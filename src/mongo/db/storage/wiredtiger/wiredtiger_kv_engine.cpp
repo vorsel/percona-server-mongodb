@@ -101,6 +101,8 @@
 
 namespace mongo {
 
+
+
 bool WiredTigerFileVersion::shouldDowngrade(bool readOnly,
                                             bool repairMode,
                                             bool hasRecoveryTimestamp) {
@@ -390,6 +392,8 @@ private:
 
 namespace {
 
+constexpr auto keydbDir = "key.db";
+
 class TicketServerParameter : public ServerParameter {
     MONGO_DISALLOW_COPYING(TicketServerParameter);
 
@@ -519,7 +523,7 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
     if (encryptionGlobalParams.enableEncryption) {
         namespace fs = boost::filesystem;
         fs::path keyDBPath = path;
-        keyDBPath /= "key.db";
+        keyDBPath /= keydbDir;
         if (!fs::exists(keyDBPath)) {
             fs::path betaKeyDBPath = path;
             betaKeyDBPath /= "keydb";
@@ -1093,7 +1097,6 @@ Status WiredTigerKVEngine::hotBackup(OperationContext* opCtx, const std::string&
 
     // Open backup cursor for keyDB
     if (_encryptionKeyDB) {
-        const char* keydbDir = "keydb";
         try {
             fs::create_directory(destPath / keydbDir);
         } catch (const fs::filesystem_error& ex) {
