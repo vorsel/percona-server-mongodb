@@ -77,6 +77,7 @@
 #include "mongo/db/storage/storage_repair_observer.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_cursor.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_customization_hooks.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_encryption_hooks.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_extensions.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_global_options.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_index.h"
@@ -570,6 +571,12 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
         std::stringstream ss;
         ss << "local=(entry=percona_encryption_extension_init,early_load=true,config=(cipher=" << encryptionGlobalParams.encryptionCipherMode << "))";
         WiredTigerExtensions::get(getGlobalServiceContext())->addExtension(ss.str());
+        // setup encryption hooks
+        // WiredTigerEncryptionHooks instance should be created after EncryptionKeyDB (depends on it)
+        if (encryptionGlobalParams.encryptionCipherMode == "AES256-CBC")
+            EncryptionHooks::set(getGlobalServiceContext(), stdx::make_unique<WiredTigerEncryptionHooksCBC>());
+        else // AES256-GCM
+            EncryptionHooks::set(getGlobalServiceContext(), stdx::make_unique<WiredTigerEncryptionHooksGCM>());
     }
 
     std::stringstream ss;
