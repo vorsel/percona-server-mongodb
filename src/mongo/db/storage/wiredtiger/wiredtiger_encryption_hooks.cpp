@@ -38,7 +38,9 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 #include <wiredtiger.h>
 
 #include "mongo/db/encryption/encryption_options.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_data_protector.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_encryption_hooks.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
 
 #include <third_party/wiredtiger/ext/encryptors/percona/encryption_keydb_c_api.h>
@@ -173,6 +175,10 @@ size_t WiredTigerEncryptionHooksCBC::additionalBytesForProtectedBuffer() {
     return _chksum_len + _iv_len + EVP_CIPHER_block_size(_cipher);
 }
 
+std::unique_ptr<DataProtector> WiredTigerEncryptionHooksCBC::getDataProtector() {
+    return stdx::make_unique<WiredTigerDataProtectorCBC>();
+}
+
 boost::filesystem::path WiredTigerEncryptionHooksCBC::getProtectedPathSuffix() {
     return ".aes256-cbc";
 }
@@ -264,6 +270,10 @@ Status WiredTigerEncryptionHooksGCM::unprotectTmpData(
 
 size_t WiredTigerEncryptionHooksGCM::additionalBytesForProtectedBuffer() {
     return _iv_len + _gcm_tag_len;
+}
+
+std::unique_ptr<DataProtector> WiredTigerEncryptionHooksGCM::getDataProtector() {
+    return stdx::make_unique<WiredTigerDataProtectorGCM>();
 }
 
 boost::filesystem::path WiredTigerEncryptionHooksGCM::getProtectedPathSuffix() {

@@ -56,11 +56,6 @@ public:
      */
     virtual bool restartRequired() override;
 
-    /**
-     * Get the data protector object
-     */
-    //virtual std::unique_ptr<DataProtector> getDataProtector() override;
-
 protected:
     static constexpr int _key_len{32};
     unsigned char _masterkey[_key_len];
@@ -90,6 +85,11 @@ public:
      * Returns the maximum size addition when doing transforming temp data.
      */
     virtual size_t additionalBytesForProtectedBuffer() override;
+
+    /**
+     * Get the data protector object
+     */
+    virtual std::unique_ptr<DataProtector> getDataProtector() override;
 
     /**
      * Get an implementation specific path suffix to tag files with
@@ -123,6 +123,11 @@ public:
      * Returns the maximum size addition when doing transforming temp data.
      */
     virtual size_t additionalBytesForProtectedBuffer() override;
+
+    /**
+     * Get the data protector object
+     */
+    virtual std::unique_ptr<DataProtector> getDataProtector() override;
 
     /**
      * Get an implementation specific path suffix to tag files with

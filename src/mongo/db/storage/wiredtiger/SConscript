@@ -37,6 +37,7 @@ if wiredtiger:
             'encryption_keydb.cpp',
             'wiredtiger_begin_transaction_block.cpp',
             'wiredtiger_cursor.cpp',
+            'wiredtiger_data_protector.cpp',
             'wiredtiger_encryption_hooks.cpp',
             'wiredtiger_global_options.cpp',
             'wiredtiger_index.cpp',
