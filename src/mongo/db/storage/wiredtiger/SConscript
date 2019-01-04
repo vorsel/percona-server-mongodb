@@ -124,6 +124,16 @@ if wiredtiger:
         )
 
     wtEnv.CppUnitTest(
+        target='storage_wiredtiger_encryption_test',
+        source=[
+            'wiredtiger_encryption_test.cpp',
+        ],
+        LIBDEPS=[
+            'storage_wiredtiger_core',
+        ],
+    )
+
+    wtEnv.CppUnitTest(
         target='storage_wiredtiger_init_test',
         source=['wiredtiger_init_test.cpp',
                 ],
