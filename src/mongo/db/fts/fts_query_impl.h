@@ -80,6 +80,7 @@ public:
 
 private:
     void _addTerms(FTSTokenizer* tokenizer, const std::string& tokens, bool negated);
+    void _addTermsForNgram(FTSTokenizer* tokenizer, const std::string& tokens, bool negated);
 
     std::set<std::string> _positiveTerms;
     std::set<std::string> _negatedTerms;
