@@ -95,6 +95,8 @@ struct ServerGlobalParams {
     std::string pidFile;           // Path to pid file, or empty if none.
     std::string timeZoneInfoPath;  // Path to time zone info directory, or empty if none.
 
+    bool relaxPermChecks = false;  // --relaxPermChecks
+
     std::string logpath;            // Path to log file, if logging to a file; otherwise, empty.
     bool logAppend = false;         // True if logging to a file in append mode.
     bool logRenameOnRotate = true;  // True if logging should rename log files on rotate
