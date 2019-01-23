@@ -30,6 +30,8 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 ======= */
 
 #include <boost/crc.hpp>
+#include <boost/filesystem/operations.hpp>
+#include <boost/filesystem/path.hpp>
 
 #include "mongo/platform/basic.h"
 
@@ -76,6 +78,10 @@ public:
                                                  + encryptionGlobalParams.encryptionKeyFile);
         }
         keyfile << "iKe9kItvgqzLl5Abz0ASLwSkuRRp0gulHKHAvG55cow=" << std::endl;
+        // set keyfile permissions
+        boost::filesystem::permissions(
+            encryptionGlobalParams.encryptionKeyFile,
+            boost::filesystem::owner_read | boost::filesystem::owner_write);
 
         _encryptionKeyDB = stdx::make_unique<EncryptionKeyDB>(_keydbpath.path());
         _encryptionKeyDB->init();
