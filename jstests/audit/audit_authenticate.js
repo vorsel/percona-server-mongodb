@@ -25,6 +25,7 @@ auditTest(
 
         let beforeCmd = Date.now();
         assert(testDB.auth('john', 'john'), "could not auth as john (pwd john)");
+        testDB.logout();
 
         let beforeLoad = Date.now();
         var auditColl = getAuditEventsCollection(m, testDBName, undefined, true);
@@ -32,7 +33,7 @@ auditTest(
             atype: 'authenticate',
             ts: withinInterval(beforeCmd, beforeLoad),
             'param.user': 'john',
-            'param.mechanism': 'SCRAM-SHA-1',
+            'param.mechanism': 'SCRAM-SHA-256',
             'param.db': testDBName,
             result: 0,
         }), "FAILED, audit log: " + tojson(auditColl.find().toArray()));
@@ -49,7 +50,7 @@ auditTest(
             atype: 'authenticate',
             ts: withinInterval(beforeCmd, beforeLoad),
             'param.user': 'john',
-            'param.mechanism': 'SCRAM-SHA-1',
+            'param.mechanism': 'SCRAM-SHA-256',
             'param.db': testDBName,
             result: authenticationFailureCode,
         }), "FAILED, audit log: " + tojson(auditColl.find().toArray()));

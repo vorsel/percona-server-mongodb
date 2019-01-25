@@ -120,15 +120,15 @@ var auditTestShard = function(name, fn, serverParams) {
 // Drop the existing audit events collection, import
 // the audit json file, then return the new collection.
 var getAuditEventsCollection = function(m, dbname, primary, useAuth) {
+    var adminDB = m.getDB('admin');
     var auth = ((useAuth !== undefined) && (useAuth != false)) ? true : false;
     if (auth) {
-        var adminDB = m.getDB('admin');
-        adminDB.auth('admin','admin');
+        assert(adminDB.auth('admin','admin'), "could not auth as admin (pwd admin)");
     }
 
     // the audit log is specifically parsable by mongoimport,
     // so we use that to conveniently read its contents.
-    var auditOptions = m.getDB('admin').runCommand('auditGetOptions');
+    var auditOptions = adminDB.runCommand('auditGetOptions');
     var auditPath = auditOptions.path;
     var auditCollectionName = 'auditCollection';
     return loadAuditEventsIntoCollection(m, auditPath, dbname, auditCollectionName, primary, auth);
