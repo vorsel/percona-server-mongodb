@@ -31,9 +31,13 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
 
-#include <boost/filesystem.hpp>
+#include <sys/stat.h>
+
+#include <cstring>  // memcpy
+#include <fstream>
 
 #include "mongo/db/encryption/encryption_options.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/storage/wiredtiger/encryption_keydb.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/base64.h"
@@ -42,7 +46,6 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 
 #include <third_party/wiredtiger/ext/encryptors/percona/encryption_keydb_c_api.h>
 
-#include <cstring>  // memcpy
 
 namespace mongo {
 
@@ -108,32 +111,45 @@ EncryptionKeyDB::~EncryptionKeyDB() {
     encryptionKeyDB = nullptr;
 }
 
+void EncryptionKeyDB::init_masterkey() {
+    struct stat stats;
+
+    if (stat(encryptionGlobalParams.encryptionKeyFile.c_str(), &stats) == -1) {
+        throw std::runtime_error(str::stream()
+                                 << "cannot read stats of encryption key file: "
+                                 << encryptionGlobalParams.encryptionKeyFile
+                                 << ": " << strerror(errno));
+    }
+    auto prohibited_perms{S_IRWXG | S_IRWXO};
+    if (serverGlobalParams.relaxPermChecks && stats.st_uid == 0) {
+        prohibited_perms = S_IWGRP | S_IXGRP | S_IRWXO;
+    }
+    if ((stats.st_mode & prohibited_perms) != 0) {
+        throw std::runtime_error(str::stream()
+                                 << "permissions on " << encryptionGlobalParams.encryptionKeyFile
+                                 << " are too open");
+    }
+    std::ifstream f(encryptionGlobalParams.encryptionKeyFile);
+    if (!f.is_open()) {
+        throw std::runtime_error(str::stream()
+                                 << "cannot open specified encryption key file: "
+                                 << encryptionGlobalParams.encryptionKeyFile);
+    }
+    std::string encoded_key;
+    f >> encoded_key;
+    auto key = base64::decode(encoded_key);
+    if (key.length() != _key_len) {
+        throw std::runtime_error(str::stream()
+                                 << "encryption key length should be " << _key_len << " bytes");
+    }
+    memcpy(_masterkey, key.c_str(), _key_len);
+}
+
 void EncryptionKeyDB::init() {
     _srng = SecureRandom::create();
     _prng = std::make_unique<PseudoRandom>(_srng->nextInt64());
     try {
-        if (!boost::filesystem::exists(encryptionGlobalParams.encryptionKeyFile)) {
-            throw std::runtime_error(std::string("specified encryption key file doesn't exist: ")
-                                                 + encryptionGlobalParams.encryptionKeyFile);
-        }
-        if ((boost::filesystem::status(encryptionGlobalParams.encryptionKeyFile).permissions()
-            & (boost::filesystem::group_all | boost::filesystem::others_all)) != 0) {
-            throw std::runtime_error(std::string("permissions on ")
-                                                 + encryptionGlobalParams.encryptionKeyFile
-                                                 + " are too open");
-        }
-        std::ifstream f(encryptionGlobalParams.encryptionKeyFile);
-        if (!f.is_open()) {
-            throw std::runtime_error(std::string("cannot open specified encryption key file: ")
-                                                 + encryptionGlobalParams.encryptionKeyFile);
-        }
-        std::string encoded_key;
-        f >> encoded_key;
-        auto key = base64::decode(encoded_key);
-        if (key.length() != _key_len) {
-            throw std::runtime_error(str::stream() << "encryption key length should be " << _key_len << " bytes");
-        }
-        memcpy(_masterkey, key.c_str(), _key_len);
+        init_masterkey();
 
         std::stringstream ss;
         ss << "create,";

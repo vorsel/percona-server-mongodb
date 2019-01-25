@@ -75,6 +75,8 @@ private:
     int store_gcm_iv_reserved();
     int reserve_gcm_iv_range();
 
+    void init_masterkey();
+
     static constexpr int _key_len = 32;
     const std::string _path;
     unsigned char _masterkey[_key_len];
