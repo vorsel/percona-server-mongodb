@@ -256,8 +256,7 @@ Status addMongodOptions(moe::OptionSection* options) {
             "security.enableEncryption",
             "enableEncryption",
             moe::Switch,
-            "enable encryption for the WiredTiger storage engine")
-        .requires("security.encryptionKeyFile");
+            "enable encryption for the WiredTiger storage engine");
 
     encryption_options
         .addOptionChaining(
@@ -275,6 +274,71 @@ Status addMongodOptions(moe::OptionSection* options) {
             moe::String,
             "the path to the local keyfile")
         .requires("security.enableEncryption");
+
+    encryption_options
+        .addOptionChaining(
+            "security.vault.serverName",
+            "vaultServerName",
+            moe::String,
+            "hostname or IP address of the Vault server")
+        .requires("security.enableEncryption")
+        .requires("security.vault.port")
+        .requires("security.vault.tokenFile")
+        .requires("security.vault.secret")
+        .incompatibleWith("security.encryptionKeyFile");
+
+    encryption_options
+        .addOptionChaining(
+            "security.vault.port",
+            "vaultPort",
+            moe::Int,
+            "port name the Vault server is listening on")
+        .requires("security.vault.serverName")
+        .validRange(0, 65535);
+
+    encryption_options
+        .addOptionChaining(
+            "security.vault.tokenFile",
+            "vaultTokenFile",
+            moe::String,
+            "the path to file with Vault server's access token")
+        .requires("security.vault.serverName");
+
+    encryption_options
+        .addOptionChaining(
+            "security.vault.secret",
+            "vaultSecret",
+            moe::String,
+            "the name of the Vault secret where the master key is stored")
+        .requires("security.vault.serverName");
+
+    encryption_options
+        .addOptionChaining(
+            "security.vault.rotateMasterKey",
+            "vaultRotateMasterKey",
+            moe::Switch,
+            "rotate master key and re-encrypt keys db")
+        .requires("security.vault.serverName");
+
+    encryption_options
+        .addOptionChaining(
+            "security.vault.serverCAFile",
+            "vaultServerCAFile",
+            moe::String,
+            "CA certificate that was used to sign Vault’s certificates "
+            "- should be used when the Vault’s CA certificate is not trusted "
+            "by the machine that is going to connect to the Vault server")
+        .requires("security.vault.serverName");
+
+    encryption_options
+        .addOptionChaining(
+            "security.vault.disableTLSForTesting",
+            "vaultDisableTLSForTesting",
+            moe::Switch,
+            "disable using TLS for Vault server connections "
+            "- is suitable for connecting Vault server in -dev mode or "
+            "Vault server with TLS disabled. Should not be used in production")
+        .requires("security.vault.serverName");
 
     // Replication Options
 
@@ -492,6 +556,15 @@ Status validateMongodOptions(const moe::Environment& params) {
         }
     }
 #endif
+
+    if (params.count("security.enableEncryption")) {
+        // One of the master key sources must be provided
+        if (!params.count("security.encryptionKeyFile") &&
+            !params.count("security.vault.serverName")) {
+            return Status(ErrorCodes::BadValue,
+                          "security.encryptionKeyFile or security.vault.serverName is required when security.enableEncryption is specified");
+        }
+    }
 
     if (params.count("storage.queryableBackupMode")) {
         // Command line options that are disallowed when --queryableBackupMode is specified.
@@ -800,6 +873,34 @@ Status storeMongodOptions(const moe::Environment& params) {
 
     if (params.count("security.encryptionKeyFile")) {
         encryptionGlobalParams.encryptionKeyFile = params["security.encryptionKeyFile"].as<std::string>();
+    }
+
+    if (params.count("security.vault.serverName")) {
+        encryptionGlobalParams.vaultServerName = params["security.vault.serverName"].as<std::string>();
+    }
+
+    if (params.count("security.vault.port")) {
+        encryptionGlobalParams.vaultPort = params["security.vault.port"].as<int>();
+    }
+
+    if (params.count("security.vault.tokenFile")) {
+        encryptionGlobalParams.vaultTokenFile = params["security.vault.tokenFile"].as<std::string>();
+    }
+
+    if (params.count("security.vault.secret")) {
+        encryptionGlobalParams.vaultSecret = params["security.vault.secret"].as<std::string>();
+    }
+
+    if (params.count("security.vault.rotateMasterKey")) {
+        encryptionGlobalParams.vaultRotateMasterKey = params["security.vault.rotateMasterKey"].as<bool>();
+    }
+
+    if (params.count("security.vault.serverCAFile")) {
+        encryptionGlobalParams.vaultServerCAFile = params["security.vault.serverCAFile"].as<std::string>();
+    }
+
+    if (params.count("security.vault.disableTLSForTesting")) {
+        encryptionGlobalParams.vaultDisableTLS = params["security.vault.disableTLSForTesting"].as<bool>();
     }
 
     if (params.count("cpu")) {

@@ -36,9 +36,17 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 namespace mongo {
 
 struct EncryptionGlobalParams {
-    bool enableEncryption = false;
-    std::string encryptionCipherMode = "AES256-CBC";
+    bool enableEncryption{false};
+    std::string encryptionCipherMode{"AES256-CBC"};
     std::string encryptionKeyFile;
+    std::string vaultServerName;
+    int vaultPort;
+    std::string vaultTokenFile;
+    std::string vaultToken;
+    std::string vaultSecret;
+    bool vaultRotateMasterKey{false};
+    std::string vaultServerCAFile;
+    bool vaultDisableTLS{false};
 };
 
 extern EncryptionGlobalParams encryptionGlobalParams;
