@@ -233,7 +233,7 @@ static int percona_encrypt_cbc(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
     EVP_CIPHER_CTX_init(ctx);
 #else
     EVP_CIPHER_CTX *ctx= EVP_CIPHER_CTX_new();
-    if (unlikely(!ctx))
+    if (!ctx)
         goto err;
 #endif
 
@@ -303,7 +303,7 @@ static int percona_encrypt_gcm(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
     EVP_CIPHER_CTX_init(ctx);
 #else
     EVP_CIPHER_CTX *ctx= EVP_CIPHER_CTX_new();
-    if (unlikely(!ctx))
+    if (!ctx)
         goto err;
 #endif
 
@@ -365,7 +365,7 @@ static int percona_decrypt_cbc(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
     EVP_CIPHER_CTX_init(ctx);
 #else
     EVP_CIPHER_CTX *ctx= EVP_CIPHER_CTX_new();
-    if (unlikely(!ctx))
+    if (!ctx)
         goto err;
 #endif
 
@@ -442,7 +442,7 @@ static int percona_decrypt_gcm(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
     EVP_CIPHER_CTX_init(ctx);
 #else
     EVP_CIPHER_CTX *ctx= EVP_CIPHER_CTX_new();
-    if (unlikely(!ctx))
+    if (!ctx)
         goto err;
 #endif
 
