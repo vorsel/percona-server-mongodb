@@ -62,19 +62,35 @@ unsigned char _masterkey[_key_len];
 class EVPCipherCtx {
 public:
     EVPCipherCtx() {
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
         EVP_CIPHER_CTX_init(&_ctx_value);
+#else
+        _ctx= EVP_CIPHER_CTX_new();
+#endif
     }
 
     ~EVPCipherCtx() {
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
         EVP_CIPHER_CTX_cleanup(&_ctx_value);
+#else
+        EVP_CIPHER_CTX_free(_ctx);
+#endif
     }
 
     operator EVP_CIPHER_CTX* () {
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
         return &_ctx_value;
+#else
+        return _ctx;
+#endif
     }
 
 private:
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
     EVP_CIPHER_CTX _ctx_value;
+#else
+    EVP_CIPHER_CTX *_ctx{nullptr};
+#endif
 };
 
 // callback for ERR_print_errors_cb

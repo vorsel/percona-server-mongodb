@@ -61,11 +61,21 @@ namespace {
 WiredTigerDataProtector::WiredTigerDataProtector() {
     // get master key
     get_key_by_id(nullptr, 0, _masterkey, nullptr);
-    EVP_CIPHER_CTX_init(&_ctx_value);
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+    _ctx = new EVP_CIPHER_CTX{};
+    EVP_CIPHER_CTX_init(_ctx);
+#else
+    _ctx= EVP_CIPHER_CTX_new();
+#endif
 }
 
 WiredTigerDataProtector::~WiredTigerDataProtector() {
-    EVP_CIPHER_CTX_cleanup(&_ctx_value);
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+    EVP_CIPHER_CTX_cleanup(_ctx);
+    delete _ctx;
+#else
+    EVP_CIPHER_CTX_free(_ctx);
+#endif
 }
 
 
@@ -81,7 +91,6 @@ Status WiredTigerDataProtectorCBC::protect(const std::uint8_t* in,
                                         std::uint8_t* out,
                                         std::size_t outLen,
                                         std::size_t* bytesWritten) {
-    EVP_CIPHER_CTX *ctx = &_ctx_value;
     *bytesWritten = 0;
 
     if (_first) {
@@ -95,12 +104,12 @@ Status WiredTigerDataProtectorCBC::protect(const std::uint8_t* in,
         store_pseudo_bytes(iv, _iv_len);
         *bytesWritten += _iv_len;
 
-        if (1 != EVP_EncryptInit_ex(ctx, _cipher, nullptr, _masterkey, iv))
+        if (1 != EVP_EncryptInit_ex(_ctx, _cipher, nullptr, _masterkey, iv))
             return handleCryptoErrors();
     }
 
     int encrypted_len = 0;
-    if (1 != EVP_EncryptUpdate(ctx, out + *bytesWritten, &encrypted_len, in, inLen))
+    if (1 != EVP_EncryptUpdate(_ctx, out + *bytesWritten, &encrypted_len, in, inLen))
         return handleCryptoErrors();
     *bytesWritten += encrypted_len;
     crc32c.process_bytes(in, inLen);
@@ -109,10 +118,8 @@ Status WiredTigerDataProtectorCBC::protect(const std::uint8_t* in,
 }
 
 Status WiredTigerDataProtectorCBC::finalize(std::uint8_t* out, std::size_t outLen, std::size_t* bytesWritten) {
-    EVP_CIPHER_CTX *ctx = &_ctx_value;
-
     int encrypted_len = 0;
-    if (1 != EVP_EncryptFinal_ex(ctx, out, &encrypted_len))
+    if (1 != EVP_EncryptFinal_ex(_ctx, out, &encrypted_len))
         return handleCryptoErrors();
     *bytesWritten = encrypted_len;
 
@@ -144,7 +151,6 @@ Status WiredTigerDataProtectorGCM::protect(const std::uint8_t* in,
                                         std::uint8_t* out,
                                         std::size_t outLen,
                                         std::size_t* bytesWritten) {
-    EVP_CIPHER_CTX *ctx = &_ctx_value;
     *bytesWritten = 0;
 
     if (_first) {
@@ -160,12 +166,12 @@ Status WiredTigerDataProtectorGCM::protect(const std::uint8_t* in,
                           "failed generating IV for GCM");
         *bytesWritten += _iv_len;
 
-        if (1 != EVP_EncryptInit_ex(ctx, _cipher, nullptr, _masterkey, iv))
+        if (1 != EVP_EncryptInit_ex(_ctx, _cipher, nullptr, _masterkey, iv))
             return handleCryptoErrors();
     }
 
     int encrypted_len = 0;
-    if (1 != EVP_EncryptUpdate(ctx, out + *bytesWritten, &encrypted_len, in, inLen))
+    if (1 != EVP_EncryptUpdate(_ctx, out + *bytesWritten, &encrypted_len, in, inLen))
         return handleCryptoErrors();
     *bytesWritten += encrypted_len;
 
@@ -173,10 +179,8 @@ Status WiredTigerDataProtectorGCM::protect(const std::uint8_t* in,
 }
 
 Status WiredTigerDataProtectorGCM::finalize(std::uint8_t* out, std::size_t outLen, std::size_t* bytesWritten) {
-    EVP_CIPHER_CTX *ctx = &_ctx_value;
-
     int encrypted_len = 0;
-    if (1 != EVP_EncryptFinal_ex(ctx, out, &encrypted_len))
+    if (1 != EVP_EncryptFinal_ex(_ctx, out, &encrypted_len))
         return handleCryptoErrors();
     *bytesWritten = encrypted_len;
 
@@ -190,9 +194,8 @@ std::size_t WiredTigerDataProtectorGCM::getNumberOfBytesReservedForTag() const {
 Status WiredTigerDataProtectorGCM::finalizeTag(std::uint8_t* out,
                                             std::size_t outLen,
                                             std::size_t* bytesWritten) {
-    EVP_CIPHER_CTX *ctx = &_ctx_value;
     // get the tag
-    if(1 != EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, _gcm_tag_len, out))
+    if(1 != EVP_CIPHER_CTX_ctrl(_ctx, EVP_CTRL_GCM_GET_TAG, _gcm_tag_len, out))
         return handleCryptoErrors();
     *bytesWritten += _gcm_tag_len;
     return Status::OK();

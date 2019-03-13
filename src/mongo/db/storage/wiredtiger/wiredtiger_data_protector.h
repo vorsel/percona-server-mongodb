@@ -51,7 +51,7 @@ protected:
     const EVP_CIPHER *_cipher{nullptr};
     int _iv_len;
     bool _first{true};
-    EVP_CIPHER_CTX _ctx_value;
+    EVP_CIPHER_CTX *_ctx{nullptr};
 };
 
 class WiredTigerDataProtectorCBC: public WiredTigerDataProtector
