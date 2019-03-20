@@ -572,6 +572,7 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
 
     if (encryptionGlobalParams.enableEncryption) {
         namespace fs = boost::filesystem;
+        bool just_created{false};
         fs::path keyDBPath = path;
         keyDBPath /= keydbDir;
         if (!fs::exists(keyDBPath)) {
@@ -580,6 +581,7 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
             if (!fs::exists(betaKeyDBPath)) {
                 try {
                     fs::create_directory(keyDBPath);
+                    just_created = true;
                 } catch (std::exception& e) {
                     log() << "error creating KeyDB dir " << keyDBPath.string() << ' ' << e.what();
                     throw;
@@ -616,7 +618,7 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
                 }
             }
         }
-        auto encryptionKeyDB = stdx::make_unique<EncryptionKeyDB>(keyDBPath.string());
+        auto encryptionKeyDB = stdx::make_unique<EncryptionKeyDB>(just_created, keyDBPath.string());
         encryptionKeyDB->init();
         // do master key rotation if necessary
         if (encryptionGlobalParams.vaultRotateMasterKey) {
