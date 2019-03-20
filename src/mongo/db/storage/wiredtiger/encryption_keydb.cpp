@@ -91,8 +91,9 @@ static void dump_table(WT_SESSION* _sess, const int _key_len, const char* msg) {
     res = cursor->close(cursor);
 }
 
-EncryptionKeyDB::EncryptionKeyDB(const std::string& path, const bool rotation)
-  : _rotation(rotation),
+EncryptionKeyDB::EncryptionKeyDB(const bool just_created, const std::string& path, const bool rotation)
+  : _just_created(just_created),
+    _rotation(rotation),
     _path(path) {
     // single instance is allowed as main keydb
     // and another one for rotation
@@ -121,6 +122,14 @@ EncryptionKeyDB::~EncryptionKeyDB() {
         encryptionKeyDB = nullptr;
     else
         rotationKeyDB = nullptr;
+}
+
+// this function uses _srng without synchronization
+// caller must ensure it is safe
+void EncryptionKeyDB::generate_secure_key(char key[]) {
+    for (int i = 0; i < 4; ++i) {
+        ((int64_t*)key)[i] = _srng->nextInt64();
+    }
 }
 
 void EncryptionKeyDB::init_masterkey() {
@@ -155,15 +164,24 @@ void EncryptionKeyDB::init_masterkey() {
         if (_rotation) {
             // generate new key
             char newkey[_key_len];
-            for (int i = 0; i < 4; ++i) {
-                // this code will run in single threaded environment
-                // no need to synchronize _srng access
-                ((int64_t*)newkey)[i] = _srng->nextInt64();
-            }
+            generate_secure_key(newkey);
             encoded_key = base64::encode(newkey, _key_len);
         } else {
             // read key from the Vault
             encoded_key = vaultReadKey();
+            // empty key is returned when there was HTTP error 404
+            // if this happens on first run (with empty keydb) then
+            // we can generate key here
+            if (encoded_key.empty()) {
+                if (!_just_created) {
+                    throw std::runtime_error("Cannot start. Master encryption key is absent in the Vault. Check configuration options.");
+                }
+                log() << "Master key is absent in the Vault. Generating and writing one.";
+                char newkey[_key_len];
+                generate_secure_key(newkey);
+                encoded_key = base64::encode(newkey, _key_len);
+                vaultWriteKey(encoded_key);
+            }
         }
     } else {
         struct stat stats;
