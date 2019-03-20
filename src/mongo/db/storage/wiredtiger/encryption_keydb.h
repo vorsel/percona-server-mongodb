@@ -44,7 +44,10 @@ namespace mongo {
 class EncryptionKeyDB
 {
 public:
-    EncryptionKeyDB(const std::string& path, const bool rotation = false);
+    EncryptionKeyDB(const std::string& path, const bool rotation = false)
+        : EncryptionKeyDB(false, path, rotation) {}
+    EncryptionKeyDB(const bool just_created, const std::string& path)
+        : EncryptionKeyDB(just_created, path, false) {}
     ~EncryptionKeyDB();
 
     // tries to read master key from specified file
@@ -78,12 +81,16 @@ public:
 private:
     typedef boost::multiprecision::uint128_t _gcm_iv_type;
 
+    EncryptionKeyDB(const bool just_created, const std::string& path, const bool rotation);
+
     int store_gcm_iv_reserved();
     int reserve_gcm_iv_range();
+    void generate_secure_key(char key[]); // uses _srng without locks
 
     void init_masterkey();
 
     static constexpr int _key_len = 32;
+    const bool _just_created;
     const bool _rotation;
     const std::string _path;
     unsigned char _masterkey[_key_len];
