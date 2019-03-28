@@ -45,8 +45,6 @@ class Environment;
 namespace moe = mongo::optionenvironment;
 
 struct PerconaDecryptGlobalParams {
-    std::string keyPath;
-    std::string cipherMode{"AES256-CBC"};
     std::string inputPath;
     std::string outputPath;
 
