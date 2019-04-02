@@ -134,6 +134,7 @@ void throw_CURL_error(CURLcode curl_res, const char curl_errbuf[], const char* m
 std::string vaultReadKey() {
     char curl_errbuf[CURL_ERROR_SIZE]{0}; // should be available until curl_easy_cleanup
     long http_code{0};
+    long verifyresult{0};
     CURLGuard guard;
     guard.initialize();
 
@@ -157,15 +158,19 @@ std::string vaultReadKey() {
         (curl_res = curl_easy_setopt(curl, CURLOPT_WRITEDATA, static_cast<void*>(&response))) != CURLE_OK ||
         (curl_res = curl_easy_setopt(curl, CURLOPT_URL,
                                      std::string(str::stream()
-                                     << "http://" << encryptionGlobalParams.vaultServerName
+                                     << (encryptionGlobalParams.vaultDisableTLS ? "http://" : "https://")
+                                     << encryptionGlobalParams.vaultServerName
                                      << ':'       << encryptionGlobalParams.vaultPort
                                      << "/v1/"    << encryptionGlobalParams.vaultSecret).c_str())) != CURLE_OK ||
         (curl_res = curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers)) != CURLE_OK ||
         (curl_res = curl_easy_perform(curl)) != CURLE_OK ||
-        (curl_res = curl_easy_getinfo (curl, CURLINFO_RESPONSE_CODE, &http_code)) != CURLE_OK) {
+        (curl_res = curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code)) != CURLE_OK ||
+        (curl_res = curl_easy_getinfo(curl, CURLINFO_SSL_VERIFYRESULT, &verifyresult)) != CURLE_OK) {
         throw_CURL_error(curl_res, curl_errbuf, "Error reading key from the Vault");
     }
 
+    // verify result 0 means success
+    // log() << "SSL verifyresult is " << verifyresult;
     // response may contain encryption key
     // log() << std::string(response);
     LOG(4) << "HTTP code (GET): " << http_code;
@@ -216,7 +221,8 @@ void vaultWriteKey(std::string const& key) {
     Curl_slist_guard curl_slist_guard(headers);
 
     std::string urlstr = std::string(str::stream()
-                                     << "http://" << encryptionGlobalParams.vaultServerName
+                                     << (encryptionGlobalParams.vaultDisableTLS ? "http://" : "https://")
+                                     << encryptionGlobalParams.vaultServerName
                                      << ':'       << encryptionGlobalParams.vaultPort
                                      << "/v1/"    << encryptionGlobalParams.vaultSecret);
     std::string postdata = std::string(str::stream()
