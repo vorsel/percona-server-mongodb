@@ -101,20 +101,39 @@ private:
     curl_slist *list;
 };
 
-} // namespace
 size_t write_response_callback(char *ptr, size_t size, size_t nmemb, void *userdata) {
     *(str::stream*)userdata << std::string(ptr, nmemb);
-    return CURLE_OK;
+    return nmemb;
 }
 
 CURLcode setup_curl_options(CURL *curl) {
     CURLcode curl_res = CURLE_OK;
-    (curl_res = curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L)) != CURLE_OK
-    || (curl_res = curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L)) != CURLE_OK;
+    (curl_res = curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L)) != CURLE_OK ||
+    (curl_res = curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L)) != CURLE_OK ||
+    (!encryptionGlobalParams.vaultServerCAFile.empty() &&
+        (curl_res = curl_easy_setopt(curl, CURLOPT_CAINFO, encryptionGlobalParams.vaultServerCAFile.c_str())) != CURLE_OK
+    ) ||
+    (curl_res = curl_easy_setopt(curl, CURLOPT_USE_SSL, CURLUSESSL_ALL)) != CURLE_OK ||
+    (curl_res = curl_easy_setopt(curl, CURLOPT_TIMEOUT, encryptionGlobalParams.vaultTimeout)) != CURLE_OK ||
+    (curl_res = curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, encryptionGlobalParams.vaultTimeout)) != CURLE_OK;
     return curl_res;
 }
 
+void throw_CURL_error(CURLcode curl_res, const char curl_errbuf[], const char* msg) {
+    str::stream ss;
+    ss << msg << "; CURL error code: " << curl_res << "; CURL error message: ";
+    if (curl_errbuf[0])
+        ss << curl_errbuf;
+    else
+        ss << curl_easy_strerror(curl_res);
+    throw std::runtime_error(ss);
+}
+
+} // namespace
+
 std::string vaultReadKey() {
+    char curl_errbuf[CURL_ERROR_SIZE]{0}; // should be available until curl_easy_cleanup
+    long http_code{0};
     CURLGuard guard;
     guard.initialize();
 
@@ -125,7 +144,6 @@ std::string vaultReadKey() {
     }
     Curl_session_guard curl_session_guard(curl);
 
-    char curl_errbuf[CURL_ERROR_SIZE]; //error from CURL
     CURLcode curl_res = CURLE_OK;
     str::stream response;
 
@@ -133,19 +151,34 @@ std::string vaultReadKey() {
     headers = curl_slist_append(headers, std::string(str::stream() << "X-Vault-Token: " << encryptionGlobalParams.vaultToken).c_str());
     Curl_slist_guard curl_slist_guard(headers);
 
-    curl_res = setup_curl_options(curl);
-    curl_res = curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, curl_errbuf);
-    curl_res = curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_response_callback);
-    curl_res = curl_easy_setopt(curl, CURLOPT_WRITEDATA, static_cast<void*>(&response));
-    curl_res = curl_easy_setopt(curl, CURLOPT_URL,
-                                std::string(str::stream()
-                                << "http://" << encryptionGlobalParams.vaultServerName
-                                << ':'       << encryptionGlobalParams.vaultPort
-                                << "/v1/"    << encryptionGlobalParams.vaultSecret).c_str());
-    curl_res = curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_res = curl_easy_perform(curl);
+    if ((curl_res = setup_curl_options(curl)) != CURLE_OK ||
+        (curl_res = curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, curl_errbuf)) != CURLE_OK ||
+        (curl_res = curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_response_callback)) != CURLE_OK ||
+        (curl_res = curl_easy_setopt(curl, CURLOPT_WRITEDATA, static_cast<void*>(&response))) != CURLE_OK ||
+        (curl_res = curl_easy_setopt(curl, CURLOPT_URL,
+                                     std::string(str::stream()
+                                     << "http://" << encryptionGlobalParams.vaultServerName
+                                     << ':'       << encryptionGlobalParams.vaultPort
+                                     << "/v1/"    << encryptionGlobalParams.vaultSecret).c_str())) != CURLE_OK ||
+        (curl_res = curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers)) != CURLE_OK ||
+        (curl_res = curl_easy_perform(curl)) != CURLE_OK ||
+        (curl_res = curl_easy_getinfo (curl, CURLINFO_RESPONSE_CODE, &http_code)) != CURLE_OK) {
+        throw_CURL_error(curl_res, curl_errbuf, "Error reading key from the Vault");
+    }
 
-    log() << std::string(response);
+    // response may contain encryption key
+    // log() << std::string(response);
+    LOG(4) << "HTTP code (GET): " << http_code;
+    if (http_code == 404) {
+        // requested value does not exist - return empty string
+        return {};
+    }
+    if (http_code / 100 != 2) {
+        // not success - throw error
+        throw std::runtime_error(str::stream()
+                                 << "Error reading key from the Vault; HTTP code: "
+                                 << http_code);
+    }
     BSONObj bson = fromjson(response);
     BSONElement data1 = bson["data"];
     if (data1.eoo() || !data1.isABSONObj()) {
@@ -163,6 +196,8 @@ std::string vaultReadKey() {
 }
 
 void vaultWriteKey(std::string const& key) {
+    char curl_errbuf[CURL_ERROR_SIZE]{0}; // should be available until curl_easy_cleanup
+    long http_code{0};
     CURLGuard guard;
     guard.initialize();
 
@@ -173,7 +208,6 @@ void vaultWriteKey(std::string const& key) {
     }
     Curl_session_guard curl_session_guard(curl);
 
-    char curl_errbuf[CURL_ERROR_SIZE]; //error from CURL
     CURLcode curl_res = CURLE_OK;
     str::stream response;
 
@@ -181,26 +215,34 @@ void vaultWriteKey(std::string const& key) {
     headers = curl_slist_append(headers, std::string(str::stream() << "X-Vault-Token: " << encryptionGlobalParams.vaultToken).c_str());
     Curl_slist_guard curl_slist_guard(headers);
 
-    curl_res = setup_curl_options(curl);
-    curl_res = curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, curl_errbuf);
-    curl_res = curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_response_callback);
-    curl_res = curl_easy_setopt(curl, CURLOPT_WRITEDATA, static_cast<void*>(&response));
     std::string urlstr = std::string(str::stream()
-                                << "http://" << encryptionGlobalParams.vaultServerName
-                                << ':'       << encryptionGlobalParams.vaultPort
-                                << "/v1/"    << encryptionGlobalParams.vaultSecret);
-    curl_res = curl_easy_setopt(curl, CURLOPT_URL,
-                                urlstr.c_str());
-    curl_res = curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+                                     << "http://" << encryptionGlobalParams.vaultServerName
+                                     << ':'       << encryptionGlobalParams.vaultPort
+                                     << "/v1/"    << encryptionGlobalParams.vaultSecret);
     std::string postdata = std::string(str::stream()
-                                << "{\"data\": "
-                                << "{\"value\": \"" << key
-                                << "\"}}");
-    curl_res = curl_easy_setopt(curl, CURLOPT_POSTFIELDS,
-                                postdata.c_str());
-    curl_res = curl_easy_perform(curl);
+                                       << "{\"data\": "
+                                       << "{\"value\": \"" << key
+                                       << "\"}}");
+    if ((curl_res = setup_curl_options(curl)) != CURLE_OK ||
+        (curl_res = curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, curl_errbuf)) != CURLE_OK ||
+        (curl_res = curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_response_callback)) != CURLE_OK ||
+        (curl_res = curl_easy_setopt(curl, CURLOPT_WRITEDATA, static_cast<void*>(&response))) != CURLE_OK ||
+        (curl_res = curl_easy_setopt(curl, CURLOPT_URL, urlstr.c_str())) != CURLE_OK ||
+        (curl_res = curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers)) != CURLE_OK ||
+        (curl_res = curl_easy_setopt(curl, CURLOPT_POSTFIELDS, postdata.c_str())) != CURLE_OK ||
+        (curl_res = curl_easy_perform(curl)) != CURLE_OK ||
+        (curl_res = curl_easy_getinfo (curl, CURLINFO_RESPONSE_CODE, &http_code)) != CURLE_OK) {
+        throw_CURL_error(curl_res, curl_errbuf, "Error writing key to the Vault");
+    }
 
-    log() << std::string(response);
+    // log() << std::string(response);
+    LOG(4) << "HTTP code (POST): " << http_code;
+    if (http_code / 100 != 2) {
+        // not success - throw error
+        throw std::runtime_error(str::stream()
+                                 << "Error writing key to the Vault; HTTP code: "
+                                 << http_code);
+    }
 }
 
 }  // namespace mongo
