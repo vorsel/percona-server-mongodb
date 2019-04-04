@@ -47,6 +47,7 @@ struct EncryptionGlobalParams {
     bool vaultRotateMasterKey{false};
     std::string vaultServerCAFile;
     bool vaultDisableTLS{false};
+    long vaultTimeout{15L};
 };
 
 extern EncryptionGlobalParams encryptionGlobalParams;
