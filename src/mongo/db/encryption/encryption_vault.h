@@ -40,4 +40,8 @@ namespace mongo {
 // returns base64 encoded value
 std::string vaultReadKey();
 
+// write key to the Vault
+// 'key' should be base64 encoded string
+void vaultWriteKey(std::string const& key);
+
 }  // namespace mongo

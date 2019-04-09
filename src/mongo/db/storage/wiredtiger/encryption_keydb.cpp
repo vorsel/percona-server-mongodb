@@ -51,6 +51,7 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 namespace mongo {
 
 static EncryptionKeyDB *encryptionKeyDB = nullptr;
+static EncryptionKeyDB *rotationKeyDB = nullptr;
 
 static constexpr const char * gcm_iv_key = "_gcm_iv_reserved";
 constexpr int EncryptionKeyDB::_key_len;
@@ -90,11 +91,18 @@ static void dump_table(WT_SESSION* _sess, const int _key_len, const char* msg) {
     res = cursor->close(cursor);
 }
 
-EncryptionKeyDB::EncryptionKeyDB(const std::string& path)
-  : _path(path) {
-    // only single instance is allowed
-    invariant(encryptionKeyDB == nullptr);
-    encryptionKeyDB = this;
+EncryptionKeyDB::EncryptionKeyDB(const std::string& path, const bool rotation)
+  : _rotation(rotation),
+    _path(path) {
+    // single instance is allowed as main keydb
+    // and another one for rotation
+    if (!_rotation) {
+        invariant(encryptionKeyDB == nullptr);
+        encryptionKeyDB = this;
+    } else {
+        invariant(rotationKeyDB == nullptr);
+        rotationKeyDB = this;
+    }
 }
 
 EncryptionKeyDB::~EncryptionKeyDB() {
@@ -109,7 +117,10 @@ EncryptionKeyDB::~EncryptionKeyDB() {
     if (_conn)
         _conn->close(_conn, nullptr);
     // should be the last line because closing wiredTiger's handles may write to DB
-    encryptionKeyDB = nullptr;
+    if (!_rotation)
+        encryptionKeyDB = nullptr;
+    else
+        rotationKeyDB = nullptr;
 }
 
 void EncryptionKeyDB::init_masterkey() {
@@ -141,8 +152,19 @@ void EncryptionKeyDB::init_masterkey() {
             }
             f >> encryptionGlobalParams.vaultToken;
         }
-        // read key from the Vault
-        encoded_key = vaultReadKey();
+        if (_rotation) {
+            // generate new key
+            char newkey[_key_len];
+            for (int i = 0; i < 4; ++i) {
+                // this code will run in single threaded environment
+                // no need to synchronize _srng access
+                ((int64_t*)newkey)[i] = _srng->nextInt64();
+            }
+            encoded_key = base64::encode(newkey, _key_len);
+        } else {
+            // read key from the Vault
+            encoded_key = vaultReadKey();
+        }
     } else {
         struct stat stats;
 
@@ -191,7 +213,7 @@ void EncryptionKeyDB::init() {
         // keys DB will always use CBC cipher because wiredtiger_open internally calls
         // encryption extension's encrypt function which depends on the GCM encryption counter
         // loaded later (see 'load parameters' section below)
-        ss << "extensions=[local=(entry=percona_encryption_extension_init,early_load=true,config=(cipher=AES256-CBC))],";
+        ss << "extensions=[local=(entry=percona_encryption_extension_init,early_load=true,config=(cipher=AES256-CBC" << (_rotation ? ",rotation=true" : ",rotation=false") << "))],";
         ss << "encryption=(name=percona,keyid=\"\"),";
         // logging configured; updates durable on application or system failure
         // https://source.wiredtiger.com/3.0.0/tune_durability.html
@@ -255,6 +277,52 @@ void EncryptionKeyDB::init() {
         throw;
     }
     log() << "Encryption keys DB is initialized successfully";
+}
+
+void EncryptionKeyDB::clone(EncryptionKeyDB *old) {
+    // not doing any synchronization here because key rotation process is single threaded
+    try {
+        // copy parameters table
+        // clone is called right after init(). at this point _gcm_iv_reserved is equal to _gcm_iv
+        _gcm_iv_reserved = old->_gcm_iv_reserved;
+        if (store_gcm_iv_reserved()) {
+            throw std::runtime_error("failed to copy key db data during rotation");
+        }
+        // copy key table
+        int res;
+        auto cursor_close = [](WT_CURSOR* c){c->close(c);};
+        WT_CURSOR *srcc;
+        res = old->_sess->open_cursor(old->_sess, "table:key", nullptr, nullptr, &srcc);
+        if (res)
+            throw std::runtime_error(std::string("clone: error opening cursor: ") + wiredtiger_strerror(res));
+        std::unique_ptr<WT_CURSOR, std::function<void(WT_CURSOR*)>> srcc_guard(srcc, cursor_close);
+        WT_CURSOR *dstc;
+        res = _sess->open_cursor(_sess, "table:key", nullptr, nullptr, &dstc);
+        if (res)
+            throw std::runtime_error(std::string("clone: error opening cursor: ") + wiredtiger_strerror(res));
+        std::unique_ptr<WT_CURSOR, std::function<void(WT_CURSOR*)>> dstc_guard(dstc, cursor_close);
+        while ((res = srcc->next(srcc)) == 0) {
+            char* k;
+            WT_ITEM v;
+            if ((res = srcc->get_key(srcc, &k))
+                || (res = srcc->get_value(srcc, &v)))
+                throw std::runtime_error(std::string("clone: error getting key/value from the key table: ") + wiredtiger_strerror(res));
+            invariant(v.size == _key_len);
+            dstc->set_key(dstc, k);
+            dstc->set_value(dstc, &v);
+            if ((res = dstc->insert(dstc)) != 0)
+                throw std::runtime_error(std::string("clone: error writing key table: ") + wiredtiger_strerror(res));
+        }
+        if (res != WT_NOTFOUND)
+            throw std::runtime_error(std::string("clone: error reading key table: ") + wiredtiger_strerror(res));
+    } catch (std::exception& e) {
+        error() << e.what();
+        throw;
+    }
+}
+
+void EncryptionKeyDB::store_masterkey() {
+    vaultWriteKey(base64::encode((const char*)_masterkey, _key_len));
 }
 
 int EncryptionKeyDB::get_key_by_id(const char *keyid, size_t len, unsigned char *key, void *pe) {
@@ -436,9 +504,19 @@ extern "C" void store_pseudo_bytes(uint8_t *buf, int len) {
     encryptionKeyDB->store_pseudo_bytes(buf, len);
 }
 
+extern "C" void rotation_store_pseudo_bytes(uint8_t *buf, int len) {
+    invariant(rotationKeyDB);
+    rotationKeyDB->store_pseudo_bytes(buf, len);
+}
+
 extern "C" int get_iv_gcm(uint8_t *buf, int len) {
     invariant(encryptionKeyDB);
     return encryptionKeyDB->get_iv_gcm(buf, len);
+}
+
+extern "C" int rotation_get_iv_gcm(uint8_t *buf, int len) {
+    invariant(rotationKeyDB);
+    return rotationKeyDB->get_iv_gcm(buf, len);
 }
 
 // returns encryption key from keys DB
@@ -447,6 +525,11 @@ extern "C" int get_iv_gcm(uint8_t *buf, int len) {
 extern "C" int get_key_by_id(const char *keyid, size_t len, unsigned char *key, void *pe) {
     invariant(encryptionKeyDB);
     return encryptionKeyDB->get_key_by_id(keyid, len, key, pe);
+}
+
+extern "C" int rotation_get_key_by_id(const char *keyid, size_t len, unsigned char *key, void *pe) {
+    invariant(rotationKeyDB);
+    return rotationKeyDB->get_key_by_id(keyid, len, key, pe);
 }
 
 }  // namespace mongo

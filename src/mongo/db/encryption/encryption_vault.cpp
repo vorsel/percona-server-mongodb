@@ -162,4 +162,45 @@ std::string vaultReadKey() {
     return value.String();
 }
 
+void vaultWriteKey(std::string const& key) {
+    CURLGuard guard;
+    guard.initialize();
+
+    CURL *curl = curl_easy_init();
+    if (curl == nullptr) {
+        throw std::runtime_error(str::stream()
+                                 << "Cannot initialize curl session");
+    }
+    Curl_session_guard curl_session_guard(curl);
+
+    char curl_errbuf[CURL_ERROR_SIZE]; //error from CURL
+    CURLcode curl_res = CURLE_OK;
+    str::stream response;
+
+    curl_slist *headers = nullptr;
+    headers = curl_slist_append(headers, std::string(str::stream() << "X-Vault-Token: " << encryptionGlobalParams.vaultToken).c_str());
+    Curl_slist_guard curl_slist_guard(headers);
+
+    curl_res = setup_curl_options(curl);
+    curl_res = curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, curl_errbuf);
+    curl_res = curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_response_callback);
+    curl_res = curl_easy_setopt(curl, CURLOPT_WRITEDATA, static_cast<void*>(&response));
+    std::string urlstr = std::string(str::stream()
+                                << "http://" << encryptionGlobalParams.vaultServerName
+                                << ':'       << encryptionGlobalParams.vaultPort
+                                << "/v1/"    << encryptionGlobalParams.vaultSecret);
+    curl_res = curl_easy_setopt(curl, CURLOPT_URL,
+                                urlstr.c_str());
+    curl_res = curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    std::string postdata = std::string(str::stream()
+                                << "{\"data\": "
+                                << "{\"value\": \"" << key
+                                << "\"}}");
+    curl_res = curl_easy_setopt(curl, CURLOPT_POSTFIELDS,
+                                postdata.c_str());
+    curl_res = curl_easy_perform(curl);
+
+    log() << std::string(response);
+}
+
 }  // namespace mongo

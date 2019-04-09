@@ -44,13 +44,19 @@ namespace mongo {
 class EncryptionKeyDB
 {
 public:
-    EncryptionKeyDB(const std::string& path);
+    EncryptionKeyDB(const std::string& path, const bool rotation = false);
     ~EncryptionKeyDB();
 
     // tries to read master key from specified file
     // then opens WT connection
     // throws exceptions if something goes wrong
     void init();
+
+    // during rotation copies data from provided instance
+    void clone(EncryptionKeyDB *old);
+
+    // write master key to the Vault (during rotation)
+    void store_masterkey();
 
     // returns encryption key from keys DB
     // create key if it does not exists
@@ -78,6 +84,7 @@ private:
     void init_masterkey();
 
     static constexpr int _key_len = 32;
+    const bool _rotation;
     const std::string _path;
     unsigned char _masterkey[_key_len];
     WT_CONNECTION *_conn = nullptr;

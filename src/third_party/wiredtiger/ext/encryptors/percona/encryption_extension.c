@@ -57,6 +57,9 @@ typedef struct {
     int iv_len;
     unsigned char key[KEY_LEN];
     uint32_t (*wiredtiger_checksum_crc32c)(const void *, size_t);
+    void (*store_pseudo_bytes)(uint8_t *buf, int len);
+    int (*get_iv_gcm)(uint8_t *buf, int len);
+    int (*get_key_by_id)(const char *keyid, size_t len, unsigned char *key, void *pe);
 } PERCONA_ENCRYPTOR;
 
 
@@ -186,7 +189,7 @@ static int parse_customization_config(PERCONA_ENCRYPTOR *pe, WT_SESSION *session
     WT_CONFIG_ITEM k, v;
     while (parser->next(parser, &k, &v) == 0) {
         if (!strncmp("keyid", k.str, (int)k.len)) {
-            if (0 != get_key_by_id(v.str, v.len, pe->key, pe)) {
+            if (0 != (pe->get_key_by_id)(v.str, v.len, pe->key, pe)) {
                 ret = report_error(pe, session, EINVAL, "cannot get key by keyid");
                 break;
             }
@@ -198,7 +201,7 @@ static int parse_customization_config(PERCONA_ENCRYPTOR *pe, WT_SESSION *session
 
 static void store_IV(PERCONA_ENCRYPTOR *pe, uint8_t *dst) {
     uint8_t buf[pe->iv_len];
-    store_pseudo_bytes(buf, pe->iv_len);
+    (pe->store_pseudo_bytes)(buf, pe->iv_len);
     //TODO: encrypt pseudo bytes same way as PS does
     memcpy(dst, buf, pe->iv_len);
 }
@@ -307,7 +310,7 @@ static int percona_encrypt_gcm(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
         goto err;
 #endif
 
-    if (0 != get_iv_gcm(dst, pe->iv_len)) {
+    if (0 != (pe->get_iv_gcm)(dst, pe->iv_len)) {
         ret = report_error(pe, session, EINVAL, "failed generating IV for GCM");
         goto cleanup;
     }
@@ -566,6 +569,11 @@ static int init_from_config(PERCONA_ENCRYPTOR *pe, WT_CONFIG_ARG *config)
     if (ret != 0)
         return ret;
 
+    // by default use non-rotation instance
+    pe->store_pseudo_bytes = &store_pseudo_bytes;
+    pe->get_iv_gcm = &get_iv_gcm;
+    pe->get_key_by_id = &get_key_by_id;
+
     WT_CONFIG_ITEM k, v;
     while ((ret = parser->next(parser, &k, &v)) == 0) {
         if (!strncmp("cipher", k.str, (int)k.len)) {
@@ -585,6 +593,11 @@ static int init_from_config(PERCONA_ENCRYPTOR *pe, WT_CONFIG_ARG *config)
             }
             else
                 return (report_error(pe, NULL, EINVAL, "specified cipher mode is not supported"));
+        } else if (!strncmp("rotation", k.str, (int)k.len) && v.type == WT_CONFIG_ITEM_BOOL && v.val != 0) {
+            // use rotation instance when it is explicitly specified
+            pe->store_pseudo_bytes = &rotation_store_pseudo_bytes;
+            pe->get_iv_gcm = &rotation_get_iv_gcm;
+            pe->get_key_by_id = &rotation_get_key_by_id;
         }
     }
     parser->close(parser);
