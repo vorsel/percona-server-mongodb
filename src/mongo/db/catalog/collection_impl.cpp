@@ -44,6 +44,7 @@
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/background.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
+#include "mongo/db/catalog/collection_info_cache_impl.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/catalog/document_validation.h"
@@ -187,7 +188,7 @@ CollectionImpl::CollectionImpl(Collection* _this_init,
       _recordStore(recordStore),
       _dbce(dbce),
       _needCappedLock(supportsDocLocking() && _recordStore->isCapped() && _ns.db() != "local"),
-      _infoCache(_this_init, _ns),
+      _infoCache(std::make_unique<CollectionInfoCacheImpl>(_this_init, _ns)),
       _indexCatalog(std::make_unique<IndexCatalogImpl>(_this_init,
                                                        getCatalogEntry()->getMaxAllowedIndexes())),
       _collator(parseCollation(opCtx, _ns, _details->getCollectionOptions(opCtx).collation)),
@@ -209,7 +210,7 @@ void CollectionImpl::init(OperationContext* opCtx) {
     if (isCapped())
         _recordStore->setCappedCallback(this);
 
-    _infoCache.init(opCtx);
+    _infoCache->init(opCtx);
 }
 
 CollectionImpl::~CollectionImpl() {
@@ -586,14 +587,14 @@ void CollectionImpl::deleteDocument(OperationContext* opCtx,
 
     int64_t keysDeleted;
     _indexCatalog->unindexRecord(opCtx, doc.value(), loc, noWarn, &keysDeleted);
-    if (opDebug) {
-        opDebug->additiveMetrics.incrementKeysDeleted(keysDeleted);
-    }
-
     _recordStore->deleteRecord(opCtx, loc);
 
     getGlobalServiceContext()->getOpObserver()->onDelete(
         opCtx, ns(), uuid(), stmtId, fromMigrate, deletedDoc);
+
+    if (opDebug) {
+        opDebug->additiveMetrics.incrementKeysDeleted(keysDeleted);
+    }
 }
 
 Counter64 moveCounter;
@@ -655,51 +656,20 @@ RecordId CollectionImpl::updateDocument(OperationContext* opCtx,
                                 << " != "
                                 << newDoc.objsize());
 
-    // At the end of this step, we will have a map of UpdateTickets, one per index, which
-    // represent the index updates needed to be done, based on the changes between oldDoc and
-    // newDoc.
-    OwnedPointerMap<IndexDescriptor*, UpdateTicket> updateTickets;
-    if (indexesAffected) {
-        IndexCatalog::IndexIterator ii = _indexCatalog->getIndexIterator(opCtx, true);
-        while (ii.more()) {
-            IndexDescriptor* descriptor = ii.next();
-            IndexCatalogEntry* entry = ii.catalogEntry(descriptor);
-            IndexAccessMethod* iam = ii.accessMethod(descriptor);
-
-            InsertDeleteOptions options;
-            _indexCatalog->prepareInsertDeleteOptions(opCtx, descriptor, &options);
-            UpdateTicket* updateTicket = new UpdateTicket();
-            updateTickets.mutableMap()[descriptor] = updateTicket;
-            uassertStatusOK(iam->validateUpdate(opCtx,
-                                                oldDoc.value(),
-                                                newDoc,
-                                                oldLocation,
-                                                options,
-                                                updateTicket,
-                                                entry->getFilterExpression()));
-        }
-    }
-
     args->preImageDoc = oldDoc.value().getOwned();
 
     Status updateStatus =
         _recordStore->updateRecord(opCtx, oldLocation, newDoc.objdata(), newDoc.objsize());
 
-    // Update each index with each respective UpdateTicket.
     if (indexesAffected) {
-        IndexCatalog::IndexIterator ii = _indexCatalog->getIndexIterator(opCtx, true);
-        while (ii.more()) {
-            IndexDescriptor* descriptor = ii.next();
-            IndexAccessMethod* iam = ii.accessMethod(descriptor);
+        int64_t keysInserted, keysDeleted;
 
-            int64_t keysInserted;
-            int64_t keysDeleted;
-            uassertStatusOK(iam->update(
-                opCtx, *updateTickets.mutableMap()[descriptor], &keysInserted, &keysDeleted));
-            if (opDebug) {
-                opDebug->additiveMetrics.incrementKeysInserted(keysInserted);
-                opDebug->additiveMetrics.incrementKeysDeleted(keysDeleted);
-            }
+        uassertStatusOK(_indexCatalog->updateRecord(
+            opCtx, args->preImageDoc.get(), newDoc, oldLocation, &keysInserted, &keysDeleted));
+
+        if (opDebug) {
+            opDebug->additiveMetrics.incrementKeysInserted(keysInserted);
+            opDebug->additiveMetrics.incrementKeysDeleted(keysDeleted);
         }
     }
 
@@ -764,19 +734,20 @@ uint64_t CollectionImpl::dataSize(OperationContext* opCtx) const {
 uint64_t CollectionImpl::getIndexSize(OperationContext* opCtx, BSONObjBuilder* details, int scale) {
     IndexCatalog* idxCatalog = getIndexCatalog();
 
-    IndexCatalog::IndexIterator ii = idxCatalog->getIndexIterator(opCtx, true);
+    std::unique_ptr<IndexCatalog::IndexIterator> ii = idxCatalog->getIndexIterator(opCtx, true);
 
     uint64_t totalSize = 0;
 
-    while (ii.more()) {
-        IndexDescriptor* d = ii.next();
-        IndexAccessMethod* iam = idxCatalog->getIndex(d);
+    while (ii->more()) {
+        IndexCatalogEntry* entry = ii->next();
+        IndexDescriptor* descriptor = entry->descriptor();
+        IndexAccessMethod* iam = entry->accessMethod();
 
         long long ds = iam->getSpaceUsedBytes(opCtx);
 
         totalSize += ds;
         if (details) {
-            details->appendNumber(d->indexName(), ds / scale);
+            details->appendNumber(descriptor->indexName(), ds / scale);
         }
     }
 
@@ -798,9 +769,10 @@ Status CollectionImpl::truncate(OperationContext* opCtx) {
     // 1) store index specs
     vector<BSONObj> indexSpecs;
     {
-        IndexCatalog::IndexIterator ii = _indexCatalog->getIndexIterator(opCtx, false);
-        while (ii.more()) {
-            const IndexDescriptor* idx = ii.next();
+        std::unique_ptr<IndexCatalog::IndexIterator> ii =
+            _indexCatalog->getIndexIterator(opCtx, false);
+        while (ii->more()) {
+            const IndexDescriptor* idx = ii->next()->descriptor();
             indexSpecs.push_back(idx->infoObj().getOwned());
         }
     }
@@ -1031,14 +1003,16 @@ void _validateIndexes(OperationContext* opCtx,
                       ValidateResultsMap* indexNsResultsMap,
                       ValidateResults* results) {
 
-    IndexCatalog::IndexIterator i = indexCatalog->getIndexIterator(opCtx, false);
+    std::unique_ptr<IndexCatalog::IndexIterator> it = indexCatalog->getIndexIterator(opCtx, false);
 
     // Validate Indexes.
-    while (i.more()) {
+    while (it->more()) {
         opCtx->checkForInterrupt();
-        const IndexDescriptor* descriptor = i.next();
+        IndexCatalogEntry* entry = it->next();
+        IndexDescriptor* descriptor = entry->descriptor();
+        IndexAccessMethod* iam = entry->accessMethod();
+
         log(LogComponent::kIndex) << "validating index " << descriptor->indexNamespace() << endl;
-        IndexAccessMethod* iam = indexCatalog->getIndex(descriptor);
         ValidateResults& curIndexResults = (*indexNsResultsMap)[descriptor->indexNamespace()];
         bool checkCounts = false;
         int64_t numTraversedKeys;
@@ -1095,9 +1069,10 @@ void _validateIndexKeyCount(OperationContext* opCtx,
                             RecordStoreValidateAdaptor* indexValidator,
                             ValidateResultsMap* indexNsResultsMap) {
 
-    IndexCatalog::IndexIterator indexIterator = indexCatalog->getIndexIterator(opCtx, false);
-    while (indexIterator.more()) {
-        IndexDescriptor* descriptor = indexIterator.next();
+    std::unique_ptr<IndexCatalog::IndexIterator> indexIterator =
+        indexCatalog->getIndexIterator(opCtx, false);
+    while (indexIterator->more()) {
+        IndexDescriptor* descriptor = indexIterator->next()->descriptor();
         ValidateResults& curIndexResults = (*indexNsResultsMap)[descriptor->indexNamespace()];
 
         if (curIndexResults.valid) {
@@ -1287,10 +1262,11 @@ Status CollectionImpl::touch(OperationContext* opCtx,
 
     if (touchIndexes) {
         Timer t;
-        IndexCatalog::IndexIterator ii = _indexCatalog->getIndexIterator(opCtx, false);
-        while (ii.more()) {
-            const IndexDescriptor* desc = ii.next();
-            const IndexAccessMethod* iam = _indexCatalog->getIndex(desc);
+        std::unique_ptr<IndexCatalog::IndexIterator> ii =
+            _indexCatalog->getIndexIterator(opCtx, false);
+        while (ii->more()) {
+            IndexCatalogEntry* entry = ii->next();
+            IndexAccessMethod* iam = entry->accessMethod();
             Status status = iam->touch(opCtx);
             if (!status.isOK())
                 return status;
@@ -1314,7 +1290,7 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> CollectionImpl::makePlanExe
 void CollectionImpl::setNs(NamespaceString nss) {
     _ns = std::move(nss);
     _indexCatalog->setNs(_ns);
-    _infoCache.setNs(_ns);
+    _infoCache->setNs(_ns);
     _recordStore->setNs(_ns);
 
     // Until the query layer is prepared for cursors to survive renames, all cursors are killed when
@@ -1326,4 +1302,8 @@ void CollectionImpl::setNs(NamespaceString nss) {
     _cursorManager = std::make_unique<CursorManager>(_ns);
 }
 
+void CollectionImpl::indexBuildSuccess(OperationContext* opCtx, IndexCatalogEntry* index) {
+    _details->indexBuildSuccess(opCtx, index->descriptor()->indexName());
+    _indexCatalog->indexBuildSuccess(opCtx, index);
+}
 }  // namespace mongo

@@ -229,24 +229,28 @@ std::vector<FieldPath> Exchange::extractKeyPaths(const BSONObj& keyPattern) {
     return paths;
 }
 
+void Exchange::unblockLoading(size_t consumerId) {
+    // See if the loading is blocked on this consumer and if so unblock it.
+    if (_loadingThreadId == consumerId) {
+        _loadingThreadId = kInvalidThreadId;
+        _haveBufferSpace.notify_all();
+    }
+}
 DocumentSource::GetNextResult Exchange::getNext(OperationContext* opCtx, size_t consumerId) {
     // Grab a lock.
     stdx::unique_lock<stdx::mutex> lk(_mutex);
 
     for (;;) {
         // Execute only in case we have not encountered an error.
-        uassertStatusOKWithContext(_errorInLoadNextBatch,
-                                   "Exchange failed due to an error on different thread.");
+        if (!_errorInLoadNextBatch.isOK()) {
+            uasserted(ErrorCodes::ExchangePassthrough,
+                      "Exchange failed due to an error on different thread.");
+        }
 
         // Check if we have a document.
         if (!_consumers[consumerId]->isEmpty()) {
             auto doc = _consumers[consumerId]->getNext();
-
-            // See if the loading is blocked on this consumer and if so unblock it.
-            if (_loadingThreadId == consumerId) {
-                _loadingThreadId = kInvalidThreadId;
-                _haveBufferSpace.notify_all();
-            }
+            unblockLoading(consumerId);
 
             return doc;
         }
@@ -397,6 +401,9 @@ void Exchange::dispose(OperationContext* opCtx, size_t consumerId) {
     } else if (_disposeRunDown == getConsumers()) {
         _pipeline->dispose(opCtx);
     }
+
+    _consumers[consumerId]->dispose();
+    unblockLoading(consumerId);
 }
 
 DocumentSource::GetNextResult Exchange::ExchangeBuffer::getNext() {
@@ -413,6 +420,11 @@ DocumentSource::GetNextResult Exchange::ExchangeBuffer::getNext() {
 }
 
 bool Exchange::ExchangeBuffer::appendDocument(DocumentSource::GetNextResult input, size_t limit) {
+    // If the buffer is disposed then we simply ignore any appends.
+    if (_disposed) {
+        return false;
+    }
+
     if (input.isAdvanced()) {
         _bytesInBuffer += input.getDocument().getApproximateSize();
     }

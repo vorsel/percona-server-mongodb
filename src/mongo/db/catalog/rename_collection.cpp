@@ -175,10 +175,10 @@ Status renameCollectionCommon(OperationContext* opCtx,
 
     // Make sure the source collection is not sharded.
     {
-        auto const css = CollectionShardingState::get(opCtx, source);
-        if (css->getMetadata(opCtx)->isSharded()) {
+        auto* const css = CollectionShardingState::get(opCtx, source);
+        const auto metadata = css->getCurrentMetadata();
+        if (metadata->isSharded())
             return {ErrorCodes::IllegalOperation, "source namespace cannot be sharded"};
-        }
     }
 
     // Disallow renaming from a replicated to an unreplicated collection or vice versa.
@@ -220,10 +220,10 @@ Status renameCollectionCommon(OperationContext* opCtx,
         }
 
         {
-            auto const css = CollectionShardingState::get(opCtx, target);
-            if (css->getMetadata(opCtx)->isSharded()) {
+            auto* const css = CollectionShardingState::get(opCtx, target);
+            const auto metadata = css->getCurrentMetadata();
+            if (metadata->isSharded())
                 return {ErrorCodes::IllegalOperation, "cannot rename to a sharded collection"};
-            }
         }
 
         if (!options.dropTarget) {
@@ -306,8 +306,8 @@ Status renameCollectionCommon(OperationContext* opCtx,
                 // Determine which index names are too long. Since we don't have the collection
                 // rename optime at this time, use the maximum optime to check the index names.
                 auto longDpns = target.makeDropPendingNamespace(repl::OpTime::max());
-                while (indexIter.more()) {
-                    auto index = indexIter.next();
+                while (indexIter->more()) {
+                    auto index = indexIter->next()->descriptor();
                     auto status = longDpns.checkLengthForRename(index->indexName().size());
                     if (!status.isOK()) {
                         indexesToDrop.push_back(index);
@@ -435,10 +435,10 @@ Status renameCollectionCommon(OperationContext* opCtx,
         indexer.allowInterruption();
 
         std::vector<BSONObj> indexesToCopy;
-        IndexCatalog::IndexIterator sourceIndIt =
+        std::unique_ptr<IndexCatalog::IndexIterator> sourceIndIt =
             sourceColl->getIndexCatalog()->getIndexIterator(opCtx, true);
-        while (sourceIndIt.more()) {
-            auto descriptor = sourceIndIt.next();
+        while (sourceIndIt->more()) {
+            auto descriptor = sourceIndIt->next()->descriptor();
             if (descriptor->isIdIndex()) {
                 continue;
             }
@@ -462,19 +462,26 @@ Status renameCollectionCommon(OperationContext* opCtx,
             return status;
         }
 
-        status = indexer.doneInserting();
+        status = indexer.dumpInsertsFromBulk();
         if (!status.isOK()) {
             return status;
         }
 
-        writeConflictRetry(opCtx, "renameCollection", tmpName.ns(), [&] {
+        status = writeConflictRetry(opCtx, "renameCollection", tmpName.ns(), [&] {
             WriteUnitOfWork wunit(opCtx);
-            indexer.commit([opCtx, &tmpName, tmpColl](const BSONObj& spec) {
+            auto status = indexer.commit([opCtx, &tmpName, tmpColl](const BSONObj& spec) {
                 opCtx->getServiceContext()->getOpObserver()->onCreateIndex(
                     opCtx, tmpName, *(tmpColl->uuid()), spec, false);
             });
+            if (!status.isOK()) {
+                return status;
+            }
             wunit.commit();
+            return Status::OK();
         });
+        if (!status.isOK()) {
+            return status;
+        }
     }
 
     {

@@ -50,6 +50,7 @@ namespace mongo {
 class BSONObjBuilder;
 class MatchExpression;
 class UpdateTicket;
+struct InsertResult;
 struct InsertDeleteOptions;
 
 bool failIndexKeyTooLongParam();
@@ -78,8 +79,11 @@ public:
     /**
      * Internally generate the keys {k1, ..., kn} for 'obj'.  For each key k, insert (k ->
      * 'loc') into the index.  'obj' is the object at the location 'loc'.
-     * 'numInserted' will be set to the number of keys added to the index for the document.  If
-     * there is more than one key for 'obj', either all keys will be inserted or none will.
+     * If 'result' is not null, 'numInserted' will be set to the number of keys added to the index
+     * for the document and the number of duplicate keys will be appended to 'dupsInserted' if this
+     * is a unique index and duplicates are allowed.
+     *
+     * If there is more than one key for 'obj', either all keys will be inserted or none will.
      *
      * The behavior of the insertion can be specified through 'options'.
      */
@@ -87,7 +91,15 @@ public:
                           const BSONObj& obj,
                           const RecordId& loc,
                           const InsertDeleteOptions& options,
-                          int64_t* numInserted) = 0;
+                          InsertResult* result) = 0;
+
+    virtual Status insertKeys(OperationContext* opCtx,
+                              const BSONObjSet& keys,
+                              const BSONObjSet& multikeyMetadataKeys,
+                              const MultikeyPaths& multikeyPaths,
+                              const RecordId& loc,
+                              const InsertDeleteOptions& options,
+                              InsertResult* result) = 0;
 
     /**
      * Analogous to above, but remove the records instead of inserting them.
@@ -98,6 +110,12 @@ public:
                           const RecordId& loc,
                           const InsertDeleteOptions& options,
                           int64_t* numDeleted) = 0;
+
+    virtual Status removeKeys(OperationContext* opCtx,
+                              const BSONObjSet& keys,
+                              const RecordId& loc,
+                              const InsertDeleteOptions& options,
+                              int64_t* numDeleted) = 0;
 
     /**
      * Checks whether the index entries for the document 'from', which is placed at location
@@ -251,17 +269,27 @@ public:
     /**
      * Call this when you are ready to finish your bulk work.
      * Pass in the BulkBuilder returned from initiateBulk.
-     * @param bulk - something created from initiateBulk
-     * @param mayInterrupt - is this commit interruptible (will cancel)
-     * @param dupsAllowed - if false, error or fill 'dups' if any duplicate values are found
-     * @param dups - if NULL, error out on dups if not allowed
-     *               if not NULL, put the bad RecordIds there
+     * @param bulk - Something created from initiateBulk
+     * @param mayInterrupt - Is this commit interruptible (will cancel)
+     * @param dupsAllowed - If false and 'dupRecords' is not null, append with the RecordIds of
+     *                      the uninserted duplicates.
+     *                      If true and 'dupKeys' is not null, append with the keys of the inserted
+     *                      duplicates.
+     * @param dupRecords - If not null, is filled with the RecordIds of uninserted duplicate keys.
+     *                     If null, duplicate keys will return errors.
+     * @param dupKeys - If not null and 'dupsAllowed' is true, is filled with the keys of inserted
+     *                  duplicates.
+     *                  If null, duplicates are inserted but not recorded.
+     *
+     * It is invalid and contradictory to pass both 'dupRecords' and 'dupKeys'.
      */
+
     virtual Status commitBulk(OperationContext* opCtx,
                               BulkBuilder* bulk,
                               bool mayInterrupt,
                               bool dupsAllowed,
-                              std::set<RecordId>* dups) = 0;
+                              std::set<RecordId>* dupRecords,
+                              std::vector<BSONObj>* dupKeys) = 0;
 
     /**
      * Specifies whether getKeys should relax the index constraints or not, in order of most
@@ -331,10 +359,19 @@ public:
     }
 
     /**
-     * For test use only. Provides direct access to the SortedDataInterface, allowing tests to write
-     * invalid entries that would otherwise not be possible via IndexAccessMethod.
+     * Provides direct access to the SortedDataInterface. This should not be used to insert
+     * documents into an index, except for testing purposes.
      */
-    virtual SortedDataInterface* getSortedDataInterface_forTest() const = 0;
+    virtual SortedDataInterface* getSortedDataInterface() const = 0;
+};
+
+/**
+ * Records number of keys inserted and duplicate keys inserted, if applicable.
+ */
+struct InsertResult {
+public:
+    std::int64_t numInserted{0};
+    std::vector<BSONObj> dupsInserted;
 };
 
 /**
@@ -380,6 +417,10 @@ struct InsertDeleteOptions {
     // Are duplicate keys allowed in the index?
     bool dupsAllowed = false;
 
+    // Only an index builder is allowed to insert into the index while it is building, so only the
+    // index builder should set this to 'true'.
+    bool fromIndexBuilder = false;
+
     // Should we relax the index constraints?
     IndexAccessMethod::GetKeysMode getKeysMode =
         IndexAccessMethod::GetKeysMode::kEnforceConstraints;
@@ -414,13 +455,27 @@ public:
                   const BSONObj& obj,
                   const RecordId& loc,
                   const InsertDeleteOptions& options,
-                  int64_t* numInserted) final;
+                  InsertResult* result) final;
+
+    Status insertKeys(OperationContext* opCtx,
+                      const BSONObjSet& keys,
+                      const BSONObjSet& multikeyMetadataKeys,
+                      const MultikeyPaths& multikeyPaths,
+                      const RecordId& loc,
+                      const InsertDeleteOptions& options,
+                      InsertResult* result) final;
 
     Status remove(OperationContext* opCtx,
                   const BSONObj& obj,
                   const RecordId& loc,
                   const InsertDeleteOptions& options,
                   int64_t* numDeleted) final;
+
+    Status removeKeys(OperationContext* opCtx,
+                      const BSONObjSet& keys,
+                      const RecordId& loc,
+                      const InsertDeleteOptions& options,
+                      int64_t* numDeleted) final;
 
     Status validateUpdate(OperationContext* opCtx,
                           const BSONObj& from,
@@ -465,7 +520,8 @@ public:
                       BulkBuilder* bulk,
                       bool mayInterrupt,
                       bool dupsAllowed,
-                      std::set<RecordId>* dups) final;
+                      std::set<RecordId>* dupRecords,
+                      std::vector<BSONObj>* dupKeys) final;
 
     void getKeys(const BSONObj& obj,
                  GetKeysMode mode,
@@ -477,7 +533,7 @@ public:
                                    const BSONObjSet& multikeyMetadataKeys,
                                    const MultikeyPaths& multikeyPaths) const override;
 
-    SortedDataInterface* getSortedDataInterface_forTest() const final;
+    SortedDataInterface* getSortedDataInterface() const override final;
 
 protected:
     /**

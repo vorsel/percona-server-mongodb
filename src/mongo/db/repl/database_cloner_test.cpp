@@ -104,10 +104,9 @@ void DatabaseClonerTest::setUp() {
                                           storageInterface.get(),
                                           makeCollectionWorkClosure(),
                                           makeSetStatusClosure());
-    _databaseCloner->setScheduleDbWorkFn_forTest(
-        [this](const executor::TaskExecutor::CallbackFn& work) {
-            return getExecutor().scheduleWork(work);
-        });
+    _databaseCloner->setScheduleDbWorkFn_forTest([this](executor::TaskExecutor::CallbackFn work) {
+        return getExecutor().scheduleWork(std::move(work));
+    });
 
     _mockServer = stdx::make_unique<MockRemoteDBServer>(target.toString());
     _mockServer->assignCollectionUuid("db.a", *_options1.uuid);
@@ -542,7 +541,7 @@ TEST_F(DatabaseClonerTest, CollectionInfoNameDuplicate) {
                                                              << _options2.toBSON()))));
     }
 
-    ASSERT_EQUALS(ErrorCodes::DuplicateKey, getStatus().code());
+    ASSERT_EQUALS(51005, getStatus().code());
     ASSERT_STRING_CONTAINS(getStatus().reason(), "duplicate collection name 'a'");
     ASSERT_FALSE(_databaseCloner->isActive());
     ASSERT_EQUALS(DatabaseCloner::State::kComplete, _databaseCloner->getState_forTest());

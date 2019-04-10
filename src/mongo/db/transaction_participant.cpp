@@ -51,6 +51,7 @@
 #include "mongo/db/ops/update.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/retryable_writes_stats.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/server_transactions_metrics.h"
@@ -92,6 +93,8 @@ namespace {
 MONGO_FAIL_POINT_DEFINE(hangAfterPreallocateSnapshot);
 
 MONGO_FAIL_POINT_DEFINE(hangAfterReservingPrepareTimestamp);
+
+MONGO_FAIL_POINT_DEFINE(hangAfterSettingPrepareStartTime);
 
 const auto getTransactionParticipant = Session::declareDecoration<TransactionParticipant>();
 
@@ -322,7 +325,12 @@ void TransactionParticipant::_continueMultiDocumentTransaction(WithLock wl, TxnN
     if (_txnState.isInProgress(wl) && !_txnResourceStash) {
         // This indicates that the first command in the transaction failed but did not implicitly
         // abort the transaction. It is not safe to continue the transaction, in particular because
-        // we have not saved the readConcern from the first statement of the transaction.
+        // we have not saved the readConcern from the first statement of the transaction. Mark the
+        // transaction as active here, since _abortTransactionOnSession() will assume we are
+        // aborting an active transaction since there are no stashed resources.
+        _transactionMetricsObserver.onUnstash(
+            ServerTransactionsMetrics::get(getGlobalServiceContext()),
+            getGlobalServiceContext()->getTickSource());
         _abortTransactionOnSession(wl);
 
         uasserted(ErrorCodes::NoSuchTransaction,
@@ -438,9 +446,8 @@ void TransactionParticipant::beginOrContinueTransactionUnconditionally(TxnNumber
     }
 }
 
-void TransactionParticipant::setSpeculativeTransactionOpTime(
-    OperationContext* opCtx, SpeculativeTransactionOpTime opTimeChoice) {
-    stdx::lock_guard<stdx::mutex> lg(_mutex);
+void TransactionParticipant::_setSpeculativeTransactionOpTime(
+    WithLock, OperationContext* opCtx, SpeculativeTransactionOpTime opTimeChoice) {
     repl::ReplicationCoordinator* replCoord =
         repl::ReplicationCoordinator::get(opCtx->getClient()->getServiceContext());
     opCtx->recoveryUnit()->setTimestampReadSource(
@@ -448,13 +455,12 @@ void TransactionParticipant::setSpeculativeTransactionOpTime(
             ? RecoveryUnit::ReadSource::kAllCommittedSnapshot
             : RecoveryUnit::ReadSource::kLastAppliedSnapshot);
     opCtx->recoveryUnit()->preallocateSnapshot();
-    auto readTimestamp = opCtx->recoveryUnit()->getPointInTimeReadTimestamp();
-    invariant(readTimestamp);
+    auto readTimestamp = repl::StorageInterface::get(opCtx)->getPointInTimeReadTimestamp(opCtx);
     // Transactions do not survive term changes, so combining "getTerm" here with the
     // recovery unit timestamp does not cause races.
-    _speculativeTransactionReadOpTime = {*readTimestamp, replCoord->getTerm()};
+    _speculativeTransactionReadOpTime = {readTimestamp, replCoord->getTerm()};
     stdx::lock_guard<stdx::mutex> lm(_metricsMutex);
-    _transactionMetricsObserver.onChooseReadTimestamp(*readTimestamp);
+    _transactionMetricsObserver.onChooseReadTimestamp(readTimestamp);
 }
 
 TransactionParticipant::OplogSlotReserver::OplogSlotReserver(OperationContext* opCtx) {
@@ -523,6 +529,12 @@ TransactionParticipant::TxnResources::TxnResources(OperationContext* opCtx, bool
     }
     _locker->unsetThreadId();
 
+    // On secondaries, we yield the locks for transactions.
+    if (!opCtx->writesAreReplicated()) {
+        _lockSnapshot = std::make_unique<Locker::LockSnapshot>();
+        _locker->releaseWriteUnitOfWork(_lockSnapshot.get());
+    }
+
     // This thread must still respect the transaction lock timeout, since it can prevent the
     // transaction from making progress.
     auto maxTransactionLockMillis = maxTransactionLockRequestTimeoutMillis.load();
@@ -547,25 +559,35 @@ TransactionParticipant::TxnResources::~TxnResources() {
         // when starting a new transaction before completing an old one.  So we should
         // be at WUOW nesting level 1 (only the top level WriteUnitOfWork).
         _recoveryUnit->abortUnitOfWork();
-        _locker->endWriteUnitOfWork();
+        // If locks are not yielded, release them.
+        if (!_lockSnapshot) {
+            _locker->endWriteUnitOfWork();
+        }
         invariant(!_locker->inAWriteUnitOfWork());
     }
 }
 
 void TransactionParticipant::TxnResources::release(OperationContext* opCtx) {
     // Perform operations that can fail the release before marking the TxnResources as released.
+
+    // Restore locks if they are yielded.
+    if (_lockSnapshot) {
+        invariant(!_locker->isLocked());
+        // opCtx is passed in to enable the restoration to be interrupted.
+        _locker->restoreWriteUnitOfWork(opCtx, *_lockSnapshot);
+        _lockSnapshot.reset(nullptr);
+    }
     _locker->reacquireTicket(opCtx);
 
     invariant(!_released);
     _released = true;
 
-    // We intentionally do not capture the return value of swapLockState(), which is just an empty
-    // locker. At the end of the operation, if the transaction is not complete, we will stash the
-    // operation context's locker and replace it with a new empty locker.
-
     // It is necessary to lock the client to change the Locker on the OperationContext.
     stdx::lock_guard<Client> lk(*opCtx->getClient());
     invariant(opCtx->lockState()->getClientState() == Locker::ClientState::kInactive);
+    // We intentionally do not capture the return value of swapLockState(), which is just an empty
+    // locker. At the end of the operation, if the transaction is not complete, we will stash the
+    // operation context's locker and replace it with a new empty locker.
     opCtx->swapLockState(std::move(_locker));
     opCtx->lockState()->updateThreadIdToCurrentThread();
 
@@ -680,6 +702,26 @@ void TransactionParticipant::unstashTransactionResources(OperationContext* opCtx
             return;
         }
 
+        // Set speculative execution.
+        const auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
+        const bool speculative =
+            readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern &&
+            !readConcernArgs.getArgsAtClusterTime();
+        // Only set speculative on primary.
+        if (opCtx->writesAreReplicated() && speculative) {
+            _setSpeculativeTransactionOpTime(lg,
+                                             opCtx,
+                                             readConcernArgs.getOriginalLevel() ==
+                                                     repl::ReadConcernLevel::kSnapshotReadConcern
+                                                 ? SpeculativeTransactionOpTime::kAllCommitted
+                                                 : SpeculativeTransactionOpTime::kLastApplied);
+        }
+
+        // All locks of transactions must be acquired inside the global WUOW so that we can
+        // yield and restore all locks on state transition. Otherwise, we'd have to remember
+        // which locks are managed by WUOW.
+        invariant(!opCtx->lockState()->isLocked());
+
         // Stashed transaction resources do not exist for this in-progress multi-document
         // transaction. Set up the transaction resources on the opCtx.
         opCtx->setWriteUnitOfWork(std::make_unique<WriteUnitOfWork>(opCtx));
@@ -695,10 +737,6 @@ void TransactionParticipant::unstashTransactionResources(OperationContext* opCtx
 
         // On secondaries, max lock timeout must not be set.
         invariant(opCtx->writesAreReplicated() || !opCtx->lockState()->hasMaxLockTimeout());
-
-        stdx::lock_guard<stdx::mutex> lm(_metricsMutex);
-        _transactionMetricsObserver.onUnstash(ServerTransactionsMetrics::get(opCtx),
-                                              opCtx->getServiceContext()->getTickSource());
     }
 
     // Storage engine transactions may be started in a lazy manner. By explicitly
@@ -717,6 +755,13 @@ void TransactionParticipant::unstashTransactionResources(OperationContext* opCtx
     if (MONGO_FAIL_POINT(hangAfterPreallocateSnapshot)) {
         CurOpFailpointHelpers::waitWhileFailPointEnabled(
             &hangAfterPreallocateSnapshot, opCtx, "hangAfterPreallocateSnapshot");
+    }
+
+    {
+        stdx::lock_guard<stdx::mutex> lg(_mutex);
+        stdx::lock_guard<stdx::mutex> lm(_metricsMutex);
+        _transactionMetricsObserver.onUnstash(ServerTransactionsMetrics::get(opCtx),
+                                              opCtx->getServiceContext()->getTickSource());
     }
 }
 
@@ -804,6 +849,12 @@ Timestamp TransactionParticipant::prepareTransaction(OperationContext* opCtx,
         _transactionMetricsObserver.onPrepare(ServerTransactionsMetrics::get(opCtx),
                                               *_oldestOplogEntryOpTime,
                                               tickSource->getTicks());
+    }
+
+    if (MONGO_FAIL_POINT(hangAfterSettingPrepareStartTime)) {
+        log() << "transaction - hangAfterSettingPrepareStartTime fail point enabled. Blocking "
+                 "until fail point is disabled.";
+        MONGO_FAIL_POINT_PAUSE_WHILE_SET(hangAfterSettingPrepareStartTime);
     }
 
     return prepareOplogSlot.opTime.getTimestamp();
@@ -903,8 +954,8 @@ void TransactionParticipant::commitPreparedTransaction(OperationContext* opCtx,
     uassert(
         ErrorCodes::InvalidOptions, "'commitTimestamp' cannot be null", !commitTimestamp.isNull());
     uassert(ErrorCodes::InvalidOptions,
-            "'commitTimestamp' must be greater than or equal to 'prepareTimestamp'",
-            commitTimestamp >= _prepareOpTime.getTimestamp());
+            "'commitTimestamp' must be greater than the 'prepareTimestamp'",
+            commitTimestamp > _prepareOpTime.getTimestamp());
 
     _txnState.transitionTo(lk, TransactionState::kCommittingWithPrepare);
     opCtx->recoveryUnit()->setCommitTimestamp(commitTimestamp);
@@ -1285,7 +1336,7 @@ void TransactionParticipant::reportStashedState(BSONObjBuilder* builder) const {
     }
 }
 
-void TransactionParticipant::reportUnstashedState(repl::ReadConcernArgs readConcernArgs,
+void TransactionParticipant::reportUnstashedState(OperationContext* opCtx,
                                                   BSONObjBuilder* builder) const {
     stdx::lock_guard<stdx::mutex> lm(_metricsMutex);
 
@@ -1298,7 +1349,7 @@ void TransactionParticipant::reportUnstashedState(repl::ReadConcernArgs readConc
     if (!singleTransactionStats.isForMultiDocumentTransaction() ||
         singleTransactionStats.isActive() || singleTransactionStats.isEnded()) {
         BSONObjBuilder transactionBuilder;
-        _reportTransactionStats(lm, &transactionBuilder, readConcernArgs);
+        _reportTransactionStats(lm, &transactionBuilder, repl::ReadConcernArgs::get(opCtx));
         builder->append("transaction", transactionBuilder.obj());
     }
 }
@@ -1412,8 +1463,7 @@ void TransactionParticipant::_reportTransactionStats(WithLock wl,
 std::string TransactionParticipant::_transactionInfoForLog(
     const SingleThreadedLockStats* lockStats,
     TransactionState::StateFlag terminationCause,
-    repl::ReadConcernArgs readConcernArgs,
-    bool wasPrepared) {
+    repl::ReadConcernArgs readConcernArgs) {
     invariant(lockStats);
     invariant(terminationCause == TransactionState::kCommitted ||
               terminationCause == TransactionState::kAborted);
@@ -1466,11 +1516,14 @@ std::string TransactionParticipant::_transactionInfoForLog(
     s << " "
       << duration_cast<Milliseconds>(singleTransactionStats.getDuration(tickSource, curTick));
 
-    s << " wasPrepared:" << wasPrepared;
-    if (wasPrepared) {
-        s << " totalPreparedDurationMicros:"
-          << durationCount<Microseconds>(
-                 singleTransactionStats.getPreparedDuration(tickSource, curTick));
+    // It is possible for a slow transaction to have aborted in the prepared state if an
+    // exception was thrown before prepareTransaction succeeds.
+    const auto totalPreparedDuration = durationCount<Microseconds>(
+        singleTransactionStats.getPreparedDuration(tickSource, curTick));
+    const bool txnWasPrepared = totalPreparedDuration > 0;
+    s << " wasPrepared:" << txnWasPrepared;
+    if (txnWasPrepared) {
+        s << " totalPreparedDurationMicros:" << totalPreparedDuration;
     }
 
     return s.str();
@@ -1486,10 +1539,9 @@ void TransactionParticipant::_logSlowTransaction(WithLock wl,
         // Log the transaction if its duration is longer than the slowMS command threshold.
         if (_transactionMetricsObserver.getSingleTransactionStats().getDuration(
                 tickSource, tickSource->getTicks()) > Milliseconds(serverGlobalParams.slowMS)) {
-            bool wasPrepared = !_prepareOpTime.isNull();
             log(logger::LogComponent::kTransaction)
-                << "transaction " << _transactionInfoForLog(
-                                         lockStats, terminationCause, readConcernArgs, wasPrepared);
+                << "transaction "
+                << _transactionInfoForLog(lockStats, terminationCause, readConcernArgs);
         }
     }
 }

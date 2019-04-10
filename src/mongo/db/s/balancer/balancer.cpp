@@ -45,6 +45,7 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/s/balancer/balancer_chunk_selection_policy_impl.h"
 #include "mongo/db/s/balancer/cluster_statistics_impl.h"
+#include "mongo/db/s/sharding_logging.h"
 #include "mongo/s/balancer_configuration.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog_cache.h"
@@ -359,8 +360,10 @@ void Balancer::_mainThread() {
                        << ", secondaryThrottle: "
                        << balancerConfig->getSecondaryThrottle().toBSON();
 
-                OCCASIONALLY warnOnMultiVersion(
-                    uassertStatusOK(_clusterStats->getStats(opCtx.get())));
+                static Occasionally sampler;
+                if (sampler.tick()) {
+                    warnOnMultiVersion(uassertStatusOK(_clusterStats->getStats(opCtx.get())));
+                }
 
                 Status status = _enforceTagRanges(opCtx.get());
                 if (!status.isOK()) {
@@ -381,7 +384,7 @@ void Balancer::_mainThread() {
                     roundDetails.setSucceeded(static_cast<int>(candidateChunks.size()),
                                               _balancedLastTime);
 
-                    shardingContext->catalogClient()
+                    ShardingLogging::get(opCtx.get())
                         ->logAction(opCtx.get(), "balancer.round", "", roundDetails.toBSON())
                         .transitional_ignore();
                 }
@@ -401,7 +404,7 @@ void Balancer::_mainThread() {
             // This round failed, tell the world!
             roundDetails.setFailed(e.what());
 
-            shardingContext->catalogClient()
+            ShardingLogging::get(opCtx.get())
                 ->logAction(opCtx.get(), "balancer.round", "", roundDetails.toBSON())
                 .transitional_ignore();
 

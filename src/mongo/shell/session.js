@@ -88,6 +88,17 @@ var {
     const kWireVersionSupportingRetryableWrites = 6;
     const kWireVersionSupportingMultiDocumentTransactions = 7;
 
+    function processCommandResponse(driverSession, client, res) {
+        if (res.hasOwnProperty("operationTime")) {
+            driverSession.advanceOperationTime(res.operationTime);
+        }
+
+        if (res.hasOwnProperty("$clusterTime")) {
+            driverSession.advanceClusterTime(res.$clusterTime);
+            client.advanceClusterTime(res.$clusterTime);
+        }
+    }
+
     function SessionAwareClient(client) {
         this.getReadPreference = function getReadPreference(driverSession) {
             const sessionOptions = driverSession.getOptions();
@@ -290,17 +301,6 @@ var {
             return cmdObj;
         }
 
-        function processCommandResponse(driverSession, res) {
-            if (res.hasOwnProperty("operationTime")) {
-                driverSession.advanceOperationTime(res.operationTime);
-            }
-
-            if (res.hasOwnProperty("$clusterTime")) {
-                driverSession.advanceClusterTime(res.$clusterTime);
-                client.advanceClusterTime(res.$clusterTime);
-            }
-        }
-
         /**
          * Returns true if the error code is retryable, assuming the command is idempotent.
          *
@@ -442,7 +442,7 @@ var {
             const res = runClientFunctionWithRetries(
                 driverSession, cmdObj, client.runCommand, [dbName, cmdObj, options]);
 
-            processCommandResponse(driverSession, res);
+            processCommandResponse(driverSession, client, res);
             return res;
         };
 
@@ -453,7 +453,7 @@ var {
             const res = runClientFunctionWithRetries(
                 driverSession, cmdObj, client.runCommandWithMetadata, [dbName, metadata, cmdObj]);
 
-            processCommandResponse(driverSession, res);
+            processCommandResponse(driverSession, client, res);
             return res;
         };
     }
@@ -591,6 +591,10 @@ var {
             if (cmdName === "query" || cmdName === "$query") {
                 cmdObj = cmdObj[cmdName];
                 cmdName = Object.keys(cmdObj)[0];
+            }
+
+            if (cmdObj.hasOwnProperty("autocommit")) {
+                return false;
             }
 
             if (isNonNullObject(cmdObj.writeConcern)) {
@@ -741,7 +745,7 @@ var {
         };
 
         this.startTransaction = function startTransaction(txnOptsObj, ignoreActiveTxn) {
-            // If the session is already in a transaction, raise an error. If retryNewTxnNum
+            // If the session is already in a transaction, raise an error. If ignoreActiveTxn
             // is true, don't raise an error. This is to allow multiple threads to try to
             // use the same session in a concurrency workload.
             if (this.isTxnActive() && !ignoreActiveTxn) {
@@ -966,6 +970,11 @@ var {
 
             this.abortTransaction_forTesting = function abortTransaction_forTesting() {
                 return this._serverSession.abortTransaction(this);
+            };
+
+            this.processCommandResponse_forTesting = function processCommandResponse_forTesting(
+                res) {
+                processCommandResponse(this, client, res);
             };
         };
 

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -192,9 +191,9 @@ auto makeTaskExecutor(ServiceContext* service, const std::string& poolName) {
  * Schedules a task using the executor. This task is always run unless the task executor is shutting
  * down.
  */
-void scheduleWork(executor::TaskExecutor* executor,
-                  const executor::TaskExecutor::CallbackFn& work) {
-    auto cbh = executor->scheduleWork([work](const executor::TaskExecutor::CallbackArgs& args) {
+void scheduleWork(executor::TaskExecutor* executor, executor::TaskExecutor::CallbackFn work) {
+    auto cbh = executor->scheduleWork([work = std::move(work)](
+        const executor::TaskExecutor::CallbackArgs& args) {
         if (args.status == ErrorCodes::CallbackCanceled) {
             return;
         }
@@ -480,7 +479,7 @@ void ReplicationCoordinatorExternalStateImpl::onDrainComplete(OperationContext* 
 }
 
 OpTime ReplicationCoordinatorExternalStateImpl::onTransitionToPrimary(OperationContext* opCtx) {
-    invariant(opCtx->lockState()->isW());
+    invariant(opCtx->lockState()->isRSTLExclusive());
 
     // Clear the appliedThrough marker so on startup we'll use the top of the oplog. This must be
     // done before we add anything to our oplog.
@@ -494,6 +493,9 @@ OpTime ReplicationCoordinatorExternalStateImpl::onTransitionToPrimary(OperationC
         opCtx, lastAppliedOpTime.getTimestamp());
 
     writeConflictRetry(opCtx, "logging transition to primary to oplog", "local.oplog.rs", [&] {
+        // Writes to the oplog only require a Global intent lock.
+        Lock::GlobalLock globalLock(opCtx, MODE_IX);
+
         WriteUnitOfWork wuow(opCtx);
         opCtx->getClient()->getServiceContext()->getOpObserver()->onOpMessage(
             opCtx,
@@ -811,6 +813,10 @@ void ReplicationCoordinatorExternalStateImpl::startProducerIfStopped() {
 }
 
 void ReplicationCoordinatorExternalStateImpl::_dropAllTempCollections(OperationContext* opCtx) {
+    // Acquire the GlobalLock in mode IS to conflict with database drops which acquire the
+    // GlobalLock in mode X.
+    Lock::GlobalLock lk(opCtx, MODE_IS);
+
     std::vector<std::string> dbNames;
     StorageEngine* storageEngine = _service->getStorageEngine();
     storageEngine->listDatabases(&dbNames);
@@ -821,12 +827,9 @@ void ReplicationCoordinatorExternalStateImpl::_dropAllTempCollections(OperationC
         if (*it == "local")
             continue;
         LOG(2) << "Removing temporary collections from " << *it;
-        Database* db = DatabaseHolder::getDatabaseHolder().get(opCtx, *it);
-        // Since we must be holding the global lock during this function, if listDatabases
-        // returned this dbname, we should be able to get a reference to it - it can't have
-        // been dropped.
-        invariant(db, str::stream() << "Unable to get reference to database " << *it);
-        db->clearTmpCollections(opCtx);
+        AutoGetDb autoDb(opCtx, *it, MODE_X);
+        invariant(autoDb.getDb(), str::stream() << "Unable to get reference to database " << *it);
+        autoDb.getDb()->clearTmpCollections(opCtx);
     }
 }
 

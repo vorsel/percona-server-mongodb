@@ -61,38 +61,42 @@ Status KVEngine::createRecordStore(OperationContext* opCtx,
     return Status::OK();
 }
 
-std::unique_ptr<::mongo::RecordStore> KVEngine::getRecordStore(OperationContext* opCtx,
-                                                               StringData ns,
-                                                               StringData ident,
-                                                               const CollectionOptions& options) {
-    std::unique_ptr<::mongo::RecordStore> recordStore;
+std::unique_ptr<mongo::RecordStore> KVEngine::makeTemporaryRecordStore(OperationContext* opCtx,
+                                                                       StringData ident) {
+    std::unique_ptr<mongo::RecordStore> recordStore =
+        std::make_unique<RecordStore>("", ident, false);
+    _idents[ident.toString()] = true;
+    return recordStore;
+};
+
+
+std::unique_ptr<mongo::RecordStore> KVEngine::getRecordStore(OperationContext* opCtx,
+                                                             StringData ns,
+                                                             StringData ident,
+                                                             const CollectionOptions& options) {
+    std::unique_ptr<mongo::RecordStore> recordStore;
     if (options.capped) {
-        recordStore = stdx::make_unique<RecordStore>(
+        recordStore = std::make_unique<RecordStore>(
             ns,
             ident,
             true,
             options.cappedSize ? options.cappedSize : kDefaultCappedSizeBytes,
             options.cappedMaxDocs ? options.cappedMaxDocs : -1);
     } else {
-        recordStore = stdx::make_unique<RecordStore>(ns, ident, false);
+        recordStore = std::make_unique<RecordStore>(ns, ident, false);
     }
     _idents[ident.toString()] = true;
     return recordStore;
 }
 
-std::shared_ptr<StringStore> KVEngine::getMaster() const {
+bool KVEngine::trySwapMaster(StringStore& newMaster, uint64_t version) {
     stdx::lock_guard<stdx::mutex> lock(_masterLock);
-    return _master;
-}
-
-bool KVEngine::compareAndSwapMaster(std::shared_ptr<StringStore> compareAgainst,
-                                    std::unique_ptr<StringStore>& newMaster) {
-    stdx::lock_guard<stdx::mutex> lock(_masterLock);
-    if (compareAgainst->sameRoot(*_master)) {
-        _master.reset(newMaster.release());
-        return true;
-    }
-    return false;
+    invariant(!newMaster.hasBranch() && !_master.hasBranch());
+    if (_masterVersion != version)
+        return false;
+    _master = newMaster;
+    _masterVersion++;
+    return true;
 }
 
 
@@ -107,7 +111,7 @@ mongo::SortedDataInterface* KVEngine::getSortedDataInterface(OperationContext* o
                                                              StringData ident,
                                                              const IndexDescriptor* desc) {
     _idents[ident.toString()] = false;
-    return new SortedDataInterface(Ordering::make(desc->keyPattern()), desc->unique(), ident);
+    return new SortedDataInterface(opCtx, ident, desc);
 }
 
 Status KVEngine::dropIdent(OperationContext* opCtx, StringData ident) {
@@ -118,7 +122,9 @@ Status KVEngine::dropIdent(OperationContext* opCtx, StringData ident) {
         if (_idents[ident.toString()] == true) {  // ident is RecordStore.
             CollectionOptions s;
             auto rs = getRecordStore(opCtx, ""_sd, ident, s);
-            dropStatus = rs->truncate(opCtx);
+            dropStatus = checked_cast<RecordStore*>(rs.get())
+                             ->truncateWithoutUpdatingCount(opCtx)
+                             .getStatus();
         } else {  // ident is SortedDataInterface.
             auto sdi =
                 std::make_unique<SortedDataInterface>(Ordering::make(BSONObj()), true, ident);

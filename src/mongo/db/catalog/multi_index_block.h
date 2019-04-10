@@ -37,6 +37,7 @@
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/record_id.h"
@@ -122,13 +123,16 @@ public:
     virtual Status insertAllDocumentsInCollection() = 0;
 
     /**
-     * Call this after init() for each document in the collection.
+     * Call this after init() for each document in the collection. Any duplicate keys inserted will
+     * be appended to 'dupKeysInserted' if it is not null.
      *
      * Do not call if you called insertAllDocumentsInCollection();
      *
      * Should be called inside of a WriteUnitOfWork.
      */
-    virtual Status insert(const BSONObj& wholeDocument, const RecordId& loc) = 0;
+    virtual Status insert(const BSONObj& wholeDocument,
+                          const RecordId& loc,
+                          std::vector<BSONObj>* const dupKeysInserted = nullptr) = 0;
 
     /**
      * Call this after the last insert(). This gives the index builder a chance to do any
@@ -136,14 +140,31 @@ public:
      *
      * Do not call if you called insertAllDocumentsInCollection();
      *
-     * If dupsOut is passed as non-NULL, violators of uniqueness constraints will be added to
-     * the set. Documents added to this set are not indexed, so callers MUST either fail this
-     * index build or delete the documents from the collection.
+     * If 'dupRecords' is passed as non-NULL and duplicates are not allowed for the index, violators
+     * of uniqueness constraints will be added to the set. Records added to this set are not
+     * indexed, so callers MUST either fail this index build or delete the documents from the
+     * collection.
+     *
+     * If 'dupKeysInserted' is passed as non-NULL and duplicates are allowed for the unique index,
+     * violators of uniqueness constraints will still be indexed, and the keys will be appended to
+     * the vector. No DuplicateKey errors will be returned.
      *
      * Should not be called inside of a WriteUnitOfWork.
      */
-    virtual Status doneInserting() = 0;
-    virtual Status doneInserting(std::set<RecordId>* const dupsOut) = 0;
+    virtual Status dumpInsertsFromBulk() = 0;
+    virtual Status dumpInsertsFromBulk(std::set<RecordId>* const dupRecords) = 0;
+    virtual Status dumpInsertsFromBulk(std::vector<BSONObj>* const dupKeysInserted) = 0;
+
+    /**
+     * For background indexes using an IndexBuildInterceptor to capture inserts during a build,
+     * drain these writes into the index. If intent locks are held on the collection, more writes
+     * may come in after this drain completes. To ensure that all writes are completely drained
+     * before calling commit(), stop writes on the collection by holding a S or X while calling this
+     * method.
+     *
+     * Must not be in a WriteUnitOfWork.
+     */
+    virtual Status drainBackgroundWritesIfNeeded() = 0;
 
     /**
      * Marks the index ready for use. Should only be called as the last method after
@@ -156,8 +177,33 @@ public:
      *
      * Requires holding an exclusive database lock.
      */
-    virtual void commit() = 0;
-    virtual void commit(stdx::function<void(const BSONObj& spec)> onCreateFn) = 0;
+    virtual Status commit() = 0;
+    virtual Status commit(stdx::function<void(const BSONObj& spec)> onCreateFn) = 0;
+
+    /**
+     * Returns true if this index builder was added to the index catalog successfully.
+     * In addition to having commit() return without errors, the enclosing WUOW has to be committed
+     * for the indexes to show up in the index catalog.
+     */
+    virtual bool isCommitted() const = 0;
+
+    /**
+     * Signals the index build to abort.
+     *
+     * In-progress inserts and commits will still run to completion. However, subsequent index build
+     * operations will fail an IndexBuildAborted error.
+     *
+     * Aborts the uncommitted index build and prevents further inserts or commit attempts from
+     * proceeding. On destruction, all traces of uncommitted index builds will be removed.
+     *
+     * If the index build has already been aborted (using abort() or abortWithoutCleanup()),
+     * this function does nothing.
+     *
+     * If this index build has been committed successfully, this function has no effect.
+     *
+     * May be called from any thread.
+     */
+    virtual void abort(StringData reason) = 0;
 
     /**
      * May be called at any time after construction but before a successful commit(). Suppresses
@@ -172,9 +218,12 @@ public:
      *
      * Does not matter whether it is called inside of a WriteUnitOfWork. Will not be rolled
      * back.
+     *
+     * Must be called from owning thread.
      */
     virtual void abortWithoutCleanup() = 0;
 
     virtual bool getBuildInBackground() const = 0;
 };
+
 }  // namespace mongo

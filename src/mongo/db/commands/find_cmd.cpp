@@ -123,6 +123,11 @@ public:
             return true;
         }
 
+        bool allowsSpeculativeMajorityReads() const override {
+            // TODO (SERVER-37560): Support this for change stream update lookup queries.
+            return false;
+        }
+
         NamespaceString ns() const override {
             // TODO get the ns from the parsed QueryRequest.
             return NamespaceString(CommandHelpers::parseNsFromCommand(_dbName, _request.body));
@@ -236,6 +241,12 @@ public:
                     !txnParticipant ||
                         !(txnParticipant->inMultiDocumentTransaction() && qr->isTailable()));
 
+            uassert(ErrorCodes::OperationNotSupportedInTransaction,
+                    "The 'readOnce' option is not supported within a transaction.",
+                    !txnParticipant ||
+                        !txnParticipant->inActiveOrKilledMultiDocumentTransaction() ||
+                        !qr->isReadOnce());
+
             // Validate term before acquiring locks, if provided.
             if (auto term = qr->getReplicationTerm()) {
                 // Note: updateTerm returns ok if term stayed the same.
@@ -297,6 +308,12 @@ public:
             }
 
             Collection* const collection = ctx->getCollection();
+
+            if (cq->getQueryRequest().isReadOnce()) {
+                // The readOnce option causes any storage-layer cursors created during plan
+                // execution to assume read data will not be needed again and need not be cached.
+                opCtx->recoveryUnit()->setReadOnce(true);
+            }
 
             // Get the execution plan for the query.
             auto exec = uassertStatusOK(getExecutorFind(opCtx, collection, nss, std::move(cq)));
@@ -368,7 +385,7 @@ public:
                     {std::move(exec),
                      nss,
                      AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
-                     repl::ReadConcernArgs::get(opCtx).getLevel(),
+                     repl::ReadConcernArgs::get(opCtx),
                      _request.body});
                 cursorId = pinnedCursor.getCursor()->cursorid();
 

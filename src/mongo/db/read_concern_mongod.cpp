@@ -203,9 +203,8 @@ MONGO_REGISTER_SHIM(waitForReadConcern)
     // illegal to wait for read concern. This is fine, since the outer operation should have handled
     // waiting for read concern. We don't want to ignore prepare conflicts because snapshot reads
     // should block on prepared transactions.
-    auto txnParticipant = TransactionParticipant::get(opCtx);
-    if (opCtx->getClient()->isInDirectClient() && txnParticipant &&
-        txnParticipant->inMultiDocumentTransaction()) {
+    if (opCtx->getClient()->isInDirectClient() &&
+        readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern) {
         opCtx->recoveryUnit()->setIgnorePrepared(false);
         return Status::OK();
     }
@@ -293,13 +292,6 @@ MONGO_REGISTER_SHIM(waitForReadConcern)
             return {ErrorCodes::NotAReplicaSet,
                     "node needs to be a replica set member to use readConcern: snapshot"};
         }
-        if (speculative) {
-            txnParticipant->setSpeculativeTransactionOpTime(
-                opCtx,
-                readConcernArgs.getOriginalLevel() == repl::ReadConcernLevel::kSnapshotReadConcern
-                    ? SpeculativeTransactionOpTime::kAllCommitted
-                    : SpeculativeTransactionOpTime::kLastApplied);
-        }
     }
 
     if (atClusterTime) {
@@ -336,7 +328,8 @@ MONGO_REGISTER_SHIM(waitForReadConcern)
             return status;
         }
 
-        LOG(debugLevel) << "Using 'committed' snapshot: " << CurOp::get(opCtx)->opDescription();
+        LOG(debugLevel) << "Using 'committed' snapshot: " << CurOp::get(opCtx)->opDescription()
+                        << " with readTs: " << opCtx->recoveryUnit()->getPointInTimeReadTimestamp();
     }
 
     // Only snapshot, linearizable and afterClusterTime reads should block on prepared transactions.

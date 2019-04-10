@@ -1,5 +1,3 @@
-// biggie_recovery_unit.cpp
-
 
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
@@ -46,49 +44,109 @@ namespace biggie {
 RecoveryUnit::RecoveryUnit(KVEngine* parentKVEngine, stdx::function<void()> cb)
     : _waitUntilDurableCallback(cb), _KVEngine(parentKVEngine) {}
 
-void RecoveryUnit::beginUnitOfWork(OperationContext* opCtx) {}
+RecoveryUnit::~RecoveryUnit() {
+    invariant(!_inUnitOfWork);
+    _abort();
+}
+
+void RecoveryUnit::beginUnitOfWork(OperationContext* opCtx) {
+    invariant(!_inUnitOfWork);
+    _inUnitOfWork = true;
+}
 
 void RecoveryUnit::commitUnitOfWork() {
-    if (_dirty && _workingCopy) {
-
+    invariant(_inUnitOfWork);
+    if (_dirty) {
+        invariant(_forked);
         while (true) {
-            std::shared_ptr<StringStore> master = _KVEngine->getMaster();
-
+            std::pair<uint64_t, StringStore> masterInfo = _KVEngine->getMasterInfo();
             try {
-                _workingCopy->merge3(*_mergeBase, *master);
+                _workingCopy.merge3(_mergeBase, masterInfo.second);
             } catch (const merge_conflict_exception&) {
                 throw WriteConflictException();
             }
 
-            if (_KVEngine->compareAndSwapMaster(master, _workingCopy)) {
+            if (_KVEngine->trySwapMaster(_workingCopy, masterInfo.first)) {
                 // Merged successfully
-                _mergeBase.reset();
                 break;
             } else {
                 // Retry the merge, but update the mergeBase since some progress was made merging.
-                _mergeBase = master;
+                _mergeBase = masterInfo.second;
             }
         }
+        _forked = false;
         _dirty = false;
-    }
-    try {
-        for (Changes::iterator it = _changes.begin(), end = _changes.end(); it != end; ++it) {
-            (*it)->commit(boost::none);
+    } else if (_forked) {
+        DEV {
+            std::pair<uint64_t, StringStore> masterInfo = _KVEngine->getMasterInfo();
+            invariant(masterInfo.second == _workingCopy);
         }
+    }
+
+    try {
+        for (auto& change : _changes)
+            change->commit(boost::none);
         _changes.clear();
     } catch (...) {
         std::terminate();
     }
+
+    _inUnitOfWork = false;
 }
 
 void RecoveryUnit::abortUnitOfWork() {
-    _workingCopy.reset();
-    _mergeBase.reset();
+    invariant(_inUnitOfWork);
+    _inUnitOfWork = false;
+    _abort();
+}
+
+bool RecoveryUnit::waitUntilDurable() {
+    invariant(!_inUnitOfWork);
+    return true;  // This is an in-memory storage engine.
+}
+
+void RecoveryUnit::abandonSnapshot() {
+    invariant(!_inUnitOfWork);
+    _forked = false;
+    _dirty = false;
+}
+
+void RecoveryUnit::registerChange(Change* change) {
+    invariant(_inUnitOfWork);
+    _changes.push_back(std::unique_ptr<Change>{change});
+}
+
+SnapshotId RecoveryUnit::getSnapshotId() const {
+    return SnapshotId();
+}
+
+bool RecoveryUnit::forkIfNeeded() {
+    if (_forked)
+        return false;
+
+    // Update the copies of the trees when not in a WUOW so cursors can retrieve the latest data.
+
+    std::pair<uint64_t, StringStore> masterInfo = _KVEngine->getMasterInfo();
+    StringStore master = masterInfo.second;
+
+    _mergeBase = master;
+    _workingCopy = master;
+
+    _forked = true;
+    return true;
+}
+
+void RecoveryUnit::setOrderedCommit(bool orderedCommit) {}
+
+void RecoveryUnit::_abort() {
+    _forked = false;
+    _dirty = false;
     try {
-        for (Changes::reverse_iterator it = _changes.rbegin(), end = _changes.rend(); it != end;
+        for (Changes::const_reverse_iterator it = _changes.rbegin(), end = _changes.rend();
+             it != end;
              ++it) {
-            ChangePtr change = *it;
-            LOG(2) << "CUSTOM ROLLBACK " << demangleName(typeid(*change));
+            Change* change = it->get();
+            LOG(2) << "CUSTOM ROLLBACK " << redact(demangleName(typeid(*change)));
             change->rollback();
         }
         _changes.clear();
@@ -97,38 +155,8 @@ void RecoveryUnit::abortUnitOfWork() {
     }
 }
 
-bool RecoveryUnit::waitUntilDurable() {
-    return true;  // This is an in-memory storage engine.
+RecoveryUnit* RecoveryUnit::get(OperationContext* opCtx) {
+    return checked_cast<biggie::RecoveryUnit*>(opCtx->recoveryUnit());
 }
-
-void RecoveryUnit::abandonSnapshot() {
-    _mergeBase.reset();
-    _workingCopy.reset();
-    _dirty = false;
-}
-
-void RecoveryUnit::registerChange(Change* change) {
-    _changes.push_back(ChangePtr(change));
-}
-
-SnapshotId RecoveryUnit::getSnapshotId() const {
-    return SnapshotId();
-}
-
-bool RecoveryUnit::forkIfNeeded() {
-    // _workingCopy and _mergeBase either both exist or both don't.
-    invariant((_workingCopy && _mergeBase) || (!_workingCopy && !_mergeBase));
-    if (_mergeBase) {
-        return false;
-    }
-
-    _mergeBase = _KVEngine->getMaster();
-    _workingCopy = std::make_unique<StringStore>(*_mergeBase);
-
-    return true;
-}
-
-void RecoveryUnit::setOrderedCommit(bool orderedCommit) {}
-
 }  // namespace biggie
 }  // namespace mongo

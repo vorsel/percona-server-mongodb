@@ -44,7 +44,6 @@
 #include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
-#include "mongo/db/db.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
@@ -53,7 +52,6 @@
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/multi_key_path_tracker.h"
 #include "mongo/db/op_observer_registry.h"
-#include "mongo/db/operation_context_session_mongod.h"
 #include "mongo/db/repl/apply_ops.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/multiapplier.h"
@@ -246,7 +244,7 @@ public:
         {
             WriteUnitOfWork wuow(_opCtx);
             // Timestamping index completion. Primaries write an oplog entry.
-            indexer.commit();
+            ASSERT_OK(indexer.commit());
             // The op observer is not called from the index builder, but rather the
             // `createIndexes` command.
             _opCtx->getServiceContext()->getOpObserver()->onCreateIndex(
@@ -1836,7 +1834,7 @@ public:
             // All callers of `MultiIndexBlock::commit` are responsible for timestamping index
             // completion.  Primaries write an oplog entry. Secondaries explicitly set a
             // timestamp.
-            indexer.commit();
+            ASSERT_OK(indexer.commit());
             if (SimulatePrimary) {
                 // The op observer is not called from the index builder, but rather the
                 // `createIndexes` command.
@@ -2498,14 +2496,13 @@ public:
         _opCtx->setLogicalSessionId(sessionId);
         _opCtx->setTxnNumber(26);
 
-        OperationSessionInfoFromClient sessionInfo;
-        sessionInfo.setAutocommit(false);
-        sessionInfo.setStartTransaction(true);
-        ocs = std::make_unique<OperationContextSessionMongod>(_opCtx, true, sessionInfo);
+        ocs.emplace(_opCtx);
 
         auto txnParticipant = TransactionParticipant::get(_opCtx);
         ASSERT(txnParticipant);
 
+        txnParticipant->beginOrContinue(
+            *_opCtx->getTxnNumber(), false /* autocommit */, true /* startTransaction */);
         txnParticipant->unstashTransactionResources(_opCtx, "insert");
         {
             AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IX, LockMode::MODE_IX);
@@ -2540,7 +2537,8 @@ protected:
     Timestamp presentTs;
     Timestamp beforeTxnTs;
     Timestamp commitEntryTs;
-    std::unique_ptr<OperationContextSessionMongod> ocs;
+
+    boost::optional<MongoDOperationContextSession> ocs;
 };
 
 class MultiDocumentTransaction : public MultiDocumentTransactionTest {

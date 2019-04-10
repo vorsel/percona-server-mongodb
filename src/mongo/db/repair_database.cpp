@@ -213,13 +213,16 @@ Status rebuildIndexesOnCollection(OperationContext* opCtx,
         }
     }
 
-    Status status = indexer->doneInserting();
+    Status status = indexer->dumpInsertsFromBulk();
     if (!status.isOK())
         return status;
 
     {
         WriteUnitOfWork wunit(opCtx);
-        indexer->commit();
+        status = indexer->commit();
+        if (!status.isOK()) {
+            return status;
+        }
         rs->updateStatsAfterRepair(opCtx, numRecords, dataSize);
         wunit.commit();
     }

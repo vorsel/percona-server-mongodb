@@ -43,18 +43,17 @@
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/repair_database_and_check_version.h"
 #include "mongo/db/repl/apply_ops.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_process.h"
+#include "mongo/db/repl/replication_state_transition_lock_guard.h"
 #include "mongo/db/repl/roll_back_local_operations.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/s/shard_identity_rollback_notifier.h"
 #include "mongo/db/s/type_shard_identity.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/server_recovery.h"
-#include "mongo/db/session_catalog.h"
 #include "mongo/s/catalog/type_config_version.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
@@ -297,9 +296,10 @@ Status RollbackImpl::_transitionToRollback(OperationContext* opCtx) {
 
     log() << "transition to ROLLBACK";
     {
-        Lock::GlobalWrite globalWrite(opCtx);
+        ReplicationStateTransitionLockGuard transitionGuard(opCtx);
 
-        auto status = _replicationCoordinator->setFollowerMode(MemberState::RS_ROLLBACK);
+        auto status =
+            _replicationCoordinator->setFollowerModeStrict(opCtx, MemberState::RS_ROLLBACK);
         if (!status.isOK()) {
             status.addContext(str::stream() << "Cannot transition from "
                                             << _replicationCoordinator->getMemberState().toString()
@@ -878,7 +878,7 @@ void RollbackImpl::_transitionFromRollbackToSecondary(OperationContext* opCtx) {
 
     log() << "transition to SECONDARY";
 
-    Lock::GlobalWrite globalWrite(opCtx);
+    ReplicationStateTransitionLockGuard transitionGuard(opCtx);
 
     auto status = _replicationCoordinator->setFollowerMode(MemberState::RS_SECONDARY);
     if (!status.isOK()) {
@@ -898,7 +898,7 @@ void RollbackImpl::_resetDropPendingState(OperationContext* opCtx) {
     for (const auto& dbName : dbNames) {
         Lock::DBLock dbLock(opCtx, dbName, MODE_X);
         Database* db = DatabaseHolder::getDatabaseHolder().openDb(opCtx, dbName);
-        checkForIdIndexesAndDropPendingCollections(opCtx, db);
+        db->checkForIdIndexesAndDropPendingCollections(opCtx);
     }
 }
 

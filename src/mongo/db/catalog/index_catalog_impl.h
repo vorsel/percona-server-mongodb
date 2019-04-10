@@ -35,6 +35,7 @@
 #include "mongo/db/catalog/index_catalog.h"
 
 #include "mongo/db/catalog/index_catalog_entry.h"
+#include "mongo/db/index/index_build_interceptor.h"
 #include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context.h"
@@ -161,8 +162,9 @@ public:
     const IndexDescriptor* refreshEntry(OperationContext* opCtx,
                                         const IndexDescriptor* oldDesc) override;
 
-    // never returns NULL
     const IndexCatalogEntry* getEntry(const IndexDescriptor* desc) const override;
+
+    std::shared_ptr<const IndexCatalogEntry> getEntryShared(const IndexDescriptor*) const override;
 
     IndexAccessMethod* getIndex(const IndexDescriptor* desc) override;
     const IndexAccessMethod* getIndex(const IndexDescriptor* desc) const override;
@@ -174,8 +176,8 @@ public:
     Status checkUnfinished() const override;
 
     using IndexIterator = IndexCatalog::IndexIterator;
-    IndexIterator getIndexIterator(OperationContext* const opCtx,
-                                   const bool includeUnfinishedIndexes) const override;
+    std::unique_ptr<IndexIterator> getIndexIterator(
+        OperationContext* const opCtx, const bool includeUnfinishedIndexes) const override;
 
     // ---- index set modifiers ------
 
@@ -235,14 +237,6 @@ public:
 
     // --- these probably become private?
 
-
-    /**
-     * disk creation order
-     * 1) collection's NamespaceDetails
-     *    a) info + head
-     *    b) _indexBuildsInProgress++
-     * 2) indexes entry in .ns file
-     */
     class IndexBuildBlock : public IndexCatalog::IndexBuildBlockInterface {
         MONGO_DISALLOW_COPYING(IndexBuildBlock);
 
@@ -296,6 +290,7 @@ public:
         IndexCatalogEntry* _entry;
 
         OperationContext* _opCtx;
+        std::unique_ptr<IndexBuildInterceptor> _indexBuildInterceptor;
     };
 
     // ----- data modifiers ------
@@ -310,6 +305,15 @@ public:
                         const std::vector<BsonRecord>& bsonRecords,
                         int64_t* keysInsertedOut) override;
 
+    /**
+     * See IndexCatalog::updateRecord
+     */
+    Status updateRecord(OperationContext* const opCtx,
+                        const BSONObj& oldDoc,
+                        const BSONObj& newDoc,
+                        const RecordId& recordId,
+                        int64_t* const keysInsertedOut,
+                        int64_t* const keysDeletedOut) override;
     /**
      * When 'keysDeletedOut' is not null, it will be set to the number of index keys removed by
      * this operation.
@@ -342,6 +346,8 @@ public:
                                     InsertDeleteOptions* options) const override;
 
     void setNs(NamespaceString ns) override;
+
+    void indexBuildSuccess(OperationContext* opCtx, IndexCatalogEntry* index) override;
 
 private:
     static const BSONObj _idObj;  // { _id : 1 }
@@ -387,9 +393,12 @@ private:
     // descriptor ownership passes to _setupInMemoryStructures
     // initFromDisk: Avoids registering a change to undo this operation when set to true.
     //               You must set this flag if calling this function outside of a UnitOfWork.
+    // isReadyIndex: The index will be directly available for query usage without needing to
+    //               complete the IndexBuildBlock process.
     IndexCatalogEntry* _setupInMemoryStructures(OperationContext* opCtx,
                                                 std::unique_ptr<IndexDescriptor> descriptor,
-                                                bool initFromDisk);
+                                                bool initFromDisk,
+                                                bool isReadyIndex);
 
     // Apply a set of transformations to the user-provided index object 'spec' to make it
     // conform to the standard for insertion.  This function adds the 'v' field if it didn't
@@ -407,7 +416,8 @@ private:
     Collection* const _collection;
     const int _maxNumIndexesAllowed;
 
-    IndexCatalogEntryContainer _entries;
+    IndexCatalogEntryContainer _readyIndexes;
+    IndexCatalogEntryContainer _buildingIndexes;
 
     // These are the index specs of indexes that were "leftover".
     // "Leftover" means they were unfinished when a mongod shut down.

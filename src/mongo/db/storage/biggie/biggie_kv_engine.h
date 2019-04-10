@@ -41,17 +41,14 @@
 
 namespace mongo {
 namespace biggie {
+
 class JournalListener;
 /**
  * The biggie storage engine is intended for unit and performance testing.
  */
-class KVEngine : public ::mongo::KVEngine {
-    std::shared_ptr<StringStore> _master = std::make_shared<StringStore>();
-    std::map<std::string, bool> _idents;  // TODO : replace with a query to _master.
-    mutable stdx::mutex _masterLock;
-
+class KVEngine : public mongo::KVEngine {
 public:
-    KVEngine() : ::mongo::KVEngine() {}
+    KVEngine() : mongo::KVEngine() {}
 
     virtual ~KVEngine() {}
 
@@ -62,10 +59,13 @@ public:
                                      StringData ident,
                                      const CollectionOptions& options);
 
-    virtual std::unique_ptr<::mongo::RecordStore> getRecordStore(OperationContext* opCtx,
-                                                                 StringData ns,
-                                                                 StringData ident,
-                                                                 const CollectionOptions& options);
+    virtual std::unique_ptr<mongo::RecordStore> getRecordStore(OperationContext* opCtx,
+                                                               StringData ns,
+                                                               StringData ident,
+                                                               const CollectionOptions& options);
+
+    virtual std::unique_ptr<mongo::RecordStore> makeTemporaryRecordStore(OperationContext* opCtx,
+                                                                         StringData ident) override;
 
     virtual Status createSortedDataInterface(OperationContext* opCtx,
                                              StringData ident,
@@ -74,6 +74,12 @@ public:
     virtual mongo::SortedDataInterface* getSortedDataInterface(OperationContext* opCtx,
                                                                StringData ident,
                                                                const IndexDescriptor* desc);
+
+    virtual Status beginBackup(OperationContext* opCtx) {
+        return Status::OK();
+    }
+
+    virtual void endBackup(OperationContext* opCtx) {}
 
     virtual Status dropIdent(OperationContext* opCtx, StringData ident);
 
@@ -135,20 +141,34 @@ public:
         return Timestamp();
     }
 
+    virtual Timestamp getOldestOpenReadTimestamp() const override {
+        return Timestamp();
+    }
+
     // Biggie Specific
 
-    std::shared_ptr<StringStore> getMaster() const;
+    /**
+     * Returns a pair of the current version and copy of tree of the master.
+     */
+    std::pair<uint64_t, StringStore> getMasterInfo() {
+        stdx::lock_guard<stdx::mutex> lock(_masterLock);
+        return std::make_pair(_masterVersion, _master);
+    }
 
     /**
-     * Returns true and swaps _master to newMaster if both _master and compareAgainst are
-     * equivalent.
+     * Returns true and swaps _master to newMaster if the version passed in is the same as the
+     * masters current version.
      */
-    bool compareAndSwapMaster(std::shared_ptr<StringStore> compareAgainst,
-                              std::unique_ptr<StringStore>& newMaster);
+    bool trySwapMaster(StringStore& newMaster, uint64_t version);
 
 private:
     std::shared_ptr<void> _catalogInfo;
     int _cachePressureForTest = 0;
+    std::map<std::string, bool> _idents;  // TODO : replace with a query to _master.
+
+    mutable stdx::mutex _masterLock;
+    StringStore _master;
+    uint64_t _masterVersion = 0;
 };
 }  // namespace biggie
 }  // namespace mongo

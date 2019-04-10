@@ -49,9 +49,11 @@ public:
     static const BSONObj Acknowledged;
     static const BSONObj Unacknowledged;
     static const BSONObj Majority;
+    static const BSONObj InternalMajorityNoSnapshot;
 
     static const StringData kWriteConcernField;
-    static const char kMajority[];  // = "majority"
+    static const char kMajority[];                    // = "majority"
+    static const char kInternalMajorityNoSnapshot[];  // = "internalMajorityNoSnapshot"
 
     static const Seconds kWriteConcernTimeoutSystem;
     static const Seconds kWriteConcernTimeoutMigration;
@@ -71,6 +73,13 @@ public:
     WriteConcernOptions(const std::string& mode, SyncMode sync, Milliseconds timeout);
 
     Status parse(const BSONObj& obj);
+
+    /**
+     * Returns an instance of WriteConcernOptions from a BSONObj.
+     *
+     * uasserts() if the obj cannot be deserialized.
+     */
+    static WriteConcernOptions deserializerForIDL(const BSONObj& obj);
 
     /**
      * Attempts to extract a writeConcern from cmdObj.

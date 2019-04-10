@@ -97,7 +97,11 @@ Status ReplicationCoordinatorEmbedded::checkCanServeReadsFor_UNSAFE(OperationCon
     return Status::OK();
 }
 
-bool ReplicationCoordinatorEmbedded::isInPrimaryOrSecondaryState() const {
+bool ReplicationCoordinatorEmbedded::isInPrimaryOrSecondaryState(OperationContext* opCtx) const {
+    return false;
+}
+
+bool ReplicationCoordinatorEmbedded::isInPrimaryOrSecondaryState_UNSAFE() const {
     return false;
 }
 
@@ -159,6 +163,11 @@ void ReplicationCoordinatorEmbedded::clearSyncSourceBlacklist() {
 }
 
 Status ReplicationCoordinatorEmbedded::setFollowerMode(const MemberState&) {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
+Status ReplicationCoordinatorEmbedded::setFollowerModeStrict(OperationContext* opCtx,
+                                                             const MemberState&) {
     UASSERT_NOT_IMPLEMENTED;
 }
 
@@ -247,6 +256,10 @@ OID ReplicationCoordinatorEmbedded::getElectionId() {
 }
 
 int ReplicationCoordinatorEmbedded::getMyId() const {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
+HostAndPort ReplicationCoordinatorEmbedded::getMyHostAndPort() const {
     UASSERT_NOT_IMPLEMENTED;
 }
 
@@ -428,6 +441,10 @@ void ReplicationCoordinatorEmbedded::signalDropPendingCollectionsRemovedFromStor
 }
 
 boost::optional<Timestamp> ReplicationCoordinatorEmbedded::getRecoveryTimestamp() {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
+bool ReplicationCoordinatorEmbedded::setContainsArbiter() const {
     UASSERT_NOT_IMPLEMENTED;
 }
 

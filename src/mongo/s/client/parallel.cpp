@@ -60,8 +60,6 @@ namespace dps = ::mongo::dotted_path_support;
 
 namespace {
 
-LabeledLevel pc("pcursor", 2);
-
 /**
  * Throws an exception wrapping the error document in this cursor when the error flag is set.
  */
@@ -375,7 +373,8 @@ void ParallelSortClusteredCursor::setupVersionAndHandleSlaveOk(
             // that the primary is now up on it's own and has to rely on other threads to refresh
             // node states.
 
-            OCCASIONALLY {
+            static Occasionally sampler;
+            if (sampler.tick()) {
                 const DBClientReplicaSet* repl = dynamic_cast<const DBClientReplicaSet*>(rawConn);
                 dassert(repl);
                 warning() << "Primary for " << repl->getServerAddress()
@@ -389,8 +388,8 @@ void ParallelSortClusteredCursor::setupVersionAndHandleSlaveOk(
 
     try {
         if (state->conn->setVersion()) {
-            LOG(pc) << "needed to set remote version on connection to value "
-                    << "compatible with " << vinfo;
+            LOG(2) << "pcursor: needed to set remote version on connection to value "
+                   << "compatible with " << vinfo;
         }
     } catch (const DBException& dbExcep) {
         auto errCode = dbExcep.code();
@@ -400,7 +399,8 @@ void ParallelSortClusteredCursor::setupVersionAndHandleSlaveOk(
             // It's okay if we don't set the version when talking to a secondary, we can
             // be stale in any case.
 
-            OCCASIONALLY {
+            static Occasionally sampler;
+            if (sampler.tick()) {
                 const DBClientReplicaSet* repl =
                     dynamic_cast<const DBClientReplicaSet*>(state->conn->getRawConn());
                 dassert(repl);
@@ -419,14 +419,14 @@ void ParallelSortClusteredCursor::startInit(OperationContext* opCtx) {
     const NamespaceString nss(!_cInfo.isEmpty() ? _cInfo.versionedNS : _qSpec.ns());
 
     string prefix;
-    if (MONGO_unlikely(shouldLog(pc))) {
+    if (MONGO_unlikely(shouldLog(logger::LogSeverity::Debug(2)))) {
         if (_totalTries > 0) {
             prefix = str::stream() << "retrying (" << _totalTries << " tries)";
         } else {
             prefix = "creating";
         }
     }
-    LOG(pc) << prefix << " pcursor over " << _qSpec << " and " << _cInfo;
+    LOG(2) << "pcursor: " << prefix << " pcursor over " << _qSpec << " and " << _cInfo;
 
     shared_ptr<ChunkManager> manager;
     shared_ptr<Shard> primary;
@@ -449,7 +449,7 @@ void ParallelSortClusteredCursor::startInit(OperationContext* opCtx) {
     string vinfo;
 
     if (manager) {
-        if (MONGO_unlikely(shouldLog(pc))) {
+        if (MONGO_unlikely(shouldLog(logger::LogSeverity::Debug(2)))) {
             vinfo = str::stream() << "[" << manager->getns().ns() << " @ "
                                   << manager->getVersion().toString() << "]";
         }
@@ -459,7 +459,7 @@ void ParallelSortClusteredCursor::startInit(OperationContext* opCtx) {
                                      !_cInfo.isEmpty() ? _cInfo.cmdCollation : BSONObj(),
                                      &shardIds);
     } else if (primary) {
-        if (MONGO_unlikely(shouldLog(pc))) {
+        if (MONGO_unlikely(shouldLog(logger::LogSeverity::Debug(2)))) {
             vinfo = str::stream() << "[unsharded @ " << primary->toString() << "]";
         }
 
@@ -471,14 +471,14 @@ void ParallelSortClusteredCursor::startInit(OperationContext* opCtx) {
         const auto& shardId = cmEntry.first;
 
         if (shardIds.find(shardId) == shardIds.end()) {
-            LOG(pc) << "closing cursor on shard " << shardId
-                    << " as the connection is no longer required by " << vinfo;
+            LOG(2) << "pcursor: closing cursor on shard " << shardId
+                   << " as the connection is no longer required by " << vinfo;
 
             cmEntry.second.cleanup(true);
         }
     }
 
-    LOG(pc) << "initializing over " << shardIds.size() << " shards required by " << vinfo;
+    LOG(2) << "pcursor: initializing over " << shardIds.size() << " shards required by " << vinfo;
 
     // Don't retry indefinitely for whatever reason
     _totalTries++;
@@ -487,8 +487,8 @@ void ParallelSortClusteredCursor::startInit(OperationContext* opCtx) {
     for (const ShardId& shardId : shardIds) {
         auto& mdata = _cursorMap[shardId];
 
-        LOG(pc) << "initializing on shard " << shardId << ", current connection state is "
-                << mdata.toBSON();
+        LOG(2) << "pcursor: initializing on shard " << shardId << ", current connection state is "
+               << mdata.toBSON();
 
         // This may be the first time connecting to this shard, if so we can get an error here
         try {
@@ -607,9 +607,9 @@ void ParallelSortClusteredCursor::startInit(OperationContext* opCtx) {
                 mdata.finished = true;
             }
 
-            LOG(pc) << "initialized " << (isCommand() ? "command " : "query ")
-                    << (lazyInit ? "(lazily) " : "(full) ") << "on shard " << shardId
-                    << ", current connection state is " << mdata.toBSON();
+            LOG(2) << "pcursor: initialized " << (isCommand() ? "command " : "query ")
+                   << (lazyInit ? "(lazily) " : "(full) ") << "on shard " << shardId
+                   << ", current connection state is " << mdata.toBSON();
         } catch (StaleConfigException& e) {
             // Our version isn't compatible with the current version anymore on at least one shard,
             // need to retry immediately
@@ -704,14 +704,14 @@ void ParallelSortClusteredCursor::finishInit(OperationContext* opCtx) {
     bool retry = false;
     map<string, StaleConfigException> staleNSExceptions;
 
-    LOG(pc) << "finishing over " << _cursorMap.size() << " shards";
+    LOG(2) << "pcursor: finishing over " << _cursorMap.size() << " shards";
 
     for (auto& cmEntry : _cursorMap) {
         const auto& shardId = cmEntry.first;
         auto& mdata = cmEntry.second;
 
-        LOG(pc) << "finishing on shard " << shardId << ", current connection state is "
-                << mdata.toBSON();
+        LOG(2) << "pcursor: finishing on shard " << shardId << ", current connection state is "
+               << mdata.toBSON();
 
         // Ignore empty conns for now
         if (!mdata.pcState)
@@ -758,8 +758,8 @@ void ParallelSortClusteredCursor::finishInit(OperationContext* opCtx) {
                 // Finalize state
                 state->cursor->attach(state->conn.get());  // Closes connection for us
 
-                LOG(pc) << "finished on shard " << shardId << ", current connection state is "
-                        << mdata.toBSON();
+                LOG(2) << "pcursor: finished on shard " << shardId
+                       << ", current connection state is " << mdata.toBSON();
             }
         } catch (StaleConfigException& e) {
             retry = true;

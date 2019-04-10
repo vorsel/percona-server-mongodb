@@ -73,62 +73,37 @@ void attachWriteConcern(BatchedCommandRequest* request, const WriteConcernOption
 
 }  // namespace
 
-std::pair<std::vector<FieldPath>, bool> MongoInterfaceShardServer::collectDocumentKeyFields(
-    OperationContext* opCtx, NamespaceStringOrUUID nssOrUUID) const {
+void MongoInterfaceShardServer::checkRoutingInfoEpochOrThrow(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const NamespaceString& nss,
+    ChunkVersion targetCollectionVersion) const {
+    auto catalogCache = Grid::get(expCtx->opCtx)->catalogCache();
+    return catalogCache->checkEpochOrThrow(nss, targetCollectionVersion);
+}
+
+std::pair<std::vector<FieldPath>, bool>
+MongoInterfaceShardServer::collectDocumentKeyFieldsForHostedCollection(OperationContext* opCtx,
+                                                                       const NamespaceString& nss,
+                                                                       UUID uuid) const {
     invariant(serverGlobalParams.clusterRole == ClusterRole::ShardServer);
 
-    boost::optional<UUID> uuid;
-    NamespaceString nss;
-    if (nssOrUUID.uuid()) {
-        uuid = *(nssOrUUID.uuid());
-        nss = UUIDCatalog::get(opCtx).lookupNSSByUUID(*uuid);
-        // An empty namespace indicates that the collection has been dropped. Treat it as unsharded
-        // and mark the fields as final.
-        if (nss.isEmpty()) {
-            return {{"_id"}, true};
-        }
-    } else if (nssOrUUID.nss()) {
-        nss = *(nssOrUUID.nss());
-    }
-
-    // Before taking a collection lock to retrieve the shard key fields, consult the catalog cache
-    // to determine whether the collection is sharded in the first place.
-    auto catalogCache = Grid::get(opCtx)->catalogCache();
-
-    const bool collectionIsSharded = catalogCache && [&]() {
-        auto routingInfo = catalogCache->getCollectionRoutingInfo(opCtx, nss);
-        return routingInfo.isOK() && routingInfo.getValue().cm();
+    const auto metadata = [opCtx, &nss]() -> ScopedCollectionMetadata {
+        Lock::DBLock dbLock(opCtx, nss.db(), MODE_IS);
+        Lock::CollectionLock collLock(opCtx->lockState(), nss.ns(), MODE_IS);
+        return CollectionShardingState::get(opCtx, nss)->getCurrentMetadata();
     }();
 
-    // Collection exists and is not sharded, mark as not final.
-    if (!collectionIsSharded) {
+    if (!metadata->isSharded() || !metadata->uuidMatches(uuid)) {
+        // An unsharded collection can still become sharded so is not final. If the uuid doesn't
+        // match the one stored in the ScopedCollectionMetadata, this implies that the collection
+        // has been dropped and recreated as sharded. We don't know what the old document key fields
+        // might have been in this case so we return just _id.
         return {{"_id"}, false};
     }
 
-    auto scm = [opCtx, &nss]() -> ScopedCollectionMetadata {
-        AutoGetCollection autoColl(opCtx, nss, MODE_IS);
-        return CollectionShardingState::get(opCtx, nss)->getMetadata(opCtx);
-    }();
-
-    // If the UUID is set in 'nssOrUuid', check that the UUID in the ScopedCollectionMetadata
-    // matches. Otherwise, this implies that the collection has been dropped and recreated as
-    // sharded.
-    if (!scm->isSharded() || (uuid && !scm->uuidMatches(*uuid))) {
-        return {{"_id"}, false};
-    }
-
-    // Unpack the shard key.
-    std::vector<FieldPath> result;
-    bool gotId = false;
-    for (auto& field : scm->getKeyPatternFields()) {
-        result.emplace_back(field->dottedField());
-        gotId |= (result.back().fullPath() == "_id");
-    }
-    if (!gotId) {  // If not part of the shard key, "_id" comes last.
-        result.emplace_back("_id");
-    }
-    // Collection is now sharded so the document key fields will never change, mark as final.
-    return {result, true};
+    // Unpack the shard key. Collection is now sharded so the document key fields will never change,
+    // mark as final.
+    return {_shardKeyToDocumentKeyFields(metadata->getKeyPatternFields()), true};
 }
 
 void MongoInterfaceShardServer::insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,

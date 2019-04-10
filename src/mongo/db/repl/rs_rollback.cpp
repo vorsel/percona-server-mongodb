@@ -57,7 +57,6 @@
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/ops/update.h"
-#include "mongo/db/ops/update_lifecycle_impl.h"
 #include "mongo/db/ops/update_request.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/bgsync.h"
@@ -67,6 +66,7 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_impl.h"
 #include "mongo/db/repl/replication_process.h"
+#include "mongo/db/repl/replication_state_transition_lock_guard.h"
 #include "mongo/db/repl/roll_back_local_operations.h"
 #include "mongo/db/repl/rollback_source.h"
 #include "mongo/db/repl/rslog.h"
@@ -1391,8 +1391,6 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
                     request.setUpdates(idAndDoc.second);
                     request.setGod();
                     request.setUpsert();
-                    UpdateLifecycleImpl updateLifecycle(nss);
-                    request.setLifecycle(&updateLifecycle);
 
                     update(opCtx, ctx.db(), request);
                 }
@@ -1492,8 +1490,9 @@ void rollback(OperationContext* opCtx,
     // then.
 
     {
-        Lock::GlobalWrite globalWrite(opCtx);
-        auto status = replCoord->setFollowerMode(MemberState::RS_ROLLBACK);
+        ReplicationStateTransitionLockGuard transitionGuard(opCtx);
+
+        auto status = replCoord->setFollowerModeStrict(opCtx, MemberState::RS_ROLLBACK);
         if (!status.isOK()) {
             log() << "Cannot transition from " << replCoord->getMemberState().toString() << " to "
                   << MemberState(MemberState::RS_ROLLBACK).toString() << causedBy(status);

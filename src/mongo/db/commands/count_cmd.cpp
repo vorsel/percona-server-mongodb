@@ -153,7 +153,8 @@ public:
 
         // Prevent chunks from being cleaned up during yields - this allows us to only check the
         // version on initial entry into count.
-        auto rangePreserver = CollectionShardingState::get(opCtx, nss)->getMetadata(opCtx);
+        auto rangePreserver =
+            CollectionShardingState::get(opCtx, nss)->getMetadataForOperation(opCtx);
 
         auto statusWithPlanExecutor =
             getExecutorCount(opCtx, collection, request.getValue(), true /*explain*/);
@@ -207,7 +208,8 @@ public:
 
         // Prevent chunks from being cleaned up during yields - this allows us to only check the
         // version on initial entry into count.
-        auto rangePreserver = CollectionShardingState::get(opCtx, nss)->getMetadata(opCtx);
+        auto rangePreserver =
+            CollectionShardingState::get(opCtx, nss)->getMetadataForOperation(opCtx);
 
         auto statusWithPlanExecutor =
             getExecutorCount(opCtx, collection, request.getValue(), false /*explain*/);
@@ -239,10 +241,9 @@ public:
         }
 
         // Plan is done executing. We just need to pull the count out of the root stage.
-        invariant(STAGE_COUNT == exec->getRootStage()->stageType());
-        CountStage* countStage = static_cast<CountStage*>(exec->getRootStage());
-        const CountStats* countStats =
-            static_cast<const CountStats*>(countStage->getSpecificStats());
+        invariant(STAGE_COUNT == exec->getRootStage()->stageType() ||
+                  STAGE_RECORD_STORE_FAST_COUNT == exec->getRootStage()->stageType());
+        auto* countStats = static_cast<const CountStats*>(exec->getRootStage()->getSpecificStats());
 
         result.appendNumber("n", countStats->nCounted);
         return true;

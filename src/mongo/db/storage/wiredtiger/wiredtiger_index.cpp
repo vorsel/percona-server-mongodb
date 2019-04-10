@@ -293,6 +293,15 @@ WiredTigerIndex::WiredTigerIndex(OperationContext* ctx,
                          _dataFormatVersion == kDataFormatV4KeyStringV1UniqueIndexVersionV2)
         ? KeyString::Version::V1
         : KeyString::Version::V0;
+
+    if (!isReadOnly) {
+        bool replicatedWrites = getGlobalReplSettings().usingReplSets() ||
+            repl::ReplSettings::shouldRecoverFromOplogAsStandalone();
+        uassertStatusOK(WiredTigerUtil::setTableLogging(
+            ctx,
+            uri,
+            WiredTigerUtil::useTableLogging(NamespaceString(desc->parentNS()), replicatedWrites)));
+    }
 }
 
 StatusWith<SpecialFormatInserted> WiredTigerIndex::insert(OperationContext* opCtx,
@@ -679,18 +688,18 @@ public:
 private:
     StatusWith<SpecialFormatInserted> addKeyTimestampSafe(const BSONObj& newKey,
                                                           const RecordId& id) {
-        // Do a duplicate check
-        const int cmp = newKey.woCompare(_previousKey, _ordering);
-        if (cmp == 0) {
-            // Duplicate found!
-            if (!_dupsAllowed) {
+        // Do a duplicate check, but only if dups aren't allowed.
+        if (!_dupsAllowed) {
+            const int cmp = newKey.woCompare(_previousKey, _ordering);
+            if (cmp == 0) {
+                // Duplicate found!
                 return buildDupKeyErrorStatus(
                     newKey, _idx->collectionNamespace(), _idx->indexName(), _idx->keyPattern());
+            } else {
+                // _previousKey.isEmpty() is only true on the first call to addKey().
+                // newKey must be > the last key
+                invariant(_previousKey.isEmpty() || cmp > 0);
             }
-        } else {
-            // _previousKey.isEmpty() is only true on the first call to addKey().
-            // newKey must be > the last key
-            invariant(_previousKey.isEmpty() || cmp > 0);
         }
 
         _keyString.resetToKey(newKey, _idx->ordering(), id);
@@ -708,7 +717,9 @@ private:
 
         invariantWTOK(_cursor->insert(_cursor));
 
-        _previousKey = newKey.getOwned();
+        // Don't copy the key again if dups are allowed.
+        if (!_dupsAllowed)
+            _previousKey = newKey.getOwned();
 
         if (_keyString.getTypeBits().isLongEncoding())
             return StatusWith<SpecialFormatInserted>(SpecialFormatInserted::LongTypeBitsInserted);

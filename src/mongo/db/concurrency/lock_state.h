@@ -146,8 +146,11 @@ public:
 
     virtual bool unlockGlobal();
 
-    virtual void beginWriteUnitOfWork();
-    virtual void endWriteUnitOfWork();
+    virtual LockResult lockRSTLBegin(OperationContext* opCtx);
+    virtual LockResult lockRSTLComplete(OperationContext* opCtx, Date_t deadline);
+
+    virtual void beginWriteUnitOfWork() override;
+    virtual void endWriteUnitOfWork() override;
 
     virtual bool inAWriteUnitOfWork() const {
         return _wuowNestingLevel > 0;
@@ -162,14 +165,10 @@ public:
     virtual LockResult lock(OperationContext* opCtx,
                             ResourceId resId,
                             LockMode mode,
-                            Date_t deadline = Date_t::max(),
-                            bool checkDeadlock = false);
+                            Date_t deadline = Date_t::max());
 
-    virtual LockResult lock(ResourceId resId,
-                            LockMode mode,
-                            Date_t deadline = Date_t::max(),
-                            bool checkDeadlock = false) {
-        return lock(nullptr, resId, mode, deadline, checkDeadlock);
+    virtual LockResult lock(ResourceId resId, LockMode mode, Date_t deadline = Date_t::max()) {
+        return lock(nullptr, resId, mode, deadline);
     }
 
     virtual void downgrade(ResourceId resId, LockMode newMode);
@@ -194,6 +193,10 @@ public:
     virtual void restoreLockState(const LockSnapshot& stateToRestore) {
         restoreLockState(nullptr, stateToRestore);
     }
+
+    bool releaseWriteUnitOfWork(LockSnapshot* stateOut) override;
+    void restoreWriteUnitOfWork(OperationContext* opCtx,
+                                const LockSnapshot& stateToRestore) override;
 
     virtual void releaseTicket();
     virtual void reacquireTicket(OperationContext* opCtx);
@@ -235,16 +238,14 @@ public:
      * @param mode Mode which was passed to an earlier lockBegin call. Must match.
      * @param deadline The absolute time point when this lock acquisition will time out, if not yet
      * granted.
-     * @param checkDeadlock whether to perform deadlock detection while waiting.
      */
     LockResult lockComplete(OperationContext* opCtx,
                             ResourceId resId,
                             LockMode mode,
-                            Date_t deadline,
-                            bool checkDeadlock);
+                            Date_t deadline);
 
-    LockResult lockComplete(ResourceId resId, LockMode mode, Date_t deadline, bool checkDeadlock) {
-        return lockComplete(nullptr, resId, mode, deadline, checkDeadlock);
+    LockResult lockComplete(ResourceId resId, LockMode mode, Date_t deadline) {
+        return lockComplete(nullptr, resId, mode, deadline);
     }
 
     /**
@@ -354,6 +355,10 @@ public:
     virtual bool isLocked() const;
     virtual bool isWriteLocked() const;
     virtual bool isReadLocked() const;
+
+    virtual bool isRSTLExclusive() const;
+    virtual bool isRSTLLocked() const;
+
     bool isGlobalLockedRecursively() override;
 
     virtual bool hasLockPending() const {

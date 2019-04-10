@@ -47,7 +47,6 @@
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/replication_recovery.h"
 #include "mongo/db/repl/rs_rollback.h"
-#include "mongo/db/session_catalog.h"
 #include "mongo/logger/log_component.h"
 #include "mongo/logger/logger.h"
 #include "mongo/stdx/memory.h"
@@ -136,6 +135,11 @@ Status RollbackTest::ReplicationCoordinatorRollbackMock::setFollowerMode(
                           << _failSetFollowerModeOnThisMemberState.toString());
     }
     return ReplicationCoordinatorMock::setFollowerMode(newState);
+}
+
+Status RollbackTest::ReplicationCoordinatorRollbackMock::setFollowerModeStrict(
+    OperationContext* opCtx, const MemberState& newState) {
+    return setFollowerMode(newState);
 }
 
 std::pair<BSONObj, RecordId> RollbackTest::makeCRUDOp(OpTypeEnum opType,

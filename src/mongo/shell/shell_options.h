@@ -54,7 +54,6 @@ struct ShellGlobalParams {
 
     std::string username;
     std::string password;
-    bool usingPassword;
     std::string authenticationMechanism;
     std::string authenticationDatabase;
     std::string gssapiServiceName;
@@ -84,8 +83,6 @@ struct ShellGlobalParams {
 };
 
 extern ShellGlobalParams shellGlobalParams;
-
-Status addMongoShellOptions(moe::OptionSection* options);
 
 std::string getMongoShellHelp(StringData name, const moe::OptionSection& options);
 

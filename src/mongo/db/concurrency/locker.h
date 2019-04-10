@@ -191,9 +191,23 @@ public:
     virtual bool unlockGlobal() = 0;
 
     /**
+     * Requests the RSTL to be acquired in mode X. This should only be called inside
+     * ReplicationStateTransitionLockGuard.
+     *
+     * See the comments for lockBegin/Complete for more information on the semantics.
+     */
+    virtual LockResult lockRSTLBegin(OperationContext* opCtx) = 0;
+
+    /**
+     * Waits for the completion of acquiring the RSTL in mode X. This should only be called inside
+     * ReplicationStateTransitionLockGuard.
+     */
+    virtual LockResult lockRSTLComplete(OperationContext* opCtx, Date_t deadline) = 0;
+
+    /**
      * beginWriteUnitOfWork/endWriteUnitOfWork are called at the start and end of WriteUnitOfWorks.
-     * They can be used to implement two-phase locking. Each call to begin should be matched with an
-     * eventual call to end.
+     * They can be used to implement two-phase locking. Each call to begin or restore should be
+     * matched with an eventual call to end or release.
      *
      * endWriteUnitOfWork, if not called in a nested WUOW, will release all two-phase locking held
      * lock resources.
@@ -222,26 +236,19 @@ public:
      *              returning LOCK_TIMEOUT. This parameter defaults to an infinite deadline.
      *              If Milliseconds(0) is passed, the request will return immediately, if
      *              the request could not be granted right away.
-     * @param checkDeadlock Whether to enable deadlock detection for this acquisition. This
-     *              parameter is put in place until we can handle deadlocks at all places,
-     *              which acquire locks.
      *
      * @return All LockResults except for LOCK_WAITING, because it blocks.
      */
     virtual LockResult lock(OperationContext* opCtx,
                             ResourceId resId,
                             LockMode mode,
-                            Date_t deadline = Date_t::max(),
-                            bool checkDeadlock = false) = 0;
+                            Date_t deadline = Date_t::max()) = 0;
 
     /**
      * Calling lock without an OperationContext does not allow LOCK_WAITING states to be
      * interrupted.
      */
-    virtual LockResult lock(ResourceId resId,
-                            LockMode mode,
-                            Date_t deadline = Date_t::max(),
-                            bool checkDeadlock = false) = 0;
+    virtual LockResult lock(ResourceId resId, LockMode mode, Date_t deadline = Date_t::max()) = 0;
 
     /**
      * Downgrades the specified resource's lock mode without changing the reference count.
@@ -368,6 +375,15 @@ public:
     virtual void restoreLockState(const LockSnapshot& stateToRestore) = 0;
 
     /**
+     * releaseWriteUnitOfWork opts out two-phase locking and yield the locks after a WUOW
+     * has been released. restoreWriteUnitOfWork reaquires the locks and resume the two-phase
+     * locking behavior of WUOW.
+     */
+    virtual bool releaseWriteUnitOfWork(LockSnapshot* stateOut) = 0;
+    virtual void restoreWriteUnitOfWork(OperationContext* opCtx,
+                                        const LockSnapshot& stateToRestore) = 0;
+
+    /**
      * Releases the ticket associated with the Locker. This allows locks to be held without
      * contributing to reader/writer throttling.
      */
@@ -394,6 +410,10 @@ public:
     virtual bool isLocked() const = 0;
     virtual bool isWriteLocked() const = 0;
     virtual bool isReadLocked() const = 0;
+
+    virtual bool isRSTLExclusive() const = 0;
+    virtual bool isRSTLLocked() const = 0;
+
     virtual bool isGlobalLockedRecursively() = 0;
 
     /**

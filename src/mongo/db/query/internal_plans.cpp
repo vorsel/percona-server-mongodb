@@ -82,6 +82,7 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> InternalPlanner::deleteWith
     PlanExecutor::YieldPolicy yieldPolicy,
     Direction direction,
     const RecordId& startLoc) {
+    invariant(collection);
     auto ws = stdx::make_unique<WorkingSet>();
 
     auto root = _collectionScan(opCtx, ws.get(), collection, direction, startLoc);
@@ -133,6 +134,7 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> InternalPlanner::deleteWith
     BoundInclusion boundInclusion,
     PlanExecutor::YieldPolicy yieldPolicy,
     Direction direction) {
+    invariant(collection);
     auto ws = stdx::make_unique<WorkingSet>();
 
     std::unique_ptr<PlanStage> root = _indexScan(opCtx,
@@ -160,9 +162,10 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> InternalPlanner::updateWith
     const IndexDescriptor* descriptor,
     const BSONObj& key,
     PlanExecutor::YieldPolicy yieldPolicy) {
+    invariant(collection);
     auto ws = stdx::make_unique<WorkingSet>();
 
-    auto idHackStage = stdx::make_unique<IDHackStage>(opCtx, collection, key, ws.get(), descriptor);
+    auto idHackStage = stdx::make_unique<IDHackStage>(opCtx, key, ws.get(), descriptor);
     auto root =
         stdx::make_unique<UpdateStage>(opCtx, params, ws.get(), collection, idHackStage.release());
 
@@ -204,7 +207,7 @@ std::unique_ptr<PlanStage> InternalPlanner::_indexScan(OperationContext* opCtx,
     invariant(collection);
     invariant(descriptor);
 
-    IndexScanParams params(opCtx, *descriptor);
+    IndexScanParams params(opCtx, descriptor);
     params.direction = direction;
     params.bounds.isSimpleRange = true;
     params.bounds.startKey = startKey;

@@ -231,11 +231,12 @@ public:
             boost::optional<Lock::CollectionLock> collLock;
             collLock.emplace(opCtx->lockState(), nss.ns(), MODE_IS);
 
-            auto const css = CollectionShardingState::get(opCtx, nss);
+            auto* const css = CollectionShardingState::get(opCtx, nss);
             const ChunkVersion collectionShardVersion = [&] {
-                auto metadata = css->getMetadata(opCtx);
-                return metadata->isSharded() ? metadata->getShardVersion()
-                                             : ChunkVersion::UNSHARDED();
+                auto optMetadata = css->getCurrentMetadataIfKnown();
+                return (optMetadata && (*optMetadata)->isSharded())
+                    ? (*optMetadata)->getShardVersion()
+                    : ChunkVersion::UNSHARDED();
             }();
 
             if (requestedVersion.isWriteCompatibleWith(collectionShardVersion)) {
@@ -349,11 +350,13 @@ public:
         {
             AutoGetCollection autoColl(opCtx, nss, MODE_IS);
 
-            ChunkVersion currVersion = ChunkVersion::UNSHARDED();
-            auto metadata = CollectionShardingState::get(opCtx, nss)->getMetadata(opCtx);
-            if (metadata->isSharded()) {
-                currVersion = metadata->getShardVersion();
-            }
+            const ChunkVersion currVersion = [&] {
+                auto* const css = CollectionShardingState::get(opCtx, nss);
+                auto optMetadata = css->getCurrentMetadataIfKnown();
+                return (optMetadata && (*optMetadata)->isSharded())
+                    ? (*optMetadata)->getShardVersion()
+                    : ChunkVersion::UNSHARDED();
+            }();
 
             if (!status.isOK()) {
                 // The reload itself was interrupted or confused here
@@ -380,7 +383,10 @@ public:
                                        << ", requested version is " << requestedVersion.toString()
                                        << " but found version " << currVersion.toString();
 
-                OCCASIONALLY warning() << errmsg;
+                static Occasionally sampler;
+                if (sampler.tick()) {
+                    warning() << errmsg;
+                }
 
                 // WARNING: the exact fields below are important for compatibility with mongos
                 // version reload.

@@ -123,6 +123,9 @@ public:
                                      StringData ident,
                                      const CollectionOptions& options) = 0;
 
+    virtual std::unique_ptr<RecordStore> makeTemporaryRecordStore(OperationContext* opCtx,
+                                                                  StringData ident) = 0;
+
     /**
      * Create a RecordStore that MongoDB considers eligible to share space in an underlying table
      * with other RecordStores. 'prefix' is guaranteed to be 'KVPrefix::kNotPrefixed' when
@@ -372,6 +375,11 @@ public:
      * See `StorageEngine::getAllCommittedTimestamp`
      */
     virtual Timestamp getAllCommittedTimestamp() const = 0;
+
+    /**
+     * See `StorageEngine::getOldestOpenReadTimestamp`
+     */
+    virtual Timestamp getOldestOpenReadTimestamp() const = 0;
 
     /**
      * See `StorageEngine::supportsReadConcernSnapshot`

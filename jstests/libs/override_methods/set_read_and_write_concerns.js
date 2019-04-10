@@ -1,10 +1,24 @@
 /**
  * Use prototype overrides to set read concern and write concern while running tests.
+ *
+ * A test can override the default read and write concern of commands by loading this library before
+ * the test is run and setting the 'TestData.defaultReadConcernLevel' or
+ * 'TestData.defaultWriteConcern' variables with the desired read/write concern level. For example,
+ * setting:
+ *
+ * TestData.defaultReadConcernLevel = "majority"
+ * TestData.writeConcernLevel = {w: "majority"}
+ *
+ * will run all commands with read/write concern "majority". It is also possible to only override
+ * the write concern of commands, by setting 'TestData.defaultReadConcernLevel' = null. This will
+ * not affect the default read concern of commands in any way.
+ *
  */
 (function() {
     "use strict";
 
     load("jstests/libs/override_methods/override_helpers.js");
+    load("jstests/libs/override_methods/read_and_write_concern_helpers.js");
 
     if (typeof TestData === "undefined" || !TestData.hasOwnProperty("defaultReadConcernLevel")) {
         throw new Error(
@@ -12,6 +26,8 @@
             " property on the global TestData object");
     }
 
+    // If the default read concern level is null, that indicates that no read concern overrides
+    // should be applied.
     const kDefaultReadConcern = {level: TestData.defaultReadConcernLevel};
     const kDefaultWriteConcern =
         (TestData.hasOwnProperty("defaultWriteConcern")) ? TestData.defaultWriteConcern : {
@@ -20,89 +36,6 @@
             // This way the wtimeout set by this override is distinguishable in the server logs.
             wtimeout: 5 * 60 * 1000 + 321,  // 300321ms
         };
-
-    const kCommandsSupportingReadConcern = new Set([
-        "aggregate",
-        "count",
-        "distinct",
-        "find",
-        "geoSearch",
-    ]);
-
-    const kCommandsOnlySupportingReadConcernSnapshot = new Set([
-        "delete",
-        "findAndModify",
-        "findandmodify",
-        "insert",
-        "update",
-    ]);
-
-    const kCommandsSupportingWriteConcern = new Set([
-        "_configsvrAddShard",
-        "_configsvrAddShardToZone",
-        "_configsvrCommitChunkMerge",
-        "_configsvrCommitChunkMigration",
-        "_configsvrCommitChunkSplit",
-        "_configsvrCreateDatabase",
-        "_configsvrEnableSharding",
-        "_configsvrMoveChunk",
-        "_configsvrMovePrimary",
-        "_configsvrRemoveShard",
-        "_configsvrRemoveShardFromZone",
-        "_configsvrShardCollection",
-        "_configsvrUpdateZoneKeyRange",
-        "_mergeAuthzCollections",
-        "_recvChunkStart",
-        "abortTransaction",
-        "appendOplogNote",
-        "applyOps",
-        "aggregate",
-        "captrunc",
-        "cleanupOrphaned",
-        "clone",
-        "cloneCollection",
-        "cloneCollectionAsCapped",
-        "collMod",
-        "commitTransaction",
-        "convertToCapped",
-        "create",
-        "createIndexes",
-        "createRole",
-        "createUser",
-        "delete",
-        "deleteIndexes",
-        "doTxn",
-        "drop",
-        "dropAllRolesFromDatabase",
-        "dropAllUsersFromDatabase",
-        "dropDatabase",
-        "dropIndexes",
-        "dropRole",
-        "dropUser",
-        "emptycapped",
-        "findAndModify",
-        "findandmodify",
-        "godinsert",
-        "grantPrivilegesToRole",
-        "grantRolesToRole",
-        "grantRolesToUser",
-        "insert",
-        "mapReduce",
-        "mapreduce",
-        "mapreduce.shardedfinish",
-        "moveChunk",
-        "renameCollection",
-        "revokePrivilegesFromRole",
-        "revokeRolesFromRole",
-        "revokeRolesFromUser",
-        "setFeatureCompatibilityVersion",
-        "update",
-        "updateRole",
-        "updateUser",
-    ]);
-
-    const kCommandsSupportingWriteConcernInTransaction =
-        new Set(["doTxn", "abortTransaction", "commitTransaction"]);
 
     function runCommandWithReadAndWriteConcerns(
         conn, dbName, commandName, commandObj, func, makeFuncArgs) {
@@ -136,8 +69,11 @@
             }
 
             if (OverrideHelpers.isAggregationWithOutStage(commandName, commandObjUnwrapped)) {
-                // The $out stage can only be used with readConcern={level: "local"}.
-                shouldForceReadConcern = false;
+                // The $out stage can only be used with readConcern={level: "local"} or
+                // readConcern={level: "majority"}
+                if (TestData.defaultReadConcernLevel === "linearizable") {
+                    shouldForceReadConcern = false;
+                }
             } else {
                 // A writeConcern can only be used with a $out stage.
                 shouldForceWriteConcern = false;
@@ -161,7 +97,8 @@
 
         const inWrappedForm = commandObj !== commandObjUnwrapped;
 
-        if (shouldForceReadConcern) {
+        // Only override read concern if an override level was specified.
+        if (shouldForceReadConcern && (kDefaultReadConcern.level !== null)) {
             // We create a copy of 'commandObj' to avoid mutating the parameter the caller
             // specified.
             commandObj = Object.assign({}, commandObj);

@@ -42,6 +42,7 @@
 #include "mongo/db/storage/kv/kv_catalog_feature_tracker.h"
 #include "mongo/db/storage/kv/kv_database_catalog_entry.h"
 #include "mongo/db/storage/kv/kv_engine.h"
+#include "mongo/db/storage/kv/temporary_kv_record_store.h"
 #include "mongo/db/storage/storage_repair_observer.h"
 #include "mongo/db/unclean_shutdown.h"
 #include "mongo/util/assert_util.h"
@@ -463,6 +464,10 @@ KVStorageEngine::reconcileCatalogAndIdents(OperationContext* opCtx) {
     return ret;
 }
 
+std::string KVStorageEngine::getFilesystemPathForDb(const std::string& dbName) const {
+    return _catalog->getFilesystemPathForDb(dbName);
+}
+
 void KVStorageEngine::cleanShutdown() {
     for (DBMap::const_iterator it = _dbs.begin(); it != _dbs.end(); ++it) {
         delete it->second;
@@ -636,6 +641,14 @@ Status KVStorageEngine::repairRecordStore(OperationContext* opCtx, const std::st
     return Status::OK();
 }
 
+std::unique_ptr<TemporaryRecordStore> KVStorageEngine::makeTemporaryRecordStore(
+    OperationContext* opCtx) {
+    std::unique_ptr<RecordStore> rs =
+        _engine->makeTemporaryRecordStore(opCtx, _catalog->newTempIdent());
+    LOG(1) << "created temporary record store: " << rs->getIdent();
+    return std::make_unique<TemporaryKVRecordStore>(opCtx, getEngine(), std::move(rs));
+}
+
 void KVStorageEngine::setJournalListener(JournalListener* jl) {
     _engine->setJournalListener(jl);
 }
@@ -725,6 +738,10 @@ Timestamp KVStorageEngine::getAllCommittedTimestamp() const {
     return _engine->getAllCommittedTimestamp();
 }
 
+Timestamp KVStorageEngine::getOldestOpenReadTimestamp() const {
+    return _engine->getOldestOpenReadTimestamp();
+}
+
 void KVStorageEngine::_dumpCatalog(OperationContext* opCtx) {
     auto catalogRs = _catalogRecordStore.get();
     auto cursor = catalogRs->getCursor(opCtx);
@@ -738,5 +755,6 @@ void KVStorageEngine::_dumpCatalog(OperationContext* opCtx) {
     }
     opCtx->recoveryUnit()->abandonSnapshot();
 }
+
 
 }  // namespace mongo

@@ -56,16 +56,6 @@ namespace {
 thread_local ServiceContext::UniqueClient currentClient;
 }  // namespace
 
-void Client::initThreadIfNotAlready(StringData desc) {
-    if (currentClient)
-        return;
-    initThread(desc);
-}
-
-void Client::initThreadIfNotAlready() {
-    initThreadIfNotAlready(getThreadName());
-}
-
 void Client::initThread(StringData desc, transport::SessionHandle session) {
     initThread(desc, getGlobalServiceContext(), std::move(session));
 }
@@ -86,11 +76,6 @@ void Client::initThread(StringData desc,
 
     // Create the client obj, attach to thread
     currentClient = service->makeClient(fullDesc, std::move(session));
-}
-
-void Client::destroy() {
-    invariant(haveClient());
-    currentClient.reset(nullptr);
 }
 
 namespace {
@@ -167,6 +152,21 @@ ServiceContext::UniqueClient Client::releaseCurrent() {
 void Client::setCurrent(ServiceContext::UniqueClient client) {
     invariant(!haveClient());
     currentClient = std::move(client);
+}
+
+ThreadClient::ThreadClient(ServiceContext* serviceContext)
+    : ThreadClient(getThreadName(), serviceContext, nullptr) {}
+
+ThreadClient::ThreadClient(StringData desc,
+                           ServiceContext* serviceContext,
+                           transport::SessionHandle session) {
+    invariant(!currentClient);
+    Client::initThread(desc, serviceContext, std::move(session));
+}
+
+ThreadClient::~ThreadClient() {
+    invariant(currentClient);
+    currentClient.reset(nullptr);
 }
 
 }  // namespace mongo

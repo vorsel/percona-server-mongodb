@@ -62,7 +62,8 @@ public:
 
     bool isReplEnabled() const override;
     bool isMasterForReportingPurposes() override;
-    bool isInPrimaryOrSecondaryState() const override;
+    bool isInPrimaryOrSecondaryState(OperationContext* opCtx) const override;
+    bool isInPrimaryOrSecondaryState_UNSAFE() const override;
 
     bool canAcceptWritesForDatabase(OperationContext* opCtx, StringData dbName) override;
     bool canAcceptWritesForDatabase_UNSAFE(OperationContext* opCtx, StringData dbName) override;
@@ -126,7 +127,11 @@ public:
 
     int getMyId() const override;
 
+    HostAndPort getMyHostAndPort() const override;
+
     Status setFollowerMode(const repl::MemberState&) override;
+
+    Status setFollowerModeStrict(OperationContext* opCtx, const repl::MemberState&) override;
 
     ApplierState getApplierState() override;
 
@@ -228,6 +233,8 @@ public:
     void signalDropPendingCollectionsRemovedFromStorage() final;
 
     boost::optional<Timestamp> getRecoveryTimestamp() override;
+
+    bool setContainsArbiter() const override;
 
 private:
     // Back pointer to the ServiceContext that has started the instance.

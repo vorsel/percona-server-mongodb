@@ -34,7 +34,6 @@
 
 #include "mongo/db/catalog/collection_info_cache_impl.h"
 
-#include "mongo/base/init.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/concurrency/d_concurrency.h"
@@ -49,15 +48,9 @@
 #include "mongo/db/ttl_collection_cache.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/clock_source.h"
-#include "mongo/util/debug_util.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
-MONGO_REGISTER_SHIM(CollectionInfoCache::makeImpl)
-(Collection* const collection, const NamespaceString& ns, PrivateTo<CollectionInfoCache>)
-    ->std::unique_ptr<CollectionInfoCache::Impl> {
-    return std::make_unique<CollectionInfoCacheImpl>(collection, ns);
-}
 
 CollectionInfoCacheImpl::CollectionInfoCacheImpl(Collection* collection, const NamespaceString& ns)
     : _collection(collection),
@@ -88,14 +81,16 @@ void CollectionInfoCacheImpl::computeIndexKeys(OperationContext* opCtx) {
     bool hadTTLIndex = _hasTTLIndex;
     _hasTTLIndex = false;
 
-    IndexCatalog::IndexIterator i = _collection->getIndexCatalog()->getIndexIterator(opCtx, true);
-    while (i.more()) {
-        IndexDescriptor* descriptor = i.next();
+    std::unique_ptr<IndexCatalog::IndexIterator> it =
+        _collection->getIndexCatalog()->getIndexIterator(opCtx, true);
+    while (it->more()) {
+        IndexCatalogEntry* entry = it->next();
+        IndexDescriptor* descriptor = entry->descriptor();
+        IndexAccessMethod* iam = entry->accessMethod();
 
         if (descriptor->getAccessMethodName() == IndexNames::WILDCARD) {
             // Obtain the projection used by the $** index's key generator.
-            const auto* pathProj =
-                static_cast<WildcardAccessMethod*>(i.accessMethod(descriptor))->getProjectionExec();
+            const auto* pathProj = static_cast<WildcardAccessMethod*>(iam)->getProjectionExec();
             // If the projection is an exclusion, then we must check the new document's keys on all
             // updates, since we do not exhaustively know the set of paths to be indexed.
             if (pathProj->getType() == ProjectionExecAgg::ProjectionType::kExclusionProjection) {
@@ -142,7 +137,6 @@ void CollectionInfoCacheImpl::computeIndexKeys(OperationContext* opCtx) {
         }
 
         // handle partial indexes
-        const IndexCatalogEntry* entry = i.catalogEntry(descriptor);
         const MatchExpression* filter = entry->getFilterExpression();
         if (filter) {
             stdx::unordered_set<std::string> paths;
@@ -199,11 +193,10 @@ void CollectionInfoCacheImpl::updatePlanCacheIndexEntries(OperationContext* opCt
     // TODO We shouldn't need to include unfinished indexes, but we must here because the index
     // catalog may be in an inconsistent state.  SERVER-18346.
     const bool includeUnfinishedIndexes = true;
-    IndexCatalog::IndexIterator ii =
+    std::unique_ptr<IndexCatalog::IndexIterator> ii =
         _collection->getIndexCatalog()->getIndexIterator(opCtx, includeUnfinishedIndexes);
-    while (ii.more()) {
-        const IndexDescriptor* desc = ii.next();
-        const IndexCatalogEntry* ice = ii.catalogEntry(desc);
+    while (ii->more()) {
+        const IndexCatalogEntry* ice = ii->next();
         indexEntries.emplace_back(indexEntryFromIndexCatalogEntry(opCtx, *ice));
     }
 
@@ -215,10 +208,10 @@ void CollectionInfoCacheImpl::init(OperationContext* opCtx) {
     invariant(opCtx->lockState()->isCollectionLockedForMode(_collection->ns().ns(), MODE_X));
 
     const bool includeUnfinishedIndexes = false;
-    IndexCatalog::IndexIterator ii =
+    std::unique_ptr<IndexCatalog::IndexIterator> ii =
         _collection->getIndexCatalog()->getIndexIterator(opCtx, includeUnfinishedIndexes);
-    while (ii.more()) {
-        const IndexDescriptor* desc = ii.next();
+    while (ii->more()) {
+        const IndexDescriptor* desc = ii->next()->descriptor();
         _indexUsageTracker.registerIndex(desc->indexName(), desc->keyPattern());
     }
 

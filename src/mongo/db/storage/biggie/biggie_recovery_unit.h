@@ -1,5 +1,3 @@
-// biggie_recovery_unit.h
-
 
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
@@ -44,15 +42,9 @@ namespace mongo {
 namespace biggie {
 
 class RecoveryUnit : public ::mongo::RecoveryUnit {
-    stdx::function<void()> _waitUntilDurableCallback;
-    // Official master is kept by KVEngine
-    KVEngine* _KVEngine;
-    bool _dirty = false;  // Whether or not we have written to this _workingCopy.
-    std::shared_ptr<StringStore> _mergeBase;
-    std::unique_ptr<StringStore> _workingCopy;
-
 public:
     RecoveryUnit(KVEngine* parentKVEngine, stdx::function<void()> cb = nullptr);
+    ~RecoveryUnit();
 
     void beginUnitOfWork(OperationContext* opCtx) override final;
     void commitUnitOfWork() override final;
@@ -69,22 +61,37 @@ public:
     virtual void setOrderedCommit(bool orderedCommit) override;
 
     // Biggie specific function declarations below.
-    StringStore* getWorkingCopy() {
-        return _workingCopy.get();
+    StringStore* getHead() {
+        forkIfNeeded();
+        return &_workingCopy;
     }
+
     inline void makeDirty() {
         _dirty = true;
     }
+
     /**
      * Checks if there already exists a current working copy and merge base; if not fetches
      * one and creates them.
      */
     bool forkIfNeeded();
 
-private:
-    typedef std::shared_ptr<Change> ChangePtr;
-    typedef std::vector<ChangePtr> Changes;
+    static RecoveryUnit* get(OperationContext* opCtx);
 
+private:
+    void _abort();
+
+    stdx::function<void()> _waitUntilDurableCallback;
+    // Official master is kept by KVEngine
+    KVEngine* _KVEngine;
+    StringStore _mergeBase;
+    StringStore _workingCopy;
+
+    bool _forked = false;
+    bool _dirty = false;  // Whether or not we have written to this _workingCopy.
+    bool _inUnitOfWork = false;
+
+    typedef std::vector<std::unique_ptr<Change>> Changes;
     Changes _changes;
 };
 

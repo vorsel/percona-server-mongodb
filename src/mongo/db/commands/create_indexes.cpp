@@ -28,6 +28,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
+
 #include "mongo/platform/basic.h"
 
 #include <string>
@@ -60,6 +62,8 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/views/view_catalog.h"
 #include "mongo/s/shard_key_pattern.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -67,6 +71,10 @@ namespace mongo {
 using std::string;
 
 using IndexVersion = IndexDescriptor::IndexVersion;
+
+MONGO_FAIL_POINT_DEFINE(hangAfterIndexBuildFirstDrain);
+MONGO_FAIL_POINT_DEFINE(hangAfterIndexBuildSecondDrain);
+MONGO_FAIL_POINT_DEFINE(hangAfterIndexBuildDumpsInsertsFromBulk);
 
 namespace {
 
@@ -235,8 +243,6 @@ std::vector<BSONObj> resolveDefaultsAndRemoveExistingIndexes(OperationContext* o
     return specs;
 }
 
-}  // namespace
-
 /**
  * { createIndexes : "bar", indexes : [ { ns : "test.bar", key : { x : 1 }, name: "x_1" } ] }
  */
@@ -244,16 +250,17 @@ class CmdCreateIndex : public ErrmsgCommandDeprecated {
 public:
     CmdCreateIndex() : ErrmsgCommandDeprecated(kCommandName) {}
 
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
     }
+
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
 
-    virtual Status checkAuthForCommand(Client* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj) const {
+    Status checkAuthForCommand(Client* client,
+                               const std::string& dbname,
+                               const BSONObj& cmdObj) const override {
         ActionSet actions;
         actions.addAction(ActionType::createIndex);
         Privilege p(parseResourcePattern(dbname, cmdObj), actions);
@@ -262,26 +269,22 @@ public:
         return Status(ErrorCodes::Unauthorized, "Unauthorized");
     }
 
-    virtual bool errmsgRun(OperationContext* opCtx,
-                           const string& dbname,
-                           const BSONObj& cmdObj,
-                           string& errmsg,
-                           BSONObjBuilder& result) {
+    bool errmsgRun(OperationContext* opCtx,
+                   const string& dbname,
+                   const BSONObj& cmdObj,
+                   string& errmsg,
+                   BSONObjBuilder& result) override {
         const NamespaceString ns(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
+        uassertStatusOK(userAllowedWriteNS(ns));
 
-        Status status = userAllowedWriteNS(ns);
-        uassertStatusOK(status);
-
-        // Disallow users from creating new indexes on config.transactions since the sessions
-        // code was optimized to not update indexes.
+        // Disallow users from creating new indexes on config.transactions since the sessions code
+        // was optimized to not update indexes
         uassert(ErrorCodes::IllegalOperation,
                 str::stream() << "not allowed to create index on " << ns.ns(),
                 ns != NamespaceString::kSessionTransactionsTableNamespace);
 
-        auto specsWithStatus =
-            parseAndValidateIndexSpecs(opCtx, ns, cmdObj, serverGlobalParams.featureCompatibility);
-        uassertStatusOK(specsWithStatus.getStatus());
-        auto specs = std::move(specsWithStatus.getValue());
+        auto specs = uassertStatusOK(
+            parseAndValidateIndexSpecs(opCtx, ns, cmdObj, serverGlobalParams.featureCompatibility));
 
         // Do not use AutoGetOrCreateDb because we may relock the database in mode X.
         Lock::DBLock dbLock(opCtx, ns.db(), MODE_IX);
@@ -336,8 +339,7 @@ public:
                 uasserted(ErrorCodes::CommandNotSupportedOnView, errmsg);
             }
 
-            status = userAllowedCreateNS(ns.db(), ns.coll());
-            uassertStatusOK(status);
+            uassertStatusOK(userAllowedCreateNS(ns.db(), ns.coll()));
 
             writeConflictRetry(opCtx, kCommandName, ns.ns(), [&] {
                 WriteUnitOfWork wunit(opCtx);
@@ -351,7 +353,11 @@ public:
         // Use AutoStatsTracker to update Top.
         boost::optional<AutoStatsTracker> statsTracker;
         const boost::optional<int> dbProfilingLevel = boost::none;
-        statsTracker.emplace(opCtx, ns, Top::LockType::WriteLocked, dbProfilingLevel);
+        statsTracker.emplace(opCtx,
+                             ns,
+                             Top::LockType::WriteLocked,
+                             AutoStatsTracker::LogMode::kUpdateTopAndCurop,
+                             dbProfilingLevel);
 
 
         MultiIndexBlockImpl indexer(opCtx, collection);
@@ -375,8 +381,7 @@ public:
         for (size_t i = 0; i < specs.size(); i++) {
             const BSONObj& spec = specs[i];
             if (spec["unique"].trueValue()) {
-                status = checkUniqueIndexConstraints(opCtx, ns, spec["key"].Obj());
-                uassertStatusOK(status);
+                _checkUniqueIndexConstraints(opCtx, ns, spec["key"].Obj());
             }
         }
 
@@ -392,11 +397,7 @@ public:
             dbLock.relockWithMode(MODE_IX);
         }
 
-        try {
-            Lock::CollectionLock colLock(opCtx->lockState(), ns.ns(), MODE_IX);
-            uassertStatusOK(indexer.insertAllDocumentsInCollection());
-        } catch (const DBException& e) {
-            invariant(e.code() != ErrorCodes::WriteConflict);
+        auto relockOnErrorGuard = MakeGuard([&] {
             // Must have exclusive DB lock before we clean up the index build via the
             // destructor of 'indexer'.
             if (indexer.getBuildInBackground()) {
@@ -409,8 +410,50 @@ public:
                     std::terminate();
                 }
             }
-            throw;
+        });
+
+        // Collection scan and insert into index, followed by a drain of writes received in the
+        // background.
+        {
+            Lock::CollectionLock colLock(opCtx->lockState(), ns.ns(), MODE_IX);
+            uassertStatusOK(indexer.insertAllDocumentsInCollection());
         }
+
+        if (MONGO_FAIL_POINT(hangAfterIndexBuildDumpsInsertsFromBulk)) {
+            log() << "Hanging after dumping inserts from bulk builder";
+            MONGO_FAIL_POINT_PAUSE_WHILE_SET(hangAfterIndexBuildDumpsInsertsFromBulk);
+        }
+
+        // Perform the first drain while holding an intent lock.
+        {
+            opCtx->recoveryUnit()->abandonSnapshot();
+            Lock::CollectionLock colLock(opCtx->lockState(), ns.ns(), MODE_IS);
+
+            LOG(1) << "performing first index build drain";
+            uassertStatusOK(indexer.drainBackgroundWritesIfNeeded());
+        }
+
+        if (MONGO_FAIL_POINT(hangAfterIndexBuildFirstDrain)) {
+            log() << "Hanging after index build first drain";
+            MONGO_FAIL_POINT_PAUSE_WHILE_SET(hangAfterIndexBuildFirstDrain);
+        }
+
+        // Perform the second drain while stopping writes on the collection.
+        {
+            opCtx->recoveryUnit()->abandonSnapshot();
+            Lock::CollectionLock colLock(opCtx->lockState(), ns.ns(), MODE_S);
+
+            LOG(1) << "performing second index build drain";
+            uassertStatusOK(indexer.drainBackgroundWritesIfNeeded());
+        }
+
+        if (MONGO_FAIL_POINT(hangAfterIndexBuildSecondDrain)) {
+            log() << "Hanging after index build second drain";
+            MONGO_FAIL_POINT_PAUSE_WHILE_SET(hangAfterIndexBuildSecondDrain);
+        }
+
+        relockOnErrorGuard.Dismiss();
+
         // Need to return db lock back to exclusive, to complete the index build.
         if (indexer.getBuildInBackground()) {
             opCtx->recoveryUnit()->abandonSnapshot();
@@ -421,17 +464,22 @@ public:
                 DatabaseShardingState::get(db).checkDbVersion(opCtx);
             }
 
-            uassert(28551, "database dropped during index build", db);
-            uassert(28552, "collection dropped during index build", db->getCollection(opCtx, ns));
+            invariant(db);
+            invariant(db->getCollection(opCtx, ns));
         }
+
+        // Perform the third and final drain after releasing a shared lock and reacquiring an
+        // exclusive lock on the database.
+        LOG(1) << "performing final index build drain";
+        uassertStatusOK(indexer.drainBackgroundWritesIfNeeded());
 
         writeConflictRetry(opCtx, kCommandName, ns.ns(), [&] {
             WriteUnitOfWork wunit(opCtx);
 
-            indexer.commit([opCtx, &ns, collection](const BSONObj& spec) {
+            uassertStatusOK(indexer.commit([opCtx, &ns, collection](const BSONObj& spec) {
                 opCtx->getServiceContext()->getOpObserver()->onCreateIndex(
                     opCtx, ns, *(collection->uuid()), spec, false);
-            });
+            }));
 
             wunit.commit();
         });
@@ -442,24 +490,24 @@ public:
     }
 
 private:
-    static Status checkUniqueIndexConstraints(OperationContext* opCtx,
-                                              const NamespaceString& nss,
-                                              const BSONObj& newIdxKey) {
+    static void _checkUniqueIndexConstraints(OperationContext* opCtx,
+                                             const NamespaceString& nss,
+                                             const BSONObj& newIdxKey) {
         invariant(opCtx->lockState()->isCollectionLockedForMode(nss.ns(), MODE_X));
 
-        auto metadata = CollectionShardingState::get(opCtx, nss)->getMetadata(opCtx);
-        if (metadata->isSharded()) {
-            ShardKeyPattern shardKeyPattern(metadata->getKeyPattern());
-            if (!shardKeyPattern.isUniqueIndexCompatible(newIdxKey)) {
-                return Status(ErrorCodes::CannotCreateIndex,
-                              str::stream() << "cannot create unique index over " << newIdxKey
-                                            << " with shard key pattern "
-                                            << shardKeyPattern.toBSON());
-            }
-        }
+        const auto metadata = CollectionShardingState::get(opCtx, nss)->getCurrentMetadata();
+        if (!metadata->isSharded())
+            return;
 
-
-        return Status::OK();
+        const ShardKeyPattern shardKeyPattern(metadata->getKeyPattern());
+        uassert(ErrorCodes::CannotCreateIndex,
+                str::stream() << "cannot create unique index over " << newIdxKey
+                              << " with shard key pattern "
+                              << shardKeyPattern.toBSON(),
+                shardKeyPattern.isUniqueIndexCompatible(newIdxKey));
     }
+
 } cmdCreateIndex;
-}
+
+}  // namespace
+}  // namespace mongo

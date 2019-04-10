@@ -37,42 +37,110 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/transaction_coordinator.h"
-#include "mongo/db/transaction_coordinator_commands_impl.h"
-#include "mongo/executor/task_executor.h"
+#include "mongo/db/transaction_coordinator_util.h"
+#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/s/grid.h"
 #include "mongo/s/shard_id.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 
 namespace {
+
 const auto transactionCoordinatorServiceDecoration =
     ServiceContext::declareDecoration<TransactionCoordinatorService>();
 
-void doCoordinatorAction(OperationContext* opCtx,
-                         std::shared_ptr<TransactionCoordinator> coordinator,
-                         TransactionCoordinator::StateMachine::Action action) {
-    switch (action) {
-        case TransactionCoordinator::StateMachine::Action::kSendCommit: {
-            txn::sendCommit(opCtx,
-                            coordinator,
-                            coordinator->getNonAckedCommitParticipants(),
-                            coordinator->getCommitTimestamp());
-            break;
+using Action = TransactionCoordinator::StateMachine::Action;
+using State = TransactionCoordinator::StateMachine::State;
+
+/**
+ * Constructs the default options for the thread pool used to run commit.
+ */
+ThreadPool::Options makeDefaultThreadPoolOptions() {
+    ThreadPool::Options options;
+    options.poolName = "TransactionCoordinatorService";
+    options.minThreads = 0;
+    options.maxThreads = 20;
+
+    // Ensure all threads have a client
+    options.onCreateThread = [](const std::string& threadName) {
+        Client::initThread(threadName.c_str());
+    };
+    return options;
+}
+
+void driveCoordinatorUntilDone(OperationContext* opCtx,
+                               std::shared_ptr<TransactionCoordinator> coordinator,
+                               const LogicalSessionId& lsid,
+                               const TxnNumber& txnNumber,
+                               Action action) {
+    while (true) {
+        switch (action) {
+            case Action::kWriteParticipantList:
+                action = coordinator->madeParticipantListDurable();
+                break;
+            case Action::kSendPrepare:
+                action = txn::sendPrepare(
+                    opCtx, lsid, txnNumber, coordinator, coordinator->getParticipants());
+                break;
+            case Action::kWriteAbortDecision:
+                action = coordinator->madeAbortDecisionDurable();
+                break;
+            case Action::kSendAbort:
+                action = txn::sendAbort(opCtx,
+                                        lsid,
+                                        txnNumber,
+                                        coordinator,
+                                        coordinator->getNonVotedAbortParticipants());
+                break;
+            case Action::kWriteCommitDecision:
+                action = coordinator->madeCommitDecisionDurable();
+                break;
+            case Action::kSendCommit:
+                action = txn::sendCommit(opCtx,
+                                         lsid,
+                                         txnNumber,
+                                         coordinator,
+                                         coordinator->getNonAckedCommitParticipants(),
+                                         coordinator->getCommitTimestamp().get());
+                break;
+            case Action::kDone:
+                return;
+            case Action::kNone:
+                // This means an event was delivered to the coordinator outside the expected order
+                // of events.
+                MONGO_UNREACHABLE;
         }
-        case TransactionCoordinator::StateMachine::Action::kSendAbort: {
-            txn::sendAbort(opCtx, coordinator->getNonVotedAbortParticipants());
-            break;
-        }
-        case TransactionCoordinator::StateMachine::Action::kNone:
-            break;
     }
 }
+
+void launchCoordinateCommitTask(ThreadPool& threadPool,
+                                std::shared_ptr<TransactionCoordinator> coordinator,
+                                const LogicalSessionId& lsid,
+                                const TxnNumber& txnNumber,
+                                TransactionCoordinator::StateMachine::Action initialAction) {
+    auto ch = threadPool.schedule([coordinator, lsid, txnNumber, initialAction]() {
+        try {
+            // The opCtx destructor handles unsetting itself from the Client
+            auto opCtx = Client::getCurrent()->makeOperationContext();
+            driveCoordinatorUntilDone(opCtx.get(), coordinator, lsid, txnNumber, initialAction);
+        } catch (const DBException& e) {
+            log() << "Exception was thrown while coordinating commit: " << causedBy(e.toStatus());
+        }
+    });
 }
 
-TransactionCoordinatorService::TransactionCoordinatorService()
-    : _coordinatorCatalog(std::make_shared<TransactionCoordinatorCatalog>()) {}
+}  // namespace
 
-TransactionCoordinatorService::~TransactionCoordinatorService() = default;
+TransactionCoordinatorService::TransactionCoordinatorService()
+    : _coordinatorCatalog(std::make_shared<TransactionCoordinatorCatalog>()),
+      _threadPool(makeDefaultThreadPoolOptions()) {
+    _threadPool.startup();
+}
+
+void TransactionCoordinatorService::shutdown() {
+    _threadPool.shutdown();
+}
 
 TransactionCoordinatorService* TransactionCoordinatorService::get(OperationContext* opCtx) {
     return get(opCtx->getServiceContext());
@@ -100,22 +168,20 @@ void TransactionCoordinatorService::createCoordinator(OperationContext* opCtx,
                     "Cannot start a new transaction with the same session ID and transaction "
                     "number as a transaction that has already begun two-phase commit.",
                     latestCoordinator->state() ==
-                        TransactionCoordinator::StateMachine::State::kWaitingForParticipantList);
+                        TransactionCoordinator::StateMachine::State::kUninitialized);
 
             return;
         }
         // Call tryAbort on previous coordinator.
-        auto actionToTake = latestCoordinator.get()->recvTryAbort();
-        doCoordinatorAction(opCtx, latestCoordinator, actionToTake);
+        latestCoordinator.get()->recvTryAbort();
     }
 
     _coordinatorCatalog->create(lsid, txnNumber);
 
     // TODO (SERVER-37024): Schedule abort task on executor to execute at commitDeadline.
-    // TODO (SERVER-37025): Schedule poke task on executor.
 }
 
-Future<TransactionCoordinatorService::CommitDecision>
+boost::optional<Future<TransactionCoordinator::CommitDecision>>
 TransactionCoordinatorService::coordinateCommit(OperationContext* opCtx,
                                                 LogicalSessionId lsid,
                                                 TxnNumber txnNumber,
@@ -123,49 +189,53 @@ TransactionCoordinatorService::coordinateCommit(OperationContext* opCtx,
 
     auto coordinator = _coordinatorCatalog->get(lsid, txnNumber);
     if (!coordinator) {
-        return TransactionCoordinatorService::CommitDecision::kAbort;
+        return boost::none;
     }
 
-    auto actionToTake = coordinator.get()->recvCoordinateCommit(participantList);
-    doCoordinatorAction(opCtx, coordinator.get(), actionToTake);
+    Action initialAction = coordinator->recvCoordinateCommit(participantList);
+    if (initialAction != Action::kNone) {
+        launchCoordinateCommitTask(_threadPool, coordinator, lsid, txnNumber, initialAction);
+    }
 
-    return coordinator.get()->waitForCompletion().then([](auto finalState) {
+    return coordinator->waitForCompletion().then([](auto finalState) {
         switch (finalState) {
             case TransactionCoordinator::StateMachine::State::kAborted:
-                return TransactionCoordinatorService::CommitDecision::kAbort;
+                return TransactionCoordinator::CommitDecision::kAbort;
             case TransactionCoordinator::StateMachine::State::kCommitted:
-                return TransactionCoordinatorService::CommitDecision::kCommit;
+                return TransactionCoordinator::CommitDecision::kCommit;
             default:
                 MONGO_UNREACHABLE;
         }
     });
+    // TODO (SERVER-37364): Re-enable the coordinator returning the decision as soon as the decision
+    // is made durable. Currently the coordinator waits to hear acks because participants in prepare
+    // reject requests with a higher transaction number, causing tests to fail.
+    // return coordinator.get()->waitForDecision();
 }
 
-void TransactionCoordinatorService::voteCommit(OperationContext* opCtx,
-                                               LogicalSessionId lsid,
-                                               TxnNumber txnNumber,
-                                               const ShardId& shardId,
-                                               Timestamp prepareTimestamp) {
+boost::optional<Future<TransactionCoordinator::CommitDecision>>
+TransactionCoordinatorService::recoverCommit(OperationContext* opCtx,
+                                             LogicalSessionId lsid,
+                                             TxnNumber txnNumber) {
     auto coordinator = _coordinatorCatalog->get(lsid, txnNumber);
     if (!coordinator) {
-        txn::sendAbort(opCtx, {shardId});
-        return;
+        return boost::none;
     }
 
-    auto actionToTake = coordinator.get()->recvVoteCommit(shardId, prepareTimestamp);
-    doCoordinatorAction(opCtx, coordinator.get(), actionToTake);
-}
-
-void TransactionCoordinatorService::voteAbort(OperationContext* opCtx,
-                                              LogicalSessionId lsid,
-                                              TxnNumber txnNumber,
-                                              const ShardId& shardId) {
-    auto coordinator = _coordinatorCatalog->get(lsid, txnNumber);
-
-    if (coordinator) {
-        auto actionToTake = coordinator.get()->recvVoteAbort(shardId);
-        doCoordinatorAction(opCtx, coordinator.get(), actionToTake);
-    }
+    return coordinator->waitForCompletion().then([](auto finalState) {
+        switch (finalState) {
+            case TransactionCoordinator::StateMachine::State::kAborted:
+                return TransactionCoordinator::CommitDecision::kAbort;
+            case TransactionCoordinator::StateMachine::State::kCommitted:
+                return TransactionCoordinator::CommitDecision::kCommit;
+            default:
+                MONGO_UNREACHABLE;
+        }
+    });
+    // TODO (SERVER-37364): Re-enable the coordinator returning the decision as soon as the decision
+    // is made durable. Currently the coordinator waits to hear acks because participants in prepare
+    // reject requests with a higher transaction number, causing tests to fail.
+    // return coordinator.get()->waitForDecision();
 }
 
 }  // namespace mongo

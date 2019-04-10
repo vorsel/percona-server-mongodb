@@ -52,9 +52,6 @@
 
 namespace mongo {
 
-template <typename T>
-class SharedPromise;
-
 namespace future_details {
 template <typename T>
 class Promise;
@@ -64,6 +61,14 @@ class Future;
 template <>
 class Future<void>;
 
+template <typename T>
+class SharedPromise;
+
+template <typename T>
+class SharedSemiFuture;
+template <>
+class SharedSemiFuture<void>;
+
 // Using extern constexpr to prevent the compiler from allocating storage as a poor man's c++17
 // inline constexpr variable.
 // TODO delete extern in c++17 because inline is the default for constexper variables.
@@ -71,6 +76,8 @@ template <typename T>
 extern constexpr bool isFuture = false;
 template <typename T>
 extern constexpr bool isFuture<Future<T>> = true;
+template <typename T>
+extern constexpr bool isFuture<SharedSemiFuture<T>> = true;
 
 // This is used to "normalize" void since it can't be used as an argument and it becomes Status
 // rather than StatusWith<void>.
@@ -301,11 +308,41 @@ using SharedState = SharedStateImpl<VoidToFakeVoid<T>>;
 
 /**
  * SSB is SharedStateBase, and this is its current state.
+ *
+ * Legal transitions on future side:
+ *      kInit -> kWaiting
+ *      kInit -> kHaveContinuation
+ *      kWaiting -> kHaveContinuation
+ *
+ * Legal transitions on promise side:
+ *      kInit -> kFinished
+ *      kWaiting -> kFinished
+ *      kHaveContinuation -> kFinished
+ *
+ * Note that all and only downward transitions are legal.
+ *
+ * Each thread must change the state *after* it is set up all data that it is releasing to the other
+ * side. This must be done with an exchange() or compareExchange() so that you know what to do if
+ * the other side finished its transition before you.
  */
 enum class SSBState : uint8_t {
+    // Initial state: Promise hasn't been completed and has nothing to do when it is.
     kInit,
+
+    // Promise hasn't been completed. Someone has constructed the condvar and may be waiting on it.
+    // We do not transition back to kInit if they give up on waiting. There is also no continuation
+    // registered in this state.
     kWaiting,
-    kFinished,  // This should stay last since we have code like assert(state < kFinished).
+
+    // Promise hasn't been completed. Someone has registered a callback to be run when it is.
+    //
+    // There is no-one currently waiting on the condvar. TODO This assumption will need to change
+    // when we add continuation support to SharedSemiFuture.
+    kHaveContinuation,
+
+    // The promise has been completed with a value or error. This is the terminal state. This should
+    // stay last since we have code like assert(state < kFinished).
+    kFinished,
 };
 
 class SharedStateBase : public FutureRefCountable {
@@ -317,22 +354,30 @@ public:
 
     virtual ~SharedStateBase() = default;
 
-    // Only called by future side.
+    // Only called by future side, but may be called multiple times if waiting times out and is
+    // retried.
     void wait(Interruptible* interruptible) {
         if (state.load(std::memory_order_acquire) == SSBState::kFinished)
             return;
 
-        cv.emplace();
+        stdx::unique_lock<stdx::mutex> lk(mx);
+        if (!cv) {
+            cv.emplace();
 
-        auto oldState = SSBState::kInit;
-        if (MONGO_unlikely(!state.compare_exchange_strong(
-                oldState, SSBState::kWaiting, std::memory_order_acq_rel))) {
-            // transitionToFinished() transitioned after we did our initial check.
-            dassert(oldState == SSBState::kFinished);
-            return;
+            auto oldState = SSBState::kInit;
+            if (MONGO_unlikely(!state.compare_exchange_strong(
+                    oldState, SSBState::kWaiting, std::memory_order_acq_rel))) {
+                // transitionToFinished() transitioned after we did our initial check.
+                dassert(oldState == SSBState::kFinished);
+                return;
+            }
+        } else {
+            // Someone has already created the cv and put us in the waiting state. The promise may
+            // also have completed after we checked above, so we can't assume we aren't at
+            // kFinished.
+            dassert(state.load() != SSBState::kInit);
         }
 
-        stdx::unique_lock<stdx::mutex> lk(mx);
         interruptible->waitForConditionOrInterrupt(*cv, lk, [&] {
             // The mx locking above is insufficient to establish an acquire if state transitions to
             // kFinished before we get here, but we aquire mx before the producer does.
@@ -346,7 +391,7 @@ public:
         if (oldState == SSBState::kInit)
             return;
 
-        dassert(oldState == SSBState::kWaiting);
+        dassert(oldState == SSBState::kWaiting || oldState == SSBState::kHaveContinuation);
 
         DEV {
             // If you hit this limit one of two things has probably happened
@@ -360,7 +405,7 @@ public:
 
             size_t depth = 0;
             for (auto ssb = continuation.get(); ssb;
-                 ssb = ssb->state.load(std::memory_order_acquire) == SSBState::kWaiting
+                 ssb = ssb->state.load(std::memory_order_acquire) == SSBState::kHaveContinuation
                      ? ssb->continuation.get()
                      : nullptr) {
                 depth++;
@@ -369,11 +414,10 @@ public:
             }
         }
 
-        if (callback) {
+        if (oldState == SSBState::kHaveContinuation) {
+            invariant(callback);
             callback(this);
-        }
-
-        if (cv) {
+        } else if (cv) {
             stdx::unique_lock<stdx::mutex> lk(mx);
             // This must be done inside the lock to correctly synchronize with wait().
             cv->notify_all();
@@ -470,22 +514,19 @@ struct SharedStateImpl final : SharedStateBase {
 // public API.
 using future_details::Promise;
 using future_details::Future;
+using future_details::SharedPromise;
+using future_details::SharedSemiFuture;
 
 /**
  * This class represents the producer side of a Future.
  *
- * This is a single-shot class. You may only extract the Future once, and you may either set a value
- * or error at most once. Extracting the future and setting the value/error can be done in either
- * order.
+ * This is a single-shot class: you may either set a value or error at most once. If no value or
+ * error has been set at the time this Promise is destroyed, a error will be set with
+ * ErrorCode::BrokenPromise. This should generally be considered a programmer error, and should not
+ * be relied upon. We may make it debug-fatal in the future.
  *
- * If the Future has been extracted, but no value or error has been set at the time this Promise is
- * destroyed, a error will be set with ErrorCode::BrokenPromise. This should generally be considered
- * a programmer error, and should not be relied upon. We may make it debug-fatal in the future.
- *
- * Only one thread can use a given Promise at a time. It is legal to have different threads setting
- * the value/error and extracting the Future, but it is the user's responsibility to ensure that
- * those calls are strictly synchronized. This is usually easiest to achieve by calling
- * makePromiseFuture<T>() then passing a SharedPromise to the completing threads.
+ * Only one thread can use a given Promise at a time, but another thread may be using the associated
+ * Future object.
  *
  * If the result is ready when producing the Future, it is more efficient to use
  * makeReadyFutureWith() or Future<T>::makeReady() than to use a Promise<T>.
@@ -569,18 +610,6 @@ public:
         });
     }
 
-    /**
-     * Get a copyable SharedPromise that can be used to complete this Promise's Future.
-     *
-     * Callers are required to extract the Future before calling share() to prevent race conditions.
-     * Even with a SharedPromise, callers must ensure it is only completed at most once. Copyability
-     * is primarily to allow capturing lambdas to be put in std::functions which don't support
-     * move-only types.
-     *
-     * It is safe to destroy the original Promise as soon as this call returns.
-     */
-    SharedPromise<T> share() noexcept;
-
     static auto makePromiseFutureImpl() {
         struct PromiseAndFuture {
             Promise<T> promise{make_intrusive<SharedState<T>>()};
@@ -621,54 +650,6 @@ private:
 };
 
 /**
- * A SharedPromise is a copyable object that can be used to complete a Promise.
- *
- * All copies derived from the same call to Promise::share() will complete the same shared state.
- * Callers must ensure that the shared state is only completed at most once. Copyability is
- * primarily to allow capturing lambdas to be put in std::functions which don't support move-only
- * types. If the final derived SharedPromise is destroyed without completion, the Promise will be
- * broken.
- *
- * All methods behave the same as on the underlying Promise.
- */
-template <typename T>
-class SharedPromise {
-public:
-    SharedPromise() = default;
-
-    template <typename Func>
-    void setWith(Func&& func) noexcept {
-        _promise->setWith(std::forward<Func>(func));
-    }
-
-    void setFrom(Future<T>&& future) noexcept {
-        _promise->setFrom(std::move(future));
-    }
-
-    template <typename... Args>
-    void emplaceValue(Args&&... args) noexcept {
-        _promise->emplaceValue(std::forward<Args>(args)...);
-    }
-
-    void setError(Status status) noexcept {
-        _promise->setError(std::move(status));
-    }
-
-private:
-    // Only Promise<T> needs to be a friend, but MSVC2015 doesn't respect that friendship.
-    // TODO see if this is still needed on MSVC2017+
-    template <typename T2>
-    friend class Promise;
-
-    explicit SharedPromise(std::shared_ptr<Promise<T>>&& promise) : _promise(std::move(promise)) {}
-
-    // TODO consider adding a SharedPromise refcount to SharedStateBase to avoid the extra
-    // allocation. The tricky part will be ensuring that BrokenPromise is set when the last copy is
-    // destroyed.
-    std::shared_ptr<Promise<T>> _promise;
-};
-
-/**
  * Future<T> is logically a possibly-deferred StatusWith<T> (or Status when T is void).
  *
  * As is usual for rvalue-qualified methods, you may call at most one of them on a given Future.
@@ -686,7 +667,7 @@ public:
     static_assert(!std::is_same<T, Status>::value,
                   "Future<Status> is banned. Use Future<void> instead.");
     static_assert(!isStatusWith<T>, "Future<StatusWith<T>> is banned. Just use Future<T> instead.");
-    static_assert(!isFuture<T>, "Future<Future<T>> is banned. Just use Future<T> instead.");
+    static_assert(!isFuture<T>, "Future of Future types is banned. Just use Future<T> instead.");
     static_assert(!std::is_reference<T>::value, "Future<T&> is banned.");
     static_assert(!std::is_const<T>::value, "Future<const T> is banned.");
     static_assert(!std::is_array<T>::value, "Future<T[]> is banned.");
@@ -737,6 +718,11 @@ public:
             return makeReady(std::move(val.getValue()));
         return makeReady(val.getStatus());
     }
+
+    /**
+     * Convert this Future to a SharedSemiFuture.
+     */
+    SharedSemiFuture<T> share() && noexcept;
 
     /**
      * If this returns true, get() is guaranteed not to block and callbacks will be immediately
@@ -1162,7 +1148,9 @@ private:
             return success(std::move(*_immediate));
         }
 
-        if (_shared->state.load(std::memory_order_acquire) == SSBState::kFinished) {
+        auto oldState = _shared->state.load(std::memory_order_acquire);
+        dassert(oldState != SSBState::kHaveContinuation);
+        if (oldState == SSBState::kFinished) {
             if (_shared->status.isOK()) {
                 return success(std::move(*_shared->data));
             } else {
@@ -1174,9 +1162,10 @@ private:
         // support both void- and value-returning notReady implementations since we can't assign
         // void to a variable.
         ON_BLOCK_EXIT([&] {
-            auto oldState = SSBState::kInit;
+            // oldState could be either kInit or kWaiting, depending on whether we've failed a call
+            // to wait().
             if (MONGO_unlikely(!_shared->state.compare_exchange_strong(
-                    oldState, SSBState::kWaiting, std::memory_order_acq_rel))) {
+                    oldState, SSBState::kHaveContinuation, std::memory_order_acq_rel))) {
                 dassert(oldState == SSBState::kFinished);
                 _shared->callback(_shared.get());
             }
@@ -1292,6 +1281,8 @@ public:
         return Future<FakeVoid>::makeReady(std::move(status));
     }
 
+    SharedSemiFuture<void> share() && noexcept;
+
     bool isReady() const {
         return _inner.isReady();
     }
@@ -1376,6 +1367,216 @@ private:
 };
 
 /**
+ * SharedSemiFuture<T> is logically a possibly-deferred StatusWith<T> (or Status when T is void).
+ *
+ * All methods that are present do the same as on a Future<T> so see it for documentation.
+ *
+ * Unlike Future<T> it only supports blocking operation, not chained continuations. This is intended
+ * to protect the promise-completer's execution context from needing to perform arbitrary
+ * operations requested by other subsystem's continuations.
+ * TODO Support continuation chaining when supplied with an executor to run them on.
+ *
+ * A SharedSemiFuture may be passed between threads, but only one thread may use it at a time.
+ */
+template <typename T>
+class MONGO_WARN_UNUSED_RESULT_CLASS future_details::SharedSemiFuture {
+public:
+    static_assert(!std::is_same<T, Status>::value,
+                  "SharedSemiFuture<Status> is banned. Use SharedSemiFuture<void> instead.");
+    static_assert(
+        !isStatusWith<T>,
+        "SharedSemiFuture<StatusWith<T>> is banned. Just use SharedSemiFuture<T> instead.");
+    static_assert(
+        !isFuture<T>,
+        "SharedSemiFuture of Future types is banned. Just use SharedSemiFuture<T> instead.");
+    static_assert(!std::is_reference<T>::value, "SharedSemiFuture<T&> is banned.");
+    static_assert(!std::is_const<T>::value, "SharedSemiFuture<const T> is banned.");
+    static_assert(!std::is_array<T>::value, "SharedSemiFuture<T[]> is banned.");
+
+    using value_type = T;
+
+    SharedSemiFuture() = default;
+
+    bool isReady() const {
+        return _shared->state.load(std::memory_order_acquire) == SSBState::kFinished;
+    }
+
+    void wait(Interruptible* interruptible = Interruptible::notInterruptible()) const {
+        _shared->wait(interruptible);
+    }
+
+    Status waitNoThrow(Interruptible* interruptible = Interruptible::notInterruptible()) const
+        noexcept {
+        try {
+            _shared->wait(interruptible);
+        } catch (const DBException& ex) {
+            return ex.toStatus();
+        }
+
+        return Status::OK();
+    }
+
+    const T& get(Interruptible* interruptible = Interruptible::notInterruptible()) const& {
+        _shared->wait(interruptible);
+        uassertStatusOK(_shared->status);
+        return *(_shared->data);
+    }
+
+    StatusWith<T> getNoThrow(
+        Interruptible* interruptible = Interruptible::notInterruptible()) const& noexcept {
+        try {
+            _shared->wait(interruptible);
+        } catch (const DBException& ex) {
+            return ex.toStatus();
+        }
+
+        if (!_shared->status.isOK())
+            return _shared->status;
+        return *_shared->data;
+    }
+
+private:
+    template <typename T2>
+    friend class SharedPromise;
+    template <typename T2>
+    friend class Future;
+    friend class SharedSemiFuture<void>;
+
+    explicit SharedSemiFuture(boost::intrusive_ptr<SharedState<T>> ptr) : _shared(std::move(ptr)) {}
+
+    boost::intrusive_ptr<SharedState<T>> _shared;
+};
+
+template <>
+class MONGO_WARN_UNUSED_RESULT_CLASS future_details::SharedSemiFuture<void> {
+public:
+    using value_type = void;
+
+    bool isReady() const {
+        return _inner.isReady();
+    }
+
+    void wait(Interruptible* interruptible = Interruptible::notInterruptible()) const {
+        _inner.wait(interruptible);
+    }
+
+    Status waitNoThrow(Interruptible* interruptible = Interruptible::notInterruptible()) const
+        noexcept {
+        return _inner.waitNoThrow(interruptible);
+    }
+
+    void get(Interruptible* interruptible = Interruptible::notInterruptible()) const {
+        _inner.get(interruptible);
+    }
+
+    Status getNoThrow(Interruptible* interruptible = Interruptible::notInterruptible()) const
+        noexcept {
+        return _inner.getNoThrow(interruptible).getStatus();
+    }
+
+private:
+    friend class SharedPromise<void>;
+    friend class Future<void>;
+
+    explicit SharedSemiFuture(boost::intrusive_ptr<SharedState<FakeVoid>> ptr)
+        : _inner(std::move(ptr)) {}
+
+    /*implicit*/ SharedSemiFuture(SharedSemiFuture<FakeVoid>&& inner) : _inner(std::move(inner)) {}
+    /*implicit*/ operator SharedSemiFuture<FakeVoid>() && {
+        return std::move(_inner);
+    }
+
+    SharedSemiFuture<FakeVoid> _inner;
+};
+
+/**
+ * This class represents the producer of SharedSemiFutures.
+ *
+ * This is a single-shot class: you may either set a value or error at most once. However you may
+ * extract as many futures as you want and they will all be completed at the same time. Any number
+ * of threads can extract a future at the same time. It is also safe to extract a future
+ * concurrently with completing the promise. If you extract a future after the promise has been
+ * completed, a ready future will be returned. You must still ensure that all calls to getFuture()
+ * complete prior to destroying the Promise.
+ *
+ * If no value or error has been set at the time this Promise is destroyed, an error will be set
+ * with ErrorCode::BrokenPromise. This should generally be considered a programmer error, and should
+ * not be relied upon. We may make it debug-fatal in the future.
+ *
+ * Unless otherwise specified, all methods behave the same as on Promise<T>.
+ */
+template <typename T>
+class future_details::SharedPromise {
+public:
+    using value_type = T;
+
+    /**
+     * Creates a `SharedPromise` ready for use.
+     */
+    SharedPromise() = default;
+
+    ~SharedPromise() {
+        if (MONGO_unlikely(!haveCompleted())) {
+            _sharedState->setError({ErrorCodes::BrokenPromise, "broken promise"});
+        }
+    }
+
+    SharedPromise(const SharedPromise&) = delete;
+    SharedPromise(SharedPromise&&) = delete;
+    SharedPromise& operator=(const SharedPromise&) = delete;
+    SharedPromise& operator=(SharedPromise&& p) noexcept = delete;
+
+    /**
+     * Returns a future associated with this promise. All returned futures will be completed when
+     * the promise is completed.
+     */
+    SharedSemiFuture<T> getFuture() const {
+        return SharedSemiFuture<T>(_sharedState);
+    }
+
+    template <typename Func>
+    void setWith(Func&& func) noexcept {
+        invariant(!haveCompleted());
+        setFrom(Future<void>::makeReady().then(std::forward<Func>(func)));
+    }
+
+    void setFrom(Future<T>&& future) noexcept {
+        invariant(!haveCompleted());
+        std::move(future).propagateResultTo(_sharedState.get());
+    }
+
+    template <typename... Args>
+    void emplaceValue(Args&&... args) noexcept {
+        invariant(!haveCompleted());
+        _sharedState->emplaceValue(std::forward<Args>(args)...);
+    }
+
+    void setError(Status status) noexcept {
+        invariant(!status.isOK());
+        invariant(!haveCompleted());
+        _sharedState->setError(std::move(status));
+    }
+
+    // TODO rename to not XXXWith and handle void
+    void setFromStatusWith(StatusWith<T> sw) noexcept {
+        invariant(!haveCompleted());
+        _sharedState->setFromStatusWith(std::move(sw));
+    }
+
+private:
+    friend class Future<void>;
+
+    bool haveCompleted() const noexcept {
+        // This can be relaxed because it is only called from the Promise thread which is also the
+        // only thread that will transition this from returning false to true. Additionally it isn't
+        // used to establish synchronization with any other thread.
+        return _sharedState->state.load(std::memory_order_relaxed) == SSBState::kFinished;
+    }
+
+    const boost::intrusive_ptr<SharedState<T>> _sharedState = make_intrusive<SharedState<T>>();
+};
+
+/**
  * Makes a ready Future with the return value of a nullary function. This has the same semantics as
  * Promise::setWith, and has the same reasons to prefer it over Future<T>::makeReady(). Also, it
  * deduces the T, so it is easier to use.
@@ -1431,12 +1632,6 @@ inline Future<T> Promise<T>::getFuture() noexcept {
 }
 
 template <typename T>
-inline SharedPromise<T> Promise<T>::share() noexcept {
-    invariant(_sharedState);
-    return SharedPromise<T>(std::make_shared<Promise<T>>(std::move(*this)));
-}
-
-template <typename T>
 inline void Promise<T>::setFrom(Future<T>&& future) noexcept {
     setImpl([&](boost::intrusive_ptr<SharedState<T>>&& sharedState) {
         future.propagateResultTo(sharedState.get());
@@ -1450,8 +1645,22 @@ inline void Promise<T>::setWith(Func&& func) noexcept {
 }
 
 template <typename T>
-    Future<void> Future<T>::ignoreValue() && noexcept {
+    inline Future<void> Future<T>::ignoreValue() && noexcept {
     return std::move(*this).then([](auto&&) {});
+}
+
+template <typename T>
+    inline SharedSemiFuture<T> Future<T>::share() && noexcept {
+    if (!_immediate)
+        return SharedSemiFuture<T>(std::move(_shared));
+
+    auto shared = make_intrusive<SharedState<T>>();
+    shared->emplaceValue(std::move(*_immediate));
+    return SharedSemiFuture<T>(std::move(shared));
+}
+
+inline SharedSemiFuture<void> Future<void>::share() && noexcept {
+    return std::move(_inner).share();
 }
 
 }  // namespace mongo

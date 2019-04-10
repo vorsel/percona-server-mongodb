@@ -94,8 +94,10 @@ public:
     Status attachCursorSourceToPipeline(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                         Pipeline* pipeline) final;
     std::string getShardName(OperationContext* opCtx) const final;
-    std::pair<std::vector<FieldPath>, bool> collectDocumentKeyFields(
-        OperationContext* opCtx, NamespaceStringOrUUID nssOrUUID) const override;
+    std::pair<std::vector<FieldPath>, bool> collectDocumentKeyFieldsForHostedCollection(
+        OperationContext* opCtx, const NamespaceString&, UUID) const override;
+    std::vector<FieldPath> collectDocumentKeyFieldsActingAsRouter(
+        OperationContext* opCtx, const NamespaceString&) const override;
     boost::optional<Document> lookupSingleDocument(
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         const NamespaceString& nss,
@@ -105,7 +107,10 @@ public:
     std::vector<GenericCursor> getIdleCursors(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                               CurrentOpUserMode userMode) const final;
     BackupCursorState openBackupCursor(OperationContext* opCtx) final;
-    void closeBackupCursor(OperationContext* opCtx, std::uint64_t cursorId) final;
+    void closeBackupCursor(OperationContext* opCtx, const UUID& backupId) final;
+    BackupCursorExtendState extendBackupCursor(OperationContext* opCtx,
+                                               const UUID& backupId,
+                                               const Timestamp& extendTo) final;
 
     std::vector<BSONObj> getMatchingPlanCacheEntryStats(OperationContext*,
                                                         const NamespaceString&,
@@ -114,6 +119,12 @@ public:
     bool uniqueKeyIsSupportedByIndex(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                      const NamespaceString& nss,
                                      const std::set<FieldPath>& uniqueKeyPaths) const final;
+
+    virtual void checkRoutingInfoEpochOrThrow(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                              const NamespaceString& nss,
+                                              ChunkVersion targetCollectionVersion) const override {
+        uasserted(51020, "unexpected request to consult sharding catalog on non-shardsvr");
+    }
 
 protected:
     BSONObj _reportCurrentOpForClient(OperationContext* opCtx,

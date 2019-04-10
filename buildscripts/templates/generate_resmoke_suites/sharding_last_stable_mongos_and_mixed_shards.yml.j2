@@ -57,7 +57,9 @@ selector:
   - jstests/sharding/snapshot_cursor_commands_mongos.js
   - jstests/sharding/transactions_error_labels.js
   - jstests/sharding/transactions_implicit_abort.js
+  - jstests/sharding/transactions_multi_writes.js
   - jstests/sharding/transactions_read_concerns.js
+  - jstests/sharding/transactions_recover_decision_from_local_participant.js
   - jstests/sharding/transactions_reject_writes_for_moved_chunks.js
   - jstests/sharding/transactions_snapshot_errors_first_statement.js
   - jstests/sharding/transactions_snapshot_errors_subsequent_statements.js
@@ -72,6 +74,7 @@ selector:
   - jstests/sharding/txn_writes_during_movechunk.js
   - jstests/sharding/update_sharded.js
   - jstests/sharding/shard_existing_coll_chunk_count.js
+  - jstests/sharding/failcommand_failpoint_not_parallel.js
   # Enable if SERVER-20865 is backported or 4.2 becomes last-stable
   - jstests/sharding/sharding_statistics_server_status.js
 

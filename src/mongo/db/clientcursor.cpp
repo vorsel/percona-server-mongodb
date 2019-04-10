@@ -88,7 +88,7 @@ ClientCursor::ClientCursor(ClientCursorParams params,
       _authenticatedUsers(std::move(params.authenticatedUsers)),
       _lsid(operationUsingCursor->getLogicalSessionId()),
       _txnNumber(operationUsingCursor->getTxnNumber()),
-      _readConcernLevel(params.readConcernLevel),
+      _readConcernArgs(params.readConcernArgs),
       _cursorManager(cursorManager),
       _originatingCommand(params.originatingCommandObj),
       _queryOptions(params.queryOptions),
@@ -286,8 +286,7 @@ public:
     }
 
     void run() {
-        Client::initThread("clientcursormon");
-        ON_BLOCK_EXIT([] { Client::destroy(); });
+        ThreadClient tc("clientcursormon", getGlobalServiceContext());
         while (!globalInShutdownDeprecated()) {
             {
                 const ServiceContext::UniqueOperationContext opCtx = cc().makeOperationContext();

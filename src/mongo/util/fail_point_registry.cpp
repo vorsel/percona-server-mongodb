@@ -48,7 +48,7 @@ Status FailPointRegistry::addFailPoint(const string& name, FailPoint* failPoint)
     }
 
     if (_fpMap.count(name) > 0) {
-        return Status(ErrorCodes::DuplicateKey,
+        return Status(ErrorCodes::Error(51006),
                       stream() << "Fail point already registered: " << name);
     }
 

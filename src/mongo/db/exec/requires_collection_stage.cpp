@@ -35,14 +35,16 @@
 
 namespace mongo {
 
-void RequiresCollectionStage::doSaveState() {
+template <typename CollectionT>
+void RequiresCollectionStageBase<CollectionT>::doSaveState() {
+    doSaveStateRequiresCollection();
+
     // A stage may not access storage while in a saved state.
     _collection = nullptr;
-
-    saveState(RequiresCollTag{});
 }
 
-void RequiresCollectionStage::doRestoreState() {
+template <typename CollectionT>
+void RequiresCollectionStageBase<CollectionT>::doRestoreState() {
     invariant(!_collection);
 
     const UUIDCatalog& catalog = UUIDCatalog::get(getOpCtx());
@@ -51,7 +53,10 @@ void RequiresCollectionStage::doRestoreState() {
             str::stream() << "UUID " << _collectionUUID << " no longer exists.",
             _collection);
 
-    restoreState(RequiresCollTag{});
+    doRestoreStateRequiresCollection();
 }
+
+template class RequiresCollectionStageBase<const Collection*>;
+template class RequiresCollectionStageBase<Collection*>;
 
 }  // namespace mongo

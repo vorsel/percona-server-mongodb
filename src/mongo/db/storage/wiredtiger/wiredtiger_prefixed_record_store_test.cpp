@@ -99,11 +99,12 @@ public:
         WiredTigerRecoveryUnit* ru =
             checked_cast<WiredTigerRecoveryUnit*>(_engine->newRecoveryUnit());
         OperationContextNoop opCtx(ru);
-        string uri = "table:" + ns;
+        string ident = ns;
+        string uri = WiredTigerKVEngine::kTableUriPrefix + ns;
 
         const bool prefixed = true;
         StatusWith<std::string> result = WiredTigerRecordStore::generateCreateString(
-            kWiredTigerEngineName, ns, CollectionOptions(), "", prefixed);
+            kWiredTigerEngineName, StringData(ns), CollectionOptions(), "", prefixed);
         ASSERT_TRUE(result.isOK());
         std::string config = result.getValue();
 
@@ -116,7 +117,7 @@ public:
 
         WiredTigerRecordStore::Params params;
         params.ns = ns;
-        params.uri = uri;
+        params.ident = ident;
         params.engineName = kWiredTigerEngineName;
         params.isCapped = false;
         params.isEphemeral = false;
@@ -142,14 +143,15 @@ public:
         WiredTigerRecoveryUnit* ru =
             checked_cast<WiredTigerRecoveryUnit*>(_engine->newRecoveryUnit());
         OperationContextNoop opCtx(ru);
-        string uri = "table:a.b";
+        string ident = "a.b";
+        string uri = WiredTigerKVEngine::kTableUriPrefix + ident;
 
         CollectionOptions options;
         options.capped = true;
 
         KVPrefix prefix = KVPrefix::generateNextPrefix();
         StatusWith<std::string> result = WiredTigerRecordStore::generateCreateString(
-            kWiredTigerEngineName, ns, options, "", prefix.isPrefixed());
+            kWiredTigerEngineName, StringData(ns), options, "", prefix.isPrefixed());
         ASSERT_TRUE(result.isOK());
         std::string config = result.getValue();
 
@@ -162,7 +164,7 @@ public:
 
         WiredTigerRecordStore::Params params;
         params.ns = ns;
-        params.uri = uri;
+        params.ident = ident;
         params.engineName = kWiredTigerEngineName;
         params.isCapped = true;
         params.isEphemeral = false;

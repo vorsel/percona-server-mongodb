@@ -141,8 +141,13 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    std::pair<std::vector<FieldPath>, bool> collectDocumentKeyFields(
-        OperationContext* opCtx, NamespaceStringOrUUID nssOrUUID) const override {
+    std::pair<std::vector<FieldPath>, bool> collectDocumentKeyFieldsForHostedCollection(
+        OperationContext*, const NamespaceString&, UUID) const override {
+        MONGO_UNREACHABLE;
+    }
+
+    std::vector<FieldPath> collectDocumentKeyFieldsActingAsRouter(
+        OperationContext*, const NamespaceString&) const override {
         MONGO_UNREACHABLE;
     }
 
@@ -161,11 +166,15 @@ public:
     }
 
     BackupCursorState openBackupCursor(OperationContext* opCtx) final {
-        MONGO_UNREACHABLE;
+        return BackupCursorState{UUID::gen(), boost::none, {}};
     }
 
-    void closeBackupCursor(OperationContext* opCtx, std::uint64_t cursorId) final {
-        MONGO_UNREACHABLE;
+    void closeBackupCursor(OperationContext* opCtx, const UUID& backupId) final {}
+
+    BackupCursorExtendState extendBackupCursor(OperationContext* opCtx,
+                                               const UUID& backupId,
+                                               const Timestamp& extendTo) final {
+        return {{}};
     }
 
     std::vector<BSONObj> getMatchingPlanCacheEntryStats(OperationContext*,
@@ -180,9 +189,16 @@ public:
         return true;
     }
 
-    boost::optional<OID> refreshAndGetEpoch(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                            const NamespaceString& nss) const override {
+    boost::optional<ChunkVersion> refreshAndGetCollectionVersion(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        const NamespaceString& nss) const override {
         return boost::none;
+    }
+
+    void checkRoutingInfoEpochOrThrow(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                      const NamespaceString&,
+                                      ChunkVersion) const override {
+        uasserted(51019, "Unexpected check of routing table");
     }
 };
 }  // namespace mongo

@@ -381,12 +381,17 @@ Status runAggregate(OperationContext* opCtx,
         if (liteParsedPipeline.hasChangeStream()) {
             nss = NamespaceString::kRsOplogNamespace;
 
-            // If the read concern is not specified, upgrade to 'majority' and wait to make sure we
-            // have a snapshot available.
+            // If the read concern is not specified, upgrade to 'majority' and wait to make sure
+            // we have a snapshot available.
             auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
             if (!readConcernArgs.hasLevel()) {
-                readConcernArgs =
-                    repl::ReadConcernArgs(repl::ReadConcernLevel::kMajorityReadConcern);
+                {
+                    // We must obtain the client lock to set the ReadConcernArgs on the operation
+                    // context as it may be concurrently read by CurrentOp.
+                    stdx::lock_guard<Client> lk(*opCtx->getClient());
+                    readConcernArgs =
+                        repl::ReadConcernArgs(repl::ReadConcernLevel::kMajorityReadConcern);
+                }
                 uassertStatusOK(waitForReadConcern(opCtx, readConcernArgs, true));
             }
 
@@ -420,7 +425,11 @@ Status runAggregate(OperationContext* opCtx,
         // If this is a collectionless aggregation with no foreign namespaces, we don't want to
         // acquire any locks. Otherwise, lock the collection or view.
         if (nss.isCollectionlessAggregateNS() && pipelineInvolvedNamespaces.empty()) {
-            statsTracker.emplace(opCtx, nss, Top::LockType::NotLocked, 0);
+            statsTracker.emplace(opCtx,
+                                 nss,
+                                 Top::LockType::NotLocked,
+                                 AutoStatsTracker::LogMode::kUpdateTopAndCurop,
+                                 0);
         } else {
             ctx.emplace(opCtx, nss, AutoGetCollection::ViewMode::kViewsPermitted);
         }
@@ -590,7 +599,7 @@ Status runAggregate(OperationContext* opCtx,
             std::move(execs[idx]),
             origNss,
             AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
-            repl::ReadConcernArgs::get(opCtx).getLevel(),
+            repl::ReadConcernArgs::get(opCtx),
             cmdObj);
         if (expCtx->tailableMode == TailableModeEnum::kTailable) {
             cursorParams.setTailable(true);

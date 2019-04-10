@@ -272,7 +272,11 @@ Message getMore(OperationContext* opCtx,
             const auto profilingLevel = autoDb.getDb()
                 ? boost::optional<int>{autoDb.getDb()->getProfilingLevel()}
                 : boost::none;
-            statsTracker.emplace(opCtx, *nssForCurOp, Top::LockType::NotLocked, profilingLevel);
+            statsTracker.emplace(opCtx,
+                                 *nssForCurOp,
+                                 Top::LockType::NotLocked,
+                                 AutoStatsTracker::LogMode::kUpdateTopAndCurop,
+                                 profilingLevel);
             auto view = autoDb.getDb()
                 ? autoDb.getDb()->getViewCatalog()->lookup(opCtx, nssForCurOp->ns())
                 : nullptr;
@@ -290,6 +294,7 @@ Message getMore(OperationContext* opCtx,
         statsTracker.emplace(opCtx,
                              nss,
                              Top::LockType::ReadLocked,
+                             AutoStatsTracker::LogMode::kUpdateTopAndCurop,
                              readLock->getDb() ? readLock->getDb()->getProfilingLevel()
                                                : doNotChangeProfilingLevel);
         Collection* collection = readLock->getCollection();
@@ -356,7 +361,7 @@ Message getMore(OperationContext* opCtx,
         const auto replicationMode = repl::ReplicationCoordinator::get(opCtx)->getReplicationMode();
 
         if (replicationMode == repl::ReplicationCoordinator::modeReplSet &&
-            cc->getReadConcernLevel() == repl::ReadConcernLevel::kMajorityReadConcern) {
+            cc->getReadConcernArgs().getLevel() == repl::ReadConcernLevel::kMajorityReadConcern) {
             opCtx->recoveryUnit()->setTimestampReadSource(
                 RecoveryUnit::ReadSource::kMajorityCommitted);
             uassertStatusOK(opCtx->recoveryUnit()->obtainMajorityCommittedSnapshot());
@@ -676,7 +681,7 @@ std::string runQuery(OperationContext* opCtx,
             {std::move(exec),
              nss,
              AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
-             readConcernArgs.getLevel(),
+             readConcernArgs,
              upconvertedQuery});
         ccId = pinnedCursor.getCursor()->cursorid();
 

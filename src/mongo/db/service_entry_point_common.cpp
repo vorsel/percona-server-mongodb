@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -58,7 +57,6 @@
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/logical_time_validator.h"
-#include "mongo/db/operation_context_session_mongod.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/ops/write_ops_exec.h"
 #include "mongo/db/query/find.h"
@@ -71,9 +69,11 @@
 #include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_entry_point_common.h"
+#include "mongo/db/session_catalog_mongod.h"
 #include "mongo/db/snapshot_window_util.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/stats/top.h"
+#include "mongo/db/transaction_coordinator_factory.h"
 #include "mongo/db/transaction_participant.h"
 #include "mongo/db/transaction_validation.h"
 #include "mongo/rpc/factory.h"
@@ -98,38 +98,6 @@ MONGO_FAIL_POINT_DEFINE(skipCheckingForNotMasterInCommandDispatch);
 
 namespace {
 using logger::LogComponent;
-
-// The command names for which to check out a session. These are commands that support retryable
-// writes, readConcern snapshot, or multi-statement transactions. We additionally check out the
-// session for commands that can take a lock and then run another whitelisted command in
-// DBDirectClient. Otherwise, the nested command would try to check out a session under a lock,
-// which is not allowed.
-const StringMap<int> sessionCheckOutList = {{"abortTransaction", 1},
-                                            {"aggregate", 1},
-                                            {"applyOps", 1},
-                                            {"commitTransaction", 1},
-                                            {"count", 1},
-                                            {"dbHash", 1},
-                                            {"delete", 1},
-                                            {"distinct", 1},
-                                            {"doTxn", 1},
-                                            {"explain", 1},
-                                            {"filemd5", 1},
-                                            {"find", 1},
-                                            {"findandmodify", 1},
-                                            {"findAndModify", 1},
-                                            {"geoNear", 1},
-                                            {"geoSearch", 1},
-                                            {"getMore", 1},
-                                            {"group", 1},
-                                            {"insert", 1},
-                                            {"killCursors", 1},
-                                            {"prepareTransaction", 1},
-                                            {"refreshLogicalSessionCacheNow", 1},
-                                            {"update", 1}};
-
-const StringMap<int> skipSessionCheckOutList = {
-    {"coordinateCommitTransaction", 1}, {"voteAbortTransaction", 1}, {"voteCommitTransaction", 1}};
 
 void generateLegacyQueryErrorResponse(const AssertionException& exception,
                                       const QueryMessage& queryMessage,
@@ -258,12 +226,24 @@ StatusWith<repl::ReadConcernArgs> _extractReadConcern(const CommandInvocation* i
         // We must be in a transaction if the readConcern level was upconverted to snapshot and the
         // command must support readConcern level snapshot in order to be supported in transactions.
         if (upconvertToSnapshot) {
-            return {ErrorCodes::OperationNotSupportedInTransaction,
-                    str::stream() << "Command is not supported in a transaction"};
+            return {
+                ErrorCodes::OperationNotSupportedInTransaction,
+                str::stream() << "Command is not supported as the first command in a transaction"};
         }
         return {ErrorCodes::InvalidOptions,
                 str::stream() << "Command does not support read concern "
                               << readConcernArgs.toString()};
+    }
+
+
+    // If this command invocation asked for 'majority' read concern, supports blocking majority
+    // reads, and storage engine support for majority reads is disabled, then we set the majority
+    // read mechanism appropriately i.e. we utilize "speculative" read behavior.
+    if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kMajorityReadConcern &&
+        invocation->allowsSpeculativeMajorityReads() &&
+        !serverGlobalParams.enableMajorityReadConcern) {
+        readConcernArgs.setMajorityReadMechanism(
+            repl::ReadConcernArgs::MajorityReadMechanism::kSpeculative);
     }
 
     return readConcernArgs;
@@ -373,11 +353,26 @@ void appendClusterAndOperationTime(OperationContext* opCtx,
     operationTime.appendAsOperationTime(commandBodyFieldsBob);
 }
 
-void invokeInTransaction(OperationContext* opCtx,
-                         CommandInvocation* invocation,
-                         TransactionParticipant* txnParticipant,
-                         const OperationSessionInfoFromClient& sessionOptions,
-                         rpc::ReplyBuilderInterface* replyBuilder) {
+void invokeWithSessionCheckedOut(OperationContext* opCtx,
+                                 CommandInvocation* invocation,
+                                 TransactionParticipant* txnParticipant,
+                                 const OperationSessionInfoFromClient& sessionOptions,
+                                 rpc::ReplyBuilderInterface* replyBuilder) try {
+
+    if (!opCtx->getClient()->isInDirectClient()) {
+        txnParticipant->beginOrContinue(*sessionOptions.getTxnNumber(),
+                                        sessionOptions.getAutocommit(),
+                                        sessionOptions.getStartTransaction());
+        // Create coordinator if needed. If "startTransaction" is present, it must be true.
+        if (sessionOptions.getStartTransaction()) {
+            // If this shard has been selected as the coordinator, set up the coordinator state
+            // to be ready to receive votes.
+            if (sessionOptions.getCoordinator() == boost::optional<bool>(true)) {
+                createTransactionCoordinator(opCtx, *sessionOptions.getTxnNumber());
+            }
+        }
+    }
+
     txnParticipant->unstashTransactionResources(opCtx, invocation->definition()->getName());
     ScopeGuard guard = MakeGuard([&txnParticipant, opCtx]() {
         txnParticipant->abortActiveUnpreparedOrStashPreparedTransaction(opCtx);
@@ -418,6 +413,15 @@ void invokeInTransaction(OperationContext* opCtx,
     // Stash or commit the transaction when the command succeeds.
     txnParticipant->stashTransactionResources(opCtx);
     guard.Dismiss();
+} catch (const ExceptionFor<ErrorCodes::NoSuchTransaction>&) {
+    // We make our decision about the transaction state based on the oplog we have, so
+    // we set the client last op to the last optime observed by the system to ensure that
+    // we wait for the specified write concern on an optime greater than or equal to the
+    // the optime of our decision basis. Thus we know our decision basis won't be rolled
+    // back.
+    auto& replClient = repl::ReplClientInfo::forClient(opCtx->getClient());
+    replClient.setLastOpToSystemLastOpTime(opCtx);
+    throw;
 }
 
 bool runCommandImpl(OperationContext* opCtx,
@@ -443,13 +447,14 @@ bool runCommandImpl(OperationContext* opCtx,
     if (!invocation->supportsWriteConcern()) {
         behaviors.uassertCommandDoesNotSpecifyWriteConcern(request.body);
         if (txnParticipant) {
-            invokeInTransaction(opCtx, invocation, txnParticipant, sessionOptions, replyBuilder);
+            invokeWithSessionCheckedOut(
+                opCtx, invocation, txnParticipant, sessionOptions, replyBuilder);
         } else {
             invocation->run(opCtx, replyBuilder);
         }
     } else {
         auto wcResult = uassertStatusOK(extractWriteConcern(opCtx, request.body));
-        if (txnParticipant && txnParticipant->inMultiDocumentTransaction()) {
+        if (sessionOptions.getAutocommit()) {
             validateWriteConcernForTransaction(wcResult, invocation->definition()->getName());
         }
 
@@ -463,7 +468,7 @@ bool runCommandImpl(OperationContext* opCtx,
         auto waitForWriteConcern = [&](auto&& bb) {
             MONGO_FAIL_POINT_BLOCK_IF(failCommand, data, [&](const BSONObj& data) {
                 return CommandHelpers::shouldActivateFailCommandFailPoint(
-                           data, request.getCommandName()) &&
+                           data, request.getCommandName(), opCtx->getClient()) &&
                     data.hasField("writeConcernError");
             }) {
                 bb.append(data.getData()["writeConcernError"]);
@@ -475,7 +480,7 @@ bool runCommandImpl(OperationContext* opCtx,
 
         try {
             if (txnParticipant) {
-                invokeInTransaction(
+                invokeWithSessionCheckedOut(
                     opCtx, invocation, txnParticipant, sessionOptions, replyBuilder);
             } else {
                 invocation->run(opCtx, replyBuilder);
@@ -503,11 +508,12 @@ bool runCommandImpl(OperationContext* opCtx,
     if (!ok) {
         auto response = replyBuilder->getBodyBuilder().asTempObj();
         auto codeField = response["code"];
-
+        const auto hasWriteConcern = response.hasField("writeConcernError");
         if (codeField.isNumber()) {
             auto code = ErrorCodes::Error(codeField.numberInt());
             // Append the error labels for transient transaction errors.
-            auto errorLabels = getErrorLabels(sessionOptions, command->getName(), code);
+            auto errorLabels =
+                getErrorLabels(sessionOptions, command->getName(), code, hasWriteConcern);
             replyBuilder->getBodyBuilder().appendElements(errorLabels);
         }
     }
@@ -564,42 +570,17 @@ void execCommandDatabase(OperationContext* opCtx,
             str::stream() << "Invalid database name: '" << dbname << "'",
             NamespaceString::validDBName(dbname, NamespaceString::DollarInDbNameBehavior::Allow));
 
-        // Session ids are forwarded in requests, so commands that require roundtrips between
-        // servers may result in a deadlock when a server tries to check out a session it is already
-        // using to service an earlier operation in the command's chain. To avoid this, only check
-        // out sessions for commands that require them.
-        const bool shouldCheckoutSession = static_cast<bool>(opCtx->getTxnNumber()) &&
-            sessionCheckOutList.find(command->getName()) != sessionCheckOutList.cend();
-
-        // Reject commands with 'txnNumber' that do not check out the Session, since no retryable
-        // writes or transaction machinery will be used to execute commands that do not check out
-        // the Session. Do not check this if we are in DBDirectClient because the outer command is
-        // responsible for checking out the Session.
-        const auto skipSessionCheckout =
-            skipSessionCheckOutList.find(command->getName()) != skipSessionCheckOutList.cend();
-        const auto shouldNotCheckOutSession = !shouldCheckoutSession  //
-            && !opCtx->getClient()->isInDirectClient()                // Skip DBDirectClient.
-            && !skipSessionCheckout;  // If we know they cannot check out, don't bother.
-
-        if (shouldNotCheckOutSession) {
-            uassert(ErrorCodes::OperationNotSupportedInTransaction,
-                    str::stream() << "It is illegal to run command " << command->getName()
-                                  << " in a multi-document transaction.",
-                    !sessionOptions.getAutocommit());
-            uassert(50768,
-                    str::stream() << "It is illegal to provide a txnNumber for command "
-                                  << command->getName(),
-                    !opCtx->getTxnNumber());
-        }
-
-        if (sessionOptions.getAutocommit()) {
-            uassertStatusOK(CommandHelpers::canUseTransactions(dbname, command->getName()));
-        }
+        validateSessionOptions(sessionOptions, command->getName(), dbname);
 
         // This constructor will check out the session and start a transaction, if necessary. It
         // handles the appropriate state management for both multi-statement transactions and
-        // retryable writes.
-        OperationContextSessionMongod sessionTxnState(opCtx, shouldCheckoutSession, sessionOptions);
+        // retryable writes. Currently, only requests with a transaction number will check out the
+        // session.
+        boost::optional<MongoDOperationContextSession> sessionTxnState;
+        const bool shouldCheckOutSession =
+            sessionOptions.getTxnNumber() && !shouldCommandSkipSessionCheckout(command->getName());
+        if (shouldCheckOutSession)
+            sessionTxnState.emplace(opCtx);
 
         std::unique_ptr<MaintenanceModeSetter> mmSetter;
 
@@ -644,12 +625,14 @@ void execCommandDatabase(OperationContext* opCtx,
 
         if (!opCtx->getClient()->isInDirectClient() &&
             !MONGO_FAIL_POINT(skipCheckingForNotMasterInCommandDispatch)) {
+            const bool inMultiDocumentTransaction = (sessionOptions.getAutocommit() == false);
             auto allowed = command->secondaryAllowed(opCtx->getServiceContext());
             bool alwaysAllowed = allowed == Command::AllowedOnSecondary::kAlways;
-            bool couldHaveOptedIn = allowed == Command::AllowedOnSecondary::kOptIn;
+            bool couldHaveOptedIn =
+                allowed == Command::AllowedOnSecondary::kOptIn && !inMultiDocumentTransaction;
             bool optedIn =
                 couldHaveOptedIn && ReadPreferenceSetting::get(opCtx).canRunOnSecondary();
-            bool canRunHere = commandCanRunHere(opCtx, dbname, command);
+            bool canRunHere = commandCanRunHere(opCtx, dbname, command, inMultiDocumentTransaction);
             if (!canRunHere && couldHaveOptedIn) {
                 uasserted(ErrorCodes::NotMasterNoSlaveOk, "not master and slaveOk=false");
             }
@@ -708,20 +691,26 @@ void execCommandDatabase(OperationContext* opCtx,
         }
 
         auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
-        auto txnParticipant = TransactionParticipant::get(opCtx);
-        if (!opCtx->getClient()->isInDirectClient() || !txnParticipant ||
-            !txnParticipant->inMultiDocumentTransaction()) {
-            const bool upconvertToSnapshot = txnParticipant &&
-                txnParticipant->inMultiDocumentTransaction() &&
-                sessionOptions.getStartTransaction();
-            readConcernArgs = uassertStatusOK(
+        // If the parent operation runs in snapshot isolation, we don't override the read concern.
+        auto skipReadConcern = opCtx->getClient()->isInDirectClient() &&
+            readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern;
+        if (!skipReadConcern) {
+            // If "startTransaction" is present, it must be true due to the parsing above.
+            const bool upconvertToSnapshot(sessionOptions.getStartTransaction());
+            auto newReadConcernArgs = uassertStatusOK(
                 _extractReadConcern(invocation.get(), request.body, upconvertToSnapshot));
+            {
+                // We must obtain the client lock to set the ReadConcernArgs on the operation
+                // context as it may be concurrently read by CurrentOp.
+                stdx::lock_guard<Client> lk(*opCtx->getClient());
+                readConcernArgs = std::move(newReadConcernArgs);
+            }
         }
 
         if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern) {
             uassert(ErrorCodes::InvalidOptions,
-                    "readConcern level snapshot is only valid in multi-statement transactions",
-                    txnParticipant && txnParticipant->inActiveOrKilledMultiDocumentTransaction());
+                    "readConcern level snapshot is only valid for the first transaction operation",
+                    opCtx->getClient()->isInDirectClient() || sessionOptions.getStartTransaction());
             uassert(ErrorCodes::InvalidOptions,
                     "readConcern level snapshot requires a session ID",
                     opCtx->getLogicalSessionId());
@@ -811,7 +800,10 @@ void execCommandDatabase(OperationContext* opCtx,
         }
 
         // Append the error labels for transient transaction errors.
-        auto errorLabels = getErrorLabels(sessionOptions, command->getName(), e.code());
+        auto response = extraFieldsBuilder.asTempObj();
+        auto hasWriteConcern = response.hasField("writeConcernError");
+        auto errorLabels =
+            getErrorLabels(sessionOptions, command->getName(), e.code(), hasWriteConcern);
         extraFieldsBuilder.appendElements(errorLabels);
 
         BSONObjBuilder metadataBob;
@@ -823,6 +815,9 @@ void execCommandDatabase(OperationContext* opCtx,
         if (readConcernArgs.isEmpty()) {
             auto readConcernArgsStatus = _extractReadConcern(invocation.get(), request.body, false);
             if (readConcernArgsStatus.isOK()) {
+                // We must obtain the client lock to set the ReadConcernArgs on the operation
+                // context as it may be concurrently read by CurrentOp.
+                stdx::lock_guard<Client> lk(*opCtx->getClient());
                 readConcernArgs = readConcernArgsStatus.getValue();
             }
         }

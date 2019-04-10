@@ -77,6 +77,7 @@
 #include "mongo/s/grid.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
 #include "mongo/s/query/cluster_find.h"
+#include "mongo/s/session_catalog_router.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/s/transaction_router.h"
 #include "mongo/util/fail_point_service.h"
@@ -302,8 +303,8 @@ void execCommandClient(OperationContext* opCtx,
         auto body = result->getBodyBuilder();
 
         MONGO_FAIL_POINT_BLOCK_IF(failCommand, data, [&](const BSONObj& data) {
-            return CommandHelpers::shouldActivateFailCommandFailPoint(data,
-                                                                      request.getCommandName()) &&
+            return CommandHelpers::shouldActivateFailCommandFailPoint(
+                       data, request.getCommandName(), opCtx->getClient()) &&
                 data.hasField("writeConcernError");
         }) {
             body.append(data.getData()["writeConcernError"]);
@@ -376,8 +377,17 @@ void runCommand(OperationContext* opCtx,
     // Fill out all currentOp details.
     CurOp::get(opCtx)->setGenericOpRequestDetails(opCtx, nss, command, request.body, opType);
 
+    auto osi =
+        initializeOperationSessionInfo(opCtx, request.body, command->requiresAuth(), true, true);
+    validateSessionOptions(osi, command->getName(), nss.db());
+
     auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
-    auto readConcernParseStatus = readConcernArgs.initialize(request.body);
+    auto readConcernParseStatus = [&]() {
+        // We must obtain the client lock to set the ReadConcernArgs on the operation
+        // context as it may be concurrently read by CurrentOp.
+        stdx::lock_guard<Client> lk(*opCtx->getClient());
+        return readConcernArgs.initialize(request.body);
+    }();
     if (!readConcernParseStatus.isOK()) {
         auto builder = replyBuilder->getBodyBuilder();
         CommandHelpers::appendCommandStatusNoThrow(builder, readConcernParseStatus);
@@ -394,14 +404,11 @@ void runCommand(OperationContext* opCtx,
                 !readConcernArgs.getArgsAtClusterTime());
     }
 
-    boost::optional<ScopedRouterSession> scopedSession;
-    auto osi =
-        initializeOperationSessionInfo(opCtx, request.body, command->requiresAuth(), true, true);
-
+    boost::optional<RouterOperationContextSession> routerSession;
     try {
         CommandHelpers::evaluateFailCommandFailPoint(opCtx, commandName);
         if (osi.getAutocommit()) {
-            scopedSession.emplace(opCtx);
+            routerSession.emplace(opCtx);
 
             auto txnRouter = TransactionRouter::get(opCtx);
             invariant(txnRouter);
@@ -411,8 +418,6 @@ void runCommand(OperationContext* opCtx,
 
             auto startTxnSetting = osi.getStartTransaction();
             bool startTransaction = startTxnSetting ? *startTxnSetting : false;
-
-            uassertStatusOK(CommandHelpers::canUseTransactions(nss.db(), command->getName()));
 
             txnRouter->beginOrContinueTxn(opCtx, *txnNumber, startTransaction);
         }
@@ -523,7 +528,7 @@ void runCommand(OperationContext* opCtx,
     } catch (const DBException& e) {
         command->incrementCommandsFailed();
         LastError::get(opCtx->getClient()).setLastError(e.code(), e.reason());
-        auto errorLabels = getErrorLabels(osi, command->getName(), e.code());
+        auto errorLabels = getErrorLabels(osi, command->getName(), e.code(), false);
         errorBuilder->appendElements(errorLabels);
         throw;
     }

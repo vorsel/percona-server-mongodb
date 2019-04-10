@@ -84,6 +84,7 @@ scratch
 /mongos
 /mongoshim
 /mongosniff
+/wt
 
 *.tgz
 *.zip
@@ -151,8 +152,9 @@ CMakeLists.txt
 # XCode projects
 .xcworkspace
 
-# VSCode projects
+# Visual Studio and VSCode projects
 .vscode/
+.vs/
 
 # Windows MSI builder artifacts
 *.msi

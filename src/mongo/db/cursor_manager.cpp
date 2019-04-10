@@ -52,7 +52,6 @@
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/session_catalog.h"
 #include "mongo/platform/random.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/exit.h"
@@ -185,9 +184,8 @@ bool GlobalCursorIdCache::killCursor(OperationContext* opCtx, CursorId id, bool 
     if (CursorManager::isGloballyManagedCursor(id)) {
         auto pin = globalCursorManager->pinCursor(opCtx, id, CursorManager::kNoCheckSession);
         if (!pin.isOK()) {
-            invariant(pin == ErrorCodes::CursorNotFound || pin == ErrorCodes::Unauthorized);
-            // No such cursor.  TODO: Consider writing to audit log here (even though we don't
-            // have a namespace).
+            // Either the cursor doesn't exist, or it was killed during the last time it was being
+            // used, and was cleaned up after this call. Either way, we cannot kill it.
             return false;
         }
         nss = pin.getValue().getCursor()->nss();
@@ -196,8 +194,7 @@ bool GlobalCursorIdCache::killCursor(OperationContext* opCtx, CursorId id, bool 
         uint32_t nsid = idFromCursorId(id);
         IdToNssMap::const_iterator it = _idToNss.find(nsid);
         if (it == _idToNss.end()) {
-            // No namespace corresponding to this cursor id prefix.  TODO: Consider writing to
-            // audit log here (even though we don't have a namespace).
+            // No namespace corresponding to this cursor id prefix.
             return false;
         }
         nss = it->second;

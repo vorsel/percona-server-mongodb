@@ -105,8 +105,8 @@ DBClientBase* MongoInterfaceStandalone::directClient() {
 
 bool MongoInterfaceStandalone::isSharded(OperationContext* opCtx, const NamespaceString& nss) {
     AutoGetCollectionForRead autoColl(opCtx, nss);
-    auto const css = CollectionShardingState::get(opCtx, nss);
-    return css->getMetadata(opCtx)->isSharded();
+    const auto metadata = CollectionShardingState::get(opCtx, nss)->getCurrentMetadata();
+    return metadata->isSharded();
 }
 
 Insert MongoInterfaceStandalone::buildInsertOp(const NamespaceString& nss,
@@ -247,7 +247,7 @@ void MongoInterfaceStandalone::renameIfOptionsAndIndexesHaveNotChanged(
     const NamespaceString& targetNs,
     const BSONObj& originalCollectionOptions,
     const std::list<BSONObj>& originalIndexes) {
-    Lock::GlobalWrite globalLock(opCtx);
+    Lock::DBLock(opCtx, targetNs.db(), MODE_X);
 
     uassert(ErrorCodes::CommandFailed,
             str::stream() << "collection options of target collection " << targetNs.ns()
@@ -305,13 +305,20 @@ Status MongoInterfaceStandalone::attachCursorSourceToPipeline(
     if (expCtx->uuid) {
         try {
             autoColl.emplace(expCtx->opCtx,
-                             NamespaceStringOrUUID{expCtx->ns.db().toString(), *expCtx->uuid});
+                             NamespaceStringOrUUID{expCtx->ns.db().toString(), *expCtx->uuid},
+                             AutoGetCollection::ViewMode::kViewsForbidden,
+                             Date_t::max(),
+                             AutoStatsTracker::LogMode::kUpdateTop);
         } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>& ex) {
             // The UUID doesn't exist anymore
             return ex.toStatus();
         }
     } else {
-        autoColl.emplace(expCtx->opCtx, expCtx->ns);
+        autoColl.emplace(expCtx->opCtx,
+                         expCtx->ns,
+                         AutoGetCollection::ViewMode::kViewsForbidden,
+                         Date_t::max(),
+                         AutoStatsTracker::LogMode::kUpdateTop);
     }
 
     // makePipeline() is only called to perform secondary aggregation requests and expects the
@@ -322,7 +329,7 @@ Status MongoInterfaceStandalone::attachCursorSourceToPipeline(
     auto css = CollectionShardingState::get(expCtx->opCtx, expCtx->ns);
     uassert(4567,
             str::stream() << "from collection (" << expCtx->ns.ns() << ") cannot be sharded",
-            !css->getMetadata(expCtx->opCtx)->isSharded());
+            !css->getMetadataForOperation(expCtx->opCtx)->isSharded());
 
     PipelineD::prepareCursorSource(autoColl->getCollection(), expCtx->ns, nullptr, pipeline);
 
@@ -341,9 +348,16 @@ std::string MongoInterfaceStandalone::getShardName(OperationContext* opCtx) cons
     return std::string();
 }
 
-std::pair<std::vector<FieldPath>, bool> MongoInterfaceStandalone::collectDocumentKeyFields(
-    OperationContext* opCtx, NamespaceStringOrUUID nssOrUUID) const {
+std::pair<std::vector<FieldPath>, bool>
+MongoInterfaceStandalone::collectDocumentKeyFieldsForHostedCollection(OperationContext* opCtx,
+                                                                      const NamespaceString& nss,
+                                                                      UUID uuid) const {
     return {{"_id"}, false};  // Nothing is sharded.
+}
+
+std::vector<FieldPath> MongoInterfaceStandalone::collectDocumentKeyFieldsActingAsRouter(
+    OperationContext* opCtx, const NamespaceString& nss) const {
+    return {"_id"};  // Nothing is sharded.
 }
 
 std::vector<GenericCursor> MongoInterfaceStandalone::getIdleCursors(
@@ -395,12 +409,23 @@ BackupCursorState MongoInterfaceStandalone::openBackupCursor(OperationContext* o
     }
 }
 
-void MongoInterfaceStandalone::closeBackupCursor(OperationContext* opCtx, std::uint64_t cursorId) {
+void MongoInterfaceStandalone::closeBackupCursor(OperationContext* opCtx, const UUID& backupId) {
     auto backupCursorHooks = BackupCursorHooks::get(opCtx->getServiceContext());
     if (backupCursorHooks->enabled()) {
-        backupCursorHooks->closeBackupCursor(opCtx, cursorId);
+        backupCursorHooks->closeBackupCursor(opCtx, backupId);
     } else {
         uasserted(50955, "Backup cursors are an enterprise only feature.");
+    }
+}
+
+BackupCursorExtendState MongoInterfaceStandalone::extendBackupCursor(OperationContext* opCtx,
+                                                                     const UUID& backupId,
+                                                                     const Timestamp& extendTo) {
+    auto backupCursorHooks = BackupCursorHooks::get(opCtx->getServiceContext());
+    if (backupCursorHooks->enabled()) {
+        return backupCursorHooks->extendBackupCursor(opCtx, backupId, extendTo);
+    } else {
+        uasserted(51010, "Backup cursors are an enterprise only feature.");
     }
 }
 
@@ -448,9 +473,9 @@ bool MongoInterfaceStandalone::uniqueKeyIsSupportedByIndex(
     }
 
     auto indexIterator = collection->getIndexCatalog()->getIndexIterator(opCtx, false);
-    while (indexIterator.more()) {
-        IndexDescriptor* descriptor = indexIterator.next();
-        if (supportsUniqueKey(expCtx, indexIterator.catalogEntry(descriptor), uniqueKeyPaths)) {
+    while (indexIterator->more()) {
+        IndexCatalogEntry* entry = indexIterator->next();
+        if (supportsUniqueKey(expCtx, entry, uniqueKeyPaths)) {
             return true;
         }
     }
@@ -468,7 +493,7 @@ BSONObj MongoInterfaceStandalone::_reportCurrentOpForClient(
 
     if (clientOpCtx) {
         if (auto txnParticipant = TransactionParticipant::get(clientOpCtx)) {
-            txnParticipant->reportUnstashedState(repl::ReadConcernArgs::get(clientOpCtx), &builder);
+            txnParticipant->reportUnstashedState(clientOpCtx, &builder);
         }
 
         // Append lock stats before returning.

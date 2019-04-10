@@ -252,7 +252,9 @@ struct CommandHelpers {
     /**
      * Checks if the command passed in is in the list of failCommands defined in the fail point.
      */
-    static bool shouldActivateFailCommandFailPoint(const BSONObj& data, StringData cmdName);
+    static bool shouldActivateFailCommandFailPoint(const BSONObj& data,
+                                                   StringData cmdName,
+                                                   Client* client);
 
     /**
      * Possibly uasserts according to the "failCommand" fail point.
@@ -299,14 +301,6 @@ public:
      */
     virtual std::size_t reserveBytesForReply() const {
         return 0u;
-    }
-
-    /**
-     * Return true for "user management commands", a distinction that affects
-     * backward compatible output formatting.
-     */
-    virtual bool isUserManagementCommand() const {
-        return false;
     }
 
     /**
@@ -510,6 +504,19 @@ public:
      */
     virtual bool allowsAfterClusterTime() const {
         return true;
+    }
+
+    /**
+     * Returns true if this command invocation is allowed to utilize "speculative" majority reads to
+     * service 'majority' read concern requests. This allows a query to satisfy a 'majority' read
+     * without storage engine support for reading from a historical snapshot.
+     *
+     * Note: This feature is currently only limited to a very small subset of commands (related to
+     * change streams), and is not intended to be generally used, which is why it is disabled by
+     * default.
+     */
+    virtual bool allowsSpeculativeMajorityReads() const {
+        return false;
     }
 
     /**

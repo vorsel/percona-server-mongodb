@@ -69,6 +69,8 @@ struct WiredTigerFileVersion {
 class WiredTigerKVEngine final : public KVEngine {
 public:
     static const int kDefaultJournalDelayMillis;
+    static StringData kTableUriPrefix;
+
     WiredTigerKVEngine(const std::string& canonicalName,
                        const std::string& path,
                        ClockSource* cs,
@@ -111,6 +113,9 @@ public:
                                                         const CollectionOptions& options) override {
         return getGroupedRecordStore(opCtx, ns, ident, options, KVPrefix::kNotPrefixed);
     }
+
+    virtual std::unique_ptr<RecordStore> makeTemporaryRecordStore(OperationContext* opCtx,
+                                                                  StringData ident) override;
 
     virtual Status createSortedDataInterface(OperationContext* opCtx,
                                              StringData ident,
@@ -231,6 +236,8 @@ public:
     virtual boost::optional<Timestamp> getLastStableRecoveryTimestamp() const override;
 
     virtual Timestamp getAllCommittedTimestamp() const override;
+
+    virtual Timestamp getOldestOpenReadTimestamp() const override;
 
     bool supportsReadConcernSnapshot() const final override;
 

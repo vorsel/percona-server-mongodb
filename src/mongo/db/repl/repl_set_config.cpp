@@ -353,7 +353,7 @@ Status ReplSetConfig::_parseSettingsSubdocument(const BSONObj& settings) {
     for (auto&& modeElement : gleModes) {
         if (_customWriteConcernModes.find(modeElement.fieldNameStringData()) !=
             _customWriteConcernModes.end()) {
-            return Status(ErrorCodes::DuplicateKey,
+            return Status(ErrorCodes::Error(51001),
                           str::stream() << kSettingsFieldName << '.' << kGetLastErrorModesFieldName
                                         << " contains multiple fields named "
                                         << modeElement.fieldName());
@@ -609,7 +609,8 @@ Status ReplSetConfig::validate() const {
 
 Status ReplSetConfig::checkIfWriteConcernCanBeSatisfied(
     const WriteConcernOptions& writeConcern) const {
-    if (!writeConcern.wMode.empty() && writeConcern.wMode != WriteConcernOptions::kMajority) {
+    if (!writeConcern.wMode.empty() && writeConcern.wMode != WriteConcernOptions::kMajority &&
+        writeConcern.wMode != WriteConcernOptions::kInternalMajorityNoSnapshot) {
         StatusWith<ReplSetTagPattern> tagPatternStatus = findCustomWriteMode(writeConcern.wMode);
         if (!tagPatternStatus.isOK()) {
             return tagPatternStatus.getStatus();

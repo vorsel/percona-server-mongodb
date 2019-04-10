@@ -87,7 +87,7 @@ std::vector<BSONObj> MongoProcessCommon::getCurrentOps(
             auto ns = cursor.getNs();
             auto lsid = cursor.getLsid();
             cursorObj.append("type", "idleCursor");
-            cursorObj.append("host", getHostNameCached());
+            cursorObj.append("host", getHostNameCachedAndPort());
             cursorObj.append("ns", ns->toString());
             // If in legacy read mode, lsid is not present.
             if (lsid) {
@@ -122,6 +122,18 @@ std::vector<BSONObj> MongoProcessCommon::getCurrentOps(
     return ops;
 }
 
+std::vector<FieldPath> MongoProcessCommon::collectDocumentKeyFieldsActingAsRouter(
+    OperationContext* opCtx, const NamespaceString& nss) const {
+    if (auto chunkManager =
+            uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss))
+                .cm()) {
+        return _shardKeyToDocumentKeyFields(
+            chunkManager->getShardKeyPattern().getKeyPatternFields());
+    }
+    // We have no evidence this collection is sharded, so the document key is just _id.
+    return {"_id"};
+}
+
 bool MongoProcessCommon::keyPatternNamesExactPaths(const BSONObj& keyPattern,
                                                    const std::set<FieldPath>& uniqueKeyPaths) {
     size_t nFieldsMatched = 0;
@@ -137,7 +149,7 @@ bool MongoProcessCommon::keyPatternNamesExactPaths(const BSONObj& keyPattern,
     return nFieldsMatched == uniqueKeyPaths.size();
 }
 
-boost::optional<OID> MongoProcessCommon::refreshAndGetEpoch(
+boost::optional<ChunkVersion> MongoProcessCommon::refreshAndGetCollectionVersion(
     const boost::intrusive_ptr<ExpressionContext>& expCtx, const NamespaceString& nss) const {
     const bool forceRefreshFromThisThread = false;
     auto routingInfo = uassertStatusOK(
@@ -145,8 +157,23 @@ boost::optional<OID> MongoProcessCommon::refreshAndGetEpoch(
             ->catalogCache()
             ->getCollectionRoutingInfoWithRefresh(expCtx->opCtx, nss, forceRefreshFromThisThread));
     if (auto chunkManager = routingInfo.cm()) {
-        return chunkManager->getVersion().epoch();
+        return chunkManager->getVersion();
     }
     return boost::none;
 }
+
+std::vector<FieldPath> MongoProcessCommon::_shardKeyToDocumentKeyFields(
+    const std::vector<std::unique_ptr<FieldRef>>& keyPatternFields) const {
+    std::vector<FieldPath> result;
+    bool gotId = false;
+    for (auto& field : keyPatternFields) {
+        result.emplace_back(field->dottedField());
+        gotId |= (result.back().fullPath() == "_id");
+    }
+    if (!gotId) {  // If not part of the shard key, "_id" comes last.
+        result.emplace_back("_id");
+    }
+    return result;
+}
+
 }  // namespace mongo

@@ -39,8 +39,12 @@
 namespace mongo {
 
 struct BackupCursorState {
-    std::uint64_t cursorId;
+    UUID backupId;
     boost::optional<Document> preamble;
+    std::vector<std::string> filenames;
+};
+
+struct BackupCursorExtendState {
     std::vector<std::string> filenames;
 };
 

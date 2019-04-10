@@ -250,14 +250,23 @@ class OperationContextSession {
     MONGO_DISALLOW_COPYING(OperationContextSession);
 
 public:
-    OperationContextSession(OperationContext* opCtx, bool checkOutSession);
-
+    OperationContextSession(OperationContext* opCtx);
     ~OperationContextSession();
 
     /**
      * Returns the session checked out in the constructor.
      */
     static Session* get(OperationContext* opCtx);
+
+    /**
+     * These methods take an operation context with a checked-out session and allow it to be
+     * temporarily or permanently checked back in, in order to allow other operations to use it.
+     *
+     * Check-in may only be called if the session has actually been checked out previously and
+     * similarly check-out may only be called if the session is not checked out already.
+     */
+    static void checkIn(OperationContext* opCtx);
+    static void checkOut(OperationContext* opCtx);
 
 private:
     OperationContext* const _opCtx;

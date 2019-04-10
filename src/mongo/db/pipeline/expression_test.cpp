@@ -2234,7 +2234,54 @@ TEST(ExpressionFromAccumulators, StdDevSamp) {
          {{}, Value(BSONNULL)}});
 }
 
-TEST(ExpressionPowTest, NegativeOneRaisedToNegativeOddExponentShouldOutPutNegativeOne) {
+TEST(ExpressionPowTest, LargeExponentValuesWithBaseOfZero) {
+    assertExpectedResults(
+        "$pow",
+        {
+            {{Value(0), Value(0)}, Value(1)},
+            {{Value(0LL), Value(0LL)}, Value(1LL)},
+
+            {{Value(0), Value(10)}, Value(0)},
+            {{Value(0), Value(10000)}, Value(0)},
+
+            {{Value(0LL), Value(10)}, Value(0LL)},
+
+            // $pow may sometimes use a loop to compute a^b, so it's important to check
+            // that the loop doesn't hang if a large exponent is provided.
+            {{Value(0LL), Value(std::numeric_limits<long long>::max())}, Value(0LL)},
+        });
+}
+
+TEST(ExpressionPowTest, ThrowsWhenBaseZeroAndExpNegative) {
+    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    VariablesParseState vps = expCtx->variablesParseState;
+
+    const auto expr = Expression::parseExpression(expCtx, BSON("$pow" << BSON_ARRAY(0 << -5)), vps);
+    ASSERT_THROWS([&] { expr->evaluate(Document()); }(), AssertionException);
+
+    const auto exprWithLong =
+        Expression::parseExpression(expCtx, BSON("$pow" << BSON_ARRAY(0LL << -5LL)), vps);
+    ASSERT_THROWS([&] { expr->evaluate(Document()); }(), AssertionException);
+}
+
+TEST(ExpressionPowTest, LargeExponentValuesWithBaseOfOne) {
+    assertExpectedResults(
+        "$pow",
+        {
+            {{Value(1), Value(10)}, Value(1)},
+            {{Value(1), Value(10LL)}, Value(1LL)},
+            {{Value(1), Value(10000LL)}, Value(1LL)},
+
+            {{Value(1LL), Value(10LL)}, Value(1LL)},
+
+            // $pow may sometimes use a loop to compute a^b, so it's important to check
+            // that the loop doesn't hang if a large exponent is provided.
+            {{Value(1LL), Value(std::numeric_limits<long long>::max())}, Value(1LL)},
+            {{Value(1LL), Value(std::numeric_limits<long long>::min())}, Value(1LL)},
+        });
+}
+
+TEST(ExpressionPowTest, LargeExponentValuesWithBaseOfNegativeOne) {
     assertExpectedResults("$pow",
                           {
                               {{Value(-1), Value(-1)}, Value(-1)},
@@ -2247,6 +2294,32 @@ TEST(ExpressionPowTest, NegativeOneRaisedToNegativeOddExponentShouldOutPutNegati
                               {{Value(-1LL), Value(-3LL)}, Value(-1LL)},
                               {{Value(-1LL), Value(-4LL)}, Value(1LL)},
                               {{Value(-1LL), Value(-5LL)}, Value(-1LL)},
+
+                              {{Value(-1LL), Value(-61LL)}, Value(-1LL)},
+                              {{Value(-1LL), Value(61LL)}, Value(-1LL)},
+
+                              {{Value(-1LL), Value(-62LL)}, Value(1LL)},
+                              {{Value(-1LL), Value(62LL)}, Value(1LL)},
+
+                              {{Value(-1LL), Value(-101LL)}, Value(-1LL)},
+                              {{Value(-1LL), Value(-102LL)}, Value(1LL)},
+
+                              // Use a value large enough that will make the test hang for a
+                              // considerable amount of time if a loop is used to compute the
+                              // answer.
+                              {{Value(-1LL), Value(63234673905128LL)}, Value(1LL)},
+                              {{Value(-1LL), Value(-63234673905128LL)}, Value(1LL)},
+
+                              {{Value(-1LL), Value(63234673905127LL)}, Value(-1LL)},
+                              {{Value(-1LL), Value(-63234673905127LL)}, Value(-1LL)},
+                          });
+}
+
+TEST(ExpressionPowTest, LargeBaseSmallPositiveExponent) {
+    assertExpectedResults("$pow",
+                          {
+                              {{Value(4294967296LL), Value(1LL)}, Value(4294967296LL)},
+                              {{Value(4294967296LL), Value(0)}, Value(1LL)},
                           });
 }
 
@@ -3628,13 +3701,13 @@ public:
                 const BSONObj obj = BSON(asserters[i].getString() << args);
                 VariablesParseState vps = expCtx->variablesParseState;
                 ASSERT_THROWS(
-                    {
+                    [&] {
                         // NOTE: parse and evaluatation failures are treated the
                         // same
                         const intrusive_ptr<Expression> expr =
                             Expression::parseExpression(expCtx, obj, vps);
                         expr->evaluate(Document());
-                    },
+                    }(),
                     AssertionException);
             }
         }
@@ -4159,7 +4232,7 @@ TEST(ExpressionSubstrTest, ThrowsWithNegativeStart) {
     const auto str = "abcdef"_sd;
     const auto expr =
         Expression::parseExpression(expCtx, BSON("$substrCP" << BSON_ARRAY(str << -5 << 1)), vps);
-    ASSERT_THROWS({ expr->evaluate(Document()); }, AssertionException);
+    ASSERT_THROWS([&] { expr->evaluate(Document()); }(), AssertionException);
 }
 
 }  // namespace Substr
@@ -4173,7 +4246,7 @@ TEST(ExpressionSubstrCPTest, DoesThrowWithBadContinuationByte) {
     const auto continuationByte = "\x80\x00"_sd;
     const auto expr = Expression::parseExpression(
         expCtx, BSON("$substrCP" << BSON_ARRAY(continuationByte << 0 << 1)), vps);
-    ASSERT_THROWS({ expr->evaluate(Document()); }, AssertionException);
+    ASSERT_THROWS([&] { expr->evaluate(Document()); }(), AssertionException);
 }
 
 TEST(ExpressionSubstrCPTest, DoesThrowWithInvalidLeadingByte) {
@@ -4183,7 +4256,7 @@ TEST(ExpressionSubstrCPTest, DoesThrowWithInvalidLeadingByte) {
     const auto leadingByte = "\xFF\x00"_sd;
     const auto expr = Expression::parseExpression(
         expCtx, BSON("$substrCP" << BSON_ARRAY(leadingByte << 0 << 1)), vps);
-    ASSERT_THROWS({ expr->evaluate(Document()); }, AssertionException);
+    ASSERT_THROWS([&] { expr->evaluate(Document()); }(), AssertionException);
 }
 
 TEST(ExpressionSubstrCPTest, WithStandardValue) {
@@ -5288,13 +5361,13 @@ public:
                 const BSONObj obj = BSON(asserters[i].getString() << args);
                 VariablesParseState vps = expCtx->variablesParseState;
                 ASSERT_THROWS(
-                    {
+                    [&] {
                         // NOTE: parse and evaluatation failures are treated the
                         // same
                         const intrusive_ptr<Expression> expr =
                             Expression::parseExpression(expCtx, obj, vps);
                         expr->evaluate(Document());
-                    },
+                    }(),
                     AssertionException);
             }
         }

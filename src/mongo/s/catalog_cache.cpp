@@ -43,6 +43,7 @@
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/database_version_helpers.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/stale_exception.h"
 #include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
@@ -121,6 +122,10 @@ CatalogCache::~CatalogCache() = default;
 
 StatusWith<CachedDatabaseInfo> CatalogCache::getDatabase(OperationContext* opCtx,
                                                          StringData dbName) {
+    invariant(!opCtx->lockState() || !opCtx->lockState()->isLocked(),
+              "Do not hold a lock while refreshing the catalog cache. Doing so would potentially "
+              "hold the lock during a network call, and can lead to a deadlock as described in "
+              "SERVER-37398.");
     try {
         while (true) {
             stdx::unique_lock<stdx::mutex> ul(_mutex);
@@ -196,6 +201,10 @@ StatusWith<CachedCollectionRoutingInfo> CatalogCache::getCollectionRoutingInfoAt
 
 CatalogCache::RefreshResult CatalogCache::_getCollectionRoutingInfoAt(
     OperationContext* opCtx, const NamespaceString& nss, boost::optional<Timestamp> atClusterTime) {
+    invariant(!opCtx->lockState() || !opCtx->lockState()->isLocked(),
+              "Do not hold a lock while refreshing the catalog cache. Doing so would potentially "
+              "hold the lock during a network call, and can lead to a deadlock as described in "
+              "SERVER-37398.");
     // This default value can cause a single unnecessary extra refresh if this thread did do the
     // refresh but the refresh failed, or if the database or collection was not found, but only if
     // the caller is getCollectionRoutingInfoWithRefresh with the parameter
@@ -357,6 +366,37 @@ void CatalogCache::onStaleShardVersion(CachedCollectionRoutingInfo&& ccriToInval
         // longer valid, so trigger a refresh.
         itColl->second->needsRefresh = true;
     }
+}
+
+void CatalogCache::checkEpochOrThrow(const NamespaceString& nss,
+                                     ChunkVersion targetCollectionVersion) const {
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    const auto itDb = _collectionsByDb.find(nss.db());
+    uassert(StaleConfigInfo(nss, targetCollectionVersion, boost::none),
+            str::stream() << "could not act as router for " << nss.ns()
+                          << ", no entry for database "
+                          << nss.db(),
+            itDb != _collectionsByDb.end());
+
+    auto itColl = itDb->second.find(nss.ns());
+    uassert(StaleConfigInfo(nss, targetCollectionVersion, boost::none),
+            str::stream() << "could not act as router for " << nss.ns()
+                          << ", no entry for collection.",
+            itColl != itDb->second.end());
+
+    uassert(StaleConfigInfo(nss, targetCollectionVersion, boost::none),
+            str::stream() << "could not act as router for " << nss.ns() << ", wanted "
+                          << targetCollectionVersion.toString()
+                          << ", but found the collection was unsharded",
+            itColl->second->routingInfo);
+
+    auto foundVersion = itColl->second->routingInfo->getVersion();
+    uassert(StaleConfigInfo(nss, targetCollectionVersion, foundVersion),
+            str::stream() << "could not act as router for " << nss.ns() << ", wanted "
+                          << targetCollectionVersion.toString()
+                          << ", but found "
+                          << foundVersion.toString(),
+            foundVersion.epoch() == targetCollectionVersion.epoch());
 }
 
 void CatalogCache::invalidateDatabaseEntry(const StringData dbName) {

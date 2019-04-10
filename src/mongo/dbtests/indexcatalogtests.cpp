@@ -36,7 +36,6 @@
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
-#include "mongo/db/db.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/dbtests/dbtests.h"
@@ -86,11 +85,11 @@ public:
 
         ASSERT_TRUE(_catalog->numIndexesReady(&opCtx) == numFinishedIndexesStart + 2);
 
-        IndexCatalog::IndexIterator ii = _catalog->getIndexIterator(&opCtx, false);
+        std::unique_ptr<IndexCatalog::IndexIterator> ii = _catalog->getIndexIterator(&opCtx, false);
         int indexesIterated = 0;
         bool foundIndex = false;
-        while (ii.more()) {
-            IndexDescriptor* indexDesc = ii.next();
+        while (ii->more()) {
+            IndexDescriptor* indexDesc = ii->next()->descriptor();
             indexesIterated++;
             BSONObjIterator boit(indexDesc->infoObj());
             while (boit.more() && !foundIndex) {

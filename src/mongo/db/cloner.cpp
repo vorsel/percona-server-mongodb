@@ -38,7 +38,7 @@
 #include "mongo/bson/unordered_fields_bsonobj_comparator.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/bson/util/builder.h"
-#include "mongo/db/auth/internal_user_auth.h"
+#include "mongo/client/authenticate.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/collection_options.h"
@@ -271,7 +271,8 @@ struct Cloner::Fun {
                 }
             });
 
-            RARELY if (time(0) - saveLast > 60) {
+            static Rarely sampler;
+            if (sampler.tick() && (time(0) - saveLast > 60)) {
                 log() << numSeen << " objects cloned so far from collection " << from_collection;
                 saveLast = time(0);
             }
@@ -404,7 +405,7 @@ void Cloner::copyIndexes(OperationContext* opCtx,
     uassertStatusOK(indexer.insertAllDocumentsInCollection());
 
     WriteUnitOfWork wunit(opCtx);
-    indexer.commit();
+    uassertStatusOK(indexer.commit());
     if (opCtx->writesAreReplicated()) {
         for (auto&& infoObj : indexInfoObjs) {
             getGlobalServiceContext()->getOpObserver()->onCreateIndex(
@@ -705,9 +706,11 @@ Status Cloner::copyDb(OperationContext* opCtx,
                 return Status(ErrorCodes::HostUnreachable, errmsg);
             }
 
-            if (isInternalAuthSet() && !con->authenticateInternalUser()) {
-                return Status(ErrorCodes::AuthenticationFailed,
-                              "Unable to authenticate as internal user");
+            if (auth::isInternalAuthSet()) {
+                auto authStatus = con->authenticateInternalUser();
+                if (!authStatus.isOK()) {
+                    return authStatus;
+                }
             }
 
             _conn = std::move(con);

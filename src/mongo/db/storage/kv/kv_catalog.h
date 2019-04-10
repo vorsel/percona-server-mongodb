@@ -113,6 +113,13 @@ public:
      */
     StatusWith<std::string> newOrphanedIdent(OperationContext* opCtx, std::string ident);
 
+    std::string getFilesystemPathForDb(const std::string& dbName) const;
+
+    /**
+     * Generate a temporary ident name.
+     */
+    std::string newTempIdent();
+
 private:
     class AddIdentChange;
     class RemoveIdentChange;

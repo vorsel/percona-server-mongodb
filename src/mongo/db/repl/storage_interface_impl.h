@@ -175,6 +175,8 @@ public:
 
     Timestamp getAllCommittedTimestamp(ServiceContext* serviceCtx) const override;
 
+    Timestamp getOldestOpenReadTimestamp(ServiceContext* serviceCtx) const override;
+
     /**
      * Checks that the "admin" database contains a supported version of the auth data schema.
      */
@@ -190,6 +192,8 @@ public:
 
     boost::optional<Timestamp> getLastStableCheckpointTimestampDeprecated(
         ServiceContext* serviceCtx) const override;
+
+    Timestamp getPointInTimeReadTimestamp(OperationContext* opCtx) const override;
 
 private:
     const NamespaceString _rollbackIdNss;

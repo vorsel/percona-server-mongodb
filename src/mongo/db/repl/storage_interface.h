@@ -402,6 +402,13 @@ public:
     virtual Timestamp getAllCommittedTimestamp(ServiceContext* serviceCtx) const = 0;
 
     /**
+     * Returns the oldest read timestamp in use by an open transaction. Storage engines that support
+     * the 'snapshot' ReadConcern must provide an implementation. Other storage engines may provide
+     * a no-op implementation.
+     */
+    virtual Timestamp getOldestOpenReadTimestamp(ServiceContext* serviceCtx) const = 0;
+
+    /**
      * Returns true if the storage engine supports document level locking.
      */
     virtual bool supportsDocLocking(ServiceContext* serviceCtx) const = 0;
@@ -440,6 +447,11 @@ public:
      */
     virtual boost::optional<Timestamp> getLastStableCheckpointTimestampDeprecated(
         ServiceContext* serviceCtx) const = 0;
+
+    /**
+     * Returns the read timestamp of the recovery unit of the given operation context.
+     */
+    virtual Timestamp getPointInTimeReadTimestamp(OperationContext* opCtx) const = 0;
 };
 
 }  // namespace repl

@@ -47,7 +47,6 @@
 #include "mongo/db/commands/fsync_locked.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
-#include "mongo/db/db.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/backup_cursor_hooks.h"
 #include "mongo/db/storage/storage_engine.h"
@@ -332,8 +331,7 @@ private:
 SimpleMutex filesLockedFsync;
 
 void FSyncLockThread::run() {
-    Client::initThread("fsyncLockWorker");
-    ON_BLOCK_EXIT([] { Client::destroy(); });
+    ThreadClient tc("fsyncLockWorker", getGlobalServiceContext());
     stdx::lock_guard<SimpleMutex> lkf(filesLockedFsync);
     stdx::unique_lock<stdx::mutex> lk(fsyncCmd.lockStateMutex);
 

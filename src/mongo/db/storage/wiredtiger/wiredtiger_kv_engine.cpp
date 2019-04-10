@@ -183,9 +183,7 @@ public:
     }
 
     virtual void run() {
-        Client::initThread(name().c_str());
-        ON_BLOCK_EXIT([] { Client::destroy(); });
-
+        ThreadClient tc(name(), getGlobalServiceContext());
         LOG(1) << "starting " << name() << " thread";
 
         while (!_shuttingDown.load()) {
@@ -231,9 +229,7 @@ public:
     }
 
     virtual void run() {
-        Client::initThread(name().c_str());
-        ON_BLOCK_EXIT([] { Client::destroy(); });
-
+        ThreadClient tc(name(), getGlobalServiceContext());
         LOG(1) << "starting " << name() << " thread";
 
         while (!_shuttingDown.load()) {
@@ -485,6 +481,8 @@ static void copy_keydb_files(const boost::filesystem::path& from,
     if (empty)
         emptyDirs.push_back(from);
 }
+
+StringData WiredTigerKVEngine::kTableUriPrefix = "table:"_sd;
 
 WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
                                        const std::string& path,
@@ -909,10 +907,9 @@ Status WiredTigerKVEngine::_salvageIfNeeded(const char* uri) {
 Status WiredTigerKVEngine::_rebuildIdent(WT_SESSION* session, const char* uri) {
     invariant(_inRepairMode);
 
-    static const char tablePrefix[] = "table:";
-    invariant(std::string(uri).find(tablePrefix) == 0);
+    invariant(std::string(uri).find(kTableUriPrefix.rawData()) == 0);
 
-    const std::string identName(uri + sizeof(tablePrefix) - 1);
+    const std::string identName(uri + kTableUriPrefix.size());
     auto filePath = getDataFilePathForIdent(identName);
     if (filePath) {
         const boost::filesystem::path corruptFile(filePath->string() + ".corrupt");
@@ -1324,7 +1321,7 @@ std::unique_ptr<RecordStore> WiredTigerKVEngine::getGroupedRecordStore(
 
     WiredTigerRecordStore::Params params;
     params.ns = ns;
-    params.uri = _uri(ident);
+    params.ident = ident.toString();
     params.engineName = _canonicalName;
     params.isCapped = options.capped;
     params.isEphemeral = _ephemeral;
@@ -1356,7 +1353,8 @@ std::unique_ptr<RecordStore> WiredTigerKVEngine::getGroupedRecordStore(
 }
 
 string WiredTigerKVEngine::_uri(StringData ident) const {
-    return string("table:") + ident.toString();
+    invariant(ident.find(kTableUriPrefix) == string::npos);
+    return kTableUriPrefix + ident.toString();
 }
 
 Status WiredTigerKVEngine::createGroupedSortedDataInterface(OperationContext* opCtx,
@@ -1406,6 +1404,47 @@ SortedDataInterface* WiredTigerKVEngine::getGroupedSortedDataInterface(Operation
     return new WiredTigerIndexStandard(opCtx, _uri(ident), desc, prefix, _readOnly);
 }
 
+std::unique_ptr<RecordStore> WiredTigerKVEngine::makeTemporaryRecordStore(OperationContext* opCtx,
+                                                                          StringData ident) {
+    invariant(!_readOnly);
+
+    _ensureIdentPath(ident);
+    WiredTigerSession wtSession(_conn);
+
+    CollectionOptions noOptions;
+    StatusWith<std::string> swConfig = WiredTigerRecordStore::generateCreateString(
+        _canonicalName, "" /* internal table */, noOptions, _rsOptions, false /* prefixed */);
+    uassertStatusOK(swConfig.getStatus());
+
+    std::string config = swConfig.getValue();
+
+    std::string uri = _uri(ident);
+    WT_SESSION* session = wtSession.getSession();
+    LOG(2) << "WiredTigerKVEngine::createTemporaryRecordStore uri: " << uri
+           << " config: " << config;
+    uassertStatusOK(wtRCToStatus(session->create(session, uri.c_str(), config.c_str())));
+
+    WiredTigerRecordStore::Params params;
+    params.ns = "";
+    params.ident = ident.toString();
+    params.engineName = _canonicalName;
+    params.isCapped = false;
+    params.isEphemeral = _ephemeral;
+    params.cappedCallback = nullptr;
+    // Temporary collections do not need to persist size information to the size storer.
+    params.sizeStorer = nullptr;
+    params.isReadOnly = false;
+
+    params.cappedMaxSize = -1;
+    params.cappedMaxDocs = -1;
+
+    std::unique_ptr<WiredTigerRecordStore> rs;
+    rs = stdx::make_unique<StandardWiredTigerRecordStore>(this, opCtx, params);
+    rs->postConstructorInit(opCtx);
+
+    return std::move(rs);
+}
+
 void WiredTigerKVEngine::alterIdentMetadata(OperationContext* opCtx,
                                             StringData ident,
                                             const IndexDescriptor* desc) {
@@ -1431,7 +1470,7 @@ Status WiredTigerKVEngine::dropIdent(OperationContext* opCtx, StringData ident) 
 
     int ret = session.getSession()->drop(
         session.getSession(), uri.c_str(), "force,checkpoint_wait=false");
-    LOG(1) << "WT drop of  " << uri << " res " << ret;
+    LOG(1) << "WT drop of " << uri << " res " << ret;
 
     if (ret == 0) {
         // yay, it worked
@@ -1917,6 +1956,21 @@ StatusWith<Timestamp> WiredTigerKVEngine::recoverToStableTimestamp(OperationCont
 
 Timestamp WiredTigerKVEngine::getAllCommittedTimestamp() const {
     return Timestamp(_oplogManager->fetchAllCommittedValue(_conn));
+}
+
+Timestamp WiredTigerKVEngine::getOldestOpenReadTimestamp() const {
+    // Return the minimum read timestamp of all open transactions.
+    char buf[(2 * 8 /*bytes in hex*/) + 1 /*null terminator*/];
+    auto wtstatus = _conn->query_timestamp(_conn, buf, "get=oldest_reader");
+    if (wtstatus == WT_NOTFOUND) {
+        return Timestamp();
+    } else {
+        invariantWTOK(wtstatus);
+    }
+
+    uint64_t tmp;
+    fassert(38802, parseNumberFromStringWithBase(buf, 16, &tmp));
+    return Timestamp(tmp);
 }
 
 boost::optional<Timestamp> WiredTigerKVEngine::getRecoveryTimestamp() const {

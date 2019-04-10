@@ -154,6 +154,21 @@ def _parse_mapping(
         func(ctxt, spec, first_name, second_node)
 
 
+def _parse_config_global(ctxt, node):
+    # type: (errors.ParserContext, yaml.nodes.MappingNode) -> syntax.ConfigGlobal
+    """Parse global settings for config options."""
+    config = syntax.ConfigGlobal(ctxt.file_name, node.start_mark.line, node.start_mark.column)
+
+    _generic_parser(
+        ctxt, node, "configs", config, {
+            "section": _RuleDesc("scalar"),
+            "source": _RuleDesc("scalar_or_sequence"),
+            "initializer_name": _RuleDesc("scalar"),
+        })
+
+    return config
+
+
 def _parse_global(ctxt, spec, node):
     # type: (errors.ParserContext, syntax.IDLSpec, Union[yaml.nodes.MappingNode, yaml.nodes.ScalarNode, yaml.nodes.SequenceNode]) -> None
     """Parse a global section in the IDL file."""
@@ -162,10 +177,11 @@ def _parse_global(ctxt, spec, node):
 
     idlglobal = syntax.Global(ctxt.file_name, node.start_mark.line, node.start_mark.column)
 
-    _generic_parser(ctxt, node, "global", idlglobal, {
-        "cpp_namespace": _RuleDesc("scalar"),
-        "cpp_includes": _RuleDesc("scalar_or_sequence"),
-    })
+    _generic_parser(
+        ctxt, node, "global", idlglobal, {
+            "cpp_namespace": _RuleDesc("scalar"), "cpp_includes": _RuleDesc("scalar_or_sequence"),
+            "configs": _RuleDesc("mapping", mapping_parser_func=_parse_config_global)
+        })
 
     spec.globals = idlglobal
 
@@ -219,6 +235,21 @@ def _parse_validator(ctxt, node):
         })
 
     return validator
+
+
+def _parse_condition(ctxt, node):
+    # type: (errors.ParserContext, yaml.nodes.MappingNode) -> syntax.Condition
+    """Parse a condition."""
+    condition = syntax.Condition(ctxt.file_name, node.start_mark.line, node.start_mark.column)
+
+    _generic_parser(
+        ctxt, node, "condition", condition, {
+            "preprocessor": _RuleDesc("scalar"),
+            "constexpr": _RuleDesc("scalar"),
+            "expr": _RuleDesc("scalar"),
+        })
+
+    return condition
 
 
 def _parse_field(ctxt, name, node):
@@ -503,6 +534,7 @@ def _parse_server_parameter(ctxt, spec, name, node):
             "description": _RuleDesc('scalar', _RuleDesc.REQUIRED),
             "cpp_vartype": _RuleDesc('scalar'),
             "cpp_varname": _RuleDesc('scalar'),
+            "condition": _RuleDesc('mapping', mapping_parser_func=_parse_condition),
             "default": _RuleDesc('scalar'),
             "deprecated_name": _RuleDesc('scalar_or_sequence'),
             "from_bson": _RuleDesc('scalar'),
@@ -513,6 +545,41 @@ def _parse_server_parameter(ctxt, spec, name, node):
         })
 
     spec.server_parameters.append(param)
+
+
+def _parse_config_option(ctxt, spec, name, node):
+    # type: (errors.ParserContext, syntax.IDLSpec, unicode, Union[yaml.nodes.MappingNode, yaml.nodes.ScalarNode, yaml.nodes.SequenceNode]) -> None
+    """Parse a configs section in the IDL file."""
+    if not ctxt.is_mapping_node(node, "configs"):
+        return
+
+    option = syntax.ConfigOption(ctxt.file_name, node.start_mark.line, node.start_mark.column)
+    option.name = name
+
+    _generic_parser(
+        ctxt, node, "configs", option, {
+            "short_name": _RuleDesc('scalar'),
+            "single_name": _RuleDesc('scalar'),
+            "deprecated_name": _RuleDesc('scalar_or_sequence'),
+            "deprecated_short_name": _RuleDesc('scalar_or_sequence'),
+            "description": _RuleDesc('scalar', _RuleDesc.REQUIRED),
+            "section": _RuleDesc('scalar'),
+            "arg_vartype": _RuleDesc('scalar', _RuleDesc.REQUIRED),
+            "cpp_vartype": _RuleDesc('scalar'),
+            "cpp_varname": _RuleDesc('scalar'),
+            "condition": _RuleDesc('mapping', mapping_parser_func=_parse_condition),
+            "conflicts": _RuleDesc('scalar_or_sequence'),
+            "requires": _RuleDesc('scalar_or_sequence'),
+            "hidden": _RuleDesc('bool_scalar'),
+            "default": _RuleDesc('scalar'),
+            "implicit": _RuleDesc('scalar'),
+            "source": _RuleDesc('scalar_or_sequence'),
+            "duplicate_behavior": _RuleDesc('scalar'),
+            "positional": _RuleDesc('scalar'),
+            "validator": _RuleDesc('mapping', mapping_parser_func=_parse_validator),
+        })
+
+    spec.configs.append(option)
 
 
 def _prefix_with_namespace(cpp_namespace, cpp_name):
@@ -595,6 +662,8 @@ def _parse(stream, error_file_name):
             _parse_mapping(ctxt, spec, second_node, 'commands', _parse_command)
         elif first_name == "server_parameters":
             _parse_mapping(ctxt, spec, second_node, "server_parameters", _parse_server_parameter)
+        elif first_name == "configs":
+            _parse_mapping(ctxt, spec, second_node, "configs", _parse_config_option)
         else:
             ctxt.add_unknown_root_node_error(first_node)
 

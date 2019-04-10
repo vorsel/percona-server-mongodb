@@ -43,11 +43,11 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/update.h"
-#include "mongo/db/ops/update_lifecycle_impl.h"
 #include "mongo/db/ops/update_request.h"
 #include "mongo/db/repl/bson_extract_optime.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/s/sharding_logging.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/write_concern.h"
@@ -174,8 +174,6 @@ Status modifyRecoveryDocument(OperationContext* opCtx,
         updateReq.setQuery(RecoveryDocument::getQuery());
         updateReq.setUpdates(updateObj);
         updateReq.setUpsert();
-        UpdateLifecycleImpl updateLifecycle(NamespaceString::kServerConfigurationNamespace);
-        updateReq.setLifecycle(&updateLifecycle);
 
         UpdateResult result = update(opCtx, autoGetOrCreateDb->getDb(), updateReq);
         invariant(result.numDocsModified == 1 || !result.upserted.isEmpty());
@@ -256,12 +254,12 @@ Status ShardingStateRecovery::recover(OperationContext* opCtx) {
              "to retrieve the most recent opTime.";
 
     // Need to fetch the latest uptime from the config server, so do a logging write
-    Status status =
-        grid->catalogClient()->logChangeChecked(opCtx,
-                                                "Sharding minOpTime recovery",
-                                                NamespaceString::kServerConfigurationNamespace.ns(),
-                                                recoveryDocBSON,
-                                                ShardingCatalogClient::kMajorityWriteConcern);
+    Status status = ShardingLogging::get(opCtx)->logChangeChecked(
+        opCtx,
+        "Sharding minOpTime recovery",
+        NamespaceString::kServerConfigurationNamespace.ns(),
+        recoveryDocBSON,
+        ShardingCatalogClient::kMajorityWriteConcern);
     if (!status.isOK())
         return status;
 

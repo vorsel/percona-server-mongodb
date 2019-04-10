@@ -166,23 +166,10 @@
  * normal `.ignore()` code.  This macro exists only to make using `ASSERT_THROWS` less inconvenient
  * on functions which both throw and return `Status` or `StatusWith`.
  */
-//#define UNIT_TEST_INTERNALS_IGNORE_UNUSED_RESULT_WARNINGS(STATEMENT)
-#ifdef __GNUC__
-// The `(void) 0`s are to permit more readable formatting of these in-macro pragma statements.
-#define UNIT_TEST_INTERNALS_IGNORE_UNUSED_RESULT_WARNINGS(STATEMENT)   \
-    do {                                                               \
-        _Pragma("GCC diagnostic push")(void) 0;                        \
-        _Pragma("GCC diagnostic ignored \"-Wunused\"")(void) 0;        \
-        _Pragma("GCC diagnostic ignored \"-Wunused-result\"")(void) 0; \
-        STATEMENT;                                                     \
-        _Pragma("GCC diagnostic pop")(void) 0;                         \
+#define UNIT_TEST_INTERNALS_IGNORE_UNUSED_RESULT_WARNINGS(EXPRESSION) \
+    do {                                                              \
+        (void)(EXPRESSION);                                           \
     } while (false)
-#else
-#define UNIT_TEST_INTERNALS_IGNORE_UNUSED_RESULT_WARNINGS(STATEMENT) \
-    do {                                                             \
-        STATEMENT;                                                   \
-    } while (false)
-#endif
 
 /**
  * Behaves like ASSERT_THROWS, above, but also calls CHECK(caughtException) which may contain
@@ -265,7 +252,6 @@
 #define _TEST_TYPE_NAME(CASE_NAME, TEST_NAME) UnitTest__##CASE_NAME##__##TEST_NAME
 
 namespace mongo {
-
 namespace unittest {
 
 class Result;
@@ -277,6 +263,7 @@ void setupTestLogger();
  * different target from the global log domain.
  */
 mongo::logger::LogstreamBuilder log();
+mongo::logger::LogstreamBuilder warning();
 
 /**
  * Type representing the function composing a test.
@@ -477,6 +464,23 @@ struct SuiteInstance {
     }
 };
 
+template <typename T>
+Test::RegistrationAgent<T>::RegistrationAgent(const std::string& suiteName,
+                                              const std::string& testName)
+    : _suiteName(suiteName), _testName(testName) {
+    Suite::getSuite(suiteName)->add<T>(testName);
+}
+
+template <typename T>
+std::string Test::RegistrationAgent<T>::getSuiteName() const {
+    return _suiteName;
+}
+
+template <typename T>
+std::string Test::RegistrationAgent<T>::getTestName() const {
+    return _testName;
+}
+
 /**
  * Exception thrown when a test assertion fails.
  *
@@ -632,12 +636,5 @@ T assertGet(StatusWith<T>&& swt) {
  */
 std::vector<std::string> getAllSuiteNames();
 
-
-inline bool alwaysTrue() {
-    return true;
-}
-
 }  // namespace unittest
 }  // namespace mongo
-
-#include "mongo/unittest/unittest-inl.h"

@@ -267,6 +267,10 @@ public:
         _ns = ns.ns();
     }
 
+    bool isTemp() const {
+        return ns().size() == 0;
+    }
+
     virtual const std::string& getIdent() const = 0;
 
     /**
@@ -311,7 +315,8 @@ public:
      */
     RecordData dataFor(OperationContext* opCtx, const RecordId& loc) const {
         RecordData data;
-        invariant(findRecord(opCtx, loc, &data));
+        invariant(findRecord(opCtx, loc, &data),
+                  str::stream() << "Didn't find RecordId " << loc << " in record store " << ns());
         return data;
     }
 

@@ -32,8 +32,6 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/dbmain.h"
-
 #include <boost/filesystem/operations.hpp>
 #include <boost/optional.hpp>
 #include <fstream>
@@ -74,6 +72,7 @@
 #include "mongo/db/free_mon/free_mon_mongod.h"
 #include "mongo/db/ftdc/ftdc_mongod.h"
 #include "mongo/db/global_settings.h"
+#include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/index_rebuilder.h"
 #include "mongo/db/initialize_server_global_state.h"
@@ -120,7 +119,6 @@
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_entry_point_mongod.h"
-#include "mongo/db/session_catalog.h"
 #include "mongo/db/session_killer.h"
 #include "mongo/db/startup_warnings_mongod.h"
 #include "mongo/db/stats/counters.h"
@@ -865,7 +863,10 @@ MONGO_INITIALIZER_GENERAL(setSSLManagerType, MONGO_NO_PREREQUISITES, ("SSLManage
 // NOTE: This function may be called at any time after registerShutdownTask is called below. It
 // must not depend on the prior execution of mongo initializers or the existence of threads.
 void shutdownTask() {
-    Client::initThreadIfNotAlready();
+    // This client initiation pattern is only to be used here, with plans to eliminate this pattern
+    // down the line.
+    if (!haveClient())
+        Client::initThread(getThreadName());
 
     auto const client = Client::getCurrent();
     auto const serviceContext = client->getServiceContext();
@@ -907,6 +908,11 @@ void shutdownTask() {
         // Destroy all stashed transaction resources, in order to release locks.
         killSessionsLocalShutdownAllTransactions(opCtx);
     }
+
+    // Interrupts all index builds, leaving the state intact to be recovered when the server
+    // restarts. This should be done after replication oplog application finishes, so foreground
+    // index builds begun by replication on secondaries do not invariant.
+    IndexBuildsCoordinator::get(serviceContext)->shutdown();
 
     serviceContext->setKillAllOperations();
 
@@ -983,9 +989,6 @@ void shutdownTask() {
     audit::logShutdown(client);
 }
 
-
-}  // namespace
-
 int mongoDbMain(int argc, char* argv[], char** envp) {
     registerShutdownTask(shutdownTask);
 
@@ -1036,4 +1039,23 @@ int mongoDbMain(int argc, char* argv[], char** envp) {
     return 0;
 }
 
+}  // namespace
 }  // namespace mongo
+
+#if defined(_WIN32)
+// In Windows, wmain() is an alternate entry point for main(), and receives the same parameters
+// as main() but encoded in Windows Unicode (UTF-16); "wide" 16-bit wchar_t characters.  The
+// WindowsCommandLine object converts these wide character strings to a UTF-8 coded equivalent
+// and makes them available through the argv() and envp() members.  This enables mongoDbMain()
+// to process UTF-8 encoded arguments and environment variables without regard to platform.
+int wmain(int argc, wchar_t* argvW[], wchar_t* envpW[]) {
+    mongo::WindowsCommandLine wcl(argc, argvW, envpW);
+    int exitCode = mongo::mongoDbMain(argc, wcl.argv(), wcl.envp());
+    mongo::quickExit(exitCode);
+}
+#else
+int main(int argc, char* argv[], char** envp) {
+    int exitCode = mongo::mongoDbMain(argc, argv, envp);
+    mongo::quickExit(exitCode);
+}
+#endif

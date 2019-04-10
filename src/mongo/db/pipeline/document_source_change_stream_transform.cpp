@@ -129,8 +129,6 @@ StageConstraints DocumentSourceChangeStreamTransform::constraints(
                                  TransactionRequirement::kNotAllowed,
                                  ChangeStreamRequirement::kChangeStreamStage);
 
-    constraints.canSwapWithMatch = true;
-    constraints.canSwapWithLimit = true;
     // This transformation could be part of a 'collectionless' change stream on an entire
     // database or cluster, mark as independent of any collection if so.
     constraints.isIndependentOfAnyCollection = _isIndependentOfAnyCollection;
@@ -231,8 +229,9 @@ Document DocumentSourceChangeStreamTransform::applyTransformation(const Document
         // unsharded when the entry was last populated.
         auto it = _documentKeyCache.find(uuid.getUuid());
         if (it == _documentKeyCache.end() || !it->second.isFinal) {
-            auto docKeyFields = pExpCtx->mongoProcessInterface->collectDocumentKeyFields(
-                pExpCtx->opCtx, NamespaceStringOrUUID(nss.db().toString(), uuid.getUuid()));
+            auto docKeyFields =
+                pExpCtx->mongoProcessInterface->collectDocumentKeyFieldsForHostedCollection(
+                    pExpCtx->opCtx, nss, uuid.getUuid());
             if (it == _documentKeyCache.end() || docKeyFields.second) {
                 _documentKeyCache[uuid.getUuid()] = DocumentKeyCacheEntry(docKeyFields);
             }
@@ -433,6 +432,11 @@ DocumentSource::GetModPathsReturn DocumentSourceChangeStreamTransform::getModifi
 
 DocumentSource::GetNextResult DocumentSourceChangeStreamTransform::getNext() {
     pExpCtx->checkForInterrupt();
+
+    uassert(50988,
+            "Illegal attempt to execute an internal change stream stage on mongos. A $changeStream "
+            "stage must be the first stage in a pipeline",
+            !pExpCtx->inMongos);
 
     // If we're unwinding an 'applyOps' from a transaction, check if there are any documents we have
     // stored that can be returned.

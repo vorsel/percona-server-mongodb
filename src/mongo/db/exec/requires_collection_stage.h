@@ -41,21 +41,28 @@ namespace mongo {
  * for checking that the collection is still valid (e.g. has not been dropped) when recovering from
  * yield.
  *
- * Subclasses must implement the saveStage() and restoreState() variants tagged with RequiresCollTag
+ * Subclasses must implement doSaveStateRequiresCollection() and doRestoreStateRequiresCollection()
  * in order to supply custom yield preparation or yield recovery logic.
+ *
+ * Templated on 'CollectionT', which may be instantiated using either Collection* or const
+ * Collection*. This abstracts the implementation of this base class for use by derived classes
+ * which read (e.g. COLLSCAN and MULTI_ITERATOR) and derived classes that write (e.g. UPDATE and
+ * DELETE). Derived classes should use the 'RequiresCollectionStage' or
+ * 'RequiresMutableCollectionStage' aliases provided below.
  */
-class RequiresCollectionStage : public PlanStage {
+template <typename CollectionT>
+class RequiresCollectionStageBase : public PlanStage {
 public:
-    RequiresCollectionStage(const char* stageType, OperationContext* opCtx, const Collection* coll)
+    RequiresCollectionStageBase(const char* stageType, OperationContext* opCtx, CollectionT coll)
         : PlanStage(stageType, opCtx),
           _collection(coll),
-          _collectionUUID(_collection->uuid().get()) {}
+          _collectionUUID(_collection->uuid().get()) {
+        invariant(_collection);
+    }
 
-    virtual ~RequiresCollectionStage() = default;
+    virtual ~RequiresCollectionStageBase() = default;
 
 protected:
-    struct RequiresCollTag {};
-
     void doSaveState() final;
 
     void doRestoreState() final;
@@ -63,24 +70,30 @@ protected:
     /**
      * Performs yield preparation specific to a stage which subclasses from RequiresCollectionStage.
      */
-    virtual void saveState(RequiresCollTag) = 0;
+    virtual void doSaveStateRequiresCollection() = 0;
 
     /**
      * Performs yield recovery specific to a stage which subclasses from RequiresCollectionStage.
      */
-    virtual void restoreState(RequiresCollTag) = 0;
+    virtual void doRestoreStateRequiresCollection() = 0;
 
-    const Collection* collection() {
+    CollectionT collection() const {
         return _collection;
     }
 
-    UUID uuid() {
+    UUID uuid() const {
         return _collectionUUID;
     }
 
 private:
-    const Collection* _collection;
+    CollectionT _collection;
     const UUID _collectionUUID;
 };
+
+// Type alias for use by PlanStages that read a Collection.
+using RequiresCollectionStage = RequiresCollectionStageBase<const Collection*>;
+
+// Type alias for use by PlanStages that write to a Collection.
+using RequiresMutableCollectionStage = RequiresCollectionStageBase<Collection*>;
 
 }  // namespace mongo

@@ -46,6 +46,7 @@ StringData kModeFieldName = DocumentSourceOutSpec::kModeFieldName;
 StringData kUniqueKeyFieldName = DocumentSourceOutSpec::kUniqueKeyFieldName;
 StringData kDefaultMode = WriteMode_serializer(WriteModeEnum::kModeReplaceCollection);
 StringData kInsertDocumentsMode = WriteMode_serializer(WriteModeEnum::kModeInsertDocuments);
+StringData kReplaceDocumentsMode = WriteMode_serializer(WriteModeEnum::kModeReplaceDocuments);
 
 /**
  * For the purpsoses of this test, assume every collection is unsharded. Stages may ask this during
@@ -62,9 +63,15 @@ public:
      * For the purposes of these tests, pretend each collection is unsharded and has a document key
      * of just "_id".
      */
-    std::pair<std::vector<FieldPath>, bool> collectDocumentKeyFields(
-        OperationContext* opCtx, NamespaceStringOrUUID nssOrUUID) const override {
-        return {{"_id"}, false};
+    std::vector<FieldPath> collectDocumentKeyFieldsActingAsRouter(
+        OperationContext* opCtx, const NamespaceString& nss) const override {
+        return {"_id"};
+    }
+
+    void checkRoutingInfoEpochOrThrow(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                      const NamespaceString&,
+                                      ChunkVersion) const override {
+        return;  // Pretend it always matches for our tests here.
     }
 };
 
@@ -281,6 +288,25 @@ TEST_F(DocumentSourceOutTest, FailsToParseIfModeIsNotString) {
     ASSERT_THROWS_CODE(createOutStage(spec), AssertionException, ErrorCodes::TypeMismatch);
 }
 
+TEST_F(DocumentSourceOutTest, CorrectlyAddressesMatchingTargetAndAggregationNamespaces) {
+    const auto targetNsSameAsAggregationNs = getExpCtx()->ns;
+    const auto targetColl = targetNsSameAsAggregationNs.coll();
+    const auto targetDb = targetNsSameAsAggregationNs.db();
+
+    BSONObj spec = BSON(
+        "$out" << BSON("to" << targetColl << "mode" << kInsertDocumentsMode << "db" << targetDb));
+    ASSERT_THROWS_CODE(createOutStage(spec), AssertionException, 50992);
+
+    spec = BSON(
+        "$out" << BSON("to" << targetColl << "mode" << kReplaceDocumentsMode << "db" << targetDb));
+    ASSERT_THROWS_CODE(createOutStage(spec), AssertionException, 50992);
+
+    spec = BSON("$out" << BSON("to" << targetColl << "mode" << kDefaultMode << "db" << targetDb));
+    auto outStage = createOutStage(spec);
+    ASSERT_EQ(outStage->getOutputNs().db(), targetNsSameAsAggregationNs.db());
+    ASSERT_EQ(outStage->getOutputNs().coll(), targetNsSameAsAggregationNs.coll());
+}
+
 TEST_F(DocumentSourceOutTest, FailsToParseIfModeIsUnsupportedString) {
     BSONObj spec = BSON("$out" << BSON("to"
                                        << "test"
@@ -339,21 +365,38 @@ TEST_F(DocumentSourceOutTest, FailsToParseIfUniqueKeyHasDuplicateFields) {
     ASSERT_THROWS_CODE(createOutStage(spec), AssertionException, ErrorCodes::BadValue);
 }
 
-TEST_F(DocumentSourceOutTest, FailsToParseIfTargetEpochIsSpecifiedOnMongos) {
+TEST_F(DocumentSourceOutTest, FailsToParseIfTargetCollectionVersionIsSpecifiedOnMongos) {
     BSONObj spec = BSON("$out" << BSON("to"
                                        << "test"
                                        << "mode"
                                        << kDefaultMode
                                        << "uniqueKey"
                                        << BSON("_id" << 1)
-                                       << "epoch"
-                                       << OID::gen()));
+                                       << "targetCollectionVersion"
+                                       << ChunkVersion(0, 0, OID::gen()).toBSON()));
     getExpCtx()->inMongos = true;
     ASSERT_THROWS_CODE(createOutStage(spec), AssertionException, 50984);
 
-    // Test that 'targetEpoch' is accepted if not in mongos.
+    // Test that 'targetCollectionVersion' is accepted if _from_ mongos.
     getExpCtx()->inMongos = false;
+    getExpCtx()->fromMongos = true;
     ASSERT(createOutStage(spec) != nullptr);
+
+    // Test that 'targetCollectionVersion' is not accepted if on mongod but not from mongos.
+    getExpCtx()->inMongos = false;
+    getExpCtx()->fromMongos = false;
+    ASSERT_THROWS_CODE(createOutStage(spec), AssertionException, 51018);
+}
+
+TEST_F(DocumentSourceOutTest, FailsToParseifUniqueKeyIsNotSentFromMongos) {
+    BSONObj spec = BSON("$out" << BSON("to"
+                                       << "test"
+                                       << "mode"
+                                       << kDefaultMode
+                                       << "targetCollectionVersion"
+                                       << ChunkVersion(0, 0, OID::gen()).toBSON()));
+    getExpCtx()->fromMongos = true;
+    ASSERT_THROWS_CODE(createOutStage(spec), AssertionException, 51017);
 }
 
 TEST_F(DocumentSourceOutTest, CorrectlyUsesTargetDbThatMatchesAggregationDb) {

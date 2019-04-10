@@ -93,8 +93,8 @@ public:
      *
      * Used for testing only.
      */
-    using ScheduleDbWorkFn = stdx::function<StatusWith<executor::TaskExecutor::CallbackHandle>(
-        const executor::TaskExecutor::CallbackFn&)>;
+    using ScheduleDbWorkFn = unique_function<StatusWith<executor::TaskExecutor::CallbackHandle>(
+        executor::TaskExecutor::CallbackFn)>;
 
     /**
      * Type of function to create a database client
@@ -117,7 +117,7 @@ public:
                      const HostAndPort& source,
                      const NamespaceString& sourceNss,
                      const CollectionOptions& options,
-                     const CallbackFn& onCompletion,
+                     CallbackFn onCompletion,
                      StorageInterface* storageInterface,
                      const int batchSize);
 
@@ -152,7 +152,7 @@ public:
      *
      * For testing only.
      */
-    void setScheduleDbWorkFn_forTest(const ScheduleDbWorkFn& scheduleDbWorkFn);
+    void setScheduleDbWorkFn_forTest(ScheduleDbWorkFn scheduleDbWorkFn);
 
     /**
      * Allows a different client class to be injected.
@@ -296,7 +296,10 @@ private:
         kFinished
     } _queryState = QueryState::kNotStarted;
 
-    // (M) Client connection used for query.
+    // (M) Client connection used for query. The '_clientConnection' is owned by the '_runQuery'
+    // thread and may only be set by that thread, and only when holding '_mutex'. The '_runQuery'
+    // thread may read this pointer without holding '_mutex'. It is exposed to other threads to
+    // allow cancellation, and those other threads may access it only when holding '_mutex'.
     std::unique_ptr<DBClientConnection> _clientConnection;
 
     // State transitions:

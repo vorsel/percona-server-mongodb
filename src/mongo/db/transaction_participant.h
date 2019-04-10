@@ -113,6 +113,7 @@ public:
     private:
         bool _released = false;
         std::unique_ptr<Locker> _locker;
+        std::unique_ptr<Locker::LockSnapshot> _lockSnapshot;
         std::unique_ptr<RecoveryUnit> _recoveryUnit;
         repl::ReadConcernArgs _readConcernArgs;
         WriteUnitOfWork::RecoveryUnitState _ruState;
@@ -164,12 +165,6 @@ public:
      * continue using the TransactionParticipant once we are in shutdown.
      */
     void shutdown();
-
-    /**
-     * Called for speculative transactions to fix the optime of the snapshot to read from.
-     */
-    void setSpeculativeTransactionOpTime(OperationContext* opCtx,
-                                         SpeculativeTransactionOpTime opTimeChoice);
 
     /**
      * Transfers management of transaction resources from the OperationContext to the Session.
@@ -286,20 +281,21 @@ public:
 
     std::string transactionInfoForLogForTest(const SingleThreadedLockStats* lockStats,
                                              bool committed,
-                                             repl::ReadConcernArgs readConcernArgs,
-                                             bool wasPrepared) {
+                                             repl::ReadConcernArgs readConcernArgs) {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
         TransactionState::StateFlag terminationCause =
             committed ? TransactionState::kCommitted : TransactionState::kAborted;
-        return _transactionInfoForLog(lockStats, terminationCause, readConcernArgs, wasPrepared);
+        return _transactionInfoForLog(lockStats, terminationCause, readConcernArgs);
     }
 
     /**
      * If this session is not holding stashed locks in _txnResourceStash (transaction is active),
      * reports the current state of the session using the provided builder. Locks the session
      * object's mutex while running.
+     * If this is called from a thread other than the owner of the opCtx, that thread must be
+     * holding the client lock.
      */
-    void reportUnstashedState(repl::ReadConcernArgs readConcernArgs, BSONObjBuilder* builder) const;
+    void reportUnstashedState(OperationContext* opCtx, BSONObjBuilder* builder) const;
 
     /**
      * Convenience method which creates and populates a BSONObj containing the stashed state.
@@ -643,6 +639,11 @@ private:
                                       std::vector<StmtId> stmtIdsWritten,
                                       const repl::OpTime& lastStmtIdWriteTs);
 
+    // Called for speculative transactions to fix the optime of the snapshot to read from.
+    void _setSpeculativeTransactionOpTime(WithLock,
+                                          OperationContext* opCtx,
+                                          SpeculativeTransactionOpTime opTimeChoice);
+
     // Finishes committing the multi-document transaction after the storage-transaction has been
     // committed, the oplog entry has been inserted into the oplog, and the transactions table has
     // been updated.
@@ -694,8 +695,7 @@ private:
     // passed in order for this method to be called.
     std::string _transactionInfoForLog(const SingleThreadedLockStats* lockStats,
                                        TransactionState::StateFlag terminationCause,
-                                       repl::ReadConcernArgs readConcernArgs,
-                                       bool wasPrepared);
+                                       repl::ReadConcernArgs readConcernArgs);
 
     // Reports transaction stats for both active and inactive transactions using the provided
     // builder.  The lock may be either a lock on _mutex or a lock on _metricsMutex.

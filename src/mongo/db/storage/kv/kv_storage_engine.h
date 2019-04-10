@@ -42,6 +42,7 @@
 #include "mongo/db/storage/kv/kv_database_catalog_entry_base.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/storage/temporary_record_store.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/mutex.h"
@@ -126,6 +127,9 @@ public:
 
     virtual Status repairRecordStore(OperationContext* opCtx, const std::string& ns);
 
+    virtual std::unique_ptr<TemporaryRecordStore> makeTemporaryRecordStore(
+        OperationContext* opCtx) override;
+
     virtual void cleanShutdown();
 
     virtual void setStableTimestamp(Timestamp stableTimestamp,
@@ -152,6 +156,8 @@ public:
     virtual boost::optional<Timestamp> getLastStableRecoveryTimestamp() const override;
 
     virtual Timestamp getAllCommittedTimestamp() const override;
+
+    virtual Timestamp getOldestOpenReadTimestamp() const override;
 
     bool supportsReadConcernSnapshot() const final;
 
@@ -184,6 +190,8 @@ public:
      */
     StatusWith<std::vector<StorageEngine::CollectionIndexNamePair>> reconcileCatalogAndIdents(
         OperationContext* opCtx) override;
+
+    std::string getFilesystemPathForDb(const std::string& dbName) const override;
 
     /**
      * When loading after an unclean shutdown, this performs cleanup on the KVCatalog and unsets the

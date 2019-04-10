@@ -68,6 +68,7 @@ class UUID {
     friend class DatabaseVersion;
     friend class DbCheckOplogCollection;
     friend class idl::import::One_UUID;
+    friend class IndexBuildEntry;
     friend class LogicalSessionId;
     friend class LogicalSessionToClient;
     friend class LogicalSessionIdToClient;
@@ -75,6 +76,7 @@ class UUID {
     friend class repl::OplogEntryBase;
     friend class repl::ReplOperation;
     friend class ResumeTokenInternal;
+    friend class VoteCommitIndexBuild;
 
 public:
     /**

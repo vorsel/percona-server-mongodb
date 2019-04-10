@@ -18,10 +18,8 @@ env.Library(
     ],
     LIBDEPS= ['$BUILD_DIR/mongo/base',
               '$BUILD_DIR/mongo/db/service_context'],
-    LIBDEPS_DEPENDENTS=[
-        '$BUILD_DIR/mongo/mongodmain',
-    ],
     #PROGDEPS_DEPENDENTS=[
+    #    '$BUILD_DIR/mongo/mongod',
     #    '$BUILD_DIR/mongo/mongos',
     #],
 )
@@ -84,8 +82,8 @@ if wiredtiger:
             ],
         LIBDEPS_PRIVATE= [
             '$BUILD_DIR/mongo/db/snapshot_window_options',
-            '$BUILD_DIR/mongo/util/options_parser/options_parser',
             '$BUILD_DIR/mongo/db/storage/storage_repair_observer',
+            '$BUILD_DIR/mongo/util/options_parser/options_parser',
             ],
         )
 
@@ -129,12 +127,12 @@ if wiredtiger:
                 ],
         LIBDEPS=[
             '$BUILD_DIR/mongo/db/auth/authmocks',
-            '$BUILD_DIR/mongo/db/serveronly',
             '$BUILD_DIR/mongo/db/service_context',
             '$BUILD_DIR/mongo/db/service_context_d',
             '$BUILD_DIR/mongo/db/service_context_test_fixture',
             '$BUILD_DIR/mongo/db/storage/storage_engine_metadata',
             '$BUILD_DIR/mongo/db/storage/storage_options',
+            '$BUILD_DIR/mongo/db/storage/wiredtiger/storage_wiredtiger',
             '$BUILD_DIR/mongo/db/storage/wiredtiger/storage_wiredtiger_core',
             ],
         )
@@ -256,6 +254,7 @@ if wiredtiger:
             LIBDEPS_PRIVATE=[
                 '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
                 '$BUILD_DIR/mongo/db/repl/replmocks',
+                '$BUILD_DIR/mongo/db/service_context_test_fixture',
             ],
         )
 

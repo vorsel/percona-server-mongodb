@@ -83,11 +83,8 @@ std::unique_ptr<ThreadPool> OplogApplier::makeWriterPool(int threadCount) {
     options.poolName = "repl writer worker Pool";
     options.maxThreads = options.minThreads = static_cast<size_t>(threadCount);
     options.onCreateThread = [](const std::string&) {
-        // Only do this once per thread
-        if (!Client::getCurrent()) {
-            Client::initThreadIfNotAlready();
-            AuthorizationSession::get(cc())->grantInternalAuthorization();
-        }
+        Client::initThread(getThreadName());
+        AuthorizationSession::get(cc())->grantInternalAuthorization();
     };
     auto pool = stdx::make_unique<ThreadPool>(options);
     pool->startup();
@@ -120,14 +117,14 @@ OplogBuffer* OplogApplier::getBuffer() const {
 Future<void> OplogApplier::startup() {
     auto pf = makePromiseFuture<void>();
     auto callback =
-        [ this, promise = pf.promise.share() ](const CallbackArgs& args) mutable noexcept {
+        [ this, promise = std::move(pf.promise) ](const CallbackArgs& args) mutable noexcept {
         invariant(args.status);
         log() << "Starting oplog application";
         _run(_oplogBuffer);
         log() << "Finished oplog application";
         promise.setWith([] {});
     };
-    invariant(_executor->scheduleWork(callback).getStatus());
+    invariant(_executor->scheduleWork(std::move(callback)).getStatus());
     return std::move(pf.future);
 }
 
@@ -151,7 +148,8 @@ void OplogApplier::enqueue(OperationContext* opCtx,
 void OplogApplier::enqueue(OperationContext* opCtx,
                            OplogBuffer::Batch::const_iterator begin,
                            OplogBuffer::Batch::const_iterator end) {
-    OCCASIONALLY {
+    static Occasionally sampler;
+    if (sampler.tick()) {
         LOG(2) << "oplog buffer has " << _oplogBuffer->getSize() << " bytes";
     }
     _oplogBuffer->pushAllNonBlocking(opCtx, begin, end);

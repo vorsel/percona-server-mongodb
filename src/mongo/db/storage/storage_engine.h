@@ -46,6 +46,7 @@ namespace mongo {
 class DatabaseCatalogEntry;
 class JournalListener;
 class OperationContext;
+class TemporaryRecordStore;
 class RecoveryUnit;
 class SnapshotManager;
 struct StorageGlobalParams;
@@ -288,6 +289,15 @@ public:
     virtual Status repairRecordStore(OperationContext* opCtx, const std::string& ns) = 0;
 
     /**
+     * Creates a temporary RecordStore on the storage engine. This record store will drop itself
+     * automatically when it goes out of scope. This means the TemporaryRecordStore should not exist
+     * any longer than the OperationContext used to create it. On startup, the storage engine will
+     * drop any un-dropped temporary record stores.
+     */
+    virtual std::unique_ptr<TemporaryRecordStore> makeTemporaryRecordStore(
+        OperationContext* opCtx) = 0;
+
+    /**
      * This method will be called before there is a clean shutdown.  Storage engines should
      * override this method if they have clean-up to do that is different from unclean shutdown.
      * MongoDB will not call into the storage subsystem after calling this function.
@@ -468,6 +478,18 @@ public:
      * implementation.
      */
     virtual Timestamp getAllCommittedTimestamp() const = 0;
+
+    /**
+     * Returns the oldest read timestamp in use by an open transaction. Storage engines that support
+     * the 'snapshot' ReadConcern must provide an implementation. Other storage engines may provide
+     * a no-op implementation.
+     */
+    virtual Timestamp getOldestOpenReadTimestamp() const = 0;
+
+    /**
+     * Returns the path to the directory which has the data files of database with `dbName`.
+     */
+    virtual std::string getFilesystemPathForDb(const std::string& dbName) const = 0;
 };
 
 }  // namespace mongo

@@ -41,7 +41,6 @@
 #include "mongo/bson/json.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/config.h"
-#include "mongo/db/db.h"
 #include "mongo/db/encryption/encryption_options.h"
 #include "mongo/db/global_settings.h"
 #include "mongo/db/repl/repl_settings.h"

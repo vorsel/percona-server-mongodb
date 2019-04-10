@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -130,15 +129,6 @@ enum LockResult {
     LOCK_TIMEOUT,
 
     /**
-     * The lock request was not granted because it would result in a deadlock. No changes to
-     * the state of the Locker would be made if this value is returned (i.e., it will not be
-     * killed due to deadlock). It is up to the caller to decide how to recover from this
-     * return value - could be either release some locks and try again, or just bail with an
-     * error and have some upper code handle it.
-     */
-    LOCK_DEADLOCK,
-
-    /**
      * This is used as an initializer value. Should never be returned.
      */
     LOCK_INVALID
@@ -198,6 +188,7 @@ public:
     enum SingletonHashIds {
         SINGLETON_INVALID = 0,
         SINGLETON_PARALLEL_BATCH_WRITER_MODE,
+        SINGLETON_REPLICATION_STATE_TRANSITION_LOCK,
         SINGLETON_GLOBAL,
     };
 
@@ -273,6 +264,13 @@ extern const ResourceId resourceIdAdminDB;
 // lock.
 // TODO: Merge this with resourceIdGlobal
 extern const ResourceId resourceIdParallelBatchWriterMode;
+
+// Hardcoded resource id for the ReplicationStateTransitionLock (RSTL). We use the same resource
+// type as resourceIdGlobal. This will also ensure the waits are reported as global, which is
+// appropriate. This lock is acquired in mode X for any replication state transition and is acquired
+// by all other reads and writes in mode IX. This lock is acquired after the PBWM but before the
+// resourceIdGlobal.
+extern const ResourceId resourceIdReplicationStateTransitionLock;
 
 /**
  * Interface on which granted lock requests will be notified. See the contract for the notify

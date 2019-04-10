@@ -64,6 +64,9 @@ public:
                                                         StringData ident,
                                                         const CollectionOptions& options);
 
+    virtual std::unique_ptr<RecordStore> makeTemporaryRecordStore(OperationContext* opCtx,
+                                                                  StringData ident) override;
+
     virtual Status createSortedDataInterface(OperationContext* opCtx,
                                              StringData ident,
                                              const IndexDescriptor* desc) {
@@ -122,6 +125,10 @@ public:
     void setJournalListener(JournalListener* jl) final {}
 
     virtual Timestamp getAllCommittedTimestamp() const override {
+        return Timestamp();
+    }
+
+    virtual Timestamp getOldestOpenReadTimestamp() const override {
         return Timestamp();
     }
 

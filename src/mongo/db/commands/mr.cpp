@@ -49,7 +49,6 @@
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
-#include "mongo/db/db.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/exec/working_set_common.h"
@@ -62,7 +61,7 @@
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
@@ -516,6 +515,9 @@ void State::prepTempCollection() {
                 incColl->getIndexCatalog()->createIndexOnEmptyCollection(_opCtx, indexSpec),
                 str::stream() << "createIndex failed for mr incLong ns " << _config.incLong.ns());
             wuow.commit();
+
+            CollectionShardingRuntime::get(_opCtx, _config.incLong)
+                ->setFilteringMetadata(_opCtx, CollectionMetadata());
         });
     }
 
@@ -530,11 +532,11 @@ void State::prepTempCollection() {
         if (finalColl) {
             finalOptions = finalColl->getCatalogEntry()->getCollectionOptions(_opCtx);
 
-            IndexCatalog::IndexIterator ii =
+            std::unique_ptr<IndexCatalog::IndexIterator> ii =
                 finalColl->getIndexCatalog()->getIndexIterator(_opCtx, true);
             // Iterate over finalColl's indexes.
-            while (ii.more()) {
-                IndexDescriptor* currIndex = ii.next();
+            while (ii->more()) {
+                IndexDescriptor* currIndex = ii->next()->descriptor();
                 BSONObjBuilder b;
                 b.append("ns", _config.tempNamespace.ns());
 
@@ -566,6 +568,7 @@ void State::prepTempCollection() {
 
         CollectionOptions options = finalOptions;
         options.temp = true;
+
         // If a UUID for the final output collection was sent by mongos (i.e., the final output
         // collection is sharded), use the UUID mongos sent when creating the temp collection.
         // When the temp collection is renamed to the final output collection, the UUID will be
@@ -595,6 +598,9 @@ void State::prepTempCollection() {
                 _opCtx, _config.tempNamespace, *(tempColl->uuid()), indexToInsert, false);
         }
         wuow.commit();
+
+        CollectionShardingRuntime::get(_opCtx, _config.tempNamespace)
+            ->setFilteringMetadata(_opCtx, CollectionMetadata());
     });
 }
 
@@ -1114,11 +1120,11 @@ void State::finalReduce(OperationContext* opCtx, CurOp* curOp, ProgressMeterHold
         assertCollectionNotNull(_config.incLong, autoIncColl);
 
         bool foundIndex = false;
-        IndexCatalog::IndexIterator ii =
+        std::unique_ptr<IndexCatalog::IndexIterator> ii =
             autoIncColl.getCollection()->getIndexCatalog()->getIndexIterator(_opCtx, true);
         // Iterate over incColl's indexes.
-        while (ii.more()) {
-            IndexDescriptor* currIndex = ii.next();
+        while (ii->more()) {
+            IndexDescriptor* currIndex = ii->next()->descriptor();
             BSONObj x = currIndex->infoObj();
             if (sortKey.woCompare(x["key"].embeddedObject()) == 0) {
                 foundIndex = true;
@@ -1408,12 +1414,9 @@ public:
 
         uassert(16149, "cannot run map reduce without the js engine", getGlobalScriptEngine());
 
-        // Prevent sharding state from changing during the MR.
-        const auto collMetadata = [&] {
-            // Get metadata before we check our version, to make sure it doesn't increment in the
-            // meantime
+        const auto metadata = [&] {
             AutoGetCollectionForReadCommand autoColl(opCtx, config.nss);
-            return CollectionShardingState::get(opCtx, config.nss)->getMetadata(opCtx);
+            return CollectionShardingState::get(opCtx, config.nss)->getMetadataForOperation(opCtx);
         }();
 
         bool shouldHaveData = false;
@@ -1481,17 +1484,13 @@ public:
                 const ExtensionsCallbackReal extensionsCallback(opCtx, &config.nss);
 
                 const boost::intrusive_ptr<ExpressionContext> expCtx;
-                auto statusWithCQ =
+                auto cq = uassertStatusOKWithContext(
                     CanonicalQuery::canonicalize(opCtx,
                                                  std::move(qr),
                                                  expCtx,
                                                  extensionsCallback,
-                                                 MatchExpressionParser::kAllowAllSpecialFeatures);
-                if (!statusWithCQ.isOK()) {
-                    uasserted(17238, "Can't canonicalize query " + config.filter.toString());
-                    return 0;
-                }
-                std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
+                                                 MatchExpressionParser::kAllowAllSpecialFeatures),
+                    str::stream() << "Can't canonicalize query " << config.filter);
 
                 auto exec = uassertStatusOK(getExecutor(opCtx,
                                                         scopedAutoColl->getCollection(),
@@ -1514,38 +1513,37 @@ public:
 
                 Timer mt;
 
-                // go through each doc
                 BSONObj o;
                 PlanExecutor::ExecState execState;
                 while (PlanExecutor::ADVANCED == (execState = exec->getNext(&o, NULL))) {
-                    o = o.getOwned();  // we will be accessing outside of the lock
-                    // check to see if this is a new object we don't own yet
-                    // because of a chunk migration
-                    if (collMetadata->isSharded()) {
-                        ShardKeyPattern kp(collMetadata->getKeyPattern());
-                        if (!collMetadata->keyBelongsToMe(kp.extractShardKeyFromDoc(o))) {
+                    o = o.getOwned();  // The object will be accessed outside of collection lock
+
+                    // Check to see if this is a new object we don't own yet because of a chunk
+                    // migration
+                    if (metadata->isSharded()) {
+                        ShardKeyPattern kp(metadata->getKeyPattern());
+                        if (!metadata->keyBelongsToMe(kp.extractShardKeyFromDoc(o))) {
                             continue;
                         }
                     }
 
-                    // do map
                     if (config.verbose)
                         mt.reset();
+
                     config.mapper->map(o);
+
                     if (config.verbose)
                         mapTime += mt.micros();
 
-                    // Check if the state accumulated so far needs to be written to a
-                    // collection. This may yield the DB lock temporarily and then
-                    // acquire it again.
-                    //
+                    // Check if the state accumulated so far needs to be written to a collection.
+                    // This may yield the DB lock temporarily and then acquire it again.
                     numInputs++;
                     if (numInputs % 100 == 0) {
                         Timer t;
 
-                        // TODO: As an optimization, we might want to do the save/restore
-                        // state and yield inside the reduceAndSpillInMemoryState method, so
-                        // it only happens if necessary.
+                        // TODO: As an optimization, we might want to do the save/restore state and
+                        // yield inside the reduceAndSpillInMemoryState method, so it only happens
+                        // if necessary.
                         exec->saveState();
 
                         scopedAutoColl.reset();

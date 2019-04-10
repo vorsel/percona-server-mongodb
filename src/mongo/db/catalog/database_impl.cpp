@@ -180,7 +180,6 @@ public:
         invariant(it->second == _coll);
         _db->_collections[_fromNs.ns()] = _coll;
         _db->_collections.erase(_toNs.ns());
-        _coll->setNs(_fromNs);
     }
 
     DatabaseImpl* const _db;
@@ -298,8 +297,7 @@ void DatabaseImpl::init(OperationContext* const opCtx) {
     list<string> collections;
     _dbEntry->getCollectionNamespaces(&collections);
 
-    for (list<string>::const_iterator it = collections.begin(); it != collections.end(); ++it) {
-        const string ns = *it;
+    for (auto ns : collections) {
         NamespaceString nss(ns);
         _collections[ns] = _getOrCreateCollectionInstance(opCtx, nss);
     }
@@ -324,8 +322,7 @@ void DatabaseImpl::clearTmpCollections(OperationContext* opCtx) {
     list<string> collections;
     _dbEntry->getCollectionNamespaces(&collections);
 
-    for (list<string>::iterator i = collections.begin(); i != collections.end(); ++i) {
-        string ns = *i;
+    for (auto ns : collections) {
         invariant(NamespaceString::normal(ns));
 
         CollectionCatalogEntry* coll = _dbEntry->getCollectionCatalogEntry(ns);
@@ -402,8 +399,6 @@ bool DatabaseImpl::isDropPending(OperationContext* opCtx) const {
 }
 
 void DatabaseImpl::getStats(OperationContext* opCtx, BSONObjBuilder* output, double scale) {
-    list<string> collections;
-    _dbEntry->getCollectionNamespaces(&collections);
 
     long long nCollections = 0;
     long long nViews = 0;
@@ -414,9 +409,13 @@ void DatabaseImpl::getStats(OperationContext* opCtx, BSONObjBuilder* output, dou
     long long indexes = 0;
     long long indexSize = 0;
 
-    for (list<string>::const_iterator it = collections.begin(); it != collections.end(); ++it) {
-        const string ns = *it;
+    invariant(opCtx->lockState()->isDbLockedForMode(name(), MODE_IS));
+    list<string> collections;
+    _dbEntry->getCollectionNamespaces(&collections);
 
+
+    for (auto ns : collections) {
+        Lock::CollectionLock colLock(opCtx->lockState(), ns, MODE_IS);
         Collection* collection = getCollection(opCtx, ns);
 
         if (!collection)
@@ -449,11 +448,8 @@ void DatabaseImpl::getStats(OperationContext* opCtx, BSONObjBuilder* output, dou
     _dbEntry->appendExtraStats(opCtx, output, scale);
 
     if (!opCtx->getServiceContext()->getStorageEngine()->isEphemeral()) {
-        boost::filesystem::path dbpath(storageGlobalParams.dbpath);
-        if (storageGlobalParams.directoryperdb) {
-            dbpath /= _name;
-        }
-
+        boost::filesystem::path dbpath(
+            opCtx->getServiceContext()->getStorageEngine()->getFilesystemPathForDb(_name));
         boost::system::error_code ec;
         boost::filesystem::space_info spaceInfo = boost::filesystem::space(dbpath, ec);
         if (!ec) {
@@ -578,8 +574,8 @@ Status DatabaseImpl::dropCollectionEvenIfSystem(OperationContext* opCtx,
         // Determine which index names are too long. Since we don't have the collection drop optime
         // at this time, use the maximum optime to check the index names.
         auto longDpns = fullns.makeDropPendingNamespace(repl::OpTime::max());
-        while (indexIter.more()) {
-            auto index = indexIter.next();
+        while (indexIter->more()) {
+            auto index = indexIter->next()->descriptor();
             auto status = longDpns.checkLengthForRename(index->indexName().size());
             if (!status.isOK()) {
                 indexesToDrop.push_back(index);
@@ -745,8 +741,10 @@ Status DatabaseImpl::renameCollection(OperationContext* opCtx,
     _collections.erase(fromNS);
     _collections[toNS] = collToRename;
 
-    // Update Collection's ns.
-    collToRename->setNs(toNSS);
+    // Set the namespace of 'collToRename' from within the UUIDCatalog. This is necessary because
+    // the UUIDCatalog mutex synchronizes concurrent access to the collection's namespace for
+    // callers that may not hold a collection lock.
+    UUIDCatalog::get(opCtx).setCollectionNamespace(opCtx, collToRename, fromNSS, toNSS);
 
     // Register a Change which, on rollback, will reinstall the Collection* in the collections map
     // so that it is associated with 'fromNS', not 'toNS'.
@@ -1008,6 +1006,44 @@ StatusWith<NamespaceString> DatabaseImpl::makeUniqueCollectionNamespace(
                       << " after "
                       << numGenerationAttempts
                       << " attempts due to namespace conflicts with existing collections.");
+}
+
+void DatabaseImpl::checkForIdIndexesAndDropPendingCollections(OperationContext* opCtx) {
+    if (name() == "local") {
+        // Collections in the local database are not replicated, so we do not need an _id index on
+        // any collection. For the same reason, it is not possible for the local database to contain
+        // any drop-pending collections (drops are effective immediately).
+        return;
+    }
+
+    std::list<std::string> collectionNames;
+    getDatabaseCatalogEntry()->getCollectionNamespaces(&collectionNames);
+
+    for (const auto& collectionName : collectionNames) {
+        const NamespaceString ns(collectionName);
+
+        if (ns.isDropPendingNamespace()) {
+            auto dropOpTime = fassert(40459, ns.getDropPendingNamespaceOpTime());
+            log() << "Found drop-pending namespace " << ns << " with drop optime " << dropOpTime;
+            repl::DropPendingCollectionReaper::get(opCtx)->addDropPendingNamespace(dropOpTime, ns);
+        }
+
+        if (ns.isSystem())
+            continue;
+
+        Collection* coll = getCollection(opCtx, collectionName);
+        if (!coll)
+            continue;
+
+        if (coll->getIndexCatalog()->findIdIndex(opCtx))
+            continue;
+
+        log() << "WARNING: the collection '" << collectionName << "' lacks a unique index on _id."
+              << " This index is needed for replication to function properly" << startupWarningsLog;
+        log() << "\t To fix this, you need to create a unique index on _id."
+              << " See http://dochub.mongodb.org/core/build-replica-set-indexes"
+              << startupWarningsLog;
+    }
 }
 
 MONGO_REGISTER_SHIM(Database::dropDatabase)(OperationContext* opCtx, Database* db)->void {

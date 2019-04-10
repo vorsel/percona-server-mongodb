@@ -68,7 +68,7 @@ using std::unique_ptr;
 using stdx::make_unique;
 
 PlanStage* buildStages(OperationContext* opCtx,
-                       Collection* collection,
+                       const Collection* collection,
                        const CanonicalQuery& cq,
                        const QuerySolution& qsol,
                        const QuerySolutionNode* root,
@@ -98,7 +98,7 @@ PlanStage* buildStages(OperationContext* opCtx,
 
             // We use the node's internal name, keyPattern and multikey details here. For $**
             // indexes, these may differ from the information recorded in the index's descriptor.
-            IndexScanParams params{*descriptor,
+            IndexScanParams params{descriptor,
                                    ixn->index.identifier.catalogName,
                                    ixn->index.keyPattern,
                                    ixn->index.multikeyPaths,
@@ -124,7 +124,6 @@ PlanStage* buildStages(OperationContext* opCtx,
                 return nullptr;
             }
             SortStageParams params;
-            params.collection = collection;
             params.pattern = sn->pattern;
             params.limit = sn->limit;
             return new SortStage(opCtx, params, ws, childStage);
@@ -183,7 +182,7 @@ PlanStage* buildStages(OperationContext* opCtx,
         }
         case STAGE_AND_HASH: {
             const AndHashNode* ahn = static_cast<const AndHashNode*>(root);
-            auto ret = make_unique<AndHashStage>(opCtx, ws, collection);
+            auto ret = make_unique<AndHashStage>(opCtx, ws);
             for (size_t i = 0; i < ahn->children.size(); ++i) {
                 PlanStage* childStage =
                     buildStages(opCtx, collection, cq, qsol, ahn->children[i], ws);
@@ -209,7 +208,7 @@ PlanStage* buildStages(OperationContext* opCtx,
         }
         case STAGE_AND_SORTED: {
             const AndSortedNode* asn = static_cast<const AndSortedNode*>(root);
-            auto ret = make_unique<AndSortedStage>(opCtx, ws, collection);
+            auto ret = make_unique<AndSortedStage>(opCtx, ws);
             for (size_t i = 0; i < asn->children.size(); ++i) {
                 PlanStage* childStage =
                     buildStages(opCtx, collection, cq, qsol, asn->children[i], ws);
@@ -226,7 +225,7 @@ PlanStage* buildStages(OperationContext* opCtx,
             params.dedup = msn->dedup;
             params.pattern = msn->sort;
             params.collator = cq.getCollator();
-            auto ret = make_unique<MergeSortStage>(opCtx, params, ws, collection);
+            auto ret = make_unique<MergeSortStage>(opCtx, params, ws);
             for (size_t i = 0; i < msn->children.size(); ++i) {
                 PlanStage* childStage =
                     buildStages(opCtx, collection, cq, qsol, msn->children[i], ws);
@@ -278,7 +277,7 @@ PlanStage* buildStages(OperationContext* opCtx,
                 opCtx, node->index.identifier.catalogName);
             invariant(desc);
             const FTSAccessMethod* fam =
-                static_cast<FTSAccessMethod*>(collection->getIndexCatalog()->getIndex(desc));
+                static_cast<const FTSAccessMethod*>(collection->getIndexCatalog()->getIndex(desc));
             invariant(fam);
 
             TextStageParams params(fam->getSpec());
@@ -299,11 +298,11 @@ PlanStage* buildStages(OperationContext* opCtx,
             if (nullptr == childStage) {
                 return nullptr;
             }
-            return new ShardFilterStage(
-                opCtx,
-                CollectionShardingState::get(opCtx, collection->ns())->getMetadata(opCtx),
-                ws,
-                childStage);
+            return new ShardFilterStage(opCtx,
+                                        CollectionShardingState::get(opCtx, collection->ns())
+                                            ->getMetadataForOperation(opCtx),
+                                        ws,
+                                        childStage);
         }
         case STAGE_DISTINCT_SCAN: {
             const DistinctNode* dn = static_cast<const DistinctNode*>(root);
@@ -319,7 +318,7 @@ PlanStage* buildStages(OperationContext* opCtx,
 
             // We use the node's internal name, keyPattern and multikey details here. For $**
             // indexes, these may differ from the information recorded in the index's descriptor.
-            DistinctParams params{*descriptor,
+            DistinctParams params{descriptor,
                                   dn->index.identifier.catalogName,
                                   dn->index.keyPattern,
                                   dn->index.multikeyPaths,
@@ -344,7 +343,7 @@ PlanStage* buildStages(OperationContext* opCtx,
 
             // We use the node's internal name, keyPattern and multikey details here. For $**
             // indexes, these may differ from the information recorded in the index's descriptor.
-            CountScanParams params{*descriptor,
+            CountScanParams params{descriptor,
                                    csn->index.identifier.catalogName,
                                    csn->index.keyPattern,
                                    csn->index.multikeyPaths,
@@ -368,15 +367,15 @@ PlanStage* buildStages(OperationContext* opCtx,
         case STAGE_COUNT:
         case STAGE_DELETE:
         case STAGE_EOF:
-        case STAGE_GROUP:
         case STAGE_IDHACK:
         case STAGE_MULTI_ITERATOR:
         case STAGE_MULTI_PLAN:
         case STAGE_PIPELINE_PROXY:
         case STAGE_QUEUED_DATA:
+        case STAGE_RECORD_STORE_FAST_COUNT:
         case STAGE_SUBPLAN:
-        case STAGE_TEXT_OR:
         case STAGE_TEXT_MATCH:
+        case STAGE_TEXT_OR:
         case STAGE_UNKNOWN:
         case STAGE_UPDATE: {
             mongoutils::str::stream ss;
@@ -390,7 +389,7 @@ PlanStage* buildStages(OperationContext* opCtx,
 
 // static (this one is used for Cached and MultiPlanStage)
 bool StageBuilder::build(OperationContext* opCtx,
-                         Collection* collection,
+                         const Collection* collection,
                          const CanonicalQuery& cq,
                          const QuerySolution& solution,
                          WorkingSet* wsIn,

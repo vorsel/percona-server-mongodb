@@ -68,19 +68,11 @@ AutoGetCollection::AutoGetCollection(OperationContext* opCtx,
                                      LockMode modeColl,
                                      ViewMode viewMode,
                                      Date_t deadline)
-    :  // The UUID to NamespaceString resolution is performed outside of any locks
-      _resolvedNss(resolveNamespaceStringOrUUID(opCtx, nsOrUUID)),
-      // The database locking is performed based on the resolved NamespaceString
-      _autoDb(opCtx, _resolvedNss.db(), modeDB, deadline) {
-    // In order to account for possible collection rename happening because the resolution from UUID
-    // to NamespaceString was done outside of database lock, if UUID was specified we need to
-    // re-resolve the _resolvedNss after acquiring the database lock so it has the correct value.
-    //
-    // Holding a database lock prevents collection renames, so this guarantees a stable UUID to
-    // NamespaceString mapping.
-    if (nsOrUUID.uuid())
-        _resolvedNss = resolveNamespaceStringOrUUID(opCtx, nsOrUUID);
-
+    : _autoDb(opCtx,
+              !nsOrUUID.dbname().empty() ? nsOrUUID.dbname() : nsOrUUID.nss()->db(),
+              modeDB,
+              deadline),
+      _resolvedNss(resolveNamespaceStringOrUUID(opCtx, nsOrUUID)) {
     _collLock.emplace(opCtx->lockState(), _resolvedNss.ns(), modeColl, deadline);
     uassertLockTimeout(
         str::stream() << "collection " << nsOrUUID.toString(), modeColl, _collLock->isLocked());
@@ -112,18 +104,20 @@ AutoGetCollection::AutoGetCollection(OperationContext* opCtx,
         // pending catalog changes. Instead, we must return an error in such situations. We ignore
         // this restriction for the oplog, since it never has pending catalog changes.
         auto readConcernLevel = repl::ReadConcernArgs::get(opCtx).getLevel();
-        auto mySnapshot = opCtx->recoveryUnit()->getPointInTimeReadTimestamp();
-        if (readConcernLevel == repl::ReadConcernLevel::kSnapshotReadConcern && mySnapshot &&
+        if (readConcernLevel == repl::ReadConcernLevel::kSnapshotReadConcern &&
             _resolvedNss != NamespaceString::kRsOplogNamespace) {
-            auto minSnapshot = _coll->getMinimumVisibleSnapshot();
-            uassert(
-                ErrorCodes::SnapshotUnavailable,
-                str::stream() << "Unable to read from a snapshot due to pending collection catalog "
-                                 "changes; please retry the operation. Snapshot timestamp is "
-                              << mySnapshot->toString()
-                              << ". Collection minimum is "
-                              << minSnapshot->toString(),
-                !minSnapshot || *mySnapshot >= *minSnapshot);
+            auto mySnapshot = opCtx->recoveryUnit()->getPointInTimeReadTimestamp();
+            if (mySnapshot) {
+                auto minSnapshot = _coll->getMinimumVisibleSnapshot();
+                uassert(ErrorCodes::SnapshotUnavailable,
+                        str::stream()
+                            << "Unable to read from a snapshot due to pending collection catalog "
+                               "changes; please retry the operation. Snapshot timestamp is "
+                            << mySnapshot->toString()
+                            << ". Collection minimum is "
+                            << minSnapshot->toString(),
+                        !minSnapshot || *mySnapshot >= *minSnapshot);
+            }
         }
 
         // If the collection exists, there is no need to check for views.

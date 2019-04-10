@@ -188,7 +188,7 @@ Status WiredTigerUtil::getApplicationMetadata(OperationContext* opCtx,
     while ((ret = parser.next(&keyItem, &valueItem)) == 0) {
         const StringData key(keyItem.str, keyItem.len);
         if (keysSeen.count(key)) {
-            return Status(ErrorCodes::DuplicateKey,
+            return Status(ErrorCodes::Error(50998),
                           str::stream() << "app_metadata must not contain duplicate keys. "
                                         << "Found multiple instances of key '"
                                         << key
@@ -551,6 +551,59 @@ bool WiredTigerUtil::useTableLogging(NamespaceString ns, bool replEnabled) {
 
     // The remainder of local gets logged. In particular, the oplog and user created collections.
     return true;
+}
+
+Status WiredTigerUtil::setTableLogging(OperationContext* opCtx, const std::string& uri, bool on) {
+    // Try to close as much as possible to avoid EBUSY errors.
+    WiredTigerRecoveryUnit::get(opCtx)->getSession()->closeAllCursors(uri);
+    WiredTigerSessionCache* sessionCache = WiredTigerRecoveryUnit::get(opCtx)->getSessionCache();
+    sessionCache->closeAllCursors(uri);
+
+    // Use a dedicated session for alter operations to avoid transaction issues.
+    WiredTigerSession session(sessionCache->conn());
+    return setTableLogging(session.getSession(), uri, on);
+}
+
+Status WiredTigerUtil::setTableLogging(WT_SESSION* session, const std::string& uri, bool on) {
+    std::string setting;
+    if (on) {
+        setting = "log=(enabled=true)";
+    } else {
+        setting = "log=(enabled=false)";
+    }
+
+    // This method does some "weak" parsing to see if the table is in the expected logging
+    // state. Only attempt to alter the table when a change is needed. This avoids grabbing heavy
+    // locks in WT when creating new tables for collections and indexes. Those tables are created
+    // with the proper settings and consequently should not be getting changed here.
+    //
+    // If the settings need to be changed (only expected at startup), the alter table call must
+    // succeed.
+    std::string existingMetadata = getMetadataRaw(session, uri).getValue();
+    if (existingMetadata.find("log=(enabled=true)") != std::string::npos &&
+        existingMetadata.find("log=(enabled=false)") != std::string::npos) {
+        // Sanity check against a table having multiple logging specifications.
+        invariant(false,
+                  str::stream() << "Table has contradictory logging settings. Uri: " << uri
+                                << " Conf: "
+                                << existingMetadata);
+    }
+
+    if (existingMetadata.find(setting) != std::string::npos) {
+        // The table is running with the expected logging settings.
+        return Status::OK();
+    }
+
+    LOG(1) << "Changing table logging settings. Uri: " << uri << " Enable? " << on;
+    int ret = session->alter(session, uri.c_str(), setting.c_str());
+    if (ret) {
+        severe() << "Failed to update log setting. Uri: " << uri << " Enable? " << on
+                 << " Ret: " << ret << " MD: " << redact(existingMetadata)
+                 << " Msg: " << session->strerror(session, ret);
+        fassertFailed(50756);
+    }
+
+    return Status::OK();
 }
 
 Status WiredTigerUtil::exportTableToBSON(WT_SESSION* session,

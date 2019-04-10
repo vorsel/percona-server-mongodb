@@ -120,7 +120,7 @@ class InitialSyncerTest : public executor::ThreadPoolExecutorTest,
                           public SyncSourceSelector,
                           public ScopedGlobalServiceContextForTest {
 public:
-    InitialSyncerTest() {}
+    InitialSyncerTest() : _threadClient(getGlobalServiceContext()) {}
 
     executor::ThreadPoolMock::Options makeThreadPoolMockOptions() const override;
 
@@ -215,7 +215,7 @@ public:
         getNet()->runReadyNetworkOperations();
         if (getNet()->hasReadyRequests()) {
             log() << "The network has unexpected requests to process, next req:";
-            NetworkInterfaceMock::NetworkOperation req = *getNet()->getNextReadyRequest();
+            const NetworkInterfaceMock::NetworkOperation& req = *getNet()->getNextReadyRequest();
             log() << req.getDiagnosticString();
         }
         ASSERT_FALSE(getNet()->hasReadyRequests());
@@ -331,7 +331,6 @@ protected:
         _mockServer = stdx::make_unique<MockRemoteDBServer>(_target.toString());
         _options1.uuid = UUID::gen();
 
-        Client::initThreadIfNotAlready();
         reset();
 
         launchExecutorThread();
@@ -405,8 +404,8 @@ protected:
                     _onCompletion(lastApplied);
                 });
             _initialSyncer->setScheduleDbWorkFn_forTest(
-                [this](const executor::TaskExecutor::CallbackFn& work) {
-                    return getExecutor().scheduleWork(work);
+                [this](executor::TaskExecutor::CallbackFn work) {
+                    return getExecutor().scheduleWork(std::move(work));
                 });
             _initialSyncer->setStartCollectionClonerFn([this](CollectionCloner& cloner) {
                 cloner.setCreateClientFn_forTest([&cloner, this]() {
@@ -435,7 +434,6 @@ protected:
         _dbWorkThreadPool.reset();
         _replicationProcess.reset();
         _storageInterface.reset();
-        Client::destroy();
     }
 
     /**
@@ -481,6 +479,7 @@ protected:
 private:
     DataReplicatorExternalStateMock* _externalState;
     std::unique_ptr<InitialSyncer> _initialSyncer;
+    ThreadClient _threadClient;
     bool _executorThreadShutdownComplete = false;
 };
 
