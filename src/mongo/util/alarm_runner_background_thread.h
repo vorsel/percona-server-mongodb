@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -27,52 +26,52 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-
 #pragma once
 
-#include "mongo/db/operation_context.h"
+#include <vector>
+
+#include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/thread.h"
+#include "mongo/util/alarm.h"
+#include "mongo/util/concurrency/with_lock.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
-/**
- * The GlobalLockAcquisitionTracker keeps track of if the global lock has ever been taken in
- * different modes. This class is also used to track if we ever took a global lock.
- * This class is used to track if we ever did a transaction with the intent to do a write,
- * so that we can enforce write concern on noop writes.
+/*
+ * This is a runner for alarm schedulers that waits for and processes alarms in a single
+ * background thread.
  */
-class GlobalLockAcquisitionTracker {
+class AlarmRunnerBackgroundThread {
 public:
-    static const OperationContext::Decoration<GlobalLockAcquisitionTracker> get;
+    using AlarmSchedulerHandle = std::shared_ptr<AlarmScheduler>;
+    // Construct an alarm runner from a vector of shared_ptr<AlarmScheduler>'s.
+    explicit AlarmRunnerBackgroundThread(std::vector<AlarmSchedulerHandle> container)
+        : _schedulers(_initializeSchedulers(std::move(container))) {}
 
-    // Decoration requires a default constructor.
-    GlobalLockAcquisitionTracker() = default;
-
-    /**
-     * Returns whether we have ever taken a global lock in X or IX mode in this operation.
+    /*
+     * Starts a background thread that will process alarms from all registered schedulers.
      */
-    bool getGlobalExclusiveLockTaken() const;
+    void start();
 
-    /**
-     * Sets that we have ever taken a global lock in X or IX mode in this operation.
+    /*
+     * Clears all outstanding timers from all registered schedulers and shuts down the background
+     * thread.
      */
-    void setGlobalExclusiveLockTaken();
-
-    /**
-     * Returns whether we have ever taken a global lock in this operation.
-     */
-    bool getGlobalLockTaken() const;
-
-    /**
-     * Sets that we have ever taken a global lock in this operation.
-     */
-    void setGlobalLockTaken();
+    void shutdown();
 
 private:
-    // Set to true when the global lock is first taken in X or IX mode. Never set back to false.
-    bool _globalExclusiveLockTaken = false;
+    std::vector<AlarmSchedulerHandle> _initializeSchedulers(
+        std::vector<AlarmSchedulerHandle> container);
 
-    // Set to true when the global lock is first taken in any mode. Never set back to false.
-    bool _globalLockTaken = false;
+    void _threadRoutine();
+
+    stdx::mutex _mutex;
+    stdx::condition_variable _condVar;
+    bool _running = false;
+    Date_t _nextAlarm = Date_t::max();
+    std::vector<AlarmSchedulerHandle> _schedulers;
+    stdx::thread _thread;
 };
 
 }  // namespace mongo
