@@ -1,5 +1,8 @@
 // SERVER-6179: support for two $groups in sharded agg
-// @tags: [rocks_requires_fcv36]
+// @tags: [
+//   rocks_requires_fcv36,
+//   requires_spawning_own_processes,
+// ]
 (function() {
     'use strict';
 

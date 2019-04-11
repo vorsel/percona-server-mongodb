@@ -54,6 +54,7 @@ namespace mongo {
 namespace {
 
 const auto kOplogField = "oplog";
+const auto kWaitsForNewOplogField = "waitsForNewOplog";
 const WriteConcernOptions kMajorityWC(WriteConcernOptions::kMajority,
                                       WriteConcernOptions::SyncMode::UNSET,
                                       Milliseconds(0));
@@ -254,18 +255,17 @@ ProcessOplogResult processSessionOplog(OperationContext* opCtx,
             return lastResult;
         }
     } catch (const DBException& ex) {
-        // If the transaction chain was truncated on the recipient shard, then we are most likely
-        // copying from a session that hasn't been touched on the recipient shard for a very long
-        // time but could be recent on the donor.
-        //
-        // We continue copying regardless to get the entire transaction from the donor.
-        if (ex.code() != ErrorCodes::IncompleteTransactionHistory) {
-            throw;
+        // If the transaction chain is incomplete because oplog was truncated, just ignore the
+        // incoming oplog and don't attempt to 'patch up' the missing pieces.
+        if (ex.code() == ErrorCodes::IncompleteTransactionHistory) {
+            return lastResult;
         }
 
         if (stmtId == kIncompleteHistoryStmtId) {
             return lastResult;
         }
+
+        throw;
     }
 
     BSONObj object(result.isPrePostImage
@@ -410,6 +410,7 @@ void SessionCatalogMigrationDestination::_retrieveSessionStateFromSource(Service
         auto nextBatch = getNextSessionOplogBatch(opCtx, _fromShard, _migrationSessionId);
         BSONArray oplogArray(nextBatch[kOplogField].Obj());
         BSONArrayIteratorSorted oplogIter(oplogArray);
+        const auto donorWaitsForNewOplog = nextBatch[kWaitsForNewOplogField].trueValue();
 
         if (!oplogIter.more()) {
             {
@@ -441,7 +442,10 @@ void SessionCatalogMigrationDestination::_retrieveSessionStateFromSource(Service
                 }
             }
 
-            if (lastOpTimeWaited == lastResult.oplogTime) {
+            // TODO: SERVER-40187 Completely remove after v4.2. donorWaitsForNewOplog is a
+            // 'feature flag' indicating that the donor does block until there are new oplog
+            // to return so we don't need to sleep here.
+            if (!donorWaitsForNewOplog && lastOpTimeWaited == lastResult.oplogTime) {
                 // We got an empty result at least twice in a row from the source shard so space it
                 // out a little bit so we don't hammer the shard
                 opCtx->sleepFor(Milliseconds(200));

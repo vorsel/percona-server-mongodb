@@ -1,8 +1,10 @@
 /**
  * Tests aggregate command against mongos with slaveOk. For more tests on read preference,
  * please refer to jstests/sharding/read_pref_cmd.js.
- *
- * @tags: [rocks_requires_fcv36]
+ * @tags: [
+ *   rocks_requires_fcv36,
+ *   requires_spawning_own_processes,
+ * ]
  */
 (function() {
     load('jstests/replsets/rslib.js');

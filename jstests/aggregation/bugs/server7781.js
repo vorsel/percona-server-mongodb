@@ -1,5 +1,8 @@
 // SERVER-7781 $geoNear pipeline stage
-// @tags: [rocks_requires_fcv36]
+// @tags: [
+//   rocks_requires_fcv36,
+//   requires_spawning_own_processes,
+// ]
 (function() {
     'use strict';
 

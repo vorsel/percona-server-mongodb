@@ -1,7 +1,9 @@
 /**
  * Tests some practical use cases of the $facet stage.
- *
- * @tags: [rocks_requires_fcv36]
+ * @tags: [
+ *   rocks_requires_fcv36,
+ *   requires_spawning_own_processes,
+ * ]
  */
 (function() {
     "use strict";
