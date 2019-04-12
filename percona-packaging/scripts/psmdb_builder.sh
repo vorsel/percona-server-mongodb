@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 
 shell_quote_string() {
   echo "$1" | sed -e 's,\([^a-zA-Z0-9/_.=-]\),\\\1,g'
@@ -157,7 +157,7 @@ get_sources(){
     git clone https://github.com/mongodb/mongo-tools.git
     cd mongo-tools
     git checkout $MONGO_TOOLS_TAG
-    echo "export PSMDB_TOOLS_COMMIT_HASH=\"$(git rev-parse HEAD)\""  >  set_tools_revision.sh
+    echo "export PSMDB_TOOLS_COMMIT_HASH=\"$(git rev-parse HEAD)\"" > set_tools_revision.sh
     echo "export PSMDB_TOOLS_REVISION=\"${PSM_VER}-${PSM_RELEASE}\"" >> set_tools_revision.sh
     chmod +x set_tools_revision.sh
     cd ${WORKDIR}
@@ -227,10 +227,10 @@ install_gcc_54_deb(){
         rm -rf /usr/local/gcc-5.4.0
         mv gcc-5.4.0 /usr/local/
     fi
-    if [[ x"${DEBIAN}" = xcosmic ]] || [[ x"${DEBIAN}" = xbionic ]] || [[ x"${DEBIAN}" = xdisco ]]; then
+    if [ x"${DEBIAN}" = xcosmic -o x"${DEBIAN}" = xbionic -o x"${DEBIAN}" = xdisco ]; then
         apt-get -y install gcc-5 g++-5
     fi
-    if [[ x"${DEBIAN}" = xstretch ]] || [[ x"${DEBIAN}" = xbuster ]]; then
+    if [ x"${DEBIAN}" = xstretch -o x"${DEBIAN}" = xbuster ]; then
         wget https://jenkins.percona.com/downloads/gcc-5.4.0/gcc-5.4.0_Debian-${DEBIAN}-x64.tar.gz -O /tmp/gcc-5.4.0_Debian-${DEBIAN}-x64.tar.gz
         tar -zxf /tmp/gcc-5.4.0_Debian-${DEBIAN}-x64.tar.gz
         rm -rf /usr/local/gcc-5.4.0
@@ -239,7 +239,7 @@ install_gcc_54_deb(){
 }
 
 set_compiler(){
-    if [[ x"${DEBIAN}" = xcosmic ]] || [[ x"${DEBIAN}" = xbionic ]] || [[ x"${DEBIAN}" = xdisco ]]; then
+    if [ x"${DEBIAN}" = xcosmic -o x"${DEBIAN}" = xbionic -o x"${DEBIAN}" = xdisco ]; then
         export CC=/usr/bin/gcc-5
         export CXX=/usr/bin/g++-5
     else
@@ -249,7 +249,7 @@ set_compiler(){
 }
 
 fix_rules(){
-    if [[ x"${DEBIAN}" = xcosmic ]] || [[ x"${DEBIAN}" = xbionic ]] || [[ x"${DEBIAN}" = xdisco ]]; then
+    if [ x"${DEBIAN}" = xcosmic -o x"${DEBIAN}" = xbionic -o x"${DEBIAN}" = xdisco ]; then
         sed -i 's|CC = gcc-5|CC = /usr/bin/gcc-5|' debian/rules
         sed -i 's|CXX = g++-5|CXX = /usr/bin/g++-5|' debian/rules
     else
@@ -278,34 +278,29 @@ install_deps() {
       wget http://jenkins.percona.com/yum-repo/percona-dev.repo
       mv -f percona-dev.repo /etc/yum.repos.d/
       yum clean all
-      RHEL=$(rpm --eval %rhel)
-      # CHANGEME ON RH8 RELEASE
-      if [[ ${RHEL} -lt 8 ]]; then
-          yum -y install epel-release
-      fi
-      #
       rm -fr /usr/local/gcc-5.4.0
-
-      yum -y install bzip2-devel libpcap-devel snappy-devel gcc gcc-c++ rpm-build rpmlint
-      yum -y install cmake cyrus-sasl-devel make openssl-devel zlib-devel libcurl-devel
-
-      if [[ ${RHEL} -eq 8 ]]; then
-        yum -y install python2-scons python2-pip python36-devel
-        yum -y install redhat-rpm-config python2-devel
-      fi
-
-      if [[ ${RHEL} -lt 8 ]]; then
-        yum -y install python27 python27-devel
+      RHEL=$(rpm --eval %rhel)
+      if [ x"$RHEL" = x6 ]; then
+        yum -y install epel-release
+        yum -y install rpmbuild rpm-build libpcap-devel gcc make cmake gcc-c++ openssl-devel
+        yum -y install cyrus-sasl-devel snappy-devel zlib-devel bzip2-devel libpcap-devel
+        yum -y install scons make rpm-build rpmbuild percona-devtoolset-gcc percona-devtoolset-binutils 
+        yum -y install percona-devtoolset-gcc-c++ percona-devtoolset-libstdc++-devel percona-devtoolset-valgrind-devel
+        yum -y install python27 python27-devel rpmlint libcurl-devel
         wget https://bootstrap.pypa.io/get-pip.py
         python2.7 get-pip.py
         rm -rf /usr/bin/python2
         ln -s /usr/bin/python2.7 /usr/bin/python2
-      fi
-      if [ "x${RHEL}" == "x6" ]; then
-        pip2.7 install --user -r buildscripts/requirements.txt
-      fi
-      if [ "x${RHEL}" == "x7" ]; then
-        pip install --user -r buildscripts/requirements.txt
+      elif [ x"$RHEL" = x7 ]; then
+        yum -y install epel-release
+        yum -y install rpmbuild rpm-build libpcap-devel gcc make cmake gcc-c++ openssl-devel
+        yum -y install cyrus-sasl-devel snappy-devel zlib-devel bzip2-devel scons rpmlint
+        yum -y install rpm-build git python-pip python-devel libopcodes libcurl-devel rpmlint
+      else
+        yum -y install bzip2-devel libpcap-devel snappy-devel gcc gcc-c++ rpm-build rpmlint
+        yum -y install cmake cyrus-sasl-devel make openssl-devel zlib-devel libcurl-devel
+        yum -y install python2-scons python2-pip python36-devel
+        yum -y install redhat-rpm-config python2-devel
       fi
       if [ "x${RHEL}" == "x8" ]; then
         /usr/bin/pip3.6 install --user typing pyyaml regex Cheetah3
@@ -318,11 +313,7 @@ install_deps() {
       export DEBIAN=$(lsb_release -sc)
       export ARCH=$(echo $(uname -m) | sed -e 's:i686:i386:g')
       INSTALL_LIST="python python-dev valgrind scons liblz4-dev devscripts debhelper debconf libpcap-dev libbz2-dev libsnappy-dev pkg-config zlib1g-dev libzlcore-dev dh-systemd libsasl2-dev gcc g++ cmake curl"
-      if [[] x"${DEBIAN}" = xstretch ]] || [[ x"${DEBIAN}" = xbionic ]] || [[ x"${DEBIAN}" = xcosmic ]]; then
-        INSTALL_LIST="${INSTALL_LIST} libssl1.0-dev libcurl4-gnutls-dev"
-      else
-        INSTALL_LIST="${INSTALL_LIST} libssl-dev libcurl4-openssl-dev"
-      fi
+      INSTALL_LIST="${INSTALL_LIST} libssl-dev libcurl4-openssl-dev"
       until apt-get -y install dirmngr; do
         sleep 1
         echo "waiting"
@@ -463,6 +454,11 @@ build_rpm(){
     rpm2cpio ${SRC_RPM} | cpio -id
     TARF=$(find . -name 'percona-server-mongodb*.tar.gz' | sort | tail -n1)
     tar vxzf ${TARF} --wildcards '*/buildscripts' --strip=1
+    if [ "x${RHEL}" == "x6" ]; then
+      pip2.7 install --user -r buildscripts/requirements.txt
+    else
+      pip install --user -r buildscripts/requirements.txt
+    fi
     #
     cd $WORKDIR
     if [ -f /opt/percona-devtoolset/enable ]; then
