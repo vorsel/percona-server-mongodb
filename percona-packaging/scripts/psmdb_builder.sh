@@ -40,7 +40,7 @@ parse_arguments() {
         pick_args=1
         shift
     fi
-  
+
     for arg do
         val=$(echo "$arg" | sed -e 's;^--[^=]*=;;')
         case "$arg" in
@@ -58,7 +58,7 @@ parse_arguments() {
             --psm_release=*) PSM_RELEASE="$val" ;;
             --mongo_tools_tag=*) MONGO_TOOLS_TAG="$val" ;;
             --debug=*) DEBUG="$val" ;;
-            --help) usage ;;      
+            --help) usage ;;
             *)
               if test -n "$pick_args"
               then
@@ -229,19 +229,19 @@ install_gcc_54_deb(){
         rm -rf /usr/local/gcc-5.4.0
         mv gcc-5.4.0 /usr/local/
     fi
-    if [ x"${DEBIAN}" = xcosmic -o x"${DEBIAN}" = xbionic ]; then
+    if [ x"${DEBIAN}" = xcosmic -o x"${DEBIAN}" = xbionic -o x"${DEBIAN}" = xdisco ]; then
         apt-get -y install gcc-5 g++-5
     fi
-    if [ x"${DEBIAN}" = xstretch ]; then
-        wget https://jenkins.percona.com/downloads/gcc-5.4.0/gcc-5.4.0_Debian-stretch-x64.tar.gz -O /tmp/gcc-5.4.0_ubuntu-${DEBIAN}-x64.tar.gz
-        tar -zxf /tmp/gcc-5.4.0_ubuntu-${DEBIAN}-x64.tar.gz
+    if [ x"${DEBIAN}" = xstretch -o x"${DEBIAN}" = xbuster ]; then
+        wget https://jenkins.percona.com/downloads/gcc-5.4.0/gcc-5.4.0_Debian-${DEBIAN}-x64.tar.gz -O /tmp/gcc-5.4.0_Debian-${DEBIAN}-x64.tar.gz
+        tar -zxf /tmp/gcc-5.4.0_Debian-${DEBIAN}-x64.tar.gz
         rm -rf /usr/local/gcc-5.4.0
         mv gcc-5.4.0 /usr/local/
     fi
 }
 
 set_compiler(){
-    if [ x"${DEBIAN}" = xcosmic -o x"${DEBIAN}" = xbionic ]; then
+    if [ x"${DEBIAN}" = xcosmic -o x"${DEBIAN}" = xbionic -o x"${DEBIAN}" = xdisco ]; then
         export CC=/usr/bin/gcc-5
         export CXX=/usr/bin/g++-5
     else
@@ -251,14 +251,14 @@ set_compiler(){
 }
 
 fix_rules(){
-    if [ x"${DEBIAN}" = xcosmic -o x"${DEBIAN}" = xbionic ]; then
+    if [ x"${DEBIAN}" = xcosmic -o x"${DEBIAN}" = xbionic -o x"${DEBIAN}" = xdisco ]; then
         sed -i 's|CC = gcc-5|CC = /usr/bin/gcc-5|' debian/rules
         sed -i 's|CXX = g++-5|CXX = /usr/bin/g++-5|' debian/rules
     else
         sed -i 's|CC = gcc-5|CC = /usr/local/gcc-5.4.0/bin/gcc-5.4|' debian/rules
         sed -i 's|CXX = g++-5|CXX = /usr/local/gcc-5.4.0/bin/g++-5.4|' debian/rules
     fi
-    sed -i 's:release:release --disable-warnings-as-errors :g' debian/rules 
+    sed -i 's:release:release --disable-warnings-as-errors :g' debian/rules
 }
 
 install_deps() {
@@ -267,7 +267,7 @@ install_deps() {
         echo "Dependencies will not be installed"
         return;
     fi
-    if [ ! $( id -u ) -eq 0 ]
+    if [ $( id -u ) -ne 0 ]
     then
         echo "It is not possible to instal dependencies. Please run as root"
         exit 1
@@ -491,7 +491,7 @@ build_source_deb(){
         echo "source deb package will not be created"
         return;
     fi
-    if [ "x$OS" = "xrmp" ]
+    if [ "x$OS" = "xrpm" ]
     then
         echo "It is not possible to build source deb here"
         exit 1
