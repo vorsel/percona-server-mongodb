@@ -36,7 +36,7 @@
 
 #include "mongo/base/initializer.h"
 #include "mongo/config.h"
-#include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/catalog/database_holder_impl.h"
 #include "mongo/db/catalog/health_log.h"
 #include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/catalog/uuid_catalog.h"
@@ -57,6 +57,7 @@
 #include "mongo/db/storage/encryption_hooks.h"
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/ttl.h"
+#include "mongo/embedded/index_builds_coordinator_embedded.h"
 #include "mongo/embedded/logical_session_cache_factory_embedded.h"
 #include "mongo/embedded/periodic_runner_embedded.h"
 #include "mongo/embedded/replication_coordinator_embedded.h"
@@ -98,6 +99,10 @@ MONGO_INITIALIZER_GENERAL(ForkServer, ("EndStartupOptionHandling"), ("default"))
     return Status::OK();
 }
 
+void setUpCatalog(ServiceContext* serviceContext) {
+    DatabaseHolder::set(serviceContext, std::make_unique<DatabaseHolderImpl>());
+}
+
 // Create a minimalistic replication coordinator to provide a limited interface for users. Not
 // functional to provide any replication logic.
 ServiceContext::ConstructorActionRegisterer replicationManagerInitializer(
@@ -112,6 +117,9 @@ ServiceContext::ConstructorActionRegisterer replicationManagerInitializer(
         auto replCoord = std::make_unique<ReplicationCoordinatorEmbedded>(serviceContext);
         repl::ReplicationCoordinator::set(serviceContext, std::move(replCoord));
         repl::setOplogCollectionName(serviceContext);
+
+        IndexBuildsCoordinator::set(serviceContext,
+                                    std::make_unique<IndexBuildsCoordinatorEmbedded>());
     });
 
 MONGO_INITIALIZER(fsyncLockedForWriting)(InitializerContext* context) {
@@ -151,14 +159,18 @@ void shutdown(ServiceContext* srvContext) {
         {
             UninterruptibleLockGuard noInterrupt(shutdownOpCtx->lockState());
             Lock::GlobalLock lk(shutdownOpCtx.get(), MODE_X);
-            DatabaseHolder::getDatabaseHolder().closeAll(shutdownOpCtx.get(), "shutdown");
+            auto databaseHolder = DatabaseHolder::get(shutdownOpCtx.get());
+            databaseHolder->closeAll(shutdownOpCtx.get(), "shutdown");
 
             LogicalSessionCache::set(serviceContext, nullptr);
 
-            // Shut down the background periodic task runner
+            // Shut down the background periodic task runner, before the storage engine.
             if (auto runner = serviceContext->getPeriodicRunner()) {
                 runner->shutdown();
             }
+
+            repl::ReplicationCoordinator::get(serviceContext)->shutdown(shutdownOpCtx.get());
+            IndexBuildsCoordinator::get(serviceContext)->shutdown();
 
             // Global storage engine may not be started in all cases before we exit
             if (serviceContext->getStorageEngine()) {
@@ -214,7 +226,14 @@ ServiceContext* initialize(const char* yaml_config) {
 
     DEV log(LogComponent::kControl) << "DEBUG build (which is slower)" << endl;
 
+    // The periodic runner is required by the storage engine to be running beforehand.
+    auto periodicRunner = std::make_unique<PeriodicRunnerEmbedded>(
+        serviceContext, serviceContext->getPreciseClockSource());
+    periodicRunner->startup();
+    serviceContext->setPeriodicRunner(std::move(periodicRunner));
+
     initializeStorageEngine(serviceContext, StorageEngineInitFlags::kAllowNoLockFile);
+    setUpCatalog(serviceContext);
 
     // Warn if we detect configurations for multiple registered storage engines in the same
     // configuration file/environment.
@@ -300,11 +319,6 @@ ServiceContext* initialize(const char* yaml_config) {
     if (!storageGlobalParams.readOnly) {
         restartInProgressIndexesFromLastShutdown(startupOpCtx.get());
     }
-
-    auto periodicRunner = std::make_unique<PeriodicRunnerEmbedded>(
-        serviceContext, serviceContext->getPreciseClockSource());
-    periodicRunner->startup();
-    serviceContext->setPeriodicRunner(std::move(periodicRunner));
 
     // Set up the logical session cache
     auto sessionCache = makeLogicalSessionCacheEmbedded();

@@ -325,8 +325,7 @@ public:
         const auto stmtId = 0;
         if (opCtx->getTxnNumber() && !inTransaction) {
             const auto txnParticipant = TransactionParticipant::get(opCtx);
-            if (auto entry =
-                    txnParticipant->checkStatementExecuted(opCtx, *opCtx->getTxnNumber(), stmtId)) {
+            if (auto entry = txnParticipant->checkStatementExecuted(stmtId)) {
                 RetryableWritesStats::get(opCtx)->incrementRetriedCommandsCount();
                 RetryableWritesStats::get(opCtx)->incrementRetriedStatementsCount();
                 parseOplogEntryForFindAndModify(opCtx, args, *entry, &result);
@@ -458,8 +457,8 @@ public:
                         CollectionOptions collectionOptions;
                         uassertStatusOK(collectionOptions.parse(
                             BSONObj(), CollectionOptions::ParseKind::parseForCommand));
-                        uassertStatusOK(Database::userCreateNS(
-                            opCtx, autoDb->getDb(), nsString.ns(), collectionOptions));
+                        auto db = autoDb->getDb();
+                        uassertStatusOK(db->userCreateNS(opCtx, nsString, collectionOptions));
                         wuow.commit();
 
                         collection = autoDb->getDb()->getCollection(opCtx, nsString);

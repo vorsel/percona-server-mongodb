@@ -222,15 +222,6 @@ CursorId runQueryWithoutRetrying(OperationContext* opCtx,
                                               query.getQueryRequest().getFilter(),
                                               query.getQueryRequest().getCollation());
 
-    if (auto txnRouter = TransactionRouter::get(opCtx)) {
-        txnRouter->computeAndSetAtClusterTime(opCtx,
-                                              false,
-                                              shardIds,
-                                              query.nss(),
-                                              query.getQueryRequest().getFilter(),
-                                              query.getQueryRequest().getCollation());
-    }
-
     // Construct the query and parameters.
 
     ClusterClientCursorParams params(query.nss(), readPref);
@@ -462,8 +453,11 @@ CursorId ClusterFind::runQuery(OperationContext* opCtx,
 
             if (auto txnRouter = TransactionRouter::get(opCtx)) {
                 // A transaction can always continue on a stale version error during find because
-                // the operation must be idempotent.
-                txnRouter->onStaleShardOrDbError(kFindCmdName);
+                // the operation must be idempotent. Reset the default global read timestamp so the
+                // retry's routing table reflects the chunk placement after the refresh (no-op if
+                // the transaction is not running with snapshot read concern).
+                txnRouter->onStaleShardOrDbError(kFindCmdName, ex.toStatus());
+                txnRouter->setDefaultAtClusterTime(opCtx);
             }
         }
     }
@@ -544,11 +538,11 @@ void validateTxnNumber(OperationContext* opCtx,
 void validateOperationSessionInfo(OperationContext* opCtx,
                                   const GetMoreRequest& request,
                                   ClusterCursorManager::PinnedCursor* cursor) {
-    ScopeGuard returnCursorGuard = MakeGuard(
+    auto returnCursorGuard = makeGuard(
         [cursor] { cursor->returnCursor(ClusterCursorManager::CursorState::NotExhausted); });
     validateLSID(opCtx, request, cursor);
     validateTxnNumber(opCtx, request, cursor);
-    returnCursorGuard.Dismiss();
+    returnCursorGuard.dismiss();
 }
 
 StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
@@ -601,6 +595,8 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
     long long batchSize = request.batchSize.value_or(0);
     long long startingFrom = pinnedCursor.getValue().getNumReturnedSoFar();
     auto cursorState = ClusterCursorManager::CursorState::NotExhausted;
+    BSONObj postBatchResumeToken;
+    bool stashedResult = false;
 
     while (!FindCommon::enoughForGetMore(batchSize, batch.size())) {
         auto context = batch.empty()
@@ -638,6 +634,7 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
         if (!FindCommon::haveSpaceForNext(
                 *next.getValue().getResult(), batch.size(), bytesBuffered)) {
             pinnedCursor.getValue().queueResult(*next.getValue().getResult());
+            stashedResult = true;
             break;
         }
 
@@ -646,6 +643,15 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
         bytesBuffered +=
             (next.getValue().getResult()->objsize() + kPerDocumentOverheadBytesUpperBound);
         batch.push_back(std::move(*next.getValue().getResult()));
+
+        // Update the postBatchResumeToken. For non-$changeStream aggregations, this will be empty.
+        postBatchResumeToken = pinnedCursor.getValue().getPostBatchResumeToken();
+    }
+
+    // For empty batches, or in the case where the final result was added to the batch rather than
+    // being stashed, we update the PBRT here to ensure that it is the most recent available.
+    if (!stashedResult) {
+        postBatchResumeToken = pinnedCursor.getValue().getPostBatchResumeToken();
     }
 
     pinnedCursor.getValue().setLeftoverMaxTimeMicros(opCtx->getRemainingMaxTimeMicros());
@@ -669,7 +675,8 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
             "waitBeforeUnpinningOrDeletingCursorAfterGetMoreBatch");
     }
 
-    return CursorResponse(request.nss, idToReturn, std::move(batch), startingFrom);
+    return CursorResponse(
+        request.nss, idToReturn, std::move(batch), startingFrom, boost::none, postBatchResumeToken);
 }
 
 }  // namespace mongo

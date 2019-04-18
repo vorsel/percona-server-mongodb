@@ -108,7 +108,8 @@ unsigned long long collectionCount(OperationContext* opCtx,
     // If the global write lock is held, we must avoid using AutoGetCollectionForReadCommand as it
     // may lead to deadlock when waiting for a majority snapshot to be committed. See SERVER-24596.
     if (callerHoldsGlobalLock) {
-        Database* db = DatabaseHolder::getDatabaseHolder().get(opCtx, nss.ns());
+        auto databaseHolder = DatabaseHolder::get(opCtx);
+        auto db = databaseHolder->getDb(opCtx, nss.ns());
         if (db) {
             coll = db->getCollection(opCtx, nss);
         }
@@ -164,7 +165,7 @@ void assertCollectionNotNull(const NamespaceString& nss, AutoT& autoT) {
 
 }  // namespace
 
-AtomicUInt32 Config::JOB_NUMBER;
+AtomicWord<unsigned> Config::JOB_NUMBER;
 
 JSFunction::JSFunction(const std::string& type, const BSONElement& e) {
     _type = type;
@@ -467,8 +468,8 @@ void State::dropTempCollections() {
     if (_useIncremental && !_config.incLong.isEmpty()) {
         writeConflictRetry(_opCtx, "M/R dropTempCollections", _config.incLong.ns(), [this] {
             Lock::DBLock lk(_opCtx, _config.incLong.db(), MODE_X);
-            if (Database* db =
-                    DatabaseHolder::getDatabaseHolder().get(_opCtx, _config.incLong.ns())) {
+            auto databaseHolder = DatabaseHolder::get(_opCtx);
+            if (auto db = databaseHolder->getDb(_opCtx, _config.incLong.ns())) {
                 WriteUnitOfWork wunit(_opCtx);
                 uassertStatusOK(db->dropCollection(_opCtx, _config.incLong.ns()));
                 wunit.commit();
@@ -536,7 +537,7 @@ void State::prepTempCollection() {
                 finalColl->getIndexCatalog()->getIndexIterator(_opCtx, true);
             // Iterate over finalColl's indexes.
             while (ii->more()) {
-                IndexDescriptor* currIndex = ii->next()->descriptor();
+                const IndexDescriptor* currIndex = ii->next()->descriptor();
                 BSONObjBuilder b;
                 b.append("ns", _config.tempNamespace.ns());
 
@@ -682,27 +683,24 @@ void State::appendResults(BSONObjBuilder& final) {
  * Does post processing on output collection.
  * This may involve replacing, merging or reducing.
  */
-long long State::postProcessCollection(OperationContext* opCtx,
-                                       CurOp* curOp,
-                                       ProgressMeterHolder& pm) {
+long long State::postProcessCollection(OperationContext* opCtx, CurOp* curOp) {
     if (_onDisk == false || _config.outputOptions.outType == Config::INMEMORY)
         return numInMemKeys();
 
     bool holdingGlobalLock = false;
     if (_config.outputOptions.outNonAtomic)
-        return postProcessCollectionNonAtomic(opCtx, curOp, pm, holdingGlobalLock);
+        return postProcessCollectionNonAtomic(opCtx, curOp, holdingGlobalLock);
 
     invariant(!opCtx->lockState()->isLocked());
 
     // This must be global because we may write across different databases.
     Lock::GlobalWrite lock(opCtx);
     holdingGlobalLock = true;
-    return postProcessCollectionNonAtomic(opCtx, curOp, pm, holdingGlobalLock);
+    return postProcessCollectionNonAtomic(opCtx, curOp, holdingGlobalLock);
 }
 
 long long State::postProcessCollectionNonAtomic(OperationContext* opCtx,
                                                 CurOp* curOp,
-                                                ProgressMeterHolder& pm,
                                                 bool callerHoldsGlobalLock) {
     if (_config.outputOptions.finalNamespace == _config.tempNamespace)
         return collectionCount(opCtx, _config.outputOptions.finalNamespace, callerHoldsGlobalLock);
@@ -727,12 +725,14 @@ long long State::postProcessCollectionNonAtomic(OperationContext* opCtx,
         _db.dropCollection(_config.tempNamespace.ns());
     } else if (_config.outputOptions.outType == Config::MERGE) {
         // merge: upsert new docs into old collection
+        const auto count = collectionCount(opCtx, _config.tempNamespace, callerHoldsGlobalLock);
+
+        ProgressMeterHolder pm;
         {
-            const auto count = collectionCount(opCtx, _config.tempNamespace, callerHoldsGlobalLock);
-            stdx::lock_guard<Client> lk(*opCtx->getClient());
-            curOp->setMessage_inlock(
-                "m/r: merge post processing", "M/R Merge Post Processing Progress", count);
+            stdx::unique_lock<Client> lk(*opCtx->getClient());
+            pm.set(curOp->setProgress_inlock("M/R Merge Post Processing", count));
         }
+
         unique_ptr<DBClientCursor> cursor = _db.query(_config.tempNamespace, BSONObj());
         while (cursor->more()) {
             Lock::DBLock lock(opCtx, _config.outputOptions.finalNamespace.db(), MODE_X);
@@ -746,12 +746,14 @@ long long State::postProcessCollectionNonAtomic(OperationContext* opCtx,
         // reduce: apply reduce op on new result and existing one
         BSONList values;
 
+        const auto count = collectionCount(opCtx, _config.tempNamespace, callerHoldsGlobalLock);
+
+        ProgressMeterHolder pm;
         {
-            const auto count = collectionCount(opCtx, _config.tempNamespace, callerHoldsGlobalLock);
-            stdx::lock_guard<Client> lk(*opCtx->getClient());
-            curOp->setMessage_inlock(
-                "m/r: reduce post processing", "M/R Reduce Post Processing Progress", count);
+            stdx::unique_lock<Client> lk(*opCtx->getClient());
+            pm.set(curOp->setProgress_inlock("M/R Reduce Post Processing", count));
         }
+
         unique_ptr<DBClientCursor> cursor = _db.query(_config.tempNamespace, BSONObj());
         while (cursor->more()) {
             // This must be global because we may write across different databases.
@@ -1077,7 +1079,7 @@ BSONObj _nativeToTemp(const BSONObj& args, void* data) {
  * After calling this method, the temp collection will be completed.
  * If inline, the results will be in the in memory map
  */
-void State::finalReduce(OperationContext* opCtx, CurOp* curOp, ProgressMeterHolder& pm) {
+void State::finalReduce(OperationContext* opCtx, CurOp* curOp) {
     if (_jsMode) {
         // apply the reduce within JS
         if (_onDisk) {
@@ -1124,7 +1126,7 @@ void State::finalReduce(OperationContext* opCtx, CurOp* curOp, ProgressMeterHold
             autoIncColl.getCollection()->getIndexCatalog()->getIndexIterator(_opCtx, true);
         // Iterate over incColl's indexes.
         while (ii->more()) {
-            IndexDescriptor* currIndex = ii->next()->descriptor();
+            const IndexDescriptor* currIndex = ii->next()->descriptor();
             BSONObj x = currIndex->infoObj();
             if (sortKey.woCompare(x["key"].embeddedObject()) == 0) {
                 foundIndex = true;
@@ -1142,13 +1144,11 @@ void State::finalReduce(OperationContext* opCtx, CurOp* curOp, ProgressMeterHold
     BSONObj prev;
     BSONList all;
 
+    const auto count = _db.count(_config.incLong.ns(), BSONObj(), QueryOption_SlaveOk);
+    ProgressMeterHolder pm;
     {
-        const auto count = _db.count(_config.incLong.ns(), BSONObj(), QueryOption_SlaveOk);
-        stdx::lock_guard<Client> lk(*_opCtx->getClient());
-        verify(pm ==
-               curOp->setMessage_inlock("m/r: (3/3) final reduce to collection",
-                                        "M/R: (3/3) Final Reduce Progress",
-                                        count));
+        stdx::unique_lock<Client> lk(*opCtx->getClient());
+        pm.set(curOp->setProgress_inlock("M/R: (3/3) Final Reduce", count));
     }
 
     const ExtensionsCallbackReal extensionsCallback(_opCtx, &_config.incLong);
@@ -1448,12 +1448,12 @@ public:
                 progressTotal = 1;
             }
 
-            stdx::unique_lock<Client> lk(*opCtx->getClient());
-            ProgressMeter& progress(curOp->setMessage_inlock(
-                "m/r: (1/3) emit phase", "M/R: (1/3) Emit Progress", progressTotal));
-            lk.unlock();
-            progress.showTotal(showTotal);
-            ProgressMeterHolder pm(progress);
+            ProgressMeterHolder pm;
+            {
+                stdx::unique_lock<Client> lk(*opCtx->getClient());
+                pm.set(curOp->setProgress_inlock("M/R: (1/3) Emit Phase", progressTotal));
+            }
+            pm->showTotal(showTotal);
 
             long long mapTime = 0;
             long long reduceTime = 0;
@@ -1601,8 +1601,7 @@ public:
 
             {
                 stdx::lock_guard<Client> lk(*opCtx->getClient());
-                curOp->setMessage_inlock("m/r: (2/3) final reduce in memory",
-                                         "M/R: (2/3) Final In-Memory Reduce Progress");
+                curOp->setMessage_inlock("M/R: (2/3) Final In-Memory Reduce");
             }
             Timer rt;
             // do reduce in memory
@@ -1611,7 +1610,7 @@ public:
             // if not inline: dump the in memory map to inc collection, all data is on disk
             state.dumpToInc();
             // final reduce
-            state.finalReduce(opCtx, curOp, pm);
+            state.finalReduce(opCtx, curOp);
             reduceTime += rt.micros();
 
             // Ensure the profile shows the source namespace. If the output was not inline, the
@@ -1625,7 +1624,7 @@ public:
             timingBuilder.appendNumber("reduceTime", reduceTime / 1000);
             timingBuilder.append("mode", state.jsMode() ? "js" : "mixed");
 
-            long long finalCount = state.postProcessCollection(opCtx, curOp, pm);
+            long long finalCount = state.postProcessCollection(opCtx, curOp);
             state.appendResults(result);
 
             timingBuilder.appendNumber("total", t.millis());
@@ -1742,10 +1741,10 @@ public:
         BSONObj shardCounts = cmdObj["shardCounts"].embeddedObjectUserCheck();
         BSONObj counts = cmdObj["counts"].embeddedObjectUserCheck();
 
-        stdx::unique_lock<Client> lk(*opCtx->getClient());
-        ProgressMeterHolder pm(curOp->setMessage_inlock("m/r: merge sort and reduce",
-                                                        "M/R Merge Sort and Reduce Progress"));
-        lk.unlock();
+        {
+            stdx::unique_lock<Client> lk(*opCtx->getClient());
+            curOp->setMessage_inlock("M/R Merge Sort and Reduce");
+        }
         set<string> servers;
 
         {
@@ -1838,7 +1837,7 @@ public:
         // Forget temporary input collection, if output is sharded collection
         ShardConnection::forgetNS(inputNS);
 
-        long long outputCount = state.postProcessCollection(opCtx, curOp, pm);
+        long long outputCount = state.postProcessCollection(opCtx, curOp);
         state.appendResults(result);
 
         BSONObjBuilder countsB(32);

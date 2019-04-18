@@ -1,5 +1,5 @@
 // Test TransientTransactionErrors error label in mongos write commands.
-// @tags: [uses_transactions, uses_single_shard_transaction]
+// @tags: [uses_transactions]
 (function() {
     "use strict";
 
@@ -9,10 +9,16 @@
     let sessionDB = session.getDatabase("test");
 
     st.rs0.nodes.forEach(function(node) {
+        // Sharding tests require failInternalCommands: true, since the mongos appears to mongod to
+        // be an internal client.
         assert.commandWorked(node.getDB("admin").runCommand({
             configureFailPoint: "failCommand",
             mode: "alwaysOn",
-            data: {errorCode: ErrorCodes.WriteConflict, failCommands: ["insert"]}
+            data: {
+                errorCode: ErrorCodes.WriteConflict,
+                failCommands: ["insert"],
+                failInternalCommands: true
+            }
         }));
     });
 

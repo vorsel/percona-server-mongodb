@@ -81,6 +81,7 @@
 #include "mongo/db/session_catalog_mongod.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/system_index.h"
+#include "mongo/db/transaction_coordinator_service.h"
 #include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface.h"
 #include "mongo/executor/network_interface_factory.h"
@@ -506,7 +507,14 @@ OpTime ReplicationCoordinatorExternalStateImpl::onTransitionToPrimary(OperationC
     const auto opTimeToReturn = fassert(28665, loadLastOpTime(opCtx));
 
     _shardingOnTransitionToPrimaryHook(opCtx);
+
+    // This has to go before reaquiring locks for prepared transactions, otherwise this can be
+    // blocked by prepared transactions.
     _dropAllTempCollections(opCtx);
+
+    MongoDSessionCatalog::onStepUp(opCtx);
+
+    notifyFreeMonitoringOnTransitionToPrimary();
 
     // It is only necessary to check the system indexes on the first transition to master.
     // On subsequent transitions to master the indexes will have already been created.
@@ -756,6 +764,8 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook
         if (auto validator = LogicalTimeValidator::get(_service)) {
             validator->enableKeyGenerator(opCtx, true);
         }
+
+        TransactionCoordinatorService::get(_service)->onStepUp(opCtx);
     } else if (ShardingState::get(opCtx)->enabled()) {
         Status status = ShardingStateRecovery::recover(opCtx);
 
@@ -780,15 +790,12 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook
         CatalogCacheLoader::get(_service).onStepUp();
         ChunkSplitter::get(_service).onStepUp();
         PeriodicBalancerConfigRefresher::get(_service).onStepUp(_service);
+        TransactionCoordinatorService::get(_service)->onStepUp(opCtx);
     } else {  // unsharded
         if (auto validator = LogicalTimeValidator::get(_service)) {
             validator->enableKeyGenerator(opCtx, true);
         }
     }
-
-    MongoDSessionCatalog::onStepUp(opCtx);
-
-    notifyFreeMonitoringOnTransitionToPrimary();
 }
 
 void ReplicationCoordinatorExternalStateImpl::signalApplierToChooseNewSyncSource() {

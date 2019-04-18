@@ -380,6 +380,11 @@ add_option('use-system-zlib',
     nargs=0,
 )
 
+add_option('use-system-zstd',
+    help="use system version of Zstandard library",
+    nargs=0,
+)
+
 add_option('use-system-sqlite',
     help='use system version of sqlite library',
     nargs=0,
@@ -1968,14 +1973,14 @@ def doConfigure(myenv):
     # bare compilers, and we should re-check at the very end that TryCompile and TryLink still
     # work with the flags we have selected.
     if myenv.ToolchainIs('msvc'):
-        compiler_minimum_string = "Microsoft Visual Studio 2015 Update 3"
+        compiler_minimum_string = "Microsoft Visual Studio 2017 15.9"
         compiler_test_body = textwrap.dedent(
         """
         #if !defined(_MSC_VER)
         #error
         #endif
 
-        #if _MSC_VER < 1900 || (_MSC_VER == 1900 && _MSC_FULL_VER < 190024218)
+        #if _MSC_VER < 1916
         #error %s or newer is required to build MongoDB
         #endif
 
@@ -2262,10 +2267,6 @@ def doConfigure(myenv):
         # exceptionToStatus(). See https://bugs.llvm.org/show_bug.cgi?id=34804
         AddToCCFLAGSIfSupported(myenv, "-Wno-exceptions")
 
-        # These warnings begin in gcc-8.2 and we should get rid of these disables at some point.
-        AddToCCFLAGSIfSupported(env, '-Wno-format-truncation')
-        AddToCXXFLAGSIfSupported(env, '-Wno-class-memaccess')
-
 
         # Check if we can set "-Wnon-virtual-dtor" when "-Werror" is set. The only time we can't set it is on
         # clang 3.4, where a class with virtual function(s) and a non-virtual destructor throws a warning when
@@ -2393,10 +2394,11 @@ def doConfigure(myenv):
         conf.Finish()
 
     if myenv.ToolchainIs('msvc'):
+        myenv.AppendUnique(CXXFLAGS=['/Zc:__cplusplus'])
         if get_option('cxx-std') == "14":
             myenv.AppendUnique(CCFLAGS=['/std:c++14'])
         elif get_option('cxx-std') == "17":
-            myenv.AppendUnique(CCFLAGS=['/std:c++17', '/Zc:__cplusplus'])
+            myenv.AppendUnique(CCFLAGS=['/std:c++17'])
     else:
         if get_option('cxx-std') == "14":
             if not AddToCXXFLAGSIfSupported(myenv, '-std=c++14'):
@@ -2411,18 +2413,10 @@ def doConfigure(myenv):
     if using_system_version_of_cxx_libraries():
         print( 'WARNING: System versions of C++ libraries must be compiled with C++14/17 support' )
 
-    # We appear to have C++14, or at least a flag to enable it. Check that the declared C++
-    # language level is not less than C++14, and that we can at least compile an 'auto'
-    # expression. We don't check the __cplusplus macro when using MSVC because as of our
-    # current required MS compiler version (MSVS 2015 Update 2), they don't set it. If
-    # MSFT ever decides (in MSVS 2017?) to define __cplusplus >= 201402L, remove the exception
-    # here for _MSC_VER
     def CheckCxx14(context):
         test_body = """
-        #ifndef _MSC_VER
         #if __cplusplus < 201402L
         #error
-        #endif
         #endif
         auto DeducedReturnTypesAreACXX14Feature() {
             return 0;
@@ -2714,11 +2708,17 @@ def doConfigure(myenv):
             myenv.FatalError("Using the leak sanitizer requires a valid symbolizer")
 
         if using_asan:
-            myenv.AppendUnique(CCFLAGS=['-DADDRESS_SANITIZER'])
+            # Unfortunately, abseil requires that we make these macros
+            # (this, and THREAD_ and UNDEFINED_BEHAVIOR_ below) set,
+            # because apparently it is too hard to query the running
+            # compiler. We do this unconditionally because abseil is
+            # basically pervasive via the 'base' library.
+            myenv.AppendUnique(CPPDEFINES=['ADDRESS_SANITIZER'])
 
         if using_tsan:
             tsan_options += "suppressions=\"%s\" " % myenv.File("#etc/tsan.suppressions").abspath
             myenv['ENV']['TSAN_OPTIONS'] = tsan_options
+            myenv.AppendUnique(CPPDEFINES=['THREAD_SANITIZER'])
 
         if using_ubsan:
             # By default, undefined behavior sanitizer doesn't stop on
@@ -2726,6 +2726,7 @@ def doConfigure(myenv):
             # have renamed the flag.
             if not AddToCCFLAGSIfSupported(myenv, "-fno-sanitize-recover"):
                 AddToCCFLAGSIfSupported(myenv, "-fno-sanitize-recover=undefined")
+            myenv.AppendUnique(CPPDEFINES=['UNDEFINED_BEHAVIOR_SANITIZER'])
 
     if myenv.ToolchainIs('msvc') and optBuild:
         # http://blogs.msdn.com/b/vcblog/archive/2013/09/11/introducing-gw-compiler-switch.aspx
@@ -3231,6 +3232,9 @@ def doConfigure(myenv):
     if use_system_version_of_library("zlib"):
         conf.FindSysLibDep("zlib", ["zdll" if conf.env.TargetOSIs('windows') else "z"])
 
+    if use_system_version_of_library("zstd"):
+        conf.FindSysLibDep("zstd", ["libzstd" if conf.env.TargetOSIs('windows') else "zstd"])
+
     if use_system_version_of_library("stemmer"):
         conf.FindSysLibDep("stemmer", ["stemmer"])
 
@@ -3265,6 +3269,7 @@ def doConfigure(myenv):
         CPPDEFINES=[
             "BOOST_SYSTEM_NO_DEPRECATED",
             "BOOST_MATH_NO_LONG_DOUBLE_MATH_FUNCTIONS",
+            "ABSL_FORCE_ALIGNED_ACCESS",
         ]
     )
 

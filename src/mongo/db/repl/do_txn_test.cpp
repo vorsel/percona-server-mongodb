@@ -40,6 +40,7 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/storage_interface_impl.h"
+#include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/s/op_observer_sharding_impl.h"
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/db/session_catalog_mongod.h"
@@ -107,9 +108,11 @@ protected:
         auto txnRecord = SessionTxnRecord::parse(IDLParserErrorContext("parse txn record for test"),
                                                  unittest::assertGet(result));
 
-        ASSERT_EQ(opCtx()->getTxnNumber(), txnRecord.getTxnNum());
+        ASSERT(opCtx()->getTxnNumber());
+        ASSERT_EQ(*opCtx()->getTxnNumber(), txnRecord.getTxnNum());
         ASSERT_EQ(_opObserver->applyOpsOplogEntry->getOpTime(), txnRecord.getLastWriteOpTime());
-        ASSERT_EQ(_opObserver->applyOpsOplogEntry->getWallClockTime(),
+        ASSERT(_opObserver->applyOpsOplogEntry->getWallClockTime());
+        ASSERT_EQ(*_opObserver->applyOpsOplogEntry->getWallClockTime(),
                   txnRecord.getLastWriteDate());
     }
 
@@ -151,6 +154,11 @@ void DoTxnTest::setUp() {
     // This test uses StorageInterface to create collections and inspect documents inside
     // collections.
     _storage = stdx::make_unique<StorageInterfaceImpl>();
+
+    // We also need to give replication a StorageInterface for checking out the transaction.
+    // The test storage engine doesn't support the necessary call (getPointInTimeReadTimestamp()),
+    // so we use a mock.
+    repl::StorageInterface::set(service, stdx::make_unique<StorageInterfaceMock>());
 
     // Set up the transaction and session.
     _opCtx->setLogicalSessionId(makeLogicalSessionIdForTest());
@@ -274,7 +282,7 @@ TEST_F(DoTxnTest, AtomicDoTxnInsertWithUuidIntoCollectionWithOtherUuid) {
     // Collection has a different UUID.
     CollectionOptions collectionOptions;
     collectionOptions.uuid = UUID::gen();
-    ASSERT_NOT_EQUALS(doTxnUuid, collectionOptions.uuid);
+    ASSERT_NOT_EQUALS(doTxnUuid, *collectionOptions.uuid);
     ASSERT_OK(_storage->createCollection(opCtx(), nss, collectionOptions));
 
     // The doTxn returns a NamespaceNotFound error because of the failed UUID lookup

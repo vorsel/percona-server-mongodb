@@ -145,6 +145,8 @@ debian/mongodb
 .cproject
 .project
 .pydevproject
+.externalToolBuilders/
+.settings/
 
 # Idea CLion project artifacts
 .idea
@@ -171,3 +173,4 @@ src/mongo/embedded/java/jar/build/
 local.properties
 
 compile_commands.json
+generated_resmoke_config

@@ -129,14 +129,7 @@ public:
         {
             stdx::unique_lock<stdx::mutex> lk(_mutex);
             _resuming = true;
-            _paused = false;
-            _resumedQueryCount = _queryCount;
-            while (_waiting) {
-                lk.unlock();
-                _net->signalWorkAvailable();
-                mongo::sleepmillis(10);
-                lk.lock();
-            }
+            _resume(&lk);
             _resuming = false;
             _cond.notify_all();
         }
@@ -148,10 +141,15 @@ public:
         _cond.wait(lk, [this] { return _waiting; });
     }
 
-    // Waits for the next query to run after resume() is called to complete.
-    void waitForResumedQuery() {
+    // Resumes, then waits for the next query to run after resume() is called to complete.
+    void resumeAndWaitForResumedQuery() {
         stdx::unique_lock<stdx::mutex> lk(_mutex);
+        _resuming = true;
+        _resume(&lk);
+        _cond.notify_all();  // This is to wake up the paused thread.
         _cond.wait(lk, [this] { return _resumedQueryCount != _queryCount; });
+        _resuming = false;
+        _cond.notify_all();  // This potentially wakes up the destructor.
     }
 
 private:
@@ -165,6 +163,18 @@ private:
     int _resumedQueryCount = 0;
     Status _failureForConnect = Status::OK();
     Status _failureForQuery = Status::OK();
+
+    void _resume(stdx::unique_lock<stdx::mutex>* lk) {
+        invariant(lk->owns_lock());
+        _paused = false;
+        _resumedQueryCount = _queryCount;
+        while (_waiting) {
+            lk->unlock();
+            _net->signalWorkAvailable();
+            mongo::sleepmillis(10);
+            lk->lock();
+        }
+    }
 };
 
 // RAII class to pause the client; since tests are very exception-heavy this prevents them
@@ -182,6 +192,12 @@ public:
     void resume() {
         if (_client)
             _client->resume();
+        _client = nullptr;
+    }
+
+    void resumeAndWaitForResumedQuery() {
+        if (_client)
+            _client->resumeAndWaitForResumedQuery();
         _client = nullptr;
     }
 
@@ -1230,15 +1246,15 @@ protected:
 
     /**
      * Sets up a test for the CollectionCloner that simulates the collection being dropped while
-     * copying the documents.
-     * The DBClientConnection returns a CursorNotFound error to indicate a collection drop.
+     * copying the documents by making a query return the given error code.
+     *
+     * The DBClientConnection returns 'code' to indicate a collection drop.
      */
-    void setUpVerifyCollectionWasDroppedTest() {
+    void setUpVerifyCollectionWasDroppedTest(ErrorCodes::Error code) {
         // Pause the query so we can reliably wait for it to complete.
         MockClientPauser pauser(_client);
         // Return error response from the query.
-        _client->setFailureForQuery(
-            {ErrorCodes::CursorNotFound, "collection dropped while copying documents"});
+        _client->setFailureForQuery({code, "collection dropped while copying documents"});
         ASSERT_OK(collectionCloner->startup());
         {
             executor::NetworkInterfaceMock::InNetworkGuard guard(getNet());
@@ -1249,8 +1265,7 @@ protected:
 
         _client->waitForPausedQuery();
         ASSERT_TRUE(collectionStats.initCalled);
-        pauser.resume();
-        _client->waitForResumedQuery();
+        pauser.resumeAndWaitForResumedQuery();
     }
 
     /**
@@ -1268,6 +1283,39 @@ protected:
         ASSERT_EQUALS("find"_sd, firstElement.fieldNameStringData());
         ASSERT_EQUALS(*options.uuid, unittest::assertGet(UUID::parse(firstElement)));
         return noi;
+    }
+
+    /**
+     * Start cloning. While copying collection, simulate a collection drop by having the
+     * DBClientConnection return code 'collectionDropErrCode'.
+     *
+     * The CollectionCloner should run a find command on the collection by UUID. Simulate successful
+     * find command with a drop-pending namespace in the response.  The CollectionCloner should
+     * complete with a successful final status.
+     */
+    void runCloningSuccessfulWithCollectionDropTest(ErrorCodes::Error collectionDropErrCode) {
+        setUpVerifyCollectionWasDroppedTest(collectionDropErrCode);
+
+        // CollectionCloner should send a find command with the collection's UUID.
+        {
+            executor::NetworkInterfaceMock::InNetworkGuard guard(getNet());
+            auto noi = getVerifyCollectionDroppedRequest(getNet());
+
+            // Return a drop-pending namespace in the find response instead of the original
+            // collection name passed to CollectionCloner at construction.
+            repl::OpTime dropOpTime(Timestamp(Seconds(100), 0), 1LL);
+            auto dpns = nss.makeDropPendingNamespace(dropOpTime);
+            scheduleNetworkResponse(noi,
+                                    createCursorResponse(0, dpns.ns(), BSONArray(), "firstBatch"));
+            finishProcessingNetworkResponse();
+        }
+
+        // CollectionCloner treats a in collection state to drop-pending during cloning as a
+        // successful
+        // clone operation.
+        collectionCloner->join();
+        ASSERT_OK(getStatus());
+        ASSERT_FALSE(collectionCloner->isActive());
     }
 };
 
@@ -1364,49 +1412,32 @@ TEST_F(CollectionClonerRenamedBeforeStartTest, BeginCollectionWithUUID) {
     ASSERT_TRUE(collectionCloner->isActive());
 }
 
-/**
- * Start cloning.
- * While copying collection, simulate a collection drop by having the DBClientConnection return a
- * CursorNotFound error.
- * The CollectionCloner should run a find command on the collection by UUID.
- * Simulate successful find command with a drop-pending namespace in the response.
- * The CollectionCloner should complete with a successful final status.
- */
 TEST_F(CollectionClonerRenamedBeforeStartTest,
-       CloningIsSuccessfulIfCollectionWasDroppedWhileCopyingDocuments) {
-    setUpVerifyCollectionWasDroppedTest();
+       CloningIsSuccessfulIfCollectionWasDroppedWithCursorNotFoundWhileCopyingDocuments) {
+    runCloningSuccessfulWithCollectionDropTest(ErrorCodes::CursorNotFound);
+}
 
-    // CollectionCloner should send a find command with the collection's UUID.
-    {
-        executor::NetworkInterfaceMock::InNetworkGuard guard(getNet());
-        auto noi = getVerifyCollectionDroppedRequest(getNet());
+TEST_F(CollectionClonerRenamedBeforeStartTest,
+       CloningIsSuccessfulIfCollectionWasDroppedWithOperationFailedWhileCopyingDocuments) {
+    runCloningSuccessfulWithCollectionDropTest(ErrorCodes::OperationFailed);
+}
 
-        // Return a drop-pending namespace in the find response instead of the original collection
-        // name passed to CollectionCloner at construction.
-        repl::OpTime dropOpTime(Timestamp(Seconds(100), 0), 1LL);
-        auto dpns = nss.makeDropPendingNamespace(dropOpTime);
-        scheduleNetworkResponse(noi, createCursorResponse(0, dpns.ns(), BSONArray(), "firstBatch"));
-        finishProcessingNetworkResponse();
-    }
-
-    // CollectionCloner treats a in collection state to drop-pending during cloning as a successful
-    // clone operation.
-    collectionCloner->join();
-    ASSERT_OK(getStatus());
-    ASSERT_FALSE(collectionCloner->isActive());
+TEST_F(CollectionClonerRenamedBeforeStartTest,
+       CloningIsSuccessfulIfCollectionWasDroppedWithQueryPlanKilledWhileCopyingDocuments) {
+    runCloningSuccessfulWithCollectionDropTest(ErrorCodes::QueryPlanKilled);
 }
 
 /**
- * Start cloning.
- * While copying collection, simulate a collection drop by having the DBClientConnection return a
- * CursorNotFound error.
- * The CollectionCloner should run a find command on the collection by UUID.
- * Shut the CollectionCloner down.
- * The CollectionCloner should return a CursorNotFound final status.
+ * Start cloning.  While copying collection, simulate a collection drop by having the
+ * DBClientConnection return a CursorNotFound error.
+ *
+ * The CollectionCloner should run a find command on the collection by UUID.  Shut the
+ * CollectionCloner down.  The CollectionCloner should return final status corresponding to the
+ * error code from the DBClientConnection.
  */
 TEST_F(CollectionClonerRenamedBeforeStartTest,
        ShuttingDownCollectionClonerDuringCollectionDropVerificationReturnsCallbackCanceled) {
-    setUpVerifyCollectionWasDroppedTest();
+    setUpVerifyCollectionWasDroppedTest(ErrorCodes::CursorNotFound);
 
     // CollectionCloner should send a find command with the collection's UUID.
     {

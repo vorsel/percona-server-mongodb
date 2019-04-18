@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2018 MongoDB, Inc.
+ * Copyright (c) 2014-2019 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -2619,10 +2619,11 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler,
 	}
 
 	WT_ERR(__wt_config_gets(session, cfg, "buffer_alignment", &cval));
-	if (cval.val == -1)
-		conn->buffer_alignment =
-		    (conn->direct_io == 0) ? 0 : WT_BUFFER_ALIGNMENT_DEFAULT;
-	else
+	if (cval.val == -1) {
+		conn->buffer_alignment = 0;
+		if (conn->direct_io != 0)
+			conn->buffer_alignment = WT_BUFFER_ALIGNMENT_DEFAULT;
+	} else
 		conn->buffer_alignment = (size_t)cval.val;
 #ifndef HAVE_POSIX_MEMALIGN
 	if (conn->buffer_alignment != 0)

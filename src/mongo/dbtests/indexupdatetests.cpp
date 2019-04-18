@@ -37,7 +37,6 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/multi_index_block.h"
-#include "mongo/db/catalog/multi_index_block_impl.h"
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
@@ -77,7 +76,7 @@ protected:
 
     bool buildIndexInterrupted(const BSONObj& key, bool allowInterruption) {
         try {
-            MultiIndexBlockImpl indexer(&_opCtx, collection());
+            MultiIndexBlock indexer(&_opCtx, collection());
             if (allowInterruption)
                 indexer.allowInterruption();
 
@@ -130,7 +129,7 @@ public:
             wunit.commit();
         }
 
-        MultiIndexBlockImpl indexer(&_opCtx, coll);
+        MultiIndexBlock indexer(&_opCtx, coll);
         indexer.allowBackgroundBuilding();
         indexer.allowInterruption();
         indexer.ignoreUniqueConstraint();
@@ -171,22 +170,20 @@ public:
             coll = db->createCollection(&_opCtx, _ns);
 
             OpDebug* const nullOpDebug = nullptr;
-            coll->insertDocument(&_opCtx,
-                                 InsertStatement(BSON("_id" << 1 << "a"
-                                                            << "dup")),
-                                 nullOpDebug,
-                                 true)
-                .transitional_ignore();
-            coll->insertDocument(&_opCtx,
-                                 InsertStatement(BSON("_id" << 2 << "a"
-                                                            << "dup")),
-                                 nullOpDebug,
-                                 true)
-                .transitional_ignore();
+            ASSERT_OK(coll->insertDocument(&_opCtx,
+                                           InsertStatement(BSON("_id" << 1 << "a"
+                                                                      << "dup")),
+                                           nullOpDebug,
+                                           true));
+            ASSERT_OK(coll->insertDocument(&_opCtx,
+                                           InsertStatement(BSON("_id" << 2 << "a"
+                                                                      << "dup")),
+                                           nullOpDebug,
+                                           true));
             wunit.commit();
         }
 
-        MultiIndexBlockImpl indexer(&_opCtx, coll);
+        MultiIndexBlock indexer(&_opCtx, coll);
         indexer.allowBackgroundBuilding();
         indexer.allowInterruption();
         // indexer.ignoreUniqueConstraint(); // not calling this
@@ -205,7 +202,20 @@ public:
                                   << background);
 
         ASSERT_OK(indexer.init(spec).getStatus());
-        const Status status = indexer.insertAllDocumentsInCollection();
+        auto desc =
+            coll->getIndexCatalog()->findIndexByName(&_opCtx, "a", true /* includeUnfinished */);
+        ASSERT(desc);
+
+        Status status = indexer.insertAllDocumentsInCollection();
+        if (!coll->getIndexCatalog()->getEntry(desc)->isBuilding()) {
+            ASSERT_EQUALS(status.code(), ErrorCodes::DuplicateKey);
+            return;
+        }
+
+        // Hybrid index builds, with an interceptor, check duplicates explicitly.
+        ASSERT_OK(status);
+
+        status = indexer.checkConstraints();
         ASSERT_EQUALS(status.code(), ErrorCodes::DuplicateKey);
     }
 };
@@ -372,7 +382,7 @@ public:
 };
 
 Status IndexBuildBase::createIndex(const std::string& dbname, const BSONObj& indexSpec) {
-    MultiIndexBlockImpl indexer(&_opCtx, collection());
+    MultiIndexBlock indexer(&_opCtx, collection());
     Status status = indexer.init(indexSpec).getStatus();
     if (status == ErrorCodes::IndexAlreadyExists) {
         return Status::OK();

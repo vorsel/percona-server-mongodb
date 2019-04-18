@@ -72,6 +72,7 @@ public:
     repl::OpTime onDropCollection(OperationContext* opCtx,
                                   const NamespaceString& collectionName,
                                   OptionalCollectionUUID uuid,
+                                  std::uint64_t numRecords,
                                   const CollectionDropType dropType) override {
         // If the oplog is not disabled for this namespace, then we need to reserve an op time for
         // the drop.
@@ -166,8 +167,12 @@ std::pair<BSONObj, RecordId> RollbackTest::makeCRUDOp(OpTypeEnum opType,
 }
 
 
-std::pair<BSONObj, RecordId> RollbackTest::makeCommandOp(
-    Timestamp ts, OptionalCollectionUUID uuid, StringData nss, BSONObj cmdObj, int recordId) {
+std::pair<BSONObj, RecordId> RollbackTest::makeCommandOp(Timestamp ts,
+                                                         OptionalCollectionUUID uuid,
+                                                         StringData nss,
+                                                         BSONObj cmdObj,
+                                                         int recordId,
+                                                         boost::optional<BSONObj> o2) {
 
     BSONObjBuilder bob;
     bob.append("ts", ts);
@@ -178,6 +183,9 @@ std::pair<BSONObj, RecordId> RollbackTest::makeCommandOp(
     }
     bob.append("ns", nss);
     bob.append("o", cmdObj);
+    if (o2) {
+        bob.append("o2", *o2);
+    }
 
     return std::make_pair(bob.obj(), RecordId(recordId));
 }
@@ -187,7 +195,8 @@ Collection* RollbackTest::_createCollection(OperationContext* opCtx,
                                             const CollectionOptions& options) {
     Lock::DBLock dbLock(opCtx, nss.db(), MODE_X);
     mongo::WriteUnitOfWork wuow(opCtx);
-    auto db = DatabaseHolder::getDatabaseHolder().openDb(opCtx, nss.db());
+    auto databaseHolder = DatabaseHolder::get(opCtx);
+    auto db = databaseHolder->openDb(opCtx, nss.db());
     ASSERT_TRUE(db);
     db->dropCollection(opCtx, nss.ns()).transitional_ignore();
     auto coll = db->createCollection(opCtx, nss.ns(), options);

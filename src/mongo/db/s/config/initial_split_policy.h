@@ -34,8 +34,11 @@
 
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/repl/read_concern_level.h"
 #include "mongo/s/catalog/type_chunk.h"
+#include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog/type_tags.h"
+#include "mongo/s/request_types/shard_collection_gen.h"
 #include "mongo/s/shard_id.h"
 #include "mongo/s/shard_key_pattern.h"
 
@@ -105,7 +108,8 @@ public:
         const Timestamp& validAfter,
         const std::vector<TagsType>& tags,
         const StringMap<std::vector<ShardId>>& tagToShards,
-        const std::vector<ShardId>& allShardIds);
+        const std::vector<ShardId>& allShardIds,
+        const bool isEmpty);
 
     /**
      * Creates the first chunks for a newly sharded collection.
@@ -118,6 +122,7 @@ public:
                                                    const std::vector<BSONObj>& splitPoints,
                                                    const std::vector<TagsType>& tags,
                                                    const bool distributeInitialChunks,
+                                                   const bool isEmpty,
                                                    const int numContiguousChunksPerShard = 1);
 
     /**
@@ -125,5 +130,17 @@ public:
      */
     static void writeFirstChunksToConfig(
         OperationContext* opCtx, const InitialSplitPolicy::ShardCollectionConfig& initialChunks);
+
+    /**
+     * Throws an exception if the collection is already sharded with different options.
+     *
+     * If the collection is already sharded with the same options, returns the existing collection's
+     * full spec, else returns boost::none.
+     */
+    static boost::optional<CollectionType> checkIfCollectionAlreadyShardedWithSameOptions(
+        OperationContext* opCtx,
+        const NamespaceString& nss,
+        const ShardsvrShardCollection& request,
+        repl::ReadConcernLevel readConcernLevel);
 };
 }  // namespace mongo

@@ -130,7 +130,7 @@ void MozJSImplScope::_reportError(JSContext* cx, const char* message, JSErrorRep
     }
 
     scope->_inReportError = true;
-    const auto guard = MakeGuard([&] { scope->_inReportError = false; });
+    const auto guard = makeGuard([&] { scope->_inReportError = false; });
 
     if (!JSREPORT_IS_WARNING(report->flags)) {
 
@@ -149,6 +149,9 @@ void MozJSImplScope::_reportError(JSContext* cx, const char* message, JSErrorRep
                 auto stackStr = ValueWriter(cx, stack).toString();
 
                 if (stackStr.empty()) {
+                    // The JavaScript Error objects resulting from C++ exceptions may not always
+                    // have a non-empty "stack" property. We instead use the line and column
+                    // numbers of where in the JavaScript code the C++ function was called from.
                     str::stream ss;
                     ss << "@" << report->filename << ":" << report->lineno << ":" << report->column
                        << "\n";
@@ -240,7 +243,7 @@ bool MozJSImplScope::_interruptCallback(JSContext* cx) {
     auto scope = getScope(cx);
 
     JS_SetInterruptCallback(scope->_runtime, nullptr);
-    auto guard = MakeGuard([&]() { JS_SetInterruptCallback(scope->_runtime, _interruptCallback); });
+    auto guard = makeGuard([&]() { JS_SetInterruptCallback(scope->_runtime, _interruptCallback); });
 
     if (scope->_pendingGC.load() || closeToMaxMemory()) {
         scope->_pendingGC.store(false);
@@ -931,6 +934,15 @@ bool MozJSImplScope::_checkErrorState(bool success, bool reportError, bool asser
             auto fnameStr = ObjectWrapper(_context, excn).getString(InternedString::fileName);
             auto lineNum = ObjectWrapper(_context, excn).getNumberInt(InternedString::lineNumber);
             auto colNum = ObjectWrapper(_context, excn).getNumberInt(InternedString::columnNumber);
+
+            if (stackStr.empty()) {
+                // The JavaScript Error objects resulting from C++ exceptions may not always have a
+                // non-empty "stack" property. We instead use the line and column numbers of where
+                // in the JavaScript code the C++ function was called from.
+                str::stream ss;
+                ss << "@" << fnameStr << ":" << lineNum << ":" << colNum << "\n";
+                stackStr = ss;
+            }
 
             if (fnameStr != "") {
                 ss << "[" << fnameStr << ":" << lineNum << ":" << colNum << "] ";

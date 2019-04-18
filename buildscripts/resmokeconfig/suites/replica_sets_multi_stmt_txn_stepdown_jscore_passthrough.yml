@@ -172,17 +172,6 @@ selector:
   # Collection drops done through applyOps are not converted to w:majority
   - jstests/core/views/invalid_system_views.js
 
-  # Operations run on the "out" collection of a MapReduce call, which is not always
-  # immediately available to a transaction as it is still being replicated. Transactions
-  # fail with "Unable to acquire lock" errors.
-  - jstests/core/function_string_representations.js
-  - jstests/core/mr_errorhandling.js
-  - jstests/core/mr_merge.js
-  - jstests/core/mr_merge2.js
-  - jstests/core/mr_replaceIntoDB.js
-  - jstests/core/mr_outreduce.js
-  - jstests/core/mr_outreduce2.js
-
   ##
   ## Misc. reasons.
   ##
@@ -354,12 +343,15 @@ executor:
         load("jstests/libs/override_methods/auto_retry_on_network_error.js");
         db = connect(TestData.connectionString);
         load("jstests/libs/override_methods/enable_sessions.js");
+        load('jstests/libs/override_methods/txn_passthrough_cmd_massage.js');
       global_vars:
         TestData:
           logRetryAttempts: true
           overrideRetryAttempts: 3
           sessionOptions:
-            causalConsistency: false
+            # Read your own writes is not guaranteed without causal consistency if all nodes are
+            # electable.
+            causalConsistency: true
             retryWrites: true
       # We specify nodb so the shell used by each test will attempt to connect after loading the
       # retry logic in auto_retry_on_network_error.js.
@@ -395,7 +387,6 @@ executor:
             recovery: 2
           transaction: 4
         enableTestCommands: 1
-        numInitialSyncAttempts: 1
         enableElectionHandoff: 0
     all_nodes_electable: true
     num_nodes: 3

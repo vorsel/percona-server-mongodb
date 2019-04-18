@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2018 MongoDB, Inc.
+ * Copyright (c) 2014-2019 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -288,6 +288,10 @@ __logmgr_config(
 			conn->log_extend_len = conn->log_file_max;
 		WT_STAT_CONN_SET(session, log_max_filesize, conn->log_file_max);
 	}
+
+	WT_RET(__wt_config_gets(session, cfg, "log.os_cache_dirty_pct", &cval));
+	if (cval.val != 0)
+		conn->log_dirty_max = (conn->log_file_max * cval.val) / 100;
 
 	/*
 	 * If pre-allocation is configured, set the initial number to a few.

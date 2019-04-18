@@ -89,9 +89,7 @@ public:
                                      HostTypeRequirement::kNone,
                                      DiskUseRequirement::kNoDiskUse,
                                      FacetRequirement::kNotAllowed,
-                                     // TODO SERVER-33683: Permit $mergeCursors with readConcern
-                                     // level "snapshot".
-                                     TransactionRequirement::kNotAllowed);
+                                     TransactionRequirement::kAllowed);
 
         constraints.requiresInputDocSource = false;
         return constraints;
@@ -100,6 +98,13 @@ public:
     GetNextResult getNext() final;
 
     std::size_t getNumRemotes() const;
+
+    /**
+     * Returns the high water mark sort key for the given cursor, if it exists; otherwise, returns
+     * an empty BSONObj. Calling this method causes the underlying BlockingResultsMerger to be
+     * populated and assumes ownership of the remote cursors.
+     */
+    BSONObj getHighWaterMark();
 
     bool remotesExhausted() const;
 

@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2018 MongoDB, Inc.
+ * Copyright (c) 2014-2019 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -41,7 +41,10 @@
 #define	WT_SESSION_IS_CHECKPOINT(s)					\
 	((s)->id != 0 && (s)->id == S2C(s)->txn_global.checkpoint_id)
 
-#define	WT_TS_NONE	0		/* No timestamp */
+#define	WT_TS_NONE	0		/* No (or earliest) timestamp) */
+#define	WT_TS_FIXME	37		/* Fake timestamp */
+#define	WT_TS_MAX	UINT64_MAX	/* Valid after start time */
+
 					/* Bytes to hold a hex timestamp */
 #define	WT_TS_HEX_SIZE	(2 * sizeof(wt_timestamp_t) + 1)
 
@@ -254,6 +257,13 @@ struct __wt_txn {
 	 * running.
 	 */
 	wt_timestamp_t commit_timestamp;
+
+	/*
+	 * Durable timestamp copied into updates created by this transaction.
+	 * It is used to decide whether to consider this update to be persisted
+	 * or not by stable checkpoint.
+	 */
+	wt_timestamp_t durable_timestamp;
 
 	/*
 	 * Set to the first commit timestamp used in the transaction and fixed

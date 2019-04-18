@@ -342,21 +342,20 @@ void CurOp::setGenericOpRequestDetails(OperationContext* opCtx,
     _ns = nss.ns();
 }
 
-ProgressMeter& CurOp::setMessage_inlock(const char* msg,
-                                        std::string name,
-                                        unsigned long long progressMeterTotal,
-                                        int secondsBetween) {
-    if (progressMeterTotal) {
-        if (_progressMeter.isActive()) {
-            error() << "old _message: " << redact(_message) << " new message:" << redact(msg);
-            verify(!_progressMeter.isActive());
-        }
-        _progressMeter.reset(progressMeterTotal, secondsBetween);
-        _progressMeter.setName(name);
-    } else {
-        _progressMeter.finished();
+void CurOp::setMessage_inlock(StringData message) {
+    if (_progressMeter.isActive()) {
+        error() << "old _message: " << redact(_message) << " new message:" << redact(message);
+        verify(!_progressMeter.isActive());
     }
-    _message = msg;
+    _message = message.toString();  // copy
+}
+
+ProgressMeter& CurOp::setProgress_inlock(StringData message,
+                                         unsigned long long progressMeterTotal,
+                                         int secondsBetween) {
+    setMessage_inlock(message);
+    _progressMeter.reset(progressMeterTotal, secondsBetween);
+    _progressMeter.setName(message);
     return _progressMeter;
 }
 
@@ -407,6 +406,7 @@ bool CurOp::completeAndLogOperation(OperationContext* opCtx,
 
     if (shouldLogOp || (shouldSample && _debug.executionTimeMicros > slowMs * 1000LL)) {
         auto lockerInfo = opCtx->lockState()->getLockerInfo(_lockStatsBase);
+        _debug.storageStats = opCtx->recoveryUnit()->getOperationStatistics();
         log(component) << _debug.report(client, *this, (lockerInfo ? &lockerInfo->stats : nullptr));
     }
 
@@ -475,6 +475,37 @@ void appendAsObjOrString(StringData name,
 }
 }  // namespace
 
+BSONObj CurOp::truncateAndSerializeGenericCursor(GenericCursor* cursor,
+                                                 boost::optional<size_t> maxQuerySize) {
+    // This creates a new builder to truncate the object that will go into the curOp output. In
+    // order to make sure the object is not too large but not truncate the comment, we only
+    // truncate the originatingCommand and not the entire cursor.
+    if (maxQuerySize) {
+        BSONObjBuilder tempObj;
+        appendAsObjOrString(
+            "truncatedObj", cursor->getOriginatingCommand().get(), maxQuerySize, &tempObj);
+        auto originatingCommand = tempObj.done().getObjectField("truncatedObj");
+        cursor->setOriginatingCommand(originatingCommand.getOwned());
+    }
+    // lsid, ns, and planSummary exist in the top level curop object, so they need to be temporarily
+    // removed from the cursor object to avoid duplicating information.
+    auto lsid = cursor->getLsid();
+    auto ns = cursor->getNs();
+    auto originalPlanSummary(cursor->getPlanSummary() ? boost::optional<std::string>(
+                                                            cursor->getPlanSummary()->toString())
+                                                      : boost::none);
+    cursor->setLsid(boost::none);
+    cursor->setNs(boost::none);
+    cursor->setPlanSummary(boost::none);
+    auto serialized = cursor->toBSON();
+    cursor->setLsid(lsid);
+    cursor->setNs(ns);
+    if (originalPlanSummary) {
+        cursor->setPlanSummary(StringData(*originalPlanSummary));
+    }
+    return serialized;
+}
+
 void CurOp::reportState(BSONObjBuilder* builder, bool truncateOps) {
     if (_start) {
         builder->append("secs_running", durationCount<Seconds>(elapsedTimeTotal()));
@@ -497,23 +528,8 @@ void CurOp::reportState(BSONObjBuilder* builder, bool truncateOps) {
     }
 
     if (_genericCursor) {
-        // This creates a new builder to truncate the object that will go into the curOp output. In
-        // order to make sure the object is not too large but not truncate the comment, we only
-        // truncate the originatingCommand and not the entire cursor.
-        BSONObjBuilder tempObj;
-        appendAsObjOrString(
-            "truncatedObj", _genericCursor->getOriginatingCommand().get(), maxQuerySize, &tempObj);
-        auto originatingCommand = tempObj.done().getObjectField("truncatedObj");
-        _genericCursor->setOriginatingCommand(originatingCommand.getOwned());
-        // lsid and ns exist in the top level curop object, so they need to be temporarily
-        // removed from the cursor object to avoid duplicating information.
-        auto lsid = _genericCursor->getLsid();
-        auto ns = _genericCursor->getNs();
-        _genericCursor->setLsid(boost::none);
-        _genericCursor->setNs(boost::none);
-        builder->append("cursor", _genericCursor->toBSON());
-        _genericCursor->setLsid(lsid);
-        _genericCursor->setNs(ns);
+        builder->append("cursor",
+                        truncateAndSerializeGenericCursor(&(*_genericCursor), maxQuerySize));
     }
 
     if (!_message.empty()) {
@@ -682,6 +698,10 @@ string OpDebug::report(Client* client,
         s << " locks:" << locks.obj().toString();
     }
 
+    if (storageStats) {
+        s << " storage:" << storageStats->toBSON().toString();
+    }
+
     if (iscommand) {
         s << " protocol:" << getProtoString(networkOp);
     }
@@ -754,6 +774,10 @@ void OpDebug::append(const CurOp& curop,
     {
         BSONObjBuilder locks(b.subobjStart("locks"));
         lockStats.report(&locks);
+    }
+
+    if (storageStats) {
+        b.append("storage", storageStats->toBSON());
     }
 
     if (!errInfo.isOK()) {
@@ -874,7 +898,7 @@ void OpDebug::AdditiveMetrics::incrementPrepareReadConflicts(long long n) {
     *prepareReadConflicts += n;
 }
 
-string OpDebug::AdditiveMetrics::report() {
+string OpDebug::AdditiveMetrics::report() const {
     StringBuilder s;
 
     OPDEBUG_TOSTRING_HELP_OPTIONAL("keysExamined", keysExamined);

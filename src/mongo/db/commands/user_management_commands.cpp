@@ -704,7 +704,7 @@ Status buildCredentials(BSONObjBuilder* builder, const auth::CreateOrUpdateUserA
         if (!args.digestPassword) {
             return {ErrorCodes::BadValue, "Use of SCRAM-SHA-256 requires undigested passwords"};
         }
-        const auto swPwd = saslPrep(args.password);
+        const auto swPwd = icuSaslPrep(args.password);
         if (!swPwd.isOK()) {
             return swPwd.getStatus();
         }
@@ -1981,7 +1981,7 @@ public:
         uassertStatusOK(status);
 
         // From here on, we always want to invalidate the user cache before returning.
-        auto invalidateGuard = MakeGuard([&] {
+        auto invalidateGuard = makeGuard([&] {
             try {
                 authzManager->invalidateUserCache(opCtx);
             } catch (const DBException& e) {
@@ -2102,7 +2102,7 @@ public:
 
         auto lk = uassertStatusOK(requireWritableAuthSchema28SCRAM(opCtx, authzManager));
         // From here on, we always want to invalidate the user cache before returning.
-        auto invalidateGuard = MakeGuard([&] {
+        auto invalidateGuard = makeGuard([&] {
             try {
                 authzManager->invalidateUserCache(opCtx);
             } catch (const DBException& e) {
@@ -2712,7 +2712,7 @@ public:
 
         auto lk = uassertStatusOK(requireWritableAuthSchema28SCRAM(opCtx, authzManager));
         // From here on, we always want to invalidate the user cache before returning.
-        auto invalidateGuard = MakeGuard([&] {
+        auto invalidateGuard = makeGuard([&] {
             try {
                 authzManager->invalidateUserCache(opCtx);
             } catch (const DBException& e) {

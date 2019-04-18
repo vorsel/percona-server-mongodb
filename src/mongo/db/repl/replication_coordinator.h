@@ -73,7 +73,6 @@ class ReadConcernArgs;
 class ReplSetConfig;
 class ReplSetHeartbeatArgsV1;
 class ReplSetHeartbeatResponse;
-class ReplSetHtmlSummary;
 class ReplSetRequestVotesArgs;
 class ReplSetRequestVotesResponse;
 class UpdatePositionArgs;
@@ -368,6 +367,19 @@ public:
     virtual Status waitUntilOpTimeForReadUntil(OperationContext* opCtx,
                                                const ReadConcernArgs& settings,
                                                boost::optional<Date_t> deadline) = 0;
+
+    /**
+     * Wait until the given optime is known to be majority committed.
+     *
+     * The given optime is expected to be an optime in this node's local oplog. This method cannot
+     * determine correctly whether an arbitrary optime is majority committed within a replica set.
+     * It is expected that the execution of this method is contained within the span of one user
+     * operation, and thus, should not span rollbacks.
+     *
+     * Returns whether the wait was successful. Will respect the deadline on the given
+     * OperationContext, if one has been set.
+     */
+    virtual Status awaitOpTimeCommitted(OperationContext* opCtx, OpTime opTime) = 0;
 
     /**
      * Retrieves and returns the current election id, which is a unique id that is local to
@@ -715,12 +727,6 @@ public:
     virtual bool getWriteConcernMajorityShouldJournal() = 0;
 
     /**
-     * Writes into 'output' all the information needed to generate a summary of the current
-     * replication state for use by the web interface.
-     */
-    virtual void summarizeAsHtml(ReplSetHtmlSummary* output) = 0;
-
-    /**
      * Returns the current term.
      */
     virtual long long getTerm() = 0;
@@ -775,8 +781,6 @@ public:
      */
     virtual WriteConcernOptions populateUnsetWriteConcernOptionsSyncMode(
         WriteConcernOptions wc) = 0;
-    virtual ReplSettings::IndexPrefetchConfig getIndexPrefetchConfig() const = 0;
-    virtual void setIndexPrefetchConfig(const ReplSettings::IndexPrefetchConfig cfg) = 0;
 
     virtual Status stepUpIfEligible(bool skipDryRun) = 0;
 

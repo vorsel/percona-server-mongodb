@@ -137,6 +137,7 @@ public:
     virtual Status waitUntilOpTimeForReadUntil(OperationContext* opCtx,
                                                const ReadConcernArgs& settings,
                                                boost::optional<Date_t> deadline) override;
+    virtual Status awaitOpTimeCommitted(OperationContext* opCtx, OpTime opTime);
     virtual OID getElectionId();
 
     virtual OID getMyRID() const;
@@ -237,8 +238,6 @@ public:
 
     virtual bool getWriteConcernMajorityShouldJournal();
 
-    virtual void summarizeAsHtml(ReplSetHtmlSummary* output);
-
     virtual long long getTerm();
 
     virtual Status updateTerm(OperationContext* opCtx, long long term);
@@ -254,9 +253,6 @@ public:
 
     virtual WriteConcernOptions populateUnsetWriteConcernOptionsSyncMode(
         WriteConcernOptions wc) override;
-
-    virtual ReplSettings::IndexPrefetchConfig getIndexPrefetchConfig() const override;
-    virtual void setIndexPrefetchConfig(const ReplSettings::IndexPrefetchConfig cfg) override;
 
     virtual Status stepUpIfEligible(bool skipDryRun) override;
 
@@ -293,7 +289,7 @@ public:
     virtual bool setContainsArbiter() const override;
 
 private:
-    AtomicUInt64 _snapshotNameGenerator;
+    AtomicWord<unsigned long long> _snapshotNameGenerator;
     ServiceContext* const _service;
     ReplSettings _settings;
     StorageInterface* _storage = nullptr;

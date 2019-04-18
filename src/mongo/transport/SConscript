@@ -208,7 +208,7 @@ env.CppUnitTest(
 )
 
 zlibEnv = env.Clone()
-zlibEnv.InjectThirdPartyIncludePaths(libraries=['zlib', 'snappy'])
+zlibEnv.InjectThirdPartyIncludePaths(libraries=['zlib', 'zstd', 'snappy'])
 zlibEnv.Library(
     target='message_compressor',
     source=[
@@ -217,13 +217,37 @@ zlibEnv.Library(
         'message_compressor_registry.cpp',
         'message_compressor_snappy.cpp',
         'message_compressor_zlib.cpp',
+        'message_compressor_zstd.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/util/options_parser/options_parser',
         '$BUILD_DIR/third_party/shim_snappy',
         '$BUILD_DIR/third_party/shim_zlib',
+        '$BUILD_DIR/third_party/shim_zstd',
     ]
+)
+
+env.Library(
+    target='message_compressor_options_client',
+    source=[
+        env.Idlc('message_compressor_options_client.idl')[0],
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        'message_compressor',
+    ],
+)
+
+env.Library(
+    target='message_compressor_options_server',
+    source=[
+        env.Idlc('message_compressor_options_server.idl')[0],
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        'message_compressor',
+    ],
 )
 
 env.CppUnitTest(
@@ -234,6 +258,7 @@ env.CppUnitTest(
     ],
     LIBDEPS=[
         'message_compressor',
+        'message_compressor_options_server',
     ]
 )
 

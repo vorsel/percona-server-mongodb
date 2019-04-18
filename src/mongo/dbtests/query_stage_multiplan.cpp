@@ -62,7 +62,7 @@ namespace mongo {
 const std::unique_ptr<ClockSource> clockSource = stdx::make_unique<ClockSourceMock>();
 
 // How we access the external setParameter testing bool.
-extern AtomicBool internalQueryForceIntersectionPlans;
+extern AtomicWord<bool> internalQueryForceIntersectionPlans;
 
 namespace {
 
@@ -137,7 +137,7 @@ unique_ptr<PlanStage> getIxScanPlan(OperationContext* opCtx,
                                     const Collection* coll,
                                     WorkingSet* sharedWs,
                                     int desiredFooValue) {
-    std::vector<IndexDescriptor*> indexes;
+    std::vector<const IndexDescriptor*> indexes;
     coll->getIndexCatalog()->findIndexesByKeyPattern(opCtx, BSON("foo" << 1), false, &indexes);
     ASSERT_EQ(indexes.size(), 1U);
 

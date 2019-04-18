@@ -207,7 +207,7 @@ private:
             return;
         }
 
-        IndexDescriptor* desc = collection->getIndexCatalog()->findIndexByName(opCtx, name);
+        const IndexDescriptor* desc = collection->getIndexCatalog()->findIndexByName(opCtx, name);
         if (!desc) {
             LOG(1) << "index not found (index build in progress? index dropped?), skipping "
                    << "ttl job for: " << idx;
@@ -253,14 +253,14 @@ private:
         auto canonicalQuery = CanonicalQuery::canonicalize(opCtx, std::move(qr));
         invariant(canonicalQuery.getStatus());
 
-        DeleteStageParams params;
-        params.isMulti = true;
-        params.canonicalQuery = canonicalQuery.getValue().get();
+        auto params = std::make_unique<DeleteStageParams>();
+        params->isMulti = true;
+        params->canonicalQuery = canonicalQuery.getValue().get();
 
         auto exec =
             InternalPlanner::deleteWithIndexScan(opCtx,
                                                  collection,
-                                                 params,
+                                                 std::move(params),
                                                  desc,
                                                  startKey,
                                                  endKey,

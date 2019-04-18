@@ -67,6 +67,7 @@ functions:
         dsi: ${dsi_rev}
         enterprise: ${enterprise_rev}
         linkbench: ${linkbench_rev}
+        genny: ${genny_rev}
         workloads: ${workloads_rev}
         wtdevelop: ${wtdevelop_rev}
 
@@ -102,7 +103,7 @@ functions:
         file: src/compile_expansions.yml
     - command: shell.exec
       params:
-        working_dir: src/src/mongo/gotools
+        working_dir: src/src/mongo/gotools/src/github.com/mongodb/mongo-tools
         script: |
           set -o verbose
           set -o errexit
@@ -110,16 +111,17 @@ functions:
           if [ "Windows_NT" = "$OS" ]; then
             set -o igncr
           fi;
-          sed -i.bak "s/built-without-version-string/$(git describe)/" common/options/options.go
-          sed -i.bak "s/built-without-git-spec/$(git rev-parse HEAD)/" common/options/options.go
-          . ./${set_tools_gopath|set_gopath.sh}
+          # set_goenv provides set_goenv(), print_ldflags() and print_tags() used below
+          . ./set_goenv.sh
+          GOROOT="" set_goenv || exit
+          go version
           build_tools="bsondump mongostat mongofiles mongoexport mongoimport mongorestore mongodump mongotop"
           if [ "${build_mongoreplay}" = "true" ]; then
-            build_tools="$build_tools mongoreplay"
+              build_tools="$build_tools mongoreplay"
           fi
           for i in $build_tools; do
-            ${gorootvars} go build ${tooltags|} -o "../../mongo-tools/$i${exe|}" $i/main/$i.go
-            "../../mongo-tools/$i${exe|}" --version
+              go build -ldflags "$(print_ldflags)" ${args} -tags "$(print_tags ${tooltags})" -o "../../../../../../mongo-tools/$i${exe|}" $i/main/$i.go
+              "../../../../../../mongo-tools/$i${exe|}" --version
           done
     - command: shell.exec
       params:
@@ -201,6 +203,7 @@ functions:
           workloads_dir: ../src/workloads/workloads
           ycsb_dir: ../src/YCSB/YCSB
           linkbench_dir: ../src/linkbench/linkbench
+          genny_dir: ../src/genny/genny
           authentication: ${authentication}
           EOF
 
@@ -348,6 +351,17 @@ tasks:
     - func: "prepare environment"
       vars:
         test: "genny_workloads"
+        authentication: disabled
+    - func: "deploy cluster"
+    - func: "run test"
+    - func: "analyze"
+
+- name: big_update
+  priority: 5
+  commands:
+    - func: "prepare environment"
+      vars:
+        test: "big_update"
         authentication: disabled
     - func: "deploy cluster"
     - func: "run test"
@@ -532,6 +546,17 @@ tasks:
     - func: "run test"
     - func: "analyze"
 
+- name: mongos_large_catalog_workloads
+  priority: 5
+  commands:
+    - func: "prepare environment"
+      vars:
+        test: "mongos_large_catalog"
+        authentication: disabled
+    - func: "deploy cluster"
+    - func: "run test"
+    - func: "analyze"
+
 - name: move_chunk_workloads
   priority: 5
   commands:
@@ -642,6 +667,11 @@ modules:
   repo: git@github.com:10gen/dsi.git
   prefix: dsi
   branch: master
+ 
+- name: genny
+  repo: git@github.com:10gen/genny.git
+  prefix: genny
+  branch: master
 
 - name: workloads
   repo: git@github.com:10gen/workloads.git
@@ -681,7 +711,6 @@ buildvariants:
       -j$(grep -c ^processor /proc/cpuinfo)
       --release
       --variables-files=etc/scons/mongodbtoolchain_gcc.vars
-    gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
     platform: linux
     project_dir: &project_dir dsi
     tooltags: ""
@@ -727,6 +756,7 @@ buildvariants:
   batchtime: 1440 # 24 hours
   modules: &modules
     - dsi
+    - genny
     - workloads
     - linkbench
   expansions:
@@ -759,6 +789,7 @@ buildvariants:
     - name: linkbench
     - name: tpcc
     - name: genny_workloads
+    - name: big_update
 
 - name: linux-standalone
   display_name: Linux Standalone
@@ -788,6 +819,7 @@ buildvariants:
     - name: bestbuy_agg
     - name: bestbuy_agg_out
     - name: bestbuy_query
+    - name: big_update
 
 - name: linux-standalone-audit
   display_name: Linux Standalone Audit
@@ -837,6 +869,7 @@ buildvariants:
     - name: smoke_test
     - name: industry_benchmarks_wmajority
     - name: mongos_workloads
+    - name: mongos_large_catalog_workloads
     - name: change_streams_throughput
     - name: change_streams_latency
     - name: change_streams_multi_mongos
@@ -865,8 +898,10 @@ buildvariants:
     - name: change_streams_throughput
     - name: industry_benchmarks
     - name: industry_benchmarks_wmajority
+    - name: linkbench
     - name: mixed_workloads
     - name: mongos_workloads
+    - name: mongos_large_catalog_workloads
     - name: move_chunk_workloads
     - name: move_chunk_waiting_workloads
     - name: retryable_writes_workloads
@@ -911,6 +946,7 @@ buildvariants:
     - name: secondary_reads
     - name: tpcc
     - name: linkbench
+    - name: big_update
 
 - name: linux-3-node-replSet-initialsync
   display_name: Linux 3-Node ReplSet Initial Sync

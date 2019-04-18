@@ -122,6 +122,7 @@ public:
                                        boost::optional<Date_t>) override;
 
     Status waitUntilOpTimeForRead(OperationContext*, const repl::ReadConcernArgs&) override;
+    Status awaitOpTimeCommitted(OperationContext* opCtx, repl::OpTime opTime) override;
 
     OID getElectionId() override;
 
@@ -205,8 +206,6 @@ public:
 
     bool getWriteConcernMajorityShouldJournal() override;
 
-    void summarizeAsHtml(repl::ReplSetHtmlSummary*) override;
-
     void dropAllSnapshots() override;
 
     long long getTerm() override;
@@ -222,9 +221,6 @@ public:
     void appendConnectionStats(executor::ConnectionPoolStats* stats) const override;
 
     size_t getNumUncommittedSnapshots() override;
-
-    repl::ReplSettings::IndexPrefetchConfig getIndexPrefetchConfig() const override;
-    void setIndexPrefetchConfig(const repl::ReplSettings::IndexPrefetchConfig) override;
 
     Status stepUpIfEligible(bool skipDryRun) override;
 

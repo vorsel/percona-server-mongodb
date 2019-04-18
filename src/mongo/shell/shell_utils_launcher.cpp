@@ -62,6 +62,7 @@
 
 #include "mongo/client/dbclient_connection.h"
 #include "mongo/scripting/engine.h"
+#include "mongo/shell/shell_options.h"
 #include "mongo/shell/shell_utils.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/destructor_guard.h"
@@ -337,12 +338,10 @@ ProgramRunner::ProgramRunner(const BSONObj& args, const BSONObj& env, bool isMon
 // we explicitly override them.
 #ifdef _WIN32
     wchar_t* processEnv = GetEnvironmentStringsW();
-    ON_BLOCK_EXIT(
-        [](wchar_t* toFree) {
-            if (toFree)
-                FreeEnvironmentStringsW(toFree);
-        },
-        processEnv);
+    ON_BLOCK_EXIT([processEnv] {
+        if (processEnv)
+            FreeEnvironmentStringsW(processEnv);
+    });
 
     // Windows' GetEnvironmentStringsW returns a NULL terminated array of NULL separated
     // <key>=<value> pairs.
@@ -486,7 +485,18 @@ boost::filesystem::path ProgramRunner::findProgram(const string& prog) {
     // (e.g., mongorestore-2.4) or just <utility>. For windows, the appropriate extension
     // needs to be appended.
     //
-    if (p.extension() != ".exe") {
+
+    auto isExtensionValid = [](std::string extension) {
+        for (auto c : extension) {
+            if (std::isdigit(c)) {
+                return false;
+            }
+        }
+
+        return true;
+    };
+
+    if (!p.has_extension() || !isExtensionValid(p.extension().string())) {
         p = prog + ".exe";
     }
 #endif
@@ -776,7 +786,7 @@ BSONObj WaitProgram(const BSONObj& a, void* data) {
 // an array with all commandline tokens. The Object may have a field named "env" which contains an
 // object of Key Value pairs which will be loaded into the environment of the spawned process.
 BSONObj StartMongoProgram(const BSONObj& a, void* data) {
-    _nokillop = true;
+    shellGlobalParams.nokillop = true;
     BSONObj args = a;
     BSONObj env{};
     BSONElement firstElement = args.firstElement();
@@ -947,7 +957,7 @@ inline void kill_wrapper(ProcessId pid, int sig, int port, const BSONObj& opt) {
         return;
     }
 
-    ON_BLOCK_EXIT(CloseHandle, event);
+    ON_BLOCK_EXIT([&] { CloseHandle(event); });
 
     bool result = SetEvent(event);
     if (!result) {

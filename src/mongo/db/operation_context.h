@@ -45,6 +45,7 @@
 #include "mongo/platform/atomic_word.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/mutex.h"
+#include "mongo/transport/session.h"
 #include "mongo/util/decorable.h"
 #include "mongo/util/interruptible.h"
 #include "mongo/util/time_support.h"
@@ -78,8 +79,7 @@ class OperationContext : public Interruptible, public Decorable<OperationContext
 
 public:
     OperationContext(Client* client, unsigned int opId);
-
-    virtual ~OperationContext() = default;
+    virtual ~OperationContext();
 
     /**
      * Interface for durability.  Caller DOES NOT own pointer.
@@ -163,7 +163,7 @@ public:
     /**
      * Returns the session ID associated with this operation, if there is one.
      */
-    boost::optional<LogicalSessionId> getLogicalSessionId() const {
+    const boost::optional<LogicalSessionId>& getLogicalSessionId() const {
         return _lsid;
     }
 
@@ -406,7 +406,9 @@ private:
 
     friend class WriteUnitOfWork;
     friend class repl::UnreplicatedWritesBlock;
+
     Client* const _client;
+
     const unsigned int _opId;
 
     boost::optional<LogicalSessionId> _lsid;
@@ -446,8 +448,8 @@ private:
 
     WriteConcernOptions _writeConcern;
 
-    Date_t _deadline =
-        Date_t::max();  // The timepoint at which this operation exceeds its time limit.
+    // The timepoint at which this operation exceeds its time limit.
+    Date_t _deadline = Date_t::max();
 
     ErrorCodes::Error _timeoutError = ErrorCodes::ExceededTimeLimit;
     bool _ignoreInterrupts = false;
@@ -464,6 +466,35 @@ private:
     Timer _elapsedTime;
 
     bool _writesAreReplicated = true;
+};
+
+/**
+ * RAII-style class to temporarily swap the operation context associated with the client.
+ *
+ * Use this class to bind a new operation context to a client for the duration of the
+ * AlternativeOpCtx's lifetime and restore the prior opCtx at the end of the block.
+ */
+class AlternativeOpCtx {
+public:
+    explicit AlternativeOpCtx(mongo::OperationContext* originalOpCtx)
+        : _client(originalOpCtx->getClient()), _originalOpCtx(originalOpCtx) {
+        _client->resetOperationContext();
+        _alternateOpCtx = _client->makeOperationContext();
+    }
+
+    ~AlternativeOpCtx() {
+        _alternateOpCtx.reset();
+        _client->setOperationContext(_originalOpCtx);
+    }
+
+    mongo::OperationContext* getOperationContext() {
+        return _alternateOpCtx.get();
+    }
+
+private:
+    Client* _client = nullptr;
+    mongo::OperationContext* _originalOpCtx = nullptr;
+    ServiceContext::UniqueOperationContext _alternateOpCtx;
 };
 
 namespace repl {

@@ -72,16 +72,6 @@ public:
         _recoveryTimestamp = recoveryTimestamp;
     }
 
-    bool supportsRecoverToStableTimestamp(ServiceContext* serviceCtx) const override {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
-        return _supportsRecoverToStableTimestamp;
-    }
-
-    void setSupportsRecoverToStableTimestamp(bool supports) {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
-        _supportsRecoverToStableTimestamp = supports;
-    }
-
     bool supportsRecoveryTimestamp(ServiceContext* serviceCtx) const override {
         stdx::lock_guard<stdx::mutex> lock(_mutex);
         return _supportsRecoveryTimestamp;
@@ -92,11 +82,21 @@ public:
         _supportsRecoveryTimestamp = supports;
     }
 
+    void setPointInTimeReadTimestamp(Timestamp pointInTimeReadTimestamp) {
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        _pointInTimeReadTimestamp = pointInTimeReadTimestamp;
+    }
+
+    Timestamp getPointInTimeReadTimestamp(OperationContext* opCtx) const override {
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        return _pointInTimeReadTimestamp;
+    }
+
 private:
     mutable stdx::mutex _mutex;
     Timestamp _initialDataTimestamp = Timestamp::min();
     boost::optional<Timestamp> _recoveryTimestamp = boost::none;
-    bool _supportsRecoverToStableTimestamp = true;
+    Timestamp _pointInTimeReadTimestamp = {};
     bool _supportsRecoveryTimestamp = true;
 };
 
@@ -105,6 +105,7 @@ public:
     repl::OpTime onDropCollection(OperationContext* opCtx,
                                   const NamespaceString& collectionName,
                                   OptionalCollectionUUID uuid,
+                                  std::uint64_t numRecords,
                                   const CollectionDropType dropType) override {
         // If the oplog is not disabled for this namespace, then we need to reserve an op time for
         // the drop.
@@ -124,11 +125,11 @@ protected:
     }
 
     StorageInterface* getStorageInterface() {
-        return _storageInterface.get();
+        return _storageInterface;
     }
 
     StorageInterfaceRecovery* getStorageInterfaceRecovery() {
-        return _storageInterface.get();
+        return _storageInterface;
     }
 
     ReplicationConsistencyMarkers* getConsistencyMarkers() {
@@ -155,11 +156,14 @@ private:
     void setUp() override {
         ServiceContextMongoDTest::setUp();
 
+        auto service = getServiceContext();
+        StorageInterface::set(service, stdx::make_unique<StorageInterfaceRecovery>());
+        _storageInterface = static_cast<StorageInterfaceRecovery*>(StorageInterface::get(service));
+
         _createOpCtx();
-        _storageInterface = stdx::make_unique<StorageInterfaceRecovery>();
         _consistencyMarkers = stdx::make_unique<ReplicationConsistencyMarkersMock>();
 
-        auto service = getServiceContext();
+
         ReplicationCoordinator::set(
             service, stdx::make_unique<ReplicationCoordinatorMock>(service, getStorageInterface()));
 
@@ -175,13 +179,12 @@ private:
         observerRegistry->addObserver(std::make_unique<ReplicationRecoveryTestObObserver>());
 
         repl::DropPendingCollectionReaper::set(
-            service, stdx::make_unique<repl::DropPendingCollectionReaper>(_storageInterface.get()));
+            service, stdx::make_unique<repl::DropPendingCollectionReaper>(_storageInterface));
     }
 
     void tearDown() override {
         _opCtx.reset(nullptr);
         _consistencyMarkers.reset();
-        _storageInterface.reset();
 
         ServiceContextMongoDTest::tearDown();
     }
@@ -191,7 +194,7 @@ private:
     }
 
     ServiceContext::UniqueOperationContext _opCtx;
-    std::unique_ptr<StorageInterfaceRecovery> _storageInterface;
+    StorageInterfaceRecovery* _storageInterface;
     std::unique_ptr<ReplicationConsistencyMarkersMock> _consistencyMarkers;
 };
 
@@ -541,14 +544,14 @@ void ReplicationRecoveryTest::testRecoveryAppliesDocumentsWhenAppliedThroughIsBe
 }
 
 TEST_F(ReplicationRecoveryTest, RecoveryAppliesDocumentsWhenAppliedThroughIsBehind) {
-    getStorageInterfaceRecovery()->setSupportsRecoverToStableTimestamp(true);
+    getStorageInterfaceRecovery()->setSupportsRecoveryTimestamp(true);
     bool hasStableTimestamp = false;
     bool hasStableCheckpoint = false;
     testRecoveryAppliesDocumentsWhenAppliedThroughIsBehind(hasStableTimestamp, hasStableCheckpoint);
 }
 
 TEST_F(ReplicationRecoveryTest, RecoveryAppliesDocumentsWhenAppliedThroughIsBehindNoRTT) {
-    getStorageInterfaceRecovery()->setSupportsRecoverToStableTimestamp(false);
+    getStorageInterfaceRecovery()->setSupportsRecoveryTimestamp(false);
     bool hasStableTimestamp = false;
     bool hasStableCheckpoint = false;
     testRecoveryAppliesDocumentsWhenAppliedThroughIsBehind(hasStableTimestamp, hasStableCheckpoint);
@@ -883,7 +886,8 @@ TEST_F(ReplicationRecoveryTest, PrepareTransactionOplogEntryCorrectlyUpdatesConf
     auto opCtx = getOperationContext();
 
     const auto appliedThrough = OpTime(Timestamp(1, 1), 1);
-    getStorageInterfaceRecovery()->setSupportsRecoverToStableTimestamp(true);
+    getStorageInterfaceRecovery()->setPointInTimeReadTimestamp(Timestamp(1, 0));
+    getStorageInterfaceRecovery()->setSupportsRecoveryTimestamp(true);
     getStorageInterfaceRecovery()->setRecoveryTimestamp(appliedThrough.getTimestamp());
     getConsistencyMarkers()->setAppliedThrough(opCtx, appliedThrough);
     _setUpOplog(opCtx, getStorageInterface(), {1});
@@ -931,7 +935,7 @@ TEST_F(ReplicationRecoveryTest, AbortTransactionOplogEntryCorrectlyUpdatesConfig
     auto opCtx = getOperationContext();
 
     const auto appliedThrough = OpTime(Timestamp(1, 1), 1);
-    getStorageInterfaceRecovery()->setSupportsRecoverToStableTimestamp(true);
+    getStorageInterfaceRecovery()->setSupportsRecoveryTimestamp(true);
     getStorageInterfaceRecovery()->setRecoveryTimestamp(appliedThrough.getTimestamp());
     getConsistencyMarkers()->setAppliedThrough(opCtx, appliedThrough);
     _setUpOplog(opCtx, getStorageInterface(), {1});
@@ -994,7 +998,7 @@ DEATH_TEST_F(ReplicationRecoveryTest,
     auto opCtx = getOperationContext();
 
     const auto appliedThrough = OpTime(Timestamp(1, 1), 1);
-    getStorageInterfaceRecovery()->setSupportsRecoverToStableTimestamp(true);
+    getStorageInterfaceRecovery()->setSupportsRecoveryTimestamp(true);
     getStorageInterfaceRecovery()->setRecoveryTimestamp(appliedThrough.getTimestamp());
     getConsistencyMarkers()->setAppliedThrough(opCtx, appliedThrough);
     _setUpOplog(opCtx, getStorageInterface(), {1});
@@ -1028,7 +1032,7 @@ TEST_F(ReplicationRecoveryTest, CommitTransactionOplogEntryCorrectlyUpdatesConfi
     auto opCtx = getOperationContext();
 
     const auto appliedThrough = OpTime(Timestamp(1, 1), 1);
-    getStorageInterfaceRecovery()->setSupportsRecoverToStableTimestamp(true);
+    getStorageInterfaceRecovery()->setSupportsRecoveryTimestamp(true);
     getStorageInterfaceRecovery()->setRecoveryTimestamp(appliedThrough.getTimestamp());
     getConsistencyMarkers()->setAppliedThrough(opCtx, appliedThrough);
     _setUpOplog(opCtx, getStorageInterface(), {1});
@@ -1105,7 +1109,7 @@ TEST_F(ReplicationRecoveryTest,
     // when updating the transactions table during startup recovery when the table already reflects
     // the committed transaction.
     const auto appliedThrough = OpTime(Timestamp(2, 2), 1);
-    getStorageInterfaceRecovery()->setSupportsRecoverToStableTimestamp(true);
+    getStorageInterfaceRecovery()->setSupportsRecoveryTimestamp(true);
     getStorageInterfaceRecovery()->setRecoveryTimestamp(appliedThrough.getTimestamp());
     getConsistencyMarkers()->setAppliedThrough(opCtx, appliedThrough);
     _setUpOplog(opCtx, getStorageInterface(), {1});

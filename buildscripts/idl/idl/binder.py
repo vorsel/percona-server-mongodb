@@ -518,6 +518,54 @@ def _normalize_method_name(cpp_type_name, cpp_method_name):
     return cpp_method_name
 
 
+def _bind_expression(expr, allow_literal_string=True):
+    # type: (syntax.Expression, bool) -> ast.Expression
+    """Bind an expression."""
+    node = ast.Expression(expr.file_name, expr.line, expr.column)
+
+    if expr.literal is None:
+        node.expr = expr.expr
+        node.validate_constexpr = expr.is_constexpr
+        node.export = expr.is_constexpr
+        return node
+
+    node.validate_constexpr = False
+    node.export = True
+
+    # bool
+    if (expr.literal == "true") or (expr.literal == "false"):
+        node.expr = expr.literal
+        return node
+
+    # int32_t
+    try:
+        intval = int(expr.literal)
+        if (intval >= -0x80000000) and (intval <= 0x7FFFFFFF):
+            node.expr = repr(intval)
+            return node
+    except ValueError:
+        pass
+
+    # float
+    try:
+        node.expr = repr(float(expr.literal))
+        return node
+    except ValueError:
+        pass
+
+    # std::string
+    if allow_literal_string:
+        strval = expr.literal
+        for i in ['\\', '"', "'"]:
+            if i in strval:
+                strval = strval.replace(i, '\\' + i)
+        node.expr = '"' + strval + '"'
+        return node
+
+    # Unable to bind expression.
+    return None
+
+
 def _bind_validator(ctxt, validator):
     # type: (errors.ParserContext, syntax.Validator) -> ast.Validator
     """Bind a validator from the idl.syntax tree."""
@@ -526,21 +574,17 @@ def _bind_validator(ctxt, validator):
 
     # Parse syntax value as numeric if possible.
     for pred in ["gt", "lt", "gte", "lte"]:
-        val = getattr(validator, pred)
-        if val is None:
+        src = getattr(validator, pred)
+        if src is None:
             continue
 
-        try:
-            intval = int(val)
-            if (intval < -0x80000000) or (intval > 0x7FFFFFFF):
-                raise ValueError('IDL ints are limited to int32_t')
-            setattr(ast_validator, pred, intval)
-        except ValueError:
-            try:
-                setattr(ast_validator, pred, float(val))
-            except ValueError:
-                ctxt.add_value_not_numeric_error(ast_validator, pred, val)
-                return None
+        dest = _bind_expression(src, allow_literal_string=False)
+        if dest is None:
+            # This only happens if we have a non-numeric literal.
+            ctxt.add_value_not_numeric_error(ast_validator, pred, src)
+            return None
+
+        setattr(ast_validator, pred, dest)
 
     ast_validator.callback = validator.callback
     return ast_validator
@@ -840,44 +884,73 @@ def _bind_enum(ctxt, idl_enum):
     return ast_enum
 
 
-def _bind_server_parameter(ctxt, param):
-    # type: (errors.ParserContext, syntax.ServerParameter) -> ast.ServerParameter
-    # pylint: disable=too-many-branches
-    """Bind a serverParameter setting."""
-    ast_param = ast.ServerParameter(param.file_name, param.line, param.column)
-    ast_param.name = param.name
-    ast_param.description = param.description
+def _bind_server_parameter_class(ctxt, ast_param, param):
+    # type: (errors.ParserContext, ast.ServerParameter, syntax.ServerParameter) -> ast.ServerParameter
+    """Bind and validate ServerParameter attributes specific to specialized ServerParameters."""
+
+    # Fields specific to bound and unbound standard params.
+    for field in ['cpp_vartype', 'cpp_varname', 'on_update', 'validator']:
+        if getattr(param, field) is not None:
+            ctxt.add_server_parameter_invalid_attr(param, field, 'specialized')
+            return None
+
+    # Fields specific to specialized stroage.
+    cls = param.cpp_class
+
+    if param.default is not None:
+        if cls.data is None:
+            ctxt.add_server_parameter_required_attr(param, 'data', 'specialized',
+                                                    dependant='default')
+            return None
+
+        if not param.default.is_constexpr:
+            ctxt.add_server_parameter_invalid_attr(param, 'default.is_constexpr=false',
+                                                   'specialized')
+            return None
+
+        ast_param.default = _bind_expression(param.default)
+        if ast_param.default is None:
+            return None
+
+    ast_param.cpp_class = ast.ServerParameterClass(cls.file_name, cls.line, cls.column)
+    ast_param.cpp_class.name = cls.name
+    ast_param.cpp_class.data = cls.data
+    ast_param.cpp_class.override_ctor = cls.override_ctor
+    ast_param.cpp_class.override_set = cls.override_set
+
+    return ast_param
+
+
+def _bind_server_parameter_with_storage(ctxt, ast_param, param):
+    # type: (errors.ParserContext, ast.ServerParameter, syntax.ServerParameter) -> ast.ServerParameter
+    """Bind and validate ServerParameter attributes specific to bound ServerParameters."""
+
+    # Fields specific to specialized and unbound standard params.
+    for field in ['cpp_class']:
+        if getattr(param, field) is not None:
+            ctxt.add_server_parameter_invalid_attr(param, field, 'bound')
+            return None
+
     ast_param.cpp_vartype = param.cpp_vartype
     ast_param.cpp_varname = param.cpp_varname
-    ast_param.condition = _bind_condition(param.condition)
-    ast_param.deprecated_name = param.deprecated_name
+    ast_param.on_update = param.on_update
 
-    custom_required_fields = ["from_string", "append_bson"]
-    standard_optional_fields = ["default", "on_update", "validator"]
+    if param.default:
+        ast_param.default = _bind_expression(param.default)
+        if ast_param.default is None:
+            return None
 
-    if param.cpp_varname is None:
-        # Custom SCP, uses callbacks.
-        ast_param.append_bson = param.append_bson
-        ast_param.from_bson = param.from_bson
-        ast_param.from_string = param.from_string
+    if param.validator:
+        ast_param.validator = _bind_validator(ctxt, param.validator)
+        if ast_param.validator is None:
+            return None
 
-        # Check for required callbacks.
-        for req in custom_required_fields:
-            if getattr(param, req) is None:
-                ctxt.add_missing_server_parameter_method(param, req)
+    return ast_param
 
-        # Check for disallowed declared-storage fields.
-        for conflict in standard_optional_fields:
-            if getattr(param, conflict) is not None:
-                ctxt.add_server_parameter_attr_without_storage(param, conflict)
-    else:
-        # Standard SCP, allows optional fields, but not custom callbacks.
-        for conflict in custom_required_fields + ["from_bson"]:
-            if getattr(param, conflict) is not None:
-                ctxt.add_server_parameter_attr_with_storage(param, conflict)
 
-        ast_param.default = param.default
-        ast_param.on_update = param.on_update
+def _bind_server_parameter_set_at(ctxt, param):
+    # type: (errors.ParserContext, syntax.ServerParameter) -> unicode
+    """Translate set_at options to C++ enum value."""
 
     set_at = 0
     for psa in param.set_at:
@@ -890,21 +963,39 @@ def _bind_server_parameter(ctxt, param):
             return None
 
     if set_at == 1:
-        ast_param.set_at = "ServerParameterType::kStartupOnly"
+        return "ServerParameterType::kStartupOnly"
     elif set_at == 2:
-        ast_param.set_at = "ServerParameterType::kRuntimeOnly"
+        return "ServerParameterType::kRuntimeOnly"
     elif set_at == 3:
-        ast_param.set_at = "ServerParameterType::kStartupAndRuntime"
+        return "ServerParameterType::kStartupAndRuntime"
     else:
         # Can't happen based on above logic.
         ctxt.add_bad_setat_specifier(param, ','.join(param.set_at))
+        return None
 
-    if param.validator is not None:
-        ast_param.validator = _bind_validator(ctxt, param.validator)
-        if ast_param.validator is None:
-            return None
 
-    return ast_param
+def _bind_server_parameter(ctxt, param):
+    # type: (errors.ParserContext, syntax.ServerParameter) -> ast.ServerParameter
+    """Bind a serverParameter setting."""
+    ast_param = ast.ServerParameter(param.file_name, param.line, param.column)
+    ast_param.name = param.name
+    ast_param.description = param.description
+    ast_param.condition = _bind_condition(param.condition)
+    ast_param.redact = param.redact
+    ast_param.test_only = param.test_only
+    ast_param.deprecated_name = param.deprecated_name
+
+    ast_param.set_at = _bind_server_parameter_set_at(ctxt, param)
+    if ast_param.set_at is None:
+        return None
+
+    if param.cpp_class:
+        return _bind_server_parameter_class(ctxt, ast_param, param)
+    elif param.cpp_varname:
+        return _bind_server_parameter_with_storage(ctxt, ast_param, param)
+    else:
+        ctxt.add_server_parameter_required_attr(param, 'cpp_varname', 'server_parameter')
+        return None
 
 
 def _is_invalid_config_short_name(name):
@@ -989,8 +1080,13 @@ def _bind_config_option(ctxt, globals_spec, option):
     node.requires = option.requires
     node.conflicts = option.conflicts
     node.hidden = option.hidden
-    node.default = option.default
-    node.implicit = option.implicit
+    node.redact = option.redact
+
+    if option.default:
+        node.default = _bind_expression(option.default)
+
+    if option.implicit:
+        node.implicit = _bind_expression(option.implicit)
 
     # Commonly repeated attributes section and source may be set in globals.
     if globals_spec and globals_spec.configs:

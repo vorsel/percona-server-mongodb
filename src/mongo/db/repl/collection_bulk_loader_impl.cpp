@@ -37,8 +37,7 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/multi_index_block.h"
-#include "mongo/db/catalog/multi_index_block_impl.h"
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -62,10 +61,9 @@ CollectionBulkLoaderImpl::CollectionBulkLoaderImpl(ServiceContext::UniqueClient&
       _opCtx{std::move(opCtx)},
       _autoColl{std::move(autoColl)},
       _nss{_autoColl->getCollection()->ns()},
-      _idIndexBlock(
-          std::make_unique<MultiIndexBlockImpl>(_opCtx.get(), _autoColl->getCollection())),
+      _idIndexBlock(std::make_unique<MultiIndexBlock>(_opCtx.get(), _autoColl->getCollection())),
       _secondaryIndexesBlock(
-          std::make_unique<MultiIndexBlockImpl>(_opCtx.get(), _autoColl->getCollection())),
+          std::make_unique<MultiIndexBlock>(_opCtx.get(), _autoColl->getCollection())),
       _idIndexSpec(idIndexSpec.getOwned()) {
 
     invariant(_opCtx);
@@ -83,9 +81,9 @@ Status CollectionBulkLoaderImpl::init(const std::vector<BSONObj>& secondaryIndex
             // All writes in CollectionBulkLoaderImpl should be unreplicated.
             // The opCtx is accessed indirectly through _secondaryIndexesBlock.
             UnreplicatedWritesBlock uwb(_opCtx.get());
-            std::vector<BSONObj> specs(secondaryIndexSpecs);
             // This enforces the buildIndexes setting in the replica set configuration.
-            _secondaryIndexesBlock->removeExistingIndexes(&specs);
+            auto indexCatalog = coll->getIndexCatalog();
+            auto specs = indexCatalog->removeExistingIndexes(_opCtx.get(), secondaryIndexSpecs);
             if (specs.size()) {
                 _secondaryIndexesBlock->ignoreUniqueConstraint();
                 auto status = _secondaryIndexesBlock->init(specs).getStatus();
@@ -111,7 +109,7 @@ Status CollectionBulkLoaderImpl::init(const std::vector<BSONObj>& secondaryIndex
 Status CollectionBulkLoaderImpl::insertDocuments(const std::vector<BSONObj>::const_iterator begin,
                                                  const std::vector<BSONObj>::const_iterator end) {
     int count = 0;
-    return _runTaskReleaseResourcesOnFailure([&]() -> Status {
+    return _runTaskReleaseResourcesOnFailure([&] {
         UnreplicatedWritesBlock uwb(_opCtx.get());
 
         for (auto iter = begin; iter != end; ++iter) {
@@ -156,7 +154,7 @@ Status CollectionBulkLoaderImpl::insertDocuments(const std::vector<BSONObj>::con
 }
 
 Status CollectionBulkLoaderImpl::commit() {
-    return _runTaskReleaseResourcesOnFailure([this]() -> Status {
+    return _runTaskReleaseResourcesOnFailure([&] {
         _stats.startBuildingIndexes = Date_t::now();
         LOG(2) << "Creating indexes for ns: " << _nss.ns();
         UnreplicatedWritesBlock uwb(_opCtx.get());
@@ -249,17 +247,13 @@ void CollectionBulkLoaderImpl::_releaseResources() {
 }
 
 template <typename F>
-Status CollectionBulkLoaderImpl::_runTaskReleaseResourcesOnFailure(F task) noexcept {
-
+Status CollectionBulkLoaderImpl::_runTaskReleaseResourcesOnFailure(const F& task) noexcept {
     AlternativeClientRegion acr(_client);
-    ScopeGuard guard = MakeGuard(&CollectionBulkLoaderImpl::_releaseResources, this);
+    auto guard = makeGuard([this] { _releaseResources(); });
     try {
-        const auto status = [&task]() noexcept {
-            return task();
-        }
-        ();
+        const auto status = task();
         if (status.isOK()) {
-            guard.Dismiss();
+            guard.dismiss();
         }
         return status;
     } catch (...) {

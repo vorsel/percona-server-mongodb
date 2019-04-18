@@ -181,6 +181,7 @@
         },
         dropAllRolesFromDatabase: {skip: "always targets the config server"},
         dropAllUsersFromDatabase: {skip: "always targets the config server"},
+        dropConnections: {skip: "not on a user database"},
         dropDatabase: {skip: "drops the database from the cluster, changing the UUID"},
         dropIndexes: {
             sendsDbVersion: true,
@@ -224,7 +225,6 @@
         getLog: {skip: "executes locally on mongos (not sent to any remote node)"},
         getMore: {skip: "requires a previously established cursor"},
         getParameter: {skip: "executes locally on mongos (not sent to any remote node)"},
-        getPrevError: {skip: "not supported in mongos"},
         getShardMap: {skip: "executes locally on mongos (not sent to any remote node)"},
         getShardVersion: {skip: "executes locally on mongos (not sent to any remote node)"},
         getnonce: {skip: "not on a user database"},

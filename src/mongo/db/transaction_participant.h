@@ -56,11 +56,29 @@ namespace mongo {
 
 class OperationContext;
 
-extern AtomicInt32 transactionLifetimeLimitSeconds;
+extern AtomicWord<int> transactionLifetimeLimitSeconds;
 
+/**
+ * Read timestamp to be used for a speculative transaction.  For transactions with read
+ * concern level specified as 'snapshot', we will use 'kAllCommitted' which ensures a snapshot
+ * with no 'holes'; that is, it is a state of the system that could be reconstructed from
+ * the oplog.  For transactions with read concern level specified as 'local' or 'majority',
+ * we will use 'kLastApplied' which gives us the most recent snapshot.  This snapshot may
+ * reflect oplog 'holes' from writes earlier than the last applied write which have not yet
+ * completed.  Using 'kLastApplied' ensures that transactions with mode 'local' are always able to
+ * read writes from earlier transactions with mode 'local' on the same connection.
+ */
 enum class SpeculativeTransactionOpTime {
     kLastApplied,
     kAllCommitted,
+};
+
+/**
+ * Reason a transaction was terminated.
+ */
+enum class TerminationCause {
+    kCommitted,
+    kAborted,
 };
 
 /**
@@ -77,12 +95,13 @@ public:
      */
     class TxnResources {
     public:
+        enum class StashStyle { kPrimary, kSecondary, kSideTransaction };
+
         /**
          * Stashes transaction state from 'opCtx' in the newly constructed TxnResources.
          * Ephemerally holds the Client lock associated with opCtx.
          */
-        TxnResources(OperationContext* opCtx, bool keepTicket = false);
-
+        TxnResources(OperationContext* opCtx, StashStyle stashStyle);
         ~TxnResources();
 
         // Rule of 5: because we have a class-defined destructor, we need to explictly specify
@@ -106,7 +125,7 @@ public:
         /**
          * Returns the read concern arguments.
          */
-        repl::ReadConcernArgs getReadConcernArgs() const {
+        const repl::ReadConcernArgs& getReadConcernArgs() const {
             return _readConcernArgs;
         }
 
@@ -142,201 +161,24 @@ public:
 
     static const BSONObj kDeadEndSentinel;
 
-    TransactionParticipant() = default;
+    TransactionParticipant();
+    ~TransactionParticipant();
 
     /**
-     * Obtains the transaction participant from an operation context on which the session has been
-     * checked-out.
+     * Obtains the transaction participant from a session and a syntactic sugar variant, which
+     * obtains it from an operation context on which the session has been checked-out.
      */
     static TransactionParticipant* get(OperationContext* opCtx);
+    static TransactionParticipant* get(Session* session);
 
     /**
-     * This should only be used when session was obtained without checking it out and its only user
-     * should be chunk migration.
-     */
-    static TransactionParticipant* getFromNonCheckedOutSession(Session* session);
-
-    /**
-     * Kills the transaction if it is running, ensuring that it releases all resources, even if the
-     * transaction is in prepare().  Avoids writing any oplog entries or making any changes to the
-     * transaction table.  State for prepared transactions will be re-constituted at startup.
-     * Note that we don't take any active steps to prevent continued use of this
-     * TransactionParticipant after shutdown() is called, but we rely on callers to not
-     * continue using the TransactionParticipant once we are in shutdown.
-     */
-    void shutdown();
-
-    /**
-     * Transfers management of transaction resources from the OperationContext to the Session.
-     */
-    void stashTransactionResources(OperationContext* opCtx);
-
-    /**
-     * Transfers management of transaction resources from the Session to the OperationContext.
-     */
-    void unstashTransactionResources(OperationContext* opCtx, const std::string& cmdName);
-
-    /**
-     * Commits the transaction, including committing the write unit of work and updating
-     * transaction state.
+     * Blocking method, which loads the transaction state from storage if it has been marked as
+     * needing refresh.
      *
-     * Throws an exception if the transaction is prepared.
+     * In order to avoid the possibility of deadlock, this method must not be called while holding a
+     * lock.
      */
-    void commitUnpreparedTransaction(OperationContext* opCtx);
-
-    /**
-    * Commits the transaction, including committing the write unit of work and updating
-    * transaction state.
-    *
-    * Throws an exception if the transaction is not prepared or if the 'commitTimestamp' is null.
-    */
-    void commitPreparedTransaction(OperationContext* opCtx, Timestamp commitTimestamp);
-
-    /**
-     * Puts a transaction into a prepared state and returns the prepareTimestamp.
-     *
-     * On secondary, the "prepareTimestamp" will be given in the oplog.
-     */
-    Timestamp prepareTransaction(OperationContext* opCtx,
-                                 boost::optional<repl::OpTime> prepareOptime);
-
-    /**
-     * Returns whether we are in a multi-document transaction, which means we have an active
-     * transaction which has autoCommit:false and has not been committed or aborted. It is possible
-     * that the current transaction is stashed onto the stack via a `SideTransactionBlock`.
-     */
-    bool inMultiDocumentTransaction() const {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
-        return _txnState.inMultiDocumentTransaction(lk);
-    };
-
-    bool transactionIsCommitted() const {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
-        return _txnState.isCommitted(lk);
-    }
-
-    bool transactionIsAborted() const {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
-        return _txnState.isAborted(lk);
-    }
-
-    bool transactionIsPrepared() const {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
-        return _txnState.isPrepared(lk);
-    }
-
-    /**
-     * Returns true if we are in an active multi-document transaction or if the transaction has
-     * been aborted. This is used to cover the case where a transaction has been aborted, but the
-     * OperationContext state has not been cleared yet.
-     */
-    bool inActiveOrKilledMultiDocumentTransaction() const {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
-        return (_txnState.inMultiDocumentTransaction(lk) || _txnState.isAborted(lk));
-    }
-
-    /**
-     * Adds a stored operation to the list of stored operations for the current multi-document
-     * (non-autocommit) transaction.  It is illegal to add operations when no multi-document
-     * transaction is in progress.
-     */
-    void addTransactionOperation(OperationContext* opCtx, const repl::ReplOperation& operation);
-
-    /**
-     * Returns and clears the stored operations for an multi-document (non-autocommit) transaction,
-     * and marks the transaction as closed.  It is illegal to attempt to add operations to the
-     * transaction after this is called.
-     */
-    std::vector<repl::ReplOperation> endTransactionAndRetrieveOperations(OperationContext* opCtx);
-
-    const std::vector<repl::ReplOperation>& transactionOperationsForTest() {
-        return _transactionOperations;
-    }
-
-    SingleTransactionStats getSingleTransactionStats() const {
-        return _transactionMetricsObserver.getSingleTransactionStats();
-    }
-
-    repl::OpTime getSpeculativeTransactionReadOpTimeForTest() const {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
-        return _speculativeTransactionReadOpTime;
-    }
-
-    repl::OpTime getPrepareOpTime() const {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
-        return _prepareOpTime;
-    }
-
-    const Locker* getTxnResourceStashLockerForTest() const {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
-        invariant(_txnResourceStash);
-        return _txnResourceStash->locker();
-    }
-
-    /**
-     * If this session is holding stashed locks in _txnResourceStash, reports the current state of
-     * the session using the provided builder. Locks the session object's mutex while running.
-     */
-    void reportStashedState(BSONObjBuilder* builder) const;
-
-    std::string transactionInfoForLogForTest(const SingleThreadedLockStats* lockStats,
-                                             bool committed,
-                                             repl::ReadConcernArgs readConcernArgs) {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
-        TransactionState::StateFlag terminationCause =
-            committed ? TransactionState::kCommitted : TransactionState::kAborted;
-        return _transactionInfoForLog(lockStats, terminationCause, readConcernArgs);
-    }
-
-    /**
-     * If this session is not holding stashed locks in _txnResourceStash (transaction is active),
-     * reports the current state of the session using the provided builder. Locks the session
-     * object's mutex while running.
-     * If this is called from a thread other than the owner of the opCtx, that thread must be
-     * holding the client lock.
-     */
-    void reportUnstashedState(OperationContext* opCtx, BSONObjBuilder* builder) const;
-
-    /**
-     * Convenience method which creates and populates a BSONObj containing the stashed state.
-     * Returns an empty BSONObj if this session has no stashed resources.
-     */
-    BSONObj reportStashedState() const;
-
-    /**
-     * Aborts the transaction outside the transaction, releasing transaction resources.
-     *
-     * Not called with session checked out.
-     */
-    void abortArbitraryTransaction();
-
-    /**
-     * Returns whether the transaction has exceedet its expiration time.
-     */
-    bool expired() const;
-
-    /*
-    * Aborts the transaction inside the transaction, releasing transaction resources.
-    * We're inside the transaction when we have the Session checked out and 'opCtx' owns the
-    * transaction resources.
-    * Aborts the transaction and releases transaction resources when we have the Session checked
-    * out and 'opCtx' owns the transaction resources.
-     */
-    void abortActiveTransaction(OperationContext* opCtx);
-
-    /*
-     * If the transaction is prepared, stash its resources. If not, it's the same as
-     * abortActiveTransaction.
-     */
-    void abortActiveUnpreparedOrStashPreparedTransaction(OperationContext* opCtx);
-
-    void addMultikeyPathInfo(MultikeyPathInfo info) {
-        _multikeyPathInfo.push_back(std::move(info));
-    }
-
-    const std::vector<MultikeyPathInfo>& getMultikeyPathInfo() const {
-        return _multikeyPathInfo;
-    }
+    void refreshFromStorageIfNeeded();
 
     /**
      * Starts a new transaction (and if the txnNumber is newer aborts any in-progress transaction on
@@ -379,28 +221,105 @@ public:
      */
     void beginOrContinueTransactionUnconditionally(TxnNumber txnNumber);
 
-    void transitionToPreparedforTest() {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
-        _txnState.transitionTo(lk, TransactionState::kPrepared);
-    }
+    /**
+     * Transfers management of transaction resources from the OperationContext to the Session.
+     */
+    void stashTransactionResources(OperationContext* opCtx);
 
-    void transitionToAbortedforTest() {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
-        _txnState.transitionTo(lk, TransactionState::kAborted);
+    /**
+     * Transfers management of transaction resources from the Session to the OperationContext.
+     */
+    void unstashTransactionResources(OperationContext* opCtx, const std::string& cmdName);
+
+    /**
+     * Puts a transaction into a prepared state and returns the prepareTimestamp.
+     *
+     * On secondary, the "prepareTimestamp" will be given in the oplog.
+     */
+    Timestamp prepareTransaction(OperationContext* opCtx,
+                                 boost::optional<repl::OpTime> prepareOptime);
+
+    /**
+     * Commits the transaction, including committing the write unit of work and updating
+     * transaction state.
+     *
+     * Throws an exception if the transaction is prepared.
+     */
+    void commitUnpreparedTransaction(OperationContext* opCtx);
+
+    /**
+    * Commits the transaction, including committing the write unit of work and updating
+    * transaction state.
+    *
+    * Throws an exception if the transaction is not prepared or if the 'commitTimestamp' is null.
+    */
+    void commitPreparedTransaction(OperationContext* opCtx, Timestamp commitTimestamp);
+
+    /**
+     * Aborts the transaction outside the transaction, releasing transaction resources.
+     *
+     * Not called with session checked out.
+     */
+    void abortArbitraryTransaction();
+
+    /*
+    * Aborts the transaction inside the transaction, releasing transaction resources.
+    * We're inside the transaction when we have the Session checked out and 'opCtx' owns the
+    * transaction resources.
+    * Aborts the transaction and releases transaction resources when we have the Session checked
+    * out and 'opCtx' owns the transaction resources.
+     */
+    void abortActiveTransaction(OperationContext* opCtx);
+
+    /*
+     * If the transaction is prepared, stash its resources. If not, it's the same as
+     * abortActiveTransaction.
+     */
+    void abortActiveUnpreparedOrStashPreparedTransaction(OperationContext* opCtx);
+
+    /**
+     * Aborts the storage transaction of the prepared transaction on this participant by releasing
+     * its resources. Also invalidates the session and the current transaction state.
+     * Avoids writing any oplog entries or making any changes to the transaction table since the
+     * state for prepared transactions will be re-constituted during replication recovery.
+     */
+    void abortPreparedTransactionForRollback();
+
+    /**
+     * Adds a stored operation to the list of stored operations for the current multi-document
+     * (non-autocommit) transaction.  It is illegal to add operations when no multi-document
+     * transaction is in progress.
+     */
+    void addTransactionOperation(OperationContext* opCtx, const repl::ReplOperation& operation);
+
+    /**
+     * Returns and clears the stored operations for an multi-document (non-autocommit) transaction,
+     * and marks the transaction as closed.  It is illegal to attempt to add operations to the
+     * transaction after this is called.
+     */
+    std::vector<repl::ReplOperation> endTransactionAndRetrieveOperations(OperationContext* opCtx);
+
+    /**
+     * Yield or reacquire locks for prepared transacitons, used on replication state transition.
+     */
+    void refreshLocksForPreparedTransaction(OperationContext* opCtx, bool yieldLocks);
+
+    /**
+     * May only be called while a multi-document transaction is not committed and adds the multi-key
+     * path info to the set of path infos to be updated at commit time.
+     */
+    void addUncommittedMultikeyPathInfo(MultikeyPathInfo info) {
+        invariant(inMultiDocumentTransaction());
+        _multikeyPathInfo.emplace_back(std::move(info));
     }
 
     /**
-     * Blocking method, which loads the transaction state from storage if it has been marked as
-     * needing refresh.
-     *
-     * In order to avoid the possibility of deadlock, this method must not be called while holding a
-     * lock.
+     * May only be called while a mutil-document transaction is not committed and returns the path
+     * infos which have been added so far.
      */
-    void refreshFromStorageIfNeeded(OperationContext* opCtx);
-
-    TxnNumber getActiveTxnNumber() const {
-        stdx::lock_guard<stdx::mutex> lg(_mutex);
-        return _activeTxnNumber;
+    const std::vector<MultikeyPathInfo>& getUncommittedMultikeyPathInfos() const {
+        invariant(inMultiDocumentTransaction());
+        return _multikeyPathInfo;
     }
 
     /**
@@ -423,15 +342,6 @@ public:
                                      boost::optional<DurableTxnStateEnum> txnState);
 
     /**
-     * Helper function to begin a migration on a primary node.
-     *
-     * Returns whether the specified statement should be migrated at all or skipped.
-     *
-     * Not called with session checked out.
-     */
-    bool onMigrateBeginOnPrimary(OperationContext* opCtx, TxnNumber txnNumber, StmtId stmtId);
-
-    /**
      * Called after an entry for the specified session and transaction has been written to the oplog
      * during chunk migration, while the node is still primary. Must be called while the caller is
      * still in the oplog write's WUOW. Updates the on-disk state of the session to match the
@@ -450,20 +360,6 @@ public:
                                      Date_t oplogLastStmtIdWriteDate);
 
     /**
-     * Marks the session as requiring refresh. Used when the session state has been modified
-     * externally, such as through a direct write to the transactions table.
-     */
-    void invalidate();
-
-    /**
-     * Returns the op time of the last committed write for this session and transaction. If no write
-     * has completed yet, returns an empty timestamp.
-     *
-     * Throws if the session has been invalidated or the active transaction number doesn't match.
-     */
-    repl::OpTime getLastWriteOpTime(TxnNumber txnNumber) const;
-
-    /**
      * Checks whether the given statementId for the specified transaction has already executed and
      * if so, returns the oplog entry which was generated by that write. If the statementId hasn't
      * executed, returns boost::none.
@@ -472,9 +368,7 @@ public:
      *
      * Throws if the session has been invalidated or the active transaction number doesn't match.
      */
-    boost::optional<repl::OplogEntry> checkStatementExecuted(OperationContext* opCtx,
-                                                             TxnNumber txnNumber,
-                                                             StmtId stmtId) const;
+    boost::optional<repl::OplogEntry> checkStatementExecuted(StmtId stmtId) const;
 
     /**
      * Checks whether the given statementId for the specified transaction has already executed
@@ -484,7 +378,155 @@ public:
      *
      * Throws if the session has been invalidated or the active transaction number doesn't match.
      */
-    bool checkStatementExecutedNoOplogEntryFetch(TxnNumber txnNumber, StmtId stmtId) const;
+    bool checkStatementExecutedNoOplogEntryFetch(StmtId stmtId) const;
+
+    /**
+     * Marks the session as requiring refresh. Used when the session state has been modified
+     * externally, such as through a direct write to the transactions table.
+     */
+    void invalidate();
+
+    /**
+     * Kills the transaction if it is running, ensuring that it releases all resources, even if the
+     * transaction is in prepare().  Avoids writing any oplog entries or making any changes to the
+     * transaction table.  State for prepared transactions will be re-constituted at startup.
+     * Note that we don't take any active steps to prevent continued use of this
+     * TransactionParticipant after shutdown() is called, but we rely on callers to not
+     * continue using the TransactionParticipant once we are in shutdown.
+     */
+    void shutdown();
+
+    /**
+     * Returns the currently active transaction number on this participant.
+     */
+    TxnNumber getActiveTxnNumber() const {
+        stdx::lock_guard<stdx::mutex> lg(_mutex);
+        return _activeTxnNumber;
+    }
+
+    /**
+     * Returns the op time of the last committed write for this session and transaction. If no write
+     * has completed yet, returns an empty timestamp.
+     *
+     * Throws if the session has been invalidated or the active transaction number doesn't match.
+     */
+    repl::OpTime getLastWriteOpTime() const;
+
+    /**
+     * Returns the prepare op time that was selected for the transaction, which can be Null if the
+     * transaction is not prepared.
+     */
+    repl::OpTime getPrepareOpTime() const {
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        return _prepareOpTime;
+    }
+
+    /**
+     * Returns whether the transaction has exceeded its expiration time.
+     */
+    bool expired() const;
+
+    /**
+     * Returns whether we are in a multi-document transaction, which means we have an active
+     * transaction which has autoCommit:false and has not been committed or aborted. It is possible
+     * that the current transaction is stashed onto the stack via a `SideTransactionBlock`.
+     */
+    bool inMultiDocumentTransaction() const {
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        return _txnState.inMultiDocumentTransaction(lk);
+    };
+
+    bool transactionIsCommitted() const {
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        return _txnState.isCommitted(lk);
+    }
+
+    bool transactionIsAborted() const {
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        return _txnState.isAborted(lk);
+    }
+
+    bool transactionIsPrepared() const {
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        return _txnState.isPrepared(lk);
+    }
+
+    /**
+     * Returns true if we are in an active multi-document transaction or if the transaction has
+     * been aborted. This is used to cover the case where a transaction has been aborted, but the
+     * OperationContext state has not been cleared yet.
+     */
+    bool inActiveOrKilledMultiDocumentTransaction() const {
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        return (_txnState.inMultiDocumentTransaction(lk) || _txnState.isAborted(lk));
+    }
+
+    /**
+     * If this session is holding stashed locks in _txnResourceStash, reports the current state of
+     * the session using the provided builder. Locks the session object's mutex while running.
+     */
+    BSONObj reportStashedState() const;
+    void reportStashedState(BSONObjBuilder* builder) const;
+
+    /**
+     * If this session is not holding stashed locks in _txnResourceStash (transaction is active),
+     * reports the current state of the session using the provided builder. Locks the session
+     * object's mutex while running.
+     *
+     * If this is called from a thread other than the owner of the opCtx, that thread must be
+     * holding the client lock.
+     */
+    void reportUnstashedState(OperationContext* opCtx, BSONObjBuilder* builder) const;
+
+    //
+    // Methods used for unit-testing only
+    //
+
+    std::string getTransactionInfoForLogForTest(
+        const SingleThreadedLockStats* lockStats,
+        bool committed,
+        const repl::ReadConcernArgs& readConcernArgs) const {
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        TerminationCause terminationCause =
+            committed ? TerminationCause::kCommitted : TerminationCause::kAborted;
+        return _transactionInfoForLog(lockStats, terminationCause, readConcernArgs);
+    }
+
+    SingleTransactionStats getSingleTransactionStatsForTest() const {
+        stdx::lock_guard<stdx::mutex> lk(_metricsMutex);
+        return _transactionMetricsObserver.getSingleTransactionStats();
+    }
+
+    std::vector<repl::ReplOperation> getTransactionOperationsForTest() const {
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        return _transactionOperations;
+    }
+
+    repl::OpTime getSpeculativeTransactionReadOpTimeForTest() const {
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        return _speculativeTransactionReadOpTime;
+    }
+
+    const Locker* getTxnResourceStashLockerForTest() const {
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        invariant(_txnResourceStash);
+        return _txnResourceStash->locker();
+    }
+
+    void transitionToPreparedforTest() {
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        _txnState.transitionTo(lk, TransactionState::kPrepared);
+    }
+
+    void transitionToAbortedWithoutPrepareforTest() {
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        _txnState.transitionTo(lk, TransactionState::kAbortedWithoutPrepare);
+    }
+
+    void transitionToAbortedWithPrepareforTest() {
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        _txnState.transitionTo(lk, TransactionState::kAbortedWithPrepare);
+    }
 
 private:
     /**
@@ -495,7 +537,6 @@ private:
     class OplogSlotReserver {
     public:
         OplogSlotReserver(OperationContext* opCtx);
-
         ~OplogSlotReserver();
 
         // Rule of 5: because we have a class-defined destructor, we need to explictly specify
@@ -532,7 +573,8 @@ private:
             kCommittingWithoutPrepare = 1 << 3,
             kCommittingWithPrepare = 1 << 4,
             kCommitted = 1 << 5,
-            kAborted = 1 << 6
+            kAbortedWithoutPrepare = 1 << 6,
+            kAbortedWithPrepare = 1 << 7
         };
 
         using StateSet = int;
@@ -579,7 +621,7 @@ private:
         }
 
         bool isAborted(WithLock) const {
-            return _state == kAborted;
+            return _state == kAbortedWithoutPrepare || _state == kAbortedWithPrepare;
         }
 
         std::string toString() const {
@@ -605,6 +647,9 @@ private:
     // Shortcut to obtain the id of the session under which this participant runs
     const LogicalSessionId& _sessionId() const;
 
+    // Shortcut to obtain the currently checked-out operation context under this participant runs
+    OperationContext* _opCtx() const;
+
     /**
      * Performing any checks based on the in-memory state of the TransactionParticipant requires
      * that the object is fully in sync with its on-disk representation in the transactions table.
@@ -618,31 +663,27 @@ private:
     // a check that the caller operates on the transaction it thinks it is operating on.
     void _checkIsActiveTransaction(WithLock, TxnNumber txnNumber) const;
 
-    boost::optional<repl::OpTime> _checkStatementExecuted(WithLock,
-                                                          TxnNumber txnNumber,
-                                                          StmtId stmtId) const;
+    boost::optional<repl::OpTime> _checkStatementExecuted(StmtId stmtId) const;
 
-    // Returns the write date of the last committed write for this session and transaction. If no
-    // write has completed yet, returns an empty date.
-    //
-    // Throws if the session has been invalidated or the active transaction number doesn't match.
-    Date_t _getLastWriteDate(WithLock, TxnNumber txnNumber) const;
-
-    UpdateRequest _makeUpdateRequest(WithLock,
-                                     TxnNumber newTxnNumber,
-                                     const repl::OpTime& newLastWriteOpTime,
+    UpdateRequest _makeUpdateRequest(const repl::OpTime& newLastWriteOpTime,
                                      Date_t newLastWriteDate,
                                      boost::optional<DurableTxnStateEnum> newState) const;
 
-    void _registerUpdateCacheOnCommit(OperationContext* opCtx,
-                                      TxnNumber newTxnNumber,
-                                      std::vector<StmtId> stmtIdsWritten,
+    void _registerUpdateCacheOnCommit(std::vector<StmtId> stmtIdsWritten,
                                       const repl::OpTime& lastStmtIdWriteTs);
 
     // Called for speculative transactions to fix the optime of the snapshot to read from.
     void _setSpeculativeTransactionOpTime(WithLock,
                                           OperationContext* opCtx,
                                           SpeculativeTransactionOpTime opTimeChoice);
+
+
+    // Like _setSpeculativeTransactionOpTime, but caller chooses timestamp of snapshot explicitly.
+    // It is up to the caller to ensure that Timestamp is greater than or equal to the all-committed
+    // optime before calling this method (e.g. by calling ReplCoordinator::waitForOpTimeForRead).
+    void _setSpeculativeTransactionReadTimestamp(WithLock,
+                                                 OperationContext* opCtx,
+                                                 Timestamp timestamp);
 
     // Finishes committing the multi-document transaction after the storage-transaction has been
     // committed, the oplog entry has been inserted into the oplog, and the transactions table has
@@ -669,7 +710,7 @@ private:
     // Clean up the transaction resources unstashed on operation context.
     void _cleanUpTxnResourceOnOpCtx(WithLock wl,
                                     OperationContext* opCtx,
-                                    TransactionState::StateFlag terminationCause);
+                                    TerminationCause terminationCause);
 
     // Checks if the current transaction number of this transaction still matches with the
     // parent session as well as the transaction number of the current operation context.
@@ -679,14 +720,14 @@ private:
 
     // Checks if the command can be run on this transaction based on the state of the transaction.
     void _checkIsCommandValidWithTxnState(WithLock,
-                                          OperationContext* opCtx,
+                                          const TxnNumber& requestTxnNumber,
                                           const std::string& cmdName);
 
     // Logs the transaction information if it has run slower than the global parameter slowMS. The
     // transaction must be committed or aborted when this function is called.
     void _logSlowTransaction(WithLock wl,
                              const SingleThreadedLockStats* lockStats,
-                             TransactionState::StateFlag terminationCause,
+                             TerminationCause terminationCause,
                              repl::ReadConcernArgs readConcernArgs);
 
     // This method returns a string with information about a slow transaction. The format of the
@@ -694,8 +735,8 @@ private:
     // transaction must be completed (committed or aborted) and a valid LockStats reference must be
     // passed in order for this method to be called.
     std::string _transactionInfoForLog(const SingleThreadedLockStats* lockStats,
-                                       TransactionState::StateFlag terminationCause,
-                                       repl::ReadConcernArgs readConcernArgs);
+                                       TerminationCause terminationCause,
+                                       repl::ReadConcernArgs readConcernArgs) const;
 
     // Reports transaction stats for both active and inactive transactions using the provided
     // builder.  The lock may be either a lock on _mutex or a lock on _metricsMutex.
@@ -716,10 +757,19 @@ private:
     // number.
     void _continueMultiDocumentTransaction(WithLock wl, TxnNumber txnNumber);
 
+    // Helper that invalidates the session state and activeTxnNumber. Also resets the single
+    // transaction stats because the session is no longer valid.
+    void _invalidate(WithLock);
+
+    // Helper that resets the retryable writes state.
+    void _resetRetryableWriteState(WithLock);
+
+    // Helper that resets the transactional state. This is used when aborting a transaction,
+    // invalidating a transaction, or starting a new transaction.
+    void _resetTransactionState(WithLock wl, TransactionState::StateFlag state);
+
     // Protects the member variables below.
     mutable stdx::mutex _mutex;
-
-    bool _inShutdown{false};
 
     // Holds transaction resources between network operations.
     boost::optional<TxnResources> _txnResourceStash;
@@ -739,6 +789,9 @@ private:
     // means a new transaction has begun on the session, but it hasn't yet performed any writes.
     TxnNumber _activeTxnNumber{kUninitializedTxnNumber};
 
+    // Caches what is known to be the last optime written for the active transaction.
+    repl::OpTime _lastWriteOpTime;
+
     // Set when a snapshot read / transaction begins. Alleviates cache pressure by limiting how long
     // a snapshot will remain open and available. Checked in combination with _txnState to determine
     // whether the transaction should be aborted.
@@ -757,30 +810,15 @@ private:
     // should wait for write concern for on commit.
     repl::OpTime _speculativeTransactionReadOpTime;
 
+    // Contains uncommitted multi-key path info entries which were modified under this transaction
+    // so they can be applied to subsequent opreations before the transaction commits
     std::vector<MultikeyPathInfo> _multikeyPathInfo;
 
-    //
-    // Retryable writes state
-    //
+    // Tracks the OpTime of the first oplog entry written by this TransactionParticipant.
+    boost::optional<repl::OpTime> _oldestOplogEntryOpTime;
 
-    // Specifies whether the session information needs to be refreshed from storage
-    bool _isValid{false};
-
-    // Counter, incremented with each call to invalidate in order to discern invalidations, which
-    // happen during refresh
-    int _numInvalidations{0};
-
-    // Set to true if incomplete history is detected. For example, when the oplog to a write was
-    // truncated because it was too old.
-    bool _hasIncompleteHistory{false};
-
-    // Caches what is known to be the last written transaction record for the session
-    boost::optional<SessionTxnRecord> _lastWrittenSessionRecord;
-
-    // For the active txn, tracks which statement ids have been committed and at which oplog
-    // opTime. Used for fast retryability check and retrieving the previous write's data without
-    // having to scan through the oplog.
-    CommittedStatementTimestampMap _activeTxnCommittedStatements;
+    // Tracks the OpTime of the abort/commit oplog entry associated with this transaction.
+    boost::optional<repl::OpTime> _finishOpTime;
 
     // Protects _transactionMetricsObserver.  The concurrency rules are that const methods on
     // _transactionMetricsObserver may be called under either _mutex or _metricsMutex, but for
@@ -792,11 +830,27 @@ private:
     // Tracks and updates transaction metrics upon the appropriate transaction event.
     TransactionMetricsObserver _transactionMetricsObserver;
 
-    // Tracks the OpTime of the first oplog entry written by this TransactionParticipant.
-    boost::optional<repl::OpTime> _oldestOplogEntryOpTime;
+    // Only set if the server is shutting down and it has been ensured that no new requests will be
+    // accepted. Ensures that any transaction resources will not be stashed from the operation
+    // context onto the transaction participant when the session is checked-in so that locks can
+    // automatically get freed.
+    bool _inShutdown{false};
 
-    // Tracks the OpTime of the abort/commit oplog entry associated with this transaction.
-    boost::optional<repl::OpTime> _finishOpTime;
+    //
+    // Retryable writes state
+    //
+
+    // Specifies whether the session information needs to be refreshed from storage
+    bool _isValid{false};
+
+    // Set to true if incomplete history is detected. For example, when the oplog to a write was
+    // truncated because it was too old.
+    bool _hasIncompleteHistory{false};
+
+    // For the active txn, tracks which statement ids have been committed and at which oplog
+    // opTime. Used for fast retryability check and retrieving the previous write's data without
+    // having to scan through the oplog.
+    CommittedStatementTimestampMap _activeTxnCommittedStatements;
 };
 
 }  // namespace mongo

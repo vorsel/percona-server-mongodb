@@ -38,6 +38,7 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/global_lock_acquisition_tracker.h"
 #include "mongo/db/concurrency/lock_manager_test_help.h"
+#include "mongo/db/concurrency/replication_state_transition_lock_guard.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/db/storage/recovery_unit_noop.h"
@@ -108,7 +109,7 @@ public:
         auto result = task.get_future();
         stdx::thread taskThread{std::move(task)};
 
-        auto taskThreadJoiner = MakeGuard([&] { taskThread.join(); });
+        auto taskThreadJoiner = makeGuard([&] { taskThread.join(); });
 
         {
             stdx::lock_guard<Client> clientLock(*opCtx->getClient());
@@ -188,7 +189,7 @@ TEST_F(DConcurrencyTestFixture, ResourceMutex) {
         void waitFor(int n) {
             waitFor([this, n]() { return this->step.load() == n; });
         }
-        AtomicInt32 step{0};
+        AtomicWord<int> step{0};
     } state;
 
     stdx::thread t1([&]() {
@@ -933,6 +934,33 @@ TEST_F(DConcurrencyTestFixture, DBLockWaitIsNotInterruptibleWithLockGuard) {
     result.get();
 }
 
+TEST_F(DConcurrencyTestFixture, LockCompleteInterruptedWhenUncontested) {
+    auto clientOpctxPairs = makeKClientsWithLockers(2);
+    auto opCtx1 = clientOpctxPairs[0].second.get();
+    auto opCtx2 = clientOpctxPairs[1].second.get();
+
+    boost::optional<Lock::GlobalLock> globalWrite;
+    globalWrite.emplace(opCtx1, MODE_IX);
+    ASSERT(globalWrite->isLocked());
+
+    // Attempt to take a conflicting lock, which will fail.
+    LockResult result = opCtx2->lockState()->lockGlobalBegin(opCtx2, MODE_X, Date_t::max());
+    ASSERT_EQ(result, LOCK_WAITING);
+
+    // Release the conflicting lock.
+    globalWrite.reset();
+
+    {
+        stdx::lock_guard<Client> clientLock(*opCtx2->getClient());
+        opCtx2->markKilled();
+    }
+
+    // After the operation has been killed, the lockComplete request should fail, even though the
+    // lock is uncontested.
+    ASSERT_THROWS_CODE(opCtx2->lockState()->lockGlobalComplete(opCtx2, Date_t::max()),
+                       AssertionException,
+                       ErrorCodes::Interrupted);
+}
 
 TEST_F(DConcurrencyTestFixture, DBLockTakesS) {
     auto opCtx = makeOperationContext();
@@ -1100,7 +1128,7 @@ TEST_F(DConcurrencyTestFixture, Stress) {
     std::vector<std::pair<ServiceContext::UniqueClient, ServiceContext::UniqueOperationContext>>
         clients = makeKClientsWithLockers(kMaxStressThreads);
 
-    AtomicInt32 ready{0};
+    AtomicWord<int> ready{0};
     std::vector<stdx::thread> threads;
 
 
@@ -1224,7 +1252,7 @@ TEST_F(DConcurrencyTestFixture, StressPartitioned) {
     std::vector<std::pair<ServiceContext::UniqueClient, ServiceContext::UniqueOperationContext>>
         clients = makeKClientsWithLockers(kMaxStressThreads);
 
-    AtomicInt32 ready{0};
+    AtomicWord<int> ready{0};
     std::vector<stdx::thread> threads;
 
     for (int threadId = 0; threadId < kMaxStressThreads; threadId++) {
@@ -1726,8 +1754,8 @@ TEST_F(DConcurrencyTestFixture, CompatibleFirstWithXSXIXIS) {
 TEST_F(DConcurrencyTestFixture, CompatibleFirstStress) {
     int numThreads = 8;
     int testMicros = 500'000;
-    AtomicUInt64 readOnlyInterval{0};
-    AtomicBool done{false};
+    AtomicWord<unsigned long long> readOnlyInterval{0};
+    AtomicWord<bool> done{false};
     std::vector<uint64_t> acquisitionCount(numThreads);
     std::vector<uint64_t> timeoutCount(numThreads);
     std::vector<uint64_t> busyWaitCount(numThreads);
@@ -1901,6 +1929,63 @@ TEST_F(DConcurrencyTestFixture, TestGlobalLockDoesNotAbandonSnapshotWhenInWriteU
     ASSERT_TRUE(recovUnitBorrowed->activeTransaction);
 
     opCtx->lockState()->endWriteUnitOfWork();
+}
+
+TEST_F(DConcurrencyTestFixture, RSTLLockGuardTimeout) {
+    auto clients = makeKClientsWithLockers(2);
+    auto firstOpCtx = clients[0].second.get();
+    auto secondOpCtx = clients[1].second.get();
+
+    // The first opCtx holds the RSTL.
+    repl::ReplicationStateTransitionLockGuard firstRSTL(firstOpCtx);
+    ASSERT_TRUE(firstRSTL.isLocked());
+    ASSERT_EQ(firstOpCtx->lockState()->getLockMode(resourceIdReplicationStateTransitionLock),
+              MODE_X);
+
+    // The second opCtx enqueues the lock request but cannot acquire it.
+    repl::ReplicationStateTransitionLockGuard secondRSTL(
+        secondOpCtx, repl::ReplicationStateTransitionLockGuard::EnqueueOnly());
+    ASSERT_FALSE(secondRSTL.isLocked());
+
+    // The second opCtx times out.
+    ASSERT_THROWS_CODE(secondRSTL.waitForLockUntil(Date_t::now() + Milliseconds(1)),
+                       AssertionException,
+                       ErrorCodes::ExceededTimeLimit);
+
+    // Check the first opCtx is still holding the RSTL.
+    ASSERT_TRUE(firstRSTL.isLocked());
+    ASSERT_EQ(firstOpCtx->lockState()->getLockMode(resourceIdReplicationStateTransitionLock),
+              MODE_X);
+    ASSERT_FALSE(secondRSTL.isLocked());
+}
+
+TEST_F(DConcurrencyTestFixture, RSTLLockGuardEnqueueAndWait) {
+    auto clients = makeKClientsWithLockers(2);
+    auto firstOpCtx = clients[0].second.get();
+    auto secondOpCtx = clients[1].second.get();
+
+    // The first opCtx holds the RSTL.
+    auto firstRSTL = stdx::make_unique<repl::ReplicationStateTransitionLockGuard>(firstOpCtx);
+    ASSERT_TRUE(firstRSTL->isLocked());
+    ASSERT_EQ(firstOpCtx->lockState()->getLockMode(resourceIdReplicationStateTransitionLock),
+              MODE_X);
+
+
+    // The second opCtx enqueues the lock request but cannot acquire it.
+    repl::ReplicationStateTransitionLockGuard secondRSTL(
+        secondOpCtx, repl::ReplicationStateTransitionLockGuard::EnqueueOnly());
+    ASSERT_FALSE(secondRSTL.isLocked());
+
+    // The first opCtx unlocks so the second opCtx acquires it.
+    firstRSTL.reset();
+    ASSERT_EQ(firstOpCtx->lockState()->getLockMode(resourceIdReplicationStateTransitionLock),
+              MODE_NONE);
+
+
+    secondRSTL.waitForLockUntil(Date_t::now());
+    ASSERT_TRUE(secondRSTL.isLocked());
+    ASSERT_EQ(secondOpCtx->lockState()->getLockMode(resourceIdReplicationStateTransitionLock),
+              MODE_X);
 }
 
 }  // namespace

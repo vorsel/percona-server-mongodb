@@ -215,12 +215,12 @@ TEST_F(DocumentSourceLookUpTest, LookupEmptyPipelineDoesntUseDiskAndIsOKInATrans
            DocumentSource::TransactionRequirement::kAllowed);
 }
 
-TEST_F(DocumentSourceLookUpTest, LookupWithChildStagesInheritsDiskUseRequirement) {
+TEST_F(DocumentSourceLookUpTest, LookupWithOutInPipelineNotAllowed) {
+    auto ERROR_CODE_OUT_BANNED_IN_LOOKUP = 51047;
     auto expCtx = getExpCtx();
     NamespaceString fromNs("test", "coll");
     expCtx->setResolvedNamespace_forTest(fromNs, {fromNs, std::vector<BSONObj>{}});
-
-    auto docSource =
+    ASSERT_THROWS_CODE(
         DocumentSourceLookUp::createFromBson(BSON("$lookup" << BSON("from"
                                                                     << "coll"
                                                                     << "pipeline"
@@ -229,14 +229,9 @@ TEST_F(DocumentSourceLookUpTest, LookupWithChildStagesInheritsDiskUseRequirement
                                                                     << "as"
                                                                     << "as"))
                                                  .firstElement(),
-                                             expCtx);
-    auto lookup = static_cast<DocumentSourceLookUp*>(docSource.get());
-
-    ASSERT_TRUE(lookup->wasConstructedWithPipelineSyntax());
-    ASSERT(lookup->constraints(Pipeline::SplitState::kUnsplit).diskRequirement ==
-           DocumentSource::DiskUseRequirement::kWritesPersistentData);
-    ASSERT(lookup->constraints(Pipeline::SplitState::kUnsplit).transactionRequirement ==
-           DocumentSource::TransactionRequirement::kNotAllowed);
+                                             expCtx),
+        AssertionException,
+        ERROR_CODE_OUT_BANNED_IN_LOOKUP);
 }
 
 TEST_F(DocumentSourceLookUpTest, LiteParsedDocumentSourceLookupContainsExpectedNamespaces) {
@@ -544,28 +539,28 @@ public:
         return false;
     }
 
-    StatusWith<std::unique_ptr<Pipeline, PipelineDeleter>> makePipeline(
+    std::unique_ptr<Pipeline, PipelineDeleter> makePipeline(
         const std::vector<BSONObj>& rawPipeline,
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         const MakePipelineOptions opts) final {
-        auto pipeline = Pipeline::parse(rawPipeline, expCtx);
-        if (!pipeline.isOK()) {
-            return pipeline.getStatus();
-        }
+        auto pipeline = uassertStatusOK(Pipeline::parse(rawPipeline, expCtx));
 
         if (opts.optimize) {
-            pipeline.getValue()->optimizePipeline();
+            pipeline->optimizePipeline();
         }
 
         if (opts.attachCursorSource) {
-            uassertStatusOK(attachCursorSourceToPipeline(expCtx, pipeline.getValue().get()));
+            pipeline = attachCursorSourceToPipeline(expCtx, pipeline.release());
         }
 
         return pipeline;
     }
 
-    Status attachCursorSourceToPipeline(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                        Pipeline* pipeline) final {
+    std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx, Pipeline* ownedPipeline) final {
+        std::unique_ptr<Pipeline, PipelineDeleter> pipeline(ownedPipeline,
+                                                            PipelineDeleter(expCtx->opCtx));
+
         while (_removeLeadingQueryStages && !pipeline->getSources().empty()) {
             if (pipeline->popFrontWithName("$match") || pipeline->popFrontWithName("$sort") ||
                 pipeline->popFrontWithName("$project")) {
@@ -575,7 +570,7 @@ public:
         }
 
         pipeline->addInitialSource(DocumentSourceMock::create(_mockResults));
-        return Status::OK();
+        return pipeline;
     }
 
 private:

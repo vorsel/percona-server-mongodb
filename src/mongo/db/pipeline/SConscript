@@ -135,6 +135,7 @@ env.Library(
     target='expression',
     source=[
         'expression.cpp',
+        'expression_trigonometric.cpp',
         ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/query/datetime/date_time_support',
@@ -258,6 +259,7 @@ env.Library(
     target='lite_parsed_document_source',
     source=[
         'lite_parsed_document_source.cpp',
+        'lite_parsed_pipeline.cpp',
         ],
     LIBDEPS=[
         'aggregation_request',
@@ -320,7 +322,10 @@ env.Library(
         'mongos_process_interface.cpp',
     ],
     LIBDEPS=[
+        '$BUILD_DIR/mongo/db/pipeline/pipeline',
         '$BUILD_DIR/mongo/s/query/async_results_merger',
+        '$BUILD_DIR/mongo/s/query/cluster_aggregation_planner',
+        '$BUILD_DIR/mongo/s/query/cluster_query',
         'mongo_process_common',
     ]
 )
@@ -442,6 +447,7 @@ env.CppUnitTest(
         'expression_convert_test.cpp',
         'expression_date_test.cpp',
         'expression_test.cpp',
+        'expression_trigonometric_test.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/query/query_test_service_context',

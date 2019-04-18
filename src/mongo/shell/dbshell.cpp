@@ -89,7 +89,7 @@ using namespace mongo;
 string historyFile;
 bool gotInterrupted = false;
 bool inMultiLine = false;
-static AtomicBool atPrompt(false);  // can eval before getting to prompt
+static AtomicWord<bool> atPrompt(false);  // can eval before getting to prompt
 
 namespace {
 const std::string kDefaultMongoHost = "127.0.0.1"s;
@@ -202,7 +202,7 @@ void shellHistoryAdd(const char* line) {
 }
 
 void killOps() {
-    if (mongo::shell_utils::_nokillop)
+    if (shellGlobalParams.nokillop)
         return;
 
     if (atPrompt.load())
@@ -889,7 +889,7 @@ int _main(int argc, char* argv[], char** envp) {
     mongo::getGlobalScriptEngine()->enableJavaScriptProtection(
         shellGlobalParams.javascriptProtection);
 
-    auto poolGuard = MakeGuard([] { ScriptEngine::dropScopeCache(); });
+    auto poolGuard = makeGuard([] { ScriptEngine::dropScopeCache(); });
 
     unique_ptr<mongo::Scope> scope(mongo::getGlobalScriptEngine()->newScope());
     shellMainScope = scope.get();

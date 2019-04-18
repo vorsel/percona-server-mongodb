@@ -38,15 +38,18 @@ env.Library(
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/server_parameters',
     ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/util/options_parser/options_parser',
+    ],
 )
 
 env.CppUnitTest(
     target='idl_server_parameter_test',
     source=[
-        'server_parameter_test.cpp',
-        env.Idlc('server_parameter_test.idl')[0],
         'server_parameter_with_storage_test.cpp',
         env.Idlc('server_parameter_with_storage_test.idl')[0],
+        'server_parameter_specialized_test.cpp',
+        env.Idlc('server_parameter_specialized_test.idl')[0],
     ],
     LIBDEPS=[
         'server_parameter',
@@ -62,6 +65,7 @@ env.CppUnitTest(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/util/cmdline_utils/cmdline_utils',
         '$BUILD_DIR/mongo/util/options_parser/options_parser',
     ],
 )

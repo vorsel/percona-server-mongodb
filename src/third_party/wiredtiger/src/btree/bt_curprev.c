@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2018 MongoDB, Inc.
+ * Copyright (c) 2014-2019 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -371,7 +371,7 @@ new_page:	if (cbt->recno < cbt->ref->ref_recno)
 		if (cbt->cip_saved != cip) {
 			if ((cell = WT_COL_PTR(page, cip)) == NULL)
 				continue;
-			__wt_cell_unpack(cell, &unpack);
+			__wt_cell_unpack(page, cell, &unpack);
 			if (unpack.type == WT_CELL_DEL) {
 				if (__wt_cell_rle(&unpack) == 1)
 					continue;

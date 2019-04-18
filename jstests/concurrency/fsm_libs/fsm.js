@@ -52,14 +52,15 @@ var fsm = (function() {
 
             if (TestData.runInsideTransaction) {
                 try {
+                    // We make a deep copy of 'args.data' before running the state function in a
+                    // transaction so that if the transaction aborts, then we haven't speculatively
+                    // modified the thread-local state.
+                    let data;
                     withTxnAndAutoRetry(args.db.getSession(), () => {
-                        // We make a deep copy of 'args.data' before calling the 'fn' state function
-                        // so that if the transaction aborts, then we haven't speculatively modified
-                        // the thread-local state.
-                        const data = deepCopyObject({}, args.data);
+                        data = deepCopyObject({}, args.data);
                         fn.call(data, args.db, args.collName, connCache);
-                        args.data = data;
                     });
+                    args.data = data;
                 } catch (e) {
                     // Retry state functions that threw OperationNotSupportedInTransaction or
                     // InvalidOptions errors outside of a transaction. Rethrow any other error.
@@ -104,7 +105,9 @@ var fsm = (function() {
                     v = deepCopyObject([], v);
                 }
             }
-            dst[k] = v;
+            var desc = Object.getOwnPropertyDescriptor(src, k);
+            desc.value = v;
+            Object.defineProperty(dst, k, desc);
         }
         return dst;
     }

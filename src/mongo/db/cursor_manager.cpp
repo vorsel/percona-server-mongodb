@@ -181,7 +181,7 @@ void GlobalCursorIdCache::deregisterCursorManager(uint32_t id, const NamespaceSt
 bool GlobalCursorIdCache::killCursor(OperationContext* opCtx, CursorId id, bool checkAuth) {
     // Figure out what the namespace of this cursor is.
     NamespaceString nss;
-    if (CursorManager::isGloballyManagedCursor(id)) {
+    {
         auto pin = globalCursorManager->pinCursor(opCtx, id, CursorManager::kNoCheckSession);
         if (!pin.isOK()) {
             // Either the cursor doesn't exist, or it was killed during the last time it was being
@@ -189,17 +189,18 @@ bool GlobalCursorIdCache::killCursor(OperationContext* opCtx, CursorId id, bool 
             return false;
         }
         nss = pin.getValue().getCursor()->nss();
-    } else {
-        stdx::lock_guard<SimpleMutex> lk(_mutex);
-        uint32_t nsid = idFromCursorId(id);
-        IdToNssMap::const_iterator it = _idToNss.find(nsid);
-        if (it == _idToNss.end()) {
-            // No namespace corresponding to this cursor id prefix.
-            return false;
-        }
-        nss = it->second;
     }
     invariant(nss.isValid());
+
+    boost::optional<AutoStatsTracker> statsTracker;
+    if (!nss.isCollectionlessCursorNamespace()) {
+        const boost::optional<int> dbProfilingLevel = boost::none;
+        statsTracker.emplace(opCtx,
+                             nss,
+                             Top::LockType::NotLocked,
+                             AutoStatsTracker::LogMode::kUpdateTopAndCurop,
+                             dbProfilingLevel);
+    }
 
     // Check if we are authorized to kill this cursor.
     if (checkAuth) {
@@ -219,33 +220,11 @@ bool GlobalCursorIdCache::killCursor(OperationContext* opCtx, CursorId id, bool 
         }
     }
 
-    // If this cursor is owned by the global cursor manager, ask it to kill the cursor for us.
-    if (CursorManager::isGloballyManagedCursor(id)) {
-        Status killStatus = globalCursorManager->killCursor(opCtx, id, checkAuth);
-        massert(28697,
-                killStatus.reason(),
-                killStatus.code() == ErrorCodes::OK ||
-                    killStatus.code() == ErrorCodes::CursorNotFound);
-        return killStatus.isOK();
-    }
-
-    // If not, then the cursor must be owned by a collection. Kill the cursor under the
-    // collection lock (to prevent the collection from going away during the erase).
-    AutoGetCollectionForReadCommand ctx(opCtx, nss);
-    Collection* collection = ctx.getCollection();
-    if (!collection) {
-        if (checkAuth)
-            audit::logKillCursorsAuthzCheck(
-                opCtx->getClient(), nss, id, ErrorCodes::CursorNotFound);
-        return false;
-    }
-
-    Status eraseStatus = collection->getCursorManager()->killCursor(opCtx, id, checkAuth);
-    uassert(16089,
-            eraseStatus.reason(),
-            eraseStatus.code() == ErrorCodes::OK ||
-                eraseStatus.code() == ErrorCodes::CursorNotFound);
-    return eraseStatus.isOK();
+    Status killStatus = globalCursorManager->killCursor(opCtx, id, checkAuth);
+    massert(28697,
+            killStatus.reason(),
+            killStatus.code() == ErrorCodes::OK || killStatus.code() == ErrorCodes::CursorNotFound);
+    return killStatus.isOK();
 }
 
 std::size_t GlobalCursorIdCache::timeoutCursors(OperationContext* opCtx, Date_t now) {
@@ -408,24 +387,15 @@ Status CursorManager::withCursorManager(OperationContext* opCtx,
 
 // --------------------------
 
-std::size_t CursorManager::PlanExecutorPartitioner::operator()(const PlanExecutor* exec,
-                                                               const std::size_t nPartitions) {
-    auto token = exec->getRegistrationToken();
-    invariant(token);
-    return (*token) % nPartitions;
-}
-
 CursorManager::CursorManager(NamespaceString nss)
     : _nss(std::move(nss)),
       _collectionCacheRuntimeId(_nss.isEmpty() ? 0
                                                : globalCursorIdCache->registerCursorManager(_nss)),
       _random(stdx::make_unique<PseudoRandom>(globalCursorIdCache->nextSeed())),
-      _registeredPlanExecutors(),
       _cursorMap(stdx::make_unique<Partitioned<stdx::unordered_map<CursorId, ClientCursor*>>>()) {}
 
 CursorManager::~CursorManager() {
-    // All cursors and PlanExecutors should have been deleted already.
-    invariant(_registeredPlanExecutors.empty());
+    // All cursors should have been deleted already.
     invariant(_cursorMap->empty());
 
     if (!isGlobalManager()) {
@@ -436,18 +406,8 @@ CursorManager::~CursorManager() {
 void CursorManager::invalidateAll(OperationContext* opCtx,
                                   bool collectionGoingAway,
                                   const std::string& reason) {
-    invariant(!isGlobalManager());  // The global cursor manager should never need to kill cursors.
-    dassert(opCtx->lockState()->isCollectionLockedForMode(_nss.ns(), MODE_X));
+    dassert(isGlobalManager() || opCtx->lockState()->isCollectionLockedForMode(_nss.ns(), MODE_X));
     fassert(28819, !BackgroundOperation::inProgForNs(_nss));
-    auto allExecPartitions = _registeredPlanExecutors.lockAllPartitions();
-    for (auto&& partition : allExecPartitions) {
-        for (auto&& exec : partition) {
-            // The PlanExecutor is owned elsewhere, so we just mark it as killed and let it be
-            // cleaned up later.
-            exec->markAsKilled({ErrorCodes::QueryPlanKilled, reason});
-        }
-    }
-    allExecPartitions.clear();
 
     // Mark all cursors as killed, but keep around those we can in order to provide a useful error
     // message to the user when they attempt to use it next time.
@@ -462,7 +422,7 @@ void CursorManager::invalidateAll(OperationContext* opCtx,
                 // If there's an operation actively using the cursor, then that operation is now
                 // responsible for cleaning it up.  Otherwise we can immediately dispose of it.
                 if (cursor->_operationUsingCursor) {
-                    it = partition.erase(it);
+                    partition.erase(it++);
                     continue;
                 }
 
@@ -472,7 +432,7 @@ void CursorManager::invalidateAll(OperationContext* opCtx,
                     ++it;
                 } else {
                     toDisposeWithoutMutex.emplace_back(cursor);
-                    it = partition.erase(it);
+                    partition.erase(it++);
                 }
             }
         }
@@ -501,7 +461,7 @@ std::size_t CursorManager::timeoutCursors(OperationContext* opCtx, Date_t now) {
             auto* cursor = it->second;
             if (cursorShouldTimeout_inlock(cursor, now)) {
                 toDisposeWithoutMutex.emplace_back(cursor);
-                it = lockedPartition->erase(it);
+                lockedPartition->erase(it++);
             } else {
                 ++it;
             }
@@ -515,24 +475,6 @@ std::size_t CursorManager::timeoutCursors(OperationContext* opCtx, Date_t now) {
         cursor->dispose(opCtx);
     }
     return toDisposeWithoutMutex.size();
-}
-
-namespace {
-static AtomicUInt32 registeredPlanExecutorId;
-}  // namespace
-
-Partitioned<stdx::unordered_set<PlanExecutor*>>::PartitionId CursorManager::registerExecutor(
-    PlanExecutor* exec) {
-    auto partitionId = registeredPlanExecutorId.fetchAndAdd(1);
-    exec->setRegistrationToken(partitionId);
-    _registeredPlanExecutors.insert(exec);
-    return partitionId;
-}
-
-void CursorManager::deregisterExecutor(PlanExecutor* exec) {
-    if (auto partitionId = exec->getRegistrationToken()) {
-        _registeredPlanExecutors.erase(exec);
-    }
 }
 
 StatusWith<ClientCursorPin> CursorManager::pinCursor(OperationContext* opCtx,
@@ -692,15 +634,18 @@ CursorId CursorManager::allocateCursorId_inlock() {
 
 ClientCursorPin CursorManager::registerCursor(OperationContext* opCtx,
                                               ClientCursorParams&& cursorParams) {
+    // TODO SERVER-37455: Cursors should only ever be registered against the global cursor manager.
+    // Follow-up work is required to actually delete the concept of a per-collection cursor manager
+    // from the code base.
+    invariant(isGlobalManager());
+
     // Avoid computing the current time within the critical section.
     auto now = opCtx->getServiceContext()->getPreciseClockSource()->now();
 
     // Make sure the PlanExecutor isn't registered, since we will register the ClientCursor wrapping
     // it.
     invariant(cursorParams.exec);
-    deregisterExecutor(cursorParams.exec.get());
     cursorParams.exec.get_deleter().dismissDisposal();
-    cursorParams.exec->unsetRegistered();
 
     // Note we must hold the registration lock from now until insertion into '_cursorMap' to ensure
     // we don't insert two cursors with the same cursor id.

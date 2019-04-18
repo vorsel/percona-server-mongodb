@@ -251,7 +251,7 @@ void ShardRegistry::_internalReload(const CallbackArgs& cbArgs) {
         return;
     }
 
-    ThreadClient tc("shard registry reload", getGlobalServiceContext());
+    ThreadClient tc("shard-registry-reload", getGlobalServiceContext());
     auto opCtx = cc().makeOperationContext();
 
     try {
@@ -311,7 +311,7 @@ bool ShardRegistry::reload(OperationContext* opCtx) {
 
     auto nextReloadState = ReloadState::Failed;
 
-    auto failGuard = MakeGuard([&] {
+    auto failGuard = makeGuard([&] {
         if (!reloadLock.owns_lock()) {
             reloadLock.lock();
         }

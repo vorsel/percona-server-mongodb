@@ -37,11 +37,13 @@
 #include <algorithm>
 
 #include "mongo/db/catalog/catalog_control.h"
+#include "mongo/db/client.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/storage/kv/kv_catalog_feature_tracker.h"
 #include "mongo/db/storage/kv/kv_database_catalog_entry.h"
 #include "mongo/db/storage/kv/kv_engine.h"
+#include "mongo/db/storage/kv/kv_storage_engine_gen.h"
 #include "mongo/db/storage/kv/temporary_kv_record_store.h"
 #include "mongo/db/storage/storage_repair_observer.h"
 #include "mongo/db/unclean_shutdown.h"
@@ -90,11 +92,15 @@ void KVStorageEngine::keydbDropDatabase(const std::string& db) {
 
 KVStorageEngine::KVStorageEngine(
     KVEngine* engine,
-    const KVStorageEngineOptions& options,
+    KVStorageEngineOptions options,
     stdx::function<KVDatabaseCatalogEntryFactory> databaseCatalogEntryFactory)
-    : _databaseCatalogEntryFactory(std::move(databaseCatalogEntryFactory)),
-      _options(options),
-      _engine(engine),
+    : _engine(engine),
+      _options(std::move(options)),
+      _databaseCatalogEntryFactory(std::move(databaseCatalogEntryFactory)),
+      _dropPendingIdentReaper(engine),
+      _oldestTimestampListener(
+          TimestampMonitor::TimestampType::kOldest,
+          [this](Timestamp timestamp) { _onOldestTimestampChanged(timestamp); }),
       _supportsDocLocking(_engine->supportsDocLocking()),
       _supportsDBLocking(_engine->supportsDBLocking()),
       _supportsCappedCollections(_engine->supportsCappedCollections()) {
@@ -280,8 +286,8 @@ void KVStorageEngine::closeCatalog(OperationContext* opCtx) {
     }
     _dbs.clear();
 
-    _catalog.reset(nullptr);
-    _catalogRecordStore.reset(nullptr);
+    _catalog.reset();
+    _catalogRecordStore.reset();
 }
 
 Status KVStorageEngine::_recoverOrphanedCollection(OperationContext* opCtx,
@@ -354,6 +360,8 @@ KVStorageEngine::reconcileCatalogAndIdents(OperationContext* opCtx) {
         catalogIdents.insert(vec.begin(), vec.end());
     }
 
+    auto dropPendingIdents = _dropPendingIdentReaper.getAllIdents();
+
     // Drop all idents in the storage engine that are not known to the catalog. This can happen in
     // the case of a collection or index creation being rolled back.
     for (const auto& it : engineIdents) {
@@ -368,6 +376,14 @@ KVStorageEngine::reconcileCatalogAndIdents(OperationContext* opCtx) {
         // In repair context, any orphaned collection idents from the engine should already be
         // recovered in the catalog in loadCatalog().
         invariant(!(_catalog->isCollectionIdent(it) && _options.forRepair));
+
+        // Leave drop-pending idents alone.
+        // These idents have to be retained as long as the corresponding drops are not part of a
+        // checkpoint.
+        if (dropPendingIdents.find(it) != dropPendingIdents.cend()) {
+            log() << "Not removing ident for uncheckpointed collection or index drop: " << it;
+            continue;
+        }
 
         const auto& toRemove = it;
         log() << "Dropping unknown ident: " << toRemove;
@@ -469,13 +485,19 @@ std::string KVStorageEngine::getFilesystemPathForDb(const std::string& dbName) c
 }
 
 void KVStorageEngine::cleanShutdown() {
+    if (_timestampMonitor) {
+        _timestampMonitor->removeListener(&_oldestTimestampListener);
+    }
+
     for (DBMap::const_iterator it = _dbs.begin(); it != _dbs.end(); ++it) {
         delete it->second;
     }
     _dbs.clear();
 
-    _catalog.reset(NULL);
-    _catalogRecordStore.reset(NULL);
+    _catalog.reset();
+    _catalogRecordStore.reset();
+
+    _timestampMonitor.reset();
 
     _engine->cleanShutdown();
     // intentionally not deleting _engine
@@ -483,12 +505,19 @@ void KVStorageEngine::cleanShutdown() {
 
 KVStorageEngine::~KVStorageEngine() {}
 
-void KVStorageEngine::finishInit() {}
+void KVStorageEngine::finishInit() {
+    if (_engine->supportsRecoveryTimestamp()) {
+        _timestampMonitor = std::make_unique<TimestampMonitor>(
+            _engine.get(), getGlobalServiceContext()->getPeriodicRunner());
+        _timestampMonitor->startup();
+        _timestampMonitor->addListener(&_oldestTimestampListener);
+    }
+}
 
 RecoveryUnit* KVStorageEngine::newRecoveryUnit() {
     if (!_engine) {
         // shutdown
-        return NULL;
+        return nullptr;
     }
     return _engine->newRecoveryUnit();
 }
@@ -558,7 +587,7 @@ Status KVStorageEngine::_dropCollectionsNoTimestamp(OperationContext* opCtx,
     }
 
     // Ensure the method exits with the same "commit timestamp" state that it was called with.
-    auto addCommitTimestamp = MakeGuard([&opCtx, commitTs] {
+    auto addCommitTimestamp = makeGuard([&opCtx, commitTs] {
         if (!commitTs.isNull()) {
             opCtx->recoveryUnit()->setCommitTimestamp(commitTs);
         }
@@ -610,6 +639,10 @@ void KVStorageEngine::endNonBlockingBackup(OperationContext* opCtx) {
     return _engine->endNonBlockingBackup(opCtx);
 }
 
+StatusWith<std::vector<std::string>> KVStorageEngine::extendBackupCursor(OperationContext* opCtx) {
+    return _engine->extendBackupCursor(opCtx);
+}
+
 bool KVStorageEngine::isDurable() const {
     return _engine->isDurable();
 }
@@ -654,8 +687,9 @@ void KVStorageEngine::setJournalListener(JournalListener* jl) {
 }
 
 void KVStorageEngine::setStableTimestamp(Timestamp stableTimestamp,
-                                         boost::optional<Timestamp> maximumTruncationTimestamp) {
-    _engine->setStableTimestamp(stableTimestamp, maximumTruncationTimestamp);
+                                         boost::optional<Timestamp> maximumTruncationTimestamp,
+                                         bool force) {
+    _engine->setStableTimestamp(stableTimestamp, maximumTruncationTimestamp, force);
 }
 
 void KVStorageEngine::setInitialDataTimestamp(Timestamp initialDataTimestamp) {
@@ -678,10 +712,6 @@ bool KVStorageEngine::isCacheUnderPressure(OperationContext* opCtx) const {
 
 void KVStorageEngine::setCachePressureForTest(int pressure) {
     return _engine->setCachePressureForTest(pressure);
-}
-
-bool KVStorageEngine::supportsRecoverToStableTimestamp() const {
-    return _engine->supportsRecoverToStableTimestamp();
 }
 
 bool KVStorageEngine::supportsRecoveryTimestamp() const {
@@ -730,6 +760,14 @@ bool KVStorageEngine::supportsReadConcernMajority() const {
     return _engine->supportsReadConcernMajority();
 }
 
+bool KVStorageEngine::supportsPendingDrops() const {
+    return enableKVPendingDrops && supportsReadConcernMajority();
+}
+
+void KVStorageEngine::clearDropPendingState() {
+    _dropPendingIdentReaper.clearDropPendingState();
+}
+
 void KVStorageEngine::replicationBatchIsComplete() const {
     return _engine->replicationBatchIsComplete();
 }
@@ -754,6 +792,98 @@ void KVStorageEngine::_dumpCatalog(OperationContext* opCtx) {
         rec = cursor->next();
     }
     opCtx->recoveryUnit()->abandonSnapshot();
+}
+
+void KVStorageEngine::addDropPendingIdent(const Timestamp& dropTimestamp,
+                                          const NamespaceString& nss,
+                                          StringData ident) {
+    _dropPendingIdentReaper.addDropPendingIdent(dropTimestamp, nss, ident);
+}
+
+void KVStorageEngine::_onOldestTimestampChanged(const Timestamp& oldestTimestamp) {
+    if (oldestTimestamp.isNull()) {
+        return;
+    }
+    // No drop-pending idents present if getEarliestDropTimestamp() returns boost::none.
+    if (auto earliestDropTimestamp = _dropPendingIdentReaper.getEarliestDropTimestamp()) {
+        if (oldestTimestamp > *earliestDropTimestamp) {
+            log() << "Removing drop-pending idents with drop timestamps before: "
+                  << oldestTimestamp;
+            auto opCtx = cc().makeOperationContext();
+            _dropPendingIdentReaper.dropIdentsOlderThan(opCtx.get(), oldestTimestamp);
+        }
+    }
+}
+
+KVStorageEngine::TimestampMonitor::TimestampMonitor(KVEngine* engine, PeriodicRunner* runner)
+    : _engine(engine), _running(false), _periodicRunner(runner) {
+    _currentTimestamps.checkpoint = _engine->getCheckpointTimestamp();
+    _currentTimestamps.oldest = _engine->getOldestTimestamp();
+    _currentTimestamps.stable = _engine->getStableTimestamp();
+}
+
+KVStorageEngine::TimestampMonitor::~TimestampMonitor() {
+    log() << "Timestamp monitor shutting down";
+    stdx::lock_guard<stdx::mutex> lock(_monitorMutex);
+    invariant(_listeners.empty());
+}
+
+void KVStorageEngine::TimestampMonitor::startup() {
+    invariant(!_running);
+
+    log() << "Timestamp monitor starting";
+    PeriodicRunner::PeriodicJob job("TimestampMonitor",
+                                    [&](Client* client) {
+                                        Timestamp checkpoint = _engine->getCheckpointTimestamp();
+                                        Timestamp oldest = _engine->getOldestTimestamp();
+                                        Timestamp stable = _engine->getStableTimestamp();
+
+                                        // Notify listeners if the timestamps changed.
+                                        if (_currentTimestamps.checkpoint != checkpoint) {
+                                            _currentTimestamps.checkpoint = checkpoint;
+                                            notifyAll(TimestampType::kCheckpoint, checkpoint);
+                                        }
+
+                                        if (_currentTimestamps.oldest != oldest) {
+                                            _currentTimestamps.oldest = oldest;
+                                            notifyAll(TimestampType::kOldest, oldest);
+                                        }
+
+                                        if (_currentTimestamps.stable != stable) {
+                                            _currentTimestamps.stable = stable;
+                                            notifyAll(TimestampType::kStable, stable);
+                                        }
+                                    },
+                                    Seconds(1));
+    _periodicRunner->scheduleJob(std::move(job));
+    _running = true;
+}
+
+void KVStorageEngine::TimestampMonitor::notifyAll(TimestampType type, Timestamp newTimestamp) {
+    stdx::lock_guard<stdx::mutex> lock(_monitorMutex);
+    for (auto& listener : _listeners) {
+        if (listener->getType() == type) {
+            listener->notify(newTimestamp);
+        }
+    }
+}
+
+void KVStorageEngine::TimestampMonitor::addListener(TimestampListener* listener) {
+    stdx::lock_guard<stdx::mutex> lock(_monitorMutex);
+    if (std::find(_listeners.begin(), _listeners.end(), listener) != _listeners.end()) {
+        bool listenerAlreadyRegistered = true;
+        invariant(!listenerAlreadyRegistered);
+    }
+    _listeners.push_back(listener);
+}
+
+void KVStorageEngine::TimestampMonitor::removeListener(TimestampListener* listener) {
+    stdx::lock_guard<stdx::mutex> lock(_monitorMutex);
+    if (std::find(_listeners.begin(), _listeners.end(), listener) == _listeners.end()) {
+        bool listenerNotRegistered = true;
+        invariant(!listenerNotRegistered);
+    }
+    _listeners.erase(std::remove(_listeners.begin(), _listeners.end(), listener));
 }
 
 

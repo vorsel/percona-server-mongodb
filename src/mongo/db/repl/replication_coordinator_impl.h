@@ -165,7 +165,7 @@ public:
 
     virtual Status waitUntilOpTimeForRead(OperationContext* opCtx,
                                           const ReadConcernArgs& readConcern) override;
-
+    Status awaitOpTimeCommitted(OperationContext* opCtx, OpTime opTime) override;
     virtual OID getElectionId() override;
 
     virtual int getMyId() const override;
@@ -268,8 +268,6 @@ public:
 
     virtual bool getWriteConcernMajorityShouldJournal() override;
 
-    virtual void summarizeAsHtml(ReplSetHtmlSummary* s) override;
-
     virtual void dropAllSnapshots() override;
     /**
      * Get current term from topology coordinator
@@ -296,9 +294,6 @@ public:
 
     virtual WriteConcernOptions populateUnsetWriteConcernOptionsSyncMode(
         WriteConcernOptions wc) override;
-
-    virtual ReplSettings::IndexPrefetchConfig getIndexPrefetchConfig() const override;
-    virtual void setIndexPrefetchConfig(const ReplSettings::IndexPrefetchConfig cfg) override;
 
     virtual Status stepUpIfEligible(bool skipDryRun) override;
 
@@ -362,7 +357,7 @@ public:
      * Simple test wrappers that expose private methods.
      */
     boost::optional<OpTime> calculateStableOpTime_forTest(const std::set<OpTime>& candidates,
-                                                          const OpTime& commitPoint);
+                                                          const OpTime& maximumStableOpTime);
     void cleanupStableOpTimeCandidates_forTest(std::set<OpTime>* candidates, OpTime stableOpTime);
     std::set<OpTime> getStableOpTimeCandidates_forTest();
     boost::optional<OpTime> getStableOpTime_forTest();
@@ -444,9 +439,8 @@ private:
      */
     enum PostMemberStateUpdateAction {
         kActionNone,
-        kActionCloseAllConnections,  // Also indicates that we should clear sharding state.
+        kActionSteppedDownOrRemoved,
         kActionFollowerModeStateChange,
-        kActionWinElection,
         kActionStartSingleNodeElection
     };
 
@@ -599,7 +593,7 @@ private:
         // during rollback. In order to read it, must have the RSTL. To set it when transitioning
         // into RS_ROLLBACK, must have the RSTL in mode X. Otherwise, no lock or mutex is necessary
         // to set it.
-        AtomicUInt32 _canServeNonLocalReads;
+        AtomicWord<unsigned> _canServeNonLocalReads;
     };
 
     void _resetMyLastOpTimes(WithLock lk);
@@ -850,6 +844,16 @@ private:
     void _performPostMemberStateUpdateAction(PostMemberStateUpdateAction action);
 
     /**
+     * Update state after winning an election.
+     */
+    void _postWonElectionUpdateMemberState(WithLock lk);
+
+    /**
+     * Helper to select appropriate sync source after transitioning from a follower state.
+     */
+    void _onFollowerModeStateChange();
+
+    /**
      * Begins an attempt to elect this node.
      * Called after an incoming heartbeat changes this node's view of the set such that it
      * believes it can be elected PRIMARY.
@@ -918,6 +922,11 @@ private:
      * Schedules stepdown to run with the global exclusive lock.
      */
     executor::TaskExecutor::EventHandle _stepDownStart();
+
+    /**
+     * Kills users operations and aborts unprepared transactions.
+     */
+    void _killOperationsOnStepDown(OperationContext* opCtx);
 
     /**
      * Completes a step-down of the current node.  Must be run with a global
@@ -1020,13 +1029,13 @@ private:
     boost::optional<OpTime> _getStableOpTime(WithLock lk);
 
     /**
-     * Calculates the 'stable' replication optime given a set of optime candidates and the
-     * current commit point. The stable optime is the greatest optime in 'candidates' that is
-     * also less than or equal to 'commitPoint'.
+     * Calculates the 'stable' replication optime given a set of optime candidates and a maximum
+     * stable optime. The stable optime is the greatest optime in 'candidates' that is also less
+     * than or equal to 'maximumStableOpTime'.
      */
     boost::optional<OpTime> _calculateStableOpTime(WithLock lk,
                                                    const std::set<OpTime>& candidates,
-                                                   const OpTime& commitPoint);
+                                                   OpTime maximumStableOpTime);
 
     /**
      * Removes any optimes from the optime set 'candidates' that are less than
@@ -1261,7 +1270,7 @@ private:
         _initialSyncer;  // (I) pointer set under mutex, copied by callers.
 
     // Hands out the next snapshot name.
-    AtomicUInt64 _snapshotNameGenerator;  // (S)
+    AtomicWord<unsigned long long> _snapshotNameGenerator;  // (S)
 
     // The OpTimes and SnapshotNames for all snapshots newer than the current commit point, kept in
     // sorted order. Any time this is changed, you must also update _uncommitedSnapshotsSize.
@@ -1269,7 +1278,7 @@ private:
 
     // A cache of the size of _uncommittedSnaphots that can be read without any locking.
     // May only be written to while holding _mutex.
-    AtomicUInt64 _uncommittedSnapshotsSize;  // (I)
+    AtomicWord<unsigned long long> _uncommittedSnapshotsSize;  // (I)
 
     // The non-null OpTime and SnapshotName of the current snapshot used for committed reads, if
     // there is one.
@@ -1322,15 +1331,10 @@ private:
     int _earliestMemberId = -1;  // (M)
 
     // Cached copy of the current config protocol version.
-    AtomicInt64 _protVersion{1};  // (S)
+    AtomicWord<long long> _protVersion{1};  // (S)
 
     // Source of random numbers used in setting election timeouts, etc.
     PseudoRandom _random;  // (M)
-
-    // This setting affects the Applier prefetcher behavior.
-    mutable stdx::mutex _indexPrefetchMutex;
-    ReplSettings::IndexPrefetchConfig _indexPrefetchConfig =
-        ReplSettings::IndexPrefetchConfig::PREFETCH_ALL;  // (I)
 
     // The catchup state including all catchup logic. The presence of a non-null pointer indicates
     // that the node is currently in catchup mode.
@@ -1340,7 +1344,7 @@ private:
     // function.
     // This variable must be written immediately after _term, and thus its value can lag.
     // Reading this value does not require the replication coordinator mutex to be locked.
-    AtomicInt64 _termShadow;  // (S)
+    AtomicWord<long long> _termShadow;  // (S)
 
     // When we decide to step down due to hearing about a higher term, we remember the term we heard
     // here so we can update our term to match as part of finishing stepdown.

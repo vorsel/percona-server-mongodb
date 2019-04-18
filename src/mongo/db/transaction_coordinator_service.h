@@ -34,7 +34,6 @@
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/db/logical_session_id.h"
-#include "mongo/db/transaction_coordinator.h"
 #include "mongo/db/transaction_coordinator_catalog.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/future.h"
@@ -53,7 +52,12 @@ public:
     ~TransactionCoordinatorService() = default;
 
     /**
-     * Shuts down the thread pool used for executing commits.
+     * Starts up the thread pool used for executing commits.
+     */
+    void startup();
+
+    /**
+     * Shuts down and joins the thread pool used for executing commits.
      */
     void shutdown();
 
@@ -81,7 +85,7 @@ public:
      *
      * If no coordinator for the (lsid, txnNumber) exists, returns boost::none.
      */
-    boost::optional<Future<TransactionCoordinator::CommitDecision>> coordinateCommit(
+    boost::optional<Future<txn::CommitDecision>> coordinateCommit(
         OperationContext* opCtx,
         LogicalSessionId lsid,
         TxnNumber txnNumber,
@@ -93,13 +97,31 @@ public:
      *
      * If no coordinator for the (lsid, txnNumber) exists, returns boost::none.
      */
-    boost::optional<Future<TransactionCoordinator::CommitDecision>> recoverCommit(
-        OperationContext* opCtx, LogicalSessionId lsid, TxnNumber txnNumber);
+    boost::optional<Future<txn::CommitDecision>> recoverCommit(OperationContext* opCtx,
+                                                               LogicalSessionId lsid,
+                                                               TxnNumber txnNumber);
+
+    /**
+     * Marks the coordinator catalog as stepping up, which blocks all incoming requests for
+     * coordinators, and launches an async task to:
+     * 1. Wait for the coordinators in the catalog to complete (successfully or with an error) and
+     *    be removed from the catalog.
+     * 2. Read all pending commit tasks from the config.transactionCoordinators collection.
+     * 3. Create TransactionCoordinator objects in memory for each pending commit and launch an
+     *    async task to continue coordinating its commit.
+     */
+    void onStepUp(OperationContext* opCtx);
+
+    /*
+     * Shuts down and joins the original thread pool, then sets the thread pool to 'pool' and starts
+     * 'pool'.
+     */
+    void setThreadPoolForTest(std::unique_ptr<ThreadPool> pool);
 
 private:
     std::shared_ptr<TransactionCoordinatorCatalog> _coordinatorCatalog;
 
-    ThreadPool _threadPool;
+    std::unique_ptr<ThreadPool> _threadPool;
 };
 
 }  // namespace mongo

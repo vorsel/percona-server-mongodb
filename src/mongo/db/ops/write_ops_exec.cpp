@@ -94,6 +94,7 @@ MONGO_FAIL_POINT_DEFINE(hangBeforeChildRemoveOpIsPopped);
 MONGO_FAIL_POINT_DEFINE(hangAfterAllChildRemoveOpsArePopped);
 MONGO_FAIL_POINT_DEFINE(hangDuringBatchInsert);
 MONGO_FAIL_POINT_DEFINE(hangDuringBatchUpdate);
+MONGO_FAIL_POINT_DEFINE(hangDuringBatchRemove);
 
 void updateRetryStats(OperationContext* opCtx, bool containsRetry) {
     if (containsRetry) {
@@ -209,7 +210,7 @@ void makeCollection(OperationContext* opCtx, const NamespaceString& ns) {
             CollectionOptions collectionOptions;
             uassertStatusOK(
                 collectionOptions.parse(BSONObj(), CollectionOptions::ParseKind::parseForCommand));
-            uassertStatusOK(Database::userCreateNS(opCtx, db.getDb(), ns.ns(), collectionOptions));
+            uassertStatusOK(db.getDb()->userCreateNS(opCtx, ns, collectionOptions));
             wuow.commit();
         }
     });
@@ -354,12 +355,14 @@ bool insertBatchAndHandleErrors(OperationContext* opCtx,
                 &hangDuringBatchInsert,
                 opCtx,
                 "hangDuringBatchInsert",
-                []() {
-                    log() << "batch insert - hangDuringBatchInsert fail point enabled. Blocking "
-                             "until fail point is disabled.";
+                [wholeOp]() {
+                    log()
+                        << "batch insert - hangDuringBatchInsert fail point enabled for namespace "
+                        << wholeOp.getNamespace() << ". Blocking "
+                                                     "until fail point is disabled.";
                 },
-                true  // Check for interrupt periodically.
-                );
+                true,  // Check for interrupt periodically.
+                wholeOp.getNamespace());
 
             if (MONGO_FAIL_POINT(failAllInserts)) {
                 uasserted(ErrorCodes::InternalError, "failAllInserts failpoint active!");
@@ -520,8 +523,7 @@ WriteResult performInserts(OperationContext* opCtx,
             const auto stmtId = getStmtIdForWriteOp(opCtx, wholeOp, stmtIdIndex++);
             if (opCtx->getTxnNumber()) {
                 if (!txnParticipant->inMultiDocumentTransaction() &&
-                    txnParticipant->checkStatementExecutedNoOplogEntryFetch(*opCtx->getTxnNumber(),
-                                                                            stmtId)) {
+                    txnParticipant->checkStatementExecutedNoOplogEntryFetch(stmtId)) {
                     containsRetry = true;
                     RetryableWritesStats::get(opCtx)->incrementRetriedStatementsCount();
                     out.results.emplace_back(makeWriteResultForInsertOrDeleteRetry());
@@ -568,11 +570,18 @@ static SingleWriteResult performSingleUpdateOp(OperationContext* opCtx,
 
     boost::optional<AutoGetCollection> collection;
     while (true) {
+        const auto checkForInterrupt = false;
         CurOpFailpointHelpers::waitWhileFailPointEnabled(
-            &hangDuringBatchUpdate, opCtx, "hangDuringBatchUpdate", [opCtx]() {
-                log() << "batch update - hangDuringBatchUpdate fail point enabled. Blocking until "
+            &hangDuringBatchUpdate,
+            opCtx,
+            "hangDuringBatchUpdate",
+            [ns]() {
+                log() << "batch update - hangDuringBatchUpdate fail point enabled for nss " << ns
+                      << ". Blocking until "
                          "fail point is disabled.";
-            });
+            },
+            checkForInterrupt,
+            ns);
 
         if (MONGO_FAIL_POINT(failAllUpdates)) {
             uasserted(ErrorCodes::InternalError, "failAllUpdates failpoint active!");
@@ -729,8 +738,7 @@ WriteResult performUpdates(OperationContext* opCtx, const write_ops::Update& who
         const auto stmtId = getStmtIdForWriteOp(opCtx, wholeOp, stmtIdIndex++);
         if (opCtx->getTxnNumber()) {
             if (!txnParticipant->inMultiDocumentTransaction()) {
-                if (auto entry = txnParticipant->checkStatementExecuted(
-                        opCtx, *opCtx->getTxnNumber(), stmtId)) {
+                if (auto entry = txnParticipant->checkStatementExecuted(stmtId)) {
                     containsRetry = true;
                     RetryableWritesStats::get(opCtx)->incrementRetriedStatementsCount();
                     out.results.emplace_back(parseOplogEntryForUpdate(*entry));
@@ -786,8 +794,6 @@ static SingleWriteResult performSingleDeleteOp(OperationContext* opCtx,
         curOp.ensureStarted();
     }
 
-    curOp.debug().additiveMetrics.ndeleted = 0;
-
     DeleteRequest request(ns);
     request.setQuery(op.getQ());
     request.setCollation(write_ops::collationOf(op));
@@ -802,6 +808,16 @@ static SingleWriteResult performSingleDeleteOp(OperationContext* opCtx,
     ParsedDelete parsedDelete(opCtx, &request);
     uassertStatusOK(parsedDelete.parseRequest());
 
+    CurOpFailpointHelpers::waitWhileFailPointEnabled(
+        &hangDuringBatchRemove,
+        opCtx,
+        "hangDuringBatchRemove",
+        []() {
+            log() << "batch remove - hangDuringBatchRemove fail point enabled. Blocking "
+                     "until fail point is disabled.";
+        },
+        true  // Check for interrupt periodically.
+        );
     if (MONGO_FAIL_POINT(failAllRemoves)) {
         uasserted(ErrorCodes::InternalError, "failAllRemoves failpoint active!");
     }
@@ -871,8 +887,7 @@ WriteResult performDeletes(OperationContext* opCtx, const write_ops::Delete& who
         const auto stmtId = getStmtIdForWriteOp(opCtx, wholeOp, stmtIdIndex++);
         if (opCtx->getTxnNumber()) {
             if (!txnParticipant->inMultiDocumentTransaction() &&
-                txnParticipant->checkStatementExecutedNoOplogEntryFetch(*opCtx->getTxnNumber(),
-                                                                        stmtId)) {
+                txnParticipant->checkStatementExecutedNoOplogEntryFetch(stmtId)) {
                 containsRetry = true;
                 RetryableWritesStats::get(opCtx)->incrementRetriedStatementsCount();
                 out.results.emplace_back(makeWriteResultForInsertOrDeleteRetry());

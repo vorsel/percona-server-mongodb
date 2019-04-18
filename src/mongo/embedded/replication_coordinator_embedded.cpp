@@ -239,6 +239,11 @@ Status ReplicationCoordinatorEmbedded::waitUntilOpTimeForReadUntil(OperationCont
     UASSERT_NOT_IMPLEMENTED;
 }
 
+Status ReplicationCoordinatorEmbedded::awaitOpTimeCommitted(OperationContext* opCtx,
+                                                            OpTime opTime) {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
 ReplicationCoordinator::StatusAndDuration ReplicationCoordinatorEmbedded::awaitReplication(
     OperationContext*, const OpTime&, const WriteConcernOptions&) {
     UASSERT_NOT_IMPLEMENTED;
@@ -398,10 +403,6 @@ Status ReplicationCoordinatorEmbedded::processHeartbeatV1(const ReplSetHeartbeat
     UASSERT_NOT_IMPLEMENTED;
 }
 
-void ReplicationCoordinatorEmbedded::summarizeAsHtml(ReplSetHtmlSummary*) {
-    UASSERT_NOT_IMPLEMENTED;
-}
-
 long long ReplicationCoordinatorEmbedded::getTerm() {
     UASSERT_NOT_IMPLEMENTED;
 }
@@ -424,15 +425,6 @@ void ReplicationCoordinatorEmbedded::dropAllSnapshots() {
 }
 
 Status ReplicationCoordinatorEmbedded::stepUpIfEligible(bool skipDryRun) {
-    UASSERT_NOT_IMPLEMENTED;
-}
-
-ReplSettings::IndexPrefetchConfig ReplicationCoordinatorEmbedded::getIndexPrefetchConfig() const {
-    UASSERT_NOT_IMPLEMENTED;
-}
-
-void ReplicationCoordinatorEmbedded::setIndexPrefetchConfig(
-    const ReplSettings::IndexPrefetchConfig) {
     UASSERT_NOT_IMPLEMENTED;
 }
 

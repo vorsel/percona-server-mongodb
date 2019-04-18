@@ -40,8 +40,6 @@
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/drop_collection.h"
 #include "mongo/db/catalog/index_catalog.h"
-#include "mongo/db/catalog/multi_index_block.h"
-#include "mongo/db/catalog/multi_index_block_impl.h"
 #include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -142,10 +140,6 @@ Status renameCollectionCommon(OperationContext* opCtx,
     else if (!lockState->isW())
         globalWriteLock.emplace(opCtx);
 
-    // Allow the MODE_X lock above to be interrupted, but rename is not resilient to interruption
-    // when the onRenameCollection OpObserver takes an oplog collection lock.
-    UninterruptibleLockGuard noInterrupt(opCtx->lockState());
-
     // We stay in source context the whole time. This is mostly to set the CurOp namespace.
     boost::optional<OldClientContext> ctx;
     ctx.emplace(opCtx, source.ns());
@@ -161,7 +155,8 @@ Status renameCollectionCommon(OperationContext* opCtx,
                                     << target.ns());
     }
 
-    Database* const sourceDB = DatabaseHolder::getDatabaseHolder().get(opCtx, source.db());
+    auto databaseHolder = DatabaseHolder::get(opCtx);
+    auto sourceDB = databaseHolder->getDb(opCtx, source.db());
     if (sourceDB) {
         DatabaseShardingState::get(sourceDB).checkDbVersion(opCtx);
     }
@@ -205,7 +200,7 @@ Status renameCollectionCommon(OperationContext* opCtx,
 
     BackgroundOperation::assertNoBgOpInProgForNs(source.ns());
 
-    Database* const targetDB = DatabaseHolder::getDatabaseHolder().openDb(opCtx, target.db());
+    auto targetDB = databaseHolder->openDb(opCtx, target.db());
 
     // Check if the target namespace exists and if dropTarget is true.
     // Return a non-OK status if target exists and dropTarget is not true or if the collection
@@ -258,12 +253,13 @@ Status renameCollectionCommon(OperationContext* opCtx,
         }
     }
 
+    auto opObserver = opCtx->getServiceContext()->getOpObserver();
+
     auto sourceUUID = sourceColl->uuid();
     // If we are renaming in the same database, just rename the namespace and we're done.
     if (sourceDB == targetDB) {
         return writeConflictRetry(opCtx, "renameCollection", target.ns(), [&] {
             WriteUnitOfWork wunit(opCtx);
-            auto opObserver = getGlobalServiceContext()->getOpObserver();
             if (!targetColl) {
                 // Target collection does not exist.
                 auto stayTemp = options.stayTemp;
@@ -275,10 +271,14 @@ Status renameCollectionCommon(OperationContext* opCtx,
                         return status;
                     }
                 }
+                // Rename is not resilient to interruption when the onRenameCollection OpObserver
+                // takes an oplog collection lock.
+                UninterruptibleLockGuard noInterrupt(opCtx->lockState());
+
                 // We have to override the provided 'dropTarget' setting for idempotency reasons to
                 // avoid unintentionally removing a collection on a secondary with the same name as
                 // the target.
-                opObserver->onRenameCollection(opCtx, source, target, sourceUUID, {}, stayTemp);
+                opObserver->onRenameCollection(opCtx, source, target, sourceUUID, {}, 0U, stayTemp);
                 wunit.commit();
                 return Status::OK();
             }
@@ -300,7 +300,7 @@ Status renameCollectionCommon(OperationContext* opCtx,
                 // drop-pending rename. In the case that this collection drop gets rolled back, this
                 // will incur a performance hit, since those indexes will have to be rebuilt from
                 // scratch, but data integrity is maintained.
-                std::vector<IndexDescriptor*> indexesToDrop;
+                std::vector<const IndexDescriptor*> indexesToDrop;
                 auto indexIter = targetColl->getIndexCatalog()->getIndexIterator(opCtx, true);
 
                 // Determine which index names are too long. Since we don't have the collection
@@ -331,8 +331,9 @@ Status renameCollectionCommon(OperationContext* opCtx,
                 }
             }
 
+            auto numRecords = targetColl->numRecords(opCtx);
             auto renameOpTime = opObserver->preRenameCollection(
-                opCtx, source, target, sourceUUID, dropTargetUUID, options.stayTemp);
+                opCtx, source, target, sourceUUID, dropTargetUUID, numRecords, options.stayTemp);
 
             if (!renameOpTimeFromApplyOps.isNull()) {
                 // 'renameOpTime' must be null because a valid 'renameOpTimeFromApplyOps' implies
@@ -410,17 +411,19 @@ Status renameCollectionCommon(OperationContext* opCtx,
     }
 
     // Dismissed on success
-    auto tmpCollectionDropper = MakeGuard([&] {
-        // Ensure that we don't trigger an exception when attempting to take locks.
-        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
-
+    auto tmpCollectionDropper = makeGuard([&] {
         BSONObjBuilder unusedResult;
-        auto status =
-            dropCollection(opCtx,
-                           tmpName,
-                           unusedResult,
-                           renameOpTimeFromApplyOps,
-                           DropCollectionSystemCollectionMode::kAllowSystemCollectionDrops);
+        Status status = Status::OK();
+        try {
+            status =
+                dropCollection(opCtx,
+                               tmpName,
+                               unusedResult,
+                               renameOpTimeFromApplyOps,
+                               DropCollectionSystemCollectionMode::kAllowSystemCollectionDrops);
+        } catch (...) {
+            status = exceptionToStatus();
+        }
         if (!status.isOK()) {
             // Ignoring failure case when dropping the temporary collection during cleanup because
             // the rename operation has already failed for another reason.
@@ -431,9 +434,6 @@ Status renameCollectionCommon(OperationContext* opCtx,
 
     // Copy the index descriptions from the source collection, adjusting the ns field.
     {
-        MultiIndexBlockImpl indexer(opCtx, tmpColl);
-        indexer.allowInterruption();
-
         std::vector<BSONObj> indexesToCopy;
         std::unique_ptr<IndexCatalog::IndexIterator> sourceIndIt =
             sourceColl->getIndexCatalog()->getIndexIterator(opCtx, true);
@@ -457,25 +457,30 @@ Status renameCollectionCommon(OperationContext* opCtx,
             indexesToCopy.push_back(newIndex.obj());
         }
 
-        status = indexer.init(indexesToCopy).getStatus();
-        if (!status.isOK()) {
-            return status;
-        }
-
-        status = indexer.dumpInsertsFromBulk();
-        if (!status.isOK()) {
-            return status;
-        }
-
+        // Create indexes using the namespace-adjusted index specs on the empty temporary collection
+        // that was just created. Since each index build is possibly replicated to downstream nodes,
+        // each createIndex oplog entry must have a distinct timestamp to support correct rollback
+        // operation. This is achieved by writing the createIndexes oplog entry *before* creating
+        // the index. Using IndexCatalog::createIndexOnEmptyCollection() for the index creation
+        // allows us to add and commit the index within a single WriteUnitOfWork and avoids the
+        // possibility of seeing the index in an unfinished state. For more information on assigning
+        // timestamps to multiple index builds, please see SERVER-35780 and SERVER-35070.
         status = writeConflictRetry(opCtx, "renameCollection", tmpName.ns(), [&] {
             WriteUnitOfWork wunit(opCtx);
-            auto status = indexer.commit([opCtx, &tmpName, tmpColl](const BSONObj& spec) {
-                opCtx->getServiceContext()->getOpObserver()->onCreateIndex(
-                    opCtx, tmpName, *(tmpColl->uuid()), spec, false);
-            });
-            if (!status.isOK()) {
-                return status;
-            }
+            auto tmpIndexCatalog = tmpColl->getIndexCatalog();
+            for (const auto& indexToCopy : indexesToCopy) {
+                opObserver->onCreateIndex(opCtx,
+                                          tmpName,
+                                          *(tmpColl->uuid()),
+                                          indexToCopy,
+                                          false  // fromMigrate
+                                          );
+                auto indexResult =
+                    tmpIndexCatalog->createIndexOnEmptyCollection(opCtx, indexToCopy);
+                if (!indexResult.isOK()) {
+                    return indexResult.getStatus();
+                }
+            };
             wunit.commit();
             return Status::OK();
         });
@@ -558,7 +563,7 @@ Status renameCollectionCommon(OperationContext* opCtx,
     if (!status.isOK()) {
         return status;
     }
-    tmpCollectionDropper.Dismiss();
+    tmpCollectionDropper.dismiss();
 
     BSONObjBuilder unusedResult;
     return dropCollection(opCtx,

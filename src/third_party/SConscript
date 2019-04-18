@@ -6,18 +6,19 @@ Import("env use_system_version_of_library usemozjs get_option")
 Import("wiredtiger")
 Import("mobile_se")
 
-boostSuffix = "-1.60.0"
-snappySuffix = '-1.1.3'
+boostSuffix = "-1.69.0"
+snappySuffix = '-1.1.7'
 zlibSuffix = '-1.2.11'
-pcreSuffix = "-8.41"
+zstdSuffix = '-1.3.7'
+pcreSuffix = "-8.42"
 mozjsSuffix = '-45'
 yamlSuffix = '-0.6.2'
 icuSuffix = '-57.1'
 gperftoolsSuffix = '-2.5'
 lz4Suffix = '-r131'
 timelibSuffix = '-2018.01alpha1'
-tomcryptSuffix = '-1.18.1'
-benchmarkSuffix = '-1.3.0'
+tomcryptSuffix = '-1.18.2'
+benchmarkSuffix = '-1.4.1'
 sqliteSuffix = '-amalgamation-3190300'
 
 thirdPartyIncludePathList = [
@@ -53,11 +54,15 @@ if not use_system_version_of_library('lz4'):
 # Valgrind is a header only include as valgrind.h includes everything we need
 if not use_system_version_of_library('valgrind'):
     thirdPartyIncludePathList.append(
-        ('valgrind', '#/src/third_party/valgrind-3.11.0/include'))
+        ('valgrind', '#/src/third_party/valgrind-3.14.0/include'))
 
 if not use_system_version_of_library('zlib'):
     thirdPartyIncludePathList.append(
         ('zlib', '#/src/third_party/zlib' + zlibSuffix))
+
+if not use_system_version_of_library('zstd'):
+    thirdPartyIncludePathList.append(
+        ('zstd', '#/src/third_party/zstandard' + zstdSuffix + '/zstd/lib'))
 
 if not use_system_version_of_library('sqlite'):
     thirdPartyIncludePathList.append(
@@ -274,6 +279,26 @@ zlibEnv.Library(
     target="shim_zlib",
     source=[
         'shim_zlib.cpp',
+    ])
+
+if use_system_version_of_library("zstd"):
+    zstdEnv = env.Clone(
+        SYSLIBDEPS=[
+            env['LIBDEPS_ZSTD_SYSLIBDEP'],
+        ])
+else:
+    zstdEnv = env.Clone()
+    zstdEnv.InjectThirdPartyIncludePaths(libraries=['zstd'])
+    zstdEnv.SConscript('zstandard' + zstdSuffix + '/SConscript', exports={ 'env' : zstdEnv })
+    zstdEnv = zstdEnv.Clone(
+        LIBDEPS_INTERFACE=[
+            'zstandard' + zstdSuffix + '/zstd',
+        ])
+
+zstdEnv.Library(
+    target="shim_zstd",
+    source=[
+        'shim_zstd.cpp',
     ])
 
 if use_system_version_of_library("google-benchmark"):

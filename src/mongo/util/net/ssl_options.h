@@ -51,11 +51,11 @@ class Environment;
 
 struct SSLParams {
     enum class Protocols { TLS1_0, TLS1_1, TLS1_2, TLS1_3 };
-    AtomicInt32 sslMode;            // --tlsMode - the TLS operation mode, see enum SSLModes
+    AtomicWord<int> sslMode;        // --tlsMode - the TLS operation mode, see enum SSLModes
     std::string sslPEMTempDHParam;  // --setParameter OpenSSLDiffieHellmanParameters=file : PEM file
                                     // with DH parameters.
-    std::string sslPEMKeyFile;      // --tlsPEMKeyFile
-    std::string sslPEMKeyPassword;  // --tlsPEMKeyPassword
+    std::string sslPEMKeyFile;      // --tlsCertificateKeyFile
+    std::string sslPEMKeyPassword;  // --tlsCertificateKeyFilePassword
     std::string sslClusterFile;     // --tlsInternalKeyFile
     std::string sslClusterPassword;  // --tlsInternalKeyPassword
     std::string sslCAFile;           // --tlsCAFile
@@ -92,7 +92,7 @@ struct SSLParams {
         sslMode.store(SSLMode_disabled);
     }
 
-    enum SSLModes : AtomicInt32::WordType {
+    enum SSLModes : int {
         /**
         * Make unencrypted outgoing connections and do not accept incoming SSL-connections.
         */
@@ -116,8 +116,8 @@ struct SSLParams {
 
     static StatusWith<SSLModes> sslModeParse(StringData strMode);
     static StatusWith<SSLModes> tlsModeParse(StringData strMode);
-    static std::string sslModeFormat(AtomicInt32::WordType mode);
-    static std::string tlsModeFormat(AtomicInt32::WordType mode);
+    static std::string sslModeFormat(int mode);
+    static std::string tlsModeFormat(int mode);
 };
 
 extern SSLParams sslGlobalParams;

@@ -27,6 +27,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/namespace_string',
         '$BUILD_DIR/mongo/db/storage/bson_collection_catalog_entry',
         '$BUILD_DIR/mongo/db/catalog/uuid_catalog',
+        'kv_drop_pending_ident_reaper',
         'kv_prefix',
         ],
     )
@@ -50,6 +51,7 @@ env.Library(
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/storage/bson_collection_catalog_entry',
         '$BUILD_DIR/mongo/db/storage/kv/kv_engine_core',
+        'kv_drop_pending_ident_reaper',
     ],
 )
 
@@ -58,18 +60,21 @@ env.Library(
     target='kv_storage_engine',
     source=[
         'kv_storage_engine.cpp',
-        'temporary_kv_record_store.cpp'
+        'temporary_kv_record_store.cpp',
+        env.Idlc('kv_storage_engine.idl')[0],
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/catalog/catalog_impl',
+        '$BUILD_DIR/mongo/db/catalog/catalog_control',
         '$BUILD_DIR/mongo/db/storage/kv/kv_engine_core',
         '$BUILD_DIR/mongo/db/storage/storage_options',
         'kv_database_catalog_entry_core',
+        'kv_drop_pending_ident_reaper',
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/logical_clock',
         '$BUILD_DIR/mongo/db/storage/storage_repair_observer',
+        '$BUILD_DIR/mongo/idl/server_parameter',
     ],
 )
 
@@ -178,6 +183,7 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/db/namespace_string',
         '$BUILD_DIR/mongo/db/repl/replmocks',
         '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
+        '$BUILD_DIR/mongo/db/storage/devnull/storage_devnull_core',
         '$BUILD_DIR/mongo/db/storage/ephemeral_for_test/storage_ephemeral_for_test_core',
         '$BUILD_DIR/mongo/db/storage/storage_repair_observer',
         'kv_engine',

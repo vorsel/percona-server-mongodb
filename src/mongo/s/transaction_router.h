@@ -34,6 +34,7 @@
 #include <map>
 
 #include "mongo/base/disallow_copying.h"
+#include "mongo/db/commands/txn_cmds_gen.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/read_concern_args.h"
@@ -71,43 +72,27 @@ public:
      * Represents a shard participant in a distributed transaction. Lives only for the duration of
      * the transaction that created it.
      */
-    class Participant {
-    public:
-        explicit Participant(bool isCoordinator,
-                             StmtId stmtIdCreatedAt,
-                             SharedTransactionOptions sharedOptions);
+    struct Participant {
+        Participant(bool isCoordinator,
+                    StmtId stmtIdCreatedAt,
+                    SharedTransactionOptions sharedOptions);
 
         /**
          * Attaches necessary fields if this is participating in a multi statement transaction.
          */
         BSONObj attachTxnFieldsIfNeeded(BSONObj cmd, bool isFirstStatementInThisParticipant) const;
 
-        /**
-         * True if the participant has been chosen as the coordinator for its transaction.
-         */
-        bool isCoordinator() const;
-
-        /**
-         * Returns the highest statement id of the command during which this participant was
-         * created.
-         */
-        StmtId getStmtIdCreatedAt() const;
-
-        /**
-         * Returns the shared transaction options this participant was created with.
-         */
-        const auto& getSharedOptions() const {
-            return _sharedOptions;
-        }
-
-    private:
-        const bool _isCoordinator{false};
+        // True if the participant has been chosen as the coordinator for its transaction
+        const bool isCoordinator{false};
 
         // The highest statement id of the request during which this participant was created.
-        const StmtId _stmtIdCreatedAt{kUninitializedStmtId};
+        const StmtId stmtIdCreatedAt{kUninitializedStmtId};
 
-        const SharedTransactionOptions _sharedOptions;
+        // Returns the shared transaction options this participant was created with
+        const SharedTransactionOptions sharedOptions;
     };
+
+    enum class TransactionActions { kStart, kContinue, kCommit };
 
     /**
      * Encapsulates the logic around selecting a global read timestamp for a sharded transaction at
@@ -151,10 +136,18 @@ public:
     ~TransactionRouter();
 
     /**
+     * Extract the runtime state attached to the operation context. Returns nullptr if none is
+     * attached.
+     */
+    static TransactionRouter* get(OperationContext* opCtx);
+
+    /**
      * Starts a fresh transaction in this session or continue an existing one. Also cleans up the
      * previous transaction state.
      */
-    void beginOrContinueTxn(OperationContext* opCtx, TxnNumber txnNumber, bool startTransaction);
+    void beginOrContinueTxn(OperationContext* opCtx,
+                            TxnNumber txnNumber,
+                            TransactionActions action);
 
     /**
      * Attaches the required transaction related fields for a request to be sent to the given
@@ -172,39 +165,20 @@ public:
      * Updates the transaction state to allow for a retry of the current command on a stale version
      * error. Will throw if the transaction cannot be continued.
      */
-    void onStaleShardOrDbError(StringData cmdName);
+    void onStaleShardOrDbError(StringData cmdName, const Status& errorStatus);
 
     /**
      * Resets the transaction state to allow for a retry attempt. This includes clearing all
      * participants, clearing the coordinator, and resetting the global read timestamp. Will throw
      * if the transaction cannot be continued.
      */
-    void onSnapshotError();
+    void onSnapshotError(const Status& errorStatus);
 
     /**
      * Updates the transaction tracking state to allow for a retry attempt on a view resolution
      * error.
      */
-    void onViewResolutionError();
-
-    /**
-     * Computes and sets the atClusterTime for the current transaction based on the given query
-     * parameters. Does nothing if the transaction does not have snapshot read concern or an
-     * atClusterTime has already been selected and cannot be changed.
-     */
-    void computeAndSetAtClusterTime(OperationContext* opCtx,
-                                    bool mustRunOnAll,
-                                    const std::set<ShardId>& shardIds,
-                                    const NamespaceString& nss,
-                                    const BSONObj query,
-                                    const BSONObj collation);
-
-    /**
-     * Computes and sets the atClusterTime for the current transaction based on the targeted shard.
-     * Does nothing if the transaction does not have snapshot read concern or an atClusterTime has
-     * already been selected and cannot be changed.
-     */
-    void computeAndSetAtClusterTimeForUnsharded(OperationContext* opCtx, const ShardId& shardId);
+    void onViewResolutionError(const NamespaceString& nss);
 
     /**
      * Sets the atClusterTime for the current transaction to the latest time in the router's logical
@@ -228,29 +202,32 @@ public:
      * Commits the transaction. For transactions with multiple participants, this will initiate
      * the two phase commit procedure.
      */
-    Shard::CommandResponse commitTransaction(OperationContext* opCtx);
+    Shard::CommandResponse commitTransaction(
+        OperationContext* opCtx, const boost::optional<TxnRecoveryToken>& recoveryToken);
 
     /**
      * Sends abort to all participants and returns the responses from all shards.
      */
-    std::vector<AsyncRequestsSender::Response> abortTransaction(OperationContext* opCtx);
+    std::vector<AsyncRequestsSender::Response> abortTransaction(OperationContext* opCtx,
+                                                                bool isImplicit = false);
 
     /**
      * Sends abort to all shards in the current participant list. Will retry on retryable errors,
      * but ignores the responses from each shard.
      */
-    void implicitlyAbortTransaction(OperationContext* opCtx);
+    void implicitlyAbortTransaction(OperationContext* opCtx, const Status& errorStatus);
 
     /**
-     * Extract the runtimne state attached to the operation context. Returns nullptr if none is
-     * attached.
+     * Returns the participant for this transaction or nullptr if the specified shard is not
+     * participant of this transaction.
      */
-    static TransactionRouter* get(OperationContext* opCtx);
+    Participant* getParticipant(const ShardId& shard);
 
     /**
-     * Returns the participant for this transaction.
+     * If a coordinator has been selected for this transaction already, constructs a recovery token,
+     * which can be used to resume commit or abort of the transaction from a different router.
      */
-    boost::optional<Participant&> getParticipant(const ShardId& shard);
+    void appendRecoveryToken(BSONObjBuilder* builder) const;
 
 private:
     // Shortcut to obtain the id of the session under which this transaction router runs
@@ -260,6 +237,9 @@ private:
      * Run basic commit for transactions that touched a single shard.
      */
     Shard::CommandResponse _commitSingleShardTransaction(OperationContext* opCtx);
+
+    Shard::CommandResponse _commitWithRecoveryToken(OperationContext* opCtx,
+                                                    const TxnRecoveryToken& recoveryToken);
 
     /**
      * Run two phase commit for transactions that touched multiple shards.
@@ -317,6 +297,12 @@ private:
      */
     void _verifyParticipantAtClusterTime(const Participant& participant);
 
+    /**
+     * Returns a string with the active transaction's transaction number and logical session id
+     * (i.e. the transaction id).
+     */
+    std::string _txnIdToString() const;
+
     // The currently active transaction number on this transaction router (i.e. on the session)
     TxnNumber _txnNumber{kUninitializedTxnNumber};
 
@@ -324,6 +310,9 @@ private:
     // coordinator. If so, the router should no longer implicitly abort the transaction on errors,
     // since the coordinator may independently make a commit decision.
     bool _initiatedTwoPhaseCommit{false};
+
+    // Indicates whether this is trying to recover a commitTransaction on the current transaction.
+    bool _isRecoveringCommit{false};
 
     // Map of current participants of the current transaction.
     StringMap<Participant> _participants;

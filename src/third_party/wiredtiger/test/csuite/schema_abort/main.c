@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2018 MongoDB, Inc.
+ * Public Domain 2014-2019 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -1096,7 +1096,7 @@ main(int argc, char *argv[])
 		testutil_check(__wt_snprintf(
 		    statname, sizeof(statname), "%s/%s", home, ckpt_file));
 		while (stat(statname, &sb) != 0)
-			sleep(1);
+			testutil_sleep_wait(1, pid);
 		sleep(timeout);
 		sa.sa_handler = SIG_DFL;
 		testutil_checksys(sigaction(SIGCHLD, &sa, NULL));

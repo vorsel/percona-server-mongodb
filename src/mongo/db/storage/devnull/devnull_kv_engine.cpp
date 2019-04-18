@@ -215,7 +215,7 @@ public:
                          const RecordId& loc,
                          bool dupsAllowed) {}
 
-    virtual Status dupKeyCheck(OperationContext* opCtx, const BSONObj& key, const RecordId& loc) {
+    virtual Status dupKeyCheck(OperationContext* opCtx, const BSONObj& key) {
         return Status::OK();
     }
 
@@ -281,6 +281,11 @@ void DevNullKVEngine::setCachePressureForTest(int pressure) {
 StatusWith<std::vector<std::string>> DevNullKVEngine::beginNonBlockingBackup(
     OperationContext* opCtx) {
     std::vector<std::string> filesToCopy = {"filename.wt"};
+    return filesToCopy;
+}
+
+StatusWith<std::vector<std::string>> DevNullKVEngine::extendBackupCursor(OperationContext* opCtx) {
+    std::vector<std::string> filesToCopy = {"journal/WiredTigerLog.999"};
     return filesToCopy;
 }
 

@@ -35,486 +35,202 @@
 #include "mongo/db/transaction_coordinator.h"
 
 #include "mongo/db/logical_clock.h"
-#include "mongo/db/service_context.h"
+#include "mongo/db/transaction_coordinator_futures_util.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
+namespace {
 
-using Action = TransactionCoordinator::StateMachine::Action;
-using Event = TransactionCoordinator::StateMachine::Event;
-using State = TransactionCoordinator::StateMachine::State;
+using CoordinatorCommitDecision = TransactionCoordinator::CoordinatorCommitDecision;
 
-//
-// Pre-decision
-//
+CoordinatorCommitDecision makeDecisionFromPrepareVoteConsensus(
+    ServiceContext* service,
+    const txn::PrepareVoteConsensus& result,
+    const LogicalSessionId& lsid,
+    TxnNumber txnNumber) {
+    invariant(result.decision);
+    CoordinatorCommitDecision decision{*result.decision, boost::none};
 
-Action TransactionCoordinator::recvCoordinateCommit(const std::set<ShardId>& participants) {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
-    _participantList.recordFullList(participants);
-    return _stateMachine.onEvent(std::move(lk), Event::kRecvParticipantList);
-}
+    if (result.decision == txn::CommitDecision::kCommit) {
+        invariant(result.maxPrepareTimestamp);
 
-Action TransactionCoordinator::madeParticipantListDurable() {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
-    return _stateMachine.onEvent(std::move(lk), Event::kMadeParticipantListDurable);
-}
+        decision.commitTimestamp = Timestamp(result.maxPrepareTimestamp->getSecs(),
+                                             result.maxPrepareTimestamp->getInc() + 1);
 
-//
-// Abort path
-//
+        LOG(3) << "Advancing cluster time to commit Timestamp " << decision.commitTimestamp.get()
+               << " of transaction " << txnNumber << " on session " << lsid.toBSON();
 
-Action TransactionCoordinator::recvVoteAbort(const ShardId& shardId) {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
-    _participantList.recordVoteAbort(shardId);
-    return _stateMachine.onEvent(std::move(lk), Event::kRecvVoteAbort);
-}
-
-Action TransactionCoordinator::madeAbortDecisionDurable() {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
-    return _stateMachine.onEvent(std::move(lk), Event::kMadeAbortDecisionDurable);
-}
-
-Action TransactionCoordinator::recvAbortAck(const ShardId& shardId) {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
-    _participantList.recordAbortAck(shardId);
-    auto event = _participantList.allParticipantsAckedAbort() ? Event::kRecvFinalAbortAck
-                                                              : Event::kRecvAbortAck;
-    return _stateMachine.onEvent(std::move(lk), event);
-}
-
-//
-// Commit path
-//
-
-Action TransactionCoordinator::recvVoteCommit(const ShardId& shardId, Timestamp prepareTimestamp) {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
-    _participantList.recordVoteCommit(shardId, prepareTimestamp);
-    auto event = (_participantList.allParticipantsVotedCommit()) ? Event::kRecvFinalVoteCommit
-                                                                 : Event::kRecvVoteCommit;
-    if (event == Event::kRecvFinalVoteCommit) {
-        const auto maxPrepareTs = _participantList.getHighestPrepareTimestamp();
-        _commitTimestamp = Timestamp(maxPrepareTs.getSecs(), maxPrepareTs.getInc() + 1);
-        Status s = LogicalClock::get(getGlobalServiceContext())
-                       ->advanceClusterTime(LogicalTime(_commitTimestamp.get()));
-        if (!s.isOK()) {
-            log() << "Coordinator shard failed to advance cluster time to commitTimestamp "
-                  << causedBy(s);
-        }
+        uassertStatusOK(LogicalClock::get(service)->advanceClusterTime(
+            LogicalTime(result.maxPrepareTimestamp.get())));
     }
-    return _stateMachine.onEvent(std::move(lk), event);
+
+    return decision;
 }
 
-Action TransactionCoordinator::madeCommitDecisionDurable() {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
-    return _stateMachine.onEvent(std::move(lk), Event::kMadeCommitDecisionDurable);
+}  // namespace
+
+TransactionCoordinator::TransactionCoordinator(ServiceContext* service,
+                                               executor::TaskExecutor* networkExecutor,
+                                               ThreadPool* callbackPool,
+                                               const LogicalSessionId& lsid,
+                                               const TxnNumber& txnNumber)
+    : _service(service),
+      _driver(networkExecutor, callbackPool),
+      _lsid(lsid),
+      _txnNumber(txnNumber),
+      _state(CoordinatorState::kInit) {}
+
+TransactionCoordinator::~TransactionCoordinator() {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    invariant(_state == TransactionCoordinator::CoordinatorState::kDone);
+
+    // Make sure no callers of functions on the coordinator are waiting for a decision to be
+    // signaled or the commit process to complete.
+    invariant(_completionPromises.empty());
 }
-
-Action TransactionCoordinator::recvCommitAck(const ShardId& shardId) {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
-    _participantList.recordCommitAck(shardId);
-    auto event = _participantList.allParticipantsAckedCommit() ? Event::kRecvFinalCommitAck
-                                                               : Event::kRecvCommitAck;
-    return _stateMachine.onEvent(std::move(lk), event);
-}
-
-//
-// Any time
-//
-
-Future<TransactionCoordinator::StateMachine::State> TransactionCoordinator::waitForCompletion() {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
-    return _stateMachine.waitForTransitionTo({State::kCommitted, State::kAborted});
-}
-
-Future<TransactionCoordinator::CommitDecision> TransactionCoordinator::waitForDecision() {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
-    return _stateMachine
-        .waitForTransitionTo({State::kWaitingForAbortAcks,
-                              State::kWaitingForCommitAcks,
-                              State::kCommitted,
-                              State::kAborted})
-        .then([](auto state) {
-            switch (state) {
-                case TransactionCoordinator::StateMachine::State::kWaitingForAbortAcks:
-                case TransactionCoordinator::StateMachine::State::kAborted:
-                    return TransactionCoordinator::CommitDecision::kAbort;
-                case TransactionCoordinator::StateMachine::State::kWaitingForCommitAcks:
-                case TransactionCoordinator::StateMachine::State::kCommitted:
-                    return TransactionCoordinator::CommitDecision::kCommit;
-                default:
-                    MONGO_UNREACHABLE;
-            }
-        });
-}
-
-Action TransactionCoordinator::recvTryAbort() {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
-    return _stateMachine.onEvent(std::move(lk), Event::kRecvTryAbort);
-}
-
-//
-// StateMachine
-//
 
 /**
- * This table shows the events that are legal to occur (given an asynchronous network) while in each
- * state.
- *
- * For each legal event, it shows the associated action (if any) the coordinator should take, and
- * the next state the coordinator should transition to.
- *
- * Empty ("{}") transitions mean "legal event, but no action to take and no new state to transition
- * to.
- * Missing transitions are illegal.
+ * Implements the high-level logic for two-phase commit.
  */
-const std::map<State, std::map<Event, TransactionCoordinator::StateMachine::Transition>>
-    TransactionCoordinator::StateMachine::transitionTable = {
-        // clang-format off
-        {State::kUninitialized, {
-            {Event::kRecvParticipantList,   {Action::kWriteParticipantList, State::kMakingParticipantListDurable}},
-            {Event::kRecvTryAbort,          {{}, State::kAborted}},
-        }},
-        {State::kMakingParticipantListDurable, {
-            {Event::kRecvParticipantList,          {}},
-            {Event::kMadeParticipantListDurable,   {Action::kSendPrepare, State::kWaitingForVotes}},
-            {Event::kRecvTryAbort,                 {}},
-        }},
-        {State::kWaitingForVotes, {
-            {Event::kRecvParticipantList,   {}},
-            {Event::kRecvVoteAbort,         {Action::kWriteAbortDecision, State::kMakingAbortDecisionDurable}},
-            {Event::kRecvVoteCommit,        {}},
-            {Event::kRecvFinalVoteCommit,   {Action::kWriteCommitDecision, State::kMakingCommitDecisionDurable}},
-            {Event::kRecvTryAbort,          {}},
-        }},
+SharedSemiFuture<txn::CommitDecision> TransactionCoordinator::runCommit(
+    const std::vector<ShardId>& participantShards) {
+    {
+        // If another thread has already begun the commit process, return early.
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        if (_state != CoordinatorState::kInit) {
+            return _finalDecisionPromise.getFuture();
+        }
+        _state = CoordinatorState::kPreparing;
+    }
 
-        // Abort path
-        // Note: Can continue to receive votes after abort decision has been made, because an abort
-        // decision only requires a single voteAbort.
-        {State::kMakingAbortDecisionDurable, {
-            {Event::kRecvParticipantList,      {}},
-            {Event::kRecvVoteAbort,            {}},
-            {Event::kRecvVoteCommit,           {}},
-            {Event::kMadeAbortDecisionDurable, {Action::kSendAbort, State::kWaitingForAbortAcks}},
-            {Event::kRecvTryAbort,             {}},
-        }},
-        {State::kWaitingForAbortAcks, {
-            {Event::kRecvParticipantList,   {}},
-            {Event::kRecvVoteAbort,         {}},
-            {Event::kRecvVoteCommit,        {}},
-            {Event::kRecvAbortAck,          {}},
-            {Event::kRecvFinalAbortAck,     {Action::kDone, State::kAborted}},
-            {Event::kRecvTryAbort,          {}},
+    _driver.persistParticipantList(_lsid, _txnNumber, participantShards)
+        .then([this, participantShards]() { return _runPhaseOne(participantShards); })
+        .then([this, participantShards](CoordinatorCommitDecision decision) {
+            return _runPhaseTwo(participantShards, decision);
+        })
+        .getAsync([this](Status s) { _handleCompletionStatus(s); });
 
-        }},
-        {State::kAborted, {
-            {Event::kRecvParticipantList,   {}},
-            {Event::kRecvVoteAbort,         {}},
-            {Event::kRecvVoteCommit,        {}},
-            {Event::kRecvTryAbort,          {}},
-        }},
+    return _finalDecisionPromise.getFuture();
+}
 
-        // Commit path
-        // Note: Cannot continue to receive votes after commit decision has been made, because a
-        // commit decision requires all voteCommits.
-        {State::kMakingCommitDecisionDurable, {
-            {Event::kRecvParticipantList,       {}},
-            {Event::kMadeCommitDecisionDurable, {Action::kSendCommit, State::kWaitingForCommitAcks}},
-            {Event::kRecvTryAbort,              {}},
+Future<CoordinatorCommitDecision> TransactionCoordinator::_runPhaseOne(
+    const std::vector<ShardId>& participantShards) {
+    return _driver.sendPrepare(participantShards, _lsid, _txnNumber)
+        .then([this, participantShards](txn::PrepareVoteConsensus result) {
+            invariant(_state == CoordinatorState::kPreparing);
 
-        }},
-        {State::kWaitingForCommitAcks, {
-            {Event::kRecvParticipantList,   {}},
-            {Event::kRecvCommitAck,         {}},
-            {Event::kRecvFinalCommitAck,    {Action::kDone, State::kCommitted}},
-            {Event::kRecvTryAbort,          {}},
+            auto decision =
+                makeDecisionFromPrepareVoteConsensus(_service, result, _lsid, _txnNumber);
 
-        }},
-        {State::kCommitted, {
-            {Event::kRecvParticipantList,   {}},
-            {Event::kRecvTryAbort,          {}},
-        }},
+            return _driver
+                .persistDecision(_lsid, _txnNumber, participantShards, decision.commitTimestamp)
+                .then([decision] { return decision; });
+        });
+}
 
-        {State::kBroken, {}},
-        // clang-format on
+Future<void> TransactionCoordinator::_runPhaseTwo(const std::vector<ShardId>& participantShards,
+                                                  const CoordinatorCommitDecision& decision) {
+    return _sendDecisionToParticipants(participantShards, decision)
+        .then([this] { return _driver.deleteCoordinatorDoc(_lsid, _txnNumber); })
+        .then([this] {
+            LOG(3) << "Two-phase commit completed for session " << _lsid.toBSON()
+                   << ", transaction number " << _txnNumber;
+
+            stdx::unique_lock<stdx::mutex> ul(_mutex);
+            _transitionToDone(std::move(ul));
+        });
+}
+
+void TransactionCoordinator::continueCommit(const TransactionCoordinatorDocument& doc) {
+    _state = CoordinatorState::kPreparing;
+    const auto participantShards = doc.getParticipants();
+
+    // Helper lambda to get the decision either from the document passed in or from the participants
+    // (by performing 'phase one' of two-phase commit).
+    auto getDecision = [&]() -> Future<CoordinatorCommitDecision> {
+        if (!doc.getDecision()) {
+            return _runPhaseOne(participantShards);
+        } else {
+            return (*doc.getDecision() == "commit")
+                ? CoordinatorCommitDecision{txn::CommitDecision::kCommit, *doc.getCommitTimestamp()}
+                : CoordinatorCommitDecision{txn::CommitDecision::kAbort, boost::none};
+        }
+    };
+
+    getDecision()
+        .then([this, participantShards](CoordinatorCommitDecision decision) {
+            return _runPhaseTwo(participantShards, decision);
+        })
+        .getAsync([this](Status s) { _handleCompletionStatus(s); });
+}
+
+Future<void> TransactionCoordinator::onCompletion() {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    if (_state == CoordinatorState::kDone) {
+        return Future<void>::makeReady();
+    }
+
+    auto completionPromiseFuture = makePromiseFuture<void>();
+    _completionPromises.push_back(std::move(completionPromiseFuture.promise));
+    return std::move(completionPromiseFuture.future);
+}
+
+void TransactionCoordinator::cancelIfCommitNotYetStarted() {
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    if (_state == CoordinatorState::kInit) {
+        _transitionToDone(std::move(lk));
+    }
+}
+
+Future<void> TransactionCoordinator::_sendDecisionToParticipants(
+    const std::vector<ShardId>& participantShards, CoordinatorCommitDecision decision) {
+    invariant(_state == CoordinatorState::kPreparing);
+    _finalDecisionPromise.emplaceValue(decision.decision);
+
+    // Send the decision to all participants.
+    switch (decision.decision) {
+        case txn::CommitDecision::kCommit:
+            _state = CoordinatorState::kCommitting;
+            invariant(decision.commitTimestamp);
+            return _driver.sendCommit(
+                participantShards, _lsid, _txnNumber, decision.commitTimestamp.get());
+        case txn::CommitDecision::kAbort:
+            _state = CoordinatorState::kAborting;
+            return _driver.sendAbort(participantShards, _lsid, _txnNumber);
+    };
+    MONGO_UNREACHABLE;
 };
 
-TransactionCoordinator::StateMachine::~StateMachine() {
-    // Coordinators should always reach a terminal state prior to destructing, and all calls to
-    // waitForTransitionTo must contain both terminal states, so all outstanding promises should
-    // have been triggered prior to this.
-    invariant(_stateTransitionPromises.size() == 0);
+void TransactionCoordinator::_handleCompletionStatus(Status s) {
+    if (s.isOK()) {
+        return;
+    }
+
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    LOG(3) << "Two-phase commit failed with error in state " << _state << " for transaction "
+           << _txnNumber << " on session " << _lsid.toBSON() << causedBy(s);
+
+    // If an error occurred prior to making a decision, set an error on the decision
+    // promise to propagate it to callers of runCommit.
+    if (!_finalDecisionPromise.getFuture().isReady()) {
+        invariant(_state == CoordinatorState::kPreparing);
+        _finalDecisionPromise.setError(s);
+    }
+
+    _transitionToDone(std::move(lk));
 }
 
-void TransactionCoordinator::StateMachine::_signalAllPromisesWaitingForState(
-    stdx::unique_lock<stdx::mutex> lk, State newState) {
+void TransactionCoordinator::_transitionToDone(stdx::unique_lock<stdx::mutex> lk) noexcept {
+    _state = CoordinatorState::kDone;
 
-    std::list<StateTransitionPromise> promisesToTrigger;
-    // Reorder promises so that those which were waiting to be signaled on the current state
-    // come first, and those which were not come last.
-    auto partitionPoint =
-        std::partition(_stateTransitionPromises.begin(),
-                       _stateTransitionPromises.end(),
-                       [&](const auto& stateTransitionPromise) {
-                           return stateTransitionPromise.triggeringStates.find(newState) !=
-                               stateTransitionPromise.triggeringStates.end();
-                       });
-    // Remove all of the promises to trigger from _stateTransitionPromises and put them in
-    // promisesToTrigger.
-    promisesToTrigger.splice(promisesToTrigger.begin(),
-                             _stateTransitionPromises,
-                             _stateTransitionPromises.begin(),
-                             partitionPoint);
-
-    // Signaling the promises must be done without holding the mutex to avoid deadlock in case
-    // signaling the promise triggers a callback that requires locking the mutex.
+    auto promisesToTrigger = std::move(_completionPromises);
     lk.unlock();
-    for (auto& stateTransitionPromise : promisesToTrigger) {
-        stateTransitionPromise.promise.emplaceValue(newState);
-    }
-}
 
-Action TransactionCoordinator::StateMachine::onEvent(stdx::unique_lock<stdx::mutex> lk,
-                                                     Event event) {
-
-    const auto legalTransitions = transitionTable.find(_state)->second;
-    if (!legalTransitions.count(event)) {
-        std::string errmsg = str::stream() << "Transaction coordinator received illegal event '"
-                                           << event << "' while in state '" << _state << "'";
-        _state = State::kBroken;
-        uasserted(ErrorCodes::InternalError, errmsg);
-    }
-
-    const auto transition = legalTransitions.find(event)->second;
-
-    if (transition.nextState) {
-        StringBuilder ss;
-        ss << "TransactionCoordinator received event " << event << " while in state " << _state
-           << " and returning " << transition.action << " and transitioning to "
-           << *transition.nextState;
-        LOG(3) << ss.str();
-        _state = *transition.nextState;
-        _signalAllPromisesWaitingForState(std::move(lk), _state);
-    } else {
-        StringBuilder ss;
-        ss << "TransactionCoordinator received event " << event << " while in state " << _state
-           << " and returning " << transition.action << " and not transitioning to new state";
-        LOG(3) << ss.str();
-    }
-
-    return transition.action;
-}
-
-Future<State> TransactionCoordinator::StateMachine::waitForTransitionTo(
-    const std::set<State>& states) {
-
-    // The set of states waited on MUST include both terminal states of the state machine (committed
-    // and aborted). Otherwise it would be possible to wait on a state which is never reached,
-    // causing the caller to hang forever.
-    invariant(states.find(State::kCommitted) != states.end());
-    invariant(states.find(State::kAborted) != states.end());
-
-    // If we're already in one of the states the caller is waiting for, there's no need for a
-    // promise so we return immediately.
-    if (states.find(_state) != states.end()) {
-        return Future<State>::makeReady(_state);
-    }
-
-    auto promiseAndFuture = makePromiseFuture<TransactionCoordinator::StateMachine::State>();
-
-    _stateTransitionPromises.emplace_back(std::move(promiseAndFuture.promise), states);
-
-    return std::move(promiseAndFuture.future);
-}
-
-//
-// ParticipantList
-//
-
-void TransactionCoordinator::ParticipantList::recordFullList(
-    const std::set<ShardId>& participants) {
-    if (!_fullListReceived) {
-        for (auto& shardId : participants) {
-            _recordParticipant(shardId);
-        }
-        _fullListReceived = true;
-    }
-    _validate(participants);
-}
-
-void TransactionCoordinator::ParticipantList::recordVoteCommit(const ShardId& shardId,
-                                                               Timestamp prepareTimestamp) {
-    if (!_fullListReceived) {
-        _recordParticipant(shardId);
-    }
-
-    auto it = _participants.find(shardId);
-    uassert(
-        ErrorCodes::InternalError,
-        str::stream() << "Transaction commit coordinator received vote 'commit' from participant "
-                      << shardId.toString()
-                      << " not in participant list",
-        it != _participants.end());
-    auto& participant = it->second;
-
-    uassert(
-        ErrorCodes::InternalError,
-        str::stream() << "Transaction commit coordinator received vote 'commit' from participant "
-                      << shardId.toString()
-                      << " that previously voted to abort",
-        participant.vote != Participant::Vote::kAbort);
-
-    if (participant.vote == Participant::Vote::kUnknown) {
-        participant.vote = Participant::Vote::kCommit;
-        participant.prepareTimestamp = prepareTimestamp;
-    } else {
-        uassert(ErrorCodes::InternalError,
-                str::stream() << "Transaction commit coordinator received prepareTimestamp "
-                              << prepareTimestamp.toStringPretty()
-                              << " from participant "
-                              << shardId.toString()
-                              << " that previously reported prepareTimestamp "
-                              << participant.prepareTimestamp->toStringPretty(),
-                *participant.prepareTimestamp == prepareTimestamp);
-    }
-}
-
-void TransactionCoordinator::ParticipantList::recordVoteAbort(const ShardId& shardId) {
-    if (!_fullListReceived) {
-        _recordParticipant(shardId);
-    }
-
-    auto it = _participants.find(shardId);
-    uassert(
-        ErrorCodes::InternalError,
-        str::stream() << "Transaction commit coordinator received vote 'abort' from participant "
-                      << shardId.toString()
-                      << " not in participant list",
-        it != _participants.end());
-    auto& participant = it->second;
-
-    uassert(
-        ErrorCodes::InternalError,
-        str::stream() << "Transaction commit coordinator received vote 'abort' from participant "
-                      << shardId.toString()
-                      << " that previously voted to commit",
-        participant.vote != Participant::Vote::kCommit);
-
-    participant.vote = Participant::Vote::kAbort;
-    participant.ack = Participant::Ack::kAbort;
-}
-
-void TransactionCoordinator::ParticipantList::recordCommitAck(const ShardId& shardId) {
-    auto it = _participants.find(shardId);
-    uassert(
-        50989,
-        str::stream() << "Transaction commit coordinator processed 'commit' ack from participant "
-                      << shardId.toString()
-                      << " not in participant list",
-        it != _participants.end());
-    it->second.ack = Participant::Ack::kCommit;
-}
-
-void TransactionCoordinator::ParticipantList::recordAbortAck(const ShardId& shardId) {
-    auto it = _participants.find(shardId);
-    uassert(
-        50990,
-        str::stream() << "Transaction commit coordinator processed 'abort' ack from participant "
-                      << shardId.toString()
-                      << " not in participant list",
-        it != _participants.end());
-    it->second.ack = Participant::Ack::kAbort;
-}
-
-bool TransactionCoordinator::ParticipantList::allParticipantsVotedCommit() const {
-    return _fullListReceived && std::all_of(_participants.begin(),
-                                            _participants.end(),
-                                            [](const std::pair<ShardId, Participant>& i) {
-                                                return i.second.vote == Participant::Vote::kCommit;
-                                            });
-}
-
-bool TransactionCoordinator::ParticipantList::allParticipantsAckedAbort() const {
-    return std::all_of(
-        _participants.begin(), _participants.end(), [](const std::pair<ShardId, Participant>& i) {
-            return i.second.ack == Participant::Ack::kAbort;
-        });
-}
-
-bool TransactionCoordinator::ParticipantList::allParticipantsAckedCommit() const {
-    invariant(_fullListReceived);
-    return std::all_of(
-        _participants.begin(), _participants.end(), [](const std::pair<ShardId, Participant>& i) {
-            return i.second.ack == Participant::Ack::kCommit;
-        });
-}
-
-Timestamp TransactionCoordinator::ParticipantList::getHighestPrepareTimestamp() const {
-    invariant(_fullListReceived);
-    Timestamp highestPrepareTimestamp = Timestamp::min();
-    for (const auto& participant : _participants) {
-        invariant(participant.second.prepareTimestamp);
-        if (*participant.second.prepareTimestamp > highestPrepareTimestamp) {
-            highestPrepareTimestamp = *participant.second.prepareTimestamp;
-        }
-    }
-    return highestPrepareTimestamp;
-}
-
-std::set<ShardId> TransactionCoordinator::ParticipantList::getParticipants() const {
-    std::set<ShardId> participants;
-    for (const auto& kv : _participants) {
-        participants.insert(kv.first);
-    }
-    return participants;
-}
-
-std::set<ShardId> TransactionCoordinator::ParticipantList::getNonAckedCommitParticipants() const {
-    std::set<ShardId> nonAckedCommitParticipants;
-    for (const auto& kv : _participants) {
-        if (kv.second.ack != Participant::Ack::kCommit) {
-            invariant(kv.second.ack == Participant::Ack::kNone);
-            nonAckedCommitParticipants.insert(kv.first);
-        }
-    }
-    return nonAckedCommitParticipants;
-}
-
-std::set<ShardId> TransactionCoordinator::ParticipantList::getNonVotedAbortParticipants() const {
-    std::set<ShardId> nonVotedAbortParticipants;
-    for (const auto& kv : _participants) {
-        if (kv.second.vote != Participant::Vote::kAbort) {
-            invariant(kv.second.ack == Participant::Ack::kNone);
-            nonVotedAbortParticipants.insert(kv.first);
-        }
-    }
-    return nonVotedAbortParticipants;
-}
-
-void TransactionCoordinator::ParticipantList::_recordParticipant(const ShardId& shardId) {
-    if (_participants.find(shardId) == _participants.end()) {
-        _participants[shardId] = {};
-    }
-}
-
-void TransactionCoordinator::ParticipantList::_validate(const std::set<ShardId>& participants) {
-    // Ensure that the participant list received contained only participants that we already know
-    // about.
-    for (auto& shardId : participants) {
-        uassert(ErrorCodes::InternalError,
-                str::stream() << "Transaction commit coordinator received a participant list with "
-                                 "unexpected participant "
-                              << shardId,
-                _participants.find(shardId) != _participants.end());
-    }
-
-    // Ensure that the participant list received is not missing a participant we already heard from.
-    for (auto& it : _participants) {
-        auto& shardId = it.first;
-        uassert(ErrorCodes::InternalError,
-                str::stream() << "Transaction commit coordinator received a participant list "
-                                 "missing expected participant "
-                              << shardId.toString(),
-                participants.find(shardId) != participants.end());
+    // No fields from 'this' are allowed to be accessed after the for loop below runs, because the
+    // future handlers indicate to the potential lifetime controller that the object can be
+    // destroyed
+    for (auto&& promise : promisesToTrigger) {
+        promise.emplaceValue();
     }
 }
 

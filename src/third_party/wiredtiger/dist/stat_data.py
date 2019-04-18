@@ -296,22 +296,30 @@ connection_stats = [
     ##########################################
     # Cursor operations
     ##########################################
-    CursorStat('cursors_cached', 'cursors currently cached', 'no_clear,no_scale'),
+    CursorStat('cursor_open_count', 'open cursor count', 'no_clear,no_scale'),
+    CursorStat('cursor_cached_count', 'cached cursor count', 'no_clear,no_scale'),
     CursorStat('cursor_cache', 'cursor close calls that result in cache'),
     CursorStat('cursor_create', 'cursor create calls'),
     CursorStat('cursor_insert', 'cursor insert calls'),
+    CursorStat('cursor_insert_bulk', 'cursor bulk loaded cursor insert calls'),
+    CursorStat('cursor_insert_bytes', 'cursor insert key and value bytes', 'size'),
     CursorStat('cursor_modify', 'cursor modify calls'),
+    CursorStat('cursor_modify_bytes', 'cursor modify key and value bytes affected', 'size'),
+    CursorStat('cursor_modify_bytes_touch', 'cursor modify value bytes modified', 'size'),
     CursorStat('cursor_next', 'cursor next calls'),
     CursorStat('cursor_prev', 'cursor prev calls'),
     CursorStat('cursor_remove', 'cursor remove calls'),
+    CursorStat('cursor_remove_bytes', 'cursor remove key bytes removed', 'size'),
     CursorStat('cursor_reopen', 'cursors reused from cache'),
     CursorStat('cursor_reserve', 'cursor reserve calls'),
     CursorStat('cursor_reset', 'cursor reset calls'),
     CursorStat('cursor_restart', 'cursor operation restarted'),
     CursorStat('cursor_search', 'cursor search calls'),
     CursorStat('cursor_search_near', 'cursor search near calls'),
-    CursorStat('cursor_truncate', 'truncate calls'),
+    CursorStat('cursor_truncate', 'cursor truncate calls'),
     CursorStat('cursor_update', 'cursor update calls'),
+    CursorStat('cursor_update_bytes', 'cursor update key and value bytes', 'size'),
+    CursorStat('cursor_update_bytes_changed', 'cursor update value size change', 'size'),
 
     ##########################################
     # Cursor sweep
@@ -469,7 +477,6 @@ connection_stats = [
     ##########################################
     # Session operations
     ##########################################
-    SessionOpStat('session_cursor_open', 'open cursor count', 'no_clear,no_scale'),
     SessionOpStat('session_open', 'open session count', 'no_clear,no_scale'),
     SessionOpStat('session_query_ts', 'session query timestamp calls'),
     SessionOpStat('session_table_alter_fail', 'table alter failed calls', 'no_clear,no_scale'),
@@ -616,6 +623,7 @@ dsrc_stats = [
     BtreeStat('btree_maxleafpage', 'maximum leaf page size', 'max_aggregate,no_scale,size'),
     BtreeStat('btree_maxleafvalue', 'maximum leaf page value size', 'max_aggregate,no_scale,size'),
     BtreeStat('btree_overflow', 'overflow pages', 'no_scale,tree_walk'),
+    BtreeStat('btree_row_empty_values', 'row-store empty values', 'no_scale,tree_walk'),
     BtreeStat('btree_row_internal', 'row-store internal pages', 'no_scale,tree_walk'),
     BtreeStat('btree_row_leaf', 'row-store leaf pages', 'no_scale,tree_walk'),
 
@@ -690,9 +698,6 @@ dsrc_stats = [
     ##########################################
     # Compression statistics
     ##########################################
-    CompressStat('compress_raw_fail', 'raw compression call failed, no additional data available'),
-    CompressStat('compress_raw_fail_temporary', 'raw compression call failed, additional data available'),
-    CompressStat('compress_raw_ok', 'raw compression call succeeded'),
     CompressStat('compress_read', 'compressed pages read'),
     CompressStat('compress_write', 'compressed pages written'),
     CompressStat('compress_write_fail', 'page written failed to compress'),
@@ -701,25 +706,29 @@ dsrc_stats = [
     ##########################################
     # Cursor operations
     ##########################################
+    CursorStat('cursor_open_count', 'open cursor count', 'no_clear,no_scale'),
     CursorStat('cursor_cache', 'close calls that result in cache'),
     CursorStat('cursor_create', 'create calls'),
     CursorStat('cursor_insert', 'insert calls'),
-    CursorStat('cursor_insert_bulk', 'bulk-loaded cursor-insert calls'),
-    CursorStat('cursor_insert_bytes', 'cursor-insert key and value bytes inserted', 'size'),
-    CursorStat('cursor_modify', 'modify calls'),
+    CursorStat('cursor_insert_bulk', 'bulk loaded cursor insert calls'),
+    CursorStat('cursor_insert_bytes', 'insert key and value bytes', 'size'),
+    CursorStat('cursor_modify', 'modify'),
+    CursorStat('cursor_modify_bytes', 'modify key and value bytes affected', 'size'),
+    CursorStat('cursor_modify_bytes_touch', 'modify value bytes modified', 'size'),
     CursorStat('cursor_next', 'next calls'),
     CursorStat('cursor_prev', 'prev calls'),
     CursorStat('cursor_remove', 'remove calls'),
-    CursorStat('cursor_remove_bytes', 'cursor-remove key bytes removed', 'size'),
-    CursorStat('cursor_reopen', 'cursors reused from cache'),
+    CursorStat('cursor_remove_bytes', 'remove key bytes removed', 'size'),
+    CursorStat('cursor_reopen', 'cache cursors reuse count'),
     CursorStat('cursor_reserve', 'reserve calls'),
     CursorStat('cursor_reset', 'reset calls'),
-    CursorStat('cursor_restart', 'cursor operation restarted'),
+    CursorStat('cursor_restart', 'operation restarted'),
     CursorStat('cursor_search', 'search calls'),
     CursorStat('cursor_search_near', 'search near calls'),
     CursorStat('cursor_truncate', 'truncate calls'),
     CursorStat('cursor_update', 'update calls'),
-    CursorStat('cursor_update_bytes', 'cursor-update value bytes updated', 'size'),
+    CursorStat('cursor_update_bytes', 'update key and value bytes', 'size'),
+    CursorStat('cursor_update_bytes_changed', 'update value size change', 'size'),
 
     ##########################################
     # LSM statistics
@@ -759,8 +768,6 @@ dsrc_stats = [
     # Session operations
     ##########################################
     SessionOpStat('session_compact', 'object compaction'),
-    SessionOpStat('session_cursors_cached', 'cached cursor count', 'no_clear,no_scale'),
-    SessionOpStat('session_cursor_open', 'open cursor count', 'no_clear,no_scale'),
 
     ##########################################
     # Transaction statistics

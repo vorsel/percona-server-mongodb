@@ -73,7 +73,7 @@ NamespaceString MovePrimarySourceManager::getNss() const {
 Status MovePrimarySourceManager::clone(OperationContext* opCtx) {
     invariant(!opCtx->lockState()->isLocked());
     invariant(_state == kCreated);
-    auto scopedGuard = MakeGuard([&] { cleanupOnError(opCtx); });
+    auto scopedGuard = makeGuard([&] { cleanupOnError(opCtx); });
 
     log() << "Moving " << _dbname << " primary from: " << _fromShard << " to: " << _toShard;
 
@@ -86,9 +86,6 @@ Status MovePrimarySourceManager::clone(OperationContext* opCtx) {
         ShardingCatalogClient::kMajorityWriteConcern));
 
     {
-        // Register for notifications from the replication subsystem
-        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
-
         // We use AutoGetOrCreateDb the first time just in case movePrimary was called before any
         // data was inserted into the database.
         AutoGetOrCreateDb autoDb(opCtx, getNss().toString(), MODE_X);
@@ -125,14 +122,14 @@ Status MovePrimarySourceManager::clone(OperationContext* opCtx) {
     }
 
     _state = kCloneCaughtUp;
-    scopedGuard.Dismiss();
+    scopedGuard.dismiss();
     return Status::OK();
 }
 
 Status MovePrimarySourceManager::enterCriticalSection(OperationContext* opCtx) {
     invariant(!opCtx->lockState()->isLocked());
     invariant(_state == kCloneCaughtUp);
-    auto scopedGuard = MakeGuard([&] { cleanupOnError(opCtx); });
+    auto scopedGuard = makeGuard([&] { cleanupOnError(opCtx); });
 
     // Mark the shard as running a critical operation that requires recovery on crash.
     uassertStatusOK(ShardingStateRecovery::startMetadataOp(opCtx));
@@ -141,7 +138,6 @@ Status MovePrimarySourceManager::enterCriticalSection(OperationContext* opCtx) {
         // The critical section must be entered with the database X lock in order to ensure there
         // are no writes which could have entered and passed the database version check just before
         // we entered the critical section, but will potentially complete after we left it.
-        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
         AutoGetDb autoDb(opCtx, getNss().toString(), MODE_X);
 
         if (!autoDb.getDb()) {
@@ -177,21 +173,20 @@ Status MovePrimarySourceManager::enterCriticalSection(OperationContext* opCtx) {
 
     log() << "movePrimary successfully entered critical section";
 
-    scopedGuard.Dismiss();
+    scopedGuard.dismiss();
     return Status::OK();
 }
 
 Status MovePrimarySourceManager::commitOnConfig(OperationContext* opCtx) {
     invariant(!opCtx->lockState()->isLocked());
     invariant(_state == kCriticalSection);
-    auto scopedGuard = MakeGuard([&] { cleanupOnError(opCtx); });
+    auto scopedGuard = makeGuard([&] { cleanupOnError(opCtx); });
 
     ConfigsvrCommitMovePrimary commitMovePrimaryRequest;
     commitMovePrimaryRequest.set_configsvrCommitMovePrimary(getNss().ns());
     commitMovePrimaryRequest.setTo(_toShard.toString());
 
     {
-        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
         AutoGetDb autoDb(opCtx, getNss().toString(), MODE_X);
 
         if (!autoDb.getDb()) {
@@ -295,7 +290,7 @@ Status MovePrimarySourceManager::commitOnConfig(OperationContext* opCtx) {
         _buildMoveLogEntry(_dbname.toString(), _fromShard.toString(), _toShard.toString()),
         ShardingCatalogClient::kMajorityWriteConcern));
 
-    scopedGuard.Dismiss();
+    scopedGuard.dismiss();
 
     _state = kNeedCleanStaleData;
 

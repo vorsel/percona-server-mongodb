@@ -40,7 +40,6 @@
 #include "mongo/db/catalog/drop_indexes.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/multi_index_block.h"
-#include "mongo/db/catalog/multi_index_block_impl.h"
 #include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -75,6 +74,7 @@
 #include "mongo/db/session.h"
 #include "mongo/db/session_catalog_mongod.h"
 #include "mongo/db/storage/kv/kv_storage_engine.h"
+#include "mongo/db/storage/snapshot_manager.h"
 #include "mongo/db/transaction_participant.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/stdx/future.h"
@@ -110,10 +110,16 @@ private:
 
 const auto kIndexVersion = IndexDescriptor::IndexVersion::kV2;
 
+void assertIndexMetaDataMissing(const BSONCollectionCatalogEntry::MetaData& collMetaData,
+                                StringData indexName) {
+    const auto idxOffset = collMetaData.findIndexOffset(indexName);
+    ASSERT_EQUALS(-1, idxOffset) << indexName << ". Collection Metdata: " << collMetaData.toBSON();
+}
+
 BSONCollectionCatalogEntry::IndexMetaData getIndexMetaData(
     const BSONCollectionCatalogEntry::MetaData& collMetaData, StringData indexName) {
     const auto idxOffset = collMetaData.findIndexOffset(indexName);
-    invariant(idxOffset > -1);
+    ASSERT_GT(idxOffset, -1) << indexName;
     return collMetaData.indexes[idxOffset];
 }
 
@@ -230,7 +236,7 @@ public:
     void createIndex(Collection* coll, std::string indexName, const BSONObj& indexKey) {
 
         // Build an index.
-        MultiIndexBlockImpl indexer(_opCtx, coll);
+        MultiIndexBlock indexer(_opCtx, coll);
         BSONObj indexInfoObj;
         {
             auto swIndexInfoObj = indexer.init({BSON(
@@ -1724,8 +1730,14 @@ public:
         // ident for `kvDropDatabase` still exists.
         const Timestamp postRenameTime = _clock->reserveTicks(1).asTimestamp();
 
-        // The namespace has changed, but the ident still exists as-is after the rename.
-        assertIdentsExistAtTimestamp(kvCatalog, collIdent, indexIdent, postRenameTime);
+        // If the storage engine is managing drops internally, the ident should not be visible after
+        // a drop.
+        if (kvStorageEngine->supportsPendingDrops()) {
+            assertIdentsMissingAtTimestamp(kvCatalog, collIdent, indexIdent, postRenameTime);
+        } else {
+            // The namespace has changed, but the ident still exists as-is after the rename.
+            assertIdentsExistAtTimestamp(kvCatalog, collIdent, indexIdent, postRenameTime);
+        }
 
         const Timestamp dropTime = _clock->reserveTicks(1).asTimestamp();
         if (SimulatePrimary) {
@@ -1797,7 +1809,7 @@ public:
         std::vector<std::string> origIdents = kvCatalog->getAllIdents(_opCtx);
 
         // Build an index on `{a: 1}`. This index will be multikey.
-        MultiIndexBlockImpl indexer(_opCtx, autoColl.getCollection());
+        MultiIndexBlock indexer(_opCtx, autoColl.getCollection());
         const LogicalTime beforeIndexBuild = _clock->reserveTicks(2);
         BSONObj indexInfoObj;
         {
@@ -2023,11 +2035,11 @@ public:
             renamedNss.db(),
             createIndexesString.substr(filterString.size(),
                                        createIndexesString.size() - filterString.size() - 1));
-        const std::string createIndexMsg = "Creating indexes. Coll: " + tmpName.ns();
+
         const Timestamp indexCreateInitTs = queryOplog(BSON("op"
-                                                            << "n"
-                                                            << "o.msg"
-                                                            << createIndexMsg))["ts"]
+                                                            << "c"
+                                                            << "o.create"
+                                                            << tmpName.coll()))["ts"]
                                                 .timestamp();
 
         const Timestamp indexAComplete = createIndexesDocument["ts"].timestamp();
@@ -2039,26 +2051,22 @@ public:
                                                          << "b_1"))["ts"]
                                              .timestamp();
 
-        // We expect one new collection ident and three new index idents (including the _id index)
-        // during this rename. The a_1 and b_1 index idents are created and persisted with the
-        // "ready: false" write.
+        // We expect one new collection ident and one new index ident (the _id index) during this
+        // rename.
         assertRenamedCollectionIdentsAtTimestamp(
-            kvCatalog, origIdents, /*expectedNewIndexIdents*/ 3, indexCreateInitTs);
+            kvCatalog, origIdents, /*expectedNewIndexIdents*/ 1, indexCreateInitTs);
 
-        ASSERT_FALSE(
-            getIndexMetaData(getMetaDataAtTime(kvCatalog, renamedNss, indexCreateInitTs), "a_1")
-                .ready);
-        ASSERT_FALSE(
-            getIndexMetaData(getMetaDataAtTime(kvCatalog, renamedNss, indexCreateInitTs), "b_1")
-                .ready);
+        // We expect one new collection ident and three new index idents (including the _id index)
+        // after this rename. The a_1 and b_1 index idents are created and persisted with the
+        // "ready: true" write.
+        assertRenamedCollectionIdentsAtTimestamp(
+            kvCatalog, origIdents, /*expectedNewIndexIdents*/ 3, indexBComplete);
 
         // Assert the `a_1` index becomes ready at the next oplog entry time.
         ASSERT_TRUE(
             getIndexMetaData(getMetaDataAtTime(kvCatalog, renamedNss, indexAComplete), "a_1")
                 .ready);
-        ASSERT_FALSE(
-            getIndexMetaData(getMetaDataAtTime(kvCatalog, renamedNss, indexAComplete), "b_1")
-                .ready);
+        assertIndexMetaDataMissing(getMetaDataAtTime(kvCatalog, renamedNss, indexAComplete), "b_1");
 
         // Assert the `b_1` index becomes ready at the last oplog entry time.
         ASSERT_TRUE(
@@ -2180,7 +2188,7 @@ public:
         auto taskFuture = task.get_future();
         stdx::thread taskThread{std::move(task)};
 
-        auto joinGuard = MakeGuard([&] {
+        auto joinGuard = makeGuard([&] {
             batchInProgress.promise.emplaceValue(false);
             taskThread.join();
         });
@@ -2233,7 +2241,7 @@ public:
         auto lastOpTime = unittest::assertGet(syncTail.multiApply(_opCtx, {insertOp}));
         ASSERT_EQ(insertOp.getOpTime(), lastOpTime);
 
-        joinGuard.Dismiss();
+        joinGuard.dismiss();
         taskThread.join();
 
         // Read on the local snapshot to verify the document was inserted.
@@ -2488,6 +2496,10 @@ public:
         }
 
         presentTs = _clock->getClusterTime().asTimestamp();
+        // This test does not run a real ReplicationCoordinator, so must advance the snapshot
+        // manager manually.
+        auto storageEngine = cc().getServiceContext()->getStorageEngine();
+        storageEngine->getSnapshotManager()->setLocalSnapshot(presentTs);
         const auto beforeTxnTime = _clock->reserveTicks(1);
         beforeTxnTs = beforeTxnTime.asTimestamp();
         commitEntryTs = beforeTxnTime.addTicks(1).asTimestamp();

@@ -201,6 +201,29 @@ env.CppUnitTest(
     ],
 )
 
+env.Library(
+    target='alarm',
+    source=[
+        'alarm.cpp',
+        'alarm_runner_background_thread.cpp',
+    ],
+    LIBDEPS=[
+        'clock_sources',
+        '$BUILD_DIR/mongo/base',
+    ],
+)
+
+env.CppUnitTest(
+    target='alarm_test',
+    source=[
+        'alarm_test.cpp',
+    ],
+    LIBDEPS=[
+        'alarm',
+        'clock_source_mock',
+    ]
+)
+
 env.CppUnitTest(
     target='tick_source_test',
     source=[
@@ -265,13 +288,13 @@ env.Library(
     source=[
         "fail_point.cpp",
         "fail_point_registry.cpp",
-        "fail_point_server_parameter.cpp",
         "fail_point_service.cpp",
+        env.Idlc('fail_point_server_parameter.idl')[0],
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/base",
         "$BUILD_DIR/mongo/bson/util/bson_extract",
-        "$BUILD_DIR/mongo/db/server_parameters",
+        "$BUILD_DIR/mongo/idl/server_parameter",
     ],
 )
 
@@ -377,6 +400,7 @@ if env['MONGO_ALLOCATOR'] == 'tcmalloc':
         source=[
             'tcmalloc_server_status_section.cpp',
             'tcmalloc_set_parameter.cpp',
+            env.Idlc('tcmalloc_parameters.idl')[0],
             'heap_profiler.cpp',
         ],
         LIBDEPS=[
@@ -385,6 +409,7 @@ if env['MONGO_ALLOCATOR'] == 'tcmalloc':
         ],
         LIBDEPS_PRIVATE=[
             '$BUILD_DIR/mongo/db/commands/server_status',
+            '$BUILD_DIR/mongo/idl/server_parameter',
             'processinfo',
         ],
         PROGDEPS_DEPENDENTS=[

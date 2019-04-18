@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2018 MongoDB, Inc.
+ * Copyright (c) 2014-2019 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -80,12 +80,12 @@ struct __wt_page_header {
 #define	WT_PAGE_LAS_UPDATE	0x10u	/* Page updates in lookaside store */
 	uint8_t flags;			/* 25: flags */
 
-	/*
-	 * End the structure with 2 bytes of padding: it wastes space, but it
-	 * leaves the structure 32-bit aligned and having a few bytes to play
-	 * with in the future can't hurt.
-	 */
-	uint8_t unused[2];		/* 26-27: unused padding */
+	/* A byte of padding, positioned to be added to the flags. */
+	uint8_t unused;			/* 26: unused padding */
+
+#define	WT_PAGE_VERSION_ORIG	0	/* Original version */
+#define	WT_PAGE_VERSION_TS	1	/* Timestamps added */
+	uint8_t version;		/* 27: version */
 };
 /*
  * WT_PAGE_HEADER_SIZE is the number of bytes we allocate for the structure: if
@@ -819,6 +819,7 @@ struct __wt_page {
 struct __wt_page_deleted {
 	volatile uint64_t txnid;		/* Transaction ID */
 	wt_timestamp_t timestamp;
+	wt_timestamp_t durable_timestamp;	/* aligned uint64_t timestamp */
 
 	/*
 	 * The state is used for transaction prepare to manage visibility
@@ -1049,6 +1050,7 @@ struct __wt_ikey {
 struct __wt_update {
 	volatile uint64_t txnid;	/* transaction ID */
 	wt_timestamp_t timestamp;	/* aligned uint64_t timestamp */
+	wt_timestamp_t durable_timestamp;	/* aligned uint64_t timestamp */
 
 	WT_UPDATE *next;		/* forward-linked list */
 
@@ -1085,7 +1087,7 @@ struct __wt_update {
  * WT_UPDATE_SIZE is the expected structure size excluding the payload data --
  * we verify the build to ensure the compiler hasn't inserted padding.
  */
-#define	WT_UPDATE_SIZE	30
+#define	WT_UPDATE_SIZE	38
 
 /*
  * The memory size of an update: include some padding because this is such a

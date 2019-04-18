@@ -236,7 +236,8 @@ void createIndexForApplyOps(OperationContext* opCtx,
         dbLock.emplace(opCtx, indexNss.db(), MODE_X);
     }
     // Check if collection exists.
-    Database* db = DatabaseHolder::getDatabaseHolder().get(opCtx, indexNss.ns());
+    auto databaseHolder = DatabaseHolder::get(opCtx);
+    auto db = databaseHolder->getDb(opCtx, indexNss.ns());
     auto indexCollection = db ? db->getCollection(opCtx, indexNss) : nullptr;
     uassert(ErrorCodes::NamespaceNotFound,
             str::stream() << "Failed to create index due to missing collection: " << indexNss.ns(),
@@ -245,13 +246,20 @@ void createIndexForApplyOps(OperationContext* opCtx,
     OpCounters* opCounters = opCtx->writesAreReplicated() ? &globalOpCounters : &replOpCounters;
     opCounters->gotInsert();
 
-    bool relaxIndexConstraints =
-        ReplicationCoordinator::get(opCtx)->shouldRelaxIndexConstraints(opCtx, indexNss);
+    const IndexBuilder::IndexConstraints constraints =
+        ReplicationCoordinator::get(opCtx)->shouldRelaxIndexConstraints(opCtx, indexNss)
+        ? IndexBuilder::IndexConstraints::kRelax
+        : IndexBuilder::IndexConstraints::kEnforce;
+
+    const IndexBuilder::ReplicatedWrites replicatedWrites = opCtx->writesAreReplicated()
+        ? IndexBuilder::ReplicatedWrites::kReplicated
+        : IndexBuilder::ReplicatedWrites::kUnreplicated;
+
     if (indexSpec["background"].trueValue()) {
         if (mode == OplogApplication::Mode::kRecovering) {
             LOG(3) << "apply op: building background index " << indexSpec
                    << " in the foreground because the node is in recovery";
-            IndexBuilder builder(indexSpec, relaxIndexConstraints);
+            IndexBuilder builder(indexSpec, constraints, replicatedWrites);
             Status status = builder.buildInForeground(opCtx, db);
             uassertStatusOK(status);
         } else {
@@ -260,12 +268,15 @@ void createIndexForApplyOps(OperationContext* opCtx,
                 // If TempRelease fails, background index build will deadlock.
                 LOG(3) << "apply op: building background index " << indexSpec
                        << " in the foreground because temp release failed";
-                IndexBuilder builder(indexSpec, relaxIndexConstraints);
+                IndexBuilder builder(indexSpec, constraints, replicatedWrites);
                 Status status = builder.buildInForeground(opCtx, db);
                 uassertStatusOK(status);
             } else {
-                IndexBuilder* builder = new IndexBuilder(
-                    indexSpec, relaxIndexConstraints, opCtx->recoveryUnit()->getCommitTimestamp());
+                IndexBuilder* builder =
+                    new IndexBuilder(indexSpec,
+                                     constraints,
+                                     replicatedWrites,
+                                     opCtx->recoveryUnit()->getCommitTimestamp());
                 // This spawns a new thread and returns immediately.
                 builder->go();
                 // Wait for thread to start and register itself
@@ -275,15 +286,13 @@ void createIndexForApplyOps(OperationContext* opCtx,
 
         opCtx->recoveryUnit()->abandonSnapshot();
     } else {
-        IndexBuilder builder(indexSpec, relaxIndexConstraints);
+        IndexBuilder builder(indexSpec, constraints, replicatedWrites);
         Status status = builder.buildInForeground(opCtx, db);
         uassertStatusOK(status);
     }
     if (incrementOpsAppliedStats) {
         incrementOpsAppliedStats();
     }
-    getGlobalServiceContext()->getOpObserver()->onCreateIndex(
-        opCtx, indexNss, *(indexCollection->uuid()), indexSpec, false);
 }
 
 namespace {
@@ -542,8 +551,7 @@ std::vector<OpTime> logInsertOps(OperationContext* opCtx,
     if (txnParticipant) {
         sessionInfo.setSessionId(*opCtx->getLogicalSessionId());
         sessionInfo.setTxnNumber(*opCtx->getTxnNumber());
-
-        oplogLink.prevOpTime = txnParticipant->getLastWriteOpTime(*opCtx->getTxnNumber());
+        oplogLink.prevOpTime = txnParticipant->getLastWriteOpTime();
     }
 
     auto timestamps = stdx::make_unique<Timestamp[]>(count);
@@ -1077,7 +1085,13 @@ Status applyOperation_inlock(OperationContext* opCtx,
     LOG(3) << "applying op: " << redact(op)
            << ", oplog application mode: " << OplogApplication::modeToString(mode);
 
-    OpCounters* opCounters = opCtx->writesAreReplicated() ? &globalOpCounters : &replOpCounters;
+    // Choose opCounters based on running on standalone/primary or secondary by checking
+    // whether writes are replicated. Atomic applyOps command is an exception, which runs
+    // on primary/standalone but disables write replication.
+    OpCounters* opCounters =
+        (mode == repl::OplogApplication::Mode::kApplyOpsCmd || opCtx->writesAreReplicated())
+        ? &globalOpCounters
+        : &replOpCounters;
 
     std::array<StringData, 8> names = {"ts", "t", "o", "ui", "ns", "op", "b", "o2"};
     std::array<BSONElement, 8> fields;
@@ -1533,6 +1547,11 @@ Status applyCommand_inlock(OperationContext* opCtx,
     const char* opType = fieldOp.valuestrsafe();
     invariant(*opType == 'c');  // only commands are processed here
 
+    // Choose opCounters based on running on standalone/primary or secondary by checking
+    // whether writes are replicated.
+    OpCounters* opCounters = opCtx->writesAreReplicated() ? &globalOpCounters : &replOpCounters;
+    opCounters->gotCommand();
+
     if (fieldO.eoo()) {
         return Status(ErrorCodes::NoSuchKey, "Missing expected field 'o'");
     }
@@ -1554,7 +1573,8 @@ Status applyCommand_inlock(OperationContext* opCtx,
         // Command application doesn't always acquire the global writer lock for transaction
         // commands, so we acquire its own locks here.
         Lock::DBLock lock(opCtx, nss.db(), MODE_IS);
-        Database* db = DatabaseHolder::getDatabaseHolder().get(opCtx, nss.ns());
+        auto databaseHolder = DatabaseHolder::get(opCtx);
+        auto db = databaseHolder->getDb(opCtx, nss.ns());
         if (db && !db->getCollection(opCtx, nss) && db->getViewCatalog()->lookup(opCtx, nss.ns())) {
             return {ErrorCodes::CommandNotSupportedOnView,
                     str::stream() << "applyOps not supported on view:" << nss.ns()};
@@ -1729,7 +1749,7 @@ void establishOplogCollectionForLogging(OperationContext* opCtx, Collection* opl
 void signalOplogWaiters() {
     auto oplog = localOplogInfo(getGlobalServiceContext()).oplog;
     if (oplog) {
-        oplog->notifyCappedWaitersIfNeeded();
+        oplog->getCappedCallback()->notifyCappedWaitersIfNeeded();
     }
 }
 

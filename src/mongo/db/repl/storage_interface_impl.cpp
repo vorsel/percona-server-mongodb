@@ -48,7 +48,7 @@
 #include "mongo/db/catalog/coll_mod.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
-#include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/uuid_catalog.h"
@@ -118,6 +118,7 @@ StatusWith<int> StorageInterfaceImpl::getRollbackID(OperationContext* opCtx) {
 }
 
 StatusWith<int> StorageInterfaceImpl::initializeRollbackID(OperationContext* opCtx) {
+    UninterruptibleLockGuard noInterrupt(opCtx->lockState());
     auto status = createCollection(opCtx, _rollbackIdNss, CollectionOptions());
     if (!status.isOK()) {
         return status;
@@ -372,7 +373,37 @@ Status StorageInterfaceImpl::insertDocuments(OperationContext* opCtx,
 }
 
 Status StorageInterfaceImpl::dropReplicatedDatabases(OperationContext* opCtx) {
-    Database::dropAllDatabasesExceptLocal(opCtx);
+    Lock::GlobalWrite globalWriteLock(opCtx);
+
+    std::vector<std::string> dbNames;
+    opCtx->getServiceContext()->getStorageEngine()->listDatabases(&dbNames);
+    invariant(!dbNames.empty());
+    log() << "dropReplicatedDatabases - dropping " << dbNames.size() << " databases";
+
+    ReplicationCoordinator::get(opCtx)->dropAllSnapshots();
+
+    auto databaseHolder = DatabaseHolder::get(opCtx);
+    auto hasLocalDatabase = false;
+    for (const auto& dbName : dbNames) {
+        if (dbName == "local") {
+            hasLocalDatabase = true;
+            continue;
+        }
+        writeConflictRetry(opCtx, "dropReplicatedDatabases", dbName, [&] {
+            if (auto db = databaseHolder->getDb(opCtx, dbName)) {
+                databaseHolder->dropDb(opCtx, db);
+            } else {
+                // This is needed since dropDatabase can't be rolled back.
+                // This is safe be replaced by "invariant(db);dropDatabase(opCtx, db);" once fixed.
+                log() << "dropReplicatedDatabases - database disappeared after retrieving list of "
+                         "database names but before drop: "
+                      << dbName;
+            }
+        });
+    }
+    invariant(hasLocalDatabase, "local database missing");
+    log() << "dropReplicatedDatabases - dropped " << dbNames.size() << " databases";
+
     return Status::OK();
 }
 
@@ -401,7 +432,6 @@ Status StorageInterfaceImpl::createCollection(OperationContext* opCtx,
                                               const NamespaceString& nss,
                                               const CollectionOptions& options) {
     return writeConflictRetry(opCtx, "StorageInterfaceImpl::createCollection", nss.ns(), [&] {
-        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
         AutoGetOrCreateDb databaseWriteGuard(opCtx, nss.db(), MODE_X);
         auto db = databaseWriteGuard.getDb();
         invariant(db);
@@ -424,7 +454,6 @@ Status StorageInterfaceImpl::createCollection(OperationContext* opCtx,
 
 Status StorageInterfaceImpl::dropCollection(OperationContext* opCtx, const NamespaceString& nss) {
     return writeConflictRetry(opCtx, "StorageInterfaceImpl::dropCollection", nss.ns(), [&] {
-        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
         AutoGetDb autoDB(opCtx, nss.db(), MODE_X);
         if (!autoDB.getDb()) {
             // Database does not exist - nothing to do.
@@ -528,7 +557,7 @@ Status StorageInterfaceImpl::setIndexIsMultikey(OperationContext* opCtx,
                                         << nss.ns()
                                         << " to set to multikey.");
         }
-        collection->getIndexCatalog()->getIndex(idx)->setIndexIsMultikey(opCtx, paths);
+        collection->getIndexCatalog()->setMultikeyPaths(opCtx, idx, paths);
         wunit.commit();
         return Status::OK();
     });
@@ -539,10 +568,10 @@ namespace {
 /**
  * Returns DeleteStageParams for deleteOne with fetch.
  */
-DeleteStageParams makeDeleteStageParamsForDeleteDocuments() {
-    DeleteStageParams deleteStageParams;
-    deleteStageParams.isMulti = true;
-    deleteStageParams.returnDeleted = true;
+std::unique_ptr<DeleteStageParams> makeDeleteStageParamsForDeleteDocuments() {
+    auto deleteStageParams = std::make_unique<DeleteStageParams>();
+    deleteStageParams->isMulti = true;
+    deleteStageParams->returnDeleted = true;
     return deleteStageParams;
 }
 
@@ -609,7 +638,7 @@ StatusWith<std::vector<BSONObj>> _findOrDeleteDocuments(
                 auto indexCatalog = collection->getIndexCatalog();
                 invariant(indexCatalog);
                 bool includeUnfinishedIndexes = false;
-                IndexDescriptor* indexDescriptor =
+                const IndexDescriptor* indexDescriptor =
                     indexCatalog->findIndexByName(opCtx, *indexName, includeUnfinishedIndexes);
                 if (!indexDescriptor) {
                     return Result(ErrorCodes::IndexNotFound,
@@ -1054,10 +1083,6 @@ StatusWith<Timestamp> StorageInterfaceImpl::recoverToStableTimestamp(OperationCo
     return opCtx->getServiceContext()->getStorageEngine()->recoverToStableTimestamp(opCtx);
 }
 
-bool StorageInterfaceImpl::supportsRecoverToStableTimestamp(ServiceContext* serviceCtx) const {
-    return serviceCtx->getStorageEngine()->supportsRecoverToStableTimestamp();
-}
-
 bool StorageInterfaceImpl::supportsRecoveryTimestamp(ServiceContext* serviceCtx) const {
     return serviceCtx->getStorageEngine()->supportsRecoveryTimestamp();
 }
@@ -1124,8 +1149,12 @@ Status StorageInterfaceImpl::isAdminDbValid(OperationContext* opCtx) {
     return Status::OK();
 }
 
-void StorageInterfaceImpl::waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx) {
+void StorageInterfaceImpl::waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx,
+                                                                   bool primaryOnly) {
     Lock::GlobalLock lk(opCtx, MODE_IS);
+    if (primaryOnly &&
+        !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesForDatabase(opCtx, "admin"))
+        return;
     Collection* oplog;
     {
         // We don't want to be holding the collection lock while blocking, to avoid deadlocks.
@@ -1151,7 +1180,7 @@ void StorageInterfaceImpl::oplogDiskLocRegister(OperationContext* opCtx,
 
 boost::optional<Timestamp> StorageInterfaceImpl::getLastStableRecoveryTimestamp(
     ServiceContext* serviceCtx) const {
-    if (!supportsRecoverToStableTimestamp(serviceCtx)) {
+    if (!supportsRecoveryTimestamp(serviceCtx)) {
         return boost::none;
     }
 

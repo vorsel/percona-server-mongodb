@@ -44,7 +44,6 @@ namespace shell_utils {
 
 extern std::string _dbConnect;
 extern std::string _dbAuth;
-extern bool _nokillop;
 
 void RecordMyLocation(const char* _argv0);
 void installShellUtils(Scope& scope);

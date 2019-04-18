@@ -34,6 +34,7 @@
 #include <map>
 
 #include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/storage/biggie/biggie_visibility_manager.h"
 #include "mongo/db/storage/biggie/store.h"
 #include "mongo/db/storage/capped_callback.h"
 #include "mongo/db/storage/record_store.h"
@@ -42,17 +43,20 @@
 
 namespace mongo {
 namespace biggie {
+
 /**
  * A RecordStore that stores all data in-memory.
  */
-class RecordStore : public ::mongo::RecordStore {
+class RecordStore final : public ::mongo::RecordStore {
 public:
     explicit RecordStore(StringData ns,
                          StringData ident,
                          bool isCapped = false,
                          int64_t cappedMaxSize = -1,
                          int64_t cappedMaxDocs = -1,
-                         CappedCallback* cappedCallback = nullptr);
+                         CappedCallback* cappedCallback = nullptr,
+                         VisibilityManager* visibilityManager = nullptr);
+    ~RecordStore() = default;
 
     virtual const char* name() const;
     virtual const std::string& getIdent() const;
@@ -111,13 +115,32 @@ public:
 
     virtual Status touch(OperationContext* opCtx, BSONObjBuilder* output) const;
 
-    void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx) const;
+    virtual boost::optional<RecordId> oplogStartHack(OperationContext* opCtx,
+                                                     const RecordId& startingPosition) const;
+
+    void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx) const override;
 
     virtual void updateStatsAfterRepair(OperationContext* opCtx,
                                         long long numRecords,
                                         long long dataSize);
 
 private:
+    friend class VisibilityManagerChange;
+
+    /**
+     * This gets the next (guaranteed) unique record id.
+     */
+    inline int64_t _nextRecordId() {
+        return _highestRecordId.fetchAndAdd(1);
+    }
+
+    /**
+     *  Two helper functions for deleting excess records in capped record stores.
+     *  The caller should not have an active SizeAdjuster.
+     */
+    bool _cappedAndNeedDelete(OperationContext* opCtx, StringStore* workingCopy);
+    void _cappedDeleteAsNeeded(OperationContext* opCtx, StringStore* workingCopy);
+
     const bool _isCapped;
     const int64_t _cappedMaxSize;
     const int64_t _cappedMaxDocs;
@@ -133,18 +156,32 @@ private:
 
     mutable stdx::mutex _cappedDeleterMutex;
 
-    AtomicInt64 _highest_record_id{1};
+    AtomicWord<long long> _highestRecordId{1};
+    AtomicWord<long long> _numRecords{0};
+    AtomicWord<long long> _dataSize{0};
+
     std::string generateKey(const uint8_t* key, size_t key_len) const;
 
-    /*
-     * This gets the next (guaranteed) unique record id.
-     */
-    inline int64_t nextRecordId() {
-        return _highest_record_id.fetchAndAdd(1);
-    }
+    bool _isOplog;
+    VisibilityManager* _visibilityManager;
 
-    bool cappedAndNeedDelete(OperationContext* opCtx, StringStore* workingCopy);
-    void cappedDeleteAsNeeded(OperationContext* opCtx, StringStore* workingCopy);
+    /**
+     * Automatically adjust the record count and data size based on the size in change of the
+     * underlying radix store during the life time of the SizeAdjuster.
+     */
+    friend class SizeAdjuster;
+    class SizeAdjuster {
+    public:
+        SizeAdjuster(OperationContext* opCtx, RecordStore* rs);
+        ~SizeAdjuster();
+
+    private:
+        OperationContext* const _opCtx;
+        RecordStore* const _rs;
+        const StringStore* _workingCopy;
+        const int64_t _origNumRecords;
+        const int64_t _origDataSize;
+    };
 
     class Cursor final : public SeekableRecordCursor {
         OperationContext* opCtx;
@@ -156,9 +193,13 @@ private:
         bool _needFirstSeek = true;
         bool _lastMoveWasRestore = false;
         bool _isCapped;
+        bool _isOplog;
+        VisibilityManager* _visibilityManager;
 
     public:
-        Cursor(OperationContext* opCtx, const RecordStore& rs);
+        Cursor(OperationContext* opCtx,
+               const RecordStore& rs,
+               VisibilityManager* visibilityManager);
         boost::optional<Record> next() final;
         boost::optional<Record> seekExact(const RecordId& id) final override;
         void save() final;
@@ -181,9 +222,13 @@ private:
         bool _needFirstSeek = true;
         bool _lastMoveWasRestore = false;
         bool _isCapped;
+        bool _isOplog;
+        VisibilityManager* _visibilityManager;
 
     public:
-        ReverseCursor(OperationContext* opCtx, const RecordStore& rs);
+        ReverseCursor(OperationContext* opCtx,
+                      const RecordStore& rs,
+                      VisibilityManager* visibilityManager);
         boost::optional<Record> next() final;
         boost::optional<Record> seekExact(const RecordId& id) final override;
         void save() final;
@@ -196,5 +241,6 @@ private:
         bool inPrefix(const std::string& key_string);
     };
 };
+
 }  // namespace biggie
 }  // namespace mongo

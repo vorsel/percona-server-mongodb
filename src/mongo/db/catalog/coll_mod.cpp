@@ -147,7 +147,7 @@ StatusWith<CollModRequest> parseCollModRequest(OperationContext* opCtx,
                                                 << nss.ns());
                 }
             } else {
-                std::vector<IndexDescriptor*> indexes;
+                std::vector<const IndexDescriptor*> indexes;
                 coll->getIndexCatalog()->findIndexesByKeyPattern(
                     opCtx, keyPattern, false, &indexes);
 
@@ -203,15 +203,15 @@ StatusWith<CollModRequest> parseCollModRequest(OperationContext* opCtx,
 
             cmr.collValidator = e;
         } else if (fieldName == "validationLevel" && !isView) {
-            auto statusW = coll->parseValidationLevel(e.String());
-            if (!statusW.isOK())
-                return statusW.getStatus();
+            auto status = coll->parseValidationLevel(e.String());
+            if (!status.isOK())
+                return status;
 
             cmr.collValidationLevel = e.String();
         } else if (fieldName == "validationAction" && !isView) {
-            auto statusW = coll->parseValidationAction(e.String());
-            if (!statusW.isOK())
-                return statusW.getStatus();
+            auto status = coll->parseValidationAction(e.String());
+            if (!status.isOK())
+                return status;
 
             cmr.collValidationAction = e.String();
         } else if (fieldName == "pipeline") {

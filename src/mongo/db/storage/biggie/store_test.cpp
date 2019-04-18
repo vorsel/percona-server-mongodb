@@ -40,6 +40,14 @@ using value_type = StringStore::value_type;
 
 class RadixStoreTest : public unittest::Test {
 public:
+    virtual ~RadixStoreTest() {
+        checkValid(thisStore);
+        checkValid(parallelStore);
+        checkValid(otherStore);
+        checkValid(baseStore);
+        checkValid(expected);
+    }
+
     StringStore::Head* getRootAddress() const {
         return thisStore._root.get();
     }
@@ -50,6 +58,19 @@ public:
 
     bool hasPreviousVersion() const {
         return thisStore._root->hasPreviousVersion();
+    }
+
+    void checkValid(StringStore& store) const {
+        size_t actualSize = 0;
+        size_t actualDataSize = 0;
+        std::string lastKey = "";
+        for (auto& item : store) {
+            ASSERT_GT(item.first, lastKey);
+            actualDataSize += item.second.size();
+            actualSize++;
+        }
+        ASSERT_EQ(store.size(), actualSize);
+        ASSERT_EQ(store.dataSize(), actualDataSize);
     }
 
 protected:
@@ -688,6 +709,21 @@ TEST_F(RadixStoreTest, UpdateTest) {
     ASSERT_TRUE(it2 == thisStore.end());
 }
 
+TEST_F(RadixStoreTest, DuplicateKeyTest) {
+    std::string msg1 = "Hello, world!";
+    std::string msg2 = msg1 + "!!";
+    value_type value1 = std::make_pair("msg", msg1);
+    value_type value2 = std::make_pair("msg", msg2);
+
+    ASSERT(thisStore.insert(value_type(value1)).second);
+    ASSERT_EQ(thisStore.size(), 1u);
+    ASSERT_EQ(thisStore.dataSize(), msg1.size());
+
+    ASSERT(!thisStore.insert(value_type(value2)).second);
+    ASSERT_EQ(thisStore.size(), 1u);
+    ASSERT_EQ(thisStore.dataSize(), msg1.size());
+}
+
 TEST_F(RadixStoreTest, UpdateLeafOnSharedNodeTest) {
     value_type value1 = std::make_pair("foo", "1");
     value_type value2 = std::make_pair("bar", "2");
@@ -902,7 +938,7 @@ TEST_F(RadixStoreTest, EraseNonLeafNodeWithSharedParent) {
 
     otherStore = thisStore;
 
-    StringStore::size_type success = otherStore.erase(value3.first);
+    bool success = otherStore.erase(value3.first);
 
     ASSERT_TRUE(success);
     ASSERT_EQ(thisStore.size(), StringStore::size_type(4));
@@ -1760,7 +1796,7 @@ TEST_F(RadixStoreTest, BasicInsertFindDeleteNullCharacter) {
     ASSERT_TRUE(iter != thisStore.end());
     ASSERT_EQ(iter->first, value1.first);
 
-    ASSERT_EQ(thisStore.erase(std::string("ab\0", 3)), StringStore::size_type(1));
+    ASSERT_TRUE(thisStore.erase(std::string("ab\0", 3)));
     ASSERT_EQ(thisStore.size(), StringStore::size_type(1));
 
     iter = thisStore.find(std::string("ab\0", 3));
@@ -1939,79 +1975,79 @@ TEST_F(RadixStoreTest, PathCompressionTest) {
     value_type value7 = std::make_pair("foodie", "7");
 
     thisStore.insert(value_type(value1));
-    ASSERT_EQ(thisStore.to_string_for_test(), "\n food*\n");
+    ASSERT_EQ(thisStore.toString(), "\n1 food*\n");
 
     // Add a key that is a prefix of a key already in the tree
     thisStore.insert(value_type(value2));
-    ASSERT_EQ(thisStore.to_string_for_test(),
-              "\n foo*"
-              "\n  d*\n");
+    ASSERT_EQ(thisStore.toString(),
+              "\n1 foo*"
+              "\n1  d*\n");
 
     // Add a key with no prefix already in the tree
     thisStore.insert(value_type(value3));
-    ASSERT_EQ(thisStore.to_string_for_test(),
-              "\n bar*"
-              "\n foo*"
-              "\n  d*\n");
+    ASSERT_EQ(thisStore.toString(),
+              "\n1 bar*"
+              "\n1 foo*"
+              "\n1  d*\n");
 
     // Add a key that shares a prefix with a key in the tree
     thisStore.insert(value_type(value4));
-    ASSERT_EQ(thisStore.to_string_for_test(),
-              "\n ba"
-              "\n  r*"
-              "\n  tter*"
-              "\n foo*"
-              "\n  d*\n");
+    ASSERT_EQ(thisStore.toString(),
+              "\n1 ba"
+              "\n1  r*"
+              "\n1  tter*"
+              "\n1 foo*"
+              "\n1  d*\n");
 
     // Add another level to the tree
     thisStore.insert(value_type(value5));
-    ASSERT_EQ(thisStore.to_string_for_test(),
-              "\n ba"
-              "\n  r*"
-              "\n  tt"
-              "\n   er*"
-              "\n   y*"
-              "\n foo*"
-              "\n  d*\n");
+    ASSERT_EQ(thisStore.toString(),
+              "\n1 ba"
+              "\n1  r*"
+              "\n1  tt"
+              "\n1   er*"
+              "\n1   y*"
+              "\n1 foo*"
+              "\n1  d*\n");
 
     // Erase a key that causes the path to be compressed
     thisStore.erase(value2.first);
-    ASSERT_EQ(thisStore.to_string_for_test(),
-              "\n ba"
-              "\n  r*"
-              "\n  tt"
-              "\n   er*"
-              "\n   y*"
-              "\n food*\n");
+    ASSERT_EQ(thisStore.toString(),
+              "\n1 ba"
+              "\n1  r*"
+              "\n1  tt"
+              "\n1   er*"
+              "\n1   y*"
+              "\n1 food*\n");
 
     // Erase a key that causes the path to be compressed
     thisStore.erase(value3.first);
-    ASSERT_EQ(thisStore.to_string_for_test(),
-              "\n batt"
-              "\n  er*"
-              "\n  y*"
-              "\n food*\n");
+    ASSERT_EQ(thisStore.toString(),
+              "\n1 batt"
+              "\n1  er*"
+              "\n1  y*"
+              "\n1 food*\n");
 
     // Add a key that causes a node with children to be split
     thisStore.insert(value_type(value6));
-    ASSERT_EQ(thisStore.to_string_for_test(),
-              "\n bat"
-              "\n  s*"
-              "\n  t"
-              "\n   er*"
-              "\n   y*"
-              "\n food*\n");
+    ASSERT_EQ(thisStore.toString(),
+              "\n1 bat"
+              "\n1  s*"
+              "\n1  t"
+              "\n1   er*"
+              "\n1   y*"
+              "\n1 food*\n");
 
     // Add a key that has a prefix already in the tree with a value
     thisStore.insert(value_type(value7));
-    ASSERT_EQ(thisStore.to_string_for_test(),
-              "\n bat"
-              "\n  s*"
-              "\n  t"
-              "\n   er*"
-              "\n   y*"
-              "\n food*"
-              "\n  ie*\n");
+    ASSERT_EQ(thisStore.toString(),
+              "\n1 bat"
+              "\n1  s*"
+              "\n1  t"
+              "\n1   er*"
+              "\n1   y*"
+              "\n1 food*"
+              "\n1  ie*\n");
 }
 
 TEST_F(RadixStoreTest, MergeOneTest) {

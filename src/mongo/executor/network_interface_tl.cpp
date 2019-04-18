@@ -222,20 +222,30 @@ Status NetworkInterfaceTL::startCommand(const TaskExecutor::CallbackHandle& cbHa
     // return on the reactor thread.
     //
     // TODO: get rid of this cruft once we have a connection pool that's executor aware.
-    auto connFuture = _reactor->execute([this, state, request, baton] {
-        return makeReadyFutureWith(
-                   [this, request] { return _pool->get(request.target, request.timeout); })
+
+    auto connFuture = [&] {
+        auto conn = _pool->tryGet(request.target, request.sslMode);
+
+        if (conn) {
+            return Future<ConnectionPool::ConnectionHandle>(std::move(*conn));
+        }
+
+        return _reactor
+            ->execute([this, state, request, baton] {
+                return makeReadyFutureWith([this, request] {
+                    return _pool->get(request.target, request.sslMode, request.timeout);
+                });
+            })
             .tapError([state](Status error) {
                 LOG(2) << "Failed to get connection from pool for request " << state->request.id
                        << ": " << error;
-            })
-            .then([this, baton](ConnectionPool::ConnectionHandle conn) {
-                auto deleter = conn.get_deleter();
-
-                // TODO: drop out this shared_ptr once we have a unique_function capable future
-                return std::make_shared<CommandState::ConnHandle>(
-                    conn.release(), CommandState::Deleter{deleter, _reactor});
             });
+    }().then([this, baton](ConnectionPool::ConnectionHandle conn) {
+        auto deleter = conn.get_deleter();
+
+        // TODO: drop out this shared_ptr once we have a unique_function capable future
+        return std::make_shared<CommandState::ConnHandle>(conn.release(),
+                                                          CommandState::Deleter{deleter, _reactor});
     });
 
     auto remainingWork =
@@ -340,11 +350,14 @@ Future<RemoteCommandResponse> NetworkInterfaceTL::_onAcquireConn(
                     _counters.timedOut++;
                 }
 
-                LOG(2) << "Request " << state->request.id << " timed out"
-                       << ", deadline was " << state->deadline << ", op was "
-                       << redact(state->request.toString());
+                const std::string message = str::stream()
+                    << "Request " << state->request.id << " timed out"
+                    << ", deadline was " << state->deadline.toString() << ", op was "
+                    << redact(state->request.toString());
+
+                LOG(2) << message;
                 state->promise.setError(
-                    Status(ErrorCodes::NetworkInterfaceExceededTimeLimit, "timed out"));
+                    Status(ErrorCodes::NetworkInterfaceExceededTimeLimit, message));
 
                 client->cancel(baton);
             });

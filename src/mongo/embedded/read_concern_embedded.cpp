@@ -30,6 +30,7 @@
 
 #include "mongo/db/read_concern.h"
 #include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/repl/speculative_majority_read_info.h"
 
 namespace mongo {
 
@@ -48,6 +49,10 @@ MONGO_REGISTER_SHIM(waitForReadConcern)
         return {ErrorCodes::NotImplemented, "afterOpTime is not supported on embedded"};
     }
 
+    return Status::OK();
+}
+MONGO_REGISTER_SHIM(waitForSpeculativeMajorityReadConcern)
+(OperationContext* opCtx, repl::SpeculativeMajorityReadInfo speculativeReadInfo)->Status {
     return Status::OK();
 }
 

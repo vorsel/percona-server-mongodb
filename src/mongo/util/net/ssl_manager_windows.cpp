@@ -66,10 +66,9 @@
 
 namespace mongo {
 
-namespace {
+extern SSLManagerInterface* theSSLManager;
 
-SimpleMutex sslManagerMtx;
-SSLManagerInterface* theSSLManager = NULL;
+namespace {
 
 /**
 * Free a Certificate Context.
@@ -344,8 +343,8 @@ private:
     UniqueCertificate _sslClusterCertificate;
 };
 
-MONGO_INITIALIZER(SSLManager)(InitializerContext*) {
-    stdx::lock_guard<SimpleMutex> lck(sslManagerMtx);
+MONGO_INITIALIZER_WITH_PREREQUISITES(SSLManager, ("EndStartupOptionHandling"))
+(InitializerContext*) {
     if (!isSSLServer || (sslGlobalParams.sslMode.load() != SSLParams::SSLMode_disabled)) {
         theSSLManager = new SSLManagerWindows(sslGlobalParams, isSSLServer);
     }
@@ -376,13 +375,6 @@ bool isSSLServer = false;
 std::unique_ptr<SSLManagerInterface> SSLManagerInterface::create(const SSLParams& params,
                                                                  bool isServer) {
     return stdx::make_unique<SSLManagerWindows>(params, isServer);
-}
-
-SSLManagerInterface* getSSLManager() {
-    stdx::lock_guard<SimpleMutex> lck(sslManagerMtx);
-    if (theSSLManager)
-        return theSSLManager;
-    return NULL;
 }
 
 namespace {
@@ -417,10 +409,12 @@ SSLManagerWindows::SSLManagerWindows(const SSLParams& params, bool isServer)
         uassertStatusOK(initSSLContext(&_serverCred, params, ConnectionDirection::kIncoming));
 
         if (_serverCertificates[0] != nullptr) {
+            SSLX509Name subjectName;
             uassertStatusOK(
                 _validateCertificate(_serverCertificates[0],
-                                     &_sslConfiguration.serverSubjectName,
+                                     &subjectName,
                                      &_sslConfiguration.serverCertificateExpirationDate));
+            uassertStatusOK(_sslConfiguration.setServerSubjectName(std::move(subjectName)));
         }
 
         // Monitor the server certificate's expiration
@@ -1483,6 +1477,7 @@ Status SSLManagerWindows::_validateCertificate(PCCERT_CONTEXT cert,
             Date_t::fromMillisSinceEpoch(FiletimeToEpocMillis(cert->pCertInfo->NotAfter));
     }
 
+    uassertStatusOK(subjectName->normalizeStrings());
     return Status::OK();
 }
 
@@ -1693,6 +1688,7 @@ Status validatePeerCertificate(const std::string& remoteHost,
             return Status(ErrorCodes::SSLHandshakeFailed, msg);
         }
     }
+    uassertStatusOK(peerSubjectName->normalizeStrings());
     return Status::OK();
 }
 
@@ -1790,6 +1786,11 @@ StatusWith<boost::optional<SSLPeerInfo>> SSLManagerWindows::parseAndValidatePeer
     }
 
     LOG(2) << "Accepted TLS connection from peer: " << peerSubjectName;
+
+    // If this is a server and client and server certificate are the same, log a warning.
+    if (remoteHost.empty() && _sslConfiguration.serverSubjectName() == peerSubjectName) {
+        warning() << "Client connecting with server's own TLS certificate";
+    }
 
     // On the server side, parse the certificate for roles
     if (remoteHost.empty()) {

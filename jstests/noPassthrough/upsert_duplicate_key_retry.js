@@ -3,7 +3,10 @@
  * the query values, it is possible that they will both attempt to perform an insert with one of
  * the two failing on the unique index constraint. This test confirms that the failed insert will be
  * retried, resulting in an update.
- *  @tags: [requires_replication]
+ *
+ * In order for one of the two conflicting upserts to make progress we require a storage engine
+ * which supports document level locking.
+ *  @tags: [requires_replication, requires_document_locking]
  */
 
 (function() {
@@ -61,6 +64,27 @@
     const oplogColl = testDB.getSiblingDB("local").getCollection("oplog.rs");
     assert.eq(1, oplogColl.find({"op": "i", "ns": "test.upsert_duplicate_key_retry"}).itcount());
     assert.eq(1, oplogColl.find({"op": "u", "ns": "test.upsert_duplicate_key_retry"}).itcount());
+
+    //
+    // Confirm DuplicateKey error for cases that should not be retried.
+    //
+    assert.commandWorked(testDB.runCommand({drop: collName}));
+    assert.commandWorked(testColl.createIndex({x: 1}, {unique: true}));
+
+    // DuplicateKey error on replacement-style upsert, where the unique index key value to be
+    // written does not match the value of the query predicate.
+    assert.commandWorked(testColl.createIndex({x: 1}, {unique: true}));
+    assert.commandWorked(testColl.insert({_id: 1, 'a': 12345}));
+    assert.commandFailedWithCode(testColl.update({x: 3}, {}, {upsert: true}),
+                                 ErrorCodes.DuplicateKey);
+
+    // DuplicateKey error on update-style upsert, where the unique index key value to be written
+    // does not match the value of the query predicate.
+    assert.commandWorked(testColl.remove({}));
+    assert.commandWorked(testColl.insert({x: 3}));
+    assert.commandWorked(testColl.insert({x: 4}));
+    assert.commandFailedWithCode(testColl.update({x: 3}, {$inc: {x: 1}}, {upsert: true}),
+                                 ErrorCodes.DuplicateKey);
 
     rst.stopSet();
 })();

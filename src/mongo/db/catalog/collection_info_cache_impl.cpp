@@ -84,13 +84,14 @@ void CollectionInfoCacheImpl::computeIndexKeys(OperationContext* opCtx) {
     std::unique_ptr<IndexCatalog::IndexIterator> it =
         _collection->getIndexCatalog()->getIndexIterator(opCtx, true);
     while (it->more()) {
-        IndexCatalogEntry* entry = it->next();
-        IndexDescriptor* descriptor = entry->descriptor();
-        IndexAccessMethod* iam = entry->accessMethod();
+        const IndexCatalogEntry* entry = it->next();
+        const IndexDescriptor* descriptor = entry->descriptor();
+        const IndexAccessMethod* iam = entry->accessMethod();
 
         if (descriptor->getAccessMethodName() == IndexNames::WILDCARD) {
             // Obtain the projection used by the $** index's key generator.
-            const auto* pathProj = static_cast<WildcardAccessMethod*>(iam)->getProjectionExec();
+            const auto* pathProj =
+                static_cast<const WildcardAccessMethod*>(iam)->getProjectionExec();
             // If the projection is an exclusion, then we must check the new document's keys on all
             // updates, since we do not exhaustively know the set of paths to be indexed.
             if (pathProj->getType() == ProjectionExecAgg::ProjectionType::kExclusionProjection) {
@@ -188,7 +189,7 @@ QuerySettings* CollectionInfoCacheImpl::getQuerySettings() const {
 }
 
 void CollectionInfoCacheImpl::updatePlanCacheIndexEntries(OperationContext* opCtx) {
-    std::vector<IndexEntry> indexEntries;
+    std::vector<CoreIndexInfo> indexCores;
 
     // TODO We shouldn't need to include unfinished indexes, but we must here because the index
     // catalog may be in an inconsistent state.  SERVER-18346.
@@ -197,10 +198,10 @@ void CollectionInfoCacheImpl::updatePlanCacheIndexEntries(OperationContext* opCt
         _collection->getIndexCatalog()->getIndexIterator(opCtx, includeUnfinishedIndexes);
     while (ii->more()) {
         const IndexCatalogEntry* ice = ii->next();
-        indexEntries.emplace_back(indexEntryFromIndexCatalogEntry(opCtx, *ice));
+        indexCores.emplace_back(indexInfoFromIndexCatalogEntry(*ice));
     }
 
-    _planCache->notifyOfIndexEntries(indexEntries);
+    _planCache->notifyOfIndexUpdates(indexCores);
 }
 
 void CollectionInfoCacheImpl::init(OperationContext* opCtx) {

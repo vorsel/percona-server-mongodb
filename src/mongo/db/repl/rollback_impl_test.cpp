@@ -36,6 +36,7 @@
 #include "mongo/db/catalog/collection_mock.h"
 #include "mongo/db/catalog/drop_collection.h"
 #include "mongo/db/catalog/uuid_catalog.h"
+#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/oplog_interface_local.h"
@@ -44,6 +45,8 @@
 #include "mongo/db/repl/rollback_test_fixture.h"
 #include "mongo/db/s/shard_identity_rollback_notifier.h"
 #include "mongo/db/s/type_shard_identity.h"
+#include "mongo/db/server_transactions_metrics.h"
+#include "mongo/db/service_context.h"
 #include "mongo/s/catalog/type_config_version.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/util/assert_util.h"
@@ -171,12 +174,11 @@ protected:
         ASSERT_OK(_storageInterface->createCollection(opCtx, nss, options));
 
         // Initialize a mock collection.
-        std::unique_ptr<Collection> coll =
-            std::make_unique<Collection>(std::make_unique<CollectionMock>(nss));
+        auto coll = std::make_unique<CollectionMock>(nss);
 
         // Register the UUID to that collection in the UUIDCatalog.
         UUIDCatalog::get(opCtx).registerUUIDCatalogEntry(uuid, coll.get());
-        return coll;
+        return std::move(coll);
     }
 
     /**
@@ -1289,12 +1291,13 @@ TEST_F(RollbackImplTest, CountChangesCancelOut) {
     _deleteDocAndGenerateOplogEntry(obj["_id"], uuid, nss, 3);
     _insertDocAndGenerateOplogEntry(BSON("_id" << 3), uuid, nss, 4);
 
-    // Test that we do nothing on drop oplog entries.
+    // Test that we read the collection count from drop entries.
     ASSERT_OK(_insertOplogEntry(makeCommandOp(Timestamp(5, 5),
-                                              UUID::gen(),
+                                              uuid,
                                               nss.getCommandNS().toString(),
                                               BSON("drop" << nss.coll()),
-                                              5)
+                                              5,
+                                              BSON("numRecords" << 1))
                                     .first));
 
     ASSERT_EQ(2ULL,
@@ -1365,6 +1368,35 @@ TEST_F(RollbackImplTest, ResetToZeroIfCountGoesNegative) {
 
     ASSERT_OK(_rollback->runRollback(_opCtx.get()));
     ASSERT_EQ(_storageInterface->getFinalCollectionCount(kGenericUUID), 0);
+}
+
+TEST_F(RollbackImplTest, RollbackCallsClearOpTimes) {
+    auto op = makeOpAndRecordId(1);
+    _remoteOplog->setOperations({op});
+    ASSERT_OK(_insertOplogEntry(op.first));
+    ASSERT_OK(_insertOplogEntry(makeOp(2)));
+    _storageInterface->setStableTimestamp(nullptr, Timestamp(1, 1));
+
+    auto txnMetrics = ServerTransactionsMetrics::get(getGlobalServiceContext());
+
+    // Insert arbitrary values for _oldestActiveOplogEntryOpTime, _oldestActiveOplogEntryOpTimes,
+    // and _oldestNonMajorityCommittedOpTimes. This simulates two active prepared transactions.
+    txnMetrics->addActiveOpTime(repl::OpTime(Timestamp(1, 2), 0));
+    txnMetrics->addActiveOpTime(repl::OpTime(Timestamp(1, 3), 0));
+
+    // All three variables should be populated at this time.
+    ASSERT(txnMetrics->getOldestActiveOpTime());
+    ASSERT_EQ(*txnMetrics->getOldestActiveOpTime(), repl::OpTime(Timestamp(1, 2), 0));
+    ASSERT_EQ(txnMetrics->getTotalActiveOpTimes(), 2U);
+    ASSERT(txnMetrics->getOldestNonMajorityCommittedOpTime());
+    ASSERT_EQ(*txnMetrics->getOldestNonMajorityCommittedOpTime(), repl::OpTime(Timestamp(1, 2), 0));
+
+    // Call runRollback to make sure these variables get cleared.
+    ASSERT_OK(_rollback->runRollback(_opCtx.get()));
+
+    ASSERT_FALSE(txnMetrics->getOldestActiveOpTime());
+    ASSERT_EQ(txnMetrics->getTotalActiveOpTimes(), 0U);
+    ASSERT_FALSE(txnMetrics->getOldestNonMajorityCommittedOpTime());
 }
 
 /**
@@ -1625,11 +1657,13 @@ TEST_F(RollbackImplObserverInfoTest, RollbackRecordsNamespacesOfApplyOpsOplogEnt
                                   2);
 
     auto dropNss = NamespaceString("test", "dropColl");
+    auto dropUuid = UUID::gen();
     auto dropOp = makeCommandOp(Timestamp(2, 2),
-                                UUID::gen(),
+                                dropUuid,
                                 dropNss.getCommandNS().toString(),
                                 BSON("drop" << dropNss.coll()),
                                 2);
+    _initializeCollection(_opCtx.get(), dropUuid, dropNss);
 
     auto collModNss = NamespaceString("test", "collModColl");
     auto collModOp = makeCommandOp(Timestamp(2, 2),

@@ -37,6 +37,7 @@
 #include <algorithm>
 
 #include "mongo/base/status_with.h"
+#include "mongo/bson/bson_comparator_interface_base.h"
 #include "mongo/bson/mutable/algorithm.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop_failpoint_helpers.h"
@@ -476,7 +477,8 @@ bool UpdateStage::shouldRetryDuplicateKeyException(const ParsedUpdate& parsedUpd
     }
 
     // In order to be retryable, the update equality field paths must be identical to the unique
-    // index key field paths.
+    // index key field paths. Also, the values that triggered the DuplicateKey error must match the
+    // values used in the upsert query predicate.
     pathsupport::EqualityMatches equalities;
     auto status = pathsupport::extractEqualityMatches(*matchExpr, &equalities);
     if (!status.isOK()) {
@@ -488,11 +490,27 @@ bool UpdateStage::shouldRetryDuplicateKeyException(const ParsedUpdate& parsedUpd
         return false;
     }
 
-    for (const auto& key : keyPattern) {
-        if (!equalities.count(key.fieldNameStringData())) {
+    auto keyValue = errorInfo.getDuplicatedKeyValue();
+
+    BSONObjIterator keyPatternIter(keyPattern);
+    BSONObjIterator keyValueIter(keyValue);
+    while (keyPatternIter.more() && keyValueIter.more()) {
+        auto keyPatternElem = keyPatternIter.next();
+        auto keyValueElem = keyValueIter.next();
+
+        auto keyName = keyPatternElem.fieldNameStringData();
+        if (!equalities.count(keyName)) {
+            return false;
+        }
+
+        // Comparison which obeys field ordering but ignores field name.
+        BSONElementComparator cmp{BSONElementComparator::FieldNamesMode::kIgnore, nullptr};
+        if (cmp.evaluate(equalities[keyName]->getData() != keyValueElem)) {
             return false;
         }
     }
+    invariant(!keyPatternIter.more());
+    invariant(!keyValueIter.more());
 
     return true;
 }
@@ -625,7 +643,7 @@ PlanStage::StageState UpdateStage::doWork(WorkingSetID* out) {
 
         // We want to free this member when we return, unless we need to retry updating or returning
         // it.
-        ScopeGuard memberFreer = MakeGuard(&WorkingSet::free, _ws, id);
+        auto memberFreer = makeGuard([&] { _ws->free(id); });
 
         invariant(member->hasRecordId());
         recordId = member->recordId;
@@ -648,7 +666,7 @@ PlanStage::StageState UpdateStage::doWork(WorkingSetID* out) {
                 collection(), getOpCtx(), _ws, id, _params.canonicalQuery);
         } catch (const WriteConflictException&) {
             // There was a problem trying to detect if the document still exists, so retry.
-            memberFreer.Dismiss();
+            memberFreer.dismiss();
             return prepareToRetryWSM(id, out);
         }
 
@@ -684,7 +702,7 @@ PlanStage::StageState UpdateStage::doWork(WorkingSetID* out) {
             // Do the update, get us the new version of the doc.
             newObj = transformAndUpdate(member->obj, recordId);
         } catch (const WriteConflictException&) {
-            memberFreer.Dismiss();  // Keep this member around so we can retry updating it.
+            memberFreer.dismiss();  // Keep this member around so we can retry updating it.
             return prepareToRetryWSM(id, out);
         }
 
@@ -720,7 +738,7 @@ PlanStage::StageState UpdateStage::doWork(WorkingSetID* out) {
 
                 _idReturning = id;
                 // Keep this member around so that we can return it on the next work() call.
-                memberFreer.Dismiss();
+                memberFreer.dismiss();
             }
             *out = WorkingSet::INVALID_ID;
             return NEED_YIELD;
@@ -730,7 +748,7 @@ PlanStage::StageState UpdateStage::doWork(WorkingSetID* out) {
             // member->obj should refer to the document we want to return.
             invariant(member->getState() == WorkingSetMember::OWNED_OBJ);
 
-            memberFreer.Dismiss();  // Keep this member around so we can return it.
+            memberFreer.dismiss();  // Keep this member around so we can return it.
             *out = id;
             return PlanStage::ADVANCED;
         }

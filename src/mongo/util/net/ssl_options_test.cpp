@@ -34,12 +34,15 @@
 
 #include "mongo/util/net/ssl_options.h"
 
+#include <boost/range/size.hpp>
 #include <ostream>
 
 #include "mongo/base/global_initializer.h"
+#include "mongo/base/init.h"
 #include "mongo/base/initializer.h"
 #include "mongo/db/server_options_server_helpers.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/cmdline_utils/censor_cmdline_test.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/options_parser/environment.h"
 #include "mongo/util/options_parser/option_section.h"
@@ -50,6 +53,12 @@ namespace moe = mongo::optionenvironment;
 
 namespace mongo {
 namespace {
+
+MONGO_INITIALIZER(ServerLogRedirection)(InitializerContext*) {
+    // ssl_options_server.cpp has an initializer which depends on logging.
+    // We can stub that dependency out for unit testing purposes.
+    return Status::OK();
+}
 
 Status executeInitializer(const std::string& name) try {
     const auto* node =
@@ -203,7 +212,7 @@ TEST(SetupOptions, tlsModeRequired) {
     argv.push_back("binaryname");
     argv.push_back("--tlsMode");
     argv.push_back("requireTLS");
-    argv.push_back("--tlsPEMKeyFile");
+    argv.push_back("--tlsCertificateKeyFile");
     argv.push_back(sslPEMKeyFile);
     argv.push_back("--tlsCAFile");
     argv.push_back(sslCAFFile);
@@ -215,7 +224,7 @@ TEST(SetupOptions, tlsModeRequired) {
     argv.push_back("--tlsAllowInvalidCertificates");
     argv.push_back("--tlsWeakCertificateValidation");
     argv.push_back("--tlsFIPSMode");
-    argv.push_back("--tlsPEMKeyPassword");
+    argv.push_back("--tlsCertificateKeyFilePassword");
     argv.push_back("pw1");
     argv.push_back("--tlsClusterPassword");
     argv.push_back("pw2");
@@ -471,6 +480,62 @@ TEST(SetupOptions, disableNonTLSConnectionLoggingInvalid) {
 
     ASSERT_OK(parser.run(options, argv, env_map, &environment));
     ASSERT_NOT_OK(mongo::storeServerOptions(environment));
+}
+
+TEST(SetupOptions, RedactionSingleName) {
+    const std::vector<std::string> argv({"mongod",
+                                         "--tlsMode",
+                                         "requireTLS",
+                                         "--tlsCertificateKeyFilePassword=qwerty",
+                                         "--tlsClusterPassword",
+                                         "Lose Me.",
+                                         "--sslPEMKeyPassword=qwerty",
+                                         "--sslClusterPassword=qwerty"});
+
+    const std::vector<std::string> expected({"mongod",
+                                             "--tlsMode",
+                                             "requireTLS",
+                                             "--tlsCertificateKeyFilePassword=<password>",
+                                             "--tlsClusterPassword",
+                                             "<password>",
+                                             "--sslPEMKeyPassword=<password>",
+                                             "--sslClusterPassword=<password>"});
+
+    ASSERT_EQ(expected.size(), argv.size());
+    ::mongo::test::censoringVector(expected, argv);
+}
+
+TEST(SetupOptions, RedactionDottedName) {
+    auto obj = BSON("net" << BSON("tls" << BSON("mode"
+                                                << "requireTLS"
+                                                << "certificateKeyFilePassword"
+                                                << "qwerty"
+                                                << "ClusterPassword"
+                                                << "qwerty")
+                                        << "ssl"
+                                        << BSON("mode"
+                                                << "requireSSL"
+                                                << "PEMKeyPassword"
+                                                << "qwerty"
+                                                << "ClusterPassword"
+                                                << "qwerty")));
+
+    auto res = BSON("net" << BSON("tls" << BSON("mode"
+                                                << "requireTLS"
+                                                << "certificateKeyFilePassword"
+                                                << "<password>"
+                                                << "ClusterPassword"
+                                                << "<password>")
+                                        << "ssl"
+                                        << BSON("mode"
+                                                << "requireSSL"
+                                                << "PEMKeyPassword"
+                                                << "<password>"
+                                                << "ClusterPassword"
+                                                << "<password>")));
+
+    cmdline_utils::censorBSONObj(&obj);
+    ASSERT_BSONOBJ_EQ(res, obj);
 }
 
 }  // namespace

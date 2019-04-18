@@ -82,26 +82,7 @@ using std::vector;
 using executor::RemoteCommandRequest;
 using executor::RemoteCommandResponse;
 
-namespace {
-
-#ifdef MONGO_CONFIG_SSL
-static SimpleMutex s_mtx;
-static SSLManagerInterface* s_sslMgr(NULL);
-
-SSLManagerInterface* sslManager() {
-    stdx::lock_guard<SimpleMutex> lk(s_mtx);
-    if (s_sslMgr) {
-        return s_sslMgr;
-    }
-
-    s_sslMgr = getSSLManager();
-    return s_sslMgr;
-}
-#endif
-
-}  // namespace
-
-AtomicInt64 DBClientBase::ConnectionIdSequence;
+AtomicWord<long long> DBClientBase::ConnectionIdSequence;
 
 void (*DBClientBase::withConnection_do_not_use)(std::string host,
                                                 std::function<void(DBClientBase*)>) = nullptr;
@@ -418,14 +399,6 @@ string DBClientBase::getLastErrorString(const BSONObj& info) {
     }
 }
 
-const BSONObj getpreverrorcmdobj = fromjson("{getpreverror:1}");
-
-BSONObj DBClientBase::getPrevError() {
-    BSONObj info;
-    runCommand("admin", getpreverrorcmdobj, info);
-    return info;
-}
-
 string DBClientBase::createPasswordDigest(const string& username, const string& clearTextPassword) {
     return mongo::createPasswordDigest(username, clearTextPassword);
 }
@@ -470,8 +443,8 @@ void DBClientBase::_auth(const BSONObj& params) {
     // We will only have a client name if SSL is enabled
     std::string clientName = "";
 #ifdef MONGO_CONFIG_SSL
-    if (sslManager() != nullptr) {
-        clientName = sslManager()->getSSLConfiguration().clientSubjectName.toString();
+    if (getSSLManager() != nullptr) {
+        clientName = getSSLManager()->getSSLConfiguration().clientSubjectName.toString();
     }
 #endif
 
@@ -497,8 +470,8 @@ Status DBClientBase::authenticateInternalUser() {
     // We will only have a client name if SSL is enabled
     std::string clientName = "";
 #ifdef MONGO_CONFIG_SSL
-    if (sslManager() != nullptr) {
-        clientName = sslManager()->getSSLConfiguration().clientSubjectName.toString();
+    if (getSSLManager() != nullptr) {
+        clientName = getSSLManager()->getSSLConfiguration().clientSubjectName.toString();
     }
 #endif
 
@@ -857,7 +830,7 @@ void DBClientBase::dropIndex(const string& ns, BSONObj keys) {
 void DBClientBase::dropIndex(const string& ns, const string& indexName) {
     BSONObj info;
     if (!runCommand(nsToDatabase(ns),
-                    BSON("deleteIndexes" << nsToCollectionSubstring(ns) << "index" << indexName),
+                    BSON("dropIndexes" << nsToCollectionSubstring(ns) << "index" << indexName),
                     info)) {
         LOG(_logLevel) << "dropIndex failed: " << info << endl;
         uassert(10007, "dropIndex failed", 0);
@@ -869,8 +842,8 @@ void DBClientBase::dropIndexes(const string& ns) {
     uassert(10008,
             "dropIndexes failed",
             runCommand(nsToDatabase(ns),
-                       BSON("deleteIndexes" << nsToCollectionSubstring(ns) << "index"
-                                            << "*"),
+                       BSON("dropIndexes" << nsToCollectionSubstring(ns) << "index"
+                                          << "*"),
                        info));
 }
 

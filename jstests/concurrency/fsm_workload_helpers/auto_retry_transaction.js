@@ -19,6 +19,10 @@ var {withTxnAndAutoRetry} = (function() {
         }
     }
 
+    // Use a "signature" value that won't typically match a value assigned in normal use. This way
+    // the wtimeout set by this override is distinguishable in the server logs.
+    const kDefaultWtimeout = 5 * 60 * 1000 + 789;
+
     /**
      * Runs 'func' inside of a transaction started with 'txnOptions', and automatically retries
      * until it either succeeds or the server returns a non-TransientTransactionError error
@@ -31,7 +35,12 @@ var {withTxnAndAutoRetry} = (function() {
      * after the withTxnAndAutoRetry() function returns.
      */
     function withTxnAndAutoRetry(session, func, {
-        txnOptions: txnOptions = {readConcern: {level: 'snapshot'}},
+        txnOptions: txnOptions = {
+            readConcern: {level: TestData.defaultTransactionReadConcernLevel || 'snapshot'},
+            writeConcern: TestData.hasOwnProperty("defaultTransactionWriteConcernW")
+                ? {w: TestData.defaultTransactionWriteConcernW, wtimeout: kDefaultWtimeout}
+                : undefined
+        },
         retryOnKilledSession: retryOnKilledSession = false,
         prepareProbability: prepareProbability = 0.0
     } = {}) {

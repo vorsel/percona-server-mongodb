@@ -52,6 +52,7 @@
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/lock_state.h"
+#include "mongo/db/concurrency/replication_state_transition_lock_guard.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
@@ -68,13 +69,11 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/repl/replication_state_transition_lock_guard.h"
 #include "mongo/db/repl/session_update_tracker.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/session.h"
 #include "mongo/db/session_txn_record_gen.h"
 #include "mongo/db/stats/timer_stats.h"
-#include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/transaction_participant.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/exit.h"
@@ -94,6 +93,11 @@ MONGO_FAIL_POINT_DEFINE(hangAfterRecordingOpApplicationStartTime);
 // The oplog entries applied
 Counter64 opsAppliedStats;
 ServerStatusMetricField<Counter64> displayOpsApplied("repl.apply.ops", &opsAppliedStats);
+
+// Tracks the oplog application batch size.
+Counter64 oplogApplicationBatchSize;
+ServerStatusMetricField<Counter64> displayOplogApplicationBatchSize("repl.apply.batchSize",
+                                                                    &oplogApplicationBatchSize);
 
 // Number of times we tried to go live as a secondary.
 Counter64 attemptsToBecomeSecondary;
@@ -317,6 +321,7 @@ Status SyncTail::syncApply(OperationContext* opCtx,
 
     if (opType == OpTypeEnum::kNoop) {
         if (nss.db() == "") {
+            incrementOpsAppliedStats();
             return Status::OK();
         }
         Lock::DBLock dbLock(opCtx, nss.db(), MODE_X);
@@ -503,7 +508,7 @@ public:
     };
 
     CollectionProperties getCollectionProperties(OperationContext* opCtx,
-                                                 const StringMapTraits::HashedKey& ns) {
+                                                 const StringMapHashedKey& ns) {
         auto it = _cache.find(ns);
         if (it != _cache.end()) {
             return it->second;
@@ -519,7 +524,8 @@ private:
         CollectionProperties collProperties;
 
         Lock::DBLock dbLock(opCtx, nsToDatabaseSubstring(ns), MODE_IS);
-        auto db = DatabaseHolder::getDatabaseHolder().get(opCtx, ns);
+        auto databaseHolder = DatabaseHolder::get(opCtx);
+        auto db = databaseHolder->getDb(opCtx, ns);
         if (!db) {
             return collProperties;
         }
@@ -559,8 +565,11 @@ void fillWriterVectors(OperationContext* opCtx,
     CachedCollectionProperties collPropertiesCache;
 
     for (auto&& op : *ops) {
-        StringMapTraits::HashedKey hashedNs(op.getNss().ns());
-        uint32_t hash = hashedNs.hash();
+        auto hashedNs = StringMapHasher().hashed_key(op.getNss().ns());
+        // Reduce the hash from 64bit down to 32bit, just to allow combinations with murmur3 later
+        // on. Bit depth not important, we end up just doing integer modulo with this in the end.
+        // The hash function should provide entropy in the lower bits as it's used in hash tables.
+        uint32_t hash = static_cast<uint32_t>(hashedNs.hash());
 
         // We need to track all types of ops, including type 'n' (these are generated from chunk
         // migrations).
@@ -752,6 +761,15 @@ private:
             // tryPopAndWaitForMore adds to ops and returns true when we need to end a batch early.
             {
                 auto opCtx = cc().makeOperationContext();
+
+                // This use of UninterruptibleLockGuard is intentional. It is undesirable to use an
+                // UninterruptibleLockGuard in client operations because stepdown requires the
+                // ability to interrupt client operations. However, it is acceptable to use an
+                // UninterruptibleLockGuard in batch application because the only cause of
+                // interruption would be shutdown, and the ReplBatcher thread has its own shutdown
+                // handling.
+                UninterruptibleLockGuard noInterrupt(opCtx->lockState());
+
                 while (!_syncTail->tryPopAndWaitForMore(
                     opCtx.get(), _oplogBuffer, &ops, batchLimits)) {
                 }
@@ -1289,40 +1307,17 @@ StatusWith<OpTime> SyncTail::multiApply(OperationContext* opCtx, MultiApplier::O
                 "attempting to replicate ops while primary"};
     }
 
+    // Increment the batch size stat.
+    oplogApplicationBatchSize.increment(ops.size());
+
     std::vector<WorkerMultikeyPathInfo> multikeyVector(_writerPool->getStats().numThreads);
     {
         // Each node records cumulative batch application stats for itself using this timer.
         TimerHolder timer(&applyBatchStats);
 
-        const bool pinOldestTimestamp = !serverGlobalParams.enableMajorityReadConcern;
-        std::unique_ptr<RecoveryUnit> pinningTransaction;
-        if (pinOldestTimestamp) {
-            // If `enableMajorityReadConcern` is false, storage aggressively trims
-            // history. Documents may not be inserted before the cutoff point. This piece will pin
-            // the "oldest timestamp" until after the batch is fully applied.
-            //
-            // When `enableMajorityReadConcern` is false, storage sets the "oldest timestamp" to
-            // the "get all committed" timestamp. Opening a transaction and setting its timestamp
-            // to first oplog entry's timestamp will prevent the "get all committed" timestamp
-            // from advancing.
-            //
-            // This transaction will be aborted after all writes from the batch of operations are
-            // complete. Aborting the transaction allows the "get all committed" point to be
-            // move forward.
-            pinningTransaction = std::unique_ptr<RecoveryUnit>(
-                opCtx->getServiceContext()->getStorageEngine()->newRecoveryUnit());
-            pinningTransaction->beginUnitOfWork(opCtx);
-            fassert(40677, pinningTransaction->setTimestamp(ops.front().getTimestamp()));
-        }
-
         // We must wait for the all work we've dispatched to complete before leaving this block
         // because the spawned threads refer to objects on the stack
-        ON_BLOCK_EXIT([&] {
-            _writerPool->waitForIdle();
-            if (pinOldestTimestamp) {
-                pinningTransaction->abortUnitOfWork();
-            }
-        });
+        ON_BLOCK_EXIT([&] { _writerPool->waitForIdle(); });
 
         // Write batch of ops into oplog.
         if (!_options.skipWritesToOplog) {

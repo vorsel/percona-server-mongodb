@@ -36,6 +36,7 @@
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/cached_plan.h"
 #include "mongo/db/exec/queued_data_stage.h"
 #include "mongo/db/jsobj.h"
@@ -68,6 +69,8 @@ std::unique_ptr<CanonicalQuery> canonicalQueryFromFilterObj(OperationContext* op
 
 class QueryStageCachedPlan : public unittest::Test {
 public:
+    QueryStageCachedPlan() : _client(&_opCtx) {}
+
     void setUp() {
         // If collection exists already, we need to drop it.
         dropCollection();
@@ -90,9 +93,14 @@ public:
         ASSERT_OK(dbtests::createIndex(&_opCtx, nss.ns(), obj));
     }
 
+    void dropIndex(BSONObj keyPattern) {
+        _client.dropIndex(nss.ns(), std::move(keyPattern));
+    }
+
     void dropCollection() {
         Lock::DBLock dbLock(&_opCtx, nss.db(), MODE_X);
-        Database* database = DatabaseHolder::getDatabaseHolder().get(&_opCtx, nss.db());
+        auto databaseHolder = DatabaseHolder::get(&_opCtx);
+        auto database = databaseHolder->getDb(&_opCtx, nss.db());
         if (!database) {
             return;
         }
@@ -162,6 +170,7 @@ protected:
     const ServiceContext::UniqueOperationContext _opCtxPtr = cc().makeOperationContext();
     OperationContext& _opCtx = *_opCtxPtr;
     WorkingSet _ws;
+    DBDirectClient _client{&_opCtx};
 };
 
 /**
@@ -417,6 +426,94 @@ TEST_F(QueryStageCachedPlan, EntriesAreNotDeactivatedWhenInactiveEntriesDisabled
         canonicalQueryFromFilterObj(opCtx(), nss, fromjson("{a: {$gte: 0}, b: {$gte:0}}"));
     forceReplanning(collection, highWorksCq.get());
     ASSERT_EQ(cache->get(*shapeCq).state, PlanCache::CacheEntryState::kPresentActive);
+}
+
+TEST_F(QueryStageCachedPlan, ThrowsOnYieldRecoveryWhenIndexIsDroppedBeforePlanSelection) {
+    // Create an index which we will drop later on.
+    BSONObj keyPattern = BSON("c" << 1);
+    addIndex(keyPattern);
+
+    boost::optional<AutoGetCollectionForReadCommand> readLock;
+    readLock.emplace(&_opCtx, nss);
+    Collection* collection = readLock->getCollection();
+    ASSERT(collection);
+
+    // Query can be answered by either index on "a" or index on "b".
+    auto qr = stdx::make_unique<QueryRequest>(nss);
+    auto statusWithCQ = CanonicalQuery::canonicalize(opCtx(), std::move(qr));
+    ASSERT_OK(statusWithCQ.getStatus());
+    const std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
+
+    // We shouldn't have anything in the plan cache for this shape yet.
+    PlanCache* cache = collection->infoCache()->getPlanCache();
+    ASSERT(cache);
+
+    // Get planner params.
+    QueryPlannerParams plannerParams;
+    fillOutPlannerParams(&_opCtx, collection, cq.get(), &plannerParams);
+
+    const size_t decisionWorks = 10;
+    CachedPlanStage cachedPlanStage(&_opCtx,
+                                    collection,
+                                    &_ws,
+                                    cq.get(),
+                                    plannerParams,
+                                    decisionWorks,
+                                    new QueuedDataStage(&_opCtx, &_ws));
+
+    // Drop an index while the CachedPlanStage is in a saved state. Restoring should fail, since we
+    // may still need the dropped index for plan selection.
+    cachedPlanStage.saveState();
+    readLock.reset();
+    dropIndex(keyPattern);
+    readLock.emplace(&_opCtx, nss);
+    ASSERT_THROWS_CODE(cachedPlanStage.restoreState(), DBException, ErrorCodes::QueryPlanKilled);
+}
+
+TEST_F(QueryStageCachedPlan, DoesNotThrowOnYieldRecoveryWhenIndexIsDroppedAferPlanSelection) {
+    // Create an index which we will drop later on.
+    BSONObj keyPattern = BSON("c" << 1);
+    addIndex(keyPattern);
+
+    boost::optional<AutoGetCollectionForReadCommand> readLock;
+    readLock.emplace(&_opCtx, nss);
+    Collection* collection = readLock->getCollection();
+    ASSERT(collection);
+
+    // Query can be answered by either index on "a" or index on "b".
+    auto qr = stdx::make_unique<QueryRequest>(nss);
+    auto statusWithCQ = CanonicalQuery::canonicalize(opCtx(), std::move(qr));
+    ASSERT_OK(statusWithCQ.getStatus());
+    const std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
+
+    // We shouldn't have anything in the plan cache for this shape yet.
+    PlanCache* cache = collection->infoCache()->getPlanCache();
+    ASSERT(cache);
+
+    // Get planner params.
+    QueryPlannerParams plannerParams;
+    fillOutPlannerParams(&_opCtx, collection, cq.get(), &plannerParams);
+
+    const size_t decisionWorks = 10;
+    CachedPlanStage cachedPlanStage(&_opCtx,
+                                    collection,
+                                    &_ws,
+                                    cq.get(),
+                                    plannerParams,
+                                    decisionWorks,
+                                    new QueuedDataStage(&_opCtx, &_ws));
+
+    PlanYieldPolicy yieldPolicy(PlanExecutor::YIELD_MANUAL,
+                                _opCtx.getServiceContext()->getFastClockSource());
+    ASSERT_OK(cachedPlanStage.pickBestPlan(&yieldPolicy));
+
+    // Drop an index while the CachedPlanStage is in a saved state. We should be able to restore
+    // successfully.
+    cachedPlanStage.saveState();
+    readLock.reset();
+    dropIndex(keyPattern);
+    readLock.emplace(&_opCtx, nss);
+    cachedPlanStage.restoreState();
 }
 
 }  // namespace QueryStageCachedPlan

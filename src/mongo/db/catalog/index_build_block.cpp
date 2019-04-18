@@ -39,6 +39,7 @@
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/util/assert_util.h"
@@ -90,11 +91,16 @@ Status IndexCatalogImpl::IndexBuildBlock::init() {
     _entry = _catalog->_setupInMemoryStructures(
         _opCtx, std::move(descriptor), initFromDisk, isReadyIndex);
 
-    // Hybrid indexes are only enabled for background, non-unique indexes.
-    // TODO: Remove when SERVER-38036 and SERVER-37270 are complete.
-    const bool useHybrid = isBackgroundIndex && !descriptorPtr->unique();
+    // Hybrid indexes are only enabled for background indexes.
+    bool useHybrid = true;
+    // TODO: Remove when SERVER-37270 is complete.
+    useHybrid = useHybrid && isBackgroundIndex;
+    // TODO: Remove when SERVER-38550 is complete. The mobile storage engine does not suport
+    // dupsAllowed mode on bulk builders.
+    useHybrid = useHybrid && storageGlobalParams.engine != "mobile";
+
     if (useHybrid) {
-        _indexBuildInterceptor = stdx::make_unique<IndexBuildInterceptor>(_opCtx);
+        _indexBuildInterceptor = stdx::make_unique<IndexBuildInterceptor>(_opCtx, _entry);
         _entry->setIndexBuildInterceptor(_indexBuildInterceptor.get());
 
         _opCtx->recoveryUnit()->onCommit(
@@ -146,11 +152,17 @@ void IndexCatalogImpl::IndexBuildBlock::success() {
     NamespaceString ns(_indexNamespace);
     invariant(_opCtx->lockState()->isDbLockedForMode(ns.db(), MODE_X));
 
-    // An index build should never be completed with writes remaining in the interceptor.
-    invariant(!_indexBuildInterceptor || _indexBuildInterceptor->areAllWritesApplied(_opCtx));
+    if (_indexBuildInterceptor) {
+        // An index build should never be completed with writes remaining in the interceptor.
+        invariant(_indexBuildInterceptor->areAllWritesApplied(_opCtx));
 
-    LOG(2) << "marking index " << _indexName << " as ready in snapshot id "
-           << _opCtx->recoveryUnit()->getSnapshotId();
+        // An index build should never be completed without resolving all key constraints.
+        invariant(_indexBuildInterceptor->areAllConstraintsChecked(_opCtx));
+    }
+
+    log() << "index build: done building index " << _indexName << " on ns "
+          << _collection->ns().ns();
+
     _collection->indexBuildSuccess(_opCtx, _entry);
 
     OperationContext* opCtx = _opCtx;

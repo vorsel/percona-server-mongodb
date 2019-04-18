@@ -34,10 +34,12 @@
 #include "mongo/base/status.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/repl/speculative_majority_read_info.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
@@ -49,6 +51,8 @@
 namespace mongo {
 
 namespace {
+
+MONGO_FAIL_POINT_DEFINE(hangBeforeLinearizableReadConcern);
 
 /**
 *  Synchronize writeRequests
@@ -212,15 +216,6 @@ MONGO_REGISTER_SHIM(waitForReadConcern)
     repl::ReplicationCoordinator* const replCoord = repl::ReplicationCoordinator::get(opCtx);
     invariant(replCoord);
 
-    // Currently speculative read concern is used only for transactions (equivalently, when the read
-    // concern level is 'snapshot'). However, speculative read concern is not yet supported with
-    // atClusterTime.
-    //
-    // TODO SERVER-34620: Re-enable speculative behavior when "atClusterTime" is specified.
-    const bool speculative =
-        readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern &&
-        !readConcernArgs.getArgsAtClusterTime();
-
     if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kLinearizableReadConcern) {
         if (replCoord->getReplicationMode() != repl::ReplicationCoordinator::modeReplSet) {
             // For standalone nodes, Linearizable Read is not supported.
@@ -295,19 +290,25 @@ MONGO_REGISTER_SHIM(waitForReadConcern)
     }
 
     if (atClusterTime) {
-        opCtx->recoveryUnit()->setIgnorePrepared(false);
-
-        // TODO(SERVER-34620): We should be using Session::setSpeculativeTransactionReadOpTime when
-        // doing speculative execution with atClusterTime.
         opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kProvided,
                                                       atClusterTime->asTimestamp());
-        return Status::OK();
-    }
+    } else if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kMajorityReadConcern &&
+               replCoord->getReplicationMode() == repl::ReplicationCoordinator::Mode::modeReplSet) {
+        // This block is not used for kSnapshotReadConcern because snapshots are always speculative;
+        // we wait for majority when the transaction commits.
+        // It is not used for atClusterTime because waitUntilOpTimeForRead handles waiting for
+        // the majority snapshot in that case.
 
-    if ((readConcernArgs.getLevel() == repl::ReadConcernLevel::kMajorityReadConcern ||
-         readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern) &&
-        !speculative &&
-        replCoord->getReplicationMode() == repl::ReplicationCoordinator::Mode::modeReplSet) {
+        // Handle speculative majority reads.
+        if (readConcernArgs.getMajorityReadMechanism() ==
+            repl::ReadConcernArgs::MajorityReadMechanism::kSpeculative) {
+            // We read from a local snapshot, so there is no need to set an explicit read source.
+            // Mark down that we need to block after the command is done to satisfy majority read
+            // concern, though.
+            auto& speculativeReadInfo = repl::SpeculativeMajorityReadInfo::get(opCtx);
+            speculativeReadInfo.setIsSpeculativeRead();
+            return Status::OK();
+        }
 
         const int debugLevel = serverGlobalParams.clusterRole == ClusterRole::ConfigServer ? 1 : 2;
 
@@ -346,6 +347,12 @@ MONGO_REGISTER_SHIM(waitForReadConcern)
 
 MONGO_REGISTER_SHIM(waitForLinearizableReadConcern)(OperationContext* opCtx)->Status {
 
+    CurOpFailpointHelpers::waitWhileFailPointEnabled(
+        &hangBeforeLinearizableReadConcern, opCtx, "hangBeforeLinearizableReadConcern", [opCtx]() {
+            log() << "batch update - hangBeforeLinearizableReadConcern fail point enabled. "
+                     "Blocking until fail point is disabled.";
+        });
+
     repl::ReplicationCoordinator* replCoord =
         repl::ReplicationCoordinator::get(opCtx->getClient()->getServiceContext());
 
@@ -372,11 +379,52 @@ MONGO_REGISTER_SHIM(waitForLinearizableReadConcern)(OperationContext* opCtx)->St
 
     repl::OpTime lastOpApplied = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
     auto awaitReplResult = replCoord->awaitReplication(opCtx, lastOpApplied, wc);
+
     if (awaitReplResult.status == ErrorCodes::WriteConcernFailed) {
         return Status(ErrorCodes::LinearizableReadConcernError,
                       "Failed to confirm that read was linearizable.");
     }
     return awaitReplResult.status;
 }
+
+MONGO_REGISTER_SHIM(waitForSpeculativeMajorityReadConcern)
+(OperationContext* opCtx, repl::SpeculativeMajorityReadInfo speculativeReadInfo)->Status {
+    invariant(speculativeReadInfo.isSpeculativeRead());
+
+    // Select the optime to wait on. A command may have selected a specific optime to wait on. If
+    // not, then we just wait on the most recent optime written on this node i.e. lastApplied.
+    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    repl::OpTime waitOpTime;
+    auto lastApplied = replCoord->getMyLastAppliedOpTime();
+    auto speculativeReadOpTime = speculativeReadInfo.getSpeculativeReadOpTime();
+    if (speculativeReadOpTime) {
+        // The optime provided must not be greater than the current lastApplied.
+        invariant(*speculativeReadOpTime <= lastApplied);
+        waitOpTime = *speculativeReadOpTime;
+    } else {
+        waitOpTime = lastApplied;
+    }
+
+    // Block to make sure returned data is majority committed.
+    LOG(1) << "Servicing speculative majority read, waiting for optime " << waitOpTime
+           << " to become committed, current commit point: " << replCoord->getLastCommittedOpTime();
+
+    if (!opCtx->hasDeadline()) {
+        // TODO (SERVER-38727): Replace this with a user specified timeout value, to address the
+        // fact that getMore commands do not respect maxTimeMS properly. Currently, this hard-coded
+        // value represents the maximum time we are ever willing to wait for an optime to majority
+        // commit when doing a speculative majority read. We make this value rather conservative.
+        auto timeout = Seconds(15);
+        opCtx->setDeadlineAfterNowBy(timeout, ErrorCodes::MaxTimeMSExpired);
+    }
+    Timer t;
+    auto waitStatus = replCoord->awaitOpTimeCommitted(opCtx, waitOpTime);
+    if (waitStatus.isOK()) {
+        LOG(1) << "Optime " << waitOpTime << " became majority committed, waited " << t.millis()
+               << "ms for speculative majority read to be satisfied.";
+    }
+    return waitStatus;
+}
+
 
 }  // namespace mongo

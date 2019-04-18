@@ -46,6 +46,7 @@
 #include "mongo/crypto/mechanism_scram.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/address_restriction.h"
+#include "mongo/db/auth/authorization_manager_impl_parameters_gen.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/authorization_session_impl.h"
 #include "mongo/db/auth/authz_manager_external_state.h"
@@ -57,7 +58,7 @@
 #include "mongo/db/auth/user_document_parser.h"
 #include "mongo/db/auth/user_management_commands_parser.h"
 #include "mongo/db/auth/user_name.h"
-#include "mongo/db/auth/user_name_hash.h"
+
 #include "mongo/db/global_settings.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/mongod_options.h"
@@ -113,15 +114,9 @@ MONGO_INITIALIZER_GENERAL(SetupInternalSecurityUser,
     return exceptionToStatus();
 }
 
-MONGO_EXPORT_STARTUP_SERVER_PARAMETER(authorizationManagerCacheSize, int, 100);
-
-class PinnedUserSetParameter final : public ServerParameter {
+class PinnedUserSetParameter {
 public:
-    PinnedUserSetParameter()
-        : ServerParameter(
-              ServerParameterSet::getGlobal(), "authorizationManagerPinnedUsers", true, true) {}
-
-    void append(OperationContext* opCtx, BSONObjBuilder& b, const std::string& name) override {
+    void append(OperationContext* opCtx, BSONObjBuilder& b, const std::string& name) const {
         BSONArrayBuilder sub(b.subarrayStart(name));
         for (const auto& username : _userNames) {
             BSONObjBuilder nameObj(sub.subobjStart());
@@ -130,7 +125,7 @@ public:
         }
     }
 
-    Status set(const BSONElement& newValueElement) override {
+    Status set(const BSONElement& newValueElement) {
         if (newValueElement.type() == String) {
             return setFromString(newValueElement.valuestrsafe());
         } else if (newValueElement.type() == Array) {
@@ -146,7 +141,7 @@ public:
             }
 
             stdx::unique_lock<stdx::mutex> lk(_mutex);
-            std::swap(_userNames, out);
+            _userNames = std::move(out);
             auto authzManager = _authzManager;
             if (!authzManager) {
                 return Status::OK();
@@ -162,7 +157,7 @@ public:
         }
     }
 
-    Status setFromString(const std::string& str) override {
+    Status setFromString(const std::string& str) {
         std::vector<std::string> strList;
         splitStringDelim(str, &strList, ',');
 
@@ -185,9 +180,10 @@ public:
             return Status::OK();
         }
 
-        stdx::unique_lock<stdx::mutex> lk(_mutex);
-        std::swap(out, _userNames);
-        lk.unlock();
+        {
+            stdx::lock_guard<stdx::mutex> lk(_mutex);
+            _userNames = std::move(out);
+        }
 
         authzManager->invalidateUserCache(Client::getCurrent()->getOperationContext());
         return Status::OK();
@@ -222,6 +218,21 @@ const auto inUserManagementCommandsFlag = OperationContext::declareDecoration<bo
 
 }  // namespace
 
+int authorizationManagerCacheSize;
+
+void AuthorizationManagerPinnedUsersServerParameter::append(OperationContext* opCtx,
+                                                            BSONObjBuilder& out,
+                                                            const std::string& name) {
+    return authorizationManagerPinnedUsers.append(opCtx, out, name);
+}
+
+Status AuthorizationManagerPinnedUsersServerParameter::set(const BSONElement& newValue) {
+    return authorizationManagerPinnedUsers.set(newValue);
+}
+
+Status AuthorizationManagerPinnedUsersServerParameter::setFromString(const std::string& str) {
+    return authorizationManagerPinnedUsers.setFromString(str);
+}
 
 MONGO_REGISTER_SHIM(AuthorizationManager::create)()->std::unique_ptr<AuthorizationManager> {
     return std::make_unique<AuthorizationManagerImpl>();

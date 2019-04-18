@@ -509,7 +509,10 @@ void InMatchExpression::_doSetCollator(const CollatorInterface* collator) {
     }
 
     // We need to re-compute '_equalitySet', since our set comparator has changed.
-    _equalitySet = _eltCmp.makeBSONEltFlatSet(_originalEqualityVector);
+    _equalitySet = _eltCmp.makeBSONEltFlatSetFromSortedUniqueRange(
+        _originalEqualityVector.begin(),
+        std::unique(
+            _originalEqualityVector.begin(), _originalEqualityVector.end(), _eltCmp.makeEqualTo()));
 }
 
 Status InMatchExpression::setEqualities(std::vector<BSONElement> equalities) {
@@ -538,7 +541,10 @@ Status InMatchExpression::setEqualities(std::vector<BSONElement> equalities) {
             _originalEqualityVector.begin(), _originalEqualityVector.end(), _eltCmp.makeLessThan());
     }
 
-    _equalitySet = _eltCmp.makeBSONEltFlatSet(_originalEqualityVector);
+    _equalitySet = _eltCmp.makeBSONEltFlatSetFromSortedUniqueRange(
+        _originalEqualityVector.begin(),
+        std::unique(
+            _originalEqualityVector.begin(), _originalEqualityVector.end(), _eltCmp.makeEqualTo()));
 
     return Status::OK();
 }
@@ -720,7 +726,7 @@ bool BitTestMatchExpression::matchesSingleElement(const BSONElement& e,
         // integer are treated as 0. We use 'kLongLongMaxAsDouble' because if we just did
         // eDouble > 2^63-1, it would be compared against 2^63. eDouble=2^63 would not get caught
         // that way.
-        if (eDouble >= MatchExpressionParser::kLongLongMaxPlusOneAsDouble ||
+        if (eDouble >= BSONElement::kLongLongMaxPlusOneAsDouble ||
             eDouble < std::numeric_limits<long long>::min()) {
             return false;
         }

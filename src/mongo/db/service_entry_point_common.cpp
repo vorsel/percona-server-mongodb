@@ -65,6 +65,7 @@
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/speculative_majority_read_info.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/s/sharding_state.h"
@@ -370,11 +371,17 @@ void invokeWithSessionCheckedOut(OperationContext* opCtx,
             if (sessionOptions.getCoordinator() == boost::optional<bool>(true)) {
                 createTransactionCoordinator(opCtx, *sessionOptions.getTxnNumber());
             }
+        } else if (txnParticipant->inMultiDocumentTransaction()) {
+            const auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
+            uassert(ErrorCodes::InvalidOptions,
+                    "Only the first command in a transaction may specify a readConcern",
+                    readConcernArgs.isEmpty());
         }
+
+        txnParticipant->unstashTransactionResources(opCtx, invocation->definition()->getName());
     }
 
-    txnParticipant->unstashTransactionResources(opCtx, invocation->definition()->getName());
-    ScopeGuard guard = MakeGuard([&txnParticipant, opCtx]() {
+    auto guard = makeGuard([&txnParticipant, opCtx] {
         txnParticipant->abortActiveUnpreparedOrStashPreparedTransaction(opCtx);
     });
 
@@ -399,7 +406,7 @@ void invokeWithSessionCheckedOut(OperationContext* opCtx,
         // If this shard has completed an earlier statement for this transaction, it must already be
         // in the transaction's participant list, so it is guaranteed to learn its outcome.
         txnParticipant->stashTransactionResources(opCtx);
-        guard.Dismiss();
+        guard.dismiss();
         throw;
     }
 
@@ -412,7 +419,7 @@ void invokeWithSessionCheckedOut(OperationContext* opCtx,
 
     // Stash or commit the transaction when the command succeeds.
     txnParticipant->stashTransactionResources(opCtx);
-    guard.Dismiss();
+    guard.dismiss();
 } catch (const ExceptionFor<ErrorCodes::NoSuchTransaction>&) {
     // We make our decision about the transaction state based on the oplog we have, so
     // we set the client last op to the last optime observed by the system to ensure that
@@ -498,6 +505,9 @@ bool runCommandImpl(OperationContext* opCtx,
     }
 
     behaviors.waitForLinearizableReadConcern(opCtx);
+
+    // Wait for data to satisfy the read concern level, if necessary.
+    behaviors.waitForSpeculativeMajorityReadConcern(opCtx);
 
     const bool ok = [&] {
         auto body = replyBuilder->getBodyBuilder();
@@ -1235,6 +1245,12 @@ DbResponse ServiceEntryPointCommon::handleRequest(OperationContext* opCtx,
                    << redact(ue);
             debug.errInfo = ue.toStatus();
         }
+        // A NotMaster error can be set either within receivedInsert/receivedUpdate/receivedDelete
+        // or within the AssertionException handler above.  Either way, we want to throw an
+        // exception here, which will cause the client to be disconnected.
+        uassert(ErrorCodes::NotMaster,
+                "Not-master error during legacy fire-and-forget command processing",
+                !LastError::get(opCtx->getClient()).hadNotMasterError());
     }
 
     // Mark the op as complete, and log it if appropriate. Returns a boolean indicating whether

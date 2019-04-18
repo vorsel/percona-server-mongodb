@@ -60,6 +60,7 @@
 #include "mongo/db/repl/sync_source_selector.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/executor/thread_pool_task_executor.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
@@ -174,7 +175,7 @@ StatusWith<OpTimeWithHash> parseOpTimeWithHash(const QueryResponseStatus& fetchR
  */
 class InitialSyncApplyObserver : public OplogApplier::Observer {
 public:
-    explicit InitialSyncApplyObserver(AtomicUInt32* fetchCount) : _fetchCount(fetchCount) {}
+    explicit InitialSyncApplyObserver(AtomicWord<unsigned>* fetchCount) : _fetchCount(fetchCount) {}
 
     // OplogApplier::Observer functions
     void onBatchBegin(const OplogApplier::Operations&) final {}
@@ -184,7 +185,7 @@ public:
     }
 
 private:
-    AtomicUInt32* const _fetchCount;
+    AtomicWord<unsigned>* const _fetchCount;
 };
 
 }  // namespace
@@ -1010,6 +1011,20 @@ void InitialSyncer::_getNextApplierBatchCallback(
         return;
     }
 
+    // Set and unset by the InitialSyncTest fixture to cause initial sync to pause so that the
+    // Initial Sync Fuzzer can run commands on the sync source.
+    if (MONGO_FAIL_POINT(initialSyncFuzzerSynchronizationPoint1)) {
+        log() << "Initial Syncer is about to apply the next oplog batch of size: "
+              << batchResult.getValue().size();
+        log() << "initialSyncFuzzerSynchronizationPoint1 fail point enabled.";
+        MONGO_FAIL_POINT_PAUSE_WHILE_SET(initialSyncFuzzerSynchronizationPoint1);
+    }
+
+    if (MONGO_FAIL_POINT(initialSyncFuzzerSynchronizationPoint2)) {
+        log() << "initialSyncFuzzerSynchronizationPoint2 fail point enabled.";
+        MONGO_FAIL_POINT_PAUSE_WHILE_SET(initialSyncFuzzerSynchronizationPoint2);
+    }
+
     // Schedule MultiApplier if we have operations to apply.
     const auto& ops = batchResult.getValue();
     if (!ops.empty()) {
@@ -1190,7 +1205,7 @@ void InitialSyncer::_finishInitialSyncAttempt(const StatusWith<OpTimeWithHash>& 
     // if the task scheduling fails and we have to invoke _finishCallback() synchronously), we
     // declare the scope guard before the lock guard.
     auto result = lastApplied;
-    auto finishCallbackGuard = MakeGuard([this, &result] {
+    auto finishCallbackGuard = makeGuard([this, &result] {
         auto scheduleResult = _exec->scheduleWork(
             [=](const mongo::executor::TaskExecutor::CallbackArgs&) { _finishCallback(result); });
         if (!scheduleResult.isOK()) {
@@ -1258,7 +1273,7 @@ void InitialSyncer::_finishInitialSyncAttempt(const StatusWith<OpTimeWithHash>& 
 
     // Next initial sync attempt scheduled successfully and we do not need to call _finishCallback()
     // until the next initial sync attempt finishes.
-    finishCallbackGuard.Dismiss();
+    finishCallbackGuard.dismiss();
 }
 
 void InitialSyncer::_finishCallback(StatusWith<OpTimeWithHash> lastApplied) {

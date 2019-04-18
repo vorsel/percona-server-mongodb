@@ -65,14 +65,24 @@ env.Library(
 )
 
 env.Library(
-    target='index_build_entry_idl',
+    target='commit_quorum_idl',
     source=[
-        env.Idlc('index_build_entry.idl')[0],
+        env.Idlc('commit_quorum.idl')[0],
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/write_concern_options',
         '$BUILD_DIR/mongo/idl/idl_parser',
+    ],
+)
+
+env.Library(
+    target='index_build_entry_idl',
+    source=[
+        env.Idlc('index_build_entry.idl')[0],
+    ],
+    LIBDEPS=[
+        'commit_quorum_idl',
         '$BUILD_DIR/mongo/util/net/network',
     ],
 )
@@ -186,23 +196,12 @@ env.Library(
     ],
 )
 
-env.Library(
-    target='database',
-    source=[
-        "database.cpp",
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-    ],
-)
-
 env.CppUnitTest(
     target='database_test',
     source=[
         'database_test.cpp',
     ],
     LIBDEPS=[
-        'database',
         'multi_index_block',
         '$BUILD_DIR/mongo/db/auth/authmocks',
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
@@ -223,14 +222,17 @@ env.Library(
         'database_holder.cpp',
     ],
     LIBDEPS=[
+        'collection',
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/service_context',
     ],
 )
 
 env.Library(
     target='multi_index_block',
     source=[
-        'multi_index_block_impl.cpp',
+        'multi_index_block.cpp',
+        env.Idlc('multi_index_block.idl')[0],
     ],
     LIBDEPS=[
         'collection',
@@ -240,7 +242,6 @@ env.Library(
         '$BUILD_DIR/mongo/db/concurrency/write_conflict_exception',
         '$BUILD_DIR/mongo/db/curop',
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
-        '$BUILD_DIR/mongo/db/server_parameters',
         '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/db/storage/write_unit_of_work',
         '$BUILD_DIR/mongo/util/fail_point',
@@ -248,6 +249,7 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/index/index_build_interceptor',
+        '$BUILD_DIR/mongo/idl/server_parameter',
     ]
 )
 
@@ -269,17 +271,19 @@ env.Library(
     target='uuid_catalog',
     source=[
         'namespace_uuid_cache.cpp',
+        env.Idlc('namespace_uuid_cache.idl')[0],
         'uuid_catalog.cpp',
     ],
     LIBDEPS=[
         'collection',
-        'database',
         'database_holder',
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/namespace_string',
         '$BUILD_DIR/mongo/db/service_context',
-        '$BUILD_DIR/mongo/db/storage/storage_options',
     ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/idl/server_parameter',
+    ]
 )
 
 env.CppUnitTest(
@@ -305,20 +309,33 @@ env.CppUnitTest(
 )
 
 env.Library(
-    target='database_holder_mock',
+    target='catalog_control',
     source=[
-        'database_holder_mock.cpp',
+        "catalog_control.cpp",
+    ],
+    LIBDEPS_PRIVATE=[
+        'collection',
+        'uuid_catalog',
+        '$BUILD_DIR/mongo/db/repair_database',
+        '$BUILD_DIR/mongo/db/service_context',
+    ],
+)
+
+env.CppUnitTest(
+    target='catalog_control_test',
+    source=[
+        'catalog_control_test.cpp'
     ],
     LIBDEPS=[
+        'catalog_control',
         'database_holder',
-        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/service_context',
     ],
 )
 
 env.Library(
     target='catalog_impl',
     source=[
-        "catalog_control.cpp",
         "collection_impl.cpp",
         "collection_info_cache_impl.cpp",
         "database_holder_impl.cpp",
@@ -332,7 +349,6 @@ env.Library(
     LIBDEPS=[
         'collection',
         'collection_options',
-        'database',
         'database_holder',
         'health_log',
         'index_catalog',
@@ -348,7 +364,6 @@ env.Library(
         '$BUILD_DIR/mongo/db/index_d',
         '$BUILD_DIR/mongo/db/op_observer',
         '$BUILD_DIR/mongo/db/query_exec',
-        '$BUILD_DIR/mongo/db/repair_database',
         '$BUILD_DIR/mongo/db/repl/drop_pending_collection_reaper',
         '$BUILD_DIR/mongo/db/repl/oplog',
         '$BUILD_DIR/mongo/db/server_options_core',
@@ -389,7 +404,6 @@ env.Library(
         '$BUILD_DIR/mongo/db/write_ops',
         'collection_options',
         'collection',
-        'database',
         'index_catalog',
         'index_key_validate',
         'multi_index_block',
@@ -438,7 +452,6 @@ env.CppUnitTest(
     ],
     LIBDEPS=[
         'catalog_helpers',
-        'multi_index_block',
         '$BUILD_DIR/mongo/db/auth/authmocks',
         '$BUILD_DIR/mongo/db/db_raii',
         '$BUILD_DIR/mongo/db/namespace_string',

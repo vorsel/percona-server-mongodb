@@ -124,8 +124,10 @@ public:
         }
 
         bool allowsSpeculativeMajorityReads() const override {
-            // TODO (SERVER-37560): Support this for change stream update lookup queries.
-            return false;
+            // Find queries are only allowed to use speculative behavior if the 'allowsSpeculative'
+            // flag is passed. The find command will check for this flag internally and fail if
+            // necessary.
+            return true;
         }
 
         NamespaceString ns() const override {
@@ -150,11 +152,11 @@ public:
         void explain(OperationContext* opCtx,
                      ExplainOptions::Verbosity verbosity,
                      rpc::ReplyBuilderInterface* result) override {
-            // Acquire locks and resolve possible UUID. The RAII object is optional, because in the
-            // case of a view, the locks need to be released.
+            // Acquire locks. The RAII object is optional, because in the case of a view, the locks
+            // need to be released.
             boost::optional<AutoGetCollectionForReadCommand> ctx;
             ctx.emplace(opCtx,
-                        CommandHelpers::parseNsOrUUID(_dbName, _request.body),
+                        CommandHelpers::parseNsCollectionRequired(_dbName, _request.body),
                         AutoGetCollection::ViewMode::kViewsPermitted);
             const auto nss = ctx->getNss();
 
@@ -233,6 +235,12 @@ public:
                 NamespaceString(CommandHelpers::parseNsFromCommand(_dbName, _request.body)),
                 _request.body,
                 isExplain));
+
+            // Only allow speculative majority for internal commands that specify the correct flag.
+            uassert(ErrorCodes::ReadConcernMajorityNotEnabled,
+                    "Majority read concern is not enabled.",
+                    !(repl::ReadConcernArgs::get(opCtx).isSpeculativeMajority() &&
+                      !qr->allowSpeculativeMajorityRead()));
 
             auto replCoord = repl::ReplicationCoordinator::get(opCtx);
             const auto txnParticipant = TransactionParticipant::get(opCtx);
@@ -362,9 +370,9 @@ public:
             // Throw an assertion if query execution fails for any reason.
             if (PlanExecutor::FAILURE == state || PlanExecutor::DEAD == state) {
                 firstBatch.abandon();
-                error() << "Plan executor error during find command: "
-                        << PlanExecutor::statestr(state)
-                        << ", stats: " << redact(Explain::getWinningPlanStats(exec.get()));
+                LOG(1) << "Plan executor error during find command: "
+                       << PlanExecutor::statestr(state)
+                       << ", stats: " << redact(Explain::getWinningPlanStats(exec.get()));
 
                 uassertStatusOK(WorkingSetCommon::getMemberObjectStatus(obj).withContext(
                     "Executor error during find command"));
@@ -380,13 +388,15 @@ public:
             if (shouldSaveCursor(opCtx, collection, state, exec.get())) {
                 // Create a ClientCursor containing this plan executor and register it with the
                 // cursor manager.
-                ClientCursorPin pinnedCursor = collection->getCursorManager()->registerCursor(
-                    opCtx,
-                    {std::move(exec),
-                     nss,
-                     AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
-                     repl::ReadConcernArgs::get(opCtx),
-                     _request.body});
+                ClientCursorPin pinnedCursor =
+                    CursorManager::getGlobalCursorManager()->registerCursor(
+                        opCtx,
+                        {std::move(exec),
+                         nss,
+                         AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
+                         repl::ReadConcernArgs::get(opCtx),
+                         _request.body,
+                         ClientCursorParams::LockPolicy::kLockExternally});
                 cursorId = pinnedCursor.getCursor()->cursorid();
 
                 invariant(!exec);

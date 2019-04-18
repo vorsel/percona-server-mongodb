@@ -38,13 +38,15 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
-#include "mongo/db/catalog/multi_index_block_impl.h"
+#include "mongo/db/catalog/multi_index_block.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/logical_clock.h"
+#include "mongo/db/op_observer.h"
 #include "mongo/db/repl/timestamp_block.h"
+#include "mongo/db/server_options.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
@@ -53,7 +55,7 @@ namespace mongo {
 
 using std::endl;
 
-AtomicUInt32 IndexBuilder::_indexBuildCount;
+AtomicWord<unsigned> IndexBuilder::_indexBuildCount;
 
 namespace {
 
@@ -92,6 +94,13 @@ bool requiresGhostCommitTimestamp(OperationContext* opCtx, NamespaceString nss) 
         return false;
     }
 
+    // When in rollback via refetch, it's valid for all writes to be untimestamped. Additionally,
+    // it's illegal to timestamp a write later than the timestamp associated with the node exiting
+    // the rollback state. This condition opts for being conservative.
+    if (!serverGlobalParams.enableMajorityReadConcern && memberState.rollback()) {
+        return false;
+    }
+
     return true;
 }
 
@@ -110,12 +119,16 @@ void _setBgIndexStarting() {
 }
 }  // namespace
 
-IndexBuilder::IndexBuilder(const BSONObj& index, bool relaxConstraints, Timestamp initIndexTs)
+IndexBuilder::IndexBuilder(const BSONObj& index,
+                           IndexConstraints indexConstraints,
+                           ReplicatedWrites replicatedWrites,
+                           Timestamp initIndexTs)
     : BackgroundJob(true /* self-delete */),
       _index(index.getOwned()),
-      _relaxConstraints(relaxConstraints),
+      _indexConstraints(indexConstraints),
+      _replicatedWrites(replicatedWrites),
       _initIndexTs(initIndexTs),
-      _name(str::stream() << "repl index builder " << _indexBuildCount.addAndFetch(1)) {}
+      _name(str::stream() << "repl-index-builder-" << _indexBuildCount.addAndFetch(1)) {}
 
 IndexBuilder::~IndexBuilder() {}
 
@@ -130,6 +143,12 @@ void IndexBuilder::run() {
     auto opCtx = cc().makeOperationContext();
     ShouldNotConflictWithSecondaryBatchApplicationBlock shouldNotConflictBlock(opCtx->lockState());
 
+    // If the calling thread is not replicating writes, neither should this thread.
+    boost::optional<repl::UnreplicatedWritesBlock> unreplicatedWrites;
+    if (_replicatedWrites == ReplicatedWrites::kUnreplicated) {
+        unreplicatedWrites.emplace(opCtx.get());
+    }
+
     AuthorizationSession::get(opCtx->getClient())->grantInternalAuthorization();
 
     {
@@ -139,7 +158,8 @@ void IndexBuilder::run() {
     NamespaceString ns(_index["ns"].String());
 
     Lock::DBLock dlk(opCtx.get(), ns.db(), MODE_X);
-    Database* db = DatabaseHolder::getDatabaseHolder().get(opCtx.get(), ns.db().toString());
+    auto databaseHolder = DatabaseHolder::get(opCtx.get());
+    auto db = databaseHolder->getDb(opCtx.get(), ns.db().toString());
 
     // This background index build can only be interrupted at shutdown.
     // For the duration of the OperationContext::runWithoutInterruption() invocation, any kill
@@ -225,7 +245,7 @@ Status IndexBuilder::_build(OperationContext* opCtx,
         curOp->setOpDescription_inlock(opDescObj);
     }
 
-    MultiIndexBlockImpl indexer(opCtx, coll);
+    MultiIndexBlock indexer(opCtx, coll);
     indexer.allowInterruption();
     if (allowBackgroundBuilding)
         indexer.allowBackgroundBuilding();
@@ -238,7 +258,8 @@ Status IndexBuilder::_build(OperationContext* opCtx,
     }
 
     if (status == ErrorCodes::IndexAlreadyExists ||
-        (status == ErrorCodes::IndexOptionsConflict && _relaxConstraints)) {
+        (status == ErrorCodes::IndexOptionsConflict &&
+         _indexConstraints == IndexConstraints::kRelax)) {
         LOG(1) << "Ignoring indexing error: " << redact(status);
         if (allowBackgroundBuilding) {
             // Must set this in case anyone is waiting for this build.
@@ -248,6 +269,13 @@ Status IndexBuilder::_build(OperationContext* opCtx,
     }
     if (!status.isOK()) {
         return _failIndexBuild(opCtx, indexer, dbLock, status, allowBackgroundBuilding);
+    }
+
+    // Ignore uniqueness constraint violations when relaxed (on secondaries). Secondaries can
+    // complete index builds in the middle of batches, which creates the potential for finding
+    // duplicate key violations where there otherwise would be none at consistent states.
+    if (_indexConstraints == IndexConstraints::kRelax) {
+        indexer.ignoreUniqueConstraint();
     }
 
     if (allowBackgroundBuilding) {
@@ -262,11 +290,16 @@ Status IndexBuilder::_build(OperationContext* opCtx,
         Lock::CollectionLock collLock(opCtx->lockState(), ns.ns(), MODE_IX);
         // WriteConflict exceptions and statuses are not expected to escape this method.
         status = indexer.insertAllDocumentsInCollection();
-        if (!status.isOK()) {
-            return _failIndexBuild(opCtx, indexer, dbLock, status, allowBackgroundBuilding);
-        }
+    }
+    // _failIndexBuild upgrades our database lock, so we must take care to release our Collection IX
+    // lock first.
+    if (!status.isOK()) {
+        return _failIndexBuild(opCtx, indexer, dbLock, status, allowBackgroundBuilding);
+    }
 
+    {
         // Perform the first drain while holding an intent lock.
+        Lock::CollectionLock collLock(opCtx->lockState(), ns.ns(), MODE_IX);
         status = indexer.drainBackgroundWritesIfNeeded();
     }
     if (!status.isOK()) {
@@ -295,9 +328,20 @@ Status IndexBuilder::_build(OperationContext* opCtx,
         return _failIndexBuild(opCtx, indexer, dbLock, status, allowBackgroundBuilding);
     }
 
-    status = writeConflictRetry(opCtx, "Commit index build", ns.ns(), [this, opCtx, &indexer, &ns] {
+    // Only perform constraint checking when enforced (on primaries).
+    if (_indexConstraints == IndexConstraints::kEnforce) {
+        status = indexer.checkConstraints();
+        if (!status.isOK()) {
+            return _failIndexBuild(opCtx, indexer, dbLock, status, allowBackgroundBuilding);
+        }
+    }
+
+    status = writeConflictRetry(opCtx, "Commit index build", ns.ns(), [opCtx, coll, &indexer, &ns] {
         WriteUnitOfWork wunit(opCtx);
-        auto status = indexer.commit();
+        auto status = indexer.commit([opCtx, coll, &ns](const BSONObj& indexSpec) {
+            opCtx->getServiceContext()->getOpObserver()->onCreateIndex(
+                opCtx, ns, *(coll->uuid()), indexSpec, false);
+        });
         if (!status.isOK()) {
             return status;
         }
@@ -336,7 +380,8 @@ Status IndexBuilder::_build(OperationContext* opCtx,
                                 << ns.ns()
                                 << ": "
                                 << _index);
-        Database* reloadDb = DatabaseHolder::getDatabaseHolder().get(opCtx, ns.db());
+        auto databaseHolder = DatabaseHolder::get(opCtx);
+        auto reloadDb = databaseHolder->getDb(opCtx, ns.db());
         fassert(28553, reloadDb);
         fassert(28554, reloadDb->getCollection(opCtx, ns));
     }

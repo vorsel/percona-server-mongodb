@@ -233,6 +233,10 @@ Status ReplicationCoordinatorMock::waitUntilOpTimeForReadUntil(OperationContext*
     return Status::OK();
 }
 
+Status ReplicationCoordinatorMock::awaitOpTimeCommitted(OperationContext* opCtx, OpTime opTime) {
+    return Status::OK();
+}
+
 OID ReplicationCoordinatorMock::getElectionId() {
     // TODO
     return OID();
@@ -431,8 +435,6 @@ bool ReplicationCoordinatorMock::getWriteConcernMajorityShouldJournal() {
     return true;
 }
 
-void ReplicationCoordinatorMock::summarizeAsHtml(ReplSetHtmlSummary* output) {}
-
 long long ReplicationCoordinatorMock::getTerm() {
     return _term;
 }
@@ -466,13 +468,6 @@ WriteConcernOptions ReplicationCoordinatorMock::populateUnsetWriteConcernOptions
     }
     return wc;
 }
-
-ReplSettings::IndexPrefetchConfig ReplicationCoordinatorMock::getIndexPrefetchConfig() const {
-    return ReplSettings::IndexPrefetchConfig();
-}
-
-void ReplicationCoordinatorMock::setIndexPrefetchConfig(
-    const ReplSettings::IndexPrefetchConfig cfg) {}
 
 Status ReplicationCoordinatorMock::stepUpIfEligible(bool skipDryRun) {
     return Status::OK();

@@ -112,7 +112,7 @@ const ResourceId resourceIdGlobal = ResourceId(RESOURCE_GLOBAL, ResourceId::SING
 const Milliseconds MaxWaitTime = Milliseconds(500);
 
 // Dispenses unique LockerId identifiers
-AtomicUInt64 idCounter(0);
+AtomicWord<unsigned long long> idCounter(0);
 
 // Partitioned global lock statistics, so we don't hit the same bucket
 PartitionedInstanceWideLockStats globalStats;
@@ -216,10 +216,16 @@ LockResult CondVarLockGrantNotification::wait(Milliseconds timeout) {
 LockResult CondVarLockGrantNotification::wait(OperationContext* opCtx, Milliseconds timeout) {
     invariant(opCtx);
     stdx::unique_lock<stdx::mutex> lock(_mutex);
-    return opCtx->waitForConditionOrInterruptFor(
-               _cond, lock, timeout, [this] { return _result != LOCK_INVALID; })
-        ? _result
-        : LOCK_TIMEOUT;
+    if (opCtx->waitForConditionOrInterruptFor(
+            _cond, lock, timeout, [this] { return _result != LOCK_INVALID; })) {
+        // Because waitForConditionOrInterruptFor evaluates the predicate before checking for
+        // interrupt, it is possible that a killed operation can acquire a lock if the request is
+        // granted quickly. For that reason, it is necessary to check if the operation has been
+        // killed at least once before accepting the lock grant.
+        opCtx->checkForInterrupt();
+        return _result;
+    }
+    return LOCK_TIMEOUT;
 }
 
 void CondVarLockGrantNotification::notify(ResourceId resId, LockResult result) {
@@ -329,7 +335,7 @@ LockResult LockerImpl::_acquireTicket(OperationContext* opCtx, LockMode mode, Da
         }
 
         // If the ticket wait is interrupted, restore the state of the client.
-        auto restoreStateOnErrorGuard = MakeGuard([&] { _clientState.store(kInactive); });
+        auto restoreStateOnErrorGuard = makeGuard([&] { _clientState.store(kInactive); });
 
         OperationContext* interruptible = _uninterruptibleLocksRequested ? nullptr : opCtx;
         if (deadline == Date_t::max()) {
@@ -337,7 +343,7 @@ LockResult LockerImpl::_acquireTicket(OperationContext* opCtx, LockMode mode, Da
         } else if (!holder->waitForTicketUntil(interruptible, deadline)) {
             return LOCK_TIMEOUT;
         }
-        restoreStateOnErrorGuard.Dismiss();
+        restoreStateOnErrorGuard.dismiss();
     }
     _clientState.store(reader ? kActiveReader : kActiveWriter);
     return LOCK_OK;
@@ -480,6 +486,11 @@ void LockerImpl::downgrade(ResourceId resId, LockMode newMode) {
 
 bool LockerImpl::unlock(ResourceId resId) {
     LockRequestsMap::Iterator it = _requests.find(resId);
+
+    // Don't attempt to unlock twice. This can happen when an interrupted global lock is destructed.
+    if (it.finished())
+        return false;
+
     if (inAWriteUnitOfWork() && _shouldDelayUnlock(it.key(), (it->mode))) {
         if (!it->unlockPending) {
             _numResourcesToUnlockAtEndUnitOfWork++;
@@ -492,10 +503,27 @@ bool LockerImpl::unlock(ResourceId resId) {
         return false;
     }
 
-    // Don't attempt to unlock twice. This can happen when an interrupted global lock is destructed.
-    if (it.finished())
-        return false;
     return _unlockImpl(&it);
+}
+
+bool LockerImpl::unlockRSTLforPrepare() {
+    auto rstlRequest = _requests.find(resourceIdReplicationStateTransitionLock);
+
+    // Don't attempt to unlock twice. This can happen when an interrupted global lock is destructed.
+    if (!rstlRequest)
+        return false;
+
+    // If the RSTL is 'unlockPending' and we are fully unlocking it, then we do not want to
+    // attempt to unlock the RSTL when the WUOW ends, since it will already be unlocked.
+    if (rstlRequest->unlockPending) {
+        _numResourcesToUnlockAtEndUnitOfWork--;
+    }
+
+    // Reset the recursiveCount to 1 so that we fully unlock the RSTL. Since it will be fully
+    // unlocked, any future unlocks will be noops anyways.
+    rstlRequest->recursiveCount = 1;
+
+    return _unlockImpl(&rstlRequest);
 }
 
 LockMode LockerImpl::getLockMode(ResourceId resId) const {
@@ -788,7 +816,7 @@ LockResult LockerImpl::lockComplete(OperationContext* opCtx,
     Milliseconds timeout;
     if (deadline == Date_t::max()) {
         timeout = Milliseconds::max();
-    } else if (deadline == Date_t::min()) {
+    } else if (deadline <= Date_t()) {
         timeout = Milliseconds(0);
     } else {
         timeout = deadline - Date_t::now();
@@ -807,7 +835,7 @@ LockResult LockerImpl::lockComplete(OperationContext* opCtx,
     uint64_t startOfCurrentWaitTime = startOfTotalWaitTime;
 
     // Clean up the state on any failed lock attempts.
-    auto unlockOnErrorGuard = MakeGuard([&] {
+    auto unlockOnErrorGuard = makeGuard([&] {
         LockRequestsMap::Iterator it = _requests.find(resId);
         _unlockImpl(&it);
     });
@@ -864,7 +892,7 @@ LockResult LockerImpl::lockComplete(OperationContext* opCtx,
     // lock was still granted after all, but we don't try to take advantage of that and will return
     // a timeout.
     if (result == LOCK_OK) {
-        unlockOnErrorGuard.Dismiss();
+        unlockOnErrorGuard.dismiss();
     }
     return result;
 }

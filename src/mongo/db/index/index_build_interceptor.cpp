@@ -47,29 +47,62 @@
 
 namespace mongo {
 
-IndexBuildInterceptor::IndexBuildInterceptor(OperationContext* opCtx)
-    : _sideWritesTable(
-          opCtx->getServiceContext()->getStorageEngine()->makeTemporaryRecordStore(opCtx)){};
+IndexBuildInterceptor::IndexBuildInterceptor(OperationContext* opCtx, IndexCatalogEntry* entry)
+    : _indexCatalogEntry(entry),
+      _sideWritesTable(
+          opCtx->getServiceContext()->getStorageEngine()->makeTemporaryRecordStore(opCtx)) {
+
+    if (entry->descriptor()->unique()) {
+        _duplicateKeyTracker = std::make_unique<DuplicateKeyTracker>(opCtx, entry);
+    }
+}
+
+Status IndexBuildInterceptor::recordDuplicateKeys(OperationContext* opCtx,
+                                                  const std::vector<BSONObj>& keys) {
+    invariant(_indexCatalogEntry->descriptor()->unique());
+    return _duplicateKeyTracker->recordKeys(opCtx, keys);
+}
+
+Status IndexBuildInterceptor::checkDuplicateKeyConstraints(OperationContext* opCtx) const {
+    if (!_duplicateKeyTracker) {
+        return Status::OK();
+    }
+    return _duplicateKeyTracker->checkConstraints(opCtx);
+}
+
+bool IndexBuildInterceptor::areAllConstraintsChecked(OperationContext* opCtx) const {
+    if (!_duplicateKeyTracker) {
+        return true;
+    }
+    return _duplicateKeyTracker->areAllConstraintsChecked(opCtx);
+}
 
 Status IndexBuildInterceptor::drainWritesIntoIndex(OperationContext* opCtx,
-                                                   IndexAccessMethod* indexAccessMethod,
-                                                   const IndexDescriptor* indexDescriptor,
                                                    const InsertDeleteOptions& options) {
     invariant(!opCtx->lockState()->inAWriteUnitOfWork());
 
     // These are used for logging only.
     int64_t totalDeleted = 0;
     int64_t totalInserted = 0;
+    Timer timer;
 
     const int64_t appliedAtStart = _numApplied;
 
     // Set up the progress meter. This will never be completely accurate, because more writes can be
     // read from the side writes table than are observed before draining.
-    static const char* curopMessage = "Index build draining writes";
-    stdx::unique_lock<Client> lk(*opCtx->getClient());
-    ProgressMeterHolder progress(CurOp::get(opCtx)->setMessage_inlock(
-        curopMessage, curopMessage, _sideWritesCounter.load() - appliedAtStart, 1));
-    lk.unlock();
+    static const char* curopMessage = "Index Build: draining writes received during build";
+    ProgressMeterHolder progress;
+    {
+        stdx::unique_lock<Client> lk(*opCtx->getClient());
+        progress.set(CurOp::get(opCtx)->setProgress_inlock(curopMessage));
+    }
+
+    // Force the progress meter to log at the end of every batch. By default, the progress meter
+    // only logs after a large number of calls to hit(), but since we batch inserts by up to
+    // 1000 records, progress would rarely be displayed.
+    progress->reset(_sideWritesCounter.load() - appliedAtStart /* total */,
+                    3 /* secondsBetween */,
+                    1 /* checkInterval */);
 
     // Buffer operations into batches to insert per WriteUnitOfWork. Impose an upper limit on the
     // number of documents and the total size of the batch.
@@ -126,9 +159,6 @@ Status IndexBuildInterceptor::drainWritesIntoIndex(OperationContext* opCtx,
                 break;
         }
 
-        // Account for more writes coming in after the drain starts.
-        progress->setTotalWhileRunning(_sideWritesCounter.loadRelaxed() - appliedAtStart);
-
         invariant(!batch.empty());
 
         // If we are here, either we have reached the end of the table or the batch is full, so
@@ -136,8 +166,8 @@ Status IndexBuildInterceptor::drainWritesIntoIndex(OperationContext* opCtx,
         // writes table.
         WriteUnitOfWork wuow(opCtx);
         for (auto& operation : batch) {
-            auto status = _applyWrite(
-                opCtx, indexAccessMethod, operation.second, options, &totalInserted, &totalDeleted);
+            auto status =
+                _applyWrite(opCtx, operation.second, options, &totalInserted, &totalDeleted);
             if (!status.isOK()) {
                 return status;
             }
@@ -152,6 +182,10 @@ Status IndexBuildInterceptor::drainWritesIntoIndex(OperationContext* opCtx,
         cursor->restore();
 
         progress->hit(batch.size());
+
+        // Account for more writes coming in during a batch.
+        progress->setTotalWhileRunning(_sideWritesCounter.loadRelaxed() - appliedAtStart);
+
         _numApplied += batch.size();
         batch.clear();
         batchSizeBytes = 0;
@@ -159,15 +193,16 @@ Status IndexBuildInterceptor::drainWritesIntoIndex(OperationContext* opCtx,
 
     progress->finished();
 
-    log() << "index build for " << indexDescriptor->indexName() << ": drain applied "
-          << (_numApplied - appliedAtStart) << " side writes. i: " << totalInserted
-          << ", d: " << totalDeleted << ", total: " << _numApplied;
+    int logLevel = (_numApplied - appliedAtStart > 0) ? 0 : 1;
+    LOG(logLevel) << "index build: drain applied " << (_numApplied - appliedAtStart)
+                  << " side writes (inserted: " << totalInserted << ", deleted: " << totalDeleted
+                  << ") for '" << _indexCatalogEntry->descriptor()->indexName() << "' in "
+                  << timer.millis() << " ms";
 
     return Status::OK();
 }
 
 Status IndexBuildInterceptor::_applyWrite(OperationContext* opCtx,
-                                          IndexAccessMethod* indexAccessMethod,
                                           const BSONObj& operation,
                                           const InsertDeleteOptions& options,
                                           int64_t* const keysInserted,
@@ -178,28 +213,35 @@ Status IndexBuildInterceptor::_applyWrite(OperationContext* opCtx,
         (strcmp(operation.getStringField("op"), "i") == 0) ? Op::kInsert : Op::kDelete;
     const BSONObjSet keySet = SimpleBSONObjComparator::kInstance.makeBSONObjSet({key});
 
+    auto accessMethod = _indexCatalogEntry->accessMethod();
     if (opType == Op::kInsert) {
         InsertResult result;
-        Status s =
-            indexAccessMethod->insertKeys(opCtx,
-                                          keySet,
-                                          SimpleBSONObjComparator::kInstance.makeBSONObjSet(),
-                                          MultikeyPaths{},
-                                          opRecordId,
-                                          options,
-                                          &result);
-        if (!s.isOK()) {
-            return s;
+        auto status = accessMethod->insertKeys(opCtx,
+                                               keySet,
+                                               SimpleBSONObjComparator::kInstance.makeBSONObjSet(),
+                                               MultikeyPaths{},
+                                               opRecordId,
+                                               options,
+                                               &result);
+        if (!status.isOK()) {
+            return status;
         }
 
-        invariant(!result.dupsInserted.size());
+        if (result.dupsInserted.size() &&
+            options.getKeysMode == IndexAccessMethod::GetKeysMode::kEnforceConstraints) {
+            status = recordDuplicateKeys(opCtx, result.dupsInserted);
+            if (!status.isOK()) {
+                return status;
+            }
+        }
+
         *keysInserted += result.numInserted;
     } else {
         invariant(opType == Op::kDelete);
         DEV invariant(strcmp(operation.getStringField("op"), "d") == 0);
 
         int64_t numDeleted;
-        Status s = indexAccessMethod->removeKeys(opCtx, keySet, opRecordId, options, &numDeleted);
+        Status s = accessMethod->removeKeys(opCtx, keySet, opRecordId, options, &numDeleted);
         if (!s.isOK()) {
             return s;
         }
@@ -297,13 +339,19 @@ Status IndexBuildInterceptor::sideWrite(OperationContext* opCtx,
         [ this, size = toInsert.size() ] { _sideWritesCounter.fetchAndSubtract(size); });
 
     std::vector<Record> records;
-    for (auto& obj : toInsert) {
-        records.emplace_back(Record{RecordId(), RecordData(obj.objdata(), obj.objsize())});
+    for (auto& doc : toInsert) {
+        records.emplace_back(Record{RecordId(),  // The storage engine will assign its own RecordId
+                                                 // when we pass one that is null.
+                                    RecordData(doc.objdata(), doc.objsize())});
     }
+
+    LOG(2) << "recording " << records.size() << " side write keys on index '"
+           << _indexCatalogEntry->descriptor()->indexName() << "'";
 
     // By passing a vector of null timestamps, these inserts are not timestamped individually, but
     // rather with the timestamp of the owning operation.
     std::vector<Timestamp> timestamps(records.size());
     return _sideWritesTable->rs()->insertRecords(opCtx, &records, timestamps);
 }
+
 }  // namespace mongo

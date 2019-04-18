@@ -165,8 +165,6 @@ public:
 
     StatusWith<Timestamp> recoverToStableTimestamp(OperationContext* opCtx) override;
 
-    bool supportsRecoverToStableTimestamp(ServiceContext* serviceCtx) const override;
-
     bool supportsRecoveryTimestamp(ServiceContext* serviceCtx) const override;
 
     boost::optional<Timestamp> getRecoveryTimestamp(ServiceContext* serviceCtx) const override;
@@ -182,7 +180,8 @@ public:
      */
     Status isAdminDbValid(OperationContext* opCtx) override;
 
-    void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx) override;
+    void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx,
+                                                 bool primaryOnly) override;
     void oplogDiskLocRegister(OperationContext* opCtx,
                               const Timestamp& ts,
                               bool orderedCommit) override;

@@ -34,26 +34,29 @@
 
 #include "mongo/db/repl/rollback_impl.h"
 
+#include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/background.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/replication_state_transition_lock_guard.h"
 #include "mongo/db/db_raii.h"
-#include "mongo/db/dbhelpers.h"
+#include "mongo/db/kill_sessions_local.h"
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/apply_ops.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_process.h"
-#include "mongo/db/repl/replication_state_transition_lock_guard.h"
 #include "mongo/db/repl/roll_back_local_operations.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/s/shard_identity_rollback_notifier.h"
 #include "mongo/db/s/type_shard_identity.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/server_recovery.h"
+#include "mongo/db/server_transactions_metrics.h"
+#include "mongo/db/storage/remove_saver.h"
 #include "mongo/s/catalog/type_config_version.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
@@ -61,6 +64,9 @@
 namespace mongo {
 namespace repl {
 namespace {
+
+// Used to set RollbackImpl::_newCounts to force a collection scan to fix count.
+constexpr long long kCollectionScanRequired = -1;
 
 RollbackImpl::Listener kNoopListener;
 
@@ -87,6 +93,47 @@ MONGO_EXPORT_SERVER_PARAMETER(rollbackTimeLimitSecs, int, 60 * 60 * 24)  // Defa
 constexpr auto kInsertCmdName = "insert"_sd;
 constexpr auto kUpdateCmdName = "update"_sd;
 constexpr auto kDeleteCmdName = "delete"_sd;
+constexpr auto kNumRecordsFieldName = "numRecords"_sd;
+constexpr auto kToFieldName = "to"_sd;
+constexpr auto kDropTargetFieldName = "dropTarget"_sd;
+
+/**
+ * Parses the o2 field of a drop or rename oplog entry for the count of the collection that was
+ * dropped.
+ */
+boost::optional<long long> _parseDroppedCollectionCount(const OplogEntry& oplogEntry) {
+    auto commandType = oplogEntry.getCommandType();
+    auto desc = OplogEntry::CommandType::kDrop == commandType ? "drop oplog entry"_sd
+                                                              : "rename oplog entry"_sd;
+
+    auto obj2 = oplogEntry.getObject2();
+    if (!obj2) {
+        warning() << "Unable to get collection count from " << desc << " without the o2 "
+                                                                       "field. oplog op: "
+                  << redact(oplogEntry.toBSON());
+        return boost::none;
+    }
+
+    long long count = 0;
+    // TODO: Use IDL to parse o2 object. See txn_cmds.idl for example.
+    auto status = bsonExtractIntegerField(*obj2, kNumRecordsFieldName, &count);
+    if (!status.isOK()) {
+        warning() << "Failed to parse " << desc << " for collection count: " << status
+                  << ". oplog op: " << redact(oplogEntry.toBSON());
+        return boost::none;
+    }
+
+    if (count < 0) {
+        warning() << "Invalid collection count found in " << desc << ": " << count
+                  << ". oplog op: " << redact(oplogEntry.toBSON());
+        return boost::none;
+    }
+
+    LOG(2) << "Parsed collection count of " << count << " from " << desc
+           << ". oplog op: " << redact(oplogEntry.toBSON());
+    return count;
+}
+
 }  // namespace
 
 constexpr const char* RollbackImpl::kRollbackRemoveSaverType;
@@ -205,6 +252,14 @@ Status RollbackImpl::runRollback(OperationContext* opCtx) {
     } else {
         log() << "Not writing rollback files. 'createRollbackDataFiles' set to false.";
     }
+
+    // Before calling recoverToStableTimestamp, we must abort the storage transaction of any
+    // prepared transaction. This will require us to scan all sessions and call
+    // abortPreparedTransactionForRollback() on any txnParticipant with a prepared transaction.
+    killSessionsAbortAllPreparedTransactions(opCtx);
+
+    // Clear the in memory state of prepared transactions in ServerTransactionsMetrics.
+    ServerTransactionsMetrics::get(getGlobalServiceContext())->clearOpTimes();
 
     // Recover to the stable timestamp.
     auto stableTimestampSW = _recoverToStableTimestamp(opCtx);
@@ -437,7 +492,7 @@ void RollbackImpl::_correctRecordStoreCounts(OperationContext* opCtx) {
         invariant(!ident.empty(),
                   str::stream() << "The collection with UUID " << uuid << " has no ident.");
 
-        const auto newCount = uiCount.second;
+        auto newCount = uiCount.second;
         // If the collection is marked for size adjustment, then we made sure the collection size
         // was accurate at the stable timestamp and we can trust replication recovery to keep it
         // correct. This is necessary for capped collections whose deletions will be untracked
@@ -448,6 +503,36 @@ void RollbackImpl::_correctRecordStoreCounts(OperationContext* opCtx) {
                    << uuid.toString() << ") [" << ident
                    << "] because it is marked for size adjustment.";
             continue;
+        }
+
+        // If _findRecordStoreCounts() is unable to determine the correct count from the oplog
+        // (most likely due to a 4.0 drop oplog entry without the count information), we will
+        // determine the correct count here post-recovery using a collection scan.
+        if (kCollectionScanRequired == newCount) {
+            log() << "Scanning collection " << nss.ns() << " (" << uuid.toString()
+                  << ") to fix collection count.";
+            AutoGetCollectionForRead autoCollToScan(opCtx, nss);
+            auto collToScan = autoCollToScan.getCollection();
+            invariant(coll == collToScan,
+                      str::stream() << "Catalog returned invalid collection: " << nss.ns() << " ("
+                                    << uuid.toString()
+                                    << ")");
+            auto exec = collToScan->makePlanExecutor(
+                opCtx, PlanExecutor::INTERRUPT_ONLY, Collection::ScanDirection::kForward);
+            long long countFromScan = 0;
+            PlanExecutor::ExecState state;
+            while (PlanExecutor::ADVANCED == (state = exec->getNext(nullptr, nullptr))) {
+                ++countFromScan;
+            }
+            if (PlanExecutor::IS_EOF != state) {
+                // We ignore errors here because crashing or leaving rollback would only leave
+                // collection counts more inaccurate.
+                warning() << "Failed to set count of " << nss.ns() << " (" << uuid.toString()
+                          << ") [" << ident
+                          << "] due to failed collection scan: " << exec->statestr(state);
+                continue;
+            }
+            newCount = countFromScan;
         }
 
         auto status =
@@ -469,6 +554,7 @@ Status RollbackImpl::_findRecordStoreCounts(OperationContext* opCtx) {
         return Status(ErrorCodes::ShutdownInProgress, "rollback shutting down");
     }
     const auto& uuidCatalog = UUIDCatalog::get(opCtx);
+    auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
 
     log() << "finding record store counts";
     for (const auto& uiCount : _countDiffs) {
@@ -478,15 +564,37 @@ Status RollbackImpl::_findRecordStoreCounts(OperationContext* opCtx) {
             continue;
         }
 
-        const auto nss = uuidCatalog.lookupNSSByUUID(uuid);
-        invariant(!nss.isEmpty(),
-                  str::stream() << "The collection with UUID " << uuid
-                                << " is unexpectedly missing in the UUIDCatalog");
-        auto countSW = _storageInterface->getCollectionCount(opCtx, {nss.db().toString(), uuid});
-        if (!countSW.isOK()) {
-            return countSW.getStatus();
+        auto nss = uuidCatalog.lookupNSSByUUID(uuid);
+        StorageInterface::CollectionCount oldCount = 0;
+
+        // Drop-pending collections are not visible to rollback via the catalog when they are
+        // managed by the storage engine. See StorageEngine::supportsPendingDrops().
+        if (nss.isEmpty()) {
+            invariant(storageEngine->supportsPendingDrops(),
+                      str::stream() << "The collection with UUID " << uuid
+                                    << " is unexpectedly missing in the UUIDCatalog");
+            auto it = _pendingDrops.find(uuid);
+            if (it == _pendingDrops.end()) {
+                _newCounts[uuid] = kCollectionScanRequired;
+                continue;
+            }
+            const auto& dropPendingInfo = it->second;
+            nss = dropPendingInfo.nss;
+            invariant(dropPendingInfo.count >= 0,
+                      str::stream() << "The collection with UUID " << uuid
+                                    << " was dropped with a negative collection count of "
+                                    << dropPendingInfo.count
+                                    << " in the drop or rename oplog entry. Unable to reset "
+                                       "collection count during rollback.");
+            oldCount = static_cast<StorageInterface::CollectionCount>(dropPendingInfo.count);
+        } else {
+            auto countSW = _storageInterface->getCollectionCount(opCtx, nss);
+            if (!countSW.isOK()) {
+                return countSW.getStatus();
+            }
+            oldCount = countSW.getValue();
         }
-        auto oldCount = countSW.getValue();
+
         if (oldCount > static_cast<uint64_t>(std::numeric_limits<long long>::max())) {
             warning() << "Count for " << nss.ns() << " (" << uuid.toString() << ") was " << oldCount
                       << " which is larger than the maximum int64_t value. Not attempting to fix "
@@ -608,6 +716,58 @@ Status RollbackImpl::_processRollbackOp(const OplogEntry& oplogEntry) {
         if (oplogEntry.getCommandType() == OplogEntry::CommandType::kCreate) {
             // If we roll back a create, then we do not need to change the size of that uuid.
             _countDiffs.erase(oplogEntry.getUuid().get());
+            _pendingDrops.erase(oplogEntry.getUuid().get());
+            _newCounts.erase(oplogEntry.getUuid().get());
+        } else if (oplogEntry.getCommandType() == OplogEntry::CommandType::kDrop) {
+            // If we roll back a collection drop, parse the o2 field for the collection count for
+            // use later by _findRecordStoreCounts().
+            // This will be used to reconcile collection counts in the case where the drop-pending
+            // collection is managed by the storage engine and is not accessible through the UUID
+            // catalog.
+            // Adding a _newCounts entry ensures that the count will be set after the rollback.
+            const auto uuid = oplogEntry.getUuid().get();
+            invariant(_countDiffs.find(uuid) == _countDiffs.end(),
+                      str::stream() << "Unexpected existing count diff for " << uuid.toString()
+                                    << " op: "
+                                    << redact(oplogEntry.toBSON()));
+            if (auto countResult = _parseDroppedCollectionCount(oplogEntry)) {
+                PendingDropInfo info;
+                info.count = *countResult;
+                const auto& opNss = oplogEntry.getNss();
+                info.nss =
+                    CommandHelpers::parseNsCollectionRequired(opNss.db(), oplogEntry.getObject());
+                _pendingDrops[uuid] = info;
+                _newCounts[uuid] = info.count;
+            } else {
+                _newCounts[uuid] = kCollectionScanRequired;
+            }
+        } else if (oplogEntry.getCommandType() == OplogEntry::CommandType::kRenameCollection &&
+                   oplogEntry.getObject()[kDropTargetFieldName].trueValue()) {
+            // If we roll back a rename with a dropped target collection, parse the o2 field for the
+            // target collection count for use later by _findRecordStoreCounts().
+            // This will be used to reconcile collection counts in the case where the drop-pending
+            // collection is managed by the storage engine and is not accessible through the UUID
+            // catalog.
+            // Adding a _newCounts entry ensures that the count will be set after the rollback.
+            auto dropTargetUUID = invariant(
+                UUID::parse(oplogEntry.getObject()[kDropTargetFieldName]),
+                str::stream()
+                    << "Oplog entry to roll back is unexpectedly missing dropTarget UUID: "
+                    << redact(oplogEntry.toBSON()));
+            invariant(_countDiffs.find(dropTargetUUID) == _countDiffs.end(),
+                      str::stream() << "Unexpected existing count diff for "
+                                    << dropTargetUUID.toString()
+                                    << " op: "
+                                    << redact(oplogEntry.toBSON()));
+            if (auto countResult = _parseDroppedCollectionCount(oplogEntry)) {
+                PendingDropInfo info;
+                info.count = *countResult;
+                info.nss = NamespaceString(oplogEntry.getObject()[kToFieldName].String());
+                _pendingDrops[dropTargetUUID] = info;
+                _newCounts[dropTargetUUID] = info.count;
+            } else {
+                _newCounts[dropTargetUUID] = kCollectionScanRequired;
+            }
         }
     }
 
@@ -774,9 +934,21 @@ boost::optional<BSONObj> RollbackImpl::_findDocumentById(OperationContext* opCtx
 
 Status RollbackImpl::_writeRollbackFiles(OperationContext* opCtx) {
     const auto& uuidCatalog = UUIDCatalog::get(opCtx);
+    auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
     for (auto&& entry : _observerInfo.rollbackDeletedIdsMap) {
         const auto& uuid = entry.first;
         const auto nss = uuidCatalog.lookupNSSByUUID(uuid);
+
+        // Drop-pending collections are not visible to rollback via the catalog when they are
+        // managed by the storage engine. See StorageEngine::supportsPendingDrops().
+        if (nss.isEmpty() && storageEngine->supportsPendingDrops()) {
+            log() << "The collection with UUID " << uuid
+                  << " is missing in the UUIDCatalog. This could be due to a dropped collection. "
+                     "Not writing rollback file for namespace "
+                  << nss.ns() << " with uuid " << uuid;
+            continue;
+        }
+
         invariant(!nss.isEmpty(),
                   str::stream() << "The collection with UUID " << uuid
                                 << " is unexpectedly missing in the UUIDCatalog");
@@ -801,7 +973,7 @@ void RollbackImpl::_writeRollbackFileForNamespace(OperationContext* opCtx,
                                                   UUID uuid,
                                                   NamespaceString nss,
                                                   const SimpleBSONObjUnorderedSet& idSet) {
-    Helpers::RemoveSaver removeSaver(kRollbackRemoveSaverType, nss.ns(), kRollbackRemoveSaverWhy);
+    RemoveSaver removeSaver(kRollbackRemoveSaverType, nss.ns(), kRollbackRemoveSaverWhy);
     log() << "Preparing to write deleted documents to a rollback file for collection " << nss.ns()
           << " with uuid " << uuid.toString() << " to " << removeSaver.file().generic_string();
 
@@ -891,13 +1063,22 @@ void RollbackImpl::_transitionFromRollbackToSecondary(OperationContext* opCtx) {
 }
 
 void RollbackImpl::_resetDropPendingState(OperationContext* opCtx) {
+    // TODO(SERVER-38671): Remove this line when drop-pending idents are always supported with this
+    // rolback method. Until then, we should assume that pending drops can be handled by either the
+    // replication subsystem or the storage engine.
     DropPendingCollectionReaper::get(opCtx)->clearDropPendingState();
 
+    // After recovering to a timestamp, the list of drop-pending idents maintained by the storage
+    // engine is no longer accurate and needs to be cleared.
+    auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
+    storageEngine->clearDropPendingState();
+
     std::vector<std::string> dbNames;
-    opCtx->getServiceContext()->getStorageEngine()->listDatabases(&dbNames);
+    storageEngine->listDatabases(&dbNames);
+    auto databaseHolder = DatabaseHolder::get(opCtx);
     for (const auto& dbName : dbNames) {
         Lock::DBLock dbLock(opCtx, dbName, MODE_X);
-        Database* db = DatabaseHolder::getDatabaseHolder().openDb(opCtx, dbName);
+        auto db = databaseHolder->openDb(opCtx, dbName);
         db->checkForIdIndexesAndDropPendingCollections(opCtx);
     }
 }

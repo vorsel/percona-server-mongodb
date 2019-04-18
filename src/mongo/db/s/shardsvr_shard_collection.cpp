@@ -41,6 +41,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/hasher.h"
+#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
@@ -134,6 +135,22 @@ BSONObj makeCreateIndexesCmd(const NamespaceString& nss,
     createIndexes.append("indexes", BSON_ARRAY(index.obj()));
     createIndexes.append("writeConcern", WriteConcernOptions::Majority);
     return appendAllowImplicitCreate(createIndexes.obj(), true);
+}
+
+bool checkIfCollectionAlreadyShardedWithSameOptions(OperationContext* opCtx,
+                                                    const NamespaceString& nss,
+                                                    const ShardsvrShardCollection& request,
+                                                    BSONObjBuilder& result) {
+    if (auto existingColl = InitialSplitPolicy::checkIfCollectionAlreadyShardedWithSameOptions(
+            opCtx, nss, request, repl::ReadConcernLevel::kMajorityReadConcern)) {
+        result << "collectionsharded" << nss.ns();
+        if (existingColl->getUUID()) {
+            result << "collectionUUID" << *existingColl->getUUID();
+        }
+
+        return true;
+    }
+    return false;
 }
 
 /**
@@ -408,7 +425,8 @@ void shardCollection(OperationContext* opCtx,
                      const std::vector<TagsType>& tags,
                      const bool fromMapReduce,
                      const ShardId& dbPrimaryShardId,
-                     const int numContiguousChunksPerShard) {
+                     const int numContiguousChunksPerShard,
+                     const bool isEmpty) {
     const auto shardRegistry = Grid::get(opCtx)->shardRegistry();
 
     const auto primaryShard = uassertStatusOK(shardRegistry->getShard(opCtx, dbPrimaryShardId));
@@ -450,6 +468,7 @@ void shardCollection(OperationContext* opCtx,
                                                                      splitPoints,
                                                                      tags,
                                                                      distributeChunks,
+                                                                     isEmpty,
                                                                      numContiguousChunksPerShard);
 
     // Create collections on all shards that will receive chunks. We need to do this after we mark
@@ -605,8 +624,22 @@ public:
             result << "collectionsharded" << nss.ns();
         } else {
             try {
+                if (checkIfCollectionAlreadyShardedWithSameOptions(opCtx, nss, request, result)) {
+                    status = Status::OK();
+                    scopedShardCollection.signalComplete(status);
+
+                    return true;
+                }
+
                 // Take the collection critical section so that no writes can happen.
                 CollectionCriticalSection critSec(opCtx, nss);
+
+                if (checkIfCollectionAlreadyShardedWithSameOptions(opCtx, nss, request, result)) {
+                    status = Status::OK();
+                    scopedShardCollection.signalComplete(status);
+
+                    return true;
+                }
 
                 auto proposedKey(request.getKey().getOwned());
                 ShardKeyPattern shardKeyPattern(proposedKey);
@@ -644,13 +677,7 @@ public:
 
                 if (request.getInitialSplitPoints()) {
                     finalSplitPoints = std::move(*request.getInitialSplitPoints());
-                } else if (!tags.empty()) {
-                    // no need to find split points since we will create chunks based on
-                    // the existing zones
-                    uassert(ErrorCodes::InvalidOptions,
-                            str::stream() << "found existing zones but the collection is not empty",
-                            isEmpty);
-                } else {
+                } else if (tags.empty()) {
                     InitialSplitPolicy::calculateHashedSplitPointsForEmptyCollection(
                         shardKeyPattern,
                         isEmpty,
@@ -691,7 +718,8 @@ public:
                                 tags,
                                 fromMapReduce,
                                 ShardingState::get(opCtx)->shardId(),
-                                numContiguousChunksPerShard);
+                                numContiguousChunksPerShard,
+                                isEmpty);
 
                 status = Status::OK();
             } catch (const DBException& e) {

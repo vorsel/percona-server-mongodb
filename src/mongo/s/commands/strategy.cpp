@@ -174,7 +174,7 @@ void invokeInTransactionRouter(OperationContext* opCtx,
             throw;
         }
 
-        txnRouter->implicitlyAbortTransaction(opCtx);
+        txnRouter->implicitlyAbortTransaction(opCtx, e.toStatus());
         throw;
     }
 }
@@ -318,7 +318,8 @@ void execCommandClient(OperationContext* opCtx,
         c->incrementCommandsFailed();
 
         if (auto txnRouter = TransactionRouter::get(opCtx)) {
-            txnRouter->implicitlyAbortTransaction(opCtx);
+            txnRouter->implicitlyAbortTransaction(opCtx,
+                                                  getStatusFromCommandResult(body.asTempObj()));
         }
     }
 }
@@ -416,10 +417,20 @@ void runCommand(OperationContext* opCtx,
             auto txnNumber = opCtx->getTxnNumber();
             invariant(txnNumber);
 
-            auto startTxnSetting = osi.getStartTransaction();
-            bool startTransaction = startTxnSetting ? *startTxnSetting : false;
+            auto transactionAction = ([&] {
+                auto startTxnSetting = osi.getStartTransaction();
+                if (startTxnSetting && *startTxnSetting) {
+                    return TransactionRouter::TransactionActions::kStart;
+                }
 
-            txnRouter->beginOrContinueTxn(opCtx, *txnNumber, startTransaction);
+                if (command->getName() == CommitTransaction::kCommandName) {
+                    return TransactionRouter::TransactionActions::kCommit;
+                }
+
+                return TransactionRouter::TransactionActions::kContinue;
+            })();
+
+            txnRouter->beginOrContinueTxn(opCtx, *txnNumber, transactionAction);
         }
 
         for (int tries = 0;; ++tries) {
@@ -437,6 +448,12 @@ void runCommand(OperationContext* opCtx,
             replyBuilder->reset();
             try {
                 execCommandClient(opCtx, invocation.get(), request, replyBuilder);
+
+                auto responseBuilder = replyBuilder->getBodyBuilder();
+                if (auto txnRouter = TransactionRouter::get(opCtx)) {
+                    txnRouter->appendRecoveryToken(&responseBuilder);
+                }
+
                 return;
             } catch (const ExceptionForCat<ErrorCategory::NeedRetargettingError>& ex) {
                 const auto staleNs = [&] {
@@ -475,11 +492,11 @@ void runCommand(OperationContext* opCtx,
                 // Update transaction tracking state for a possible retry. Throws and aborts the
                 // transaction if it cannot continue.
                 if (auto txnRouter = TransactionRouter::get(opCtx)) {
-                    auto abortGuard =
-                        MakeGuard([&] { txnRouter->implicitlyAbortTransaction(opCtx); });
+                    auto abortGuard = makeGuard(
+                        [&] { txnRouter->implicitlyAbortTransaction(opCtx, ex.toStatus()); });
                     handleCanRetryInTransaction(opCtx, txnRouter, canRetry, ex);
-                    txnRouter->onStaleShardOrDbError(commandName);
-                    abortGuard.Dismiss();
+                    txnRouter->onStaleShardOrDbError(commandName, ex.toStatus());
+                    abortGuard.dismiss();
                 }
 
                 if (canRetry) {
@@ -494,11 +511,11 @@ void runCommand(OperationContext* opCtx,
                 // Update transaction tracking state for a possible retry. Throws and aborts the
                 // transaction if it cannot continue.
                 if (auto txnRouter = TransactionRouter::get(opCtx)) {
-                    auto abortGuard =
-                        MakeGuard([&] { txnRouter->implicitlyAbortTransaction(opCtx); });
+                    auto abortGuard = makeGuard(
+                        [&] { txnRouter->implicitlyAbortTransaction(opCtx, ex.toStatus()); });
                     handleCanRetryInTransaction(opCtx, txnRouter, canRetry, ex);
-                    txnRouter->onStaleShardOrDbError(commandName);
-                    abortGuard.Dismiss();
+                    txnRouter->onStaleShardOrDbError(commandName, ex.toStatus());
+                    abortGuard.dismiss();
                 }
 
                 if (canRetry) {
@@ -511,11 +528,11 @@ void runCommand(OperationContext* opCtx,
                 // Update transaction tracking state for a possible retry. Throws and aborts the
                 // transaction if it cannot continue.
                 if (auto txnRouter = TransactionRouter::get(opCtx)) {
-                    auto abortGuard =
-                        MakeGuard([&] { txnRouter->implicitlyAbortTransaction(opCtx); });
+                    auto abortGuard = makeGuard(
+                        [&] { txnRouter->implicitlyAbortTransaction(opCtx, ex.toStatus()); });
                     handleCanRetryInTransaction(opCtx, txnRouter, canRetry, ex);
-                    txnRouter->onSnapshotError();
-                    abortGuard.Dismiss();
+                    txnRouter->onSnapshotError(ex.toStatus());
+                    abortGuard.dismiss();
                 }
 
                 if (canRetry) {

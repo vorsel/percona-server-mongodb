@@ -168,7 +168,7 @@ TEST_F(ServiceExecutorAdaptiveFixture, TestStuckTask) {
     stdx::unique_lock<stdx::mutex> blockedLock(blockedMutex);
 
     auto exec = makeAndStartExecutor<TestOptions>();
-    auto guard = MakeGuard([&] {
+    auto guard = makeGuard([&] {
         if (blockedLock)
             blockedLock.unlock();
         ASSERT_OK(exec->shutdown(config->workerThreadRunTime() * 2));
@@ -213,7 +213,7 @@ TEST_F(ServiceExecutorAdaptiveFixture, TestStuckThreads) {
     stdx::unique_lock<stdx::mutex> blockedLock(blockedMutex);
 
     auto exec = makeAndStartExecutor<TestOptions>();
-    auto guard = MakeGuard([&] {
+    auto guard = makeGuard([&] {
         if (blockedLock)
             blockedLock.unlock();
         ASSERT_OK(exec->shutdown(config->workerThreadRunTime() * 2));
@@ -264,7 +264,7 @@ TEST_F(ServiceExecutorAdaptiveFixture, TestStarvation) {
     // Mutex so we don't attempt to call schedule and shutdown concurrently
     stdx::mutex scheduleMutex;
 
-    auto guard = MakeGuard([&] { ASSERT_OK(exec->shutdown(config->workerThreadRunTime() * 2)); });
+    auto guard = makeGuard([&] { ASSERT_OK(exec->shutdown(config->workerThreadRunTime() * 2)); });
 
     bool scheduleNew{true};
 
@@ -311,12 +311,12 @@ TEST_F(ServiceExecutorAdaptiveFixture, TestStarvation) {
 TEST_F(ServiceExecutorAdaptiveFixture, TestRecursion) {
     auto exec = makeAndStartExecutor<RecursionOptions>();
 
-    AtomicInt32 remainingTasks{config->recursionLimit() - 1};
+    AtomicWord<int> remainingTasks{config->recursionLimit() - 1};
     stdx::mutex mutex;
     stdx::condition_variable cv;
     stdx::function<void()> task;
 
-    auto guard = MakeGuard([&] { ASSERT_OK(exec->shutdown(config->workerThreadRunTime() * 2)); });
+    auto guard = makeGuard([&] { ASSERT_OK(exec->shutdown(config->workerThreadRunTime() * 2)); });
 
     task = [this, &task, &exec, &mutex, &cv, &remainingTasks] {
         if (remainingTasks.subtractAndFetch(1) == 0) {
@@ -358,7 +358,7 @@ TEST_F(ServiceExecutorAdaptiveFixture, TestDeferredTasks) {
     stdx::unique_lock<stdx::mutex> blockedLock(blockedMutex);
 
     auto exec = makeAndStartExecutor<TestOptions>();
-    auto guard = MakeGuard([&] {
+    auto guard = makeGuard([&] {
         if (blockedLock)
             blockedLock.unlock();
         ASSERT_OK(exec->shutdown(config->workerThreadRunTime() * 2));

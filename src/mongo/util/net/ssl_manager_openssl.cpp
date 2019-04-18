@@ -416,8 +416,6 @@ public:
 
 ////////////////////////////////////////////////////////////////
 
-SimpleMutex sslManagerMtx;
-SSLManagerInterface* theSSLManager = NULL;
 using UniqueSSLContext = std::unique_ptr<SSL_CTX, decltype(&free_ssl_context)>;
 static const int BUFFER_SIZE = 8 * 1024;
 static const int DATE_LEN = 128;
@@ -642,6 +640,7 @@ void setupFIPS() {
 // Global variable indicating if this is a server or a client instance
 bool isSSLServer = false;
 
+extern SSLManagerInterface* theSSLManager;
 
 MONGO_INITIALIZER(SetupOpenSSL)(InitializerContext*) {
     SSL_library_init();
@@ -662,8 +661,8 @@ MONGO_INITIALIZER(SetupOpenSSL)(InitializerContext*) {
     return Status::OK();
 }
 
-MONGO_INITIALIZER_WITH_PREREQUISITES(SSLManager, ("SetupOpenSSL"))(InitializerContext*) {
-    stdx::lock_guard<SimpleMutex> lck(sslManagerMtx);
+MONGO_INITIALIZER_WITH_PREREQUISITES(SSLManager, ("SetupOpenSSL", "EndStartupOptionHandling"))
+(InitializerContext*) {
     if (!isSSLServer || (sslGlobalParams.sslMode.load() != SSLParams::SSLMode_disabled)) {
         theSSLManager = new SSLManagerOpenSSL(sslGlobalParams, isSSLServer);
     }
@@ -673,13 +672,6 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(SSLManager, ("SetupOpenSSL"))(InitializerCo
 std::unique_ptr<SSLManagerInterface> SSLManagerInterface::create(const SSLParams& params,
                                                                  bool isServer) {
     return stdx::make_unique<SSLManagerOpenSSL>(params, isServer);
-}
-
-SSLManagerInterface* getSSLManager() {
-    stdx::lock_guard<SimpleMutex> lck(sslManagerMtx);
-    if (theSSLManager)
-        return theSSLManager;
-    return NULL;
 }
 
 SSLX509Name getCertificateSubjectX509Name(X509* cert) {
@@ -717,7 +709,9 @@ SSLX509Name getCertificateSubjectX509Name(X509* cert) {
         entries.push_back(std::move(rdn));
     }
 
-    return SSLX509Name(std::move(entries));
+    SSLX509Name subjectName = SSLX509Name(std::move(entries));
+    uassertStatusOK(subjectName.normalizeStrings());
+    return subjectName;
 }
 
 int verifyDHParameters(const UniqueDHParams& dhparams) {
@@ -846,12 +840,15 @@ SSLManagerOpenSSL::SSLManagerOpenSSL(const SSLParams& params, bool isServer)
             uasserted(16562, "ssl initialization problem");
         }
 
+        SSLX509Name serverSubjectName;
         if (!_parseAndValidateCertificate(params.sslPEMKeyFile,
                                           &_serverPEMPassword,
-                                          &_sslConfiguration.serverSubjectName,
+                                          &serverSubjectName,
                                           &_sslConfiguration.serverCertificateExpirationDate)) {
             uasserted(16942, "ssl initialization problem");
         }
+
+        uassertStatusOK(_sslConfiguration.setServerSubjectName(std::move(serverSubjectName)));
 
         static CertificateExpirationMonitor task =
             CertificateExpirationMonitor(_sslConfiguration.serverCertificateExpirationDate);
@@ -1064,7 +1061,7 @@ bool SSLManagerOpenSSL::_initSynchronousSSLContext(UniqueSSLContext* contextPtr,
 unsigned long long SSLManagerOpenSSL::_convertASN1ToMillis(ASN1_TIME* asn1time) {
     BIO* outBIO = BIO_new(BIO_s_mem());
     int timeError = ASN1_TIME_print(outBIO, asn1time);
-    ON_BLOCK_EXIT(BIO_free, outBIO);
+    ON_BLOCK_EXIT([&] { BIO_free(outBIO); });
 
     if (timeError <= 0) {
         error() << "ASN1_TIME_print failed or wrote no data.";
@@ -1107,7 +1104,7 @@ bool SSLManagerOpenSSL::_parseAndValidateCertificate(const std::string& keyFile,
         return false;
     }
 
-    ON_BLOCK_EXIT(BIO_free, inBIO);
+    ON_BLOCK_EXIT([&] { BIO_free(inBIO); });
     if (BIO_read_filename(inBIO, keyFile.c_str()) <= 0) {
         error() << "cannot read key file when setting subject name: " << keyFile << ' '
                 << getSSLErrorMessage(ERR_get_error());
@@ -1121,7 +1118,7 @@ bool SSLManagerOpenSSL::_parseAndValidateCertificate(const std::string& keyFile,
                 << getSSLErrorMessage(ERR_get_error());
         return false;
     }
-    ON_BLOCK_EXIT(X509_free, x509);
+    ON_BLOCK_EXIT([&] { X509_free(x509); });
 
     *subjectName = getCertificateSubjectX509Name(x509);
     if (serverCertificateExpirationDate != NULL) {
@@ -1162,7 +1159,7 @@ bool SSLManagerOpenSSL::_setupPEM(SSL_CTX* context,
         error() << "failed to allocate BIO object: " << getSSLErrorMessage(ERR_get_error());
         return false;
     }
-    const auto bioGuard = MakeGuard([&inBio]() { BIO_free(inBio); });
+    const auto bioGuard = makeGuard([&inBio]() { BIO_free(inBio); });
 
     if (BIO_read_filename(inBio, keyFile.c_str()) <= 0) {
         error() << "cannot read PEM key file: " << keyFile << ' '
@@ -1179,7 +1176,7 @@ bool SSLManagerOpenSSL::_setupPEM(SSL_CTX* context,
                 << getSSLErrorMessage(ERR_get_error());
         return false;
     }
-    const auto privateKeyGuard = MakeGuard([&privateKey]() { EVP_PKEY_free(privateKey); });
+    const auto privateKeyGuard = makeGuard([&privateKey]() { EVP_PKEY_free(privateKey); });
 
     if (SSL_CTX_use_PrivateKey(context, privateKey) != 1) {
         error() << "cannot use PEM key file: " << keyFile << ' '
@@ -1246,7 +1243,7 @@ Status importCertStoreToX509_STORE(const wchar_t* storeName,
         return {ErrorCodes::InvalidSSLConfiguration,
                 str::stream() << "error opening system CA store: " << errnoWithDescription()};
     }
-    auto systemStoreGuard = MakeGuard([systemStore]() { CertCloseStore(systemStore, 0); });
+    auto systemStoreGuard = makeGuard([systemStore]() { CertCloseStore(systemStore, 0); });
 
     PCCERT_CONTEXT certCtx = NULL;
     while ((certCtx = CertEnumCertificatesInStore(systemStore, certCtx)) != NULL) {
@@ -1257,7 +1254,7 @@ Status importCertStoreToX509_STORE(const wchar_t* storeName,
                     str::stream() << "Error parsing X509 object from Windows certificate store"
                                   << SSLManagerInterface::getSSLErrorMessage(ERR_get_error())};
         }
-        const auto x509ObjGuard = MakeGuard([&x509Obj]() { X509_free(x509Obj); });
+        const auto x509ObjGuard = makeGuard([&x509Obj]() { X509_free(x509Obj); });
 
         if (X509_STORE_add_cert(verifyStore, x509Obj) != 1) {
             auto status = checkX509_STORE_error();
@@ -1542,7 +1539,7 @@ StatusWith<boost::optional<SSLPeerInfo>> SSLManagerOpenSSL::parseAndValidatePeer
             return Status(ErrorCodes::SSLHandshakeFailed, msg);
         }
     }
-    ON_BLOCK_EXIT(X509_free, peerCert);
+    ON_BLOCK_EXIT([&] { X509_free(peerCert); });
 
     long result = SSL_get_verify_result(conn);
 
@@ -1563,6 +1560,11 @@ StatusWith<boost::optional<SSLPeerInfo>> SSLManagerOpenSSL::parseAndValidatePeer
     // TODO: check optional cipher restriction, using cert.
     auto peerSubject = getCertificateSubjectX509Name(peerCert);
     LOG(2) << "Accepted TLS connection from peer: " << peerSubject;
+
+    // If this is a server and client and server certificate are the same, log a warning.
+    if (remoteHost.empty() && _sslConfiguration.serverSubjectName() == peerSubject) {
+        warning() << "Client connecting with server's own TLS certificate";
+    }
 
     StatusWith<stdx::unordered_set<RoleName>> swPeerCertificateRoles = _parsePeerRoles(peerCert);
     if (!swPeerCertificateRoles.isOK()) {

@@ -301,10 +301,6 @@ public:
         return Status{ErrorCodes::IllegalOperation, "recoverToStableTimestamp not implemented."};
     }
 
-    bool supportsRecoverToStableTimestamp(ServiceContext* serviceCtx) const override {
-        return false;
-    }
-
     bool supportsRecoveryTimestamp(ServiceContext* serviceCtx) const override {
         return false;
     }
@@ -323,7 +319,8 @@ public:
         return isAdminDbValidFn(opCtx);
     };
 
-    void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx) override {
+    void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx,
+                                                 bool primaryOnly) override {
         return;
     }
 

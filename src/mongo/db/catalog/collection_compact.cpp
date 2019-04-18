@@ -35,7 +35,6 @@
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/catalog/multi_index_block.h"
-#include "mongo/db/catalog/multi_index_block_impl.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/operation_context.h"
@@ -67,20 +66,9 @@ StatusWith<CompactStats> compactCollection(OperationContext* opCtx,
             return StatusWith<CompactStats>(status);
 
         // Compact all indexes (not including unfinished indexes)
-        std::unique_ptr<IndexCatalog::IndexIterator> ii(
-            indexCatalog->getIndexIterator(opCtx, false));
-        while (ii->more()) {
-            IndexCatalogEntry* entry = ii->next();
-            IndexDescriptor* descriptor = entry->descriptor();
-            IndexAccessMethod* iam = entry->accessMethod();
-
-            LOG(1) << "compacting index: " << descriptor->toString();
-            Status status = iam->compact(opCtx);
-            if (!status.isOK()) {
-                error() << "failed to compact index: " << descriptor->toString();
-                return status;
-            }
-        }
+        status = indexCatalog->compactIndexes(opCtx);
+        if (!status.isOK())
+            return StatusWith<CompactStats>(status);
 
         return StatusWith<CompactStats>(stats);
     }
@@ -94,7 +82,7 @@ StatusWith<CompactStats> compactCollection(OperationContext* opCtx,
         std::unique_ptr<IndexCatalog::IndexIterator> ii(
             indexCatalog->getIndexIterator(opCtx, false));
         while (ii->more()) {
-            IndexDescriptor* descriptor = ii->next()->descriptor();
+            const IndexDescriptor* descriptor = ii->next()->descriptor();
 
             // Compact always creates the new index in the foreground.
             const BSONObj spec =
@@ -129,7 +117,7 @@ StatusWith<CompactStats> compactCollection(OperationContext* opCtx,
 
     CompactStats stats;
 
-    MultiIndexBlockImpl indexer(opCtx, collection);
+    MultiIndexBlock indexer(opCtx, collection);
     indexer.allowInterruption();
     indexer.ignoreUniqueConstraint();  // in compact we should be doing no checking
 

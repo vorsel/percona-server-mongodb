@@ -96,6 +96,7 @@ DIRECTIO
 DNE
 DOI
 DONTNEED
+DSK
 DUPLICATEV
 DataSet
 DbCursor
@@ -378,6 +379,7 @@ ThreadList
 ThreadListWrapper
 Timespec
 Timestamp
+Timestamps
 TryCV
 TxnID
 UDF
@@ -398,10 +400,12 @@ UnmapViewOfFile
 Unmarshall
 Unordered
 Uryyb
+VALGRIND
 VARCHAR
 VLDB
 VMSG
 VR
+VRFY
 VX
 Vc
 Vfprintf
@@ -528,6 +532,7 @@ bzDecompressInit
 bzalloc
 bzfree
 bzip
+calc
 call's
 calloc
 cas
@@ -700,6 +705,7 @@ endian
 english
 enqueue
 enqueued
+enum
 env
 eof
 epi
@@ -952,6 +958,7 @@ marshalled
 maxCLevel
 maxcpu
 maxdbs
+maxdiff
 mbll
 mbss
 mem
@@ -999,9 +1006,11 @@ needkey
 needvalue
 negint
 nentries
+nentriesp
 newbar
 newfile
 newuri
+newv
 nextprev
 nfilename
 nhex
@@ -1030,6 +1039,7 @@ numSymbols
 numbare
 offpage
 ok
+oldv
 ondisk
 onint
 online
@@ -1217,6 +1227,7 @@ subgets
 subinit
 sublicense
 subone
+suboptimal
 subtest
 subtree
 sunique

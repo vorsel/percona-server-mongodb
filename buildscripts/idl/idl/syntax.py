@@ -295,10 +295,10 @@ class Validator(common.SourceLocation):
         """Construct a Validator."""
         # Don't lint gt/lt as bad attibute names.
         # pylint: disable=C0103
-        self.gt = None  # type: unicode
-        self.lt = None  # type: unicode
-        self.gte = None  # type: unicode
-        self.lte = None  # type: unicode
+        self.gt = None  # type: Expression
+        self.lt = None  # type: Expression
+        self.gte = None  # type: Expression
+        self.lte = None  # type: Expression
         self.callback = None  # type: unicode
 
         super(Validator, self).__init__(file_name, line, column)
@@ -473,6 +473,35 @@ class Condition(common.SourceLocation):
         super(Condition, self).__init__(file_name, line, column)
 
 
+class Expression(common.SourceLocation):
+    """Description of a valid C++ expression."""
+
+    def __init__(self, file_name, line, column):
+        # type: (unicode, int, int) -> None
+        """Construct an Expression."""
+
+        self.literal = None  # type: unicode
+        self.expr = None  # type: unicode
+        self.is_constexpr = True  # type: bool
+
+        super(Expression, self).__init__(file_name, line, column)
+
+
+class ServerParameterClass(common.SourceLocation):
+    """ServerParameter as C++ class specialization."""
+
+    def __init__(self, file_name, line, column):
+        # type: (unicode, int, int) -> None
+        """Construct a ServerParameterClass."""
+
+        self.name = None  # type: unicode
+        self.data = None  # type: unicode
+        self.override_ctor = False  # type: bool
+        self.override_set = False  # type: bool
+
+        super(ServerParameterClass, self).__init__(file_name, line, column)
+
+
 class ServerParameter(common.SourceLocation):
     """IDL ServerParameter information."""
 
@@ -486,18 +515,16 @@ class ServerParameter(common.SourceLocation):
         self.description = None  # type: unicode
         self.cpp_vartype = None  # type: unicode
         self.cpp_varname = None  # type: unicode
+        self.cpp_class = None  # type: ServerParameterClass
         self.condition = None  # type: Condition
         self.deprecated_name = []  # type: List[unicode]
+        self.redact = False  # type: bool
+        self.test_only = False  # type: bool
+        self.default = None  # type: Expression
 
-        # Only valid if cppStorage is specified.
+        # Only valid if cpp_varname is specified.
         self.validator = None  # type: Validator
         self.on_update = None  # type: unicode
-        self.default = None  # type: unicode
-
-        # Required if cppStorage is not specified.
-        self.from_bson = None  # type: unicode
-        self.append_bson = None  # type: unicode
-        self.from_string = None  # type: unicode
 
         super(ServerParameter, self).__init__(file_name, line, column)
 
@@ -539,8 +566,9 @@ class ConfigOption(common.SourceLocation):
         self.conflicts = []  # type: List[unicode]
         self.requires = []  # type: List[unicode]
         self.hidden = False  # type: bool
-        self.default = None  # type: unicode
-        self.implicit = None  # type: unicode
+        self.redact = False  # type: bool
+        self.default = None  # type: Expression
+        self.implicit = None  # type: Expression
         self.source = []  # type: List[unicode]
 
         self.duplicate_behavior = None  # type: unicode

@@ -38,7 +38,6 @@
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
 #include "mongo/db/repl/optime.h"
-#include "mongo/platform/hash_namespace.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/uuid.h"
 
@@ -92,6 +91,9 @@ public:
 
     // Namespace of the the oplog collection.
     static const NamespaceString kRsOplogNamespace;
+
+    // Namespace for storing the persisted state of transaction coordinators.
+    static const NamespaceString kTransactionCoordinatorsNamespace;
 
     /**
      * Constructs an empty NamespaceString.
@@ -149,12 +151,6 @@ public:
     static NamespaceString makeListCollectionsNSS(StringData dbName);
 
     /**
-     * Constructs a NamespaceString representing a listIndexes namespace. The format for this
-     * namespace is "<dbName>.$cmd.listIndexes.<collectionName>".
-     */
-    static NamespaceString makeListIndexesNSS(StringData dbName, StringData collectionName);
-
-    /**
      * Note that these values are derived from the mmap_v1 implementation and that is the only
      * reason they are constrained as such.
      */
@@ -207,12 +203,6 @@ public:
     bool isEmpty() const {
         return _ns.empty();
     }
-
-    struct Hasher {
-        size_t operator()(const NamespaceString& nss) const {
-            return std::hash<std::string>()(nss._ns);
-        }
-    };
 
     //
     // The following methods assume isValid() is true for this NamespaceString.
@@ -283,28 +273,22 @@ public:
     bool isReplicated() const;
 
     /**
-     * Returns true if cursors for this namespace are registered with the global cursor manager.
+     * The namespace associated with some ClientCursors does not correspond to a particular
+     * namespace. For example, this is true for listCollections cursors and $currentOp agg cursors.
+     * Returns true if the namespace string is for a "collectionless" cursor.
      */
-    bool isGloballyManagedNamespace() const {
+    bool isCollectionlessCursorNamespace() const {
         return coll().startsWith("$cmd."_sd);
     }
 
     bool isCollectionlessAggregateNS() const;
     bool isListCollectionsCursorNS() const;
-    bool isListIndexesCursorNS() const;
 
     /**
      * Returns true if a client can modify this namespace even though it is under ".system."
      * For example <dbname>.system.users is ok for regular clients to update.
      */
     bool isLegalClientSystemNS() const;
-
-    /**
-     * Given a NamespaceString for which isGloballyManagedNamespace() returns true, returns the
-     * namespace the command targets, or boost::none for commands like 'listCollections' which
-     * do not target a collection.
-     */
-    boost::optional<NamespaceString> getTargetNSForGloballyManagedNamespace() const;
 
     /**
      * Returns true if this namespace refers to a drop-pending collection.
@@ -335,12 +319,6 @@ public:
     Status checkLengthForRename(const std::string::size_type longestIndexNameLength) const;
 
     /**
-     * Given a NamespaceString for which isListIndexesCursorNS() returns true, returns the
-     * NamespaceString for the collection that the "listIndexes" targets.
-     */
-    NamespaceString getTargetNSForListIndexes() const;
-
-    /**
      * Returns true if the namespace is valid. Special namespaces for internal use are considered as
      * valid.
      */
@@ -356,6 +334,11 @@ public:
     NamespaceString getCommandNS() const {
         return {db(), "$cmd"};
     }
+
+    /**
+     * Returns index namespace for an index in this collection namespace.
+     */
+    NamespaceString makeIndexNamespace(StringData indexName) const;
 
     /**
      * @return true if ns is 'normal'.  A "$" is used for namespaces holding index data,
@@ -447,6 +430,11 @@ public:
     }
     friend bool operator>=(const NamespaceString& a, const NamespaceString& b) {
         return a.ns() >= b.ns();
+    }
+
+    template <typename H>
+    friend H AbslHashValue(H h, const NamespaceString& nss) {
+        return H::combine(std::move(h), nss._ns);
     }
 
 private:
@@ -612,13 +600,3 @@ inline bool NamespaceString::validCollectionName(StringData coll) {
 }
 
 }  // namespace mongo
-
-MONGO_HASH_NAMESPACE_START
-template <>
-struct hash<mongo::NamespaceString> {
-    size_t operator()(const mongo::NamespaceString& nss) const {
-        mongo::NamespaceString::Hasher hasher;
-        return hasher(nss);
-    }
-};
-MONGO_HASH_NAMESPACE_END

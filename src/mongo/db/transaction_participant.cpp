@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -176,8 +175,11 @@ ActiveTransactionHistory fetchActiveTransactionHistory(OperationContext* opCtx,
                                            entry.getOpTime());
             }
 
-            // applyOps oplog entry marks the commit of a transaction.
-            if (entry.getCommandType() == repl::OplogEntry::CommandType::kApplyOps) {
+            // Either an applyOps oplog entry without a prepare flag or the state being kCommitted
+            // marks the commit of a transaction.
+            if ((entry.getCommandType() == repl::OplogEntry::CommandType::kApplyOps &&
+                 !entry.shouldPrepare()) ||
+                (result.lastTxnRecord->getState() == DurableTxnStateEnum::kCommitted)) {
                 result.transactionCommitted = true;
             }
         } catch (const DBException& ex) {
@@ -216,7 +218,7 @@ void updateSessionEntry(OperationContext* opCtx, const UpdateRequest& updateRequ
                           << NamespaceString::kSessionTransactionsTableNamespace.ns(),
             idIndex);
 
-    auto indexAccess = collection->getIndexCatalog()->getIndex(idIndex);
+    auto indexAccess = collection->getIndexCatalog()->getEntry(idIndex)->accessMethod();
     // Since we are looking up a key inside the _id index, create a key object consisting of only
     // the _id field.
     auto idToFetch = updateRequest.getQuery().firstElement();
@@ -281,22 +283,33 @@ MONGO_FAIL_POINT_DEFINE(onPrimaryTransactionalWrite);
 
 const BSONObj TransactionParticipant::kDeadEndSentinel(BSON("$incompleteOplogHistory" << 1));
 
+TransactionParticipant::TransactionParticipant() = default;
+
+TransactionParticipant::~TransactionParticipant() = default;
+
 TransactionParticipant* TransactionParticipant::get(OperationContext* opCtx) {
     auto session = OperationContextSession::get(opCtx);
     if (!session) {
         return nullptr;
     }
 
-    return &getTransactionParticipant(session);
+    return get(session);
 }
 
-TransactionParticipant* TransactionParticipant::getFromNonCheckedOutSession(Session* session) {
+TransactionParticipant* TransactionParticipant::get(Session* session) {
     return &getTransactionParticipant(session);
 }
 
 const LogicalSessionId& TransactionParticipant::_sessionId() const {
     const auto* owningSession = getTransactionParticipant.owner(this);
     return owningSession->getSessionId();
+}
+
+OperationContext* TransactionParticipant::_opCtx() const {
+    const auto* owningSession = getTransactionParticipant.owner(this);
+    auto* opCtx = owningSession->currentOperation_forTest();
+    invariant(opCtx);
+    return opCtx;
 }
 
 void TransactionParticipant::_beginOrContinueRetryableWrite(WithLock wl, TxnNumber txnNumber) {
@@ -355,7 +368,7 @@ void TransactionParticipant::_beginMultiDocumentTransaction(WithLock wl, TxnNumb
     auto now = getGlobalServiceContext()->getPreciseClockSource()->now();
     auto tickSource = getGlobalServiceContext()->getTickSource();
 
-    _transactionExpireDate = now + stdx::chrono::seconds{transactionLifetimeLimitSeconds.load()};
+    _transactionExpireDate = now + Seconds(transactionLifetimeLimitSeconds.load());
 
     {
         stdx::lock_guard<stdx::mutex> lm(_metricsMutex);
@@ -418,11 +431,8 @@ void TransactionParticipant::beginOrContinue(TxnNumber txnNumber,
         // The active transaction number can only be reused if the transaction is not in a state
         // that indicates it has been involved in a two phase commit. In normal operation this check
         // should never fail.
-        //
-        // TODO SERVER-36639: Ensure the active transaction number cannot be reused if the
-        // transaction is in the abort after prepare state (or any state indicating the participant
-        // has been involved in a two phase commit).
-        const auto restartableStates = TransactionState::kInProgress | TransactionState::kAborted;
+        const auto restartableStates =
+            TransactionState::kInProgress | TransactionState::kAbortedWithoutPrepare;
         uassert(50911,
                 str::stream() << "Cannot start a transaction at given transaction number "
                               << txnNumber
@@ -461,6 +471,20 @@ void TransactionParticipant::_setSpeculativeTransactionOpTime(
     _speculativeTransactionReadOpTime = {readTimestamp, replCoord->getTerm()};
     stdx::lock_guard<stdx::mutex> lm(_metricsMutex);
     _transactionMetricsObserver.onChooseReadTimestamp(readTimestamp);
+}
+
+void TransactionParticipant::_setSpeculativeTransactionReadTimestamp(WithLock,
+                                                                     OperationContext* opCtx,
+                                                                     Timestamp timestamp) {
+    // Read concern code should have already set the timestamp on the recovery unit.
+    invariant(timestamp == opCtx->recoveryUnit()->getPointInTimeReadTimestamp());
+
+    repl::ReplicationCoordinator* replCoord =
+        repl::ReplicationCoordinator::get(opCtx->getClient()->getServiceContext());
+    opCtx->recoveryUnit()->preallocateSnapshot();
+    _speculativeTransactionReadOpTime = {timestamp, replCoord->getTerm()};
+    stdx::lock_guard<stdx::mutex> lm(_metricsMutex);
+    _transactionMetricsObserver.onChooseReadTimestamp(timestamp);
 }
 
 TransactionParticipant::OplogSlotReserver::OplogSlotReserver(OperationContext* opCtx) {
@@ -513,7 +537,7 @@ TransactionParticipant::OplogSlotReserver::~OplogSlotReserver() {
     }
 }
 
-TransactionParticipant::TxnResources::TxnResources(OperationContext* opCtx, bool keepTicket) {
+TransactionParticipant::TxnResources::TxnResources(OperationContext* opCtx, StashStyle stashStyle) {
     // We must lock the Client to change the Locker on the OperationContext.
     stdx::lock_guard<Client> lk(*opCtx->getClient());
 
@@ -524,13 +548,13 @@ TransactionParticipant::TxnResources::TxnResources(OperationContext* opCtx, bool
     // Inherit the locking setting from the original one.
     opCtx->lockState()->setShouldConflictWithSecondaryBatchApplication(
         _locker->shouldConflictWithSecondaryBatchApplication());
-    if (!keepTicket) {
+    if (stashStyle != StashStyle::kSideTransaction) {
         _locker->releaseTicket();
     }
     _locker->unsetThreadId();
 
     // On secondaries, we yield the locks for transactions.
-    if (!opCtx->writesAreReplicated()) {
+    if (stashStyle == StashStyle::kSecondary) {
         _lockSnapshot = std::make_unique<Locker::LockSnapshot>();
         _locker->releaseWriteUnitOfWork(_lockSnapshot.get());
     }
@@ -538,12 +562,12 @@ TransactionParticipant::TxnResources::TxnResources(OperationContext* opCtx, bool
     // This thread must still respect the transaction lock timeout, since it can prevent the
     // transaction from making progress.
     auto maxTransactionLockMillis = maxTransactionLockRequestTimeoutMillis.load();
-    if (opCtx->writesAreReplicated() && maxTransactionLockMillis >= 0) {
+    if (stashStyle != StashStyle::kSecondary && maxTransactionLockMillis >= 0) {
         opCtx->lockState()->setMaxLockTimeout(Milliseconds(maxTransactionLockMillis));
     }
 
     // On secondaries, max lock timeout must not be set.
-    invariant(opCtx->writesAreReplicated() || !opCtx->lockState()->hasMaxLockTimeout());
+    invariant(stashStyle != StashStyle::kSecondary || !opCtx->lockState()->hasMaxLockTimeout());
 
     _recoveryUnit = opCtx->releaseRecoveryUnit();
     opCtx->setRecoveryUnit(std::unique_ptr<RecoveryUnit>(
@@ -605,7 +629,8 @@ void TransactionParticipant::TxnResources::release(OperationContext* opCtx) {
 TransactionParticipant::SideTransactionBlock::SideTransactionBlock(OperationContext* opCtx)
     : _opCtx(opCtx) {
     if (_opCtx->getWriteUnitOfWork()) {
-        _txnResources = TransactionParticipant::TxnResources(_opCtx, true /* keepTicket*/);
+        _txnResources = TransactionParticipant::TxnResources(
+            _opCtx, TxnResources::StashStyle::kSideTransaction);
     }
 }
 
@@ -626,11 +651,15 @@ void TransactionParticipant::_stashActiveTransaction(WithLock, OperationContext*
         auto tickSource = opCtx->getServiceContext()->getTickSource();
         _transactionMetricsObserver.onStash(ServerTransactionsMetrics::get(opCtx), tickSource);
         _transactionMetricsObserver.onTransactionOperation(
-            opCtx->getClient(), CurOp::get(opCtx)->debug().additiveMetrics);
+            opCtx->getClient(),
+            CurOp::get(opCtx)->debug().additiveMetrics,
+            CurOp::get(opCtx)->debug().storageStats);
     }
 
     invariant(!_txnResourceStash);
-    _txnResourceStash = TxnResources(opCtx);
+    auto stashStyle = opCtx->writesAreReplicated() ? TxnResources::StashStyle::kPrimary
+                                                   : TxnResources::StashStyle::kSecondary;
+    _txnResourceStash = TxnResources(opCtx, stashStyle);
 }
 
 
@@ -643,7 +672,7 @@ void TransactionParticipant::stashTransactionResources(OperationContext* opCtx) 
     stdx::unique_lock<stdx::mutex> lg(_mutex);
 
     // Always check session's txnNumber, since it can be modified by migration, which does not
-    // check out the session. We intentionally do not error if _txnState=kAborted, since we
+    // check out the session. We intentionally do not error if the transaction is aborted, since we
     // expect this function to be called at the end of the 'abortTransaction' command.
     _checkIsActiveTransaction(lg, *opCtx->getTxnNumber(), false);
 
@@ -657,17 +686,13 @@ void TransactionParticipant::stashTransactionResources(OperationContext* opCtx) 
 
 void TransactionParticipant::unstashTransactionResources(OperationContext* opCtx,
                                                          const std::string& cmdName) {
-    if (opCtx->getClient()->isInDirectClient()) {
-        return;
-    }
-
+    invariant(!opCtx->getClient()->isInDirectClient());
     invariant(opCtx->getTxnNumber());
 
     {
         stdx::lock_guard<stdx::mutex> lg(_mutex);
 
-        // Always check session's txnNumber and '_txnState', since they can be modified by session
-        // kill and migration, which do not check out the session.
+        _checkValid(lg);
         _checkIsActiveTransaction(lg, *opCtx->getTxnNumber(), false);
 
         // If this is not a multi-document transaction, there is nothing to unstash.
@@ -676,15 +701,11 @@ void TransactionParticipant::unstashTransactionResources(OperationContext* opCtx
             return;
         }
 
-        _checkIsCommandValidWithTxnState(lg, opCtx, cmdName);
+        _checkIsCommandValidWithTxnState(lg, *opCtx->getTxnNumber(), cmdName);
 
         if (_txnResourceStash) {
             // Transaction resources already exist for this transaction.  Transfer them from the
             // stash to the operation context.
-            auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
-            uassert(ErrorCodes::InvalidOptions,
-                    "Only the first command in a transaction may specify a readConcern",
-                    readConcernArgs.isEmpty());
             _txnResourceStash->release(opCtx);
             _txnResourceStash = boost::none;
             stdx::lock_guard<stdx::mutex> lm(_metricsMutex);
@@ -696,25 +717,11 @@ void TransactionParticipant::unstashTransactionResources(OperationContext* opCtx
         // If we have no transaction resources then we cannot be prepared. If we're not in progress,
         // we don't do anything else.
         invariant(!_txnState.isPrepared(lg));
+
         if (!_txnState.isInProgress(lg)) {
             // At this point we're either committed and this is a 'commitTransaction' command, or we
             // are in the process of committing.
             return;
-        }
-
-        // Set speculative execution.
-        const auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
-        const bool speculative =
-            readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern &&
-            !readConcernArgs.getArgsAtClusterTime();
-        // Only set speculative on primary.
-        if (opCtx->writesAreReplicated() && speculative) {
-            _setSpeculativeTransactionOpTime(lg,
-                                             opCtx,
-                                             readConcernArgs.getOriginalLevel() ==
-                                                     repl::ReadConcernLevel::kSnapshotReadConcern
-                                                 ? SpeculativeTransactionOpTime::kAllCommitted
-                                                 : SpeculativeTransactionOpTime::kLastApplied);
         }
 
         // All locks of transactions must be acquired inside the global WUOW so that we can
@@ -748,7 +755,35 @@ void TransactionParticipant::unstashTransactionResources(OperationContext* opCtx
     // exclusive lock here because we might be doing writes in this transaction, and it is currently
     // not deadlock-safe to upgrade IS to IX.
     Lock::GlobalLock(opCtx, MODE_IX);
-    opCtx->recoveryUnit()->preallocateSnapshot();
+
+    {
+        // Set speculative execution.  This must be done after the global lock is acquired, because
+        // we need to check that we are primary.
+        stdx::lock_guard<stdx::mutex> lg(_mutex);
+        const auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
+        // TODO(SERVER-38203): We cannot wait for write concern on secondaries, so we do not set the
+        // speculative optime on secondaries either.  This means that reads done in transactions on
+        // secondaries will not wait for the read snapshot to become majority-committed.
+        repl::ReplicationCoordinator* replCoord =
+            repl::ReplicationCoordinator::get(opCtx->getClient()->getServiceContext());
+        if (replCoord->canAcceptWritesForDatabase(
+                opCtx, NamespaceString::kSessionTransactionsTableNamespace.db())) {
+            if (readConcernArgs.getArgsAtClusterTime()) {
+                _setSpeculativeTransactionReadTimestamp(
+                    lg, opCtx, readConcernArgs.getArgsAtClusterTime()->asTimestamp());
+            } else {
+                _setSpeculativeTransactionOpTime(
+                    lg,
+                    opCtx,
+                    readConcernArgs.getOriginalLevel() ==
+                            repl::ReadConcernLevel::kSnapshotReadConcern
+                        ? SpeculativeTransactionOpTime::kAllCommitted
+                        : SpeculativeTransactionOpTime::kLastApplied);
+            }
+        } else {
+            opCtx->recoveryUnit()->preallocateSnapshot();
+        }
+    }
 
     // The Client lock must not be held when executing this failpoint as it will block currentOp
     // execution.
@@ -765,6 +800,28 @@ void TransactionParticipant::unstashTransactionResources(OperationContext* opCtx
     }
 }
 
+void TransactionParticipant::refreshLocksForPreparedTransaction(OperationContext* opCtx,
+                                                                bool yieldLocks) {
+    // The opCtx will be used to swap locks, so it cannot hold any lock.
+    invariant(!opCtx->lockState()->isRSTLLocked());
+    invariant(!opCtx->lockState()->isLocked());
+
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
+
+    // The node must have txn resource.
+    invariant(_txnResourceStash);
+    invariant(_txnState.isPrepared(lk));
+
+    // Transfer the txn resource from the stash to the operation context.
+    _txnResourceStash->release(opCtx);
+    _txnResourceStash = boost::none;
+
+    // Transfer the txn resource back from the operation context to the stash.
+    auto stashStyle =
+        yieldLocks ? TxnResources::StashStyle::kSecondary : TxnResources::StashStyle::kPrimary;
+    _txnResourceStash = TxnResources(opCtx, stashStyle);
+}
+
 Timestamp TransactionParticipant::prepareTransaction(OperationContext* opCtx,
                                                      boost::optional<repl::OpTime> prepareOptime) {
     stdx::unique_lock<stdx::mutex> lk(_mutex);
@@ -773,7 +830,7 @@ Timestamp TransactionParticipant::prepareTransaction(OperationContext* opCtx,
     // session kill and migration, which do not check out the session.
     _checkIsActiveTransaction(lk, *opCtx->getTxnNumber(), true);
 
-    ScopeGuard abortGuard = MakeGuard([&] {
+    auto abortGuard = makeGuard([&] {
         // Prepare transaction on secondaries should always succeed.
         invariant(!prepareOptime);
 
@@ -831,7 +888,7 @@ Timestamp TransactionParticipant::prepareTransaction(OperationContext* opCtx,
     lk.unlock();
     opCtx->getServiceContext()->getOpObserver()->onTransactionPrepare(opCtx, prepareOplogSlot);
 
-    abortGuard.Dismiss();
+    abortGuard.dismiss();
 
     invariant(!_oldestOplogEntryOpTime,
               str::stream() << "This transaction's oldest oplog entry Timestamp has already "
@@ -856,6 +913,12 @@ Timestamp TransactionParticipant::prepareTransaction(OperationContext* opCtx,
                  "until fail point is disabled.";
         MONGO_FAIL_POINT_PAUSE_WHILE_SET(hangAfterSettingPrepareStartTime);
     }
+
+    // We unlock the RSTL to allow prepared transactions to survive state transitions. This should
+    // be the last thing we do since a state transition may happen immediately after releasing the
+    // RSTL.
+    const bool unlocked = opCtx->lockState()->unlockRSTLforPrepare();
+    invariant(unlocked);
 
     return prepareOplogSlot.opTime.getTimestamp();
 }
@@ -945,6 +1008,17 @@ void TransactionParticipant::commitUnpreparedTransaction(OperationContext* opCtx
 
 void TransactionParticipant::commitPreparedTransaction(OperationContext* opCtx,
                                                        Timestamp commitTimestamp) {
+    // Re-acquire the RSTL to prevent state transitions while committing the transaction. When the
+    // transaction was prepared, we dropped the RSTL. We do not need to reacquire the PBWM because
+    // if we're not the primary we will uassert anyways.
+    Lock::ResourceLock rstl(opCtx->lockState(), resourceIdReplicationStateTransitionLock, MODE_IX);
+    if (opCtx->writesAreReplicated()) {
+        auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+        uassert(ErrorCodes::NotMaster,
+                "Not primary so we cannot commit a prepared transaction",
+                replCoord->canAcceptWritesForDatabase(opCtx, "admin"));
+    }
+
     stdx::unique_lock<stdx::mutex> lk(_mutex);
     _checkIsActiveTransaction(lk, *opCtx->getTxnNumber(), true);
 
@@ -1009,6 +1083,7 @@ void TransactionParticipant::commitPreparedTransaction(OperationContext* opCtx,
 
 void TransactionParticipant::_commitStorageTransaction(OperationContext* opCtx) try {
     invariant(opCtx->getWriteUnitOfWork());
+    invariant(opCtx->lockState()->isRSTLLocked());
     opCtx->getWriteUnitOfWork()->commit();
     opCtx->setWriteUnitOfWork(nullptr);
 
@@ -1049,12 +1124,14 @@ void TransactionParticipant::_finishCommitTransaction(WithLock lk, OperationCont
                                              &Top::get(getGlobalServiceContext()),
                                              isCommittingWithPrepare);
         _transactionMetricsObserver.onTransactionOperation(
-            opCtx->getClient(), CurOp::get(opCtx)->debug().additiveMetrics);
+            opCtx->getClient(),
+            CurOp::get(opCtx)->debug().additiveMetrics,
+            CurOp::get(opCtx)->debug().storageStats);
     }
 
     // We must clear the recovery unit and locker so any post-transaction writes can run without
     // transactional settings such as a read timestamp.
-    _cleanUpTxnResourceOnOpCtx(lk, opCtx, TransactionState::kCommitted);
+    _cleanUpTxnResourceOnOpCtx(lk, opCtx, TerminationCause::kCommitted);
 }
 
 void TransactionParticipant::shutdown() {
@@ -1085,6 +1162,18 @@ bool TransactionParticipant::expired() const {
 
 void TransactionParticipant::abortActiveTransaction(OperationContext* opCtx) {
     stdx::unique_lock<stdx::mutex> lock(_mutex);
+
+    // Re-acquire the RSTL to prevent state transitions while aborting the transaction. If the
+    // transaction was prepared then we dropped it on preparing the transaction. We do not need to
+    // reacquire the PBWM because if we're not the primary we will uassert anyways.
+    Lock::ResourceLock rstl(opCtx->lockState(), resourceIdReplicationStateTransitionLock, MODE_IX);
+    if (_txnState.isPrepared(lock) && opCtx->writesAreReplicated()) {
+        auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+        uassert(ErrorCodes::NotMaster,
+                "Not primary so we cannot abort a prepared transaction",
+                replCoord->canAcceptWritesForDatabase(opCtx, "admin"));
+    }
+
     // This function shouldn't throw if the transaction is already aborted.
     _checkIsActiveTransaction(lock, *opCtx->getTxnNumber(), false);
     _abortActiveTransaction(
@@ -1133,7 +1222,9 @@ void TransactionParticipant::_abortActiveTransaction(stdx::unique_lock<stdx::mut
     if (!_txnState.isNone(lock)) {
         stdx::lock_guard<stdx::mutex> lm(_metricsMutex);
         _transactionMetricsObserver.onTransactionOperation(
-            opCtx->getClient(), CurOp::get(opCtx)->debug().additiveMetrics);
+            opCtx->getClient(),
+            CurOp::get(opCtx)->debug().additiveMetrics,
+            CurOp::get(opCtx)->debug().storageStats);
     }
 
     // We reserve an oplog slot before aborting the transaction so that no writes that are causally
@@ -1149,16 +1240,18 @@ void TransactionParticipant::_abortActiveTransaction(stdx::unique_lock<stdx::mut
 
     // Clean up the transaction resources on the opCtx even if the transaction resources on the
     // session were not aborted. This actually aborts the storage-transaction.
-    _cleanUpTxnResourceOnOpCtx(lock, opCtx, TransactionState::kAborted);
+    _cleanUpTxnResourceOnOpCtx(lock, opCtx, TerminationCause::kAborted);
 
     // Write the abort oplog entry. This must be done after aborting the storage transaction, so
     // that the lock state is reset, and there is no max lock timeout on the locker. We need to
     // unlock the session to run the opObserver onTransactionAbort, which calls back into the
     // session.
     lock.unlock();
+
     auto opObserver = opCtx->getServiceContext()->getOpObserver();
     invariant(opObserver);
     opObserver->onTransactionAbort(opCtx, abortOplogSlot);
+
     lock.lock();
     // We do not check if the active transaction number is correct here because we handle it below.
 
@@ -1190,7 +1283,10 @@ void TransactionParticipant::_abortActiveTransaction(stdx::unique_lock<stdx::mut
                   str::stream() << "Cannot abort transaction in " << _txnState.toString());
     } else {
         // If _activeTxnNumber is higher than ours, it means the transaction is already aborted.
-        invariant(_txnState.isInSet(lock, TransactionState::kNone | TransactionState::kAborted));
+        invariant(_txnState.isInSet(lock,
+                                    TransactionState::kNone |
+                                        TransactionState::kAbortedWithoutPrepare |
+                                        TransactionState::kAbortedWithPrepare));
     }
 }
 
@@ -1209,9 +1305,8 @@ void TransactionParticipant::_abortTransactionOnSession(WithLock wl) {
         }
         _logSlowTransaction(wl,
                             &(_txnResourceStash->locker()->getLockerInfo(boost::none))->stats,
-                            TransactionState::kAborted,
+                            TerminationCause::kAborted,
                             _txnResourceStash->getReadConcernArgs());
-        _txnResourceStash = boost::none;
     } else {
         stdx::lock_guard<stdx::mutex> lm(_metricsMutex);
         _transactionMetricsObserver.onAbortActive(
@@ -1223,17 +1318,14 @@ void TransactionParticipant::_abortTransactionOnSession(WithLock wl) {
             _txnState.isPrepared(lm));
     }
 
-    _transactionOperationBytes = 0;
-    _transactionOperations.clear();
-    _txnState.transitionTo(wl, TransactionState::kAborted);
-    _prepareOpTime = repl::OpTime();
-    _oldestOplogEntryOpTime = boost::none;
-    _finishOpTime = boost::none;
-    _speculativeTransactionReadOpTime = repl::OpTime();
+    const auto nextState = _txnState.isPrepared(wl) ? TransactionState::kAbortedWithPrepare
+                                                    : TransactionState::kAbortedWithoutPrepare;
+    _resetTransactionState(wl, nextState);
 }
 
-void TransactionParticipant::_cleanUpTxnResourceOnOpCtx(
-    WithLock wl, OperationContext* opCtx, TransactionState::StateFlag terminationCause) {
+void TransactionParticipant::_cleanUpTxnResourceOnOpCtx(WithLock wl,
+                                                        OperationContext* opCtx,
+                                                        TerminationCause terminationCause) {
     // Log the transaction if its duration is longer than the slowMS command threshold.
     _logSlowTransaction(
         wl,
@@ -1243,6 +1335,7 @@ void TransactionParticipant::_cleanUpTxnResourceOnOpCtx(
 
     // Reset the WUOW. We should be able to abort empty transactions that don't have WUOW.
     if (opCtx->getWriteUnitOfWork()) {
+        invariant(opCtx->lockState()->isRSTLLocked());
         opCtx->setWriteUnitOfWork(nullptr);
     }
 
@@ -1274,17 +1367,17 @@ void TransactionParticipant::_checkIsActiveTransaction(WithLock wl,
 }
 
 void TransactionParticipant::_checkIsCommandValidWithTxnState(WithLock wl,
-                                                              OperationContext* opCtx,
+                                                              const TxnNumber& requestTxnNumber,
                                                               const std::string& cmdName) {
     // Throw NoSuchTransaction error instead of TransactionAborted error since this is the entry
     // point of transaction execution.
     uassert(ErrorCodes::NoSuchTransaction,
-            str::stream() << "Transaction " << *opCtx->getTxnNumber() << " has been aborted.",
+            str::stream() << "Transaction " << requestTxnNumber << " has been aborted.",
             !_txnState.isAborted(wl));
 
     // Cannot change committed transaction but allow retrying commitTransaction command.
     uassert(ErrorCodes::TransactionCommitted,
-            str::stream() << "Transaction " << *opCtx->getTxnNumber() << " has been committed.",
+            str::stream() << "Transaction " << requestTxnNumber << " has been committed.",
             cmdName == "commitTransaction" || !_txnState.isCommitted(wl));
 
     // Disallow operations other than abort, prepare or commit on a prepared transaction
@@ -1338,13 +1431,12 @@ void TransactionParticipant::reportStashedState(BSONObjBuilder* builder) const {
 
 void TransactionParticipant::reportUnstashedState(OperationContext* opCtx,
                                                   BSONObjBuilder* builder) const {
-    stdx::lock_guard<stdx::mutex> lm(_metricsMutex);
-
     // This method may only take the metrics mutex, as it is called with the Client mutex held.  So
     // we cannot check the stashed state directly.  Instead, a transaction is considered unstashed
     // if it is not actually a transaction (retryable write, no stash used), or is active (not
     // stashed), or has ended (any stash would be cleared).
 
+    stdx::lock_guard<stdx::mutex> lm(_metricsMutex);
     const auto& singleTransactionStats = _transactionMetricsObserver.getSingleTransactionStats();
     if (!singleTransactionStats.isForMultiDocumentTransaction() ||
         singleTransactionStats.isActive() || singleTransactionStats.isEnded()) {
@@ -1368,8 +1460,10 @@ std::string TransactionParticipant::TransactionState::toString(StateFlag state) 
             return "TxnState::CommittingWithPrepare";
         case TransactionParticipant::TransactionState::kCommitted:
             return "TxnState::Committed";
-        case TransactionParticipant::TransactionState::kAborted:
-            return "TxnState::Aborted";
+        case TransactionParticipant::TransactionState::kAbortedWithoutPrepare:
+            return "TxnState::AbortedWithoutPrepare";
+        case TransactionParticipant::TransactionState::kAbortedWithPrepare:
+            return "TxnState::AbortedAfterPrepare";
     }
     MONGO_UNREACHABLE;
 }
@@ -1391,7 +1485,7 @@ bool TransactionParticipant::TransactionState::_isLegalTransition(StateFlag oldS
                 case kNone:
                 case kPrepared:
                 case kCommittingWithoutPrepare:
-                case kAborted:
+                case kAbortedWithoutPrepare:
                     return true;
                 default:
                     return false;
@@ -1400,18 +1494,25 @@ bool TransactionParticipant::TransactionState::_isLegalTransition(StateFlag oldS
         case kPrepared:
             switch (newState) {
                 case kCommittingWithPrepare:
-                case kAborted:
+                case kAbortedWithPrepare:
                     return true;
                 default:
                     return false;
             }
             MONGO_UNREACHABLE;
         case kCommittingWithPrepare:
+            switch (newState) {
+                case kCommitted:
+                    return true;
+                default:
+                    return false;
+            }
+            MONGO_UNREACHABLE;
         case kCommittingWithoutPrepare:
             switch (newState) {
                 case kNone:
                 case kCommitted:
-                case kAborted:
+                case kAbortedWithoutPrepare:
                     return true;
                 default:
                     return false;
@@ -1420,16 +1521,23 @@ bool TransactionParticipant::TransactionState::_isLegalTransition(StateFlag oldS
         case kCommitted:
             switch (newState) {
                 case kNone:
+                    return true;
+                default:
+                    return false;
+            }
+            MONGO_UNREACHABLE;
+        case kAbortedWithoutPrepare:
+            switch (newState) {
+                case kNone:
                 case kInProgress:
                     return true;
                 default:
                     return false;
             }
             MONGO_UNREACHABLE;
-        case kAborted:
+        case kAbortedWithPrepare:
             switch (newState) {
                 case kNone:
-                case kInProgress:
                     return true;
                 default:
                     return false;
@@ -1455,18 +1563,16 @@ void TransactionParticipant::TransactionState::transitionTo(WithLock,
 void TransactionParticipant::_reportTransactionStats(WithLock wl,
                                                      BSONObjBuilder* builder,
                                                      repl::ReadConcernArgs readConcernArgs) const {
-    auto tickSource = getGlobalServiceContext()->getTickSource();
+    const auto tickSource = getGlobalServiceContext()->getTickSource();
     _transactionMetricsObserver.getSingleTransactionStats().report(
         builder, readConcernArgs, tickSource, tickSource->getTicks());
 }
 
 std::string TransactionParticipant::_transactionInfoForLog(
     const SingleThreadedLockStats* lockStats,
-    TransactionState::StateFlag terminationCause,
-    repl::ReadConcernArgs readConcernArgs) {
+    TerminationCause terminationCause,
+    repl::ReadConcernArgs readConcernArgs) const {
     invariant(lockStats);
-    invariant(terminationCause == TransactionState::kCommitted ||
-              terminationCause == TransactionState::kAborted);
 
     StringBuilder s;
 
@@ -1485,12 +1591,12 @@ std::string TransactionParticipant::_transactionInfoForLog(
 
     s << " readTimestamp:" << _speculativeTransactionReadOpTime.getTimestamp().toString() << ",";
 
-    auto singleTransactionStats = _transactionMetricsObserver.getSingleTransactionStats();
+    const auto& singleTransactionStats = _transactionMetricsObserver.getSingleTransactionStats();
 
     s << singleTransactionStats.getOpDebug()->additiveMetrics.report();
 
     std::string terminationCauseString =
-        terminationCause == TransactionState::kCommitted ? "committed" : "aborted";
+        terminationCause == TerminationCause::kCommitted ? "committed" : "aborted";
     s << " terminationCause:" << terminationCauseString;
 
     auto tickSource = getGlobalServiceContext()->getTickSource();
@@ -1512,6 +1618,9 @@ std::string TransactionParticipant::_transactionInfoForLog(
     lockStats->report(&locks);
     s << " locks:" << locks.obj().toString();
 
+    if (singleTransactionStats.getOpDebug()->storageStats)
+        s << " storage:" << singleTransactionStats.getOpDebug()->storageStats->toBSON().toString();
+
     // Total duration of the transaction.
     s << " "
       << duration_cast<Milliseconds>(singleTransactionStats.getDuration(tickSource, curTick));
@@ -1531,11 +1640,11 @@ std::string TransactionParticipant::_transactionInfoForLog(
 
 void TransactionParticipant::_logSlowTransaction(WithLock wl,
                                                  const SingleThreadedLockStats* lockStats,
-                                                 TransactionState::StateFlag terminationCause,
+                                                 TerminationCause terminationCause,
                                                  repl::ReadConcernArgs readConcernArgs) {
     // Only log multi-document transactions.
     if (!_txnState.isNone(wl)) {
-        auto tickSource = getGlobalServiceContext()->getTickSource();
+        const auto tickSource = getGlobalServiceContext()->getTickSource();
         // Log the transaction if its duration is longer than the slowMS command threshold.
         if (_transactionMetricsObserver.getSingleTransactionStats().getDuration(
                 tickSource, tickSource->getTicks()) > Milliseconds(serverGlobalParams.slowMS)) {
@@ -1561,64 +1670,48 @@ void TransactionParticipant::_setNewTxnNumber(WithLock wl, const TxnNumber& txnN
     }
 
     _activeTxnNumber = txnNumber;
+    _lastWriteOpTime = repl::OpTime();
 
     // Reset the retryable writes state
-    _activeTxnCommittedStatements.clear();
-    _hasIncompleteHistory = false;
+    _resetRetryableWriteState(wl);
 
     // Reset the transactional state
-    _txnState.transitionTo(wl, TransactionState::kNone);
-    _prepareOpTime = repl::OpTime();
-    _oldestOplogEntryOpTime = boost::none;
-    _finishOpTime = boost::none;
-    _speculativeTransactionReadOpTime = repl::OpTime();
-    _multikeyPathInfo.clear();
-    _autoCommit = boost::none;
+    _resetTransactionState(wl, TransactionState::kNone);
 
     // Reset the transactions metrics
     stdx::lock_guard<stdx::mutex> lm(_metricsMutex);
     _transactionMetricsObserver.resetSingleTransactionStats(txnNumber);
 }
 
-void TransactionParticipant::refreshFromStorageIfNeeded(OperationContext* opCtx) {
-    if (opCtx->getClient()->isInDirectClient()) {
-        return;
-    }
-
+void TransactionParticipant::refreshFromStorageIfNeeded() {
+    const auto opCtx = _opCtx();
+    invariant(!opCtx->getClient()->isInDirectClient());
     invariant(!opCtx->lockState()->isLocked());
 
-    stdx::unique_lock<stdx::mutex> ul(_mutex);
+    if (_isValid)
+        return;
 
-    while (!_isValid) {
-        const int numInvalidations = _numInvalidations;
+    auto activeTxnHistory = fetchActiveTransactionHistory(opCtx, _sessionId());
 
-        ul.unlock();
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
 
-        auto activeTxnHistory = fetchActiveTransactionHistory(opCtx, _sessionId());
+    const auto& lastTxnRecord = activeTxnHistory.lastTxnRecord;
 
-        ul.lock();
+    if (lastTxnRecord) {
+        _activeTxnNumber = lastTxnRecord->getTxnNum();
+        _lastWriteOpTime = lastTxnRecord->getLastWriteOpTime();
+        _activeTxnCommittedStatements = std::move(activeTxnHistory.committedStatements);
+        _hasIncompleteHistory = activeTxnHistory.hasIncompleteHistory;
 
-        // Protect against concurrent refreshes or invalidations
-        if (!_isValid && _numInvalidations == numInvalidations) {
-            _isValid = true;
-            _lastWrittenSessionRecord = std::move(activeTxnHistory.lastTxnRecord);
-
-            if (_lastWrittenSessionRecord) {
-                _activeTxnNumber = _lastWrittenSessionRecord->getTxnNum();
-                _activeTxnCommittedStatements = std::move(activeTxnHistory.committedStatements);
-                _hasIncompleteHistory = activeTxnHistory.hasIncompleteHistory;
-
-                if (activeTxnHistory.transactionCommitted) {
-                    _txnState.transitionTo(
-                        ul,
-                        TransactionState::kCommitted,
-                        TransactionState::TransitionValidation::kRelaxTransitionValidation);
-                }
-            }
-
-            break;
+        if (activeTxnHistory.transactionCommitted) {
+            _txnState.transitionTo(
+                lg,
+                TransactionState::kCommitted,
+                TransactionState::TransitionValidation::kRelaxTransitionValidation);
         }
     }
+
+    _isValid = true;
 }
 
 void TransactionParticipant::onWriteOpCompletedOnPrimary(
@@ -1629,12 +1722,13 @@ void TransactionParticipant::onWriteOpCompletedOnPrimary(
     Date_t lastStmtIdWriteDate,
     boost::optional<DurableTxnStateEnum> txnState) {
     invariant(opCtx->lockState()->inAWriteUnitOfWork());
+    invariant(txnNumber == _activeTxnNumber);
 
     stdx::unique_lock<stdx::mutex> ul(_mutex);
 
     // Sanity check that we don't double-execute statements
     for (const auto stmtId : stmtIdsWritten) {
-        const auto stmtOpTime = _checkStatementExecuted(ul, txnNumber, stmtId);
+        const auto stmtOpTime = _checkStatementExecuted(stmtId);
         if (stmtOpTime) {
             fassertOnRepeatedExecution(
                 _sessionId(), txnNumber, stmtId, *stmtOpTime, lastStmtIdWriteOpTime);
@@ -1642,40 +1736,14 @@ void TransactionParticipant::onWriteOpCompletedOnPrimary(
     }
 
     const auto updateRequest =
-        _makeUpdateRequest(ul, txnNumber, lastStmtIdWriteOpTime, lastStmtIdWriteDate, txnState);
+        _makeUpdateRequest(lastStmtIdWriteOpTime, lastStmtIdWriteDate, txnState);
 
     ul.unlock();
 
     repl::UnreplicatedWritesBlock doNotReplicateWrites(opCtx);
 
     updateSessionEntry(opCtx, updateRequest);
-    _registerUpdateCacheOnCommit(
-        opCtx, txnNumber, std::move(stmtIdsWritten), lastStmtIdWriteOpTime);
-}
-
-bool TransactionParticipant::onMigrateBeginOnPrimary(OperationContext* opCtx,
-                                                     TxnNumber txnNumber,
-                                                     StmtId stmtId) {
-    beginOrContinue(txnNumber, boost::none, boost::none);
-
-    try {
-        if (checkStatementExecuted(opCtx, txnNumber, stmtId)) {
-            return false;
-        }
-    } catch (const DBException& ex) {
-        // If the transaction chain was truncated on the recipient shard, then we
-        // are most likely copying from a session that hasn't been touched on the
-        // recipient shard for a very long time but could be recent on the donor.
-        // We continue copying regardless to get the entire transaction from the donor.
-        if (ex.code() != ErrorCodes::IncompleteTransactionHistory) {
-            throw;
-        }
-        if (stmtId == kIncompleteHistoryStmtId) {
-            return false;
-        }
-    }
-
-    return true;
+    _registerUpdateCacheOnCommit(std::move(stmtIdsWritten), lastStmtIdWriteOpTime);
 }
 
 void TransactionParticipant::onMigrateCompletedOnPrimary(OperationContext* opCtx,
@@ -1684,24 +1752,64 @@ void TransactionParticipant::onMigrateCompletedOnPrimary(OperationContext* opCtx
                                                          const repl::OpTime& lastStmtIdWriteOpTime,
                                                          Date_t oplogLastStmtIdWriteDate) {
     invariant(opCtx->lockState()->inAWriteUnitOfWork());
+    invariant(txnNumber == _activeTxnNumber);
 
     stdx::unique_lock<stdx::mutex> ul(_mutex);
 
     _checkValid(ul);
     _checkIsActiveTransaction(ul, txnNumber);
 
-    // We do not migrate transaction oplog entries.
-    auto txnState = boost::none;
-    const auto updateRequest = _makeUpdateRequest(
-        ul, txnNumber, lastStmtIdWriteOpTime, oplogLastStmtIdWriteDate, txnState);
+    // We do not migrate transaction oplog entries so don't set the txn state
+    const auto txnState = boost::none;
+    const auto updateRequest =
+        _makeUpdateRequest(lastStmtIdWriteOpTime, oplogLastStmtIdWriteDate, txnState);
 
     ul.unlock();
 
     repl::UnreplicatedWritesBlock doNotReplicateWrites(opCtx);
 
     updateSessionEntry(opCtx, updateRequest);
-    _registerUpdateCacheOnCommit(
-        opCtx, txnNumber, std::move(stmtIdsWritten), lastStmtIdWriteOpTime);
+    _registerUpdateCacheOnCommit(std::move(stmtIdsWritten), lastStmtIdWriteOpTime);
+}
+
+void TransactionParticipant::_invalidate(WithLock) {
+    _isValid = false;
+    _activeTxnNumber = kUninitializedTxnNumber;
+    _lastWriteOpTime = repl::OpTime();
+
+    // Reset the transactions metrics.
+    stdx::lock_guard<stdx::mutex> lm(_metricsMutex);
+    _transactionMetricsObserver.resetSingleTransactionStats(_activeTxnNumber);
+}
+
+void TransactionParticipant::_resetRetryableWriteState(WithLock) {
+    _activeTxnCommittedStatements.clear();
+    _hasIncompleteHistory = false;
+}
+
+void TransactionParticipant::_resetTransactionState(WithLock wl,
+                                                    TransactionState::StateFlag state) {
+    // If we are transitioning to kNone, we are either starting a new transaction or aborting a
+    // prepared transaction for rollback. In the latter case, we will need to relax the invariant
+    // that prevents transitioning from kPrepared to kNone.
+    if (_txnState.isPrepared(wl) && state == TransactionState::kNone) {
+        _txnState.transitionTo(
+            wl, state, TransactionState::TransitionValidation::kRelaxTransitionValidation);
+    } else {
+        _txnState.transitionTo(wl, state);
+    }
+
+    _transactionOperationBytes = 0;
+    _transactionOperations.clear();
+    _prepareOpTime = repl::OpTime();
+    _oldestOplogEntryOpTime = boost::none;
+    _finishOpTime = boost::none;
+    _speculativeTransactionReadOpTime = repl::OpTime();
+    _multikeyPathInfo.clear();
+    _autoCommit = boost::none;
+
+    // Release any locks held by this participant and abort the storage transaction.
+    _txnResourceStash = boost::none;
 }
 
 void TransactionParticipant::invalidate() {
@@ -1712,40 +1820,48 @@ void TransactionParticipant::invalidate() {
             !_txnState.isInSet(
                 lg, TransactionState::kPrepared | TransactionState::kCommittingWithPrepare));
 
-    _isValid = false;
-    _numInvalidations++;
-
-    _lastWrittenSessionRecord.reset();
-
-    _activeTxnNumber = kUninitializedTxnNumber;
-    _activeTxnCommittedStatements.clear();
-    _hasIncompleteHistory = false;
+    // Invalidate the session and clear both the retryable writes and transactional states on
+    // this participant.
+    _invalidate(lg);
+    _resetRetryableWriteState(lg);
+    _resetTransactionState(lg, TransactionState::kNone);
 }
 
-repl::OpTime TransactionParticipant::getLastWriteOpTime(TxnNumber txnNumber) const {
+void TransactionParticipant::abortPreparedTransactionForRollback() {
     stdx::lock_guard<stdx::mutex> lg(_mutex);
-    _checkValid(lg);
-    _checkIsActiveTransaction(lg, txnNumber);
 
-    if (!_lastWrittenSessionRecord || _lastWrittenSessionRecord->getTxnNum() != txnNumber)
-        return {};
+    // Invalidate the session.
+    _invalidate(lg);
 
-    return _lastWrittenSessionRecord->getLastWriteOpTime();
+    uassert(51030,
+            str::stream() << "Cannot call abortPreparedTransactionForRollback on unprepared "
+                          << "transaction.",
+            _txnState.isPrepared(lg));
+
+    // It should be safe to clear transactionOperationBytes and transactionOperations because
+    // we only modify these variables when adding an operation to a transaction. Since this
+    // transaction is already prepared, we cannot add more operations to it. We will have this
+    // in the prepare oplog entry.
+    // Both _finishOpTime and _oldestOplogEntryOpTime will be reset to boost::none. With a
+    // prepared transaction, the latter is the same as the prepareOpTime.
+    _resetTransactionState(lg, TransactionState::kNone);
+}
+
+repl::OpTime TransactionParticipant::getLastWriteOpTime() const {
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    return _lastWriteOpTime;
 }
 
 boost::optional<repl::OplogEntry> TransactionParticipant::checkStatementExecuted(
-    OperationContext* opCtx, TxnNumber txnNumber, StmtId stmtId) const {
-    const auto stmtTimestamp = [&] {
-        stdx::lock_guard<stdx::mutex> lg(_mutex);
-        return _checkStatementExecuted(lg, txnNumber, stmtId);
-    }();
+    StmtId stmtId) const {
+    const auto stmtTimestamp = _checkStatementExecuted(stmtId);
 
     if (!stmtTimestamp)
         return boost::none;
 
     TransactionHistoryIterator txnIter(*stmtTimestamp);
     while (txnIter.hasNext()) {
-        const auto entry = txnIter.next(opCtx);
+        const auto entry = txnIter.next(_opCtx());
         invariant(entry.getStatementId());
         if (*entry.getStatementId() == stmtId)
             return entry;
@@ -1754,10 +1870,8 @@ boost::optional<repl::OplogEntry> TransactionParticipant::checkStatementExecuted
     MONGO_UNREACHABLE;
 }
 
-bool TransactionParticipant::checkStatementExecutedNoOplogEntryFetch(TxnNumber txnNumber,
-                                                                     StmtId stmtId) const {
-    stdx::lock_guard<stdx::mutex> lg(_mutex);
-    return bool(_checkStatementExecuted(lg, txnNumber, stmtId));
+bool TransactionParticipant::checkStatementExecutedNoOplogEntryFetch(StmtId stmtId) const {
+    return bool(_checkStatementExecuted(stmtId));
 }
 
 void TransactionParticipant::_checkValid(WithLock) const {
@@ -1778,16 +1892,13 @@ void TransactionParticipant::_checkIsActiveTransaction(WithLock, TxnNumber txnNu
             txnNumber == _activeTxnNumber);
 }
 
-boost::optional<repl::OpTime> TransactionParticipant::_checkStatementExecuted(WithLock wl,
-                                                                              TxnNumber txnNumber,
-                                                                              StmtId stmtId) const {
-    _checkValid(wl);
-    _checkIsActiveTransaction(wl, txnNumber);
+boost::optional<repl::OpTime> TransactionParticipant::_checkStatementExecuted(StmtId stmtId) const {
+    invariant(_isValid);
 
     const auto it = _activeTxnCommittedStatements.find(stmtId);
     if (it == _activeTxnCommittedStatements.end()) {
         uassert(ErrorCodes::IncompleteTransactionHistory,
-                str::stream() << "Incomplete history detected for transaction " << txnNumber
+                str::stream() << "Incomplete history detected for transaction " << _activeTxnNumber
                               << " on session "
                               << _sessionId(),
                 !_hasIncompleteHistory);
@@ -1795,25 +1906,10 @@ boost::optional<repl::OpTime> TransactionParticipant::_checkStatementExecuted(Wi
         return boost::none;
     }
 
-    invariant(_lastWrittenSessionRecord);
-    invariant(_lastWrittenSessionRecord->getTxnNum() == txnNumber);
-
     return it->second;
 }
 
-Date_t TransactionParticipant::_getLastWriteDate(WithLock wl, TxnNumber txnNumber) const {
-    _checkValid(wl);
-    _checkIsActiveTransaction(wl, txnNumber);
-
-    if (!_lastWrittenSessionRecord || _lastWrittenSessionRecord->getTxnNum() != txnNumber)
-        return {};
-
-    return _lastWrittenSessionRecord->getLastWriteDate();
-}
-
 UpdateRequest TransactionParticipant::_makeUpdateRequest(
-    WithLock,
-    TxnNumber newTxnNumber,
     const repl::OpTime& newLastWriteOpTime,
     Date_t newLastWriteDate,
     boost::optional<DurableTxnStateEnum> newState) const {
@@ -1822,7 +1918,7 @@ UpdateRequest TransactionParticipant::_makeUpdateRequest(
     const auto updateBSON = [&] {
         SessionTxnRecord newTxnRecord;
         newTxnRecord.setSessionId(_sessionId());
-        newTxnRecord.setTxnNum(newTxnNumber);
+        newTxnRecord.setTxnNum(_activeTxnNumber);
         newTxnRecord.setLastWriteOpTime(newLastWriteOpTime);
         newTxnRecord.setLastWriteDate(newLastWriteDate);
         newTxnRecord.setState(newState);
@@ -1836,63 +1932,36 @@ UpdateRequest TransactionParticipant::_makeUpdateRequest(
 }
 
 void TransactionParticipant::_registerUpdateCacheOnCommit(
-    OperationContext* opCtx,
-    TxnNumber newTxnNumber,
-    std::vector<StmtId> stmtIdsWritten,
-    const repl::OpTime& lastStmtIdWriteOpTime) {
-    opCtx->recoveryUnit()->onCommit(
-        [ this, newTxnNumber, stmtIdsWritten = std::move(stmtIdsWritten), lastStmtIdWriteOpTime ](
+    std::vector<StmtId> stmtIdsWritten, const repl::OpTime& lastStmtIdWriteOpTime) {
+    _opCtx()->recoveryUnit()->onCommit(
+        [ this, stmtIdsWritten = std::move(stmtIdsWritten), lastStmtIdWriteOpTime ](
             boost::optional<Timestamp>) {
+            invariant(_isValid);
+
             RetryableWritesStats::get(getGlobalServiceContext())
                 ->incrementTransactionsCollectionWriteCount();
 
             stdx::lock_guard<stdx::mutex> lg(_mutex);
 
-            if (!_isValid)
-                return;
-
             // The cache of the last written record must always be advanced after a write so that
             // subsequent writes have the correct point to start from.
-            if (!_lastWrittenSessionRecord) {
-                _lastWrittenSessionRecord.emplace();
+            _lastWriteOpTime = lastStmtIdWriteOpTime;
 
-                _lastWrittenSessionRecord->setSessionId(_sessionId());
-                _lastWrittenSessionRecord->setTxnNum(newTxnNumber);
-                _lastWrittenSessionRecord->setLastWriteOpTime(lastStmtIdWriteOpTime);
-            } else {
-                if (newTxnNumber > _lastWrittenSessionRecord->getTxnNum())
-                    _lastWrittenSessionRecord->setTxnNum(newTxnNumber);
+            for (const auto stmtId : stmtIdsWritten) {
+                if (stmtId == kIncompleteHistoryStmtId) {
+                    _hasIncompleteHistory = true;
+                    continue;
+                }
 
-                if (lastStmtIdWriteOpTime > _lastWrittenSessionRecord->getLastWriteOpTime())
-                    _lastWrittenSessionRecord->setLastWriteOpTime(lastStmtIdWriteOpTime);
-            }
-
-            if (newTxnNumber > _activeTxnNumber) {
-                // This call is necessary in order to advance the txn number and reset the cached
-                // state in the case where just before the storage transaction commits, the cache
-                // entry gets invalidated and immediately refreshed while there were no writes for
-                // newTxnNumber yet. In this case _activeTxnNumber will be less than newTxnNumber
-                // and we will fail to update the cache even though the write was successful.
-                _beginOrContinueRetryableWrite(lg, newTxnNumber);
-            }
-
-            if (newTxnNumber == _activeTxnNumber) {
-                for (const auto stmtId : stmtIdsWritten) {
-                    if (stmtId == kIncompleteHistoryStmtId) {
-                        _hasIncompleteHistory = true;
-                        continue;
-                    }
-
-                    const auto insertRes =
-                        _activeTxnCommittedStatements.emplace(stmtId, lastStmtIdWriteOpTime);
-                    if (!insertRes.second) {
-                        const auto& existingOpTime = insertRes.first->second;
-                        fassertOnRepeatedExecution(_sessionId(),
-                                                   newTxnNumber,
-                                                   stmtId,
-                                                   existingOpTime,
-                                                   lastStmtIdWriteOpTime);
-                    }
+                const auto insertRes =
+                    _activeTxnCommittedStatements.emplace(stmtId, lastStmtIdWriteOpTime);
+                if (!insertRes.second) {
+                    const auto& existingOpTime = insertRes.first->second;
+                    fassertOnRepeatedExecution(_sessionId(),
+                                               _activeTxnNumber,
+                                               stmtId,
+                                               existingOpTime,
+                                               lastStmtIdWriteOpTime);
                 }
             }
         });
@@ -1902,14 +1971,15 @@ void TransactionParticipant::_registerUpdateCacheOnCommit(
 
         const auto closeConnectionElem = data["closeConnection"];
         if (closeConnectionElem.eoo() || closeConnectionElem.Bool()) {
-            opCtx->getClient()->session()->end();
+            _opCtx()->getClient()->session()->end();
         }
 
         const auto failBeforeCommitExceptionElem = data["failBeforeCommitExceptionCode"];
         if (!failBeforeCommitExceptionElem.eoo()) {
             const auto failureCode = ErrorCodes::Error(int(failBeforeCommitExceptionElem.Number()));
             uasserted(failureCode,
-                      str::stream() << "Failing write for " << _sessionId() << ":" << newTxnNumber
+                      str::stream() << "Failing write for " << _sessionId() << ":"
+                                    << _activeTxnNumber
                                     << " due to failpoint. The write must not be reflected.");
         }
     }

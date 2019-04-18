@@ -33,7 +33,6 @@
 #include <memory>
 
 #include "mongo/db/catalog/multi_index_block.h"
-#include "mongo/db/catalog/multi_index_block_impl.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/wildcard_access_method.h"
 #include "mongo/db/repl/storage_interface_impl.h"
@@ -195,7 +194,7 @@ protected:
         AutoGetCollection autoColl(opCtx(), nss, MODE_X);
         auto coll = autoColl.getCollection();
 
-        MultiIndexBlockImpl indexer(opCtx(), coll);
+        MultiIndexBlock indexer(opCtx(), coll);
         indexer.allowBackgroundBuilding();
         indexer.allowInterruption();
 
@@ -221,8 +220,10 @@ protected:
         return collection->getIndexCatalog()->findIndexByName(opCtx(), indexName);
     }
 
-    IndexAccessMethod* getIndex(Collection* collection, const StringData indexName) {
-        return collection->getIndexCatalog()->getIndex(getIndexDesc(collection, indexName));
+    const IndexAccessMethod* getIndex(Collection* collection, const StringData indexName) {
+        return collection->getIndexCatalog()
+            ->getEntry(getIndexDesc(collection, indexName))
+            ->accessMethod();
     }
 
     std::unique_ptr<SortedDataInterface::Cursor> getIndexCursor(Collection* collection,

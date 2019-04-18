@@ -75,6 +75,7 @@ CollectionShardingRuntime::CollectionShardingRuntime(ServiceContext* sc,
                                                      NamespaceString nss,
                                                      executor::TaskExecutor* rangeDeleterExecutor)
     : CollectionShardingState(nss),
+      _stateChangeMutex(nss.toString()),
       _nss(std::move(nss)),
       _metadataManager(std::make_shared<MetadataManager>(sc, _nss, rangeDeleterExecutor)) {
     if (isNamespaceAlwaysUnsharded(_nss)) {
@@ -113,8 +114,8 @@ void CollectionShardingRuntime::forgetReceive(const ChunkRange& range) {
 
 auto CollectionShardingRuntime::cleanUpRange(ChunkRange const& range, CleanWhen when)
     -> CleanupNotification {
-    Date_t time = (when == kNow) ? Date_t{} : Date_t::now() +
-            stdx::chrono::seconds{orphanCleanupDelaySecs.load()};
+    Date_t time =
+        (when == kNow) ? Date_t{} : Date_t::now() + Seconds(orphanCleanupDelaySecs.load());
     return _metadataManager->cleanUpRange(range, time);
 }
 
@@ -178,6 +179,26 @@ boost::optional<ChunkRange> CollectionShardingRuntime::getNextOrphanRange(BSONOb
 boost::optional<ScopedCollectionMetadata> CollectionShardingRuntime::_getMetadata(
     const boost::optional<mongo::LogicalTime>& atClusterTime) {
     return _metadataManager->getActiveMetadata(_metadataManager, atClusterTime);
+}
+
+CollectionShardingRuntimeLock::CollectionShardingRuntimeLock(OperationContext* opCtx,
+                                                             CollectionShardingRuntime* csr,
+                                                             LockMode lockMode)
+    : _lock([&]() -> CSRLock {
+          invariant(lockMode == MODE_IS || lockMode == MODE_X);
+          return (lockMode == MODE_IS
+                      ? CSRLock(Lock::SharedLock(opCtx->lockState(), csr->_stateChangeMutex))
+                      : CSRLock(Lock::ExclusiveLock(opCtx->lockState(), csr->_stateChangeMutex)));
+      }()) {}
+
+CollectionShardingRuntimeLock CollectionShardingRuntimeLock::lock(OperationContext* opCtx,
+                                                                  CollectionShardingRuntime* csr) {
+    return CollectionShardingRuntimeLock(opCtx, csr, MODE_IS);
+}
+
+CollectionShardingRuntimeLock CollectionShardingRuntimeLock::lockExclusive(
+    OperationContext* opCtx, CollectionShardingRuntime* csr) {
+    return CollectionShardingRuntimeLock(opCtx, csr, MODE_X);
 }
 
 CollectionCriticalSection::CollectionCriticalSection(OperationContext* opCtx, NamespaceString ns)
