@@ -674,12 +674,12 @@ build_tarball(){
     #scons --prefix=$PWD/$PSMDIR install
     #
     mkdir -p ${PSMDIR}/bin
-    if [ ${DEBUG} = 0 ]; then
     for target in ${PSM_TARGETS[@]}; do
         cp -f $target ${PSMDIR}/bin
-        strip --strip-debug ${PSMDIR}/bin/${target}
+        if [ ${DEBUG} = 0 ]; then
+            strip --strip-debug ${PSMDIR}/bin/${target}
+        fi
     done
-    fi
     #
     cd ${WORKDIR}
     #
