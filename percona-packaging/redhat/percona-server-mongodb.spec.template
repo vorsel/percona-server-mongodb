@@ -1,13 +1,13 @@
 #
 %define         mongo_home /var/lib/mongo
 #
-Name:           Percona-Server-MongoDB-36
+Name:           percona-server-mongodb
 Version:        @@VERSION@@
 Release:        @@RELEASE@@%{?dist}
 Summary:        High-performance MongoDB replacement from Percona (metapackage)
 Group:          Applications/Databases
 
-License:        AGPL
+License:        AGPL 3.0
 URL:            https://github.com/percona/percona-server-mongodb.git
 Source0:        @@SOURCE_TARBALL@@
 Source1:        mongod.conf
@@ -53,7 +53,8 @@ Requires: %{name}-shell = %{version}-%{release}
 Requires: %{name}-tools = %{version}-%{release}
 Requires: numactl
 
-Conflicts: Percona-Server-MongoDB Percona-Server-MongoDB-32 Percona-Server-MongoDB-34 mongodb-org
+Conflicts: Percona-Server-MongoDB < 4.0.0
+Conflicts: Percona-Server-MongoDB-32 Percona-Server-MongoDB-34 Percona-Server-MongoDB-36 mongodb-org
 
 %description
 This package contains high-performance MongoDB replacement from Percona - Percona Server for MongoDB.
@@ -79,7 +80,7 @@ Group:          Applications/Databases
 Summary:        Percona Server for MongoDB sharded cluster query router
 %description mongos
 This package contains mongos - the Percona Server for MongoDB sharded cluster query router
-Conflicts: Percona-Server-MongoDB-mongos Percona-Server-MongoDB-32-mongos Percona-Server-MongoDB-34-mongos mongodb-org-mongos
+Conflicts: Percona-Server-MongoDB-mongos Percona-Server-MongoDB-32-mongos Percona-Server-MongoDB-34-mongos Percona-Server-MongoDB-36-mongos mongodb-org-mongos
 
 %package server
 Group:          Applications/Databases
@@ -88,21 +89,21 @@ Requires: policycoreutils
 Requires: %{name}-shell = %{version}-%{release}
 %description server
 This package contains the Percona Server for MongoDB server software, default configuration files and init.d scripts
-Conflicts: Percona-Server-MongoDB-server Percona-Server-MongoDB-32-server Percona-Server-MongoDB-34-server mongodb-org-server
+Conflicts: Percona-Server-MongoDB-server Percona-Server-MongoDB-32-server Percona-Server-MongoDB-34-server Percona-Server-MongoDB-36-server mongodb-org-server
 
 %package shell
 Group:          Applications/Databases
 Summary:        Percona Server for MongoDB shell client
 %description shell
 This package contains the Percona Server for MongoDB shell
-Conflicts: Percona-Server-MongoDB-shell Percona-Server-MongoDB-32-shell Percona-Server-MongoDB-34-shell mongodb-org-shell
+Conflicts: Percona-Server-MongoDB-shell Percona-Server-MongoDB-32-shell Percona-Server-MongoDB-34-shell Percona-Server-MongoDB-36-shell mongodb-org-shell
 
 %package tools
 Group:          Applications/Databases
 Summary:        The tools package for Percona Server for MongoDB
 %description tools
 This package contains various tools from MongoDB project, recompiled for Percona Server for MongoDB
-Conflicts: Percona-Server-MongoDB-tools Percona-Server-MongoDB-32-tools Percona-Server-MongoDB-34-tools mongodb-org-tools
+Conflicts: Percona-Server-MongoDB-tools Percona-Server-MongoDB-32-tools Percona-Server-MongoDB-34-tools Percona-Server-MongoDB-36-tools mongodb-org-tools
 
 %prep
 
@@ -112,39 +113,42 @@ Conflicts: Percona-Server-MongoDB-tools Percona-Server-MongoDB-32-tools Percona-
 
 export CC=${CC:-gcc}
 export CXX=${CXX:-g++}
-export PSM_TARGETS="mongod mongos mongo"
+export PSM_TARGETS="mongod mongos mongo perconadecrypt"
 export INSTALLDIR=$RPM_BUILD_DIR/install
 export TOOLS_TAGS="ssl sasl"
 export PORTABLE=1
 export USE_SSE=1
 export PATH=/usr/local/go/bin:$PATH
 
-# RocksDB
-pushd $RPM_BUILD_DIR/%{src_dir}/src/third_party/rocksdb
-make -j4 EXTRA_CFLAGS='-fPIC -DLZ4 -I../lz4-r131 -DSNAPPY -I../snappy-1.1.3 -DHAVE_SSE42' EXTRA_CXXFLAGS='-fPIC -DLZ4 -I../lz4-r131 -DSNAPPY -I../snappy-1.1.3 -DHAVE_SSE42' DISABLE_JEMALLOC=1 static_lib
-rm -rf ${INSTALLDIR}
-mkdir -p ${INSTALLDIR}/include
-mkdir -p ${INSTALLDIR}/bin
-mkdir -p ${INSTALLDIR}/lib
-make install-static INSTALL_PATH=${INSTALLDIR}
-popd
+export PATH=/usr/local/go/bin:${PATH}
+export GOROOT="/usr/local/go/"
+export GOPATH=$(pwd)/
+export PATH="/usr/local/go/bin:$PATH:$GOPATH"
+export GOBINPATH="/usr/local/go/bin"
 
 # Build PSfMDB with SCons
 pushd $RPM_BUILD_DIR/%{src_dir}
 buildscripts/scons.py CC=${CC} CXX=${CXX} --audit --release --ssl --opt=on  \
 %{?_smp_mflags} --use-sasl-client CPPPATH=${INSTALLDIR}/include LIBPATH=${INSTALLDIR}/lib \
---rocksdb --wiredtiger --inmemory --hotbackup ${PSM_TARGETS}
+--wiredtiger --inmemory --hotbackup ${PSM_TARGETS}
 popd
 
 # Mongo Tools compilation
 pushd $RPM_BUILD_DIR/%{src_dir}/mongo-tools
-. ./set_gopath.sh
-. ./set_tools_revision.sh
-rm -rf $RPM_BUILD_DIR/%{src_dir}/mongo-tools/vendor/pkg
+mkdir -p build_tools/src/github.com/mongodb/mongo-tools
 mkdir -p $RPM_BUILD_DIR/%{src_dir}/bin
-for tool in bsondump mongostat mongofiles mongoexport mongoimport mongorestore mongodump mongotop mongoreplay; do
-  go build -a -x -o $RPM_BUILD_DIR/%{src_dir}/bin/${tool} -ldflags "-X github.com/mongodb/mongo-tools/common/options.Gitspec=${PSMDB_TOOLS_COMMIT_HASH} -X github.com/mongodb/mongo-tools/common/options.VersionStr=${PSMDB_TOOLS_REVISION}" -tags "${TOOLS_TAGS}" $RPM_BUILD_DIR/%{src_dir}/mongo-tools/${tool}/main/${tool}.go
-done
+cp -r $(ls | grep -v build_tools) build_tools/src/github.com/mongodb/mongo-tools/
+pushd build_tools/src/github.com/mongodb/mongo-tools
+sed -i 's|VersionStr="$(git describe)"|VersionStr="$PSMDB_TOOLS_REVISION"|' set_goenv.sh
+sed -i 's|Gitspec="$(git rev-parse HEAD)"|Gitspec="$PSMDB_TOOLS_COMMIT_HASH"|' set_goenv.sh
+sed -i 's|go build|go build -a -x|' build.sh
+sed -i 's|exit $ec||' build.sh
+. ./set_tools_revision.sh
+. ./set_goenv.sh
+mkdir -p bin
+. ./build.sh ${TOOLS_TAGS}
+mv bin/* $RPM_BUILD_DIR/%{src_dir}/bin
+popd
 popd
 
 %install
@@ -182,6 +186,7 @@ install -m 755 %{SOURCE7} %{buildroot}/%{_bindir}/
 install -m 755 mongo %{buildroot}/%{_bindir}/
 install -m 755 mongod %{buildroot}/%{_bindir}/
 install -m 755 mongos %{buildroot}/%{_bindir}/
+install -m 755 perconadecrypt %{buildroot}/%{_bindir}/
 
 install -m 755 $RPM_BUILD_DIR/%{src_dir}/bin/* %{buildroot}/%{_bindir}/
 
@@ -197,6 +202,7 @@ install -m 644 $RPM_BUILD_DIR/%{src_dir}/manpages/* %{buildroot}/%{_mandir}/man1
 %files server
 %defattr(-,root,root,-)
 %{_bindir}/mongod
+%{_bindir}/perconadecrypt
 %{_mandir}/man1/mongod.1.gz
 %{_bindir}/percona-server-mongodb-helper.sh
 %{_bindir}/percona-server-mongodb-enable-auth.sh
@@ -362,5 +368,5 @@ fi
 #
 %changelog
 
-* Fri Dec 15 2017 Evgeniy Patlan <evgeniy.patlan@percona.com> 3.6
+* Wed Nov 21 2018 Evgeniy Patlan <evgeniy.patlan@percona.com> 4.0
 - Initial RPM release for Percona Server for MongoDB

@@ -3,7 +3,7 @@
 export DH_VERBOSE=1
 export DEB_BUILD_HARDENING=1
 export NJOBS=$(shell grep -c processor /proc/cpuinfo)
-export PSM_TARGETS=mongod mongos mongo
+export PSM_TARGETS=mongod mongos mongo perconadecrypt
 export PSMSRC=$(CURDIR)
 export MONGOTOOLS=bsondump mongostat mongofiles mongoexport mongoimport mongorestore mongodump mongotop mongoreplay
 export INSTALLDIR=$(PSMSRC)/install
@@ -21,54 +21,50 @@ override_dh_auto_clean:
 	dh_auto_clean
 	rm -fr $(PSMSRC)/bin
 	rm -fr $(INSTALLDIR)
-	buildscripts/scons.py CC=$(CC) CXX=$(CXX) -C $(PSMSRC) -c --audit --release --ssl --opt -j$(NJOBS) --use-sasl-client CPPPATH=$(INSTALLDIR)/include \
-	LIBPATH=$(INSTALLDIR)/lib --rocksdb --wiredtiger --inmemory --hotbackup $(PSM_TARGETS)
+	buildscripts/scons.py CC=$(CC) CXX=$(CXX) -C $(PSMSRC) -c --disable-warnings-as-errors --audit --release --ssl --opt -j$(NJOBS) --use-sasl-client CPPPATH=$(INSTALLDIR)/include \
+	LIBPATH=$(INSTALLDIR)/lib --wiredtiger --inmemory --hotbackup $(PSM_TARGETS)
 	rm -fr build
 	find $(PSMSRC) -name '*.pyc' -delete
 
-RocksDB:
-	rm -rf ${INSTALLDIR}; \
-	mkdir -p ${INSTALLDIR}/include; \
-	mkdir -p ${INSTALLDIR}/bin; \
-	mkdir -p ${INSTALLDIR}/lib; \
-	cd $(PSMSRC)/src/third_party/rocksdb; \
-	make -j4 EXTRA_CFLAGS='-fPIC -DLZ4 -I../lz4-r131 -DSNAPPY -I../snappy-1.1.3 -DHAVE_SSE42' EXTRA_CXXFLAGS='-fPIC -DLZ4 -I../lz4-r131 -DSNAPPY -I../snappy-1.1.3 -DHAVE_SSE42' DISABLE_JEMALLOC=1 static_lib; \
-	make install-static INSTALL_PATH=${INSTALLDIR}
-
 # Finally PSfMDB
 percona-server-mongodb:
-	buildscripts/scons.py CC=${CC} CXX=${CXX} --audit --release --ssl --opt=on -j$(NJOBS) \
-	--use-sasl-client --wiredtiger --rocksdb --inmemory --hotbackup \
+	buildscripts/scons.py CC=${CC} CXX=${CXX} --disable-warnings-as-errors --audit --release --ssl --opt=on -j$(NJOBS) \
+	--use-sasl-client --wiredtiger --inmemory --hotbackup \
 	CPPPATH=${INSTALLDIR}/include LIBPATH=${INSTALLDIR}/lib ${PSM_TARGETS}
 
 compile-mongo-tools:
-	rm -rf $(PSMSRC)/mongo-tools/vendor/pkg
-	mkdir -p $(PSMSRC)/bin
-	for tool in $(MONGOTOOLS) ; do \
-		cd $(PSMSRC)/mongo-tools; \
-		export GOROOT="/usr/local/go/"; \
-		export GOPATH=$(pwd)/; \
-		export PATH="/usr/local/go/bin:$(PATH):$(GOPATH)"; \
-		export GOBINPATH="/usr/local/go/bin"; \
-		. ./set_gopath.sh; \
-		. ./set_tools_revision.sh; \
-		go build -a -x -o $(PSMSRC)/bin/$$tool -ldflags "-X github.com/mongodb/mongo-tools/common/options.Gitspec=$$PSMDB_TOOLS_COMMIT_HASH -X github.com/mongodb/mongo-tools/common/options.VersionStr=$$PSMDB_TOOLS_REVISION" -tags "$(TOOLS_TAGS)" $(PSMSRC)/mongo-tools/$$tool/main/$$tool.go; \
-	done
+	mkdir $(PSMSRC)/bin || true;
+	mkdir -p $(PSMSRC)/build_tools/src/github.com/mongodb/mongo-tools;
+	cp -r $(PSMSRC)/mongo-tools/* $(PSMSRC)/build_tools/src/github.com/mongodb/mongo-tools;
+	#mv $(PSMSRC)/build_tools $(PSMSRC)/mongo-tools/;
+	cp -r $(PSMSRC)/build_tools $(PSMSRC)/mongo-tools/;
+	cd $(PSMSRC)/mongo-tools/build_tools/src/github.com/mongodb/mongo-tools; \
+	export GOROOT="/usr/local/go/"; \
+	export GOPATH=$(PWD)/; \
+	export PATH="/usr/local/go/bin:$(PATH):$(GOPATH)"; \
+	export GOBINPATH="/usr/local/go/bin"; \
+	. ./set_tools_revision.sh; \
+	. ./set_goenv.sh; \
+	mkdir -p bin; \
+	bash -x ./build.sh ${TOOLS_TAGS};
+	cp -av $(PSMSRC)/mongo-tools/build_tools/src/github.com/mongodb/mongo-tools/bin/* $(PSMSRC)/bin; \
+	cd $(PSMSRC)/mongo-tools;
 
-build: RocksDB percona-server-mongodb compile-mongo-tools
+build: percona-server-mongodb compile-mongo-tools
 
 override_dh_auto_install:
 	dh_auto_install
-	cp -av mongos debian/percona-server-mongodb-36-mongos/usr/bin
-	cp -av mongo debian/percona-server-mongodb-36-shell/usr/bin
-	cp -av mongod debian/percona-server-mongodb-36-server/usr/bin
-	cp -av debian/percona-server-mongodb-helper.sh debian/percona-server-mongodb-36-server/usr/bin
-	cp -av debian/percona-server-mongodb-enable-auth.sh debian/percona-server-mongodb-36-server/usr/bin
-	cp -av debian/mongod.conf debian/percona-server-mongodb-36-server/etc/mongod.conf
-	cp -av $(PSMSRC)/bin/* debian/percona-server-mongodb-36-tools/usr/bin
+	cp -av mongos debian/percona-server-mongodb-mongos/usr/bin
+	cp -av mongo debian/percona-server-mongodb-shell/usr/bin
+	cp -av mongod debian/percona-server-mongodb-server/usr/bin
+	cp -av perconadecrypt debian/percona-server-mongodb-server/usr/bin
+	cp -av debian/percona-server-mongodb-helper.sh debian/percona-server-mongodb-server/usr/bin
+	cp -av debian/percona-server-mongodb-enable-auth.sh debian/percona-server-mongodb-server/usr/bin
+	cp -av debian/mongod.conf debian/percona-server-mongodb-server/etc/mongod.conf
+	cp -av $(PSMSRC)/bin/* debian/percona-server-mongodb-tools/usr/bin
 
 override_dh_strip:
-	dh_strip -a --dbg-package=percona-server-mongodb-36-dbg
+	dh_strip -a --dbg-package=percona-server-mongodb-dbg
 
 override_dh_installinit:
 	dh_installinit -a --name=mongod

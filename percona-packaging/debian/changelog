@@ -1,5 +1,5 @@
-percona-server-mongodb-36 (3.6.0) UNRELEASED; urgency=medium
+percona-server-mongodb (4.0.4) UNRELEASED; urgency=medium
 
   * Updated to next upstream release. (Closes: #RM-564)
 
- -- Evgeniy Patlan <evgeniy.Patlan@percona.com>  Fri, 15 Dec 2017 12:20:22 +0600
+ -- Evgeniy Patlan <evgeniy.Patlan@percona.com>  Wed, 21 Nov 2018 12:20:22 +0600
