@@ -88,6 +88,15 @@ if wiredtiger:
             '$BUILD_DIR/mongo/util/options_parser/options_parser',
             '$BUILD_DIR/mongo/db/storage/storage_repair_observer',
             ],
+        SYSLIBDEPS=[
+            # S3 and its dependencies
+            # order is important
+            'aws-cpp-sdk-s3',
+            'aws-cpp-sdk-core',
+            'aws-c-event-stream',
+            'aws-c-common',
+            'aws-checksums',
+            ]
         )
 
     wtEnv.Library(
