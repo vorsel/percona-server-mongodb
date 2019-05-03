@@ -81,6 +81,15 @@ if wiredtiger:
             # SERVER-31802 : remove this.
             '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
             ],
+        SYSLIBDEPS=[
+            # S3 and its dependencies
+            # order is important
+            'aws-cpp-sdk-s3',
+            'aws-cpp-sdk-core',
+            'aws-c-event-stream',
+            'aws-c-common',
+            'aws-checksums',
+            ]
         )
 
     wtEnv.Library(
