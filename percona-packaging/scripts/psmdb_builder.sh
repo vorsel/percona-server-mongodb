@@ -281,6 +281,7 @@ install_deps() {
       rm -fr /usr/local/gcc-5.4.0
       RHEL=$(rpm --eval %rhel)
       if [ x"$RHEL" = x6 ]; then
+        yum -y update
         yum -y install epel-release
         yum -y install rpmbuild rpm-build libpcap-devel gcc make cmake gcc-c++ openssl-devel
         yum -y install cyrus-sasl-devel snappy-devel zlib-devel bzip2-devel libpcap-devel
@@ -309,6 +310,10 @@ install_deps() {
 #
       install_golang
       install_gcc_54_centos
+      if [ x"$RHEL" = x6 ]; then
+          mv /usr/bin/as /usr/bin/as_back
+          ln -s /opt/percona-devtoolset/root/usr/bin/as /usr/bin/as
+      fi
     else
       export DEBIAN=$(lsb_release -sc)
       export ARCH=$(echo $(uname -m) | sed -e 's:i686:i386:g')
@@ -767,3 +772,8 @@ build_srpm
 build_source_deb
 build_rpm
 build_deb
+if [ x"$RHEL" = x6 ]; then
+    if [ -f "usr/bin/as_back" ]; then
+        mv /usr/bin/as_back /usr/bin/as
+    fi
+fi
