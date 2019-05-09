@@ -1006,6 +1006,13 @@ Status WiredTigerKVEngine::hotBackup(OperationContext* opCtx, const std::string&
         else
             return wtRCToStatus(ret);
     }
+    // We also need to backup storage engine metadata
+    {
+        const char* storageMetadata = "storage.bson";
+        fs::path srcFile{fs::path{_path} / storageMetadata};
+        fs::path destFile{destPath / storageMetadata};
+        filesList.emplace_back(srcFile, destFile, fs::file_size(srcFile));
+    }
 
     // Release global lock (if it was created)
     global.reset();
