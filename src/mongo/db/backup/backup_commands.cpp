@@ -113,15 +113,6 @@ bool CreateBackupCommand::errmsgRun(mongo::OperationContext* opCtx,
         return false;
     }
 
-    // Copy storage engine metadata.
-    try {
-        const char* storageMetadata = "storage.bson";
-        fs::path srcPath(mongo::storageGlobalParams.dbpath);
-        fs::copy_file(srcPath / storageMetadata, destPath / storageMetadata, fs::copy_option::none);
-    } catch (const fs::filesystem_error& ex) {
-        errmsg = ex.what();
-        return false;
-    }
     return true;
 }
 
