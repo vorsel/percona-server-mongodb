@@ -67,6 +67,10 @@ Status StorageEngineImpl::hotBackup(OperationContext* opCtx, const std::string& 
     return _engine->hotBackup(opCtx, path);
 }
 
+Status StorageEngineImpl::hotBackup(OperationContext* opCtx, const percona::S3BackupParameters& s3params) {
+    return _engine->hotBackup(opCtx, s3params);
+}
+
 void StorageEngineImpl::keydbDropDatabase(const std::string& db) {
     _engine->keydbDropDatabase(db);
 }
