@@ -90,6 +90,7 @@ using KVDatabaseCatalogEntryFactory = decltype(defaultDatabaseCatalogEntryFactor
 class KVStorageEngine final : public KVStorageEngineInterface, public StorageEngine {
     // percona::EngineExtension implementaion
     Status hotBackup(OperationContext* opCtx, const std::string& path) override;
+    Status hotBackup(OperationContext* opCtx, const percona::S3BackupParameters& s3params) override;
     void keydbDropDatabase(const std::string& db) override;
 
 public:

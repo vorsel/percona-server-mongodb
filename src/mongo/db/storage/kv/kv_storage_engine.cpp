@@ -86,6 +86,10 @@ Status KVStorageEngine::hotBackup(OperationContext* opCtx, const std::string& pa
     return _engine->hotBackup(opCtx, path);
 }
 
+Status KVStorageEngine::hotBackup(OperationContext* opCtx, const percona::S3BackupParameters& s3params) {
+    return _engine->hotBackup(opCtx, s3params);
+}
+
 void KVStorageEngine::keydbDropDatabase(const std::string& db) {
     _engine->keydbDropDatabase(db);
 }
