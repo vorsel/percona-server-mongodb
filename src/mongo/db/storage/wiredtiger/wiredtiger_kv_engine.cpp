@@ -53,6 +53,15 @@
 #include <boost/system/error_code.hpp>
 #include <valgrind/valgrind.h>
 
+#include <aws/core/Aws.h>
+#include <aws/core/auth/AWSCredentialsProvider.h>
+#include <aws/core/utils/logging/AWSLogging.h>
+#include <aws/core/utils/logging/FormattedLogSystem.h>
+#include <aws/s3/S3Client.h>
+#include <aws/s3/model/CreateBucketRequest.h>
+#include <aws/s3/model/ListObjectsRequest.h>
+#include <aws/s3/model/PutObjectRequest.h>
+
 #include "mongo/base/error_codes.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/bson/dotted_path_support.h"
@@ -1146,7 +1155,7 @@ static void copy_file_size(const boost::filesystem::path& srcFile, const boost::
     }
 }
 
-Status WiredTigerKVEngine::hotBackup(OperationContext* opCtx, const std::string& path) {
+Status WiredTigerKVEngine::_hotBackupPopulateLists(OperationContext* opCtx, const std::string& path, std::vector<DBTuple>& dbList, std::vector<FileTuple>& filesList) {
     // Nothing to backup for non-durable engine.
     if (!_durable) {
         return EngineExtension::hotBackup(opCtx, path);
@@ -1154,11 +1163,6 @@ Status WiredTigerKVEngine::hotBackup(OperationContext* opCtx, const std::string&
 
     namespace fs = boost::filesystem;
     int ret;
-
-    // srcPath, destPath, session, cursor
-    typedef std::tuple<fs::path, fs::path, std::shared_ptr<WiredTigerSession>, WT_CURSOR*> DBTuple;
-    // list of DBs to backup
-    std::vector<DBTuple> dbList;
 
     const char* journalDir = "journal";
     fs::path destPath{path};
@@ -1188,11 +1192,6 @@ Status WiredTigerKVEngine::hotBackup(OperationContext* opCtx, const std::string&
 
     // Open backup cursor for keyDB
     if (_encryptionKeyDB) {
-        try {
-            fs::create_directory(destPath / keydbDir);
-        } catch (const fs::filesystem_error& ex) {
-            return Status(ErrorCodes::InvalidPath, str::stream() << ex.what());
-        }
         auto session = std::make_shared<WiredTigerSession>(_encryptionKeyDB->getConnection());
         WT_SESSION* s = session->getSession();
         ret = s->log_flush(s, "sync=off");
@@ -1208,8 +1207,6 @@ Status WiredTigerKVEngine::hotBackup(OperationContext* opCtx, const std::string&
     }
 
     // Populate list of files to copy
-    typedef std::tuple<fs::path, fs::path, boost::uintmax_t> FileTuple;  // srcPath, destPath, filename, size to copy
-    std::vector<FileTuple> filesList;
     for (auto&& db : dbList) {
         fs::path srcPath = std::get<0>(db);
         fs::path destPath = std::get<1>(db);
@@ -1250,16 +1247,172 @@ Status WiredTigerKVEngine::hotBackup(OperationContext* opCtx, const std::string&
     // Release global lock (if it was created)
     global.reset();
 
-    // We assume destination dir exists
-    std::set<fs::path> existDirs{destPath};
+    return wtRCToStatus(ret);
+}
 
-    // WT-999: Create journal folder.
-    try {
-        fs::create_directory(destPath / journalDir);
-        existDirs.insert(destPath / journalDir);
-    } catch (const fs::filesystem_error& ex) {
-        return Status(ErrorCodes::InvalidPath, str::stream() << ex.what());
+// Define log redirector for AWS SDK
+namespace {
+
+class MongoLogSystem : public Aws::Utils::Logging::FormattedLogSystem
+{
+public:
+
+    using Base = FormattedLogSystem;
+
+    MongoLogSystem() :
+        Base(Aws::Utils::Logging::LogLevel::Info)
+    {}
+
+    virtual ~MongoLogSystem() {}
+
+protected:
+
+    virtual void ProcessFormattedStatement(Aws::String&& statement) override {
+        log() << statement;
     }
+};
+
+}
+
+//TODO: (15) consider replacing s3params with BSONObj and moving parse code from backup_commands.cpp
+Status WiredTigerKVEngine::hotBackup(OperationContext* opCtx, const percona::S3BackupParameters& s3params) {
+    // list of DBs to backup
+    std::vector<DBTuple> dbList;
+    // list of files to backup
+    std::vector<FileTuple> filesList;
+
+    auto status = _hotBackupPopulateLists(opCtx, s3params.path, dbList, filesList);
+    if (!status.isOK()) {
+        return status;
+    }
+
+    // stream files to S3-compatible storage
+    Aws::SDKOptions options;
+    Aws::InitAPI(options);
+    ON_BLOCK_EXIT([&] { Aws::ShutdownAPI(options); });
+    Aws::Utils::Logging::InitializeAWSLogging(Aws::MakeShared<MongoLogSystem>("AWS"));
+    ON_BLOCK_EXIT([&] { Aws::Utils::Logging::ShutdownAWSLogging(); });
+
+    Aws::Client::ClientConfiguration config;
+    config.endpointOverride = s3params.endpoint; // for example "127.0.0.1:9000"
+    config.scheme = Aws::Http::SchemeMapper::FromString(s3params.scheme.c_str());
+    if (!s3params.region.empty())
+        config.region = s3params.region;
+    // using ProfileConfigFileAWSCredentialsProvider to allow loading of non-default profile
+    auto credentialsProvider = s3params.profile.empty()
+        ? Aws::MakeShared<Aws::Auth::ProfileConfigFileAWSCredentialsProvider>("AWS", 1000 * 3600)
+        : Aws::MakeShared<Aws::Auth::ProfileConfigFileAWSCredentialsProvider>("AWS", s3params.profile.c_str(), 1000 * 3600);
+    Aws::S3::S3Client s3_client{credentialsProvider, config, Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never, s3params.useVirtualAddressing};
+
+    // check if bucket already exists and skip create if it does
+    bool bucketExists{false};
+    {
+        auto outcome = s3_client.ListBuckets();
+        if (!outcome.IsSuccess()) {
+            return Status(ErrorCodes::InternalError,
+                          str::stream() << "Cannot list buckets on storage server"
+                                        << " : " << outcome.GetError().GetExceptionName()
+                                        << " : " << outcome.GetError().GetMessage());
+        }
+        for (auto&& bucket : outcome.GetResult().GetBuckets()) {
+            if (bucket.GetName() == s3params.bucket) {
+                bucketExists = true;
+            }
+        }
+    }
+
+    // create bucket for the backup
+    if (!bucketExists) {
+        Aws::S3::Model::CreateBucketRequest request;
+        request.SetBucket(s3params.bucket);
+
+        auto outcome = s3_client.CreateBucket(request);
+        if (!outcome.IsSuccess()) {
+            return Status(ErrorCodes::InvalidPath,
+                          str::stream() << "Cannot create '" << s3params.bucket << "' bucket for the backup"
+                                        << " : " << outcome.GetError().GetExceptionName()
+                                        << " : " << outcome.GetError().GetMessage());
+        }
+        log() << "Successfully created bucket for backup: " << s3params.bucket;
+    }
+
+    // check if target location is empty, fail if not
+    if (bucketExists) {
+        Aws::S3::Model::ListObjectsRequest request;
+        request.SetBucket(s3params.bucket);
+        if (!s3params.path.empty())
+            request.SetPrefix(s3params.path);
+
+        auto outcome = s3_client.ListObjects(request);
+        if (!outcome.IsSuccess()) {
+            return Status(ErrorCodes::InvalidPath,
+                          str::stream() << "Cannot list objects in the target location"
+                                        << " : " << outcome.GetError().GetExceptionName()
+                                        << " : " << outcome.GetError().GetMessage());
+        }
+        const auto root = s3params.path + '/';
+        Aws::Vector<Aws::S3::Model::Object> object_list = outcome.GetResult().GetContents();
+        for (auto const &s3_object : object_list) {
+            if (s3_object.GetKey() != root) {
+                return Status(ErrorCodes::InvalidPath,
+                              str::stream() << "Target location is not empty"
+                                            << " : " << s3params.bucket << '/' << s3params.path);
+            }
+        }
+    }
+
+    // stream files to the bucket
+    for (auto&& file : filesList) {
+        boost::filesystem::path srcFile{std::get<0>(file)};
+        boost::filesystem::path destFile{std::get<1>(file)};
+        auto fsize{std::get<2>(file)};
+
+        LOG(2) << "uploading file: " << srcFile.string() << std::endl;
+        LOG(2) << "      key name: " << destFile.string() << std::endl;
+
+        Aws::S3::Model::PutObjectRequest request;
+        request.SetBucket(s3params.bucket);
+        request.SetKey(destFile.string());
+        request.SetContentLength(fsize);
+        request.SetContentType("application/octet-stream");
+
+        auto fileToUpload = Aws::MakeShared<Aws::FStream>("AWS", srcFile.string(), std::ios_base::in | std::ios_base::binary);
+        if (!fileToUpload) {
+            return Status(ErrorCodes::InvalidPath,
+                          str::stream() << "Cannot open file '" << srcFile.string() << "' for backup"
+                                        << " : " << strerror(errno));
+        }
+        request.SetBody(fileToUpload);
+
+        auto outcome = s3_client.PutObject(request);
+        if (!outcome.IsSuccess()) {
+            return Status(ErrorCodes::InternalError,
+                          str::stream() << "Cannot backup '" << srcFile.string() << "'"
+                                        << " : " << outcome.GetError().GetExceptionName()
+                                        << " : " << outcome.GetError().GetMessage());
+        }
+        LOG(2) << "Successfully uploaded file: " << destFile.string();
+    }
+
+    return Status::OK();
+}
+
+Status WiredTigerKVEngine::hotBackup(OperationContext* opCtx, const std::string& path) {
+    namespace fs = boost::filesystem;
+
+    // list of DBs to backup
+    std::vector<DBTuple> dbList;
+    // list of files to backup
+    std::vector<FileTuple> filesList;
+
+    auto status = _hotBackupPopulateLists(opCtx, path, dbList, filesList);
+    if (!status.isOK()) {
+        return status;
+    }
+
+    // We assume destination dir exists - it is created during command validation
+    fs::path destPath{path};
+    std::set<fs::path> existDirs{destPath};
 
     // Do copy files
     for (auto&& file : filesList) {
@@ -1286,7 +1439,7 @@ Status WiredTigerKVEngine::hotBackup(OperationContext* opCtx, const std::string&
 
     }
 
-    return wtRCToStatus(ret);
+    return Status::OK();
 }
 
 void WiredTigerKVEngine::syncSizeInfo(bool sync) const {

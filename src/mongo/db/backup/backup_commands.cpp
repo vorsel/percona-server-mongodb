@@ -83,30 +83,86 @@ bool CreateBackupCommand::errmsgRun(mongo::OperationContext* opCtx,
                               const BSONObj& cmdObj,
                               std::string& errmsg,
                               BSONObjBuilder& result) {
-    namespace fs = boost::filesystem;
-
-    const std::string& dest = cmdObj["backupDir"].String();
-    fs::path destPath(dest);
-
-    // Validate destination directory.
-    try {
-        if (!destPath.is_absolute()) {
-            errmsg = "Destination path must be absolute";
-            return false;
-        }
-
-        fs::create_directory(destPath);
-    } catch (const fs::filesystem_error& ex) {
-        errmsg = ex.what();
+    BSONElement destPathElem = cmdObj["backupDir"];
+    BSONElement s3Elem = cmdObj["s3"];
+    // Command object must specify either 'backupDir' or 's3' not both
+    if (destPathElem && s3Elem) {
+        errmsg = "Cannot specify both 'backupDir' and 's3'";
         return false;
     }
 
-    // Flush all files first.
-    auto se = getGlobalServiceContext()->getStorageEngine();
-    se->flushAllFiles(opCtx, true);
+    Status status{Status::OK()};
 
-    // Do the backup itself.
-    const auto status = se->hotBackup(opCtx, dest);
+    if (destPathElem) {
+        namespace fs = boost::filesystem;
+        const std::string& dest = destPathElem.String();
+        fs::path destPath(dest);
+
+        // Validate destination directory.
+        try {
+            if (!destPath.is_absolute()) {
+                errmsg = "Destination path must be absolute";
+                return false;
+            }
+
+            fs::create_directory(destPath);
+        } catch (const fs::filesystem_error& ex) {
+            errmsg = ex.what();
+            return false;
+        }
+
+        // Flush all files first.
+        auto se = getGlobalServiceContext()->getStorageEngine();
+        se->flushAllFiles(opCtx, true);
+
+        // Do the backup itself.
+        status = se->hotBackup(opCtx, dest);
+
+    } else if (s3Elem) {
+        if (s3Elem.type() != BSONType::Object) {
+            errmsg = "'s3' field must be an object";
+            return false;
+        }
+
+        percona::S3BackupParameters s3params;
+        for (auto&& elem : s3Elem.embeddedObject()) {
+            if (elem.fieldNameStringData() == "profile"_sd)
+                s3params.profile = elem.String();
+            else if (elem.fieldNameStringData() == "region"_sd)
+                s3params.region = elem.String();
+            else if (elem.fieldNameStringData() == "endpoint"_sd)
+                s3params.endpoint = elem.String();
+            else if (elem.fieldNameStringData() == "scheme"_sd)
+                s3params.scheme = elem.String();
+            else if (elem.fieldNameStringData() == "useVirtualAddressing"_sd)
+                s3params.useVirtualAddressing = elem.Bool();
+            else if (elem.fieldNameStringData() == "bucket"_sd)
+                s3params.bucket = elem.String();
+            else if (elem.fieldNameStringData() == "path"_sd)
+                s3params.path = elem.String();
+            else {
+                errmsg = str::stream()
+                    << "s3 subobject contains usupported field or field's name is misspelled: "
+                    << elem.fieldName();
+                return false;
+            }
+        }
+        if (s3params.bucket.empty()) {
+            errmsg = "s3 subobject must provide non-empty 'bucket' field";
+            return false;
+        }
+
+        // Flush all files first.
+        auto se = getGlobalServiceContext()->getStorageEngine();
+        se->flushAllFiles(opCtx, true);
+
+        // Do the backup itself.
+        status = se->hotBackup(opCtx, s3params);
+
+    } else {
+        errmsg = "command object must specify either 'backupDir' or 's3' field";
+        return false;
+    }
 
     if (!status.isOK()) {
         errmsg = status.reason();
