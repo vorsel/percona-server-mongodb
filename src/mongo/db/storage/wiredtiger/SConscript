@@ -82,6 +82,8 @@ if wiredtiger:
             '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
             ],
         SYSLIBDEPS=[
+            # curl is required by S3
+            'curl',
             # S3 and its dependencies
             # order is important
             'aws-cpp-sdk-s3',
