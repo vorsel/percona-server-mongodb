@@ -629,6 +629,7 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
         bool just_created{false};
         fs::path keyDBPath = path;
         keyDBPath /= keydbDir;
+        auto keyDBPathGuard = makeGuard([&] { if (just_created) fs::remove_all(keyDBPath); });
         if (!fs::exists(keyDBPath)) {
             fs::path betaKeyDBPath = path;
             betaKeyDBPath /= "keydb";
@@ -674,6 +675,7 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
         }
         auto encryptionKeyDB = stdx::make_unique<EncryptionKeyDB>(just_created, keyDBPath.string());
         encryptionKeyDB->init();
+        keyDBPathGuard.dismiss();
         // do master key rotation if necessary
         if (encryptionGlobalParams.vaultRotateMasterKey) {
             fs::path newKeyDBPath = path;
