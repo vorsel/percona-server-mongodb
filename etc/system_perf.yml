@@ -79,12 +79,12 @@ functions:
           set -o verbose
 
           # We get the raw version string (r1.2.3-45-gabcdef) from git
-          MONGO_VERSION=$(git describe)
+          MONGO_VERSION=$(git describe --abbrev=7)
 
           # If we're going to compile the upstream wtdevelop repository for wiredtiger, add
           # that githash to version string.
           if [ "${compile-variant|}" = "-wtdevelop" ]; then
-            WT_VERSION=$(cd src/third_party/wtdevelop; git describe | cut -c 9-)
+            WT_VERSION=$(cd src/third_party/wtdevelop; git describe --abbrev=7 | cut -c 9-)
             MONGO_VERSION="$MONGO_VERSION-wtdevelop-$WT_VERSION"
           fi
           # If this is a patch build, we add the patch version id to the version string so we know
@@ -211,7 +211,7 @@ functions:
           build_id: ${build_id}
           build_variant: ${build_variant}
           execution: ${execution}
-          is_patch: ${is_patch}
+          order: ${revision_order_id}
           project: ${project}
           project_dir: ${project_dir}
           revision: ${revision}
@@ -390,6 +390,16 @@ tasks:
     - func: "run test"
     - func: "analyze"
 
+- name: cursor_manager
+  priority: 5
+  commands:
+    - func: "prepare environment"
+      vars:
+        test: "cursor_manager"
+    - func: "deploy cluster"
+    - func: "run test"
+    - func: "analyze"
+
 - name: mixed_workloads
   priority: 5
   commands:
@@ -552,6 +562,7 @@ tasks:
     - func: "prepare environment"
       vars:
         test: "initialsync"
+        authentication: disabled
     - func: "deploy cluster"
     - func: "run test"
     - func: "analyze"
@@ -730,6 +741,7 @@ buildvariants:
   tasks: &standalonetasks
     - name: industry_benchmarks
     - name: crud_workloads
+    - name: cursor_manager
     - name: mixed_workloads
     - name: misc_workloads
     - name: map_reduce_workloads

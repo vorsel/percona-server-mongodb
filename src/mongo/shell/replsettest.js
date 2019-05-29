@@ -1193,18 +1193,28 @@ var ReplSetTest = function(opts) {
      * of the oplog on *all* secondaries.
      * Returns last oplog entry.
      */
-    this.awaitLastOpCommitted = function(timeout) {
+    this.awaitLastOpCommitted = function(timeout, members) {
         var rst = this;
         var master = rst.getPrimary();
         var masterOpTime = _getLastOpTime(master);
 
-        print("Waiting for op with OpTime " + tojson(masterOpTime) +
-              " to be committed on all secondaries");
+        let membersToCheck;
+        if (members !== undefined) {
+            print("Waiting for op with OpTime " + tojson(masterOpTime) + " to be committed on " +
+                  members.map(s => s.host));
+
+            membersToCheck = members;
+        } else {
+            print("Waiting for op with OpTime " + tojson(masterOpTime) +
+                  " to be committed on all secondaries");
+
+            membersToCheck = rst.nodes;
+        }
 
         assert.soonNoExcept(
             function() {
-                for (var i = 0; i < rst.nodes.length; i++) {
-                    var node = rst.nodes[i];
+                for (var i = 0; i < membersToCheck.length; i++) {
+                    var node = membersToCheck[i];
 
                     // Continue if we're connected to an arbiter
                     var res = assert.commandWorked(node.adminCommand({replSetGetStatus: 1}));
@@ -2250,14 +2260,14 @@ var ReplSetTest = function(opts) {
         }
 
         // If restarting a node, use its existing options as the defaults.
+        var baseOptions;
         if ((options && options.restart) || restart) {
-            const existingOpts =
-                _useBridge ? _unbridgedNodes[n].fullOptions : this.nodes[n].fullOptions;
-            options = Object.merge(existingOpts, options);
+            baseOptions = _useBridge ? _unbridgedNodes[n].fullOptions : this.nodes[n].fullOptions;
         } else {
-            options = Object.merge(defaults, options);
+            baseOptions = defaults;
         }
-        options = Object.merge(options, this.nodeOptions["n" + n]);
+        baseOptions = Object.merge(baseOptions, this.nodeOptions["n" + n]);
+        options = Object.merge(baseOptions, options);
         delete options.rsConfig;
 
         options.restart = options.restart || restart;
@@ -2267,7 +2277,17 @@ var ReplSetTest = function(opts) {
 
         // Turn off periodic noop writes for replica sets by default.
         options.setParameter = options.setParameter || {};
+        if (typeof(options.setParameter) === "string") {
+            var eqIdx = options.setParameter.indexOf("=");
+            if (eqIdx != -1) {
+                var param = options.setParameter.substring(0, eqIdx);
+                var value = options.setParameter.substring(eqIdx + 1);
+                options.setParameter = {};
+                options.setParameter[param] = value;
+            }
+        }
         options.setParameter.writePeriodicNoops = options.setParameter.writePeriodicNoops || false;
+
         options.setParameter.numInitialSyncAttempts =
             options.setParameter.numInitialSyncAttempts || 1;
         // We raise the number of initial sync connect attempts for tests that disallow chaining.
@@ -2466,6 +2486,24 @@ var ReplSetTest = function(opts) {
                 asCluster(this._liveNodes, () => this.checkOplogs());
                 asCluster(this._liveNodes, () => this.checkReplicatedDataHashes());
             }
+        }
+
+        // Make shutdown faster in tests, especially when election handoff has no viable candidate.
+        // Ignore errors from setParameter, perhaps mongod is too old for this parameter.
+        if (_callIsMaster()) {
+            asCluster(this._liveNodes, () => {
+                for (let node of this._liveNodes) {
+                    try {
+                        assert.commandWorked(node.adminCommand({
+                            setParameter: 1,
+                            waitForStepDownOnNonCommandShutdown: false,
+                        }));
+                    } catch (e) {
+                        print("Error in setParameter for waitForStepDownOnNonCommandShutdown:");
+                        print(e);
+                    }
+                }
+            });
         }
 
         for (var i = 0; i < this.ports.length; i++) {

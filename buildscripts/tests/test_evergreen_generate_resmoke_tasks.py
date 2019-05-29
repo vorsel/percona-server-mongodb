@@ -308,7 +308,7 @@ class PrepareDirectoryForSuite(unittest.TestCase):
 
 class CalculateTimeoutTest(unittest.TestCase):
     def test_min_timeout(self):
-        self.assertEqual(300, grt.calculate_timeout(15, 1))
+        self.assertEqual(grt.MIN_TIMEOUT_SECONDS, grt.calculate_timeout(15, 1))
 
     def test_over_timeout_by_one_minute(self):
         self.assertEqual(360, grt.calculate_timeout(301, 1))
@@ -317,7 +317,9 @@ class CalculateTimeoutTest(unittest.TestCase):
         self.assertEqual(360, grt.calculate_timeout(300.14, 1))
 
     def test_scaling_factor(self):
-        self.assertEqual(600, grt.calculate_timeout(30, 10))
+        scaling_factor = 10
+        self.assertEqual(grt.MIN_TIMEOUT_SECONDS * scaling_factor,
+                         grt.calculate_timeout(30, scaling_factor))
 
 
 class EvergreenConfigGeneratorTest(unittest.TestCase):
@@ -341,6 +343,7 @@ class EvergreenConfigGeneratorTest(unittest.TestCase):
         options.variant = "buildvariant"
         options.suite = "suite"
         options.task = "suite"
+        options.use_default_timeouts = False
         options.use_large_distro = None
         options.use_multiversion = False
         options.is_patch = True
@@ -467,6 +470,18 @@ class EvergreenConfigGeneratorTest(unittest.TestCase):
         options = self.generate_mock_options()
         suites = self.generate_mock_suites(3)
         suites[suite_without_timing_info].should_overwrite_timeout.return_value = False
+
+        config = grt.EvergreenConfigGenerator(suites, options, Mock()).generate_config().to_map()
+
+        timeout_cmd = config["tasks"][suite_without_timing_info]["commands"][0]
+        self.assertNotIn("command", timeout_cmd)
+        self.assertEqual("do setup", timeout_cmd["func"])
+
+    def test_timeout_info_not_included_if_use_default_timeouts_set(self):
+        suite_without_timing_info = 1
+        options = self.generate_mock_options()
+        suites = self.generate_mock_suites(3)
+        options.use_default_timeouts = True
 
         config = grt.EvergreenConfigGenerator(suites, options, Mock()).generate_config().to_map()
 
