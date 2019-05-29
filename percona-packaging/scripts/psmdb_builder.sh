@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 
 shell_quote_string() {
   echo "$1" | sed -e 's,\([^a-zA-Z0-9/_.=-]\),\\\1,g'
@@ -669,7 +669,9 @@ build_tarball(){
     #
     # Finally build Percona Server for MongoDB with SCons
     cd ${PSMDIR_ABS}
-    pip install --user -r buildscripts/requirements.txt
+    if [ ${INSTALL} -ne 0 ]; then
+        pip install --user -r buildscripts/requirements.txt
+    fi
     if [ ${DEBUG} = 0 ]; then
         buildscripts/scons.py CC=${CC} CXX=${CXX} --disable-warnings-as-errors --release --ssl --opt=on -j$NJOBS --use-sasl-client --wiredtiger --audit --rocksdb --inmemory --hotbackup CPPPATH=${INSTALLDIR}/include LIBPATH=${INSTALLDIR}/lib ${PSM_TARGETS}
     else
