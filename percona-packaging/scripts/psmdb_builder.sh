@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 
 shell_quote_string() {
   echo "$1" | sed -e 's,\([^a-zA-Z0-9/_.=-]\),\\\1,g'
