@@ -34,27 +34,69 @@
 #include "mongo/db/catalog/index_builds_manager.h"
 
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/service_context.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
-using std::shared_ptr;
+namespace {
+
+/**
+ * Returns basic info on index builders.
+ */
+std::string toSummary(const std::map<UUID, std::shared_ptr<MultiIndexBlock>>& builders) {
+    str::stream ss;
+    ss << "Number of builders: " << builders.size() << ": [";
+    bool first = true;
+    for (const auto& pair : builders) {
+        if (!first) {
+            ss << ", ";
+        }
+        ss << pair.first;
+        first = false;
+    }
+    ss << "]";
+    return ss;
+}
+
+}  // namespace
 
 IndexBuildsManager::~IndexBuildsManager() {
-    invariant(_builders.empty());
+    invariant(_builders.empty(),
+              str::stream() << "Index builds still active: " << toSummary(_builders));
 }
 
 Status IndexBuildsManager::setUpIndexBuild(OperationContext* opCtx,
                                            Collection* collection,
-                                           const NamespaceString& nss,
                                            const std::vector<BSONObj>& specs,
-                                           const UUID& buildUUID) {
+                                           const UUID& buildUUID,
+                                           OnInitFn onInit) {
     _registerIndexBuild(opCtx, collection, buildUUID);
 
-    // TODO: Not yet implemented.
+    const auto& nss = collection->ns();
+    invariant(opCtx->lockState()->isCollectionLockedForMode(nss.ns(), MODE_X),
+              str::stream() << "Unable to set up index build " << buildUUID << ": collection "
+                            << nss.ns()
+                            << " is not locked in exclusive mode.");
+
+    auto builder = _getBuilder(buildUUID);
+
+    auto initResult = writeConflictRetry(
+        opCtx, "IndexBuildsManager::setUpIndexBuild", nss.ns(), [opCtx, builder, &onInit, &specs] {
+            return builder->init(specs, onInit);
+        });
+
+    if (!initResult.isOK()) {
+        return initResult.getStatus();
+    }
+
+    log() << "Index build initialized: " << buildUUID << ": " << nss << " (" << *collection->uuid()
+          << " ): indexes: " << initResult.getValue().size();
 
     return Status::OK();
 }
@@ -68,15 +110,18 @@ StatusWith<IndexBuildRecoveryState> IndexBuildsManager::recoverIndexBuild(
 }
 
 Status IndexBuildsManager::startBuildingIndex(const UUID& buildUUID) {
-    auto multiIndexBlockPtr = _getBuilder(buildUUID);
-    // TODO: verify that the index builder is in the expected state.
+    auto builder = _getBuilder(buildUUID);
 
-    // TODO: Not yet implemented.
-
-    return Status::OK();
+    return builder->insertAllDocumentsInCollection();
 }
 
-Status IndexBuildsManager::finishbBuildingPhase(const UUID& buildUUID) {
+Status IndexBuildsManager::drainBackgroundWrites(const UUID& buildUUID) {
+    auto builder = _getBuilder(buildUUID);
+
+    return builder->drainBackgroundWrites();
+}
+
+Status IndexBuildsManager::finishBuildingPhase(const UUID& buildUUID) {
     auto multiIndexBlockPtr = _getBuilder(buildUUID);
     // TODO: verify that the index builder is in the expected state.
 
@@ -86,30 +131,31 @@ Status IndexBuildsManager::finishbBuildingPhase(const UUID& buildUUID) {
 }
 
 Status IndexBuildsManager::checkIndexConstraintViolations(const UUID& buildUUID) {
-    auto multiIndexBlockPtr = _getBuilder(buildUUID);
-    // TODO: verify that the index builder is in the expected state.
+    auto builder = _getBuilder(buildUUID);
 
-    // TODO: Not yet implemented.
-
-    return Status::OK();
+    return builder->checkConstraints();
 }
 
-Status IndexBuildsManager::finishConstraintPhase(const UUID& buildUUID) {
-    auto multiIndexBlockPtr = _getBuilder(buildUUID);
-    // TODO: verify that the index builder is in the expected state.
+Status IndexBuildsManager::commitIndexBuild(OperationContext* opCtx,
+                                            const NamespaceString& nss,
+                                            const UUID& buildUUID,
+                                            MultiIndexBlock::OnCreateEachFn onCreateEachFn,
+                                            MultiIndexBlock::OnCommitFn onCommitFn) {
+    auto builder = _getBuilder(buildUUID);
 
-    // TODO: Not yet implemented.
+    return writeConflictRetry(opCtx,
+                              "IndexBuildsManager::commitIndexBuild",
+                              nss.ns(),
+                              [builder, opCtx, &onCreateEachFn, &onCommitFn] {
+                                  WriteUnitOfWork wunit(opCtx);
+                                  auto status = builder->commit(onCreateEachFn, onCommitFn);
+                                  if (!status.isOK()) {
+                                      return status;
+                                  }
 
-    return Status::OK();
-}
-
-Status IndexBuildsManager::commitIndexBuild(const UUID& buildUUID) {
-    auto multiIndexBlockPtr = _getBuilder(buildUUID);
-    // TODO: verify that the index builder is in the expected state.
-
-    // TODO: Not yet implemented.
-
-    return Status::OK();
+                                  wunit.commit();
+                                  return Status::OK();
+                              });
 }
 
 bool IndexBuildsManager::abortIndexBuild(const UUID& buildUUID, const std::string& reason) {
@@ -138,6 +184,11 @@ bool IndexBuildsManager::interruptIndexBuild(const UUID& buildUUID, const std::s
 void IndexBuildsManager::tearDownIndexBuild(const UUID& buildUUID) {
     // TODO verify that the index builder is in a finished state before allowing its destruction.
     _unregisterIndexBuild(buildUUID);
+}
+
+bool IndexBuildsManager::isBackgroundBuilding(const UUID& buildUUID) {
+    auto builder = _getBuilder(buildUUID);
+    return builder->isBackgroundBuilding();
 }
 
 void IndexBuildsManager::verifyNoIndexBuilds_forTestOnly() {

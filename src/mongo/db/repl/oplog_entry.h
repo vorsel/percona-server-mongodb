@@ -57,6 +57,9 @@ public:
         kEmptyCapped,
         kConvertToCapped,
         kCreateIndexes,
+        kStartIndexBuild,
+        kCommitIndexBuild,
+        kAbortIndexBuild,
         kDropIndexes,
         kCommitTransaction,
         kAbortTransaction,
@@ -83,7 +86,7 @@ public:
     static StatusWith<OplogEntry> parse(const BSONObj& object);
 
     OplogEntry(OpTime opTime,
-               long long hash,
+               const boost::optional<long long> hash,
                OpTypeEnum opType,
                const NamespaceString& nss,
                const boost::optional<UUID>& uuid,

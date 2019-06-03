@@ -194,6 +194,19 @@ env.Library(
     ]
 )
 
+env.Library(
+    target='sharded_agg_helpers',
+    source=[
+        'sharded_agg_helpers.cpp',
+    ],
+    LIBDEPS=[
+        'aggregation',
+        '$BUILD_DIR/mongo/s/async_requests_sender',
+        '$BUILD_DIR/mongo/s/query/cluster_aggregation_planner',
+        '$BUILD_DIR/mongo/s/commands/shared_cluster_commands',
+    ],
+)
+
 env.CppUnitTest(
     target='document_source_test',
     source=[
@@ -297,6 +310,7 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/ops/write_ops_exec',
         '$BUILD_DIR/mongo/db/query_exec',
+        '$BUILD_DIR/mongo/db/repl/speculative_majority_read_info',
         'mongo_process_common',
     ],
     LIBDEPS_PRIVATE=[
@@ -313,6 +327,7 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/s/sharding_api',
         'process_interface_standalone',
+        'sharded_agg_helpers',
     ],
 )
 
@@ -327,6 +342,7 @@ env.Library(
         '$BUILD_DIR/mongo/s/query/cluster_aggregation_planner',
         '$BUILD_DIR/mongo/s/query/cluster_query',
         'mongo_process_common',
+        'sharded_agg_helpers',
     ]
 )
 
@@ -341,7 +357,7 @@ env.Library(
 )
 
 pipelineeEnv = env.Clone()
-pipelineeEnv.InjectThirdPartyIncludePaths(libraries=['snappy'])
+pipelineeEnv.InjectThirdParty(libraries=['snappy'])
 pipelineeEnv.Library(
     target='pipeline',
     source=[
@@ -387,6 +403,7 @@ pipelineeEnv.Library(
         'document_source_sort_by_count.cpp',
         'document_source_tee_consumer.cpp',
         'document_source_unwind.cpp',
+        'document_source_watch_for_uuid.cpp',
         'pipeline.cpp',
         'sequential_document_cache.cpp',
         'stage_constraints.cpp',
@@ -409,6 +426,7 @@ pipelineeEnv.Library(
         '$BUILD_DIR/mongo/db/repl/oplog_entry',
         '$BUILD_DIR/mongo/db/repl/read_concern_args',
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
+        '$BUILD_DIR/mongo/db/repl/speculative_majority_read_info',
         '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/db/sessions_collection',
         '$BUILD_DIR/mongo/db/storage/encryption_hooks',

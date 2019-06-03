@@ -253,58 +253,6 @@ struct FutureContinuationResultImpl<Status> {
     using type = void;
 };
 
-/**
- * A base class that handles the ref-count for boost::intrusive_ptr compatibility.
- *
- * This is taken from RefCountable which is used for the aggregation types, adding in a way to set
- * the refcount non-atomically during initialization. Also using explicit memory orderings for all
- * operations on the count.
- * TODO look into merging back.
- */
-class FutureRefCountable {
-    MONGO_DISALLOW_COPYING(FutureRefCountable);
-
-public:
-    /**
-     * Sets the refcount to count, assuming it is currently one less. This should only be used
-     * during logical initialization before another thread could possibly have access to this
-     * object.
-     */
-    void threadUnsafeIncRefCountTo(uint32_t count) const {
-        dassert(_count.load(std::memory_order_relaxed) == (count - 1));
-        _count.store(count, std::memory_order_relaxed);
-    }
-
-    friend void intrusive_ptr_add_ref(const FutureRefCountable* ptr) {
-        // See this for a description of why relaxed is OK here. It is also used in libc++.
-        // http://www.boost.org/doc/libs/1_66_0/doc/html/atomic/usage_examples.html#boost_atomic.usage_examples.example_reference_counters.discussion
-        ptr->_count.fetch_add(1, std::memory_order_relaxed);
-    };
-
-    friend void intrusive_ptr_release(const FutureRefCountable* ptr) {
-        if (ptr->_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            delete ptr;
-        }
-    };
-
-protected:
-    FutureRefCountable() = default;
-    virtual ~FutureRefCountable() = default;
-
-private:
-    mutable std::atomic<uint32_t> _count{0};  // NOLINT
-};
-
-template <typename T,
-          typename... Args,
-          typename = std::enable_if_t<std::is_base_of<FutureRefCountable, T>::value>>
-boost::intrusive_ptr<T> make_intrusive(Args&&... args) {
-    auto ptr = new T(std::forward<Args>(args)...);
-    ptr->threadUnsafeIncRefCountTo(1);
-    return boost::intrusive_ptr<T>(ptr, /*add ref*/ false);
-}
-
-
 template <typename T>
 struct SharedStateImpl;
 
@@ -350,7 +298,7 @@ enum class SSBState : uint8_t {
     kFinished,
 };
 
-class SharedStateBase : public FutureRefCountable {
+class SharedStateBase : public RefCountable {
 public:
     SharedStateBase(const SharedStateBase&) = delete;
     SharedStateBase(SharedStateBase&&) = delete;
@@ -1149,6 +1097,29 @@ public:
     }
 
     /**
+     * Similar to the first two onErrors, but only calls the callback if the category matches
+     * the template parameter. Otherwise lets the error propagate unchanged.
+     */
+    template <ErrorCategory category, typename Func>
+        Future<T> onErrorCategory(Func&& func) && noexcept {
+        using Result = RawNormalizedCallResult<Func, Status>;
+        static_assert(
+            std::is_same<Result, T>::value || std::is_same<Result, Future<T>>::value ||
+                (std::is_same<T, FakeVoid>::value && std::is_same<Result, Future<void>>::value),
+            "func passed to Future<T>::onErrorCategory must return T, StatusWith<T>, or Future<T>");
+
+        if (_immediate || (isReady() && _shared->status.isOK()))
+            return std::move(*this);
+
+        return std::move(*this).onError([func =
+                                             std::forward<Func>(func)](Status && status) mutable {
+            if (!ErrorCodes::isA<category>(status.code()))
+                uassertStatusOK(status);
+            return throwingCall(func, std::move(status));
+        });
+    }
+
+    /**
      * TODO do we need a version of then/onError like onCompletion() that handles both success and
      * Failure, but doesn't end the chain like getAsync()? Right now we don't, and we can add one if
      * we do.
@@ -1739,8 +1710,8 @@ inline auto makePromiseFuture() {
  * FutureContinuationResult<std::function<int(bool)>, NotBool> SFINAE-safe substitution failure.
  */
 template <typename Func, typename... Args>
-using FutureContinuationResult =
-    typename future_details::FutureContinuationResultImpl<std::result_of_t<Func(Args&&...)>>::type;
+using FutureContinuationResult = typename future_details::FutureContinuationResultImpl<
+    std::invoke_result_t<Func, Args&&...>>::type;
 
 //
 // Implementations of methods that couldn't be defined in the class due to ordering requirements.
@@ -1748,12 +1719,14 @@ using FutureContinuationResult =
 
 template <typename T>
 inline Future<T> Promise<T>::getFuture() noexcept {
+    using namespace future_details;
     _sharedState->threadUnsafeIncRefCountTo(2);
     return Future<T>(boost::intrusive_ptr<SharedState<T>>(_sharedState.get(), /*add ref*/ false));
 }
 
 template <typename T>
 inline void Promise<T>::setFrom(Future<T>&& future) noexcept {
+    using namespace future_details;
     setImpl([&](boost::intrusive_ptr<SharedState<T>>&& sharedState) {
         future.propagateResultTo(sharedState.get());
     });
@@ -1772,6 +1745,7 @@ template <typename T>
 
 template <typename T>
     inline SharedSemiFuture<T> Future<T>::share() && noexcept {
+    using namespace future_details;
     if (!_immediate)
         return SharedSemiFuture<T>(std::move(_shared));
 

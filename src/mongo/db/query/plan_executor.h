@@ -44,7 +44,6 @@ class BSONObj;
 class CappedInsertNotifier;
 struct CappedInsertNotifierData;
 class Collection;
-class CursorManager;
 class PlanExecutor;
 class PlanStage;
 class PlanYieldPolicy;
@@ -79,20 +78,9 @@ public:
         // We're EOF.  We won't return any more results (edge case exception: capped+tailable).
         IS_EOF,
 
-        // The plan executor died, usually due to a concurrent catalog event such as a collection
-        // drop.
-        //
-        // If the underlying PlanStage has any information on the error, it will be available in
-        // the objOut parameter. Call WorkingSetCommon::toStatusString() to retrieve the error
-        // details from the output BSON object.
-        //
-        // The PlanExecutor is no longer capable of executing. The caller may extract stats from the
-        // underlying plan stages, but should not attempt to do anything else with the executor
-        // other than dispose() and destroy it.
-        DEAD,
-
         // getNext() was asked for data it cannot provide, or the underlying PlanStage had an
-        // unrecoverable error.
+        // unrecoverable error, or the executor died, usually due to a concurrent catalog event
+        // such as a collection drop.
         //
         // If the underlying PlanStage has any information on the error, it will be available in
         // the objOut parameter. Call WorkingSetCommon::toStatusString() to retrieve the error
@@ -111,7 +99,7 @@ public:
     enum YieldPolicy {
         // Any call to getNext() may yield. In particular, the executor may die on any call to
         // getNext() due to a required index or collection becoming invalid during yield. If this
-        // occurs, getNext() will produce an error during yield recovery and will return DEAD.
+        // occurs, getNext() will produce an error during yield recovery and will return FAILURE.
         // Additionally, this will handle all WriteConflictExceptions that occur while processing
         // the query.
         YIELD_AUTO,
@@ -143,12 +131,12 @@ public:
         INTERRUPT_ONLY,
 
         // Used for testing, this yield policy will cause the PlanExecutor to time out on the first
-        // yield, returning DEAD with an error object encoding a ErrorCodes::ExceededTimeLimit
+        // yield, returning FAILURE with an error object encoding a ErrorCodes::ExceededTimeLimit
         // message.
         ALWAYS_TIME_OUT,
 
         // Used for testing, this yield policy will cause the PlanExecutor to be marked as killed on
-        // the first yield, returning DEAD with an error object encoding a
+        // the first yield, returning FAILURE with an error object encoding a
         // ErrorCodes::QueryPlanKilled message.
         ALWAYS_MARK_KILLED,
     };
@@ -164,8 +152,7 @@ public:
          */
         Deleter() = default;
 
-        inline Deleter(OperationContext* opCtx, CursorManager* cursorManager)
-            : _opCtx(opCtx), _cursorManager(cursorManager) {}
+        inline Deleter(OperationContext* opCtx) : _opCtx(opCtx) {}
 
         /**
          * If an owner of a std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> wants to assume
@@ -185,7 +172,7 @@ public:
                 // It is illegal to invoke operator() on a default constructed Deleter.
                 invariant(_opCtx);
                 if (!_dismissed) {
-                    execPtr->dispose(_opCtx, _cursorManager);
+                    execPtr->dispose(_opCtx);
                 }
                 delete execPtr;
             } catch (...) {
@@ -196,7 +183,6 @@ public:
 
     private:
         OperationContext* _opCtx = nullptr;
-        CursorManager* _cursorManager = nullptr;
 
         bool _dismissed = false;
     };
@@ -396,7 +382,8 @@ public:
 
     /**
      * Notifies a PlanExecutor that it should die. Callers must specify the reason for why this
-     * executor is being killed. Subsequent calls to getNext() will return DEAD, and fill 'objOut'
+     * executor is being killed. Subsequent calls to getNext() will return FAILURE, and fill
+     * 'objOut'
      * with an error reflecting 'killStatus'. If this method is called multiple times, only the
      * first 'killStatus' will be retained. It is an error to call this method with Status::OK.
      */
@@ -404,8 +391,7 @@ public:
 
     /**
      * Cleans up any state associated with this PlanExecutor. Must be called before deleting this
-     * PlanExecutor. It is illegal to use a PlanExecutor after calling dispose(). 'cursorManager'
-     * may be null.
+     * PlanExecutor. It is illegal to use a PlanExecutor after calling dispose().
      *
      * There are multiple cleanup scenarios:
      *  - This PlanExecutor will only ever use one OperationContext. In this case the
@@ -415,7 +401,7 @@ public:
      *    is the owner's responsibility to call dispose() with a valid OperationContext before
      *    deleting the PlanExecutor.
      */
-    virtual void dispose(OperationContext* opCtx, CursorManager* cursorManager) = 0;
+    virtual void dispose(OperationContext* opCtx) = 0;
 
     /**
      * Helper method to aid in displaying an ExecState for debug or other recreational purposes.

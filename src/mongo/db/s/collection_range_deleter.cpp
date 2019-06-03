@@ -49,7 +49,7 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/query/plan_yield_policy.h"
-#include "mongo/db/query/query_knobs.h"
+#include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
@@ -420,11 +420,10 @@ StatusWith<int> CollectionRangeDeleter::_doDeletion(OperationContext* opCtx,
             break;
         }
 
-        if (state == PlanExecutor::FAILURE || state == PlanExecutor::DEAD) {
+        if (state == PlanExecutor::FAILURE) {
             warning() << PlanExecutor::statestr(state) << " - cursor error while trying to delete "
-                      << redact(min) << " to " << redact(max) << " in " << nss << ": "
-                      << redact(WorkingSetCommon::toStatusString(deletedObj))
-                      << ", stats: " << Explain::getWinningPlanStats(exec.get());
+                      << redact(min) << " to " << redact(max) << " in " << nss
+                      << ": FAILURE, stats: " << Explain::getWinningPlanStats(exec.get());
             break;
         }
 

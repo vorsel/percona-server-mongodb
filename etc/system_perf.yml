@@ -55,7 +55,7 @@ post:
           # these default values in the distro config in evergreen.
 
           if [ -d "${scons_cache_path}" ]; then
-              ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/scons_cache_prune.py --cache-dir ${scons_cache_path} --cache-size ${scons_cache_size|200} --prune-ratio ${scons_prune_ratio|0.8}
+              ${python|/opt/mongodbtoolchain/v3/bin/python2} buildscripts/scons_cache_prune.py --cache-dir ${scons_cache_path} --cache-size ${scons_cache_size|200} --prune-ratio ${scons_prune_ratio|0.8}
           fi
 
 functions:
@@ -96,7 +96,7 @@ functions:
 
           # This script converts the generated version string into a sanitized version string for
           # use by scons and uploading artifacts as well as information about for the scons cache.
-          MONGO_VERSION=$MONGO_VERSION USE_SCONS_CACHE=${use_scons_cache|false} ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/generate_compile_expansions.py --out compile_expansions.yml
+          MONGO_VERSION=$MONGO_VERSION USE_SCONS_CACHE=${use_scons_cache|false} ${python|/opt/mongodbtoolchain/v3/bin/python2} buildscripts/generate_compile_expansions.py --out compile_expansions.yml
     # Then we load the generated version data into the agent so we can use it in task definitions
     - command: expansions.update
       params:
@@ -129,7 +129,7 @@ functions:
         script: |
           set -o errexit
           set -o verbose
-          ${python|/opt/mongodbtoolchain/v2/bin/python2} ./buildscripts/scons.py ${compile_flags|} ${scons_cache_args|} mongo${extension} --use-new-tools mongod${extension} mongos${extension} MONGO_VERSION=${version}
+          ${python|/opt/mongodbtoolchain/v3/bin/python2} ./buildscripts/scons.py ${compile_flags|} ${scons_cache_args|} mongo${extension} --use-new-tools mongod${extension} mongos${extension} MONGO_VERSION=${version}
           mkdir -p mongodb/bin
           mkdir -p mongodb/jstests/hooks
           mv mongo${extension|} mongodb/bin
@@ -301,6 +301,11 @@ functions:
         script: |
           ../src/dsi/dsi/run-dsi detect-changes
     - command: shell.exec
+      params:
+        working_dir: work
+        script: |
+          ../src/dsi/dsi/run-dsi detect-outliers
+    - command: shell.exec
       type : test
       params:
         working_dir: work
@@ -345,12 +350,23 @@ tasks:
     - func: "run test"
     - func: "analyze"
 
-- name: genny_workloads
+- name: insert_remove
   priority: 5
   commands:
     - func: "prepare environment"
       vars:
-        test: "genny_workloads"
+        test: "insert_remove"
+        authentication: disabled
+    - func: "deploy cluster"
+    - func: "run test"
+    - func: "analyze"
+
+- name: service_architecture_workloads
+  priority: 5
+  commands:
+    - func: "prepare environment"
+      vars:
+        test: "service_architecture_workloads"
         authentication: disabled
     - func: "deploy cluster"
     - func: "run test"
@@ -710,7 +726,7 @@ buildvariants:
       MONGO_DISTMOD=linux-64-amzn-build
       -j$(grep -c ^processor /proc/cpuinfo)
       --release
-      --variables-files=etc/scons/mongodbtoolchain_gcc.vars
+      --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
     platform: linux
     project_dir: &project_dir dsi
     tooltags: ""
@@ -741,7 +757,7 @@ buildvariants:
       MONGO_DISTMOD=amazon2
       -j$(grep -c ^processor /proc/cpuinfo)
       --release
-      --variables-files=etc/scons/mongodbtoolchain_gcc.vars
+      --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
     compile-variant: -enterprise
   run_on:
       - "amazon2-build"
@@ -788,7 +804,7 @@ buildvariants:
     - name: snapshot_reads
     - name: linkbench
     - name: tpcc
-    - name: genny_workloads
+    - name: insert_remove
     - name: big_update
 
 - name: linux-standalone
@@ -810,7 +826,7 @@ buildvariants:
   tasks: &standalonetasks
     - name: industry_benchmarks
     - name: crud_workloads
-    - name: genny_workloads
+    - name: insert_remove
     - name: mixed_workloads
     - name: misc_workloads
     - name: map_reduce_workloads
@@ -862,7 +878,7 @@ buildvariants:
   tasks:
     - name: industry_benchmarks
     - name: crud_workloads
-    - name: genny_workloads
+    - name: insert_remove
     - name: mixed_workloads
     - name: misc_workloads
     - name: map_reduce_workloads
@@ -928,7 +944,8 @@ buildvariants:
     - name: industry_benchmarks
     - name: industry_benchmarks_secondary_reads
     - name: crud_workloads
-    - name: genny_workloads
+    - name: insert_remove
+    - name: service_architecture_workloads
     - name: mixed_workloads
     - name: misc_workloads
     - name: map_reduce_workloads

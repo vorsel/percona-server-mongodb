@@ -40,6 +40,7 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/cursor_manager.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/change_stream_proxy.h"
 #include "mongo/db/exec/working_set_common.h"
@@ -391,6 +392,7 @@ Status runAggregate(OperationContext* opCtx,
                     const NamespaceString& origNss,
                     const AggregationRequest& request,
                     const BSONObj& cmdObj,
+                    const PrivilegeVector& privileges,
                     rpc::ReplyBuilderInterface* result) {
     // For operations on views, this will be the underlying namespace.
     NamespaceString nss = request.getNamespaceString();
@@ -430,7 +432,7 @@ Status runAggregate(OperationContext* opCtx,
             // Upgrade and wait for read concern if necessary.
             _adjustChangeStreamReadConcern(opCtx);
 
-            if (!origNss.isCollectionlessAggregateNS()) {
+            if (liteParsedPipeline.shouldResolveUUIDAndCollation()) {
                 // AutoGetCollectionForReadCommand will raise an error if 'origNss' is a view.
                 AutoGetCollectionForReadCommand origNssCtx(opCtx, origNss);
 
@@ -515,7 +517,7 @@ Status runAggregate(OperationContext* opCtx,
             auto newRequest = resolvedView.asExpandedViewAggregation(request);
             auto newCmd = newRequest.serializeToCommandObj().toBson();
 
-            auto status = runAggregate(opCtx, origNss, newRequest, newCmd, result);
+            auto status = runAggregate(opCtx, origNss, newRequest, newCmd, privileges, result);
 
             {
                 // Set the namespace of the curop back to the view namespace so ctx records
@@ -627,7 +629,6 @@ Status runAggregate(OperationContext* opCtx,
             p.deleteUnderlying();
         }
     });
-
     for (size_t idx = 0; idx < execs.size(); ++idx) {
         ClientCursorParams cursorParams(
             std::move(execs[idx]),
@@ -635,7 +636,8 @@ Status runAggregate(OperationContext* opCtx,
             AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
             repl::ReadConcernArgs::get(opCtx),
             cmdObj,
-            ClientCursorParams::LockPolicy::kLocksInternally);
+            ClientCursorParams::LockPolicy::kLocksInternally,
+            privileges);
         if (expCtx->tailableMode == TailableModeEnum::kTailable) {
             cursorParams.setTailable(true);
         } else if (expCtx->tailableMode == TailableModeEnum::kTailableAndAwaitData) {
@@ -643,8 +645,7 @@ Status runAggregate(OperationContext* opCtx,
             cursorParams.setAwaitData(true);
         }
 
-        auto pin =
-            CursorManager::getGlobalCursorManager()->registerCursor(opCtx, std::move(cursorParams));
+        auto pin = CursorManager::get(opCtx)->registerCursor(opCtx, std::move(cursorParams));
         cursors.emplace_back(pin.getCursor());
         pins.emplace_back(std::move(pin));
     }

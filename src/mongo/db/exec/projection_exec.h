@@ -141,9 +141,9 @@ public:
                                 const int64_t recordId = 0) const;
 
     /**
-     * Performs a projection given a function to retrieve fields by name. This function handles
-     * projections which do not qualify for the COVERED_ONE_INDEX fast-path but are still coverd by
-     * indices.
+     * Performs a projection given index 'KeyData' to directly retrieve results. This function
+     * handles projections which do not qualify for the ProjectionNodeCovered fast-path but are
+     * still covered by indices.
      */
     StatusWith<BSONObj> projectCovered(
         const std::vector<IndexKeyDatum>& keyData,
@@ -152,6 +152,15 @@ public:
         const BSONObj& sortKey = BSONObj(),
         const boost::optional<const double> textScore = boost::none,
         const int64_t recordId = 0) const;
+
+    /**
+     * Determines if calls to the project method require that this object was created with the full
+     * query expression. We may need it for MatchDetails.
+     */
+    bool projectRequiresQueryExpression() const {
+        return ARRAY_OP_POSITIONAL == _arrayOpType;
+    }
+
 
 private:
     /**
@@ -196,13 +205,6 @@ private:
     Status projectHelper(const BSONObj& in,
                          BSONObjBuilder* bob,
                          const MatchDetails* details = nullptr) const;
-
-    /**
-     * See transform(...) above.
-     */
-    bool transformRequiresDetails() const {
-        return ARRAY_OP_POSITIONAL == _arrayOpType;
-    }
 
     /**
      * Appends the element 'e' to the builder 'bob', possibly descending into sub-fields of 'e'

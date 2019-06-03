@@ -35,12 +35,15 @@
 
 #include "mongo/client/dbclient_cursor.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/multi_index_block.h"
 #include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
+#include "mongo/db/cursor_manager.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/exec/queued_data_stage.h"
+#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/json.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/logical_clock.h"
@@ -92,9 +95,26 @@ protected:
     }
 
     void addIndex(const IndexSpec& spec) {
-        DBDirectClient client(&_opCtx);
-        client.createIndex(ns(), spec);
-        client.getLastError();
+        BSONObjBuilder builder(spec.toBSON());
+        builder.append("v", int(IndexDescriptor::kLatestIndexVersion));
+        builder.append("ns", ns());
+        auto specObj = builder.obj();
+
+        MultiIndexBlock indexer(&_opCtx, _collection);
+        {
+            WriteUnitOfWork wunit(&_opCtx);
+            uassertStatusOK(indexer.init(specObj, MultiIndexBlock::kNoopOnInitFn));
+            wunit.commit();
+        }
+        uassertStatusOK(indexer.insertAllDocumentsInCollection());
+        uassertStatusOK(indexer.drainBackgroundWrites());
+        uassertStatusOK(indexer.checkConstraints());
+        {
+            WriteUnitOfWork wunit(&_opCtx);
+            uassertStatusOK(indexer.commit(MultiIndexBlock::kNoopOnCreateEachFn,
+                                           MultiIndexBlock::kNoopOnCommitFn));
+            wunit.commit();
+        }
     }
 
     void insert(const char* s) {
@@ -284,8 +304,8 @@ public:
         {
             // Check that a cursor has been registered with the global cursor manager, and has
             // already returned its first batch of results.
-            auto pinnedCursor = unittest::assertGet(
-                CursorManager::getGlobalCursorManager()->pinCursor(&_opCtx, cursorId));
+            auto pinnedCursor =
+                unittest::assertGet(CursorManager::get(&_opCtx)->pinCursor(&_opCtx, cursorId));
             ASSERT_EQUALS(std::uint64_t(2), pinnedCursor.getCursor()->nReturnedSoFar());
         }
 
@@ -348,7 +368,7 @@ public:
         _client.dropCollection("unittests.querytests.GetMoreInvalidRequest");
     }
     void run() {
-        auto startNumCursors = CursorManager::getGlobalCursorManager()->numCursors();
+        auto startNumCursors = CursorManager::get(&_opCtx)->numCursors();
 
         // Create a collection with some data.
         const char* ns = "unittests.querytests.GetMoreInvalidRequest";
@@ -375,9 +395,8 @@ public:
             AssertionException);
 
         // Check that the cursor still exists.
-        ASSERT_EQ(startNumCursors + 1, CursorManager::getGlobalCursorManager()->numCursors());
-        ASSERT_OK(
-            CursorManager::getGlobalCursorManager()->pinCursor(&_opCtx, cursorId).getStatus());
+        ASSERT_EQ(startNumCursors + 1, CursorManager::get(&_opCtx)->numCursors());
+        ASSERT_OK(CursorManager::get(&_opCtx)->pinCursor(&_opCtx, cursorId).getStatus());
 
         // Check that the cursor can be iterated until all documents are returned.
         while (cursor->more()) {
@@ -387,7 +406,7 @@ public:
         ASSERT_EQUALS(1000, count);
 
         // The cursor should no longer exist, since we exhausted it.
-        ASSERT_EQ(startNumCursors, CursorManager::getGlobalCursorManager()->numCursors());
+        ASSERT_EQ(startNumCursors, CursorManager::get(&_opCtx)->numCursors());
     }
 };
 
@@ -1261,11 +1280,7 @@ public:
     }
 
     size_t numCursorsOpen() {
-        AutoGetCollectionForReadCommand ctx(&_opCtx, NamespaceString(_ns));
-        Collection* collection = ctx.getCollection();
-        if (!collection)
-            return 0;
-        return collection->getCursorManager()->numCursors();
+        return CursorManager::get(&_opCtx)->numCursors();
     }
 
     const char* ns() {

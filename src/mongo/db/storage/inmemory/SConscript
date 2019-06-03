@@ -5,9 +5,9 @@ env = env.Clone()
 
 if inmemory:
     imEnv = env.Clone()
-    imEnv.InjectThirdPartyIncludePaths(libraries=['wiredtiger'])
-    imEnv.InjectThirdPartyIncludePaths(libraries=['zlib'])
-    imEnv.InjectThirdPartyIncludePaths(libraries=['valgrind'])
+    imEnv.InjectThirdParty(libraries=['wiredtiger'])
+    imEnv.InjectThirdParty(libraries=['zlib'])
+    imEnv.InjectThirdParty(libraries=['valgrind'])
 
     imEnv.Library(
         target='storage_inmemory',

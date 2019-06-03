@@ -31,6 +31,9 @@
 
 #include "mongo/platform/basic.h"
 
+#include <iostream>
+#include <string>
+
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/set_index_commit_quorum_gen.h"
@@ -39,6 +42,7 @@
 #include "mongo/util/log.h"
 
 namespace mongo {
+
 namespace {
 
 /**
@@ -56,7 +60,17 @@ public:
     using Request = SetIndexCommitQuorum;
 
     std::string help() const override {
-        return "Resets the commitQuorum for an index build";
+        std::stringstream ss;
+        ss << "Resets the commitQuorum for the given index builds in a collection. Usage:"
+           << std::endl
+           << "{" << std::endl
+           << "    setIndexCommitQuorum: <string> collection name," << std::endl
+           << "    indexNames: array<string> list of index names," << std::endl
+           << "    commitQuorum: <string|number|object> option to define the required quorum for"
+           << std::endl
+           << "                  the index builds to commit" << std::endl
+           << "}";
+        return ss.str();
     }
 
     bool adminOnly() const override {

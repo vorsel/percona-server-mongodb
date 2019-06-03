@@ -3130,7 +3130,7 @@ var authCommandsLib = {
           testcases: [
               {
                 runOnDb: adminDbName,
-                roles: roles_monitoring,
+                roles: Object.extend({backup: 1}, roles_monitoring),
                 privileges: [{resource: {cluster: true}, actions: ["serverStatus"]}]
               },
               {runOnDb: firstDbName, roles: {}, expectFail: true},
@@ -3823,6 +3823,24 @@ var authCommandsLib = {
                 privileges:
                     [{resource: {db: secondDbName, collection: "foo"}, actions: ["find"]}]
               }
+          ]
+        },
+        {
+          testname: "dbstats_on_local",
+          command: {dbStats: 1},
+          skipSharded: true,
+          testcases: [
+              {
+                runOnDb: "local",
+                roles: {
+                    "readLocal": 1,
+                    "readWriteLocal": 1,
+                    "clusterAdmin": 1,
+                    "clusterMonitor": 1,
+                    "root": 1,
+                    "__system": 1,
+                },
+              },
           ]
         },
         {
@@ -5478,17 +5496,17 @@ var authCommandsLib = {
           testcases: [
               {
                 runOnDb: adminDbName,
-                roles: roles_monitoring,
+                roles: Object.extend({backup: 1}, roles_monitoring),
                 privileges: [{resource: {cluster: true}, actions: ["serverStatus"]}]
               },
               {
                 runOnDb: firstDbName,
-                roles: roles_monitoring,
+                roles: Object.extend({backup: 1}, roles_monitoring),
                 privileges: [{resource: {cluster: true}, actions: ["serverStatus"]}]
               },
               {
                 runOnDb: secondDbName,
-                roles: roles_monitoring,
+                roles: Object.extend({backup: 1}, roles_monitoring),
                 privileges: [{resource: {cluster: true}, actions: ["serverStatus"]}]
               }
           ]
@@ -5954,7 +5972,29 @@ var authCommandsLib = {
                       {killCursors: "$cmd.aggregate", cursors: [response.cursor.id]}));
               }
           }
-        }
+        },
+        {
+          testname: "startRecordingTraffic",
+          command: {startRecordingTraffic: 1, filename: "notARealPath"},
+          testcases: [
+              {runOnDb: adminDbName, roles: roles_hostManager},
+          ],
+          teardown: (db, response) => {
+              if (response.ok) {
+                  assert.commandWorked(db.runCommand({stopRecordingTraffic: 1}));
+              }
+          }
+        },
+        {
+          testname: "stopRecordingTraffic",
+          command: {stopRecordingTraffic: 1},
+          testcases: [
+              {runOnDb: adminDbName, roles: roles_hostManager},
+          ],
+          setup: function(db) {
+              db.runCommand({startRecordingTraffic: 1, filename: "notARealPath"});
+          }
+        },
     ],
 
     /************* SHARED TEST LOGIC ****************/

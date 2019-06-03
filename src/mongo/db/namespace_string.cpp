@@ -73,6 +73,10 @@ const NamespaceString NamespaceString::kShardConfigDatabasesNamespace(NamespaceS
 const NamespaceString NamespaceString::kSystemKeysNamespace(NamespaceString::kAdminDb,
                                                             "system.keys");
 const NamespaceString NamespaceString::kRsOplogNamespace(NamespaceString::kLocalDb, "oplog.rs");
+const NamespaceString NamespaceString::kSystemReplSetNamespace(NamespaceString::kLocalDb,
+                                                               "system.replset");
+const NamespaceString NamespaceString::kIndexBuildEntryNamespace(NamespaceString::kConfigDb,
+                                                                 "system.indexBuilds");
 
 bool NamespaceString::isListCollectionsCursorNS() const {
     return coll() == listCollectionsCursorCol;
@@ -249,6 +253,14 @@ std::ostream& operator<<(std::ostream& stream, const NamespaceString& nss) {
 
 std::ostream& operator<<(std::ostream& stream, const NamespaceStringOrUUID& nsOrUUID) {
     return stream << nsOrUUID.toString();
+}
+
+StringBuilder& operator<<(StringBuilder& builder, const NamespaceString& nss) {
+    return builder << nss.toString();
+}
+
+StringBuilder& operator<<(StringBuilder& builder, const NamespaceStringOrUUID& nsOrUUID) {
+    return builder << nsOrUUID.toString();
 }
 
 }  // namespace mongo

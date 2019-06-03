@@ -109,6 +109,12 @@ public:
 
     virtual Status checkIfWriteConcernCanBeSatisfied(const WriteConcernOptions& writeConcern) const;
 
+    virtual Status checkIfCommitQuorumCanBeSatisfied(const CommitQuorumOptions& commitQuorum) const;
+
+    virtual StatusWith<bool> checkIfCommitQuorumIsSatisfied(
+        const CommitQuorumOptions& commitQuorum,
+        const std::vector<HostAndPort>& commitReadyMembers) const;
+
     virtual Status checkCanServeReadsFor(OperationContext* opCtx,
                                          const NamespaceString& ns,
                                          bool slaveOk);
@@ -287,6 +293,8 @@ public:
     virtual boost::optional<Timestamp> getRecoveryTimestamp() override;
 
     virtual bool setContainsArbiter() const override;
+
+    virtual void attemptToAdvanceStableTimestamp() override;
 
 private:
     AtomicWord<unsigned long long> _snapshotNameGenerator;

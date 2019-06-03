@@ -353,6 +353,17 @@ Status ReplicationCoordinatorEmbedded::checkIfWriteConcernCanBeSatisfied(
     UASSERT_NOT_IMPLEMENTED;
 }
 
+Status ReplicationCoordinatorEmbedded::checkIfCommitQuorumCanBeSatisfied(
+    const CommitQuorumOptions& commitQuorum) const {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
+StatusWith<bool> ReplicationCoordinatorEmbedded::checkIfCommitQuorumIsSatisfied(
+    const CommitQuorumOptions& commitQuorum,
+    const std::vector<HostAndPort>& commitReadyMembers) const {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
 Status ReplicationCoordinatorEmbedded::checkReplEnabledForCommand(BSONObjBuilder*) {
     return Status(ErrorCodes::NoReplicationEnabled, "no replication on embedded");
 }
@@ -437,6 +448,10 @@ boost::optional<Timestamp> ReplicationCoordinatorEmbedded::getRecoveryTimestamp(
 }
 
 bool ReplicationCoordinatorEmbedded::setContainsArbiter() const {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
+void ReplicationCoordinatorEmbedded::attemptToAdvanceStableTimestamp() {
     UASSERT_NOT_IMPLEMENTED;
 }
 

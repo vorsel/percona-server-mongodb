@@ -35,6 +35,7 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/txn_cmds_gen.h"
+#include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/repl_client_info.h"
@@ -47,13 +48,15 @@ namespace {
 
 MONGO_FAIL_POINT_DEFINE(participantReturnNetworkErrorForAbortAfterExecutingAbortLogic);
 MONGO_FAIL_POINT_DEFINE(participantReturnNetworkErrorForCommitAfterExecutingCommitLogic);
+MONGO_FAIL_POINT_DEFINE(hangBeforeCommitingTxn);
+MONGO_FAIL_POINT_DEFINE(hangBeforeAbortingTxn);
 
 class CmdCommitTxn : public BasicCommand {
 public:
     CmdCommitTxn() : BasicCommand("commitTransaction") {}
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
-        return AllowedOnSecondary::kAlways;
+        return AllowedOnSecondary::kNever;
     }
 
     virtual bool adminOnly() const {
@@ -108,10 +111,13 @@ public:
                 "Transaction isn't in progress",
                 txnParticipant->inMultiDocumentTransaction());
 
+        CurOpFailpointHelpers::waitWhileFailPointEnabled(
+            &hangBeforeCommitingTxn, opCtx, "hangBeforeCommitingTxn");
+
         auto optionalCommitTimestamp = cmd.getCommitTimestamp();
         if (optionalCommitTimestamp) {
             // commitPreparedTransaction will throw if the transaction is not prepared.
-            txnParticipant->commitPreparedTransaction(opCtx, optionalCommitTimestamp.get());
+            txnParticipant->commitPreparedTransaction(opCtx, optionalCommitTimestamp.get(), {});
         } else {
             // commitUnpreparedTransaction will throw if the transaction is prepared.
             txnParticipant->commitUnpreparedTransaction(opCtx);
@@ -131,7 +137,7 @@ public:
     CmdAbortTxn() : BasicCommand("abortTransaction") {}
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
-        return AllowedOnSecondary::kAlways;
+        return AllowedOnSecondary::kNever;
     }
 
     virtual bool adminOnly() const {
@@ -167,6 +173,9 @@ public:
         uassert(ErrorCodes::NoSuchTransaction,
                 "Transaction isn't in progress",
                 txnParticipant->inMultiDocumentTransaction());
+
+        CurOpFailpointHelpers::waitWhileFailPointEnabled(
+            &hangBeforeAbortingTxn, opCtx, "hangBeforeAbortingTxn");
 
         txnParticipant->abortActiveTransaction(opCtx);
 

@@ -71,21 +71,7 @@ public:
     MultiIndexBlock(OperationContext* opCtx, Collection* collection);
     ~MultiIndexBlock();
 
-    /**
-     * By default we ignore the 'background' flag in specs when building an index. If this is
-     * called before init(), we will build the indexes in the background as long as *all* specs
-     * call for background indexing. If any spec calls for foreground indexing all indexes will
-     * be built in the foreground, as there is no concurrency benefit to building a subset of
-     * indexes in the background, but there is a performance benefit to building all in the
-     * foreground.
-     */
-    void allowBackgroundBuilding();
-
-    /**
-     * Call this before init() to allow the index build to be interrupted.
-     * This only affects builds using the insertAllDocumentsInCollection helper.
-     */
-    void allowInterruption();
+    static bool areHybridIndexBuildsEnabled();
 
     /**
      * By default we enforce the 'unique' flag in specs when building an index by failing.
@@ -101,13 +87,31 @@ public:
      * Prepares the index(es) for building and returns the canonicalized form of the requested index
      * specifications.
      *
+     * Calls 'onInitFn' in the same WriteUnitOfWork as the 'ready: false' write to the index after
+     * all indexes have been initialized. For callers that timestamp this write, use
+     * 'makeTimestampedIndexOnInitFn', otherwise use 'kNoopOnInitFn'.
+     *
      * Does not need to be called inside of a WriteUnitOfWork (but can be due to nesting).
      *
      * Requires holding an exclusive database lock.
      */
-    StatusWith<std::vector<BSONObj>> init(const std::vector<BSONObj>& specs);
+    using OnInitFn = stdx::function<void()>;
+    StatusWith<std::vector<BSONObj>> init(const std::vector<BSONObj>& specs, OnInitFn onInit);
+    StatusWith<std::vector<BSONObj>> init(const BSONObj& spec, OnInitFn onInit);
 
-    StatusWith<std::vector<BSONObj>> init(const BSONObj& spec);
+    /**
+     * Not all index initializations need an OnInitFn, in particular index builds that do not need
+     * to timestamp catalog writes. This is a no-op.
+     */
+    static OnInitFn kNoopOnInitFn;
+
+    /**
+     * Returns an OnInit function for initialization when this index build should be timestamped.
+     * When called on primaries, this generates a new optime, writes a no-op oplog entry, and
+     * timestamps the first catalog write. Does nothing on secondaries.
+     */
+    static OnInitFn makeTimestampedIndexOnInitFn(OperationContext* opCtx, const Collection* coll);
+
 
     /**
      * Inserts all documents in the Collection into the indexes and logs with timing info.
@@ -155,9 +159,13 @@ public:
      * before calling commit(), stop writes on the collection by holding a S or X while calling this
      * method.
      *
+     * When 'readSource' is not kUnset, perform the drain by reading at the timestamp described by
+     * the ReadSource.
+     *
      * Must not be in a WriteUnitOfWork.
      */
-    Status drainBackgroundWritesIfNeeded();
+    Status drainBackgroundWrites(
+        RecoveryUnit::ReadSource readSource = RecoveryUnit::ReadSource::kUnset);
 
     /**
      * Check any constraits that may have been temporarily violated during the index build for
@@ -175,12 +183,21 @@ public:
      * Should be called inside of a WriteUnitOfWork. If the index building is to be logOp'd,
      * logOp() should be called from the same unit of work as commit().
      *
-     * `onCreateFn` will be called on each index before writes that mark the index as "ready".
+     * `onCreateEach` will be called after each index has been marked as "ready".
+     * `onCommit` will be called after all indexes have been marked "ready".
      *
      * Requires holding an exclusive database lock.
      */
-    Status commit();
-    Status commit(stdx::function<void(const BSONObj& spec)> onCreateFn);
+    using OnCommitFn = stdx::function<void()>;
+    using OnCreateEachFn = stdx::function<void(const BSONObj& spec)>;
+    Status commit(OnCreateEachFn onCreateEach, OnCommitFn onCommit);
+
+    /**
+     * Not all index commits need these functions, in particular index builds that do not need
+     * to timestamp catalog writes. These are no-ops.
+     */
+    static OnCreateEachFn kNoopOnCreateEachFn;
+    static OnCommitFn kNoopOnCommitFn;
 
     /**
      * Returns true if this index builder was added to the index catalog successfully.
@@ -225,7 +242,11 @@ public:
      */
     void abortWithoutCleanup();
 
-    bool getBuildInBackground() const;
+    /**
+     * Returns true if this build block supports background writes while building an index. This is
+     * true for the kHybrid and kBackground methods.
+     */
+    bool isBackgroundBuilding() const;
 
     /**
      * State transitions:
@@ -289,8 +310,8 @@ private:
     Collection* _collection;
     OperationContext* _opCtx;
 
-    bool _buildInBackground = false;
-    bool _allowInterruption = false;
+    IndexBuildMethod _method = IndexBuildMethod::kHybrid;
+
     bool _ignoreUnique = false;
 
     bool _needToCleanup = true;
@@ -306,4 +327,5 @@ private:
 // The ASSERT_*() macros use this function to print the value of 'state' when the predicate fails.
 std::ostream& operator<<(std::ostream& os, const MultiIndexBlock::State& state);
 
+logger::LogstreamBuilder& operator<<(logger::LogstreamBuilder& out, const IndexBuildMethod& method);
 }  // namespace mongo

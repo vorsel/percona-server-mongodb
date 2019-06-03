@@ -57,72 +57,40 @@ class PlanExecutor;
  * ClientCursors. It is also responsible for allocating the cursor ids that are passed back to
  * clients.
  *
- * There is a CursorManager per-collection and a global CursorManager. The global CursorManager owns
- * cursors whose lifetime is not tied to that of the collection and which do not need to receive
- * notifications about writes for a particular collection. In contrast, cursors owned by a
- * collection's CursorManager, unless pinned, are destroyed when the collection is destroyed.
- *
- * Callers must hold the collection lock in at least MODE_IS in order to access a collection's
- * CursorManager, which guards against the CursorManager being concurrently deleted due to a
- * catalog-level operation such as a collection drop. No locks are required to access the global
- * cursor manager.
- *
- * The CursorManager is internally synchronized; operations on a given collection may call methods
- * concurrently on that collection's CursorManager.
+ * There is a process-global CursorManager on every mongod which is responsible for managing all
+ * open cursors on the node. No lock manager locks are required to access this global cursor
+ * manager. The CursorManager is internally synchronized, and unless otherwise noted its public
+ * methods are thread-safe. For scalability in circumstances where many threads may be concurrently
+ * accessing the CursorManager (i.e. a workload which runs many concurrent queries), the cursor
+ * manager's underlying data structure is partitioned. Each partition is protected by its own latch.
  *
  * See clientcursor.h for more information.
  */
 class CursorManager {
 public:
     /**
-     * Appends the sessions that have open cursors on the global cursor manager and across
-     * all collection-level cursor managers to the given set of lsids.
+     * Returns a pointer to the cursor manager defined within the specified ServiceContext.
      */
-    static void appendAllActiveSessions(OperationContext* opCtx, LogicalSessionIdSet* lsids);
+    static CursorManager* get(ServiceContext* svcCtx);
 
     /**
-     * Returns a list of GenericCursors for all idle cursors on the global cursor manager and across
-     * all collection-level cursor managers. Does not include currently pinned cursors.
-     * 'userMode': If auth is on, calling with userMode as kExcludeOthers will cause this function
-     * to only return cursors owned by the caller. If auth is off, this argument does not matter.
+     * Returns a pointer to the cursor manager defined within the specified OperationContext.
      */
-    static std::vector<GenericCursor> getIdleCursors(
-        OperationContext* opCtx, MongoProcessInterface::CurrentOpUserMode userMode);
+    static CursorManager* get(OperationContext* opCtx);
 
     /**
-     * Kills cursors with matching logical sessions. Returns a pair with the overall
-     * Status of the operation and the number of cursors successfully killed.
+     * Registers the new cursor manager within the specified ServiceContext.
      */
-    static std::pair<Status, int> killCursorsWithMatchingSessions(
-        OperationContext* opCtx, const SessionKiller::Matcher& matcher);
+    static void set(ServiceContext* svcCtx, std::unique_ptr<CursorManager> newCursorManager);
 
-    CursorManager(NamespaceString nss);
+
+    CursorManager();
 
     /**
-     * Destroys the CursorManager. All cursors must be cleaned up via invalidateAll() before
-     * destruction.
+     * Destroys the cursor manager, deleting all managed cursors. Illegal to call if any managed
+     * cursor is pinned.
      */
     ~CursorManager();
-
-    /**
-     * Kills all managed ClientCursors. Callers must have exclusive access to the collection (i.e.
-     * must have the collection, database, or global resource locked in MODE_X).
-     *
-     * Must be called before the CursorManger is destroyed.
-     *
-     * 'collectionGoingAway' indicates whether the Collection instance is being deleted.  This could
-     * be because the db is being closed, or the collection/db is being dropped.
-     *
-     * For any cursors that are in use by an active operation, ownership is transferred to the
-     * respective cursor pin objects.
-     *
-     * The 'reason' is the motivation for invalidating all cursors. This will be used for error
-     * reporting and logging when an operation finds that the cursor it was operating on has been
-     * killed.
-     */
-    void invalidateAll(OperationContext* opCtx,
-                       bool collectionGoingAway,
-                       const std::string& reason);
 
     /**
      * Destroys cursors that have been inactive for too long.
@@ -180,11 +148,13 @@ public:
     void appendActiveSessions(LogicalSessionIdSet* lsids) const;
 
     /**
-     * Appends all idle (non-pinned) cursors in this cursor manager to the output vector.
+     * Returns a vector of all idle (non-pinned) cursors in this cursor manager.
+     *
+     * If auth is on, calling with 'userMode' as 'kExcludeOthers' will cause this function to only
+     * return cursors owned by the caller. If auth is off, this argument does not matter.
      */
-    void appendIdleCursors(AuthorizationSession* ctxAuth,
-                           MongoProcessInterface::CurrentOpUserMode userMode,
-                           std::vector<GenericCursor>* cursors) const;
+    std::vector<GenericCursor> getIdleCursors(
+        OperationContext* opCtx, MongoProcessInterface::CurrentOpUserMode userMode) const;
 
     /*
      * Returns a list of all open cursors for the given session.
@@ -196,39 +166,12 @@ public:
      */
     std::size_t numCursors() const;
 
-    static CursorManager* getGlobalCursorManager();
-
     /**
-     * Returns true if this CursorId would be registered with the global CursorManager. Note that if
-     * this method returns true it does not imply the cursor exists.
+     * Kills cursors in this cursor manager with matching logical sessions. Returns a pair with the
+     * overall Status of the operation and the number of cursors successfully killed.
      */
-    static bool isGloballyManagedCursor(CursorId cursorId) {
-        // The first two bits are 01 for globally managed cursors, and 00 for cursors owned by a
-        // collection. The leading bit is always 0 so that CursorIds do not appear as negative.
-        const long long mask = static_cast<long long>(0b11) << 62;
-        return (cursorId & mask) == (static_cast<long long>(0b01) << 62);
-    }
-
-    static int killCursorGlobalIfAuthorized(OperationContext* opCtx, int n, const char* ids);
-
-    static bool killCursorGlobalIfAuthorized(OperationContext* opCtx, CursorId id);
-
-    static bool killCursorGlobal(OperationContext* opCtx, CursorId id);
-
-    /**
-     * Deletes inactive cursors from the global cursor manager and from all per-collection cursor
-     * managers. Returns the number of cursors that were timed out.
-     */
-    static std::size_t timeoutCursorsGlobal(OperationContext* opCtx, Date_t now);
-
-    /**
-     * Locate the correct cursor manager for a given cursorId and execute the provided callback.
-     * Returns ErrorCodes::CursorNotFound if cursorId does not exist.
-     */
-    static Status withCursorManager(OperationContext* opCtx,
-                                    CursorId id,
-                                    const NamespaceString& nss,
-                                    stdx::function<Status(CursorManager*)> callback);
+    std::pair<Status, int> killCursorsWithMatchingSessions(OperationContext* opCtx,
+                                                           const SessionKiller::Matcher& matcher);
 
 private:
     static constexpr int kNumPartitions = 16;
@@ -249,14 +192,6 @@ private:
                std::unique_ptr<ClientCursor, ClientCursor::Deleter> cursor);
 
     bool cursorShouldTimeout_inlock(const ClientCursor* cursor, Date_t now);
-
-    bool isGlobalManager() const {
-        return _nss.isEmpty();
-    }
-
-    // No locks are needed to consult these data members.
-    const NamespaceString _nss;
-    const uint32_t _collectionCacheRuntimeId;
 
     // A CursorManager holds a pointer to all open ClientCursors. ClientCursors are owned by the
     // CursorManager, except when they are in use by a ClientCursorPin. When in use by a pin, an

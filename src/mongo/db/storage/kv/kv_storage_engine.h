@@ -165,6 +165,8 @@ public:
 
     virtual void setCachePressureForTest(int pressure) override;
 
+    virtual bool supportsRecoverToStableTimestamp() const override;
+
     virtual bool supportsRecoveryTimestamp() const override;
 
     virtual StatusWith<Timestamp> recoverToStableTimestamp(OperationContext* opCtx) override;
@@ -208,7 +210,7 @@ public:
         /**
          * Timestamps that can be listened to for changes.
          */
-        enum class TimestampType { kCheckpoint, kOldest, kStable };
+        enum class TimestampType { kCheckpoint, kOldest, kStable, kMinOfCheckpointAndOldest };
 
         /**
          * A TimestampListener is used to listen for changes in a given timestamp and to execute the
@@ -241,6 +243,8 @@ public:
                     _onOldestTimestampChanged(newTimestamp);
                 else if (_type == TimestampType::kStable)
                     _onStableTimestampChanged(newTimestamp);
+                else if (_type == TimestampType::kMinOfCheckpointAndOldest)
+                    _onMinOfCheckpointAndOldestTimestampChanged(newTimestamp);
             }
 
             TimestampType getType() const {
@@ -257,6 +261,10 @@ public:
             }
 
             void _onStableTimestampChanged(Timestamp newTimestamp) noexcept {
+                _callback(newTimestamp);
+            }
+
+            void _onMinOfCheckpointAndOldestTimestampChanged(Timestamp newTimestamp) noexcept {
                 _callback(newTimestamp);
             }
 
@@ -301,6 +309,7 @@ public:
             Timestamp checkpoint;
             Timestamp oldest;
             Timestamp stable;
+            Timestamp minOfCheckpointAndOldest;
         };
 
         KVEngine* _engine;
@@ -394,9 +403,10 @@ private:
     void _dumpCatalog(OperationContext* opCtx);
 
     /**
-     * Called when the oldest timestamp advances in the KVEngine.
+     * Called when the min of checkpoint timestamp (if exists) and oldest timestamp advances in the
+     * KVEngine.
      */
-    void _onOldestTimestampChanged(const Timestamp& oldestTimestamp);
+    void _onMinOfCheckpointAndOldestTimestampChanged(const Timestamp& timestamp);
 
     class RemoveDBChange;
 
@@ -410,8 +420,8 @@ private:
     // Manages drop-pending idents. Requires access to '_engine'.
     KVDropPendingIdentReaper _dropPendingIdentReaper;
 
-    // Listener for oldest timestamp changes.
-    TimestampMonitor::TimestampListener _oldestTimestampListener;
+    // Listener for min of checkpoint and oldest timestamp changes.
+    TimestampMonitor::TimestampListener _minOfCheckpointAndOldestTimestampListener;
 
     const bool _supportsDocLocking;
     const bool _supportsDBLocking;

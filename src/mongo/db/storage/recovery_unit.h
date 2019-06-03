@@ -190,17 +190,20 @@ public:
      * Returns the Timestamp being used by this recovery unit or boost::none if not reading from
      * a point in time. Any point in time returned will reflect one of the following:
      *  - when using ReadSource::kProvided, the timestamp provided.
+     *  - when using ReadSource::kNoOverlap, the timestamp chosen by the storage engine.
      *  - when using ReadSource::kLastAppliedSnapshot, the timestamp chosen using the storage
      * engine's last applied timestamp.
      *  - when using ReadSource::kAllCommittedSnapshot, the timestamp chosen using the storage
      * engine's all-committed timestamp.
-     *  - when using ReadSource::kLastApplied, the last applied timestamp at which the current
-     * storage transaction was opened, if one is open.
+     *  - when using ReadSource::kLastApplied, the timestamp chosen using the storage engine's last
+     * applied timestamp. Can return boost::none if no timestamp has been established.
      *  - when using ReadSource::kMajorityCommitted, the majority committed timestamp chosen by the
      * storage engine after a transaction has been opened or after a call to
      * obtainMajorityCommittedSnapshot().
+     *
+     * This may passively start a storage engine transaction to establish a read timestamp.
      */
-    virtual boost::optional<Timestamp> getPointInTimeReadTimestamp() const {
+    virtual boost::optional<Timestamp> getPointInTimeReadTimestamp() {
         return boost::none;
     }
 
@@ -238,6 +241,12 @@ public:
     virtual void setCommitTimestamp(Timestamp timestamp) {}
 
     /**
+     * Sets a timestamp that decides when all the future writes on this RecoveryUnit will be
+     * durable.
+     */
+    virtual void setDurableTimestamp(Timestamp timestamp) {}
+
+    /**
      * Clears the commit timestamp that was set by setCommitTimestamp(). This must be called outside
      * of a WUOW. This must be called when a commit timestamp is set.
      */
@@ -247,6 +256,13 @@ public:
      * Returns the commit timestamp. Can be called at any time.
      */
     virtual Timestamp getCommitTimestamp() const {
+        return {};
+    }
+
+    /**
+     * Returns the durable timestamp.
+     */
+    virtual Timestamp getDurableTimestamp() const {
         return {};
     }
 
@@ -279,7 +295,7 @@ public:
     }
 
     /**
-     * The ReadSource indicates which exteral or provided timestamp to read from for future
+     * The ReadSource indicates which external or provided timestamp to read from for future
      * transactions.
      */
     enum ReadSource {
@@ -295,6 +311,10 @@ public:
          * Read from the majority all-commmitted timestamp.
          */
         kMajorityCommitted,
+        /**
+         * Read from the latest timestamp where no future transactions will commit at or before.
+         */
+        kNoOverlap,
         /**
          * Read from the last applied timestamp. New transactions start at the most up-to-date
          * timestamp.

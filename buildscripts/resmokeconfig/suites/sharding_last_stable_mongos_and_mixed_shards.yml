@@ -38,6 +38,7 @@ selector:
   - jstests/sharding/failcommand_ignores_internal.js
   - jstests/sharding/geo_near_random1.js
   - jstests/sharding/geo_near_random2.js
+  - jstests/sharding/graph_lookup.js
   - jstests/sharding/lookup.js
   - jstests/sharding/lookup_mongod_unaware.js
   - jstests/sharding/lookup_stale_mongos.js
@@ -51,10 +52,13 @@ selector:
   - jstests/sharding/out_unique_key.js
   - jstests/sharding/out_unique_key_requires_index.js
   - jstests/sharding/out_with_chunk_migrations.js
+  - jstests/sharding/out_with_drop_shard.js
+  - jstests/sharding/out_with_move_primary.js
   - jstests/sharding/out_write_concern.js
   - jstests/sharding/restart_transactions.js
   - jstests/sharding/shard7.js
   - jstests/sharding/shard_config_db_collections.js
+  - jstests/sharding/lookup_on_shard.js
   # TODO: SERVER-38541 remove from blacklist
   - jstests/sharding/shard_collection_existing_zones.js
   - jstests/sharding/single_shard_transaction_with_arbiter.js
@@ -66,7 +70,6 @@ selector:
   - jstests/sharding/transactions_implicit_abort.js
   - jstests/sharding/transactions_multi_writes.js
   - jstests/sharding/transactions_read_concerns.js
-  - jstests/sharding/transactions_recover_decision_from_local_participant.js
   - jstests/sharding/transactions_reject_writes_for_moved_chunks.js
   - jstests/sharding/transactions_snapshot_errors_first_statement.js
   - jstests/sharding/transactions_snapshot_errors_subsequent_statements.js
@@ -77,10 +80,12 @@ selector:
   - jstests/sharding/transactions_view_resolution.js
   - jstests/sharding/transactions_writes_not_retryable.js
   - jstests/sharding/txn_agg.js
-  - jstests/sharding/txn_basic_two_phase_commit.js
-  - jstests/sharding/txn_coordinator_commands_basic_requirements.js
-  - jstests/sharding/txn_failover_two_phase_commit.js
-  - jstests/sharding/txn_wait_for_majority_commit_after_stepup.js
+  - jstests/sharding/txn_two_phase_commit_basic.js
+  - jstests/sharding/txn_two_phase_commit_commands_basic_requirements.js
+  - jstests/sharding/txn_two_phase_commit_failover.js
+  - jstests/sharding/txn_two_phase_commit_killop.js
+  - jstests/sharding/txn_two_phase_commit_recover_decision.js
+  - jstests/sharding/txn_two_phase_commit_wait_for_majority_commit_after_stepup.js
   - jstests/sharding/txn_writes_during_movechunk.js
   - jstests/sharding/update_sharded.js
   - jstests/sharding/shard_existing_coll_chunk_count.js

@@ -335,6 +335,7 @@ class EvergreenConfigGeneratorTest(unittest.TestCase):
         options.use_large_distro = None
         options.use_multiversion = False
         options.is_patch = True
+        options.repeat_suites = 1
 
         return options
 
@@ -434,6 +435,24 @@ class EvergreenConfigGeneratorTest(unittest.TestCase):
         cfg_generator._add_dependencies(cfg_mock)
         self.assertEqual(4, cfg_mock.dependency.call_count)
 
+    def test_evg_config_has_timeouts_for_repeated_suites(self):
+        options = self.generate_mock_options()
+        options.repeat_suites = 5
+        suites = self.generate_mock_suites(3)
+
+        config = grt.EvergreenConfigGenerator(suites, options, Mock()).generate_config().to_map()
+
+        self.assertEqual(len(config["tasks"]), len(suites) + 1)
+        command1 = config["tasks"][0]["commands"][2]
+        self.assertIn(" --repeatSuites=5 ", command1["vars"]["resmoke_args"])
+        self.assertIn(options.resmoke_args, command1["vars"]["resmoke_args"])
+        timeout_cmd = config["tasks"][0]["commands"][0]
+        self.assertEqual("timeout.update", timeout_cmd["command"])
+        expected_timeout = grt.calculate_timeout(suites[0].max_runtime, 3) * 5
+        self.assertEqual(expected_timeout, timeout_cmd["params"]["timeout_secs"])
+        expected_exec_timeout = grt.calculate_timeout(suites[0].get_runtime(), 3) * 5
+        self.assertEqual(expected_exec_timeout, timeout_cmd["params"]["exec_timeout_secs"])
+
 
 class NormalizeTestNameTest(unittest.TestCase):
     def test_unix_names(self):
@@ -473,6 +492,7 @@ class MainTest(unittest.TestCase):
                 self.assertEqual(10, len(suite.tests))
 
     def test_calculate_suites_fallback(self):
+        n_tests = 100
         response = Mock()
         response.status_code = requests.codes.SERVICE_UNAVAILABLE
         evg = Mock()
@@ -482,13 +502,32 @@ class MainTest(unittest.TestCase):
         main.options = Mock()
         main.options.execution_time_minutes = 10
         main.config_options = self.get_mock_options()
-        main.list_tests = Mock(return_value=["test{}.js".format(i) for i in range(100)])
+        main.list_tests = Mock(return_value=["test{}.js".format(i) for i in range(n_tests)])
 
         suites = main.calculate_suites(_DATE, _DATE)
 
         self.assertEqual(main.config_options.fallback_num_sub_suites, len(suites))
         for suite in suites:
             self.assertEqual(50, len(suite.tests))
+
+        self.assertEqual(n_tests, len(main.test_list))
+
+    def test_calculate_suites_uses_fallback_for_no_results(self):
+        n_tests = 100
+        evg = Mock()
+        evg.test_stats.return_value = []
+
+        main = grt.Main(evg)
+        main.options = Mock()
+        main.config_options = self.get_mock_options()
+        main.list_tests = Mock(return_value=["test{}.js".format(i) for i in range(n_tests)])
+        suites = main.calculate_suites(_DATE, _DATE)
+
+        self.assertEqual(main.config_options.fallback_num_sub_suites, len(suites))
+        for suite in suites:
+            self.assertEqual(50, len(suite.tests))
+
+        self.assertEqual(n_tests, len(main.test_list))
 
     def test_calculate_suites_error(self):
         response = Mock()

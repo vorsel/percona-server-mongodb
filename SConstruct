@@ -28,12 +28,13 @@ import mongo.toolchain as mongo_toolchain
 import mongo.generators as mongo_generators
 
 EnsurePythonVersion(2, 7)
-EnsureSConsVersion(2, 5)
+EnsureSConsVersion(3, 0, 4)
 
 from buildscripts import utils
 from buildscripts import moduleconfig
 
 import libdeps
+import psutil
 
 atexit.register(mongo.print_build_failures)
 
@@ -291,7 +292,7 @@ add_option('durableDefaultOn',
 )
 
 add_option('allocator',
-    choices=["auto", "system", "tcmalloc"],
+    choices=["auto", "system", "tcmalloc", "tcmalloc-experimental"],
     default="auto",
     help='allocator to use (use "auto" for best choice for current platform)',
     type='choice',
@@ -498,8 +499,8 @@ add_option('cache-dir',
 )
 
 add_option("cxx-std",
-    choices=["14", "17"],
-    default="14",
+    choices=["17"],
+    default="17",
     help="Select the C++ langauge standard to build with",
 )
 
@@ -572,9 +573,14 @@ add_option('msvc-debugging-format',
 )
 
 add_option('jlink',
-        help="Limit link concurrency to given value",
-        nargs=1,
-        type=int)
+        help="Limit link concurrency. Takes either an integer to limit to or a"
+        " float between 0 and 1.0 whereby jobs will be multiplied to get the final"
+        " jlink value."
+        "\n\nExample: --jlink=0.75 --jobs 8 will result in a jlink value of 6",
+        const=0.5,
+        default=None,
+        nargs='?',
+        type=float)
 
 try:
     with open("version.json", "r") as version_fp:
@@ -1421,6 +1427,10 @@ if link_model.startswith("dynamic"):
     # If that condition is met, then the graph will be acyclic.
 
     if env.TargetOSIs('darwin'):
+        if link_model.startswith('dynamic'):
+            print("WARNING: Building MongoDB server with dynamic linking " +
+                  "on macOS is not supported. Static linking is recommended.")
+
         if link_model == "dynamic-strict":
             # Darwin is strict by default
             pass
@@ -1635,43 +1645,83 @@ elif env.TargetOSIs('windows'):
     env.Append( CPPDEFINES=[ "UNICODE" ] )
 
     # Temporary fixes to allow compilation with VS2017
-    env.Append( CPPDEFINES=[ "_SILENCE_FPOS_SEEKPOS_DEPRECATION_WARNING" ] )
+    env.Append(CPPDEFINES=[
+        "_SILENCE_CXX17_ALLOCATOR_VOID_DEPRECATION_WARNING",
+        "_SILENCE_CXX17_OLD_ALLOCATOR_MEMBERS_DEPRECATION_WARNING",
+        "_SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING",
+    ])
 
     # /EHsc exception handling style for visual studio
     # /W3 warning level
     env.Append(CCFLAGS=["/EHsc","/W3"])
 
-    # some warnings we don't like:
-    # c4355
-    # 'this' : used in base member initializer list
-    #    The this pointer is valid only within nonstatic member functions. It cannot be used in the initializer list for a base class.
-    # c4800
-    # 'type' : forcing value to bool 'true' or 'false' (performance warning)
-    #    This warning is generated when a value that is not bool is assigned or coerced into type bool.
-    # c4267
-    # 'var' : conversion from 'size_t' to 'type', possible loss of data
-    # When compiling with /Wp64, or when compiling on a 64-bit operating system, type is 32 bits but size_t is 64 bits when compiling for 64-bit targets. To fix this warning, use size_t instead of a type.
-    # c4244
-    # 'conversion' conversion from 'type1' to 'type2', possible loss of data
-    #  An integer type is converted to a smaller integer type.
-    # c4290
-    #  C++ exception specification ignored except to indicate a function is not __declspec(nothrow
-    #  A function is declared using exception specification, which Visual C++ accepts but does not
-    #  implement
-    # c4068
-    #  unknown pragma -- added so that we can specify unknown pragmas for other compilers
-    # c4351
-    #  on extremely old versions of MSVC (pre 2k5), default constructing an array member in a
-    #  constructor's initialization list would not zero the array members "in some cases".
-    #  since we don't target MSVC versions that old, this warning is safe to ignore.
-    # c4373
-    #  Older versions of MSVC would fail to make a function in a derived class override a virtual
-    #  function in the parent, when defined inline and at least one of the parameters is made const.
-    #  The behavior is incorrect under the standard.  MSVC is fixed now, and the warning exists
-    #  merely to alert users who may have relied upon the older, non-compliant behavior.  Our code
-    #  should not have any problems with the older behavior, so we can just disable this warning.
-    env.Append( CCFLAGS=["/wd4355", "/wd4800", "/wd4267", "/wd4244",
-                         "/wd4290", "/wd4068", "/wd4351", "/wd4373"] )
+    # Suppress some warnings we don't like, or find necessary to
+    # suppress. Please keep this list alphabetized and commented.
+    env.Append(CCFLAGS=[
+
+        # C4068: unknown pragma. added so that we can specify unknown
+        # pragmas for other compilers.
+        "/wd4068",
+
+        # C4244: 'conversion' conversion from 'type1' to 'type2',
+        # possible loss of data. An integer type is converted to a
+        # smaller integer type.
+        "/wd4244",
+
+        # C4267: 'var' : conversion from 'size_t' to 'type', possible
+        # loss of data. When compiling with /Wp64, or when compiling
+        # on a 64-bit operating system, type is 32 bits but size_t is
+        # 64 bits when compiling for 64-bit targets. To fix this
+        # warning, use size_t instead of a type.
+        "/wd4267",
+
+        # C4290: C++ exception specification ignored except to
+        # indicate a function is not __declspec(nothrow). A function
+        # is declared using exception specification, which Visual C++
+        # accepts but does not implement.
+        "/wd4290",
+
+        # C4351: On extremely old versions of MSVC (pre 2k5), default
+        # constructing an array member in a constructor's
+        # initialization list would not zero the array members "in
+        # some cases". Since we don't target MSVC versions that old,
+        # this warning is safe to ignore.
+        "/wd4351",
+
+        # C4355: 'this' : used in base member initializer list. The
+        # this pointer is valid only within nonstatic member
+        # functions. It cannot be used in the initializer list for a
+        # base class
+        "/wd4355",
+
+        # C4373: Older versions of MSVC would fail to make a function
+        # in a derived class override a virtual function in the
+        # parent, when defined inline and at least one of the
+        # parameters is made const. The behavior is incorrect under
+        # the standard. MSVC is fixed now, and the warning exists
+        # merely to alert users who may have relied upon the older,
+        # non-compliant behavior. Our code should not have any
+        # problems with the older behavior, so we can just disable
+        # this warning.
+        "/wd4373",
+
+        # C4800: 'type' : forcing value to bool 'true' or 'false'
+        # (performance warning). This warning is generated when a
+        # value that is not bool is assigned or coerced into type
+        # bool.
+        "/wd4800",
+
+        # C5041: out-of-line definition for constexpr static data
+        # member is not needed and is deprecated in C++17. We still
+        # have these, but we don't want to fix them up before we roll
+        # over to C++17.
+        "/wd5041",
+    ])
+
+    # mozjs-60 requires the following
+    #  'declaration' : no matching operator delete found; memory will not be freed if
+    #  initialization throws an exception
+    env.Append( CCFLAGS=["/wd4291"] )
 
     # some warnings we should treat as errors:
     # c4013
@@ -1700,7 +1750,7 @@ elif env.TargetOSIs('windows'):
     #env.Append( CCFLAGS=['/Yu"pch.h"'] )
 
     # Don't send error reports in case of internal compiler error
-    env.Append( CCFLAGS= ["/errorReport:none"] ) 
+    env.Append( CCFLAGS= ["/errorReport:none"] )
 
     # Select debugging format. /Zi gives faster links but seem to use more memory
     if get_option('msvc-debugging-format') == "codeview":
@@ -1875,7 +1925,7 @@ if env.TargetOSIs('posix'):
 
     if optBuild and not optBuildForSize:
         env.Append( CCFLAGS=["-O2"] )
-    elif optBuild and optBuildForSize: 
+    elif optBuild and optBuildForSize:
         env.Append( CCFLAGS=["-Os"] )
     else:
         env.Append( CCFLAGS=["-O0"] )
@@ -1989,14 +2039,14 @@ def doConfigure(myenv):
         }
         """ % compiler_minimum_string)
     elif myenv.ToolchainIs('gcc'):
-        compiler_minimum_string = "GCC 5.3.0"
+        compiler_minimum_string = "GCC 8.2"
         compiler_test_body = textwrap.dedent(
         """
         #if !defined(__GNUC__) || defined(__clang__)
         #error
         #endif
 
-        #if (__GNUC__ < 5) || (__GNUC__ == 5 && __GNUC_MINOR__ < 3) || (__GNUC__ == 5 && __GNUC_MINOR__ == 3 && __GNUC_PATCHLEVEL__ < 0)
+        #if (__GNUC__ < 8) || (__GNUC__ == 8 && __GNUC_MINOR__ < 2)
         #error %s or newer is required to build MongoDB
         #endif
 
@@ -2005,7 +2055,7 @@ def doConfigure(myenv):
         }
         """ % compiler_minimum_string)
     elif myenv.ToolchainIs('clang'):
-        compiler_minimum_string = "clang 3.8 (or Apple XCode 8.3.2)"
+        compiler_minimum_string = "clang 7.0 (or Apple XCode 10.0)"
         compiler_test_body = textwrap.dedent(
         """
         #if !defined(__clang__)
@@ -2013,10 +2063,10 @@ def doConfigure(myenv):
         #endif
 
         #if defined(__apple_build_version__)
-        #if __apple_build_version__ < 8020042
+        #if __apple_build_version__ < 10001044
         #error %s or newer is required to build MongoDB
         #endif
-        #elif (__clang_major__ < 3) || (__clang_major__ == 3 && __clang_minor__ < 8)
+        #elif (__clang_major__ < 7) || (__clang_major__ == 7 && __clang_minor__ < 0)
         #error %s or newer is required to build MongoDB
         #endif
 
@@ -2394,16 +2444,11 @@ def doConfigure(myenv):
         conf.Finish()
 
     if myenv.ToolchainIs('msvc'):
-        myenv.AppendUnique(CXXFLAGS=['/Zc:__cplusplus'])
-        if get_option('cxx-std') == "14":
-            myenv.AppendUnique(CCFLAGS=['/std:c++14'])
-        elif get_option('cxx-std') == "17":
+        myenv.AppendUnique(CCFLAGS=['/Zc:__cplusplus', '/permissive-'])
+        if get_option('cxx-std') == "17":
             myenv.AppendUnique(CCFLAGS=['/std:c++17'])
     else:
-        if get_option('cxx-std') == "14":
-            if not AddToCXXFLAGSIfSupported(myenv, '-std=c++14'):
-                myenv.ConfError('Compiler does not honor -std=c++14')
-        elif get_option('cxx-std') == "17":
+        if get_option('cxx-std') == "17":
             if not AddToCXXFLAGSIfSupported(myenv, '-std=c++17'):
                 myenv.ConfError('Compiler does not honor -std=c++17')
 
@@ -2412,21 +2457,6 @@ def doConfigure(myenv):
 
     if using_system_version_of_cxx_libraries():
         print( 'WARNING: System versions of C++ libraries must be compiled with C++14/17 support' )
-
-    def CheckCxx14(context):
-        test_body = """
-        #if __cplusplus < 201402L
-        #error
-        #endif
-        auto DeducedReturnTypesAreACXX14Feature() {
-            return 0;
-        }
-        """
-
-        context.Message('Checking for C++14... ')
-        ret = context.TryCompile(textwrap.dedent(test_body), ".cpp")
-        context.Result(ret)
-        return ret
 
     def CheckCxx17(context):
         test_body = """
@@ -2442,15 +2472,11 @@ def doConfigure(myenv):
         return ret
 
     conf = Configure(myenv, help=False, custom_tests = {
-        'CheckCxx14' : CheckCxx14,
         'CheckCxx17' : CheckCxx17,
     })
 
-    if not conf.CheckCxx14():
-        myenv.ConfError('C++14 support is required to build MongoDB')
-
     if get_option('cxx-std') == "17" and not conf.CheckCxx17():
-        myenv.ConfError('C++17 was requested, but the compiler appears not to offer it')
+        myenv.ConfError('C++17 support is required to build MongoDB')
 
     conf.Finish()
 
@@ -2618,7 +2644,7 @@ def doConfigure(myenv):
             # GCC's implementation of ASAN depends on libdl.
             env.Append(LIBS=['dl'])
 
-        if env['MONGO_ALLOCATOR'] == 'tcmalloc':
+        if env['MONGO_ALLOCATOR'] in ['tcmalloc', 'tcmalloc-experimental']:
             # There are multiply defined symbols between the sanitizer and
             # our vendorized tcmalloc.
             env.FatalError("Cannot use --sanitize with tcmalloc")
@@ -3330,7 +3356,7 @@ def doConfigure(myenv):
     if myenv['MONGO_ALLOCATOR'] == 'tcmalloc':
         if use_system_version_of_library('tcmalloc'):
             conf.FindSysLibDep("tcmalloc", ["tcmalloc"])
-    elif myenv['MONGO_ALLOCATOR'] == 'system':
+    elif myenv['MONGO_ALLOCATOR'] in ['system', 'tcmalloc-experimental']:
         pass
     else:
         myenv.FatalError("Invalid --allocator parameter: $MONGO_ALLOCATOR")
@@ -3435,7 +3461,7 @@ def doConfigure(myenv):
         if conf.CheckExtendedAlignment(size):
             conf.env.SetConfigHeaderDefine("MONGO_CONFIG_MAX_EXTENDED_ALIGNMENT", size)
             break
- 
+
     def CheckMongoCMinVersion(context):
         compile_test_body = textwrap.dedent("""
         #include <mongoc/mongoc.h>
@@ -3451,7 +3477,7 @@ def doConfigure(myenv):
         return result
 
     conf.AddTest('CheckMongoCMinVersion', CheckMongoCMinVersion)
-    
+
     if env.TargetOSIs('darwin'):
         def CheckMongoCFramework(context):
             context.Message("Checking for mongoc_get_major_version() in darwin framework mongoc...")
@@ -3471,7 +3497,7 @@ def doConfigure(myenv):
             context.Result(result)
             context.env['FRAMEWORKS'] = lastFRAMEWORKS
             return result
-        
+
         conf.AddTest('CheckMongoCFramework', CheckMongoCFramework)
 
     mongoc_mode = get_option('use-system-mongo-c')
@@ -3483,7 +3509,7 @@ def doConfigure(myenv):
                 "C",
                 "mongoc_get_major_version();",
                 autoadd=False ):
-            conf.env['MONGO_HAVE_LIBMONGOC'] = "library" 
+            conf.env['MONGO_HAVE_LIBMONGOC'] = "library"
         if not conf.env['MONGO_HAVE_LIBMONGOC'] and env.TargetOSIs('darwin') and conf.CheckMongoCFramework():
             conf.env['MONGO_HAVE_LIBMONGOC'] = "framework"
         if not conf.env['MONGO_HAVE_LIBMONGOC'] and mongoc_mode == 'on':
@@ -3785,6 +3811,20 @@ env.Alias("distsrc-tgz", env.GZip(
 env.Alias("distsrc-zip", env.DistSrc("mongodb-src-${MONGO_VERSION}.zip"))
 env.Alias("distsrc", "distsrc-tgz")
 
+# Defaults for SCons provided flags. SetOption only sets the option to our value
+# if the user did not provide it. So for any flag here if it's explicitly passed
+# the values below set with SetOption will be overwritten.
+#
+# Default j to the number of CPUs on the system. Note: in containers this
+# reports the number of CPUs for the host system. Perhaps in a future version of
+# psutil it will instead report the correct number when in a container.
+#
+# psutil.cpu_count returns None when it can't determine the number. This always
+# fails on BSD's for example.
+if psutil.cpu_count() is not None:
+    env.SetOption('num_jobs', psutil.cpu_count())
+
+
 # Do this as close to last as possible before reading SConscripts, so
 # that any tools that may have injected other things via emitters are included
 # among the side effect adornments.
@@ -3792,9 +3832,16 @@ env.Alias("distsrc", "distsrc-tgz")
 # TODO: Move this to a tool.
 if has_option('jlink'):
     jlink = get_option('jlink')
-    if jlink < 1:
-        env.FatalError("The argument to jlink must be a positive integer")
+    if jlink <= 0:
+        env.FatalError("The argument to jlink must be a positive integer or float")
+    elif jlink < 1 and jlink > 0:
+        jlink = env.GetOption('num_jobs') * jlink
+        jlink = round(jlink)
+        if jlink < 1.0:
+            print("Computed jlink value was less than 1; Defaulting to 1")
+            jlink = 1.0
 
+    jlink = int(jlink)
     target_builders = ['Program', 'SharedLibrary', 'LoadableModule']
 
     # A bound map of stream (as in stream of work) name to side-effect
@@ -3832,7 +3879,12 @@ env.SConscript(
     variant_dir='$BUILD_DIR',
 )
 
-all = env.Alias('all', ['core', 'tools', 'dbtest', 'unittests', 'integration_tests', 'benchmarks'])
+allTargets = ['core', 'tools', 'unittests', 'integration_tests', 'benchmarks']
+
+if not has_option('noshell') and usemozjs:
+    allTargets.extend(['dbtest'])
+
+env.Alias('all', allTargets)
 
 # run the Dagger tool if it's installed
 if should_dagger:

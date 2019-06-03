@@ -54,10 +54,6 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/views/view_catalog.h"
-#include "mongo/s/catalog/type_collection.h"
-#include "mongo/s/client/shard_registry.h"
-#include "mongo/s/grid.h"
-#include "mongo/s/sharding_initialization.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 
@@ -144,7 +140,7 @@ StatusWith<CollModRequest> parseCollModRequest(OperationContext* opCtx,
                 if (!cmr.idx) {
                     return Status(ErrorCodes::IndexNotFound,
                                   str::stream() << "cannot find index " << indexName << " for ns "
-                                                << nss.ns());
+                                                << nss);
                 }
             } else {
                 std::vector<const IndexDescriptor*> indexes;
@@ -164,7 +160,7 @@ StatusWith<CollModRequest> parseCollModRequest(OperationContext* opCtx,
                 } else if (indexes.empty()) {
                     return Status(ErrorCodes::IndexNotFound,
                                   str::stream() << "cannot find index " << keyPattern << " for ns "
-                                                << nss.ns());
+                                                << nss);
                 }
 
                 cmr.idx = indexes[0];
@@ -338,8 +334,7 @@ Status _collModInternal(OperationContext* opCtx,
 
     if (userInitiatedWritesAndNotPrimary) {
         return Status(ErrorCodes::NotMaster,
-                      str::stream() << "Not primary while setting collection options on "
-                                    << nss.ns());
+                      str::stream() << "Not primary while setting collection options on " << nss);
     }
 
     BSONObjBuilder oplogEntryBuilder;

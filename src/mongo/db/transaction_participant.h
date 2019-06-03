@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -172,6 +171,17 @@ public:
     static TransactionParticipant* get(Session* session);
 
     /**
+     * When the server returns a NoSuchTransaction error for a command, it performs a noop write if
+     * there is a writeConcern on the command. The TransientTransactionError label is only appended
+     * to a NoSuchTransaction response for 'commitTransaction' and 'coordinateCommitTransaction' if
+     * there is no writeConcern error. This ensures that if 'commitTransaction' or
+     * 'coordinateCommitTransaction' is run with w:majority, then the TransientTransactionError
+     * label is only returned if the transaction is not committed on any valid branch of history,
+     * so the driver or application can safely retry the entire transaction.
+     */
+    static void performNoopWriteForNoSuchTransaction(OperationContext* opCtx);
+
+    /**
      * Blocking method, which loads the transaction state from storage if it has been marked as
      * needing refresh.
      *
@@ -251,9 +261,14 @@ public:
     * Commits the transaction, including committing the write unit of work and updating
     * transaction state.
     *
+    * On a secondary, the "commitOplogEntryOpTime" will be the OpTime of the commitTransaction oplog
+    * entry.
+    *
     * Throws an exception if the transaction is not prepared or if the 'commitTimestamp' is null.
     */
-    void commitPreparedTransaction(OperationContext* opCtx, Timestamp commitTimestamp);
+    void commitPreparedTransaction(OperationContext* opCtx,
+                                   Timestamp commitTimestamp,
+                                   boost::optional<repl::OpTime> commitOplogEntryOpTime);
 
     /**
      * Aborts the transaction outside the transaction, releasing transaction resources.
@@ -293,11 +308,19 @@ public:
     void addTransactionOperation(OperationContext* opCtx, const repl::ReplOperation& operation);
 
     /**
-     * Returns and clears the stored operations for an multi-document (non-autocommit) transaction,
-     * and marks the transaction as closed.  It is illegal to attempt to add operations to the
-     * transaction after this is called.
+     * Returns a reference to the stored operations for a completed multi-document (non-autocommit)
+     * transaction. "Completed" implies that no more operations will be added to the transaction.
+     * It is legal to call this method only when the transaction state is in progress or committed.
      */
-    std::vector<repl::ReplOperation> endTransactionAndRetrieveOperations(OperationContext* opCtx);
+    std::vector<repl::ReplOperation>& retrieveCompletedTransactionOperations(
+        OperationContext* opCtx);
+
+    /**
+     * Clears the stored operations for an multi-document (non-autocommit) transaction, marking
+     * the transaction as closed.  It is illegal to attempt to add operations to the transaction
+     * after this is called.
+     */
+    void clearOperationsInMemory(OperationContext* opCtx);
 
     /**
      * Yield or reacquire locks for prepared transacitons, used on replication state transition.
@@ -507,6 +530,16 @@ public:
         return _speculativeTransactionReadOpTime;
     }
 
+    boost::optional<repl::OpTime> getFinishOpTimeForTest() const {
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        return _finishOpTime;
+    }
+
+    boost::optional<repl::OpTime> getOldestOplogEntryOpTimeForTest() const {
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        return _oldestOplogEntryOpTime;
+    }
+
     const Locker* getTxnResourceStashLockerForTest() const {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
         invariant(_txnResourceStash);
@@ -517,6 +550,12 @@ public:
         stdx::lock_guard<stdx::mutex> lk(_mutex);
         _txnState.transitionTo(lk, TransactionState::kPrepared);
     }
+
+    void transitionToCommittingWithPrepareforTest() {
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        _txnState.transitionTo(lk, TransactionState::kCommittingWithPrepare);
+    }
+
 
     void transitionToAbortedWithoutPrepareforTest() {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
@@ -553,6 +592,7 @@ private:
         }
 
     private:
+        OperationContext* _opCtx;
         std::unique_ptr<Locker> _locker;
         std::unique_ptr<RecoveryUnit> _recoveryUnit;
         OplogSlot _oplogSlot;

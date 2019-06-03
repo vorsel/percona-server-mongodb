@@ -43,7 +43,7 @@
 #include "mongo/db/query/plan_cache.h"
 #include "mongo/db/query/plan_ranker.h"
 #include "mongo/db/query/plan_yield_policy.h"
-#include "mongo/db/query/query_knobs.h"
+#include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/stage_builder.h"
 #include "mongo/stdx/memory.h"
@@ -148,17 +148,6 @@ Status CachedPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
 
             const bool shouldCache = false;
             return replan(yieldPolicy, shouldCache);
-        } else if (PlanStage::DEAD == state) {
-            BSONObj statusObj;
-            invariant(WorkingSet::INVALID_ID != id);
-            WorkingSetCommon::getStatusMemberObject(*_ws, id, &statusObj);
-
-            LOG(1) << "Execution of cached plan failed: PlanStage died"
-                   << ", query: " << redact(_canonicalQuery->toStringShort())
-                   << " planSummary: " << Explain::getPlanSummary(child().get())
-                   << " status: " << redact(statusObj);
-
-            return WorkingSetCommon::getMemberObjectStatus(statusObj);
         } else {
             invariant(PlanStage::NEED_TIME == state);
         }

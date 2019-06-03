@@ -34,6 +34,7 @@
 
 #include "mongo/base/status.h"
 #include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog/multi_index_block.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/platform/atomic_word.h"
@@ -92,6 +93,9 @@ public:
      */
     virtual std::string name() const;
 
+    /**
+     * Instead of building the index in a background thread, build on the current thread.
+     */
     Status buildInForeground(OperationContext* opCtx, Database* db) const;
 
     /**
@@ -101,12 +105,19 @@ public:
      */
     static void waitForBgIndexStarting();
 
-private:
-    Status _build(OperationContext* opCtx,
-                  Database* db,
-                  bool allowBackgroundBuilding,
-                  Lock::DBLock* dbLock) const;
+    static bool canBuildInBackground();
 
+private:
+    Status _buildAndHandleErrors(OperationContext* opCtx,
+                                 Database* db,
+                                 bool buildInBackground,
+                                 Lock::DBLock* dbLock) const;
+
+    Status _build(OperationContext* opCtx,
+                  bool buildInBackground,
+                  Collection* coll,
+                  MultiIndexBlock& indexer,
+                  Lock::DBLock* dbLock) const;
     const BSONObj _index;
     const IndexConstraints _indexConstraints;
     const ReplicatedWrites _replicatedWrites;

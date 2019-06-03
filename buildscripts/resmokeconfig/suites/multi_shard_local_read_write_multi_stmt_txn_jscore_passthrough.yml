@@ -143,6 +143,7 @@ selector:
   - jstests/core/uniqueness.js
   - jstests/core/unset2.js
   - jstests/core/update_addToSet.js
+  - jstests/core/update_array_offset_positional.js
   - jstests/core/update_arrayFilters.js
   - jstests/core/update_find_and_modify_id.js
   - jstests/core/update_modifier_pop.js
@@ -176,9 +177,6 @@ selector:
   # TODO: SERVER-38690 Mongos should throw write targeting errors in a transaction.
   - jstests/core/update_setOnInsert.js
 
-  # TODO: SERVER-38588 Hybrid index builds can miss documents during secondary replication.
-  - jstests/core/background_index_multikey.js
-
   ##
   ## Some aggregation stages aren't allowed in a transaction.
   ##
@@ -204,6 +202,7 @@ selector:
   - jstests/core/json_schema/additional_properties.js
   - jstests/core/json_schema/bsontype.js
   - jstests/core/json_schema/dependencies.js
+  - jstests/core/json_schema/encrypt.js
   - jstests/core/json_schema/items.js
   - jstests/core/json_schema/logical_keywords.js
   - jstests/core/json_schema/min_max_items.js
@@ -400,5 +399,8 @@ executor:
         numInitialSyncAttempts: 1
         # TODO SERVER-38302: Disable the no-op writer.
         writePeriodicNoops: true
+        # TODO: SERVER-38588 Hybrid index builds can conflict with prepared transactions on
+        # secondaries and miss documents.
+        enableHybridIndexBuilds: false
     num_rs_nodes_per_shard: 2
     num_shards: 2

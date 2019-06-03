@@ -66,15 +66,17 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/speculative_majority_read_info.h"
+#include "mongo/db/run_op_kill_cursors.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/s/sharding_state.h"
+#include "mongo/db/s/transaction_coordinator_factory.h"
 #include "mongo/db/service_entry_point_common.h"
 #include "mongo/db/session_catalog_mongod.h"
 #include "mongo/db/snapshot_window_util.h"
 #include "mongo/db/stats/counters.h"
+#include "mongo/db/stats/server_read_concern_metrics.h"
 #include "mongo/db/stats/top.h"
-#include "mongo/db/transaction_coordinator_factory.h"
 #include "mongo/db/transaction_participant.h"
 #include "mongo/db/transaction_validation.h"
 #include "mongo/rpc/factory.h"
@@ -327,7 +329,7 @@ void appendClusterAndOperationTime(OperationContext* opCtx,
         auto signedTime = SignedLogicalTime(
             LogicalClock::get(opCtx)->getClusterTime(), TimeProofService::TimeProof(), 0);
 
-        // TODO SERVER-35663: invariant that signedTime.getTime() >= operationTime.
+        dassert(signedTime.getTime() >= operationTime);
         rpc::LogicalTimeMetadata(signedTime).writeToMetadata(metadataBob);
         operationTime.appendAsOperationTime(commandBodyFieldsBob);
 
@@ -349,7 +351,7 @@ void appendClusterAndOperationTime(OperationContext* opCtx,
         return;
     }
 
-    // TODO SERVER-35663: invariant that signedTime.getTime() >= operationTime.
+    dassert(signedTime.getTime() >= operationTime);
     rpc::LogicalTimeMetadata(signedTime).writeToMetadata(metadataBob);
     operationTime.appendAsOperationTime(commandBodyFieldsBob);
 }
@@ -358,8 +360,7 @@ void invokeWithSessionCheckedOut(OperationContext* opCtx,
                                  CommandInvocation* invocation,
                                  TransactionParticipant* txnParticipant,
                                  const OperationSessionInfoFromClient& sessionOptions,
-                                 rpc::ReplyBuilderInterface* replyBuilder) try {
-
+                                 rpc::ReplyBuilderInterface* replyBuilder) {
     if (!opCtx->getClient()->isInDirectClient()) {
         txnParticipant->beginOrContinue(*sessionOptions.getTxnNumber(),
                                         sessionOptions.getAutocommit(),
@@ -420,15 +421,6 @@ void invokeWithSessionCheckedOut(OperationContext* opCtx,
     // Stash or commit the transaction when the command succeeds.
     txnParticipant->stashTransactionResources(opCtx);
     guard.dismiss();
-} catch (const ExceptionFor<ErrorCodes::NoSuchTransaction>&) {
-    // We make our decision about the transaction state based on the oplog we have, so
-    // we set the client last op to the last optime observed by the system to ensure that
-    // we wait for the specified write concern on an optime greater than or equal to the
-    // the optime of our decision basis. Thus we know our decision basis won't be rolled
-    // back.
-    auto& replClient = repl::ReplClientInfo::forClient(opCtx->getClient());
-    replClient.setLastOpToSystemLastOpTime(opCtx);
-    throw;
 }
 
 bool runCommandImpl(OperationContext* opCtx,
@@ -492,7 +484,11 @@ bool runCommandImpl(OperationContext* opCtx,
             } else {
                 invocation->run(opCtx, replyBuilder);
             }
-        } catch (const DBException&) {
+        } catch (const DBException& ex) {
+            if (ex.toStatus().code() == ErrorCodes::NoSuchTransaction &&
+                !opCtx->getWriteConcern().usedDefault) {
+                TransactionParticipant::performNoopWriteForNoSuchTransaction(opCtx);
+            }
             waitForWriteConcern(*extraFieldsBuilder);
             throw;
         }
@@ -550,7 +546,9 @@ void execCommandDatabase(OperationContext* opCtx,
     CommandHelpers::uassertShouldAttemptParse(opCtx, command, request);
     BSONObjBuilder extraFieldsBuilder;
     auto startOperationTime = getClientOperationTime(opCtx);
+
     auto invocation = command->parse(opCtx, request);
+
     OperationSessionInfoFromClient sessionOptions;
 
     try {
@@ -569,6 +567,7 @@ void execCommandDatabase(OperationContext* opCtx,
             opCtx,
             request.body,
             command->requiresAuth(),
+            command->attachLogicalSessionsToOpCtx(),
             replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet,
             opCtx->getServiceContext()->getStorageEngine()->supportsDocLocking());
 
@@ -956,6 +955,7 @@ DbResponse receivedQuery(OperationContext* opCtx,
                          const ServiceEntryPointCommon::Hooks& behaviors) {
     invariant(!nss.isCommand());
     globalOpCounters.gotQuery();
+    ServerReadConcernMetrics::get(opCtx)->recordReadConcern(repl::ReadConcernArgs::get(opCtx));
 
     DbMessage d(m);
     QueryMessage q(d);
@@ -999,7 +999,7 @@ void receivedKillCursors(OperationContext* opCtx, const Message& m) {
 
     const char* cursorArray = dbmessage.getArray(n);
 
-    int found = CursorManager::killCursorGlobalIfAuthorized(opCtx, n, cursorArray);
+    int found = runOpKillCursors(opCtx, static_cast<size_t>(n), cursorArray);
 
     if (shouldLog(logger::LogSeverity::Debug(1)) || found != n) {
         LOG(found == n ? 1 : 0) << "killcursors: found " << found << " of " << n;
@@ -1102,12 +1102,15 @@ DbResponse receivedGetMore(OperationContext* opCtx,
             // Make sure that killCursorGlobal does not throw an exception if it is interrupted.
             UninterruptibleLockGuard noInterrupt(opCtx->lockState());
 
-            // If a cursor with id 'cursorid' was authorized, it may have been advanced
-            // before an exception terminated processGetMore.  Erase the ClientCursor
-            // because it may now be out of sync with the client's iteration state.
-            // SERVER-7952
-            // TODO Temporary code, see SERVER-4563 for a cleanup overview.
-            CursorManager::killCursorGlobal(opCtx, cursorid);
+            // If an error was thrown prior to auth checks, then the cursor should remain alive in
+            // order to prevent an unauthorized user from resulting in the death of a cursor. In
+            // other error cases, the cursor is dead and should be cleaned up.
+            //
+            // If killing the cursor fails, ignore the error and don't try again. The cursor should
+            // be reaped by the client cursor timeout thread.
+            CursorManager::get(opCtx)
+                ->killCursor(opCtx, cursorid, false /* shouldAudit */)
+                .ignore();
         }
 
         BSONObjBuilder err;
@@ -1202,6 +1205,8 @@ DbResponse ServiceEntryPointCommon::handleRequest(OperationContext* opCtx,
         dbresponse = receivedCommands(opCtx, m, behaviors);
     } else if (op == dbQuery) {
         invariant(!isCommand);
+        opCtx->markKillOnClientDisconnect();
+
         dbresponse = receivedQuery(opCtx, nsString, c, m, behaviors);
     } else if (op == dbGetMore) {
         dbresponse = receivedGetMore(opCtx, m, currentOp, &forceLog);

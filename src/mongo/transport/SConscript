@@ -13,6 +13,7 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/service_context',
     ],
 )
 
@@ -30,7 +31,7 @@ env.Library(
 )
 
 tlEnv = env.Clone()
-tlEnv.InjectThirdPartyIncludePaths(libraries=['asio'])
+tlEnv.InjectThirdParty(libraries=['asio'])
 
 tlEnv.Library(
     target='transport_layer_manager',
@@ -115,7 +116,6 @@ tlEnv.Library(
         'service_executor_adaptive.cpp',
         'service_executor_reserved.cpp',
         'service_executor_synchronous.cpp',
-        'thread_idle_callback.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/service_context',
@@ -174,6 +174,7 @@ env.Library(
         'transport_layer_common',
     ],
     LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/traffic_recorder',
         '$BUILD_DIR/mongo/transport/message_compressor',
     ],
 )
@@ -208,7 +209,7 @@ env.CppUnitTest(
 )
 
 zlibEnv = env.Clone()
-zlibEnv.InjectThirdPartyIncludePaths(libraries=['zlib', 'zstd', 'snappy'])
+zlibEnv.InjectThirdParty(libraries=['zlib', 'zstd', 'snappy'])
 zlibEnv.Library(
     target='message_compressor',
     source=[

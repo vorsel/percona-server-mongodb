@@ -59,7 +59,9 @@ AutoGetDb::AutoGetDb(OperationContext* opCtx, StringData dbName, LockMode mode, 
           return databaseHolder->getDb(opCtx, dbName);
       }()) {
     if (_db) {
-        DatabaseShardingState::get(_db).checkDbVersion(opCtx);
+        auto& dss = DatabaseShardingState::get(_db);
+        auto dssLock = DatabaseShardingState::DSSLock::lock(opCtx, &dss);
+        dss.checkDbVersion(opCtx, dssLock);
     }
 }
 
@@ -89,6 +91,15 @@ AutoGetCollection::AutoGetCollection(OperationContext* opCtx,
               str::stream() << "Database for " << _resolvedNss.ns()
                             << " disappeared after successufully resolving "
                             << nsOrUUID.toString());
+
+    // In most cases we expect modifications for system.views to upgrade MODE_IX to MODE_X before
+    // taking the lock. One exception is a query by UUID of system.views in a transaction. Usual
+    // queries of system.views (by name, not UUID) within a transaction are rejected. However, if
+    // the query is by UUID we can't determine whether the namespace is actually system.views until
+    // we take the lock here. So we have this one last assertion.
+    uassert(51070,
+            "Modifications to system.views must take an exclusive lock",
+            !_resolvedNss.isSystemDotViews() || modeColl != MODE_IX);
 
     // If the database doesn't exists, we can't obtain a collection or check for views
     if (!db)
@@ -171,7 +182,9 @@ AutoGetOrCreateDb::AutoGetOrCreateDb(OperationContext* opCtx,
         _db = databaseHolder->openDb(opCtx, dbName, &_justCreated);
     }
 
-    DatabaseShardingState::get(_db).checkDbVersion(opCtx);
+    auto& dss = DatabaseShardingState::get(_db);
+    auto dssLock = DatabaseShardingState::DSSLock::lock(opCtx, &dss);
+    dss.checkDbVersion(opCtx, dssLock);
 }
 
 ConcealUUIDCatalogChangesBlock::ConcealUUIDCatalogChangesBlock(OperationContext* opCtx)

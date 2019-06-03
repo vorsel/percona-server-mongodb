@@ -8,7 +8,7 @@ Import("endian")
 
 env = env.Clone()
 
-env.InjectThirdPartyIncludePaths(libraries=['snappy', 'zlib', 'zstd'])
+env.InjectThirdParty(libraries=['snappy', 'zlib', 'zstd'])
 
 if endian == "big":
     env.Append(CPPDEFINES=[('WORDS_BIGENDIAN', 1)])
@@ -52,8 +52,8 @@ if env.TargetOSIs('windows'):
     env.Append(CFLAGS=[
         "/wd4090" # Ignore warning about mismatched const qualifiers
     ])
-    if env['MONGO_ALLOCATOR'] == 'tcmalloc':
-        env.InjectThirdPartyIncludePaths(libraries=['gperftools'])
+    if env['MONGO_ALLOCATOR'] in ['tcmalloc', 'tcmalloc-experimental']:
+        env.InjectThirdParty(libraries=['gperftools'])
         env.Append(CPPDEFINES=['HAVE_LIBTCMALLOC'])
 elif env.TargetOSIs('darwin'):
     env.Append(CPPPATH=["build_darwin"])

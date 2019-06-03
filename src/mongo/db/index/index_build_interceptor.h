@@ -63,13 +63,14 @@ public:
     Status sideWrite(OperationContext* opCtx,
                      IndexAccessMethod* indexAccessMethod,
                      const BSONObj* obj,
+                     const InsertDeleteOptions& options,
                      RecordId loc,
                      Op op,
                      int64_t* const numKeysOut);
 
     /**
      * Given a set of duplicate keys, record the keys for later verification by a call to
-     * checkConstraints();
+     * checkDuplicateKeyConstraints();
      */
     Status recordDuplicateKeys(OperationContext* opCtx, const std::vector<BSONObj>& keys);
 
@@ -87,9 +88,16 @@ public:
      *
      * This is resumable, so subsequent calls will start the scan at the record immediately
      * following the last inserted record from a previous call to drainWritesIntoIndex.
+     *
+     * When 'readSource' is not kUnset, perform the drain by reading at the timestamp described by
+     * the ReadSource. This will always reset the ReadSource to its original value before returning.
+     * The drain otherwise reads at the pre-existing ReadSource on the RecoveryUnit. This may be
+     * necessary by callers that can only guarantee consistency of data up to a certain point in
+     * time.
      */
-    Status drainWritesIntoIndex(OperationContext* opCtx, const InsertDeleteOptions& options);
-
+    Status drainWritesIntoIndex(OperationContext* opCtx,
+                                const InsertDeleteOptions& options,
+                                RecoveryUnit::ReadSource readSource);
 
     /**
      * Returns 'true' if there are no visible records remaining to be applied from the side writes
@@ -108,6 +116,10 @@ public:
       */
     boost::optional<MultikeyPaths> getMultikeyPaths() const;
 
+    const std::string& getSideWritesTableIdent() const;
+
+    const std::string& getConstraintViolationsTableIdent() const;
+
 private:
     using SideWriteRecord = std::pair<RecordId, BSONObj>;
 
@@ -116,6 +128,12 @@ private:
                        const InsertDeleteOptions& options,
                        int64_t* const keysInserted,
                        int64_t* const keysDeleted);
+
+    /**
+     * Yield lock manager locks, but only when holding intent locks. Does nothing otherwise. If this
+     * yields locks, it will also abandon the current storage engine snapshot.
+     */
+    void _tryYield(OperationContext*);
 
     // The entry for the index that is being built.
     IndexCatalogEntry* _indexCatalogEntry;

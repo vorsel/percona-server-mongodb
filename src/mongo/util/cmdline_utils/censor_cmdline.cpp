@@ -52,11 +52,9 @@ struct InsensitiveCompare {
 std::set<std::string, InsensitiveCompare> gRedactedDottedNames = {
     // Legacy redacted names pending conversion.
     "processManagement.windowsService.servicePassword",
-    "security.kmip.clientCertificatePassword",
-    "security.ldap.bind.queryPassword",
 };
 std::set<std::string, InsensitiveCompare> gRedactedSingleNames = {
-    "servicePassword", "kmipClientCertificatePassword", "ldapQueryPassword",
+    "servicePassword",
 };
 std::set<char> gRedactedCharacterNames;
 

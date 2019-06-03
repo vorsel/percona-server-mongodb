@@ -37,6 +37,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/cursor_manager.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/queued_data_stage.h"
@@ -59,6 +60,9 @@ using std::vector;
 using stdx::make_unique;
 
 namespace {
+
+// Failpoint which causes to hang "listIndexes" cmd after acquiring the DB lock.
+MONGO_FAIL_POINT_DEFINE(hangBeforeListIndexes);
 
 /**
  * Lists the indexes for a given collection.
@@ -124,6 +128,7 @@ public:
              const string& dbname,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) {
+        CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
         const long long defaultBatchSize = std::numeric_limits<long long>::max();
         long long batchSize;
         uassertStatusOK(
@@ -146,6 +151,9 @@ public:
             invariant(cce);
 
             nss = ctx.getNss();
+
+            CurOpFailpointHelpers::waitWhileFailPointEnabled(
+                &hangBeforeListIndexes, opCtx, "hangBeforeListIndexes", []() {}, false, nss);
 
             vector<string> indexNames;
             writeConflictRetry(opCtx, "listIndexes", nss.ns(), [&] {
@@ -212,14 +220,15 @@ public:
         }  // Drop collection lock. Global cursor registration must be done without holding any
            // locks.
 
-        const auto pinnedCursor = CursorManager::getGlobalCursorManager()->registerCursor(
+        const auto pinnedCursor = CursorManager::get(opCtx)->registerCursor(
             opCtx,
             {std::move(exec),
              nss,
              AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
              repl::ReadConcernArgs::get(opCtx),
              cmdObj,
-             ClientCursorParams::LockPolicy::kLocksInternally});
+             ClientCursorParams::LockPolicy::kLocksInternally,
+             {Privilege(ResourcePattern::forExactNamespace(nss), ActionType::listIndexes)}});
 
         appendCursorResponseObject(
             pinnedCursor.getCursor()->cursorid(), nss.ns(), firstBatch.arr(), &result);

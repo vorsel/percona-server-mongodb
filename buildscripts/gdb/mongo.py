@@ -11,7 +11,7 @@ import gdb
 try:
     # Try to find and load the C++ pretty-printer library.
     import glob
-    pp = glob.glob("/opt/mongodbtoolchain/v2/share/gcc-*/python/libstdcxx/v6/printers.py")
+    pp = glob.glob("/opt/mongodbtoolchain/v3/share/gcc-*/python/libstdcxx/v6/printers.py")
     printers = pp[0]
     path = os.path.dirname(os.path.dirname(os.path.dirname(printers)))
     sys.path.insert(0, path)
@@ -331,7 +331,10 @@ class DumpMongoDSessionCatalog(gdb.Command):
                 val = get_boost_optional(txn_part['_txnResourceStash'])
                 if val:
                     locker_addr = val["_locker"]["_M_t"]['_M_head_impl']
+                    locker_obj = locker_addr.dereference().cast(
+                        gdb.lookup_type("mongo::LockerImpl"))
                     print('_txnResourceStash._locker', "@", locker_addr)
+                    print("_txnResourceStash._locker._id", "=", locker_obj["_id"])
                 else:
                     print('_txnResourceStash', "=", None)
             # Separate sessions by a newline.
@@ -524,7 +527,7 @@ class MongoDBJavaScriptStack(gdb.Command):
                 if gdb.parse_and_eval(
                         'mongo::mozjs::kCurrentScope && mongo::mozjs::kCurrentScope->_inOp'):
                     gdb.execute('thread', from_tty=False, to_string=False)
-                    gdb.execute('printf "%s\n", ' +
+                    gdb.execute('printf "%s\\n", ' +
                                 'mongo::mozjs::kCurrentScope->buildStackString().c_str()',
                                 from_tty=False, to_string=False)
             except gdb.error as err:

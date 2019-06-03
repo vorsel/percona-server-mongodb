@@ -47,6 +47,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/list_collections_filter.h"
 #include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/cursor_manager.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/queued_data_stage.h"
@@ -70,6 +71,9 @@ using std::vector;
 using stdx::make_unique;
 
 namespace {
+
+// Failpoint which causes to hang "listCollections" cmd after acquiring the DB lock.
+MONGO_FAIL_POINT_DEFINE(hangBeforeListCollections);
 
 /**
  * Determines if 'matcher' is an exact match on the "name" field. If so, returns a vector of all the
@@ -229,7 +233,7 @@ public:
 
         AuthorizationSession* authzSession = AuthorizationSession::get(client);
 
-        if (authzSession->isAuthorizedToListCollections(dbname, cmdObj)) {
+        if (authzSession->checkAuthorizedToListCollections(dbname, cmdObj).isOK()) {
             return Status::OK();
         }
 
@@ -243,6 +247,7 @@ public:
              const string& dbname,
              const BSONObj& jsobj,
              BSONObjBuilder& result) final {
+        CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
         unique_ptr<MatchExpression> matcher;
         const auto as = AuthorizationSession::get(opCtx->getClient());
 
@@ -283,6 +288,13 @@ public:
         {
             AutoGetDb autoDb(opCtx, dbname, MODE_IS);
             Database* db = autoDb.getDb();
+
+            CurOpFailpointHelpers::waitWhileFailPointEnabled(&hangBeforeListCollections,
+                                                             opCtx,
+                                                             "hangBeforeListCollections",
+                                                             []() {},
+                                                             false,
+                                                             cursorNss);
 
             auto ws = make_unique<WorkingSet>();
             auto root = make_unique<QueuedDataStage>(opCtx, ws.get());
@@ -368,14 +380,16 @@ public:
             exec->detachFromOperationContext();
         }  // Drop db lock. Global cursor registration must be done without holding any locks.
 
-        auto pinnedCursor = CursorManager::getGlobalCursorManager()->registerCursor(
+        auto pinnedCursor = CursorManager::get(opCtx)->registerCursor(
             opCtx,
             {std::move(exec),
              cursorNss,
              AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
              repl::ReadConcernArgs::get(opCtx),
              jsobj,
-             ClientCursorParams::LockPolicy::kLocksInternally});
+             ClientCursorParams::LockPolicy::kLocksInternally,
+             uassertStatusOK(AuthorizationSession::get(opCtx->getClient())
+                                 ->checkAuthorizedToListCollections(dbname, jsobj))});
 
         appendCursorResponseObject(
             pinnedCursor.getCursor()->cursorid(), cursorNss.ns(), firstBatch.arr(), &result);

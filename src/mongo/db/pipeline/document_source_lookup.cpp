@@ -40,7 +40,7 @@
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/value.h"
-#include "mongo/db/query/query_knobs.h"
+#include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/stdx/memory.h"
 
 namespace mongo {
@@ -197,11 +197,18 @@ StageConstraints DocumentSourceLookUp::constraints(Pipeline::SplitState) const {
     }
 
     // If executing on mongos and the foreign collection is sharded, then this stage can run on
-    // mongos.
+    // mongos or any shard.
     HostTypeRequirement hostRequirement =
         (pExpCtx->inMongos && pExpCtx->mongoProcessInterface->isSharded(pExpCtx->opCtx, _fromNs))
-        ? HostTypeRequirement::kMongoS
+        ? HostTypeRequirement::kNone
         : HostTypeRequirement::kPrimaryShard;
+
+    const bool foreignShardedAllowed =
+        getTestCommandsEnabled() && internalQueryAllowShardedLookup.load();
+    if (!foreignShardedAllowed) {
+        // Always run on the primary shard.
+        hostRequirement = HostTypeRequirement::kPrimaryShard;
+    }
 
     StageConstraints constraints(StreamType::kStreaming,
                                  PositionRequirement::kNone,
@@ -330,6 +337,7 @@ std::unique_ptr<Pipeline, PipelineDeleter> DocumentSourceLookUp::buildPipeline(
         _cache.reset();
     }
 
+    invariant(pipeline);
     return pipeline;
 }
 
@@ -736,7 +744,12 @@ DepsTracker::State DocumentSourceLookUp::getDependencies(DepsTracker* deps) cons
         // We will use the introspection pipeline which we prebuilt during construction.
         invariant(_parsedIntrospectionPipeline);
 
-        DepsTracker subDeps(deps->getMetadataAvailable());
+        // We are not attempting to enforce that any referenced metadata are in fact available,
+        // this is done elsewhere. We only need to know what variable dependencies exist in the
+        // subpipeline for the top-level pipeline. So without knowledge of what metadata is in fact
+        // available, we "lie" and say that all metadata is available to avoid tripping any
+        // assertions.
+        DepsTracker subDeps(DepsTracker::kAllMetadataAvailable);
 
         // Get the subpipeline dependencies. Subpipeline stages may reference both 'let' variables
         // declared by this $lookup and variables declared externally.

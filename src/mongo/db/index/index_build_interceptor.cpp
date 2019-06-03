@@ -34,18 +34,23 @@
 #include "mongo/db/index/index_build_interceptor.h"
 
 #include "mongo/bson/bsonobj.h"
+#include "mongo/db/catalog/index_timestamp_helper.h"
 #include "mongo/db/catalog_raii.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/multi_key_path_tracker.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/progress_meter.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
+
+MONGO_FAIL_POINT_DEFINE(hangDuringIndexBuildDrainYield);
 
 IndexBuildInterceptor::IndexBuildInterceptor(OperationContext* opCtx, IndexCatalogEntry* entry)
     : _indexCatalogEntry(entry),
@@ -77,9 +82,35 @@ bool IndexBuildInterceptor::areAllConstraintsChecked(OperationContext* opCtx) co
     return _duplicateKeyTracker->areAllConstraintsChecked(opCtx);
 }
 
+const std::string& IndexBuildInterceptor::getSideWritesTableIdent() const {
+    return _sideWritesTable->rs()->getIdent();
+}
+
+const std::string& IndexBuildInterceptor::getConstraintViolationsTableIdent() const {
+    return _duplicateKeyTracker->getConstraintsTableIdent();
+}
+
+
 Status IndexBuildInterceptor::drainWritesIntoIndex(OperationContext* opCtx,
-                                                   const InsertDeleteOptions& options) {
+                                                   const InsertDeleteOptions& options,
+                                                   RecoveryUnit::ReadSource readSource) {
     invariant(!opCtx->lockState()->inAWriteUnitOfWork());
+
+    // Callers may request to read at a specific timestamp so that no drained writes are timestamped
+    // earlier than their original write timestamp. Also ensure that leaving this function resets
+    // the ReadSource to its original value.
+    auto resetReadSourceGuard =
+        makeGuard([ opCtx, prevReadSource = opCtx->recoveryUnit()->getTimestampReadSource() ] {
+            opCtx->recoveryUnit()->abandonSnapshot();
+            opCtx->recoveryUnit()->setTimestampReadSource(prevReadSource);
+        });
+
+    if (readSource != RecoveryUnit::ReadSource::kUnset) {
+        opCtx->recoveryUnit()->abandonSnapshot();
+        opCtx->recoveryUnit()->setTimestampReadSource(readSource);
+    } else {
+        resetReadSourceGuard.dismiss();
+    }
 
     // These are used for logging only.
     int64_t totalDeleted = 0;
@@ -122,6 +153,7 @@ Status IndexBuildInterceptor::drainWritesIntoIndex(OperationContext* opCtx,
 
     bool atEof = false;
     while (!atEof) {
+        opCtx->checkForInterrupt();
 
         // Stashed records should be inserted into a batch first.
         if (stashed) {
@@ -161,27 +193,42 @@ Status IndexBuildInterceptor::drainWritesIntoIndex(OperationContext* opCtx,
 
         invariant(!batch.empty());
 
+        cursor->save();
+
         // If we are here, either we have reached the end of the table or the batch is full, so
         // insert everything in one WriteUnitOfWork, and delete each inserted document from the side
         // writes table.
-        WriteUnitOfWork wuow(opCtx);
-        for (auto& operation : batch) {
-            auto status =
-                _applyWrite(opCtx, operation.second, options, &totalInserted, &totalDeleted);
-            if (!status.isOK()) {
-                return status;
+        auto status = writeConflictRetry(opCtx, "index build drain", _indexCatalogEntry->ns(), [&] {
+            WriteUnitOfWork wuow(opCtx);
+            for (auto& operation : batch) {
+                auto status =
+                    _applyWrite(opCtx, operation.second, options, &totalInserted, &totalDeleted);
+                if (!status.isOK()) {
+                    return status;
+                }
+
+                // Delete the document from the table as soon as it has been inserted into the
+                // index. This ensures that no key is ever inserted twice and no keys are skipped.
+                _sideWritesTable->rs()->deleteRecord(opCtx, operation.first);
             }
 
-            // Delete the document from the table as soon as it has been inserted into the index.
-            // This ensures that no key is ever inserted twice and no keys are skipped.
-            _sideWritesTable->rs()->deleteRecord(opCtx, operation.first);
-        }
-        cursor->save();
-        wuow.commit();
+            // For rollback to work correctly, these writes need to be timestamped. The actual time
+            // is not important, as long as it not older than the most recent visible side write.
+            IndexTimestampHelper::setGhostCommitTimestampForWrite(
+                opCtx, NamespaceString(_indexCatalogEntry->ns()));
 
-        cursor->restore();
+            wuow.commit();
+            return Status::OK();
+        });
+        if (!status.isOK()) {
+            return status;
+        }
 
         progress->hit(batch.size());
+
+        // Lock yielding will only happen if we are holding intent locks.
+        _tryYield(opCtx);
+        cursor->restore();
 
         // Account for more writes coming in during a batch.
         progress->setTotalWhileRunning(_sideWritesCounter.loadRelaxed() - appliedAtStart);
@@ -235,7 +282,10 @@ Status IndexBuildInterceptor::_applyWrite(OperationContext* opCtx,
             }
         }
 
-        *keysInserted += result.numInserted;
+        int64_t numInserted = result.numInserted;
+        *keysInserted += numInserted;
+        opCtx->recoveryUnit()->onRollback(
+            [keysInserted, numInserted] { *keysInserted -= numInserted; });
     } else {
         invariant(opType == Op::kDelete);
         DEV invariant(strcmp(operation.getStringField("op"), "d") == 0);
@@ -247,8 +297,45 @@ Status IndexBuildInterceptor::_applyWrite(OperationContext* opCtx,
         }
 
         *keysDeleted += numDeleted;
+        opCtx->recoveryUnit()->onRollback(
+            [keysDeleted, numDeleted] { *keysDeleted -= numDeleted; });
     }
     return Status::OK();
+}
+
+void IndexBuildInterceptor::_tryYield(OperationContext* opCtx) {
+    // Never yield while holding locks that prevent writes to the collection: only yield while
+    // holding intent locks. This check considers all locks in the hierarchy that would cover this
+    // mode.
+    if (opCtx->lockState()->isCollectionLockedForMode(_indexCatalogEntry->ns(), MODE_S)) {
+        return;
+    }
+    DEV {
+        const NamespaceString nss(_indexCatalogEntry->ns());
+        invariant(!opCtx->lockState()->isCollectionLockedForMode(nss.ns(), MODE_X));
+        invariant(!opCtx->lockState()->isDbLockedForMode(nss.db(), MODE_X));
+    }
+
+    // Releasing locks means a new snapshot should be acquired when restored.
+    opCtx->recoveryUnit()->abandonSnapshot();
+
+    auto locker = opCtx->lockState();
+    Locker::LockSnapshot snapshot;
+    invariant(locker->saveLockStateAndUnlock(&snapshot));
+
+
+    // Track the number of yields in CurOp.
+    CurOp::get(opCtx)->yielded();
+
+    MONGO_FAIL_POINT_BLOCK(hangDuringIndexBuildDrainYield, config) {
+        StringData ns{config.getData().getStringField("namespace")};
+        if (ns == _indexCatalogEntry->ns()) {
+            log() << "Hanging index build during drain yield";
+            MONGO_FAIL_POINT_PAUSE_WHILE_SET(hangDuringIndexBuildDrainYield);
+        }
+    }
+
+    locker->restoreLockState(opCtx, snapshot);
 }
 
 bool IndexBuildInterceptor::areAllWritesApplied(OperationContext* opCtx) const {
@@ -271,6 +358,7 @@ boost::optional<MultikeyPaths> IndexBuildInterceptor::getMultikeyPaths() const {
 Status IndexBuildInterceptor::sideWrite(OperationContext* opCtx,
                                         IndexAccessMethod* indexAccessMethod,
                                         const BSONObj* obj,
+                                        const InsertDeleteOptions& options,
                                         RecordId loc,
                                         Op op,
                                         int64_t* const numKeysOut) {
@@ -281,11 +369,14 @@ Status IndexBuildInterceptor::sideWrite(OperationContext* opCtx,
     BSONObjSet multikeyMetadataKeys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
     MultikeyPaths multikeyPaths;
 
-    indexAccessMethod->getKeys(*obj,
-                               IndexAccessMethod::GetKeysMode::kEnforceConstraints,
-                               &keys,
-                               &multikeyMetadataKeys,
-                               &multikeyPaths);
+    // Override key constraints when generating keys for removal. This is the same behavior as
+    // IndexAccessMethod::remove and only applies to keys that do not apply to a partial filter
+    // expression.
+    const auto getKeysMode = op == Op::kInsert
+        ? options.getKeysMode
+        : IndexAccessMethod::GetKeysMode::kRelaxConstraintsUnfiltered;
+    indexAccessMethod->getKeys(*obj, getKeysMode, &keys, &multikeyMetadataKeys, &multikeyPaths);
+
     // Maintain parity with IndexAccessMethods handling of key counting. Only include
     // `multikeyMetadataKeys` when inserting.
     *numKeysOut = keys.size() + (op == Op::kInsert ? multikeyMetadataKeys.size() : 0);

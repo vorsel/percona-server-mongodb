@@ -53,6 +53,27 @@ public:
                        BSONObj indexDoc,
                        bool fromMigrate) override {}
 
+    void onStartIndexBuild(OperationContext* opCtx,
+                           const NamespaceString& nss,
+                           CollectionUUID collUUID,
+                           const UUID& indexBuildUUID,
+                           const std::vector<BSONObj>& indexes,
+                           bool fromMigrate) override {}
+
+    void onCommitIndexBuild(OperationContext* opCtx,
+                            const NamespaceString& nss,
+                            CollectionUUID collUUID,
+                            const UUID& indexBuildUUID,
+                            const std::vector<BSONObj>& indexes,
+                            bool fromMigrate) override {}
+
+    void onAbortIndexBuild(OperationContext* opCtx,
+                           const NamespaceString& nss,
+                           CollectionUUID collUUID,
+                           const UUID& indexBuildUUID,
+                           const std::vector<BSONObj>& indexes,
+                           bool fromMigrate) override {}
+
     void onInserts(OperationContext* opCtx,
                    const NamespaceString& nss,
                    OptionalCollectionUUID uuid,
@@ -140,9 +161,12 @@ public:
 
     void onTransactionCommit(OperationContext* opCtx,
                              boost::optional<OplogSlot> commitOplogEntryOpTime,
-                             boost::optional<Timestamp> commitTimestamp) override {}
+                             boost::optional<Timestamp> commitTimestamp,
+                             std::vector<repl::ReplOperation>& statements) override {}
 
-    void onTransactionPrepare(OperationContext* opCtx, const OplogSlot& prepareOpTime) override {}
+    void onTransactionPrepare(OperationContext* opCtx,
+                              const OplogSlot& prepareOpTime,
+                              std::vector<repl::ReplOperation>& statements) override {}
 
     void onTransactionAbort(OperationContext* opCtx,
                             boost::optional<OplogSlot> abortOplogEntryOpTime) override {}

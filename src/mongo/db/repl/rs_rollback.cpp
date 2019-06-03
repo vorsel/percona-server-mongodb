@@ -233,10 +233,6 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(FixUpInfo& fixUpInf
         if (!ourObj.hasField("ts")) {
             bob.appendTimestamp("ts");
         }
-        if (!ourObj.hasField("h")) {
-            long long dummyHash = 0;
-            bob.append("h", dummyHash);
-        }
     }
     bob.appendElements(ourObj);
     BSONObj fixedObj = bob.obj();
@@ -615,10 +611,9 @@ void checkRbidAndUpdateMinValid(OperationContext* opCtx,
     OpTime minValid = fassert(40492, OpTime::parseFromOplogEntry(newMinValidDoc));
     log() << "Setting minvalid to " << minValid;
 
-    // This method is only used when read concern majority is set to off, as the storage engine
-    // doesn't support recover to stable timestamp. As a result, the timestamp on the
-    // 'appliedThrough' update does not matter.
-    invariant(!opCtx->getServiceContext()->getStorageEngine()->supportsReadConcernMajority());
+    // This method is only used with storage engines that do not support recover to stable
+    // timestamp. As a result, the timestamp on the 'appliedThrough' update does not matter.
+    invariant(!opCtx->getServiceContext()->getStorageEngine()->supportsRecoverToStableTimestamp());
     replicationProcess->getConsistencyMarkers()->clearAppliedThrough(opCtx, {});
     replicationProcess->getConsistencyMarkers()->setMinValid(opCtx, minValid);
 
@@ -768,11 +763,10 @@ void dropCollection(OperationContext* opCtx,
         }
 
         // If we exited the above for loop with any other execState than IS_EOF, this means that
-        // a FAILURE or DEAD state was returned. If a DEAD state occurred, the collection or
-        // database that we are attempting to save may no longer be valid. If a FAILURE state
-        // was returned, either an unrecoverable error was thrown by exec, or we attempted to
-        // retrieve data that could not be provided by the PlanExecutor. In both of these cases
-        // it is necessary for a full resync of the server.
+        // a FAILURE state was returned. If a FAILURE state was returned, either an unrecoverable
+        // error was thrown by exec, or we attempted to retrieve data that could not be provided
+        // by the PlanExecutor. In both of these cases it is necessary for a full resync of the
+        // server.
 
         if (execState != PlanExecutor::IS_EOF) {
             if (execState == PlanExecutor::FAILURE &&
@@ -1475,7 +1469,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
     }
 
     // Reload the lastAppliedOpTime and lastDurableOpTime value in the replcoord and the
-    // lastAppliedHash value in bgsync to reflect our new last op. The rollback common point does
+    // lastApplied value in bgsync to reflect our new last op. The rollback common point does
     // not necessarily represent a consistent database state. For example, on a secondary, we may
     // have rolled back to an optime that fell in the middle of an oplog application batch. We make
     // the database consistent again after rollback by applying ops forward until we reach

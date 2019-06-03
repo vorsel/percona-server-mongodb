@@ -135,10 +135,13 @@ public:
             }
 
             auto bodyBuilder = result->getBodyBuilder();
+            // An empty PrivilegeVector is acceptable because these privileges are only checked on
+            // getMore and explain will not open a cursor.
             return ClusterAggregate::retryOnViewError(opCtx,
                                                       aggRequestOnView.getValue(),
                                                       *ex.extraInfo<ResolvedView>(),
                                                       nss,
+                                                      PrivilegeVector(),
                                                       &bodyBuilder);
         }
 
@@ -160,6 +163,7 @@ public:
              const std::string& dbName,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
+        CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
         const NamespaceString nss(parseNs(dbName, cmdObj));
 
         auto query = extractQuery(cmdObj);
@@ -201,7 +205,7 @@ public:
             auto resolvedAggCmd = resolvedAggRequest.serializeToCommandObj().toBson();
 
             if (auto txnRouter = TransactionRouter::get(opCtx)) {
-                txnRouter->onViewResolutionError(nss);
+                txnRouter->onViewResolutionError(opCtx, nss);
             }
 
             BSONObj aggResult = CommandHelpers::runCommandDirectly(

@@ -60,7 +60,6 @@
 #include "mongo/db/ops/write_ops_retryability.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_summary_stats.h"
-#include "mongo/db/query/query_knobs.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/retryable_writes_stats.h"
@@ -68,6 +67,7 @@
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/stats/counters.h"
+#include "mongo/db/stats/server_write_concern_metrics.h"
 #include "mongo/db/stats/top.h"
 #include "mongo/db/storage/duplicate_key_error_info.h"
 #include "mongo/db/transaction_participant.h"
@@ -95,6 +95,11 @@ MONGO_FAIL_POINT_DEFINE(hangAfterAllChildRemoveOpsArePopped);
 MONGO_FAIL_POINT_DEFINE(hangDuringBatchInsert);
 MONGO_FAIL_POINT_DEFINE(hangDuringBatchUpdate);
 MONGO_FAIL_POINT_DEFINE(hangDuringBatchRemove);
+// The withLock fail points are for testing interruptability of these operations, so they will not
+// themselves check for interrupt.
+MONGO_FAIL_POINT_DEFINE(hangWithLockDuringBatchInsert);
+MONGO_FAIL_POINT_DEFINE(hangWithLockDuringBatchUpdate);
+MONGO_FAIL_POINT_DEFINE(hangWithLockDuringBatchRemove);
 
 void updateRetryStats(OperationContext* opCtx, bool containsRetry) {
     if (containsRetry) {
@@ -297,6 +302,10 @@ SingleWriteResult createIndex(OperationContext* opCtx,
     return result;
 }
 
+LockMode fixLockModeForSystemDotViewsChanges(const NamespaceString& nss, LockMode mode) {
+    return nss.isSystemDotViews() ? MODE_X : mode;
+}
+
 void insertDocuments(OperationContext* opCtx,
                      Collection* collection,
                      std::vector<InsertStatement>::iterator begin,
@@ -355,7 +364,7 @@ bool insertBatchAndHandleErrors(OperationContext* opCtx,
                 &hangDuringBatchInsert,
                 opCtx,
                 "hangDuringBatchInsert",
-                [wholeOp]() {
+                [&wholeOp]() {
                     log()
                         << "batch insert - hangDuringBatchInsert fail point enabled for namespace "
                         << wholeOp.getNamespace() << ". Blocking "
@@ -368,7 +377,10 @@ bool insertBatchAndHandleErrors(OperationContext* opCtx,
                 uasserted(ErrorCodes::InternalError, "failAllInserts failpoint active!");
             }
 
-            collection.emplace(opCtx, wholeOp.getNamespace(), MODE_IX);
+            collection.emplace(
+                opCtx,
+                wholeOp.getNamespace(),
+                fixLockModeForSystemDotViewsChanges(wholeOp.getNamespace(), MODE_IX));
             if (collection->getCollection())
                 break;
 
@@ -378,6 +390,9 @@ bool insertBatchAndHandleErrors(OperationContext* opCtx,
 
         curOp.raiseDbProfileLevel(collection->getDb()->getProfilingLevel());
         assertCanWrite_inlock(opCtx, wholeOp.getNamespace());
+
+        CurOpFailpointHelpers::waitWhileFailPointEnabled(
+            &hangWithLockDuringBatchInsert, opCtx, "hangWithLockDuringBatchInsert");
     };
 
     try {
@@ -390,6 +405,8 @@ bool insertBatchAndHandleErrors(OperationContext* opCtx,
                 opCtx, collection->getCollection(), batch.begin(), batch.end(), fromMigrate);
             lastOpFixer->finishedOpSuccessfully();
             globalOpCounters.gotInserts(batch.size());
+            ServerWriteConcernMetrics::get(opCtx)->recordWriteConcernForInserts(
+                opCtx->getWriteConcern(), batch.size());
             SingleWriteResult result;
             result.setN(1);
 
@@ -414,6 +431,8 @@ bool insertBatchAndHandleErrors(OperationContext* opCtx,
     // for batches that failed all-at-once inserting.
     for (auto it = batch.begin(); it != batch.end(); ++it) {
         globalOpCounters.gotInsert();
+        ServerWriteConcernMetrics::get(opCtx)->recordWriteConcernForInsert(
+            opCtx->getWriteConcern());
         try {
             writeConflictRetry(opCtx, "insert", wholeOp.getNamespace().ns(), [&] {
                 try {
@@ -510,6 +529,7 @@ WriteResult performInserts(OperationContext* opCtx,
     size_t bytesInBatch = 0;
     std::vector<InsertStatement> batch;
     const size_t maxBatchSize = internalInsertMaxBatchSize.load();
+    const size_t maxBatchBytes = write_ops::insertVectorMaxBytes;
     batch.reserve(std::min(wholeOp.getDocuments().size(), maxBatchSize));
 
     for (auto&& doc : wholeOp.getDocuments()) {
@@ -534,7 +554,7 @@ WriteResult performInserts(OperationContext* opCtx,
             BSONObj toInsert = fixedDoc.getValue().isEmpty() ? doc : std::move(fixedDoc.getValue());
             batch.emplace_back(stmtId, toInsert);
             bytesInBatch += batch.back().doc.objsize();
-            if (!isLastDoc && batch.size() < maxBatchSize && bytesInBatch < insertVectorMaxBytes)
+            if (!isLastDoc && batch.size() < maxBatchSize && bytesInBatch < maxBatchBytes)
                 continue;  // Add more to batch before inserting.
         }
 
@@ -545,6 +565,8 @@ WriteResult performInserts(OperationContext* opCtx,
 
         if (canContinue && !fixedDoc.isOK()) {
             globalOpCounters.gotInsert();
+            ServerWriteConcernMetrics::get(opCtx)->recordWriteConcernForInsert(
+                opCtx->getWriteConcern());
             try {
                 uassertStatusOK(fixedDoc.getStatus());
                 MONGO_UNREACHABLE;
@@ -575,7 +597,7 @@ static SingleWriteResult performSingleUpdateOp(OperationContext* opCtx,
             &hangDuringBatchUpdate,
             opCtx,
             "hangDuringBatchUpdate",
-            [ns]() {
+            [&ns]() {
                 log() << "batch update - hangDuringBatchUpdate fail point enabled for nss " << ns
                       << ". Blocking until "
                          "fail point is disabled.";
@@ -590,13 +612,16 @@ static SingleWriteResult performSingleUpdateOp(OperationContext* opCtx,
         collection.emplace(opCtx,
                            ns,
                            MODE_IX,  // DB is always IX, even if collection is X.
-                           MODE_IX);
+                           fixLockModeForSystemDotViewsChanges(ns, MODE_IX));
         if (collection->getCollection() || !updateRequest.isUpsert())
             break;
 
         collection.reset();  // unlock.
         makeCollection(opCtx, ns);
     }
+
+    CurOpFailpointHelpers::waitWhileFailPointEnabled(
+        &hangWithLockDuringBatchUpdate, opCtx, "hangWithLockDuringBatchUpdate");
 
     auto& curOp = *CurOp::get(opCtx);
 
@@ -653,6 +678,7 @@ static SingleWriteResult performSingleUpdateOpWithDupKeyRetry(OperationContext* 
                                                               StmtId stmtId,
                                                               const write_ops::UpdateOpEntry& op) {
     globalOpCounters.gotUpdate();
+    ServerWriteConcernMetrics::get(opCtx)->recordWriteConcernForUpdate(opCtx->getWriteConcern());
     auto& curOp = *CurOp::get(opCtx);
     {
         stdx::lock_guard<Client> lk(*opCtx->getClient());
@@ -784,6 +810,7 @@ static SingleWriteResult performSingleDeleteOp(OperationContext* opCtx,
                 !opCtx->getTxnNumber() || !op.getMulti());
 
     globalOpCounters.gotDelete();
+    ServerWriteConcernMetrics::get(opCtx)->recordWriteConcernForDelete(opCtx->getWriteConcern());
     auto& curOp = *CurOp::get(opCtx);
     {
         stdx::lock_guard<Client> lk(*opCtx->getClient());
@@ -825,12 +852,15 @@ static SingleWriteResult performSingleDeleteOp(OperationContext* opCtx,
     AutoGetCollection collection(opCtx,
                                  ns,
                                  MODE_IX,  // DB is always IX, even if collection is X.
-                                 MODE_IX);
+                                 fixLockModeForSystemDotViewsChanges(ns, MODE_IX));
     if (collection.getDb()) {
         curOp.raiseDbProfileLevel(collection.getDb()->getProfilingLevel());
     }
 
     assertCanWrite_inlock(opCtx, ns);
+
+    CurOpFailpointHelpers::waitWhileFailPointEnabled(
+        &hangWithLockDuringBatchRemove, opCtx, "hangWithLockDuringBatchRemove");
 
     auto exec = uassertStatusOK(
         getExecutorDelete(opCtx, &curOp.debug(), collection.getCollection(), &parsedDelete));

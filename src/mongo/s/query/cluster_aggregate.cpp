@@ -49,6 +49,7 @@
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
 #include "mongo/db/pipeline/mongos_process_interface.h"
 #include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/sharded_agg_helpers.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/find_common.h"
@@ -140,13 +141,13 @@ BSONObj createCommandForMergingShard(const AggregationRequest& request,
     return appendAllowImplicitCreate(aggCmd, true);
 }
 
-MongoSInterface::DispatchShardPipelineResults dispatchExchangeConsumerPipeline(
+sharded_agg_helpers::DispatchShardPipelineResults dispatchExchangeConsumerPipeline(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     const NamespaceString& executionNss,
     const AggregationRequest& request,
     const LiteParsedPipeline& litePipe,
     BSONObj collationObj,
-    MongoSInterface::DispatchShardPipelineResults* shardDispatchResults) {
+    sharded_agg_helpers::DispatchShardPipelineResults* shardDispatchResults) {
     invariant(!litePipe.hasChangeStream());
     auto opCtx = expCtx->opCtx;
 
@@ -183,7 +184,7 @@ MongoSInterface::DispatchShardPipelineResults dispatchExchangeConsumerPipeline(
 
         consumerPipelines.emplace_back(std::move(consumerPipeline), nullptr, boost::none);
 
-        auto consumerCmdObj = MongoSInterface::createCommandForTargetedShards(
+        auto consumerCmdObj = sharded_agg_helpers::createCommandForTargetedShards(
             opCtx, request, litePipe, consumerPipelines.back(), collationObj, boost::none, false);
 
         requests.emplace_back(shardDispatchResults->exchangeSpec->consumerShards[idx],
@@ -216,16 +217,16 @@ MongoSInterface::DispatchShardPipelineResults dispatchExchangeConsumerPipeline(
             static_cast<DocumentSourceMergeCursors*>(pipeline.shardsPipeline->peekFront());
         mergeCursors->dismissCursorOwnership();
     }
-    return MongoSInterface::DispatchShardPipelineResults{false,
-                                                         std::move(ownedCursors),
-                                                         {} /*TODO SERVER-36279*/,
-                                                         std::move(splitPipeline),
-                                                         nullptr,
-                                                         BSONObj(),
-                                                         numConsumers};
+    return sharded_agg_helpers::DispatchShardPipelineResults{false,
+                                                             std::move(ownedCursors),
+                                                             {} /*TODO SERVER-36279*/,
+                                                             std::move(splitPipeline),
+                                                             nullptr,
+                                                             BSONObj(),
+                                                             numConsumers};
 }
 
-Status appendExplainResults(MongoSInterface::DispatchShardPipelineResults&& dispatchResults,
+Status appendExplainResults(sharded_agg_helpers::DispatchShardPipelineResults&& dispatchResults,
                             const boost::intrusive_ptr<ExpressionContext>& mergeCtx,
                             BSONObjBuilder* result) {
     if (dispatchResults.splitPipeline) {
@@ -287,17 +288,17 @@ Shard::CommandResponse establishMergingShardCursor(OperationContext* opCtx,
     const auto mergingShard =
         uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, mergingShardId));
 
-    Shard::RetryPolicy retryPolicy = MongoSInterface::getDesiredRetryPolicy(request);
+    Shard::RetryPolicy retryPolicy = sharded_agg_helpers::getDesiredRetryPolicy(request);
     return uassertStatusOK(mergingShard->runCommandWithFixedRetryAttempts(
         opCtx, ReadPreferenceSetting::get(opCtx), nss.db().toString(), mergeCmdObj, retryPolicy));
 }
 
-BSONObj establishMergingMongosCursor(
-    OperationContext* opCtx,
-    const AggregationRequest& request,
-    const NamespaceString& requestedNss,
-    const LiteParsedPipeline& liteParsedPipeline,
-    std::unique_ptr<Pipeline, PipelineDeleter> pipelineForMerging) {
+BSONObj establishMergingMongosCursor(OperationContext* opCtx,
+                                     const AggregationRequest& request,
+                                     const NamespaceString& requestedNss,
+                                     const LiteParsedPipeline& liteParsedPipeline,
+                                     std::unique_ptr<Pipeline, PipelineDeleter> pipelineForMerging,
+                                     const PrivilegeVector& privileges) {
 
     ClusterClientCursorParams params(requestedNss, ReadPreferenceSetting::get(opCtx));
 
@@ -311,6 +312,7 @@ BSONObj establishMergingMongosCursor(
         : boost::optional<long long>(request.getBatchSize());
     params.lsid = opCtx->getLogicalSessionId();
     params.txnNumber = opCtx->getTxnNumber();
+    params.originatingPrivileges = privileges;
 
     if (TransactionRouter::get(opCtx)) {
         params.isAutoCommit = false;
@@ -460,15 +462,17 @@ BSONObj getDefaultCollationForUnshardedCollection(const BSONObj collectionInfo) 
 std::pair<BSONObj, boost::optional<UUID>> getCollationAndUUID(
     const boost::optional<CachedCollectionRoutingInfo>& routingInfo,
     const NamespaceString& nss,
-    const AggregationRequest& request) {
+    const AggregationRequest& request,
+    const LiteParsedPipeline& litePipe) {
     const bool collectionIsSharded = (routingInfo && routingInfo->cm());
     const bool collectionIsNotSharded = (routingInfo && !routingInfo->cm());
 
-    // Because collectionless aggregations are generally run against the 'admin' database, the
-    // standard logic will attempt to resolve its non-existent UUID and collation by sending a
-    // specious 'listCollections' command to the config servers. To prevent this, we immediately
-    // return the user-defined collation if one exists, or an empty BSONObj otherwise.
-    if (nss.isCollectionlessAggregateNS()) {
+    // If the LiteParsedPipeline reports that we should not attempt to resolve the namespace's UUID
+    // and collation, we immediately return the user-defined collation if one exists, or an empty
+    // BSONObj otherwise. For instance, because collectionless aggregations generally run against
+    // the 'admin' database, the standard logic would attempt to resolve its non-existent UUID and
+    // collation by sending a specious 'listCollections' command to the config servers.
+    if (!litePipe.shouldResolveUUIDAndCollation()) {
         return {request.getCollation(), boost::none};
     }
 
@@ -574,7 +578,8 @@ Status runPipelineOnMongoS(const boost::intrusive_ptr<ExpressionContext>& expCtx
                            const AggregationRequest& request,
                            const LiteParsedPipeline& litePipe,
                            std::unique_ptr<Pipeline, PipelineDeleter> pipeline,
-                           BSONObjBuilder* result) {
+                           BSONObjBuilder* result,
+                           const PrivilegeVector& privileges) {
     // We should never receive a pipeline which cannot run on mongoS.
     invariant(!expCtx->explain);
     invariant(pipeline->canRunOnMongos());
@@ -590,8 +595,8 @@ Status runPipelineOnMongoS(const boost::intrusive_ptr<ExpressionContext>& expCtx
             !pipeline->getSources().front()->constraints().requiresInputDocSource);
 
     // Register the new mongoS cursor, and retrieve the initial batch of results.
-    auto cursorResponse =
-        establishMergingMongosCursor(opCtx, request, requestedNss, litePipe, std::move(pipeline));
+    auto cursorResponse = establishMergingMongosCursor(
+        opCtx, request, requestedNss, litePipe, std::move(pipeline), privileges);
 
     // We don't need to storePossibleCursor or propagate writeConcern errors; an $out pipeline
     // can never run on mongoS. Filter the command response and return immediately.
@@ -599,13 +604,15 @@ Status runPipelineOnMongoS(const boost::intrusive_ptr<ExpressionContext>& expCtx
     return getStatusFromCommandResult(result->asTempObj());
 }
 
-Status dispatchMergingPipeline(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                               const ClusterAggregate::Namespaces& namespaces,
-                               const AggregationRequest& request,
-                               const LiteParsedPipeline& litePipe,
-                               const boost::optional<CachedCollectionRoutingInfo>& routingInfo,
-                               MongoSInterface::DispatchShardPipelineResults&& shardDispatchResults,
-                               BSONObjBuilder* result) {
+Status dispatchMergingPipeline(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const ClusterAggregate::Namespaces& namespaces,
+    const AggregationRequest& request,
+    const LiteParsedPipeline& litePipe,
+    const boost::optional<CachedCollectionRoutingInfo>& routingInfo,
+    sharded_agg_helpers::DispatchShardPipelineResults&& shardDispatchResults,
+    BSONObjBuilder* result,
+    const PrivilegeVector& privileges) {
     // We should never be in a situation where we call this function on a non-merge pipeline.
     invariant(shardDispatchResults.splitPipeline);
     auto* mergePipeline = shardDispatchResults.splitPipeline->mergePipeline.get();
@@ -636,7 +643,8 @@ Status dispatchMergingPipeline(const boost::intrusive_ptr<ExpressionContext>& ex
                                    request,
                                    litePipe,
                                    std::move(shardDispatchResults.splitPipeline->mergePipeline),
-                                   result);
+                                   result,
+                                   privileges);
     }
 
     // If we are not merging on mongoS, then this is not a $changeStream aggregation, and we
@@ -658,8 +666,12 @@ Status dispatchMergingPipeline(const boost::intrusive_ptr<ExpressionContext>& ex
     auto mergeResponse = establishMergingShardCursor(
         opCtx, namespaces.executionNss, request, mergeCmdObj, mergingShardId);
 
-    auto mergeCursorResponse = uassertStatusOK(storePossibleCursor(
-        opCtx, namespaces.requestedNss, mergingShardId, mergeResponse, expCtx->tailableMode));
+    auto mergeCursorResponse = uassertStatusOK(storePossibleCursor(opCtx,
+                                                                   namespaces.requestedNss,
+                                                                   mergingShardId,
+                                                                   mergeResponse,
+                                                                   privileges,
+                                                                   expCtx->tailableMode));
 
     // Ownership for the shard cursors has been transferred to the merging shard. Dismiss the
     // ownership in the current merging pipeline such that when it goes out of scope it does not
@@ -686,10 +698,11 @@ void appendEmptyResultSetWithStatus(OperationContext* opCtx,
 Status ClusterAggregate::runAggregate(OperationContext* opCtx,
                                       const Namespaces& namespaces,
                                       const AggregationRequest& request,
+                                      const PrivilegeVector& privileges,
                                       BSONObjBuilder* result) {
     uassert(51028, "Cannot specify exchange option to a mongos", !request.getExchangeSpec());
     auto executionNsRoutingInfoStatus =
-        MongoSInterface::getExecutionNsRoutingInfo(opCtx, namespaces.executionNss);
+        sharded_agg_helpers::getExecutionNsRoutingInfo(opCtx, namespaces.executionNss);
     boost::optional<CachedCollectionRoutingInfo> routingInfo;
     LiteParsedPipeline litePipe(request);
     const auto isSharded = [](OperationContext* opCtx, const NamespaceString& nss) -> bool {
@@ -717,7 +730,7 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
 
     // Determine whether this aggregation must be dispatched to all shards in the cluster.
     const bool mustRunOnAll =
-        MongoSInterface::mustRunOnAllShards(namespaces.executionNss, litePipe);
+        sharded_agg_helpers::mustRunOnAllShards(namespaces.executionNss, litePipe);
 
     // If we don't have a routing table, then this is a $changeStream which must run on all shards.
     invariant(routingInfo || (mustRunOnAll && litePipe.hasChangeStream()));
@@ -735,11 +748,12 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
         litePipe.allowedToForwardFromMongos() && litePipe.allowedToPassthroughFromMongos() &&
         !involvesShardedCollections) {
         const auto primaryShardId = routingInfo->db().primary()->getId();
-        return aggPassthrough(opCtx, namespaces, primaryShardId, request, litePipe, result);
+        return aggPassthrough(
+            opCtx, namespaces, primaryShardId, request, litePipe, privileges, result);
     }
 
     // Populate the collection UUID and the appropriate collation to use.
-    auto collInfo = getCollationAndUUID(routingInfo, namespaces.executionNss, request);
+    auto collInfo = getCollationAndUUID(routingInfo, namespaces.executionNss, request, litePipe);
     BSONObj collationObj = collInfo.first;
     boost::optional<UUID> uuid = collInfo.second;
 
@@ -764,11 +778,11 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
         }
 
         return runPipelineOnMongoS(
-            expCtx, namespaces, request, litePipe, std::move(pipeline), result);
+            expCtx, namespaces, request, litePipe, std::move(pipeline), result, privileges);
     }
 
     // If not, split the pipeline as necessary and dispatch to the relevant shards.
-    auto shardDispatchResults = MongoSInterface::dispatchShardPipeline(
+    auto shardDispatchResults = sharded_agg_helpers::dispatchShardPipeline(
         expCtx, namespaces.executionNss, request, litePipe, std::move(pipeline), collationObj);
 
     // If the operation is an explain, then we verify that it succeeded on all targeted shards,
@@ -786,8 +800,11 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
         invariant(shardDispatchResults.remoteCursors.size() == 1);
         auto&& remoteCursor = std::move(shardDispatchResults.remoteCursors.front());
         const auto shardId = remoteCursor->getShardId().toString();
-        const auto reply = uassertStatusOK(storePossibleCursor(
-            opCtx, namespaces.requestedNss, std::move(remoteCursor), expCtx->tailableMode));
+        const auto reply = uassertStatusOK(storePossibleCursor(opCtx,
+                                                               namespaces.requestedNss,
+                                                               std::move(remoteCursor),
+                                                               privileges,
+                                                               expCtx->tailableMode));
         return appendCursorResponseToCommandResult(shardId, reply, result);
     }
 
@@ -808,7 +825,8 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
                                    litePipe,
                                    routingInfo,
                                    std::move(shardDispatchResults),
-                                   result);
+                                   result,
+                                   privileges);
 }
 
 void ClusterAggregate::uassertAllShardsSupportExplain(
@@ -835,6 +853,7 @@ Status ClusterAggregate::aggPassthrough(OperationContext* opCtx,
                                         const ShardId& shardId,
                                         const AggregationRequest& aggRequest,
                                         const LiteParsedPipeline& liteParsedPipeline,
+                                        const PrivilegeVector& privileges,
                                         BSONObjBuilder* out) {
     // Temporary hack. See comment on declaration for details.
     auto swShard = Grid::get(opCtx)->shardRegistry()->getShard(opCtx, shardId);
@@ -846,7 +865,7 @@ Status ClusterAggregate::aggPassthrough(OperationContext* opCtx,
     // Format the command for the shard. This adds the 'fromMongos' field, wraps the command as an
     // explain if necessary, and rewrites the result into a format safe to forward to shards.
     BSONObj cmdObj = CommandHelpers::filterCommandRequestForPassthrough(
-        MongoSInterface::createPassthroughCommandForShard(
+        sharded_agg_helpers::createPassthroughCommandForShard(
             opCtx, aggRequest, shardId, nullptr, BSONObj()));
 
     auto cmdResponse = uassertStatusOK(shard->runCommandWithFixedRetryAttempts(
@@ -874,7 +893,7 @@ Status ClusterAggregate::aggPassthrough(OperationContext* opCtx,
             ? TailableModeEnum::kTailableAndAwaitData
             : TailableModeEnum::kNormal;
         result = uassertStatusOK(storePossibleCursor(
-            opCtx, namespaces.requestedNss, shard->getId(), cmdResponse, tailMode));
+            opCtx, namespaces.requestedNss, shard->getId(), cmdResponse, privileges, tailMode));
     }
 
     // First append the properly constructed writeConcernError. It will then be skipped
@@ -892,6 +911,7 @@ Status ClusterAggregate::retryOnViewError(OperationContext* opCtx,
                                           const AggregationRequest& request,
                                           const ResolvedView& resolvedView,
                                           const NamespaceString& requestedNss,
+                                          const PrivilegeVector& privileges,
                                           BSONObjBuilder* result,
                                           unsigned numberRetries) {
     if (numberRetries >= kMaxViewRetries) {
@@ -903,7 +923,7 @@ Status ClusterAggregate::retryOnViewError(OperationContext* opCtx,
     result->resetToEmpty();
 
     if (auto txnRouter = TransactionRouter::get(opCtx)) {
-        txnRouter->onViewResolutionError(requestedNss);
+        txnRouter->onViewResolutionError(opCtx, requestedNss);
     }
 
     // We pass both the underlying collection namespace and the view namespace here. The
@@ -914,7 +934,8 @@ Status ClusterAggregate::retryOnViewError(OperationContext* opCtx,
     nsStruct.requestedNss = requestedNss;
     nsStruct.executionNss = resolvedView.getNamespace();
 
-    auto status = ClusterAggregate::runAggregate(opCtx, nsStruct, resolvedAggRequest, result);
+    auto status =
+        ClusterAggregate::runAggregate(opCtx, nsStruct, resolvedAggRequest, privileges, result);
 
     // If the underlying namespace was changed to a view during retry, then re-run the aggregation
     // on the new resolved namespace.
@@ -923,6 +944,7 @@ Status ClusterAggregate::retryOnViewError(OperationContext* opCtx,
                                                   resolvedAggRequest,
                                                   *status.extraInfo<ResolvedView>(),
                                                   requestedNss,
+                                                  privileges,
                                                   result,
                                                   numberRetries + 1);
     }

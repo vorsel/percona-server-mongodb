@@ -184,14 +184,14 @@ public:
     /**
      * Sets a transport Baton on the operation.  This will trigger the Baton on markKilled.
      */
-    void setBaton(const transport::BatonHandle& baton) {
+    void setBaton(const BatonHandle& baton) {
         _baton = baton;
     }
 
     /**
      * Retrieves the baton associated with the operation.
      */
-    const transport::BatonHandle& getBaton() const {
+    const BatonHandle& getBaton() const {
         return _baton;
     }
 
@@ -236,6 +236,8 @@ public:
     bool writesAreReplicated() const {
         return _writesAreReplicated;
     }
+
+    void markKillOnClientDisconnect();
 
     /**
      * Marks this operation as killed so that subsequent calls to checkForInterrupt and
@@ -310,6 +312,11 @@ public:
     Date_t getDeadline() const override {
         return _deadline;
     }
+
+    /**
+     * Returns the error code used when this operation's time limit is reached.
+     */
+    ErrorCodes::Error getTimeoutError() const;
 
     /**
      * Returns the number of milliseconds remaining for this operation's time limit or
@@ -431,13 +438,17 @@ private:
 
     // A transport Baton associated with the operation. The presence of this object implies that a
     // client thread is doing it's own async networking by blocking on it's own thread.
-    transport::BatonHandle _baton;
+    BatonHandle _baton;
 
     // If non-null, _waitMutex and _waitCV are the (mutex, condition variable) pair that the
     // operation is currently waiting on inside a call to waitForConditionOrInterrupt...().
+    //
+    // _waitThread is the calling thread's thread id.
+    //
     // All access guarded by the Client's lock.
     stdx::mutex* _waitMutex = nullptr;
     stdx::condition_variable* _waitCV = nullptr;
+    stdx::thread::id _waitThread;
 
     // If _waitMutex and _waitCV are non-null, this is the number of threads in a call to markKilled
     // actively attempting to kill the operation. If this value is non-zero, the operation is inside
@@ -454,6 +465,8 @@ private:
     ErrorCodes::Error _timeoutError = ErrorCodes::ExceededTimeLimit;
     bool _ignoreInterrupts = false;
     bool _hasArtificialDeadline = false;
+    bool _markKillOnClientDisconnect = false;
+    Date_t _lastClientCheck;
 
     // Max operation time requested by the user or by the cursor in the case of a getMore with no
     // user-specified maxTime. This is tracked with microsecond granularity for the purpose of
@@ -466,35 +479,6 @@ private:
     Timer _elapsedTime;
 
     bool _writesAreReplicated = true;
-};
-
-/**
- * RAII-style class to temporarily swap the operation context associated with the client.
- *
- * Use this class to bind a new operation context to a client for the duration of the
- * AlternativeOpCtx's lifetime and restore the prior opCtx at the end of the block.
- */
-class AlternativeOpCtx {
-public:
-    explicit AlternativeOpCtx(mongo::OperationContext* originalOpCtx)
-        : _client(originalOpCtx->getClient()), _originalOpCtx(originalOpCtx) {
-        _client->resetOperationContext();
-        _alternateOpCtx = _client->makeOperationContext();
-    }
-
-    ~AlternativeOpCtx() {
-        _alternateOpCtx.reset();
-        _client->setOperationContext(_originalOpCtx);
-    }
-
-    mongo::OperationContext* getOperationContext() {
-        return _alternateOpCtx.get();
-    }
-
-private:
-    Client* _client = nullptr;
-    mongo::OperationContext* _originalOpCtx = nullptr;
-    ServiceContext::UniqueOperationContext _alternateOpCtx;
 };
 
 namespace repl {

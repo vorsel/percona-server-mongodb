@@ -225,6 +225,10 @@ env.Library(
     target='authorization_manager_global',
     source=[
         'authorization_manager_global.cpp',
+        env.Idlc('authorization_manager_global_parameters.idl')[0],
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/idl/server_parameter',
     ],
     LIBDEPS=[
         'auth',
@@ -296,7 +300,7 @@ env.Library(
 )
 
 yamlEnv = env.Clone()
-yamlEnv.InjectThirdPartyIncludePaths(libraries=['yaml'])
+yamlEnv.InjectThirdParty(libraries=['yaml'])
 yamlEnv.Library(
     target='security_file',
     source=[
@@ -382,7 +386,6 @@ env.Library(
         '$BUILD_DIR/mongo/db/dbdirectclient',
         '$BUILD_DIR/mongo/db/dbhelpers',
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
-        '$BUILD_DIR/mongo/db/server_parameters',
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',

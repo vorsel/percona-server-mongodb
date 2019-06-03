@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -204,7 +203,7 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PlanExecutorImpl::ma
                                          collection,
                                          std::move(nss),
                                          yieldPolicy);
-    PlanExecutor::Deleter planDeleter(opCtx, collection ? collection->getCursorManager() : nullptr);
+    PlanExecutor::Deleter planDeleter(opCtx);
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec(execImpl, std::move(planDeleter));
 
     // Perform plan selection, if necessary.
@@ -294,8 +293,6 @@ string PlanExecutor::statestr(ExecState s) {
         return "ADVANCED";
     } else if (PlanExecutor::IS_EOF == s) {
         return "IS_EOF";
-    } else if (PlanExecutor::DEAD == s) {
-        return "DEAD";
     } else {
         verify(PlanExecutor::FAILURE == s);
         return "FAILURE";
@@ -494,7 +491,7 @@ PlanExecutor::ExecState PlanExecutorImpl::_waitForInserts(CappedInsertNotifierDa
         *errorObj = Snapshotted<BSONObj>(SnapshotId(),
                                          WorkingSetCommon::buildMemberStatusObject(yieldResult));
     }
-    return DEAD;
+    return FAILURE;
 }
 
 PlanExecutor::ExecState PlanExecutorImpl::_getNextImpl(Snapshotted<BSONObj>* objOut,
@@ -514,7 +511,7 @@ PlanExecutor::ExecState PlanExecutorImpl::_getNextImpl(Snapshotted<BSONObj>* obj
             *objOut = Snapshotted<BSONObj>(SnapshotId(),
                                            WorkingSetCommon::buildMemberStatusObject(_killStatus));
         }
-        return PlanExecutor::DEAD;
+        return PlanExecutor::FAILURE;
     }
 
     if (!_stash.empty()) {
@@ -548,7 +545,7 @@ PlanExecutor::ExecState PlanExecutorImpl::_getNextImpl(Snapshotted<BSONObj>* obj
                     *objOut = Snapshotted<BSONObj>(
                         SnapshotId(), WorkingSetCommon::buildMemberStatusObject(yieldStatus));
                 }
-                return PlanExecutor::DEAD;
+                return PlanExecutor::FAILURE;
             }
         }
 
@@ -627,7 +624,7 @@ PlanExecutor::ExecState PlanExecutorImpl::_getNextImpl(Snapshotted<BSONObj>* obj
             }
             return waitResult;
         } else {
-            invariant(PlanStage::DEAD == code || PlanStage::FAILURE == code);
+            invariant(PlanStage::FAILURE == code);
 
             if (NULL != objOut) {
                 BSONObj statusObj;
@@ -636,7 +633,7 @@ PlanExecutor::ExecState PlanExecutorImpl::_getNextImpl(Snapshotted<BSONObj>* obj
                 *objOut = Snapshotted<BSONObj>(SnapshotId(), statusObj);
             }
 
-            return (PlanStage::DEAD == code) ? PlanExecutor::DEAD : PlanExecutor::FAILURE;
+            return PlanExecutor::FAILURE;
         }
     }
 }
@@ -654,7 +651,7 @@ void PlanExecutorImpl::markAsKilled(Status killStatus) {
     }
 }
 
-void PlanExecutorImpl::dispose(OperationContext* opCtx, CursorManager* cursorManager) {
+void PlanExecutorImpl::dispose(OperationContext* opCtx) {
     if (_currentState == kDisposed) {
         return;
     }
@@ -671,7 +668,7 @@ Status PlanExecutorImpl::executePlan() {
         state = this->getNext(&obj, NULL);
     }
 
-    if (PlanExecutor::DEAD == state || PlanExecutor::FAILURE == state) {
+    if (PlanExecutor::FAILURE == state) {
         if (isMarkedAsKilled()) {
             return _killStatus;
         }

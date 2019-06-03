@@ -132,6 +132,10 @@ __wt_page_header_byteswap(WT_PAGE_HEADER *dsk)
  *	An in-memory structure to hold a block's location.
  */
 struct __wt_addr {
+	wt_timestamp_t oldest_start_ts;	/* Aggregated timestamp information */
+	wt_timestamp_t newest_start_ts;
+	wt_timestamp_t newest_stop_ts;
+
 	uint8_t *addr;			/* Block-manager's cookie */
 	uint8_t  size;			/* Block-manager's cookie length */
 
@@ -205,8 +209,13 @@ struct __wt_ovfl_reuse {
  * this way so that overall the lookaside table is append-mostly), a counter
  * (used to ensure the update records remain in the original order), and the
  * record's key (byte-string for row-store, record number for column-store).
- * The value is the WT_UPDATE structure's transaction ID, timestamp, update's
- * prepare state, update type and value.
+ * The value is the WT_UPDATE structure's:
+ * 	- transaction ID
+ * 	- timestamp
+ * 	- durable timestamp
+ * 	- update's prepare state
+ *	- update type
+ *	- value.
  *
  * As the key for the lookaside table is different for row- and column-store, we
  * store both key types in a WT_ITEM, building/parsing them in the code, because
@@ -223,7 +232,7 @@ struct __wt_ovfl_reuse {
 #endif
 #define	WT_LAS_CONFIG							\
     "key_format=" WT_UNCHECKED_STRING(QIQu)				\
-    ",value_format=" WT_UNCHECKED_STRING(QQBBu)				\
+    ",value_format=" WT_UNCHECKED_STRING(QQQBBu)			\
     ",block_compressor=" WT_LOOKASIDE_COMPRESSOR			\
     ",leaf_value_max=64MB"						\
     ",prefix_compression=true"

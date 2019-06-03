@@ -45,9 +45,12 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/views/view_catalog.h"
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
+
+MONGO_FAIL_POINT_DEFINE(hangDuringDropCollection);
 
 Status dropCollection(OperationContext* opCtx,
                       const NamespaceString& collectionName,
@@ -58,16 +61,18 @@ Status dropCollection(OperationContext* opCtx,
         log() << "CMD: drop " << collectionName;
     }
 
-    invariant(opCtx->recoveryUnit()->getTimestampReadSource() == RecoveryUnit::ReadSource::kUnset ||
-              opCtx->recoveryUnit()->getTimestampReadSource() ==
-                  RecoveryUnit::ReadSource::kNoTimestamp);
-
     return writeConflictRetry(opCtx, "drop", collectionName.ns(), [&] {
         AutoGetDb autoDb(opCtx, collectionName.db(), MODE_X);
         Database* const db = autoDb.getDb();
         Collection* coll = db ? db->getCollection(opCtx, collectionName) : nullptr;
         auto view =
             db && !coll ? db->getViewCatalog()->lookup(opCtx, collectionName.ns()) : nullptr;
+
+        if (MONGO_FAIL_POINT(hangDuringDropCollection)) {
+            log() << "hangDuringDropCollection fail point enabled. Blocking until fail point is "
+                     "disabled.";
+            MONGO_FAIL_POINT_PAUSE_WHILE_SET(hangDuringDropCollection);
+        }
 
         if (!db || (!coll && !view)) {
             return Status(ErrorCodes::NamespaceNotFound, "ns not found");
@@ -82,7 +87,7 @@ Status dropCollection(OperationContext* opCtx,
         if (userInitiatedWritesAndNotPrimary) {
             return Status(ErrorCodes::NotMaster,
                           str::stream() << "Not primary while dropping collection "
-                                        << collectionName.ns());
+                                        << collectionName);
         }
 
         WriteUnitOfWork wunit(opCtx);

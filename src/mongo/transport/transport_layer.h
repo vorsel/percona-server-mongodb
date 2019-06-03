@@ -33,6 +33,7 @@
 #include <memory>
 
 #include "mongo/base/status.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/transport/session.h"
 #include "mongo/util/functional.h"
@@ -109,8 +110,8 @@ public:
     enum WhichReactor { kIngress, kEgress, kNewReactor };
     virtual ReactorHandle getReactor(WhichReactor which) = 0;
 
-    virtual BatonHandle makeBaton(OperationContext* opCtx) {
-        return nullptr;
+    virtual BatonHandle makeBaton(OperationContext* opCtx) const {
+        return opCtx->getServiceContext()->makeBaton(opCtx);
     }
 
 protected:
@@ -119,7 +120,8 @@ protected:
 
 class ReactorTimer {
 public:
-    ReactorTimer() = default;
+    ReactorTimer();
+
     ReactorTimer(const ReactorTimer&) = delete;
     ReactorTimer& operator=(const ReactorTimer&) = delete;
 
@@ -127,6 +129,10 @@ public:
      * The destructor calls cancel() to ensure outstanding Futures are filled.
      */
     virtual ~ReactorTimer() = default;
+
+    size_t id() const {
+        return _id;
+    }
 
     /*
      * Cancel any outstanding future from waitFor/waitUntil. The future will be filled with an
@@ -142,6 +148,9 @@ public:
      * Calling this implicitly calls cancel().
      */
     virtual Future<void> waitUntil(Date_t deadline, const BatonHandle& baton = nullptr) = 0;
+
+private:
+    const size_t _id;
 };
 
 class Reactor {

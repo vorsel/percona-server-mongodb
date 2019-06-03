@@ -59,6 +59,9 @@ selector:
   # Test is only for stand alone mongod.
   - jstests/core/read_after_optime.js
 
+  # Reads from system.views.
+  - jstests/core/views/views_drop.js
+
   ##
   ## Limitations with the way the runner file injects transactions.
   ##
@@ -108,6 +111,7 @@ selector:
   - jstests/core/uniqueness.js
   - jstests/core/unset2.js
   - jstests/core/update_addToSet.js
+  - jstests/core/update_array_offset_positional.js
   - jstests/core/update_arrayFilters.js
   - jstests/core/update_find_and_modify_id.js
   - jstests/core/update_modifier_pop.js
@@ -168,6 +172,7 @@ selector:
   - jstests/core/json_schema/additional_properties.js
   - jstests/core/json_schema/bsontype.js
   - jstests/core/json_schema/dependencies.js
+  - jstests/core/json_schema/encrypt.js
   - jstests/core/json_schema/items.js
   - jstests/core/json_schema/logical_keywords.js
   - jstests/core/json_schema/min_max_items.js

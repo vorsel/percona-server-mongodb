@@ -46,7 +46,6 @@
 #include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/global_settings.h"
-#include "mongo/db/index_rebuilder.h"
 #include "mongo/db/kill_sessions_local.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/op_observer_impl.h"
@@ -160,7 +159,7 @@ void shutdown(ServiceContext* srvContext) {
             UninterruptibleLockGuard noInterrupt(shutdownOpCtx->lockState());
             Lock::GlobalLock lk(shutdownOpCtx.get(), MODE_X);
             auto databaseHolder = DatabaseHolder::get(shutdownOpCtx.get());
-            databaseHolder->closeAll(shutdownOpCtx.get(), "shutdown");
+            databaseHolder->closeAll(shutdownOpCtx.get());
 
             LogicalSessionCache::set(serviceContext, nullptr);
 
@@ -315,10 +314,6 @@ ServiceContext* initialize(const char* yaml_config) {
 
     // This is for security on certain platforms (nonce generation)
     srand((unsigned)(curTimeMicros64()) ^ (unsigned(uintptr_t(&startupOpCtx))));
-
-    if (!storageGlobalParams.readOnly) {
-        restartInProgressIndexesFromLastShutdown(startupOpCtx.get());
-    }
 
     // Set up the logical session cache
     auto sessionCache = makeLogicalSessionCacheEmbedded();

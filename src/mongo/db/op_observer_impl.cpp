@@ -360,6 +360,117 @@ void OpObserverImpl::onCreateIndex(OperationContext* opCtx,
                  OplogSlot());
 }
 
+void OpObserverImpl::onStartIndexBuild(OperationContext* opCtx,
+                                       const NamespaceString& nss,
+                                       CollectionUUID collUUID,
+                                       const UUID& indexBuildUUID,
+                                       const std::vector<BSONObj>& indexes,
+                                       bool fromMigrate) {
+    BSONObjBuilder oplogEntryBuilder;
+    oplogEntryBuilder.append("startIndexBuild", nss.coll());
+
+    indexBuildUUID.appendToBuilder(&oplogEntryBuilder, "indexBuildUUID");
+
+    BSONArrayBuilder indexesArr(oplogEntryBuilder.subarrayStart("indexes"));
+    for (auto indexDoc : indexes) {
+        BSONObjBuilder builder;
+        for (const auto& e : indexDoc) {
+            if (e.fieldNameStringData() != "ns"_sd)
+                builder.append(e);
+        }
+        indexesArr.append(builder.obj());
+    }
+    indexesArr.done();
+
+    logOperation(opCtx,
+                 "c",
+                 nss.getCommandNS(),
+                 collUUID,
+                 oplogEntryBuilder.done(),
+                 nullptr,
+                 fromMigrate,
+                 getWallClockTimeForOpLog(opCtx),
+                 {},
+                 kUninitializedStmtId,
+                 {},
+                 false /* prepare */,
+                 OplogSlot());
+}
+
+void OpObserverImpl::onCommitIndexBuild(OperationContext* opCtx,
+                                        const NamespaceString& nss,
+                                        CollectionUUID collUUID,
+                                        const UUID& indexBuildUUID,
+                                        const std::vector<BSONObj>& indexes,
+                                        bool fromMigrate) {
+    BSONObjBuilder oplogEntryBuilder;
+    oplogEntryBuilder.append("commitIndexBuild", nss.coll());
+
+    indexBuildUUID.appendToBuilder(&oplogEntryBuilder, "indexBuildUUID");
+
+    BSONArrayBuilder indexesArr(oplogEntryBuilder.subarrayStart("indexes"));
+    for (auto indexDoc : indexes) {
+        BSONObjBuilder builder;
+        for (const auto& e : indexDoc) {
+            if (e.fieldNameStringData() != "ns"_sd)
+                builder.append(e);
+        }
+        indexesArr.append(builder.obj());
+    }
+    indexesArr.done();
+
+    logOperation(opCtx,
+                 "c",
+                 nss.getCommandNS(),
+                 collUUID,
+                 oplogEntryBuilder.done(),
+                 nullptr,
+                 fromMigrate,
+                 getWallClockTimeForOpLog(opCtx),
+                 {},
+                 kUninitializedStmtId,
+                 {},
+                 false /* prepare */,
+                 OplogSlot());
+}
+
+void OpObserverImpl::onAbortIndexBuild(OperationContext* opCtx,
+                                       const NamespaceString& nss,
+                                       CollectionUUID collUUID,
+                                       const UUID& indexBuildUUID,
+                                       const std::vector<BSONObj>& indexes,
+                                       bool fromMigrate) {
+    BSONObjBuilder oplogEntryBuilder;
+    oplogEntryBuilder.append("abortIndexBuild", nss.coll());
+
+    indexBuildUUID.appendToBuilder(&oplogEntryBuilder, "indexBuildUUID");
+
+    BSONArrayBuilder indexesArr(oplogEntryBuilder.subarrayStart("indexes"));
+    for (auto indexDoc : indexes) {
+        BSONObjBuilder builder;
+        for (const auto& e : indexDoc) {
+            if (e.fieldNameStringData() != "ns"_sd)
+                builder.append(e);
+        }
+        indexesArr.append(builder.obj());
+    }
+    indexesArr.done();
+
+    logOperation(opCtx,
+                 "c",
+                 nss.getCommandNS(),
+                 collUUID,
+                 oplogEntryBuilder.done(),
+                 nullptr,
+                 fromMigrate,
+                 getWallClockTimeForOpLog(opCtx),
+                 {},
+                 kUninitializedStmtId,
+                 {},
+                 false /* prepare */,
+                 OplogSlot());
+}
+
 void OpObserverImpl::onInserts(OperationContext* opCtx,
                                const NamespaceString& nss,
                                OptionalCollectionUUID uuid,
@@ -974,15 +1085,13 @@ void logCommitOrAbortForPreparedTransaction(OperationContext* opCtx,
 
 void OpObserverImpl::onTransactionCommit(OperationContext* opCtx,
                                          boost::optional<OplogSlot> commitOplogEntryOpTime,
-                                         boost::optional<Timestamp> commitTimestamp) {
+                                         boost::optional<Timestamp> commitTimestamp,
+                                         std::vector<repl::ReplOperation>& statements) {
     invariant(opCtx->getTxnNumber());
 
     if (!opCtx->writesAreReplicated()) {
         return;
     }
-
-    const auto txnParticipant = TransactionParticipant::get(opCtx);
-    invariant(txnParticipant);
 
     if (commitOplogEntryOpTime) {
         invariant(commitTimestamp);
@@ -994,26 +1103,24 @@ void OpObserverImpl::onTransactionCommit(OperationContext* opCtx,
             opCtx, *commitOplogEntryOpTime, cmdObj.toBSON(), DurableTxnStateEnum::kCommitted);
     } else {
         invariant(!commitTimestamp);
-        const auto stmts = txnParticipant->endTransactionAndRetrieveOperations(opCtx);
 
         // It is possible that the transaction resulted in no changes.  In that case, we should
         // not write an empty applyOps entry.
-        if (stmts.empty())
+        if (statements.empty())
             return;
 
-        const auto commitOpTime = logApplyOpsForTransaction(opCtx, stmts, OplogSlot()).writeOpTime;
+        const auto commitOpTime =
+            logApplyOpsForTransaction(opCtx, statements, OplogSlot()).writeOpTime;
         invariant(!commitOpTime.isNull());
     }
 }
 
-void OpObserverImpl::onTransactionPrepare(OperationContext* opCtx, const OplogSlot& prepareOpTime) {
+void OpObserverImpl::onTransactionPrepare(OperationContext* opCtx,
+                                          const OplogSlot& prepareOpTime,
+                                          std::vector<repl::ReplOperation>& statements) {
     invariant(opCtx->getTxnNumber());
 
-    const auto txnParticipant = TransactionParticipant::get(opCtx);
-    invariant(txnParticipant);
-    invariant(txnParticipant->inMultiDocumentTransaction());
     invariant(!prepareOpTime.opTime.isNull());
-    auto stmts = txnParticipant->endTransactionAndRetrieveOperations(opCtx);
 
     // Don't write oplog entry on secondaries.
     if (!opCtx->writesAreReplicated()) {
@@ -1034,7 +1141,7 @@ void OpObserverImpl::onTransactionPrepare(OperationContext* opCtx, const OplogSl
                 Lock::GlobalLock globalLock(opCtx, MODE_IX);
 
                 WriteUnitOfWork wuow(opCtx);
-                logApplyOpsForTransaction(opCtx, stmts, prepareOpTime);
+                logApplyOpsForTransaction(opCtx, statements, prepareOpTime);
                 wuow.commit();
             });
     }

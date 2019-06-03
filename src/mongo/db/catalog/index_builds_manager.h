@@ -36,6 +36,7 @@
 #include "mongo/base/disallow_copying.h"
 #include "mongo/db/catalog/multi_index_block.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/stdx/functional.h"
 #include "mongo/stdx/mutex.h"
 
 namespace mongo {
@@ -60,15 +61,13 @@ public:
 
     /**
      * Sets up the index build state and registers it in the manager.
-     *
-     * TODO: Not yet implemented. Only instantiates and registers a builder in the manager. Does not
-     * set up index build state.
      */
+    using OnInitFn = MultiIndexBlock::OnInitFn;
     Status setUpIndexBuild(OperationContext* opCtx,
                            Collection* collection,
-                           const NamespaceString& nss,
                            const std::vector<BSONObj>& specs,
-                           const UUID& buildUUID);
+                           const UUID& buildUUID,
+                           OnInitFn onInit);
 
     /**
      * Recovers the index build from its persisted state and sets it up to run again.
@@ -90,12 +89,18 @@ public:
     Status startBuildingIndex(const UUID& buildUUID);
 
     /**
+     * Document inserts observed during the scanning/insertion phase of an index build are not
+     * added but are instead stored in a temporary buffer until this function is invoked.
+     */
+    Status drainBackgroundWrites(const UUID& buildUUID);
+
+    /**
      * Persists information in the index catalog entry to reflect the successful completion of the
      * scanning/insertion phase.
      *
      * TODO: Not yet implemented.
      */
-    Status finishbBuildingPhase(const UUID& buildUUID);
+    Status finishBuildingPhase(const UUID& buildUUID);
 
     /**
      * Runs the index constraint violation checking phase of the index build..
@@ -105,20 +110,16 @@ public:
     Status checkIndexConstraintViolations(const UUID& buildUUID);
 
     /**
-     * Persists information in the index catalog entry to reflect the successful completion of the
-     * index constraint violation checking phase..
-     *
-     * TODO: Not yet implemented.
-     */
-    Status finishConstraintPhase(const UUID& buildUUID);
-
-    /**
      * Persists information in the index catalog entry that the index is ready for use, as well as
      * updating the in-memory index catalog entry for this index to ready.
-     *
-     * TODO: Not yet implemented.
      */
-    Status commitIndexBuild(const UUID& buildUUID);
+    using OnCreateEachFn = MultiIndexBlock::OnCreateEachFn;
+    using OnCommitFn = MultiIndexBlock::OnCommitFn;
+    Status commitIndexBuild(OperationContext* opCtx,
+                            const NamespaceString& nss,
+                            const UUID& buildUUID,
+                            OnCreateEachFn onCreateEachFn,
+                            OnCommitFn onCommitFn);
 
     /**
      * Signals the index build to be aborted and returns without waiting for completion.
@@ -146,6 +147,12 @@ public:
      * Cleans up the index build state and unregisters it from the manager.
      */
     void tearDownIndexBuild(const UUID& buildUUID);
+
+    /**
+     * Returns true if the index build supports background writes while building an index. This is
+     * true for the kHybrid and kBackground methods.
+     */
+    bool isBackgroundBuilding(const UUID& buildUUID);
 
     /**
      * Checks via invariant that the manager has no index builds presently.

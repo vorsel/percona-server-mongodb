@@ -81,6 +81,7 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_extensions.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_global_options.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_index.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_parameters_gen.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
@@ -126,7 +127,10 @@ bool WiredTigerFileVersion::shouldDowngrade(bool readOnly,
     const auto replCoord = repl::ReplicationCoordinator::get(getGlobalServiceContext());
     const auto memberState = replCoord->getMemberState();
     if (memberState.arbiter()) {
-        return true;
+        // SERVER-35361: Arbiters will no longer downgrade their data files. To downgrade
+        // binaries, the user must delete the dbpath. It's not particularly expensive for a
+        // replica set to re-initialize an arbiter that comes online.
+        return false;
     }
 
     if (!serverGlobalParams.featureCompatibility.isVersionInitialized()) {
@@ -453,53 +457,54 @@ private:
 };
 
 namespace {
-
-constexpr auto keydbDir = "key.db";
-
-class TicketServerParameter : public ServerParameter {
-    MONGO_DISALLOW_COPYING(TicketServerParameter);
-
-public:
-    TicketServerParameter(TicketHolder* holder, const std::string& name)
-        : ServerParameter(ServerParameterSet::getGlobal(), name, true, true), _holder(holder) {}
-
-    virtual void append(OperationContext* opCtx, BSONObjBuilder& b, const std::string& name) {
-        b.append(name, _holder->outof());
-    }
-
-    virtual Status set(const BSONElement& newValueElement) {
-        if (!newValueElement.isNumber())
-            return Status(ErrorCodes::BadValue, str::stream() << name() << " has to be a number");
-        return _set(newValueElement.numberInt());
-    }
-
-    virtual Status setFromString(const std::string& str) {
-        int num = 0;
-        Status status = parseNumberFromString(str, &num);
-        if (!status.isOK())
-            return status;
-        return _set(num);
-    }
-
-    Status _set(int newNum) {
-        if (newNum <= 0) {
-            return Status(ErrorCodes::BadValue, str::stream() << name() << " has to be > 0");
-        }
-
-        return _holder->resize(newNum);
-    }
-
-private:
-    TicketHolder* _holder;
-};
-
 TicketHolder openWriteTransaction(128);
-TicketServerParameter openWriteTransactionParam(&openWriteTransaction,
-                                                "wiredTigerConcurrentWriteTransactions");
-
 TicketHolder openReadTransaction(128);
-TicketServerParameter openReadTransactionParam(&openReadTransaction,
-                                               "wiredTigerConcurrentReadTransactions");
+constexpr auto keydbDir = "key.db";
+}  // namespace
+
+OpenWriteTransactionParam::OpenWriteTransactionParam(StringData name, ServerParameterType spt)
+    : ServerParameter(name, spt), _data(&openWriteTransaction) {}
+
+void OpenWriteTransactionParam::append(OperationContext* opCtx,
+                                       BSONObjBuilder& b,
+                                       const std::string& name) {
+    b.append(name, _data->outof());
+}
+
+Status OpenWriteTransactionParam::setFromString(const std::string& str) {
+    int num = 0;
+    Status status = parseNumberFromString(str, &num);
+    if (!status.isOK()) {
+        return status;
+    }
+    if (num <= 0) {
+        return {ErrorCodes::BadValue, str::stream() << name() << " has to be > 0"};
+    }
+    return _data->resize(num);
+}
+
+OpenReadTransactionParam::OpenReadTransactionParam(StringData name, ServerParameterType spt)
+    : ServerParameter(name, spt), _data(&openReadTransaction) {}
+
+void OpenReadTransactionParam::append(OperationContext* opCtx,
+                                      BSONObjBuilder& b,
+                                      const std::string& name) {
+    b.append(name, _data->outof());
+}
+
+Status OpenReadTransactionParam::setFromString(const std::string& str) {
+    int num = 0;
+    Status status = parseNumberFromString(str, &num);
+    if (!status.isOK()) {
+        return status;
+    }
+    if (num <= 0) {
+        return {ErrorCodes::BadValue, str::stream() << name() << " has to be > 0"};
+    }
+    return _data->resize(num);
+}
+
+namespace {
 
 stdx::function<bool(StringData)> initRsOplogBackgroundThreadCallback = [](StringData) -> bool {
     fassertFailed(40358);
@@ -2020,6 +2025,13 @@ void WiredTigerKVEngine::setInitialDataTimestamp(Timestamp initialDataTimestamp)
     _initialDataTimestamp.store(initialDataTimestamp.asULL());
 }
 
+bool WiredTigerKVEngine::supportsRecoverToStableTimestamp() const {
+    if (!_keepDataHistory) {
+        return false;
+    }
+    return true;
+}
+
 bool WiredTigerKVEngine::supportsRecoveryTimestamp() const {
     return true;
 }
@@ -2034,6 +2046,11 @@ bool WiredTigerKVEngine::_canRecoverToStableTimestamp() const {
 }
 
 StatusWith<Timestamp> WiredTigerKVEngine::recoverToStableTimestamp(OperationContext* opCtx) {
+    if (!supportsRecoverToStableTimestamp()) {
+        severe() << "WiredTiger is configured to not support recover to a stable timestamp";
+        fassertFailed(50665);
+    }
+
     if (!_canRecoverToStableTimestamp()) {
         Timestamp stableTS(_stableTimestamp.load());
         Timestamp initialDataTS(_initialDataTimestamp.load());
@@ -2103,12 +2120,24 @@ Timestamp WiredTigerKVEngine::getOldestOpenReadTimestamp() const {
 }
 
 boost::optional<Timestamp> WiredTigerKVEngine::getRecoveryTimestamp() const {
-    if (_recoveryTimestamp.isNull())
+    if (!supportsRecoveryTimestamp()) {
+        severe() << "WiredTiger is configured to not support providing a recovery timestamp";
+        fassertFailed(50745);
+    }
+
+    if (_recoveryTimestamp.isNull()) {
         return boost::none;
+    }
+
     return _recoveryTimestamp;
 }
 
 boost::optional<Timestamp> WiredTigerKVEngine::getLastStableRecoveryTimestamp() const {
+    if (!supportsRecoverToStableTimestamp()) {
+        severe() << "WiredTiger is configured to not support recover to a stable timestamp";
+        fassertFailed(50770);
+    }
+
     if (_ephemeral) {
         Timestamp stable(_stableTimestamp.load());
         Timestamp initialData(_initialDataTimestamp.load());

@@ -41,10 +41,13 @@
 #include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/cursor_manager.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/pipeline/document_source_cursor.h"
+#include "mongo/db/pipeline/lite_parsed_pipeline.h"
 #include "mongo/db/pipeline/pipeline_d.h"
+#include "mongo/db/repl/speculative_majority_read_info.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/session_catalog.h"
@@ -53,6 +56,8 @@
 #include "mongo/db/stats/storage_stats.h"
 #include "mongo/db/storage/backup_cursor_hooks.h"
 #include "mongo/db/transaction_participant.h"
+#include "mongo/s/cluster_commands_helpers.h"
+#include "mongo/s/query/document_source_merge_cursors.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -338,29 +343,14 @@ unique_ptr<Pipeline, PipelineDeleter> MongoInterfaceStandalone::attachCursorSour
               !dynamic_cast<DocumentSourceCursor*>(pipeline->getSources().front().get()));
 
     boost::optional<AutoGetCollectionForReadCommand> autoColl;
-    if (expCtx->uuid) {
-        autoColl.emplace(expCtx->opCtx,
-                         NamespaceStringOrUUID{expCtx->ns.db().toString(), *expCtx->uuid},
-                         AutoGetCollection::ViewMode::kViewsForbidden,
-                         Date_t::max(),
-                         AutoStatsTracker::LogMode::kUpdateTop);
-    } else {
-        autoColl.emplace(expCtx->opCtx,
-                         expCtx->ns,
-                         AutoGetCollection::ViewMode::kViewsForbidden,
-                         Date_t::max(),
-                         AutoStatsTracker::LogMode::kUpdateTop);
-    }
-
-    // makePipeline() is only called to perform secondary aggregation requests and expects the
-    // collection representing the document source to be not-sharded. We confirm sharding state
-    // here to avoid taking a collection lock elsewhere for this purpose alone.
-    // TODO SERVER-27616: This check is incorrect in that we don't acquire a collection cursor
-    // until after we release the lock, leaving room for a collection to be sharded in-between.
-    auto css = CollectionShardingState::get(expCtx->opCtx, expCtx->ns);
-    uassert(4567,
-            str::stream() << "from collection (" << expCtx->ns.ns() << ") cannot be sharded",
-            !css->getMetadataForOperation(expCtx->opCtx)->isSharded());
+    const NamespaceStringOrUUID nsOrUUID = expCtx->uuid
+        ? NamespaceStringOrUUID{expCtx->ns.db().toString(), *expCtx->uuid}
+        : expCtx->ns;
+    autoColl.emplace(expCtx->opCtx,
+                     nsOrUUID,
+                     AutoGetCollection::ViewMode::kViewsForbidden,
+                     Date_t::max(),
+                     AutoStatsTracker::LogMode::kUpdateTop);
 
     PipelineD::prepareCursorSource(autoColl->getCollection(), expCtx->ns, nullptr, pipeline.get());
 
@@ -393,7 +383,7 @@ std::vector<FieldPath> MongoInterfaceStandalone::collectDocumentKeyFieldsActingA
 
 std::vector<GenericCursor> MongoInterfaceStandalone::getIdleCursors(
     const intrusive_ptr<ExpressionContext>& expCtx, CurrentOpUserMode userMode) const {
-    return CursorManager::getIdleCursors(expCtx->opCtx, userMode);
+    return CursorManager::get(expCtx->opCtx)->getIdleCursors(expCtx->opCtx, userMode);
 }
 
 boost::optional<Document> MongoInterfaceStandalone::lookupSingleDocument(
@@ -432,6 +422,18 @@ boost::optional<Document> MongoInterfaceStandalone::lookupSingleDocument(
                                 << next->toString()
                                 << "]");
     }
+
+    // Set the speculative read optime appropriately after we do a document lookup locally. We don't
+    // know exactly what optime the document reflects, we so set the speculative read optime to the
+    // most recent applied optime.
+    repl::SpeculativeMajorityReadInfo& speculativeMajorityReadInfo =
+        repl::SpeculativeMajorityReadInfo::get(expCtx->opCtx);
+    if (speculativeMajorityReadInfo.isSpeculativeRead()) {
+        auto replCoord = repl::ReplicationCoordinator::get(expCtx->opCtx);
+        speculativeMajorityReadInfo.setSpeculativeReadOpTimeForward(
+            replCoord->getMyLastAppliedOpTime());
+    }
+
     return lookedUpDocument;
 }
 

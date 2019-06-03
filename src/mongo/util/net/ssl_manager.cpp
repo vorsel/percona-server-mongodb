@@ -427,9 +427,12 @@ std::string x509OidToShortName(StringData name) {
     return sn;
 }
 
+using UniqueASN1Object =
+    std::unique_ptr<ASN1_OBJECT, OpenSSLDeleter<decltype(ASN1_OBJECT_free), ASN1_OBJECT_free>>;
+
 boost::optional<std::string> x509ShortNameToOid(StringData name) {
     // Converts the OID to an ASN1_OBJECT
-    const auto obj = OBJ_txt2obj(name.rawData(), 0);
+    UniqueASN1Object obj(OBJ_txt2obj(name.rawData(), 0));
     if (!obj) {
         return boost::none;
     }
@@ -438,7 +441,7 @@ boost::optional<std::string> x509ShortNameToOid(StringData name) {
     // big the buffer should be, but the man page gives 80 as a good guess for buffer size.
     constexpr auto kDefaultBufferSize = 80;
     std::vector<char> buffer(kDefaultBufferSize);
-    size_t realSize = OBJ_obj2txt(buffer.data(), buffer.size(), obj, 1);
+    size_t realSize = OBJ_obj2txt(buffer.data(), buffer.size(), obj.get(), 1);
 
     // Resize the buffer down or up to the real size.
     buffer.resize(realSize);
@@ -446,7 +449,7 @@ boost::optional<std::string> x509ShortNameToOid(StringData name) {
     // If the real size is greater than the default buffer size we picked, then just call
     // OBJ_obj2txt again now that the buffer is correctly sized.
     if (realSize > kDefaultBufferSize) {
-        OBJ_obj2txt(buffer.data(), buffer.size(), obj, 1);
+        OBJ_obj2txt(buffer.data(), buffer.size(), obj.get(), 1);
     }
 
     return std::string(buffer.data(), buffer.size());
@@ -583,6 +586,15 @@ Status SSLX509Name::normalizeStrings() {
                 case kASN1UniversalString:
                 case kASN1BMPString:
                 case kASN1OctetString: {
+                    // Technically https://tools.ietf.org/html/rfc5280#section-4.1.2.4 requires
+                    // that DN component values must be at least 1 code point long, but we've
+                    // supported empty components before (see SERVER-39107) so we special-case
+                    // normalizing empty values to an empty UTF-8 string
+                    if (entry.value.empty()) {
+                        entry.type = kASN1UTF8String;
+                        break;
+                    }
+
                     auto res = icuX509DNPrep(entry.value);
                     if (!res.isOK()) {
                         return res.getStatus();

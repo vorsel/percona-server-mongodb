@@ -42,6 +42,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/curop_failpoint_helpers.h"
+#include "mongo/db/cursor_manager.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/filter.h"
 #include "mongo/db/exec/working_set_common.h"
@@ -83,7 +84,7 @@ bool shouldSaveCursor(OperationContext* opCtx,
                       const Collection* collection,
                       PlanExecutor::ExecState finalState,
                       PlanExecutor* exec) {
-    if (PlanExecutor::FAILURE == finalState || PlanExecutor::DEAD == finalState) {
+    if (PlanExecutor::FAILURE == finalState) {
         return false;
     }
 
@@ -108,7 +109,7 @@ bool shouldSaveCursor(OperationContext* opCtx,
 bool shouldSaveCursorGetMore(PlanExecutor::ExecState finalState,
                              PlanExecutor* exec,
                              bool isTailable) {
-    if (PlanExecutor::FAILURE == finalState || PlanExecutor::DEAD == finalState) {
+    if (PlanExecutor::FAILURE == finalState) {
         return false;
     }
 
@@ -198,11 +199,10 @@ void generateBatch(int ntoreturn,
 
     // Propagate any errors to the caller.
     switch (*state) {
-        // Log an error message and then perform the same cleanup as DEAD.
-        case PlanExecutor::FAILURE:
+        // Log an error message and then perform the cleanup.
+        case PlanExecutor::FAILURE: {
             error() << "getMore executor error, stats: "
                     << redact(Explain::getWinningPlanStats(exec));
-        case PlanExecutor::DEAD: {
             // We should always have a valid status object by this point.
             auto status = WorkingSetCommon::getMemberObjectStatus(obj);
             invariant(!status.isOK());
@@ -279,7 +279,7 @@ Message getMore(OperationContext* opCtx,
     // These are set in the QueryResult msg we return.
     int resultFlags = ResultFlag_AwaitCapable;
 
-    auto cursorManager = CursorManager::getGlobalCursorManager();
+    auto cursorManager = CursorManager::get(opCtx);
     auto statusWithCursorPin = cursorManager->pinCursor(opCtx, cursorid);
     if (statusWithCursorPin == ErrorCodes::CursorNotFound) {
         return makeCursorNotFoundResponse();
@@ -353,6 +353,38 @@ Message getMore(OperationContext* opCtx,
 
     *isCursorAuthorized = true;
 
+    // Only used by the failpoints.
+    stdx::function<void()> dropAndReaquireReadLock = [&] {
+        // Make sure an interrupted operation does not prevent us from reacquiring the lock.
+        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
+
+        readLock.reset();
+        readLock.emplace(opCtx, nss);
+    };
+
+    // On early return, get rid of the cursor.
+    auto cursorFreer = makeGuard([&] { cursorPin.deleteUnderlying(); });
+
+    // If the 'waitAfterPinningCursorBeforeGetMoreBatch' fail point is enabled, set the
+    // 'msg' field of this operation's CurOp to signal that we've hit this point and then
+    // repeatedly release and re-acquire the collection readLock at regular intervals until
+    // the failpoint is released. This is done in order to avoid deadlocks caused by the
+    // pinned-cursor failpoints in this file (see SERVER-21997).
+    MONGO_FAIL_POINT_BLOCK(waitAfterPinningCursorBeforeGetMoreBatch, options) {
+        const BSONObj& data = options.getData();
+        if (data["shouldNotdropLock"].booleanSafe()) {
+            dropAndReaquireReadLock = []() {};
+        }
+
+        CurOpFailpointHelpers::waitWhileFailPointEnabled(&waitAfterPinningCursorBeforeGetMoreBatch,
+                                                         opCtx,
+                                                         "waitAfterPinningCursorBeforeGetMoreBatch",
+                                                         dropAndReaquireReadLock,
+                                                         false,
+                                                         nss);
+    }
+
+
     const auto replicationMode = repl::ReplicationCoordinator::get(opCtx)->getReplicationMode();
 
     if (replicationMode == repl::ReplicationCoordinator::modeReplSet &&
@@ -421,9 +453,11 @@ Message getMore(OperationContext* opCtx,
     // accumulate over the course of a cursor's lifetime.
     PlanSummaryStats preExecutionStats;
     Explain::getSummaryStats(*exec, &preExecutionStats);
-    if (MONGO_FAIL_POINT(legacyGetMoreWaitWithCursor)) {
-        CurOpFailpointHelpers::waitWhileFailPointEnabled(
-            &legacyGetMoreWaitWithCursor, opCtx, "legacyGetMoreWaitWithCursor", nullptr);
+    if (MONGO_FAIL_POINT(waitWithPinnedCursorDuringGetMoreBatch)) {
+        CurOpFailpointHelpers::waitWhileFailPointEnabled(&waitWithPinnedCursorDuringGetMoreBatch,
+                                                         opCtx,
+                                                         "waitWithPinnedCursorDuringGetMoreBatch",
+                                                         nullptr);
     }
 
     generateBatch(ntoreturn, cursorPin.getCursor(), &bb, &numResults, &state);
@@ -478,8 +512,6 @@ Message getMore(OperationContext* opCtx,
     // ClientCursorPin is declared after our lock is declared, this will happen under the lock if
     // any locking was necessary.
     if (!shouldSaveCursorGetMore(state, exec, cursorPin->isTailable())) {
-        cursorPin.deleteUnderlying();
-
         // cc is now invalid, as is the executor
         cursorid = 0;
         curOp.debug().cursorExhausted = true;
@@ -487,6 +519,7 @@ Message getMore(OperationContext* opCtx,
         LOG(5) << "getMore NOT saving client cursor, ended with state "
                << PlanExecutor::statestr(state);
     } else {
+        cursorFreer.dismiss();
         // Continue caching the ClientCursor.
         cursorPin->incNReturnedSoFar(numResults);
         cursorPin->incNBatches();
@@ -503,6 +536,18 @@ Message getMore(OperationContext* opCtx,
             // (for use by future getmore ops).
             cursorPin->setLeftoverMaxTimeMicros(opCtx->getRemainingMaxTimeMicros());
         }
+    }
+
+    // We're about to unpin or delete the cursor as the ClientCursorPin goes out of scope.
+    // If the 'waitBeforeUnpinningOrDeletingCursorAfterGetMoreBatch' failpoint is active, we
+    // set the 'msg' field of this operation's CurOp to signal that we've hit this point and
+    // then spin until the failpoint is released.
+    if (MONGO_FAIL_POINT(waitBeforeUnpinningOrDeletingCursorAfterGetMoreBatch)) {
+        CurOpFailpointHelpers::waitWhileFailPointEnabled(
+            &waitBeforeUnpinningOrDeletingCursorAfterGetMoreBatch,
+            opCtx,
+            "waitBeforeUnpinningOrDeletingCursorAfterGetMoreBatch",
+            dropAndReaquireReadLock);
     }
 
     QueryResult::View qr = bb.buf();
@@ -604,6 +649,9 @@ std::string runQuery(OperationContext* opCtx,
     }
     opCtx->checkForInterrupt();  // May trigger maxTimeAlwaysTimeOut fail point.
 
+    CurOpFailpointHelpers::waitWhileFailPointEnabled(
+        &waitInFindBeforeMakingBatch, opCtx, "waitInFindBeforeMakingBatch");
+
     // Run the query.
     // bb is used to hold query results
     // this buffer should contain either requested documents per query or
@@ -645,7 +693,7 @@ std::string runQuery(OperationContext* opCtx,
     }
 
     // Caller expects exceptions thrown in certain cases.
-    if (PlanExecutor::FAILURE == state || PlanExecutor::DEAD == state) {
+    if (PlanExecutor::FAILURE == state) {
         error() << "Plan executor error during find: " << PlanExecutor::statestr(state)
                 << ", stats: " << redact(Explain::getWinningPlanStats(exec.get()));
         uassertStatusOKWithContext(WorkingSetCommon::getMemberObjectStatus(obj),
@@ -669,14 +717,15 @@ std::string runQuery(OperationContext* opCtx,
 
         const auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
         // Allocate a new ClientCursor and register it with the cursor manager.
-        ClientCursorPin pinnedCursor = CursorManager::getGlobalCursorManager()->registerCursor(
+        ClientCursorPin pinnedCursor = CursorManager::get(opCtx)->registerCursor(
             opCtx,
             {std::move(exec),
              nss,
              AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
              readConcernArgs,
              upconvertedQuery,
-             ClientCursorParams::LockPolicy::kLockExternally});
+             ClientCursorParams::LockPolicy::kLockExternally,
+             {Privilege(ResourcePattern::forExactNamespace(nss), ActionType::find)}});
         ccId = pinnedCursor.getCursor()->cursorid();
 
         LOG(5) << "caching executor with cursorid " << ccId << " after returning " << numResults

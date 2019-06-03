@@ -423,6 +423,17 @@ void CatalogCache::invalidateShardedCollection(const NamespaceString& nss) {
     itDb->second[nss.ns()]->needsRefresh = true;
 }
 
+void CatalogCache::purgeCollection(const NamespaceString& nss) {
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
+
+    auto itDb = _collectionsByDb.find(nss.db());
+    if (itDb == _collectionsByDb.end()) {
+        return;
+    }
+
+    itDb->second.erase(nss.ns());
+}
+
 void CatalogCache::purgeDatabase(StringData dbName) {
     stdx::lock_guard<stdx::mutex> lg(_mutex);
     _databases.erase(dbName);
@@ -532,7 +543,7 @@ void CatalogCache::_scheduleCollectionRefresh(WithLock lk,
                                               std::shared_ptr<CollectionRoutingInfoEntry> collEntry,
                                               NamespaceString const& nss,
                                               int refreshAttempt) {
-    const auto existingRoutingInfo = std::move(collEntry->routingInfo);
+    const auto existingRoutingInfo = collEntry->routingInfo;
 
     // If we have an existing chunk manager, the refresh is considered "incremental", regardless of
     // how many chunks are in the differential
@@ -651,6 +662,10 @@ void CatalogCache::_scheduleCollectionRefresh(WithLock lk,
         stdx::lock_guard<stdx::mutex> lg(_mutex);
         onRefreshFailed(lg, status);
     }
+
+    // The routing info for this collection shouldn't change, as other threads may try to use the
+    // CatalogCache while we are waiting for the refresh to complete.
+    invariant(collEntry->routingInfo.get() == existingRoutingInfo.get());
 }
 
 void CatalogCache::Stats::report(BSONObjBuilder* builder) const {

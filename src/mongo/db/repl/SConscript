@@ -27,6 +27,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/index_d',
         '$BUILD_DIR/mongo/db/op_observer',
         '$BUILD_DIR/mongo/db/stats/counters',
+        '$BUILD_DIR/mongo/db/stats/server_read_concern_write_concern_metrics',
         '$BUILD_DIR/mongo/idl/idl_parser',
     ],
 )
@@ -789,6 +790,9 @@ env.Library('topology_coordinator',
                 'repl_settings',
                 'rslog',
                 'repl_coordinator_interface',
+            ],
+            LIBDEPS_PRIVATE=[
+                '$BUILD_DIR/mongo/db/catalog/commit_quorum_options',
             ])
 
 env.CppUnitTest('repl_set_heartbeat_response_test',
@@ -1608,7 +1612,6 @@ env.Library(
         '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/db/stats/counters',
         '$BUILD_DIR/mongo/db/system_index',
-        '$BUILD_DIR/mongo/db/transaction_coordinator',
         '$BUILD_DIR/mongo/rpc/client_metadata',
         '$BUILD_DIR/mongo/util/fail_point',
         'bgsync',

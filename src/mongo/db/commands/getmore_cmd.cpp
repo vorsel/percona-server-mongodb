@@ -72,8 +72,6 @@ namespace {
 
 MONGO_FAIL_POINT_DEFINE(rsStopGetMoreCmd);
 
-MONGO_FAIL_POINT_DEFINE(waitWithPinnedCursorDuringGetMoreBatch);
-
 /**
  * Validates that the lsid of 'opCtx' matches that of 'cursor'. This must be called after
  * authenticating, so that it is safe to report the lsid of 'cursor'.
@@ -247,11 +245,11 @@ public:
             }
 
             switch (*state) {
-                case PlanExecutor::FAILURE:
-                    // Log an error message and then perform the same cleanup as DEAD.
-                    error() << "GetMore command executor error: " << PlanExecutor::statestr(*state)
-                            << ", stats: " << redact(Explain::getWinningPlanStats(exec));
-                case PlanExecutor::DEAD: {
+                case PlanExecutor::FAILURE: {
+                    // Log an error message and then perform the cleanup.
+                    error() << "GetMore command executor error: FAILURE, stats: "
+                            << redact(Explain::getWinningPlanStats(exec));
+
                     nextBatch->abandon();
                     // We should always have a valid status member object at this point.
                     auto status = WorkingSetCommon::getMemberObjectStatus(obj);
@@ -306,8 +304,34 @@ public:
             boost::optional<AutoGetCollectionForRead> readLock;
             boost::optional<AutoStatsTracker> statsTracker;
 
-            auto cursorManager = CursorManager::getGlobalCursorManager();
+            auto cursorManager = CursorManager::get(opCtx);
             auto cursorPin = uassertStatusOK(cursorManager->pinCursor(opCtx, _request.cursorid));
+
+            {
+                // We call RecoveryUnit::setTimestampReadSource() before acquiring a lock on the
+                // collection via AutoGetCollectionForRead in order to ensure the comparison to the
+                // collection's minimum visible snapshot is accurate.
+                PlanExecutor* exec = cursorPin->getExecutor();
+                const auto* cq = exec->getCanonicalQuery();
+
+                if (auto clusterTime =
+                        (cq ? cq->getQueryRequest().getReadAtClusterTime() : boost::none)) {
+                    // We don't compare 'clusterTime' to the last applied opTime or to the
+                    // all-committed timestamp because the testing infrastructure won't use the
+                    // $_internalReadAtClusterTime option in any test suite where rollback is
+                    // expected to occur.
+
+                    // The $_internalReadAtClusterTime option causes any storage-layer cursors
+                    // created during plan execution to read from a consistent snapshot of data at
+                    // the supplied clusterTime, even across yields.
+                    opCtx->recoveryUnit()->setTimestampReadSource(
+                        RecoveryUnit::ReadSource::kProvided, clusterTime);
+
+                    // The $_internalReadAtClusterTime option also causes any storage-layer cursors
+                    // created during plan execution to block on prepared transactions.
+                    opCtx->recoveryUnit()->setIgnorePrepared(false);
+                }
+            }
 
             if (cursorPin->lockPolicy() == ClientCursorParams::LockPolicy::kLocksInternally) {
                 if (!_request.nss.isCollectionlessCursorNamespace()) {
@@ -332,7 +356,7 @@ public:
             }
 
             // Only used by the failpoints.
-            const auto dropAndReaquireReadLock = [&readLock, opCtx, this]() {
+            stdx::function<void()> dropAndReaquireReadLock = [&readLock, opCtx, this]() {
                 // Make sure an interrupted operation does not prevent us from reacquiring the lock.
                 UninterruptibleLockGuard noInterrupt(opCtx->lockState());
 
@@ -340,27 +364,21 @@ public:
                 readLock.emplace(opCtx, _request.nss);
             };
 
-            // If the 'waitAfterPinningCursorBeforeGetMoreBatch' fail point is enabled, set the
-            // 'msg' field of this operation's CurOp to signal that we've hit this point and then
-            // repeatedly release and re-acquire the collection readLock at regular intervals until
-            // the failpoint is released. This is done in order to avoid deadlocks caused by the
-            // pinned-cursor failpoints in this file (see SERVER-21997).
-            if (MONGO_FAIL_POINT(waitAfterPinningCursorBeforeGetMoreBatch)) {
-                CurOpFailpointHelpers::waitWhileFailPointEnabled(
-                    &waitAfterPinningCursorBeforeGetMoreBatch,
-                    opCtx,
-                    "waitAfterPinningCursorBeforeGetMoreBatch",
-                    dropAndReaquireReadLock);
-            }
-
             // A user can only call getMore on their own cursor. If there were multiple users
             // authenticated when the cursor was created, then at least one of them must be
             // authenticated in order to run getMore on the cursor.
-            if (!AuthorizationSession::get(opCtx->getClient())
-                     ->isCoauthorizedWith(cursorPin->getAuthenticatedUsers())) {
+            auto authzSession = AuthorizationSession::get(opCtx->getClient());
+            if (!authzSession->isCoauthorizedWith(cursorPin->getAuthenticatedUsers())) {
                 uasserted(ErrorCodes::Unauthorized,
                           str::stream() << "cursor id " << _request.cursorid
                                         << " was not created by the authenticated user");
+            }
+
+            // Ensure that the client still has the privileges to run the originating command.
+            if (!authzSession->isAuthorizedForPrivileges(cursorPin->getOriginatingPrivileges())) {
+                uasserted(ErrorCodes::Unauthorized,
+                          str::stream() << "not authorized for getMore with cursor id "
+                                        << _request.cursorid);
             }
 
             if (_request.nss != cursorPin->nss()) {
@@ -392,6 +410,26 @@ public:
 
             // On early return, get rid of the cursor.
             auto cursorFreer = makeGuard([&] { cursorPin.deleteUnderlying(); });
+
+            // If the 'waitAfterPinningCursorBeforeGetMoreBatch' fail point is enabled, set the
+            // 'msg' field of this operation's CurOp to signal that we've hit this point and then
+            // repeatedly release and re-acquire the collection readLock at regular intervals until
+            // the failpoint is released. This is done in order to avoid deadlocks caused by the
+            // pinned-cursor failpoints in this file (see SERVER-21997).
+            MONGO_FAIL_POINT_BLOCK(waitAfterPinningCursorBeforeGetMoreBatch, options) {
+                const BSONObj& data = options.getData();
+                if (data["shouldNotdropLock"].booleanSafe()) {
+                    dropAndReaquireReadLock = []() {};
+                }
+
+                CurOpFailpointHelpers::waitWhileFailPointEnabled(
+                    &waitAfterPinningCursorBeforeGetMoreBatch,
+                    opCtx,
+                    "waitAfterPinningCursorBeforeGetMoreBatch",
+                    dropAndReaquireReadLock,
+                    false,
+                    _request.nss);
+            }
 
             // We must respect the read concern from the cursor.
             applyCursorReadConcern(opCtx, cursorPin->getReadConcernArgs());

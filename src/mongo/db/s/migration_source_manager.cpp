@@ -59,6 +59,7 @@
 #include "mongo/s/request_types/set_shard_version_request.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/stdx/memory.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/elapsed_tracker.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point_service.h"
@@ -121,7 +122,7 @@ MONGO_FAIL_POINT_DEFINE(hangBeforeLeavingCriticalSection);
 MONGO_FAIL_POINT_DEFINE(migrationCommitNetworkError);
 
 MigrationSourceManager* MigrationSourceManager::get(CollectionShardingRuntime* csr,
-                                                    CollectionShardingRuntimeLock& csrLock) {
+                                                    CollectionShardingRuntime::CSRLock& csrLock) {
     return msmForCsr(csr);
 }
 
@@ -238,6 +239,7 @@ Status MigrationSourceManager::startClone(OperationContext* opCtx) {
     {
         const auto metadata = _getCurrentMetadataAndCheckEpoch(opCtx);
 
+        _state = kCloning;
         // Having the metadata manager registered on the collection sharding state is what indicates
         // that a chunk on that collection is being migrated. With an active migration, write
         // operations require the cloner to be present in order to track changes to the chunk which
@@ -245,11 +247,16 @@ Status MigrationSourceManager::startClone(OperationContext* opCtx) {
         _cloneDriver = stdx::make_unique<MigrationChunkClonerSourceLegacy>(
             _args, metadata->getKeyPattern(), _donorConnStr, _recipientHost);
 
-        AutoGetCollection autoColl(opCtx, getNss(), MODE_IX, MODE_X);
+        AutoGetCollection autoColl(opCtx,
+                                   getNss(),
+                                   MODE_IX,
+                                   MODE_X,
+                                   AutoGetCollection::ViewMode::kViewsForbidden,
+                                   opCtx->getServiceContext()->getPreciseClockSource()->now() +
+                                       Milliseconds(migrationLockAcquisitionMaxWaitMS.load()));
         auto csr = CollectionShardingRuntime::get(opCtx, getNss());
-        auto lockedCsr = CollectionShardingRuntimeLock::lockExclusive(opCtx, csr);
+        auto lockedCsr = CollectionShardingRuntime::CSRLock::lockExclusive(opCtx, csr);
         invariant(nullptr == std::exchange(msmForCsr(csr), this));
-        _state = kCloning;
     }
 
     Status startCloneStatus = _cloneDriver->startClone(opCtx);

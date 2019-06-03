@@ -69,10 +69,19 @@ public:
      *
      * Returns an error status if there are any errors setting up the index build.
      */
-    StatusWith<SharedSemiFuture<void>> buildIndex(OperationContext* opCtx,
-                                                  const NamespaceString& nss,
-                                                  const std::vector<BSONObj>& specs,
-                                                  const UUID& buildUUID) override;
+    StatusWith<SharedSemiFuture<ReplIndexBuildState::IndexCatalogStats>> startIndexBuild(
+        OperationContext* opCtx,
+        CollectionUUID collectionUUID,
+        const std::vector<BSONObj>& specs,
+        const UUID& buildUUID,
+        IndexBuildProtocol protocol) override;
+
+    /**
+     * TODO: not yet implemented.
+     */
+    Status commitIndexBuild(OperationContext* opCtx,
+                            const std::vector<BSONObj>& specs,
+                            const UUID& buildUUID) override;
 
     void signalChangeToPrimaryMode() override;
     void signalChangeToSecondaryMode() override;
@@ -82,7 +91,7 @@ public:
 
     Status setCommitQuorum(const NamespaceString& nss,
                            const std::vector<StringData>& indexNames,
-                           const WriteConcernOptions& newCommitQuorum) override;
+                           const CommitQuorumOptions& newCommitQuorum) override;
 
 private:
     /**
@@ -95,11 +104,6 @@ private:
      * before Primary.
      */
     enum class ReplState { Primary, Secondary, InitialSync };
-
-    /**
-     * TODO: not yet implemented.
-     */
-    void _runIndexBuild(OperationContext* opCtx, const UUID& buildUUID) noexcept override;
 
     /**
      * TODO: not yet implemented.

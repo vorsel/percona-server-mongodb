@@ -37,6 +37,7 @@
 
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/util/builder.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/uuid.h"
@@ -94,6 +95,12 @@ public:
 
     // Namespace for storing the persisted state of transaction coordinators.
     static const NamespaceString kTransactionCoordinatorsNamespace;
+
+    // Namespace for replica set configuration settings.
+    static const NamespaceString kSystemReplSetNamespace;
+
+    // Namespace for index build entries.
+    static const NamespaceString kIndexBuildEntryNamespace;
 
     /**
      * Constructs an empty NamespaceString.
@@ -479,6 +486,8 @@ private:
 
 std::ostream& operator<<(std::ostream& stream, const NamespaceString& nss);
 std::ostream& operator<<(std::ostream& stream, const NamespaceStringOrUUID& nsOrUUID);
+StringBuilder& operator<<(StringBuilder& builder, const NamespaceString& nss);
+StringBuilder& operator<<(StringBuilder& builder, const NamespaceStringOrUUID& nsOrUUID);
 
 /**
  * "database.a.b.c" -> "database"

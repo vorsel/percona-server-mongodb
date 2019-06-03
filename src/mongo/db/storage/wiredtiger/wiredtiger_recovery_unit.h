@@ -116,7 +116,7 @@ public:
 
     Status obtainMajorityCommittedSnapshot() override;
 
-    boost::optional<Timestamp> getPointInTimeReadTimestamp() const override;
+    boost::optional<Timestamp> getPointInTimeReadTimestamp() override;
 
     SnapshotId getSnapshotId() const override;
 
@@ -127,6 +127,10 @@ public:
     void clearCommitTimestamp() override;
 
     Timestamp getCommitTimestamp() const override;
+
+    void setDurableTimestamp(Timestamp timestamp) override;
+
+    Timestamp getDurableTimestamp() const override;
 
     void setPrepareTimestamp(Timestamp timestamp) override;
 
@@ -182,6 +186,8 @@ public:
         return _isActive();
     }
     void assertInActiveTxn() const;
+
+    boost::optional<int64_t> getOplogVisibilityTs();
 
     static WiredTigerRecoveryUnit* get(OperationContext* opCtx) {
         return checked_cast<WiredTigerRecoveryUnit*>(opCtx->recoveryUnit());
@@ -251,6 +257,17 @@ private:
     Timestamp _beginTransactionAtAllCommittedTimestamp(WT_SESSION* session);
 
     /**
+     * Starts a transaction at the no-overlap timestamp. Returns the timestamp the transaction
+     * was started at.
+     */
+    Timestamp _beginTransactionAtNoOverlapTimestamp(WT_SESSION* session);
+
+    /**
+     * Returns the timestamp at which the current transaction is reading.
+     */
+    Timestamp _getTransactionReadTimestamp(WT_SESSION* session);
+
+    /**
      * Transitions to new state.
      */
     void _setState(State newState);
@@ -291,6 +308,7 @@ private:
     WiredTigerBeginTxnBlock::IgnorePrepared _ignorePrepared{
         WiredTigerBeginTxnBlock::IgnorePrepared::kIgnore};
     Timestamp _commitTimestamp;
+    Timestamp _durableTimestamp;
     Timestamp _prepareTimestamp;
     boost::optional<Timestamp> _lastTimestampSet;
     uint64_t _mySnapshotId;
@@ -298,6 +316,7 @@ private:
     Timestamp _readAtTimestamp;
     std::unique_ptr<Timer> _timer;
     bool _isOplogReader = false;
+    boost::optional<int64_t> _oplogVisibleTs = boost::none;
     typedef std::vector<std::unique_ptr<Change>> Changes;
     Changes _changes;
 };

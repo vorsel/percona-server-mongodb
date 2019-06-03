@@ -35,6 +35,7 @@
 #include <vector>
 
 #include "mongo/bson/bsonobj.h"
+#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/write_concern_options.h"
@@ -55,12 +56,16 @@ namespace mongo {
 struct ReplIndexBuildState {
     ReplIndexBuildState(const UUID& indexBuildUUID,
                         const UUID& collUUID,
+                        const std::string& dbName,
                         const std::vector<std::string> names,
-                        const std::vector<BSONObj>& specs)
+                        const std::vector<BSONObj>& specs,
+                        IndexBuildProtocol protocol)
         : buildUUID(indexBuildUUID),
           collectionUUID(collUUID),
+          dbName(dbName),
           indexNames(names),
-          indexSpecs(specs) {
+          indexSpecs(specs),
+          protocol(protocol) {
         // Verify that the given index names and index specs match.
         invariant(names.size() == specs.size());
         for (auto& spec : specs) {
@@ -76,6 +81,10 @@ struct ReplIndexBuildState {
     // the collection UUID is used to maintain correct association.
     const UUID collectionUUID;
 
+    // Identifies the database containing the index being built. Unlike collections, databases
+    // cannot be renamed.
+    const std::string dbName;
+
     // The names of the indexes being built.
     const std::vector<std::string> indexNames;
 
@@ -85,7 +94,7 @@ struct ReplIndexBuildState {
 
     // Whether to do a two phase index build or a single phase index build like in v4.0. The FCV
     // at the start of the index build will determine this setting.
-    bool twoPhaseIndexBuild = false;
+    IndexBuildProtocol protocol;
 
     // Protects the state below.
     mutable stdx::mutex mutex;
@@ -94,17 +103,21 @@ struct ReplIndexBuildState {
     // allowed to commit.
     WriteConcernOptions commitQuorum;
 
-    // Whether or not the primary replica set member has signaled that it is okay to go ahead and
-    // verify index constraint violations have gone away.
-    bool prepareIndexBuild = false;
-
     // Tracks the members of the replica set that have finished building the index(es) and are ready
     // to commit the index(es).
     std::vector<HostAndPort> commitReadyMembers;
 
+    using IndexCatalogStats = struct {
+        int numIndexesBefore = 0;
+        int numIndexesAfter = 0;
+    };
+
+    // Tracks the index build stats that are returned to the caller upon success.
+    IndexCatalogStats stats;
+
     // Communicates the final outcome of the index build to any callers waiting upon the associated
     // SharedSemiFuture(s).
-    SharedPromise<void> sharedPromise;
+    SharedPromise<IndexCatalogStats> sharedPromise;
 
     // There is a period of time where the index build is registered on the coordinator, but an
     // index builder does not yet exist. Since a signal cannot be set on the index builder at that

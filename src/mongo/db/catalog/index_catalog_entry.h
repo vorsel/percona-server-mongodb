@@ -75,9 +75,11 @@ public:
 
     virtual const IndexAccessMethod* accessMethod() const = 0;
 
-    virtual bool isBuilding() const = 0;
+    virtual bool isHybridBuilding() const = 0;
 
     virtual IndexBuildInterceptor* indexBuildInterceptor() = 0;
+
+    virtual const IndexBuildInterceptor* indexBuildInterceptor() const = 0;
 
     virtual void setIndexBuildInterceptor(IndexBuildInterceptor* interceptor) = 0;
 

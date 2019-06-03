@@ -4,7 +4,7 @@ Import("env")
 env = env.Clone()
 
 ftdcEnv = env.Clone()
-ftdcEnv.InjectThirdPartyIncludePaths(libraries=['zlib'])
+ftdcEnv.InjectThirdParty(libraries=['zlib'])
 
 ftdcEnv.Library(
     target='ftdc',
@@ -81,7 +81,6 @@ env.Library(
 env.Library(
     target='ftdc_mongos',
     source=[
-        env.Idlc('ftdc_mongos.idl')[0],
         'ftdc_mongos.cpp',
     ],
     LIBDEPS_PRIVATE=[

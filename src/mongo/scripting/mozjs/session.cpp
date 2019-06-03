@@ -127,21 +127,23 @@ void endSession(SessionHolder* holder) {
                                                    << "autocommit"
                                                    << false);
 
-        holder->client->runCommand("admin", abortObj, out);
+        MONGO_COMPILER_VARIABLE_UNUSED auto ignored =
+            holder->client->runCommand("admin", abortObj, out);
     }
 
     EndSessions es;
 
     es.setEndSessions({holder->lsid});
 
-    holder->client->runCommand("admin", es.toBSON(), out);
+    MONGO_COMPILER_VARIABLE_UNUSED auto ignored =
+        holder->client->runCommand("admin", es.toBSON(), out);
 
     holder->client.reset();
 }
 
 }  // namespace
 
-void SessionInfo::finalize(JSFreeOp* fop, JSObject* obj) {
+void SessionInfo::finalize(js::FreeOp* fop, JSObject* obj) {
     auto holder = getHolder(obj);
 
     if (holder) {

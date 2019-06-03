@@ -65,6 +65,7 @@
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_builder.h"
+#include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_time.h"
@@ -83,6 +84,7 @@
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/counters.h"
+#include "mongo/db/stats/server_write_concern_metrics.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/transaction_participant.h"
@@ -212,6 +214,36 @@ private:
     BSONObj _oField;
 };
 
+bool shouldBuildInForeground(OperationContext* opCtx,
+                             const BSONObj& index,
+                             const NamespaceString& indexNss,
+                             repl::OplogApplication::Mode mode) {
+    if (mode == OplogApplication::Mode::kRecovering) {
+        LOG(3) << "apply op: building background index " << index
+               << " in the foreground because the node is in recovery";
+        return true;
+    }
+
+    // Primaries should build indexes in the foreground because failures cannot be handled
+    // by the background thread.
+    const bool isPrimary =
+        repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, indexNss);
+    if (isPrimary) {
+        LOG(3) << "apply op: not building background index " << index
+               << " in a background thread because this is a primary";
+        return true;
+    }
+
+    // Without hybrid builds enabled, indexes should build with the behavior of their specs.
+    bool hybrid = IndexBuilder::canBuildInBackground();
+    if (!hybrid) {
+        return !index["background"].trueValue();
+    }
+
+    return false;
+}
+
+
 }  // namespace
 
 void setOplogCollectionName(ServiceContext* service) {
@@ -223,6 +255,69 @@ void setOplogCollectionName(ServiceContext* service) {
             // leave empty.
             break;
     }
+}
+
+/**
+ * Parse the given BSON array of BSON into a vector of BSON.
+ */
+StatusWith<std::vector<BSONObj>> parseBSONSpecsIntoVector(const BSONElement& bsonArrayElem,
+                                                          const NamespaceString& nss) {
+    invariant(bsonArrayElem.type() == Array);
+    std::vector<BSONObj> vec;
+    for (auto& bsonElem : bsonArrayElem.Array()) {
+        if (bsonElem.type() != BSONType::Object) {
+            return {ErrorCodes::TypeMismatch,
+                    str::stream() << "The elements of '" << bsonArrayElem.fieldName()
+                                  << "' array must be objects, but found "
+                                  << typeName(bsonElem.type())};
+        }
+        BSONObjBuilder builder(bsonElem.Obj());
+        builder.append("ns", nss.toString());
+        vec.emplace_back(builder.obj());
+    }
+    return vec;
+}
+
+Status startIndexBuild(OperationContext* opCtx,
+                       const NamespaceString& nss,
+                       const UUID& collUUID,
+                       const UUID& indexBuildUUID,
+                       const BSONElement& indexesElem,
+                       OplogApplication::Mode mode) {
+    auto statusWithIndexes = parseBSONSpecsIntoVector(indexesElem, nss);
+    if (!statusWithIndexes.isOK()) {
+        return statusWithIndexes.getStatus();
+    }
+    return IndexBuildsCoordinator::get(opCtx)
+        ->startIndexBuild(opCtx,
+                          collUUID,
+                          statusWithIndexes.getValue(),
+                          indexBuildUUID,
+                          /* This oplog entry is only replicated for two-phase index builds */
+                          IndexBuildProtocol::kTwoPhase)
+        .getStatus();
+}
+
+Status commitIndexBuild(OperationContext* opCtx,
+                        const NamespaceString& nss,
+                        const UUID& indexBuildUUID,
+                        const BSONElement& indexesElem,
+                        OplogApplication::Mode mode) {
+    auto statusWithIndexes = parseBSONSpecsIntoVector(indexesElem, nss);
+    if (!statusWithIndexes.isOK()) {
+        return statusWithIndexes.getStatus();
+    }
+    return IndexBuildsCoordinator::get(opCtx)->commitIndexBuild(
+        opCtx, statusWithIndexes.getValue(), indexBuildUUID);
+}
+
+Status abortIndexBuild(OperationContext* opCtx,
+                       const UUID& indexBuildUUID,
+                       OplogApplication::Mode mode) {
+    // Wait until the index build finishes aborting.
+    Future<void> abort = IndexBuildsCoordinator::get(opCtx)->abortIndexBuildByBuildUUID(
+        indexBuildUUID, "abortIndexBuild oplog entry encountered");
+    return abort.waitNoThrow();
 }
 
 void createIndexForApplyOps(OperationContext* opCtx,
@@ -245,51 +340,39 @@ void createIndexForApplyOps(OperationContext* opCtx,
 
     OpCounters* opCounters = opCtx->writesAreReplicated() ? &globalOpCounters : &replOpCounters;
     opCounters->gotInsert();
+    if (opCtx->writesAreReplicated()) {
+        ServerWriteConcernMetrics::get(opCtx)->recordWriteConcernForInsert(
+            opCtx->getWriteConcern());
+    }
 
-    const IndexBuilder::IndexConstraints constraints =
+    const auto constraints =
         ReplicationCoordinator::get(opCtx)->shouldRelaxIndexConstraints(opCtx, indexNss)
         ? IndexBuilder::IndexConstraints::kRelax
         : IndexBuilder::IndexConstraints::kEnforce;
 
-    const IndexBuilder::ReplicatedWrites replicatedWrites = opCtx->writesAreReplicated()
+    const auto replicatedWrites = opCtx->writesAreReplicated()
         ? IndexBuilder::ReplicatedWrites::kReplicated
         : IndexBuilder::ReplicatedWrites::kUnreplicated;
 
-    if (indexSpec["background"].trueValue()) {
-        if (mode == OplogApplication::Mode::kRecovering) {
-            LOG(3) << "apply op: building background index " << indexSpec
-                   << " in the foreground because the node is in recovery";
-            IndexBuilder builder(indexSpec, constraints, replicatedWrites);
-            Status status = builder.buildInForeground(opCtx, db);
-            uassertStatusOK(status);
-        } else {
-            Lock::TempRelease release(opCtx->lockState());
-            if (opCtx->lockState()->isLocked()) {
-                // If TempRelease fails, background index build will deadlock.
-                LOG(3) << "apply op: building background index " << indexSpec
-                       << " in the foreground because temp release failed";
-                IndexBuilder builder(indexSpec, constraints, replicatedWrites);
-                Status status = builder.buildInForeground(opCtx, db);
-                uassertStatusOK(status);
-            } else {
-                IndexBuilder* builder =
-                    new IndexBuilder(indexSpec,
-                                     constraints,
-                                     replicatedWrites,
-                                     opCtx->recoveryUnit()->getCommitTimestamp());
-                // This spawns a new thread and returns immediately.
-                builder->go();
-                // Wait for thread to start and register itself
-                IndexBuilder::waitForBgIndexStarting();
-            }
-        }
-
-        opCtx->recoveryUnit()->abandonSnapshot();
-    } else {
+    if (shouldBuildInForeground(opCtx, indexSpec, indexNss, mode)) {
         IndexBuilder builder(indexSpec, constraints, replicatedWrites);
         Status status = builder.buildInForeground(opCtx, db);
         uassertStatusOK(status);
+    } else {
+        Lock::TempRelease release(opCtx->lockState());
+        // TempRelease cannot fail because no recursive locks should be taken.
+        invariant(!opCtx->lockState()->isLocked());
+
+        IndexBuilder* builder = new IndexBuilder(
+            indexSpec, constraints, replicatedWrites, opCtx->recoveryUnit()->getCommitTimestamp());
+        // This spawns a new thread and returns immediately.
+        builder->go();
+        // Wait for thread to start and register itself
+        IndexBuilder::waitForBgIndexStarting();
     }
+
+    opCtx->recoveryUnit()->abandonSnapshot();
+
     if (incrementOpsAppliedStats) {
         incrementOpsAppliedStats();
     }
@@ -871,6 +954,182 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
           return Status::OK();
       },
       {ErrorCodes::IndexAlreadyExists, ErrorCodes::NamespaceNotFound}}},
+    {"startIndexBuild",
+     {[](OperationContext* opCtx,
+         const char* ns,
+         const BSONElement& ui,
+         BSONObj& cmd,
+         const OpTime& opTime,
+         const OplogEntry& entry,
+         OplogApplication::Mode mode) -> Status {
+         // {
+         //     "startIndexBuild" : "coll",
+         //     "indexBuildUUID" : <UUID>,
+         //     "indexes" : [
+         //         {
+         //             "key" : {
+         //                 "x" : 1
+         //             },
+         //             "name" : "x_1",
+         //             "v" : 2
+         //         },
+         //         {
+         //             "key" : {
+         //                 "k" : 1
+         //             },
+         //             "name" : "k_1",
+         //             "v" : 2
+         //         }
+         //     ]
+         // }
+
+         if (OplogApplication::Mode::kApplyOpsCmd == mode) {
+             return {ErrorCodes::CommandNotSupported,
+                     "The startIndexBuild operation is not supported in applyOps mode"};
+         }
+
+         const NamespaceString nss(parseUUIDorNs(opCtx, ns, ui, cmd));
+
+         auto buildUUIDElem = cmd.getField("indexBuildUUID");
+         uassert(ErrorCodes::BadValue,
+                 "Error parsing 'startIndexBuild' oplog entry, missing required field "
+                 "'indexBuildUUID'.",
+                 !buildUUIDElem.eoo());
+         UUID indexBuildUUID = uassertStatusOK(UUID::parse(buildUUIDElem));
+
+         auto indexesElem = cmd.getField("indexes");
+         uassert(ErrorCodes::BadValue,
+                 "Error parsing 'startIndexBuild' oplog entry, missing required field 'indexes'.",
+                 !indexesElem.eoo());
+         uassert(ErrorCodes::BadValue,
+                 "Error parsing 'startIndexBuild' oplog entry, field 'indexes' must be an array.",
+                 indexesElem.type() == Array);
+
+         auto collUUID = uassertStatusOK(UUID::parse(ui));
+
+         return startIndexBuild(opCtx, nss, collUUID, indexBuildUUID, indexesElem, mode);
+     }}},
+    {"commitIndexBuild",
+     {[](OperationContext* opCtx,
+         const char* ns,
+         const BSONElement& ui,
+         BSONObj& cmd,
+         const OpTime& opTime,
+         const OplogEntry& entry,
+         OplogApplication::Mode mode) -> Status {
+         // {
+         //     "commitIndexBuild" : "coll",
+         //     "indexBuildUUID" : <UUID>,
+         //     "indexes" : [
+         //         {
+         //             "key" : {
+         //                 "x" : 1
+         //             },
+         //             "name" : "x_1",
+         //             "v" : 2
+         //         },
+         //         {
+         //             "key" : {
+         //                 "k" : 1
+         //             },
+         //             "name" : "k_1",
+         //             "v" : 2
+         //         }
+         //     ]
+         // }
+
+         if (OplogApplication::Mode::kApplyOpsCmd == mode) {
+             return {ErrorCodes::CommandNotSupported,
+                     "The commitIndexBuild operation is not supported in applyOps mode"};
+         }
+
+         // Ensure the collection name is specified
+         BSONElement first = cmd.firstElement();
+         invariant(first.fieldNameStringData() == "commitIndexBuild");
+         uassert(ErrorCodes::InvalidNamespace,
+                 "commitIndexBuild value must be a string",
+                 first.type() == mongo::String);
+
+         const NamespaceString nss(parseUUIDorNs(opCtx, ns, ui, cmd));
+
+         auto buildUUIDElem = cmd.getField("indexBuildUUID");
+         uassert(ErrorCodes::BadValue,
+                 "Error parsing 'commitIndexBuild' oplog entry, missing required field "
+                 "'indexBuildUUID'.",
+                 !buildUUIDElem.eoo());
+         UUID indexBuildUUID = uassertStatusOK(UUID::parse(buildUUIDElem));
+
+         auto indexesElem = cmd.getField("indexes");
+         uassert(ErrorCodes::BadValue,
+                 "Error parsing 'commitIndexBuild' oplog entry, missing required field 'indexes'.",
+                 !indexesElem.eoo());
+         uassert(ErrorCodes::BadValue,
+                 "Error parsing 'commitIndexBuild' oplog entry, field 'indexes' must be an array.",
+                 indexesElem.type() == Array);
+
+         return commitIndexBuild(opCtx, nss, indexBuildUUID, indexesElem, mode);
+     }}},
+    {"abortIndexBuild",
+     {[](OperationContext* opCtx,
+         const char* ns,
+         const BSONElement& ui,
+         BSONObj& cmd,
+         const OpTime& opTme,
+         const OplogEntry& entry,
+         OplogApplication::Mode mode) -> Status {
+         // {
+         //     "abortIndexBuild" : "coll",
+         //     "indexBuildUUID" : <UUID>,
+         //     "indexes" : [
+         //         {
+         //             "key" : {
+         //                 "x" : 1
+         //             },
+         //             "name" : "x_1",
+         //             "v" : 2
+         //         },
+         //         {
+         //             "key" : {
+         //                 "k" : 1
+         //             },
+         //             "name" : "k_1",
+         //             "v" : 2
+         //         }
+         //     ]
+         // }
+
+         if (OplogApplication::Mode::kApplyOpsCmd == mode) {
+             return {ErrorCodes::CommandNotSupported,
+                     "The abortIndexBuild operation is not supported in applyOps mode"};
+         }
+
+         // Ensure that the first element is the 'abortIndexBuild' field.
+         BSONElement first = cmd.firstElement();
+         invariant(first.fieldNameStringData() == "abortIndexBuild");
+         uassert(ErrorCodes::InvalidNamespace,
+                 "abortIndexBuild value must be a string specifying the collection name",
+                 first.type() == mongo::String);
+
+         auto buildUUIDElem = cmd.getField("indexBuildUUID");
+         uassert(ErrorCodes::BadValue,
+                 "Error parsing 'abortIndexBuild' oplog entry, missing required field "
+                 "'indexBuildUUID'.",
+                 buildUUIDElem.eoo());
+         UUID indexBuildUUID = uassertStatusOK(UUID::parse(buildUUIDElem));
+
+         // We require the indexes field to ensure that rollback via refetch knows the appropriate
+         // indexes to rebuild.
+         auto indexesElem = cmd.getField("indexes");
+         uassert(ErrorCodes::BadValue,
+                 "Error parsing 'abortIndexBuild' oplog entry, missing required field 'indexes'.",
+                 indexesElem.eoo());
+         uassert(ErrorCodes::BadValue,
+                 "Error parsing 'abortIndexBuild' oplog entry, field 'indexes' must be an array of "
+                 "index names.",
+                 indexesElem.type() == Array);
+
+         return abortIndexBuild(opCtx, indexBuildUUID, mode);
+     }}},
     {"collMod",
      {[](OperationContext* opCtx,
          const char* ns,
@@ -1088,10 +1347,9 @@ Status applyOperation_inlock(OperationContext* opCtx,
     // Choose opCounters based on running on standalone/primary or secondary by checking
     // whether writes are replicated. Atomic applyOps command is an exception, which runs
     // on primary/standalone but disables write replication.
-    OpCounters* opCounters =
-        (mode == repl::OplogApplication::Mode::kApplyOpsCmd || opCtx->writesAreReplicated())
-        ? &globalOpCounters
-        : &replOpCounters;
+    const bool shouldUseGlobalOpCounters =
+        mode == repl::OplogApplication::Mode::kApplyOpsCmd || opCtx->writesAreReplicated();
+    OpCounters* opCounters = shouldUseGlobalOpCounters ? &globalOpCounters : &replOpCounters;
 
     std::array<StringData, 8> names = {"ts", "t", "o", "ui", "ns", "op", "b", "o2"};
     std::array<BSONElement, 8> fields;
@@ -1303,6 +1561,10 @@ Status applyOperation_inlock(OperationContext* opCtx,
             wuow.commit();
             for (auto entry : insertObjs) {
                 opCounters->gotInsert();
+                if (shouldUseGlobalOpCounters) {
+                    ServerWriteConcernMetrics::get(opCtx)->recordWriteConcernForInsert(
+                        opCtx->getWriteConcern());
+                }
                 if (incrementOpsAppliedStats) {
                     incrementOpsAppliedStats();
                 }
@@ -1310,6 +1572,10 @@ Status applyOperation_inlock(OperationContext* opCtx,
         } else {
             // Single insert.
             opCounters->gotInsert();
+            if (shouldUseGlobalOpCounters) {
+                ServerWriteConcernMetrics::get(opCtx)->recordWriteConcernForInsert(
+                    opCtx->getWriteConcern());
+            }
 
             // No _id.
             // This indicates an issue with the upstream server:
@@ -1406,6 +1672,10 @@ Status applyOperation_inlock(OperationContext* opCtx,
         }
     } else if (*opType == 'u') {
         opCounters->gotUpdate();
+        if (shouldUseGlobalOpCounters) {
+            ServerWriteConcernMetrics::get(opCtx)->recordWriteConcernForUpdate(
+                opCtx->getWriteConcern());
+        }
 
         auto idField = o2["_id"];
         uassert(ErrorCodes::NoSuchKey,
@@ -1488,6 +1758,10 @@ Status applyOperation_inlock(OperationContext* opCtx,
         }
     } else if (*opType == 'd') {
         opCounters->gotDelete();
+        if (shouldUseGlobalOpCounters) {
+            ServerWriteConcernMetrics::get(opCtx)->recordWriteConcernForDelete(
+                opCtx->getWriteConcern());
+        }
 
         auto idField = o["_id"];
         uassert(ErrorCodes::NoSuchKey,
@@ -1582,12 +1856,13 @@ Status applyCommand_inlock(OperationContext* opCtx,
     }
 
     // The feature compatibility version in the server configuration collection cannot change during
-    // initial sync.
-    // We do not attempt to parse the whitelisted ops because they do not have a collection
-    // namespace. If we drop the 'admin' database we will also log a 'drop' oplog entry for each
-    // collection dropped. 'applyOps' will try to apply each individual operation, and those
-    // will be caught then if they are a problem.
-    auto whitelistedOps = std::vector<std::string>{"dropDatabase", "applyOps", "dbCheck"};
+    // initial sync. We do not attempt to parse the whitelisted ops because they do not have a
+    // collection namespace. If we drop the 'admin' database we will also log a 'drop' oplog entry
+    // for each collection dropped. 'applyOps' and 'commitTransaction' will try to apply each
+    // individual operation, and those will be caught then if they are a problem. 'abortTransaction'
+    // won't ever change the server configuration collection.
+    auto whitelistedOps = std::vector<std::string>{
+        "dropDatabase", "applyOps", "dbCheck", "commitTransaction", "abortTransaction"};
     if ((mode == OplogApplication::Mode::kInitialSync) &&
         (std::find(whitelistedOps.begin(), whitelistedOps.end(), o.firstElementFieldName()) ==
          whitelistedOps.end()) &&

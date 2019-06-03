@@ -101,6 +101,132 @@ private:
     }
 };
 
+TEST_F(OpObserverTest, StartIndexBuildExpectedOplogEntry) {
+    OpObserverImpl opObserver;
+    auto opCtx = cc().makeOperationContext();
+    auto uuid = CollectionUUID::gen();
+    NamespaceString nss("test.coll");
+    UUID indexBuildUUID = UUID::gen();
+
+    BSONObj specX = BSON("key" << BSON("x" << 1) << "name"
+                               << "x_1"
+                               << "v"
+                               << 2);
+    BSONObj specA = BSON("key" << BSON("a" << 1) << "name"
+                               << "a_1"
+                               << "v"
+                               << 2);
+    std::vector<BSONObj> specs = {specX, specA};
+
+    // Write to the oplog.
+    {
+        AutoGetDb autoDb(opCtx.get(), nss.db(), MODE_X);
+        WriteUnitOfWork wunit(opCtx.get());
+        opObserver.onStartIndexBuild(
+            opCtx.get(), nss, uuid, indexBuildUUID, specs, false /*fromMigrate*/);
+        wunit.commit();
+    }
+
+    // Create expected startIndexBuild command.
+    BSONObjBuilder startIndexBuildBuilder;
+    startIndexBuildBuilder.append("startIndexBuild", nss.coll());
+    indexBuildUUID.appendToBuilder(&startIndexBuildBuilder, "indexBuildUUID");
+    BSONArrayBuilder indexesArr(startIndexBuildBuilder.subarrayStart("indexes"));
+    indexesArr.append(specX);
+    indexesArr.append(specA);
+    indexesArr.done();
+    BSONObj startIndexBuildCmd = startIndexBuildBuilder.done();
+
+    // Ensure the startIndexBuild fields were correctly set.
+    auto oplogEntry = getSingleOplogEntry(opCtx.get());
+    auto o = oplogEntry.getObjectField("o");
+    ASSERT_BSONOBJ_EQ(startIndexBuildCmd, o);
+}
+
+TEST_F(OpObserverTest, CommitIndexBuildExpectedOplogEntry) {
+    OpObserverImpl opObserver;
+    auto opCtx = cc().makeOperationContext();
+    auto uuid = CollectionUUID::gen();
+    NamespaceString nss("test.coll");
+    UUID indexBuildUUID = UUID::gen();
+
+    BSONObj specX = BSON("key" << BSON("x" << 1) << "name"
+                               << "x_1"
+                               << "v"
+                               << 2);
+    BSONObj specA = BSON("key" << BSON("a" << 1) << "name"
+                               << "a_1"
+                               << "v"
+                               << 2);
+    std::vector<BSONObj> specs = {specX, specA};
+
+    // Write to the oplog.
+    {
+        AutoGetDb autoDb(opCtx.get(), nss.db(), MODE_X);
+        WriteUnitOfWork wunit(opCtx.get());
+        opObserver.onCommitIndexBuild(
+            opCtx.get(), nss, uuid, indexBuildUUID, specs, false /*fromMigrate*/);
+        wunit.commit();
+    }
+
+    // Create expected commitIndexBuild command.
+    BSONObjBuilder commitIndexBuildBuilder;
+    commitIndexBuildBuilder.append("commitIndexBuild", nss.coll());
+    indexBuildUUID.appendToBuilder(&commitIndexBuildBuilder, "indexBuildUUID");
+    BSONArrayBuilder indexesArr(commitIndexBuildBuilder.subarrayStart("indexes"));
+    indexesArr.append(specX);
+    indexesArr.append(specA);
+    indexesArr.done();
+    BSONObj commitIndexBuildCmd = commitIndexBuildBuilder.done();
+
+    // Ensure the commitIndexBuild fields were correctly set.
+    auto oplogEntry = getSingleOplogEntry(opCtx.get());
+    auto o = oplogEntry.getObjectField("o");
+    ASSERT_BSONOBJ_EQ(commitIndexBuildCmd, o);
+}
+
+TEST_F(OpObserverTest, AbortIndexBuildExpectedOplogEntry) {
+    OpObserverImpl opObserver;
+    auto opCtx = cc().makeOperationContext();
+    auto uuid = CollectionUUID::gen();
+    NamespaceString nss("test.coll");
+    UUID indexBuildUUID = UUID::gen();
+
+    BSONObj specX = BSON("key" << BSON("x" << 1) << "name"
+                               << "x_1"
+                               << "v"
+                               << 2);
+    BSONObj specA = BSON("key" << BSON("a" << 1) << "name"
+                               << "a_1"
+                               << "v"
+                               << 2);
+    std::vector<BSONObj> specs = {specX, specA};
+
+    // Write to the oplog.
+    {
+        AutoGetDb autoDb(opCtx.get(), nss.db(), MODE_X);
+        WriteUnitOfWork wunit(opCtx.get());
+        opObserver.onAbortIndexBuild(
+            opCtx.get(), nss, uuid, indexBuildUUID, specs, false /*fromMigrate*/);
+        wunit.commit();
+    }
+
+    // Create expected abortIndexBuild command.
+    BSONObjBuilder abortIndexBuildBuilder;
+    abortIndexBuildBuilder.append("abortIndexBuild", nss.coll());
+    indexBuildUUID.appendToBuilder(&abortIndexBuildBuilder, "indexBuildUUID");
+    BSONArrayBuilder indexesArr(abortIndexBuildBuilder.subarrayStart("indexes"));
+    indexesArr.append(specX);
+    indexesArr.append(specA);
+    indexesArr.done();
+    BSONObj abortIndexBuildCmd = abortIndexBuildBuilder.done();
+
+    // Ensure the abortIndexBuild fields were correctly set.
+    auto oplogEntry = getSingleOplogEntry(opCtx.get());
+    auto o = oplogEntry.getObjectField("o");
+    ASSERT_BSONOBJ_EQ(abortIndexBuildCmd, o);
+}
+
 TEST_F(OpObserverTest, CollModWithCollectionOptionsAndTTLInfo) {
     OpObserverImpl opObserver;
     auto opCtx = cc().makeOperationContext();
@@ -558,7 +684,11 @@ TEST_F(OpObserverLargeTransactionTest, TransactionTooLargeWhileCommitting) {
                   << BSONBinData(halfTransactionData.get(), kHalfTransactionSize, BinDataGeneral)));
     txnParticipant->addTransactionOperation(opCtx(), operation);
     txnParticipant->addTransactionOperation(opCtx(), operation);
-    ASSERT_THROWS_CODE(opObserver().onTransactionCommit(opCtx(), boost::none, boost::none),
+    ASSERT_THROWS_CODE(opObserver().onTransactionCommit(
+                           opCtx(),
+                           boost::none,
+                           boost::none,
+                           txnParticipant->retrieveCompletedTransactionOperations(opCtx())),
                        AssertionException,
                        ErrorCodes::TransactionTooLarge);
 }
@@ -604,7 +734,8 @@ TEST_F(OpObserverTransactionTest, TransactionalPrepareTest) {
     {
         WriteUnitOfWork wuow(opCtx());
         OplogSlot slot = repl::getNextOpTime(opCtx());
-        opObserver().onTransactionPrepare(opCtx(), slot);
+        opObserver().onTransactionPrepare(
+            opCtx(), slot, txnParticipant->retrieveCompletedTransactionOperations(opCtx()));
         opCtx()->recoveryUnit()->setPrepareTimestamp(slot.opTime.getTimestamp());
     }
 
@@ -679,7 +810,8 @@ TEST_F(OpObserverTransactionTest, TransactionalPreparedCommitTest) {
         txnParticipant->transitionToPreparedforTest();
         const auto prepareSlot = repl::getNextOpTime(opCtx());
         prepareTimestamp = prepareSlot.opTime.getTimestamp();
-        opObserver().onTransactionPrepare(opCtx(), prepareSlot);
+        opObserver().onTransactionPrepare(
+            opCtx(), prepareSlot, txnParticipant->retrieveCompletedTransactionOperations(opCtx()));
 
         commitSlot = repl::getNextOpTime(opCtx());
     }
@@ -687,7 +819,13 @@ TEST_F(OpObserverTransactionTest, TransactionalPreparedCommitTest) {
     // Mimic committing the transaction.
     opCtx()->setWriteUnitOfWork(nullptr);
     opCtx()->lockState()->unsetMaxLockTimeout();
-    opObserver().onTransactionCommit(opCtx(), commitSlot, prepareTimestamp);
+
+    txnParticipant->transitionToCommittingWithPrepareforTest();
+    opObserver().onTransactionCommit(
+        opCtx(),
+        commitSlot,
+        prepareTimestamp,
+        txnParticipant->retrieveCompletedTransactionOperations(opCtx()));
 
     repl::OplogInterfaceLocal oplogInterface(opCtx(), NamespaceString::kRsOplogNamespace.ns());
     auto oplogIter = oplogInterface.makeIterator();
@@ -743,7 +881,8 @@ TEST_F(OpObserverTransactionTest, TransactionalPreparedAbortTest) {
 
         txnParticipant->transitionToPreparedforTest();
         const auto prepareSlot = repl::getNextOpTime(opCtx());
-        opObserver().onTransactionPrepare(opCtx(), prepareSlot);
+        opObserver().onTransactionPrepare(
+            opCtx(), prepareSlot, txnParticipant->retrieveCompletedTransactionOperations(opCtx()));
         abortSlot = repl::getNextOpTime(opCtx());
     }
 
@@ -821,7 +960,8 @@ TEST_F(OpObserverTransactionTest, PreparingEmptyTransactionLogsEmptyApplyOps) {
     {
         WriteUnitOfWork wuow(opCtx());
         OplogSlot slot = repl::getNextOpTime(opCtx());
-        opObserver().onTransactionPrepare(opCtx(), slot);
+        opObserver().onTransactionPrepare(
+            opCtx(), slot, txnParticipant->retrieveCompletedTransactionOperations(opCtx()));
         opCtx()->recoveryUnit()->setPrepareTimestamp(slot.opTime.getTimestamp());
     }
 
@@ -846,7 +986,8 @@ TEST_F(OpObserverTransactionTest, PreparingTransactionWritesToTransactionTable) 
         WriteUnitOfWork wuow(opCtx());
         OplogSlot slot = repl::getNextOpTime(opCtx());
         prepareOpTime = slot.opTime;
-        opObserver().onTransactionPrepare(opCtx(), slot);
+        opObserver().onTransactionPrepare(
+            opCtx(), slot, txnParticipant->retrieveCompletedTransactionOperations(opCtx()));
         opCtx()->recoveryUnit()->setPrepareTimestamp(slot.opTime.getTimestamp());
     }
 
@@ -877,7 +1018,8 @@ TEST_F(OpObserverTransactionTest, AbortingPreparedTransactionWritesToTransaction
     {
         WriteUnitOfWork wuow(opCtx());
         OplogSlot slot = repl::getNextOpTime(opCtx());
-        opObserver().onTransactionPrepare(opCtx(), slot);
+        opObserver().onTransactionPrepare(
+            opCtx(), slot, txnParticipant->retrieveCompletedTransactionOperations(opCtx()));
         opCtx()->recoveryUnit()->setPrepareTimestamp(slot.opTime.getTimestamp());
         txnParticipant->transitionToPreparedforTest();
         abortSlot = repl::getNextOpTime(opCtx());
@@ -913,7 +1055,11 @@ TEST_F(OpObserverTransactionTest, CommittingUnpreparedNonEmptyTransactionWritesT
         opObserver().onInserts(opCtx(), nss, uuid, insert.begin(), insert.end(), false);
     }
 
-    opObserver().onTransactionCommit(opCtx(), boost::none, boost::none);
+    opObserver().onTransactionCommit(
+        opCtx(),
+        boost::none,
+        boost::none,
+        txnParticipant->retrieveCompletedTransactionOperations(opCtx()));
     opCtx()->getWriteUnitOfWork()->commit();
 
     assertTxnRecord(txnNum(), {}, DurableTxnStateEnum::kCommitted);
@@ -924,7 +1070,11 @@ TEST_F(OpObserverTransactionTest,
     auto txnParticipant = TransactionParticipant::get(opCtx());
     txnParticipant->unstashTransactionResources(opCtx(), "prepareTransaction");
 
-    opObserver().onTransactionCommit(opCtx(), boost::none, boost::none);
+    opObserver().onTransactionCommit(
+        opCtx(),
+        boost::none,
+        boost::none,
+        txnParticipant->retrieveCompletedTransactionOperations(opCtx()));
 
     txnParticipant->stashTransactionResources(opCtx());
 
@@ -943,7 +1093,8 @@ TEST_F(OpObserverTransactionTest, CommittingPreparedTransactionWritesToTransacti
         WriteUnitOfWork wuow(opCtx());
         OplogSlot slot = repl::getNextOpTime(opCtx());
         prepareOpTime = slot.opTime;
-        opObserver().onTransactionPrepare(opCtx(), slot);
+        opObserver().onTransactionPrepare(
+            opCtx(), slot, txnParticipant->retrieveCompletedTransactionOperations(opCtx()));
         opCtx()->recoveryUnit()->setPrepareTimestamp(slot.opTime.getTimestamp());
         txnParticipant->transitionToPreparedforTest();
     }
@@ -955,7 +1106,13 @@ TEST_F(OpObserverTransactionTest, CommittingPreparedTransactionWritesToTransacti
     // Mimic committing the transaction.
     opCtx()->setWriteUnitOfWork(nullptr);
     opCtx()->lockState()->unsetMaxLockTimeout();
-    opObserver().onTransactionCommit(opCtx(), commitSlot, prepareOpTime.getTimestamp());
+
+    txnParticipant->transitionToCommittingWithPrepareforTest();
+    opObserver().onTransactionCommit(
+        opCtx(),
+        commitSlot,
+        prepareOpTime.getTimestamp(),
+        txnParticipant->retrieveCompletedTransactionOperations(opCtx()));
 
     assertTxnRecord(txnNum(), commitOpTime, DurableTxnStateEnum::kCommitted);
 }
@@ -987,7 +1144,11 @@ TEST_F(OpObserverTransactionTest, TransactionalInsertTest) {
     AutoGetCollection autoColl2(opCtx(), nss2, MODE_IX);
     opObserver().onInserts(opCtx(), nss1, uuid1, inserts1.begin(), inserts1.end(), false);
     opObserver().onInserts(opCtx(), nss2, uuid2, inserts2.begin(), inserts2.end(), false);
-    opObserver().onTransactionCommit(opCtx(), boost::none, boost::none);
+    opObserver().onTransactionCommit(
+        opCtx(),
+        boost::none,
+        boost::none,
+        txnParticipant->retrieveCompletedTransactionOperations(opCtx()));
     auto oplogEntryObj = getSingleOplogEntry(opCtx());
     checkCommonFields(oplogEntryObj);
     OplogEntry oplogEntry = assertGet(OplogEntry::parse(oplogEntryObj));
@@ -1064,7 +1225,11 @@ TEST_F(OpObserverTransactionTest, TransactionalUpdateTest) {
     AutoGetCollection autoColl2(opCtx(), nss2, MODE_IX);
     opObserver().onUpdate(opCtx(), update1);
     opObserver().onUpdate(opCtx(), update2);
-    opObserver().onTransactionCommit(opCtx(), boost::none, boost::none);
+    opObserver().onTransactionCommit(
+        opCtx(),
+        boost::none,
+        boost::none,
+        txnParticipant->retrieveCompletedTransactionOperations(opCtx()));
     auto oplogEntry = getSingleOplogEntry(opCtx());
     checkCommonFields(oplogEntry);
     auto o = oplogEntry.getObjectField("o");
@@ -1117,7 +1282,11 @@ TEST_F(OpObserverTransactionTest, TransactionalDeleteTest) {
                                BSON("_id" << 1 << "data"
                                           << "y"));
     opObserver().onDelete(opCtx(), nss2, uuid2, 0, false, boost::none);
-    opObserver().onTransactionCommit(opCtx(), boost::none, boost::none);
+    opObserver().onTransactionCommit(
+        opCtx(),
+        boost::none,
+        boost::none,
+        txnParticipant->retrieveCompletedTransactionOperations(opCtx()));
     auto oplogEntry = getSingleOplogEntry(opCtx());
     checkCommonFields(oplogEntry);
     auto o = oplogEntry.getObjectField("o");

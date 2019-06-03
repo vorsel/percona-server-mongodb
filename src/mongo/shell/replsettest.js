@@ -484,7 +484,7 @@ var ReplSetTest = function(opts) {
             member._id = i;
 
             member.host = this.host;
-            if (!member.host.contains('/')) {
+            if (!member.host.includes('/')) {
                 member.host += ":" + this.ports[i];
             }
 
@@ -1482,13 +1482,28 @@ var ReplSetTest = function(opts) {
         }, "awaiting replication", timeout);
     };
 
+    // TODO: SERVER-38961 Remove when simultaneous index builds complete.
+    this.waitForAllIndexBuildsToFinish = function(dbName, collName) {
+        // Run a no-op command and wait for it to be applied on secondaries. Due to the asynchronous
+        // completion nature of indexes on secondaries, we can guarantee an index build is complete
+        // on all secondaries once all secondaries have applied this collMod command.
+        assert.commandWorked(this.getPrimary().getDB(dbName).runCommand(
+            {collMod: collName, usePowerOf2Sizes: true}));
+        this.awaitReplication();
+    };
+
     this.getHashesUsingSessions = function(sessions, dbName, {
         filterCapped: filterCapped = true,
-        filterMapReduce: filterMapReduce = true,
+        filterMapReduce: filterMapReduce = true, readAtClusterTime,
     } = {}) {
         return sessions.map(session => {
+            const commandObj = {dbHash: 1};
+            if (readAtClusterTime !== undefined) {
+                commandObj.$_internalReadAtClusterTime = readAtClusterTime;
+            }
+
             const db = session.getDatabase(dbName);
-            const res = assert.commandWorked(db.runCommand({dbHash: 1}));
+            const res = assert.commandWorked(db.runCommand(commandObj));
 
             // The "capped" field in the dbHash command response is new as of MongoDB 4.0.
             const cappedCollections = new Set(filterCapped ? res.capped : []);
@@ -1518,7 +1533,7 @@ var ReplSetTest = function(opts) {
     };
 
     this.getCollectionDiffUsingSessions = function(
-        primarySession, secondarySession, dbName, collNameOrUUID) {
+        primarySession, secondarySession, dbName, collNameOrUUID, readAtClusterTime) {
         function PeekableCursor(cursor) {
             let _stashedDoc;
 
@@ -1547,11 +1562,16 @@ var ReplSetTest = function(opts) {
         const primaryDB = primarySession.getDatabase(dbName);
         const secondaryDB = secondarySession.getDatabase(dbName);
 
-        const primaryCursor = new PeekableCursor(new DBCommandCursor(
-            primaryDB, primaryDB.runCommand({find: collNameOrUUID, sort: {_id: 1}})));
+        const commandObj = {find: collNameOrUUID, sort: {_id: 1}};
+        if (readAtClusterTime !== undefined) {
+            commandObj.$_internalReadAtClusterTime = readAtClusterTime;
+        }
 
-        const secondaryCursor = new PeekableCursor(new DBCommandCursor(
-            secondaryDB, secondaryDB.runCommand({find: collNameOrUUID, sort: {_id: 1}})));
+        const primaryCursor =
+            new PeekableCursor(new DBCommandCursor(primaryDB, primaryDB.runCommand(commandObj)));
+
+        const secondaryCursor = new PeekableCursor(
+            new DBCommandCursor(secondaryDB, secondaryDB.runCommand(commandObj)));
 
         while (primaryCursor.hasNext() && secondaryCursor.hasNext()) {
             const primaryDoc = primaryCursor.peekNext();
@@ -2269,6 +2289,15 @@ var ReplSetTest = function(opts) {
 
         // Turn off periodic noop writes for replica sets by default.
         options.setParameter = options.setParameter || {};
+        if (typeof(options.setParameter) === "string") {
+            var eqIdx = options.setParameter.indexOf("=");
+            if (eqIdx != -1) {
+                var param = options.setParameter.substring(0, eqIdx);
+                var value = options.setParameter.substring(eqIdx + 1);
+                options.setParameter = {};
+                options.setParameter[param] = value;
+            }
+        }
         options.setParameter.writePeriodicNoops = options.setParameter.writePeriodicNoops || false;
 
         // We raise the number of initial sync connect attempts for tests that disallow chaining.
@@ -2282,7 +2311,9 @@ var ReplSetTest = function(opts) {
 
         print("ReplSetTest " + (restart ? "(Re)" : "") + "Starting....");
 
-        if (_useBridge) {
+        if (_useBridge && (restart === undefined || !restart)) {
+            // We leave the mongobridge process running when the mongod process is restarted so we
+            // don't need to start a new one.
             var bridgeOptions = Object.merge(_bridgeOptions, options.bridgeOptions || {});
             bridgeOptions = Object.merge(bridgeOptions, {
                 hostName: this.host,
@@ -2366,7 +2397,7 @@ var ReplSetTest = function(opts) {
             signal = undefined;
         }
 
-        this.stop(n, signal, options);
+        this.stop(n, signal, options, {forRestart: true});
 
         var started = this.start(n, options, true, wait);
 
@@ -2392,11 +2423,18 @@ var ReplSetTest = function(opts) {
     /**
      * Stops a particular node or nodes, specified by conn or id
      *
+     * If _useBridge=true, then the mongobridge process(es) corresponding to the node(s) are also
+     * terminated unless forRestart=true. The mongobridge process(es) are left running across
+     * restarts to ensure their configuration remains intact.
+     *
      * @param {number|Mongo} n the index or connection object of the replica set member to stop.
      * @param {number} signal the signal number to use for killing
      * @param {Object} opts @see MongoRunner.stopMongod
+     * @param {Object} [extraOptions={}]
+     * @param {boolean} [extraOptions.forRestart=false] indicates whether stop() is being called
+     * with the intent to call start() with restart=true for the same node(s) n.
      */
-    this.stop = function(n, signal, opts) {
+    this.stop = function(n, signal, opts, {forRestart: forRestart = false} = {}) {
         // Flatten array of nodes to stop
         if (n.length) {
             var nodes = n;
@@ -2424,8 +2462,13 @@ var ReplSetTest = function(opts) {
         print('ReplSetTest stop *** Mongod in port ' + conn.port + ' shutdown with code (' + ret +
               ') ***');
 
-        if (_useBridge) {
-            this.nodes[n].stop();
+        if (_useBridge && !forRestart) {
+            // We leave the mongobridge process running when the mongod process is being restarted.
+            const bridge = this.nodes[n];
+            print('ReplSetTest stop *** Shutting down mongobridge on port ' + bridge.port + ' ***');
+            const exitCode = bridge.stop();  // calls MongoBridge#stop()
+            print('ReplSetTest stop *** mongobridge on port ' + bridge.port +
+                  ' exited with code (' + exitCode + ') ***');
         }
 
         return ret;

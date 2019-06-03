@@ -54,7 +54,7 @@
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/logical_clock.h"
-#include "mongo/db/query/query_knobs.h"
+#include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
@@ -151,7 +151,7 @@ Status rebuildIndexesOnCollection(OperationContext* opCtx,
         collection = databaseHolder->makeCollection(opCtx, ns, uuid, cce, rs, dbce);
 
         indexer = std::make_unique<MultiIndexBlock>(opCtx, collection.get());
-        Status status = indexer->init(indexSpecs).getStatus();
+        Status status = indexer->init(indexSpecs, MultiIndexBlock::kNoopOnInitFn).getStatus();
         if (!status.isOK()) {
             // The WUOW will handle cleanup, so the indexer shouldn't do its own.
             indexer->abortWithoutCleanup();
@@ -220,7 +220,8 @@ Status rebuildIndexesOnCollection(OperationContext* opCtx,
 
     {
         WriteUnitOfWork wunit(opCtx);
-        status = indexer->commit();
+        status =
+            indexer->commit(MultiIndexBlock::kNoopOnCreateEachFn, MultiIndexBlock::kNoopOnCommitFn);
         if (!status.isOK()) {
             return status;
         }
@@ -234,7 +235,8 @@ Status rebuildIndexesOnCollection(OperationContext* opCtx,
 namespace {
 Status repairCollections(OperationContext* opCtx,
                          StorageEngine* engine,
-                         const std::string& dbName) {
+                         const std::string& dbName,
+                         stdx::function<void(const std::string& dbName)> onRecordStoreRepair) {
 
     DatabaseCatalogEntry* dbce = engine->getDatabaseCatalogEntry(opCtx, dbName);
 
@@ -242,8 +244,6 @@ Status repairCollections(OperationContext* opCtx,
     dbce->getCollectionNamespaces(&colls);
 
     for (std::list<std::string>::const_iterator it = colls.begin(); it != colls.end(); ++it) {
-        // Don't check for interrupt after starting to repair a collection otherwise we can
-        // leave data in an inconsistent state. Interrupting between collections is ok, however.
         opCtx->checkForInterrupt();
 
         log() << "Repairing collection " << *it;
@@ -251,21 +251,32 @@ Status repairCollections(OperationContext* opCtx,
         Status status = engine->repairRecordStore(opCtx, *it);
         if (!status.isOK())
             return status;
+    }
+
+    onRecordStoreRepair(dbName);
+
+    for (std::list<std::string>::const_iterator it = colls.begin(); it != colls.end(); ++it) {
+        opCtx->checkForInterrupt();
 
         CollectionCatalogEntry* cce = dbce->getCollectionCatalogEntry(*it);
         auto swIndexNameObjs = getIndexNameObjs(opCtx, dbce, cce);
         if (!swIndexNameObjs.isOK())
             return swIndexNameObjs.getStatus();
 
-        status = rebuildIndexesOnCollection(opCtx, dbce, cce, swIndexNameObjs.getValue());
+        Status status = rebuildIndexesOnCollection(opCtx, dbce, cce, swIndexNameObjs.getValue());
         if (!status.isOK())
             return status;
+
+        engine->flushAllFiles(opCtx, true);
     }
     return Status::OK();
 }
 }  // namespace
 
-Status repairDatabase(OperationContext* opCtx, StorageEngine* engine, const std::string& dbName) {
+Status repairDatabase(OperationContext* opCtx,
+                      StorageEngine* engine,
+                      const std::string& dbName,
+                      stdx::function<void(const std::string& dbName)> onRecordStoreRepair) {
     DisableDocumentValidation validationDisabler(opCtx);
 
     // We must hold some form of lock here
@@ -280,7 +291,7 @@ Status repairDatabase(OperationContext* opCtx, StorageEngine* engine, const std:
 
     // Close the db and invalidate all current users and caches.
     auto databaseHolder = DatabaseHolder::get(opCtx);
-    databaseHolder->close(opCtx, dbName, "database closed for repair");
+    databaseHolder->close(opCtx, dbName);
     ON_BLOCK_EXIT([databaseHolder, &dbName, &opCtx] {
         try {
             // Ensure that we don't trigger an exception when attempting to take locks.
@@ -306,40 +317,13 @@ Status repairDatabase(OperationContext* opCtx, StorageEngine* engine, const std:
         }
     });
 
-    auto status = repairCollections(opCtx, engine, dbName);
+    auto status = repairCollections(opCtx, engine, dbName, onRecordStoreRepair);
     if (!status.isOK()) {
         severe() << "Failed to repair database " << dbName << ": " << status.reason();
         return status;
     }
 
-    DatabaseCatalogEntry* dbce = engine->getDatabaseCatalogEntry(opCtx, dbName);
-
-    std::list<std::string> colls;
-    dbce->getCollectionNamespaces(&colls);
-
-    for (std::list<std::string>::const_iterator it = colls.begin(); it != colls.end(); ++it) {
-        // Don't check for interrupt after starting to repair a collection otherwise we can
-        // leave data in an inconsistent state. Interrupting between collections is ok, however.
-        opCtx->checkForInterrupt();
-
-        log() << "Repairing collection " << *it;
-
-        Status status = engine->repairRecordStore(opCtx, *it);
-        if (!status.isOK())
-            return status;
-
-        CollectionCatalogEntry* cce = dbce->getCollectionCatalogEntry(*it);
-        auto swIndexNameObjs = getIndexNameObjs(opCtx, dbce, cce);
-        if (!swIndexNameObjs.isOK())
-            return swIndexNameObjs.getStatus();
-
-        status = rebuildIndexesOnCollection(opCtx, dbce, cce, swIndexNameObjs.getValue());
-        if (!status.isOK())
-            return status;
-
-        engine->flushAllFiles(opCtx, true);
-    }
-
     return Status::OK();
 }
+
 }  // namespace mongo

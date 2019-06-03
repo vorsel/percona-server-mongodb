@@ -33,9 +33,11 @@
 
 #include "mongo/db/index_builds_coordinator_mongod.h"
 
-#include "mongo/db/catalog_raii.h"
+#include "mongo/db/catalog/uuid_catalog.h"
+#include "mongo/db/curop.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
@@ -78,11 +80,12 @@ void IndexBuildsCoordinatorMongod::shutdown() {
     _threadPool.join();
 }
 
-StatusWith<SharedSemiFuture<void>> IndexBuildsCoordinatorMongod::buildIndex(
-    OperationContext* opCtx,
-    const NamespaceString& nss,
-    const std::vector<BSONObj>& specs,
-    const UUID& buildUUID) {
+StatusWith<SharedSemiFuture<ReplIndexBuildState::IndexCatalogStats>>
+IndexBuildsCoordinatorMongod::startIndexBuild(OperationContext* opCtx,
+                                              CollectionUUID collectionUUID,
+                                              const std::vector<BSONObj>& specs,
+                                              const UUID& buildUUID,
+                                              IndexBuildProtocol protocol) {
     std::vector<std::string> indexNames;
     for (auto& spec : specs) {
         std::string name = spec.getStringField(IndexDescriptor::kIndexNameFieldName);
@@ -95,21 +98,84 @@ StatusWith<SharedSemiFuture<void>> IndexBuildsCoordinatorMongod::buildIndex(
         indexNames.push_back(name);
     }
 
-    UUID collectionUUID = [&] {
-        AutoGetCollection autoColl(opCtx, nss, MODE_IS);
-        return autoColl.getCollection()->uuid().get();
-    }();
-
-    auto replIndexBuildState =
-        std::make_shared<ReplIndexBuildState>(buildUUID, collectionUUID, indexNames, specs);
+    auto nss = UUIDCatalog::get(opCtx).lookupNSSByUUID(collectionUUID);
+    auto dbName = nss.db().toString();
+    auto replIndexBuildState = std::make_shared<ReplIndexBuildState>(
+        buildUUID, collectionUUID, dbName, indexNames, specs, protocol);
 
     Status status = _registerIndexBuild(opCtx, replIndexBuildState);
     if (!status.isOK()) {
         return status;
     }
 
-    status = _threadPool.schedule([ this, buildUUID ]() noexcept {
+    // Run index build in-line if we are transitioning between replication modes.
+    // While the RSTLExclusive is being held, the async thread in the thread pool is not allowed
+    // to take locks.
+    if (opCtx->lockState()->isRSTLExclusive()) {
+        log() << "Running index build on current thread because we are transitioning between "
+                 "replication states: "
+              << buildUUID;
+        // Sets up and runs the index build. Sets result and cleans up index build.
+        _runIndexBuild(opCtx, buildUUID);
+        return replIndexBuildState->sharedPromise.getFuture();
+    }
+
+    // Copy over all necessary OperationContext state.
+
+    // Task in thread pool should retain the caller's deadline.
+    const auto deadline = opCtx->getDeadline();
+    const auto timeoutError = opCtx->getTimeoutError();
+
+    // TODO: SERVER-39484 Because both 'writesAreReplicated' and
+    // 'shouldNotConflictWithSecondaryBatchApplication' depend on the current replication state,
+    // just passing the state here is not resilient to member state changes like stepup/stepdown.
+
+    // If the calling thread is replicating oplog writes (primary), this state should be passed to
+    // the builder.
+    const bool writesAreReplicated = opCtx->writesAreReplicated();
+    // Index builds on secondaries can't hold the PBWM lock because it would conflict with
+    // replication.
+    const bool shouldNotConflictWithSecondaryBatchApplication =
+        !opCtx->lockState()->shouldConflictWithSecondaryBatchApplication();
+
+    // Task in thread pool should have similar CurOp representation to the caller so that it can be
+    // identified as a createIndexes operation.
+    BSONObj opDesc;
+    {
+        stdx::unique_lock<Client> lk(*opCtx->getClient());
+        auto curOp = CurOp::get(opCtx);
+        opDesc = curOp->opDescription().getOwned();
+    }
+
+    status = _threadPool.schedule([
+        this,
+        buildUUID,
+        deadline,
+        timeoutError,
+        writesAreReplicated,
+        shouldNotConflictWithSecondaryBatchApplication,
+        opDesc
+    ]() noexcept {
         auto opCtx = Client::getCurrent()->makeOperationContext();
+
+        opCtx->setDeadlineByDate(deadline, timeoutError);
+
+        boost::optional<repl::UnreplicatedWritesBlock> unreplicatedWrites;
+        if (!writesAreReplicated) {
+            unreplicatedWrites.emplace(opCtx.get());
+        }
+
+        // If the calling thread should not take the PBWM lock, neither should this thread.
+        boost::optional<ShouldNotConflictWithSecondaryBatchApplicationBlock> shouldNotConflictBlock;
+        if (shouldNotConflictWithSecondaryBatchApplication) {
+            shouldNotConflictBlock.emplace(opCtx->lockState());
+        }
+
+        {
+            stdx::unique_lock<Client> lk(*opCtx->getClient());
+            auto curOp = CurOp::get(opCtx.get());
+            curOp->setOpDescription_inlock(opDesc);
+        }
 
         // Sets up and runs the index build. Sets result and cleans up index build.
         _runIndexBuild(opCtx.get(), buildUUID);
@@ -130,6 +196,13 @@ StatusWith<SharedSemiFuture<void>> IndexBuildsCoordinatorMongod::buildIndex(
     }
 
     return replIndexBuildState->sharedPromise.getFuture();
+}
+
+Status IndexBuildsCoordinatorMongod::commitIndexBuild(OperationContext* opCtx,
+                                                      const std::vector<BSONObj>& specs,
+                                                      const UUID& buildUUID) {
+    // TODO: not yet implemented.
+    return Status::OK();
 }
 
 void IndexBuildsCoordinatorMongod::signalChangeToPrimaryMode() {
@@ -155,41 +228,9 @@ Status IndexBuildsCoordinatorMongod::voteCommitIndexBuild(const UUID& buildUUID,
 
 Status IndexBuildsCoordinatorMongod::setCommitQuorum(const NamespaceString& nss,
                                                      const std::vector<StringData>& indexNames,
-                                                     const WriteConcernOptions& newCommitQuorum) {
+                                                     const CommitQuorumOptions& newCommitQuorum) {
     // TODO: not yet implemented.
     return Status::OK();
-}
-
-void IndexBuildsCoordinatorMongod::_runIndexBuild(OperationContext* opCtx,
-                                                  const UUID& buildUUID) noexcept {
-    auto replState = [&] {
-        stdx::unique_lock<stdx::mutex> lk(_mutex);
-        auto it = _allIndexBuilds.find(buildUUID);
-        invariant(it != _allIndexBuilds.end());
-        return it->second;
-    }();
-
-    {
-        stdx::unique_lock<stdx::mutex> lk(_mutex);
-        while (_sleepForTest) {
-            lk.unlock();
-            sleepmillis(100);
-            lk.lock();
-        }
-    }
-
-    // TODO: create scoped object to create the index builder, then destroy the builder, set the
-    // promises and unregister the build.
-
-    // TODO: implement.
-
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
-
-    _unregisterIndexBuild(lk, opCtx, replState);
-
-    replState->sharedPromise.emplaceValue();
-
-    return;
 }
 
 Status IndexBuildsCoordinatorMongod::_finishScanningPhase() {

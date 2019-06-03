@@ -47,9 +47,9 @@ SessionKiller::Result killSessionsLocal(OperationContext* opCtx,
 /**
  * Kills all transactions on mongod for sessions matching 'matcher'.
  */
-void killSessionsLocalKillTransactions(OperationContext* opCtx,
-                                       const SessionKiller::Matcher& matcher,
-                                       ErrorCodes::Error reason = ErrorCodes::Interrupted);
+void killSessionsAbortUnpreparedTransactions(OperationContext* opCtx,
+                                             const SessionKiller::Matcher& matcher,
+                                             ErrorCodes::Error reason = ErrorCodes::Interrupted);
 
 /**
  * Aborts any expired transactions.
@@ -65,5 +65,10 @@ void killSessionsLocalShutdownAllTransactions(OperationContext* opCtx);
  * Run during rollback to abort all in-progress prepared transactions.
  */
 void killSessionsAbortAllPreparedTransactions(OperationContext* opCtx);
+
+/**
+ * Yields locks of prepared transactions.
+ */
+void yieldLocksForPreparedTransactions(OperationContext* opCtx);
 
 }  // namespace mongo

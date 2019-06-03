@@ -33,16 +33,32 @@
 
 #include "mongo/db/index_builds_coordinator.h"
 
+#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/catalog_raii.h"
+#include "mongo/db/concurrency/locker.h"
+#include "mongo/db/db_raii.h"
+#include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/s/database_sharding_state.h"
 #include "mongo/db/service_context.h"
+#include "mongo/s/shard_key_pattern.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
+MONGO_FAIL_POINT_DEFINE(hangAfterIndexBuildFirstDrain);
+MONGO_FAIL_POINT_DEFINE(hangAfterIndexBuildSecondDrain);
+MONGO_FAIL_POINT_DEFINE(hangAfterIndexBuildDumpsInsertsFromBulk);
+
 namespace {
+
+constexpr auto kUniqueFieldName = "unique"_sd;
+constexpr auto kKeyFieldName = "key"_sd;
 
 /**
  * Returns the collection UUID for the given 'nss', or a NamespaceNotFound error.
@@ -57,6 +73,26 @@ StatusWith<UUID> getCollectionUUID(OperationContext* opCtx, const NamespaceStrin
         invariant(ex.toStatus().code() == ErrorCodes::NamespaceNotFound);
         return ex.toStatus();
     }
+}
+
+/**
+ * Checks if unique index specification is compatible with sharding configuration.
+ */
+void checkShardKeyRestrictions(OperationContext* opCtx,
+                               const NamespaceString& nss,
+                               const BSONObj& newIdxKey) {
+    invariant(opCtx->lockState()->isCollectionLockedForMode(nss.ns(), MODE_X));
+
+    const auto metadata = CollectionShardingState::get(opCtx, nss)->getCurrentMetadata();
+    if (!metadata->isSharded())
+        return;
+
+    const ShardKeyPattern shardKeyPattern(metadata->getKeyPattern());
+    uassert(ErrorCodes::CannotCreateIndex,
+            str::stream() << "cannot create unique index over " << newIdxKey
+                          << " with shard key pattern "
+                          << shardKeyPattern.toBSON(),
+            shardKeyPattern.isUniqueIndexCompatible(newIdxKey));
 }
 
 /**
@@ -77,6 +113,16 @@ void abortIndexBuild(WithLock lk,
     // case, set the abort signal on the coordinator index build state.
     replIndexBuildState->aborted = true;
     replIndexBuildState->abortReason = reason;
+}
+
+/**
+ * Logs the index build failure error in a standard format.
+ */
+void logFailure(Status status,
+                const NamespaceString& nss,
+                std::shared_ptr<ReplIndexBuildState> replState) {
+    log() << "Index build failed: " << replState->buildUUID << ": " << nss << " ( "
+          << replState->collectionUUID << " ): " << status;
 }
 
 }  // namespace
@@ -176,8 +222,8 @@ Future<void> IndexBuildsCoordinator::abortIndexBuildByName(
     return std::move(pf.future);
 }
 
-Future<void> IndexBuildsCoordinator::abortIndexBuildByUUID(const UUID& buildUUID,
-                                                           const std::string& reason) {
+Future<void> IndexBuildsCoordinator::abortIndexBuildByBuildUUID(const UUID& buildUUID,
+                                                                const std::string& reason) {
     // TODO: not yet implemented. Some code to make it compile.
     auto pf = makePromiseFuture<void>();
     auto promise = std::move(pf.promise);
@@ -287,20 +333,13 @@ Status IndexBuildsCoordinator::_registerIndexBuild(
     OperationContext* opCtx, std::shared_ptr<ReplIndexBuildState> replIndexBuildState) {
     stdx::unique_lock<stdx::mutex> lk(_mutex);
 
-    NamespaceString nss =
-        UUIDCatalog::get(opCtx).lookupNSSByUUID(replIndexBuildState->collectionUUID);
-    if (!nss.isValid()) {
-        return Status(ErrorCodes::NamespaceNotFound,
-                      "The collection has been dropped since the index build began.");
-    }
-
     auto itns = _disallowedCollections.find(replIndexBuildState->collectionUUID);
-    auto itdb = _disallowedDbs.find(nss.db());
+    auto itdb = _disallowedDbs.find(replIndexBuildState->dbName);
     if (itns != _disallowedCollections.end() || itdb != _disallowedDbs.end()) {
         return Status(ErrorCodes::CannotCreateIndex,
-                      str::stream() << "Collection '" << nss.toString()
-                                    << "' is in the process of being dropped. New index builds are "
-                                       "not currently allowed.");
+                      str::stream() << "Collection ( " << replIndexBuildState->collectionUUID
+                                    << " ) is in the process of being dropped. New index builds "
+                                       "are not currently allowed.");
     }
 
     // Check whether any indexes are already being built with the same index name(s). (Duplicate
@@ -311,17 +350,21 @@ Status IndexBuildsCoordinator::_registerIndexBuild(
             if (collIndexBuildsIt->second->hasIndexBuildState(lk, name)) {
                 return Status(ErrorCodes::IndexKeySpecsConflict,
                               str::stream() << "There's already an index with name '" << name
-                                            << "' being built on the collection");
+                                            << "' being built on the collection: "
+                                            << " ( "
+                                            << replIndexBuildState->collectionUUID
+                                            << " )");
             }
         }
     }
 
     // Register the index build.
 
-    auto dbIndexBuilds = _databaseIndexBuilds[nss.db()];
+    auto dbIndexBuilds = _databaseIndexBuilds[replIndexBuildState->dbName];
     if (!dbIndexBuilds) {
-        _databaseIndexBuilds[nss.db()] = std::make_shared<DatabaseIndexBuildsTracker>();
-        dbIndexBuilds = _databaseIndexBuilds[nss.db()];
+        _databaseIndexBuilds[replIndexBuildState->dbName] =
+            std::make_shared<DatabaseIndexBuildsTracker>();
+        dbIndexBuilds = _databaseIndexBuilds[replIndexBuildState->dbName];
     }
     dbIndexBuilds->addIndexBuild(lk, replIndexBuildState);
 
@@ -338,15 +381,11 @@ void IndexBuildsCoordinator::_unregisterIndexBuild(
     WithLock lk,
     OperationContext* opCtx,
     std::shared_ptr<ReplIndexBuildState> replIndexBuildState) {
-    NamespaceString nss =
-        UUIDCatalog::get(opCtx).lookupNSSByUUID(replIndexBuildState->collectionUUID);
-    invariant(!nss.isEmpty());
-
-    auto dbIndexBuilds = _databaseIndexBuilds[nss.db()];
+    auto dbIndexBuilds = _databaseIndexBuilds[replIndexBuildState->dbName];
     invariant(dbIndexBuilds);
     dbIndexBuilds->removeIndexBuild(lk, replIndexBuildState->buildUUID);
     if (dbIndexBuilds->getNumberOfIndexBuilds(lk) == 0) {
-        _databaseIndexBuilds.erase(nss.db());
+        _databaseIndexBuilds.erase(replIndexBuildState->dbName);
     }
 
     auto collIndexBuildsIt = _collectionIndexBuilds.find(replIndexBuildState->collectionUUID);
@@ -357,6 +396,259 @@ void IndexBuildsCoordinator::_unregisterIndexBuild(
     }
 
     invariant(_allIndexBuilds.erase(replIndexBuildState->buildUUID));
+}
+
+void IndexBuildsCoordinator::_runIndexBuild(OperationContext* opCtx,
+                                            const UUID& buildUUID) noexcept {
+    auto replState = [&] {
+        stdx::unique_lock<stdx::mutex> lk(_mutex);
+        auto it = _allIndexBuilds.find(buildUUID);
+        invariant(it != _allIndexBuilds.end());
+        return it->second;
+    }();
+
+    // 'status' should always be set to something else before this function exits.
+    Status status{ErrorCodes::InternalError,
+                  "Uninitialized status value in IndexBuildsCoordinator"};
+
+    ON_BLOCK_EXIT([&] {
+        // Ensure the index build is unregistered from the Coordinator and the Promise is set with
+        // the build's result so that callers are notified of the outcome.
+
+        invariant(status.code() != ErrorCodes::InternalError, status.toString());
+
+        stdx::unique_lock<stdx::mutex> lk(_mutex);
+
+        _unregisterIndexBuild(lk, opCtx, replState);
+
+        if (status.isOK()) {
+            replState->sharedPromise.emplaceValue(replState->stats);
+        } else {
+            replState->sharedPromise.setError(status);
+        }
+    });
+
+    NamespaceString nss = UUIDCatalog::get(opCtx).lookupNSSByUUID(replState->collectionUUID);
+
+    if (nss.isEmpty()) {
+        status = Status(ErrorCodes::NamespaceNotFound,
+                        str::stream() << "Collection with UUID '" << replState->collectionUUID
+                                      << "' was dropped since the index build request began.");
+        log() << "Index build failed (" << replState->buildUUID << "): " << status;
+        return;
+    }
+
+    // Do not use AutoGetOrCreateDb because we may relock the database in mode IX.
+    Lock::DBLock dbLock(opCtx, nss.db(), MODE_X);
+
+    // Allow the strong lock acquisition above to be interrupted, but from this point forward do
+    // not allow locks or re-locks to be interrupted.
+    UninterruptibleLockGuard noInterrupt(opCtx->lockState());
+
+    auto collection = UUIDCatalog::get(opCtx).lookupCollectionByUUID(replState->collectionUUID);
+    if (!collection) {
+        status = Status(ErrorCodes::NamespaceNotFound,
+                        str::stream() << "Collection '" << replState->collectionUUID
+                                      << "' was dropped.");
+        logFailure(status, nss, replState);
+        return;
+    }
+
+    replState->stats.numIndexesBefore = _getNumIndexesTotal(opCtx, collection);
+
+    std::vector<BSONObj> filteredSpecs;
+    try {
+        filteredSpecs =
+            _addDefaultsAndFilterExistingIndexes(opCtx, collection, nss, replState->indexSpecs);
+    } catch (const DBException& ex) {
+        status = ex.toStatus();
+        logFailure(status, nss, replState);
+        return;
+    }
+
+    if (filteredSpecs.size() == 0) {
+        // Finish setting the index catalog stats and return success.
+        replState->stats.numIndexesAfter = replState->stats.numIndexesBefore;
+        status = Status::OK();
+        return;
+    }
+
+    {
+        stdx::unique_lock<stdx::mutex> lk(_mutex);
+        while (_sleepForTest) {
+            lk.unlock();
+            sleepmillis(100);
+            lk.lock();
+        }
+    }
+
+    try {
+        _buildIndex(opCtx, collection, nss, replState, filteredSpecs, &dbLock);
+        replState->stats.numIndexesAfter = _getNumIndexesTotal(opCtx, collection);
+    } catch (const DBException& ex) {
+        status = ex.toStatus();
+        logFailure(status, nss, replState);
+        return;
+    }
+
+    invariant(opCtx->lockState()->isDbLockedForMode(replState->dbName, MODE_X));
+    _indexBuildsManager.tearDownIndexBuild(replState->buildUUID);
+
+    log() << "Index build completed successfully: " << replState->buildUUID << ": " << nss << " ( "
+          << replState->collectionUUID
+          << " ). Index specs requested: " << replState->indexSpecs.size()
+          << ". Indexes built: " << filteredSpecs.size()
+          << ". Indexes in catalog before build: " << replState->stats.numIndexesBefore
+          << ". Indexes in catalog after build: " << replState->stats.numIndexesAfter;
+
+    status = Status::OK();
+
+    return;
+}
+
+void IndexBuildsCoordinator::_buildIndex(OperationContext* opCtx,
+                                         Collection* collection,
+                                         const NamespaceString& nss,
+                                         std::shared_ptr<ReplIndexBuildState> replState,
+                                         const std::vector<BSONObj>& filteredSpecs,
+                                         Lock::DBLock* dbLock) {
+    MultiIndexBlock::OnInitFn onInitFn;
+    // Two-phase index builds write a different oplog entry than the default behavior which
+    // writes a no-op just to generate an optime.
+    if (IndexBuildProtocol::kTwoPhase == replState->protocol) {
+        onInitFn = [&] {
+            opCtx->getServiceContext()->getOpObserver()->onStartIndexBuild(
+                opCtx,
+                nss,
+                replState->collectionUUID,
+                replState->buildUUID,
+                filteredSpecs,
+                false /* fromMigrate */);
+        };
+    } else {
+        onInitFn = MultiIndexBlock::makeTimestampedIndexOnInitFn(opCtx, collection);
+    }
+    uassertStatusOK(_indexBuildsManager.setUpIndexBuild(
+        opCtx, collection, filteredSpecs, replState->buildUUID, onInitFn));
+
+    // If we're a background index, replace exclusive db lock with an intent lock, so that
+    // other readers and writers can proceed during this phase.
+    if (_indexBuildsManager.isBackgroundBuilding(replState->buildUUID)) {
+        opCtx->recoveryUnit()->abandonSnapshot();
+        dbLock->relockWithMode(MODE_IX);
+    }
+
+    auto relockOnErrorGuard = makeGuard([&] {
+        // Must have exclusive DB lock before we clean up the index build via the
+        // destructor of 'indexer'.
+        if (_indexBuildsManager.isBackgroundBuilding(replState->buildUUID)) {
+            opCtx->recoveryUnit()->abandonSnapshot();
+            dbLock->relockWithMode(MODE_X);
+        }
+    });
+
+    // Collection scan and insert into index, followed by a drain of writes received in the
+    // background.
+    {
+        Lock::CollectionLock colLock(opCtx->lockState(), nss.ns(), MODE_IX);
+        uassertStatusOK(_indexBuildsManager.startBuildingIndex(replState->buildUUID));
+    }
+
+    if (MONGO_FAIL_POINT(hangAfterIndexBuildDumpsInsertsFromBulk)) {
+        log() << "Hanging after dumping inserts from bulk builder";
+        MONGO_FAIL_POINT_PAUSE_WHILE_SET(hangAfterIndexBuildDumpsInsertsFromBulk);
+    }
+
+    // Perform the first drain while holding an intent lock.
+    {
+        opCtx->recoveryUnit()->abandonSnapshot();
+        Lock::CollectionLock colLock(opCtx->lockState(), nss.ns(), MODE_IS);
+    }
+
+    if (MONGO_FAIL_POINT(hangAfterIndexBuildFirstDrain)) {
+        log() << "Hanging after index build first drain";
+        MONGO_FAIL_POINT_PAUSE_WHILE_SET(hangAfterIndexBuildFirstDrain);
+    }
+
+    // Perform the second drain while stopping writes on the collection.
+    {
+        opCtx->recoveryUnit()->abandonSnapshot();
+        Lock::CollectionLock colLock(opCtx->lockState(), nss.ns(), MODE_S);
+
+        uassertStatusOK(_indexBuildsManager.drainBackgroundWrites(replState->buildUUID));
+    }
+
+    if (MONGO_FAIL_POINT(hangAfterIndexBuildSecondDrain)) {
+        log() << "Hanging after index build second drain";
+        MONGO_FAIL_POINT_PAUSE_WHILE_SET(hangAfterIndexBuildSecondDrain);
+    }
+
+    relockOnErrorGuard.dismiss();
+
+    // Need to return db lock back to exclusive, to complete the index build.
+    if (_indexBuildsManager.isBackgroundBuilding(replState->buildUUID)) {
+        opCtx->recoveryUnit()->abandonSnapshot();
+        dbLock->relockWithMode(MODE_X);
+
+        auto db = DatabaseHolder::get(opCtx)->getDb(opCtx, nss.db());
+        if (db) {
+            auto& dss = DatabaseShardingState::get(db);
+            auto dssLock = DatabaseShardingState::DSSLock::lock(opCtx, &dss);
+            dss.checkDbVersion(opCtx, dssLock);
+        }
+
+        invariant(db,
+                  str::stream() << "Database not found after relocking. Index build: "
+                                << replState->buildUUID
+                                << ": "
+                                << nss.ns()
+                                << " ("
+                                << replState->collectionUUID
+                                << ")");
+        invariant(db->getCollection(opCtx, nss),
+                  str::stream() << "Collection not found after relocking. Index build: "
+                                << replState->buildUUID
+                                << ": "
+                                << nss.ns()
+                                << " ("
+                                << replState->collectionUUID
+                                << ")");
+    }
+
+    // Perform the third and final drain after releasing a shared lock and reacquiring an
+    // exclusive lock on the database.
+    uassertStatusOK(_indexBuildsManager.drainBackgroundWrites(replState->buildUUID));
+
+    // Index constraint checking phase.
+    uassertStatusOK(_indexBuildsManager.checkIndexConstraintViolations(replState->buildUUID));
+
+    auto collectionUUID = replState->collectionUUID;
+    auto onCommitFn = MultiIndexBlock::kNoopOnCommitFn;
+    auto onCreateEachFn = MultiIndexBlock::kNoopOnCreateEachFn;
+    if (IndexBuildProtocol::kTwoPhase == replState->protocol) {
+        // Two-phase index builds write one oplog entry for all indexes that are completed.
+        onCommitFn = [&] {
+            opCtx->getServiceContext()->getOpObserver()->onCommitIndexBuild(
+                opCtx,
+                nss,
+                collectionUUID,
+                replState->buildUUID,
+                filteredSpecs,
+                false /* fromMigrate */);
+        };
+    } else {
+        // Single-phase index builds write an oplog entry per index being built.
+        onCreateEachFn = [opCtx, &nss, &collectionUUID](const BSONObj& spec) {
+            opCtx->getServiceContext()->getOpObserver()->onCreateIndex(
+                opCtx, nss, collectionUUID, spec, false);
+        };
+    }
+
+    // Commit index build.
+    uassertStatusOK(_indexBuildsManager.commitIndexBuild(
+        opCtx, nss, replState->buildUUID, onCreateEachFn, onCommitFn));
+
+    return;
 }
 
 void IndexBuildsCoordinator::_stopIndexBuildsOnDatabase(StringData dbName) {
@@ -421,6 +713,43 @@ ScopedStopNewCollectionIndexBuilds::ScopedStopNewCollectionIndexBuilds(
 
 ScopedStopNewCollectionIndexBuilds::~ScopedStopNewCollectionIndexBuilds() {
     _indexBuildsCoordinatorPtr->_allowIndexBuildsOnCollection(_collectionUUID);
+}
+
+int IndexBuildsCoordinator::_getNumIndexesTotal(OperationContext* opCtx, Collection* collection) {
+    invariant(collection);
+    const auto& nss = collection->ns();
+    invariant(opCtx->lockState()->isLocked(),
+              str::stream() << "Unable to get index count because collection was not locked"
+                            << nss);
+
+    auto indexCatalog = collection->getIndexCatalog();
+    invariant(indexCatalog, str::stream() << "Collection is missing index catalog: " << nss.ns());
+
+    return indexCatalog->numIndexesTotal(opCtx);
+}
+
+std::vector<BSONObj> IndexBuildsCoordinator::_addDefaultsAndFilterExistingIndexes(
+    OperationContext* opCtx,
+    Collection* collection,
+    const NamespaceString& nss,
+    const std::vector<BSONObj>& indexSpecs) {
+    invariant(opCtx->lockState()->isCollectionLockedForMode(nss.ns(), MODE_X));
+    invariant(collection);
+
+    auto specsWithCollationDefaults =
+        uassertStatusOK(collection->addCollationDefaultsToIndexSpecsForCreate(opCtx, indexSpecs));
+
+    auto indexCatalog = collection->getIndexCatalog();
+    auto filteredSpecs = indexCatalog->removeExistingIndexes(
+        opCtx, specsWithCollationDefaults, /*throwOnError=*/true);
+
+    for (const BSONObj& spec : filteredSpecs) {
+        if (spec[kUniqueFieldName].trueValue()) {
+            checkShardKeyRestrictions(opCtx, nss, spec[kKeyFieldName].Obj());
+        }
+    }
+
+    return filteredSpecs;
 }
 
 }  // namespace mongo

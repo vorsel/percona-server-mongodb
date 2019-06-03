@@ -55,7 +55,7 @@ LogicalSessionId parseSessionIdFromCmd(BSONObj cmdObj) {
 }
 
 BSONObj makePostBatchResumeToken(Timestamp clusterTime) {
-    auto pbrt = ResumeToken::makeHighWaterMarkResumeToken(clusterTime).toDocument().toBson();
+    auto pbrt = ResumeToken::makeHighWaterMarkToken(clusterTime, boost::none).toDocument().toBson();
     invariant(pbrt.firstElement().type() == BSONType::String);
     return pbrt;
 }
@@ -1446,7 +1446,7 @@ TEST_F(AsyncResultsMergerTest, SortedTailableCursorNotReadyIfRemoteHasLowerPostB
 
 DEATH_TEST_F(AsyncResultsMergerTest,
              SortedTailableCursorInvariantsIfRemoteHasOplogTimestampButNoPostBatchResumeToken,
-             "Invariant failure !response.getLastOplogTimestamp()") {
+             "Fatal Assertion 51062") {
     AsyncResultsMergerParams params;
     params.setNss(kTestNss);
     UUID uuid = UUID::gen();

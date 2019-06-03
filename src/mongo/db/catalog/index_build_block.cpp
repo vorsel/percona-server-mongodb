@@ -49,11 +49,13 @@ namespace mongo {
 IndexCatalogImpl::IndexBuildBlock::IndexBuildBlock(OperationContext* opCtx,
                                                    Collection* collection,
                                                    IndexCatalogImpl* catalog,
-                                                   const BSONObj& spec)
+                                                   const BSONObj& spec,
+                                                   IndexBuildMethod method)
     : _collection(collection),
       _catalog(catalog),
       _ns(_collection->ns().ns()),
       _spec(spec.getOwned()),
+      _method(method),
       _entry(nullptr),
       _opCtx(opCtx) {
     invariant(collection);
@@ -71,7 +73,8 @@ Status IndexCatalogImpl::IndexBuildBlock::init() {
     _indexName = descriptor->indexName();
     _indexNamespace = descriptor->indexNamespace();
 
-    bool isBackgroundIndex = _spec["background"].trueValue();
+    bool isBackgroundIndex =
+        _method == IndexBuildMethod::kHybrid || _method == IndexBuildMethod::kBackground;
     bool isBackgroundSecondaryBuild = false;
     if (auto replCoord = repl::ReplicationCoordinator::get(_opCtx)) {
         isBackgroundSecondaryBuild =
@@ -80,29 +83,35 @@ Status IndexCatalogImpl::IndexBuildBlock::init() {
     }
 
     // Setup on-disk structures.
+    const auto protocol = IndexBuildProtocol::kTwoPhase;
     Status status = _collection->getCatalogEntry()->prepareForIndexBuild(
-        _opCtx, descriptor.get(), isBackgroundSecondaryBuild);
+        _opCtx, descriptor.get(), protocol, isBackgroundSecondaryBuild);
     if (!status.isOK())
         return status;
 
-    auto* const descriptorPtr = descriptor.get();
     const bool initFromDisk = false;
     const bool isReadyIndex = false;
     _entry = _catalog->_setupInMemoryStructures(
         _opCtx, std::move(descriptor), initFromDisk, isReadyIndex);
 
-    // Hybrid indexes are only enabled for background indexes.
-    bool useHybrid = true;
-    // TODO: Remove when SERVER-37270 is complete.
-    useHybrid = useHybrid && isBackgroundIndex;
-    // TODO: Remove when SERVER-38550 is complete. The mobile storage engine does not suport
-    // dupsAllowed mode on bulk builders.
-    useHybrid = useHybrid && storageGlobalParams.engine != "mobile";
-
-    if (useHybrid) {
+    if (_method == IndexBuildMethod::kHybrid) {
         _indexBuildInterceptor = stdx::make_unique<IndexBuildInterceptor>(_opCtx, _entry);
         _entry->setIndexBuildInterceptor(_indexBuildInterceptor.get());
 
+        const auto sideWritesIdent = _indexBuildInterceptor->getSideWritesTableIdent();
+        // Only unique indexes have a constraint violations table.
+        const auto constraintsIdent = (_entry->descriptor()->unique())
+            ? boost::optional<std::string>(
+                  _indexBuildInterceptor->getConstraintViolationsTableIdent())
+            : boost::none;
+
+        if (IndexBuildProtocol::kTwoPhase == protocol) {
+            _collection->getCatalogEntry()->setIndexBuildScanning(
+                _opCtx, _entry->descriptor()->indexName(), sideWritesIdent, constraintsIdent);
+        }
+    }
+
+    if (isBackgroundIndex) {
         _opCtx->recoveryUnit()->onCommit(
             [ opCtx = _opCtx, entry = _entry, collection = _collection ](
                 boost::optional<Timestamp> commitTime) {
@@ -117,7 +126,7 @@ Status IndexCatalogImpl::IndexBuildBlock::init() {
     // Register this index with the CollectionInfoCache to regenerate the cache. This way, updates
     // occurring while an index is being build in the background will be aware of whether or not
     // they need to modify any indexes.
-    _collection->infoCache()->addedIndex(_opCtx, descriptorPtr);
+    _collection->infoCache()->addedIndex(_opCtx, _entry->descriptor());
 
     return Status::OK();
 }

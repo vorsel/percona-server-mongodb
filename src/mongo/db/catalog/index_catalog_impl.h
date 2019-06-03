@@ -153,9 +153,7 @@ public:
      *
      * Use this method to notify the IndexCatalog that the spec for this index has changed.
      *
-     * It is invalid to dereference 'oldDesc' after calling this method.  This method broadcasts
-     * an invalidateAll() on the cursor manager to notify other users of the IndexCatalog that
-     * this descriptor is now invalid.
+     * It is invalid to dereference 'oldDesc' after calling this method.
      */
     const IndexDescriptor* refreshEntry(OperationContext* opCtx,
                                         const IndexDescriptor* oldDesc) override;
@@ -249,7 +247,8 @@ public:
         IndexBuildBlock(OperationContext* opCtx,
                         Collection* collection,
                         IndexCatalogImpl* catalog,
-                        const BSONObj& spec);
+                        const BSONObj& spec,
+                        IndexBuildMethod method);
 
         ~IndexBuildBlock();
 
@@ -288,6 +287,7 @@ public:
         const std::string _ns;
 
         BSONObj _spec;
+        IndexBuildMethod _method;
 
         std::string _indexName;
         std::string _indexNamespace;
@@ -336,7 +336,7 @@ public:
     }
 
     std::unique_ptr<IndexCatalog::IndexBuildBlockInterface> createIndexBuildBlock(
-        OperationContext* opCtx, const BSONObj& spec) override;
+        OperationContext* opCtx, const BSONObj& spec, IndexBuildMethod method) override;
 
     std::string::size_type getLongestIndexNameLength(OperationContext* opCtx) const override;
 

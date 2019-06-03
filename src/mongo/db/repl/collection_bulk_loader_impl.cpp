@@ -86,7 +86,8 @@ Status CollectionBulkLoaderImpl::init(const std::vector<BSONObj>& secondaryIndex
             auto specs = indexCatalog->removeExistingIndexes(_opCtx.get(), secondaryIndexSpecs);
             if (specs.size()) {
                 _secondaryIndexesBlock->ignoreUniqueConstraint();
-                auto status = _secondaryIndexesBlock->init(specs).getStatus();
+                auto status =
+                    _secondaryIndexesBlock->init(specs, MultiIndexBlock::kNoopOnInitFn).getStatus();
                 if (!status.isOK()) {
                     return status;
                 }
@@ -94,7 +95,8 @@ Status CollectionBulkLoaderImpl::init(const std::vector<BSONObj>& secondaryIndex
                 _secondaryIndexesBlock.reset();
             }
             if (!_idIndexSpec.isEmpty()) {
-                auto status = _idIndexBlock->init(_idIndexSpec).getStatus();
+                auto status =
+                    _idIndexBlock->init(_idIndexSpec, MultiIndexBlock::kNoopOnInitFn).getStatus();
                 if (!status.isOK()) {
                     return status;
                 }
@@ -176,7 +178,8 @@ Status CollectionBulkLoaderImpl::commit() {
             status = writeConflictRetry(
                 _opCtx.get(), "CollectionBulkLoaderImpl::commit", _nss.ns(), [this] {
                     WriteUnitOfWork wunit(_opCtx.get());
-                    auto status = _secondaryIndexesBlock->commit();
+                    auto status = _secondaryIndexesBlock->commit(
+                        MultiIndexBlock::kNoopOnCreateEachFn, MultiIndexBlock::kNoopOnCommitFn);
                     if (!status.isOK()) {
                         return status;
                     }
@@ -189,7 +192,7 @@ Status CollectionBulkLoaderImpl::commit() {
         }
 
         if (_idIndexBlock) {
-            // Delete dups.
+            // Gather RecordIds for uninserted duplicate keys to delete.
             std::set<RecordId> dups;
             // Do not do inside a WriteUnitOfWork (required by dumpInsertsFromBulk).
             auto status = _idIndexBlock->dumpInsertsFromBulk(&dups);
@@ -197,6 +200,25 @@ Status CollectionBulkLoaderImpl::commit() {
                 return status;
             }
 
+            // Commit _id index without duplicate keys even though there may still be documents
+            // with duplicate _ids. These duplicates will be deleted in the following step.
+            status = writeConflictRetry(
+                _opCtx.get(), "CollectionBulkLoaderImpl::commit", _nss.ns(), [this] {
+                    WriteUnitOfWork wunit(_opCtx.get());
+                    auto status = _idIndexBlock->commit(MultiIndexBlock::kNoopOnCreateEachFn,
+                                                        MultiIndexBlock::kNoopOnCommitFn);
+                    if (!status.isOK()) {
+                        return status;
+                    }
+                    wunit.commit();
+                    return Status::OK();
+                });
+            if (!status.isOK()) {
+                return status;
+            }
+
+            // Delete duplicate records after committing the index so these writes are not
+            // intercepted by the still in-progress index builder.
             for (auto&& it : dups) {
                 writeConflictRetry(
                     _opCtx.get(), "CollectionBulkLoaderImpl::commit", _nss.ns(), [this, &it] {
@@ -209,21 +231,6 @@ Status CollectionBulkLoaderImpl::commit() {
                                                                    true /* noWarn */);
                         wunit.commit();
                     });
-            }
-
-            // Commit _id index, without dups.
-            status = writeConflictRetry(
-                _opCtx.get(), "CollectionBulkLoaderImpl::commit", _nss.ns(), [this] {
-                    WriteUnitOfWork wunit(_opCtx.get());
-                    auto status = _idIndexBlock->commit();
-                    if (!status.isOK()) {
-                        return status;
-                    }
-                    wunit.commit();
-                    return Status::OK();
-                });
-            if (!status.isOK()) {
-                return status;
             }
         }
         _stats.endBuildingIndexes = Date_t::now();

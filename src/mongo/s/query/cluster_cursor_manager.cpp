@@ -149,6 +149,11 @@ BSONObj ClusterCursorManager::PinnedCursor::getOriginatingCommand() const {
     return _cursor->getOriginatingCommand();
 }
 
+const PrivilegeVector& ClusterCursorManager::PinnedCursor::getOriginatingPrivileges() const& {
+    invariant(_cursor);
+    return _cursor->getOriginatingPrivileges();
+}
+
 std::size_t ClusterCursorManager::PinnedCursor::getNumRemotes() const {
     invariant(_cursor);
     return _cursor->getNumRemotes();
@@ -435,7 +440,7 @@ void ClusterCursorManager::killOperationUsingCursor(WithLock, CursorEntry* entry
     // Interrupt any operation currently using the cursor.
     OperationContext* opUsingCursor = entry->getOperationUsingCursor();
     stdx::lock_guard<Client> lk(*opUsingCursor->getClient());
-    opUsingCursor->getServiceContext()->killOperation(opUsingCursor, ErrorCodes::CursorKilled);
+    opUsingCursor->getServiceContext()->killOperation(lk, opUsingCursor, ErrorCodes::CursorKilled);
 
     // Don't delete the cursor, as an operation is using it. It will be cleaned up when the
     // operation is done.
@@ -673,9 +678,10 @@ std::pair<Status, int> ClusterCursorManager::killCursorsWithMatchingSessions(
         uassertStatusOK(mgr.killCursor(opCtx, getNamespaceForCursorId(id).get(), id));
     };
 
-    auto visitor = makeKillSessionsCursorManagerVisitor(opCtx, matcher, std::move(eraser));
-    visitor(*this);
-    return std::make_pair(visitor.getStatus(), visitor.getCursorsKilled());
+    auto bySessionCursorKiller = makeKillCursorsBySessionAdaptor(opCtx, matcher, std::move(eraser));
+    bySessionCursorKiller(*this);
+    return std::make_pair(bySessionCursorKiller.getStatus(),
+                          bySessionCursorKiller.getCursorsKilled());
 }
 
 stdx::unordered_set<CursorId> ClusterCursorManager::getCursorsForSession(

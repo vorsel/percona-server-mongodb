@@ -46,6 +46,7 @@ static void *thread_insert(void *);
 static void *thread_get(void *);
 
 #define	BLOOM		false
+#define	MAX_GAP		7.0
 #define	N_RECORDS	10000
 #define	N_INSERT	1000000
 #define	N_INSERT_THREAD	1
@@ -81,6 +82,14 @@ main(int argc, char *argv[])
 	pthread_t get_tid[N_GET_THREAD], insert_tid[N_INSERT_THREAD];
 	int i, nfail;
 	const char *tablename;
+
+	/*
+	 * Bypass this test for valgrind or slow test machines. This
+	 * test is timing sensitive.
+	 */
+	if (testutil_is_flag_set("TESTUTIL_BYPASS_VALGRIND") ||
+	    testutil_is_flag_set("TESTUTIL_SLOW_MACHINE"))
+		return (EXIT_SUCCESS);
 
 	opts = &_opts;
 	sharedopts = &_sharedopts;
@@ -244,7 +253,7 @@ thread_insert(void *arg)
 			else
 				fprintf(stderr, ".");
 			(void)time(&curtime);
-			if ((elapsed = difftime(curtime, prevtime)) > 5.0) {
+			if ((elapsed = difftime(curtime, prevtime)) > MAX_GAP) {
 				testutil_progress(opts, "insert time gap");
 				fprintf(stderr, "\n"
 				    "GAP: %.0f secs after %d inserts\n",
@@ -317,7 +326,7 @@ thread_get(void *arg)
 		testutil_check(session->rollback_transaction(session, NULL));
 
 		(void)time(&curtime);
-		if ((elapsed = difftime(curtime, prevtime)) > 5.0) {
+		if ((elapsed = difftime(curtime, prevtime)) > MAX_GAP) {
 			testutil_progress(opts, "get time gap");
 			fprintf(stderr, "\n"
 			    "GAP: %.0f secs after %d gets\n",

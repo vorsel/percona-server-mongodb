@@ -33,7 +33,7 @@
 
 #include "mongo/embedded/index_builds_coordinator_embedded.h"
 
-#include "mongo/db/catalog_raii.h"
+#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
 #include "mongo/util/log.h"
@@ -43,11 +43,12 @@ namespace mongo {
 
 void IndexBuildsCoordinatorEmbedded::shutdown() {}
 
-StatusWith<SharedSemiFuture<void>> IndexBuildsCoordinatorEmbedded::buildIndex(
-    OperationContext* opCtx,
-    const NamespaceString& nss,
-    const std::vector<BSONObj>& specs,
-    const UUID& buildUUID) {
+StatusWith<SharedSemiFuture<ReplIndexBuildState::IndexCatalogStats>>
+IndexBuildsCoordinatorEmbedded::startIndexBuild(OperationContext* opCtx,
+                                                CollectionUUID collectionUUID,
+                                                const std::vector<BSONObj>& specs,
+                                                const UUID& buildUUID,
+                                                IndexBuildProtocol protocol) {
     std::vector<std::string> indexNames;
     for (auto& spec : specs) {
         std::string name = spec.getStringField(IndexDescriptor::kIndexNameFieldName);
@@ -60,13 +61,10 @@ StatusWith<SharedSemiFuture<void>> IndexBuildsCoordinatorEmbedded::buildIndex(
         indexNames.push_back(name);
     }
 
-    UUID collectionUUID = [&] {
-        AutoGetCollection autoColl(opCtx, nss, MODE_IS);
-        return autoColl.getCollection()->uuid().get();
-    }();
-
-    auto replIndexBuildState =
-        std::make_shared<ReplIndexBuildState>(buildUUID, collectionUUID, indexNames, specs);
+    auto nss = UUIDCatalog::get(opCtx).lookupNSSByUUID(collectionUUID);
+    auto dbName = nss.db().toString();
+    auto replIndexBuildState = std::make_shared<ReplIndexBuildState>(
+        buildUUID, collectionUUID, dbName, indexNames, specs, protocol);
 
     Status status = _registerIndexBuild(opCtx, replIndexBuildState);
     if (!status.isOK()) {
@@ -76,6 +74,12 @@ StatusWith<SharedSemiFuture<void>> IndexBuildsCoordinatorEmbedded::buildIndex(
     _runIndexBuild(opCtx, buildUUID);
 
     return replIndexBuildState->sharedPromise.getFuture();
+}
+
+Status IndexBuildsCoordinatorEmbedded::commitIndexBuild(OperationContext* opCtx,
+                                                        const std::vector<BSONObj>& specs,
+                                                        const UUID& buildUUID) {
+    MONGO_UNREACHABLE;
 }
 
 void IndexBuildsCoordinatorEmbedded::signalChangeToPrimaryMode() {
@@ -97,40 +101,8 @@ Status IndexBuildsCoordinatorEmbedded::voteCommitIndexBuild(const UUID& buildUUI
 
 Status IndexBuildsCoordinatorEmbedded::setCommitQuorum(const NamespaceString& nss,
                                                        const std::vector<StringData>& indexNames,
-                                                       const WriteConcernOptions& newCommitQuorum) {
+                                                       const CommitQuorumOptions& newCommitQuorum) {
     MONGO_UNREACHABLE;
-}
-
-void IndexBuildsCoordinatorEmbedded::_runIndexBuild(OperationContext* opCtx,
-                                                    const UUID& buildUUID) noexcept {
-    auto replState = [&] {
-        stdx::unique_lock<stdx::mutex> lk(_mutex);
-        auto it = _allIndexBuilds.find(buildUUID);
-        invariant(it != _allIndexBuilds.end());
-        return it->second;
-    }();
-
-    {
-        stdx::unique_lock<stdx::mutex> lk(_mutex);
-        while (_sleepForTest) {
-            lk.unlock();
-            sleepmillis(100);
-            lk.lock();
-        }
-    }
-
-    // TODO: create scoped object to create the index builder, then destroy the builder, set the
-    // promises and unregister the build.
-
-    // TODO: implement.
-
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
-
-    _unregisterIndexBuild(lk, opCtx, replState);
-
-    replState->sharedPromise.emplaceValue();
-
-    return;
 }
 
 }  // namespace mongo

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -136,6 +135,13 @@ public:
     bool canAcceptWritesFor_UNSAFE(OperationContext* opCtx, const NamespaceString& ns) override;
 
     virtual Status checkIfWriteConcernCanBeSatisfied(const WriteConcernOptions& writeConcern) const;
+
+    virtual Status checkIfCommitQuorumCanBeSatisfied(
+        const CommitQuorumOptions& commitQuorum) const override;
+
+    virtual StatusWith<bool> checkIfCommitQuorumIsSatisfied(
+        const CommitQuorumOptions& commitQuorum,
+        const std::vector<HostAndPort>& commitReadyMembers) const override;
 
     virtual Status checkCanServeReadsFor(OperationContext* opCtx,
                                          const NamespaceString& ns,
@@ -305,6 +311,8 @@ public:
 
     virtual bool setContainsArbiter() const override;
 
+    virtual void attemptToAdvanceStableTimestamp() override;
+
     // ================== Test support API ===================
 
     /**
@@ -356,11 +364,10 @@ public:
     /**
      * Simple test wrappers that expose private methods.
      */
-    boost::optional<OpTime> calculateStableOpTime_forTest(const std::set<OpTime>& candidates,
-                                                          const OpTime& maximumStableOpTime);
+    boost::optional<OpTime> chooseStableOpTimeFromCandidates_forTest(
+        const std::set<OpTime>& candidates, const OpTime& maximumStableOpTime);
     void cleanupStableOpTimeCandidates_forTest(std::set<OpTime>* candidates, OpTime stableOpTime);
     std::set<OpTime> getStableOpTimeCandidates_forTest();
-    boost::optional<OpTime> getStableOpTime_forTest();
 
     /**
      * Non-blocking version of updateTerm.
@@ -439,9 +446,62 @@ private:
      */
     enum PostMemberStateUpdateAction {
         kActionNone,
-        kActionSteppedDownOrRemoved,
+        kActionSteppedDown,
+        kActionRollbackOrRemoved,
         kActionFollowerModeStateChange,
         kActionStartSingleNodeElection
+    };
+
+    // This object handles killing user operations and aborting stashed running
+    // transactions during step down.
+    class KillOpContainer {
+    public:
+        KillOpContainer(ReplicationCoordinatorImpl* repl, OperationContext* opCtx)
+            : _replCord(repl), _stepDownOpCtx(opCtx){};
+
+        /**
+         * It will spawn a new thread killOpThread to kill user operations.
+         */
+        void startKillOpThread();
+
+        /**
+         * On stepdown, we need to kill all write operations and all transactional operations,
+         * so that unprepared and prepared transactions can release or yield their locks.
+         * The required ordering between stepdown steps is:
+         * 1) Enqueue RSTL in X mode.
+         * 2) Kill all write operations and operations with S locks
+         * 3) Abort unprepared transactions.
+         * 4) Repeat step 2) and 3) until the stepdown thread can acquire RSTL.
+         * 5) Yield locks of all prepared transactions.
+         *
+         * Since prepared transactions don't hold RSTL, step 1) to step 3) make sure all
+         * running transactions that may hold RSTL finish, get killed or yield their locks,
+         * so that we can acquire RSTL at step 4). Holding the locks of prepared transactions
+         * until step 5) guarantees if any conflict operations (e.g. DDL operations) failed
+         * to be killed for any reason, we will get a deadlock instead of a silent data corruption.
+         *
+         * Loops continuously to kill all user operations that have global lock except in IS mode.
+         * And, aborts all stashed (inactive) transactions.
+         * Terminates once killSignaled is set true.
+        */
+        void killOpThreadFn();
+
+        /*
+         * Signals killOpThread to stop killing user operations.
+         */
+        void stopAndWaitForKillOpThread();
+
+    private:
+        ReplicationCoordinatorImpl* const _replCord;  // not owned.
+        OperationContext* const _stepDownOpCtx;       // not owned.
+        // Thread that will run killOpThreadFn().
+        std::unique_ptr<stdx::thread> _killOpThread;
+        // Protects killSignaled and stopKillingOps cond. variable.
+        stdx::mutex _mutex;
+        // Signals thread about the change of killSignaled value.
+        stdx::condition_variable _stopKillingOps;
+        // Once this is set to true, the killOpThreadFn method will terminate.
+        bool _killSignaled = false;
     };
 
     // Abstract struct that holds information about clients waiting for replication.
@@ -672,6 +732,9 @@ private:
                                            const WriteConcernOptions& writeConcern);
 
     Status _checkIfWriteConcernCanBeSatisfied_inlock(const WriteConcernOptions& writeConcern) const;
+
+    Status _checkIfCommitQuorumCanBeSatisfied(WithLock,
+                                              const CommitQuorumOptions& commitQuorum) const;
 
     bool _canAcceptWritesFor_inlock(const NamespaceString& ns);
 
@@ -924,9 +987,9 @@ private:
     executor::TaskExecutor::EventHandle _stepDownStart();
 
     /**
-     * Kills users operations and aborts unprepared transactions.
+     * kill all user operations that have taken a global lock except in IS mode.
      */
-    void _killOperationsOnStepDown(OperationContext* opCtx);
+    void _killUserOperationsOnStepDown(const OperationContext* stepDownOpCtx);
 
     /**
      * Completes a step-down of the current node.  Must be run with a global
@@ -1026,16 +1089,18 @@ private:
      * A helper method that returns the current stable optime based on the current commit point and
      * set of stable optime candidates.
      */
-    boost::optional<OpTime> _getStableOpTime(WithLock lk);
+    boost::optional<OpTime> _recalculateStableOpTime(WithLock lk);
 
     /**
      * Calculates the 'stable' replication optime given a set of optime candidates and a maximum
      * stable optime. The stable optime is the greatest optime in 'candidates' that is also less
-     * than or equal to 'maximumStableOpTime'.
+     * than or equal to 'maximumStableOpTime' and other criteria.
+     *
+     * Returns boost::none if there is no satisfactory candidate.
      */
-    boost::optional<OpTime> _calculateStableOpTime(WithLock lk,
-                                                   const std::set<OpTime>& candidates,
-                                                   OpTime maximumStableOpTime);
+    boost::optional<OpTime> _chooseStableOpTimeFromCandidates(WithLock lk,
+                                                              const std::set<OpTime>& candidates,
+                                                              OpTime maximumStableOpTime);
 
     /**
      * Removes any optimes from the optime set 'candidates' that are less than
@@ -1044,9 +1109,9 @@ private:
     void _cleanupStableOpTimeCandidates(std::set<OpTime>* candidates, OpTime stableOpTime);
 
     /**
-     * Calculates and sets the value of the 'stable' replication optime for the storage engine.
-     * See ReplicationCoordinatorImpl::_calculateStableOpTime for a definition of 'stable', in
-     * this context.
+     * Calculates and sets the value of the 'stable' replication optime for the storage engine.  See
+     * ReplicationCoordinatorImpl::_chooseStableOpTimeFromCandidates for a definition of 'stable',
+     * in this context.
      */
     void _setStableTimestampForStorage(WithLock lk);
 

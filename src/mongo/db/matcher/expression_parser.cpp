@@ -68,7 +68,7 @@
 #include "mongo/db/matcher/schema/expression_internal_schema_xor.h"
 #include "mongo/db/matcher/schema/json_schema_parser.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/query/query_knobs.h"
+#include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/string_map.h"
@@ -1370,12 +1370,6 @@ StatusWithMatchExpression parseNot(StringData name,
         name, notObject, theAnd.get(), expCtx, extensionsCallback, allowedFeatures, currentLevel);
     if (!parseStatus.isOK()) {
         return parseStatus;
-    }
-
-    for (size_t i = 0; i < theAnd->numChildren(); i++) {
-        if (theAnd->getChild(i)->matchType() == MatchExpression::REGEX) {
-            return {ErrorCodes::BadValue, "$not cannot have a regex"};
-        }
     }
 
     return {stdx::make_unique<NotMatchExpression>(theAnd.release())};

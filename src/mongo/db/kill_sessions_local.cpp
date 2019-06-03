@@ -84,25 +84,28 @@ void killSessionsAction(
 
 }  // namespace
 
-void killSessionsLocalKillTransactions(OperationContext* opCtx,
-                                       const SessionKiller::Matcher& matcher,
-                                       ErrorCodes::Error reason) {
-    killSessionsAction(opCtx,
-                       matcher,
-                       [](const ObservableSession&) { return true; },
-                       [](OperationContext* opCtx, const SessionToKill& session) {
-                           TransactionParticipant::get(session.get())->abortArbitraryTransaction();
-                       },
-                       reason);
+void killSessionsAbortUnpreparedTransactions(OperationContext* opCtx,
+                                             const SessionKiller::Matcher& matcher,
+                                             ErrorCodes::Error reason) {
+    killSessionsAction(
+        opCtx,
+        matcher,
+        [](const ObservableSession& session) {
+            return !TransactionParticipant::get(session.get())->transactionIsPrepared();
+        },
+        [](OperationContext* opCtx, const SessionToKill& session) {
+            TransactionParticipant::get(session.get())->abortArbitraryTransaction();
+        },
+        reason);
 }
 
 SessionKiller::Result killSessionsLocal(OperationContext* opCtx,
                                         const SessionKiller::Matcher& matcher,
                                         SessionKiller::UniformRandomBitGenerator* urbg) {
-    killSessionsLocalKillTransactions(opCtx, matcher);
+    killSessionsAbortUnpreparedTransactions(opCtx, matcher);
     uassertStatusOK(killSessionsLocalKillOps(opCtx, matcher));
 
-    auto res = CursorManager::killCursorsWithMatchingSessions(opCtx, matcher);
+    auto res = CursorManager::get(opCtx)->killCursorsWithMatchingSessions(opCtx, matcher);
     uassertStatusOK(res.first);
 
     return {std::vector<HostAndPort>{}};
@@ -172,6 +175,38 @@ void killSessionsAbortAllPreparedTransactions(OperationContext* opCtx) {
             // Abort the prepared transaction and invalidate the session it is
             // associated with.
             TransactionParticipant::get(session.get())->abortPreparedTransactionForRollback();
+        });
+}
+
+void yieldLocksForPreparedTransactions(OperationContext* opCtx) {
+    // Create a new opCtx because we need an empty locker to refresh the locks.
+    auto newClient = opCtx->getServiceContext()->makeClient("prepared-txns-yield-locks");
+    AlternativeClientRegion acr(newClient);
+    auto newOpCtx = cc().makeOperationContext();
+
+    // Scan the sessions again to get the list of all sessions with prepared transaction
+    // to yield their locks.
+    SessionKiller::Matcher matcherAllSessions(
+        KillAllSessionsByPatternSet{makeKillAllSessionsByPattern(newOpCtx.get())});
+    killSessionsAction(
+        newOpCtx.get(),
+        matcherAllSessions,
+        [](const ObservableSession& session) {
+            return TransactionParticipant::get(session.get())->transactionIsPrepared();
+        },
+        [](OperationContext* killerOpCtx, const SessionToKill& session) {
+            auto const txnParticipant = TransactionParticipant::get(session.get());
+            // Yield locks for prepared transactions.
+            // When scanning and killing operations, all prepared transactions are included in the
+            // list. Even though new sessions may be created after the scan, none of them can become
+            // prepared during stepdown, since the RSTL has been enqueued, preventing any new
+            // writes.
+            if (txnParticipant->transactionIsPrepared()) {
+                LOG(3) << "Yielding locks of prepared transaction. SessionId: "
+                       << session.getSessionId().getId()
+                       << " TxnNumber: " << txnParticipant->getActiveTxnNumber();
+                txnParticipant->refreshLocksForPreparedTransaction(killerOpCtx, true);
+            }
         });
 }
 

@@ -34,7 +34,11 @@
     for (let i = 0; i < TestData.loadErrors.length; ++i) {
         const error = TestData.loadErrors[i];
         assert.eq("error loading js file: jstests/noPassthrough/shell_load_file.js", error.message);
-        assert(error.stack === "",
-               () => "JavaScript stacktrace from load() wasn't empty: " + error.stack);
+        assert(
+            /@jstests\/noPassthrough\/shell_load_file.js:/.test(error.stack) ||
+                /@jstests\\noPassthrough\\shell_load_file.js:/.test(error.stack),
+            () =>
+                "JavaScript stacktrace from load() didn't include file paths (AKA stack frames): " +
+                error.stack);
     }
 })();

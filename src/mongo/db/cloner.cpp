@@ -63,7 +63,6 @@
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_options.h"
-#include "mongo/s/grid.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
@@ -403,7 +402,6 @@ void Cloner::copyIndexes(OperationContext* opCtx,
     // matches. It also wouldn't work on non-empty collections so we would need both
     // implementations anyway as long as that is supported.
     MultiIndexBlock indexer(opCtx, collection);
-    indexer.allowInterruption();
 
     auto indexCatalog = collection->getIndexCatalog();
     auto prunedIndexesToBuild = indexCatalog->removeExistingIndexes(opCtx, indexesToBuild);
@@ -411,11 +409,13 @@ void Cloner::copyIndexes(OperationContext* opCtx,
         return;
     }
 
-    auto indexInfoObjs = uassertStatusOK(indexer.init(prunedIndexesToBuild));
+    auto indexInfoObjs =
+        uassertStatusOK(indexer.init(prunedIndexesToBuild, MultiIndexBlock::kNoopOnInitFn));
     uassertStatusOK(indexer.insertAllDocumentsInCollection());
 
     WriteUnitOfWork wunit(opCtx);
-    uassertStatusOK(indexer.commit());
+    uassertStatusOK(
+        indexer.commit(MultiIndexBlock::kNoopOnCreateEachFn, MultiIndexBlock::kNoopOnCommitFn));
     if (opCtx->writesAreReplicated()) {
         for (auto&& infoObj : indexInfoObjs) {
             getGlobalServiceContext()->getOpObserver()->onCreateIndex(

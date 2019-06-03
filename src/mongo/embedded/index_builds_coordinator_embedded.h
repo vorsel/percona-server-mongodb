@@ -56,24 +56,26 @@ public:
      */
     void shutdown() override;
 
-    StatusWith<SharedSemiFuture<void>> buildIndex(OperationContext* opCtx,
-                                                  const NamespaceString& nss,
-                                                  const std::vector<BSONObj>& specs,
-                                                  const UUID& buildUUID) override;
+    StatusWith<SharedSemiFuture<ReplIndexBuildState::IndexCatalogStats>> startIndexBuild(
+        OperationContext* opCtx,
+        CollectionUUID collectionUUID,
+        const std::vector<BSONObj>& specs,
+        const UUID& buildUUID,
+        IndexBuildProtocol protocol) override;
 
     /**
      * None of the following functions should ever be called on an embedded server node.
      */
+    Status commitIndexBuild(OperationContext* opCtx,
+                            const std::vector<BSONObj>& specs,
+                            const UUID& buildUUID) override;
     void signalChangeToPrimaryMode() override;
     void signalChangeToSecondaryMode() override;
     void signalChangeToInitialSyncMode() override;
     Status voteCommitIndexBuild(const UUID& buildUUID, const HostAndPort& hostAndPort) override;
     Status setCommitQuorum(const NamespaceString& nss,
                            const std::vector<StringData>& indexNames,
-                           const WriteConcernOptions& newCommitQuorum) override;
-
-private:
-    void _runIndexBuild(OperationContext* opCtx, const UUID& buildUUID) noexcept override;
+                           const CommitQuorumOptions& newCommitQuorum) override;
 };
 
 }  // namespace mongo

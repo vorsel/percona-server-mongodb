@@ -47,7 +47,7 @@
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
-#include "mongo/db/query/query_knobs.h"
+#include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/service_context.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/mongoutils/str.h"
@@ -326,7 +326,7 @@ StatusWith<BSONObj> validateIndexSpec(
                                       << "' ("
                                       << ns
                                       << ") doesn't match the namespace '"
-                                      << expectedNamespace.ns()
+                                      << expectedNamespace
                                       << "'"};
             }
 

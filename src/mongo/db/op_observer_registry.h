@@ -68,6 +68,42 @@ public:
             o->onCreateIndex(opCtx, nss, uuid, indexDoc, fromMigrate);
     }
 
+    virtual void onStartIndexBuild(OperationContext* opCtx,
+                                   const NamespaceString& nss,
+                                   CollectionUUID collUUID,
+                                   const UUID& indexBuildUUID,
+                                   const std::vector<BSONObj>& indexes,
+                                   bool fromMigrate) override {
+        ReservedTimes times{opCtx};
+        for (auto& o : _observers) {
+            o->onStartIndexBuild(opCtx, nss, collUUID, indexBuildUUID, indexes, fromMigrate);
+        }
+    }
+
+    virtual void onCommitIndexBuild(OperationContext* opCtx,
+                                    const NamespaceString& nss,
+                                    CollectionUUID collUUID,
+                                    const UUID& indexBuildUUID,
+                                    const std::vector<BSONObj>& indexes,
+                                    bool fromMigrate) override {
+        ReservedTimes times{opCtx};
+        for (auto& o : _observers) {
+            o->onCommitIndexBuild(opCtx, nss, collUUID, indexBuildUUID, indexes, fromMigrate);
+        }
+    }
+
+    virtual void onAbortIndexBuild(OperationContext* opCtx,
+                                   const NamespaceString& nss,
+                                   CollectionUUID collUUID,
+                                   const UUID& indexBuildUUID,
+                                   const std::vector<BSONObj>& indexes,
+                                   bool fromMigrate) override {
+        ReservedTimes times{opCtx};
+        for (auto& o : _observers) {
+            o->onAbortIndexBuild(opCtx, nss, collUUID, indexBuildUUID, indexes, fromMigrate);
+        }
+    }
+
     void onInserts(OperationContext* const opCtx,
                    const NamespaceString& nss,
                    OptionalCollectionUUID uuid,
@@ -225,16 +261,19 @@ public:
 
     void onTransactionCommit(OperationContext* opCtx,
                              boost::optional<OplogSlot> commitOplogEntryOpTime,
-                             boost::optional<Timestamp> commitTimestamp) override {
+                             boost::optional<Timestamp> commitTimestamp,
+                             std::vector<repl::ReplOperation>& statements) override {
         ReservedTimes times{opCtx};
         for (auto& o : _observers)
-            o->onTransactionCommit(opCtx, commitOplogEntryOpTime, commitTimestamp);
+            o->onTransactionCommit(opCtx, commitOplogEntryOpTime, commitTimestamp, statements);
     }
 
-    void onTransactionPrepare(OperationContext* opCtx, const OplogSlot& prepareOpTime) override {
+    void onTransactionPrepare(OperationContext* opCtx,
+                              const OplogSlot& prepareOpTime,
+                              std::vector<repl::ReplOperation>& statements) override {
         ReservedTimes times{opCtx};
         for (auto& observer : _observers) {
-            observer->onTransactionPrepare(opCtx, prepareOpTime);
+            observer->onTransactionPrepare(opCtx, prepareOpTime, statements);
         }
     }
 
