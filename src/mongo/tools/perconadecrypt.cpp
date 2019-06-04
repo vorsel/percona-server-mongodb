@@ -39,6 +39,8 @@ Copyright (C) 2019-present Percona and/or its affiliates. All rights reserved.
 
 #include "mongo/base/init.h"
 #include "mongo/base/initializer.h"
+#include "mongo/db/encryption/encryption_options.h"
+#include "mongo/db/encryption/encryption_vault.h"
 #include "mongo/tools/perconadecrypt_options.h"
 #include "mongo/util/base64.h"
 #include "mongo/util/exit_code.h"
@@ -217,18 +219,35 @@ int decryptMain(int argc, char** argv, char** envp) {
     runGlobalInitializersOrDie(argc, argv, envp);
 
     try{
-        std::cout << "Loading encryption key from: " << perconaDecryptGlobalParams.keyPath << std::endl;
-        if (!boost::filesystem::exists(perconaDecryptGlobalParams.keyPath)) {
-            throw std::runtime_error(std::string("specified encryption key file doesn't exist: ")
-                                                 + perconaDecryptGlobalParams.keyPath);
-        }
-        std::ifstream f{perconaDecryptGlobalParams.keyPath};
-        if (!f.is_open()) {
-            throw std::runtime_error(std::string("cannot open specified encryption key file: ")
-                                                 + perconaDecryptGlobalParams.keyPath);
-        }
         std::string encoded_key;
-        f >> encoded_key;
+        if (!encryptionGlobalParams.vaultServerName.empty()) {
+            if (encryptionGlobalParams.vaultToken.empty()) {
+                if (!boost::filesystem::exists(encryptionGlobalParams.vaultTokenFile)) {
+                    throw std::runtime_error(std::string("specified Vault tokne file doesn't exist: ")
+                                                         + encryptionGlobalParams.vaultTokenFile);
+                }
+                std::ifstream f{encryptionGlobalParams.vaultTokenFile};
+                if (!f.is_open()) {
+                    throw std::runtime_error(std::string("cannot open specified Vault token file: ")
+                                                         + encryptionGlobalParams.vaultTokenFile);
+                }
+                f >> encryptionGlobalParams.vaultToken;
+            }
+            std::cout << "Loading encryption key from the Vault server" << std::endl;
+            encoded_key = vaultReadKey();
+        } else {
+            std::cout << "Loading encryption key from: " << encryptionGlobalParams.encryptionKeyFile << std::endl;
+            if (!boost::filesystem::exists(encryptionGlobalParams.encryptionKeyFile)) {
+                throw std::runtime_error(std::string("specified encryption key file doesn't exist: ")
+                                                     + encryptionGlobalParams.encryptionKeyFile);
+            }
+            std::ifstream f{encryptionGlobalParams.encryptionKeyFile};
+            if (!f.is_open()) {
+                throw std::runtime_error(std::string("cannot open specified encryption key file: ")
+                                                     + encryptionGlobalParams.encryptionKeyFile);
+            }
+            f >> encoded_key;
+        }
         auto key = base64::decode(encoded_key);
         if (key.length() != _key_len) {
             throw std::runtime_error(str::stream() << "encryption key length should be " << _key_len << " bytes");
@@ -263,10 +282,10 @@ int decryptMain(int argc, char** argv, char** envp) {
                                                  + perconaDecryptGlobalParams.inputPath);
         }
 
-        std::cout << "Executing decryption with cipher mode: " << perconaDecryptGlobalParams.cipherMode << std::endl;
-        if (perconaDecryptGlobalParams.cipherMode == "AES256-CBC")
+        std::cout << "Executing decryption with cipher mode: " << encryptionGlobalParams.encryptionCipherMode << std::endl;
+        if (encryptionGlobalParams.encryptionCipherMode == "AES256-CBC")
             ret = decryptCBC(fsize, src, dst);
-        else if ((perconaDecryptGlobalParams.cipherMode == "AES256-GCM"))
+        else if ((encryptionGlobalParams.encryptionCipherMode == "AES256-GCM"))
             ret = decryptGCM(fsize, src, dst);
 
         if (ret)
