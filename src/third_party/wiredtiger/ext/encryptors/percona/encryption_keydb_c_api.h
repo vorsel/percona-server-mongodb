@@ -41,6 +41,10 @@ int get_iv_gcm(uint8_t *buf, int len);
 int get_key_by_id(const char *keyid, size_t len, unsigned char *key, void *pe);
 int percona_encryption_extension_drop_keyid(void *vp);
 
+void rotation_store_pseudo_bytes(uint8_t *buf, int len);
+int rotation_get_iv_gcm(uint8_t *buf, int len);
+int rotation_get_key_by_id(const char *keyid, size_t len, unsigned char *key, void *pe);
+
 #ifdef __cplusplus
 }
 #endif

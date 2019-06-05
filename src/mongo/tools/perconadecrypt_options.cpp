@@ -33,6 +33,7 @@ Copyright (C) 2019-present Percona and/or its affiliates. All rights reserved.
 
 #include <iostream>
 
+#include "mongo/db/encryption/encryption_options.h"
 #include "mongo/util/options_parser/startup_options.h"
 
 namespace mongo {
@@ -42,22 +43,73 @@ PerconaDecryptGlobalParams perconaDecryptGlobalParams;
 Status addPerconaDecryptOptions(moe::OptionSection* options) {
     options->addOptionChaining("help", "help", moe::Switch, "show this usage information");
 
+    options->addOptionChaining("inputPath", "inputPath", moe::String, "encrypted file to decrypt");
+
+    options->addOptionChaining("outputPath", "outputPath", moe::String, "where to store decrypted result");
+
     options->addOptionChaining("encryptionKeyFile", "encryptionKeyFile", moe::String, "the path to encryption key file");
 
     options->addOptionChaining("encryptionCipherMode", "encryptionCipherMode", moe::String, "the cipher mode to use for decryption (AES256-CBC/AES256-GCM)")
         .format("(:?AES256-CBC)|(:?AES256-GCM)", "(AES256-CBC/AES256-GCM)");
 
-    options->addOptionChaining("inputPath", "inputPath", moe::String, "encrypted file to decrypt");
+    options->addOptionChaining(
+            "vaultServerName",
+            "vaultServerName",
+            moe::String,
+            "hostname or IP address of the Vault server")
+        .requires("vaultPort")
+        .requires("vaultTokenFile")
+        .requires("vaultSecret")
+        .incompatibleWith("encryptionKeyFile");
 
-    options->addOptionChaining("outputPath", "outputPath", moe::String, "where to store decrypted result");
+    options->addOptionChaining(
+            "vaultPort",
+            "vaultPort",
+            moe::Int,
+            "port name the Vault server is listening on")
+        .requires("vaultServerName")
+        .validRange(0, 65535);
+
+    options->addOptionChaining(
+            "vaultTokenFile",
+            "vaultTokenFile",
+            moe::String,
+            "the path to file with Vault server's access token")
+        .requires("vaultServerName");
+
+    options->addOptionChaining(
+            "vaultSecret",
+            "vaultSecret",
+            moe::String,
+            "the name of the Vault secret where the master key is stored")
+        .requires("vaultServerName");
+
+    options->addOptionChaining(
+            "vaultServerCAFile",
+            "vaultServerCAFile",
+            moe::String,
+            "CA certificate that was used to sign Vault’s certificates "
+            "- should be used when the Vault’s CA certificate is not trusted "
+            "by the machine that is going to connect to the Vault server")
+        .requires("vaultServerName");
+
+    options->addOptionChaining(
+            "vaultDisableTLSForTesting",
+            "vaultDisableTLSForTesting",
+            moe::Switch,
+            "disable using TLS for Vault server connections "
+            "- is suitable for connecting Vault server in -dev mode or "
+            "Vault server with TLS disabled. Should not be used in production")
+        .requires("vaultServerName");
 
     return Status::OK();
 }
 
 void printPerconaDecryptHelp(std::ostream* out) {
-    *out << "Usage: perconadecrypt [options] --encryptionKeyFile <key path> --inputPath <src> --outputPath <dest>"
-            " [ --help ]"
-         << std::endl;
+    *out << "Usage:" << std::endl
+         << "    perconadecrypt [options] --inputPath <src> --outputPath <dest> --encryptionKeyFile <key path>" << std::endl
+         << "    perconadecrypt [options] --inputPath <src> --outputPath <dest> --vaultServerName <server name> [other Vault options]" << std::endl
+         << "    perconadecrypt --help" << std::endl;
     *out << moe::startupOptions.helpString();
     *out << std::flush;
 }
@@ -72,13 +124,41 @@ bool handlePreValidationPerconaDecryptOptions(const moe::Environment& params) {
 
 Status storePerconaDecryptOptions(const moe::Environment& params,
                                const std::vector<std::string>& args) {
-    if (!params.count("encryptionKeyFile")) {
-        return {ErrorCodes::BadValue, "Missing required option: --encryptionKeyFile"};
+    if (!params.count("encryptionKeyFile") && !params.count("vaultServerName")) {
+        return {ErrorCodes::BadValue, "Missing required option: one of --encryptionKeyFile and --vaultServerName must be specified"};
     }
-    perconaDecryptGlobalParams.keyPath = params["encryptionKeyFile"].as<std::string>();
+
+    if (params.count("encryptionKeyFile")) {
+        encryptionGlobalParams.encryptionKeyFile = params["encryptionKeyFile"].as<std::string>();
+    }
+
+    if (params.count("vaultServerName")) {
+        encryptionGlobalParams.vaultServerName = params["vaultServerName"].as<std::string>();
+    }
+
+    if (params.count("vaultPort")) {
+        encryptionGlobalParams.vaultPort = params["vaultPort"].as<int>();
+    }
+
+    if (params.count("vaultTokenFile")) {
+        encryptionGlobalParams.vaultTokenFile = params["vaultTokenFile"].as<std::string>();
+    }
+
+    if (params.count("vaultSecret")) {
+        encryptionGlobalParams.vaultSecret = params["vaultSecret"].as<std::string>();
+    }
+
+    if (params.count("vaultServerCAFile")) {
+        encryptionGlobalParams.vaultServerCAFile = params["vaultServerCAFile"].as<std::string>();
+    }
+
+    if (params.count("vaultDisableTLSForTesting")) {
+        encryptionGlobalParams.vaultDisableTLS = params["vaultDisableTLSForTesting"].as<bool>();
+    }
+
 
     if (params.count("encryptionCipherMode")) {
-        perconaDecryptGlobalParams.cipherMode = params["encryptionCipherMode"].as<std::string>();
+        encryptionGlobalParams.encryptionCipherMode = params["encryptionCipherMode"].as<std::string>();
     }
 
     if (!params.count("inputPath")) {

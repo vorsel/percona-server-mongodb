@@ -460,6 +460,8 @@ namespace {
 TicketHolder openWriteTransaction(128);
 TicketHolder openReadTransaction(128);
 constexpr auto keydbDir = "key.db";
+constexpr auto rotationDir = "key.db.rotation";
+constexpr auto keydbBackupDir = "key.db.rotated";
 }  // namespace
 
 OpenWriteTransactionParam::OpenWriteTransactionParam(StringData name, ServerParameterType spt)
@@ -624,14 +626,17 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
 
     if (encryptionGlobalParams.enableEncryption) {
         namespace fs = boost::filesystem;
+        bool just_created{false};
         fs::path keyDBPath = path;
         keyDBPath /= keydbDir;
+        auto keyDBPathGuard = makeGuard([&] { if (just_created) fs::remove_all(keyDBPath); });
         if (!fs::exists(keyDBPath)) {
             fs::path betaKeyDBPath = path;
             betaKeyDBPath /= "keydb";
             if (!fs::exists(betaKeyDBPath)) {
                 try {
                     fs::create_directory(keyDBPath);
+                    just_created = true;
                 } catch (std::exception& e) {
                     log() << "error creating KeyDB dir " << keyDBPath.string() << ' ' << e.what();
                     throw;
@@ -668,8 +673,41 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
                 }
             }
         }
-        _encryptionKeyDB = stdx::make_unique<EncryptionKeyDB>(keyDBPath.string());
-        _encryptionKeyDB->init();
+        auto encryptionKeyDB = stdx::make_unique<EncryptionKeyDB>(just_created, keyDBPath.string());
+        encryptionKeyDB->init();
+        keyDBPathGuard.dismiss();
+        // do master key rotation if necessary
+        if (encryptionGlobalParams.vaultRotateMasterKey) {
+            fs::path newKeyDBPath = path;
+            newKeyDBPath /= rotationDir;
+            if (fs::exists(newKeyDBPath)) {
+                std::stringstream ss;
+                ss << "Cannot do master key rotation. ";
+                ss << "Rotation directory '" << newKeyDBPath << "' already exists.";
+                throw std::runtime_error(ss.str());
+            }
+            try {
+                fs::create_directory(newKeyDBPath);
+            } catch (std::exception& e) {
+                log() << "error creating rotation directory " << newKeyDBPath.string() << ' ' << e.what();
+                throw;
+            }
+            auto rotationKeyDB = stdx::make_unique<EncryptionKeyDB>(newKeyDBPath.string(), true);
+            rotationKeyDB->init();
+            rotationKeyDB->clone(encryptionKeyDB.get());
+            // store new key to the Vault
+            rotationKeyDB->store_masterkey();
+            // close key db instances and rename dirs
+            encryptionKeyDB.reset(nullptr);
+            rotationKeyDB.reset(nullptr);
+            fs::path backupKeyDBPath = path;
+            backupKeyDBPath /= keydbBackupDir;
+            fs::remove_all(backupKeyDBPath);
+            fs::rename(keyDBPath, backupKeyDBPath);
+            fs::rename(newKeyDBPath, keyDBPath);
+            throw std::runtime_error("master key rotation finished successfully");
+        }
+        _encryptionKeyDB = std::move(encryptionKeyDB);
         // add Percona encryption extension
         std::stringstream ss;
         ss << "local=(entry=percona_encryption_extension_init,early_load=true,config=(cipher=" << encryptionGlobalParams.encryptionCipherMode << "))";
