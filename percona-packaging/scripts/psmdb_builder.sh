@@ -662,9 +662,7 @@ build_tarball(){
 
     # Finally build Percona Server for MongoDB with SCons
     cd ${PSMDIR_ABS}
-    if [ ${INSTALL} -ne 0 ]; then
-        pip install --user -r buildscripts/requirements.txt
-    fi
+    pip install --user -r buildscripts/requirements.txt
     if [ ${DEBUG} = 0 ]; then
         buildscripts/scons.py CC=${CC} CXX=${CXX} --disable-warnings-as-errors --release --ssl --opt=on -j$NJOBS --use-sasl-client --wiredtiger --audit --inmemory --hotbackup CPPPATH=${INSTALLDIR}/include LIBPATH=${INSTALLDIR}/lib ${PSM_TARGETS}
     else
