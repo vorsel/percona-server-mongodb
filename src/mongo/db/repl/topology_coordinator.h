@@ -249,10 +249,10 @@ public:
     bool updateLastCommittedOpTime();
 
     /**
-     * Updates _lastCommittedOpTime to be "committedOpTime" if it is more recent than the
-     * current last committed OpTime.  Returns true if _lastCommittedOpTime is changed.
+     * Updates _lastCommittedOpTime to min(committedOpTime, lastApplied) if it is more recent than
+     * the current last committed OpTime.  Returns true if _lastCommittedOpTime is changed.
      */
-    bool advanceLastCommittedOpTime(const OpTime& committedOpTime);
+    bool advanceLastCommittedOpTime(OpTime committedOpTime);
 
     /**
      * Resets _lastCommittedOpTime to OpTime(), the default value at startup.
@@ -339,8 +339,9 @@ public:
     StatusWith<BSONObj> prepareReplSetUpdatePositionCommand(
         OpTime currentCommittedSnapshotOpTime) const;
 
-    // produce a reply to an ismaster request.  It is only valid to call this if we are a
-    // replset.
+    // Produce a reply to an ismaster request.  It is only valid to call this if we are a
+    // replset.  Drivers interpret the isMaster fields according to the Server Discovery and
+    // Monitoring Spec, see the "Parsing an isMaster response" section.
     void fillIsMasterForReplSet(IsMasterResponse* response);
 
     // Produce member data for the serverStatus command and diagnostic logging.

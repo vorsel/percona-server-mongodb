@@ -1118,17 +1118,27 @@ var ReplSetTest = function(opts) {
      * of the oplog on *all* secondaries.
      * Returns last oplog entry.
      */
-    this.awaitLastOpCommitted = function() {
+    this.awaitLastOpCommitted = function(members) {
         var rst = this;
         var master = rst.getPrimary();
         var masterOpTime = _getLastOpTime(master);
 
-        print("Waiting for op with OpTime " + tojson(masterOpTime) +
-              " to be committed on all secondaries");
+        let membersToCheck;
+        if (members !== undefined) {
+            print("Waiting for op with OpTime " + tojson(masterOpTime) + " to be committed on " +
+                  members.map(s => s.host));
+
+            membersToCheck = members;
+        } else {
+            print("Waiting for op with OpTime " + tojson(masterOpTime) +
+                  " to be committed on all secondaries");
+
+            membersToCheck = rst.nodes;
+        }
 
         assert.soonNoExcept(function() {
-            for (var i = 0; i < rst.nodes.length; i++) {
-                var node = rst.nodes[i];
+            for (var i = 0; i < membersToCheck.length; i++) {
+                var node = membersToCheck[i];
 
                 // Continue if we're connected to an arbiter
                 var res = assert.commandWorked(node.adminCommand({replSetGetStatus: 1}));
@@ -1150,8 +1160,9 @@ var ReplSetTest = function(opts) {
         return masterOpTime;
     };
 
-    // Wait until the optime of the specified type reaches the primary's last applied optime.
-    this.awaitReplication = function(timeout, secondaryOpTimeType) {
+    // Wait until the optime of the specified type reaches the primary's last applied optime. Blocks
+    // on all secondary nodes or just 'slaves', if specified.
+    this.awaitReplication = function(timeout, secondaryOpTimeType, slaves) {
         timeout = timeout || self.kDefaultTimeoutMS;
         secondaryOpTimeType = secondaryOpTimeType || ReplSetTest.OpTimeType.LAST_APPLIED;
 
@@ -1195,8 +1206,10 @@ var ReplSetTest = function(opts) {
                 print("ReplSetTest awaitReplication: checking secondaries " +
                       "against latest primary optime " + tojson(masterLatestOpTime));
                 var secondaryCount = 0;
-                for (var i = 0; i < self.liveNodes.slaves.length; i++) {
-                    var slave = self.liveNodes.slaves[i];
+
+                var slavesToCheck = slaves || self.liveNodes.slaves;
+                for (var i = 0; i < slavesToCheck.length; i++) {
+                    var slave = slavesToCheck[i];
                     var slaveName = slave.toString().substr(14);  // strip "connection to "
 
                     var slaveConfigVersion =
@@ -1875,7 +1888,17 @@ var ReplSetTest = function(opts) {
 
         // Turn off periodic noop writes for replica sets by default.
         options.setParameter = options.setParameter || {};
+        if (typeof(options.setParameter) === "string") {
+            var eqIdx = options.setParameter.indexOf("=");
+            if (eqIdx != -1) {
+                var param = options.setParameter.substring(0, eqIdx);
+                var value = options.setParameter.substring(eqIdx + 1);
+                options.setParameter = {};
+                options.setParameter[param] = value;
+            }
+        }
         options.setParameter.writePeriodicNoops = options.setParameter.writePeriodicNoops || false;
+
         options.setParameter.numInitialSyncAttempts =
             options.setParameter.numInitialSyncAttempts || 1;
         // We raise the number of initial sync connect attempts for tests that disallow chaining.

@@ -1672,7 +1672,7 @@ Status ReplicationCoordinatorImpl::_awaitReplication_inlock(
         }
     }
 
-    auto clockSource = opCtx->getServiceContext()->getFastClockSource();
+    auto clockSource = opCtx->getServiceContext()->getPreciseClockSource();
     const auto wTimeoutDate = [&]() -> const Date_t {
         if (writeConcern.wDeadline != Date_t::max()) {
             return writeConcern.wDeadline;
@@ -2935,8 +2935,10 @@ void ReplicationCoordinatorImpl::CatchupState::signalHeartbeatUpdate_inlock() {
     }
 
     // We've caught up.
-    if (*targetOpTime <= _repl->_getMyLastAppliedOpTime_inlock()) {
-        log() << "Caught up to the latest optime known via heartbeats after becoming primary.";
+    const auto myLastApplied = _repl->_getMyLastAppliedOpTime_inlock();
+    if (*targetOpTime <= myLastApplied) {
+        log() << "Caught up to the latest optime known via heartbeats after becoming primary. "
+              << "Target optime: " << *targetOpTime << ". My Last Applied: " << myLastApplied;
         abort_inlock();
         return;
     }
@@ -2952,8 +2954,10 @@ void ReplicationCoordinatorImpl::CatchupState::signalHeartbeatUpdate_inlock() {
     }
     auto targetOpTimeCB = [this, targetOpTime]() {
         // Double check the target time since stepdown may signal us too.
-        if (*targetOpTime <= _repl->_getMyLastAppliedOpTime_inlock()) {
-            log() << "Caught up to the latest known optime successfully after becoming primary.";
+        const auto myLastApplied = _repl->_getMyLastAppliedOpTime_inlock();
+        if (*targetOpTime <= myLastApplied) {
+            log() << "Caught up to the latest known optime successfully after becoming primary. "
+                  << "Target optime: " << *targetOpTime << ". My Last Applied: " << myLastApplied;
             abort_inlock();
         }
     };

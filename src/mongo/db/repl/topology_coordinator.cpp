@@ -2217,7 +2217,10 @@ void TopologyCoordinator::fillIsMasterForReplSet(IsMasterResponse* response) {
     }
 
     response->setReplSetVersion(_rsConfig.getConfigVersion());
-    response->setIsMaster(myState.primary());
+    // "ismaster" is false if we are not primary. If we're stepping down, we're waiting for the
+    // Replication State Transition Lock before we can change to secondary, but we should report
+    // "ismaster" false to indicate that we can't accept new writes.
+    response->setIsMaster(myState.primary() && _leaderMode != LeaderMode::kSteppingDown);
     response->setIsSecondary(myState.secondary());
 
     const MemberConfig* curPrimary = _currentPrimaryMember();
@@ -3019,19 +3022,33 @@ bool TopologyCoordinator::updateLastCommittedOpTime() {
     return advanceLastCommittedOpTime(committedOpTime);
 }
 
-bool TopologyCoordinator::advanceLastCommittedOpTime(const OpTime& committedOpTime) {
-    if (committedOpTime == _lastCommittedOpTime) {
-        return false;  // Hasn't changed, so ignore it.
-    } else if (committedOpTime < _lastCommittedOpTime) {
-        LOG(1) << "Ignoring older committed snapshot optime: " << committedOpTime
-               << ", currentCommittedOpTime: " << _lastCommittedOpTime;
-        return false;  // This may have come from an out-of-order heartbeat. Ignore it.
+bool TopologyCoordinator::advanceLastCommittedOpTime(OpTime committedOpTime) {
+    if (_selfIndex == -1) {
+        // The config hasn't been installed or we are not in the config. This could happen
+        // on heartbeats before installing a config.
+        return false;
     }
 
     // This check is performed to ensure primaries do not commit an OpTime from a previous term.
     if (_iAmPrimary() && committedOpTime < _firstOpTimeOfMyTerm) {
         LOG(1) << "Ignoring older committed snapshot from before I became primary, optime: "
                << committedOpTime << ", firstOpTimeOfMyTerm: " << _firstOpTimeOfMyTerm;
+        return false;
+    }
+
+    // Arbiters don't have data so they always advance their commit point via heartbeats.
+    if (!_selfConfig().isArbiter() &&
+        getMyLastAppliedOpTime().getTerm() != committedOpTime.getTerm()) {
+        committedOpTime = std::min(committedOpTime, getMyLastAppliedOpTime());
+    }
+
+    if (committedOpTime == _lastCommittedOpTime) {
+        return false;  // Hasn't changed, so ignore it.
+    }
+
+    if (committedOpTime < _lastCommittedOpTime) {
+        LOG(1) << "Ignoring older committed snapshot optime: " << committedOpTime
+               << ", currentCommittedOpTime: " << _lastCommittedOpTime;
         return false;
     }
 

@@ -196,6 +196,7 @@ functions:
           cat > runtime.yml <<EOF
           # evergreen default expansions
           is_patch: ${is_patch}
+          order: ${revision_order_id}
           task_id: ${task_id}
           task_name: ${task_name}
           execution: ${execution}
@@ -206,6 +207,7 @@ functions:
           revision: ${revision}
           project_dir: ${project_dir}
           branch_name: ${branch_name}
+          project: ${project}
 
           # sys-perf expansions
           # Shouldn't be needed: testList: ${testList}
