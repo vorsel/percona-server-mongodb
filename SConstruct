@@ -1892,7 +1892,8 @@ if env.TargetOSIs('posix'):
     env.Append( LIBS=[] )
 
     #make scons colorgcc friendly
-    for key in ('HOME', 'TERM'):
+    # also use GCC_COLORS from external environment
+    for key in ('HOME', 'TERM', 'GCC_COLORS'):
         try:
             env['ENV'][key] = os.environ[key]
         except KeyError:
