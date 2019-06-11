@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -267,6 +266,23 @@ Status canonicalizeSSLServerOptions(moe::Environment* params) {
         }
 
         ret = params->set("net.tls.mode", moe::Value(std::string("requireTLS")));
+        if (!ret.isOK()) {
+            return ret;
+        }
+    }
+
+    if (params->count("net.ssl.mode")) {
+        auto mode = (*params)["net.ssl.mode"].as<std::string>();
+        auto ret = params->remove("net.ssl.mode");
+        if (!ret.isOK()) {
+            return ret;
+        }
+
+        if (StringData(mode).endsWith("SSL")) {
+            mode.replace(mode.size() - 3, 3, "TLS");
+        }
+
+        ret = params->set("net.tls.mode", moe::Value(mode));
         if (!ret.isOK()) {
             return ret;
         }

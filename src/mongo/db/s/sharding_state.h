@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -104,12 +103,6 @@ public:
      * 'enabled()' above returns true.
      */
     OID clusterId();
-
-    /**
-     * Returns true if this node is a shard and if the currently runnint operation must engage the
-     * sharding subsystem (i.e., perform version checking, orphan filtering, etc).
-     */
-    bool needCollectionMetadata(OperationContext* opCtx, const std::string& ns);
 
     /**
      * For testing only. This is a workaround for the fact that it is not possible to get a clean

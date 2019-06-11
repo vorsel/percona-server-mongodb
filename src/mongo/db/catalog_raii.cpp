@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -35,6 +34,7 @@
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/s/database_sharding_state.h"
+#include "mongo/db/views/view_catalog.h"
 #include "mongo/util/fail_point_service.h"
 
 namespace mongo {
@@ -54,7 +54,6 @@ void uassertLockTimeout(std::string resourceName, LockMode lockMode, bool isLock
 
 AutoGetDb::AutoGetDb(OperationContext* opCtx, StringData dbName, LockMode mode, Date_t deadline)
     : _dbLock(opCtx, dbName, mode, deadline), _db([&] {
-          uassertLockTimeout(str::stream() << "database " << dbName, mode, _dbLock.isLocked());
           auto databaseHolder = DatabaseHolder::get(opCtx);
           return databaseHolder->getDb(opCtx, dbName);
       }()) {
@@ -77,9 +76,6 @@ AutoGetCollection::AutoGetCollection(OperationContext* opCtx,
               deadline),
       _resolvedNss(resolveNamespaceStringOrUUID(opCtx, nsOrUUID)) {
     _collLock.emplace(opCtx->lockState(), _resolvedNss.ns(), modeColl, deadline);
-    uassertLockTimeout(
-        str::stream() << "collection " << nsOrUUID.toString(), modeColl, _collLock->isLocked());
-
     // Wait for a configured amount of time after acquiring locks if the failpoint is enabled
     MONGO_FAIL_POINT_BLOCK(setAutoGetCollectionWait, customWait) {
         const BSONObj& data = customWait.getData();
@@ -136,7 +132,7 @@ AutoGetCollection::AutoGetCollection(OperationContext* opCtx,
         return;
     }
 
-    _view = db->getViewCatalog()->lookup(opCtx, _resolvedNss.ns());
+    _view = ViewCatalog::get(db)->lookup(opCtx, _resolvedNss.ns());
     uassert(ErrorCodes::CommandNotSupportedOnView,
             str::stream() << "Namespace " << _resolvedNss.ns() << " is a view, not a collection",
             !_view || viewMode == kViewsPermitted);

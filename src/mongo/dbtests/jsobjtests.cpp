@@ -1,7 +1,3 @@
-// jsobjtests.cpp - Tests for jsobj.{h,cpp} code
-//
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -29,6 +25,10 @@
  *    delete this exception statement from your version. If you delete this
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
+ */
+
+/**
+ * Tests for jsobj.{h,cpp} code
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
@@ -1853,7 +1853,7 @@ public:
             memcpy(crap, x.objdata(), x.objsize());
             BSONObj y(crap);
             ASSERT_BSONOBJ_EQ(x, y);
-            free(crap);
+            mongoFree(crap);
         }
 
         {
@@ -1869,7 +1869,7 @@ public:
                 state = 2;
                 ASSERT(strstr(e.what(), "_id: 5") != NULL);
             }
-            free(crap);
+            mongoFree(crap);
             ASSERT_EQUALS(2, state);
         }
     }

@@ -1,6 +1,3 @@
-// ephemeral_for_test_record_store.h
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -97,12 +94,6 @@ public:
     virtual Status truncate(OperationContext* opCtx);
 
     virtual void cappedTruncateAfter(OperationContext* opCtx, RecordId end, bool inclusive);
-
-    virtual Status validate(OperationContext* opCtx,
-                            ValidateCmdLevel level,
-                            ValidateAdaptor* adaptor,
-                            ValidateResults* results,
-                            BSONObjBuilder* output);
 
     virtual void appendCustomStats(OperationContext* opCtx,
                                    BSONObjBuilder* result,

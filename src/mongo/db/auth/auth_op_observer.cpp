@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -72,7 +71,7 @@ void AuthOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateEntryArg
 BSONObj AuthOpObserver::getDocumentKey(OperationContext* opCtx,
                                        NamespaceString const& nss,
                                        BSONObj const& doc) {
-    auto metadata = CollectionShardingState::get(opCtx, nss)->getMetadataForOperation(opCtx);
+    const auto metadata = CollectionShardingState::get(opCtx, nss)->getCurrentMetadata();
     return metadata->extractDocumentKey(doc).getOwned();
 }
 

@@ -808,7 +808,16 @@ def _bind_globals(parsed_spec):
         configs = parsed_spec.globals.configs
         if configs:
             ast_global.configs = ast.ConfigGlobal(configs.file_name, configs.line, configs.column)
-            ast_global.configs.initializer_name = configs.initializer_name
+
+            if configs.initializer:
+                init = configs.initializer
+
+                ast_global.configs.initializer = ast.GlobalInitializer(
+                    init.file_name, init.line, init.column)
+                # Parser rule makes it impossible to have both name and register/store.
+                ast_global.configs.initializer.name = init.name
+                ast_global.configs.initializer.register = init.register
+                ast_global.configs.initializer.store = init.store
 
     else:
         ast_global = ast.Global("<implicit>", 0, 0)
@@ -1066,7 +1075,7 @@ def _bind_config_option(ctxt, globals_spec, option):
 
         node.short_name = node.short_name + ',' + option.single_name
 
-    node.description = option.description
+    node.description = _bind_expression(option.description)
     node.arg_vartype = option.arg_vartype
     node.cpp_vartype = option.cpp_vartype
     node.cpp_varname = option.cpp_varname
@@ -1076,6 +1085,7 @@ def _bind_config_option(ctxt, globals_spec, option):
     node.conflicts = option.conflicts
     node.hidden = option.hidden
     node.redact = option.redact
+    node.canonicalize = option.canonicalize
 
     if option.default:
         node.default = _bind_expression(option.default)

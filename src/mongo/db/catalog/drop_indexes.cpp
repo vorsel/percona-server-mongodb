@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -41,10 +40,10 @@
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/index_builder.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/views/view_catalog.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -218,7 +217,7 @@ Status dropIndexes(OperationContext* opCtx,
         Database* db = autoDb.getDb();
         Collection* collection = db ? db->getCollection(opCtx, nss) : nullptr;
         if (!db || !collection) {
-            if (db && db->getViewCatalog()->lookup(opCtx, nss.ns())) {
+            if (db && ViewCatalog::get(db)->lookup(opCtx, nss.ns())) {
                 return Status(ErrorCodes::CommandNotSupportedOnView,
                               str::stream() << "Cannot drop indexes on view " << nss);
             }

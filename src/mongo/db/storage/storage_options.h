@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -78,7 +77,7 @@ struct StorageGlobalParams {
     bool dur;  // --dur durability (now --journal)
 
     // --journalCommitInterval
-    static const int kMaxJournalCommitIntervalMs;
+    static constexpr int kMaxJournalCommitIntervalMs = 500;
     AtomicWord<int> journalCommitIntervalMs;
 
     // --notablescan
@@ -96,7 +95,7 @@ struct StorageGlobalParams {
     // via an fsync operation.
     // Do not set this value on production systems.
     // In almost every situation, you should use the default setting.
-    static const double kMaxSyncdelaySecs;
+    static constexpr double kMaxSyncdelaySecs = 9.0 * 1000.0 * 1000.0;
     AtomicDouble syncdelay;  // seconds between fsyncs
 
     // --queryableBackupMode

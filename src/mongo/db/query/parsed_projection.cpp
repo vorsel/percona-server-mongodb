@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -241,7 +240,7 @@ Status ParsedProjection::make(OperationContext* opCtx,
             }
 
             std::string matchfield = mongoutils::str::before(elem.fieldName(), '.');
-            if (!_hasPositionalOperatorMatch(query, matchfield)) {
+            if (query && !_hasPositionalOperatorMatch(query, matchfield)) {
                 mongoutils::str::stream ss;
                 ss << "Positional projection '" << elem.fieldName() << "' does not "
                    << "match the query document.";

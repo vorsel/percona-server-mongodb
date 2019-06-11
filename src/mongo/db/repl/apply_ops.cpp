@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -35,6 +34,7 @@
 #include "mongo/db/repl/apply_ops.h"
 
 #include "mongo/bson/util/bson_extract.h"
+#include "mongo/db/background.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
@@ -68,6 +68,9 @@ namespace {
 
 // If enabled, causes loop in _applyOps() to hang after applying current operation.
 MONGO_FAIL_POINT_DEFINE(applyOpsPauseBetweenOperations);
+
+// If enabled, causes _applyPrepareTransaction to hang before preparing the transaction participant.
+MONGO_FAIL_POINT_DEFINE(applyOpsHangBeforePreparingTransaction);
 
 /**
  * Return true iff the applyOpsCmd can be executed in a single WriteUnitOfWork.
@@ -215,8 +218,8 @@ Status _applyOps(OperationContext* opCtx,
                         auto entry = uassertStatusOK(OplogEntry::parse(entryObj));
                         if (*opType == 'c') {
                             invariant(opCtx->lockState()->isW());
-                            uassertStatusOK(repl::applyCommand_inlock(
-                                opCtx, opObj, entry, oplogApplicationMode));
+                            uassertStatusOK(applyCommand_inlock(
+                                opCtx, opObj, entry, oplogApplicationMode, boost::none));
                             return Status::OK();
                         }
 
@@ -288,6 +291,18 @@ Status _applyPrepareTransaction(OperationContext* opCtx,
         "applyOps with prepared must only include CRUD operations and cannot have precondition.",
         !info.getPreCondition() && info.areOpsCrudOnly());
 
+    // Block application of prepare oplog entry on secondaries when a concurrent background index
+    // build is running.
+    // This will prevent hybrid index builds from corrupting an index on secondary nodes if a
+    // prepared transaction becomes prepared during a build but commits after the index build
+    // commits.
+    for (const auto& opObj : info.getOperations()) {
+        auto ns = opObj.getField("ns").checkAndGetStringData();
+        if (BackgroundOperation::inProgForNs(ns)) {
+            BackgroundOperation::awaitNoBgOpInProgForNs(ns);
+        }
+    }
+
     // Transaction operations are in its own batch, so we can modify their opCtx.
     invariant(entry.getSessionId());
     invariant(entry.getTxnNumber());
@@ -299,7 +314,7 @@ Status _applyPrepareTransaction(OperationContext* opCtx,
     MongoDOperationContextSessionWithoutRefresh sessionCheckout(opCtx);
 
     auto transaction = TransactionParticipant::get(opCtx);
-    transaction->unstashTransactionResources(opCtx, "prepareTransaction");
+    transaction.unstashTransactionResources(opCtx, "prepareTransaction");
 
     // Apply the operations via applysOps functionality.
     int numApplied = 0;
@@ -316,8 +331,16 @@ Status _applyPrepareTransaction(OperationContext* opCtx,
         return status;
     }
     invariant(!entry.getOpTime().isNull());
-    transaction->prepareTransaction(opCtx, entry.getOpTime());
-    transaction->stashTransactionResources(opCtx);
+
+    if (MONGO_FAIL_POINT(applyOpsHangBeforePreparingTransaction)) {
+        LOG(0) << "Hit applyOpsHangBeforePreparingTransaction failpoint";
+        MONGO_FAIL_POINT_PAUSE_WHILE_SET_OR_INTERRUPTED(opCtx,
+                                                        applyOpsHangBeforePreparingTransaction);
+    }
+
+    transaction.prepareTransaction(opCtx, entry.getOpTime());
+    transaction.stashTransactionResources(opCtx);
+
     return Status::OK();
 }
 

@@ -36,7 +36,6 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/server_parameters',
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/util/options_parser/options_parser',
@@ -61,6 +60,7 @@ env.CppUnitTest(
     target='idl_config_option_test',
     source=[
         'config_option_test.cpp',
+        env.Idlc('config_option_no_init_test.idl')[0],
         env.Idlc('config_option_test.idl')[0],
     ],
     LIBDEPS=[

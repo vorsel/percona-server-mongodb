@@ -15,6 +15,7 @@ if inmemory:
             'inmemory_global_options.cpp',
             'inmemory_init.cpp',
             'inmemory_options_init.cpp',
+            env.Idlc('inmemory_global_options.idl')[0],
             ],
         LIBDEPS=[
             '$BUILD_DIR/mongo/db/storage/wiredtiger/storage_wiredtiger_core',

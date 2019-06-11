@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -44,7 +43,13 @@ class Status;
 // ErrorExtraInfo subclasses:
 //#for $ec in $codes:
 //#if $ec.extra
-class $ec.extra;
+//#if $ec.extra_ns
+namespace $ec.extra_ns {
+    //#end if
+    class $ec.extra_class;
+    //#if $ec.extra_ns
+}  // namespace $ec.extra_ns
+//#end if
 //#end if
 //#end for
 

@@ -247,6 +247,9 @@ struct __wt_page_lookaside {
 	uint64_t unstable_txn;		/* First transaction ID not on page */
 	wt_timestamp_t max_timestamp;	/* Maximum timestamp */
 	wt_timestamp_t unstable_timestamp;/* First timestamp not on page */
+	wt_timestamp_t unstable_durable_timestamp;
+					/* First durable timestamp not on
+					 * page */
 	bool eviction_to_lookaside;	/* Revert to lookaside on eviction */
 	bool has_prepares;		/* One or more updates are prepared */
 	bool skew_newest;		/* Page image has newest versions */
@@ -827,8 +830,9 @@ struct __wt_page {
  */
 struct __wt_page_deleted {
 	volatile uint64_t txnid;		/* Transaction ID */
-	wt_timestamp_t timestamp;
-	wt_timestamp_t durable_timestamp;	/* aligned uint64_t timestamp */
+
+	wt_timestamp_t timestamp;		/* Timestamps */
+	wt_timestamp_t durable_timestamp;
 
 	/*
 	 * The state is used for transaction prepare to manage visibility
@@ -1058,8 +1062,9 @@ struct __wt_ikey {
  */
 struct __wt_update {
 	volatile uint64_t txnid;	/* transaction ID */
-	wt_timestamp_t timestamp;	/* aligned uint64_t timestamp */
-	wt_timestamp_t durable_timestamp;	/* aligned uint64_t timestamp */
+
+	wt_timestamp_t durable_ts;	/* timestamps */
+	wt_timestamp_t start_ts, stop_ts;
 
 	WT_UPDATE *next;		/* forward-linked list */
 
@@ -1082,7 +1087,7 @@ struct __wt_update {
 	 * The update state is used for transaction prepare to manage
 	 * visibility and transitioning update structure state safely.
 	 */
-	volatile uint8_t prepare_state;	/* Prepare state. */
+	volatile uint8_t prepare_state;	/* prepare state */
 
 	/*
 	 * Zero or more bytes of value (the payload) immediately follows the
@@ -1096,7 +1101,7 @@ struct __wt_update {
  * WT_UPDATE_SIZE is the expected structure size excluding the payload data --
  * we verify the build to ensure the compiler hasn't inserted padding.
  */
-#define	WT_UPDATE_SIZE	38
+#define	WT_UPDATE_SIZE	46
 
 /*
  * The memory size of an update: include some padding because this is such a

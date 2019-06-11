@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -174,7 +173,7 @@ public:
      * to propagate)
      */
     template <typename Callback>
-    decltype(auto) runWithoutInterruption(Callback&& cb) {
+    decltype(auto) runWithoutInterruptionExceptAtGlobalShutdown(Callback&& cb) {
         try {
             const auto guard = makeIgnoreInterruptionsGuard();
             return std::forward<Callback>(cb)();

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -40,7 +39,6 @@
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
-#include "mongo/db/index_builder.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
@@ -66,7 +64,7 @@ Status dropCollection(OperationContext* opCtx,
         Database* const db = autoDb.getDb();
         Collection* coll = db ? db->getCollection(opCtx, collectionName) : nullptr;
         auto view =
-            db && !coll ? db->getViewCatalog()->lookup(opCtx, collectionName.ns()) : nullptr;
+            db && !coll ? ViewCatalog::get(db)->lookup(opCtx, collectionName.ns()) : nullptr;
 
         if (MONGO_FAIL_POINT(hangDuringDropCollection)) {
             log() << "hangDuringDropCollection fail point enabled. Blocking until fail point is "

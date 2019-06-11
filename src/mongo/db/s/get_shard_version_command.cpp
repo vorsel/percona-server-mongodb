@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -132,7 +131,7 @@ public:
                     metadata->toBSONBasic(metadataBuilder);
 
                     BSONArrayBuilder chunksArr(metadataBuilder.subarrayStart("chunks"));
-                    metadata->toBSONChunks(chunksArr);
+                    metadata->toBSONChunks(&chunksArr);
                     chunksArr.doneFast();
 
                     BSONArrayBuilder pendingArr(metadataBuilder.subarrayStart("pending"));

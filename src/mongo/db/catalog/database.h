@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -40,7 +39,6 @@
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/optime.h"
-#include "mongo/db/views/view_catalog.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
@@ -154,8 +152,6 @@ public:
      * Sets the 'drop-pending' state of this Database.
      * This is done at the beginning of a dropDatabase operation and is used to reject subsequent
      * collection creation requests on this database.
-     * Throws a UserAssertion if this is called on a Database that is already in a 'drop-pending'
-     * state.
      * The database must be locked in MODE_X when calling this function.
      */
     virtual void setDropPending(OperationContext* opCtx, bool dropPending) = 0;
@@ -204,12 +200,6 @@ public:
     virtual Collection* getCollection(OperationContext* opCtx, const StringData ns) const = 0;
 
     virtual Collection* getCollection(OperationContext* opCtx, const NamespaceString& ns) const = 0;
-
-    /**
-     * Get the view catalog, which holds the definition for all views created on this database. You
-     * must be holding a database lock to use this accessor.
-     */
-    virtual ViewCatalog* getViewCatalog() = 0;
 
     virtual Collection* getOrCreateCollection(OperationContext* const opCtx,
                                               const NamespaceString& nss) = 0;

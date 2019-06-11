@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -107,7 +106,7 @@ public:
 
     virtual void debugString(StringBuilder& debug, int level = 0) const;
 
-    virtual void serialize(BSONObjBuilder* out) const;
+    BSONObj getSerializedRightHandSide() const final;
 
     virtual bool equivalent(const MatchExpression* other) const;
 
@@ -118,6 +117,14 @@ public:
 
     const BSONElement& getData() const {
         return _rhs;
+    }
+
+    /**
+     * Replaces the RHS element of this expression. The caller is responsible for ensuring that the
+     * BSONObj backing 'elem' outlives this MatchExpression.
+     */
+    void setData(BSONElement elem) {
+        _rhs = elem;
     }
 
     const CollatorInterface* getCollator() const {
@@ -283,7 +290,6 @@ public:
 
 class RegexMatchExpression : public LeafMatchExpression {
 public:
-    static constexpr size_t kMaxPatternSize = 32764;
     static const std::set<char> kValidRegexFlags;
 
     RegexMatchExpression(StringData path, const BSONElement& e);
@@ -304,7 +310,7 @@ public:
 
     virtual void debugString(StringBuilder& debug, int level) const;
 
-    virtual void serialize(BSONObjBuilder* out) const;
+    BSONObj getSerializedRightHandSide() const final;
 
     void serializeToBSONTypeRegex(BSONObjBuilder* out) const;
 
@@ -348,7 +354,7 @@ public:
 
     virtual void debugString(StringBuilder& debug, int level) const;
 
-    virtual void serialize(BSONObjBuilder* out) const;
+    BSONObj getSerializedRightHandSide() const final;
 
     virtual bool equivalent(const MatchExpression* other) const;
 
@@ -384,7 +390,7 @@ public:
 
     virtual void debugString(StringBuilder& debug, int level) const;
 
-    virtual void serialize(BSONObjBuilder* out) const;
+    BSONObj getSerializedRightHandSide() const final;
 
     virtual bool equivalent(const MatchExpression* other) const;
 
@@ -407,7 +413,7 @@ public:
 
     virtual void debugString(StringBuilder& debug, int level) const;
 
-    virtual void serialize(BSONObjBuilder* out) const;
+    BSONObj getSerializedRightHandSide() const final;
 
     virtual bool equivalent(const MatchExpression* other) const;
 
@@ -496,7 +502,7 @@ public:
 
     virtual void debugString(StringBuilder& debug, int level) const;
 
-    virtual void serialize(BSONObjBuilder* out) const;
+    BSONObj getSerializedRightHandSide() const final;
 
     virtual bool equivalent(const MatchExpression* other) const;
 

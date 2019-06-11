@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -52,6 +51,7 @@
 #include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/ops/insert.h"
+#include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/collection_sharding_state.h"
@@ -69,6 +69,8 @@ namespace {
 
 constexpr auto kIndexesFieldName = "indexes"_sd;
 constexpr auto kCommandName = "createIndexes"_sd;
+constexpr auto kCommitQuorumFieldName = "commitQuorum"_sd;
+constexpr auto kIgnoreUnknownIndexOptionsName = "ignoreUnknownIndexOptions"_sd;
 constexpr auto kTwoPhaseCommandName = "twoPhaseCreateIndexes"_sd;
 constexpr auto kCreateCollectionAutomaticallyFieldName = "createdCollectionAutomatically"_sd;
 constexpr auto kNumIndexesBeforeFieldName = "numIndexesBefore"_sd;
@@ -86,6 +88,18 @@ StatusWith<std::vector<BSONObj>> parseAndValidateIndexSpecs(
     const BSONObj& cmdObj,
     const ServerGlobalParams::FeatureCompatibility& featureCompatibility) {
     bool hasIndexesField = false;
+
+    bool ignoreUnknownIndexOptions = false;
+    if (cmdObj.hasField(kIgnoreUnknownIndexOptionsName)) {
+        auto ignoreUnknownIndexOptionsElement = cmdObj.getField(kIgnoreUnknownIndexOptionsName);
+        if (ignoreUnknownIndexOptionsElement.type() != BSONType::Bool) {
+            return {ErrorCodes::TypeMismatch,
+                    str::stream() << "The field '" << kIgnoreUnknownIndexOptionsName
+                                  << "' must be a boolean, but got "
+                                  << typeName(ignoreUnknownIndexOptionsElement.type())};
+        }
+        ignoreUnknownIndexOptions = ignoreUnknownIndexOptionsElement.boolean();
+    }
 
     std::vector<BSONObj> indexSpecs;
     for (auto&& cmdElem : cmdObj) {
@@ -107,8 +121,13 @@ StatusWith<std::vector<BSONObj>> parseAndValidateIndexSpecs(
                                           << typeName(indexesElem.type())};
                 }
 
+                BSONObj parsedIndexSpec = indexesElem.Obj();
+                if (ignoreUnknownIndexOptions) {
+                    parsedIndexSpec = index_key_validate::removeUnknownFields(parsedIndexSpec);
+                }
+
                 auto indexSpecStatus = index_key_validate::validateIndexSpec(
-                    opCtx, indexesElem.Obj(), ns, featureCompatibility);
+                    opCtx, parsedIndexSpec, ns, featureCompatibility);
                 if (!indexSpecStatus.isOK()) {
                     return indexSpecStatus.getStatus();
                 }
@@ -136,7 +155,9 @@ StatusWith<std::vector<BSONObj>> parseAndValidateIndexSpecs(
             }
 
             hasIndexesField = true;
-        } else if (kCommandName == cmdElemFieldName || kTwoPhaseCommandName == cmdElemFieldName ||
+        } else if (kCommandName == cmdElemFieldName || kCommitQuorumFieldName == cmdElemFieldName ||
+                   kTwoPhaseCommandName == cmdElemFieldName ||
+                   kIgnoreUnknownIndexOptionsName == cmdElemFieldName ||
                    isGenericArgument(cmdElemFieldName)) {
             continue;
         } else {
@@ -162,6 +183,25 @@ StatusWith<std::vector<BSONObj>> parseAndValidateIndexSpecs(
 }
 
 /**
+ * Retrieves the commit quorum from 'cmdObj' if it is present. If it isn't, we provide a default
+ * commit quorum, which consists of all the data-bearing nodes.
+ */
+boost::optional<CommitQuorumOptions> parseAndGetCommitQuorum(OperationContext* opCtx,
+                                                             const BSONObj& cmdObj) {
+    if (cmdObj.hasField(kCommitQuorumFieldName)) {
+        CommitQuorumOptions commitQuorum;
+        uassertStatusOK(commitQuorum.parse(cmdObj.getField(kCommitQuorumFieldName)));
+        return commitQuorum;
+    } else {
+        // Retrieve the default commit quorum if one wasn't passed in, which consists of all
+        // data-bearing nodes.
+        auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+        int numDataBearingMembers = replCoord->getConfig().getNumDataBearingMembers();
+        return CommitQuorumOptions(numDataBearingMembers);
+    }
+}
+
+/**
  * Returns a vector of index specs with the filled in collection default options and removes any
  * indexes that already exist on the collection. If the returned vector is empty after returning, no
  * new indexes need to be built. Throws on error.
@@ -179,7 +219,7 @@ std::vector<BSONObj> resolveDefaultsAndRemoveExistingIndexes(OperationContext* o
 void checkUniqueIndexConstraints(OperationContext* opCtx,
                                  const NamespaceString& nss,
                                  const BSONObj& newIdxKey) {
-    invariant(opCtx->lockState()->isCollectionLockedForMode(nss.ns(), MODE_X));
+    invariant(opCtx->lockState()->isCollectionLockedForMode(nss, MODE_X));
 
     const auto metadata = CollectionShardingState::get(opCtx, nss)->getCurrentMetadata();
     if (!metadata->isSharded())
@@ -264,7 +304,7 @@ bool runCreateIndexes(OperationContext* opCtx,
     if (collection) {
         result.appendBool("createdCollectionAutomatically", false);
     } else {
-        if (db->getViewCatalog()->lookup(opCtx, ns.ns())) {
+        if (ViewCatalog::get(db)->lookup(opCtx, ns.ns())) {
             errmsg = "Cannot create indexes on a view";
             uasserted(ErrorCodes::CommandNotSupportedOnView, errmsg);
         }
@@ -289,7 +329,7 @@ bool runCreateIndexes(OperationContext* opCtx,
                          AutoStatsTracker::LogMode::kUpdateTopAndCurop,
                          dbProfilingLevel);
 
-    MultiIndexBlock indexer(opCtx, collection);
+    MultiIndexBlock indexer;
 
     const size_t origSpecsSize = specs.size();
     specs = resolveDefaultsAndRemoveExistingIndexes(opCtx, collection, std::move(specs));
@@ -312,10 +352,28 @@ bool runCreateIndexes(OperationContext* opCtx,
         }
     }
 
+    // The 'indexer' can throw, so ensure the build cleanup occurs.
+    ON_BLOCK_EXIT([&] {
+        if (MONGO_FAIL_POINT(leaveIndexBuildUnfinishedForShutdown)) {
+            // Set a flag to leave the persisted index build state intact when cleanUpAfterBuild()
+            // is called below. The index build will be found on server startup.
+            //
+            // Note: this failpoint has two parts, the first to make the index build error and the
+            // second to catch it here: the index build must error before commit(), otherwise
+            // commit() clears the state.
+            indexer.abortWithoutCleanup(opCtx);
+        }
+        invariant(opCtx->lockState()->isDbLockedForMode(dbname, MODE_X));
+        indexer.cleanUpAfterBuild(opCtx, collection);
+    });
+
     std::vector<BSONObj> indexInfoObjs =
         writeConflictRetry(opCtx, kCommandName, ns.ns(), [opCtx, collection, &indexer, &specs] {
-            return uassertStatusOK(indexer.init(
-                specs, MultiIndexBlock::makeTimestampedIndexOnInitFn(opCtx, collection)));
+            return uassertStatusOK(
+                indexer.init(opCtx,
+                             collection,
+                             specs,
+                             MultiIndexBlock::makeTimestampedIndexOnInitFn(opCtx, collection)));
         });
 
     // If we're a background index, replace exclusive db lock with an intent lock, so that
@@ -344,7 +402,7 @@ bool runCreateIndexes(OperationContext* opCtx,
     // background.
     {
         Lock::CollectionLock colLock(opCtx->lockState(), ns.ns(), MODE_IX);
-        uassertStatusOK(indexer.insertAllDocumentsInCollection());
+        uassertStatusOK(indexer.insertAllDocumentsInCollection(opCtx, collection));
     }
 
     if (MONGO_FAIL_POINT(hangAfterIndexBuildDumpsInsertsFromBulk)) {
@@ -359,7 +417,7 @@ bool runCreateIndexes(OperationContext* opCtx,
 
         // Read at a point in time so that the drain, which will timestamp writes at lastApplied,
         // can never commit writes earlier than its read timestamp.
-        uassertStatusOK(indexer.drainBackgroundWrites(RecoveryUnit::ReadSource::kNoOverlap));
+        uassertStatusOK(indexer.drainBackgroundWrites(opCtx, RecoveryUnit::ReadSource::kNoOverlap));
     }
 
     if (MONGO_FAIL_POINT(hangAfterIndexBuildFirstDrain)) {
@@ -372,7 +430,7 @@ bool runCreateIndexes(OperationContext* opCtx,
         opCtx->recoveryUnit()->abandonSnapshot();
         Lock::CollectionLock colLock(opCtx->lockState(), ns.ns(), MODE_S);
 
-        uassertStatusOK(indexer.drainBackgroundWrites());
+        uassertStatusOK(indexer.drainBackgroundWrites(opCtx));
     }
 
     if (MONGO_FAIL_POINT(hangAfterIndexBuildSecondDrain)) {
@@ -400,20 +458,22 @@ bool runCreateIndexes(OperationContext* opCtx,
 
     // Perform the third and final drain after releasing a shared lock and reacquiring an
     // exclusive lock on the database.
-    uassertStatusOK(indexer.drainBackgroundWrites());
+    uassertStatusOK(indexer.drainBackgroundWrites(opCtx));
 
     // This is required before completion.
-    uassertStatusOK(indexer.checkConstraints());
+    uassertStatusOK(indexer.checkConstraints(opCtx));
 
     writeConflictRetry(opCtx, kCommandName, ns.ns(), [&] {
         WriteUnitOfWork wunit(opCtx);
 
-        uassertStatusOK(indexer.commit(
-            [opCtx, &ns, collection](const BSONObj& spec) {
-                opCtx->getServiceContext()->getOpObserver()->onCreateIndex(
-                    opCtx, ns, *(collection->uuid()), spec, false);
-            },
-            MultiIndexBlock::kNoopOnCommitFn));
+        uassertStatusOK(
+            indexer.commit(opCtx,
+                           collection,
+                           [opCtx, &ns, collection](const BSONObj& spec) {
+                               opCtx->getServiceContext()->getOpObserver()->onCreateIndex(
+                                   opCtx, ns, *(collection->uuid()), spec, false);
+                           },
+                           MultiIndexBlock::kNoopOnCommitFn));
 
         wunit.commit();
     });
@@ -440,6 +500,7 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
 
     auto specs = uassertStatusOK(
         parseAndValidateIndexSpecs(opCtx, ns, cmdObj, serverGlobalParams.featureCompatibility));
+    boost::optional<CommitQuorumOptions> commitQuorum = parseAndGetCommitQuorum(opCtx, cmdObj);
 
     // Preliminary checks before handing control over to IndexBuildsCoordinator:
     // 1) We are in a replication mode that allows for index creation.
@@ -500,7 +561,7 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
             // We would not reach this point if we were able to check existing indexes on the
             // collection.
             invariant(!collection);
-            if (db->getViewCatalog()->lookup(opCtx, ns.ns())) {
+            if (ViewCatalog::get(db)->lookup(opCtx, ns.ns())) {
                 errmsg = str::stream() << "Cannot create indexes on a view: " << ns.ns();
                 uasserted(ErrorCodes::CommandNotSupportedOnView, errmsg);
             }
@@ -538,9 +599,11 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
         (runTwoPhaseBuild) ? IndexBuildProtocol::kTwoPhase : IndexBuildProtocol::kSinglePhase;
     log() << "Registering index build: " << buildUUID;
     ReplIndexBuildState::IndexCatalogStats stats;
+    IndexBuildsCoordinator::IndexBuildOptions indexBuildOptions = {commitQuorum};
+
     try {
-        auto buildIndexFuture = uassertStatusOK(
-            indexBuildsCoord->startIndexBuild(opCtx, *collectionUUID, specs, buildUUID, protocol));
+        auto buildIndexFuture = uassertStatusOK(indexBuildsCoord->startIndexBuild(
+            opCtx, *collectionUUID, specs, buildUUID, protocol, indexBuildOptions));
 
         auto deadline = opCtx->getDeadline();
         // Date_t::max() means no deadline.
@@ -599,11 +662,15 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
         result.append(kNoteFieldName, "index already exists");
     }
 
+    commitQuorum->append("commitQuorum", &result);
+
     return true;
 }
 
 /**
- * { createIndexes : "bar", indexes : [ { ns : "test.bar", key : { x : 1 }, name: "x_1" } ] }
+ * { createIndexes : "bar",
+ *   indexes : [ { ns : "test.bar", key : { x : 1 }, name: "x_1" } ],
+ *   commitQuorum: "majority" }
  */
 class CmdCreateIndex : public ErrmsgCommandDeprecated {
 public:
@@ -648,7 +715,9 @@ public:
  * Builds project would have to be turned on all at once because so much testing already exists that
  * would break with incremental changes.
  *
- * {twoPhaseCreateIndexes : "bar", indexes : [ { ns : "test.bar", key : { x : 1 }, name: "x_1" } ]}
+ * {twoPhaseCreateIndexes : "bar",
+ *  indexes : [ { ns : "test.bar", key : { x : 1 }, name: "x_1" } ],
+ *  commitQuorum: "majority" }
  */
 class CmdTwoPhaseCreateIndex : public ErrmsgCommandDeprecated {
 public:

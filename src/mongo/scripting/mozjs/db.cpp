@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -76,7 +75,7 @@ void DBInfo::resolve(JSContext* cx, JS::HandleObject obj, JS::HandleId id, bool*
     }
 
     // Check if this exists on the parent, ie. DBCollection::resolve case
-    if (parentWrapper.hasOwnField(id)) {
+    if (parentWrapper.alreadyHasOwnField(id)) {
         parentWrapper.getValue(id, &coll);
 
         o.defineProperty(id, coll, 0);

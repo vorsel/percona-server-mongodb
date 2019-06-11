@@ -55,8 +55,7 @@
 
             // Verify the command must fail on a snapshot error from a subsequent statement.
             setFailCommandOnShards(st, {times: 1}, [commandName], errorCode, 1);
-            const res = assert.commandFailedWithCode(sessionDB.runCommand(commandBody),
-                                                     ErrorCodes.NoSuchTransaction);
+            const res = assert.commandFailedWithCode(sessionDB.runCommand(commandBody), errorCode);
             assert.eq(res.errorLabels, ["TransientTransactionError"]);
 
             assertNoSuchTransactionOnAllShards(
@@ -67,6 +66,8 @@
     }
 
     const st = new ShardingTest({shards: 2, mongos: 1, config: 1});
+
+    enableStaleVersionAndSnapshotRetriesWithinTransactions(st);
 
     jsTestLog("Unsharded transaction");
 
@@ -108,6 +109,8 @@
     for (let errorCode of kSnapshotErrors) {
         runTest(st, collName, errorCode);
     }
+
+    disableStaleVersionAndSnapshotRetriesWithinTransactions(st);
 
     st.stop();
 })();

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -46,7 +45,7 @@ namespace mongo {
 StatusWith<CompactStats> compactCollection(OperationContext* opCtx,
                                            Collection* collection,
                                            const CompactOptions* compactOptions) {
-    dassert(opCtx->lockState()->isCollectionLockedForMode(collection->ns().toString(), MODE_X));
+    dassert(opCtx->lockState()->isCollectionLockedForMode(collection->ns(), MODE_X));
 
     DisableDocumentValidation validationDisabler(opCtx);
 
@@ -117,10 +116,14 @@ StatusWith<CompactStats> compactCollection(OperationContext* opCtx,
 
     CompactStats stats;
 
-    MultiIndexBlock indexer(opCtx, collection);
+    MultiIndexBlock indexer;
     indexer.ignoreUniqueConstraint();  // in compact we should be doing no checking
 
-    Status status = indexer.init(indexSpecs, MultiIndexBlock::kNoopOnInitFn).getStatus();
+    // The 'indexer' could throw, so ensure build cleanup occurs.
+    ON_BLOCK_EXIT([&] { indexer.cleanUpAfterBuild(opCtx, collection); });
+
+    Status status =
+        indexer.init(opCtx, collection, indexSpecs, MultiIndexBlock::kNoopOnInitFn).getStatus();
     if (!status.isOK())
         return StatusWith<CompactStats>(status);
 
@@ -129,14 +132,16 @@ StatusWith<CompactStats> compactCollection(OperationContext* opCtx,
         return StatusWith<CompactStats>(status);
 
     log() << "starting index commits";
-    status = indexer.dumpInsertsFromBulk();
+    status = indexer.dumpInsertsFromBulk(opCtx);
     if (!status.isOK())
         return StatusWith<CompactStats>(status);
 
     {
         WriteUnitOfWork wunit(opCtx);
-        status =
-            indexer.commit(MultiIndexBlock::kNoopOnCreateEachFn, MultiIndexBlock::kNoopOnCommitFn);
+        status = indexer.commit(opCtx,
+                                collection,
+                                MultiIndexBlock::kNoopOnCreateEachFn,
+                                MultiIndexBlock::kNoopOnCommitFn);
         if (!status.isOK()) {
             return StatusWith<CompactStats>(status);
         }

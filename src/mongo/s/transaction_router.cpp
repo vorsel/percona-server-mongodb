@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -43,9 +42,12 @@
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/session_catalog.h"
+#include "mongo/executor/task_executor_pool.h"
 #include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/s/async_requests_sender.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/multi_statement_transaction_requests_sender.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
@@ -56,6 +58,10 @@ namespace {
 // TODO (SERVER-37886): Remove this failpoint once failover can be tested on coordinators that
 // have a local participant.
 MONGO_FAIL_POINT_DEFINE(sendCoordinateCommitToConfigServer);
+
+// TODO SERVER-39704: Remove this fail point once the router can safely retry within a transaction
+// on stale version and snapshot errors.
+MONGO_FAIL_POINT_DEFINE(enableStaleVersionAndSnapshotRetriesWithinTransactions);
 
 const char kCoordinatorField[] = "coordinator";
 const char kReadConcernLevelSnapshotName[] = "snapshot";
@@ -221,6 +227,50 @@ BSONObj TransactionRouter::Participant::attachTxnFieldsIfNeeded(
     return newCmd.obj();
 }
 
+void TransactionRouter::processParticipantResponse(const ShardId& shardId,
+                                                   const BSONObj& responseObj) {
+    auto participant = getParticipant(shardId);
+    invariant(participant, "Participant should exist if processing participant response");
+
+    auto commandStatus = getStatusFromCommandResult(responseObj);
+    if (!commandStatus.isOK()) {
+        return;
+    }
+
+    if (participant->stmtIdCreatedAt != _latestStmtId) {
+        uassert(
+            51112,
+            str::stream() << "readOnly field for participant " << shardId
+                          << " should have been set on the participant's first successful response",
+            participant->readOnly != Participant::ReadOnly::kUnset);
+    }
+
+    auto txnResponseMetadata =
+        TxnResponseMetadata::parse("processParticipantResponse"_sd, responseObj);
+
+    if (txnResponseMetadata.getReadOnly()) {
+        if (participant->readOnly == Participant::ReadOnly::kUnset) {
+            LOG(0) << txnIdToString() << " Marking " << shardId << " as read-only";
+            participant->readOnly = Participant::ReadOnly::kReadOnly;
+            return;
+        }
+
+        uassert(51113,
+                str::stream() << "Participant shard " << shardId
+                              << " claimed to be read-only for a transaction after previously "
+                                 "claiming to have done a write for the transaction",
+                participant->readOnly == Participant::ReadOnly::kReadOnly);
+        return;
+    }
+
+    // The shard reported readOnly:false on this statement.
+
+    if (participant->readOnly != Participant::ReadOnly::kNotReadOnly) {
+        LOG(0) << txnIdToString() << " Marking " << shardId << " as having done a write";
+        participant->readOnly = Participant::ReadOnly::kNotReadOnly;
+    }
+}
+
 LogicalTime TransactionRouter::AtClusterTime::getTime() const {
     invariant(_atClusterTime != LogicalTime::kUninitialized);
     invariant(_stmtIdSelectedAt != kUninitializedStmtId);
@@ -261,13 +311,13 @@ const boost::optional<ShardId>& TransactionRouter::getCoordinatorId() const {
 
 BSONObj TransactionRouter::attachTxnFieldsIfNeeded(const ShardId& shardId, const BSONObj& cmdObj) {
     if (auto txnPart = getParticipant(shardId)) {
-        LOG(4) << _txnIdToString()
+        LOG(4) << txnIdToString()
                << " Sending transaction fields to existing participant: " << shardId;
         return txnPart->attachTxnFieldsIfNeeded(cmdObj, false);
     }
 
     auto txnPart = _createParticipant(shardId);
-    LOG(4) << _txnIdToString() << " Sending transaction fields to new participant: " << shardId;
+    LOG(4) << txnIdToString() << " Sending transaction fields to new participant: " << shardId;
     return txnPart.attachTxnFieldsIfNeeded(cmdObj, true);
 }
 
@@ -320,7 +370,7 @@ void TransactionRouter::_assertAbortStatusIsOkOrNoSuchTransaction(
 
     auto status = getStatusFromCommandResult(shardResponse.data);
     uassert(ErrorCodes::NoSuchTransaction,
-            str::stream() << _txnIdToString() << "Transaction aborted between retries of statement "
+            str::stream() << txnIdToString() << "Transaction aborted between retries of statement "
                           << _latestStmtId
                           << " due to error: "
                           << status
@@ -381,14 +431,26 @@ void TransactionRouter::_clearPendingParticipants(OperationContext* opCtx) {
     invariant(_participants.count(*_coordinatorId) == 1);
 }
 
-bool TransactionRouter::_canContinueOnStaleShardOrDbError(StringData cmdName) const {
-    // We can always retry on the first overall statement.
-    if (_latestStmtId == _firstStmtId) {
-        return true;
-    }
+bool TransactionRouter::canContinueOnStaleShardOrDbError(StringData cmdName) const {
+    if (MONGO_FAIL_POINT(enableStaleVersionAndSnapshotRetriesWithinTransactions)) {
+        // We can always retry on the first overall statement because all targeted participants must
+        // be pending, so the retry will restart the local transaction on each one, overwriting any
+        // effects from the first attempt.
+        if (_latestStmtId == _firstStmtId) {
+            return true;
+        }
 
-    if (alwaysRetryableCmds.count(cmdName)) {
-        return true;
+        // Only idempotent operations can be retried if the error came from a later statement
+        // because non-pending participants targeted by the statement may receive the same statement
+        // id more than once, and currently statement ids are not tracked by participants so the
+        // operation would be applied each time.
+        //
+        // Note that the retry will fail if any non-pending participants returned a stale version
+        // error during the latest statement, because the error will abort their local transactions
+        // but the router's retry will expect them to be in-progress.
+        if (alwaysRetryableCmds.count(cmdName)) {
+            return true;
+        }
     }
 
     return false;
@@ -397,14 +459,9 @@ bool TransactionRouter::_canContinueOnStaleShardOrDbError(StringData cmdName) co
 void TransactionRouter::onStaleShardOrDbError(OperationContext* opCtx,
                                               StringData cmdName,
                                               const Status& errorStatus) {
-    uassert(ErrorCodes::NoSuchTransaction,
-            str::stream() << "Transaction " << _txnNumber << " was aborted on statement "
-                          << _latestStmtId
-                          << " due to an error from cluster data placement change: "
-                          << errorStatus,
-            _canContinueOnStaleShardOrDbError(cmdName));
+    invariant(canContinueOnStaleShardOrDbError(cmdName));
 
-    LOG(0) << _txnIdToString()
+    LOG(0) << txnIdToString()
            << " Clearing pending participants after stale version error: " << errorStatus;
 
     // Remove participants created during the current statement so they are sent the correct options
@@ -415,7 +472,7 @@ void TransactionRouter::onStaleShardOrDbError(OperationContext* opCtx,
 void TransactionRouter::onViewResolutionError(OperationContext* opCtx, const NamespaceString& nss) {
     // The router can always retry on a view resolution error.
 
-    LOG(0) << _txnIdToString()
+    LOG(0) << txnIdToString()
            << " Clearing pending participants after view resolution error on namespace: " << nss;
 
     // Requests against views are always routed to the primary shard for its database, but the retry
@@ -424,20 +481,19 @@ void TransactionRouter::onViewResolutionError(OperationContext* opCtx, const Nam
     _clearPendingParticipants(opCtx);
 }
 
-bool TransactionRouter::_canContinueOnSnapshotError() const {
-    return _atClusterTime && _atClusterTime->canChange(_latestStmtId);
+bool TransactionRouter::canContinueOnSnapshotError() const {
+    if (MONGO_FAIL_POINT(enableStaleVersionAndSnapshotRetriesWithinTransactions)) {
+        return _atClusterTime && _atClusterTime->canChange(_latestStmtId);
+    }
+
+    return false;
 }
 
 void TransactionRouter::onSnapshotError(OperationContext* opCtx, const Status& errorStatus) {
-    uassert(ErrorCodes::NoSuchTransaction,
-            str::stream() << "Transaction " << _txnNumber << " was aborted on statement "
-                          << _latestStmtId
-                          << " due to a non-retryable snapshot error: "
-                          << errorStatus,
-            _canContinueOnSnapshotError());
+    invariant(canContinueOnSnapshotError());
 
-    LOG(0) << _txnIdToString() << " Clearing pending participants and resetting global snapshot "
-                                  "timestamp after snapshot error: "
+    LOG(0) << txnIdToString() << " Clearing pending participants and resetting global snapshot "
+                                 "timestamp after snapshot error: "
            << errorStatus << ", previous timestamp: " << _atClusterTime->getTime();
 
     // The transaction must be restarted on all participants because a new read timestamp will be
@@ -469,7 +525,7 @@ void TransactionRouter::_setAtClusterTime(const boost::optional<LogicalTime>& af
         return;
     }
 
-    LOG(0) << _txnIdToString() << " Setting global snapshot timestamp to " << candidateTime
+    LOG(0) << txnIdToString() << " Setting global snapshot timestamp to " << candidateTime
            << " on statement " << _latestStmtId;
 
     _atClusterTime->setTime(candidateTime, _latestStmtId);
@@ -546,7 +602,7 @@ void TransactionRouter::beginOrContinueTxn(OperationContext* opCtx,
         _atClusterTime.emplace();
     }
 
-    LOG(0) << _txnIdToString() << " New transaction started";
+    LOG(0) << txnIdToString() << " New transaction started";
 }
 
 const LogicalSessionId& TransactionRouter::_sessionId() const {
@@ -554,7 +610,7 @@ const LogicalSessionId& TransactionRouter::_sessionId() const {
     return owningSession->getSessionId();
 }
 
-Shard::CommandResponse TransactionRouter::_commitSingleShardTransaction(OperationContext* opCtx) {
+BSONObj TransactionRouter::_commitSingleShardTransaction(OperationContext* opCtx) {
     auto shardRegistry = Grid::get(opCtx)->shardRegistry();
 
     const auto citer = _participants.cbegin();
@@ -564,24 +620,74 @@ Shard::CommandResponse TransactionRouter::_commitSingleShardTransaction(Operatio
 
     auto shard = uassertStatusOK(shardRegistry->getShard(opCtx, shardId));
 
-    LOG(0) << _txnIdToString()
-           << " Committing single shard transaction, single participant: " << shardId;
+    LOG(0) << txnIdToString()
+           << " Committing single-shard transaction, single participant: " << shardId;
 
     CommitTransaction commitCmd;
     commitCmd.setDbName(NamespaceString::kAdminDb);
 
     return uassertStatusOK(shard->runCommandWithFixedRetryAttempts(
-        opCtx,
-        ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-        "admin",
-        participant.attachTxnFieldsIfNeeded(
-            commitCmd.toBSON(
-                BSON(WriteConcernOptions::kWriteConcernField << opCtx->getWriteConcern().toBSON())),
-            false),
-        Shard::RetryPolicy::kIdempotent));
+                               opCtx,
+                               ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                               "admin",
+                               participant.attachTxnFieldsIfNeeded(
+                                   commitCmd.toBSON(BSON(WriteConcernOptions::kWriteConcernField
+                                                         << opCtx->getWriteConcern().toBSON())),
+                                   false),
+                               Shard::RetryPolicy::kIdempotent))
+        .response;
 }
 
-Shard::CommandResponse TransactionRouter::_commitMultiShardTransaction(OperationContext* opCtx) {
+BSONObj TransactionRouter::_commitReadOnlyTransaction(OperationContext* opCtx) {
+    // Assemble requests.
+    std::vector<AsyncRequestsSender::Request> requests;
+    for (const auto& participant : _participants) {
+        CommitTransaction commitCmd;
+        commitCmd.setDbName(NamespaceString::kAdminDb);
+        const auto commitCmdObj = commitCmd.toBSON(
+            BSON(WriteConcernOptions::kWriteConcernField << opCtx->getWriteConcern().toBSON()));
+        requests.emplace_back(participant.first, commitCmdObj);
+    }
+
+    LOG(0) << txnIdToString() << " Committing read-only transaction on " << requests.size()
+           << " shards";
+
+    // Send the requests.
+    MultiStatementTransactionRequestsSender ars(
+        opCtx,
+        Grid::get(opCtx)->getExecutorPool()->getFixedExecutor(),
+        NamespaceString::kAdminDb,
+        requests,
+        ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+        Shard::RetryPolicy::kIdempotent);
+
+    // Receive the responses.
+    while (!ars.done()) {
+        auto response = ars.next();
+
+        uassertStatusOK(response.swResponse);
+        const auto result = response.swResponse.getValue().data;
+
+        // If any shard returned an error, return the error immediately.
+        const auto commandStatus = getStatusFromCommandResult(result);
+        if (!commandStatus.isOK()) {
+            return result;
+        }
+
+        // If any participant had a writeConcern error, return the participant's writeConcern
+        // error immediately.
+        const auto writeConcernStatus = getWriteConcernStatusFromCommandResult(result);
+        if (!writeConcernStatus.isOK()) {
+            return result;
+        }
+    }
+
+    // If all the responses were ok, return empty BSON, which the commitTransaction command will
+    // interpret as success.
+    return BSONObj();
+}
+
+BSONObj TransactionRouter::_commitMultiShardTransaction(OperationContext* opCtx) {
     invariant(_coordinatorId);
     auto coordinatorIter = _participants.find(*_coordinatorId);
     invariant(coordinatorIter != _participants.end());
@@ -604,17 +710,23 @@ Shard::CommandResponse TransactionRouter::_commitMultiShardTransaction(Operation
         coordinatorShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
 
         if (!_initiatedTwoPhaseCommit) {
+            SharedTransactionOptions options;
+            options.txnNumber = _txnNumber;
+            // Intentionally leave atClusterTime blank since we don't care and to minimize
+            // possibility that storage engine won't have it available.
+            Participant configParticipant(true, 0, options);
+
             // Send a fake transaction statement to the config server primary so that the config
             // server primary sets up state in memory to receive coordinateCommit.
             auto cmdResponse = coordinatorShard->runCommandWithFixedRetryAttempts(
                 opCtx,
                 ReadPreferenceSetting{ReadPreference::PrimaryOnly},
                 "dummy",
-                coordinatorIter->second.attachTxnFieldsIfNeeded(BSON("distinct"
-                                                                     << "dummy"
-                                                                     << "key"
-                                                                     << "dummy"),
-                                                                true),
+                configParticipant.attachTxnFieldsIfNeeded(BSON("distinct"
+                                                               << "dummy"
+                                                               << "key"
+                                                               << "dummy"),
+                                                          true),
                 Shard::RetryPolicy::kIdempotent);
             uassertStatusOK(Shard::CommandResponse::getEffectiveStatus(cmdResponse));
 
@@ -624,8 +736,7 @@ Shard::CommandResponse TransactionRouter::_commitMultiShardTransaction(Operation
                 opCtx,
                 ReadPreferenceSetting{ReadPreference::PrimaryOnly},
                 "admin",
-                coordinatorIter->second.attachTxnFieldsIfNeeded(BSON("abortTransaction" << 1),
-                                                                false),
+                configParticipant.attachTxnFieldsIfNeeded(BSON("abortTransaction" << 1), false),
                 Shard::RetryPolicy::kIdempotent);
             uassertStatusOK(Shard::CommandResponse::getEffectiveStatus(cmdResponse));
         }
@@ -637,29 +748,59 @@ Shard::CommandResponse TransactionRouter::_commitMultiShardTransaction(Operation
 
     _initiatedTwoPhaseCommit = true;
 
-    LOG(0) << _txnIdToString()
-           << " Committing multi shard transaction, coordinator: " << *_coordinatorId;
+    LOG(0) << txnIdToString()
+           << " Committing multi-shard transaction, coordinator: " << *_coordinatorId;
 
-    return uassertStatusOK(coordinatorShard->runCommandWithFixedRetryAttempts(
-        opCtx,
-        ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-        "admin",
-        coordinatorIter->second.attachTxnFieldsIfNeeded(
-            coordinateCommitCmd.toBSON(
-                BSON(WriteConcernOptions::kWriteConcernField << opCtx->getWriteConcern().toBSON())),
-            false),
-        Shard::RetryPolicy::kIdempotent));
+    return uassertStatusOK(
+               coordinatorShard->runCommandWithFixedRetryAttempts(
+                   opCtx,
+                   ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                   "admin",
+                   coordinatorIter->second.attachTxnFieldsIfNeeded(
+                       coordinateCommitCmd.toBSON(BSON(WriteConcernOptions::kWriteConcernField
+                                                       << opCtx->getWriteConcern().toBSON())),
+                       false),
+                   Shard::RetryPolicy::kIdempotent))
+        .response;
 }
 
-Shard::CommandResponse TransactionRouter::commitTransaction(
+BSONObj TransactionRouter::commitTransaction(
     OperationContext* opCtx, const boost::optional<TxnRecoveryToken>& recoveryToken) {
-    if (_participants.empty()) {
-        uassert(50940, "cannot commit with no participants", recoveryToken);
+    if (_isRecoveringCommit) {
+        uassert(50940,
+                "Cannot recover the transaction decision without a recoveryToken",
+                recoveryToken);
         return _commitWithRecoveryToken(opCtx, *recoveryToken);
     }
 
+    if (_participants.empty()) {
+        // The participants list can be empty if a transaction was began on mongos, but it never
+        // ended up targeting any hosts. Such cases are legal for example if a find is issued
+        // against a non-existend database.
+        uassert(ErrorCodes::IllegalOperation,
+                "Cannot commit without participants",
+                _txnNumber != kUninitializedTxnNumber);
+        return BSON("ok" << 1);
+    }
+
+    bool allParticipantsReadOnly = true;
+    for (const auto& participant : _participants) {
+        uassert(ErrorCodes::NoSuchTransaction,
+                "Can't send commit unless all previous statements were successful",
+                participant.second.readOnly != Participant::ReadOnly::kUnset);
+        if (participant.second.readOnly == Participant::ReadOnly::kNotReadOnly) {
+            allParticipantsReadOnly = false;
+        }
+    }
+
+    // Make the single-shard commit path take precedence. The read-only optimization is only to skip
+    // two-phase commit for a read-only multi-shard transaction.
     if (_participants.size() == 1) {
         return _commitSingleShardTransaction(opCtx);
+    }
+
+    if (allParticipantsReadOnly) {
+        return _commitReadOnlyTransaction(opCtx);
     }
 
     return _commitMultiShardTransaction(opCtx);
@@ -682,7 +823,7 @@ std::vector<AsyncRequestsSender::Response> TransactionRouter::abortTransaction(
 
     // Implicit aborts log earlier.
     if (!isImplicit) {
-        LOG(0) << _txnIdToString() << " Aborting transaction on " << _participants.size()
+        LOG(0) << txnIdToString() << " Aborting transaction on " << _participants.size()
                << " shard(s)";
     }
 
@@ -700,12 +841,12 @@ void TransactionRouter::implicitlyAbortTransaction(OperationContext* opCtx,
     }
 
     if (_initiatedTwoPhaseCommit) {
-        LOG(0) << _txnIdToString() << " Router not sending implicit abortTransaction because "
-                                      "already initiated two phase commit for the transaction";
+        LOG(0) << txnIdToString() << " Router not sending implicit abortTransaction because "
+                                     "already initiated two phase commit for the transaction";
         return;
     }
 
-    LOG(0) << _txnIdToString() << " Implicitly aborting transaction on " << _participants.size()
+    LOG(0) << txnIdToString() << " Implicitly aborting transaction on " << _participants.size()
            << " shard(s) due to error: " << errorStatus;
 
     try {
@@ -715,7 +856,7 @@ void TransactionRouter::implicitlyAbortTransaction(OperationContext* opCtx,
     }
 }
 
-std::string TransactionRouter::_txnIdToString() const {
+std::string TransactionRouter::txnIdToString() const {
     return str::stream() << _sessionId().getId() << ":" << _txnNumber;
 }
 
@@ -725,15 +866,31 @@ void TransactionRouter::appendRecoveryToken(BSONObjBuilder* builder) const {
 
     BSONObjBuilder recoveryTokenBuilder(
         builder->subobjStart(CommitTransaction::kRecoveryTokenFieldName));
-    TxnRecoveryToken recoveryToken(*_coordinatorId);
+
+    TxnRecoveryToken recoveryToken;
+
+    // Only return a populated recovery token if the transaction has done a write (transactions that
+    // only did reads do not need to be recovered; they can just be retried).
+    for (const auto& participant : _participants) {
+        if (participant.second.readOnly == Participant::ReadOnly::kNotReadOnly) {
+            recoveryToken.setShardId(*_coordinatorId);
+            break;
+        }
+    }
+
     recoveryToken.serialize(&recoveryTokenBuilder);
     recoveryTokenBuilder.doneFast();
 }
 
-Shard::CommandResponse TransactionRouter::_commitWithRecoveryToken(
-    OperationContext* opCtx, const TxnRecoveryToken& recoveryToken) {
+BSONObj TransactionRouter::_commitWithRecoveryToken(OperationContext* opCtx,
+                                                    const TxnRecoveryToken& recoveryToken) {
+    uassert(ErrorCodes::NoSuchTransaction,
+            "Recovery token is empty, meaning the transaction only performed reads and can be "
+            "safely retried",
+            recoveryToken.getShardId());
+    const auto& coordinatorId = *recoveryToken.getShardId();
+
     const auto shardRegistry = Grid::get(opCtx)->shardRegistry();
-    const auto& coordinatorId = recoveryToken.getShardId();
 
     auto coordinateCommitCmd = [&] {
         CoordinateCommitTransaction coordinateCommitCmd;
@@ -753,11 +910,12 @@ Shard::CommandResponse TransactionRouter::_commitWithRecoveryToken(
 
     auto coordinatorShard = uassertStatusOK(shardRegistry->getShard(opCtx, coordinatorId));
     return uassertStatusOK(coordinatorShard->runCommandWithFixedRetryAttempts(
-        opCtx,
-        ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-        "admin",
-        coordinateCommitCmd,
-        Shard::RetryPolicy::kIdempotent));
+                               opCtx,
+                               ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                               "admin",
+                               coordinateCommitCmd,
+                               Shard::RetryPolicy::kIdempotent))
+        .response;
 }
 
 }  // namespace mongo

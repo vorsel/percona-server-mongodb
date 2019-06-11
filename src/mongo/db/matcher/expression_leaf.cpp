@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -46,6 +45,7 @@
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/mongoutils/str.h"
+#include "mongo/util/regex_util.h"
 
 namespace mongo {
 
@@ -87,8 +87,8 @@ void ComparisonMatchExpressionBase::debugString(StringBuilder& debug, int level)
     debug << "\n";
 }
 
-void ComparisonMatchExpressionBase::serialize(BSONObjBuilder* out) const {
-    out->append(path(), BSON(name() << _rhs));
+BSONObj ComparisonMatchExpressionBase::getSerializedRightHandSide() const {
+    return BSON(name() << _rhs);
 }
 
 ComparisonMatchExpression::ComparisonMatchExpression(MatchType type,
@@ -197,34 +197,13 @@ constexpr StringData LTEMatchExpression::kName;
 constexpr StringData GTMatchExpression::kName;
 constexpr StringData GTEMatchExpression::kName;
 
-// ---------------
-
-// TODO: move
-inline pcrecpp::RE_Options flags2options(const char* flags) {
-    pcrecpp::RE_Options options;
-    options.set_utf8(true);
-    while (flags && *flags) {
-        if (*flags == 'i')
-            options.set_caseless(true);
-        else if (*flags == 'm')
-            options.set_multiline(true);
-        else if (*flags == 'x')
-            options.set_extended(true);
-        else if (*flags == 's')
-            options.set_dotall(true);
-        flags++;
-    }
-    return options;
-}
-
 const std::set<char> RegexMatchExpression::kValidRegexFlags = {'i', 'm', 's', 'x'};
-constexpr size_t RegexMatchExpression::kMaxPatternSize;
 
 RegexMatchExpression::RegexMatchExpression(StringData path, const BSONElement& e)
     : LeafMatchExpression(REGEX, path),
       _regex(e.regex()),
       _flags(e.regexFlags()),
-      _re(new pcrecpp::RE(_regex.c_str(), flags2options(_flags.c_str()))) {
+      _re(new pcrecpp::RE(_regex.c_str(), regex_util::flags2PcreOptions(_flags, true))) {
     uassert(ErrorCodes::BadValue, "regex not a regex", e.type() == RegEx);
     _init();
 }
@@ -233,14 +212,11 @@ RegexMatchExpression::RegexMatchExpression(StringData path, StringData regex, St
     : LeafMatchExpression(REGEX, path),
       _regex(regex.toString()),
       _flags(options.toString()),
-      _re(new pcrecpp::RE(_regex.c_str(), flags2options(_flags.c_str()))) {
+      _re(new pcrecpp::RE(_regex.c_str(), regex_util::flags2PcreOptions(_flags, true))) {
     _init();
 }
 
 void RegexMatchExpression::_init() {
-    uassert(
-        ErrorCodes::BadValue, "Regular expression is too long", _regex.size() <= kMaxPatternSize);
-
     uassert(ErrorCodes::BadValue,
             "Regular expression cannot contain an embedded null byte",
             _regex.find('\0') == std::string::npos);
@@ -248,6 +224,10 @@ void RegexMatchExpression::_init() {
     uassert(ErrorCodes::BadValue,
             "Regular expression options string cannot contain an embedded null byte",
             _flags.find('\0') == std::string::npos);
+
+    uassert(51091,
+            str::stream() << "Regular expression is invalid: " << _re->error(),
+            _re->error().empty());
 }
 
 RegexMatchExpression::~RegexMatchExpression() {}
@@ -290,15 +270,15 @@ void RegexMatchExpression::debugString(StringBuilder& debug, int level) const {
     debug << "\n";
 }
 
-void RegexMatchExpression::serialize(BSONObjBuilder* out) const {
-    BSONObjBuilder regexBuilder(out->subobjStart(path()));
+BSONObj RegexMatchExpression::getSerializedRightHandSide() const {
+    BSONObjBuilder regexBuilder;
     regexBuilder.append("$regex", _regex);
 
     if (!_flags.empty()) {
         regexBuilder.append("$options", _flags);
     }
 
-    regexBuilder.doneFast();
+    return regexBuilder.obj();
 }
 
 void RegexMatchExpression::serializeToBSONTypeRegex(BSONObjBuilder* out) const {
@@ -333,8 +313,8 @@ void ModMatchExpression::debugString(StringBuilder& debug, int level) const {
     debug << "\n";
 }
 
-void ModMatchExpression::serialize(BSONObjBuilder* out) const {
-    out->append(path(), BSON("$mod" << BSON_ARRAY(_divisor << _remainder)));
+BSONObj ModMatchExpression::getSerializedRightHandSide() const {
+    return BSON("$mod" << BSON_ARRAY(_divisor << _remainder));
 }
 
 bool ModMatchExpression::equivalent(const MatchExpression* other) const {
@@ -367,8 +347,8 @@ void ExistsMatchExpression::debugString(StringBuilder& debug, int level) const {
     debug << "\n";
 }
 
-void ExistsMatchExpression::serialize(BSONObjBuilder* out) const {
-    out->append(path(), BSON("$exists" << true));
+BSONObj ExistsMatchExpression::getSerializedRightHandSide() const {
+    return BSON("$exists" << true);
 }
 
 bool ExistsMatchExpression::equivalent(const MatchExpression* other) const {
@@ -440,8 +420,8 @@ void InMatchExpression::debugString(StringBuilder& debug, int level) const {
     debug << "\n";
 }
 
-void InMatchExpression::serialize(BSONObjBuilder* out) const {
-    BSONObjBuilder inBob(out->subobjStart(path()));
+BSONObj InMatchExpression::getSerializedRightHandSide() const {
+    BSONObjBuilder inBob;
     BSONArrayBuilder arrBob(inBob.subarrayStart("$in"));
     for (auto&& _equality : _equalitySet) {
         arrBob.append(_equality);
@@ -452,7 +432,7 @@ void InMatchExpression::serialize(BSONObjBuilder* out) const {
         arrBob.append(regexBob.obj().firstElement());
     }
     arrBob.doneFast();
-    inBob.doneFast();
+    return inBob.obj();
 }
 
 bool InMatchExpression::equivalent(const MatchExpression* other) const {
@@ -779,7 +759,7 @@ void BitTestMatchExpression::debugString(StringBuilder& debug, int level) const 
     }
 }
 
-void BitTestMatchExpression::serialize(BSONObjBuilder* out) const {
+BSONObj BitTestMatchExpression::getSerializedRightHandSide() const {
     std::string opString = "";
 
     switch (matchType()) {
@@ -805,7 +785,7 @@ void BitTestMatchExpression::serialize(BSONObjBuilder* out) const {
     }
     arrBob.doneFast();
 
-    out->append(path(), BSON(opString << arrBob.arr()));
+    return BSON(opString << arrBob.arr());
 }
 
 bool BitTestMatchExpression::equivalent(const MatchExpression* other) const {

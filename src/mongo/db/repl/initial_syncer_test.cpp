@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -68,7 +67,6 @@
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/scopeguard.h"
 
-#include "mongo/db/server_parameters.h"
 #include "mongo/unittest/barrier.h"
 #include "mongo/unittest/unittest.h"
 

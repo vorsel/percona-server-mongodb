@@ -37,6 +37,7 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 #include <boost/filesystem/path.hpp>
 
 #include "mongo/base/status.h"
+#include "mongo/db/audit/audit_options_gen.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/json.h"
 #include "mongo/util/file.h"
@@ -62,34 +63,6 @@ namespace mongo {
                     "path" << path <<
                     "destination" << destination <<
                     "filter" << filter);
-    }
-
-    Status addAuditOptions(optionenvironment::OptionSection* options) {
-        optionenvironment::OptionSection auditOptions("Audit Options");
-
-        auditOptions.addOptionChaining("auditLog.destination", "auditDestination", optionenvironment::String,
-                "Output type: enables auditing functionality",
-                {"audit.destination"});
-
-        auditOptions.addOptionChaining("auditLog.format", "auditFormat", optionenvironment::String,
-                "Output format (supported formats are JSON and BSON; defaults to JSON)",
-                {"audit.format"});
-
-        auditOptions.addOptionChaining("auditLog.filter", "auditFilter", optionenvironment::String,
-                "JSON query filter on events, users, etc.",
-                {"audit.filter"});
-
-        auditOptions.addOptionChaining("auditLog.path", "auditPath", optionenvironment::String,
-                "Event destination file path and name",
-                {"audit.path"});
-
-        Status ret = options->addSection(auditOptions);
-        if (!ret.isOK()) {
-            log() << "Failed to add audit option section: " << ret.toString();
-            return ret;
-        }
-
-        return Status::OK();
     }
 
     Status storeAuditOptions(const optionenvironment::Environment& params) {

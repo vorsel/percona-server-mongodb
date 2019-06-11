@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -107,6 +106,7 @@ public:
 
 private:
     OperationContextSession _operationContextSession;
+    OperationContext* const _opCtx;
 };
 
 }  // namespace mongo

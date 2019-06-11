@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -33,12 +32,6 @@
 #include "mongo/db/update/update_internal_node.h"
 
 namespace mongo {
-namespace {
-
-std::string toArrayFilterIdentifier(const std::string& fieldName) {
-    return "$[" + fieldName + "]";
-}
-}
 
 // static
 std::map<std::string, clonable_ptr<UpdateNode>> UpdateInternalNode::createUpdateNodeMapByMerging(

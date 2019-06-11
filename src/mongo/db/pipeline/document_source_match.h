@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -44,11 +43,8 @@ public:
     virtual ~DocumentSourceMatch() = default;
 
     GetNextResult getNext() override;
+
     boost::intrusive_ptr<DocumentSource> optimize() final;
-    BSONObjSet getOutputSorts() final {
-        return pSource ? pSource->getOutputSorts()
-                       : SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-    }
 
     const char* getSourceName() const override;
 
@@ -161,6 +157,10 @@ public:
         MatchExpression* matchExpr,
         const std::string& path,
         const boost::intrusive_ptr<ExpressionContext>& expCtx);
+
+    boost::optional<MergingLogic> mergingLogic() final {
+        return boost::none;
+    }
 
 protected:
     DocumentSourceMatch(const BSONObj& query,

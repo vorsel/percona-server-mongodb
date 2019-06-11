@@ -1,6 +1,3 @@
-// wiredtiger_session_cache.h
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -116,7 +113,7 @@ public:
 
     /**
      * Release a cursor into the cursor cache and close old cursors if the number of cursors in the
-     * cache exceeds kWiredTigerCursorCacheSize.
+     * cache exceeds wiredTigerCursorCacheSize.
      */
     void releaseCursor(uint64_t id, WT_CURSOR* cursor);
 
@@ -275,7 +272,7 @@ public:
      * units share the same session cache, and we want a recovery unit on one thread to signal all
      * recovery units waiting for prepare conflicts across all other threads.
      */
-    void waitUntilPreparedUnitOfWorkCommitsOrAborts(OperationContext* opCtx);
+    void waitUntilPreparedUnitOfWorkCommitsOrAborts(OperationContext* opCtx, uint64_t lastCount);
 
     /**
      * Notifies waiters that the caller's perpared unit of work has ended (either committed or
@@ -302,6 +299,10 @@ public:
 
     WiredTigerKVEngine* getKVEngine() const {
         return _engine;
+    }
+
+    std::uint64_t getPrepareCommitOrAbortCount() const {
+        return _prepareCommitOrAbortCounter.loadRelaxed();
     }
 
 private:
@@ -333,7 +334,7 @@ private:
     // Mutex and cond var for waiting on prepare commit or abort.
     stdx::mutex _prepareCommittedOrAbortedMutex;
     stdx::condition_variable _prepareCommittedOrAbortedCond;
-    std::uint64_t _lastCommitOrAbortCounter;
+    AtomicWord<std::uint64_t> _prepareCommitOrAbortCounter{0};
 
     // Protects _journalListener.
     stdx::mutex _journalListenerMutex;

@@ -33,6 +33,7 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/repl/rollback_impl.h"
+#include "mongo/db/repl/rollback_impl_gen.h"
 
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/background.h"
@@ -53,9 +54,9 @@
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/s/shard_identity_rollback_notifier.h"
 #include "mongo/db/s/type_shard_identity.h"
-#include "mongo/db/server_parameters.h"
 #include "mongo/db/server_recovery.h"
 #include "mongo/db/server_transactions_metrics.h"
+#include "mongo/db/session_catalog_mongod.h"
 #include "mongo/db/storage/remove_saver.h"
 #include "mongo/s/catalog/type_config_version.h"
 #include "mongo/util/log.h"
@@ -69,25 +70,6 @@ namespace {
 constexpr long long kCollectionScanRequired = -1;
 
 RollbackImpl::Listener kNoopListener;
-
-// Control whether or not the server will write out data files containing deleted documents during
-// rollback. This server parameter affects both rollback via refetch and rollback via recovery to
-// stable timestamp.
-constexpr bool createRollbackFilesDefault = true;
-MONGO_EXPORT_SERVER_PARAMETER(createRollbackDataFiles, bool, createRollbackFilesDefault);
-
-/**
- * This amount, measured in seconds, represents the maximum allowed rollback period.
- * It is calculated by taking the difference of the wall clock times of the oplog entries
- * at the top of the local oplog and at the common point.
- */
-MONGO_EXPORT_SERVER_PARAMETER(rollbackTimeLimitSecs, int, 60 * 60 * 24)  // Default 1 day
-    ->withValidator([](const int& newVal) {
-        if (newVal > 0) {
-            return Status::OK();
-        }
-        return Status(ErrorCodes::BadValue, "rollbackTimeLimitSecs must be greater than 0");
-    });
 
 // The name of the insert, update and delete commands as found in oplog command entries.
 constexpr auto kInsertCmdName = "insert"_sd;
@@ -140,7 +122,7 @@ constexpr const char* RollbackImpl::kRollbackRemoveSaverType;
 constexpr const char* RollbackImpl::kRollbackRemoveSaverWhy;
 
 bool RollbackImpl::shouldCreateDataFiles() {
-    return createRollbackDataFiles.load();
+    return gCreateRollbackDataFiles.load();
 }
 
 RollbackImpl::RollbackImpl(OplogInterface* localOplog,
@@ -261,6 +243,13 @@ Status RollbackImpl::runRollback(OperationContext* opCtx) {
     // Clear the in memory state of prepared transactions in ServerTransactionsMetrics.
     ServerTransactionsMetrics::get(getGlobalServiceContext())->clearOpTimes();
 
+    // If there were rolled back operations on any session, invalidate all sessions.
+    // We invalidate sessions before we recover so that we avoid invalidating sessions that had
+    // just recovered prepared transactions.
+    if (_observerInfo.rollbackSessionIds.size() > 0) {
+        MongoDSessionCatalog::invalidateSessions(opCtx, boost::none);
+    }
+
     // Recover to the stable timestamp.
     auto stableTimestampSW = _recoverToStableTimestamp(opCtx);
     if (!stableTimestampSW.isOK()) {
@@ -351,7 +340,7 @@ Status RollbackImpl::_transitionToRollback(OperationContext* opCtx) {
 
     log() << "transition to ROLLBACK";
     {
-        ReplicationStateTransitionLockGuard transitionGuard(opCtx);
+        ReplicationStateTransitionLockGuard transitionGuard(opCtx, MODE_X);
 
         auto status =
             _replicationCoordinator->setFollowerModeStrict(opCtx, MemberState::RS_ROLLBACK);
@@ -869,7 +858,7 @@ Status RollbackImpl::_checkAgainstTimeLimit(
             _rollbackStats.lastLocalWallClockTime = topOfOplogWallTime;
             _rollbackStats.commonPointWallClockTime = commonPointWallTime;
 
-            auto timeLimit = static_cast<unsigned long long>(rollbackTimeLimitSecs.loadRelaxed());
+            auto timeLimit = static_cast<unsigned long long>(gRollbackTimeLimitSecs.loadRelaxed());
 
             if (diff > timeLimit) {
                 return Status(ErrorCodes::UnrecoverableRollbackError,
@@ -1054,7 +1043,7 @@ void RollbackImpl::_transitionFromRollbackToSecondary(OperationContext* opCtx) {
 
     log() << "transition to SECONDARY";
 
-    ReplicationStateTransitionLockGuard transitionGuard(opCtx);
+    ReplicationStateTransitionLockGuard transitionGuard(opCtx, MODE_X);
 
     auto status = _replicationCoordinator->setFollowerMode(MemberState::RS_SECONDARY);
     if (!status.isOK()) {

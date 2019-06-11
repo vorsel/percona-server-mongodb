@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -136,7 +135,7 @@ void TaskRunner::_runTasks() {
     // client used to create the operation context.
     Client* client = &cc();
     if (AuthorizationManager::get(client->getServiceContext())->isAuthEnabled()) {
-        AuthorizationSession::get(client)->grantInternalAuthorization();
+        AuthorizationSession::get(client)->grantInternalAuthorization(client);
     }
     ServiceContext::UniqueOperationContext opCtx;
 

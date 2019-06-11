@@ -147,7 +147,8 @@ DBClientBase* MongoInterfaceStandalone::directClient() {
 }
 
 bool MongoInterfaceStandalone::isSharded(OperationContext* opCtx, const NamespaceString& nss) {
-    AutoGetCollectionForRead autoColl(opCtx, nss);
+    Lock::DBLock dbLock(opCtx, nss.db(), MODE_IS);
+    Lock::CollectionLock collLock(opCtx->lockState(), nss.ns(), MODE_IS);
     const auto metadata = CollectionShardingState::get(opCtx, nss)->getCurrentMetadata();
     return metadata->isSharded();
 }
@@ -281,7 +282,14 @@ Status MongoInterfaceStandalone::appendRecordCount(OperationContext* opCtx,
 
 BSONObj MongoInterfaceStandalone::getCollectionOptions(const NamespaceString& nss) {
     const auto infos = _client.getCollectionInfos(nss.db().toString(), BSON("name" << nss.coll()));
-    return infos.empty() ? BSONObj() : infos.front().getObjectField("options").getOwned();
+    if (infos.empty()) {
+        return BSONObj();
+    }
+    const auto& infoObj = infos.front();
+    uassert(ErrorCodes::CommandNotSupportedOnView,
+            str::stream() << nss.toString() << " is a view, not a collection",
+            infoObj["type"].valueStringData() != "view"_sd);
+    return infoObj.getObjectField("options").getOwned();
 }
 
 void MongoInterfaceStandalone::renameIfOptionsAndIndexesHaveNotChanged(
@@ -423,15 +431,15 @@ boost::optional<Document> MongoInterfaceStandalone::lookupSingleDocument(
                                 << "]");
     }
 
-    // Set the speculative read optime appropriately after we do a document lookup locally. We don't
-    // know exactly what optime the document reflects, we so set the speculative read optime to the
-    // most recent applied optime.
+    // Set the speculative read timestamp appropriately after we do a document lookup locally. We
+    // don't know exactly what timestamp the document reflects, we so set the speculative read
+    // timestamp to the most recent applied timestamp.
     repl::SpeculativeMajorityReadInfo& speculativeMajorityReadInfo =
         repl::SpeculativeMajorityReadInfo::get(expCtx->opCtx);
     if (speculativeMajorityReadInfo.isSpeculativeRead()) {
         auto replCoord = repl::ReplicationCoordinator::get(expCtx->opCtx);
-        speculativeMajorityReadInfo.setSpeculativeReadOpTimeForward(
-            replCoord->getMyLastAppliedOpTime());
+        speculativeMajorityReadInfo.setSpeculativeReadTimestampForward(
+            replCoord->getMyLastAppliedOpTime().getTimestamp());
     }
 
     return lookedUpDocument;
@@ -529,7 +537,7 @@ BSONObj MongoInterfaceStandalone::_reportCurrentOpForClient(
 
     if (clientOpCtx) {
         if (auto txnParticipant = TransactionParticipant::get(clientOpCtx)) {
-            txnParticipant->reportUnstashedState(clientOpCtx, &builder);
+            txnParticipant.reportUnstashedState(clientOpCtx, &builder);
         }
 
         // Append lock stats before returning.
@@ -561,7 +569,7 @@ void MongoInterfaceStandalone::_reportCurrentOpsForIdleSessions(OperationContext
     sessionCatalog->scanSessions(
         {std::move(sessionFilter)},
         [&](const ObservableSession& session) {
-            auto op = TransactionParticipant::get(session.get())->reportStashedState();
+            auto op = TransactionParticipant::get(session).reportStashedState(opCtx);
             if (!op.isEmpty()) {
                 ops->emplace_back(op);
             }

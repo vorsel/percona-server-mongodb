@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -45,7 +44,7 @@
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/delete.h"
-#include "mongo/db/exec/update.h"
+#include "mongo/db/exec/update_stage.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/namespace_string.h"
@@ -309,7 +308,7 @@ public:
             maybeDisableValidation.emplace(opCtx);
 
         const auto txnParticipant = TransactionParticipant::get(opCtx);
-        const auto inTransaction = txnParticipant && txnParticipant->inMultiDocumentTransaction();
+        const auto inTransaction = txnParticipant && txnParticipant.inMultiDocumentTransaction();
         uassert(50781,
                 str::stream() << "Cannot write to system collection " << nsString.ns()
                               << " within a transaction.",
@@ -325,7 +324,7 @@ public:
         const auto stmtId = 0;
         if (opCtx->getTxnNumber() && !inTransaction) {
             const auto txnParticipant = TransactionParticipant::get(opCtx);
-            if (auto entry = txnParticipant->checkStatementExecuted(stmtId)) {
+            if (auto entry = txnParticipant.checkStatementExecuted(opCtx, stmtId)) {
                 RetryableWritesStats::get(opCtx)->incrementRetriedCommandsCount();
                 RetryableWritesStats::get(opCtx)->incrementRetriedStatementsCount();
                 parseOplogEntryForFindAndModify(opCtx, args, *entry, &result);

@@ -9,6 +9,7 @@
 
     // These are all commands that can return BackgroundOperationInProgress error codes.
     const commandWhitelist = new Set([
+        "cloneCollectionAsCapped",
         "collMod",
         "compact",
         "convertToCapped",
@@ -28,8 +29,8 @@
         "renameCollection": [ErrorCodes.NamespaceNotFound],
     };
 
-    const kTimeout = 5 * 60 * 1000;
-    const kInterval = 1000;
+    const kTimeout = 10 * 60 * 1000;
+    const kInterval = 200;
 
     // Make it easier to understand whether or not returns from the assert.soon are being retried.
     const kNoRetry = true;
@@ -75,7 +76,9 @@
                 }
 
                 // The following logic only applies to sharded clusters.
-                if (!conn.isMongos()) {
+                if (!conn.isMongos() || !res.raw) {
+                    // We don't attempt to retry commands for which mongos doesn't expose the raw
+                    // responses from the shards.
                     return kNoRetry;
                 }
 
@@ -123,7 +126,7 @@
                 print(message + " on shards: " + tojson(shardsWithBackgroundOps));
                 return kRetry;
             },
-            "Timed out while retrying command '" + tojson(commandObj) + "', response: " +
+            () => "Timed out while retrying command '" + tojson(commandObj) + "', response: " +
                 tojson(res),
             kTimeout,
             kInterval);

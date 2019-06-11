@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -33,11 +32,11 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/s/commands/kill_sessions_remote.h"
+#include "mongo/s/commands/kill_sessions_remote_gen.h"
 
 #include "mongo/db/client.h"
 #include "mongo/db/kill_sessions_common.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/executor/async_multicaster.h"
 #include "mongo/executor/task_executor_pool.h"
@@ -50,12 +49,6 @@
 namespace mongo {
 
 namespace {
-
-constexpr size_t kMaxConcurrency = 100;
-constexpr Milliseconds kTimeout = Milliseconds(60000);
-
-MONGO_EXPORT_STARTUP_SERVER_PARAMETER(KillSessionsMaxConcurrency, int, kMaxConcurrency);
-MONGO_EXPORT_STARTUP_SERVER_PARAMETER(KillSessionsPerHostTimeoutMS, int, kTimeout.count());
 
 /**
  * Get all hosts in the cluster.
@@ -96,10 +89,10 @@ SessionKiller::Result parallelExec(OperationContext* opCtx,
     std::vector<HostAndPort> failed;
 
     executor::AsyncMulticaster::Options options;
-    options.maxConcurrency = KillSessionsMaxConcurrency;
+    options.maxConcurrency = gKillSessionsMaxConcurrency;
     auto results =
         executor::AsyncMulticaster(executor, options)
-            .multicast(servers, "admin", cmd, opCtx, Milliseconds(KillSessionsPerHostTimeoutMS));
+            .multicast(servers, "admin", cmd, opCtx, Milliseconds(gKillSessionsPerHostTimeoutMS));
 
     for (const auto& result : results) {
         if (!std::get<1>(result).isOK()) {

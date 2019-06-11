@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -68,8 +67,10 @@ TEST(LockStats, Wait) {
         ASSERT_EQUALS(LOCK_WAITING, lockerConflict.lockBegin(nullptr, resId, MODE_S));
 
         // Sleep 1 millisecond so the wait time passes
-        ASSERT_EQUALS(LOCK_TIMEOUT,
-                      lockerConflict.lockComplete(resId, MODE_S, Date_t::now() + Milliseconds(5)));
+        ASSERT_THROWS_CODE(
+            lockerConflict.lockComplete(resId, MODE_S, Date_t::now() + Milliseconds(5)),
+            AssertionException,
+            ErrorCodes::LockTimeout);
     }
 
     // Make sure that the waits/blocks are non-zero
@@ -112,8 +113,9 @@ TEST(LockStats, Subtraction) {
 
     {
         LockerForTests lockerConflict(MODE_IX);
-        ASSERT_EQUALS(LOCK_TIMEOUT,
-                      lockerConflict.lock(resId, MODE_S, Date_t::now() + Milliseconds(5)));
+        ASSERT_THROWS_CODE(lockerConflict.lock(resId, MODE_S, Date_t::now() + Milliseconds(5)),
+                           AssertionException,
+                           ErrorCodes::LockTimeout);
     }
 
     SingleThreadedLockStats stats;
@@ -124,8 +126,9 @@ TEST(LockStats, Subtraction) {
 
     {
         LockerForTests lockerConflict(MODE_IX);
-        ASSERT_EQUALS(LOCK_TIMEOUT,
-                      lockerConflict.lock(resId, MODE_S, Date_t::now() + Milliseconds(5)));
+        ASSERT_THROWS_CODE(lockerConflict.lock(resId, MODE_S, Date_t::now() + Milliseconds(5)),
+                           AssertionException,
+                           ErrorCodes::LockTimeout);
     }
 
     SingleThreadedLockStats stats2;
@@ -138,6 +141,68 @@ TEST(LockStats, Subtraction) {
     ASSERT_EQUALS(1, stats2.get(resId, MODE_S).numAcquisitions);
     ASSERT_EQUALS(1, stats2.get(resId, MODE_S).numWaits);
     ASSERT_GREATER_THAN(stats2.get(resId, MODE_S).combinedWaitTimeMicros, 0);
+}
+
+namespace {
+void assertAcquisitionStats(ResourceId rid) {
+    resetGlobalLockStats();
+
+    SingleThreadedLockStats stats;
+    reportGlobalLockingStats(&stats);
+    ASSERT_EQUALS(0, stats.get(rid, LockMode::MODE_IX).numAcquisitions);
+
+    LockerImpl locker;
+    if (rid == resourceIdGlobal) {
+        locker.lockGlobal(LockMode::MODE_IX);
+    } else {
+        locker.lock(rid, LockMode::MODE_IX);
+    }
+
+    reportGlobalLockingStats(&stats);
+    if (rid == resourceIdGlobal) {
+        ASSERT_EQUALS(1, stats.get(resourceIdGlobal, LockMode::MODE_IX).numAcquisitions);
+    } else {
+        ASSERT_EQUALS(0, stats.get(resourceIdGlobal, LockMode::MODE_IX).numAcquisitions);
+    }
+
+    if (rid == resourceIdGlobal) {
+        ASSERT_TRUE(locker.unlockGlobal());
+    } else {
+        ASSERT_TRUE(locker.unlock(rid));
+    }
+}
+}  // namespace
+
+TEST(LockStats, GlobalRetrievableSeparately) {
+    assertAcquisitionStats(resourceIdGlobal);
+    assertAcquisitionStats(resourceIdParallelBatchWriterMode);
+    assertAcquisitionStats(resourceIdReplicationStateTransitionLock);
+}
+
+TEST(LockStats, ServerStatusAggregatesAllGlobal) {
+    resetGlobalLockStats();
+
+    SingleThreadedLockStats stats;
+    reportGlobalLockingStats(&stats);
+    BSONObjBuilder builder;
+    stats.report(&builder);
+    ASSERT_EQUALS(0, builder.done().nFields());
+
+    LockerImpl locker;
+    locker.lockGlobal(LockMode::MODE_IX);
+    locker.lock(resourceIdParallelBatchWriterMode, LockMode::MODE_IX);
+    locker.lock(resourceIdReplicationStateTransitionLock, LockMode::MODE_IX);
+
+    locker.unlock(resourceIdReplicationStateTransitionLock);
+    locker.unlock(resourceIdParallelBatchWriterMode);
+    locker.unlockGlobal();
+
+    reportGlobalLockingStats(&stats);
+    BSONObjBuilder builder2;
+    stats.report(&builder2);
+    ASSERT_EQUALS(
+        3,
+        builder2.done().getObjectField("Global").getObjectField("acquireCount").getIntField("w"));
 }
 
 }  // namespace mongo

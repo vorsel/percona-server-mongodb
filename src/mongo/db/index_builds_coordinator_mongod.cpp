@@ -35,6 +35,8 @@
 
 #include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/db_raii.h"
+#include "mongo/db/index_build_entry_helpers.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
 #include "mongo/util/assert_util.h"
@@ -42,6 +44,8 @@
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
+
+using namespace indexbuildentryhelpers;
 
 namespace {
 
@@ -85,39 +89,40 @@ IndexBuildsCoordinatorMongod::startIndexBuild(OperationContext* opCtx,
                                               CollectionUUID collectionUUID,
                                               const std::vector<BSONObj>& specs,
                                               const UUID& buildUUID,
-                                              IndexBuildProtocol protocol) {
-    std::vector<std::string> indexNames;
-    for (auto& spec : specs) {
-        std::string name = spec.getStringField(IndexDescriptor::kIndexNameFieldName);
-        if (name.empty()) {
-            return Status(
-                ErrorCodes::CannotCreateIndex,
-                str::stream() << "Cannot create an index for a spec '" << spec
-                              << "' without a non-empty string value for the 'name' field");
-        }
-        indexNames.push_back(name);
+                                              IndexBuildProtocol protocol,
+                                              IndexBuildOptions indexBuildOptions) {
+    auto statusWithOptionalResult = _registerAndSetUpIndexBuild(
+        opCtx, collectionUUID, specs, buildUUID, protocol, indexBuildOptions.commitQuorum);
+    if (!statusWithOptionalResult.isOK()) {
+        return statusWithOptionalResult.getStatus();
     }
 
-    auto nss = UUIDCatalog::get(opCtx).lookupNSSByUUID(collectionUUID);
-    auto dbName = nss.db().toString();
-    auto replIndexBuildState = std::make_shared<ReplIndexBuildState>(
-        buildUUID, collectionUUID, dbName, indexNames, specs, protocol);
-
-    Status status = _registerIndexBuild(opCtx, replIndexBuildState);
-    if (!status.isOK()) {
-        return status;
+    if (statusWithOptionalResult.getValue()) {
+        // TODO (SERVER-37644): when joining is implemented, the returned Future will no longer
+        // always be set.
+        invariant(statusWithOptionalResult.getValue()->isReady());
+        // The requested index (specs) are already built or are being built. Return success early
+        // (this is v4.0 behavior compatible).
+        return statusWithOptionalResult.getValue().get();
     }
+
+    auto replState = [&]() {
+        stdx::unique_lock<stdx::mutex> lk(_mutex);
+        auto it = _allIndexBuilds.find(buildUUID);
+        invariant(it != _allIndexBuilds.end());
+        return it->second;
+    }();
 
     // Run index build in-line if we are transitioning between replication modes.
-    // While the RSTLExclusive is being held, the async thread in the thread pool is not allowed
-    // to take locks.
+    // While the RSTLExclusive is being held, an async thread in the thread pool would not be
+    // allowed to take locks.
     if (opCtx->lockState()->isRSTLExclusive()) {
         log() << "Running index build on current thread because we are transitioning between "
                  "replication states: "
               << buildUUID;
         // Sets up and runs the index build. Sets result and cleans up index build.
         _runIndexBuild(opCtx, buildUUID);
-        return replIndexBuildState->sharedPromise.getFuture();
+        return replState->sharedPromise.getFuture();
     }
 
     // Copy over all necessary OperationContext state.
@@ -140,20 +145,23 @@ IndexBuildsCoordinatorMongod::startIndexBuild(OperationContext* opCtx,
 
     // Task in thread pool should have similar CurOp representation to the caller so that it can be
     // identified as a createIndexes operation.
+    LogicalOp logicalOp = LogicalOp::opInvalid;
     BSONObj opDesc;
     {
         stdx::unique_lock<Client> lk(*opCtx->getClient());
         auto curOp = CurOp::get(opCtx);
+        logicalOp = curOp->getLogicalOp();
         opDesc = curOp->opDescription().getOwned();
     }
 
-    status = _threadPool.schedule([
+    Status status = _threadPool.schedule([
         this,
         buildUUID,
         deadline,
         timeoutError,
         writesAreReplicated,
         shouldNotConflictWithSecondaryBatchApplication,
+        logicalOp,
         opDesc
     ]() noexcept {
         auto opCtx = Client::getCurrent()->makeOperationContext();
@@ -174,6 +182,7 @@ IndexBuildsCoordinatorMongod::startIndexBuild(OperationContext* opCtx,
         {
             stdx::unique_lock<Client> lk(*opCtx->getClient());
             auto curOp = CurOp::get(opCtx.get());
+            curOp->setLogicalOp_inlock(logicalOp);
             curOp->setOpDescription_inlock(opDesc);
         }
 
@@ -187,15 +196,15 @@ IndexBuildsCoordinatorMongod::startIndexBuild(OperationContext* opCtx,
 
         // Unregister the index build before setting the promises, so callers do not see the build
         // again.
-        _unregisterIndexBuild(lk, opCtx, replIndexBuildState);
+        _unregisterIndexBuild(lk, replState);
 
         // Set the promise in case another thread already joined the index build.
-        replIndexBuildState->sharedPromise.setError(status);
+        replState->sharedPromise.setError(status);
 
         return status;
     }
 
-    return replIndexBuildState->sharedPromise.getFuture();
+    return replState->sharedPromise.getFuture();
 }
 
 Status IndexBuildsCoordinatorMongod::commitIndexBuild(OperationContext* opCtx,
@@ -226,11 +235,66 @@ Status IndexBuildsCoordinatorMongod::voteCommitIndexBuild(const UUID& buildUUID,
     return Status::OK();
 }
 
-Status IndexBuildsCoordinatorMongod::setCommitQuorum(const NamespaceString& nss,
+Status IndexBuildsCoordinatorMongod::setCommitQuorum(OperationContext* opCtx,
+                                                     const NamespaceString& nss,
                                                      const std::vector<StringData>& indexNames,
                                                      const CommitQuorumOptions& newCommitQuorum) {
-    // TODO: not yet implemented.
-    return Status::OK();
+    if (indexNames.empty()) {
+        return Status(ErrorCodes::IndexNotFound,
+                      str::stream()
+                          << "Cannot set a new commit quorum on an index build in collection '"
+                          << nss
+                          << "' without providing any indexes.");
+    }
+
+    AutoGetCollectionForRead autoColl(opCtx, nss);
+    Collection* collection = autoColl.getCollection();
+    if (!collection) {
+        return Status(ErrorCodes::NamespaceNotFound,
+                      str::stream() << "Collection '" << nss << "' was not found.");
+    }
+
+    UUID collectionUUID = *collection->uuid();
+
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    auto collectionIt = _collectionIndexBuilds.find(collectionUUID);
+    if (collectionIt == _collectionIndexBuilds.end()) {
+        return Status(ErrorCodes::IndexNotFound,
+                      str::stream() << "No index builds found on collection '" << nss << "'.");
+    }
+
+    if (!collectionIt->second->hasIndexBuildState(lk, indexNames.front())) {
+        return Status(ErrorCodes::IndexNotFound,
+                      str::stream() << "Cannot find an index build on collection '" << nss
+                                    << "' with the provided index names");
+    }
+
+    // Use the first index to get the ReplIndexBuildState.
+    std::shared_ptr<ReplIndexBuildState> buildState =
+        collectionIt->second->getIndexBuildState(lk, indexNames.front());
+
+    // Ensure the ReplIndexBuildState has the same indexes as 'indexNames'.
+    bool equal = std::equal(
+        buildState->indexNames.begin(), buildState->indexNames.end(), indexNames.begin());
+    if (buildState->indexNames.size() != indexNames.size() || !equal) {
+        return Status(ErrorCodes::IndexNotFound,
+                      str::stream() << "Provided indexes are not all being "
+                                    << "built by the same index builder in collection '"
+                                    << nss
+                                    << "'.");
+    }
+
+    // See if the new commit quorum is satisfiable.
+    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    Status status = replCoord->checkIfCommitQuorumCanBeSatisfied(newCommitQuorum);
+    if (!status.isOK()) {
+        return status;
+    }
+
+    // Persist the new commit quorum for the index build and write it to the collection.
+    buildState->commitQuorum = newCommitQuorum;
+    const UUID buildUUID = buildState->buildUUID;
+    return indexbuildentryhelpers::setCommitQuorum(opCtx, buildUUID, newCommitQuorum);
 }
 
 Status IndexBuildsCoordinatorMongod::_finishScanningPhase() {

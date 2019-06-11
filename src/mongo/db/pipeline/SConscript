@@ -140,6 +140,7 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/query/datetime/date_time_support',
         '$BUILD_DIR/mongo/db/server_options_core',
+        '$BUILD_DIR/mongo/util/regex_util',
         '$BUILD_DIR/mongo/util/summation',
         'dependencies',
         'document_value',
@@ -403,7 +404,6 @@ pipelineeEnv.Library(
         'document_source_sort_by_count.cpp',
         'document_source_tee_consumer.cpp',
         'document_source_unwind.cpp',
-        'document_source_watch_for_uuid.cpp',
         'pipeline.cpp',
         'sequential_document_cache.cpp',
         'stage_constraints.cpp',

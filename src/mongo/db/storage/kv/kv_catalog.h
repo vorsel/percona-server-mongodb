@@ -1,6 +1,3 @@
-// kv_catalog.h
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -69,7 +66,7 @@ public:
      * @return error or ident for instance
      */
     Status newCollection(OperationContext* opCtx,
-                         StringData ns,
+                         const NamespaceString& ns,
                          const CollectionOptions& options,
                          KVPrefix prefix);
 

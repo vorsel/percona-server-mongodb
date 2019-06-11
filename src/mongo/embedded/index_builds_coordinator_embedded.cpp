@@ -48,32 +48,35 @@ IndexBuildsCoordinatorEmbedded::startIndexBuild(OperationContext* opCtx,
                                                 CollectionUUID collectionUUID,
                                                 const std::vector<BSONObj>& specs,
                                                 const UUID& buildUUID,
-                                                IndexBuildProtocol protocol) {
-    std::vector<std::string> indexNames;
-    for (auto& spec : specs) {
-        std::string name = spec.getStringField(IndexDescriptor::kIndexNameFieldName);
-        if (name.empty()) {
-            return Status(
-                ErrorCodes::CannotCreateIndex,
-                str::stream() << "Cannot create an index for a spec '" << spec
-                              << "' without a non-empty string value for the 'name' field");
-        }
-        indexNames.push_back(name);
+                                                IndexBuildProtocol protocol,
+                                                IndexBuildOptions indexBuildOptions) {
+    invariant(!opCtx->lockState()->isLocked());
+
+    auto statusWithOptionalResult = _registerAndSetUpIndexBuild(
+        opCtx, collectionUUID, specs, buildUUID, protocol, indexBuildOptions.commitQuorum);
+    if (!statusWithOptionalResult.isOK()) {
+        return statusWithOptionalResult.getStatus();
     }
 
-    auto nss = UUIDCatalog::get(opCtx).lookupNSSByUUID(collectionUUID);
-    auto dbName = nss.db().toString();
-    auto replIndexBuildState = std::make_shared<ReplIndexBuildState>(
-        buildUUID, collectionUUID, dbName, indexNames, specs, protocol);
-
-    Status status = _registerIndexBuild(opCtx, replIndexBuildState);
-    if (!status.isOK()) {
-        return status;
+    if (statusWithOptionalResult.getValue()) {
+        // TODO (SERVER-37644): when joining is implemented, the returned Future will no longer
+        // always be set.
+        invariant(statusWithOptionalResult.getValue()->isReady());
+        // The requested index (specs) are already built or are being built. Return success early
+        // (this is v4.0 behavior compatible).
+        return statusWithOptionalResult.getValue().get();
     }
+
+    auto replState = [&]() {
+        stdx::unique_lock<stdx::mutex> lk(_mutex);
+        auto it = _allIndexBuilds.find(buildUUID);
+        invariant(it != _allIndexBuilds.end());
+        return it->second;
+    }();
 
     _runIndexBuild(opCtx, buildUUID);
 
-    return replIndexBuildState->sharedPromise.getFuture();
+    return replState->sharedPromise.getFuture();
 }
 
 Status IndexBuildsCoordinatorEmbedded::commitIndexBuild(OperationContext* opCtx,
@@ -99,7 +102,8 @@ Status IndexBuildsCoordinatorEmbedded::voteCommitIndexBuild(const UUID& buildUUI
     MONGO_UNREACHABLE;
 }
 
-Status IndexBuildsCoordinatorEmbedded::setCommitQuorum(const NamespaceString& nss,
+Status IndexBuildsCoordinatorEmbedded::setCommitQuorum(OperationContext* opCtx,
+                                                       const NamespaceString& nss,
                                                        const std::vector<StringData>& indexNames,
                                                        const CommitQuorumOptions& newCommitQuorum) {
     MONGO_UNREACHABLE;

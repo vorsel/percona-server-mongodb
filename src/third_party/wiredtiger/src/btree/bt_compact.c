@@ -30,7 +30,7 @@ __compact_rewrite(WT_SESSION_IMPL *session, WT_REF *ref, bool *skipp)
 
 	/* If the page is clean, test the original addresses. */
 	if (__wt_page_evict_clean(page)) {
-		__wt_ref_info(ref, &addr, &addr_size, NULL);
+		__wt_ref_info(session, ref, &addr, &addr_size, NULL);
 		if (addr == NULL)
 			return (0);
 		return (
@@ -104,6 +104,39 @@ __compact_rewrite_lock(WT_SESSION_IMPL *session, WT_REF *ref, bool *skipp)
 }
 
 /*
+ * __compact_progress --
+ *     Output a compact progress message.
+ */
+static void
+__compact_progress(WT_SESSION_IMPL *session)
+{
+	struct timespec cur_time;
+	WT_BM *bm;
+	uint64_t time_diff;
+
+	if (!WT_VERBOSE_ISSET(session, WT_VERB_COMPACT_PROGRESS))
+		return;
+
+	bm = S2BT(session)->bm;
+	__wt_epoch(session, &cur_time);
+
+	/* Log one progress message every twenty seconds. */
+	time_diff = WT_TIMEDIFF_SEC(cur_time, session->compact->begin);
+	if (time_diff / WT_PROGRESS_MSG_PERIOD >
+	    session->compact->prog_msg_count) {
+		__wt_verbose(session,
+		    WT_VERB_COMPACT_PROGRESS, "Compact running"
+		    " for %" PRIu64 " seconds; reviewed %"
+		    PRIu64 " pages, skipped %" PRIu64 " pages,"
+		    " wrote %" PRIu64 " pages", time_diff,
+		    bm->block->compact_pages_reviewed,
+		    bm->block->compact_pages_skipped,
+		    bm->block->compact_pages_written);
+		session->compact->prog_msg_count++;
+	}
+}
+
+/*
  * __wt_compact --
  *	Compact a file.
  */
@@ -137,6 +170,7 @@ __wt_compact(WT_SESSION_IMPL *session)
 		 * Quit if eviction is stuck, we're making the problem worse.
 		 */
 		if (++i > 100) {
+			__compact_progress(session);
 			WT_ERR(__wt_session_compact_check_timeout(session));
 
 			if (__wt_cache_stuck(session))
@@ -249,7 +283,7 @@ __wt_compact_page_skip(
 	 * if it's useful to rewrite leaf pages, don't do the I/O if a rewrite
 	 * won't help.
 	 */
-	__wt_ref_info(ref, &addr, &addr_size, &type);
+	__wt_ref_info(session, ref, &addr, &addr_size, &type);
 	WT_ASSERT(session, addr != NULL);
 	if (addr != NULL && type != WT_CELL_ADDR_INT) {
 		bm = S2BT(session)->bm;

@@ -53,10 +53,29 @@ env.SConscript(
     ],
 )
 
+allocatorEnv = env.Clone()
+if allocatorEnv['MONGO_ALLOCATOR'] == 'tcmalloc':
+    allocatorEnv.Append(
+            CPPDEFINES=[
+                'MONGO_USE_GPERFTOOLS_TCMALLOC',
+            ]
+        )
+
+    if not use_system_version_of_library('tcmalloc'):
+        # Add in the include path for our vendored tcmalloc.
+        allocatorEnv.InjectThirdParty('gperftools')
+
+        # If our changes to tcmalloc are ever upstreamed, this should become set based on a top
+        # level configure check, though its effects should still be scoped just to these files.
+
+    if not use_system_version_of_library('valgrind'):
+        # Include valgrind since tcmalloc disables itself while running under valgrind
+        allocatorEnv.InjectThirdParty('valgrind')
+
 # NOTE: This library does not really belong here. Its presence here is
 # temporary. Do not add to this library, do not remove from it, and do
 # not declare other libraries in this file.
-env.Library(
+allocatorEnv.Library(
     target='base',
     source=[
         'base/data_range.cpp',
@@ -77,6 +96,7 @@ env.Library(
         'base/simple_string_data_comparator.cpp',
         'base/status.cpp',
         'base/string_data.cpp',
+        'base/transaction_error.cpp',
         'base/validate_locale.cpp',
         'bson/bson_comparator_interface_base.cpp',
         'bson/bson_depth.cpp',
@@ -352,7 +372,6 @@ mongod = env.Program(
         'db/index/index_access_method',
         'db/index_builds_coordinator_mongod',
         'db/index/index_descriptor',
-        'db/index_d',
         'db/initialize_snmp',
         'db/introspect',
         'db/keys_collection_client_direct',
@@ -412,6 +431,7 @@ mongod = env.Program(
         'db/update/update_driver',
         'db/update_index_data',
         'db/views/views_mongod',
+        'db/windows_options' if env.TargetOSIs('windows') else [],
         'executor/network_interface_factory',
         'mongod_options_init',
         'rpc/rpc',
@@ -503,8 +523,10 @@ mongos = env.Program(
         'db/logical_time_metadata_hook',
         'db/mongodandmongos',
         'db/server_options',
+        'db/server_options_base',
         'db/startup_warnings_common',
         'db/stats/counters',
+        'db/windows_options' if env.TargetOSIs('windows') else [],
         's/commands/cluster_commands',
         's/commands/shared_cluster_commands',
         's/committed_optime_metadata_hook',
@@ -582,9 +604,6 @@ if not has_option('noshell') and usemozjs:
                     'executor/thread_pool_task_executor',
                     'executor/network_interface_thread_pool',
                     'executor/network_interface_factory'
-                ],
-                LIBDEPS_PRIVATE=[
-                    'db/server_parameters',
                 ],
                 # Because `::environ` is resolved in `/usr/lib/crt1.o` on FreeBSD, this library
                 # needs to be marked `incomplete` on FreeBSD.
@@ -684,17 +703,20 @@ def installBinary( e, name ):
             name,
             debug_sym_cmd
         )
+        e.NoCache(debug_sym)
         e.Install("#/", debug_sym)
         e.Alias('debugsymbols', debug_sym)
         distDebugSymbols.append(debug_sym)
 
     if env.TargetOSIs('linux', 'solaris') and (not has_option("nostrip")):
+        stripped_name = 'stripped/%s' % name
         strip_cmd = e.Command(
-            'stripped/%s' % name,
+            stripped_name,
             [name, debug_sym],
             '${OBJCOPY} --strip-debug --add-gnu-debuglink ${SOURCES[1]} ${SOURCES[0]} $TARGET'
         )
-        distBinaries.append('stripped/%s' % name)
+        e.NoCache(stripped_name)
+        distBinaries.append(stripped_name)
     else:
         distBinaries.append(name)
 
@@ -818,7 +840,7 @@ if env.TargetOSIs('posix'):
 # "dist" target is valid only when --use-new-tools is specified
 # Attempts to build release artifacts without tools must fail
 if has_option("use-new-tools"):
-    env.Command(
+    server_archive = env.Command(
         target='#/${SERVER_ARCHIVE}',
         source=['#buildscripts/make_archive.py'] + env["MODULE_BANNERS"] + env["ARCHIVE_ADDITIONS"] + distBinaries,
         action=' '.join(
@@ -839,7 +861,8 @@ if has_option("use-new-tools"):
         BUILD_DIR=env.Dir('$BUILD_DIR').path
     )
 
-    env.Alias("dist", source='#/${SERVER_ARCHIVE}')
+    env.Alias("dist", server_archive)
+    env.NoCache(server_archive)
 else:
     def failDist(env, target, source):
         env.FatalError("ERROR: 'dist' target only valid with --use-new-tools.")
@@ -861,6 +884,7 @@ debug_symbols_dist = env.Command(
 )
 
 env.Alias('dist-debugsymbols', debug_symbols_dist)
+env.NoCache(debug_symbols_dist)
 
 #final alias
 if not hygienic:

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -67,7 +66,7 @@ std::vector<BSONObj> MongoProcessCommon::getCurrentOps(
         // If auth is disabled, ignore the allUsers parameter.
         if (ctxAuth->getAuthorizationManager().isAuthEnabled() &&
             userMode == CurrentOpUserMode::kExcludeOthers &&
-            !ctxAuth->isCoauthorizedWithClient(client)) {
+            !ctxAuth->isCoauthorizedWithClient(client, lk)) {
             continue;
         }
 

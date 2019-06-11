@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -96,7 +95,8 @@ KillOpCmdBase::findOpForKilling(Client* client, unsigned int opId) {
         OperationContext* opToKill = std::get<1>(*lockAndOpCtx);
         if (authzSession->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
                                                            ActionType::killop) ||
-            authzSession->isCoauthorizedWithClient(opToKill->getClient())) {
+            authzSession->isCoauthorizedWithClient(opToKill->getClient(),
+                                                   std::get<0>(*lockAndOpCtx))) {
             return lockAndOpCtx;
         }
     }

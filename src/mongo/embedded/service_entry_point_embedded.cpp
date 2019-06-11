@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -76,7 +75,7 @@ public:
     void waitForLinearizableReadConcern(OperationContext* opCtx) const override {
         if (repl::ReadConcernArgs::get(opCtx).getLevel() ==
             repl::ReadConcernLevel::kLinearizableReadConcern) {
-            uassertStatusOK(mongo::waitForLinearizableReadConcern(opCtx));
+            uassertStatusOK(mongo::waitForLinearizableReadConcern(opCtx, 0));
         }
     }
 

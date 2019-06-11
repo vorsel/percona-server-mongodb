@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -60,10 +59,10 @@ AsyncWorkScheduler::AsyncWorkScheduler(ServiceContext* serviceContext)
 
 AsyncWorkScheduler::~AsyncWorkScheduler() {
     {
-        stdx::lock_guard<stdx::mutex> lg(_mutex);
-        invariant(_activeOpContexts.empty());
-        invariant(_activeHandles.empty());
-        invariant(_childSchedulers.empty());
+        stdx::unique_lock<stdx::mutex> ul(_mutex);
+        _allListsEmptyCV.wait(ul, [&] {
+            return _activeOpContexts.empty() && _activeHandles.empty() && _childSchedulers.empty();
+        });
     }
 
     if (!_parent)
@@ -71,6 +70,7 @@ AsyncWorkScheduler::~AsyncWorkScheduler() {
 
     stdx::lock_guard<stdx::mutex> lg(_parent->_mutex);
     _parent->_childSchedulers.erase(_itToRemove);
+    _parent->_notifyAllTasksComplete(lg);
     _parent = nullptr;
 }
 
@@ -96,7 +96,8 @@ Future<executor::TaskExecutor::ResponseStatus> AsyncWorkScheduler::scheduleRemot
                                                                                   opCtx) {
             // Note: This internal authorization is tied to the lifetime of 'opCtx', which is
             // destroyed by 'scheduleWork' immediately after this lambda ends.
-            AuthorizationSession::get(Client::getCurrent())->grantInternalAuthorization();
+            AuthorizationSession::get(Client::getCurrent())
+                ->grantInternalAuthorization(Client::getCurrent());
 
             if (MONGO_FAIL_POINT(hangWhileTargetingLocalHost)) {
                 LOG(0) << "Hit hangWhileTargetingLocalHost failpoint";
@@ -166,6 +167,7 @@ Future<executor::TaskExecutor::ResponseStatus> AsyncWorkScheduler::scheduleRemot
                 [ this, it = std::move(it) ](StatusWith<ResponseStatus> s) {
                     stdx::lock_guard<stdx::mutex> lg(_mutex);
                     _activeHandles.erase(it);
+                    _notifyAllTasksComplete(lg);
                 });
         });
 }
@@ -213,13 +215,18 @@ Future<HostAndPort> AsyncWorkScheduler::_targetHostAsync(const ShardId& shardId,
         const auto shard = uassertStatusOK(shardRegistry->getShard(opCtx, shardId));
 
         if (MONGO_FAIL_POINT(hangWhileTargetingRemoteHost)) {
-            LOG(0) << "Hit hangWhileTargetingRemoteHost failpoint";
+            LOG(0) << "Hit hangWhileTargetingRemoteHost failpoint for shard " << shardId;
             MONGO_FAIL_POINT_PAUSE_WHILE_SET_OR_INTERRUPTED(opCtx, hangWhileTargetingRemoteHost);
         }
 
         // TODO (SERVER-35678): Return a SemiFuture<HostAndPort> rather than using a blocking call
         return shard->getTargeter()->findHostWithMaxWait(readPref, Seconds(20)).get(opCtx);
     });
+}
+
+void AsyncWorkScheduler::_notifyAllTasksComplete(WithLock) {
+    if (_activeOpContexts.empty() && _activeHandles.empty() && _childSchedulers.empty())
+        _allListsEmptyCV.notify_all();
 }
 
 Future<void> whenAll(std::vector<Future<void>>& futures) {

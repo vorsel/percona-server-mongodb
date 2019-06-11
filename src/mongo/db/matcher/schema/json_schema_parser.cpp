@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -41,6 +40,7 @@
 #include "mongo/db/matcher/expression_always_boolean.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/matcher/matcher_type_set.h"
+#include "mongo/db/matcher/schema/encrypt_schema_gen.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_all_elem_match_from_index.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_allowed_properties.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_cond.h"
@@ -57,6 +57,7 @@
 #include "mongo/db/matcher/schema/expression_internal_schema_root_doc_eq.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_unique_items.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_xor.h"
+#include "mongo/db/matcher/schema/json_pointer.h"
 #include "mongo/logger/log_component_settings.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
@@ -146,46 +147,8 @@ StatusWith<std::unique_ptr<InternalSchemaTypeExpression>> parseType(
     StringData keywordName,
     BSONElement typeElt,
     const StringMap<BSONType>& aliasMap) {
-    if (typeElt.type() != BSONType::String && typeElt.type() != BSONType::Array) {
-        return {Status(ErrorCodes::TypeMismatch,
-                       str::stream() << "$jsonSchema keyword '" << keywordName
-                                     << "' must be either a string or an array of strings")};
-    }
 
-    std::set<StringData> aliases;
-    if (typeElt.type() == BSONType::String) {
-        if (typeElt.valueStringData() == JSONSchemaParser::kSchemaTypeInteger) {
-            return {ErrorCodes::FailedToParse,
-                    str::stream() << "$jsonSchema type '" << JSONSchemaParser::kSchemaTypeInteger
-                                  << "' is not currently supported."};
-        }
-        aliases.insert(typeElt.valueStringData());
-    } else {
-        for (auto&& typeArrayEntry : typeElt.embeddedObject()) {
-            if (typeArrayEntry.type() != BSONType::String) {
-                return {Status(ErrorCodes::TypeMismatch,
-                               str::stream() << "$jsonSchema keyword '" << keywordName
-                                             << "' array elements must be strings")};
-            }
-
-            if (typeArrayEntry.valueStringData() == JSONSchemaParser::kSchemaTypeInteger) {
-                return {ErrorCodes::FailedToParse,
-                        str::stream() << "$jsonSchema type '"
-                                      << JSONSchemaParser::kSchemaTypeInteger
-                                      << "' is not currently supported."};
-            }
-
-            auto insertionResult = aliases.insert(typeArrayEntry.valueStringData());
-            if (!insertionResult.second) {
-                return {Status(ErrorCodes::FailedToParse,
-                               str::stream() << "$jsonSchema keyword '" << keywordName
-                                             << "' has duplicate value: "
-                                             << typeArrayEntry.valueStringData())};
-            }
-        }
-    }
-
-    auto typeSet = MatcherTypeSet::fromStringAliases(std::move(aliases), aliasMap);
+    auto typeSet = JSONSchemaParser::parseTypeSet(typeElt, aliasMap);
     if (!typeSet.isOK()) {
         return typeSet.getStatus();
     }
@@ -1318,21 +1281,62 @@ Status translateScalarKeywords(StringMap<BSONElement>& keywordMap,
  */
 Status translateEncryptionKeywords(StringMap<BSONElement>& keywordMap,
                                    StringData path,
-                                   InternalSchemaTypeExpression* typeExpr,
                                    AndMatchExpression* andExpr) {
-    if (auto encryptElt = keywordMap[JSONSchemaParser::kSchemaEncryptKeyword]) {
-        if (encryptElt.type() != BSONType::Object) {
+    auto encryptElt = keywordMap[JSONSchemaParser::kSchemaEncryptKeyword];
+    auto encryptMetadataElt = keywordMap[JSONSchemaParser::kSchemaEncryptMetadataKeyword];
+
+    if (encryptElt && encryptMetadataElt) {
+        return Status(ErrorCodes::FailedToParse,
+                      str::stream() << "Cannot specify both $jsonSchema keywords '"
+                                    << JSONSchemaParser::kSchemaEncryptKeyword
+                                    << "' and '"
+                                    << JSONSchemaParser::kSchemaEncryptMetadataKeyword
+                                    << "'");
+    }
+
+    if (encryptMetadataElt) {
+        if (encryptMetadataElt.type() != BSONType::Object) {
+            return {ErrorCodes::TypeMismatch,
+                    str::stream() << "$jsonSchema keyword '"
+                                  << JSONSchemaParser::kSchemaEncryptMetadataKeyword
+                                  << "' must be an object "};
+        } else if (encryptMetadataElt.embeddedObject().isEmpty()) {
             return {ErrorCodes::FailedToParse,
+                    str::stream() << "$jsonSchema keyword '"
+                                  << JSONSchemaParser::kSchemaEncryptMetadataKeyword
+                                  << "' cannot be an empty object "};
+        }
+
+        const IDLParserErrorContext ctxt("encryptMetadata");
+        try {
+            // Discard the result as we are only concerned with validation.
+            EncryptionMetadata::parse(ctxt, encryptMetadataElt.embeddedObject());
+        } catch (const AssertionException&) {
+            return exceptionToStatus();
+        }
+    }
+
+    if (encryptElt) {
+        if (encryptElt.type() != BSONType::Object) {
+            return {ErrorCodes::TypeMismatch,
                     str::stream() << "$jsonSchema keyword '"
                                   << JSONSchemaParser::kSchemaEncryptKeyword
                                   << "' must be an object "};
-        } else if (!encryptElt.embeddedObject().isEmpty()) {
-            return {ErrorCodes::FailedToParse,
-                    str::stream() << "$jsonSchema keyword '"
-                                  << JSONSchemaParser::kSchemaEncryptKeyword
-                                  << "' must be an empty object "};
         }
-        andExpr->add(new InternalSchemaBinDataSubTypeExpression(path, BinDataType::Encrypt));
+
+        try {
+            // This checks the types of all the fields. Will throw on any parsing error.
+            const IDLParserErrorContext encryptCtxt("encrypt");
+            auto encryptInfo = EncryptionInfo::parse(encryptCtxt, encryptElt.embeddedObject());
+
+            andExpr->add(new InternalSchemaBinDataSubTypeExpression(path, BinDataType::Encrypt));
+
+            if (auto typeOptional = encryptInfo.getBsonType())
+                andExpr->add(new InternalSchemaBinDataEncryptedTypeExpression(
+                    path, typeFromName(typeOptional.get())));
+        } catch (const AssertionException&) {
+            return exceptionToStatus();
+        }
     }
 
     return Status::OK();
@@ -1376,6 +1380,7 @@ StatusWithMatchExpression _parse(StringData path, BSONObj schema, bool ignoreUnk
         {std::string(JSONSchemaParser::kSchemaDependenciesKeyword), {}},
         {std::string(JSONSchemaParser::kSchemaDescriptionKeyword), {}},
         {std::string(JSONSchemaParser::kSchemaEncryptKeyword), {}},
+        {std::string(JSONSchemaParser::kSchemaEncryptMetadataKeyword), {}},
         {std::string(JSONSchemaParser::kSchemaEnumKeyword), {}},
         {std::string(JSONSchemaParser::kSchemaExclusiveMaximumKeyword), {}},
         {std::string(JSONSchemaParser::kSchemaExclusiveMinimumKeyword), {}},
@@ -1497,8 +1502,7 @@ StatusWithMatchExpression _parse(StringData path, BSONObj schema, bool ignoreUnk
         return translationStatus;
     }
 
-    translationStatus =
-        translateEncryptionKeywords(keywordMap, path, typeExpr.get(), andExpr.get());
+    translationStatus = translateEncryptionKeywords(keywordMap, path, andExpr.get());
     if (!translationStatus.isOK()) {
         return translationStatus;
     }
@@ -1527,6 +1531,52 @@ StatusWithMatchExpression _parse(StringData path, BSONObj schema, bool ignoreUnk
     return {std::move(andExpr)};
 }
 }  // namespace
+
+StatusWith<MatcherTypeSet> JSONSchemaParser::parseTypeSet(BSONElement typeElt,
+                                                          const StringMap<BSONType>& aliasMap) {
+    if (typeElt.type() != BSONType::String && typeElt.type() != BSONType::Array) {
+        return {Status(ErrorCodes::TypeMismatch,
+                       str::stream() << "$jsonSchema keyword '" << typeElt.fieldNameStringData()
+                                     << "' must be either a string or an array of strings")};
+    }
+
+    std::set<StringData> aliases;
+    if (typeElt.type() == BSONType::String) {
+        if (typeElt.valueStringData() == JSONSchemaParser::kSchemaTypeInteger) {
+            return {ErrorCodes::FailedToParse,
+                    str::stream() << "$jsonSchema type '" << JSONSchemaParser::kSchemaTypeInteger
+                                  << "' is not currently supported."};
+        }
+        aliases.insert(typeElt.valueStringData());
+    } else {
+        for (auto&& typeArrayEntry : typeElt.embeddedObject()) {
+            if (typeArrayEntry.type() != BSONType::String) {
+                return {Status(ErrorCodes::TypeMismatch,
+                               str::stream() << "$jsonSchema keyword '"
+                                             << typeElt.fieldNameStringData()
+                                             << "' array elements must be strings")};
+            }
+
+            if (typeArrayEntry.valueStringData() == JSONSchemaParser::kSchemaTypeInteger) {
+                return {ErrorCodes::FailedToParse,
+                        str::stream() << "$jsonSchema type '"
+                                      << JSONSchemaParser::kSchemaTypeInteger
+                                      << "' is not currently supported."};
+            }
+
+            auto insertionResult = aliases.insert(typeArrayEntry.valueStringData());
+            if (!insertionResult.second) {
+                return {Status(ErrorCodes::FailedToParse,
+                               str::stream() << "$jsonSchema keyword '"
+                                             << typeElt.fieldNameStringData()
+                                             << "' has duplicate value: "
+                                             << typeArrayEntry.valueStringData())};
+            }
+        }
+    }
+
+    return MatcherTypeSet::fromStringAliases(std::move(aliases), aliasMap);
+}
 
 StatusWithMatchExpression JSONSchemaParser::parse(BSONObj schema, bool ignoreUnknownKeywords) {
     LOG(5) << "Parsing JSON Schema: " << schema.jsonString();

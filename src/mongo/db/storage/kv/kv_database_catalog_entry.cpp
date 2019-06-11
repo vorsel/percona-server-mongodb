@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -92,6 +91,10 @@ IndexAccessMethod* KVDatabaseCatalogEntry::getIndex(OperationContext* opCtx,
         return new WildcardAccessMethod(index, sdi);
 
     log() << "Can't find index for keyPattern " << desc->keyPattern();
-    MONGO_UNREACHABLE;
+
+    // We should never reach this point.
+    bool foundIndex = false;
+    fassert(51072, foundIndex);
+    return nullptr;
 }
 }  // namespace mongo

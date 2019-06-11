@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -106,6 +105,7 @@ void ShardingMongodTestFixture::setUp() {
     // Set up this node as part of a replica set.
 
     repl::ReplSettings replSettings;
+    replSettings.setOplogSizeBytes(512'000);
     replSettings.setReplSetString(ConnectionString::forReplicaSet(_setName, _servers).toString());
     auto replCoordPtr = makeReplicationCoordinator(replSettings);
     _replCoord = replCoordPtr.get();
@@ -357,24 +357,6 @@ DistLockManager* ShardingMongodTestFixture::distLock() const {
 RemoteCommandTargeterFactoryMock* ShardingMongodTestFixture::targeterFactory() const {
     invariant(_targeterFactory);
     return _targeterFactory;
-}
-
-void ShardingMongodTestFixture::onCommand(NetworkTestEnv::OnCommandFunction func) {
-    _networkTestEnv->onCommand(func);
-}
-
-void ShardingMongodTestFixture::onCommandWithMetadata(
-    NetworkTestEnv::OnCommandWithMetadataFunction func) {
-    _networkTestEnv->onCommandWithMetadata(func);
-}
-
-void ShardingMongodTestFixture::onFindCommand(NetworkTestEnv::OnFindCommandFunction func) {
-    _networkTestEnv->onFindCommand(func);
-}
-
-void ShardingMongodTestFixture::onFindWithMetadataCommand(
-    NetworkTestEnv::OnFindCommandWithMetadataFunction func) {
-    _networkTestEnv->onFindWithMetadataCommand(func);
 }
 
 }  // namespace mongo

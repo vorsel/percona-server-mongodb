@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -128,12 +127,12 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    void schedule(ScheduleMode mode, Task task) final {
-        if (mode == kDispatch) {
-            asio::dispatch(_ioContext, std::move(task));
-        } else {
-            asio::post(_ioContext, std::move(task));
-        }
+    void schedule(Task task) final {
+        asio::post(_ioContext, std::move(task));
+    }
+
+    void dispatch(Task task) final {
+        asio::dispatch(_ioContext, std::move(task));
     }
 
     bool onReactorThread() const final {

@@ -35,85 +35,24 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/base/status.h"
 #include "mongo/db/storage/inmemory/inmemory_global_options.h"
 #include "mongo/util/log.h"
+
+namespace moe = mongo::optionenvironment;
 
 namespace mongo {
 
 InMemoryGlobalOptions inMemoryGlobalOptions;
 
-Status InMemoryGlobalOptions::add(moe::OptionSection* options) {
-    moe::OptionSection inMemoryOptions("InMemory options");
-
+Status InMemoryGlobalOptions::store(const moe::Environment& params) {
     // InMemory storage engine options
-    inMemoryOptions
-        .addOptionChaining("storage.inMemory.engineConfig.inMemorySizeGB",
-                           "inMemorySizeGB",
-                           moe::Double,
-                           "The maximum memory in gigabytes to use for InMemory storage. "
-                           "See documentation for default.");
-
-    // hidden options
-    inMemoryOptions
-        .addOptionChaining("storage.inMemory.engineConfig.statisticsLogDelaySecs",
-                           "inMemoryStatisticsLogDelaySecs",
-                           moe::Int,
-                           "The number of seconds between writes to statistics log. "
-                           "If 0 is specified then statistics will not be logged.")
-        // FTDC supercedes inMemory's statistics logging.
-        .hidden()
-        .validRange(0, 100000)
-        .setDefault(moe::Value(0));
-    inMemoryOptions
-        .addOptionChaining("storage.inMemory.engineConfig.configString",
-                           "inMemoryEngineConfigString",
-                           moe::String,
-                           "InMemory storage engine custom "
-                           "configuration settings")
-        .hidden();
-    inMemoryOptions
-        .addOptionChaining("storage.inMemory.collectionConfig.configString",
-                           "inMemoryCollectionConfigString",
-                           moe::String,
-                           "InMemory custom collection configuration settings")
-        .hidden();
-    inMemoryOptions
-        .addOptionChaining("storage.inMemory.indexConfig.configString",
-                           "inMemoryIndexConfigString",
-                           moe::String,
-                           "InMemory custom index configuration settings")
-        .hidden();
-
-    return options->addSection(inMemoryOptions);
-}
-
-Status InMemoryGlobalOptions::store(const moe::Environment& params,
-                                    const std::vector<std::string>& args) {
-    // InMemory storage engine options
-    if (params.count("storage.inMemory.engineConfig.inMemorySizeGB")) {
-        inMemoryGlobalOptions.cacheSizeGB =
-            params["storage.inMemory.engineConfig.inMemorySizeGB"].as<double>();
-    }
-    if (params.count("storage.inMemory.engineConfig.statisticsLogDelaySecs")) {
-        inMemoryGlobalOptions.statisticsLogDelaySecs =
-            params["storage.inMemory.engineConfig.statisticsLogDelaySecs"].as<int>();
-    }
-
-    // hidden options
-    if (params.count("storage.inMemory.engineConfig.configString")) {
-        inMemoryGlobalOptions.engineConfig =
-            params["storage.inMemory.engineConfig.configString"].as<std::string>();
+    if (!inMemoryGlobalOptions.engineConfig.empty()) {
         log() << "Engine custom option: " << inMemoryGlobalOptions.engineConfig;
     }
-    if (params.count("storage.inMemory.collectionConfig.configString")) {
-        inMemoryGlobalOptions.collectionConfig =
-            params["storage.inMemory.collectionConfig.configString"].as<std::string>();
+    if (!inMemoryGlobalOptions.collectionConfig.empty()) {
         log() << "Collection custom option: " << inMemoryGlobalOptions.collectionConfig;
     }
-    if (params.count("storage.inMemory.indexConfig.configString")) {
-        inMemoryGlobalOptions.indexConfig =
-            params["storage.inMemory.indexConfig.configString"].as<std::string>();
+    if (!inMemoryGlobalOptions.indexConfig.empty()) {
         log() << "Index custom option: " << inMemoryGlobalOptions.indexConfig;
     }
 

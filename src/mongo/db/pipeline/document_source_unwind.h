@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -39,9 +38,10 @@ class DocumentSourceUnwind final : public DocumentSource {
 public:
     // virtuals from DocumentSource
     GetNextResult getNext() final;
+
     const char* getSourceName() const final;
+
     Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
-    BSONObjSet getOutputSorts() final;
 
     /**
      * Returns the unwound path, and the 'includeArrayIndex' path, if specified.
@@ -58,6 +58,10 @@ public:
 
         constraints.canSwapWithMatch = true;
         return constraints;
+    }
+
+    boost::optional<MergingLogic> mergingLogic() final {
+        return boost::none;
     }
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final;

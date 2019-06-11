@@ -1,6 +1,3 @@
-// progress_meter.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -38,8 +35,6 @@
 #include "mongo/util/progress_meter.h"
 
 #include "mongo/util/log.h"
-
-using namespace std;
 
 namespace mongo {
 
@@ -83,16 +78,16 @@ bool ProgressMeter::hit(int n) {
         if (!_units.empty()) {
             out << " (" << _units << ")";
         }
-        out << endl;
+        out << std::endl;
     }
     _lastTime = t;
     return true;
 }
 
-string ProgressMeter::toString() const {
+std::string ProgressMeter::toString() const {
     if (!_active)
         return "";
-    stringstream buf;
+    std::stringstream buf;
     if (_total) {
         buf << _name << ": " << _done << '/' << _total << ' ' << (_done * 100) / _total << '%';
     } else {
@@ -100,7 +95,7 @@ string ProgressMeter::toString() const {
     }
 
     if (!_units.empty()) {
-        buf << " (" << _units << ")" << endl;
+        buf << " (" << _units << ")" << std::endl;
     }
 
     return buf.str();

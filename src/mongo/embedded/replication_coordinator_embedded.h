@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -129,7 +128,7 @@ public:
                                        boost::optional<Date_t>) override;
 
     Status waitUntilOpTimeForRead(OperationContext*, const repl::ReadConcernArgs&) override;
-    Status awaitOpTimeCommitted(OperationContext* opCtx, repl::OpTime opTime) override;
+    Status awaitTimestampCommitted(OperationContext* opCtx, Timestamp ts) override;
 
     OID getElectionId() override;
 

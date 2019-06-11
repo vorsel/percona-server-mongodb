@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -237,15 +236,17 @@ auto parseFromOplogEntryArray(const BSONObj& obj, int elem) {
 TEST_F(SyncTailTest, SyncApplyNoNamespaceBadOp) {
     const BSONObj op = BSON("op"
                             << "x");
-    ASSERT_THROWS(SyncTail::syncApply(_opCtx.get(), op, OplogApplication::Mode::kInitialSync),
-                  ExceptionFor<ErrorCodes::BadValue>);
+    ASSERT_THROWS(
+        SyncTail::syncApply(_opCtx.get(), op, OplogApplication::Mode::kInitialSync, boost::none),
+        ExceptionFor<ErrorCodes::BadValue>);
 }
 
 TEST_F(SyncTailTest, SyncApplyNoNamespaceNoOp) {
     ASSERT_OK(SyncTail::syncApply(_opCtx.get(),
                                   BSON("op"
                                        << "n"),
-                                  OplogApplication::Mode::kInitialSync));
+                                  OplogApplication::Mode::kInitialSync,
+                                  boost::none));
 }
 
 TEST_F(SyncTailTest, SyncApplyBadOp) {
@@ -253,16 +254,17 @@ TEST_F(SyncTailTest, SyncApplyBadOp) {
                             << "x"
                             << "ns"
                             << "test.t");
-    ASSERT_THROWS(SyncTail::syncApply(_opCtx.get(), op, OplogApplication::Mode::kInitialSync),
-                  ExceptionFor<ErrorCodes::BadValue>);
+    ASSERT_THROWS(
+        SyncTail::syncApply(_opCtx.get(), op, OplogApplication::Mode::kInitialSync, boost::none),
+        ExceptionFor<ErrorCodes::BadValue>);
 }
 
 TEST_F(SyncTailTest, SyncApplyInsertDocumentDatabaseMissing) {
     NamespaceString nss("test.t");
     auto op = makeOplogEntry(OpTypeEnum::kInsert, nss, {});
-    ASSERT_THROWS(
-        SyncTail::syncApply(_opCtx.get(), op.toBSON(), OplogApplication::Mode::kSecondary),
-        ExceptionFor<ErrorCodes::NamespaceNotFound>);
+    ASSERT_THROWS(SyncTail::syncApply(
+                      _opCtx.get(), op.toBSON(), OplogApplication::Mode::kSecondary, boost::none),
+                  ExceptionFor<ErrorCodes::NamespaceNotFound>);
 }
 
 TEST_F(SyncTailTest, SyncApplyDeleteDocumentDatabaseMissing) {
@@ -276,9 +278,9 @@ TEST_F(SyncTailTest, SyncApplyInsertDocumentCollectionLookupByUUIDFails) {
     createDatabase(_opCtx.get(), nss.db());
     NamespaceString otherNss(nss.getSisterNS("othername"));
     auto op = makeOplogEntry(OpTypeEnum::kInsert, otherNss, kUuid);
-    ASSERT_THROWS(
-        SyncTail::syncApply(_opCtx.get(), op.toBSON(), OplogApplication::Mode::kSecondary),
-        ExceptionFor<ErrorCodes::NamespaceNotFound>);
+    ASSERT_THROWS(SyncTail::syncApply(
+                      _opCtx.get(), op.toBSON(), OplogApplication::Mode::kSecondary, boost::none),
+                  ExceptionFor<ErrorCodes::NamespaceNotFound>);
 }
 
 TEST_F(SyncTailTest, SyncApplyDeleteDocumentCollectionLookupByUUIDFails) {
@@ -296,9 +298,9 @@ TEST_F(SyncTailTest, SyncApplyInsertDocumentCollectionMissing) {
     // which in the case of this test just ignores such errors. This tests mostly that we don't
     // implicitly create the collection and lock the database in MODE_X.
     auto op = makeOplogEntry(OpTypeEnum::kInsert, nss, {});
-    ASSERT_THROWS(
-        SyncTail::syncApply(_opCtx.get(), op.toBSON(), OplogApplication::Mode::kSecondary),
-        ExceptionFor<ErrorCodes::NamespaceNotFound>);
+    ASSERT_THROWS(SyncTail::syncApply(
+                      _opCtx.get(), op.toBSON(), OplogApplication::Mode::kSecondary, boost::none),
+                  ExceptionFor<ErrorCodes::NamespaceNotFound>);
     ASSERT_FALSE(collectionExists(_opCtx.get(), nss));
 }
 
@@ -366,7 +368,7 @@ TEST_F(SyncTailTest, SyncApplyCommand) {
                                             const BSONObj&) {
         applyCmdCalled = true;
         ASSERT_TRUE(opCtx);
-        ASSERT_TRUE(opCtx->lockState()->isW());
+        ASSERT_TRUE(opCtx->lockState()->isDbLockedForMode(nss.db(), MODE_X));
         ASSERT_TRUE(opCtx->writesAreReplicated());
         ASSERT_FALSE(documentValidationDisabled(opCtx));
         ASSERT_EQUALS(nss, collNss);
@@ -374,7 +376,8 @@ TEST_F(SyncTailTest, SyncApplyCommand) {
     };
     ASSERT_TRUE(_opCtx->writesAreReplicated());
     ASSERT_FALSE(documentValidationDisabled(_opCtx.get()));
-    ASSERT_OK(SyncTail::syncApply(_opCtx.get(), op, OplogApplication::Mode::kInitialSync));
+    ASSERT_OK(
+        SyncTail::syncApply(_opCtx.get(), op, OplogApplication::Mode::kInitialSync, boost::none));
     ASSERT_TRUE(applyCmdCalled);
 }
 
@@ -389,8 +392,9 @@ TEST_F(SyncTailTest, SyncApplyCommandThrowsException) {
                             << "ts"
                             << Timestamp(1, 1));
     // This test relies on the namespace type check of IDL.
-    ASSERT_THROWS(SyncTail::syncApply(_opCtx.get(), op, OplogApplication::Mode::kInitialSync),
-                  ExceptionFor<ErrorCodes::TypeMismatch>);
+    ASSERT_THROWS(
+        SyncTail::syncApply(_opCtx.get(), op, OplogApplication::Mode::kInitialSync, boost::none),
+        ExceptionFor<ErrorCodes::TypeMismatch>);
 }
 
 DEATH_TEST_F(SyncTailTest, MultiApplyAbortsWhenNoOperationsAreGiven, "!ops.empty()") {
@@ -1499,8 +1503,8 @@ TEST_F(SyncTailTest, LogSlowOpApplicationWhenSuccessful) {
     auto entry = makeOplogEntry(OpTypeEnum::kInsert, nss, {});
 
     startCapturingLogMessages();
-    ASSERT_OK(
-        SyncTail::syncApply(_opCtx.get(), entry.toBSON(), OplogApplication::Mode::kSecondary));
+    ASSERT_OK(SyncTail::syncApply(
+        _opCtx.get(), entry.toBSON(), OplogApplication::Mode::kSecondary, boost::none));
 
     // Use a builder for easier escaping. We expect the operation to be logged.
     StringBuilder expected;
@@ -1522,7 +1526,8 @@ TEST_F(SyncTailTest, DoNotLogSlowOpApplicationWhenFailed) {
 
     startCapturingLogMessages();
     ASSERT_THROWS(
-        SyncTail::syncApply(_opCtx.get(), entry.toBSON(), OplogApplication::Mode::kSecondary),
+        SyncTail::syncApply(
+            _opCtx.get(), entry.toBSON(), OplogApplication::Mode::kSecondary, boost::none),
         ExceptionFor<ErrorCodes::NamespaceNotFound>);
 
     // Use a builder for easier escaping. We expect the operation to *not* be logged
@@ -1546,8 +1551,8 @@ TEST_F(SyncTailTest, DoNotLogNonSlowOpApplicationWhenSuccessful) {
     auto entry = makeOplogEntry(OpTypeEnum::kInsert, nss, {});
 
     startCapturingLogMessages();
-    ASSERT_OK(
-        SyncTail::syncApply(_opCtx.get(), entry.toBSON(), OplogApplication::Mode::kSecondary));
+    ASSERT_OK(SyncTail::syncApply(
+        _opCtx.get(), entry.toBSON(), OplogApplication::Mode::kSecondary, boost::none));
 
     // Use a builder for easier escaping. We expect the operation to *not* be logged,
     // since it wasn't slow to apply.
@@ -1586,6 +1591,34 @@ public:
                                 ns,             // namespace
                                 boost::none,    // uuid
                                 boost::none,    // fromMigrate
+                                0,              // version
+                                object,         // o
+                                object2,        // o2
+                                sessionInfo,    // sessionInfo
+                                boost::none,    // false
+                                wallClockTime,  // wall clock time
+                                boost::none,    // statement id
+                                boost::none,    // optime of previous write within same transaction
+                                boost::none,    // pre-image optime
+                                boost::none);   // post-image optime
+    }
+
+    /**
+     * Creates an OplogEntry with given parameters and preset defaults for this test suite.
+     */
+    repl::OplogEntry makeOplogEntryForMigrate(const NamespaceString& ns,
+                                              repl::OpTime opTime,
+                                              repl::OpTypeEnum opType,
+                                              BSONObj object,
+                                              boost::optional<BSONObj> object2,
+                                              const OperationSessionInfo& sessionInfo,
+                                              Date_t wallClockTime) {
+        return repl::OplogEntry(opTime,         // optime
+                                boost::none,    // hash
+                                opType,         // opType
+                                ns,             // namespace
+                                boost::none,    // uuid
+                                true,           // fromMigrate
                                 0,              // version
                                 object,         // o
                                 object2,        // o2
@@ -1846,6 +1879,91 @@ TEST_F(SyncTailTxnTableTest, MultiApplyUpdatesTheTransactionTable) {
         client.findOne(NamespaceString::kSessionTransactionsTableNamespace.ns(),
                        BSON(SessionTxnRecord::kSessionIdFieldName << lsidNoTxn.toBSON()));
     ASSERT_TRUE(resultNoTxn.isEmpty());
+}
+
+TEST_F(SyncTailTxnTableTest, SessionMigrationNoOpEntriesShouldUpdateTxnTable) {
+    const auto insertLsid = makeLogicalSessionIdForTest();
+    OperationSessionInfo insertSessionInfo;
+    insertSessionInfo.setSessionId(insertLsid);
+    insertSessionInfo.setTxnNumber(3);
+    auto date = Date_t::now();
+
+    auto innerOplog = makeOplogEntry(nss(),
+                                     {Timestamp(10, 10), 1},
+                                     repl::OpTypeEnum::kInsert,
+                                     BSON("_id" << 1),
+                                     boost::none,
+                                     insertSessionInfo,
+                                     date);
+
+    auto outerInsertDate = Date_t::now();
+    auto insertOplog = makeOplogEntryForMigrate(nss(),
+                                                {Timestamp(40, 0), 1},
+                                                repl::OpTypeEnum::kNoop,
+                                                BSON("$sessionMigrateInfo" << 1),
+                                                innerOplog.toBSON(),
+                                                insertSessionInfo,
+                                                outerInsertDate);
+
+    auto writerPool = OplogApplier::makeWriterPool();
+    SyncTail syncTail(
+        nullptr, getConsistencyMarkers(), getStorageInterface(), multiSyncApply, writerPool.get());
+    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {insertOplog}));
+
+    checkTxnTable(insertSessionInfo, {Timestamp(40, 0), 1}, outerInsertDate);
+}
+
+TEST_F(SyncTailTxnTableTest, PreImageNoOpEntriesShouldNotUpdateTxnTable) {
+    const auto preImageLsid = makeLogicalSessionIdForTest();
+    OperationSessionInfo preImageSessionInfo;
+    preImageSessionInfo.setSessionId(preImageLsid);
+    preImageSessionInfo.setTxnNumber(3);
+    auto preImageDate = Date_t::now();
+
+    auto preImageOplog = makeOplogEntryForMigrate(nss(),
+                                                  {Timestamp(30, 0), 1},
+                                                  repl::OpTypeEnum::kNoop,
+                                                  BSON("_id" << 1),
+                                                  boost::none,
+                                                  preImageSessionInfo,
+                                                  preImageDate);
+
+    auto writerPool = OplogApplier::makeWriterPool();
+    SyncTail syncTail(
+        nullptr, getConsistencyMarkers(), getStorageInterface(), multiSyncApply, writerPool.get());
+    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {preImageOplog}));
+
+    DBDirectClient client(_opCtx.get());
+    auto result = client.findOne(NamespaceString::kSessionTransactionsTableNamespace.ns(),
+                                 {BSON(SessionTxnRecord::kSessionIdFieldName
+                                       << preImageSessionInfo.getSessionId()->toBSON())});
+    ASSERT_TRUE(result.isEmpty());
+}
+
+TEST_F(SyncTailTxnTableTest, NonMigrateNoOpEntriesShouldNotUpdateTxnTable) {
+    const auto lsid = makeLogicalSessionIdForTest();
+    OperationSessionInfo sessionInfo;
+    sessionInfo.setSessionId(lsid);
+    sessionInfo.setTxnNumber(3);
+
+    auto oplog = makeOplogEntry(nss(),
+                                {Timestamp(30, 0), 1},
+                                repl::OpTypeEnum::kNoop,
+                                BSON("_id" << 1),
+                                boost::none,
+                                sessionInfo,
+                                Date_t::now());
+
+    auto writerPool = OplogApplier::makeWriterPool();
+    SyncTail syncTail(
+        nullptr, getConsistencyMarkers(), getStorageInterface(), multiSyncApply, writerPool.get());
+    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {oplog}));
+
+    DBDirectClient client(_opCtx.get());
+    auto result = client.findOne(
+        NamespaceString::kSessionTransactionsTableNamespace.ns(),
+        {BSON(SessionTxnRecord::kSessionIdFieldName << sessionInfo.getSessionId()->toBSON())});
+    ASSERT_TRUE(result.isEmpty());
 }
 
 TEST_F(IdempotencyTest, EmptyCappedNamespaceNotFound) {

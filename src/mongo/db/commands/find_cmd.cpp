@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -50,7 +49,6 @@
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/collection_sharding_state.h"
-#include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/stats/server_read_concern_metrics.h"
@@ -213,8 +211,8 @@ public:
             // execution tree with an EOFStage.
             Collection* const collection = ctx->getCollection();
 
-            // We have a parsed query. Time to get the execution plan for it.
-            auto exec = uassertStatusOK(getExecutorFind(opCtx, collection, nss, std::move(cq)));
+            // Get the execution plan for the query.
+            auto exec = uassertStatusOK(getExecutorFind(opCtx, collection, std::move(cq)));
 
             auto bodyBuilder = result->getBodyBuilder();
             // Got the execution tree. Explain it.
@@ -256,12 +254,11 @@ public:
             uassert(ErrorCodes::InvalidOptions,
                     "It is illegal to open a tailable cursor in a transaction",
                     !txnParticipant ||
-                        !(txnParticipant->inMultiDocumentTransaction() && qr->isTailable()));
+                        !(txnParticipant.inMultiDocumentTransaction() && qr->isTailable()));
 
             uassert(ErrorCodes::OperationNotSupportedInTransaction,
                     "The 'readOnce' option is not supported within a transaction.",
-                    !txnParticipant ||
-                        !txnParticipant->inActiveOrKilledMultiDocumentTransaction() ||
+                    !txnParticipant || !txnParticipant.inActiveOrKilledMultiDocumentTransaction() ||
                         !qr->isReadOnce());
 
             uassert(ErrorCodes::InvalidOptions,
@@ -397,7 +394,7 @@ public:
             }
 
             // Get the execution plan for the query.
-            auto exec = uassertStatusOK(getExecutorFind(opCtx, collection, nss, std::move(cq)));
+            auto exec = uassertStatusOK(getExecutorFind(opCtx, collection, std::move(cq)));
 
             {
                 stdx::lock_guard<Client> lk(*opCtx->getClient());

@@ -101,6 +101,7 @@ DUPLICATEV
 DataSet
 DbCursor
 DbEnv
+DeadStores
 Decrement
 Decrypt
 DeleteFileW
@@ -264,6 +265,8 @@ Mutex
 MySecret
 NEEDKEY
 NEEDVALUE
+NOLINT
+NOLINTNEXTLINE
 NOLL
 NOLOCK
 NONINFRINGEMENT
@@ -292,6 +295,7 @@ PARAM
 POSIX
 PPC
 PREDEFINE
+PRId
 PRIu
 PRNG
 PTHREAD
@@ -638,6 +642,7 @@ dbc
 dbs
 dcalloc
 ddd
+deadcode
 decile
 deciles
 decl
@@ -1101,6 +1106,7 @@ primary's
 printf
 printlog
 priv
+prog
 progname
 ps
 psp
@@ -1175,6 +1181,7 @@ scalability
 sched
 scr
 sd
+second's
 secretkey
 sed
 sessionp
@@ -1230,6 +1237,7 @@ subinit
 sublicense
 subone
 suboptimal
+subsystem's
 subtest
 subtree
 sunique
@@ -1254,6 +1262,7 @@ th
 tid
 timedwait
 timestamp
+timestamped
 timestamps
 tmp
 todo

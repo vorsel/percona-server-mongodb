@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -50,14 +49,26 @@ protected:
         onCommandForPoolExecutor([&](const executor::RemoteCommandRequest& request) {
             ASSERT_EQ(kNss.coll(), request.cmdObj.firstElement().valueStringData());
             cb(request);
-            return BSON("nMatched" << 1 << "nUpserted" << 0 << "nModified" << 1);
+
+            BSONObjBuilder bob;
+            bob.append("nMatched", 1);
+            bob.append("nUpserted", 0);
+            bob.append("nModified", 1);
+            appendTxnResponseMetadata(bob);
+            return bob.obj();
         });
     }
 
     void expectReturnsSuccess(int shardIndex) override {
         onCommandForPoolExecutor([this, shardIndex](const executor::RemoteCommandRequest& request) {
             ASSERT_EQ(kNss.coll(), request.cmdObj.firstElement().valueStringData());
-            return BSON("nMatched" << 1 << "nUpserted" << 0 << "nModified" << 1);
+
+            BSONObjBuilder bob;
+            bob.append("nMatched", 1);
+            bob.append("nUpserted", 0);
+            bob.append("nModified", 1);
+            appendTxnResponseMetadata(bob);
+            return bob.obj();
         });
     }
 };

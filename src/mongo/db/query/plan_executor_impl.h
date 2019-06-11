@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -73,7 +72,6 @@ public:
     void markAsKilled(Status killStatus) final;
     void dispose(OperationContext* opCtx) final;
     void enqueue(const BSONObj& obj) final;
-    BSONObjSet getOutputSorts() const final;
     bool isMarkedAsKilled() const final;
     Status getKillStatus() final;
     bool isDisposed() const final;

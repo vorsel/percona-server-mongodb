@@ -29,39 +29,14 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
     it in the license file.
 ======= */
 
-#include "mongo/base/init.h"
+//#include "mongo/base/init.h"
+#include "mongo/db/ratelimit_parameter_gen.h"
 #include "mongo/db/server_options.h"
-#include "mongo/db/server_parameters.h"
 #include "mongo/util/mongoutils/str.h"  // for str::stream()!
 
 namespace mongo {
 
 // Allow rateLimit access via setParameter/getParameter
-namespace {
-
-class RateLimitParameter : public ServerParameter
-{
-    MONGO_DISALLOW_COPYING(RateLimitParameter);
-
-public:
-    RateLimitParameter(ServerParameterSet* sps);
-    virtual void append(OperationContext* txn, BSONObjBuilder& b, const std::string& name);
-    virtual Status set(const BSONElement& newValueElement);
-    virtual Status setFromString(const std::string& str);
-
-private:
-    Status _set(int rateLimit);
-};
-
-MONGO_INITIALIZER_GENERAL(InitRateLimitParameter,
-                          MONGO_NO_PREREQUISITES,
-                          ("BeginStartupOptionParsing"))(InitializerContext*) {
-    new RateLimitParameter(ServerParameterSet::getGlobal());
-    return Status::OK();
-}
-
-RateLimitParameter::RateLimitParameter(ServerParameterSet* sps)
-    : ServerParameter(sps, "profilingRateLimit", true, true) {}
 
 void RateLimitParameter::append(OperationContext* txn,
                                    BSONObjBuilder& b,
@@ -69,21 +44,9 @@ void RateLimitParameter::append(OperationContext* txn,
     b.append(name, serverGlobalParams.rateLimit);
 }
 
-Status RateLimitParameter::set(const BSONElement& newValueElement) {
-    if (!newValueElement.isNumber()) {
-        return Status(ErrorCodes::BadValue, str::stream() << name() << " has to be a number");
-    }
-    return _set(newValueElement.numberInt());
-}
+namespace {
 
-Status RateLimitParameter::setFromString(const std::string& newValueString) {
-    int num = 0;
-    Status status = parseNumberFromString(newValueString, &num);
-    if (!status.isOK()) return status;
-    return _set(num);
-}
-
-Status RateLimitParameter::_set(int rateLimit) {
+Status _set(int rateLimit) {
     if (rateLimit == 0)
         rateLimit = 1;
     if (1 <= rateLimit && rateLimit <= RATE_LIMIT_MAX) {
@@ -100,6 +63,20 @@ Status RateLimitParameter::_set(int rateLimit) {
     return Status(ErrorCodes::BadValue, sb.str());
 }
 
-}  // namespace
+}
+
+Status RateLimitParameter::set(const BSONElement& newValueElement) {
+    if (!newValueElement.isNumber()) {
+        return Status(ErrorCodes::BadValue, str::stream() << name() << " has to be a number");
+    }
+    return _set(newValueElement.numberInt());
+}
+
+Status RateLimitParameter::setFromString(const std::string& newValueString) {
+    int num = 0;
+    Status status = parseNumberFromString(newValueString, &num);
+    if (!status.isOK()) return status;
+    return _set(num);
+}
 
 }  // namespace mongo

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -1756,6 +1755,14 @@ public:
     const char* getOpName() const final;
 };
 
+class ExpressionRound final : public ExpressionRangedArity<ExpressionRound, 1, 2> {
+public:
+    explicit ExpressionRound(const boost::intrusive_ptr<ExpressionContext>& expCtx)
+        : ExpressionRangedArity<ExpressionRound, 1, 2>(expCtx) {}
+
+    Value evaluate(const Document& root) const final;
+    const char* getOpName() const final;
+};
 
 class ExpressionSplit final : public ExpressionFixedArity<ExpressionSplit, 2> {
 public:
@@ -1950,12 +1957,12 @@ private:
 };
 
 
-class ExpressionTrunc final : public ExpressionSingleNumericArg<ExpressionTrunc> {
+class ExpressionTrunc final : public ExpressionRangedArity<ExpressionTrunc, 1, 2> {
 public:
     explicit ExpressionTrunc(const boost::intrusive_ptr<ExpressionContext>& expCtx)
-        : ExpressionSingleNumericArg<ExpressionTrunc>(expCtx) {}
+        : ExpressionRangedArity<ExpressionTrunc, 1, 2>(expCtx) {}
 
-    Value evaluateNumericArg(const Value& numericArg) const final;
+    Value evaluate(const Document& root) const final;
     const char* getOpName() const final;
 };
 
@@ -2084,5 +2091,14 @@ private:
     boost::intrusive_ptr<Expression> _to;
     boost::intrusive_ptr<Expression> _onError;
     boost::intrusive_ptr<Expression> _onNull;
+};
+
+class ExpressionRegexFind final : public ExpressionFixedArity<ExpressionRegexFind, 1> {
+public:
+    explicit ExpressionRegexFind(const boost::intrusive_ptr<ExpressionContext>& expCtx)
+        : ExpressionFixedArity<ExpressionRegexFind, 1>(expCtx) {}
+
+    Value evaluate(const Document& root) const final;
+    const char* getOpName() const final;
 };
 }

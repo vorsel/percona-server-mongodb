@@ -173,6 +173,15 @@ class SuiteTest(unittest.TestCase):
 
         self.assertEqual(suite.get_test_count(), 3)
         self.assertEqual(suite.get_runtime(), 29)
+        self.assertTrue(suite.should_overwrite_timeout())
+
+    def test_suites_without_full_runtime_history_should_not_be_overridden(self):
+        suite = grt.Suite()
+        suite.add_test("test1", 10)
+        suite.add_test("test2", 0)
+        suite.add_test("test3", 7)
+
+        self.assertFalse(suite.should_overwrite_timeout())
 
 
 def create_suite(count=3, start=0):
@@ -453,6 +462,18 @@ class EvergreenConfigGeneratorTest(unittest.TestCase):
         expected_exec_timeout = grt.calculate_timeout(suites[0].get_runtime(), 3) * 5
         self.assertEqual(expected_exec_timeout, timeout_cmd["params"]["exec_timeout_secs"])
 
+    def test_suites_without_enough_info_should_not_include_timeouts(self):
+        suite_without_timing_info = 1
+        options = self.generate_mock_options()
+        suites = self.generate_mock_suites(3)
+        suites[suite_without_timing_info].should_overwrite_timeout.return_value = False
+
+        config = grt.EvergreenConfigGenerator(suites, options, Mock()).generate_config().to_map()
+
+        timeout_cmd = config["tasks"][suite_without_timing_info]["commands"][0]
+        self.assertNotIn("command", timeout_cmd)
+        self.assertEqual("do setup", timeout_cmd["func"])
+
 
 class NormalizeTestNameTest(unittest.TestCase):
     def test_unix_names(self):
@@ -528,6 +549,27 @@ class MainTest(unittest.TestCase):
             self.assertEqual(50, len(suite.tests))
 
         self.assertEqual(n_tests, len(main.test_list))
+
+    def test_calculate_suites_uses_fallback_if_only_results_are_filtered(self):
+        n_tests = 100
+        evg = Mock()
+        evg.test_stats.return_value = [{
+            "test_file": "test{}.js".format(i), "avg_duration_pass": 60, "num_pass": 1
+        } for i in range(100)]
+
+        main = grt.Main(evg)
+        main.options = Mock()
+        main.config_options = self.get_mock_options()
+        main.list_tests = Mock(return_value=["test{}.js".format(i) for i in range(n_tests)])
+        with patch("os.path.exists") as exists_mock:
+            exists_mock.return_value = False
+            suites = main.calculate_suites(_DATE, _DATE)
+
+            self.assertEqual(main.config_options.fallback_num_sub_suites, len(suites))
+            for suite in suites:
+                self.assertEqual(50, len(suite.tests))
+
+            self.assertEqual(n_tests, len(main.test_list))
 
     def test_calculate_suites_error(self):
         response = Mock()

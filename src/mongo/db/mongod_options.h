@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -48,7 +47,6 @@ class Environment;
 
 namespace moe = mongo::optionenvironment;
 
-extern bool skipShardingConfigurationChecks;
 
 Status addMongodOptions(moe::OptionSection* options);
 
@@ -81,4 +79,9 @@ Status canonicalizeMongodOptions(moe::Environment* params);
 StatusWith<repl::ReplSettings> parseMongodReplicationOptions(const moe::Environment& params);
 
 Status storeMongodOptions(const moe::Environment& params);
+
+/**
+ * Help test user for storage.dbPath config option.
+ */
+std::string storageDBPathDescription();
 }

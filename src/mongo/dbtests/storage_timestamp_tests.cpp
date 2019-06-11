@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -49,6 +48,7 @@
 #include "mongo/db/global_settings.h"
 #include "mongo/db/index/index_build_interceptor.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/multi_key_path_tracker.h"
 #include "mongo/db/op_observer_registry.h"
@@ -77,13 +77,13 @@
 #include "mongo/db/storage/kv/kv_storage_engine.h"
 #include "mongo/db/storage/snapshot_manager.h"
 #include "mongo/db/transaction_participant.h"
+#include "mongo/db/transaction_participant_gen.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/stdx/future.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/stacktrace.h"
 
 namespace mongo {
-
 namespace {
 /**
  * RAII type for operating at a timestamp. Will remove any timestamping when the object destructs.
@@ -237,10 +237,14 @@ public:
     void createIndex(Collection* coll, std::string indexName, const BSONObj& indexKey) {
 
         // Build an index.
-        MultiIndexBlock indexer(_opCtx, coll);
+        MultiIndexBlock indexer;
+        ON_BLOCK_EXIT([&] { indexer.cleanUpAfterBuild(_opCtx, coll); });
+
         BSONObj indexInfoObj;
         {
             auto swIndexInfoObj = indexer.init(
+                _opCtx,
+                coll,
                 {BSON("v" << 2 << "name" << indexName << "ns" << coll->ns().ns() << "key"
                           << indexKey)},
                 MultiIndexBlock::makeTimestampedIndexOnInitFn(_opCtx, coll));
@@ -248,17 +252,19 @@ public:
             indexInfoObj = std::move(swIndexInfoObj.getValue()[0]);
         }
 
-        ASSERT_OK(indexer.insertAllDocumentsInCollection());
+        ASSERT_OK(indexer.insertAllDocumentsInCollection(_opCtx, coll));
 
         {
             WriteUnitOfWork wuow(_opCtx);
             // Timestamping index completion. Primaries write an oplog entry.
-            ASSERT_OK(indexer.commit(
-                [&](const BSONObj& indexSpec) {
-                    _opCtx->getServiceContext()->getOpObserver()->onCreateIndex(
-                        _opCtx, coll->ns(), *(coll->uuid()), indexSpec, false);
-                },
-                MultiIndexBlock::kNoopOnCommitFn));
+            ASSERT_OK(
+                indexer.commit(_opCtx,
+                               coll,
+                               [&](const BSONObj& indexSpec) {
+                                   _opCtx->getServiceContext()->getOpObserver()->onCreateIndex(
+                                       _opCtx, coll->ns(), *(coll->uuid()), indexSpec, false);
+                               },
+                               MultiIndexBlock::kNoopOnCommitFn));
             // The timestamping repsponsibility is placed on the caller rather than the
             // MultiIndexBlock.
             wuow.commit();
@@ -327,16 +333,17 @@ public:
         return {result.obj()};
     }
 
-    BSONObj queryOplog(const BSONObj& query) {
-        OneOffRead oor(_opCtx, Timestamp::min());
+    BSONObj queryCollection(NamespaceString nss, const BSONObj& query) {
         BSONObj ret;
         ASSERT_TRUE(Helpers::findOne(
-            _opCtx,
-            AutoGetCollectionForRead(_opCtx, NamespaceString::kRsOplogNamespace).getCollection(),
-            query,
-            ret))
+            _opCtx, AutoGetCollectionForRead(_opCtx, nss).getCollection(), query, ret))
             << "Query: " << query;
         return ret;
+    }
+
+    BSONObj queryOplog(const BSONObj& query) {
+        OneOffRead oor(_opCtx, Timestamp::min());
+        return queryCollection(NamespaceString::kRsOplogNamespace, query);
     }
 
     void assertMinValidDocumentAtTimestamp(Collection* coll,
@@ -376,6 +383,23 @@ public:
         }
     }
 
+    void assertFilteredDocumentAtTimestamp(Collection* coll,
+                                           const BSONObj& query,
+                                           const Timestamp& ts,
+                                           boost::optional<const BSONObj&> expectedDoc) {
+        OneOffRead oor(_opCtx, ts);
+        BSONObj doc;
+        bool found = Helpers::findOne(_opCtx, coll, query, doc);
+        if (!expectedDoc) {
+            ASSERT_FALSE(found) << "Should not find any documents in " << coll->ns() << " matching "
+                                << query << " at ts: " << ts;
+        } else {
+            ASSERT(found) << "Should find document in " << coll->ns() << " matching " << query
+                          << " at ts: " << ts;
+            ASSERT_BSONOBJ_EQ(doc, *expectedDoc);
+        }
+    }
+
     void assertOplogDocumentExistsAtTimestamp(const BSONObj& query,
                                               const Timestamp& ts,
                                               bool exists) {
@@ -388,6 +412,22 @@ public:
             ret);
         ASSERT_EQ(found, exists) << "Found " << ret << " at " << ts.toBSON();
         ASSERT_EQ(!ret.isEmpty(), exists) << "Found " << ret << " at " << ts.toBSON();
+    }
+
+    void assertOldestActiveTxnTimestampEquals(const boost::optional<Timestamp>& ts,
+                                              const Timestamp& atTs) {
+        OneOffRead oor(_opCtx, atTs);
+        ASSERT_EQ(TransactionParticipant::getOldestActiveTimestamp(_opCtx), ts);
+    }
+
+    void assertHasStartTimestamp() {
+        auto txnDoc = _getTxnDoc();
+        ASSERT_TRUE(txnDoc.hasField(SessionTxnRecord::kStartTimestampFieldName));
+    }
+
+    void assertNoStartTimestamp() {
+        auto txnDoc = _getTxnDoc();
+        ASSERT_FALSE(txnDoc.hasField(SessionTxnRecord::kStartTimestampFieldName));
     }
 
     void setReplCoordAppliedOpTime(const repl::OpTime& opTime) {
@@ -601,9 +641,11 @@ public:
 
         MultikeyPaths actualMultikeyPaths;
         if (!shouldBeMultikey) {
-            ASSERT_FALSE(catalog->isIndexMultikey(opCtx, indexName, &actualMultikeyPaths));
+            ASSERT_FALSE(catalog->isIndexMultikey(opCtx, indexName, &actualMultikeyPaths))
+                << "index " << indexName << " should not be multikey at timestamp " << ts;
         } else {
-            ASSERT(catalog->isIndexMultikey(opCtx, indexName, &actualMultikeyPaths));
+            ASSERT(catalog->isIndexMultikey(opCtx, indexName, &actualMultikeyPaths))
+                << "index " << indexName << " should be multikey at timestamp " << ts;
         }
 
         const bool match = (expectedMultikeyPaths == actualMultikeyPaths);
@@ -613,6 +655,14 @@ public:
                                << dumpMultikeyPaths(actualMultikeyPaths));
         }
         ASSERT_TRUE(match);
+    }
+
+private:
+    BSONObj _getTxnDoc() {
+        auto txnParticipant = TransactionParticipant::get(_opCtx);
+        auto txnsFilter = BSON("_id" << _opCtx->getLogicalSessionId()->toBSON() << "txnNum"
+                                     << txnParticipant.getActiveTxnNumber());
+        return queryCollection(NamespaceString::kSessionTransactionsTableNamespace, txnsFilter);
     }
 };
 
@@ -713,7 +763,7 @@ public:
 
         auto oplogEntry = oplogEntryBuilder.done();
         ASSERT_OK(repl::SyncTail::syncApply(
-            _opCtx, oplogEntry, repl::OplogApplication::Mode::kSecondary));
+            _opCtx, oplogEntry, repl::OplogApplication::Mode::kSecondary, boost::none));
 
         for (std::uint32_t idx = 0; idx < docsToInsert; ++idx) {
             OneOffRead oor(_opCtx, firstInsertTime.addTicks(idx).asTimestamp());
@@ -1354,6 +1404,7 @@ public:
         ASSERT_OK(dbtests::createIndexFromSpec(_opCtx, nss.ns(), indexSpec));
 
         _coordinatorMock->alwaysAllowWrites(false);
+        ASSERT_OK(_coordinatorMock->setFollowerMode({repl::MemberState::MS::RS_STARTUP2}));
 
         const LogicalTime pastTime = _clock->reserveTicks(1);
         const LogicalTime insertTime0 = _clock->reserveTicks(1);
@@ -1417,6 +1468,7 @@ public:
         repl::OplogApplier::Options options;
         options.allowNamespaceNotFoundErrorsOnCrudOps = true;
         options.missingDocumentSourceForInitialSync = HostAndPort("localhost", 123);
+
         repl::OplogApplierImpl oplogApplier(
             nullptr,  // task executor. not required for multiApply().
             nullptr,  // oplog buffer. not required for multiApply().
@@ -1429,9 +1481,24 @@ public:
         auto lastTime = unittest::assertGet(oplogApplier.multiApply(_opCtx, ops));
         ASSERT_EQ(lastTime.getTimestamp(), insertTime2.asTimestamp());
 
+        // Wait for the index build to finish before making any assertions.
+        IndexBuildsCoordinator::get(_opCtx)->awaitNoBgOpInProgForNs(_opCtx, nss);
+
         AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_X, LockMode::MODE_IX);
-        assertMultikeyPaths(
-            _opCtx, autoColl.getCollection(), indexName, pastTime.asTimestamp(), false, {{}});
+
+        // It is not valid to read the multikey state earlier than the 'minimumVisibleTimestamp',
+        // so at least assert that it has been updated due to the index creation.
+        ASSERT_GT(autoColl.getCollection()->getMinimumVisibleSnapshot().get(),
+                  pastTime.asTimestamp());
+
+        // Reading the multikey state before 'insertTime0' is not valid or reliable to test. If the
+        // background index build intercepts and drains writes during inital sync, the index write
+        // and the write to the multikey path state will not be timestamped. This write is not
+        // timestamped because the lastApplied timestamp, which would normally be used on a primary
+        // or secondary, is not always available during initial sync.
+        // Additionally, it is not valid to read at a timestamp before inital sync completes, so
+        // these assertions below only make sense in the context of this unit test, but would
+        // otherwise not be exercised in any normal scenario.
         assertMultikeyPaths(
             _opCtx, autoColl.getCollection(), indexName, insertTime0.asTimestamp(), true, {{0}});
         assertMultikeyPaths(
@@ -1800,7 +1867,8 @@ public:
         std::vector<std::string> origIdents = kvCatalog->getAllIdents(_opCtx);
 
         // Build an index on `{a: 1}`. This index will be multikey.
-        MultiIndexBlock indexer(_opCtx, autoColl.getCollection());
+        MultiIndexBlock indexer;
+        ON_BLOCK_EXIT([&] { indexer.cleanUpAfterBuild(_opCtx, autoColl.getCollection()); });
         const LogicalTime beforeIndexBuild = _clock->reserveTicks(2);
         BSONObj indexInfoObj;
         {
@@ -1817,6 +1885,8 @@ public:
             }
 
             auto swIndexInfoObj = indexer.init(
+                _opCtx,
+                autoColl.getCollection(),
                 {BSON("v" << 2 << "unique" << true << "name"
                           << "a_1"
                           << "ns"
@@ -1832,7 +1902,7 @@ public:
 
         // Inserting all the documents has the side-effect of setting internal state on the index
         // builder that the index is multikey.
-        ASSERT_OK(indexer.insertAllDocumentsInCollection());
+        ASSERT_OK(indexer.insertAllDocumentsInCollection(_opCtx, autoColl.getCollection()));
 
         {
             WriteUnitOfWork wuow(_opCtx);
@@ -1840,6 +1910,8 @@ public:
             // completion  Primaries write an oplog entry. Secondaries explicitly set a
             // timestamp.
             ASSERT_OK(indexer.commit(
+                _opCtx,
+                autoColl.getCollection(),
                 [&](const BSONObj& indexSpec) {
                     if (SimulatePrimary) {
                         // The timestamping responsibility for each index is placed on the caller.
@@ -1903,7 +1975,8 @@ public:
         AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_X, LockMode::MODE_X);
 
         // Build an index on `{a: 1}`.
-        MultiIndexBlock indexer(_opCtx, autoColl.getCollection());
+        MultiIndexBlock indexer;
+        ON_BLOCK_EXIT([&] { indexer.cleanUpAfterBuild(_opCtx, autoColl.getCollection()); });
         const LogicalTime beforeIndexBuild = _clock->reserveTicks(2);
         BSONObj indexInfoObj;
         {
@@ -1920,6 +1993,8 @@ public:
             }
 
             auto swIndexInfoObj = indexer.init(
+                _opCtx,
+                autoColl.getCollection(),
                 {BSON("v" << 2 << "unique" << true << "name"
                           << "a_1"
                           << "ns"
@@ -1954,7 +2029,7 @@ public:
                       .getTimestamp(),
                   firstInsert.asTimestamp());
 
-        ASSERT_OK(indexer.drainBackgroundWrites());
+        ASSERT_OK(indexer.drainBackgroundWrites(_opCtx));
 
         auto indexCatalog = autoColl.getCollection()->getIndexCatalog();
         const IndexCatalogEntry* buildingIndex = indexCatalog->getEntry(
@@ -1995,7 +2070,7 @@ public:
         const LogicalTime afterSecondInsert = _clock->reserveTicks(1);
         setReplCoordAppliedOpTime(repl::OpTime(afterSecondInsert.asTimestamp(), presentTerm));
 
-        ASSERT_OK(indexer.drainBackgroundWrites());
+        ASSERT_OK(indexer.drainBackgroundWrites(_opCtx));
 
         {
             // At time of the second insert, there are un-drained writes.
@@ -2012,6 +2087,8 @@ public:
         {
             WriteUnitOfWork wuow(_opCtx);
             ASSERT_OK(indexer.commit(
+                _opCtx,
+                autoColl.getCollection(),
                 [&](const BSONObj& indexSpec) {
                     if (SimulatePrimary) {
                         // The timestamping responsibility for each index is placed on the caller.
@@ -2639,14 +2716,14 @@ public:
         auto txnParticipant = TransactionParticipant::get(_opCtx);
         ASSERT(txnParticipant);
 
-        txnParticipant->beginOrContinue(
-            *_opCtx->getTxnNumber(), false /* autocommit */, true /* startTransaction */);
-        txnParticipant->unstashTransactionResources(_opCtx, "insert");
+        txnParticipant.beginOrContinue(
+            _opCtx, *_opCtx->getTxnNumber(), false /* autocommit */, true /* startTransaction */);
+        txnParticipant.unstashTransactionResources(_opCtx, "insert");
         {
             AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IX, LockMode::MODE_IX);
             insertDocument(autoColl.getCollection(), InsertStatement(doc));
         }
-        txnParticipant->stashTransactionResources(_opCtx);
+        txnParticipant.stashTransactionResources(_opCtx);
 
         {
             AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IS, LockMode::MODE_IS);
@@ -2688,11 +2765,12 @@ public:
         ASSERT(txnParticipant);
         logTimestamps();
 
-        txnParticipant->unstashTransactionResources(_opCtx, "insert");
+        txnParticipant.unstashTransactionResources(_opCtx, "insert");
 
-        txnParticipant->commitUnpreparedTransaction(_opCtx);
+        txnParticipant.commitUnpreparedTransaction(_opCtx);
 
-        txnParticipant->stashTransactionResources(_opCtx);
+        txnParticipant.stashTransactionResources(_opCtx);
+        assertNoStartTimestamp();
         {
             AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_X, LockMode::MODE_IX);
             auto coll = autoColl.getCollection();
@@ -2710,6 +2788,227 @@ public:
     }
 };
 
+class MultiOplogEntryTransaction : public MultiDocumentTransactionTest {
+public:
+    MultiOplogEntryTransaction() : MultiDocumentTransactionTest("multiOplogEntryTransaction") {
+        gUseMultipleOplogEntryFormatForTransactions = true;
+        const auto currentTime = _clock->getClusterTime();
+        firstOplogEntryTs = currentTime.addTicks(1).asTimestamp();
+        secondOplogEntryTs = currentTime.addTicks(2).asTimestamp();
+        commitEntryTs = currentTime.addTicks(3).asTimestamp();
+    }
+
+    ~MultiOplogEntryTransaction() {
+        gUseMultipleOplogEntryFormatForTransactions = false;
+    }
+
+    void run() {
+        auto txnParticipant = TransactionParticipant::get(_opCtx);
+        ASSERT(txnParticipant);
+        logTimestamps();
+
+        txnParticipant.unstashTransactionResources(_opCtx, "insert");
+
+        const BSONObj doc2 = BSON("_id" << 2 << "TestValue" << 2);
+        {
+            AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IX, LockMode::MODE_IX);
+            insertDocument(autoColl.getCollection(), InsertStatement(doc2));
+        }
+        txnParticipant.commitUnpreparedTransaction(_opCtx);
+
+        txnParticipant.stashTransactionResources(_opCtx);
+        {
+            AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_X, LockMode::MODE_IX);
+            const BSONObj query1 = BSON("_id" << 1);
+            const BSONObj query2 = BSON("_id" << 2);
+            auto coll = autoColl.getCollection();
+
+            // Collection should be empty until commit, at which point both documents
+            // should show up.
+            assertDocumentAtTimestamp(coll, presentTs, BSONObj());
+            assertDocumentAtTimestamp(coll, beforeTxnTs, BSONObj());
+            assertDocumentAtTimestamp(coll, firstOplogEntryTs, BSONObj());
+            assertDocumentAtTimestamp(coll, secondOplogEntryTs, BSONObj());
+            assertFilteredDocumentAtTimestamp(coll, query1, commitEntryTs, doc);
+            assertFilteredDocumentAtTimestamp(coll, query2, commitEntryTs, doc2);
+            assertFilteredDocumentAtTimestamp(coll, query1, nullTs, doc);
+            assertFilteredDocumentAtTimestamp(coll, query2, nullTs, doc2);
+
+            // Commit oplog entry should exist at commitEntryTs.
+            const auto commitFilter = BSON("ts" << commitEntryTs << "op"
+                                                << "c");
+            assertOplogDocumentExistsAtTimestamp(commitFilter, presentTs, false);
+            assertOplogDocumentExistsAtTimestamp(commitFilter, beforeTxnTs, false);
+            assertOplogDocumentExistsAtTimestamp(commitFilter, firstOplogEntryTs, false);
+            assertOplogDocumentExistsAtTimestamp(commitFilter, secondOplogEntryTs, false);
+            assertOplogDocumentExistsAtTimestamp(commitFilter, commitEntryTs, true);
+            assertOplogDocumentExistsAtTimestamp(commitFilter, nullTs, true);
+
+            // first oplog entry should exist at firstOplogEntryTs and after it.
+            const auto firstOplogEntryFilter = BSON("ts" << firstOplogEntryTs << "op"
+                                                         << "i"
+                                                         << "o"
+                                                         << doc);
+            assertOplogDocumentExistsAtTimestamp(firstOplogEntryFilter, presentTs, false);
+            assertOplogDocumentExistsAtTimestamp(firstOplogEntryFilter, beforeTxnTs, false);
+            assertOplogDocumentExistsAtTimestamp(firstOplogEntryFilter, firstOplogEntryTs, true);
+            assertOplogDocumentExistsAtTimestamp(firstOplogEntryFilter, secondOplogEntryTs, true);
+            assertOplogDocumentExistsAtTimestamp(firstOplogEntryFilter, commitEntryTs, true);
+            assertOplogDocumentExistsAtTimestamp(firstOplogEntryFilter, nullTs, true);
+
+            // second oplog entry should exist at secondOplogEntryTs and after it.
+            const auto secondOplogEntryFilter = BSON("ts" << secondOplogEntryTs << "op"
+                                                          << "i"
+                                                          << "o"
+                                                          << doc2);
+            assertOplogDocumentExistsAtTimestamp(secondOplogEntryFilter, presentTs, false);
+            assertOplogDocumentExistsAtTimestamp(secondOplogEntryFilter, beforeTxnTs, false);
+            assertOplogDocumentExistsAtTimestamp(secondOplogEntryFilter, firstOplogEntryTs, false);
+            assertOplogDocumentExistsAtTimestamp(secondOplogEntryFilter, secondOplogEntryTs, true);
+            assertOplogDocumentExistsAtTimestamp(secondOplogEntryFilter, commitEntryTs, true);
+            assertOplogDocumentExistsAtTimestamp(secondOplogEntryFilter, nullTs, true);
+
+            // Session state should go to inProgress at firstOplogEntryTs, then to committed
+            // at commitEntryTs
+            getSessionTxnInfoAtTimestamp(presentTs, false);
+            getSessionTxnInfoAtTimestamp(beforeTxnTs, false);
+            auto sessionInfo = getSessionTxnInfoAtTimestamp(firstOplogEntryTs, true);
+            ASSERT_EQ(sessionInfo["state"].String(), "inProgress");
+            ASSERT_EQ(sessionInfo["lastWriteOpTime"]["ts"].timestamp(), firstOplogEntryTs);
+
+            sessionInfo = getSessionTxnInfoAtTimestamp(secondOplogEntryTs, true);
+            ASSERT_EQ(sessionInfo["state"].String(), "inProgress");
+            ASSERT_EQ(sessionInfo["lastWriteOpTime"]["ts"].timestamp(), secondOplogEntryTs);
+
+            sessionInfo = getSessionTxnInfoAtTimestamp(commitEntryTs, true);
+            ASSERT_EQ(sessionInfo["state"].String(), "committed");
+            ASSERT_EQ(sessionInfo["lastWriteOpTime"]["ts"].timestamp(), commitEntryTs);
+
+            sessionInfo = getSessionTxnInfoAtTimestamp(nullTs, true);
+            ASSERT_EQ(sessionInfo["state"].String(), "committed");
+            ASSERT_EQ(sessionInfo["lastWriteOpTime"]["ts"].timestamp(), commitEntryTs);
+        }
+    }
+
+    BSONObj getSessionTxnInfoAtTimestamp(const Timestamp& ts, bool expected) {
+        AutoGetCollection autoColl(
+            _opCtx, NamespaceString::kSessionTransactionsTableNamespace, LockMode::MODE_IX);
+        const auto sessionId = *_opCtx->getLogicalSessionId();
+        const auto txnNum = *_opCtx->getTxnNumber();
+        BSONObj doc;
+        OneOffRead oor(_opCtx, ts);
+        bool found = Helpers::findOne(_opCtx,
+                                      autoColl.getCollection(),
+                                      BSON("_id" << sessionId.toBSON() << "txnNum" << txnNum),
+                                      doc);
+        if (expected) {
+            ASSERT(found) << "Missing session transaction info at " << ts;
+        } else {
+            ASSERT_FALSE(found) << "Session transaction info at " << ts
+                                << " is unexpectedly present " << doc;
+        }
+        return doc;
+    }
+
+protected:
+    Timestamp firstOplogEntryTs, secondOplogEntryTs;
+};
+
+class PreparedMultiOplogEntryTransaction : public MultiDocumentTransactionTest {
+public:
+    PreparedMultiOplogEntryTransaction()
+        : MultiDocumentTransactionTest("preparedMultiOplogEntryTransaction") {
+        gUseMultipleOplogEntryFormatForTransactions = true;
+        const auto currentTime = _clock->getClusterTime();
+        firstOplogEntryTs = currentTime.addTicks(1).asTimestamp();
+        secondOplogEntryTs = currentTime.addTicks(2).asTimestamp();
+        prepareEntryTs = currentTime.addTicks(3).asTimestamp();
+        commitEntryTs = currentTime.addTicks(4).asTimestamp();
+    }
+
+    ~PreparedMultiOplogEntryTransaction() {
+        gUseMultipleOplogEntryFormatForTransactions = false;
+    }
+
+    void run() {
+        auto txnParticipant = TransactionParticipant::get(_opCtx);
+        ASSERT(txnParticipant);
+        unittest::log() << "PrepareTS: " << prepareEntryTs;
+        logTimestamps();
+
+        const auto prepareFilter = BSON("ts" << prepareEntryTs);
+        const auto commitFilter = BSON("ts" << commitEntryTs);
+        {
+            AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IS, LockMode::MODE_IS);
+            auto coll = autoColl.getCollection();
+            assertDocumentAtTimestamp(coll, presentTs, BSONObj());
+            assertDocumentAtTimestamp(coll, beforeTxnTs, BSONObj());
+            assertDocumentAtTimestamp(coll, firstOplogEntryTs, BSONObj());
+            assertDocumentAtTimestamp(coll, secondOplogEntryTs, BSONObj());
+            assertDocumentAtTimestamp(coll, prepareEntryTs, BSONObj());
+            assertDocumentAtTimestamp(coll, commitEntryTs, BSONObj());
+
+            assertOplogDocumentExistsAtTimestamp(prepareFilter, presentTs, false);
+            assertOplogDocumentExistsAtTimestamp(prepareFilter, beforeTxnTs, false);
+            assertOplogDocumentExistsAtTimestamp(prepareFilter, firstOplogEntryTs, false);
+            assertOplogDocumentExistsAtTimestamp(prepareFilter, secondOplogEntryTs, false);
+            assertOplogDocumentExistsAtTimestamp(prepareFilter, prepareEntryTs, false);
+            assertOplogDocumentExistsAtTimestamp(prepareFilter, commitEntryTs, false);
+            assertOplogDocumentExistsAtTimestamp(prepareFilter, nullTs, false);
+
+            assertOplogDocumentExistsAtTimestamp(commitFilter, presentTs, false);
+            assertOplogDocumentExistsAtTimestamp(commitFilter, beforeTxnTs, false);
+            assertOplogDocumentExistsAtTimestamp(commitFilter, prepareEntryTs, false);
+            assertOplogDocumentExistsAtTimestamp(commitFilter, commitEntryTs, false);
+            assertOplogDocumentExistsAtTimestamp(commitFilter, nullTs, false);
+        }
+        txnParticipant.unstashTransactionResources(_opCtx, "insert");
+        const BSONObj doc2 = BSON("_id" << 2 << "TestValue" << 2);
+        {
+            AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IX, LockMode::MODE_IX);
+            insertDocument(autoColl.getCollection(), InsertStatement(doc2));
+        }
+        txnParticipant.prepareTransaction(_opCtx, {});
+
+        txnParticipant.stashTransactionResources(_opCtx);
+        {
+            AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IS, LockMode::MODE_IS);
+            auto coll = autoColl.getCollection();
+            const BSONObj query1 = BSON("_id" << 1);
+            const BSONObj query2 = BSON("_id" << 2);
+            assertDocumentAtTimestamp(coll, presentTs, BSONObj());
+            assertDocumentAtTimestamp(coll, beforeTxnTs, BSONObj());
+            assertDocumentAtTimestamp(coll, prepareEntryTs, BSONObj());
+            assertDocumentAtTimestamp(coll, commitEntryTs, BSONObj());
+            assertDocumentAtTimestamp(coll, nullTs, BSONObj());
+
+            assertOplogDocumentExistsAtTimestamp(prepareFilter, presentTs, false);
+            assertOplogDocumentExistsAtTimestamp(prepareFilter, beforeTxnTs, false);
+            assertOplogDocumentExistsAtTimestamp(prepareFilter, prepareEntryTs, true);
+            assertOplogDocumentExistsAtTimestamp(prepareFilter, commitEntryTs, true);
+            assertOplogDocumentExistsAtTimestamp(prepareFilter, nullTs, true);
+
+            // We haven't committed the prepared transaction
+            assertOplogDocumentExistsAtTimestamp(commitFilter, presentTs, false);
+            assertOplogDocumentExistsAtTimestamp(commitFilter, beforeTxnTs, false);
+            assertOplogDocumentExistsAtTimestamp(commitFilter, prepareEntryTs, false);
+            assertOplogDocumentExistsAtTimestamp(commitFilter, commitEntryTs, false);
+            assertOplogDocumentExistsAtTimestamp(commitFilter, nullTs, false);
+        }
+
+        // Temporary until SERVER-39442: abort the prepared transaction and clean up the resources.
+        txnParticipant.unstashTransactionResources(_opCtx, "abortTransaction");
+        txnParticipant.abortActiveTransaction(_opCtx);
+        txnParticipant.stashTransactionResources(_opCtx);
+
+        // TODO (SERVER-39442): Commit the prepared transaction and assert existence of oplogs at
+        // commitTimestamp.
+    }
+
+protected:
+    Timestamp firstOplogEntryTs, secondOplogEntryTs, prepareEntryTs;
+};
+
 class PreparedMultiDocumentTransaction : public MultiDocumentTransactionTest {
 public:
     PreparedMultiDocumentTransaction()
@@ -2725,40 +3024,35 @@ public:
         unittest::log() << "Prepare TS: " << prepareTs;
         logTimestamps();
 
-        auto commitTimestamp = commitEntryTs;
-
         {
             AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IS, LockMode::MODE_IS);
             auto coll = autoColl.getCollection();
             assertDocumentAtTimestamp(coll, prepareTs, BSONObj());
             assertDocumentAtTimestamp(coll, commitEntryTs, BSONObj());
-            assertDocumentAtTimestamp(coll, commitTimestamp, BSONObj());
 
             const auto prepareFilter = BSON("ts" << prepareTs);
             assertOplogDocumentExistsAtTimestamp(prepareFilter, presentTs, false);
             assertOplogDocumentExistsAtTimestamp(prepareFilter, beforeTxnTs, false);
             assertOplogDocumentExistsAtTimestamp(prepareFilter, prepareTs, false);
             assertOplogDocumentExistsAtTimestamp(prepareFilter, commitEntryTs, false);
-            assertOplogDocumentExistsAtTimestamp(prepareFilter, commitTimestamp, false);
             assertOplogDocumentExistsAtTimestamp(prepareFilter, nullTs, false);
 
             const auto commitFilter = BSON("ts" << commitEntryTs);
             assertOplogDocumentExistsAtTimestamp(commitFilter, prepareTs, false);
             assertOplogDocumentExistsAtTimestamp(commitFilter, commitEntryTs, false);
-            assertOplogDocumentExistsAtTimestamp(commitFilter, commitTimestamp, false);
         }
-        txnParticipant->unstashTransactionResources(_opCtx, "insert");
+        txnParticipant.unstashTransactionResources(_opCtx, "insert");
 
-        txnParticipant->prepareTransaction(_opCtx, {});
+        txnParticipant.prepareTransaction(_opCtx, {});
 
-        txnParticipant->stashTransactionResources(_opCtx);
+        txnParticipant.stashTransactionResources(_opCtx);
+        assertHasStartTimestamp();
         {
             const auto prepareFilter = BSON("ts" << prepareTs);
             assertOplogDocumentExistsAtTimestamp(prepareFilter, presentTs, false);
             assertOplogDocumentExistsAtTimestamp(prepareFilter, beforeTxnTs, false);
             assertOplogDocumentExistsAtTimestamp(prepareFilter, prepareTs, true);
             assertOplogDocumentExistsAtTimestamp(prepareFilter, commitEntryTs, true);
-            assertOplogDocumentExistsAtTimestamp(prepareFilter, commitTimestamp, true);
             assertOplogDocumentExistsAtTimestamp(prepareFilter, nullTs, true);
 
             const auto commitFilter = BSON("ts" << commitEntryTs);
@@ -2766,14 +3060,20 @@ public:
             assertOplogDocumentExistsAtTimestamp(commitFilter, beforeTxnTs, false);
             assertOplogDocumentExistsAtTimestamp(commitFilter, prepareTs, false);
             assertOplogDocumentExistsAtTimestamp(commitFilter, commitEntryTs, false);
-            assertOplogDocumentExistsAtTimestamp(commitFilter, commitTimestamp, false);
             assertOplogDocumentExistsAtTimestamp(commitFilter, nullTs, false);
+
+            assertOldestActiveTxnTimestampEquals(boost::none, presentTs);
+            assertOldestActiveTxnTimestampEquals(boost::none, beforeTxnTs);
+            assertOldestActiveTxnTimestampEquals(prepareTs, prepareTs);
+            assertOldestActiveTxnTimestampEquals(prepareTs, nullTs);
+            assertOldestActiveTxnTimestampEquals(prepareTs, commitEntryTs);
         }
-        txnParticipant->unstashTransactionResources(_opCtx, "commitTransaction");
+        txnParticipant.unstashTransactionResources(_opCtx, "commitTransaction");
 
-        txnParticipant->commitPreparedTransaction(_opCtx, commitTimestamp, {});
+        txnParticipant.commitPreparedTransaction(_opCtx, commitEntryTs, {});
+        assertNoStartTimestamp();
 
-        txnParticipant->stashTransactionResources(_opCtx);
+        txnParticipant.stashTransactionResources(_opCtx);
         {
             AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_X, LockMode::MODE_IX);
             auto coll = autoColl.getCollection();
@@ -2781,7 +3081,6 @@ public:
             assertDocumentAtTimestamp(coll, beforeTxnTs, BSONObj());
             assertDocumentAtTimestamp(coll, prepareTs, BSONObj());
             assertDocumentAtTimestamp(coll, commitEntryTs, doc);
-            assertDocumentAtTimestamp(coll, commitTimestamp, doc);
             assertDocumentAtTimestamp(coll, nullTs, doc);
 
             const auto prepareFilter = BSON("ts" << prepareTs);
@@ -2789,7 +3088,6 @@ public:
             assertOplogDocumentExistsAtTimestamp(prepareFilter, beforeTxnTs, false);
             assertOplogDocumentExistsAtTimestamp(prepareFilter, prepareTs, true);
             assertOplogDocumentExistsAtTimestamp(prepareFilter, commitEntryTs, true);
-            assertOplogDocumentExistsAtTimestamp(prepareFilter, commitTimestamp, true);
             assertOplogDocumentExistsAtTimestamp(prepareFilter, nullTs, true);
 
             const auto commitFilter = BSON("ts" << commitEntryTs);
@@ -2797,8 +3095,110 @@ public:
             assertOplogDocumentExistsAtTimestamp(commitFilter, beforeTxnTs, false);
             assertOplogDocumentExistsAtTimestamp(commitFilter, prepareTs, false);
             assertOplogDocumentExistsAtTimestamp(commitFilter, commitEntryTs, true);
-            assertOplogDocumentExistsAtTimestamp(commitFilter, commitTimestamp, true);
             assertOplogDocumentExistsAtTimestamp(commitFilter, nullTs, true);
+
+            assertOldestActiveTxnTimestampEquals(boost::none, presentTs);
+            assertOldestActiveTxnTimestampEquals(boost::none, beforeTxnTs);
+            assertOldestActiveTxnTimestampEquals(prepareTs, prepareTs);
+            assertOldestActiveTxnTimestampEquals(boost::none, commitEntryTs);
+            assertOldestActiveTxnTimestampEquals(boost::none, nullTs);
+        }
+    }
+};
+
+class AbortedPreparedMultiDocumentTransaction : public MultiDocumentTransactionTest {
+public:
+    AbortedPreparedMultiDocumentTransaction()
+        : MultiDocumentTransactionTest("abortedPreparedMultiDocumentTransaction") {}
+
+    void run() {
+        auto txnParticipant = TransactionParticipant::get(_opCtx);
+        ASSERT(txnParticipant);
+
+        const auto currentTime = _clock->getClusterTime();
+        const auto prepareTs = currentTime.addTicks(1).asTimestamp();
+        const auto abortEntryTs = currentTime.addTicks(2).asTimestamp();
+        unittest::log() << "Prepare TS: " << prepareTs;
+        logTimestamps();
+
+        {
+            AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IS, LockMode::MODE_IS);
+            auto coll = autoColl.getCollection();
+            assertDocumentAtTimestamp(coll, prepareTs, BSONObj());
+            assertDocumentAtTimestamp(coll, abortEntryTs, BSONObj());
+
+            const auto prepareFilter = BSON("ts" << prepareTs);
+            assertOplogDocumentExistsAtTimestamp(prepareFilter, presentTs, false);
+            assertOplogDocumentExistsAtTimestamp(prepareFilter, beforeTxnTs, false);
+            assertOplogDocumentExistsAtTimestamp(prepareFilter, prepareTs, false);
+            assertOplogDocumentExistsAtTimestamp(prepareFilter, abortEntryTs, false);
+            assertOplogDocumentExistsAtTimestamp(prepareFilter, nullTs, false);
+
+            const auto commitFilter = BSON("ts" << abortEntryTs);
+            assertOplogDocumentExistsAtTimestamp(commitFilter, prepareTs, false);
+            assertOplogDocumentExistsAtTimestamp(commitFilter, abortEntryTs, false);
+        }
+        txnParticipant.unstashTransactionResources(_opCtx, "insert");
+
+        txnParticipant.prepareTransaction(_opCtx, {});
+
+        txnParticipant.stashTransactionResources(_opCtx);
+        assertHasStartTimestamp();
+        {
+            const auto prepareFilter = BSON("ts" << prepareTs);
+            assertOplogDocumentExistsAtTimestamp(prepareFilter, presentTs, false);
+            assertOplogDocumentExistsAtTimestamp(prepareFilter, beforeTxnTs, false);
+            assertOplogDocumentExistsAtTimestamp(prepareFilter, prepareTs, true);
+            assertOplogDocumentExistsAtTimestamp(prepareFilter, abortEntryTs, true);
+            assertOplogDocumentExistsAtTimestamp(prepareFilter, nullTs, true);
+
+            const auto abortFilter = BSON("ts" << abortEntryTs);
+            assertOplogDocumentExistsAtTimestamp(abortFilter, presentTs, false);
+            assertOplogDocumentExistsAtTimestamp(abortFilter, beforeTxnTs, false);
+            assertOplogDocumentExistsAtTimestamp(abortFilter, prepareTs, false);
+            assertOplogDocumentExistsAtTimestamp(abortFilter, abortEntryTs, false);
+            assertOplogDocumentExistsAtTimestamp(abortFilter, nullTs, false);
+
+            assertOldestActiveTxnTimestampEquals(boost::none, presentTs);
+            assertOldestActiveTxnTimestampEquals(boost::none, beforeTxnTs);
+            assertOldestActiveTxnTimestampEquals(prepareTs, prepareTs);
+            assertOldestActiveTxnTimestampEquals(prepareTs, nullTs);
+            assertOldestActiveTxnTimestampEquals(prepareTs, abortEntryTs);
+        }
+        txnParticipant.unstashTransactionResources(_opCtx, "abortTransaction");
+
+        txnParticipant.abortActiveTransaction(_opCtx);
+        assertNoStartTimestamp();
+
+        txnParticipant.stashTransactionResources(_opCtx);
+        {
+            AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_X, LockMode::MODE_IX);
+            auto coll = autoColl.getCollection();
+            assertDocumentAtTimestamp(coll, presentTs, BSONObj());
+            assertDocumentAtTimestamp(coll, beforeTxnTs, BSONObj());
+            assertDocumentAtTimestamp(coll, prepareTs, BSONObj());
+            assertDocumentAtTimestamp(coll, abortEntryTs, BSONObj());
+            assertDocumentAtTimestamp(coll, nullTs, BSONObj());
+
+            const auto prepareFilter = BSON("ts" << prepareTs);
+            assertOplogDocumentExistsAtTimestamp(prepareFilter, presentTs, false);
+            assertOplogDocumentExistsAtTimestamp(prepareFilter, beforeTxnTs, false);
+            assertOplogDocumentExistsAtTimestamp(prepareFilter, prepareTs, true);
+            assertOplogDocumentExistsAtTimestamp(prepareFilter, abortEntryTs, true);
+            assertOplogDocumentExistsAtTimestamp(prepareFilter, nullTs, true);
+
+            const auto abortFilter = BSON("ts" << abortEntryTs);
+            assertOplogDocumentExistsAtTimestamp(abortFilter, presentTs, false);
+            assertOplogDocumentExistsAtTimestamp(abortFilter, beforeTxnTs, false);
+            assertOplogDocumentExistsAtTimestamp(abortFilter, prepareTs, false);
+            assertOplogDocumentExistsAtTimestamp(abortFilter, abortEntryTs, true);
+            assertOplogDocumentExistsAtTimestamp(abortFilter, nullTs, true);
+
+            assertOldestActiveTxnTimestampEquals(boost::none, presentTs);
+            assertOldestActiveTxnTimestampEquals(boost::none, beforeTxnTs);
+            assertOldestActiveTxnTimestampEquals(prepareTs, prepareTs);
+            assertOldestActiveTxnTimestampEquals(boost::none, abortEntryTs);
+            assertOldestActiveTxnTimestampEquals(boost::none, nullTs);
         }
     }
 };
@@ -2851,7 +3251,10 @@ public:
         add<ViewCreationSeparateTransaction>();
         add<CreateCollectionWithSystemIndex>();
         add<MultiDocumentTransaction>();
+        add<MultiOplogEntryTransaction>();
+        add<PreparedMultiOplogEntryTransaction>();
         add<PreparedMultiDocumentTransaction>();
+        add<AbortedPreparedMultiDocumentTransaction>();
     }
 };
 

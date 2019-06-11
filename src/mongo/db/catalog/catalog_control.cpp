@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -160,9 +159,10 @@ void openCatalog(OperationContext* opCtx, const MinVisibleTimestampMap& minVisib
             log() << "openCatalog: rebuilding index: collection: " << collNss.toString()
                   << ", index: " << indexName;
         }
+
+        std::vector<BSONObj> indexSpecs = entry.second.second;
         fassert(40690,
-                rebuildIndexesOnCollection(
-                    opCtx, dbCatalogEntry, collCatalogEntry, std::move(entry.second)));
+                rebuildIndexesOnCollection(opCtx, dbCatalogEntry, collCatalogEntry, indexSpecs));
     }
 
     // Open all databases and repopulate the UUID catalog.

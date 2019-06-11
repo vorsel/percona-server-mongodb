@@ -11,6 +11,8 @@
 
     const st = new ShardingTest({shards: 2, mongos: 1, config: 1});
 
+    enableStaleVersionAndSnapshotRetriesWithinTransactions(st);
+
     // Set up two unsharded collections in different databases with shard0 as their primary.
 
     assert.writeOK(st.s.getDB(dbName)[collName].insert({_id: 0}, {writeConcern: {w: "majority"}}));
@@ -89,7 +91,7 @@
     session.commitTransaction();
 
     //
-    // NoSuchTransaction should be returned if the router exhausts its retries.
+    // The final StaleDbVersion error should be returned if the router exhausts its retries.
     //
 
     st.ensurePrimaryShard(dbName, st.shard0.shardName);
@@ -107,9 +109,10 @@
 
     // Target the first database which is on Shard0. The shard is stale and won't refresh its
     // metadata, so mongos should exhaust its retries and implicitly abort the transaction.
-    assert.commandFailedWithCode(
+    res = assert.commandFailedWithCode(
         sessionDB.runCommand({distinct: collName, key: "_id", query: {_id: 0}}),
-        ErrorCodes.NoSuchTransaction);
+        ErrorCodes.StaleDbVersion);
+    assert.eq(res.errorLabels, ["TransientTransactionError"]);
 
     // Verify all shards aborted the transaction.
     assertNoSuchTransactionOnAllShards(
@@ -119,6 +122,8 @@
 
     assert.commandWorked(st.rs0.getPrimary().adminCommand(
         {configureFailPoint: "skipDatabaseVersionMetadataRefresh", mode: "off"}));
+
+    disableStaleVersionAndSnapshotRetriesWithinTransactions(st);
 
     st.stop();
 })();

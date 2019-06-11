@@ -59,7 +59,7 @@ boost::optional<BSONObj> ChangeStreamProxyStage::getNextBson() {
         auto nextBSON = _validateAndConvertToBSON(*next);
         _latestOplogTimestamp = PipelineD::getLatestOplogTimestamp(_pipeline.get());
         _postBatchResumeToken = next->getSortKeyMetaField();
-        _setSpeculativeReadOpTime();
+        _setSpeculativeReadTimestamp();
         return nextBSON;
     }
 
@@ -70,11 +70,10 @@ boost::optional<BSONObj> ChangeStreamProxyStage::getNextBson() {
     // at the current clusterTime.
     auto highWaterMark = PipelineD::getLatestOplogTimestamp(_pipeline.get());
     if (highWaterMark > _latestOplogTimestamp) {
-        auto token =
-            ResumeToken::makeHighWaterMarkToken(highWaterMark, _pipeline->getContext()->uuid);
+        auto token = ResumeToken::makeHighWaterMarkToken(highWaterMark);
         _postBatchResumeToken = token.toDocument().toBson();
         _latestOplogTimestamp = highWaterMark;
-        _setSpeculativeReadOpTime();
+        _setSpeculativeReadTimestamp();
     }
     return boost::none;
 }
@@ -89,7 +88,7 @@ BSONObj ChangeStreamProxyStage::_validateAndConvertToBSON(const Document& event)
     auto resumeToken = event.getSortKeyMetaField();
     auto idField = eventBSON.getObjectField("_id");
     invariant(!resumeToken.isEmpty());
-    uassert(51059,
+    uassert(ErrorCodes::ChangeStreamFatalError,
             str::stream() << "Encountered an event whose _id field, which contains the resume "
                              "token, was modified by the pipeline. Modifying the _id field of an "
                              "event makes it impossible to resume the stream from that point. Only "
@@ -102,17 +101,11 @@ BSONObj ChangeStreamProxyStage::_validateAndConvertToBSON(const Document& event)
     return eventBSON;
 }
 
-void ChangeStreamProxyStage::_setSpeculativeReadOpTime() {
+void ChangeStreamProxyStage::_setSpeculativeReadTimestamp() {
     repl::SpeculativeMajorityReadInfo& speculativeMajorityReadInfo =
         repl::SpeculativeMajorityReadInfo::get(_pipeline->getContext()->opCtx);
     if (speculativeMajorityReadInfo.isSpeculativeRead() && !_latestOplogTimestamp.isNull()) {
-        // Using an uninitialized term here means that this optime will be compared to others based
-        // on its timestamp only. All speculative read optimes are guaranteed to be from our own
-        // local oplog, so it should be safe to order these optimes by timestamp, since timestamps
-        // are totally ordered within a log. That is, ordering by (timestamp + term) should be
-        // equivalent to ordering by timestamp alone.
-        repl::OpTime waitOpTime(_latestOplogTimestamp, repl::OpTime::kUninitializedTerm);
-        speculativeMajorityReadInfo.setSpeculativeReadOpTimeForward(waitOpTime);
+        speculativeMajorityReadInfo.setSpeculativeReadTimestampForward(_latestOplogTimestamp);
     }
 }
 

@@ -1,6 +1,3 @@
-// @file log_process_details.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -55,6 +52,11 @@ void logProcessDetails() {
     auto&& vii = VersionInfoInterface::instance();
     log() << mongodVersion(vii);
     vii.logBuildInfo();
+
+    if (ProcessInfo::getMemSizeMB() < ProcessInfo::getSystemMemSizeMB()) {
+        log() << ProcessInfo::getMemSizeMB() << " MB of memory available to the process out of "
+              << ProcessInfo::getSystemMemSizeMB() << " MB total system memory";
+    }
 
     printCommandLineOpts();
 }

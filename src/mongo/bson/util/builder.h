@@ -1,6 +1,3 @@
-/* builder.h */
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -139,7 +136,7 @@ public:
     }
     void free() {
         if (_ptr != _buf)
-            ::free(_ptr);
+            mongoFree(_ptr);
         _ptr = _buf;
     }
 

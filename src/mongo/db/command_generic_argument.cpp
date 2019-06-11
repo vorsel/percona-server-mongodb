@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -52,7 +51,7 @@ struct SpecialArgRecord {
 // If that changes, it should be added. When you add to this list, consider whether you
 // should also change the filterCommandRequestForPassthrough() function.
 // clang-format off
-static constexpr std::array<SpecialArgRecord, 25> specials{{
+static constexpr std::array<SpecialArgRecord, 26> specials{{
     //                                       /-isGeneric
     //                                       |  /-stripFromRequest
     //                                       |  |  /-stripFromReply
@@ -80,7 +79,8 @@ static constexpr std::array<SpecialArgRecord, 25> specials{{
     {"stmtId"_sd,                            1, 0, 0},
     {"$gleStats"_sd,                         0, 0, 1},
     {"operationTime"_sd,                     0, 0, 1},
-    {"lastCommittedOpTime"_sd,               0, 0, 1}}};
+    {"lastCommittedOpTime"_sd,               0, 0, 1},
+    {"readOnly"_sd,                          0, 0, 1}}};
 // clang-format on
 
 const SpecialArgRecord* findSpecialArg(StringData arg) {

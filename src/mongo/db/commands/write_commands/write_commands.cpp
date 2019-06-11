@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -49,7 +48,6 @@
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/server_parameters.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/storage/duplicate_key_error_info.h"
 #include "mongo/db/transaction_participant.h"
@@ -263,7 +261,7 @@ private:
 
     void _transactionChecks(OperationContext* opCtx) const {
         auto txnParticipant = TransactionParticipant::get(opCtx);
-        if (!txnParticipant || !txnParticipant->inMultiDocumentTransaction())
+        if (!txnParticipant || !txnParticipant.inMultiDocumentTransaction())
             return;
         uassert(50791,
                 str::stream() << "Cannot write to system collection " << ns().toString()

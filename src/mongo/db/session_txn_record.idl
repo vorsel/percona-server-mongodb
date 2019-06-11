@@ -47,6 +47,7 @@ enums:
             kPrepared: "prepared"
             kCommitted: "committed"
             kAborted: "aborted"
+            kInProgress: "inProgress"
 
 structs:
     sessionTxnRecord:
@@ -60,6 +61,10 @@ structs:
             txnNum:
                 type: TxnNumber
                 description: "The id representing this transaction."
+            startTimestamp:
+                type: timestamp
+                description: "The timestamp of this transaction's first oplog entry."
+                optional: true
             lastWriteOpTime:
                 type: optime
                 description: "The optime timestamp component of the last write on this

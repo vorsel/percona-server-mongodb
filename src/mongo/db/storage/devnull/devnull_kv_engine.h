@@ -1,6 +1,3 @@
-// devnull_kv_engine.h
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -145,6 +142,10 @@ public:
 
     virtual StatusWith<std::vector<std::string>> extendBackupCursor(
         OperationContext* opCtx) override;
+
+    virtual boost::optional<Timestamp> getLastStableRecoveryTimestamp() const override {
+        return boost::none;
+    }
 
 private:
     std::shared_ptr<void> _catalogInfo;

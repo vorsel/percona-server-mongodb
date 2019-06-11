@@ -29,36 +29,27 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
     it in the license file.
 ======= */
 
+#include "mongo/db/redaction_parameter_gen.h"
 #include "mongo/db/server_options.h"
-#include "mongo/db/server_parameters.h"
 #include "mongo/logger/logger.h"
 
 namespace mongo {
 
 // Allow --redactClientLogData access via setParameter/getParameter
-namespace {
-
-class RedactClientLogDataParameter : public ServerParameter
-{
-    MONGO_DISALLOW_COPYING(RedactClientLogDataParameter);
-
-public:
-    RedactClientLogDataParameter();
-    virtual void append(OperationContext* txn, BSONObjBuilder& b, const std::string& name);
-    virtual Status set(const BSONElement& newValueElement);
-    virtual Status setFromString(const std::string& str);
-
-private:
-    Status _set(bool v);
-} redactClientLogDataParameter;
-
-RedactClientLogDataParameter::RedactClientLogDataParameter()
-    : ServerParameter(ServerParameterSet::getGlobal(), "redactClientLogData", true, true) {}
 
 void RedactClientLogDataParameter::append(OperationContext* txn,
                                    BSONObjBuilder& b,
                                    const std::string& name) {
     b.append(name, logger::globalLogDomain()->shouldRedactLogs());
+}
+
+namespace {
+
+Status _set(bool v) {
+    logger::globalLogDomain()->setShouldRedactLogs(v);
+    return Status::OK();
+}
+
 }
 
 Status RedactClientLogDataParameter::set(const BSONElement& newValueElement) {
@@ -75,12 +66,5 @@ Status RedactClientLogDataParameter::setFromString(const std::string& newValueSt
         return _set(false);
     return Status(ErrorCodes::BadValue, "can't convert string to bool");
 }
-
-Status RedactClientLogDataParameter::_set(bool v) {
-    logger::globalLogDomain()->setShouldRedactLogs(v);
-    return Status::OK();
-}
-
-}  // namespace
 
 }  // namespace mongo

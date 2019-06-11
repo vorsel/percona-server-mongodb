@@ -7,6 +7,8 @@
 // 4. Use an existing client to check current op for that special appname.  Return true if it's
 //    still there at the end of a timeout
 // 5. Disable the fail point
+//
+// @tags: [requires_sharding]
 
 (function() {
     "use strict";
@@ -23,8 +25,8 @@
     // Returns false if the op was gone from current op
     function check(client, pre, post) {
         const interval = 200;
-        const timeout = 2000;
-        const socketTimeout = 1000;
+        const timeout = 10000;
+        const socketTimeout = 5000;
 
         const host = client.host;
 

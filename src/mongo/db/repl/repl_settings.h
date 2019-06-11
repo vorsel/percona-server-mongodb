@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -33,12 +32,11 @@
 #include <string>
 
 #include "mongo/db/jsobj.h"
+#include "mongo/db/repl/repl_set_config_gen.h"
+#include "mongo/db/repl/repl_settings_gen.h"
 
 namespace mongo {
 namespace repl {
-
-extern int maxSyncSourceLagSecs;
-extern double replElectionTimeoutOffsetLimitFraction;
 
 class ReplSettings {
 public:

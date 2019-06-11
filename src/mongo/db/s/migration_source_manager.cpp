@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -40,6 +39,7 @@
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/read_concern.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/migration_chunk_cloner_source_legacy.h"
 #include "mongo/db/s/migration_util.h"
@@ -236,10 +236,12 @@ Status MigrationSourceManager::startClone(OperationContext* opCtx) {
 
     _cloneAndCommitTimer.reset();
 
+    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    auto replEnabled = replCoord->isReplEnabled();
+
     {
         const auto metadata = _getCurrentMetadataAndCheckEpoch(opCtx);
 
-        _state = kCloning;
         // Having the metadata manager registered on the collection sharding state is what indicates
         // that a chunk on that collection is being migrated. With an active migration, write
         // operations require the cloner to be present in order to track changes to the chunk which
@@ -247,16 +249,37 @@ Status MigrationSourceManager::startClone(OperationContext* opCtx) {
         _cloneDriver = stdx::make_unique<MigrationChunkClonerSourceLegacy>(
             _args, metadata->getKeyPattern(), _donorConnStr, _recipientHost);
 
-        AutoGetCollection autoColl(opCtx,
-                                   getNss(),
-                                   MODE_IX,
-                                   MODE_X,
-                                   AutoGetCollection::ViewMode::kViewsForbidden,
-                                   opCtx->getServiceContext()->getPreciseClockSource()->now() +
-                                       Milliseconds(migrationLockAcquisitionMaxWaitMS.load()));
+        boost::optional<AutoGetCollection> autoColl;
+        if (replEnabled) {
+            autoColl.emplace(opCtx,
+                             getNss(),
+                             MODE_IX,
+                             MODE_IX,
+                             AutoGetCollection::ViewMode::kViewsForbidden,
+                             opCtx->getServiceContext()->getPreciseClockSource()->now() +
+                                 Milliseconds(migrationLockAcquisitionMaxWaitMS.load()));
+        } else {
+            autoColl.emplace(opCtx,
+                             getNss(),
+                             MODE_IX,
+                             MODE_X,
+                             AutoGetCollection::ViewMode::kViewsForbidden,
+                             opCtx->getServiceContext()->getPreciseClockSource()->now() +
+                                 Milliseconds(migrationLockAcquisitionMaxWaitMS.load()));
+        }
+
         auto csr = CollectionShardingRuntime::get(opCtx, getNss());
         auto lockedCsr = CollectionShardingRuntime::CSRLock::lockExclusive(opCtx, csr);
         invariant(nullptr == std::exchange(msmForCsr(csr), this));
+
+        _state = kCloning;
+    }
+
+    if (replEnabled) {
+        auto const readConcernArgs = repl::ReadConcernArgs(
+            replCoord->getMyLastAppliedOpTime(), repl::ReadConcernLevel::kLocalReadConcern);
+
+        uassertStatusOK(waitForReadConcern(opCtx, readConcernArgs, false));
     }
 
     Status startCloneStatus = _cloneDriver->startClone(opCtx);
@@ -449,7 +472,7 @@ Status MigrationSourceManager::commitChunkMetadataOnConfig(OperationContext* opC
         // this node can accept writes for this collection as a proxy for it being primary.
         if (!status.isOK()) {
             UninterruptibleLockGuard noInterrupt(opCtx->lockState());
-            AutoGetCollection autoColl(opCtx, getNss(), MODE_IX, MODE_X);
+            AutoGetCollection autoColl(opCtx, getNss(), MODE_IX, MODE_IX);
             if (!repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, getNss())) {
                 CollectionShardingRuntime::get(opCtx, getNss())->clearFilteringMetadata();
                 uassertStatusOK(status.withContext(
@@ -485,7 +508,7 @@ Status MigrationSourceManager::commitChunkMetadataOnConfig(OperationContext* opC
 
     if (!refreshStatus.isOK()) {
         UninterruptibleLockGuard noInterrupt(opCtx->lockState());
-        AutoGetCollection autoColl(opCtx, getNss(), MODE_IX, MODE_X);
+        AutoGetCollection autoColl(opCtx, getNss(), MODE_IX, MODE_IX);
 
         CollectionShardingRuntime::get(opCtx, getNss())->clearFilteringMetadata();
 
@@ -684,20 +707,22 @@ void MigrationSourceManager::_cleanup(OperationContext* opCtx) {
     auto cloneDriver = [&]() {
         // Unregister from the collection's sharding state and exit the migration critical section.
         UninterruptibleLockGuard noInterrupt(opCtx->lockState());
-        AutoGetCollection autoColl(opCtx, getNss(), MODE_IX, MODE_X);
-        auto* const css = CollectionShardingRuntime::get(opCtx, getNss());
+        AutoGetCollection autoColl(opCtx, getNss(), MODE_IX, MODE_IX);
+        auto* const csr = CollectionShardingRuntime::get(opCtx, getNss());
+        auto csrLock = CollectionShardingState::CSRLock::lockExclusive(opCtx, csr);
 
-        // In the kCreated state there should be no state to clean up, but we can verify this
-        // just to be safe.
-        if (_state == kCreated) {
-            // Verify that we did not set the MSM on the CSR.
-            invariant(!msmForCsr(css));
-            // Verify that the clone driver was not initialized.
-            invariant(!_cloneDriver);
-        } else {
-            auto oldMsmOnCsr = std::exchange(msmForCsr(css), nullptr);
+        if (_state != kCreated) {
+            invariant(msmForCsr(csr));
+            invariant(_cloneDriver);
+        }
+
+        // While we are in kCreated, the MigrationSourceManager may or may not be already be
+        // installed on the CollectionShardingRuntime.
+        if (_state != kCreated || (_state == kCreated && msmForCsr(csr))) {
+            auto oldMsmOnCsr = std::exchange(msmForCsr(csr), nullptr);
             invariant(this == oldMsmOnCsr);
         }
+
         _critSec.reset();
         return std::move(_cloneDriver);
     }();

@@ -1,6 +1,3 @@
-// expression_parser.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -549,15 +546,28 @@ StatusWithMatchExpression parseRegexDocument(StringData name, const BSONObj& doc
                     regex = e.valueStringData();
                 } else if (e.type() == BSONType::RegEx) {
                     regex = e.regex();
-                    regexOptions = e.regexFlags();
+                    if (!StringData{e.regexFlags()}.empty()) {
+                        if (!regexOptions.empty()) {
+                            return {Status(ErrorCodes::Error(51074),
+                                           "options set in both $regex and $options")};
+                        }
+                        regexOptions = e.regexFlags();
+                    }
                 } else {
                     return {Status(ErrorCodes::BadValue, "$regex has to be a string")};
                 }
 
                 break;
             case PathAcceptingKeyword::OPTIONS:
-                if (e.type() != BSONType::String)
+                if (e.type() != BSONType::String) {
                     return {Status(ErrorCodes::BadValue, "$options has to be a string")};
+                }
+
+                if (!regexOptions.empty()) {
+                    return {Status(ErrorCodes::Error(51075),
+                                   "options set in both $regex and $options")};
+                }
+
                 regexOptions = e.valueStringData();
                 break;
             default:
@@ -1402,6 +1412,33 @@ StatusWithMatchExpression parseInternalSchemaBinDataSubType(StringData name, BSO
         name, static_cast<BinDataType>(valueAsInt.getValue()))};
 }
 
+StatusWithMatchExpression parseInternalSchemaBinDataEncryptedType(StringData name, BSONElement e) {
+    if (!e.isNumber()) {
+        return Status(ErrorCodes::FailedToParse,
+                      str::stream() << InternalSchemaBinDataEncryptedTypeExpression::kName
+                                    << " must be represented as a number");
+    }
+
+    auto valueAsInt = MatchExpressionParser::parseIntegerElementToInt(e);
+    if (!valueAsInt.isOK()) {
+        return Status(ErrorCodes::FailedToParse,
+                      str::stream() << "Invalid numerical type code for "
+                                    << InternalSchemaBinDataEncryptedTypeExpression::kName
+                                    << ": "
+                                    << e.number());
+    }
+
+    if (!isValidBSONType(valueAsInt.getValue())) {
+        return Status(ErrorCodes::FailedToParse,
+                      str::stream() << InternalSchemaBinDataEncryptedTypeExpression::kName
+                                    << " value must represent a valid BSON type: "
+                                    << valueAsInt.getValue());
+    }
+
+    return {stdx::make_unique<InternalSchemaBinDataEncryptedTypeExpression>(
+        name, static_cast<BSONType>(valueAsInt.getValue()))};
+}
+
 /**
  * Parses a single field in a sub expression.
  * If the query is { x : { $gt : 5, $lt : 8 } },
@@ -1730,6 +1767,10 @@ StatusWithMatchExpression parseSubField(const BSONObj& context,
             return {stdx::make_unique<InternalSchemaEqMatchExpression>(name, e)};
         }
 
+        case PathAcceptingKeyword::INTERNAL_SCHEMA_BIN_DATA_ENCRYPTED_TYPE: {
+            return parseInternalSchemaBinDataEncryptedType(name, e);
+        }
+
         case PathAcceptingKeyword::INTERNAL_SCHEMA_BIN_DATA_SUBTYPE: {
             return parseInternalSchemaBinDataSubType(name, e);
         }
@@ -1870,6 +1911,8 @@ MONGO_INITIALIZER(MatchExpressionParser)(InitializerContext* context) {
             {"_internalExprEq", PathAcceptingKeyword::INTERNAL_EXPR_EQ},
             {"_internalSchemaAllElemMatchFromIndex",
              PathAcceptingKeyword::INTERNAL_SCHEMA_ALL_ELEM_MATCH_FROM_INDEX},
+            {"_internalSchemaBinDataEncryptedType",
+             PathAcceptingKeyword::INTERNAL_SCHEMA_BIN_DATA_ENCRYPTED_TYPE},
             {"_internalSchemaBinDataSubType",
              PathAcceptingKeyword::INTERNAL_SCHEMA_BIN_DATA_SUBTYPE},
             {"_internalSchemaEq", PathAcceptingKeyword::INTERNAL_SCHEMA_EQ},

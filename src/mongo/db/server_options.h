@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -53,6 +52,7 @@ struct ServerGlobalParams {
     bool isDefaultPort() const {
         return port == DefaultDBPort;
     }
+    static std::string getPortSettingHelpText();
 
     std::vector<std::string> bind_ips;  // --bind_ip
     bool enableIPv6 = false;

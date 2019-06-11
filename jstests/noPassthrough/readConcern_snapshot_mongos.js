@@ -1,7 +1,9 @@
 // Test parsing of readConcern level 'snapshot' on mongos.
-// @tags: [requires_replication,requires_sharding, uses_transactions]
+// @tags: [requires_replication,requires_sharding, uses_transactions, uses_atclustertime]
 (function() {
     "use strict";
+
+    load("jstests/sharding/libs/sharded_transactions_helpers.js");
 
     // Runs the command as the first in a multi statement txn that is aborted right after, expecting
     // success.
@@ -28,6 +30,8 @@
 
     // Insert data to create the collection.
     assert.writeOK(testDB[collName].insert({x: 1}));
+
+    flushRoutersAndRefreshShardMetadata(st, {ns: dbName + "." + collName, dbNames: [dbName]});
 
     // noPassthrough tests
 

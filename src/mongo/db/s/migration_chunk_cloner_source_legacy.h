@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -42,6 +41,7 @@
 #include "mongo/db/s/session_catalog_migration_source.h"
 #include "mongo/s/request_types/move_chunk_request.h"
 #include "mongo/s/shard_key_pattern.h"
+#include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/net/hostandport.h"
@@ -206,6 +206,55 @@ private:
                long long* sizeAccumulator,
                bool explode);
 
+    /*
+     * Consumes the operation track request and appends the relevant document changes to
+     * the appropriate internal data structures (known colloquially as the 'transfer mods queue').
+     * These structures track document changes that are part of a part of a chunk being migrated.
+     * In doing so, this the method also removes the corresponding operation track request from the
+     * operation track requests queue.
+     */
+    void _consumeOperationTrackRequestAndAddToTransferModsQueue(
+        const BSONObj& idObj,
+        const char op,
+        const repl::OpTime& opTime,
+        const repl::OpTime& prePostImageOpTime);
+
+    /**
+     * Adds an operation to the outstanding operation track requests. Returns false if the cloner
+     * is no longer accepting new operation track requests.
+     */
+    bool _addedOperationToOutstandingOperationTrackRequests();
+
+    /**
+     * Called to indicate a request to track an operation must be filled. The operations in
+     * question indicate a change to a document in the chunk being cloned. Increments a counter
+     * residing inside the MigrationChunkClonerSourceLegacy class.
+     *
+     * There should always be a one to one match from the number of calls to this function to the
+     * number of calls to the corresponding decrement* function.
+     *
+     * NOTE: This funtion invariants that we are currently accepting new operation track requests.
+     * It is up to callers of this function to make sure that will always be the case.
+     */
+    void _incrementOutstandingOperationTrackRequests(WithLock);
+
+    /**
+     * Called once a request to track an operation has been filled. The operations in question
+     * indicate a change to a document in the chunk being cloned. Decrements a counter residing
+     * inside the MigrationChunkClonerSourceLegacy class.
+     *
+     * There should always be a one to one match from the number of calls to this function to the
+     * number of calls to the corresponding increment* function.
+     */
+    void _decrementOutstandingOperationTrackRequests();
+
+    /**
+     * Waits for all outstanding operation track requests to be fulfilled before returning from this
+     * function. Should only be used in the cleanup for this class. Should use a lock wrapped
+     * around this class's mutex.
+     */
+    void _drainAllOutstandingOperationTrackRequests(stdx::unique_lock<stdx::mutex>& lk);
+
     // The original move chunk request
     const MoveChunkRequest _args;
 
@@ -235,6 +284,16 @@ private:
     // The estimated average object size during the clone phase. Used for buffer size
     // pre-allocation (initial clone).
     uint64_t _averageObjectSizeForCloneLocs{0};
+
+    // Represents all of the requested but not yet fulfilled operations to be tracked, with regards
+    // to the chunk being cloned.
+    uint64_t _outstandingOperationTrackRequests{0};
+
+    // Signals to any waiters once all unresolved operation tracking requests have completed.
+    stdx::condition_variable _allOutstandingOperationTrackRequestsDrained;
+
+    // Indicates whether new requests to track an operation are accepted.
+    bool _acceptingNewOperationTrackRequests{true};
 
     // List of _id of documents that were modified that must be re-cloned (xfer mods)
     std::list<BSONObj> _reload;

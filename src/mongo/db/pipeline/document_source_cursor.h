@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -52,10 +51,6 @@ public:
 
     const char* getSourceName() const override;
 
-    BSONObjSet getOutputSorts() override {
-        return _outputSorts;
-    }
-
     Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
@@ -70,6 +65,10 @@ public:
         return constraints;
     }
 
+    boost::optional<MergingLogic> mergingLogic() final {
+        return boost::none;
+    }
+
     void detachFromOperationContext() final;
 
     void reattachToOperationContext(OperationContext* opCtx) final;
@@ -81,7 +80,8 @@ public:
     static boost::intrusive_ptr<DocumentSourceCursor> create(
         Collection* collection,
         std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
-        const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+        const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
+        bool trackOplogTimestamp = false);
 
     /*
       Record the query that was specified for the cursor this wraps, if
@@ -140,10 +140,7 @@ public:
     }
 
     Timestamp getLatestOplogTimestamp() const {
-        if (_exec) {
-            return _exec->getLatestOplogTimestamp();
-        }
-        return Timestamp();
+        return _latestOplogTimestamp;
     }
 
     const std::string& getPlanSummaryStr() const {
@@ -157,7 +154,8 @@ public:
 protected:
     DocumentSourceCursor(Collection* collection,
                          std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
-                         const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+                         const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
+                         bool trackOplogTimestamp = false);
 
     ~DocumentSourceCursor();
 
@@ -196,6 +194,12 @@ private:
 
     void recordPlanSummaryStats();
 
+    /**
+     * If we are tailing the oplog, this method updates the cached timestamp to that of the latest
+     * document returned, or the latest timestamp observed in the oplog if we have no more results.
+     */
+    void _updateOplogTimestamp();
+
     // Batches results returned from the underlying PlanExecutor.
     std::deque<Document> _currentBatch;
 
@@ -217,7 +221,6 @@ private:
     // the default.
     Status _execStatus = Status::OK();
 
-    BSONObjSet _outputSorts;
     std::string _planSummary;
     PlanSummaryStats _planSummaryStats;
 
@@ -225,6 +228,13 @@ private:
     // stage is a MultiPlanStage. When the query is executed (with exec->executePlan()), it will
     // wipe out its own copy of the winning plan's statistics, so they need to be saved here.
     std::unique_ptr<PlanStageStats> _winningPlanTrialStats;
+
+    // True if we are tracking the latest observed oplog timestamp, false otherwise.
+    bool _trackOplogTS = false;
+
+    // If we are tailing the oplog and tracking the latest observed oplog time, this is the latest
+    // timestamp seen in the collection. Otherwise, this is a null timestamp.
+    Timestamp _latestOplogTimestamp;
 };
 
 }  // namespace mongo

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -42,15 +41,21 @@
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/background.h"
+#include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/record_id.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/mutex.h"
+#include "mongo/util/fail_point_service.h"
 
 namespace mongo {
+
+MONGO_FAIL_POINT_DECLARE(leaveIndexBuildUnfinishedForShutdown);
+
 class Collection;
 class MatchExpression;
+class NamespaceString;
 class OperationContext;
 
 /**
@@ -68,8 +73,19 @@ class MultiIndexBlock {
     MONGO_DISALLOW_COPYING(MultiIndexBlock);
 
 public:
-    MultiIndexBlock(OperationContext* opCtx, Collection* collection);
+    MultiIndexBlock() = default;
     ~MultiIndexBlock();
+
+    /**
+     * Ensures the index build state is cleared correctly after index build success or failure.
+     *
+     * Must be called before object destruction if init() has been called; and safe to call if
+     * init() has not been called.
+     *
+     * By only requiring this call after init(), we allow owners of the object to exit without
+     * further handling if they never use the object.
+     */
+    void cleanUpAfterBuild(OperationContext* opCtx, Collection* collection);
 
     static bool areHybridIndexBuildsEnabled();
 
@@ -95,9 +111,15 @@ public:
      *
      * Requires holding an exclusive database lock.
      */
-    using OnInitFn = stdx::function<void()>;
-    StatusWith<std::vector<BSONObj>> init(const std::vector<BSONObj>& specs, OnInitFn onInit);
-    StatusWith<std::vector<BSONObj>> init(const BSONObj& spec, OnInitFn onInit);
+    using OnInitFn = stdx::function<Status(std::vector<BSONObj>& specs)>;
+    StatusWith<std::vector<BSONObj>> init(OperationContext* opCtx,
+                                          Collection* collection,
+                                          const std::vector<BSONObj>& specs,
+                                          OnInitFn onInit);
+    StatusWith<std::vector<BSONObj>> init(OperationContext* opCtx,
+                                          Collection* collection,
+                                          const BSONObj& spec,
+                                          OnInitFn onInit);
 
     /**
      * Not all index initializations need an OnInitFn, in particular index builds that do not need
@@ -112,7 +134,6 @@ public:
      */
     static OnInitFn makeTimestampedIndexOnInitFn(OperationContext* opCtx, const Collection* coll);
 
-
     /**
      * Inserts all documents in the Collection into the indexes and logs with timing info.
      *
@@ -125,7 +146,7 @@ public:
      *
      * Should not be called inside of a WriteUnitOfWork.
      */
-    Status insertAllDocumentsInCollection();
+    Status insertAllDocumentsInCollection(OperationContext* opCtx, Collection* collection);
 
     /**
      * Call this after init() for each document in the collection.
@@ -134,7 +155,7 @@ public:
      *
      * Should be called inside of a WriteUnitOfWork.
      */
-    Status insert(const BSONObj& wholeDocument, const RecordId& loc);
+    Status insert(OperationContext* opCtx, const BSONObj& wholeDocument, const RecordId& loc);
 
     /**
      * Call this after the last insert(). This gives the index builder a chance to do any
@@ -149,8 +170,8 @@ public:
      *
      * Should not be called inside of a WriteUnitOfWork.
      */
-    Status dumpInsertsFromBulk();
-    Status dumpInsertsFromBulk(std::set<RecordId>* const dupRecords);
+    Status dumpInsertsFromBulk(OperationContext* opCtx);
+    Status dumpInsertsFromBulk(OperationContext* opCtx, std::set<RecordId>* const dupRecords);
 
     /**
      * For background indexes using an IndexBuildInterceptor to capture inserts during a build,
@@ -165,6 +186,7 @@ public:
      * Must not be in a WriteUnitOfWork.
      */
     Status drainBackgroundWrites(
+        OperationContext* opCtx,
         RecoveryUnit::ReadSource readSource = RecoveryUnit::ReadSource::kUnset);
 
     /**
@@ -174,7 +196,7 @@ public:
      *
      * Must not be in a WriteUnitOfWork.
      */
-    Status checkConstraints();
+    Status checkConstraints(OperationContext* opCtx);
 
     /**
      * Marks the index ready for use. Should only be called as the last method after
@@ -190,7 +212,10 @@ public:
      */
     using OnCommitFn = stdx::function<void()>;
     using OnCreateEachFn = stdx::function<void(const BSONObj& spec)>;
-    Status commit(OnCreateEachFn onCreateEach, OnCommitFn onCommit);
+    Status commit(OperationContext* opCtx,
+                  Collection* collection,
+                  OnCreateEachFn onCreateEach,
+                  OnCommitFn onCommit);
 
     /**
      * Not all index commits need these functions, in particular index builds that do not need
@@ -240,7 +265,7 @@ public:
      *
      * Must be called from owning thread.
      */
-    void abortWithoutCleanup();
+    void abortWithoutCleanup(OperationContext* opCtx);
 
     /**
      * Returns true if this build block supports background writes while building an index. This is
@@ -300,21 +325,27 @@ private:
     /**
      * Updates CurOp's 'opDescription' field with the current state of this index build.
      */
-    void _updateCurOpOpDescription(bool isBuildingPhaseComplete) const;
+    void _updateCurOpOpDescription(OperationContext* opCtx,
+                                   const NamespaceString& nss,
+                                   const std::vector<BSONObj>& indexSpecs,
+                                   bool isBuildingPhaseComplete) const;
+
+    // Is set during init() and ensures subsequent function calls act on the same Collection.
+    boost::optional<UUID> _collectionUUID;
 
     std::vector<IndexToBuild> _indexes;
 
     std::unique_ptr<BackgroundOperation> _backgroundOperation;
-
-    // Pointers not owned here and must outlive 'this'
-    Collection* _collection;
-    OperationContext* _opCtx;
 
     IndexBuildMethod _method = IndexBuildMethod::kHybrid;
 
     bool _ignoreUnique = false;
 
     bool _needToCleanup = true;
+
+    // Set to true when no work remains to be done, the object can safely destruct without leaving
+    // incorrect state set anywhere.
+    bool _buildIsCleanedUp = true;
 
     // Protects member variables of this class declared below.
     mutable stdx::mutex _mutex;

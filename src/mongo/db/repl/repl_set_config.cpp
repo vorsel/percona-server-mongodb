@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -39,17 +38,10 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/mongod_options.h"
 #include "mongo/db/server_options.h"
-#include "mongo/db/server_parameters.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/util/stringutils.h"
 
 namespace mongo {
-/**
- * Dont run any sharding validations. Can not be combined with --configsvr or shardvr. Intended to
- * allow restarting config server or shard as an independent replica set.
- */
-MONGO_EXPORT_STARTUP_SERVER_PARAMETER(skipShardingConfigurationChecks, bool, false);
-
 namespace repl {
 
 const size_t ReplSetConfig::kMaxMembers;
@@ -645,6 +637,12 @@ Status ReplSetConfig::checkIfWriteConcernCanBeSatisfied(
         }
         return Status(ErrorCodes::UnsatisfiableWriteConcern, "Not enough data-bearing nodes");
     }
+}
+
+int ReplSetConfig::getNumDataBearingMembers() const {
+    int numArbiters =
+        std::count_if(begin(_members), end(_members), [](const auto& x) { return x.isArbiter(); });
+    return _members.size() - numArbiters;
 }
 
 const MemberConfig& ReplSetConfig::getMemberAt(size_t i) const {

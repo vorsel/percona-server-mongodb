@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -118,9 +117,9 @@ public:
     static ResumeToken parse(const Document& document);
 
     /**
-     * Generate a high-water-mark token for 'clusterTime', with an optional UUID and no documentKey.
+     * Generate a high-water-mark token for 'clusterTime', with no UUID or documentKey.
      */
-    static ResumeToken makeHighWaterMarkToken(Timestamp clusterTime, boost::optional<UUID> uuid);
+    static ResumeToken makeHighWaterMarkToken(Timestamp clusterTime);
 
     /**
      * Returns true if the given token data represents a valid high-water-mark resume token; that

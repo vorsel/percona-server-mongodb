@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -125,36 +124,13 @@ public:
           _prePostImageOpTime(prePostImageOpTime) {}
 
     void commit(boost::optional<Timestamp>) override {
-        switch (_op) {
-            case 'd': {
-                stdx::lock_guard<stdx::mutex> sl(_cloner->_mutex);
-                _cloner->_deleted.push_back(_idObj);
-                _cloner->_memoryUsed += _idObj.firstElement().size() + 5;
-            } break;
-
-            case 'i':
-            case 'u': {
-                stdx::lock_guard<stdx::mutex> sl(_cloner->_mutex);
-                _cloner->_reload.push_back(_idObj);
-                _cloner->_memoryUsed += _idObj.firstElement().size() + 5;
-            } break;
-
-            default:
-                MONGO_UNREACHABLE;
-        }
-
-        if (auto sessionSource = _cloner->_sessionCatalogSource.get()) {
-            if (!_prePostImageOpTime.isNull()) {
-                sessionSource->notifyNewWriteOpTime(_prePostImageOpTime);
-            }
-
-            if (!_opTime.isNull()) {
-                sessionSource->notifyNewWriteOpTime(_opTime);
-            }
-        }
+        _cloner->_consumeOperationTrackRequestAndAddToTransferModsQueue(
+            _idObj, _op, _opTime, _prePostImageOpTime);
     }
 
-    void rollback() override {}
+    void rollback() override {
+        _cloner->_decrementOutstandingOperationTrackRequests();
+    }
 
 private:
     MigrationChunkClonerSourceLegacy* const _cloner;
@@ -364,7 +340,7 @@ bool MigrationChunkClonerSourceLegacy::isDocumentInMigratingChunk(const BSONObj&
 void MigrationChunkClonerSourceLegacy::onInsertOp(OperationContext* opCtx,
                                                   const BSONObj& insertedDoc,
                                                   const repl::OpTime& opTime) {
-    dassert(opCtx->lockState()->isCollectionLockedForMode(_args.getNss().ns(), MODE_IX));
+    dassert(opCtx->lockState()->isCollectionLockedForMode(_args.getNss(), MODE_IX));
 
     BSONElement idElement = insertedDoc["_id"];
     if (idElement.eoo()) {
@@ -374,6 +350,10 @@ void MigrationChunkClonerSourceLegacy::onInsertOp(OperationContext* opCtx,
     }
 
     if (!isInRange(insertedDoc, _args.getMinKey(), _args.getMaxKey(), _shardKeyPattern)) {
+        return;
+    }
+
+    if (!_addedOperationToOutstandingOperationTrackRequests()) {
         return;
     }
 
@@ -390,7 +370,7 @@ void MigrationChunkClonerSourceLegacy::onUpdateOp(OperationContext* opCtx,
                                                   const BSONObj& updatedDoc,
                                                   const repl::OpTime& opTime,
                                                   const repl::OpTime& prePostImageOpTime) {
-    dassert(opCtx->lockState()->isCollectionLockedForMode(_args.getNss().ns(), MODE_IX));
+    dassert(opCtx->lockState()->isCollectionLockedForMode(_args.getNss(), MODE_IX));
 
     BSONElement idElement = updatedDoc["_id"];
     if (idElement.eoo()) {
@@ -400,6 +380,10 @@ void MigrationChunkClonerSourceLegacy::onUpdateOp(OperationContext* opCtx,
     }
 
     if (!isInRange(updatedDoc, _args.getMinKey(), _args.getMaxKey(), _shardKeyPattern)) {
+        return;
+    }
+
+    if (!_addedOperationToOutstandingOperationTrackRequests()) {
         return;
     }
 
@@ -416,12 +400,16 @@ void MigrationChunkClonerSourceLegacy::onDeleteOp(OperationContext* opCtx,
                                                   const BSONObj& deletedDocId,
                                                   const repl::OpTime& opTime,
                                                   const repl::OpTime& preImageOpTime) {
-    dassert(opCtx->lockState()->isCollectionLockedForMode(_args.getNss().ns(), MODE_IX));
+    dassert(opCtx->lockState()->isCollectionLockedForMode(_args.getNss(), MODE_IX));
 
     BSONElement idElement = deletedDocId["_id"];
     if (idElement.eoo()) {
         warning() << "logDeleteOp got a document with no _id field, ignoring deleted doc: "
                   << redact(deletedDocId);
+        return;
+    }
+
+    if (!_addedOperationToOutstandingOperationTrackRequests()) {
         return;
     }
 
@@ -431,6 +419,74 @@ void MigrationChunkClonerSourceLegacy::onDeleteOp(OperationContext* opCtx,
     } else {
         opCtx->recoveryUnit()->registerChange(
             new LogOpForShardingHandler(this, idElement.wrap(), 'd', {}, {}));
+    }
+}
+
+void MigrationChunkClonerSourceLegacy::_consumeOperationTrackRequestAndAddToTransferModsQueue(
+    const BSONObj& idObj,
+    const char op,
+    const repl::OpTime& opTime,
+    const repl::OpTime& prePostImageOpTime) {
+    switch (op) {
+        case 'd': {
+            stdx::lock_guard<stdx::mutex> sl(_mutex);
+            _deleted.push_back(idObj);
+            _memoryUsed += idObj.firstElement().size() + 5;
+        } break;
+
+        case 'i':
+        case 'u': {
+            stdx::lock_guard<stdx::mutex> sl(_mutex);
+            _reload.push_back(idObj);
+            _memoryUsed += idObj.firstElement().size() + 5;
+        } break;
+
+        default:
+            MONGO_UNREACHABLE;
+    }
+
+    if (auto sessionSource = _sessionCatalogSource.get()) {
+        if (!prePostImageOpTime.isNull()) {
+            sessionSource->notifyNewWriteOpTime(prePostImageOpTime);
+        }
+
+        if (!opTime.isNull()) {
+            sessionSource->notifyNewWriteOpTime(opTime);
+        }
+    }
+
+    _decrementOutstandingOperationTrackRequests();
+}
+
+bool MigrationChunkClonerSourceLegacy::_addedOperationToOutstandingOperationTrackRequests() {
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    if (!_acceptingNewOperationTrackRequests) {
+        return false;
+    }
+
+    _incrementOutstandingOperationTrackRequests(lk);
+    return true;
+}
+
+void MigrationChunkClonerSourceLegacy::_drainAllOutstandingOperationTrackRequests(
+    stdx::unique_lock<stdx::mutex>& lk) {
+    invariant(_state == kDone);
+    _acceptingNewOperationTrackRequests = false;
+    _allOutstandingOperationTrackRequestsDrained.wait(
+        lk, [&] { return _outstandingOperationTrackRequests == 0; });
+}
+
+
+void MigrationChunkClonerSourceLegacy::_incrementOutstandingOperationTrackRequests(WithLock) {
+    invariant(_acceptingNewOperationTrackRequests);
+    ++_outstandingOperationTrackRequests;
+}
+
+void MigrationChunkClonerSourceLegacy::_decrementOutstandingOperationTrackRequests() {
+    stdx::lock_guard<stdx::mutex> sl(_mutex);
+    --_outstandingOperationTrackRequests;
+    if (_outstandingOperationTrackRequests == 0) {
+        _allOutstandingOperationTrackRequestsDrained.notify_all();
     }
 }
 
@@ -444,7 +500,7 @@ uint64_t MigrationChunkClonerSourceLegacy::getCloneBatchBufferAllocationSize() {
 Status MigrationChunkClonerSourceLegacy::nextCloneBatch(OperationContext* opCtx,
                                                         Collection* collection,
                                                         BSONArrayBuilder* arrBuilder) {
-    dassert(opCtx->lockState()->isCollectionLockedForMode(_args.getNss().ns(), MODE_IS));
+    dassert(opCtx->lockState()->isCollectionLockedForMode(_args.getNss(), MODE_IS));
 
     ElapsedTracker tracker(opCtx->getServiceContext()->getFastClockSource(),
                            internalQueryExecYieldIterations.load(),
@@ -483,7 +539,7 @@ Status MigrationChunkClonerSourceLegacy::nextCloneBatch(OperationContext* opCtx,
 Status MigrationChunkClonerSourceLegacy::nextModsBatch(OperationContext* opCtx,
                                                        Database* db,
                                                        BSONObjBuilder* builder) {
-    dassert(opCtx->lockState()->isCollectionLockedForMode(_args.getNss().ns(), MODE_IS));
+    dassert(opCtx->lockState()->isCollectionLockedForMode(_args.getNss(), MODE_IS));
 
     stdx::lock_guard<stdx::mutex> sl(_mutex);
 
@@ -501,8 +557,11 @@ Status MigrationChunkClonerSourceLegacy::nextModsBatch(OperationContext* opCtx,
 }
 
 void MigrationChunkClonerSourceLegacy::_cleanup(OperationContext* opCtx) {
-    stdx::lock_guard<stdx::mutex> sl(_mutex);
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
     _state = kDone;
+
+    _drainAllOutstandingOperationTrackRequests(lk);
+
     _reload.clear();
     _deleted.clear();
 }

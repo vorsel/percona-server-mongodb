@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -53,9 +52,9 @@
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/migration_util.h"
 #include "mongo/db/s/move_timing_helper.h"
+#include "mongo/db/s/sharding_runtime_d_params_gen.h"
 #include "mongo/db/s/sharding_statistics.h"
 #include "mongo/db/s/start_chunk_clone_request.h"
-#include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/remove_saver.h"
 #include "mongo/s/catalog/type_chunk.h"
@@ -699,7 +698,7 @@ void MigrationDestinationManager::_migrateThread() {
 
 
     if (AuthorizationManager::get(opCtx->getServiceContext())->isAuthEnabled()) {
-        AuthorizationSession::get(opCtx->getClient())->grantInternalAuthorization();
+        AuthorizationSession::get(opCtx->getClient())->grantInternalAuthorization(opCtx.get());
     }
 
     try {
@@ -717,31 +716,6 @@ void MigrationDestinationManager::_migrateThread() {
     _scopedReceiveChunk.reset();
     _isActiveCV.notify_all();
 }
-
-// The maximum number of documents to insert in a single batch during migration clone.
-// secondaryThrottle and migrateCloneInsertionBatchDelayMS apply between each batch.
-// 0 or negative values (the default) means no limit to batch size.
-// 1 corresponds to 3.4.16 (and earlier) behavior.
-MONGO_EXPORT_SERVER_PARAMETER(migrateCloneInsertionBatchSize, int, 0)
-    ->withValidator([](const int& newVal) {
-        if (newVal < 0) {
-            return Status(ErrorCodes::BadValue,
-                          "migrateCloneInsertionBatchSize must not be negative");
-        }
-        return Status::OK();
-    });
-
-// Time in milliseconds between batches of insertions during migration clone.
-// This is in addition to any time spent waiting for replication (secondaryThrottle).
-// Defaults to 0, which means no wait.
-MONGO_EXPORT_SERVER_PARAMETER(migrateCloneInsertionBatchDelayMS, int, 0)
-    ->withValidator([](const int& newVal) {
-        if (newVal < 0) {
-            return Status(ErrorCodes::BadValue,
-                          "migrateCloneInsertionBatchDelayMS must not be negative");
-        }
-        return Status::OK();
-    });
 
 void MigrationDestinationManager::_migrateDriver(OperationContext* opCtx) {
     invariant(isActive());
@@ -1202,7 +1176,7 @@ void MigrationDestinationManager::_forgetPending(OperationContext* opCtx, ChunkR
     }
 
     UninterruptibleLockGuard noInterrupt(opCtx->lockState());
-    AutoGetCollection autoColl(opCtx, _nss, MODE_IX, MODE_X);
+    AutoGetCollection autoColl(opCtx, _nss, MODE_IX, MODE_IX);
     auto* const css = CollectionShardingRuntime::get(opCtx, _nss);
     const auto optMetadata = css->getCurrentMetadataIfKnown();
 

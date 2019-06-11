@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -36,18 +35,13 @@
 
 #include "mongo/base/checked_cast.h"
 #include "mongo/db/catalog_raii.h"
-#include "mongo/db/server_parameters.h"
+#include "mongo/db/s/sharding_runtime_d_params_gen.h"
 #include "mongo/util/duration.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 
-MONGO_EXPORT_SERVER_PARAMETER(migrationLockAcquisitionMaxWaitMS, int, 500);
-
 namespace {
-
-// How long to wait before starting cleanup of an emigrated chunk range
-MONGO_EXPORT_SERVER_PARAMETER(orphanCleanupDelaySecs, int, 900);  // 900s = 15m
 
 /**
  * Returns whether the specified namespace is used for sharding-internal purposes only and can never
@@ -79,7 +73,6 @@ CollectionShardingRuntime::CollectionShardingRuntime(ServiceContext* sc,
                                                      NamespaceString nss,
                                                      executor::TaskExecutor* rangeDeleterExecutor)
     : CollectionShardingState(nss),
-      _stateChangeMutex(nss.toString()),
       _nss(std::move(nss)),
       _metadataManager(std::make_shared<MetadataManager>(sc, _nss, rangeDeleterExecutor)) {
     if (isNamespaceAlwaysUnsharded(_nss)) {
@@ -97,7 +90,7 @@ void CollectionShardingRuntime::setFilteringMetadata(OperationContext* opCtx,
                                                      CollectionMetadata newMetadata) {
     invariant(!newMetadata.isSharded() || !isNamespaceAlwaysUnsharded(_nss),
               str::stream() << "Namespace " << _nss.ns() << " must never be sharded.");
-    invariant(opCtx->lockState()->isCollectionLockedForMode(_nss.ns(), MODE_X));
+    invariant(opCtx->lockState()->isCollectionLockedForMode(_nss, MODE_X));
 
     _metadataManager->setFilteringMetadata(std::move(newMetadata));
 }
@@ -194,13 +187,19 @@ CollectionCriticalSection::CollectionCriticalSection(OperationContext* opCtx, Na
                                AutoGetCollection::ViewMode::kViewsForbidden,
                                opCtx->getServiceContext()->getPreciseClockSource()->now() +
                                    Milliseconds(migrationLockAcquisitionMaxWaitMS.load()));
-    CollectionShardingState::get(opCtx, _nss)->enterCriticalSectionCatchUpPhase(_opCtx);
+    auto* const csr = CollectionShardingRuntime::get(_opCtx, _nss);
+    auto csrLock = CollectionShardingState::CSRLock::lockExclusive(_opCtx, csr);
+
+    csr->enterCriticalSectionCatchUpPhase(_opCtx, csrLock);
 }
 
 CollectionCriticalSection::~CollectionCriticalSection() {
     UninterruptibleLockGuard noInterrupt(_opCtx->lockState());
-    AutoGetCollection autoColl(_opCtx, _nss, MODE_IX, MODE_X);
-    CollectionShardingState::get(_opCtx, _nss)->exitCriticalSection(_opCtx);
+    AutoGetCollection autoColl(_opCtx, _nss, MODE_IX, MODE_IX);
+    auto* const csr = CollectionShardingRuntime::get(_opCtx, _nss);
+    auto csrLock = CollectionShardingRuntime::CSRLock::lockExclusive(_opCtx, csr);
+
+    csr->exitCriticalSection(_opCtx, csrLock);
 }
 
 void CollectionCriticalSection::enterCommitPhase() {
@@ -211,7 +210,10 @@ void CollectionCriticalSection::enterCommitPhase() {
                                AutoGetCollection::ViewMode::kViewsForbidden,
                                _opCtx->getServiceContext()->getPreciseClockSource()->now() +
                                    Milliseconds(migrationLockAcquisitionMaxWaitMS.load()));
-    CollectionShardingState::get(_opCtx, _nss)->enterCriticalSectionCommitPhase(_opCtx);
+    auto* const csr = CollectionShardingRuntime::get(_opCtx, _nss);
+    auto csrLock = CollectionShardingRuntime::CSRLock::lockExclusive(_opCtx, csr);
+
+    csr->enterCriticalSectionCommitPhase(_opCtx, csrLock);
 }
 
 }  // namespace mongo

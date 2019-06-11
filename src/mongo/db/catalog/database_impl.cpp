@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -63,7 +62,6 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/server_options.h"
-#include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/top.h"
 #include "mongo/db/storage/recovery_unit.h"
@@ -265,9 +263,12 @@ DatabaseImpl::DatabaseImpl(const StringData name,
       _dbEntry(dbEntry),
       _epoch(epoch),
       _profileName(_name + ".system.profile"),
-      _viewsName(_name + "." + DurableViewCatalog::viewsCollectionName().toString()),
-      _durableViews(DurableViewCatalogImpl(this)),
-      _views(&_durableViews) {}
+      _viewsName(_name + "." + DurableViewCatalog::viewsCollectionName().toString()) {
+    auto durableViewCatalog = std::make_unique<DurableViewCatalogImpl>(this);
+    auto viewCatalog = std::make_unique<ViewCatalog>(std::move(durableViewCatalog));
+
+    ViewCatalog::set(this, std::move(viewCatalog));
+}
 
 void DatabaseImpl::init(OperationContext* const opCtx) {
     Status status = validateDBName(_name);
@@ -291,8 +292,9 @@ void DatabaseImpl::init(OperationContext* const opCtx) {
     // system.views collection would be found. Now we're sufficiently initialized, signal a version
     // change. Also force a reload, so if there are problems with the catalog contents as might be
     // caused by incorrect mongod versions or similar, they are found right away.
-    _views.invalidate();
-    Status reloadStatus = _views.reloadIfNeeded(opCtx);
+    auto views = ViewCatalog::get(this);
+    views->invalidate();
+    Status reloadStatus = views->reloadIfNeeded(opCtx);
 
     if (!reloadStatus.isOK()) {
         warning() << "Unable to parse views: " << redact(reloadStatus)
@@ -368,10 +370,6 @@ Status DatabaseImpl::setProfilingLevel(OperationContext* opCtx, int newLevel) {
 void DatabaseImpl::setDropPending(OperationContext* opCtx, bool dropPending) {
     if (dropPending) {
         invariant(opCtx->lockState()->isDbLockedForMode(name(), MODE_X));
-        uassert(ErrorCodes::DatabaseDropPending,
-                str::stream() << "Unable to drop database " << name()
-                              << " because it is already in the process of being dropped.",
-                !_dropPending);
         _dropPending = true;
     } else {
         invariant(opCtx->lockState()->isDbLockedForMode(name(), MODE_IX));
@@ -419,7 +417,7 @@ void DatabaseImpl::getStats(OperationContext* opCtx, BSONObjBuilder* output, dou
         indexSize += collection->getIndexSize(opCtx);
     }
 
-    getViewCatalog()->iterate(opCtx, [&](const ViewDefinition& view) { nViews += 1; });
+    ViewCatalog::get(this)->iterate(opCtx, [&](const ViewDefinition& view) { nViews += 1; });
 
     output->appendNumber("collections", nCollections);
     output->appendNumber("views", nViews);
@@ -451,7 +449,8 @@ void DatabaseImpl::getStats(OperationContext* opCtx, BSONObjBuilder* output, dou
 }
 
 Status DatabaseImpl::dropView(OperationContext* opCtx, StringData fullns) {
-    Status status = _views.dropView(opCtx, NamespaceString(fullns));
+    auto views = ViewCatalog::get(this);
+    Status status = views->dropView(opCtx, NamespaceString(fullns));
     Top::get(opCtx->getServiceContext()).collectionDropped(fullns);
     return status;
 }
@@ -674,17 +673,16 @@ Collection* DatabaseImpl::getCollection(OperationContext* opCtx, StringData ns) 
 
 Collection* DatabaseImpl::getCollection(OperationContext* opCtx, const NamespaceString& nss) const {
     dassert(!cc().getOperationContext() || opCtx == cc().getOperationContext());
-    CollectionMap::const_iterator it = _collections.find(nss.ns());
-
-    if (it != _collections.end() && it->second) {
-        Collection* found = it->second;
-        NamespaceUUIDCache& cache = NamespaceUUIDCache::get(opCtx);
-        if (auto uuid = found->uuid())
-            cache.ensureNamespaceInCache(nss, uuid.get());
-        return found;
+    auto coll = UUIDCatalog::get(opCtx).lookupCollectionByNamespace(nss);
+    if (!coll) {
+        return nullptr;
     }
 
-    return NULL;
+    NamespaceUUIDCache& cache = NamespaceUUIDCache::get(opCtx);
+    auto uuid = coll->uuid();
+    invariant(uuid);
+    cache.ensureNamespaceInCache(nss, uuid.get());
+    return coll;
 }
 
 Status DatabaseImpl::renameCollection(OperationContext* opCtx,
@@ -788,7 +786,8 @@ Status DatabaseImpl::createView(OperationContext* opCtx,
         return Status(ErrorCodes::InvalidNamespace,
                       str::stream() << "invalid namespace name for a view: " + nss.toString());
 
-    return _views.createView(opCtx, nss, viewOnNss, BSONArray(options.pipeline), options.collation);
+    auto views = ViewCatalog::get(this);
+    return views->createView(opCtx, nss, viewOnNss, BSONArray(options.pipeline), options.collation);
 }
 
 Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
@@ -848,7 +847,7 @@ Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
     }
 
     massertStatusOK(
-        _dbEntry->createCollection(opCtx, ns, optionsWithUUID, true /*allocateDefaultSpace*/));
+        _dbEntry->createCollection(opCtx, nss, optionsWithUUID, true /*allocateDefaultSpace*/));
 
     opCtx->recoveryUnit()->registerChange(new AddCollectionChange(opCtx, this, ns));
     Collection* collection = _getOrCreateCollectionInstance(opCtx, nss);
@@ -1013,7 +1012,7 @@ Status DatabaseImpl::userCreateNS(OperationContext* opCtx,
         return Status(ErrorCodes::NamespaceExists,
                       str::stream() << "a collection '" << fullns << "' already exists");
 
-    if (getViewCatalog()->lookup(opCtx, fullns.ns()))
+    if (ViewCatalog::get(this)->lookup(opCtx, fullns.ns()))
         return Status(ErrorCodes::NamespaceExists,
                       str::stream() << "a view '" << fullns << "' already exists");
 

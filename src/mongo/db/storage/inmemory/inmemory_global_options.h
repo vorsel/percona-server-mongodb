@@ -33,19 +33,16 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 
 #pragma once
 
-#include "mongo/util/options_parser/startup_option_init.h"
-#include "mongo/util/options_parser/startup_options.h"
+#include "mongo/base/status.h"
+#include "mongo/util/options_parser/environment.h"
 
 namespace mongo {
-
-namespace moe = mongo::optionenvironment;
 
 class InMemoryGlobalOptions {
 public:
     InMemoryGlobalOptions() : cacheSizeGB(0), statisticsLogDelaySecs(0) {}
 
-    Status add(moe::OptionSection* options);
-    Status store(const moe::Environment& params, const std::vector<std::string>& args);
+    Status store(const optionenvironment::Environment& params);
 
     double cacheSizeGB;
     size_t statisticsLogDelaySecs;
@@ -56,4 +53,5 @@ public:
 };
 
 extern InMemoryGlobalOptions inMemoryGlobalOptions;
-}
+
+}  // namespace mongo

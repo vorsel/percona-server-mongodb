@@ -1,6 +1,3 @@
-// write_conflict_exception.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -33,12 +30,13 @@
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kWrite
 
 #include "mongo/db/concurrency/write_conflict_exception.h"
-#include "mongo/db/server_parameters.h"
 #include "mongo/util/log.h"
 #include "mongo/util/log_and_backoff.h"
 #include "mongo/util/stacktrace.h"
 
 namespace mongo {
+
+MONGO_FAIL_POINT_DEFINE(skipWriteConflictRetries);
 
 AtomicWord<bool> WriteConflictException::trace(false);
 
@@ -55,12 +53,5 @@ void WriteConflictException::logAndBackoff(int attempt, StringData operation, St
         logger::LogSeverity::Debug(1),
         static_cast<size_t>(attempt),
         str::stream() << "Caught WriteConflictException doing " << operation << " on " << ns);
-}
-namespace {
-// for WriteConflictException
-ExportedServerParameter<bool, ServerParameterType::kStartupAndRuntime> TraceWCExceptionsSetting(
-    ServerParameterSet::getGlobal(),
-    "traceWriteConflictExceptions",
-    &WriteConflictException::trace);
 }
 }

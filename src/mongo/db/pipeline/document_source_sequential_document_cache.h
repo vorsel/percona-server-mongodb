@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -62,6 +61,10 @@ public:
 
         constraints.requiresInputDocSource = (_cache->isBuilding());
         return constraints;
+    }
+
+    boost::optional<MergingLogic> mergingLogic() final {
+        return boost::none;
     }
 
     GetNextResult getNext() final;

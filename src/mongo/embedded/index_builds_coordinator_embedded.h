@@ -61,7 +61,8 @@ public:
         CollectionUUID collectionUUID,
         const std::vector<BSONObj>& specs,
         const UUID& buildUUID,
-        IndexBuildProtocol protocol) override;
+        IndexBuildProtocol protocol,
+        IndexBuildOptions indexBuildOptions) override;
 
     /**
      * None of the following functions should ever be called on an embedded server node.
@@ -73,7 +74,8 @@ public:
     void signalChangeToSecondaryMode() override;
     void signalChangeToInitialSyncMode() override;
     Status voteCommitIndexBuild(const UUID& buildUUID, const HostAndPort& hostAndPort) override;
-    Status setCommitQuorum(const NamespaceString& nss,
+    Status setCommitQuorum(OperationContext* opCtx,
+                           const NamespaceString& nss,
                            const std::vector<StringData>& indexNames,
                            const CommitQuorumOptions& newCommitQuorum) override;
 };

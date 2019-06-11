@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,6 +31,6 @@
 
 namespace mongo {
 namespace repl {
-MONGO_DEFINE_SHIM(GetNextOpTimeClass::getNextOpTime);
+MONGO_DEFINE_SHIM(GetNextOpTimeClass::getNextOpTimes);
 }  // namespace repl
 }  // namespace mongo

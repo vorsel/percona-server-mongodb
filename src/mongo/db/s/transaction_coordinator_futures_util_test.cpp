@@ -597,6 +597,48 @@ TEST_F(AsyncWorkSchedulerTest, MakeChildSchedulerAfterShutdownParentScheduler) {
     ASSERT_THROWS_CODE(childFuture2.get(), AssertionException, ErrorCodes::InternalError);
 }
 
+TEST_F(AsyncWorkSchedulerTest, ShutdownAllowedFromScheduleWorkAtCallback) {
+    AsyncWorkScheduler async(getServiceContext());
+    auto future = async.scheduleWork([&](OperationContext* opCtx) {
+        async.shutdown({ErrorCodes::InternalError, "Test error"});
+    });
+
+    future.get();
+}
+
+TEST_F(AsyncWorkSchedulerTest, DestroyingSchedulerCapturedInFutureCallback) {
+    auto async = std::make_unique<AsyncWorkScheduler>(getServiceContext());
+
+    Barrier barrier(2);
+    auto future =
+        async->scheduleWork([&barrier](OperationContext* opCtx) { barrier.countDownAndWait(); })
+            .tapAll([ async = std::move(async), &barrier ](Status){});
+
+    barrier.countDownAndWait();
+    future.get();
+}
+
+TEST_F(AsyncWorkSchedulerTest, DestroyingSchedulerWithoutCallingShutdown) {
+    boost::optional<AsyncWorkScheduler> async;
+    async.emplace(getServiceContext());
+
+    // This test is not 100% deterministic in that it would exercise the condition, but the idea is
+    // to occasionally test a race in the destructor of AsyncWorkScheduler where shutdown has not
+    // been called, but the scheduler is destroyed before the last scheduled task has been
+    // unregistered, therefore causing a wait on the 'all work completed' condition variable.
+    Barrier barrier(3);
+    async->scheduleWork([&barrier](OperationContext* opCtx) { barrier.countDownAndWait(); })
+        .getAsync([](Status) {});
+
+    auto f = stdx::async(stdx::launch::async, [&async, &barrier] {
+        barrier.countDownAndWait();
+        async.reset();
+    });
+
+    barrier.countDownAndWait();
+    f.get();
+}
+
 
 using DoWhileTest = AsyncWorkSchedulerTest;
 

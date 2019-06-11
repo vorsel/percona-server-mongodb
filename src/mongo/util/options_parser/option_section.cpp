@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -138,7 +137,9 @@ OptionDescription& OptionSection::addOptionChaining(
     const OptionType type,
     const std::string& description,
     const std::vector<std::string>& deprecatedDottedNames,
-    const std::vector<std::string>& deprecatedSingleNames) {
+    const std::vector<std::string>& deprecatedSingleNames,
+    OptionParserUsageType) {
+
     OptionDescription option(
         dottedName, singleName, type, description, deprecatedDottedNames, deprecatedSingleNames);
 

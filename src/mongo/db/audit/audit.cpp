@@ -55,6 +55,7 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 #include "mongo/base/init.h"
 #include "mongo/bson/bson_field.h"
 #include "mongo/db/audit.h"
+#include "mongo/db/audit/audit_parameters_gen.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/client.h"
@@ -62,7 +63,6 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/matcher.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/server_parameters.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/logger/auditlog.h"
 #include "mongo/util/concurrency/mutex.h"
@@ -81,8 +81,6 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 namespace mongo {
 
 namespace audit {
-
-    MONGO_EXPORT_SERVER_PARAMETER(auditAuthorizationSuccess, bool, false);
 
     NOINLINE_DECL void realexit( ExitCode rc ) {
 #ifdef _COVERAGE

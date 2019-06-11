@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -33,6 +32,7 @@
 #include <iosfwd>
 #include <string>
 
+#include "mongo/base/string_data.h"
 #include "mongo/db/jsobj.h"
 
 namespace mongo {
@@ -65,7 +65,7 @@ class Document;
  *          return;
  *      }
  *      // append SafeNum to a BSONObj
- *      bsonObjBuilder.append(newValue);
+ *      newValue.toBSON(fieldName, &bsonObjBuilder);
  *
  */
 class SafeNum {
@@ -87,10 +87,6 @@ public:
     SafeNum(int64_t num);
     SafeNum(double num);
     SafeNum(Decimal128 num);
-
-    // Other/Implicit conversions are not allowed.
-    template <typename T>
-    SafeNum(T t) = delete;
 
     // TODO: add Paul's mutablebson::Element ctor
 
@@ -154,7 +150,6 @@ public:
     SafeNum operator^(const SafeNum& rhs) const;
     SafeNum& operator^=(const SafeNum& rhs);
 
-
     //
     // output support
     //
@@ -162,7 +157,10 @@ public:
     friend class mutablebson::Element;
     friend class mutablebson::Document;
 
-    // TODO: output to builder
+    /**
+     * Appends contents to given BSONObjBuilder.
+     */
+    void toBSON(StringData fieldName, BSONObjBuilder* bob) const;
 
     //
     // accessors

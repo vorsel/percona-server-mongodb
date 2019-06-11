@@ -29,6 +29,7 @@
     rst.startSet();
     let config = rst.getReplSetConfig();
     config.members[2].priority = 0;
+    config.settings = {chainingAllowed: false};
     rst.initiate(config);
 
     // Prior to 4.0, rollback imposed a 300 MB limit on the total size of documents to refetch from
@@ -46,7 +47,8 @@
     const rollbackSizeLimitMB = 300;
     const minDocSizeMB = 10;
     const largeString = 'x'.repeat(minDocSizeMB * 1024 * 1024);
-    const numDocs = Math.floor(rollbackSizeLimitMB / minDocSizeMB) - 5;
+    // TODO(SERVER-39774): Increase numDocs to Math.floor(rollbackSizeLimitMB / minDocSizeMB).
+    const numDocs = 1;
 
     // Operations that will be present on both nodes, before the common point.
     const collName = 'test.t';

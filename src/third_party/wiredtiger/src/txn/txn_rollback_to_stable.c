@@ -68,7 +68,7 @@ __txn_rollback_to_stable_lookaside_fixup(WT_SESSION_IMPL *session)
 		 * which will fail the following check and cause them to never
 		 * be removed.
 		 */
-		if (rollback_timestamp < las_timestamp) {
+		if (rollback_timestamp < durable_timestamp) {
 			WT_ERR(cursor->remove(cursor));
 			WT_STAT_CONN_INCR(session, txn_rollback_las_removed);
 			--las_total;
@@ -106,10 +106,10 @@ __txn_abort_newer_update(WT_SESSION_IMPL *session,
 		 * updates were also rolled back.
 		 */
 		if (upd->txnid == WT_TXN_ABORTED ||
-		    upd->timestamp == WT_TS_NONE) {
+		    upd->start_ts == WT_TS_NONE) {
 			if (upd == first_upd)
 				first_upd = upd->next;
-		} else if (rollback_timestamp < upd->durable_timestamp) {
+		} else if (rollback_timestamp < upd->durable_ts) {
 			/*
 			 * If any updates are aborted, all newer updates
 			 * better be aborted as well.
@@ -127,8 +127,8 @@ __txn_abort_newer_update(WT_SESSION_IMPL *session,
 
 			upd->txnid = WT_TXN_ABORTED;
 			WT_STAT_CONN_INCR(session, txn_rollback_upd_aborted);
-			upd->timestamp = 0;
-			upd->durable_timestamp = 0;
+			upd->durable_ts = 0;
+			upd->start_ts = 0;
 		}
 	}
 }
@@ -250,7 +250,7 @@ __txn_abort_newer_updates(
 	local_read = false;
 	read_flags = WT_READ_WONT_NEED;
 	if (ref->page_las != NULL && ref->page_las->skew_newest &&
-	    rollback_timestamp < ref->page_las->unstable_timestamp) {
+	    rollback_timestamp < ref->page_las->unstable_durable_timestamp) {
 		/* Make sure get back a page with history, not limbo page */
 		WT_ASSERT(session,
 		    !F_ISSET(&session->txn, WT_TXN_HAS_SNAPSHOT));

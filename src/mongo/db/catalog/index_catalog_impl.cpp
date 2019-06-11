@@ -290,7 +290,7 @@ std::vector<BSONObj> IndexCatalogImpl::removeExistingIndexes(
 
 StatusWith<BSONObj> IndexCatalogImpl::createIndexOnEmptyCollection(OperationContext* opCtx,
                                                                    BSONObj spec) {
-    invariant(opCtx->lockState()->isCollectionLockedForMode(_collection->ns().toString(), MODE_X));
+    invariant(opCtx->lockState()->isCollectionLockedForMode(_collection->ns(), MODE_X));
     invariant(_collection->numRecords(opCtx) == 0,
               str::stream() << "Collection must be empty. Collection: " << _collection->ns()
                             << " UUID: "
@@ -310,8 +310,8 @@ StatusWith<BSONObj> IndexCatalogImpl::createIndexOnEmptyCollection(OperationCont
     spec = statusWithSpec.getValue();
 
     // now going to touch disk
-    IndexBuildBlock indexBuildBlock(opCtx, _collection, this, spec, IndexBuildMethod::kForeground);
-    status = indexBuildBlock.init();
+    IndexBuildBlock indexBuildBlock(this, _collection->ns(), spec, IndexBuildMethod::kForeground);
+    status = indexBuildBlock.init(opCtx, _collection);
     if (!status.isOK())
         return status;
 
@@ -325,7 +325,7 @@ StatusWith<BSONObj> IndexCatalogImpl::createIndexOnEmptyCollection(OperationCont
     status = entry->accessMethod()->initializeAsEmpty(opCtx);
     if (!status.isOK())
         return status;
-    indexBuildBlock.success();
+    indexBuildBlock.success(opCtx, _collection);
 
     // sanity check
     invariant(_collection->getCatalogEntry()->isIndexReady(opCtx, descriptor->indexName()));
@@ -738,7 +738,7 @@ BSONObj IndexCatalogImpl::getDefaultIdIndexSpec() const {
 void IndexCatalogImpl::dropAllIndexes(OperationContext* opCtx,
                                       bool includingIdIndex,
                                       stdx::function<void(const IndexDescriptor*)> onDropFn) {
-    invariant(opCtx->lockState()->isCollectionLockedForMode(_collection->ns().toString(), MODE_X));
+    invariant(opCtx->lockState()->isCollectionLockedForMode(_collection->ns(), MODE_X));
 
     BackgroundOperation::assertNoBgOpInProgForNs(_collection->ns().ns());
 
@@ -812,7 +812,7 @@ void IndexCatalogImpl::dropAllIndexes(OperationContext* opCtx, bool includingIdI
 }
 
 Status IndexCatalogImpl::dropIndex(OperationContext* opCtx, const IndexDescriptor* desc) {
-    invariant(opCtx->lockState()->isCollectionLockedForMode(_collection->ns().toString(), MODE_X));
+    invariant(opCtx->lockState()->isCollectionLockedForMode(_collection->ns(), MODE_X));
     BackgroundOperation::assertNoBgOpInProgForNs(_collection->ns().ns());
     invariant(_buildingIndexes.size() == 0);
 
@@ -849,8 +849,13 @@ public:
     }
 
     void rollback() final {
-        _collection->infoCache()->addedIndex(_opCtx, _entry->descriptor());
+        auto indexDescriptor = _entry->descriptor();
         _entries->add(std::move(_entry));
+
+        // Refresh the CollectionInfoCache's knowledge of what indices are present. This must be
+        // done after re-adding our IndexCatalogEntry to the '_entries' list, since 'addedIndex()'
+        // refreshes its knowledge by iterating the list of indices currently in the catalog.
+        _collection->infoCache()->addedIndex(_opCtx, indexDescriptor);
     }
 
 private:
@@ -984,6 +989,10 @@ int IndexCatalogImpl::numIndexesReady(OperationContext* opCtx) const {
                 log() << "  index: " << i;
             }
 
+            if (_collection->uuid()) {
+                log() << "collection uuid: " << _collection->uuid();
+            }
+
             invariant(itIndexes.size() == completedIndexes.size(),
                       "The number of ready indexes reported in the collection metadata catalog did "
                       "not match the number of ready indexes reported by the index catalog.");
@@ -1114,7 +1123,7 @@ std::vector<std::shared_ptr<const IndexCatalogEntry>> IndexCatalogImpl::getAllRe
 
 const IndexDescriptor* IndexCatalogImpl::refreshEntry(OperationContext* opCtx,
                                                       const IndexDescriptor* oldDesc) {
-    invariant(opCtx->lockState()->isCollectionLockedForMode(_collection->ns().ns(), MODE_X));
+    invariant(opCtx->lockState()->isCollectionLockedForMode(_collection->ns(), MODE_X));
     invariant(!BackgroundOperation::inProgForNs(_collection->ns()));
     invariant(_buildingIndexes.size() == 0);
 
@@ -1383,7 +1392,7 @@ Status IndexCatalogImpl::compactIndexes(OperationContext* opCtx) {
 
 std::unique_ptr<IndexCatalog::IndexBuildBlockInterface> IndexCatalogImpl::createIndexBuildBlock(
     OperationContext* opCtx, const BSONObj& spec, IndexBuildMethod method) {
-    return std::make_unique<IndexBuildBlock>(opCtx, _collection, this, spec, method);
+    return std::make_unique<IndexBuildBlock>(this, _collection->ns(), spec, method);
 }
 
 std::string::size_type IndexCatalogImpl::getLongestIndexNameLength(OperationContext* opCtx) const {

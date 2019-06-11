@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -37,6 +36,7 @@
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/s/transaction_coordinator_document_gen.h"
 #include "mongo/db/s/transaction_coordinator_futures_util.h"
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -72,13 +72,29 @@ CoordinatorCommitDecision makeDecisionFromPrepareVoteConsensus(
 
 TransactionCoordinator::TransactionCoordinator(ServiceContext* serviceContext,
                                                const LogicalSessionId& lsid,
-                                               TxnNumber txnNumber)
+                                               TxnNumber txnNumber,
+                                               std::unique_ptr<txn::AsyncWorkScheduler> scheduler,
+                                               boost::optional<Date_t> coordinateCommitDeadline)
     : _serviceContext(serviceContext),
-      _driver(serviceContext),
       _lsid(lsid),
-      _txnNumber(txnNumber) {}
+      _txnNumber(txnNumber),
+      _scheduler(std::move(scheduler)),
+      _driver(serviceContext) {
+    if (coordinateCommitDeadline) {
+        _deadlineScheduler = _scheduler->makeChildScheduler();
+        _deadlineScheduler
+            ->scheduleWorkAt(*coordinateCommitDeadline,
+                             [this](OperationContext* opCtx) { cancelIfCommitNotYetStarted(); })
+            .getAsync([](const Status&) {});
+    }
+}
 
 TransactionCoordinator::~TransactionCoordinator() {
+    _cancelTimeoutWaitForCommitTask();
+
+    if (_deadlineScheduler)
+        _deadlineScheduler.reset();
+
     stdx::lock_guard<stdx::mutex> lk(_mutex);
     invariant(_state == TransactionCoordinator::CoordinatorState::kDone);
 
@@ -87,19 +103,15 @@ TransactionCoordinator::~TransactionCoordinator() {
     invariant(_completionPromises.empty());
 }
 
-/**
- * Implements the high-level logic for two-phase commit.
- */
-SharedSemiFuture<txn::CommitDecision> TransactionCoordinator::runCommit(
-    const std::vector<ShardId>& participantShards) {
+void TransactionCoordinator::runCommit(std::vector<ShardId> participantShards) {
     {
-        // If another thread has already begun the commit process, return early.
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
-        if (_state != CoordinatorState::kInit) {
-            return _finalDecisionPromise.getFuture();
-        }
+        stdx::lock_guard<stdx::mutex> lg(_mutex);
+        if (_state != CoordinatorState::kInit)
+            return;
         _state = CoordinatorState::kPreparing;
     }
+
+    _cancelTimeoutWaitForCommitTask();
 
     _driver.persistParticipantList(_lsid, _txnNumber, participantShards)
         .then([this, participantShards]() { return _runPhaseOne(participantShards); })
@@ -107,41 +119,17 @@ SharedSemiFuture<txn::CommitDecision> TransactionCoordinator::runCommit(
             return _runPhaseTwo(participantShards, decision);
         })
         .getAsync([this](Status s) { _handleCompletionStatus(s); });
-
-    return _finalDecisionPromise.getFuture();
-}
-
-Future<CoordinatorCommitDecision> TransactionCoordinator::_runPhaseOne(
-    const std::vector<ShardId>& participantShards) {
-    return _driver.sendPrepare(participantShards, _lsid, _txnNumber)
-        .then([this, participantShards](txn::PrepareVoteConsensus result) {
-            invariant(_state == CoordinatorState::kPreparing);
-
-            auto decision =
-                makeDecisionFromPrepareVoteConsensus(_serviceContext, result, _lsid, _txnNumber);
-
-            return _driver
-                .persistDecision(_lsid, _txnNumber, participantShards, decision.commitTimestamp)
-                .then([decision] { return decision; });
-        });
-}
-
-Future<void> TransactionCoordinator::_runPhaseTwo(const std::vector<ShardId>& participantShards,
-                                                  const CoordinatorCommitDecision& decision) {
-    return _sendDecisionToParticipants(participantShards, decision)
-        .then([this] { return _driver.deleteCoordinatorDoc(_lsid, _txnNumber); })
-        .then([this] {
-            LOG(3) << "Two-phase commit completed for session " << _lsid.toBSON()
-                   << ", transaction number " << _txnNumber;
-
-            stdx::unique_lock<stdx::mutex> ul(_mutex);
-            _transitionToDone(std::move(ul));
-        });
 }
 
 void TransactionCoordinator::continueCommit(const TransactionCoordinatorDocument& doc) {
-    _state = CoordinatorState::kPreparing;
-    const auto participantShards = doc.getParticipants();
+    {
+        stdx::lock_guard<stdx::mutex> lg(_mutex);
+        invariant(_state == CoordinatorState::kInit);
+        invariant(!_deadlineScheduler);
+        _state = CoordinatorState::kPreparing;
+    }
+
+    const auto& participantShards = doc.getParticipants();
 
     // Helper lambda to get the decision either from the document passed in or from the participants
     // (by performing 'phase one' of two-phase commit).
@@ -171,27 +159,75 @@ Future<void> TransactionCoordinator::onCompletion() {
 
     auto completionPromiseFuture = makePromiseFuture<void>();
     _completionPromises.push_back(std::move(completionPromiseFuture.promise));
-    return std::move(completionPromiseFuture.future);
+
+    return std::move(completionPromiseFuture.future)
+        .onError<ErrorCodes::TransactionCoordinatorSteppingDown>(
+            [](const Status& s) { uasserted(ErrorCodes::InterruptedDueToStepDown, s.reason()); });
 }
 
 SharedSemiFuture<txn::CommitDecision> TransactionCoordinator::getDecision() {
     stdx::lock_guard<stdx::mutex> lg(_mutex);
-    return _finalDecisionPromise.getFuture();
+    return _decisionPromise.getFuture();
 }
 
 void TransactionCoordinator::cancelIfCommitNotYetStarted() {
+    _cancelTimeoutWaitForCommitTask();
+
     stdx::unique_lock<stdx::mutex> lk(_mutex);
     if (_state == CoordinatorState::kInit) {
-        invariant(!_finalDecisionPromise.getFuture().isReady());
-        _finalDecisionPromise.emplaceValue(txn::CommitDecision::kCanceled);
+        invariant(!_decisionPromise.getFuture().isReady());
+        _decisionPromise.emplaceValue(txn::CommitDecision::kCanceled);
         _transitionToDone(std::move(lk));
     }
+}
+
+void TransactionCoordinator::_cancelTimeoutWaitForCommitTask() {
+    if (_deadlineScheduler) {
+        _deadlineScheduler->shutdown(
+            {ErrorCodes::CallbackCanceled, "Interrupting the commit received deadline task"});
+    }
+}
+
+Future<CoordinatorCommitDecision> TransactionCoordinator::_runPhaseOne(
+    const std::vector<ShardId>& participantShards) {
+    return _driver.sendPrepare(participantShards, _lsid, _txnNumber)
+        .then([this, participantShards](txn::PrepareVoteConsensus result) {
+            invariant(_state == CoordinatorState::kPreparing);
+
+            auto decision =
+                makeDecisionFromPrepareVoteConsensus(_serviceContext, result, _lsid, _txnNumber);
+
+            return _driver
+                .persistDecision(_lsid, _txnNumber, participantShards, decision.commitTimestamp)
+                .then([decision] { return decision; });
+        });
+}
+
+Future<void> TransactionCoordinator::_runPhaseTwo(const std::vector<ShardId>& participantShards,
+                                                  const CoordinatorCommitDecision& decision) {
+    return _sendDecisionToParticipants(participantShards, decision)
+        .then([this] {
+            if (getGlobalFailPointRegistry()
+                    ->getFailPoint("doNotForgetCoordinator")
+                    ->shouldFail()) {
+                return Future<void>::makeReady();
+            }
+
+            return _driver.deleteCoordinatorDoc(_lsid, _txnNumber);
+        })
+        .then([this] {
+            LOG(3) << "Two-phase commit completed for session " << _lsid.toBSON()
+                   << ", transaction number " << _txnNumber;
+
+            stdx::unique_lock<stdx::mutex> ul(_mutex);
+            _transitionToDone(std::move(ul));
+        });
 }
 
 Future<void> TransactionCoordinator::_sendDecisionToParticipants(
     const std::vector<ShardId>& participantShards, CoordinatorCommitDecision decision) {
     invariant(_state == CoordinatorState::kPreparing);
-    _finalDecisionPromise.emplaceValue(decision.decision);
+    _decisionPromise.emplaceValue(decision.decision);
 
     // Send the decision to all participants.
     switch (decision.decision) {
@@ -215,14 +251,17 @@ void TransactionCoordinator::_handleCompletionStatus(Status s) {
     }
 
     stdx::unique_lock<stdx::mutex> lk(_mutex);
+
     LOG(3) << "Two-phase commit failed with error in state " << _state << " for transaction "
            << _txnNumber << " on session " << _lsid.toBSON() << causedBy(s);
 
-    // If an error occurred prior to making a decision, set an error on the decision
-    // promise to propagate it to callers of runCommit.
-    if (!_finalDecisionPromise.getFuture().isReady()) {
+    // If an error occurred prior to making a decision, set an error on the decision promise to
+    // propagate it to callers of runCommit
+    if (!_decisionPromise.getFuture().isReady()) {
         invariant(_state == CoordinatorState::kPreparing);
-        _finalDecisionPromise.setError(s);
+        _decisionPromise.setError(s == ErrorCodes::TransactionCoordinatorReachedAbortDecision
+                                      ? Status{ErrorCodes::InterruptedDueToStepDown, s.reason()}
+                                      : s);
     }
 
     _transitionToDone(std::move(lk));
@@ -291,6 +330,33 @@ BSONObj CoordinatorCommitDecision::toBSON() const {
     }
 
     return builder.obj();
+}
+
+logger::LogstreamBuilder& operator<<(logger::LogstreamBuilder& stream,
+                                     const TransactionCoordinator::CoordinatorState& state) {
+    using State = TransactionCoordinator::CoordinatorState;
+    // clang-format off
+    switch (state) {
+        case State::kInit:  stream.stream() << "kInit"; break;
+        case State::kPreparing:   stream.stream() << "kPreparing"; break;
+        case State::kAborting: stream.stream() << "kAborting"; break;
+        case State::kCommitting: stream.stream() << "kCommitting"; break;
+        case State::kDone: stream.stream() << "kDone"; break;
+    };
+    // clang-format on
+    return stream;
+}
+
+logger::LogstreamBuilder& operator<<(logger::LogstreamBuilder& stream,
+                                     const txn::CommitDecision& decision) {
+    // clang-format off
+    switch (decision) {
+        case txn::CommitDecision::kCommit:     stream.stream() << "kCommit"; break;
+        case txn::CommitDecision::kAbort:      stream.stream() << "kAbort"; break;
+        case txn::CommitDecision::kCanceled:   stream.stream() << "kCanceled"; break;
+    };
+    // clang-format on
+    return stream;
 }
 
 }  // namespace mongo

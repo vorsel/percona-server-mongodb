@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -377,18 +376,6 @@ Pipeline::SourceContainer::iterator DocumentSourceGraphLookUp::doOptimizeAt(
     return std::next(itr);
 }
 
-BSONObjSet DocumentSourceGraphLookUp::getOutputSorts() {
-    std::set<std::string> fields{_as.fullPath()};
-    if (_depthField) {
-        fields.insert(_depthField->fullPath());
-    }
-    if (_unwind && (*_unwind)->indexPath()) {
-        fields.insert((*_unwind)->indexPath()->fullPath());
-    }
-
-    return DocumentSource::truncateSortSet(pSource->getOutputSorts(), fields);
-}
-
 void DocumentSourceGraphLookUp::checkMemoryUsage() {
     // TODO SERVER-23980: Implement spilling to disk if allowDiskUse is specified.
     uassert(40099,
@@ -477,7 +464,7 @@ DocumentSourceGraphLookUp::DocumentSourceGraphLookUp(
     // We append an additional BSONObj to '_fromPipeline' as a placeholder for the $match stage
     // we'll eventually construct from the input document.
     _fromPipeline.reserve(_fromPipeline.size() + 1);
-    _fromPipeline.push_back(BSONObj());
+    _fromPipeline.push_back(BSON("$match" << BSONObj()));
 }
 
 intrusive_ptr<DocumentSourceGraphLookUp> DocumentSourceGraphLookUp::create(
@@ -602,5 +589,14 @@ intrusive_ptr<DocumentSource> DocumentSourceGraphLookUp::createFromBson(
                                       boost::none));
 
     return std::move(newSource);
+}
+
+void DocumentSourceGraphLookUp::addInvolvedCollections(
+    stdx::unordered_set<NamespaceString>* collectionNames) const {
+    collectionNames->insert(_fromExpCtx->ns);
+    auto introspectionPipeline = uassertStatusOK(Pipeline::parse(_fromPipeline, _fromExpCtx));
+    for (auto&& stage : introspectionPipeline->getSources()) {
+        stage->addInvolvedCollections(collectionNames);
+    }
 }
 }  // namespace mongo

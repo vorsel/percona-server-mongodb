@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -275,7 +274,8 @@ LockMode fixLockModeForSystemDotViewsChanges(const NamespaceString& nss, LockMod
 // static
 Status SyncTail::syncApply(OperationContext* opCtx,
                            const BSONObj& op,
-                           OplogApplication::Mode oplogApplicationMode) {
+                           OplogApplication::Mode oplogApplicationMode,
+                           boost::optional<Timestamp> stableTimestampForRecovery) {
     // Count each log op application as a separate operation, for reporting purposes
     CurOp individualOp(opCtx);
 
@@ -361,23 +361,13 @@ Status SyncTail::syncApply(OperationContext* opCtx,
         }));
     } else if (opType == OpTypeEnum::kCommand) {
         return finishApply(writeConflictRetry(opCtx, "syncApply_command", nss.ns(), [&] {
-            // A command may need a global write lock. so we will conservatively go
-            // ahead and grab one for non-transaction commands.
-            // Transactions have to acquire the same locks on secondaries as on primary.
-            boost::optional<Lock::GlobalWrite> globalWriteLock;
-
             // TODO SERVER-37180 Remove this double-parsing.
             // The command entry has been parsed before, so it must be valid.
             auto entry = uassertStatusOK(OplogEntry::parse(op));
-            const StringData commandName(op["o"].embeddedObject().firstElementFieldName());
-            // SERVER-37313: createIndex does not need to take the Global X lock.
-            if (!op.getBoolField("prepare") && commandName != "abortTransaction" &&
-                commandName != "createIndexes" && commandName != "commitTransaction") {
-                globalWriteLock.emplace(opCtx);
-            }
 
-            // special case apply for commands to avoid implicit database creation
-            Status status = applyCommand_inlock(opCtx, op, entry, oplogApplicationMode);
+            // A special case apply for commands to avoid implicit database creation.
+            Status status = applyCommand_inlock(
+                opCtx, op, entry, oplogApplicationMode, stableTimestampForRecovery);
             incrementOpsAppliedStats();
             return status;
         }));
@@ -413,31 +403,6 @@ const OplogApplier::Options& SyncTail::getOptions() const {
 }
 
 namespace {
-
-// Doles out all the work to the writer pool threads.
-// Does not modify writerVectors, but passes non-const pointers to inner vectors into func.
-void applyOps(std::vector<MultiApplier::OperationPtrs>& writerVectors,
-              ThreadPool* writerPool,
-              const SyncTail::MultiSyncApplyFunc& func,
-              SyncTail* st,
-              std::vector<Status>* statusVector,
-              std::vector<WorkerMultikeyPathInfo>* workerMultikeyPathInfo) {
-    invariant(writerVectors.size() == statusVector->size());
-    for (size_t i = 0; i < writerVectors.size(); i++) {
-        if (!writerVectors[i].empty()) {
-            invariant(writerPool->schedule([
-                &func,
-                st,
-                &writer = writerVectors.at(i),
-                &status = statusVector->at(i),
-                &workerMultikeyPathInfo = workerMultikeyPathInfo->at(i)
-            ] {
-                auto opCtx = cc().makeOperationContext();
-                status = func(opCtx.get(), &writer, st, &workerMultikeyPathInfo);
-            }));
-        }
-    }
-}
 
 // Schedules the writes to the oplog for 'ops' into threadPool. The caller must guarantee that 'ops'
 // stays valid until all scheduled work in the thread pool completes.
@@ -558,7 +523,7 @@ void tryToGoLiveAsASecondary(OperationContext* opCtx,
     ON_BLOCK_EXIT([] { attemptsToBecomeSecondary.increment(); });
 
     // Need the RSTL in mode X to transition to SECONDARY
-    ReplicationStateTransitionLockGuard transitionGuard(opCtx);
+    ReplicationStateTransitionLockGuard transitionGuard(opCtx, MODE_X);
 
     // Check if we are primary or secondary again now that we have the RSTL in mode X.
     if (replCoord->isInPrimaryOrSecondaryState(opCtx)) {
@@ -908,12 +873,16 @@ bool SyncTail::tryPopAndWaitForMore(OperationContext* opCtx,
     // Commands must be processed one at a time. The only exception to this is applyOps because
     // applyOps oplog entries are effectively containers for CRUD operations. Therefore, it is safe
     // to batch applyOps commands with CRUD operations when reading from the oplog buffer.
+    //
     // Oplog entries on 'system.views' should also be processed one at a time. View catalog
     // immediately reflects changes for each oplog entry so we can see inconsistent view catalog if
     // multiple oplog entries on 'system.views' are being applied out of the original order.
+    //
+    // Process updates to 'admin.system.version' individually as well so the secondary's FCV when
+    // processing each operation matches the primary's when committing that operation.
     if ((entry.isCommand() &&
          (entry.getCommandType() != OplogEntry::CommandType::kApplyOps || entry.shouldPrepare())) ||
-        entry.getNss().isSystemDotViews()) {
+        entry.getNss().isSystemDotViews() || entry.getNss().isServerConfigurationCollection()) {
         if (ops->getCount() == 1) {
             // apply commands one-at-a-time
             _consume(opCtx, oplogBuffer);
@@ -1150,7 +1119,9 @@ Status multiSyncApply(OperationContext* opCtx,
 
             // If we didn't create a group, try to apply the op individually.
             try {
-                const Status status = SyncTail::syncApply(opCtx, entry.raw, oplogApplicationMode);
+                auto stableTimestampForRecovery = st->getOptions().stableTimestampForRecovery;
+                const Status status = SyncTail::syncApply(
+                    opCtx, entry.raw, oplogApplicationMode, stableTimestampForRecovery);
 
                 if (!status.isOK()) {
                     // In initial sync, update operations can cause documents to be missed during
@@ -1300,6 +1271,27 @@ void SyncTail::_fillWriterVectors(OperationContext* opCtx,
     }
 }
 
+void SyncTail::_applyOps(std::vector<MultiApplier::OperationPtrs>& writerVectors,
+                         std::vector<Status>* statusVector,
+                         std::vector<WorkerMultikeyPathInfo>* workerMultikeyPathInfo) {
+    invariant(writerVectors.size() == statusVector->size());
+    for (size_t i = 0; i < writerVectors.size(); i++) {
+        if (writerVectors[i].empty())
+            continue;
+
+        invariant(_writerPool->schedule([
+            this,
+            &writer = writerVectors.at(i),
+            &status = statusVector->at(i),
+            &workerMultikeyPathInfo = workerMultikeyPathInfo->at(i)
+        ] {
+            auto opCtx = cc().makeOperationContext();
+            status = opCtx->runWithoutInterruptionExceptAtGlobalShutdown(
+                [&] { return _applyFunc(opCtx.get(), &writer, this, &workerMultikeyPathInfo); });
+        }));
+    }
+}
+
 StatusWith<OpTime> SyncTail::multiApply(OperationContext* opCtx, MultiApplier::Operations ops) {
     invariant(!ops.empty());
 
@@ -1356,7 +1348,7 @@ StatusWith<OpTime> SyncTail::multiApply(OperationContext* opCtx, MultiApplier::O
 
         {
             std::vector<Status> statusVector(_writerPool->getStats().numThreads, Status::OK());
-            applyOps(writerVectors, _writerPool, _applyFunc, this, &statusVector, &multikeyVector);
+            _applyOps(writerVectors, &statusVector, &multikeyVector);
             _writerPool->waitForIdle();
 
             // If any of the statuses is not ok, return error.

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -318,6 +317,24 @@ TEST(ErrorExtraInfo, StatusParserWorks) {
     ASSERT(status.extraInfo());
     ASSERT(status.extraInfo<ErrorExtraInfoExample>());
     ASSERT_EQ(status.extraInfo<ErrorExtraInfoExample>()->data, 123);
+}
+
+TEST(ErrorExtraInfo, StatusParserWorksNested) {
+    nested::twice::NestedErrorExtraInfoExample::EnableParserForTest whenInScope;
+    auto status = Status(
+        ErrorCodes::ForTestingErrorExtraInfoWithExtraInfoInNamespace, "", fromjson("{data: 123}"));
+    ASSERT_EQ(status, ErrorCodes::ForTestingErrorExtraInfoWithExtraInfoInNamespace);
+    ASSERT(status.extraInfo());
+    ASSERT(status.extraInfo<nested::twice::NestedErrorExtraInfoExample>());
+    ASSERT_EQ(status.extraInfo<nested::twice::NestedErrorExtraInfoExample>()->data, 123);
+}
+
+TEST(ErrorExtraInfo, StatusWhenParserThrowsNested) {
+    auto status = Status(
+        ErrorCodes::ForTestingErrorExtraInfoWithExtraInfoInNamespace, "", fromjson("{data: 123}"));
+    ASSERT_EQ(status, ErrorCodes::duplicateCodeForTest(51100));
+    ASSERT(!status.extraInfo());
+    ASSERT(!status.extraInfo<nested::twice::NestedErrorExtraInfoExample>());
 }
 
 }  // namespace

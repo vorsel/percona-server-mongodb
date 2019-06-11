@@ -1,5 +1,3 @@
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -50,7 +48,7 @@
 #include "mongo/db/index/expression_params.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/query/expression_index.h"
-#include "mongo/db/query/expression_index_knobs.h"
+#include "mongo/db/query/expression_index_knobs_gen.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
 
@@ -518,6 +516,10 @@ public:
     // These won't be called.
     //
 
+    BSONObj getSerializedRightHandSide() const final {
+        MONGO_UNREACHABLE;
+    }
+
     void debugString(StringBuilder& debug, int level = 0) const final {
         MONGO_UNREACHABLE;
     }
@@ -693,7 +695,7 @@ StatusWith<NearStage::CoveredInterval*>  //
     const int twoDFieldPosition = 0;
 
     std::vector<GeoHash> unorderedCovering = ExpressionMapping::get2dCovering(
-        *coverRegion, indexDescriptor()->infoObj(), internalGeoNearQuery2DMaxCoveringCells.load());
+        *coverRegion, indexDescriptor()->infoObj(), gInternalGeoNearQuery2DMaxCoveringCells.load());
 
     // Make sure the same index key isn't visited twice
     R2CellUnion diffUnion;
@@ -844,7 +846,7 @@ public:
           _currentLevel(0) {
         // cellId.AppendVertexNeighbors(level, output) requires level < finest,
         // so we use the minimum of max_level - 1 and the user specified finest
-        int level = std::min(S2::kMaxCellLevel - 1, internalQueryS2GeoFinestLevel.load());
+        int level = std::min(S2::kMaxCellLevel - 1, gInternalQueryS2GeoFinestLevel.load());
         _currentLevel = std::max(0, level);
     }
 

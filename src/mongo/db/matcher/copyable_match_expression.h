@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -86,6 +85,10 @@ public:
      */
     const MatchExpression* operator->() {
         return &(*_matchExpr);
+    }
+
+    auto inputBSON() const {
+        return _matchAST;
     }
 
 private:

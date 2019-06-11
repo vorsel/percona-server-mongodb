@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -62,6 +61,13 @@ public:
      * Retrieves a reference to the shard version decorating the OperationContext, 'opCtx'.
      */
     static OperationShardingState& get(OperationContext* opCtx);
+
+    /**
+     * Returns true if the the current operation was sent by the caller with shard version
+     * information attached, meaning that it must perform shard version checking and orphan
+     * filtering.
+     */
+    static bool isOperationVersioned(OperationContext* opCtx);
 
     /**
      * Requests on a sharded collection that are broadcast without a shardVersion should not cause

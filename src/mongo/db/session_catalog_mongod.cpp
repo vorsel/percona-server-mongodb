@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -93,8 +92,7 @@ void killSessionTokensFunction(
         for (auto& sessionKillToken : *sessionKillTokens) {
             auto session = catalog->checkOutSessionForKill(opCtx, std::move(sessionKillToken));
 
-            auto const txnParticipant = TransactionParticipant::get(session.get());
-            txnParticipant->invalidate();
+            TransactionParticipant::get(session).invalidate(opCtx);
         }
     }));
 }
@@ -118,12 +116,12 @@ void MongoDSessionCatalog::onStepUp(OperationContext* opCtx) {
     SessionKiller::Matcher matcher(
         KillAllSessionsByPatternSet{makeKillAllSessionsByPattern(opCtx)});
     catalog->scanSessions(matcher, [&](const ObservableSession& session) {
-        const auto txnParticipant = TransactionParticipant::get(session.get());
-        if (!txnParticipant->inMultiDocumentTransaction()) {
+        const auto txnParticipant = TransactionParticipant::get(session);
+        if (!txnParticipant.inMultiDocumentTransaction()) {
             sessionKillTokens->emplace_back(session.kill());
         }
 
-        if (txnParticipant->transactionIsPrepared()) {
+        if (txnParticipant.transactionIsPrepared()) {
             sessionIdToReacquireLocks.emplace_back(session.getSessionId());
         }
     });
@@ -137,11 +135,10 @@ void MongoDSessionCatalog::onStepUp(OperationContext* opCtx) {
             auto newOpCtx = cc().makeOperationContext();
             newOpCtx->setLogicalSessionId(sessionId);
             MongoDOperationContextSession ocs(newOpCtx.get());
-            auto txnParticipant =
-                TransactionParticipant::get(OperationContextSession::get(newOpCtx.get()));
+            auto txnParticipant = TransactionParticipant::get(newOpCtx.get());
             LOG(3) << "Restoring locks of prepared transaction. SessionId: " << sessionId.getId()
-                   << " TxnNumber: " << txnParticipant->getActiveTxnNumber();
-            txnParticipant->refreshLocksForPreparedTransaction(newOpCtx.get(), false);
+                   << " TxnNumber: " << txnParticipant.getActiveTxnNumber();
+            txnParticipant.refreshLocksForPreparedTransaction(newOpCtx.get(), false);
         }
     }
 
@@ -221,15 +218,15 @@ MongoDOperationContextSession::MongoDOperationContextSession(OperationContext* o
     : _operationContextSession(opCtx) {
     invariant(!opCtx->getClient()->isInDirectClient());
 
-    const auto txnParticipant = TransactionParticipant::get(opCtx);
-    txnParticipant->refreshFromStorageIfNeeded();
+    auto txnParticipant = TransactionParticipant::get(opCtx);
+    txnParticipant.refreshFromStorageIfNeeded(opCtx);
 }
 
 MongoDOperationContextSession::~MongoDOperationContextSession() = default;
 
 void MongoDOperationContextSession::checkIn(OperationContext* opCtx) {
     if (auto txnParticipant = TransactionParticipant::get(opCtx)) {
-        txnParticipant->stashTransactionResources(opCtx);
+        txnParticipant.stashTransactionResources(opCtx);
     }
 
     OperationContextSession::checkIn(opCtx);
@@ -239,21 +236,26 @@ void MongoDOperationContextSession::checkOut(OperationContext* opCtx, const std:
     OperationContextSession::checkOut(opCtx);
 
     if (auto txnParticipant = TransactionParticipant::get(opCtx)) {
-        txnParticipant->unstashTransactionResources(opCtx, cmdName);
+        txnParticipant.unstashTransactionResources(opCtx, cmdName);
     }
 }
 
 MongoDOperationContextSessionWithoutRefresh::MongoDOperationContextSessionWithoutRefresh(
     OperationContext* opCtx)
-    : _operationContextSession(opCtx) {
+    : _operationContextSession(opCtx), _opCtx(opCtx) {
     invariant(!opCtx->getClient()->isInDirectClient());
     const auto clientTxnNumber = *opCtx->getTxnNumber();
 
-    const auto txnParticipant = TransactionParticipant::get(opCtx);
-    txnParticipant->beginOrContinueTransactionUnconditionally(clientTxnNumber);
+    auto txnParticipant = TransactionParticipant::get(opCtx);
+    txnParticipant.beginOrContinueTransactionUnconditionally(opCtx, clientTxnNumber);
 }
 
-MongoDOperationContextSessionWithoutRefresh::~MongoDOperationContextSessionWithoutRefresh() =
-    default;
+MongoDOperationContextSessionWithoutRefresh::~MongoDOperationContextSessionWithoutRefresh() {
+    const auto txnParticipant = TransactionParticipant::get(_opCtx);
+    // A session on secondaries should never be checked back in with a TransactionParticipant that
+    // isn't prepared, aborted, or committed.
+    invariant(!txnParticipant.inMultiDocumentTransaction() ||
+              txnParticipant.transactionIsPrepared());
+}
 
 }  // namespace mongo

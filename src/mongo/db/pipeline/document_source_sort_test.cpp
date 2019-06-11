@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -132,8 +131,9 @@ TEST_F(DocumentSourceSortTest, SortWithLimit) {
         sort()->serializeToArray(arr);
         ASSERT_BSONOBJ_EQ(arr[0].getDocument().toBson(), BSON("$sort" << BSON("a" << 1)));
 
-        ASSERT(sort()->getShardSource() != nullptr);
-        ASSERT(sort()->mergingLogic().mergingStage == nullptr);
+        ASSERT(sort()->mergingLogic());
+        ASSERT(sort()->mergingLogic()->shardsStage != nullptr);
+        ASSERT(sort()->mergingLogic()->mergingStage == nullptr);
     }
 
     container.push_back(DocumentSourceLimit::create(expCtx, 10));
@@ -159,9 +159,10 @@ TEST_F(DocumentSourceSortTest, SortWithLimit) {
         Value(arr),
         DOC_ARRAY(DOC("$sort" << DOC("a" << 1)) << DOC("$limit" << sort()->getLimit())));
 
-    ASSERT(sort()->getShardSource() != nullptr);
-    ASSERT(sort()->mergingLogic().mergingStage != nullptr);
-    ASSERT(dynamic_cast<DocumentSourceLimit*>(sort()->mergingLogic().mergingStage.get()));
+    ASSERT(sort()->mergingLogic());
+    ASSERT(sort()->mergingLogic()->shardsStage != nullptr);
+    ASSERT(sort()->mergingLogic()->mergingStage != nullptr);
+    ASSERT(dynamic_cast<DocumentSourceLimit*>(sort()->mergingLogic()->mergingStage.get()));
 }
 
 TEST_F(DocumentSourceSortTest, Dependencies) {
@@ -173,14 +174,6 @@ TEST_F(DocumentSourceSortTest, Dependencies) {
     ASSERT_EQUALS(1U, dependencies.fields.count("b.c"));
     ASSERT_EQUALS(false, dependencies.needWholeDocument);
     ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
-}
-
-TEST_F(DocumentSourceSortTest, OutputSort) {
-    createSort(BSON("a" << 1 << "b.c" << -1));
-    BSONObjSet outputSort = sort()->getOutputSorts();
-    ASSERT_EQUALS(outputSort.count(BSON("a" << 1)), 1U);
-    ASSERT_EQUALS(outputSort.count(BSON("a" << 1 << "b.c" << -1)), 1U);
-    ASSERT_EQUALS(outputSort.size(), 2U);
 }
 
 TEST_F(DocumentSourceSortTest, ReportsNoPathsModified) {

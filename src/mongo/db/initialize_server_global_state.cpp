@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -33,6 +32,7 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/initialize_server_global_state.h"
+#include "mongo/db/initialize_server_global_state_gen.h"
 
 #include <boost/filesystem/operations.hpp>
 #include <iostream>
@@ -48,7 +48,6 @@
 #include "mongo/base/init.h"
 #include "mongo/config.h"
 #include "mongo/db/server_options.h"
-#include "mongo/db/server_parameters.h"
 #include "mongo/logger/console_appender.h"
 #include "mongo/logger/logger.h"
 #include "mongo/logger/message_event.h"
@@ -206,7 +205,6 @@ void forkServerOrDie() {
         quickExit(EXIT_FAILURE);
 }
 
-MONGO_EXPORT_SERVER_PARAMETER(maxLogSizeKB, int, logger::LogContext::kDefaultMaxLogSizeKB);
 // On POSIX platforms we need to set our umask before opening any log files, so this
 // should depend on MungeUmask above, but not on Windows.
 MONGO_INITIALIZER_GENERAL(
@@ -223,7 +221,7 @@ MONGO_INITIALIZER_GENERAL(
     using logger::StatusWithRotatableFileWriter;
 
     // Hook up this global into our logging encoder
-    MessageEventDetailsEncoder::setMaxLogSizeKBSource(maxLogSizeKB);
+    MessageEventDetailsEncoder::setMaxLogSizeKBSource(gMaxLogSizeKB);
 
     if (serverGlobalParams.logWithSyslog) {
 #ifdef _WIN32
@@ -351,14 +349,11 @@ MONGO_INITIALIZER(RegisterShortCircuitExitHandler)(InitializerContext*) {
 // is to set the bits for 'other' and 'group', but leave umask bits
 // bits for 'user' unaltered.
 namespace {
-#ifndef _WIN32
-MONGO_EXPORT_STARTUP_SERVER_PARAMETER(honorSystemUmask, bool, false);
-#endif
 
 MONGO_INITIALIZER_WITH_PREREQUISITES(MungeUmask, ("EndStartupOptionHandling"))
 (InitializerContext*) {
 #ifndef _WIN32
-    if (!honorSystemUmask) {
+    if (!gHonorSystemUmask) {
         umask(umask(S_IRWXU | S_IRWXG | S_IRWXO) | S_IRWXG | S_IRWXO);
     }
 #endif

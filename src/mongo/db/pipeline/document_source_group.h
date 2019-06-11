@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -87,7 +86,7 @@ private:
     std::string _groupId;
 };
 
-class DocumentSourceGroup final : public DocumentSource, public NeedsMergerDocumentSource {
+class DocumentSourceGroup final : public DocumentSource {
 public:
     using Accumulators = std::vector<boost::intrusive_ptr<Accumulator>>;
     using GroupsMap = ValueUnorderedMap<Accumulators>;
@@ -99,7 +98,6 @@ public:
     Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
     GetNextResult getNext() final;
     const char* getSourceName() const final;
-    BSONObjSet getOutputSorts() final;
     GetModPathsReturn getModifiedPaths() const final;
 
     /**
@@ -153,18 +151,12 @@ public:
         _doingMerge = doingMerge;
     }
 
-    bool isStreaming() const {
-        return _streaming;
-    }
-
     /**
      * Returns true if this $group stage used disk during execution and false otherwise.
      */
     bool usedDisk() final;
 
-    // Virtuals for NeedsMergerDocumentSource.
-    boost::intrusive_ptr<DocumentSource> getShardSource() final;
-    MergingLogic mergingLogic() final;
+    boost::optional<MergingLogic> mergingLogic() final;
     bool canRunInParallelBeforeOut(
         const std::set<std::string>& nameOfShardKeyFieldsUponEntryToStage) const final;
 
@@ -190,19 +182,12 @@ private:
     ~DocumentSourceGroup();
 
     /**
-     * getNext() dispatches to one of these three depending on what type of $group it is. All three
-     * of these methods expect '_currentAccumulators' to have been reset before being called, and
-     * also expect initialize() to have been called already.
+     * getNext() dispatches to one of these three depending on what type of $group it is. These
+     * methods expect '_currentAccumulators' to have been reset before being called, and also expect
+     * initialize() to have been called already.
      */
-    GetNextResult getNextStreaming();
     GetNextResult getNextSpilled();
     GetNextResult getNextStandard();
-
-    /**
-     * Attempt to identify an input sort order that allows us to turn into a streaming $group. If we
-     * find one, return it. Otherwise, return boost::none.
-     */
-    boost::optional<BSONObj> findRelevantInputSort() const;
 
     /**
      * Before returning anything, this source must prepare itself. In a streaming $group,
@@ -254,8 +239,6 @@ private:
     std::vector<std::string> _idFieldNames;  // used when id is a document
     std::vector<boost::intrusive_ptr<Expression>> _idExpressions;
 
-    BSONObj _inputSort;
-    bool _streaming;
     bool _initialized;
 
     Value _currentId;
@@ -277,8 +260,6 @@ private:
     const bool _allowDiskUse;
 
     std::pair<Value, Value> _firstPartOfNextGroup;
-    // Only used when '_sorted' is true.
-    boost::optional<Document> _firstDocOfNextGroup;
 };
 
 }  // namespace mongo

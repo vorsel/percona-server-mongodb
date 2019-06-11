@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -129,6 +128,7 @@ std::vector<OpTime> logInsertOps(OperationContext* opCtx,
  *   linked via prevTs, and the timestamps of the oplog entry that contains the document
  *   before/after update was applied. The timestamps are ignored if isNull() is true.
  * prepare this specifies if the oplog entry should be put into a 'prepare' state.
+ * inTxn this specifies that the oplog entry is part of a transaction in progress.
  * oplogSlot If non-null, use this reserved oplog slot instead of a new one.
  *
  * Returns the optime of the oplog entry written to the oplog.
@@ -146,6 +146,7 @@ OpTime logOp(OperationContext* opCtx,
              StmtId stmtId,
              const OplogLink& oplogLink,
              bool prepare,
+             bool inTxn,
              const OplogSlot& oplogSlot);
 
 // Flush out the cached pointer to the oplog.
@@ -230,7 +231,8 @@ Status applyOperation_inlock(OperationContext* opCtx,
 Status applyCommand_inlock(OperationContext* opCtx,
                            const BSONObj& op,
                            const OplogEntry& entry,
-                           OplogApplication::Mode mode);
+                           OplogApplication::Mode mode,
+                           boost::optional<Timestamp> stableTimestampForRecovery);
 
 /**
  * Initializes the global Timestamp with the value from the timestamp of the last oplog entry.
@@ -265,15 +267,21 @@ void createIndexForApplyOps(OperationContext* opCtx,
 // workaround.
 struct GetNextOpTimeClass {
     /**
-     * Allocates optimes for new entries in the oplog.  Returns an OplogSlot or a vector of
-     * OplogSlots, which contain the new optimes along with their terms and newly calculated hash
-     * fields.
+     * Allocates optimes for new entries in the oplog.  Returns a vector of OplogSlots, which
+     * contain the new optimes along with their terms and newly calculated hash fields.
      */
-    static MONGO_DECLARE_SHIM((OperationContext * opCtx)->OplogSlot) getNextOpTime;
+    static MONGO_DECLARE_SHIM((OperationContext * opCtx, std::size_t count)->std::vector<OplogSlot>)
+        getNextOpTimes;
+};
+
+inline std::vector<OplogSlot> getNextOpTimes(OperationContext* opCtx, std::size_t count) {
+    return GetNextOpTimeClass::getNextOpTimes(opCtx, count);
 };
 
 inline OplogSlot getNextOpTime(OperationContext* opCtx) {
-    return GetNextOpTimeClass::getNextOpTime(opCtx);
+    auto slots = getNextOpTimes(opCtx, 1);
+    invariant(slots.size() == 1);
+    return slots.back();
 }
 
 /**
@@ -288,7 +296,6 @@ inline OplogSlot getNextOpTime(OperationContext* opCtx) {
  * prepare generates an oplog entry in a separate unit of work.
  */
 OplogSlot getNextOpTimeNoPersistForTesting(OperationContext* opCtx);
-std::vector<OplogSlot> getNextOpTimes(OperationContext* opCtx, std::size_t count);
 
 }  // namespace repl
 }  // namespace mongo

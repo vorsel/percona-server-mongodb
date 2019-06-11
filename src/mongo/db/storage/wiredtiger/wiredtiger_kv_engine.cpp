@@ -1,6 +1,3 @@
-// wiredtiger_kv_engine.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -68,7 +65,6 @@
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/server_options.h"
-#include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/snapshot_window_options.h"
 #include "mongo/db/storage/journal_listener.h"
@@ -102,19 +98,6 @@
 #endif
 
 namespace mongo {
-
-// Close idle wiredtiger sessions in the session cache after this many seconds.
-// The default is 5 mins. Have a shorter default in the debug build to aid testing.
-MONGO_EXPORT_SERVER_PARAMETER(wiredTigerSessionCloseIdleTimeSecs,
-                              std::int32_t,
-                              kDebugBuild ? 5 : 300)
-    ->withValidator([](const auto& potentialNewValue) {
-        if (potentialNewValue < 0) {
-            return Status(ErrorCodes::BadValue,
-                          "wiredTigerSessionCloseIdleTimeSecs must be greater than or equal to 0s");
-        }
-        return Status::OK();
-    });
 
 bool WiredTigerFileVersion::shouldDowngrade(bool readOnly,
                                             bool repairMode,
@@ -210,7 +193,7 @@ public:
                 _condvar.wait_for(lock, stdx::chrono::seconds(kDebugBuild ? 1 : 10));
             }
 
-            _sessionCache->closeExpiredIdleSessions(wiredTigerSessionCloseIdleTimeSecs.load() *
+            _sessionCache->closeExpiredIdleSessions(gWiredTigerSessionCloseIdleTimeSecs.load() *
                                                     1000);
         }
         LOG(1) << "stopping " << name() << " thread";
@@ -540,10 +523,6 @@ StatusWith<std::vector<std::string>> getDataFilesFromBackupCursor(WT_CURSOR* cur
     return files;
 }
 
-constexpr bool takeUnstableCheckpointOnShutdownDefault = false;
-MONGO_EXPORT_STARTUP_SERVER_PARAMETER(takeUnstableCheckpointOnShutdown,
-                                      bool,
-                                      takeUnstableCheckpointOnShutdownDefault);
 }  // namespace
 
 // Copy files and fill vectors for remove copied files and empty dirs
@@ -986,7 +965,7 @@ void WiredTigerKVEngine::cleanShutdown() {
         invariantWTOK(_conn->reconfigure(_conn, _fileVersion.getDowngradeString().c_str()));
     }
 
-    if (takeUnstableCheckpointOnShutdown) {
+    if (gTakeUnstableCheckpointOnShutdown) {
         closeConfig += "use_timestamp=false,";
     }
 
@@ -2171,11 +2150,6 @@ boost::optional<Timestamp> WiredTigerKVEngine::getRecoveryTimestamp() const {
 }
 
 boost::optional<Timestamp> WiredTigerKVEngine::getLastStableRecoveryTimestamp() const {
-    if (!supportsRecoverToStableTimestamp()) {
-        severe() << "WiredTiger is configured to not support recover to a stable timestamp";
-        fassertFailed(50770);
-    }
-
     if (_ephemeral) {
         Timestamp stable(_stableTimestamp.load());
         Timestamp initialData(_initialDataTimestamp.load());

@@ -209,13 +209,38 @@ __wt_txn_get_snapshot(WT_SESSION_IMPL *session)
 		 *    can happen if we race with a thread that is allocating
 		 *    an ID -- the ID will not be used because the thread will
 		 *    keep spinning until it gets a valid one.
+		 *  - The ID if it is higher than the current ID we saw. This
+		 *    can happen if the transaction is already finished. In
+		 *    this case, we ignore this transaction because it would
+		 *    not be visible to the current snapshot.
 		 */
-		if (s != txn_state &&
+		while (s != txn_state &&
 		    (id = s->id) != WT_TXN_NONE &&
-		    WT_TXNID_LE(prev_oldest_id, id)) {
-			txn->snapshot[n++] = id;
-			if (WT_TXNID_LT(id, pinned_id))
-				pinned_id = id;
+		    WT_TXNID_LE(prev_oldest_id, id) &&
+		    WT_TXNID_LT(id, current_id)) {
+			/*
+			 * If the transaction is still allocating its ID, then
+			 * we spin here until it gets its valid ID.
+			 */
+			WT_READ_BARRIER();
+			if (!s->is_allocating) {
+				/*
+				 * There is still a chance that fetched ID is
+				 * not valid after ID allocation, so we check
+				 * again here. The read of transaction ID
+				 * should be carefully ordered: we want to
+				 * re-read ID from transaction state after this
+				 * transaction completes ID allocation.
+				 */
+				WT_READ_BARRIER();
+				if (id == s->id) {
+					txn->snapshot[n++] = id;
+					if (WT_TXNID_LT(id, pinned_id))
+						pinned_id = id;
+					break;
+				}
+			}
+			WT_PAUSE();
 		}
 	}
 
@@ -261,10 +286,31 @@ __txn_oldest_scan(WT_SESSION_IMPL *session,
 	WT_ORDERED_READ(session_cnt, conn->session_cnt);
 	for (i = 0, s = txn_global->states; i < session_cnt; i++, s++) {
 		/* Update the last running transaction ID. */
-		if ((id = s->id) != WT_TXN_NONE &&
+		while ((id = s->id) != WT_TXN_NONE &&
 		    WT_TXNID_LE(prev_oldest_id, id) &&
-		    WT_TXNID_LT(id, last_running))
-			last_running = id;
+		    WT_TXNID_LT(id, last_running)) {
+			/*
+			 * If the transaction is still allocating its ID, then
+			 * we spin here until it gets its valid ID.
+			 */
+			WT_READ_BARRIER();
+			if (!s->is_allocating) {
+				/*
+				 * There is still a chance that fetched ID is
+				 * not valid after ID allocation, so we check
+				 * again here. The read of transaction ID
+				 * should be carefully ordered: we want to
+				 * re-read ID from transaction state after this
+				 * transaction completes ID allocation.
+				 */
+				WT_READ_BARRIER();
+				if (id == s->id) {
+					last_running = id;
+					break;
+				}
+			}
+			WT_PAUSE();
+		}
 
 		/* Update the metadata pinned ID. */
 		if ((id = s->metadata_pinned) != WT_TXN_NONE &&
@@ -576,17 +622,21 @@ __wt_txn_release(WT_SESSION_IMPL *session)
 }
 
 /*
- * __txn_commit_timestamp_validate --
- *	Validate that timestamp provided to commit is legal.
+ * __txn_commit_timestamps_assert --
+ *	Validate that timestamps provided to commit are legal.
  */
 static inline int
-__txn_commit_timestamp_validate(WT_SESSION_IMPL *session)
+__txn_commit_timestamps_assert(WT_SESSION_IMPL *session)
 {
+	WT_CURSOR *cursor;
+	WT_DECL_RET;
 	WT_TXN *txn;
 	WT_TXN_OP *op;
 	WT_UPDATE *upd;
 	wt_timestamp_t op_timestamp;
 	u_int i;
+	const char *open_cursor_cfg[] = {
+	    WT_CONFIG_BASE(session, WT_SESSION_open_cursor), NULL };
 	bool op_zero_ts, upd_zero_ts;
 
 	txn = &session->txn;
@@ -604,11 +654,21 @@ __txn_commit_timestamp_validate(WT_SESSION_IMPL *session)
 	    txn->mod_count != 0)
 		WT_RET_MSG(session, EINVAL, "no commit_timestamp required and "
 		    "timestamp set on this transaction");
+	if (F_ISSET(txn, WT_TXN_TS_DURABLE_ALWAYS) &&
+	    !F_ISSET(txn, WT_TXN_HAS_TS_DURABLE) &&
+	    txn->mod_count != 0)
+		WT_RET_MSG(session, EINVAL, "durable_timestamp required and "
+		    "none set on this transaction");
+	if (F_ISSET(txn, WT_TXN_TS_DURABLE_NEVER) &&
+	    F_ISSET(txn, WT_TXN_HAS_TS_DURABLE) &&
+	    txn->mod_count != 0)
+		WT_RET_MSG(session, EINVAL, "no durable_timestamp required and "
+		    "durable timestamp set on this transaction");
 
 	/*
 	 * If we're not doing any key consistency checking, we're done.
 	 */
-	if (!F_ISSET(txn, WT_TXN_TS_COMMIT_KEYS))
+	if (!F_ISSET(txn, WT_TXN_TS_COMMIT_KEYS | WT_TXN_TS_DURABLE_KEYS))
 		return (0);
 
 	/*
@@ -619,10 +679,35 @@ __txn_commit_timestamp_validate(WT_SESSION_IMPL *session)
 		if (op->type == WT_TXN_OP_BASIC_COL ||
 		    op->type == WT_TXN_OP_BASIC_ROW) {
 			/*
+			 * Search for prepared updates, so that they will be
+			 * restored, if moved to lookaside.
+			 */
+			if (F_ISSET(txn, WT_TXN_PREPARE)) {
+				WT_RET(__wt_open_cursor(session,
+				    op->btree->dhandle->name, NULL,
+				    open_cursor_cfg, &cursor));
+				F_CLR(txn, WT_TXN_PREPARE);
+				if (op->type == WT_TXN_OP_BASIC_ROW)
+					__wt_cursor_set_raw_key(
+					    cursor, &op->u.op_row.key);
+				else
+					((WT_CURSOR_BTREE*)cursor)->iface.recno
+					    = op->u.op_col.recno;
+				F_SET(txn, WT_TXN_PREPARE);
+				WT_WITH_BTREE(session, op->btree,
+				    ret = __wt_btcur_search_uncommitted(
+				    (WT_CURSOR_BTREE *)cursor, &upd));
+					WT_TRET(cursor->close(cursor));
+				if (ret != 0)
+					WT_RET_MSG(session, EINVAL,
+					    "prepared update restore failed");
+				op->u.op_upd = upd;
+			} else
+				upd = op->u.op_upd->next;
+			/*
 			 * Skip over any aborted update structures or ones
 			 * from our own transaction.
 			 */
-			upd = op->u.op_upd->next;
 			while (upd != NULL && (upd->txnid == WT_TXN_ABORTED ||
 			    upd->txnid == txn->id))
 				upd = upd->next;
@@ -643,7 +728,7 @@ __txn_commit_timestamp_validate(WT_SESSION_IMPL *session)
 			 * Check timestamps are used in order.
 			 */
 			op_zero_ts = !F_ISSET(txn, WT_TXN_HAS_TS_COMMIT);
-			upd_zero_ts = upd->timestamp == WT_TS_NONE;
+			upd_zero_ts = upd->start_ts == WT_TS_NONE;
 			if (op_zero_ts != upd_zero_ts)
 				WT_RET_MSG(session, EINVAL,
 				    "per-key timestamps used inconsistently");
@@ -655,16 +740,21 @@ __txn_commit_timestamp_validate(WT_SESSION_IMPL *session)
 			if (op_zero_ts)
 				continue;
 
-			op_timestamp = op->u.op_upd->timestamp;
+			op_timestamp = op->u.op_upd->start_ts;
 			/*
 			 * Only if the update structure doesn't have a timestamp
 			 * then use the one in the transaction structure.
 			 */
 			if (op_timestamp == WT_TS_NONE)
 				op_timestamp = txn->commit_timestamp;
-			if (op_timestamp < upd->timestamp)
+			if (F_ISSET(txn, WT_TXN_TS_COMMIT_KEYS) &&
+				op_timestamp < upd->start_ts)
 				WT_RET_MSG(session, EINVAL,
-				    "out of order timestamps");
+				    "out of order commit timestamps");
+			if (F_ISSET(txn, WT_TXN_TS_DURABLE_KEYS) &&
+			    txn->durable_timestamp < upd->durable_ts)
+				WT_RET_MSG(session, EINVAL,
+				    "out of order durable timestamps");
 		}
 	return (0);
 }
@@ -699,6 +789,8 @@ __wt_txn_commit(WT_SESSION_IMPL *session, const char *cfg[])
 	    txn->mod_count == 0);
 
 	readonly = txn->mod_count == 0;
+
+	prepare = F_ISSET(txn, WT_TXN_PREPARE);
 	/* Look for a commit timestamp. */
 	WT_ERR(
 	    __wt_config_gets_def(session, cfg, "commit_timestamp", 0, &cval));
@@ -708,46 +800,44 @@ __wt_txn_commit(WT_SESSION_IMPL *session, const char *cfg[])
 		 * For prepared transactions commit timestamp could be earlier
 		 * than stable timestamp.
 		 */
-		WT_ERR(__wt_timestamp_validate(
-		    session, "commit", ts, &cval, false));
+		WT_ERR(__wt_txn_commit_timestamp_validate(
+		    session, "commit", ts, &cval, !prepare));
 		txn->commit_timestamp = ts;
 		__wt_txn_set_commit_timestamp(session);
+		if (!prepare)
+			txn->durable_timestamp = txn->commit_timestamp;
 	}
 
-	prepare = F_ISSET(txn, WT_TXN_PREPARE);
 	if (prepare && !F_ISSET(txn, WT_TXN_HAS_TS_COMMIT))
 		WT_ERR_MSG(session, EINVAL,
 		    "commit_timestamp is required for a prepared transaction");
 
-	/* Durable timestamp is required for a prepared transaction. */
-	if (prepare) {
-		WT_ERR(__wt_config_gets_def(
-		    session, cfg, "durable_timestamp", 0, &cval));
-		if (cval.len != 0) {
-			WT_ERR(__wt_txn_parse_timestamp(
-			    session, "durable", &ts, &cval));
-			WT_ERR(__wt_timestamp_validate(
-			    session, "durable", ts, &cval, true));
-			txn->durable_timestamp = ts;
-		} else
-			/*
-			 * If durable timestamp is not given, commit timestamp
-			 * will be considered as durable timestamp.
-			 * TODO : error if durable timestamp is not given.
-			 */
-			txn->durable_timestamp = txn->commit_timestamp;
+	/*
+	 * Durable timestamp is required for a prepared transaction.
+	 * If durable timestamp is not given, commit timestamp will be
+	 * considered as durable timestamp. We don't flag error if durable
+	 * timestamp is not specified for prepared transactions, but will flag
+	 * error if durable timestamp is specified for non-prepared
+	 * transactions.
+	 */
+	WT_ERR(__wt_config_gets_def(
+	    session, cfg, "durable_timestamp", 0, &cval));
+	if (cval.len != 0) {
+		if (!prepare)
+			WT_ERR_MSG(session, EINVAL,
+			    "durable_timestamp should not be given for "
+			    "non-prepared transaction");
 
-	} else
-		txn->durable_timestamp = txn->commit_timestamp;
+		WT_ERR(__wt_txn_parse_timestamp(
+		    session, "durable", &ts, &cval));
+		/* Durable timestamp should be later than stable timestamp. */
+		F_SET(txn, WT_TXN_HAS_TS_DURABLE);
+		txn->durable_timestamp = ts;
+		WT_ERR(__wt_txn_commit_timestamp_validate(
+		    session, "durable", ts, &cval, true));
+	}
 
-	/* Durable timestamp should be later than stable timestamp. */
-	if (cval.len != 0)
-		WT_ERR(__wt_timestamp_validate(
-		    session, "durable", txn->durable_timestamp, &cval, true));
-
-	WT_ERR(__txn_commit_timestamp_validate(session));
-
-	/* TODO : assert durable_timestamp. */
+	WT_ERR(__txn_commit_timestamps_assert(session));
 
 	/*
 	 * The default sync setting is inherited from the connection, but can
@@ -1016,7 +1106,7 @@ __wt_txn_prepare(WT_SESSION_IMPL *session, const char *cfg[])
 			}
 
 			/* Set prepare timestamp. */
-			upd->timestamp = ts;
+			upd->start_ts = ts;
 
 			WT_PUBLISH(upd->prepare_state, WT_PREPARE_INPROGRESS);
 			op->u.op_upd = NULL;

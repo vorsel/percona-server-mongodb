@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -101,18 +100,6 @@ public:
         return std::any_of(_stageSpecs.begin(), _stageSpecs.end(), [](auto&& spec) {
             return spec->isChangeStream();
         });
-    }
-
-    /**
-     * Returns true if this pipeline's UUID and collation should be resolved. For the latter, this
-     * means adopting the collection's default collation, unless a custom collation was specified.
-     */
-    bool shouldResolveUUIDAndCollation() const {
-        // Collectionless aggregations do not have a UUID or default collation.
-        return !_nss.isCollectionlessAggregateNS() &&
-            std::all_of(_stageSpecs.begin(), _stageSpecs.end(), [](auto&& spec) {
-                return spec->shouldResolveUUIDAndCollation();
-            });
     }
 
     /**

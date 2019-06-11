@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -33,7 +32,6 @@
 #include "mongo/base/disallow_copying.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/storage/recovery_unit.h"
 
 namespace mongo {
 
@@ -46,20 +44,8 @@ class TimestampBlock {
     MONGO_DISALLOW_COPYING(TimestampBlock);
 
 public:
-    TimestampBlock(OperationContext* opCtx, Timestamp ts) : _opCtx(opCtx), _ts(ts) {
-        uassert(ErrorCodes::IllegalOperation,
-                "Cannot timestamp a write operation in read-only mode",
-                !storageGlobalParams.readOnly);
-        if (!_ts.isNull()) {
-            _opCtx->recoveryUnit()->setCommitTimestamp(_ts);
-        }
-    }
-
-    ~TimestampBlock() {
-        if (!_ts.isNull()) {
-            _opCtx->recoveryUnit()->clearCommitTimestamp();
-        }
-    }
+    TimestampBlock(OperationContext* opCtx, Timestamp ts);
+    ~TimestampBlock();
 
 private:
     OperationContext* const _opCtx;

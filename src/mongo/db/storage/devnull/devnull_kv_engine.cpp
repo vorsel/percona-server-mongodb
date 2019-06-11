@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -153,14 +152,6 @@ public:
     }
 
     virtual void cappedTruncateAfter(OperationContext* opCtx, RecordId end, bool inclusive) {}
-
-    virtual Status validate(OperationContext* opCtx,
-                            ValidateCmdLevel level,
-                            ValidateAdaptor* adaptor,
-                            ValidateResults* results,
-                            BSONObjBuilder* output) {
-        return Status::OK();
-    }
 
     virtual void appendCustomStats(OperationContext* opCtx,
                                    BSONObjBuilder* result,

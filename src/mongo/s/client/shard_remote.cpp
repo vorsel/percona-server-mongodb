@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -33,6 +32,7 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/s/client/shard_remote.h"
+#include "mongo/s/client/shard_remote_gen.h"
 
 #include <algorithm>
 #include <string>
@@ -47,7 +47,6 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/query_request.h"
 #include "mongo/db/repl/read_concern_args.h"
-#include "mongo/db/server_parameters.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
@@ -71,11 +70,6 @@ namespace {
 // Include kReplSetMetadataFieldName in a request to get the shard's ReplSetMetadata in the
 // response.
 const BSONObj kReplMetadata(BSON(rpc::kReplSetMetadataFieldName << 1));
-
-constexpr bool internalProhibitShardOperationRetryByDefault = false;
-MONGO_EXPORT_SERVER_PARAMETER(internalProhibitShardOperationRetry,
-                              bool,
-                              internalProhibitShardOperationRetryByDefault);
 
 /**
  * Returns a new BSONObj describing the same command and arguments as 'cmdObj', but with maxTimeMS
@@ -109,7 +103,7 @@ ShardRemote::ShardRemote(const ShardId& id,
 ShardRemote::~ShardRemote() = default;
 
 bool ShardRemote::isRetriableError(ErrorCodes::Error code, RetryPolicy options) {
-    if (internalProhibitShardOperationRetry.loadRelaxed()) {
+    if (gInternalProhibitShardOperationRetry.loadRelaxed()) {
         return false;
     }
 

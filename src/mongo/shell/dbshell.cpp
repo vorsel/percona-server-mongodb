@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -82,11 +81,10 @@
 #include <unistd.h>
 #endif
 
-using namespace std;
 using namespace std::literals::string_literals;
 using namespace mongo;
 
-string historyFile;
+std::string historyFile;
 bool gotInterrupted = false;
 bool inMultiLine = false;
 static AtomicWord<bool> atPrompt(false);  // can eval before getting to prompt
@@ -108,6 +106,52 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(SetFeatureCompatibilityVersion42, ("EndStar
     return Status::OK();
 }
 const auto kAuthParam = "authSource"s;
+
+/**
+ * This throws away all log output while inside of a LoggingDisabledScope.
+ */
+class ShellConsoleAppender final : public logger::ConsoleAppender<logger::MessageEventEphemeral> {
+    using Base = logger::ConsoleAppender<logger::MessageEventEphemeral>;
+
+public:
+    using Base::Base;
+
+    Status append(const Event& event) override {
+        auto lk = stdx::lock_guard(mx);
+        if (!loggingEnabled)
+            return Status::OK();
+        return Base::append(event);
+    }
+
+    struct LoggingDisabledScope {
+        LoggingDisabledScope() {
+            disableLogging();
+        }
+
+        ~LoggingDisabledScope() {
+            enableLogging();
+        }
+    };
+
+private:
+    static void enableLogging() {
+        auto lk = stdx::lock_guard(mx);
+        invariant(!loggingEnabled);
+        loggingEnabled = true;
+    }
+
+    static void disableLogging() {
+        auto lk = stdx::lock_guard(mx);
+        invariant(loggingEnabled);
+        loggingEnabled = false;
+    }
+
+    // This needs to use a mutex rather than an atomic bool because we need to ensure that no more
+    // logging will happen once we return from disable().
+    static inline stdx::mutex mx;
+    static inline bool loggingEnabled = true;
+};
+
 }  // namespace
 
 namespace mongo {
@@ -124,8 +168,8 @@ enum ShellExitCode : int {
 Scope* shellMainScope;
 }
 
-void generateCompletions(const string& prefix, vector<string>& all) {
-    if (prefix.find('"') != string::npos)
+void generateCompletions(const std::string& prefix, std::vector<std::string>& all) {
+    if (prefix.find('"') != std::string::npos)
         return;
 
     try {
@@ -147,7 +191,7 @@ void generateCompletions(const string& prefix, vector<string>& all) {
 }
 
 void completionHook(const char* text, linenoiseCompletions* lc) {
-    vector<string> all;
+    std::vector<std::string> all;
     generateCompletions(text, all);
 
     for (unsigned i = 0; i < all.size(); ++i)
@@ -155,7 +199,7 @@ void completionHook(const char* text, linenoiseCompletions* lc) {
 }
 
 void shellHistoryInit() {
-    stringstream ss;
+    std::stringstream ss;
     const char* h = shell_utils::getUserDir();
     if (h)
         ss << h << "/";
@@ -181,7 +225,7 @@ void shellHistoryAdd(const char* line) {
         return;
 
     // dont record duplicate lines
-    static string lastLine;
+    static std::string lastLine;
     if (lastLine == line)
         return;
     lastLine = line;
@@ -220,6 +264,7 @@ void quitNicely(int sig) {
 
 // the returned string is allocated with strdup() or malloc() and must be freed by calling free()
 char* shellReadline(const char* prompt, int handlesigint = 0) {
+    auto lds = ShellConsoleAppender::LoggingDisabledScope();
     atPrompt.store(true);
 
     char* ret = linenoise(prompt);
@@ -238,7 +283,9 @@ void setupSignals() {
     signal(SIGINT, quitNicely);
 }
 
-string getURIFromArgs(const std::string& arg, const std::string& host, const std::string& port) {
+std::string getURIFromArgs(const std::string& arg,
+                           const std::string& host,
+                           const std::string& port) {
     if (host.empty() && arg.empty() && port.empty()) {
         // Nothing provided, just play the default.
         return kDefaultMongoURL;
@@ -257,8 +304,9 @@ string getURIFromArgs(const std::string& arg, const std::string& host, const std
 
     // We expect a positional arg to be a plain dbname or plain hostname at this point
     // since we have separate host/port args.
-    if ((arg.find('/') != string::npos) && (host.size() || port.size())) {
-        cerr << "If a full URI is provided, you cannot also specify --host or --port" << endl;
+    if ((arg.find('/') != std::string::npos) && (host.size() || port.size())) {
+        std::cerr << "If a full URI is provided, you cannot also specify --host or --port"
+                  << std::endl;
         quickExit(-1);
     }
 
@@ -324,8 +372,9 @@ string getURIFromArgs(const std::string& arg, const std::string& host, const std
                     // Have a port in our host element, verify it.
                     const auto myport = hostElem.substr(colon + 1);
                     if (port.size() && (port != myport)) {
-                        cerr << "connection string bears different port than provided by --port"
-                             << endl;
+                        std::cerr
+                            << "connection string bears different port than provided by --port"
+                            << std::endl;
                         quickExit(-1);
                     }
                     ss << ':' << uriEncode(myport);
@@ -387,7 +436,7 @@ string getURIFromArgs(const std::string& arg, const std::string& host, const std
     return parseDbHost("", "127.0.0.1");
 }
 
-static string OpSymbols = "~!%^&*-+=|:,<>/?.";
+static std::string OpSymbols = "~!%^&*-+=|:,<>/?.";
 
 bool isOpSymbol(char c) {
     for (size_t i = 0; i < OpSymbols.size(); i++)
@@ -397,7 +446,7 @@ bool isOpSymbol(char c) {
 }
 
 bool isUseCmd(const std::string& code) {
-    string cmd = code;
+    std::string cmd = code;
     if (cmd.find(" ") > 0)
         cmd = cmd.substr(0, cmd.find(" "));
     return cmd == "use";
@@ -544,12 +593,12 @@ public:
     }
 } balanced_test;
 
-string finishCode(string code) {
+std::string finishCode(std::string code) {
     while (!isBalanced(code)) {
         inMultiLine = true;
         code += "\n";
         // cancel multiline if two blank lines are entered
-        if (code.find("\n\n\n") != string::npos)
+        if (code.find("\n\n\n") != std::string::npos)
             return ";";
         char* line = shellReadline("... ", 1);
         if (gotInterrupted) {
@@ -570,8 +619,8 @@ string finishCode(string code) {
     return code;
 }
 
-bool execPrompt(mongo::Scope& scope, const char* promptFunction, string& prompt) {
-    string execStatement = string("__promptWrapper__(") + promptFunction + ");";
+bool execPrompt(mongo::Scope& scope, const char* promptFunction, std::string& prompt) {
+    std::string execStatement = std::string("__promptWrapper__(") + promptFunction + ");";
     scope.exec("delete __prompt__;", "", false, false, false, 0);
     scope.exec(execStatement, "", false, false, false, 0);
     if (scope.type("__prompt__") == String) {
@@ -586,9 +635,9 @@ bool execPrompt(mongo::Scope& scope, const char* promptFunction, string& prompt)
  *
  * @param whatToEdit Name of JavaScript variable to be edited, or any text string
  */
-static void edit(const string& whatToEdit) {
+static void edit(const std::string& whatToEdit) {
     // EDITOR may be defined in the JavaScript scope or in the environment
-    string editor;
+    std::string editor;
     if (shellMainScope->type("EDITOR") == String) {
         editor = shellMainScope->getString("EDITOR");
     } else {
@@ -598,7 +647,8 @@ static void edit(const string& whatToEdit) {
         }
     }
     if (editor.empty()) {
-        cout << "please define EDITOR as a JavaScript string or as an environment variable" << endl;
+        std::cout << "please define EDITOR as a JavaScript string or as an environment variable"
+                  << std::endl;
         return;
     }
 
@@ -611,7 +661,7 @@ static void edit(const string& whatToEdit) {
         }
     }
 
-    string js;
+    std::string js;
     if (editingVariable) {
         // If "whatToEdit" is undeclared or uninitialized, declare
         int varType = shellMainScope->type(whatToEdit.c_str());
@@ -627,7 +677,7 @@ static void edit(const string& whatToEdit) {
         js = shellMainScope->getString("__jsout__");
 
         if (strstr(js.c_str(), "[native code]")) {
-            cout << "can't edit native functions" << endl;
+            std::cout << "can't edit native functions" << std::endl;
             return;
         }
     } else {
@@ -635,7 +685,7 @@ static void edit(const string& whatToEdit) {
     }
 
     // Pick a name to use for the temp file
-    string filename;
+    std::string filename;
     const int maxAttempts = 10;
     int i;
     for (i = 0; i < maxAttempts; ++i) {
@@ -652,7 +702,8 @@ static void edit(const string& whatToEdit) {
             break;
     }
     if (i == maxAttempts) {
-        cout << "couldn't create unique temp file after " << maxAttempts << " attempts" << endl;
+        std::cout << "couldn't create unique temp file after " << maxAttempts << " attempts"
+                  << std::endl;
         return;
     }
 
@@ -660,8 +711,8 @@ static void edit(const string& whatToEdit) {
     FILE* tempFileStream;
     tempFileStream = fopen(filename.c_str(), "wt");
     if (!tempFileStream) {
-        cout << "couldn't create temp file (" << filename << "): " << errnoWithDescription()
-             << endl;
+        std::cout << "couldn't create temp file (" << filename << "): " << errnoWithDescription()
+                  << std::endl;
         return;
     }
 
@@ -669,7 +720,8 @@ static void edit(const string& whatToEdit) {
     size_t fileSize = js.size();
     if (fwrite(js.data(), sizeof(char), fileSize, tempFileStream) != fileSize) {
         int systemErrno = errno;
-        cout << "failed to write to temp file: " << errnoWithDescription(systemErrno) << endl;
+        std::cout << "failed to write to temp file: " << errnoWithDescription(systemErrno)
+                  << std::endl;
         fclose(tempFileStream);
         remove(filename.c_str());
         return;
@@ -679,14 +731,18 @@ static void edit(const string& whatToEdit) {
     // Pass file to editor
     StringBuilder sb;
     sb << editor << " " << filename;
-    int ret = ::system(sb.str().c_str());
+    int ret = [&] {
+        auto lds = ShellConsoleAppender::LoggingDisabledScope();
+        return ::system(sb.str().c_str());
+    }();
     if (ret) {
         if (ret == -1) {
             int systemErrno = errno;
-            cout << "failed to launch $EDITOR (" << editor
-                 << "): " << errnoWithDescription(systemErrno) << endl;
+            std::cout << "failed to launch $EDITOR (" << editor
+                      << "): " << errnoWithDescription(systemErrno) << std::endl;
         } else
-            cout << "editor exited with error (" << ret << "), not applying changes" << endl;
+            std::cout << "editor exited with error (" << ret << "), not applying changes"
+                      << std::endl;
         remove(filename.c_str());
         return;
     }
@@ -694,7 +750,8 @@ static void edit(const string& whatToEdit) {
     // The editor gave return code zero, so read the file back in
     tempFileStream = fopen(filename.c_str(), "rt");
     if (!tempFileStream) {
-        cout << "couldn't open temp file on return from editor: " << errnoWithDescription() << endl;
+        std::cout << "couldn't open temp file on return from editor: " << errnoWithDescription()
+                  << std::endl;
         remove(filename.c_str());
         return;
     }
@@ -704,7 +761,7 @@ static void edit(const string& whatToEdit) {
         char buf[1024];
         bytes = fread(buf, sizeof(char), sizeof buf, tempFileStream);
         if (ferror(tempFileStream)) {
-            cout << "failed to read temp file: " << errnoWithDescription() << endl;
+            std::cout << "failed to read temp file: " << errnoWithDescription() << std::endl;
             fclose(tempFileStream);
             remove(filename.c_str());
             return;
@@ -718,9 +775,9 @@ static void edit(const string& whatToEdit) {
 
     if (editingVariable) {
         // Try to execute assignment to copy edited value back into the variable
-        const string code = whatToEdit + string(" = ") + sb.str();
+        const std::string code = whatToEdit + std::string(" = ") + sb.str();
         if (!shellMainScope->exec(code, "tojs", false, true, false)) {
-            cout << "error executing assignment: " << code << endl;
+            std::cout << "error executing assignment: " << code << std::endl;
         }
     } else {
         linenoisePreloadBuffer(sb.str().c_str());
@@ -754,6 +811,10 @@ int _main(int argc, char* argv[], char** envp) {
     setupSignalHandlers();
     setupSignals();
 
+    logger::globalLogManager()->getGlobalDomain()->clearAppenders();
+    logger::globalLogManager()->getGlobalDomain()->attachAppender(
+        std::make_unique<ShellConsoleAppender>(
+            std::make_unique<logger::MessageEventDetailsEncoder>()));
     mongo::shell_utils::RecordMyLocation(argv[0]);
 
     mongo::runGlobalInitializersOrDie(argc, argv, envp);
@@ -776,13 +837,13 @@ int _main(int argc, char* argv[], char** envp) {
     ErrorExtraInfo::invariantHaveAllParsers();
 
     if (!mongo::serverGlobalParams.quiet.load())
-        cout << mongoShellVersion(VersionInfoInterface::instance()) << endl;
+        std::cout << mongoShellVersion(VersionInfoInterface::instance()) << std::endl;
 
     mongo::StartupTest::runTests();
 
     logger::globalLogManager()
         ->getNamedDomain("javascriptOutput")
-        ->attachAppender(std::make_unique<logger::ConsoleAppender<logger::MessageEventEphemeral>>(
+        ->attachAppender(std::make_unique<ShellConsoleAppender>(
             std::make_unique<logger::MessageEventUnadornedEncoder>()));
 
     // Get the URL passed to the shell
@@ -801,16 +862,16 @@ int _main(int argc, char* argv[], char** envp) {
     parsedURI.setOptionIfNecessary("gssapiHostName"s, shellGlobalParams.gssapiHostName);
 
     if (const auto authMechanisms = parsedURI.getOption("authMechanism")) {
-        stringstream ss;
+        std::stringstream ss;
         ss << "DB.prototype._defaultAuthenticationMechanism = \"" << escape(authMechanisms.get())
-           << "\";" << endl;
+           << "\";" << std::endl;
         mongo::shell_utils::_dbConnect += ss.str();
     }
 
     if (const auto gssapiServiveName = parsedURI.getOption("gssapiServiceName")) {
-        stringstream ss;
+        std::stringstream ss;
         ss << "DB.prototype._defaultGssapiServiceName = \"" << escape(gssapiServiveName.get())
-           << "\";" << endl;
+           << "\";" << std::endl;
         mongo::shell_utils::_dbConnect += ss.str();
     }
 
@@ -834,18 +895,18 @@ int _main(int argc, char* argv[], char** envp) {
             parsedURI.setUser(stdx::as_const(shellGlobalParams.username));
         }
 
-        stringstream ss;
+        std::stringstream ss;
         if (mongo::serverGlobalParams.quiet.load()) {
-            ss << "__quiet = true;" << endl;
+            ss << "__quiet = true;" << std::endl;
         }
 
-        ss << "db = connect( \"" << parsedURI.canonicalizeURIAsString() << "\");" << endl;
+        ss << "db = connect( \"" << parsedURI.canonicalizeURIAsString() << "\");" << std::endl;
 
         if (shellGlobalParams.shouldRetryWrites || parsedURI.getRetryWrites()) {
             // If the --retryWrites cmdline argument or retryWrites URI param was specified, then
             // replace the global `db` object with a DB object started in a session. The resulting
             // Mongo connection checks its _retryWrites property.
-            ss << "db = db.getMongo().startSession().getDatabase(db.getName());" << endl;
+            ss << "db = db.getMongo().startSession().getDatabase(db.getName());" << std::endl;
         }
 
         mongo::shell_utils::_dbConnect += ss.str();
@@ -861,11 +922,11 @@ int _main(int argc, char* argv[], char** envp) {
 
     auto poolGuard = makeGuard([] { ScriptEngine::dropScopeCache(); });
 
-    unique_ptr<mongo::Scope> scope(mongo::getGlobalScriptEngine()->newScope());
+    std::unique_ptr<mongo::Scope> scope(mongo::getGlobalScriptEngine()->newScope());
     shellMainScope = scope.get();
 
     if (shellGlobalParams.runShell && !mongo::serverGlobalParams.quiet.load())
-        cout << "type \"help\" for help" << endl;
+        std::cout << "type \"help\" for help" << std::endl;
 
     // Load and execute /etc/mongorc.js before starting shell
     std::string rcGlobalLocation;
@@ -880,7 +941,8 @@ int _main(int argc, char* argv[], char** envp) {
 #endif
     if (!rcGlobalLocation.empty() && ::mongo::shell_utils::fileExists(rcGlobalLocation)) {
         if (!scope->execFile(rcGlobalLocation, false, true)) {
-            cout << "The \"" << rcGlobalLocation << "\" file could not be executed" << endl;
+            std::cout << "The \"" << rcGlobalLocation << "\" file could not be executed"
+                      << std::endl;
         }
     }
 
@@ -897,7 +959,7 @@ int _main(int argc, char* argv[], char** envp) {
         mongo::shell_utils::MongoProgramScope s;
 
         if (shellGlobalParams.files.size() > 1)
-            cout << "loading file: " << shellGlobalParams.files[i] << endl;
+            std::cout << "loading file: " << shellGlobalParams.files[i] << std::endl;
 
         if (!scope->execFile(shellGlobalParams.files[i], false, true)) {
             severe() << "failed to load: " << shellGlobalParams.files[i];
@@ -909,10 +971,10 @@ int _main(int argc, char* argv[], char** envp) {
         std::vector<ProcessId> pids = mongo::shell_utils::getRunningMongoChildProcessIds();
 
         if (!pids.empty()) {
-            cout << "terminating the following processes started by " << shellGlobalParams.files[i]
-                 << ": ";
-            std::copy(pids.begin(), pids.end(), std::ostream_iterator<ProcessId>(cout, " "));
-            cout << endl;
+            std::cout << "terminating the following processes started by "
+                      << shellGlobalParams.files[i] << ": ";
+            std::copy(pids.begin(), pids.end(), std::ostream_iterator<ProcessId>(std::cout, " "));
+            std::cout << std::endl;
 
             if (mongo::shell_utils::KillMongoProgramInstances() != EXIT_SUCCESS) {
                 severe() << "one more more child processes exited with an error during "
@@ -947,7 +1009,7 @@ int _main(int argc, char* argv[], char** envp) {
         mongo::shell_utils::MongoProgramScope s;
         // If they specify norc, assume it's not their first time
         bool hasMongoRC = shellGlobalParams.norc;
-        string rcLocation;
+        std::string rcLocation;
         if (!shellGlobalParams.norc) {
 #ifndef _WIN32
             if (getenv("HOME") != NULL)
@@ -970,12 +1032,12 @@ int _main(int argc, char* argv[], char** envp) {
         }
 
         if (!hasMongoRC && isatty(fileno(stdin))) {
-            cout
+            std::cout
                 << "Welcome to the Percona Server for MongoDB shell.\n"
                    "For interactive help, type \"help\".\n"
                    "For more comprehensive documentation, see\n\thttps://www.percona.com/doc/percona-server-for-mongodb\n"
                    "Questions? Try the support group\n\thttps://www.percona.com/forums/questions-discussions/percona-server-for-mongodb"
-                << endl;
+                << std::endl;
             File f;
             f.open(rcLocation.c_str(), false);  // Create empty .mongorc.js file
         }
@@ -997,7 +1059,7 @@ int _main(int argc, char* argv[], char** envp) {
 
         shellHistoryInit();
 
-        string prompt;
+        std::string prompt;
         int promptType;
 
         while (1) {
@@ -1026,13 +1088,13 @@ int _main(int argc, char* argv[], char** envp) {
 
             if (!linePtr || (strlen(linePtr) == 4 && strstr(linePtr, "exit"))) {
                 if (!mongo::serverGlobalParams.quiet.load())
-                    cout << "bye" << endl;
+                    std::cout << "bye" << std::endl;
                 if (line)
                     free(line);
                 break;
             }
 
-            string code = linePtr;
+            std::string code = linePtr;
             if (code == "exit" || code == "exit;") {
                 free(line);
                 break;
@@ -1063,7 +1125,7 @@ int _main(int argc, char* argv[], char** envp) {
             gotInterrupted = false;
             code = finishCode(code);
             if (gotInterrupted) {
-                cout << endl;
+                std::cout << std::endl;
                 free(line);
                 continue;
             }
@@ -1075,22 +1137,22 @@ int _main(int argc, char* argv[], char** envp) {
 
             bool wascmd = false;
             {
-                string cmd = linePtr;
-                string::size_type firstSpace;
-                if ((firstSpace = cmd.find(" ")) != string::npos)
+                std::string cmd = linePtr;
+                std::string::size_type firstSpace;
+                if ((firstSpace = cmd.find(" ")) != std::string::npos)
                     cmd = cmd.substr(0, firstSpace);
 
-                if (cmd.find("\"") == string::npos) {
+                if (cmd.find("\"") == std::string::npos) {
                     try {
                         lastLineSuccessful =
-                            scope->exec((string) "__iscmd__ = shellHelper[\"" + cmd + "\"];",
+                            scope->exec(std::string("__iscmd__ = shellHelper[\"") + cmd + "\"];",
                                         "(shellhelp1)",
                                         false,
                                         true,
                                         true);
                         if (scope->getBoolean("__iscmd__")) {
                             lastLineSuccessful =
-                                scope->exec((string) "shellHelper( \"" + cmd + "\" , \"" +
+                                scope->exec(std::string("shellHelper( \"") + cmd + "\" , \"" +
                                                 code.substr(cmd.size()) + "\");",
                                             "(shellhelp2)",
                                             false,
@@ -1099,7 +1161,7 @@ int _main(int argc, char* argv[], char** envp) {
                             wascmd = true;
                         }
                     } catch (std::exception& e) {
-                        cout << "error2:" << e.what() << endl;
+                        std::cout << "error2:" << e.what() << std::endl;
                         wascmd = true;
                         lastLineSuccessful = false;
                     }
@@ -1114,7 +1176,7 @@ int _main(int argc, char* argv[], char** envp) {
                             "shellPrintHelper( __lastres__ );", "(shell2)", true, true, false);
                     }
                 } catch (std::exception& e) {
-                    cout << "error:" << e.what() << endl;
+                    std::cout << "error:" << e.what() << std::endl;
                     lastLineSuccessful = false;
                 }
             }

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -34,11 +33,11 @@
 
 #include "mongo/db/logical_session_cache_impl.h"
 
+#include "mongo/db/logical_session_cache_impl_gen.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/s/operation_sharding_state.h"
-#include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/util/duration.h"
@@ -58,15 +57,6 @@ void clearShardingOperationFailedStatus(OperationContext* opCtx) {
 }
 
 }  // namespace
-
-MONGO_EXPORT_STARTUP_SERVER_PARAMETER(
-    logicalSessionRefreshMillis,
-    int,
-    LogicalSessionCacheImpl::kLogicalSessionDefaultRefresh.count());
-
-MONGO_EXPORT_STARTUP_SERVER_PARAMETER(disableLogicalSessionCacheRefresh, bool, false);
-
-MONGO_EXPORT_STARTUP_SERVER_PARAMETER(maxSessions, int, 1'000'000);
 
 constexpr Milliseconds LogicalSessionCacheImpl::kLogicalSessionDefaultRefresh;
 

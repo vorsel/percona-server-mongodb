@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -421,12 +420,6 @@ public:
      * 'obj' will be null when 'obj' is dequeued.
      */
     virtual void enqueue(const BSONObj& obj) = 0;
-
-    /**
-     * Helper method which returns a set of BSONObj, where each represents a sort order of our
-     * output.
-     */
-    virtual BSONObjSet getOutputSorts() const = 0;
 
     virtual bool isMarkedAsKilled() const = 0;
     virtual Status getKillStatus() = 0;

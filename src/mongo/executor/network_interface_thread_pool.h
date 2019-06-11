@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -61,8 +60,9 @@ public:
     Status schedule(Task task) override;
 
 private:
-    void consumeTasks(stdx::unique_lock<stdx::mutex> lk);
-    void dtorImpl();
+    void _consumeTasks(stdx::unique_lock<stdx::mutex> lk);
+    void _consumeTasksInline(stdx::unique_lock<stdx::mutex> lk) noexcept;
+    void _dtorImpl();
 
     NetworkInterface* const _net;
 
@@ -73,8 +73,13 @@ private:
     bool _started = false;
     bool _inShutdown = false;
     bool _joining = false;
-    bool _registeredAlarm = false;
-    bool _consumingTasks = false;
+
+    enum class ConsumeState {
+        kNeutral = 0,
+        kScheduled,
+        kConsuming,
+    };
+    ConsumeState _consumeState = ConsumeState::kNeutral;
 };
 
 }  // namespace executor

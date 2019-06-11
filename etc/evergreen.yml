@@ -172,7 +172,7 @@ variables:
 
 - &powercycle_test
   ec2_artifacts: ${log_path} ${db_path} ${backup_artifacts}
-  program_options:  --exitYamlFile=${exit_file} --logLevel=info --backupPathBefore=${backup_path_before} --backupPathAfter=${backup_path_after}
+  program_options: --exitYamlFile=${exit_file} --logLevel=info --backupPathBefore=${backup_path_before} --backupPathAfter=${backup_path_after}
   connection_options: --sshUserHost=${private_ip_address} --sshConnection=\"${ssh_identity} ${ssh_connection_options}\"
   test_options: --testLoops=15 --seedDocNum=10000 --rsync --rsyncExcludeFiles=diagnostic.data/metrics.interim* --validate=local --canary=local
   crash_options: --crashMethod=internal --crashOption=${windows_crash_cmd} --crashWaitTime=45 --jitterForCrashWaitTime=5 --instanceId=${instance_id}
@@ -242,6 +242,7 @@ variables:
         system-resource-info.tgz
         ${report_file|src/report.json}
         ${archive_file|src/archive.json}
+  setup_group_can_fail_task: true
   setup_group:
   - func: "kill processes"
   - func: "cleanup environment"
@@ -363,6 +364,7 @@ variables:
     - func: "apply compile expansions"
     - func: "set task expansion macros"
   teardown_task:
+  setup_group_can_fail_task: true
   setup_group:
     - func: "kill processes"
     - func: "cleanup environment"
@@ -398,7 +400,7 @@ functions:
           fi
         done
 
-  "configure evergreen api credentials" : &configure_evergreen_api_credentials
+  "configure evergreen api credentials": &configure_evergreen_api_credentials
     command: shell.exec
     type: test
     params:
@@ -412,7 +414,7 @@ functions:
         user: "${evergreen_api_user}"
         END_OF_CREDS
 
-  "git get project" : &git_get_project
+  "git get project": &git_get_project
     command: git.get_project
     params:
       directory: ${git_project_directory|src}
@@ -420,7 +422,7 @@ functions:
         enterprise: ${enterprise_rev}
         wtdevelop: ${wtdevelop_rev}
 
-  "fetch artifacts" : &fetch_artifacts
+  "fetch artifacts": &fetch_artifacts
     command: s3.get
     params:
       aws_key: ${aws_key}
@@ -429,7 +431,7 @@ functions:
       bucket: mciuploads
       extract_to: src
 
-  "fetch binaries" : &fetch_binaries
+  "fetch binaries": &fetch_binaries
     command: s3.get
     params:
       aws_key: ${aws_key}
@@ -438,7 +440,7 @@ functions:
       bucket: mciuploads
       local_file: src/mongo-binaries.tgz
 
-  "extract binaries" : &extract_binaries
+  "extract binaries": &extract_binaries
     command: shell.exec
     params:
       working_dir: src
@@ -447,7 +449,7 @@ functions:
         ${decompress} mongo-binaries.tgz
         cp mongodb*/bin/* .
 
-  "check binary version" : &check_binary_version
+  "check binary version": &check_binary_version
     command: shell.exec
     params:
       working_dir: src
@@ -467,6 +469,7 @@ functions:
           exit 0
         fi
         ${activate_virtualenv}
+        $python -m pip install -r etc/pip/evgtest-requirements.txt
         bin_ver=$($python -c "import yaml; print(yaml.safe_load(open('compile_expansions.yml'))['version']);" | tr -d '[ \r\n]')
         # Due to SERVER-23810, we cannot use $mongo_binary --quiet --nodb --eval "version();"
         mongo_ver=$($mongo_binary --version | perl -pe '/version v(.*)$/; $_ = $1;' | tr -d '[ \r\n]')
@@ -476,7 +479,7 @@ functions:
           exit 1
         fi
 
-  "fetch benchmarks" : &fetch_benchmarks
+  "fetch benchmarks": &fetch_benchmarks
     command: s3.get
     params:
       aws_key: ${aws_key}
@@ -485,7 +488,7 @@ functions:
       bucket: mciuploads
       extract_to: src
 
-  "fetch benchrun embedded files" : &fetch_benchrun_embedded_files
+  "fetch benchrun embedded files": &fetch_benchrun_embedded_files
     command: s3.get
     params:
       aws_key: ${aws_key}
@@ -494,7 +497,7 @@ functions:
       bucket: mciuploads
       extract_to: src/benchrun_embedded/testcases
 
-  "get buildnumber" : &get_buildnumber
+  "get buildnumber": &get_buildnumber
     command: keyval.inc
     params:
       key: "${build_variant}_master"
@@ -593,7 +596,7 @@ functions:
           sleep 60
         done
 
-  "set up credentials" : &set_up_credentials
+  "set up credentials": &set_up_credentials
     command: shell.exec
     params:
       working_dir: src
@@ -607,7 +610,7 @@ functions:
         build_phase='${task_name}_${execution}'
         END_OF_CREDS
 
-  "set up notary client credentials" : &set_up_notary_client_credentials
+  "set up notary client credentials": &set_up_notary_client_credentials
     command: shell.exec
     params:
       working_dir: src
@@ -693,7 +696,7 @@ functions:
           echo "Request to BF Suggestion service status: $?"
         fi
 
-  "upload debugsymbols" : &upload_debugsymbols
+  "upload debugsymbols": &upload_debugsymbols
     command: s3.put
     params:
       optional: true
@@ -705,7 +708,7 @@ functions:
       permissions: public-read
       content_type: ${content_type|application/gzip}
 
-  "fetch debugsymbols archive" : &fetch_debugsymbols_archive
+  "fetch debugsymbols archive": &fetch_debugsymbols_archive
     command: s3.get
     params:
       aws_key: ${aws_key}
@@ -714,7 +717,7 @@ functions:
       bucket: mciuploads
       local_file: src/mongo-debugsymbols.tgz
 
-  "extract debugsymbols" : &extract_debugsymbols
+  "extract debugsymbols": &extract_debugsymbols
     command: shell.exec
     params:
       working_dir: src
@@ -738,10 +741,10 @@ functions:
         done
         rm mongo-debugsymbols.tgz 2>/dev/null || true
 
-  "fetch and build OpenSSL" :
+  "fetch and build OpenSSL":
     command: shell.exec
     params:
-        working_dir:  src
+        working_dir: src
         script: |
             set -o errexit
             set -o verbose
@@ -749,7 +752,7 @@ functions:
                 bash buildscripts/fetch_and_build_openssl.sh "${python|python}" "${openssl_make_flags|}" "${openssl_config_flags|}"
             fi
 
-  "use WiredTiger develop" :
+  "use WiredTiger develop":
     command: shell.exec
     params:
       working_dir: src
@@ -788,7 +791,7 @@ functions:
         export artifactory_mobile_pass=${artifactory_mobile_pass}
         EOF
 
-  "setup android toolchain" :
+  "setup android toolchain":
     command: shell.exec
     params:
       script: |
@@ -810,56 +813,57 @@ functions:
         # If the android toolchain has not been setup the android sdk will not
         # be available and we should not build the android version of mongodb
         # embedded.
-        if [ "${setup_android_toolchain|}" = "true" ]; then
-            export ANDROID_HOME=$(pwd)/android_sdk
-
-            cd src/src/mongo/embedded/mongo_embedded/java
-
-            # TODO: Clean this up later where we can remove duplication
-            if [ ${package_type|embedded-android} = "embedded-jar" ]; then
-                tar zxvf ../../../../../../embedded-sdk-java-linux-x86-64.tgz
-                mkdir -p jniLibs/linux-x86-64
-                cp ./mongo-embedded-sdk-${version}/lib/libmongo_embedded.so jniLibs/linux-x86-64
-                rm -rf ./mongo-embedded-sdk-${version}
-
-                tar zxvf ../../../../../../embedded-sdk-java-darwin.tgz
-                mkdir -p jniLibs/darwin
-                cp ./mongo-embedded-sdk-${version}/lib/libmongo_embedded.dylib jniLibs/darwin
-                rm -rf ./mongo-embedded-sdk-${version}
-
-                ./gradlew clean :embedded-jar:build :embedded-jar:publishMavenPublicationToLocalRepository
-
-                # Is this a release?
-                if [ "${is_release|false}" = "true" ]; then
-                    echo "Releases disabled on master."
-                    #source ./artifactory_mobile_creds.sh
-                    #./gradlew --info :embedded-jar:artifactoryPublish
-                fi
-
-
-                mkdir -p ../../../../../build/mongo-embedded-sdk-${version}/java
-                cp -r embedded-jar/build/repo/* ../../../../../build/mongo-embedded-sdk-${version}/java
-            else
-                for arch in arm64-v8a armeabi-v7a x86_64 ; do
-                    tar zxvf ../../../../../../embedded-sdk-android-$arch.tgz
-                    mkdir -p jniLibs/$arch
-                    cp ./mongo-embedded-sdk-${version}/lib/libmongo_embedded.so jniLibs/$arch
-                    rm -rf ./mongo-embedded-sdk-${version}
-                done
-
-                ./gradlew clean :embedded-android:build
-                # Is this a release?
-                if [ "${is_release|false}" = "true" ]; then
-                    echo "Releases disabled on master."
-                    #./gradlew :embedded-android:uploadArchives closeAndReleaseRepository
-                fi
-
-                mkdir -p ../../../../../build/mongo-embedded-sdk-${version}/android
-                cp -r embedded-android/build/repo/* ../../../../../build/mongo-embedded-sdk-${version}/android
-            fi
+        if [ "${setup_android_toolchain|}" != "true" ]; then
+            echo "Android toolchain has not been setup, skipping \"build java embedded sdk\""
+            exit 0
         fi
 
-  "shared scons cache pruning" :
+        export ANDROID_HOME=$(pwd)/android_sdk
+        MINOR_VER=$(echo "${version}" | awk -F. '{print $(NF-1)}')
+        if [ $(($MINOR_VER % 2)) != 0 ]; then
+            EMBEDDED_RELEASE_VERSION="${version}-SNAPSHOT"
+        else
+            EMBEDDED_RELEASE_VERSION="${version}"
+        fi
+
+
+        cd src/src/mongo/embedded/mongo_embedded/java
+
+        # TODO: Clean this up later where we can remove duplication
+        if [ ${package_type|embedded-android} = "embedded-jar" ]; then
+            tar zxvf ../../../../../../embedded-sdk-java-linux-x86-64.tgz
+            mkdir -p jniLibs/linux-x86-64
+            cp ./mongo-embedded-sdk-$EMBEDDED_RELEASE_VERSION/lib/libmongo_embedded.so jniLibs/linux-x86-64
+            rm -rf ./mongo-embedded-sdk-$EMBEDDED_RELEASE_VERSION
+
+            tar zxvf ../../../../../../embedded-sdk-java-darwin.tgz
+            mkdir -p jniLibs/darwin
+            cp ./mongo-embedded-sdk-$EMBEDDED_RELEASE_VERSION/lib/libmongo_embedded.dylib jniLibs/darwin
+            rm -rf ./mongo-embedded-sdk-$EMBEDDED_RELEASE_VERSION
+
+            ./gradlew clean :embedded-jar:build :embedded-jar:publishMavenPublicationToLocalRepository
+
+            mkdir -p ../../../../../build/mongo-embedded-sdk-$EMBEDDED_RELEASE_VERSION/java
+            cp -r embedded-jar/build/repo/* ../../../../../build/mongo-embedded-sdk-$EMBEDDED_RELEASE_VERSION/java
+        else
+            for arch in arm64-v8a armeabi-v7a x86_64 ; do
+                tar zxvf ../../../../../../embedded-sdk-android-$arch.tgz
+                mkdir -p jniLibs/$arch
+                cp ./mongo-embedded-sdk-$EMBEDDED_RELEASE_VERSION/lib/libmongo_embedded.so jniLibs/$arch
+                rm -rf ./mongo-embedded-sdk-$EMBEDDED_RELEASE_VERSION
+            done
+
+            ./gradlew clean :embedded-android:build
+            # Is this a release?
+            if [ "${is_release|false}" = "true" ]; then
+                ./gradlew :embedded-android:uploadArchives closeAndReleaseRepository
+            fi
+
+            mkdir -p ../../../../../build/mongo-embedded-sdk-$EMBEDDED_RELEASE_VERSION/android
+            cp -r embedded-android/build/repo/* ../../../../../build/mongo-embedded-sdk-$EMBEDDED_RELEASE_VERSION/android
+        fi
+
+  "shared scons cache pruning":
     command: shell.exec
     type: system
     params:
@@ -916,7 +920,7 @@ functions:
           echo "Not on master, shared SCons cache pruning skipped"
         fi
 
-  "scons cache pruning" :
+  "scons cache pruning":
     command: shell.exec
     params:
       working_dir: src
@@ -931,7 +935,7 @@ functions:
           $python buildscripts/scons_cache_prune.py --cache-dir ${scons_cache_path} --cache-size ${scons_cache_size|200} --prune-ratio ${scons_prune_ratio|0.8}
         fi
 
-  "umount shared scons directory" :
+  "umount shared scons directory":
     command: shell.exec
     params:
       working_dir: src
@@ -944,7 +948,7 @@ functions:
             $sudo umount /efs || true
         fi
 
-  "build new tools" :
+  "build new tools":
     command: shell.exec
     params:
       working_dir: src/src/mongo/gotools/src/github.com/mongodb/mongo-tools
@@ -974,7 +978,7 @@ functions:
             "../../../../../../mongo-tools/$i${exe|}" --version
         done
 
-  "get modified patch files" :
+  "get modified patch files":
     command: shell.exec
     params:
       working_dir: src
@@ -995,7 +999,7 @@ functions:
           fi
         fi
 
-  "install pip requirements" : &install_pip_requirements
+  "install pip requirements": &install_pip_requirements
     command: shell.exec
     params:
       working_dir: src
@@ -1007,7 +1011,7 @@ functions:
         ${activate_virtualenv}
         python2 -m pip install -r etc/pip/evgtest-requirements.txt
 
-  "determine resmoke jobs" : &determine_resmoke_jobs
+  "determine resmoke jobs": &determine_resmoke_jobs
     command: shell.exec
     params:
       working_dir: src
@@ -1024,13 +1028,13 @@ functions:
           --jobsMax ${resmoke_jobs_max|0}                   \
           --outFile resmoke_jobs_expansion.yml
 
-  "update resmoke jobs expansions" : &update_resmoke_jobs_expansions
+  "update resmoke jobs expansions": &update_resmoke_jobs_expansions
     command: expansions.update
     params:
       ignore_missing_file: true
       file: src/resmoke_jobs_expansion.yml
 
-  "determine task timeout" : &determine_task_timeout
+  "determine task timeout": &determine_task_timeout
     command: shell.exec
     params:
       working_dir: src
@@ -1046,24 +1050,24 @@ functions:
           --timeout ${timeout_secs|0}                  \
           --out-file task_timeout_expansions.yml
 
-  "update task timeout expansions" : &update_task_timeout_expansions
+  "update task timeout expansions": &update_task_timeout_expansions
     command: expansions.update
     params:
       ignore_missing_file: true
       file: src/task_timeout_expansions.yml
 
-  "update task timeout" : &update_task_timeout
+  "update task timeout": &update_task_timeout
     command: timeout.update
     params:
       timeout_secs: ${timeout_secs}
 
-  "update bypass expansions" : &update_bypass_expansions
+  "update bypass expansions": &update_bypass_expansions
     command: expansions.update
     params:
       ignore_missing_file: true
       file: src/bypass_compile_expansions.yml
 
-  "bypass compile and fetch binaries" :
+  "bypass compile and fetch binaries":
     command: shell.exec
     params:
       continue_on_err: true
@@ -1085,13 +1089,13 @@ functions:
             --jsonArtifact artifacts.json
         fi
 
-  "send benchmark results" :
+  "send benchmark results":
     command: json.send
     params:
       name: perf
       file: src/perf.json
 
-  "do setup" :
+  "do setup":
   - *fetch_artifacts
   - *update_bypass_expansions
   - *fetch_binaries
@@ -1103,21 +1107,21 @@ functions:
   - *monitor_process_threads
   - *collect_system_resource_info
 
-  "do benchmark setup" :
+  "do benchmark setup":
   - *git_get_project
   - *update_bypass_expansions
   - *get_buildnumber
   - *set_up_credentials
   - *fetch_benchmarks
 
-  "do benchmark embedded setup" :
+  "do benchmark embedded setup":
   - *git_get_project
   - *fetch_artifacts
   - *get_buildnumber
   - *set_up_credentials
   - *fetch_benchrun_embedded_files
 
-  "set up virtualenv" :
+  "set up virtualenv":
     command: shell.exec
     type: test
     params:
@@ -1154,7 +1158,7 @@ functions:
           if [[ ! -f $venv2_bin/python2 ]]; then ln -sfv "$py2_exe" "$venv2_bin/python2"; fi
           if [[ ! -f $venv2_bin/python3 ]]; then ln -sfv "$py3_exe" "$venv2_bin/python3"; fi
 
-  "execute resmoke tests" : &execute_resmoke_tests
+  "execute resmoke tests": &execute_resmoke_tests
     command: shell.exec
     type: test
     params:
@@ -1358,7 +1362,7 @@ functions:
         files:
           - src/generated_resmoke_config/${task}.json
 
-  "run generated tests" :
+  "run generated tests":
   - *install_pip_requirements
   - *retrieve_generated_test_configuration
   - *extract_generated_test_configuration
@@ -1388,7 +1392,7 @@ functions:
           exit $(cat run_tests_infrastructure_failure)
         fi
 
-  "run tests" :
+  "run tests":
     - *install_pip_requirements
     - *determine_task_timeout
     - *update_task_timeout_expansions
@@ -1419,7 +1423,7 @@ functions:
             exit $(cat run_tests_infrastructure_failure)
           fi
 
-  "scons compile" :
+  "scons compile":
     command: shell.exec
     type: test
     params:
@@ -1461,7 +1465,7 @@ functions:
         fi
         exit $exit_status
 
-  "generate compile expansions" :
+  "generate compile expansions":
     command: shell.exec
     params:
       working_dir: src
@@ -1520,12 +1524,12 @@ functions:
           MONGO_VERSION=$MONGO_VERSION SCONS_CACHE_MODE=${scons_cache_mode|nolinked} USE_SCONS_CACHE=${use_scons_cache|false} $python buildscripts/generate_compile_expansions.py --out compile_expansions.yml
         fi
 
-  "apply compile expansions" :
+  "apply compile expansions":
     command: expansions.update
     params:
       file: src/compile_expansions.yml
 
-  "do jepsen setup" :
+  "do jepsen setup":
     - command: shell.exec
       params:
         working_dir: src
@@ -1562,7 +1566,7 @@ functions:
           ${activate_virtualenv}
           $python -c 'import socket; num_nodes = 5; print("\n".join(["%s:%d" % (socket.gethostname(), port) for port in range(20000, 20000 + num_nodes)]))' > nodes.txt
 
-  "run jepsen test" :
+  "run jepsen test":
     - command: shell.exec
       type: test
       timeout_secs: 2700 # Timeout test if there is no output for more than 45 minutes.
@@ -1753,7 +1757,7 @@ functions:
         content_type: ${content_type|application/gzip}
         display_name: Generated Tests - Execution ${execution}
 
-  "run idl tests" :
+  "run idl tests":
     - command: shell.exec
       type: test
       params:
@@ -1766,7 +1770,7 @@ functions:
           $python -m pip install -r etc/pip/evgtest-requirements.txt
           $python buildscripts/idl/run_tests.py
 
-  "run powercycle test" :
+  "run powercycle test":
     - command: shell.exec
       type: test
       params:
@@ -1889,7 +1893,7 @@ functions:
           exit $exit_code
 
 
-  "do multiversion setup" :
+  "do multiversion setup":
     command: shell.exec
     params:
       working_dir: src
@@ -1908,9 +1912,9 @@ functions:
           --edition ${multiversion_edition|base}             \
           --platform ${multiversion_platform|linux}          \
           --architecture ${multiversion_architecture|x86_64} \
-          --useLatest 3.2 3.4 3.6 4.0 4.0.1
+          --useLatest 3.2 3.4 3.6 4.0 4.0.1 4.0.5
 
-  "do snmp setup" :
+  "do snmp setup":
     command: shell.exec
     params:
       working_dir: src
@@ -1921,7 +1925,7 @@ functions:
         mkdir -p snmpconf
         cp -f src/mongo/db/modules/enterprise/docs/mongod.conf.master snmpconf/mongod.conf
 
-  "do watchdog setup" :
+  "do watchdog setup":
     command: shell.exec
     params:
       working_dir: src
@@ -1931,7 +1935,7 @@ functions:
 
         bash src/mongo/db/modules/enterprise/jstests/watchdog/charybdefs_setup.sh
 
-  "cleanup environment" :
+  "cleanup environment":
     command: shell.exec
     params:
       script: |
@@ -1939,7 +1943,7 @@ functions:
 
         rm -rf src /data/db/* mongo-diskstats* mongo-*.tgz ~/.aws ~/.boto venv
 
-  "kill processes" :
+  "kill processes":
     command: shell.exec
     params:
       silent: true
@@ -1989,6 +1993,8 @@ functions:
         do
           kill_process "$process"
         done
+
+        exit 0
 
   "run kitchen":
     command: shell.exec
@@ -2770,6 +2776,8 @@ functions:
           fi
       - key: mongo_binaries
         value: ${project}/${build_variant}/${revision}/binaries/mongo-${build_id}.${ext|tgz}
+      - key: mongo_cryptd
+        value: ${project}/${build_variant}/${revision}/binaries/mongo-cryptd-${build_id}.${ext|tgz}
       - key: mongo_debugsymbols
         value: ${project}/${build_variant}/${revision}/debugsymbols/debugsymbols-${build_id}.${ext|tgz}
       - key: mongo_shell
@@ -3333,7 +3341,7 @@ tasks:
     - func: "build new tools"
     - func: "scons compile"
       vars:
-        targets: core tools dbtest integration_tests dist dist-debugsymbols distsrc-${ext|tgz} ${msi_target|}
+        targets: core tools integration_tests dist dist-debugsymbols distsrc-${ext|tgz} ${msi_target|}
         task_compile_flags: >-
           --use-new-tools
           --build-mongoreplay="${build_mongoreplay}"
@@ -3378,7 +3386,6 @@ tasks:
           # before tarring them up
           if [ -x ${strip_path|/usr/bin/strip} ]; then
             cat build/integration_tests.txt | xargs ${strip_command|/usr/bin/strip}
-            ${strip_command|/usr/bin/strip} dbtest
             ${strip_command|/usr/bin/strip} mongobridge
             ${strip_command|/usr/bin/strip} wt
           fi
@@ -3409,6 +3416,16 @@ tasks:
           $python ../buildscripts/make_archive.py -o mongodb-shell.${ext|tgz} $(find mongodb-* -type f)
           cd ..
 
+          # Create separate cryptd archive if mongocryptd is in the tarball
+          mkdir -p cryptd-archive/build
+          cd cryptd-archive
+          ${platform_decompress|tar xzvf} ../mongodb-binaries.tgz
+          find . -mindepth 3 ! -name "mongocryptd${exe}" -type f -exec rm {} \; # delete bin/* except bin/mongocryptd
+          if [ $(find . -name mongocryptd | wc -l) -eq 1 ] ; then
+            $python ../buildscripts/make_archive.py -o mongodb-cryptd.${ext|tgz} $(find mongodb-* -type f)
+          fi
+          cd ..
+
   # Test lifecycle is temporarily disabled to reduce load on Evergreen API.
   # - func: "fetch test_lifecycle.yml"
   #   vars:
@@ -3428,7 +3445,6 @@ tasks:
           - "jstests/**"
           - "pytests/**"
           - "./test*"
-          - "./dbtest*"
           - "./mongobridge*"
           - "./mongoebench*"
           - "./mongoed*"
@@ -3473,6 +3489,17 @@ tasks:
         optional: true
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
+        local_file: src/cryptd-archive/mongodb-cryptd.tgz
+        remote_file: ${mongo_cryptd}
+        bucket: mciuploads
+        permissions: public-read
+        content_type: ${content_type|application/gzip}
+        display_name: CryptD Binaries
+    - command: s3.put
+      params:
+        optional: true
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
         local_file: src/shell-archive/mongodb-shell.${ext|tgz}
         remote_file: ${mongo_shell}
         bucket: mciuploads
@@ -3501,7 +3528,7 @@ tasks:
         display_name: Source tarball
         # We only need to upload the source tarball from one of the build variants
         # because it should be the same everywhere, so just use rhel70/windows-64-2k8-ssl.
-        build_variants: [ rhel70, windows-64-2k8-ssl ]
+        build_variants: [rhel70, windows-64-2k8-ssl]
     - command: s3.put
       params:
         optional: true
@@ -3509,7 +3536,7 @@ tasks:
         aws_secret: ${aws_secret}
         local_file: src/scons_cache.log
         content_type: text/plain
-        remote_file: ${project}/${build_variant}/${revision}/cache.log
+        remote_file: ${project}/${build_variant}/${revision}/scons-cache-${build_id}-${execution}.log
         bucket: mciuploads
         permissions: public-read
         display_name: SCons cache debug log
@@ -3949,7 +3976,7 @@ tasks:
     - name: embedded_sdk_s3_put
       variant: embedded-sdk-ubuntu-1604-x86_64
     - name: embedded_sdk_s3_put
-      variant: embedded-sdk-macosx-10.11
+      variant: embedded-sdk-macos
   commands:
     - command: manifest.load
     - func: "git get project"
@@ -3970,7 +3997,7 @@ tasks:
       params:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
-        remote_file: ${project}/embedded-sdk/embedded-sdk-macosx-10.11/${revision}/mongo-embedded-sdk-${version}.tgz
+        remote_file: ${project}/embedded-sdk/embedded-sdk-macos/${revision}/mongo-embedded-sdk-${version}.tgz
         bucket: mciuploads
         local_file: "embedded-sdk-java-darwin.tgz"
     - func: "setup gradle signing keys"
@@ -4026,19 +4053,19 @@ tasks:
 - name: embedded_sdk_multiarch_apple_package
   depends_on:
     - name: embedded_sdk_s3_put
-      variant: embedded-sdk-macosx-10.11
+      variant: embedded-sdk-macos
     - name: embedded_sdk_s3_put
-      variant: embedded-sdk-iphoneos-11.0
+      variant: embedded-sdk-iphoneos
     - name: embedded_sdk_s3_put
-      variant: embedded-sdk-iphonesimulator-11.0
+      variant: embedded-sdk-iphonesimulator
     - name: embedded_sdk_s3_put
-      variant: embedded-sdk-appletvos-10.2
+      variant: embedded-sdk-appletvos
     - name: embedded_sdk_s3_put
-      variant: embedded-sdk-appletvsimulator-10.2
+      variant: embedded-sdk-appletvsimulator
     - name: embedded_sdk_s3_put
-      variant: embedded-sdk-watchos-4.2
+      variant: embedded-sdk-watchos
     - name: embedded_sdk_s3_put
-      variant: embedded-sdk-watchsimulator-4.2
+      variant: embedded-sdk-watchsimulator
 
   commands:
     - command: manifest.load
@@ -4053,7 +4080,7 @@ tasks:
       params:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
-        remote_file: ${project}/embedded-sdk/embedded-sdk-macosx-10.11/${revision}/mongo-embedded-sdk-${version}.tgz
+        remote_file: ${project}/embedded-sdk/embedded-sdk-macos/${revision}/mongo-embedded-sdk-${version}.tgz
         bucket: mciuploads
         local_file: "mongo-embedded-sdk-${version}/MacOS/embedded-sdk.tgz"
 
@@ -4061,7 +4088,7 @@ tasks:
       params:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
-        remote_file: ${project}/embedded-sdk/embedded-sdk-iphoneos-11.0/${revision}/mongo-embedded-sdk-${version}.tgz
+        remote_file: ${project}/embedded-sdk/embedded-sdk-iphoneos/${revision}/mongo-embedded-sdk-${version}.tgz
         bucket: mciuploads
         local_file: "mongo-embedded-sdk-${version}/iPhoneOS/embedded-sdk.tgz"
 
@@ -4069,7 +4096,7 @@ tasks:
       params:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
-        remote_file: ${project}/embedded-sdk/embedded-sdk-iphonesimulator-11.0/${revision}/mongo-embedded-sdk-${version}.tgz
+        remote_file: ${project}/embedded-sdk/embedded-sdk-iphonesimulator/${revision}/mongo-embedded-sdk-${version}.tgz
         bucket: mciuploads
         local_file: "mongo-embedded-sdk-${version}/iPhoneSimulator/embedded-sdk.tgz"
 
@@ -4077,7 +4104,7 @@ tasks:
       params:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
-        remote_file: ${project}/embedded-sdk/embedded-sdk-appletvos-10.2/${revision}/mongo-embedded-sdk-${version}.tgz
+        remote_file: ${project}/embedded-sdk/embedded-sdk-appletvos/${revision}/mongo-embedded-sdk-${version}.tgz
         bucket: mciuploads
         local_file: "mongo-embedded-sdk-${version}/AppleTVOS/embedded-sdk.tgz"
 
@@ -4085,7 +4112,7 @@ tasks:
       params:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
-        remote_file: ${project}/embedded-sdk/embedded-sdk-appletvsimulator-10.2/${revision}/mongo-embedded-sdk-${version}.tgz
+        remote_file: ${project}/embedded-sdk/embedded-sdk-appletvsimulator/${revision}/mongo-embedded-sdk-${version}.tgz
         bucket: mciuploads
         local_file: "mongo-embedded-sdk-${version}/AppleTVSimulator/embedded-sdk.tgz"
 
@@ -4093,7 +4120,7 @@ tasks:
       params:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
-        remote_file: ${project}/embedded-sdk/embedded-sdk-watchos-4.2/${revision}/mongo-embedded-sdk-${version}.tgz
+        remote_file: ${project}/embedded-sdk/embedded-sdk-watchos/${revision}/mongo-embedded-sdk-${version}.tgz
         bucket: mciuploads
         local_file: "mongo-embedded-sdk-${version}/WatchOS/embedded-sdk.tgz"
 
@@ -4101,7 +4128,7 @@ tasks:
       params:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
-        remote_file: ${project}/embedded-sdk/embedded-sdk-watchsimulator-4.2/${revision}/mongo-embedded-sdk-${version}.tgz
+        remote_file: ${project}/embedded-sdk/embedded-sdk-watchsimulator/${revision}/mongo-embedded-sdk-${version}.tgz
         bucket: mciuploads
         local_file: "mongo-embedded-sdk-${version}/WatchSimulator/embedded-sdk.tgz"
 
@@ -4390,7 +4417,7 @@ tasks:
 
           if [ "${is_release|false}" != "true" ]; then
               echo "Not a release build"
-              exit 0 
+              exit 0
           fi
 
           sed s/@VERSION@/1.13.0/g src/src/mongo/embedded/mongoc_embedded/mongo-embedded-c-driver.podspec.in | tee mongo-embedded-c-driver.podspec
@@ -4420,6 +4447,10 @@ tasks:
           --prefix='$BUILD_ROOT/stitch-support-lib-$MONGO_VERSION'
           --dbg=off
           --link-model=dynamic-sdk
+          --enable-free-mon=off
+          --ssl=off
+          --enable-http-client=off
+          --modules=
     - command: shell.exec
       params:
         working_dir: "src/build"
@@ -4526,6 +4557,23 @@ tasks:
           echo "Found mypy executable at '$MYPY'"
           ${compile_env|} python2 ./buildscripts/scons.py ${compile_flags|} --stack-size=1024 lint
 
+- name: lint_yaml
+  depends_on: []
+  commands:
+  - command: manifest.load
+  - func: "git get project"
+  - command: shell.exec
+    type: test
+    params:
+      working_dir: src
+      script: |
+        set -o errexit
+        set -o verbose
+
+        ${activate_virtualenv}
+        python -m pip install -I -r etc/pip/lint-requirements.txt
+        find buildscripts etc jstests -name '*.y*ml' -exec yamllint -c etc/yamllint_config.yml {} +
+
 - name: verify_pip
   depends_on: []
   commands:
@@ -4588,11 +4636,9 @@ tasks:
         if [ "${is_patch}" != "true" ]; then
           burn_in_args="--checkEvergreen"
         fi
-        # Copy the dbtest executable from the src dir because burn_in_tests.py calls it to get the
-        # list of dbtest suites.
-        cp ../src/dbtest${exe} .
         pushd ../src
         ${activate_virtualenv}
+        $python -m pip install -r etc/pip/evgtest-requirements.txt
         popd
         # Capture a list of new and modified tests.
         build_variant=${build_variant}
@@ -5231,224 +5277,6 @@ tasks:
     vars:
       resmoke_args: --suites=audit --storageEngine=wiredTiger
 
-- <<: *task_template
-  name: auth
-  commands:
-    - func: "do setup"
-    - func: "run tests"
-      vars:
-        resmoke_args: --suites=auth --storageEngine=wiredTiger
-
-- <<: *task_template
-  name: causally_consistent_jscore_passthrough
-  depends_on:
-    - name: jsCore
-  commands:
-    - func: "do setup"
-    - func: "run tests"
-      vars:
-        resmoke_args: --suites=causally_consistent_jscore_passthrough --storageEngine=wiredTiger
-
-- <<: *task_template
-  name: causally_consistent_jscore_passthrough_auth
-  depends_on:
-    - name: jsCore
-  commands:
-    - func: "do setup"
-    - func: "run tests"
-      vars:
-        resmoke_args: --suites=causally_consistent_jscore_passthrough_auth --storageEngine=wiredTiger
-
-- <<: *task_template
-  name: sharded_causally_consistent_jscore_passthrough
-  depends_on:
-    - name: jsCore
-  commands:
-    - func: "do setup"
-    - func: "run tests"
-      vars:
-        resmoke_args: --suites=sharded_causally_consistent_jscore_passthrough --storageEngine=wiredTiger
-
-- <<: *task_template
-  name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
-  depends_on:
-    - name: jsCore
-  commands:
-    - func: "do setup"
-    - func: "run tests"
-      vars:
-        resmoke_args: --suites=logical_session_cache_sharding_1sec_refresh_jscore_passthrough --storageEngine=wiredTiger
-
-- <<: *task_template
-  name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
-  depends_on:
-    - name: jsCore
-  commands:
-    - func: "do setup"
-    - func: "run tests"
-      vars:
-        resmoke_args: --suites=logical_session_cache_replication_1sec_refresh_jscore_passthrough --storageEngine=wiredTiger
-
-- <<: *task_template
-  name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
-  depends_on:
-    - name: jsCore
-  commands:
-    - func: "do setup"
-    - func: "run tests"
-      vars:
-        resmoke_args: --suites=logical_session_cache_standalone_1sec_refresh_jscore_passthrough --storageEngine=wiredTiger
-
-- <<: *task_template
-  name: multi_shard_multi_stmt_txn_jscore_passthrough
-  depends_on:
-    - name: jsCore
-  commands:
-    - func: "do setup"
-    - func: "run tests"
-      vars:
-        resmoke_args: --suites=multi_shard_multi_stmt_txn_jscore_passthrough --storageEngine=wiredTiger
-
-- <<: *task_template
-  name: multi_stmt_txn_jscore_passthrough_with_migration
-  depends_on:
-    - name: jsCore
-  commands:
-    - func: "do setup"
-    - func: "run tests"
-      vars:
-        resmoke_args: --suites=multi_stmt_txn_jscore_passthrough_with_migration --storageEngine=wiredTiger
-
-- <<: *task_template
-  name: noPassthrough
-  commands:
-    - func: "do setup"
-    - func: "run tests"
-      vars:
-        resmoke_args: --suites=no_passthrough --storageEngine=wiredTiger
-
-- <<: *task_template
-  name: noPassthroughWithMongod
-  commands:
-    - func: "do setup"
-    - func: "run tests"
-      vars:
-        resmoke_args: --suites=no_passthrough_with_mongod --storageEngine=wiredTiger
-
-- <<: *task_template
-  name: read_concern_majority_passthrough
-  commands:
-    - func: "do setup"
-    - func: "run tests"
-      vars:
-        resmoke_args: --suites=read_concern_majority_passthrough --storageEngine=wiredTiger
-
-- <<: *task_template
-  name: retryable_writes_jscore_passthrough
-  commands:
-    - func: "do setup"
-    - func: "run tests"
-      vars:
-        resmoke_args: --suites=retryable_writes_jscore_passthrough --storageEngine=wiredTiger
-
-- <<: *task_template
-  name: ssl
-  commands:
-    - func: "do setup"
-    - func: "run tests"
-      vars:
-        resmoke_args: --suites=ssl --storageEngine=wiredTiger
-
-- <<: *task_template
-  name: sslSpecial
-  commands:
-    - func: "do setup"
-    - func: "run tests"
-      vars:
-        resmoke_args: --suites=ssl_special --storageEngine=wiredTiger
-
-- <<: *task_template
-  name: slow1
-  commands:
-    - func: "do setup"
-    - func: "run tests"
-      vars:
-        resmoke_args: --suites=slow1 --storageEngine=wiredTiger
-
-- <<: *task_template
-  name: concurrency_sharded_causal_consistency
-  commands:
-    - func: "do setup"
-    - func: "run tests"
-      vars:
-        resmoke_args: --suites=concurrency_sharded_causal_consistency --storageEngine=wiredTiger
-        resmoke_jobs_max: 1
-
-- <<: *task_template
-  name: parallel
-  depends_on:
-  - name: jsCore
-  commands:
-    - func: "do setup"
-    - func: "run tests"
-      vars:
-        resmoke_args: --suites=parallel --storageEngine=wiredTiger
-        resmoke_jobs_max: 1
-
-- <<: *task_template
-  name: replica_sets_multi_stmt_txn_stepdown_jscore_passthrough
-  depends_on:
-    - name: jsCore
-  commands:
-    - func: "do setup"
-    - func: "run tests"
-      vars:
-        resmoke_args: --suites=replica_sets_multi_stmt_txn_stepdown_jscore_passthrough --storageEngine=wiredTiger
-
-- <<: *task_template
-  name: sharded_causally_consistent_jscore_txns_passthrough
-  depends_on:
-    - name: jsCore
-  commands:
-    - func: "do setup"
-    - func: "run tests"
-      vars:
-        resmoke_args: --suites=sharded_causally_consistent_jscore_txns_passthrough --storageEngine=wiredTiger
-
-- <<: *task_template
-  name: sharding_jscore_passthrough_wire_ops
-  depends_on:
-    - name: jsCore
-  commands:
-    - func: "do setup"
-    - func: "run tests"
-      vars:
-        resmoke_args: --suites=sharding_jscore_passthrough --storageEngine=wiredTiger --shellReadMode=legacy --shellWriteMode=compatibility --excludeWithAnyTags=requires_find_command
-
-- <<: *task_template
-  name: auth_audit
-  commands:
-    - func: "do setup"
-    - func: "run tests"
-      vars:
-        resmoke_args: --suites=auth_audit --storageEngine=wiredTiger
-
-- <<: *task_template
-  name: sharding_auth
-  commands:
-    - func: "do setup"
-    - func: "run tests"
-      vars:
-        resmoke_args: --suites=sharding_auth --storageEngine=wiredTiger
-
-- <<: *task_template
-  name: sharding_auth_audit
-  commands:
-    - func: "do setup"
-    - func: "run tests"
-      vars:
-        resmoke_args: --suites=sharding_auth_audit --storageEngine=wiredTiger
-
 - name: auth_gen
   commands:
   - func: "generate resmoke tasks"
@@ -5741,7 +5569,7 @@ tasks:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=core --mongod=./mongoed --excludeWithAnyTags=requires_scripting,requires_auth,requires_sharding,does_not_support_stepdowns,requires_background_index,requires_ttl_index,incompatible_with_embedded,incompatible_with_embedded_todo_investigate,requires_replication,requires_capped,requires_profiling,requires_javascript,requires_fsync,requires_compact
+      resmoke_args: --suites=core --mongod=./mongoed --excludeWithAnyTags=requires_scripting,requires_auth,requires_sharding,does_not_support_stepdowns,requires_background_index,requires_ttl_index,incompatible_with_embedded,incompatible_with_embedded_todo_investigate,requires_replication,requires_capped,requires_profiling,requires_javascript,requires_fsync,requires_compact,requires_snapshot_read
 
 - <<: *task_template
   name: jsCore_ese
@@ -5802,12 +5630,28 @@ tasks:
       resmoke_args: --suites=core_txns --storageEngine=wiredTiger
 
 - <<: *task_template
+  name: jsCore_txns_multi_oplog_entries
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=core_txns_multi_oplog_entries --storageEngine=wiredTiger
+
+- <<: *task_template
   name: sharded_jscore_txns
   commands:
   - func: "do setup"
   - func: "run tests"
     vars:
       resmoke_args: --suites=sharded_jscore_txns --storageEngine=wiredTiger
+
+- <<: *task_template
+  name: sharded_jscore_txns_without_snapshot
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharded_jscore_txns --storageEngine=wiredTiger --excludeWithAnyTags=uses_snapshot_read_concern
 
 - <<: *task_template
   name: sharded_jscore_txns_sharded_collections
@@ -5831,6 +5675,15 @@ tasks:
     vars:
       task: sharded_causally_consistent_jscore_txns_passthrough
       resmoke_args: --storageEngine=wiredTiger
+      fallback_num_sub_suites: 1
+
+- name: sharded_causally_consistent_jscore_txns_passthrough_without_snapshot_gen
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      task: sharded_causally_consistent_jscore_txns_passthrough_without_snapshot
+      suite: sharded_causally_consistent_jscore_txns_passthrough
+      resmoke_args: --storageEngine=wiredTiger --excludeWithAnyTags=uses_snapshot_read_concern
       fallback_num_sub_suites: 1
 
 - <<: *task_template
@@ -6110,6 +5963,18 @@ tasks:
   - func: "generate resmoke tasks"
     vars:
       task: multi_stmt_txn_jscore_passthrough_with_migration
+      depends_on: jsCore
+      use_large_distro: "true"
+      resmoke_args: --storageEngine=wiredTiger
+      fallback_num_sub_suites: 19
+
+- name: multi_shard_multi_stmt_txn_kill_primary_jscore_passthrough_gen
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      task: multi_shard_multi_stmt_txn_kill_primary_jscore_passthrough
       depends_on: jsCore
       use_large_distro: "true"
       resmoke_args: --storageEngine=wiredTiger
@@ -7045,6 +6910,14 @@ tasks:
         remote_file: ${mongo_shell}
         bucket: mciuploads
         local_file: src/mongo-shell.tgz
+    # Fetch mongocryptd
+    - command: s3.get
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        remote_file: ${mongo_cryptd}
+        bucket: mciuploads
+        local_file: src/mongo-cryptd.tgz
     # Fetch the sources (on relevant variants only)
     - command: s3.get
       params:
@@ -7053,7 +6926,7 @@ tasks:
         remote_file: ${project}/${build_variant}/${revision}/sources/mongo-src-${build_id}.${ext|tgz}
         bucket: mciuploads
         local_file: src/distsrc.${ext|tgz}
-        build_variants: [ rhel70, windows-64-2k8-ssl ]
+        build_variants: [rhel70, windows-64-2k8-ssl]
     - func: "apply compile expansions"
     - func: "fetch debugsymbols archive"
     - func: "set up remote credentials"
@@ -7072,11 +6945,12 @@ tasks:
 
           mv mongo-binaries.tgz mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz}
           mv mongo-shell.tgz mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz}
+          mv mongo-cryptd.tgz mongodb-cryptd-${push_name}-${push_arch}-${suffix}.${ext|tgz}
           mv mongo-debugsymbols.tgz mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz} || true
           mv distsrc.${ext|tgz} mongodb-src-${src_suffix}.${ext|tar.gz} || true
           /usr/bin/find build/ -type f | grep msi$ | xargs -I original_filename cp original_filename mongodb-win32-${push_arch}-${suffix}.msi || true
 
-          /usr/local/bin/notary-client.py --key-name "server-4.2" --auth-token-file ${workdir}/src/signing_auth_token --comment "Evergreen Automatic Signing ${revision} - ${build_variant} - ${branch_name}" --notary-url http://notary-service.build.10gen.cc:5000 --skip-missing mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz} mongodb-win32-${push_arch}-${suffix}.msi mongodb-src-${src_suffix}.${ext|tar.gz}
+          /usr/local/bin/notary-client.py --key-name "server-4.2" --auth-token-file ${workdir}/src/signing_auth_token --comment "Evergreen Automatic Signing ${revision} - ${build_variant} - ${branch_name}" --notary-url http://notary-service.build.10gen.cc:5000 --skip-missing mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz} mongodb-win32-${push_arch}-${suffix}.msi mongodb-src-${src_suffix}.${ext|tar.gz} mongodb-cryptd-${push_name}-${push_arch}-${suffix}.${ext|tgz}
 
     # Put the binaries tarball/zipfile
     - command: s3.put
@@ -7098,6 +6972,16 @@ tasks:
         permissions: public-read
         content_type: ${content_type|application/gzip}
         remote_file: ${push_path}-STAGE/${push_name}/mongodb-shell-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}
+    # Put the cryptd tarball/zipfile
+    - command: s3.put
+      params:
+        aws_secret: ${aws_secret}
+        local_file: src/mongodb-cryptd-${push_name}-${push_arch}-${suffix}.${ext|tgz}
+        aws_key: ${aws_key}
+        bucket: build-push-testing
+        permissions: public-read
+        content_type: ${content_type|application/gzip}
+        remote_file: ${push_path}-STAGE/${push_name}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}
     # Put the source tarball
     - command: s3.put
       params:
@@ -7108,7 +6992,7 @@ tasks:
         permissions: public-read
         content_type: ${content_type|application/gzip}
         remote_file: ${push_path}-STAGE/${push_name}/mongodb-src-${src_suffix}-${task_id}.${ext|tar.gz}
-        build_variants: [ rhel70, windows-64-2k8-ssl ]
+        build_variants: [rhel70, windows-64-2k8-ssl]
 
     # Put the debug symbols
     - command: s3.put
@@ -7144,6 +7028,17 @@ tasks:
         content_type: ${content_type|application/gzip}
         remote_file: ${push_path}-STAGE/${push_name}/mongodb-shell-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sig
 
+    # Put the cryptd tarball signature
+    - command: s3.put
+      params:
+        aws_secret: ${aws_secret}
+        local_file: src/mongodb-cryptd-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sig
+        aws_key: ${aws_key}
+        bucket: build-push-testing
+        permissions: public-read
+        content_type: ${content_type|application/gzip}
+        remote_file: ${push_path}-STAGE/${push_name}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sig
+
     # Put the source tarball signature
     - command: s3.put
       params:
@@ -7154,7 +7049,7 @@ tasks:
         permissions: public-read
         content_type: ${content_type|application/gzip}
         remote_file: ${push_path}-STAGE/${push_name}/mongodb-src-${src_suffix}-${task_id}.${ext|tar.gz}.sig
-        build_variants: [ rhel70, windows-64-2k8-ssl ]
+        build_variants: [rhel70, windows-64-2k8-ssl]
 
     # Put the debug symbols signature
     - command: s3.put
@@ -7202,6 +7097,17 @@ tasks:
         content_type: text/plain
         remote_file: ${push_path}-STAGE/${push_name}/mongodb-shell-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha1
 
+    # Put the cryptd tarball sha1
+    - command: s3.put
+      params:
+        aws_secret: ${aws_secret}
+        local_file: src/mongodb-cryptd-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sha1
+        aws_key: ${aws_key}
+        permissions: public-read
+        bucket: build-push-testing
+        content_type: text/plain
+        remote_file: ${push_path}-STAGE/${push_name}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha1
+
     # Put the source tarball sha1
     - command: s3.put
       params:
@@ -7212,7 +7118,7 @@ tasks:
         bucket: build-push-testing
         content_type: text/plain
         remote_file: ${push_path}-STAGE/${push_name}/mongodb-src-${src_suffix}-${task_id}.${ext|tar.gz}.sha1
-        build_variants: [ rhel70, windows-64-2k8-ssl ]
+        build_variants: [rhel70, windows-64-2k8-ssl]
 
     # Put the debug symbols sha1
     - command: s3.put
@@ -7260,6 +7166,17 @@ tasks:
         content_type: text/plain
         remote_file: ${push_path}-STAGE/${push_name}/mongodb-shell-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha256
 
+    # Put the cryptd tarball sha256
+    - command: s3.put
+      params:
+        aws_secret: ${aws_secret}
+        local_file: src/mongodb-cryptd-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sha256
+        permissions: public-read
+        aws_key: ${aws_key}
+        bucket: build-push-testing
+        content_type: text/plain
+        remote_file: ${push_path}-STAGE/${push_name}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha256
+
     # Put the source tarball sha256
     - command: s3.put
       params:
@@ -7270,7 +7187,7 @@ tasks:
         bucket: build-push-testing
         content_type: text/plain
         remote_file: ${push_path}-STAGE/${push_name}/mongodb-src-${src_suffix}-${task_id}.${ext|tar.gz}.sha256
-        build_variants: [ rhel70, windows-64-2k8-ssl ]
+        build_variants: [rhel70, windows-64-2k8-ssl]
 
     # Put the debug symbols sha256
     - command: s3.put
@@ -7318,6 +7235,17 @@ tasks:
         content_type: text/plain
         remote_file: ${push_path}-STAGE/${push_name}/mongodb-shell-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.md5
 
+    # Put the cryptd tarball md5
+    - command: s3.put
+      params:
+        aws_secret: ${aws_secret}
+        local_file: src/mongodb-cryptd-${push_name}-${push_arch}-${suffix}.${ext|tgz}.md5
+        aws_key: ${aws_key}
+        bucket: build-push-testing
+        permissions: public-read
+        content_type: text/plain
+        remote_file: ${push_path}-STAGE/${push_name}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.md5
+
     # Put the source tarball md5
     - command: s3.put
       params:
@@ -7328,7 +7256,7 @@ tasks:
         permissions: public-read
         content_type: text/plain
         remote_file: ${push_path}-STAGE/${push_name}/mongodb-src-${src_suffix}-${task_id}.${ext|tar.gz}.md5
-        build_variants: [ rhel70, windows-64-2k8-ssl ]
+        build_variants: [rhel70, windows-64-2k8-ssl]
 
     # Put the debug symbols md5
     - command: s3.put
@@ -7367,15 +7295,19 @@ tasks:
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-shell-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}', 'bucket': 'build-push-testing'},
                'destination': {'path': '${push_path}/mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz}', 'bucket': '${push_bucket}'}}
 
+            #Cryptd
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}', 'bucket': 'build-push-testing'},
+               'destination': {'path': '${push_path}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}.${ext|tgz}', 'bucket': '${push_bucket}'}}
+
             #Source tarball
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-src-${src_suffix}-${task_id}.${ext|tar.gz}', 'bucket': 'build-push-testing'},
                'destination': {'path': 'src/mongodb-src-${src_suffix}.${ext|tar.gz}', 'bucket': '${push_bucket}'},
-               'build_variants': [ 'rhel70', 'windows-64-2k8-ssl' ]}
+               'build_variants': ['rhel70', 'windows-64-2k8-ssl']}
 
             #MSI (Windows only)
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-win32-${push_arch}-${suffix}-${task_id}-signed.msi', 'bucket': 'build-push-testing'},
                'destination': {'path': '${push_path}/mongodb-win32-${push_arch}-${suffix}-signed.msi', 'bucket': '${push_bucket}'},
-               'build_variants': [ 'enterprise-windows-64-2k8', 'windows-64-2k8-ssl' ]}
+               'build_variants': ['enterprise-windows-64-2k8', 'windows-64-2k8-ssl']}
 
             #Binaries Signature
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sig', 'bucket': 'build-push-testing'},
@@ -7385,10 +7317,14 @@ tasks:
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-shell-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sig', 'bucket': 'build-push-testing'},
                'destination': {'path': '${push_path}/mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sig', 'bucket': '${push_bucket}'}}
 
+            #Cryptd Signature
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sig', 'bucket': 'build-push-testing'},
+               'destination': {'path': '${push_path}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sig', 'bucket': '${push_bucket}'}}
+
             #Source tarball signature
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-src-${src_suffix}-${task_id}.${ext|tar.gz}.sig', 'bucket': 'build-push-testing'},
                'destination': {'path': 'src/mongodb-src-${src_suffix}.${ext|tar.gz}.sig', 'bucket': '${push_bucket}'},
-               'build_variants': [ 'rhel70', 'windows-64-2k8-ssl' ]}
+               'build_variants': ['rhel70', 'windows-64-2k8-ssl']}
 
             #SHA1 for binaries
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha1', 'bucket': 'build-push-testing'},
@@ -7398,10 +7334,14 @@ tasks:
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-shell-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha1', 'bucket': 'build-push-testing'},
                'destination': {'path': '${push_path}/mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sha1', 'bucket': '${push_bucket}'}}
 
+            #SHA1 for cryptd
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha1', 'bucket': 'build-push-testing'},
+               'destination': {'path': '${push_path}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sha1', 'bucket': '${push_bucket}'}}
+
             #SHA1 for source tarball
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-src-${src_suffix}-${task_id}.${ext|tar.gz}.sha1', 'bucket': 'build-push-testing'},
                'destination': {'path': 'src/mongodb-src-${src_suffix}.${ext|tar.gz}.sha1', 'bucket': '${push_bucket}'},
-               'build_variants': [ 'rhel70', 'windows-64-2k8-ssl' ]}
+               'build_variants': ['rhel70', 'windows-64-2k8-ssl']}
 
             #SHA1 for MSI
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-win32-${push_arch}-${suffix}-${task_id}-signed.msi.sha1', 'bucket': 'build-push-testing'},
@@ -7416,10 +7356,14 @@ tasks:
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-shell-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha256', 'bucket': 'build-push-testing'},
                'destination': {'path': '${push_path}/mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sha256', 'bucket': '${push_bucket}'}}
 
+            #SHA256 for cryptd
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha256', 'bucket': 'build-push-testing'},
+               'destination': {'path': '${push_path}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sha256', 'bucket': '${push_bucket}'}}
+
             #SHA256 for source tarball
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-src-${src_suffix}-${task_id}.${ext|tar.gz}.sha256', 'bucket': 'build-push-testing'},
                'destination': {'path': 'src/mongodb-src-${src_suffix}.${ext|tar.gz}.sha256', 'bucket': '${push_bucket}'},
-               'build_variants': [ 'rhel70', 'windows-64-2k8-ssl' ]}
+               'build_variants': ['rhel70', 'windows-64-2k8-ssl']}
 
             #SHA256 for MSI files
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-win32-${push_arch}-${suffix}-${task_id}-signed.msi.sha256', 'bucket': 'build-push-testing'},
@@ -7434,15 +7378,19 @@ tasks:
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-shell-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.md5', 'bucket': 'build-push-testing'},
                'destination': {'path': '${push_path}/mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz}.md5', 'bucket': '${push_bucket}'}}
 
+            #MD5 for cryptd
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.md5', 'bucket': 'build-push-testing'},
+               'destination': {'path': '${push_path}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}.${ext|tgz}.md5', 'bucket': '${push_bucket}'}}
+
             #MD5 for source tarball
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-src-${src_suffix}-${task_id}.${ext|tar.gz}.md5', 'bucket': 'build-push-testing'},
                'destination': {'path': 'src/mongodb-src-${src_suffix}.${ext|tar.gz}.md5', 'bucket': '${push_bucket}'},
-               'build_variants': [ 'rhel70', 'windows-64-2k8-ssl' ]}
+               'build_variants': ['rhel70', 'windows-64-2k8-ssl']}
 
             #MD5 for MSIs
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-win32-${push_arch}-${suffix}-${task_id}-signed.msi.md5', 'bucket': 'build-push-testing'},
                'destination': {'path': '${push_path}/mongodb-win32-${push_arch}-${suffix}-signed.msi.md5', 'bucket': '${push_bucket}'},
-               'build_variants': ['enterprise-windows-64-2k8', 'windows-64-2k8-ssl'], }
+               'build_variants': ['enterprise-windows-64-2k8', 'windows-64-2k8-ssl']}
 
     # Debug symbols are not created for all variants and the copy is optional.
     - command: s3Copy.copy
@@ -7561,19 +7509,21 @@ task_groups:
   - dbtest
   - compile_all
 - name: embedded_sdk_build_and_test
+  setup_group_can_fail_task: true
   setup_group:
     - command: manifest.load
     - func: "git get project"
     - func: "get buildnumber"
     - func: "set up credentials"
     - func: "setup android toolchain" # noop if ${setup_android_toolchain} is not "true"
+    - func: "set up virtualenv"
+    - func: "set task expansion macros"
     - func: "install pip requirements"
     - func: "generate compile expansions"
   teardown_group:
     - func: "scons cache pruning"
     - func: "umount shared scons directory"
   setup_task:
-    - func: "set up virtualenv"
     - func: "set task expansion macros"
     - func: "apply compile expansions"
   teardown_task:
@@ -7770,6 +7720,7 @@ buildvariants:
   - name: jsCore_compatibility
   - name: jsCore_decimal
   - name: jsCore_txns
+  - name: jsCore_txns_multi_oplog_entries
   - name: causally_consistent_jscore_txns_passthrough
   - name: jsonSchema
   - name: logical_session_cache_replication_100ms_refresh_jscore_passthrough_gen
@@ -7790,6 +7741,7 @@ buildvariants:
   - name: multi_stmt_txn_jscore_passthrough_with_migration_gen
   - name: noPassthrough_gen
   - name: noPassthroughWithMongod_gen
+  - name: multi_shard_multi_stmt_txn_kill_primary_jscore_passthrough_gen
   - name: parallel_gen
   - name: parallel_compatibility
   - name: read_concern_linearizable_passthrough
@@ -7983,6 +7935,7 @@ buildvariants:
   - name: jsCore_compatibility
   - name: jsCore_decimal
   - name: jsCore_txns
+  - name: jsCore_txns_multi_oplog_entries
   - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_multiversion_fuzzer_gen
   - name: aggregation_wildcard_fuzzer_gen
@@ -8844,7 +8797,6 @@ buildvariants:
     packager_arch: s390x
     packager_distro: ubuntu1804
     repo_edition: org
-    scons_cache_scope: local
     tooltags: "ssl"
     build_mongoreplay: true
   display_tasks:
@@ -8889,7 +8841,6 @@ buildvariants:
     multiversion_platform: ubuntu1804
     multiversion_architecture: s390x
     multiversion_edition: enterprise
-    scons_cache_scope: local
   display_tasks:
   - *dbtest
   - *unittests
@@ -9415,10 +9366,10 @@ buildvariants:
   - name: aggregation_read_concern_majority_passthrough
   - name: aggregation_sharded_collections_passthrough
   - name: aggregation_expression_multiversion_fuzzer_gen
-  - name: auth
-  - name: causally_consistent_jscore_passthrough
-  - name: causally_consistent_jscore_passthrough_auth
-  - name: sharded_causally_consistent_jscore_passthrough
+  - name: auth_gen
+  - name: causally_consistent_jscore_passthrough_gen
+  - name: causally_consistent_jscore_passthrough_auth_gen
+  - name: sharded_causally_consistent_jscore_passthrough_gen
   - name: change_streams
   - name: change_streams_mongos_passthrough
   - name: change_streams_mongos_sessions_passthrough
@@ -9439,24 +9390,25 @@ buildvariants:
   - name: jsCore_compatibility
   - name: jsCore_decimal
   - name: jsCore_txns
+  - name: jsCore_txns_multi_oplog_entries
   - name: causally_consistent_jscore_txns_passthrough
   - name: jsonSchema
-  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
-  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
-  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_gen
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_gen
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_gen
   - name: mongosTest
-  - name: multi_shard_multi_stmt_txn_jscore_passthrough
-  - name: multi_stmt_txn_jscore_passthrough_with_migration
-  - name: noPassthrough
-  - name: noPassthroughWithMongod
+  - name: multi_shard_multi_stmt_txn_jscore_passthrough_gen
+  - name: multi_stmt_txn_jscore_passthrough_with_migration_gen
+  - name: noPassthrough_gen
+  - name: noPassthroughWithMongod_gen
   - name: rollback_fuzzer_gen
   - name: rollback_fuzzer_clean_shutdowns_gen
   - name: rollback_fuzzer_unclean_shutdowns_gen
   - name: bulk_gle_passthrough
-  - name: parallel
+  - name: parallel_gen
   - name: parallel_compatibility
-    # Some concurrency workloads require a lot of memory, so we use machines
-    # with more RAM for these suites.
+  # Some concurrency workloads require a lot of memory, so we use machines
+  # with more RAM for these suites.
   - name: concurrency
     distros:
     - windows-64-vs2017-compile
@@ -9472,22 +9424,22 @@ buildvariants:
   - name: concurrency_sharded_replication
     distros:
     - windows-64-vs2017-compile
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-    distros:
-    - windows-64-vs2017-compile
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
-    distros:
-    - windows-64-vs2017-compile
-  #- name: concurrency_sharded_replication_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-    distros:
-    - windows-64-vs2017-compile
-  #- name: concurrency_sharded_replication_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
-    distros:
-    - windows-64-vs2017-compile
+  # - name: concurrency_sharded_replication_local_read_write_multi_stmt_txn # Removed until SERVER-38499 is resolved.
+  #   distros:
+  #   - windows-64-vs2017-compile
+  # - name: concurrency_sharded_replication_local_read_write_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
+  #   distros:
+  #   - windows-64-vs2017-compile
+  # - name: concurrency_sharded_replication_multi_stmt_txn # Removed until SERVER-38499 is resolved.
+  #   distros:
+  #   - windows-64-vs2017-compile
+  # - name: concurrency_sharded_replication_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
+  #   distros:
+  #   - windows-64-vs2017-compile
   - name: concurrency_sharded_replication_with_balancer
     distros:
     - windows-64-vs2017-compile
-  - name: concurrency_sharded_causal_consistency
+  - name: concurrency_sharded_causal_consistency_gen
   - name: concurrency_sharded_causal_consistency_and_balancer
     distros:
     - windows-64-vs2017-compile
@@ -9506,7 +9458,7 @@ buildvariants:
   - name: read_concern_linearizable_passthrough
     distros:
     - windows-64-vs2017-compile
-  - name: read_concern_majority_passthrough
+  - name: read_concern_majority_passthrough_gen
   - name: read_only
   - name: read_only_sharded
   - name: replica_sets
@@ -9524,7 +9476,7 @@ buildvariants:
   - name: replica_sets_multi_stmt_txn_jscore_passthrough
     distros:
     - windows-64-vs2017-compile
-  - name: replica_sets_multi_stmt_txn_stepdown_jscore_passthrough
+  - name: replica_sets_multi_stmt_txn_stepdown_jscore_passthrough_gen
   - name: replica_sets_kill_primary_jscore_passthrough
     distros:
     - windows-64-vs2017-compile
@@ -9534,7 +9486,7 @@ buildvariants:
   - name: replica_sets_kill_secondaries_jscore_passthrough
     distros:
     - windows-64-vs2017-compile
-  - name: retryable_writes_jscore_passthrough
+  - name: retryable_writes_jscore_passthrough_gen
   - name: retryable_writes_jscore_stepdown_passthrough
     distros:
     - windows-64-vs2017-compile
@@ -9592,7 +9544,7 @@ buildvariants:
   - name: burn_in_tests
   - name: verify_pip
   - name: audit
-  - name: auth_audit
+  - name: auth_audit_gen
   - name: benchmarks_orphaned
   - name: benchmarks_sharding
   - name: buildscripts_test
@@ -9609,6 +9561,7 @@ buildvariants:
   - name: jsCore_decimal
   - name: jsCore_auth
   - name: jsCore_txns
+  - name: jsCore_txns_multi_oplog_entries
   - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_multiversion_fuzzer_gen
   - name: aggregation_expression_multiversion_fuzzer_gen
@@ -9619,22 +9572,23 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded_gen
   - name: jstestfuzz_replication_gen
   - name: jstestfuzz_sharded_gen
-  - name: noPassthrough
-  - name: noPassthroughWithMongod
+  - name: noPassthrough_gen
+  - name: noPassthroughWithMongod_gen
   - name: replica_sets_auth_gen
   - name: replica_sets_ese_gen
   - name: replica_sets_jscore_passthrough
   - name: sasl
-  - name: sharded_causally_consistent_jscore_txns_passthrough
+  - name: sharded_causally_consistent_jscore_txns_passthrough_gen
   - name: sharded_collections_causally_consistent_jscore_txns_passthrough
   - name: sharded_jscore_txns
   - name: sharded_jscore_txns_sharded_collections
-  - name: sharding_auth
-  - name: sharding_auth_audit
+  - name: sharding_auth_gen
+  - name: sharding_auth_audit_gen
   - name: sharding_ese_gen
   - name: snmp
-  - name: ssl
-  - name: sslSpecial
+  - name: ssl_gen
+  - name: sslSpecial_gen
+  - name: jsCore_txns_multi_oplog_entries
   - name: push
     distros:
     - rhel70-small
@@ -9646,7 +9600,6 @@ buildvariants:
   modules:
   - enterprise
   - wtdevelop
-  expansions:
   expansions:
     <<: *enterprise-windows-64-2k8-nopush-expansions-template
     use_wt_develop: true
@@ -9742,7 +9695,7 @@ buildvariants:
     distros:
     - windows-64-vs2017-compile
   - name: audit
-  - name: auth_audit
+  - name: auth_audit_gen
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
@@ -9769,22 +9722,22 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded_gen
   - name: jstestfuzz_replication_gen
   - name: jstestfuzz_sharded_gen
-  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
-  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
-  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_gen
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_gen
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_gen
   - name: read_concern_linearizable_passthrough
   - name: replica_sets_auth_gen
   - name: replica_sets_jscore_passthrough
   - name: sasl
-  - name: sharded_causally_consistent_jscore_txns_passthrough
+  - name: sharded_causally_consistent_jscore_txns_passthrough_gen
   - name: sharded_collections_causally_consistent_jscore_txns_passthrough
   - name: sharded_jscore_txns
   - name: sharded_jscore_txns_sharded_collections
-  - name: sharding_auth
-  - name: sharding_auth_audit
+  - name: sharding_auth_gen
+  - name: sharding_auth_audit_gen
   - name: snmp
-  - name: ssl
-  - name: sslSpecial
+  - name: ssl_gen
+  - name: sslSpecial_gen
 
 - name: windows-64-2k8-ssl
   display_name: Windows 2008R2
@@ -9824,7 +9777,7 @@ buildvariants:
   - name: aggregation_one_shard_sharded_collections
   - name: aggregation_read_concern_majority_passthrough
   - name: aggregation_sharded_collections_passthrough
-  - name: auth
+  - name: auth_gen
   - name: bulk_gle_passthrough
   - name: concurrency
   - name: concurrency_replication
@@ -9866,15 +9819,15 @@ buildvariants:
   - name: jstestfuzz_sharded_causal_consistency_gen
   - name: jstestfuzz_sharded_continuous_stepdown_gen
   - name: jstestfuzz_sharded_session_gen
-  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
-  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
-  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_gen
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_gen
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_gen
   - name: mongosTest
   - name: multiversion
   - name: multiversion_auth
-  - name: noPassthroughWithMongod
-  - name: noPassthrough
-  - name: parallel
+  - name: noPassthroughWithMongod_gen
+  - name: noPassthrough_gen
+  - name: parallel_gen
   - name: parallel_compatibility
   - name: powercycle
   - name: powercycle_fcv4.0
@@ -9882,11 +9835,11 @@ buildvariants:
   - name: powercycle_replication
   - name: powercycle_syncdelay
   - name: read_concern_linearizable_passthrough
-  - name: read_concern_majority_passthrough
+  - name: read_concern_majority_passthrough_gen
   - name: replica_sets
   - name: replica_sets_jscore_passthrough
   - name: serial_run
-  - name: sharded_causally_consistent_jscore_txns_passthrough
+  - name: sharded_causally_consistent_jscore_txns_passthrough_gen
   - name: sharded_collections_causally_consistent_jscore_txns_passthrough
   - name: sharded_collections_jscore_passthrough
   - name: sharded_jscore_txns
@@ -9896,11 +9849,11 @@ buildvariants:
   - name: sharding_gle_auth_basics_passthrough_write_cmd
   - name: sharding_jscore_passthrough
   - name: sharding_jscore_op_query_passthrough
-  - name: sharding_jscore_passthrough_wire_ops
+  - name: sharding_jscore_passthrough_wire_ops_gen
   - name: sharding_last_stable_mongos_and_mixed_shards_gen
-  - name: slow1
-  - name: ssl
-  - name: sslSpecial
+  - name: slow1_gen
+  - name: ssl_gen
+  - name: sslSpecial_gen
   - name: stitch_support_lib_build_and_test
   - name: stitch_support_lib_build_and_archive
   - name: tool
@@ -9946,8 +9899,8 @@ buildvariants:
 #             OSX buildvariants           #
 ###########################################
 
-- name: osx-1010
-  display_name: macOS 10.10
+- name: macos
+  display_name: macOS
   run_on:
   - macos-1014
   batchtime: 1440 # 1 day
@@ -10068,8 +10021,8 @@ buildvariants:
     distros:
     - rhel70-small
 
-- name: osx-1010-debug
-  display_name: "* macOS 10.10 DEBUG"
+- name: macos-debug
+  display_name: "* macOS DEBUG"
   run_on:
   - macos-1014
   expansions:
@@ -10091,6 +10044,7 @@ buildvariants:
   - name: jsCore_compatibility
   - name: jsCore_decimal
   - name: jsCore_txns
+  - name: jsCore_txns_multi_oplog_entries
   - name: causally_consistent_jscore_txns_passthrough
   - name: mongosTest
   - name: replica_sets
@@ -10100,8 +10054,8 @@ buildvariants:
   - name: stitch_support_lib_build_and_archive
   - name: tool
 
-- name: enterprise-osx-1010
-  display_name: Enterprise macOS 10.10
+- name: enterprise-macos
+  display_name: Enterprise macOS
   modules:
   - enterprise
   run_on:
@@ -10149,8 +10103,8 @@ buildvariants:
     distros:
     - rhel70-small
 
-- name: enterprise-osx-1010-openssl
-  display_name: ~ Enterprise macOS 10.10 OpenSSL
+- name: enterprise-macos-openssl
+  display_name: ~ Enterprise macOS OpenSSL
   modules:
   - enterprise
   run_on:
@@ -10168,7 +10122,7 @@ buildvariants:
     resmoke_jobs_max: 1
     build_mongoreplay: true
     build_openssl: true
-    openssl_config_flags: "-mmacosx-version-min=10.11"
+    openssl_config_flags: "-mmacosx-version-min=10.12"
     openssl_make_flags: "-j$(sysctl -n hw.logicalcpu)"
   display_tasks:
   - *dbtest
@@ -10199,8 +10153,8 @@ buildvariants:
 #          Mobile SDK buildvariants       #
 ###########################################
 
-- name: embedded-sdk-macosx-10.11
-  display_name: "Embedded SDK - macOS 10.11"
+- name: embedded-sdk-macos
+  display_name: "Embedded SDK - macOS"
   run_on:
   - macos-1014
   batchtime: 1440 # 1 day
@@ -10213,7 +10167,7 @@ buildvariants:
       --variables-files=etc/scons/xcode_macosx.vars
       FRAMEWORKPATH='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/Frameworks'
       --lto
-    cdriver_cmake_osx_deployment_target: "10.11"
+    cdriver_cmake_osx_deployment_target: "10.12"
     cdriver_cmake_flags: >-
         -DCMAKE_BUILD_TYPE=RelWithDebInfo
         -DCMAKE_OSX_SYSROOT="$(xcrun --sdk macosx --show-sdk-path)"
@@ -10229,8 +10183,8 @@ buildvariants:
   tasks:
   - name: embedded_sdk_build_and_test
 
-- name: embedded-sdk-iphoneos-11.0
-  display_name: "Embedded SDK - iOS 11.0"
+- name: embedded-sdk-iphoneos
+  display_name: "Embedded SDK - iOS"
   run_on:
   - macos-1014
   batchtime: 1440 # 1 day
@@ -10261,8 +10215,8 @@ buildvariants:
   tasks:
   - name: embedded_sdk_build_and_test
 
-- name: embedded-sdk-iphonesimulator-11.0
-  display_name: "Embedded SDK - iOS Simulator 11.0"
+- name: embedded-sdk-iphonesimulator
+  display_name: "Embedded SDK - iOS Simulator"
   run_on:
   - macos-1014
   batchtime: 1440 # 1 day
@@ -10296,8 +10250,8 @@ buildvariants:
   tasks:
   - name: embedded_sdk_build_and_test
 
-- name: embedded-sdk-appletvos-10.2
-  display_name: "Embedded SDK - tvOS 10.2"
+- name: embedded-sdk-appletvos
+  display_name: "Embedded SDK - tvOS"
   run_on:
   - macos-1014
   batchtime: 1440 # 1 day
@@ -10328,8 +10282,8 @@ buildvariants:
   tasks:
   - name: embedded_sdk_build_and_test
 
-- name: embedded-sdk-appletvsimulator-10.2
-  display_name: "Embedded SDK - tvOS Simulator 10.2"
+- name: embedded-sdk-appletvsimulator
+  display_name: "Embedded SDK - tvOS Simulator"
   run_on:
   - macos-1014
   batchtime: 1440 # 1 day
@@ -10363,8 +10317,8 @@ buildvariants:
   tasks:
   - name: embedded_sdk_build_and_test
 
-- name: embedded-sdk-watchos-4.2
-  display_name: "Embedded SDK - watchOS 4.2"
+- name: embedded-sdk-watchos
+  display_name: "Embedded SDK - watchOS"
   run_on:
   - macos-1014
   batchtime: 1440 # 1 day
@@ -10395,8 +10349,8 @@ buildvariants:
   tasks:
   - name: embedded_sdk_build_and_test
 
-- name: embedded-sdk-watchsimulator-4.2
-  display_name: "Embedded SDK - watchOS Simulator 4.2"
+- name: embedded-sdk-watchsimulator
+  display_name: "Embedded SDK - watchOS Simulator"
   run_on:
   - macos-1014
   batchtime: 1440 # 1 day
@@ -10667,6 +10621,7 @@ buildvariants:
     distros:
     - rhel62-large
   - name: lint
+  - name: lint_yaml
   - name: burn_in_tests
     distros:
     - rhel62-large
@@ -10749,6 +10704,7 @@ buildvariants:
   - name: jsCore_minimum_batch_size
   - name: jsCore_op_query
   - name: jsCore_txns
+  - name: jsCore_txns_multi_oplog_entries
   - name: causally_consistent_jscore_txns_passthrough
   - name: jsonSchema
   - name: aggregation_multiversion_fuzzer_gen
@@ -10787,6 +10743,7 @@ buildvariants:
   - name: multi_shard_local_read_write_multi_stmt_txn_jscore_passthrough_gen
   - name: multi_shard_multi_stmt_txn_jscore_passthrough_gen
   - name: multi_stmt_txn_jscore_passthrough_with_migration_gen
+  - name: multi_shard_multi_stmt_txn_kill_primary_jscore_passthrough_gen
   - name: multiversion_auth
   - name: multiversion
   - name: noPassthroughWithMongod_gen
@@ -10877,12 +10834,12 @@ buildvariants:
   run_on:
   - rhel62-small
   expansions: &enterprise-rhel-62-64-bit-majority-read-concern-off-expansions
-  # Ban tests that run prepareTransaction or multi-shard transactions (which use
-  # prepareTransaction). prepareTransaction is rejected on nodes with
-  # enableMajorityReadConcern:"false" (SERVER-37559).
+    # Ban tests that run prepareTransaction or multi-shard transactions (which use
+    # prepareTransaction). prepareTransaction is rejected on nodes with
+    # enableMajorityReadConcern:"false" (SERVER-37559).
     test_flags: >-
       --majorityReadConcern=off
-      --excludeWithAnyTags=requires_majority_read_concern,uses_prepare_transaction,uses_multi_shard_transaction
+      --excludeWithAnyTags=requires_majority_read_concern,uses_prepare_transaction,uses_multi_shard_transaction,uses_atclustertime
     compile_flags: >-
       -j$(grep -c ^processor /proc/cpuinfo)
       --ssl
@@ -11026,8 +10983,11 @@ buildvariants:
   - name: sasl
   - name: session_jscore_passthrough
   - name: sharded_collections_jscore_passthrough
-  - name: sharded_causally_consistent_jscore_txns_passthrough_gen
-  - name: sharded_jscore_txns
+  # Sharded transactions suites exclude tests that use snapshot read concern, since snapshot read
+  # concern uses 'atClusterTime' in sharded clusters, and this is not supported with
+  # enableMajorityReadConcern=false.
+  - name: sharded_causally_consistent_jscore_txns_passthrough_without_snapshot_gen
+  - name: sharded_jscore_txns_without_snapshot
   - name: sharded_multi_stmt_txn_jscore_passthrough
   - name: sharding_gen
   - name: sharding_auth_gen
@@ -11168,6 +11128,7 @@ buildvariants:
   - name: jsCore_minimum_batch_size
   - name: jsCore_op_query
   - name: jsCore_txns
+  - name: jsCore_txns_multi_oplog_entries
   - name: causally_consistent_jscore_txns_passthrough
   - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_gen
   - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_gen
@@ -11268,6 +11229,7 @@ buildvariants:
   - name: jsCore
   - name: jsCore_auth
   - name: jsCore_txns
+  - name: jsCore_txns_multi_oplog_entries
   - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_multiversion_fuzzer_gen
   - name: aggregation_expression_multiversion_fuzzer_gen
@@ -11547,18 +11509,18 @@ buildvariants:
   - name: concurrency_sharded_replication
     distros:
     - rhel70
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-    distros:
-    - rhel70
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
-    distros:
-    - rhel70
-  #- name: concurrency_sharded_replication_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-    distros:
-    - rhel70
-  #- name: concurrency_sharded_replication_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
-    distros:
-    - rhel70
+  # - name: concurrency_sharded_replication_local_read_write_multi_stmt_txn # Removed until SERVER-38499 is resolved.
+  #   distros:
+  #   - rhel70
+  # - name: concurrency_sharded_replication_local_read_write_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
+  #   distros:
+  #   - rhel70
+  # - name: concurrency_sharded_replication_multi_stmt_txn # Removed until SERVER-38499 is resolved.
+  #   distros:
+  #   - rhel70
+  # - name: concurrency_sharded_replication_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
+  #   distros:
+  #   - rhel70
   - name: concurrency_sharded_replication_with_balancer
     distros:
     - rhel70
@@ -11591,6 +11553,22 @@ buildvariants:
     - ubuntu1604-packer
   - name: publish_packages
   - name: push
+
+# This variant compiles on RHEL 7.0 and runs tests on RHEL 7.6
+- name: rhel76_compile_rhel70
+  display_name: RHEL 7.0/7.6 Cross-ABI
+  run_on:
+  - rhel76-test
+  batchtime: 1440 # 1 day
+  expansions:
+    compile_flags: --ssl MONGO_DISTMOD=rhel70 -j$(grep -c ^processor /proc/cpuinfo) --release --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
+  tasks:
+  - name: compile_TG
+    distros:
+    - rhel70
+  - name: ssl_gen
+  - name: jsCore
+  - name: external_auth
 
 - name: enterprise-rhel-71-ppc64le
   display_name: Enterprise RHEL 7.1 PPC64LE
@@ -12897,7 +12875,7 @@ buildvariants:
   - rhel62-small
   batchtime: 1440 # 1 day
   expansions:
-    test_flags: --storageEngine=biggie --excludeWithAnyTags=SERVER-38379,requires_persistence,requires_journaling,uses_transactions,requires_wiredtiger
+    test_flags: --storageEngine=biggie --excludeWithAnyTags=SERVER-38379,requires_persistence,requires_journaling,uses_transactions,requires_wiredtiger,requires_snapshot_read
     compile_flags: MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) --dbg=off --opt=on --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     scons_cache_scope: shared
@@ -13119,7 +13097,7 @@ buildvariants:
     # mobile storage engine.
     test_flags: >-
       --storageEngine=mobile
-      --excludeWithAnyTags=requires_wiredtiger,requires_replication,requires_sharding,uses_transactions,requires_capped,requires_profiling,requires_compact,requires_document_locking
+      --excludeWithAnyTags=requires_wiredtiger,requires_replication,requires_sharding,uses_transactions,requires_capped,requires_profiling,requires_compact,requires_document_locking,requires_snapshot_read
       --excludeWithAnyTags=SERVER-32709,SERVER-32869
     compile_flags: >-
       -j$(grep -c ^processor /proc/cpuinfo)
@@ -13197,7 +13175,7 @@ buildvariants:
   expansions:
     test_flags: >-
       --storageEngine=mobile
-      --excludeWithAnyTags=requires_wiredtiger,requires_replication,requires_sharding,uses_transactions,requires_capped,requires_profiling,requires_compact,requires_document_locking
+      --excludeWithAnyTags=requires_wiredtiger,requires_replication,requires_sharding,uses_transactions,requires_capped,requires_profiling,requires_compact,requires_document_locking,requires_snapshot_read
       --excludeWithAnyTags=SERVER-32709,SERVER-32869
     compile_flags: >-
         -j$(grep -c ^processor /proc/cpuinfo)
@@ -13260,8 +13238,8 @@ buildvariants:
   - name: burn_in_tests
   - name: jsCore_mobile
 
-- name: osx-1011-mobile
-  display_name: macOS 10.11 (mobile)
+- name: macos-mobile
+  display_name: macOS (mobile)
   run_on:
   - macos-1014
   batchtime: 1440 # 1 day
@@ -13274,7 +13252,7 @@ buildvariants:
     # mobile storage engine.
     test_flags: >-
       --storageEngine=mobile
-      --excludeWithAnyTags=requires_wiredtiger,requires_replication,requires_sharding,uses_transactions,requires_capped,requires_profiling,requires_compact,requires_document_locking
+      --excludeWithAnyTags=requires_wiredtiger,requires_replication,requires_sharding,uses_transactions,requires_capped,requires_profiling,requires_compact,requires_document_locking,requires_snapshot_read
       --excludeWithAnyTags=SERVER-32709,SERVER-32869
     compile_env: DEVELOPER_DIR=/Applications/Xcode10.1.app
     compile_flags: >-
@@ -13325,7 +13303,7 @@ buildvariants:
   expansions:
     # Transactions are not explicitly supported on the ephemeralForTest storage engine.
     # Speculative majority reads are currently only allowed for change streams, which are only supported on WiredTiger.
-    test_flags: --storageEngine=ephemeralForTest --excludeWithAnyTags=requires_persistence,requires_fsync,SERVER-21420,SERVER-21658,requires_journaling,requires_wiredtiger,uses_transactions,requires_document_locking,uses_speculative_majority
+    test_flags: --storageEngine=ephemeralForTest --excludeWithAnyTags=requires_persistence,requires_fsync,SERVER-21420,SERVER-21658,requires_journaling,requires_wiredtiger,uses_transactions,requires_document_locking,uses_speculative_majority,requires_snapshot_read
     compile_flags: -j$(grep -c ^processor /proc/cpuinfo) --dbg=off --opt=on --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
     scons_cache_scope: shared
     tooltags: ""
@@ -13618,7 +13596,7 @@ buildvariants:
     # We need llvm-symbolizer in the PATH for ASAN for clang-3.7 or later.
     variant_path_suffix: /opt/mongodbtoolchain/v3/bin
     lang_environment: LANG=C
-    san_options: LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=0:handle_segv=0:handle_sigbus=0:handle_sigill=0:handle_sigfpe=0
+    san_options: LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=1
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_v3_clang.vars --dbg=on --opt=on --allocator=system --sanitize=address --ssl --enable-free-mon=on -j$(grep -c ^processor /proc/cpuinfo) --nostrip
     multiversion_platform: ubuntu1604
     multiversion_edition: enterprise
@@ -13781,7 +13759,7 @@ buildvariants:
     # We need llvm-symbolizer in the PATH for ASAN for clang-3.7 or later.
     variant_path_suffix: /opt/mongodbtoolchain/v3/bin
     lang_environment: LANG=C
-    san_options: LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=0:handle_segv=0:handle_sigbus=0:handle_sigill=0:handle_sigfpe=0
+    san_options: LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=1
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_v3_clang.vars --opt=on --allocator=system --sanitize=address --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
     resmoke_jobs_factor: 0.3  # Avoid starting too many mongod's under ASAN build.
     tooltags: "ssl"
@@ -13826,8 +13804,8 @@ buildvariants:
     # We need llvm-symbolizer in the PATH for UBSAN.
     variant_path_suffix: /opt/mongodbtoolchain/v3/bin
     lang_environment: LANG=C
-    san_options: UBSAN_OPTIONS="print_stacktrace=1:handle_abort=0:handle_segv=0:handle_sigbus=0:handle_sigill=0:handle_sigfpe=0"
-    compile_flags: --variables-files=etc/scons/mongodbtoolchain_v3_clang.vars --dbg=on --opt=on --allocator=system --sanitize=undefined --ssl --enable-free-mon=on -j$(grep -c ^processor /proc/cpuinfo) --nostrip
+    san_options: UBSAN_OPTIONS="print_stacktrace=1"
+    compile_flags: --variables-files=etc/scons/mongodbtoolchain_v3_clang.vars --dbg=on --opt=on --sanitize=undefined --ssl --enable-free-mon=on -j$(grep -c ^processor /proc/cpuinfo) --nostrip
     multiversion_platform: ubuntu1604
     multiversion_edition: enterprise
     resmoke_jobs_factor: 0.3  # Avoid starting too many mongod's under UBSAN build.
@@ -13978,7 +13956,7 @@ buildvariants:
     # We need llvm-symbolizer in the PATH for ASAN for clang-3.7 or later.
     variant_path_suffix: /opt/mongodbtoolchain/v3/bin
     lang_environment: LANG=C
-    san_options: UBSAN_OPTIONS="print_stacktrace=1:handle_abort=0:handle_segv=0:handle_sigbus=0:handle_sigill=0:handle_sigfpe=0" LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=0:handle_segv=0:handle_sigbus=0:handle_sigill=0:handle_sigfpe=0
+    san_options: UBSAN_OPTIONS="print_stacktrace=1" LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=1
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_v3_clang.vars --dbg=on --opt=on --allocator=system --sanitize=undefined,address --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
     resmoke_jobs_factor: 0.3  # Avoid starting too many mongod's under {A,UB}SAN build.
     tooltags: "ssl"
@@ -13992,6 +13970,7 @@ buildvariants:
   - name: compile_all_run_unittests_TG
   - name: jsCore
   - name: jsCore_txns
+  - name: jsCore_txns_multi_oplog_entries
   - name: causally_consistent_jscore_txns_passthrough
   - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_gen
   - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_gen
@@ -14010,7 +13989,7 @@ buildvariants:
     # We need llvm-symbolizer in the PATH for ASAN for clang-3.7 or later.
     variant_path_suffix: /opt/mongodbtoolchain/v3/bin
     lang_environment: LANG=C
-    san_options: UBSAN_OPTIONS="print_stacktrace=1:handle_abort=0:handle_segv=0:handle_sigbus=0:handle_sigill=0:handle_sigfpe=0" LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=0:handle_segv=0:handle_sigbus=0:handle_sigill=0:handle_sigfpe=0
+    san_options: UBSAN_OPTIONS="print_stacktrace=1" LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=1
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_v3_clang.vars --dbg=on --opt=on --allocator=system --sanitize=undefined,address --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
     resmoke_jobs_factor: 0.3  # Avoid starting too many mongod's under {A,UB}SAN build.
     tooltags: "ssl"
@@ -14131,7 +14110,6 @@ buildvariants:
     scons_cache_mode: all
     tooltags: "ssl sasl"
     build_mongoreplay: true
-    build_mongoreplay: true
   display_tasks:
   - *dbtest
   - *unittests
@@ -14147,8 +14125,8 @@ buildvariants:
   batchtime: 1440 # 1 day
   stepback: false
   tasks:
-# Test lifecycle is temporarily disabled to reduce load on Evergreen API.
-# - name: update_test_lifecycle
+  # Test lifecycle is temporarily disabled to reduce load on Evergreen API.
+  # - name: update_test_lifecycle
   - name: fetch_test_lifecycle
     distros:
     - rhel62-small

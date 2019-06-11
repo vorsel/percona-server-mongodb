@@ -1592,7 +1592,7 @@ TEST_F(ReplCoordTest, ConcurrentStepDownShouldNotSignalTheSameFinishEventMoreTha
     // Prevent _stepDownFinish() from running and becoming secondary by blocking in this
     // exclusive task.
     const auto opCtx = makeOperationContext();
-    boost::optional<ReplicationStateTransitionLockGuard> transitionGuard(opCtx.get());
+    boost::optional<ReplicationStateTransitionLockGuard> transitionGuard({opCtx.get(), MODE_X});
 
     TopologyCoordinator::UpdateTermResult termUpdated2;
     auto updateTermEvh2 = getReplCoord()->updateTerm_forTest(2, &termUpdated2);
@@ -1927,14 +1927,14 @@ TEST_F(StepDownTest,
 
     // Make sure stepDown cannot grab the RSTL in mode X. We need to use a different
     // locker to test this, or otherwise stepDown will be granted the lock automatically.
-    ReplicationStateTransitionLockGuard transitionGuard(opCtx.get());
+    ReplicationStateTransitionLockGuard transitionGuard(opCtx.get(), MODE_X);
     ASSERT_TRUE(opCtx->lockState()->isRSTLExclusive());
     auto locker = opCtx.get()->swapLockState(stdx::make_unique<LockerImpl>());
 
     ASSERT_THROWS_CODE(
         getReplCoord()->stepDown(opCtx.get(), false, Milliseconds(0), Milliseconds(1000)),
         AssertionException,
-        ErrorCodes::ExceededTimeLimit);
+        ErrorCodes::LockTimeout);
     ASSERT_TRUE(getReplCoord()->getMemberState().primary());
 
     ASSERT_TRUE(locker->isRSTLExclusive());
@@ -2440,8 +2440,7 @@ TEST_F(StepDownTest, UnconditionalStepDownFailsStepDownCommand) {
 }
 
 // Test that if a stepdown command is blocked waiting for secondaries to catch up when an
-// unconditional stepdown happens, and then is interrupted, we stay stepped down, even though
-// normally if we were just interrupted we would step back up.
+// unconditional stepdown happens, and then is interrupted, we step back up.
 TEST_F(StepDownTest, InterruptingStepDownCommandRestoresWriteAvailability) {
     OpTime optime1(Timestamp(100, 1), 1);
     OpTime optime2(Timestamp(100, 2), 1);
@@ -2463,6 +2462,12 @@ TEST_F(StepDownTest, InterruptingStepDownCommandRestoresWriteAvailability) {
     // We should still be primary at this point
     ASSERT_TRUE(getReplCoord()->getMemberState().primary());
 
+    // We should not indicate that we are master, nor that we are secondary.
+    IsMasterResponse response;
+    getReplCoord()->fillIsMasterForReplSet(&response);
+    ASSERT_FALSE(response.isMaster());
+    ASSERT_FALSE(response.isSecondary());
+
     // Interrupt the ongoing stepdown command.
     {
         stdx::lock_guard<Client> lk(*result.first.client.get());
@@ -2473,8 +2478,13 @@ TEST_F(StepDownTest, InterruptingStepDownCommandRestoresWriteAvailability) {
     ASSERT_EQUALS(*result.second.get(), ErrorCodes::Interrupted);
     ASSERT_TRUE(getReplCoord()->getMemberState().primary());
 
-    // This is the important check, that we didn't accidentally step back up when aborting the
-    // stepdown command attempt.
+    // We should now report that we are master.
+    getReplCoord()->fillIsMasterForReplSet(&response);
+    ASSERT_TRUE(response.isMaster());
+    ASSERT_FALSE(response.isSecondary());
+
+    // This is the important check, that we stepped back up when aborting the stepdown command
+    // attempt.
     const auto opCtx = makeOperationContext();
     Lock::GlobalLock lock(opCtx.get(), MODE_IX);
     ASSERT_TRUE(getReplCoord()->canAcceptWritesForDatabase(opCtx.get(), "admin"));
@@ -2504,6 +2514,12 @@ TEST_F(StepDownTest, InterruptingAfterUnconditionalStepdownDoesNotRestoreWriteAv
     // We should still be primary at this point
     ASSERT_TRUE(getReplCoord()->getMemberState().primary());
 
+    // We should not indicate that we are master, nor that we are secondary.
+    IsMasterResponse response;
+    getReplCoord()->fillIsMasterForReplSet(&response);
+    ASSERT_FALSE(response.isMaster());
+    ASSERT_FALSE(response.isSecondary());
+
     // Interrupt the ongoing stepdown command.
     {
         stdx::lock_guard<Client> lk(*result.first.client.get());
@@ -2523,6 +2539,10 @@ TEST_F(StepDownTest, InterruptingAfterUnconditionalStepdownDoesNotRestoreWriteAv
     ASSERT(stepDownStatus == ErrorCodes::PrimarySteppedDown ||
            stepDownStatus == ErrorCodes::Interrupted);
     ASSERT_TRUE(getReplCoord()->getMemberState().secondary());
+
+    // We should still be indicating that we are not master.
+    getReplCoord()->fillIsMasterForReplSet(&response);
+    ASSERT_FALSE(response.isMaster());
 
     // This is the important check, that we didn't accidentally step back up when aborting the
     // stepdown command attempt.
@@ -2686,7 +2706,7 @@ TEST_F(ReplCoordTest,
 
     // We must take the RSTL in mode X before transitioning to RS_ROLLBACK.
     const auto opCtx = makeOperationContext();
-    ReplicationStateTransitionLockGuard transitionGuard(opCtx.get());
+    ReplicationStateTransitionLockGuard transitionGuard(opCtx.get(), MODE_X);
 
     // If we go into rollback while in maintenance mode, our state changes to RS_ROLLBACK.
     ASSERT_OK(getReplCoord()->setFollowerModeStrict(opCtx.get(), MemberState::RS_ROLLBACK));
@@ -2753,7 +2773,7 @@ TEST_F(ReplCoordTest, SettingAndUnsettingMaintenanceModeShouldNotAffectRollbackS
 
     // We must take the RSTL in mode X before transitioning to RS_ROLLBACK.
     const auto opCtx = makeOperationContext();
-    ReplicationStateTransitionLockGuard transitionGuard(opCtx.get());
+    ReplicationStateTransitionLockGuard transitionGuard(opCtx.get(), MODE_X);
 
     // From rollback, entering and exiting maintenance mode doesn't change perceived
     // state.
@@ -2876,7 +2896,7 @@ TEST_F(ReplCoordTest, DoNotAllowSettingMaintenanceModeWhileConductingAnElection)
     ASSERT_EQUALS(ErrorCodes::NotSecondary, status);
 
     // We must take the RSTL in mode X before transitioning to RS_ROLLBACK.
-    ReplicationStateTransitionLockGuard transitionGuard(opCtx.get());
+    ReplicationStateTransitionLockGuard transitionGuard(opCtx.get(), MODE_X);
 
     // This cancels the actual election.
     // We do not need to respond to any pending network operations because setFollowerMode() will
@@ -4011,24 +4031,22 @@ TEST_F(StableOpTimeTest, SetMyLastAppliedSetsStableOpTimeForStorage) {
 
     auto repl = getReplCoord();
     Timestamp stableTimestamp;
-    long long term = 2;
 
     getStorageInterface()->supportsDocLockingBool = true;
-
-    repl->advanceCommitPoint(OpTime({1, 1}, term));
     ASSERT_EQUALS(Timestamp::min(), getStorageInterface()->getStableTimestamp());
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
 
     getStorageInterface()->allCommittedTimestamp = Timestamp(1, 1);
-    getReplCoord()->setMyLastAppliedOpTime(OpTimeWithTermOne(1, 1));
-    getReplCoord()->setMyLastDurableOpTime(OpTimeWithTermOne(1, 1));
+    repl->setMyLastAppliedOpTime(OpTimeWithTermOne(1, 1));
+    repl->setMyLastDurableOpTime(OpTimeWithTermOne(1, 1));
     simulateSuccessfulV1Election();
 
-    repl->advanceCommitPoint(OpTime({2, 2}, term));
+    // Advance the commit point so it's higher than all the others.
+    repl->advanceCommitPoint(OpTimeWithTermOne(10, 1));
     ASSERT_EQUALS(Timestamp(1, 1), getStorageInterface()->getStableTimestamp());
 
     // Check that the stable timestamp is not updated if the all-committed timestamp is behind.
-    repl->setMyLastAppliedOpTime(OpTime({1, 2}, term));
+    repl->setMyLastAppliedOpTime(OpTimeWithTermOne(1, 2));
     stableTimestamp = getStorageInterface()->getStableTimestamp();
     ASSERT_EQUALS(Timestamp(1, 1), getStorageInterface()->getStableTimestamp());
 
@@ -4036,17 +4054,17 @@ TEST_F(StableOpTimeTest, SetMyLastAppliedSetsStableOpTimeForStorage) {
 
     // Check that the stable timestamp is updated for the storage engine when we set the applied
     // optime.
-    repl->setMyLastAppliedOpTime(OpTime({2, 1}, term));
+    repl->setMyLastAppliedOpTime(OpTimeWithTermOne(2, 1));
     stableTimestamp = getStorageInterface()->getStableTimestamp();
     ASSERT_EQUALS(Timestamp(2, 1), stableTimestamp);
 
     // Check that timestamp cleanup occurs.
-    repl->setMyLastAppliedOpTime(OpTime({2, 2}, term));
+    repl->setMyLastAppliedOpTime(OpTimeWithTermOne(2, 2));
     stableTimestamp = getStorageInterface()->getStableTimestamp();
     ASSERT_EQUALS(Timestamp(2, 2), stableTimestamp);
 
     auto opTimeCandidates = repl->getStableOpTimeCandidates_forTest();
-    std::set<OpTime> expectedOpTimeCandidates = {OpTime({2, 2}, term)};
+    std::set<OpTime> expectedOpTimeCandidates = {OpTimeWithTermOne(2, 2)};
     ASSERT_OPTIME_SET_EQ(expectedOpTimeCandidates, opTimeCandidates);
 }
 
@@ -4175,8 +4193,11 @@ TEST_F(StableOpTimeTest, ClearOpTimeCandidatesPastCommonPointAfterRollback) {
 
     OpTime rollbackCommonPoint = OpTime({1, 2}, term);
     OpTime commitPoint = OpTime({1, 2}, term);
-    repl->advanceCommitPoint(commitPoint);
     ASSERT_EQUALS(Timestamp::min(), getStorageInterface()->getStableTimestamp());
+
+    repl->setMyLastAppliedOpTime(OpTime({0, 1}, term));
+    // Advance commit point when it has the same term as the last applied.
+    repl->advanceCommitPoint(commitPoint);
 
     repl->setMyLastAppliedOpTime(OpTime({1, 1}, term));
     repl->setMyLastAppliedOpTime(OpTime({1, 2}, term));
@@ -4196,7 +4217,7 @@ TEST_F(StableOpTimeTest, ClearOpTimeCandidatesPastCommonPointAfterRollback) {
 
     // We must take the RSTL in mode X before transitioning to RS_ROLLBACK.
     const auto opCtx = makeOperationContext();
-    ReplicationStateTransitionLockGuard transitionGuard(opCtx.get());
+    ReplicationStateTransitionLockGuard transitionGuard(opCtx.get(), MODE_X);
 
     // Transition to ROLLBACK. The set of stable optime candidates should not have changed.
     ASSERT_OK(repl->setFollowerModeStrict(opCtx.get(), MemberState::RS_ROLLBACK));
@@ -4811,6 +4832,85 @@ TEST_F(ReplCoordTest,
     ASSERT_EQUALS(-1, getTopoCoord().getCurrentPrimaryIndex());
 }
 
+TEST_F(ReplCoordTest, LastCommittedOpTimeOnlyUpdatedWhenLastAppliedHasTheSameTerm) {
+    // Ensure that the metadata is processed if it is contained in a heartbeat response.
+    assertStartSuccess(BSON("_id"
+                            << "mySet"
+                            << "version"
+                            << 2
+                            << "members"
+                            << BSON_ARRAY(BSON("host"
+                                               << "node1:12345"
+                                               << "_id"
+                                               << 0)
+                                          << BSON("host"
+                                                  << "node2:12345"
+                                                  << "_id"
+                                                  << 1))
+                            << "protocolVersion"
+                            << 1),
+                       HostAndPort("node1", 12345));
+    ASSERT_EQUALS(OpTime(), getReplCoord()->getLastCommittedOpTime());
+
+    auto config = getReplCoord()->getConfig();
+
+    auto opTime1 = OpTime({10, 1}, 1);
+    auto opTime2 = OpTime({11, 1}, 2);  // In higher term.
+    auto commitPoint = OpTime({15, 1}, 2);
+    getReplCoord()->setMyLastAppliedOpTime(opTime1);
+
+    // Node 1 is the current primary. The commit point has a higher term than lastApplied.
+    rpc::ReplSetMetadata metadata(2,            // term
+                                  commitPoint,  // committedOpTime
+                                  commitPoint,  // visibleOpTime
+                                  config.getConfigVersion(),
+                                  {},  // replset id
+                                  1,   // currentPrimaryIndex,
+                                  1);  // currentSyncSourceIndex
+
+    auto net = getNet();
+    BSONObjBuilder responseBuilder;
+    ASSERT_OK(metadata.writeToMetadata(&responseBuilder));
+
+    ReplSetHeartbeatResponse hbResp;
+    hbResp.setConfigVersion(config.getConfigVersion());
+    hbResp.setSetName(config.getReplSetName());
+    hbResp.setState(MemberState::RS_PRIMARY);
+    responseBuilder.appendElements(hbResp.toBSON());
+    auto hbRespObj = responseBuilder.obj();
+    {
+        net->enterNetwork();
+        ASSERT_TRUE(net->hasReadyRequests());
+        auto noi = net->getNextReadyRequest();
+        auto& request = noi->getRequest();
+        ASSERT_EQUALS(config.getMemberAt(1).getHostAndPort(), request.target);
+        ASSERT_EQUALS("replSetHeartbeat", request.cmdObj.firstElement().fieldNameStringData());
+
+        net->scheduleResponse(noi, net->now(), makeResponseStatus(hbRespObj));
+        net->runReadyNetworkOperations();
+        net->exitNetwork();
+
+        ASSERT_EQUALS(OpTime(), getReplCoord()->getLastCommittedOpTime());
+        ASSERT_EQUALS(2, getReplCoord()->getTerm());
+    }
+
+    // Update lastApplied, so commit point can be advanced.
+    getReplCoord()->setMyLastAppliedOpTime(opTime2);
+    {
+        net->enterNetwork();
+        net->runUntil(net->now() + config.getHeartbeatInterval());
+        auto noi = net->getNextReadyRequest();
+        auto& request = noi->getRequest();
+        ASSERT_EQUALS("replSetHeartbeat", request.cmdObj.firstElement().fieldNameStringData());
+
+        net->scheduleResponse(noi, net->now(), makeResponseStatus(hbRespObj));
+        net->runReadyNetworkOperations();
+        net->exitNetwork();
+
+        ASSERT_EQUALS(commitPoint, getReplCoord()->getLastCommittedOpTime());
+    }
+}
+
 TEST_F(ReplCoordTest, PrepareOplogQueryMetadata) {
     assertStartSuccess(BSON("_id"
                             << "mySet"
@@ -4834,11 +4934,11 @@ TEST_F(ReplCoordTest, PrepareOplogQueryMetadata) {
                        HostAndPort("node1", 12345));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
 
-    OpTime optime1{Timestamp(10, 0), 3};
+    OpTime optime1{Timestamp(10, 0), 5};
     OpTime optime2{Timestamp(11, 2), 5};
 
-    getReplCoord()->advanceCommitPoint(optime1);
     getReplCoord()->setMyLastAppliedOpTime(optime2);
+    getReplCoord()->advanceCommitPoint(optime1);
 
     auto opCtx = makeOperationContext();
 
@@ -5010,7 +5110,7 @@ TEST_F(ReplCoordTest, DoNotScheduleElectionWhenCancelAndRescheduleElectionTimeou
 
     // We must take the RSTL in mode X before transitioning to RS_ROLLBACK.
     const auto opCtx = makeOperationContext();
-    ReplicationStateTransitionLockGuard transitionGuard(opCtx.get());
+    ReplicationStateTransitionLockGuard transitionGuard(opCtx.get(), MODE_X);
     ASSERT_OK(replCoord->setFollowerModeStrict(opCtx.get(), MemberState::RS_ROLLBACK));
 
     getReplCoord()->cancelAndRescheduleElectionTimeout();

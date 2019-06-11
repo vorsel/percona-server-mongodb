@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -71,7 +70,7 @@ public:
     StatusWith<std::string> createCollection(OperationContext* opCtx, NamespaceString ns) {
         AutoGetDb db(opCtx, ns.db(), LockMode::MODE_X);
         DatabaseCatalogEntry* dbce = _storageEngine->getDatabaseCatalogEntry(opCtx, ns.db());
-        auto ret = dbce->createCollection(opCtx, ns.ns(), CollectionOptions(), false);
+        auto ret = dbce->createCollection(opCtx, ns, CollectionOptions(), false);
         if (!ret.isOK()) {
             return ret;
         }
@@ -278,6 +277,8 @@ TEST_F(KVStorageEngineTest, ReconcileDropsTemporary) {
 
     // The storage engine is responsible for dropping its temporary idents.
     ASSERT(!identExists(opCtx.get(), ident));
+
+    rs->deleteTemporaryTable(opCtx.get());
 }
 
 TEST_F(KVStorageEngineTest, TemporaryDropsItself) {
@@ -290,6 +291,8 @@ TEST_F(KVStorageEngineTest, TemporaryDropsItself) {
         ident = rs->rs()->getIdent();
 
         ASSERT(identExists(opCtx.get(), ident));
+
+        rs->deleteTemporaryTable(opCtx.get());
     }
 
     // The temporary record store RAII class should drop itself.
@@ -331,6 +334,9 @@ TEST_F(KVStorageEngineTest, ReconcileDoesNotDropIndexBuildTempTables) {
     // The owning index was dropped, and so should its temporary tables.
     ASSERT(!identExists(opCtx.get(), sideWrites->rs()->getIdent()));
     ASSERT(!identExists(opCtx.get(), constraintViolations->rs()->getIdent()));
+
+    sideWrites->deleteTemporaryTable(opCtx.get());
+    constraintViolations->deleteTemporaryTable(opCtx.get());
 }
 
 TEST_F(KVStorageEngineTest, ReconcileDoesNotDropIndexBuildTempTablesBackgroundSecondary) {
@@ -373,6 +379,9 @@ TEST_F(KVStorageEngineTest, ReconcileDoesNotDropIndexBuildTempTablesBackgroundSe
     // dropped.
     ASSERT(identExists(opCtx.get(), sideWrites->rs()->getIdent()));
     ASSERT(identExists(opCtx.get(), constraintViolations->rs()->getIdent()));
+
+    sideWrites->deleteTemporaryTable(opCtx.get());
+    constraintViolations->deleteTemporaryTable(opCtx.get());
 }
 
 TEST_F(KVStorageEngineRepairTest, LoadCatalogRecoversOrphans) {
@@ -564,34 +573,40 @@ TEST_F(TimestampKVEngineTest, TimestampListeners) {
 }
 
 TEST_F(TimestampKVEngineTest, TimestampMonitorNotifiesListeners) {
-    unittest::Barrier barrier(2);
+    stdx::mutex mutex;
+    stdx::condition_variable cv;
+
     bool changes[4] = {false, false, false, false};
 
     TimestampListener first(checkpoint, [&](Timestamp timestamp) {
+        stdx::lock_guard<stdx::mutex> lock(mutex);
         if (!changes[0]) {
             changes[0] = true;
-            barrier.countDownAndWait();
+            cv.notify_all();
         }
     });
 
     TimestampListener second(oldest, [&](Timestamp timestamp) {
+        stdx::lock_guard<stdx::mutex> lock(mutex);
         if (!changes[1]) {
             changes[1] = true;
-            barrier.countDownAndWait();
+            cv.notify_all();
         }
     });
 
     TimestampListener third(stable, [&](Timestamp timestamp) {
+        stdx::lock_guard<stdx::mutex> lock(mutex);
         if (!changes[2]) {
             changes[2] = true;
-            barrier.countDownAndWait();
+            cv.notify_all();
         }
     });
 
     TimestampListener fourth(stable, [&](Timestamp timestamp) {
+        stdx::lock_guard<stdx::mutex> lock(mutex);
         if (!changes[3]) {
             changes[3] = true;
-            barrier.countDownAndWait();
+            cv.notify_all();
         }
     });
 
@@ -601,11 +616,15 @@ TEST_F(TimestampKVEngineTest, TimestampMonitorNotifiesListeners) {
     _storageEngine->getTimestampMonitor()->addListener(&fourth);
 
     // Wait until all 4 listeners get notified at least once.
-    size_t listenersNotified = 0;
-    while (listenersNotified < 4) {
-        barrier.countDownAndWait();
-        listenersNotified++;
-    }
+    stdx::unique_lock<stdx::mutex> lk(mutex);
+    cv.wait(lk, [&] {
+        for (auto const& change : changes) {
+            if (!change) {
+                return false;
+            }
+        }
+        return true;
+    });
 
     _storageEngine->getTimestampMonitor()->removeListener(&first);
     _storageEngine->getTimestampMonitor()->removeListener(&second);

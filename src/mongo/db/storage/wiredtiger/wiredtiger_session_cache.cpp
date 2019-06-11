@@ -1,6 +1,3 @@
-// wiredtiger_session_cache.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -40,9 +37,9 @@
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/global_settings.h"
 #include "mongo/db/repl/repl_settings.h"
-#include "mongo/db/server_parameters.h"
 #include "mongo/db/storage/journal_listener.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_parameters_gen.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/thread.h"
@@ -51,41 +48,9 @@
 
 namespace mongo {
 
-// The "wiredTigerCursorCacheSize" parameter has the following meaning.
-//
-// wiredTigerCursorCacheSize == 0
-// For this setting, cursors are only cached in the WiredTiger storage engine
-// itself. Operations that need exclusive access such as drop or verify will
-// not be blocked by inactive cached cursors with this setting. However, this
-// setting may reduce the performance of certain workloads that normally
-// benefit from cursor caching above the storage engine.
-//
-// wiredTigerCursorCacheSize > 0
-// WiredTiger-level caching of cursors is disabled but cursor caching does
-// occur above the storage engine. The value of this setting represents the
-// maximum number of cursors that are cached. Setting the value to 10000 will
-// give the old (<= 3.6) behavior. Note that cursors remain cached, even when a
-// session is released back to the cache. Thus, exclusive operations may be
-// blocked temporarily, and in some cases, a long time. Drops that fail because
-// of exclusivity silently succeed and are queued for retries.
-//
-// wiredTigerCursorCacheSize < 0
-// This is a hybrid approach of the above two, and is the default. The the
-// absolute value of the setting is used as the number of cursors cached above
-// the storage engine. When a session is released, all cursors are closed, and
-// will be cached in WiredTiger. Exclusive operations should only be blocked
-// for a short time, except if a cursor is held by a long running session. This
-// is a good compromise for most workloads.
-AtomicWord<int> kWiredTigerCursorCacheSize(-100);
-
 const std::string kWTRepairMsg =
     "Please read the documentation for starting MongoDB with --repair here: "
     "http://dochub.mongodb.org/core/repair";
-
-ExportedServerParameter<std::int32_t, ServerParameterType::kStartupAndRuntime>
-    WiredTigerCursorCacheSizeSetting(ServerParameterSet::getGlobal(),
-                                     "wiredTigerCursorCacheSize",
-                                     &kWiredTigerCursorCacheSize);
 
 WiredTigerSession::WiredTigerSession(WT_CONNECTION* conn, uint64_t epoch, uint64_t cursorEpoch)
     : _epoch(epoch),
@@ -176,7 +141,7 @@ void WiredTigerSession::releaseCursor(uint64_t id, WT_CURSOR* cursor) {
     _cursors.push_front(WiredTigerCachedCursor(id, _cursorGen++, cursor));
 
     // A negative value for wiredTigercursorCacheSize means to use hybrid caching.
-    std::uint32_t cacheSize = abs(kWiredTigerCursorCacheSize.load());
+    std::uint32_t cacheSize = abs(gWiredTigerCursorCacheSize.load());
 
     while (!_cursors.empty() && _cursorGen - _cursors.back()._gen > cacheSize) {
         cursor = _cursors.back()._cursor;
@@ -235,10 +200,15 @@ WiredTigerSessionCache::WiredTigerSessionCache(WiredTigerKVEngine* engine)
     : _engine(engine),
       _conn(engine->getConnection()),
       _clockSource(_engine->getClockSource()),
-      _shuttingDown(0) {}
+      _shuttingDown(0),
+      _prepareCommitOrAbortCounter(0) {}
 
 WiredTigerSessionCache::WiredTigerSessionCache(WT_CONNECTION* conn, ClockSource* cs)
-    : _engine(NULL), _conn(conn), _clockSource(cs), _shuttingDown(0) {}
+    : _engine(nullptr),
+      _conn(conn),
+      _clockSource(cs),
+      _shuttingDown(0),
+      _prepareCommitOrAbortCounter(0) {}
 
 WiredTigerSessionCache::~WiredTigerSessionCache() {
     shuttingDown();
@@ -361,21 +331,20 @@ void WiredTigerSessionCache::waitUntilDurable(bool forceCheckpoint, bool stableC
     _journalListener->onDurable(token);
 }
 
-void WiredTigerSessionCache::waitUntilPreparedUnitOfWorkCommitsOrAborts(OperationContext* opCtx) {
+void WiredTigerSessionCache::waitUntilPreparedUnitOfWorkCommitsOrAborts(OperationContext* opCtx,
+                                                                        std::uint64_t lastCount) {
     invariant(opCtx);
     stdx::unique_lock<stdx::mutex> lk(_prepareCommittedOrAbortedMutex);
-
-    auto lastCounter = _lastCommitOrAbortCounter;
-    opCtx->waitForConditionOrInterrupt(_prepareCommittedOrAbortedCond, lk, [&] {
-        return lastCounter != _lastCommitOrAbortCounter;
-    });
+    if (lastCount == _prepareCommitOrAbortCounter.loadRelaxed()) {
+        opCtx->waitForConditionOrInterrupt(_prepareCommittedOrAbortedCond, lk, [&] {
+            return _prepareCommitOrAbortCounter.loadRelaxed() > lastCount;
+        });
+    }
 }
 
 void WiredTigerSessionCache::notifyPreparedUnitOfWorkHasCommittedOrAborted() {
-    {
-        stdx::unique_lock<stdx::mutex> lk(_prepareCommittedOrAbortedMutex);
-        _lastCommitOrAbortCounter++;
-    }
+    stdx::unique_lock<stdx::mutex> lk(_prepareCommittedOrAbortedMutex);
+    _prepareCommitOrAbortCounter.fetchAndAdd(1);
     _prepareCommittedOrAbortedCond.notify_all();
 }
 
@@ -496,7 +465,7 @@ void WiredTigerSessionCache::releaseSession(WiredTigerSession* session) {
         // Release resources in the session we're about to cache.
         // If we are using hybrid caching, then close cursors now and let them
         // be cached at the WiredTiger level.
-        if (kWiredTigerCursorCacheSize.load() < 0) {
+        if (gWiredTigerCursorCacheSize.load() < 0) {
             session->closeAllCursors("");
         }
         invariantWTOK(ss->reset(ss));
@@ -539,7 +508,7 @@ void WiredTigerSessionCache::setJournalListener(JournalListener* jl) {
 }
 
 bool WiredTigerSessionCache::isEngineCachingCursors() {
-    return kWiredTigerCursorCacheSize.load() <= 0;
+    return gWiredTigerCursorCacheSize.load() <= 0;
 }
 
 void WiredTigerSessionCache::WiredTigerSessionDeleter::operator()(

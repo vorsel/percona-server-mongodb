@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -143,13 +142,13 @@ public:
     /**
      * Unlike `waitUntilDurable`, this method takes a stable checkpoint, making durable any writes
      * on unjournaled tables that are behind the current stable timestamp. If the storage engine
-     * is starting from an "unstable" checkpoint, this method call will turn into an unstable
-     * checkpoint.
+     * is starting from an "unstable" checkpoint or 'stableCheckpoint'=false, this method call will
+     * turn into an unstable checkpoint.
      *
      * This must not be called by a system taking user writes until after a stable timestamp is
      * passed to the storage engine.
      */
-    virtual bool waitUntilUnjournaledWritesDurable() {
+    virtual bool waitUntilUnjournaledWritesDurable(bool stableCheckpoint = true) {
         return waitUntilDurable();
     }
 
@@ -191,8 +190,6 @@ public:
      * a point in time. Any point in time returned will reflect one of the following:
      *  - when using ReadSource::kProvided, the timestamp provided.
      *  - when using ReadSource::kNoOverlap, the timestamp chosen by the storage engine.
-     *  - when using ReadSource::kLastAppliedSnapshot, the timestamp chosen using the storage
-     * engine's last applied timestamp.
      *  - when using ReadSource::kAllCommittedSnapshot, the timestamp chosen using the storage
      * engine's all-committed timestamp.
      *  - when using ReadSource::kLastApplied, the timestamp chosen using the storage engine's last
@@ -320,11 +317,6 @@ public:
          * timestamp.
          */
         kLastApplied,
-        /**
-         * Read from the last applied timestamp. New transactions will always read from the same
-         * timestamp and never advance.
-         */
-        kLastAppliedSnapshot,
         /**
          * Read from the all-committed timestamp. New transactions will always read from the same
          * timestamp and never advance.

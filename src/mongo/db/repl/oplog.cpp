@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -81,13 +80,13 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/timestamp_block.h"
 #include "mongo/db/repl/transaction_oplog_application.h"
-#include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/stats/server_write_concern_metrics.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/transaction_participant.h"
+#include "mongo/db/views/view_catalog.h"
 #include "mongo/platform/random.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/stdx/memory.h"
@@ -288,13 +287,18 @@ Status startIndexBuild(OperationContext* opCtx,
     if (!statusWithIndexes.isOK()) {
         return statusWithIndexes.getStatus();
     }
+
+    IndexBuildsCoordinator::IndexBuildOptions indexBuildOptions = {/*commitQuorum=*/boost::none};
+
+    // We don't pass in a commit quorum here because secondary nodes don't have any knowledge of it.
     return IndexBuildsCoordinator::get(opCtx)
         ->startIndexBuild(opCtx,
                           collUUID,
                           statusWithIndexes.getValue(),
                           indexBuildUUID,
                           /* This oplog entry is only replicated for two-phase index builds */
-                          IndexBuildProtocol::kTwoPhase)
+                          IndexBuildProtocol::kTwoPhase,
+                          indexBuildOptions)
         .getStatus();
 }
 
@@ -362,13 +366,21 @@ void createIndexForApplyOps(OperationContext* opCtx,
         Lock::TempRelease release(opCtx->lockState());
         // TempRelease cannot fail because no recursive locks should be taken.
         invariant(!opCtx->lockState()->isLocked());
-
-        IndexBuilder* builder = new IndexBuilder(
-            indexSpec, constraints, replicatedWrites, opCtx->recoveryUnit()->getCommitTimestamp());
+        auto collUUID = *indexCollection->uuid();
+        auto indexBuildUUID = UUID::gen();
+        auto indexBuildsCoordinator = IndexBuildsCoordinator::get(opCtx);
+        // We don't pass in a commit quorum here because secondary nodes don't have any knowledge of
+        // it.
+        IndexBuildsCoordinator::IndexBuildOptions indexBuildOptions = {
+            /*commitQuorum=*/boost::none};
         // This spawns a new thread and returns immediately.
-        builder->go();
-        // Wait for thread to start and register itself
-        IndexBuilder::waitForBgIndexStarting();
+        MONGO_COMPILER_VARIABLE_UNUSED auto fut = uassertStatusOK(
+            indexBuildsCoordinator->startIndexBuild(opCtx,
+                                                    collUUID,
+                                                    {indexSpec},
+                                                    indexBuildUUID,
+                                                    IndexBuildProtocol::kSinglePhase,
+                                                    indexBuildOptions));
     }
 
     opCtx->recoveryUnit()->abandonSnapshot();
@@ -427,7 +439,8 @@ OplogDocWriter _logOpWriter(OperationContext* opCtx,
                             const OperationSessionInfo& sessionInfo,
                             StmtId statementId,
                             const OplogLink& oplogLink,
-                            bool prepare) {
+                            bool prepare,
+                            bool inTxn) {
     BSONObjBuilder b(256);
 
     b.append("ts", optime.getTimestamp());
@@ -453,6 +466,10 @@ OplogDocWriter _logOpWriter(OperationContext* opCtx,
 
     if (prepare) {
         b.appendBool(OplogEntryBase::kPrepareFieldName, true);
+    }
+
+    if (inTxn) {
+        b.appendBool(OplogEntryBase::kInTxnFieldName, true);
     }
 
     return OplogDocWriter(OplogDocWriter(b.obj(), obj));
@@ -531,6 +548,7 @@ OpTime logOp(OperationContext* opCtx,
              StmtId statementId,
              const OplogLink& oplogLink,
              bool prepare,
+             bool inTxn,
              const OplogSlot& oplogSlot) {
     // All collections should have UUIDs now, so all insert, update, and delete oplog entries should
     // also have uuids. Some no-op (n) and command (c) entries may still elide the uuid field.
@@ -585,7 +603,8 @@ OpTime logOp(OperationContext* opCtx,
                                sessionInfo,
                                statementId,
                                oplogLink,
-                               prepare);
+                               prepare,
+                               inTxn);
     const DocWriter* basePtr = &writer;
     auto timestamp = slot.opTime.getTimestamp();
     _logOpsInner(opCtx, nss, &basePtr, &timestamp, 1, oplog, slot.opTime);
@@ -634,7 +653,7 @@ std::vector<OpTime> logInsertOps(OperationContext* opCtx,
     if (txnParticipant) {
         sessionInfo.setSessionId(*opCtx->getLogicalSessionId());
         sessionInfo.setTxnNumber(*opCtx->getTxnNumber());
-        oplogLink.prevOpTime = txnParticipant->getLastWriteOpTime();
+        oplogLink.prevOpTime = txnParticipant.getLastWriteOpTime();
     }
 
     auto timestamps = stdx::make_unique<Timestamp[]>(count);
@@ -661,7 +680,8 @@ std::vector<OpTime> logInsertOps(OperationContext* opCtx,
                                           sessionInfo,
                                           begin[i].stmtId,
                                           oplogLink,
-                                          prepare));
+                                          prepare,
+                                          false /* inTxn */));
         oplogLink.prevOpTime = insertStatementOplogSlot.opTime;
         timestamps[i] = oplogLink.prevOpTime.getTimestamp();
         opTimes.push_back(insertStatementOplogSlot.opTime);
@@ -799,17 +819,6 @@ void createOplog(OperationContext* opCtx) {
     createOplog(opCtx, localOplogInfo(opCtx->getServiceContext()).oplogName, isReplSet);
 }
 
-MONGO_REGISTER_SHIM(GetNextOpTimeClass::getNextOpTime)(OperationContext* opCtx)->OplogSlot {
-    // The local oplog collection pointer must already be established by this point.
-    // We can't establish it here because that would require locking the local database, which would
-    // be a lock order violation.
-    auto oplog = localOplogInfo(opCtx->getServiceContext()).oplog;
-    invariant(oplog);
-    OplogSlot os;
-    _getNextOpTimes(opCtx, oplog, 1, &os);
-    return os;
-}
-
 OplogSlot getNextOpTimeNoPersistForTesting(OperationContext* opCtx) {
     auto oplog = localOplogInfo(opCtx->getServiceContext()).oplog;
     invariant(oplog);
@@ -819,7 +828,8 @@ OplogSlot getNextOpTimeNoPersistForTesting(OperationContext* opCtx) {
     return os;
 }
 
-std::vector<OplogSlot> getNextOpTimes(OperationContext* opCtx, std::size_t count) {
+MONGO_REGISTER_SHIM(GetNextOpTimeClass::getNextOpTimes)
+(OperationContext* opCtx, std::size_t count)->std::vector<OplogSlot> {
     // The local oplog collection pointer must already be established by this point.
     // We can't establish it here because that would require locking the local database, which would
     // be a lock order violation.
@@ -830,7 +840,6 @@ std::vector<OplogSlot> getNextOpTimes(OperationContext* opCtx, std::size_t count
     _getNextOpTimes(opCtx, oplog, count, &(*oplogSlot));
     return oplogSlots;
 }
-
 
 // -------------------------------------
 
@@ -887,7 +896,8 @@ using OpApplyFn = stdx::function<Status(OperationContext* opCtx,
                                         BSONObj& cmd,
                                         const OpTime& opTime,
                                         const OplogEntry& entry,
-                                        OplogApplication::Mode mode)>;
+                                        OplogApplication::Mode mode,
+                                        boost::optional<Timestamp> stableTimestampForRecovery)>;
 
 struct ApplyOpMetadata {
     OpApplyFn applyFunc;
@@ -903,7 +913,7 @@ struct ApplyOpMetadata {
     }
 };
 
-std::map<std::string, ApplyOpMetadata> opsMap = {
+const StringMap<ApplyOpMetadata> kOpsMap = {
     {"create",
      {[](OperationContext* opCtx,
          const char* ns,
@@ -911,8 +921,10 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          BSONObj& cmd,
          const OpTime& opTime,
          const OplogEntry& entry,
-         OplogApplication::Mode mode) -> Status {
+         OplogApplication::Mode mode,
+         boost::optional<Timestamp> stableTimestampForRecovery) -> Status {
           const NamespaceString nss(parseNs(ns, cmd));
+          Lock::DBLock dbXLock(opCtx, nss.db(), MODE_X);
           if (auto idIndexElem = cmd["idIndex"]) {
               // Remove "idIndex" field from command.
               auto cmdWithoutIdIndex = cmd.removeField("idIndex");
@@ -938,7 +950,8 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          BSONObj& cmd,
          const OpTime& opTime,
          const OplogEntry& entry,
-         OplogApplication::Mode mode) -> Status {
+         OplogApplication::Mode mode,
+         boost::optional<Timestamp> stableTimestampForRecovery) -> Status {
           const NamespaceString nss(parseUUIDorNs(opCtx, ns, ui, cmd));
           BSONElement first = cmd.firstElement();
           invariant(first.fieldNameStringData() == "createIndexes");
@@ -953,7 +966,9 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
           createIndexForApplyOps(opCtx, indexSpec, nss, {}, mode);
           return Status::OK();
       },
-      {ErrorCodes::IndexAlreadyExists, ErrorCodes::NamespaceNotFound}}},
+      {ErrorCodes::IndexAlreadyExists,
+       ErrorCodes::IndexBuildAlreadyInProgress,
+       ErrorCodes::NamespaceNotFound}}},
     {"startIndexBuild",
      {[](OperationContext* opCtx,
          const char* ns,
@@ -961,7 +976,8 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          BSONObj& cmd,
          const OpTime& opTime,
          const OplogEntry& entry,
-         OplogApplication::Mode mode) -> Status {
+         OplogApplication::Mode mode,
+         boost::optional<Timestamp> stableTimestampForRecovery) -> Status {
          // {
          //     "startIndexBuild" : "coll",
          //     "indexBuildUUID" : <UUID>,
@@ -1016,7 +1032,8 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          BSONObj& cmd,
          const OpTime& opTime,
          const OplogEntry& entry,
-         OplogApplication::Mode mode) -> Status {
+         OplogApplication::Mode mode,
+         boost::optional<Timestamp> stableTimestampForRecovery) -> Status {
          // {
          //     "commitIndexBuild" : "coll",
          //     "indexBuildUUID" : <UUID>,
@@ -1076,7 +1093,8 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          BSONObj& cmd,
          const OpTime& opTme,
          const OplogEntry& entry,
-         OplogApplication::Mode mode) -> Status {
+         OplogApplication::Mode mode,
+         boost::optional<Timestamp> stableTimestampForRecovery) -> Status {
          // {
          //     "abortIndexBuild" : "coll",
          //     "indexBuildUUID" : <UUID>,
@@ -1137,7 +1155,8 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          BSONObj& cmd,
          const OpTime& opTime,
          const OplogEntry& entry,
-         OplogApplication::Mode mode) -> Status {
+         OplogApplication::Mode mode,
+         boost::optional<Timestamp> stableTimestampForRecovery) -> Status {
           NamespaceString nss;
           std::tie(std::ignore, nss) = parseCollModUUIDAndNss(opCtx, ui, ns, cmd);
           // The collMod for apply ops could be either a user driven collMod or a collMod triggered
@@ -1153,7 +1172,8 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          BSONObj& cmd,
          const OpTime& opTime,
          const OplogEntry& entry,
-         OplogApplication::Mode mode) -> Status {
+         OplogApplication::Mode mode,
+         boost::optional<Timestamp> stableTimestampForRecovery) -> Status {
           return dropDatabase(opCtx, NamespaceString(ns).db().toString());
       },
       {ErrorCodes::NamespaceNotFound}}},
@@ -1164,7 +1184,8 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          BSONObj& cmd,
          const OpTime& opTime,
          const OplogEntry& entry,
-         OplogApplication::Mode mode) -> Status {
+         OplogApplication::Mode mode,
+         boost::optional<Timestamp> stableTimestampForRecovery) -> Status {
           BSONObjBuilder resultWeDontCareAbout;
           auto nss = parseUUIDorNs(opCtx, ns, ui, cmd);
           if (nss.isDropPendingNamespace()) {
@@ -1189,7 +1210,8 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          BSONObj& cmd,
          const OpTime& opTime,
          const OplogEntry& entry,
-         OplogApplication::Mode mode) -> Status {
+         OplogApplication::Mode mode,
+         boost::optional<Timestamp> stableTimestampForRecovery) -> Status {
           BSONObjBuilder resultWeDontCareAbout;
           return dropIndexes(opCtx, parseUUIDorNs(opCtx, ns, ui, cmd), cmd, &resultWeDontCareAbout);
       },
@@ -1201,7 +1223,8 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          BSONObj& cmd,
          const OpTime& opTime,
          const OplogEntry& entry,
-         OplogApplication::Mode mode) -> Status {
+         OplogApplication::Mode mode,
+         boost::optional<Timestamp> stableTimestampForRecovery) -> Status {
           BSONObjBuilder resultWeDontCareAbout;
           return dropIndexes(opCtx, parseUUIDorNs(opCtx, ns, ui, cmd), cmd, &resultWeDontCareAbout);
       },
@@ -1213,7 +1236,8 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          BSONObj& cmd,
          const OpTime& opTime,
          const OplogEntry& entry,
-         OplogApplication::Mode mode) -> Status {
+         OplogApplication::Mode mode,
+         boost::optional<Timestamp> stableTimestampForRecovery) -> Status {
           BSONObjBuilder resultWeDontCareAbout;
           return dropIndexes(opCtx, parseUUIDorNs(opCtx, ns, ui, cmd), cmd, &resultWeDontCareAbout);
       },
@@ -1225,7 +1249,8 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          BSONObj& cmd,
          const OpTime& opTime,
          const OplogEntry& entry,
-         OplogApplication::Mode mode) -> Status {
+         OplogApplication::Mode mode,
+         boost::optional<Timestamp> stableTimestampForRecovery) -> Status {
           BSONObjBuilder resultWeDontCareAbout;
           return dropIndexes(opCtx, parseUUIDorNs(opCtx, ns, ui, cmd), cmd, &resultWeDontCareAbout);
       },
@@ -1237,7 +1262,8 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          BSONObj& cmd,
          const OpTime& opTime,
          const OplogEntry& entry,
-         OplogApplication::Mode mode) -> Status {
+         OplogApplication::Mode mode,
+         boost::optional<Timestamp> stableTimestampForRecovery) -> Status {
           return renameCollectionForApplyOps(opCtx, nsToDatabase(ns), ui, cmd, opTime);
       },
       {ErrorCodes::NamespaceNotFound, ErrorCodes::NamespaceExists}}},
@@ -1248,7 +1274,8 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          BSONObj& cmd,
          const OpTime& opTime,
          const OplogEntry& entry,
-         OplogApplication::Mode mode) -> Status {
+         OplogApplication::Mode mode,
+         boost::optional<Timestamp> stableTimestampForRecovery) -> Status {
          return applyApplyOpsOplogEntry(opCtx, entry, mode);
      }}},
     {"convertToCapped",
@@ -1258,7 +1285,8 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          BSONObj& cmd,
          const OpTime& opTime,
          const OplogEntry& entry,
-         OplogApplication::Mode mode) -> Status {
+         OplogApplication::Mode mode,
+         boost::optional<Timestamp> stableTimestampForRecovery) -> Status {
           convertToCapped(opCtx, parseUUIDorNs(opCtx, ns, ui, cmd), cmd["size"].number());
           return Status::OK();
       },
@@ -1270,7 +1298,8 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          BSONObj& cmd,
          const OpTime& opTime,
          const OplogEntry& entry,
-         OplogApplication::Mode mode) -> Status {
+         OplogApplication::Mode mode,
+         boost::optional<Timestamp> stableTimestampForRecovery) -> Status {
           return emptyCapped(opCtx, parseUUIDorNs(opCtx, ns, ui, cmd));
       },
       {ErrorCodes::NamespaceNotFound}}},
@@ -1281,7 +1310,8 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          BSONObj& cmd,
          const OpTime& opTime,
          const OplogEntry& entry,
-         OplogApplication::Mode mode) -> Status {
+         OplogApplication::Mode mode,
+         boost::optional<Timestamp> stableTimestampForRecovery) -> Status {
          return applyCommitTransaction(opCtx, entry, mode);
      }}},
     {"abortTransaction",
@@ -1291,7 +1321,8 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          BSONObj& cmd,
          const OpTime& opTime,
          const OplogEntry& entry,
-         OplogApplication::Mode mode) -> Status {
+         OplogApplication::Mode mode,
+         boost::optional<Timestamp> stableTimestampForRecovery) -> Status {
          return applyAbortTransaction(opCtx, entry, mode);
      }}},
 };
@@ -1392,26 +1423,17 @@ Status applyOperation_inlock(OperationContext* opCtx,
                 collection);
         requestNss = collection->ns();
         dassert(opCtx->lockState()->isCollectionLockedForMode(
-                    requestNss.ns(), supportsDocLocking() ? MODE_IX : MODE_X),
-                requestNss.ns());
+            requestNss, supportsDocLocking() ? MODE_IX : MODE_X));
     } else {
         uassert(ErrorCodes::InvalidNamespace,
                 "'ns' must be of type String",
                 fieldNs.type() == BSONType::String);
         const StringData ns = fieldNs.valuestrsafe();
         requestNss = NamespaceString(ns);
-        if (nsIsFull(ns)) {
-            if (supportsDocLocking()) {
-                // WiredTiger, and others requires MODE_IX since the applier threads driving
-                // this allow writes to the same collection on any thread.
-                dassert(opCtx->lockState()->isCollectionLockedForMode(ns, MODE_IX),
-                        requestNss.ns());
-            } else {
-                // mmapV1 ensures that all operations to the same collection are executed from
-                // the same worker thread, so it takes an exclusive lock (MODE_X)
-                dassert(opCtx->lockState()->isCollectionLockedForMode(ns, MODE_X), requestNss.ns());
-            }
-        }
+        invariant(requestNss.coll().size());
+        dassert(opCtx->lockState()->isCollectionLockedForMode(
+                    requestNss, supportsDocLocking() ? MODE_IX : MODE_X),
+                requestNss.ns());
         collection = db->getCollection(opCtx, requestNss);
     }
 
@@ -1439,7 +1461,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
     const bool haveWrappingWriteUnitOfWork = opCtx->lockState()->inAWriteUnitOfWork();
     uassert(ErrorCodes::CommandNotSupportedOnView,
             str::stream() << "applyOps not supported on view: " << requestNss.ns(),
-            collection || !db->getViewCatalog()->lookup(opCtx, requestNss.ns()));
+            collection || !ViewCatalog::get(db)->lookup(opCtx, requestNss.ns()));
 
     // This code must decide what timestamp the storage engine should make the upcoming writes
     // visible with. The requirements and use-cases:
@@ -1806,9 +1828,14 @@ Status applyOperation_inlock(OperationContext* opCtx,
 Status applyCommand_inlock(OperationContext* opCtx,
                            const BSONObj& op,
                            const OplogEntry& entry,
-                           OplogApplication::Mode mode) {
+                           OplogApplication::Mode mode,
+                           boost::optional<Timestamp> stableTimestampForRecovery) {
+    // We should only have a stableTimestampForRecovery during replication recovery.
+    invariant(stableTimestampForRecovery == boost::none ||
+              mode == OplogApplication::Mode::kRecovering);
     LOG(3) << "applying command op: " << redact(op)
-           << ", oplog application mode: " << OplogApplication::modeToString(mode);
+           << ", oplog application mode: " << OplogApplication::modeToString(mode)
+           << ", stable timestamp for recovery: " << stableTimestampForRecovery;
 
     std::array<StringData, 4> names = {"o", "ui", "ns", "op"};
     std::array<BSONElement, 4> fields;
@@ -1849,7 +1876,7 @@ Status applyCommand_inlock(OperationContext* opCtx,
         Lock::DBLock lock(opCtx, nss.db(), MODE_IS);
         auto databaseHolder = DatabaseHolder::get(opCtx);
         auto db = databaseHolder->getDb(opCtx, nss.ns());
-        if (db && !db->getCollection(opCtx, nss) && db->getViewCatalog()->lookup(opCtx, nss.ns())) {
+        if (db && !db->getCollection(opCtx, nss) && ViewCatalog::get(db)->lookup(opCtx, nss.ns())) {
             return {ErrorCodes::CommandNotSupportedOnView,
                     str::stream() << "applyOps not supported on view:" << nss.ns()};
         }
@@ -1921,23 +1948,33 @@ Status applyCommand_inlock(OperationContext* opCtx,
 
     bool done = false;
     while (!done) {
-        auto op = opsMap.find(o.firstElementFieldName());
-        if (op == opsMap.end()) {
+        auto op = kOpsMap.find(o.firstElementFieldName());
+        if (op == kOpsMap.end()) {
             return Status(ErrorCodes::BadValue,
                           mongoutils::str::stream() << "Invalid key '" << o.firstElementFieldName()
                                                     << "' found in field 'o'");
         }
-        ApplyOpMetadata curOpToApply = op->second;
-        Status status = Status::OK();
-        try {
-            // If 'writeTime' is not null, any writes in this scope will be given 'writeTime' as
-            // their timestamp at commit.
-            TimestampBlock tsBlock(opCtx, writeTime);
-            status =
-                curOpToApply.applyFunc(opCtx, nss.ns().c_str(), fieldUI, o, opTime, entry, mode);
-        } catch (...) {
-            status = exceptionToStatus();
-        }
+
+        const ApplyOpMetadata& curOpToApply = op->second;
+
+        Status status = [&] {
+            try {
+                // If 'writeTime' is not null, any writes in this scope will be given 'writeTime' as
+                // their timestamp at commit.
+                TimestampBlock tsBlock(opCtx, writeTime);
+                return curOpToApply.applyFunc(opCtx,
+                                              nss.ns().c_str(),
+                                              fieldUI,
+                                              o,
+                                              opTime,
+                                              entry,
+                                              mode,
+                                              stableTimestampForRecovery);
+            } catch (const DBException& ex) {
+                return ex.toStatus();
+            }
+        }();
+
         switch (status.code()) {
             case ErrorCodes::WriteConflict: {
                 // Need to throw this up to a higher level where it will be caught and the
@@ -1966,12 +2003,13 @@ Status applyCommand_inlock(OperationContext* opCtx,
                 opCtx->checkForInterrupt();
                 break;
             }
-            default:
+            default: {
                 if (!curOpToApply.acceptableErrors.count(status.code())) {
                     error() << "Failed command " << redact(o) << " on " << nss.db()
                             << " with status " << status << " during oplog application";
                     return status;
                 }
+            }
             // fallthrough
             case ErrorCodes::OK:
                 done = true;

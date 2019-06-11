@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -81,12 +80,20 @@ public:
     // MongoDB-specific (non-standard) JSON Schema keyword constants.
     static constexpr StringData kSchemaBsonTypeKeyword = "bsonType"_sd;
     static constexpr StringData kSchemaEncryptKeyword = "encrypt"_sd;
+    static constexpr StringData kSchemaEncryptMetadataKeyword = "encryptMetadata"_sd;
 
     /**
      * Converts a JSON schema, represented as BSON, into a semantically equivalent match expression
      * tree. Returns a non-OK status if the schema is invalid or cannot be parsed.
      */
     static StatusWithMatchExpression parse(BSONObj schema, bool ignoreUnknownKeywords = false);
+
+    /**
+     * Builds a set of type aliases from the given type element using 'aliasMap'. Returns a non-OK
+     * status if 'typeElt' is invalid or does not contain an entry in the 'aliasMap'.
+     */
+    static StatusWith<MatcherTypeSet> parseTypeSet(BSONElement typeElt,
+                                                   const StringMap<BSONType>& aliasMap);
 };
 
 }  // namespace mongo

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -38,7 +37,6 @@
 #include "mongo/db/commands/txn_cmds_gen.h"
 #include "mongo/db/commands/txn_two_phase_commit_cmds_gen.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/server_parameters.h"
 #include "mongo/s/catalog/sharding_catalog_client_mock.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/unittest/unittest.h"
@@ -59,7 +57,7 @@ void TransactionCoordinatorTestFixture::setUp() {
     ASSERT_OK(ServerParameterSet::getGlobal()
                   ->getMap()
                   .find("logComponentVerbosity")
-                  ->second->setFromString("{verbosity: 3}"));
+                  ->second->setFromString("{transaction: {verbosity: 3}}"));
 
     for (const auto& shardId : kThreeShardIdList) {
         auto shardTargeter = RemoteCommandTargeterMock::get(
@@ -102,7 +100,7 @@ void TransactionCoordinatorTestFixture::assertCommandSentAndRespondWith(
     const StatusWith<BSONObj>& response,
     boost::optional<BSONObj> expectedWriteConcern) {
     onCommand([&](const executor::RemoteCommandRequest& request) {
-        ASSERT_EQ(request.cmdObj.firstElement().fieldNameStringData(), commandName);
+        ASSERT_EQ(commandName, request.cmdObj.firstElement().fieldNameStringData());
         if (expectedWriteConcern) {
             ASSERT_BSONOBJ_EQ(
                 *expectedWriteConcern,

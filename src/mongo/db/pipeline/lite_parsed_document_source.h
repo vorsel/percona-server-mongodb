@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -106,14 +105,6 @@ public:
      */
     virtual bool isChangeStream() const {
         return false;
-    }
-
-    /**
-     * Returns true if this pipeline's UUID and collation should be resolved. For the latter, this
-     * means adopting the collection's default collation, unless a custom collation was specified.
-     */
-    virtual bool shouldResolveUUIDAndCollation() const {
-        return true;
     }
 
     /**

@@ -1,6 +1,3 @@
-// documentsourcetests.cpp : Unit tests for DocumentSource classes.
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,6 +25,10 @@
  *    delete this exception statement from your version. If you delete this
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
+ */
+
+/**
+ * Unit tests for DocumentSource classes.
  */
 
 #include "mongo/platform/basic.h"
@@ -248,43 +249,6 @@ TEST_F(DocumentSourceCursorTest, LimitCoalesce) {
     ASSERT(source()->getNext().isAdvanced());
     ASSERT(source()->getNext().isAdvanced());
     ASSERT(source()->getNext().isEOF());
-}
-
-//
-// Test cursor output sort.
-//
-TEST_F(DocumentSourceCursorTest, CollectionScanProvidesNoSort) {
-    createSource(BSON("$natural" << 1));
-    ASSERT_EQ(source()->getOutputSorts().size(), 0U);
-    source()->dispose();
-}
-
-TEST_F(DocumentSourceCursorTest, IndexScanProvidesSortOnKeys) {
-    client.createIndex(nss.ns(), BSON("a" << 1));
-    createSource(BSON("a" << 1));
-
-    ASSERT_EQ(source()->getOutputSorts().size(), 1U);
-    ASSERT_EQ(source()->getOutputSorts().count(BSON("a" << 1)), 1U);
-    source()->dispose();
-}
-
-TEST_F(DocumentSourceCursorTest, ReverseIndexScanProvidesSort) {
-    client.createIndex(nss.ns(), BSON("a" << -1));
-    createSource(BSON("a" << -1));
-
-    ASSERT_EQ(source()->getOutputSorts().size(), 1U);
-    ASSERT_EQ(source()->getOutputSorts().count(BSON("a" << -1)), 1U);
-    source()->dispose();
-}
-
-TEST_F(DocumentSourceCursorTest, CompoundIndexScanProvidesMultipleSorts) {
-    client.createIndex(nss.ns(), BSON("a" << 1 << "b" << -1));
-    createSource(BSON("a" << 1 << "b" << -1));
-
-    ASSERT_EQ(source()->getOutputSorts().size(), 2U);
-    ASSERT_EQ(source()->getOutputSorts().count(BSON("a" << 1)), 1U);
-    ASSERT_EQ(source()->getOutputSorts().count(BSON("a" << 1 << "b" << -1)), 1U);
-    source()->dispose();
 }
 
 TEST_F(DocumentSourceCursorTest, SerializationNoExplainLevel) {

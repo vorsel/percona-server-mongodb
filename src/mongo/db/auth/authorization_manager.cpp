@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -69,6 +68,7 @@ mongo::AuthInfo mongo::internalSecurity;
 
 namespace mongo {
 
+constexpr StringData AuthorizationManager::USERID_FIELD_NAME;
 constexpr StringData AuthorizationManager::USER_NAME_FIELD_NAME;
 constexpr StringData AuthorizationManager::USER_DB_FIELD_NAME;
 constexpr StringData AuthorizationManager::ROLE_NAME_FIELD_NAME;

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -199,6 +198,8 @@ void cleanupTask(ServiceContext* serviceContext) {
             uniqueTxn = client.makeOperationContext();
             opCtx = uniqueTxn.get();
         }
+
+        opCtx->setIsExecutingShutdown();
 
         if (serviceContext) {
             serviceContext->setKillAllOperations();

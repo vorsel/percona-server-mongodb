@@ -1,6 +1,3 @@
-// processinfo_none.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -35,8 +32,6 @@
 #include <iostream>
 
 #include "mongo/util/processinfo.h"
-
-using namespace std;
 
 namespace mongo {
 
@@ -76,7 +71,7 @@ bool ProcessInfo::blockInMemory(const void* start) {
     verify(0);
 }
 
-bool ProcessInfo::pagesInMemory(const void* start, size_t numPages, vector<char>* out) {
+bool ProcessInfo::pagesInMemory(const void* start, size_t numPages, std::vector<char>* out) {
     verify(0);
 }
 

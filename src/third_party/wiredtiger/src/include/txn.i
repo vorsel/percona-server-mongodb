@@ -35,6 +35,12 @@ __wt_txn_timestamp_flags(WT_SESSION_IMPL *session)
 		F_SET(&session->txn, WT_TXN_TS_COMMIT_KEYS);
 	if (FLD_ISSET(btree->assert_flags, WT_ASSERT_COMMIT_TS_NEVER))
 		F_SET(&session->txn, WT_TXN_TS_COMMIT_NEVER);
+	if (FLD_ISSET(btree->assert_flags, WT_ASSERT_DURABLE_TS_ALWAYS))
+		F_SET(&session->txn, WT_TXN_TS_DURABLE_ALWAYS);
+	if (FLD_ISSET(btree->assert_flags, WT_ASSERT_DURABLE_TS_KEYS))
+		F_SET(&session->txn, WT_TXN_TS_DURABLE_KEYS);
+	if (FLD_ISSET(btree->assert_flags, WT_ASSERT_DURABLE_TS_NEVER))
+		F_SET(&session->txn, WT_TXN_TS_DURABLE_NEVER);
 }
 
 /*
@@ -129,8 +135,8 @@ __txn_resolve_prepared_update(WT_SESSION_IMPL *session, WT_UPDATE *upd)
 	 */
 	upd->prepare_state = WT_PREPARE_LOCKED;
 	WT_WRITE_BARRIER();
-	upd->timestamp = txn->commit_timestamp;
-	upd->durable_timestamp = txn->durable_timestamp;
+	upd->start_ts = txn->commit_timestamp;
+	upd->durable_ts = txn->durable_timestamp;
 	WT_PUBLISH(upd->prepare_state, WT_PREPARE_RESOLVED);
 }
 
@@ -382,7 +388,7 @@ __wt_txn_op_apply_prepare_state(
 	}
 	for (updp = ref->page_del->update_list;
 	    updp != NULL && *updp != NULL; ++updp) {
-		(*updp)->timestamp = ts;
+		(*updp)->start_ts = ts;
 		/*
 		 * Holding the ref locked means we have exclusive access, so if
 		 * we are committing we don't need to use the prepare locked
@@ -390,7 +396,7 @@ __wt_txn_op_apply_prepare_state(
 		 */
 		(*updp)->prepare_state = prepare_state;
 		if (commit)
-			(*updp)->durable_timestamp = txn->durable_timestamp;
+			(*updp)->durable_ts = txn->durable_timestamp;
 	}
 	ref->page_del->timestamp = ts;
 	if (commit)
@@ -446,13 +452,13 @@ __wt_txn_op_set_timestamp(WT_SESSION_IMPL *session, WT_TXN_OP *op)
 		 * commit and durable timestamps need to be updated.
 		 */
 		timestamp = op->type == WT_TXN_OP_REF_DELETE ?
-		    &op->u.ref->page_del->timestamp : &op->u.op_upd->timestamp;
+		    &op->u.ref->page_del->timestamp : &op->u.op_upd->start_ts;
 		if (*timestamp == WT_TS_NONE) {
 			*timestamp = txn->commit_timestamp;
 
 			timestamp = op->type == WT_TXN_OP_REF_DELETE ?
 			    &op->u.ref->page_del->durable_timestamp :
-			    &op->u.op_upd->durable_timestamp;
+			    &op->u.op_upd->durable_ts;
 			*timestamp = txn->durable_timestamp;
 		}
 	}
@@ -684,7 +690,7 @@ __wt_txn_upd_visible_all(WT_SESSION_IMPL *session, WT_UPDATE *upd)
 	    upd->prepare_state == WT_PREPARE_INPROGRESS)
 		return (false);
 
-	return (__wt_txn_visible_all(session, upd->txnid, upd->timestamp));
+	return (__wt_txn_visible_all(session, upd->txnid, upd->start_ts));
 }
 
 /*
@@ -782,8 +788,8 @@ __wt_txn_upd_visible_type(WT_SESSION_IMPL *session, WT_UPDATE *upd)
 		if (prepare_state == WT_PREPARE_LOCKED)
 			continue;
 
-		upd_visible = __wt_txn_visible(
-		    session, upd->txnid, upd->timestamp);
+		upd_visible =
+		    __wt_txn_visible(session, upd->txnid, upd->start_ts);
 
 		/*
 		 * The visibility check is only valid if the update does not
@@ -817,7 +823,7 @@ __wt_txn_upd_durable(WT_SESSION_IMPL *session, WT_UPDATE *upd)
 	/* If update is visible then check if it is durable. */
 	if (__wt_txn_upd_visible_type(session, upd) != WT_VISIBLE_TRUE)
 		return (false);
-	return (__wt_txn_visible(session, upd->txnid, upd->durable_timestamp));
+	return (__wt_txn_visible(session, upd->txnid, upd->durable_ts));
 }
 
 /*
@@ -966,14 +972,16 @@ __wt_txn_id_alloc(WT_SESSION_IMPL *session, bool publish)
 	/*
 	 * Allocating transaction IDs involves several steps.
 	 *
-	 * Firstly, we do an atomic increment to allocate a unique ID.  The
-	 * field we increment is not used anywhere else.
+	 * Firstly, publish that this transaction is allocating its ID, then
+	 * publish the transaction ID as the current global ID.  Note that this
+	 * transaction ID might not be unique among threads and hence not valid
+	 * at this moment. The flag will notify other transactions that are
+	 * attempting to get their own snapshot for this transaction ID to
+	 * retry.
 	 *
-	 * Then we optionally publish the allocated ID into the global
-	 * transaction table.  It is critical that this becomes visible before
-	 * the global current value moves past our ID, or some concurrent
-	 * reader could get a snapshot that makes our changes visible before we
-	 * commit.
+	 * Then we do an atomic increment to allocate a unique ID. This will
+	 * give the valid ID to this transaction that we publish to the global
+	 * transaction table.
 	 *
 	 * We want the global value to lead the allocated values, so that any
 	 * allocated transaction ID eventually becomes globally visible.  When
@@ -985,21 +993,16 @@ __wt_txn_id_alloc(WT_SESSION_IMPL *session, bool publish)
 	 * for unlocked reads to be well defined, we must use an atomic
 	 * increment here.
 	 */
-	__wt_spin_lock(session, &txn_global->id_lock);
-	id = txn_global->current;
-
 	if (publish) {
+		WT_PUBLISH(txn_state->is_allocating, true);
+		WT_PUBLISH(txn_state->id, txn_global->current);
+		id = __wt_atomic_addv64(&txn_global->current, 1) - 1;
 		session->txn.id = id;
 		WT_PUBLISH(txn_state->id, id);
-	}
+		WT_PUBLISH(txn_state->is_allocating, false);
+	} else
+		id = __wt_atomic_addv64(&txn_global->current, 1) - 1;
 
-	/*
-	 * Even though we are in a spinlock, readers are not.  We rely on
-	 * atomic reads of the current ID to create snapshots, so for unlocked
-	 * reads to be well defined, we must use an atomic increment here.
-	 */
-	(void)__wt_atomic_addv64(&txn_global->current, 1);
-	__wt_spin_unlock(session, &txn_global->id_lock);
 	return (id);
 }
 
@@ -1187,7 +1190,14 @@ __wt_txn_am_oldest(WT_SESSION_IMPL *session)
 
 	WT_ORDERED_READ(session_cnt, conn->session_cnt);
 	for (i = 0, s = txn_global->states; i < session_cnt; i++, s++)
-		if ((id = s->id) != WT_TXN_NONE && WT_TXNID_LT(id, txn->id))
+		/*
+		 * We are checking if the transaction is oldest one in the
+		 * system. It is safe to ignore any sessions that are
+		 * allocating transaction IDs, since we already have an ID,
+		 * they are guaranteed to be newer.
+		 */
+		if (!s->is_allocating && (id = s->id) != WT_TXN_NONE &&
+		    WT_TXNID_LT(id, txn->id))
 			return (false);
 
 	return (true);

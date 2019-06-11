@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -80,7 +79,8 @@ public:
      */
     static Status syncApply(OperationContext* opCtx,
                             const BSONObj& o,
-                            OplogApplication::Mode oplogApplicationMode);
+                            OplogApplication::Mode oplogApplicationMode,
+                            boost::optional<Timestamp> stableTimestampForRecovery);
 
     /**
      *
@@ -263,6 +263,14 @@ private:
                             MultiApplier::Operations* ops,
                             std::vector<MultiApplier::OperationPtrs>* writerVectors,
                             std::vector<MultiApplier::Operations>* derivedOps);
+
+    /**
+     * Doles out all the work to the writer pool threads. Does not modify writerVectors, but passes
+     * non-const pointers to inner vectors into func.
+     */
+    void _applyOps(std::vector<MultiApplier::OperationPtrs>& writerVectors,
+                   std::vector<Status>* statusVector,
+                   std::vector<WorkerMultikeyPathInfo>* workerMultikeyPathInfo);
 
     OplogApplier::Observer* const _observer;
     ReplicationConsistencyMarkers* const _consistencyMarkers;

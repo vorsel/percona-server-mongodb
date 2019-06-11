@@ -68,6 +68,13 @@ class ServiceContext;
 class IndexBuildsCoordinator {
 public:
     /**
+     * Contains additional information required by 'startIndexBuild()'.
+     */
+    struct IndexBuildOptions {
+        boost::optional<CommitQuorumOptions> commitQuorum;
+    };
+
+    /**
      * Invariants that there are no index builds in-progress.
      */
     virtual ~IndexBuildsCoordinator();
@@ -104,7 +111,24 @@ public:
         CollectionUUID collectionUUID,
         const std::vector<BSONObj>& specs,
         const UUID& buildUUID,
-        IndexBuildProtocol protocol) = 0;
+        IndexBuildProtocol protocol,
+        IndexBuildOptions indexBuildOptions) = 0;
+
+    /**
+     * Sets up the in-memory and persisted state of the index build.
+     *
+     * This function should only be called when in recovery mode, because we use the DatabaseHolder
+     * to create a temporary collection using the collection catalog entry to allow us to rebuild
+     * the indexes on the collection without initializing it fully.
+     *
+     * Returns the number of records and the size of the data iterated over, if successful.
+     */
+    StatusWith<std::pair<long long, long long>> startIndexRebuildForRecovery(
+        OperationContext* opCtx,
+        DatabaseCatalogEntry* dbce,
+        CollectionCatalogEntry* cce,
+        const std::vector<BSONObj>& specs,
+        const UUID& buildUUID);
 
     /**
      * TODO: not yet implemented.
@@ -128,9 +152,6 @@ public:
      * This should only be called when certain the server will not start any new index builds --
      * i.e. when the server is not accepting user requests and no internal operations are
      * concurrently starting new index builds.
-     *
-     * TODO: not yet fully implemented. IndexBuildsManager::interruptIndexBuild is not yet
-     * implemented.
      */
     void interruptAllIndexBuilds(const std::string& reason);
 
@@ -206,10 +227,12 @@ public:
     virtual Status voteCommitIndexBuild(const UUID& buildUUID, const HostAndPort& hostAndPort) = 0;
 
     /**
-     * TODO: This is not yet implemented. (This will have to take a collection IS lock to look up
-     * the collection UUID.)
+     * Sets a new commit quorum on an index build that manages 'indexNames' on collection 'nss'.
+     * If the 'newCommitQuorum' is not satisfiable by the current replica set config, then the
+     * previous commit quorum is kept and the UnsatisfiableCommitQuorum error code is returned.
      */
-    virtual Status setCommitQuorum(const NamespaceString& nss,
+    virtual Status setCommitQuorum(OperationContext* opCtx,
+                                   const NamespaceString& nss,
                                    const std::vector<StringData>& indexNames,
                                    const CommitQuorumOptions& newCommitQuorum) = 0;
 
@@ -264,6 +287,15 @@ public:
      */
     void awaitNoBgOpInProgForDb(StringData db) const;
 
+    /**
+     * Called by the replication coordinator when a replica set reconfig occurs, which could affect
+     * any index build to make their commit quorum unachievable.
+     *
+     * Checks if the commit quorum is still satisfiable for each index build, if it is no longer
+     * satisfiable, then those index builds are aborted.
+     */
+    void onReplicaSetReconfig();
+
     void sleepIndexBuilds_forTestOnly(bool sleep);
 
     void verifyNoIndexBuilds_forTestOnly();
@@ -291,36 +323,57 @@ private:
     void _allowIndexBuildsOnDatabase(StringData dbName);
     void _allowIndexBuildsOnCollection(const UUID& collectionUUID);
 
-protected:
+private:
     /**
      * Registers an index build so that the rest of the system can discover it.
      *
      * If stopIndexBuildsOnNsOrDb has been called on the index build's collection or database, then
      * an error will be returned.
      */
-    Status _registerIndexBuild(OperationContext* opCtx,
-                               std::shared_ptr<ReplIndexBuildState> replIndexBuildState);
+    Status _registerIndexBuild(WithLock, std::shared_ptr<ReplIndexBuildState> replIndexBuildState);
 
+protected:
     /**
      * Unregisters the index build.
      */
     void _unregisterIndexBuild(WithLock lk,
-                               OperationContext* opCtx,
                                std::shared_ptr<ReplIndexBuildState> replIndexBuildState);
 
     /**
-     * Runs the index build on the caller thread.
+     * Sets up the in-memory and persisted state of the index build.
+     *
+     * Helper function for startIndexBuild. If the returned boost::optional is set, then the task
+     * does not require scheduling and can be immediately returned to the caller of startIndexBuild.
+     *
+     * Returns an error status if there are any errors setting up the index build.
      */
-    virtual void _runIndexBuild(OperationContext* opCtx, const UUID& buildUUID) noexcept;
+    StatusWith<boost::optional<SharedSemiFuture<ReplIndexBuildState::IndexCatalogStats>>>
+    _registerAndSetUpIndexBuild(OperationContext* opCtx,
+                                CollectionUUID collectionUUID,
+                                const std::vector<BSONObj>& specs,
+                                const UUID& buildUUID,
+                                IndexBuildProtocol protocol,
+                                boost::optional<CommitQuorumOptions> commitQuorum);
 
     /**
-     * Modularizes the _indexBuildsManager calls part of _runIndexBuild. Throws on error.
+     * Runs the index build on the caller thread. Handles unregistering the index build and setting
+     * the index build's Promise with the outcome of the index build.
+     */
+    void _runIndexBuild(OperationContext* opCtx, const UUID& buildUUID) noexcept;
+
+    /**
+     * Acquires locks and runs index build. Throws on error.
+     */
+    void _runIndexBuildInner(OperationContext* opCtx,
+                             std::shared_ptr<ReplIndexBuildState> replState);
+
+    /**
+     * Modularizes the _indexBuildsManager calls part of _runIndexBuildInner. Throws on error.
      */
     void _buildIndex(OperationContext* opCtx,
                      Collection* collection,
                      const NamespaceString& nss,
                      std::shared_ptr<ReplIndexBuildState> replState,
-                     const std::vector<BSONObj>& filteredSpecs,
                      Lock::DBLock* dbLock);
     /**
      * Returns total number of indexes in collection, including unfinished/in-progress indexes.
@@ -345,6 +398,19 @@ protected:
         Collection* collection,
         const NamespaceString& nss,
         const std::vector<BSONObj>& indexSpecs);
+
+    /**
+     * Runs the index build.
+     * Rebuilding an index in recovery mode verifies each document to ensure that it is a valid
+     * BSON object. It will remove any documents with invalid BSON.
+     *
+     * Returns the number of records and the size of the data iterated over, if successful.
+     */
+    StatusWith<std::pair<long long, long long>> _runIndexRebuildForRecovery(
+        OperationContext* opCtx,
+        Collection* collection,
+        ReplIndexBuildState::IndexCatalogStats& indexCatalogStats,
+        const UUID& buildUUID) noexcept;
 
     // Protects the below state.
     mutable stdx::mutex _mutex;

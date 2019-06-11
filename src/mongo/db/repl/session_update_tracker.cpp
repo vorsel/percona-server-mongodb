@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -36,6 +35,7 @@
 
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/session.h"
 #include "mongo/db/session_txn_record_gen.h"
 #include "mongo/util/assert_util.h"
@@ -69,20 +69,29 @@ boost::optional<repl::OplogEntry> createMatchingTransactionTableUpdate(
         newTxnRecord.setLastWriteOpTime(entry.getOpTime());
         newTxnRecord.setLastWriteDate(*entry.getWallClockTime());
 
-        switch (entry.getCommandType()) {
-            case repl::OplogEntry::CommandType::kApplyOps:
-                newTxnRecord.setState(entry.shouldPrepare() ? DurableTxnStateEnum::kPrepared
-                                                            : DurableTxnStateEnum::kCommitted);
-                break;
-            case repl::OplogEntry::CommandType::kCommitTransaction:
-                newTxnRecord.setState(DurableTxnStateEnum::kCommitted);
-                break;
-            case repl::OplogEntry::CommandType::kAbortTransaction:
-                newTxnRecord.setState(DurableTxnStateEnum::kAborted);
-                break;
-            default:
-                break;
+        // "state" is a new field in 4.2.
+        if (serverGlobalParams.featureCompatibility.getVersion() >=
+            ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo42) {
+            switch (entry.getCommandType()) {
+                case repl::OplogEntry::CommandType::kApplyOps:
+                    if (entry.shouldPrepare()) {
+                        newTxnRecord.setState(DurableTxnStateEnum::kPrepared);
+                        newTxnRecord.setStartTimestamp(entry.getOpTime().getTimestamp());
+                    } else {
+                        newTxnRecord.setState(DurableTxnStateEnum::kCommitted);
+                    }
+                    break;
+                case repl::OplogEntry::CommandType::kCommitTransaction:
+                    newTxnRecord.setState(DurableTxnStateEnum::kCommitted);
+                    break;
+                case repl::OplogEntry::CommandType::kAbortTransaction:
+                    newTxnRecord.setState(DurableTxnStateEnum::kAborted);
+                    break;
+                default:
+                    break;
+            }
         }
+
         return newTxnRecord.toBSON();
     }();
 
@@ -130,6 +139,19 @@ void SessionUpdateTracker::_updateSessionInfo(const OplogEntry& entry) {
 
     const auto& lsid = sessionInfo.getSessionId();
     invariant(lsid);
+
+    // Ignore any no-op oplog entries, except for the ones generated from session migration
+    // of CRUD ops. These entries will have an o2 field that contains the original CRUD
+    // oplog entry.
+    if (entry.getOpType() == OpTypeEnum::kNoop) {
+        if (!entry.getFromMigrate() || !*entry.getFromMigrate()) {
+            return;
+        }
+
+        if (!entry.getObject2()) {
+            return;
+        }
+    }
 
     auto iter = _sessionsToUpdate.find(*lsid);
     if (iter == _sessionsToUpdate.end()) {

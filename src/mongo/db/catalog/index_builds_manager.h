@@ -56,6 +56,20 @@ class IndexBuildsManager {
     MONGO_DISALLOW_COPYING(IndexBuildsManager);
 
 public:
+    /**
+     * Indicates whether or not to ignore indexing constraints.
+     */
+    enum class IndexConstraints { kEnforce, kRelax };
+
+    /**
+     * Additional options for setUpIndexBuild. The default values are sufficient in most cases.
+     */
+    struct SetupOptions {
+        SetupOptions();
+        IndexConstraints indexConstraints = IndexConstraints::kEnforce;
+        bool forRecovery = false;
+    };
+
     IndexBuildsManager() = default;
     ~IndexBuildsManager();
 
@@ -67,7 +81,8 @@ public:
                            Collection* collection,
                            const std::vector<BSONObj>& specs,
                            const UUID& buildUUID,
-                           OnInitFn onInit);
+                           OnInitFn onInit,
+                           SetupOptions options = {});
 
     /**
      * Recovers the index build from its persisted state and sets it up to run again.
@@ -86,13 +101,26 @@ public:
      *
      * TODO: Not yet implemented.
      */
-    Status startBuildingIndex(const UUID& buildUUID);
+    Status startBuildingIndex(OperationContext* opCtx,
+                              Collection* collection,
+                              const UUID& buildUUID);
+
+    /**
+     * Iterates through every record in the collection to index it while also removing documents
+     * that are not valid BSON objects.
+     *
+     * Returns the number of records and the size of the data iterated over.
+     */
+    StatusWith<std::pair<long long, long long>> startBuildingIndexForRecovery(
+        OperationContext* opCtx, NamespaceString ns, const UUID& buildUUID);
 
     /**
      * Document inserts observed during the scanning/insertion phase of an index build are not
      * added but are instead stored in a temporary buffer until this function is invoked.
      */
-    Status drainBackgroundWrites(const UUID& buildUUID);
+    Status drainBackgroundWrites(OperationContext* opCtx,
+                                 const UUID& buildUUID,
+                                 RecoveryUnit::ReadSource readSource);
 
     /**
      * Persists information in the index catalog entry to reflect the successful completion of the
@@ -107,7 +135,7 @@ public:
      *
      * TODO: Not yet implemented.
      */
-    Status checkIndexConstraintViolations(const UUID& buildUUID);
+    Status checkIndexConstraintViolations(OperationContext* opCtx, const UUID& buildUUID);
 
     /**
      * Persists information in the index catalog entry that the index is ready for use, as well as
@@ -116,6 +144,7 @@ public:
     using OnCreateEachFn = MultiIndexBlock::OnCreateEachFn;
     using OnCommitFn = MultiIndexBlock::OnCommitFn;
     Status commitIndexBuild(OperationContext* opCtx,
+                            Collection* collection,
                             const NamespaceString& nss,
                             const UUID& buildUUID,
                             OnCreateEachFn onCreateEachFn,
@@ -138,15 +167,15 @@ public:
      *
      * Returns true if a build existed to be signaled, as opposed to having already finished and
      * been cleared away, or not having yet started..
-     *
-     * TODO: Not yet implemented.
      */
-    bool interruptIndexBuild(const UUID& buildUUID, const std::string& reason);
+    bool interruptIndexBuild(OperationContext* opCtx,
+                             const UUID& buildUUID,
+                             const std::string& reason);
 
     /**
      * Cleans up the index build state and unregisters it from the manager.
      */
-    void tearDownIndexBuild(const UUID& buildUUID);
+    void tearDownIndexBuild(OperationContext* opCtx, Collection* collection, const UUID& buildUUID);
 
     /**
      * Returns true if the index build supports background writes while building an index. This is
@@ -163,7 +192,7 @@ private:
     /**
      * Creates and registers a new builder in the _builders map, mapped by the provided buildUUID.
      */
-    void _registerIndexBuild(OperationContext* opCtx, Collection* collection, UUID buildUUID);
+    void _registerIndexBuild(UUID buildUUID);
 
     /**
      * Unregisters the builder associcated with the given buildUUID from the _builders map.

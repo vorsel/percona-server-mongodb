@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -252,34 +251,33 @@ ProcessOplogResult processSessionOplog(const BSONObj& oplogBSON,
     opCtx->setTxnNumber(result.txnNum);
     MongoDOperationContextSession ocs(opCtx);
     auto txnParticipant = TransactionParticipant::get(opCtx);
-    txnParticipant->beginOrContinue(result.txnNum, boost::none, boost::none);
+    txnParticipant.beginOrContinue(opCtx, result.txnNum, boost::none, boost::none);
 
     try {
-        if (txnParticipant->checkStatementExecuted(stmtId)) {
+        if (txnParticipant.checkStatementExecuted(opCtx, stmtId)) {
             // Skip the incoming statement because it has already been logged locally
             return lastResult;
         }
     } catch (const DBException& ex) {
-        // If the transaction chain was truncated on the recipient shard, then we are most likely
-        // copying from a session that hasn't been touched on the recipient shard for a very long
-        // time but could be recent on the donor.
-        //
-        // We continue copying regardless to get the entire transaction from the donor.
-        if (ex.code() != ErrorCodes::IncompleteTransactionHistory) {
-            throw;
+        // If the transaction chain is incomplete because oplog was truncated, just ignore the
+        // incoming oplog and don't attempt to 'patch up' the missing pieces.
+        if (ex.code() == ErrorCodes::IncompleteTransactionHistory) {
+            return lastResult;
         }
 
         if (stmtId == kIncompleteHistoryStmtId) {
             // No need to log entries for transactions whose history has been truncated
             return lastResult;
         }
+
+        throw;
     }
 
     BSONObj object(result.isPrePostImage
                        ? oplogEntry.getObject()
                        : BSON(SessionCatalogMigrationDestination::kSessionMigrateOplogTag << 1));
     auto oplogLink = extractPrePostImageTs(lastResult, oplogEntry);
-    oplogLink.prevOpTime = txnParticipant->getLastWriteOpTime();
+    oplogLink.prevOpTime = txnParticipant.getLastWriteOpTime();
 
     writeConflictRetry(
         opCtx,
@@ -307,6 +305,7 @@ ProcessOplogResult processSessionOplog(const BSONObj& oplogBSON,
                                            stmtId,
                                            oplogLink,
                                            false /* prepare */,
+                                           false /* inTxn */,
                                            OplogSlot());
 
             const auto& oplogOpTime = result.oplogTime;
@@ -320,7 +319,7 @@ ProcessOplogResult processSessionOplog(const BSONObj& oplogBSON,
             // Do not call onWriteOpCompletedOnPrimary if we inserted a pre/post image, because the
             // next oplog will contain the real operation
             if (!result.isPrePostImage) {
-                txnParticipant->onMigrateCompletedOnPrimary(
+                txnParticipant.onMigrateCompletedOnPrimary(
                     opCtx, result.txnNum, {stmtId}, oplogOpTime, *oplogEntry.getWallClockTime());
             }
 

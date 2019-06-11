@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -36,12 +35,14 @@
 
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/test_commands_enabled.h"
+#include "mongo/db/commands/txn_cmds_gen.h"
 #include "mongo/db/keys_collection_client_sharded.h"
 #include "mongo/db/keys_collection_manager.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_session_cache_noop.h"
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/s/cluster_last_error_info.h"
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -67,6 +68,9 @@ void ClusterCommandTestFixture::setUp() {
     LogicalSessionCache::set(getServiceContext(), stdx::make_unique<LogicalSessionCacheNoop>());
 
     loadRoutingTableWithTwoChunksAndTwoShards(kNss);
+
+    _staleVersionAndSnapshotRetriesBlock = stdx::make_unique<FailPointEnableBlock>(
+        "enableStaleVersionAndSnapshotRetriesWithinTransactions");
 }
 
 BSONObj ClusterCommandTestFixture::_makeCmd(BSONObj cmdObj, bool includeAfterClusterTime) {
@@ -168,10 +172,14 @@ void ClusterCommandTestFixture::runCommandInspectRequests(BSONObj cmd,
 }
 
 void ClusterCommandTestFixture::expectAbortTransaction() {
-    onCommandForPoolExecutor([](const executor::RemoteCommandRequest& request) {
+    onCommandForPoolExecutor([this](const executor::RemoteCommandRequest& request) {
         auto cmdName = request.cmdObj.firstElement().fieldNameStringData();
         ASSERT_EQ(cmdName, "abortTransaction");
-        return BSON("ok" << 1);
+
+        BSONObjBuilder bob;
+        bob.append("ok", 1);
+        appendTxnResponseMetadata(bob);
+        return bob.obj();
     });
 }
 
@@ -283,6 +291,12 @@ void ClusterCommandTestFixture::testSnapshotReadConcernWithAfterClusterTime(
         runCommandInspectRequests(
             _makeCmd(scatterGatherCmd, true), containsAtClusterTimeNoAfterClusterTime, false);
     }
+}
+
+void ClusterCommandTestFixture::appendTxnResponseMetadata(BSONObjBuilder& bob) {
+    // Set readOnly to false to avoid opting in to the read-only optimization.
+    TxnResponseMetadata txnResponseMetadata(false);
+    txnResponseMetadata.serialize(&bob);
 }
 
 }  // namespace mongo

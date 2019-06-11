@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -63,10 +62,6 @@ public:
         return constraints;
     }
 
-    BSONObjSet getOutputSorts() override {
-        return sorts;
-    }
-
     static boost::intrusive_ptr<DocumentSourceMock> create();
 
     static boost::intrusive_ptr<DocumentSourceMock> create(Document doc);
@@ -96,6 +91,10 @@ public:
      */
     GetModPathsReturn getModifiedPaths() const override {
         return {GetModPathsReturn::Type::kFiniteSet, std::set<std::string>{}, {}};
+    }
+
+    boost::optional<MergingLogic> mergingLogic() override {
+        return boost::none;
     }
 
     // Return documents from front of queue.

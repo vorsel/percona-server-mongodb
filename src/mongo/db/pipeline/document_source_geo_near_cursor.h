@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -69,12 +68,6 @@ public:
         double distanceMultiplier = 1.0);
 
     const char* getSourceName() const final;
-
-    /**
-     * $geoNear returns documents ordered from nearest to furthest, which is an ascending sort on
-     * '_distanceField'.
-     */
-    BSONObjSet getOutputSorts() final;
 
 private:
     DocumentSourceGeoNearCursor(Collection*,

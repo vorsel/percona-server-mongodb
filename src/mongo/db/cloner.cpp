@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -33,6 +32,7 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/cloner.h"
+#include "mongo/db/cloner_gen.h"
 
 #include "mongo/base/status.h"
 #include "mongo/bson/unordered_fields_bsonobj_comparator.h"
@@ -53,14 +53,12 @@
 #include "mongo/db/curop.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/index_builder.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/repl/isself.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/util/assert_util.h"
@@ -79,7 +77,6 @@ using std::vector;
 
 using IndexVersion = IndexDescriptor::IndexVersion;
 
-MONGO_EXPORT_SERVER_PARAMETER(skipCorruptDocumentsWhenCloning, bool, false);
 MONGO_FAIL_POINT_DEFINE(movePrimaryFailPoint);
 
 BSONElement getErrField(const BSONObj& o);
@@ -244,7 +241,7 @@ struct Cloner::Fun {
                 str::stream ss;
                 ss << "Cloner: found corrupt document in " << from_collection.toString() << ": "
                    << redact(status);
-                if (skipCorruptDocumentsWhenCloning.load()) {
+                if (gSkipCorruptDocumentsWhenCloning.load()) {
                     warning() << ss.ss.str() << "; skipping";
                     continue;
                 }
@@ -396,26 +393,29 @@ void Cloner::copyIndexes(OperationContext* opCtx,
         });
     }
 
-    // TODO pass the MultiIndexBlock when inserting into the collection rather than building the
-    // indexes after the fact. This depends on holding a lock on the collection the whole time
-    // from creation to completion without yielding to ensure the index and the collection
-    // matches. It also wouldn't work on non-empty collections so we would need both
-    // implementations anyway as long as that is supported.
-    MultiIndexBlock indexer(opCtx, collection);
-
     auto indexCatalog = collection->getIndexCatalog();
     auto prunedIndexesToBuild = indexCatalog->removeExistingIndexes(opCtx, indexesToBuild);
     if (prunedIndexesToBuild.empty()) {
         return;
     }
 
-    auto indexInfoObjs =
-        uassertStatusOK(indexer.init(prunedIndexesToBuild, MultiIndexBlock::kNoopOnInitFn));
-    uassertStatusOK(indexer.insertAllDocumentsInCollection());
+    // TODO pass the MultiIndexBlock when inserting into the collection rather than building the
+    // indexes after the fact. This depends on holding a lock on the collection the whole time
+    // from creation to completion without yielding to ensure the index and the collection
+    // matches. It also wouldn't work on non-empty collections so we would need both
+    // implementations anyway as long as that is supported.
+    MultiIndexBlock indexer;
+
+    // The code below throws, so ensure build cleanup occurs.
+    ON_BLOCK_EXIT([&] { indexer.cleanUpAfterBuild(opCtx, collection); });
+
+    auto indexInfoObjs = uassertStatusOK(
+        indexer.init(opCtx, collection, prunedIndexesToBuild, MultiIndexBlock::kNoopOnInitFn));
+    uassertStatusOK(indexer.insertAllDocumentsInCollection(opCtx, collection));
 
     WriteUnitOfWork wunit(opCtx);
-    uassertStatusOK(
-        indexer.commit(MultiIndexBlock::kNoopOnCreateEachFn, MultiIndexBlock::kNoopOnCommitFn));
+    uassertStatusOK(indexer.commit(
+        opCtx, collection, MultiIndexBlock::kNoopOnCreateEachFn, MultiIndexBlock::kNoopOnCommitFn));
     if (opCtx->writesAreReplicated()) {
         for (auto&& infoObj : indexInfoObjs) {
             getGlobalServiceContext()->getOpObserver()->onCreateIndex(

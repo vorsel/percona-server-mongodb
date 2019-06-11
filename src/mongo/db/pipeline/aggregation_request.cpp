@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -345,5 +344,4 @@ Document AggregationRequest::serializeToCommandObj() const {
          _writeConcern ? Value(_writeConcern->toBSON()) : Value()},
     };
 }
-
 }  // namespace mongo

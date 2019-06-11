@@ -1,6 +1,3 @@
-// wiredtiger_global_options.h
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -32,12 +29,12 @@
 
 #pragma once
 
-#include "mongo/util/options_parser/startup_option_init.h"
-#include "mongo/util/options_parser/startup_options.h"
+#include <string>
+
+#include "mongo/base/status.h"
+#include "mongo/util/options_parser/environment.h"
 
 namespace mongo {
-
-namespace moe = mongo::optionenvironment;
 
 class WiredTigerGlobalOptions {
 public:
@@ -50,8 +47,7 @@ public:
           useCollectionPrefixCompression(false),
           useIndexPrefixCompression(false){};
 
-    Status add(moe::OptionSection* options);
-    Status store(const moe::Environment& params, const std::vector<std::string>& args);
+    Status store(const optionenvironment::Environment& params);
 
     double cacheSizeGB;
     size_t checkpointSizeMB;
@@ -67,7 +63,10 @@ public:
     bool useIndexPrefixCompression;
     std::string collectionConfig;
     std::string indexConfig;
+
+    static Status validateWiredTigerCompressor(const std::string&);
 };
 
 extern WiredTigerGlobalOptions wiredTigerGlobalOptions;
-}
+
+}  // namespace mongo

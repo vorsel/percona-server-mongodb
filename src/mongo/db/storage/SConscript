@@ -85,9 +85,13 @@ env.Library(
     target='storage_options',
     source=[
         'storage_options.cpp',
+        env.Idlc('storage_parameters.idl')[0],
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/db/server_parameters',
+        '$BUILD_DIR/mongo/base',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/idl/server_parameter',
     ],
 )
 
@@ -180,7 +184,6 @@ env.Library(
         'record_store_test_truncate.cpp',
         'record_store_test_updaterecord.cpp',
         'record_store_test_updatewithdamages.cpp',
-        'record_store_test_validate.cpp',
         ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/service_context',

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -180,19 +179,16 @@ void invokeInTransactionRouter(OperationContext* opCtx,
 }
 
 /**
- * Throws NoSuchTransaction if canRetry is false.
+ * Adds info from the active transaction and the given reason as context to the active exception.
  */
-void handleCanRetryInTransaction(OperationContext* opCtx,
-                                 TransactionRouter* txnRouter,
-                                 bool canRetry,
-                                 const DBException& ex) {
-    if (!canRetry) {
-        uasserted(ErrorCodes::NoSuchTransaction,
-                  str::stream() << "Transaction " << opCtx->getTxnNumber() << " was aborted after "
-                                << kMaxNumStaleVersionRetries
-                                << " failed retries. The latest attempt failed with: "
-                                << ex.toStatus());
-    }
+void addContextForTransactionAbortingError(TransactionRouter* txnRouter,
+                                           DBException& ex,
+                                           StringData reason) {
+    ex.addContext(str::stream() << "Transaction " << txnRouter->txnIdToString()
+                                << " was aborted on statement "
+                                << txnRouter->getLatestStmtId()
+                                << " due to: "
+                                << reason);
 }
 
 void execCommandClient(OperationContext* opCtx,
@@ -459,7 +455,7 @@ void runCommand(OperationContext* opCtx,
                 }
 
                 return;
-            } catch (const ExceptionForCat<ErrorCategory::NeedRetargettingError>& ex) {
+            } catch (ExceptionForCat<ErrorCategory::NeedRetargettingError>& ex) {
                 const auto staleNs = [&] {
                     if (auto staleInfo = ex.extraInfo<StaleConfigInfo>()) {
                         return staleInfo->getNss();
@@ -493,50 +489,92 @@ void runCommand(OperationContext* opCtx,
 
                 Grid::get(opCtx)->catalogCache()->invalidateShardedCollection(staleNs);
 
-                // Update transaction tracking state for a possible retry. Throws and aborts the
-                // transaction if it cannot continue.
+                // Retry logic specific to transactions. Throws and aborts the transaction if the
+                // error cannot be retried on.
                 if (auto txnRouter = TransactionRouter::get(opCtx)) {
                     auto abortGuard = makeGuard(
                         [&] { txnRouter->implicitlyAbortTransaction(opCtx, ex.toStatus()); });
-                    handleCanRetryInTransaction(opCtx, txnRouter, canRetry, ex);
+
+                    if (!canRetry) {
+                        addContextForTransactionAbortingError(txnRouter, ex, "exhausted retries");
+                        throw;
+                    }
+
+                    if (!txnRouter->canContinueOnStaleShardOrDbError(commandName)) {
+                        addContextForTransactionAbortingError(
+                            txnRouter, ex, "an error from cluster data placement change");
+                        throw;
+                    }
+
+                    // The error is retryable, so update transaction state before retrying.
                     txnRouter->onStaleShardOrDbError(opCtx, commandName, ex.toStatus());
+
                     abortGuard.dismiss();
+                    continue;
                 }
 
                 if (canRetry) {
                     continue;
                 }
                 throw;
-            } catch (const ExceptionFor<ErrorCodes::StaleDbVersion>& ex) {
+            } catch (ExceptionFor<ErrorCodes::StaleDbVersion>& ex) {
                 // Mark database entry in cache as stale.
                 Grid::get(opCtx)->catalogCache()->onStaleDatabaseVersion(ex->getDb(),
                                                                          ex->getVersionReceived());
 
-                // Update transaction tracking state for a possible retry. Throws and aborts the
-                // transaction if it cannot continue.
+                // Retry logic specific to transactions. Throws and aborts the transaction if the
+                // error cannot be retried on.
                 if (auto txnRouter = TransactionRouter::get(opCtx)) {
                     auto abortGuard = makeGuard(
                         [&] { txnRouter->implicitlyAbortTransaction(opCtx, ex.toStatus()); });
-                    handleCanRetryInTransaction(opCtx, txnRouter, canRetry, ex);
+
+                    if (!canRetry) {
+                        addContextForTransactionAbortingError(txnRouter, ex, "exhausted retries");
+                        throw;
+                    }
+
+                    if (!txnRouter->canContinueOnStaleShardOrDbError(commandName)) {
+                        addContextForTransactionAbortingError(
+                            txnRouter, ex, "an error from cluster data placement change");
+                        throw;
+                    }
+
+                    // The error is retryable, so update transaction state before retrying.
                     txnRouter->onStaleShardOrDbError(opCtx, commandName, ex.toStatus());
+
                     abortGuard.dismiss();
+                    continue;
                 }
 
                 if (canRetry) {
                     continue;
                 }
                 throw;
-            } catch (const ExceptionForCat<ErrorCategory::SnapshotError>& ex) {
+            } catch (ExceptionForCat<ErrorCategory::SnapshotError>& ex) {
                 // Simple retry on any type of snapshot error.
 
-                // Update transaction tracking state for a possible retry. Throws and aborts the
-                // transaction if it cannot continue.
+                // Retry logic specific to transactions. Throws and aborts the transaction if the
+                // error cannot be retried on.
                 if (auto txnRouter = TransactionRouter::get(opCtx)) {
                     auto abortGuard = makeGuard(
                         [&] { txnRouter->implicitlyAbortTransaction(opCtx, ex.toStatus()); });
-                    handleCanRetryInTransaction(opCtx, txnRouter, canRetry, ex);
+
+                    if (!canRetry) {
+                        addContextForTransactionAbortingError(txnRouter, ex, "exhausted retries");
+                        throw;
+                    }
+
+                    if (!txnRouter->canContinueOnSnapshotError()) {
+                        addContextForTransactionAbortingError(
+                            txnRouter, ex, "a non-retryable snapshot error");
+                        throw;
+                    }
+
+                    // The error is retryable, so update transaction state before retrying.
                     txnRouter->onSnapshotError(opCtx, ex.toStatus());
+
                     abortGuard.dismiss();
+                    continue;
                 }
 
                 if (canRetry) {
@@ -549,6 +587,12 @@ void runCommand(OperationContext* opCtx,
     } catch (const DBException& e) {
         command->incrementCommandsFailed();
         LastError::get(opCtx->getClient()).setLastError(e.code(), e.reason());
+        // hasWriteConcernError is set to false because:
+        // 1. TransientTransaction error label handling for commitTransaction command in mongos is
+        //    delegated to the shards. Mongos simply propagates the shard's response up to the
+        //    client.
+        // 2. For other commands in a transaction, they shouldn't get a writeConcern error so
+        //    this setting doesn't apply.
         auto errorLabels = getErrorLabels(osi, command->getName(), e.code(), false);
         errorBuilder->appendElements(errorLabels);
         throw;

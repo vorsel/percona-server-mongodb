@@ -34,12 +34,24 @@ imports:
     - "mongo/s/sharding_types.idl"
 
 structs:
+    TxnResponseMetadata:
+        description: "Contains fields a participant attaches in responses to successful transaction
+                      statements"
+        strict: false
+        fields:
+            readOnly:
+                description: "True if the shard has the transaction in progress but has not done a
+                              write for it"
+                type: bool
+
+
     TxnRecoveryToken:
         description: "Contains info for retrying the commit of a sharded transaction"
         fields:
             shardId:
                 description: "The id of the shard that can make progress committing the transaction"
                 type: shard_id
+                optional: true
 
     CommitTransactionOplogObject:
         description: A document representing the 'o' field of a 'commitTransaction' oplog entry.
@@ -49,13 +61,27 @@ structs:
                 default: 1
             commitTimestamp:
                 type: timestamp
+                optional: true
                 description: "Specifies the timestamp at which the multi-document transaction should
-                              be committed."
+                              be committed.  Required for prepared transactions, not permitted for
+                              unprepared ones."
+            prepare:
+                type: bool
+                optional: true
+                description: "Set to false for a commit for an unprepared transaction.  Implicit
+                              default is true, do not set explicitly to true"
 
     AbortTransactionOplogObject:
         description: A document representing the 'o' field of an 'abortTransaction' oplog entry.
         fields:
             abortTransaction:
+                type: int
+                default: 1
+
+    PrepareTransactionOplogObject:
+        description: A document representing the 'o' field of a 'prepareTransaction' oplog entry.
+        fields:
+            prepareTransaction:
                 type: int
                 default: 1
 

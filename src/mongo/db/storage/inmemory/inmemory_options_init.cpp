@@ -41,18 +41,12 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 #include "mongo/util/exit_code.h"
 #include "mongo/util/options_parser/startup_options.h"
 
+namespace moe = mongo::optionenvironment;
+
 namespace mongo {
 
-MONGO_MODULE_STARTUP_OPTIONS_REGISTER(InMemoryOptions)(InitializerContext* context) {
-    return inMemoryGlobalOptions.add(&moe::startupOptions);
-}
-
-MONGO_STARTUP_OPTIONS_VALIDATE(InMemoryOptions)(InitializerContext* context) {
-    return Status::OK();
-}
-
 MONGO_STARTUP_OPTIONS_STORE(InMemoryOptions)(InitializerContext* context) {
-    Status ret = inMemoryGlobalOptions.store(moe::startupOptionsParsed, context->args());
+    Status ret = inMemoryGlobalOptions.store(moe::startupOptionsParsed);
     if (!ret.isOK()) {
         std::cerr << ret.toString() << std::endl;
         std::cerr << "try '" << context->args()[0] << " --help' for more information" << std::endl;

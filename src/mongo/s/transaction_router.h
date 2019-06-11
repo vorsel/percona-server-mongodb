@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -73,6 +72,8 @@ public:
      * the transaction that created it.
      */
     struct Participant {
+        enum class ReadOnly { kUnset, kReadOnly, kNotReadOnly };
+
         Participant(bool isCoordinator,
                     StmtId stmtIdCreatedAt,
                     SharedTransactionOptions sharedOptions);
@@ -84,6 +85,10 @@ public:
 
         // True if the participant has been chosen as the coordinator for its transaction
         const bool isCoordinator{false};
+
+        // Is updated to kReadOnly or kNotReadOnly based on the readOnly field in the participant's
+        // responses to statements.
+        ReadOnly readOnly{ReadOnly::kUnset};
 
         // The highest statement id of the request during which this participant was created.
         const StmtId stmtIdCreatedAt{kUninitializedStmtId};
@@ -157,6 +162,28 @@ public:
     BSONObj attachTxnFieldsIfNeeded(const ShardId& shardId, const BSONObj& cmdObj);
 
     /**
+     * Processes the transaction metadata in the response from the participant if the response
+     * indicates the operation succeeded.
+     */
+    void processParticipantResponse(const ShardId& shardId, const BSONObj& responseObj);
+
+    /**
+     * Returns true if the current transaction can retry on a stale version error from a contacted
+     * shard. This is always true except for an error received by a write that is not the first
+     * overall statement in the sharded transaction. This is because the entire command will be
+     * retried, and shards that were not stale and are targeted again may incorrectly execute the
+     * command a second time.
+     *
+     * Note: Even if this method returns true, the retry attempt may still fail, e.g. if one of the
+     * shards that returned a stale version error was involved in a previously completed a statement
+     * for this transaction.
+     *
+     * TODO SERVER-37207: Change batch writes to retry only the failed writes in a batch, to allow
+     * retrying writes beyond the first overall statement.
+     */
+    bool canContinueOnStaleShardOrDbError(StringData cmdName) const;
+
+    /**
      * Updates the transaction state to allow for a retry of the current command on a stale version
      * error. This includes sending abortTransaction to all cleared participants. Will throw if the
      * transaction cannot be continued.
@@ -164,6 +191,12 @@ public:
     void onStaleShardOrDbError(OperationContext* opCtx,
                                StringData cmdName,
                                const Status& errorStatus);
+
+    /**
+     * Returns true if the current transaction can retry on a snapshot error. This is only true on
+     * the first command recevied for a transaction.
+     */
+    bool canContinueOnSnapshotError() const;
 
     /**
      * Resets the transaction state to allow for a retry attempt. This includes clearing all
@@ -201,8 +234,8 @@ public:
      * Commits the transaction. For transactions with multiple participants, this will initiate
      * the two phase commit procedure.
      */
-    Shard::CommandResponse commitTransaction(
-        OperationContext* opCtx, const boost::optional<TxnRecoveryToken>& recoveryToken);
+    BSONObj commitTransaction(OperationContext* opCtx,
+                              const boost::optional<TxnRecoveryToken>& recoveryToken);
 
     /**
      * Sends abort to all participants and returns the responses from all shards.
@@ -228,6 +261,19 @@ public:
      */
     void appendRecoveryToken(BSONObjBuilder* builder) const;
 
+    /**
+     * Returns a string with the active transaction's transaction number and logical session id
+     * (i.e. the transaction id).
+     */
+    std::string txnIdToString() const;
+
+    /**
+     * Returns the statement id of the latest received command for this transaction.
+     */
+    StmtId getLatestStmtId() const {
+        return _latestStmtId;
+    }
+
 private:
     // Shortcut to obtain the id of the session under which this transaction router runs
     const LogicalSessionId& _sessionId() const;
@@ -235,15 +281,21 @@ private:
     /**
      * Run basic commit for transactions that touched a single shard.
      */
-    Shard::CommandResponse _commitSingleShardTransaction(OperationContext* opCtx);
+    BSONObj _commitSingleShardTransaction(OperationContext* opCtx);
 
-    Shard::CommandResponse _commitWithRecoveryToken(OperationContext* opCtx,
-                                                    const TxnRecoveryToken& recoveryToken);
+    /**
+     * Skips explicit commit and instead waits for participants' read Timestamps to reach the level
+     * of durability specified by the writeConcern on 'opCtx'.
+     */
+    BSONObj _commitReadOnlyTransaction(OperationContext* opCtx);
+
+    BSONObj _commitWithRecoveryToken(OperationContext* opCtx,
+                                     const TxnRecoveryToken& recoveryToken);
 
     /**
      * Run two phase commit for transactions that touched multiple shards.
      */
-    Shard::CommandResponse _commitMultiShardTransaction(OperationContext* opCtx);
+    BSONObj _commitMultiShardTransaction(OperationContext* opCtx);
 
     /**
      * Sets the given logical time as the atClusterTime for the transaction to be the greater of the
@@ -251,28 +303,6 @@ private:
      */
     void _setAtClusterTime(const boost::optional<LogicalTime>& afterClusterTime,
                            LogicalTime candidateTime);
-
-    /**
-     * Returns true if the current transaction can retry on a stale version error from a contacted
-     * shard. This is always true except for an error received by a write that is not the first
-     * overall statement in the sharded transaction. This is because the entire command will be
-     * retried, and shards that were not stale and are targeted again may incorrectly execute the
-     * command a second time.
-     *
-     * Note: Even if this method returns true, the retry attempt may still fail, e.g. if one of the
-     * shards that returned a stale version error was involved in a previously completed a statement
-     * for this transaction.
-     *
-     * TODO SERVER-37207: Change batch writes to retry only the failed writes in a batch, to allow
-     * retrying writes beyond the first overall statement.
-     */
-    bool _canContinueOnStaleShardOrDbError(StringData cmdName) const;
-
-    /**
-     * Returns true if the current transaction can retry on a snapshot error. This is only true on
-     * the first command recevied for a transaction.
-     */
-    bool _canContinueOnSnapshotError() const;
 
     /**
      * Throws NoSuchTransaction if the response from abortTransaction failed with a code other than
@@ -303,13 +333,8 @@ private:
      */
     void _verifyParticipantAtClusterTime(const Participant& participant);
 
-    /**
-     * Returns a string with the active transaction's transaction number and logical session id
-     * (i.e. the transaction id).
-     */
-    std::string _txnIdToString() const;
-
-    // The currently active transaction number on this transaction router (i.e. on the session)
+    // The currently active transaction number on this router, if beginOrContinueTxn has been
+    // called. Otherwise set to kUninitializedTxnNumber.
     TxnNumber _txnNumber{kUninitializedTxnNumber};
 
     // Whether the router has initiated a two-phase commit by handing off commit coordination to the

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -40,11 +39,13 @@
 #include "mongo/db/matcher/matcher.h"
 #include "mongo/db/ops/parsed_update.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
+#include "mongo/db/query/parsed_projection.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/update/update_driver.h"
 #include "mongo/util/assert_util.h"
 
 #include <algorithm>
+#include <memory>
 #include <string>
 
 #if defined(_WIN32)
@@ -139,6 +140,20 @@ struct ServiceContextDestructor {
 
 using EmbeddedServiceContextPtr = std::unique_ptr<mongo::ServiceContext, ServiceContextDestructor>;
 
+ProjectionExec makeProjectionExecChecked(OperationContext* opCtx,
+                                         const BSONObj& spec,
+                                         const MatchExpression* queryExpression,
+                                         const CollatorInterface* collator) {
+    /**
+     * ParsedProjction::make performs necessary checks to ensure a projection spec is valid however
+     * we are not interested in the ParsedProjection object it produces.
+     */
+    ParsedProjection* dummy;
+    uassertStatusOK(ParsedProjection::make(opCtx, spec, queryExpression, &dummy));
+    delete dummy;
+    return ProjectionExec(opCtx, spec, queryExpression, collator);
+}
+
 }  // namespace
 }  // namespace mongo
 
@@ -179,10 +194,11 @@ struct stitch_support_v1_projection {
                                  stitch_support_v1_collator* collator)
         : client(std::move(client)),
           opCtx(this->client->makeOperationContext()),
-          projectionExec(opCtx.get(),
-                         pattern.getOwned(),
-                         matcher ? matcher->matcher.getMatchExpression() : nullptr,
-                         collator ? collator->collator.get() : nullptr),
+          projectionExec(mongo::makeProjectionExecChecked(
+              opCtx.get(),
+              pattern.getOwned(),
+              matcher ? matcher->matcher.getMatchExpression() : nullptr,
+              collator ? collator->collator.get() : nullptr)),
           matcher(matcher) {
         uassert(51050,
                 "Projections with a positional operator require a matcher",
@@ -594,15 +610,20 @@ stitch_support_v1_update_apply(stitch_support_v1_update* const update,
 
 uint8_t* MONGO_API_CALL stitch_support_v1_update_upsert(stitch_support_v1_update* const update,
                                                         stitch_support_v1_status* status) {
-    return enterCXX(mongo::getStatusImpl(status), [&] {
+    return enterCXX(mongo::getStatusImpl(status), [=] {
         mongo::FieldRefSet immutablePaths;  //  Empty set
         bool docWasModified = false;
 
         mongo::mutablebson::Document mutableDoc(mongo::BSONObj(),
                                                 mongo::mutablebson::Document::kInPlaceDisabled);
 
-        uassertStatusOK(update->updateDriver.populateDocumentWithQueryFields(
-            update->opCtx.get(), *update->matcher->matcher.getQuery(), immutablePaths, mutableDoc));
+        if (update->matcher) {
+            uassertStatusOK(update->updateDriver.populateDocumentWithQueryFields(
+                update->opCtx.get(),
+                *update->matcher->matcher.getQuery(),
+                immutablePaths,
+                mutableDoc));
+        }
 
         uassertStatusOK(update->updateDriver.update(mongo::StringData() /* matchedField */,
                                                     &mutableDoc,
@@ -611,7 +632,7 @@ uint8_t* MONGO_API_CALL stitch_support_v1_update_upsert(stitch_support_v1_update
                                                     true /* isInsert */,
                                                     nullptr /* logOpRec */,
                                                     &docWasModified,
-                                                    nullptr /*modifiedPaths*/));
+                                                    nullptr /* modifiedPaths */));
 
         auto outputObj = mutableDoc.getObject();
         size_t outputSize = static_cast<size_t>(outputObj.objsize());

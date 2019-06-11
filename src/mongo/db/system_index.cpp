@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -39,6 +38,7 @@
 #include "mongo/client/index_spec.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/commit_quorum_options.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/catalog/multi_index_block.h"
@@ -123,8 +123,14 @@ SharedSemiFuture<ReplIndexBuildState::IndexCatalogStats> generateSystemIndexForE
 
         UUID buildUUID = UUID::gen();
         IndexBuildsCoordinator* indexBuildsCoord = IndexBuildsCoordinator::get(opCtx);
-        auto indexBuildFuture = uassertStatusOK(indexBuildsCoord->startIndexBuild(
-            opCtx, collectionUUID, {indexSpec}, buildUUID, IndexBuildProtocol::kSinglePhase));
+        IndexBuildsCoordinator::IndexBuildOptions indexBuildOptions = {CommitQuorumOptions(1)};
+        auto indexBuildFuture =
+            uassertStatusOK(indexBuildsCoord->startIndexBuild(opCtx,
+                                                              collectionUUID,
+                                                              {indexSpec},
+                                                              buildUUID,
+                                                              IndexBuildProtocol::kSinglePhase,
+                                                              indexBuildOptions));
         return indexBuildFuture;
     } catch (const DBException& e) {
         severe() << "Failed to regenerate index for " << ns << ". Exception: " << e.what();

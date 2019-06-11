@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -107,7 +106,7 @@ public:
 
     bool waitUntilDurable() override;
 
-    bool waitUntilUnjournaledWritesDurable() override;
+    bool waitUntilUnjournaledWritesDurable(bool stableCheckpoint = true) override;
 
     void registerChange(Change* change) override;
 

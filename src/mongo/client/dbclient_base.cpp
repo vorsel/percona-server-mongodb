@@ -1,6 +1,3 @@
-// dbclient.cpp - connect to a Mongo database as a database, from C++
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,6 +25,10 @@
  *    delete this exception statement from your version. If you delete this
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
+ */
+
+/**
+ * Connect to a Mongo database as a database, from C++.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
@@ -155,9 +156,15 @@ rpc::UniqueReply DBClientBase::parseCommandReplyMessage(const std::string& host,
         uassertStatusOK(_metadataReader(opCtx, commandReply->getCommandReply(), host));
     }
 
-    auto status = getStatusFromCommandResult(commandReply->getCommandReply());
-    if (status == ErrorCodes::StaleConfig) {
-        uassertStatusOK(status.withContext("stale config in runCommand"));
+    // StaleConfig is thrown because clients acting as routers handle the exception at a higher
+    // level. Routing clients only expect StaleConfig from shards, so the exception should not be
+    // thrown when connected to a mongos, which allows StaleConfig to be returned to clients that
+    // connect to a mongos with DBClient, e.g. the shell.
+    if (!isMongos()) {
+        auto status = getStatusFromCommandResult(commandReply->getCommandReply());
+        if (status == ErrorCodes::StaleConfig) {
+            uassertStatusOK(status.withContext("stale config in runCommand"));
+        }
     }
 
     return rpc::UniqueReply(replyMsg, std::move(commandReply));

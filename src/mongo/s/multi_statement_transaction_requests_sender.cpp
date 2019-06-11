@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -56,6 +55,19 @@ std::vector<AsyncRequestsSender::Request> attachTxnDetails(
     return newRequests;
 }
 
+void processReplyMetadata(OperationContext* opCtx, const AsyncRequestsSender::Response& response) {
+    auto txnRouter = TransactionRouter::get(opCtx);
+    if (!txnRouter) {
+        return;
+    }
+
+    if (!response.swResponse.isOK()) {
+        return;
+    }
+
+    txnRouter->processParticipantResponse(response.shardId, response.swResponse.getValue().data);
+}
+
 }  // unnamed namespace
 
 MultiStatementTransactionRequestsSender::MultiStatementTransactionRequestsSender(
@@ -75,7 +87,9 @@ bool MultiStatementTransactionRequestsSender::done() {
 }
 
 AsyncRequestsSender::Response MultiStatementTransactionRequestsSender::next() {
-    return _ars.next();
+    const auto response = _ars.next();
+    processReplyMetadata(_opCtx, response);
+    return response;
 }
 
 void MultiStatementTransactionRequestsSender::stopRetrying() {

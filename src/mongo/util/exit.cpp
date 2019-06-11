@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -56,14 +55,10 @@ AtomicWord<unsigned> shutdownFlag;
 std::stack<stdx::function<void()>> shutdownTasks;
 stdx::thread::id shutdownTasksThreadId;
 
-void runTasks(decltype(shutdownTasks) tasks) {
+void runTasks(decltype(shutdownTasks) tasks) noexcept {
     while (!tasks.empty()) {
         const auto& task = tasks.top();
-        try {
-            task();
-        } catch (...) {
-            std::terminate();
-        }
+        task();
         tasks.pop();
     }
 }

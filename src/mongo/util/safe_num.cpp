@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -158,6 +157,25 @@ bool SafeNum::isIdentical(const SafeNum& rhs) const {
         // EOO doesn't match anything, including itself.
         default:
             return false;
+    }
+}
+
+void SafeNum::toBSON(StringData fieldName, BSONObjBuilder* bob) const {
+    switch (_type) {
+        case BSONType::NumberInt:
+            bob->append(fieldName, _value.int32Val);
+            return;
+        case BSONType::NumberLong:
+            bob->append(fieldName, _value.int64Val);
+            return;
+        case BSONType::NumberDouble:
+            bob->append(fieldName, _value.doubleVal);
+            return;
+        case BSONType::NumberDecimal:
+            bob->append(fieldName, Decimal128(_value.decimalVal));
+            return;
+        default:
+            MONGO_UNREACHABLE;
     }
 }
 

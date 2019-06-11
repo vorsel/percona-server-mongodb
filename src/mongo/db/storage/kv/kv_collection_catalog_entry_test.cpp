@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -84,7 +83,7 @@ public:
             WriteUnitOfWork wuow(opCtx.get());
             const bool allocateDefaultSpace = true;
             ASSERT_OK(dbEntry->createCollection(
-                opCtx.get(), _nss.ns(), CollectionOptions(), allocateDefaultSpace));
+                opCtx.get(), _nss, CollectionOptions(), allocateDefaultSpace));
             wuow.commit();
         }
     }

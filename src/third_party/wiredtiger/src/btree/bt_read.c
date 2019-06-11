@@ -188,9 +188,9 @@ __las_page_instantiate(WT_SESSION_IMPL *session, WT_REF *ref)
 		    session, &las_value, &upd, &incr, upd_type));
 		total_incr += incr;
 		upd->txnid = las_txnid;
-		upd->timestamp = las_timestamp;
+		upd->start_ts = las_timestamp;
+		upd->durable_ts = durable_timestamp;
 		upd->prepare_state = prepare_state;
-		upd->durable_timestamp = durable_timestamp;
 
 		switch (page->type) {
 		case WT_PAGE_COL_FIX:
@@ -283,7 +283,7 @@ __las_page_instantiate(WT_SESSION_IMPL *session, WT_REF *ref)
 		    !ref->page_las->has_prepares &&
 		    !S2C(session)->txn_global.has_stable_timestamp &&
 		    __wt_txn_visible_all(session, ref->page_las->unstable_txn,
-		    ref->page_las->unstable_timestamp)) {
+		    ref->page_las->unstable_durable_timestamp)) {
 			page->modify->rec_max_txn = ref->page_las->max_txn;
 			page->modify->rec_max_timestamp =
 			    ref->page_las->max_timestamp;
@@ -478,7 +478,7 @@ __page_read(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags)
 	 * only lookaside entries, and a subsequent search or insert is forcing
 	 * re-creation of the name space.
 	 */
-	__wt_ref_info(ref, &addr, &addr_size, NULL);
+	__wt_ref_info(session, ref, &addr, &addr_size, NULL);
 	if (addr == NULL) {
 		WT_ASSERT(session, previous_state != WT_REF_DISK);
 

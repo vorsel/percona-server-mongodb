@@ -50,7 +50,7 @@ struct PartitionedLockHead;
  * This matrix answers the question, "Is a lock request with mode 'Requested Mode' compatible with
  * an existing lock held in mode 'Granted Mode'?"
  *
- * | Requested Mode | Granted Mode |         |          |        |          |
+ * | Requested Mode |                      Granted Mode                     |
  * |----------------|:------------:|:-------:|:--------:|:------:|:--------:|
  * |                |  MODE_NONE   | MODE_IS |  MODE_IX | MODE_S |  MODE_X  |
  * | MODE_IS        |      +       |    +    |     +    |    +   |          |
@@ -259,6 +259,13 @@ extern const ResourceId resourceIdOplog;
 // Hardcoded resource id for admin db. This is to ensure direct writes to auth collections
 // are serialized (see SERVER-16092)
 extern const ResourceId resourceIdAdminDB;
+
+// Global lock. Every server operation, which uses the Locker must acquire this lock at least
+// once. See comments in the header file (begin/endTransaction) for more information.
+//
+// There are multiple locks with the "GLOBAL" type. This one is colloquially known as the global
+// lock.
+extern const ResourceId resourceIdGlobal;
 
 // Hardcoded resource id for ParallelBatchWriterMode. We use the same resource type
 // as resourceIdGlobal. This will also ensure the waits are reported as global, which

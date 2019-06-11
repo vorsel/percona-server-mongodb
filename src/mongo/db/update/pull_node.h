@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -30,6 +29,7 @@
 
 #pragma once
 
+#include "mongo/base/string_data.h"
 #include "mongo/db/update/array_culling_node.h"
 #include "mongo/stdx/memory.h"
 
@@ -51,6 +51,10 @@ public:
     }
 
 private:
+    StringData operatorName() const final {
+        return "$pull";
+    }
+
     class ObjectMatcher;
     class WrappedObjectMatcher;
     class EqualityMatcher;

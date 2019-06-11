@@ -1,6 +1,3 @@
-// ttl.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -55,8 +52,8 @@
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/server_parameters.h"
 #include "mongo/db/ttl_collection_cache.h"
+#include "mongo/db/ttl_gen.h"
 #include "mongo/util/background.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
 #include "mongo/util/exit.h"
@@ -71,14 +68,6 @@ ServerStatusMetricField<Counter64> ttlPassesDisplay("ttl.passes", &ttlPasses);
 ServerStatusMetricField<Counter64> ttlDeletedDocumentsDisplay("ttl.deletedDocuments",
                                                               &ttlDeletedDocuments);
 
-MONGO_EXPORT_SERVER_PARAMETER(ttlMonitorEnabled, bool, true);
-MONGO_EXPORT_SERVER_PARAMETER(ttlMonitorSleepSecs, int, 60)
-    ->withValidator([](const int& newVal) {
-        if (newVal <= 0)
-            return Status(ErrorCodes::BadValue, "ttlMonitorSleepSecs must be strictly positive");
-        return Status::OK();
-    });  // used for testing
-
 class TTLMonitor : public BackgroundJob {
 public:
     TTLMonitor() {}
@@ -92,7 +81,7 @@ public:
 
     virtual void run() {
         ThreadClient tc(name(), getGlobalServiceContext());
-        AuthorizationSession::get(cc())->grantInternalAuthorization();
+        AuthorizationSession::get(cc())->grantInternalAuthorization(&cc());
 
         while (!globalInShutdownDeprecated()) {
             {

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -239,8 +238,8 @@ Status ReplicationCoordinatorEmbedded::waitUntilOpTimeForReadUntil(OperationCont
     UASSERT_NOT_IMPLEMENTED;
 }
 
-Status ReplicationCoordinatorEmbedded::awaitOpTimeCommitted(OperationContext* opCtx,
-                                                            OpTime opTime) {
+Status ReplicationCoordinatorEmbedded::awaitTimestampCommitted(OperationContext* opCtx,
+                                                               Timestamp ts) {
     UASSERT_NOT_IMPLEMENTED;
 }
 

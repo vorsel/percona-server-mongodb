@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -46,15 +45,17 @@
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
-#include "mongo/db/index_builder.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/query/plan_yield_policy.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/views/view_catalog.h"
 #include "mongo/util/scopeguard.h"
 
-mongo::Status mongo::emptyCapped(OperationContext* opCtx, const NamespaceString& collectionName) {
+namespace mongo {
+
+Status emptyCapped(OperationContext* opCtx, const NamespaceString& collectionName) {
     AutoGetDb autoDb(opCtx, collectionName.db(), MODE_X);
 
     bool userInitiatedWritesAndNotPrimary = opCtx->writesAreReplicated() &&
@@ -72,7 +73,7 @@ mongo::Status mongo::emptyCapped(OperationContext* opCtx, const NamespaceString&
     Collection* collection = db->getCollection(opCtx, collectionName);
     uassert(ErrorCodes::CommandNotSupportedOnView,
             str::stream() << "emptycapped not supported on view: " << collectionName.ns(),
-            collection || !db->getViewCatalog()->lookup(opCtx, collectionName.ns()));
+            collection || !ViewCatalog::get(db)->lookup(opCtx, collectionName.ns()));
     uassert(ErrorCodes::NamespaceNotFound, "no such collection", collection);
 
     if (collectionName.isSystem() && !collectionName.isSystemDotProfile()) {
@@ -102,20 +103,20 @@ mongo::Status mongo::emptyCapped(OperationContext* opCtx, const NamespaceString&
         return status;
     }
 
-    getGlobalServiceContext()->getOpObserver()->onEmptyCapped(
-        opCtx, collection->ns(), collection->uuid());
+    const auto service = opCtx->getServiceContext();
+    service->getOpObserver()->onEmptyCapped(opCtx, collection->ns(), collection->uuid());
 
     wuow.commit();
 
     return Status::OK();
 }
 
-void mongo::cloneCollectionAsCapped(OperationContext* opCtx,
-                                    Database* db,
-                                    const std::string& shortFrom,
-                                    const std::string& shortTo,
-                                    long long size,
-                                    bool temp) {
+void cloneCollectionAsCapped(OperationContext* opCtx,
+                             Database* db,
+                             const std::string& shortFrom,
+                             const std::string& shortTo,
+                             long long size,
+                             bool temp) {
     NamespaceString fromNss(db->name(), shortFrom);
     NamespaceString toNss(db->name(), shortTo);
 
@@ -123,7 +124,7 @@ void mongo::cloneCollectionAsCapped(OperationContext* opCtx,
     if (!fromCollection) {
         uassert(ErrorCodes::CommandNotSupportedOnView,
                 str::stream() << "cloneCollectionAsCapped not supported for views: " << fromNss,
-                !db->getViewCatalog()->lookup(opCtx, fromNss.ns()));
+                !ViewCatalog::get(db)->lookup(opCtx, fromNss.ns()));
 
         uasserted(ErrorCodes::NamespaceNotFound,
                   str::stream() << "source collection " << fromNss << " does not exist");
@@ -236,9 +237,9 @@ void mongo::cloneCollectionAsCapped(OperationContext* opCtx,
     MONGO_UNREACHABLE;
 }
 
-void mongo::convertToCapped(OperationContext* opCtx,
-                            const NamespaceString& collectionName,
-                            long long size) {
+void convertToCapped(OperationContext* opCtx,
+                     const NamespaceString& collectionName,
+                     long long size) {
     StringData dbname = collectionName.db();
     StringData shortSource = collectionName.coll();
 
@@ -277,3 +278,5 @@ void mongo::convertToCapped(OperationContext* opCtx,
     options.stayTemp = false;
     uassertStatusOK(renameCollection(opCtx, longTmpName, collectionName, options));
 }
+
+}  // namespace mongo

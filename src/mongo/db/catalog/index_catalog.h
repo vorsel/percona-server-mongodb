@@ -156,6 +156,12 @@ public:
         virtual ~IndexBuildBlockInterface() = default;
 
         /**
+         * Must be called before the object is destructed if init() has been called.
+         * Cleans up the temporary tables that are created for an index build.
+         */
+        virtual void deleteTemporaryTables(OperationContext* opCtx) = 0;
+
+        /**
          * Initializes a new entry for the index in the IndexCatalog.
          *
          * On success, holds pointer to newly created IndexCatalogEntry that can be accessed using
@@ -163,21 +169,21 @@ public:
          *
          * Must be called from within a `WriteUnitOfWork`
          */
-        virtual Status init() = 0;
+        virtual Status init(OperationContext* opCtx, Collection* collection) = 0;
 
         /**
          * Marks the state of the index as 'ready' and commits the index to disk.
          *
          * Must be called from within a `WriteUnitOfWork`
          */
-        virtual void success() = 0;
+        virtual void success(OperationContext* opCtx, Collection* collection) = 0;
 
         /**
          * Aborts the index build and removes any on-disk state where applicable.
          *
          * Must be called from within a `WriteUnitOfWork`
          */
-        virtual void fail() = 0;
+        virtual void fail(OperationContext* opCtx, const Collection* collection) = 0;
 
         /**
          * Returns the IndexCatalogEntry that was created in init().

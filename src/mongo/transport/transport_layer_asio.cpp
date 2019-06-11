@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -183,12 +182,12 @@ public:
         return Date_t(asio::system_timer::clock_type::now());
     }
 
-    void schedule(ScheduleMode mode, Task task) override {
-        if (mode == kDispatch) {
-            asio::dispatch(_ioContext, std::move(task));
-        } else {
-            asio::post(_ioContext, std::move(task));
-        }
+    void schedule(Task task) override {
+        asio::post(_ioContext, std::move(task));
+    }
+
+    void dispatch(Task task) override {
+        asio::dispatch(_ioContext, std::move(task));
     }
 
     bool onReactorThread() const override {
@@ -880,13 +879,10 @@ SSLParams::SSLModes TransportLayerASIO::_sslMode() const {
 
 #ifdef __linux__
 BatonHandle TransportLayerASIO::makeBaton(OperationContext* opCtx) const {
-    auto baton = std::make_shared<BatonASIO>(opCtx);
+    invariant(!opCtx->getBaton());
 
-    {
-        stdx::lock_guard<Client> lk(*opCtx->getClient());
-        invariant(!opCtx->getBaton());
-        opCtx->setBaton(baton);
-    }
+    auto baton = std::make_shared<BatonASIO>(opCtx);
+    opCtx->setBaton(baton);
 
     return baton;
 }

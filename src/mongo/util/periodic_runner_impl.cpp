@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -101,6 +100,8 @@ PeriodicRunnerImpl::PeriodicJobImpl::PeriodicJobImpl(PeriodicJob job,
     : _job(std::move(job)), _clockSource(source), _serviceContext(svc) {}
 
 void PeriodicRunnerImpl::PeriodicJobImpl::_run() {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    invariant(_execStatus == PeriodicJobImpl::ExecutionStatus::NOT_SCHEDULED);
     _thread = stdx::thread([this] {
         Client::initThread(_job.name, _serviceContext, nullptr);
         while (true) {
@@ -125,14 +126,10 @@ void PeriodicRunnerImpl::PeriodicJobImpl::_run() {
             }
         }
     });
+    _execStatus = PeriodicJobImpl::ExecutionStatus::RUNNING;
 }
 
 void PeriodicRunnerImpl::PeriodicJobImpl::start() {
-    {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
-        invariant(_execStatus == PeriodicJobImpl::ExecutionStatus::NOT_SCHEDULED);
-        _execStatus = PeriodicJobImpl::ExecutionStatus::RUNNING;
-    }
     _run();
 }
 

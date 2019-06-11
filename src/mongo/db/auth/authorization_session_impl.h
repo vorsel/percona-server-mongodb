@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -95,9 +94,11 @@ public:
 
     std::string getAuthenticatedUserNamesToken() override;
 
-    void logoutDatabase(StringData dbname) override;
+    void logoutDatabase(OperationContext* opCtx, StringData dbname) override;
 
-    void grantInternalAuthorization() override;
+    void grantInternalAuthorization(Client* client) override;
+
+    void grantInternalAuthorization(OperationContext* opCtx) override;
 
     PrivilegeVector getDefaultPrivileges() override;
 
@@ -187,7 +188,7 @@ public:
 
     void clearImpersonatedUserData() override;
 
-    bool isCoauthorizedWithClient(Client* opClient) override;
+    bool isCoauthorizedWithClient(Client* opClient, WithLock opClientLock) override;
 
     bool isCoauthorizedWith(UserNameIterator userNameIter) override;
 

@@ -6,8 +6,7 @@
 
     load("jstests/libs/curop_helpers.js");
 
-    const rst = new ReplSetTest(
-        {nodes: [{setParameter: {closeConnectionsOnStepdown: false}}, {rsConfig: {priority: 0}}]});
+    const rst = new ReplSetTest({nodes: [{}, {rsConfig: {priority: 0}}]});
     rst.startSet();
     rst.initiate();
 
@@ -68,6 +67,13 @@
             print("Failed trying to write or ping in " + description + ", possibly disconnected.");
             throw ex;
         }
+
+        // Validate the number of operations killed on step down and number of failed unacknowledged
+        // writes resulted in network disconnection.
+        let replMetrics =
+            assert.commandWorked(primaryAdmin.adminCommand({serverStatus: 1})).metrics.repl;
+        assert.eq(replMetrics.stepDown.userOperationsKilled, 1);
+        assert.eq(replMetrics.network.notMasterUnacknowledgedWrites, 0);
 
         // Allow the primary to be re-elected, and wait for it.
         assert.commandWorked(primaryAdmin.adminCommand({replSetFreeze: 0}));

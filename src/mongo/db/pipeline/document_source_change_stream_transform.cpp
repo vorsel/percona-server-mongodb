@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -179,7 +178,11 @@ ResumeTokenData DocumentSourceChangeStreamTransform::getResumeToken(Value ts,
     if (!uuid.missing())
         resumeTokenData.uuid = uuid.getUuid();
 
-    if (_fcv < ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42) {
+    // If 'needsMerge' is true, 'mergeByPBRT' is false, and FCV is less than 4.2, then we are
+    // running on a sharded cluster that is mid-upgrade, and so we generate v0 resume tokens.
+    // Otherwise, we always generate v1 resume tokens whether the FCV is 4.0 or 4.2.
+    if (pExpCtx->needsMerge && !pExpCtx->mergeByPBRT &&
+        _fcv < ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42) {
         resumeTokenData.version = 0;
     }
 
@@ -300,6 +303,11 @@ Document DocumentSourceChangeStreamTransform::applyTransformation(const Document
                 invariant(nextDoc);
 
                 return applyTransformation(*nextDoc);
+            } else if (!input.getNestedField("o.commitTransaction").missing()) {
+                // TODO SERVER-39675: Perform a lookup for the associated committed transaction
+                // operations. The current invalidate behavior is just a placeholder pending this
+                // work.
+                operationType = DocumentSourceChangeStream::kInvalidateOpType;
             } else if (!input.getNestedField("o.drop").missing()) {
                 operationType = DocumentSourceChangeStream::kDropCollectionOpType;
 

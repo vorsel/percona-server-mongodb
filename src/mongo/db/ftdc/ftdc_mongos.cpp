@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -37,7 +36,6 @@
 
 #include "mongo/db/ftdc/controller.h"
 #include "mongo/db/ftdc/ftdc_server.h"
-#include "mongo/db/server_parameters.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/log.h"
 #include "mongo/util/synchronized_value.h"

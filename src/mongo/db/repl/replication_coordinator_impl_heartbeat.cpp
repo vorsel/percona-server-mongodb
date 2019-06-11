@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -40,6 +39,7 @@
 
 #include "mongo/base/status.h"
 #include "mongo/db/concurrency/replication_state_transition_lock_guard.h"
+#include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/kill_sessions_local.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_time_validator.h"
@@ -148,7 +148,6 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
     }
 
     ReplSetHeartbeatResponse hbResponse;
-    OpTime lastOpCommitted;
     BSONObj resp;
     if (responseStatus.isOK()) {
         resp = cbData.response.data;
@@ -177,12 +176,8 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
             replMetadata = responseStatus;
         }
         if (replMetadata.isOK()) {
-            lastOpCommitted = replMetadata.getValue().getLastOpCommitted();
+            _advanceCommitPoint(lk, replMetadata.getValue().getLastOpCommitted());
 
-            // Arbiters are the only nodes allowed to advance their commit point via heartbeats.
-            if (_getMemberState_inlock().arbiter()) {
-                _advanceCommitPoint(lk, lastOpCommitted);
-            }
             // Asynchronous stepdown could happen, but it will wait for _mutex and execute
             // after this function, so we cannot and don't need to wait for it to finish.
             _processReplSetMetadata_inlock(replMetadata.getValue());
@@ -205,14 +200,14 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
             _cancelAndRescheduleElectionTimeout_inlock();
         }
     } else {
-        LOG_FOR_HEARTBEATS(0) << "Error in heartbeat (requestId: " << cbData.request.id << ") to "
+        LOG_FOR_HEARTBEATS(2) << "Error in heartbeat (requestId: " << cbData.request.id << ") to "
                               << target << ", response status: " << responseStatus;
 
         hbStatusResponse = StatusWith<ReplSetHeartbeatResponse>(responseStatus);
     }
 
-    HeartbeatResponseAction action = _topCoord->processHeartbeatResponse(
-        now, networkTime, target, hbStatusResponse, lastOpCommitted);
+    HeartbeatResponseAction action =
+        _topCoord->processHeartbeatResponse(now, networkTime, target, hbStatusResponse);
 
     if (action.getAction() == HeartbeatResponseAction::NoAction && hbStatusResponse.isOK() &&
         hbStatusResponse.getValue().hasState() &&
@@ -384,7 +379,7 @@ void ReplicationCoordinatorImpl::_stepDownFinish(
     auto opCtx = cc().makeOperationContext();
 
     ReplicationStateTransitionLockGuard rstlLock(
-        opCtx.get(), ReplicationStateTransitionLockGuard::EnqueueOnly());
+        opCtx.get(), MODE_X, ReplicationStateTransitionLockGuard::EnqueueOnly());
 
     // kill all write operations which are no longer safe to run on step down. Also, operations that
     // have taken global lock in S mode will be killed to avoid 3-way deadlock between read,
@@ -414,6 +409,7 @@ void ReplicationCoordinatorImpl::_stepDownFinish(
     }
     lk.unlock();
     _performPostMemberStateUpdateAction(action);
+    _updateAndLogStatsOnStepDown(&koc);
     _replExecutor->signalEvent(finishedEvent);
 }
 
@@ -578,7 +574,7 @@ void ReplicationCoordinatorImpl::_heartbeatReconfigFinish(
         // transition out of primary while waiting for the RSTL, there's no harm in holding
         // it.
         lk.unlock();
-        transitionGuard.emplace(opCtx.get());
+        transitionGuard.emplace(opCtx.get(), MODE_X);
         lk.lock();
     }
 
@@ -628,6 +624,9 @@ void ReplicationCoordinatorImpl::_heartbeatReconfigFinish(
         _setCurrentRSConfig(lk, opCtx.get(), newConfig, myIndexValue);
     lk.unlock();
     _performPostMemberStateUpdateAction(action);
+
+    // Inform the index builds coordinator of the replica set reconfig.
+    IndexBuildsCoordinator::get(opCtx.get())->onReplicaSetReconfig();
 }
 
 void ReplicationCoordinatorImpl::_trackHeartbeatHandle_inlock(

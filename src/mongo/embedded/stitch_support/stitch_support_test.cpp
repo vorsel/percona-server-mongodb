@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -296,10 +295,13 @@ protected:
         return ss.str();
     }
 
-    auto checkUpsert(const char* expr, const char* match) {
-        stitch_support_v1_matcher* matcher =
-            stitch_support_v1_matcher_create(lib, toBSONForAPI(match).first, nullptr, nullptr);
-        ASSERT(matcher);
+    auto checkUpsert(const char* expr, const char* match = nullptr) {
+        stitch_support_v1_matcher* matcher = nullptr;
+        if (match) {
+            matcher =
+                stitch_support_v1_matcher_create(lib, toBSONForAPI(match).first, nullptr, nullptr);
+            ASSERT(matcher);
+        }
         ON_BLOCK_EXIT([matcher] { stitch_support_v1_matcher_destroy(matcher); });
 
         stitch_support_v1_update* update = stitch_support_v1_update_create(
@@ -373,18 +375,16 @@ TEST_F(StitchSupportTest, CheckMatchWorksWithDefaults) {
 }
 
 TEST_F(StitchSupportTest, CheckMatchWorksWithStatus) {
-    ASSERT_EQ("bad query: BadValue: unknown operator: $bogus",
-              checkMatchStatus("{a: {$bogus: 1}}", "{a: 1}"));
-    ASSERT_EQ("bad query: BadValue: $where is not allowed in this context",
+    ASSERT_EQ("unknown operator: $bogus", checkMatchStatus("{a: {$bogus: 1}}", "{a: 1}"));
+    ASSERT_EQ("$where is not allowed in this context",
               checkMatchStatus("{$where: 'this.a == 1'}", "{a: 1}"));
-    ASSERT_EQ("bad query: BadValue: $text is not allowed in this context",
+    ASSERT_EQ("$text is not allowed in this context",
               checkMatchStatus("{$text: {$search: 'stitch'}}", "{a: 'stitch lib'}"));
-    ASSERT_EQ(
-        "bad query: BadValue: $geoNear, $near, and $nearSphere are not allowed in this context",
-        checkMatchStatus(
-            "{location: {$near: {$geometry: {type: 'Point', "
-            "coordinates: [ -73.9667, 40.78 ] }, $minDistance: 10, $maxDistance: 500}}}",
-            "{type: 'Point', 'coordinates': [100.0, 0.0]}"));
+    ASSERT_EQ("$geoNear, $near, and $nearSphere are not allowed in this context",
+              checkMatchStatus(
+                  "{location: {$near: {$geometry: {type: 'Point', "
+                  "coordinates: [ -73.9667, 40.78 ] }, $minDistance: 10, $maxDistance: 500}}}",
+                  "{type: 'Point', 'coordinates': [100.0, 0.0]}"));
 
     // 'check_match' cannot actually fail so we do not test it with a status.
 }
@@ -396,7 +396,7 @@ TEST_F(StitchSupportTest, CheckMatchWorksWithCollation) {
     ASSERT_TRUE(checkMatch("{a: 'word'}", {"{a: 'WORD', b: 'other'}"}, collator));
 }
 
-TEST_F(StitchSupportTest, CheckProjectionWorkDefaults) {
+TEST_F(StitchSupportTest, CheckProjectionWorksWithDefaults) {
     auto results =
         checkProjection("{a: 1}", {"{_id: 1, a: 100, b: 200}", "{_id: 1, a: 200, b: 300}"});
     ASSERT_EQ("{ \"_id\" : 1, \"a\" : 100 }", results[0]);
@@ -421,6 +421,8 @@ TEST_F(StitchSupportTest, CheckProjectionProducesExpectedStatus) {
     ASSERT_EQ(
         "$textScore, $sortKey, $recordId, $geoNear and $returnKey are not allowed in this context",
         checkProjectionStatus("{a: {$meta: 'textScore'}}", "{_id: 1, a: 100, b: 200}"));
+    ASSERT_EQ("Unsupported projection option: a: { b: 0 }",
+              checkProjectionStatus("{a: {b: 0}}", "{_id: 1, a: {b: 200}}"));
 }
 
 TEST_F(StitchSupportTest, CheckProjectionCollatesRespectfully) {
@@ -538,6 +540,22 @@ TEST_F(StitchSupportTest, TestUpsert) {
     ASSERT_EQ("{ \"a\" : 2 }", checkUpsert("{$set: {a: 2}}", "{a: 1}"));
     ASSERT_EQ("{ \"_id\" : 1, \"a\" : 1 }", checkUpsert("{$setOnInsert: {a: 1}}", "{_id: 1}"));
     ASSERT_EQ("{ \"_id\" : 1, \"b\" : 1 }", checkUpsert("{$inc: {b: 1}}", "{_id: 1, a: {$gt: 2}}"));
+    // Document replace overrides matcher.
+    ASSERT_EQ("{}", checkUpsert("{}", "{a: 1}"));
+}
+
+TEST_F(StitchSupportTest, TestUpsertWithoutMatcher) {
+    ASSERT_EQ("{ \"a\" : 1 }", checkUpsert("{a: 1}"));
+    ASSERT_EQ("{ \"a\" : [ { \"b\" : 2 }, false ] }", checkUpsert("{a: [{b: 2}, false]}"));
+    ASSERT_EQ("{}", checkUpsert("{}"));
+}
+
+TEST_F(StitchSupportTest, TestUpsertEmptyMatcher) {
+    ASSERT_EQ("{ \"a\" : 1 }", checkUpsert("{$set: {a: 1}}", "{}"));
+    ASSERT_EQ("{ \"a\" : 1 }", checkUpsert("{$setOnInsert: {a: 1}}", "{}"));
+    ASSERT_EQ("{ \"b\" : 1 }", checkUpsert("{$inc: {b: 1}}", "{}"));
+    ASSERT_EQ("{ \"a\" : 1 }", checkUpsert("{a: 1}", "{}"));
+    ASSERT_EQ("{ \"a\" : [ { \"b\" : 2 }, false ] }", checkUpsert("{a: [{b: 2}, false]}", "{}"));
 }
 
 TEST_F(StitchSupportTest, TestUpsertProducesProperStatus) {

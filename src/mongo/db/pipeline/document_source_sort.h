@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -39,7 +38,7 @@
 
 namespace mongo {
 
-class DocumentSourceSort final : public DocumentSource, public NeedsMergerDocumentSource {
+class DocumentSourceSort final : public DocumentSource {
 public:
     static constexpr StringData kStageName = "$sort"_sd;
     enum class SortKeySerialization {
@@ -77,14 +76,9 @@ public:
         return constraints;
     }
 
-    BSONObjSet getOutputSorts() final {
-        return allPrefixes(_rawSort);
-    }
-
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
 
-    boost::intrusive_ptr<DocumentSource> getShardSource() final;
-    MergingLogic mergingLogic() final;
+    boost::optional<MergingLogic> mergingLogic() final;
     bool canRunInParallelBeforeOut(
         const std::set<std::string>& nameOfShardKeyFieldsUponEntryToStage) const final;
 
