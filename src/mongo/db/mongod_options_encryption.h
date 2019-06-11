@@ -31,9 +31,9 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 
 #pragma once
 
-namespace mongo {
-
 #include "mongo/base/status.h"
+
+namespace mongo {
 
 inline Status validateEncryptionCipherModeSetting(const std::string& value) {
     constexpr auto kCBC = "AES256-CBC"_sd;
