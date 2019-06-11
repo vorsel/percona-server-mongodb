@@ -66,4 +66,17 @@ bool handlePreValidationPerconaDecryptOptions(const moe::Environment& params);
 
 Status storePerconaDecryptOptions(const moe::Environment& params,
                                const std::vector<std::string>& args);
+
+inline Status validateEncryptionCipherModeSetting(const std::string& value) {
+    constexpr auto kCBC = "AES256-CBC"_sd;
+    constexpr auto kGCM = "AES256-GCM"_sd;
+
+    if (!kCBC.equalCaseInsensitive(value) && !kGCM.equalCaseInsensitive(value)) {
+        return {ErrorCodes::BadValue,
+                "--encryptionCipherMode expects either 'AES256-CBC' or 'AES256-GCM'"};
+    }
+
+    return Status::OK();
+}
+
 }
