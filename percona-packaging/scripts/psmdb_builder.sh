@@ -284,25 +284,20 @@ install_deps() {
       rm -fr /usr/local/gcc-5.4.0
       RHEL=$(rpm --eval %rhel)
       if [ x"$RHEL" = x6 ]; then
-        yum -y install rpmbuild rpm-build libpcap-devel gcc make cmake gcc-c++ openssl-devel cyrus-sasl-devel snappy-devel zlib-devel bzip2-devel libpcap-devel scons make rpm-build rpmbuild percona-devtoolset-gcc percona-devtoolset-binutils percona-devtoolset-gcc-c++ percona-devtoolset-libstdc++-devel percona-devtoolset-valgrind-devel python27 python27-devel
+        yum -y install rpmbuild rpm-build libpcap-devel gcc make cmake gcc-c++ openssl-devel cyrus-sasl-devel snappy-devel zlib-devel bzip2-devel libpcap-devel scons make rpm-build rpmbuild percona-devtoolset-gcc percona-devtoolset-binutils percona-devtoolset-gcc-c++ percona-devtoolset-libstdc++-devel percona-devtoolset-valgrind-devel python27 python27-devel libcurl-devel
         wget https://bootstrap.pypa.io/get-pip.py
         python2.7 get-pip.py
         rm -rf /usr/bin/python2
         ln -s /usr/bin/python2.7 /usr/bin/python2
       else
-        yum -y install rpmbuild rpm-build libpcap-devel gcc make cmake gcc-c++ openssl-devel cyrus-sasl-devel snappy-devel zlib-devel bzip2-devel scons rpmlint rpm-build git python-pip python-devel libopcodes
+        yum -y install rpmbuild rpm-build libpcap-devel gcc make cmake gcc-c++ openssl-devel cyrus-sasl-devel snappy-devel zlib-devel bzip2-devel scons rpmlint rpm-build git python-pip python-devel libopcodes libcurl-devel
       fi
       install_golang
       install_gcc_54_centos
     else
       export DEBIAN=$(lsb_release -sc)
       export ARCH=$(echo $(uname -m) | sed -e 's:i686:i386:g')
-      INSTALL_LIST="python python-dev valgrind scons liblz4-dev devscripts debhelper debconf libpcap-dev libbz2-dev libsnappy-dev pkg-config zlib1g-dev libzlcore-dev dh-systemd libsasl2-dev gcc g++ cmake "
-      if [ x"${DEBIAN}" = xstretch -o x"${DEBIAN}" = xbionic -o x"${DEBIAN}" = xcosmic ]; then
-        INSTALL_LIST="${INSTALL_LIST} libssl1.0-dev"
-      else
-        INSTALL_LIST="${INSTALL_LIST} libssl-dev"
-      fi
+      INSTALL_LIST="python python-dev valgrind scons liblz4-dev devscripts debhelper debconf libpcap-dev libbz2-dev libsnappy-dev pkg-config zlib1g-dev libzlcore-dev dh-systemd libsasl2-dev gcc g++ cmake curl libcurl4-openssl-dev libssl-dev"
       until apt-get -y install dirmngr; do
         sleep 1
         echo "waiting"
