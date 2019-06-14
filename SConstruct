@@ -366,11 +366,6 @@ add_option('use-system-snappy',
     nargs=0,
 )
 
-add_option('use-system-lz4',
-    help='use system version of LZ4 library',
-    nargs=0,
-)
-
 add_option('use-system-valgrind',
     help='use system version of valgrind library',
     nargs=0,

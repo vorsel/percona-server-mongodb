@@ -15,7 +15,6 @@ mozjsSuffix = '-60'
 yamlSuffix = '-0.6.2'
 icuSuffix = '-57.1'
 gperftoolsSuffix = '-2.7'
-lz4Suffix = '-r131'
 timelibSuffix = '-2018.01'
 tomcryptSuffix = '-1.18.2'
 benchmarkSuffix = '-1.4.1'
@@ -58,11 +57,6 @@ if not use_system_version_of_library('abseil-cpp'):
 if not use_system_version_of_library('snappy'):
     thirdPartyEnvironmentModifications['snappy'] = {
         'CPPPATH' : ['#/src/third_party/snappy' + snappySuffix],
-    }
-
-if not use_system_version_of_library('lz4'):
-    thirdPartyEnvironmentModifications['lz4'] = {
-        'CPPPATH' : ['#/src/third_party/lz4' + lz4Suffix],
     }
 
 # Valgrind is a header only include as valgrind.h includes everything we need
@@ -295,29 +289,6 @@ snappyEnv.Library(
     source=[
         'shim_snappy.cpp',
     ])
-
-
-if use_system_version_of_library("lz4"):
-    lz4Env = env.Clone(
-        SYSLIBDEPS=[
-            env['LIBDEPS_LZ4_SYSLIBDEP'],
-        ])
-else:
-    lz4Env = env.Clone()
-    lz4Env.InjectThirdParty(libraries=['lz4'])
-    lz4Env.InjectMongoIncludePaths()
-    lz4Env.SConscript('lz4' + lz4Suffix + '/SConscript', exports={ 'env' : lz4Env })
-    lz4Env = lz4Env.Clone(
-        LIBDEPS_INTERFACE=[
-            'lz4' + lz4Suffix + '/lz4'
-        ])
-
-lz4Env.Library(
-    target="shim_lz4",
-    source=[
-        'shim_lz4.cpp',
-    ])
-
 
 if use_system_version_of_library("zlib"):
     zlibEnv = env.Clone(
