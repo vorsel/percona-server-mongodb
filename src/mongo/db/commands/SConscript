@@ -259,6 +259,7 @@ env.Library(
         "sleep_command.cpp",
         "validate.cpp",
         "write_commands/write_commands.cpp",
+        env.Idlc('create.idl')[0],
         env.Idlc('enable_coordinator_for_create_indexes_command.idl')[0],
     ],
     LIBDEPS_PRIVATE=[
@@ -278,6 +279,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/stats/counters',
         '$BUILD_DIR/mongo/db/stats/server_read_concern_write_concern_metrics',
         '$BUILD_DIR/mongo/db/storage/storage_engine_common',
+        '$BUILD_DIR/mongo/db/transaction',
         '$BUILD_DIR/mongo/db/views/views_mongod',
         '$BUILD_DIR/mongo/util/net/http_client',
         'core',

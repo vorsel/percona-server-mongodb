@@ -315,6 +315,9 @@ public:
      * removes all documents as fast as possible
      * indexes before and after will be the same
      * as will other characteristics.
+     *
+     * The caller should hold a collection X lock and ensure there are no index builds in progress
+     * on the collection.
      */
     virtual Status truncate(OperationContext* const opCtx) = 0;
 
@@ -343,6 +346,9 @@ public:
      * collection.  The collection cannot be completely emptied using this
      * function.  An assertion will be thrown if that is attempted.
      * @param inclusive - Truncate 'end' as well iff true
+     *
+     * The caller should hold a collection X lock and ensure there are no index builds in progress
+     * on the collection.
      */
     virtual void cappedTruncateAfter(OperationContext* const opCtx,
                                      RecordId end,
@@ -381,7 +387,13 @@ public:
                                    StringData newLevel,
                                    StringData newAction) = 0;
 
-    // -----------
+    /**
+     * Returns true if this is a temporary collection.
+     *
+     * Calling this function is somewhat costly because it requires accessing the storage engine's
+     * cache of collection information.
+     */
+    virtual bool isTemporary(OperationContext* opCtx) const = 0;
 
     //
     // Stats

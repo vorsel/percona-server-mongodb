@@ -63,7 +63,6 @@ function RollbackTest(name = "RollbackTest", replSet, expectPreparedTxnsDuringRo
     const SIGTERM = 15;
     const kNumDataBearingNodes = 3;
     const kElectableNodes = 2;
-    const dontCheckCollCounts = expectPreparedTxnsDuringRollback;
 
     let rst;
     let curPrimary;
@@ -102,6 +101,11 @@ function RollbackTest(name = "RollbackTest", replSet, expectPreparedTxnsDuringRo
         // Extract the other two nodes and wait for them to be ready.
         let secondaries = replSet.getSecondaries();
         let config = replSet.getReplSetConfigFromNode();
+
+        // Make sure chaining is disabled, so that the tiebreaker cannot be used as a sync source.
+        assert.eq(config.settings.chainingAllowed,
+                  false,
+                  "Must set up ReplSetTest with chaining disabled.");
 
         // Make sure the primary is not a priority: 0 node.
         assert.neq(0, config.members[0].priority);
@@ -164,10 +168,7 @@ function RollbackTest(name = "RollbackTest", replSet, expectPreparedTxnsDuringRo
         const name = rst.name;
         // We must check counts before we validate since validate fixes counts. We cannot check
         // counts if unclean shutdowns occur.
-        // TODO SERVER-39762: Once we fix collection counts when aborting a prepared
-        // transaction that was recovered during rollback, re-enable this check.
-        if (!dontCheckCollCounts &&
-            (!TestData.allowUncleanShutdowns || !TestData.rollbackShutdowns)) {
+        if (!TestData.allowUncleanShutdowns || !TestData.rollbackShutdowns) {
             rst.checkCollectionCounts(name);
         }
         rst.checkOplogs(name);
@@ -248,7 +249,10 @@ function RollbackTest(name = "RollbackTest", replSet, expectPreparedTxnsDuringRo
         // After the previous rollback (if any) has completed and await replication has finished,
         // the replica set should be in a consistent and "fresh" state. We now prepare for the next
         // rollback.
-        if (!dontCheckCollCounts) {
+        if (expectPreparedTxnsDuringRollback === true) {
+            print('Skipping data consistency checks because active prepared transactions are' +
+                  ' expected after rollback');
+        } else {
             checkDataConsistency();
         }
 
@@ -384,7 +388,7 @@ function RollbackTest(name = "RollbackTest", replSet, expectPreparedTxnsDuringRo
         return curSecondary;
     };
 
-    this.restartNode = function(nodeId, signal, startOptions) {
+    this.restartNode = function(nodeId, signal, startOptions, allowedExitCode) {
         assert(signal === SIGKILL || signal === SIGTERM, `Received unknown signal: ${signal}`);
         assert.gte(nodeId, 0, "Invalid argument to RollbackTest.restartNode()");
 
@@ -408,7 +412,9 @@ function RollbackTest(name = "RollbackTest", replSet, expectPreparedTxnsDuringRo
         }
 
         let opts = {};
-        if (signal === SIGKILL) {
+        if (allowedExitCode !== undefined) {
+            opts = {allowedExitCode: allowedExitCode};
+        } else if (signal === SIGKILL) {
             opts = {allowedExitCode: MongoRunner.EXIT_SIGKILL};
         }
 

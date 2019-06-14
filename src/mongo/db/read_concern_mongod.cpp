@@ -38,11 +38,11 @@
 #include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/read_concern_mongod_gen.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/speculative_majority_read_info.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/server_options.h"
-#include "mongo/db/transaction_participant.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/concurrency/notification.h"
 #include "mongo/util/log.h"
@@ -197,10 +197,35 @@ Status makeNoopWriteIfNeeded(OperationContext* opCtx, LogicalTime clusterTime) {
     }
     return Status::OK();
 }
+
+/**
+ * Returns whether the command should ignore prepare conflicts or not.
+ */
+bool shouldIgnorePrepared(PrepareConflictBehavior prepareConflictBehavior,
+                          repl::ReadConcernLevel readConcernLevel,
+                          boost::optional<LogicalTime> afterClusterTime,
+                          boost::optional<LogicalTime> atClusterTime) {
+
+    // Only these read concern levels are eligible for ignoring prepare conflicts.
+    if (readConcernLevel != repl::ReadConcernLevel::kLocalReadConcern &&
+        readConcernLevel != repl::ReadConcernLevel::kAvailableReadConcern &&
+        readConcernLevel != repl::ReadConcernLevel::kMajorityReadConcern) {
+        return false;
+    }
+
+    if (afterClusterTime || atClusterTime) {
+        return false;
+    }
+
+    return prepareConflictBehavior == PrepareConflictBehavior::kIgnore;
+}
 }  // namespace
 
 MONGO_REGISTER_SHIM(waitForReadConcern)
-(OperationContext* opCtx, const repl::ReadConcernArgs& readConcernArgs, bool allowAfterClusterTime)
+(OperationContext* opCtx,
+ const repl::ReadConcernArgs& readConcernArgs,
+ bool allowAfterClusterTime,
+ PrepareConflictBehavior prepareConflictBehavior)
     ->Status {
     // If we are in a direct client within a transaction, then we may be holding locks, so it is
     // illegal to wait for read concern. This is fine, since the outer operation should have handled
@@ -208,7 +233,6 @@ MONGO_REGISTER_SHIM(waitForReadConcern)
     // should block on prepared transactions.
     if (opCtx->getClient()->isInDirectClient() &&
         readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern) {
-        opCtx->recoveryUnit()->setIgnorePrepared(false);
         return Status::OK();
     }
 
@@ -301,9 +325,11 @@ MONGO_REGISTER_SHIM(waitForReadConcern)
         // Handle speculative majority reads.
         if (readConcernArgs.getMajorityReadMechanism() ==
             repl::ReadConcernArgs::MajorityReadMechanism::kSpeculative) {
-            // We read from a local snapshot, so there is no need to set an explicit read source.
-            // Mark down that we need to block after the command is done to satisfy majority read
-            // concern, though.
+            // For speculative majority reads, we utilize the "no overlap" read source as a means of
+            // always reading at the minimum of the all-committed and lastApplied timestamps. This
+            // allows for safe behavior on both primaries and secondaries, where the behavior of the
+            // all-committed and lastApplied timestamps differ significantly.
+            opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoOverlap);
             auto& speculativeReadInfo = repl::SpeculativeMajorityReadInfo::get(opCtx);
             speculativeReadInfo.setIsSpeculativeRead();
             return Status::OK();
@@ -332,13 +358,11 @@ MONGO_REGISTER_SHIM(waitForReadConcern)
                         << " with readTs: " << opCtx->recoveryUnit()->getPointInTimeReadTimestamp();
     }
 
-    // Only snapshot, linearizable and afterClusterTime reads should block on prepared transactions.
-    if (readConcernArgs.getLevel() != repl::ReadConcernLevel::kSnapshotReadConcern &&
-        readConcernArgs.getLevel() != repl::ReadConcernLevel::kLinearizableReadConcern &&
-        !afterClusterTime && !atClusterTime) {
-        opCtx->recoveryUnit()->setIgnorePrepared(true);
-    } else {
-        opCtx->recoveryUnit()->setIgnorePrepared(false);
+    // DBDirectClient should inherit whether or not to ignore prepare conflicts from its parent.
+    if (!opCtx->getClient()->isInDirectClient()) {
+        // Set whether this command should ignore prepare conflicts or not.
+        opCtx->recoveryUnit()->setIgnorePrepared(shouldIgnorePrepared(
+            prepareConflictBehavior, readConcernArgs.getLevel(), afterClusterTime, atClusterTime));
     }
 
     return Status::OK();
@@ -391,17 +415,19 @@ MONGO_REGISTER_SHIM(waitForSpeculativeMajorityReadConcern)
     invariant(speculativeReadInfo.isSpeculativeRead());
 
     // Select the timestamp to wait on. A command may have selected a specific timestamp to wait on.
-    // If not, then we just wait on the most recent timestamp written on this node i.e. lastApplied.
+    // If not, then we use the timestamp selected by the read source.
     auto replCoord = repl::ReplicationCoordinator::get(opCtx);
     Timestamp waitTs;
-    auto lastAppliedTs = replCoord->getMyLastAppliedOpTime().getTimestamp();
     auto speculativeReadTimestamp = speculativeReadInfo.getSpeculativeReadTimestamp();
     if (speculativeReadTimestamp) {
-        // The timestamp provided must not be greater than the current lastApplied.
-        invariant(*speculativeReadTimestamp <= lastAppliedTs);
         waitTs = *speculativeReadTimestamp;
     } else {
-        waitTs = lastAppliedTs;
+        // Speculative majority reads are required to use the 'kNoOverlap' read source.
+        invariant(opCtx->recoveryUnit()->getTimestampReadSource() ==
+                  RecoveryUnit::ReadSource::kNoOverlap);
+        boost::optional<Timestamp> readTs = opCtx->recoveryUnit()->getPointInTimeReadTimestamp();
+        invariant(readTs);
+        waitTs = *readTs;
     }
 
     // Block to make sure returned data is majority committed.

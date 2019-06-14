@@ -921,6 +921,23 @@ var ReplSetTest = function(opts) {
         }
     };
 
+    function replSetCommandWithRetry(master, cmd) {
+        printjson(cmd);
+        const cmdName = Object.keys(cmd)[0];
+        const errorMsg = `${cmdName} during initiate failed`;
+        assert.retry(() => {
+            const result = assert.commandWorkedOrFailedWithCode(
+                master.runCommand(cmd),
+                [
+                  ErrorCodes.NodeNotFound,
+                  ErrorCodes.NewReplicaSetConfigurationIncompatible,
+                  ErrorCodes.InterruptedDueToStepDown
+                ],
+                errorMsg);
+            return result.ok;
+        }, errorMsg, 3, 5 * 1000);
+    }
+
     /**
      * Runs replSetInitiate on the first node of the replica set.
      * Ensures that a primary is elected (not necessarily node 0).
@@ -953,9 +970,13 @@ var ReplSetTest = function(opts) {
         this._setDefaultConfigOptions(config);
 
         cmd[cmdKey] = config;
-        printjson(cmd);
 
-        assert.commandWorked(master.runCommand(cmd), tojson(cmd));
+        // replSetInitiate and replSetReconfig commands can fail with a NodeNotFound error if a
+        // heartbeat times out during the quorum check. They may also fail with
+        // NewReplicaSetConfigurationIncompatible on similar timeout during the config validation
+        // stage while deducing isSelf(). This can fail with an InterruptedDueToStepDown error when
+        // interrupted. We try several times, to reduce the chance of failing this way.
+        replSetCommandWithRetry(master, cmd);
         this.getPrimary();  // Blocks until there is a primary.
 
         // Reconfigure the set to contain the correct number of nodes (if necessary).
@@ -974,40 +995,7 @@ var ReplSetTest = function(opts) {
 
             cmd = {replSetReconfig: config};
             print("Reconfiguring replica set to add in other nodes");
-            printjson(cmd);
-
-            // replSetInitiate and replSetReconfig commands can fail with a NodeNotFound error
-            // if a heartbeat times out during the quorum check.
-            // They may also fail with NewReplicaSetConfigurationIncompatible on similar timeout
-            // during the config validation stage while deducing isSelf().
-            // This can fail with an InterruptedDueToStepDown error when interrupted.
-            // We retry three times to reduce the chance of failing this way.
-            assert.retry(() => {
-                var res;
-                try {
-                    res = master.runCommand(cmd);
-                    if (res.ok === 1) {
-                        return true;
-                    }
-                } catch (e) {
-                    // reconfig can lead to a stepdown if the primary looks for a majority before
-                    // a majority of nodes have successfully joined the set. If there is a stepdown
-                    // then the reconfig request will be killed and respond with a network error.
-                    if (isNetworkError(e)) {
-                        return true;
-                    }
-                    throw e;
-                }
-
-                assert.commandFailedWithCode(res,
-                                             [
-                                               ErrorCodes.NodeNotFound,
-                                               ErrorCodes.NewReplicaSetConfigurationIncompatible,
-                                               ErrorCodes.InterruptedDueToStepDown
-                                             ],
-                                             "replSetReconfig during initiate failed");
-                return false;
-            }, "replSetReconfig during initiate failed", 3, 5 * 1000);
+            replSetCommandWithRetry(master, cmd);
         }
 
         // Setup authentication if running test with authentication
@@ -1269,6 +1257,11 @@ var ReplSetTest = function(opts) {
                     "data": {"awaitLastStableRecoveryTimestamp": 1},
                     "writeConcern": {"w": "majority", "wtimeout": ReplSetTest.kDefaultTimeoutMS}
                 }));
+
+                // Perform a second write, in case some node had lost its sync source.
+                // TODO SERVER-40211: Remove the second write.
+                assert.commandWorked(db.adminCommand(
+                    {"appendOplogNote": 1, "data": {"awaitLastStableRecoveryTimestamp": 2}}));
             };
 
             // TODO(SERVER-14017): Remove this extra sub-shell in favor of a cleaner authentication

@@ -56,4 +56,3 @@ server_parameters:
         validator:
             gte: 1
             lte: { expr: 'StorageGlobalParams::kMaxJournalCommitIntervalMs' }
-

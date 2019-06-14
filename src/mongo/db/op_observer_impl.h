@@ -34,7 +34,8 @@
 namespace mongo {
 
 class OpObserverImpl : public OpObserver {
-    MONGO_DISALLOW_COPYING(OpObserverImpl);
+    OpObserverImpl(const OpObserverImpl&) = delete;
+    OpObserverImpl& operator=(const OpObserverImpl&) = delete;
 
 public:
     OpObserverImpl() = default;
@@ -179,9 +180,7 @@ private:
                                       const repl::OpTime& preImageOpTime,
                                       const bool inMultiDocumentTransaction) {}
     virtual void shardObserveTransactionPrepareOrUnpreparedCommit(
-        OperationContext* opCtx,
-        const std::vector<repl::ReplOperation>& stmts,
-        const repl::OpTime& opTime) {}
+        OperationContext* opCtx, const std::vector<repl::ReplOperation>& stmts) {}
 };
 
 }  // namespace mongo

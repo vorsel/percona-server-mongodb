@@ -31,16 +31,22 @@
 
 #include <vector>
 
-#include "mongo/db/s/transaction_coordinator_driver.h"
-#include "mongo/logger/logstream_builder.h"
+#include "mongo/db/s/transaction_coordinator_util.h"
+#include "mongo/util/fail_point_service.h"
 
 namespace mongo {
 
 /**
- * Class responsible for coordinating two-phase commit across shards.
+ * State machine, which implements the two-phase commit protocol for a specific transaction,
+ * identified by lsid + txnNumber.
+ *
+ * The lifetime of a coordinator starts with a construction and ends with the `onCompletion()`
+ * future getting signaled. It is illegal to destroy a coordinator without waiting for
+ * `onCompletion()`.
  */
 class TransactionCoordinator {
-    MONGO_DISALLOW_COPYING(TransactionCoordinator);
+    TransactionCoordinator(const TransactionCoordinator&) = delete;
+    TransactionCoordinator& operator=(const TransactionCoordinator&) = delete;
 
 public:
     /**
@@ -55,53 +61,9 @@ public:
                            const LogicalSessionId& lsid,
                            TxnNumber txnNumber,
                            std::unique_ptr<txn::AsyncWorkScheduler> scheduler,
-                           boost::optional<Date_t> coordinateCommitDeadline);
+                           Date_t deadline);
 
     ~TransactionCoordinator();
-
-    /**
-     * Represents a decision made by the coordinator, including commit timestamp to be sent with
-     * commitTransaction in the case of a decision to commit.
-     */
-    struct CoordinatorCommitDecision {
-        txn::CommitDecision decision;
-        boost::optional<Timestamp> commitTimestamp;
-
-        /**
-         * Parses a CoordinatorCommitDecision from the object.
-         */
-        static StatusWith<CoordinatorCommitDecision> fromBSON(const BSONObj& obj);
-
-        /**
-         * Returns an instance of CoordinatorCommitDecision from an object.
-         *
-         * Throws if the object cannot be deserialized.
-         */
-        static CoordinatorCommitDecision fromBSONThrowing(const BSONObj& obj) {
-            return uassertStatusOK(fromBSON(obj));
-        };
-
-        /**
-         * Returns the BSON representation of this object.
-         */
-        BSONObj toBSON() const;
-    };
-
-    /**
-     * The state of the coordinator.
-     */
-    enum class CoordinatorState {
-        // The initial state prior to receiving the participant list from the router.
-        kInit,
-        // The coordinator is sending prepare and processing responses.
-        kPreparing,
-        // The coordinator is sending commit messages and waiting for responses.
-        kCommitting,
-        // The coordinator is sending abort messages and waiting for responses.
-        kAborting,
-        // The coordinator has received commit/abort acknowledgements from all participants.
-        kDone,
-    };
 
     /**
      * The first time this is called, it asynchronously begins the two-phase commit process for the
@@ -114,7 +76,7 @@ public:
     /**
      * To be used to continue coordinating a transaction on step up.
      */
-    void continueCommit(const TransactionCoordinatorDocument& doc);
+    void continueCommit(const txn::TransactionCoordinatorDocument& doc);
 
     /**
      * Gets a Future that will contain the decision that the coordinator reaches. Note that this
@@ -125,11 +87,9 @@ public:
     SharedSemiFuture<txn::CommitDecision> getDecision();
 
     /**
-     * Returns a future that will be signaled when the transaction has completely finished
-     * committing or aborting (i.e. when commit/abort acknowledgements have been received from all
-     * participants, or the coordinator commit process is aborted locally for some reason).
-     *
-     * Unlike runCommit, this will not kick off the commit process if it has not already begun.
+     * Returns a future which can be listened on for when all the asynchronous activity spawned by
+     * this coordinator has completed. It will always eventually be set and once set it is safe to
+     * dispose of the TransactionCoordinator object.
      */
     Future<void> onCompletion();
 
@@ -144,54 +104,12 @@ public:
     void cancelIfCommitNotYetStarted();
 
 private:
-    /**
-     * Called when the timeout task scheduled by the constructor is no longer necessary (i.e.
-     * coordinateCommit was received or the coordinator was cancelled intentionally).
-     */
-    void _cancelTimeoutWaitForCommitTask();
-
-    /**
-     * Expects the participant list to already be majority-committed.
-     *
-     * 1. Sends prepare and collect the votes (i.e., responses), retrying requests as needed.
-     * 2. Based on the votes, makes a commit or abort decision.
-     * 3. If the decision is to commit, calculates the commit Timestamp.
-     * 4. Writes the decision and waits for the decision to become majority-committed.
-     */
-    Future<CoordinatorCommitDecision> _runPhaseOne(const std::vector<ShardId>& participantShards);
-
-    /**
-     * Expects the decision to already be majority-committed.
-     *
-     * 1. Send the decision (commit or abort) until receiving all acks (i.e., responses),
-     *    retrying requests as needed.
-     * 2. Delete the coordinator's durable state without waiting for the delete to become
-     *    majority-committed.
-     */
-    Future<void> _runPhaseTwo(const std::vector<ShardId>& participantShards,
-                              const CoordinatorCommitDecision& decision);
-
-    /**
-    * Asynchronously sends the commit decision to all participants (commit or abort), resolving the
-    * returned future when all participants have acknowledged the decision.
-    */
-    Future<void> _sendDecisionToParticipants(const std::vector<ShardId>& participantShards,
-                                             CoordinatorCommitDecision coordinatorDecision);
+    bool _reserveKickOffCommitPromise();
 
     /**
      * Helper for handling errors that occur during either phase of commit coordination.
      */
-    void _handleCompletionStatus(Status s);
-
-    /**
-     * Notifies all callers of onCompletion that the commit process has completed by fulfilling
-     * their promises, and transitions the state to done.
-     *
-     * NOTE: Unlocks the lock passed in in order to fulfill the promises.
-     *
-     * TODO (SERVER-38346): Used SharedSemiFuture to simplify this implementation.
-     */
-    void _transitionToDone(stdx::unique_lock<stdx::mutex> lk) noexcept;
+    void _done(Status s);
 
     // Shortcut to the service context under which this coordinator runs
     ServiceContext* const _serviceContext;
@@ -200,42 +118,50 @@ private:
     const LogicalSessionId _lsid;
     const TxnNumber _txnNumber;
 
-    // Scheduler to use for all asynchronous activity which needs to be performed by this
-    // coordinator
+    // Scheduler and context wrapping all asynchronous work dispatched by this coordinator
     std::unique_ptr<txn::AsyncWorkScheduler> _scheduler;
 
-    // If not nullptr, references the scheduler containing a task which willl trigger
-    // 'cancelIfCommitNotYetStarted' if runCommit has not been invoked. If nullptr, then this
-    // coordinator was not created with an expiration task.
-    std::unique_ptr<txn::AsyncWorkScheduler> _deadlineScheduler;
-
-    // Context object used to perform and track the state of asynchronous operations on behalf of
-    // this coordinator.
-    TransactionCoordinatorDriver _driver;
+    // Scheduler used for the persist participants + prepare part of the 2PC sequence and
+    // interrupted separately from the rest of the chain in order to allow the clean-up tasks
+    // (running on _scheduler to still be able to execute).
+    std::unique_ptr<txn::AsyncWorkScheduler> _sendPrepareScheduler;
 
     // Protects the state below
     mutable stdx::mutex _mutex;
 
-    // Stores the current state of the coordinator in the commit process.
-    CoordinatorState _state{CoordinatorState::kInit};
+    // Promise/future pair which will be signaled when the coordinator has completed
+    bool _kickOffCommitPromiseSet{false};
+    Promise<void> _kickOffCommitPromise;
 
-    // Promise which will contain the final decision made by the coordinator (whether to commit or
-    // abort). This is only known once all responses to prepare have been received from all
-    // participants, and the collective decision has been majority persisted to
-    // config.transactionCommitDecisions.
+    // The state below gets populated sequentially as the coordinator advances through the 2 phase
+    // commit stages. Each of these fields is set only once for the lifetime of a coordinator and
+    // after that never changes.
+    //
+    // If the coordinator is canceled before commit is requested, none of these fiends will be set
+
+    // Set when the coordinator has been asked to coordinate commit
+    boost::optional<txn::ParticipantsList> _participants;
+    bool _participantsDurable{false};
+
+    // Set when the coordinator has heard back from all the participants and reached a decision, but
+    // hasn't yet persisted it
+    boost::optional<txn::CoordinatorCommitDecision> _decision;
+
+    // Set when the coordinator has durably persisted `_decision` to the `config.coordinators`
+    // collection
+    bool _decisionDurable{false};
     SharedPromise<txn::CommitDecision> _decisionPromise;
 
     // A list of all promises corresponding to futures that were returned to callers of
     // onCompletion.
     //
     // TODO (SERVER-38346): Remove this when SharedSemiFuture supports continuations.
+    bool _completionPromisesFired{false};
     std::vector<Promise<void>> _completionPromises;
 };
 
-logger::LogstreamBuilder& operator<<(logger::LogstreamBuilder& stream,
-                                     const TransactionCoordinator::CoordinatorState& state);
-
-logger::LogstreamBuilder& operator<<(logger::LogstreamBuilder& stream,
-                                     const txn::CommitDecision& decision);
+// TODO (SERVER-37886): Remove this failpoint once failover can be tested on coordinators that have
+// a local participant
+MONGO_FAIL_POINT_DECLARE(doNotForgetCoordinator);
 
 }  // namespace mongo

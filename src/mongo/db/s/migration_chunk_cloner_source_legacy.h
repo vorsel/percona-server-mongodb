@@ -55,7 +55,8 @@ class Database;
 class RecordId;
 
 class MigrationChunkClonerSourceLegacy final : public MigrationChunkClonerSource {
-    MONGO_DISALLOW_COPYING(MigrationChunkClonerSourceLegacy);
+    MigrationChunkClonerSourceLegacy(const MigrationChunkClonerSourceLegacy&) = delete;
+    MigrationChunkClonerSourceLegacy& operator=(const MigrationChunkClonerSourceLegacy&) = delete;
 
 public:
     MigrationChunkClonerSourceLegacy(MoveChunkRequest request,
@@ -119,7 +120,8 @@ public:
 
     /**
      * Called by the recipient shard. Populates the passed BSONArrayBuilder with a set of documents,
-     * which are part of the initial clone sequence.
+     * which are part of the initial clone sequence. Assumes that there is only one active caller
+     * to this method at a time (otherwise, it can cause corruption/crash).
      *
      * Returns OK status on success. If there were documents returned in the result argument, this
      * method should be called more times until the result is empty. If it returns failure, it is
@@ -164,6 +166,16 @@ public:
     boost::optional<repl::OpTime> nextSessionMigrationBatch(OperationContext* opCtx,
                                                             BSONArrayBuilder* arrBuilder);
 
+    /**
+     * Returns a notification that can be used to wait for new oplog that needs to be migrated.
+     * If the value in the notification returns true, it means that there are no more new batches
+     * that needs to be fetched because the migration has already entered the critical section or
+     * aborted.
+     *
+     * Returns nullptr if there is no session migration associated with this migration.
+     */
+    std::shared_ptr<Notification<bool>> getNotificationForNextSessionMigrationBatch();
+
 private:
     friend class LogOpForShardingHandler;
 
@@ -189,22 +201,6 @@ private:
      * Returns OK or any error status otherwise.
      */
     Status _storeCurrentLocs(OperationContext* opCtx);
-
-    /**
-     * Insert items from docIdList to a new array with the given fieldName in the given builder. If
-     * explode is true, the inserted object will be the full version of the document. Note that
-     * whenever an item from the docList is inserted to the array, it will also be removed from
-     * docList.
-     *
-     * Should be holding the collection lock for ns if explode is true.
-     */
-    void _xfer(OperationContext* opCtx,
-               Database* db,
-               std::list<BSONObj>* docIdList,
-               BSONObjBuilder* builder,
-               const char* fieldName,
-               long long* sizeAccumulator,
-               bool explode);
 
     /*
      * Consumes the operation track request and appends the relevant document changes to
@@ -254,6 +250,26 @@ private:
      * around this class's mutex.
      */
     void _drainAllOutstandingOperationTrackRequests(stdx::unique_lock<stdx::mutex>& lk);
+
+    /**
+     * Appends to the builder the list of _id of documents that were deleted during migration.
+     * Entries appended to the builder are removed from the list.
+     * Returns the total size of the documents that were appended + initialSize.
+     */
+    long long _xferDeletes(BSONObjBuilder* builder,
+                           std::list<BSONObj>* removeList,
+                           long long initialSize);
+
+    /**
+     * Appends to the builder the list of full documents that were modified/inserted during the
+     * migration. Entries appended to the builder are removed from the list.
+     * Returns the total size of the documents that were appended + initialSize.
+     */
+    long long _xferUpdates(OperationContext* opCtx,
+                           Database* db,
+                           BSONObjBuilder* builder,
+                           std::list<BSONObj>* updateList,
+                           long long initialSize);
 
     // The original move chunk request
     const MoveChunkRequest _args;

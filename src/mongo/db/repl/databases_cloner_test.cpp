@@ -630,7 +630,8 @@ TEST_F(DBsClonerTest, DatabasesClonerReturnsCallbackCanceledIfShutdownDuringList
 
 bool sharedCallbackStateDestroyed = false;
 class SharedCallbackState {
-    MONGO_DISALLOW_COPYING(SharedCallbackState);
+    SharedCallbackState(const SharedCallbackState&) = delete;
+    SharedCallbackState& operator=(const SharedCallbackState&) = delete;
 
 public:
     SharedCallbackState() {}
@@ -790,7 +791,7 @@ TEST_F(DBsClonerTest, FailingToScheduleSecondDatabaseClonerShouldCancelTheCloner
 
     TaskExecutorWithFailureInScheduleRemoteCommand _executorProxy(
         &getExecutor(), [](const executor::RemoteCommandRequest& request) {
-            return str::equals("listCollections", request.cmdObj.firstElementFieldName()) &&
+            return request.cmdObj.firstElementFieldNameStringData() == "listCollections" &&
                 request.dbname == "b";
         });
 

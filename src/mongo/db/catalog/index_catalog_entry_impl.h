@@ -55,7 +55,8 @@ class MatchExpression;
 class OperationContext;
 
 class IndexCatalogEntryImpl : public IndexCatalogEntry {
-    MONGO_DISALLOW_COPYING(IndexCatalogEntryImpl);
+    IndexCatalogEntryImpl(const IndexCatalogEntryImpl&) = delete;
+    IndexCatalogEntryImpl& operator=(const IndexCatalogEntryImpl&) = delete;
 
 public:
     explicit IndexCatalogEntryImpl(
@@ -67,7 +68,7 @@ public:
 
     ~IndexCatalogEntryImpl() final;
 
-    const std::string& ns() const final {
+    const NamespaceString& ns() const final {
         return _ns;
     }
 
@@ -183,9 +184,11 @@ public:
         return _minVisibleSnapshot;
     }
 
-    void setMinimumVisibleSnapshot(Timestamp name) final {
-        _minVisibleSnapshot = name;
-    }
+    /**
+     * Updates the minimum visible snapshot. The 'newMinimumVisibleSnapshot' is ignored if it would
+     * set the minimum visible snapshot backwards in time.
+     */
+    void setMinimumVisibleSnapshot(Timestamp newMinimumVisibleSnapshot) final;
 
 private:
     class SetMultikeyChange;
@@ -206,7 +209,7 @@ private:
 
     // -----
 
-    std::string _ns;
+    NamespaceString _ns;
 
     CollectionCatalogEntry* _collection;  // not owned here
 

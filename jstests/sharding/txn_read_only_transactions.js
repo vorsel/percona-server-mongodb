@@ -15,6 +15,16 @@
     load("jstests/libs/write_concern_util.js");
     load("jstests/sharding/libs/sharded_transactions_helpers.js");
 
+    // Waits for the given log to appear a number of times in the shell's rawMongoProgramOutput.
+    // Loops because it is not guaranteed the program output will immediately contain all lines
+    // logged at an earlier wall clock time.
+    function waitForLog(logLine, times) {
+        assert.soon(function() {
+            const matches = rawMongoProgramOutput().match(new RegExp(logLine, "g")) || [];
+            return matches.length === times;
+        }, 'Failed to find "' + logLine + '" logged ' + times + ' times');
+    }
+
     const addTxnFields = function(command, lsid, txnNumber) {
         const txnFields = {
             lsid: lsid,
@@ -284,28 +294,21 @@
             });
 
             // Run commit.
+            const commitCmd = failureMode.getCommitCommand(lsid, txnNumber);
             failureMode.beforeCommit();
-            const res = st.s.adminCommand(failureMode.getCommitCommand(lsid, txnNumber));
-            print(`Response for ${failureModeName} for ${type}: ` + tojson(res));
+            const commitRes = st.s.adminCommand(commitCmd);
+            failureMode.checkCommitResult(commitRes);
 
-            // Check the commit response.
-            failureMode.checkCommitResult(res);
+            // Re-running commit should return the same response.
+            const commitRetryRes = st.s.adminCommand(commitCmd);
+            failureMode.checkCommitResult(commitRetryRes);
 
             if (type.includes("SingleShard")) {
-                assert.eq(1,
-                          rawMongoProgramOutput()
-                              .match(new RegExp('Committing single-shard transaction'))
-                              .length);
+                waitForLog("Committing single-shard transaction", 2);
             } else if (type.includes("readOnly")) {
-                assert.eq(1,
-                          rawMongoProgramOutput()
-                              .match(new RegExp('Committing read-only transaction'))
-                              .length);
+                waitForLog("Committing read-only transaction", 2);
             } else if (type.includes("MultiShard")) {
-                assert.eq(1,
-                          rawMongoProgramOutput()
-                              .match(new RegExp('Committing multi-shard transaction'))
-                              .length);
+                waitForLog("Committing multi-shard transaction", 2);
             } else {
                 assert(false, `Unknown transaction type: ${type}`);
             }

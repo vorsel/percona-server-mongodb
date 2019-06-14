@@ -29,8 +29,6 @@
 #
 """IDL Compiler Driver Main Entry point."""
 
-from __future__ import absolute_import, print_function
-
 import argparse
 import logging
 import sys
@@ -81,7 +79,7 @@ def main():
     compiler_args.output_base_dir = args.base_dir
     compiler_args.output_suffix = "_gen"
     compiler_args.write_dependencies = args.write_dependencies
-    compiler_args.write_inpendencies_inline = args.write_dependencies_inline
+    compiler_args.write_dependencies_inline = args.write_dependencies_inline
 
     if (args.output is not None and args.header is None) or \
         (args.output is  None and args.header is not None):

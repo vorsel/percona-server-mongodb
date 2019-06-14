@@ -4,7 +4,6 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/string_data.h"
 #include "mongo/db/fts/fts_tokenizer.h"
 #include "mongo/db/fts/stemmer.h"
@@ -31,7 +30,8 @@ class StopWords;
  * Optionally supports returning case sensitive search terms.
  */
 class UnicodeNgramFTSTokenizer final : public FTSTokenizer {
-    MONGO_DISALLOW_COPYING(UnicodeNgramFTSTokenizer);
+    UnicodeNgramFTSTokenizer(const UnicodeNgramFTSTokenizer&) = delete;
+    UnicodeNgramFTSTokenizer& operator=(const UnicodeNgramFTSTokenizer&) = delete;
 
 public:
     UnicodeNgramFTSTokenizer(const FTSLanguage* language);

@@ -33,7 +33,6 @@
 #include <iostream>
 #include <map>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/db/commands/txn_cmds_gen.h"
 #include "mongo/db/concurrency/locker.h"
 #include "mongo/db/logical_session_id.h"
@@ -48,7 +47,9 @@
 #include "mongo/db/session_txn_record_gen.h"
 #include "mongo/db/single_transaction_stats.h"
 #include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/transaction_metrics_observer.h"
+#include "mongo/idl/mutable_observer_registry.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/with_lock.h"
@@ -90,7 +91,8 @@ enum class TerminationCause {
  * the comments below for more information.
  */
 class TransactionParticipant {
-    MONGO_DISALLOW_COPYING(TransactionParticipant);
+    TransactionParticipant(const TransactionParticipant&) = delete;
+    TransactionParticipant& operator=(const TransactionParticipant&) = delete;
 
     struct PrivateState;
     struct ObservableState;
@@ -111,7 +113,8 @@ class TransactionParticipant {
             kCommittingWithPrepare = 1 << 4,
             kCommitted = 1 << 5,
             kAbortedWithoutPrepare = 1 << 6,
-            kAbortedWithPrepare = 1 << 7
+            kAbortedWithPrepare = 1 << 7,
+            kExecutedRetryableWrite = 1 << 8,
         };
 
         using StateSet = int;
@@ -160,6 +163,14 @@ class TransactionParticipant {
             return _state == kAbortedWithPrepare || _state == kAbortedWithoutPrepare;
         }
 
+        bool hasExecutedRetryableWrite() const {
+            return _state == kExecutedRetryableWrite;
+        }
+
+        bool isInRetryableWriteMode() const {
+            return _state == kNone || _state == kExecutedRetryableWrite;
+        }
+
         std::string toString() const {
             return toString(_state);
         }
@@ -173,6 +184,8 @@ class TransactionParticipant {
     };
 
 public:
+    static inline MutableObeserverRegistry<int32_t> observeTransactionLifetimeLimitSeconds;
+
     /**
      * Holds state for a snapshot read or multi-statement transaction in between network
      * operations.
@@ -408,6 +421,11 @@ public:
         void stashTransactionResources(OperationContext* opCtx);
 
         /**
+         * Resets the retryable writes state.
+         */
+        void resetRetryableWriteState(OperationContext* opCtx);
+
+        /**
          * Transfers management of transaction resources from the Session to the currently
          * checked-out OperationContext.
          */
@@ -534,7 +552,8 @@ public:
                                          std::vector<StmtId> stmtIdsWritten,
                                          const repl::OpTime& lastStmtIdWriteOpTime,
                                          Date_t lastStmtIdWriteDate,
-                                         boost::optional<DurableTxnStateEnum> txnState);
+                                         boost::optional<DurableTxnStateEnum> txnState,
+                                         boost::optional<repl::OpTime> startOpTime);
 
         /**
          * Called after an entry for the specified session and transaction has been written to the
@@ -619,10 +638,6 @@ public:
             return p().oldestOplogEntryOpTime;
         }
 
-        boost::optional<repl::OpTime> getFinishOpTimeForTest() const {
-            return p().finishOpTime;
-        }
-
         const Locker* getTxnResourceStashLockerForTest() const {
             invariant(o().txnResourceStash);
             return o().txnResourceStash->locker();
@@ -654,7 +669,8 @@ public:
 
         UpdateRequest _makeUpdateRequest(const repl::OpTime& newLastWriteOpTime,
                                          Date_t newLastWriteDate,
-                                         boost::optional<DurableTxnStateEnum> newState) const;
+                                         boost::optional<DurableTxnStateEnum> newState,
+                                         boost::optional<repl::OpTime> startOpTime) const;
 
         void _registerUpdateCacheOnCommit(OperationContext* opCtx,
                                           std::vector<StmtId> stmtIdsWritten,
@@ -774,10 +790,12 @@ public:
 
 
     /**
-     * Returns the timestamp of the oldest oplog entry written across all open transactions.
-     * Returns boost::none if there are no active transactions.
+     * Returns the timestamp of the oldest oplog entry written across all open transactions, at the
+     * time of the stable timestamp. Returns boost::none if there are no active transactions, or an
+     * error if it fails.
      */
-    static boost::optional<Timestamp> getOldestActiveTimestamp(OperationContext* opCtx);
+    static StorageEngine::OldestActiveTransactionTimestampResult getOldestActiveTimestamp(
+        Timestamp stableTimestamp);
 
     /**
      * Append a no-op to the oplog, for cases where we haven't written in this unit of work but
@@ -804,13 +822,13 @@ private:
          */
         OplogSlot getLastSlot() {
             invariant(!_oplogSlots.empty());
-            invariant(!_oplogSlots.back().opTime.isNull());
+            invariant(!_oplogSlots.back().isNull());
             return getSlots().back();
         }
 
         std::vector<OplogSlot>& getSlots() {
             invariant(!_oplogSlots.empty());
-            invariant(!_oplogSlots.back().opTime.isNull());
+            invariant(!_oplogSlots.back().isNull());
             return _oplogSlots;
         }
 
@@ -898,9 +916,6 @@ private:
 
         // Tracks the OpTime of the first oplog entry written by this TransactionParticipant.
         boost::optional<repl::OpTime> oldestOplogEntryOpTime;
-
-        // Tracks the OpTime of the abort/commit oplog entry associated with this transaction.
-        boost::optional<repl::OpTime> finishOpTime;
 
         //
         // Retryable writes state

@@ -32,6 +32,7 @@
 #include "mongo/base/status.h"
 #include "mongo/bson/mutable/document.h"
 #include "mongo/bson/mutable/element.h"
+#include "mongo/bson/unordered_fields_bsonobj_comparator.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/auth/address_restriction.h"
 #include "mongo/db/auth/authorization_manager.h"
@@ -297,6 +298,11 @@ Status handleOplogCommand(RoleGraph* roleGraph, const BSONObj& cmdObj) {
         return Status::OK();
     }
 
+    if (cmdName == "commitTransaction" || cmdName == "abortTransaction" ||
+        cmdName == "prepareTransaction") {
+        return Status::OK();
+    }
+
     if (cmdName == "dropIndexes" || cmdName == "deleteIndexes") {
         return Status::OK();
     }
@@ -305,10 +311,39 @@ Status handleOplogCommand(RoleGraph* roleGraph, const BSONObj& cmdObj) {
         // We don't care about these if they're not on the roles collection.
         return Status::OK();
     }
+    if (cmdName == "createIndexes" &&
+        cmdObj.firstElement().str() == rolesCollectionNamespace.coll()) {
+        UnorderedFieldsBSONObjComparator instance;
+        if (instance.evaluate(cmdObj == (BSON("createIndexes"
+                                              << "system.roles"
+                                              << "v"
+                                              << 2
+                                              << "name"
+                                              << "role_1_db_1"
+                                              << "key"
+                                              << BSON("role" << 1 << "db" << 1)
+                                              << "unique"
+                                              << true)))) {
+            return Status::OK();
+        }
+    }
 
-    if ((cmdName == "collMod") && (cmdObj.nFields() == 1)) {
-        // We also don't care about empty modifications even if they are on roles collection
-        return Status::OK();
+    if (cmdName == "collMod") {
+        // We don't care about empty modifications, even if they are on roles collection.
+        if (cmdObj.nFields() == 1) {
+            return Status::OK();
+        }
+
+        // Some arguments are known to be no-ops.
+        auto isNoOpArgument = [](const BSONElement& elem) {
+            return elem.fieldNameStringData() == "usePowerOf2Sizes";
+        };
+
+        // If all arguments are known to be no-ops, we don't care about the operation.
+        auto argument = std::find_if_not(++cmdObj.begin(), cmdObj.end(), isNoOpArgument);
+        if (argument == cmdObj.end()) {
+            return Status::OK();
+        }
     }
 
     //  No other commands expected.  Warn.

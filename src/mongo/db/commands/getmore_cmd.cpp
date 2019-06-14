@@ -34,7 +34,6 @@
 #include <memory>
 #include <string>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/client.h"
@@ -70,6 +69,7 @@ namespace mongo {
 namespace {
 
 MONGO_FAIL_POINT_DEFINE(rsStopGetMoreCmd);
+MONGO_FAIL_POINT_DEFINE(GetMoreHangBeforeReadLock);
 
 // The timeout when waiting for linearizable read concern on a getMore command.
 static constexpr int kLinearizableReadConcernTimeout = 15000;
@@ -137,6 +137,8 @@ void validateTxnNumber(OperationContext* opCtx,
  */
 void applyCursorReadConcern(OperationContext* opCtx, repl::ReadConcernArgs rcArgs) {
     const auto replicationMode = repl::ReplicationCoordinator::get(opCtx)->getReplicationMode();
+
+    // Select the appropriate read source.
     if (replicationMode == repl::ReplicationCoordinator::modeReplSet &&
         rcArgs.getLevel() == repl::ReadConcernLevel::kMajorityReadConcern) {
         switch (rcArgs.getMajorityReadMechanism()) {
@@ -148,11 +150,21 @@ void applyCursorReadConcern(OperationContext* opCtx, repl::ReadConcernArgs rcArg
                 break;
             }
             case repl::ReadConcernArgs::MajorityReadMechanism::kSpeculative: {
-                // Mark the operation as speculative.
+                // Mark the operation as speculative and select the correct read source.
                 repl::SpeculativeMajorityReadInfo::get(opCtx).setIsSpeculativeRead();
+                opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoOverlap);
                 break;
             }
         }
+    }
+
+    // For cursor commands that take locks internally, the read concern on the
+    // OperationContext may affect the timestamp read source selected by the storage engine.
+    // We place the cursor read concern onto the OperationContext so the lock acquisition
+    // respects the cursor's read concern.
+    {
+        stdx::lock_guard<Client> lk(*opCtx->getClient());
+        repl::ReadConcernArgs::get(opCtx) = rcArgs;
     }
 }
 
@@ -186,6 +198,10 @@ public:
 
         bool allowsAfterClusterTime() const override {
             return false;
+        }
+
+        bool canIgnorePrepareConflicts() const override {
+            return true;
         }
 
         NamespaceString ns() const override {
@@ -317,10 +333,6 @@ public:
                     // the supplied clusterTime, even across yields.
                     opCtx->recoveryUnit()->setTimestampReadSource(
                         RecoveryUnit::ReadSource::kProvided, clusterTime);
-
-                    // The $_internalReadAtClusterTime option also causes any storage-layer cursors
-                    // created during plan execution to block on prepared transactions.
-                    opCtx->recoveryUnit()->setIgnorePrepared(false);
                 }
             }
             if (cursorPin->lockPolicy() == ClientCursorParams::LockPolicy::kLocksInternally) {
@@ -335,7 +347,26 @@ public:
             } else {
                 invariant(cursorPin->lockPolicy() ==
                           ClientCursorParams::LockPolicy::kLockExternally);
-                readLock.emplace(opCtx, _request.nss);
+
+                if (MONGO_FAIL_POINT(GetMoreHangBeforeReadLock)) {
+                    log() << "GetMoreHangBeforeReadLock fail point enabled. Blocking until fail "
+                             "point is disabled.";
+                    MONGO_FAIL_POINT_PAUSE_WHILE_SET_OR_INTERRUPTED(opCtx,
+                                                                    GetMoreHangBeforeReadLock);
+                }
+
+                // Lock the backing collection by using the executor's namespace. Note that it may
+                // be different from the cursor's namespace. One such possible scenario is when
+                // getMore() is executed against a view. Technically, views are pipelines and under
+                // normal circumstances use 'kLocksInternally' policy, so we shouldn't be getting
+                // into here in the first place. However, if the pipeline was optimized away and
+                // replaced with a query plan, its lock policy would have also been changed to
+                // 'kLockExternally'. So, we'll use the executor's namespace to take the lock (which
+                // is always the backing collection namespace), but will use the namespace provided
+                // in the user request for profiling.
+                // Otherwise, these two namespaces will match.
+                readLock.emplace(opCtx, cursorPin->getExecutor()->nss());
+
                 const int doNotChangeProfilingLevel = 0;
                 statsTracker.emplace(opCtx,
                                      _request.nss,
@@ -343,6 +374,10 @@ public:
                                      AutoStatsTracker::LogMode::kUpdateTopAndCurop,
                                      readLock->getDb() ? readLock->getDb()->getProfilingLevel()
                                                        : doNotChangeProfilingLevel);
+
+                // Check whether we are allowed to read from this node after acquiring our locks.
+                uassertStatusOK(repl::ReplicationCoordinator::get(opCtx)->checkCanServeReadsFor(
+                    opCtx, _request.nss, true));
             }
 
             // Only used by the failpoints.

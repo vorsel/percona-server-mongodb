@@ -46,6 +46,7 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/matcher/matcher.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context.h"
@@ -298,9 +299,9 @@ Status _applyPrepareTransaction(OperationContext* opCtx,
     // commits.
     for (const auto& opObj : info.getOperations()) {
         auto ns = opObj.getField("ns").checkAndGetStringData();
-        if (BackgroundOperation::inProgForNs(ns)) {
-            BackgroundOperation::awaitNoBgOpInProgForNs(ns);
-        }
+        auto uuid = uassertStatusOK(UUID::parse(opObj.getField("ui")));
+        BackgroundOperation::awaitNoBgOpInProgForNs(ns);
+        IndexBuildsCoordinator::get(opCtx)->awaitNoIndexBuildInProgressForCollection(uuid);
     }
 
     // Transaction operations are in its own batch, so we can modify their opCtx.
@@ -477,10 +478,9 @@ Status applyApplyOpsOplogEntry(OperationContext* opCtx,
                     &resultWeDontCareAbout);
 }
 
-Status applyRecoveredPrepareTransaction(OperationContext* opCtx, const OplogEntry& entry) {
-    // Snapshot transactions never conflict with the PBWM lock.
-    invariant(!opCtx->lockState()->shouldConflictWithSecondaryBatchApplication());
-    UnreplicatedWritesBlock uwb(opCtx);
+Status applyRecoveredPrepareApplyOpsOplogEntry(OperationContext* opCtx, const OplogEntry& entry) {
+    // We might replay a prepared transaction behind oldest timestamp.
+    opCtx->recoveryUnit()->setRoundUpPreparedTimestamps(true);
     return _applyPrepareTransaction(opCtx, entry, OplogApplication::Mode::kRecovering);
 }
 

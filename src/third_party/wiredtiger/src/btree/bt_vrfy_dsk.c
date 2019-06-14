@@ -39,11 +39,11 @@ static int __verify_dsk_row(
 		else							\
 			__wt_err(session, ret, __VA_ARGS__);		\
 	}								\
-	return ((ret) == 0 ? ret : WT_ERROR);				\
+	return ((ret) == 0 ? WT_ERROR : ret);				\
 } while (0)
 
 #define	WT_RET_VRFY(session, ...)					\
-	WT_RET_VRFY_RETVAL(session, 0, __VA_ARGS__);
+	WT_RET_VRFY_RETVAL(session, 0, __VA_ARGS__)
 
 /*
  * WT_CELL_FOREACH_VRFY --

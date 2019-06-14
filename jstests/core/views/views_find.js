@@ -78,20 +78,20 @@
 
     // Find with explicit explain modes works on a view.
     let explainPlan = assert.commandWorked(viewsDB.identityView.find().explain("queryPlanner"));
-    assert.eq(explainPlan.stages[0].$cursor.queryPlanner.namespace, "views_find.coll");
-    assert(!explainPlan.stages[0].$cursor.hasOwnProperty("executionStats"));
+    assert.eq(explainPlan.queryPlanner.namespace, "views_find.coll");
+    assert(!explainPlan.hasOwnProperty("executionStats"));
 
     explainPlan = assert.commandWorked(viewsDB.identityView.find().explain("executionStats"));
-    assert.eq(explainPlan.stages[0].$cursor.queryPlanner.namespace, "views_find.coll");
-    assert(explainPlan.stages[0].$cursor.hasOwnProperty("executionStats"));
-    assert.eq(explainPlan.stages[0].$cursor.executionStats.nReturned, 5);
-    assert(!explainPlan.stages[0].$cursor.executionStats.hasOwnProperty("allPlansExecution"));
+    assert.eq(explainPlan.queryPlanner.namespace, "views_find.coll");
+    assert(explainPlan.hasOwnProperty("executionStats"));
+    assert.eq(explainPlan.executionStats.nReturned, 5);
+    assert(!explainPlan.executionStats.hasOwnProperty("allPlansExecution"));
 
     explainPlan = assert.commandWorked(viewsDB.identityView.find().explain("allPlansExecution"));
-    assert.eq(explainPlan.stages[0].$cursor.queryPlanner.namespace, "views_find.coll");
-    assert(explainPlan.stages[0].$cursor.hasOwnProperty("executionStats"));
-    assert.eq(explainPlan.stages[0].$cursor.executionStats.nReturned, 5);
-    assert(explainPlan.stages[0].$cursor.executionStats.hasOwnProperty("allPlansExecution"));
+    assert.eq(explainPlan.queryPlanner.namespace, "views_find.coll");
+    assert(explainPlan.hasOwnProperty("executionStats"));
+    assert.eq(explainPlan.executionStats.nReturned, 5);
+    assert(explainPlan.executionStats.hasOwnProperty("allPlansExecution"));
 
     // Only simple 0 or 1 projections are allowed on views.
     assert.writeOK(viewsDB.coll.insert({arr: [{x: 1}]}));
@@ -107,8 +107,7 @@
 
     // The readOnce cursor option is not allowed on views.  But if we're in a transaction,
     // the error code saying that it's not allowed in a transaction takes precedence.
-    const inTxnPassthrough = viewsDB.getMongo().hasOwnProperty('txnOverrideOptions');
-    assert.commandFailedWithCode(viewsDB.runCommand({find: "identityView", readOnce: true}),
-                                 inTxnPassthrough ? ErrorCodes.OperationNotSupportedInTransaction
-                                                  : ErrorCodes.InvalidPipelineOperator);
+    assert.commandFailedWithCode(
+        viewsDB.runCommand({find: "identityView", readOnce: true}),
+        [ErrorCodes.OperationNotSupportedInTransaction, ErrorCodes.InvalidPipelineOperator]);
 }());

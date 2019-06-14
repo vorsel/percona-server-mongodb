@@ -10,13 +10,19 @@ var ElectionHandoffTest = (function() {
     load("jstests/replsets/rslib.js");
 
     const kStepDownPeriodSecs = 30;
+    const kSIGTERM = 15;
 
     /**
      * Exercises and validates an election handoff scenario by stepping down the primary and
      * ensuring that the node at "expectedCandidateId" is stepped up in its place. The desired
      * configuration of the replica set is passed in as its ReplSetTest instance.
+     *
+     * The options parameter contains extra options for the handoff.  Currently supported options
+     * are:
+     *   stepDownBySignal - When this option is set, the primary will be stepped down by stopping
+     *                      and restarting with sigterm, rather than with a replSetStepDown command
      */
-    function testElectionHandoff(rst, initialPrimaryId, expectedCandidateId) {
+    function testElectionHandoff(rst, initialPrimaryId, expectedCandidateId, options = {}) {
         const config = rst.getReplSetConfigFromNode();
         const numNodes = config.members.length;
         const memberInfo = config.members[expectedCandidateId];
@@ -49,11 +55,16 @@ var ElectionHandoffTest = (function() {
             {"a": 1}, {writeConcern: {w: rst.nodes.length}}));
         rst.awaitNodesAgreeOnAppliedOpTime();
 
-        // Step down the current primary.
-        assert.commandWorked(primary.adminCommand({
-            replSetStepDown: kStepDownPeriodSecs,
-            secondaryCatchUpPeriodSecs: kStepDownPeriodSecs / 2
-        }));
+        // Step down the current primary. Skip validation since it prevents election handoff.
+        if (options["stepDownBySignal"]) {
+            rst.stop(initialPrimaryId, kSIGTERM, {skipValidation: true}, {forRestart: true});
+            rst.start(initialPrimaryId, {}, true);
+        } else {
+            assert.commandWorked(primary.adminCommand({
+                replSetStepDown: kStepDownPeriodSecs,
+                secondaryCatchUpPeriodSecs: kStepDownPeriodSecs / 2
+            }));
+        }
 
         jsTestLog(`Checking that the secondary with id ${expectedCandidateId} is stepped up...`);
 

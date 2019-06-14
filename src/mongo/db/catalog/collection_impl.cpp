@@ -228,7 +228,7 @@ CollectionImpl::CollectionImpl(OperationContext* opCtx,
 }
 
 CollectionImpl::~CollectionImpl() {
-    verify(ok());
+    invariant(ok());
     if (isCapped()) {
         _recordStore->setCappedCallback(nullptr);
         _cappedNotifier->kill();
@@ -236,14 +236,17 @@ CollectionImpl::~CollectionImpl() {
 
     if (_uuid) {
         if (auto opCtx = cc().getOperationContext()) {
-            auto& uuidCatalog = UUIDCatalog::get(opCtx);
-            invariant(uuidCatalog.lookupCollectionByUUID(_uuid.get()) != this);
             auto& cache = NamespaceUUIDCache::get(opCtx);
             // TODO(geert): cache.verifyNotCached(ns(), uuid().get());
             cache.evictNamespace(ns());
         }
         LOG(2) << "destructed collection " << ns() << " with UUID " << uuid()->toString();
     }
+
+    if (ns().isOplog()) {
+        repl::clearLocalOplogPtr();
+    }
+
     _magic = 0;
 }
 
@@ -521,7 +524,7 @@ Status CollectionImpl::_insertDocuments(OperationContext* opCtx,
 
     for (auto it = begin; it != end; it++) {
         records.emplace_back(Record{RecordId(), RecordData(it->doc.objdata(), it->doc.objsize())});
-        timestamps.emplace_back(it->oplogSlot.opTime.getTimestamp());
+        timestamps.emplace_back(it->oplogSlot.getTimestamp());
     }
     Status status = _recordStore->insertRecords(opCtx, &records, timestamps);
     if (!status.isOK())
@@ -535,7 +538,7 @@ Status CollectionImpl::_insertDocuments(OperationContext* opCtx,
         invariant(RecordId::min() < loc);
         invariant(loc < RecordId::max());
 
-        BsonRecord bsonRecord = {loc, Timestamp(it->oplogSlot.opTime.getTimestamp()), &(it->doc)};
+        BsonRecord bsonRecord = {loc, Timestamp(it->oplogSlot.getTimestamp()), &(it->doc)};
         bsonRecords.push_back(bsonRecord);
     }
 
@@ -546,6 +549,12 @@ Status CollectionImpl::_insertDocuments(OperationContext* opCtx,
     }
 
     return status;
+}
+
+void CollectionImpl::setMinimumVisibleSnapshot(Timestamp newMinimumVisibleSnapshot) {
+    if (!_minVisibleSnapshot || (newMinimumVisibleSnapshot > _minVisibleSnapshot.get())) {
+        _minVisibleSnapshot = newMinimumVisibleSnapshot;
+    }
 }
 
 bool CollectionImpl::haveCappedWaiters() {
@@ -727,6 +736,10 @@ StatusWith<RecordData> CollectionImpl::updateDocumentWithDamages(
     return newRecStatus;
 }
 
+bool CollectionImpl::isTemporary(OperationContext* opCtx) const {
+    return _details->getCollectionOptions(opCtx).temp;
+}
+
 bool CollectionImpl::isCapped() const {
     return _cappedNotifier.get();
 }
@@ -780,7 +793,6 @@ uint64_t CollectionImpl::getIndexSize(OperationContext* opCtx, BSONObjBuilder* d
  */
 Status CollectionImpl::truncate(OperationContext* opCtx) {
     dassert(opCtx->lockState()->isCollectionLockedForMode(ns(), MODE_X));
-    BackgroundOperation::assertNoBgOpInProgForNs(ns());
     invariant(_indexCatalog->numIndexesInProgress(opCtx) == 0);
 
     // 1) store index specs
@@ -815,7 +827,6 @@ Status CollectionImpl::truncate(OperationContext* opCtx) {
 void CollectionImpl::cappedTruncateAfter(OperationContext* opCtx, RecordId end, bool inclusive) {
     dassert(opCtx->lockState()->isCollectionLockedForMode(ns(), MODE_X));
     invariant(isCapped());
-    BackgroundOperation::assertNoBgOpInProgForNs(ns());
     invariant(_indexCatalog->numIndexesInProgress(opCtx) == 0);
 
     _recordStore->cappedTruncateAfter(opCtx, end, inclusive);

@@ -123,6 +123,10 @@ struct OpMsgRequest : public OpMsg {
         return OpMsgRequest(OpMsg::parse(message));
     }
 
+    static OpMsgRequest parseOwned(const Message& message) {
+        return OpMsgRequest(OpMsg::parseOwned(message));
+    }
+
     static OpMsgRequest fromDBAndBody(StringData db,
                                       BSONObj body,
                                       const BSONObj& extraFields = {}) {
@@ -160,7 +164,8 @@ struct OpMsgRequest : public OpMsg {
  * sent.
  */
 class OpMsgBuilder {
-    MONGO_DISALLOW_COPYING(OpMsgBuilder);
+    OpMsgBuilder(const OpMsgBuilder&) = delete;
+    OpMsgBuilder& operator=(const OpMsgBuilder&) = delete;
 
 public:
     OpMsgBuilder() {
@@ -282,7 +287,8 @@ private:
  * docSeq.done(); // Or just let it go out of scope.
  */
 class OpMsgBuilder::DocSequenceBuilder {
-    MONGO_DISALLOW_COPYING(DocSequenceBuilder);
+    DocSequenceBuilder(const DocSequenceBuilder&) = delete;
+    DocSequenceBuilder& operator=(const DocSequenceBuilder&) = delete;
 
 public:
     DocSequenceBuilder(DocSequenceBuilder&& other)

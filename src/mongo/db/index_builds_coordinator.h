@@ -263,6 +263,11 @@ public:
     bool inProgForDb(StringData db) const;
 
     /**
+     * Uasserts if any index builds are in progress on any database.
+     */
+    void assertNoIndexBuildInProgress() const;
+
+    /**
      * Uasserts if any index builds is in progress on the specified collection.
      */
     void assertNoIndexBuildInProgForCollection(const UUID& collectionUUID) const;
@@ -274,13 +279,8 @@ public:
 
     /**
      * Waits for all index builds on a specified collection to finish.
-     *
-     * Momentarily takes the collection IS lock for 'ns', to fetch the collection UUID.
      */
-    void awaitNoBgOpInProgForNs(OperationContext* opCtx, StringData ns) const;
-    void awaitNoBgOpInProgForNs(OperationContext* opCtx, const NamespaceString& ns) const {
-        awaitNoBgOpInProgForNs(opCtx, ns.ns());
-    }
+    void awaitNoIndexBuildInProgressForCollection(const UUID& collectionUUID) const;
 
     /**
      * Waits for all index builds on a specified database to finish.
@@ -323,7 +323,13 @@ private:
     void _allowIndexBuildsOnDatabase(StringData dbName);
     void _allowIndexBuildsOnCollection(const UUID& collectionUUID);
 
-private:
+    /**
+     * Updates CurOp's 'opDescription' field with the current state of this index build.
+     */
+    void _updateCurOpOpDescription(OperationContext* opCtx,
+                                   const NamespaceString& nss,
+                                   const std::vector<BSONObj>& indexSpecs) const;
+
     /**
      * Registers an index build so that the rest of the system can discover it.
      *
@@ -458,7 +464,8 @@ protected:
  * builds should be scheduled.
  */
 class ScopedStopNewDatabaseIndexBuilds {
-    MONGO_DISALLOW_COPYING(ScopedStopNewDatabaseIndexBuilds);
+    ScopedStopNewDatabaseIndexBuilds(const ScopedStopNewDatabaseIndexBuilds&) = delete;
+    ScopedStopNewDatabaseIndexBuilds& operator=(const ScopedStopNewDatabaseIndexBuilds&) = delete;
 
 public:
     /**
@@ -488,7 +495,9 @@ private:
  * builds should be scheduled.
  */
 class ScopedStopNewCollectionIndexBuilds {
-    MONGO_DISALLOW_COPYING(ScopedStopNewCollectionIndexBuilds);
+    ScopedStopNewCollectionIndexBuilds(const ScopedStopNewCollectionIndexBuilds&) = delete;
+    ScopedStopNewCollectionIndexBuilds& operator=(const ScopedStopNewCollectionIndexBuilds&) =
+        delete;
 
 public:
     /**

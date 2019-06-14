@@ -30,6 +30,7 @@
 #pragma once
 
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/multiapplier.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplog_entry.h"
 
@@ -48,5 +49,27 @@ Status applyCommitTransaction(OperationContext* opCtx,
 Status applyAbortTransaction(OperationContext* opCtx,
                              const repl::OplogEntry& entry,
                              repl::OplogApplication::Mode mode);
+
+/**
+ * Follow an oplog chain and copy the operations to destination.  Operations will be copied in
+ * forward oplog order (increasing optimes).
+ */
+repl::MultiApplier::Operations readTransactionOperationsFromOplogChain(
+    OperationContext* opCtx,
+    const repl::OplogEntry& entry,
+    const std::vector<repl::OplogEntry*> cachedOps);
+
+/**
+ * Apply `prepareTransaction` oplog entry.
+ */
+Status applyPrepareTransaction(OperationContext* opCtx,
+                               const repl::OplogEntry& entry,
+                               repl::OplogApplication::Mode mode);
+
+/**
+ * Apply a prepared transaction during recovery.  The OplogEntry must be an 'applyOps' with
+ * 'prepare' set or a prepareTransaction command.
+ */
+Status applyRecoveredPrepareTransaction(OperationContext* opCtx, const repl::OplogEntry& entry);
 
 }  // namespace mongo

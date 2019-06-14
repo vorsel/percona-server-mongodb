@@ -125,6 +125,10 @@ public:
             return true;
         }
 
+        bool canIgnorePrepareConflicts() const override {
+            return true;
+        }
+
         bool allowsSpeculativeMajorityReads() const override {
             // Find queries are only allowed to use speculative behavior if the 'allowsSpeculative'
             // flag is passed. The find command will check for this flag internally and fail if
@@ -216,7 +220,7 @@ public:
 
             auto bodyBuilder = result->getBodyBuilder();
             // Got the execution tree. Explain it.
-            Explain::explainStages(exec.get(), collection, verbosity, &bodyBuilder);
+            Explain::explainStages(exec.get(), collection, verbosity, BSONObj(), &bodyBuilder);
         }
 
         /**
@@ -325,10 +329,6 @@ public:
                 // clusterTime, even across yields.
                 opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kProvided,
                                                               targetClusterTime);
-
-                // The $_internalReadAtClusterTime option also causes any storage-layer cursors
-                // created during plan execution to block on prepared transactions.
-                opCtx->recoveryUnit()->setIgnorePrepared(false);
             }
 
             // Acquire locks. If the query is on a view, we release our locks and convert the query

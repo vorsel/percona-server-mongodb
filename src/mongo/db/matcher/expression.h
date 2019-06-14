@@ -30,7 +30,6 @@
 #pragma once
 
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
@@ -56,7 +55,8 @@ class TreeMatchExpression;
 typedef StatusWith<std::unique_ptr<MatchExpression>> StatusWithMatchExpression;
 
 class MatchExpression {
-    MONGO_DISALLOW_COPYING(MatchExpression);
+    MatchExpression(const MatchExpression&) = delete;
+    MatchExpression& operator=(const MatchExpression&) = delete;
 
 public:
     enum MatchType {
@@ -309,8 +309,20 @@ public:
     //
     // Debug information
     //
-    virtual std::string toString() const;
-    virtual void debugString(StringBuilder& debug, int level = 0) const = 0;
+
+    /**
+     * Returns a debug string representing the match expression tree, including any tags attached
+     * for planning. This debug string format may spill across multiple lines, so it is not suitable
+     * for logging at low debug levels or for error messages.
+     */
+    std::string debugString() const;
+    virtual void debugString(StringBuilder& debug, int indentationLevel = 0) const = 0;
+
+    /**
+     * Serializes this MatchExpression to BSON, and then returns a standard string representation of
+     * the resulting BSON object.
+     */
+    std::string toString() const;
 
 protected:
     /**
@@ -330,7 +342,7 @@ protected:
 
     virtual void _doAddDependencies(DepsTracker* deps) const {}
 
-    void _debugAddSpace(StringBuilder& debug, int level) const;
+    void _debugAddSpace(StringBuilder& debug, int indentationLevel) const;
 
 private:
     /**

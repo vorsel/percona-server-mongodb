@@ -1,6 +1,4 @@
 """Git Utility functions."""
-from __future__ import absolute_import
-from __future__ import print_function
 
 import itertools
 import os
@@ -112,7 +110,7 @@ class Repo(_git.Repository):
         diff_files += self.git_diff(["--name-only"])
 
         file_set = {
-            line.rstrip()
+            os.path.normpath(os.path.join(self.directory, line.rstrip()))
             for line in diff_files.splitlines() if filter_function(line.rstrip())
         }
 
@@ -196,7 +194,7 @@ def get_files_to_check_from_patch(patches, filter_function):
 
     lines = []  # type: List[str]
     for patch in patches:
-        with open(patch, "rb") as infile:
+        with open(patch, "r") as infile:
             lines += infile.readlines()
 
     candidates = [check.match(line).group(1) for line in lines if check.match(line)]

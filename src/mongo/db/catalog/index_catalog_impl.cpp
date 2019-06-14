@@ -361,7 +361,7 @@ Status _checkValidFilterExpressions(MatchExpression* expression, int level = 0) 
         default:
             return Status(ErrorCodes::CannotCreateIndex,
                           str::stream() << "unsupported expression in partial index: "
-                                        << expression->toString());
+                                        << expression->debugString());
     }
 }
 }  // namespace
@@ -678,7 +678,7 @@ Status IndexCatalogImpl::_doesSpecConflictWithExisting(OperationContext* opCtx,
         const IndexDescriptor* desc =
             findIndexByKeyPatternAndCollationSpec(opCtx, key, collation, findInProgressIndexes);
         if (desc) {
-            LOG(2) << "index already exists with diff name " << name << " pattern: " << key
+            LOG(2) << "Index already exists with a different name: " << name << " pattern: " << key
                    << " collation: " << collation;
 
             IndexDescriptor temp(_collection, _getAccessMethodName(key), spec);
@@ -688,8 +688,9 @@ Status IndexCatalogImpl::_doesSpecConflictWithExisting(OperationContext* opCtx,
                                             << " already exists with different options: "
                                             << desc->infoObj());
 
-            return Status(ErrorCodes::IndexAlreadyExists,
-                          str::stream() << "index already exists with different name: " << name);
+            return Status(ErrorCodes::IndexOptionsConflict,
+                          str::stream() << "Index with name: " << name
+                                        << " already exists with a different name");
         }
     }
 
@@ -740,7 +741,10 @@ void IndexCatalogImpl::dropAllIndexes(OperationContext* opCtx,
                                       stdx::function<void(const IndexDescriptor*)> onDropFn) {
     invariant(opCtx->lockState()->isCollectionLockedForMode(_collection->ns(), MODE_X));
 
-    BackgroundOperation::assertNoBgOpInProgForNs(_collection->ns().ns());
+    uassert(ErrorCodes::BackgroundOperationInProgressForNamespace,
+            mongoutils::str::stream()
+                << "cannot perform operation: an index build is currently running",
+            !haveAnyIndexesInProgress());
 
     // make sure nothing in progress
     massert(17348,
@@ -813,8 +817,7 @@ void IndexCatalogImpl::dropAllIndexes(OperationContext* opCtx, bool includingIdI
 
 Status IndexCatalogImpl::dropIndex(OperationContext* opCtx, const IndexDescriptor* desc) {
     invariant(opCtx->lockState()->isCollectionLockedForMode(_collection->ns(), MODE_X));
-    BackgroundOperation::assertNoBgOpInProgForNs(_collection->ns().ns());
-    invariant(_buildingIndexes.size() == 0);
+    invariant(!haveAnyIndexesInProgress());
 
     IndexCatalogEntry* entry = _readyIndexes.find(desc);
 
@@ -958,6 +961,10 @@ void IndexCatalogImpl::setMultikeyPaths(OperationContext* const opCtx,
 
 bool IndexCatalogImpl::haveAnyIndexes() const {
     return _readyIndexes.size() > 0 || _buildingIndexes.size() > 0;
+}
+
+bool IndexCatalogImpl::haveAnyIndexesInProgress() const {
+    return _buildingIndexes.size() > 0;
 }
 
 int IndexCatalogImpl::numIndexesTotal(OperationContext* opCtx) const {
@@ -1124,7 +1131,6 @@ std::vector<std::shared_ptr<const IndexCatalogEntry>> IndexCatalogImpl::getAllRe
 const IndexDescriptor* IndexCatalogImpl::refreshEntry(OperationContext* opCtx,
                                                       const IndexDescriptor* oldDesc) {
     invariant(opCtx->lockState()->isCollectionLockedForMode(_collection->ns(), MODE_X));
-    invariant(!BackgroundOperation::inProgForNs(_collection->ns()));
     invariant(_buildingIndexes.size() == 0);
 
     const std::string indexName = oldDesc->indexName();
@@ -1420,7 +1426,7 @@ void IndexCatalogImpl::prepareInsertDeleteOptions(OperationContext* opCtx,
                                                   const IndexDescriptor* desc,
                                                   InsertDeleteOptions* options) const {
     auto replCoord = repl::ReplicationCoordinator::get(opCtx);
-    if (replCoord->shouldRelaxIndexConstraints(opCtx, NamespaceString(desc->parentNS()))) {
+    if (replCoord->shouldRelaxIndexConstraints(opCtx, desc->parentNS())) {
         options->getKeysMode = IndexAccessMethod::GetKeysMode::kRelaxConstraints;
     } else {
         options->getKeysMode = IndexAccessMethod::GetKeysMode::kEnforceConstraints;

@@ -52,12 +52,10 @@ public:
 
 TEST_F(DocumentShardKeyUpdateTest, constructShardKeyDeleteCmdObj) {
     NamespaceString nss("test.foo");
-    BSONObj originalQueryPredicate = BSON("x" << 4);
-    BSONObj updatePostImage = BSON("x" << 4 << "y" << 3 << "_id" << 20);
+    BSONObj updatePreImage = BSON("x" << 4 << "y" << 3 << "_id" << 20);
     int stmtId = 1;
 
-    auto deleteCmdObj =
-        constructShardKeyDeleteCmdObj(nss, originalQueryPredicate, updatePostImage, stmtId);
+    auto deleteCmdObj = constructShardKeyDeleteCmdObj(nss, updatePreImage, stmtId);
 
     auto deletesObj = deleteCmdObj["deletes"].Array();
     ASSERT_EQ(deletesObj.size(), 1U);
@@ -67,6 +65,7 @@ TEST_F(DocumentShardKeyUpdateTest, constructShardKeyDeleteCmdObj) {
     ASSERT_EQ(predicate["_id"].Int(), 20);
 
     ASSERT_EQ(deleteCmdObj["delete"].String(), nss.coll());
+    ASSERT_EQ(deleteCmdObj["stmtId"].Int(), stmtId);
 }
 
 TEST_F(DocumentShardKeyUpdateTest, constructShardKeyInsertCmdObj) {
@@ -85,7 +84,7 @@ TEST_F(DocumentShardKeyUpdateTest, constructShardKeyInsertCmdObj) {
     ASSERT_EQ(insert["_id"].Int(), 20);
 
     ASSERT_EQ(insertCmdObj["insert"].String(), nss.coll());
+    ASSERT_EQ(insertCmdObj["stmtId"].Int(), stmtId);
 }
-
 }  // namespace
 }  // namespace mongo

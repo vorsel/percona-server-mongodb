@@ -35,6 +35,7 @@
 
 #include "mongo/db/namespace_string.h"
 #include "mongo/util/log.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 namespace repl {
@@ -106,7 +107,8 @@ BSONObj makeOplogEntryDoc(OpTime opTime,
                           const boost::optional<StmtId>& statementId,
                           const boost::optional<OpTime>& prevWriteOpTimeInTransaction,
                           const boost::optional<OpTime>& preImageOpTime,
-                          const boost::optional<OpTime>& postImageOpTime) {
+                          const boost::optional<OpTime>& postImageOpTime,
+                          const boost::optional<bool>& prepare) {
     BSONObjBuilder builder;
     sessionInfo.serialize(&builder);
     builder.append(OplogEntryBase::kTimestampFieldName, opTime.getTimestamp());
@@ -148,6 +150,9 @@ BSONObj makeOplogEntryDoc(OpTime opTime,
     if (postImageOpTime) {
         const BSONObj localObject = postImageOpTime.get().toBSON();
         builder.append(OplogEntryBase::kPostImageOpTimeFieldName, localObject);
+    }
+    if (prepare) {
+        builder.append(OplogEntryBase::kPrepareFieldName, prepare.get());
     }
     return builder.obj();
 }
@@ -192,7 +197,7 @@ ReplOperation OplogEntry::makeDeleteOperation(const NamespaceString& nss,
     return op;
 }
 
-size_t OplogEntry::getReplOperationSize(const ReplOperation& op) {
+size_t OplogEntry::getDurableReplOperationSize(const DurableReplOperation& op) {
     return sizeof(op) + op.getNss().size() + op.getObject().objsize() +
         (op.getObject2() ? op.getObject2()->objsize() : 0);
 }
@@ -232,7 +237,8 @@ OplogEntry::OplogEntry(OpTime opTime,
                        const boost::optional<StmtId>& statementId,
                        const boost::optional<OpTime>& prevWriteOpTimeInTransaction,
                        const boost::optional<OpTime>& preImageOpTime,
-                       const boost::optional<OpTime>& postImageOpTime)
+                       const boost::optional<OpTime>& postImageOpTime,
+                       const boost::optional<bool>& prepare)
     : OplogEntry(makeOplogEntryDoc(opTime,
                                    hash,
                                    opType,
@@ -248,7 +254,8 @@ OplogEntry::OplogEntry(OpTime opTime,
                                    statementId,
                                    prevWriteOpTimeInTransaction,
                                    preImageOpTime,
-                                   postImageOpTime)) {}
+                                   postImageOpTime,
+                                   prepare)) {}
 
 bool OplogEntry::isCommand() const {
     return getOpType() == OpTypeEnum::kCommand;

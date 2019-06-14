@@ -35,6 +35,7 @@
 
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/s/transaction_coordinator_document_gen.h"
+#include "mongo/db/transaction_participant_gen.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/log.h"
@@ -154,17 +155,17 @@ void TransactionCoordinatorService::onStepUp(OperationContext* opCtx,
                     uassertStatusOK(waitForWriteConcern(
                         opCtx,
                         lastOpTime,
-                        WriteConcernOptions{WriteConcernOptions::kInternalMajorityNoSnapshot,
+                        WriteConcernOptions{WriteConcernOptions::kMajority,
                                             WriteConcernOptions::SyncMode::UNSET,
                                             WriteConcernOptions::kNoTimeout},
                         &unusedWCResult));
 
-                    auto coordinatorDocs =
-                        TransactionCoordinatorDriver::readAllCoordinatorDocs(opCtx);
+                    auto coordinatorDocs = txn::readAllCoordinatorDocs(opCtx);
 
                     LOG(0) << "Need to resume coordinating commit for " << coordinatorDocs.size()
                            << " transactions";
 
+                    auto clockSource = opCtx->getServiceContext()->getFastClockSource();
                     auto& catalog = catalogAndScheduler->catalog;
                     auto& scheduler = catalogAndScheduler->scheduler;
 
@@ -174,12 +175,12 @@ void TransactionCoordinatorService::onStepUp(OperationContext* opCtx,
                         const auto lsid = *doc.getId().getSessionId();
                         const auto txnNumber = *doc.getId().getTxnNumber();
 
-                        auto coordinator =
-                            std::make_shared<TransactionCoordinator>(opCtx->getServiceContext(),
-                                                                     lsid,
-                                                                     txnNumber,
-                                                                     scheduler.makeChildScheduler(),
-                                                                     boost::none /* No deadline */);
+                        auto coordinator = std::make_shared<TransactionCoordinator>(
+                            opCtx->getServiceContext(),
+                            lsid,
+                            txnNumber,
+                            scheduler.makeChildScheduler(),
+                            clockSource->now() + Seconds(gTransactionLifetimeLimitSeconds.load()));
 
                         catalog.insert(opCtx, lsid, txnNumber, coordinator, true /* forStepUp */);
                         coordinator->continueCommit(doc);

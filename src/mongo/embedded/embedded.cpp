@@ -194,9 +194,12 @@ ServiceContext* initialize(const char* yaml_config) {
 
     Status status = mongo::runGlobalInitializers(yaml_config ? 1 : 0, argv, nullptr);
     uassertStatusOKWithContext(status, "Global initilization failed");
+    auto giGuard = makeGuard([] { mongo::runGlobalDeinitializers().ignore(); });
     setGlobalServiceContext(ServiceContext::make());
 
     Client::initThread("initandlisten");
+    // Make sure current thread have no client set in thread_local when we leave this function
+    auto clientGuard = makeGuard([] { Client::releaseCurrent(); });
 
     initWireSpec();
 
@@ -278,30 +281,18 @@ ServiceContext* initialize(const char* yaml_config) {
                                                        repl::StorageInterface::get(serviceContext));
     }
 
-    auto swNonLocalDatabases = repairDatabasesAndCheckVersion(startupOpCtx.get());
-    if (!swNonLocalDatabases.isOK()) {
-        // SERVER-31611 introduced a return value to `repairDatabasesAndCheckVersion`. Previously,
-        // a failing condition would fassert. SERVER-31611 covers a case where the binary (3.6) is
-        // refusing to start up because it refuses acknowledgement of FCV 3.2 and requires the
-        // user to start up with an older binary. Thus shutting down the server must leave the
-        // datafiles in a state that the older binary can start up. This requires going through a
-        // clean shutdown.
-        //
-        // The invariant is *not* a statement that `repairDatabasesAndCheckVersion` must return
-        // `MustDowngrade`. Instead, it is meant as a guardrail to protect future developers from
-        // accidentally buying into this behavior. New errors that are returned from the method
-        // may or may not want to go through a clean shutdown, and they likely won't want the
-        // program to return an exit code of `EXIT_NEED_DOWNGRADE`.
-        severe(LogComponent::kControl) << "** IMPORTANT: "
-                                       << swNonLocalDatabases.getStatus().reason();
-        invariant(swNonLocalDatabases == ErrorCodes::MustDowngrade);
+    try {
+        repairDatabasesAndCheckVersion(startupOpCtx.get());
+    } catch (const ExceptionFor<ErrorCodes::MustDowngrade>& error) {
+        severe(LogComponent::kControl) << "** IMPORTANT: " << error.toStatus().reason();
         quickExit(EXIT_NEED_DOWNGRADE);
     }
 
-    // Assert that the in-memory featureCompatibilityVersion parameter has been explicitly set. If
-    // we are part of a replica set and are started up with no data files, we do not set the
-    // featureCompatibilityVersion until a primary is chosen. For this case, we expect the in-memory
-    // featureCompatibilityVersion parameter to still be uninitialized until after startup.
+    // Assert that the in-memory featureCompatibilityVersion parameter has been explicitly set.
+    // If we are part of a replica set and are started up with no data files, we do not set the
+    // featureCompatibilityVersion until a primary is chosen. For this case, we expect the
+    // in-memory featureCompatibilityVersion parameter to still be uninitialized until after
+    // startup.
     if (canCallFCVSetIfCleanStartup) {
         invariant(serverGlobalParams.featureCompatibility.isVersionInitialized());
     }
@@ -322,10 +313,10 @@ ServiceContext* initialize(const char* yaml_config) {
     // operation context anymore
     startupOpCtx.reset();
 
-    // Make sure current thread have no client set in thread_local
-    Client::releaseCurrent();
-
     serviceContext->notifyStartupComplete();
+
+    // Init succeeded, no need for global deinit.
+    giGuard.dismiss();
 
     return serviceContext;
 }

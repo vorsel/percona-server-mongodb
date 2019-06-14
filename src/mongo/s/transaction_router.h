@@ -32,7 +32,6 @@
 #include <boost/optional.hpp>
 #include <map>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/db/commands/txn_cmds_gen.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/operation_context.h"
@@ -275,6 +274,14 @@ public:
     }
 
 private:
+    // The type of commit initiated for this transaction.
+    enum class CommitType {
+        kNotInitiated,
+        kDirectCommit,
+        kTwoPhaseCommit,
+        kRecoverWithToken,
+    };
+
     // Shortcut to obtain the id of the session under which this transaction router runs
     const LogicalSessionId& _sessionId() const;
 
@@ -337,10 +344,9 @@ private:
     // called. Otherwise set to kUninitializedTxnNumber.
     TxnNumber _txnNumber{kUninitializedTxnNumber};
 
-    // Whether the router has initiated a two-phase commit by handing off commit coordination to the
-    // coordinator. If so, the router should no longer implicitly abort the transaction on errors,
-    // since the coordinator may independently make a commit decision.
-    bool _initiatedTwoPhaseCommit{false};
+    // Is updated at commit time to reflect whether the direct commit, two-phase commit, or recover
+    // commit path was taken.
+    CommitType _commitType{CommitType::kNotInitiated};
 
     // Indicates whether this is trying to recover a commitTransaction on the current transaction.
     bool _isRecoveringCommit{false};

@@ -156,6 +156,7 @@ Fsync
 Fuerst
 GCC
 GIDs
+GLIBC
 Gcc
 Geoff
 GetEnvironmentVariableA
@@ -840,7 +841,6 @@ iiu
 ikey
 im
 impl
-incase
 incr
 incrementals
 incrementing
@@ -1053,6 +1053,7 @@ online
 onpage
 oo
 opcode
+openat
 opendir
 openfile
 oplist
@@ -1215,6 +1216,7 @@ stdin
 stdout
 stepp
 str
+strace
 strcmp
 strdup
 strerror

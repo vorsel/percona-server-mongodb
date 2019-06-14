@@ -44,7 +44,7 @@ namespace mongo {
 
 namespace repl {
 class OplogEntryBase;
-class ReplOperation;
+class DurableReplOperation;
 }  // namespace repl
 
 namespace idl {
@@ -75,7 +75,7 @@ class UUID {
     friend class LogicalSessionFromClient;
     friend class ResolvedKeyId;
     friend class repl::OplogEntryBase;
-    friend class repl::ReplOperation;
+    friend class repl::DurableReplOperation;
     friend class ResumeTokenInternal;
     friend class VoteCommitIndexBuild;
 
@@ -125,7 +125,7 @@ public:
      * Returns a ConstDataRange view of the UUID.
      */
     ConstDataRange toCDR() const {
-        return ConstDataRange(reinterpret_cast<const char*>(_uuid.data()), _uuid.size());
+        return ConstDataRange(_uuid);
     }
 
     /**

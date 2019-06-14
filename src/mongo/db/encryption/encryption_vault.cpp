@@ -35,7 +35,6 @@ Copyright (C) 2019-present Percona and/or its affiliates. All rights reserved.
 
 #include <curl/curl.h>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/db/encryption/encryption_options.h"
 #include "mongo/db/json.h"
 #include "mongo/util/log.h"
@@ -45,7 +44,8 @@ namespace mongo {
 namespace {
 
 class CURLGuard {
-    MONGO_DISALLOW_COPYING(CURLGuard);
+    CURLGuard(const CURLGuard&) = delete;
+    CURLGuard& operator=(const CURLGuard&) = delete;
 
 public:
     CURLGuard() {}
@@ -69,7 +69,8 @@ public:
 };
 
 class Curl_session_guard {
-    MONGO_DISALLOW_COPYING(Curl_session_guard);
+    Curl_session_guard(const Curl_session_guard&) = delete;
+    Curl_session_guard& operator=(const Curl_session_guard&) = delete;
 
 public:
     Curl_session_guard(CURL *curl)
@@ -86,7 +87,8 @@ private:
 };
 
 class Curl_slist_guard {
-    MONGO_DISALLOW_COPYING(Curl_slist_guard);
+    Curl_slist_guard(const Curl_slist_guard&) = delete;
+    Curl_slist_guard& operator=(const Curl_slist_guard&) = delete;
 
 public:
     Curl_slist_guard(curl_slist *list)

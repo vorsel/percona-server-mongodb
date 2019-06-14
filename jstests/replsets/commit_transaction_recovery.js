@@ -28,28 +28,25 @@
     let sessionDB = session.getDatabase(dbName);
     const sessionColl = sessionDB.getCollection(collName);
 
-    jsTestLog("Disable snapshotting on all nodes");
-
-    // Disable snapshotting so that future operations do not enter the majority snapshot.
-    assert.commandWorked(
-        primary.adminCommand({configureFailPoint: "disableSnapshotting", mode: "alwaysOn"}));
-
     session.startTransaction();
     assert.commandWorked(sessionColl.insert({_id: 1}));
     let prepareTimestamp = PrepareHelpers.prepareTransaction(session);
 
-    jsTestLog("Committing the transaction");
+    jsTestLog("Disable snapshotting on all nodes");
+    // Disable snapshotting so that future operations do not enter the majority snapshot.
+    assert.commandWorked(
+        primary.adminCommand({configureFailPoint: "disableSnapshotting", mode: "alwaysOn"}));
 
+    jsTestLog("Committing the transaction");
     // Since the commitTimestamp is after the last snapshot, this oplog entry will be replayed
     // during replication recovery during restart.
-    assert.commandWorked(PrepareHelpers.commitTransactionAfterPrepareTS(session, prepareTimestamp));
+    assert.commandWorked(PrepareHelpers.commitTransaction(session, prepareTimestamp));
 
     jsTestLog("Restarting node");
 
     // Perform a clean shutdown and restart. Note that the 'disableSnapshotting' failpoint will be
     // unset on the node following the restart.
-    replTest.stop(primary, undefined, {skipValidation: true});
-    replTest.start(primary, {}, true);
+    replTest.restart(primary);
 
     jsTestLog("Node was restarted");
 
@@ -66,7 +63,7 @@
     // Also, make sure that we can run another transaction after recovery without any problems.
     assert.commandWorked(sessionDB[collName].update({_id: 1}, {_id: 1, a: 1}));
     prepareTimestamp = PrepareHelpers.prepareTransaction(session);
-    assert.commandWorked(PrepareHelpers.commitTransactionAfterPrepareTS(session, prepareTimestamp));
+    assert.commandWorked(PrepareHelpers.commitTransaction(session, prepareTimestamp));
     assert.eq(testDB[collName].findOne({_id: 1}), {_id: 1, a: 1});
 
     replTest.stopSet();

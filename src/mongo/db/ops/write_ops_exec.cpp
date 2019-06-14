@@ -74,6 +74,7 @@
 #include "mongo/db/write_concern.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/cannot_implicitly_create_collection_info.h"
+#include "mongo/s/would_change_owning_shard_exception.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
@@ -237,6 +238,10 @@ bool handleError(OperationContext* opCtx,
         throw;  // These have always failed the whole batch.
     }
 
+    if (ErrorCodes::WouldChangeOwningShard == ex.code()) {
+        throw;  // Fail this write so mongos can retry
+    }
+
     auto txnParticipant = TransactionParticipant::get(opCtx);
     if (txnParticipant && txnParticipant.inActiveOrKilledMultiDocumentTransaction()) {
         if (isTransientTransactionError(
@@ -272,41 +277,6 @@ bool handleError(OperationContext* opCtx,
 
     out->results.emplace_back(ex.toStatus());
     return !wholeOp.getOrdered();
-}
-
-SingleWriteResult createIndex(OperationContext* opCtx,
-                              const NamespaceString& systemIndexes,
-                              const BSONObj& spec) {
-    BSONElement nsElement = spec["ns"];
-    uassert(ErrorCodes::NoSuchKey, "Missing \"ns\" field in index description", !nsElement.eoo());
-    uassert(ErrorCodes::TypeMismatch,
-            str::stream() << "Expected \"ns\" field of index description to be a "
-                             "string, "
-                             "but found a "
-                          << typeName(nsElement.type()),
-            nsElement.type() == String);
-    const NamespaceString ns(nsElement.valueStringData());
-    uassert(ErrorCodes::InvalidOptions,
-            str::stream() << "Cannot create an index on " << ns.ns() << " with an insert to "
-                          << systemIndexes.ns(),
-            ns.db() == systemIndexes.db());
-
-    BSONObjBuilder cmdBuilder;
-    cmdBuilder << "createIndexes" << ns.coll();
-    cmdBuilder << "indexes" << BSON_ARRAY(spec);
-
-    auto cmdResult = CommandHelpers::runCommandDirectly(
-        opCtx, OpMsgRequest::fromDBAndBody(systemIndexes.db(), cmdBuilder.obj()));
-    uassertStatusOK(getStatusFromCommandResult(cmdResult));
-
-    // Unlike normal inserts, it is not an error to "insert" a duplicate index.
-    long long n =
-        cmdResult["numIndexesAfter"].numberInt() - cmdResult["numIndexesBefore"].numberInt();
-    CurOp::get(opCtx)->debug().additiveMetrics.incrementNinserted(n);
-
-    SingleWriteResult result;
-    result.setN(n);
-    return result;
 }
 
 LockMode fixLockModeForSystemDotViewsChanges(const NamespaceString& nss, LockMode mode) {

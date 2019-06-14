@@ -78,9 +78,7 @@ static Value serializeConstant(Value val) {
 
 string Expression::removeFieldPrefix(const string& prefixedField) {
     uassert(16419,
-            str::stream() << "field path must not contain embedded null characters"
-                          << prefixedField.find("\0")
-                          << ",",
+            str::stream() << "field path must not contain embedded null characters",
             prefixedField.find('\0') == string::npos);
 
     const char* pPrefixedField = prefixedField.c_str();
@@ -908,18 +906,18 @@ intrusive_ptr<Expression> ExpressionCond::parse(
     if (expr.type() != Object) {
         return Base::parse(expCtx, expr, vps);
     }
-    verify(str::equals(expr.fieldName(), "$cond"));
+    verify(expr.fieldNameStringData() == "$cond");
 
     intrusive_ptr<ExpressionCond> ret = new ExpressionCond(expCtx);
     ret->vpOperand.resize(3);
 
     const BSONObj args = expr.embeddedObject();
     BSONForEach(arg, args) {
-        if (str::equals(arg.fieldName(), "if")) {
+        if (arg.fieldNameStringData() == "if") {
             ret->vpOperand[0] = parseOperand(expCtx, arg, vps);
-        } else if (str::equals(arg.fieldName(), "then")) {
+        } else if (arg.fieldNameStringData() == "then") {
             ret->vpOperand[1] = parseOperand(expCtx, arg, vps);
-        } else if (str::equals(arg.fieldName(), "else")) {
+        } else if (arg.fieldNameStringData() == "else") {
             ret->vpOperand[2] = parseOperand(expCtx, arg, vps);
         } else {
             uasserted(17083,
@@ -1642,7 +1640,7 @@ intrusive_ptr<Expression> ExpressionDateToString::parse(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     BSONElement expr,
     const VariablesParseState& vps) {
-    verify(str::equals(expr.fieldName(), "$dateToString"));
+    verify(expr.fieldNameStringData() == "$dateToString");
 
     uassert(18629,
             "$dateToString only supports an object as its argument",
@@ -1948,7 +1946,22 @@ intrusive_ptr<ExpressionFieldPath> ExpressionFieldPath::parse(
         const StringData fieldPath = rawSD.substr(2);  // strip off $$
         const StringData varName = fieldPath.substr(0, fieldPath.find('.'));
         Variables::uassertValidNameForUserRead(varName);
-        return new ExpressionFieldPath(expCtx, fieldPath.toString(), vps.getVariable(varName));
+        auto varId = vps.getVariable(varName);
+        // $$NOW and $$CLUSTER_TIME are available only in 4.2 and up.
+        // The check should be removed when 4.2 becomes the last stable version.
+        if (varId == Variables::kNowId || varId == Variables::kClusterTimeId) {
+            uassert(ErrorCodes::QueryFeatureNotAllowed,
+                    str::stream()
+                        << "'$$"
+                        << varName
+                        << "' is not allowed in the current feature compatibility version. See "
+                        << feature_compatibility_version_documentation::kCompatibilityLink
+                        << " for more information.",
+                    !expCtx->maxFeatureCompatibilityVersion ||
+                        (ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42 <=
+                         *expCtx->maxFeatureCompatibilityVersion));
+        }
+        return new ExpressionFieldPath(expCtx, fieldPath.toString(), varId);
     } else {
         return new ExpressionFieldPath(expCtx,
                                        "CURRENT." + raw.substr(1),  // strip the "$" prefix
@@ -2097,7 +2110,7 @@ intrusive_ptr<Expression> ExpressionFilter::parse(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     BSONElement expr,
     const VariablesParseState& vpsIn) {
-    verify(str::equals(expr.fieldName(), "$filter"));
+    verify(expr.fieldNameStringData() == "$filter");
 
     uassert(28646, "$filter only supports an object as its argument", expr.type() == Object);
 
@@ -2106,11 +2119,11 @@ intrusive_ptr<Expression> ExpressionFilter::parse(
     BSONElement asElem;
     BSONElement condElem;
     for (auto elem : expr.Obj()) {
-        if (str::equals(elem.fieldName(), "input")) {
+        if (elem.fieldNameStringData() == "input") {
             inputElem = elem;
-        } else if (str::equals(elem.fieldName(), "as")) {
+        } else if (elem.fieldNameStringData() == "as") {
             asElem = elem;
-        } else if (str::equals(elem.fieldName(), "cond")) {
+        } else if (elem.fieldNameStringData() == "cond") {
             condElem = elem;
         } else {
             uasserted(28647,
@@ -2226,7 +2239,7 @@ intrusive_ptr<Expression> ExpressionLet::parse(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     BSONElement expr,
     const VariablesParseState& vpsIn) {
-    verify(str::equals(expr.fieldName(), "$let"));
+    verify(expr.fieldNameStringData() == "$let");
 
     uassert(16874, "$let only supports an object as its argument", expr.type() == Object);
     const BSONObj args = expr.embeddedObject();
@@ -2235,9 +2248,9 @@ intrusive_ptr<Expression> ExpressionLet::parse(
     BSONElement varsElem;
     BSONElement inElem;
     BSONForEach(arg, args) {
-        if (str::equals(arg.fieldName(), "vars")) {
+        if (arg.fieldNameStringData() == "vars") {
             varsElem = arg;
-        } else if (str::equals(arg.fieldName(), "in")) {
+        } else if (arg.fieldNameStringData() == "in") {
             inElem = arg;
         } else {
             uasserted(16875,
@@ -2325,7 +2338,7 @@ intrusive_ptr<Expression> ExpressionMap::parse(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     BSONElement expr,
     const VariablesParseState& vpsIn) {
-    verify(str::equals(expr.fieldName(), "$map"));
+    verify(expr.fieldNameStringData() == "$map");
 
     uassert(16878, "$map only supports an object as its argument", expr.type() == Object);
 
@@ -2335,11 +2348,11 @@ intrusive_ptr<Expression> ExpressionMap::parse(
     BSONElement inElem;
     const BSONObj args = expr.embeddedObject();
     BSONForEach(arg, args) {
-        if (str::equals(arg.fieldName(), "input")) {
+        if (arg.fieldNameStringData() == "input") {
             inputElem = arg;
-        } else if (str::equals(arg.fieldName(), "as")) {
+        } else if (arg.fieldNameStringData() == "as") {
             asElem = arg;
-        } else if (str::equals(arg.fieldName(), "in")) {
+        } else if (arg.fieldNameStringData() == "in") {
             inElem = arg;
         } else {
             uasserted(16879,
@@ -3100,7 +3113,7 @@ intrusive_ptr<Expression> ExpressionNary::optimize() {
             // is also associative, replace the expression for the operands it has.
             // E.g: sum(a, b, sum(c, d), e) => sum(a, b, c, d, e)
             ExpressionNary* nary = dynamic_cast<ExpressionNary*>(operand.get());
-            if (nary && str::equals(nary->getOpName(), getOpName()) && nary->isAssociative()) {
+            if (nary && !strcmp(nary->getOpName(), getOpName()) && nary->isAssociative()) {
                 invariant(!nary->vpOperand.empty());
                 vpOperand[i] = std::move(nary->vpOperand[0]);
                 vpOperand.insert(
@@ -5661,138 +5674,277 @@ Value ExpressionConvert::performConversion(BSONType targetType, Value inputValue
 
 namespace {
 
-Value generateRegexCapturesAndMatches(StringData pattern,
-                                      const int numCaptures,
-                                      const pcrecpp::RE_Options& options,
-                                      StringData input,
-                                      int startBytePos,
-                                      int startCodePointPos) {
-
-    const auto pcreOptions = options.all_options();
-    // The first two-thirds of the vector is used to pass back captured substrings' start and limit
-    // indexes. The remaining third of the vector is used as workspace by pcre_exec() while matching
-    // capturing subpatterns, and is not available for passing back information.
-    const size_t sizeOfOVector = (1 + numCaptures) * 3;
-    const char* compile_error;
-    int eoffset;
-
-    // The C++ interface pcreccp.h doesn't have a way to capture the matched string (or the index of
-    // the match). So we are using the C interface. First we compile all the regex options to
-    // generate pcre object, which will later be used to match against the input string.
-    pcre* pcre = pcre_compile(pattern.rawData(), pcreOptions, &compile_error, &eoffset, nullptr);
-    if (pcre == nullptr) {
-        uasserted(51111, str::stream() << "Invalid Regex: " << compile_error);
+class RegexMatchHandler {
+public:
+    RegexMatchHandler(const Value& inputExpr) : _pcre(nullptr), _nullish(false) {
+        _validateInputAndExtractElements(inputExpr);
+        _compile(regex_util::flags2PcreOptions(_options, false).all_options());
     }
 
-    // TODO: Evaluate the upper bound for this array and fail the request if numCaptures are higher
-    // than the limit (SERVER-37848).
-    std::vector<int> outVector(sizeOfOVector);
-    const int out = pcre_exec(pcre,
-                              0,
-                              input.rawData(),
-                              input.size(),
-                              startBytePos,
-                              0,  // No need to overwrite the options set during pcre_compile.
-                              &outVector.front(),
-                              sizeOfOVector);
-    (*pcre_free)(pcre);
-    // The 'out' parameter will be zero if outVector's size is not big enough to hold all the
-    // captures, which should never be the case.
-    invariant(out != 0);
-
-    // No match.
-    if (out < 0) {
-        return Value(BSONNULL);
+    ~RegexMatchHandler() {
+        if (_pcre != nullptr) {
+            pcre_free(_pcre);
+        }
     }
 
-    // The first and second entires of the outVector have the start and limit indices of the matched
-    // string. as byte offsets.
-    const int matchStartByteIndex = outVector[0];
-    // We iterate through the input string's contents preceding the match index, in order to convert
-    // the byte offset to a code point offset.
-    for (int byteIx = startBytePos; byteIx < matchStartByteIndex; ++startCodePointPos) {
-        byteIx += getCodePointLength(input[byteIx]);
+    int execute(int startBytePos) {
+        int execResult = pcre_exec(_pcre,
+                                   0,
+                                   _input.c_str(),
+                                   _input.size(),
+                                   startBytePos,
+                                   0,  // No need to overwrite the options set during pcre_compile.
+                                   &_capturesBuffer.front(),
+                                   _capturesBuffer.size());
+        // The 'execResult' will be (_numCaptures + 1) if there is a match, -1 if there is no
+        // match, negative if there is an error during execution, and zero if _capturesBuffer's
+        // capacity is not sufficient to hold all the results. The latter scenario should never
+        // occur.
+        uassert(
+            51156,
+            str::stream() << "Error occurred while executing the regular expression. Result code:"
+                          << execResult,
+            execResult == -1 || execResult == (_numCaptures + 1));
+        return execResult;
     }
-    StringData matchedStr = input.substr(outVector[0], outVector[1] - outVector[0]);
 
-    std::vector<Value> captures;
-    // The next 2 * numCaptures entries hold the start index and limit pairs, for each of the
-    // capture groups. We skip the first two elements and start iteration from 3rd element so that
-    // we only construct the strings for capture groups.
-    for (int i = 0; i < numCaptures; i++) {
-        const int start = outVector[2 * (i + 1)];
-        const int limit = outVector[2 * (i + 1) + 1];
-        captures.push_back(Value(input.substr(start, limit - start)));
+    /**
+     * The function will match '_input' string based on the regex pattern present in '_pcre'. If
+     * there is a match, the function will return a 'Value' object encapsulating the matched string,
+     * the code point index of the matched string and a vector representing all the captured
+     * substrings. The function will also update the parameters 'startBytePos' and
+     * 'startCodePointPos' to the corresponding new indices. If there is no match, the function will
+     * return null 'Value' object.
+     */
+    Value nextMatch(int* startBytePos, int* startCodePointPos) {
+        invariant(startBytePos != nullptr && startCodePointPos != nullptr);
+
+        // Use input as StringData throughout the function to avoid copying the string on 'substr'
+        // calls.
+        StringData input = _input;
+        int execResult = execute(*startBytePos);
+        // No match.
+        if (execResult < 0) {
+            return Value(BSONNULL);
+        }
+
+        // The first and second entries of the '_capturesBuffer' will have the start and limit
+        // indices of the matched string, as byte offsets. '(limit - startIndex)' would be the
+        // length of the captured string.
+        const int matchStartByteIndex = _capturesBuffer[0];
+        StringData matchedStr =
+            input.substr(matchStartByteIndex, _capturesBuffer[1] - matchStartByteIndex);
+        // We iterate through the input string's contents preceding the match index, in order to
+        // convert the byte offset to a code point offset.
+        for (int byteIx = *startBytePos; byteIx < matchStartByteIndex; ++(*startCodePointPos)) {
+            byteIx += getCodePointLength(input[byteIx]);
+        }
+        // Set the start index for match to the new one.
+        *startBytePos = matchStartByteIndex;
+
+        std::vector<Value> captures;
+        captures.reserve(_numCaptures);
+        // The next '2 * numCaptures' entries (after the first two entries) of '_capturesBuffer'
+        // will hold the start index and limit pairs, for each of the capture groups. We skip the
+        // first two elements and start iteration from 3rd element so that we only construct the
+        // strings for capture groups.
+        for (int i = 0; i < _numCaptures; ++i) {
+            const int start = _capturesBuffer[2 * (i + 1)];
+            const int limit = _capturesBuffer[2 * (i + 1) + 1];
+            captures.push_back(Value(input.substr(start, limit - start)));
+        }
+
+        MutableDocument match;
+        match.addField("match", Value(matchedStr));
+        match.addField("idx", Value(*startCodePointPos));
+        match.addField("captures", Value(captures));
+        return match.freezeToValue();
     }
 
-    MutableDocument match;
-    match.addField("match", Value(matchedStr));
-    match.addField("idx", Value(startCodePointPos));
-    match.addField("captures", Value(captures));
-    return match.freezeToValue();
-}
+    int numCaptures() {
+        return _numCaptures;
+    }
+
+    bool nullish() {
+        return _nullish;
+    }
+
+    StringData getInput() {
+        return _input;
+    }
+
+private:
+    RegexMatchHandler(const RegexMatchHandler&) = delete;
+
+    void _compile(const int pcreOptions) {
+        const char* compile_error;
+        int eoffset;
+        // The C++ interface pcreccp.h doesn't have a way to capture the matched string (or the
+        // index of the match). So we are using the C interface. First we compile all the regex
+        // options to generate pcre object, which will later be used to match against the input
+        // string.
+        _pcre = pcre_compile(_pattern.c_str(), pcreOptions, &compile_error, &eoffset, nullptr);
+        if (_pcre == nullptr) {
+            uasserted(51111, str::stream() << "Invalid Regex: " << compile_error);
+        }
+
+        // Calculate the number of capture groups present in '_pattern' and store in '_numCaptures'.
+        int pcre_retval = pcre_fullinfo(_pcre, NULL, PCRE_INFO_CAPTURECOUNT, &_numCaptures);
+        invariant(pcre_retval == 0);
+
+        // The first two-thirds of the vector is used to pass back captured substrings' start and
+        // limit indexes. The remaining third of the vector is used as workspace by pcre_exec()
+        // while matching capturing subpatterns, and is not available for passing back information.
+        // pcre_compile will error if there are too many capture groups in the pattern. As long as
+        // this memory is allocated after compile, the amount of memory allocated will not be too
+        // high.
+        _capturesBuffer = std::vector<int>((1 + _numCaptures) * 3);
+    }
+
+    void _validateInputAndExtractElements(const Value& inputExpr) {
+        uassert(51103,
+                str::stream() << "$regexFind expects an object of named arguments, but found type "
+                              << inputExpr.getType(),
+                inputExpr.getType() == BSONType::Object);
+        Value textInput = inputExpr.getDocument().getField("input");
+        Value regexPattern = inputExpr.getDocument().getField("regex");
+        Value regexOptions = inputExpr.getDocument().getField("options");
+
+        uassert(51104,
+                "'input' field should be of type string",
+                textInput.nullish() || textInput.getType() == BSONType::String);
+        uassert(51105,
+                "'regex' field should be of type string or regex",
+                regexPattern.nullish() || regexPattern.getType() == BSONType::String ||
+                    regexPattern.getType() == BSONType::RegEx);
+        uassert(51106,
+                "'options' should be of type string",
+                regexOptions.nullish() || regexOptions.getType() == BSONType::String);
+
+        // If either the text input or regex pattern is nullish, then we consider the operation as a
+        // whole nullish.
+        _nullish = textInput.nullish() || regexPattern.nullish();
+
+        if (textInput.getType() == BSONType::String) {
+            _input = textInput.getString();
+        }
+
+        // The 'regex' field can be a RegEx object and may have its own options...
+        if (regexPattern.getType() == BSONType::RegEx) {
+            StringData regexFlags = regexPattern.getRegexFlags();
+            _pattern = regexPattern.getRegex();
+            uassert(51107,
+                    str::stream()
+                        << "Found regex option(s) specified in both 'regex' and 'option' fields",
+                    regexOptions.nullish() || regexFlags.empty());
+            if (!regexFlags.empty()) {
+                _options = regexFlags.toString();
+            }
+        } else if (regexPattern.getType() == BSONType::String) {
+            // ...or it can be a string field with options specified separately.
+            _pattern = regexPattern.getString();
+        }
+        // If 'options' is non-null, we must extract and validate its contents even if
+        // 'regexPattern' is nullish.
+        if (!regexOptions.nullish()) {
+            _options = regexOptions.getString();
+        }
+        uassert(51109,
+                "Regular expression cannot contain an embedded null byte",
+                _pattern.find('\0', 0) == string::npos);
+        uassert(51110,
+                "Regular expression options string cannot contain an embedded null byte",
+                _options.find('\0', 0) == string::npos);
+    }
+
+    pcre* _pcre;
+    // Number of capture groups present in '_pattern'.
+    int _numCaptures;
+    // Holds the start and limit indices of match and captures for the current match.
+    std::vector<int> _capturesBuffer;
+    std::string _input;
+    std::string _pattern;
+    std::string _options;
+    bool _nullish;
+};
 
 }  // namespace
 
 Value ExpressionRegexFind::evaluate(const Document& root) const {
 
-    const Value expr = vpOperand[0]->evaluate(root);
-    uassert(51103,
-            str::stream() << "$regexFind expects an object of named arguments, but found type "
-                          << expr.getType(),
-            !expr.nullish() && expr.getType() == BSONType::Object);
-    Value textInput = expr.getDocument().getField("input");
-    Value regexPattern = expr.getDocument().getField("regex");
-    Value regexOptions = expr.getDocument().getField("options");
-
-    uassert(51104,
-            "input field should be of type string",
-            textInput.nullish() || textInput.getType() == BSONType::String);
-    uassert(51105,
-            "regex field should be of type string or regex",
-            regexPattern.nullish() || regexPattern.getType() == BSONType::String ||
-                regexPattern.getType() == BSONType::RegEx);
-    uassert(51106,
-            "options should be of type string",
-            regexOptions.nullish() || regexOptions.getType() == BSONType::String);
-    if (textInput.nullish() || regexPattern.nullish()) {
+    RegexMatchHandler regex(vpOperand[0]->evaluate(root));
+    if (regex.nullish()) {
         return Value(BSONNULL);
     }
-
-    StringData pattern, optionFlags;
-    // The 'regex' field can be a RegEx object with its own options/options specified separately...
-    if (regexPattern.getType() == BSONType::RegEx) {
-        StringData regexFlags = regexPattern.getRegexFlags();
-        pattern = regexPattern.getRegex();
-        uassert(
-            51107,
-            str::stream() << "Found regex option(s) specified in both 'regex' and 'option' fields",
-            regexOptions.nullish() || regexFlags.empty());
-        optionFlags = regexOptions.nullish() ? regexFlags : regexOptions.getStringData();
-    } else {
-        // ... or it can be a string field with options specified separately.
-        pattern = regexPattern.getStringData();
-        if (!regexOptions.nullish()) {
-            optionFlags = regexOptions.getStringData();
-        }
-    }
-    uassert(51109,
-            "Regular expression cannot contain an embedded null byte",
-            pattern.find('\0', 0) == string::npos);
-    uassert(51110,
-            "Regular expression options string cannot contain an embedded null byte",
-            optionFlags.find('\0', 0) == string::npos);
-
-    pcrecpp::RE_Options opt = regex_util::flags2PcreOptions(optionFlags, false);
-    pcrecpp::RE regex(pattern.rawData(), opt);
-    return generateRegexCapturesAndMatches(
-        pattern, regex.NumberOfCapturingGroups(), opt, textInput.getStringData(), 0, 0);
+    int startByteIndex = 0, startCodePointIndex = 0;
+    return regex.nextMatch(&startByteIndex, &startCodePointIndex);
 }
-
 
 REGISTER_EXPRESSION(regexFind, ExpressionRegexFind::parse);
 const char* ExpressionRegexFind::getOpName() const {
     return "$regexFind";
+}
+
+Value ExpressionRegexFindAll::evaluate(const Document& root) const {
+
+    std::vector<Value> output;
+    RegexMatchHandler regex(vpOperand[0]->evaluate(root));
+    if (regex.nullish()) {
+        return Value(output);
+    }
+    int startByteIndex = 0, startCodePointIndex = 0;
+    StringData input = regex.getInput();
+    size_t totalDocSize = 0;
+
+    // Using do...while loop because, when input is an empty string, we still want to see if there
+    // is a match.
+    do {
+        auto matchObj = regex.nextMatch(&startByteIndex, &startCodePointIndex);
+        if (matchObj.getType() == BSONType::jstNULL) {
+            break;
+        }
+        totalDocSize += matchObj.getApproximateSize();
+        uassert(51151,
+                "The size of buffer to store $regexFindAll output exceeded the 64MB limit",
+                totalDocSize <= mongo::BufferMaxSize);
+
+        output.push_back(matchObj);
+        std::string matchStr = matchObj.getDocument().getField("match").getString();
+        if (matchStr.empty()) {
+            // This would only happen if the regex matched an empty string. In this case, even if
+            // the character at startByteIndex matches the regex, we cannot return it since we are
+            // already returing an empty string starting at this index. So we move on to the next
+            // byte index.
+            startByteIndex += getCodePointLength(input[startByteIndex]);
+            ++startCodePointIndex;
+            continue;
+        }
+        // We don't want any overlapping sub-strings. So we move 'startByteIndex' to point to the
+        // byte after 'matchStr'. We move the code point index also correspondingly.
+        startByteIndex += matchStr.size();
+        for (size_t byteIx = 0; byteIx < matchStr.size(); ++startCodePointIndex) {
+            byteIx += getCodePointLength(matchStr[byteIx]);
+        }
+        invariant(startByteIndex > 0 && startCodePointIndex > 0 &&
+                  startCodePointIndex <= startByteIndex);
+    } while (static_cast<size_t>(startByteIndex) < input.size());
+    return Value(output);
+}
+
+REGISTER_EXPRESSION(regexFindAll, ExpressionRegexFindAll::parse);
+const char* ExpressionRegexFindAll::getOpName() const {
+    return "$regexFindAll";
+}
+
+Value ExpressionRegexMatch::evaluate(const Document& root) const {
+    RegexMatchHandler regex(vpOperand[0]->evaluate(root));
+    // Return output of execute only if regex is not nullish.
+    return regex.nullish() ? Value(false) : Value(regex.execute(0) > 0);
+}
+
+REGISTER_EXPRESSION(regexMatch, ExpressionRegexMatch::parse);
+const char* ExpressionRegexMatch::getOpName() const {
+    return "$regexMatch";
 }
 
 }  // namespace mongo

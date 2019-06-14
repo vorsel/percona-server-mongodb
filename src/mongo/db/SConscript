@@ -140,6 +140,7 @@ env.CppUnitTest(
         'repl/oplog_interface_local',
         'repl/replmocks',
         'service_context_d_test_fixture',
+        'transaction',
     ],
 )
 
@@ -720,6 +721,23 @@ env.Library(
     target='catalog_raii',
     source=[
         'catalog_raii.cpp',
+    ],
+    LIBDEPS=[
+        'catalog/collection',
+        'catalog/uuid_catalog',
+        'concurrency/lock_manager',
+        'namespace_string',
+        'views/views',
+    ],
+    LIBDEPS_PRIVATE=[
+        'catalog/database_holder',
+        's/sharding_api_d',
+    ]
+)
+
+env.Library(
+    target='transaction',
+    source=[
         'retryable_writes_stats.cpp',
         'server_transactions_metrics.cpp',
         'session_catalog_mongod.cpp',
@@ -732,30 +750,24 @@ env.Library(
         env.Idlc('transactions_stats.idl')[0],
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/idl/idl_parser',
-        'catalog/collection',
-        'catalog/database_holder',
-        'catalog/uuid_catalog',
-        'commands/test_commands_enabled',
         'commands/txn_cmd_request',
-        'concurrency/lock_manager',
-        'curop_failpoint_helpers',
-        'curop_metrics',
-        'dbdirectclient',
-        'index/index_access_method',
-        'namespace_string',
         'repl/oplog_entry',
         'repl/oplog_shim',
-        's/sharding_api_d',
         'session_catalog',
-        'stats/fill_locker_info',
-        'stats/top',
-        'views/views',
     ],
     LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/util/concurrency/thread_pool',
+        '$BUILD_DIR/mongo/idl/idl_parser',
         '$BUILD_DIR/mongo/idl/server_parameter',
+        '$BUILD_DIR/mongo/util/concurrency/thread_pool',
+        'catalog_raii',
         'commands/server_status',
+        'commands/test_commands_enabled',
+        'curop_failpoint_helpers',
+        'dbdirectclient',
+        'index/index_access_method',
+        'query_exec',
+        'stats/fill_locker_info',
+        'stats/top',
         'update/update_driver',
     ]
 )
@@ -890,6 +902,7 @@ env.Library(
         "$BUILD_DIR/mongo/s/grid",
     ],
     LIBDEPS_PRIVATE=[
+        'transaction',
         '$BUILD_DIR/mongo/db/commands/mongod_fcv',
     ],
 )
@@ -908,10 +921,12 @@ env.Library(
         'lasterror',
         'query_exec',
         'snapshot_window_util',
+        'transaction',
         '$BUILD_DIR/mongo/db/audit',
         '$BUILD_DIR/mongo/db/auth/auth',
         '$BUILD_DIR/mongo/db/auth/authprivilege',
         '$BUILD_DIR/mongo/db/command_can_run_here',
+        '$BUILD_DIR/mongo/db/curop_metrics',
         '$BUILD_DIR/mongo/db/ops/write_ops_exec',
         '$BUILD_DIR/mongo/db/rw_concern_d',
         '$BUILD_DIR/mongo/db/s/sharding_api_d',
@@ -1001,7 +1016,6 @@ env.Library(
         "query_exec",
         "service_context",
         "$BUILD_DIR/mongo/base",
-        "$BUILD_DIR/mongo/db/catalog/catalog_helpers",
         "$BUILD_DIR/mongo/db/catalog/commit_quorum_options",
         "$BUILD_DIR/mongo/db/catalog/index_build_entry_idl",
         "$BUILD_DIR/mongo/db/matcher/expressions_mongod_only",
@@ -1120,6 +1134,7 @@ env.Library(
         "$BUILD_DIR/mongo/s/grid",
         "catalog_raii",
         "curop",
+        "concurrency/write_conflict_exception",
         "repl/repl_coordinator_interface",
         "repl/speculative_majority_read_info",
         "s/sharding_api_d",
@@ -1657,6 +1672,7 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         'session_catalog',
+        'transaction'
     ],
 )
 
@@ -1668,6 +1684,7 @@ env.Library(
     LIBDEPS_PRIVATE=[
         'kill_sessions_local',
         '$BUILD_DIR/mongo/util/periodic_runner',
+        'transaction',
     ],
 )
 
@@ -2096,11 +2113,12 @@ env.CppUnitTest(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/client/read_preference',
-        '$BUILD_DIR/mongo/db/auth/authmocks',
-        '$BUILD_DIR/mongo/db/op_observer',
-        '$BUILD_DIR/mongo/db/repl/mock_repl_coord_server_fixture',
         '$BUILD_DIR/mongo/util/clock_source_mock',
+        'auth/authmocks',
+        'op_observer',
         'query_exec',
+        'repl/mock_repl_coord_server_fixture',
+        'transaction',
     ],
 )
 

@@ -245,6 +245,20 @@ NamespaceString IDLParserErrorContext::parseNSCollectionRequired(StringData dbNa
     return nss;
 }
 
+NamespaceStringOrUUID IDLParserErrorContext::parseNsOrUUID(StringData dbname,
+                                                           const BSONElement& element) {
+    if (element.type() == BinData && element.binDataType() == BinDataType::newUUID) {
+        return {dbname.toString(), uassertStatusOK(UUID::parse(element))};
+    } else {
+        // Ensure collection identifier is not a Command
+        const NamespaceString nss(parseNSCollectionRequired(dbname, element));
+        uassert(ErrorCodes::InvalidNamespace,
+                str::stream() << "Invalid collection name specified '" << nss.ns() << "'",
+                nss.isNormal());
+        return nss;
+    }
+}
+
 void IDLParserErrorContext::appendGenericCommandArguments(
     const BSONObj& commandPassthroughFields,
     const std::vector<StringData>& knownFields,
@@ -283,7 +297,7 @@ std::vector<ConstDataRange> transformVector(const std::vector<std::vector<std::u
     output.reserve(input.size());
 
     std::transform(begin(input), end(input), std::back_inserter(output), [](auto&& vec) {
-        return makeCDR(vec);
+        return ConstDataRange(vec);
     });
 
     return output;

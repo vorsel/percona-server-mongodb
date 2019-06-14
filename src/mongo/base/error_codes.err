@@ -284,6 +284,9 @@ error_code("TransactionCoordinatorReachedAbortDecision", 282)
 error_code("WouldChangeOwningShard", 283, extra="WouldChangeOwningShardInfo")
 error_code("ForTestingErrorExtraInfoWithExtraInfoInNamespace", 284, extra="nested::twice::NestedErrorExtraInfoExample")
 error_code("IndexBuildAlreadyInProgress", 285)
+error_code("ChangeStreamHistoryLost", 286)
+# The code below is for internal use only and must never be returned in a network response
+error_code("TransactionCoordinatorDeadlineTaskCanceled", 287)
 
 # Error codes 4000-8999 are reserved.
 
@@ -340,6 +343,10 @@ error_class("WriteConcernError", ["WriteConcernFailed",
                                   "UnsatisfiableWriteConcern"])
 error_class("ShutdownError", ["ShutdownInProgress", "InterruptedAtShutdown"])
 
+# isCancelationError() includes all codes that, when passed to a function as its parameter,
+# indicates that it cannot be executed as normal and must abort its intended work.
+error_class("CancelationError", ["ShutdownInProgress", "InterruptedAtShutdown", "CallbackCanceled"])
+
 #TODO SERVER-28679 add checksum failure.
 error_class("ConnectionFatalMessageParseError", ["IllegalOpMsgFlag",
                                                  "TooManyDocumentSequences"])
@@ -349,3 +356,5 @@ error_class("ExceededTimeLimitError", ["ExceededTimeLimit", "MaxTimeMSExpired", 
 error_class("SnapshotError", ["SnapshotTooOld", "SnapshotUnavailable", "StaleChunkHistory", "MigrationConflict"])
 
 error_class("VoteAbortError", ["NoSuchTransaction", "TransactionTooOld"])
+
+error_class("NonRetryableChangeStreamError", ["ChangeStreamFatalError", "ChangeStreamHistoryLost"])

@@ -33,7 +33,6 @@
 #include <string>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/mutex.h"
@@ -51,7 +50,8 @@ class Status;
  * See the Options struct for information about how to configure an instance.
  */
 class ThreadPool final : public ThreadPoolInterface {
-    MONGO_DISALLOW_COPYING(ThreadPool);
+    ThreadPool(const ThreadPool&) = delete;
+    ThreadPool& operator=(const ThreadPool&) = delete;
 
 public:
     /**
@@ -123,7 +123,7 @@ public:
     void startup() override;
     void shutdown() override;
     void join() override;
-    Status schedule(Task task) override;
+    void schedule(Task task) override;
 
     /**
      * Blocks the caller until there are no pending tasks on this pool.

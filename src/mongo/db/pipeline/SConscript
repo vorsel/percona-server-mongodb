@@ -317,6 +317,7 @@ env.Library(
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/session_catalog',
         '$BUILD_DIR/mongo/db/storage/backup_cursor_hooks',
+        '$BUILD_DIR/mongo/db/transaction',
     ],
 )
 
@@ -326,6 +327,7 @@ env.Library(
         'process_interface_shardsvr.cpp',
     ],
     LIBDEPS=[
+        '$BUILD_DIR/mongo/db/transaction',
         '$BUILD_DIR/mongo/s/sharding_api',
         'process_interface_standalone',
         'sharded_agg_helpers',
@@ -593,6 +595,7 @@ env.Library(
         env.Idlc('document_source_list_sessions.idl')[0],
         env.Idlc('document_source_out.idl')[0],
         env.Idlc('exchange_spec.idl')[0],
+        env.Idlc('runtime_constants.idl')[0],
         'resume_token.cpp',
     ],
     LIBDEPS=[
@@ -610,5 +613,14 @@ env.CppUnitTest(
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/auth/authmocks',
         'document_sources_idl',
+    ],
+)
+
+env.CppUnitTest(
+    target='pipeline_metadata_tree_test',
+    source='pipeline_metadata_tree_test.cpp',
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/service_context_test_fixture',
+        'pipeline',
     ],
 )

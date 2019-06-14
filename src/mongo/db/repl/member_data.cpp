@@ -122,46 +122,65 @@ void MemberData::setAuthIssue(Date_t now) {
     _lastResponse.setSyncingTo(HostAndPort());
 }
 
-void MemberData::setLastAppliedOpTime(OpTime opTime, Date_t now) {
+void MemberData::setLastAppliedOpTimeAndWallTime(OpTimeAndWallTime opTime, Date_t now) {
     _lastUpdate = now;
     _lastUpdateStale = false;
-    _lastAppliedOpTime = opTime;
+    _lastAppliedOpTime = opTime.opTime;
+    _lastAppliedWallTime = opTime.wallTime;
 }
 
-void MemberData::setLastDurableOpTime(OpTime opTime, Date_t now) {
+void MemberData::setLastAppliedOpTime(OpTime opTime, Date_t now) {
+    setLastAppliedOpTimeAndWallTime({opTime, Date_t::min()}, now);
+}
+
+void MemberData::setLastDurableOpTimeAndWallTime(OpTimeAndWallTime opTime, Date_t now) {
     _lastUpdate = now;
     _lastUpdateStale = false;
-    if (_lastAppliedOpTime < opTime) {
+    if (_lastAppliedOpTime < opTime.opTime) {
         // TODO(russotto): We think this should never happen, rollback or no rollback.  Make this an
         // invariant and see what happens.
-        log() << "Durable progress (" << opTime << ") is ahead of the applied progress ("
+        log() << "Durable progress (" << opTime.opTime << ") is ahead of the applied progress ("
               << _lastAppliedOpTime << ". This is likely due to a "
                                        "rollback."
               << " memberid: " << _memberId << _hostAndPort.toString()
               << " previous durable progress: " << _lastDurableOpTime;
     } else {
-        _lastDurableOpTime = opTime;
+        _lastDurableOpTime = opTime.opTime;
+        _lastDurableWallTime = opTime.wallTime;
     }
 }
 
-bool MemberData::advanceLastAppliedOpTime(OpTime opTime, Date_t now) {
+void MemberData::setLastDurableOpTime(OpTime opTime, Date_t now) {
+    setLastDurableOpTimeAndWallTime({opTime, Date_t::min()}, now);
+}
+
+bool MemberData::advanceLastAppliedOpTimeAndWallTime(OpTimeAndWallTime opTime, Date_t now) {
     _lastUpdate = now;
     _lastUpdateStale = false;
-    if (_lastAppliedOpTime < opTime) {
-        setLastAppliedOpTime(opTime, now);
+    if (_lastAppliedOpTime < opTime.opTime) {
+        setLastAppliedOpTimeAndWallTime(opTime, now);
+        return true;
+    }
+    return false;
+}
+
+bool MemberData::advanceLastAppliedOpTime(OpTime opTime, Date_t now) {
+    return advanceLastAppliedOpTimeAndWallTime({opTime, Date_t::min()}, now);
+}
+
+bool MemberData::advanceLastDurableOpTimeAndWallTime(OpTimeAndWallTime opTime, Date_t now) {
+    _lastUpdate = now;
+    _lastUpdateStale = false;
+    if (_lastDurableOpTime < opTime.opTime) {
+        _lastDurableOpTime = opTime.opTime;
+        _lastDurableWallTime = opTime.wallTime;
         return true;
     }
     return false;
 }
 
 bool MemberData::advanceLastDurableOpTime(OpTime opTime, Date_t now) {
-    _lastUpdate = now;
-    _lastUpdateStale = false;
-    if (_lastDurableOpTime < opTime) {
-        setLastDurableOpTime(opTime, now);
-        return true;
-    }
-    return false;
+    return advanceLastDurableOpTimeAndWallTime({opTime, Date_t::min()}, now);
 }
 
 }  // namespace repl

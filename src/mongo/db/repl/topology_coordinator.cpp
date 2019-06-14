@@ -823,7 +823,7 @@ bool TopologyCoordinator::haveNumNodesReachedOpTime(const OpTime& targetOpTime,
     }
 
     for (auto&& memberData : _memberData) {
-        const auto isArbiter = _rsConfig.getMemberAt(memberData.getMemberId()).isArbiter();
+        const auto isArbiter = _rsConfig.getMemberAt(memberData.getConfigIndex()).isArbiter();
 
         // We do not count arbiters towards the write concern.
         if (isArbiter) {
@@ -957,9 +957,14 @@ OpTime TopologyCoordinator::getMyLastAppliedOpTime() const {
     return _selfMemberData().getLastAppliedOpTime();
 }
 
-void TopologyCoordinator::setMyLastAppliedOpTime(OpTime opTime,
-                                                 Date_t now,
-                                                 bool isRollbackAllowed) {
+OpTimeAndWallTime TopologyCoordinator::getMyLastAppliedOpTimeAndWallTime() const {
+    return {_selfMemberData().getLastAppliedOpTime(), _selfMemberData().getLastAppliedWallTime()};
+}
+
+void TopologyCoordinator::setMyLastAppliedOpTimeAndWallTime(OpTimeAndWallTime opTimeAndWallTime,
+                                                            Date_t now,
+                                                            bool isRollbackAllowed) {
+    auto opTime = opTimeAndWallTime.opTime;
     auto& myMemberData = _selfMemberData();
     auto myLastAppliedOpTime = myMemberData.getLastAppliedOpTime();
 
@@ -972,19 +977,24 @@ void TopologyCoordinator::setMyLastAppliedOpTime(OpTime opTime,
                   myLastAppliedOpTime.getTerm() == OpTime::kUninitializedTerm ||
                   opTime.getTimestamp() > myLastAppliedOpTime.getTimestamp());
     }
-    myMemberData.setLastAppliedOpTime(opTime, now);
+    myMemberData.setLastAppliedOpTimeAndWallTime(opTimeAndWallTime, now);
 }
 
 OpTime TopologyCoordinator::getMyLastDurableOpTime() const {
     return _selfMemberData().getLastDurableOpTime();
 }
 
-void TopologyCoordinator::setMyLastDurableOpTime(OpTime opTime,
-                                                 Date_t now,
-                                                 bool isRollbackAllowed) {
+OpTimeAndWallTime TopologyCoordinator::getMyLastDurableOpTimeAndWallTime() const {
+    return {_selfMemberData().getLastDurableOpTime(), _selfMemberData().getLastDurableWallTime()};
+}
+
+void TopologyCoordinator::setMyLastDurableOpTimeAndWallTime(OpTimeAndWallTime opTimeAndWallTime,
+                                                            Date_t now,
+                                                            bool isRollbackAllowed) {
+    auto opTime = opTimeAndWallTime.opTime;
     auto& myMemberData = _selfMemberData();
     invariant(isRollbackAllowed || opTime >= myMemberData.getLastDurableOpTime());
-    myMemberData.setLastDurableOpTime(opTime, now);
+    myMemberData.setLastDurableOpTimeAndWallTime(opTimeAndWallTime, now);
 }
 
 StatusWith<bool> TopologyCoordinator::setLastOptime(const UpdatePositionArgs::UpdateInfo& args,
@@ -1411,7 +1421,9 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
     const MemberState myState = getMemberState();
     const Date_t now = rsStatusArgs.now;
     const OpTime lastOpApplied = getMyLastAppliedOpTime();
+    const Date_t lastOpAppliedWall = getMyLastAppliedOpTimeAndWallTime().wallTime;
     const OpTime lastOpDurable = getMyLastDurableOpTime();
+    const Date_t lastOpDurableWall = getMyLastDurableOpTimeAndWallTime().wallTime;
     const BSONObj& initialSyncStatus = rsStatusArgs.initialSyncStatus;
     const boost::optional<Timestamp>& lastStableRecoveryTimestamp =
         rsStatusArgs.lastStableRecoveryTimestamp;
@@ -1585,8 +1597,12 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
         rsStatusArgs.readConcernMajorityOpTime.append(&optimes, "readConcernMajorityOpTime");
     }
 
+
     appendOpTime(&optimes, "appliedOpTime", lastOpApplied);
     appendOpTime(&optimes, "durableOpTime", lastOpDurable);
+    optimes.appendDate("lastAppliedWallTime", lastOpAppliedWall);
+    optimes.appendDate("lastDurableWallTime", lastOpDurableWall);
+
     response->append("optimes", optimes.obj());
     if (lastStableRecoveryTimestamp) {
         // Only include this field if the storage engine supports RTT.
@@ -2133,6 +2149,10 @@ MemberState TopologyCoordinator::getMemberState() const {
     return _followerMode;
 }
 
+std::vector<MemberData> TopologyCoordinator::getMemberData() const {
+    return _memberData;
+}
+
 bool TopologyCoordinator::canAcceptWrites() const {
     return _leaderMode == LeaderMode::kMaster;
 }
@@ -2387,24 +2407,16 @@ bool TopologyCoordinator::updateLastCommittedOpTime() {
     // need the majority to have this OpTime
     OpTime committedOpTime =
         votingNodesOpTimes[votingNodesOpTimes.size() - _rsConfig.getWriteMajority()];
-    return advanceLastCommittedOpTime(committedOpTime);
+
+    const bool fromSyncSource = false;
+    return advanceLastCommittedOpTime(committedOpTime, fromSyncSource);
 }
 
-bool TopologyCoordinator::advanceLastCommittedOpTime(const OpTime& committedOpTime) {
+bool TopologyCoordinator::advanceLastCommittedOpTime(OpTime committedOpTime, bool fromSyncSource) {
     if (_selfIndex == -1) {
         // The config hasn't been installed or we are not in the config. This could happen
         // on heartbeats before installing a config.
         return false;
-    }
-
-    if (committedOpTime == _lastCommittedOpTime) {
-        return false;  // Hasn't changed, so ignore it.
-    }
-
-    if (committedOpTime < _lastCommittedOpTime) {
-        LOG(1) << "Ignoring older committed snapshot optime: " << committedOpTime
-               << ", currentCommittedOpTime: " << _lastCommittedOpTime;
-        return false;  // This may have come from an out-of-order heartbeat. Ignore it.
     }
 
     // This check is performed to ensure primaries do not commit an OpTime from a previous term.
@@ -2415,12 +2427,26 @@ bool TopologyCoordinator::advanceLastCommittedOpTime(const OpTime& committedOpTi
     }
 
     // Arbiters don't have data so they always advance their commit point via heartbeats.
-    // Otherwise, only update the commit point if it's on the same oplog branch as our last applied.
     if (!_selfConfig().isArbiter() &&
         getMyLastAppliedOpTime().getTerm() != committedOpTime.getTerm()) {
-        LOG(1) << "Ignoring commit point with different term than my lastApplied, since it may "
-                  "not be on the same oplog branch as mine. optime: "
-               << committedOpTime << ", my last applied: " << getMyLastAppliedOpTime();
+        if (fromSyncSource) {
+            committedOpTime = std::min(committedOpTime, getMyLastAppliedOpTime());
+        } else {
+            LOG(1) << "Ignoring commit point with different term than my lastApplied, since it "
+                      "may "
+                      "not be on the same oplog branch as mine. optime: "
+                   << committedOpTime << ", my last applied: " << getMyLastAppliedOpTime();
+            return false;
+        }
+    }
+
+    if (committedOpTime == _lastCommittedOpTime) {
+        return false;  // Hasn't changed, so ignore it.
+    }
+
+    if (committedOpTime < _lastCommittedOpTime) {
+        LOG(1) << "Ignoring older committed snapshot optime: " << committedOpTime
+               << ", currentCommittedOpTime: " << _lastCommittedOpTime;
         return false;
     }
 

@@ -47,7 +47,7 @@
     session.startTransaction();
     assert.commandWorked(sessionColl.insert({x: 1000}));
 
-    const prepareTimestamp = PrepareHelpers.prepareTransaction(session);
+    const prepareTimestamp = PrepareHelpers.prepareTransaction(session, {w: 1});
 
     jsTestLog("Unblocking index build.");
 
@@ -63,7 +63,7 @@
 
     jsTestLog("Committing txn");
     // Commit the transaction.
-    assert.commandWorked(PrepareHelpers.commitTransactionAfterPrepareTS(session, prepareTimestamp));
+    assert.commandWorked(PrepareHelpers.commitTransaction(session, prepareTimestamp));
     replTest.awaitReplication();
 
     jsTestLog("Testing index integrity");

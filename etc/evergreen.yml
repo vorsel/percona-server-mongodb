@@ -292,8 +292,7 @@ variables:
     # We invoke SCons using --jobs = (# of CPUs / 4) to avoid causing out of memory errors due to
     # spawning a large number of linker processes.
     num_scons_link_jobs_available: $(( $(grep -c ^processor /proc/cpuinfo) / 4 ))
-    python: python
-    python3: '/cygdrive/c/python/python36/python.exe'
+    python: '/cygdrive/c/python/python36/python.exe'
     ext: zip
     use_scons_cache: true
     multiversion_platform: windows
@@ -305,13 +304,13 @@ variables:
   tasks:
   - name: compile_all_run_unittests_TG
     requires:
-    - name: burn_in_tests
+    - name: burn_in_tests_gen
     distros:
     - windows-64-vs2017-compile
   - name: compile_benchmarks
     distros:
     - windows-64-vs2017-compile
-  - name: burn_in_tests
+  - name: burn_in_tests_gen
   - name: aggregation_multiversion_fuzzer_gen
   - name: aggregation_wildcard_fuzzer_gen
   - name: audit
@@ -378,6 +377,52 @@ variables:
   teardown_group:
     - func: "scons cache pruning"
     - func: "umount shared scons directory"
+
+# List of all variants that make mongocryptd
+# If a variant is listed here and has a push task, mongocryptd is pushed
+- mongocryptd_variants: &mongocryptd_variants
+  - enterprise-amazon2
+  - enterprise-debian81-64
+  - enterprise-debian92-64
+  - enterprise-linux-64-amazon-ami
+  - enterprise-macos
+  - enterprise-macos-openssl
+  - enterprise-rhel-62-64-bit
+  - enterprise-rhel-62-64-bit-coverage
+  - enterprise-rhel-62-64-bit-inmem
+  - enterprise-rhel-62-64-bit-majority-read-concern-off
+  - enterprise-rhel-62-64-bit-required-inmem
+  - enterprise-rhel-62-64-bit-required-majority-read-concern-off
+  - enterprise-rhel-67-s390x
+  - enterprise-rhel-70-64-bit
+  - enterprise-rhel-70-64-bit-kitchen-sink
+  - enterprise-rhel-71-ppc64le
+  - enterprise-rhel-71-ppc64le-inmem
+  - enterprise-rhel-72-s390x
+  - enterprise-rhel-72-s390x-inmem
+  - enterprise-suse12-64
+  - enterprise-suse12-s390x
+  - enterprise-ubuntu-dynamic-1604-64-bit
+  - enterprise-ubuntu-dynamic-1604-clang
+  - enterprise-ubuntu1604-64
+  - enterprise-ubuntu1604-arm64
+  - enterprise-ubuntu1604-s390x
+  - enterprise-ubuntu1804-64
+  - enterprise-ubuntu1804-arm64
+  - enterprise-ubuntu1804-ppc64le
+  - enterprise-ubuntu1804-s390x
+  - enterprise-windows-64-2k8
+  - enterprise-windows-64-2k8-async
+  - enterprise-windows-64-2k8-compile-all
+  - enterprise-windows-64-2k8-debug-unoptimized
+  - enterprise-windows-64-2k8-inmem
+  - enterprise-windows-64-2k8-nopush-template
+  - enterprise-windows-64-2k8-openssl
+  - enterprise-windows-64-2k8-wtdevelop
+  - ubuntu1804-debug-asan
+  - ubuntu1804-debug-ubsan
+  - ubuntu1804-debug-aubsan-lite
+  - ubuntu1804-debug-aubsan-async
 
 #######################################
 #            Functions                #
@@ -639,9 +684,9 @@ functions:
           chmod 0600 ${private_key_file|/dev/null}
         fi
 
-        if [ ! -d ~.aws ]; then
-          mkdir -p ~/.aws
-        fi
+        # Ensure a clean aws configuration state
+        rm -rf ~/.aws
+        mkdir -p ~/.aws
 
         # If ${aws_profile_remote} is not specified then the config & credentials are
         # stored in the 'default' profile.
@@ -749,7 +794,7 @@ functions:
             set -o errexit
             set -o verbose
             if [ "${build_openssl|}" = "true" ]; then
-                bash buildscripts/fetch_and_build_openssl.sh "${python|python}" "${openssl_make_flags|}" "${openssl_config_flags|}"
+                bash buildscripts/fetch_and_build_openssl.sh "${python|python3}" "${openssl_make_flags|}" "${openssl_config_flags|}"
             fi
 
   "use WiredTiger develop":
@@ -978,6 +1023,9 @@ functions:
             "../../../../../../mongo-tools/$i${exe|}" --version
         done
 
+        mkdir -p ../../../../../../mongo-tools/distsrc
+        cp THIRD-PARTY-NOTICES ../../../../../../mongo-tools/distsrc/THIRD-PARTY-NOTICES.gotools
+
   "get modified patch files":
     command: shell.exec
     params:
@@ -1009,7 +1057,7 @@ functions:
         set -o errexit
 
         ${activate_virtualenv}
-        python2 -m pip install -r etc/pip/evgtest-requirements.txt
+        python -m pip install -r etc/pip/evgtest-requirements.txt
 
   "determine resmoke jobs": &determine_resmoke_jobs
     command: shell.exec
@@ -1080,6 +1128,7 @@ functions:
         # For patch builds determine if we can bypass compile.
         if [[ "${is_patch}" = "true" && "${task_name}" = "compile" ]]; then
           ${activate_virtualenv}
+          $python -m pip install -r etc/pip/constraints.txt
           $python buildscripts/bypass_compile_and_fetch_binaries.py            \
             --project ${project}                                               \
             --buildVariant ${build_variant}                                    \
@@ -1133,30 +1182,19 @@ functions:
 
           virtualenv_loc=$(which ${virtualenv|virtualenv})
 
-          python2_loc=$(which ${python|/opt/mongodbtoolchain/v3/bin/python2})
-          python3_loc=$(which ${python3|/opt/mongodbtoolchain/v3/bin/python3})
-          venv2_dir="${workdir}/venv"
-          venv3_dir="${workdir}/venv_3"
+          python_loc=$(which ${python|/opt/mongodbtoolchain/v3/bin/python3})
+          venv_dir="${workdir}/venv"
           if command -V cygpath; then
             # Sad note: We have to use the Windows path instead of the posix path here.
             # Otherwise, virtualenv may mistakenly resolve paths relative to c:\cygdrive.
-            python2_loc=$(cygpath -w $python2_loc)
-            python3_loc=$(cygpath -w $python3_loc)
-            venv2_dir="$(cygpath -w "$venv2_dir")"
-            venv3_dir="$(cygpath -w "$venv3_dir")"
+            python_loc=$(cygpath -w $python_loc)
+            venv_dir="$(cygpath -w "$venv_dir")"
           fi
 
           # Set up virtualenvs in ${workdir}
-          "$virtualenv_loc" --python "$python2_loc" --system-site-packages "$venv2_dir"
-          "$virtualenv_loc" --python "$python3_loc" --system-site-packages "$venv3_dir"
+          "$virtualenv_loc" --python "$python_loc" --system-site-packages "$venv_dir"
 
-          # Link python2/python3 in the primary virtualenv bin dir
           export VIRTUAL_ENV_DISABLE_PROMPT=yes
-          venv2_bin="$(dirname "$(cd "$venv2_dir"; . ./*/activate; which python)")"
-          py2_exe="$(cd "$venv2_dir"; . ./*/activate; which python)"
-          py3_exe="$(cd "$venv3_dir"; . ./*/activate; which python)"
-          if [[ ! -f $venv2_bin/python2 ]]; then ln -sfv "$py2_exe" "$venv2_bin/python2"; fi
-          if [[ ! -f $venv2_bin/python3 ]]; then ln -sfv "$py3_exe" "$venv2_bin/python3"; fi
 
   "execute resmoke tests": &execute_resmoke_tests
     command: shell.exec
@@ -1450,7 +1488,7 @@ functions:
 
         ${activate_virtualenv}
 
-        python2 -m pip install -r ./etc/pip/compile-requirements.txt
+        python -m pip install -r ./etc/pip/compile-requirements.txt
         ${compile_env|} $python ./buildscripts/scons.py                                     \
             ${compile_flags|} ${task_compile_flags|} ${task_compile_flags_extra|}           \
             ${scons_cache_args|} $extra_args                                                \
@@ -1482,6 +1520,8 @@ functions:
         fi
 
         ${activate_virtualenv}
+        python -m pip install -r etc/pip/compile-requirements.txt
+
         # shared scons cache testing
         # if 'scons_cache_scope' enabled and project level 'disable_shared_scons_cache' is not true
         # 'scons_cache_scope' is set on a per variant basis
@@ -1902,8 +1942,7 @@ functions:
         set -o verbose
 
         ${activate_virtualenv}
-        # The Windows build variants are running python 2.7.3 and require TLS 1.2 from pyOpenSSL
-        python2 -m pip install 'pyOpenSSL ; sys_platform == "win32" or sys_platform == "cygwin"'
+        python -m pip install -r etc/pip/core-requirements.txt
 
         rm -rf /data/install /data/multiversion
         $python buildscripts/setup_multiversion_mongodb.py   \
@@ -2108,7 +2147,7 @@ functions:
 
           set -o errexit
           ${activate_virtualenv}
-          python2 -m pip install -r etc/pip/powercycle-requirements.txt
+          python -m pip install -r etc/pip/powercycle-requirements.txt
 
           if [ ! -z "${subnet_id}" ]; then
             subnet_id="-n ${subnet_id}"
@@ -2260,7 +2299,7 @@ functions:
         script: |
           set -o errexit
           # Set up virtualenv on remote.
-          cmds="python_loc=\$(which \${python|/opt/mongodbtoolchain/v3/bin/python2})"
+          cmds="python_loc=\$(which \${python|/opt/mongodbtoolchain/v3/bin/python3})"
           cmds="$cmds; remote_dir=${remote_dir|.}"
           cmds="$cmds; if [ \"Windows_NT\" = \"$OS\" ]; then python_loc=\$(cygpath -w \$python_loc); remote_dir=\$(cygpath -w \$remote_dir); fi"
           cmds="$cmds; virtualenv --python \$python_loc --system-site-packages ${virtualenv_dir|venv}"
@@ -2723,30 +2762,15 @@ functions:
             fi
             python=python
           else
-            python=${python|/opt/mongodbtoolchain/v3/bin/python2}
+            python=${python|/opt/mongodbtoolchain/v3/bin/python3}
           fi
-          echo "python set to $(which $python)"
-      - key: activate_virtualenv_3
-        value: |
-          # check if virtualenv for python3 is set up
-          if [ -d "${workdir}/venv_3" ]; then
-            if [ "Windows_NT" = "$OS" ]; then
-              # Need to quote the path on Windows to preserve the separator.
-              . "${workdir}/venv_3/Scripts/activate" 2> /tmp/activate_error.log
-            else
-              . ${workdir}/venv_3/bin/activate 2> /tmp/activate_error.log
-            fi
-            if [ $? -ne 0 ]; then
-              echo "Failed to activate virtualenv: $(cat /tmp/activate_error.log)"
-            fi
-            python=python
+
+          if [ "Windows_NT" = "$OS" ]; then
+            export PYTHONPATH="$PYTHONPATH;$(cygpath -w ${workdir}/src)"
           else
-            if [ "Windows_NT" = "$OS" ]; then
-              python=/cygdrive/c/python/python36/python
-            else
-              python=${python3|/opt/mongodbtoolchain/v3/bin/python3}
-            fi
+            export PYTHONPATH="$PYTHONPATH:${workdir}/src"
           fi
+
           echo "python set to $(which $python)"
       - key: posix_workdir
         value: eval 'if [ "Windows_NT" = "$OS" ]; then echo $(cygpath -u "${workdir}"); else echo ${workdir}; fi'
@@ -3296,6 +3320,7 @@ post:
   - func: "save disk statistics"
   - func: "save system resource information"
   - func: "print OOM messages"
+  - func: "umount shared scons directory"
   - func: "cleanup FUSE watchdog"
   - func: "cleanup environment"
 
@@ -3317,7 +3342,7 @@ timeout:
 ##   - Non standard jstests, i.e., jstestfuzz
 ## Note that the task name supports glob patterns.
 test_lifecycle_excluded_tasks:
-- burn_in_tests
+- burn_in_tests*
 - compile*
 - benchmarks*
 - dbtest*
@@ -3341,7 +3366,7 @@ tasks:
     - func: "build new tools"
     - func: "scons compile"
       vars:
-        targets: core tools integration_tests dist dist-debugsymbols distsrc-${ext|tgz} ${msi_target|}
+        targets: core tools dist dist-debugsymbols distsrc-${ext|tgz} ${msi_target|}
         task_compile_flags: >-
           --use-new-tools
           --build-mongoreplay="${build_mongoreplay}"
@@ -3385,7 +3410,6 @@ tasks:
           # If strip is on the path (everywhere except windows) then we should strip the test binaries
           # before tarring them up
           if [ -x ${strip_path|/usr/bin/strip} ]; then
-            cat build/integration_tests.txt | xargs ${strip_command|/usr/bin/strip}
             ${strip_command|/usr/bin/strip} mongobridge
             ${strip_command|/usr/bin/strip} wt
           fi
@@ -3421,8 +3445,11 @@ tasks:
           cd cryptd-archive
           ${platform_decompress|tar xzvf} ../mongodb-binaries.tgz
           find . -mindepth 3 ! -name "mongocryptd${exe}" -type f -exec rm {} \; # delete bin/* except bin/mongocryptd
-          if [ $(find . -name mongocryptd | wc -l) -eq 1 ] ; then
+          if [ $(find . -name mongocryptd${exe} | wc -l) -eq 1 ] ; then
             $python ../buildscripts/make_archive.py -o mongodb-cryptd.${ext|tgz} $(find mongodb-* -type f)
+
+            # Validate that this build_variant is listed as a known enterprise task for mongocryptd
+            $python ../buildscripts/validate_mongocryptd.py --variant "${build_variant}" ../etc/evergreen.yml
           fi
           cd ..
 
@@ -3460,8 +3487,6 @@ tasks:
           - "./etc/repo_config.yaml"
           - "./etc/test_lifecycle.yml"
           - "./etc/test_retrial.yml"
-          - "./build/integration_tests/**"
-          - "./build/integration_tests.txt"
           - "./build/**.gcno"
           - "repo/**"
           - "src/mongo/util/options_parser/test_config_files/**"
@@ -3489,7 +3514,7 @@ tasks:
         optional: true
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
-        local_file: src/cryptd-archive/mongodb-cryptd.tgz
+        local_file: src/cryptd-archive/mongodb-cryptd.${ext|tgz}
         remote_file: ${mongo_cryptd}
         bucket: mciuploads
         permissions: public-read
@@ -4543,8 +4568,7 @@ tasks:
           set -o verbose
 
           ${activate_virtualenv}
-          python3 -m pip install -I -r etc/pip/lint-requirements.txt
-          python2 -m pip install -I -r etc/pip/lint-requirements.txt
+          python -m pip install -I -r etc/pip/lint-requirements.txt
           export MYPY="$(
             if command -V cygpath 2>/dev/null; then
                 PATH+=":$(cypath "${workdir}")/venv_3/Scripts"
@@ -4555,7 +4579,7 @@ tasks:
             which mypy
           )"
           echo "Found mypy executable at '$MYPY'"
-          ${compile_env|} python2 ./buildscripts/scons.py ${compile_flags|} --stack-size=1024 lint
+          ${compile_env|} python3 ./buildscripts/scons.py ${compile_flags|} --stack-size=1024 lint
 
 - name: lint_yaml
   depends_on: []
@@ -4595,24 +4619,23 @@ tasks:
         ${activate_virtualenv}
         # This installs the explicit project versions which would be installed in the toolchain
         # from this patch
-        python2 -m pip install -I -r etc/pip/constraints.txt
-        python3 -m pip install -I -r etc/pip/constraints.txt
+        python -m pip install -I -r etc/pip/constraints.txt
 
-        python2 -m pip freeze >requirements.txt.python2.old
-        python3 -m pip freeze >requirements.txt.python3.old
+        python -m pip freeze >requirements.txt.python3.old
 
         # This installs any requirements which are unsatisfied by the constraints.txt above
-        python2 -m pip install -r etc/pip/toolchain-requirements.txt
-        python3 -m pip install -r etc/pip/toolchain-requirements.txt
+        python -m pip install -r etc/pip/toolchain-requirements.txt
 
-        python2 -m pip freeze >requirements.txt.python2.new
-        python3 -m pip freeze >requirements.txt.python3.new
+        python -m pip freeze >requirements.txt.python3.new
 
         # Compare the old freezes to the new freezes.
         # They should be the same if our constraints satisfy our toolchain requirements
-        diff -w requirements.txt.python2.old requirements.txt.python2.new
         diff -w requirements.txt.python3.old requirements.txt.python3.new
 
+### This task is deprecated, but left in here in case of need to run burn_in_tests
+### instead of the generated task:
+###  - Rename burn_in_tests_gen task to burn_in_tests_gen_UNUSED
+###  - Rename burn_in_tests_gen to burn_in_tests on the build variants
 - <<: *task_template
   name: burn_in_tests
   depends_on:
@@ -4655,6 +4678,61 @@ tasks:
       task_path_suffix: /data/multiversion:$HOME
       resmoke_wrapper: $python buildscripts/burn_in_tests.py --testListFile=jstests/new_tests.json
       resmoke_args: --repeatSuites=2
+###
+
+- name: burn_in_tests_gen
+  commands:
+  - func: "git get project"
+    # The repository is cloned in a directory distinct from src for the modified test detection
+    # because the extraction of the artifacts performed in the 'do setup' causes
+    # 'git diff --name-only' to see all tests as modified on Windows (git 1.9.5). See SERVER-30634.
+    vars:
+      git_project_directory: burn_in_tests_clonedir
+  - command: shell.exec
+    params:
+      working_dir: burn_in_tests_clonedir
+      shell: bash
+      script: |
+        set -o errexit
+        set -o verbose
+        mkdir ../src
+        ${activate_virtualenv}
+        $python -m pip install -r etc/pip/evgtest-requirements.txt
+        # If this is a scheduled build, we check for changes against the last scheduled commit.
+        if [ "${is_patch}" != "true" ]; then
+          burn_in_args="--checkEvergreen"
+        fi
+        # Capture a list of new and modified tests. The expansion macro burn_in_tests_build_variant
+        # is used to for finding the associated tasks from a different build varaint than the
+        # burn_in_tests_gen task executes on.
+        build_variant_opts="--buildVariant=${build_variant}"
+        if [ -n "${burn_in_tests_build_variant|}" ]; then
+          build_variant_opts="--buildVariant=${burn_in_tests_build_variant} --runBuildVariant=${build_variant}"
+        fi
+        # Increase the burn_in repetition from 2 to 1000 executions or 10 minutes
+        burn_in_args="$burn_in_args --repeatTestsMin=2 --repeatTestsMax=1000 --repeatTestsSecs=600"
+        # Evergreen executable is in $HOME.
+        PATH=$PATH:$HOME $python buildscripts/burn_in_tests.py --branch=${branch_name} $build_variant_opts --distro=${distro_id} --generateTasksFile=../src/burn_in_tests_gen.json --noExec $burn_in_args
+  - command: archive.targz_pack
+    params:
+      target: src/burn_in_tests_gen.tgz
+      source_dir: src
+      include:
+        - burn_in_tests_gen.json
+  - command: s3.put
+    params:
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      local_file: src/burn_in_tests_gen.tgz
+      remote_file: ${project}/${build_variant}/${revision}/burn_in_tests_gen/burn_in_tests_gen-${build_id}.tgz
+      bucket: mciuploads
+      permissions: public-read
+      content_type: ${content_type|application/gzip}
+      display_name: Burn_in_tests Task Config - Execution ${execution}
+  - command: generate.tasks
+    params:
+      files:
+        - src/burn_in_tests_gen.json
 
 - <<: *benchmark_template
   name: benchmarks_orphaned
@@ -4871,6 +4949,19 @@ tasks:
       jepsen_storage_engine: --storage-engine wiredTiger
       jepsen_test_name: read-concern-majority
       jepsen_write_concern: --write-concern w1
+
+## initial sync generational fuzzer ##
+- <<: *jstestfuzz_template
+  name: initial_sync_fuzzer_gen
+  commands:
+  - func: "generate fuzzer tasks"
+    vars:
+      <<: *jstestfuzz_config_vars
+      num_files: 10
+      num_tasks: 5
+      npm_command: initsync-fuzzer
+      resmoke_args: --suites=initial_sync_fuzzer
+      name: initial_sync_fuzzer
 
 ## Standalone generational fuzzer for aggregation pipelines ##
 - <<: *jstestfuzz_template
@@ -5498,7 +5589,16 @@ tasks:
 - <<: *task_template
   name: integration_tests_standalone
   commands:
+  - func: "git get project"
   - func: "do setup"
+  - func: "generate compile expansions"  # Generate compile expansions needs to be run to mount the shared scons cache.
+  - func: "apply compile expansions"
+  - func: "scons compile"
+    vars:
+      targets: integration_tests
+      bypass_compile: false
+      task_compile_flags: >-
+        --detect-odr-violations
   - func: "run tests"
     vars:
       resmoke_args: --suites=integration_tests_standalone --storageEngine=wiredTiger
@@ -5506,7 +5606,16 @@ tasks:
 - <<: *task_template
   name: integration_tests_standalone_audit
   commands:
+  - func: "git get project"
   - func: "do setup"
+  - func: "generate compile expansions"  # Generate compile expansions needs to be run to mount the shared scons cache.
+  - func: "apply compile expansions"
+  - func: "scons compile"
+    vars:
+      targets: integration_tests
+      bypass_compile: false
+      task_compile_flags: >-
+        --detect-odr-violations
   - func: "run tests"
     vars:
       resmoke_args: --suites=integration_tests_standalone_audit --storageEngine=wiredTiger
@@ -5514,7 +5623,16 @@ tasks:
 - <<: *task_template
   name: integration_tests_replset
   commands:
+  - func: "git get project"
   - func: "do setup"
+  - func: "generate compile expansions"  # Generate compile expansions needs to be run to mount the shared scons cache.
+  - func: "apply compile expansions"
+  - func: "scons compile"
+    vars:
+      targets: integration_tests
+      bypass_compile: false
+      task_compile_flags: >-
+        --detect-odr-violations
   - func: "run tests"
     vars:
       resmoke_args: --suites=integration_tests_replset --storageEngine=wiredTiger
@@ -5522,7 +5640,16 @@ tasks:
 - <<: *task_template
   name: integration_tests_sharded
   commands:
+  - func: "git get project"
   - func: "do setup"
+  - func: "generate compile expansions"  # Generate compile expansions needs to be run to mount the shared scons cache.
+  - func: "apply compile expansions"
+  - func: "scons compile"
+    vars:
+      targets: integration_tests
+      bypass_compile: false
+      task_compile_flags: >-
+        --detect-odr-violations
   - func: "run tests"
     vars:
       resmoke_args: --suites=integration_tests_sharded --storageEngine=wiredTiger
@@ -5715,6 +5842,16 @@ tasks:
       use_large_distro: "true"
       resmoke_args: --storageEngine=wiredTiger
       fallback_num_sub_suites: 1
+
+- <<: *task_template
+  name: replica_sets_multi_oplog_txns_jscore_passthrough
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=replica_sets_multi_oplog_txns_jscore_passthrough --storageEngine=wiredTiger
 
 - <<: *task_template
   name: replica_sets_multi_stmt_txn_jscore_passthrough
@@ -6140,39 +6277,39 @@ tasks:
       resmoke_jobs_max: 1
 
 - <<: *task_template
-  name: concurrency_sharded_replication_multi_stmt_txn
+  name: concurrency_sharded_multi_stmt_txn
   commands:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=concurrency_sharded_replication_multi_stmt_txn --storageEngine=wiredTiger
+      resmoke_args: --suites=concurrency_sharded_multi_stmt_txn --storageEngine=wiredTiger
       resmoke_jobs_max: 1
 
 - <<: *task_template
-  name: concurrency_sharded_replication_multi_stmt_txn_with_balancer
+  name: concurrency_sharded_multi_stmt_txn_with_balancer
   commands:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=concurrency_sharded_replication_multi_stmt_txn_with_balancer --storageEngine=wiredTiger
+      resmoke_args: --suites=concurrency_sharded_multi_stmt_txn_with_balancer --storageEngine=wiredTiger
       resmoke_jobs_max: 1
 
 - <<: *task_template
-  name: concurrency_sharded_replication_local_read_write_multi_stmt_txn
+  name: concurrency_sharded_local_read_write_multi_stmt_txn
   commands:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=concurrency_sharded_replication_local_read_write_multi_stmt_txn --storageEngine=wiredTiger
+      resmoke_args: --suites=concurrency_sharded_local_read_write_multi_stmt_txn --storageEngine=wiredTiger
       resmoke_jobs_max: 1
 
 - <<: *task_template
-  name: concurrency_sharded_replication_local_read_write_multi_stmt_txn_with_balancer
+  name: concurrency_sharded_local_read_write_multi_stmt_txn_with_balancer
   commands:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=concurrency_sharded_replication_local_read_write_multi_stmt_txn_with_balancer --storageEngine=wiredTiger
+      resmoke_args: --suites=concurrency_sharded_local_read_write_multi_stmt_txn_with_balancer --storageEngine=wiredTiger
       resmoke_jobs_max: 1
 
 - <<: *task_template
@@ -6262,6 +6399,14 @@ tasks:
       use_large_distro: "true"
       resmoke_args: --storageEngine=wiredTiger
       fallback_num_sub_suites: 7
+
+- name: replica_sets_multi_oplog_txns_gen
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      task: replica_sets_multi_oplog_txns
+      resmoke_args: --storageEngine=wiredTiger
+      fallback_num_sub_suites: 1
 
 - <<: *task_template
   name: sasl
@@ -6635,8 +6780,8 @@ tasks:
         # We happen to pre-seed the core requirements in the toolchain,
         # but we have no way of doing so to Windows python3.6 installed via Chocolatey.
         if command -V cygpath; then
-            echo "Installing core requirements into Python at '${python3}'"
-            "$(cygpath "${python3}")" -mpip install -r etc/pip/core-requirements.txt
+            echo "Installing core requirements into Python at '${python}'"
+            "$(cygpath "${python}")" -mpip install -r etc/pip/core-requirements.txt
         fi
   - func: "run tests"
     vars:
@@ -6918,6 +7063,7 @@ tasks:
         remote_file: ${mongo_cryptd}
         bucket: mciuploads
         local_file: src/mongo-cryptd.tgz
+        build_variants: *mongocryptd_variants
     # Fetch the sources (on relevant variants only)
     - command: s3.get
       params:
@@ -6945,7 +7091,7 @@ tasks:
 
           mv mongo-binaries.tgz mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz}
           mv mongo-shell.tgz mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz}
-          mv mongo-cryptd.tgz mongodb-cryptd-${push_name}-${push_arch}-${suffix}.${ext|tgz}
+          mv mongo-cryptd.tgz mongodb-cryptd-${push_name}-${push_arch}-${suffix}.${ext|tgz} || true
           mv mongo-debugsymbols.tgz mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz} || true
           mv distsrc.${ext|tgz} mongodb-src-${src_suffix}.${ext|tar.gz} || true
           /usr/bin/find build/ -type f | grep msi$ | xargs -I original_filename cp original_filename mongodb-win32-${push_arch}-${suffix}.msi || true
@@ -6982,6 +7128,7 @@ tasks:
         permissions: public-read
         content_type: ${content_type|application/gzip}
         remote_file: ${push_path}-STAGE/${push_name}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}
+        build_variants: *mongocryptd_variants
     # Put the source tarball
     - command: s3.put
       params:
@@ -7038,6 +7185,7 @@ tasks:
         permissions: public-read
         content_type: ${content_type|application/gzip}
         remote_file: ${push_path}-STAGE/${push_name}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sig
+        build_variants: *mongocryptd_variants
 
     # Put the source tarball signature
     - command: s3.put
@@ -7107,6 +7255,7 @@ tasks:
         bucket: build-push-testing
         content_type: text/plain
         remote_file: ${push_path}-STAGE/${push_name}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha1
+        build_variants: *mongocryptd_variants
 
     # Put the source tarball sha1
     - command: s3.put
@@ -7176,6 +7325,7 @@ tasks:
         bucket: build-push-testing
         content_type: text/plain
         remote_file: ${push_path}-STAGE/${push_name}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha256
+        build_variants: *mongocryptd_variants
 
     # Put the source tarball sha256
     - command: s3.put
@@ -7245,6 +7395,7 @@ tasks:
         permissions: public-read
         content_type: text/plain
         remote_file: ${push_path}-STAGE/${push_name}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.md5
+        build_variants: *mongocryptd_variants
 
     # Put the source tarball md5
     - command: s3.put
@@ -7297,7 +7448,8 @@ tasks:
 
             #Cryptd
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}', 'bucket': 'build-push-testing'},
-               'destination': {'path': '${push_path}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}.${ext|tgz}', 'bucket': '${push_bucket}'}}
+               'destination': {'path': '${push_path}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}.${ext|tgz}', 'bucket': '${push_bucket}'},
+               'build_variants': *mongocryptd_variants}
 
             #Source tarball
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-src-${src_suffix}-${task_id}.${ext|tar.gz}', 'bucket': 'build-push-testing'},
@@ -7319,7 +7471,8 @@ tasks:
 
             #Cryptd Signature
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sig', 'bucket': 'build-push-testing'},
-               'destination': {'path': '${push_path}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sig', 'bucket': '${push_bucket}'}}
+               'destination': {'path': '${push_path}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sig', 'bucket': '${push_bucket}'},
+               'build_variants': *mongocryptd_variants}
 
             #Source tarball signature
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-src-${src_suffix}-${task_id}.${ext|tar.gz}.sig', 'bucket': 'build-push-testing'},
@@ -7336,7 +7489,8 @@ tasks:
 
             #SHA1 for cryptd
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha1', 'bucket': 'build-push-testing'},
-               'destination': {'path': '${push_path}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sha1', 'bucket': '${push_bucket}'}}
+               'destination': {'path': '${push_path}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sha1', 'bucket': '${push_bucket}'},
+               'build_variants': *mongocryptd_variants}
 
             #SHA1 for source tarball
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-src-${src_suffix}-${task_id}.${ext|tar.gz}.sha1', 'bucket': 'build-push-testing'},
@@ -7358,7 +7512,8 @@ tasks:
 
             #SHA256 for cryptd
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha256', 'bucket': 'build-push-testing'},
-               'destination': {'path': '${push_path}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sha256', 'bucket': '${push_bucket}'}}
+               'destination': {'path': '${push_path}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sha256', 'bucket': '${push_bucket}'},
+               'build_variants': *mongocryptd_variants}
 
             #SHA256 for source tarball
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-src-${src_suffix}-${task_id}.${ext|tar.gz}.sha256', 'bucket': 'build-push-testing'},
@@ -7380,7 +7535,8 @@ tasks:
 
             #MD5 for cryptd
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.md5', 'bucket': 'build-push-testing'},
-               'destination': {'path': '${push_path}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}.${ext|tgz}.md5', 'bucket': '${push_bucket}'}}
+               'destination': {'path': '${push_path}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}.${ext|tgz}.md5', 'bucket': '${push_bucket}'},
+               'build_variants': *mongocryptd_variants}
 
             #MD5 for source tarball
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-src-${src_suffix}-${task_id}.${ext|tar.gz}.md5', 'bucket': 'build-push-testing'},
@@ -7463,7 +7619,7 @@ tasks:
         set -o verbose
 
         ${activate_virtualenv}
-        python2 -m pip install -r etc/pip/jira-requirements.txt
+        python -m pip install -r etc/pip/jira-requirements.txt
 
         # We use a small batch size to avoid hitting the load balancer timeout if the Evergreen
         # API query is not fast enough.
@@ -7582,10 +7738,9 @@ buildvariants:
     compile_flags: -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars --enable-free-mon=off --enable-http-client=off
     test_flags: >-
       --excludeWithAnyTags=requires_http_client
-      --repeatSuites=5
+      --repeatSuites=10
       --shuffle
-    # TODO: SERVER-39479 Increase the number of executions back to 10
-    resmoke_repeat_suites: 5
+    resmoke_repeat_suites: 10
     # TODO: There are currently 2 ways of repeating suites, one for regular suites and one for
     # generated suites. Once everything is converted to generated suites, we should remove the
     # '--repeatSuites=10' from the test_flags. This will be done in SERVER-38817.
@@ -7600,8 +7755,14 @@ buildvariants:
     distros:
     - rhel62-large
   - name: integration_tests_standalone
+    distros:
+    - rhel62-large
   - name: integration_tests_replset
+    distros:
+    - rhel62-large
   - name: integration_tests_sharded
+    distros:
+    - rhel62-large
   - name: jsCore
   - name: jsCore_txns
   - name: logical_session_cache_replication_100ms_refresh_jscore_passthrough_gen
@@ -7630,18 +7791,6 @@ buildvariants:
   - name: concurrency_sharded_replication
     distros:
     - rhel62-large
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #  distros:
-  #  - rhel62-large
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
-  #  distros:
-  #  - rhel62-large
-  #- name: concurrency_sharded_replication_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #  distros:
-  #  - rhel62-large
-  #- name: concurrency_sharded_replication_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
-  #  distros:
-  #  - rhel62-large
   - name: concurrency_sharded_replication_with_balancer
     distros:
     - rhel62-large
@@ -7698,13 +7847,13 @@ buildvariants:
   - name: concurrency_replication_causal_consistency
   - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_sharded_causal_consistency_gen
   - name: concurrency_sharded_causal_consistency_and_balancer
+  - name: concurrency_sharded_local_read_write_multi_stmt_txn
+  - name: concurrency_sharded_local_read_write_multi_stmt_txn_with_balancer
+  - name: concurrency_sharded_multi_stmt_txn
+  - name: concurrency_sharded_multi_stmt_txn_with_balancer
   - name: concurrency_sharded_with_stepdowns
   - name: concurrency_sharded_with_stepdowns_and_balancer
   - name: concurrency_simultaneous
@@ -7753,8 +7902,12 @@ buildvariants:
   - name: replica_sets_initsync_jscore_passthrough
   - name: replica_sets_initsync_static_jscore_passthrough
   - name: replica_sets_jscore_passthrough
+  - name: replica_sets_multi_oplog_txns_gen
+  - name: replica_sets_multi_oplog_txns_jscore_passthrough
   - name: replica_sets_multi_stmt_txn_jscore_passthrough
   - name: replica_sets_multi_stmt_txn_stepdown_jscore_passthrough_gen
+  - name: replica_sets_multi_stmt_txn_kill_primary_jscore_passthrough
+  - name: replica_sets_multi_stmt_txn_terminate_primary_jscore_passthrough
   - name: replica_sets_kill_primary_jscore_passthrough
   - name: replica_sets_terminate_primary_jscore_passthrough
   - name: replica_sets_kill_secondaries_jscore_passthrough
@@ -7863,10 +8016,10 @@ buildvariants:
   # configurations to run the tests under. Do not add more tasks to this list.
   - name: compile_TG
     requires:
-    - name: burn_in_tests
+    - name: burn_in_tests_gen
     distros:
     - rhel62-large
-  - name: burn_in_tests
+  - name: burn_in_tests_gen
 
 - name: linux-64-lsm
   stepback: false
@@ -7888,116 +8041,6 @@ buildvariants:
     distros:
     - rhel62-large
   - name: jsCore
-
-- name: ubuntu1404
-  display_name: SSL Ubuntu 14.04
-  run_on:
-  - ubuntu1404-test
-  batchtime: 1440 # 1 day
-  expansions:
-    push_path: linux
-    push_bucket: downloads.mongodb.org
-    push_name: linux
-    push_arch: x86_64-ubuntu1404
-    compile_flags: --ssl MONGO_DISTMOD=ubuntu1404 -j$(grep -c ^processor /proc/cpuinfo) --release --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
-    multiversion_platform: ubuntu1404
-    multiversion_edition: targeted
-    has_packages: true
-    packager_script: packager.py
-    packager_arch: x86_64
-    packager_distro: ubuntu1404
-    repo_edition: org
-    scons_cache_scope: shared
-    tooltags: "ssl"
-    build_mongoreplay: true
-  display_tasks:
-  - *dbtest
-  - *unittests
-  tasks:
-  - name: compile_all_run_unittests_TG
-    distros:
-    - ubuntu1404-build
-  - name: aggregation
-  - name: aggregation_auth
-  - name: auth_gen
-  - name: disk_wiredtiger
-  - name: failpoints
-  - name: failpoints_auth
-  - name: free_monitoring
-  - name: gle_auth
-  - name: gle_auth_write_cmd
-  - name: gle_auth_basics_passthrough
-  - name: gle_auth_basics_passthrough_write_cmd
-  - name: sharding_gle_auth_basics_passthrough
-  - name: sharding_gle_auth_basics_passthrough_write_cmd
-  - name: jsCore
-  - name: jsCore_auth
-  - name: jsCore_compatibility
-  - name: jsCore_decimal
-  - name: jsCore_txns
-  - name: jsCore_txns_multi_oplog_entries
-  - name: causally_consistent_jscore_txns_passthrough
-  - name: aggregation_multiversion_fuzzer_gen
-  - name: aggregation_wildcard_fuzzer_gen
-  - name: jstestfuzz_gen
-  - name: jstestfuzz_concurrent_gen
-  - name: jstestfuzz_concurrent_replication_gen
-  - name: jstestfuzz_concurrent_sharded_gen
-  - name: jstestfuzz_replication_gen
-  - name: jstestfuzz_sharded_gen
-  - name: mongosTest
-  - name: multiversion
-  - name: noPassthrough_gen
-  - name: noPassthroughWithMongod_gen
-  - name: bulk_gle_passthrough
-  - name: parallel_gen
-  - name: parallel_compatibility
-  - name: concurrency
-  - name: concurrency_replication
-  - name: concurrency_replication_causal_consistency
-    distros:
-    - ubuntu1404-build
-  - name: concurrency_replication_multi_stmt_txn
-  - name: concurrency_sharded_replication
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
-  - name: concurrency_sharded_replication_with_balancer
-  - name: concurrency_simultaneous
-  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_gen
-  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_gen
-  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_gen
-  - name: replica_sets
-  - name: replica_sets_auth_gen
-  - name: replica_sets_jscore_passthrough
-  - name: powercycle
-  - name: powercycle_fcv4.0
-  - name: powercycle_kill_mongod
-  - name: powercycle_replication
-  - name: powercycle_replication_smalloplog
-  - name: powercycle_syncdelay
-  - name: powercycle_write_concern_majority
-  - name: sharding_gen
-  - name: sharding_auth_gen
-  - name: sharding_last_stable_mongos_and_mixed_shards_gen
-  - name: slow1_gen
-  - name: serial_run
-  - name: sharded_causally_consistent_jscore_txns_passthrough_gen
-  - name: sharded_collections_causally_consistent_jscore_txns_passthrough
-  - name: sharded_jscore_txns
-  - name: sharded_jscore_txns_sharded_collections
-  - name: sharding_jscore_passthrough
-  - name: ssl_gen
-  - name: sslSpecial_gen
-  - name: stitch_support_lib_build_and_test
-  - name: stitch_support_lib_build_and_archive
-  - name: tool
-  - name: package
-    distros:
-    - ubuntu1604-packer
-  - name: publish_packages
-  - name: push
 
 - name: ubuntu1804
   display_name: SSL Ubuntu 18.04
@@ -8067,10 +8110,6 @@ buildvariants:
     - ubuntu1804-build
   - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
@@ -8248,10 +8287,6 @@ buildvariants:
     - ubuntu1604-build
   - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
@@ -8293,7 +8328,7 @@ buildvariants:
     push_path: linux
     push_bucket: downloads.10gen.com
     push_name: linux
-    push_arch: arm64-enterprise-ubuntu1604
+    push_arch: aarch64-enterprise-ubuntu1604
     compile_flags: --ssl MONGO_DISTMOD=ubuntu1604 -j$(grep -c ^processor /proc/cpuinfo) CCFLAGS="-march=armv8-a+crc -mtune=generic" --release --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
     resmoke_jobs_max: 8 # Avoid starting too many mongod's on ARM test servers
     has_packages: true
@@ -8347,10 +8382,6 @@ buildvariants:
   - name: concurrency_replication_causal_consistency
   - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
@@ -8381,43 +8412,6 @@ buildvariants:
     distros:
     - ubuntu1604-test
 
-- name: ubuntu1604-arm64
-  display_name: SSL Ubuntu 16.04 arm64
-  run_on:
-  - ubuntu1604-arm64-large
-  batchtime: 1440 # 1 day
-  expansions:
-    push_path: linux
-    push_bucket: downloads.mongodb.org
-    push_name: linux
-    push_arch: arm64-ubuntu1604
-    compile_flags: --ssl MONGO_DISTMOD=ubuntu1604 -j$(grep -c ^processor /proc/cpuinfo) --release CCFLAGS="-march=armv8-a+crc -mtune=generic" --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
-    resmoke_jobs_max: 8 # Avoid starting too many mongod's on ARM test servers
-    has_packages: true
-    packager_script: packager.py
-    packager_arch: arm64
-    packager_distro: ubuntu1604
-    repo_edition: org
-    tooltags: "ssl"
-    build_mongoreplay: true
-    multiversion_platform: ubuntu1604
-    multiversion_architecture: arm64
-    multiversion_edition: targeted
-  display_tasks:
-  - *dbtest
-  - *unittests
-  tasks:
-  - name: compile_all_run_unittests_TG
-  - name: free_monitoring
-  - name: jsCore
-  - name: replica_sets_jscore_passthrough
-  - name: publish_packages
-    distros:
-    - ubuntu1604-test
-  - name: push
-    distros:
-    - ubuntu1604-test
-
 - name: enterprise-ubuntu1804-arm64
   display_name: Enterprise Ubuntu 18.04 arm64
   modules:
@@ -8429,7 +8423,7 @@ buildvariants:
     push_path: linux
     push_bucket: downloads.10gen.com
     push_name: linux
-    push_arch: arm64-enterprise-ubuntu1804
+    push_arch: aarch64-enterprise-ubuntu1804
     compile_flags: --ssl MONGO_DISTMOD=ubuntu1804 -j$(grep -c ^processor /proc/cpuinfo) CCFLAGS="-march=armv8-a+crc -mtune=generic" --release --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
     resmoke_jobs_max: 8 # Avoid starting too many mongod's on ARM test servers
     has_packages: true
@@ -8482,10 +8476,6 @@ buildvariants:
   - name: concurrency_replication_causal_consistency
   - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
@@ -8525,7 +8515,7 @@ buildvariants:
     push_path: linux
     push_bucket: downloads.mongodb.org
     push_name: linux
-    push_arch: arm64-ubuntu1804
+    push_arch: aarch64-ubuntu1804
     compile_flags: --ssl MONGO_DISTMOD=ubuntu1804 -j$(grep -c ^processor /proc/cpuinfo) --release CCFLAGS="-march=armv8-a+crc -mtune=generic" --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
     resmoke_jobs_max: 8 # Avoid starting too many mongod's on ARM test servers
     has_packages: true
@@ -8553,28 +8543,28 @@ buildvariants:
     distros:
     - ubuntu1804-test
 
-- name: enterprise-ubuntu1604-ppc64le
-  display_name: Enterprise Ubuntu 16.04 PPC64LE
+- name: enterprise-ubuntu1804-ppc64le
+  display_name: Enterprise Ubuntu 18.04 PPC64LE
   modules:
   - enterprise
   run_on:
-  - ubuntu1604-power8-test
+  - ubuntu1804-power8-test
   batchtime: 1440 # 1 day
   expansions:
     push_path: linux
     push_bucket: downloads.10gen.com
     push_name: linux
     push_arch: ppc64le-enterprise-ubuntu1604
-    compile_flags: --ssl MONGO_DISTMOD=ubuntu1604 -j$(echo "$(grep -c processor /proc/cpuinfo)/2" | bc) --release CCFLAGS="-mcpu=power8 -mtune=power8 -mcmodel=medium" --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
+    compile_flags: --ssl MONGO_DISTMOD=ubuntu1804 -j$(echo "$(grep -c processor /proc/cpuinfo)/2" | bc) --release CCFLAGS="-mcpu=power8 -mtune=power8 -mcmodel=medium" --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
     resmoke_jobs_max: 2
     has_packages: true
     packager_script: packager_enterprise.py
     packager_arch: ppc64le
-    packager_distro: ubuntu1604
+    packager_distro: ubuntu1804
     repo_edition: enterprise
     tooltags: "ssl sasl"
     build_mongoreplay: true
-    multiversion_platform: ubuntu1604
+    multiversion_platform: ubuntu1804
     multiversion_architecture: ppc64le
     multiversion_edition: enterprise
   display_tasks:
@@ -8583,7 +8573,7 @@ buildvariants:
   tasks:
   - name: compile_all_run_unittests_TG
     distros:
-    - ubuntu1604-power8-build
+    - ubuntu1804-power8-build
   - name: aggregation
   - name: aggregation_auth
   - name: auth_gen
@@ -8601,7 +8591,6 @@ buildvariants:
   - name: jsCore_decimal
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: aggregation_multiversion_fuzzer_gen
   - name: aggregation_wildcard_fuzzer_gen
   - name: jstestfuzz_gen
   - name: jstestfuzz_concurrent_gen
@@ -8611,6 +8600,8 @@ buildvariants:
   - name: jstestfuzz_sharded_gen
   - name: mongosTest
   - name: noPassthrough_gen
+    distros:
+    - ubuntu1804-power8-build
   - name: noPassthroughWithMongod_gen
   - name: bulk_gle_passthrough
   - name: parallel_gen
@@ -8649,10 +8640,10 @@ buildvariants:
   - name: tool
   - name: publish_packages
     distros:
-    - ubuntu1604-test
+    - ubuntu1804-test
   - name: push
     distros:
-    - ubuntu1604-test
+    - ubuntu1804-test
 
 - name: enterprise-ubuntu1604-s390x
   display_name: Enterprise Ubuntu 16.04 s390x
@@ -8700,10 +8691,6 @@ buildvariants:
   - name: concurrency_replication_causal_consistency
   - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
@@ -8716,8 +8703,14 @@ buildvariants:
   - name: gle_auth_basics_passthrough_write_cmd
   - name: gle_auth_write_cmd
   - name: integration_tests_replset
+    distros:
+    - ubuntu1604-zseries-large
   - name: integration_tests_sharded
+    distros:
+    - ubuntu1604-zseries-large
   - name: integration_tests_standalone
+    distros:
+    - ubuntu1604-zseries-large
   - name: jsCore
   - name: jsCore_ese
   - name: jsCore_compatibility
@@ -8874,8 +8867,14 @@ buildvariants:
   - name: gle_auth_basics_passthrough_write_cmd
   - name: gle_auth_write_cmd
   - name: integration_tests_replset
+    distros:
+    - ubuntu1804-zseries-build
   - name: integration_tests_sharded
+    distros:
+    - ubuntu1804-zseries-build
   - name: integration_tests_standalone
+    distros:
+    - ubuntu1804-zseries-build
   - name: jsCore
   - name: jsCore_ese
   - name: jsCore_compatibility
@@ -9090,10 +9089,6 @@ buildvariants:
     - linux-64-amzn-build
   - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
@@ -9290,10 +9285,6 @@ buildvariants:
     - amazon2-build
   - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
@@ -9343,8 +9334,7 @@ buildvariants:
     # We invoke SCons using --jobs = (# of CPUs / 4) to avoid causing out of memory errors due to
     # spawning a large number of linker processes.
     num_scons_link_jobs_available: $(( $(grep -c ^processor /proc/cpuinfo) / 4 ))
-    python: python
-    python3: '/cygdrive/c/python/python36/python.exe'
+    python: '/cygdrive/c/python/python36/python.exe'
     ext: zip
     use_scons_cache: true
     multiversion_platform: windows
@@ -9383,9 +9373,16 @@ buildvariants:
   - name: disk_wiredtiger
   - name: failpoints
   - name: free_monitoring
+  - name: initial_sync_fuzzer_gen
   - name: integration_tests_standalone
+    distros:
+    - windows-64-vs2017-compile
   - name: integration_tests_replset
+    distros:
+    - windows-64-vs2017-compile
   - name: integration_tests_sharded
+    distros:
+    - windows-64-vs2017-compile
   - name: jsCore
   - name: jsCore_compatibility
   - name: jsCore_decimal
@@ -9424,23 +9421,23 @@ buildvariants:
   - name: concurrency_sharded_replication
     distros:
     - windows-64-vs2017-compile
-  # - name: concurrency_sharded_replication_local_read_write_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #   distros:
-  #   - windows-64-vs2017-compile
-  # - name: concurrency_sharded_replication_local_read_write_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
-  #   distros:
-  #   - windows-64-vs2017-compile
-  # - name: concurrency_sharded_replication_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #   distros:
-  #   - windows-64-vs2017-compile
-  # - name: concurrency_sharded_replication_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
-  #   distros:
-  #   - windows-64-vs2017-compile
   - name: concurrency_sharded_replication_with_balancer
     distros:
     - windows-64-vs2017-compile
   - name: concurrency_sharded_causal_consistency_gen
   - name: concurrency_sharded_causal_consistency_and_balancer
+    distros:
+    - windows-64-vs2017-compile
+  - name: concurrency_sharded_local_read_write_multi_stmt_txn
+    distros:
+    - windows-64-vs2017-compile
+  - name: concurrency_sharded_local_read_write_multi_stmt_txn_with_balancer
+    distros:
+    - windows-64-vs2017-compile
+  - name: concurrency_sharded_multi_stmt_txn
+    distros:
+    - windows-64-vs2017-compile
+  - name: concurrency_sharded_multi_stmt_txn_with_balancer
     distros:
     - windows-64-vs2017-compile
   - name: concurrency_sharded_with_stepdowns
@@ -9467,6 +9464,10 @@ buildvariants:
   - name: replica_sets_jscore_passthrough
     distros:
     - windows-64-vs2017-compile
+  - name: replica_sets_multi_oplog_txns_gen
+  - name: replica_sets_multi_oplog_txns_jscore_passthrough
+    distros:
+    - windows-64-vs2017-compile
   - name: replica_sets_initsync_jscore_passthrough
     distros:
     - windows-64-vs2017-compile
@@ -9477,6 +9478,8 @@ buildvariants:
     distros:
     - windows-64-vs2017-compile
   - name: replica_sets_multi_stmt_txn_stepdown_jscore_passthrough_gen
+  - name: replica_sets_multi_stmt_txn_kill_primary_jscore_passthrough
+  - name: replica_sets_multi_stmt_txn_terminate_primary_jscore_passthrough
   - name: replica_sets_kill_primary_jscore_passthrough
     distros:
     - windows-64-vs2017-compile
@@ -9518,8 +9521,7 @@ buildvariants:
     # We invoke SCons using --jobs = (# of CPUs / 4) to avoid causing out of memory errors due to
     # spawning a large number of linker processes.
     num_scons_link_jobs_available: $(( $(grep -c ^processor /proc/cpuinfo) / 4 ))
-    python: python
-    python3: '/cygdrive/c/python/python36/python.exe'
+    python: '/cygdrive/c/python/python36/python.exe'
     ext: zip
     use_scons_cache: true
     multiversion_platform: windows
@@ -9534,14 +9536,14 @@ buildvariants:
   tasks:
   - name: compile_TG
     requires:
-    - name: burn_in_tests
+    - name: burn_in_tests_gen
     - name: verify_pip
     distros:
     - windows-64-vs2017-compile
   - name: compile_benchmarks
     distros:
     - windows-64-vs2017-compile
-  - name: burn_in_tests
+  - name: burn_in_tests_gen
   - name: verify_pip
   - name: audit
   - name: auth_audit_gen
@@ -9577,6 +9579,8 @@ buildvariants:
   - name: replica_sets_auth_gen
   - name: replica_sets_ese_gen
   - name: replica_sets_jscore_passthrough
+  - name: replica_sets_multi_oplog_txns_gen
+  - name: replica_sets_multi_oplog_txns_jscore_passthrough
   - name: sasl
   - name: sharded_causally_consistent_jscore_txns_passthrough_gen
   - name: sharded_collections_causally_consistent_jscore_txns_passthrough
@@ -9643,8 +9647,7 @@ buildvariants:
     # We invoke SCons using --jobs = (# of CPUs / 4) to avoid causing out of memory errors due to
     # spawning a large number of linker processes.
     num_scons_link_jobs_available: $(( $(grep -c ^processor /proc/cpuinfo) / 4 ))
-    python: python
-    python3: '/cygdrive/c/python/python36/python.exe'
+    python: '/cygdrive/c/python/python36/python.exe'
     ext: zip
     use_scons_cache: true
     test_flags: |- # Use the ServiceExecutorAdaptive with a reasonable number of starting threads
@@ -9677,8 +9680,7 @@ buildvariants:
     # We invoke SCons using --jobs = (# of CPUs / 4) to avoid causing out of memory errors due to
     # spawning a large number of linker processes.
     num_scons_link_jobs_available: $(( $(grep -c ^processor /proc/cpuinfo) / 4 ))
-    python: python
-    python3: '/cygdrive/c/python/python36/python.exe'
+    python: '/cygdrive/c/python/python36/python.exe'
     test_flags: --storageEngine=inMemory --excludeWithAnyTags=requires_persistence,requires_journaling,uses_transactions
     ext: zip
     use_scons_cache: true
@@ -9703,10 +9705,6 @@ buildvariants:
     - windows-64-vs2017-compile
   - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
@@ -9758,8 +9756,7 @@ buildvariants:
     # We invoke SCons using --jobs = (# of CPUs / 4) to avoid causing out of memory errors due to
     # spawning a large number of linker processes.
     num_scons_link_jobs_available: $(( $(grep -c ^processor /proc/cpuinfo) / 4 ))
-    python: python
-    python3: '/cygdrive/c/python/python36/python.exe'
+    python: '/cygdrive/c/python/python36/python.exe'
     ext: zip
     use_scons_cache: true
     tooltags: "ssl"
@@ -9879,8 +9876,7 @@ buildvariants:
     # We invoke SCons using --jobs = (# of CPUs / 4) to avoid causing out of memory errors due to
     # spawning a large number of linker processes.
     num_scons_link_jobs_available: $(( $(grep -c ^processor /proc/cpuinfo) / 4 ))
-    python: python
-    python3: '/cygdrive/c/python/python36/python.exe'
+    python: '/cygdrive/c/python/python36/python.exe'
     ext: zip
     use_scons_cache: true
     tooltags: "ssl sasl"
@@ -9945,13 +9941,13 @@ buildvariants:
   - name: concurrency_replication_causal_consistency
   - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_sharded_causal_consistency_gen
   - name: concurrency_sharded_causal_consistency_and_balancer
+  - name: concurrency_sharded_local_read_write_multi_stmt_txn
+  - name: concurrency_sharded_local_read_write_multi_stmt_txn_with_balancer
+  - name: concurrency_sharded_multi_stmt_txn
+  - name: concurrency_sharded_multi_stmt_txn_with_balancer
   - name: concurrency_sharded_with_stepdowns
   - name: concurrency_sharded_with_stepdowns_and_balancer
   - name: concurrency_simultaneous
@@ -9963,6 +9959,7 @@ buildvariants:
   - name: gle_auth_basics_passthrough
   - name: gle_auth_basics_passthrough_write_cmd
   - name: gle_auth_write_cmd
+  - name: initial_sync_fuzzer_gen
   - name: jsCore
   - name: jsCore_compatibility
   - name: jsCore_decimal
@@ -10048,6 +10045,7 @@ buildvariants:
   - name: causally_consistent_jscore_txns_passthrough
   - name: mongosTest
   - name: replica_sets
+  - name: replica_sets_multi_oplog_txns_gen
   - name: ssl_gen
   - name: sslSpecial_gen
   - name: stitch_support_lib_build_and_test
@@ -10264,7 +10262,7 @@ buildvariants:
       --variables-files=etc/scons/xcode_tvos.vars
       FRAMEWORKPATH='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/Frameworks'
       --lto
-    cdriver_cmake_osx_deployment_target: "10.2"
+    cdriver_cmake_osx_deployment_target: "11.0"
     cdriver_cmake_flags: >-
         -DCMAKE_BUILD_TYPE=RelWithDebInfo
         -DCMAKE_OSX_SYSROOT="$(xcrun --sdk appletvos --show-sdk-path)"
@@ -10296,7 +10294,7 @@ buildvariants:
       --variables-files=etc/scons/xcode_tvos_sim.vars
       FRAMEWORKPATH='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/Frameworks'
       --lto
-    cdriver_cmake_osx_deployment_target: "10.2"
+    cdriver_cmake_osx_deployment_target: "11.0"
     cdriver_cmake_flags: >-
         -DCMAKE_BUILD_TYPE=RelWithDebInfo
         -DCMAKE_OSX_SYSROOT="$(xcrun --sdk appletvsimulator --show-sdk-path)"
@@ -10312,7 +10310,7 @@ buildvariants:
     disable_unit_tests: true
     enable_embedded_tests: ios_tvos_simulator
     ios_sim_device: Apple-TV-1080p
-    ios_sim_runtime: tvOS-10-2
+    ios_sim_runtime: tvOS-11-0
     dump_scons_config_on_failure: true
   tasks:
   - name: embedded_sdk_build_and_test
@@ -10612,7 +10610,7 @@ buildvariants:
   tasks:
   - name: compile_all_run_unittests_TG
     requires:
-    - name: burn_in_tests
+    - name: burn_in_tests_gen
     - name: verify_pip
     - name: lint
     distros:
@@ -10622,7 +10620,7 @@ buildvariants:
     - rhel62-large
   - name: lint
   - name: lint_yaml
-  - name: burn_in_tests
+  - name: burn_in_tests_gen
     distros:
     - rhel62-large
   - name: verify_pip
@@ -10671,13 +10669,13 @@ buildvariants:
     - rhel62-large
   - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_sharded_causal_consistency_gen
   - name: concurrency_sharded_causal_consistency_and_balancer
+  - name: concurrency_sharded_local_read_write_multi_stmt_txn
+  - name: concurrency_sharded_local_read_write_multi_stmt_txn_with_balancer
+  - name: concurrency_sharded_multi_stmt_txn
+  - name: concurrency_sharded_multi_stmt_txn_with_balancer
   - name: concurrency_sharded_with_stepdowns
   - name: concurrency_sharded_with_stepdowns_and_balancer
   - name: concurrency_simultaneous
@@ -10692,10 +10690,19 @@ buildvariants:
   - name: gle_auth_basics_passthrough_write_cmd
   - name: gle_auth_write_cmd
   - name: idl_tests
+  - name: initial_sync_fuzzer_gen
   - name: integration_tests_replset
+    distros:
+    - rhel62-large
   - name: integration_tests_sharded
+    distros:
+    - rhel62-large
   - name: integration_tests_standalone
+    distros:
+    - rhel62-large
   - name: integration_tests_standalone_audit
+    distros:
+    - rhel62-large
   - name: jsCore
   - name: jsCore_ese
   - name: jsCore_auth
@@ -10768,10 +10775,20 @@ buildvariants:
   - name: replica_sets_initsync_static_jscore_passthrough
     distros:
     - rhel62-large
+  - name: replica_sets_multi_oplog_txns_gen
+  - name: replica_sets_multi_oplog_txns_jscore_passthrough
   - name: replica_sets_multi_stmt_txn_jscore_passthrough
     distros:
     - rhel62-large
   - name: replica_sets_multi_stmt_txn_stepdown_jscore_passthrough_gen
+    distros:
+    - rhel62-large
+  - name: replica_sets_multi_stmt_txn_kill_primary_jscore_passthrough
+    distros:
+    - rhel62-large
+  - name: replica_sets_multi_stmt_txn_terminate_primary_jscore_passthrough
+    distros:
+    - rhel62-large
   - name: replica_sets_kill_primary_jscore_passthrough
     distros:
     - rhel62-large
@@ -10912,10 +10929,19 @@ buildvariants:
   - name: gle_auth_basics_passthrough
   - name: gle_auth_basics_passthrough_write_cmd
   - name: gle_auth_write_cmd
+  - name: initial_sync_fuzzer_gen
   - name: integration_tests_replset
+    distros:
+    - rhel62-large
   - name: integration_tests_sharded
+    distros:
+    - rhel62-large
   - name: integration_tests_standalone
+    distros:
+    - rhel62-large
   - name: integration_tests_standalone_audit
+    distros:
+    - rhel62-large
   - name: jsCore
   - name: jsCore_ese
   - name: jsCore_auth
@@ -11032,10 +11058,10 @@ buildvariants:
   # not add more tasks to this list.
   - name: compile_TG
     requires:
-    - name: burn_in_tests
+    - name: burn_in_tests_gen
     distros:
     - rhel62-large
-  - name: burn_in_tests
+  - name: burn_in_tests_gen
 
 - name: enterprise-rhel-62-64-bit-coverage
   display_name: "~ Enterprise RHEL 6.2 DEBUG Code Coverage"
@@ -11097,13 +11123,13 @@ buildvariants:
   - name: concurrency_replication_causal_consistency
   - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_sharded_causal_consistency_gen
   - name: concurrency_sharded_causal_consistency_and_balancer
+  - name: concurrency_sharded_local_read_write_multi_stmt_txn
+  - name: concurrency_sharded_local_read_write_multi_stmt_txn_with_balancer
+  - name: concurrency_sharded_multi_stmt_txn
+  - name: concurrency_sharded_multi_stmt_txn_with_balancer
   - name: concurrency_sharded_with_stepdowns
   - name: concurrency_sharded_with_stepdowns_and_balancer
   - name: concurrency_simultaneous
@@ -11117,6 +11143,7 @@ buildvariants:
   - name: gle_auth_basics_passthrough
   - name: gle_auth_basics_passthrough_write_cmd
   - name: gle_auth_write_cmd
+  - name: initial_sync_fuzzer_gen
   - name: integration_tests_replset
   - name: integration_tests_sharded
   - name: integration_tests_standalone
@@ -11150,10 +11177,14 @@ buildvariants:
   - name: replica_sets_ese_gen
   - name: replica_sets_auth_gen
   - name: replica_sets_jscore_passthrough
+  - name: replica_sets_multi_oplog_txns_jscore_passthrough
   - name: replica_sets_initsync_jscore_passthrough
   - name: replica_sets_initsync_static_jscore_passthrough
+  - name: replica_sets_multi_oplog_txns_gen
   - name: replica_sets_multi_stmt_txn_jscore_passthrough
   - name: replica_sets_multi_stmt_txn_stepdown_jscore_passthrough_gen
+  - name: replica_sets_multi_stmt_txn_kill_primary_jscore_passthrough
+  - name: replica_sets_multi_stmt_txn_terminate_primary_jscore_passthrough
   - name: replica_sets_kill_primary_jscore_passthrough
   - name: replica_sets_terminate_primary_jscore_passthrough
   - name: replica_sets_kill_secondaries_jscore_passthrough
@@ -11246,6 +11277,8 @@ buildvariants:
   - name: external_auth
   - name: replica_sets_auth_gen
   - name: replica_sets_jscore_passthrough
+  - name: replica_sets_multi_oplog_txns_gen
+  - name: replica_sets_multi_oplog_txns_jscore_passthrough
   - name: sasl
   - name: sharding_auth_gen
   - name: sharding_auth_audit_gen
@@ -11311,6 +11344,7 @@ buildvariants:
   - name: read_concern_linearizable_passthrough
   - name: read_concern_majority_passthrough_gen
   - name: replica_sets_jscore_passthrough
+  - name: replica_sets_multi_oplog_txns_jscore_passthrough
   - name: sharded_collections_jscore_passthrough
   - name: sharding_gen
   - name: sharding_auth_gen
@@ -11399,10 +11433,6 @@ buildvariants:
     - rhel62-large
   - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
@@ -11509,18 +11539,6 @@ buildvariants:
   - name: concurrency_sharded_replication
     distros:
     - rhel70
-  # - name: concurrency_sharded_replication_local_read_write_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #   distros:
-  #   - rhel70
-  # - name: concurrency_sharded_replication_local_read_write_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
-  #   distros:
-  #   - rhel70
-  # - name: concurrency_sharded_replication_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #   distros:
-  #   - rhel70
-  # - name: concurrency_sharded_replication_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
-  #   distros:
-  #   - rhel70
   - name: concurrency_sharded_replication_with_balancer
     distros:
     - rhel70
@@ -11617,10 +11635,6 @@ buildvariants:
   - name: concurrency_replication_causal_consistency
   - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
@@ -11633,8 +11647,14 @@ buildvariants:
   - name: gle_auth_basics_passthrough_write_cmd
   - name: gle_auth_write_cmd
   - name: integration_tests_replset
+    distros:
+    - rhel71-power8-build
   - name: integration_tests_sharded
+    distros:
+    - rhel71-power8-build
   - name: integration_tests_standalone
+    distros:
+    - rhel71-power8-build
   - name: jsCore
   - name: jsCore_ese
   - name: jsCore_compatibility
@@ -11744,10 +11764,6 @@ buildvariants:
   - name: concurrency_replication_causal_consistency
   - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
@@ -11760,8 +11776,14 @@ buildvariants:
   - name: gle_auth_basics_passthrough_write_cmd
   - name: gle_auth_write_cmd
   - name: integration_tests_replset
+    distros:
+    - rhel72-zseries-build
   - name: integration_tests_sharded
+    distros:
+    - rhel72-zseries-build
   - name: integration_tests_standalone
+    distros:
+    - rhel72-zseries-build
   - name: jsCore
   - name: jsCore_ese
   - name: jsCore_compatibility
@@ -11865,10 +11887,6 @@ buildvariants:
   - name: concurrency_replication_causal_consistency
   - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
@@ -11881,7 +11899,11 @@ buildvariants:
   - name: gle_auth_basics_passthrough_write_cmd
   - name: gle_auth_write_cmd
   - name: integration_tests_replset
+    distros:
+    - rhel67-zseries-build
   - name: integration_tests_standalone
+    distros:
+    - rhel67-zseries-build
   - name: jsCore
   - name: jsCore_ese
   - name: jsCore_auth
@@ -12012,66 +12034,6 @@ buildvariants:
 ###########################################
 #          Ubuntu buildvariants           #
 ###########################################
-
-- name: enterprise-ubuntu1404-64
-  display_name: Enterprise Ubuntu 14.04
-  modules:
-  - enterprise
-  run_on:
-  - ubuntu1404-test
-  batchtime: 1440 # 1 day
-  expansions:
-    push_path: linux
-    push_bucket: downloads.10gen.com
-    push_name: linux
-    push_arch: x86_64-enterprise-ubuntu1404
-    compile_flags: --ssl MONGO_DISTMOD=ubuntu1404 --release -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
-    has_packages: true
-    packager_script: packager_enterprise.py
-    packager_arch: x86_64
-    packager_distro: ubuntu1404
-    repo_edition: enterprise
-    scons_cache_scope: shared
-    tooltags: "ssl sasl"
-    build_mongoreplay: true
-  display_tasks:
-  - *dbtest
-  - *unittests
-  tasks:
-  - name: compile_all_run_unittests_TG
-    distros:
-    - ubuntu1404-build
-  - name: audit
-  - name: fle
-  - name: ese
-  - name: jsCore
-  - name: jsCore_auth
-  - name: jsCore_txns
-  - name: causally_consistent_jscore_txns_passthrough
-  - name: aggregation_multiversion_fuzzer_gen
-  - name: aggregation_wildcard_fuzzer_gen
-  - name: jstestfuzz_gen
-  - name: jstestfuzz_concurrent_gen
-  - name: jstestfuzz_concurrent_replication_gen
-  - name: jstestfuzz_concurrent_sharded_gen
-  - name: jstestfuzz_replication_gen
-  - name: jstestfuzz_sharded_gen
-  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_gen
-  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_gen
-  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_gen
-  - name: replica_sets_auth_gen
-  - name: replica_sets_jscore_passthrough
-  - name: sasl
-  - name: sharding_auth_gen
-  - name: snmp
-  - name: ssl_gen
-  - name: sslSpecial_gen
-  - name: package
-    distros:
-    - ubuntu1604-packer
-  - name: publish_packages
-  - name: push
-
 
 - name: enterprise-ubuntu1604-64
   display_name: Enterprise Ubuntu 16.04
@@ -12306,10 +12268,6 @@ buildvariants:
   - name: concurrency_replication_causal_consistency
   - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
@@ -12322,8 +12280,14 @@ buildvariants:
   - name: gle_auth_basics_passthrough_write_cmd
   - name: gle_auth_write_cmd
   - name: integration_tests_replset
+    distros:
+    - suse12-zseries-build
   - name: integration_tests_sharded
+    distros:
+    - suse12-zseries-build
   - name: integration_tests_standalone
+    distros:
+    - suse12-zseries-build
   - name: jsCore
   - name: jsCore_ese
   - name: jsCore_compatibility
@@ -12493,10 +12457,6 @@ buildvariants:
     - suse12-build
   - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
@@ -12660,10 +12620,6 @@ buildvariants:
     - debian81-build
   - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
@@ -12828,10 +12784,6 @@ buildvariants:
     - debian92-build
   - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
@@ -12955,6 +12907,18 @@ buildvariants:
   - name: concurrency_sharded_causal_consistency_and_balancer
     distros:
     - rhel62-large  # Some workloads require a lot of memory, use a bigger machine for this suite.
+  - name: concurrency_sharded_local_read_write_multi_stmt_txn
+    distros:
+    - rhel62-large  # Some workloads require a lot of memory, use a bigger machine for this suite.
+  - name: concurrency_sharded_local_read_write_multi_stmt_txn_with_balancer
+    distros:
+    - rhel62-large  # Some workloads require a lot of memory, use a bigger machine for this suite.
+  - name: concurrency_sharded_multi_stmt_txn
+    distros:
+    - rhel62-large  # Some workloads require a lot of memory, use a bigger machine for this suite.
+  - name: concurrency_sharded_multi_stmt_txn_with_balancer
+    distros:
+    - rhel62-large  # Some workloads require a lot of memory, use a bigger machine for this suite.
   - name: concurrency_sharded_with_stepdowns
     distros:
     - rhel62-large  # Some workloads require a lot of memory, use a bigger machine for this suite.
@@ -12974,8 +12938,14 @@ buildvariants:
   - name: gle_auth_basics_passthrough_write_cmd
   - name: gle_auth_write_cmd
   - name: integration_tests_replset
+    distros:
+    - rhel62-large
   - name: integration_tests_sharded
+    distros:
+    - rhel62-large
   - name: integration_tests_standalone
+    distros:
+    - rhel62-large
   - name: jsCore
   - name: jsCore_auth
   - name: jsCore_compatibility
@@ -13081,10 +13051,10 @@ buildvariants:
     - rhel62-large
   - name: compile_TG
     requires:
-    - name: burn_in_tests
+    - name: burn_in_tests_gen
     distros:
     - rhel62-large
-  - name: burn_in_tests
+  - name: burn_in_tests_gen
   - name: jsCore
 
 - name: rhel-62-64-bit-mobile
@@ -13097,8 +13067,8 @@ buildvariants:
     # mobile storage engine.
     test_flags: >-
       --storageEngine=mobile
-      --excludeWithAnyTags=requires_wiredtiger,requires_replication,requires_sharding,uses_transactions,requires_capped,requires_profiling,requires_compact,requires_document_locking,requires_snapshot_read
-      --excludeWithAnyTags=SERVER-32709,SERVER-32869
+      --excludeWithAnyTags=requires_wiredtiger,requires_replication,requires_sharding,uses_transactions,requires_capped,requires_profiling,requires_compact,requires_document_locking,requires_snapshot_read,requires_db_locking
+      --excludeWithAnyTags=SERVER-32869
     compile_flags: >-
       -j$(grep -c ^processor /proc/cpuinfo)
       --mobile-se=on
@@ -13150,6 +13120,8 @@ buildvariants:
   - name: failpoints_auth
   - name: generate_benchrun_embedded_files
   - name: integration_tests_standalone
+    distros:
+    - rhel62-large
   - name: jsCore
   - name: jsCore_auth
   - name: jsCore_compatibility
@@ -13175,8 +13147,8 @@ buildvariants:
   expansions:
     test_flags: >-
       --storageEngine=mobile
-      --excludeWithAnyTags=requires_wiredtiger,requires_replication,requires_sharding,uses_transactions,requires_capped,requires_profiling,requires_compact,requires_document_locking,requires_snapshot_read
-      --excludeWithAnyTags=SERVER-32709,SERVER-32869
+      --excludeWithAnyTags=requires_wiredtiger,requires_replication,requires_sharding,uses_transactions,requires_capped,requires_profiling,requires_compact,requires_document_locking,requires_snapshot_read,requires_db_locking
+      --excludeWithAnyTags=SERVER-32869
     compile_flags: >-
         -j$(grep -c ^processor /proc/cpuinfo)
         --mobile-se=on
@@ -13232,10 +13204,10 @@ buildvariants:
   # to this list.
   - name: compile_TG
     requires:
-    - name: burn_in_tests
+    - name: burn_in_tests_gen
     distros:
     - rhel62-large
-  - name: burn_in_tests
+  - name: burn_in_tests_gen
   - name: jsCore_mobile
 
 - name: macos-mobile
@@ -13252,8 +13224,8 @@ buildvariants:
     # mobile storage engine.
     test_flags: >-
       --storageEngine=mobile
-      --excludeWithAnyTags=requires_wiredtiger,requires_replication,requires_sharding,uses_transactions,requires_capped,requires_profiling,requires_compact,requires_document_locking,requires_snapshot_read
-      --excludeWithAnyTags=SERVER-32709,SERVER-32869
+      --excludeWithAnyTags=requires_wiredtiger,requires_replication,requires_sharding,uses_transactions,requires_capped,requires_profiling,requires_compact,requires_document_locking,requires_snapshot_read,requires_db_locking
+      --excludeWithAnyTags=SERVER-32869
     compile_env: DEVELOPER_DIR=/Applications/Xcode10.1.app
     compile_flags: >-
       -j$(sysctl -n hw.logicalcpu)
@@ -13303,7 +13275,7 @@ buildvariants:
   expansions:
     # Transactions are not explicitly supported on the ephemeralForTest storage engine.
     # Speculative majority reads are currently only allowed for change streams, which are only supported on WiredTiger.
-    test_flags: --storageEngine=ephemeralForTest --excludeWithAnyTags=requires_persistence,requires_fsync,SERVER-21420,SERVER-21658,requires_journaling,requires_wiredtiger,uses_transactions,requires_document_locking,uses_speculative_majority,requires_snapshot_read
+    test_flags: --storageEngine=ephemeralForTest --excludeWithAnyTags=requires_persistence,requires_fsync,SERVER-21420,SERVER-21658,requires_journaling,requires_wiredtiger,uses_transactions,requires_document_locking,uses_speculative_majority,requires_snapshot_read,requires_majority_read_concern
     compile_flags: -j$(grep -c ^processor /proc/cpuinfo) --dbg=off --opt=on --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
     scons_cache_scope: shared
     tooltags: ""
@@ -13338,8 +13310,14 @@ buildvariants:
   - name: gle_auth_basics_passthrough
   - name: gle_auth_basics_passthrough_write_cmd
   - name: integration_tests_standalone
+    distros:
+    - rhel62-large
   - name: integration_tests_replset
+    distros:
+    - rhel62-large
   - name: integration_tests_sharded
+    distros:
+    - rhel62-large
   - name: sharding_gle_auth_basics_passthrough
   - name: sharding_gle_auth_basics_passthrough_write_cmd
   - name: jsCore
@@ -13429,8 +13407,14 @@ buildvariants:
   - name: gle_auth_basics_passthrough_write_cmd
   - name: gle_auth_write_cmd
   - name: integration_tests_replset
+    distros:
+    - rhel71-power8-build
   - name: integration_tests_sharded
+    distros:
+    - rhel71-power8-build
   - name: integration_tests_standalone
+    distros:
+    - rhel71-power8-build
   - name: jsCore
   - name: jsCore_auth
   - name: jsCore_compatibility
@@ -13534,8 +13518,14 @@ buildvariants:
   - name: gle_auth_basics_passthrough_write_cmd
   - name: gle_auth_write_cmd
   - name: integration_tests_replset
+    distros:
+    - rhel72-zseries-build
   - name: integration_tests_sharded
+    distros:
+    - rhel72-zseries-build
   - name: integration_tests_standalone
+    distros:
+    - rhel72-zseries-build
   - name: jsCore
   - name: jsCore_auth
   - name: jsCore_compatibility
@@ -13584,12 +13574,12 @@ buildvariants:
 #     Experimental buildvariants          #
 ###########################################
 
-- name: ubuntu1604-debug-asan
-  display_name: ~ ASAN Enterprise SSL Ubuntu 16.04 DEBUG
+- name: ubuntu1804-debug-asan
+  display_name: ~ ASAN Enterprise SSL Ubuntu 18.04 DEBUG
   modules:
   - enterprise
   run_on:
-  - ubuntu1604-build
+  - ubuntu1804-build
   stepback: true
   batchtime: 1440 # 1 day
   expansions:
@@ -13598,7 +13588,7 @@ buildvariants:
     lang_environment: LANG=C
     san_options: LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=1
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_v3_clang.vars --dbg=on --opt=on --allocator=system --sanitize=address --ssl --enable-free-mon=on -j$(grep -c ^processor /proc/cpuinfo) --nostrip
-    multiversion_platform: ubuntu1604
+    multiversion_platform: ubuntu1804
     multiversion_edition: enterprise
     resmoke_jobs_factor: 0.3  # Avoid starting too many mongod's under ASAN build.
     tooltags: "ssl"
@@ -13646,13 +13636,13 @@ buildvariants:
   - name: concurrency_replication_causal_consistency
   - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_sharded_causal_consistency_gen
   - name: concurrency_sharded_causal_consistency_and_balancer
+  - name: concurrency_sharded_local_read_write_multi_stmt_txn
+  - name: concurrency_sharded_local_read_write_multi_stmt_txn_with_balancer
+  - name: concurrency_sharded_multi_stmt_txn
+  - name: concurrency_sharded_multi_stmt_txn_with_balancer
   - name: concurrency_sharded_with_stepdowns
   - name: concurrency_sharded_with_stepdowns_and_balancer
   - name: concurrency_simultaneous
@@ -13667,6 +13657,7 @@ buildvariants:
   - name: gle_auth_basics_passthrough
   - name: gle_auth_basics_passthrough_write_cmd
   - name: gle_auth_write_cmd
+  - name: initial_sync_fuzzer_gen
   - name: integration_tests_replset
   - name: integration_tests_sharded
   - name: jsCore
@@ -13712,6 +13703,8 @@ buildvariants:
   - name: replica_sets_initsync_static_jscore_passthrough
   - name: replica_sets_multi_stmt_txn_jscore_passthrough
   - name: replica_sets_multi_stmt_txn_stepdown_jscore_passthrough_gen
+  - name: replica_sets_multi_stmt_txn_kill_primary_jscore_passthrough
+  - name: replica_sets_multi_stmt_txn_terminate_primary_jscore_passthrough
   - name: replica_sets_kill_primary_jscore_passthrough
   - name: replica_sets_terminate_primary_jscore_passthrough
   - name: replica_sets_kill_secondaries_jscore_passthrough
@@ -13749,10 +13742,10 @@ buildvariants:
   - name: write_concern_majority_passthrough
   - name: secondary_reads_passthrough_gen
 
-- name: ubuntu1604-asan
-  display_name: ~ ASAN SSL Ubuntu 16.04
+- name: ubuntu1804-asan
+  display_name: ~ ASAN SSL Ubuntu 18.04
   run_on:
-  - ubuntu1604-build
+  - ubuntu1804-build
   stepback: true
   batchtime: 1440 # 1 day
   expansions:
@@ -13792,12 +13785,12 @@ buildvariants:
   - name: jstestfuzz_sharded_continuous_stepdown_gen
   - name: jstestfuzz_sharded_session_gen
 
-- name: ubuntu1604-debug-ubsan
-  display_name: ~ UBSAN Enterprise Ubuntu 16.04 DEBUG
+- name: ubuntu1804-debug-ubsan
+  display_name: ~ UBSAN Enterprise Ubuntu 18.04 DEBUG
   modules:
   - enterprise
   run_on:
-  - ubuntu1604-build
+  - ubuntu1804-build
   stepback: true
   batchtime: 1440 # 1 day
   expansions:
@@ -13806,7 +13799,7 @@ buildvariants:
     lang_environment: LANG=C
     san_options: UBSAN_OPTIONS="print_stacktrace=1"
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_v3_clang.vars --dbg=on --opt=on --sanitize=undefined --ssl --enable-free-mon=on -j$(grep -c ^processor /proc/cpuinfo) --nostrip
-    multiversion_platform: ubuntu1604
+    multiversion_platform: ubuntu1804
     multiversion_edition: enterprise
     resmoke_jobs_factor: 0.3  # Avoid starting too many mongod's under UBSAN build.
     tooltags: "ssl sasl"
@@ -13857,6 +13850,10 @@ buildvariants:
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_sharded_causal_consistency_gen
   - name: concurrency_sharded_causal_consistency_and_balancer
+  - name: concurrency_sharded_local_read_write_multi_stmt_txn
+  - name: concurrency_sharded_local_read_write_multi_stmt_txn_with_balancer
+  - name: concurrency_sharded_multi_stmt_txn
+  - name: concurrency_sharded_multi_stmt_txn_with_balancer
   - name: concurrency_sharded_with_stepdowns
   - name: concurrency_sharded_with_stepdowns_and_balancer
   - name: concurrency_simultaneous
@@ -13871,6 +13868,7 @@ buildvariants:
   - name: gle_auth_basics_passthrough
   - name: gle_auth_basics_passthrough_write_cmd
   - name: gle_auth_write_cmd
+  - name: initial_sync_fuzzer_gen
   - name: integration_tests_replset
   - name: integration_tests_sharded
   - name: integration_tests_standalone
@@ -13908,6 +13906,8 @@ buildvariants:
   - name: replica_sets_initsync_static_jscore_passthrough
   - name: replica_sets_multi_stmt_txn_jscore_passthrough
   - name: replica_sets_multi_stmt_txn_stepdown_jscore_passthrough_gen
+  - name: replica_sets_multi_stmt_txn_kill_primary_jscore_passthrough
+  - name: replica_sets_multi_stmt_txn_terminate_primary_jscore_passthrough
   - name: replica_sets_kill_primary_jscore_passthrough
   - name: replica_sets_terminate_primary_jscore_passthrough
   - name: replica_sets_kill_secondaries_jscore_passthrough
@@ -13945,12 +13945,12 @@ buildvariants:
   - name: write_concern_majority_passthrough
   - name: secondary_reads_passthrough_gen
 
-- name: ubuntu1604-debug-aubsan-lite
-  display_name: "! {A,UB}SAN Enterprise SSL Ubuntu 16.04 DEBUG"
+- name: ubuntu1804-debug-aubsan-lite
+  display_name: "! {A,UB}SAN Enterprise SSL Ubuntu 18.04 DEBUG"
   modules:
   - enterprise
   run_on:
-  - ubuntu1604-build
+  - ubuntu1804-build
   stepback: true
   expansions:
     # We need llvm-symbolizer in the PATH for ASAN for clang-3.7 or later.
@@ -13977,12 +13977,12 @@ buildvariants:
   - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_gen
   - name: watchdog_wiredtiger
 
-- name: ubuntu1604-debug-aubsan-async
-  display_name: "~ {A,UB}SAN Enterprise SSL Ubuntu 16.04 async"
+- name: ubuntu1804-debug-aubsan-async
+  display_name: "~ {A,UB}SAN Enterprise SSL Ubuntu 18.04 async"
   modules:
   - enterprise
   run_on:
-  - ubuntu1604-build
+  - ubuntu1804-build
   stepback: true
   batchtime: 1440 # 1 day
   expansions:
@@ -14023,10 +14023,6 @@ buildvariants:
   - name: concurrency_replication_causal_consistency
   - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-  #- name: concurrency_sharded_replication_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
@@ -14072,6 +14068,7 @@ buildvariants:
   - name: replica_sets_initsync_jscore_passthrough
   - name: replica_sets_initsync_static_jscore_passthrough
   - name: replica_sets_kill_secondaries_jscore_passthrough
+  - name: replica_sets_multi_oplog_txns_gen
   - name: sasl
   - name: sharded_causally_consistent_jscore_txns_passthrough_gen
   - name: sharded_collections_causally_consistent_jscore_txns_passthrough

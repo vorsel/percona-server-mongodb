@@ -90,7 +90,7 @@ boost::optional<vector<StringData>> _getExactNameMatches(const MatchExpression* 
     if (matchType == MatchExpression::EQ) {
         auto eqMatch = checked_cast<const EqualityMatchExpression*>(matcher);
         if (eqMatch->path() == "name") {
-            StringData name(eqMatch->getData().valuestrsafe());
+            StringData name(eqMatch->getData().valueStringDataSafe());
             if (name.size()) {
                 return {vector<StringData>{name}};
             } else {
@@ -102,7 +102,7 @@ boost::optional<vector<StringData>> _getExactNameMatches(const MatchExpression* 
         if (matchIn->path() == "name" && matchIn->getRegexes().empty()) {
             vector<StringData> exactMatches;
             for (auto&& elem : matchIn->getEqualities()) {
-                StringData name(elem.valuestrsafe());
+                StringData name(elem.valueStringDataSafe());
                 if (name.size()) {
                     exactMatches.push_back(elem.valueStringData());
                 }
@@ -321,7 +321,12 @@ public:
                         }
                     }
                 } else {
-                    for (auto&& collection : *db) {
+                    for (auto collIt = db->begin(opCtx); collIt != db->end(opCtx); ++collIt) {
+                        auto collection = *collIt;
+                        if (!collection) {
+                            break;
+                        }
+
                         if (authorizedCollections &&
                             (collection->ns().coll().startsWith("system.") ||
                              !as->isAuthorizedForAnyActionOnResource(

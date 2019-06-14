@@ -72,6 +72,14 @@ public:
                                                            BSON("" << currentPath->dottedField()));
     }
 
+    void acceptVisitor(UpdateNodeVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    BSONElement getValue() const {
+        return _val;
+    }
+
 private:
     BSONElement _val;
 };

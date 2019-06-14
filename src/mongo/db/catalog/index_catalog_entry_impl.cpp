@@ -213,6 +213,12 @@ MultikeyPaths IndexCatalogEntryImpl::getMultikeyPaths(OperationContext* opCtx) c
 
 // ---
 
+void IndexCatalogEntryImpl::setMinimumVisibleSnapshot(Timestamp newMinimumVisibleSnapshot) {
+    if (!_minVisibleSnapshot || (newMinimumVisibleSnapshot > _minVisibleSnapshot.get())) {
+        _minVisibleSnapshot = newMinimumVisibleSnapshot;
+    }
+}
+
 void IndexCatalogEntryImpl::setIsReady(bool newIsReady) {
     _isReady = newIsReady;
 }
@@ -341,7 +347,7 @@ void IndexCatalogEntryImpl::setIndexKeyStringWithLongTypeBitsExistsOnDisk(Operat
 }
 
 void IndexCatalogEntryImpl::setNs(NamespaceString ns) {
-    _ns = ns.toString();
+    _ns = ns;
     _descriptor->setNs(std::move(ns));
 }
 

@@ -53,29 +53,10 @@ env.SConscript(
     ],
 )
 
-allocatorEnv = env.Clone()
-if allocatorEnv['MONGO_ALLOCATOR'] == 'tcmalloc':
-    allocatorEnv.Append(
-            CPPDEFINES=[
-                'MONGO_USE_GPERFTOOLS_TCMALLOC',
-            ]
-        )
-
-    if not use_system_version_of_library('tcmalloc'):
-        # Add in the include path for our vendored tcmalloc.
-        allocatorEnv.InjectThirdParty('gperftools')
-
-        # If our changes to tcmalloc are ever upstreamed, this should become set based on a top
-        # level configure check, though its effects should still be scoped just to these files.
-
-    if not use_system_version_of_library('valgrind'):
-        # Include valgrind since tcmalloc disables itself while running under valgrind
-        allocatorEnv.InjectThirdParty('valgrind')
-
 # NOTE: This library does not really belong here. Its presence here is
 # temporary. Do not add to this library, do not remove from it, and do
 # not declare other libraries in this file.
-allocatorEnv.Library(
+env.Library(
     target='base',
     source=[
         'base/data_range.cpp',
@@ -170,6 +151,7 @@ allocatorEnv.Library(
         '$BUILD_DIR/third_party/shim_abseil',
         '$BUILD_DIR/third_party/shim_allocator',
         '$BUILD_DIR/third_party/shim_boost',
+        '$BUILD_DIR/third_party/shim_fmt',
         '$BUILD_DIR/third_party/shim_intel_decimal128',
         '$BUILD_DIR/third_party/shim_pcrecpp',
         'util/quick_exit',
@@ -183,9 +165,9 @@ js_engine_ver = get_option("js-engine") if get_option("server-js") == "on" else 
 
 # On windows, we need to escape the backslashes in the command-line
 # so that windows paths look okay.
-cmd_line = " ".join(sys.argv).encode('string-escape')
+cmd_line = " ".join(sys.argv).encode('unicode_escape')
 if env.TargetOSIs('windows'):
-    cmd_line = cmd_line.replace('\\', r'\\')
+    cmd_line = cmd_line.replace(b'\\', b'\\')
 
 module_list = '{ %s }' % ', '.join([ '"{0}"'.format(x) for x in env['MONGO_MODULES'] ])
 
@@ -343,8 +325,8 @@ mongod = env.Program(
     LIBDEPS=[
         '$BUILD_DIR/third_party/shim_snappy',
         'base',
-        'db/auth/authmongod',
         'db/auth/auth_op_observer',
+        'db/auth/authmongod',
         'db/background',
         'db/bson/dotted_path_support',
         'db/catalog/catalog_impl',
@@ -370,13 +352,12 @@ mongod = env.Program(
         'db/ftdc/ftdc_mongod',
         'db/fts/ftsmongod',
         'db/index/index_access_method',
-        'db/index_builds_coordinator_mongod',
         'db/index/index_descriptor',
+        'db/index_builds_coordinator_mongod',
         'db/initialize_snmp',
         'db/introspect',
         'db/keys_collection_client_direct',
         'db/kill_sessions_local',
-        'db/traffic_recorder',
         'db/logical_session_cache_factory_mongod',
         'db/logical_time_metadata_hook',
         'db/matcher/expressions_mongod_only',
@@ -419,6 +400,7 @@ mongod = env.Program(
         'db/storage/biggie/storage_biggie',
         'db/storage/devnull/storage_devnull',
         'db/storage/ephemeral_for_test/storage_ephemeral_for_test',
+        'db/storage/flow_control',
         'db/storage/inmemory/storage_inmemory' if inmemory else [],
         'db/storage/storage_engine_lock_file',
         'db/storage/storage_engine_metadata',
@@ -426,6 +408,7 @@ mongod = env.Program(
         'db/storage/storage_options',
         'db/storage/wiredtiger/storage_wiredtiger' if wiredtiger else [],
         'db/system_index',
+        'db/traffic_recorder',
         'db/ttl_collection_cache',
         'db/ttl_d',
         'db/update/update_driver',
@@ -744,7 +727,11 @@ def installExternalBinary( e, name_str ):
 # "--use-new-tools" adds dependencies for rewritten (Go) tools
 # It is required for "dist" but optional for "install"
 if has_option("use-new-tools"):
+
+    env.Append(MODULE_BANNERS=[env.File('#/src/mongo-tools/distsrc/THIRD-PARTY-NOTICES.gotools')])
+
     toolsRoot = "src/mongo-tools"
+
     for t in rewrittenTools:
         installExternalBinary(env, "%s/%s" % (toolsRoot, t))
     if has_option("build-mongoreplay") and get_option("build-mongoreplay") == "true":
@@ -773,7 +760,7 @@ env.Append(MODULE_BANNERS = [distsrc.File('README'),
 
 # If no module has introduced a file named LICENSE-Enterprise.txt then this
 # is a Community build, so inject the AGPL and the Community license
-if sum(itertools.imap(lambda x: x.name == "LICENSE-Enterprise.txt", env['MODULE_BANNERS'])) == 0:
+if sum(map(lambda x: x.name == "LICENSE-Enterprise.txt", env['MODULE_BANNERS'])) == 0:
     env.Append(MODULE_BANNERS = [distsrc.File('LICENSE-Community.txt')])
 
 # All module banners get staged to the top level of the tarfile, so we
@@ -792,7 +779,7 @@ module_banner_transforms = ["--transform %s=$SERVER_DIST_BASENAME" % d for d in 
 # Allow modules to map original file name directories to subdirectories
 # within the archive (e.g. { "src/mongo/db/modules/enterprise/docs": "snmp"})
 archive_addition_transforms = []
-for full_dir, archive_dir in env["ARCHIVE_ADDITION_DIR_MAP"].items():
+for full_dir, archive_dir in list(env["ARCHIVE_ADDITION_DIR_MAP"].items()):
   archive_addition_transforms.append("--transform \"%s=$SERVER_DIST_BASENAME/%s\"" %
                                      (full_dir, archive_dir))
 

@@ -48,11 +48,13 @@
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/views/view_catalog.h"
 #include "mongo/util/log.h"
+#include "mongo/util/quick_exit.h"
 
 namespace mongo {
 
@@ -60,6 +62,8 @@ using std::endl;
 using std::string;
 using std::stringstream;
 using std::vector;
+
+MONGO_FAIL_POINT_DEFINE(reIndexCrashAfterDrop);
 
 /* "dropIndexes" is now the preferred form - "deleteIndexes" deprecated */
 class CmdDropIndexes : public BasicCommand {
@@ -141,6 +145,9 @@ public:
         }
 
         BackgroundOperation::assertNoBgOpInProgForNs(toReIndexNss.ns());
+        invariant(collection->uuid());
+        IndexBuildsCoordinator::get(opCtx)->assertNoIndexBuildInProgForCollection(
+            collection->uuid().get());
 
         // This is necessary to set up CurOp and update the Top stats.
         OldClientContext ctx(opCtx, toReIndexNss.ns());
@@ -204,6 +211,11 @@ public:
                 indexer->init(opCtx, collection, all, MultiIndexBlock::kNoopOnInitFn);
             uassertStatusOK(swIndexesToRebuild.getStatus());
             wunit.commit();
+        }
+
+        if (MONGO_FAIL_POINT(reIndexCrashAfterDrop)) {
+            log() << "exiting because 'reIndexCrashAfterDrop' fail point was set";
+            quickExit(EXIT_ABRUPT);
         }
 
         auto status = indexer->insertAllDocumentsInCollection(opCtx, collection);

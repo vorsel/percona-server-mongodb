@@ -72,6 +72,10 @@ public:
         return false;
     }
 
+    bool canIgnorePrepareConflicts() const override {
+        return true;
+    }
+
     AllowedOnSecondary secondaryAllowed(ServiceContext* serviceContext) const override {
         return Command::AllowedOnSecondary::kOptIn;
     }
@@ -170,7 +174,7 @@ public:
         auto exec = std::move(statusWithPlanExecutor.getValue());
 
         auto bodyBuilder = result->getBodyBuilder();
-        Explain::explainStages(exec.get(), collection, verbosity, &bodyBuilder);
+        Explain::explainStages(exec.get(), collection, verbosity, BSONObj(), &bodyBuilder);
         return Status::OK();
     }
 
@@ -185,7 +189,7 @@ public:
         ctx.emplace(opCtx,
                     CommandHelpers::parseNsOrUUID(dbname, cmdObj),
                     AutoGetCollection::ViewMode::kViewsPermitted);
-        const auto nss = ctx->getNss();
+        const auto& nss = ctx->getNss();
 
         CurOpFailpointHelpers::waitWhileFailPointEnabled(
             &hangBeforeCollectionCount, opCtx, "hangBeforeCollectionCount", []() {}, false, nss);

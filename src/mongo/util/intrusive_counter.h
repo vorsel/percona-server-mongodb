@@ -29,11 +29,9 @@
 
 #pragma once
 
-#include <atomic>
 #include <boost/intrusive_ptr.hpp>
 #include <stdlib.h>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/string_data.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/util/allocator.h"
@@ -42,7 +40,8 @@ namespace mongo {
 
 /// This is an alternative base class to the above ones (will replace them eventually)
 class RefCountable {
-    MONGO_DISALLOW_COPYING(RefCountable);
+    RefCountable(const RefCountable&) = delete;
+    RefCountable& operator=(const RefCountable&) = delete;
 
 public:
     /// If false you have exclusive access to this object. This is useful for implementing COW.
@@ -115,11 +114,7 @@ public:
 #pragma warning(push)
 #pragma warning(disable : 4291)
     void operator delete(void* ptr) {
-        // Accessing ptr here is technically undefined behavior, but the toolchains we use + UBSAN
-        // are okay with it.
-        // TODO When we are on C++20, this should change and use a destroying delete function.
-        // See https://jira.mongodb.org/browse/SERVER-39506
-        mongoFree(ptr, bytesRequiredForSize(reinterpret_cast<RCString*>(ptr)->size()));
+        free(ptr);
     }
 #pragma warning(pop)
 
@@ -128,10 +123,6 @@ private:
     RCString(){};
     void* operator new(size_t objSize, size_t realSize) {
         return mongoMalloc(realSize);
-    }
-
-    static size_t bytesRequiredForSize(size_t size) {
-        return sizeof(RCString) + size + 1;
     }
 
     int _size;  // does NOT include trailing NUL byte.

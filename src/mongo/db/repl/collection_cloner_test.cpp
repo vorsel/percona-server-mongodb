@@ -179,7 +179,8 @@ private:
 // RAII class to pause the client; since tests are very exception-heavy this prevents them
 // from hanging on failure.
 class MockClientPauser {
-    MONGO_DISALLOW_COPYING(MockClientPauser);
+    MockClientPauser(const MockClientPauser&) = delete;
+    MockClientPauser& operator=(const MockClientPauser&) = delete;
 
 public:
     MockClientPauser(FailableMockDBClientConnection* client) : _client(client) {
@@ -524,7 +525,7 @@ TEST_F(CollectionClonerTest,
        CollectionClonerReturnsScheduleErrorOnFailingToScheduleListIndexesCommand) {
     TaskExecutorWithFailureInScheduleRemoteCommand _executorProxy(
         &getExecutor(), [](const executor::RemoteCommandRequest& request) {
-            return str::equals("listIndexes", request.cmdObj.firstElementFieldName());
+            return request.cmdObj.firstElementFieldNameStringData() == "listIndexes";
         });
 
     collectionCloner = stdx::make_unique<CollectionCloner>(&_executorProxy,
@@ -1118,7 +1119,8 @@ TEST_F(CollectionClonerTest, CollectionClonerCannotBeRestartedAfterPreviousFailu
 
 bool sharedCallbackStateDestroyed = false;
 class SharedCallbackState {
-    MONGO_DISALLOW_COPYING(SharedCallbackState);
+    SharedCallbackState(const SharedCallbackState&) = delete;
+    SharedCallbackState& operator=(const SharedCallbackState&) = delete;
 
 public:
     SharedCallbackState() {}

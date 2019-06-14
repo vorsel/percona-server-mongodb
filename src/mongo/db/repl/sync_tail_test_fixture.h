@@ -31,10 +31,12 @@
 
 #include "mongo/base/status.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/logical_session_id.h"
 #include "mongo/db/op_observer_noop.h"
 #include "mongo/db/repl/replication_consistency_markers.h"
 #include "mongo/db/repl/sync_tail.h"
 #include "mongo/db/service_context_d_test_fixture.h"
+#include "mongo/db/session_txn_record_gen.h"
 
 namespace mongo {
 
@@ -105,6 +107,10 @@ public:
      * Creates OplogApplier::Options for initial sync.
      */
     static OplogApplier::Options makeInitialSyncOptions();
+    /**
+     * Creates OplogApplier::Options for recovery.
+     */
+    static OplogApplier::Options makeRecoveryOptions();
 
 protected:
     void _testSyncApplyCrudOperation(ErrorCodes::Error expectedError,
@@ -146,6 +152,14 @@ protected:
 Status failedApplyCommand(OperationContext* opCtx,
                           const BSONObj& theOperation,
                           OplogApplication::Mode);
+
+void checkTxnTable(OperationContext* opCtx,
+                   const LogicalSessionId& lsid,
+                   const TxnNumber& txnNum,
+                   const repl::OpTime& expectedOpTime,
+                   Date_t expectedWallClock,
+                   boost::optional<repl::OpTime> expectedStartOpTime,
+                   boost::optional<DurableTxnStateEnum> expectedState);
 
 }  // namespace repl
 }  // namespace mongo

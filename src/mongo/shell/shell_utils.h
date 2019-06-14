@@ -29,6 +29,11 @@
 
 #pragma once
 
+#include <boost/filesystem.hpp>
+#include <map>
+#include <set>
+#include <string>
+
 #include "mongo/db/jsobj.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/mutex.h"
@@ -40,7 +45,8 @@ class DBClientBase;
 
 namespace shell_utils {
 
-extern std::string _dbConnect;
+extern std::string dbConnect;
+using EnterpriseShellCallback = void(Scope&);
 
 void RecordMyLocation(const char* _argv0);
 void installShellUtils(Scope& scope);
@@ -48,7 +54,9 @@ void installShellUtils(Scope& scope);
 void initScope(Scope& scope);
 void onConnect(DBClientBase& c);
 
-const char* getUserDir();
+boost::filesystem::path getHistoryFilePath();
+void setEnterpriseShellCallback(EnterpriseShellCallback* callback);
+
 
 BSONElement singleArg(const BSONObj& args);
 extern const BSONObj undefinedReturn;

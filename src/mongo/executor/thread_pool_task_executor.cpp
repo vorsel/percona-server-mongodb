@@ -38,7 +38,6 @@
 #include <utility>
 
 #include "mongo/base/checked_cast.h"
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status_with.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/executor/connection_pool_stats.h"
@@ -61,7 +60,8 @@ MONGO_FAIL_POINT_DEFINE(scheduleIntoPoolSpinsUntilThreadPoolShutsDown);
 }
 
 class ThreadPoolTaskExecutor::CallbackState : public TaskExecutor::CallbackState {
-    MONGO_DISALLOW_COPYING(CallbackState);
+    CallbackState(const CallbackState&) = delete;
+    CallbackState& operator=(const CallbackState&) = delete;
 
 public:
     static std::shared_ptr<CallbackState> make(CallbackFn&& cb,
@@ -106,7 +106,8 @@ public:
 };
 
 class ThreadPoolTaskExecutor::EventState : public TaskExecutor::EventState {
-    MONGO_DISALLOW_COPYING(EventState);
+    EventState(const EventState&) = delete;
+    EventState& operator=(const EventState&) = delete;
 
 public:
     static std::shared_ptr<EventState> make() {
@@ -596,7 +597,9 @@ void ThreadPoolTaskExecutor::scheduleIntoPool_inlock(WorkQueue* fromQueue,
 
     if (MONGO_FAIL_POINT(scheduleIntoPoolSpinsUntilThreadPoolShutsDown)) {
         scheduleIntoPoolSpinsUntilThreadPoolShutsDown.setMode(FailPoint::off);
-        while (_pool->schedule([] {}) != ErrorCodes::ShutdownInProgress) {
+
+        auto checkStatus = [&] { return _pool->execute([] {}).getNoThrow(); };
+        while (!ErrorCodes::isCancelationError(checkStatus().code())) {
             sleepmillis(100);
         }
     }
@@ -610,16 +613,24 @@ void ThreadPoolTaskExecutor::scheduleIntoPool_inlock(WorkQueue* fromQueue,
                 }
 
                 cbState->canceled.store(1);
-                const auto status =
-                    _pool->schedule([this, cbState] { runCallback(std::move(cbState)); });
-                invariant(status.isOK() || status == ErrorCodes::ShutdownInProgress);
+                _pool->schedule([this, cbState](auto status) {
+                    invariant(status.isOK() || ErrorCodes::isCancelationError(status.code()));
+
+                    runCallback(std::move(cbState));
+                });
             });
         } else {
-            const auto status =
-                _pool->schedule([this, cbState] { runCallback(std::move(cbState)); });
-            if (status == ErrorCodes::ShutdownInProgress)
-                break;
-            fassert(28735, status);
+            _pool->schedule([this, cbState](auto status) {
+                if (ErrorCodes::isCancelationError(status.code())) {
+                    stdx::lock_guard<stdx::mutex> lk(_mutex);
+
+                    cbState->canceled.store(1);
+                } else {
+                    fassert(28735, status);
+                }
+
+                runCallback(std::move(cbState));
+            });
         }
     }
     _net->signalWorkAvailable();

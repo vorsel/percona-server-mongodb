@@ -1,7 +1,5 @@
 """Unit tests for the buildscripts.ciconfig.evergreen module."""
 
-from __future__ import absolute_import
-
 import datetime
 import os
 import unittest
@@ -71,7 +69,7 @@ class TestEvergreenProjectConfig(unittest.TestCase):
         self.assertIn("amazon", self.conf.distro_names)
 
 
-class TestTask(unittest.TestCase):  #pylint: disable=too-many-public-methods
+class TestTask(unittest.TestCase):  # pylint: disable=too-many-public-methods
     """Unit tests for the Task class."""
 
     def test_from_dict(self):
@@ -122,12 +120,13 @@ class TestTask(unittest.TestCase):  #pylint: disable=too-many-public-methods
 
     def test_run_tests_multiversion(self):
         multiversion_path = "/data/multiversion"
-        task_commands = [{"func": "do multiversion setup"}, {
-            "func": "run tests", "vars": {
-                "task_path_suffix": multiversion_path,
-                "resmoke_args": "--suites=core --shellWriteMode=commands"
-            }
-        }]
+        task_commands = [{"func": "do multiversion setup"},
+                         {
+                             "func": "run tests", "vars": {
+                                 "task_path_suffix": multiversion_path,
+                                 "resmoke_args": "--suites=core --shellWriteMode=commands"
+                             }
+                         }]
         task_dict = {"name": "jsCore", "commands": task_commands}
         task = _evergreen.Task(task_dict)
 
@@ -146,19 +145,6 @@ class TestTask(unittest.TestCase):  #pylint: disable=too-many-public-methods
         self.assertFalse(task.is_multiversion_task)
         self.assertIsNone(task.multiversion_setup_command)
         self.assertIsNone(task.multiversion_path)
-
-    def test_get_vars_suite_name_run_tests(self):
-        suite_name = "core"
-        task_commands = [{
-            "func": "run tests",
-            "vars": {"resmoke_args": "--suites={} --shellWriteMode=commands".format(suite_name)}
-        }]
-
-        task_dict = {"name": "jsCore", "commands": task_commands}
-        task = _evergreen.Task(task_dict)
-
-        with self.assertRaises(ValueError):
-            task.get_vars_suite_name(task_commands[0]["vars"])
 
     def test_resmoke_args_gen(self):
         task_name = "core"
@@ -252,39 +238,6 @@ class TestTask(unittest.TestCase):  #pylint: disable=too-many-public-methods
         self.assertDictEqual(task_commands[0], task.generate_resmoke_tasks_command)
         self.assertEqual(task_name, task.get_vars_task_name(task_commands[0]["vars"]))
 
-    def test_get_vars_suite_name_generate_resmoke_tasks(self):
-        task_name = "jsCore"
-        suite_name = "core"
-        task_commands = [{
-            "func": "generate resmoke tasks", "vars": {
-                "task": task_name, "suite": suite_name, "resmoke_args": "--shellWriteMode=commands"
-            }
-        }]
-        task_dict = {"name": task_name, "commands": task_commands}
-        task = _evergreen.Task(task_dict)
-
-        self.assertEqual(suite_name, task.get_vars_suite_name(task_commands[0]["vars"]))
-
-    def test_get_vars_suite_name_gen_resmoke_no_vars(self):
-        task_name = "jsCore"
-        task_commands = [{"func": "generate resmoke tasks"}]
-        task_dict = {"name": task_name, "commands": task_commands}
-        task = _evergreen.Task(task_dict)
-
-        with self.assertRaises(TypeError):
-            task.get_vars_suite_name(None)
-
-    def test_get_vars_suite_name_gen_resmoke_notasksuite(self):
-        task_name = "jsCore"
-        task_commands = [{
-            "func": "generate resmoke tasks", "vars": {"resmoke_args": "--shellWriteMode=commands"}
-        }]
-        task_dict = {"name": task_name, "commands": task_commands}
-        task = _evergreen.Task(task_dict)
-
-        with self.assertRaises(ValueError):
-            task.get_vars_suite_name(task_commands[0]["vars"])
-
     def test_gen_resmoke_multiversion(self):
         multiversion_path = "/data/multiversion"
         task_name = "core"
@@ -311,6 +264,52 @@ class TestTask(unittest.TestCase):  #pylint: disable=too-many-public-methods
 
         self.assertFalse(task.is_multiversion_task)
         self.assertIsNone(task.multiversion_path)
+
+    def test_get_vars_suite_name_run_tests(self):
+        suite_name = "core"
+        task_commands = [{
+            "func": "run tests",
+            "vars": {"resmoke_args": "--suites={} --shellWriteMode=commands".format(suite_name)}
+        }]
+
+        task_dict = {"name": "jsCore", "commands": task_commands}
+        task = _evergreen.Task(task_dict)
+
+        with self.assertRaises(ValueError):
+            task.get_vars_suite_name(task_commands[0]["vars"])
+
+    def test_get_vars_suite_name_generate_resmoke_tasks(self):
+        task_name = "jsCore"
+        suite_name = "core"
+        task_commands = [{
+            "func": "generate resmoke tasks", "vars": {
+                "task": task_name, "suite": suite_name, "resmoke_args": "--shellWriteMode=commands"
+            }
+        }]
+        task_dict = {"name": task_name, "commands": task_commands}
+        task = _evergreen.Task(task_dict)
+
+        self.assertEqual(suite_name, task.get_vars_suite_name(task_commands[0]["vars"]))
+
+    def test_get_vars_suite_name_gen_resmoke_no_vars(self):
+        task_name = "jsCore"
+        task_commands = [{"func": "generate resmoke tasks"}]
+        task_dict = {"name": task_name, "commands": task_commands}
+        task = _evergreen.Task(task_dict)
+
+        with self.assertRaises(TypeError):
+            task.get_vars_suite_name(None)
+
+    def test_get_vars_suite_name_gen_resmoke_notask_nosuite(self):
+        task_name = "jsCore"
+        task_commands = [{
+            "func": "generate resmoke tasks", "vars": {"resmoke_args": "--shellWriteMode=commands"}
+        }]
+        task_dict = {"name": task_name, "commands": task_commands}
+        task = _evergreen.Task(task_dict)
+
+        with self.assertRaises(ValueError):
+            task.get_vars_suite_name(task_commands[0]["vars"])
 
     def test_get_vars_task_name(self):
         task_name = "task_name"

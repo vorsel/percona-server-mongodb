@@ -239,7 +239,8 @@ repl::OplogEntry _makeOplogEntry(repl::OpTime opTime,
                             boost::none,                      // statement id
                             boost::none,   // optime of previous write within same transaction
                             boost::none,   // pre-image optime
-                            boost::none);  // post-image optime
+                            boost::none,   // post-image optime
+                            boost::none);  // prepare
 }
 
 /**
@@ -927,7 +928,7 @@ TEST_F(ReplicationRecoveryTest, PrepareTransactionOplogEntryCorrectlyUpdatesConf
     expectedTxnRecord.setTxnNum(*sessionInfo.getTxnNumber());
     expectedTxnRecord.setLastWriteOpTime({Timestamp(2, 0), 1});
     expectedTxnRecord.setLastWriteDate(lastDate);
-    expectedTxnRecord.setStartTimestamp(Timestamp(2, 0));
+    expectedTxnRecord.setStartOpTime({{Timestamp(2, 0), 1}});
     expectedTxnRecord.setState(DurableTxnStateEnum::kPrepared);
 
     std::vector<BSONObj> expectedTxnColl{expectedTxnRecord.toBSON()};

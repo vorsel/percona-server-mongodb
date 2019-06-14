@@ -1794,6 +1794,23 @@ struct __wt_session {
 	 * @config{round_to_oldest, if read timestamp is earlier than oldest
 	 * timestamp\, read timestamp will be rounded to oldest timestamp., a
 	 * boolean flag; default \c false.}
+	 * @config{roundup_timestamps = (, round up timestamps of the
+	 * transaction.  This setting alters the visibility expected in a
+	 * transaction.  See @ref transaction_timestamps., a set of related
+	 * configuration options defined below.}
+	 * @config{&nbsp;&nbsp;&nbsp;&nbsp;prepared, applicable only for
+	 * prepared transactions.  Indicates if the prepare timestamp and the
+	 * commit timestamp of this transaction can be rounded up.  If the
+	 * prepare timestamp is less than the oldest timestamp\, the prepare
+	 * timestamp will be rounded to the oldest timestamp.  If the commit
+	 * timestamp is less than the prepare timestamp\, the commit timestamp
+	 * will be rounded up to the prepare timestamp., a boolean flag; default
+	 * \c false.}
+	 * @config{&nbsp;&nbsp;&nbsp;&nbsp;read, if the read
+	 * timestamp is less than the oldest timestamp\, the read timestamp will
+	 * be rounded up to the oldest timestamp., a boolean flag; default \c
+	 * false.}
+	 * @config{ ),,}
 	 * @config{snapshot, use a named\, in-memory snapshot\, see @ref
 	 * transaction_named_snapshots., a string; default empty.}
 	 * @config{sync, whether to sync log records when the transaction
@@ -1861,9 +1878,8 @@ struct __wt_session {
 	 * @configstart{WT_SESSION.prepare_transaction, see dist/api_data.py}
 	 * @config{prepare_timestamp, set the prepare timestamp for the updates
 	 * of the current transaction.  The supplied value must not be older
-	 * than any active read timestamps.  This configuration option is
-	 * mandatory.  See @ref transaction_timestamps., a string; default
-	 * empty.}
+	 * than any active read timestamps.  See @ref transaction_timestamps., a
+	 * string; default empty.}
 	 * @configend
 	 * @errors
 	 */
@@ -1905,9 +1921,13 @@ struct __wt_session {
 	 * timestamp set for the current transaction.  The value must also not
 	 * be older than the current stable timestamp.  See @ref
 	 * transaction_timestamps., a string; default empty.}
+	 * @config{prepare_timestamp, set the prepare timestamp for the updates
+	 * of the current transaction.  The supplied value must not be older
+	 * than any active read timestamps.  See @ref transaction_timestamps., a
+	 * string; default empty.}
 	 * @config{read_timestamp, read using the specified timestamp.  The
 	 * supplied value must not be older than the current oldest timestamp.
-	 * This can only be set once for a transaction.  @ref
+	 * This can only be set once for a transaction.  See @ref
 	 * transaction_timestamps., a string; default empty.}
 	 * @config{round_to_oldest, if read timestamp is earlier than oldest
 	 * timestamp\, read timestamp will be rounded to oldest timestamp., a

@@ -81,7 +81,8 @@ OplogEntry makeOplogEntry(int ts) {
                       boost::none,                  // statement id
                       boost::none,   // optime of previous write within same transaction
                       boost::none,   // pre-image optime
-                      boost::none);  // post-image optime
+                      boost::none,   // post-image optime
+                      boost::none);  // prepare
 }
 
 TEST_F(MultiApplierTest, InvalidConstruction) {
@@ -265,7 +266,8 @@ TEST_F(
 }
 
 class SharedCallbackState {
-    MONGO_DISALLOW_COPYING(SharedCallbackState);
+    SharedCallbackState(const SharedCallbackState&) = delete;
+    SharedCallbackState& operator=(const SharedCallbackState&) = delete;
 
 public:
     explicit SharedCallbackState(bool* sharedCallbackStateDestroyed)

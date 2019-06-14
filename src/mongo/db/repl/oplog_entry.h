@@ -39,6 +39,32 @@ namespace mongo {
 namespace repl {
 
 /**
+ * A parsed DurableReplOperation along with information about the operation that should only exist
+ * in-memory.
+ *
+ * ReplOperation should always be used over DurableReplOperation when passing around ReplOperations
+ * in server code.
+ */
+
+class ReplOperation : public DurableReplOperation {
+public:
+    static ReplOperation parse(const IDLParserErrorContext& ctxt, const BSONObj& bsonObject) {
+        ReplOperation o;
+        o.parseProtected(ctxt, bsonObject);
+        return o;
+    }
+    const BSONObj& getPreImageDocumentKey() const {
+        return _preImageDocumentKey;
+    }
+    void setPreImageDocumentKey(BSONObj value) {
+        _preImageDocumentKey = std::move(value);
+    }
+
+private:
+    BSONObj _preImageDocumentKey;
+};
+
+/**
  * A parsed oplog entry that inherits from the OplogEntryBase parsed by the IDL.
  * This class is immutable.
  */
@@ -81,7 +107,7 @@ public:
                                              const BSONObj& docToDelete);
 
     // Get the in-memory size in bytes of a ReplOperation.
-    static size_t getReplOperationSize(const ReplOperation& op);
+    static size_t getDurableReplOperationSize(const DurableReplOperation& op);
 
     static StatusWith<OplogEntry> parse(const BSONObj& object);
 
@@ -100,7 +126,8 @@ public:
                const boost::optional<StmtId>& statementId,
                const boost::optional<OpTime>& prevWriteOpTimeInTransaction,
                const boost::optional<OpTime>& preImageOpTime,
-               const boost::optional<OpTime>& postImageOpTime);
+               const boost::optional<OpTime>& postImageOpTime,
+               const boost::optional<bool>& prepare);
 
     // DEPRECATED: This constructor can throw. Use static parse method instead.
     explicit OplogEntry(BSONObj raw);
@@ -114,6 +141,15 @@ public:
      * Returns if the oplog entry is for a command operation.
      */
     bool isCommand() const;
+
+    /**
+     * Returns if the oplog entry is part of a transaction that has not yet been prepared or
+     * committed.  The actual "prepare" or "commit" oplog entries do not have an inTxn field
+     * and so this method will always return false for them.
+     */
+    bool isInPendingTransaction() const {
+        return getInTxn() && *getInTxn();
+    }
 
     /**
      * Returns if the oplog entry is for a CRUD operation.
@@ -140,7 +176,7 @@ public:
     BSONObj getOperationToApply() const;
 
     /**
-     * Returns the type of command of the oplog entry. Must be called on a command op.
+     * Returns the type of command of the oplog entry. If it is not a command, returns kNotCommand.
      */
     CommandType getCommandType() const;
 

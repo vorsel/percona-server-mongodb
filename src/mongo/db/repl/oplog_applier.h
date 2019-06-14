@@ -33,14 +33,15 @@
 #include <boost/optional.hpp>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/db/repl/oplog_buffer.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/functional.h"
 #include "mongo/util/future.h"
 #include "mongo/util/net/hostandport.h"
 
@@ -52,7 +53,8 @@ namespace repl {
  * Reads from an OplogBuffer batches of operations that may be applied in parallel.
  */
 class OplogApplier {
-    MONGO_DISALLOW_COPYING(OplogApplier);
+    OplogApplier(const OplogApplier&) = delete;
+    OplogApplier& operator=(const OplogApplier&) = delete;
 
 public:
     /**
@@ -96,6 +98,10 @@ public:
     class Observer;
 
     using Operations = std::vector<OplogEntry>;
+
+    // Used by SyncTail to access batching logic.
+    using GetNextApplierBatchFn = stdx::function<StatusWith<OplogApplier::Operations>(
+        OperationContext* opCtx, const BatchLimits& batchLimits)>;
 
     /**
      * Lower bound of batch limit size (in bytes) returned by calculateBatchLimitBytes().
@@ -148,6 +154,11 @@ public:
     void shutdown();
 
     /**
+     * Returns true if we are shutting down.
+     */
+    bool inShutdown() const;
+
+    /**
      * Pushes operations read into oplog buffer.
      * Accepts both Operations (OplogEntry) and OplogBuffer::Batch (BSONObj) iterators.
      * This supports current implementations of OplogFetcher and OplogBuffer which work in terms of
@@ -189,6 +200,11 @@ public:
 
 private:
     /**
+     * Pops the operation at the front of the OplogBuffer.
+     */
+    void _consume(OperationContext* opCtx, OplogBuffer* oplogBuffer);
+
+    /**
      * Called from startup() to run oplog application loop.
      * Currently applicable to steady state replication only.
      * Implemented in subclasses but not visible otherwise.
@@ -217,6 +233,12 @@ private:
 
     // Not owned by us.
     Observer* const _observer;
+
+    // Protects member data of OplogApplier.
+    mutable stdx::mutex _mutex;
+
+    // Set to true if shutdown() has been called.
+    bool _inShutdown = false;
 };
 
 /**

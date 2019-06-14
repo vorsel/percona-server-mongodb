@@ -56,6 +56,9 @@ public:
         transport::ConnectSSLMode sslMode,
         size_t generation) override;
     std::shared_ptr<ConnectionPool::TimerInterface> makeTimer() override;
+    OutOfLineExecutor& getExecutor() override {
+        return *_reactor;
+    }
 
     Date_t now() override;
 
@@ -77,7 +80,8 @@ private:
 class TLTypeFactory::Type : public std::enable_shared_from_this<TLTypeFactory::Type> {
     friend class TLTypeFactory;
 
-    MONGO_DISALLOW_COPYING(Type);
+    Type(const Type&) = delete;
+    Type& operator=(const Type&) = delete;
 
 public:
     explicit Type(const std::shared_ptr<TLTypeFactory>& factory);

@@ -113,6 +113,9 @@ BSONObj createCommandForMergingShard(const AggregationRequest& request,
     mergeCmd["pipeline"] = Value(pipelineForMerging->serialize());
     mergeCmd[AggregationRequest::kFromMongosName] = Value(true);
 
+    mergeCmd[AggregationRequest::kRuntimeConstants] =
+        Value(mergeCtx->getRuntimeConstants().toBSON());
+
     // If the user didn't specify a collation already, make sure there's a collation attached to
     // the merge command, since the merging shard may not have the collection metadata.
     if (mergeCmd.peek()["collation"].missing()) {
@@ -178,8 +181,15 @@ sharded_agg_helpers::DispatchShardPipelineResults dispatchExchangeConsumerPipeli
 
         consumerPipelines.emplace_back(std::move(consumerPipeline), nullptr, boost::none);
 
-        auto consumerCmdObj = sharded_agg_helpers::createCommandForTargetedShards(
-            opCtx, request, litePipe, consumerPipelines.back(), collationObj, boost::none, false);
+        auto consumerCmdObj =
+            sharded_agg_helpers::createCommandForTargetedShards(opCtx,
+                                                                request,
+                                                                litePipe,
+                                                                consumerPipelines.back(),
+                                                                collationObj,
+                                                                boost::none,
+                                                                expCtx->getRuntimeConstants(),
+                                                                false);
 
         requests.emplace_back(shardDispatchResults->exchangeSpec->consumerShards[idx],
                               consumerCmdObj);
@@ -260,9 +270,28 @@ Status appendExplainResults(sharded_agg_helpers::DispatchShardPipelineResults&& 
     BSONObjBuilder shardExplains(result->subobjStart("shards"));
     for (const auto& shardResult : dispatchResults.remoteExplainOutput) {
         invariant(shardResult.shardHostAndPort);
-        shardExplains.append(shardResult.shardId.toString(),
-                             BSON("host" << shardResult.shardHostAndPort->toString() << "stages"
-                                         << shardResult.swResponse.getValue().data["stages"]));
+
+        uassertStatusOK(shardResult.swResponse.getStatus());
+        uassertStatusOK(getStatusFromCommandResult(shardResult.swResponse.getValue().data));
+
+        auto shardId = shardResult.shardId.toString();
+        const auto& data = shardResult.swResponse.getValue().data;
+        BSONObjBuilder explain(shardExplains.subobjStart(shardId));
+        explain << "host" << shardResult.shardHostAndPort->toString();
+        if (auto stagesElement = data["stages"]) {
+            explain << "stages" << stagesElement;
+        } else {
+            auto queryPlannerElement = data["queryPlanner"];
+            uassert(51157,
+                    str::stream() << "Malformed explain response received from shard " << shardId
+                                  << ": "
+                                  << data.toString(),
+                    queryPlannerElement);
+            explain << "queryPlanner" << queryPlannerElement;
+            if (auto executionStatsElement = data["executionStats"]) {
+                explain << "executionStats" << executionStatsElement;
+            }
+        }
     }
 
     return Status::OK();
@@ -704,6 +733,9 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
                                       const PrivilegeVector& privileges,
                                       BSONObjBuilder* result) {
     uassert(51028, "Cannot specify exchange option to a mongos", !request.getExchangeSpec());
+    uassert(51143,
+            "Cannot specify runtime constants option to a mongos",
+            !request.getRuntimeConstants());
     uassert(51089,
             str::stream() << "Internal parameter(s) [" << AggregationRequest::kNeedsMergeName
                           << ", "
@@ -799,7 +831,6 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
     // If the operation is an explain, then we verify that it succeeded on all targeted shards,
     // write the results to the output builder, and return immediately.
     if (expCtx->explain) {
-        uassertAllShardsSupportExplain(shardDispatchResults.remoteExplainOutput);
         return appendExplainResults(std::move(shardDispatchResults), expCtx, result);
     }
 
@@ -840,25 +871,6 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
                                    privileges);
 }
 
-void ClusterAggregate::uassertAllShardsSupportExplain(
-    const std::vector<AsyncRequestsSender::Response>& shardResults) {
-    for (const auto& result : shardResults) {
-        auto status = result.swResponse.getStatus();
-        if (status.isOK()) {
-            status = getStatusFromCommandResult(result.swResponse.getValue().data);
-        }
-        uassert(17403,
-                str::stream() << "Shard " << result.shardId.toString() << " failed: "
-                              << causedBy(status),
-                status.isOK());
-
-        uassert(17404,
-                str::stream() << "Shard " << result.shardId.toString()
-                              << " does not support $explain",
-                result.swResponse.getValue().data.hasField("stages"));
-    }
-}
-
 Status ClusterAggregate::aggPassthrough(OperationContext* opCtx,
                                         const Namespaces& namespaces,
                                         const ShardId& shardId,
@@ -870,7 +882,7 @@ Status ClusterAggregate::aggPassthrough(OperationContext* opCtx,
     // explain if necessary, and rewrites the result into a format safe to forward to shards.
     BSONObj cmdObj = CommandHelpers::filterCommandRequestForPassthrough(
         sharded_agg_helpers::createPassthroughCommandForShard(
-            opCtx, aggRequest, shardId, nullptr, BSONObj()));
+            opCtx, aggRequest, boost::none, nullptr, BSONObj()));
 
     MultiStatementTransactionRequestsSender ars(
         opCtx,

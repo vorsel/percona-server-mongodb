@@ -37,7 +37,6 @@
 #include <vector>
 
 #include "mongo/base/data_type.h"
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/string_data.h"
 #include "mongo/base/string_data_comparator_interface.h"
 #include "mongo/bson/bson_comparator_interface_base.h"
@@ -503,6 +502,10 @@ public:
         return *p == EOO ? "" : p + 1;
     }
 
+    StringData firstElementFieldNameStringData() const {
+        return StringData(firstElementFieldName());
+    }
+
     BSONType firstElementType() const {
         const char* p = objdata() + 4;
         return (BSONType)*p;
@@ -754,7 +757,8 @@ private:
 
 /** Base class implementing ordered iteration through BSONElements. */
 class BSONIteratorSorted {
-    MONGO_DISALLOW_COPYING(BSONIteratorSorted);
+    BSONIteratorSorted(const BSONIteratorSorted&) = delete;
+    BSONIteratorSorted& operator=(const BSONIteratorSorted&) = delete;
 
 public:
     ~BSONIteratorSorted() {

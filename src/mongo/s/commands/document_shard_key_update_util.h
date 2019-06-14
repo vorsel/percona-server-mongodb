@@ -36,6 +36,7 @@
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/executor/task_executor_pool.h"
+#include "mongo/s/transaction_router.h"
 
 namespace mongo {
 
@@ -58,13 +59,23 @@ namespace documentShardKeyUpdateUtil {
  * creates the necessary extra operations. It will then run each operation using the ClusterWriter.
  * If any statement throws, an exception will leave this method, and must be handled by external
  * callers.
- *
- * This is the only method that should be called outside of this class.
  */
-void updateShardKeyForDocument(OperationContext* opCtx,
+bool updateShardKeyForDocument(OperationContext* opCtx,
                                const NamespaceString& nss,
                                const WouldChangeOwningShardInfo& documentKeyChangeInfo,
                                int stmtId);
+
+/**
+ * Gets the transaction router and starts a transaction on this session. This method is called when
+ * WouldChangeOwningShard is thrown for a write that is not in a transaction already.
+ */
+TransactionRouter* startTransactionForShardKeyUpdate(OperationContext* opCtx);
+
+/**
+ * Commits the transaction on this session. This method is called to commit the transaction started
+ * when WouldChangeOwningShard is thrown for a write that is not in a transaction already.
+ */
+void commitShardKeyUpdateTransaction(OperationContext* opCtx, TransactionRouter* txnRouter);
 
 /**
  * Creates the BSONObj that will be used to delete the pre-image document. Will also attach
@@ -74,8 +85,7 @@ void updateShardKeyForDocument(OperationContext* opCtx,
  * intermediary test coverage.
  */
 BSONObj constructShardKeyDeleteCmdObj(const NamespaceString& nss,
-                                      const BSONObj& originalQueryPredicate,
-                                      const BSONObj& updatePostImage,
+                                      const BSONObj& updatePreImage,
                                       int stmtId);
 
 /*

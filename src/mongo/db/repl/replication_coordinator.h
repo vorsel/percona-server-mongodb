@@ -31,10 +31,10 @@
 
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/bson/timestamp.h"
+#include "mongo/db/repl/member_data.h"
 #include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/sync_source_selector.h"
@@ -69,6 +69,7 @@ namespace repl {
 class BackgroundSync;
 class IsMasterResponse;
 class OpTime;
+struct OpTimeAndWallTime;
 class ReadConcernArgs;
 class ReplSetConfig;
 class ReplSetHeartbeatArgsV1;
@@ -83,7 +84,8 @@ class UpdatePositionArgs;
  * API that the replication subsystem presents to the rest of the codebase.
  */
 class ReplicationCoordinator : public SyncSourceSelector {
-    MONGO_DISALLOW_COPYING(ReplicationCoordinator);
+    ReplicationCoordinator(const ReplicationCoordinator&) = delete;
+    ReplicationCoordinator& operator=(const ReplicationCoordinator&) = delete;
 
 public:
     static ReplicationCoordinator* get(ServiceContext* service);
@@ -109,6 +111,15 @@ public:
      * initialization they need.
      */
     virtual void startup(OperationContext* opCtx) = 0;
+
+    /**
+     * Start terminal shutdown.  This causes the topology coordinator to refuse to vote in any
+     * further elections.  This should only be called from global shutdown after we've passed the
+     * point of no return.
+     *
+     * This should be called once we are sure to call shutdown().
+     */
+    virtual void enterTerminalShutdown() = 0;
 
     /**
      * Does whatever cleanup is required to stop replication, including instructing the other
@@ -296,7 +307,8 @@ public:
                                              const NamespaceString& ns) = 0;
 
     /**
-     * Updates our internal tracking of the last OpTime applied to this node.
+     * Updates our internal tracking of the last OpTime applied to this node. Also updates our
+     * internal tracking of the wall clock time corresponding to that operation.
      *
      * The new value of "opTime" must be no less than any prior value passed to this method, and
      * it is the caller's job to properly synchronize this behavior.  The exception to this rule
@@ -304,10 +316,11 @@ public:
      * "opTime" is reset based on the contents of the oplog, and may go backwards due to
      * rollback. Additionally, the optime given MUST represent a consistent database state.
      */
-    virtual void setMyLastAppliedOpTime(const OpTime& opTime) = 0;
+    virtual void setMyLastAppliedOpTimeAndWallTime(const OpTimeAndWallTime& opTimeAndWallTime) = 0;
 
     /**
-     * Updates our internal tracking of the last OpTime durable to this node.
+     * Updates our internal tracking of the last OpTime durable to this node. Also updates our
+     * internal tracking of the wall clock time corresponding to that operation.
      *
      * The new value of "opTime" must be no less than any prior value passed to this method, and
      * it is the caller's job to properly synchronize this behavior.  The exception to this rule
@@ -315,7 +328,7 @@ public:
      * "opTime" is reset based on the contents of the oplog, and may go backwards due to
      * rollback.
      */
-    virtual void setMyLastDurableOpTime(const OpTime& opTime) = 0;
+    virtual void setMyLastDurableOpTimeAndWallTime(const OpTimeAndWallTime& opTimeAndWallTime) = 0;
 
     /**
      * This type is used to represent the "consistency" of a current database state. In
@@ -330,25 +343,28 @@ public:
      * Updates our internal tracking of the last OpTime applied to this node, but only
      * if the supplied optime is later than the current last OpTime known to the replication
      * coordinator. The 'consistency' argument must tell whether or not the optime argument
-     * represents a consistent database state.
+     * represents a consistent database state. Also updates the wall clock time corresponding to
+     * that operation.
      *
      * This function is used by logOp() on a primary, since the ops in the oplog do not
      * necessarily commit in sequential order. It is also used when we finish oplog batch
      * application on secondaries, to avoid any potential race conditions around setting the
      * applied optime from more than one thread.
      */
-    virtual void setMyLastAppliedOpTimeForward(const OpTime& opTime,
-                                               DataConsistency consistency) = 0;
+    virtual void setMyLastAppliedOpTimeAndWallTimeForward(
+        const OpTimeAndWallTime& opTimeAndWallTime, DataConsistency consistency) = 0;
 
     /**
      * Updates our internal tracking of the last OpTime durable to this node, but only
      * if the supplied optime is later than the current last OpTime known to the replication
-     * coordinator.
+     * coordinator. Also updates the wall clock time corresponding to that operation.
      *
      * This function is used by logOp() on a primary, since the ops in the oplog do not
      * necessarily commit in sequential order.
      */
-    virtual void setMyLastDurableOpTimeForward(const OpTime& opTime) = 0;
+    virtual void setMyLastDurableOpTimeAndWallTimeForward(
+        const OpTimeAndWallTime& opTimeAndWallTime) = 0;
+    // virtual void setMyLastDurableOpTimeForward(const OpTimeAndWallTime& opTimeAndWallTime) = 0;
 
     /**
      * Same as above, but used during places we need to zero our last optime.
@@ -365,10 +381,22 @@ public:
      */
     virtual OpTime getMyLastAppliedOpTime() const = 0;
 
+    /*
+     * Returns the same as getMyLastAppliedOpTime() and additionally returns the wall clock time
+     * corresponding to that OpTime.
+     */
+    virtual OpTimeAndWallTime getMyLastAppliedOpTimeAndWallTime() const = 0;
+
     /**
      * Returns the last optime recorded by setMyLastDurableOpTime.
      */
     virtual OpTime getMyLastDurableOpTime() const = 0;
+
+    /*
+     * Returns the same as getMyLastDurableOpTime() and additionally returns the wall clock time
+     * corresponding to that OpTime.
+     */
+    virtual OpTimeAndWallTime getMyLastDurableOpTimeAndWallTime() const = 0;
 
     /**
      * Waits until the optime of the current node is at least the opTime specified in 'settings'.
@@ -587,9 +615,12 @@ public:
     virtual void processReplSetMetadata(const rpc::ReplSetMetadata& replMetadata) = 0;
 
     /**
-     * This updates the node's notion of the commit point.
+     * This updates the node's notion of the commit point. We ignore 'committedOptime' if it has a
+     * different term than our lastApplied, unless 'fromSyncSource'=true, which guarantees we are on
+     * the same branch of history as 'committedOptime', so we update our commit point to
+     * min(committedOptime, lastApplied).
      */
-    virtual void advanceCommitPoint(const OpTime& committedOptime) = 0;
+    virtual void advanceCommitPoint(const OpTime& committedOptime, bool fromSyncSource) = 0;
 
     /**
      * Elections under protocol version 1 are triggered by a timer.
@@ -724,6 +755,12 @@ public:
      * operation in their oplogs.  This implies such ops will never be rolled back.
      */
     virtual OpTime getLastCommittedOpTime() const = 0;
+
+    /**
+     * Returns a list of objects that contain this node's knowledge of the state of the members of
+     * the replica set.
+     */
+    virtual std::vector<MemberData> getMemberData() const = 0;
 
     /*
     * Handles an incoming replSetRequestVotes command.

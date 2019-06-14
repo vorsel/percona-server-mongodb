@@ -582,11 +582,9 @@ __las_insert_block_verbose(
 		(void)__wt_eviction_clean_needed(session, &pct_full);
 		(void)__wt_eviction_dirty_needed(session, &pct_dirty);
 		__wt_timestamp_to_string(
-		    multi->page_las.unstable_timestamp,
-		    ts_string[0], sizeof(ts_string));
+		    multi->page_las.unstable_timestamp, ts_string[0]);
 		__wt_timestamp_to_string(
-		    multi->page_las.unstable_durable_timestamp,
-		    ts_string[1], sizeof(ts_string));
+		    multi->page_las.unstable_durable_timestamp, ts_string[1]);
 
 		__wt_verbose(session,
 		    WT_VERB_LOOKASIDE | WT_VERB_LOOKASIDE_ACTIVITY,
@@ -1144,15 +1142,17 @@ __wt_las_sweep(WT_SESSION_IMPL *session)
 			    session, saved_key, las_key.data, las_key.size));
 
 			/*
-			 * Never expect an entry with prepare locked state or
-			 * with durable timestamp as max timestamp or with
-			 * in-progress prepare state and non-zero durable
-			 * timestamp. In all other cases the durable timestamp
-			 * is higher or same as the las timestamp.
+			 * Expect an update entry with:
+			 *	1. not in a prepare locked state
+			 *	2. durable timestamp as not max timestamp.
+			 *	3. for an in-progress prepared update, durable
+			 *	timestamp should be zero.
+			 *	4. no restriction on durable timestamp value
+			 *	for other updates.
 			 */
 			WT_ASSERT(session,
-			    prepare_state != WT_PREPARE_LOCKED ||
-			    durable_timestamp != WT_TS_MAX ||
+			    prepare_state != WT_PREPARE_LOCKED &&
+			    durable_timestamp != WT_TS_MAX &&
 			    (prepare_state != WT_PREPARE_INPROGRESS ||
 			    durable_timestamp == 0));
 
