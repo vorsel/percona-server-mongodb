@@ -116,7 +116,7 @@ TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 
     // Though some shards don't own data for the sharded collection, createIndex, reIndex,
     // dropIndex, and collMod (which are broadcast to all shards) report overall success (that is,
-    // NamespaceNotFound-type errors from shards are ignored, though they are included in the 'raw'
+    // NamespaceNotFound-type errors from shards are ignored, and they are not included in the 'raw'
     // shard responses).
 
     var res;
@@ -126,8 +126,9 @@ TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
     assert.commandWorked(res);
     assert.eq(res.raw[st.shard0.host].ok, 1, tojson(res));
     assert.eq(res.raw[st.shard1.host].ok, 1, tojson(res));
-    assert.eq(
-        res.raw[st.shard2.host].code, ErrorCodes.CannotImplicitlyCreateCollection, tojson(res));
+    assert.eq(undefined,
+              res.raw[st.shard2.host],
+              tojson(res));  // CannotImplicitlyCreateCollection is ignored
     checkShardIndexes("idx2", [st.shard0, st.shard1], [st.shard2]);
 
     // dropIndex
@@ -135,7 +136,7 @@ TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
     assert.commandWorked(res);
     assert.eq(res.raw[st.shard0.host].ok, 1, tojson(res));
     assert.eq(res.raw[st.shard1.host].ok, 1, tojson(res));
-    assert.eq(res.raw[st.shard2.host].code, ErrorCodes.NamespaceNotFound, tojson(res));
+    assert.eq(undefined, res.raw[st.shard2.host], tojson(res));  // NamespaceNotFound is ignored
     checkShardIndexes("idx1", [], [st.shard0, st.shard1, st.shard2]);
 
     // collMod
@@ -149,7 +150,7 @@ TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
     assert.commandWorked(res);
     assert.eq(res.raw[st.shard0.host].ok, 1, tojson(res));
     assert.eq(res.raw[st.shard1.host].ok, 1, tojson(res));
-    assert.eq(res.raw[st.shard2.host].code, ErrorCodes.NamespaceNotFound, tojson(res));
+    assert.eq(undefined, res.raw[st.shard2.host], tojson(res));  // NamespaceNotFound is ignored
     checkShardCollOption("validator", validationOption2, [st.shard0, st.shard1], [st.shard2]);
 
     // Check that errors from shards are aggregated correctly.
@@ -178,6 +179,20 @@ TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
     assert.eq("CannotCreateIndex", res.codeName, tojson(res));
     assert.neq(null, res.errmsg, tojson(res));
 
+    // If all the non-ignorable errors reported by shards are the same, the overall command error
+    // should be set to that error.
+    res = st.s.getDB(dbName).getCollection(collName).createIndex({z: 1}, {unique: true});
+    assert.eq(res.raw[st.shard0.host].ok, 0, tojson(res));
+    assert.eq(res.raw[st.shard1.host].ok, 0, tojson(res));
+    assert.eq(null, res.raw[st.shard2.host], tojson(res));
+    assert.eq(ErrorCodes.CannotCreateIndex, res.raw[st.shard0.host].code, tojson(res));
+    assert.eq(ErrorCodes.CannotCreateIndex, res.raw[st.shard1.host].code, tojson(res));
+    assert.eq("CannotCreateIndex", res.raw[st.shard0.host].codeName, tojson(res));
+    assert.eq("CannotCreateIndex", res.raw[st.shard1.host].codeName, tojson(res));
+    assert.eq(res.code, ErrorCodes.CannotCreateIndex, tojson(res));
+    assert.eq("CannotCreateIndex", res.codeName, tojson(res));
+    assert.neq(null, res.errmsg, tojson(res));
+
     st.rs0.stopSet();
 
     // If we receive a non-ignorable error, it should be reported as the command error.
@@ -199,7 +214,7 @@ TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
     assert.eq(res.raw[st.shard0.host].ok, 0, tojson(res));  // shard was down
     assert.eq(
         res.raw[st.shard1.host].ok, 1, tojson(res));  // gets created on shard that owns chunks
-    assert.eq(res.raw[st.shard2.host].ok, 0, tojson(res));  // shard does not own chunks
+    assert.eq(undefined, res.raw[st.shard2.host], tojson(res));  // shard does not own chunks
     assert.eq(res.code, res.raw[st.shard0.host].code, tojson(res));
     assert.eq(res.codeName, res.raw[st.shard0.host].codeName, tojson(res));
     // We can expect to see 'FailedToSatisfyReadPreference' this time, because after the previous

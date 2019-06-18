@@ -274,7 +274,6 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(OperationContext* o
     if (txnNumber) {
         auto sessionId = operationSessionInfo.getSessionId();
         invariant(sessionId);
-        invariant(oplogEntry.getStatementId());
 
         auto transactionTableUUID = fixUpInfo.transactionTableUUID;
         if (transactionTableUUID) {
@@ -592,17 +591,6 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(OperationContext* o
             }
             case OplogEntry::CommandType::kAbortTransaction: {
                 return Status::OK();
-            }
-            // TODO(SERVER-40728): Remove commitTransaction handling for unprepared transactions.
-            case OplogEntry::CommandType::kCommitTransaction: {
-                IDLParserErrorContext ctx("commitTransaction");
-                auto commitCommand = CommitTransactionOplogObject::parse(ctx, obj);
-                const bool prepared = !commitCommand.getPrepared() || *commitCommand.getPrepared();
-                if (!prepared) {
-                    log() << "Ignoring unprepared commitTransaction during rollback: "
-                          << redact(oplogEntry.toBSON());
-                    return Status::OK();
-                }
             }
             default: {
                 std::string message = str::stream() << "Can't roll back this command yet: "
@@ -1581,7 +1569,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
 
     // If necessary, clear the memory of existing sessions.
     if (fixUpInfo.refetchTransactionDocs) {
-        MongoDSessionCatalog::invalidateSessions(opCtx, boost::none);
+        MongoDSessionCatalog::invalidateAllSessions(opCtx);
     }
 
     if (auto validator = LogicalTimeValidator::get(opCtx)) {

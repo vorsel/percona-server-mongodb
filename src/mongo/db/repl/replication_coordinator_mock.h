@@ -179,7 +179,8 @@ public:
 
     virtual Status processReplSetGetStatus(BSONObjBuilder*, ReplSetGetStatusResponseStyle);
 
-    virtual void fillIsMasterForReplSet(IsMasterResponse* result);
+    void fillIsMasterForReplSet(IsMasterResponse* result,
+                                const SplitHorizon::Parameters& horizon) override;
 
     virtual void appendSlaveInfoData(BSONObjBuilder* result);
 
@@ -310,6 +311,8 @@ public:
 
     virtual void attemptToAdvanceStableTimestamp() override;
 
+    virtual void setCanAcceptNonLocalWrites(bool canAcceptNonLocalWrites);
+
 private:
     AtomicWord<unsigned long long> _snapshotNameGenerator;
     ServiceContext* const _service;
@@ -327,6 +330,7 @@ private:
     bool _alwaysAllowWrites = false;
     bool _resetLastOpTimesCalled = false;
     long long _term = OpTime::kInitialTerm;
+    bool _canAcceptNonLocalWrites = false;
 };
 
 }  // namespace repl

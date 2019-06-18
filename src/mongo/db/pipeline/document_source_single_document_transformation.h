@@ -62,6 +62,7 @@ public:
                                      DiskUseRequirement::kNoDiskUse,
                                      FacetRequirement::kAllowed,
                                      TransactionRequirement::kAllowed,
+                                     LookupRequirement::kAllowed,
                                      ChangeStreamRequirement::kWhitelist);
         constraints.canSwapWithMatch = true;
         constraints.canSwapWithLimitAndSample = true;
@@ -72,7 +73,7 @@ public:
         return constraints;
     }
 
-    boost::optional<MergingLogic> mergingLogic() final {
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
         return boost::none;
     }
 

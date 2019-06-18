@@ -68,6 +68,14 @@ public:
         return false;
     }
 
+    bool allowsAfterClusterTime(const BSONObj& cmd) const override {
+        return false;
+    }
+
+    bool canIgnorePrepareConflicts() const override {
+        return true;
+    }
+
     ReadWriteType getReadWriteType() const override {
         return ReadWriteType::kRead;
     }
@@ -223,7 +231,7 @@ public:
             opCtx,
             dbname,
             MODE_IS,
-            [&](Collection* collection, CollectionCatalogEntry* catalogEntry) {
+            [&](const Collection* collection, const CollectionCatalogEntry* catalogEntry) {
                 auto collNss = collection->ns();
 
                 if (collNss.size() - 1 <= dbname.size()) {

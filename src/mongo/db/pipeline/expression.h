@@ -244,6 +244,9 @@ public:
     const auto& getChildren() const {
         return _children;
     }
+    auto& getChildren() {
+        return _children;
+    }
 
 protected:
     using ExpressionVector = std::vector<boost::intrusive_ptr<Expression>>;
@@ -563,6 +566,10 @@ public:
     Value getValue() const {
         return _value;
     }
+
+    void setValue(const Value& value) {
+        _value = value;
+    };
 
     void acceptVisitor(ExpressionVisitor* visitor) final {
         return visitor->visit(this);
@@ -1631,6 +1638,8 @@ private:
     enum MetaType {
         TEXT_SCORE,
         RAND_VAL,
+        SEARCH_SCORE,
+        SEARCH_HIGHLIGHTS,
     };
 
     ExpressionMeta(const boost::intrusive_ptr<ExpressionContext>& expCtx, MetaType metaType);
@@ -2320,6 +2329,10 @@ public:
     explicit ExpressionTrunc(const boost::intrusive_ptr<ExpressionContext>& expCtx)
         : ExpressionRangedArity<ExpressionTrunc, 1, 2>(expCtx) {}
 
+    static boost::intrusive_ptr<Expression> parse(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        BSONElement elem,
+        const VariablesParseState& vps);
     Value evaluate(const Document& root) const final;
     const char* getOpName() const final;
 

@@ -2069,8 +2069,6 @@ TEST(JSONSchemaParserTest, ParseSucceedsIfEncryptFieldsAreValid) {
                                             << "string"
                                             << "keyId"
                                             << "/pointer"
-                                            << "initializationVector"
-                                            << BSONBinData("four", 4, BinDataType::BinDataGeneral)
                                             << "algorithm"
                                             << "AEAD_AES_256_CBC_HMAC_SHA_512-Deterministic"))));
     auto result = JSONSchemaParser::parse(new ExpressionContextForTest(), schema);
@@ -2127,7 +2125,6 @@ TEST(JSONSchemaParserTest, FailsToParseWithBadPointer) {
 TEST(JSONSchemaParserTest, TopLevelEncryptMetadataValidatedCorrectly) {
     BSONObj schema = fromjson(
         "{encryptMetadata: {algorithm: \"AEAD_AES_256_CBC_HMAC_SHA_512-Deterministic\","
-        "initializationVector: {$binary: \"four\", $type: \"00\"},"
         " keyId: [{$binary: \"ASNFZ4mrze/ty6mHZUMhAQ==\", $type: \"04\"}]}}");
     auto result = JSONSchemaParser::parse(new ExpressionContextForTest(), schema);
     ASSERT_OK(result.getStatus());
@@ -2164,139 +2161,6 @@ TEST(JSONSchemaParserTest, FailsToParseWithNonUUIDArrayElement) {
         BSON("properties" << BSON("foo" << BSON("encrypt" << BSON("keyId" << builder.arr()))));
     auto result = JSONSchemaParser::parse(new ExpressionContextForTest(), schema);
     ASSERT_EQ(result.getStatus().code(), 51084);
-}
-
-TEST(JSONSchemaParserTest, FailsToParseWithNoBSONTypeInDeterministicEncrypt) {
-    auto uuid = UUID::gen();
-    BSONObj schema = BSON("encrypt" << BSON("algorithm"
-                                            << "AEAD_AES_256_CBC_HMAC_SHA_512-Deterministic"
-                                            << "initializationVector"
-                                            << BSONBinData(NULL, 0, BinDataType::BinDataGeneral)
-                                            << "keyId"
-                                            << BSON_ARRAY(uuid)));
-    auto result = JSONSchemaParser::parse(new ExpressionContextForTest(), schema);
-    ASSERT_EQ(result.getStatus().code(), 31051);
-}
-
-TEST(JSONSchemaParserTest, FailsToParseWithBSONTypeObjectInDeterministicEncrypt) {
-    auto uuid = UUID::gen();
-    BSONObj schema = BSON("encrypt" << BSON("algorithm"
-                                            << "AEAD_AES_256_CBC_HMAC_SHA_512-Deterministic"
-                                            << "initializationVector"
-                                            << BSONBinData(NULL, 0, BinDataType::BinDataGeneral)
-                                            << "keyId"
-                                            << BSON_ARRAY(uuid)
-                                            << "bsonType"
-                                            << "object"));
-    auto result = JSONSchemaParser::parse(new ExpressionContextForTest(), schema);
-    ASSERT_EQ(result.getStatus().code(), 31051);
-}
-
-TEST(JSONSchemaParserTest, FailsToParseWithEmptyArrayBSONTypeInDeterministicEncrypt) {
-    auto uuid = UUID::gen();
-    BSONObj schema = BSON("encrypt" << BSON("algorithm"
-                                            << "AEAD_AES_256_CBC_HMAC_SHA_512-Deterministic"
-                                            << "initializationVector"
-                                            << BSONBinData(NULL, 0, BinDataType::BinDataGeneral)
-                                            << "keyId"
-                                            << BSON_ARRAY(uuid)
-                                            << "bsonType"
-                                            << BSONArray()));
-    auto result = JSONSchemaParser::parse(new ExpressionContextForTest(), schema);
-    ASSERT_EQ(result.getStatus().code(), 31051);
-}
-
-TEST(JSONSchemaParserTest, FailsToParseWithMultipleElementArrayBSONTypeInDeterministicEncrypt) {
-    auto uuid = UUID::gen();
-    BSONObj schema = BSON("encrypt" << BSON("algorithm"
-                                            << "AEAD_AES_256_CBC_HMAC_SHA_512-Deterministic"
-                                            << "initializationVector"
-                                            << BSONBinData(NULL, 0, BinDataType::BinDataGeneral)
-                                            << "keyId"
-                                            << BSON_ARRAY(uuid)
-                                            << "bsonType"
-                                            << BSON_ARRAY("int"
-                                                          << "string")));
-    auto result = JSONSchemaParser::parse(new ExpressionContextForTest(), schema);
-    ASSERT_EQ(result.getStatus().code(), 31051);
-}
-
-TEST(JSONSchemaParserTest, FailsToParseWithObjectInArrayBSONTypeInDeterministicEncrypt) {
-    auto uuid = UUID::gen();
-    BSONObj schema = BSON("encrypt" << BSON("algorithm"
-                                            << "AEAD_AES_256_CBC_HMAC_SHA_512-Deterministic"
-                                            << "initializationVector"
-                                            << BSONBinData(NULL, 0, BinDataType::BinDataGeneral)
-                                            << "keyId"
-                                            << BSON_ARRAY(uuid)
-                                            << "bsonType"
-                                            << BSON_ARRAY("object")));
-    auto result = JSONSchemaParser::parse(new ExpressionContextForTest(), schema);
-    ASSERT_EQ(result.getStatus().code(), 31051);
-}
-
-TEST(JSONSchemaParserTest, FailsToParseWithSingleValueBSONTypeInEncryptObject) {
-    auto uuid = UUID::gen();
-    // Test MinKey
-    BSONObj encrypt = BSON("encrypt" << BSON("algorithm"
-                                             << "AEAD_AES_256_CBC_HMAC_SHA_512-Deterministic"
-                                             << "initializationVector"
-                                             << BSONBinData(NULL, 0, BinDataType::BinDataGeneral)
-                                             << "bsonType"
-                                             << "minKey"
-                                             << "keyId"
-                                             << BSON_ARRAY(uuid)));
-    BSONObj schema = BSON("type"
-                          << "object"
-                          << "properties"
-                          << BSON("foo" << encrypt));
-    auto result = JSONSchemaParser::parse(new ExpressionContextForTest(), schema);
-    ASSERT_EQ(result.getStatus().code(), 31041);
-    // Test MaxKey
-    encrypt = BSON("encrypt" << BSON("algorithm"
-                                     << "AEAD_AES_256_CBC_HMAC_SHA_512-Deterministic"
-                                     << "initializationVector"
-                                     << BSONBinData(NULL, 0, BinDataType::BinDataGeneral)
-                                     << "bsonType"
-                                     << "maxKey"
-                                     << "keyId"
-                                     << BSON_ARRAY(uuid)));
-    schema = BSON("type"
-                  << "object"
-                  << "properties"
-                  << BSON("foo" << encrypt));
-    result = JSONSchemaParser::parse(new ExpressionContextForTest(), schema);
-    ASSERT_EQ(result.getStatus().code(), 31041);
-    // Test Undefined
-    encrypt = BSON("encrypt" << BSON("algorithm"
-                                     << "AEAD_AES_256_CBC_HMAC_SHA_512-Deterministic"
-                                     << "initializationVector"
-                                     << BSONBinData(NULL, 0, BinDataType::BinDataGeneral)
-                                     << "bsonType"
-                                     << "undefined"
-                                     << "keyId"
-                                     << BSON_ARRAY(uuid)));
-    schema = BSON("type"
-                  << "object"
-                  << "properties"
-                  << BSON("foo" << encrypt));
-    result = JSONSchemaParser::parse(new ExpressionContextForTest(), schema);
-    ASSERT_EQ(result.getStatus().code(), 31041);
-    // Test Null
-    encrypt = BSON("encrypt" << BSON("algorithm"
-                                     << "AEAD_AES_256_CBC_HMAC_SHA_512-Deterministic"
-                                     << "initializationVector"
-                                     << BSONBinData(NULL, 0, BinDataType::BinDataGeneral)
-                                     << "bsonType"
-                                     << "null"
-                                     << "keyId"
-                                     << BSON_ARRAY(uuid)));
-    schema = BSON("type"
-                  << "object"
-                  << "properties"
-                  << BSON("foo" << encrypt));
-    result = JSONSchemaParser::parse(new ExpressionContextForTest(), schema);
-    ASSERT_EQ(result.getStatus().code(), 31041);
 }
 
 }  // namespace

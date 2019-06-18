@@ -28,7 +28,7 @@ load('jstests/libs/write_concern_util.js');
         assert.commandFailedWithCode(
             coll.runCommand(
                 {'find': 'foo', readConcern: {level: "linearizable"}, maxTimeMS: 60000}),
-            ErrorCodes.InterruptedDueToStepDown);
+            ErrorCodes.InterruptedDueToReplStateChange);
     };
 
     var num_nodes = 3;
@@ -78,10 +78,16 @@ load('jstests/libs/write_concern_util.js');
     assert.eq(opTimeCmd.code, ErrorCodes.FailedToParse);
 
     // A $out aggregation is not allowed with readConcern level "linearizable".
-    let result = assert.throws(
-        () => primary.getDB("test").foo.aggregate([{$out: {to: "out", mode: "replaceDocuments"}}],
-                                                  {readConcern: {level: "linearizable"}}));
-    assert.eq(result.code, ErrorCodes.InvalidOptions);
+    let outResult = assert.throws(() => primary.getDB("test").foo.aggregate(
+                                      [{$out: "out"}], {readConcern: {level: "linearizable"}}));
+    assert.eq(outResult.code, ErrorCodes.InvalidOptions);
+
+    // A $merge aggregation is not allowed with readConcern level "linearizable".
+    let mergeResult = assert.throws(
+        () => primary.getDB("test").foo.aggregate(
+            [{$merge: {into: "out", whenMatched: "replace", whenNotMatched: "insert"}}],
+            {readConcern: {level: "linearizable"}}));
+    assert.eq(mergeResult.code, ErrorCodes.InvalidOptions);
 
     primary = replTest.getPrimary();
 
@@ -104,9 +110,9 @@ load('jstests/libs/write_concern_util.js');
         ErrorCodes.LinearizableReadConcernError);
 
     jsTestLog("Test that a linearizable read will timeout when the primary is isolated.");
-    result = primary.getDB("test").runCommand(
+    let findResult = primary.getDB("test").runCommand(
         {"find": "foo", "readConcern": {level: "linearizable"}, "maxTimeMS": 3000});
-    assert.commandFailedWithCode(result, ErrorCodes.MaxTimeMSExpired);
+    assert.commandFailedWithCode(findResult, ErrorCodes.MaxTimeMSExpired);
 
     jsTestLog("Testing to make sure linearizable read command does not block forever.");
 

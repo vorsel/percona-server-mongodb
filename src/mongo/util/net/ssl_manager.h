@@ -137,6 +137,15 @@ private:
     std::vector<SSLX509Name::Entry> _canonicalServerSubjectName;
 };
 
+// These represent the ASN.1 type bytes for strings used in an X509 DirectoryString
+constexpr int kASN1BMPString = 30;
+constexpr int kASN1IA5String = 22;
+constexpr int kASN1OctetString = 4;
+constexpr int kASN1PrintableString = 19;
+constexpr int kASN1TeletexString = 20;
+constexpr int kASN1UTF8String = 12;
+constexpr int kASN1UniversalString = 28;
+
 /**
  * Stores information about a globally unique OID.
  */
@@ -237,12 +246,13 @@ public:
 
     /**
      * Fetches a peer certificate and validates it if it exists. If validation fails, but weak
-     * validation is enabled, boost::none will be returned. If validation fails, and invalid
+     * validation is enabled, the `subjectName` will be empty. If validation fails, and invalid
      * certificates are not allowed, a non-OK status will be returned. If validation is successful,
-     * an engaged optional containing the certificate's subject name, and any roles acquired by
-     * X509 authorization will be returned.
+     * the `subjectName` will contain  the certificate's subject name, and any roles acquired by
+     * X509 authorization will be returned in `roles`.
+     * Further, the SNI Name will be captured into the `sniName` value, when available.
      */
-    virtual StatusWith<boost::optional<SSLPeerInfo>> parseAndValidatePeerCertificate(
+    virtual StatusWith<SSLPeerInfo> parseAndValidatePeerCertificate(
         SSLConnectionType ssl,
         const std::string& remoteHost,
         const HostAndPort& hostForLogging) = 0;

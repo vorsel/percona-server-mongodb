@@ -67,7 +67,8 @@ std::vector<AsyncRequestsSender::Response> gatherResponses(
     StringData dbName,
     const ReadPreferenceSetting& readPref,
     Shard::RetryPolicy retryPolicy,
-    const std::vector<AsyncRequestsSender::Request>& requests);
+    const std::vector<AsyncRequestsSender::Request>& requests,
+    const std::set<ErrorCodes::Error>& ignorableErrors = {});
 
 /**
  * Returns a copy of 'cmdObj' with 'version' appended.
@@ -134,7 +135,8 @@ std::vector<AsyncRequestsSender::Response> scatterGatherOnlyVersionIfUnsharded(
     const NamespaceString& nss,
     const BSONObj& cmdObj,
     const ReadPreferenceSetting& readPref,
-    Shard::RetryPolicy retryPolicy);
+    Shard::RetryPolicy retryPolicy,
+    const std::set<ErrorCodes::Error>& ignorableErrors = {});
 
 /**
  * Utility for dispatching commands against the primary of a database and attach the appropriate
@@ -163,7 +165,7 @@ AsyncRequestsSender::Response executeCommandAgainstDatabasePrimary(
 bool appendRawResponses(OperationContext* opCtx,
                         std::string* errmsg,
                         BSONObjBuilder* output,
-                        std::vector<AsyncRequestsSender::Response> shardResponses,
+                        const std::vector<AsyncRequestsSender::Response>& shardResponses,
                         std::set<ErrorCodes::Error> ignoredErrors = {});
 
 /**

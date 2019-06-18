@@ -47,6 +47,7 @@
 #include "mongo/db/exec/update_stage.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/lasterror.h"
+#include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/delete_request.h"
@@ -104,7 +105,7 @@ boost::optional<BSONObj> advanceExecutor(OperationContext* opCtx,
     return boost::none;
 }
 
-void makeUpdateRequest(const OperationContext* opCtx,
+void makeUpdateRequest(OperationContext* opCtx,
                        const FindAndModifyRequest& args,
                        bool explain,
                        UpdateRequest* requestOut) {
@@ -112,6 +113,8 @@ void makeUpdateRequest(const OperationContext* opCtx,
     requestOut->setProj(args.getFields());
     invariant(args.getUpdate());
     requestOut->setUpdateModification(*args.getUpdate());
+    requestOut->setRuntimeConstants(
+        args.getRuntimeConstants().value_or(Variables::generateRuntimeConstants(opCtx)));
     requestOut->setSort(args.getSort());
     requestOut->setCollation(args.getCollation());
     requestOut->setArrayFilters(args.getArrayFilters());
@@ -128,12 +131,14 @@ void makeUpdateRequest(const OperationContext* opCtx,
                                    : PlanExecutor::YIELD_AUTO);
 }
 
-void makeDeleteRequest(const OperationContext* opCtx,
+void makeDeleteRequest(OperationContext* opCtx,
                        const FindAndModifyRequest& args,
                        bool explain,
                        DeleteRequest* requestOut) {
     requestOut->setQuery(args.getQuery());
     requestOut->setProj(args.getFields());
+    requestOut->setRuntimeConstants(
+        args.getRuntimeConstants().value_or(Variables::generateRuntimeConstants(opCtx)));
     requestOut->setSort(args.getSort());
     requestOut->setCollation(args.getCollation());
     requestOut->setMulti(false);
@@ -269,7 +274,8 @@ public:
             const bool isExplain = true;
             makeUpdateRequest(opCtx, args, isExplain, &request);
 
-            ParsedUpdate parsedUpdate(opCtx, &request);
+            const ExtensionsCallbackReal extensionsCallback(opCtx, &request.getNamespaceString());
+            ParsedUpdate parsedUpdate(opCtx, &request, extensionsCallback);
             uassertStatusOK(parsedUpdate.parseRequest());
 
             // Explain calls of the findAndModify command are read-only, but we take write
@@ -411,7 +417,9 @@ public:
                     request.setStmtId(stmtId);
                 }
 
-                ParsedUpdate parsedUpdate(opCtx, &request);
+                const ExtensionsCallbackReal extensionsCallback(opCtx,
+                                                                &request.getNamespaceString());
+                ParsedUpdate parsedUpdate(opCtx, &request, extensionsCallback);
                 uassertStatusOK(parsedUpdate.parseRequest());
 
                 // These are boost::optional, because if the database or collection does not exist,

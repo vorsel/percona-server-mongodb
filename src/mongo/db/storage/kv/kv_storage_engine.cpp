@@ -42,6 +42,7 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/operation_context_noop.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/storage/kv/kv_catalog_feature_tracker.h"
 #include "mongo/db/storage/kv/kv_engine.h"
 #include "mongo/db/storage/kv/temporary_kv_record_store.h"
@@ -439,9 +440,18 @@ KVStorageEngine::reconcileCatalogAndIdents(OperationContext* opCtx) {
             // table is not found, or the index build did not successfully complete, this code
             // will return the index to be rebuilt.
             if (indexMetaData.isBackgroundSecondaryBuild && (!foundIdent || !indexMetaData.ready)) {
-                log()
-                    << "Expected background index build did not complete, rebuilding. Collection: "
-                    << coll << " Index: " << indexName;
+                if (!serverGlobalParams.indexBuildRetry) {
+                    log() << "Dropping an unfinished index because --noIndexBuildRetry is set. "
+                             "Collection: "
+                          << coll << " Index: " << indexName;
+                    fassert(51197, _engine->dropIdent(opCtx, indexIdent));
+                    indexesToDrop.push_back(indexName);
+                    continue;
+                }
+
+                log() << "Expected background index build did not complete, rebuilding. "
+                         "Collection: "
+                      << coll << " Index: " << indexName;
                 ret.emplace_back(coll.ns(), indexName);
                 continue;
             }
@@ -689,12 +699,12 @@ void KVStorageEngine::setOldestActiveTransactionTimestampCallback(
     _engine->setOldestActiveTransactionTimestampCallback(callback);
 }
 
-bool KVStorageEngine::isCacheUnderPressure(OperationContext* opCtx) const {
-    return _engine->isCacheUnderPressure(opCtx);
+int64_t KVStorageEngine::getCacheOverflowTableInsertCount(OperationContext* opCtx) const {
+    return _engine->getCacheOverflowTableInsertCount(opCtx);
 }
 
-void KVStorageEngine::setCachePressureForTest(int pressure) {
-    return _engine->setCachePressureForTest(pressure);
+void KVStorageEngine::setCacheOverflowTableInsertCountForTest(int insertCount) {
+    return _engine->setCacheOverflowTableInsertCountForTest(insertCount);
 }
 
 bool KVStorageEngine::supportsRecoverToStableTimestamp() const {
@@ -765,6 +775,10 @@ Timestamp KVStorageEngine::getAllCommittedTimestamp() const {
 
 Timestamp KVStorageEngine::getOldestOpenReadTimestamp() const {
     return _engine->getOldestOpenReadTimestamp();
+}
+
+boost::optional<Timestamp> KVStorageEngine::getOplogNeededForCrashRecovery() const {
+    return _engine->getOplogNeededForCrashRecovery();
 }
 
 void KVStorageEngine::_dumpCatalog(OperationContext* opCtx) {
@@ -853,6 +867,9 @@ void KVStorageEngine::TimestampMonitor::startup() {
                     uOpCtx = client->makeOperationContext();
                     opCtx = uOpCtx.get();
                 }
+
+                ShouldNotConflictWithSecondaryBatchApplicationBlock shouldNotConflictBlock(
+                    opCtx->lockState());
                 Lock::GlobalLock lock(opCtx, MODE_IS);
 
                 // The checkpoint timestamp is not cached in mongod and needs to be fetched with a
@@ -923,7 +940,10 @@ int64_t KVStorageEngine::sizeOnDiskForDb(OperationContext* opCtx, StringData dbN
     int64_t size = 0;
 
     catalog::forEachCollectionFromDb(
-        opCtx, dbName, MODE_IS, [&](Collection* collection, CollectionCatalogEntry* catalogEntry) {
+        opCtx,
+        dbName,
+        MODE_IS,
+        [&](const Collection* collection, const CollectionCatalogEntry* catalogEntry) {
             size += catalogEntry->getRecordStore()->storageSize(opCtx);
 
             std::vector<std::string> indexNames;

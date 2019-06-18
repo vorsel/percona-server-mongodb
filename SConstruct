@@ -3227,9 +3227,8 @@ def doConfigure(myenv):
     else:
         ssl_provider = "none"
 
-    # The Windows build needs the openssl binaries if it targets openssl or includes the tools
-    # since the tools link against openssl
-    if conf.env.TargetOSIs('windows') and (ssl_provider == "openssl" or has_option("use-new-tools")):
+    # The Windows build needs the openssl binaries if it targets openssl
+    if conf.env.TargetOSIs('windows') and ssl_provider == "openssl":
         # Add the SSL binaries to the zip file distribution
         def addOpenSslLibraryToDistArchive(file_name):
             openssl_bin_path = os.path.normpath(env['WINDOWS_OPENSSL_BIN'].lower())
@@ -3318,6 +3317,7 @@ def doConfigure(myenv):
         CPPDEFINES=[
             "BOOST_SYSTEM_NO_DEPRECATED",
             "BOOST_MATH_NO_LONG_DOUBLE_MATH_FUNCTIONS",
+            "BOOST_ENABLE_ASSERT_DEBUG_HANDLER",
             "ABSL_FORCE_ALIGNED_ACCESS",
         ]
     )
@@ -3852,10 +3852,19 @@ env.Alias("distsrc", "distsrc-tgz")
 # reports the number of CPUs for the host system. Perhaps in a future version of
 # psutil it will instead report the correct number when in a container.
 #
+# The presence of the variable ICECC means the icecream tool is
+# enabled and so the default j value should scale accordingly. In this
+# scenario multiply the cpu count by 8 to set a reasonable default since the
+# cluster can handle many more jobs than your local machine but is
+# still throttled by your cpu count in the sense that you can only
+# handle so many python threads sending out jobs.
+#
 # psutil.cpu_count returns None when it can't determine the number. This always
 # fails on BSD's for example.
-if psutil.cpu_count() is not None:
+if psutil.cpu_count() is not None and 'ICECC' not in env:
     env.SetOption('num_jobs', psutil.cpu_count())
+elif psutil.cpu_count() and 'ICECC' in env:
+    env.SetOption('num_jobs', 8 * psutil.cpu_count())
 
 
 # Do this as close to last as possible before reading SConscripts, so

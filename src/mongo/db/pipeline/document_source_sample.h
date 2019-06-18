@@ -50,14 +50,15 @@ public:
                 HostTypeRequirement::kNone,
                 DiskUseRequirement::kWritesTmpData,
                 FacetRequirement::kAllowed,
-                TransactionRequirement::kAllowed};
+                TransactionRequirement::kAllowed,
+                LookupRequirement::kAllowed};
     }
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final {
         return DepsTracker::State::SEE_NEXT;
     }
 
-    boost::optional<MergingLogic> mergingLogic() final;
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final;
 
     long long getSampleSize() const {
         return _size;

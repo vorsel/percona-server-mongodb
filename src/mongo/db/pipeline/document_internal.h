@@ -192,7 +192,8 @@ public:
           _metaFields(),
           _textScore(0),
           _randVal(0),
-          _geoNearDistance(0) {}
+          _geoNearDistance(0),
+          _searchScore(0) {}
 
     ~DocumentStorage();
 
@@ -202,6 +203,8 @@ public:
         SORT_KEY,
         GEONEAR_DIST,
         GEONEAR_POINT,
+        SEARCH_SCORE,
+        SEARCH_HIGHLIGHTS,
 
         // New fields must be added before the NUM_FIELDS sentinel.
         NUM_FIELDS
@@ -277,6 +280,12 @@ public:
     }
 
     /**
+     * Compute the space allocated for the metadata fields. Will account for space allocated for
+     * unused metadata fields as well.
+     */
+    size_t getMetadataApproximateSize() const;
+
+    /**
      * Copies all metadata from source if it has any.
      * Note: does not clear metadata from this.
      */
@@ -295,6 +304,12 @@ public:
         }
         if (source.hasGeoNearPoint()) {
             setGeoNearPoint(source.getGeoNearPoint());
+        }
+        if (source.hasSearchScore()) {
+            setSearchScore(source.getSearchScore());
+        }
+        if (source.hasSearchHighlights()) {
+            setSearchHighlights(source.getSearchHighlights());
         }
     }
 
@@ -351,6 +366,28 @@ public:
     void setGeoNearPoint(Value point) {
         _metaFields.set(MetaType::GEONEAR_POINT);
         _geoNearPoint = std::move(point);
+    }
+
+    bool hasSearchScore() const {
+        return _metaFields.test(MetaType::SEARCH_SCORE);
+    }
+    double getSearchScore() const {
+        return _searchScore;
+    }
+    void setSearchScore(double score) {
+        _metaFields.set(MetaType::SEARCH_SCORE);
+        _searchScore = score;
+    }
+
+    bool hasSearchHighlights() const {
+        return _metaFields.test(MetaType::SEARCH_HIGHLIGHTS);
+    }
+    Value getSearchHighlights() const {
+        return _searchHighlights;
+    }
+    void setSearchHighlights(Value highlights) {
+        _metaFields.set(MetaType::SEARCH_HIGHLIGHTS);
+        _searchHighlights = highlights;
     }
 
 private:
@@ -437,7 +474,9 @@ private:
     BSONObj _sortKey;
     double _geoNearDistance;
     Value _geoNearPoint;
-    // When adding a field, make sure to update clone() method
+    double _searchScore;
+    Value _searchHighlights;
+    // When adding a field, make sure to update clone() and getMetadataApproximateSize() methods.
 
     // Defined in document.cpp
     static const DocumentStorage kEmptyDoc;

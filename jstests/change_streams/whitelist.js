@@ -18,7 +18,9 @@
         {$match: {_id: {$exists: true}}},
         {$project: {_id: 1}},
         {$addFields: {newField: 1}},
+        {$set: {newField: 1}},
         {$replaceRoot: {newRoot: {_id: "$_id"}}},
+        {$replaceWith: {_id: "$_id"}},
         {$redact: "$$DESCEND"}
     ];
 

@@ -29,6 +29,8 @@
 
 #pragma once
 
+#include "mongo/db/repl/replication_coordinator_fwd.h"
+
 #include <vector>
 
 #include "mongo/base/status.h"
@@ -37,6 +39,7 @@
 #include "mongo/db/repl/member_data.h"
 #include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/repl_settings.h"
+#include "mongo/db/repl/split_horizon.h"
 #include "mongo/db/repl/sync_source_selector.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
@@ -592,7 +595,8 @@ public:
      * Handles an incoming isMaster command for a replica set node.  Should not be
      * called on a standalone node.
      */
-    virtual void fillIsMasterForReplSet(IsMasterResponse* result) = 0;
+    virtual void fillIsMasterForReplSet(IsMasterResponse* result,
+                                        const SplitHorizon::Parameters& horizonParams) = 0;
 
     /**
      * Adds to "result" a description of the slaveInfo data structure used to map RIDs to their

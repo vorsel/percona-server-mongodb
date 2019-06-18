@@ -77,7 +77,7 @@ std::size_t OplogApplier::calculateBatchLimitBytes(OperationContext* opCtx,
     auto oplogMaxSizeResult =
         storageInterface->getOplogMaxSize(opCtx, NamespaceString::kRsOplogNamespace);
     auto oplogMaxSize = fassert(40301, oplogMaxSizeResult);
-    return std::min(oplogMaxSize / 10, std::size_t(replBatchLimitBytes));
+    return std::min(oplogMaxSize / 10, std::size_t(replBatchLimitBytes.load()));
 }
 
 OplogApplier::OplogApplier(executor::TaskExecutor* executor,
@@ -141,27 +141,30 @@ void OplogApplier::enqueue(OperationContext* opCtx,
 namespace {
 
 /**
- * Returns whether an oplog entry represents a commitTransaction for a transaction which has not
+ * Returns whether an oplog entry represents an implicit commit for a transaction which has not
  * been prepared.  An entry is an unprepared commit if it has a boolean "prepared" field set to
- * false.
+ * false and "isPartial" is not present.
  */
 bool isUnpreparedCommit(const OplogEntry& entry) {
-    if (entry.getCommandType() != OplogEntry::CommandType::kCommitTransaction) {
+    if (entry.getCommandType() != OplogEntry::CommandType::kApplyOps) {
         return false;
     }
 
-    auto preparedElement = entry.getObject()[CommitTransactionOplogObject::kPreparedFieldName];
-    if (!preparedElement.isBoolean()) {
+    if (entry.isPartialTransaction()) {
         return false;
     }
 
-    auto isPrepared = preparedElement.boolean();
-    return !isPrepared;
+    if (entry.shouldPrepare()) {
+        return false;
+    }
+
+    return true;
 }
 
 /**
- * Returns whether an oplog entry represents an applyOps which is a self-contained atomic operation,
- * as opposed to part of a prepared transaction.
+ * Returns whether an oplog entry represents an applyOps which doesn't imply prepare.
+ * It could be a partial transaction oplog entry, an implicit commit applyOps or an applyOps outside
+ * of transaction.
  */
 bool isUnpreparedApplyOps(const OplogEntry& entry) {
     return entry.getCommandType() == OplogEntry::CommandType::kApplyOps && !entry.shouldPrepare();
@@ -268,6 +271,13 @@ StatusWith<OplogApplier::Operations> OplogApplier::getNextApplierBatch(
             if (totalOps + opCount > batchLimits.ops || totalBytes + opBytes > batchLimits.bytes) {
                 return std::move(ops);
             }
+        }
+
+        // If we have a forced batch boundary, apply it.
+        if (totalOps > 0 && !batchLimits.forceBatchBoundaryAfter.isNull() &&
+            entry.getOpTime().getTimestamp() > batchLimits.forceBatchBoundaryAfter &&
+            ops.back().getOpTime().getTimestamp() <= batchLimits.forceBatchBoundaryAfter) {
+            return std::move(ops);
         }
 
         // Add op to buffer.

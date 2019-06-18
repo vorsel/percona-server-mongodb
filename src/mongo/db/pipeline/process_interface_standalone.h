@@ -64,12 +64,18 @@ public:
                 boost::optional<OID> targetEpoch) override;
     void update(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                 const NamespaceString& ns,
-                std::vector<BSONObj>&& queries,
-                std::vector<BSONObj>&& updates,
+                BatchedObjects&& batch,
                 const WriteConcernOptions& wc,
                 bool upsert,
                 bool multi,
                 boost::optional<OID> targetEpoch) override;
+    WriteResult updateWithResult(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                 const NamespaceString& ns,
+                                 BatchedObjects&& batch,
+                                 const WriteConcernOptions& wc,
+                                 bool upsert,
+                                 bool multi,
+                                 boost::optional<OID> targetEpoch) override;
 
     CollectionIndexUsageMap getIndexStats(OperationContext* opCtx, const NamespaceString& ns) final;
     void appendLatencyStats(OperationContext* opCtx,
@@ -148,17 +154,13 @@ protected:
                          bool bypassDocValidation);
 
     /**
-     * Builds an ordered update op on namespace 'nss' with update entries {q: <queries>, u:
-     * <updates>}.
-     *
-     * Note that 'queries' and 'updates' must be the same length.
+     * Builds an ordered update op on namespace 'nss' with update entries contained in 'batch'.
      */
-    Update buildUpdateOp(const NamespaceString& nss,
-                         std::vector<BSONObj>&& queries,
-                         std::vector<BSONObj>&& updates,
+    Update buildUpdateOp(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                         const NamespaceString& nss,
+                         BatchedObjects&& batch,
                          bool upsert,
-                         bool multi,
-                         bool bypassDocValidation);
+                         bool multi);
 
 private:
     /**

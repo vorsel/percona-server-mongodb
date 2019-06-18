@@ -51,7 +51,8 @@ public:
      * Initializes the node with an aggregation pipeline definition.
      */
     explicit PipelineExecutor(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                              const std::vector<BSONObj>& pipeline);
+                              const std::vector<BSONObj>& pipeline,
+                              boost::optional<BSONObj> constants = boost::none);
 
     /**
      * Replaces the document that 'applyParams.element' belongs to with 'val'. If 'val' does not
@@ -61,21 +62,7 @@ public:
      */
     ApplyResult applyUpdate(ApplyParams applyParams) const final;
 
-    Value serialize() const final {
-        std::vector<Value> valueArray;
-        for (const auto& stage : _pipeline->getSources()) {
-            // TODO SERVER-40539: Consider subclassing DocumentSourceQueue with a class that is
-            // explicitly skipped when serializing. With that change call Pipeline::serialize()
-            // directly.
-            if (stage->getSourceName() == "mock"_sd) {
-                continue;
-            }
-
-            stage->serializeToArray(valueArray);
-        }
-
-        return Value(valueArray);
-    }
+    Value serialize() const final;
 
 private:
     boost::intrusive_ptr<ExpressionContext> _expCtx;

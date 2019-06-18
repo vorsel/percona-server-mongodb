@@ -1685,8 +1685,13 @@ StatusWith<Operations> InitialSyncer::_getNextApplierBatch_inlock() {
     // Obtain next batch of operations from OplogApplier.
     auto opCtx = makeOpCtx();
     OplogApplier::BatchLimits batchLimits;
-    batchLimits.bytes = OplogApplier::replBatchLimitBytes;
+    batchLimits.bytes = replBatchLimitBytes.load();
     batchLimits.ops = OplogApplier::getBatchLimitOperations();
+    // We want a batch boundary after the beginApplyingTimestamp, to make sure all oplog entries
+    // that are part of a transaction before that timestamp are written out before we start applying
+    // entries after them.  This is because later entries may be commit or prepare and thus
+    // expect to read the partial entries from the oplog.
+    batchLimits.forceBatchBoundaryAfter = _initialSyncState->beginApplyingTimestamp;
     return _oplogApplier->getNextApplierBatch(opCtx.get(), batchLimits);
 }
 

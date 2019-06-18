@@ -139,6 +139,7 @@ public:
     using FacetRequirement = StageConstraints::FacetRequirement;
     using StreamType = StageConstraints::StreamType;
     using TransactionRequirement = StageConstraints::TransactionRequirement;
+    using LookupRequirement = StageConstraints::LookupRequirement;
 
     /**
      * This is what is returned from the main DocumentSource API: getNext(). It is essentially a
@@ -219,7 +220,7 @@ public:
      * A struct representing the information needed to execute this stage on a distributed
      * collection. Describes how a pipeline should be split for sharded execution.
      */
-    struct MergingLogic {
+    struct DistributedPlanLogic {
         // A stage which executes on each shard in parallel, or nullptr if nothing can be done in
         // parallel. For example, a partial $group before a subsequent global $group.
         boost::intrusive_ptr<DocumentSource> shardsStage = nullptr;
@@ -453,10 +454,10 @@ public:
      * Otherwise, returns a struct representing what needs to be done to merge each shard's pipeline
      * into a single stream of results. Must not mutate the existing source object; if different
      * behaviour is required, a new source should be created and configured appropriately. It is an
-     * error for the returned MergingLogic to have identical pointers for 'shardsStage' and
+     * error for the returned DistributedPlanLogic to have identical pointers for 'shardsStage' and
      * 'mergingStage'.
      */
-    virtual boost::optional<MergingLogic> mergingLogic() = 0;
+    virtual boost::optional<DistributedPlanLogic> distributedPlanLogic() = 0;
 
     /**
      * Returns true if it would be correct to execute this stage in parallel across the shards in

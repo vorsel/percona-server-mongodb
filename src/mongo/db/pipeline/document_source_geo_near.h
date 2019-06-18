@@ -55,7 +55,8 @@ public:
                 HostTypeRequirement::kAnyShard,
                 DiskUseRequirement::kNoDiskUse,
                 FacetRequirement::kNotAllowed,
-                TransactionRequirement::kAllowed};
+                TransactionRequirement::kAllowed,
+                LookupRequirement::kAllowed};
     }
 
     /**
@@ -77,6 +78,13 @@ public:
      */
     BSONObj getQuery() const {
         return query;
+    };
+
+    /**
+     * Set the query predicate to apply to the documents in addition to the "near" predicate.
+     */
+    void setQuery(BSONObj newQuery) {
+        query = newQuery.getOwned();
     };
 
     /**
@@ -123,7 +131,7 @@ public:
     /**
      * In a sharded cluster, this becomes a merge sort by distance, from nearest to furthest.
      */
-    boost::optional<MergingLogic> mergingLogic() final;
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final;
 
 
 private:

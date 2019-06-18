@@ -78,8 +78,6 @@ OplogEntry::CommandType parseCommandType(const BSONObj& objectField) {
         return OplogEntry::CommandType::kCommitTransaction;
     } else if (commandString == "abortTransaction") {
         return OplogEntry::CommandType::kAbortTransaction;
-    } else if (commandString == "prepareTransaction") {
-        return OplogEntry::CommandType::kPrepareTransaction;
     } else {
         uasserted(ErrorCodes::BadValue,
                   str::stream() << "Unknown oplog entry command type: " << commandString
@@ -107,8 +105,7 @@ BSONObj makeOplogEntryDoc(OpTime opTime,
                           const boost::optional<StmtId>& statementId,
                           const boost::optional<OpTime>& prevWriteOpTimeInTransaction,
                           const boost::optional<OpTime>& preImageOpTime,
-                          const boost::optional<OpTime>& postImageOpTime,
-                          const boost::optional<bool>& prepare) {
+                          const boost::optional<OpTime>& postImageOpTime) {
     BSONObjBuilder builder;
     sessionInfo.serialize(&builder);
     builder.append(OplogEntryBase::kTimestampFieldName, opTime.getTimestamp());
@@ -150,9 +147,6 @@ BSONObj makeOplogEntryDoc(OpTime opTime,
     if (postImageOpTime) {
         const BSONObj localObject = postImageOpTime.get().toBSON();
         builder.append(OplogEntryBase::kPostImageOpTimeFieldName, localObject);
-    }
-    if (prepare) {
-        builder.append(OplogEntryBase::kPrepareFieldName, prepare.get());
     }
     return builder.obj();
 }
@@ -237,8 +231,7 @@ OplogEntry::OplogEntry(OpTime opTime,
                        const boost::optional<StmtId>& statementId,
                        const boost::optional<OpTime>& prevWriteOpTimeInTransaction,
                        const boost::optional<OpTime>& preImageOpTime,
-                       const boost::optional<OpTime>& postImageOpTime,
-                       const boost::optional<bool>& prepare)
+                       const boost::optional<OpTime>& postImageOpTime)
     : OplogEntry(makeOplogEntryDoc(opTime,
                                    hash,
                                    opType,
@@ -254,8 +247,7 @@ OplogEntry::OplogEntry(OpTime opTime,
                                    statementId,
                                    prevWriteOpTimeInTransaction,
                                    preImageOpTime,
-                                   postImageOpTime,
-                                   prepare)) {}
+                                   postImageOpTime)) {}
 
 bool OplogEntry::isCommand() const {
     return getOpType() == OpTypeEnum::kCommand;
@@ -280,7 +272,8 @@ bool OplogEntry::isCrudOpType() const {
 }
 
 bool OplogEntry::shouldPrepare() const {
-    return getPrepare() && *getPrepare();
+    return getCommandType() == CommandType::kApplyOps &&
+        getObject()[ApplyOpsCommandInfoBase::kPrepareFieldName].booleanSafe();
 }
 
 BSONElement OplogEntry::getIdElement() const {

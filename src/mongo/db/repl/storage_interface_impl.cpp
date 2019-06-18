@@ -63,6 +63,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/logical_clock.h"
+#include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/delete_request.h"
 #include "mongo/db/ops/parsed_update.h"
@@ -537,7 +538,7 @@ Status StorageInterfaceImpl::setIndexIsMultikey(OperationContext* opCtx,
     }
 
     return writeConflictRetry(opCtx, "StorageInterfaceImpl::setIndexIsMultikey", nss.ns(), [&] {
-        AutoGetCollection autoColl(opCtx, nss, MODE_X);
+        AutoGetCollection autoColl(opCtx, nss, MODE_IX);
         auto collectionResult = getCollection(
             autoColl, nss, "The collection must exist before setting an index to multikey.");
         if (!collectionResult.isOK()) {
@@ -846,7 +847,8 @@ Status _updateWithQuery(OperationContext* opCtx,
         // ParsedUpdate needs to be inside the write conflict retry loop because it may create a
         // CanonicalQuery whose ownership will be transferred to the plan executor in
         // getExecutorUpdate().
-        ParsedUpdate parsedUpdate(opCtx, &request);
+        const ExtensionsCallbackReal extensionsCallback(opCtx, &request.getNamespaceString());
+        ParsedUpdate parsedUpdate(opCtx, &request, extensionsCallback);
         auto parsedUpdateStatus = parsedUpdate.parseRequest();
         if (!parsedUpdateStatus.isOK()) {
             return parsedUpdateStatus;
@@ -914,7 +916,8 @@ Status StorageInterfaceImpl::upsertById(OperationContext* opCtx,
 
         // ParsedUpdate needs to be inside the write conflict retry loop because it contains
         // the UpdateDriver whose state may be modified while we are applying the update.
-        ParsedUpdate parsedUpdate(opCtx, &request);
+        const ExtensionsCallbackReal extensionsCallback(opCtx, &request.getNamespaceString());
+        ParsedUpdate parsedUpdate(opCtx, &request, extensionsCallback);
         auto parsedUpdateStatus = parsedUpdate.parseRequest();
         if (!parsedUpdateStatus.isOK()) {
             return parsedUpdateStatus;

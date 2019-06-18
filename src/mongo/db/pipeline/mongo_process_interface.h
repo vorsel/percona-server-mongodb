@@ -42,6 +42,8 @@
 #include "mongo/db/generic_cursor.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/ops/write_ops_exec.h"
+#include "mongo/db/ops/write_ops_parsers.h"
 #include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/field_path.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
@@ -66,6 +68,20 @@ class PipelineDeleter;
  */
 class MongoProcessInterface {
 public:
+    /**
+     * Storage for a batch of BSON Objects to be updated in the write namespace. For each element
+     * in the batch we store a tuple of the folliwng elements:
+     *   1. BSONObj - specifies the query that identifies a document in the to collection to be
+     *      updated.
+     *   2. write_ops::UpdateModification - either the new document we want to upsert or insert into
+     *      the collection (i.e. a 'classic' replacement update), or the pipeline to run to compute
+     *      the new document.
+     *   3. boost::optional<BSONObj> - for pipeline-style updated, specifies variables that can be
+     *      referred to in the pipeline performing the custom update.
+     */
+    using BatchedObjects =
+        std::vector<std::tuple<BSONObj, write_ops::UpdateModification, boost::optional<BSONObj>>>;
+
     enum class CurrentOpConnectionsMode { kIncludeIdle, kExcludeIdle };
     enum class CurrentOpUserMode { kIncludeAll, kExcludeOthers };
     enum class CurrentOpTruncateMode { kNoTruncation, kTruncateOps };
@@ -133,12 +149,25 @@ public:
      */
     virtual void update(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                         const NamespaceString& ns,
-                        std::vector<BSONObj>&& queries,
-                        std::vector<BSONObj>&& updates,
+                        BatchedObjects&& batch,
                         const WriteConcernOptions& wc,
                         bool upsert,
                         bool multi,
                         boost::optional<OID> targetEpoch) = 0;
+
+    /**
+     * Updates the documents matching 'queries' with the objects 'updates'. Throws a UserException
+     * if any of the updates fail. If 'targetEpoch' is set, throws ErrorCodes::StaleEpoch if the
+     * targeted collection does not have the same epoch, or if the epoch changes during the update.
+     * Returns a 'WriteResult' object with information about the write operation.
+     */
+    virtual WriteResult updateWithResult(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                         const NamespaceString& ns,
+                                         BatchedObjects&& batch,
+                                         const WriteConcernOptions& wc,
+                                         bool upsert,
+                                         bool multi,
+                                         boost::optional<OID> targetEpoch) = 0;
 
     virtual CollectionIndexUsageMap getIndexStats(OperationContext* opCtx,
                                                   const NamespaceString& ns) = 0;

@@ -4,6 +4,8 @@ var DB;
 
 (function() {
 
+    var _defaultWriteConcern = {w: 'majority', wtimeout: 10 * 60 * 1000};
+
     if (DB === undefined) {
         DB = function(mongo, name) {
             this._mongo = mongo;
@@ -230,13 +232,18 @@ var DB;
 
         const pipeline = cmdObj.pipeline;
 
-        // Check whether the pipeline has an $out stage. If not, we may run on a Secondary and
-        // should attach a readPreference.
-        const hasOutStage =
-            pipeline.length >= 1 && pipeline[pipeline.length - 1].hasOwnProperty("$out");
+        // Check whether the pipeline has a stage which performs writes like $out. If not, we may
+        // run on a Secondary and should attach a readPreference.
+        const hasWritingStage = (function() {
+            if (pipeline.length == 0) {
+                return false;
+            }
+            const lastStage = pipeline[pipeline.length - 1];
+            return lastStage.hasOwnProperty("$out") || lastStage.hasOwnProperty("$merge");
+        }());
 
         const doAgg = function(cmdObj) {
-            return hasOutStage ? this.runCommand(cmdObj) : this.runReadCommand(cmdObj);
+            return hasWritingStage ? this.runCommand(cmdObj) : this.runReadCommand(cmdObj);
         }.bind(this);
 
         const res = doAgg(cmdObj);
@@ -386,14 +393,13 @@ var DB;
     };
 
     /**
-      Erase the entire database.  (!)
-
+     * Erase the entire database.
+     * @params writeConcern: (document) expresses the write concern of the drop command.
      * @return Object returned has member ok set to true if operation succeeds, false otherwise.
      */
-    DB.prototype.dropDatabase = function() {
-        if (arguments.length)
-            throw Error("dropDatabase doesn't take arguments");
-        return this._dbCommand({dropDatabase: 1});
+    DB.prototype.dropDatabase = function(writeConcern) {
+        return this._dbCommand(
+            {dropDatabase: 1, writeConcern: writeConcern ? writeConcern : _defaultWriteConcern});
     };
 
     /**
@@ -568,7 +574,7 @@ var DB;
         print("\tdb.createUser(userDocument)");
         print("\tdb.createView(name, viewOn, [{$operator: {...}}, ...], {viewOptions})");
         print("\tdb.currentOp() displays currently executing operations in the db");
-        print("\tdb.dropDatabase()");
+        print("\tdb.dropDatabase(writeConcern)");
         print("\tdb.dropUser(username)");
         print("\tdb.eval() - deprecated");
         print("\tdb.fsyncLock() flush data to disk and lock server for backups");
@@ -1301,8 +1307,6 @@ var DB;
     //////////////////////////// Security shell helpers below
     /////////////////////////////////////////////
     ////////////////////////////////////////////////////////////////////////////////////////////////////
-
-    var _defaultWriteConcern = {w: 'majority', wtimeout: 10 * 60 * 1000};
 
     function getUserObjString(userObj) {
         var pwd = userObj.pwd;

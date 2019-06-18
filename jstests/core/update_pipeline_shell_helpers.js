@@ -20,22 +20,22 @@
     assert.commandWorked(testColl.insert({_id: 2, a: 2, b: 3}));
 
     // Test that each of the update shell helpers permits pipeline-style updates.
-    assert.commandWorked(testColl.update({_id: 1}, [{$addFields: {update: true}}]));
-    assert.commandWorked(testColl.update({}, [{$addFields: {updateMulti: true}}], {multi: true}));
-    assert.commandWorked(testColl.updateOne({_id: 1}, [{$addFields: {updateOne: true}}]));
+    assert.commandWorked(testColl.update({_id: 1}, [{$set: {update: true}}]));
+    assert.commandWorked(testColl.update({}, [{$set: {updateMulti: true}}], {multi: true}));
+    assert.commandWorked(testColl.updateOne({_id: 1}, [{$set: {updateOne: true}}]));
     assert.commandWorked(testColl.bulkWrite([
-        {updateOne: {filter: {_id: 1}, update: [{$addFields: {bulkWriteUpdateOne: true}}]}},
-        {updateMany: {filter: {}, update: [{$addFields: {bulkWriteUpdateMany: true}}]}}
+        {updateOne: {filter: {_id: 1}, update: [{$set: {bulkWriteUpdateOne: true}}]}},
+        {updateMany: {filter: {}, update: [{$set: {bulkWriteUpdateMany: true}}]}}
     ]));
 
     // Test that each of the Bulk API update functions correctly handle pipeline syntax.
     const unorderedBulkOp = testColl.initializeUnorderedBulkOp();
     const orderedBulkOp = testColl.initializeOrderedBulkOp();
 
-    unorderedBulkOp.find({_id: 1}).updateOne([{$addFields: {unorderedBulkOpUpdateOne: true}}]);
-    unorderedBulkOp.find({}).update([{$addFields: {unorderedBulkOpUpdateMulti: true}}]);
-    orderedBulkOp.find({_id: 1}).updateOne([{$addFields: {orderedBulkOpUpdateOne: true}}]);
-    orderedBulkOp.find({}).update([{$addFields: {orderedBulkOpUpdateMulti: true}}]);
+    unorderedBulkOp.find({_id: 1}).updateOne([{$set: {unorderedBulkOpUpdateOne: true}}]);
+    unorderedBulkOp.find({}).update([{$set: {unorderedBulkOpUpdateMulti: true}}]);
+    orderedBulkOp.find({_id: 1}).updateOne([{$set: {orderedBulkOpUpdateOne: true}}]);
+    orderedBulkOp.find({}).update([{$set: {orderedBulkOpUpdateMulti: true}}]);
     assert.commandWorked(unorderedBulkOp.execute());
     assert.commandWorked(orderedBulkOp.execute());
 
@@ -73,16 +73,15 @@
     const expectedFindOneAndUpdatePostImage =
         Object.merge(expectedFindAndModifyPostImage, {findOneAndUpdate: true});
     const findAndModifyPostImage = testColl.findAndModify(
-        {query: {_id: 1}, update: [{$addFields: {findAndModify: true}}], new: true});
+        {query: {_id: 1}, update: [{$set: {findAndModify: true}}], new: true});
     assert.docEq(findAndModifyPostImage, expectedFindAndModifyPostImage);
     const findOneAndUpdatePostImage = testColl.findOneAndUpdate(
-        {_id: 1}, [{$addFields: {findOneAndUpdate: true}}], {returnNewDocument: true});
+        {_id: 1}, [{$set: {findOneAndUpdate: true}}], {returnNewDocument: true});
     assert.docEq(findOneAndUpdatePostImage, expectedFindOneAndUpdatePostImage);
 
     // Shell helpers for replacement updates should reject pipeline-style updates.
-    assert.throws(() => testColl.replaceOne({_id: 1}, [{$replaceRoot: {newObj: {}}}]));
-    assert.throws(() => testColl.findOneAndReplace({_id: 1}, [{$replaceRoot: {newObj: {}}}]));
-    assert.throws(
-        () => testColl.bulkWrite(
-            [{replaceOne: {filter: {_id: 1}, replacement: [{$replaceRoot: {newObj: {}}}]}}]));
+    assert.throws(() => testColl.replaceOne({_id: 1}, [{$replaceWith: {}}]));
+    assert.throws(() => testColl.findOneAndReplace({_id: 1}, [{$replaceWith: {}}]));
+    assert.throws(() => testColl.bulkWrite(
+                      [{replaceOne: {filter: {_id: 1}, replacement: [{$replaceWith: {}}]}}]));
 })();

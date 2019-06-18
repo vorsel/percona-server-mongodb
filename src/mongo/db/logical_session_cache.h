@@ -32,10 +32,9 @@
 #include <boost/optional.hpp>
 
 #include "mongo/base/status.h"
-#include "mongo/db/commands/end_sessions_gen.h"
+#include "mongo/db/logical_session_cache_gen.h"
 #include "mongo/db/logical_session_cache_stats_gen.h"
 #include "mongo/db/logical_session_id.h"
-#include "mongo/db/refresh_sessions_gen.h"
 
 namespace mongo {
 
@@ -58,28 +57,18 @@ public:
     virtual ~LogicalSessionCache() = 0;
 
     /**
-     * If the cache contains a record for this LogicalSessionId, promotes that lsid
-     * to be the most recently used and updates its lastUse date to be the current
-     * time. Returns an error if the session was not found.
+     * Invoked on service shutdown time in order to join the cache's refresher and reaper tasks.
      */
-    virtual Status promote(LogicalSessionId lsid) = 0;
+    virtual void joinOnShutDown() = 0;
 
     /**
-     * Inserts a new authoritative session record into the cache. This method will
-     * insert the authoritative record into the sessions collection. This method
-     * should only be used when starting new sessions and should not be used to
-     * insert records for existing sessions.
+     * Inserts a new authoritative session record into the cache.
+     *
+     * This method will insert the authoritative record into the sessions collection and should only
+     * be used when starting new sessions. It should not be used to insert records for existing
+     * sessions.
      */
-    virtual Status startSession(OperationContext* opCtx, LogicalSessionRecord record) = 0;
-
-    /**
-     * Refresh the given sessions. Updates the timestamps of these records in
-     * the local cache.
-     */
-    virtual Status refreshSessions(OperationContext* opCtx,
-                                   const RefreshSessionsCmdFromClient& cmd) = 0;
-    virtual Status refreshSessions(OperationContext* opCtx,
-                                   const RefreshSessionsCmdFromClusterMember& cmd) = 0;
+    virtual Status startSession(OperationContext* opCtx, const LogicalSessionRecord& record) = 0;
 
     /**
      * Vivifies the session in the cache. I.e. creates it if it isn't there, updates last use if it
@@ -93,8 +82,8 @@ public:
     virtual void endSessions(const LogicalSessionIdSet& lsids) = 0;
 
     /**
-     * Refreshes the cache synchronously. This flushes all pending refreshes and
-     * inserts to the sessions collection.
+     * Refreshes the cache synchronously. This flushes all pending refreshes and inserts to the
+     * sessions collection.
      */
     virtual Status refreshNow(Client* client) = 0;
 
@@ -102,11 +91,6 @@ public:
      * Reaps transaction records synchronously.
      */
     virtual Status reapNow(Client* client) = 0;
-
-    /**
-     * Returns the current time.
-     */
-    virtual Date_t now() = 0;
 
     /**
      * Returns the number of session records currently in the cache.

@@ -121,8 +121,7 @@ OplogEntry makeInsertOplogEntry(int t, const NamespaceString& nss) {
                       boost::none,                 // statement id
                       boost::none,   // optime of previous write within same transaction
                       boost::none,   // pre-image optime
-                      boost::none,   // post-image optime
-                      boost::none);  // prepare
+                      boost::none);  // post-image optime
 }
 
 /**
@@ -130,7 +129,11 @@ OplogEntry makeInsertOplogEntry(int t, const NamespaceString& nss) {
  */
 OplogEntry makeApplyOpsOplogEntry(int t, bool prepare) {
     auto nss = NamespaceString(NamespaceString::kAdminDb).getCommandNS();
-    BSONObj oField = BSON("applyOps" << BSONArray());
+    BSONObjBuilder oField;
+    oField.append("applyOps", BSONArray());
+    if (prepare) {
+        oField.append("prepare", true);
+    }
     return OplogEntry(OpTime(Timestamp(t, 1), 1),  // optime
                       boost::none,                 // hash
                       OpTypeEnum::kCommand,        // op type
@@ -138,27 +141,31 @@ OplogEntry makeApplyOpsOplogEntry(int t, bool prepare) {
                       boost::none,                 // uuid
                       boost::none,                 // fromMigrate
                       OplogEntry::kOplogVersion,   // version
-                      oField,                      // o
+                      oField.obj(),                // o
                       boost::none,                 // o2
                       {},                          // sessionInfo
                       boost::none,                 // upsert
                       Date_t::min() + Seconds(t),  // wall clock time
                       boost::none,                 // statement id
-                      boost::none,  // optime of previous write within same transaction
-                      boost::none,  // pre-image optime
-                      boost::none,  // post-image optime
-                      prepare);     // prepare
+                      boost::none,   // optime of previous write within same transaction
+                      boost::none,   // pre-image optime
+                      boost::none);  // post-image optime
 }
 
 /**
- * Generates a commitTransaction oplog entry with the given number used for the timestamp.
+ * Generates a commitTransaction/applyOps oplog entry, depending on whether this is for a prepared
+ * transaction, with the given number used for the timestamp.
  */
 OplogEntry makeCommitTransactionOplogEntry(int t, StringData dbName, bool prepared, int count) {
     auto nss = NamespaceString(dbName).getCommandNS();
-    CommitTransactionOplogObject cmdObj;
-    cmdObj.setPrepared(prepared);
-    cmdObj.setCount(count);
-    BSONObj oField = cmdObj.toBSON();
+    BSONObj oField;
+    if (prepared) {
+        CommitTransactionOplogObject cmdObj;
+        cmdObj.setCount(count);
+        oField = cmdObj.toBSON();
+    } else {
+        oField = BSON("applyOps" << BSONArray() << "count" << count);
+    }
     return OplogEntry(OpTime(Timestamp(t, 1), 1),  // optime
                       boost::none,                 // hash
                       OpTypeEnum::kCommand,        // op type
@@ -174,8 +181,7 @@ OplogEntry makeCommitTransactionOplogEntry(int t, StringData dbName, bool prepar
                       boost::none,                 // statement id
                       boost::none,   // optime of previous write within same transaction
                       boost::none,   // pre-image optime
-                      boost::none,   // post-image optime
-                      boost::none);  // prepare
+                      boost::none);  // post-image optime
 }
 
 /**

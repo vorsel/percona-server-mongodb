@@ -30,7 +30,7 @@
 #pragma once
 
 #include "mongo/db/curop.h"
-#include "mongo/db/operation_context.h"
+#include "mongo/db/prepare_conflict_tracker.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
 #include "mongo/util/fail_point_service.h"
@@ -43,10 +43,17 @@ MONGO_FAIL_POINT_DECLARE(WTPrepareConflictForReads);
 // When set, WT_ROLLBACK is returned in place of retrying on WT_PREPARE_CONFLICT errors.
 MONGO_FAIL_POINT_DECLARE(WTSkipPrepareConflictRetries);
 
+MONGO_FAIL_POINT_DECLARE(WTPrintPrepareConflictLog);
+
 /**
  * Logs a message with the number of prepare conflict retry attempts.
  */
 void wiredTigerPrepareConflictLog(int attempt);
+
+/**
+ * Logs a message to confirm we've hit the WTPrintPrepareConflictLog fail point.
+ */
+void wiredTigerPrepareConflictFailPointLog();
 
 /**
  * Runs the argument function f as many times as needed for f to return an error other than
@@ -61,13 +68,42 @@ int wiredTigerPrepareConflictRetry(OperationContext* opCtx, F&& f) {
 
     auto recoveryUnit = WiredTigerRecoveryUnit::get(opCtx);
     int attempts = 1;
+    // If we return from this function, we have either returned successfully or we've returned an
+    // error other than WT_PREPARE_CONFLICT. Reset PrepareConflictTracker accordingly.
+    ON_BLOCK_EXIT([opCtx] { PrepareConflictTracker::get(opCtx).endPrepareConflict(); });
     // If the failpoint is enabled, don't call the function, just simulate a conflict.
     int ret =
         MONGO_FAIL_POINT(WTPrepareConflictForReads) ? WT_PREPARE_CONFLICT : WT_READ_CHECK(f());
     if (ret != WT_PREPARE_CONFLICT)
         return ret;
+
+    PrepareConflictTracker::get(opCtx).beginPrepareConflict();
+
+    if (MONGO_FAIL_POINT(WTPrintPrepareConflictLog)) {
+        wiredTigerPrepareConflictFailPointLog();
+    }
+
     CurOp::get(opCtx)->debug().additiveMetrics.incrementPrepareReadConflicts(1);
     wiredTigerPrepareConflictLog(attempts);
+
+    const auto lockerInfo = opCtx->lockState()->getLockerInfo(boost::none);
+    invariant(lockerInfo);
+    for (const auto& lock : lockerInfo->locks) {
+        const auto type = lock.resourceId.getType();
+        // If a user operation on secondaries acquires a lock in MODE_S and then blocks on a prepare
+        // conflict with a prepared transaction, deadlock will occur at the commit time of the
+        // prepared transaction when it attempts to reacquire (since locks were yielded on
+        // secondaries) an IX lock that conflicts with the MODE_S lock held by the user operation.
+        // User operations that acquire MODE_X locks and block on prepare conflicts could lead to
+        // the same problem. However, user operations on secondaries should never hold MODE_X locks.
+        // Since prepared transactions will not reacquire RESOURCE_MUTEX / RESOURCE_METADATA locks
+        // at commit time, these lock types are safe. Therefore, invariant here that we do not get a
+        // prepare conflict while holding a global, database, or collection MODE_S lock (or MODE_X
+        // lock for completeness).
+        if (type == RESOURCE_GLOBAL || type == RESOURCE_DATABASE || type == RESOURCE_COLLECTION)
+            invariant(lock.mode != MODE_S && lock.mode != MODE_X,
+                      str::stream() << lock.resourceId.toString() << " in " << modeName(lock.mode));
+    }
 
     if (MONGO_FAIL_POINT(WTSkipPrepareConflictRetries)) {
         // Callers of wiredTigerPrepareConflictRetry() should eventually call wtRCToStatus() via
@@ -90,6 +126,7 @@ int wiredTigerPrepareConflictRetry(OperationContext* opCtx, F&& f) {
 
         CurOp::get(opCtx)->debug().additiveMetrics.incrementPrepareReadConflicts(1);
         wiredTigerPrepareConflictLog(attempts);
+
         // Wait on the session cache to signal that a unit of work has been committed or aborted.
         recoveryUnit->getSessionCache()->waitUntilPreparedUnitOfWorkCommitsOrAborts(opCtx,
                                                                                     lastCount);

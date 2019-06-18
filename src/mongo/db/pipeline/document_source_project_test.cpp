@@ -57,11 +57,12 @@ using std::vector;
 
 // This provides access to getExpCtx(), but we'll use a different name for this test suite.
 using ProjectStageTest = AggregationContextFixture;
+using UnsetTest = AggregationContextFixture;
 
 TEST_F(ProjectStageTest, InclusionProjectionShouldRemoveUnspecifiedFields) {
     auto project =
         DocumentSourceProject::create(BSON("a" << true << "c" << BSON("d" << true)), getExpCtx());
-    auto source = DocumentSourceMock::create("{_id: 0, a: 1, b: 1, c: {d: 1}}");
+    auto source = DocumentSourceMock::createForTest("{_id: 0, a: 1, b: 1, c: {d: 1}}");
     project->setSource(source.get());
     // The first result exists and is as expected.
     auto next = project->getNext();
@@ -99,7 +100,7 @@ TEST_F(ProjectStageTest, ShouldErrorOnNonObjectSpec) {
  */
 TEST_F(ProjectStageTest, InclusionShouldBeAbleToProcessMultipleDocuments) {
     auto project = DocumentSourceProject::create(BSON("a" << true), getExpCtx());
-    auto source = DocumentSourceMock::create({"{a: 1, b: 2}", "{a: 3, b: 4}"});
+    auto source = DocumentSourceMock::createForTest({"{a: 1, b: 2}", "{a: 3, b: 4}"});
     project->setSource(source.get());
     auto next = project->getNext();
     ASSERT(next.isAdvanced());
@@ -122,7 +123,7 @@ TEST_F(ProjectStageTest, InclusionShouldBeAbleToProcessMultipleDocuments) {
  */
 TEST_F(ProjectStageTest, ExclusionShouldBeAbleToProcessMultipleDocuments) {
     auto project = DocumentSourceProject::create(BSON("a" << false), getExpCtx());
-    auto source = DocumentSourceMock::create({"{a: 1, b: 2}", "{a: 3, b: 4}"});
+    auto source = DocumentSourceMock::createForTest({"{a: 1, b: 2}", "{a: 3, b: 4}"});
     project->setSource(source.get());
     auto next = project->getNext();
     ASSERT(next.isAdvanced());
@@ -141,12 +142,13 @@ TEST_F(ProjectStageTest, ExclusionShouldBeAbleToProcessMultipleDocuments) {
 
 TEST_F(ProjectStageTest, ShouldPropagatePauses) {
     auto project = DocumentSourceProject::create(BSON("a" << false), getExpCtx());
-    auto source = DocumentSourceMock::create({Document(),
-                                              DocumentSource::GetNextResult::makePauseExecution(),
-                                              Document(),
-                                              DocumentSource::GetNextResult::makePauseExecution(),
-                                              Document(),
-                                              DocumentSource::GetNextResult::makePauseExecution()});
+    auto source =
+        DocumentSourceMock::createForTest({Document(),
+                                           DocumentSource::GetNextResult::makePauseExecution(),
+                                           Document(),
+                                           DocumentSource::GetNextResult::makePauseExecution(),
+                                           Document(),
+                                           DocumentSource::GetNextResult::makePauseExecution()});
     project->setSource(source.get());
 
     ASSERT_TRUE(project->getNext().isAdvanced());
@@ -249,7 +251,7 @@ TEST_F(ProjectStageTest, ExclusionProjectionReportsExcludedPathsWithIdExclusion)
 TEST_F(ProjectStageTest, CanUseRemoveSystemVariableToConditionallyExcludeProjectedField) {
     auto project = DocumentSourceProject::create(
         fromjson("{a: 1, b: {$cond: [{$eq: ['$b', 4]}, '$$REMOVE', '$b']}}"), getExpCtx());
-    auto source = DocumentSourceMock::create({"{a: 2, b: 2}", "{a: 3, b: 4}"});
+    auto source = DocumentSourceMock::createForTest({"{a: 2, b: 2}", "{a: 3, b: 4}"});
     project->setSource(source.get());
     auto next = project->getNext();
     ASSERT(next.isAdvanced());
@@ -281,7 +283,7 @@ BSONObj makeProjectForNestedDocument(size_t depth) {
 TEST_F(ProjectStageTest, CanAddNestedDocumentExactlyAtDepthLimit) {
     auto project = DocumentSourceProject::create(
         makeProjectForNestedDocument(BSONDepth::getMaxAllowableDepth()), getExpCtx());
-    auto mock = DocumentSourceMock::create(Document{{"_id", 1}});
+    auto mock = DocumentSourceMock::createForTest(Document{{"_id", 1}});
     project->setSource(mock.get());
 
     auto next = project->getNext();
@@ -294,6 +296,125 @@ TEST_F(ProjectStageTest, CannotAddNestedDocumentExceedingDepthLimit) {
             makeProjectForNestedDocument(BSONDepth::getMaxAllowableDepth() + 1), getExpCtx()),
         AssertionException,
         ErrorCodes::Overflow);
+}
+
+TEST_F(UnsetTest, AcceptsValidUnsetSpec) {
+    auto spec = BSON("$unset" << BSON_ARRAY("a"
+                                            << "b"
+                                            << "c.d"));
+    auto specElement = spec.firstElement();
+    auto stage = DocumentSourceProject::createFromBson(specElement, getExpCtx());
+    ASSERT(stage);
+}
+
+TEST_F(UnsetTest, RejectsUnsetSpecWhichIsNotAnArray) {
+    auto spec = BSON("$unset"
+                     << "foo");
+    auto specElement = spec.firstElement();
+    ASSERT_THROWS_CODE(
+        DocumentSourceProject::createFromBson(specElement, getExpCtx()), AssertionException, 31002);
+}
+
+TEST_F(UnsetTest, RejectsUnsetSpecWithEmptyArray) {
+    auto spec = BSON("$unset" << BSONArray());
+    auto specElement = spec.firstElement();
+    ASSERT_THROWS_CODE(
+        DocumentSourceProject::createFromBson(specElement, getExpCtx()), AssertionException, 31119);
+}
+
+TEST_F(UnsetTest, RejectsUnsetSpecWithArrayContainingAnyNonStringValue) {
+    auto spec = BSON("$unset" << BSON_ARRAY("a" << 2 << "b"));
+    auto specElement = spec.firstElement();
+    ASSERT_THROWS_CODE(
+        DocumentSourceProject::createFromBson(specElement, getExpCtx()), AssertionException, 31120);
+}
+
+TEST_F(UnsetTest, UnsetSingleField) {
+    auto updateDoc = BSON("$unset" << BSON_ARRAY("a"));
+    auto unsetStage = DocumentSourceProject::createFromBson(updateDoc.firstElement(), getExpCtx());
+    auto source = DocumentSourceMock::createForTest({"{a: 10, b: 20}"});
+    unsetStage->setSource(source.get());
+    auto next = unsetStage->getNext();
+    ASSERT(next.isAdvanced());
+    ASSERT(next.getDocument().getField("a").missing());
+    ASSERT_EQUALS(20, next.getDocument().getField("b").getInt());
+
+    ASSERT(unsetStage->getNext().isEOF());
+}
+
+TEST_F(UnsetTest, UnsetMultipleFields) {
+    auto updateDoc = BSON("$unset" << BSON_ARRAY("a"
+                                                 << "b.c"
+                                                 << "d.e"));
+    auto unsetStage = DocumentSourceProject::createFromBson(updateDoc.firstElement(), getExpCtx());
+    auto source = DocumentSourceMock::createForTest({"{a: 10, b: {c: 20}, d: [{e: 30, f: 40}]}"});
+    unsetStage->setSource(source.get());
+    auto next = unsetStage->getNext();
+    ASSERT(next.isAdvanced());
+    ASSERT_BSONOBJ_EQ(next.getDocument().toBson(),
+                      BSON("b" << BSONObj() << "d" << BSON_ARRAY(BSON("f" << 40))));
+
+    ASSERT(unsetStage->getNext().isEOF());
+}
+
+TEST_F(UnsetTest, UnsetShouldBeAbleToProcessMultipleDocuments) {
+    auto updateDoc = BSON("$unset" << BSON_ARRAY("a"));
+    auto unsetStage = DocumentSourceProject::createFromBson(updateDoc.firstElement(), getExpCtx());
+    auto source = DocumentSourceMock::createForTest({"{a: 1, b: 2}", "{a: 3, b: 4}"});
+    unsetStage->setSource(source.get());
+    auto next = unsetStage->getNext();
+    ASSERT(next.isAdvanced());
+    ASSERT(next.getDocument().getField("a").missing());
+    ASSERT_EQUALS(2, next.getDocument().getField("b").getInt());
+
+    next = unsetStage->getNext();
+    ASSERT(next.isAdvanced());
+    ASSERT(next.getDocument().getField("a").missing());
+    ASSERT_EQUALS(4, next.getDocument().getField("b").getInt());
+
+    ASSERT(unsetStage->getNext().isEOF());
+}
+
+TEST_F(UnsetTest, UnsetSerializesToProject) {
+    auto updateDoc = BSON("$unset" << BSON_ARRAY("b.c"));
+    auto unsetStage = DocumentSourceProject::createFromBson(updateDoc.firstElement(), getExpCtx());
+
+    vector<Value> serializedArray;
+    unsetStage->serializeToArray(serializedArray);
+    auto serializedUnsetStage = serializedArray[0].getDocument().toBson();
+    ASSERT_BSONOBJ_EQ(serializedUnsetStage, fromjson("{$project: {b: {c: false}}}"));
+    auto projectStage =
+        DocumentSourceProject::createFromBson(serializedUnsetStage.firstElement(), getExpCtx());
+    projectStage->serializeToArray(serializedArray);
+    auto serializedProjectStage = serializedArray[0].getDocument().toBson();
+    ASSERT_BSONOBJ_EQ(serializedUnsetStage, serializedProjectStage);
+}
+
+TEST_F(UnsetTest, UnsetShouldNotAddDependencies) {
+    auto updateDoc = BSON("$unset" << BSON_ARRAY("a"
+                                                 << "b.c"));
+    auto unsetStage = DocumentSourceProject::createFromBson(updateDoc.firstElement(), getExpCtx());
+
+    DepsTracker dependencies;
+    ASSERT_EQUALS(DepsTracker::State::SEE_NEXT, unsetStage->getDependencies(&dependencies));
+
+    ASSERT_EQUALS(0U, dependencies.fields.size());
+    ASSERT_EQUALS(false, dependencies.needWholeDocument);
+    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
+}
+
+TEST_F(UnsetTest, UnsetReportsExcludedPathsAsModifiedPaths) {
+    auto updateDoc = BSON("$unset" << BSON_ARRAY("a"
+                                                 << "b.c.d"
+                                                 << "e.f.g"));
+    auto unsetStage = DocumentSourceProject::createFromBson(updateDoc.firstElement(), getExpCtx());
+
+    auto modifiedPaths = unsetStage->getModifiedPaths();
+    ASSERT(modifiedPaths.type == DocumentSource::GetModPathsReturn::Type::kFiniteSet);
+    ASSERT_EQUALS(3U, modifiedPaths.paths.size());
+    ASSERT_EQUALS(1U, modifiedPaths.paths.count("a"));
+    ASSERT_EQUALS(1U, modifiedPaths.paths.count("b.c.d"));
+    ASSERT_EQUALS(1U, modifiedPaths.paths.count("e.f.g"));
 }
 }  // namespace
 }  // namespace mongo

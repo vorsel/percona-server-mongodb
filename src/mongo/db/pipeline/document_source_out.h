@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include "mongo/db/db_raii.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_out_gen.h"
 #include "mongo/db/write_concern_options.h"
@@ -46,23 +47,21 @@ class OutStageWriteBlock {
     OperationContext* _opCtx;
     repl::ReadConcernArgs _originalArgs;
     RecoveryUnit::ReadSource _originalSource;
-    bool _originalIgnorePrepared;
+    EnforcePrepareConflictsBlock _enforcePrepareConflictsBlock;
 
 public:
-    OutStageWriteBlock(OperationContext* opCtx) : _opCtx(opCtx) {
+    OutStageWriteBlock(OperationContext* opCtx)
+        : _opCtx(opCtx), _enforcePrepareConflictsBlock(opCtx) {
         _originalArgs = repl::ReadConcernArgs::get(_opCtx);
         _originalSource = _opCtx->recoveryUnit()->getTimestampReadSource();
-        _originalIgnorePrepared = _opCtx->recoveryUnit()->getIgnorePrepared();
 
         repl::ReadConcernArgs::get(_opCtx) = repl::ReadConcernArgs();
         _opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::kUnset);
-        _opCtx->recoveryUnit()->setIgnorePrepared(false);
     }
 
     ~OutStageWriteBlock() {
         repl::ReadConcernArgs::get(_opCtx) = _originalArgs;
         _opCtx->recoveryUnit()->setTimestampReadSource(_originalSource);
-        _opCtx->recoveryUnit()->setIgnorePrepared(_originalIgnorePrepared);
     }
 };
 
@@ -145,7 +144,8 @@ public:
                 hostTypeRequirement,
                 DiskUseRequirement::kWritesPersistentData,
                 FacetRequirement::kNotAllowed,
-                TransactionRequirement::kNotAllowed};
+                TransactionRequirement::kNotAllowed,
+                LookupRequirement::kNotAllowed};
     }
 
     const NamespaceString& getOutputNs() const {
@@ -156,7 +156,7 @@ public:
         return _mode;
     }
 
-    boost::optional<MergingLogic> mergingLogic() final {
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
         // It should always be faster to avoid splitting the pipeline if the output collection is
         // sharded. If we avoid splitting the pipeline then each shard can perform the writes to the
         // target collection in parallel.
@@ -168,7 +168,7 @@ public:
             return boost::none;
         }
         // {shardsStage, mergingStage, sortPattern}
-        return MergingLogic{nullptr, this, boost::none};
+        return DistributedPlanLogic{nullptr, this, boost::none};
     }
 
     virtual bool canRunInParallelBeforeOut(

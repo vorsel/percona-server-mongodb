@@ -197,7 +197,7 @@
     // TODO SERVER-32208: Remove this function once it is no longer needed.
     function isRetryableExecutorCodeAndMessage(code, msg) {
         return code === ErrorCodes.OperationFailed && typeof msg !== "undefined" &&
-            msg.indexOf("InterruptedDueToStepDown") >= 0;
+            msg.indexOf("InterruptedDueToReplStateChange") >= 0;
     }
 
     // Returns true if the given response could have come from shardCollection being interrupted by
@@ -510,8 +510,7 @@
         if (TransactionsUtil.isTransientTransactionError(res)) {
             return;
         }
-        // TODO (SERVER-40001) enforce abortTransaction errors.
-        // assert.commandWorked(res);
+        assert.commandWorked(res);
     }
 
     function startNewTransaction(conn, cmdObj) {
@@ -819,7 +818,7 @@
             }
 
             // Thrown when an index build is interrupted during its collection scan.
-            if (cmdName === "createIndexes" && res.codeName === "InterruptedDueToStepDown") {
+            if (cmdName === "createIndexes" && res.codeName === "InterruptedDueToReplStateChange") {
                 logError("Retrying because of interrupted collection scan");
                 return kContinue;
             }

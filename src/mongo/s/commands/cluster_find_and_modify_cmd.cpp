@@ -35,6 +35,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/find_and_modify_common.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
+#include "mongo/db/storage/duplicate_key_error_info.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/balancer_configuration.h"
@@ -57,6 +58,16 @@ namespace mongo {
 namespace {
 
 const ReadPreferenceSetting kPrimaryOnlyReadPreference(ReadPreference::PrimaryOnly);
+const char kRuntimeConstantsField[] = "runtimeConstants";
+
+BSONObj appendRuntimeConstantsToCommandObject(OperationContext* opCtx, const BSONObj& origCmdObj) {
+    uassert(51196,
+            "Cannot specify runtime constants option to a mongos",
+            !origCmdObj.getField(kRuntimeConstantsField));
+    auto rtcBSON =
+        BSON(kRuntimeConstantsField << Variables::generateRuntimeConstants(opCtx).toBSON());
+    return origCmdObj.addField(rtcBSON.getField(kRuntimeConstantsField));
+}
 
 BSONObj getCollation(const BSONObj& cmdObj) {
     BSONElement collationElement;
@@ -91,26 +102,38 @@ void updateShardKeyValueOnWouldChangeOwningShardError(OperationContext* opCtx,
         WouldChangeOwningShardInfo::parseFromCommandError(extraInfo);
 
     try {
-        auto matchedDoc = documentShardKeyUpdateUtil::updateShardKeyForDocument(
+        auto matchedDocOrUpserted = documentShardKeyUpdateUtil::updateShardKeyForDocument(
             opCtx, nss, wouldChangeOwningShardExtraInfo, cmdObj.getIntField("stmtId"));
+        auto upserted = matchedDocOrUpserted && wouldChangeOwningShardExtraInfo.getShouldUpsert();
+        auto updatedExistingDocument = matchedDocOrUpserted && !upserted;
 
         BSONObjBuilder lastErrorObjBuilder(result->subobjStart("lastErrorObject"));
-        lastErrorObjBuilder.appendNumber("n", matchedDoc ? 1 : 0);
-        lastErrorObjBuilder.appendBool("updatedExisting", matchedDoc ? true : false);
+        lastErrorObjBuilder.appendNumber("n", matchedDocOrUpserted ? 1 : 0);
+        lastErrorObjBuilder.appendBool("updatedExisting", updatedExistingDocument);
+        if (upserted) {
+            lastErrorObjBuilder.appendAs(wouldChangeOwningShardExtraInfo.getPostImage()["_id"],
+                                         "upserted");
+        }
         lastErrorObjBuilder.doneFast();
 
-        if (matchedDoc) {
+        auto shouldReturnPostImage = cmdObj.getBoolField("new");
+        if (updatedExistingDocument) {
             result->append("value",
-                           cmdObj.getBoolField("new")
-                               ? wouldChangeOwningShardExtraInfo.getPostImage()
-                               : wouldChangeOwningShardExtraInfo.getPreImage());
+                           shouldReturnPostImage ? wouldChangeOwningShardExtraInfo.getPostImage()
+                                                 : wouldChangeOwningShardExtraInfo.getPreImage());
+        } else if (upserted && shouldReturnPostImage) {
+            result->append("value", wouldChangeOwningShardExtraInfo.getPostImage());
         } else {
             result->appendNull("value");
         }
         result->append("ok", 1.0);
-    } catch (const DBException& e) {
-        auto status = e.toStatus();
-        uassertStatusOK(status.withContext("findAndModify"));
+    } catch (DBException& e) {
+        if (e.code() == ErrorCodes::DuplicateKey &&
+            e.extraInfo<DuplicateKeyErrorInfo>()->getKeyPattern().hasField("_id")) {
+            e.addContext(documentShardKeyUpdateUtil::kDuplicateKeyErrorContext);
+        }
+        e.addContext("findAndModify");
+        throw;
     }
 }
 
@@ -170,7 +193,8 @@ public:
                 Grid::get(opCtx)->shardRegistry()->getShard(opCtx, chunk.getShardId()));
         }
 
-        const auto explainCmd = ClusterExplain::wrapAsExplain(cmdObj, verbosity);
+        const auto explainCmd = ClusterExplain::wrapAsExplain(
+            appendRuntimeConstantsToCommandObject(opCtx, cmdObj), verbosity);
 
         // Time how long it takes to run the explain command on the shard.
         Timer timer;
@@ -206,21 +230,24 @@ public:
         // that the parsing be pulled into this function.
         uassertStatusOK(createShardDatabase(opCtx, nss.db()));
 
+        // Append mongoS' runtime constants to the command object before forwarding it to the shard.
+        auto cmdObjForShard = appendRuntimeConstantsToCommandObject(opCtx, cmdObj);
+
         const auto routingInfo = uassertStatusOK(getCollectionRoutingInfoForTxnCmd(opCtx, nss));
         if (!routingInfo.cm()) {
             _runCommand(opCtx,
                         routingInfo.db().primaryId(),
                         ChunkVersion::UNSHARDED(),
                         nss,
-                        cmdObj,
+                        cmdObjForShard,
                         &result);
             return true;
         }
 
         const auto chunkMgr = routingInfo.cm();
 
-        const BSONObj query = cmdObj.getObjectField("query");
-        const BSONObj collation = getCollation(cmdObj);
+        const BSONObj query = cmdObjForShard.getObjectField("query");
+        const BSONObj collation = getCollation(cmdObjForShard);
         const BSONObj shardKey = getShardKey(opCtx, *chunkMgr, query);
         auto chunk = chunkMgr->findIntersectingChunk(shardKey, collation);
 
@@ -228,7 +255,7 @@ public:
                     chunk.getShardId(),
                     chunkMgr->getVersion(chunk.getShardId()),
                     nss,
-                    cmdObj,
+                    cmdObjForShard,
                     &result);
 
         return true;
@@ -296,9 +323,11 @@ private:
                         appendWriteConcernErrorToCmdResponse(shardId, wcErrorElem, *result);
                     }
                 } catch (DBException& e) {
-                    e.addContext(
-                        "Update operation was converted into a distributed transaction because the "
-                        "document being updated would move shards and that transaction failed");
+                    if (e.code() != ErrorCodes::DuplicateKey ||
+                        (e.code() == ErrorCodes::DuplicateKey &&
+                         !e.extraInfo<DuplicateKeyErrorInfo>()->getKeyPattern().hasField("_id"))) {
+                        e.addContext(documentShardKeyUpdateUtil::kNonDuplicateKeyErrorContext);
+                    };
 
                     auto txnRouterForAbort = TransactionRouter::get(opCtx);
                     if (txnRouterForAbort)
@@ -323,7 +352,6 @@ private:
         result->appendElementsUnique(
             CommandHelpers::filterCommandReplyForPassthrough(response.data));
     }
-
 } findAndModifyCmd;
 
 }  // namespace

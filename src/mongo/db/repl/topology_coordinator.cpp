@@ -1317,8 +1317,9 @@ bool TopologyCoordinator::prepareForUnconditionalStepDown() {
         // Can only be processing one required stepdown at a time.
         return false;
     }
-    // Heartbeat-initiated stepdowns take precedence over stepdown command initiated stepdowns, so
-    // it's safe to transition from kAttemptingStepDown to kSteppingDown.
+    // Heartbeat and reconfig (via cmd or heartbeat) initiated stepdowns take precedence over
+    // stepdown command initiated stepdowns, so it's safe to transition from kAttemptingStepDown
+    // to kSteppingDown.
     _setLeaderMode(LeaderMode::kSteppingDown);
     return true;
 }
@@ -1721,32 +1722,39 @@ void TopologyCoordinator::fillMemberData(BSONObjBuilder* result) {
     }
 }
 
-void TopologyCoordinator::fillIsMasterForReplSet(IsMasterResponse* response) {
+void TopologyCoordinator::fillIsMasterForReplSet(IsMasterResponse* const response,
+                                                 const SplitHorizon::Parameters& horizonParams) {
     const MemberState myState = getMemberState();
     if (!_rsConfig.isInitialized()) {
         response->markAsNoConfig();
         return;
     }
 
-    for (ReplSetConfig::MemberIterator it = _rsConfig.membersBegin(); it != _rsConfig.membersEnd();
-         ++it) {
-        if (it->isHidden() || it->getSlaveDelay() > Seconds{0}) {
-            continue;
-        }
-
-        if (it->isElectable()) {
-            response->addHost(it->getHostAndPort());
-        } else if (it->isArbiter()) {
-            response->addArbiter(it->getHostAndPort());
-        } else {
-            response->addPassive(it->getHostAndPort());
-        }
-    }
-
     response->setReplSetName(_rsConfig.getReplSetName());
     if (myState.removed()) {
         response->markAsNoConfig();
         return;
+    }
+
+    invariant(!_rsConfig.members().empty());
+
+    const auto& self = _rsConfig.members()[_selfIndex];
+
+    const auto horizon = self.determineHorizon(horizonParams);
+
+    for (const auto& member : _rsConfig.members()) {
+        if (member.isHidden() || member.getSlaveDelay() > Seconds{0}) {
+            continue;
+        }
+        auto hostView = member.getHostAndPort(horizon);
+
+        if (member.isElectable()) {
+            response->addHost(std::move(hostView));
+        } else if (member.isArbiter()) {
+            response->addArbiter(std::move(hostView));
+        } else {
+            response->addPassive(std::move(hostView));
+        }
     }
 
     response->setReplSetVersion(_rsConfig.getConfigVersion());
@@ -1758,7 +1766,7 @@ void TopologyCoordinator::fillIsMasterForReplSet(IsMasterResponse* response) {
 
     const MemberConfig* curPrimary = _currentPrimaryMember();
     if (curPrimary) {
-        response->setPrimary(curPrimary->getHostAndPort());
+        response->setPrimary(curPrimary->getHostAndPort(horizon));
     }
 
     const MemberConfig& selfConfig = _rsConfig.getMemberAt(_selfIndex);
@@ -2110,9 +2118,12 @@ int TopologyCoordinator::_getTotalPings() {
     return totalPings;
 }
 
+bool TopologyCoordinator::isSteppingDownUnconditionally() const {
+    return _leaderMode == LeaderMode::kSteppingDown;
+}
+
 bool TopologyCoordinator::isSteppingDown() const {
-    return _leaderMode == LeaderMode::kAttemptingStepDown ||
-        _leaderMode == LeaderMode::kSteppingDown;
+    return isSteppingDownUnconditionally() || _leaderMode == LeaderMode::kAttemptingStepDown;
 }
 
 void TopologyCoordinator::_setLeaderMode(TopologyCoordinator::LeaderMode newMode) {

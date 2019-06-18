@@ -47,6 +47,17 @@ public:
         kForSortKeyMerging,
     };
 
+    // Represents one of the components in a compound sort pattern. Each component is either the
+    // field path by which we are sorting, or an Expression which can be used to retrieve the sort
+    // value in the case of a $meta-sort (but not both).
+    struct SortPatternPart {
+        bool isAscending = true;
+        boost::optional<FieldPath> fieldPath;
+        boost::intrusive_ptr<Expression> expression;
+    };
+
+    using SortPattern = std::vector<SortPatternPart>;
+
     GetNextResult getNext() final;
 
     const char* getSourceName() const final {
@@ -69,6 +80,7 @@ public:
                                      DiskUseRequirement::kWritesTmpData,
                                      FacetRequirement::kAllowed,
                                      TransactionRequirement::kAllowed,
+                                     LookupRequirement::kAllowed,
                                      ChangeStreamRequirement::kBlacklist);
 
         // Can't swap with a $match if a limit has been absorbed, as $match can't swap with $limit.
@@ -78,14 +90,21 @@ public:
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
 
-    boost::optional<MergingLogic> mergingLogic() final;
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final;
     bool canRunInParallelBeforeOut(
         const std::set<std::string>& nameOfShardKeyFieldsUponEntryToStage) const final;
 
     /**
+     * Returns the sort key pattern.
+     */
+    const SortPattern& getSortKeyPattern() const {
+        return _sortPattern;
+    }
+
+    /**
      * Write out a Document whose contents are the sort key pattern.
      */
-    Document sortKeyPattern(SortKeySerialization) const;
+    Document serializeSortKeyPattern(SortKeySerialization) const;
 
     /**
      * Parses a $sort stage from the user-supplied BSON.
@@ -162,17 +181,6 @@ private:
     private:
         const DocumentSourceSort& _source;
     };
-
-    // Represents one of the components in a compound sort pattern. Each component is either the
-    // field path by which we are sorting, or an Expression which can be used to retrieve the sort
-    // value in the case of a $meta-sort (but not both).
-    struct SortPatternPart {
-        bool isAscending = true;
-        boost::optional<FieldPath> fieldPath;
-        boost::intrusive_ptr<Expression> expression;
-    };
-
-    using SortPattern = std::vector<SortPatternPart>;
 
     explicit DocumentSourceSort(const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 

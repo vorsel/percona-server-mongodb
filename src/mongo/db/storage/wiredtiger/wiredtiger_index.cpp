@@ -173,8 +173,7 @@ std::string WiredTigerIndex::generateAppMetadataString(const IndexDescriptor& de
 
     // Index metadata
     ss << ",app_metadata=("
-       << "formatVersion=" << keyStringVersion << ',' << "infoObj=" << desc.infoObj().jsonString()
-       << "),";
+       << "formatVersion=" << keyStringVersion << "),";
 
     return (ss.str());
 }
@@ -1556,6 +1555,7 @@ void WiredTigerIndexUnique::_unindexTimestampUnsafe(OperationContext* opCtx,
         }
         int ret = WT_OP_CHECK(c->remove(c));
         if (ret == WT_NOTFOUND) {
+            triggerWriteConflictAtPoint(c);
             return;
         }
         invariantWTOK(ret);

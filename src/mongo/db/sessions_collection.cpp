@@ -39,16 +39,12 @@
 #include "mongo/db/create_indexes_gen.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/ops/write_ops.h"
-#include "mongo/db/refresh_sessions_gen.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/memory.h"
 
 namespace mongo {
-
-constexpr StringData SessionsCollection::kSessionsTTLIndex;
-
 namespace {
 
 // This batch size is chosen to ensure that we don't form requests larger than the 16mb limit.
@@ -161,6 +157,10 @@ Status runBulkCmd(StringData label,
 
 }  // namespace
 
+constexpr StringData SessionsCollection::kSessionsTTLIndex;
+
+SessionsCollection::SessionsCollection() = default;
+
 SessionsCollection::~SessionsCollection() = default;
 
 SessionsCollection::SendBatchFn SessionsCollection::makeSendFnForBatchWrite(
@@ -212,7 +212,7 @@ SessionsCollection::FindBatchFn SessionsCollection::makeFindFnForCommand(const N
 }
 
 Status SessionsCollection::doRefresh(const NamespaceString& ns,
-                                     const LogicalSessionRecordSet& sessions,
+                                     const std::vector<LogicalSessionRecord>& sessions,
                                      SendBatchFn send) {
     auto init = [ns](BSONObjBuilder* batch) {
         batch->append("update", ns.coll());
@@ -230,7 +230,7 @@ Status SessionsCollection::doRefresh(const NamespaceString& ns,
 }
 
 Status SessionsCollection::doRemove(const NamespaceString& ns,
-                                    const LogicalSessionIdSet& sessions,
+                                    const std::vector<LogicalSessionId>& sessions,
                                     SendBatchFn send) {
     auto init = [ns](BSONObjBuilder* batch) {
         batch->append("delete", ns.coll());
@@ -245,16 +245,15 @@ Status SessionsCollection::doRemove(const NamespaceString& ns,
     return runBulkCmd("deletes", init, add, send, sessions);
 }
 
-StatusWith<LogicalSessionIdSet> SessionsCollection::doFetch(const NamespaceString& ns,
-                                                            const LogicalSessionIdSet& sessions,
-                                                            FindBatchFn send) {
+StatusWith<LogicalSessionIdSet> SessionsCollection::doFindRemoved(
+    const NamespaceString& ns, const std::vector<LogicalSessionId>& sessions, FindBatchFn send) {
     auto makeT = [] { return std::vector<LogicalSessionId>{}; };
 
     auto add = [](std::vector<LogicalSessionId>& batch, const LogicalSessionId& record) {
         batch.push_back(record);
     };
 
-    LogicalSessionIdSet removed = sessions;
+    LogicalSessionIdSet removed{sessions.begin(), sessions.end()};
 
     auto wrappedSend = [&](BSONObj batch) {
         auto swBatchResult = send(batch);

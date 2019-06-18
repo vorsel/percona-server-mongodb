@@ -90,11 +90,16 @@ Status ParsedDelete::parseQueryToCQ() {
         qr->setLimit(1);
     }
 
+    // If the delete request has runtime constants attached to it, pass them to the QueryRequest.
+    if (auto& runtimeConstants = _request->getRuntimeConstants()) {
+        qr->setRuntimeConstants(*runtimeConstants);
+    }
+
     const boost::intrusive_ptr<ExpressionContext> expCtx;
     auto statusWithCQ =
         CanonicalQuery::canonicalize(_opCtx,
                                      std::move(qr),
-                                     expCtx,
+                                     std::move(expCtx),
                                      extensionsCallback,
                                      MatchExpressionParser::kAllowAllSpecialFeatures);
 

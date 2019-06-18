@@ -36,6 +36,8 @@
 
 #include "mongo/db/transaction_participant.h"
 
+#include <fmt/format.h>
+
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog_raii.h"
@@ -58,8 +60,6 @@
 #include "mongo/db/retryable_writes_stats.h"
 #include "mongo/db/server_recovery.h"
 #include "mongo/db/server_transactions_metrics.h"
-#include "mongo/db/session.h"
-#include "mongo/db/session_catalog.h"
 #include "mongo/db/stats/fill_locker_info.h"
 #include "mongo/db/transaction_history_iterator.h"
 #include "mongo/db/transaction_participant_gen.h"
@@ -68,6 +68,7 @@
 #include "mongo/util/net/socket_utils.h"
 
 namespace mongo {
+using namespace fmt::literals;
 namespace {
 
 // Failpoint which will pause an operation just after allocating a point-in-time storage engine
@@ -137,29 +138,37 @@ ActiveTransactionHistory fetchActiveTransactionHistory(OperationContext* opCtx,
     if ((serverGlobalParams.featureCompatibility.getVersion() >=
          ServerGlobalParams::FeatureCompatibility::Version::kDowngradingTo40)) {
 
+        // The state being kPrepared marks a prepared transaction. We should never be refreshing
+        // a prepared transaction from storage since it should already be in a valid state after
+        // replication recovery.
+        invariant(result.lastTxnRecord->getState() != DurableTxnStateEnum::kPrepared);
+
         // The state being kCommitted marks the commit of a transaction.
         if (result.lastTxnRecord->getState() == DurableTxnStateEnum::kCommitted) {
             result.state = result.TxnRecordState::kCommitted;
+            return result;
         }
 
         // The state being kAborted marks the abort of a prepared transaction since we do not write
         // down abortTransaction oplog entries in 4.0.
         if (result.lastTxnRecord->getState() == DurableTxnStateEnum::kAborted) {
             result.state = result.TxnRecordState::kAbortedWithPrepare;
+            return result;
         }
 
-        // The state being kPrepared marks a prepared transaction. We should never be refreshing
-        // a prepared transaction from storage since it should already be in a valid state after
-        // replication recovery.
-        invariant(result.lastTxnRecord->getState() != DurableTxnStateEnum::kPrepared);
+        if (result.lastTxnRecord->getState() == DurableTxnStateEnum::kInProgress) {
+            return result;
+        }
     }
 
     auto it = TransactionHistoryIterator(result.lastTxnRecord->getLastWriteOpTime());
     while (it.hasNext()) {
         try {
             const auto entry = it.next(opCtx);
-            invariant(entry.getStatementId());
 
+            // Each entry should correspond to a retryable write or a FCV4.0 format transaction.
+            // These oplog entries must have statementIds.
+            invariant(entry.getStatementId());
             if (*entry.getStatementId() == kIncompleteHistoryStmtId) {
                 // Only the dead end sentinel can have this id for oplog write history
                 invariant(entry.getObject2());
@@ -187,7 +196,7 @@ ActiveTransactionHistory fetchActiveTransactionHistory(OperationContext* opCtx,
             if ((serverGlobalParams.featureCompatibility.getVersion() <=
                  ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo42) &&
                 (entry.getCommandType() == repl::OplogEntry::CommandType::kApplyOps &&
-                 !entry.shouldPrepare())) {
+                 !entry.shouldPrepare() && !entry.isPartialTransaction())) {
                 result.state = result.TxnRecordState::kCommitted;
             }
         } catch (const DBException& ex) {
@@ -291,6 +300,11 @@ MONGO_FAIL_POINT_DEFINE(onPrimaryTransactionalWrite);
 
 const BSONObj TransactionParticipant::kDeadEndSentinel(BSON("$incompleteOplogHistory" << 1));
 
+TransactionParticipant::TransactionParticipant() = default;
+
+TransactionParticipant::~TransactionParticipant() {
+    // invariant(!_o.txnState.isInProgress());
+}
 
 TransactionParticipant::Observer::Observer(const ObservableSession& osession)
     : Observer(&getTransactionParticipant(osession.get())) {}
@@ -307,30 +321,30 @@ TransactionParticipant::Participant::Participant(const SessionToKill& session)
     : Observer(&getTransactionParticipant(session.get())) {}
 
 void TransactionParticipant::performNoopWrite(OperationContext* opCtx, StringData msg) {
-    repl::ReplicationCoordinator* replCoord =
-        repl::ReplicationCoordinator::get(opCtx->getClient()->getServiceContext());
+    const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
 
     // The locker must not have a max lock timeout when this noop write is performed, since if it
     // threw LockTimeout, this would be treated as a TransientTransactionError, which would indicate
-    // it's resafe to retry the entire transaction. We cannot know it is safe to attach
+    // it's safe to retry the entire transaction. We cannot know it is safe to attach
     // TransientTransactionError until the noop write has been performed and the writeConcern has
     // been satisfied.
     invariant(!opCtx->lockState()->hasMaxLockTimeout());
 
     {
         Lock::DBLock dbLock(opCtx, "local", MODE_IX);
-        Lock::CollectionLock collectionLock(opCtx, NamespaceString("local.oplog.rs"), MODE_IX);
+        Lock::CollectionLock collectionLock(opCtx, NamespaceString::kRsOplogNamespace, MODE_IX);
 
         uassert(ErrorCodes::NotMaster,
-                "Not primary when performing noop write for NoSuchTransaction error",
+                "Not primary when performing noop write for {}"_format(msg),
                 replCoord->canAcceptWritesForDatabase(opCtx, "admin"));
 
-        writeConflictRetry(opCtx, "performNoopWrite", "local.rs.oplog", [&opCtx, &msg] {
-            WriteUnitOfWork wuow(opCtx);
-            opCtx->getClient()->getServiceContext()->getOpObserver()->onOpMessage(
-                opCtx, BSON("msg" << msg));
-            wuow.commit();
-        });
+        writeConflictRetry(
+            opCtx, "performNoopWrite", NamespaceString::kRsOplogNamespace.ns(), [&opCtx, &msg] {
+                WriteUnitOfWork wuow(opCtx);
+                opCtx->getClient()->getServiceContext()->getOpObserver()->onOpMessage(
+                    opCtx, BSON("msg" << msg));
+                wuow.commit();
+            });
     }
 }
 
@@ -347,6 +361,9 @@ TransactionParticipant::getOldestActiveTimestamp(Timestamp stableTimestamp) {
         auto opCtx = cc().makeOperationContext();
         auto nss = NamespaceString::kSessionTransactionsTableNamespace;
         auto deadline = Date_t::now() + Milliseconds(100);
+
+        ShouldNotConflictWithSecondaryBatchApplicationBlock shouldNotConflictBlock(
+            opCtx->lockState());
         Lock::DBLock dbLock(opCtx.get(), nss.db(), MODE_IS, deadline);
         Lock::CollectionLock collLock(opCtx.get(), nss, MODE_IS, deadline);
 
@@ -582,40 +599,39 @@ SharedSemiFuture<void> TransactionParticipant::Participant::onExitPrepare() cons
     return o().txnState._exitPreparePromise->getFuture();
 }
 
-void TransactionParticipant::Participant::_setSpeculativeTransactionOpTime(
-    OperationContext* opCtx, SpeculativeTransactionOpTime opTimeChoice) {
-    repl::ReplicationCoordinator* replCoord =
-        repl::ReplicationCoordinator::get(opCtx->getServiceContext());
+void TransactionParticipant::Participant::_setReadSnapshot(OperationContext* opCtx,
+                                                           repl::ReadConcernArgs readConcernArgs) {
+    if (readConcernArgs.getArgsAtClusterTime()) {
+        // Read concern code should have already set the timestamp on the recovery unit.
+        const auto readTimestamp = readConcernArgs.getArgsAtClusterTime()->asTimestamp();
+        const auto ruTs = opCtx->recoveryUnit()->getPointInTimeReadTimestamp();
+        invariant(readTimestamp == ruTs,
+                  "readTimestamp: {}, pointInTime: {}"_format(readTimestamp.toString(),
+                                                              ruTs ? ruTs->toString() : "none"));
 
-    boost::optional<Timestamp> readTimestamp;
-
-    if (opTimeChoice == SpeculativeTransactionOpTime::kAllCommitted) {
+        stdx::lock_guard<Client> lk(*opCtx->getClient());
+        o(lk).transactionMetricsObserver.onChooseReadTimestamp(readTimestamp);
+    } else if (readConcernArgs.getOriginalLevel() == repl::ReadConcernLevel::kSnapshotReadConcern) {
+        // For transactions with read concern level specified as 'snapshot', we will use
+        // 'kAllCommittedSnapshot' which ensures a snapshot with no 'holes'; that is, it is a state
+        // of the system that could be reconstructed from the oplog.
         opCtx->recoveryUnit()->setTimestampReadSource(
             RecoveryUnit::ReadSource::kAllCommittedSnapshot);
-        readTimestamp = repl::StorageInterface::get(opCtx)->getPointInTimeReadTimestamp(opCtx);
-        // Transactions do not survive term changes, so combining "getTerm" here with the
-        // recovery unit timestamp does not cause races.
-        p().speculativeTransactionReadOpTime = {*readTimestamp, replCoord->getTerm()};
+
+        const auto readTimestamp =
+            repl::StorageInterface::get(opCtx)->getPointInTimeReadTimestamp(opCtx);
         stdx::lock_guard<Client> lk(*opCtx->getClient());
-        o(lk).transactionMetricsObserver.onChooseReadTimestamp(*readTimestamp);
+        o(lk).transactionMetricsObserver.onChooseReadTimestamp(readTimestamp);
     } else {
+        // For transactions with read concern level specified as 'local' or 'majority', we will use
+        // 'kNoTimestamp' which gives us the most recent snapshot.  This snapshot may reflect oplog
+        // 'holes' from writes earlier than the last applied write which have not yet completed.
+        // Using 'kNoTimestamp' ensures that transactions with mode 'local' are always able to read
+        // writes from earlier transactions with mode 'local' on the same connection.
         opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
     }
 
     opCtx->recoveryUnit()->preallocateSnapshot();
-}
-
-void TransactionParticipant::Participant::_setSpeculativeTransactionReadTimestamp(
-    OperationContext* opCtx, Timestamp timestamp) {
-    // Read concern code should have already set the timestamp on the recovery unit.
-    invariant(timestamp == opCtx->recoveryUnit()->getPointInTimeReadTimestamp());
-
-    repl::ReplicationCoordinator* replCoord =
-        repl::ReplicationCoordinator::get(opCtx->getClient()->getServiceContext());
-    opCtx->recoveryUnit()->preallocateSnapshot();
-    p().speculativeTransactionReadOpTime = {timestamp, replCoord->getTerm()};
-    stdx::lock_guard<Client> lk(*opCtx->getClient());
-    o(lk).transactionMetricsObserver.onChooseReadTimestamp(timestamp);
 }
 
 TransactionParticipant::OplogSlotReserver::OplogSlotReserver(OperationContext* opCtx,
@@ -926,29 +942,8 @@ void TransactionParticipant::Participant::unstashTransactionResources(OperationC
     // not deadlock-safe to upgrade IS to IX.
     Lock::GlobalLock(opCtx, MODE_IX);
 
-    // Set speculative execution.  This must be done after the global lock is acquired, because
-    // we need to check that we are primary.
-    const auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
-    // TODO(SERVER-38203): We cannot wait for write concern on secondaries, so we do not set the
-    // speculative optime on secondaries either.  This means that reads done in transactions on
-    // secondaries will not wait for the read snapshot to become majority-committed.
-    repl::ReplicationCoordinator* replCoord =
-        repl::ReplicationCoordinator::get(opCtx->getServiceContext());
-    if (replCoord->canAcceptWritesForDatabase(
-            opCtx, NamespaceString::kSessionTransactionsTableNamespace.db())) {
-        if (readConcernArgs.getArgsAtClusterTime()) {
-            _setSpeculativeTransactionReadTimestamp(
-                opCtx, readConcernArgs.getArgsAtClusterTime()->asTimestamp());
-        } else {
-            _setSpeculativeTransactionOpTime(opCtx,
-                                             readConcernArgs.getOriginalLevel() ==
-                                                     repl::ReadConcernLevel::kSnapshotReadConcern
-                                                 ? SpeculativeTransactionOpTime::kAllCommitted
-                                                 : SpeculativeTransactionOpTime::kNoTimestamp);
-        }
-    } else {
-        opCtx->recoveryUnit()->preallocateSnapshot();
-    }
+    // This begins the storage transaction and so we do it after acquiring the global lock.
+    _setReadSnapshot(opCtx, repl::ReadConcernArgs::get(opCtx));
 
     // The Client lock must not be held when executing this failpoint as it will block currentOp
     // execution.
@@ -1062,9 +1057,10 @@ Timestamp TransactionParticipant::Participant::prepareTransaction(
                 ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42) {
             oplogSlotReserver.emplace(opCtx);
         } else {
+            // Even if the prepared transaction contained no statements, we always reserve at least
+            // 1 oplog slot for the prepare oplog entry.
             const auto numSlotsToReserve = retrieveCompletedTransactionOperations(opCtx).size();
-            // Reserve an extra slot here for the prepare oplog entry.
-            oplogSlotReserver.emplace(opCtx, numSlotsToReserve + 1);
+            oplogSlotReserver.emplace(opCtx, std::max(1, static_cast<int>(numSlotsToReserve)));
             invariant(oplogSlotReserver->getSlots().size() >= 1);
         }
         prepareOplogSlot = oplogSlotReserver->getLastSlot();
@@ -1097,6 +1093,13 @@ Timestamp TransactionParticipant::Participant::prepareTransaction(
         const auto ticks = opCtx->getServiceContext()->getTickSource()->getTicks();
         stdx::lock_guard<Client> lk(*opCtx->getClient());
         o(lk).transactionMetricsObserver.onPrepare(ServerTransactionsMetrics::get(opCtx), ticks);
+
+        // Ensure the lastWriteOpTime is set. This is needed so that we can correctly assign the
+        // prevOpTime for commit and abort oplog entries if a failover happens after the prepare.
+        // This value is updated in _registerCacheUpdateOnCommit, but only on primaries. We
+        // update the lastWriteOpTime here so that it is also available to secondaries. We can
+        // count on it to persist since we never invalidate prepared transactions.
+        o(lk).lastWriteOpTime = prepareOplogSlot;
     }
 
     if (MONGO_FAIL_POINT(hangAfterSettingPrepareStartTime)) {
@@ -1124,6 +1127,13 @@ void TransactionParticipant::Participant::addTransactionOperation(
     invariant(opCtx->lockState()->inAWriteUnitOfWork());
     p().transactionOperations.push_back(operation);
     p().transactionOperationBytes += repl::OplogEntry::getDurableReplOperationSize(operation);
+
+    auto transactionSizeLimitBytes = gTransactionSizeLimitBytes.load();
+    uassert(ErrorCodes::TransactionTooLarge,
+            str::stream() << "Total size of all transaction operations must be less than "
+                          << "server parameter 'transactionSizeLimitBytes' = "
+                          << transactionSizeLimitBytes,
+            p().transactionOperationBytes <= static_cast<size_t>(transactionSizeLimitBytes));
 
     // Creating transactions larger than 16MB requires a new oplog format only available in FCV 4.2.
     const auto isFCV42 = serverGlobalParams.featureCompatibility.getVersion() ==
@@ -1180,10 +1190,33 @@ void TransactionParticipant::Participant::commitUnpreparedTransaction(OperationC
     auto txnOps = retrieveCompletedTransactionOperations(opCtx);
     auto opObserver = opCtx->getServiceContext()->getOpObserver();
     invariant(opObserver);
+
+    auto abortGuard = makeGuard([&] {
+        if (gUseMultipleOplogEntryFormatForTransactions &&
+            serverGlobalParams.featureCompatibility.getVersion() ==
+                ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42) {
+            // We should already be holding the RSTL if we have performed a read or write
+            // as part of this unprepared transaction.
+            invariant(opCtx->lockState()->isRSTLLocked());
+            opCtx->runWithoutInterruptionExceptAtGlobalShutdown([&] {
+                _abortActiveTransaction(
+                    opCtx, TransactionState::kInProgress, true /* writeOplog */);
+            });
+        }
+    });
+
     opObserver->onUnpreparedTransactionCommit(opCtx, txnOps);
 
+    // Read-only transactions with all read concerns must wait for any data they read to be majority
+    // committed. For local read concern this is to match majority read concern. For both local and
+    // majority read concerns we do an untimestamped read, so we have no read timestamp to wait on.
+    // Instead, we write a noop which is guaranteed to have a greater OpTime than any writes we
+    // read.
+    //
+    // TODO (SERVER-41165): Snapshot read concern should wait on the read timestamp instead.
     auto wc = opCtx->getWriteConcern();
     auto needsNoopWrite = txnOps.empty() && !opCtx->getWriteConcern().usedDefault;
+
     clearOperationsInMemory(opCtx);
     {
         stdx::lock_guard<Client> lk(*opCtx->getClient());
@@ -1193,6 +1226,8 @@ void TransactionParticipant::Participant::commitUnpreparedTransaction(OperationC
         // before this point in the function, entry point will abort the transaction.
         o(lk).txnState.transitionTo(TransactionState::kCommittingWithoutPrepare);
     }
+
+    abortGuard.dismiss();
 
     try {
         // Once entering "committing without prepare" we cannot throw an exception.
@@ -1274,6 +1309,10 @@ void TransactionParticipant::Participant::commitPreparedTransaction(
             invariant(commitOplogEntryOpTime);
         }
 
+        // We must have a lastWriteOpTime set, as that will be used for the prevOpTime on the oplog
+        // entry.
+        invariant(!o().lastWriteOpTime.isNull());
+
         // If commitOplogEntryOpTime is a nullopt, then we grab the OpTime from the commitOplogSlot
         // which will only be set if we are primary. Otherwise, the commitOplogEntryOpTime must have
         // been passed in during secondary oplog application.
@@ -1323,16 +1362,6 @@ void TransactionParticipant::Participant::_commitStorageTransaction(OperationCon
 }
 
 void TransactionParticipant::Participant::_finishCommitTransaction(OperationContext* opCtx) {
-    // If no writes have been done, set the client optime forward to the read timestamp so waiting
-    // for write concern will ensure all read data was committed.
-    //
-    // TODO(SERVER-34881): Once the default read concern is speculative majority, only set the
-    // client optime forward if the original read concern level is "majority" or "snapshot".
-    auto& clientInfo = repl::ReplClientInfo::forClient(opCtx->getClient());
-    if (p().speculativeTransactionReadOpTime > clientInfo.getLastOp()) {
-        clientInfo.setLastOp(p().speculativeTransactionReadOpTime);
-    }
-
     {
         auto tickSource = opCtx->getServiceContext()->getTickSource();
         stdx::lock_guard<Client> lk(*opCtx->getClient());
@@ -1383,7 +1412,9 @@ void TransactionParticipant::Participant::abortActiveTransaction(OperationContex
                 replCoord->canAcceptWritesForDatabase(opCtx, "admin"));
     }
 
-    _abortActiveTransaction(opCtx, TransactionState::kInProgress | TransactionState::kPrepared);
+    _abortActiveTransaction(opCtx,
+                            TransactionState::kInProgress | TransactionState::kPrepared,
+                            o().txnState.isPrepared());
 }
 
 void TransactionParticipant::Participant::abortActiveUnpreparedOrStashPreparedTransaction(
@@ -1400,7 +1431,7 @@ void TransactionParticipant::Participant::abortActiveUnpreparedOrStashPreparedTr
         return;
     }
 
-    _abortActiveTransaction(opCtx, TransactionState::kInProgress);
+    _abortActiveTransaction(opCtx, TransactionState::kInProgress, false /* writeOplog */);
 } catch (...) {
     // It is illegal for this to throw so we catch and log this here for diagnosability.
     severe() << "Caught exception during transaction " << opCtx->getTxnNumber()
@@ -1409,8 +1440,12 @@ void TransactionParticipant::Participant::abortActiveUnpreparedOrStashPreparedTr
     std::terminate();
 }
 
+void TransactionParticipant::Participant::abortTransactionForStepUp(OperationContext* opCtx) {
+    _abortActiveTransaction(opCtx, TransactionState::kInProgress, true);
+}
+
 void TransactionParticipant::Participant::_abortActiveTransaction(
-    OperationContext* opCtx, TransactionState::StateSet expectedStates) {
+    OperationContext* opCtx, TransactionState::StateSet expectedStates, bool writeOplog) {
     invariant(!o().txnResourceStash);
     invariant(!o().txnState.isCommittingWithPrepare());
 
@@ -1419,14 +1454,13 @@ void TransactionParticipant::Participant::_abortActiveTransaction(
         o(lk).transactionMetricsObserver.onTransactionOperation(
             opCtx, CurOp::get(opCtx)->debug().additiveMetrics, o().txnState.isPrepared());
     }
-
     // We reserve an oplog slot before aborting the transaction so that no writes that are causally
     // related to the transaction abort enter the oplog at a timestamp earlier than the abort oplog
     // entry. On secondaries, we generate a fake empty oplog slot, since it's not used by the
     // OpObserver.
     boost::optional<OplogSlotReserver> oplogSlotReserver;
     boost::optional<OplogSlot> abortOplogSlot;
-    if (o().txnState.isPrepared() && opCtx->writesAreReplicated()) {
+    if (opCtx->writesAreReplicated() && writeOplog) {
         oplogSlotReserver.emplace(opCtx);
         abortOplogSlot = oplogSlotReserver->getLastSlot();
     }
@@ -1762,9 +1796,9 @@ std::string TransactionParticipant::Participant::_transactionInfoForLog(
 
     s << "parameters:" << parametersBuilder.obj().toString() << ",";
 
-    s << " readTimestamp:" << p().speculativeTransactionReadOpTime.getTimestamp().toString() << ",";
-
     const auto& singleTransactionStats = o().transactionMetricsObserver.getSingleTransactionStats();
+
+    s << " readTimestamp:" << singleTransactionStats.getReadTimestamp().toString() << ",";
 
     s << singleTransactionStats.getOpDebug()->additiveMetrics.report();
 
@@ -1979,7 +2013,6 @@ void TransactionParticipant::Participant::_resetTransactionState(
     p().transactionOperationBytes = 0;
     p().transactionOperations.clear();
     o(wl).prepareOpTime = repl::OpTime();
-    p().speculativeTransactionReadOpTime = repl::OpTime();
     p().multikeyPathInfo.clear();
     p().autoCommit = boost::none;
 
@@ -2004,20 +2037,18 @@ void TransactionParticipant::Participant::invalidate(OperationContext* opCtx) {
 
 void TransactionParticipant::Participant::abortPreparedTransactionForRollback(
     OperationContext* opCtx) {
-    stdx::lock_guard<Client> lg(*opCtx->getClient());
-
-    // Invalidate the session.
-    _invalidate(lg);
-
     uassert(51030,
             str::stream() << "Cannot call abortPreparedTransactionForRollback on unprepared "
                           << "transaction.",
             o().txnState.isPrepared());
 
+    stdx::lock_guard<Client> lg(*opCtx->getClient());
+
     // It should be safe to clear transactionOperationBytes and transactionOperations because
     // we only modify these variables when adding an operation to a transaction. Since this
     // transaction is already prepared, we cannot add more operations to it. We will have this
     // in the prepare oplog entry.
+    _invalidate(lg);
     _resetTransactionState(lg, TransactionState::kNone);
 }
 
@@ -2077,18 +2108,7 @@ UpdateRequest TransactionParticipant::Participant::_makeUpdateRequest(
         newTxnRecord.setLastWriteOpTime(newLastWriteOpTime);
         newTxnRecord.setLastWriteDate(newLastWriteDate);
         newTxnRecord.setState(newState);
-        if (gUseMultipleOplogEntryFormatForTransactions &&
-            serverGlobalParams.featureCompatibility.getVersion() ==
-                ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42 &&
-            startOpTime) {
-            // The startOpTime should only be set when transitioning the txn to in-progress or
-            // prepared.
-            invariant(newState == DurableTxnStateEnum::kInProgress ||
-                      newState == DurableTxnStateEnum::kPrepared);
-            newTxnRecord.setStartOpTime(*startOpTime);
-        } else if (newState == DurableTxnStateEnum::kPrepared) {
-            newTxnRecord.setStartOpTime(o().prepareOpTime);
-        }
+        newTxnRecord.setStartOpTime(startOpTime);
         return newTxnRecord.toBSON();
     }();
     updateRequest.setUpdateModification(updateBSON);

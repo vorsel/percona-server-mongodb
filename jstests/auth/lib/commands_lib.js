@@ -526,6 +526,47 @@ var authCommandsLib = {
           ]
         },
         {
+          testname: "applyOps_c_renameCollection_twoDbs",
+          command: {
+              applyOps: [{
+                  "op": "c",
+                  "ns": firstDbName + ".$cmd",
+                  "o": {
+                      "renameCollection": firstDbName + ".x",
+                      "to": secondDbName + ".y",
+                      "stayTemp": false,
+                      "dropTarget": false
+                  }
+              }]
+          },
+          skipSharded: true,
+          setup: function(db) {
+              db.getSisterDB(firstDbName).x.save({});
+              db.getSisterDB(adminDbName).runCommand({movePrimary: firstDbName, to: shard0name});
+              db.getSisterDB(adminDbName).runCommand({movePrimary: secondDbName, to: shard0name});
+          },
+          teardown: function(db) {
+              db.getSisterDB(firstDbName).x.drop();
+              db.getSisterDB(secondDbName).y.drop();
+          },
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: {readWriteAnyDatabase: 1, root: 1, __system: 1},
+                privileges: [
+                    {
+                      resource: {db: firstDbName, collection: "x"},
+                      actions: ["find", "dropCollection"]
+                    },
+                    {
+                      resource: {db: secondDbName, collection: "y"},
+                      actions: ["insert", "createIndex"]
+                    }
+                ]
+              },
+          ]
+        },
+        {
           testname: "applyOps_insert",
           command: {
               applyOps: [{
@@ -1113,11 +1154,17 @@ var authCommandsLib = {
           ]
         },
         {
-          testname: "aggregate_out_insert_documents",
+          testname: "aggregate_merge_insert_documents",
           command: function(state, args) {
               return {
                   aggregate: "foo",
-                  pipeline: [{$out: {db: args.targetDB, to: "foo_out", mode: "insertDocuments"}}],
+                  pipeline: [{
+                      $merge: {
+                          into: {db: args.targetDB, coll: "foo_out"},
+                          whenMatched: "fail",
+                          whenNotMatched: "insert"
+                      }
+                  }],
                   cursor: {},
                   bypassDocumentValidation: args.bypassDocumentValidation,
               };
@@ -1181,11 +1228,17 @@ var authCommandsLib = {
           ]
         },
         {
-          testname: "aggregate_out_replace_documents",
+          testname: "aggregate_merge_replace_documents",
           command: function(state, args) {
               return {
                   aggregate: "foo",
-                  pipeline: [{$out: {db: args.targetDB, to: "foo_out", mode: "replaceDocuments"}}],
+                  pipeline: [{
+                      $merge: {
+                          into: {db: args.targetDB, coll: "foo_out"},
+                          whenMatched: "replace",
+                          whenNotMatched: "insert"
+                      }
+                  }],
                   cursor: {},
                   bypassDocumentValidation: args.bypassDocumentValidation,
               };
@@ -5892,11 +5945,6 @@ var authCommandsLib = {
           testcases: [{runOnDb: adminDbName, roles: roles_all}],
         },
         {
-          testname: "refreshSessionsInternal",
-          command: {refreshSessionsInternal: []},
-          testcases: [{runOnDb: adminDbName, roles: {__system: 1}}],
-        },
-        {
           testname: "_getNextSessionMods",
           command: {_getNextSessionMods: "a-b"},
           skipSharded: true,
@@ -5930,6 +5978,46 @@ var authCommandsLib = {
                   assert.commandWorked(db.runCommand(
                       {killCursors: "$cmd.aggregate", cursors: [response.cursor.id]}));
               }
+          }
+        },
+        {
+          testname: "aggregate_$searchBeta",
+          command: {
+              aggregate: "foo",
+              cursor: {},
+              pipeline: [{
+                  $searchBeta: {
+                      // empty query
+                  }
+              }]
+          },
+          skipSharded: false,
+          // Only enterprise knows of this aggregation stage.
+          skipTest:
+              (conn) =>
+                  !conn.getDB("admin").runCommand({buildInfo: 1}).modules.includes("enterprise"),
+          testcases: [
+              {
+                runOnDb: firstDbName,
+                roles: roles_read,
+                privileges: [{resource: {db: firstDbName, collection: "foo"}, actions: ["find"]}]
+              },
+              {
+                runOnDb: secondDbName,
+                roles: roles_readAny,
+                privileges:
+                    [{resource: {db: secondDbName, collection: "foo"}, actions: ["find"]}]
+              }
+          ],
+          setup: function(db) {
+              // Configure the $searchBeta stage to always return EOF so we can avoid the hassle
+              // of giving mongod a host and port for mongot.
+              const cmd = {configureFailPoint: "searchBetaReturnEofImmediately", mode: "alwaysOn"};
+              FixtureHelpers.runCommandOnEachPrimary({db: db.getSiblingDB("admin"), cmdObj: cmd});
+          },
+          teardown: function(db) {
+              const cmd = {configureFailPoint: "searchBetaReturnEofImmediately", mode: "off"};
+              FixtureHelpers.runCommandOnEachPrimary({db: db.getSiblingDB("admin"), cmdObj: cmd});
           }
         },
         {
@@ -5979,18 +6067,18 @@ var authCommandsLib = {
      *  An array of strings. Each string in the array reports
      *  a particular test error.
      */
-    runOneTest: function(conn, t, impls) {
+    runOneTest: function(conn, t, impls, isMongos) {
         jsTest.log("Running test: " + t.testname);
 
         if (t.skipTest && t.skipTest(conn)) {
             return [];
         }
         // some tests shouldn't run in a sharded environment
-        if (t.skipSharded && this.isMongos(conn)) {
+        if (t.skipSharded && isMongos) {
             return [];
         }
         // others shouldn't run in a standalone environment
-        if (t.skipUnlessSharded && !this.isMongos(conn)) {
+        if (t.skipUnlessSharded && !isMongos) {
             return [];
         }
         // some tests require replica sets to be enabled.
@@ -6043,8 +6131,9 @@ var authCommandsLib = {
 
         var failures = [];
 
+        const isMongos = this.isMongos(conn);
         for (var i = 0; i < this.tests.length; i++) {
-            res = this.runOneTest(conn, this.tests[i], impls);
+            res = this.runOneTest(conn, this.tests[i], impls, isMongos);
             failures = failures.concat(res);
         }
 

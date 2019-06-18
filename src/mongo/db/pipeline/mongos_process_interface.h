@@ -110,12 +110,21 @@ public:
 
     void update(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                 const NamespaceString& ns,
-                std::vector<BSONObj>&& queries,
-                std::vector<BSONObj>&& updates,
+                BatchedObjects&& batch,
                 const WriteConcernOptions& wc,
                 bool upsert,
                 bool multi,
                 boost::optional<OID>) final {
+        MONGO_UNREACHABLE;
+    }
+
+    WriteResult updateWithResult(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                 const NamespaceString& ns,
+                                 BatchedObjects&& batch,
+                                 const WriteConcernOptions& wc,
+                                 bool upsert,
+                                 bool multi,
+                                 boost::optional<OID> targetEpoch) final override {
         MONGO_UNREACHABLE;
     }
 

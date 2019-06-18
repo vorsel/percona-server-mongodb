@@ -1,5 +1,10 @@
 // Test commands that are not allowed in multi-document transactions.
-// @tags: [uses_transactions, uses_snapshot_read_concern]
+// @tags: [
+//   # mapReduce does not support afterClusterTime.
+//   does_not_support_causal_consistency,
+//   uses_snapshot_read_concern,
+//   uses_transactions,
+// ]
 (function() {
     "use strict";
 
@@ -38,6 +43,8 @@
 
     function testCommand(command) {
         jsTest.log("Testing command: " + tojson(command));
+        const errmsgRegExp = new RegExp(
+            'Cannot run .* in a multi-document transaction.\|This command is not supported in transactions');
 
         // Check that the command runs successfully outside transactions.
         setup();
@@ -45,14 +52,16 @@
 
         // Check that the command cannot be used to start a transaction.
         setup();
-        assert.commandFailedWithCode(sessionDb.runCommand(Object.assign({}, command, {
+        let res = assert.commandFailedWithCode(sessionDb.runCommand(Object.assign({}, command, {
             readConcern: {level: "snapshot"},
             txnNumber: NumberLong(++txnNumber),
             stmtId: NumberInt(0),
             startTransaction: true,
             autocommit: false
         })),
-                                     ErrorCodes.OperationNotSupportedInTransaction);
+                                               ErrorCodes.OperationNotSupportedInTransaction);
+        // Check that the command fails with expected error message.
+        assert(res.errmsg.match(errmsgRegExp), res);
 
         // Mongos has special handling for commitTransaction to support commit recovery.
         if (!isMongos) {
@@ -76,12 +85,14 @@
             startTransaction: true,
             autocommit: false
         }));
-        assert.commandFailedWithCode(
+        res = assert.commandFailedWithCode(
             sessionDb.runCommand(Object.assign(
                 {},
                 command,
                 {txnNumber: NumberLong(txnNumber), stmtId: NumberInt(1), autocommit: false})),
             ErrorCodes.OperationNotSupportedInTransaction);
+        // Check that the command fails with expected error message.
+        assert(res.errmsg.match(errmsgRegExp), res);
         assert.commandWorked(sessionDb.adminCommand({
             commitTransaction: 1,
             txnNumber: NumberLong(txnNumber),
@@ -91,31 +102,14 @@
     }
 
     //
-    // Test commands that check out the session but are not allowed in multi-document
-    // transactions.
+    // Test a selection of commands that are not allowed in transactions.
     //
 
-    const sessionCommands = [
+    const commands = [
         {count: collName},
         {count: collName, query: {a: 1}},
         {explain: {find: collName}},
         {filemd5: 1, root: "fs"},
-    ];
-
-    // There is no applyOps command on mongos.
-    if (!isMongos) {
-        sessionCommands.push(
-            {applyOps: [{op: "u", ns: testColl.getFullName(), o2: {_id: 0}, o: {$set: {a: 5}}}]});
-    }
-
-    sessionCommands.forEach(testCommand);
-
-    //
-    // Test a selection of commands that do not check out the session. It is illegal to provide a
-    // 'txnNumber' on these commands.
-    //
-
-    const nonSessionCommands = [
         {isMaster: 1},
         {buildInfo: 1},
         {ping: 1},
@@ -133,14 +127,13 @@
         {mapReduce: collName, map: function() {}, reduce: function(key, vals) {}, out: {inline: 1}},
     ];
 
-    nonSessionCommands.forEach(testCommand);
+    // There is no applyOps command on mongos.
+    if (!isMongos) {
+        commands.push(
+            {applyOps: [{op: "u", ns: testColl.getFullName(), o2: {_id: 0}, o: {$set: {a: 5}}}]});
+    }
 
-    nonSessionCommands.forEach(function(command) {
-        setup();
-        assert.commandFailedWithCode(
-            sessionDb.runCommand(Object.assign({}, command, {txnNumber: NumberLong(++txnNumber)})),
-            [50768, 50889]);
-    });
+    commands.forEach(testCommand);
 
     //
     // Test that doTxn is not allowed at positions after the first in transactions.

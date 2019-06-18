@@ -258,10 +258,16 @@ inline void walk(Stage<T>* stage,
  * calling the 'propagator' function on the last source.
  */
 template <typename T>
-inline std::pair<Stage<T>, T> makeTree(
+inline std::pair<boost::optional<Stage<T>>, T> makeTree(
     std::deque<T>&& initialStageContents,
     const Pipeline& pipeline,
     const std::function<T(const T&, const std::vector<T>&, const DocumentSource&)>& propagator) {
+    // For empty pipelines, there's no Stage<T> to return and the output schema is the same as the
+    // input schema.
+    if (pipeline.getSources().empty()) {
+        return std::pair(boost::none, initialStageContents.front());
+    }
+
     auto && [ finalStage, reshaper ] =
         detail::makeTreeWithOffTheEndStage(std::move(initialStageContents), pipeline, propagator);
 
@@ -280,4 +286,4 @@ inline void zip(Stage<T>* tree,
     detail::walk(tree, &iter, zipper);
 }
 
-}  // namespace mongo::AggregatePipelineSchemaTracker
+}  // namespace mongo::pipeline_metadata_tree

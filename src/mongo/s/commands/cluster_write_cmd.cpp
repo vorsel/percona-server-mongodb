@@ -39,6 +39,7 @@
 #include "mongo/db/commands/write_commands/write_commands_common.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/lasterror.h"
+#include "mongo/db/logical_clock.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/storage/duplicate_key_error_info.h"
 #include "mongo/executor/task_executor_pool.h"
@@ -182,28 +183,6 @@ boost::optional<WouldChangeOwningShardInfo> getWouldChangeOwningShardErrorInfo(
 }
 
 /**
- * Called when the response contains a WouldChangeOwningShard error. Deletes the original document
- * and inserts the new one in a transaction. Returns whether or not we match and delete the original
- * document. If the delete and insert succeed, modifies the response object to reflect that we
- * successfully updated one document.
- */
-bool updateShardKeyValue(OperationContext* opCtx,
-                         const BatchedCommandRequest& request,
-                         BatchedCommandResponse* response,
-                         const WouldChangeOwningShardInfo& wouldChangeOwningShardErrorInfo) {
-    auto matchedDoc = documentShardKeyUpdateUtil::updateShardKeyForDocument(
-        opCtx,
-        request.getNS(),
-        wouldChangeOwningShardErrorInfo,
-        request.getWriteCommandBase().getStmtId() ? request.getWriteCommandBase().getStmtId().get()
-                                                  : 0);
-    if (!matchedDoc)
-        return false;
-
-    return true;
-}
-
-/**
  * Changes the shard key for the document if the response object contains a WouldChangeOwningShard
  * error. If the original command was sent as a retryable write, starts a transaction on the same
  * session and txnNum, deletes the original document, inserts the new one, and commits the
@@ -223,6 +202,7 @@ bool handleWouldChangeOwningShardError(OperationContext* opCtx,
         return false;
 
     bool updatedShardKey = false;
+    boost::optional<BSONObj> upsertedId;
     if (isRetryableWrite) {
         if (MONGO_FAIL_POINT(hangAfterThrowWouldChangeOwningShardRetryableWrite)) {
             log() << "Hit hangAfterThrowWouldChangeOwningShardRetryableWrite failpoint";
@@ -246,9 +226,18 @@ bool handleWouldChangeOwningShardError(OperationContext* opCtx,
             // If we do not get WouldChangeOwningShard when re-running the update, the document has
             // been modified or deleted concurrently and we do not need to delete it and insert a
             // new one.
-            updatedShardKey = wouldChangeOwningShardErrorInfo &&
-                updateShardKeyValue(
-                                  opCtx, request, response, wouldChangeOwningShardErrorInfo.get());
+            updatedShardKey =
+                wouldChangeOwningShardErrorInfo &&
+                documentShardKeyUpdateUtil::updateShardKeyForDocument(
+                    opCtx,
+                    request.getNS(),
+                    wouldChangeOwningShardErrorInfo.get(),
+                    boost::get_optional_value_or(request.getWriteCommandBase().getStmtId(), 0));
+
+            // If the operation was an upsert, record the _id of the new document.
+            if (updatedShardKey && wouldChangeOwningShardErrorInfo->getShouldUpsert()) {
+                upsertedId = wouldChangeOwningShardErrorInfo->getPostImage()["_id"].wrap();
+            }
 
             // Commit the transaction
             auto commitResponse = documentShardKeyUpdateUtil::commitShardKeyUpdateTransaction(
@@ -259,28 +248,22 @@ bool handleWouldChangeOwningShardError(OperationContext* opCtx,
             auto writeConcernDetail = getWriteConcernErrorDetailFromBSONObj(commitResponse);
             if (writeConcernDetail && !writeConcernDetail->toStatus().isOK())
                 response->setWriteConcernError(writeConcernDetail.release());
-        } catch (const DBException& e) {
-            // Set the error status to the status of the failed command and abort the transaction.
-            auto status = e.toStatus();
-            if (status == ErrorCodes::DuplicateKey) {
-                BSONObjBuilder extraInfoBuilder;
-                status.extraInfo()->serialize(&extraInfoBuilder);
-                auto extraInfo = extraInfoBuilder.obj();
-                if (extraInfo.getObjectField("keyPattern").hasField("_id"))
-                    status = status.withContext(
-                        "Failed to update document's shard key field. There is either an "
-                        "orphan for this document or _id for this collection is not globally "
-                        "unique.");
+        } catch (DBException& e) {
+            if (e.code() == ErrorCodes::DuplicateKey &&
+                e.extraInfo<DuplicateKeyErrorInfo>()->getKeyPattern().hasField("_id")) {
+                e.addContext(documentShardKeyUpdateUtil::kDuplicateKeyErrorContext);
             } else {
-                status = status.withContext(
-                    "Update operation was converted into a distributed transaction because the "
-                    "document being updated would move shards and that transaction failed");
+                e.addContext(documentShardKeyUpdateUtil::kNonDuplicateKeyErrorContext);
             }
+
             if (!response->isErrDetailsSet() || !response->getErrDetails().back()) {
                 auto error = stdx::make_unique<WriteErrorDetail>();
                 error->setIndex(0);
                 response->addToErrDetails(error.release());
             }
+
+            // Set the error status to the status of the failed command and abort the transaction.
+            auto status = e.toStatus();
             response->getErrDetails().back()->setStatus(status);
 
             auto txnRouterForAbort = TransactionRouter::get(opCtx);
@@ -292,13 +275,19 @@ bool handleWouldChangeOwningShardError(OperationContext* opCtx,
     } else {
         try {
             // Delete the original document and insert the new one
-            updatedShardKey = updateShardKeyValue(
-                opCtx, request, response, wouldChangeOwningShardErrorInfo.get());
+            updatedShardKey = documentShardKeyUpdateUtil::updateShardKeyForDocument(
+                opCtx,
+                request.getNS(),
+                wouldChangeOwningShardErrorInfo.get(),
+                boost::get_optional_value_or(request.getWriteCommandBase().getStmtId(), 0));
+
+            // If the operation was an upsert, record the _id of the new document.
+            if (updatedShardKey && wouldChangeOwningShardErrorInfo->getShouldUpsert()) {
+                upsertedId = wouldChangeOwningShardErrorInfo->getPostImage()["_id"].wrap();
+            }
         } catch (const ExceptionFor<ErrorCodes::DuplicateKey>& ex) {
             Status status = ex->getKeyPattern().hasField("_id")
-                ? ex.toStatus().withContext(
-                      "Failed to update document's shard key field. There is either an orphan "
-                      "for this document or _id for this collection is not globally unique.")
+                ? ex.toStatus().withContext(documentShardKeyUpdateUtil::kDuplicateKeyErrorContext)
                 : ex.toStatus();
             uassertStatusOK(status);
         }
@@ -309,7 +298,15 @@ bool handleWouldChangeOwningShardError(OperationContext* opCtx,
         // and inserted the new one, so it is safe to unset the error details.
         response->unsetErrDetails();
         response->setN(response->getN() + 1);
-        response->setNModified(response->getNModified() + 1);
+
+        if (upsertedId) {
+            auto upsertDetail = stdx::make_unique<BatchedUpsertDetail>();
+            upsertDetail->setIndex(0);
+            upsertDetail->setUpsertedID(upsertedId.get());
+            response->addToUpsertDetails(upsertDetail.release());
+        } else {
+            response->setNModified(response->getNModified() + 1);
+        }
     }
 
     return updatedShardKey;
@@ -625,8 +622,12 @@ private:
 
     std::unique_ptr<CommandInvocation> parse(OperationContext* opCtx,
                                              const OpMsgRequest& request) final {
-        return stdx::make_unique<Invocation>(
-            this, request, BatchedCommandRequest::parseUpdate(request));
+        auto parsedRequest = BatchedCommandRequest::parseUpdate(request);
+        uassert(51195,
+                "Cannot specify runtime constants option to a mongos",
+                !parsedRequest.hasRuntimeConstants());
+        parsedRequest.setRuntimeConstants(Variables::generateRuntimeConstants(opCtx));
+        return stdx::make_unique<Invocation>(this, request, std::move(parsedRequest));
     }
 
     std::string help() const override {

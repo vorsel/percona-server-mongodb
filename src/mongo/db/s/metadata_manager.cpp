@@ -151,6 +151,10 @@ void scheduleCleanup(executor::TaskExecutor* executor,
             invariant(status);
 
             ThreadClient tc("Collection-Range-Deleter", getGlobalServiceContext());
+            {
+                stdx::lock_guard<Client> lk(*tc.get());
+                tc->setSystemOperationKillable(lk);
+            }
             auto uniqueOpCtx = Client::getCurrent()->makeOperationContext();
             auto opCtx = uniqueOpCtx.get();
 
@@ -224,7 +228,7 @@ MetadataManager::~MetadataManager() {
 void MetadataManager::_clearAllCleanups(WithLock lock) {
     _clearAllCleanups(
         lock,
-        {ErrorCodes::InterruptedDueToStepDown,
+        {ErrorCodes::InterruptedDueToReplStateChange,
          str::stream() << "Range deletions in " << _nss.ns()
                        << " abandoned because collection was dropped or became unsharded"});
 }

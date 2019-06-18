@@ -33,6 +33,7 @@ global:
 
 imports:
     - "mongo/db/logical_session_id.idl"
+    - "mongo/db/pipeline/runtime_constants.idl"
 
 types:
     multi_delete_bool:
@@ -100,6 +101,11 @@ structs:
             u:
                 description: "Set of modifications to apply."
                 type: update_modification
+            c:
+                description: "Specifies constant values that can be referred to in the pipeline
+                              performing a custom update."
+                type: object
+                optional: true
             arrayFilters:
                 description: "Specifies which array elements an update modifier should apply to."
                 type: array<object>
@@ -163,6 +169,11 @@ commands:
                 description: "An array of one or more update statements to perform."
                 type: array<UpdateOpEntry>
                 supports_doc_sequence: true
+            runtimeConstants:
+                description: "A collection of values that do not change once computed. These are
+                              used by pipeline-style update operations."
+                type: RuntimeConstants
+                optional: true
 
     delete:
         description: "Parser for the 'delete' command."

@@ -68,15 +68,18 @@ public:
                                      hostRequirement,
                                      DiskUseRequirement::kNoDiskUse,
                                      FacetRequirement::kAllowed,
-                                     TransactionRequirement::kAllowed);
+                                     TransactionRequirement::kAllowed,
+                                     hostRequirement == HostTypeRequirement::kMongoS
+                                         ? LookupRequirement::kNotAllowed
+                                         : LookupRequirement::kAllowed);
 
         constraints.canSwapWithMatch = true;
         return constraints;
     }
 
-    boost::optional<MergingLogic> mergingLogic() final {
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
         // {shardsStage, mergingStage, sortPattern}
-        return MergingLogic{nullptr, this, boost::none};
+        return DistributedPlanLogic{nullptr, this, boost::none};
     }
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final {

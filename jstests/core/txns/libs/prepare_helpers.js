@@ -123,6 +123,42 @@ const PrepareHelpers = (function() {
         }
     }
 
+    /**
+     * Waits for the oplog entry of the given timestamp to be majority committed.
+     */
+    function awaitMajorityCommitted(replSet, timestamp) {
+        print(`Waiting for majority commit point to advance past the given timestamp ${timestamp}`);
+        const primary = replSet.getPrimary();
+        assert.soon(() => {
+            const ts = assert.commandWorked(primary.adminCommand({replSetGetStatus: 1}))
+                           .optimes.lastCommittedOpTime.ts;
+            if (timestampCmp(ts, timestamp) >= 0) {
+                print(`Finished awaiting lastCommittedOpTime.ts, now at ${ts}`);
+                return true;
+            } else {
+                print(`Awaiting lastCommittedOpTime.ts, now at ${ts}`);
+                return false;
+            }
+        }, "Timeout waiting for majority commit point", ReplSetTest.kDefaultTimeoutMS, 1000);
+    }
+
+    function findPrepareEntry(oplogColl) {
+        return oplogColl.findOne({op: "c", "o.prepare": true});
+    }
+
+    /**
+     * Retrieves the oldest required timestamp from the serverStatus output.
+     *
+     * @return {Timestamp} oldest required timestamp for crash recovery.
+     */
+    function getOldestRequiredTimestampForCrashRecovery(database) {
+        const res = database.serverStatus().storageEngine;
+        const ts = res.oldestRequiredTimestampForCrashRecovery;
+        assert(ts instanceof Timestamp,
+               'oldestRequiredTimestampForCrashRecovery was not a Timestamp: ' + tojson(res));
+        return ts;
+    }
+
     return {
         prepareTransaction: prepareTransaction,
         commitTransaction: commitTransaction,
@@ -131,6 +167,9 @@ const PrepareHelpers = (function() {
         oplogSizeBytes: oplogSizeBytes,
         replSetStartSetOptions: {oplogSize: oplogSizeMB},
         growOplogPastMaxSize: growOplogPastMaxSize,
-        awaitOplogTruncation: awaitOplogTruncation
+        awaitOplogTruncation: awaitOplogTruncation,
+        awaitMajorityCommitted: awaitMajorityCommitted,
+        findPrepareEntry: findPrepareEntry,
+        getOldestRequiredTimestampForCrashRecovery: getOldestRequiredTimestampForCrashRecovery,
     };
 })();

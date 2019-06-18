@@ -34,8 +34,6 @@
 
 namespace mongo {
 
-class BSONArrayBuilder;
-class BSONObjBuilder;
 class DBClientBase;
 class OperationContext;
 
@@ -46,7 +44,6 @@ class OperationContext;
  * implement their own classes that fulfill this interface.
  */
 class SessionsCollection {
-
 public:
     static constexpr StringData kSessionsTTLIndex = "lsidTTLIndex"_sd;
 
@@ -98,35 +95,40 @@ public:
     static BSONObj generateCollModCmd();
 
 protected:
+    SessionsCollection();
+
     /**
      * Makes a send function for the given client.
      */
     using SendBatchFn = stdx::function<Status(BSONObj batch)>;
-    SendBatchFn makeSendFnForCommand(const NamespaceString& ns, DBClientBase* client);
-    SendBatchFn makeSendFnForBatchWrite(const NamespaceString& ns, DBClientBase* client);
+    static SendBatchFn makeSendFnForCommand(const NamespaceString& ns, DBClientBase* client);
+    static SendBatchFn makeSendFnForBatchWrite(const NamespaceString& ns, DBClientBase* client);
+
     using FindBatchFn = stdx::function<StatusWith<BSONObj>(BSONObj batch)>;
-    FindBatchFn makeFindFnForCommand(const NamespaceString& ns, DBClientBase* client);
+    static FindBatchFn makeFindFnForCommand(const NamespaceString& ns, DBClientBase* client);
 
     /**
      * Formats and sends batches of refreshes for the given set of sessions.
      */
     Status doRefresh(const NamespaceString& ns,
-                     const LogicalSessionRecordSet& sessions,
+                     const std::vector<LogicalSessionRecord>& sessions,
                      SendBatchFn send);
 
     /**
      * Formats and sends batches of deletes for the given set of sessions.
      */
     Status doRemove(const NamespaceString& ns,
-                    const LogicalSessionIdSet& sessions,
+                    const std::vector<LogicalSessionId>& sessions,
                     SendBatchFn send);
 
     /**
-     * Formats and sends batches of fetches for the given set of sessions.
+     * Returns those lsids from the input 'sessions' array which are not present in the sessions
+     * collection (essentially performs an inner join of 'sessions' against the sessions
+     * collection).
      */
-    StatusWith<LogicalSessionIdSet> doFetch(const NamespaceString& ns,
-                                            const LogicalSessionIdSet& sessions,
-                                            FindBatchFn send);
+    StatusWith<LogicalSessionIdSet> doFindRemoved(const NamespaceString& ns,
+                                                  const std::vector<LogicalSessionId>& sessions,
+                                                  FindBatchFn send);
 };
 
 }  // namespace mongo

@@ -62,6 +62,7 @@ selector:
   - jstests/core/ismaster.js
 
   - jstests/core/bench_test*.js # benchRun() used for writes
+  - jstests/core/benchrun_pipeline_updates.js # benchRun() used for writes
   - jstests/core/connection_string_validation.js # Does not expect a replica set connection string.
   - jstests/core/explain_large_bounds.js # Stepdown can timeout waiting for global lock.
   - jstests/core/insert2.js # Creates new mongo connection.
@@ -80,6 +81,9 @@ selector:
 
   # Inserts enough data that recovery takes more than 8 seconds, so we never get a working primary.
   - jstests/core/geo_s2ordering.js
+
+  # Inserts enough data that the secondaries get too far behind to catch up.
+  - jstests/core/txns/large_transactions_require_fcv42.js
 
   exclude_with_any_tags:
   ##

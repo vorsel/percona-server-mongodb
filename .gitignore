@@ -85,6 +85,7 @@ scratch
 /mongos
 /mongoshim
 /mongosniff
+/mongotmock
 /mongotrafficreader
 /perconadecrypt
 /wt

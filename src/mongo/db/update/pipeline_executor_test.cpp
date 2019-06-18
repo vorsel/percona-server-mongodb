@@ -275,7 +275,7 @@ TEST_F(PipelineExecutorTest, SerializeTest) {
 
     std::vector<BSONObj> pipeline{fromjson("{$addFields: {_id: 0, a: [{b: 1}]}}"),
                                   fromjson("{$project: {a: 1}}"),
-                                  fromjson("{$replaceRoot: {newRoot: '$foo'}}")};
+                                  fromjson("{$replaceWith: '$foo'}")};
     PipelineExecutor exec(expCtx, pipeline);
 
     auto serialized = exec.serialize();
@@ -283,6 +283,83 @@ TEST_F(PipelineExecutorTest, SerializeTest) {
         fromjson("[{$addFields: {_id: {$const: 0}, a: [{b: {$const: 1}}]}}, {$project: { _id: "
                  "true, a: true}}, {$replaceRoot: {newRoot: '$foo'}}]"));
     ASSERT_VALUE_EQ(serialized, Value(BSONArray(doc)));
+}
+
+TEST_F(PipelineExecutorTest, RejectsInvalidConstantNames) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    const std::vector<BSONObj> pipeline;
+
+    // Empty name.
+    auto constants = BSON("" << 10);
+    ASSERT_THROWS_CODE(PipelineExecutor(expCtx, pipeline, constants), AssertionException, 16869);
+
+    // Invalid first character.
+    constants = BSON("^invalidFirstChar" << 10);
+    ASSERT_THROWS_CODE(PipelineExecutor(expCtx, pipeline, constants), AssertionException, 16870);
+
+    // Contains invalid character.
+    constants = BSON("contains*InvalidChar" << 10);
+    ASSERT_THROWS_CODE(PipelineExecutor(expCtx, pipeline, constants), AssertionException, 16871);
+}
+
+TEST_F(PipelineExecutorTest, CanUseConstants) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+
+    const std::vector<BSONObj> pipeline{fromjson("{$set: {b: '$$var1', c: '$$var2'}}")};
+    const auto constants = BSON("var1" << 10 << "var2" << BSON("x" << 1 << "y" << 2));
+    PipelineExecutor exec(expCtx, pipeline, constants);
+
+    mutablebson::Document doc(fromjson("{a: 1}"));
+    const auto result = exec.applyUpdate(getApplyParams(doc.root()));
+    ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_EQUALS(fromjson("{a: 1, b: 10, c : {x: 1, y: 2}}"), doc);
+    ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS(fromjson("{a: 1, b: 10, c : {x: 1, y: 2}}"), getLogDoc());
+}
+
+TEST_F(PipelineExecutorTest, CanUseConstantsAcrossMultipleUpdates) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+
+    const std::vector<BSONObj> pipeline{fromjson("{$set: {b: '$$var1'}}")};
+    const auto constants = BSON("var1"
+                                << "foo");
+    PipelineExecutor exec(expCtx, pipeline, constants);
+
+    // Update first doc.
+    mutablebson::Document doc1(fromjson("{a: 1}"));
+    auto result = exec.applyUpdate(getApplyParams(doc1.root()));
+    ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_EQUALS(fromjson("{a: 1, b: 'foo'}"), doc1);
+    ASSERT_FALSE(doc1.isInPlaceModeEnabled());
+    ASSERT_EQUALS(fromjson("{a: 1, b: 'foo'}"), getLogDoc());
+
+    // Update second doc.
+    mutablebson::Document doc2(fromjson("{a: 2}"));
+    resetApplyParams();
+    result = exec.applyUpdate(getApplyParams(doc2.root()));
+    ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_EQUALS(fromjson("{a: 2, b: 'foo'}"), doc2);
+    ASSERT_FALSE(doc2.isInPlaceModeEnabled());
+    ASSERT_EQUALS(fromjson("{a: 2, b: 'foo'}"), getLogDoc());
+}
+
+TEST_F(PipelineExecutorTest, NoopWithConstants) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+
+    const std::vector<BSONObj> pipeline{fromjson("{$set: {a: '$$var1', b: '$$var2'}}")};
+    const auto constants = BSON("var1" << 1 << "var2" << 2);
+    PipelineExecutor exec(expCtx, pipeline, constants);
+
+    mutablebson::Document doc(fromjson("{a: 1, b: 2}"));
+    const auto result = exec.applyUpdate(getApplyParams(doc.root()));
+    ASSERT_TRUE(result.noop);
+    ASSERT_FALSE(result.indexesAffected);
+    ASSERT_EQUALS(fromjson("{a: 1, b: 2}"), doc);
+    ASSERT_TRUE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS(fromjson("{}"), getLogDoc());
 }
 
 }  // namespace

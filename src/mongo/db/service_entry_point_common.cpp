@@ -531,7 +531,7 @@ bool runCommandImpl(OperationContext* opCtx,
             // Do no-op write before returning NoSuchTransaction if command has writeConcern.
             if (ex.toStatus().code() == ErrorCodes::NoSuchTransaction &&
                 !opCtx->getWriteConcern().usedDefault) {
-                TransactionParticipant::performNoopWrite(opCtx, "NoSuchTransaction");
+                TransactionParticipant::performNoopWrite(opCtx, "NoSuchTransaction error");
             }
             waitForWriteConcern(*extraFieldsBuilder);
             throw;
@@ -791,7 +791,7 @@ void execCommandDatabase(OperationContext* opCtx,
         // We defer to individual commands to allow themselves to be interruptible by stepdowns,
         // since commands like 'voteRequest' should conversely continue executing.
         if (status != ErrorCodes::PrimarySteppedDown &&
-            status != ErrorCodes::InterruptedDueToStepDown) {
+            status != ErrorCodes::InterruptedDueToReplStateChange) {
             uassertStatusOK(status);
         }
 
@@ -836,6 +836,7 @@ void execCommandDatabase(OperationContext* opCtx,
             // of successful future PIT atClusterTime requests.
             auto engine = opCtx->getServiceContext()->getStorageEngine();
             if (engine && engine->supportsReadConcernSnapshot()) {
+                SnapshotWindowUtil::incrementSnapshotTooOldErrorCount();
                 SnapshotWindowUtil::increaseTargetSnapshotWindowSize(opCtx);
             }
         } else {

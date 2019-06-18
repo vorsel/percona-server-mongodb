@@ -89,7 +89,6 @@ public:
         kDropIndexes,
         kCommitTransaction,
         kAbortTransaction,
-        kPrepareTransaction,
     };
 
     // Current oplog version, should be the value of the v field in all oplog entries.
@@ -127,8 +126,7 @@ public:
                const boost::optional<StmtId>& statementId,
                const boost::optional<OpTime>& prevWriteOpTimeInTransaction,
                const boost::optional<OpTime>& preImageOpTime,
-               const boost::optional<OpTime>& postImageOpTime,
-               const boost::optional<bool>& prepare);
+               const boost::optional<OpTime>& postImageOpTime);
 
     // DEPRECATED: This constructor can throw. Use static parse method instead.
     explicit OplogEntry(BSONObj raw);
@@ -149,11 +147,10 @@ public:
      * and so this method will always return false for them.
      */
     bool isPartialTransaction() const {
-        if (getCommandType() == CommandType::kApplyOps) {
-            return getObject()[ApplyOpsCommandInfoBase::kPartialTxnFieldName].booleanSafe();
+        if (getCommandType() != CommandType::kApplyOps) {
+            return false;
         }
-        // TODO(SERVER-40763): Remove "inTxn" entirely and return false here.
-        return getInTxn() && *getInTxn();
+        return getObject()[ApplyOpsCommandInfoBase::kPartialTxnFieldName].booleanSafe();
     }
 
     /**

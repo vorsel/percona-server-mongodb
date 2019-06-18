@@ -129,9 +129,9 @@ public:
         SourceContainer sources, const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
     /**
-     * Returns true if the provided aggregation command has a $out stage.
+     * Returns true if the provided aggregation command has an $out or $merge stage.
      */
-    static bool aggSupportsWriteConcern(const BSONObj& cmd);
+    static bool aggHasWriteStage(const BSONObj& cmd);
 
     /**
      * Given 'pathsOfInterest' which describes a set of paths which the caller is interested in,

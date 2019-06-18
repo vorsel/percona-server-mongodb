@@ -140,20 +140,26 @@ public:
 
     /**
      * Reads contents of table using URI and exports all keys to BSON as string elements.
-     * Additional, adds 'uri' field to output document.
+     * Additional, adds 'uri' field to output document. A filter can be specified to skip desired
+     * fields.
      */
     static Status exportTableToBSON(WT_SESSION* s,
                                     const std::string& uri,
                                     const std::string& config,
                                     BSONObjBuilder* bob);
+    static Status exportTableToBSON(WT_SESSION* s,
+                                    const std::string& uri,
+                                    const std::string& config,
+                                    BSONObjBuilder* bob,
+                                    const std::vector<std::string>& filter);
 
     /**
      * Appends information about the storage engine's currently available snapshots and the settings
      * that affect that window of maintained history.
      *
      * "snapshot-window-settings" : {
-     *      "cache pressure percentage threshold" : <num>,
-     *      "current cache pressure percentage" : <num>,
+     *      "total number of cache overflow disk writes",
+     *      "total number of SnapshotTooOld errors",
      *      "max target available snapshots window size in seconds" : <num>,
      *      "target available snapshots window size in seconds" : <num>,
      *      "current available snapshots window size in seconds" : <num>,

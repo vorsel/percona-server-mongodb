@@ -10,13 +10,11 @@ Note - the remote hosts should be running bash shell (this script may fail other
 There are no assumptions on the server what is the current deployment of MongoDB.
 For Windows the assumption is that Cygwin is installed.
 The server needs these utilities:
-    - python 2.7 or higher
+    - python 3.7 or higher
     - sshd
     - rsync
 This script will either download a MongoDB tarball or use an existing setup.
 """
-
-from __future__ import print_function
 
 import atexit
 import collections
@@ -43,7 +41,7 @@ import tempfile
 import threading
 import time
 import traceback
-import urlparse
+import urllib.parse
 import zipfile
 import subprocess
 
@@ -87,6 +85,7 @@ if _IS_WINDOWS:
     # These modules are used on the 'server' side.
     _try_import("ntsecuritycon")
     _try_import("pywintypes")
+    _try_import("winerror")
     _try_import("win32file")
     _try_import("win32security")
     _try_import("win32service")
@@ -242,7 +241,7 @@ def kill_process(parent, kill_children=True):
         # accurate notion of the creation time.
         procs = parent.children(recursive=True) if kill_children else []
     except psutil.NoSuchProcess:
-        LOGGER.warn("Could not kill process %d, as it no longer exists", parent.pid)
+        LOGGER.warning("Could not kill process %d, as it no longer exists", parent.pid)
         return 0
 
     procs.append(parent)
@@ -252,7 +251,7 @@ def kill_process(parent, kill_children=True):
             LOGGER.debug("Killing process '%s' pid %d", proc.name(), proc.pid)
             proc.kill()
         except psutil.NoSuchProcess:
-            LOGGER.warn("Could not kill process %d, as it no longer exists", proc.pid)
+            LOGGER.warning("Could not kill process %d, as it no longer exists", proc.pid)
 
     _, alive = psutil.wait_procs(procs, timeout=30, callback=None)
     if alive:
@@ -314,7 +313,7 @@ def get_bin_dir(root_dir):
 
 def create_temp_executable_file(cmds):
     """Create an executable temporary file containing 'cmds'. Returns file name."""
-    temp_file_name = NamedTempFile.create(suffix=".sh", directory="tmp")
+    temp_file_name = NamedTempFile.create(newline="\n", suffix=".sh", directory="tmp")
     with NamedTempFile.get(temp_file_name) as temp_file:
         temp_file.write(cmds)
     os_st = os.stat(temp_file_name)
@@ -375,6 +374,7 @@ def execute_cmd(cmd, use_file=False):
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         output, _ = proc.communicate()
+        output = output.decode("utf-8", "replace")
         error_code = proc.returncode
         if error_code:
             output = "Error executing cmd {}: {}".format(cmd, output)
@@ -592,7 +592,7 @@ def install_mongod(bin_dir=None, tarball_url="latest", root_dir=None):
         elif _IS_LINUX:
             tarball_url = "https://fastdl.mongodb.org/linux/mongodb-linux-x86_64-latest.tgz"
 
-    tarball = os.path.split(urlparse.urlsplit(tarball_url).path)[-1]
+    tarball = os.path.split(urllib.parse.urlsplit(tarball_url).path)[-1]
     download_file(tarball_url, tarball)
     install_tarball(tarball, root_dir)
     chmod_x_binaries(get_bin_dir(root_dir))
@@ -611,7 +611,9 @@ def get_boot_datetime(uptime_string):
     """
     match = re.search(r"last booted (.*), up", uptime_string)
     if match:
-        return datetime.datetime(*map(int, map(float, re.split("[ :-]", match.groups()[0]))))
+        return datetime.datetime(
+            *list(map(int, list(map(float, re.split("[ :-]",
+                                                    match.groups()[0]))))))
     return -1
 
 
@@ -667,13 +669,14 @@ class NamedTempFile(object):
     _DIR_LIST = []  # type: ignore
 
     @classmethod
-    def create(cls, directory=None, suffix=""):
+    def create(cls, newline=None, suffix="", directory=None):
         """Create a temporary file, and optional directory, and returns the file name."""
         if directory and not os.path.isdir(directory):
             LOGGER.debug("Creating temporary directory %s", directory)
             os.makedirs(directory)
             cls._DIR_LIST.append(directory)
-        temp_file = tempfile.NamedTemporaryFile(suffix=suffix, dir=directory, delete=False)
+        temp_file = tempfile.NamedTemporaryFile(mode="w+", newline=newline, suffix=suffix,
+                                                dir=directory, delete=False)
         cls._FILE_MAP[temp_file.name] = temp_file
         return temp_file.name
 
@@ -696,7 +699,7 @@ class NamedTempFile(object):
         try:
             os.remove(name)
         except (IOError, OSError) as err:
-            LOGGER.warn("Unable to delete temporary file %s with error %s", name, err)
+            LOGGER.warning("Unable to delete temporary file %s with error %s", name, err)
         if not os.path.exists(name):
             del cls._FILE_MAP[name]
 
@@ -712,7 +715,7 @@ class NamedTempFile(object):
         try:
             shutil.rmtree(directory)
         except (IOError, OSError) as err:
-            LOGGER.warn("Unable to delete temporary directory %s with error %s", directory, err)
+            LOGGER.warning("Unable to delete temporary directory %s with error %s", directory, err)
         if not os.path.exists(directory):
             cls._DIR_LIST.remove(directory)
 
@@ -769,7 +772,10 @@ class ProcessControl(object):
         """Return a list of 'proc' for the associated pids."""
         procs = []
         for pid in self.get_pids():
-            procs.append(psutil.Process(pid))
+            try:
+                procs.append(psutil.Process(pid))
+            except psutil.NoSuchProcess:
+                pass
         return procs
 
     def is_running(self):
@@ -818,7 +824,7 @@ class WindowsService(object):
 
     def create(self):
         """Create service, if not installed. Return (code, output) tuple."""
-        if self.status() in self._states.values():
+        if self.status() in list(self._states.values()):
             return 1, "Service '{}' already installed, status: {}".format(self.name, self.status())
         try:
             win32serviceutil.InstallService(pythonClassString="Service.{}".format(
@@ -828,7 +834,7 @@ class WindowsService(object):
             output = "Service '{}' created".format(self.name)
         except pywintypes.error as err:
             ret = err.winerror
-            output = "{}: {}".format(err[1], err[2])
+            output = f"{err.args[1]}: {err.args[2]}"
 
         return ret, output
 
@@ -844,7 +850,7 @@ class WindowsService(object):
             output = "Service '{}' updated".format(self.name)
         except pywintypes.error as err:
             ret = err.winerror
-            output = "{}: {}".format(err[1], err[2])
+            output = f"{err.args[1]}: {err.args[2]}"
 
         return ret, output
 
@@ -858,7 +864,7 @@ class WindowsService(object):
             output = "Service '{}' deleted".format(self.name)
         except pywintypes.error as err:
             ret = err.winerror
-            output = "{}: {}".format(err[1], err[2])
+            output = f"{err.args[1]}: {err.args[2]}"
 
         return ret, output
 
@@ -872,7 +878,7 @@ class WindowsService(object):
             output = "Service '{}' started".format(self.name)
         except pywintypes.error as err:
             ret = err.winerror
-            output = "{}: {}".format(err[1], err[2])
+            output = f"{err.args[1]}: {err.args[2]}"
 
         proc = ProcessControl(name=self.bin_name)
         self.pids = proc.get_pids()
@@ -899,7 +905,14 @@ class WindowsService(object):
             output = "Service '{}' stopped".format(self.name)
         except pywintypes.error as err:
             ret = err.winerror
-            output = "{}: {}".format(err[1], err[2])
+            output = f"{err.args[1]}: {err.args[2]}"
+
+            if ret == winerror.ERROR_BROKEN_PIPE:
+                # win32serviceutil.StopService() returns a "The pipe has been ended" error message
+                # (winerror=109) when stopping the "mongod-powertest" service on
+                # Windows Server 2016 and the underlying mongod process has already exited.
+                ret = 0
+                output = f"Assuming service '{self.name}' stopped despite error: {output}"
 
         return ret, output
 
@@ -1290,7 +1303,7 @@ def remote_handler(options, operations):  # pylint: disable=too-many-branches,to
                 ret = mongo.admin.command("setFeatureCompatibilityVersion", options.fcv_version)
                 ret = 0 if ret["ok"] == 1 else 1
             except pymongo.errors.OperationFailure as err:
-                LOGGER.error(err.message)
+                LOGGER.error("%s", err)
                 ret = err.code
 
         elif operation == "remove_lock_file":
@@ -1300,7 +1313,8 @@ def remote_handler(options, operations):  # pylint: disable=too-many-branches,to
                 try:
                     os.remove(lock_file)
                 except (IOError, OSError) as err:
-                    LOGGER.warn("Unable to delete mongod lockfile %s with error %s", lock_file, err)
+                    LOGGER.warning("Unable to delete mongod lockfile %s with error %s", lock_file,
+                                   err)
                     ret = err.code
 
         else:
@@ -1333,9 +1347,27 @@ def rsync(src_dir, dest_dir, exclude_files=None):
     LOGGER.info("Rsync'ing %s to %s%s", src_dir, dest_dir, exclude_str)
     if not distutils.spawn.find_executable("rsync"):
         return 1, "No rsync exists on the host, not rsync'ing"
-    cmds = "rsync -va --delete --quiet {} {} {}".format(exclude_options, src_dir, dest_dir)
-    ret, output = execute_cmd(cmds)
-    return ret, output
+
+    # We retry running the rsync command up to 'max_attempts' times in order to work around how it
+    # sporadically fails under cygwin on Windows Server 2016 with a "No medium found" error message.
+    max_attempts = 5
+    for attempt in range(1, max_attempts + 1):
+        rsync_cmd = f"rsync -va --delete --quiet {exclude_options} {src_dir} {dest_dir}"
+        ret, rsync_output = execute_cmd(rsync_cmd)
+
+        if ret == 0 or "No medium found" not in rsync_output:
+            break
+
+        LOGGER.warning("[%d/%d] rsync command failed (code=%d): %s", attempt, max_attempts, ret,
+                       rsync_output)
+
+        # If the rsync command failed with an "No medium found" error message, then we log some
+        # basic information about the /log mount point.
+        diag_cmds = "ls -ld /data/db /log; df"
+        _, diag_output = execute_cmd(diag_cmds, use_file=True)
+        LOGGER.info("Output from running '%s':\n%s", diag_cmds, diag_output)
+
+    return ret, rsync_output
 
 
 def kill_mongod():
@@ -1570,14 +1602,15 @@ def mongo_seed_docs(mongo, db_name, coll_name, num_docs):
 
     def rand_string(max_length=1024):
         """Return random string of random length."""
-        return ''.join(random.choice(string.letters) for _ in range(random.randint(1, max_length)))
+        return ''.join(
+            random.choice(string.ascii_letters) for _ in range(random.randint(1, max_length)))
 
     LOGGER.info("Seeding DB '%s' collection '%s' with %d documents, %d already exist", db_name,
                 coll_name, num_docs, mongo[db_name][coll_name].count())
     random.seed()
     base_num = 100000
     bulk_num = min(num_docs, 10000)
-    bulk_loops = num_docs / bulk_num
+    bulk_loops = num_docs // bulk_num
     for _ in range(bulk_loops):
         num_coll_docs = mongo[db_name][coll_name].count()
         if num_coll_docs >= num_docs:
@@ -1638,7 +1671,7 @@ def new_resmoke_config(config_file, new_config_file, test_data, eval_str=""):
         }
     }
     with open(config_file, "r") as yaml_stream:
-        config = yaml.load(yaml_stream)
+        config = yaml.safe_load(yaml_stream)
     config.update(new_config)
     with open(new_config_file, "w") as yaml_stream:
         yaml.safe_dump(config, yaml_stream)

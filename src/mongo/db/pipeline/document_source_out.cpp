@@ -321,14 +321,18 @@ intrusive_ptr<DocumentSource> DocumentSourceOut::create(
                                                expCtx,
                                                MergeWhenMatchedModeEnum::kFail,
                                                MergeWhenNotMatchedModeEnum::kInsert,
+                                               boost::none, /* no variables */
+                                               boost::none, /* no custom pipeline */
                                                std::move(uniqueKey),
                                                targetCollectionVersion,
                                                true /* serialize as $out stage */);
         case WriteModeEnum::kModeReplaceDocuments:
             return DocumentSourceMerge::create(std::move(outputNs),
                                                expCtx,
-                                               MergeWhenMatchedModeEnum::kReplaceWithNew,
+                                               MergeWhenMatchedModeEnum::kReplace,
                                                MergeWhenNotMatchedModeEnum::kInsert,
+                                               boost::none, /* no variables */
+                                               boost::none, /* no custom pipeline */
                                                std::move(uniqueKey),
                                                targetCollectionVersion,
                                                true /* serialize as $out stage */);

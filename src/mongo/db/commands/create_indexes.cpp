@@ -36,6 +36,7 @@
 
 #include "mongo/base/string_data.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/background.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
@@ -183,6 +184,67 @@ StatusWith<std::vector<BSONObj>> parseAndValidateIndexSpecs(
 }
 
 /**
+ * Ensures that the options passed in for TTL indexes are valid.
+ */
+Status validateTTLOptions(OperationContext* opCtx, const BSONObj& cmdObj) {
+    const std::string kExpireAfterSeconds = "expireAfterSeconds";
+
+    const BSONElement& indexes = cmdObj[kIndexesFieldName];
+    for (const auto& index : indexes.Array()) {
+        BSONObj indexObj = index.Obj();
+        if (!indexObj.hasField(kExpireAfterSeconds)) {
+            continue;
+        }
+
+        const BSONElement expireAfterSecondsElt = indexObj[kExpireAfterSeconds];
+        if (!expireAfterSecondsElt.isNumber()) {
+            return {ErrorCodes::CannotCreateIndex,
+                    str::stream() << "TTL index '" << kExpireAfterSeconds
+                                  << "' option must be numeric, but received a type of '"
+                                  << typeName(expireAfterSecondsElt.type())
+                                  << "'. Index spec: "
+                                  << indexObj};
+        }
+
+        if (expireAfterSecondsElt.safeNumberLong() < 0) {
+            return {ErrorCodes::CannotCreateIndex,
+                    str::stream() << "TTL index '" << kExpireAfterSeconds
+                                  << "' option cannot be less than 0. Index spec: "
+                                  << indexObj};
+        }
+
+        const std::string tooLargeErr = str::stream()
+            << "TTL index '" << kExpireAfterSeconds
+            << "' option must be within an acceptable range, try a lower number. Index spec: "
+            << indexObj;
+
+        // There are two cases where we can encounter an issue here.
+        // The first case is when we try to cast to millseconds from seconds, which could cause an
+        // overflow. The second case is where 'expireAfterSeconds' is larger than the current epoch
+        // time.
+        try {
+            auto expireAfterMillis =
+                duration_cast<Milliseconds>(Seconds(expireAfterSecondsElt.safeNumberLong()));
+            if (expireAfterMillis > Date_t::now().toDurationSinceEpoch()) {
+                return {ErrorCodes::CannotCreateIndex, tooLargeErr};
+            }
+        } catch (const AssertionException&) {
+            return {ErrorCodes::CannotCreateIndex, tooLargeErr};
+        }
+
+        const BSONObj key = indexObj["key"].Obj();
+        if (key.nFields() != 1) {
+            return {ErrorCodes::CannotCreateIndex,
+                    str::stream() << "TTL indexes are single-field indexes, compound indexes do "
+                                     "not support TTL. Index spec: "
+                                  << indexObj};
+        }
+    }
+
+    return Status::OK();
+}
+
+/**
  * Retrieves the commit quorum from 'cmdObj' if it is present. If it isn't, we provide a default
  * commit quorum, which consists of all the data-bearing nodes.
  */
@@ -213,7 +275,9 @@ std::vector<BSONObj> resolveDefaultsAndRemoveExistingIndexes(OperationContext* o
     uassertStatusOK(swDefaults.getStatus());
 
     auto indexCatalog = collection->getIndexCatalog();
-    return indexCatalog->removeExistingIndexes(opCtx, swDefaults.getValue());
+
+    return indexCatalog->removeExistingIndexes(
+        opCtx, swDefaults.getValue(), false /*removeIndexBuildsToo*/);
 }
 
 void checkUniqueIndexConstraints(OperationContext* opCtx,
@@ -251,6 +315,9 @@ bool runCreateIndexes(OperationContext* opCtx,
     auto specs = uassertStatusOK(
         parseAndValidateIndexSpecs(opCtx, ns, cmdObj, serverGlobalParams.featureCompatibility));
 
+    Status validateTTL = validateTTLOptions(opCtx, cmdObj);
+    uassertStatusOK(validateTTL);
+
     // Do not use AutoGetOrCreateDb because we may relock the database in mode X.
     Lock::DBLock dbLock(opCtx, ns.db(), MODE_IX);
     if (!repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, ns)) {
@@ -266,8 +333,7 @@ bool runCreateIndexes(OperationContext* opCtx,
     };
 
     // Before potentially taking an exclusive database or collection lock, check if all indexes
-    // already exist while holding an intent lock. Only continue if new indexes need to be built
-    // and the collection or database should be re-locked in exclusive mode.
+    // already exist while holding an intent lock.
     {
         AutoGetCollection autoColl(opCtx, ns, MODE_IX);
         if (auto collection = autoColl.getCollection()) {
@@ -483,6 +549,9 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
         parseAndValidateIndexSpecs(opCtx, ns, cmdObj, serverGlobalParams.featureCompatibility));
     boost::optional<CommitQuorumOptions> commitQuorum = parseAndGetCommitQuorum(opCtx, cmdObj);
 
+    Status validateTTL = validateTTLOptions(opCtx, cmdObj);
+    uassertStatusOK(validateTTL);
+
     // Preliminary checks before handing control over to IndexBuildsCoordinator:
     // 1) We are in a replication mode that allows for index creation.
     // 2) Check sharding state.
@@ -634,7 +703,6 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
         throw;
     }
 
-
     result.append(kNumIndexesBeforeFieldName, stats.numIndexesBefore);
     result.append(kNumIndexesAfterFieldName, stats.numIndexesAfter);
     if (stats.numIndexesAfter == stats.numIndexesBefore) {
@@ -681,11 +749,44 @@ public:
                    const BSONObj& cmdObj,
                    std::string& errmsg,
                    BSONObjBuilder& result) override {
-        if (enableIndexBuildsCoordinatorForCreateIndexesCommand) {
-            return runCreateIndexesWithCoordinator(
-                opCtx, dbname, cmdObj, errmsg, result, false /*two phase build*/);
+        // If we encounter an IndexBuildAlreadyInProgress error for any of the requested index
+        // specs, then we will wait for the build(s) to finish before trying again.
+        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
+        bool shouldLogMessageOnAlreadyBuildingError = true;
+        while (true) {
+            try {
+                if (enableIndexBuildsCoordinatorForCreateIndexesCommand) {
+                    return runCreateIndexesWithCoordinator(
+                        opCtx, dbname, cmdObj, errmsg, result, false /*two phase build*/);
+                }
+                return runCreateIndexes(
+                    opCtx, dbname, cmdObj, errmsg, result, false /*two phase build*/);
+            } catch (const DBException& ex) {
+                if (ex.toStatus() != ErrorCodes::IndexBuildAlreadyInProgress) {
+                    throw;
+                }
+                if (shouldLogMessageOnAlreadyBuildingError) {
+                    auto bsonElem = cmdObj.getField(kIndexesFieldName);
+                    log()
+                        << "Received a request to create indexes: '" << bsonElem
+                        << "', but found that at least one of the indexes is already being built, '"
+                        << ex.toStatus()
+                        << "'. This request will wait for the pre-existing index build to finish "
+                           "before proceeding.";
+                    shouldLogMessageOnAlreadyBuildingError = false;
+                }
+                // Unset the response fields so we do not write duplicate fields.
+                errmsg = "";
+                result.resetToEmpty();
+                // Reset the snapshot because we have released locks and may reacquire them again
+                // later.
+                opCtx->recoveryUnit()->abandonSnapshot();
+                // This is a bit racy since we are not holding a lock across discovering an
+                // in-progress build and starting to listen for completion. It is good enough,
+                // however: we can only wait longer than needed, not less.
+                BackgroundOperation::waitUntilAnIndexBuildFinishes(opCtx, nss.ns());
+            }
         }
-        return runCreateIndexes(opCtx, dbname, cmdObj, errmsg, result, false /*two phase build*/);
     }
 
 } cmdCreateIndex;

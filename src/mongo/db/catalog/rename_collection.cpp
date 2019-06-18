@@ -337,8 +337,12 @@ Status renameCollectionWithinDB(OperationContext* opCtx,
     Lock::DBLock dbWriteLock(opCtx, source.db(), MODE_IX);
     boost::optional<Lock::CollectionLock> sourceLock;
     boost::optional<Lock::CollectionLock> targetLock;
-    if (ResourceId(RESOURCE_COLLECTION, source.ns()) <
-        ResourceId(RESOURCE_COLLECTION, target.ns())) {
+    // To prevent deadlock, always lock system.views collection in the end because concurrent
+    // view-related operations always lock system.views in the end.
+    if (!source.isSystemDotViews() && (target.isSystemDotViews() ||
+                                       ResourceId(RESOURCE_COLLECTION, source.ns()) <
+                                           ResourceId(RESOURCE_COLLECTION, target.ns()))) {
+        // To prevent deadlock, always lock source and target in ascending resourceId order.
         sourceLock.emplace(opCtx, source, MODE_X);
         targetLock.emplace(opCtx, target, MODE_X);
     } else {
@@ -646,9 +650,7 @@ Status renameBetweenDBs(OperationContext* opCtx,
 
         if (opCtx->getServiceContext()->getStorageEngine()->supportsDBLocking()) {
             if (globalWriteLock) {
-                const ResourceId globalLockResourceId(RESOURCE_GLOBAL,
-                                                      ResourceId::SINGLETON_GLOBAL);
-                opCtx->lockState()->downgrade(globalLockResourceId, MODE_IX);
+                opCtx->lockState()->downgrade(resourceIdGlobal, MODE_IX);
                 invariant(!opCtx->lockState()->isW());
             } else {
                 invariant(opCtx->lockState()->isW());
@@ -828,9 +830,12 @@ Status renameCollectionForApplyOps(OperationContext* opCtx,
     log() << "renameCollectionForApplyOps: rename " << sourceNss << " (" << uuidString << ") to "
           << targetNss << dropTargetMsg;
 
-    invariant(sourceNss.db() == targetNss.db());
-    return renameCollectionWithinDBForApplyOps(
-        opCtx, sourceNss, targetNss, uuidToDrop, renameOpTime, options);
+    if (sourceNss.db() == targetNss.db()) {
+        return renameCollectionWithinDBForApplyOps(
+            opCtx, sourceNss, targetNss, uuidToDrop, renameOpTime, options);
+    } else {
+        return renameBetweenDBs(opCtx, sourceNss, targetNss, options);
+    }
 }
 
 Status renameCollectionForRollback(OperationContext* opCtx,

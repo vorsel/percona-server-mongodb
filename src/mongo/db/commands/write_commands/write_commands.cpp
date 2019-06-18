@@ -39,6 +39,7 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/json.h"
 #include "mongo/db/lasterror.h"
+#include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/ops/delete_request.h"
 #include "mongo/db/ops/parsed_delete.h"
 #include "mongo/db/ops/parsed_update.h"
@@ -362,6 +363,9 @@ private:
             UpdateRequest updateRequest(_batch.getNamespace());
             updateRequest.setQuery(_batch.getUpdates()[0].getQ());
             updateRequest.setUpdateModification(_batch.getUpdates()[0].getU());
+            updateRequest.setUpdateConstants(_batch.getUpdates()[0].getC());
+            updateRequest.setRuntimeConstants(
+                _batch.getRuntimeConstants().value_or(Variables::generateRuntimeConstants(opCtx)));
             updateRequest.setCollation(write_ops::collationOf(_batch.getUpdates()[0]));
             updateRequest.setArrayFilters(write_ops::arrayFiltersOf(_batch.getUpdates()[0]));
             updateRequest.setMulti(_batch.getUpdates()[0].getMulti());
@@ -369,7 +373,9 @@ private:
             updateRequest.setYieldPolicy(PlanExecutor::YIELD_AUTO);
             updateRequest.setExplain();
 
-            ParsedUpdate parsedUpdate(opCtx, &updateRequest);
+            const ExtensionsCallbackReal extensionsCallback(opCtx,
+                                                            &updateRequest.getNamespaceString());
+            ParsedUpdate parsedUpdate(opCtx, &updateRequest, extensionsCallback);
             uassertStatusOK(parsedUpdate.parseRequest());
 
             // Explains of write commands are read-only, but we take write locks so that timing

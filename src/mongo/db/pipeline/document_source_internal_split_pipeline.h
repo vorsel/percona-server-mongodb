@@ -58,9 +58,9 @@ public:
         return kStageName.rawData();
     }
 
-    boost::optional<MergingLogic> mergingLogic() final {
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
         // {shardsStage, mergingStage, sortPattern}
-        return MergingLogic{nullptr, this, boost::none};
+        return DistributedPlanLogic{nullptr, this, boost::none};
     }
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
@@ -69,7 +69,9 @@ public:
                 _mergeType,
                 DiskUseRequirement::kNoDiskUse,
                 FacetRequirement::kAllowed,
-                TransactionRequirement::kAllowed};
+                TransactionRequirement::kAllowed,
+                _mergeType == HostTypeRequirement::kMongoS ? LookupRequirement::kNotAllowed
+                                                           : LookupRequirement::kAllowed};
     }
 
     GetNextResult getNext() final;

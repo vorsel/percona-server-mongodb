@@ -1,5 +1,7 @@
 // @tags: [
 //   assumes_superuser_permissions,
+//   # mapReduce does not support afterClusterTime.
+//   does_not_support_causal_consistency,
 //   does_not_support_stepdowns,
 //   requires_fastcount,
 //   requires_getmore,
@@ -407,7 +409,6 @@
         refreshLogicalSessionCacheNow: {skip: isAnInternalCommand},
         reapLogicalSessionCacheNow: {skip: isAnInternalCommand},
         refreshSessions: {skip: isUnrelated},
-        refreshSessionsInternal: {skip: isAnInternalCommand},
         restartCatalog: {skip: isAnInternalCommand},
         reIndex: {command: {reIndex: "view"}, expectFailure: true},
         removeShard: {skip: isUnrelated},

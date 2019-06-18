@@ -248,7 +248,7 @@ public:
      */
     void replicationBatchIsComplete() const override;
 
-    bool isCacheUnderPressure(OperationContext* opCtx) const override;
+    int64_t getCacheOverflowTableInsertCount(OperationContext* opCtx) const override;
 
     bool supportsReadConcernMajority() const final;
 
@@ -348,7 +348,7 @@ public:
      *
      * Returns boost::none when called on an ephemeral database.
      */
-    boost::optional<Timestamp> getOplogNeededForCrashRecovery() const;
+    boost::optional<Timestamp> getOplogNeededForCrashRecovery() const final;
 
     /**
      * Returns oplog that may not be truncated. This method is a function of oplog needed for

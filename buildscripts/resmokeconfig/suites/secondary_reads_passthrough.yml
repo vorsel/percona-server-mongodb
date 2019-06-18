@@ -44,6 +44,7 @@ selector:
   - jstests/core/fsync.js
   # benchRun cannot be overridden to be causally consistent
   - jstests/core/bench_test*.js
+  - jstests/core/benchrun_pipeline_updates.js
   # getMore is not causal consistent because afterClusterTime has been specified
   # by the preceding find command which establishes the cursor. Therefore,
   # getMore cannot be guaranteed to get executed after commands in between find
@@ -71,6 +72,7 @@ selector:
   # "Cowardly refusing to run test with overridden read preference when it reads from a
   #  non-replicated collection: ..."
   - assumes_read_preference_unchanged
+  - does_not_support_causal_consistency
   ##
   # collStats and dbStats are not causally consistent
   - requires_collstats

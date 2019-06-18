@@ -50,6 +50,7 @@
 #include "mongo/db/exec/update_stage.h"
 #include "mongo/db/introspect.h"
 #include "mongo/db/lasterror.h"
+#include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/ops/delete_request.h"
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/ops/parsed_delete.h"
@@ -324,22 +325,24 @@ void insertDocuments(OperationContext* opCtx,
 
 /**
  * Returns a OperationNotSupportedInTransaction error Status if we are in a transaction and
- * operating on a capped collection on a shard.
+ * operating on a capped collection.
  *
  * The behavior of an operation against a capped collection may differ across replica set members,
  * where it can succeed on one member and fail on another, crashing the failing member. Prepared
  * transactions are not allowed to fail, so capped collections will not be allowed on shards.
- * Furthermore, capped collections only allow one operation at a time because they enforce
- * sequential insertion order with a MODE_X collection lock, which we cannot hold in transactions.
+ * Even in the unsharded case, capped collections are still problematic with transactions because
+ * they only allow one operation at a time because they enforce insertion order with a MODE_X
+ * collection lock, which we cannot hold in transactions.
  */
-Status checkIfTransactionOnCappedCollOnShard(OperationContext* opCtx, Collection* collection) {
+Status checkIfTransactionOnCappedColl(OperationContext* opCtx, Collection* collection) {
     auto txnParticipant = TransactionParticipant::get(opCtx);
-    if (txnParticipant && txnParticipant.inMultiDocumentTransaction() && collection->isCapped() &&
-        serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
-        return {ErrorCodes::OperationNotSupportedInTransaction,
-                str::stream() << "Collection '" << collection->ns()
-                              << "' is a capped collection. Transactions are not allowed on capped "
-                                 "collections on shards."};
+    if (txnParticipant && txnParticipant.inMultiDocumentTransaction() && collection->isCapped()) {
+        return {
+            ErrorCodes::OperationNotSupportedInTransaction,
+            str::stream()
+                << "Collection '"
+                << collection->ns()
+                << "' is a capped collection. Transactions are not allowed on capped collections."};
     }
     return Status::OK();
 }
@@ -433,9 +436,9 @@ bool insertBatchAndHandleErrors(OperationContext* opCtx,
                 try {
                     if (!collection)
                         acquireCollection();
-                    // Transactions are not allowed to operate on capped collections on shards.
+                    // Transactions are not allowed to operate on capped collections.
                     uassertStatusOK(
-                        checkIfTransactionOnCappedCollOnShard(opCtx, collection->getCollection()));
+                        checkIfTransactionOnCappedColl(opCtx, collection->getCollection()));
                     lastOpFixer->startingOp();
                     insertDocuments(opCtx, collection->getCollection(), it, it + 1, fromMigrate);
                     lastOpFixer->finishedOpSuccessfully();
@@ -588,7 +591,8 @@ static SingleWriteResult performSingleUpdateOp(OperationContext* opCtx,
                                                const NamespaceString& ns,
                                                StmtId stmtId,
                                                const UpdateRequest& updateRequest) {
-    ParsedUpdate parsedUpdate(opCtx, &updateRequest);
+    const ExtensionsCallbackReal extensionsCallback(opCtx, &updateRequest.getNamespaceString());
+    ParsedUpdate parsedUpdate(opCtx, &updateRequest, extensionsCallback);
     uassertStatusOK(parsedUpdate.parseRequest());
 
     CurOpFailpointHelpers::waitWhileFailPointEnabled(
@@ -621,8 +625,8 @@ static SingleWriteResult performSingleUpdateOp(OperationContext* opCtx,
     }
 
     if (auto coll = collection->getCollection()) {
-        // Transactions are not allowed to operate on capped collections on shards.
-        uassertStatusOK(checkIfTransactionOnCappedCollOnShard(opCtx, coll));
+        // Transactions are not allowed to operate on capped collections.
+        uassertStatusOK(checkIfTransactionOnCappedColl(opCtx, coll));
     }
 
     CurOpFailpointHelpers::waitWhileFailPointEnabled(
@@ -681,7 +685,8 @@ static SingleWriteResult performSingleUpdateOp(OperationContext* opCtx,
 static SingleWriteResult performSingleUpdateOpWithDupKeyRetry(OperationContext* opCtx,
                                                               const NamespaceString& ns,
                                                               StmtId stmtId,
-                                                              const write_ops::UpdateOpEntry& op) {
+                                                              const write_ops::UpdateOpEntry& op,
+                                                              RuntimeConstants runtimeConstants) {
     globalOpCounters.gotUpdate();
     ServerWriteConcernMetrics::get(opCtx)->recordWriteConcernForUpdate(opCtx->getWriteConcern());
     auto& curOp = *CurOp::get(opCtx);
@@ -703,6 +708,8 @@ static SingleWriteResult performSingleUpdateOpWithDupKeyRetry(OperationContext* 
     UpdateRequest request(ns);
     request.setQuery(op.getQ());
     request.setUpdateModification(op.getU());
+    request.setUpdateConstants(op.getC());
+    request.setRuntimeConstants(std::move(runtimeConstants));
     request.setCollation(write_ops::collationOf(op));
     request.setStmtId(stmtId);
     request.setArrayFilters(write_ops::arrayFiltersOf(op));
@@ -722,7 +729,8 @@ static SingleWriteResult performSingleUpdateOpWithDupKeyRetry(OperationContext* 
         try {
             return performSingleUpdateOp(opCtx, ns, stmtId, request);
         } catch (ExceptionFor<ErrorCodes::DuplicateKey>& ex) {
-            ParsedUpdate parsedUpdate(opCtx, &request);
+            const ExtensionsCallbackReal extensionsCallback(opCtx, &request.getNamespaceString());
+            ParsedUpdate parsedUpdate(opCtx, &request, extensionsCallback);
             uassertStatusOK(parsedUpdate.parseRequest());
 
             if (!parsedUpdate.hasParsedQuery()) {
@@ -765,6 +773,11 @@ WriteResult performUpdates(OperationContext* opCtx, const write_ops::Update& who
     WriteResult out;
     out.results.reserve(wholeOp.getUpdates().size());
 
+    // If the update command specified runtime constants, we adopt them. Otherwise, we set them to
+    // the current local and cluster time. These constants are applied to each update in the batch.
+    const auto& runtimeConstants =
+        wholeOp.getRuntimeConstants().value_or(Variables::generateRuntimeConstants(opCtx));
+
     for (auto&& singleOp : wholeOp.getUpdates()) {
         const auto stmtId = getStmtIdForWriteOp(opCtx, wholeOp, stmtIdIndex++);
         if (opCtx->getTxnNumber()) {
@@ -791,7 +804,7 @@ WriteResult performUpdates(OperationContext* opCtx, const write_ops::Update& who
         try {
             lastOpFixer.startingOp();
             out.results.emplace_back(performSingleUpdateOpWithDupKeyRetry(
-                opCtx, wholeOp.getNamespace(), stmtId, singleOp));
+                opCtx, wholeOp.getNamespace(), stmtId, singleOp, runtimeConstants));
             lastOpFixer.finishedOpSuccessfully();
         } catch (const DBException& ex) {
             const bool canContinue =

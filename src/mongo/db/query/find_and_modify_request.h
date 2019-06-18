@@ -34,6 +34,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/ops/write_ops_parsers.h"
+#include "mongo/db/pipeline/runtime_constants_gen.h"
 #include "mongo/db/write_concern_options.h"
 
 namespace mongo {
@@ -51,7 +52,6 @@ class StatusWith;
  */
 class FindAndModifyRequest {
 public:
-    static constexpr auto kBypassDocumentValidationFieldName = "bypassDocumentValidation"_sd;
     static constexpr auto kLegacyCommandName = "findandmodify"_sd;
     static constexpr auto kCommandName = "findAndModify"_sd;
 
@@ -107,6 +107,7 @@ public:
     bool shouldReturnNew() const;
     bool isUpsert() const;
     bool isRemove() const;
+    bool getBypassDocumentValidation() const;
 
     // Not implemented. Use extractWriteConcern() to get the setting instead.
     WriteConcernOptions getWriteConcern() const;
@@ -164,9 +165,25 @@ public:
     void setArrayFilters(const std::vector<BSONObj>& arrayFilters);
 
     /**
+     * Sets any constant values which may be required by the query and/or update.
+     */
+    void setRuntimeConstants(RuntimeConstants runtimeConstants) {
+        _runtimeConstants = std::move(runtimeConstants);
+    }
+
+    /**
+     * Returns the runtime constants associated with this findAndModify request, if present.
+     */
+    const boost::optional<RuntimeConstants>& getRuntimeConstants() const {
+        return _runtimeConstants;
+    }
+
+    /**
      * Sets the write concern for this request.
      */
     void setWriteConcern(WriteConcernOptions writeConcern);
+
+    void setBypassDocumentValidation(bool bypassDocumentValidation);
 
 private:
     /**
@@ -180,13 +197,15 @@ private:
     const NamespaceString _ns;
     BSONObj _query;
 
-    boost::optional<bool> _isUpsert;
+    bool _isUpsert{false};
     boost::optional<BSONObj> _fieldProjection;
     boost::optional<BSONObj> _sort;
     boost::optional<BSONObj> _collation;
     boost::optional<std::vector<BSONObj>> _arrayFilters;
-    boost::optional<bool> _shouldReturnNew;
+    boost::optional<RuntimeConstants> _runtimeConstants;
+    bool _shouldReturnNew{false};
     boost::optional<WriteConcernOptions> _writeConcern;
+    bool _bypassDocumentValidation{false};
 
     // Holds value when performing an update request and none when a remove request.
     boost::optional<write_ops::UpdateModification> _update;

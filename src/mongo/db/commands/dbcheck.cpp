@@ -484,8 +484,6 @@ private:
                                                   {},
                                                   kUninitializedStmtId,
                                                   {},
-                                                  false /* prepare */,
-                                                  false /* inTxn */,
                                                   OplogSlot());
                 uow.commit();
                 return result;

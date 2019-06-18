@@ -159,15 +159,6 @@ selector:
   # SERVER-38096 Mongos opCounter doesn't increase when last op causes the transaction to implicitly abort
   - jstests/core/opcounters_write_cmd.js
 
-  # Consecutive writes totalling more than the size upper threshold will cause the txn to
-  # abort with a TransactionTooLarge error.
-  - jstests/core/batch_size.js
-  - jstests/core/single_batch.js
-  # For insert1.js, only Windows DEBUG builds are affected. We compute the in-memory size
-  # of the transaction, which uses the size of the oplog entry and is 8 bytes larger on
-  # Windows debug builds than other builds.
-  - jstests/core/insert1.js
-
   # TODO: SERVER-38207 Cannot insert document with MaxKey shard key.
   - jstests/core/type8.js
 
@@ -187,6 +178,7 @@ selector:
   # transaction and can cause test to timeout because of the 3 hr transactions lifetime setting and
   # moveChunk getting blocked trying to acquire collection X lock while doing chunk refresh.
   - jstests/core/bench_test*.js
+  - jstests/core/benchrun_pipeline_updates.js # benchRun() used for writes
 
   ##
   ## Some aggregation stages don't support snapshot readconcern.
@@ -370,6 +362,7 @@ selector:
   # op3 will still be using the snapshot from op1, and not see op2 at all.
   - jstests/core/cursora.js
   - jstests/core/bench_test1.js
+  - jstests/core/benchrun_pipeline_updates.js
 
   # The tests below use applyOps, SERVER-1439.
   - jstests/core/list_collections1.js

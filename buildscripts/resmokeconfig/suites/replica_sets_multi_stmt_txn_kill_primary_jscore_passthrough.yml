@@ -71,15 +71,6 @@ selector:
   - jstests/core/updateh.js
   - jstests/core/updatej.js
 
-  # Consecutive writes totalling more than the size upper threshold will cause the txn to
-  # abort with a TransactionTooLarge error.
-  - jstests/core/batch_size.js
-  - jstests/core/single_batch.js
-  # For insert1.js, only Windows DEBUG builds are affected. We compute the in-memory size
-  # of the transaction, which uses the size of the oplog entry and is 8 bytes larger on
-  # Windows debug builds than other builds.
-  - jstests/core/insert1.js
-
   # Reads from system.views.
   - jstests/core/views/views_drop.js
 
@@ -283,6 +274,7 @@ selector:
   - jstests/core/ismaster.js
 
   - jstests/core/bench_test*.js # benchRun() used for writes
+  - jstests/core/benchrun_pipeline_updates.js # benchRun() used for writes
   - jstests/core/connection_string_validation.js # Does not expect a replica set connection string.
   - jstests/core/explain_large_bounds.js # Stepdown can timeout waiting for global lock.
   - jstests/core/insert2.js # Creates new mongo connection.
@@ -366,6 +358,8 @@ selector:
   # This tag corresponds to operations which are run long enough to exceed the stepdown interval
   # when grouped into transactions
   - operations_longer_than_stepdown_interval_in_txns
+  # Transactions are not allowed to operate on capped collections.
+  - requires_capped
 
 executor:
   archive:

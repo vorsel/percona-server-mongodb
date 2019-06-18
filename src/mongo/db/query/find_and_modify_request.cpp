@@ -41,25 +41,34 @@
 namespace mongo {
 
 namespace {
-const char kCmdName[] = "findAndModify";
 const char kQueryField[] = "query";
 const char kSortField[] = "sort";
 const char kCollationField[] = "collation";
 const char kArrayFiltersField[] = "arrayFilters";
+const char kRuntimeConstantsField[] = "runtimeConstants";
 const char kRemoveField[] = "remove";
 const char kUpdateField[] = "update";
 const char kNewField[] = "new";
 const char kFieldProjectionField[] = "fields";
 const char kUpsertField[] = "upsert";
 const char kWriteConcernField[] = "writeConcern";
+const char kBypassDocumentValidationField[] = "bypassDocumentValidation";
 
 const std::vector<BSONObj> emptyArrayFilters{};
 
-const std::vector<StringData> _knownFields{
-    FindAndModifyRequest::kBypassDocumentValidationFieldName,
-    FindAndModifyRequest::kLegacyCommandName,
-    FindAndModifyRequest::kCommandName,
-};
+const std::vector<StringData> _knownFields{kQueryField,
+                                           kSortField,
+                                           kCollationField,
+                                           kArrayFiltersField,
+                                           kRemoveField,
+                                           kUpdateField,
+                                           kNewField,
+                                           kFieldProjectionField,
+                                           kUpsertField,
+                                           kWriteConcernField,
+                                           kBypassDocumentValidationField,
+                                           FindAndModifyRequest::kLegacyCommandName,
+                                           FindAndModifyRequest::kCommandName};
 }  // unnamed namespace
 
 FindAndModifyRequest::FindAndModifyRequest(NamespaceString fullNs,
@@ -81,14 +90,14 @@ FindAndModifyRequest FindAndModifyRequest::makeRemove(NamespaceString fullNs, BS
 BSONObj FindAndModifyRequest::toBSON(const BSONObj& commandPassthroughFields) const {
     BSONObjBuilder builder;
 
-    builder.append(kCmdName, _ns.coll());
+    builder.append(kCommandName, _ns.coll());
     builder.append(kQueryField, _query);
 
     if (_update) {
         _update->serializeToBSON(kUpdateField, &builder);
 
         if (_isUpsert) {
-            builder.append(kUpsertField, _isUpsert.get());
+            builder.append(kUpsertField, _isUpsert);
         }
     } else {
         builder.append(kRemoveField, true);
@@ -114,12 +123,22 @@ BSONObj FindAndModifyRequest::toBSON(const BSONObj& commandPassthroughFields) co
         arrayBuilder.doneFast();
     }
 
+    if (_runtimeConstants) {
+        BSONObjBuilder rtcBuilder(builder.subobjStart(kRuntimeConstantsField));
+        _runtimeConstants->serialize(&rtcBuilder);
+        rtcBuilder.doneFast();
+    }
+
     if (_shouldReturnNew) {
-        builder.append(kNewField, _shouldReturnNew.get());
+        builder.append(kNewField, _shouldReturnNew);
     }
 
     if (_writeConcern) {
         builder.append(kWriteConcernField, _writeConcern->toBSON());
+    }
+
+    if (_bypassDocumentValidation) {
+        builder.append(kBypassDocumentValidationField, _bypassDocumentValidation);
     }
 
     IDLParserErrorContext::appendGenericCommandArguments(
@@ -140,8 +159,12 @@ StatusWith<FindAndModifyRequest> FindAndModifyRequest::parseFromBSON(NamespaceSt
     bool shouldReturnNew = false;
     bool isUpsert = false;
     bool isRemove = false;
+    bool bypassDocumentValidation = false;
     bool arrayFiltersSet = false;
     std::vector<BSONObj> arrayFilters;
+    boost::optional<RuntimeConstants> runtimeConstants;
+    bool writeConcernOptionsSet = false;
+    WriteConcernOptions writeConcernOptions;
 
     for (auto&& field : cmdObj.getFieldNames<std::set<std::string>>()) {
         if (field == kQueryField) {
@@ -158,6 +181,8 @@ StatusWith<FindAndModifyRequest> FindAndModifyRequest::parseFromBSON(NamespaceSt
             fields = cmdObj.getObjectField(kFieldProjectionField);
         } else if (field == kUpsertField) {
             isUpsert = cmdObj[kUpsertField].trueValue();
+        } else if (field == kBypassDocumentValidationField) {
+            bypassDocumentValidation = cmdObj[kBypassDocumentValidationField].trueValue();
         } else if (field == kCollationField) {
             BSONElement collationElt;
             Status collationEltStatus =
@@ -166,7 +191,7 @@ StatusWith<FindAndModifyRequest> FindAndModifyRequest::parseFromBSON(NamespaceSt
                 return collationEltStatus;
             }
             if (collationEltStatus.isOK()) {
-                collation = collationElt.Obj();
+                collation = collationElt.embeddedObject();
             }
         } else if (field == kArrayFiltersField) {
             BSONElement arrayFiltersElt;
@@ -177,14 +202,31 @@ StatusWith<FindAndModifyRequest> FindAndModifyRequest::parseFromBSON(NamespaceSt
             }
             if (arrayFiltersEltStatus.isOK()) {
                 arrayFiltersSet = true;
-                for (auto arrayFilter : arrayFiltersElt.Obj()) {
+                for (auto arrayFilter : arrayFiltersElt.embeddedObject()) {
                     if (arrayFilter.type() != BSONType::Object) {
                         return {ErrorCodes::TypeMismatch,
                                 str::stream() << "Each array filter must be an object, found "
                                               << arrayFilter.type()};
                     }
-                    arrayFilters.push_back(arrayFilter.Obj());
+                    arrayFilters.push_back(arrayFilter.embeddedObject());
                 }
+            }
+        } else if (field == kRuntimeConstantsField) {
+            runtimeConstants =
+                RuntimeConstants::parse(IDLParserErrorContext(kRuntimeConstantsField),
+                                        cmdObj.getObjectField(kRuntimeConstantsField));
+        } else if (field == kWriteConcernField) {
+            BSONElement writeConcernElt;
+            Status writeConcernEltStatus = bsonExtractTypedField(
+                cmdObj, kWriteConcernField, BSONType::Object, &writeConcernElt);
+            if (!writeConcernEltStatus.isOK()) {
+                return writeConcernEltStatus;
+            }
+            auto status = writeConcernOptions.parse(writeConcernElt.embeddedObject());
+            if (!status.isOK()) {
+                return status;
+            } else {
+                writeConcernOptionsSet = true;
             }
         } else if (!isGenericArgument(field) &&
                    !std::count(_knownFields.begin(), _knownFields.end(), field)) {
@@ -226,8 +268,15 @@ StatusWith<FindAndModifyRequest> FindAndModifyRequest::parseFromBSON(NamespaceSt
     request.setFieldProjection(fields);
     request.setSort(sort);
     request.setCollation(collation);
+    request.setBypassDocumentValidation(bypassDocumentValidation);
     if (arrayFiltersSet) {
         request.setArrayFilters(std::move(arrayFilters));
+    }
+    if (runtimeConstants) {
+        request.setRuntimeConstants(*runtimeConstants);
+    }
+    if (writeConcernOptionsSet) {
+        request.setWriteConcern(std::move(writeConcernOptions));
     }
 
     if (!isRemove) {
@@ -278,6 +327,10 @@ void FindAndModifyRequest::setWriteConcern(WriteConcernOptions writeConcern) {
     _writeConcern = std::move(writeConcern);
 }
 
+void FindAndModifyRequest::setBypassDocumentValidation(bool bypassDocumentValidation) {
+    _bypassDocumentValidation = bypassDocumentValidation;
+}
+
 const NamespaceString& FindAndModifyRequest::getNamespaceString() const {
     return _ns;
 }
@@ -310,14 +363,18 @@ const std::vector<BSONObj>& FindAndModifyRequest::getArrayFilters() const {
 }
 
 bool FindAndModifyRequest::shouldReturnNew() const {
-    return _shouldReturnNew.value_or(false);
+    return _shouldReturnNew;
 }
 
 bool FindAndModifyRequest::isUpsert() const {
-    return _isUpsert.value_or(false);
+    return _isUpsert;
 }
 
 bool FindAndModifyRequest::isRemove() const {
     return !static_cast<bool>(_update);
 }
+
+bool FindAndModifyRequest::getBypassDocumentValidation() const {
+    return _bypassDocumentValidation;
 }
+}  // namespace mongo

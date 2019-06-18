@@ -51,7 +51,7 @@ namespace mongo {
 using repl::OplogEntry;
 namespace {
 // If enabled, causes _applyPrepareTransaction to hang before preparing the transaction participant.
-MONGO_FAIL_POINT_DEFINE(applyPrepareCommandHangBeforePreparingTransaction);
+MONGO_FAIL_POINT_DEFINE(applyOpsHangBeforePreparingTransaction);
 
 // Failpoint that will cause reconstructPreparedTransactions to return early.
 MONGO_FAIL_POINT_DEFINE(skipReconstructPreparedTransactions);
@@ -74,11 +74,8 @@ Status _applyOperationsForTransaction(OperationContext* opCtx,
 }
 
 /**
- * Helper that will find the previous oplog entry for that transaction, then for old-style applyOps
- * entries, will transform it to be a normal applyOps command and applies the oplog entry.
- *
- * For new-style transactions, with prepare command entries, will then read the entire set of oplog
- * entries for the transaction and apply each of them.
+ * Helper that will read the entire sequence of oplog entries for the transaction and apply each of
+ * them.
  *
  * Currently used for oplog application of a commitTransaction oplog entry during recovery, rollback
  * and initial sync.
@@ -91,30 +88,18 @@ Status _applyTransactionFromOplogChain(OperationContext* opCtx,
     invariant(mode == repl::OplogApplication::Mode::kRecovering ||
               mode == repl::OplogApplication::Mode::kInitialSync);
 
-    BSONObj prepareCmd;
     repl::MultiApplier::Operations ops;
     {
         // Traverse the oplog chain with its own snapshot and read timestamp.
         ReadSourceScope readSourceScope(opCtx);
 
-        // Get the corresponding prepareTransaction oplog entry.
+        // Get the corresponding prepare applyOps oplog entry.
         const auto prepareOpTime = entry.getPrevWriteOpTimeInTransaction();
         invariant(prepareOpTime);
         TransactionHistoryIterator iter(prepareOpTime.get());
         invariant(iter.hasNext());
         const auto prepareOplogEntry = iter.next(opCtx);
-
-        if (prepareOplogEntry.getCommandType() == OplogEntry::CommandType::kApplyOps) {
-            // Transform prepare command into a normal applyOps command.
-            prepareCmd = prepareOplogEntry.getOperationToApply().removeField("prepare");
-        } else {
-            invariant(prepareOplogEntry.getCommandType() ==
-                      OplogEntry::CommandType::kPrepareTransaction);
-            // The operations here are reconstructed at their prepare time.  However, that time will
-            // be ignored because there is an outer write unit of work during their application.
-            // Both the prepare time and the commit time are set explicitly below.
-            ops = readTransactionOperationsFromOplogChain(opCtx, prepareOplogEntry, {});
-        }
+        ops = readTransactionOperationsFromOplogChain(opCtx, prepareOplogEntry, {});
     }
 
     const auto dbName = entry.getNss().db().toString();
@@ -127,11 +112,8 @@ Status _applyTransactionFromOplogChain(OperationContext* opCtx,
         opCtx->recoveryUnit()->setRoundUpPreparedTimestamps(true);
 
         BSONObjBuilder resultWeDontCareAbout;
-        if (prepareCmd.isEmpty()) {
-            status = _applyOperationsForTransaction(opCtx, ops, mode);
-        } else {
-            status = applyOps(opCtx, dbName, prepareCmd, mode, &resultWeDontCareAbout);
-        }
+
+        status = _applyOperationsForTransaction(opCtx, ops, mode);
         if (status.isOK()) {
             opCtx->recoveryUnit()->setPrepareTimestamp(commitTimestamp);
             wunit.prepare();
@@ -160,9 +142,6 @@ Status applyCommitTransaction(OperationContext* opCtx,
     IDLParserErrorContext ctx("commitTransaction");
     auto commitOplogEntryOpTime = entry.getOpTime();
     auto commitCommand = CommitTransactionOplogObject::parse(ctx, entry.getObject());
-    const bool prepared = !commitCommand.getPrepared() || *commitCommand.getPrepared();
-    if (!prepared)
-        return Status::OK();
     invariant(commitCommand.getCommitTimestamp());
 
     if (mode == repl::OplogApplication::Mode::kRecovering ||
@@ -228,28 +207,10 @@ Status applyAbortTransaction(OperationContext* opCtx,
     return Status::OK();
 }
 
-namespace {
-// Reconstruct the entry "as if" it were at the time given in topLevelObj, with the session
-// information also from "topLevelObj", and remove the "partialTxn" indicator.
-// TODO(SERVER-40763): Remove "inTxn" entirely.  We can replace this helper with a direct call to
-// repl::ApplyOps::extractOperationsTo.
-void _reconstructPartialTxnEntryAtGivenTime(const OplogEntry& operationEntry,
-                                            const BSONObj& topLevelObj,
-                                            repl::MultiApplier::Operations* operations) {
-    if (operationEntry.getInTxn()) {
-        BSONObjBuilder builder(operationEntry.getDurableReplOperation().toBSON());
-        builder.appendElementsUnique(topLevelObj);
-        operations->emplace_back(builder.obj());
-    } else {
-        repl::ApplyOps::extractOperationsTo(operationEntry, topLevelObj, operations);
-    }
-}
-}  // namespace
-
 repl::MultiApplier::Operations readTransactionOperationsFromOplogChain(
     OperationContext* opCtx,
     const OplogEntry& commitOrPrepare,
-    const std::vector<OplogEntry*> cachedOps) {
+    const std::vector<OplogEntry*>& cachedOps) {
     repl::MultiApplier::Operations ops;
 
     // Get the previous oplog entry.
@@ -278,7 +239,7 @@ repl::MultiApplier::Operations readTransactionOperationsFromOplogChain(
         const auto& operationEntry = iter.next(opCtx);
         invariant(operationEntry.isPartialTransaction());
         auto prevOpsEnd = ops.size();
-        _reconstructPartialTxnEntryAtGivenTime(operationEntry, commitOrPrepareObj, &ops);
+        repl::ApplyOps::extractOperationsTo(operationEntry, commitOrPrepareObj, &ops);
         // Because BSONArrays do not have fast way of determining size without iterating through
         // them, and we also have no way of knowing how many oplog entries are in a transaction
         // without iterating, reversing each applyOps and then reversing the whole array is
@@ -293,7 +254,12 @@ repl::MultiApplier::Operations readTransactionOperationsFromOplogChain(
     for (auto* cachedOp : cachedOps) {
         const auto& operationEntry = *cachedOp;
         invariant(operationEntry.isPartialTransaction());
-        _reconstructPartialTxnEntryAtGivenTime(operationEntry, commitOrPrepareObj, &ops);
+        repl::ApplyOps::extractOperationsTo(operationEntry, commitOrPrepareObj, &ops);
+    }
+
+    // Reconstruct the operations from the commit or prepare oplog entry.
+    if (commitOrPrepare.getCommandType() == OplogEntry::CommandType::kApplyOps) {
+        repl::ApplyOps::extractOperationsTo(commitOrPrepare, commitOrPrepareObj, &ops);
     }
     return ops;
 }
@@ -324,7 +290,7 @@ Status _applyPrepareTransaction(OperationContext* opCtx,
         opCtx->recoveryUnit()->setRoundUpPreparedTimestamps(true);
     }
 
-    // Block application of prepare oplog entry on secondaries when a concurrent background index
+    // Block application of prepare oplog entries on secondaries when a concurrent background index
     // build is running.
     // This will prevent hybrid index builds from corrupting an index on secondary nodes if a
     // prepared transaction becomes prepared during a build but commits after the index build
@@ -332,8 +298,12 @@ Status _applyPrepareTransaction(OperationContext* opCtx,
     for (const auto& op : ops) {
         auto ns = op.getNss();
         auto uuid = *op.getUuid();
-        BackgroundOperation::awaitNoBgOpInProgForNs(ns);
-        IndexBuildsCoordinator::get(opCtx)->awaitNoIndexBuildInProgressForCollection(uuid);
+        if (BackgroundOperation::inProgForNs(ns)) {
+            warning() << "blocking replication until index builds are finished on "
+                      << redact(ns.toString()) << ", due to prepared transaction";
+            BackgroundOperation::awaitNoBgOpInProgForNs(ns);
+            IndexBuildsCoordinator::get(opCtx)->awaitNoIndexBuildInProgressForCollection(uuid);
+        }
     }
 
     // Transaction operations are in their own batch, so we can modify their opCtx.
@@ -353,10 +323,10 @@ Status _applyPrepareTransaction(OperationContext* opCtx,
     if (!status.isOK())
         return status;
 
-    if (MONGO_FAIL_POINT(applyPrepareCommandHangBeforePreparingTransaction)) {
-        LOG(0) << "Hit applyPrepareCommandHangBeforePreparingTransaction failpoint";
-        MONGO_FAIL_POINT_PAUSE_WHILE_SET_OR_INTERRUPTED(
-            opCtx, applyPrepareCommandHangBeforePreparingTransaction);
+    if (MONGO_FAIL_POINT(applyOpsHangBeforePreparingTransaction)) {
+        LOG(0) << "Hit applyOpsHangBeforePreparingTransaction failpoint";
+        MONGO_FAIL_POINT_PAUSE_WHILE_SET_OR_INTERRUPTED(opCtx,
+                                                        applyOpsHangBeforePreparingTransaction);
     }
 
     transaction.prepareTransaction(opCtx, entry.getOpTime());
@@ -366,20 +336,16 @@ Status _applyPrepareTransaction(OperationContext* opCtx,
 }
 
 /**
- * Apply a prepared transaction during recovery.  The OplogEntry must be an 'applyOps' with
- * 'prepare' set or a prepareTransaction command.
+ * Apply a prepared transaction during recovery.
  */
 Status applyRecoveredPrepareTransaction(OperationContext* opCtx,
                                         const OplogEntry& entry,
                                         repl::OplogApplication::Mode mode) {
     // Snapshot transactions never conflict with the PBWM lock.
     invariant(!opCtx->lockState()->shouldConflictWithSecondaryBatchApplication());
-    if (entry.getCommandType() == OplogEntry::CommandType::kPrepareTransaction) {
-        return _applyPrepareTransaction(opCtx, entry, mode);
-    } else {
-        // This is an applyOps with prepare.
-        return applyRecoveredPrepareApplyOpsOplogEntry(opCtx, entry, mode);
-    }
+    // We might replay a prepared transaction behind oldest timestamp.
+    opCtx->recoveryUnit()->setRoundUpPreparedTimestamps(true);
+    return _applyPrepareTransaction(opCtx, entry, mode);
 }
 }  // namespace
 
@@ -413,7 +379,7 @@ Status applyPrepareTransaction(OperationContext* opCtx,
 
     // Return error if run via applyOps command.
     uassert(51145,
-            "prepareTransaction oplog entry is only used internally by secondaries.",
+            "prepare applyOps oplog entry is only used internally by secondaries.",
             oplogApplicationMode != repl::OplogApplication::Mode::kApplyOpsCmd);
 
     invariant(oplogApplicationMode == repl::OplogApplication::Mode::kSecondary);
@@ -470,5 +436,4 @@ void reconstructPreparedTransactions(OperationContext* opCtx, repl::OplogApplica
         }
     }
 }
-
 }  // namespace mongo

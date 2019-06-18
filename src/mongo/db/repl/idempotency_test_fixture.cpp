@@ -76,8 +76,7 @@ repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
                                 boost::optional<Date_t> wallClockTime = boost::none,
                                 boost::optional<StmtId> stmtId = boost::none,
                                 boost::optional<UUID> uuid = boost::none,
-                                boost::optional<OpTime> prevOpTime = boost::none,
-                                const boost::optional<bool> prepare = boost::none) {
+                                boost::optional<OpTime> prevOpTime = boost::none) {
     return repl::OplogEntry(opTime,                           // optime
                             boost::none,                      // hash
                             opType,                           // opType
@@ -91,10 +90,9 @@ repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
                             boost::none,                      // upsert
                             wallClockTime,                    // wall clock time
                             stmtId,                           // statement id
-                            prevOpTime,   // optime of previous write within same transaction
-                            boost::none,  // pre-image optime
-                            boost::none,  // post-image optime
-                            prepare);     // prepare
+                            prevOpTime,    // optime of previous write within same transaction
+                            boost::none,   // pre-image optime
+                            boost::none);  // post-image optime
 }
 
 }  // namespace
@@ -254,8 +252,13 @@ OplogEntry makeCreateCollectionOplogEntry(OpTime opTime,
                                           const BSONObj& options) {
     BSONObjBuilder bob;
     bob.append("create", nss.coll());
+    boost::optional<UUID> optionalUUID;
+    if (options.hasField("uuid")) {
+        StatusWith<UUID> uuid = UUID::parse(options.getField("uuid"));
+        optionalUUID = uuid.getValue();
+    }
     bob.appendElements(options);
-    return makeCommandOplogEntry(opTime, nss, bob.obj());
+    return makeCommandOplogEntry(opTime, nss, bob.obj(), optionalUUID);
 }
 
 /**
@@ -394,7 +397,10 @@ void IdempotencyTest::testOpsAreIdempotent(std::vector<OplogEntry> ops, Sequence
     auto iterations = sequenceType == SequenceType::kEntireSequence ? 1 : ops.size();
 
     for (std::size_t i = 0; i < iterations; i++) {
-        ASSERT_OK(resetState());
+        // Since the end state after each iteration is expected to be the same as the start state,
+        // we don't drop and re-create the collections. Dropping and re-creating the collections
+        // won't work either because we don't have ways to wait until second-phase drop to
+        // completely finish.
         std::vector<OplogEntry> fullSequence;
 
         if (sequenceType == SequenceType::kEntireSequence) {
@@ -461,32 +467,33 @@ OplogEntry IdempotencyTest::dropIndex(const std::string& indexName, const UUID& 
 OplogEntry IdempotencyTest::prepare(LogicalSessionId lsid,
                                     TxnNumber txnNum,
                                     StmtId stmtId,
-                                    const BSONArray& ops) {
+                                    const BSONArray& ops,
+                                    OpTime prevOpTime) {
     OperationSessionInfo info;
     info.setSessionId(lsid);
     info.setTxnNumber(txnNum);
     return makeOplogEntry(nextOpTime(),
                           OpTypeEnum::kCommand,
                           nss.getCommandNS(),
-                          BSON("applyOps" << ops),
+                          BSON("applyOps" << ops << "prepare" << true),
                           boost::none /* o2 */,
                           info /* sessionInfo */,
                           Date_t::min() /* wallClockTime -- required but not checked */,
                           stmtId,
                           boost::none /* uuid */,
-                          OpTime(),
-                          true);
+                          prevOpTime);
 }
 
 OplogEntry IdempotencyTest::commitUnprepared(LogicalSessionId lsid,
                                              TxnNumber txnNum,
                                              StmtId stmtId,
-                                             const BSONArray& ops) {
+                                             const BSONArray& ops,
+                                             OpTime prevOpTime) {
     OperationSessionInfo info;
     info.setSessionId(lsid);
     info.setTxnNumber(txnNum);
     return makeCommandOplogEntryWithSessionInfoAndStmtId(
-        nextOpTime(), nss, BSON("applyOps" << ops), lsid, txnNum, stmtId, OpTime());
+        nextOpTime(), nss, BSON("applyOps" << ops), lsid, txnNum, stmtId, prevOpTime);
 }
 
 OplogEntry IdempotencyTest::commitPrepared(LogicalSessionId lsid,
@@ -509,6 +516,26 @@ OplogEntry IdempotencyTest::abortPrepared(LogicalSessionId lsid,
                                           OpTime prepareOpTime) {
     return makeCommandOplogEntryWithSessionInfoAndStmtId(
         nextOpTime(), nss, BSON("abortTransaction" << 1), lsid, txnNum, stmtId, prepareOpTime);
+}
+
+OplogEntry IdempotencyTest::partialTxn(LogicalSessionId lsid,
+                                       TxnNumber txnNum,
+                                       StmtId stmtId,
+                                       OpTime prevOpTime,
+                                       const BSONArray& ops) {
+    OperationSessionInfo info;
+    info.setSessionId(lsid);
+    info.setTxnNumber(txnNum);
+    return makeOplogEntry(nextOpTime(),
+                          OpTypeEnum::kCommand,
+                          nss.getCommandNS(),
+                          BSON("applyOps" << ops << "partialTxn" << true),
+                          boost::none /* o2 */,
+                          info /* sessionInfo */,
+                          Date_t::min() /* wallClockTime -- required but not checked */,
+                          stmtId,
+                          boost::none /* uuid */,
+                          prevOpTime);
 }
 
 std::string IdempotencyTest::computeDataHash(Collection* collection) {

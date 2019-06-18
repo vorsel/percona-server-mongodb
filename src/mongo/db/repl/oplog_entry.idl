@@ -124,8 +124,7 @@ structs:
             stmtId:
                 cpp_name: statementId
                 type: StmtId
-                optional: true # If txnNumber is missing, this will also be absent, otherwise it
-                               # must exist.
+                optional: true
                 description: "Identifier of the transaction statement which generated this oplog
                               entry"
             prevOpTime:
@@ -143,13 +142,3 @@ structs:
                 optional: true
                 description: "The optime of another oplog entry that contains the document
                               after an update was applied."
-            prepare:
-                type: bool
-                optional: true
-                description: "Specifies that this operation should be put into a 'prepare' state"
-
-            inTxn:
-                type: bool
-                optional: true
-                description: "Specifies that this oplog entry is part of a multi-statement
-                              transaction that has not yet been committed or prepared."

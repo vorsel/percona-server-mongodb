@@ -181,7 +181,7 @@ public:
         ASSERT_EQ(string(transform->getSourceName()), DSChangeStream::kStageName);
 
         // Create mock stage and insert at the front of the stages.
-        auto mock = DocumentSourceMock::create(D(entry));
+        auto mock = DocumentSourceMock::createForTest(D(entry));
         stages.insert(stages.begin(), mock);
 
         // Wire up the stages by setting the source stage.
@@ -232,8 +232,7 @@ public:
      * Helper for running an applyOps through the pipeline, and getting all of the results.
      */
     std::vector<Document> getApplyOpsResults(const Document& applyOpsDoc,
-                                             const LogicalSessionFromClient& lsid,
-                                             bool setPrepareTrue = false) {
+                                             const LogicalSessionFromClient& lsid) {
         BSONObj applyOpsObj = applyOpsDoc.toBson();
 
         // Create an oplog entry and then glue on an lsid and txnNumber
@@ -246,9 +245,6 @@ public:
         BSONObjBuilder builder(baseOplogEntry.toBSON());
         builder.append("lsid", lsid.toBSON());
         builder.append("txnNumber", 0LL);
-        if (setPrepareTrue) {
-            builder.append("prepare", true);
-        }
         BSONObj oplogEntry = builder.done();
 
         // Create the stages and check that the documents produced matched those in the applyOps.
@@ -310,8 +306,7 @@ public:
                                 boost::none,                        // statement id
                                 boost::none,   // optime of previous write within same transaction
                                 boost::none,   // pre-image optime
-                                boost::none,   // post-image optime
-                                boost::none);  // prepare
+                                boost::none);  // post-image optime
     }
 };
 
@@ -471,6 +466,15 @@ TEST_F(ChangeStreamStageTestNoSetup, FailsWithNoReplicationCoordinator) {
                        40573);
 }
 
+TEST_F(ChangeStreamStageTest, ShowMigrationsFailsOnMongos) {
+    auto expCtx = getExpCtx();
+    expCtx->inMongos = true;
+    auto spec = fromjson("{$changeStream: {showMigrationEvents: true}}");
+
+    ASSERT_THROWS_CODE(
+        DSChangeStream::createFromBson(spec.firstElement(), expCtx), AssertionException, 31123);
+}
+
 TEST_F(ChangeStreamStageTest, TransformInsertDocKeyXAndId) {
     auto insert = makeOplogEntry(OpTypeEnum::kInsert,           // op type
                                  nss,                           // namespace
@@ -548,6 +552,28 @@ TEST_F(ChangeStreamStageTest, TransformInsertFromMigrate) {
                                  boost::none);                  // o2
 
     checkTransformation(insert, boost::none);
+}
+
+TEST_F(ChangeStreamStageTest, TransformInsertFromMigrateShowMigrations) {
+    bool fromMigrate = true;
+    auto insert = makeOplogEntry(OpTypeEnum::kInsert,           // op type
+                                 nss,                           // namespace
+                                 BSON("x" << 2 << "_id" << 1),  // o
+                                 testUuid(),                    // uuid
+                                 fromMigrate,                   // fromMigrate
+                                 boost::none);                  // o2
+
+    auto spec = fromjson("{$changeStream: {showMigrationEvents: true}}");
+    Document expectedInsert{
+        {DSChangeStream::kIdField,
+         makeResumeToken(kDefaultTs, testUuid(), BSON("_id" << 1 << "x" << 2))},
+        {DSChangeStream::kOperationTypeField, DSChangeStream::kInsertOpType},
+        {DSChangeStream::kClusterTimeField, kDefaultTs},
+        {DSChangeStream::kFullDocumentField, D{{"x", 2}, {"_id", 1}}},
+        {DSChangeStream::kNamespaceField, D{{"db", nss.db()}, {"coll", nss.coll()}}},
+        {DSChangeStream::kDocumentKeyField, D{{"_id", 1}, {"x", 2}}},  // _id first
+    };
+    checkTransformation(insert, expectedInsert, {{"_id"}, {"x"}}, spec);
 }
 
 TEST_F(ChangeStreamStageTest, TransformUpdateFields) {
@@ -685,6 +711,28 @@ TEST_F(ChangeStreamStageTest, TransformDeleteFromMigrate) {
                                       boost::none);         // o2
 
     checkTransformation(deleteEntry, boost::none);
+}
+
+TEST_F(ChangeStreamStageTest, TransformDeleteFromMigrateShowMigrations) {
+    bool fromMigrate = true;
+    BSONObj o = BSON("_id" << 1);
+    auto deleteEntry = makeOplogEntry(OpTypeEnum::kDelete,  // op type
+                                      nss,                  // namespace
+                                      o,                    // o
+                                      testUuid(),           // uuid
+                                      fromMigrate,          // fromMigrate
+                                      boost::none);         // o2
+
+    auto spec = fromjson("{$changeStream: {showMigrationEvents: true}}");
+    Document expectedDelete{
+        {DSChangeStream::kIdField, makeResumeToken(kDefaultTs, testUuid(), o)},
+        {DSChangeStream::kOperationTypeField, DSChangeStream::kDeleteOpType},
+        {DSChangeStream::kClusterTimeField, kDefaultTs},
+        {DSChangeStream::kNamespaceField, D{{"db", nss.db()}, {"coll", nss.coll()}}},
+        {DSChangeStream::kDocumentKeyField, D{{"_id", 1}}},
+    };
+
+    checkTransformation(deleteEntry, expectedDelete, {}, spec);
 }
 
 TEST_F(ChangeStreamStageTest, TransformDrop) {
@@ -893,15 +941,16 @@ TEST_F(ChangeStreamStageTest, TransformApplyOpsWithEntriesOnDifferentNs) {
 }
 
 TEST_F(ChangeStreamStageTest, PreparedTransactionApplyOpsEntriesAreIgnored) {
-    Document applyOpsDoc = Document{{"applyOps",
-                                     Value{std::vector<Document>{Document{
-                                         {"op", "i"_sd},
-                                         {"ns", nss.ns()},
-                                         {"ui", testUuid()},
-                                         {"o", Value{Document{{"_id", 123}, {"x", "hallo"_sd}}}},
-                                         {"prepare", true}}}}}};
+    Document applyOpsDoc =
+        Document{{"applyOps",
+                  Value{std::vector<Document>{
+                      Document{{"op", "i"_sd},
+                               {"ns", nss.ns()},
+                               {"ui", testUuid()},
+                               {"o", Value{Document{{"_id", 123}, {"x", "hallo"_sd}}}}}}}},
+                 {"prepare", true}};
     LogicalSessionFromClient lsid = testLsid();
-    vector<Document> results = getApplyOpsResults(applyOpsDoc, lsid, true);
+    vector<Document> results = getApplyOpsResults(applyOpsDoc, lsid);
 
     // applyOps entries that are part of a prepared transaction are ignored. These entries will be
     // fetched for changeStreams delivery as part of transaction commit.
@@ -921,16 +970,13 @@ TEST_F(ChangeStreamStageTest, CommitCommandReturnsOperationsFromPreparedTransact
         {"prepare", true},
     };
 
-    auto basePreparedTransaction = makeOplogEntry(OpTypeEnum::kCommand,
-                                                  nss.getCommandNS(),
-                                                  preparedApplyOps.toBson(),
-                                                  testUuid(),
-                                                  boost::none,  // fromMigrate
-                                                  boost::none,  // o2 field
-                                                  kPreparedTransactionOpTime);
-    BSONObjBuilder builder(basePreparedTransaction.toBSON());
-    builder.append("prepare", true);
-    auto preparedTransaction = uassertStatusOK(repl::OplogEntry::parse(builder.done()));
+    auto preparedTransaction = makeOplogEntry(OpTypeEnum::kCommand,
+                                              nss.getCommandNS(),
+                                              preparedApplyOps.toBson(),
+                                              testUuid(),
+                                              boost::none,  // fromMigrate
+                                              boost::none,  // o2 field
+                                              kPreparedTransactionOpTime);
 
     // Create an oplog entry representing the commit for the prepared transaction. The commit has a
     // 'prevWriteOpTimeInTransaction' value that matches the 'preparedApplyOps' entry, which the
@@ -954,8 +1000,7 @@ TEST_F(ChangeStreamStageTest, CommitCommandReturnsOperationsFromPreparedTransact
         boost::none,                      // statement id
         kPreparedTransactionOpTime,       // optime of previous write within same transaction
         boost::none,                      // pre-image optime
-        boost::none,                      // post-image optime
-        boost::none);                     // prepare
+        boost::none);                     // post-image optime
 
     // When the DocumentSourceChangeStreamTransform sees the "commitTransaction" oplog entry, we
     // expect it to return the insert op within our 'preparedApplyOps' oplog entry.
@@ -1629,6 +1674,29 @@ TEST_F(ChangeStreamStageDBTest, TransformDeleteFromMigrate) {
                                       boost::none);         // o2
 
     checkTransformation(deleteEntry, boost::none);
+}
+
+TEST_F(ChangeStreamStageDBTest, TransformDeleteFromMigrateShowMigrations) {
+    bool fromMigrate = true;
+    BSONObj o = BSON("_id" << 1 << "x" << 2);
+    auto deleteEntry = makeOplogEntry(OpTypeEnum::kDelete,  // op type
+                                      nss,                  // namespace
+                                      o,                    // o
+                                      testUuid(),           // uuid
+                                      fromMigrate,          // fromMigrate
+                                      boost::none);         // o2
+
+    // Delete
+    auto spec = fromjson("{$changeStream: {showMigrationEvents: true}}");
+    Document expectedDelete{
+        {DSChangeStream::kIdField, makeResumeToken(kDefaultTs, testUuid(), o)},
+        {DSChangeStream::kOperationTypeField, DSChangeStream::kDeleteOpType},
+        {DSChangeStream::kClusterTimeField, kDefaultTs},
+        {DSChangeStream::kNamespaceField, D{{"db", nss.db()}, {"coll", nss.coll()}}},
+        {DSChangeStream::kDocumentKeyField, D{{"_id", 1}, {"x", 2}}},
+    };
+
+    checkTransformation(deleteEntry, expectedDelete, {}, spec);
 }
 
 TEST_F(ChangeStreamStageDBTest, TransformDrop) {

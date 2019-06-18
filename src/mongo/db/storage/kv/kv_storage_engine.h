@@ -129,9 +129,9 @@ public:
     virtual void setOldestActiveTransactionTimestampCallback(
         StorageEngine::OldestActiveTransactionTimestampCallback) override;
 
-    virtual bool isCacheUnderPressure(OperationContext* opCtx) const override;
+    virtual int64_t getCacheOverflowTableInsertCount(OperationContext* opCtx) const override;
 
-    virtual void setCachePressureForTest(int pressure) override;
+    virtual void setCacheOverflowTableInsertCountForTest(int insertCount) override;
 
     virtual bool supportsRecoverToStableTimestamp() const override;
 
@@ -146,6 +146,8 @@ public:
     virtual Timestamp getAllCommittedTimestamp() const override;
 
     virtual Timestamp getOldestOpenReadTimestamp() const override;
+
+    boost::optional<Timestamp> getOplogNeededForCrashRecovery() const final;
 
     bool supportsReadConcernSnapshot() const final;
 

@@ -65,12 +65,10 @@ OplogEntry createOplogEntryForTransactionTableUpdate(repl::OpTime opTime,
                             {},    // sessionInfo
                             true,  // upsert
                             wallClockTime,
-                            boost::none,  // statementId
-                            boost::none,  // prevWriteOpTime
-                            boost::none,  // preImangeOpTime
-                            boost::none,  // postImageOpTime
-                            boost::none   // prepare
-                            );
+                            boost::none,   // statementId
+                            boost::none,   // prevWriteOpTime
+                            boost::none,   // preImangeOpTime
+                            boost::none);  // postImageOpTime
 }
 
 /**
@@ -117,7 +115,6 @@ bool isTransactionEntry(OplogEntry entry) {
     }
 
     return entry.isPartialTransaction() ||
-        entry.getCommandType() == repl::OplogEntry::CommandType::kPrepareTransaction ||
         entry.getCommandType() == repl::OplogEntry::CommandType::kAbortTransaction ||
         entry.getCommandType() == repl::OplogEntry::CommandType::kCommitTransaction ||
         entry.getCommandType() == repl::OplogEntry::CommandType::kApplyOps;
@@ -143,9 +140,21 @@ boost::optional<std::vector<OplogEntry>> SessionUpdateTracker::updateSession(
     if (!isTransactionEntry(entry)) {
         return _updateOrFlush(entry);
     }
-    auto txnTableUpdate = _createTransactionTableUpdateFromTransactionOp(entry);
-    return (txnTableUpdate) ? boost::optional<std::vector<OplogEntry>>({*txnTableUpdate})
-                            : boost::none;
+
+    // If we generate an update from a multi-statement transaction operation, we must clear (then
+    // replace) a possibly queued transaction table update for a retryable write on this session.
+    // It is okay to clear the transaction table update because retryable writes only care about
+    // the final state of the transaction table entry for a given session, not the full history
+    // of updates for the session. By contrast, we care about each transaction table update for
+    // multi-statement transactions -- we must maintain the timestamps and transaction states for
+    // each entry originating from a multi-statement transaction. For this reason, we cannot defer
+    // entries originating from multi-statement transactions.
+    if (auto txnTableUpdate = _createTransactionTableUpdateFromTransactionOp(entry)) {
+        _sessionsToUpdate.erase(*entry.getOperationSessionInfo().getSessionId());
+        return boost::optional<std::vector<OplogEntry>>({*txnTableUpdate});
+    }
+
+    return boost::none;
 }
 
 void SessionUpdateTracker::_updateSessionInfo(const OplogEntry& entry) {
@@ -249,7 +258,7 @@ boost::optional<OplogEntry> SessionUpdateTracker::_createTransactionTableUpdateF
     const repl::OplogEntry& entry) {
     auto sessionInfo = entry.getOperationSessionInfo();
 
-    // We only update the transaction table on the first inTxn operation.
+    // We only update the transaction table on the first partialTxn operation.
     if (entry.isPartialTransaction() && !entry.getPrevWriteOpTimeInTransaction()->isNull()) {
         return boost::none;
     }
@@ -279,20 +288,16 @@ boost::optional<OplogEntry> SessionUpdateTracker::_createTransactionTableUpdateF
             case repl::OplogEntry::CommandType::kApplyOps:
                 if (entry.shouldPrepare()) {
                     newTxnRecord.setState(DurableTxnStateEnum::kPrepared);
-                    newTxnRecord.setStartOpTime(entry.getOpTime());
+                    if (entry.getPrevWriteOpTimeInTransaction()->isNull()) {
+                        // The prepare oplog entry is the first operation of the transaction.
+                        newTxnRecord.setStartOpTime(entry.getOpTime());
+                    } else {
+                        // Update the transaction record using $set to avoid overwriting the
+                        // startOpTime.
+                        return BSON("$set" << newTxnRecord.toBSON());
+                    }
                 } else {
                     newTxnRecord.setState(DurableTxnStateEnum::kCommitted);
-                }
-                break;
-            case repl::OplogEntry::CommandType::kPrepareTransaction:
-                newTxnRecord.setState(DurableTxnStateEnum::kPrepared);
-                if (entry.getPrevWriteOpTimeInTransaction()->isNull()) {
-                    // The 'prepareTransaction' entry is the first operation of the transaction.
-                    newTxnRecord.setStartOpTime(entry.getOpTime());
-                } else {
-                    // Update the transaction record using $set to avoid overwriting the
-                    // startOpTime.
-                    return BSON("$set" << newTxnRecord.toBSON());
                 }
                 break;
             case repl::OplogEntry::CommandType::kCommitTransaction:

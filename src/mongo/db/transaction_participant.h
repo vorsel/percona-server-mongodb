@@ -61,21 +61,6 @@ namespace mongo {
 class OperationContext;
 
 /**
- * Read timestamp to be used for a speculative transaction.  For transactions with read
- * concern level specified as 'snapshot', we will use 'kAllCommitted' which ensures a snapshot
- * with no 'holes'; that is, it is a state of the system that could be reconstructed from
- * the oplog.  For transactions with read concern level specified as 'local' or 'majority',
- * we will use 'kNoTimestamp' which gives us the most recent snapshot.  This snapshot may
- * reflect oplog 'holes' from writes earlier than the last applied write which have not yet
- * completed.  Using 'kNoTimestamp' ensures that transactions with mode 'local' are always able to
- * read writes from earlier transactions with mode 'local' on the same connection.
- */
-enum class SpeculativeTransactionOpTime {
-    kNoTimestamp,
-    kAllCommitted,
-};
-
-/**
  * Reason a transaction was terminated.
  */
 enum class TerminationCause {
@@ -92,9 +77,6 @@ enum class TerminationCause {
  * the comments below for more information.
  */
 class TransactionParticipant {
-    TransactionParticipant(const TransactionParticipant&) = delete;
-    TransactionParticipant& operator=(const TransactionParticipant&) = delete;
-
     struct PrivateState;
     struct ObservableState;
 
@@ -190,7 +172,14 @@ class TransactionParticipant {
     };
 
 public:
-    static inline MutableObeserverRegistry<int32_t> observeTransactionLifetimeLimitSeconds;
+    static inline MutableObserverRegistry<int32_t> observeTransactionLifetimeLimitSeconds;
+
+    TransactionParticipant();
+
+    TransactionParticipant(const TransactionParticipant&) = delete;
+    TransactionParticipant& operator=(const TransactionParticipant&) = delete;
+
+    ~TransactionParticipant();
 
     /**
      * Holds state for a snapshot read or multi-statement transaction in between network
@@ -360,10 +349,9 @@ public:
         TransactionParticipant* _tp;
     };  // class Observer
 
-
     /**
-     * Class used by a thread that has checked out the TransactionParticipant's session to
-     * observe and modify the transaction participant.
+     * Class used by a thread that has checked out the TransactionParticipant's session to observe
+     * and modify the transaction participant.
      */
     class Participant : public Observer {
     public:
@@ -501,6 +489,11 @@ public:
          * abortActiveTransaction.
          */
         void abortActiveUnpreparedOrStashPreparedTransaction(OperationContext* opCtx);
+
+        /**
+         * Abort the transaction and write an abort oplog entry unconditionally.
+         */
+        void abortTransactionForStepUp(OperationContext* opCtx);
 
         /**
          * Aborts the storage transaction of the prepared transaction on this participant by
@@ -655,10 +648,6 @@ public:
             return p().transactionOperations;
         }
 
-        repl::OpTime getSpeculativeTransactionReadOpTimeForTest() const {
-            return p().speculativeTransactionReadOpTime;
-        }
-
         const Locker* getTxnResourceStashLockerForTest() const {
             invariant(o().txnResourceStash);
             return o().txnResourceStash->locker();
@@ -697,17 +686,12 @@ public:
                                           std::vector<StmtId> stmtIdsWritten,
                                           const repl::OpTime& lastStmtIdWriteTs);
 
-        // Called for speculative transactions to fix the optime of the snapshot to read from.
-        void _setSpeculativeTransactionOpTime(OperationContext* opCtx,
-                                              SpeculativeTransactionOpTime opTimeChoice);
-
-
-        // Like _setSpeculativeTransactionOpTime, but caller chooses timestamp of snapshot
-        // explicitly.
-        // It is up to the caller to ensure that Timestamp is greater than or equal to the
-        // all-committed optime before calling this method (e.g. by calling
+        // Chooses a snapshot from which a new transaction will read by beginning a storage
+        // transaction. This is chosen based on the read concern arguments. If an atClusterTime is
+        // provided, it is up to the caller to ensure that timestamp is greater than or equal to the
+        // all-committed timestamp before calling this method (e.g. by calling
         // ReplCoordinator::waitForOpTimeForRead).
-        void _setSpeculativeTransactionReadTimestamp(OperationContext* opCtx, Timestamp timestamp);
+        void _setReadSnapshot(OperationContext* opCtx, repl::ReadConcernArgs readConcernArgs);
 
         // Finishes committing the multi-document transaction after the storage-transaction has been
         // committed, the oplog entry has been inserted into the oplog, and the transactions table
@@ -724,8 +708,10 @@ public:
 
         // Abort the transaction if it's in one of the expected states and clean up the transaction
         // states associated with the opCtx.
+        // If 'writeOplog' is true, logs an 'abortTransaction' oplog entry if writes are replicated.
         void _abortActiveTransaction(OperationContext* opCtx,
-                                     TransactionState::StateSet expectedStates);
+                                     TransactionState::StateSet expectedStates,
+                                     bool writeOplog);
 
         // Releases stashed transaction resources to abort the transaction on the session.
         void _abortTransactionOnSession(OperationContext* opCtx);
@@ -778,9 +764,6 @@ public:
         // invalidating a transaction, or starting a new transaction.
         void _resetTransactionState(WithLock wl, TransactionState::StateFlag state);
 
-        // Helper that updates ServerTransactionsMetrics once a transaction commits.
-        void _updateTxnMetricsOnCommit(OperationContext* opCtx, bool isCommittingWithPrepare);
-
         // Releases the resources held in *o().txnResources to the operation context.
         // o().txnResources must be engaged prior to calling this.
         void _releaseTransactionResourcesToOpCtx(OperationContext* opCtx);
@@ -809,7 +792,6 @@ public:
         return Observer(osession);
     }
 
-
     /**
      * Returns the timestamp of the oldest oplog entry written across all open transactions, at the
      * time of the stable timestamp. Returns boost::none if there are no active transactions, or an
@@ -823,9 +805,6 @@ public:
      * want to await a write concern.
      */
     static void performNoopWrite(OperationContext* opCtx, StringData msg);
-
-    TransactionParticipant() = default;
-    ~TransactionParticipant() = default;
 
 private:
     /**
@@ -909,30 +888,29 @@ private:
 
     /**
      * State in this struct may be read and written by methods of the Participant, only. It may
-     * access the struct via the private p() accessor. No further locking is required in methods
-     * of the Participant.
+     * access the struct via the private p() accessor. No further locking is required in methods of
+     * the Participant.
      */
     struct PrivateState {
+        // Specifies whether the session information needs to be refreshed from storage
+        bool isValid{false};
+
         // Only set if the server is shutting down and it has been ensured that no new requests will
         // be accepted. Ensures that any transaction resources will not be stashed from the
         // operation context onto the transaction participant when the session is checked-in so that
         // locks can automatically get freed.
-        bool inShutdown = false;
+        bool inShutdown{false};
 
         // Holds oplog data for operations which have been applied in the current multi-document
         // transaction.
         std::vector<repl::ReplOperation> transactionOperations;
 
         // Total size in bytes of all operations within the _transactionOperations vector.
-        size_t transactionOperationBytes = 0;
+        size_t transactionOperationBytes{0};
 
         // The autocommit setting of this transaction. Should always be false for multi-statement
         // transaction. Currently only needed for diagnostics reporting.
         boost::optional<bool> autoCommit;
-
-        // The OpTime a speculative transaction is reading from and also the earliest opTime it
-        // should wait for write concern for on commit.
-        repl::OpTime speculativeTransactionReadOpTime;
 
         // Contains uncommitted multi-key path info entries which were modified under this
         // transaction so they can be applied to subsequent opreations before the transaction
@@ -942,9 +920,6 @@ private:
         //
         // Retryable writes state
         //
-
-        // Specifies whether the session information needs to be refreshed from storage
-        bool isValid{false};
 
         // Set to true if incomplete history is detected. For example, when the oplog to a write was
         // truncated because it was too old.

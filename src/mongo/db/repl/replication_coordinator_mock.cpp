@@ -109,8 +109,11 @@ std::vector<MemberData> ReplicationCoordinatorMock::getMemberData() const {
 }
 
 bool ReplicationCoordinatorMock::canAcceptNonLocalWrites() const {
-    MONGO_UNREACHABLE;
-    return false;
+    return _canAcceptNonLocalWrites;
+}
+
+void ReplicationCoordinatorMock::setCanAcceptNonLocalWrites(bool canAcceptNonLocalWrites) {
+    _canAcceptNonLocalWrites = canAcceptNonLocalWrites;
 }
 
 Status ReplicationCoordinatorMock::waitForMemberState(MemberState expectedState,
@@ -340,7 +343,8 @@ Status ReplicationCoordinatorMock::processReplSetGetStatus(BSONObjBuilder*,
     return Status::OK();
 }
 
-void ReplicationCoordinatorMock::fillIsMasterForReplSet(IsMasterResponse* result) {
+void ReplicationCoordinatorMock::fillIsMasterForReplSet(IsMasterResponse* result,
+                                                        const SplitHorizon::Parameters&) {
     result->setReplSetVersion(_getConfigReturnValue.getConfigVersion());
     result->setIsMaster(true);
     result->setIsSecondary(false);

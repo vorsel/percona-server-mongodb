@@ -2346,7 +2346,8 @@ public:
                 HostTypeRequirement::kMongoS,
                 DiskUseRequirement::kNoDiskUse,
                 FacetRequirement::kNotAllowed,
-                TransactionRequirement::kAllowed};
+                TransactionRequirement::kAllowed,
+                LookupRequirement::kNotAllowed};
     }
 
     static boost::intrusive_ptr<DocumentSourceMustRunOnMongoS> create() {
@@ -2417,7 +2418,7 @@ DEATH_TEST_F(PipelineMustRunOnMongoSTest,
 
 /**
  * For the purpsoses of this test, assume every collection is unsharded. Stages may ask this during
- * setup. For example, to compute its constraints, the $out stage needs to know if the output
+ * setup. For example, to compute its constraints, the $merge stage needs to know if the output
  * collection is sharded.
  */
 class FakeMongoProcessInterface : public StubMongoProcessInterface {
@@ -2530,7 +2531,8 @@ public:
                                      HostTypeRequirement::kNone,
                                      DiskUseRequirement::kNoDiskUse,
                                      FacetRequirement::kNotAllowed,
-                                     TransactionRequirement::kAllowed);
+                                     TransactionRequirement::kAllowed,
+                                     LookupRequirement::kAllowed);
         constraints.isIndependentOfAnyCollection = true;
         constraints.requiresInputDocSource = false;
         return constraints;
@@ -2625,7 +2627,8 @@ public:
                                 HostTypeRequirement::kNone,
                                 DiskUseRequirement::kNoDiskUse,
                                 FacetRequirement::kAllowed,
-                                TransactionRequirement::kNotAllowed};
+                                TransactionRequirement::kNotAllowed,
+                                LookupRequirement::kAllowed};
     }
 
     static boost::intrusive_ptr<DocumentSourceDisallowedInTransactions> create() {
@@ -2697,7 +2700,8 @@ public:
                 HostTypeRequirement::kNone,
                 DiskUseRequirement::kNoDiskUse,
                 FacetRequirement::kAllowed,
-                TransactionRequirement::kAllowed};
+                TransactionRequirement::kAllowed,
+                LookupRequirement::kAllowed};
     }
 };
 
@@ -2863,7 +2867,8 @@ TEST_F(PipelineDependenciesTest, ShouldNotRequireTextScoreIfAvailableButDefinite
 namespace {
 TEST(PipelineRenameTracking, ReportsIdentityMapWhenEmpty) {
     boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
-    auto pipeline = unittest::assertGet(Pipeline::create({DocumentSourceMock::create()}, expCtx));
+    auto pipeline =
+        unittest::assertGet(Pipeline::create({DocumentSourceMock::createForTest()}, expCtx));
     auto renames = pipeline->renamedPaths({"a", "b", "c.d"});
     ASSERT(static_cast<bool>(renames));
     auto nameMap = *renames;
@@ -2891,8 +2896,8 @@ public:
 TEST(PipelineRenameTracking, ReportsIdentityWhenNoStageModifiesAnything) {
     boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
     {
-        auto pipeline = unittest::assertGet(
-            Pipeline::create({DocumentSourceMock::create(), NoModifications::create()}, expCtx));
+        auto pipeline = unittest::assertGet(Pipeline::create(
+            {DocumentSourceMock::createForTest(), NoModifications::create()}, expCtx));
         auto renames = pipeline->renamedPaths({"a", "b", "c.d"});
         ASSERT(static_cast<bool>(renames));
         auto nameMap = *renames;
@@ -2902,7 +2907,7 @@ TEST(PipelineRenameTracking, ReportsIdentityWhenNoStageModifiesAnything) {
         ASSERT_EQ(nameMap["c.d"], "c.d");
     }
     {
-        auto pipeline = unittest::assertGet(Pipeline::create({DocumentSourceMock::create(),
+        auto pipeline = unittest::assertGet(Pipeline::create({DocumentSourceMock::createForTest(),
                                                               NoModifications::create(),
                                                               NoModifications::create(),
                                                               NoModifications::create()},
@@ -2934,7 +2939,7 @@ public:
 
 TEST(PipelineRenameTracking, DoesNotReportRenamesIfAStageDoesNotSupportTrackingThem) {
     boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
-    auto pipeline = unittest::assertGet(Pipeline::create({DocumentSourceMock::create(),
+    auto pipeline = unittest::assertGet(Pipeline::create({DocumentSourceMock::createForTest(),
                                                           NoModifications::create(),
                                                           NotSupported::create(),
                                                           NoModifications::create()},
@@ -2958,7 +2963,7 @@ public:
 TEST(PipelineRenameTracking, ReportsNewNamesWhenSingleStageRenames) {
     boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
     auto pipeline = unittest::assertGet(
-        Pipeline::create({DocumentSourceMock::create(), RenamesAToB::create()}, expCtx));
+        Pipeline::create({DocumentSourceMock::createForTest(), RenamesAToB::create()}, expCtx));
     {
         auto renames = pipeline->renamedPaths({"b"});
         ASSERT(static_cast<bool>(renames));
@@ -2989,7 +2994,7 @@ TEST(PipelineRenameTracking, ReportsNewNamesWhenSingleStageRenames) {
 TEST(PipelineRenameTracking, ReportsIdentityMapWhenGivenEmptyIteratorRange) {
     boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
     auto pipeline = unittest::assertGet(
-        Pipeline::create({DocumentSourceMock::create(), RenamesAToB::create()}, expCtx));
+        Pipeline::create({DocumentSourceMock::createForTest(), RenamesAToB::create()}, expCtx));
     {
         auto renames = Pipeline::renamedPaths(
             pipeline->getSources().rbegin(), pipeline->getSources().rbegin(), {"b"});
@@ -3023,7 +3028,8 @@ public:
 TEST(PipelineRenameTracking, ReportsNewNameAcrossMultipleRenames) {
     boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
     auto pipeline = unittest::assertGet(Pipeline::create(
-        {DocumentSourceMock::create(), RenamesAToB::create(), RenamesBToC::create()}, expCtx));
+        {DocumentSourceMock::createForTest(), RenamesAToB::create(), RenamesBToC::create()},
+        expCtx));
     auto renames = pipeline->renamedPaths({"c"});
     ASSERT(static_cast<bool>(renames));
     auto nameMap = *renames;
@@ -3045,7 +3051,8 @@ public:
 TEST(PipelineRenameTracking, CanHandleBackAndForthRename) {
     boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
     auto pipeline = unittest::assertGet(Pipeline::create(
-        {DocumentSourceMock::create(), RenamesAToB::create(), RenamesBToA::create()}, expCtx));
+        {DocumentSourceMock::createForTest(), RenamesAToB::create(), RenamesBToA::create()},
+        expCtx));
     auto renames = pipeline->renamedPaths({"a"});
     ASSERT(static_cast<bool>(renames));
     auto nameMap = *renames;
@@ -3056,7 +3063,7 @@ TEST(PipelineRenameTracking, CanHandleBackAndForthRename) {
 TEST(InvolvedNamespacesTest, NoInvolvedNamespacesForMatchSortProject) {
     boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
     auto pipeline = unittest::assertGet(
-        Pipeline::create({DocumentSourceMock::create(),
+        Pipeline::create({DocumentSourceMock::createForTest(),
                           DocumentSourceMatch::create(BSON("x" << 1), expCtx),
                           DocumentSourceSort::create(expCtx, BSON("y" << -1)),
                           DocumentSourceProject::create(BSON("x" << 1 << "y" << 1), expCtx)},
@@ -3073,7 +3080,7 @@ TEST(InvolvedNamespacesTest, IncludesLookupNamespace) {
     auto lookupSpec =
         fromjson("{$lookup: {from: 'foo', as: 'x', localField: 'foo_id', foreignField: '_id'}}");
     auto pipeline = unittest::assertGet(
-        Pipeline::create({DocumentSourceMock::create(),
+        Pipeline::create({DocumentSourceMock::createForTest(),
                           DocumentSourceLookUp::createFromBson(lookupSpec.firstElement(), expCtx)},
                          expCtx));
 
@@ -3096,7 +3103,7 @@ TEST(InvolvedNamespacesTest, IncludesGraphLookupNamespace) {
         "  startWith: '$start'"
         "}}");
     auto pipeline = unittest::assertGet(Pipeline::create(
-        {DocumentSourceMock::create(),
+        {DocumentSourceMock::createForTest(),
          DocumentSourceGraphLookUp::createFromBson(graphLookupSpec.firstElement(), expCtx)},
         expCtx));
 
@@ -3120,7 +3127,7 @@ TEST(InvolvedNamespacesTest, IncludesLookupSubpipelineNamespaces) {
         "  pipeline: [{$lookup: {from: 'foo_inner', as: 'y', pipeline: []}}]"
         "}}");
     auto pipeline = unittest::assertGet(
-        Pipeline::create({DocumentSourceMock::create(),
+        Pipeline::create({DocumentSourceMock::createForTest(),
                           DocumentSourceLookUp::createFromBson(lookupSpec.firstElement(), expCtx)},
                          expCtx));
 
@@ -3151,7 +3158,7 @@ TEST(InvolvedNamespacesTest, IncludesGraphLookupSubPipeline) {
         "  startWith: '$start'"
         "}}");
     auto pipeline = unittest::assertGet(Pipeline::create(
-        {DocumentSourceMock::create(),
+        {DocumentSourceMock::createForTest(),
          DocumentSourceGraphLookUp::createFromBson(graphLookupSpec.firstElement(), expCtx)},
         expCtx));
 
@@ -3194,7 +3201,7 @@ TEST(InvolvedNamespacesTest, IncludesAllCollectionsWhenResolvingViews) {
         "  ]"
         "}}");
     auto pipeline = unittest::assertGet(
-        Pipeline::create({DocumentSourceMock::create(),
+        Pipeline::create({DocumentSourceMock::createForTest(),
                           DocumentSourceFacet::createFromBson(facetSpec.firstElement(), expCtx)},
                          expCtx));
 

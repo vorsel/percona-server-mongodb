@@ -2517,6 +2517,10 @@ intrusive_ptr<Expression> ExpressionMeta::parse(
         return new ExpressionMeta(expCtx, MetaType::TEXT_SCORE);
     } else if (expr.valueStringData() == "randVal") {
         return new ExpressionMeta(expCtx, MetaType::RAND_VAL);
+    } else if (expr.valueStringData() == "searchScore") {
+        return new ExpressionMeta(expCtx, MetaType::SEARCH_SCORE);
+    } else if (expr.valueStringData() == "searchHighlights") {
+        return new ExpressionMeta(expCtx, MetaType::SEARCH_HIGHLIGHTS);
     } else {
         uasserted(17308, "Unsupported argument to $meta: " + expr.String());
     }
@@ -2534,6 +2538,12 @@ Value ExpressionMeta::serialize(bool explain) const {
         case MetaType::RAND_VAL:
             return Value(DOC("$meta"
                              << "randVal"_sd));
+        case MetaType::SEARCH_SCORE:
+            return Value(DOC("$meta"
+                             << "searchScore"_sd));
+        case MetaType::SEARCH_HIGHLIGHTS:
+            return Value(DOC("$meta"
+                             << "searchHighlights"_sd));
     }
     MONGO_UNREACHABLE;
 }
@@ -2544,6 +2554,10 @@ Value ExpressionMeta::evaluate(const Document& root) const {
             return root.hasTextScore() ? Value(root.getTextScore()) : Value();
         case MetaType::RAND_VAL:
             return root.hasRandMetaField() ? Value(root.getRandMetaField()) : Value();
+        case MetaType::SEARCH_SCORE:
+            return root.hasSearchScore() ? Value(root.getSearchScore()) : Value();
+        case MetaType::SEARCH_HIGHLIGHTS:
+            return root.hasSearchHighlights() ? Value(root.getSearchHighlights()) : Value();
     }
     MONGO_UNREACHABLE;
 }
@@ -2551,6 +2565,9 @@ Value ExpressionMeta::evaluate(const Document& root) const {
 void ExpressionMeta::_doAddDependencies(DepsTracker* deps) const {
     if (_metaType == MetaType::TEXT_SCORE) {
         deps->setNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE, true);
+
+        // We do not add the dependencies for SEARCH_SCORE or SEARCH_HIGHLIGHTS because those values
+        // are not stored in the collection (or in mongod at all).
     }
 }
 
@@ -4907,7 +4924,10 @@ Value ExpressionRound::evaluate(const Document& root) const {
         root, _children, getOpName(), Decimal128::kRoundTiesToEven, &std::round);
 }
 
-REGISTER_EXPRESSION(round, ExpressionRound::parse);
+REGISTER_EXPRESSION_WITH_MIN_VERSION(
+    round,
+    ExpressionRound::parse,
+    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
 const char* ExpressionRound::getOpName() const {
     return "$round";
 }
@@ -4915,6 +4935,30 @@ const char* ExpressionRound::getOpName() const {
 Value ExpressionTrunc::evaluate(const Document& root) const {
     return evaluateRoundOrTrunc(
         root, _children, getOpName(), Decimal128::kRoundTowardZero, &std::trunc);
+}
+
+intrusive_ptr<Expression> ExpressionTrunc::parse(const intrusive_ptr<ExpressionContext>& expCtx,
+                                                 BSONElement elem,
+                                                 const VariablesParseState& vps) {
+    // In version 4.2 we added new arguments. In all previous versions the expression existed but
+    // only supported a single argument.
+    const bool newArgumentsAllowed =
+        (!expCtx->maxFeatureCompatibilityVersion ||
+         (*expCtx->maxFeatureCompatibilityVersion >=
+          ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42));
+    uassert(
+        ErrorCodes::QueryFeatureNotAllowed,
+        // TODO SERVER-31968 we would like to include the current version and the required minimum
+        // version in this error message, but using FeatureCompatibilityVersion::toString() would
+        // introduce a dependency cycle.
+        str::stream()
+            << elem.fieldNameStringData()
+            << " with >1 argument is not allowed in the current feature compatibility version. See "
+            << feature_compatibility_version_documentation::kCompatibilityLink
+            << " for more information.",
+        // Allow non-arrays since they will be rejected anyway by the parser below.
+        elem.type() != BSONType::Array || elem.Array().size() <= 1 || newArgumentsAllowed);
+    return ExpressionRangedArity<ExpressionTrunc, 1, 2>::parse(expCtx, elem, vps);
 }
 
 REGISTER_EXPRESSION(trunc, ExpressionTrunc::parse);
@@ -5998,7 +6042,10 @@ void ExpressionRegex::_doAddDependencies(DepsTracker* deps) const {
 
 /* -------------------------- ExpressionRegexFind ------------------------------ */
 
-REGISTER_EXPRESSION(regexFind, ExpressionRegexFind::parse);
+REGISTER_EXPRESSION_WITH_MIN_VERSION(
+    regexFind,
+    ExpressionRegexFind::parse,
+    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
 boost::intrusive_ptr<Expression> ExpressionRegexFind::parse(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     BSONElement expr,
@@ -6019,7 +6066,10 @@ Value ExpressionRegexFind::evaluate(const Document& root) const {
 
 /* -------------------------- ExpressionRegexFindAll ------------------------------ */
 
-REGISTER_EXPRESSION(regexFindAll, ExpressionRegexFindAll::parse);
+REGISTER_EXPRESSION_WITH_MIN_VERSION(
+    regexFindAll,
+    ExpressionRegexFindAll::parse,
+    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
 boost::intrusive_ptr<Expression> ExpressionRegexFindAll::parse(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     BSONElement expr,
@@ -6080,7 +6130,10 @@ Value ExpressionRegexFindAll::evaluate(const Document& root) const {
 
 /* -------------------------- ExpressionRegexMatch ------------------------------ */
 
-REGISTER_EXPRESSION(regexMatch, ExpressionRegexMatch::parse);
+REGISTER_EXPRESSION_WITH_MIN_VERSION(
+    regexMatch,
+    ExpressionRegexMatch::parse,
+    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
 boost::intrusive_ptr<Expression> ExpressionRegexMatch::parse(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     BSONElement expr,
