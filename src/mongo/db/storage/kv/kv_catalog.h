@@ -44,47 +44,38 @@ namespace mongo {
 
 class OperationContext;
 class RecordStore;
+class KVStorageEngineInterface;
 
 class KVCatalog {
 public:
     class FeatureTracker;
 
     /**
-     * @param rs - does NOT take ownership. The RecordStore must be thread-safe, in particular
-     * with concurrent calls to RecordStore::find, updateRecord, insertRecord, deleteRecord and
-     * dataFor. The KVCatalog does not utilize Cursors and those methods may omit further
-     * protection.
+     * The RecordStore must be thread-safe, in particular with concurrent calls to
+     * RecordStore::find, updateRecord, insertRecord, deleteRecord and dataFor. The KVCatalog does
+     * not utilize Cursors and those methods may omit further protection.
      */
-    KVCatalog(RecordStore* rs, bool directoryPerDb, bool directoryForIndexes);
+    KVCatalog(RecordStore* rs,
+              bool directoryPerDb,
+              bool directoryForIndexes,
+              KVStorageEngineInterface* engine);
     ~KVCatalog();
 
     void init(OperationContext* opCtx);
 
-    void getAllCollections(std::vector<std::string>* out) const;
+    std::vector<NamespaceString> getAllCollections() const;
 
-    /**
-     * @return error or ident for instance
-     */
-    Status newCollection(OperationContext* opCtx,
-                         const NamespaceString& ns,
-                         const CollectionOptions& options,
-                         KVPrefix prefix);
+    std::string getCollectionIdent(const NamespaceString& nss) const;
 
-    std::string getCollectionIdent(StringData ns) const;
+    std::string getIndexIdent(OperationContext* opCtx,
+                              const NamespaceString& nss,
+                              StringData idName) const;
 
-    std::string getIndexIdent(OperationContext* opCtx, StringData ns, StringData idName) const;
-
-    BSONCollectionCatalogEntry::MetaData getMetaData(OperationContext* opCtx, StringData ns) const;
+    BSONCollectionCatalogEntry::MetaData getMetaData(OperationContext* opCtx,
+                                                     const NamespaceString& nss) const;
     void putMetaData(OperationContext* opCtx,
-                     StringData ns,
+                     const NamespaceString& nss,
                      BSONCollectionCatalogEntry::MetaData& md);
-
-    Status renameCollection(OperationContext* opCtx,
-                            StringData fromNS,
-                            StringData toNS,
-                            bool stayTemp);
-
-    Status dropCollection(OperationContext* opCtx, StringData ns);
 
     std::vector<std::string> getAllIdentsForDB(StringData db) const;
     std::vector<std::string> getAllIdents(OperationContext* opCtx) const;
@@ -119,18 +110,50 @@ public:
      */
     std::string newInternalIdent();
 
+    void initCollection(OperationContext* opCtx, const NamespaceString& nss, bool forRepair);
+
+    void reinitCollectionAfterRepair(OperationContext* opCtx, const NamespaceString& nss);
+
+    Status createCollection(OperationContext* opCtx,
+                            const NamespaceString& nss,
+                            const CollectionOptions& options,
+                            bool allocateDefaultSpace);
+
+    Status renameCollection(OperationContext* opCtx,
+                            const NamespaceString& fromNss,
+                            const NamespaceString& toNss,
+                            bool stayTemp);
+
+    Status dropCollection(OperationContext* opCtx, const NamespaceString& nss);
+
 private:
     class AddIdentChange;
     class RemoveIdentChange;
+    class FinishDropCatalogEntryChange;
 
-    BSONObj _findEntry(OperationContext* opCtx, StringData ns, RecordId* out = NULL) const;
+    friend class KVStorageEngine;
+    friend class KVCatalogTest;
+    friend class KVStorageEngineTest;
+
+    BSONObj _findEntry(OperationContext* opCtx,
+                       const NamespaceString& nss,
+                       RecordId* out = nullptr) const;
+    Status _addEntry(OperationContext* opCtx,
+                     const NamespaceString& nss,
+                     const CollectionOptions& options,
+                     KVPrefix prefix);
+    Status _replaceEntry(OperationContext* opCtx,
+                         const NamespaceString& fromNss,
+                         const NamespaceString& toNss,
+                         bool stayTemp);
+    Status _removeEntry(OperationContext* opCtx, const NamespaceString& nss);
 
     /**
      * Generates a new unique identifier for a new "thing".
-     * @param ns - the containing ns
+     * @param nss - the containing namespace
      * @param kind - what this "thing" is, likely collection or index
      */
-    std::string _newUniqueIdent(StringData ns, const char* kind);
+    std::string _newUniqueIdent(const NamespaceString& nss, const char* kind);
 
     // Helpers only used by constructor and init(). Don't call from elsewhere.
     static std::string _newRand();
@@ -157,5 +180,7 @@ private:
     // Manages the feature document that may be present in the KVCatalog. '_featureTracker' is
     // guaranteed to be non-null after KVCatalog::init() is called.
     std::unique_ptr<FeatureTracker> _featureTracker;
+
+    KVStorageEngineInterface* const _engine;
 };
 }

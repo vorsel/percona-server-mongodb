@@ -32,9 +32,9 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/health_log.h"
-#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/command_generic_argument.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/test_commands_enabled.h"
@@ -344,8 +344,8 @@ private:
         if (!uuid) {
             return false;
         }
-        auto prev = UUIDCatalog::get(opCtx).prev(_dbName, *uuid);
-        auto next = UUIDCatalog::get(opCtx).next(_dbName, *uuid);
+
+        auto[prev, next] = getPrevAndNextUUIDs(opCtx, collection);
 
         // Find and report collection metadata.
         auto indices = collectionIndexInfo(opCtx, collection);

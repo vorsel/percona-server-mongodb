@@ -31,11 +31,13 @@
 #include "mongo/util/regex_util.h"
 
 #include "mongo/base/error_codes.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace regex_util {
-pcrecpp::RE_Options flags2PcreOptions(StringData optionFlags, bool ignoreInvalidFlags) {
+pcrecpp::RE_Options flagsToPcreOptions(StringData optionFlags,
+                                       bool ignoreInvalidFlags,
+                                       StringData opName) {
     pcrecpp::RE_Options opt;
     opt.set_utf8(true);
     for (auto flag : optionFlags) {
@@ -54,7 +56,9 @@ pcrecpp::RE_Options flags2PcreOptions(StringData optionFlags, bool ignoreInvalid
                 continue;
             default:
                 if (!ignoreInvalidFlags) {
-                    uasserted(51108, str::stream() << "Invalid flag: " << flag);
+                    uasserted(
+                        51108,
+                        str::stream() << opName << " invalid flag in regex options: " << flag);
                 }
         }
     }

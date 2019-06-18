@@ -38,11 +38,10 @@
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/storage/temporary_record_store.h"
 #include "mongo/util/functional.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
-class DatabaseCatalogEntry;
 class JournalListener;
 class OperationContext;
 class RecoveryUnit;
@@ -171,19 +170,8 @@ public:
 
     /**
      * List the databases stored in this storage engine.
-     *
-     * XXX: why doesn't this take OpCtx?
      */
-    virtual void listDatabases(std::vector<std::string>* out) const = 0;
-
-    /**
-     * Return the DatabaseCatalogEntry that describes the database indicated by 'db'.
-     *
-     * StorageEngine owns returned pointer.
-     * It should not be deleted by any caller.
-     */
-    virtual DatabaseCatalogEntry* getDatabaseCatalogEntry(OperationContext* opCtx,
-                                                          StringData db) = 0;
+    virtual std::vector<std::string> listDatabases() const = 0;
 
     /**
      * Returns whether the storage engine supports its own locking locking below the collection
@@ -298,7 +286,7 @@ public:
      * Generally, this method should not be called directly except by the repairDatabase()
      * free function.
      */
-    virtual Status repairRecordStore(OperationContext* opCtx, const std::string& ns) = 0;
+    virtual Status repairRecordStore(OperationContext* opCtx, const NamespaceString& nss) = 0;
 
     /**
      * Creates a temporary RecordStore on the storage engine. This record store will drop itself
@@ -519,6 +507,22 @@ public:
      * Returns the path to the directory which has the data files of database with `dbName`.
      */
     virtual std::string getFilesystemPathForDb(const std::string& dbName) const = 0;
+
+    /**
+     * Returns whethers the data files are compatible with the current code:
+     *
+     *   - Status::OK() if the data files are compatible with the current code.
+     *
+     *   - ErrorCodes::CanRepairToDowngrade if the data files are incompatible with the current
+     *     code, but a --repair would make them compatible. For example, when rebuilding all indexes
+     *     in the data files would resolve the incompatibility.
+     *
+     *   - ErrorCodes::MustUpgrade if the data files are incompatible with the current code and a
+     *     newer version is required to start up.
+     */
+    virtual Status currentFilesCompatible(OperationContext* opCtx) const = 0;
+
+    virtual int64_t sizeOnDiskForDb(OperationContext* opCtx, StringData dbName) = 0;
 };
 
 }  // namespace mongo

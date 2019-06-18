@@ -55,7 +55,7 @@
 #include "mongo/util/fail_point.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 #define TRACING_ENABLED 0
 
@@ -1087,6 +1087,9 @@ protected:
                 log() << "WTIndex::updatePosition -- the new key ( "
                       << redact(toHex(item.data, item.size)) << ") is less than the previous key ("
                       << redact(_key.toString()) << "), which is a bug.";
+
+                // Crash when test commands are enabled.
+                invariant(!getTestCommandsEnabled());
 
                 // Force a retry of the operation from our last known position by acting as-if
                 // we received a WT_ROLLBACK error.

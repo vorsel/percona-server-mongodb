@@ -39,6 +39,8 @@
 #include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/s/sharding_state.h"
+#include "mongo/db/s/transaction_coordinator_service.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/transaction_participant.h"
 #include "mongo/util/log.h"
@@ -50,6 +52,7 @@ MONGO_FAIL_POINT_DEFINE(participantReturnNetworkErrorForAbortAfterExecutingAbort
 MONGO_FAIL_POINT_DEFINE(participantReturnNetworkErrorForCommitAfterExecutingCommitLogic);
 MONGO_FAIL_POINT_DEFINE(hangBeforeCommitingTxn);
 MONGO_FAIL_POINT_DEFINE(hangBeforeAbortingTxn);
+MONGO_FAIL_POINT_DEFINE(skipCommitTxnCheckPrepareMajorityCommitted);
 
 class CmdCommitTxn : public BasicCommand {
 public:
@@ -121,13 +124,21 @@ public:
                     "commitTransaction for a prepared transaction cannot be run before its prepare "
                     "oplog entry has been majority committed",
                     replCoord->getLastCommittedOpTime().getTimestamp() >=
-                        txnParticipant.getPrepareOpTime().getTimestamp());
+                            txnParticipant.getPrepareOpTime().getTimestamp() ||
+                        MONGO_FAIL_POINT(skipCommitTxnCheckPrepareMajorityCommitted));
             // commitPreparedTransaction will throw if the transaction is not prepared.
             txnParticipant.commitPreparedTransaction(opCtx, optionalCommitTimestamp.get(), {});
         } else {
+            if (ShardingState::get(opCtx)->canAcceptShardedCommands().isOK() ||
+                serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+                TransactionCoordinatorService::get(opCtx)->cancelIfCommitNotYetStarted(
+                    opCtx, *opCtx->getLogicalSessionId(), *opCtx->getTxnNumber());
+            }
+
             // commitUnpreparedTransaction will throw if the transaction is prepared.
             txnParticipant.commitUnpreparedTransaction(opCtx);
         }
+
         if (MONGO_FAIL_POINT(participantReturnNetworkErrorForCommitAfterExecutingCommitLogic)) {
             uasserted(ErrorCodes::HostUnreachable,
                       "returning network error because failpoint is on");

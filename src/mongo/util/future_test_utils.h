@@ -41,6 +41,72 @@
 
 namespace mongo {
 
+enum DoExecutorFuture : bool {
+    // Force exemptions to say *why* they shouldn't test ExecutorFuture to ensure that if the
+    // reason stops applying (eg, if we implement ExecutorFuture::tap()) we can delete the enum
+    // value and recover the test coverage.
+    kNoExecutorFuture_needsTap = false,
+    kNoExecutorFuture_needsPromiseSetFrom = false,
+    kDoExecutorFuture = true,
+};
+
+class InlineCountingExecutor final : public OutOfLineExecutor {
+public:
+    void schedule(Task task) noexcept override {
+        // Relaxed to avoid adding synchronization where there otherwise wouldn't be. That would
+        // cause a false negative from TSAN.
+        tasksRun.fetch_add(1, std::memory_order_relaxed);
+        task(Status::OK());
+    }
+
+    static auto make() {
+        return std::make_shared<InlineCountingExecutor>();
+    }
+
+    std::atomic<int32_t> tasksRun{0};  // NOLINT
+};
+
+class RejectingExecutor final : public OutOfLineExecutor {
+public:
+    void schedule(Task task) noexcept override {
+        task(Status(ErrorCodes::ShutdownInProgress, ""));
+    }
+
+    static auto make() {
+        return std::make_shared<RejectingExecutor>();
+    }
+};
+
+class DummyInterruptable final : public Interruptible {
+    StatusWith<stdx::cv_status> waitForConditionOrInterruptNoAssertUntil(
+        stdx::condition_variable& cv,
+        stdx::unique_lock<stdx::mutex>& m,
+        Date_t deadline) noexcept override {
+        return Status(ErrorCodes::Interrupted, "");
+    }
+    Date_t getDeadline() const override {
+        MONGO_UNREACHABLE;
+    }
+    Status checkForInterruptNoAssert() noexcept override {
+        MONGO_UNREACHABLE;
+    }
+    IgnoreInterruptsState pushIgnoreInterrupts() override {
+        MONGO_UNREACHABLE;
+    }
+    void popIgnoreInterrupts(IgnoreInterruptsState iis) override {
+        MONGO_UNREACHABLE;
+    }
+    DeadlineState pushArtificialDeadline(Date_t deadline, ErrorCodes::Error error) override {
+        MONGO_UNREACHABLE;
+    }
+    void popArtificialDeadline(DeadlineState) override {
+        MONGO_UNREACHABLE;
+    }
+    Date_t getExpirationDateForWaitForValue(Milliseconds waitFor) override {
+        MONGO_UNREACHABLE;
+    }
+};
+
 template <typename T, typename Func>
 void completePromise(Promise<T>* promise, Func&& func) {
     promise->emplaceValue(func());
@@ -52,10 +118,12 @@ void completePromise(Promise<void>* promise, Func&& func) {
     promise->emplaceValue();
 }
 
-inline void sleepUnlessInTsan() {
+inline void sleepIfShould() {
 #if !__has_feature(thread_sanitizer)
-    // TSAN works better without this sleep, but it is useful for testing correctness.
-    sleepmillis(100);  // Try to wait until after the Future has been handled.
+    // TSAN and rr work better without this sleep, but it is useful for testing correctness.
+    static const bool runningUnderRR = getenv("RUNNING_UNDER_RR") != nullptr;
+    if (!runningUnderRR)
+        sleepmillis(100);  // Try to wait until after the Future has been handled.
 #endif
 }
 
@@ -64,7 +132,7 @@ Future<Result> async(Func&& func) {
     auto pf = makePromiseFuture<Result>();
 
     stdx::thread([ promise = std::move(pf.promise), func = std::forward<Func>(func) ]() mutable {
-        sleepUnlessInTsan();
+        sleepIfShould();
         try {
             completePromise(&promise, func);
         } catch (const DBException& ex) {
@@ -88,7 +156,8 @@ inline Status failStatus() {
 
 // Tests a Future completed by completionExpr using testFunc. The Future will be completed in
 // various ways to maximize test coverage.
-template <typename CompletionFunc,
+template <DoExecutorFuture doExecutorFuture = kDoExecutorFuture,
+          typename CompletionFunc,
           typename TestFunc,
           typename = std::enable_if_t<!std::is_void<std::result_of_t<CompletionFunc()>>::value>>
 void FUTURE_SUCCESS_TEST(const CompletionFunc& completion, const TestFunc& test) {
@@ -105,9 +174,15 @@ void FUTURE_SUCCESS_TEST(const CompletionFunc& completion, const TestFunc& test)
     {  // async future
         test(async([&] { return completion(); }));
     }
+
+    IF_CONSTEXPR(doExecutorFuture) {  // immediate executor future
+        auto exec = InlineCountingExecutor::make();
+        test(Future<CompletionType>::makeReady(completion()).thenRunOn(exec));
+    }
 }
 
-template <typename CompletionFunc,
+template <DoExecutorFuture doExecutorFuture = kDoExecutorFuture,
+          typename CompletionFunc,
           typename TestFunc,
           typename = std::enable_if_t<std::is_void<std::result_of_t<CompletionFunc()>>::value>,
           typename = void>
@@ -127,9 +202,17 @@ void FUTURE_SUCCESS_TEST(const CompletionFunc& completion, const TestFunc& test)
     {  // async future
         test(async([&] { return completion(); }));
     }
+
+    IF_CONSTEXPR(doExecutorFuture) {  // immediate executor future
+        completion();
+        auto exec = InlineCountingExecutor::make();
+        test(Future<CompletionType>::makeReady().thenRunOn(exec));
+    }
 }
 
-template <typename CompletionType, typename TestFunc>
+template <typename CompletionType,
+          DoExecutorFuture doExecutorFuture = kDoExecutorFuture,
+          typename TestFunc>
 void FUTURE_FAIL_TEST(const TestFunc& test) {
     {  // immediate future
         test(Future<CompletionType>::makeReady(failStatus()));
@@ -145,6 +228,10 @@ void FUTURE_FAIL_TEST(const TestFunc& test) {
             uassertStatusOK(failStatus());
             MONGO_UNREACHABLE;
         }));
+    }
+    IF_CONSTEXPR(doExecutorFuture) {  // immediate executor future
+        auto exec = InlineCountingExecutor::make();
+        test(Future<CompletionType>::makeReady(failStatus()).thenRunOn(exec));
     }
 }
 }  // namespace mongo

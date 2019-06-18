@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #
 # Copyright (C) 2018-present MongoDB, Inc.
 #
@@ -49,7 +49,7 @@ INDENT_SPACE_COUNT = 4
 
 
 def fill_spaces(count):
-    # type: (int) -> unicode
+    # type: (int) -> str
     """Fill a string full of spaces."""
     fill = ''
     for _ in range(count * INDENT_SPACE_COUNT):

@@ -37,8 +37,8 @@
 
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/background.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/database_holder.h"
-#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/replication_state_transition_lock_guard.h"
@@ -53,11 +53,14 @@
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/roll_back_local_operations.h"
 #include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/repl/transaction_oplog_application.h"
 #include "mongo/db/s/shard_identity_rollback_notifier.h"
 #include "mongo/db/s/type_shard_identity.h"
 #include "mongo/db/server_recovery.h"
 #include "mongo/db/session_catalog_mongod.h"
+#include "mongo/db/session_txn_record_gen.h"
 #include "mongo/db/storage/remove_saver.h"
+#include "mongo/db/transaction_history_iterator.h"
 #include "mongo/s/catalog/type_config_version.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
@@ -215,16 +218,6 @@ Status RollbackImpl::runRollback(OperationContext* opCtx) {
         return status;
     }
 
-    // Ask the record store for the pre-rollback counts of any collections whose counts will change
-    // and create a map with the adjusted counts for post-rollback. While finding the common
-    // point, we keep track of how much each collection's count will change during the rollback.
-    // Note: these numbers are relative to the common point, not the stable timestamp, and thus
-    // must be set after recovering from the oplog.
-    status = _findRecordStoreCounts(opCtx);
-    if (!status.isOK()) {
-        return status;
-    }
-
     // Increment the Rollback ID of this node. The Rollback ID is a natural number that it is
     // incremented by 1 every time a rollback occurs. Note that the Rollback ID must be incremented
     // before modifying any local data.
@@ -234,9 +227,31 @@ Status RollbackImpl::runRollback(OperationContext* opCtx) {
     }
     _rollbackStats.rollbackId = _replicationProcess->getRollbackID();
 
+    // Before computing record store counts, abort all active transactions. This ensures that the
+    // count adjustments are based on correct values where no prepared transactions are active and
+    // all in-memory counts have been rolled-back.
+    // Before calling recoverToStableTimestamp, we must abort the storage transaction of any
+    // prepared transaction. This will require us to scan all sessions and call
+    // abortPreparedTransactionForRollback() on any txnParticipant with a prepared transaction.
+    killSessionsAbortAllPreparedTransactions(opCtx);
+
+    // Ask the record store for the pre-rollback counts of any collections whose counts will change
+    // and create a map with the adjusted counts for post-rollback. While finding the common
+    // point, we keep track of how much each collection's count will change during the rollback.
+    // Note: these numbers are relative to the common point, not the stable timestamp, and thus
+    // must be set after recovering from the oplog.
+    // TODO (SERVER-40614): This error should be fatal.
+    status = _findRecordStoreCounts(opCtx);
+    if (!status.isOK()) {
+        return status;
+    }
+
     if (shouldCreateDataFiles()) {
         // Write a rollback file for each namespace that has documents that would be deleted by
-        // rollback.
+        // rollback. We need to do this after aborting prepared transactions. Otherwise, we risk
+        // unecessary prepare conflicts when trying to read documents that were modified by those
+        // prepared transactions, which we know we will abort anyway.
+        // TODO (SERVER-40614): This error should be fatal.
         status = _writeRollbackFiles(opCtx);
         if (!status.isOK()) {
             return status;
@@ -244,11 +259,6 @@ Status RollbackImpl::runRollback(OperationContext* opCtx) {
     } else {
         log() << "Not writing rollback files. 'createRollbackDataFiles' set to false.";
     }
-
-    // Before calling recoverToStableTimestamp, we must abort the storage transaction of any
-    // prepared transaction. This will require us to scan all sessions and call
-    // abortPreparedTransactionForRollback() on any txnParticipant with a prepared transaction.
-    killSessionsAbortAllPreparedTransactions(opCtx);
 
     // If there were rolled back operations on any session, invalidate all sessions.
     // We invalidate sessions before we recover so that we avoid invalidating sessions that had
@@ -259,6 +269,7 @@ Status RollbackImpl::runRollback(OperationContext* opCtx) {
 
     // Recover to the stable timestamp.
     auto stableTimestampSW = _recoverToStableTimestamp(opCtx);
+    // TODO (SERVER-40614): This error should be fatal.
     if (!stableTimestampSW.isOK()) {
         return stableTimestampSW.getStatus();
     }
@@ -281,6 +292,7 @@ Status RollbackImpl::runRollback(OperationContext* opCtx) {
     // We cannot have an interrupt point between setting the oplog truncation point and fixing the
     // record store counts or else a clean shutdown could produce incorrect counts. We explicitly
     // check for shutdown here to safely maximize interruptibility.
+    // TODO (SERVER-40614): This interrupt point should be removed.
     if (_isInShutdown()) {
         return Status(ErrorCodes::ShutdownInProgress, "rollback shutting down");
     }
@@ -312,6 +324,12 @@ Status RollbackImpl::runRollback(OperationContext* opCtx) {
     // Sets the correct post-rollback counts on any collections whose counts changed during the
     // rollback.
     _correctRecordStoreCounts(opCtx);
+
+    // Reconstruct prepared transactions after counts have been adjusted. Since prepared
+    // transactions were aborted (i.e. the in-memory counts were rolled-back) before computing
+    // collection counts, reconstruct the prepared transactions now, adding on any additional counts
+    // to the now corrected record store.
+    reconstructPreparedTransactions(opCtx, OplogApplication::Mode::kRecovering);
 
     // At this point, the last applied and durable optimes on this node still point to ops on
     // the divergent branch of history. We therefore update the last optimes to the top of the
@@ -374,7 +392,7 @@ Status RollbackImpl::_awaitBgIndexCompletion(OperationContext* opCtx) {
     std::vector<std::string> dbs;
     {
         Lock::GlobalLock lk(opCtx, MODE_IS);
-        storageEngine->listDatabases(&dbs);
+        dbs = storageEngine->listDatabases();
     }
 
     // Wait for all background operations to complete by waiting on each database.
@@ -465,6 +483,7 @@ StatusWith<std::set<NamespaceString>> RollbackImpl::_namespacesForOp(const Oplog
                 break;
             }
             case OplogEntry::CommandType::kCommitTransaction:
+            case OplogEntry::CommandType::kPrepareTransaction:
             case OplogEntry::CommandType::kAbortTransaction: {
                 break;
             }
@@ -481,13 +500,13 @@ StatusWith<std::set<NamespaceString>> RollbackImpl::_namespacesForOp(const Oplog
 void RollbackImpl::_correctRecordStoreCounts(OperationContext* opCtx) {
     // This function explicitly does not check for shutdown since a clean shutdown post oplog
     // truncation is not allowed to occur until the record store counts are corrected.
-    const auto& uuidCatalog = UUIDCatalog::get(opCtx);
+    const auto& catalog = CollectionCatalog::get(opCtx);
     for (const auto& uiCount : _newCounts) {
         const auto uuid = uiCount.first;
-        const auto coll = uuidCatalog.lookupCollectionByUUID(uuid);
+        const auto coll = catalog.lookupCollectionByUUID(uuid);
         invariant(coll,
                   str::stream() << "The collection with UUID " << uuid
-                                << " is unexpectedly missing in the UUIDCatalog");
+                                << " is unexpectedly missing in the CollectionCatalog");
         const auto nss = coll->ns();
         invariant(!nss.isEmpty(),
                   str::stream() << "The collection with UUID " << uuid << " has no namespace.");
@@ -553,10 +572,11 @@ void RollbackImpl::_correctRecordStoreCounts(OperationContext* opCtx) {
 }
 
 Status RollbackImpl::_findRecordStoreCounts(OperationContext* opCtx) {
+    // TODO (SERVER-40614): This interrupt point should be removed.
     if (_isInShutdown()) {
         return Status(ErrorCodes::ShutdownInProgress, "rollback shutting down");
     }
-    const auto& uuidCatalog = UUIDCatalog::get(opCtx);
+    const auto& catalog = CollectionCatalog::get(opCtx);
     auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
 
     log() << "finding record store counts";
@@ -567,15 +587,15 @@ Status RollbackImpl::_findRecordStoreCounts(OperationContext* opCtx) {
             continue;
         }
 
-        auto nss = uuidCatalog.lookupNSSByUUID(uuid);
+        auto nss = catalog.lookupNSSByUUID(uuid);
         StorageInterface::CollectionCount oldCount = 0;
 
         // Drop-pending collections are not visible to rollback via the catalog when they are
         // managed by the storage engine. See StorageEngine::supportsPendingDrops().
-        if (nss.isEmpty()) {
+        if (!nss) {
             invariant(storageEngine->supportsPendingDrops(),
                       str::stream() << "The collection with UUID " << uuid
-                                    << " is unexpectedly missing in the UUIDCatalog");
+                                    << " is unexpectedly missing in the CollectionCatalog");
             auto it = _pendingDrops.find(uuid);
             if (it == _pendingDrops.end()) {
                 _newCounts[uuid] = kCollectionScanRequired;
@@ -591,7 +611,7 @@ Status RollbackImpl::_findRecordStoreCounts(OperationContext* opCtx) {
                                        "collection count during rollback.");
             oldCount = static_cast<StorageInterface::CollectionCount>(dropPendingInfo.count);
         } else {
-            auto countSW = _storageInterface->getCollectionCount(opCtx, nss);
+            auto countSW = _storageInterface->getCollectionCount(opCtx, *nss);
             if (!countSW.isOK()) {
                 return countSW.getStatus();
             }
@@ -599,7 +619,8 @@ Status RollbackImpl::_findRecordStoreCounts(OperationContext* opCtx) {
         }
 
         if (oldCount > static_cast<uint64_t>(std::numeric_limits<long long>::max())) {
-            warning() << "Count for " << nss.ns() << " (" << uuid.toString() << ") was " << oldCount
+            warning() << "Count for " << nss->ns() << " (" << uuid.toString() << ") was "
+                      << oldCount
                       << " which is larger than the maximum int64_t value. Not attempting to fix "
                          "count during rollback.";
             continue;
@@ -609,7 +630,7 @@ Status RollbackImpl::_findRecordStoreCounts(OperationContext* opCtx) {
         auto newCount = oldCountSigned + countDiff;
 
         if (newCount < 0) {
-            warning() << "Attempted to set count for " << nss.ns() << " (" << uuid.toString()
+            warning() << "Attempted to set count for " << nss->ns() << " (" << uuid.toString()
                       << ") to " << newCount
                       << " but set it to 0 instead. This is likely due to the count previously "
                          "becoming inconsistent from an unclean shutdown or a rollback that could "
@@ -617,7 +638,7 @@ Status RollbackImpl::_findRecordStoreCounts(OperationContext* opCtx) {
                       << oldCount << ". Count change: " << countDiff;
             newCount = 0;
         }
-        LOG(2) << "Record count of " << nss.ns() << " (" << uuid.toString()
+        LOG(2) << "Record count of " << nss->ns() << " (" << uuid.toString()
                << ") before rollback is " << oldCount << ". Setting it to " << newCount
                << ", due to change of " << countDiff;
         _newCounts[uuid] = newCount;
@@ -630,7 +651,7 @@ Status RollbackImpl::_findRecordStoreCounts(OperationContext* opCtx) {
  * Process a single oplog entry that is getting rolled back and update the necessary rollback info
  * structures.
  */
-Status RollbackImpl::_processRollbackOp(const OplogEntry& oplogEntry) {
+Status RollbackImpl::_processRollbackOp(OperationContext* opCtx, const OplogEntry& oplogEntry) {
     ++_observerInfo.numberOfEntriesObserved;
 
     NamespaceString opNss = oplogEntry.getNss();
@@ -650,7 +671,7 @@ Status RollbackImpl::_processRollbackOp(const OplogEntry& oplogEntry) {
         try {
             auto subOps = ApplyOps::extractOperations(oplogEntry);
             for (auto& subOp : subOps) {
-                auto subStatus = _processRollbackOp(subOp);
+                auto subStatus = _processRollbackOp(opCtx, subOp);
                 if (!subStatus.isOK()) {
                     return subStatus;
                 }
@@ -780,6 +801,34 @@ Status RollbackImpl::_processRollbackOp(const OplogEntry& oplogEntry) {
             } else {
                 _newCounts[dropTargetUUID] = kCollectionScanRequired;
             }
+        } else if (oplogEntry.getCommandType() == OplogEntry::CommandType::kCommitTransaction) {
+            // If we are rolling-back the commit of a prepared transaction, use the prepare oplog
+            // entry to compute size adjustments. After recovering to the stable timestamp, prepared
+            // transactions are reconstituted and any count adjustments will be replayed and
+            // committed again.
+            // TODO (SERVER-40566): Handle new oplog format for transactions larger than 16 MB
+
+            if (const auto prepareOpTime = oplogEntry.getPrevWriteOpTimeInTransaction()) {
+                TransactionHistoryIterator iter(*prepareOpTime);
+                invariant(iter.hasNext());
+
+                const auto prepareOplogEntry = iter.next(opCtx);
+                if (prepareOplogEntry.getCommandType() == OplogEntry::CommandType::kApplyOps &&
+                    prepareOplogEntry.shouldPrepare()) {
+                    // Transform the prepare command into a normal applyOps command. If the
+                    // "prepare" field were not removed, the operation would be ignored.
+                    const auto swApplyOpsEntry =
+                        OplogEntry::parse(prepareOplogEntry.toBSON().removeField("prepare"));
+                    if (!swApplyOpsEntry.isOK()) {
+                        return swApplyOpsEntry.getStatus();
+                    }
+
+                    auto subStatus = _processRollbackOp(opCtx, swApplyOpsEntry.getValue());
+                    if (!subStatus.isOK()) {
+                        return subStatus;
+                    }
+                }
+            }
         }
     }
 
@@ -813,7 +862,7 @@ StatusWith<RollBackLocalOperations::RollbackCommonPoint> RollbackImpl::_findComm
     // restarting will have cleared out any invalid in-memory state anyway.
     auto onLocalOplogEntryFn = [&](const BSONObj& operation) {
         OplogEntry oplogEntry(operation);
-        return _processRollbackOp(oplogEntry);
+        return _processRollbackOp(opCtx, oplogEntry);
     };
 
     // Calls syncRollBackLocalOperations to find the common point and run onLocalOplogEntryFn on
@@ -957,35 +1006,36 @@ boost::optional<BSONObj> RollbackImpl::_findDocumentById(OperationContext* opCtx
 }
 
 Status RollbackImpl::_writeRollbackFiles(OperationContext* opCtx) {
-    const auto& uuidCatalog = UUIDCatalog::get(opCtx);
+    const auto& catalog = CollectionCatalog::get(opCtx);
     auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
     for (auto&& entry : _observerInfo.rollbackDeletedIdsMap) {
         const auto& uuid = entry.first;
-        const auto nss = uuidCatalog.lookupNSSByUUID(uuid);
+        const auto nss = catalog.lookupNSSByUUID(uuid);
 
         // Drop-pending collections are not visible to rollback via the catalog when they are
         // managed by the storage engine. See StorageEngine::supportsPendingDrops().
-        if (nss.isEmpty() && storageEngine->supportsPendingDrops()) {
+        if (!nss && storageEngine->supportsPendingDrops()) {
             log() << "The collection with UUID " << uuid
-                  << " is missing in the UUIDCatalog. This could be due to a dropped collection. "
-                     "Not writing rollback file for namespace "
-                  << nss.ns() << " with uuid " << uuid;
+                  << " is missing in the CollectionCatalog. This could be due to a dropped "
+                     " collection. Not writing rollback file for uuid "
+                  << uuid;
             continue;
         }
 
-        invariant(!nss.isEmpty(),
+        invariant(nss,
                   str::stream() << "The collection with UUID " << uuid
-                                << " is unexpectedly missing in the UUIDCatalog");
+                                << " is unexpectedly missing in the CollectionCatalog");
 
         if (_isInShutdown()) {
-            log() << "Rollback shutting down; not writing rollback file for namespace " << nss.ns()
+            log() << "Rollback shutting down; not writing rollback file for namespace " << nss->ns()
                   << " with uuid " << uuid;
             continue;
         }
 
-        _writeRollbackFileForNamespace(opCtx, uuid, nss, entry.second);
+        _writeRollbackFileForNamespace(opCtx, uuid, *nss, entry.second);
     }
 
+    // TODO (SERVER-40614): This interrupt point should be removed.
     if (_isInShutdown()) {
         return {ErrorCodes::ShutdownInProgress, "rollback shutting down"};
     }
@@ -1038,6 +1088,7 @@ void RollbackImpl::_writeRollbackFileForNamespace(OperationContext* opCtx,
 }
 
 StatusWith<Timestamp> RollbackImpl::_recoverToStableTimestamp(OperationContext* opCtx) {
+    // TODO (SERVER-40614): This interrupt point should be removed.
     if (_isInShutdown()) {
         return Status(ErrorCodes::ShutdownInProgress, "rollback shutting down");
     }
@@ -1049,6 +1100,7 @@ StatusWith<Timestamp> RollbackImpl::_recoverToStableTimestamp(OperationContext* 
             if (!stableTimestampSW.isOK()) {
                 severe() << "RecoverToStableTimestamp failed. "
                          << causedBy(stableTimestampSW.getStatus());
+                // TODO (SERVER-40614): fassert here instead of depending on the caller to do it
                 return {ErrorCodes::UnrecoverableRollbackError,
                         "Recover to stable timestamp failed."};
             }
@@ -1097,8 +1149,7 @@ void RollbackImpl::_resetDropPendingState(OperationContext* opCtx) {
     auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
     storageEngine->clearDropPendingState();
 
-    std::vector<std::string> dbNames;
-    storageEngine->listDatabases(&dbNames);
+    std::vector<std::string> dbNames = storageEngine->listDatabases();
     auto databaseHolder = DatabaseHolder::get(opCtx);
     for (const auto& dbName : dbNames) {
         Lock::DBLock dbLock(opCtx, dbName, MODE_X);

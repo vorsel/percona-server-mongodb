@@ -45,7 +45,7 @@ protected:
     void setUp() override {
         resetApplyParams();
 
-        // Set up the logical clock needed by CurrentDateNode and ObjectReplaceNode.
+        // Set up the logical clock needed by CurrentDateNode and ObjectReplaceExecutor.
         auto service = mongo::getGlobalServiceContext();
         auto logicalClock = mongo::stdx::make_unique<mongo::LogicalClock>(service);
         mongo::LogicalClock::set(service, std::move(logicalClock));
@@ -66,10 +66,8 @@ protected:
         _modifiedPaths.clear();
     }
 
-    UpdateNode::ApplyParams getApplyParams(mutablebson::Element element) {
-        UpdateNode::ApplyParams applyParams(element, _immutablePaths);
-        applyParams.pathToCreate = _pathToCreate;
-        applyParams.pathTaken = _pathTaken;
+    UpdateExecutor::ApplyParams getApplyParams(mutablebson::Element element) {
+        UpdateExecutor::ApplyParams applyParams(element, _immutablePaths);
         applyParams.matchedField = _matchedField;
         applyParams.insert = _insert;
         applyParams.fromOplogApplication = _fromOplogApplication;
@@ -77,6 +75,13 @@ protected:
         applyParams.indexData = _indexData.get();
         applyParams.logBuilder = _logBuilder.get();
         applyParams.modifiedPaths = &_modifiedPaths;
+        return applyParams;
+    }
+
+    UpdateNode::UpdateNodeApplyParams getUpdateNodeApplyParams() {
+        UpdateNode::UpdateNodeApplyParams applyParams;
+        applyParams.pathToCreate = _pathToCreate;
+        applyParams.pathTaken = _pathTaken;
         return applyParams;
     }
 

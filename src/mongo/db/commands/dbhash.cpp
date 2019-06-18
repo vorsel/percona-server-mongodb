@@ -33,11 +33,12 @@
 
 #include <boost/optional.hpp>
 #include <map>
+#include <set>
 #include <string>
 
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog_helper.h"
 #include "mongo/db/catalog/database.h"
-#include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/test_commands_enabled.h"
@@ -132,6 +133,11 @@ public:
 
             auto targetClusterTime = elem.timestamp();
 
+            uassert(ErrorCodes::InvalidOptions,
+                    str::stream() << "$_internalReadAtClusterTime value must not be a null"
+                                     " timestamp.",
+                    !targetClusterTime.isNull());
+
             // We aren't holding the global lock in intent mode, so it is possible after comparing
             // 'targetClusterTime' to 'lastAppliedOpTime' for the last applied opTime to go
             // backwards or for the term to change due to replication rollback. This isn't an actual
@@ -168,24 +174,31 @@ public:
             // clusterTime, even across yields.
             opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kProvided,
                                                           targetClusterTime);
+
+            // The $_internalReadAtClusterTime option also causes any storage-layer cursors created
+            // during plan execution to block on prepared transactions.
+            opCtx->recoveryUnit()->setIgnorePrepared(false);
         }
 
         // We lock the entire database in S-mode in order to ensure that the contents will not
         // change for the snapshot.
         auto lockMode = LockMode::MODE_S;
+        boost::optional<ShouldNotConflictWithSecondaryBatchApplicationBlock> shouldNotConflictBlock;
         if (opCtx->recoveryUnit()->getTimestampReadSource() ==
             RecoveryUnit::ReadSource::kProvided) {
             // However, if we are performing a read at a timestamp, then we only need to lock the
-            // database in intent mode to ensure that none of the collections get dropped.
+            // database in intent mode and then collection in intent mode as well to ensure that
+            // none of the collections get dropped.
             lockMode = LockMode::MODE_IS;
+
+            // Additionally, if we are performing a read at a timestamp, then we allow oplog
+            // application to proceed concurrently with the dbHash command. This is done
+            // to ensure a prepare conflict is able to eventually be resolved by processing a
+            // later commitTransaction or abortTransaction oplog entry.
+            shouldNotConflictBlock.emplace(opCtx->lockState());
         }
         AutoGetDb autoDb(opCtx, ns, lockMode);
         Database* db = autoDb.getDb();
-        std::list<std::string> colls;
-        if (db) {
-            db->getDatabaseCatalogEntry()->getCollectionNamespaces(&colls);
-            colls.sort();
-        }
 
         result.append("host", prettyHostName());
 
@@ -201,54 +214,84 @@ public:
                                                                "system.version",
                                                                "system.views"};
 
-        BSONArrayBuilder cappedCollections;
-        BSONObjBuilder collectionsByUUID;
+        std::map<std::string, std::string> collectionToHashMap;
+        std::map<std::string, OptionalCollectionUUID> collectionToUUIDMap;
+        std::set<std::string> cappedCollectionSet;
 
-        BSONObjBuilder bb(result.subobjStart("collections"));
-        for (const auto& collectionName : colls) {
+        bool noError = true;
+        catalog::forEachCollectionFromDb(
+            opCtx,
+            dbname,
+            MODE_IS,
+            [&](Collection* collection, CollectionCatalogEntry* catalogEntry) {
+                auto collNss = collection->ns();
 
-            NamespaceString collNss(collectionName);
+                if (collNss.size() - 1 <= dbname.size()) {
+                    errmsg = str::stream() << "weird fullCollectionName [" << collNss.toString()
+                                           << "]";
+                    noError = false;
+                    return false;
+                }
 
-            if (collNss.size() - 1 <= dbname.size()) {
-                errmsg = str::stream() << "weird fullCollectionName [" << collNss.toString() << "]";
-                return false;
-            }
+                // Only include 'system' collections that are replicated.
+                bool isReplicatedSystemColl =
+                    (replicatedSystemCollections.count(collNss.coll().toString()) > 0);
+                if (collNss.isSystem() && !isReplicatedSystemColl)
+                    return true;
 
-            // Only include 'system' collections that are replicated.
-            bool isReplicatedSystemColl =
-                (replicatedSystemCollections.count(collNss.coll().toString()) > 0);
-            if (collNss.isSystem() && !isReplicatedSystemColl)
-                continue;
+                if (collNss.coll().startsWith("tmp.mr.")) {
+                    // We skip any incremental map reduce collections as they also aren't
+                    // replicated.
+                    return true;
+                }
 
-            if (collNss.coll().startsWith("tmp.mr.")) {
-                // We skip any incremental map reduce collections as they also aren't replicated.
-                continue;
-            }
+                if (desiredCollections.size() > 0 &&
+                    desiredCollections.count(collNss.coll().toString()) == 0)
+                    return true;
 
-            if (desiredCollections.size() > 0 &&
-                desiredCollections.count(collNss.coll().toString()) == 0)
-                continue;
+                // Don't include 'drop pending' collections.
+                if (collNss.isDropPendingNamespace())
+                    return true;
 
-            // Don't include 'drop pending' collections.
-            if (collNss.isDropPendingNamespace())
-                continue;
-
-            if (Collection* collection = db->getCollection(opCtx, collectionName)) {
                 if (collection->isCapped()) {
-                    cappedCollections.append(collNss.coll());
+                    cappedCollectionSet.insert(collNss.coll().toString());
                 }
 
                 if (OptionalCollectionUUID uuid = collection->uuid()) {
-                    uuid->appendToBuilder(&collectionsByUUID, collNss.coll());
+                    collectionToUUIDMap[collNss.coll().toString()] = uuid;
                 }
-            }
 
-            // Compute the hash for this collection.
-            std::string hash = _hashCollection(opCtx, db, collNss.toString());
+                // Compute the hash for this collection.
+                std::string hash = _hashCollection(opCtx, db, collNss);
 
-            bb.append(collNss.coll(), hash);
+                collectionToHashMap[collNss.coll().toString()] = hash;
+
+                return true;
+            });
+        if (!noError)
+            return false;
+
+        BSONObjBuilder bb(result.subobjStart("collections"));
+        BSONArrayBuilder cappedCollections;
+        BSONObjBuilder collectionsByUUID;
+
+        for (auto elem : cappedCollectionSet) {
+            cappedCollections.append(elem);
+        }
+
+        for (auto entry : collectionToUUIDMap) {
+            auto collName = entry.first;
+            auto uuid = entry.second;
+            uuid->appendToBuilder(&collectionsByUUID, collName);
+        }
+
+        for (auto entry : collectionToHashMap) {
+            auto collName = entry.first;
+            auto hash = entry.second;
+            bb.append(collName, hash);
             md5_append(&globalState, (const md5_byte_t*)hash.c_str(), hash.size());
         }
+
         bb.done();
 
         result.append("capped", BSONArray(cappedCollections.done()));
@@ -265,15 +308,10 @@ public:
     }
 
 private:
-    std::string _hashCollection(OperationContext* opCtx,
-                                Database* db,
-                                const std::string& fullCollectionName) {
+    std::string _hashCollection(OperationContext* opCtx, Database* db, const NamespaceString& nss) {
 
-        NamespaceString ns(fullCollectionName);
-
-        Collection* collection = db->getCollection(opCtx, ns);
-        if (!collection)
-            return "";
+        Collection* collection = db->getCollection(opCtx, nss);
+        invariant(collection);
 
         boost::optional<Lock::CollectionLock> collLock;
         if (opCtx->recoveryUnit()->getTimestampReadSource() ==
@@ -282,8 +320,7 @@ private:
             // intent mode. We need to also acquire the collection lock in intent mode to ensure
             // reading from the consistent snapshot doesn't overlap with any catalog operations on
             // the collection.
-            invariant(opCtx->lockState()->isDbLockedForMode(db->name(), MODE_IS));
-            collLock.emplace(opCtx->lockState(), fullCollectionName, MODE_IS);
+            invariant(opCtx->lockState()->isCollectionLockedForMode(nss, MODE_IS));
 
             auto minSnapshot = collection->getMinimumVisibleSnapshot();
             auto mySnapshot = opCtx->recoveryUnit()->getPointInTimeReadTimestamp();
@@ -316,9 +353,9 @@ private:
                                               InternalPlanner::IXSCAN_FETCH);
         } else if (collection->isCapped()) {
             exec = InternalPlanner::collectionScan(
-                opCtx, fullCollectionName, collection, PlanExecutor::NO_YIELD);
+                opCtx, nss.ns(), collection, PlanExecutor::NO_YIELD);
         } else {
-            log() << "can't find _id index for: " << fullCollectionName;
+            log() << "can't find _id index for: " << nss;
             return "no _id _index";
         }
 
@@ -334,7 +371,7 @@ private:
             n++;
         }
         if (PlanExecutor::IS_EOF != state) {
-            warning() << "error while hashing, db dropped? ns=" << fullCollectionName;
+            warning() << "error while hashing, db dropped? ns=" << nss;
             uasserted(34371,
                       "Plan executor error while running dbHash command: " +
                           WorkingSetCommon::toStatusString(c));

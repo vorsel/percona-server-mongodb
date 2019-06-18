@@ -119,7 +119,8 @@ void OpObserverShardingImpl::shardObserveInsertOp(OperationContext* opCtx,
 
 void OpObserverShardingImpl::shardObserveUpdateOp(OperationContext* opCtx,
                                                   const NamespaceString nss,
-                                                  const BSONObj& updatedDoc,
+                                                  boost::optional<BSONObj> preImageDoc,
+                                                  const BSONObj& postImageDoc,
                                                   const repl::OpTime& opTime,
                                                   const repl::OpTime& prePostImageOpTime,
                                                   const bool inMultiDocumentTransaction) {
@@ -127,14 +128,14 @@ void OpObserverShardingImpl::shardObserveUpdateOp(OperationContext* opCtx,
     csr->checkShardVersionOrThrow(opCtx);
 
     if (inMultiDocumentTransaction) {
-        assertIntersectingChunkHasNotMoved(opCtx, csr, updatedDoc);
+        assertIntersectingChunkHasNotMoved(opCtx, csr, postImageDoc);
         return;
     }
 
     auto csrLock = CollectionShardingRuntime::CSRLock::lock(opCtx, csr);
     auto msm = MigrationSourceManager::get(csr, csrLock);
     if (msm) {
-        msm->getCloner()->onUpdateOp(opCtx, updatedDoc, opTime, prePostImageOpTime);
+        msm->getCloner()->onUpdateOp(opCtx, preImageDoc, postImageDoc, opTime, prePostImageOpTime);
     }
 }
 
@@ -161,12 +162,17 @@ void OpObserverShardingImpl::shardObserveDeleteOp(OperationContext* opCtx,
 }
 
 void OpObserverShardingImpl::shardObserveTransactionPrepareOrUnpreparedCommit(
-    OperationContext* opCtx, const std::vector<repl::ReplOperation>& stmts) {
+    OperationContext* opCtx,
+    const std::vector<repl::ReplOperation>& stmts,
+    const repl::OpTime& prepareOrCommitOptime) {
 
-    for (const auto stmt : stmts) {
-        auto const nss = stmt.getNss();
+    std::set<NamespaceString> namespacesTouchedByTransaction;
 
-        AutoGetCollection autoColl(opCtx, nss, MODE_IS);
+    for (const auto& stmt : stmts) {
+        const auto& nss = stmt.getNss();
+
+        invariant(opCtx->lockState()->isCollectionLockedForMode(nss, MODE_IS));
+
         auto csr = CollectionShardingRuntime::get(opCtx, nss);
         auto csrLock = CollectionShardingRuntime::CSRLock::lock(opCtx, csr);
         auto msm = MigrationSourceManager::get(csr, csrLock);
@@ -174,7 +180,13 @@ void OpObserverShardingImpl::shardObserveTransactionPrepareOrUnpreparedCommit(
             continue;
         }
 
-        auto const opType = stmt.getOpType();
+        if (namespacesTouchedByTransaction.find(nss) == namespacesTouchedByTransaction.end()) {
+            msm->getCloner()->onTransactionPrepareOrUnpreparedCommit(opCtx, prepareOrCommitOptime);
+            namespacesTouchedByTransaction.insert(nss);
+        }
+
+
+        const auto& opType = stmt.getOpType();
 
         // We pass an empty opTime to observers because retryable write history doesn't care about
         // writes in transactions.
@@ -182,7 +194,8 @@ void OpObserverShardingImpl::shardObserveTransactionPrepareOrUnpreparedCommit(
             msm->getCloner()->onInsertOp(opCtx, stmt.getObject(), {});
         } else if (opType == repl::OpTypeEnum::kUpdate) {
             if (auto updateDoc = stmt.getObject2()) {
-                msm->getCloner()->onUpdateOp(opCtx, *updateDoc, {}, {});
+                msm->getCloner()->onUpdateOp(
+                    opCtx, stmt.getPreImageDocumentKey(), *updateDoc, {}, {});
             }
         } else if (opType == repl::OpTypeEnum::kDelete) {
             if (isMigratingWithCSRLock(csr, csrLock, stmt.getObject())) {

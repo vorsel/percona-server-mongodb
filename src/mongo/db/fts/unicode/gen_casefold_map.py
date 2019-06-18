@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import os
 import sys
@@ -23,10 +23,9 @@ def generate(unicode_casefold_file, target):
 
     case_mappings = {}
 
-    cf_file = open(unicode_casefold_file, 'rb')
+    cf_file = open(unicode_casefold_file, 'r', encoding='utf-8')
 
     for line in cf_file:
-        line = line.decode('utf-8')
         # Filter out blank lines and lines that start with #
         data = line[:line.find('#')]
         if(data == ""):

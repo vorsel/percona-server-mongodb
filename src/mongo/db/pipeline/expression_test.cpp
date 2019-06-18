@@ -204,9 +204,8 @@ public:
         // By default, this is not associative/commutative so the results will change if
         // instantiated as commutative or associative and operations are reordered.
         vector<Value> values;
-        for (ExpressionVector::const_iterator i = vpOperand.begin(); i != vpOperand.end(); ++i) {
-            values.push_back((*i)->evaluate(root));
-        }
+        for (auto&& child : _children)
+            values.push_back(child->evaluate(root));
         return Value(values);
     }
 
@@ -220,6 +219,10 @@ public:
 
     virtual bool isCommutative() const {
         return _isCommutative;
+    }
+
+    void acceptVisitor(ExpressionVisitor* visitor) final {
+        return visitor->visit(this);
     }
 
     static intrusive_ptr<Testable> create(bool associative, bool commutative) {
@@ -994,8 +997,13 @@ TEST_F(ExpressionRoundOneArgTest, DoubleArg1) {
     assertEval(-2.0, -2.0);
     assertEval(0.9, 1.0);
     assertEval(0.1, 0.0);
+    assertEval(1.5, 2.0);
+    assertEval(2.5, 2.0);
+    assertEval(3.5, 4.0);
     assertEval(-1.2, -1.0);
     assertEval(-1.7, -2.0);
+    assertEval(-1.5, -2.0);
+    assertEval(-2.5, -2.0);
 
     // Outside the range of long longs (there isn't enough precision for decimals in this range, so
     // should just preserve the number).
@@ -1010,8 +1018,13 @@ TEST_F(ExpressionRoundTwoArgTest, DoubleArg2) {
     assertEval(-2.0, 2.0, -2.0);
     assertEval(0.9, 0, 1.0);
     assertEval(0.1, 0, 0.0);
+    assertEval(1.5, 0, 2.0);
+    assertEval(2.5, 0, 2.0);
+    assertEval(3.5, 0, 4.0);
     assertEval(-1.2, 0, -1.0);
     assertEval(-1.7, 0, -2.0);
+    assertEval(-1.5, 0, -2.0);
+    assertEval(-2.5, 0, -2.0);
 
     assertEval(-3.14159265, 0, -3.0);
     assertEval(-3.14159265, 1, -3.1);
@@ -1041,6 +1054,9 @@ TEST_F(ExpressionRoundOneArgTest, DecimalArg1) {
     assertEval(Decimal128("-2"), Decimal128("-2.0"));
     assertEval(Decimal128("0.9"), Decimal128("1.0"));
     assertEval(Decimal128("0.1"), Decimal128("0.0"));
+    assertEval(Decimal128("0.5"), Decimal128("0.0"));
+    assertEval(Decimal128("1.5"), Decimal128("2.0"));
+    assertEval(Decimal128("2.5"), Decimal128("2.0"));
     assertEval(Decimal128("-1.2"), Decimal128("-1.0"));
     assertEval(Decimal128("-1.7"), Decimal128("-2.0"));
     assertEval(Decimal128("123456789.9999999999999999999999999"), Decimal128("123456790"));
@@ -1054,6 +1070,9 @@ TEST_F(ExpressionRoundTwoArgTest, DecimalArg2) {
     assertEval(Decimal128("-2"), 0, Decimal128("-2.0"));
     assertEval(Decimal128("0.9"), 0, Decimal128("1.0"));
     assertEval(Decimal128("0.1"), 0, Decimal128("0.0"));
+    assertEval(Decimal128("0.5"), 0, Decimal128("0.0"));
+    assertEval(Decimal128("1.5"), 0, Decimal128("2.0"));
+    assertEval(Decimal128("2.5"), 0, Decimal128("2.0"));
     assertEval(Decimal128("-1.2"), 0, Decimal128("-1.0"));
     assertEval(Decimal128("-1.7"), 0, Decimal128("-2.0"));
     assertEval(Decimal128("123456789.9999999999999999999999999"), 0, Decimal128("123456790"));
@@ -1117,6 +1136,7 @@ public:
 
 TEST_F(ExpressionTruncOneArgTest, IntArg1) {
     assertEval(0, 0);
+    assertEval(0, 0);
     assertEval(numeric_limits<int>::min(), numeric_limits<int>::min());
     assertEval(numeric_limits<int>::max(), numeric_limits<int>::max());
 }
@@ -1148,8 +1168,14 @@ TEST_F(ExpressionTruncOneArgTest, DoubleArg1) {
     assertEval(-2.0, -2.0);
     assertEval(0.9, 0.0);
     assertEval(0.1, 0.0);
+    assertEval(0.5, 0.0);
+    assertEval(1.5, 1.0);
+    assertEval(2.5, 2.0);
     assertEval(-1.2, -1.0);
     assertEval(-1.7, -1.0);
+    assertEval(-0.5, -0.0);
+    assertEval(-1.5, -1.0);
+    assertEval(-2.5, -2.0);
 
     // Outside the range of long longs (there isn't enough precision for decimals in this range, so
     // should just preserve the number).
@@ -1164,9 +1190,14 @@ TEST_F(ExpressionTruncTwoArgTest, DoubleArg2) {
     assertEval(-2.0, 2.0, -2.0);
     assertEval(0.9, 0, 0.0);
     assertEval(0.1, 0, 0.0);
+    assertEval(0.5, 0, 0.0);
+    assertEval(1.5, 0, 1.0);
+    assertEval(2.5, 0, 2.0);
     assertEval(-1.2, 0, -1.0);
     assertEval(-1.7, 0, -1.0);
-
+    assertEval(-0.5, 0, -0.0);
+    assertEval(-1.5, 0, -1.0);
+    assertEval(-2.5, 0, -2.0);
 
     assertEval(-3.14159265, 0, -3.0);
     assertEval(-3.14159265, 1, -3.1);
@@ -3302,9 +3333,32 @@ TEST(ParseObject, ShouldRejectExpressionAsTheSecondField) {
 // Evaluation.
 //
 
+namespace {
+/**
+ * ExpressionObject builds two vectors within it's ::parse() method, one owning and one with names
+ * and references to the former. Since the ::create() method bypasses this step, we have to mimic
+ * the behavior here.
+ */
+auto expressionObjectCreateHelper(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    std::vector<std::pair<std::string, boost::intrusive_ptr<Expression>>>&&
+        expressionsWithChildrenInPlace) {
+    std::vector<boost::intrusive_ptr<Expression>> children;
+    std::vector<std::pair<std::string, boost::intrusive_ptr<Expression>&>> expressions;
+    for (auto & [ unused, expression ] : expressionsWithChildrenInPlace)
+        children.push_back(std::move(expression));
+    std::vector<boost::intrusive_ptr<Expression>>::size_type index = 0;
+    for (auto & [ fieldName, unused ] : expressionsWithChildrenInPlace) {
+        expressions.emplace_back(fieldName, children[index]);
+        ++index;
+    }
+    return ExpressionObject::create(expCtx, std::move(children), std::move(expressions));
+}
+}  // namespace
+
 TEST(ExpressionObjectEvaluate, EmptyObjectShouldEvaluateToEmptyDocument) {
     intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    auto object = ExpressionObject::create(expCtx, {});
+    auto object = expressionObjectCreateHelper(expCtx, {});
     ASSERT_VALUE_EQ(Value(Document()), object->evaluate(Document()));
     ASSERT_VALUE_EQ(Value(Document()), object->evaluate(Document{{"a", 1}}));
     ASSERT_VALUE_EQ(Value(Document()), object->evaluate(Document{{"_id", "ID"_sd}}));
@@ -3313,7 +3367,7 @@ TEST(ExpressionObjectEvaluate, EmptyObjectShouldEvaluateToEmptyDocument) {
 TEST(ExpressionObjectEvaluate, ShouldEvaluateEachField) {
     intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
     auto object =
-        ExpressionObject::create(expCtx, {{"a", makeConstant(1)}, {"b", makeConstant(5)}});
+        expressionObjectCreateHelper(expCtx, {{"a", makeConstant(1)}, {"b", makeConstant(5)}});
     ASSERT_VALUE_EQ(Value(Document{{"a", 1}, {"b", 5}}), object->evaluate(Document()));
     ASSERT_VALUE_EQ(Value(Document{{"a", 1}, {"b", 5}}), object->evaluate(Document{{"a", 1}}));
     ASSERT_VALUE_EQ(Value(Document{{"a", 1}, {"b", 5}}),
@@ -3322,10 +3376,10 @@ TEST(ExpressionObjectEvaluate, ShouldEvaluateEachField) {
 
 TEST(ExpressionObjectEvaluate, OrderOfFieldsInOutputShouldMatchOrderInSpecification) {
     intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    auto object = ExpressionObject::create(expCtx,
-                                           {{"a", ExpressionFieldPath::create(expCtx, "a")},
-                                            {"b", ExpressionFieldPath::create(expCtx, "b")},
-                                            {"c", ExpressionFieldPath::create(expCtx, "c")}});
+    auto object = expressionObjectCreateHelper(expCtx,
+                                               {{"a", ExpressionFieldPath::create(expCtx, "a")},
+                                                {"b", ExpressionFieldPath::create(expCtx, "b")},
+                                                {"c", ExpressionFieldPath::create(expCtx, "c")}});
     ASSERT_VALUE_EQ(
         Value(Document{{"a", "A"_sd}, {"b", "B"_sd}, {"c", "C"_sd}}),
         object->evaluate(Document{{"c", "C"_sd}, {"a", "A"_sd}, {"b", "B"_sd}, {"_id", "ID"_sd}}));
@@ -3333,19 +3387,20 @@ TEST(ExpressionObjectEvaluate, OrderOfFieldsInOutputShouldMatchOrderInSpecificat
 
 TEST(ExpressionObjectEvaluate, ShouldRemoveFieldsThatHaveMissingValues) {
     intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    auto object = ExpressionObject::create(expCtx,
-                                           {{"a", ExpressionFieldPath::create(expCtx, "a.b")},
-                                            {"b", ExpressionFieldPath::create(expCtx, "missing")}});
+    auto object =
+        expressionObjectCreateHelper(expCtx,
+                                     {{"a", ExpressionFieldPath::create(expCtx, "a.b")},
+                                      {"b", ExpressionFieldPath::create(expCtx, "missing")}});
     ASSERT_VALUE_EQ(Value(Document{}), object->evaluate(Document()));
     ASSERT_VALUE_EQ(Value(Document{}), object->evaluate(Document{{"a", 1}}));
 }
 
 TEST(ExpressionObjectEvaluate, ShouldEvaluateFieldsWithinNestedObject) {
     intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    auto object = ExpressionObject::create(
+    auto object = expressionObjectCreateHelper(
         expCtx,
         {{"a",
-          ExpressionObject::create(
+          expressionObjectCreateHelper(
               expCtx,
               {{"b", makeConstant(1)}, {"c", ExpressionFieldPath::create(expCtx, "_id")}})}});
     ASSERT_VALUE_EQ(Value(Document{{"a", Document{{"b", 1}}}}), object->evaluate(Document()));
@@ -3355,11 +3410,11 @@ TEST(ExpressionObjectEvaluate, ShouldEvaluateFieldsWithinNestedObject) {
 
 TEST(ExpressionObjectEvaluate, ShouldEvaluateToEmptyDocumentIfAllFieldsAreMissing) {
     intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    auto object =
-        ExpressionObject::create(expCtx, {{"a", ExpressionFieldPath::create(expCtx, "missing")}});
+    auto object = expressionObjectCreateHelper(
+        expCtx, {{"a", ExpressionFieldPath::create(expCtx, "missing")}});
     ASSERT_VALUE_EQ(Value(Document{}), object->evaluate(Document()));
 
-    auto objectWithNestedObject = ExpressionObject::create(expCtx, {{"nested", object}});
+    auto objectWithNestedObject = expressionObjectCreateHelper(expCtx, {{"nested", object}});
     ASSERT_VALUE_EQ(Value(Document{{"nested", Document{}}}),
                     objectWithNestedObject->evaluate(Document()));
 }
@@ -3370,7 +3425,7 @@ TEST(ExpressionObjectEvaluate, ShouldEvaluateToEmptyDocumentIfAllFieldsAreMissin
 
 TEST(ExpressionObjectDependencies, ConstantValuesShouldNotBeAddedToDependencies) {
     intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    auto object = ExpressionObject::create(expCtx, {{"a", makeConstant(5)}});
+    auto object = expressionObjectCreateHelper(expCtx, {{"a", makeConstant(5)}});
     DepsTracker deps;
     object->addDependencies(&deps);
     ASSERT_EQ(deps.fields.size(), 0UL);
@@ -3379,7 +3434,7 @@ TEST(ExpressionObjectDependencies, ConstantValuesShouldNotBeAddedToDependencies)
 TEST(ExpressionObjectDependencies, FieldPathsShouldBeAddedToDependencies) {
     intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
     auto object =
-        ExpressionObject::create(expCtx, {{"x", ExpressionFieldPath::create(expCtx, "c.d")}});
+        expressionObjectCreateHelper(expCtx, {{"x", ExpressionFieldPath::create(expCtx, "c.d")}});
     DepsTracker deps;
     object->addDependencies(&deps);
     ASSERT_EQ(deps.fields.size(), 1UL);
@@ -3458,7 +3513,7 @@ TEST(ExpressionObjectOptimizations, OptimizingAnObjectShouldOptimizeSubExpressio
     VariablesParseState vps = expCtx->variablesParseState;
     auto addExpression =
         ExpressionAdd::parse(expCtx, BSON("$add" << BSON_ARRAY(1 << 2)).firstElement(), vps);
-    auto object = ExpressionObject::create(expCtx, {{"a", addExpression}});
+    auto object = expressionObjectCreateHelper(expCtx, {{"a", addExpression}});
     ASSERT_EQ(object->getChildExpressions().size(), 1UL);
 
     auto optimized = object->optimize();
@@ -5952,113 +6007,135 @@ TEST(GetComputedPathsTest, ExpressionMapNotConsideredRenameWithDottedInputPath) 
 
 namespace ExpressionRegexTest {
 
-TEST(ExpressionRegexFindTest, BasicTest) {
-    Value input(fromjson("{input: 'asdf', regex: '^as' }"));
-    BSONObj expectedOut(fromjson("{match: 'as', idx:0, captures:[]}"));
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    ExpressionRegexFind regexF(expCtx);
-    regexF.addOperand(ExpressionConstant::create(expCtx, input));
-    Value output = regexF.evaluate(Document());
-    ASSERT_BSONOBJ_EQ(toBson(output.getDocument()), expectedOut);
+class ExpressionRegexTest {
+public:
+    template <typename ExpressionRegexSubClass>
+    static intrusive_ptr<Expression> generateOptimizedExpression(const BSONObj& input) {
+        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+        auto expression = ExpressionRegexSubClass::parse(
+            expCtx, input.firstElement(), expCtx->variablesParseState);
+        return expression->optimize();
+    }
+
+    static void testAllExpressions(const BSONObj& input,
+                                   bool optimized,
+                                   const std::vector<Value>& expectedFindAllOutput) {
+        {
+            // For $regexFindAll.
+            auto expression = generateOptimizedExpression<ExpressionRegexFindAll>(input);
+            auto regexFindAllExpr = dynamic_cast<ExpressionRegexFindAll*>(expression.get());
+            ASSERT_EQ(regexFindAllExpr->hasConstantRegex(), optimized);
+            Value output = regexFindAllExpr->evaluate(Document());
+            ASSERT_VALUE_EQ(output, Value(expectedFindAllOutput));
+        }
+
+        {
+            // For $regexFind.
+            auto expression = generateOptimizedExpression<ExpressionRegexFind>(input);
+            auto regexFindExpr = dynamic_cast<ExpressionRegexFind*>(expression.get());
+            ASSERT_EQ(regexFindExpr->hasConstantRegex(), optimized);
+            Value output = regexFindExpr->evaluate(Document());
+            ASSERT_VALUE_EQ(
+                output, expectedFindAllOutput.empty() ? Value(BSONNULL) : expectedFindAllOutput[0]);
+        }
+
+        {
+            // For $regexMatch.
+            auto expression = generateOptimizedExpression<ExpressionRegexMatch>(input);
+            auto regexMatchExpr = dynamic_cast<ExpressionRegexMatch*>(expression.get());
+            ASSERT_EQ(regexMatchExpr->hasConstantRegex(), optimized);
+            Value output = regexMatchExpr->evaluate(Document());
+            ASSERT_VALUE_EQ(output, expectedFindAllOutput.empty() ? Value(false) : Value(true));
+        }
+    }
+};
+
+TEST(ExpressionRegexTest, BasicTest) {
+    ExpressionRegexTest::testAllExpressions(
+        fromjson("{$regexFindAll : {input: 'asdf', regex: '^as' }}"),
+        true,
+        {Value(fromjson("{match: 'as', idx:0, captures:[]}"))});
 }
 
-TEST(ExpressionRegexFindTest, ExtendedRegexOptions) {
-    Value input(fromjson("{input: 'FirstLine\\nSecondLine', regex: '^second' , options: 'mi'}"));
-    BSONObj expectedOut(fromjson("{match: 'Second', idx:10, captures:[]}"));
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    ExpressionRegexFind regexF(expCtx);
-    regexF.addOperand(ExpressionConstant::create(expCtx, input));
-    Value output = regexF.evaluate(Document());
-    ASSERT_BSONOBJ_EQ(toBson(output.getDocument()), expectedOut);
+TEST(ExpressionRegexTest, ExtendedRegexOptions) {
+    ExpressionRegexTest::testAllExpressions(
+        fromjson("{$regexFindAll : {input: 'FirstLine\\nSecondLine', regex: "
+                 "'^second' , options: 'mi'}}"),
+        true,
+        {Value(fromjson("{match: 'Second', idx:10, captures:[]}"))});
 }
 
-TEST(ExpressionRegexFindTest, FailureCase) {
-    Value input(
-        fromjson("{input: 'FirstLine\\nSecondLine', regex: {invalid : 'regex'} , options: 'mi'}"));
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    ExpressionRegexFind regexF(expCtx);
-    regexF.addOperand(ExpressionConstant::create(expCtx, input));
-    ASSERT_THROWS_CODE(regexF.evaluate(Document()), DBException, 51105);
+TEST(ExpressionRegexTest, MultipleMatches) {
+    ExpressionRegexTest::testAllExpressions(
+        fromjson("{$regexFindAll : {input: 'a1b2c3', regex: '([a-c][1-3])' }}"),
+        true,
+        {Value(fromjson("{match: 'a1', idx:0, captures:['a1']}")),
+         Value(fromjson("{match: 'b2', idx:2, captures:['b2']}")),
+         Value(fromjson("{match: 'c3', idx:4, captures:['c3']}"))});
 }
 
-TEST(ExpressionRegexFindAllTest, MultipleMatches) {
-    Value input(fromjson("{input: 'a1b2c3', regex: '([a-c][1-3])' }"));
-    std::vector<Value> expectedOut = {Value(fromjson("{match: 'a1', idx:0, captures:['a1']}")),
-                                      Value(fromjson("{match: 'b2', idx:2, captures:['b2']}")),
-                                      Value(fromjson("{match: 'c3', idx:4, captures:['c3']}"))};
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    ExpressionRegexFindAll regexF(expCtx);
-    regexF.addOperand(ExpressionConstant::create(expCtx, input));
-    Value output = regexF.evaluate(Document());
-    ASSERT_VALUE_EQ(output, Value(expectedOut));
+TEST(ExpressionRegexTest, OptimizPatternWhenInputIsVariable) {
+    ExpressionRegexTest::testAllExpressions(
+        fromjson("{$regexFindAll : {input: '$input', regex: '([a-c][1-3])' }}"), true, {});
 }
 
-TEST(ExpressionRegexFindAllTest, NoMatch) {
-    Value input(fromjson("{input: 'a1b2c3', regex: 'ab' }"));
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    ExpressionRegexFindAll regexF(expCtx);
-    regexF.addOperand(ExpressionConstant::create(expCtx, input));
-    Value output = regexF.evaluate(Document());
-    ASSERT_VALUE_EQ(output, Value(std::vector<Value>()));
+TEST(ExpressionRegexTest, NoOptimizePatternWhenRegexVariable) {
+    ExpressionRegexTest::testAllExpressions(
+        fromjson("{$regexFindAll : {input: 'asdf', regex: '$regex' }}"), false, {});
 }
 
-TEST(ExpressionRegexFindAllTest, FailureCase) {
-    Value input(fromjson("{input: 'FirstLine\\nSecondLine', regex: '[0-9'}"));
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    ExpressionRegexFindAll regexF(expCtx);
-    regexF.addOperand(ExpressionConstant::create(expCtx, input));
-    ASSERT_THROWS_CODE(regexF.evaluate(Document()), DBException, 51111);
+TEST(ExpressionRegexTest, NoOptimizePatternWhenOptionsVariable) {
+    ExpressionRegexTest::testAllExpressions(
+        fromjson("{$regexFindAll : {input: 'asdf', regex: '(asdf)', options: '$options' }}"),
+        false,
+        {Value(fromjson("{match: 'asdf', idx:0, captures:['asdf']}"))});
 }
 
-TEST(ExpressionRegexFindAllTest, InvalidUTF8InInput) {
+TEST(ExpressionRegexTest, NoMatch) {
+    ExpressionRegexTest::testAllExpressions(
+        fromjson("{$regexFindAll : {input: 'a1b2c3', regex: 'ab' }}"), true, {});
+}
+
+TEST(ExpressionRegexTest, FailureCaseBadRegexType) {
+    ASSERT_THROWS_CODE(ExpressionRegexTest::testAllExpressions(
+                           fromjson("{$regexFindAll : {input: 'FirstLine\\nSecondLine', regex: "
+                                    "{invalid : 'regex'} , options: 'mi'}}"),
+                           false,
+                           {}),
+                       AssertionException,
+                       51105);
+}
+
+TEST(ExpressionRegexTest, FailureCaseBadRegexPattern) {
+    ASSERT_THROWS_CODE(
+        ExpressionRegexTest::testAllExpressions(
+            fromjson("{$regexFindAll : {input: 'FirstLine\\nSecondLine', regex: '[0-9'}}"),
+            false,
+            {}),
+        AssertionException,
+        51111);
+}
+
+TEST(ExpressionRegexTest, InvalidUTF8InInput) {
     std::string inputField = "1234 ";
     // Append an invalid UTF-8 character.
     inputField += '\xe5';
     inputField += "  1234";
-    Value input(fromjson("{input: '" + inputField + "', regex: '[0-9]'}"));
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    ExpressionRegexFindAll regexF(expCtx);
-    regexF.addOperand(ExpressionConstant::create(expCtx, input));
+    BSONObj input(fromjson("{$regexFindAll: {input: '" + inputField + "', regex: '[0-9]'}}"));
+
     // Verify that PCRE will error during execution if input is not a valid UTF-8.
-    ASSERT_THROWS_CODE(regexF.evaluate(Document()), DBException, 51156);
+    ASSERT_THROWS_CODE(
+        ExpressionRegexTest::testAllExpressions(input, true, {}), AssertionException, 51156);
 }
 
-TEST(ExpressionRegexFindAllTest, InvalidUTF8InRegex) {
+TEST(ExpressionRegexTest, InvalidUTF8InRegex) {
     std::string regexField = "1234 ";
     // Append an invalid UTF-8 character.
     regexField += '\xe5';
-    Value input(fromjson("{input: '123456', regex: '" + regexField + "'}"));
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    ExpressionRegexFindAll regexF(expCtx);
-    regexF.addOperand(ExpressionConstant::create(expCtx, input));
+    BSONObj input(fromjson("{$regexFindAll: {input: '123456', regex: '" + regexField + "'}}"));
     // Verify that PCRE will error if REGEX is not a valid UTF-8.
-    ASSERT_THROWS_CODE(regexF.evaluate(Document()), DBException, 51111);
-}
-
-TEST(ExpressionRegexMatchTest, NoMatch) {
-    Value input(fromjson("{input: 'asdf', regex: '^sd' }"));
-    Value expectedOut(false);
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    ExpressionRegexMatch regexMatchExpr(expCtx);
-    regexMatchExpr.addOperand(ExpressionConstant::create(expCtx, input));
-    ASSERT_VALUE_EQ(regexMatchExpr.evaluate(Document()), expectedOut);
-}
-
-TEST(ExpressionRegexMatchTest, ExtendedRegexOptions) {
-    Value input(fromjson("{input: 'FirstLine\\nSecondLine', regex: '^second' , options: 'mi'}"));
-    Value expectedOut(true);
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    ExpressionRegexMatch regexMatchExpr(expCtx);
-    regexMatchExpr.addOperand(ExpressionConstant::create(expCtx, input));
-    ASSERT_VALUE_EQ(regexMatchExpr.evaluate(Document()), expectedOut);
-}
-
-TEST(ExpressionRegexMatchTest, FailureCase) {
-    Value input(fromjson("{regex: 'valid', input: {invalid : 'input'} , options: 'mi'}"));
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    ExpressionRegexMatch regexMatchExpr(expCtx);
-    regexMatchExpr.addOperand(ExpressionConstant::create(expCtx, input));
-    ASSERT_THROWS_CODE(regexMatchExpr.evaluate(Document()), DBException, 51104);
+    ASSERT_THROWS_CODE(
+        ExpressionRegexTest::testAllExpressions(input, false, {}), AssertionException, 51111);
 }
 
 }  // namespace ExpressionRegexTest

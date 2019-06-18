@@ -51,7 +51,7 @@
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/set_shard_version_request.h"
 #include "mongo/util/log.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace {
@@ -229,7 +229,7 @@ public:
             }
 
             boost::optional<Lock::CollectionLock> collLock;
-            collLock.emplace(opCtx->lockState(), nss.ns(), MODE_IS);
+            collLock.emplace(opCtx, nss, MODE_IS);
 
             auto* const css = CollectionShardingState::get(opCtx, nss);
             const ChunkVersion collectionShardVersion = [&] {

@@ -578,7 +578,16 @@ public:
         if (cmdObj.hasField("handshake"))
             return true;
 
-        auto metadataResult = rpc::ReplSetMetadata::readFromMetadata(cmdObj);
+        // Wall clock times are required in ReplSetMetadata when FCV is 4.2. Arbiters trivially
+        // have FCV equal to 4.2, so they are excluded from this check.
+        bool isArbiter = replCoord->getMemberState() == MemberState::RS_ARBITER;
+        bool requireWallTime =
+            (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+             serverGlobalParams.featureCompatibility.getVersion() ==
+                 ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42 &&
+             !isArbiter);
+
+        auto metadataResult = rpc::ReplSetMetadata::readFromMetadata(cmdObj, requireWallTime);
         if (metadataResult.isOK()) {
             // New style update position command has metadata, which may inform the
             // upstream of a higher term.
@@ -592,7 +601,13 @@ public:
 
         UpdatePositionArgs args;
 
-        status = args.initialize(cmdObj);
+        // re-check requireWallTime
+        requireWallTime =
+            (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+             serverGlobalParams.featureCompatibility.getVersion() ==
+                 ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42 &&
+             !isArbiter);
+        status = args.initialize(cmdObj, requireWallTime);
         if (status.isOK()) {
             status = replCoord->processReplSetUpdatePosition(args, &configVersion);
 
@@ -616,9 +631,8 @@ namespace {
  * Used to set the hasData field on replset heartbeat command response.
  */
 bool replHasDatabases(OperationContext* opCtx) {
-    std::vector<string> names;
     StorageEngine* storageEngine = getGlobalServiceContext()->getStorageEngine();
-    storageEngine->listDatabases(&names);
+    std::vector<string> names = storageEngine->listDatabases();
 
     if (names.size() >= 2)
         return true;
@@ -666,13 +680,15 @@ public:
         ReplSetHeartbeatArgsV1 args;
         uassertStatusOK(args.initialize(cmdObj));
 
+        LOG_FOR_HEARTBEATS(2) << "Processing heartbeat request from "
+                              << cmdObj.getStringField("from") << ", " << cmdObj;
         ReplSetHeartbeatResponse response;
         status = ReplicationCoordinator::get(opCtx)->processHeartbeatV1(args, &response);
         if (status.isOK())
             response.addToBSON(&result);
 
-        LOG_FOR_HEARTBEATS(2) << "Processed heartbeat from " << cmdObj.getStringField("from")
-                              << " and generated response, " << response;
+        LOG_FOR_HEARTBEATS(2) << "Generated heartbeat response to  "
+                              << cmdObj.getStringField("from") << ", " << response;
         uassertStatusOK(status);
         return true;
     }

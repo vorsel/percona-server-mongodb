@@ -68,7 +68,6 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/exit_code.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/sock.h"
 #include "mongo/util/string_map.h"
 #include "mongo/util/time_support.h"
@@ -637,7 +636,7 @@ namespace audit {
             Client* client,
             const NamespaceString& ns,
             const BSONObj& query,
-            const BSONObj& updateObj,
+            const write_ops::UpdateModification& update,
             bool isUpsert,
             bool isMulti,
             ErrorCodes::Error result) {
@@ -647,7 +646,7 @@ namespace audit {
 
         {
             const BSONObj args = BSON("pattern" << query <<
-                                      "updateObj" << updateObj <<
+                                      "updateObj" << update.getUpdateClassic() <<
                                       "upsert" << isUpsert <<
                                       "multi" << isMulti); 
             _auditAuthz(client, ns, "update", args, result);
@@ -655,7 +654,7 @@ namespace audit {
         {
             const BSONObj params = BSON("db" << ns.db() <<
                                         "pattern" << query <<
-                                        "updateObj" << updateObj <<
+                                        "updateObj" << update.getUpdateClassic() <<
                                         "upsert" << isUpsert <<
                                         "multi" << isMulti); 
             _auditSystemUsers(client, ns, "updateUser", params, result);

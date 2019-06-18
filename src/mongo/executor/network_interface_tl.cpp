@@ -57,7 +57,7 @@ NetworkInterfaceTL::NetworkInterfaceTL(std::string instanceName,
       _connPoolOpts(std::move(connPoolOpts)),
       _onConnectHook(std::move(onConnectHook)),
       _metadataHook(std::move(metadataHook)),
-      _inShutdown(false) {}
+      _state(kDefault) {}
 
 std::string NetworkInterfaceTL::getDiagnosticString() {
     return "DEPRECATED: getDiagnosticString is deprecated in NetworkInterfaceTL";
@@ -97,13 +97,15 @@ void NetworkInterfaceTL::startup() {
 
     _reactor = _tl->getReactor(transport::TransportLayer::kNewReactor);
     auto typeFactory = std::make_unique<connection_pool_tl::TLTypeFactory>(
-        _reactor, _tl, std::move(_onConnectHook));
-    _pool = std::make_unique<ConnectionPool>(
+        _reactor, _tl, std::move(_onConnectHook), _connPoolOpts);
+    _pool = std::make_shared<ConnectionPool>(
         std::move(typeFactory), std::string("NetworkInterfaceTL-") + _instanceName, _connPoolOpts);
     _ioThread = stdx::thread([this] {
         setThreadName(_instanceName);
         _run();
     });
+
+    invariant(_state.swap(kStarted) == kDefault);
 }
 
 void NetworkInterfaceTL::_run() {
@@ -124,7 +126,7 @@ void NetworkInterfaceTL::_run() {
 }
 
 void NetworkInterfaceTL::shutdown() {
-    if (_inShutdown.swap(true))
+    if (_state.swap(kStopped) != kStarted)
         return;
 
     LOG(2) << "Shutting down network interface.";
@@ -138,7 +140,7 @@ void NetworkInterfaceTL::shutdown() {
 }
 
 bool NetworkInterfaceTL::inShutdown() const {
-    return _inShutdown.load();
+    return _state.load() == kStopped;
 }
 
 void NetworkInterfaceTL::waitForWork() {
@@ -254,15 +256,14 @@ Status NetworkInterfaceTL::startCommand(const TaskExecutor::CallbackHandle& cbHa
         std::move(connFuture)
             .getAsync([ baton, reactor = _reactor.get(), rw = std::move(remainingWork) ](
                 StatusWith<ConnectionPool::ConnectionHandle> swConn) mutable {
-                baton->schedule([ rw = std::move(rw),
-                                  swConn = std::move(swConn) ](OperationContext * opCtx) mutable {
-                    if (opCtx) {
-                        std::move(rw)(std::move(swConn));
-                    } else {
-                        std::move(rw)(Status(ErrorCodes::ShutdownInProgress,
-                                             "baton is detached, failing operation"));
-                    }
-                });
+                baton->schedule(
+                    [ rw = std::move(rw), swConn = std::move(swConn) ](Status status) mutable {
+                        if (status.isOK()) {
+                            std::move(rw)(std::move(swConn));
+                        } else {
+                            std::move(rw)(std::move(status));
+                        }
+                    });
             });
     } else {
         // otherwise we're happy to run inline

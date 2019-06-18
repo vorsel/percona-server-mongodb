@@ -35,10 +35,10 @@
 
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/index_catalog_entry.h"
-#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/cursor_manager.h"
@@ -172,7 +172,7 @@ repl::OplogEntry MongoInterfaceStandalone::lookUpOplogEntryByOpTime(OperationCon
 
 bool MongoInterfaceStandalone::isSharded(OperationContext* opCtx, const NamespaceString& nss) {
     Lock::DBLock dbLock(opCtx, nss.db(), MODE_IS);
-    Lock::CollectionLock collLock(opCtx->lockState(), nss.ns(), MODE_IS);
+    Lock::CollectionLock collLock(opCtx, nss, MODE_IS);
     const auto metadata = CollectionShardingState::get(opCtx, nss)->getCurrentMetadata();
     return metadata->isSharded();
 }
@@ -288,7 +288,7 @@ void MongoInterfaceStandalone::appendLatencyStats(OperationContext* opCtx,
                                                   const NamespaceString& nss,
                                                   bool includeHistograms,
                                                   BSONObjBuilder* builder) const {
-    Top::get(opCtx->getServiceContext()).appendLatencyStats(nss.ns(), includeHistograms, builder);
+    Top::get(opCtx->getServiceContext()).appendLatencyStats(nss, includeHistograms, builder);
 }
 
 Status MongoInterfaceStandalone::appendStorageStats(OperationContext* opCtx,
@@ -536,7 +536,7 @@ bool MongoInterfaceStandalone::uniqueKeyIsSupportedByIndex(
     // db version or do anything else. We simply want to protect against concurrent modifications to
     // the catalog.
     Lock::DBLock dbLock(opCtx, nss.db(), MODE_IS);
-    Lock::CollectionLock collLock(opCtx->lockState(), nss.ns(), MODE_IS);
+    Lock::CollectionLock collLock(opCtx, nss, MODE_IS);
     auto databaseHolder = DatabaseHolder::get(opCtx);
     auto db = databaseHolder->getDb(opCtx, nss.db());
     auto collection = db ? db->getCollection(opCtx, nss) : nullptr;
@@ -573,6 +573,9 @@ BSONObj MongoInterfaceStandalone::_reportCurrentOpForClient(
                 CurOp::get(*clientOpCtx)->getLockStatsBase())) {
             fillLockerInfo(*lockerInfo, builder);
         }
+
+        auto flowControlStats = clientOpCtx->lockState()->getFlowControlStats();
+        flowControlStats.writeToBuilder(builder);
     }
 
     return builder.obj();

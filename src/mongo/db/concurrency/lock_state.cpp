@@ -46,8 +46,8 @@
 #include "mongo/util/debug_util.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -433,8 +433,43 @@ void LockerImpl::endWriteUnitOfWork() {
     }
 }
 
-bool LockerImpl::releaseWriteUnitOfWork(LockSnapshot* stateOut) {
-    // Only the global WUOW can be released.
+void LockerImpl::releaseWriteUnitOfWork(WUOWLockSnapshot* stateOut) {
+    stateOut->wuowNestingLevel = _wuowNestingLevel;
+    _wuowNestingLevel = 0;
+
+    for (auto it = _requests.begin(); _numResourcesToUnlockAtEndUnitOfWork > 0; it.next()) {
+        if (it->unlockPending) {
+            while (it->unlockPending) {
+                it->unlockPending--;
+                stateOut->unlockPendingLocks.push_back({it.key(), it->mode});
+            }
+            _numResourcesToUnlockAtEndUnitOfWork--;
+        }
+    }
+}
+
+void LockerImpl::restoreWriteUnitOfWork(const WUOWLockSnapshot& stateToRestore) {
+    invariant(_numResourcesToUnlockAtEndUnitOfWork == 0);
+    invariant(!inAWriteUnitOfWork());
+
+    for (auto& lock : stateToRestore.unlockPendingLocks) {
+        auto it = _requests.begin();
+        while (it && !(it.key() == lock.resourceId && it->mode == lock.mode)) {
+            it.next();
+        }
+        invariant(!it.finished());
+        if (!it->unlockPending) {
+            _numResourcesToUnlockAtEndUnitOfWork++;
+        }
+        it->unlockPending++;
+    }
+    // Equivalent to call beginWriteUnitOfWork() multiple times.
+    _wuowNestingLevel = stateToRestore.wuowNestingLevel;
+}
+
+bool LockerImpl::releaseWriteUnitOfWorkAndUnlock(LockSnapshot* stateOut) {
+    // Only the global WUOW can be released, since we never need to release and restore
+    // nested WUOW's. Thus we don't have to remember the nesting level.
     invariant(_wuowNestingLevel == 1);
     --_wuowNestingLevel;
     invariant(!isGlobalLockedRecursively());
@@ -444,14 +479,15 @@ bool LockerImpl::releaseWriteUnitOfWork(LockSnapshot* stateOut) {
     for (auto it = _requests.begin(); it; it.next()) {
         // No converted lock so we don't need to unlock more than once.
         invariant(it->unlockPending == 1);
+        it->unlockPending--;
     }
     _numResourcesToUnlockAtEndUnitOfWork = 0;
 
     return saveLockStateAndUnlock(stateOut);
 }
 
-void LockerImpl::restoreWriteUnitOfWork(OperationContext* opCtx,
-                                        const LockSnapshot& stateToRestore) {
+void LockerImpl::restoreWriteUnitOfWorkAndLock(OperationContext* opCtx,
+                                               const LockSnapshot& stateToRestore) {
     if (stateToRestore.globalMode != MODE_NONE) {
         restoreLockState(opCtx, stateToRestore);
     }
@@ -494,14 +530,21 @@ bool LockerImpl::unlock(ResourceId resId) {
         return false;
 
     if (inAWriteUnitOfWork() && _shouldDelayUnlock(it.key(), (it->mode))) {
+        // Only delay unlocking if the lock is not acquired more than once. Otherwise, we can simply
+        // call _unlockImpl to decrement recursiveCount instead of incrementing unlockPending. This
+        // is safe because the lock is still being held in the strongest mode necessary.
+        if (it->recursiveCount > 1) {
+            // Invariant that the lock is still being held.
+            invariant(!_unlockImpl(&it));
+            return false;
+        }
         if (!it->unlockPending) {
             _numResourcesToUnlockAtEndUnitOfWork++;
         }
         it->unlockPending++;
-        // unlockPending will only be incremented if a lock is converted and unlock() is called
-        // multiple times on one ResourceId.
-        invariant(it->unlockPending < LockModesCount);
-
+        // unlockPending will be incremented if a lock is converted or acquired in the same mode
+        // recursively, and unlock() is called multiple times on one ResourceId.
+        invariant(it->unlockPending <= it->recursiveCount);
         return false;
     }
 
@@ -518,6 +561,7 @@ bool LockerImpl::unlockRSTLforPrepare() {
     // If the RSTL is 'unlockPending' and we are fully unlocking it, then we do not want to
     // attempt to unlock the RSTL when the WUOW ends, since it will already be unlocked.
     if (rstlRequest->unlockPending) {
+        rstlRequest->unlockPending = 0;
         _numResourcesToUnlockAtEndUnitOfWork--;
     }
 
@@ -588,6 +632,26 @@ bool LockerImpl::isCollectionLockedForMode(const NamespaceString& nss, LockMode 
     return false;
 }
 
+bool LockerImpl::wasGlobalLockTakenForWrite() const {
+    return _globalLockMode & ((1 << MODE_IX) | (1 << MODE_X));
+}
+
+bool LockerImpl::wasGlobalLockTakenInModeConflictingWithWrites() const {
+    return _wasGlobalLockTakenInModeConflictingWithWrites.load();
+}
+
+bool LockerImpl::wasGlobalLockTaken() const {
+    return _globalLockMode;
+}
+
+void LockerImpl::setGlobalLockTakenInMode(LockMode mode) {
+    _globalLockMode |= (1 << mode);
+
+    if (mode == MODE_IX || mode == MODE_X || mode == MODE_S) {
+        _wasGlobalLockTakenInModeConflictingWithWrites.store(true);
+    }
+}
+
 ResourceId LockerImpl::getWaitingResource() const {
     scoped_spinlock scopedLock(_lock);
 
@@ -653,8 +717,8 @@ bool LockerImpl::saveLockStateAndUnlock(Locker::LockSnapshot* stateOut) {
     stateOut->locks.clear();
     stateOut->globalMode = MODE_NONE;
 
-    // First, we look at the global lock.  There is special handling for this (as the flush
-    // lock goes along with it) so we store it separately from the more pedestrian locks.
+    // First, we look at the global lock.  There is special handling for this so we store it
+    // separately from the more pedestrian locks.
     LockRequestsMap::Iterator globalRequest = _requests.find(resourceIdGlobal);
     if (!globalRequest) {
         // If there's no global lock there isn't really anything to do. Check that.
@@ -707,15 +771,13 @@ bool LockerImpl::saveLockStateAndUnlock(Locker::LockSnapshot* stateOut) {
 }
 
 void LockerImpl::restoreLockState(OperationContext* opCtx, const Locker::LockSnapshot& state) {
-    // We shouldn't be saving and restoring lock state from inside a WriteUnitOfWork.
+    // We shouldn't be restoring lock state from inside a WriteUnitOfWork.
     invariant(!inAWriteUnitOfWork());
     invariant(_modeForTicket == MODE_NONE);
+    invariant(_clientState.load() == kInactive);
 
-    if (opCtx && (state.globalMode == LockMode::MODE_IX)) {
-        auto ticketholder = FlowControlTicketholder::get(opCtx);
-        if (ticketholder) {
-            ticketholder->getTicket(opCtx);
-        }
+    if (opCtx) {
+        getFlowControlTicket(opCtx, state.globalMode);
     }
 
     std::vector<OneLock>::const_iterator it = state.locks.begin();
@@ -772,8 +834,8 @@ LockResult LockerImpl::lockBegin(OperationContext* opCtx, ResourceId resId, Lock
     globalStats.recordAcquisition(_id, resId, mode);
     _stats.recordAcquisition(resId, mode);
 
-    // Give priority to the full modes for global, parallel batch writer mode,
-    // and flush lock so we don't stall global operations such as shutdown or flush.
+    // Give priority to the full modes for Global, PBWM, and RSTL resources so we don't stall global
+    // operations such as shutdown or stepdown.
     const ResourceType resType = resId.getType();
     if (resType == RESOURCE_GLOBAL) {
         if (mode == MODE_S || mode == MODE_X) {
@@ -781,7 +843,7 @@ LockResult LockerImpl::lockBegin(OperationContext* opCtx, ResourceId resId, Lock
             request->compatibleFirst = true;
         }
     } else if (resType != RESOURCE_MUTEX) {
-        // This is all sanity checks that the global and flush locks are always be acquired
+        // This is all sanity checks that the global locks are always be acquired
         // before any other lock has been acquired and they must be in sync with the nesting.
         DEV {
             const LockRequestsMap::Iterator itGlobal = _requests.find(resourceIdGlobal);
@@ -897,6 +959,20 @@ void LockerImpl::lockComplete(OperationContext* opCtx,
 
     invariant(result == LOCK_OK);
     unlockOnErrorGuard.dismiss();
+}
+
+void LockerImpl::getFlowControlTicket(OperationContext* opCtx, LockMode lockMode) {
+    auto ticketholder = FlowControlTicketholder::get(opCtx);
+    if (ticketholder && lockMode == LockMode::MODE_IX && _clientState.load() == kInactive &&
+        opCtx->shouldParticipateInFlowControl()) {
+        // FlowControl only acts when a MODE_IX global lock is being taken. The clientState is only
+        // being modified here to change serverStatus' `globalLock.currentQueue` metrics. This
+        // method must not exit with a side-effect on the clientState. That value is also used for
+        // tracking whether other resources need to be released.
+        _clientState.store(kQueuedWriter);
+        auto restoreState = makeGuard([&] { _clientState.store(kInactive); });
+        ticketholder->getTicket(opCtx, &_flowControlStats);
+    }
 }
 
 LockResult LockerImpl::lockRSTLBegin(OperationContext* opCtx, LockMode mode) {

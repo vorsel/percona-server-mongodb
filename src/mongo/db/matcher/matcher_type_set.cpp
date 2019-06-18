@@ -89,7 +89,7 @@ Status parseSingleType(BSONElement elt,
         return addAliasToTypeSet(elt.valueStringData(), aliasMap, typeSet);
     }
 
-    auto valueAsInt = MatchExpressionParser::parseIntegerElementToInt(elt);
+    auto valueAsInt = elt.parseIntegerElementToInt();
     if (!valueAsInt.isOK()) {
         return Status(ErrorCodes::BadValue,
                       str::stream() << "Invalid numerical type code: " << elt.number());
@@ -166,4 +166,13 @@ void MatcherTypeSet::toBSONArray(BSONArrayBuilder* builder) const {
     }
 }
 
+BSONTypeSet BSONTypeSet::parseFromBSON(const BSONElement& element) {
+    // BSON type can be specified with a type alias, other values will be rejected.
+    auto typeSet = uassertStatusOK(JSONSchemaParser::parseTypeSet(element, kTypeAliasMap));
+    return BSONTypeSet(typeSet);
+}
+
+void BSONTypeSet::serializeToBSON(StringData fieldName, BSONObjBuilder* builder) const {
+    builder->appendArray(fieldName, _typeSet.toBSONArray());
+}
 }  // namespace mongo

@@ -110,7 +110,7 @@
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/signal_handlers.h"
 #include "mongo/util/stacktrace.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 #include "mongo/util/text.h"
 #include "mongo/util/version.h"
 
@@ -121,6 +121,9 @@ using logger::LogComponent;
 #if !defined(__has_feature)
 #define __has_feature(x) 0
 #endif
+
+// Failpoint for disabling replicaSetChangeConfigServerUpdateHook calls on signaled mongos.
+MONGO_FAIL_POINT_DEFINE(failReplicaSetChangeConfigServerUpdateHook);
 
 namespace {
 
@@ -144,8 +147,7 @@ Status waitForSigningKeys(OperationContext* opCtx) {
         auto rsm = ReplicaSetMonitor::get(configCS.getSetName());
         // mongod will set minWireVersion == maxWireVersion for isMaster requests from
         // internalClient.
-        if (rsm && (rsm->getMaxWireVersion() < WireVersion::SUPPORTS_OP_MSG ||
-                    rsm->getMaxWireVersion() != rsm->getMinWireVersion())) {
+        if (rsm && (rsm->getMaxWireVersion() < WireVersion::SUPPORTS_OP_MSG)) {
             log() << "Not waiting for signing keys, not supported by the config shard "
                   << configCS.getSetName();
             return Status::OK();
@@ -342,6 +344,52 @@ void initWireSpec() {
     spec.isInternalClient = true;
 }
 
+class ShardingReplicaSetChangeListener final : public ReplicaSetChangeNotifier::Listener {
+public:
+    ShardingReplicaSetChangeListener(ServiceContext* serviceContext)
+        : _serviceContext(serviceContext) {}
+    ~ShardingReplicaSetChangeListener() final = default;
+
+    void onFoundSet(const Key& key) final {}
+
+    void onConfirmedSet(const State& state) final {
+        auto connStr = state.connStr;
+
+        auto fun = [ serviceContext = _serviceContext, connStr ](auto args) {
+            if (ErrorCodes::isCancelationError(args.status.code())) {
+                return;
+            }
+            uassertStatusOK(args.status);
+
+            LOG(0) << "Updating sharding state with confirmed set " << connStr;
+
+            Grid::get(serviceContext)->shardRegistry()->updateReplSetHosts(connStr);
+
+            if (MONGO_FAIL_POINT(failReplicaSetChangeConfigServerUpdateHook)) {
+                return;
+            }
+            ShardRegistry::updateReplicaSetOnConfigServer(serviceContext, connStr);
+        };
+
+        auto executor = Grid::get(_serviceContext)->getExecutorPool()->getFixedExecutor();
+        auto schedStatus = executor->scheduleWork(std::move(fun)).getStatus();
+        if (ErrorCodes::isCancelationError(schedStatus.code())) {
+            LOG(2) << "Unable to schedule confirmed set update due to " << schedStatus;
+            return;
+        }
+        uassertStatusOK(schedStatus);
+    }
+
+    void onPossibleSet(const State& state) final {
+        Grid::get(_serviceContext)->shardRegistry()->updateReplSetHosts(state.connStr);
+    }
+
+    void onDroppedSet(const Key& key) final {}
+
+private:
+    ServiceContext* _serviceContext;
+};
+
 ExitCode runMongosServer(ServiceContext* serviceContext) {
     Client::initThread("mongosMain");
     printShardingVersionInfo(false);
@@ -380,10 +428,11 @@ ExitCode runMongosServer(ServiceContext* serviceContext) {
 
     shardConnectionPool.addHook(new ShardingConnectionHook(true, std::move(shardedHookList)));
 
-    ReplicaSetMonitor::setAsynchronousConfigChangeHook(
-        &ShardRegistry::replicaSetChangeConfigServerUpdateHook);
-    ReplicaSetMonitor::setSynchronousConfigChangeHook(
-        &ShardRegistry::replicaSetChangeShardRegistryUpdateHook);
+    // Hook up a Listener for changes from the ReplicaSetMonitor
+    // This will last for the scope of this function. i.e. until shutdown finishes
+    auto shardingRSCL =
+        ReplicaSetMonitor::getNotifier().makeListener<ShardingReplicaSetChangeListener>(
+            serviceContext);
 
     // Mongos connection pools already takes care of authenticating new connections so the
     // replica set connection shouldn't need to.

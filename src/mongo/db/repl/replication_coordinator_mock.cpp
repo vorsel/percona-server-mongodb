@@ -108,6 +108,11 @@ std::vector<MemberData> ReplicationCoordinatorMock::getMemberData() const {
     return {};
 }
 
+bool ReplicationCoordinatorMock::canAcceptNonLocalWrites() const {
+    MONGO_UNREACHABLE;
+    return false;
+}
+
 Status ReplicationCoordinatorMock::waitForMemberState(MemberState expectedState,
                                                       Milliseconds timeout) {
     MONGO_UNREACHABLE;
@@ -325,8 +330,8 @@ void ReplicationCoordinatorMock::processReplSetGetConfig(BSONObjBuilder* result)
 
 void ReplicationCoordinatorMock::processReplSetMetadata(const rpc::ReplSetMetadata& replMetadata) {}
 
-void ReplicationCoordinatorMock::advanceCommitPoint(const OpTime& committedOptime,
-                                                    bool fromSyncSource) {}
+void ReplicationCoordinatorMock::advanceCommitPoint(
+    const OpTimeAndWallTime& committedOptimeAndWallTime, bool fromSyncSource) {}
 
 void ReplicationCoordinatorMock::cancelAndRescheduleElectionTimeout() {}
 
@@ -451,6 +456,10 @@ OpTime ReplicationCoordinatorMock::getLastCommittedOpTime() const {
     return OpTime();
 }
 
+OpTimeAndWallTime ReplicationCoordinatorMock::getLastCommittedOpTimeAndWallTime() const {
+    return {OpTime(), Date_t::min()};
+}
+
 Status ReplicationCoordinatorMock::processReplSetRequestVotes(
     OperationContext* opCtx,
     const ReplSetRequestVotesArgs& args,
@@ -486,6 +495,9 @@ OpTime ReplicationCoordinatorMock::getCurrentCommittedSnapshotOpTime() const {
     return OpTime();
 }
 
+OpTimeAndWallTime ReplicationCoordinatorMock::getCurrentCommittedSnapshotOpTimeAndWallTime() const {
+    return OpTimeAndWallTime();
+}
 void ReplicationCoordinatorMock::waitUntilSnapshotCommitted(OperationContext* opCtx,
                                                             const Timestamp& untilSnapshot) {}
 

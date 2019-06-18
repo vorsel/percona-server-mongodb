@@ -46,8 +46,8 @@
 #include "mongo/db/repl/collection_bulk_loader_impl.h"
 #include "mongo/util/destructor_guard.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace repl {
@@ -82,7 +82,8 @@ Status CollectionBulkLoaderImpl::init(const std::vector<BSONObj>& secondaryIndex
             UnreplicatedWritesBlock uwb(_opCtx.get());
             // This enforces the buildIndexes setting in the replica set configuration.
             auto indexCatalog = coll->getIndexCatalog();
-            auto specs = indexCatalog->removeExistingIndexes(_opCtx.get(), secondaryIndexSpecs);
+            auto specs =
+                indexCatalog->removeExistingIndexesNoChecks(_opCtx.get(), secondaryIndexSpecs);
             if (specs.size()) {
                 _secondaryIndexesBlock->ignoreUniqueConstraint();
                 auto status =

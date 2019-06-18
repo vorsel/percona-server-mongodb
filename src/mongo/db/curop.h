@@ -55,6 +55,17 @@ public:
      */
     class AdditiveMetrics {
     public:
+        AdditiveMetrics() = default;
+        AdditiveMetrics(const AdditiveMetrics& other) {
+            this->add(other);
+        }
+
+        AdditiveMetrics& operator=(const AdditiveMetrics& other) {
+            reset();
+            add(other);
+            return *this;
+        }
+
         /**
          * Adds all the fields of another AdditiveMetrics object together with the fields of this
          * AdditiveMetrics instance.
@@ -62,10 +73,15 @@ public:
         void add(const AdditiveMetrics& otherMetrics);
 
         /**
+         * Resets all members to the default state.
+         */
+        void reset();
+
+        /**
          * Returns true if the AdditiveMetrics object we are comparing has the same field values as
          * this AdditiveMetrics instance.
          */
-        bool equals(const AdditiveMetrics& otherMetrics);
+        bool equals(const AdditiveMetrics& otherMetrics) const;
 
         /**
          * Increments writeConflicts by n.
@@ -113,16 +129,23 @@ public:
         boost::optional<long long> keysInserted;
         // Number of index keys removed.
         boost::optional<long long> keysDeleted;
+
+        // The following fields are atomic because they are reported by CurrentOp. This is an
+        // exception to the prescription that OpDebug only be used by the owning thread because
+        // these metrics are tracked over the course of a transaction by SingleTransactionStats,
+        // which is built on OpDebug.
+
         // Number of read conflicts caused by a prepared transaction.
-        boost::optional<long long> prepareReadConflicts;
-        boost::optional<long long> writeConflicts;
+        AtomicWord<long long> prepareReadConflicts{0};
+        AtomicWord<long long> writeConflicts{0};
     };
 
     OpDebug() = default;
 
     std::string report(Client* client,
                        const CurOp& curop,
-                       const SingleThreadedLockStats* lockStats) const;
+                       const SingleThreadedLockStats* lockStats,
+                       FlowControlTicketholder::CurOp flowControlStats) const;
 
     /**
      * Appends information about the current operation to "builder"
@@ -132,12 +155,18 @@ public:
      */
     void append(const CurOp& curop,
                 const SingleThreadedLockStats& lockStats,
+                FlowControlTicketholder::CurOp flowControlStats,
                 BSONObjBuilder& builder) const;
 
     /**
      * Copies relevant plan summary metrics to this OpDebug instance.
      */
     void setPlanSummaryMetrics(const PlanSummaryStats& planSummaryStats);
+
+    /**
+     * The resulting object has zeros omitted. As is typical in this file.
+     */
+    BSONObj makeFlowControlObject(FlowControlTicketholder::CurOp flowControlStats) const;
 
     // -------------------
 
@@ -196,6 +225,8 @@ public:
 
     // Stores storage statistics.
     std::shared_ptr<StorageStats> storageStats;
+
+    bool waitingForFlowControl{false};
 };
 
 /**

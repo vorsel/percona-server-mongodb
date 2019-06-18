@@ -113,6 +113,8 @@ public:
 
     virtual std::vector<MemberData> getMemberData() const override;
 
+    virtual bool canAcceptNonLocalWrites() const override;
+
     virtual Status waitForMemberState(MemberState expectedState, Milliseconds timeout) override;
 
     virtual bool isInPrimaryOrSecondaryState(OperationContext* opCtx) const override;
@@ -219,7 +221,8 @@ public:
 
     virtual void processReplSetMetadata(const rpc::ReplSetMetadata& replMetadata) override;
 
-    virtual void advanceCommitPoint(const OpTime& committedOpTime, bool fromSyncSource) override;
+    virtual void advanceCommitPoint(const OpTimeAndWallTime& committedOpTimeAndWallTime,
+                                    bool fromSyncSource) override;
 
     virtual void cancelAndRescheduleElectionTimeout() override;
 
@@ -270,6 +273,7 @@ public:
         boost::optional<rpc::OplogQueryMetadata> oqMetadata) override;
 
     virtual OpTime getLastCommittedOpTime() const override;
+    virtual OpTimeAndWallTime getLastCommittedOpTimeAndWallTime() const override;
 
     virtual Status processReplSetRequestVotes(OperationContext* opCtx,
                                               const ReplSetRequestVotesArgs& args,
@@ -298,6 +302,8 @@ public:
     virtual Status updateTerm(OperationContext* opCtx, long long term) override;
 
     virtual OpTime getCurrentCommittedSnapshotOpTime() const override;
+
+    virtual OpTimeAndWallTime getCurrentCommittedSnapshotOpTimeAndWallTime() const override;
 
     virtual void waitUntilSnapshotCommitted(OperationContext* opCtx,
                                             const Timestamp& untilSnapshot) override;
@@ -368,16 +374,24 @@ public:
     /**
      * Simple wrappers around _setLastOptime to make it easier to test.
      */
-    Status setLastAppliedOptime_forTest(long long cfgVer, long long memberId, const OpTime& opTime);
-    Status setLastDurableOptime_forTest(long long cfgVer, long long memberId, const OpTime& opTime);
+    Status setLastAppliedOptime_forTest(long long cfgVer,
+                                        long long memberId,
+                                        const OpTime& opTime,
+                                        Date_t wallTime = Date_t::min());
+    Status setLastDurableOptime_forTest(long long cfgVer,
+                                        long long memberId,
+                                        const OpTime& opTime,
+                                        Date_t wallTime = Date_t::min());
 
     /**
      * Simple test wrappers that expose private methods.
      */
-    boost::optional<OpTime> chooseStableOpTimeFromCandidates_forTest(
-        const std::set<OpTime>& candidates, const OpTime& maximumStableOpTime);
-    void cleanupStableOpTimeCandidates_forTest(std::set<OpTime>* candidates, OpTime stableOpTime);
-    std::set<OpTime> getStableOpTimeCandidates_forTest();
+    boost::optional<OpTimeAndWallTime> chooseStableOpTimeFromCandidates_forTest(
+        const std::set<OpTimeAndWallTime>& candidates,
+        const OpTimeAndWallTime& maximumStableOpTime);
+    void cleanupStableOpTimeCandidates_forTest(std::set<OpTimeAndWallTime>* candidates,
+                                               OpTimeAndWallTime stableOpTime);
+    std::set<OpTimeAndWallTime> getStableOpTimeCandidates_forTest();
 
     /**
      * Non-blocking version of updateTerm.
@@ -689,6 +703,12 @@ private:
      * Returns the OpTime of the current committed snapshot, if one exists.
      */
     OpTime _getCurrentCommittedSnapshotOpTime_inlock() const;
+
+    /**
+     * Returns the OpTime and corresponding wall clock time of the current committed snapshot, if
+     * one exists.
+     */
+    OpTimeAndWallTime _getCurrentCommittedSnapshotOpTimeAndWallTime_inlock() const;
 
     /**
      * Returns the OpTime of the current committed snapshot converted to LogicalTime.
@@ -1068,8 +1088,11 @@ private:
      * our lastApplied, unless 'fromSyncSource'=true, which guarantees we are on the same branch of
      * history as 'committedOpTime', so we update our commit point to min(committedOpTime,
      * lastApplied).
+     * Also updates corresponding wall clock time.
      */
-    void _advanceCommitPoint(WithLock lk, const OpTime& committedOpTime, bool fromSyncSource);
+    void _advanceCommitPoint(WithLock lk,
+                             const OpTimeAndWallTime& committedOpTimeAndWallTime,
+                             bool fromSyncSource);
 
     /**
      * Scan the memberData and determine the highest last applied or last
@@ -1080,7 +1103,7 @@ private:
      * Whether the last applied or last durable op time is used depends on whether
      * the config getWriteConcernMajorityShouldJournal is set.
      */
-    void _updateLastCommittedOpTime(WithLock lk);
+    void _updateLastCommittedOpTimeAndWallTime(WithLock lk);
 
     /**
      * Callback that attempts to set the current term in topology coordinator and
@@ -1119,13 +1142,13 @@ private:
      *
      * Returns true if the value was updated to `newCommittedSnapshot`.
      */
-    bool _updateCommittedSnapshot_inlock(const OpTime& newCommittedSnapshot);
+    bool _updateCommittedSnapshot_inlock(const OpTimeAndWallTime& newCommittedSnapshot);
 
     /**
      * A helper method that returns the current stable optime based on the current commit point and
      * set of stable optime candidates.
      */
-    boost::optional<OpTime> _recalculateStableOpTime(WithLock lk);
+    boost::optional<OpTimeAndWallTime> _recalculateStableOpTime(WithLock lk);
 
     /**
      * Calculates the 'stable' replication optime given a set of optime candidates and a maximum
@@ -1134,15 +1157,17 @@ private:
      *
      * Returns boost::none if there is no satisfactory candidate.
      */
-    boost::optional<OpTime> _chooseStableOpTimeFromCandidates(WithLock lk,
-                                                              const std::set<OpTime>& candidates,
-                                                              OpTime maximumStableOpTime);
+    boost::optional<OpTimeAndWallTime> _chooseStableOpTimeFromCandidates(
+        WithLock lk,
+        const std::set<OpTimeAndWallTime>& candidates,
+        OpTimeAndWallTime maximumStableOpTime);
 
     /**
      * Removes any optimes from the optime set 'candidates' that are less than
      * 'stableOpTime'.
      */
-    void _cleanupStableOpTimeCandidates(std::set<OpTime>* candidates, OpTime stableOpTime);
+    void _cleanupStableOpTimeCandidates(std::set<OpTimeAndWallTime>* candidates,
+                                        OpTimeAndWallTime stableOpTime);
 
     /**
      * Calculates and sets the value of the 'stable' replication optime for the storage engine.  See
@@ -1381,16 +1406,16 @@ private:
     // May only be written to while holding _mutex.
     AtomicWord<unsigned long long> _uncommittedSnapshotsSize;  // (I)
 
-    // The non-null OpTime and SnapshotName of the current snapshot used for committed reads, if
-    // there is one.
+    // The non-null OpTimeAndWallTime and SnapshotName of the current snapshot used for committed
+    // reads, if there is one.
     // When engaged, this must be <= _lastCommittedOpTime and < _uncommittedSnapshots.front().
-    boost::optional<OpTime> _currentCommittedSnapshot;  // (M)
+    boost::optional<OpTimeAndWallTime> _currentCommittedSnapshot;  // (M)
 
     // A set of optimes that are used for computing the replication system's current 'stable'
     // optime. Every time a node's applied optime is updated, it will be added to this set.
     // Optimes that are older than the current stable optime should get removed from this set.
     // This set should also be cleared if a rollback occurs.
-    std::set<OpTime> _stableOpTimeCandidates;  // (M)
+    std::set<OpTimeAndWallTime> _stableOpTimeCandidates;  // (M)
 
     // Used to signal threads that are waiting for new committed snapshots.
     stdx::condition_variable _currentCommittedSnapshotCond;  // (M)

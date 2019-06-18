@@ -2151,6 +2151,7 @@ __conn_write_base_config(WT_SESSION_IMPL *session, const char *cfg[])
 	    "in_memory=,"
 	    "log=(recover=),"
 	    "readonly=,"
+	    "timing_stress_for_test=,"
 	    "use_environment_priv=,"
 	    "verbose=,", &base_config));
 	__wt_config_init(session, &parser, base_config);
@@ -2773,6 +2774,9 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler,
 	 */
 	if (F_ISSET(conn, WT_CONN_SALVAGE))
 		WT_ERR(__wt_metadata_salvage(session));
+
+	/* Set the connection's base write generation. */
+	WT_ERR(__wt_metadata_set_base_write_gen(session));
 
 	WT_ERR(__wt_metadata_cursor(session, NULL));
 

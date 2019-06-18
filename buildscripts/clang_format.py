@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """Clang format script that provides the following.
 
 1. Ability to grab binaries where possible from LLVM.
@@ -7,7 +7,6 @@
 4. Has support for checking which files are to be checked.
 5. Supports validating and updating a set of files to the right coding style.
 """
-
 
 import difflib
 import glob
@@ -20,7 +19,10 @@ import sys
 import tarfile
 import tempfile
 import threading
-import urllib.request, urllib.error, urllib.parse
+import urllib.error
+import urllib.parse
+import urllib.request
+
 from distutils import spawn  # pylint: disable=no-name-in-module
 from optparse import OptionParser
 from multiprocessing import cpu_count

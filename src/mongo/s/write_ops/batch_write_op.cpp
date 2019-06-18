@@ -35,6 +35,7 @@
 
 #include "mongo/base/error_codes.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/ops/write_ops_parsers.h"
 #include "mongo/s/transaction_router.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/transitional_tools_do_not_use/vector_spooling.h"
@@ -47,11 +48,6 @@ using std::stringstream;
 using std::vector;
 
 namespace {
-
-// Conservative overhead per element contained in the write batch. This value was calculated as 1
-// byte (element type) + 5 bytes (max string encoding of the array index encoded as string and the
-// maximum key is 99999) + 1 byte (zero terminator) = 7 bytes
-const int kBSONArrayPerElementOverheadBytes = 7;
 
 struct WriteErrorDetailComp {
     bool operator()(const WriteErrorDetail* errorA, const WriteErrorDetail* errorB) const {
@@ -253,11 +249,6 @@ BatchWriteOp::BatchWriteOp(OperationContext* opCtx, const BatchedCommandRequest&
     }
 }
 
-BatchWriteOp::~BatchWriteOp() {
-    // Caller's responsibility to dispose of TargetedBatches
-    invariant(_targeted.empty());
-}
-
 Status BatchWriteOp::targetBatch(const NSTargeter& targeter,
                                  bool recordTargetErrors,
                                  std::map<ShardId, TargetedWriteBatch*>* targetedBatches) {
@@ -327,8 +318,10 @@ Status BatchWriteOp::targetBatch(const NSTargeter& targeter,
             if (TransactionRouter::get(_opCtx)) {
                 writeOp.setOpError(targetError);
                 ++numTargetErrors;
-                // Abandon the rest of the batch when in transaction since we are going to
-                // abort the entire transaction.
+
+                // Cleanup all the writes we have targetted in this call so far since we are going
+                // to abort the entire transaction.
+                _cancelBatches(targetError, std::move(batchMap));
 
                 return targetStatus;
             } else if (!recordTargetErrors) {
@@ -370,8 +363,9 @@ Status BatchWriteOp::targetBatch(const NSTargeter& targeter,
 
         // Account the array overhead once for the actual updates array and once for the statement
         // ids array, if retryable writes are used
-        const int writeSizeBytes = getWriteSizeBytes(writeOp) + kBSONArrayPerElementOverheadBytes +
-            (_batchTxnNum ? kBSONArrayPerElementOverheadBytes + 4 : 0);
+        const int writeSizeBytes = getWriteSizeBytes(writeOp) +
+            write_ops::kWriteCommandBSONArrayPerElementOverheadBytes +
+            (_batchTxnNum ? write_ops::kWriteCommandBSONArrayPerElementOverheadBytes + 4 : 0);
 
         if (wouldMakeBatchesTooBig(writes, writeSizeBytes, batchMap)) {
             invariant(!batchMap.empty());

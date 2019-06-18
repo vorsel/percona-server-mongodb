@@ -203,17 +203,17 @@ boost::optional<CommitQuorumOptions> parseAndGetCommitQuorum(OperationContext* o
 
 /**
  * Returns a vector of index specs with the filled in collection default options and removes any
- * indexes that already exist on the collection. If the returned vector is empty after returning, no
- * new indexes need to be built. Throws on error.
+ * indexes that already exist on the collection -- both ready indexes and in-progress builds. If the
+ * returned vector is empty after returning, no new indexes need to be built. Throws on error.
  */
 std::vector<BSONObj> resolveDefaultsAndRemoveExistingIndexes(OperationContext* opCtx,
                                                              const Collection* collection,
-                                                             std::vector<BSONObj> validatedSpecs) {
-    auto swDefaults = collection->addCollationDefaultsToIndexSpecsForCreate(opCtx, validatedSpecs);
+                                                             std::vector<BSONObj> indexSpecs) {
+    auto swDefaults = collection->addCollationDefaultsToIndexSpecsForCreate(opCtx, indexSpecs);
     uassertStatusOK(swDefaults.getStatus());
 
     auto indexCatalog = collection->getIndexCatalog();
-    return indexCatalog->removeExistingIndexes(opCtx, swDefaults.getValue(), /*throwOnError=*/true);
+    return indexCatalog->removeExistingIndexes(opCtx, swDefaults.getValue());
 }
 
 void checkUniqueIndexConstraints(OperationContext* opCtx,
@@ -265,9 +265,9 @@ bool runCreateIndexes(OperationContext* opCtx,
         return true;
     };
 
-    // Before potentially taking an exclusive database lock, check if all indexes already exist
-    // while holding an intent lock. Only continue if new indexes need to be built and the
-    // database should be re-locked in exclusive mode.
+    // Before potentially taking an exclusive database or collection lock, check if all indexes
+    // already exist while holding an intent lock. Only continue if new indexes need to be built
+    // and the collection or database should be re-locked in exclusive mode.
     {
         AutoGetCollection autoColl(opCtx, ns, MODE_IX);
         if (auto collection = autoColl.getCollection()) {
@@ -278,19 +278,13 @@ bool runCreateIndexes(OperationContext* opCtx,
         }
     }
 
-    // Relocking temporarily releases the Database lock while holding a Global IX lock. This
-    // prevents the replication state from changing, but requires abandoning the current
-    // snapshot in case indexes change during the period of time where no database lock is held.
-    opCtx->recoveryUnit()->abandonSnapshot();
-    dbLock.relockWithMode(MODE_X);
-
-    // Allow the strong lock acquisition above to be interrupted, but from this point forward do
-    // not allow locks or re-locks to be interrupted.
-    UninterruptibleLockGuard noInterrupt(opCtx->lockState());
-
     auto databaseHolder = DatabaseHolder::get(opCtx);
     auto db = databaseHolder->getDb(opCtx, ns.db());
     if (!db) {
+        // Temporarily release the Database lock while holding a Global IX lock. This prevents
+        // replication state from changing. Abandon the current snapshot to see changed metadata.
+        opCtx->recoveryUnit()->abandonSnapshot();
+        dbLock.relockWithMode(MODE_X);
         db = databaseHolder->openDb(opCtx, ns.db());
     }
 
@@ -300,10 +294,18 @@ bool runCreateIndexes(OperationContext* opCtx,
         dss.checkDbVersion(opCtx, dssLock);
     }
 
+    opCtx->recoveryUnit()->abandonSnapshot();
+    boost::optional<Lock::CollectionLock> exclusiveCollectionLock(
+        boost::in_place_init, opCtx, ns, MODE_X);
+
+    // Allow the strong lock acquisition above to be interrupted, but from this point forward do
+    // not allow locks or re-locks to be interrupted.
+    UninterruptibleLockGuard noInterrupt(opCtx->lockState());
+
     Collection* collection = db->getCollection(opCtx, ns);
-    if (collection) {
-        result.appendBool("createdCollectionAutomatically", false);
-    } else {
+    bool createCollectionAutomatically = collection == nullptr;
+    result.appendBool("createdCollectionAutomatically", createCollectionAutomatically);
+    if (createCollectionAutomatically) {
         if (ViewCatalog::get(db)->lookup(opCtx, ns.ns())) {
             errmsg = "Cannot create indexes on a view";
             uasserted(ErrorCodes::CommandNotSupportedOnView, errmsg);
@@ -313,11 +315,10 @@ bool runCreateIndexes(OperationContext* opCtx,
 
         writeConflictRetry(opCtx, kCommandName, ns.ns(), [&] {
             WriteUnitOfWork wunit(opCtx);
-            collection = db->createCollection(opCtx, ns.ns(), CollectionOptions());
+            collection = db->createCollection(opCtx, ns, CollectionOptions());
             invariant(collection);
             wunit.commit();
         });
-        result.appendBool("createdCollectionAutomatically", true);
     }
 
     // Use AutoStatsTracker to update Top.
@@ -354,6 +355,7 @@ bool runCreateIndexes(OperationContext* opCtx,
 
     // The 'indexer' can throw, so ensure the build cleanup occurs.
     ON_BLOCK_EXIT([&] {
+        opCtx->recoveryUnit()->abandonSnapshot();
         if (MONGO_FAIL_POINT(leaveIndexBuildUnfinishedForShutdown)) {
             // Set a flag to leave the persisted index build state intact when cleanUpAfterBuild()
             // is called below. The index build will be found on server startup.
@@ -363,7 +365,6 @@ bool runCreateIndexes(OperationContext* opCtx,
             // commit() clears the state.
             indexer.abortWithoutCleanup(opCtx);
         }
-        invariant(opCtx->lockState()->isDbLockedForMode(dbname, MODE_X));
         indexer.cleanUpAfterBuild(opCtx, collection);
     });
 
@@ -376,32 +377,19 @@ bool runCreateIndexes(OperationContext* opCtx,
                              MultiIndexBlock::makeTimestampedIndexOnInitFn(opCtx, collection)));
         });
 
-    // If we're a background index, replace exclusive db lock with an intent lock, so that
-    // other readers and writers can proceed during this phase.
+    // Don't hold an exclusive collection lock during background indexing, so that other readers
+    // and writers can proceed during this phase. A BackgroundOperation has been registered on the
+    // namespace, so the collection cannot be removed after yielding the lock.
     if (indexer.isBackgroundBuilding()) {
+        invariant(BackgroundOperation::inProgForNs(ns));
         opCtx->recoveryUnit()->abandonSnapshot();
-        dbLock.relockWithMode(MODE_IX);
+        exclusiveCollectionLock.reset();
     }
-
-    auto relockOnErrorGuard = makeGuard([&] {
-        // Must have exclusive DB lock before we clean up the index build via the
-        // destructor of 'indexer'.
-        if (indexer.isBackgroundBuilding()) {
-            try {
-                // This function cannot throw today, but we will preemptively prepare for
-                // that day, to avoid data corruption due to lack of index cleanup.
-                opCtx->recoveryUnit()->abandonSnapshot();
-                dbLock.relockWithMode(MODE_X);
-            } catch (...) {
-                std::terminate();
-            }
-        }
-    });
 
     // Collection scan and insert into index, followed by a drain of writes received in the
     // background.
     {
-        Lock::CollectionLock colLock(opCtx->lockState(), ns.ns(), MODE_IX);
+        Lock::CollectionLock colLock(opCtx, ns, MODE_IS);
         uassertStatusOK(indexer.insertAllDocumentsInCollection(opCtx, collection));
     }
 
@@ -413,11 +401,9 @@ bool runCreateIndexes(OperationContext* opCtx,
     // Perform the first drain while holding an intent lock.
     {
         opCtx->recoveryUnit()->abandonSnapshot();
-        Lock::CollectionLock colLock(opCtx->lockState(), ns.ns(), MODE_IS);
+        Lock::CollectionLock colLock(opCtx, ns, MODE_IS);
 
-        // Read at a point in time so that the drain, which will timestamp writes at lastApplied,
-        // can never commit writes earlier than its read timestamp.
-        uassertStatusOK(indexer.drainBackgroundWrites(opCtx, RecoveryUnit::ReadSource::kNoOverlap));
+        uassertStatusOK(indexer.drainBackgroundWrites(opCtx));
     }
 
     if (MONGO_FAIL_POINT(hangAfterIndexBuildFirstDrain)) {
@@ -428,7 +414,7 @@ bool runCreateIndexes(OperationContext* opCtx,
     // Perform the second drain while stopping writes on the collection.
     {
         opCtx->recoveryUnit()->abandonSnapshot();
-        Lock::CollectionLock colLock(opCtx->lockState(), ns.ns(), MODE_S);
+        Lock::CollectionLock colLock(opCtx, ns, MODE_S);
 
         uassertStatusOK(indexer.drainBackgroundWrites(opCtx));
     }
@@ -438,26 +424,21 @@ bool runCreateIndexes(OperationContext* opCtx,
         MONGO_FAIL_POINT_PAUSE_WHILE_SET(hangAfterIndexBuildSecondDrain);
     }
 
-    relockOnErrorGuard.dismiss();
-
-    // Need to return db lock back to exclusive, to complete the index build.
+    // Need to get exclusive collection lock back to complete the index build.
     if (indexer.isBackgroundBuilding()) {
         opCtx->recoveryUnit()->abandonSnapshot();
-        dbLock.relockWithMode(MODE_X);
-
-        auto db = databaseHolder->getDb(opCtx, ns.db());
-        if (db) {
-            auto& dss = DatabaseShardingState::get(db);
-            auto dssLock = DatabaseShardingState::DSSLock::lock(opCtx, &dss);
-            dss.checkDbVersion(opCtx, dssLock);
-        }
-
-        invariant(db);
-        invariant(db->getCollection(opCtx, ns));
+        exclusiveCollectionLock.emplace(opCtx, ns, MODE_X);
     }
 
-    // Perform the third and final drain after releasing a shared lock and reacquiring an
-    // exclusive lock on the database.
+    db = databaseHolder->getDb(opCtx, ns.db());
+    invariant(db->getCollection(opCtx, ns));
+    {
+        auto& dss = DatabaseShardingState::get(db);
+        auto dssLock = DatabaseShardingState::DSSLock::lock(opCtx, &dss);
+        dss.checkDbVersion(opCtx, dssLock);
+    }
+
+    // Perform the third and final drain while holding the exclusive collection lock.
     uassertStatusOK(indexer.drainBackgroundWrites(opCtx));
 
     // This is required before completion.
@@ -573,7 +554,7 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
             options.uuid = collectionUUID;
             writeConflictRetry(opCtx, kCommandName, ns.ns(), [&] {
                 WriteUnitOfWork wunit(opCtx);
-                collection = db->createCollection(opCtx, ns.ns(), options);
+                collection = db->createCollection(opCtx, ns, options);
                 invariant(collection,
                           str::stream() << "Failed to create collection " << ns.ns()
                                         << " during index creation: "

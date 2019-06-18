@@ -244,9 +244,9 @@ std::vector<std::string> constructServiceArgv(const std::vector<std::string>& in
             continue;
         }
 
-        std::string name;
-        std::string value;
-        bool foundEqualSign = mongoutils::str::splitOn(*iter, '=', name, value);
+        StringData name;
+        StringData value;
+        bool foundEqualSign = str::splitOn(*iter, '=', name, value);
         if (!foundEqualSign)
             name = *iter;
         if (optionsWithArgumentsToStripEnd !=

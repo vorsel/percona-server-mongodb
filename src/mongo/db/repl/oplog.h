@@ -32,7 +32,6 @@
 #include <string>
 #include <vector>
 
-#include "mongo/base/shim.h"
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/timestamp.h"
@@ -85,7 +84,9 @@ struct OplogLink {
  * If the collection already exists (and isReplSet is false),
  * set the 'last' Timestamp from the last entry of the oplog collection (side effect!)
  */
-void createOplog(OperationContext* opCtx, const std::string& oplogCollectionName, bool isReplSet);
+void createOplog(OperationContext* opCtx,
+                 const NamespaceString& oplogCollectionName,
+                 bool isReplSet);
 
 /*
  * Shortcut for above function using oplogCollectionName = _oplogCollectionName,
@@ -233,7 +234,7 @@ Status applyCommand_inlock(OperationContext* opCtx,
 /**
  * Initializes the global Timestamp with the value from the timestamp of the last oplog entry.
  */
-void initTimestampFromOplog(OperationContext* opCtx, const std::string& oplogNS);
+void initTimestampFromOplog(OperationContext* opCtx, const NamespaceString& oplogNS);
 
 /**
  * Sets the global Timestamp to be 'newTime'.
@@ -259,39 +260,17 @@ void createIndexForApplyOps(OperationContext* opCtx,
                             IncrementOpsAppliedStatsFn incrementOpsAppliedStats,
                             OplogApplication::Mode mode);
 
-// Shims currently do not support free functions so we wrap getNextOpTime in a class as a
-// workaround.
-struct GetNextOpTimeClass {
-    /**
-     * Allocates optimes for new entries in the oplog.  Returns a vector of OplogSlots, which
-     * contain the new optimes along with their terms and newly calculated hash fields.
-     */
-    static MONGO_DECLARE_SHIM((OperationContext * opCtx, std::size_t count)->std::vector<OplogSlot>)
-        getNextOpTimes;
-};
-
-inline std::vector<OplogSlot> getNextOpTimes(OperationContext* opCtx, std::size_t count) {
-    return GetNextOpTimeClass::getNextOpTimes(opCtx, count);
-};
+/**
+ * Allocates optimes for new entries in the oplog.  Returns a vector of OplogSlots, which
+ * contain the new optimes along with their terms and newly calculated hash fields.
+ */
+std::vector<OplogSlot> getNextOpTimes(OperationContext* opCtx, std::size_t count);
 
 inline OplogSlot getNextOpTime(OperationContext* opCtx) {
     auto slots = getNextOpTimes(opCtx, 1);
     invariant(slots.size() == 1);
     return slots.back();
 }
-
-/**
- * Allocates an OpTime, but does not update the storage engine with the timestamp. This is used to
- * test prepare support for transactions. It is necessary to do this because a transaction in
- * WiredTiger cannot be prepared if a timestamp has already been set (by a call to getNextOpTime),
- * but a timestamp is required to call prepare_transaction. The circular nature of this behavior
- * requires that an optime be allocated without updating the storage engine.
- *
- * TODO: This is a temporary workaround for prepared transactions that allows generating an
- * optime without setting the commit timestamp on the storage engine. This can be removed once
- * prepare generates an oplog entry in a separate unit of work.
- */
-OplogSlot getNextOpTimeNoPersistForTesting(OperationContext* opCtx);
 
 }  // namespace repl
 }  // namespace mongo

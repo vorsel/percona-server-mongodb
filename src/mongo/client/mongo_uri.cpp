@@ -49,7 +49,7 @@
 #include "mongo/util/dns_name.h"
 #include "mongo/util/dns_query.h"
 #include "mongo/util/hex.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 using namespace std::literals::string_literals;
 
@@ -297,6 +297,9 @@ URIParts::URIParts(StringData uri) {
     options = databaseAndOptions.second;
 }
 }  // namespace
+
+MongoURI::CaseInsensitiveString::CaseInsensitiveString(std::string str)
+    : _original(std::move(str)), _lowercase(boost::algorithm::to_lower_copy(_original)) {}
 
 bool MongoURI::isMongoURI(StringData uri) {
     return (uri.startsWith(kURIPrefix) || uri.startsWith(kURISRVPrefix));

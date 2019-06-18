@@ -181,16 +181,11 @@
         if (!configuredForNetworkRetry()) {
             return false;
         }
-        if (configuredForTxnOverride()) {
-            if (isCommitOrAbort(cmdName)) {
-                return true;
-            }
 
-            if (isCmdInTransaction(cmdObj)) {
-                // Commands in transactions cannot be retried at the statement level, except for the
-                // commit and abort.
-                return false;
-            }
+        if (isCmdInTransaction(cmdObj)) {
+            // Commands in transactions cannot be retried at the statement level, except for the
+            // commit and abort.
+            return isCommitOrAbort(cmdName);
         }
 
         return true;
@@ -205,9 +200,15 @@
             msg.indexOf("InterruptedDueToStepDown") >= 0;
     }
 
-    function isTransientTransactionError(res) {
-        return res.hasOwnProperty('errorLabels') &&
-            res.errorLabels.includes('TransientTransactionError');
+    // Returns true if the given response could have come from shardCollection being interrupted by
+    // a failover.
+    function isRetryableShardCollectionResponse(res) {
+        // shardCollection can bury the original error code in the error message.
+        return RetryableWritesUtil.errmsgContainsRetryableCodeName(res.errmsg) ||
+            // shardCollection creates collections on each shard that will receive a chunk using
+            // _cloneCollectionsOptionsFromPrimaryShard, which may fail with either of the following
+            // codes if interupted by a failover.
+            res.code === ErrorCodes.CallbackCanceled || res.code === 17405;
     }
 
     function hasError(res) {
@@ -385,7 +386,7 @@
                 shouldForceReadConcern = false;
             }
 
-            if (OverrideHelpers.isAggregationWithOutStage(cmdName, cmdObj)) {
+            if (OverrideHelpers.isAggregationWithOutOrMergeStage(cmdName, cmdObj)) {
                 // The $out stage can only be used with readConcern={level: "local"}.
                 shouldForceReadConcern = false;
             } else {
@@ -506,7 +507,7 @@
         });
 
         // Transient transaction errors mean the transaction has aborted, so consider it a success.
-        if (isTransientTransactionError(res)) {
+        if (TransactionsUtil.isTransientTransactionError(res)) {
             return;
         }
         // TODO (SERVER-40001) enforce abortTransaction errors.
@@ -706,7 +707,7 @@
 
         // Transient transaction errors should retry the entire transaction. A
         // TransientTransactionError on "abortTransaction" is considered a success.
-        if (isTransientTransactionError(res) && cmdName !== "abortTransaction") {
+        if (TransactionsUtil.isTransientTransactionError(res) && cmdName !== "abortTransaction") {
             logError("Retrying on TransientTransactionError response");
             res = retryEntireTransaction(conn, lsid);
 
@@ -721,12 +722,35 @@
         return res;
     }
 
+    // Returns true if any error code in a response's "raw" field is retryable.
+    function rawResponseHasRetryableError(rawRes, cmdName, logError) {
+        for (let shard in rawRes) {
+            const shardRes = rawRes[shard];
+
+            const logShardError = (msg) => {
+                const msgWithShardPrefix = `Processing raw response from shard: ${shard} :: ${msg}`;
+                logError(msgWithShardPrefix);
+            };
+
+            // Don't override the responses from each shard because only the top-level code in a
+            // response is used to determine if a command succeeded or not.
+            const networkRetryShardRes = shouldRetryWithNetworkErrorOverride(
+                shardRes, cmdName, logShardError, false /* shouldOverrideAcceptableError */);
+            if (networkRetryShardRes === kContinue) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     const kContinue = Object.create(null);
 
     // Processes the command response if we are configured for network error retries. Returns the
     // provided response if we should not retry in this override. Returns kContinue if we should
-    // retry the current command without subtracting from our retry allocation.
-    function shouldRetryWithNetworkErrorOverride(res, cmdName, logError) {
+    // retry the current command without subtracting from our retry allocation. By default sets ok=1
+    // for failures with acceptable error codes, unless shouldOverrideAcceptableError is false.
+    function shouldRetryWithNetworkErrorOverride(
+        res, cmdName, logError, shouldOverrideAcceptableError = true) {
         assert(configuredForNetworkRetry());
 
         if (RetryableWritesUtil.isRetryableWriteCmdName(cmdName)) {
@@ -800,7 +824,30 @@
                 return kContinue;
             }
 
-            if (!isAcceptableRetryFailedResponse(cmdName, res)) {
+            // Some sharding commands return raw responses from all contacted shards and there won't
+            // be a top level code if shards returned more than one error code, in which case retry
+            // if any error is retryable.
+            if (res.hasOwnProperty("raw") && !res.hasOwnProperty("code") &&
+                rawResponseHasRetryableError(res.raw, cmdName, logError)) {
+                logError("Retrying because of retryable code in raw response");
+                return kContinue;
+            }
+
+            // Check for the retryable error codes from an interrupted shardCollection.
+            if (cmdName === "shardCollection" && isRetryableShardCollectionResponse(res)) {
+                logError("Retrying interrupted shardCollection");
+                return kContinue;
+            }
+
+            // In a sharded cluster, drop may bury the original error code in the error message if
+            // interrupted.
+            if (cmdName === "drop" &&
+                RetryableWritesUtil.errmsgContainsRetryableCodeName(res.errmsg)) {
+                logError("Retrying interrupted drop");
+                return kContinue;
+            }
+
+            if (!shouldOverrideAcceptableError || !isAcceptableRetryFailedResponse(cmdName, res)) {
                 // Pass up unretryable errors.
                 return res;
             }
@@ -831,7 +878,7 @@
     function retryWithTxnOverrideException(e, conn, cmdName, cmdObj, lsid, logError) {
         assert(configuredForTxnOverride());
 
-        if (isTransientTransactionError(e) && cmdName !== "abortTransaction") {
+        if (TransactionsUtil.isTransientTransactionError(e) && cmdName !== "abortTransaction") {
             logError("Retrying on TransientTransactionError exception for command");
             const res = retryEntireTransaction(conn, lsid);
 
@@ -898,9 +945,12 @@
         conn, dbName, cmdName, cmdObj, lsid, clientFunction, makeFuncArgs) {
         const startTime = Date.now();
 
-        if (configuredForNetworkRetry() && !isNested()) {
+        const isTxnStatement = isCmdInTransaction(cmdObj);
+
+        if (configuredForNetworkRetry() && !isNested() && !isTxnStatement) {
             // If this is a top level command, make sure that the command supports network error
-            // retries.
+            // retries. Don't validate transaction statements because their encompassing transaction
+            // can be retried at a higher level, even if each statement isn't retryable on its own.
             validateCmdNetworkErrorCompatibility(cmdName, cmdObj);
         }
 
@@ -908,7 +958,8 @@
             setupTransactionCommand(conn, dbName, cmdName, cmdObj, lsid);
         }
 
-        let numNetworkErrorRetries = configuredForNetworkRetry() ? kMaxNumRetries : 0;
+        const canRetryNetworkError = canRetryNetworkErrorForCommand(cmdName, cmdObj);
+        let numNetworkErrorRetries = canRetryNetworkError ? kMaxNumRetries : 0;
         do {
             try {
                 // Actually run the provided command.
@@ -924,7 +975,7 @@
                     res = retryWithTxnOverride(res, conn, dbName, cmdName, cmdObj, lsid, logError);
                 }
 
-                if (canRetryNetworkErrorForCommand(cmdName, cmdObj)) {
+                if (canRetryNetworkError) {
                     const networkRetryRes =
                         shouldRetryWithNetworkErrorOverride(res, cmdName, logError);
                     if (networkRetryRes === kContinue) {
@@ -947,7 +998,7 @@
                     }
                 }
 
-                if (canRetryNetworkErrorForCommand(cmdName, cmdObj)) {
+                if (canRetryNetworkError) {
                     const decrementRetryCount = shouldRetryWithNetworkExceptionOverride(
                         e, cmdName, cmdObj, startTime, numNetworkErrorRetries, logError);
                     if (decrementRetryCount) {

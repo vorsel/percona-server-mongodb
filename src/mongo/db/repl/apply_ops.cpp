@@ -155,7 +155,7 @@ Status _applyOps(OperationContext* opCtx,
             // implicitly created on upserts. We detect both cases here and fail early with
             // NamespaceNotFound.
             // Additionally for inserts, we fail early on non-existent collections.
-            Lock::CollectionLock collectionLock(opCtx->lockState(), nss.ns(), MODE_IX);
+            Lock::CollectionLock collectionLock(opCtx, nss, MODE_IX);
             auto collection = db->getCollection(opCtx, nss);
             if (!collection && (*opType == 'i' || *opType == 'u')) {
                 uasserted(
@@ -478,10 +478,12 @@ Status applyApplyOpsOplogEntry(OperationContext* opCtx,
                     &resultWeDontCareAbout);
 }
 
-Status applyRecoveredPrepareApplyOpsOplogEntry(OperationContext* opCtx, const OplogEntry& entry) {
+Status applyRecoveredPrepareApplyOpsOplogEntry(OperationContext* opCtx,
+                                               const OplogEntry& entry,
+                                               repl::OplogApplication::Mode mode) {
     // We might replay a prepared transaction behind oldest timestamp.
     opCtx->recoveryUnit()->setRoundUpPreparedTimestamps(true);
-    return _applyPrepareTransaction(opCtx, entry, OplogApplication::Mode::kRecovering);
+    return _applyPrepareTransaction(opCtx, entry, mode);
 }
 
 Status applyOps(OperationContext* opCtx,
@@ -498,6 +500,7 @@ Status applyOps(OperationContext* opCtx,
 
     uassert(
         ErrorCodes::BadValue, "applyOps command can't have 'prepare' field", !info.getPrepare());
+    uassert(31056, "applyOps command can't have 'partialTxn' field.", !info.getPartialTxn());
 
     // There's only one case where we are allowed to take the database lock instead of the global
     // lock - no preconditions; only CRUD ops; and non-atomic mode.
@@ -611,6 +614,14 @@ Status applyOps(OperationContext* opCtx,
 
 // static
 MultiApplier::Operations ApplyOps::extractOperations(const OplogEntry& applyOpsOplogEntry) {
+    MultiApplier::Operations result;
+    extractOperationsTo(applyOpsOplogEntry, applyOpsOplogEntry.toBSON(), &result);
+    return result;
+}
+
+void ApplyOps::extractOperationsTo(const OplogEntry& applyOpsOplogEntry,
+                                   const BSONObj& topLevelDoc,
+                                   MultiApplier::Operations* operations) {
     uassert(ErrorCodes::TypeMismatch,
             str::stream() << "ApplyOps::extractOperations(): not a command: "
                           << redact(applyOpsOplogEntry.toBSON()),
@@ -625,21 +636,16 @@ MultiApplier::Operations ApplyOps::extractOperations(const OplogEntry& applyOpsO
     auto operationDocs = cmdObj.firstElement().Obj();
 
     if (operationDocs.isEmpty()) {
-        return {};
+        return;
     }
 
-    MultiApplier::Operations operations;
-
-    auto topLevelDoc = applyOpsOplogEntry.toBSON();
     for (const auto& elem : operationDocs) {
         auto operationDoc = elem.Obj();
         BSONObjBuilder builder(operationDoc);
         builder.appendElementsUnique(topLevelDoc);
         auto operation = builder.obj();
-        operations.emplace_back(operation);
+        operations->emplace_back(operation);
     }
-
-    return operations;
 }
 
 }  // namespace repl

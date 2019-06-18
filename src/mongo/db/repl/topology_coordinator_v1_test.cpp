@@ -46,6 +46,7 @@
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/net/hostandport.h"
+#include "mongo/util/net/socket_utils.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/time_support.h"
 
@@ -116,14 +117,20 @@ protected:
         ASSERT_OK(getTopoCoord().completeTransitionToPrimary(dummyOpTime));
     }
 
-    void setMyOpTime(const OpTime& opTime, const Date_t wallTime = Date_t::min()) {
+    void setMyOpTime(const OpTime& opTime, Date_t wallTime = Date_t::min()) {
+        if (wallTime == Date_t::min()) {
+            wallTime = Date_t() + Seconds(opTime.getSecs());
+        }
         getTopoCoord().setMyLastAppliedOpTimeAndWallTime({opTime, wallTime}, now(), false);
     }
 
     void topoCoordSetMyLastAppliedOpTime(const OpTime& opTime,
                                          Date_t now,
                                          bool isRollbackAllowed,
-                                         const Date_t wallTime = Date_t::min()) {
+                                         Date_t wallTime = Date_t::min()) {
+        if (wallTime == Date_t::min()) {
+            wallTime = Date_t() + Seconds(opTime.getSecs());
+        }
         getTopoCoord().setMyLastAppliedOpTimeAndWallTime(
             {opTime, wallTime}, now, isRollbackAllowed);
     }
@@ -131,9 +138,21 @@ protected:
     void topoCoordSetMyLastDurableOpTime(const OpTime& opTime,
                                          Date_t now,
                                          bool isRollbackAllowed,
-                                         const Date_t wallTime = Date_t::min()) {
+                                         Date_t wallTime = Date_t::min()) {
+        if (wallTime == Date_t::min()) {
+            wallTime = Date_t() + Seconds(opTime.getSecs());
+        }
         getTopoCoord().setMyLastDurableOpTimeAndWallTime(
             {opTime, wallTime}, now, isRollbackAllowed);
+    }
+
+    void topoCoordAdvanceLastCommittedOpTime(const OpTime& opTime,
+                                             Date_t wallTime = Date_t::min(),
+                                             const bool fromSyncSource = false) {
+        if (wallTime == Date_t::min()) {
+            wallTime = Date_t() + Seconds(opTime.getSecs());
+        }
+        getTopoCoord().advanceLastCommittedOpTimeAndWallTime({opTime, wallTime}, fromSyncSource);
     }
 
     void setSelfMemberState(const MemberState& newState) {
@@ -189,7 +208,7 @@ protected:
                                         int primaryIndex = -1,
                                         int syncSourceIndex = -1) {
         return ReplSetMetadata(_topo->getTerm(),
-                               OpTime(),
+                               OpTimeAndWallTime(),
                                visibleOpTime,
                                _currentConfig.getConfigVersion(),
                                OID(),
@@ -201,8 +220,10 @@ protected:
     // Only set lastAppliedOpTime, primaryIndex and syncSourceIndex
     OplogQueryMetadata makeOplogQueryMetadata(OpTime lastAppliedOpTime = OpTime(),
                                               int primaryIndex = -1,
-                                              int syncSourceIndex = -1) {
-        return OplogQueryMetadata(OpTime(), lastAppliedOpTime, -1, primaryIndex, syncSourceIndex);
+                                              int syncSourceIndex = -1,
+                                              Date_t lastCommittedWall = Date_t::min()) {
+        return OplogQueryMetadata(
+            {OpTime(), lastCommittedWall}, lastAppliedOpTime, -1, primaryIndex, syncSourceIndex);
     }
 
     HeartbeatResponseAction receiveUpHeartbeat(const HostAndPort& member,
@@ -261,12 +282,20 @@ private:
                                                     Timestamp electionTime,
                                                     const OpTime& lastOpTimeSender,
                                                     Milliseconds roundTripTime,
-                                                    const HostAndPort& syncingTo) {
+                                                    const HostAndPort& syncingTo,
+                                                    Date_t lastDurableWallTime = Date_t::min(),
+                                                    Date_t lastAppliedWallTime = Date_t::min()) {
+        if (lastDurableWallTime == Date_t::min()) {
+            lastDurableWallTime = Date_t() + Seconds(lastOpTimeSender.getSecs());
+        }
+        if (lastAppliedWallTime == Date_t::min()) {
+            lastAppliedWallTime = Date_t() + Seconds(lastOpTimeSender.getSecs());
+        }
         ReplSetHeartbeatResponse hb;
         hb.setConfigVersion(1);
         hb.setState(memberState);
-        hb.setDurableOpTime(lastOpTimeSender);
-        hb.setAppliedOpTime(lastOpTimeSender);
+        hb.setDurableOpTimeAndWallTime({lastOpTimeSender, lastDurableWallTime});
+        hb.setAppliedOpTimeAndWallTime({lastOpTimeSender, lastAppliedWallTime});
         hb.setElectionTime(electionTime);
         hb.setTerm(getTopoCoord().getTerm());
         hb.setSyncingTo(syncingTo);
@@ -1599,9 +1628,15 @@ TEST_F(TopoCoordTest, ReplSetGetStatus) {
     Date_t curTime = heartbeatTime + uptimeSecs;
     Timestamp electionTime(1, 2);
     OpTime oplogProgress(Timestamp(3, 1), 20);
+    Date_t appliedWallTime = Date_t() + Seconds(oplogProgress.getSecs());
     OpTime oplogDurable(Timestamp(1, 1), 19);
+    Date_t durableWallTime = Date_t() + Seconds(oplogDurable.getSecs());
+    ;
     OpTime lastCommittedOpTime(Timestamp(5, 1), 20);
+    Date_t lastCommittedWallTime = Date_t() + Seconds(lastCommittedOpTime.getSecs());
     OpTime readConcernMajorityOpTime(Timestamp(4, 1), 20);
+    Date_t readConcernMajorityWallTime = Date_t() + Seconds(readConcernMajorityOpTime.getSecs());
+
     Timestamp lastStableRecoveryTimestamp(2, 2);
     Timestamp lastStableCheckpointTimestampDeprecated(2, 2);
     BSONObj initialSyncStatus = BSON("failedInitialSyncAttempts" << 1);
@@ -1611,8 +1646,8 @@ TEST_F(TopoCoordTest, ReplSetGetStatus) {
     hb.setConfigVersion(1);
     hb.setState(MemberState::RS_SECONDARY);
     hb.setElectionTime(electionTime);
-    hb.setDurableOpTime(oplogDurable);
-    hb.setAppliedOpTime(oplogProgress);
+    hb.setDurableOpTimeAndWallTime({oplogDurable, durableWallTime});
+    hb.setAppliedOpTimeAndWallTime({oplogProgress, appliedWallTime});
     StatusWith<ReplSetHeartbeatResponse> hbResponseGood = StatusWith<ReplSetHeartbeatResponse>(hb);
 
     updateConfig(BSON("_id" << setName << "version" << 1 << "members"
@@ -1647,9 +1682,9 @@ TEST_F(TopoCoordTest, ReplSetGetStatus) {
     getTopoCoord().processHeartbeatResponse(
         heartbeatTime, Milliseconds(4000), member, hbResponseGood);
     makeSelfPrimary(electionTime);
-    topoCoordSetMyLastAppliedOpTime(oplogProgress, startupTime, false);
-    topoCoordSetMyLastDurableOpTime(oplogDurable, startupTime, false);
-    getTopoCoord().advanceLastCommittedOpTime(lastCommittedOpTime, false);
+    topoCoordSetMyLastAppliedOpTime(oplogProgress, startupTime, false, appliedWallTime);
+    topoCoordSetMyLastDurableOpTime(oplogDurable, startupTime, false, durableWallTime);
+    topoCoordAdvanceLastCommittedOpTime(lastCommittedOpTime, lastCommittedWallTime, false);
 
     // Now node 0 is down, node 1 is up, and for node 2 we have no heartbeat data yet.
     BSONObjBuilder statusBuilder;
@@ -1658,7 +1693,7 @@ TEST_F(TopoCoordTest, ReplSetGetStatus) {
         TopologyCoordinator::ReplSetStatusArgs{
             curTime,
             static_cast<unsigned>(durationCount<Seconds>(uptimeSecs)),
-            readConcernMajorityOpTime,
+            {readConcernMajorityOpTime, readConcernMajorityWallTime},
             initialSyncStatus,
             lastStableCheckpointTimestampDeprecated,
             lastStableRecoveryTimestamp},
@@ -1680,9 +1715,13 @@ TEST_F(TopoCoordTest, ReplSetGetStatus) {
         const auto optimes = rsStatus["optimes"].Obj();
         ASSERT_BSONOBJ_EQ(readConcernMajorityOpTime.toBSON(),
                           optimes["readConcernMajorityOpTime"].Obj());
+        ASSERT_EQUALS(readConcernMajorityWallTime, optimes["readConcernMajorityWallTime"].Date());
         ASSERT_BSONOBJ_EQ(oplogProgress.toBSON(), optimes["appliedOpTime"].Obj());
+        ASSERT_EQUALS(appliedWallTime, optimes["lastAppliedWallTime"].Date());
         ASSERT_BSONOBJ_EQ((oplogDurable).toBSON(), optimes["durableOpTime"].Obj());
+        ASSERT_EQUALS(durableWallTime, optimes["lastDurableWallTime"].Date());
         ASSERT_BSONOBJ_EQ(lastCommittedOpTime.toBSON(), optimes["lastCommittedOpTime"].Obj());
+        ASSERT_EQUALS(lastCommittedWallTime, optimes["lastCommittedWallTime"].Date());
     }
     std::vector<BSONElement> memberArray = rsStatus["members"].Array();
     ASSERT_EQUALS(4U, memberArray.size());
@@ -1773,7 +1812,7 @@ TEST_F(TopoCoordTest, ReplSetGetStatus) {
         TopologyCoordinator::ReplSetStatusArgs{
             curTime,
             static_cast<unsigned>(durationCount<Seconds>(uptimeSecs)),
-            readConcernMajorityOpTime,
+            {readConcernMajorityOpTime, readConcernMajorityWallTime},
             initialSyncStatus},
         &statusBuilder2,
         &resultStatus);
@@ -1783,6 +1822,47 @@ TEST_F(TopoCoordTest, ReplSetGetStatus) {
     ASSERT_EQUALS(setName, rsStatus["set"].String());
     ASSERT_FALSE(rsStatus.hasField("lastStableRecoveryTimestamp"));
     ASSERT_FALSE(rsStatus.hasField("lastStableCheckpointTimestamp"));
+}
+
+TEST_F(TopoCoordTest, ReplSetGetStatusIPs) {
+    BSONObj initialSyncStatus = BSON("failedInitialSyncAttempts" << 1);
+    std::string setName = "mySet";
+    auto now = Date_t::fromMillisSinceEpoch(100);
+    auto originalIPv6Enabled = IPv6Enabled();
+    ON_BLOCK_EXIT([&] { enableIPv6(originalIPv6Enabled); });
+
+    auto testIP = [&](const std::string& hostAndIP) -> std::string {
+        // Test framework requires that time moves forward.
+        now += Milliseconds(10);
+        updateConfig(BSON("_id" << setName << "version" << 1 << "members"
+                                << BSON_ARRAY(BSON("_id" << 0 << "host" << hostAndIP))),
+                     0,
+                     now);
+
+        BSONObjBuilder statusBuilder;
+        Status resultStatus(ErrorCodes::InternalError, "prepareStatusResponse didn't set result");
+        getTopoCoord().prepareStatusResponse({}, &statusBuilder, &resultStatus);
+        ASSERT_OK(resultStatus);
+        BSONObj rsStatus = statusBuilder.obj();
+        unittest::log() << rsStatus;
+        auto elem = rsStatus["members"].Array()[0]["ip"];
+        return elem.isNull() ? "null" : elem.String();
+    };
+
+    // We can't rely on any hostname like mongodb.org that requires DNS from the CI machine, test
+    // localhost and IP literals.
+    enableIPv6(false);
+    ASSERT_EQUALS("127.0.0.1", testIP("localhost:1234"));
+    enableIPv6(true);
+    // localhost can resolve to IPv4 or IPv6 depending on precedence.
+    auto localhostIP = testIP("localhost:1234");
+    if (localhostIP != "127.0.0.1" && localhostIP != "::1") {
+        FAIL(str::stream() << "Expected localhost IP to be 127.0.0.1 or ::1, not " << localhostIP);
+    }
+
+    ASSERT_EQUALS("1.2.3.4", testIP("1.2.3.4:1234"));
+    ASSERT_EQUALS("::1", testIP("[::1]:1234"));
+    ASSERT_EQUALS("null", testIP("test0:1234"));
 }
 
 TEST_F(TopoCoordTest, NodeReturnsInvalidReplicaSetConfigInResponseToGetStatusWhenAbsentFromConfig) {
@@ -1811,7 +1891,7 @@ TEST_F(TopoCoordTest, NodeReturnsInvalidReplicaSetConfigInResponseToGetStatusWhe
         TopologyCoordinator::ReplSetStatusArgs{
             curTime,
             static_cast<unsigned>(durationCount<Seconds>(uptimeSecs)),
-            OpTime(),
+            OpTimeAndWallTime(),
             BSONObj()},
         &statusBuilder,
         &resultStatus);
@@ -3626,7 +3706,7 @@ TEST_F(HeartbeatResponseTestV1, ShouldNotChangeSyncSourceWhenMemberHasYetToHeart
 TEST_F(HeartbeatResponseTestV1, ShouldNotChangeSyncSourceWhenMemberNotInConfig) {
     // In this test, the TopologyCoordinator should tell us to change sync sources away from
     // "host4" since "host4" is absent from the config of version 10.
-    ReplSetMetadata replMetadata(0, OpTime(), OpTime(), 10, OID(), -1, -1);
+    ReplSetMetadata replMetadata(0, {OpTime(), Date_t::min()}, OpTime(), 10, OID(), -1, -1);
     ASSERT_TRUE(getTopoCoord().shouldChangeSyncSource(
         HostAndPort("host4"), replMetadata, makeOplogQueryMetadata(), now()));
 }
@@ -3665,9 +3745,12 @@ TEST_F(HeartbeatResponseTestV1, ReconfigNodeRemovedBetweenHeartbeatRequestAndRep
                  0);
 
     ReplSetHeartbeatResponse hb;
-    hb.initialize(BSON("ok" << 1 << "v" << 1 << "state" << MemberState::RS_PRIMARY), 0)
+    hb.initialize(BSON("ok" << 1 << "v" << 1 << "state" << MemberState::RS_PRIMARY),
+                  0,
+                  /*requireWallTime*/ true)
         .transitional_ignore();
-    hb.setDurableOpTime(lastOpTimeApplied);
+    hb.setDurableOpTimeAndWallTime(
+        {lastOpTimeApplied, Date_t::min() + Seconds(lastOpTimeApplied.getSecs())});
     hb.setElectionTime(election.getTimestamp());
     StatusWith<ReplSetHeartbeatResponse> hbResponse = StatusWith<ReplSetHeartbeatResponse>(hb);
     HeartbeatResponseAction action = getTopoCoord().processHeartbeatResponse(
@@ -3713,15 +3796,21 @@ TEST_F(HeartbeatResponseTestV1, ReconfigBetweenHeartbeatRequestAndRepsonse) {
 
     ReplSetHeartbeatResponse hb;
     hb.initialize(BSON("ok" << 1 << "durableOpTime" << OpTime(Timestamp(100, 0), 0).toBSON()
+                            << "durableWallTime"
+                            << Date_t::min() + Seconds(100)
                             << "opTime"
                             << OpTime(Timestamp(100, 0), 0).toBSON()
+                            << "wallTime"
+                            << Date_t::min() + Seconds(100)
                             << "v"
                             << 1
                             << "state"
                             << MemberState::RS_PRIMARY),
-                  0)
+                  0,
+                  /*requireWallTime*/ true)
         .transitional_ignore();
-    hb.setDurableOpTime(lastOpTimeApplied);
+    hb.setDurableOpTimeAndWallTime(
+        {lastOpTimeApplied, Date_t::min() + Seconds(lastOpTimeApplied.getSecs())});
     hb.setElectionTime(election.getTimestamp());
     StatusWith<ReplSetHeartbeatResponse> hbResponse = StatusWith<ReplSetHeartbeatResponse>(hb);
     topoCoordSetMyLastAppliedOpTime(lastOpTimeApplied, Date_t(), false);
@@ -3882,14 +3971,16 @@ TEST_F(TopoCoordTest, FreshestNodeDoesCatchupTakeover) {
     setSelfMemberState(MemberState::RS_SECONDARY);
 
     OpTime currentOptime(Timestamp(200, 1), 0);
+    Date_t currentWallTime = Date_t::min() + Seconds(currentOptime.getSecs());
     OpTime behindOptime(Timestamp(100, 1), 0);
+    Date_t behindWallTime = Date_t::min() + Seconds(behindOptime.getSecs());
 
     // Create a mock heartbeat response to be able to compare who is the freshest node.
     // The latest heartbeat responses are looked at for determining the latest optime
     // and therefore freshness for catchup takeover.
     ReplSetHeartbeatResponse hbResp = ReplSetHeartbeatResponse();
     hbResp.setState(MemberState::RS_SECONDARY);
-    hbResp.setAppliedOpTime(currentOptime);
+    hbResp.setAppliedOpTimeAndWallTime({currentOptime, currentWallTime});
     hbResp.setTerm(1);
 
     Date_t firstRequestDate = unittest::assertGet(dateFromISOString("2014-08-29T13:00Z"));
@@ -3903,7 +3994,7 @@ TEST_F(TopoCoordTest, FreshestNodeDoesCatchupTakeover) {
                                             Milliseconds(999),
                                             HostAndPort("host3:27017"),
                                             StatusWith<ReplSetHeartbeatResponse>(hbResp));
-    hbResp.setAppliedOpTime(behindOptime);
+    hbResp.setAppliedOpTimeAndWallTime({behindOptime, behindWallTime});
     hbResp.setState(MemberState::RS_PRIMARY);
     getTopoCoord().processHeartbeatResponse(firstRequestDate + Milliseconds(1000),
                                             Milliseconds(999),
@@ -3937,12 +4028,14 @@ TEST_F(TopoCoordTest, StaleNodeDoesntDoCatchupTakeover) {
     setSelfMemberState(MemberState::RS_SECONDARY);
 
     OpTime currentOptime(Timestamp(200, 1), 0);
+    Date_t currentWallTime = Date_t::min() + Seconds(currentOptime.getSecs());
     OpTime behindOptime(Timestamp(100, 1), 0);
+    Date_t behindWallTime = Date_t::min() + Seconds(behindOptime.getSecs());
 
     // Create a mock heartbeat response to be able to compare who is the freshest node.
     ReplSetHeartbeatResponse hbResp = ReplSetHeartbeatResponse();
     hbResp.setState(MemberState::RS_SECONDARY);
-    hbResp.setAppliedOpTime(currentOptime);
+    hbResp.setAppliedOpTimeAndWallTime({currentOptime, currentWallTime});
     hbResp.setTerm(1);
 
     Date_t firstRequestDate = unittest::assertGet(dateFromISOString("2014-08-29T13:00Z"));
@@ -3956,7 +4049,7 @@ TEST_F(TopoCoordTest, StaleNodeDoesntDoCatchupTakeover) {
                                             Milliseconds(999),
                                             HostAndPort("host3:27017"),
                                             StatusWith<ReplSetHeartbeatResponse>(hbResp));
-    hbResp.setAppliedOpTime(behindOptime);
+    hbResp.setAppliedOpTimeAndWallTime({behindOptime, behindWallTime});
     hbResp.setState(MemberState::RS_PRIMARY);
     getTopoCoord().processHeartbeatResponse(firstRequestDate + Milliseconds(1000),
                                             Milliseconds(999),
@@ -3994,11 +4087,12 @@ TEST_F(TopoCoordTest, NodeDoesntDoCatchupTakeoverHeartbeatSaysPrimaryCaughtUp) {
     setSelfMemberState(MemberState::RS_SECONDARY);
 
     OpTime currentOptime(Timestamp(200, 1), 0);
+    Date_t currentWallTime = Date_t::min() + Seconds(currentOptime.getSecs());
 
     // Create a mock heartbeat response to be able to compare who is the freshest node.
     ReplSetHeartbeatResponse hbResp = ReplSetHeartbeatResponse();
     hbResp.setState(MemberState::RS_SECONDARY);
-    hbResp.setAppliedOpTime(currentOptime);
+    hbResp.setAppliedOpTimeAndWallTime({currentOptime, currentWallTime});
     hbResp.setTerm(1);
 
     Date_t firstRequestDate = unittest::assertGet(dateFromISOString("2014-08-29T13:00Z"));
@@ -4050,11 +4144,13 @@ TEST_F(TopoCoordTest, NodeDoesntDoCatchupTakeoverIfTermNumbersSayPrimaryCaughtUp
 
     OpTime currentOptime(Timestamp(200, 1), 1);
     OpTime behindOptime(Timestamp(100, 1), 0);
+    Date_t currentWallTime = Date_t::min() + Seconds(currentOptime.getSecs());
+    Date_t behindWallTime = Date_t::min() + Seconds(behindOptime.getSecs());
 
     // Create a mock heartbeat response to be able to compare who is the freshest node.
     ReplSetHeartbeatResponse hbResp = ReplSetHeartbeatResponse();
     hbResp.setState(MemberState::RS_SECONDARY);
-    hbResp.setAppliedOpTime(currentOptime);
+    hbResp.setAppliedOpTimeAndWallTime({currentOptime, currentWallTime});
     hbResp.setTerm(1);
 
     Date_t firstRequestDate = unittest::assertGet(dateFromISOString("2014-08-29T13:00Z"));
@@ -4070,7 +4166,7 @@ TEST_F(TopoCoordTest, NodeDoesntDoCatchupTakeoverIfTermNumbersSayPrimaryCaughtUp
                                             Milliseconds(999),
                                             HostAndPort("host3:27017"),
                                             StatusWith<ReplSetHeartbeatResponse>(hbResp));
-    hbResp.setAppliedOpTime(behindOptime);
+    hbResp.setAppliedOpTimeAndWallTime({behindOptime, behindWallTime});
     hbResp.setState(MemberState::RS_PRIMARY);
     getTopoCoord().processHeartbeatResponse(firstRequestDate + Milliseconds(1000),
                                             Milliseconds(999),
@@ -4438,7 +4534,7 @@ TEST_F(TopoCoordTest,
             TopologyCoordinator::ReplSetStatusArgs{
                 curTime,
                 static_cast<unsigned>(durationCount<Seconds>(uptimeSecs)),
-                OpTime(),
+                OpTimeAndWallTime(),
                 BSONObj()},
             &statusBuilder,
             &resultStatus);
@@ -4513,7 +4609,7 @@ TEST_F(TopoCoordTest,
             TopologyCoordinator::ReplSetStatusArgs{
                 curTime,
                 static_cast<unsigned>(durationCount<Seconds>(uptimeSecs)),
-                OpTime(),
+                OpTimeAndWallTime(),
                 BSONObj()},
             &statusBuilder,
             &resultStatus);
@@ -4604,7 +4700,7 @@ TEST_F(TopoCoordTest, replSetGetStatusForThreeMemberedReplicaSet) {
         TopologyCoordinator::ReplSetStatusArgs{
             curTime,
             static_cast<unsigned>(durationCount<Seconds>(uptimeSecs)),
-            OpTime(),
+            OpTimeAndWallTime(),
             BSONObj()},
         &statusBuilder,
         &resultStatus);
@@ -4669,7 +4765,7 @@ TEST_F(TopoCoordTest, StatusResponseAlwaysIncludesStringStatusFieldsForNonMember
         TopologyCoordinator::ReplSetStatusArgs{
             curTime,
             static_cast<unsigned>(durationCount<Seconds>(uptimeSecs)),
-            OpTime(),
+            OpTimeAndWallTime(),
             BSONObj()},
         &statusBuilder,
         &resultStatus);
@@ -5146,6 +5242,79 @@ TEST_F(TopoCoordTest, CheckIfCommitQuorumCanBeSatisfied) {
         ASSERT_TRUE(getTopoCoord().checkIfCommitQuorumCanBeSatisfied(invalidModeWC,
                                                                      commitReadyMembersMajority));
     }
+}
+
+TEST_F(TopoCoordTest, AdvanceCommittedOpTimeDisregardsWallTimeOrder) {
+    // This test starts by configuring a TopologyCoordinator as a member of a 3 node replica
+    // set. The first and second nodes are secondaries, and the third is primary and corresponds
+    // to ourself.
+    Date_t startupTime = Date_t::fromMillisSinceEpoch(100);
+    Date_t heartbeatTime = Date_t::fromMillisSinceEpoch(5000);
+    Timestamp electionTime(1, 2);
+    OpTimeAndWallTime initialCommittedOpTimeAndWallTime = {OpTime(Timestamp(4, 1), 20),
+                                                           Date_t() + Seconds(5)};
+    // Chronologically, the OpTime of lastCommittedOpTimeAndWallTime is more recent than that of
+    // initialCommittedOpTimeAndWallTime, even though the former's wall time is less recent than
+    // that of the latter.
+    OpTimeAndWallTime lastCommittedOpTimeAndWallTime = {OpTime(Timestamp(5, 1), 20),
+                                                        Date_t() + Seconds(3)};
+    std::string setName = "mySet";
+
+    ReplSetHeartbeatResponse hb;
+    hb.setConfigVersion(1);
+    hb.setState(MemberState::RS_SECONDARY);
+    hb.setElectionTime(electionTime);
+    hb.setDurableOpTimeAndWallTime(initialCommittedOpTimeAndWallTime);
+    hb.setAppliedOpTimeAndWallTime(initialCommittedOpTimeAndWallTime);
+    StatusWith<ReplSetHeartbeatResponse> hbResponseGood = StatusWith<ReplSetHeartbeatResponse>(hb);
+
+    updateConfig(BSON("_id" << setName << "version" << 1 << "members"
+                            << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                     << "test0:1234")
+                                          << BSON("_id" << 1 << "host"
+                                                        << "test1:1234")
+                                          << BSON("_id" << 2 << "host"
+                                                        << "test2:1234"))),
+                 2,
+                 startupTime + Milliseconds(1));
+
+    // Advance the commit point to initialCommittedOpTimeAndWallTime.
+    HostAndPort memberOne = HostAndPort("test0:1234");
+    getTopoCoord().prepareHeartbeatRequestV1(startupTime + Milliseconds(1), setName, memberOne);
+    getTopoCoord().processHeartbeatResponse(
+        startupTime + Milliseconds(2), Milliseconds(1), memberOne, hbResponseGood);
+
+    HostAndPort memberTwo = HostAndPort("test1:1234");
+    getTopoCoord().prepareHeartbeatRequestV1(startupTime + Milliseconds(2), setName, memberTwo);
+    getTopoCoord().processHeartbeatResponse(
+        heartbeatTime, Milliseconds(1), memberTwo, hbResponseGood);
+
+    makeSelfPrimary(electionTime);
+    getTopoCoord().setMyLastAppliedOpTimeAndWallTime(
+        initialCommittedOpTimeAndWallTime, startupTime, false);
+    getTopoCoord().setMyLastDurableOpTimeAndWallTime(
+        initialCommittedOpTimeAndWallTime, startupTime, false);
+    getTopoCoord().advanceLastCommittedOpTimeAndWallTime(initialCommittedOpTimeAndWallTime, false);
+    ASSERT_EQ(getTopoCoord().getLastCommittedOpTimeAndWallTime(),
+              initialCommittedOpTimeAndWallTime);
+
+    // memberOne's lastApplied and lastDurable OpTimeAndWallTimes are equal to
+    // lastCommittedOpTimeAndWallTime, but memberTwo's are equal to
+    // initialCommittedOpTimeAndWallTime. Only the ordering of OpTimes should influence advancing
+    // the commit point.
+    hb.setAppliedOpTimeAndWallTime(lastCommittedOpTimeAndWallTime);
+    hb.setDurableOpTimeAndWallTime(lastCommittedOpTimeAndWallTime);
+    StatusWith<ReplSetHeartbeatResponse> hbResponseGoodUpdated =
+        StatusWith<ReplSetHeartbeatResponse>(hb);
+    getTopoCoord().prepareHeartbeatRequestV1(heartbeatTime + Milliseconds(3), setName, memberOne);
+    getTopoCoord().processHeartbeatResponse(
+        heartbeatTime + Milliseconds(4), Milliseconds(1), memberOne, hbResponseGoodUpdated);
+    getTopoCoord().setMyLastAppliedOpTimeAndWallTime(
+        lastCommittedOpTimeAndWallTime, startupTime, false);
+    getTopoCoord().setMyLastDurableOpTimeAndWallTime(
+        lastCommittedOpTimeAndWallTime, startupTime, false);
+    getTopoCoord().updateLastCommittedOpTimeAndWallTime();
+    ASSERT_EQ(getTopoCoord().getLastCommittedOpTimeAndWallTime(), lastCommittedOpTimeAndWallTime);
 }
 
 TEST_F(HeartbeatResponseTestV1,
@@ -5927,7 +6096,7 @@ public:
         Status resultStatus(ErrorCodes::InternalError, "prepareStatusResponse didn't set result");
         getTopoCoord().prepareStatusResponse(
             TopologyCoordinator::ReplSetStatusArgs{
-                _firstRequestDate + Milliseconds(4000), 10, OpTime(), BSONObj()},
+                _firstRequestDate + Milliseconds(4000), 10, OpTimeAndWallTime(), BSONObj()},
             &statusBuilder,
             &resultStatus);
         ASSERT_OK(resultStatus);
@@ -6005,7 +6174,7 @@ public:
         Status resultStatus(ErrorCodes::InternalError, "prepareStatusResponse didn't set result");
         getTopoCoord().prepareStatusResponse(
             TopologyCoordinator::ReplSetStatusArgs{
-                firstRequestDate() + Seconds(4), 10, OpTime(), BSONObj()},
+                firstRequestDate() + Seconds(4), 10, OpTimeAndWallTime(), BSONObj()},
             &statusBuilder,
             &resultStatus);
         ASSERT_OK(resultStatus);
@@ -6048,7 +6217,7 @@ TEST_F(HeartbeatResponseTestTwoRetriesV1, NodeDoesNotRetryHeartbeatsAfterFailing
     Status resultStatus(ErrorCodes::InternalError, "prepareStatusResponse didn't set result");
     getTopoCoord().prepareStatusResponse(
         TopologyCoordinator::ReplSetStatusArgs{
-            firstRequestDate() + Milliseconds(4900), 10, OpTime(), BSONObj()},
+            firstRequestDate() + Milliseconds(4900), 10, OpTimeAndWallTime(), BSONObj()},
         &statusBuilder,
         &resultStatus);
     ASSERT_OK(resultStatus);
@@ -6100,7 +6269,7 @@ TEST_F(HeartbeatResponseTestTwoRetriesV1, HeartbeatThreeNonconsecutiveFailures) 
     Status resultStatus(ErrorCodes::InternalError, "prepareStatusResponse didn't set result");
     getTopoCoord().prepareStatusResponse(
         TopologyCoordinator::ReplSetStatusArgs{
-            firstRequestDate() + Milliseconds(7000), 600, OpTime(), BSONObj()},
+            firstRequestDate() + Milliseconds(7000), 600, OpTimeAndWallTime(), BSONObj()},
         &statusBuilder,
         &resultStatus);
     ASSERT_OK(resultStatus);

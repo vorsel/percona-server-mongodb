@@ -80,6 +80,39 @@ void _appendUserInfo(const CurOp& c, BSONObjBuilder& builder, AuthorizationSessi
     builder.append("user", bestUser.getUser().empty() ? "" : bestUser.getFullName());
 }
 
+/**
+ * When in scope, closes any active storage transactions and enforces prepare conflicts for reads.
+ *
+ * Locks must be held while this is in scope because both constructor and destructor access the
+ * storage engine.
+ */
+class EnforcePrepareConflictsBlock {
+public:
+    explicit EnforcePrepareConflictsBlock(OperationContext* opCtx)
+        : _opCtx(opCtx), _originalValue(opCtx->recoveryUnit()->getIgnorePrepared()) {
+        dassert(_opCtx->lockState()->isLocked());
+        dassert(!_opCtx->lockState()->inAWriteUnitOfWork());
+
+        // It is illegal to call setIgnorePrepared() while any storage transaction is active. This
+        // call is also harmless because any previous reads or writes should have already completed,
+        // as profile() is called at the end of an operation.
+        _opCtx->recoveryUnit()->abandonSnapshot();
+        _opCtx->recoveryUnit()->setIgnorePrepared(false);
+    }
+
+    ~EnforcePrepareConflictsBlock() {
+        dassert(_opCtx->lockState()->isLocked());
+        dassert(!_opCtx->lockState()->inAWriteUnitOfWork());
+
+        _opCtx->recoveryUnit()->abandonSnapshot();
+        _opCtx->recoveryUnit()->setIgnorePrepared(_originalValue);
+    }
+
+private:
+    OperationContext* _opCtx;
+    bool _originalValue;
+};
+
 }  // namespace
 
 
@@ -92,7 +125,8 @@ void profile(OperationContext* opCtx, NetworkOp op) {
     {
         Locker::LockerInfo lockerInfo;
         opCtx->lockState()->getLockerInfo(&lockerInfo, CurOp::get(opCtx)->getLockStatsBase());
-        CurOp::get(opCtx)->debug().append(*CurOp::get(opCtx), lockerInfo.stats, b);
+        CurOp::get(opCtx)->debug().append(
+            *CurOp::get(opCtx), lockerInfo.stats, opCtx->lockState()->getFlowControlStats(), b);
     }
 
     b.appendDate("ts", jsTime());
@@ -152,7 +186,11 @@ void profile(OperationContext* opCtx, NetworkOp op) {
                 break;
             }
 
-            Lock::CollectionLock collLock(opCtx->lockState(), db->getProfilingNS(), MODE_IX);
+            Lock::CollectionLock collLock(opCtx, db->getProfilingNS(), MODE_IX);
+
+            // The profiler performs writes even after read commands. Ignoring prepare conflicts is
+            // not allowed while performing writes, so temporarily enforce prepare conflicts.
+            EnforcePrepareConflictsBlock enforcePrepare(opCtx);
 
             Collection* const coll = db->getCollection(opCtx, db->getProfilingNS());
             if (coll) {
@@ -192,8 +230,7 @@ void profile(OperationContext* opCtx, NetworkOp op) {
 Status createProfileCollection(OperationContext* opCtx, Database* db) {
     invariant(opCtx->lockState()->isDbLockedForMode(db->name(), MODE_X));
 
-    const std::string dbProfilingNS(db->getProfilingNS());
-
+    auto& dbProfilingNS = db->getProfilingNS();
     Collection* const collection = db->getCollection(opCtx, dbProfilingNS);
     if (collection) {
         if (!collection->isCapped()) {

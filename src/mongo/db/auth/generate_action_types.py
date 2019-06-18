@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #
 # Copyright (C) 2018-present MongoDB, Inc.
 #
@@ -156,7 +156,7 @@ sourceFileTemplate = """// AUTO-GENERATED FILE DO NOT EDIT
 #include <string>
 
 #include "mongo/base/status.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -177,8 +177,8 @@ namespace mongo {
     Status ActionType::parseActionFromString(const std::string& action, ActionType* result) {
 %(fromStringIfStatements)s
         return Status(ErrorCodes::FailedToParse,
-                      mongoutils::str::stream() << "Unrecognized action privilege string: "
-                                                << action);
+                      str::stream() << "Unrecognized action privilege string: "
+                                    << action);
     }
 
     // Takes an ActionType and returns the string representation

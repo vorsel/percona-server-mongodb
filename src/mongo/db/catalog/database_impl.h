@@ -37,7 +37,7 @@ namespace mongo {
 
 class DatabaseImpl final : public Database {
 public:
-    explicit DatabaseImpl(StringData name, DatabaseCatalogEntry* dbEntry, uint64_t epoch);
+    explicit DatabaseImpl(StringData name, uint64_t epoch);
 
     void init(OperationContext*) const final;
 
@@ -62,8 +62,8 @@ public:
     int getProfilingLevel() const final {
         return _profile.load();
     }
-    const char* getProfilingNS() const final {
-        return _profileName.c_str();
+    const NamespaceString& getProfilingNS() const final {
+        return _profileName;
     }
 
     void setDropPending(OperationContext* opCtx, bool dropPending) final;
@@ -71,8 +71,6 @@ public:
     bool isDropPending(OperationContext* opCtx) const final;
 
     void getStats(OperationContext* opCtx, BSONObjBuilder* output, double scale = 1) const final;
-
-    const DatabaseCatalogEntry* getDatabaseCatalogEntry() const final;
 
     /**
      * dropCollection() will refuse to drop system collections. Use dropCollectionEvenIfSystem() if
@@ -85,22 +83,22 @@ public:
      * collection.
      */
     Status dropCollection(OperationContext* opCtx,
-                          StringData fullns,
+                          NamespaceString nss,
                           repl::OpTime dropOpTime) const final;
     Status dropCollectionEvenIfSystem(OperationContext* opCtx,
-                                      const NamespaceString& fullns,
+                                      NamespaceString nss,
                                       repl::OpTime dropOpTime) const final;
 
-    Status dropView(OperationContext* opCtx, const NamespaceString& viewName) const final;
+    Status dropView(OperationContext* opCtx, NamespaceString viewName) const final;
 
     Status userCreateNS(OperationContext* opCtx,
-                        const NamespaceString& fullns,
+                        const NamespaceString& nss,
                         CollectionOptions collectionOptions,
                         bool createDefaultIndexes,
                         const BSONObj& idIndex) const final;
 
     Collection* createCollection(OperationContext* opCtx,
-                                 StringData ns,
+                                 const NamespaceString& nss,
                                  const CollectionOptions& options = CollectionOptions(),
                                  bool createDefaultIndexes = true,
                                  const BSONObj& idIndex = BSONObj()) const final;
@@ -109,32 +107,19 @@ public:
                       const NamespaceString& viewName,
                       const CollectionOptions& options) const final;
 
-    /**
-     * @param ns - this is fully qualified, which is maybe not ideal ???
-     */
-    Collection* getCollection(OperationContext* opCtx, StringData ns) const final;
-
-    Collection* getCollection(OperationContext* opCtx, const NamespaceString& ns) const;
+    Collection* getCollection(OperationContext* opCtx, const NamespaceString& nss) const;
 
     Collection* getOrCreateCollection(OperationContext* opCtx,
                                       const NamespaceString& nss) const final;
 
-    /**
-     * Renames the fully qualified namespace 'fromNS' to the fully qualified namespace 'toNS'.
-     * Illegal to call unless both 'fromNS' and 'toNS' are within this database. Returns an error if
-     * 'toNS' already exists or 'fromNS' does not exist.
-     *
-     * The caller should hold a DB X lock and ensure there are no index builds in progress on either
-     * the 'fromNS' or the 'toNS'.
-     */
     Status renameCollection(OperationContext* opCtx,
-                            StringData fromNS,
-                            StringData toNS,
+                            NamespaceString fromNss,
+                            NamespaceString toNss,
                             bool stayTemp) const final;
 
     static Status validateDBName(StringData dbname);
 
-    const std::string& getSystemViewsName() const final {
+    const NamespaceString& getSystemViewsName() const final {
         return _viewsName;
     }
 
@@ -143,12 +128,12 @@ public:
 
     void checkForIdIndexesAndDropPendingCollections(OperationContext* opCtx) const final;
 
-    UUIDCatalog::iterator begin(OperationContext* opCtx) const final {
-        return UUIDCatalog::get(opCtx).begin(_name);
+    CollectionCatalog::iterator begin(OperationContext* opCtx) const final {
+        return CollectionCatalog::get(opCtx).begin(_name);
     }
 
-    UUIDCatalog::iterator end(OperationContext* opCtx) const final {
-        return UUIDCatalog::get(opCtx).end();
+    CollectionCatalog::iterator end(OperationContext* opCtx) const final {
+        return CollectionCatalog::get(opCtx).end();
     }
 
     uint64_t epoch() const {
@@ -170,24 +155,22 @@ private:
      * unreplicated collection drops.
      */
     Status _finishDropCollection(OperationContext* opCtx,
-                                 const NamespaceString& fullns,
+                                 const NamespaceString& nss,
                                  Collection* collection) const;
 
     /**
      * Removes all indexes for a collection.
      */
     void _dropCollectionIndexes(OperationContext* opCtx,
-                                const NamespaceString& fullns,
+                                const NamespaceString& nss,
                                 Collection* collection) const;
 
     const std::string _name;  // "dbname"
 
-    DatabaseCatalogEntry* _dbEntry;  // not owned here
-
     const uint64_t _epoch;
 
-    const std::string _profileName;  // "dbname.system.profile"
-    const std::string _viewsName;    // "dbname.system.views"
+    const NamespaceString _profileName;  // "dbname.system.profile"
+    const NamespaceString _viewsName;    // "dbname.system.views"
 
     AtomicWord<int> _profile{0};  // 0=off
 

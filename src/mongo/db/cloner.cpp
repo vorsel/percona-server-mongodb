@@ -64,7 +64,7 @@
 #include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -394,7 +394,7 @@ void Cloner::copyIndexes(OperationContext* opCtx,
     }
 
     auto indexCatalog = collection->getIndexCatalog();
-    auto prunedIndexesToBuild = indexCatalog->removeExistingIndexes(opCtx, indexesToBuild);
+    auto prunedIndexesToBuild = indexCatalog->removeExistingIndexesNoChecks(opCtx, indexesToBuild);
     if (prunedIndexesToBuild.empty()) {
         return;
     }
@@ -595,7 +595,7 @@ Status Cloner::createCollectionsForDb(
                 opCtx->checkForInterrupt();
                 WriteUnitOfWork wunit(opCtx);
 
-                Collection* collection = db->getCollection(opCtx, nss.ns());
+                Collection* collection = db->getCollection(opCtx, nss);
                 if (collection) {
                     if (!params.shardedColl) {
                         // If the collection is unsharded then we want to fail when a collection

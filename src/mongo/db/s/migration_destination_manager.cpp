@@ -65,9 +65,9 @@
 #include "mongo/util/concurrency/notification.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/producer_consumer_queue.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace {
@@ -619,7 +619,7 @@ void MigrationDestinationManager::cloneCollectionIndexesAndOptions(OperationCont
         // possible).
         auto checkEmptyOrGetMissingIndexesFromDonor = [&](Collection* collection) {
             auto indexCatalog = collection->getIndexCatalog();
-            auto indexSpecs = indexCatalog->removeExistingIndexes(opCtx, donorIndexSpecs);
+            auto indexSpecs = indexCatalog->removeExistingIndexesNoChecks(opCtx, donorIndexSpecs);
             if (!indexSpecs.empty()) {
                 // Only allow indexes to be copied if the collection does not have any documents.
                 uassert(ErrorCodes::CannotCreateCollection,

@@ -139,7 +139,8 @@ public:
      * NOTE: Must be called with at least IX lock held on the collection.
      */
     virtual void onUpdateOp(OperationContext* opCtx,
-                            const BSONObj& updatedDoc,
+                            boost::optional<BSONObj> preImageDoc,
+                            const BSONObj& postImageDoc,
                             const repl::OpTime& opTime,
                             const repl::OpTime& prePostImageOpTime) = 0;
 
@@ -154,6 +155,17 @@ public:
                             const BSONObj& deletedDocId,
                             const repl::OpTime& opTime,
                             const repl::OpTime& preImageOpTime) = 0;
+
+    /**
+     * Notifies this cloner that a transaction involving the collection being cloned was prepared or
+     * committed. It is up to the cloner's implementation to decide what to do with this information
+     * and it is valid for the implementation to ignore it.
+     *
+     * NOTE: Must be called with at least IX lock held on the collection.
+     */
+    virtual void onTransactionPrepareOrUnpreparedCommit(OperationContext* opCtx,
+                                                        const repl::OpTime& opTime) = 0;
+
 
 protected:
     MigrationChunkClonerSource();

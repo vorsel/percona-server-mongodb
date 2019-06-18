@@ -1,12 +1,9 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """Produce a report of all assertions in the MongoDB server codebase.
 
 Parses .cpp files for assertions and verifies assertion codes are distinct.
 Optionally replaces zero codes in source code with new distinct values.
 """
-
-
-
 
 import bisect
 import os.path
@@ -24,7 +21,7 @@ from buildscripts import utils  # pylint: disable=wrong-import-position
 try:
     import regex as re
 except ImportError:
-    print("*** Run 'pip2 install --user regex' to speed up error code checking")
+    print("*** Run 'pip3 install --user regex' to speed up error code checking")
     import re  # type: ignore
 
 ASSERT_NAMES = ["uassert", "massert", "fassert", "fassertFailed"]
@@ -45,21 +42,21 @@ list_files = False  # pylint: disable=invalid-name
 def parse_source_files(callback):
     """Walk MongoDB sourcefiles and invoke a callback for each AssertLocation found."""
 
-    quick = [b"assert", b"Exception", b"ErrorCodes::Error"]
+    quick = [r"assert", r"Exception", r"ErrorCodes::Error"]
 
     patterns = [
-        re.compile(b"(?:u|m(?:sg)?)asser(?:t|ted)(?:NoTrace)?\s*\(\s*(\d+)", re.MULTILINE),
-        re.compile(b"(?:DB|Assertion)Exception\s*[({]\s*(\d+)", re.MULTILINE),
-        re.compile(b"fassert(?:Failed)?(?:WithStatus)?(?:NoTrace)?(?:StatusOK)?\s*\(\s*(\d+)",
+        re.compile(r"(?:u|m(?:sg)?)asser(?:t|ted)(?:NoTrace)?\s*\(\s*(\d+)", re.MULTILINE),
+        re.compile(r"(?:DB|Assertion)Exception\s*[({]\s*(\d+)", re.MULTILINE),
+        re.compile(r"fassert(?:Failed)?(?:WithStatus)?(?:NoTrace)?(?:StatusOK)?\s*\(\s*(\d+)",
                    re.MULTILINE),
-        re.compile(b"ErrorCodes::Error\s*[({]\s*(\d+)", re.MULTILINE)
+        re.compile(r"ErrorCodes::Error\s*[({]\s*(\d+)", re.MULTILINE)
     ]
 
     for source_file in utils.get_all_source_files(prefix='src/mongo/'):
         if list_files:
             print('scanning file: ' + source_file)
 
-        with open(source_file, 'rb') as fh:
+        with open(source_file, 'r', encoding='utf-8') as fh:
             text = fh.read()
 
             if not any([zz in text for zz in quick]):

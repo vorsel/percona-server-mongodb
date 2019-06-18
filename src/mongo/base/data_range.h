@@ -37,7 +37,7 @@
 #include "mongo/base/error_codes.h"
 #include "mongo/base/status_with.h"
 #include "mongo/platform/endian.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 class ConstDataRange {
@@ -45,8 +45,9 @@ protected:
     // These are helper types to make ConstDataRange's and friends constructable either from
     // a range of byte-like pointers or from a container of byte-like values.
     template <typename T>
-    constexpr static auto isByteV = ((std::is_integral_v<T> && sizeof(T) == 1) ||
-                                     std::is_same_v<T, std::byte>);
+    constexpr static auto isByteV =
+        (((std::is_integral_v<T> && sizeof(T) == 1) ||
+          std::is_same_v<T, std::byte>)&&(!std::is_same_v<std::decay_t<T>, bool>));
 
     template <typename T, typename = void>
     struct HasDataSize : std::false_type {};

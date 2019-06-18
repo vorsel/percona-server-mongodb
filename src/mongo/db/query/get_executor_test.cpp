@@ -42,7 +42,7 @@
 #include "mongo/db/query/query_test_service_context.h"
 #include "mongo/stdx/unordered_set.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 using namespace mongo;
 
@@ -261,6 +261,34 @@ TEST(GetExecutorTest, GetAllowedPathSpecifiedWildcardIndicesByName) {
                        SimpleBSONObjComparator::kInstance.makeBSONObjSet(),
                        {"a.$**_1"},
                        {"a.$**_1"});
+}
+
+TEST(GetExecutorTest, isComponentOfPathMultikeyNoMetadata) {
+    BSONObj indexKey = BSON("a" << 1 << "b.c" << -1);
+    MultikeyPaths multikeyInfo = {};
+
+    ASSERT_TRUE(isAnyComponentOfPathMultikey(indexKey, true, multikeyInfo, "a"));
+    ASSERT_TRUE(isAnyComponentOfPathMultikey(indexKey, true, multikeyInfo, "b.c"));
+
+    ASSERT_FALSE(isAnyComponentOfPathMultikey(indexKey, false, multikeyInfo, "a"));
+    ASSERT_FALSE(isAnyComponentOfPathMultikey(indexKey, false, multikeyInfo, "b.c"));
+}
+
+TEST(GetExecutorTest, isComponentOfPathMultikeyWithMetadata) {
+    BSONObj indexKey = BSON("a" << 1 << "b.c" << -1);
+    MultikeyPaths multikeyInfo = {{}, {1}};
+
+    ASSERT_FALSE(isAnyComponentOfPathMultikey(indexKey, true, multikeyInfo, "a"));
+    ASSERT_TRUE(isAnyComponentOfPathMultikey(indexKey, true, multikeyInfo, "b.c"));
+}
+
+TEST(GetExecutorTest, isComponentOfPathMultikeyWithEmptyMetadata) {
+    BSONObj indexKey = BSON("a" << 1 << "b.c" << -1);
+
+
+    MultikeyPaths multikeyInfoAllPathsScalar = {{}, {}};
+    ASSERT_FALSE(isAnyComponentOfPathMultikey(indexKey, false, multikeyInfoAllPathsScalar, "a"));
+    ASSERT_FALSE(isAnyComponentOfPathMultikey(indexKey, false, multikeyInfoAllPathsScalar, "b.c"));
 }
 
 }  // namespace

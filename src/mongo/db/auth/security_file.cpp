@@ -41,7 +41,7 @@
 
 #include "mongo/base/status_with.h"
 #include "mongo/db/server_options.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 #include "yaml-cpp/yaml.h"
 

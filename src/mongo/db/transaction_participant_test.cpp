@@ -47,6 +47,7 @@
 #include "mongo/db/stats/fill_locker_info.h"
 #include "mongo/db/transaction_participant.h"
 #include "mongo/db/transaction_participant_gen.h"
+#include "mongo/logger/logger.h"
 #include "mongo/stdx/future.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/unittest/barrier.h"
@@ -246,7 +247,7 @@ protected:
             WriteUnitOfWork wuow(opCtx());
             CollectionOptions options;
             options.uuid = _uuid;
-            db->createCollection(opCtx(), kNss.ns(), options);
+            db->createCollection(opCtx(), kNss, options);
             wuow.commit();
         }
 
@@ -417,7 +418,7 @@ TEST_F(TxnParticipantTest, AutocommitRequiredOnEveryTxnOp) {
     // Omitting 'autocommit' after the first statement of a transaction should throw an error.
     ASSERT_THROWS_CODE(txnParticipant.beginOrContinue(opCtx(), txnNum, boost::none, boost::none),
                        AssertionException,
-                       ErrorCodes::InvalidOptions);
+                       ErrorCodes::IncompleteTransactionHistory);
 
     // Including autocommit=false should succeed.
     txnParticipant.beginOrContinue(opCtx(), *opCtx()->getTxnNumber(), false, boost::none);
@@ -544,7 +545,7 @@ TEST_F(TxnParticipantTest, PrepareFailsOnTemporaryCollection) {
         CollectionOptions options;
         options.uuid = tempCollUUID;
         options.temp = true;
-        db->createCollection(opCtx(), tempCollNss.ns(), options);
+        db->createCollection(opCtx(), tempCollNss, options);
         wuow.commit();
     }
 
@@ -570,7 +571,7 @@ TEST_F(TxnParticipantTest, CommitTransactionSetsCommitTimestampOnPreparedTransac
     txnParticipant.unstashTransactionResources(opCtx(), "commitTransaction");
 
     // The transaction machinery cannot store an empty locker.
-    Lock::GlobalLock lk(opCtx(), MODE_IX, Date_t::now(), Lock::InterruptBehavior::kThrow);
+    { Lock::GlobalLock lk(opCtx(), MODE_IX, Date_t::now(), Lock::InterruptBehavior::kThrow); }
     const auto prepareTimestamp = txnParticipant.prepareTransaction(opCtx(), {});
     const auto commitTS = Timestamp(prepareTimestamp.getSecs(), prepareTimestamp.getInc() + 1);
 
@@ -604,7 +605,7 @@ TEST_F(TxnParticipantTest, CommitTransactionWithCommitTimestampFailsOnUnprepared
     txnParticipant.unstashTransactionResources(opCtx(), "commitTransaction");
 
     // The transaction machinery cannot store an empty locker.
-    Lock::GlobalLock lk(opCtx(), MODE_IX, Date_t::now(), Lock::InterruptBehavior::kThrow);
+    { Lock::GlobalLock lk(opCtx(), MODE_IX, Date_t::now(), Lock::InterruptBehavior::kThrow); }
     ASSERT_THROWS_CODE(txnParticipant.commitPreparedTransaction(opCtx(), commitTimestamp, {}),
                        AssertionException,
                        ErrorCodes::InvalidOptions);
@@ -625,7 +626,7 @@ TEST_F(TxnParticipantTest, CommitTransactionDoesNotSetCommitTimestampOnUnprepare
     txnParticipant.unstashTransactionResources(opCtx(), "commitTransaction");
 
     // The transaction machinery cannot store an empty locker.
-    Lock::GlobalLock lk(opCtx(), MODE_IX, Date_t::now(), Lock::InterruptBehavior::kThrow);
+    { Lock::GlobalLock lk(opCtx(), MODE_IX, Date_t::now(), Lock::InterruptBehavior::kThrow); }
     txnParticipant.commitUnpreparedTransaction(opCtx());
 
     ASSERT(opCtx()->recoveryUnit()->getCommitTimestamp().isNull());
@@ -642,7 +643,7 @@ TEST_F(TxnParticipantTest, CommitTransactionWithoutCommitTimestampFailsOnPrepare
     txnParticipant.unstashTransactionResources(opCtx(), "commitTransaction");
 
     // The transaction machinery cannot store an empty locker.
-    Lock::GlobalLock lk(opCtx(), MODE_IX, Date_t::now(), Lock::InterruptBehavior::kThrow);
+    { Lock::GlobalLock lk(opCtx(), MODE_IX, Date_t::now(), Lock::InterruptBehavior::kThrow); }
     txnParticipant.prepareTransaction(opCtx(), {});
     ASSERT_THROWS_CODE(txnParticipant.commitUnpreparedTransaction(opCtx()),
                        AssertionException,
@@ -656,7 +657,7 @@ TEST_F(TxnParticipantTest, CommitTransactionWithNullCommitTimestampFailsOnPrepar
     txnParticipant.unstashTransactionResources(opCtx(), "commitTransaction");
 
     // The transaction machinery cannot store an empty locker.
-    Lock::GlobalLock lk(opCtx(), MODE_IX, Date_t::now(), Lock::InterruptBehavior::kThrow);
+    { Lock::GlobalLock lk(opCtx(), MODE_IX, Date_t::now(), Lock::InterruptBehavior::kThrow); }
     txnParticipant.prepareTransaction(opCtx(), {});
     ASSERT_THROWS_CODE(txnParticipant.commitPreparedTransaction(opCtx(), Timestamp(), {}),
                        AssertionException,
@@ -671,7 +672,7 @@ TEST_F(TxnParticipantTest,
     txnParticipant.unstashTransactionResources(opCtx(), "commitTransaction");
 
     // The transaction machinery cannot store an empty locker.
-    Lock::GlobalLock lk(opCtx(), MODE_IX, Date_t::now(), Lock::InterruptBehavior::kThrow);
+    { Lock::GlobalLock lk(opCtx(), MODE_IX, Date_t::now(), Lock::InterruptBehavior::kThrow); }
     auto prepareTimestamp = txnParticipant.prepareTransaction(opCtx(), {});
     ASSERT_THROWS_CODE(txnParticipant.commitPreparedTransaction(
                            opCtx(), Timestamp(prepareTimestamp.getSecs() - 1, 1), {}),
@@ -1389,7 +1390,7 @@ TEST_F(TxnParticipantTest, ReacquireLocksForPreparedTransactionsOnStepUp) {
         // Simulate the locking of an insert.
         {
             Lock::DBLock dbLock(opCtx(), "test", MODE_IX);
-            Lock::CollectionLock collLock(opCtx()->lockState(), "test.foo", MODE_IX);
+            Lock::CollectionLock collLock(opCtx(), NamespaceString("test.foo"), MODE_IX);
         }
         txnParticipant.prepareTransaction(opCtx(), repl::OpTime({1, 1}, 1));
         txnParticipant.stashTransactionResources(opCtx());
@@ -2262,8 +2263,8 @@ TEST_F(TransactionsMetricsTest, AdditiveMetricsObjectsShouldBeAddedTogetherUponS
     CurOp::get(opCtx())->debug().additiveMetrics.keysDeleted = 0;
     txnParticipant.getSingleTransactionStatsForTest()
         .getOpDebug()
-        ->additiveMetrics.prepareReadConflicts = 5;
-    CurOp::get(opCtx())->debug().additiveMetrics.prepareReadConflicts = 4;
+        ->additiveMetrics.prepareReadConflicts.store(5);
+    CurOp::get(opCtx())->debug().additiveMetrics.prepareReadConflicts.store(4);
 
     auto additiveMetricsToCompare =
         txnParticipant.getSingleTransactionStatsForTest().getOpDebug()->additiveMetrics;
@@ -2300,11 +2301,12 @@ TEST_F(TransactionsMetricsTest, AdditiveMetricsObjectsShouldBeAddedTogetherUponC
     CurOp::get(opCtx())->debug().additiveMetrics.keysInserted = 1;
     txnParticipant.getSingleTransactionStatsForTest()
         .getOpDebug()
-        ->additiveMetrics.prepareReadConflicts = 0;
-    CurOp::get(opCtx())->debug().additiveMetrics.prepareReadConflicts = 0;
-    txnParticipant.getSingleTransactionStatsForTest().getOpDebug()->additiveMetrics.writeConflicts =
-        6;
-    CurOp::get(opCtx())->debug().additiveMetrics.writeConflicts = 3;
+        ->additiveMetrics.prepareReadConflicts.store(0);
+    CurOp::get(opCtx())->debug().additiveMetrics.prepareReadConflicts.store(0);
+    txnParticipant.getSingleTransactionStatsForTest()
+        .getOpDebug()
+        ->additiveMetrics.writeConflicts.store(6);
+    CurOp::get(opCtx())->debug().additiveMetrics.writeConflicts.store(3);
 
     auto additiveMetricsToCompare =
         txnParticipant.getSingleTransactionStatsForTest().getOpDebug()->additiveMetrics;
@@ -2339,9 +2341,10 @@ TEST_F(TransactionsMetricsTest, AdditiveMetricsObjectsShouldBeAddedTogetherUponA
     CurOp::get(opCtx())->debug().additiveMetrics.keysInserted = 1;
     txnParticipant.getSingleTransactionStatsForTest().getOpDebug()->additiveMetrics.keysDeleted = 6;
     CurOp::get(opCtx())->debug().additiveMetrics.keysDeleted = 0;
-    txnParticipant.getSingleTransactionStatsForTest().getOpDebug()->additiveMetrics.writeConflicts =
-        3;
-    CurOp::get(opCtx())->debug().additiveMetrics.writeConflicts = 3;
+    txnParticipant.getSingleTransactionStatsForTest()
+        .getOpDebug()
+        ->additiveMetrics.writeConflicts.store(3);
+    CurOp::get(opCtx())->debug().additiveMetrics.writeConflicts.store(3);
 
     auto additiveMetricsToCompare =
         txnParticipant.getSingleTransactionStatsForTest().getOpDebug()->additiveMetrics;
@@ -2769,8 +2772,8 @@ void setupAdditiveMetrics(const int metricValue, OperationContext* opCtx) {
     CurOp::get(opCtx)->debug().additiveMetrics.ndeleted = metricValue;
     CurOp::get(opCtx)->debug().additiveMetrics.keysInserted = metricValue;
     CurOp::get(opCtx)->debug().additiveMetrics.keysDeleted = metricValue;
-    CurOp::get(opCtx)->debug().additiveMetrics.prepareReadConflicts = metricValue;
-    CurOp::get(opCtx)->debug().additiveMetrics.writeConflicts = metricValue;
+    CurOp::get(opCtx)->debug().additiveMetrics.prepareReadConflicts.store(metricValue);
+    CurOp::get(opCtx)->debug().additiveMetrics.writeConflicts.store(metricValue);
 }
 
 /*
@@ -2836,17 +2839,15 @@ void buildPreparedDurationString(StringBuilder* sb,
 /*
  * Builds the entire expected transaction info string and returns it.
  */
-std::string buildTransactionInfoString(
-    OperationContext* opCtx,
-    TransactionParticipant::Participant txnParticipant,
-    std::string terminationCause,
-    const LogicalSessionId sessionId,
-    const TxnNumber txnNum,
-    const int metricValue,
-    const bool wasPrepared,
-    bool autocommitVal = false,
-    boost::optional<repl::OpTime> prepareOpTime = boost::none,
-    boost::optional<repl::OpTime> oldestOplogEntryOpTime = boost::none) {
+std::string buildTransactionInfoString(OperationContext* opCtx,
+                                       TransactionParticipant::Participant txnParticipant,
+                                       std::string terminationCause,
+                                       const LogicalSessionId sessionId,
+                                       const TxnNumber txnNum,
+                                       const int metricValue,
+                                       const bool wasPrepared,
+                                       bool autocommitVal = false,
+                                       boost::optional<repl::OpTime> prepareOpTime = boost::none) {
     // Calling transactionInfoForLog to get the actual transaction info string.
     const auto lockerInfo =
         opCtx->lockState()->getLockerInfo(CurOp::get(*opCtx)->getLockStatsBase());
@@ -2895,7 +2896,7 @@ std::string buildTransactionInfoString(
     // timeInactiveMicros:2 numYields:0 locks:{ Global: { acquireCount: { r: 6, w: 4 } }, Database:
     // { acquireCount: { r: 1, w: 1, W: 2 } }, Collection: { acquireCount: { R: 1 } }, oplog: {
     // acquireCount: { W: 1 } } } wasPrepared:1 totalPreparedDurationMicros:10
-    // prepareOpTime:<OpTime> oldestOplogEntryOpTime:<OpTime> 0ms
+    // prepareOpTime:<OpTime> 0ms
     StringBuilder expectedTransactionInfo;
     expectedTransactionInfo << parametersInfo.str() << readTimestampInfo.str()
                             << singleTransactionStatsInfo.str()
@@ -2912,15 +2913,7 @@ std::string buildTransactionInfoString(
                                 << (prepareOpTime ? prepareOpTime->toString()
                                                   : txnParticipant.getPrepareOpTime().toString());
     }
-    if (txnParticipant.getOldestOplogEntryOpTimeForTest()) {
-        ASSERT(!oldestOplogEntryOpTime);
-        expectedTransactionInfo << " oldestOplogEntryOpTime:"
-                                << txnParticipant.getOldestOplogEntryOpTimeForTest()->toString();
-    }
-    if (oldestOplogEntryOpTime) {
-        ASSERT(!txnParticipant.getOldestOplogEntryOpTimeForTest());
-        expectedTransactionInfo << " oldestOplogEntryOpTime:" << oldestOplogEntryOpTime->toString();
-    }
+
     expectedTransactionInfo << ", "
                             << duration_cast<Milliseconds>(
                                    txnParticipant.getSingleTransactionStatsForTest().getDuration(
@@ -3275,7 +3268,6 @@ TEST_F(TransactionsMetricsTest, LogPreparedTransactionInfoAfterSlowAbort) {
                                    metricValue,
                                    true,
                                    false,
-                                   prepareOpTime,
                                    prepareOpTime);
 
     ASSERT_EQUALS(1, countLogLinesContaining(expectedTransactionInfo));
@@ -3364,6 +3356,54 @@ TEST_F(TransactionsMetricsTest, LogTransactionInfoAfterSlowStashedAbort) {
 
     std::string expectedTransactionInfo = "transaction parameters";
     ASSERT_EQUALS(1, countLogLinesContaining(expectedTransactionInfo));
+}
+
+TEST_F(TransactionsMetricsTest, LogTransactionInfoVerbosityInfo) {
+    auto sessionCheckout = checkOutSession();
+
+    auto txnParticipant = TransactionParticipant::get(opCtx());
+
+    // Set a high slow operation threshold to avoid the transaction being logged as slow.
+    serverGlobalParams.slowMS = 10000;
+
+    // Set verbosity level of transaction components to info.
+    logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogComponent::kTransaction,
+                                                        logger::LogSeverity::Info());
+
+    txnParticipant.unstashTransactionResources(opCtx(), "commitTransaction");
+
+    startCapturingLogMessages();
+    txnParticipant.commitUnpreparedTransaction(opCtx());
+    stopCapturingLogMessages();
+
+    // Test that the transaction is not logged.
+    ASSERT_EQUALS(0, countLogLinesContaining("transaction parameters"));
+}
+
+TEST_F(TransactionsMetricsTest, LogTransactionInfoVerbosityDebug) {
+    auto sessionCheckout = checkOutSession();
+
+    auto txnParticipant = TransactionParticipant::get(opCtx());
+
+    // Set a high slow operation threshold to avoid the transaction being logged as slow.
+    serverGlobalParams.slowMS = 10000;
+
+    // Set verbosity level of transaction components to debug.
+    logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogComponent::kTransaction,
+                                                        logger::LogSeverity::Debug(1));
+
+    txnParticipant.unstashTransactionResources(opCtx(), "commitTransaction");
+
+    startCapturingLogMessages();
+    txnParticipant.commitUnpreparedTransaction(opCtx());
+    stopCapturingLogMessages();
+
+    // Reset verbosity level of transaction components.
+    logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogComponent::kTransaction,
+                                                        logger::LogSeverity::Info());
+
+    // Test that the transaction is still logged.
+    ASSERT_EQUALS(1, countLogLinesContaining("transaction parameters"));
 }
 
 TEST_F(TxnParticipantTest, RollbackResetsInMemoryStateOfPreparedTransaction) {
@@ -3600,7 +3640,7 @@ TEST_F(TxnParticipantTest, OldestActiveTransactionTimestamp) {
 
         AutoGetOrCreateDb autoDb(opCtx(), nss.db(), MODE_X);
         WriteUnitOfWork wuow(opCtx());
-        auto coll = autoDb.getDb()->getCollection(opCtx(), nss.ns());
+        auto coll = autoDb.getDb()->getCollection(opCtx(), nss);
         ASSERT(coll);
         OpDebug* const nullOpDebug = nullptr;
         ASSERT_OK(
@@ -3612,7 +3652,7 @@ TEST_F(TxnParticipantTest, OldestActiveTransactionTimestamp) {
         Timestamp ts(1, i);
         AutoGetOrCreateDb autoDb(opCtx(), nss.db(), MODE_X);
         WriteUnitOfWork wuow(opCtx());
-        auto coll = autoDb.getDb()->getCollection(opCtx(), nss.ns());
+        auto coll = autoDb.getDb()->getCollection(opCtx(), nss);
         ASSERT(coll);
         auto cursor = coll->getCursor(opCtx());
         while (auto record = cursor->next()) {
@@ -3627,8 +3667,7 @@ TEST_F(TxnParticipantTest, OldestActiveTransactionTimestamp) {
                 return;
             }
         }
-        FAIL(mongoutils::str::stream() << "No prepared transaction with start timestamp (1, " << i
-                                       << ")");
+        FAIL(str::stream() << "No prepared transaction with start timestamp (1, " << i << ")");
     };
 
     auto oldestActiveTransactionTS = [&]() {
@@ -3671,6 +3710,83 @@ TEST_F(TxnParticipantTest, OldestActiveTransactionTimestampTimeout) {
     ASSERT_FALSE(statusWith.isOK());
     ASSERT_TRUE(ErrorCodes::isInterruption(statusWith.getStatus().code()));
 };
+
+TEST_F(TxnParticipantTest, ExitPreparePromiseIsFulfilledOnAbortAfterPrepare) {
+    MongoDOperationContextSession opCtxSession(opCtx());
+    auto txnParticipant = TransactionParticipant::get(opCtx());
+
+    txnParticipant.beginOrContinue(
+        opCtx(), *opCtx()->getTxnNumber(), false /* autocommit */, true /* startTransaction */);
+    ASSERT_TRUE(txnParticipant.onExitPrepare().isReady());
+
+    txnParticipant.unstashTransactionResources(opCtx(), "find");
+    ASSERT_TRUE(txnParticipant.onExitPrepare().isReady());
+
+    const auto prepareOpTime = repl::OpTime({3, 2}, 0);
+    txnParticipant.prepareTransaction(opCtx(), prepareOpTime);
+    const auto exitPrepareFuture = txnParticipant.onExitPrepare();
+    ASSERT_FALSE(exitPrepareFuture.isReady());
+
+    txnParticipant.abortActiveTransaction(opCtx());
+    ASSERT_TRUE(exitPrepareFuture.isReady());
+
+    // Once the promise has been fulfilled, new callers of onExitPrepare should immediately be
+    // ready.
+    ASSERT_TRUE(txnParticipant.onExitPrepare().isReady());
+
+    // abortTransaction is retryable, but does not cause the completion promise to be set again.
+    txnParticipant.abortActiveTransaction(opCtx());
+}
+
+TEST_F(TxnParticipantTest, ExitPreparePromiseIsFulfilledOnCommitAfterPrepare) {
+    MongoDOperationContextSession opCtxSession(opCtx());
+    auto txnParticipant = TransactionParticipant::get(opCtx());
+
+    txnParticipant.beginOrContinue(
+        opCtx(), *opCtx()->getTxnNumber(), false /* autocommit */, true /* startTransaction */);
+    ASSERT_TRUE(txnParticipant.onExitPrepare().isReady());
+
+    txnParticipant.unstashTransactionResources(opCtx(), "find");
+    ASSERT_TRUE(txnParticipant.onExitPrepare().isReady());
+
+    const auto prepareOpTime = repl::OpTime({3, 2}, 0);
+    const auto prepareTimestamp = txnParticipant.prepareTransaction(opCtx(), prepareOpTime);
+    const auto exitPrepareFuture = txnParticipant.onExitPrepare();
+    ASSERT_FALSE(exitPrepareFuture.isReady());
+
+    const auto commitTimestamp =
+        Timestamp(prepareTimestamp.getSecs(), prepareTimestamp.getInc() + 1);
+    txnParticipant.commitPreparedTransaction(opCtx(), commitTimestamp, {});
+    ASSERT_TRUE(exitPrepareFuture.isReady());
+
+    // Once the promise has been fulfilled, new callers of onExitPrepare should immediately be
+    // ready.
+    ASSERT_TRUE(txnParticipant.onExitPrepare().isReady());
+}
+
+TEST_F(TxnParticipantTest, ExitPreparePromiseIsFulfilledOnAbortPreparedTransactionForRollback) {
+    MongoDOperationContextSession opCtxSession(opCtx());
+    auto txnParticipant = TransactionParticipant::get(opCtx());
+
+    txnParticipant.beginOrContinue(
+        opCtx(), *opCtx()->getTxnNumber(), false /* autocommit */, true /* startTransaction */);
+    ASSERT_TRUE(txnParticipant.onExitPrepare().isReady());
+
+    txnParticipant.unstashTransactionResources(opCtx(), "find");
+    ASSERT_TRUE(txnParticipant.onExitPrepare().isReady());
+
+    const auto prepareOpTime = repl::OpTime({3, 2}, 0);
+    txnParticipant.prepareTransaction(opCtx(), prepareOpTime);
+    const auto exitPrepareFuture = txnParticipant.onExitPrepare();
+    ASSERT_FALSE(exitPrepareFuture.isReady());
+
+    txnParticipant.abortPreparedTransactionForRollback(opCtx());
+    ASSERT_TRUE(exitPrepareFuture.isReady());
+
+    // Once the promise has been fulfilled, new callers of onExitPrepare should immediately be
+    // ready.
+    ASSERT_TRUE(txnParticipant.onExitPrepare().isReady());
+}
 
 }  // namespace
 }  // namespace mongo

@@ -38,7 +38,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/collation/collator_interface.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -172,8 +172,8 @@ Status CollectionOptions::parse(const BSONObj& options, ParseKind kind) {
             else
                 autoIndexId = NO;
         } else if (fieldName == "flags") {
-            flags = e.numberInt();
-            flagsSet = true;
+            // Ignoring this field as it is deprecated.
+            continue;
         } else if (fieldName == "temp") {
             temp = e.trueValue();
         } else if (fieldName == "storageEngine") {
@@ -296,9 +296,6 @@ void CollectionOptions::appendBSON(BSONObjBuilder* builder) const {
     if (autoIndexId != DEFAULT)
         builder->appendBool("autoIndexId", autoIndexId == YES);
 
-    if (flagsSet)
-        builder->append("flags", flags);
-
     if (temp)
         builder->appendBool("temp", true);
 
@@ -368,14 +365,6 @@ bool CollectionOptions::matchesStorageOptions(const CollectionOptions& other,
     }
 
     if (autoIndexId != other.autoIndexId) {
-        return false;
-    }
-
-    if (flagsSet != other.flagsSet) {
-        return false;
-    }
-
-    if (flags != other.flags) {
         return false;
     }
 

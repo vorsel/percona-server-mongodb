@@ -61,8 +61,8 @@
 #include "mongo/util/concurrency/idle_thread_block.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/timer.h"
 
@@ -1658,7 +1658,7 @@ public:
     NumRecordsChange(WiredTigerRecordStore* rs, int64_t diff) : _rs(rs), _diff(diff) {}
     virtual void commit(boost::optional<Timestamp>) {}
     virtual void rollback() {
-        LOG(3) << "WiredTigerRecordStore: rolling back NumRecordsChange" << -_diff;
+        LOG(3) << "WiredTigerRecordStore: rolling back NumRecordsChange " << -_diff;
         _rs->_sizeInfo->numRecords.fetchAndAdd(-_diff);
     }
 
@@ -1872,6 +1872,10 @@ boost::optional<Record> WiredTigerRecordStoreCursorBase::next() {
         log() << "WTCursor::next -- c->next_key ( " << id
               << ") was not greater than _lastReturnedId (" << _lastReturnedId
               << ") which is a bug.";
+
+        // Crash when test commands are enabled.
+        invariant(!getTestCommandsEnabled());
+
         // Force a retry of the operation from our last known position by acting as-if
         // we received a WT_ROLLBACK error.
         throw WriteConflictException();

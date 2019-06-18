@@ -50,6 +50,11 @@ class OperationContext;
 class TargetedWriteBatch;
 class TrackedErrors;
 
+// Conservative overhead per element contained in the write batch. This value was calculated as 1
+// byte (element type) + 5 bytes (max string encoding of the array index encoded as string and the
+// maximum key is 99999) + 1 byte (zero terminator) = 7 bytes
+const int kWriteCommandBSONArrayPerElementOverheadBytes = 7;
+
 /**
  * Simple struct for storing an error with an endpoint.
  *
@@ -120,7 +125,7 @@ class BatchWriteOp {
 
 public:
     BatchWriteOp(OperationContext* opCtx, const BatchedCommandRequest& clientRequest);
-    ~BatchWriteOp();
+    ~BatchWriteOp() = default;
 
     /**
      * Targets one or more of the next write ops in this batch op using a NSTargeter.  The

@@ -46,7 +46,7 @@
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/clock_source_mock.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace executor {
@@ -147,14 +147,13 @@ auto makeSetStatusOnRemoteCommandCompletionClosure(const RemoteCommandRequest* e
     return [=](const TaskExecutor::RemoteCommandCallbackArgs& cbData) {
         if (cbData.request != *expectedRequest) {
             auto desc = [](const RemoteCommandRequest& request) -> std::string {
-                return mongoutils::str::stream() << "Request(" << request.target.toString() << ", "
-                                                 << request.dbname << ", " << request.cmdObj << ')';
+                return str::stream() << "Request(" << request.target.toString() << ", "
+                                     << request.dbname << ", " << request.cmdObj << ')';
             };
             *outStatus =
                 Status(ErrorCodes::BadValue,
-                       mongoutils::str::stream() << "Actual request: " << desc(cbData.request)
-                                                 << "; expected: "
-                                                 << desc(*expectedRequest));
+                       str::stream() << "Actual request: " << desc(cbData.request) << "; expected: "
+                                     << desc(*expectedRequest));
             return;
         }
         *outStatus = cbData.response.status;
@@ -168,16 +167,6 @@ COMMON_EXECUTOR_TEST(RunOne) {
     launchExecutorThread();
     joinExecutorThread();
     ASSERT_OK(status);
-}
-
-COMMON_EXECUTOR_TEST(Schedule1ButShutdown) {
-    TaskExecutor& executor = getExecutor();
-    Status status = getDetectableErrorStatus();
-    ASSERT_OK(executor.scheduleWork(makeSetStatusAndShutdownClosure(&status)).getStatus());
-    executor.shutdown();
-    launchExecutorThread();
-    joinExecutorThread();
-    ASSERT_EQUALS(status, ErrorCodes::CallbackCanceled);
 }
 
 COMMON_EXECUTOR_TEST(Schedule2Cancel1) {

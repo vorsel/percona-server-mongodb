@@ -61,10 +61,7 @@ namespace mongo {
 
 namespace {
 
-// Causes the server to hang when it attempts to assign UUIDs to the provided database (or all
-// databases if none are provided).
-MONGO_FAIL_POINT_DEFINE(hangBeforeDatabaseUpgrade);
-
+MONGO_FAIL_POINT_DEFINE(hangAfterDatabaseLock);
 MONGO_FAIL_POINT_DEFINE(assertAfterIndexUpdate);
 
 struct CollModRequest {
@@ -75,8 +72,6 @@ struct CollModRequest {
     BSONElement collValidator = {};
     std::string collValidationAction = {};
     std::string collValidationLevel = {};
-    BSONElement usePowerOf2Sizes = {};
-    BSONElement noPadding = {};
 };
 
 StatusWith<CollModRequest> parseCollModRequest(OperationContext* opCtx,
@@ -233,64 +228,15 @@ StatusWith<CollModRequest> parseCollModRequest(OperationContext* opCtx,
                 return Status(ErrorCodes::InvalidOptions,
                               str::stream() << "option not supported on a view: " << fieldName);
             }
-            // As of SERVER-17312 we only support these two options. When SERVER-17320 is
-            // resolved this will need to be enhanced to handle other options.
-            typedef CollectionOptions CO;
 
-            if (fieldName == "usePowerOf2Sizes")
-                cmr.usePowerOf2Sizes = e;
-            else if (fieldName == "noPadding")
-                cmr.noPadding = e;
-            else
-                return Status(ErrorCodes::InvalidOptions,
-                              str::stream() << "unknown option to collMod: " << fieldName);
+            return Status(ErrorCodes::InvalidOptions,
+                          str::stream() << "unknown option to collMod: " << fieldName);
         }
 
         oplogEntryBuilder->append(e);
     }
 
     return {std::move(cmr)};
-}
-
-/**
- * Set a collection option flag for 'UsePowerOf2Sizes' or 'NoPadding'. Appends both the new and
- * old flag setting to the given 'result' builder.
- */
-void setCollectionOptionFlag(OperationContext* opCtx,
-                             Collection* coll,
-                             BSONElement& collOptionElement,
-                             BSONObjBuilder* result) {
-    const StringData flagName = collOptionElement.fieldNameStringData();
-
-    int flag;
-
-    if (flagName == "usePowerOf2Sizes") {
-        flag = CollectionOptions::Flag_UsePowerOf2Sizes;
-    } else if (flagName == "noPadding") {
-        flag = CollectionOptions::Flag_NoPadding;
-    } else {
-        flag = 0;
-    }
-
-    CollectionCatalogEntry* cce = coll->getCatalogEntry();
-
-    const int oldFlags = cce->getCollectionOptions(opCtx).flags;
-    const bool oldSetting = oldFlags & flag;
-    const bool newSetting = collOptionElement.trueValue();
-
-    result->appendBool(flagName.toString() + "_old", oldSetting);
-    result->appendBool(flagName.toString() + "_new", newSetting);
-
-    const int newFlags = newSetting ? (oldFlags | flag)    // set flag
-                                    : (oldFlags & ~flag);  // clear flag
-
-    // NOTE we do this unconditionally to ensure that we note that the user has
-    // explicitly set flags, even if they are just setting the default.
-    cce->updateFlags(opCtx, newFlags);
-
-    const CollectionOptions newOptions = cce->getCollectionOptions(opCtx);
-    invariant(newOptions.flags == newFlags);
-    invariant(newOptions.flagsSet);
 }
 
 /**
@@ -306,6 +252,8 @@ Status _collModInternal(OperationContext* opCtx,
     AutoGetDb autoDb(opCtx, dbName, MODE_X);
     Database* const db = autoDb.getDb();
     Collection* coll = db ? db->getCollection(opCtx, nss) : nullptr;
+
+    MONGO_FAIL_POINT_PAUSE_WHILE_SET(hangAfterDatabaseLock);
 
     // May also modify a view instead of a collection.
     boost::optional<ViewDefinition> view;
@@ -422,14 +370,6 @@ Status _collModInternal(OperationContext* opCtx,
         invariant(coll->setValidationAction(opCtx, cmr.collValidationAction));
     if (!cmr.collValidationLevel.empty())
         invariant(coll->setValidationLevel(opCtx, cmr.collValidationLevel));
-
-    // UsePowerof2Sizes
-    if (!cmr.usePowerOf2Sizes.eoo())
-        setCollectionOptionFlag(opCtx, coll, cmr.usePowerOf2Sizes, result);
-
-    // NoPadding
-    if (!cmr.noPadding.eoo())
-        setCollectionOptionFlag(opCtx, coll, cmr.noPadding, result);
 
     // Upgrade unique indexes
     if (upgradeUniqueIndexes) {
@@ -585,10 +525,9 @@ void _updateUniqueIndexesForDatabase(OperationContext* opCtx, const std::string&
 void updateUniqueIndexesOnUpgrade(OperationContext* opCtx) {
     // Update all unique indexes except the _id index.
     std::vector<std::string> dbNames;
-    StorageEngine* storageEngine = opCtx->getServiceContext()->getStorageEngine();
     {
         Lock::GlobalLock lk(opCtx, MODE_IS);
-        storageEngine->listDatabases(&dbNames);
+        dbNames = CollectionCatalog::get(opCtx).getAllDbNames();
     }
 
     for (auto it = dbNames.begin(); it != dbNames.end(); ++it) {
@@ -620,10 +559,9 @@ Status updateNonReplicatedUniqueIndexes(OperationContext* opCtx) {
     // Update all unique indexes belonging to all non-replicated collections.
     // (_id indexes are not updated).
     std::vector<std::string> dbNames;
-    StorageEngine* storageEngine = opCtx->getServiceContext()->getStorageEngine();
     {
         Lock::GlobalLock lk(opCtx, MODE_IS);
-        storageEngine->listDatabases(&dbNames);
+        dbNames = CollectionCatalog::get(opCtx).getAllDbNames();
     }
     for (auto it = dbNames.begin(); it != dbNames.end(); ++it) {
         auto dbName = *it;

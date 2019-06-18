@@ -54,7 +54,6 @@
 #include "mongo/util/debug_util.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/cidr.h"
 #include "mongo/util/net/dh_openssl.h"
 #include "mongo/util/net/private/ssl_expiration.h"
@@ -62,6 +61,7 @@
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/net/ssl_types.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
 #include "mongo/util/text.h"
 
 #ifndef _WIN32
@@ -1601,17 +1601,24 @@ StatusWith<boost::optional<SSLPeerInfo>> SSLManagerOpenSSL::parseAndValidatePeer
             }
         }
         sk_GENERAL_NAME_pop_free(sanNames, GENERAL_NAME_free);
-    } else {
-        // If Subject Alternate Name (SAN) doesn't exist and Common Name (CN) does,
-        // check Common Name.
+    }
+
+    if (!sanMatch) {
+        // If SAN doesn't match, check to see if CN does.
+        // If it does and no SAN was provided, that's a match.
+        // Anything else is a varying degree of failure.
         auto swCN = peerSubject.getOID(kOID_CommonName);
         if (swCN.isOK()) {
             auto commonName = std::move(swCN.getValue());
-            if (hostNameMatchForX509Certificates(remoteHost, commonName)) {
-                cnMatch = true;
-            }
             certificateNames << "CN: " << commonName;
-        } else {
+            if (hostNameMatchForX509Certificates(remoteHost, commonName)) {
+                if (sanNames) {
+                    certificateNames << " would have matched, but was overridden by SAN";
+                } else {
+                    cnMatch = true;
+                }
+            }
+        } else if (!sanNames) {
             certificateNames << "No Common Name (CN) or Subject Alternate Names (SAN) found";
         }
     }

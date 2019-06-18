@@ -291,6 +291,11 @@ public:
             // collection via AutoGetCollectionForRead in order to ensure the comparison to the
             // collection's minimum visible snapshot is accurate.
             if (auto targetClusterTime = qr->getReadAtClusterTime()) {
+                uassert(ErrorCodes::InvalidOptions,
+                        str::stream() << "$_internalReadAtClusterTime value must not be a null"
+                                         " timestamp.",
+                        !targetClusterTime->isNull());
+
                 // We aren't holding the global lock in intent mode, so it is possible after
                 // comparing 'targetClusterTime' to 'lastAppliedOpTime' for the last applied opTime
                 // to go backwards or for the term to change due to replication rollback. This isn't
@@ -329,6 +334,10 @@ public:
                 // clusterTime, even across yields.
                 opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kProvided,
                                                               targetClusterTime);
+
+                // The $_internalReadAtClusterTime option also causes any storage-layer cursors
+                // created during plan execution to block on prepared transactions.
+                opCtx->recoveryUnit()->setIgnorePrepared(false);
             }
 
             // Acquire locks. If the query is on a view, we release our locks and convert the query

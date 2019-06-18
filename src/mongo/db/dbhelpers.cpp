@@ -54,8 +54,8 @@
 #include "mongo/db/write_concern.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -138,7 +138,7 @@ bool Helpers::findById(OperationContext* opCtx,
                        bool* indexFound) {
     invariant(database);
 
-    Collection* collection = database->getCollection(opCtx, ns);
+    Collection* collection = database->getCollection(opCtx, NamespaceString(ns));
     if (!collection) {
         return false;
     }
@@ -222,7 +222,7 @@ void Helpers::upsert(OperationContext* opCtx,
     UpdateRequest request(requestNs);
 
     request.setQuery(id);
-    request.setUpdates(o);
+    request.setUpdateModification(o);
     request.setUpsert();
     request.setFromMigration(fromMigrate);
 
@@ -235,7 +235,7 @@ void Helpers::putSingleton(OperationContext* opCtx, const char* ns, BSONObj obj)
     const NamespaceString requestNs(ns);
     UpdateRequest request(requestNs);
 
-    request.setUpdates(obj);
+    request.setUpdateModification(obj);
     request.setUpsert();
 
     update(opCtx, context.db(), request);

@@ -32,7 +32,7 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 //#include "mongo/base/init.h"
 #include "mongo/db/ratelimit_parameter_gen.h"
 #include "mongo/db/server_options.h"
-#include "mongo/util/mongoutils/str.h"  // for str::stream()!
+#include "mongo/util/str.h"  // for str::stream()!
 
 namespace mongo {
 

@@ -36,6 +36,7 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/op_observer_registry.h"
+#include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/replication_consistency_markers_mock.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
@@ -106,17 +107,18 @@ OplogApplier::Options SyncTailTest::makeRecoveryOptions() {
 void SyncTailTest::setUp() {
     ServiceContextMongoDTest::setUp();
 
-    auto service = getServiceContext();
+    serviceContext = getServiceContext();
     _opCtx = cc().makeOperationContext();
 
-    ReplicationCoordinator::set(service, stdx::make_unique<ReplicationCoordinatorMock>(service));
+    ReplicationCoordinator::set(serviceContext,
+                                stdx::make_unique<ReplicationCoordinatorMock>(serviceContext));
     ASSERT_OK(ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_PRIMARY));
 
-    _storageInterface = stdx::make_unique<StorageInterfaceImpl>();
+    StorageInterface::set(serviceContext, stdx::make_unique<StorageInterfaceImpl>());
 
     DropPendingCollectionReaper::set(
-        service, stdx::make_unique<DropPendingCollectionReaper>(_storageInterface.get()));
-    repl::setOplogCollectionName(service);
+        serviceContext, stdx::make_unique<DropPendingCollectionReaper>(getStorageInterface()));
+    repl::setOplogCollectionName(serviceContext);
     repl::createOplog(_opCtx.get());
 
     _consistencyMarkers = stdx::make_unique<ReplicationConsistencyMarkersMock>();
@@ -124,7 +126,7 @@ void SyncTailTest::setUp() {
     // Set up an OpObserver to track the documents SyncTail inserts.
     auto opObserver = std::make_unique<SyncTailOpObserver>();
     _opObserver = opObserver.get();
-    auto opObserverRegistry = dynamic_cast<OpObserverRegistry*>(service->getOpObserver());
+    auto opObserverRegistry = dynamic_cast<OpObserverRegistry*>(serviceContext->getOpObserver());
     opObserverRegistry->addObserver(std::move(opObserver));
 
     // Initialize the featureCompatibilityVersion server parameter. This is necessary because this
@@ -135,12 +137,10 @@ void SyncTailTest::setUp() {
 }
 
 void SyncTailTest::tearDown() {
-    auto service = getServiceContext();
     _opCtx.reset();
-    _storageInterface = {};
     _consistencyMarkers = {};
-    DropPendingCollectionReaper::set(service, {});
-    StorageInterface::set(service, {});
+    DropPendingCollectionReaper::set(serviceContext, {});
+    StorageInterface::set(serviceContext, {});
     ServiceContextMongoDTest::tearDown();
 }
 
@@ -149,7 +149,7 @@ ReplicationConsistencyMarkers* SyncTailTest::getConsistencyMarkers() const {
 }
 
 StorageInterface* SyncTailTest::getStorageInterface() const {
-    return _storageInterface.get();
+    return StorageInterface::get(serviceContext);
 }
 
 void SyncTailTest::_testSyncApplyCrudOperation(ErrorCodes::Error expectedError,
@@ -249,6 +249,28 @@ Status SyncTailTest::runOpsInitialSync(std::vector<OplogEntry> ops) {
     return Status::OK();
 }
 
+Status SyncTailTest::runOpPtrsInitialSync(MultiApplier::OperationPtrs ops) {
+    auto options = makeInitialSyncOptions();
+    SyncTail syncTail(nullptr,
+                      getConsistencyMarkers(),
+                      getStorageInterface(),
+                      SyncTail::MultiSyncApplyFunc(),
+                      nullptr,
+                      options);
+    // Apply each operation in a batch of one because 'ops' may contain a mix of commands and CRUD
+    // operations provided by idempotency tests.
+    for (auto& op : ops) {
+        MultiApplier::OperationPtrs opsPtrs;
+        opsPtrs.push_back(op);
+        WorkerMultikeyPathInfo pathInfo;
+        auto status = multiSyncApply(_opCtx.get(), &opsPtrs, &syncTail, &pathInfo);
+        if (!status.isOK()) {
+            return status;
+        }
+    }
+    return Status::OK();
+}
+
 void checkTxnTable(OperationContext* opCtx,
                    const LogicalSessionId& lsid,
                    const TxnNumber& txnNum,
@@ -276,6 +298,34 @@ void checkTxnTable(OperationContext* opCtx,
     if (expectedState) {
         ASSERT(*expectedState == txnRecord.getState());
     }
+}
+
+CollectionReader::CollectionReader(OperationContext* opCtx, const NamespaceString& nss)
+    : _collToScan(opCtx, nss),
+      _exec(InternalPlanner::collectionScan(opCtx,
+                                            nss.ns(),
+                                            _collToScan.getCollection(),
+                                            PlanExecutor::NO_YIELD,
+                                            InternalPlanner::FORWARD)) {}
+
+StatusWith<BSONObj> CollectionReader::next() {
+    BSONObj obj;
+
+    auto state = _exec->getNext(&obj, nullptr);
+    if (state == PlanExecutor::IS_EOF) {
+        return {ErrorCodes::CollectionIsEmpty,
+                str::stream() << "no more documents in " << _collToScan.getNss()};
+    }
+
+    // PlanExecutors that do not yield should only return ADVANCED or EOF.
+    invariant(state == PlanExecutor::ADVANCED);
+    return obj;
+}
+
+bool docExists(OperationContext* opCtx, const NamespaceString& nss, const BSONObj& doc) {
+    DBDirectClient client(opCtx);
+    auto result = client.findOne(nss.ns(), {doc});
+    return !result.isEmpty();
 }
 
 }  // namespace repl

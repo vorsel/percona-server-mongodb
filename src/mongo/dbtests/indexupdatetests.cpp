@@ -49,6 +49,7 @@ const auto kIndexVersion = IndexDescriptor::IndexVersion::kV2;
 }  // namespace
 
 static const char* const _ns = "unittests.indexupdate";
+static const NamespaceString _nss = NamespaceString(_ns);
 
 /**
  * Test fixture for a write locked test using collection _ns.  Includes functionality to
@@ -111,22 +112,20 @@ public:
         Collection* coll;
         {
             WriteUnitOfWork wunit(&_opCtx);
-            db->dropCollection(&_opCtx, _ns).transitional_ignore();
-            coll = db->createCollection(&_opCtx, _ns);
+            ASSERT_OK(db->dropCollection(&_opCtx, _nss));
+            coll = db->createCollection(&_opCtx, _nss);
 
             OpDebug* const nullOpDebug = nullptr;
-            coll->insertDocument(&_opCtx,
-                                 InsertStatement(BSON("_id" << 1 << "a"
-                                                            << "dup")),
-                                 nullOpDebug,
-                                 true)
-                .transitional_ignore();
-            coll->insertDocument(&_opCtx,
-                                 InsertStatement(BSON("_id" << 2 << "a"
-                                                            << "dup")),
-                                 nullOpDebug,
-                                 true)
-                .transitional_ignore();
+            ASSERT_OK(coll->insertDocument(&_opCtx,
+                                           InsertStatement(BSON("_id" << 1 << "a"
+                                                                      << "dup")),
+                                           nullOpDebug,
+                                           true));
+            ASSERT_OK(coll->insertDocument(&_opCtx,
+                                           InsertStatement(BSON("_id" << 2 << "a"
+                                                                      << "dup")),
+                                           nullOpDebug,
+                                           true));
             wunit.commit();
         }
 
@@ -168,8 +167,8 @@ public:
         Collection* coll;
         {
             WriteUnitOfWork wunit(&_opCtx);
-            db->dropCollection(&_opCtx, _ns).transitional_ignore();
-            coll = db->createCollection(&_opCtx, _ns);
+            ASSERT_OK(db->dropCollection(&_opCtx, _nss));
+            coll = db->createCollection(&_opCtx, _nss);
 
             OpDebug* const nullOpDebug = nullptr;
             ASSERT_OK(coll->insertDocument(&_opCtx,
@@ -225,16 +224,16 @@ public:
         Collection* coll;
         {
             WriteUnitOfWork wunit(&_opCtx);
-            db->dropCollection(&_opCtx, _ns).transitional_ignore();
-            coll = db->createCollection(&_opCtx, _ns);
+            ASSERT_OK(db->dropCollection(&_opCtx, _nss));
+            coll = db->createCollection(&_opCtx, _nss);
             // Drop all indexes including id index.
             coll->getIndexCatalog()->dropAllIndexes(&_opCtx, true);
             // Insert some documents.
             int32_t nDocs = 1000;
             OpDebug* const nullOpDebug = nullptr;
             for (int32_t i = 0; i < nDocs; ++i) {
-                coll->insertDocument(&_opCtx, InsertStatement(BSON("a" << i)), nullOpDebug)
-                    .transitional_ignore();
+                ASSERT_OK(
+                    coll->insertDocument(&_opCtx, InsertStatement(BSON("a" << i)), nullOpDebug));
             }
             wunit.commit();
         }
@@ -267,18 +266,18 @@ public:
         Collection* coll;
         {
             WriteUnitOfWork wunit(&_opCtx);
-            db->dropCollection(&_opCtx, _ns).transitional_ignore();
+            ASSERT_OK(db->dropCollection(&_opCtx, _nss));
             CollectionOptions options;
             options.capped = true;
             options.cappedSize = 10 * 1024;
-            coll = db->createCollection(&_opCtx, _ns, options);
+            coll = db->createCollection(&_opCtx, _nss, options);
             coll->getIndexCatalog()->dropAllIndexes(&_opCtx, true);
             // Insert some documents.
             int32_t nDocs = 1000;
             OpDebug* const nullOpDebug = nullptr;
             for (int32_t i = 0; i < nDocs; ++i) {
-                coll->insertDocument(&_opCtx, InsertStatement(BSON("_id" << i)), nullOpDebug, true)
-                    .transitional_ignore();
+                ASSERT_OK(coll->insertDocument(
+                    &_opCtx, InsertStatement(BSON("_id" << i)), nullOpDebug, true));
             }
             wunit.commit();
         }

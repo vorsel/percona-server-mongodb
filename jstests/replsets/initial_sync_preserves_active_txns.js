@@ -14,63 +14,85 @@
     "use strict";
     load("jstests/core/txns/libs/prepare_helpers.js");
 
-    const replSet = new ReplSetTest({
-        // Oplog can be truncated each "sync" cycle. Increase its frequency to once per second.
-        nodeOptions: {syncdelay: 1, setParameter: {logComponentVerbosity: tojson({storage: 1})}},
-        nodes: 1
-    });
+    // A new replica set for both the commit and abort tests to ensure the same clean state.
+    function doTest(commitOrAbort) {
+        const replSet = new ReplSetTest({
+            oplogSize: PrepareHelpers.oplogSizeMB,
+            // Oplog can be truncated each "sync" cycle. Increase its frequency to once per second.
+            nodeOptions:
+                {syncdelay: 1, setParameter: {logComponentVerbosity: tojson({storage: 1})}},
+            nodes: 1
+        });
 
-    replSet.startSet(PrepareHelpers.replSetStartSetOptions);
-    replSet.initiate();
-    const primary = replSet.getPrimary();
-    const primaryOplog = primary.getDB("local").oplog.rs;
-    assert.lte(primaryOplog.dataSize(), PrepareHelpers.oplogSizeBytes);
+        replSet.startSet(PrepareHelpers.replSetStartSetOptions);
+        replSet.initiate();
+        const primary = replSet.getPrimary();
+        const primaryOplog = primary.getDB("local").oplog.rs;
+        assert.lte(primaryOplog.dataSize(), PrepareHelpers.oplogSizeBytes);
 
-    const coll = primary.getDB("test").test;
-    assert.commandWorked(coll.insert({}, {writeConcern: {w: "majority"}}));
+        const coll = primary.getDB("test").test;
+        assert.commandWorked(coll.insert({}, {writeConcern: {w: "majority"}}));
 
-    jsTestLog("Prepare a transaction");
+        jsTestLog("Prepare a transaction");
 
-    const session = primary.startSession();
-    session.startTransaction();
-    assert.commandWorked(session.getDatabase("test").test.insert({myTransaction: 1}));
-    const prepareTimestamp = PrepareHelpers.prepareTransaction(session);
-    const txnEntry = primary.getDB("config").transactions.findOne();
-    assert.eq(txnEntry.startOpTime.ts, prepareTimestamp, tojson(txnEntry));
+        const session = primary.startSession();
+        session.startTransaction();
+        assert.commandWorked(session.getDatabase("test").test.insert({myTransaction: 1}));
+        const prepareTimestamp = PrepareHelpers.prepareTransaction(session);
+        const txnEntry = primary.getDB("config").transactions.findOne();
 
-    jsTestLog("Insert documents until oplog exceeds oplogSize");
+        // Make sure that the timestamp of the first oplog entry for this transaction matches the
+        // start timestamp in the transactions table.
+        let oplog = primary.getDB("local").getCollection("oplog.rs");
+        const txnNum = session.getTxnNumber_forTesting();
+        const op = oplog.findOne({"txnNumber": txnNum, "lsid.id": session.getSessionId().id});
+        assert.neq(op, null);
+        const firstTxnOpTs = op.ts;
+        assert.eq(txnEntry.startOpTime.ts, firstTxnOpTs, tojson(txnEntry));
 
-    // Oplog with prepared txn grows indefinitely - let it reach twice its supposed max size.
-    PrepareHelpers.growOplogPastMaxSize(replSet);
+        jsTestLog("Insert documents until oplog exceeds oplogSize");
 
-    jsTestLog("Find prepare oplog entry");
+        // Oplog with prepared txn grows indefinitely - let it reach twice its supposed max size.
+        PrepareHelpers.growOplogPastMaxSize(replSet);
 
-    const oplogEntry = primaryOplog.findOne({prepare: true});
-    assert.eq(oplogEntry.ts, prepareTimestamp, tojson(oplogEntry));
+        jsTestLog("Make sure the transaction's first entry is still in the oplog");
 
-    jsTestLog("Add a secondary node");
+        assert.eq(primaryOplog.find({ts: firstTxnOpTs}).itcount(), 1);
 
-    const secondary = replSet.add({rsConfig: {votes: 0, priority: 0}});
-    replSet.reInitiate();
+        jsTestLog("Add a secondary node");
 
-    jsTestLog("Reinitiated, awaiting secondary node");
+        const secondary = replSet.add({rsConfig: {votes: 0, priority: 0}});
+        replSet.reInitiate();
 
-    replSet.awaitSecondaryNodes();
+        jsTestLog("Reinitiated, awaiting secondary node");
 
-    jsTestLog("Checking secondary oplog and config.transactions");
+        replSet.awaitSecondaryNodes();
 
-    // Oplog grew past maxSize, and it includes the oldest active transaction's entry.
-    const secondaryOplog = secondary.getDB("local").oplog.rs;
-    assert.gt(secondaryOplog.dataSize(), PrepareHelpers.oplogSizeBytes);
-    const secondaryOplogEntry = secondaryOplog.findOne({prepare: true});
-    assert.eq(secondaryOplogEntry.ts, prepareTimestamp, tojson(secondaryOplogEntry));
+        jsTestLog("Checking secondary oplog and config.transactions");
 
-    const secondaryTxnEntry = secondary.getDB("config").transactions.findOne();
-    assert.eq(secondaryTxnEntry, txnEntry, tojson(secondaryTxnEntry));
+        // Oplog grew past maxSize, and it includes the oldest active transaction's entry.
+        const secondaryOplog = secondary.getDB("local").oplog.rs;
+        assert.gt(secondaryOplog.dataSize(), PrepareHelpers.oplogSizeBytes);
+        assert.eq(secondaryOplog.find({ts: firstTxnOpTs}).itcount(), 1);
 
-    // TODO(SERVER-36492): commit or abort, await oplog truncation
-    // See recovery_preserves_active_txns.js for example.
-    // Until then, skip validation, the stashed transaction's lock prevents validation.
-    TestData.skipCheckDBHashes = true;
-    replSet.stopSet(undefined, undefined, {skipValidation: true});
+        const secondaryTxnEntry = secondary.getDB("config").transactions.findOne();
+        assert.eq(secondaryTxnEntry, txnEntry, tojson(secondaryTxnEntry));
+
+        if (commitOrAbort === "commit") {
+            jsTestLog("Commit prepared transaction and wait for oplog to shrink to max oplogSize");
+            assert.commandWorked(PrepareHelpers.commitTransaction(session, prepareTimestamp));
+        } else if (commitOrAbort === "abort") {
+            jsTestLog("Abort prepared transaction and wait for oplog to shrink to max oplogSize");
+            assert.commandWorked(session.abortTransaction_forTesting());
+        } else {
+            throw new Error(`Unrecognized value for commitOrAbort: ${commitOrAbort}`);
+        }
+
+        replSet.awaitReplication();
+
+        PrepareHelpers.awaitOplogTruncation(replSet);
+        replSet.stopSet();
+    }
+    doTest("commit");
+    doTest("abort");
 })();

@@ -44,14 +44,14 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 #include "mongo/db/auth/sasl_command_constants.h"
 #include "mongo/db/auth/sasl_mechanism_registry.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 #include "mongo/util/net/socket_utils.h"
 
 namespace mongo {
 
 static Status getInitializationError(int result) {
     return Status(ErrorCodes::OperationFailed,
-                  mongoutils::str::stream() <<
+                  str::stream() <<
                   "Could not initialize sasl server session (" <<
                   sasl_errstring(result, NULL, NULL) <<
                   ")");
@@ -63,7 +63,7 @@ StatusWith<std::tuple<bool, std::string>> SaslExternalLDAPServerMechanism::getSt
     }
 
     return Status(ErrorCodes::OperationFailed,
-                  mongoutils::str::stream() <<
+                  str::stream() <<
                   "SASL step did not complete: (" <<
                   sasl_errstring(_results.result, NULL, NULL) <<
                   ")");

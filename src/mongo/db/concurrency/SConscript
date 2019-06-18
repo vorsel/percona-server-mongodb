@@ -40,7 +40,6 @@ env.Library(
     target='lock_manager',
     source=[
         'd_concurrency.cpp',
-        'global_lock_acquisition_tracker.cpp',
         'lock_manager.cpp',
         'lock_state.cpp',
         'lock_stats.cpp',
@@ -48,14 +47,14 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/util/background_job',
         '$BUILD_DIR/mongo/db/service_context',
+        '$BUILD_DIR/mongo/util/background_job',
         '$BUILD_DIR/mongo/util/concurrency/spin_lock',
         '$BUILD_DIR/mongo/util/concurrency/ticketholder',
         '$BUILD_DIR/third_party/shim_boost',
     ],
     LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/db/catalog/uuid_catalog',
+        '$BUILD_DIR/mongo/db/catalog/collection_catalog',
         '$BUILD_DIR/mongo/db/concurrency/flow_control_ticketholder',
     ],
 )

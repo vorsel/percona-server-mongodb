@@ -37,7 +37,7 @@
 #include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -70,6 +70,8 @@ struct CoreIndexInfo {
         // We always expect a projection executor for $** indexes, and none otherwise.
         invariant((type == IndexType::INDEX_WILDCARD) == (projExec != nullptr));
     }
+
+    virtual ~CoreIndexInfo() = default;
 
     /**
      * This struct is used to uniquely identify an index. The index "Identifier" has two
@@ -163,6 +165,12 @@ struct IndexEntry : CoreIndexInfo {
         // The caller must not supply multikey metadata in two different formats.
         invariant(multikeyPaths.empty() || multikeyPathSet.empty());
     }
+
+    IndexEntry(const IndexEntry&) = default;
+    IndexEntry(IndexEntry&&) = default;
+
+    IndexEntry& operator=(const IndexEntry&) = default;
+    IndexEntry& operator=(IndexEntry&&) = default;
 
     ~IndexEntry() {
         // An IndexEntry should never have both formats of multikey metadata simultaneously.

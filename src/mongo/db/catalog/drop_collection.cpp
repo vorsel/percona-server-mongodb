@@ -49,15 +49,13 @@
 
 namespace mongo {
 
+MONGO_FAIL_POINT_DEFINE(hangDropCollectionBeforeLockAcquisition);
 MONGO_FAIL_POINT_DEFINE(hangDuringDropCollection);
 
 Status _dropView(OperationContext* opCtx,
                  std::unique_ptr<AutoGetDb>& autoDb,
                  const NamespaceString& collectionName,
                  BSONObjBuilder& result) {
-    // TODO(SERVER-39520): No need to relock once createCollection doesn't need X lock.
-    autoDb.reset();
-    autoDb = std::make_unique<AutoGetDb>(opCtx, collectionName.db(), MODE_IX);
     Database* db = autoDb->getDb();
     if (!db) {
         return Status(ErrorCodes::NamespaceNotFound, "ns not found");
@@ -66,8 +64,8 @@ Status _dropView(OperationContext* opCtx,
     if (!view) {
         return Status(ErrorCodes::NamespaceNotFound, "ns not found");
     }
-    Lock::CollectionLock systemViewsLock(opCtx->lockState(), db->getSystemViewsName(), MODE_X);
-    Lock::CollectionLock collLock(opCtx->lockState(), collectionName.ns(), MODE_IX);
+    Lock::CollectionLock systemViewsLock(opCtx, db->getSystemViewsName(), MODE_X);
+    Lock::CollectionLock collLock(opCtx, collectionName, MODE_IX);
 
     if (MONGO_FAIL_POINT(hangDuringDropCollection)) {
         log() << "hangDuringDropCollection fail point enabled. Blocking until fail point is "
@@ -100,11 +98,16 @@ Status _dropView(OperationContext* opCtx,
 
 Status _dropCollection(OperationContext* opCtx,
                        Database* db,
-                       Collection* coll,
                        const NamespaceString& collectionName,
                        const repl::OpTime& dropOpTime,
                        DropCollectionSystemCollectionMode systemCollectionMode,
                        BSONObjBuilder& result) {
+    Lock::CollectionLock collLock(opCtx, collectionName, MODE_X);
+    Collection* coll = db->getCollection(opCtx, collectionName);
+    if (!coll) {
+        return Status(ErrorCodes::NamespaceNotFound, "ns not found");
+    }
+
     if (MONGO_FAIL_POINT(hangDuringDropCollection)) {
         log() << "hangDuringDropCollection fail point enabled. Blocking until fail point is "
                  "disabled.";
@@ -130,7 +133,7 @@ Status _dropCollection(OperationContext* opCtx,
     IndexBuildsCoordinator::get(opCtx)->assertNoIndexBuildInProgForCollection(coll->uuid().get());
     Status status =
         systemCollectionMode == DropCollectionSystemCollectionMode::kDisallowSystemCollectionDrops
-        ? db->dropCollection(opCtx, collectionName.ns(), dropOpTime)
+        ? db->dropCollection(opCtx, collectionName, dropOpTime)
         : db->dropCollectionEvenIfSystem(opCtx, collectionName, dropOpTime);
 
     if (!status.isOK()) {
@@ -153,9 +156,13 @@ Status dropCollection(OperationContext* opCtx,
         log() << "CMD: drop " << collectionName;
     }
 
+    if (MONGO_FAIL_POINT(hangDropCollectionBeforeLockAcquisition)) {
+        log() << "Hanging drop collection before lock acquisition while fail point is set";
+        MONGO_FAIL_POINT_PAUSE_WHILE_SET(hangDropCollectionBeforeLockAcquisition);
+    }
     return writeConflictRetry(opCtx, "drop", collectionName.ns(), [&] {
         // TODO(SERVER-39520): Get rid of database MODE_X lock.
-        auto autoDb = std::make_unique<AutoGetDb>(opCtx, collectionName.db(), MODE_X);
+        auto autoDb = std::make_unique<AutoGetDb>(opCtx, collectionName.db(), MODE_IX);
 
         Database* db = autoDb->getDb();
         if (!db) {
@@ -167,7 +174,7 @@ Status dropCollection(OperationContext* opCtx,
             return _dropView(opCtx, autoDb, collectionName, result);
         } else {
             return _dropCollection(
-                opCtx, db, coll, collectionName, dropOpTime, systemCollectionMode, result);
+                opCtx, db, collectionName, dropOpTime, systemCollectionMode, result);
         }
     });
 }

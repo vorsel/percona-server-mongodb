@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """Hang Analyzer module.
 
 A prototype hang analyzer for Evergreen integration to help investigate test timeouts
@@ -60,7 +60,7 @@ def callo(args, logger):
     """Call subprocess on args string."""
     logger.info("%s", str(args))
 
-    return subprocess.check_output(args).decode('utf-8')
+    return subprocess.check_output(args).decode('utf-8', 'replace')
 
 
 def find_program(prog, paths):

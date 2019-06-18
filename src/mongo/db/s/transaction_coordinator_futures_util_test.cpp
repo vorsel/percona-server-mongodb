@@ -322,6 +322,35 @@ protected:
         return std::vector<ShardId>{{"s1"}, {"s2"}, {"s3"}};
     }
     const std::vector<ShardId> kShardIds = makeThreeShardIdsList();
+
+    void scheduleAWSRemoteCommandWithResponse(ShardId shardToTarget,
+                                              StatusWith<BSONObj> swCmdResponse) {
+        AsyncWorkScheduler async(getServiceContext());
+        auto future =
+            async.scheduleRemoteCommand(shardToTarget,
+                                        ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                                        BSON("TestCommand" << 2));
+        ASSERT(!future.isReady());
+
+        onCommand([&](const executor::RemoteCommandRequest& request) {
+            ASSERT_BSONOBJ_EQ(BSON("TestCommand" << 2), request.cmdObj);
+            return swCmdResponse;
+        });
+
+        const auto& response = future.getNoThrow();
+        if (swCmdResponse.isOK()) {
+            ASSERT(response.isOK());
+            ASSERT_BSONOBJ_EQ(swCmdResponse.getValue(), response.getValue().data);
+        } else {
+            ASSERT_FALSE(response.isOK());
+            ASSERT_EQ(response.getStatus(), swCmdResponse.getStatus());
+        }
+    };
+
+    std::shared_ptr<RemoteCommandTargeterMock> getShardTargeterMock(ShardId shardId) {
+        return RemoteCommandTargeterMock::get(
+            uassertStatusOK(shardRegistry()->getShard(operationContext(), shardId))->getTargeter());
+    }
 };
 
 TEST_F(AsyncWorkSchedulerTest, ScheduledBlockingWorkSucceeds) {
@@ -608,16 +637,93 @@ TEST_F(AsyncWorkSchedulerTest, ShutdownAllowedFromScheduleWorkAtCallback) {
 
 TEST_F(AsyncWorkSchedulerTest, DestroyingSchedulerCapturedInFutureCallback) {
     auto async = std::make_unique<AsyncWorkScheduler>(getServiceContext());
+    auto future = async->scheduleWork([](OperationContext* opCtx) {})
+                      .tapAll([async = std::move(async)](Status) mutable { async.reset(); });
 
-    Barrier barrier(2);
-    auto future =
-        async->scheduleWork([&barrier](OperationContext* opCtx) { barrier.countDownAndWait(); })
-            .tapAll([ async = std::move(async), &barrier ](Status){});
-
-    barrier.countDownAndWait();
     future.get();
 }
 
+TEST_F(AsyncWorkSchedulerTest, NotifiesRemoteCommandTargeter_CmdResponseNotMasterError) {
+    ASSERT_EQ(0UL, getShardTargeterMock(kShardIds[1])->getAndClearMarkedDownHosts().size());
+
+    scheduleAWSRemoteCommandWithResponse(kShardIds[1],
+                                         BSON("ok" << 0 << "code" << ErrorCodes::NotMaster
+                                                   << "errmsg"
+                                                   << "dummy"));
+
+    ASSERT_EQ(1UL, getShardTargeterMock(kShardIds[1])->getAndClearMarkedDownHosts().size());
+}
+
+TEST_F(AsyncWorkSchedulerTest, NotifiesRemoteCommandTargeter_CmdResponseNetworkError) {
+    ASSERT_EQ(0UL, getShardTargeterMock(kShardIds[1])->getAndClearMarkedDownHosts().size());
+
+    scheduleAWSRemoteCommandWithResponse(kShardIds[1],
+                                         BSON("ok" << 0 << "code" << ErrorCodes::SocketException
+                                                   << "errmsg"
+                                                   << "dummy"));
+
+    ASSERT_EQ(1UL, getShardTargeterMock(kShardIds[1])->getAndClearMarkedDownHosts().size());
+}
+
+TEST_F(AsyncWorkSchedulerTest, DoesNotNotifyRemoteCommandTargeter_CmdResponseSuccess) {
+    ASSERT_EQ(0UL, getShardTargeterMock(kShardIds[1])->getAndClearMarkedDownHosts().size());
+
+    scheduleAWSRemoteCommandWithResponse(kShardIds[1], BSON("ok" << 1));
+
+    ASSERT_EQ(0UL, getShardTargeterMock(kShardIds[1])->getAndClearMarkedDownHosts().size());
+}
+
+TEST_F(AsyncWorkSchedulerTest, DoesNotNotifyRemoteCommandTargeter_CmdResponseOtherError) {
+    ASSERT_EQ(0UL, getShardTargeterMock(kShardIds[1])->getAndClearMarkedDownHosts().size());
+
+    scheduleAWSRemoteCommandWithResponse(kShardIds[1],
+                                         BSON("ok" << 0 << "code" << ErrorCodes::InternalError
+                                                   << "errmsg"
+                                                   << "dummy"));
+
+    ASSERT_EQ(0UL, getShardTargeterMock(kShardIds[1])->getAndClearMarkedDownHosts().size());
+}
+
+TEST_F(AsyncWorkSchedulerTest, NotifiesRemoteCommandTargeter_WCNotMasterError) {
+    ASSERT_EQ(0UL, getShardTargeterMock(kShardIds[1])->getAndClearMarkedDownHosts().size());
+
+    scheduleAWSRemoteCommandWithResponse(
+        kShardIds[1],
+        BSON("ok" << 1 << "writeConcernError"
+                  << BSON("code" << ErrorCodes::PrimarySteppedDown << "errmsg"
+                                 << "dummy")));
+
+    ASSERT_EQ(1UL, getShardTargeterMock(kShardIds[1])->getAndClearMarkedDownHosts().size());
+}
+
+TEST_F(AsyncWorkSchedulerTest, DoesNotNotifyRemoteCommandTargeter_WCOtherError) {
+    ASSERT_EQ(0UL, getShardTargeterMock(kShardIds[1])->getAndClearMarkedDownHosts().size());
+
+    scheduleAWSRemoteCommandWithResponse(
+        kShardIds[1],
+        BSON("ok" << 1 << "writeConcernError"
+                  << BSON("code" << ErrorCodes::InternalError << "errmsg"
+                                 << "dummy")));
+
+    ASSERT_EQ(0UL, getShardTargeterMock(kShardIds[1])->getAndClearMarkedDownHosts().size());
+}
+
+TEST_F(AsyncWorkSchedulerTest, NotifiesRemoteCommandTargeter_RemoteResponseNetworkError) {
+    ASSERT_EQ(0UL, getShardTargeterMock(kShardIds[1])->getAndClearMarkedDownHosts().size());
+
+    scheduleAWSRemoteCommandWithResponse(kShardIds[1],
+                                         Status(ErrorCodes::HostUnreachable, "dummy"));
+
+    ASSERT_EQ(1UL, getShardTargeterMock(kShardIds[1])->getAndClearMarkedDownHosts().size());
+}
+
+TEST_F(AsyncWorkSchedulerTest, NotifiesRemoteCommandTargeter_RemoteResponseOtherError) {
+    ASSERT_EQ(0UL, getShardTargeterMock(kShardIds[1])->getAndClearMarkedDownHosts().size());
+
+    scheduleAWSRemoteCommandWithResponse(kShardIds[1], Status(ErrorCodes::InternalError, "dummy"));
+
+    ASSERT_EQ(0UL, getShardTargeterMock(kShardIds[1])->getAndClearMarkedDownHosts().size());
+}
 
 using DoWhileTest = AsyncWorkSchedulerTest;
 

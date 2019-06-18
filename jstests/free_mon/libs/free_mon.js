@@ -23,17 +23,12 @@ class FreeMonWebServer {
     * @param {bool} disableFaultsOnStartup optionally disable fault on startup
     */
     constructor(fault_type, disableFaultsOnStartup) {
-        this.python = "/opt/mongodbtoolchain/v3/bin/python3";
+        this.python = "python3";
         this.disableFaultsOnStartup = disableFaultsOnStartup || false;
         this.fault_type = fault_type;
 
         if (_isWindows()) {
-            const paths = ["c:\\python36\\python.exe", "c:\\python\\python36\\python.exe"];
-            for (let p of paths) {
-                if (fileExists(p)) {
-                    this.python = p;
-                }
-            }
+            this.python = "python.exe";
         }
 
         print("Using python interpreter: " + this.python);

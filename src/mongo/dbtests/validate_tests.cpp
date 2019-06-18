@@ -86,7 +86,7 @@ protected:
         lockDb(MODE_IX);
         invariant(_opCtx.lockState()->isDbLockedForMode(_nss.db(), MODE_IX));
         std::unique_ptr<Lock::CollectionLock> lock =
-            stdx::make_unique<Lock::CollectionLock>(_opCtx.lockState(), _nss.ns(), MODE_X);
+            stdx::make_unique<Lock::CollectionLock>(&_opCtx, _nss, MODE_X);
         invariant(_opCtx.lockState()->isCollectionLockedForMode(_nss, MODE_X));
 
         Database* db = _autoDb.get()->getDb();
@@ -94,7 +94,6 @@ protected:
                       ->validate(&_opCtx,
                                  _full ? kValidateFull : kValidateIndex,
                                  _background,
-                                 std::move(lock),
                                  &results,
                                  &output));
 
@@ -158,8 +157,8 @@ public:
         {
             OpDebug* const nullOpDebug = nullptr;
             WriteUnitOfWork wunit(&_opCtx);
-            ASSERT_OK(_db->dropCollection(&_opCtx, _ns));
-            coll = _db->createCollection(&_opCtx, _ns);
+            ASSERT_OK(_db->dropCollection(&_opCtx, _nss));
+            coll = _db->createCollection(&_opCtx, _nss);
 
             ASSERT_OK(coll->insertDocument(
                 &_opCtx, InsertStatement(BSON("_id" << 1)), nullOpDebug, true));
@@ -219,8 +218,8 @@ public:
         {
             OpDebug* const nullOpDebug = nullptr;
             WriteUnitOfWork wunit(&_opCtx);
-            ASSERT_OK(_db->dropCollection(&_opCtx, _ns));
-            coll = _db->createCollection(&_opCtx, _ns);
+            ASSERT_OK(_db->dropCollection(&_opCtx, _nss));
+            coll = _db->createCollection(&_opCtx, _nss);
             ASSERT_OK(coll->insertDocument(
                 &_opCtx, InsertStatement(BSON("_id" << 1 << "a" << 1)), nullOpDebug, true));
             id1 = coll->getCursor(&_opCtx)->next()->id;
@@ -293,8 +292,8 @@ public:
         RecordId id1;
         {
             WriteUnitOfWork wunit(&_opCtx);
-            ASSERT_OK(_db->dropCollection(&_opCtx, _ns));
-            coll = _db->createCollection(&_opCtx, _ns);
+            ASSERT_OK(_db->dropCollection(&_opCtx, _nss));
+            coll = _db->createCollection(&_opCtx, _nss);
             ASSERT_OK(coll->insertDocument(
                 &_opCtx, InsertStatement(BSON("_id" << 1 << "a" << 1)), nullOpDebug, true));
             id1 = coll->getCursor(&_opCtx)->next()->id;
@@ -359,8 +358,8 @@ public:
         RecordId id1;
         {
             WriteUnitOfWork wunit(&_opCtx);
-            ASSERT_OK(_db->dropCollection(&_opCtx, _ns));
-            coll = _db->createCollection(&_opCtx, _ns);
+            ASSERT_OK(_db->dropCollection(&_opCtx, _nss));
+            coll = _db->createCollection(&_opCtx, _nss);
 
             ASSERT_OK(coll->insertDocument(
                 &_opCtx, InsertStatement(BSON("_id" << 1)), nullOpDebug, true));
@@ -447,8 +446,8 @@ public:
         auto doc3 = BSON("_id" << 3 << "a" << BSON_ARRAY(BSON("c" << 1)));
         {
             WriteUnitOfWork wunit(&_opCtx);
-            ASSERT_OK(_db->dropCollection(&_opCtx, _ns));
-            coll = _db->createCollection(&_opCtx, _ns);
+            ASSERT_OK(_db->dropCollection(&_opCtx, _nss));
+            coll = _db->createCollection(&_opCtx, _nss);
 
 
             ASSERT_OK(coll->insertDocument(&_opCtx, InsertStatement(doc1), nullOpDebug, true));
@@ -527,8 +526,8 @@ public:
         RecordId id1;
         {
             WriteUnitOfWork wunit(&_opCtx);
-            ASSERT_OK(_db->dropCollection(&_opCtx, _ns));
-            coll = _db->createCollection(&_opCtx, _ns);
+            ASSERT_OK(_db->dropCollection(&_opCtx, _nss));
+            coll = _db->createCollection(&_opCtx, _nss);
 
             ASSERT_OK(coll->insertDocument(
                 &_opCtx, InsertStatement(BSON("_id" << 1 << "a" << 1)), nullOpDebug, true));
@@ -595,8 +594,8 @@ public:
         RecordId id1;
         {
             WriteUnitOfWork wunit(&_opCtx);
-            ASSERT_OK(_db->dropCollection(&_opCtx, _ns));
-            coll = _db->createCollection(&_opCtx, _ns);
+            ASSERT_OK(_db->dropCollection(&_opCtx, _nss));
+            coll = _db->createCollection(&_opCtx, _nss);
 
             ASSERT_OK(coll->insertDocument(
                 &_opCtx, InsertStatement(BSON("_id" << 1 << "a" << 1)), nullOpDebug, true));
@@ -669,8 +668,8 @@ public:
         RecordId id1;
         {
             WriteUnitOfWork wunit(&_opCtx);
-            ASSERT_OK(_db->dropCollection(&_opCtx, _ns));
-            coll = _db->createCollection(&_opCtx, _ns);
+            ASSERT_OK(_db->dropCollection(&_opCtx, _nss));
+            coll = _db->createCollection(&_opCtx, _nss);
             ASSERT_OK(
                 coll->insertDocument(&_opCtx,
                                      InsertStatement(BSON("_id" << 1 << "x" << 1 << "a" << 2)),
@@ -679,8 +678,8 @@ public:
             wunit.commit();
         }
 
-        // Create a partial geo index that indexes the document. This should throw an error.
-        ASSERT_THROWS(dbtests::createIndexFromSpec(&_opCtx,
+        // Create a partial geo index that indexes the document. This should return an error.
+        ASSERT_NOT_OK(dbtests::createIndexFromSpec(&_opCtx,
                                                    coll->ns().ns(),
                                                    BSON("name"
                                                         << "partial_index"
@@ -694,8 +693,7 @@ public:
                                                         << "background"
                                                         << false
                                                         << "partialFilterExpression"
-                                                        << BSON("a" << BSON("$eq" << 2)))),
-                      AssertionException);
+                                                        << BSON("a" << BSON("$eq" << 2)))));
 
         // Create a partial geo index that does not index the document.
         auto status = dbtests::createIndexFromSpec(&_opCtx,
@@ -738,8 +736,8 @@ public:
         RecordId id1;
         {
             WriteUnitOfWork wunit(&_opCtx);
-            ASSERT_OK(_db->dropCollection(&_opCtx, _ns));
-            coll = _db->createCollection(&_opCtx, _ns);
+            ASSERT_OK(_db->dropCollection(&_opCtx, _nss));
+            coll = _db->createCollection(&_opCtx, _nss);
 
             ASSERT_OK(
                 coll->insertDocument(&_opCtx,
@@ -829,8 +827,8 @@ public:
         RecordId id1;
         {
             WriteUnitOfWork wunit(&_opCtx);
-            ASSERT_OK(_db->dropCollection(&_opCtx, _ns));
-            coll = _db->createCollection(&_opCtx, _ns);
+            ASSERT_OK(_db->dropCollection(&_opCtx, _nss));
+            coll = _db->createCollection(&_opCtx, _nss);
 
             ASSERT_OK(coll->insertDocument(
                 &_opCtx, InsertStatement(BSON("_id" << 1 << "a" << 1)), nullOpDebug, true));
@@ -905,8 +903,8 @@ public:
         RecordId id1;
         {
             WriteUnitOfWork wunit(&_opCtx);
-            ASSERT_OK(_db->dropCollection(&_opCtx, _ns));
-            coll = _db->createCollection(&_opCtx, _ns);
+            ASSERT_OK(_db->dropCollection(&_opCtx, _nss));
+            coll = _db->createCollection(&_opCtx, _nss);
 
             ASSERT_OK(coll->insertDocument(
                 &_opCtx, InsertStatement(BSON("_id" << 1 << "a" << 1)), nullOpDebug, true));
@@ -960,8 +958,8 @@ public:
         Collection* coll;
         {
             WriteUnitOfWork wunit(&_opCtx);
-            ASSERT_OK(_db->dropCollection(&_opCtx, _ns));
-            coll = _db->createCollection(&_opCtx, _ns);
+            ASSERT_OK(_db->dropCollection(&_opCtx, _nss));
+            coll = _db->createCollection(&_opCtx, _nss);
             wunit.commit();
         }
 
@@ -1071,8 +1069,8 @@ public:
         Collection* coll;
         {
             WriteUnitOfWork wunit(&_opCtx);
-            ASSERT_OK(_db->dropCollection(&_opCtx, _ns));
-            coll = _db->createCollection(&_opCtx, _ns);
+            ASSERT_OK(_db->dropCollection(&_opCtx, _nss));
+            coll = _db->createCollection(&_opCtx, _nss);
             wunit.commit();
         }
 
@@ -1148,6 +1146,270 @@ public:
     }
 };
 
+template <bool full, bool background>
+class ValidateMissingAndExtraIndexEntryResults : public ValidateBase {
+public:
+    ValidateMissingAndExtraIndexEntryResults() : ValidateBase(full, background) {}
+
+    void run() {
+        // Can't perform background validation if the RecordStore is not in RecordId order.
+        if (_background && !_isInRecordIdOrder) {
+            return;
+        }
+
+        // Create a new collection.
+        lockDb(MODE_X);
+        Collection* coll;
+        {
+            WriteUnitOfWork wunit(&_opCtx);
+            ASSERT_OK(_db->dropCollection(&_opCtx, _nss));
+            coll = _db->createCollection(&_opCtx, _nss);
+            wunit.commit();
+        }
+
+        // Create an index.
+        const auto indexName = "a";
+        const auto indexKey = BSON("a" << 1);
+        auto status = dbtests::createIndexFromSpec(
+            &_opCtx,
+            coll->ns().ns(),
+            BSON("name" << indexName << "ns" << coll->ns().ns() << "key" << indexKey << "v"
+                        << static_cast<int>(kIndexVersion)
+                        << "background"
+                        << false));
+        ASSERT_OK(status);
+
+        // Insert documents.
+        OpDebug* const nullOpDebug = nullptr;
+        RecordId rid = RecordId::min();
+        lockDb(MODE_X);
+        {
+            WriteUnitOfWork wunit(&_opCtx);
+            ASSERT_OK(coll->insertDocument(
+                &_opCtx, InsertStatement(BSON("_id" << 1 << "a" << 1)), nullOpDebug, true));
+            ASSERT_OK(coll->insertDocument(
+                &_opCtx, InsertStatement(BSON("_id" << 2 << "a" << 2)), nullOpDebug, true));
+            ASSERT_OK(coll->insertDocument(
+                &_opCtx, InsertStatement(BSON("_id" << 3 << "a" << 3)), nullOpDebug, true));
+            rid = coll->getCursor(&_opCtx)->next()->id;
+            wunit.commit();
+        }
+        ASSERT_TRUE(checkValid());
+
+        RecordStore* rs = coll->getRecordStore();
+
+        // Updating a document without updating the index entry should cause us to have a missing
+        // index entry and an extra index entry.
+        {
+            WriteUnitOfWork wunit(&_opCtx);
+            auto doc = BSON("_id" << 1 << "a" << 5);
+            auto updateStatus = rs->updateRecord(&_opCtx, rid, doc.objdata(), doc.objsize());
+            ASSERT_OK(updateStatus);
+            wunit.commit();
+        }
+
+        {
+            ValidateResults results;
+            BSONObjBuilder output;
+
+            lockDb(MODE_IX);
+            std::unique_ptr<Lock::CollectionLock> lock =
+                stdx::make_unique<Lock::CollectionLock>(&_opCtx, _nss, MODE_X);
+
+            Database* db = _autoDb.get()->getDb();
+            ASSERT_OK(db->getCollection(&_opCtx, _nss)
+                          ->validate(&_opCtx, kValidateFull, _background, &results, &output));
+
+            ASSERT_EQ(false, results.valid);
+            ASSERT_EQ(static_cast<size_t>(1), results.errors.size());
+            ASSERT_EQ(static_cast<size_t>(2), results.warnings.size());
+            ASSERT_EQ(static_cast<size_t>(1), results.extraIndexEntries.size());
+            ASSERT_EQ(static_cast<size_t>(1), results.missingIndexEntries.size());
+        }
+
+        releaseDb();
+    }
+};
+
+template <bool full, bool background>
+class ValidateMissingIndexEntryResults : public ValidateBase {
+public:
+    ValidateMissingIndexEntryResults() : ValidateBase(full, background) {}
+
+    void run() {
+        // Can't perform background validation if the RecordStore is not in RecordId order.
+        if (_background && !_isInRecordIdOrder) {
+            return;
+        }
+
+        // Create a new collection.
+        lockDb(MODE_X);
+        Collection* coll;
+        {
+            WriteUnitOfWork wunit(&_opCtx);
+            ASSERT_OK(_db->dropCollection(&_opCtx, _nss));
+            coll = _db->createCollection(&_opCtx, _nss);
+            wunit.commit();
+        }
+
+        // Create an index.
+        const auto indexName = "a";
+        const auto indexKey = BSON("a" << 1);
+        auto status = dbtests::createIndexFromSpec(
+            &_opCtx,
+            coll->ns().ns(),
+            BSON("name" << indexName << "ns" << coll->ns().ns() << "key" << indexKey << "v"
+                        << static_cast<int>(kIndexVersion)
+                        << "background"
+                        << false));
+        ASSERT_OK(status);
+
+        // Insert documents.
+        OpDebug* const nullOpDebug = nullptr;
+        RecordId rid = RecordId::min();
+        lockDb(MODE_X);
+        {
+            WriteUnitOfWork wunit(&_opCtx);
+            ASSERT_OK(coll->insertDocument(
+                &_opCtx, InsertStatement(BSON("_id" << 1 << "a" << 1)), nullOpDebug, true));
+            ASSERT_OK(coll->insertDocument(
+                &_opCtx, InsertStatement(BSON("_id" << 2 << "a" << 2)), nullOpDebug, true));
+            ASSERT_OK(coll->insertDocument(
+                &_opCtx, InsertStatement(BSON("_id" << 3 << "a" << 3)), nullOpDebug, true));
+            rid = coll->getCursor(&_opCtx)->next()->id;
+            wunit.commit();
+        }
+        ASSERT_TRUE(checkValid());
+
+        // Removing an index entry without removing the document should cause us to have a missing
+        // index entry.
+        {
+            lockDb(MODE_X);
+
+            IndexCatalog* indexCatalog = coll->getIndexCatalog();
+            auto descriptor = indexCatalog->findIndexByName(&_opCtx, indexName);
+            auto iam =
+                const_cast<IndexAccessMethod*>(indexCatalog->getEntry(descriptor)->accessMethod());
+
+            WriteUnitOfWork wunit(&_opCtx);
+            int64_t numDeleted;
+            const BSONObj actualKey = BSON("a" << 1);
+            InsertDeleteOptions options;
+            options.logIfError = true;
+            options.dupsAllowed = true;
+            auto removeStatus = iam->remove(&_opCtx, actualKey, rid, options, &numDeleted);
+
+            ASSERT_EQUALS(numDeleted, 1);
+            ASSERT_OK(removeStatus);
+            wunit.commit();
+        }
+
+        {
+            ValidateResults results;
+            BSONObjBuilder output;
+
+            lockDb(MODE_IX);
+            std::unique_ptr<Lock::CollectionLock> lock =
+                stdx::make_unique<Lock::CollectionLock>(&_opCtx, _nss, MODE_X);
+
+            Database* db = _autoDb.get()->getDb();
+            ASSERT_OK(db->getCollection(&_opCtx, _nss)
+                          ->validate(&_opCtx, kValidateFull, _background, &results, &output));
+
+            ASSERT_EQ(false, results.valid);
+            ASSERT_EQ(static_cast<size_t>(1), results.errors.size());
+            ASSERT_EQ(static_cast<size_t>(1), results.warnings.size());
+            ASSERT_EQ(static_cast<size_t>(0), results.extraIndexEntries.size());
+            ASSERT_EQ(static_cast<size_t>(1), results.missingIndexEntries.size());
+        }
+
+        releaseDb();
+    }
+};
+
+template <bool full, bool background>
+class ValidateExtraIndexEntryResults : public ValidateBase {
+public:
+    ValidateExtraIndexEntryResults() : ValidateBase(full, background) {}
+
+    void run() {
+        // Can't perform background validation if the RecordStore is not in RecordId order.
+        if (_background && !_isInRecordIdOrder) {
+            return;
+        }
+
+        // Create a new collection.
+        lockDb(MODE_X);
+        Collection* coll;
+        {
+            WriteUnitOfWork wunit(&_opCtx);
+            ASSERT_OK(_db->dropCollection(&_opCtx, _nss));
+            coll = _db->createCollection(&_opCtx, _nss);
+            wunit.commit();
+        }
+
+        // Create an index.
+        const auto indexName = "a";
+        const auto indexKey = BSON("a" << 1);
+        auto status = dbtests::createIndexFromSpec(
+            &_opCtx,
+            coll->ns().ns(),
+            BSON("name" << indexName << "ns" << coll->ns().ns() << "key" << indexKey << "v"
+                        << static_cast<int>(kIndexVersion)
+                        << "background"
+                        << false));
+        ASSERT_OK(status);
+
+        // Insert documents.
+        OpDebug* const nullOpDebug = nullptr;
+        RecordId rid = RecordId::min();
+        lockDb(MODE_X);
+        {
+            WriteUnitOfWork wunit(&_opCtx);
+            ASSERT_OK(coll->insertDocument(
+                &_opCtx, InsertStatement(BSON("_id" << 1 << "a" << 1)), nullOpDebug, true));
+            ASSERT_OK(coll->insertDocument(
+                &_opCtx, InsertStatement(BSON("_id" << 2 << "a" << 2)), nullOpDebug, true));
+            ASSERT_OK(coll->insertDocument(
+                &_opCtx, InsertStatement(BSON("_id" << 3 << "a" << 3)), nullOpDebug, true));
+            rid = coll->getCursor(&_opCtx)->next()->id;
+            wunit.commit();
+        }
+        ASSERT_TRUE(checkValid());
+
+        // Removing a document without removing the index entries should cause us to have extra
+        // index entries.
+        {
+            lockDb(MODE_X);
+            RecordStore* rs = coll->getRecordStore();
+
+            WriteUnitOfWork wunit(&_opCtx);
+            rs->deleteRecord(&_opCtx, rid);
+            wunit.commit();
+        }
+
+        {
+            ValidateResults results;
+            BSONObjBuilder output;
+
+            lockDb(MODE_IX);
+            std::unique_ptr<Lock::CollectionLock> lock =
+                stdx::make_unique<Lock::CollectionLock>(&_opCtx, _nss, MODE_X);
+
+            Database* db = _autoDb.get()->getDb();
+            ASSERT_OK(db->getCollection(&_opCtx, _nss)
+                          ->validate(&_opCtx, kValidateFull, _background, &results, &output));
+
+            ASSERT_EQ(false, results.valid);
+            ASSERT_EQ(static_cast<size_t>(2), results.errors.size());
+            ASSERT_EQ(static_cast<size_t>(1), results.warnings.size());
+            ASSERT_EQ(static_cast<size_t>(2), results.extraIndexEntries.size());
+            ASSERT_EQ(static_cast<size_t>(0), results.missingIndexEntries.size());
+        }
+
+        releaseDb();
+    }
+};
 
 class ValidateTests : public Suite {
 public:
@@ -1185,6 +1447,12 @@ public:
         add<ValidateIndexEntry<false, true>>();
         add<ValidateIndexOrdering<false, false>>();
         add<ValidateIndexOrdering<false, true>>();
+
+        // Tests that the 'missingIndexEntries' and 'extraIndexEntries' field are populated
+        // correctly.
+        add<ValidateMissingAndExtraIndexEntryResults<false, false>>();
+        add<ValidateMissingIndexEntryResults<false, false>>();
+        add<ValidateExtraIndexEntryResults<false, false>>();
     }
 } validateTests;
 }  // namespace ValidateTests

@@ -153,6 +153,11 @@ public:
     virtual MemberState getMemberState() const = 0;
 
     /**
+     * Returns whether this node can accept writes to databases other than local.
+     */
+    virtual bool canAcceptNonLocalWrites() const = 0;
+
+    /**
      * Waits for 'timeout' ms for member state to become 'state'.
      * Returns OK if member state is 'state'.
      * Returns ErrorCodes::ExceededTimeLimit if we timed out waiting for the state change.
@@ -620,7 +625,8 @@ public:
      * the same branch of history as 'committedOptime', so we update our commit point to
      * min(committedOptime, lastApplied).
      */
-    virtual void advanceCommitPoint(const OpTime& committedOptime, bool fromSyncSource) = 0;
+    virtual void advanceCommitPoint(const OpTimeAndWallTime& committedOpTimeAndWallTime,
+                                    bool fromSyncSource) = 0;
 
     /**
      * Elections under protocol version 1 are triggered by a timer.
@@ -755,6 +761,7 @@ public:
      * operation in their oplogs.  This implies such ops will never be rolled back.
      */
     virtual OpTime getLastCommittedOpTime() const = 0;
+    virtual OpTimeAndWallTime getLastCommittedOpTimeAndWallTime() const = 0;
 
     /**
      * Returns a list of objects that contain this node's knowledge of the state of the members of
@@ -818,6 +825,11 @@ public:
      * Gets the latest OpTime of the currentCommittedSnapshot.
      */
     virtual OpTime getCurrentCommittedSnapshotOpTime() const = 0;
+
+    /**
+     * Gets the latest OpTime of the currentCommittedSnapshot and its corresponding wall clock time.
+     */
+    virtual OpTimeAndWallTime getCurrentCommittedSnapshotOpTimeAndWallTime() const = 0;
 
     /**
      * Appends diagnostics about the replication subsystem.

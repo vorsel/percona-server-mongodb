@@ -67,11 +67,11 @@ public:
         {
             WriteUnitOfWork wunit(&_opCtx);
             _database = _context.db();
-            _collection = _database->getCollection(&_opCtx, ns());
+            _collection = _database->getCollection(&_opCtx, nss());
             if (_collection) {
-                _database->dropCollection(&_opCtx, ns()).transitional_ignore();
+                _database->dropCollection(&_opCtx, nss()).transitional_ignore();
             }
-            _collection = _database->createCollection(&_opCtx, ns());
+            _collection = _database->createCollection(&_opCtx, nss());
             wunit.commit();
         }
 
@@ -81,7 +81,7 @@ public:
     ~Base() {
         try {
             WriteUnitOfWork wunit(&_opCtx);
-            uassertStatusOK(_database->dropCollection(&_opCtx, ns()));
+            uassertStatusOK(_database->dropCollection(&_opCtx, nss()));
             wunit.commit();
         } catch (...) {
             FAIL("Exception while cleaning up collection");
@@ -91,6 +91,9 @@ public:
 protected:
     static const char* ns() {
         return "unittests.querytests";
+    }
+    static NamespaceString nss() {
+        return NamespaceString(ns());
     }
 
     void addIndex(const IndexSpec& spec) {
@@ -216,11 +219,11 @@ public:
         {
             WriteUnitOfWork wunit(&_opCtx);
             Database* db = ctx.db();
-            if (db->getCollection(&_opCtx, ns())) {
+            if (db->getCollection(&_opCtx, nss())) {
                 _collection = NULL;
-                db->dropCollection(&_opCtx, ns()).transitional_ignore();
+                db->dropCollection(&_opCtx, nss()).transitional_ignore();
             }
-            _collection = db->createCollection(&_opCtx, ns(), CollectionOptions(), false);
+            _collection = db->createCollection(&_opCtx, nss(), CollectionOptions(), false);
             wunit.commit();
         }
         ASSERT(_collection);
@@ -1058,30 +1061,27 @@ public:
         _client.insert(ns, BSON("a" << 2 << "b" << 2));
 
         ASSERT_EQUALS(4, count(_client.query(NamespaceString(ns), BSONObj())));
-        BSONObj hints[] = {BSONObj(), BSON("a" << 1 << "b" << 1)};
-        for (int i = 0; i < 2; ++i) {
-            check(0, 0, 3, 3, 4, hints[i]);
-            check(1, 1, 2, 2, 3, hints[i]);
-            check(1, 2, 2, 2, 2, hints[i]);
-            check(1, 2, 2, 1, 1, hints[i]);
+        BSONObj hint = BSON("a" << 1 << "b" << 1);
+        check(0, 0, 3, 3, 4, hint);
+        check(1, 1, 2, 2, 3, hint);
+        check(1, 2, 2, 2, 2, hint);
+        check(1, 2, 2, 1, 1, hint);
 
-            unique_ptr<DBClientCursor> c = query(1, 2, 2, 2, hints[i]);
-            BSONObj obj = c->next();
-            ASSERT_EQUALS(1, obj.getIntField("a"));
-            ASSERT_EQUALS(2, obj.getIntField("b"));
-            obj = c->next();
-            ASSERT_EQUALS(2, obj.getIntField("a"));
-            ASSERT_EQUALS(1, obj.getIntField("b"));
-            ASSERT(!c->more());
-        }
+        unique_ptr<DBClientCursor> c = query(1, 2, 2, 2, hint);
+        BSONObj obj = c->next();
+        ASSERT_EQUALS(1, obj.getIntField("a"));
+        ASSERT_EQUALS(2, obj.getIntField("b"));
+        obj = c->next();
+        ASSERT_EQUALS(2, obj.getIntField("a"));
+        ASSERT_EQUALS(1, obj.getIntField("b"));
+        ASSERT(!c->more());
     }
 
 private:
     unique_ptr<DBClientCursor> query(int minA, int minB, int maxA, int maxB, const BSONObj& hint) {
         Query q;
         q = q.minKey(BSON("a" << minA << "b" << minB)).maxKey(BSON("a" << maxA << "b" << maxB));
-        if (!hint.isEmpty())
-            q.hint(hint);
+        q.hint(hint);
         return _client.query(NamespaceString(ns), q);
     }
     void check(
@@ -1288,6 +1288,9 @@ public:
 
     const char* ns() {
         return _ns.c_str();
+    }
+    NamespaceString nss() {
+        return NamespaceString(ns());
     }
 
 private:
@@ -1697,7 +1700,7 @@ public:
             Lock::GlobalWrite lk(&_opCtx);
             OldClientContext context(&_opCtx, ns());
             WriteUnitOfWork wunit(&_opCtx);
-            context.db()->createCollection(&_opCtx, ns(), coll_opts, false);
+            context.db()->createCollection(&_opCtx, nss(), coll_opts, false);
             wunit.commit();
         }
         insert(ns(), BSON("a" << 1));

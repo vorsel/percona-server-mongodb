@@ -36,6 +36,9 @@ from buildscripts import moduleconfig
 import libdeps
 import psutil
 
+scons_invocation = '{} {}'.format(sys.executable, ' '.join(sys.argv))
+print('scons: running with args {}'.format(scons_invocation))
+
 atexit.register(mongo.print_build_failures)
 
 def add_option(name, **kwargs):
@@ -773,6 +776,12 @@ env_vars.Add('ICECC_CREATE_ENV',
 env_vars.Add('ICECC_SCHEDULER',
     help='Tell ICECC where the sceduler daemon is running')
 
+env_vars.Add('ICECC_VERSION',
+    help='Tell ICECC where the compiler package is')
+
+env_vars.Add('ICECC_VERSION_ARCH',
+    help='Tell ICECC the target archicture for the compiler package, if non-native')
+
 env_vars.Add('LIBPATH',
     help='Adds paths to the linker search path',
     converter=variable_shlex_converter)
@@ -1034,6 +1043,23 @@ envDict = dict(BUILD_ROOT=buildDir,
 
 env = Environment(variables=env_vars, **envDict)
 del envDict
+
+for var in ['CC', 'CXX']:
+    if var not in env:
+        continue
+    path = env[var]
+    print('{} is {}'.format(var, path))
+    if not os.path.isabs(path):
+        which = shutil.which(path)
+        if which is None:
+            print('{} was not found in $PATH'.format(path))
+        else:
+            print('{} found in $PATH at {}'.format(path, which))
+            path = which
+
+    realpath = os.path.realpath(path)
+    if realpath != path:
+        print('{} resolves to {}'.format(path, realpath))
 
 env.AddMethod(mongo_platform.env_os_is_wrapper, 'TargetOSIs')
 env.AddMethod(mongo_platform.env_get_os_name_wrapper, 'GetTargetOSName')
@@ -1791,14 +1817,22 @@ elif env.TargetOSIs('windows'):
     # file contains invalid UTF-8.
     env.Append( CCFLAGS=["/utf-8" ])
 
-    # Enforce type conversion rules for rvalue reference types as a result of a cast operation.
-    env.Append( CCFLAGS=["/Zc:rvalueCast"] )
+    # Specify standards conformance mode to the compiler.
+    env.Append( CCFLAGS=["/permissive-"] )
 
-    # Disable string literal type conversion, instead const_cast must be explicitly specified.
-    env.Append( CCFLAGS=["/Zc:strictStrings"] )
+    # Enables the __cplusplus preprocessor macro to report an updated value for recent C++ language
+    # standards support.
+    env.Append( CCFLAGS=["/Zc:__cplusplus"] )
+
+    # Tells the compiler to preferentially call global operator delete or operator delete[]
+    # functions that have a second parameter of type size_t when the size of the object is available.
+    env.Append( CCFLAGS=["/Zc:sizedDealloc"] )
 
     # Treat volatile according to the ISO standard and do not guarantee acquire/release semantics.
     env.Append( CCFLAGS=["/volatile:iso"] )
+
+    # Tell CL to produce more useful error messages.
+    env.Append( CCFLAGS=["/diagnostics:caret"] )
 
     # This gives 32-bit programs 4 GB of user address space in WOW64, ignored in 64-bit builds.
     env.Append( LINKFLAGS=["/LARGEADDRESSAWARE"] )
@@ -2302,6 +2336,8 @@ def doConfigure(myenv):
         # exceptionToStatus(). See https://bugs.llvm.org/show_bug.cgi?id=34804
         AddToCCFLAGSIfSupported(myenv, "-Wno-exceptions")
 
+        # Enable sized deallocation support.
+        AddToCXXFLAGSIfSupported(myenv, '-fsized-deallocation')
 
         # Check if we can set "-Wnon-virtual-dtor" when "-Werror" is set. The only time we can't set it is on
         # clang 3.4, where a class with virtual function(s) and a non-virtual destructor throws a warning when
@@ -2429,7 +2465,6 @@ def doConfigure(myenv):
         conf.Finish()
 
     if myenv.ToolchainIs('msvc'):
-        myenv.AppendUnique(CCFLAGS=['/Zc:__cplusplus', '/permissive-'])
         if get_option('cxx-std') == "17":
             myenv.AppendUnique(CCFLAGS=['/std:c++17'])
     else:
@@ -3687,14 +3722,13 @@ def doLint( env , target , source ):
     import buildscripts.pylinters
     buildscripts.pylinters.lint_all(None, {}, [])
 
-    env.Command(
-        target="#run_lint",
-        source=["buildscripts/lint.py", "src/mongo"],
-        action="$PYTHON $SOURCES[0] $SOURCES[1]",
-    )
+run_lint = env.Command(
+    target="#run_lint",
+    source=["buildscripts/lint.py", "src/mongo"],
+    action="$PYTHON ${SOURCES[0]} ${SOURCES[1]}",
+)
 
-
-env.Alias( "lint" , [] , [ doLint ] )
+env.Alias( "lint" , [ run_lint ] , [ doLint ] )
 env.AlwaysBuild( "lint" )
 
 

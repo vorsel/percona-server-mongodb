@@ -33,11 +33,11 @@
 
 #include "mongo/embedded/index_builds_coordinator_embedded.h"
 
-#include "mongo/db/catalog/uuid_catalog.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 

@@ -1,6 +1,5 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """Command line utility for determining what jstests have been added or modified."""
-
 
 import collections
 import copy
@@ -67,17 +66,20 @@ def parse_command_line():
     parser.add_option("--baseCommit", dest="base_commit", default=None,
                       help="The base commit to compare to for determining changes.")
 
-    parser.add_option("--buildVariant", dest="buildvariant", default=None,
-                      help=("The buildvariant to select the tasks. Required when"
-                            " generating the JSON file with test executor information"))
+    parser.add_option(
+        "--buildVariant", dest="buildvariant", default=None,
+        help=("The buildvariant to select the tasks. Required when"
+              " generating the JSON file with test executor information"))
 
-    parser.add_option("--runBuildVariant", dest="run_buildvariant", default=None,
-                      help=("The buildvariant the tasks will execute on. If not specied then tasks"
-                            " will execute on the the buildvariant specied in --buildVariant."))
+    parser.add_option(
+        "--runBuildVariant", dest="run_buildvariant", default=None,
+        help=("The buildvariant the tasks will execute on. If not specified then tasks"
+              " will execute on the the buildvariant specified in --buildVariant."))
 
-    parser.add_option("--distro", dest="distro", default=None,
-                      help=("The distro the tasks will execute on. Can only be specified"
-                            " with --generateTasksFile."))
+    parser.add_option(
+        "--distro", dest="distro", default=None,
+        help=("The distro the tasks will execute on. Can only be specified"
+              " with --generateTasksFile."))
 
     parser.add_option(
         "--checkEvergreen", dest="check_evergreen", default=False, action="store_true",
@@ -438,15 +440,18 @@ def get_resmoke_repeat_options(options):
 def _set_resmoke_cmd(options, args):
     """Build the resmoke command, if a resmoke.py command wasn't passed in."""
 
-    new_args = copy.deepcopy(args) if args else ["python", "buildscripts/resmoke.py"]
+    new_args = copy.deepcopy(args) if args else [sys.executable, "buildscripts/resmoke.py"]
     new_args += get_resmoke_repeat_options(options).split()
 
     return new_args
 
 
-def _sub_task_name(variant, task, task_num):
+def _sub_task_name(options, task, task_num):
     """Return the generated sub-task name."""
-    return "burn_in:{}_{}_{}".format(variant, task, task_num)
+    task_name_prefix = options.buildvariant
+    if options.run_buildvariant:
+        task_name_prefix = options.run_buildvariant
+    return "burn_in:{}_{}_{}".format(task_name_prefix, task, task_num)
 
 
 def _get_run_buildvariant(options):
@@ -465,7 +470,7 @@ def create_generate_tasks_file(options, tests_by_task):
     for task in sorted(tests_by_task):
         multiversion_path = tests_by_task[task].get("use_multiversion")
         for test_num, test in enumerate(tests_by_task[task]["tests"]):
-            sub_task_name = _sub_task_name(options.buildvariant, task, test_num)
+            sub_task_name = _sub_task_name(options, task, test_num)
             task_names.append(sub_task_name)
             evg_sub_task = evg_config.task(sub_task_name)
             evg_sub_task.dependency(TaskDependency("compile"))

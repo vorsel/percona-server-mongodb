@@ -115,9 +115,6 @@ selector:
   # router tries to commit, it may not know the full participant list.
   - jstests/concurrency/fsm_workloads/multi_statement_transaction_all_commands_same_session.js
 
-  # TODO SERVER-38297: Killing session on a secondary applying a prepare oplog entry can crash.
-  - jstests/concurrency/fsm_workloads/multi_statement_transaction_kill_sessions_atomicity_isolation.js
-
   # Expects reads to die with a particular error, but other errors are possible if the read is part
   # of a transaction (e.g. ErrorCodes.LockTimeout).
   - jstests/concurrency/fsm_workloads/drop_index_during_replan.js
@@ -150,10 +147,6 @@ selector:
   # failing the workload.
   - jstests/concurrency/fsm_workloads/agg_out.js
 
-  # TODO SERVER-38569: Unblacklist this workload once the performance of sharded transactions has
-  # improved to avoid timeouts on slow variants.
-  - jstests/concurrency/fsm_workloads/remove_and_bulk_insert.js
-
   exclude_with_any_tags:
   - assumes_balancer_off
   - requires_replication
@@ -174,6 +167,7 @@ selector:
 executor:
   archive:
     hooks:
+      - CheckReplDBHashInBackground
       - CheckReplDBHash
       - ValidateCollections
     tests: true
@@ -196,6 +190,7 @@ executor:
           traceExceptions: false
           usingReplicaSetShards: true
   hooks:
+  - class: CheckReplDBHashInBackground
   - class: CheckReplDBHash
   - class: ValidateCollections
   - class: CleanupConcurrencyWorkloads
@@ -210,10 +205,6 @@ executor:
     mongod_options:
       set_parameters:
         enableTestCommands: 1
-        # TODO SERVER-38302: Write noops to avoid hangs if the stable timestamp does not advance
-        # when the oldest prepared transaction commits or aborts.
-        periodicNoopIntervalSecs: 1
-        writePeriodicNoops: true
     num_rs_nodes_per_shard: 3
     num_shards: 2
     num_mongos: 2

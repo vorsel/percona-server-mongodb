@@ -45,11 +45,10 @@
 #include "mongo/db/server_options_server_helpers.h"
 #include "mongo/s/version_mongos.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/options_parser/startup_options.h"
 #include "mongo/util/startup_test.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -145,10 +144,10 @@ Status storeMongosOptions(const moe::Environment& params) {
     if (!resolvedSomeSeedSever) {
         if (!hostbyname(configdbConnectionString.getValue().getSetName().c_str()).empty()) {
             warning() << "The replica set name \""
-                      << escape(configdbConnectionString.getValue().getSetName())
+                      << str::escape(configdbConnectionString.getValue().getSetName())
                       << "\" resolves as a host name, but none of the servers in the seed list do. "
                          "Did you reverse the replica set name and the seed list in "
-                      << escape(configdbConnectionString.getValue().toString()) << "?";
+                      << str::escape(configdbConnectionString.getValue().toString()) << "?";
         }
     }
 

@@ -35,11 +35,9 @@
 
 #include "mongo/db/audit.h"
 #include "mongo/db/background.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/collection_impl.h"
-#include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/catalog/database_impl.h"
-#include "mongo/db/catalog/namespace_uuid_cache.h"
-#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/oplog.h"
@@ -137,16 +135,14 @@ Database* DatabaseHolderImpl::openDb(OperationContext* opCtx, StringData ns, boo
     // requirement for X-lock on the database when we enter. So there is no way we can insert two
     // different databases for the same name.
     lk.unlock();
-    StorageEngine* storageEngine = getGlobalServiceContext()->getStorageEngine();
-    DatabaseCatalogEntry* entry = storageEngine->getDatabaseCatalogEntry(opCtx, dbname);
 
-    if (!entry->exists()) {
+    if (CollectionCatalog::get(opCtx).getAllCollectionUUIDsFromDb(dbname).empty()) {
         audit::logCreateDatabase(opCtx->getClient(), dbname);
         if (justCreated)
             *justCreated = true;
     }
 
-    auto newDb = stdx::make_unique<DatabaseImpl>(dbname, entry, ++_epoch);
+    auto newDb = stdx::make_unique<DatabaseImpl>(dbname, ++_epoch);
     newDb->init(opCtx);
 
     // Finally replace our nullptr entry with the new Database pointer.
@@ -192,7 +188,7 @@ void DatabaseHolderImpl::dropDb(OperationContext* opCtx, Database* db) {
             break;
         }
 
-        Top::get(serviceContext).collectionDropped(coll->ns().ns(), true);
+        Top::get(serviceContext).collectionDropped(coll->ns(), true);
     }
 
     close(opCtx, name);
@@ -202,20 +198,6 @@ void DatabaseHolderImpl::dropDb(OperationContext* opCtx, Database* db) {
         storageEngine->dropDatabase(opCtx, name).transitional_ignore();
     });
 }
-
-namespace {
-void evictDatabaseFromUUIDCatalog(OperationContext* opCtx, Database* db) {
-    for (auto collIt = db->begin(opCtx); collIt != db->end(opCtx); ++collIt) {
-        auto coll = *collIt;
-        if (!coll) {
-            break;
-        }
-
-        NamespaceUUIDCache::get(opCtx).evictNamespace(coll->ns());
-    }
-    UUIDCatalog::get(opCtx).onCloseDatabase(db);
-}
-}  // namespace
 
 void DatabaseHolderImpl::close(OperationContext* opCtx, StringData ns) {
     invariant(opCtx->lockState()->isW());
@@ -231,7 +213,7 @@ void DatabaseHolderImpl::close(OperationContext* opCtx, StringData ns) {
 
     auto db = it->second;
     repl::oplogCheckCloseDatabase(opCtx, db);
-    evictDatabaseFromUUIDCatalog(opCtx, db);
+    CollectionCatalog::get(opCtx).onCloseDatabase(opCtx, dbName.toString());
 
     db->close(opCtx);
     delete db;
@@ -272,7 +254,7 @@ void DatabaseHolderImpl::closeAll(OperationContext* opCtx) {
 
         Database* db = _dbs[name];
         repl::oplogCheckCloseDatabase(opCtx, db);
-        evictDatabaseFromUUIDCatalog(opCtx, db);
+        CollectionCatalog::get(opCtx).onCloseDatabase(opCtx, name);
         db->close(opCtx);
         delete db;
 
@@ -290,9 +272,8 @@ std::unique_ptr<Collection> DatabaseHolderImpl::makeCollection(
     const StringData fullNS,
     OptionalCollectionUUID uuid,
     CollectionCatalogEntry* const details,
-    RecordStore* const recordStore,
-    DatabaseCatalogEntry* const dbce) {
-    return std::make_unique<CollectionImpl>(opCtx, fullNS, uuid, details, recordStore, dbce);
+    RecordStore* const recordStore) {
+    return std::make_unique<CollectionImpl>(opCtx, fullNS, uuid, details, recordStore);
 }
 
 }  // namespace mongo

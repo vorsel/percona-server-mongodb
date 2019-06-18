@@ -37,8 +37,7 @@
 #include "mongo/db/fts/stop_words.h"
 #include "mongo/db/fts/tokenizer.h"
 #include "mongo/stdx/memory.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace fts {

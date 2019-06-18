@@ -35,9 +35,9 @@
 
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/document_validation.h"
-#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
@@ -93,7 +93,7 @@ MongoInterfaceShardServer::collectDocumentKeyFieldsForHostedCollection(Operation
 
     const auto metadata = [opCtx, &nss]() -> ScopedCollectionMetadata {
         Lock::DBLock dbLock(opCtx, nss.db(), MODE_IS);
-        Lock::CollectionLock collLock(opCtx->lockState(), nss.ns(), MODE_IS);
+        Lock::CollectionLock collLock(opCtx, nss, MODE_IS);
         return CollectionShardingState::get(opCtx, nss)->getCurrentMetadata();
     }();
 

@@ -1,4 +1,6 @@
-// @tags: [does_not_support_stepdowns, requires_non_retryable_commands, requires_fastcount]
+// TODO SERVER-40402: Remove 'assumes_write_concern_unchanged' tag.
+// @tags: [does_not_support_stepdowns, requires_non_retryable_commands, requires_fastcount,
+// assumes_write_concern_unchanged]
 
 /**
  * Tests that various database commands respect the 'bypassDocumentValidation' flag:
@@ -144,6 +146,37 @@
         });
         assert.writeOK(res);
         assert.eq(1, coll.count({update: 1}));
+
+        // Pipeline-style update is only supported for commands and not for OP_UPDATE which cannot
+        // differentiate between an update object and an array.
+        res = myDb.runCommand({
+            update: collName,
+            updates: [{q: {}, u: [{$addFields: {pipeline: 1}}]}],
+            bypassDocumentValidation: false
+        });
+        assertFailsValidation(BulkWriteResult(res));
+        assert.eq(0, coll.count({pipeline: 1}));
+
+        assert.commandWorked(myDb.runCommand({
+            update: collName,
+            updates: [{q: {}, u: [{$addFields: {pipeline: 1}}]}],
+            bypassDocumentValidation: true
+        }));
+        assert.eq(1, coll.count({pipeline: 1}));
+
+        assert.commandFailed(myDb.runCommand({
+            findAndModify: collName,
+            update: [{$addFields: {findAndModifyPipeline: 1}}],
+            bypassDocumentValidation: false
+        }));
+        assert.eq(0, coll.count({findAndModifyPipeline: 1}));
+
+        assert.commandWorked(myDb.runCommand({
+            findAndModify: collName,
+            update: [{$addFields: {findAndModifyPipeline: 1}}],
+            bypassDocumentValidation: true
+        }));
+        assert.eq(1, coll.count({findAndModifyPipeline: 1}));
     }
 
     // Run the test using a normal validator.

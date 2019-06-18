@@ -81,6 +81,8 @@ public:
 
     virtual MemberState getMemberState() const;
 
+    virtual bool canAcceptNonLocalWrites() const;
+
     virtual Status waitForMemberState(MemberState expectedState, Milliseconds timeout) override;
 
     virtual bool isInPrimaryOrSecondaryState(OperationContext* opCtx) const;
@@ -189,7 +191,8 @@ public:
 
     virtual void processReplSetMetadata(const rpc::ReplSetMetadata& replMetadata) override;
 
-    virtual void advanceCommitPoint(const OpTime& committedOptime, bool fromSyncSource) override;
+    virtual void advanceCommitPoint(const OpTimeAndWallTime& committedOptimeAndWallTime,
+                                    bool fromSyncSource) override;
 
     virtual void cancelAndRescheduleElectionTimeout() override;
 
@@ -238,6 +241,8 @@ public:
 
     virtual OpTime getLastCommittedOpTime() const;
 
+    virtual OpTimeAndWallTime getLastCommittedOpTimeAndWallTime() const;
+
     virtual std::vector<MemberData> getMemberData() const override;
 
     virtual Status processReplSetRequestVotes(OperationContext* opCtx,
@@ -260,6 +265,8 @@ public:
     virtual void dropAllSnapshots() override;
 
     virtual OpTime getCurrentCommittedSnapshotOpTime() const override;
+
+    virtual OpTimeAndWallTime getCurrentCommittedSnapshotOpTimeAndWallTime() const override;
 
     virtual void waitUntilSnapshotCommitted(OperationContext* opCtx,
                                             const Timestamp& untilSnapshot) override;
@@ -288,8 +295,6 @@ public:
      * Always allow writes even if this node is not master. Used by sharding unit tests.
      */
     void alwaysAllowWrites(bool allowWrites);
-
-    void setMaster(bool isMaster);
 
     virtual ServiceContext* getServiceContext() override {
         return _service;

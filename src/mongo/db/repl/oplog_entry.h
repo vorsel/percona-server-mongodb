@@ -32,6 +32,7 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/logical_session_id.h"
+#include "mongo/db/repl/apply_ops_gen.h"
 #include "mongo/db/repl/oplog_entry_gen.h"
 #include "mongo/db/repl/optime.h"
 
@@ -144,10 +145,14 @@ public:
 
     /**
      * Returns if the oplog entry is part of a transaction that has not yet been prepared or
-     * committed.  The actual "prepare" or "commit" oplog entries do not have an inTxn field
+     * committed.  The actual "prepare" or "commit" oplog entries do not have a "partialTxn" field
      * and so this method will always return false for them.
      */
-    bool isInPendingTransaction() const {
+    bool isPartialTransaction() const {
+        if (getCommandType() == CommandType::kApplyOps) {
+            return getObject()[ApplyOpsCommandInfoBase::kPartialTxnFieldName].booleanSafe();
+        }
+        // TODO(SERVER-40763): Remove "inTxn" entirely and return false here.
         return getInTxn() && *getInTxn();
     }
 
@@ -168,12 +173,21 @@ public:
     BSONElement getIdElement() const;
 
     /**
-     * Returns the document representing the operation to apply.
-     * For commands and insert/delete operations, this will be the document in the 'o' field.
-     * For update operations, this will be the document in the 'o2' field.
-     * An empty document returned by this function indicates that we have a malformed OplogEntry.
+     * Returns the document representing the operation to apply. This is the 'o' field for all
+     * operations, including updates. For updates this is not guaranteed to include the _id or the
+     * shard key.
      */
     BSONObj getOperationToApply() const;
+
+    /**
+     * Returns an object containing the _id of the target document for a CRUD operation. In a
+     * sharded cluster this object also contains the shard key. This object may contain more fields
+     * in the target document than the _id and shard key.
+     * For insert/delete operations, this will be the document in the 'o' field.
+     * For update operations, this will be the document in the 'o2' field.
+     * Should not be called for non-CRUD operations.
+     */
+    BSONObj getObjectContainingDocumentKey() const;
 
     /**
      * Returns the type of command of the oplog entry. If it is not a command, returns kNotCommand.

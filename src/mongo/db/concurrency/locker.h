@@ -32,6 +32,7 @@
 #include <climits>  // For UINT_MAX
 #include <vector>
 
+#include "mongo/db/concurrency/flow_control_ticketholder.h"
 #include "mongo/db/concurrency/lock_manager.h"
 #include "mongo/db/concurrency/lock_stats.h"
 #include "mongo/db/operation_context.h"
@@ -235,6 +236,29 @@ public:
     virtual bool inAWriteUnitOfWork() const = 0;
 
     /**
+     * Returns whether we have ever taken a global lock in X or IX mode in this operation.
+     * Should only be called on the thread owning the locker.
+     */
+    virtual bool wasGlobalLockTakenForWrite() const = 0;
+
+    /**
+     * Returns whether we have ever taken a global lock in S, X, or IX mode in this operation.
+     */
+    virtual bool wasGlobalLockTakenInModeConflictingWithWrites() const = 0;
+
+    /**
+     * Returns whether we have ever taken a global lock in this operation.
+     * Should only be called on the thread owning the locker.
+     */
+    virtual bool wasGlobalLockTaken() const = 0;
+
+    /**
+     * Sets the mode bit in _globalLockMode. Once a mode bit is set, we won't clear it. Also sets
+     * _wasGlobalLockTakenInModeConflictingWithWrites to true if the mode is S, X, or IX.
+     */
+    virtual void setGlobalLockTakenInMode(LockMode mode) = 0;
+
+    /**
      * Acquires lock on the specified resource in the specified mode and returns the outcome
      * of the operation. See the details for LockResult for more information on what the
      * different results mean.
@@ -361,9 +385,21 @@ public:
         // The global lock is handled differently from all other locks.
         LockMode globalMode;
 
-        // The non-global non-flush locks held, sorted by granularity.  That is, locks[i] is
+        // The non-global locks held, sorted by granularity.  That is, locks[i] is
         // coarser or as coarse as locks[i + 1].
         std::vector<OneLock> locks;
+    };
+
+    /**
+     * WUOWLockSnapshot captures all resources that have pending unlocks when releasing the write
+     * unit of work. If a lock has more than one pending unlock, it appears more than once here.
+     */
+    struct WUOWLockSnapshot {
+        // Nested WUOW can be released and restored all together.
+        int wuowNestingLevel = 0;
+
+        // The order of locks doesn't matter in this vector.
+        std::vector<OneLock> unlockPendingLocks;
     };
 
     /**
@@ -393,13 +429,22 @@ public:
     virtual void restoreLockState(const LockSnapshot& stateToRestore) = 0;
 
     /**
-     * releaseWriteUnitOfWork opts out two-phase locking and yield the locks after a WUOW
-     * has been released. restoreWriteUnitOfWork reaquires the locks and resume the two-phase
-     * locking behavior of WUOW.
+     * releaseWriteUnitOfWorkAndUnlock opts out of two-phase locking and yields the locks after a
+     * WUOW has been released. restoreWriteUnitOfWorkAndLock reacquires the locks and resumes the
+     * two-phase locking behavior of WUOW.
      */
-    virtual bool releaseWriteUnitOfWork(LockSnapshot* stateOut) = 0;
-    virtual void restoreWriteUnitOfWork(OperationContext* opCtx,
-                                        const LockSnapshot& stateToRestore) = 0;
+    virtual bool releaseWriteUnitOfWorkAndUnlock(LockSnapshot* stateOut) = 0;
+    virtual void restoreWriteUnitOfWorkAndLock(OperationContext* opCtx,
+                                               const LockSnapshot& stateToRestore) = 0;
+
+
+    /**
+     * releaseWriteUnitOfWork opts out of two-phase locking of the current locks held but keeps
+     * holding these locks.
+     * restoreWriteUnitOfWork resumes the two-phase locking behavior of WUOW.
+     */
+    virtual void releaseWriteUnitOfWork(WUOWLockSnapshot* stateOut) = 0;
+    virtual void restoreWriteUnitOfWork(const WUOWLockSnapshot& stateToRestore) = 0;
 
     /**
      * Releases the ticket associated with the Locker. This allows locks to be held without
@@ -464,6 +509,21 @@ public:
     bool shouldAcquireTicket() const {
         return _shouldAcquireTicket;
     }
+
+    /**
+     * Acquire a flow control admission ticket into the system. Flow control is used as a
+     * backpressure mechanism to limit replication majority point lag.
+     */
+    virtual void getFlowControlTicket(OperationContext* opCtx, LockMode lockMode) {}
+
+    /**
+     * If tracked by an implementation, returns statistics on effort spent acquiring a flow control
+     * ticket.
+     */
+    virtual FlowControlTicketholder::CurOp getFlowControlStats() const {
+        return FlowControlTicketholder::CurOp();
+    }
+
     /**
      * This function is for unit testing only.
      */

@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #
 # Copyright (C) 2018-present MongoDB, Inc.
 #
@@ -50,13 +50,13 @@ class DictionaryImportResolver(idl.parser.ImportResolverBase):
     """An import resolver resolves files from a dictionary."""
 
     def __init__(self, import_dict):
-        # type: (Dict[unicode, unicode]) -> None
+        # type: (Dict[str, str]) -> None
         """Construct a DictionaryImportResolver."""
         self._import_dict = import_dict
         super(DictionaryImportResolver, self).__init__()
 
     def resolve(self, base_file, imported_file_name):
-        # type: (unicode, unicode) -> unicode
+        # type: (str, str) -> str
         """Return the complete path to an imported file name."""
         # pylint: disable=unused-argument
         if not imported_file_name in self._import_dict:

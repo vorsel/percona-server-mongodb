@@ -91,7 +91,8 @@ public:
     /**
      * An enum that indicates if we want to skip the first document during oplog fetching or not.
      * Currently, the only time we don't want to skip the first document is during initial sync
-     * if there was an oldest active transaction timestamp.
+     * if the sync source has a valid oldest active transaction optime, as we need to include
+     * the corresponding oplog entry when applying.
      */
     enum class StartingPoint { kSkipFirstDoc, kEnqueueFirstDoc };
 
@@ -113,9 +114,11 @@ public:
      * query.
      * On success, returns statistics on operations.
      */
-    static StatusWith<DocumentsInfo> validateDocuments(const Fetcher::Documents& documents,
-                                                       bool first,
-                                                       Timestamp lastTS);
+    static StatusWith<DocumentsInfo> validateDocuments(
+        const Fetcher::Documents& documents,
+        bool first,
+        Timestamp lastTS,
+        StartingPoint startingPoint = StartingPoint::kSkipFirstDoc);
 
     /**
      * Invariants if validation fails on any of the provided arguments.

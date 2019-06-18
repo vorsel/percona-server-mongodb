@@ -54,7 +54,8 @@ void TimerImpl::setTimeout(Milliseconds timeout, TimeoutCallback cb) {
 
 void TimerImpl::cancelTimeout() {
     _timers.erase(this);
-    _cb = TimeoutCallback{};
+    TimeoutCallback cb;
+    _cb.swap(cb);
 }
 
 void TimerImpl::clear() {
@@ -223,6 +224,10 @@ std::shared_ptr<ConnectionPool::ConnectionInterface> PoolImpl::makeConnection(
 
 std::shared_ptr<ConnectionPool::TimerInterface> PoolImpl::makeTimer() {
     return stdx::make_unique<TimerImpl>(this);
+}
+
+const std::shared_ptr<OutOfLineExecutor>& PoolImpl::getExecutor() {
+    return _executor;
 }
 
 Date_t PoolImpl::now() {

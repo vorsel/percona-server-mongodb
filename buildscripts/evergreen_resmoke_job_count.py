@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """Determine the number of resmoke jobs to run."""
 
 import argparse
@@ -14,10 +14,11 @@ PLATFORM_MACHINE = platform.machine()
 SYS_PLATFORM = sys.platform
 
 VARIANT_TASK_FACTOR_OVERRIDES = {
+    "enterprise-rhel-62-64-bit": [{"task": r"logical_session_cache_replication.*", "factor": 0.75}],
     "enterprise-rhel-62-64-bit-inmem": [{"task": "secondary_reads_passthrough", "factor": 0.3}]
 }
 
-TASKS_FACTORS = [{"task": "replica_sets*", "factor": 0.5}, {"task": "sharding.*", "factor": 0.5}]
+TASKS_FACTORS = [{"task": r"replica_sets.*", "factor": 0.5}, {"task": r"sharding.*", "factor": 0.5}]
 
 MACHINE_TASK_FACTOR_OVERRIDES = {"aarch64": TASKS_FACTORS}
 

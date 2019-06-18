@@ -229,7 +229,19 @@ StatusWith<boost::optional<rpc::OplogQueryMetadata>> parseOplogQueryMetadata(
         queryResponse.otherFields.metadata.hasElement(rpc::kOplogQueryMetadataFieldName);
     if (receivedOplogQueryMetadata) {
         const auto& metadataObj = queryResponse.otherFields.metadata;
-        auto metadataResult = rpc::OplogQueryMetadata::readFromMetadata(metadataObj);
+        // Wall clock times are required in OplogQueryMetadata when FCV is 4.2. Arbiters trivially
+        // have FCV equal to 4.2, so they are excluded from this check.
+        bool isArbiter = hasGlobalServiceContext() &&
+            repl::ReplicationCoordinator::get(getGlobalServiceContext()) &&
+            repl::ReplicationCoordinator::get(getGlobalServiceContext())->getMemberState() ==
+                MemberState::RS_ARBITER;
+        bool requireWallTime =
+            (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+             serverGlobalParams.featureCompatibility.getVersion() ==
+                 ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42 &&
+             !isArbiter);
+        auto metadataResult =
+            rpc::OplogQueryMetadata::readFromMetadata(metadataObj, requireWallTime);
         if (!metadataResult.isOK()) {
             return metadataResult.getStatus();
         }
@@ -240,7 +252,10 @@ StatusWith<boost::optional<rpc::OplogQueryMetadata>> parseOplogQueryMetadata(
 }  // namespace
 
 StatusWith<OplogFetcher::DocumentsInfo> OplogFetcher::validateDocuments(
-    const Fetcher::Documents& documents, bool first, Timestamp lastTS) {
+    const Fetcher::Documents& documents,
+    bool first,
+    Timestamp lastTS,
+    StartingPoint startingPoint) {
     if (first && documents.empty()) {
         return Status(ErrorCodes::OplogStartMissing,
                       str::stream() << "The first batch of oplog entries is empty, but expected at "
@@ -288,7 +303,7 @@ StatusWith<OplogFetcher::DocumentsInfo> OplogFetcher::validateDocuments(
     // These numbers are for the documents we will apply.
     info.toApplyDocumentCount = documents.size();
     info.toApplyDocumentBytes = info.networkDocumentBytes;
-    if (first) {
+    if (first && startingPoint == StartingPoint::kSkipFirstDoc) {
         // The count is one less since the first document found was already applied ($gte $ts query)
         // and we will not apply it again.
         --info.toApplyDocumentCount;
@@ -439,15 +454,23 @@ StatusWith<BSONObj> OplogFetcher::_onSuccessfulBatch(const Fetcher::QueryRespons
 
         LOG(1) << "oplog fetcher successfully fetched from " << _getSource();
 
-        // If this is the first batch, no rollback is needed and we don't want to enqueue the first
-        // document, skip it.
+        // We do not always enqueue the first document. We elect to skip it for the following
+        // reasons:
+        //    1. This is the first batch and no rollback is needed. Callers specify
+        //       StartingPoint::kSkipFirstDoc when they want this behavior.
+        //    2. We have already enqueued that document in a previous attempt. We can get into
+        //       this situation if we had a batch with StartingPoint::kEnqueueFirstDoc that failed
+        //       right after that first document was enqueued. In such a scenario, we would not
+        //       have advanced the lastFetched opTime, so we skip past that document to avoid
+        //       duplicating it.
+
         if (_startingPoint == StartingPoint::kSkipFirstDoc) {
             firstDocToApply++;
         }
     }
 
-    auto validateResult =
-        OplogFetcher::validateDocuments(documents, queryResponse.first, lastFetched.getTimestamp());
+    auto validateResult = OplogFetcher::validateDocuments(
+        documents, queryResponse.first, lastFetched.getTimestamp(), _startingPoint);
     if (!validateResult.isOK()) {
         return validateResult.getStatus();
     }
@@ -461,7 +484,18 @@ StatusWith<BSONObj> OplogFetcher::_onSuccessfulBatch(const Fetcher::QueryRespons
         queryResponse.otherFields.metadata.hasElement(rpc::kReplSetMetadataFieldName);
     if (receivedReplMetadata) {
         const auto& metadataObj = queryResponse.otherFields.metadata;
-        auto metadataResult = rpc::ReplSetMetadata::readFromMetadata(metadataObj);
+        // Wall clock times are required in ReplSetMetadata when FCV is 4.2. Arbiters trivially
+        // have FCV equal to 4.2, so they are excluded from this check.
+        bool isArbiter = hasGlobalServiceContext() &&
+            repl::ReplicationCoordinator::get(getGlobalServiceContext()) &&
+            repl::ReplicationCoordinator::get(getGlobalServiceContext())->getMemberState() ==
+                MemberState::RS_ARBITER;
+        bool requireWallTime =
+            (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+             serverGlobalParams.featureCompatibility.getVersion() ==
+                 ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42 &&
+             !isArbiter);
+        auto metadataResult = rpc::ReplSetMetadata::readFromMetadata(metadataObj, requireWallTime);
         if (!metadataResult.isOK()) {
             error() << "invalid replication metadata from sync source " << _getSource() << ": "
                     << metadataResult.getStatus() << ": " << metadataObj;
@@ -487,6 +521,10 @@ StatusWith<BSONObj> OplogFetcher::_onSuccessfulBatch(const Fetcher::QueryRespons
     if (!status.isOK()) {
         return status;
     }
+
+    // Start skipping the first doc after at least one doc has been enqueued in the lifetime
+    // of this fetcher.
+    _startingPoint = StartingPoint::kSkipFirstDoc;
 
     if (_dataReplicatorExternalState->shouldStopFetching(
             _getSource(), replSetMetadata, oqMetadata)) {

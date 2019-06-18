@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include <fmt/format.h>
 #include <iosfwd>
 #include <string>
 
@@ -40,11 +41,9 @@
 namespace mongo {
 
 class Status;
-template <typename Allocator>
-class StringBuilderImpl;
-class StringData;
 template <typename T>
 class StatusWith;
+class StringData;
 
 /**
  * Name of a process on the network.
@@ -126,9 +125,10 @@ struct HostAndPort {
     std::string toString() const;
 
     /**
-     * Like toString(), above, but writes to "ss", instead.
+     * Like toString(), but writes to various `sink` instead.
      */
-    void append(StringBuilder& ss) const;
+    void append(StringBuilder& sink) const;
+    void append(fmt::writer& sink) const;
 
     /**
      * Returns true if this object represents no valid HostAndPort.
@@ -165,7 +165,23 @@ private:
 
 std::ostream& operator<<(std::ostream& os, const HostAndPort& hp);
 
-template <typename Allocator>
-StringBuilderImpl<Allocator>& operator<<(StringBuilderImpl<Allocator>& os, const HostAndPort& hp);
+StringBuilder& operator<<(StringBuilder& os, const HostAndPort& hp);
+
+StackStringBuilder& operator<<(StackStringBuilder& os, const HostAndPort& hp);
 
 }  // namespace mongo
+
+template <>
+struct fmt::formatter<mongo::HostAndPort> {
+    template <typename ParseContext>
+    auto parse(ParseContext& ctx) -> decltype(ctx.begin()) {
+        return ctx.begin();
+    }
+
+    template <typename FormatContext>
+    auto format(const mongo::HostAndPort& hp, FormatContext& ctx) -> decltype(ctx.out()) {
+        fmt::writer w(ctx.out());
+        hp.append(w);
+        return ctx.out();
+    }
+};

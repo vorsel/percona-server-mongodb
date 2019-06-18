@@ -29,12 +29,13 @@
 
 #include "mongo/platform/basic.h"
 
+#include <boost/optional/optional_io.hpp>
 #include <pcrecpp.h>
 
 #include "mongo/bson/util/builder.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/index_catalog.h"
-#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -158,7 +159,7 @@ TEST_F(DatabaseTest, CreateCollectionThrowsExceptionWhenDatabaseIsInADropPending
             ON_BLOCK_EXIT([&wuow] { wuow.commit(); });
 
             ASSERT_THROWS_CODE_AND_WHAT(
-                db->createCollection(_opCtx.get(), _nss.ns()),
+                db->createCollection(_opCtx.get(), _nss),
                 AssertionException,
                 ErrorCodes::DatabaseDropPending,
                 (StringBuilder() << "Cannot create collection " << _nss
@@ -179,12 +180,12 @@ void _testDropCollection(OperationContext* opCtx,
 
         WriteUnitOfWork wuow(opCtx);
         if (createCollectionBeforeDrop) {
-            ASSERT_TRUE(db->createCollection(opCtx, nss.ns(), collOpts));
+            ASSERT_TRUE(db->createCollection(opCtx, nss, collOpts));
         } else {
             ASSERT_FALSE(db->getCollection(opCtx, nss));
         }
 
-        ASSERT_OK(db->dropCollection(opCtx, nss.ns(), dropOpTime));
+        ASSERT_OK(db->dropCollection(opCtx, nss, dropOpTime));
 
         ASSERT_FALSE(db->getCollection(opCtx, nss));
         wuow.commit();
@@ -247,10 +248,10 @@ TEST_F(DatabaseTest, DropCollectionRejectsProvidedDropOpTimeIfWritesAreReplicate
         ASSERT_TRUE(db);
 
         WriteUnitOfWork wuow(opCtx);
-        ASSERT_TRUE(db->createCollection(opCtx, nss.ns()));
+        ASSERT_TRUE(db->createCollection(opCtx, nss));
 
         repl::OpTime dropOpTime(Timestamp(Seconds(100), 0), 1LL);
-        ASSERT_EQUALS(ErrorCodes::BadValue, db->dropCollection(opCtx, nss.ns(), dropOpTime));
+        ASSERT_EQUALS(ErrorCodes::BadValue, db->dropCollection(opCtx, nss, dropOpTime));
     });
 }
 
@@ -290,7 +291,7 @@ void _testDropCollectionThrowsExceptionIfThereAreIndexesInProgress(OperationCont
         Collection* collection = nullptr;
         {
             WriteUnitOfWork wuow(opCtx);
-            ASSERT_TRUE(collection = db->createCollection(opCtx, nss.ns()));
+            ASSERT_TRUE(collection = db->createCollection(opCtx, nss));
             wuow.commit();
         }
 
@@ -319,7 +320,7 @@ void _testDropCollectionThrowsExceptionIfThereAreIndexesInProgress(OperationCont
         ASSERT_GREATER_THAN(indexCatalog->numIndexesInProgress(opCtx), 0);
 
         WriteUnitOfWork wuow(opCtx);
-        ASSERT_THROWS_CODE(db->dropCollection(opCtx, nss.ns()),
+        ASSERT_THROWS_CODE(db->dropCollection(opCtx, nss),
                            AssertionException,
                            ErrorCodes::BackgroundOperationInProgressForNamespace);
     });
@@ -351,17 +352,17 @@ TEST_F(DatabaseTest, RenameCollectionPreservesUuidOfSourceCollectionAndUpdatesUu
 
         auto fromUuid = UUID::gen();
 
-        auto&& uuidCatalog = UUIDCatalog::get(opCtx);
-        ASSERT_EQUALS(NamespaceString(), uuidCatalog.lookupNSSByUUID(fromUuid));
+        auto&& catalog = CollectionCatalog::get(opCtx);
+        ASSERT_EQUALS(boost::none, catalog.lookupNSSByUUID(fromUuid));
 
         WriteUnitOfWork wuow(opCtx);
         CollectionOptions fromCollectionOptions;
         fromCollectionOptions.uuid = fromUuid;
-        ASSERT_TRUE(db->createCollection(opCtx, fromNss.ns(), fromCollectionOptions));
-        ASSERT_EQUALS(fromNss, uuidCatalog.lookupNSSByUUID(fromUuid));
+        ASSERT_TRUE(db->createCollection(opCtx, fromNss, fromCollectionOptions));
+        ASSERT_EQUALS(fromNss, *catalog.lookupNSSByUUID(fromUuid));
 
         auto stayTemp = false;
-        ASSERT_OK(db->renameCollection(opCtx, fromNss.ns(), toNss.ns(), stayTemp));
+        ASSERT_OK(db->renameCollection(opCtx, fromNss, toNss, stayTemp));
 
         ASSERT_FALSE(db->getCollection(opCtx, fromNss));
         auto toCollection = db->getCollection(opCtx, toNss);
@@ -374,7 +375,7 @@ TEST_F(DatabaseTest, RenameCollectionPreservesUuidOfSourceCollectionAndUpdatesUu
         ASSERT_TRUE(toUuid);
         ASSERT_EQUALS(fromUuid, *toUuid);
 
-        ASSERT_EQUALS(toNss, uuidCatalog.lookupNSSByUUID(*toUuid));
+        ASSERT_EQUALS(toNss, *catalog.lookupNSSByUUID(*toUuid));
 
         wuow.commit();
     });
@@ -428,7 +429,7 @@ TEST_F(DatabaseTest, MakeUniqueCollectionNamespaceReplacesPercentSignsWithRandom
         // collections in the database for collisions while generating the namespace.
         {
             WriteUnitOfWork wuow(_opCtx.get());
-            ASSERT_TRUE(db->createCollection(_opCtx.get(), nss1.ns()));
+            ASSERT_TRUE(db->createCollection(_opCtx.get(), nss1));
             wuow.commit();
         }
 
@@ -465,7 +466,7 @@ TEST_F(
         for (const auto c : charsToChooseFrom) {
             NamespaceString nss(_nss.db(), model.substr(0, model.find('%')) + std::string(1U, c));
             WriteUnitOfWork wuow(_opCtx.get());
-            ASSERT_TRUE(db->createCollection(_opCtx.get(), nss.ns()));
+            ASSERT_TRUE(db->createCollection(_opCtx.get(), nss));
             wuow.commit();
         }
 
@@ -504,7 +505,7 @@ TEST_F(DatabaseTest, AutoGetCollectionForReadCommandSucceedsWithDeadlineNow) {
     NamespaceString nss("test", "coll");
     Lock::DBLock dbLock(_opCtx.get(), nss.db(), MODE_X);
     ASSERT(_opCtx.get()->lockState()->isDbLockedForMode(nss.db(), MODE_X));
-    Lock::CollectionLock collLock(_opCtx.get()->lockState(), nss.toString(), MODE_X);
+    Lock::CollectionLock collLock(_opCtx.get(), nss, MODE_X);
     ASSERT(_opCtx.get()->lockState()->isCollectionLockedForMode(nss, MODE_X));
     try {
         AutoGetCollectionForReadCommand db(
@@ -518,7 +519,7 @@ TEST_F(DatabaseTest, AutoGetCollectionForReadCommandSucceedsWithDeadlineMin) {
     NamespaceString nss("test", "coll");
     Lock::DBLock dbLock(_opCtx.get(), nss.db(), MODE_X);
     ASSERT(_opCtx.get()->lockState()->isDbLockedForMode(nss.db(), MODE_X));
-    Lock::CollectionLock collLock(_opCtx.get()->lockState(), nss.toString(), MODE_X);
+    Lock::CollectionLock collLock(_opCtx.get(), nss, MODE_X);
     ASSERT(_opCtx.get()->lockState()->isCollectionLockedForMode(nss, MODE_X));
     try {
         AutoGetCollectionForReadCommand db(
@@ -544,7 +545,7 @@ TEST_F(DatabaseTest, CreateCollectionProhibitsReplicatedCollectionsWithoutIdInde
             options.setNoIdIndex();
 
             ASSERT_THROWS_CODE_AND_WHAT(
-                db->createCollection(_opCtx.get(), _nss.ns(), options),
+                db->createCollection(_opCtx.get(), _nss, options),
                 AssertionException,
                 50001,
                 (StringBuilder() << "autoIndexId:false is not allowed for collection " << _nss

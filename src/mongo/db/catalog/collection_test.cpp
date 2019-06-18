@@ -67,13 +67,12 @@ void CollectionTest::makeUncapped(NamespaceString nss) {
 void CollectionTest::checkValidate(
     Collection* coll, bool valid, int records, int invalid, int errors) {
     auto opCtx = operationContext();
-    auto collLock =
-        std::make_unique<Lock::CollectionLock>(opCtx->lockState(), coll->ns().ns(), MODE_X);
+    auto collLock = std::make_unique<Lock::CollectionLock>(opCtx, coll->ns(), MODE_X);
 
     for (auto level : levels) {
         ValidateResults results;
         BSONObjBuilder output;
-        auto status = coll->validate(opCtx, level, false, std::move(collLock), &results, &output);
+        auto status = coll->validate(opCtx, level, false, &results, &output);
         ASSERT_OK(status);
         ASSERT_EQ(results.valid, valid);
         ASSERT_EQ(results.errors.size(), (long unsigned int)errors);

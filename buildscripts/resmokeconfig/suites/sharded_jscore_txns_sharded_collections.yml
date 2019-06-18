@@ -8,7 +8,7 @@ selector:
   - jstests/core/txns/transactions_profiling_with_drops.js
 
   # No featureCompatibilityVersion parameter on mongos.
-  - jstests/core/txns/abort_transactions_on_FCV_downgrade.js
+  - jstests/core/txns/abort_unprepared_transactions_on_FCV_downgrade.js
 
   # Mongos doesn't upconvert from local or majority level readConcern to snapshot.
   - jstests/core/txns/upconvert_read_concern.js
@@ -33,11 +33,12 @@ selector:
   # Uses hangAfterCollectionInserts failpoint not available on mongos.
   - jstests/core/txns/speculative_snapshot_includes_all_writes.js
 
-  # Cannot shard a capped collection.
-  - jstests/core/txns/ban_tailable_cursor.js
-
   # View tests aren't expected to work when collections are implicitly sharded.
   - jstests/core/txns/view_reads_in_transaction.js
+
+  # Empty commit/abort is currently allowed in mongos.
+  # TODO: SERVER-40885: unblacklist this.
+  - jstests/core/txns/empty_commit_abort.js
 
   exclude_with_any_tags:
   - assumes_against_mongod_not_mongos
@@ -46,6 +47,8 @@ selector:
   - assumes_no_implicit_index_creation
   - assumes_unsharded_collection
   - cannot_create_unique_index_when_using_hashed_shard_key
+  # Transactions are not allowed to operate on capped collections on shard servers.
+  - requires_capped
   # Prepare is not a command on mongos.
   - uses_prepare_transaction
 executor:
@@ -72,7 +75,5 @@ executor:
     mongod_options:
       set_parameters:
         enableTestCommands: 1
-        # TODO SERVER-38302: Disable the no-op writer.
-        writePeriodicNoops: true
     num_rs_nodes_per_shard: 1
     num_shards: 2

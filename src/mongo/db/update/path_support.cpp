@@ -34,14 +34,13 @@
 #include "mongo/bson/mutable/document.h"
 #include "mongo/bson/mutable/element.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace pathsupport {
 
 using std::string;
-using mongoutils::str::stream;
+using str::stream;
 
 namespace {
 
@@ -54,9 +53,8 @@ Status maybePadTo(mutablebson::Element* elemArray, size_t sizeRequired) {
 
         if (toPad > kMaxPaddingAllowed) {
             return Status(ErrorCodes::CannotBackfillArray,
-                          mongoutils::str::stream() << "can't backfill more than "
-                                                    << kMaxPaddingAllowed
-                                                    << " elements");
+                          str::stream() << "can't backfill more than " << kMaxPaddingAllowed
+                                        << " elements");
         }
 
         for (size_t i = 0; i < toPad; i++) {
@@ -100,7 +98,7 @@ Status findLongestPrefix(const FieldRef& prefix,
                 break;
 
             case Array:
-                numericPart = parseUnsignedBase10Integer(prefixPart);
+                numericPart = str::parseUnsignedBase10Integer(prefixPart);
                 if (!numericPart) {
                     viable = false;
                 } else {
@@ -129,12 +127,11 @@ Status findLongestPrefix(const FieldRef& prefix,
         *idxFound = i - 1;
         *elemFound = prev;
         return Status(ErrorCodes::PathNotViable,
-                      mongoutils::str::stream() << "cannot use the part (" << prefix.getPart(i - 1)
-                                                << " of "
-                                                << prefix.dottedField()
-                                                << ") to traverse the element ({"
-                                                << curr.toString()
-                                                << "})");
+                      str::stream() << "cannot use the part (" << prefix.getPart(i - 1) << " of "
+                                    << prefix.dottedField()
+                                    << ") to traverse the element ({"
+                                    << curr.toString()
+                                    << "})");
     } else if (curr.ok()) {
         *idxFound = i - 1;
         *elemFound = curr;
@@ -174,7 +171,7 @@ StatusWith<mutablebson::Element> createPathAt(const FieldRef& prefix,
     size_t i = idxFound;
     bool inArray = false;
     if (elemFound.getType() == mongo::Array) {
-        boost::optional<size_t> newIdx = parseUnsignedBase10Integer(prefix.getPart(idxFound));
+        boost::optional<size_t> newIdx = str::parseUnsignedBase10Integer(prefix.getPart(idxFound));
         if (!newIdx) {
             return Status(ErrorCodes::PathNotViable,
                           str::stream() << "Cannot create field '" << prefix.getPart(idxFound)

@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """Setup an Android device to run the benchrun_embedded test suite."""
 
 import glob
@@ -11,7 +11,9 @@ import sys
 import tarfile
 import tempfile
 import time
-import urllib.request, urllib.parse, urllib.error
+import urllib.error
+import urllib.parse
+import urllib.request
 
 # pylint: disable=wrong-import-position
 # Get relative imports to work when the package is not installed on the PYTHONPATH.

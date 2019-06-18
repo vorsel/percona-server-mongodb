@@ -269,4 +269,38 @@ TEST(UnitTestSelfTest, StackTraceForAssertion) {
     ASSERT_STRING_CONTAINS(stacktrace, "printStackTrace");
 }
 
+TEST(UnitTestSelfTest, ComparisonAssertionOverloadResolution) {
+    using namespace mongo;
+
+    char xBuf[] = "x";  // Guaranteed different address than "x".
+    const char* x = xBuf;
+
+    // At least one StringData, compare contents:
+    ASSERT_EQ("x"_sd, "x"_sd);
+    ASSERT_EQ("x"_sd, "x");
+    ASSERT_EQ("x"_sd, xBuf);
+    ASSERT_EQ("x"_sd, x);
+    ASSERT_EQ("x", "x"_sd);
+    ASSERT_EQ(xBuf, "x"_sd);
+    ASSERT_EQ(x, "x"_sd);
+
+    // Otherwise, compare pointers:
+    ASSERT_EQ(x, x);
+    ASSERT_EQ(xBuf, xBuf);
+    ASSERT_EQ(x, xBuf);
+    ASSERT_NE("x", xBuf);
+    ASSERT_NE("x", x);
+    ASSERT_NE(xBuf, "x");
+    ASSERT_NE(x, "x");
+}
+
+ASSERT_DOES_NOT_COMPILE(typename Char = char, *std::declval<Char>());
+ASSERT_DOES_NOT_COMPILE(bool B = false, std::enable_if_t<B, int>{});
+
+// Uncomment to check that it fails when it is supposed to. Unfortunately we can't check in a test
+// that this fails when it is supposed to, only that it passes when it should.
+//
+// ASSERT_DOES_NOT_COMPILE(typename Char = char, *std::declval<Char*>());
+// ASSERT_DOES_NOT_COMPILE(bool B = true, std::enable_if_t<B, int>{});
+
 }  // namespace

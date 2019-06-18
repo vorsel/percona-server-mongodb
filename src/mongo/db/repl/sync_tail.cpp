@@ -41,10 +41,10 @@
 #include "mongo/bson/bsonelement_comparator.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/document_validation.h"
-#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands/fsync.h"
@@ -79,9 +79,9 @@
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/socket_exception.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace repl {
@@ -219,12 +219,12 @@ NamespaceString parseUUIDOrNs(OperationContext* opCtx, const OplogEntry& oplogEn
     }
 
     const auto& uuid = optionalUuid.get();
-    auto& catalog = UUIDCatalog::get(opCtx);
+    auto& catalog = CollectionCatalog::get(opCtx);
     auto nss = catalog.lookupNSSByUUID(uuid);
     uassert(ErrorCodes::NamespaceNotFound,
             str::stream() << "No namespace with UUID " << uuid.toString(),
-            !nss.isEmpty());
-    return nss;
+            nss);
+    return *nss;
 }
 
 NamespaceStringOrUUID getNsOrUUID(const NamespaceString& nss, const BSONObj& op) {
@@ -423,6 +423,11 @@ void scheduleWritesToOplog(OperationContext* opCtx,
             invariant(status);
 
             auto opCtx = cc().makeOperationContext();
+
+            // This code path is only executed on secondaries and initial syncing nodes, so it is
+            // safe to exclude any writes from Flow Control.
+            opCtx->setShouldParticipateInFlowControl(false);
+
             UnreplicatedWritesBlock uwb(opCtx.get());
             ShouldNotConflictWithSecondaryBatchApplicationBlock shouldNotConflictBlock(
                 opCtx->lockState());
@@ -488,23 +493,24 @@ public:
             return it->second;
         }
 
-        auto collProperties = getCollectionPropertiesImpl(opCtx, ns.key());
+        auto collProperties = getCollectionPropertiesImpl(opCtx, NamespaceString(ns.key()));
         _cache[ns] = collProperties;
         return collProperties;
     }
 
 private:
-    CollectionProperties getCollectionPropertiesImpl(OperationContext* opCtx, StringData ns) {
+    CollectionProperties getCollectionPropertiesImpl(OperationContext* opCtx,
+                                                     const NamespaceString& nss) {
         CollectionProperties collProperties;
 
-        Lock::DBLock dbLock(opCtx, nsToDatabaseSubstring(ns), MODE_IS);
+        Lock::DBLock dbLock(opCtx, nss.db(), MODE_IS);
         auto databaseHolder = DatabaseHolder::get(opCtx);
-        auto db = databaseHolder->getDb(opCtx, ns);
+        auto db = databaseHolder->getDb(opCtx, nss.db());
         if (!db) {
             return collProperties;
         }
 
-        auto collection = db->getCollection(opCtx, ns);
+        auto collection = db->getCollection(opCtx, nss);
         if (!collection) {
             return collProperties;
         }
@@ -728,6 +734,11 @@ void SyncTail::_oplogApplication(ReplicationCoordinator* replCoord,
         const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
         OperationContext& opCtx = *opCtxPtr;
 
+        // This code path gets used during elections, so it should not be subject to Flow Control.
+        // It is safe to exclude this operation context from Flow Control here because this code
+        // path only gets used on secondaries or on a node transitioning to primary.
+        opCtx.setShouldParticipateInFlowControl(false);
+
         // For pausing replication in tests.
         if (MONGO_FAIL_POINT(rsSyncApplyStop)) {
             log() << "sync tail - rsSyncApplyStop fail point enabled. Blocking until fail point is "
@@ -843,9 +854,11 @@ inline bool isUnpreparedCommit(const OplogEntry& entry) {
 }
 
 // Returns whether an oplog entry represents an applyOps which is a self-contained atomic operation,
-// as opposed to part of a prepared transaction.
-inline bool isUnpreparedApplyOps(const OplogEntry& entry) {
-    return entry.getCommandType() == OplogEntry::CommandType::kApplyOps && !entry.shouldPrepare();
+// or the last applyOps of an unprepared transaction, as opposed to part of a prepared transaction
+// or a non-final applyOps in an transaction.
+inline bool isCommitApplyOps(const OplogEntry& entry) {
+    return entry.getCommandType() == OplogEntry::CommandType::kApplyOps && !entry.shouldPrepare() &&
+        !entry.isPartialTransaction();
 }
 
 void SyncTail::shutdown() {
@@ -979,7 +992,7 @@ void SyncTail::fetchAndInsertMissingDocument(OperationContext* opCtx,
         } else {
             // If the oplog entry has a UUID, use it to find the collection in which to insert the
             // missing document.
-            auto& catalog = UUIDCatalog::get(opCtx);
+            auto& catalog = CollectionCatalog::get(opCtx);
             coll = catalog.lookupCollectionByUUID(*uuid);
             if (!coll) {
                 // TODO(SERVER-30819) insert this UUID into the missing UUIDs set.
@@ -1122,7 +1135,7 @@ void SyncTail::_fillWriterVectors(OperationContext* opCtx,
     const uint32_t numWriters = writerVectors->size();
 
     CachedCollectionProperties collPropertiesCache;
-    LogicalSessionIdMap<std::vector<OplogEntry*>> pendingTxnOps;
+    LogicalSessionIdMap<std::vector<OplogEntry*>> partialTxnOps;
 
     for (auto&& op : *ops) {
         // If the operation's optime is before or the same as the beginApplyingOpTime we don't want
@@ -1149,14 +1162,15 @@ void SyncTail::_fillWriterVectors(OperationContext* opCtx,
         // If this entry is part of a multi-oplog-entry transaction, ignore it until the commit.
         // We must save it here because we are not guaranteed it has been written to the oplog
         // yet.
-        if (op.isInPendingTransaction()) {
-            auto& pendingList = pendingTxnOps[*op.getSessionId()];
-            if (!pendingList.empty() && pendingList.front()->getTxnNumber() != op.getTxnNumber()) {
+        if (op.isPartialTransaction()) {
+            auto& partialTxnList = partialTxnOps[*op.getSessionId()];
+            if (!partialTxnList.empty() &&
+                partialTxnList.front()->getTxnNumber() != op.getTxnNumber()) {
                 // TODO: When abortTransaction is implemented, this should invariant and
                 // the list should be cleared on abort.
-                pendingList.clear();
+                partialTxnList.clear();
             }
-            pendingList.push_back(&op);
+            partialTxnList.push_back(&op);
             continue;
         }
 
@@ -1185,8 +1199,28 @@ void SyncTail::_fillWriterVectors(OperationContext* opCtx,
 
         // Extract applyOps operations and fill writers with extracted operations using this
         // function.
-        if (isUnpreparedApplyOps(op)) {
+        if (isCommitApplyOps(op)) {
             try {
+                // On commit of unprepared transactions, get transactional operations from the oplog
+                // and fill writers with those operations.
+                // Flush partialTxnList operations for current transaction.
+                if (auto logicalSessionId = op.getSessionId()) {
+                    auto& partialTxnList = partialTxnOps[*logicalSessionId];
+                    {
+                        // We need to use a ReadSourceScope avoid the reads of the transaction
+                        // messing up the state of the opCtx.  In particular we do not want to
+                        // set the ReadSource to kLastApplied.
+                        ReadSourceScope readSourceScope(opCtx);
+                        derivedOps->emplace_back(
+                            readTransactionOperationsFromOplogChain(opCtx, op, partialTxnList));
+                        partialTxnList.clear();
+                    }
+                    // Transaction entries cannot have different session updates.
+                    _fillWriterVectors(
+                        opCtx, &derivedOps->back(), writerVectors, derivedOps, nullptr);
+                }
+
+                // After flushing partialTxnList ops, extract remaining ops from current operation.
                 derivedOps->emplace_back(ApplyOps::extractOperations(op));
 
                 // Nested entries cannot have different session updates.
@@ -1200,27 +1234,24 @@ void SyncTail::_fillWriterVectors(OperationContext* opCtx,
             }
             continue;
         } else if (isUnpreparedCommit(op)) {
+            // TODO(SERVER-40728): Remove this block after SERVER-40676 because we will no longer
+            // emit a commitTransaction oplog entry for an unprepared transaction. This code will
+            // no longer be reachable because we will commit the unprepared transaction on the last
+            // applyOps oplog entry, which will not contain a partialTxn field.
+
             // On commit of unprepared transactions, get transactional operations from the oplog and
             // fill writers with those operations.
             try {
                 invariant(derivedOps);
-                auto& pendingList = pendingTxnOps[*op.getSessionId()];
+                auto& partialTxnList = partialTxnOps[*op.getSessionId()];
                 {
-                    // We need to create an alternate opCtx to avoid the reads of the transaction
-                    // messing up the state of the main opCtx.  In particular we do not want to
-                    // set the ReadSource to kLastApplied for the main opCtx.
-                    // TODO(SERVER-40053): This should be no longer necessary after
-                    //                     SERVER-40053 makes the transaction history iterator
-                    //                     avoid changing the read source.
-                    auto newClient =
-                        opCtx->getServiceContext()->makeClient("read-pending-transactions");
-                    AlternativeClientRegion acr(newClient);
-                    auto newOpCtx = cc().makeOperationContext();
-                    ShouldNotConflictWithSecondaryBatchApplicationBlock shouldNotConflictBlock(
-                        newOpCtx->lockState());
+                    // We need to use a ReadSourceScope avoid the reads of the transaction messing
+                    // up the state of the opCtx.  In particular we do not want to set the
+                    // ReadSource to kLastApplied.
+                    ReadSourceScope readSourceScope(opCtx);
                     derivedOps->emplace_back(
-                        readTransactionOperationsFromOplogChain(newOpCtx.get(), op, pendingList));
-                    pendingList.clear();
+                        readTransactionOperationsFromOplogChain(opCtx, op, partialTxnList));
+                    partialTxnList.clear();
                 }
                 // Transaction entries cannot have different session updates.
                 _fillWriterVectors(opCtx, &derivedOps->back(), writerVectors, derivedOps, nullptr);
@@ -1243,10 +1274,10 @@ void SyncTail::_fillWriterVectors(OperationContext* opCtx,
     }
 }
 
-void SyncTail::_fillWriterVectors(OperationContext* opCtx,
-                                  MultiApplier::Operations* ops,
-                                  std::vector<MultiApplier::OperationPtrs>* writerVectors,
-                                  std::vector<MultiApplier::Operations>* derivedOps) {
+void SyncTail::fillWriterVectors(OperationContext* opCtx,
+                                 MultiApplier::Operations* ops,
+                                 std::vector<MultiApplier::OperationPtrs>* writerVectors,
+                                 std::vector<MultiApplier::Operations>* derivedOps) {
     SessionUpdateTracker sessionUpdateTracker;
     _fillWriterVectors(opCtx, ops, writerVectors, derivedOps, &sessionUpdateTracker);
 
@@ -1274,6 +1305,11 @@ void SyncTail::_applyOps(std::vector<MultiApplier::OperationPtrs>& writerVectors
             invariant(scheduleStatus);
 
             auto opCtx = cc().makeOperationContext();
+
+            // This code path is only executed on secondaries and initial syncing nodes, so it is
+            // safe to exclude any writes from Flow Control.
+            opCtx->setShouldParticipateInFlowControl(false);
+
             status = opCtx->runWithoutInterruptionExceptAtGlobalShutdown(
                 [&] { return _applyFunc(opCtx.get(), &writer, this, &workerMultikeyPathInfo); });
         });
@@ -1323,7 +1359,7 @@ StatusWith<OpTime> SyncTail::multiApply(OperationContext* opCtx, MultiApplier::O
         std::vector<MultiApplier::Operations> derivedOps;
 
         std::vector<MultiApplier::OperationPtrs> writerVectors(_writerPool->getStats().numThreads);
-        _fillWriterVectors(opCtx, &ops, &writerVectors, &derivedOps);
+        fillWriterVectors(opCtx, &ops, &writerVectors, &derivedOps);
 
         // Wait for writes to finish before applying ops.
         _writerPool->waitForIdle();

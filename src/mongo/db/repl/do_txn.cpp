@@ -34,10 +34,10 @@
 
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/document_validation.h"
-#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -112,21 +112,21 @@ Status _doTxn(OperationContext* opCtx,
         BSONElement e = i.next();
         const BSONObj& opObj = e.Obj();
 
-        NamespaceString nss(opObj["ns"].String());
+        boost::optional<NamespaceString> nss = NamespaceString(opObj["ns"].String());
 
         // Need to check this here, or OldClientContext may fail an invariant.
-        if (!nss.isValid())
-            return {ErrorCodes::InvalidNamespace, "invalid ns: " + nss.ns()};
+        if (!nss->isValid())
+            return {ErrorCodes::InvalidNamespace, "invalid ns: " + nss->ns()};
 
         Status status(ErrorCodes::InternalError, "");
 
-        AutoGetDb autoDb(opCtx, nss.db(), MODE_IX);
+        AutoGetDb autoDb(opCtx, nss->db(), MODE_IX);
         auto db = autoDb.getDb();
         if (!db) {
             uasserted(ErrorCodes::NamespaceNotFound,
                       str::stream() << "cannot apply insert, delete, or update operation on a "
                                        "non-existent namespace "
-                                    << nss.ns()
+                                    << nss->ns()
                                     << ": "
                                     << mongo::redact(opObj));
         }
@@ -135,27 +135,27 @@ Status _doTxn(OperationContext* opCtx,
             auto uuidStatus = UUID::parse(opObj["ui"]);
             uassertStatusOK(uuidStatus.getStatus());
             // If "ui" is present, it overrides "nss" for the collection name.
-            nss = UUIDCatalog::get(opCtx).lookupNSSByUUID(uuidStatus.getValue());
+            nss = CollectionCatalog::get(opCtx).lookupNSSByUUID(uuidStatus.getValue());
             uassert(ErrorCodes::NamespaceNotFound,
                     str::stream() << "cannot find collection uuid " << uuidStatus.getValue(),
-                    !nss.isEmpty());
+                    nss);
         }
-        Lock::CollectionLock collLock(opCtx->lockState(), nss.ns(), MODE_IX);
-        auto collection = db->getCollection(opCtx, nss);
+        Lock::CollectionLock collLock(opCtx, *nss, MODE_IX);
+        auto collection = db->getCollection(opCtx, *nss);
 
         // When processing an update on a non-existent collection, applyOperation_inlock()
         // returns UpdateOperationFailed on updates and allows the collection to be
         // implicitly created on upserts. We detect both cases here and fail early with
         // NamespaceNotFound.
         // Additionally for inserts, we fail early on non-existent collections.
-        if (!collection && ViewCatalog::get(db)->lookup(opCtx, nss.ns())) {
+        if (!collection && ViewCatalog::get(db)->lookup(opCtx, nss->ns())) {
             uasserted(ErrorCodes::CommandNotSupportedOnView,
                       str::stream() << "doTxn not supported on a view: " << redact(opObj));
         }
         if (!collection) {
             uasserted(ErrorCodes::NamespaceNotFound,
                       str::stream() << "cannot apply operation on a non-existent namespace "
-                                    << nss.ns()
+                                    << nss->ns()
                                     << " with doTxn: "
                                     << redact(opObj));
         }

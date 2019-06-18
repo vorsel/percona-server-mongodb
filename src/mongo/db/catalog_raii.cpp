@@ -31,8 +31,8 @@
 
 #include "mongo/db/catalog_raii.h"
 
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/database_holder.h"
-#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/s/database_sharding_state.h"
 #include "mongo/db/views/view_catalog.h"
 #include "mongo/util/fail_point_service.h"
@@ -75,7 +75,17 @@ AutoGetCollection::AutoGetCollection(OperationContext* opCtx,
               modeDB,
               deadline),
       _resolvedNss(resolveNamespaceStringOrUUID(opCtx, nsOrUUID)) {
-    _collLock.emplace(opCtx->lockState(), _resolvedNss.ns(), modeColl, deadline);
+
+    NamespaceString prevResolvedNss;
+    do {
+        _collLock.emplace(opCtx, _resolvedNss, modeColl, deadline);
+
+        // We looked up nsOrUUID without a collection lock so it's possible that the
+        // collection is dropped now. Look it up again.
+        prevResolvedNss = _resolvedNss;
+        _resolvedNss = resolveNamespaceStringOrUUID(opCtx, nsOrUUID);
+    } while (_resolvedNss != prevResolvedNss);
+
     // Wait for a configured amount of time after acquiring locks if the failpoint is enabled
     MONGO_FAIL_POINT_BLOCK(setAutoGetCollectionWait, customWait) {
         const BSONObj& data = customWait.getData();
@@ -140,23 +150,27 @@ AutoGetCollection::AutoGetCollection(OperationContext* opCtx,
 
 NamespaceString AutoGetCollection::resolveNamespaceStringOrUUID(OperationContext* opCtx,
                                                                 NamespaceStringOrUUID nsOrUUID) {
-    if (nsOrUUID.nss())
-        return *nsOrUUID.nss();
+    if (auto& nss = nsOrUUID.nss()) {
+        uassert(ErrorCodes::InvalidNamespace,
+                str::stream() << "Namespace " << *nss << " is not a valid collection name",
+                nss->isValid());
+        return *nss;
+    }
 
-    UUIDCatalog& uuidCatalog = UUIDCatalog::get(opCtx);
-    auto resolvedNss = uuidCatalog.lookupNSSByUUID(*nsOrUUID.uuid());
+    CollectionCatalog& catalog = CollectionCatalog::get(opCtx);
+    auto resolvedNss = catalog.lookupNSSByUUID(*nsOrUUID.uuid());
 
     uassert(ErrorCodes::NamespaceNotFound,
             str::stream() << "Unable to resolve " << nsOrUUID.toString(),
-            resolvedNss.isValid());
+            resolvedNss && resolvedNss->isValid());
 
     uassert(ErrorCodes::NamespaceNotFound,
             str::stream() << "UUID " << nsOrUUID.toString() << " specified in " << nsOrUUID.dbname()
                           << " resolved to a collection in a different database: "
-                          << resolvedNss.toString(),
-            resolvedNss.db() == nsOrUUID.dbname());
+                          << *resolvedNss,
+            resolvedNss->db() == nsOrUUID.dbname());
 
-    return resolvedNss;
+    return *resolvedNss;
 }
 
 AutoGetOrCreateDb::AutoGetOrCreateDb(OperationContext* opCtx,
@@ -183,14 +197,14 @@ AutoGetOrCreateDb::AutoGetOrCreateDb(OperationContext* opCtx,
     dss.checkDbVersion(opCtx, dssLock);
 }
 
-ConcealUUIDCatalogChangesBlock::ConcealUUIDCatalogChangesBlock(OperationContext* opCtx)
+ConcealCollectionCatalogChangesBlock::ConcealCollectionCatalogChangesBlock(OperationContext* opCtx)
     : _opCtx(opCtx) {
-    UUIDCatalog::get(_opCtx).onCloseCatalog(_opCtx);
+    CollectionCatalog::get(_opCtx).onCloseCatalog(_opCtx);
 }
 
-ConcealUUIDCatalogChangesBlock::~ConcealUUIDCatalogChangesBlock() {
+ConcealCollectionCatalogChangesBlock::~ConcealCollectionCatalogChangesBlock() {
     invariant(_opCtx);
-    UUIDCatalog::get(_opCtx).onOpenCatalog(_opCtx);
+    CollectionCatalog::get(_opCtx).onOpenCatalog(_opCtx);
 }
 
 ReadSourceScope::ReadSourceScope(OperationContext* opCtx)

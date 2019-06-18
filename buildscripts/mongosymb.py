@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """Script and library for symbolizing MongoDB stack traces.
 
 To use as a script, paste the JSON object on the line after ----- BEGIN BACKTRACE ----- into the
@@ -102,7 +102,7 @@ def symbolize_frames(  # pylint: disable=too-many-locals
     for frame in frames:
         if frame["path"] is None:
             continue
-        symbolizer_process.stdin.write("CODE %(path)s 0x%(addr)X\n" % frame)
+        symbolizer_process.stdin.write("CODE {path:s} 0x{addr:X}\n".format(**frame).encode())
         symbolizer_process.stdin.flush()
         frame["symbinfo"] = extract_symbols(symbolizer_process.stdout)
     symbolizer_process.stdin.close()

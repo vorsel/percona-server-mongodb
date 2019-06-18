@@ -85,6 +85,16 @@
     }
 
     /**
+     * Sets that the given command should return the given response. The command will not actually
+     * be run.
+     */
+    function setCommandMockResponse(cmdName, mockResponse) {
+        assert(!runCommandOverrideBlacklistedCommands.includes(cmdName));
+
+        cmdResponseOverrides[cmdName] = {responseObj: mockResponse};
+    }
+
+    /**
      * Sets that the given command should fail with ok:1 and the given write concern error.
      * The command will not actually be run.
      */
@@ -285,8 +295,10 @@
      * Runs a specific test case, resetting test state before and after.
      */
     function runTest(testSuite, testCase) {
-        coll1.drop();
-        coll2.drop();
+        // Drop with majority write concern to ensure transactions in subsequent test cases can
+        // immediately take locks on either collection.
+        coll1.drop({writeConcern: {w: "majority"}});
+        coll2.drop({writeConcern: {w: "majority"}});
 
         // Ensure all overrides and failpoints have been turned off before running the test.
         clearAllCommandOverrides();
@@ -514,6 +526,405 @@
               // both be storage-rolled-back and the count would be 0. We test that the count is 1
               // to prove that the inserts are not in a transaction.
               assert.eq(coll1.find().itcount(), 1);
+          }
+        },
+        {
+          name: "transaction commands not retried on retryable code",
+          test: function() {
+              const session = testDB.getSession();
+
+              assert.commandWorked(testDB.createCollection(collName1));
+              failCommandWithFailPoint(["update"], {errorCode: ErrorCodes.NotMaster});
+
+              assert.commandWorked(coll1.insert({_id: 1}));
+              assert.eq(coll1.find().toArray(), [{_id: 1}]);
+
+              session.startTransaction();
+              assert.commandFailedWithCode(
+                  testDB.runCommand(
+                      {update: collName1, updates: [{q: {_id: 1}, u: {$inc: {x: 1}}}]}),
+                  ErrorCodes.NotMaster);
+              assert.commandFailedWithCode(session.abortTransaction_forTesting(),
+                                           ErrorCodes.NoSuchTransaction);
+
+              assert.eq(coll1.find().toArray(), [{_id: 1}]);
+          }
+        },
+        {
+          name: "transaction commands not retried on network error",
+          test: function() {
+              const session = testDB.getSession();
+
+              assert.commandWorked(testDB.createCollection(collName1));
+              failCommandWithFailPoint(["update"], {closeConnection: true});
+
+              assert.commandWorked(coll1.insert({_id: 1}));
+              assert.eq(coll1.find().toArray(), [{_id: 1}]);
+
+              session.startTransaction();
+              const error = assert.throws(() => {
+                  return testDB.runCommand(
+                      {update: collName1, updates: [{q: {_id: 1}, u: {$inc: {x: 1}}}]});
+              });
+              assert(isNetworkError(error), tojson(error));
+              assert.commandFailedWithCode(session.abortTransaction_forTesting(),
+                                           ErrorCodes.NoSuchTransaction);
+
+              assert.eq(coll1.find().toArray(), [{_id: 1}]);
+          }
+        },
+        {
+          name: "commitTransaction retried on retryable code",
+          test: function() {
+              const session = testDB.getSession();
+
+              assert.commandWorked(testDB.createCollection(collName1));
+              failCommandWithFailPoint(["commitTransaction"], {errorCode: ErrorCodes.NotMaster});
+
+              session.startTransaction();
+              assert.commandWorked(coll1.insert({_id: 1}));
+              assert.eq(coll1.find().toArray(), [{_id: 1}]);
+
+              assert.commandWorked(session.commitTransaction_forTesting());
+
+              assert.eq(coll1.find().toArray(), [{_id: 1}]);
+          }
+        },
+        {
+          name: "commitTransaction retried on write concern error",
+          test: function() {
+              const session = testDB.getSession();
+
+              assert.commandWorked(testDB.createCollection(collName1));
+              failCommandWithFailPoint(["commitTransaction"], {
+                  writeConcernError:
+                      {code: ErrorCodes.PrimarySteppedDown, codeName: "PrimarySteppedDown"}
+              });
+
+              session.startTransaction();
+              assert.commandWorked(coll1.insert({_id: 1}));
+              assert.eq(coll1.find().toArray(), [{_id: 1}]);
+
+              const res = assert.commandWorked(session.commitTransaction_forTesting());
+              assert(!res.hasOwnProperty("writeConcernError"));
+
+              assert.eq(coll1.find().itcount(), 1);
+          }
+        },
+        {
+          name: "commitTransaction not retried on transient transaction error",
+          test: function() {
+              const session = testDB.getSession();
+
+              assert.commandWorked(testDB.createCollection(collName1));
+
+              session.startTransaction();
+              assert.commandWorked(coll1.insert({_id: 1}));
+              assert.eq(coll1.find().toArray(), [{_id: 1}]);
+
+              // Abort the transaction so the commit receives NoSuchTransaction. Note that the fail
+              // command failpoint isn't used because it returns without implicitly aborting the
+              // transaction.
+              const lsid = session.getSessionId();
+              const txnNumber = NumberLong(session.getTxnNumber_forTesting());
+              assert.commandWorked(testDB.adminCommand(
+                  {abortTransaction: 1, lsid, txnNumber, autocommit: false, stmtId: NumberInt(0)}));
+
+              const res = assert.commandFailedWithCode(session.commitTransaction_forTesting(),
+                                                       ErrorCodes.NoSuchTransaction);
+              assert.eq(["TransientTransactionError"], res.errorLabels);
+
+              assert.eq(coll1.find().itcount(), 0);
+          }
+        },
+        {
+          name: "commitTransaction retried on network error",
+          test: function() {
+              const session = testDB.getSession();
+
+              assert.commandWorked(testDB.createCollection(collName1));
+              failCommandWithFailPoint(["commitTransaction"], {closeConnection: true});
+
+              session.startTransaction();
+              assert.commandWorked(coll1.insert({_id: 1}));
+              assert.eq(coll1.find().toArray(), [{_id: 1}]);
+
+              assert.commandWorked(session.commitTransaction_forTesting());
+
+              assert.eq(coll1.find().toArray(), [{_id: 1}]);
+          }
+        },
+        {
+          name: "abortTransaction retried on retryable code",
+          test: function() {
+              const session = testDB.getSession();
+
+              assert.commandWorked(testDB.createCollection(collName1));
+              failCommandWithFailPoint(["abortTransaction"], {errorCode: ErrorCodes.NotMaster});
+
+              session.startTransaction();
+              assert.commandWorked(coll1.insert({_id: 1}));
+              assert.eq(coll1.find().toArray(), [{_id: 1}]);
+
+              assert.commandWorked(session.abortTransaction_forTesting());
+
+              assert.eq(coll1.find().itcount(), 0);
+          }
+        },
+        {
+          name: "abortTransaction retried on network error",
+          test: function() {
+              const session = testDB.getSession();
+
+              assert.commandWorked(testDB.createCollection(collName1));
+              failCommandWithFailPoint(["abortTransaction"], {closeConnection: true});
+
+              session.startTransaction();
+              assert.commandWorked(coll1.insert({_id: 1}));
+              assert.eq(coll1.find().toArray(), [{_id: 1}]);
+
+              assert.commandWorked(session.abortTransaction_forTesting());
+
+              assert.eq(coll1.find().itcount(), 0);
+          }
+        },
+        {
+          name: "abortTransaction retried on write concern error",
+          test: function() {
+              const session = testDB.getSession();
+
+              assert.commandWorked(testDB.createCollection(collName1));
+              failCommandWithFailPoint(["abortTransaction"], {
+                  writeConcernError:
+                      {code: ErrorCodes.PrimarySteppedDown, codeName: "PrimarySteppedDown"}
+              });
+
+              session.startTransaction();
+              assert.commandWorked(coll1.insert({_id: 1}));
+              assert.eq(coll1.find().toArray(), [{_id: 1}]);
+
+              // The fail command fail point with a write concern error triggers after the command
+              // is processed, so the retry will find the transaction has already aborted and return
+              // NoSuchTransaction.
+              const res = assert.commandFailedWithCode(session.abortTransaction_forTesting(),
+                                                       ErrorCodes.NoSuchTransaction);
+              assert(!res.hasOwnProperty("writeConcernError"));
+
+              assert.eq(coll1.find().itcount(), 0);
+          }
+        },
+        {
+          name: "abortTransaction not retried on transient transaction error",
+          test: function() {
+              const session = testDB.getSession();
+
+              assert.commandWorked(testDB.createCollection(collName1));
+
+              session.startTransaction();
+              assert.commandWorked(coll1.insert({_id: 1}));
+              assert.eq(coll1.find().toArray(), [{_id: 1}]);
+
+              // Abort the transaction so the commit receives NoSuchTransaction. Note that the fail
+              // command failpoint isn't used because it returns without implicitly aborting the
+              // transaction.
+              const lsid = session.getSessionId();
+              const txnNumber = NumberLong(session.getTxnNumber_forTesting());
+              assert.commandWorked(testDB.adminCommand(
+                  {abortTransaction: 1, lsid, txnNumber, autocommit: false, stmtId: NumberInt(0)}));
+
+              const res = assert.commandFailedWithCode(session.abortTransaction_forTesting(),
+                                                       ErrorCodes.NoSuchTransaction);
+              assert.eq(["TransientTransactionError"], res.errorLabels);
+
+              assert.eq(coll1.find().itcount(), 0);
+          }
+        },
+        {
+          name: "raw response w/ one retryable error",
+          test: function() {
+              setCommandMockResponse("createIndexes", {
+                  ok: 0,
+                  raw: {
+                      shardOne: {code: ErrorCodes.NotMaster, errmsg: "dummy"},
+                      shardTwo: {code: ErrorCodes.InternalError, errmsg: "dummy"}
+                  }
+              });
+
+              assert.commandWorked(testDB.createCollection(collName1));
+
+              // The first attempt should fail, but the retry succeeds.
+              assert.commandWorked(coll1.createIndex({x: 1}));
+
+              // The index should exist.
+              const indexes = coll1.getIndexes();
+              assert.eq(2, indexes.length, tojson(indexes));
+              assert(indexes.some(idx => idx.name === "x_1"), tojson(indexes));
+          }
+        },
+        {
+          name: "raw response w/ one retryable error and one success",
+          test: function() {
+              setCommandMockResponse("createIndexes", {
+                  ok: 0,
+                  raw: {
+                      // Raw responses only omit a top-level code if more than one error was
+                      // returned from a shard, so a third shard is needed.
+                      shardOne: {code: ErrorCodes.NotMaster, errmsg: "dummy"},
+                      shardTwo: {ok: 1},
+                      shardThree: {code: ErrorCodes.InternalError, errmsg: "dummy"},
+                  }
+              });
+
+              assert.commandWorked(testDB.createCollection(collName1));
+
+              // The first attempt should fail, but the retry succeeds.
+              assert.commandWorked(coll1.createIndex({x: 1}));
+
+              // The index should exist.
+              const indexes = coll1.getIndexes();
+              assert.eq(2, indexes.length, tojson(indexes));
+              assert(indexes.some(idx => idx.name === "x_1"), tojson(indexes));
+          }
+        },
+        {
+          name: "raw response w/ one network error",
+          test: function() {
+              setCommandMockResponse("createIndexes", {
+                  ok: 0,
+                  raw: {
+                      shardOne: {code: ErrorCodes.InternalError, errmsg: "dummy"},
+                      shardTwo: {code: ErrorCodes.HostUnreachable, errmsg: "dummy"}
+                  }
+              });
+
+              assert.commandWorked(testDB.createCollection(collName1));
+
+              // The first attempt should fail, but the retry succeeds.
+              assert.commandWorked(coll1.createIndex({x: 1}));
+
+              // The index should exist.
+              const indexes = coll1.getIndexes();
+              assert.eq(2, indexes.length, tojson(indexes));
+              assert(indexes.some(idx => idx.name === "x_1"), tojson(indexes));
+          }
+        },
+        {
+          name: "raw response ok:1 w/ retryable write concern error",
+          test: function() {
+              // The first encountered write concern error from a shard is attached as the top-level
+              // write concern error.
+              setCommandMockResponse("createIndexes", {
+                  ok: 1,
+                  raw: {
+                      shardOne: {
+                          ok: 1,
+                          writeConcernError: {
+                              code: ErrorCodes.PrimarySteppedDown,
+                              codeName: "PrimarySteppedDown",
+                              errmsg: "dummy"
+                          }
+                      },
+                      shardTwo: {ok: 1}
+                  },
+                  writeConcernError: {
+                      code: ErrorCodes.PrimarySteppedDown,
+                      codeName: "PrimarySteppedDown",
+                      errmsg: "dummy"
+                  }
+              });
+
+              assert.commandWorked(testDB.createCollection(collName1));
+
+              // The first attempt should fail, but the retry succeeds.
+              assert.commandWorked(coll1.createIndex({x: 1}));
+
+              // The index should exist.
+              const indexes = coll1.getIndexes();
+              assert.eq(2, indexes.length, tojson(indexes));
+              assert(indexes.some(idx => idx.name === "x_1"), tojson(indexes));
+          }
+        },
+        {
+          name: "raw response w/ no retryable error",
+          test: function() {
+              setCommandMockResponse("createIndexes", {
+                  ok: 0,
+                  raw: {
+                      shardOne: {code: ErrorCodes.InvalidOptions, errmsg: "dummy"},
+                      shardTwo: {code: ErrorCodes.InternalError, errmsg: "dummy"}
+                  }
+              });
+
+              assert.commandWorked(testDB.createCollection(collName1));
+              assert.commandFailed(coll1.createIndex({x: 1}));
+          }
+        },
+        {
+          name: "raw response w/ only acceptable errors",
+          test: function() {
+              setCommandMockResponse("createIndexes", {
+                  ok: 0,
+                  code: ErrorCodes.IndexAlreadyExists,
+                  raw: {
+                      shardOne: {code: ErrorCodes.IndexAlreadyExists, errmsg: "dummy"},
+                      shardTwo: {ok: 1},
+                      shardThree: {code: ErrorCodes.IndexAlreadyExists, errmsg: "dummy"}
+                  }
+              });
+
+              assert.commandWorked(testDB.createCollection(collName1));
+              assert.commandWorked(coll1.createIndex({x: 1}));
+          }
+        },
+        {
+          name: "raw response w/ acceptable error and non-acceptable, non-retryable error",
+          test: function() {
+              setCommandMockResponse("createIndexes", {
+                  ok: 0,
+                  raw: {
+                      shardOne: {code: ErrorCodes.IndexAlreadyExists, errmsg: "dummy"},
+                      shardTwo: {code: ErrorCodes.InternalError, errmsg: "dummy"}
+                  }
+              });
+
+              // "Acceptable" errors are not overridden inside raw reponses.
+              assert.commandWorked(testDB.createCollection(collName1));
+              const res = assert.commandFailed(coll1.createIndex({x: 1}));
+              assert(!res.raw.shardOne.ok, tojson(res));
+          }
+        },
+        {
+          name: "shardCollection retryable code buried in error message",
+          test: function() {
+              setCommandMockResponse("shardCollection", {
+                  ok: 0,
+                  code: ErrorCodes.OperationFailed,
+                  errmsg: "Sharding collection failed :: caused by InterruptedDueToStepdown",
+              });
+
+              // Mock a successful response for the retry, since sharding isn't enabled on the
+              // underlying replica set.
+              attachPostCmdFunction("shardCollection", function() {
+                  setCommandMockResponse("shardCollection", {
+                      ok: 1,
+                  });
+              });
+
+              assert.commandWorked(
+                  testDB.runCommand({shardCollection: "dummy_namespace", key: {_id: 1}}));
+          }
+        },
+        {
+          name: "drop retryable code buried in error message",
+          test: function() {
+              setCommandMockResponse("drop", {
+                  ok: 0,
+                  code: ErrorCodes.OperationFailed,
+                  errmsg: "Dropping collection failed :: caused by ShutdownInProgress",
+              });
+
+              assert.commandWorked(testDB.createCollection(collName1));
+              assert.commandWorked(testDB.runCommand({drop: collName1}));
           }
         },
     ];

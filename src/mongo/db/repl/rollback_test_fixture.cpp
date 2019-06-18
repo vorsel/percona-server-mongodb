@@ -49,7 +49,7 @@
 #include "mongo/logger/log_component.h"
 #include "mongo/logger/logger.h"
 #include "mongo/stdx/memory.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace repl {
@@ -195,8 +195,8 @@ Collection* RollbackTest::_createCollection(OperationContext* opCtx,
     auto databaseHolder = DatabaseHolder::get(opCtx);
     auto db = databaseHolder->openDb(opCtx, nss.db());
     ASSERT_TRUE(db);
-    db->dropCollection(opCtx, nss.ns()).transitional_ignore();
-    auto coll = db->createCollection(opCtx, nss.ns(), options);
+    db->dropCollection(opCtx, nss).transitional_ignore();
+    auto coll = db->createCollection(opCtx, nss, options);
     ASSERT_TRUE(coll);
     wuow.commit();
     return coll;
@@ -276,8 +276,8 @@ void RollbackResyncsCollectionOptionsTest::resyncCollectionOptionsTest(
                                 remoteCollOptionsObj,
                                 BSON("collMod"
                                      << "coll"
-                                     << "noPadding"
-                                     << false),
+                                     << "validationLevel"
+                                     << "strict"),
                                 "coll");
 }
 void RollbackResyncsCollectionOptionsTest::resyncCollectionOptionsTest(

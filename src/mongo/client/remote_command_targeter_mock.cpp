@@ -58,15 +58,20 @@ StatusWith<HostAndPort> RemoteCommandTargeterMock::findHost(OperationContext* op
     return _findHostReturnValue;
 }
 
-SharedSemiFuture<HostAndPort> RemoteCommandTargeterMock::findHostWithMaxWait(
+SemiFuture<HostAndPort> RemoteCommandTargeterMock::findHostWithMaxWait(
     const ReadPreferenceSetting& readPref, Milliseconds maxTime) {
 
     return _findHostReturnValue;
 }
 
-void RemoteCommandTargeterMock::markHostNotMaster(const HostAndPort& host, const Status& status) {}
+void RemoteCommandTargeterMock::markHostNotMaster(const HostAndPort& host, const Status& status) {
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    _hostsMarkedDown.insert(host);
+}
 
 void RemoteCommandTargeterMock::markHostUnreachable(const HostAndPort& host, const Status& status) {
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    _hostsMarkedDown.insert(host);
 }
 
 void RemoteCommandTargeterMock::setConnectionStringReturnValue(const ConnectionString returnValue) {
@@ -75,6 +80,13 @@ void RemoteCommandTargeterMock::setConnectionStringReturnValue(const ConnectionS
 
 void RemoteCommandTargeterMock::setFindHostReturnValue(StatusWith<HostAndPort> returnValue) {
     _findHostReturnValue = std::move(returnValue);
+}
+
+std::set<HostAndPort> RemoteCommandTargeterMock::getAndClearMarkedDownHosts() {
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    auto hostsMarkedDown = _hostsMarkedDown;
+    _hostsMarkedDown.clear();
+    return hostsMarkedDown;
 }
 
 }  // namespace mongo

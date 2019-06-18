@@ -110,7 +110,8 @@ void makeUpdateRequest(const OperationContext* opCtx,
                        UpdateRequest* requestOut) {
     requestOut->setQuery(args.getQuery());
     requestOut->setProj(args.getFields());
-    requestOut->setUpdates(args.getUpdateObj());
+    invariant(args.getUpdate());
+    requestOut->setUpdateModification(*args.getUpdate());
     requestOut->setSort(args.getSort());
     requestOut->setCollation(args.getCollation());
     requestOut->setArrayFilters(args.getArrayFilters());
@@ -304,8 +305,9 @@ public:
         OpDebug* const opDebug = &curOp->debug();
 
         boost::optional<DisableDocumentValidation> maybeDisableValidation;
-        if (shouldBypassDocumentValidationForCommand(cmdObj))
+        if (shouldBypassDocumentValidationForCommand(cmdObj)) {
             maybeDisableValidation.emplace(opCtx);
+        }
 
         const auto txnParticipant = TransactionParticipant::get(opCtx);
         const auto inTransaction = txnParticipant && txnParticipant.inMultiDocumentTransaction();

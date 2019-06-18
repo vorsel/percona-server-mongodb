@@ -34,7 +34,9 @@
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/util/bson_extract.h"
+#include "mongo/db/command_generic_argument.h"
 #include "mongo/db/write_concern.h"
+#include "mongo/idl/idl_parser.h"
 
 namespace mongo {
 
@@ -52,40 +54,44 @@ const char kUpsertField[] = "upsert";
 const char kWriteConcernField[] = "writeConcern";
 
 const std::vector<BSONObj> emptyArrayFilters{};
+
+const std::vector<StringData> _knownFields{
+    FindAndModifyRequest::kBypassDocumentValidationFieldName,
+    FindAndModifyRequest::kLegacyCommandName,
+    FindAndModifyRequest::kCommandName,
+};
 }  // unnamed namespace
 
-FindAndModifyRequest::FindAndModifyRequest(NamespaceString fullNs, BSONObj query, BSONObj updateObj)
-    : _ns(std::move(fullNs)),
-      _query(query.getOwned()),
-      _updateObj(updateObj.getOwned()),
-      _isRemove(false) {}
+FindAndModifyRequest::FindAndModifyRequest(NamespaceString fullNs,
+                                           BSONObj query,
+                                           boost::optional<write_ops::UpdateModification> update)
+    : _ns(std::move(fullNs)), _query(query.getOwned()), _update(std::move(update)) {}
 
 FindAndModifyRequest FindAndModifyRequest::makeUpdate(NamespaceString fullNs,
                                                       BSONObj query,
-                                                      BSONObj updateObj) {
-    return FindAndModifyRequest(fullNs, query, updateObj);
+                                                      write_ops::UpdateModification update) {
+    return FindAndModifyRequest(fullNs, query, std::move(update));
 }
 
 FindAndModifyRequest FindAndModifyRequest::makeRemove(NamespaceString fullNs, BSONObj query) {
-    FindAndModifyRequest request(fullNs, query, BSONObj());
-    request._isRemove = true;
+    FindAndModifyRequest request(fullNs, query, {});
     return request;
 }
 
-BSONObj FindAndModifyRequest::toBSON() const {
+BSONObj FindAndModifyRequest::toBSON(const BSONObj& commandPassthroughFields) const {
     BSONObjBuilder builder;
 
     builder.append(kCmdName, _ns.coll());
     builder.append(kQueryField, _query);
 
-    if (_isRemove) {
-        builder.append(kRemoveField, true);
-    } else {
-        builder.append(kUpdateField, _updateObj);
+    if (_update) {
+        _update->serializeToBSON(kUpdateField, &builder);
 
         if (_isUpsert) {
             builder.append(kUpsertField, _isUpsert.get());
         }
+    } else {
+        builder.append(kRemoveField, true);
     }
 
     if (_fieldProjection) {
@@ -116,62 +122,83 @@ BSONObj FindAndModifyRequest::toBSON() const {
         builder.append(kWriteConcernField, _writeConcern->toBSON());
     }
 
+    IDLParserErrorContext::appendGenericCommandArguments(
+        commandPassthroughFields, _knownFields, &builder);
+
     return builder.obj();
 }
 
 StatusWith<FindAndModifyRequest> FindAndModifyRequest::parseFromBSON(NamespaceString fullNs,
                                                                      const BSONObj& cmdObj) {
-    BSONObj query = cmdObj.getObjectField(kQueryField);
-    BSONObj fields = cmdObj.getObjectField(kFieldProjectionField);
-    BSONObj updateObj = cmdObj.getObjectField(kUpdateField);
-    BSONObj sort = cmdObj.getObjectField(kSortField);
+    BSONObj query;
+    BSONObj fields;
+    BSONObj updateObj;
+    BSONObj sort;
+    boost::optional<write_ops::UpdateModification> update;
 
     BSONObj collation;
-    {
-        BSONElement collationElt;
-        Status collationEltStatus =
-            bsonExtractTypedField(cmdObj, kCollationField, BSONType::Object, &collationElt);
-        if (!collationEltStatus.isOK() && (collationEltStatus != ErrorCodes::NoSuchKey)) {
-            return collationEltStatus;
-        }
-        if (collationEltStatus.isOK()) {
-            collation = collationElt.Obj();
-        }
-    }
-
-    std::vector<BSONObj> arrayFilters;
+    bool shouldReturnNew = false;
+    bool isUpsert = false;
+    bool isRemove = false;
     bool arrayFiltersSet = false;
-    {
-        BSONElement arrayFiltersElt;
-        Status arrayFiltersEltStatus =
-            bsonExtractTypedField(cmdObj, kArrayFiltersField, BSONType::Array, &arrayFiltersElt);
-        if (!arrayFiltersEltStatus.isOK() && (arrayFiltersEltStatus != ErrorCodes::NoSuchKey)) {
-            return arrayFiltersEltStatus;
-        }
-        if (arrayFiltersEltStatus.isOK()) {
-            arrayFiltersSet = true;
-            for (auto arrayFilter : arrayFiltersElt.Obj()) {
-                if (arrayFilter.type() != BSONType::Object) {
-                    return {ErrorCodes::TypeMismatch,
-                            str::stream() << "Each array filter must be an object, found "
-                                          << arrayFilter.type()};
-                }
-                arrayFilters.push_back(arrayFilter.Obj());
+    std::vector<BSONObj> arrayFilters;
+
+    for (auto&& field : cmdObj.getFieldNames<std::set<std::string>>()) {
+        if (field == kQueryField) {
+            query = cmdObj.getObjectField(kQueryField);
+        } else if (field == kSortField) {
+            sort = cmdObj.getObjectField(kSortField);
+        } else if (field == kRemoveField) {
+            isRemove = cmdObj[kRemoveField].trueValue();
+        } else if (field == kUpdateField) {
+            update = write_ops::UpdateModification::parseFromBSON(cmdObj[kUpdateField]);
+        } else if (field == kNewField) {
+            shouldReturnNew = cmdObj[kNewField].trueValue();
+        } else if (field == kFieldProjectionField) {
+            fields = cmdObj.getObjectField(kFieldProjectionField);
+        } else if (field == kUpsertField) {
+            isUpsert = cmdObj[kUpsertField].trueValue();
+        } else if (field == kCollationField) {
+            BSONElement collationElt;
+            Status collationEltStatus =
+                bsonExtractTypedField(cmdObj, kCollationField, BSONType::Object, &collationElt);
+            if (!collationEltStatus.isOK() && (collationEltStatus != ErrorCodes::NoSuchKey)) {
+                return collationEltStatus;
             }
+            if (collationEltStatus.isOK()) {
+                collation = collationElt.Obj();
+            }
+        } else if (field == kArrayFiltersField) {
+            BSONElement arrayFiltersElt;
+            Status arrayFiltersEltStatus = bsonExtractTypedField(
+                cmdObj, kArrayFiltersField, BSONType::Array, &arrayFiltersElt);
+            if (!arrayFiltersEltStatus.isOK() && (arrayFiltersEltStatus != ErrorCodes::NoSuchKey)) {
+                return arrayFiltersEltStatus;
+            }
+            if (arrayFiltersEltStatus.isOK()) {
+                arrayFiltersSet = true;
+                for (auto arrayFilter : arrayFiltersElt.Obj()) {
+                    if (arrayFilter.type() != BSONType::Object) {
+                        return {ErrorCodes::TypeMismatch,
+                                str::stream() << "Each array filter must be an object, found "
+                                              << arrayFilter.type()};
+                    }
+                    arrayFilters.push_back(arrayFilter.Obj());
+                }
+            }
+        } else if (!isGenericArgument(field) &&
+                   !std::count(_knownFields.begin(), _knownFields.end(), field)) {
+            return {ErrorCodes::Error(51177),
+                    str::stream() << "BSON field '" << field << "' is an unknown field."};
         }
     }
 
-    bool shouldReturnNew = cmdObj[kNewField].trueValue();
-    bool isUpsert = cmdObj[kUpsertField].trueValue();
-    bool isRemove = cmdObj[kRemoveField].trueValue();
-    bool isUpdate = cmdObj.hasField(kUpdateField);
-
-    if (!isRemove && !isUpdate) {
+    if (!isRemove && !update) {
         return {ErrorCodes::FailedToParse, "Either an update or remove=true must be specified"};
     }
 
     if (isRemove) {
-        if (isUpdate) {
+        if (update) {
             return {ErrorCodes::FailedToParse, "Cannot specify both an update and remove=true"};
         }
 
@@ -190,12 +217,18 @@ StatusWith<FindAndModifyRequest> FindAndModifyRequest::parseFromBSON(NamespaceSt
         }
     }
 
-    FindAndModifyRequest request(std::move(fullNs), query, updateObj);
-    request._isRemove = isRemove;
+    if (update && update->type() == write_ops::UpdateModification::Type::kPipeline &&
+        arrayFiltersSet) {
+        return {ErrorCodes::FailedToParse, "Cannot specify arrayFilters and a pipeline update"};
+    }
+
+    FindAndModifyRequest request(std::move(fullNs), query, std::move(update));
     request.setFieldProjection(fields);
     request.setSort(sort);
     request.setCollation(collation);
-    request.setArrayFilters(std::move(arrayFilters));
+    if (arrayFiltersSet) {
+        request.setArrayFilters(std::move(arrayFilters));
+    }
 
     if (!isRemove) {
         request.setShouldReturnNew(shouldReturnNew);
@@ -228,16 +261,16 @@ void FindAndModifyRequest::setQuery(BSONObj query) {
     _query = query.getOwned();
 }
 void FindAndModifyRequest::setUpdateObj(BSONObj updateObj) {
-    _updateObj = updateObj.getOwned();
+    _update.emplace(updateObj.getOwned());
 }
 
 void FindAndModifyRequest::setShouldReturnNew(bool shouldReturnNew) {
-    dassert(!_isRemove);
+    dassert(_update);
     _shouldReturnNew = shouldReturnNew;
 }
 
 void FindAndModifyRequest::setUpsert(bool upsert) {
-    dassert(!_isRemove);
+    dassert(_update);
     _isUpsert = upsert;
 }
 
@@ -257,8 +290,8 @@ BSONObj FindAndModifyRequest::getFields() const {
     return _fieldProjection.value_or(BSONObj());
 }
 
-BSONObj FindAndModifyRequest::getUpdateObj() const {
-    return _updateObj;
+const boost::optional<write_ops::UpdateModification>& FindAndModifyRequest::getUpdate() const {
+    return _update;
 }
 
 BSONObj FindAndModifyRequest::getSort() const {
@@ -285,6 +318,6 @@ bool FindAndModifyRequest::isUpsert() const {
 }
 
 bool FindAndModifyRequest::isRemove() const {
-    return _isRemove;
+    return !static_cast<bool>(_update);
 }
 }

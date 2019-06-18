@@ -31,7 +31,6 @@
 
 #include "mongo/db/matcher/expression_parser.h"
 
-#include <boost/container/flat_set.hpp>
 #include <pcrecpp.h>
 
 #include "mongo/base/init.h"
@@ -67,7 +66,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/stdx/memory.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 #include "mongo/util/string_map.h"
 
 namespace {
@@ -115,81 +114,6 @@ enum class DocumentParseLevel {
     // document or a subdocument inside an array.
     kUserSubDocument,
 };
-
-StatusWith<long long> MatchExpressionParser::parseIntegerElementToNonNegativeLong(
-    BSONElement elem) {
-    auto number = parseIntegerElementToLong(elem);
-    if (!number.isOK()) {
-        return number;
-    }
-
-    if (number.getValue() < 0) {
-        return Status(ErrorCodes::FailedToParse,
-                      str::stream() << "Expected a positive number in: " << elem);
-    }
-
-    return number;
-}
-
-StatusWith<long long> MatchExpressionParser::parseIntegerElementToLong(BSONElement elem) {
-    if (!elem.isNumber()) {
-        return Status(ErrorCodes::FailedToParse, str::stream() << "Expected a number in: " << elem);
-    }
-
-    long long number = 0;
-    if (elem.type() == BSONType::NumberDouble) {
-        auto eDouble = elem.numberDouble();
-
-        // NaN doubles are rejected.
-        if (std::isnan(eDouble)) {
-            return Status(ErrorCodes::FailedToParse,
-                          str::stream() << "Expected an integer, but found NaN in: " << elem);
-        }
-
-        // No integral doubles that are too large to be represented as a 64 bit signed integer.
-        // We use 'kLongLongMaxAsDouble' because if we just did eDouble > 2^63-1, it would be
-        // compared against 2^63. eDouble=2^63 would not get caught that way.
-        if (eDouble >= BSONElement::kLongLongMaxPlusOneAsDouble ||
-            eDouble < std::numeric_limits<long long>::min()) {
-            return Status(ErrorCodes::FailedToParse,
-                          str::stream() << "Cannot represent as a 64-bit integer: " << elem);
-        }
-
-        // This checks if elem is an integral double.
-        if (eDouble != static_cast<double>(static_cast<long long>(eDouble))) {
-            return Status(ErrorCodes::FailedToParse,
-                          str::stream() << "Expected an integer: " << elem);
-        }
-
-        number = elem.numberLong();
-    } else if (elem.type() == BSONType::NumberDecimal) {
-        uint32_t signalingFlags = Decimal128::kNoFlag;
-        number = elem.numberDecimal().toLongExact(&signalingFlags);
-        if (signalingFlags != Decimal128::kNoFlag) {
-            return Status(ErrorCodes::FailedToParse,
-                          str::stream() << "Cannot represent as a 64-bit integer: " << elem);
-        }
-    } else {
-        number = elem.numberLong();
-    }
-
-    return number;
-}
-
-StatusWith<int> MatchExpressionParser::parseIntegerElementToInt(BSONElement elem) {
-    auto parsedLong = MatchExpressionParser::parseIntegerElementToLong(elem);
-    if (!parsedLong.isOK()) {
-        return parsedLong.getStatus();
-    }
-
-    auto valueLong = parsedLong.getValue();
-    if (valueLong < std::numeric_limits<int>::min() ||
-        valueLong > std::numeric_limits<int>::max()) {
-        return {ErrorCodes::FailedToParse,
-                str::stream() << "Cannot represent " << elem << " in an int"};
-    }
-    return static_cast<int>(valueLong);
-}
 
 namespace {
 
@@ -476,7 +400,7 @@ StatusWithMatchExpression parseAlwaysBoolean(
     const ExtensionsCallback* extensionsCallback,
     MatchExpressionParser::AllowedFeatureSet allowedFeatures,
     DocumentParseLevel currentLevel) {
-    auto statusWithLong = MatchExpressionParser::parseIntegerElementToLong(elem);
+    auto statusWithLong = elem.parseIntegerElementToLong();
     if (!statusWithLong.isOK()) {
         return statusWithLong.getStatus();
     }
@@ -700,7 +624,7 @@ StatusWithMatchExpression parseBitTest(StringData name, BSONElement e) {
         bitTestMatchExpression = stdx::make_unique<T>(name, std::move(bitPositions.getValue()));
     } else if (e.isNumber()) {
         // Integer bitmask provided as value.
-        auto bitMask = MatchExpressionParser::parseIntegerElementToNonNegativeLong(e);
+        auto bitMask = e.parseIntegerElementToNonNegativeLong();
         if (!bitMask.isOK()) {
             return bitMask.getStatus();
         }
@@ -783,7 +707,7 @@ StatusWithMatchExpression parseInternalSchemaRootDocEq(
 template <class T>
 StatusWithMatchExpression parseInternalSchemaSingleIntegerArgument(StringData name,
                                                                    BSONElement elem) {
-    auto parsedInt = MatchExpressionParser::parseIntegerElementToNonNegativeLong(elem);
+    auto parsedInt = elem.parseIntegerElementToNonNegativeLong();
     if (!parsedInt.isOK()) {
         return parsedInt.getStatus();
     }
@@ -803,7 +727,7 @@ StatusWithMatchExpression parseTopLevelInternalSchemaSingleIntegerArgument(
     const ExtensionsCallback* extensionsCallback,
     MatchExpressionParser::AllowedFeatureSet allowedFeatures,
     DocumentParseLevel currentLevel) {
-    auto parsedInt = MatchExpressionParser::parseIntegerElementToNonNegativeLong(elem);
+    auto parsedInt = elem.parseIntegerElementToNonNegativeLong();
     if (!parsedInt.isOK()) {
         return parsedInt.getStatus();
     }
@@ -964,7 +888,7 @@ parsePatternProperties(BSONElement patternPropertiesElem,
     return std::move(patternProperties);
 }
 
-StatusWith<boost::container::flat_set<StringData>> parseProperties(BSONElement propertiesElem) {
+StatusWith<StringDataSet> parseProperties(BSONElement propertiesElem) {
     if (!propertiesElem) {
         return {ErrorCodes::FailedToParse,
                 str::stream() << InternalSchemaAllowedPropertiesMatchExpression::kName
@@ -976,7 +900,7 @@ StatusWith<boost::container::flat_set<StringData>> parseProperties(BSONElement p
                               << propertiesElem.type()};
     }
 
-    std::vector<StringData> properties;
+    StringDataSet properties;
     for (auto property : propertiesElem.embeddedObject()) {
         if (property.type() != BSONType::String) {
             return {
@@ -985,10 +909,10 @@ StatusWith<boost::container::flat_set<StringData>> parseProperties(BSONElement p
                               << " requires 'properties' to be an array of strings, but found a "
                               << property.type()};
         }
-        properties.push_back(property.valueStringData());
+        properties.insert(property.valueStringData());
     }
 
-    return boost::container::flat_set<StringData>(properties.begin(), properties.end());
+    return std::move(properties);
 }
 
 StatusWithMatchExpression parseInternalSchemaAllowedProperties(
@@ -1076,7 +1000,7 @@ StatusWithMatchExpression parseInternalSchemaMatchArrayIndex(
                                  "'namePlaceholder' and 'expression'"};
     }
 
-    auto index = MatchExpressionParser::parseIntegerElementToNonNegativeLong(subobj["index"]);
+    auto index = subobj["index"].parseIntegerElementToNonNegativeLong();
     if (!index.isOK()) {
         return index.getStatus();
     }
@@ -1393,7 +1317,7 @@ StatusWithMatchExpression parseInternalSchemaBinDataSubType(StringData name, BSO
                                     << " must be represented as a number");
     }
 
-    auto valueAsInt = MatchExpressionParser::parseIntegerElementToInt(e);
+    auto valueAsInt = e.parseIntegerElementToInt();
     if (!valueAsInt.isOK()) {
         return Status(ErrorCodes::FailedToParse,
                       str::stream() << "Invalid numerical BinData subtype value for "
@@ -1411,33 +1335,6 @@ StatusWithMatchExpression parseInternalSchemaBinDataSubType(StringData name, BSO
 
     return {stdx::make_unique<InternalSchemaBinDataSubTypeExpression>(
         name, static_cast<BinDataType>(valueAsInt.getValue()))};
-}
-
-StatusWithMatchExpression parseInternalSchemaBinDataEncryptedType(StringData name, BSONElement e) {
-    if (!e.isNumber()) {
-        return Status(ErrorCodes::FailedToParse,
-                      str::stream() << InternalSchemaBinDataEncryptedTypeExpression::kName
-                                    << " must be represented as a number");
-    }
-
-    auto valueAsInt = MatchExpressionParser::parseIntegerElementToInt(e);
-    if (!valueAsInt.isOK()) {
-        return Status(ErrorCodes::FailedToParse,
-                      str::stream() << "Invalid numerical type code for "
-                                    << InternalSchemaBinDataEncryptedTypeExpression::kName
-                                    << ": "
-                                    << e.number());
-    }
-
-    if (!isValidBSONType(valueAsInt.getValue())) {
-        return Status(ErrorCodes::FailedToParse,
-                      str::stream() << InternalSchemaBinDataEncryptedTypeExpression::kName
-                                    << " value must represent a valid BSON type: "
-                                    << valueAsInt.getValue());
-    }
-
-    return {stdx::make_unique<InternalSchemaBinDataEncryptedTypeExpression>(
-        name, static_cast<BSONType>(valueAsInt.getValue()))};
 }
 
 /**
@@ -1712,7 +1609,7 @@ StatusWithMatchExpression parseSubField(const BSONObj& context,
                                   << " must be an array of size 2");
             }
             auto first = iter.next();
-            auto parsedIndex = MatchExpressionParser::parseIntegerElementToNonNegativeLong(first);
+            auto parsedIndex = first.parseIntegerElementToNonNegativeLong();
             if (!parsedIndex.isOK()) {
                 return Status(ErrorCodes::TypeMismatch,
                               str::stream()
@@ -1769,7 +1666,7 @@ StatusWithMatchExpression parseSubField(const BSONObj& context,
         }
 
         case PathAcceptingKeyword::INTERNAL_SCHEMA_BIN_DATA_ENCRYPTED_TYPE: {
-            return parseInternalSchemaBinDataEncryptedType(name, e);
+            return parseType<InternalSchemaBinDataEncryptedTypeExpression>(name, e);
         }
 
         case PathAcceptingKeyword::INTERNAL_SCHEMA_BIN_DATA_SUBTYPE: {

@@ -60,7 +60,8 @@ public:
 
     void setCollator(const CollatorInterface* collator) final {}
 
-    ApplyResult apply(ApplyParams applyParams) const final {
+    ApplyResult apply(ApplyParams applyParams,
+                      UpdateNodeApplyParams updateNodeApplyParams) const final {
         return ApplyResult::noopResult();
     }
 

@@ -29,12 +29,12 @@
 
 #include "mongo/db/exec/and_hash.h"
 
-#include "mongo/db/exec/and_common-inl.h"
+#include "mongo/db/exec/and_common.h"
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/stdx/memory.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace {
 
@@ -165,7 +165,7 @@ PlanStage::StageState AndHashStage::doWork(WorkingSetID* out) {
     if (_hashingChildren) {
         // Check memory usage of previously hashed results.
         if (_memUsage > _maxMemUsage) {
-            mongoutils::str::stream ss;
+            str::stream ss;
             ss << "hashed AND stage buffered data usage of " << _memUsage
                << " bytes exceeds internal limit of " << kDefaultMaxMemUsageBytes << " bytes";
             Status status(ErrorCodes::Overflow, ss);

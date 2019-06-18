@@ -6,9 +6,10 @@
  * See the file LICENSE for redistribution information.
  */
 
-#define	WT_TXN_NONE	0		/* No txn running in a session. */
-#define	WT_TXN_FIRST	1		/* First transaction to run. */
-#define	WT_TXN_ABORTED	UINT64_MAX	/* Update rolled back, ignore. */
+#define	WT_TXN_NONE	0			/* Beginning of time */
+#define	WT_TXN_FIRST	1			/* First transaction to run */
+#define	WT_TXN_MAX	(UINT64_MAX - 10)	/* End of time */
+#define	WT_TXN_ABORTED	UINT64_MAX		/* Update rolled back */
 
 /* AUTOMATIC FLAG VALUE GENERATION START */
 #define	WT_TXN_LOG_CKPT_CLEANUP	0x01u
@@ -21,6 +22,12 @@
 /* AUTOMATIC FLAG VALUE GENERATION START */
 #define	WT_TXN_OLDEST_STRICT	0x1u
 #define	WT_TXN_OLDEST_WAIT	0x2u
+/* AUTOMATIC FLAG VALUE GENERATION STOP */
+
+/* AUTOMATIC FLAG VALUE GENERATION START */
+#define	WT_TXN_TS_ALREADY_LOCKED	0x1u
+#define	WT_TXN_TS_INCLUDE_CKPT		0x2u
+#define	WT_TXN_TS_INCLUDE_OLDEST	0x4u
 /* AUTOMATIC FLAG VALUE GENERATION STOP */
 
 /*

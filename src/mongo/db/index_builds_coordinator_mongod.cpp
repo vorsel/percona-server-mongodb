@@ -33,7 +33,7 @@
 
 #include "mongo/db/index_builds_coordinator_mongod.h"
 
-#include "mongo/db/catalog/uuid_catalog.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index_build_entry_helpers.h"
@@ -41,7 +41,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -295,8 +295,12 @@ Status IndexBuildsCoordinatorMongod::setCommitQuorum(OperationContext* opCtx,
 
     // Persist the new commit quorum for the index build and write it to the collection.
     buildState->commitQuorum = newCommitQuorum;
-    const UUID buildUUID = buildState->buildUUID;
-    return indexbuildentryhelpers::setCommitQuorum(opCtx, buildUUID, newCommitQuorum);
+    // TODO (SERVER-40807): disabling the following code for the v4.2 release so it does not have
+    // downstream impact.
+    /*
+    return indexbuildentryhelpers::setCommitQuorum(opCtx, buildState->buildUUID, newCommitQuorum);
+    */
+    return Status::OK();
 }
 
 Status IndexBuildsCoordinatorMongod::_finishScanningPhase() {

@@ -31,7 +31,7 @@
 
 #include <memory>
 
-#include "mongo/db/catalog/uuid_catalog.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/op_observer_registry.h"
@@ -45,7 +45,7 @@
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/unittest/death_test.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace {
 

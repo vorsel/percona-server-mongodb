@@ -43,14 +43,12 @@
 #include "mongo/util/duration.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
 #include "mongo/util/string_map.h"
-#include "mongo/util/stringutils.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
-namespace str = mongoutils::str;
 
 using std::dec;
 using std::hex;
@@ -70,11 +68,11 @@ void BSONElement::jsonStringStream(JsonStringFormat format,
                                    int pretty,
                                    std::stringstream& s) const {
     if (includeFieldNames)
-        s << '"' << escape(fieldName()) << "\" : ";
+        s << '"' << str::escape(fieldName()) << "\" : ";
     switch (type()) {
         case mongo::String:
         case Symbol:
-            s << '"' << escape(string(valuestr(), valuestrsize() - 1)) << '"';
+            s << '"' << str::escape(string(valuestr(), valuestrsize() - 1)) << '"';
             break;
         case NumberLong:
             if (format == TenGen) {
@@ -272,10 +270,10 @@ void BSONElement::jsonStringStream(JsonStringFormat format,
             break;
         case RegEx:
             if (format == Strict) {
-                s << "{ \"$regex\" : \"" << escape(regex());
+                s << "{ \"$regex\" : \"" << str::escape(regex());
                 s << "\", \"$options\" : \"" << regexFlags() << "\" }";
             } else {
-                s << "/" << escape(regex(), true) << "/";
+                s << "/" << str::escape(regex(), true) << "/";
                 // FIXME Worry about alpha order?
                 for (const char* f = regexFlags(); *f; ++f) {
                     switch (*f) {
@@ -293,14 +291,14 @@ void BSONElement::jsonStringStream(JsonStringFormat format,
         case CodeWScope: {
             BSONObj scope = codeWScopeObject();
             if (!scope.isEmpty()) {
-                s << "{ \"$code\" : \"" << escape(_asCode()) << "\" , "
+                s << "{ \"$code\" : \"" << str::escape(_asCode()) << "\" , "
                   << "\"$scope\" : " << scope.jsonString() << " }";
                 break;
             }
         }
 
         case Code:
-            s << "\"" << escape(_asCode()) << "\"";
+            s << "\"" << str::escape(_asCode()) << "\"";
             break;
 
         case bsonTimestamp:
@@ -567,6 +565,84 @@ bool BSONElement::binaryEqualValues(const BSONElement& rhs) const {
     }
 
     return (valueSize == 0) || (memcmp(value(), rhs.value(), valueSize) == 0);
+}
+
+StatusWith<long long> BSONElement::parseIntegerElementToNonNegativeLong() const {
+    auto number = parseIntegerElementToLong();
+    if (!number.isOK()) {
+        return number;
+    }
+
+    if (number.getValue() < 0) {
+        return Status(ErrorCodes::FailedToParse,
+                      str::stream() << "Expected a positive number in: " << toString(true, true));
+    }
+
+    return number;
+}
+
+StatusWith<long long> BSONElement::parseIntegerElementToLong() const {
+    if (!isNumber()) {
+        return Status(ErrorCodes::FailedToParse,
+                      str::stream() << "Expected a number in: " << toString(true, true));
+    }
+
+    long long number = 0;
+    if (type() == BSONType::NumberDouble) {
+        auto eDouble = numberDouble();
+
+        // NaN doubles are rejected.
+        if (std::isnan(eDouble)) {
+            return Status(ErrorCodes::FailedToParse,
+                          str::stream() << "Expected an integer, but found NaN in: "
+                                        << toString(true, true));
+        }
+
+        // No integral doubles that are too large to be represented as a 64 bit signed integer.
+        // We use 'kLongLongMaxAsDouble' because if we just did eDouble > 2^63-1, it would be
+        // compared against 2^63. eDouble=2^63 would not get caught that way.
+        if (eDouble >= kLongLongMaxPlusOneAsDouble ||
+            eDouble < std::numeric_limits<long long>::min()) {
+            return Status(ErrorCodes::FailedToParse,
+                          str::stream() << "Cannot represent as a 64-bit integer: "
+                                        << toString(true, true));
+        }
+
+        // This checks if elem is an integral double.
+        if (eDouble != static_cast<double>(static_cast<long long>(eDouble))) {
+            return Status(ErrorCodes::FailedToParse,
+                          str::stream() << "Expected an integer: " << toString(true, true));
+        }
+
+        number = numberLong();
+    } else if (type() == BSONType::NumberDecimal) {
+        uint32_t signalingFlags = Decimal128::kNoFlag;
+        number = numberDecimal().toLongExact(&signalingFlags);
+        if (signalingFlags != Decimal128::kNoFlag) {
+            return Status(ErrorCodes::FailedToParse,
+                          str::stream() << "Cannot represent as a 64-bit integer: "
+                                        << toString(true, true));
+        }
+    } else {
+        number = numberLong();
+    }
+
+    return number;
+}
+
+StatusWith<int> BSONElement::parseIntegerElementToInt() const {
+    auto parsedLong = parseIntegerElementToLong();
+    if (!parsedLong.isOK()) {
+        return parsedLong.getStatus();
+    }
+
+    auto valueLong = parsedLong.getValue();
+    if (valueLong < std::numeric_limits<int>::min() ||
+        valueLong > std::numeric_limits<int>::max()) {
+        return {ErrorCodes::FailedToParse,
+                str::stream() << "Cannot represent " << toString(true, true) << " in an int"};
+    }
+    return static_cast<int>(valueLong);
 }
 
 BSONObj BSONElement::embeddedObjectUserCheck() const {

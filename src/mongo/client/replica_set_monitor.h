@@ -37,6 +37,7 @@
 
 #include "mongo/base/string_data.h"
 #include "mongo/client/mongo_uri.h"
+#include "mongo/client/replica_set_change_notifier.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/stdx/functional.h"
@@ -62,16 +63,9 @@ class ReplicaSetMonitor : public std::enable_shared_from_this<ReplicaSetMonitor>
 public:
     class Refresher;
 
-    typedef stdx::function<void(const std::string& setName, const std::string& newConnectionString)>
-        ConfigChangeHook;
-
     /**
-     * Initializes local state.
-     *
-     * seeds must not be empty.
+     * Initializes local state from a MongoURI.
      */
-    ReplicaSetMonitor(StringData name, const std::set<HostAndPort>& seeds);
-
     ReplicaSetMonitor(const MongoURI& uri);
 
     /**
@@ -93,8 +87,8 @@ public:
      * Known errors are:
      *  FailedToSatisfyReadPreference, if node cannot be found, which matches the read preference.
      */
-    SharedSemiFuture<HostAndPort> getHostOrRefresh(const ReadPreferenceSetting& readPref,
-                                                   Milliseconds maxWait = kDefaultFindHostTimeout);
+    SemiFuture<HostAndPort> getHostOrRefresh(const ReadPreferenceSetting& readPref,
+                                             Milliseconds maxWait = kDefaultFindHostTimeout);
 
     /**
      * Returns the host we think is the current master or uasserts.
@@ -198,27 +192,9 @@ public:
     static void remove(const std::string& name);
 
     /**
-     * Sets the hook to be called whenever the config of any replica set changes.
-     * Currently only 1 globally, so this asserts if one already exists.
-     *
-     * The hook will be called from a fresh thread. It is responsible for initializing any
-     * thread-local state and ensuring that no exceptions escape.
-     *
-     * The hook must not be changed while the program has multiple threads.
+     * Returns the change notifier for the underlying ReplicaMonitorManager
      */
-    static void setAsynchronousConfigChangeHook(ConfigChangeHook hook);
-
-    /**
-     * Sets the hook to be called whenever the config of any replica set changes.
-     * Currently only 1 globally, so this asserts if one already exists.
-     *
-     * The hook will be called inline while refreshing the ReplicaSetMonitor's view of the set
-     * membership.  It is important that the hook not block for long as it will be running under
-     * the ReplicaSetMonitor's mutex.
-     *
-     * The hook must not be changed while the program has multiple threads.
-     */
-    static void setSynchronousConfigChangeHook(ConfigChangeHook hook);
+    static ReplicaSetChangeNotifier& getNotifier();
 
     /**
      * Permanently stops all monitoring on replica sets and clears all cached information
@@ -256,7 +232,7 @@ public:
     /**
      * Allows tests to set initial conditions and introspect the current state.
      */
-    explicit ReplicaSetMonitor(const SetStatePtr& initialState) : _state(initialState) {}
+    explicit ReplicaSetMonitor(const SetStatePtr& initialState);
     ~ReplicaSetMonitor();
 
     /**
@@ -384,7 +360,6 @@ private:
     /**
      * Adjusts the _scan work queue based on information from this host.
      * This should only be called with replies from non-masters.
-     * Does not update _set at all.
      */
     void receivedIsMasterBeforeFoundMaster(const IsMasterReply& reply);
 

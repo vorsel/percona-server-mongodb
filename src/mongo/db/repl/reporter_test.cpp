@@ -72,8 +72,12 @@ public:
             BSONObjBuilder entry(arrayBuilder.subobjStart());
             itr.second.lastDurableOpTime.append(&entry,
                                                 UpdatePositionArgs::kDurableOpTimeFieldName);
+            entry.appendDate(UpdatePositionArgs::kDurableWallTimeFieldName,
+                             Date_t::min() + Seconds(itr.second.lastDurableOpTime.getSecs()));
             itr.second.lastAppliedOpTime.append(&entry,
                                                 UpdatePositionArgs::kAppliedOpTimeFieldName);
+            entry.appendDate(UpdatePositionArgs::kAppliedWallTimeFieldName,
+                             Date_t::min() + Seconds(itr.second.lastAppliedOpTime.getSecs()));
             entry.append(UpdatePositionArgs::kMemberIdFieldName, itr.first);
             if (_configVersion != -1) {
                 entry.append(UpdatePositionArgs::kConfigVersionFieldName, _configVersion);
@@ -578,7 +582,7 @@ TEST_F(ReporterTestNoTriggerAtSetUp,
         TaskExecutorWithFailureInScheduleWork(executor::TaskExecutor* executor)
             : unittest::TaskExecutorProxy(executor) {}
         virtual StatusWith<executor::TaskExecutor::CallbackHandle> scheduleWork(
-            CallbackFn work) override {
+            CallbackFn&& override) {
             return Status(ErrorCodes::OperationFailed, "failed to schedule work");
         }
     };
@@ -630,7 +634,7 @@ TEST_F(ReporterTest, FailingToScheduleTimeoutShouldMakeReporterInactive) {
         TaskExecutorWithFailureInScheduleWorkAt(executor::TaskExecutor* executor)
             : unittest::TaskExecutorProxy(executor) {}
         virtual StatusWith<executor::TaskExecutor::CallbackHandle> scheduleWorkAt(
-            Date_t when, CallbackFn work) override {
+            Date_t when, CallbackFn&&) override {
             return Status(ErrorCodes::OperationFailed, "failed to schedule work");
         }
     };

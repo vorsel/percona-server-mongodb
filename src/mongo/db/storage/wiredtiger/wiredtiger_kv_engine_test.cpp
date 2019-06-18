@@ -43,6 +43,7 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_global_options.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
+#include "mongo/logger/logger.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
@@ -118,14 +119,14 @@ public:
 TEST_F(WiredTigerKVEngineRepairTest, OrphanedDataFilesCanBeRecovered) {
     auto opCtxPtr = makeOperationContext();
 
-    std::string ns = "a.b";
+    NamespaceString nss("a.b");
     std::string ident = "collection-1234";
     std::string record = "abcd";
     CollectionOptions options;
 
     std::unique_ptr<RecordStore> rs;
-    ASSERT_OK(_engine->createRecordStore(opCtxPtr.get(), ns, ident, options));
-    rs = _engine->getRecordStore(opCtxPtr.get(), ns, ident, options);
+    ASSERT_OK(_engine->createRecordStore(opCtxPtr.get(), nss.ns(), ident, options));
+    rs = _engine->getRecordStore(opCtxPtr.get(), nss.ns(), ident, options);
     ASSERT(rs);
 
     RecordId loc;
@@ -148,7 +149,7 @@ TEST_F(WiredTigerKVEngineRepairTest, OrphanedDataFilesCanBeRecovered) {
     ASSERT(!boost::filesystem::exists(tmpFile));
 
 #ifdef _WIN32
-    auto status = _engine->recoverOrphanedIdent(opCtxPtr.get(), ns, ident, options);
+    auto status = _engine->recoverOrphanedIdent(opCtxPtr.get(), nss, ident, options);
     ASSERT_EQ(ErrorCodes::CommandNotSupported, status.code());
 #else
     // Move the data file out of the way so the ident can be dropped. This not permitted on Windows
@@ -165,7 +166,7 @@ TEST_F(WiredTigerKVEngineRepairTest, OrphanedDataFilesCanBeRecovered) {
     boost::filesystem::rename(tmpFile, *dataFilePath, err);
     ASSERT(!err) << err.message();
 
-    auto status = _engine->recoverOrphanedIdent(opCtxPtr.get(), ns, ident, options);
+    auto status = _engine->recoverOrphanedIdent(opCtxPtr.get(), nss, ident, options);
     ASSERT_EQ(ErrorCodes::DataModifiedByRepair, status.code());
 #endif
 }
@@ -173,14 +174,14 @@ TEST_F(WiredTigerKVEngineRepairTest, OrphanedDataFilesCanBeRecovered) {
 TEST_F(WiredTigerKVEngineRepairTest, UnrecoverableOrphanedDataFilesAreRebuilt) {
     auto opCtxPtr = makeOperationContext();
 
-    std::string ns = "a.b";
+    NamespaceString nss("a.b");
     std::string ident = "collection-1234";
     std::string record = "abcd";
     CollectionOptions options;
 
     std::unique_ptr<RecordStore> rs;
-    ASSERT_OK(_engine->createRecordStore(opCtxPtr.get(), ns, ident, options));
-    rs = _engine->getRecordStore(opCtxPtr.get(), ns, ident, options);
+    ASSERT_OK(_engine->createRecordStore(opCtxPtr.get(), nss.ns(), ident, options));
+    rs = _engine->getRecordStore(opCtxPtr.get(), nss.ns(), ident, options);
     ASSERT(rs);
 
     RecordId loc;
@@ -202,7 +203,7 @@ TEST_F(WiredTigerKVEngineRepairTest, UnrecoverableOrphanedDataFilesAreRebuilt) {
     ASSERT_OK(_engine->dropIdent(opCtxPtr.get(), ident));
 
 #ifdef _WIN32
-    auto status = _engine->recoverOrphanedIdent(opCtxPtr.get(), ns, ident, options);
+    auto status = _engine->recoverOrphanedIdent(opCtxPtr.get(), nss, ident, options);
     ASSERT_EQ(ErrorCodes::CommandNotSupported, status.code());
 #else
     // The ident may not get immediately dropped, so ensure it is completely gone.
@@ -220,13 +221,13 @@ TEST_F(WiredTigerKVEngineRepairTest, UnrecoverableOrphanedDataFilesAreRebuilt) {
 
     // This should recreate an empty data file successfully and move the old one to a name that ends
     // in ".corrupt".
-    auto status = _engine->recoverOrphanedIdent(opCtxPtr.get(), ns, ident, options);
+    auto status = _engine->recoverOrphanedIdent(opCtxPtr.get(), nss, ident, options);
     ASSERT_EQ(ErrorCodes::DataModifiedByRepair, status.code()) << status.reason();
 
     boost::filesystem::path corruptFile = (dataFilePath->string() + ".corrupt");
     ASSERT(boost::filesystem::exists(corruptFile));
 
-    rs = _engine->getRecordStore(opCtxPtr.get(), ns, ident, options);
+    rs = _engine->getRecordStore(opCtxPtr.get(), nss.ns(), ident, options);
     RecordData data;
     ASSERT_FALSE(rs->findRecord(opCtxPtr.get(), loc, &data));
 #endif
@@ -239,6 +240,14 @@ TEST_F(WiredTigerKVEngineTest, TestOplogTruncation) {
     // CheckpointThread will observe the new `checkpointDelaySecs` value.
     _engine->setInitialDataTimestamp(Timestamp(1, 1));
     wiredTigerGlobalOptions.checkpointDelaySecs = 1;
+
+    // To diagnose any intermittent failures, maximize logging from WiredTigerKVEngine and friends.
+    const auto kStorage = logger::LogComponent::kStorage;
+    auto originalVerbosity = logger::globalLogDomain()->getMinimumLogSeverity(kStorage);
+    logger::globalLogDomain()->setMinimumLoggedSeverity(kStorage, logger::LogSeverity::Debug(3));
+    ON_BLOCK_EXIT([&]() {
+        logger::globalLogDomain()->setMinimumLoggedSeverity(kStorage, originalVerbosity);
+    });
 
     // Simulate the callback that queries config.transactions for the oldest active transaction.
     boost::optional<Timestamp> oldestActiveTxnTimestamp;

@@ -158,6 +158,14 @@ public:
         return _wuowNestingLevel > 0;
     }
 
+    bool wasGlobalLockTakenForWrite() const override;
+
+    bool wasGlobalLockTakenInModeConflictingWithWrites() const override;
+
+    bool wasGlobalLockTaken() const override;
+
+    void setGlobalLockTakenInMode(LockMode mode) override;
+
     /**
      * Requests a lock for resource 'resId' with mode 'mode'. An OperationContext 'opCtx' must be
      * provided to interrupt waiting on the locker condition variable that indicates status of
@@ -196,9 +204,12 @@ public:
         restoreLockState(nullptr, stateToRestore);
     }
 
-    bool releaseWriteUnitOfWork(LockSnapshot* stateOut) override;
-    void restoreWriteUnitOfWork(OperationContext* opCtx,
-                                const LockSnapshot& stateToRestore) override;
+    bool releaseWriteUnitOfWorkAndUnlock(LockSnapshot* stateOut) override;
+    void restoreWriteUnitOfWorkAndLock(OperationContext* opCtx,
+                                       const LockSnapshot& stateToRestore) override;
+
+    void releaseWriteUnitOfWork(WUOWLockSnapshot* stateOut) override;
+    void restoreWriteUnitOfWork(const WUOWLockSnapshot& stateToRestore) override;
 
     virtual void releaseTicket();
     virtual void reacquireTicket(OperationContext* opCtx);
@@ -247,6 +258,12 @@ public:
 
     void lockComplete(ResourceId resId, LockMode mode, Date_t deadline) {
         lockComplete(nullptr, resId, mode, deadline);
+    }
+
+    void getFlowControlTicket(OperationContext* opCtx, LockMode lockMode) override;
+
+    FlowControlTicketholder::CurOp getFlowControlStats() const override {
+        return _flowControlStats;
     }
 
     /**
@@ -347,6 +364,16 @@ private:
     // for example, lock attempts will time out immediately if the lock is not immediately
     // available. Note this will be ineffective if uninterruptible lock guard is set.
     boost::optional<Milliseconds> _maxLockTimeout;
+
+    // A structure for accumulating time spent getting flow control tickets.
+    FlowControlTicketholder::CurOp _flowControlStats;
+
+    // Tracks the global lock modes ever acquired in this Locker's life. This value should only ever
+    // be accessed from the thread that owns the Locker.
+    unsigned char _globalLockMode = (1 << MODE_NONE);
+
+    // Tracks whether this operation should be killed on step down.
+    AtomicWord<bool> _wasGlobalLockTakenInModeConflictingWithWrites{false};
 
     //////////////////////////////////////////////////////////////////////////////////////////
     //

@@ -53,13 +53,13 @@
 #include "mongo/util/exit.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/private/ssl_expiration.h"
 #include "mongo/util/net/sockaddr.h"
 #include "mongo/util/net/socket_exception.h"
 #include "mongo/util/net/ssl.hpp"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/net/ssl_types.h"
+#include "mongo/util/str.h"
 #include "mongo/util/text.h"
 #include "mongo/util/uuid.h"
 
@@ -1675,13 +1675,21 @@ Status validatePeerCertificate(const std::string& remoteHost,
 
             // Give the user a hint why the certificate validation failed.
             StringBuilder certificateNames;
+            bool hasSAN = false;
             if (swAltNames.isOK() && !swAltNames.getValue().empty()) {
+                hasSAN = true;
                 for (auto& name : swAltNames.getValue()) {
                     certificateNames << name << " ";
                 }
             };
 
             certificateNames << ", Subject Name: " << *peerSubjectName;
+
+            auto swCN = peerSubjectName->getOID(kOID_CommonName);
+            if (hasSAN && swCN.isOK() &&
+                hostNameMatchForX509Certificates(remoteHost, swCN.getValue())) {
+                certificateNames << " would have matched, but was overridden by SAN";
+            }
 
             str::stream msg;
             msg << "The server certificate does not match the host name. Hostname: " << remoteHost

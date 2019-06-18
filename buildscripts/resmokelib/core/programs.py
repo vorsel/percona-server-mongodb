@@ -100,12 +100,27 @@ def mongod_program(  # pylint: disable=too-many-branches
     if "transactionLifetimeLimitSeconds" not in suite_set_parameters:
         suite_set_parameters["transactionLifetimeLimitSeconds"] = 24 * 60 * 60
 
+    # Hybrid index builds drain writes received during the build process in batches of 1000 writes
+    # by default. Not all tests perform enough writes to exercise the code path where multiple
+    # batches are applied, which means certain bugs are harder to encounter. Set this level lower
+    # so there are more opportunities to drain writes in multiple batches.
+    if "maxIndexBuildDrainBatchSize" not in suite_set_parameters:
+        suite_set_parameters["maxIndexBuildDrainBatchSize"] = 10
+
     # The periodic no-op writer writes an oplog entry of type='n' once every 10 seconds. This has
     # the potential to mask issues such as SERVER-31609 because it allows the operationTime of
     # cluster to advance even if the client is blocked for other reasons. We should disable the
     # periodic no-op writer. Set in the .yml file to override this.
     if "replSet" in kwargs and "writePeriodicNoops" not in suite_set_parameters:
         suite_set_parameters["writePeriodicNoops"] = False
+
+    # By default the primary waits up to 10 sec to complete a stepdown and to hand off its duties to
+    # a secondary before shutting down in response to SIGTERM. Make it shut down more abruptly.
+    if "replSet" in kwargs and "waitForStepDownOnNonCommandShutdown" not in suite_set_parameters:
+        suite_set_parameters["waitForStepDownOnNonCommandShutdown"] = False
+
+    if "enableFlowControl" not in suite_set_parameters:
+        suite_set_parameters["enableFlowControl"] = config.FLOW_CONTROL
 
     _apply_set_parameters(args, suite_set_parameters)
 
@@ -259,6 +274,10 @@ def mongo_shell_program(  # pylint: disable=too-many-branches,too-many-locals,to
     mongod_set_parameters.setdefault("logComponentVerbosity",
                                      default_mongod_log_component_verbosity())
 
+    # If the 'enableFlowControl' setParameter for mongod was not already specified, we set its value
+    # to a default.
+    mongod_set_parameters.setdefault("enableFlowControl", config.FLOW_CONTROL)
+
     # If the 'logComponentVerbosity' setParameter for mongos was not already specified, we set its
     # value to a default.
     mongos_set_parameters.setdefault("logComponentVerbosity",
@@ -369,6 +388,8 @@ def dbtest_program(logger, executable=None, suites=None, process_kwargs=None, **
     kwargs["enableMajorityReadConcern"] = config.MAJORITY_READ_CONCERN
     if config.STORAGE_ENGINE is not None:
         kwargs["storageEngine"] = config.STORAGE_ENGINE
+
+    kwargs["flowControl"] = config.FLOW_CONTROL
 
     return generic_program(logger, args, process_kwargs=process_kwargs, **kwargs)
 

@@ -35,6 +35,7 @@
 
 #pragma once
 
+#include <boost/preprocessor/cat.hpp>
 #include <cmath>
 #include <sstream>
 #include <string>
@@ -49,7 +50,7 @@
 #include "mongo/unittest/bson_test_util.h"
 #include "mongo/unittest/unittest_helpers.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 /**
  * Fail unconditionally, reporting the given message.
@@ -102,8 +103,9 @@
  * Binary comparison utility macro. Do not use directly.
  */
 #define ASSERT_COMPARISON_(OP, a, b)                                                           \
-    if (auto ca = ::mongo::unittest::ComparisonAssertion<::mongo::unittest::ComparisonOp::OP>( \
-            __FILE__, __LINE__, #a, #b, a, b))                                                 \
+    if (auto ca =                                                                              \
+            ::mongo::unittest::ComparisonAssertion<::mongo::unittest::ComparisonOp::OP>::make( \
+                __FILE__, __LINE__, #a, #b, a, b))                                             \
     ca.failure().stream()
 
 /**
@@ -115,17 +117,17 @@
 /**
  * Assert a function call returns its input unchanged.
  */
-#define ASSERT_IDENTITY(INPUT, FUNCTION)                                                      \
-    [&](auto&& v) {                                                                           \
-        if (auto ca =                                                                         \
-                ::mongo::unittest::ComparisonAssertion<::mongo::unittest::ComparisonOp::kEq>( \
-                    __FILE__,                                                                 \
-                    __LINE__,                                                                 \
-                    #INPUT,                                                                   \
-                    #FUNCTION "(" #INPUT ")",                                                 \
-                    v,                                                                        \
-                    FUNCTION(std::forward<decltype(v)>(v))))                                  \
-            ca.failure().stream();                                                            \
+#define ASSERT_IDENTITY(INPUT, FUNCTION)                                                        \
+    [&](auto&& v) {                                                                             \
+        if (auto ca = ::mongo::unittest::ComparisonAssertion<                                   \
+                ::mongo::unittest::ComparisonOp::kEq>::make(__FILE__,                           \
+                                                            __LINE__,                           \
+                                                            #INPUT,                             \
+                                                            #FUNCTION "(" #INPUT ")",           \
+                                                            v,                                  \
+                                                            FUNCTION(                           \
+                                                                std::forward<decltype(v)>(v)))) \
+            ca.failure().stream();                                                              \
     }(INPUT)
 
 /**
@@ -169,6 +171,34 @@
                                            ::mongo::StringData(EXPECTED_WHAT));              \
                              }))
 
+
+/**
+ * Compiles if expr doesn't compile.
+ *
+ * This only works for compile errors in the "immediate context" of the expression, which matches
+ * the rules for SFINAE. The first argument is a defaulted template parameter that is used in the
+ * expression to make it dependent. This only works with expressions, not statements, although you
+ * can separate multiple expressions with a comma.
+ *
+ * This should be used at namespace scope, not inside a TEST function.
+ *
+ * Examples that pass:
+ *     ASSERT_DOES_NOT_COMPILE(typename Char = char, *std::declval<Char>());
+ *     ASSERT_DOES_NOT_COMPILE(bool B = false, std::enable_if_t<B, int>{});
+ *
+ * Examples that fail:
+ *     ASSERT_DOES_NOT_COMPILE(typename Char = char, *std::declval<Char*>());
+ *     ASSERT_DOES_NOT_COMPILE(bool B = true, std::enable_if_t<B, int>{});
+ *
+ */
+#define ASSERT_DOES_NOT_COMPILE(Alias, /*expr*/...)                          \
+    static auto BOOST_PP_CAT(compileCheck_, __LINE__)(...)->std::true_type;  \
+    template <Alias>                                                         \
+    static auto BOOST_PP_CAT(compileCheck_, __LINE__)(int)                   \
+        ->std::conditional_t<true, std::false_type, decltype(__VA_ARGS__)>;  \
+    static_assert(decltype(BOOST_PP_CAT(compileCheck_, __LINE__)(0))::value, \
+                  "Expression '" #__VA_ARGS__ "' [with " #Alias "] shouldn't compile.");
+
 /**
  * This internal helper is used to ignore warnings about unused results.  Some unit tests which test
  * `ASSERT_THROWS` and its variations are used on functions which both throw and return `Status` or
@@ -206,7 +236,7 @@
         std::string myString(BIG_STRING);                                                       \
         std::string myContains(CONTAINS);                                                       \
         if (myString.find(myContains) == std::string::npos) {                                   \
-            ::mongoutils::str::stream err;                                                      \
+            ::mongo::str::stream err;                                                           \
             err << "Expected to find " #CONTAINS " (" << myContains << ") in " #BIG_STRING " (" \
                 << myString << ")";                                                             \
             ::mongo::unittest::TestAssertionFailure(__FILE__, __LINE__, err).stream();          \
@@ -607,14 +637,13 @@ private:
         return ">="_sd;
     }
 
-public:
     template <typename A, typename B>
-    ComparisonAssertion(const std::string& theFile,
-                        unsigned theLine,
-                        StringData aExpression,
-                        StringData bExpression,
-                        const A& a,
-                        const B& b) {
+    NOINLINE_DECL ComparisonAssertion(const char* theFile,
+                                      unsigned theLine,
+                                      StringData aExpression,
+                                      StringData bExpression,
+                                      const A& a,
+                                      const B& b) {
         if (comparator(OpTag<op>{})(a, b)) {
             return;
         }
@@ -624,6 +653,41 @@ public:
            << opName << " " << b << ")";
         _assertion = std::make_unique<TestAssertionFailure>(theFile, theLine, os.str());
     }
+
+public:
+    // Use a single implementation (identical to the templated one) for all string-like types.
+    // This is particularly important to avoid making unique instantiations for each length of
+    // string literal.
+    static ComparisonAssertion make(const char* theFile,
+                                    unsigned theLine,
+                                    StringData aExpression,
+                                    StringData bExpression,
+                                    StringData a,
+                                    StringData b);
+
+
+    // Use a single implementation (identical to the templated one) for all pointer and array types.
+    // Note: this is selected instead of the StringData overload for char* and string literals
+    // because they are supposed to compare pointers, not contents.
+    static ComparisonAssertion make(const char* theFile,
+                                    unsigned theLine,
+                                    StringData aExpression,
+                                    StringData bExpression,
+                                    const void* a,
+                                    const void* b);
+    TEMPLATE(typename A, typename B)
+    REQUIRES(!(std::is_convertible_v<A, StringData> && std::is_convertible_v<B, StringData>)&&  //
+             !(std::is_pointer_v<A> && std::is_pointer_v<B>)&&                                  //
+             !(std::is_array_v<A> && std::is_array_v<B>))
+    static ComparisonAssertion make(const char* theFile,
+                                    unsigned theLine,
+                                    StringData aExpression,
+                                    StringData bExpression,
+                                    const A& a,
+                                    const B& b) {
+        return ComparisonAssertion(theFile, theLine, aExpression, bExpression, a, b);
+    }
+
     explicit operator bool() const {
         return static_cast<bool>(_assertion);
     }
@@ -634,6 +698,65 @@ public:
 private:
     std::unique_ptr<TestAssertionFailure> _assertion;
 };
+
+// Explicit instantiation of ComparisonAssertion ctor and factory for a pair of types.
+#define TEMPLATE_COMPARISON_ASSERTION_CTOR_CROSS(EXTERN, OP, A, B)              \
+    EXTERN template ComparisonAssertion<ComparisonOp::OP>::ComparisonAssertion( \
+        const char*, unsigned, StringData, StringData, const A&, const B&);     \
+    EXTERN template ComparisonAssertion<ComparisonOp::OP>                       \
+    ComparisonAssertion<ComparisonOp::OP>::make(                                \
+        const char*, unsigned, StringData, StringData, const A&, const B&);     \
+    EXTERN template ComparisonAssertion<ComparisonOp::OP>::ComparisonAssertion( \
+        const char*, unsigned, StringData, StringData, const B&, const A&);     \
+    EXTERN template ComparisonAssertion<ComparisonOp::OP>                       \
+    ComparisonAssertion<ComparisonOp::OP>::make(                                \
+        const char*, unsigned, StringData, StringData, const B&, const A&)
+
+// Explicit instantiation of ComparisonAssertion ctor and factory for a single type.
+#define TEMPLATE_COMPARISON_ASSERTION_CTOR_SELF(EXTERN, OP, T)                  \
+    EXTERN template ComparisonAssertion<ComparisonOp::OP>::ComparisonAssertion( \
+        const char*, unsigned, StringData, StringData, const T&, const T&);     \
+    EXTERN template ComparisonAssertion<ComparisonOp::OP>                       \
+    ComparisonAssertion<ComparisonOp::OP>::make(                                \
+        const char*, unsigned, StringData, StringData, const T&, const T&)
+
+// Call with `extern` to declace extern instantiations, and with no args to explicitly instantiate.
+#define INSTANTIATE_COMPARISON_ASSERTION_CTORS(...)                                          \
+    __VA_ARGS__ template class ComparisonAssertion<ComparisonOp::kEq>;                       \
+    __VA_ARGS__ template class ComparisonAssertion<ComparisonOp::kNe>;                       \
+    __VA_ARGS__ template class ComparisonAssertion<ComparisonOp::kGt>;                       \
+    __VA_ARGS__ template class ComparisonAssertion<ComparisonOp::kGe>;                       \
+    __VA_ARGS__ template class ComparisonAssertion<ComparisonOp::kLt>;                       \
+    __VA_ARGS__ template class ComparisonAssertion<ComparisonOp::kLe>;                       \
+                                                                                             \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_SELF(__VA_ARGS__, kEq, int);                          \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_SELF(__VA_ARGS__, kEq, long);                         \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_SELF(__VA_ARGS__, kEq, long long);                    \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_SELF(__VA_ARGS__, kEq, unsigned int);                 \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_SELF(__VA_ARGS__, kEq, unsigned long);                \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_SELF(__VA_ARGS__, kEq, unsigned long long);           \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_SELF(__VA_ARGS__, kEq, bool);                         \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_SELF(__VA_ARGS__, kEq, double);                       \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_SELF(__VA_ARGS__, kEq, OID);                          \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_SELF(__VA_ARGS__, kEq, BSONType);                     \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_SELF(__VA_ARGS__, kEq, Timestamp);                    \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_SELF(__VA_ARGS__, kEq, Date_t);                       \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_SELF(__VA_ARGS__, kEq, Status);                       \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_SELF(__VA_ARGS__, kEq, ErrorCodes::Error);            \
+                                                                                             \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_CROSS(__VA_ARGS__, kEq, int, long);                   \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_CROSS(__VA_ARGS__, kEq, int, long long);              \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_CROSS(__VA_ARGS__, kEq, long, long long);             \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_CROSS(__VA_ARGS__, kEq, unsigned int, unsigned long); \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_CROSS(__VA_ARGS__, kEq, Status, ErrorCodes::Error);   \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_CROSS(__VA_ARGS__, kEq, ErrorCodes::Error, int);      \
+                                                                                             \
+    /* These are the only types that are often used with ASSERT_NE*/                         \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_SELF(__VA_ARGS__, kNe, Status);                       \
+    TEMPLATE_COMPARISON_ASSERTION_CTOR_SELF(__VA_ARGS__, kNe, unsigned long);
+
+// Declare that these definitions will be provided in unittest.cpp.
+INSTANTIATE_COMPARISON_ASSERTION_CTORS(extern);
 
 /**
  * Get the value out of a StatusWith<T>, or throw an exception if it is not OK.

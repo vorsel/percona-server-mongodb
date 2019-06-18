@@ -72,109 +72,6 @@ TEST(MatchExpressionParserTest, MinDistanceWithoutNearFailsToParse) {
     ASSERT_FALSE(result.isOK());
 }
 
-TEST(MatchExpressionParserTest, ParseIntegerElementToNonNegativeLongRejectsNegative) {
-    BSONObj query = BSON("" << -2LL);
-    ASSERT_NOT_OK(
-        MatchExpressionParser::parseIntegerElementToNonNegativeLong(query.firstElement()));
-}
-
-TEST(MatchExpressionParserTest, ParseIntegerElementToLongAcceptsNegative) {
-    BSONObj query = BSON("" << -2LL);
-    auto result = MatchExpressionParser::parseIntegerElementToLong(query.firstElement());
-    ASSERT_OK(result.getStatus());
-    ASSERT_EQ(-2LL, result.getValue());
-}
-
-TEST(MatchExpressionParserTest, ParseIntegerElementToNonNegativeLongRejectsTooLargeDouble) {
-    BSONObj query = BSON("" << BSONElement::kLongLongMaxPlusOneAsDouble);
-    ASSERT_NOT_OK(
-        MatchExpressionParser::parseIntegerElementToNonNegativeLong(query.firstElement()));
-}
-
-TEST(MatchExpressionParserTest, ParseIntegerElementToLongRejectsTooLargeDouble) {
-    BSONObj query = BSON("" << BSONElement::kLongLongMaxPlusOneAsDouble);
-    ASSERT_NOT_OK(MatchExpressionParser::parseIntegerElementToLong(query.firstElement()));
-}
-
-TEST(MatchExpressionParserTest, ParseIntegerElementToLongRejectsTooLargeNegativeDouble) {
-    BSONObj query = BSON("" << std::numeric_limits<double>::min());
-    ASSERT_NOT_OK(MatchExpressionParser::parseIntegerElementToLong(query.firstElement()));
-}
-
-TEST(MatchExpressionParserTest, ParseIntegerElementToNonNegativeLongRejectsString) {
-    BSONObj query = BSON(""
-                         << "1");
-    ASSERT_NOT_OK(
-        MatchExpressionParser::parseIntegerElementToNonNegativeLong(query.firstElement()));
-}
-
-TEST(MatchExpressionParserTest, ParseIntegerElementToLongRejectsString) {
-    BSONObj query = BSON(""
-                         << "1");
-    ASSERT_NOT_OK(MatchExpressionParser::parseIntegerElementToLong(query.firstElement()));
-}
-
-TEST(MatchExpressionParserTest, ParseIntegerElementToNonNegativeLongRejectsNonIntegralDouble) {
-    BSONObj query = BSON("" << 2.5);
-    ASSERT_NOT_OK(
-        MatchExpressionParser::parseIntegerElementToNonNegativeLong(query.firstElement()));
-}
-
-TEST(MatchExpressionParserTest, ParseIntegerElementToLongRejectsNonIntegralDouble) {
-    BSONObj query = BSON("" << 2.5);
-    ASSERT_NOT_OK(MatchExpressionParser::parseIntegerElementToLong(query.firstElement()));
-}
-
-TEST(MatchExpressionParserTest, ParseIntegerElementToNonNegativeLongRejectsNonIntegralDecimal) {
-    BSONObj query = BSON("" << Decimal128("2.5"));
-    ASSERT_NOT_OK(
-        MatchExpressionParser::parseIntegerElementToNonNegativeLong(query.firstElement()));
-}
-
-TEST(MatchExpressionParserTest, ParseIntegerElementToLongRejectsNonIntegralDecimal) {
-    BSONObj query = BSON("" << Decimal128("2.5"));
-    ASSERT_NOT_OK(MatchExpressionParser::parseIntegerElementToLong(query.firstElement()));
-}
-
-TEST(MatchExpressionParserTest, ParseIntegerElementToNonNegativeLongRejectsLargestDecimal) {
-    BSONObj query = BSON("" << Decimal128(Decimal128::kLargestPositive));
-    ASSERT_NOT_OK(
-        MatchExpressionParser::parseIntegerElementToNonNegativeLong(query.firstElement()));
-}
-
-TEST(MatchExpressionParserTest, ParseIntegerElementToLongRejectsLargestDecimal) {
-    BSONObj query = BSON("" << Decimal128(Decimal128::kLargestPositive));
-    ASSERT_NOT_OK(MatchExpressionParser::parseIntegerElementToLong(query.firstElement()));
-}
-
-TEST(MatchExpressionParserTest, ParseIntegerElementToNonNegativeLongAcceptsZero) {
-    BSONObj query = BSON("" << 0);
-    auto result = MatchExpressionParser::parseIntegerElementToNonNegativeLong(query.firstElement());
-    ASSERT_OK(result.getStatus());
-    ASSERT_EQ(result.getValue(), 0LL);
-}
-
-TEST(MatchExpressionParserTest, ParseIntegerElementToLongAcceptsZero) {
-    BSONObj query = BSON("" << 0);
-    auto result = MatchExpressionParser::parseIntegerElementToLong(query.firstElement());
-    ASSERT_OK(result.getStatus());
-    ASSERT_EQ(result.getValue(), 0LL);
-}
-
-TEST(MatchExpressionParserTest, ParseIntegerElementToNonNegativeLongAcceptsThree) {
-    BSONObj query = BSON("" << 3.0);
-    auto result = MatchExpressionParser::parseIntegerElementToNonNegativeLong(query.firstElement());
-    ASSERT_OK(result.getStatus());
-    ASSERT_EQ(result.getValue(), 3LL);
-}
-
-TEST(MatchExpressionParserTest, ParseIntegerElementToLongAcceptsThree) {
-    BSONObj query = BSON("" << 3.0);
-    auto result = MatchExpressionParser::parseIntegerElementToLong(query.firstElement());
-    ASSERT_OK(result.getStatus());
-    ASSERT_EQ(result.getValue(), 3LL);
-}
-
 StatusWith<int> fib(int n) {
     if (n < 0)
         return StatusWith<int>(ErrorCodes::BadValue, "paramter to fib has to be >= 0");
@@ -583,7 +480,24 @@ TEST(InternalBinDataSubTypeMatchExpressionTest, InvalidNumericalSubTypeDoesNotPa
     ASSERT_NOT_OK(statusWith2.getStatus());
 }
 
-TEST(InternalSchemaBinDataEncryptedTypeExpressionTest, BsonTypeMatches) {
+TEST(InternalSchemaBinDataEncryptedTypeExpressionTest, BsonTypeMatchesSingleTypeAlias) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto query = BSON("a" << BSON("$_internalSchemaBinDataEncryptedType"
+                                  << "string"));
+    auto expr = uassertStatusOK(MatchExpressionParser::parse(query, expCtx));
+
+    FleBlobHeader blob;
+    blob.fleBlobSubtype = FleBlobSubtype::Deterministic;
+    memset(blob.keyUUID, 0, sizeof(blob.keyUUID));
+    blob.originalBsonType = BSONType::String;
+
+    BSONObj matchingDoc = BSON("a" << BSONBinData(reinterpret_cast<const void*>(&blob),
+                                                  sizeof(FleBlobHeader),
+                                                  BinDataType::Encrypt));
+    ASSERT_TRUE(expr->matchesBSON(matchingDoc));
+}
+
+TEST(InternalSchemaBinDataEncryptedTypeExpressionTest, BsonTypeMatchesSingleType) {
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
     auto query = BSON("a" << BSON("$_internalSchemaBinDataEncryptedType" << BSONType::String));
     auto expr = uassertStatusOK(MatchExpressionParser::parse(query, expCtx));
@@ -599,7 +513,24 @@ TEST(InternalSchemaBinDataEncryptedTypeExpressionTest, BsonTypeMatches) {
     ASSERT_TRUE(expr->matchesBSON(matchingDoc));
 }
 
-TEST(InternalSchemaBinDataEncryptedTypeExpressionTest, BsonTypeDoesNotMatch) {
+TEST(InternalSchemaBinDataEncryptedTypeExpressionTest, BsonTypeMatchesOneOfTypesInArray) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto query = BSON("a" << BSON("$_internalSchemaBinDataEncryptedType"
+                                  << BSON_ARRAY(BSONType::Date << BSONType::String)));
+    auto expr = uassertStatusOK(MatchExpressionParser::parse(query, expCtx));
+
+    FleBlobHeader blob;
+    blob.fleBlobSubtype = FleBlobSubtype::Deterministic;
+    memset(blob.keyUUID, 0, sizeof(blob.keyUUID));
+    blob.originalBsonType = BSONType::String;
+
+    BSONObj matchingDoc = BSON("a" << BSONBinData(reinterpret_cast<const void*>(&blob),
+                                                  sizeof(FleBlobHeader),
+                                                  BinDataType::Encrypt));
+    ASSERT_TRUE(expr->matchesBSON(matchingDoc));
+}
+
+TEST(InternalSchemaBinDataEncryptedTypeExpressionTest, BsonTypeDoesNotMatchSingleType) {
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
     auto query = BSON("a" << BSON("$_internalSchemaBinDataEncryptedType" << BSONType::String));
     auto expr = uassertStatusOK(MatchExpressionParser::parse(query, expCtx));
@@ -615,39 +546,59 @@ TEST(InternalSchemaBinDataEncryptedTypeExpressionTest, BsonTypeDoesNotMatch) {
     ASSERT_FALSE(expr->matchesBSON(notMatchingDoc));
 }
 
-TEST(InternalSchemaBinDataEncryptedTypeExpressionTest, NonNumericalArgumentDoesNotParse) {
+TEST(InternalSchemaBinDataEncryptedTypeExpressionTest, BsonTypeDoesNotMatchTypeArray) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto query = BSON("a" << BSON("$_internalSchemaBinDataEncryptedType"
+                                  << BSON_ARRAY(BSONType::Date << BSONType::Bool)));
+    auto expr = uassertStatusOK(MatchExpressionParser::parse(query, expCtx));
+
+    FleBlobHeader blob;
+    blob.fleBlobSubtype = FleBlobSubtype::Deterministic;
+    memset(blob.keyUUID, 0, sizeof(blob.keyUUID));
+    blob.originalBsonType = BSONType::NumberInt;
+
+    BSONObj notMatchingDoc = BSON("a" << BSONBinData(reinterpret_cast<const void*>(&blob),
+                                                     sizeof(FleBlobHeader),
+                                                     BinDataType::Encrypt));
+    ASSERT_FALSE(expr->matchesBSON(notMatchingDoc));
+}
+
+TEST(InternalSchemaBinDataEncryptedTypeExpressionTest, InvalidArgumentDoesNotParse) {
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
     ASSERT_EQ(MatchExpressionParser::parse(BSON("a" << BSON("$_internalSchemaBinDataEncryptedType"
                                                             << "bar")),
                                            expCtx)
                   .getStatus(),
-              ErrorCodes::FailedToParse);
+              ErrorCodes::BadValue);
     ASSERT_EQ(MatchExpressionParser::parse(BSON("a" << BSON("$_internalSchemaBinDataEncryptedType"
                                                             << "0")),
                                            expCtx)
                   .getStatus(),
-              ErrorCodes::FailedToParse);
+              ErrorCodes::BadValue);
 }
 
 TEST(InternalSchemaBinDataEncryptedTypeExpressionTest, InvalidNumericalArgumentDoesNotParse) {
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    ASSERT_EQ(MatchExpressionParser::parse(
-                  BSON("a" << BSON("$_internalSchemaBinDataEncryptedType" << 0.21)), expCtx)
-                  .getStatus(),
-              ErrorCodes::FailedToParse);
-    ASSERT_EQ(MatchExpressionParser::parse(
-                  BSON("a" << BSON("$_internalSchemaBinDataEncryptedType" << 13.3)), expCtx)
-                  .getStatus(),
-              ErrorCodes::FailedToParse);
+    ASSERT_EQ(
+        MatchExpressionParser::parse(
+            BSON("a" << BSON("$_internalSchemaBinDataEncryptedType" << BSON_ARRAY(0.21))), expCtx)
+            .getStatus(),
+        ErrorCodes::BadValue);
+    ASSERT_EQ(
+        MatchExpressionParser::parse(
+            BSON("a" << BSON("$_internalSchemaBinDataEncryptedType" << BSON_ARRAY(13.3))), expCtx)
+            .getStatus(),
+        ErrorCodes::BadValue);
 }
 
 TEST(InternalSchemaBinDataEncryptedTypeExpressionTest, NonBsonTypeArgumentDoesNotParse) {
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    ASSERT_EQ(MatchExpressionParser::parse(BSON("a" << BSON("$_internalSchemaBinDataEncryptedType"
-                                                            << (BSONType::JSTypeMax + 1))),
-                                           expCtx)
-                  .getStatus(),
-              ErrorCodes::FailedToParse);
+    ASSERT_EQ(
+        MatchExpressionParser::parse(BSON("a" << BSON("$_internalSchemaBinDataEncryptedType"
+                                                      << BSON_ARRAY(BSONType::JSTypeMax + 1))),
+                                     expCtx)
+            .getStatus(),
+        ErrorCodes::BadValue);
 }
 
 TEST(InternalSchemaBinDataEncryptedTypeExpressionTest, IntentToEncryptFleBlobDoesNotMatch) {

@@ -44,7 +44,7 @@ Copyright (C) 2019-present Percona and/or its affiliates. All rights reserved.
 #include "mongo/tools/perconadecrypt_options.h"
 #include "mongo/util/base64.h"
 #include "mongo/util/exit_code.h"
-#include "mongo/util/mongoutils/str.h"  // for str::stream()!
+#include "mongo/util/str.h"  // for str::stream()!
 
 namespace mongo {
 

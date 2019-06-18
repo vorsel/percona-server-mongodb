@@ -58,7 +58,6 @@
 namespace mongo {
 class CappedCallback;
 class CollectionCatalogEntry;
-class DatabaseCatalogEntry;
 class ExtentManager;
 class IndexCatalog;
 class IndexCatalogEntry;
@@ -184,8 +183,8 @@ public:
      * Sets a new namespace on this Collection, in the case that the Collection is being renamed.
      * In general, reads and writes to Collection objects are synchronized using locks from the lock
      * manager. However, there is special synchronization for ns() and setNs() so that the
-     * UUIDCatalog can perform UUID to namespace lookup without holding a Collection lock. See
-     * UUIDCatalog::setCollectionNamespace().
+     * CollectionCatalog can perform UUID to namespace lookup without holding a Collection lock. See
+     * CollectionCatalog::setCollectionNamespace().
      */
     virtual void setNs(NamespaceString nss) = 0;
 
@@ -329,7 +328,6 @@ public:
     virtual Status validate(OperationContext* const opCtx,
                             const ValidateCmdLevel level,
                             bool background,
-                            std::unique_ptr<Lock::CollectionLock> collLk,
                             ValidateResults* const results,
                             BSONObjBuilder* const output) = 0;
 
@@ -468,8 +466,6 @@ public:
      * onto the global lock in exclusive mode.
      */
     virtual void establishOplogCollectionForLogging(OperationContext* opCtx) = 0;
-
-    virtual DatabaseCatalogEntry* dbce() const = 0;
 };
 
 }  // namespace mongo

@@ -46,7 +46,7 @@
 #include "mongo/db/server_options.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -163,7 +163,7 @@ Status IndexBuilder::_build(OperationContext* opCtx,
     }
 
     {
-        Lock::CollectionLock collLock(opCtx->lockState(), ns.ns(), MODE_IX);
+        Lock::CollectionLock collLock(opCtx, ns, MODE_IX);
         // WriteConflict exceptions and statuses are not expected to escape this method.
         status = indexer.insertAllDocumentsInCollection(opCtx, coll);
     }

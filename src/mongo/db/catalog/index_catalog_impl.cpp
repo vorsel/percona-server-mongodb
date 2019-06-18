@@ -42,15 +42,21 @@
 #include "mongo/db/background.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
-#include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/catalog/index_catalog_entry_impl.h"
 #include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/field_ref.h"
+#include "mongo/db/index/2d_access_method.h"
+#include "mongo/db/index/btree_access_method.h"
+#include "mongo/db/index/fts_access_method.h"
+#include "mongo/db/index/hash_access_method.h"
+#include "mongo/db/index/haystack_access_method.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index/s2_access_method.h"
+#include "mongo/db/index/wildcard_access_method.h"
 #include "mongo/db/index_legacy.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/jsobj.h"
@@ -65,11 +71,13 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/storage/kv/kv_catalog.h"
+#include "mongo/db/storage/kv/kv_storage_engine.h"
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/represent_as.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -141,7 +149,7 @@ IndexCatalogEntry* IndexCatalogImpl::_setupInMemoryStructures(
     bool initFromDisk,
     bool isReadyIndex) {
     Status status = _isSpecOk(opCtx, descriptor->infoObj());
-    if (!status.isOK() && status != ErrorCodes::IndexAlreadyExists) {
+    if (!status.isOK()) {
         severe() << "Found an invalid index " << descriptor->infoObj() << " on the "
                  << _collection->ns() << " collection: " << redact(status);
         fassertFailedNoTrace(28782);
@@ -153,8 +161,38 @@ IndexCatalogEntry* IndexCatalogImpl::_setupInMemoryStructures(
                                                          _collection->getCatalogEntry(),
                                                          std::move(descriptor),
                                                          _collection->infoCache());
-    std::unique_ptr<IndexAccessMethod> accessMethod(
-        _collection->dbce()->getIndex(opCtx, _collection->getCatalogEntry(), entry.get()));
+
+    IndexDescriptor* desc = entry->descriptor();
+
+    KVStorageEngine* engine =
+        checked_cast<KVStorageEngine*>(opCtx->getServiceContext()->getStorageEngine());
+    std::string ident =
+        engine->getCatalog()->getIndexIdent(opCtx, _collection->ns(), desc->indexName());
+
+    SortedDataInterface* sdi =
+        engine->getEngine()->getGroupedSortedDataInterface(opCtx, ident, desc, entry->getPrefix());
+
+    const std::string& type = desc->getAccessMethodName();
+    std::unique_ptr<IndexAccessMethod> accessMethod;
+    if ("" == type)
+        accessMethod.reset(new BtreeAccessMethod(entry.get(), sdi));
+    else if (IndexNames::HASHED == type)
+        accessMethod.reset(new HashAccessMethod(entry.get(), sdi));
+    else if (IndexNames::GEO_2DSPHERE == type)
+        accessMethod.reset(new S2AccessMethod(entry.get(), sdi));
+    else if (IndexNames::TEXT == type)
+        accessMethod.reset(new FTSAccessMethod(entry.get(), sdi));
+    else if (IndexNames::GEO_HAYSTACK == type)
+        accessMethod.reset(new HaystackAccessMethod(entry.get(), sdi));
+    else if (IndexNames::GEO_2D == type)
+        accessMethod.reset(new TwoDAccessMethod(entry.get(), sdi));
+    else if (IndexNames::WILDCARD == type)
+        accessMethod.reset(new WildcardAccessMethod(entry.get(), sdi));
+    else {
+        log() << "Can't find index for keyPattern " << desc->keyPattern();
+        fassertFailed(51072);
+    }
+
     entry->init(std::move(accessMethod));
 
     IndexCatalogEntry* save = entry.get();
@@ -246,43 +284,153 @@ string IndexCatalogImpl::_getAccessMethodName(const BSONObj& keyPattern) const {
 
 // ---------------------------
 
-StatusWith<BSONObj> IndexCatalogImpl::prepareSpecForCreate(OperationContext* opCtx,
-                                                           const BSONObj& original) const {
+StatusWith<BSONObj> IndexCatalogImpl::_validateAndFixIndexSpec(OperationContext* opCtx,
+                                                               const BSONObj& original) const {
     Status status = _isSpecOk(opCtx, original);
-    if (!status.isOK())
-        return StatusWith<BSONObj>(status);
+    if (!status.isOK()) {
+        return status;
+    }
 
-    auto fixed = _fixIndexSpec(opCtx, _collection, original);
-    if (!fixed.isOK()) {
-        return fixed;
+    auto swFixed = _fixIndexSpec(opCtx, _collection, original);
+    if (!swFixed.isOK()) {
+        return swFixed;
     }
 
     // we double check with new index spec
-    status = _isSpecOk(opCtx, fixed.getValue());
-    if (!status.isOK())
-        return StatusWith<BSONObj>(status);
+    status = _isSpecOk(opCtx, swFixed.getValue());
+    if (!status.isOK()) {
+        return status;
+    }
 
-    status = _doesSpecConflictWithExisting(opCtx, fixed.getValue());
-    if (!status.isOK())
-        return StatusWith<BSONObj>(status);
+    return swFixed;
+}
 
-    return fixed;
+Status IndexCatalogImpl::_isNonIDIndexAndNotAllowedToBuild(OperationContext* opCtx,
+                                                           const BSONObj& spec) const {
+    const BSONObj key = spec.getObjectField("key");
+    invariant(!key.isEmpty());
+    if (!IndexDescriptor::isIdIndexPattern(key)) {
+        // Check whether the replica set member's config has {buildIndexes:false} set, which means
+        // we are not allowed to build non-_id indexes on this server.
+        if (!repl::ReplicationCoordinator::get(opCtx)->buildsIndexes()) {
+            // We return an IndexAlreadyExists error so that the caller can catch it and silently
+            // skip building it.
+            return Status(ErrorCodes::IndexAlreadyExists,
+                          "this replica set member's 'buildIndexes' setting is set to false");
+        }
+    }
+
+    return Status::OK();
+}
+
+void IndexCatalogImpl::_logInternalState(OperationContext* opCtx,
+                                         long long numIndexesInCollectionCatalogEntry,
+                                         const std::vector<std::string>& indexNamesToDrop,
+                                         bool haveIdIndex) {
+    invariant(opCtx->lockState()->isCollectionLockedForMode(_collection->ns(), MODE_X));
+
+    error() << "Internal Index Catalog state: "
+            << " numIndexesTotal(): " << numIndexesTotal(opCtx)
+            << " numSystemIndexesEntries: " << numIndexesInCollectionCatalogEntry
+            << " _readyIndexes.size(): " << _readyIndexes.size()
+            << " _buildingIndexes.size(): " << _buildingIndexes.size()
+            << " indexNamesToDrop: " << indexNamesToDrop.size() << " haveIdIndex: " << haveIdIndex;
+
+    // Report the ready indexes.
+    error() << "Ready indexes:";
+    for (const auto& entry : _readyIndexes) {
+        const IndexDescriptor* desc = entry->descriptor();
+        error() << "Index '" << desc->indexName()
+                << "' with specification: " << redact(desc->infoObj());
+    }
+
+    // Report the in-progress indexes.
+    error() << "In-progress indexes:";
+    for (const auto& entry : _buildingIndexes) {
+        const IndexDescriptor* desc = entry->descriptor();
+        error() << "Index '" << desc->indexName()
+                << "' with specification: " << redact(desc->infoObj());
+    }
+
+    error() << "Internal Collection Catalog Entry state:";
+    std::vector<std::string> allIndexes;
+    std::vector<std::string> readyIndexes;
+
+    _collection->getCatalogEntry()->getAllIndexes(opCtx, &allIndexes);
+    _collection->getCatalogEntry()->getReadyIndexes(opCtx, &readyIndexes);
+
+    error() << "All indexes:";
+    for (const auto& index : allIndexes) {
+        error() << "Index '" << index << "' with specification: "
+                << redact(_collection->getCatalogEntry()->getIndexSpec(opCtx, index));
+    }
+
+    error() << "Ready indexes:";
+    for (const auto& index : readyIndexes) {
+        error() << "Index '" << index << "' with specification: "
+                << redact(_collection->getCatalogEntry()->getIndexSpec(opCtx, index));
+    }
+
+    error() << "Index names to drop:";
+    for (const auto& indexNameToDrop : indexNamesToDrop) {
+        error() << "Index '" << indexNameToDrop << "' with specification: "
+                << redact(_collection->getCatalogEntry()->getIndexSpec(opCtx, indexNameToDrop));
+    }
+}
+
+StatusWith<BSONObj> IndexCatalogImpl::prepareSpecForCreate(OperationContext* opCtx,
+                                                           const BSONObj& original) const {
+    auto swValidatedAndFixed = _validateAndFixIndexSpec(opCtx, original);
+    if (!swValidatedAndFixed.isOK()) {
+        return swValidatedAndFixed.getStatus();
+    }
+
+    // Check whether this is a non-_id index and there are any settings disallowing this server
+    // from building non-_id indexes.
+    Status status = _isNonIDIndexAndNotAllowedToBuild(opCtx, swValidatedAndFixed.getValue());
+    if (!status.isOK()) {
+        return status;
+    }
+
+    status = _doesSpecConflictWithExisting(opCtx, swValidatedAndFixed.getValue());
+    if (!status.isOK()) {
+        return status;
+    }
+
+    return swValidatedAndFixed.getValue();
+}
+
+std::vector<BSONObj> IndexCatalogImpl::removeExistingIndexesNoChecks(
+    OperationContext* const opCtx, const std::vector<BSONObj>& indexSpecsToBuild) const {
+    std::vector<BSONObj> result;
+    // Filter out ready and in-progress index builds, and any non-_id indexes if 'buildIndexes' is
+    // set to false in the replica set's config.
+    for (const auto& spec : indexSpecsToBuild) {
+        // returned to be built by the caller.
+        if (ErrorCodes::OK != _isNonIDIndexAndNotAllowedToBuild(opCtx, spec)) {
+            continue;
+        }
+
+        // _doesSpecConflictWithExisting currently does more work than we require here: we are only
+        // interested in the index already exists error.
+        if (ErrorCodes::IndexAlreadyExists == _doesSpecConflictWithExisting(opCtx, spec)) {
+            continue;
+        }
+
+        result.push_back(spec);
+    }
+    return result;
 }
 
 std::vector<BSONObj> IndexCatalogImpl::removeExistingIndexes(
-    OperationContext* const opCtx,
-    const std::vector<BSONObj>& indexSpecsToBuild,
-    bool throwOnErrors) const {
+    OperationContext* const opCtx, const std::vector<BSONObj>& indexSpecsToBuild) const {
     std::vector<BSONObj> result;
     for (const auto& spec : indexSpecsToBuild) {
         auto prepareResult = prepareSpecForCreate(opCtx, spec);
         if (prepareResult == ErrorCodes::IndexAlreadyExists) {
             continue;
         }
-        // Intentionally ignoring other error codes unless 'throwOnErrors' is true.
-        if (throwOnErrors) {
-            uassertStatusOK(prepareResult);
-        }
+        uassertStatusOK(prepareResult);
         result.push_back(spec);
     }
     return result;
@@ -408,11 +556,6 @@ Status IndexCatalogImpl::_isSpecOk(OperationContext* opCtx, const BSONObj& spec)
 
     if (nss.isOplog())
         return Status(ErrorCodes::CannotCreateIndex, "cannot have an index on the oplog");
-
-    if (nss.coll() == "$freelist") {
-        // this isn't really proper, but we never want it and its not an error per se
-        return Status(ErrorCodes::IndexAlreadyExists, "cannot index freelist");
-    }
 
     const BSONElement specNamespace = spec["ns"];
     if (specNamespace.type() != String)
@@ -583,13 +726,6 @@ Status IndexCatalogImpl::_isSpecOk(OperationContext* opCtx, const BSONObj& spec)
             return Status(ErrorCodes::CannotCreateIndex,
                           "_id index must have the collection default collation");
         }
-    } else {
-        // for non _id indexes, we check to see if replication has turned off all indexes
-        // we _always_ created _id index
-        if (!repl::ReplicationCoordinator::get(opCtx)->buildsIndexes()) {
-            // this is not exactly the right error code, but I think will make the most sense
-            return Status(ErrorCodes::IndexAlreadyExists, "no indexes per repl");
-        }
     }
 
     // --- only storage engine checks allowed below this ----
@@ -628,8 +764,8 @@ Status IndexCatalogImpl::_doesSpecConflictWithExisting(OperationContext* opCtx,
     const BSONObj collation = spec.getObjectField("collation");
 
     {
-        // Check both existing and in-progress indexes (2nd param = true)
-        const IndexDescriptor* desc = findIndexByName(opCtx, name, true);
+        const IndexDescriptor* desc =
+            findIndexByName(opCtx, name, true /*includeUnfinishedIndexes*/);
         if (desc) {
             // index already exists with same name
 
@@ -673,10 +809,8 @@ Status IndexCatalogImpl::_doesSpecConflictWithExisting(OperationContext* opCtx,
     }
 
     {
-        // Check both existing and in-progress indexes.
-        const bool findInProgressIndexes = true;
-        const IndexDescriptor* desc =
-            findIndexByKeyPatternAndCollationSpec(opCtx, key, collation, findInProgressIndexes);
+        const IndexDescriptor* desc = findIndexByKeyPatternAndCollationSpec(
+            opCtx, key, collation, true /*includeUnfinishedIndexes*/);
         if (desc) {
             LOG(2) << "Index already exists with a different name: " << name << " pattern: " << key
                    << " collation: " << collation;
@@ -742,8 +876,7 @@ void IndexCatalogImpl::dropAllIndexes(OperationContext* opCtx,
     invariant(opCtx->lockState()->isCollectionLockedForMode(_collection->ns(), MODE_X));
 
     uassert(ErrorCodes::BackgroundOperationInProgressForNamespace,
-            mongoutils::str::stream()
-                << "cannot perform operation: an index build is currently running",
+            str::stream() << "cannot perform operation: an index build is currently running",
             !haveAnyIndexesInProgress());
 
     // make sure nothing in progress
@@ -798,12 +931,8 @@ void IndexCatalogImpl::dropAllIndexes(OperationContext* opCtx,
         fassert(17336, _readyIndexes.size() == 1);
     } else {
         if (numIndexesTotal(opCtx) || numIndexesInCollectionCatalogEntry || _readyIndexes.size()) {
-            error() << "About to fassert - "
-                    << " numIndexesTotal(): " << numIndexesTotal(opCtx)
-                    << " numSystemIndexesEntries: " << numIndexesInCollectionCatalogEntry
-                    << " _readyIndexes.size(): " << _readyIndexes.size()
-                    << " indexNamesToDrop: " << indexNamesToDrop.size()
-                    << " haveIdIndex: " << haveIdIndex;
+            _logInternalState(
+                opCtx, numIndexesInCollectionCatalogEntry, indexNamesToDrop, haveIdIndex);
         }
         fassert(17327, numIndexesTotal(opCtx) == 0);
         fassert(17328, numIndexesInCollectionCatalogEntry == 0);

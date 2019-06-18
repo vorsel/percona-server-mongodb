@@ -53,7 +53,7 @@
 #include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace {
 
@@ -186,7 +186,7 @@ void _createCollection(OperationContext* opCtx, const NamespaceString& nss) {
         ASSERT_TRUE(db);
 
         WriteUnitOfWork wuow(opCtx);
-        ASSERT_TRUE(db->createCollection(opCtx, nss.ns()));
+        ASSERT_TRUE(db->createCollection(opCtx, nss));
         wuow.commit();
     });
 

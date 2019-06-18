@@ -86,7 +86,7 @@
 #include "mongo/scripting/engine.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -123,6 +123,35 @@ namespace wcp = ::mongo::wildcard_planning;
 // The body is below in the "count hack" section but getExecutor calls it.
 bool turnIxscanIntoCount(QuerySolution* soln);
 }  // namespace
+
+bool isAnyComponentOfPathMultikey(const BSONObj& indexKeyPattern,
+                                  bool isMultikey,
+                                  const MultikeyPaths& indexMultikeyInfo,
+                                  StringData path) {
+    if (!isMultikey) {
+        return false;
+    }
+
+    size_t keyPatternFieldIndex = 0;
+    bool found = false;
+    if (indexMultikeyInfo.empty()) {
+        // There is no path-level multikey information available, so we must assume 'path' is
+        // multikey.
+        return true;
+    }
+
+    for (auto&& elt : indexKeyPattern) {
+        if (elt.fieldNameStringData() == path) {
+            found = true;
+            break;
+        }
+        keyPatternFieldIndex++;
+    }
+    invariant(found);
+
+    invariant(indexMultikeyInfo.size() > keyPatternFieldIndex);
+    return !indexMultikeyInfo[keyPatternFieldIndex].empty();
+}
 
 IndexEntry indexEntryFromIndexCatalogEntry(OperationContext* opCtx,
                                            const IndexCatalogEntry& ice,
@@ -469,9 +498,9 @@ StatusWith<PrepareExecutionResult> prepareExecution(OperationContext* opCtx,
 
     auto statusWithSolutions = QueryPlanner::plan(*canonicalQuery, plannerParams);
     if (!statusWithSolutions.isOK()) {
-        return Status(ErrorCodes::BadValue,
-                      "error processing query: " + canonicalQuery->toString() +
-                          " planner returned error: " + statusWithSolutions.getStatus().reason());
+        return statusWithSolutions.getStatus().withContext(
+            str::stream() << "error processing query: " << canonicalQuery->toString()
+                          << " planner returned error");
     }
     auto solutions = std::move(statusWithSolutions.getValue());
 
@@ -1182,12 +1211,17 @@ bool getDistinctNodeIndex(const std::vector<IndexEntry>& indices,
 }  // namespace
 
 StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorCount(
-    OperationContext* opCtx, Collection* collection, const CountRequest& request, bool explain) {
+    OperationContext* opCtx,
+    Collection* collection,
+    const CountCommand& request,
+    bool explain,
+    const NamespaceString& nss) {
     unique_ptr<WorkingSet> ws = make_unique<WorkingSet>();
 
-    auto qr = stdx::make_unique<QueryRequest>(request.getNs());
+    auto qr = stdx::make_unique<QueryRequest>(nss);
     qr->setFilter(request.getQuery());
-    qr->setCollation(request.getCollation());
+    auto collation = request.getCollation().value_or(BSONObj());
+    qr->setCollation(collation);
     qr->setHint(request.getHint());
     qr->setExplain(explain);
 
@@ -1212,16 +1246,16 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorCount(
         ? PlanExecutor::INTERRUPT_ONLY
         : PlanExecutor::YIELD_AUTO;
 
-    const CountStageParams params(request);
+    const auto skip = request.getSkip().value_or(0);
+    const auto limit = request.getLimit().value_or(0);
 
     if (!collection) {
         // Treat collections that do not exist as empty collections. Note that the explain reporting
         // machinery always assumes that the root stage for a count operation is a CountStage, so in
         // this case we put a CountStage on top of an EOFStage.
-        unique_ptr<PlanStage> root = make_unique<CountStage>(
-            opCtx, collection, std::move(params), ws.get(), new EOFStage(opCtx));
-        return PlanExecutor::make(
-            opCtx, std::move(ws), std::move(root), request.getNs(), yieldPolicy);
+        unique_ptr<PlanStage> root =
+            make_unique<CountStage>(opCtx, collection, limit, skip, ws.get(), new EOFStage(opCtx));
+        return PlanExecutor::make(opCtx, std::move(ws), std::move(root), nss, yieldPolicy);
     }
 
     // If the query is empty, then we can determine the count by just asking the collection
@@ -1235,9 +1269,8 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorCount(
 
     if (useRecordStoreCount) {
         unique_ptr<PlanStage> root =
-            make_unique<RecordStoreFastCountStage>(opCtx, collection, params.skip, params.limit);
-        return PlanExecutor::make(
-            opCtx, std::move(ws), std::move(root), request.getNs(), yieldPolicy);
+            make_unique<RecordStoreFastCountStage>(opCtx, collection, skip, limit);
+        return PlanExecutor::make(opCtx, std::move(ws), std::move(root), nss, yieldPolicy);
     }
 
     size_t plannerOptions = QueryPlannerParams::IS_COUNT;
@@ -1257,7 +1290,7 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorCount(
     invariant(root);
 
     // Make a CountStage to be the new root.
-    root = make_unique<CountStage>(opCtx, collection, std::move(params), ws.get(), root.release());
+    root = make_unique<CountStage>(opCtx, collection, limit, skip, ws.get(), root.release());
     // We must have a tree of stages in order to have a valid plan executor, but the query
     // solution may be NULL. Takes ownership of all args other than 'collection' and 'opCtx'
     return PlanExecutor::make(opCtx,
@@ -1451,6 +1484,9 @@ QueryPlannerParams fillOutPlannerParamsForDistinct(OperationContext* opCtx,
     QueryPlannerParams plannerParams;
     plannerParams.options = QueryPlannerParams::NO_TABLE_SCAN | plannerOptions;
 
+    // If the caller did not request a "strict" distinct scan then we may choose a plan which
+    // unwinds arrays and treats each element in an array as its own key.
+    const bool mayUnwindArrays = !(plannerOptions & QueryPlannerParams::STRICT_DISTINCT_ONLY);
     std::unique_ptr<IndexCatalog::IndexIterator> ii =
         collection->getIndexCatalog()->getIndexIterator(opCtx, false);
     auto query = parsedDistinct.getQuery()->getQueryRequest().getFilter();
@@ -1458,6 +1494,17 @@ QueryPlannerParams fillOutPlannerParamsForDistinct(OperationContext* opCtx,
         const IndexCatalogEntry* ice = ii->next();
         const IndexDescriptor* desc = ice->descriptor();
         if (desc->keyPattern().hasField(parsedDistinct.getKey())) {
+            if (!mayUnwindArrays && isAnyComponentOfPathMultikey(desc->keyPattern(),
+                                                                 desc->isMultikey(opCtx),
+                                                                 desc->getMultikeyPaths(opCtx),
+                                                                 parsedDistinct.getKey())) {
+                // If the caller requested "strict" distinct that does not "pre-unwind" arrays,
+                // then an index which is multikey on the distinct field may not be used. This is
+                // because when indexing an array each element gets inserted individually. Any plan
+                // which involves scanning the index will have effectively "unwound" all arrays.
+                continue;
+            }
+
             plannerParams.indices.push_back(
                 indexEntryFromIndexCatalogEntry(opCtx, *ice, parsedDistinct.getQuery()));
         } else if (desc->getIndexType() == IndexType::INDEX_WILDCARD && !query.isEmpty()) {
@@ -1468,6 +1515,14 @@ QueryPlannerParams fillOutPlannerParamsForDistinct(OperationContext* opCtx,
                 plannerParams.indices.push_back(
                     indexEntryFromIndexCatalogEntry(opCtx, *ice, parsedDistinct.getQuery()));
             }
+
+            // It is not necessary to do any checks about 'mayUnwindArrays' in this case, because:
+            // 1) If there is no predicate on the distinct(), a wildcard indices may not be used.
+            // 2) distinct() _with_ a predicate may not be answered with a DISTINCT_SCAN on _any_
+            // multikey index.
+
+            // So, we will not distinct scan a wildcard index that's multikey on the distinct()
+            // field, regardless of the value of 'mayUnwindArrays'.
         }
     }
 

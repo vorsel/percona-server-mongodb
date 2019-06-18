@@ -156,7 +156,8 @@ function RollbackTest(name = "RollbackTest", replSet, expectPreparedTxnsDuringRo
         return replSet;
     }
 
-    function checkDataConsistency() {
+    function checkDataConsistency(
+        {skipCheckCollectionCounts: skipCheckCollectionCounts = false} = {}) {
         assert.eq(curState,
                   State.kSteadyStateOps,
                   "Not in kSteadyStateOps state, cannot check data consistency");
@@ -168,7 +169,8 @@ function RollbackTest(name = "RollbackTest", replSet, expectPreparedTxnsDuringRo
         const name = rst.name;
         // We must check counts before we validate since validate fixes counts. We cannot check
         // counts if unclean shutdowns occur.
-        if (!TestData.allowUncleanShutdowns || !TestData.rollbackShutdowns) {
+        if ((!TestData.allowUncleanShutdowns || !TestData.rollbackShutdowns) &&
+            !skipCheckCollectionCounts) {
             rst.checkCollectionCounts(name);
         }
         rst.checkOplogs(name);
@@ -203,7 +205,7 @@ function RollbackTest(name = "RollbackTest", replSet, expectPreparedTxnsDuringRo
      * Transition from a rollback state to a steady state. Operations applied in this phase will
      * be replicated to all nodes and should not be rolled back.
      */
-    this.transitionToSteadyStateOperations = function() {
+    this.transitionToSteadyStateOperations = function({skipDataConsistencyChecks = false} = {}) {
         // If we shut down the primary before the secondary begins rolling back against it, then
         // the secondary may get elected and not actually roll back. In that case we do not check
         // the RBID and just await replication.
@@ -249,9 +251,9 @@ function RollbackTest(name = "RollbackTest", replSet, expectPreparedTxnsDuringRo
         // After the previous rollback (if any) has completed and await replication has finished,
         // the replica set should be in a consistent and "fresh" state. We now prepare for the next
         // rollback.
-        if (expectPreparedTxnsDuringRollback === true) {
-            print('Skipping data consistency checks because active prepared transactions are' +
-                  ' expected after rollback');
+        if (expectPreparedTxnsDuringRollback === true || skipDataConsistencyChecks === true) {
+            print('Skipping data consistency checks because there may be active transactions ' +
+                  'on the primary after rollback');
         } else {
             checkDataConsistency();
         }
@@ -372,10 +374,10 @@ function RollbackTest(name = "RollbackTest", replSet, expectPreparedTxnsDuringRo
         return curPrimary;
     };
 
-    this.stop = function() {
+    this.stop = function(checkDataConsistencyOptions) {
         restartServerReplication(tiebreakerNode);
         rst.awaitReplication();
-        checkDataConsistency();
+        checkDataConsistency(checkDataConsistencyOptions);
         transitionIfAllowed(State.kStopped);
         return rst.stopSet();
     };
@@ -388,7 +390,8 @@ function RollbackTest(name = "RollbackTest", replSet, expectPreparedTxnsDuringRo
         return curSecondary;
     };
 
-    this.restartNode = function(nodeId, signal, startOptions, allowedExitCode) {
+    this.restartNode = function(
+        nodeId, signal, startOptions, allowedExitCode, {skipValidation = false} = {}) {
         assert(signal === SIGKILL || signal === SIGTERM, `Received unknown signal: ${signal}`);
         assert.gte(nodeId, 0, "Invalid argument to RollbackTest.restartNode()");
 
@@ -411,11 +414,12 @@ function RollbackTest(name = "RollbackTest", replSet, expectPreparedTxnsDuringRo
             signal = SIGTERM;
         }
 
-        let opts = {};
+        let opts = {skipValidation};
+
         if (allowedExitCode !== undefined) {
-            opts = {allowedExitCode: allowedExitCode};
+            Object.assign(opts, {allowedExitCode: allowedExitCode});
         } else if (signal === SIGKILL) {
-            opts = {allowedExitCode: MongoRunner.EXIT_SIGKILL};
+            Object.assign(opts, {allowedExitCode: MongoRunner.EXIT_SIGKILL});
         }
 
         log(`Stopping node ${hostName} with signal ${signal}`);

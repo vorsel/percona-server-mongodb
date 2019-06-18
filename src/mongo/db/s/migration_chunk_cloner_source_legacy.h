@@ -81,7 +81,8 @@ public:
                     const repl::OpTime& opTime) override;
 
     void onUpdateOp(OperationContext* opCtx,
-                    const BSONObj& updatedDoc,
+                    boost::optional<BSONObj> preImageDoc,
+                    const BSONObj& postImageDoc,
                     const repl::OpTime& opTime,
                     const repl::OpTime& prePostImageOpTime) override;
 
@@ -89,6 +90,10 @@ public:
                     const BSONObj& deletedDocId,
                     const repl::OpTime& opTime,
                     const repl::OpTime& preImageOpTime) override;
+
+    void onTransactionPrepareOrUnpreparedCommit(OperationContext* opCtx,
+                                                const repl::OpTime& opTime) override;
+
 
     // Legacy cloner specific functionality
 
@@ -178,6 +183,7 @@ public:
 
 private:
     friend class LogOpForShardingHandler;
+    friend class LogPrepareOrCommitOpForShardingHandler;
 
     // Represents the states in which the cloner can be
     enum State { kNew, kCloning, kDone };
@@ -201,6 +207,14 @@ private:
      * Returns OK or any error status otherwise.
      */
     Status _storeCurrentLocs(OperationContext* opCtx);
+
+    /**
+     * Adds the OpTime to the list of OpTimes for oplog entries that we should consider migrating as
+     * part of session migration.
+     */
+    void _addToSessionMigrationOptimeQueue(
+        const repl::OpTime& opTime,
+        SessionCatalogMigrationSource::EntryAtOpTimeType entryAtOpTimeType);
 
     /*
      * Consumes the operation track request and appends the relevant document changes to

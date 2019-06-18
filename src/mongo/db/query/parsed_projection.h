@@ -31,7 +31,7 @@
 
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression_parser.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -144,7 +144,7 @@ private:
      * Does not take ownership of 'query'.
      */
     static bool _hasPositionalOperatorMatch(const MatchExpression* const query,
-                                            const std::string& matchfield);
+                                            StringData matchfield);
 
     // Track fields needed by the projection so that the query planner can perform projection
     // analysis and possibly give us a covered projection.

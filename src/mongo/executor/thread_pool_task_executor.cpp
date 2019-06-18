@@ -56,7 +56,7 @@ MONGO_FAIL_POINT_DEFINE(initialSyncFuzzerSynchronizationPoint1);
 MONGO_FAIL_POINT_DEFINE(initialSyncFuzzerSynchronizationPoint2);
 
 namespace {
-MONGO_FAIL_POINT_DEFINE(scheduleIntoPoolSpinsUntilThreadPoolShutsDown);
+MONGO_FAIL_POINT_DEFINE(scheduleIntoPoolSpinsUntilThreadPoolTaskExecutorShutsDown);
 }
 
 class ThreadPoolTaskExecutor::CallbackState : public TaskExecutor::CallbackState {
@@ -147,9 +147,6 @@ ThreadPoolTaskExecutor::~ThreadPoolTaskExecutor() {
 void ThreadPoolTaskExecutor::startup() {
     _net->startup();
     stdx::lock_guard<stdx::mutex> lk(_mutex);
-    if (_inShutdown_inlock()) {
-        return;
-    }
     invariant(_state == preStart);
     _setState_inlock(running);
     _pool->startup();
@@ -176,7 +173,6 @@ void ThreadPoolTaskExecutor::shutdown() {
         cbState->canceled.store(1);
     }
     scheduleIntoPool_inlock(&pending, std::move(lk));
-    _pool->shutdown();
 }
 
 void ThreadPoolTaskExecutor::join() {
@@ -185,6 +181,18 @@ void ThreadPoolTaskExecutor::join() {
 
 stdx::unique_lock<stdx::mutex> ThreadPoolTaskExecutor::_join(stdx::unique_lock<stdx::mutex> lk) {
     _stateChange.wait(lk, [this] {
+        // All tasks are spliced into the _poolInProgressQueue immediately after we accept them.
+        // This occurs in scheduleIntoPool_inlock.
+        //
+        // On the other side, all tasks are spliced out of the _poolInProgressQueue in runCallback,
+        // which removes them from this list after executing the users callback.
+        //
+        // This check ensures that all work managed to enter after shutdown successfully flushes
+        // after shutdown
+        if (!_poolInProgressQueue.empty()) {
+            return false;
+        }
+
         switch (_state) {
             case preStart:
                 return false;
@@ -199,12 +207,14 @@ stdx::unique_lock<stdx::mutex> ThreadPoolTaskExecutor::_join(stdx::unique_lock<s
         }
         MONGO_UNREACHABLE;
     });
+
     if (_state == shutdownComplete) {
         return lk;
     }
     invariant(_state == joinRequired);
     _setState_inlock(joining);
     lk.unlock();
+    _pool->shutdown();
     _pool->join();
     lk.lock();
     while (!_unsignaledEvents.empty()) {
@@ -217,18 +227,8 @@ stdx::unique_lock<stdx::mutex> ThreadPoolTaskExecutor::_join(stdx::unique_lock<s
     }
     lk.unlock();
     _net->shutdown();
-
     lk.lock();
-    // The _poolInProgressQueue may not be empty if the network interface attempted to schedule work
-    // into _pool after _pool->shutdown(). Because _pool->join() has returned, we know that any
-    // items left in _poolInProgressQueue will never be processed by another thread, so we process
-    // them now.
-    while (!_poolInProgressQueue.empty()) {
-        auto cbState = _poolInProgressQueue.front();
-        lk.unlock();
-        runCallback(std::move(cbState));
-        lk.lock();
-    }
+    invariant(_poolInProgressQueue.empty());
     invariant(_networkInProgressQueue.empty());
     invariant(_sleepersQueue.empty());
     invariant(_unsignaledEvents.empty());
@@ -278,17 +278,20 @@ void ThreadPoolTaskExecutor::signalEvent(const EventHandle& event) {
 }
 
 StatusWith<TaskExecutor::CallbackHandle> ThreadPoolTaskExecutor::onEvent(const EventHandle& event,
-                                                                         CallbackFn work) {
+                                                                         CallbackFn&& work) {
     if (!event.isValid()) {
         return {ErrorCodes::BadValue, "Passed invalid event handle to onEvent"};
     }
-    auto wq = makeSingletonWorkQueue(std::move(work), nullptr);
+    // Unsure if we'll succeed yet, so pass an empty CallbackFn.
+    auto wq = makeSingletonWorkQueue({}, nullptr);
     stdx::unique_lock<stdx::mutex> lk(_mutex);
     auto eventState = checked_cast<EventState*>(getEventFromHandle(event));
     auto cbHandle = enqueueCallbackState_inlock(&eventState->waiters, &wq);
     if (!cbHandle.isOK()) {
         return cbHandle;
     }
+    // Success, invalidate "work" by moving it into the queue.
+    eventState->waiters.back()->callback = std::move(work);
     if (eventState->isSignaledFlag) {
         scheduleIntoPool_inlock(&eventState->waiters, std::move(lk));
     }
@@ -327,20 +330,23 @@ void ThreadPoolTaskExecutor::waitForEvent(const EventHandle& event) {
     }
 }
 
-StatusWith<TaskExecutor::CallbackHandle> ThreadPoolTaskExecutor::scheduleWork(CallbackFn work) {
-    auto wq = makeSingletonWorkQueue(std::move(work), nullptr);
+StatusWith<TaskExecutor::CallbackHandle> ThreadPoolTaskExecutor::scheduleWork(CallbackFn&& work) {
+    // Unsure if we'll succeed yet, so pass an empty CallbackFn.
+    auto wq = makeSingletonWorkQueue({}, nullptr);
     WorkQueue temp;
     stdx::unique_lock<stdx::mutex> lk(_mutex);
     auto cbHandle = enqueueCallbackState_inlock(&temp, &wq);
     if (!cbHandle.isOK()) {
         return cbHandle;
     }
+    // Success, invalidate "work" by moving it into the queue.
+    temp.back()->callback = std::move(work);
     scheduleIntoPool_inlock(&temp, std::move(lk));
     return cbHandle;
 }
 
 StatusWith<TaskExecutor::CallbackHandle> ThreadPoolTaskExecutor::scheduleWorkAt(Date_t when,
-                                                                                CallbackFn work) {
+                                                                                CallbackFn&& work) {
     if (when <= now()) {
         return scheduleWork(std::move(work));
     }
@@ -595,19 +601,18 @@ void ThreadPoolTaskExecutor::scheduleIntoPool_inlock(WorkQueue* fromQueue,
 
     lk.unlock();
 
-    if (MONGO_FAIL_POINT(scheduleIntoPoolSpinsUntilThreadPoolShutsDown)) {
-        scheduleIntoPoolSpinsUntilThreadPoolShutsDown.setMode(FailPoint::off);
+    if (MONGO_FAIL_POINT(scheduleIntoPoolSpinsUntilThreadPoolTaskExecutorShutsDown)) {
+        scheduleIntoPoolSpinsUntilThreadPoolTaskExecutorShutsDown.setMode(FailPoint::off);
 
-        auto checkStatus = [&] { return _pool->execute([] {}).getNoThrow(); };
-        while (!ErrorCodes::isCancelationError(checkStatus().code())) {
-            sleepmillis(100);
-        }
+        lk.lock();
+        _stateChange.wait(lk, [&] { return _inShutdown_inlock(); });
+        lk.unlock();
     }
 
     for (const auto& cbState : todo) {
         if (cbState->baton) {
-            cbState->baton->schedule([this, cbState](OperationContext* opCtx) {
-                if (opCtx) {
+            cbState->baton->schedule([this, cbState](Status status) {
+                if (status.isOK()) {
                     runCallback(std::move(cbState));
                     return;
                 }
@@ -659,6 +664,9 @@ void ThreadPoolTaskExecutor::runCallback(std::shared_ptr<CallbackState> cbStateA
     _poolInProgressQueue.erase(cbStateArg->iter);
     if (cbStateArg->finishedCondition) {
         cbStateArg->finishedCondition->notify_all();
+    }
+    if (_inShutdown_inlock() && _poolInProgressQueue.empty()) {
+        _stateChange.notify_all();
     }
 }
 

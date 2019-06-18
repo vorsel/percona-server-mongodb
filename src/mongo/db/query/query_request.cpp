@@ -34,7 +34,7 @@
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
-#include "mongo/db/catalog/uuid_catalog.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/command_generic_argument.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/dbmessage.h"
@@ -42,7 +42,7 @@
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -117,7 +117,7 @@ QueryRequest::QueryRequest(NamespaceStringOrUUID nssOrUuid)
 
 void QueryRequest::refreshNSS(OperationContext* opCtx) {
     if (_uuid) {
-        const UUIDCatalog& catalog = UUIDCatalog::get(opCtx);
+        const CollectionCatalog& catalog = CollectionCatalog::get(opCtx);
         auto foundColl = catalog.lookupCollectionByUUID(_uuid.get());
         uassert(ErrorCodes::NamespaceNotFound,
                 str::stream() << "UUID " << _uuid.get() << " specified in query request not found",
@@ -583,7 +583,7 @@ Status QueryRequest::validate() const {
     // Min and Max objects must have the same fields.
     if (!_min.isEmpty() && !_max.isEmpty()) {
         if (!_min.isFieldNamePrefixOf(_max) || (_min.nFields() != _max.nFields())) {
-            return Status(ErrorCodes::BadValue, "min and max must have the same field names");
+            return Status(ErrorCodes::Error(51176), "min and max must have the same field names");
         }
     }
 

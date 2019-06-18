@@ -43,7 +43,6 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/db/concurrency/global_lock_acquisition_tracker.h"
 #include "mongo/db/concurrency/locker.h"
 #include "mongo/db/json.h"
 #include "mongo/db/query/getmore_request.h"
@@ -55,7 +54,7 @@
 #include "mongo/util/hex.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/socket_utils.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -407,9 +406,7 @@ bool CurOp::completeAndLogOperation(OperationContext* opCtx,
 
     if (shouldLogOp || (shouldSample && _debug.executionTimeMicros > slowMs * 1000LL)) {
         auto lockerInfo = opCtx->lockState()->getLockerInfo(_lockStatsBase);
-        const GlobalLockAcquisitionTracker& globalLockTracker =
-            GlobalLockAcquisitionTracker::get(opCtx);
-        if (_debug.storageStats == nullptr && globalLockTracker.getGlobalLockTaken() &&
+        if (_debug.storageStats == nullptr && opCtx->lockState()->wasGlobalLockTaken() &&
             opCtx->getServiceContext()->getStorageEngine()) {
             // Do not fetch operation statistics again if we have already got them (for instance,
             // as a part of stashing the transaction).
@@ -434,7 +431,10 @@ bool CurOp::completeAndLogOperation(OperationContext* opCtx,
                     << "Interrupted while trying to gather storage statistics for a slow operation";
             }
         }
-        log(component) << _debug.report(client, *this, (lockerInfo ? &lockerInfo->stats : nullptr));
+        log(component) << _debug.report(client,
+                                        *this,
+                                        (lockerInfo ? &lockerInfo->stats : nullptr),
+                                        opCtx->lockState()->getFlowControlStats());
     }
 
     // Return 'true' if this operation should also be added to the profiler.
@@ -573,6 +573,13 @@ void CurOp::reportState(BSONObjBuilder* builder, bool truncateOps) {
         }
     }
 
+    if (auto n = _debug.additiveMetrics.prepareReadConflicts.load(); n > 0) {
+        builder->append("prepareReadConflicts", n);
+    }
+    if (auto n = _debug.additiveMetrics.writeConflicts.load(); n > 0) {
+        builder->append("writeConflicts", n);
+    }
+
     builder->append("numYields", _numYields);
 }
 
@@ -617,13 +624,17 @@ StringData getProtoString(int op) {
 #define OPDEBUG_TOSTRING_HELP_BOOL(x) \
     if (x)                            \
     s << " " #x ":" << (x)
+#define OPDEBUG_TOSTRING_HELP_ATOMIC(x, y) \
+    if (auto __y = y.load(); __y > 0)      \
+    s << " " x ":" << (__y)
 #define OPDEBUG_TOSTRING_HELP_OPTIONAL(x, y) \
     if (y)                                   \
     s << " " x ":" << (*y)
 
 string OpDebug::report(Client* client,
                        const CurOp& curop,
-                       const SingleThreadedLockStats* lockStats) const {
+                       const SingleThreadedLockStats* lockStats,
+                       FlowControlTicketholder::CurOp flowControlStats) const {
     StringBuilder s;
     if (iscommand)
         s << "command ";
@@ -636,7 +647,7 @@ string OpDebug::report(Client* client,
     if (clientMetadata) {
         auto appName = clientMetadata.get().getApplicationName();
         if (!appName.empty()) {
-            s << " appName: \"" << escape(appName) << '\"';
+            s << " appName: \"" << str::escape(appName) << '\"';
         }
     }
 
@@ -693,8 +704,8 @@ string OpDebug::report(Client* client,
 
     OPDEBUG_TOSTRING_HELP_OPTIONAL("keysInserted", additiveMetrics.keysInserted);
     OPDEBUG_TOSTRING_HELP_OPTIONAL("keysDeleted", additiveMetrics.keysDeleted);
-    OPDEBUG_TOSTRING_HELP_OPTIONAL("prepareReadConflicts", additiveMetrics.prepareReadConflicts);
-    OPDEBUG_TOSTRING_HELP_OPTIONAL("writeConflicts", additiveMetrics.writeConflicts);
+    OPDEBUG_TOSTRING_HELP_ATOMIC("prepareReadConflicts", additiveMetrics.prepareReadConflicts);
+    OPDEBUG_TOSTRING_HELP_ATOMIC("writeConflicts", additiveMetrics.writeConflicts);
 
     s << " numYields:" << curop.numYields();
     OPDEBUG_TOSTRING_HELP(nreturned);
@@ -708,7 +719,7 @@ string OpDebug::report(Client* client,
     if (!errInfo.isOK()) {
         s << " ok:" << 0;
         if (!errInfo.reason().empty()) {
-            s << " errMsg:\"" << escape(redact(errInfo.reason())) << "\"";
+            s << " errMsg:\"" << str::escape(redact(errInfo.reason())) << "\"";
         }
         s << " errName:" << errInfo.code();
         s << " errCode:" << static_cast<int>(errInfo.code());
@@ -722,6 +733,11 @@ string OpDebug::report(Client* client,
         BSONObjBuilder locks;
         lockStats->report(&locks);
         s << " locks:" << locks.obj().toString();
+    }
+
+    BSONObj flowControlObj = makeFlowControlObject(flowControlStats);
+    if (flowControlObj.nFields() > 0) {
+        s << " flowControl:" << flowControlObj.toString();
     }
 
     if (storageStats) {
@@ -743,12 +759,16 @@ string OpDebug::report(Client* client,
 #define OPDEBUG_APPEND_BOOL(x) \
     if (x)                     \
     b.appendBool(#x, (x))
+#define OPDEBUG_APPEND_ATOMIC(x, y)   \
+    if (auto __y = y.load(); __y > 0) \
+    b.appendNumber(x, __y)
 #define OPDEBUG_APPEND_OPTIONAL(x, y) \
     if (y)                            \
     b.appendNumber(x, (*y))
 
 void OpDebug::append(const CurOp& curop,
                      const SingleThreadedLockStats& lockStats,
+                     FlowControlTicketholder::CurOp flowControlStats,
                      BSONObjBuilder& b) const {
     const size_t maxElementSize = 50 * 1024;
 
@@ -784,8 +804,8 @@ void OpDebug::append(const CurOp& curop,
 
     OPDEBUG_APPEND_OPTIONAL("keysInserted", additiveMetrics.keysInserted);
     OPDEBUG_APPEND_OPTIONAL("keysDeleted", additiveMetrics.keysDeleted);
-    OPDEBUG_APPEND_OPTIONAL("prepareReadConflicts", additiveMetrics.prepareReadConflicts);
-    OPDEBUG_APPEND_OPTIONAL("writeConflicts", additiveMetrics.writeConflicts);
+    OPDEBUG_APPEND_ATOMIC("prepareReadConflicts", additiveMetrics.prepareReadConflicts);
+    OPDEBUG_APPEND_ATOMIC("writeConflicts", additiveMetrics.writeConflicts);
 
     b.appendNumber("numYield", curop.numYields());
     OPDEBUG_APPEND_NUMBER(nreturned);
@@ -799,6 +819,12 @@ void OpDebug::append(const CurOp& curop,
     {
         BSONObjBuilder locks(b.subobjStart("locks"));
         lockStats.report(&locks);
+    }
+
+    {
+        BSONObj flowControlMetrics = makeFlowControlObject(flowControlStats);
+        BSONObjBuilder flowControlBuilder(b.subobjStart("flowControl"));
+        flowControlBuilder.appendElements(flowControlMetrics);
     }
 
     if (storageStats) {
@@ -840,6 +866,24 @@ void OpDebug::setPlanSummaryMetrics(const PlanSummaryStats& planSummaryStats) {
     replanned = planSummaryStats.replanned;
 }
 
+BSONObj OpDebug::makeFlowControlObject(FlowControlTicketholder::CurOp stats) const {
+    BSONObjBuilder builder;
+    if (stats.ticketsAcquired > 0) {
+        builder.append("acquireCount", stats.ticketsAcquired);
+    }
+
+    if (stats.acquireWaitCount > 0) {
+        builder.append("acquireWaitCount", stats.acquireWaitCount);
+    }
+
+    if (stats.timeAcquiringMicros > 0) {
+        builder.append("timeAcquiringMicros", stats.timeAcquiringMicros);
+    }
+
+    return builder.obj();
+}
+
+
 namespace {
 
 /**
@@ -865,25 +909,34 @@ void OpDebug::AdditiveMetrics::add(const AdditiveMetrics& otherMetrics) {
     ndeleted = addOptionalLongs(ndeleted, otherMetrics.ndeleted);
     keysInserted = addOptionalLongs(keysInserted, otherMetrics.keysInserted);
     keysDeleted = addOptionalLongs(keysDeleted, otherMetrics.keysDeleted);
-    prepareReadConflicts =
-        addOptionalLongs(prepareReadConflicts, otherMetrics.prepareReadConflicts);
-    writeConflicts = addOptionalLongs(writeConflicts, otherMetrics.writeConflicts);
+    prepareReadConflicts.fetchAndAdd(otherMetrics.prepareReadConflicts.load());
+    writeConflicts.fetchAndAdd(otherMetrics.writeConflicts.load());
 }
 
-bool OpDebug::AdditiveMetrics::equals(const AdditiveMetrics& otherMetrics) {
+void OpDebug::AdditiveMetrics::reset() {
+    keysExamined = boost::none;
+    docsExamined = boost::none;
+    nMatched = boost::none;
+    nModified = boost::none;
+    ninserted = boost::none;
+    ndeleted = boost::none;
+    keysInserted = boost::none;
+    keysDeleted = boost::none;
+    prepareReadConflicts.store(0);
+    writeConflicts.store(0);
+}
+
+bool OpDebug::AdditiveMetrics::equals(const AdditiveMetrics& otherMetrics) const {
     return keysExamined == otherMetrics.keysExamined && docsExamined == otherMetrics.docsExamined &&
         nMatched == otherMetrics.nMatched && nModified == otherMetrics.nModified &&
         ninserted == otherMetrics.ninserted && ndeleted == otherMetrics.ndeleted &&
         keysInserted == otherMetrics.keysInserted && keysDeleted == otherMetrics.keysDeleted &&
-        prepareReadConflicts == otherMetrics.prepareReadConflicts &&
-        writeConflicts == otherMetrics.writeConflicts;
+        prepareReadConflicts.load() == otherMetrics.prepareReadConflicts.load() &&
+        writeConflicts.load() == otherMetrics.writeConflicts.load();
 }
 
 void OpDebug::AdditiveMetrics::incrementWriteConflicts(long long n) {
-    if (!writeConflicts) {
-        writeConflicts = 0;
-    }
-    *writeConflicts += n;
+    writeConflicts.fetchAndAdd(n);
 }
 
 void OpDebug::AdditiveMetrics::incrementKeysInserted(long long n) {
@@ -908,10 +961,7 @@ void OpDebug::AdditiveMetrics::incrementNinserted(long long n) {
 }
 
 void OpDebug::AdditiveMetrics::incrementPrepareReadConflicts(long long n) {
-    if (!prepareReadConflicts) {
-        prepareReadConflicts = 0;
-    }
-    *prepareReadConflicts += n;
+    prepareReadConflicts.fetchAndAdd(n);
 }
 
 string OpDebug::AdditiveMetrics::report() const {
@@ -925,8 +975,8 @@ string OpDebug::AdditiveMetrics::report() const {
     OPDEBUG_TOSTRING_HELP_OPTIONAL("ndeleted", ndeleted);
     OPDEBUG_TOSTRING_HELP_OPTIONAL("keysInserted", keysInserted);
     OPDEBUG_TOSTRING_HELP_OPTIONAL("keysDeleted", keysDeleted);
-    OPDEBUG_TOSTRING_HELP_OPTIONAL("prepareReadConflicts", prepareReadConflicts);
-    OPDEBUG_TOSTRING_HELP_OPTIONAL("writeConflicts", writeConflicts);
+    OPDEBUG_TOSTRING_HELP_ATOMIC("prepareReadConflicts", prepareReadConflicts);
+    OPDEBUG_TOSTRING_HELP_ATOMIC("writeConflicts", writeConflicts);
 
     return s.str();
 }

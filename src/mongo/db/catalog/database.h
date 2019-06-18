@@ -36,15 +36,14 @@
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/collection_options.h"
-#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
 
-class DatabaseCatalogEntry;
 class OperationContext;
 
 /**
@@ -75,8 +74,8 @@ public:
     inline Database(Database&&) = delete;
     inline Database& operator=(Database&&) = delete;
 
-    virtual UUIDCatalog::iterator begin(OperationContext* opCtx) const = 0;
-    virtual UUIDCatalog::iterator end(OperationContext* opCtx) const = 0;
+    virtual CollectionCatalog::iterator begin(OperationContext* opCtx) const = 0;
+    virtual CollectionCatalog::iterator end(OperationContext* opCtx) const = 0;
 
     /**
      * Sets up internal memory structures.
@@ -100,7 +99,7 @@ public:
 
     virtual int getProfilingLevel() const = 0;
 
-    virtual const char* getProfilingNS() const = 0;
+    virtual const NamespaceString& getProfilingNS() const = 0;
 
     /**
      * Sets the 'drop-pending' state of this Database.
@@ -120,8 +119,6 @@ public:
                           BSONObjBuilder* const output,
                           const double scale = 1) const = 0;
 
-    virtual const DatabaseCatalogEntry* getDatabaseCatalogEntry() const = 0;
-
     /**
      * dropCollection() will refuse to drop system collections. Use dropCollectionEvenIfSystem() if
      * that is required.
@@ -131,19 +128,19 @@ public:
      *
      * The caller should hold a DB X lock and ensure there are no index builds in progress on the
      * collection.
+     * N.B. Namespace argument is passed by value as it may otherwise disappear or change.
      */
     virtual Status dropCollection(OperationContext* const opCtx,
-                                  const StringData fullns,
+                                  NamespaceString nss,
                                   repl::OpTime dropOpTime = {}) const = 0;
     virtual Status dropCollectionEvenIfSystem(OperationContext* const opCtx,
-                                              const NamespaceString& fullns,
+                                              NamespaceString nss,
                                               repl::OpTime dropOpTime = {}) const = 0;
 
-    virtual Status dropView(OperationContext* const opCtx,
-                            const NamespaceString& viewName) const = 0;
+    virtual Status dropView(OperationContext* const opCtx, NamespaceString viewName) const = 0;
 
     virtual Collection* createCollection(OperationContext* const opCtx,
-                                         StringData ns,
+                                         const NamespaceString& nss,
                                          const CollectionOptions& options = CollectionOptions(),
                                          const bool createDefaultIndexes = true,
                                          const BSONObj& idIndex = BSONObj()) const = 0;
@@ -152,22 +149,21 @@ public:
                               const NamespaceString& viewName,
                               const CollectionOptions& options) const = 0;
 
-    /**
-     * @param ns - this is fully qualified, which is maybe not ideal ???
-     */
-    virtual Collection* getCollection(OperationContext* opCtx, const StringData ns) const = 0;
-
-    virtual Collection* getCollection(OperationContext* opCtx, const NamespaceString& ns) const = 0;
+    virtual Collection* getCollection(OperationContext* opCtx,
+                                      const NamespaceString& nss) const = 0;
 
     virtual Collection* getOrCreateCollection(OperationContext* const opCtx,
                                               const NamespaceString& nss) const = 0;
 
+    /**
+     * Arguments are passed by value as they otherwise would be changing as result of renaming.
+     */
     virtual Status renameCollection(OperationContext* const opCtx,
-                                    const StringData fromNS,
-                                    const StringData toNS,
+                                    NamespaceString fromNss,
+                                    NamespaceString toNss,
                                     const bool stayTemp) const = 0;
 
-    virtual const std::string& getSystemViewsName() const = 0;
+    virtual const NamespaceString& getSystemViewsName() const = 0;
 
     /**
      * Generates a collection namespace suitable for creating a temporary collection.

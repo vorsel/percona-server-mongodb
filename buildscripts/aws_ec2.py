@@ -1,7 +1,5 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """AWS EC2 instance launcher and controller."""
-
-
 
 import base64
 import collections

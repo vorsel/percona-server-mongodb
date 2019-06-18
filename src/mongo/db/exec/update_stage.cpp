@@ -60,6 +60,7 @@
 namespace mongo {
 
 MONGO_FAIL_POINT_DEFINE(hangBeforeUpsertPerformsInsert);
+MONGO_FAIL_POINT_DEFINE(hangBeforeThrowWouldChangeOwningShard);
 
 using std::string;
 using std::unique_ptr;
@@ -178,9 +179,7 @@ UpdateStage::UpdateStage(OperationContext* opCtx,
         !(request->isFromOplogApplication() || request->getNamespaceString().isConfigDB() ||
           request->isFromMigration());
 
-    // Before we even start executing, we know whether or not this is a replacement
-    // style or $mod style update.
-    _specificStats.isDocReplacement = params.driver->isDocReplacement();
+    _specificStats.isModUpdate = params.driver->type() == UpdateDriver::UpdateType::kOperator;
 }
 
 BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, RecordId& recordId) {
@@ -316,7 +315,11 @@ BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, Reco
                 Snapshotted<RecordData> snap(oldObj.snapshotId(), oldRec);
 
                 if (isFCV42 && metadata->isSharded()) {
-                    assertUpdateToShardKeyFieldsIsValidAndDocStillBelongsToNode(metadata, oldObj);
+                    bool changesShardKeyOnSameNode =
+                        checkUpdateChangesShardKeyFields(metadata, oldObj);
+                    if (changesShardKeyOnSameNode && !args.preImageDoc) {
+                        args.preImageDoc = oldObj.value().getOwned();
+                    }
                 }
 
                 WriteUnitOfWork wunit(getOpCtx());
@@ -338,11 +341,15 @@ BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, Reco
                                   << BSONObjMaxUserSize,
                     newObj.objsize() <= BSONObjMaxUserSize);
 
-            if (isFCV42 && metadata->isSharded()) {
-                assertUpdateToShardKeyFieldsIsValidAndDocStillBelongsToNode(metadata, oldObj);
-            }
-
             if (!request->isExplain()) {
+                if (isFCV42 && metadata->isSharded()) {
+                    bool changesShardKeyOnSameNode =
+                        checkUpdateChangesShardKeyFields(metadata, oldObj);
+                    if (changesShardKeyOnSameNode && !args.preImageDoc) {
+                        args.preImageDoc = oldObj.value().getOwned();
+                    }
+                }
+
                 WriteUnitOfWork wunit(getOpCtx());
                 newRecordId = collection()->updateDocument(getOpCtx(),
                                                            recordId,
@@ -417,7 +424,7 @@ BSONObj UpdateStage::applyUpdateOpsForInsert(OperationContext* opCtx,
         }
         requiredPaths.keepShortest(&idFieldRef);
         uassertStatusOK(driver->populateDocumentWithQueryFields(*cq, requiredPaths, *doc));
-        if (driver->isDocReplacement())
+        if (driver->type() == UpdateDriver::UpdateType::kReplacement)
             stats->fastmodinsert = true;
     } else {
         fassert(17354, CanonicalQuery::isSimpleIdQuery(query));
@@ -877,7 +884,7 @@ void UpdateStage::recordUpdateStatsInOpDebug(const UpdateStats* updateStats, OpD
 
 UpdateResult UpdateStage::makeUpdateResult(const UpdateStats* updateStats) {
     return UpdateResult(updateStats->nMatched > 0 /* Did we update at least one obj? */,
-                        !updateStats->isDocReplacement /* $mod or obj replacement */,
+                        updateStats->isModUpdate /* Is this a $mod update? */,
                         updateStats->nModified /* number of modified docs, no no-ops */,
                         updateStats->nMatched /* # of docs matched/updated, even no-ops */,
                         updateStats->objInserted);
@@ -889,8 +896,8 @@ PlanStage::StageState UpdateStage::prepareToRetryWSM(WorkingSetID idToRetry, Wor
     return NEED_YIELD;
 }
 
-void UpdateStage::assertUpdateToShardKeyFieldsIsValidAndDocStillBelongsToNode(
-    ScopedCollectionMetadata metadata, const Snapshotted<BSONObj>& oldObj) {
+bool UpdateStage::checkUpdateChangesShardKeyFields(ScopedCollectionMetadata metadata,
+                                                   const Snapshotted<BSONObj>& oldObj) {
     auto newObj = _doc.getObject();
     auto oldShardKey = metadata->extractDocumentKey(oldObj.value());
     auto newShardKey = metadata->extractDocumentKey(newObj);
@@ -898,7 +905,7 @@ void UpdateStage::assertUpdateToShardKeyFieldsIsValidAndDocStillBelongsToNode(
     // If the shard key fields remain unchanged by this update or if this document is an orphan and
     // so does not belong to this shard, we can skip the rest of the checks.
     if ((newShardKey.woCompare(oldShardKey) == 0) || !metadata->keyBelongsToMe(oldShardKey)) {
-        return;
+        return false;
     }
 
     // Assert that the updated doc has all shard key fields and none are arrays or array
@@ -914,16 +921,30 @@ void UpdateStage::assertUpdateToShardKeyFieldsIsValidAndDocStillBelongsToNode(
                           << " shard key field.",
             !_params.request->isMulti());
 
-    // An update to a shard key value must either be a retryable write or run in a transaction.
+    // If this node is a replica set primary node, an attempted update to the shard key value must
+    // either be a retryable write or inside a transaction.
+    //
+    // If this node is a replica set secondary node, we can skip validation.
     uassert(ErrorCodes::IllegalOperation,
             str::stream() << "Must run update to shard key field "
                           << " in a multi-statement transaction or"
                              " with retryWrites: true.",
-            getOpCtx()->getTxnNumber());
+            getOpCtx()->getTxnNumber() || !getOpCtx()->writesAreReplicated());
 
-    uassert(WouldChangeOwningShardInfo(oldObj.value(), newObj),
-            str::stream() << "This update would cause the doc to change owning shards",
-            metadata->keyBelongsToMe(newShardKey));
+    if (!metadata->keyBelongsToMe(newShardKey)) {
+        if (MONGO_FAIL_POINT(hangBeforeThrowWouldChangeOwningShard)) {
+            log() << "Hit hangBeforeThrowWouldChangeOwningShard failpoint";
+            MONGO_FAIL_POINT_PAUSE_WHILE_SET_OR_INTERRUPTED(getOpCtx(),
+                                                            hangBeforeThrowWouldChangeOwningShard);
+        }
+
+        uasserted(WouldChangeOwningShardInfo(oldObj.value(), newObj),
+                  str::stream() << "This update would cause the doc to change owning shards");
+    }
+
+    // We passed all checks, so we will return that this update changes the shard key field, and
+    // the updated document will remain on the same node.
+    return true;
 }
 
 }  // namespace mongo

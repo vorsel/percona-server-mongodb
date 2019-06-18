@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """Packager Enterprise module."""
 
 # This program makes Debian and RPM repositories for MongoDB, by
@@ -38,7 +38,7 @@ import time
 
 sys.path.append(os.getcwd())
 
-import packager
+import packager  # pylint: disable=wrong-import-position
 
 # The MongoDB names for the architectures we support.
 ARCH_CHOICES = ["x86_64", "ppc64le", "s390x", "arm64"]
@@ -130,7 +130,7 @@ class EnterpriseDistro(packager.Distro):
             if self.dname == 'redhat':
                 return ["rhel67", "rhel72"]
             if self.dname == 'suse':
-                return ["suse11", "suse12"]
+                return ["suse11", "suse12", "suse15"]
             if self.dname == 'ubuntu':
                 return ["ubuntu1604", "ubuntu1804"]
             return []
@@ -277,10 +277,10 @@ def make_deb_repo(repo, distro, build_os):
     oldpwd = os.getcwd()
     os.chdir(repo + "../../../../../../")
     try:
-        dirs = set([
+        dirs = {
             os.path.dirname(deb)[2:]
             for deb in packager.backtick(["find", ".", "-name", "*.deb"]).decode('utf-8').split()
-        ])
+        }
         for directory in dirs:
             st = packager.backtick(["dpkg-scanpackages", directory, "/dev/null"])
             with open(directory + "/Packages", "wb") as fh:

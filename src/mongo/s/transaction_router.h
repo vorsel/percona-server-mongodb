@@ -225,13 +225,18 @@ public:
     const boost::optional<AtClusterTime>& getAtClusterTime() const;
 
     /**
-     * If a coordinator has been selected for the current transaction, returns its identifier
+     * If a coordinator has been selected for the current transaction, returns its id.
      */
     const boost::optional<ShardId>& getCoordinatorId() const;
 
     /**
-     * Commits the transaction. For transactions with multiple participants, this will initiate
-     * the two phase commit procedure.
+     * If a recovery shard has been selected for the current transaction, returns its id.
+     */
+    const boost::optional<ShardId>& getRecoveryShardId() const;
+
+    /**
+     * Commits the transaction. For transactions that performed writes to multiple shards, this will
+     * hand off the participant list to the coordinator to do two-phase commit.
      */
     BSONObj commitTransaction(OperationContext* opCtx,
                               const boost::optional<TxnRecoveryToken>& recoveryToken);
@@ -286,23 +291,15 @@ private:
     const LogicalSessionId& _sessionId() const;
 
     /**
-     * Run basic commit for transactions that touched a single shard.
+     * Retrieves the transaction's outcome from the shard specified in the recovery token.
      */
-    BSONObj _commitSingleShardTransaction(OperationContext* opCtx);
-
-    /**
-     * Skips explicit commit and instead waits for participants' read Timestamps to reach the level
-     * of durability specified by the writeConcern on 'opCtx'.
-     */
-    BSONObj _commitReadOnlyTransaction(OperationContext* opCtx);
-
     BSONObj _commitWithRecoveryToken(OperationContext* opCtx,
                                      const TxnRecoveryToken& recoveryToken);
 
     /**
-     * Run two phase commit for transactions that touched multiple shards.
+     * Hands off coordinating a two-phase commit across all participants to the coordinator shard.
      */
-    BSONObj _commitMultiShardTransaction(OperationContext* opCtx);
+    BSONObj _handOffCommitToCoordinator(OperationContext* opCtx);
 
     /**
      * Sets the given logical time as the atClusterTime for the transaction to be the greater of the
@@ -354,8 +351,18 @@ private:
     // Map of current participants of the current transaction.
     StringMap<Participant> _participants;
 
-    // The id of coordinator participant, used to construct prepare requests.
+    // The id of participant chosen as the two-phase commit coordinator. If, at commit time,
+    // two-phase commit is required, the participant list is handed off to this shard. Is unset
+    // until the transaction has targeted a participant, and is set to the first participant
+    // targeted. Is reset if the first participant targeted returns a "needs retargeting" error.
     boost::optional<ShardId> _coordinatorId;
+
+    // The id of the recovery participant. Passed in the recoveryToken that is included on responses
+    // to the client. Is unset until the transaction has done a write, and is set to the first
+    // participant that reports having done a write. Is reset if that participant is removed from
+    // the participant list because another participant targeted in the same statement returned a
+    // "needs retargeting" error.
+    boost::optional<ShardId> _recoveryShardId;
 
     // The read concern the current transaction was started with.
     repl::ReadConcernArgs _readConcernArgs;

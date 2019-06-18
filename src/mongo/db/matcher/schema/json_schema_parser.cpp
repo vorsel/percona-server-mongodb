@@ -33,8 +33,6 @@
 
 #include "mongo/db/matcher/schema/json_schema_parser.h"
 
-#include <boost/container/flat_set.hpp>
-
 #include "mongo/bson/bsontypes.h"
 #include "mongo/bson/unordered_fields_bsonelement_comparator.h"
 #include "mongo/db/commands/feature_compatibility_version_documentation.h"
@@ -233,7 +231,7 @@ StatusWithMatchExpression parseLength(StringData path,
                                       BSONElement length,
                                       InternalSchemaTypeExpression* typeExpr,
                                       BSONType restrictionType) {
-    auto parsedLength = MatchExpressionParser::parseIntegerElementToNonNegativeLong(length);
+    auto parsedLength = length.parseIntegerElementToNonNegativeLong();
     if (!parsedLength.isOK()) {
         return parsedLength.getStatus();
     }
@@ -389,7 +387,7 @@ StatusWithMatchExpression parseEnum(StringData path, BSONElement enumElement) {
  * required property names. If the contents of the "required" keyword are invalid, returns a non-OK
  * status.
  */
-StatusWith<boost::container::flat_set<StringData>> parseRequired(BSONElement requiredElt) {
+StatusWith<StringDataSet> parseRequired(BSONElement requiredElt) {
     if (requiredElt.type() != BSONType::Array) {
         return {ErrorCodes::TypeMismatch,
                 str::stream() << "$jsonSchema keyword '" << JSONSchemaParser::kSchemaRequiredKeyword
@@ -397,7 +395,7 @@ StatusWith<boost::container::flat_set<StringData>> parseRequired(BSONElement req
                               << requiredElt.type()};
     }
 
-    std::vector<StringData> propertyVec;
+    StringDataSet properties;
     for (auto&& propertyName : requiredElt.embeddedObject()) {
         if (propertyName.type() != BSONType::String) {
             return {ErrorCodes::TypeMismatch,
@@ -407,36 +405,36 @@ StatusWith<boost::container::flat_set<StringData>> parseRequired(BSONElement req
                                   << propertyName.type()};
         }
 
-        propertyVec.push_back(propertyName.valueStringData());
+        const auto[it, didInsert] = properties.insert(propertyName.valueStringData());
+        if (!didInsert) {
+            return {ErrorCodes::FailedToParse,
+                    str::stream() << "$jsonSchema keyword '"
+                                  << JSONSchemaParser::kSchemaRequiredKeyword
+                                  << "' array cannot contain duplicate values"};
+        }
     }
 
-    if (propertyVec.empty()) {
+    if (properties.empty()) {
         return {ErrorCodes::FailedToParse,
                 str::stream() << "$jsonSchema keyword '" << JSONSchemaParser::kSchemaRequiredKeyword
                               << "' cannot be an empty array"};
     }
 
-    boost::container::flat_set<StringData> requiredProperties{propertyVec.begin(),
-                                                              propertyVec.end()};
-    if (requiredProperties.size() != propertyVec.size()) {
-        return {ErrorCodes::FailedToParse,
-                str::stream() << "$jsonSchema keyword '" << JSONSchemaParser::kSchemaRequiredKeyword
-                              << "' array cannot contain duplicate values"};
-    }
-    return requiredProperties;
+    return std::move(properties);
 }
 
 /**
  * Given the already-parsed set of required properties, returns a MatchExpression which ensures that
  * those properties exist. Returns a parsing error if the translation fails.
  */
-StatusWithMatchExpression translateRequired(
-    const boost::container::flat_set<StringData>& requiredProperties,
-    StringData path,
-    InternalSchemaTypeExpression* typeExpr) {
+StatusWithMatchExpression translateRequired(const StringDataSet& requiredProperties,
+                                            StringData path,
+                                            InternalSchemaTypeExpression* typeExpr) {
     auto andExpr = stdx::make_unique<AndMatchExpression>();
 
-    for (auto&& propertyName : requiredProperties) {
+    std::vector<StringData> sortedProperties(requiredProperties.begin(), requiredProperties.end());
+    std::sort(sortedProperties.begin(), sortedProperties.end());
+    for (auto&& propertyName : sortedProperties) {
         andExpr->add(new ExistsMatchExpression(propertyName));
     }
 
@@ -452,13 +450,12 @@ StatusWithMatchExpression translateRequired(
     return makeRestriction(BSONType::Object, path, std::move(objectMatch), typeExpr);
 }
 
-StatusWithMatchExpression parseProperties(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    StringData path,
-    BSONElement propertiesElt,
-    InternalSchemaTypeExpression* typeExpr,
-    const boost::container::flat_set<StringData>& requiredProperties,
-    bool ignoreUnknownKeywords) {
+StatusWithMatchExpression parseProperties(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                          StringData path,
+                                          BSONElement propertiesElt,
+                                          InternalSchemaTypeExpression* typeExpr,
+                                          const StringDataSet& requiredProperties,
+                                          bool ignoreUnknownKeywords) {
     if (propertiesElt.type() != BSONType::Object) {
         return {Status(ErrorCodes::TypeMismatch,
                        str::stream() << "$jsonSchema keyword '"
@@ -609,14 +606,13 @@ StatusWithMatchExpression parseAllowedProperties(
     InternalSchemaTypeExpression* typeExpr,
     bool ignoreUnknownKeywords) {
     // Collect the set of properties named by the 'properties' keyword.
-    boost::container::flat_set<StringData> propertyNames;
+    StringDataSet propertyNames;
     if (propertiesElt) {
         std::vector<StringData> propertyNamesVec;
         for (auto&& elem : propertiesElt.embeddedObject()) {
             propertyNamesVec.push_back(elem.fieldNameStringData());
         }
-        propertyNames = boost::container::flat_set<StringData>(propertyNamesVec.begin(),
-                                                               propertyNamesVec.end());
+        propertyNames.insert(propertyNamesVec.begin(), propertyNamesVec.end());
     }
 
     auto patternProperties =
@@ -658,8 +654,7 @@ template <class T>
 StatusWithMatchExpression parseNumProperties(StringData path,
                                              BSONElement numProperties,
                                              InternalSchemaTypeExpression* typeExpr) {
-    auto parsedNumProps =
-        MatchExpressionParser::parseIntegerElementToNonNegativeLong(numProperties);
+    auto parsedNumProps = numProperties.parseIntegerElementToNonNegativeLong();
     if (!parsedNumProps.isOK()) {
         return parsedNumProps.getStatus();
     }
@@ -1119,7 +1114,7 @@ Status translateObjectKeywords(StringMap<BSONElement>& keywordMap,
                                InternalSchemaTypeExpression* typeExpr,
                                AndMatchExpression* andExpr,
                                bool ignoreUnknownKeywords) {
-    boost::container::flat_set<StringData> requiredProperties;
+    StringDataSet requiredProperties;
     if (auto requiredElt = keywordMap[JSONSchemaParser::kSchemaRequiredKeyword]) {
         auto requiredStatus = parseRequired(requiredElt);
         if (!requiredStatus.isOK()) {
@@ -1370,12 +1365,33 @@ Status translateEncryptionKeywords(StringMap<BSONElement>& keywordMap,
             // This checks the types of all the fields. Will throw on any parsing error.
             const IDLParserErrorContext encryptCtxt("encrypt");
             auto encryptInfo = EncryptionInfo::parse(encryptCtxt, encryptElt.embeddedObject());
+            auto infoType = encryptInfo.getBsonType();
+            uassert(31051,
+                    "A deterministically encrypted field must have exactly one specified "
+                    "non-object type.",
+                    encryptInfo.getAlgorithm() != FleAlgorithmEnum::kDeterministic ||
+                        ((infoType && infoType.get().typeSet().isSingleType()) &&
+                         !infoType.get().typeSet().hasType(BSONType::Object)));
+
+            if (auto bsonType = encryptInfo.getBsonType()) {
+                auto typeSet = bsonType->typeSet();
+                auto checkType = [typeSet](BSONType typeToCheck) {
+                    uassert(31041,
+                            std::string("Cannot encrypt single-valued type")
+                                .append(typeName(typeToCheck)),
+                            !typeSet.hasType(typeToCheck));
+                };
+                checkType(BSONType::MinKey);
+                checkType(BSONType::MaxKey);
+                checkType(BSONType::Undefined);
+                checkType(BSONType::jstNULL);
+            }
 
             andExpr->add(new InternalSchemaBinDataSubTypeExpression(path, BinDataType::Encrypt));
 
-            if (auto typeOptional = encryptInfo.getBsonType())
+            if (auto typeOptional = infoType)
                 andExpr->add(new InternalSchemaBinDataEncryptedTypeExpression(
-                    path, typeFromName(typeOptional.get())));
+                    path, typeOptional->typeSet()));
         } catch (const AssertionException&) {
             return exceptionToStatus();
         }

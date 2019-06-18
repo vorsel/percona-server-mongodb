@@ -38,12 +38,12 @@
 #include "mongo/base/static_assert.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/config.h"
-#include "mongo/db/catalog/uuid_catalog.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/locker.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
@@ -279,8 +279,8 @@ struct LockHead {
 
     // Doubly-linked list of requests, which have not been granted yet because they conflict
     // with the set of granted modes. Requests are queued at the end of the queue and are
-    // granted from the beginning forward, which gives these locks FIFO ordering. Exceptions
-    // are high-priority locks, such as the MMAP V1 flush lock.
+    // granted from the beginning forward, which gives these locks FIFO ordering. Exceptions to the
+    // FIFO rule are strong lock requests for global resources, such as MODE_X for Global.
     LockRequestList conflictList;
 
     // Counts the conflicting requests for each of the lock modes. These counts should exactly
@@ -965,8 +965,8 @@ std::string ResourceId::toString() const {
     }
 
     if (getType() == RESOURCE_DATABASE || getType() == RESOURCE_COLLECTION) {
-        UUIDCatalog& uuidCatalog = UUIDCatalog::get(getGlobalServiceContext());
-        boost::optional<std::string> resourceName = uuidCatalog.lookupResourceName(*this);
+        CollectionCatalog& catalog = CollectionCatalog::get(getGlobalServiceContext());
+        boost::optional<std::string> resourceName = catalog.lookupResourceName(*this);
         if (resourceName) {
             ss << ", " << *resourceName;
         }

@@ -29,9 +29,9 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/create_collection.h"
-#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/jsobj.h"
@@ -186,11 +186,12 @@ TEST_F(CreateCollectionTest,
     ASSERT_EQUALS(uuid, getCollectionUuid(opCtx.get(), newNss));
 
     // Check that old collection that was renamed out of the way still exists.
-    auto& uuidCatalog = UUIDCatalog::get(opCtx.get());
-    auto renamedCollectionNss = uuidCatalog.lookupNSSByUUID(existingCollectionUuid);
-    ASSERT_TRUE(collectionExists(opCtx.get(), renamedCollectionNss))
+    auto& catalog = CollectionCatalog::get(opCtx.get());
+    auto renamedCollectionNss = catalog.lookupNSSByUUID(existingCollectionUuid);
+    ASSERT(renamedCollectionNss);
+    ASSERT_TRUE(collectionExists(opCtx.get(), *renamedCollectionNss))
         << "old renamed collection with UUID " << existingCollectionUuid
-        << " missing: " << renamedCollectionNss;
+        << " missing: " << *renamedCollectionNss;
 }
 
 TEST_F(CreateCollectionTest,

@@ -64,8 +64,8 @@
 #include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/fail_point_service.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
 
 #include "mongo/unittest/barrier.h"
 #include "mongo/unittest/unittest.h"
@@ -518,7 +518,8 @@ RemoteCommandResponse makeCursorResponse(CursorId cursorId,
                                          bool isFirstBatch = true,
                                          int rbid = 1) {
     OpTime futureOpTime(Timestamp(1000, 1000), 1000);
-    rpc::OplogQueryMetadata oqMetadata(futureOpTime, futureOpTime, rbid, 0, 0);
+    Date_t futureWallTime = Date_t::min() + Seconds(futureOpTime.getSecs());
+    rpc::OplogQueryMetadata oqMetadata({futureOpTime, futureWallTime}, futureOpTime, rbid, 0, 0);
 
     BSONObjBuilder bob;
     {
@@ -1848,6 +1849,11 @@ TEST_F(InitialSyncerTest, InitialSyncerPassesThroughOplogFetcherCallbackError) {
 
 TEST_F(InitialSyncerTest,
        InitialSyncerSucceedsOnEarlyOplogFetcherCompletionIfThereAreNoOperationsToApply) {
+    // Skip reconstructing prepared transactions at the end of initial sync because
+    // InitialSyncerTest does not construct ServiceEntryPoint and this causes a segmentation fault
+    // when reconstructPreparedTransactions uses DBDirectClient to call into ServiceEntryPoint.
+    FailPointEnableBlock skipReconstructPreparedTransactions("skipReconstructPreparedTransactions");
+
     auto initialSyncer = &getInitialSyncer();
     auto opCtx = makeOpCtx();
 
@@ -1911,6 +1917,11 @@ TEST_F(InitialSyncerTest,
 TEST_F(
     InitialSyncerTest,
     InitialSyncerSucceedsOnEarlyOplogFetcherCompletionIfThereAreEnoughOperationsInTheOplogBufferToReachEndTimestamp) {
+    // Skip reconstructing prepared transactions at the end of initial sync because
+    // InitialSyncerTest does not construct ServiceEntryPoint and this causes a segmentation fault
+    // when reconstructPreparedTransactions uses DBDirectClient to call into ServiceEntryPoint.
+    FailPointEnableBlock skipReconstructPreparedTransactions("skipReconstructPreparedTransactions");
+
     auto initialSyncer = &getInitialSyncer();
     auto opCtx = makeOpCtx();
 
@@ -3142,6 +3153,11 @@ TEST_F(InitialSyncerTest,
 }
 
 TEST_F(InitialSyncerTest, LastOpTimeShouldBeSetEvenIfNoOperationsAreAppliedAfterCloning) {
+    // Skip reconstructing prepared transactions at the end of initial sync because
+    // InitialSyncerTest does not construct ServiceEntryPoint and this causes a segmentation fault
+    // when reconstructPreparedTransactions uses DBDirectClient to call into ServiceEntryPoint.
+    FailPointEnableBlock skipReconstructPreparedTransactions("skipReconstructPreparedTransactions");
+
     auto initialSyncer = &getInitialSyncer();
     auto opCtx = makeOpCtx();
 
@@ -3846,6 +3862,11 @@ void InitialSyncerTest::doSuccessfulInitialSyncWithOneBatch(bool shouldSetFCV) {
 
 TEST_F(InitialSyncerTest,
        InitialSyncerReturnsLastAppliedOnReachingStopTimestampAfterApplyingOneBatch) {
+    // Skip reconstructing prepared transactions at the end of initial sync because
+    // InitialSyncerTest does not construct ServiceEntryPoint and this causes a segmentation fault
+    // when reconstructPreparedTransactions uses DBDirectClient to call into ServiceEntryPoint.
+    FailPointEnableBlock skipReconstructPreparedTransactions("skipReconstructPreparedTransactions");
+
     // Tell test to setFCV=4.2 before the last rollback ID check.
     // _rollbackCheckerCheckForRollbackCallback() calls upgradeNonReplicatedUniqueIndexes
     // only if fCV is 4.2.
@@ -3858,6 +3879,11 @@ TEST_F(InitialSyncerTest,
 
 TEST_F(InitialSyncerTest,
        InitialSyncerReturnsLastAppliedOnReachingStopTimestampAfterApplyingMultipleBatches) {
+    // Skip reconstructing prepared transactions at the end of initial sync because
+    // InitialSyncerTest does not construct ServiceEntryPoint and this causes a segmentation fault
+    // when reconstructPreparedTransactions uses DBDirectClient to call into ServiceEntryPoint.
+    FailPointEnableBlock skipReconstructPreparedTransactions("skipReconstructPreparedTransactions");
+
     auto initialSyncer = &getInitialSyncer();
     auto opCtx = makeOpCtx();
 
@@ -3965,6 +3991,11 @@ TEST_F(InitialSyncerTest,
 TEST_F(
     InitialSyncerTest,
     InitialSyncerSchedulesLastOplogEntryFetcherToGetNewStopTimestampIfMissingDocumentsHaveBeenFetchedDuringMultiInitialSyncApply) {
+    // Skip reconstructing prepared transactions at the end of initial sync because
+    // InitialSyncerTest does not construct ServiceEntryPoint and this causes a segmentation fault
+    // when reconstructPreparedTransactions uses DBDirectClient to call into ServiceEntryPoint.
+    FailPointEnableBlock skipReconstructPreparedTransactions("skipReconstructPreparedTransactions");
+
     auto initialSyncer = &getInitialSyncer();
     auto opCtx = makeOpCtx();
 
@@ -4141,6 +4172,11 @@ TEST_F(InitialSyncerTest, OplogOutOfOrderOnOplogFetchFinish) {
 }
 
 TEST_F(InitialSyncerTest, GetInitialSyncProgressReturnsCorrectProgress) {
+    // Skip reconstructing prepared transactions at the end of initial sync because
+    // InitialSyncerTest does not construct ServiceEntryPoint and this causes a segmentation fault
+    // when reconstructPreparedTransactions uses DBDirectClient to call into ServiceEntryPoint.
+    FailPointEnableBlock skipReconstructPreparedTransactions("skipReconstructPreparedTransactions");
+
     auto initialSyncer = &getInitialSyncer();
     auto opCtx = makeOpCtx();
     ASSERT_OK(ServerParameterSet::getGlobal()
@@ -4493,6 +4529,11 @@ TEST_F(InitialSyncerTest, GetInitialSyncProgressOmitsClonerStatsIfClonerStatsExc
 }
 
 TEST_F(InitialSyncerTest, InitialSyncerDoesNotCallUpgradeNonReplicatedUniqueIndexesOnFCV40) {
+    // Skip reconstructing prepared transactions at the end of initial sync because
+    // InitialSyncerTest does not construct ServiceEntryPoint and this causes a segmentation fault
+    // when reconstructPreparedTransactions uses DBDirectClient to call into ServiceEntryPoint.
+    FailPointEnableBlock skipReconstructPreparedTransactions("skipReconstructPreparedTransactions");
+
     // In MongoDB 4.2, upgradeNonReplicatedUniqueIndexes will only be called if fCV is 4.2.
     doSuccessfulInitialSyncWithOneBatch(false);
 

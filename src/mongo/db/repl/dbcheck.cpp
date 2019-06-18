@@ -30,12 +30,12 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/bson/simple_bsonelement_comparator.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/health_log.h"
 #include "mongo/db/catalog/index_catalog.h"
-#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/operation_context.h"
@@ -238,6 +238,33 @@ std::string hashCollectionInfo(const DbCheckCollectionInformation& info) {
     return digestToString(digest);
 }
 
+std::pair<boost::optional<UUID>, boost::optional<UUID>> getPrevAndNextUUIDs(
+    OperationContext* opCtx, Collection* collection) {
+    const CollectionCatalog& catalog = CollectionCatalog::get(opCtx);
+    const UUID uuid = *collection->uuid();
+
+    std::vector<CollectionUUID> collectionUUIDs =
+        catalog.getAllCollectionUUIDsFromDb(collection->ns().db());
+    auto uuidIt = std::find(collectionUUIDs.begin(), collectionUUIDs.end(), uuid);
+    invariant(uuidIt != collectionUUIDs.end());
+
+    auto prevIt = std::prev(uuidIt);
+    auto nextIt = std::next(uuidIt);
+
+    boost::optional<UUID> prevUUID;
+    boost::optional<UUID> nextUUID;
+
+    if (prevIt != collectionUUIDs.end()) {
+        prevUUID = *prevIt;
+    }
+
+    if (nextIt != collectionUUIDs.end()) {
+        nextUUID = *nextIt;
+    }
+
+    return std::make_pair(prevUUID, nextUUID);
+}
+
 std::unique_ptr<HealthLogEntry> dbCheckCollectionEntry(const NamespaceString& nss,
                                                        const UUID& uuid,
                                                        const DbCheckCollectionInformation& expected,
@@ -374,7 +401,7 @@ AutoGetDbForDbCheck::AutoGetDbForDbCheck(OperationContext* opCtx, const Namespac
 AutoGetCollectionForDbCheck::AutoGetCollectionForDbCheck(OperationContext* opCtx,
                                                          const NamespaceString& nss,
                                                          const OplogEntriesEnum& type)
-    : _agd(opCtx, nss), _collLock(opCtx->lockState(), nss.ns(), MODE_S) {
+    : _agd(opCtx, nss), _collLock(opCtx, nss, MODE_S) {
     std::string msg;
 
     _collection = _agd.getDb() ? _agd.getDb()->getCollection(opCtx, nss) : nullptr;
@@ -452,7 +479,7 @@ Status dbCheckDatabaseOnSecondary(OperationContext* opCtx,
                                   const DbCheckOplogCollection& entry) {
     // dbCheckCollectionResult-specific stuff.
     auto uuid = uassertStatusOK(UUID::parse(entry.getUuid().toString()));
-    auto collection = UUIDCatalog::get(opCtx).lookupCollectionByUUID(uuid);
+    auto collection = CollectionCatalog::get(opCtx).lookupCollectionByUUID(uuid);
 
     if (!collection) {
         Status status(ErrorCodes::NamespaceNotFound, "Could not find collection for dbCheck");
@@ -471,13 +498,15 @@ Status dbCheckDatabaseOnSecondary(OperationContext* opCtx,
     expected.collectionName = entry.getNss().coll().toString();
     found.collectionName = collection->ns().coll().toString();
 
+    auto prevAndNext = getPrevAndNextUUIDs(opCtx, collection);
+
     // found/expected previous UUID,
     expected.prev = entry.getPrev();
-    found.prev = UUIDCatalog::get(opCtx).prev(db, uuid);
+    found.prev = prevAndNext.first;
 
     // found/expected next UUID,
     expected.next = entry.getNext();
-    found.next = UUIDCatalog::get(opCtx).next(db, uuid);
+    found.next = prevAndNext.second;
 
     // found/expected indices,
     expected.indexes = entry.getIndexes();

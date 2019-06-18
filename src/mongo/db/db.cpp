@@ -50,14 +50,13 @@
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/sasl_options.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/create_collection.h"
 #include "mongo/db/catalog/database.h"
-#include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/catalog/database_holder_impl.h"
 #include "mongo/db/catalog/health_log.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/index_key_validate.h"
-#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
@@ -107,6 +106,7 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_external_state_impl.h"
 #include "mongo/db/repl/replication_coordinator_impl.h"
+#include "mongo/db/repl/replication_coordinator_impl_gen.h"
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/replication_recovery.h"
 #include "mongo/db/repl/storage_interface_impl.h"
@@ -127,6 +127,7 @@
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/storage/backup_cursor_hooks.h"
 #include "mongo/db/storage/encryption_hooks.h"
+#include "mongo/db/storage/flow_control_parameters_gen.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/storage/storage_engine_lock_file.h"
@@ -270,7 +271,6 @@ ExitCode _initAndListen(int listenPort) {
     serviceContext->setFastClockSource(FastClockSourceFactory::create(Milliseconds(10)));
     auto opObserverRegistry = stdx::make_unique<OpObserverRegistry>();
     opObserverRegistry->addObserver(stdx::make_unique<OpObserverShardingImpl>());
-    opObserverRegistry->addObserver(stdx::make_unique<UUIDCatalogObserver>());
     opObserverRegistry->addObserver(stdx::make_unique<AuthOpObserver>());
 
     if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
@@ -435,6 +435,10 @@ ExitCode _initAndListen(int listenPort) {
     // featureCompatibilityVersion parameter to still be uninitialized until after startup.
     if (canCallFCVSetIfCleanStartup && (!replSettings.usingReplSets() || nonLocalDatabases)) {
         invariant(serverGlobalParams.featureCompatibility.isVersionInitialized());
+    }
+
+    if (gFlowControlEnabled.load()) {
+        log() << "Flow Control is enabled on this deployment.";
     }
 
     if (storageGlobalParams.upgrade) {
@@ -880,7 +884,12 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
         }
 
         try {
-            replCoord->stepDown(opCtx, false /* force */, Seconds(10), Seconds(120));
+            // For faster tests, we allow a short wait time with setParameter.
+            auto waitTime = repl::waitForStepDownOnNonCommandShutdown.load()
+                ? Milliseconds(Seconds(10))
+                : Milliseconds(100);
+
+            replCoord->stepDown(opCtx, false /* force */, waitTime, Seconds(120));
         } catch (const ExceptionFor<ErrorCodes::NotMaster>&) {
             // ignore not master errors
         } catch (const DBException& e) {
@@ -971,7 +980,7 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
 
     // Shutdown and wait for the service executor to exit
     if (auto svcExec = serviceContext->getServiceExecutor()) {
-        Status status = svcExec->shutdown(Seconds(5));
+        Status status = svcExec->shutdown(Seconds(10));
         if (!status.isOK()) {
             log(LogComponent::kNetwork) << "Service executor failed to shutdown within timelimit: "
                                         << status.reason();

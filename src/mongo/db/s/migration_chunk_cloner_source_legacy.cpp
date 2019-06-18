@@ -55,8 +55,8 @@
 #include "mongo/s/grid.h"
 #include "mongo/util/elapsed_tracker.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -92,7 +92,7 @@ bool shouldApplyOplogToSession(const repl::OplogEntry& oplog,
                                const ShardKeyPattern& keyPattern) {
     // Skip appending CRUD operations that don't pertain to the ChunkRange being migrated.
     if (oplog.isCrudOpType()) {
-        auto shardKey = keyPattern.extractShardKeyFromDoc(oplog.getOperationToApply());
+        auto shardKey = keyPattern.extractShardKeyFromDoc(oplog.getObjectContainingDocumentKey());
         if (!range.containsKey(shardKey)) {
             return false;
         }
@@ -126,6 +126,7 @@ public:
     void commit(boost::optional<Timestamp>) override {
         _cloner->_consumeOperationTrackRequestAndAddToTransferModsQueue(
             _idObj, _op, _opTime, _prePostImageOpTime);
+        _cloner->_decrementOutstandingOperationTrackRequests();
     }
 
     void rollback() override {
@@ -138,6 +139,31 @@ private:
     const char _op;
     const repl::OpTime _opTime;
     const repl::OpTime _prePostImageOpTime;
+};
+
+/**
+ * Used to keep track of new transactions that involve documents in any chunk
+ * with an ongoing migration.
+ */
+class LogPrepareOrCommitOpForShardingHandler final : public RecoveryUnit::Change {
+public:
+    LogPrepareOrCommitOpForShardingHandler(MigrationChunkClonerSourceLegacy* cloner,
+                                           const repl::OpTime& opTime)
+        : _cloner(cloner), _opTime(opTime) {}
+
+    void commit(boost::optional<Timestamp>) override {
+        _cloner->_addToSessionMigrationOptimeQueue(
+            _opTime, SessionCatalogMigrationSource::EntryAtOpTimeType::kTransaction);
+        _cloner->_decrementOutstandingOperationTrackRequests();
+    }
+
+    void rollback() override {
+        _cloner->_decrementOutstandingOperationTrackRequests();
+    }
+
+private:
+    MigrationChunkClonerSourceLegacy* const _cloner;
+    const repl::OpTime _opTime;
 };
 
 MigrationChunkClonerSourceLegacy::MigrationChunkClonerSourceLegacy(MoveChunkRequest request,
@@ -377,19 +403,28 @@ void MigrationChunkClonerSourceLegacy::onInsertOp(OperationContext* opCtx,
 }
 
 void MigrationChunkClonerSourceLegacy::onUpdateOp(OperationContext* opCtx,
-                                                  const BSONObj& updatedDoc,
+                                                  boost::optional<BSONObj> preImageDoc,
+                                                  const BSONObj& postImageDoc,
                                                   const repl::OpTime& opTime,
                                                   const repl::OpTime& prePostImageOpTime) {
     dassert(opCtx->lockState()->isCollectionLockedForMode(_args.getNss(), MODE_IX));
 
-    BSONElement idElement = updatedDoc["_id"];
+    BSONElement idElement = postImageDoc["_id"];
     if (idElement.eoo()) {
         warning() << "logUpdateOp got a document with no _id field, ignoring updatedDoc: "
-                  << redact(updatedDoc);
+                  << redact(postImageDoc);
         return;
     }
 
-    if (!isInRange(updatedDoc, _args.getMinKey(), _args.getMaxKey(), _shardKeyPattern)) {
+    if (!isInRange(postImageDoc, _args.getMinKey(), _args.getMaxKey(), _shardKeyPattern)) {
+        // If the preImageDoc is not in range but the postImageDoc was, we know that the document
+        // has changed shard keys and no longer belongs in the chunk being cloned. We will model
+        // the deletion of the preImage document so that the destination chunk does not receive an
+        // outdated version of this document.
+        if (preImageDoc &&
+            isInRange(*preImageDoc, _args.getMinKey(), _args.getMaxKey(), _shardKeyPattern)) {
+            onDeleteOp(opCtx, *preImageDoc, opTime, prePostImageOpTime);
+        }
         return;
     }
 
@@ -432,6 +467,28 @@ void MigrationChunkClonerSourceLegacy::onDeleteOp(OperationContext* opCtx,
     }
 }
 
+void MigrationChunkClonerSourceLegacy::onTransactionPrepareOrUnpreparedCommit(
+    OperationContext* opCtx, const repl::OpTime& opTime) {
+
+    invariant(opCtx->getTxnNumber());
+
+    if (!_addedOperationToOutstandingOperationTrackRequests()) {
+        return;
+    }
+
+    opCtx->recoveryUnit()->registerChange(new LogPrepareOrCommitOpForShardingHandler(this, opTime));
+}
+
+void MigrationChunkClonerSourceLegacy::_addToSessionMigrationOptimeQueue(
+    const repl::OpTime& opTime,
+    SessionCatalogMigrationSource::EntryAtOpTimeType entryAtOpTimeType) {
+    if (auto sessionSource = _sessionCatalogSource.get()) {
+        if (!opTime.isNull()) {
+            sessionSource->notifyNewWriteOpTime(opTime, entryAtOpTimeType);
+        }
+    }
+}
+
 void MigrationChunkClonerSourceLegacy::_consumeOperationTrackRequestAndAddToTransferModsQueue(
     const BSONObj& idObj,
     const char op,
@@ -455,17 +512,10 @@ void MigrationChunkClonerSourceLegacy::_consumeOperationTrackRequestAndAddToTran
             MONGO_UNREACHABLE;
     }
 
-    if (auto sessionSource = _sessionCatalogSource.get()) {
-        if (!prePostImageOpTime.isNull()) {
-            sessionSource->notifyNewWriteOpTime(prePostImageOpTime);
-        }
-
-        if (!opTime.isNull()) {
-            sessionSource->notifyNewWriteOpTime(opTime);
-        }
-    }
-
-    _decrementOutstandingOperationTrackRequests();
+    _addToSessionMigrationOptimeQueue(
+        prePostImageOpTime, SessionCatalogMigrationSource::EntryAtOpTimeType::kRetryableWrite);
+    _addToSessionMigrationOptimeQueue(
+        opTime, SessionCatalogMigrationSource::EntryAtOpTimeType::kRetryableWrite);
 }
 
 bool MigrationChunkClonerSourceLegacy::_addedOperationToOutstandingOperationTrackRequests() {

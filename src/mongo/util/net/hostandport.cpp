@@ -39,8 +39,7 @@
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/server_options.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -111,16 +110,34 @@ std::string HostAndPort::toString() const {
     return ss.str();
 }
 
-void HostAndPort::append(StringBuilder& ss) const {
+template <typename SinkFunc>
+static void appendGeneric(const HostAndPort& hp, const SinkFunc& write) {
     // wrap ipv6 addresses in []s for roundtrip-ability
-    if (host().find(':') != std::string::npos) {
-        ss << '[' << host() << ']';
+    if (hp.host().find(':') != std::string::npos) {
+        write("[");
+        write(hp.host());
+        write("]");
     } else {
-        ss << host();
+        write(hp.host());
     }
-    if (host().find('/') == std::string::npos) {
-        ss << ':' << port();
+    if (hp.host().find('/') == std::string::npos) {
+        write(":");
+        write(hp.port());
     }
+}
+
+template <typename Stream>
+static Stream& appendToStream(const HostAndPort& hp, Stream& sink) {
+    appendGeneric(hp, [&sink](const auto& v) { sink << v; });
+    return sink;
+}
+
+void HostAndPort::append(StringBuilder& sink) const {
+    appendToStream(*this, sink);
+}
+
+void HostAndPort::append(fmt::writer& sink) const {
+    appendGeneric(*this, [&sink](const auto& v) { sink.write(v); });
 }
 
 bool HostAndPort::empty() const {
@@ -175,7 +192,7 @@ Status HostAndPort::initialize(StringData s) {
     if (hostPart.empty()) {
         return Status(ErrorCodes::FailedToParse,
                       str::stream() << "Empty host component parsing HostAndPort from \""
-                                    << escape(s.toString())
+                                    << str::escape(s.toString())
                                     << "\"");
     }
 
@@ -190,7 +207,7 @@ Status HostAndPort::initialize(StringData s) {
             return Status(ErrorCodes::FailedToParse,
                           str::stream() << "Port number " << port
                                         << " out of range parsing HostAndPort from \""
-                                        << escape(s.toString())
+                                        << str::escape(s.toString())
                                         << "\"");
         }
     } else {
@@ -202,17 +219,15 @@ Status HostAndPort::initialize(StringData s) {
 }
 
 std::ostream& operator<<(std::ostream& os, const HostAndPort& hp) {
-    return os << hp.toString();
+    return appendToStream(hp, os);
 }
 
-template <typename Allocator>
-StringBuilderImpl<Allocator>& operator<<(StringBuilderImpl<Allocator>& os, const HostAndPort& hp) {
-    return os << hp.toString();
+StringBuilder& operator<<(StringBuilder& os, const HostAndPort& hp) {
+    return appendToStream(hp, os);
 }
 
-template StringBuilderImpl<StackAllocator>& operator<<(StringBuilderImpl<StackAllocator>&,
-                                                       const HostAndPort&);
-template StringBuilderImpl<SharedBufferAllocator>& operator<<(
-    StringBuilderImpl<SharedBufferAllocator>&, const HostAndPort&);
+StackStringBuilder& operator<<(StackStringBuilder& os, const HostAndPort& hp) {
+    return appendToStream(hp, os);
+}
 
 }  // namespace mongo

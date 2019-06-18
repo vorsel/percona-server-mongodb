@@ -114,7 +114,7 @@ Status ParsedProjection::make(OperationContext* opCtx,
                                   "Cannot specify positional operator and $elemMatch.");
                 }
 
-                if (mongoutils::str::contains(elem.fieldName(), '.')) {
+                if (str::contains(elem.fieldName(), '.')) {
                     return Status(ErrorCodes::BadValue,
                                   "Cannot use $elemMatch projection on a nested field.");
                 }
@@ -149,7 +149,7 @@ Status ParsedProjection::make(OperationContext* opCtx,
                 pp->_arrayFields.push_back(elem.fieldNameStringData());
             } else if (e2.fieldNameStringData() == "$meta") {
                 // Field for meta must be top level.  We can relax this at some point.
-                if (mongoutils::str::contains(elem.fieldName(), '.')) {
+                if (str::contains(elem.fieldName(), '.')) {
                     return Status(ErrorCodes::BadValue, "field for $meta cannot be nested");
                 }
 
@@ -231,17 +231,17 @@ Status ParsedProjection::make(OperationContext* opCtx,
                               "Cannot specify positional operator and $elemMatch.");
             }
 
-            std::string after = mongoutils::str::after(elem.fieldName(), ".$");
-            if (mongoutils::str::contains(after, ".$")) {
-                mongoutils::str::stream ss;
+            StringData after = str::after(elem.fieldNameStringData(), ".$");
+            if (after.find(".$"_sd) != std::string::npos) {
+                str::stream ss;
                 ss << "Positional projection '" << elem.fieldName() << "' contains "
                    << "the positional operator more than once.";
                 return Status(ErrorCodes::BadValue, ss);
             }
 
-            std::string matchfield = mongoutils::str::before(elem.fieldName(), '.');
+            StringData matchfield = str::before(elem.fieldNameStringData(), '.');
             if (query && !_hasPositionalOperatorMatch(query, matchfield)) {
-                mongoutils::str::stream ss;
+                str::stream ss;
                 ss << "Positional projection '" << elem.fieldName() << "' does not "
                    << "match the query document.";
                 return Status(ErrorCodes::BadValue, ss);
@@ -382,15 +382,13 @@ bool ParsedProjection::isFieldRetainedExactly(StringData path) const {
 
 // static
 bool ParsedProjection::_isPositionalOperator(const char* fieldName) {
-    return mongoutils::str::contains(fieldName, ".$") &&
-        !mongoutils::str::contains(fieldName, ".$ref") &&
-        !mongoutils::str::contains(fieldName, ".$id") &&
-        !mongoutils::str::contains(fieldName, ".$db");
+    return str::contains(fieldName, ".$") && !str::contains(fieldName, ".$ref") &&
+        !str::contains(fieldName, ".$id") && !str::contains(fieldName, ".$db");
 }
 
 // static
 bool ParsedProjection::_hasPositionalOperatorMatch(const MatchExpression* const query,
-                                                   const std::string& matchfield) {
+                                                   StringData matchfield) {
     if (query->getCategory() == MatchExpression::MatchCategory::kLogical) {
         for (unsigned int i = 0; i < query->numChildren(); ++i) {
             if (_hasPositionalOperatorMatch(query->getChild(i), matchfield)) {
@@ -399,14 +397,13 @@ bool ParsedProjection::_hasPositionalOperatorMatch(const MatchExpression* const 
         }
     } else {
         StringData queryPath = query->path();
-        const char* pathRawData = queryPath.rawData();
         // We have to make a distinction between match expressions that are
         // initialized with an empty field/path name "" and match expressions
         // for which the path is not meaningful (eg. $where).
-        if (!pathRawData) {
+        if (!queryPath.rawData()) {
             return false;
         }
-        std::string pathPrefix = mongoutils::str::before(pathRawData, '.');
+        StringData pathPrefix = str::before(queryPath, '.');
         return pathPrefix == matchfield;
     }
     return false;

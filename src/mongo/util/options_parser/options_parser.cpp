@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <boost/filesystem.hpp>
 #include <boost/program_options.hpp>
+#include <cctype>
 #include <cerrno>
 #include <fstream>
 #include <stdio.h>
@@ -46,7 +47,6 @@
 #include "mongo/db/json.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/net/http_client.h"
 #include "mongo/util/options_parser/constraints.h"
@@ -55,6 +55,7 @@
 #include "mongo/util/options_parser/option_section.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/shell_exec.h"
+#include "mongo/util/str.h"
 #include "mongo/util/text.h"
 
 namespace mongo {
@@ -722,13 +723,15 @@ Status checkLongName(const po::variables_map& vm,
             for (StringVector_t::iterator keyValueVectorIt = keyValueVector.begin();
                  keyValueVectorIt != keyValueVector.end();
                  ++keyValueVectorIt) {
-                std::string key;
-                std::string value;
-                if (!mongoutils::str::splitOn(*keyValueVectorIt, '=', key, value)) {
+                StringData keySD;
+                StringData valueSD;
+                if (!str::splitOn(*keyValueVectorIt, '=', keySD, valueSD)) {
                     StringBuilder sb;
                     sb << "Illegal option assignment: \"" << *keyValueVectorIt << "\"";
                     return Status(ErrorCodes::BadValue, sb.str());
                 }
+                std::string key = keySD.toString();
+                std::string value = valueSD.toString();
                 // Make sure we aren't setting an option to two different values
                 if (mapValue.count(key) > 0 && mapValue[key] != value) {
                     StringBuilder sb;
@@ -1672,14 +1675,14 @@ Status OptionsParser::runConfigFile(
     const std::string& config,
     const std::map<std::string, std::string>& env,  // Unused, interface consistent with run()
     Environment* configEnvironment) {
-    // Add the default values to our resulting environment
-    Status ret = addDefaultValues(options, configEnvironment);
+    // Add values from the provided config file
+    Status ret = parseConfigFile(options, config, configEnvironment, ConfigExpand());
     if (!ret.isOK()) {
         return ret;
     }
 
-    // Add values from the provided config file
-    ret = parseConfigFile(options, config, configEnvironment, ConfigExpand());
+    // Add the default values to our resulting environment
+    ret = addDefaultValues(options, configEnvironment);
     if (!ret.isOK()) {
         return ret;
     }

@@ -48,16 +48,20 @@ public:
 
     TLTypeFactory(transport::ReactorHandle reactor,
                   transport::TransportLayer* tl,
-                  std::unique_ptr<NetworkConnectionHook> onConnectHook)
-        : _reactor(std::move(reactor)), _tl(tl), _onConnectHook(std::move(onConnectHook)) {}
+                  std::unique_ptr<NetworkConnectionHook> onConnectHook,
+                  const ConnectionPool::Options& connPoolOptions)
+        : _executor(std::move(reactor)),
+          _tl(tl),
+          _onConnectHook(std::move(onConnectHook)),
+          _connPoolOptions(connPoolOptions) {}
 
     std::shared_ptr<ConnectionPool::ConnectionInterface> makeConnection(
         const HostAndPort& hostAndPort,
         transport::ConnectSSLMode sslMode,
         size_t generation) override;
     std::shared_ptr<ConnectionPool::TimerInterface> makeTimer() override;
-    OutOfLineExecutor& getExecutor() override {
-        return *_reactor;
+    const std::shared_ptr<OutOfLineExecutor>& getExecutor() override {
+        return _executor;
     }
 
     Date_t now() override;
@@ -68,9 +72,12 @@ public:
     void release(Type* type);
 
 private:
-    transport::ReactorHandle _reactor;
+    auto reactor();
+
+    std::shared_ptr<OutOfLineExecutor> _executor;  // This is always a transport::Reactor
     transport::TransportLayer* _tl;
     std::unique_ptr<NetworkConnectionHook> _onConnectHook;
+    const ConnectionPool::Options _connPoolOptions;
 
     mutable stdx::mutex _mutex;
     AtomicWord<bool> _inShutdown{false};
@@ -130,12 +137,14 @@ public:
                  HostAndPort peer,
                  transport::ConnectSSLMode sslMode,
                  size_t generation,
-                 NetworkConnectionHook* onConnectHook)
+                 NetworkConnectionHook* onConnectHook,
+                 bool skipAuth)
         : ConnectionInterface(generation),
           TLTypeFactory::Type(factory),
           _reactor(reactor),
           _serviceContext(serviceContext),
           _timer(factory->makeTimer()),
+          _skipAuth(skipAuth),
           _peer(std::move(peer)),
           _sslMode(sslMode),
           _onConnectHook(onConnectHook) {}
@@ -165,6 +174,7 @@ private:
     transport::ReactorHandle _reactor;
     ServiceContext* const _serviceContext;
     std::shared_ptr<ConnectionPool::TimerInterface> _timer;
+    const bool _skipAuth;
 
     HostAndPort _peer;
     transport::ConnectSSLMode _sslMode;

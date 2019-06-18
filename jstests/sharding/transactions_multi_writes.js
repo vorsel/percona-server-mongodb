@@ -65,7 +65,7 @@
         // Start a transaction with majority read concern to ensure the orphan will be visible if
         // its shard is targeted and send the multi-write.
         session.startTransaction({readConcern: {level: "majority"}});
-        assert.writeOK(sessionDB.runCommand(writeCmd));
+        assert.commandWorked(sessionDB.runCommand(writeCmd));
 
         // The write shouldn't be visible until the transaction commits.
         assert.sameMembers(st.getDB(dbName)[collName].find().toArray(), [
@@ -124,21 +124,25 @@
 
     multiUpdate.ordered = false;
     runTest(st, session, multiUpdate, false /*staleRouter*/);
-    runTest(st, session, multiUpdate, true /*staleRouter*/);
+    // TODO: SERVER-39704 uncomment when mongos can internally retry txn on stale errors for real.
+    // runTest(st, session, multiUpdate, true /*staleRouter*/);
 
     multiUpdate.ordered = true;
     runTest(st, session, multiUpdate, false /*staleRouter*/);
-    runTest(st, session, multiUpdate, true /*staleRouter*/);
+    // TODO: SERVER-39704 uncomment when mongos can internally retry txn on stale errors for real.
+    // runTest(st, session, multiUpdate, true /*staleRouter*/);
 
     let multiDelete = {delete: collName, deletes: [{q: {skey: {$lte: 5}}, limit: 0}]};
 
     multiDelete.ordered = false;
     runTest(st, session, multiDelete, false /*staleRouter*/);
-    runTest(st, session, multiDelete, true /*staleRouter*/);
+    // TODO: SERVER-39704 uncomment when mongos can internally retry txn on stale errors for real.
+    // runTest(st, session, multiDelete, true /*staleRouter*/);
 
     multiDelete.ordered = true;
     runTest(st, session, multiDelete, false /*staleRouter*/);
-    runTest(st, session, multiDelete, true /*staleRouter*/);
+    // TODO: SERVER-39704 uncomment when mongos can internally retry txn on stale errors for real.
+    // runTest(st, session, multiDelete, true /*staleRouter*/);
 
     disableStaleVersionAndSnapshotRetriesWithinTransactions(st);
 

@@ -55,19 +55,19 @@ public:
      * Returns the return value last set by setFindHostReturnValue.
      * Returns ErrorCodes::InternalError if setFindHostReturnValue was never called.
      */
-    SharedSemiFuture<HostAndPort> findHostWithMaxWait(const ReadPreferenceSetting& readPref,
-                                                      Milliseconds maxWait) override;
+    SemiFuture<HostAndPort> findHostWithMaxWait(const ReadPreferenceSetting& readPref,
+                                                Milliseconds maxWait) override;
 
     StatusWith<HostAndPort> findHost(OperationContext* opCtx,
                                      const ReadPreferenceSetting& readPref) override;
 
     /**
-     * No-op for the mock.
+     * Adds host to a set of hosts marked down, otherwise a no-op.
      */
     void markHostNotMaster(const HostAndPort& host, const Status& status) override;
 
     /**
-     * No-op for the mock.
+     * Adds host to a set of hosts marked down, otherwise a no-op.
      */
     void markHostUnreachable(const HostAndPort& host, const Status& status) override;
 
@@ -81,9 +81,22 @@ public:
      */
     void setFindHostReturnValue(StatusWith<HostAndPort> returnValue);
 
+    /**
+     * Returns the current set of hosts marked down and resets the mock's internal list of marked
+     * down hosts.
+     */
+    std::set<HostAndPort> getAndClearMarkedDownHosts();
+
 private:
     ConnectionString _connectionStringReturnValue;
     StatusWith<HostAndPort> _findHostReturnValue;
+
+    // Protects _hostsMarkedDown.
+    mutable stdx::mutex _mutex;
+
+    // HostAndPorts marked not master or unreachable. Meant to verify a code path updates the
+    // RemoteCommandTargeterMock.
+    std::set<HostAndPort> _hostsMarkedDown;
 };
 
 }  // namespace mongo

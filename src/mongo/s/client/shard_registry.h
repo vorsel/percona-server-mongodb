@@ -181,6 +181,12 @@ public:
     bool reload(OperationContext* opCtx);
 
     /**
+     * Clears all entries from the shard registry entries, which will force the registry to do a
+     * reload on next access.
+     */
+    void clearEntries();
+
+    /**
      * Takes a connection string describing either a shard or config server replica set, looks
      * up the corresponding Shard object based on the replica set name, then updates the
      * ShardRegistry's notion of what hosts make up that shard.
@@ -259,22 +265,11 @@ public:
     void shutdown();
 
     /**
-     * For use in mongos and mongod which needs notifications about changes to shard and config
-     * server replset membership to update the ShardRegistry.
-     *
-     * This is expected to be run in an existing thread.
-     */
-    static void replicaSetChangeShardRegistryUpdateHook(const std::string& setName,
-                                                        const std::string& newConnectionString);
-
-    /**
      * For use in mongos which needs notifications about changes to shard replset membership to
      * update the config.shards collection.
-     *
-     * This is expected to be run in a brand new thread.
      */
-    static void replicaSetChangeConfigServerUpdateHook(const std::string& setName,
-                                                       const std::string& newConnectionString);
+    static void updateReplicaSetOnConfigServer(ServiceContext* serviceContex,
+                                               const ConnectionString& connStr) noexcept;
 
 private:
     /**
