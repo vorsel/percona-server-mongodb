@@ -50,6 +50,6 @@ commands:
         description: "The fraction of eligible ops, in the range [0,1), to be logged/profiled."
         optional: true
       ratelimit:
-        type: safeInt32
+        type: safeInt64
         description: "The rate limiter value for profiling. Integer value in the range 1-RATE_LIMIT_MAX represents a  1/N probability that a query will be profiled. 0 is interpreted as 1 for convenience."
         optional: true

@@ -79,11 +79,12 @@ bool ProfileCmdBase::run(OperationContext* opCtx,
         serverGlobalParams.slowMS = *slowms;
     }
     int newRateLimit = serverGlobalParams.rateLimit;
-    if (auto rateLimit = request.getRatelimit()) {
+    if (auto optRateLimit = request.getRatelimit()) {
+        const decltype(optRateLimit)::value_type rateLimit = *optRateLimit;
         uassert(ErrorCodes::BadValue,
                 str::stream() << "ratelimit must be between 0 and " << RATE_LIMIT_MAX << " inclusive",
-                0 <= *rateLimit && *rateLimit <= RATE_LIMIT_MAX);
-        newRateLimit = std::max(*rateLimit, 1);
+                0 <= rateLimit && rateLimit <= RATE_LIMIT_MAX);
+        newRateLimit = std::max(rateLimit, static_cast<decltype(rateLimit)>(1));
 
     }
     double newSampleRate = serverGlobalParams.sampleRate;
