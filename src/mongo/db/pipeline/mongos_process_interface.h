@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include "mongo/db/exec/shard_filterer.h"
 #include "mongo/db/pipeline/mongo_process_common.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/s/async_requests_sender.h"
@@ -100,31 +101,21 @@ public:
 
     bool isSharded(OperationContext* opCtx, const NamespaceString& nss) final;
 
-    void insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                const NamespaceString& ns,
-                std::vector<BSONObj>&& objs,
-                const WriteConcernOptions& wc,
-                boost::optional<OID>) final {
+    Status insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                  const NamespaceString& ns,
+                  std::vector<BSONObj>&& objs,
+                  const WriteConcernOptions& wc,
+                  boost::optional<OID>) final {
         MONGO_UNREACHABLE;
     }
 
-    void update(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                const NamespaceString& ns,
-                BatchedObjects&& batch,
-                const WriteConcernOptions& wc,
-                bool upsert,
-                bool multi,
-                boost::optional<OID>) final {
-        MONGO_UNREACHABLE;
-    }
-
-    WriteResult updateWithResult(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                 const NamespaceString& ns,
-                                 BatchedObjects&& batch,
-                                 const WriteConcernOptions& wc,
-                                 bool upsert,
-                                 bool multi,
-                                 boost::optional<OID> targetEpoch) final override {
+    StatusWith<UpdateResult> update(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                    const NamespaceString& ns,
+                                    BatchedObjects&& batch,
+                                    const WriteConcernOptions& wc,
+                                    bool upsert,
+                                    bool multi,
+                                    boost::optional<OID>) final {
         MONGO_UNREACHABLE;
     }
 
@@ -172,6 +163,11 @@ public:
         const boost::intrusive_ptr<ExpressionContext>& expCtx, Pipeline* pipeline) final {
         // It is not meaningful to perform a "local read" on mongos.
         MONGO_UNREACHABLE;
+    }
+
+    std::unique_ptr<ShardFilterer> getShardFilterer(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx) const override {
+        return nullptr;
     }
 
     std::string getShardName(OperationContext* opCtx) const final {

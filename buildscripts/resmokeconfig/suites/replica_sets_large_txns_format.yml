@@ -15,4 +15,4 @@ executor:
       global_vars:
         TestData:
           setParameters:
-            useMultipleOplogEntryFormatForTransactions: true
+            maxNumberOfTransactionOperationsInSingleOplogEntry: 1

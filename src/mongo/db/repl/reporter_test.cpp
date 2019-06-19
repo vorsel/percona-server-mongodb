@@ -73,11 +73,11 @@ public:
             itr.second.lastDurableOpTime.append(&entry,
                                                 UpdatePositionArgs::kDurableOpTimeFieldName);
             entry.appendDate(UpdatePositionArgs::kDurableWallTimeFieldName,
-                             Date_t::min() + Seconds(itr.second.lastDurableOpTime.getSecs()));
+                             Date_t() + Seconds(itr.second.lastDurableOpTime.getSecs()));
             itr.second.lastAppliedOpTime.append(&entry,
                                                 UpdatePositionArgs::kAppliedOpTimeFieldName);
             entry.appendDate(UpdatePositionArgs::kAppliedWallTimeFieldName,
-                             Date_t::min() + Seconds(itr.second.lastAppliedOpTime.getSecs()));
+                             Date_t() + Seconds(itr.second.lastAppliedOpTime.getSecs()));
             entry.append(UpdatePositionArgs::kMemberIdFieldName, itr.first);
             if (_configVersion != -1) {
                 entry.append(UpdatePositionArgs::kConfigVersionFieldName, _configVersion);
@@ -604,9 +604,9 @@ TEST_F(ReporterTestNoTriggerAtSetUp, FailingToScheduleRemoteCommandTaskShouldMak
     public:
         TaskExecutorWithFailureInScheduleRemoteCommand(executor::TaskExecutor* executor)
             : unittest::TaskExecutorProxy(executor) {}
-        virtual StatusWith<executor::TaskExecutor::CallbackHandle> scheduleRemoteCommand(
-            const executor::RemoteCommandRequest& request,
-            const RemoteCommandCallbackFn& cb,
+        virtual StatusWith<executor::TaskExecutor::CallbackHandle> scheduleRemoteCommandOnAny(
+            const executor::RemoteCommandRequestOnAny& request,
+            const RemoteCommandOnAnyCallbackFn& cb,
             const BatonHandle& baton = nullptr) override {
             // Any error status other than ShutdownInProgress will cause the reporter to fassert.
             return Status(ErrorCodes::ShutdownInProgress,

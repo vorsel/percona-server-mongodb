@@ -445,7 +445,7 @@ public:
         ASSERT_FALSE(txnDoc.hasField(SessionTxnRecord::kStartOpTimeFieldName));
     }
 
-    void setReplCoordAppliedOpTime(const repl::OpTime& opTime, Date_t wallTime = Date_t::min()) {
+    void setReplCoordAppliedOpTime(const repl::OpTime& opTime, Date_t wallTime = Date_t()) {
         repl::ReplicationCoordinator::get(getGlobalServiceContext())
             ->setMyLastAppliedOpTimeAndWallTime({opTime, wallTime});
         ASSERT_OK(repl::ReplicationCoordinator::get(getGlobalServiceContext())
@@ -2823,15 +2823,16 @@ public:
     }
 };
 
+// Including this class in a test fixture forces transactions to use one oplog entry per operation
+// instead of packing them into as few oplog entries as fit.  This allows testing of the timestamps
+// of multi-oplog-entry transactions.
 class MultiOplogScopedSettings {
 public:
     MultiOplogScopedSettings()
         : _prevPackingLimit(gMaxNumberOfTransactionOperationsInSingleOplogEntry) {
-        gUseMultipleOplogEntryFormatForTransactions = true;
         gMaxNumberOfTransactionOperationsInSingleOplogEntry = 1;
     }
     ~MultiOplogScopedSettings() {
-        gUseMultipleOplogEntryFormatForTransactions = false;
         gMaxNumberOfTransactionOperationsInSingleOplogEntry = _prevPackingLimit;
     }
 

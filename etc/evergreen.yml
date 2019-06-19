@@ -249,7 +249,7 @@ variables:
   - func: "clear OOM messages"
   - command: manifest.load
   - func: "git get project"
-  - func: "get modified patch files"
+  - func: "get all modified patch files"
   - func: "set task expansion macros"
   # The python virtual environment is installed in ${workdir}, which is created in
   # "set up virtualenv".
@@ -990,7 +990,7 @@ functions:
         mkdir -p ../../../../../../mongo-tools/distsrc
         cp THIRD-PARTY-NOTICES ../../../../../../mongo-tools/distsrc/THIRD-PARTY-NOTICES.gotools
 
-  "get modified patch files":
+  "get all modified patch files":
     command: shell.exec
     params:
       working_dir: src
@@ -1009,6 +1009,23 @@ functions:
             git diff HEAD --name-only >> ~1/patch_files.txt
             popd
           fi
+        fi
+
+  # This function should only be called from patch-build-only tasks.
+  "get added and modified patch files":
+    command: shell.exec
+    params:
+      working_dir: src
+      shell: bash
+      script: |
+        set -o verbose
+        set -o errexit
+
+        git diff HEAD --name-only --line-prefix="${workdir}/src/" --diff-filter=d >> modified_and_created_patch_files.txt
+        if [ -d src/mongo/db/modules/enterprise ]; then
+          pushd src/mongo/db/modules/enterprise
+          git diff HEAD --name-only --line-prefix="${workdir}/src/src/mongo/db/modules/enterprise/" --diff-filter=d >> ~1/modified_and_created_patch_files.txt
+          popd
         fi
 
   "determine resmoke jobs": &determine_resmoke_jobs
@@ -1801,7 +1818,7 @@ functions:
 
           # Run parse-jsfiles on 50 files at a time with 32 processes in parallel.
           # Grep returns 1 if it fails to find a match.
-          (grep "\.js$" patch_files.txt || true) | sed -e "s|^|$PWD/|" | xargs -P 32 -L 50 npm run --prefix jstestfuzz parse-jsfiles --
+          (grep "\.js$" modified_and_created_patch_files.txt || true) | xargs -P 32 -L 50 npm run --prefix jstestfuzz parse-jsfiles --
 
   "lint fuzzer sanity all":
     - command: shell.exec
@@ -3687,9 +3704,9 @@ tasks:
           # CMake doesn't seem to do the dSYM for us for the framework
           if [ -e $BUILD_PREFIX/Frameworks ]; then
               pushd $BUILD_PREFIX/Frameworks
-              xcrun dsymutil -o bson.framework.dSYM bson.framework/bson
+              xcrun dsymutil -num-threads=1 -o bson.framework.dSYM bson.framework/bson
               xcrun strip -Sx bson.framework/bson
-              xcrun dsymutil -o mongoc.framework.dSYM mongoc.framework/mongoc
+              xcrun dsymutil -num-threads=1 -o mongoc.framework.dSYM mongoc.framework/mongoc
               xcrun strip -Sx mongoc.framework/mongoc
               popd
           fi
@@ -5297,19 +5314,20 @@ tasks:
       resmoke_args: --suites=jstestfuzz_replication_continuous_stepdown --flowControlTicketOverride=1 --storageEngine=wiredTiger
       name: jstestfuzz_replication_continuous_stepdown_flow_control
 
+# TODO(SERVER-41608) Re-enable once root cause of failures has been addressed.
 ## jstestfuzz concurrent replication continuous stepdown with flow control engaged ##
-- <<: *jstestfuzz_template
-  name: jstestfuzz_concurrent_replication_continuous_stepdown_flow_control_gen
-  tags: ["jstestfuzz", "common", "repl", "flow_control"]
-  commands:
-  - func: "generate fuzzer tasks"
-    vars:
-      <<: *jstestfuzz_config_vars
-      num_files: ${jstestfuzz_concurrent_num_files|10}
-      num_tasks: 15
-      jstestfuzz_vars: --jsTestsDir ../jstests
-      resmoke_args: --suites=jstestfuzz_replication_continuous_stepdown --flowControlTicketOverride=10 --storageEngine=wiredTiger --numClientsPerFixture=10
-      name: jstestfuzz_concurrent_replication_continuous_stepdown_flow_control
+#- <<: *jstestfuzz_template
+#  name: jstestfuzz_concurrent_replication_continuous_stepdown_flow_control_gen
+#  tags: ["jstestfuzz", "common", "repl", "flow_control"]
+#  commands:
+#  - func: "generate fuzzer tasks"
+#    vars:
+#      <<: *jstestfuzz_config_vars
+#      num_files: ${jstestfuzz_concurrent_num_files|10}
+#      num_tasks: 15
+#      jstestfuzz_vars: --jsTestsDir ../jstests
+#      resmoke_args: --suites=jstestfuzz_replication_continuous_stepdown --flowControlTicketOverride=10 --storageEngine=wiredTiger --numClientsPerFixture=10
+#      name: jstestfuzz_concurrent_replication_continuous_stepdown_flow_control
 
 ## jstestfuzz replica set ##
 - <<: *jstestfuzz_template
@@ -5406,7 +5424,7 @@ tasks:
   - command: manifest.load
   - func: "git get project"
   - func: "set task expansion macros"
-  - func: "get modified patch files"
+  - func: "get added and modified patch files"
   - func: "setup jstestfuzz"
   - func: "lint fuzzer sanity patch"
 
@@ -5964,13 +5982,13 @@ tasks:
       resmoke_args: --suites=core_txns --storageEngine=wiredTiger
 
 - <<: *task_template
-  name: jsCore_txns_multi_oplog_entries
+  name: jsCore_txns_large_txns_format
   tags: ["jscore", "txns"]
   commands:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=core_txns_multi_oplog_entries --storageEngine=wiredTiger
+      resmoke_args: --suites=core_txns_large_txns_format --storageEngine=wiredTiger
 
 - <<: *task_template
   name: sharded_jscore_txns
@@ -6057,7 +6075,7 @@ tasks:
       fallback_num_sub_suites: 1
 
 - <<: *task_template
-  name: replica_sets_multi_oplog_txns_jscore_passthrough
+  name: replica_sets_large_txns_format_jscore_passthrough
   tags: ["replica_sets", "multi_oplog", "large", "non_maj_read", "san"]
   depends_on:
   - name: jsCore
@@ -6065,7 +6083,7 @@ tasks:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=replica_sets_multi_oplog_txns_jscore_passthrough --storageEngine=wiredTiger
+      resmoke_args: --suites=replica_sets_large_txns_format_jscore_passthrough --storageEngine=wiredTiger
 
 - <<: *task_template
   name: replica_sets_multi_stmt_txn_jscore_passthrough
@@ -6685,7 +6703,7 @@ tasks:
       resmoke_args: --storageEngine=wiredTiger
       fallback_num_sub_suites: 7
 
-- name: replica_sets_multi_oplog_txns_gen
+- name: replica_sets_large_txns_format_gen
   tags: ["replica_sets", "multi_oplog", "san"]
   commands:
   - func: "generate resmoke tasks"
@@ -7906,6 +7924,15 @@ tasks:
       resmoke_jobs_max: 1
 
 - <<: *task_template
+  name: search_beta_auth
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=search_beta_auth --storageEngine=wiredTiger
+      resmoke_jobs_max: 1
+
+- <<: *task_template
   name: search_beta_ssl
   commands:
   - func: "do setup"
@@ -8076,7 +8103,7 @@ buildvariants:
   - name: disk_wiredtiger
   - name: .integration !.audit
   - name: .jscore .common
-  - name: jsCore_txns_multi_oplog_entries
+  - name: jsCore_txns_large_txns_format
   - name: jsonSchema
   - name: .logical_session_cache
   - name: .multi_shard
@@ -9027,7 +9054,7 @@ buildvariants:
     distros:
     - windows-64-vs2017-compile
   - name: .jscore .common !.auth !.sharding
-  - name: jsCore_txns_multi_oplog_entries
+  - name: jsCore_txns_large_txns_format
   - name: jsonSchema
   - name: .logical_session_cache .one_sec
   - name: multi_shard_multi_stmt_txn_jscore_passthrough_gen
@@ -9090,7 +9117,7 @@ buildvariants:
   - name: .jscore .common !.compat !.sharding
   - name: jsCore_auth
   - name: jsCore_ese
-  - name: jsCore_txns_multi_oplog_entries
+  - name: jsCore_txns_large_txns_format
   - name: .jstestfuzz .common
   - name: noPassthrough_gen
   - name: noPassthroughWithMongod_gen
@@ -9388,10 +9415,10 @@ buildvariants:
   - name: disk_wiredtiger
   - name: failpoints
   - name: .jscore .common !.auth !.sharding
-  - name: jsCore_txns_multi_oplog_entries
+  - name: jsCore_txns_large_txns_format
   - name: mongosTest
   - name: replica_sets
-  - name: replica_sets_multi_oplog_txns_gen
+  - name: replica_sets_large_txns_format_gen
   - name: .ssl
   - name: .stitch
   - name: tool
@@ -9975,7 +10002,7 @@ buildvariants:
   - name: .jscore .common
   - name: jsCore_minimum_batch_size
   - name: jsCore_op_query
-  - name: jsCore_txns_multi_oplog_entries
+  - name: jsCore_txns_large_txns_format
   - name: jsonSchema
   - name: .jstestfuzz
   - name: .logical_session_cache
@@ -9997,6 +10024,7 @@ buildvariants:
   - name: .rollbackfuzzer
   - name: sasl
   - name: search_beta
+  - name: search_beta_auth
   - name: search_beta_ssl
   - name: session_jscore_passthrough
   - name: .sharding .jscore !.wo_snapshot !.multi_stmt
@@ -10014,8 +10042,8 @@ buildvariants:
     - ubuntu1604-packer
   - name: .publish
 
-- name: enterprise-rhel-62-64-bit-multi-txn-oplog-entries
-  display_name: "Enterprise RHEL 6.2 (Multiple oplog entries transaction format)"
+- name: enterprise-rhel-62-64-bit-large-txns-format
+  display_name: "Enterprise RHEL 6.2 (large transactions format)"
   modules:
   - enterprise
   run_on:
@@ -10035,7 +10063,7 @@ buildvariants:
     build_mongoreplay: true
     large_distro_name: rhel62-large
     test_flags: >-
-        --mongodSetParameters="{useMultipleOplogEntryFormatForTransactions: true, maxNumberOfTransactionOperationsInSingleOplogEntry: 2}"
+        --mongodSetParameters="{maxNumberOfTransactionOperationsInSingleOplogEntry: 2}"
         --excludeWithAnyTags=exclude_from_large_txns
         --excludeWithAnyTags=exclude_from_large_txns_due_to_change_streams
   tasks:
@@ -10188,6 +10216,7 @@ buildvariants:
   - name: .rollbackfuzzer
   - name: sasl
   - name: search_beta
+  - name: search_beta_auth
   - name: search_beta_ssl
   - name: secondary_reads_passthrough_gen
   - name: session_jscore_passthrough
@@ -10251,7 +10280,7 @@ buildvariants:
   - name: .jscore .common
   - name: jsCore_minimum_batch_size
   - name: jsCore_op_query
-  - name: jsCore_txns_multi_oplog_entries
+  - name: jsCore_txns_large_txns_format
   - name: jsonSchema
   - name: .jstestfuzz !.flow_control
   - name: .logical_session_cache
@@ -10271,6 +10300,7 @@ buildvariants:
   - name: .rollbackfuzzer
   - name: sasl
   - name: search_beta
+  - name: search_beta_auth
   - name: search_beta_ssl
   - name: secondary_reads_passthrough_gen
   - name: session_jscore_passthrough
@@ -10342,7 +10372,7 @@ buildvariants:
     - name: initial_sync_fuzzer_gen
     - name: .integration !.audit
     - name: .jscore .common
-    - name: jsCore_txns_multi_oplog_entries
+    - name: jsCore_txns_large_txns_format
     - name: jsCore_minimum_batch_size
     - name: jsCore_op_query
     - name: .logical_session_cache .one_sec
@@ -10355,6 +10385,7 @@ buildvariants:
     - name: retryable_writes_jscore_passthrough_gen
     - name: sasl
     - name: search_beta
+    - name: search_beta_auth
     - name: search_beta_ssl
     - name: secondary_reads_passthrough_gen
     - name: session_jscore_passthrough
@@ -10404,7 +10435,7 @@ buildvariants:
   - name: .encrypt !.sharding !.replica_sets !.aggregation !.jscore
   - name: external_auth
   - name: .jscore .common !.compat !.decimal !.sharding
-  - name: jsCore_txns_multi_oplog_entries
+  - name: jsCore_txns_large_txns_format
   - name: .jstestfuzz .common
   - name: .logical_session_cache .one_sec
   - name: replica_sets_auth_gen
@@ -10412,6 +10443,7 @@ buildvariants:
   - name: .replica_sets .multi_oplog
   - name: sasl
   - name: search_beta
+  - name: search_beta_auth
   - name: search_beta_ssl
   - name: sharding_auth_audit_gen
   - name: sharding_auth_gen
@@ -10473,7 +10505,7 @@ buildvariants:
   - name: jsCore
   - name: .read_write_concern !.write !.aggregation
   - name: replica_sets_jscore_passthrough
-  - name: replica_sets_multi_oplog_txns_jscore_passthrough
+  - name: replica_sets_large_txns_format_jscore_passthrough
   - name: sharded_collections_jscore_passthrough
   - name: sharding_gen
   - name: sharding_auth_gen
@@ -11410,7 +11442,7 @@ buildvariants:
     - rhel62-large
   - name: .jscore .common !.decimal
   - name: jsCore_op_query
-  - name: jsCore_txns_multi_oplog_entries
+  - name: jsCore_txns_large_txns_format
   - name: .jstestfuzz !.initsync
   - name: .logical_session_cache
   - name: .multi_shard .common
@@ -11832,14 +11864,14 @@ buildvariants:
   - name: .jscore .common
   - name: jsCore_minimum_batch_size
   - name: jsCore_op_query
-  - name: jsCore_txns_multi_oplog_entries
+  - name: jsCore_txns_large_txns_format
   - name: jsonSchema
   - name: .logical_session_cache
   - name: .multi_shard .common
   - name: multiversion
   - name: .read_write_concern
-  - name: replica_sets_multi_oplog_txns_gen
-  - name: replica_sets_multi_oplog_txns_jscore_passthrough
+  - name: replica_sets_large_txns_format_gen
+  - name: replica_sets_large_txns_format_jscore_passthrough
   - name: .replica_sets !.multi_oplog
   - name: .retry
   - name: .read_only
@@ -11921,14 +11953,14 @@ buildvariants:
   - name: .jscore .common
   - name: jsCore_minimum_batch_size
   - name: jsCore_op_query
-  - name: jsCore_txns_multi_oplog_entries
+  - name: jsCore_txns_large_txns_format
   - name: jsonSchema
   - name: .logical_session_cache .one_sec
   - name: .multi_shard .common
   - name: multiversion
   - name: .read_write_concern
-  - name: replica_sets_multi_oplog_txns_gen
-  - name: replica_sets_multi_oplog_txns_jscore_passthrough
+  - name: replica_sets_large_txns_format_gen
+  - name: replica_sets_large_txns_format_jscore_passthrough
   - name: .replica_sets !.multi_oplog
   - name: .retry
   - name: .rollbackfuzzer
@@ -11968,7 +12000,7 @@ buildvariants:
   - name: causally_consistent_jscore_txns_passthrough
   - name: jsCore
   - name: jsCore_txns
-  - name: jsCore_txns_multi_oplog_entries
+  - name: jsCore_txns_large_txns_format
   - name: .logical_session_cache .one_sec
   - name: watchdog_wiredtiger
 
@@ -12013,7 +12045,7 @@ buildvariants:
   - name: .jscore .common
   - name: jsCore_minimum_batch_size
   - name: jsCore_op_query
-  - name: jsCore_txns_multi_oplog_entries
+  - name: jsCore_txns_large_txns_format
   - name: .logical_session_cache .one_sec
   - name: multiversion
   - name: .read_write_concern

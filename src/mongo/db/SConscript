@@ -413,6 +413,8 @@ env.Library(
     target='server_options_base',
     source=[
         'server_options_base.cpp',
+        env.Idlc('cluster_auth_mode_option.idl')[0],
+        env.Idlc('keyfile_option.idl')[0],
         env.Idlc('server_options_base.idl')[0],
         env.Idlc('server_options_general.idl')[0],
         env.Idlc('server_options_nongeneral.idl')[0],
@@ -455,7 +457,7 @@ env.CppUnitTest(
 
 # This library is linked into mongos and mongod only, not into the shell or any tools.
 env.Library(
-    target="mongodandmongos",
+    target="initialize_server_security_state",
     source=[
         "initialize_server_security_state.cpp",
     ],
@@ -1235,6 +1237,7 @@ env.Library(
         'exec/requires_collection_stage.cpp',
         'exec/requires_index_stage.cpp',
         'exec/shard_filter.cpp',
+        'exec/shard_filterer_impl.cpp',
         'exec/skip.cpp',
         'exec/sort.cpp',
         'exec/sort_key_generator.cpp',
@@ -2097,10 +2100,9 @@ env.CppUnitTest(
         'auth/authmocks',
         'dbdirectclient',
         'logical_session_id',
-        'op_observer_impl',
+        'op_observer',
         'query_exec',
         'repl/mock_repl_coord_server_fixture',
-        'repl/oplog_interface_local',
         'repl/repl_coordinator_interface',
         'service_liaison_mock',
         'sessions_collection_mock',
