@@ -48,6 +48,7 @@
 #include <boost/filesystem/operations.hpp>
 #include <boost/filesystem/path.hpp>
 #include <boost/system/error_code.hpp>
+#include <fmt/format.h>
 #include <valgrind/valgrind.h>
 
 #include "mongo/base/error_codes.h"
@@ -96,6 +97,8 @@
 #if !defined(__has_feature)
 #define __has_feature(x) 0
 #endif
+
+using namespace fmt::literals;
 
 namespace mongo {
 
@@ -1924,28 +1927,17 @@ void WiredTigerKVEngine::setStableTimestamp(Timestamp stableTimestamp, bool forc
     // `CheckpointThread` is to transition it from a state of not taking any checkpoints, to
     // taking "stable checkpoints". In the transitioning case, it's imperative for the "stable
     // timestamp" to have first been communicated to WiredTiger.
-    char stableTSConfigString["force=true,oldest_timestamp=,commit_timestamp=,stable_timestamp="_sd
-                                  .size() +
-                              (8 * 2) /* 16 hexadecimal digits */ + 1 /* trailing null */];
-    int size = 0;
+    using namespace fmt::literals;
+    std::string stableTSConfigString;
+    auto ts = stableTimestamp.asULL();
     if (force) {
-        size = std::snprintf(stableTSConfigString,
-                             sizeof(stableTSConfigString),
-                             "force=true,oldest_timestamp=,commit_timestamp=,stable_timestamp=%llx",
-                             stableTimestamp.asULL());
+        stableTSConfigString =
+            "force=true,oldest_timestamp={0:x},commit_timestamp={0:x},stable_timestamp={0:x}"_format(
+                ts);
     } else {
-        size = std::snprintf(stableTSConfigString,
-                             sizeof(stableTSConfigString),
-                             "stable_timestamp=%llx",
-                             stableTimestamp.asULL());
+        stableTSConfigString = "stable_timestamp={:x}"_format(ts);
     }
-    if (size < 0) {
-        int e = errno;
-        error() << "error snprintf " << errnoWithDescription(e);
-        fassertFailedNoTrace(50757);
-    }
-    invariant(static_cast<std::size_t>(size) < sizeof(stableTSConfigString));
-    invariantWTOK(_conn->set_timestamp(_conn, stableTSConfigString));
+    invariantWTOK(_conn->set_timestamp(_conn, stableTSConfigString.c_str()));
 
     // After publishing a stable timestamp to WT, we can record the updated stable timestamp value
     // for the necessary oplog to keep.
@@ -1992,40 +1984,19 @@ void WiredTigerKVEngine::setOldestTimestamp(Timestamp newOldestTimestamp, bool f
         return;
     }
 
-    char oldestTSConfigString["force=true,oldest_timestamp=,commit_timestamp="_sd.size() +
-                              (2 * 8 * 2) /* 2 timestamps of 16 hexadecimal digits each */ +
-                              1 /* trailing null */];
-    int size = 0;
     if (force) {
-        size = std::snprintf(oldestTSConfigString,
-                             sizeof(oldestTSConfigString),
-                             "force=true,oldest_timestamp=%llx,commit_timestamp=%llx",
-                             newOldestTimestamp.asULL(),
-                             newOldestTimestamp.asULL());
-    } else {
-        size = std::snprintf(oldestTSConfigString,
-                             sizeof(oldestTSConfigString),
-                             "oldest_timestamp=%llx",
-                             newOldestTimestamp.asULL());
-    }
-    if (size < 0) {
-        int e = errno;
-        error() << "error snprintf " << errnoWithDescription(e);
-        fassertFailedNoTrace(40661);
-    }
-    invariant(static_cast<std::size_t>(size) < sizeof(oldestTSConfigString));
-    invariantWTOK(_conn->set_timestamp(_conn, oldestTSConfigString));
-
-    // set_timestamp above ignores backwards in time unless 'force' is set.
-    if (force) {
+        auto oldestTSConfigString =
+            "force=true,oldest_timestamp={0:x},commit_timestamp={0:x}"_format(
+                newOldestTimestamp.asULL());
+        invariantWTOK(_conn->set_timestamp(_conn, oldestTSConfigString.c_str()));
         _oldestTimestamp.store(newOldestTimestamp.asULL());
-    } else if (_oldestTimestamp.load() < newOldestTimestamp.asULL()) {
-        _oldestTimestamp.store(newOldestTimestamp.asULL());
-    }
-
-    if (force) {
         LOG(2) << "oldest_timestamp and commit_timestamp force set to " << newOldestTimestamp;
     } else {
+        auto oldestTSConfigString = "oldest_timestamp={:x}"_format(newOldestTimestamp.asULL());
+        invariantWTOK(_conn->set_timestamp(_conn, oldestTSConfigString.c_str()));
+        // set_timestamp above ignores backwards in time if 'force' is not set.
+        if (_oldestTimestamp.load() < newOldestTimestamp.asULL())
+            _oldestTimestamp.store(newOldestTimestamp.asULL());
         LOG(2) << "oldest_timestamp set to " << newOldestTimestamp;
     }
 }

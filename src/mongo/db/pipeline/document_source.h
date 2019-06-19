@@ -431,6 +431,13 @@ public:
     }
 
     /**
+     * Returns the expression context from the stage's context.
+     */
+    const ExpressionContext& getContext() const {
+        return *pExpCtx;
+    }
+
+    /**
      * Given 'currentNames' which describes a set of paths which the caller is interested in,
      * returns boost::none if any of those paths are modified by this stage, or a mapping from
      * their old name to their new name if they are preserved but possibly renamed by this stage.
@@ -461,10 +468,11 @@ public:
 
     /**
      * Returns true if it would be correct to execute this stage in parallel across the shards in
-     * cases where the final stage is an $out. For example, a $group stage which is just merging the
-     * groups from the shards can be run in parallel since it will preserve the shard key.
+     * cases where the final stage is a stage which can perform a write operation, such as $merge.
+     * For example, a $group stage which is just merging the groups from the shards can be run in
+     * parallel since it will preserve the shard key.
      */
-    virtual bool canRunInParallelBeforeOut(
+    virtual bool canRunInParallelBeforeWriteStage(
         const std::set<std::string>& nameOfShardKeyFieldsUponEntryToStage) const {
         return false;
     }

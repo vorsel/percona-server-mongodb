@@ -64,7 +64,7 @@
 namespace mongo {
 namespace {
 
-MONGO_FAIL_POINT_DEFINE(writeConfilctInRenameCollCopyToTmp);
+MONGO_FAIL_POINT_DEFINE(writeConflictInRenameCollCopyToTmp);
 
 boost::optional<NamespaceString> getNamespaceFromUUID(OperationContext* opCtx, const UUID& uuid) {
     return CollectionCatalog::get(opCtx).lookupNSSByUUID(uuid);
@@ -399,7 +399,26 @@ Status renameCollectionWithinDBForApplyOps(OperationContext* opCtx,
 
     if (targetColl) {
         if (sourceColl->uuid() == targetColl->uuid()) {
-            return Status::OK();
+            if (!uuidToDrop || uuidToDrop == targetColl->uuid()) {
+                return Status::OK();
+            }
+
+            // During initial sync, it is possible that the collection already
+            // got renamed to the target, so there is not much left to do other
+            // than drop the dropTarget. See SERVER-40861 for more details.
+            return writeConflictRetry(opCtx, "renameCollection", target.ns(), [&] {
+                WriteUnitOfWork wunit(opCtx);
+                auto collToDropBasedOnUUID = getNamespaceFromUUID(opCtx, *uuidToDrop);
+                if (!collToDropBasedOnUUID)
+                    return Status::OK();
+                repl::UnreplicatedWritesBlock uwb(opCtx);
+                Status status =
+                    db->dropCollection(opCtx, *collToDropBasedOnUUID, renameOpTimeFromApplyOps);
+                if (!status.isOK())
+                    return status;
+                wunit.commit();
+                return Status::OK();
+            });
         }
         if (uuidToDrop && uuidToDrop != targetColl->uuid()) {
             // We need to rename the targetColl to a temporary name.
@@ -685,7 +704,7 @@ Status renameBetweenDBs(OperationContext* opCtx,
                         opCtx, "retryRestoreCursor", ns, [&cursor] { cursor->restore(); });
                 });
                 // Used to make sure that a WCE can be handled by this logic without data loss.
-                if (MONGO_FAIL_POINT(writeConfilctInRenameCollCopyToTmp)) {
+                if (MONGO_FAIL_POINT(writeConflictInRenameCollCopyToTmp)) {
                     throw WriteConflictException();
                 }
                 wunit.commit();

@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2018-present MongoDB, Inc.
+ *    Copyright (C) 2019-present MongoDB, Inc.
  *
  *    This program is free software: you can redistribute it and/or modify
  *    it under the terms of the Server Side Public License, version 1,
@@ -27,47 +27,32 @@
  *    it in the license file.
  */
 
-#pragma once
+#include "mongo/platform/basic.h"
 
-#include "mongo/db/pipeline/document_source_out.h"
-#include "mongo/util/destructor_guard.h"
+#include "mongo/db/commands/server_status.h"
+#include "mongo/s/router_transactions_metrics.h"
+#include "mongo/s/router_transactions_stats_gen.h"
+#include "mongo/s/transaction_router.h"
 
 namespace mongo {
+namespace {
 
-/**
- * Version of $out which directs writes to a temporary collection, then renames the temp collection
- * to the target collection with the 'dropTarget' option set to true.
- */
-class DocumentSourceOutReplaceColl final : public DocumentSourceOut {
+class RouterTransactionsSSS final : public ServerStatusSection {
 public:
-    using DocumentSourceOut::DocumentSourceOut;
+    RouterTransactionsSSS() : ServerStatusSection("transactions") {}
 
-    ~DocumentSourceOutReplaceColl();
+    bool includeByDefault() const override {
+        return true;
+    }
 
-    /**
-     * Sets up a temp collection which contains the same indexes and options as the output
-     * collection. All writes will be directed to the temp collection.
-     */
-    void initializeWriteNs() final;
+    BSONObj generateSection(OperationContext* opCtx,
+                            const BSONElement& configElement) const override {
+        RouterTransactionsStats stats;
+        RouterTransactionsMetrics::get(opCtx)->updateStats(&stats);
+        return stats.toBSON();
+    }
 
-    /**
-     * Renames the temp collection to the output collection with the 'dropTarget' option set to
-     * true.
-     */
-    void finalize() final;
+} routerTransactionsSSS;
 
-    const NamespaceString& getWriteNs() const final {
-        return _tempNs;
-    };
-
-private:
-    // Holds on to the original collection options and index specs so we can check they didn't
-    // change during computation.
-    BSONObj _originalOutOptions;
-    std::list<BSONObj> _originalIndexes;
-
-    // The temporary namespace for the $out writes.
-    NamespaceString _tempNs;
-};
-
+}  // namespace
 }  // namespace mongo

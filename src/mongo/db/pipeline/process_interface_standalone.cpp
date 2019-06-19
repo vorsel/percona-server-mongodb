@@ -147,28 +147,11 @@ DBClientBase* MongoInterfaceStandalone::directClient() {
     return &_client;
 }
 
-repl::OplogEntry MongoInterfaceStandalone::lookUpOplogEntryByOpTime(OperationContext* opCtx,
-                                                                    repl::OpTime lookupTime) {
-    invariant(!lookupTime.isNull());
-
+std::unique_ptr<TransactionHistoryIteratorBase>
+MongoInterfaceStandalone::createTransactionHistoryIterator(repl::OpTime time) const {
     bool permitYield = true;
-    TransactionHistoryIterator iterator(lookupTime, permitYield);
-    try {
-        auto result = iterator.next(opCtx);
-
-        // This function is intended to link a "commit" command to its corresponding "applyOps"
-        // command, which represents a prepared transaction. There should be no additional entries
-        // in the transaction's chain of operations. Note that when the oplog changes gated by
-        // 'useMultipleOplogEntryFormatForTransactions' become permanent, these assumptions about
-        // iterating transactions will no longer hold.
-        invariant(!iterator.hasNext());
-        return result;
-    } catch (ExceptionFor<ErrorCodes::IncompleteTransactionHistory>& ex) {
-        ex.addContext(
-            "Oplog no longer has history necessary for $changeStream to observe operations from a "
-            "committed transaction.");
-        uasserted(ErrorCodes::ChangeStreamHistoryLost, ex.reason());
-    }
+    return std::unique_ptr<TransactionHistoryIteratorBase>(
+        new TransactionHistoryIterator(time, permitYield));
 }
 
 bool MongoInterfaceStandalone::isSharded(OperationContext* opCtx, const NamespaceString& nss) {
@@ -544,10 +527,10 @@ std::vector<BSONObj> MongoInterfaceStandalone::getMatchingPlanCacheEntryStats(
     return planCache->getMatchingStats(serializer, predicate);
 }
 
-bool MongoInterfaceStandalone::uniqueKeyIsSupportedByIndex(
+bool MongoInterfaceStandalone::fieldsHaveSupportingUniqueIndex(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     const NamespaceString& nss,
-    const std::set<FieldPath>& uniqueKeyPaths) const {
+    const std::set<FieldPath>& fieldPaths) const {
     auto* opCtx = expCtx->opCtx;
     // We purposefully avoid a helper like AutoGetCollection here because we don't want to check the
     // db version or do anything else. We simply want to protect against concurrent modifications to
@@ -558,13 +541,13 @@ bool MongoInterfaceStandalone::uniqueKeyIsSupportedByIndex(
     auto db = databaseHolder->getDb(opCtx, nss.db());
     auto collection = db ? db->getCollection(opCtx, nss) : nullptr;
     if (!collection) {
-        return uniqueKeyPaths == std::set<FieldPath>{"_id"};
+        return fieldPaths == std::set<FieldPath>{"_id"};
     }
 
     auto indexIterator = collection->getIndexCatalog()->getIndexIterator(opCtx, false);
     while (indexIterator->more()) {
         const IndexCatalogEntry* entry = indexIterator->next();
-        if (supportsUniqueKey(expCtx, entry, uniqueKeyPaths)) {
+        if (supportsUniqueKey(expCtx, entry, fieldPaths)) {
             return true;
         }
     }
@@ -650,6 +633,36 @@ std::unique_ptr<CollatorInterface> MongoInterfaceStandalone::_getCollectionDefau
 
 std::unique_ptr<ResourceYielder> MongoInterfaceStandalone::getResourceYielder() const {
     return std::make_unique<MongoDResourceYielder>();
+}
+
+
+std::pair<std::set<FieldPath>, boost::optional<ChunkVersion>>
+MongoInterfaceStandalone::ensureFieldsUniqueOrResolveDocumentKey(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    boost::optional<std::vector<std::string>> fields,
+    boost::optional<ChunkVersion> targetCollectionVersion,
+    const NamespaceString& outputNs) const {
+    if (targetCollectionVersion) {
+        uassert(51123, "Unexpected target chunk version specified", expCtx->fromMongos);
+        // If mongos has sent us a target shard version, we need to be sure we are prepared to
+        // act as a router which is at least as recent as that mongos.
+        checkRoutingInfoEpochOrThrow(expCtx, outputNs, *targetCollectionVersion);
+    }
+
+    if (!fields) {
+        uassert(51124, "Expected fields to be provided from mongos", !expCtx->fromMongos);
+        return {std::set<FieldPath>{"_id"}, targetCollectionVersion};
+    }
+
+    // Make sure the 'fields' array has a supporting index. Skip this check if the command is sent
+    // from mongos since the 'fields' check would've happened already.
+    auto fieldPaths = _convertToFieldPaths(*fields);
+    if (!expCtx->fromMongos) {
+        uassert(51183,
+                "Cannot find index to verify that join fields will be unique",
+                fieldsHaveSupportingUniqueIndex(expCtx, outputNs, fieldPaths));
+    }
+    return {fieldPaths, targetCollectionVersion};
 }
 
 }  // namespace mongo

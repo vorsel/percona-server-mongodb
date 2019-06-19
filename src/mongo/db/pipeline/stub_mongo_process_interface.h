@@ -54,8 +54,8 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    repl::OplogEntry lookUpOplogEntryByOpTime(OperationContext* opCtx,
-                                              repl::OpTime lookupTime) override {
+    std::unique_ptr<TransactionHistoryIteratorBase> createTransactionHistoryIterator(
+        repl::OpTime time) const override {
         MONGO_UNREACHABLE;
     }
 
@@ -202,9 +202,9 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    bool uniqueKeyIsSupportedByIndex(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                     const NamespaceString& nss,
-                                     const std::set<FieldPath>& uniqueKeyPaths) const override {
+    bool fieldsHaveSupportingUniqueIndex(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                         const NamespaceString& nss,
+                                         const std::set<FieldPath>& fieldPaths) const override {
         return true;
     }
 
@@ -222,6 +222,22 @@ public:
 
     std::unique_ptr<ResourceYielder> getResourceYielder() const override {
         return nullptr;
+    }
+
+    std::pair<std::set<FieldPath>, boost::optional<ChunkVersion>>
+    ensureFieldsUniqueOrResolveDocumentKey(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                           boost::optional<std::vector<std::string>> fields,
+                                           boost::optional<ChunkVersion> targetCollectionVersion,
+                                           const NamespaceString& outputNs) const override {
+        if (!fields) {
+            return {std::set<FieldPath>{"_id"}, targetCollectionVersion};
+        }
+
+        std::set<FieldPath> fieldPaths;
+        for (const auto& field : *fields) {
+            fieldPaths.insert(FieldPath(field));
+        }
+        return {fieldPaths, targetCollectionVersion};
     }
 };
 }  // namespace mongo

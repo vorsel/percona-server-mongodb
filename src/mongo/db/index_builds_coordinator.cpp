@@ -553,16 +553,14 @@ IndexBuildsCoordinator::_registerAndSetUpIndexBuild(
                                     << "' because the collection no longer exists.");
     }
 
-    auto dbName = nss->db().toString();
-
-    AutoGetDb autoDb(opCtx, dbName, MODE_X);
-    if (!autoDb.getDb()) {
+    AutoGetCollection autoColl(opCtx, *nss, /*modeDB=*/MODE_IX, /*modeColl=*/MODE_X);
+    if (!autoColl.getDb()) {
         return Status(ErrorCodes::NamespaceNotFound,
                       str::stream() << "Failed to create index(es) on collection '" << *nss
-                                    << "' because the collection no longer exists");
+                                    << "' because the database no longer exists");
     }
 
-    auto collection = autoDb.getDb()->getCollection(opCtx, *nss);
+    auto collection = autoColl.getCollection();
     if (!collection) {
         // The collection does not exist. We will not build an index.
         return Status(ErrorCodes::NamespaceNotFound,
@@ -603,7 +601,7 @@ IndexBuildsCoordinator::_registerAndSetUpIndexBuild(
     }
 
     auto replIndexBuildState = std::make_shared<ReplIndexBuildState>(
-        buildUUID, collectionUUID, dbName, filteredSpecs, protocol, commitQuorum);
+        buildUUID, collectionUUID, nss->db().toString(), filteredSpecs, protocol, commitQuorum);
     replIndexBuildState->stats.numIndexesBefore = _getNumIndexesTotal(opCtx, collection);
 
     Status status = _registerIndexBuild(lk, replIndexBuildState);
@@ -848,10 +846,15 @@ void IndexBuildsCoordinator::_buildIndex(OperationContext* opCtx,
                                          Lock::DBLock* dbLock) {
     invariant(opCtx->lockState()->isDbLockedForMode(replState->dbName, MODE_X));
 
+
+    // Index builds can safely ignore prepare conflicts. On secondaries, prepare operations wait for
+    // index builds to complete.
+    opCtx->recoveryUnit()->abandonSnapshot();
+    opCtx->recoveryUnit()->setIgnorePrepared(true);
+
     // If we're a background index, replace exclusive db lock with an intent lock, so that
     // other readers and writers can proceed during this phase.
     if (_indexBuildsManager.isBackgroundBuilding(replState->buildUUID)) {
-        opCtx->recoveryUnit()->abandonSnapshot();
         dbLock->relockWithMode(MODE_IX);
     }
 

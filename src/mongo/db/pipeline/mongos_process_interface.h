@@ -42,7 +42,7 @@ namespace mongo {
  * Class to provide access to mongos-specific implementations of methods required by some
  * document sources.
  */
-class MongoSInterface final : public MongoProcessCommon {
+class MongoSInterface : public MongoProcessCommon {
 public:
     static BSONObj createPassthroughCommandForShard(OperationContext* opCtx,
                                                     const AggregationRequest& request,
@@ -89,8 +89,8 @@ public:
     std::vector<GenericCursor> getIdleCursors(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                               CurrentOpUserMode userMode) const final;
 
-    repl::OplogEntry lookUpOplogEntryByOpTime(OperationContext* opCtx,
-                                              repl::OpTime lookupTime) final {
+    std::unique_ptr<TransactionHistoryIteratorBase> createTransactionHistoryIterator(
+        repl::OpTime time) const override {
         MONGO_UNREACHABLE;
     }
 
@@ -217,9 +217,9 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    bool uniqueKeyIsSupportedByIndex(const boost::intrusive_ptr<ExpressionContext>&,
-                                     const NamespaceString&,
-                                     const std::set<FieldPath>& uniqueKeyPaths) const final;
+    bool fieldsHaveSupportingUniqueIndex(const boost::intrusive_ptr<ExpressionContext>&,
+                                         const NamespaceString&,
+                                         const std::set<FieldPath>& fieldPaths) const;
 
     void checkRoutingInfoEpochOrThrow(const boost::intrusive_ptr<ExpressionContext>&,
                                       const NamespaceString&,
@@ -230,6 +230,12 @@ public:
     std::unique_ptr<ResourceYielder> getResourceYielder() const override {
         return nullptr;
     }
+
+    std::pair<std::set<FieldPath>, boost::optional<ChunkVersion>>
+    ensureFieldsUniqueOrResolveDocumentKey(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                           boost::optional<std::vector<std::string>> fields,
+                                           boost::optional<ChunkVersion> targetCollectionVersion,
+                                           const NamespaceString& outputNs) const override;
 
 protected:
     BSONObj _reportCurrentOpForClient(OperationContext* opCtx,
