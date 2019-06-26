@@ -156,6 +156,7 @@ public:
     virtual void endBackup(OperationContext* opCtx);
 
     virtual Status hotBackup(OperationContext* opCtx, const std::string& path) override;
+    virtual Status hotBackupTar(OperationContext* opCtx, const std::string& path) override;
     virtual Status hotBackup(OperationContext* opCtx, const percona::S3BackupParameters& s3params) override;
 
     virtual int64_t getIdentSize(OperationContext* opCtx, StringData ident);
@@ -288,7 +289,7 @@ private:
     // srcPath, destPath, session, cursor
     typedef std::tuple<boost::filesystem::path, boost::filesystem::path, std::shared_ptr<WiredTigerSession>, WT_CURSOR*> DBTuple;
     // srcPath, destPath, filename, size to copy
-    typedef std::tuple<boost::filesystem::path, boost::filesystem::path, boost::uintmax_t> FileTuple;
+    typedef std::tuple<boost::filesystem::path, boost::filesystem::path, boost::uintmax_t, std::time_t> FileTuple;
 
     Status _hotBackupPopulateLists(OperationContext* opCtx, const std::string& path, std::vector<DBTuple>& dbList, std::vector<FileTuple>& filesList);
 
