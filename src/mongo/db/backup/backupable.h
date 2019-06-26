@@ -69,6 +69,16 @@ struct Backupable {
     }
 
     /**
+     * Perform hot backup into the file/stream in the tar archive format.
+     * @param path destination path to perform backup into.
+     * @return Status code of the operation.
+     */
+    virtual mongo::Status hotBackupTar(mongo::OperationContext* opCtx, const std::string& path) {
+        return mongo::Status(mongo::ErrorCodes::IllegalOperation,
+                             "This engine doesn't support hot backup to the tar format.");
+    }
+
+    /**
      * Perform hot backup to S3-compatible storage.
      * @param s3params parameters of server connection and backup location.
      * @return Status code of the operation.

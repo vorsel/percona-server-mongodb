@@ -84,10 +84,11 @@ bool CreateBackupCommand::errmsgRun(mongo::OperationContext* opCtx,
                               std::string& errmsg,
                               BSONObjBuilder& result) {
     BSONElement destPathElem = cmdObj["backupDir"];
+    BSONElement tarElem = cmdObj["tar"];
     BSONElement s3Elem = cmdObj["s3"];
-    // Command object must specify either 'backupDir' or 's3' not both
-    if (destPathElem && s3Elem) {
-        errmsg = "Cannot specify both 'backupDir' and 's3'";
+    // Command object must specify only one of 'backupDir', 'tar', 's3'
+    if ((destPathElem ? 1 : 0) + (tarElem ? 1 : 0) + (s3Elem ? 1 : 0) > 1) {
+        errmsg = "Cannot specify more than one of 'backupDir', 'tar' and 's3'";
         return false;
     }
 
@@ -117,6 +118,14 @@ bool CreateBackupCommand::errmsgRun(mongo::OperationContext* opCtx,
 
         // Do the backup itself.
         status = se->hotBackup(opCtx, dest);
+
+    } else if (tarElem) {
+        // Flush all files first.
+        auto se = getGlobalServiceContext()->getStorageEngine();
+        se->flushAllFiles(opCtx, true);
+
+        // Do the backup itself.
+        status = se->hotBackupTar(opCtx, tarElem.String());
 
     } else if (s3Elem) {
         if (s3Elem.type() != BSONType::Object) {
@@ -160,7 +169,7 @@ bool CreateBackupCommand::errmsgRun(mongo::OperationContext* opCtx,
         status = se->hotBackup(opCtx, s3params);
 
     } else {
-        errmsg = "command object must specify either 'backupDir' or 's3' field";
+        errmsg = "command object must specify one of 'backupDir', 'tar' or 's3' fields";
         return false;
     }
 
