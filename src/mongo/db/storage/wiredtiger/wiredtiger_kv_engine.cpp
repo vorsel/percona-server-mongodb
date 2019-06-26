@@ -49,7 +49,10 @@
 #include <boost/filesystem/path.hpp>
 #include <boost/system/error_code.hpp>
 #include <fmt/format.h>
+#include <libarchive/archive.h>
+#include <libarchive/archive_entry.h>
 #include <valgrind/valgrind.h>
+
 
 #include <aws/core/Aws.h>
 #include <aws/core/auth/AWSCredentialsProvider.h>
@@ -1338,13 +1341,13 @@ Status WiredTigerKVEngine::_hotBackupPopulateLists(OperationContext* opCtx, cons
             fs::path destFile{destPath / filename};
 
             if (fs::exists(srcFile)) {
-                filesList.emplace_back(srcFile, destFile, fs::file_size(srcFile));
+                filesList.emplace_back(srcFile, destFile, fs::file_size(srcFile), fs::last_write_time(srcFile));
             } else {
                 // WT-999: check journal folder.
                 srcFile = srcPath / journalDir / filename;
                 destFile = destPath / journalDir / filename;
                 if (fs::exists(srcFile)) {
-                    filesList.emplace_back(srcFile, destFile, fs::file_size(srcFile));
+                    filesList.emplace_back(srcFile, destFile, fs::file_size(srcFile), fs::last_write_time(srcFile));
                 } else {
                     return Status(ErrorCodes::InvalidPath,
                                   str::stream() << "Cannot find source file for backup :" << filename << ", source path: " << srcPath.string());
@@ -1361,7 +1364,7 @@ Status WiredTigerKVEngine::_hotBackupPopulateLists(OperationContext* opCtx, cons
         const char* storageMetadata = "storage.bson";
         fs::path srcFile{fs::path{_path} / storageMetadata};
         fs::path destFile{destPath / storageMetadata};
-        filesList.emplace_back(srcFile, destFile, fs::file_size(srcFile));
+        filesList.emplace_back(srcFile, destFile, fs::file_size(srcFile), fs::last_write_time(srcFile));
     }
 
     // Release global lock (if it was created)
@@ -1557,6 +1560,65 @@ Status WiredTigerKVEngine::hotBackup(OperationContext* opCtx, const std::string&
             return Status(ErrorCodes::InternalError, ex.what());
         }
 
+    }
+
+    return Status::OK();
+}
+
+Status WiredTigerKVEngine::hotBackupTar(OperationContext* opCtx, const std::string& path) {
+    // list of DBs to backup
+    std::vector<DBTuple> dbList;
+    // list of files to backup
+    std::vector<FileTuple> filesList;
+
+    auto status = _hotBackupPopulateLists(opCtx, "", dbList, filesList);
+    if (!status.isOK()) {
+        return status;
+    }
+
+    // Write tar archive
+    struct archive *a{archive_write_new()};
+    ON_BLOCK_EXIT([&] { archive_write_free(a);});
+    archive_write_set_format_pax_restricted(a);
+    archive_write_open_filename(a, path.c_str());
+
+    struct archive_entry *entry{archive_entry_new()};
+    ON_BLOCK_EXIT([&] { archive_entry_free(entry);});
+
+    constexpr int bufsize = 8 * 1024;
+    auto buf = stdx::make_unique<char[]>(bufsize);
+    auto bufptr = buf.get();
+
+    for (auto&& file : filesList) {
+        boost::filesystem::path srcFile{std::get<0>(file)};
+        boost::filesystem::path destFile{std::get<1>(file)};
+        auto fsize{std::get<2>(file)};
+        auto fmtime{std::get<3>(file)};
+
+        LOG(2) << "backup of file: " << srcFile.string() << std::endl;
+        LOG(2) << "    storing as: " << destFile.string() << std::endl;
+
+        archive_entry_clear(entry);
+        archive_entry_set_pathname(entry, destFile.string().c_str());
+        archive_entry_set_size(entry, fsize);
+        archive_entry_set_filetype(entry, AE_IFREG);
+        archive_entry_set_perm(entry, 0660);
+        archive_entry_set_mtime(entry, fmtime, 0);
+        archive_write_header(a, entry);
+
+        std::ifstream src{};
+        src.exceptions(std::ios::failbit | std::ios::badbit);
+        src.open(srcFile.string(), std::ios::binary);
+
+        while (fsize > 0) {
+            boost::uintmax_t cnt = bufsize;
+            if (fsize < bufsize)
+                cnt = fsize;
+            src.read(bufptr, cnt);
+            archive_write_data(a, bufptr, cnt);
+            fsize -= cnt;
+        }
+        //TODO: add error handling: std::exception, libarchive exit codes
     }
 
     return Status::OK();

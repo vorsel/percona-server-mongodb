@@ -26,6 +26,7 @@ env.Library(
 
 if wiredtiger:
     wtEnv = env.Clone()
+    wtEnv.InjectThirdParty(libraries=['libarchive'])
     wtEnv.InjectThirdParty(libraries=['wiredtiger'])
     wtEnv.InjectThirdParty(libraries=['zlib'])
     wtEnv.InjectThirdParty(libraries=['valgrind'])
@@ -81,6 +82,7 @@ if wiredtiger:
             '$BUILD_DIR/mongo/util/concurrency/ticketholder',
             '$BUILD_DIR/mongo/util/elapsed_tracker',
             '$BUILD_DIR/mongo/util/processinfo',
+            '$BUILD_DIR/third_party/shim_libarchive',
             '$BUILD_DIR/third_party/shim_snappy',
             '$BUILD_DIR/third_party/shim_wiredtiger',
             '$BUILD_DIR/third_party/shim_zlib',
