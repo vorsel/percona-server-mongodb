@@ -51,6 +51,7 @@
 #include "mongo/db/auth/sasl_options.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/catalog/collection_impl.h"
 #include "mongo/db/catalog/create_collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder_impl.h"
@@ -74,6 +75,7 @@
 #include "mongo/db/free_mon/free_mon_mongod.h"
 #include "mongo/db/ftdc/ftdc_mongod.h"
 #include "mongo/db/global_settings.h"
+#include "mongo/db/index/index_access_method_factory_impl.h"
 #include "mongo/db/index_builds_coordinator_mongod.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/initialize_server_global_state.h"
@@ -783,6 +785,8 @@ void startupConfigActions(const std::vector<std::string>& args) {
 
 void setUpCatalog(ServiceContext* serviceContext) {
     DatabaseHolder::set(serviceContext, std::make_unique<DatabaseHolderImpl>());
+    IndexAccessMethodFactory::set(serviceContext, std::make_unique<IndexAccessMethodFactoryImpl>());
+    Collection::Factory::set(serviceContext, std::make_unique<CollectionImpl::FactoryImpl>());
 }
 
 auto makeReplicationExecutor(ServiceContext* serviceContext) {
@@ -911,16 +915,16 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
     // Shut down the global dbclient pool so callers stop waiting for connections.
     globalConnPool.shutdown();
 
+    // Inform Flow Control to stop gating writes on ticket admission. This must be done before the
+    // Periodic Runner is shut down (see SERVER-41751).
+    if (auto flowControlTicketholder = FlowControlTicketholder::get(serviceContext)) {
+        flowControlTicketholder->setInShutdown();
+    }
+
     // Shut down the background periodic task runner. This must be done before shutting down the
     // storage engine.
     if (auto runner = serviceContext->getPeriodicRunner()) {
         runner->shutdown();
-    }
-
-    // Inform Flow Control to stop gating writes on ticket admission. This is necessary because the
-    // ticket refresher thread is stopped as part of the shut down process (see SERVER-41345).
-    if (auto flowControlTicketholder = FlowControlTicketholder::get(serviceContext)) {
-        flowControlTicketholder->setInShutdown();
     }
 
     if (serviceContext->getStorageEngine()) {

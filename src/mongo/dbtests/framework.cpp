@@ -38,10 +38,12 @@
 #include "mongo/base/checked_cast.h"
 #include "mongo/base/status.h"
 #include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/catalog/collection_impl.h"
 #include "mongo/db/catalog/database_holder_impl.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/index/index_access_method_factory_impl.h"
 #include "mongo/db/index_builds_coordinator_mongod.h"
 #include "mongo/db/op_observer_registry.h"
 #include "mongo/db/s/sharding_state.h"
@@ -106,6 +108,9 @@ int runDbTests(int argc, char** argv) {
 
     initializeStorageEngine(globalServiceContext, StorageEngineInitFlags::kNone);
     DatabaseHolder::set(globalServiceContext, std::make_unique<DatabaseHolderImpl>());
+    IndexAccessMethodFactory::set(globalServiceContext,
+                                  std::make_unique<IndexAccessMethodFactoryImpl>());
+    Collection::Factory::set(globalServiceContext, std::make_unique<CollectionImpl::FactoryImpl>());
     IndexBuildsCoordinator::set(globalServiceContext,
                                 std::make_unique<IndexBuildsCoordinatorMongod>());
     auto registry = stdx::make_unique<OpObserverRegistry>();

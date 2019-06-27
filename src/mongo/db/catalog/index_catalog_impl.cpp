@@ -49,15 +49,8 @@
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/field_ref.h"
-#include "mongo/db/index/2d_access_method.h"
-#include "mongo/db/index/btree_access_method.h"
-#include "mongo/db/index/fts_access_method.h"
-#include "mongo/db/index/hash_access_method.h"
-#include "mongo/db/index/haystack_access_method.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/index/s2_access_method.h"
-#include "mongo/db/index/wildcard_access_method.h"
 #include "mongo/db/index_legacy.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/jsobj.h"
@@ -73,7 +66,7 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/kv/kv_catalog.h"
-#include "mongo/db/storage/kv/kv_storage_engine.h"
+#include "mongo/db/storage/kv/kv_engine.h"
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
@@ -165,34 +158,15 @@ IndexCatalogEntry* IndexCatalogImpl::_setupInMemoryStructures(
 
     IndexDescriptor* desc = entry->descriptor();
 
-    KVStorageEngine* engine =
-        checked_cast<KVStorageEngine*>(opCtx->getServiceContext()->getStorageEngine());
+    auto engine = opCtx->getServiceContext()->getStorageEngine();
     std::string ident =
         engine->getCatalog()->getIndexIdent(opCtx, _collection->ns(), desc->indexName());
 
     SortedDataInterface* sdi =
         engine->getEngine()->getGroupedSortedDataInterface(opCtx, ident, desc, entry->getPrefix());
 
-    const std::string& type = desc->getAccessMethodName();
-    std::unique_ptr<IndexAccessMethod> accessMethod;
-    if ("" == type)
-        accessMethod.reset(new BtreeAccessMethod(entry.get(), sdi));
-    else if (IndexNames::HASHED == type)
-        accessMethod.reset(new HashAccessMethod(entry.get(), sdi));
-    else if (IndexNames::GEO_2DSPHERE == type)
-        accessMethod.reset(new S2AccessMethod(entry.get(), sdi));
-    else if (IndexNames::TEXT == type)
-        accessMethod.reset(new FTSAccessMethod(entry.get(), sdi));
-    else if (IndexNames::GEO_HAYSTACK == type)
-        accessMethod.reset(new HaystackAccessMethod(entry.get(), sdi));
-    else if (IndexNames::GEO_2D == type)
-        accessMethod.reset(new TwoDAccessMethod(entry.get(), sdi));
-    else if (IndexNames::WILDCARD == type)
-        accessMethod.reset(new WildcardAccessMethod(entry.get(), sdi));
-    else {
-        log() << "Can't find index for keyPattern " << desc->keyPattern();
-        fassertFailed(51072);
-    }
+    std::unique_ptr<IndexAccessMethod> accessMethod =
+        IndexAccessMethodFactory::get(opCtx)->make(entry.get(), sdi);
 
     entry->init(std::move(accessMethod));
 

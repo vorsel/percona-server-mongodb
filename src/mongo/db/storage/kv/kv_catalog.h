@@ -34,6 +34,7 @@
 #include <string>
 
 #include "mongo/base/string_data.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/storage/bson_collection_catalog_entry.h"
@@ -44,7 +45,7 @@ namespace mongo {
 
 class OperationContext;
 class RecordStore;
-class KVStorageEngineInterface;
+class StorageEngineInterface;
 
 class KVCatalog {
 public:
@@ -58,7 +59,7 @@ public:
     KVCatalog(RecordStore* rs,
               bool directoryPerDb,
               bool directoryForIndexes,
-              KVStorageEngineInterface* engine);
+              StorageEngineInterface* engine);
     ~KVCatalog();
 
     void init(OperationContext* opCtx);
@@ -110,14 +111,15 @@ public:
      */
     std::string newInternalIdent();
 
-    void initCollection(OperationContext* opCtx, const NamespaceString& nss, bool forRepair);
+    std::unique_ptr<CollectionCatalogEntry> makeCollectionCatalogEntry(OperationContext* opCtx,
+                                                                       const NamespaceString& nss,
+                                                                       bool forRepair);
 
-    void reinitCollectionAfterRepair(OperationContext* opCtx, const NamespaceString& nss);
-
-    Status createCollection(OperationContext* opCtx,
-                            const NamespaceString& nss,
-                            const CollectionOptions& options,
-                            bool allocateDefaultSpace);
+    StatusWith<std::unique_ptr<CollectionCatalogEntry>> createCollection(
+        OperationContext* opCtx,
+        const NamespaceString& nss,
+        const CollectionOptions& options,
+        bool allocateDefaultSpace);
 
     Status renameCollection(OperationContext* opCtx,
                             const NamespaceString& fromNss,
@@ -129,11 +131,10 @@ public:
 private:
     class AddIdentChange;
     class RemoveIdentChange;
-    class FinishDropCatalogEntryChange;
 
-    friend class KVStorageEngine;
+    friend class StorageEngineImpl;
     friend class KVCatalogTest;
-    friend class KVStorageEngineTest;
+    friend class StorageEngineTest;
 
     BSONObj _findEntry(OperationContext* opCtx,
                        const NamespaceString& nss,
@@ -181,6 +182,6 @@ private:
     // guaranteed to be non-null after KVCatalog::init() is called.
     std::unique_ptr<FeatureTracker> _featureTracker;
 
-    KVStorageEngineInterface* const _engine;
+    StorageEngineInterface* const _engine;
 };
 }

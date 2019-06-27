@@ -256,9 +256,9 @@ selector:
   # Command expects to see result from parallel operation.
   # E.g. Suppose the following sequence of events: op1, join() op2 in parallel shell, op3.
   # op3 will still be using the snapshot from op1, and not see op2 at all.
-  - jstests/core/cursora.js
   - jstests/core/bench_test1.js
   - jstests/core/benchrun_pipeline_updates.js
+  - jstests/core/cursora.js
 
   # Does not support tojson of command objects.
   - jstests/core/SERVER-23626.js
@@ -270,6 +270,8 @@ selector:
   - assumes_write_concern_unchanged
   # Transactions are not allowed to operate on capped collections.
   - requires_capped
+  # Retrying a query can change whether a plan cache entry is active.
+  - inspects_whether_plan_cache_entry_is_active
 
 executor:
   archive:

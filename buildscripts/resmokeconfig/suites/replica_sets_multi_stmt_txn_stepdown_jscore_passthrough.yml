@@ -253,6 +253,7 @@ selector:
   # Command expects to see result from parallel operation.
   # E.g. Suppose the following sequence of events: op1, join() op2 in parallel shell, op3.
   # op3 will still be using the snapshot from op1, and not see op2 at all.
+  - jstests/core/benchrun_pipeline_updates.js
   - jstests/core/cursora.js
 
   # Expect drops/creates to fail or have a certain response:
@@ -339,6 +340,8 @@ selector:
   - operations_longer_than_stepdown_interval_in_txns
   # Transactions are not allowed to operate on capped collections.
   - requires_capped
+  # Retrying a query can change whether a plan cache entry is active.
+  - inspects_whether_plan_cache_entry_is_active
 
 executor:
   archive:

@@ -29,21 +29,17 @@
 
 #pragma once
 
+#include "mongo/db/index/index_access_method.h"
+
 namespace mongo {
 
-class KVEngine;
-class KVCatalog;
-class StorageEngine;
-
-class KVStorageEngineInterface {
+class IndexAccessMethodFactoryImpl : public IndexAccessMethodFactory {
 public:
-    KVStorageEngineInterface() = default;
-    virtual ~KVStorageEngineInterface() = default;
-    virtual StorageEngine* getStorageEngine() = 0;
-    virtual KVEngine* getEngine() = 0;
-    virtual void addDropPendingIdent(const Timestamp& dropTimestamp,
-                                     const NamespaceString& nss,
-                                     StringData ident) = 0;
-    virtual KVCatalog* getCatalog() = 0;
+    IndexAccessMethodFactoryImpl() = default;
+    ~IndexAccessMethodFactoryImpl() = default;
+
+    std::unique_ptr<IndexAccessMethod> make(IndexCatalogEntry* entry,
+                                            SortedDataInterface* SortedDataInterface) final;
 };
-}
+
+}  // namespace mongo

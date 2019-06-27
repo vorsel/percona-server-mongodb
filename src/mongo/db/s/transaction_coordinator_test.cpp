@@ -35,6 +35,7 @@
 #include "mongo/db/commands/txn_cmds_gen.h"
 #include "mongo/db/commands/txn_two_phase_commit_cmds_gen.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/s/server_transaction_coordinators_metrics.h"
 #include "mongo/db/s/transaction_coordinator_document_gen.h"
 #include "mongo/db/s/transaction_coordinator_metrics_observer.h"
 #include "mongo/db/s/transaction_coordinator_test_fixture.h"
@@ -971,6 +972,28 @@ public:
                   metrics()->getCurrentDeletingCoordinatorDoc());
     }
 
+    void checkServerStatus() {
+        TransactionCoordinatorsSSS tcsss;
+        BSONElement dummy;
+        const auto serverStatusSection = tcsss.generateSection(operationContext(), dummy);
+        ASSERT_EQ(metrics()->getTotalCreated(), serverStatusSection["totalCreated"].Long());
+        ASSERT_EQ(metrics()->getTotalStartedTwoPhaseCommit(),
+                  serverStatusSection["totalStartedTwoPhaseCommit"].Long());
+        ASSERT_EQ(
+            metrics()->getCurrentWritingParticipantList(),
+            serverStatusSection.getObjectField("currentInSteps")["writingParticipantList"].Long());
+        ASSERT_EQ(metrics()->getCurrentWaitingForVotes(),
+                  serverStatusSection.getObjectField("currentInSteps")["waitingForVotes"].Long());
+        ASSERT_EQ(metrics()->getCurrentWritingDecision(),
+                  serverStatusSection.getObjectField("currentInSteps")["writingDecision"].Long());
+        ASSERT_EQ(
+            metrics()->getCurrentWaitingForDecisionAcks(),
+            serverStatusSection.getObjectField("currentInSteps")["waitingForDecisionAcks"].Long());
+        ASSERT_EQ(
+            metrics()->getCurrentDeletingCoordinatorDoc(),
+            serverStatusSection.getObjectField("currentInSteps")["deletingCoordinatorDoc"].Long());
+    }
+
     Date_t advanceClockSourceAndReturnNewNow() {
         const auto newNow = Date_t::now();
         clockSource()->reset(newNow);
@@ -1551,9 +1574,7 @@ TEST_F(TransactionCoordinatorMetricsTest,
     expectedMetrics.totalStartedTwoPhaseCommit++;
     expectedMetrics.currentWritingParticipantList++;
 
-    setGlobalFailPoint("hangBeforeWaitingForParticipantListWriteConcern",
-                       BSON("mode"
-                            << "alwaysOn"));
+    FailPointEnableBlock fp("hangBeforeWaitingForParticipantListWriteConcern");
     coordinator.runCommit(kTwoShardIdList);
     waitUntilCoordinatorDocIsPresent();
 
@@ -1577,11 +1598,6 @@ TEST_F(TransactionCoordinatorMetricsTest,
     // Slow log line is not logged since the coordination did not complete successfully.
     stopCapturingLogMessages();
     ASSERT_EQUALS(0, countLogLinesContaining("two-phase commit parameters:"));
-
-    // Clear the failpoint before the next test.
-    setGlobalFailPoint("hangBeforeWaitingForParticipantListWriteConcern",
-                       BSON("mode"
-                            << "off"));
 }
 
 TEST_F(TransactionCoordinatorMetricsTest,
@@ -1680,9 +1696,8 @@ TEST_F(TransactionCoordinatorMetricsTest,
     expectedMetrics.totalStartedTwoPhaseCommit++;
     expectedMetrics.currentWritingDecision++;
 
-    setGlobalFailPoint("hangBeforeWaitingForDecisionWriteConcern",
-                       BSON("mode"
-                            << "alwaysOn"));
+    FailPointEnableBlock fp("hangBeforeWaitingForDecisionWriteConcern");
+
     coordinator.runCommit(kTwoShardIdList);
     // Respond to the second prepare request in a separate thread, because the coordinator will
     // hijack that thread to run its continuation.
@@ -1710,11 +1725,6 @@ TEST_F(TransactionCoordinatorMetricsTest,
     // Slow log line is not logged since the coordination did not complete successfully.
     stopCapturingLogMessages();
     ASSERT_EQUALS(0, countLogLinesContaining("two-phase commit parameters:"));
-
-    // Clear the failpoint before the next test.
-    setGlobalFailPoint("hangBeforeWaitingForDecisionWriteConcern",
-                       BSON("mode"
-                            << "off"));
 }
 
 TEST_F(TransactionCoordinatorMetricsTest,
@@ -1819,16 +1829,15 @@ TEST_F(TransactionCoordinatorMetricsTest, CoordinatorsAWSIsShutDownWhileCoordina
     expectedMetrics.totalStartedTwoPhaseCommit++;
     expectedMetrics.currentDeletingCoordinatorDoc++;
 
-    setGlobalFailPoint("hangAfterDeletingCoordinatorDoc",
-                       BSON("mode"
-                            << "alwaysOn"));
+    FailPointEnableBlock fp("hangAfterDeletingCoordinatorDoc");
+
     coordinator.runCommit(kTwoShardIdList);
     // Respond to the second prepare request in a separate thread, because the coordinator will
     // hijack that thread to run its continuation.
     assertPrepareSentAndRespondWithSuccess();
     auto future = launchAsync([this] { assertPrepareSentAndRespondWithSuccess(); });
-    // The last thing the coordinator will do on the hijacked prepare response thread is schedule
-    // the commitTransaction network requests.
+    // The last thing the coordinator will do on the hijacked prepare response thread is
+    // schedule the commitTransaction network requests.
     future.timed_get(kLongFutureTimeout);
     waitUntilMessageSent();
     // Respond to the second commit request in a separate thread, because the coordinator will
@@ -1849,8 +1858,8 @@ TEST_F(TransactionCoordinatorMetricsTest, CoordinatorsAWSIsShutDownWhileCoordina
     expectedMetrics.currentDeletingCoordinatorDoc--;
 
     awsPtr->shutdown({ErrorCodes::TransactionCoordinatorSteppingDown, "dummy"});
-    // The last thing the coordinator will do on the hijacked commit response thread is signal the
-    // coordinator's completion.
+    // The last thing the coordinator will do on the hijacked commit response thread is signal
+    // the coordinator's completion.
     future.timed_get(kLongFutureTimeout);
     coordinator.onCompletion().get();
 
@@ -1860,11 +1869,6 @@ TEST_F(TransactionCoordinatorMetricsTest, CoordinatorsAWSIsShutDownWhileCoordina
     // Slow log line is not logged since the coordination did not complete successfully.
     stopCapturingLogMessages();
     ASSERT_EQUALS(0, countLogLinesContaining("two-phase commit parameters:"));
-
-    // Clear the failpoint before the next test.
-    setGlobalFailPoint("hangAfterDeletingCoordinatorDoc",
-                       BSON("mode"
-                            << "off"));
 }
 
 TEST_F(TransactionCoordinatorMetricsTest, LogsTransactionAtLogLevelOne) {
@@ -2023,70 +2027,63 @@ TEST_F(TransactionCoordinatorMetricsTest, SlowLogLineIncludesStepDurationsAndTot
         std::make_unique<txn::AsyncWorkScheduler>(getServiceContext()),
         Date_t::max());
 
-    setGlobalFailPoint("hangBeforeWaitingForParticipantListWriteConcern",
-                       BSON("mode"
-                            << "alwaysOn"
-                            << "data"
-                            << BSON("useUninterruptibleSleep" << 1)));
-    coordinator.runCommit(kTwoShardIdList);
-    waitUntilCoordinatorDocIsPresent();
+    {
+        FailPointEnableBlock fp("hangBeforeWaitingForParticipantListWriteConcern",
+                                BSON("useUninterruptibleSleep" << 1));
 
-    // Increase the duration spent writing the participant list.
-    tickSource()->advance(Milliseconds(100));
+        coordinator.runCommit(kTwoShardIdList);
+        waitUntilCoordinatorDocIsPresent();
 
-    setGlobalFailPoint("hangBeforeWaitingForParticipantListWriteConcern",
-                       BSON("mode"
-                            << "off"));
+        // Increase the duration spent writing the participant list.
+        tickSource()->advance(Milliseconds(100));
+    }
+
     waitUntilMessageSent();
 
     // Increase the duration spent waiting for votes.
     tickSource()->advance(Milliseconds(100));
 
-    setGlobalFailPoint("hangBeforeWaitingForDecisionWriteConcern",
-                       BSON("mode"
-                            << "alwaysOn"
-                            << "data"
-                            << BSON("useUninterruptibleSleep" << 1)));
-    // Respond to the second prepare request in a separate thread, because the coordinator will
-    // hijack that thread to run its continuation.
-    assertPrepareSentAndRespondWithSuccess();
-    auto future = launchAsync([this] { assertPrepareSentAndRespondWithSuccess(); });
-    waitUntilCoordinatorDocHasDecision();
+    boost::optional<executor::NetworkTestEnv::FutureHandle<void>> futureOption;
 
-    // Increase the duration spent writing the decision.
-    tickSource()->advance(Milliseconds(100));
+    {
+        FailPointEnableBlock fp("hangBeforeWaitingForDecisionWriteConcern",
+                                BSON("useUninterruptibleSleep" << 1));
 
-    setGlobalFailPoint("hangBeforeWaitingForDecisionWriteConcern",
-                       BSON("mode"
-                            << "off"));
+        // Respond to the second prepare request in a separate thread, because the coordinator will
+        // hijack that thread to run its continuation.
+        assertPrepareSentAndRespondWithSuccess();
+        futureOption.emplace(launchAsync([this] { assertPrepareSentAndRespondWithSuccess(); }));
+        waitUntilCoordinatorDocHasDecision();
+
+        // Increase the duration spent writing the decision.
+        tickSource()->advance(Milliseconds(100));
+    }
+
     // The last thing the coordinator will do on the hijacked prepare response thread is schedule
     // the commitTransaction network requests.
-    future.timed_get(kLongFutureTimeout);
+    futureOption->timed_get(kLongFutureTimeout);
     waitUntilMessageSent();
 
     // Increase the duration spent waiting for decision acks.
     tickSource()->advance(Milliseconds(100));
 
-    setGlobalFailPoint("hangAfterDeletingCoordinatorDoc",
-                       BSON("mode"
-                            << "alwaysOn"
-                            << "data"
-                            << BSON("useUninterruptibleSleep" << 1)));
-    // Respond to the second commit request in a separate thread, because the coordinator will
-    // hijack that thread to run its continuation.
-    assertCommitSentAndRespondWithSuccess();
-    future = launchAsync([this] { assertCommitSentAndRespondWithSuccess(); });
-    waitUntilNoCoordinatorDocIsPresent();
+    {
+        FailPointEnableBlock fp("hangAfterDeletingCoordinatorDoc",
+                                BSON("useUninterruptibleSleep" << 1));
 
-    // Increase the duration spent deleting the coordinator doc.
-    tickSource()->advance(Milliseconds(100));
+        // Respond to the second commit request in a separate thread, because the coordinator will
+        // hijack that thread to run its continuation.
+        assertCommitSentAndRespondWithSuccess();
+        futureOption.emplace(launchAsync([this] { assertCommitSentAndRespondWithSuccess(); }));
+        waitUntilNoCoordinatorDocIsPresent();
 
-    setGlobalFailPoint("hangAfterDeletingCoordinatorDoc",
-                       BSON("mode"
-                            << "off"));
+        // Increase the duration spent deleting the coordinator doc.
+        tickSource()->advance(Milliseconds(100));
+    }
+
     // The last thing the coordinator will do on the hijacked commit response thread is signal the
     // coordinator's completion.
-    future.timed_get(kLongFutureTimeout);
+    futureOption->timed_get(kLongFutureTimeout);
     coordinator.onCompletion().get();
 
     stopCapturingLogMessages();
@@ -2099,6 +2096,44 @@ TEST_F(TransactionCoordinatorMetricsTest, SlowLogLineIncludesStepDurationsAndTot
                                           "waitingForDecisionAcksMicros: 100000, "
                                           "deletingCoordinatorDocMicros: 100000 }"));
     ASSERT_EQUALS(1, countLogLinesContaining(" 500ms\n") + countLogLinesContaining(" 500ms\r\n"));
+}
+
+TEST_F(TransactionCoordinatorMetricsTest, ServerStatusSectionIncludesTotalCreated) {
+    metrics()->incrementTotalCreated();
+    checkServerStatus();
+}
+
+TEST_F(TransactionCoordinatorMetricsTest, ServerStatusSectionIncludesTotalStartedTwoPhaseCommit) {
+    metrics()->incrementTotalStartedTwoPhaseCommit();
+    checkServerStatus();
+}
+
+TEST_F(TransactionCoordinatorMetricsTest,
+       ServerStatusSectionIncludesCurrentWritingParticipantList) {
+    metrics()->incrementCurrentWritingParticipantList();
+    checkServerStatus();
+}
+
+TEST_F(TransactionCoordinatorMetricsTest, ServerStatusSectionIncludesCurrentWaitingForVotes) {
+    metrics()->incrementCurrentWaitingForVotes();
+    checkServerStatus();
+}
+
+TEST_F(TransactionCoordinatorMetricsTest, ServerStatusSectionIncludesCurrentWritingDecision) {
+    metrics()->incrementCurrentWritingDecision();
+    checkServerStatus();
+}
+
+TEST_F(TransactionCoordinatorMetricsTest,
+       ServerStatusSectionIncludesCurrentWaitingForDecisionAcks) {
+    metrics()->incrementCurrentWaitingForDecisionAcks();
+    checkServerStatus();
+}
+
+TEST_F(TransactionCoordinatorMetricsTest,
+       ServerStatusSectionIncludesCurrentDeletingCoordinatorDoc) {
+    metrics()->incrementCurrentDeletingCoordinatorDoc();
+    checkServerStatus();
 }
 
 }  // namespace

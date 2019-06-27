@@ -40,7 +40,7 @@
 #include "mongo/db/storage/kv/kv_catalog.h"
 #include "mongo/db/storage/kv/kv_catalog_feature_tracker.h"
 #include "mongo/db/storage/kv/kv_drop_pending_ident_reaper.h"
-#include "mongo/db/storage/kv/kv_storage_engine_interface.h"
+#include "mongo/db/storage/kv/storage_engine_interface.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/temporary_record_store.h"
@@ -54,13 +54,13 @@ namespace mongo {
 class KVCatalog;
 class KVEngine;
 
-struct KVStorageEngineOptions {
+struct StorageEngineOptions {
     bool directoryPerDB = false;
     bool directoryForIndexes = false;
     bool forRepair = false;
 };
 
-class KVStorageEngine final : public KVStorageEngineInterface, public StorageEngine {
+class StorageEngineImpl final : public StorageEngineInterface, public StorageEngine {
     // percona::EngineExtension implementaion
     Status hotBackup(OperationContext* opCtx, const std::string& path) override;
     void keydbDropDatabase(const std::string& db) override;
@@ -69,9 +69,9 @@ public:
     /**
      * @param engine - ownership passes to me
      */
-    KVStorageEngine(KVEngine* engine, KVStorageEngineOptions options = KVStorageEngineOptions());
+    StorageEngineImpl(KVEngine* engine, StorageEngineOptions options = StorageEngineOptions());
 
-    virtual ~KVStorageEngine();
+    virtual ~StorageEngineImpl();
 
     virtual void finishInit();
 
@@ -352,6 +352,8 @@ public:
 private:
     using CollIter = std::list<std::string>::iterator;
 
+    void _initCollection(OperationContext* opCtx, const NamespaceString& nss, bool forRepair);
+
     Status _dropCollectionsNoTimestamp(OperationContext* opCtx,
                                        std::vector<NamespaceString>& toDrop);
 
@@ -382,7 +384,7 @@ private:
     // This must be the first member so it is destroyed last.
     std::unique_ptr<KVEngine> _engine;
 
-    const KVStorageEngineOptions _options;
+    const StorageEngineOptions _options;
 
     // Manages drop-pending idents. Requires access to '_engine'.
     KVDropPendingIdentReaper _dropPendingIdentReaper;

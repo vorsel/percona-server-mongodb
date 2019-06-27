@@ -35,14 +35,13 @@
 
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/bson/util/builder.h"
-#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/storage/kv/kv_catalog_feature_tracker.h"
 #include "mongo/db/storage/kv/kv_collection_catalog_entry.h"
 #include "mongo/db/storage/kv/kv_engine.h"
-#include "mongo/db/storage/kv/kv_storage_engine_interface.h"
+#include "mongo/db/storage/kv/storage_engine_interface.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/platform/bits.h"
@@ -322,7 +321,7 @@ void KVCatalog::FeatureTracker::putInfo(OperationContext* opCtx, const FeatureBi
 KVCatalog::KVCatalog(RecordStore* rs,
                      bool directoryPerDb,
                      bool directoryForIndexes,
-                     KVStorageEngineInterface* engine)
+                     StorageEngineInterface* engine)
     : _rs(rs),
       _directoryPerDb(directoryPerDb),
       _directoryForIndexes(directoryForIndexes),
@@ -707,15 +706,13 @@ StatusWith<std::string> KVCatalog::newOrphanedIdent(OperationContext* opCtx, std
     return StatusWith<std::string>(std::move(ns));
 }
 
-void KVCatalog::initCollection(OperationContext* opCtx,
-                               const NamespaceString& nss,
-                               bool forRepair) {
+std::unique_ptr<CollectionCatalogEntry> KVCatalog::makeCollectionCatalogEntry(
+    OperationContext* opCtx, const NamespaceString& nss, bool forRepair) {
     BSONCollectionCatalogEntry::MetaData md = getMetaData(opCtx, nss);
     uassert(ErrorCodes::MustDowngrade,
             str::stream() << "Collection does not have UUID in KVCatalog. Collection: " << nss,
             md.options.uuid);
 
-    auto uuid = md.options.uuid.get();
     auto ident = getCollectionIdent(nss);
 
     std::unique_ptr<RecordStore> rs;
@@ -729,22 +726,15 @@ void KVCatalog::initCollection(OperationContext* opCtx,
         invariant(rs);
     }
 
-    CollectionCatalog::get(getGlobalServiceContext())
-        .registerCatalogEntry(uuid,
-                              std::make_unique<KVCollectionCatalogEntry>(
-                                  _engine, this, nss.ns(), ident, std::move(rs)));
+    return std::make_unique<KVCollectionCatalogEntry>(
+        _engine, this, nss.ns(), ident, std::move(rs));
 }
 
-void KVCatalog::reinitCollectionAfterRepair(OperationContext* opCtx, const NamespaceString& nss) {
-    auto& catalog = CollectionCatalog::get(getGlobalServiceContext());
-    catalog.deregisterCatalogEntry(catalog.lookupUUIDByNSS(nss).get());
-    initCollection(opCtx, nss, false);
-}
-
-Status KVCatalog::createCollection(OperationContext* opCtx,
-                                   const NamespaceString& nss,
-                                   const CollectionOptions& options,
-                                   bool allocateDefaultSpace) {
+StatusWith<std::unique_ptr<CollectionCatalogEntry>> KVCatalog::createCollection(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const CollectionOptions& options,
+    bool allocateDefaultSpace) {
     invariant(opCtx->lockState()->isDbLockedForMode(nss.db(), MODE_IX));
     invariant(nss.coll().size() > 0);
 
@@ -779,19 +769,13 @@ Status KVCatalog::createCollection(OperationContext* opCtx,
     opCtx->recoveryUnit()->onRollback([ opCtx, catalog = this, nss, ident, uuid ]() {
         // Intentionally ignoring failure
         catalog->_engine->getEngine()->dropIdent(opCtx, ident).ignore();
-
-        CollectionCatalog::get(opCtx).deregisterCatalogEntry(uuid);
     });
 
     auto rs = _engine->getEngine()->getGroupedRecordStore(opCtx, nss.ns(), ident, options, prefix);
     invariant(rs);
 
-    CollectionCatalog::get(getGlobalServiceContext())
-        .registerCatalogEntry(uuid,
-                              std::make_unique<KVCollectionCatalogEntry>(
-                                  _engine, this, nss.ns(), ident, std::move(rs)));
-
-    return Status::OK();
+    return std::make_unique<KVCollectionCatalogEntry>(
+        _engine, this, nss.ns(), ident, std::move(rs));
 }
 
 Status KVCatalog::renameCollection(OperationContext* opCtx,
@@ -817,29 +801,6 @@ Status KVCatalog::renameCollection(OperationContext* opCtx,
 
     return Status::OK();
 }
-
-class KVCatalog::FinishDropCatalogEntryChange : public RecoveryUnit::Change {
-public:
-    FinishDropCatalogEntryChange(CollectionCatalog& catalog,
-                                 std::unique_ptr<CollectionCatalogEntry> collectionCatalogEntry,
-                                 CollectionUUID uuid)
-        : _catalog(catalog),
-          _collectionCatalogEntry(std::move(collectionCatalogEntry)),
-          _uuid(uuid) {}
-
-    void commit(boost::optional<Timestamp>) override {
-        _collectionCatalogEntry.reset();
-    }
-
-    void rollback() override {
-        _catalog.registerCatalogEntry(_uuid, std::move(_collectionCatalogEntry));
-    }
-
-private:
-    CollectionCatalog& _catalog;
-    std::unique_ptr<CollectionCatalogEntry> _collectionCatalogEntry;
-    CollectionUUID _uuid;
-};
 
 Status KVCatalog::dropCollection(OperationContext* opCtx, const NamespaceString& nss) {
     invariant(opCtx->lockState()->isCollectionLockedForMode(nss, MODE_X));
@@ -873,18 +834,11 @@ Status KVCatalog::dropCollection(OperationContext* opCtx, const NamespaceString&
         return status;
     }
 
-    // Remove catalog entry
-    std::unique_ptr<CollectionCatalogEntry> removedCatalogEntry =
-        CollectionCatalog::get(opCtx).deregisterCatalogEntry(uuid.get());
-
-    opCtx->recoveryUnit()->registerChange(new FinishDropCatalogEntryChange(
-        CollectionCatalog::get(opCtx), std::move(removedCatalogEntry), uuid.get()));
-
     // This will lazily delete the KVCollectionCatalogEntry and notify the storageEngine to
     // drop the collection only on WUOW::commit().
     opCtx->recoveryUnit()->onCommit(
         [ opCtx, catalog = this, nss, uuid, ident ](boost::optional<Timestamp> commitTimestamp) {
-            KVStorageEngineInterface* engine = catalog->_engine;
+            StorageEngineInterface* engine = catalog->_engine;
             auto storageEngine = engine->getStorageEngine();
             if (storageEngine->supportsPendingDrops() && commitTimestamp) {
                 log() << "Deferring table drop for collection '" << nss << "' (" << uuid << ")"
@@ -897,7 +851,6 @@ Status KVCatalog::dropCollection(OperationContext* opCtx, const NamespaceString&
                 kvEngine->dropIdent(opCtx, ident).ignore();
             }
         });
-
 
     return Status::OK();
 }

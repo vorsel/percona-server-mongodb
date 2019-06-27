@@ -73,7 +73,7 @@ Document GroupFromFirstDocumentTransformation::applyTransformation(const Documen
     MutableDocument output(_accumulatorExprs.size());
 
     for (auto&& expr : _accumulatorExprs) {
-        auto value = expr.second->evaluate(input);
+        auto value = expr.second->evaluate(input, &expr.second->getExpressionContext()->variables);
         output.addField(expr.first, value.missing() ? Value(BSONNULL) : value);
     }
 
@@ -292,6 +292,24 @@ DocumentSource::GetModPathsReturn DocumentSourceGroup::getModifiedPaths() const 
             std::move(renames)};
 }
 
+StringMap<boost::intrusive_ptr<Expression>> DocumentSourceGroup::getIdFields() const {
+    if (_idFieldNames.empty()) {
+        invariant(_idExpressions.size() == 1);
+        return {{"_id", _idExpressions[0]}};
+    } else {
+        invariant(_idFieldNames.size() == _idExpressions.size());
+        StringMap<boost::intrusive_ptr<Expression>> result;
+        for (std::size_t i = 0; i < _idFieldNames.size(); ++i) {
+            result["_id." + _idFieldNames[i]] = _idExpressions[i];
+        }
+        return result;
+    }
+}
+
+const std::vector<AccumulationStatement>& DocumentSourceGroup::getAccumulatedFields() const {
+    return _accumulatedFields;
+}
+
 intrusive_ptr<DocumentSourceGroup> DocumentSourceGroup::create(
     const intrusive_ptr<ExpressionContext>& pExpCtx,
     const boost::intrusive_ptr<Expression>& groupByExpression,
@@ -495,8 +513,9 @@ DocumentSource::GetNextResult DocumentSourceGroup::initialize() {
         dassert(numAccumulators == group.size());
 
         for (size_t i = 0; i < numAccumulators; i++) {
-            group[i]->process(_accumulatedFields[i].expression->evaluate(rootDocument),
-                              _doingMerge);
+            group[i]->process(
+                _accumulatedFields[i].expression->evaluate(rootDocument, &pExpCtx->variables),
+                _doingMerge);
 
             _memoryUsageBytes += group[i]->memUsageForSorter();
         }
@@ -611,7 +630,7 @@ shared_ptr<Sorter<Value, Value>::Iterator> DocumentSourceGroup::spill() {
 Value DocumentSourceGroup::computeId(const Document& root) {
     // If only one expression, return result directly
     if (_idExpressions.size() == 1) {
-        Value retValue = _idExpressions[0]->evaluate(root);
+        Value retValue = _idExpressions[0]->evaluate(root, &pExpCtx->variables);
         return retValue.missing() ? Value(BSONNULL) : std::move(retValue);
     }
 
@@ -619,7 +638,7 @@ Value DocumentSourceGroup::computeId(const Document& root) {
     vector<Value> vals;
     vals.reserve(_idExpressions.size());
     for (size_t i = 0; i < _idExpressions.size(); i++) {
-        vals.push_back(_idExpressions[i]->evaluate(root));
+        vals.push_back(_idExpressions[i]->evaluate(root, &pExpCtx->variables));
     }
     return Value(std::move(vals));
 }

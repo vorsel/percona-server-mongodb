@@ -65,7 +65,7 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/top.h"
-#include "mongo/db/storage/kv/kv_storage_engine.h"
+#include "mongo/db/storage/kv/kv_catalog.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/storage_engine_init.h"
@@ -83,22 +83,6 @@ namespace mongo {
 
 namespace {
 MONGO_FAIL_POINT_DEFINE(hangBeforeLoggingCreateCollection);
-
-std::unique_ptr<Collection> _createCollectionInstance(OperationContext* opCtx,
-                                                      const NamespaceString& nss) {
-
-    auto cce = CollectionCatalog::get(opCtx).lookupCollectionCatalogEntryByNamespace(nss);
-    auto rs = cce->getRecordStore();
-    auto uuid = cce->getCollectionOptions(opCtx).uuid;
-    invariant(rs,
-              str::stream() << "Record store did not exist. Collection: " << nss.ns() << " UUID: "
-                            << uuid);
-    invariant(uuid);
-
-    auto coll = std::make_unique<CollectionImpl>(opCtx, nss.ns(), uuid, cce, rs);
-
-    return coll;
-}
 
 Status validateDBNameForWindows(StringData dbname) {
     const std::vector<std::string> windowsReservedNames = {
@@ -119,13 +103,6 @@ void uassertNamespaceNotIndex(StringData ns, StringData caller) {
     uassert(17320,
             str::stream() << "cannot do " << caller << " on namespace with a $ in it: " << ns,
             NamespaceString::normal(ns));
-}
-
-void DatabaseImpl::close(OperationContext* opCtx) const {
-    invariant(opCtx->lockState()->isW());
-
-    // Clear cache of oplog Collection pointer.
-    repl::oplogCheckCloseDatabase(opCtx, this);
 }
 
 Status DatabaseImpl::validateDBName(StringData dbname) {
@@ -169,13 +146,12 @@ void DatabaseImpl::init(OperationContext* const opCtx) const {
     }
 
     auto& catalog = CollectionCatalog::get(opCtx);
-    for (const auto& nss : catalog.getAllCollectionNamesFromDb(opCtx, _name)) {
-        auto ownedCollection = _createCollectionInstance(opCtx, nss);
-        invariant(ownedCollection);
-
-        // Call registerCollectionObject directly because we're not in a WUOW.
-        auto uuid = *(ownedCollection->uuid());
-        catalog.registerCollectionObject(uuid, std::move(ownedCollection));
+    for (const auto& uuid : catalog.getAllCollectionUUIDsFromDb(_name)) {
+        auto collection = catalog.lookupCollectionByUUID(uuid);
+        invariant(collection);
+        // If this is called from the repair path, the collection is already initialized.
+        if (!collection->isInitialized())
+            collection->init(opCtx);
     }
 
     // At construction time of the viewCatalog, the CollectionCatalog map wasn't initialized yet,
@@ -499,12 +475,18 @@ Status DatabaseImpl::_finishDropCollection(OperationContext* opCtx,
     UUID uuid = *collection->uuid();
     log() << "Finishing collection drop for " << nss << " (" << uuid << ").";
 
-    CollectionCatalog& catalog = CollectionCatalog::get(opCtx);
-    catalog.onDropCollection(opCtx, uuid);
+    auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
+    auto status = storageEngine->getCatalog()->dropCollection(opCtx, nss);
+    if (!status.isOK())
+        return status;
 
-    auto storageEngine =
-        checked_cast<KVStorageEngine*>(opCtx->getServiceContext()->getStorageEngine());
-    return storageEngine->getCatalog()->dropCollection(opCtx, nss);
+    auto[removedColl, removedCatalogEntry] =
+        CollectionCatalog::get(opCtx).deregisterCollection(uuid);
+    opCtx->recoveryUnit()->registerChange(
+        CollectionCatalog::get(opCtx).makeFinishDropCollectionChange(
+            std::move(removedColl), std::move(removedCatalogEntry), uuid));
+
+    return Status::OK();
 }
 
 Collection* DatabaseImpl::getCollection(OperationContext* opCtx, const NamespaceString& nss) const {
@@ -551,8 +533,7 @@ Status DatabaseImpl::renameCollection(OperationContext* opCtx,
 
     Top::get(opCtx->getServiceContext()).collectionDropped(fromNss);
 
-    auto storageEngine =
-        checked_cast<KVStorageEngine*>(opCtx->getServiceContext()->getStorageEngine());
+    auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
     Status status = storageEngine->getCatalog()->renameCollection(opCtx, fromNss, toNss, stayTemp);
 
     // Set the namespace of 'collToRename' from within the CollectionCatalog. This is necessary
@@ -681,22 +662,33 @@ Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
           << " UUID: " << optionsWithUUID.uuid.get() << " and options: " << options.toBSON();
 
     // Create CollectionCatalogEntry
-    auto storageEngine =
-        checked_cast<KVStorageEngine*>(opCtx->getServiceContext()->getStorageEngine());
-    massertStatusOK(storageEngine->getCatalog()->createCollection(
-        opCtx, nss, optionsWithUUID, true /*allocateDefaultSpace*/));
+    auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
+    auto statusWithCatalogEntry = storageEngine->getCatalog()->createCollection(
+        opCtx, nss, optionsWithUUID, true /*allocateDefaultSpace*/);
+    massertStatusOK(statusWithCatalogEntry.getStatus());
+    std::unique_ptr<CollectionCatalogEntry> ownedCatalogEntry =
+        std::move(statusWithCatalogEntry.getValue());
 
     // Create Collection object
-    auto& catalog = CollectionCatalog::get(opCtx);
-    auto ownedCollection = _createCollectionInstance(opCtx, nss);
-    Collection* collection = ownedCollection.get();
-    catalog.onCreateCollection(opCtx, std::move(ownedCollection), *(collection->uuid()));
+    std::unique_ptr<Collection> ownedCollection =
+        Collection::Factory::get(opCtx)->make(opCtx, ownedCatalogEntry.get());
+    auto collection = ownedCollection.get();
+    ownedCollection->init(opCtx);
+
     opCtx->recoveryUnit()->onCommit([collection](auto commitTime) {
         // Ban reading from this collection on committed reads on snapshots before now.
         if (commitTime)
             collection->setMinimumVisibleSnapshot(commitTime.get());
     });
 
+    auto& catalog = CollectionCatalog::get(opCtx);
+    auto uuid = ownedCollection->uuid().get();
+    catalog.registerCollection(uuid, std::move(ownedCatalogEntry), std::move(ownedCollection));
+    opCtx->recoveryUnit()->onRollback([uuid, &catalog] {
+        auto[removedColl, removedCatalogEntry] = catalog.deregisterCollection(uuid);
+        removedColl.reset();
+        removedCatalogEntry.reset();
+    });
 
     BSONObj fullIdIndexSpec;
 

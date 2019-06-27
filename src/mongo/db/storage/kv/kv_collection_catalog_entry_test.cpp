@@ -43,7 +43,7 @@
 #include "mongo/db/service_context_test_fixture.h"
 #include "mongo/db/storage/devnull/devnull_kv_engine.h"
 #include "mongo/db/storage/kv/kv_engine.h"
-#include "mongo/db/storage/kv/kv_storage_engine.h"
+#include "mongo/db/storage/kv/storage_engine_impl.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/str.h"
@@ -61,7 +61,7 @@ class KVCollectionCatalogEntryTest : public ServiceContextTest {
 public:
     KVCollectionCatalogEntryTest()
         : _nss("unittests.kv_collection_catalog_entry"),
-          _storageEngine(new DevNullKVEngine(), KVStorageEngineOptions()) {
+          _storageEngine(new DevNullKVEngine(), StorageEngineOptions()) {
         _storageEngine.finishInit();
     }
 
@@ -84,8 +84,14 @@ public:
             const bool allocateDefaultSpace = true;
             CollectionOptions options;
             options.uuid = UUID::gen();
-            ASSERT_OK(_storageEngine.getCatalog()->createCollection(
-                opCtx.get(), _nss, options, allocateDefaultSpace));
+            auto statusWithCatalogEntry = _storageEngine.getCatalog()->createCollection(
+                opCtx.get(), _nss, options, allocateDefaultSpace);
+            ASSERT_OK(statusWithCatalogEntry.getStatus());
+            auto collection = std::make_unique<CollectionMock>(_nss);
+            CollectionCatalog::get(opCtx.get())
+                .registerCollection(options.uuid.get(),
+                                    std::move(statusWithCatalogEntry.getValue()),
+                                    std::move(collection));
             wuow.commit();
         }
     }
@@ -147,7 +153,7 @@ private:
     }
 
     const NamespaceString _nss;
-    KVStorageEngine _storageEngine;
+    StorageEngineImpl _storageEngine;
     size_t numIndexesCreated = 0;
 };
 

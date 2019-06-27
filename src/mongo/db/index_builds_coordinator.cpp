@@ -170,42 +170,46 @@ StatusWith<std::pair<long long, long long>> IndexBuildsCoordinator::startIndexRe
         indexNames.push_back(name);
     }
 
-    const auto& ns = cce->ns().ns();
-    auto rs = cce->getRecordStore();
+    const NamespaceString nss(cce->ns());
 
     ReplIndexBuildState::IndexCatalogStats indexCatalogStats;
 
-    std::unique_ptr<Collection> collection;
+    auto& collectionCatalog = CollectionCatalog::get(getGlobalServiceContext());
+    Collection* collection = collectionCatalog.lookupCollectionByNamespace(nss);
+    auto indexCatalog = collection->getIndexCatalog();
     std::unique_ptr<MultiIndexBlock> indexer;
     {
         // These steps are combined into a single WUOW to ensure there are no commits without
         // the indexes.
         // 1) Drop all indexes.
-        // 2) Open the Collection
+        // 2) Re-create the Collection.
         // 3) Start the index build process.
-
         WriteUnitOfWork wuow(opCtx);
 
-        {  // 1
+        // 1
+        {
             for (size_t i = 0; i < indexNames.size(); i++) {
-                Status s = cce->removeIndex(opCtx, indexNames[i]);
+                auto descriptor = indexCatalog->findIndexByName(opCtx, indexNames[i], false);
+                if (!descriptor) {
+                    // If it's unfinished index, drop it directly via removeIndex.
+                    Status status =
+                        collection->getCatalogEntry()->removeIndex(opCtx, indexNames[i]);
+                    continue;
+                }
+                Status s = indexCatalog->dropIndex(opCtx, descriptor);
                 if (!s.isOK()) {
                     return s;
                 }
             }
         }
 
-        // Indexes must be dropped before we open the Collection otherwise we could attempt to
-        // open a bad index and fail.
-        const auto uuid = cce->getCollectionOptions(opCtx).uuid;
-        auto databaseHolder = DatabaseHolder::get(opCtx);
-        collection = databaseHolder->makeCollection(opCtx, ns, uuid, cce, rs);
+        // We need to initialize the collection to drop and rebuild the indexes.
+        collection->init(opCtx);
 
         // Register the index build. During recovery, collections may not have UUIDs present yet to
         // due upgrading. We don't require collection UUIDs during recovery except to create a
         // ReplIndexBuildState object.
         auto collectionUUID = UUID::gen();
-        auto nss = collection->ns();
         auto dbName = nss.db().toString();
 
         // We run the index build using the single phase protocol as we already hold the global
@@ -228,12 +232,12 @@ StatusWith<std::pair<long long, long long>> IndexBuildsCoordinator::startIndexRe
 
         // Setup the index build.
         indexCatalogStats.numIndexesBefore =
-            _getNumIndexesTotal(opCtx, collection.get()) + indexNames.size();
+            _getNumIndexesTotal(opCtx, collection) + indexNames.size();
 
         IndexBuildsManager::SetupOptions options;
         options.forRecovery = true;
         status = _indexBuildsManager.setUpIndexBuild(
-            opCtx, collection.get(), specs, buildUUID, MultiIndexBlock::kNoopOnInitFn, options);
+            opCtx, collection, specs, buildUUID, MultiIndexBlock::kNoopOnInitFn, options);
         if (!status.isOK()) {
             // An index build failure during recovery is fatal.
             logFailure(status, nss, replIndexBuildState);
@@ -243,7 +247,7 @@ StatusWith<std::pair<long long, long long>> IndexBuildsCoordinator::startIndexRe
         wuow.commit();
     }
 
-    return _runIndexRebuildForRecovery(opCtx, collection.get(), indexCatalogStats, buildUUID);
+    return _runIndexRebuildForRecovery(opCtx, collection, indexCatalogStats, buildUUID);
 }
 
 Future<void> IndexBuildsCoordinator::joinIndexBuilds(const NamespaceString& nss,
@@ -254,8 +258,9 @@ Future<void> IndexBuildsCoordinator::joinIndexBuilds(const NamespaceString& nss,
     return std::move(pf.future);
 }
 
-void IndexBuildsCoordinator::interruptAllIndexBuilds(const std::string& reason) {
+void IndexBuildsCoordinator::interruptAllIndexBuildsForShutdown(const std::string& reason) {
     stdx::unique_lock<stdx::mutex> lk(_mutex);
+    _shuttingDown = true;
 
     // Signal all the index builds to stop.
     for (auto& buildStateIt : _allIndexBuilds) {
@@ -779,6 +784,20 @@ void IndexBuildsCoordinator::_runIndexBuildInner(OperationContext* opCtx,
             // OperationContext::checkForInterrupt() will see the kill status and respond
             // accordingly (checkForInterrupt() will throw an exception while
             // checkForInterruptNoAssert() returns an error Status).
+
+            // We need to drop the RSTL here, as we do not need synchronization with step up and
+            // step down. Dropping the RSTL is important because otherwise if we held the RSTL it
+            // would create deadlocks with prepared transactions on step up and step down.  A
+            // deadlock could result if the index build was attempting to acquire a Collection S or
+            // X lock while a prepared transaction held a Collection IX lock, and a step down was
+            // waiting to acquire the RSTL in mode X.
+            // We should only drop the RSTL while in FCV 4.2, as prepared transactions can only
+            // occur in FCV 4.2.
+            if (serverGlobalParams.featureCompatibility.getVersion() ==
+                ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42) {
+                const bool unlocked = opCtx->lockState()->unlockRSTLforPrepare();
+                invariant(unlocked);
+            }
             opCtx->runWithoutInterruptionExceptAtGlobalShutdown(
                 [&, this] { _buildIndex(opCtx, collection, *nss, replState, &collLock); });
         } else {
@@ -819,6 +838,11 @@ void IndexBuildsCoordinator::_runIndexBuildInner(OperationContext* opCtx,
 
         // Failed index builds should abort secondary oplog application.
         if (replSetAndNotPrimary) {
+            stdx::unique_lock<stdx::mutex> lk(_mutex);
+            if (_shuttingDown) {
+                // Allow shutdown with success exit status, despite interrupted index builds.
+                return;
+            }
             fassert(51101,
                     status.withContext(str::stream() << "Index build: " << replState->buildUUID
                                                      << "; Database: "
@@ -849,10 +873,11 @@ void IndexBuildsCoordinator::_buildIndex(OperationContext* opCtx,
     invariant(_indexBuildsManager.isBackgroundBuilding(replState->buildUUID) ||
               storageGlobalParams.engine == "mobile");
 
-    // Index builds can safely ignore prepare conflicts. On secondaries, prepare operations wait for
-    // index builds to complete.
+    // Index builds can safely ignore prepare conflicts and perform writes. On secondaries, prepare
+    // operations wait for index builds to complete.
     opCtx->recoveryUnit()->abandonSnapshot();
-    opCtx->recoveryUnit()->setIgnorePrepared(true);
+    opCtx->recoveryUnit()->setPrepareConflictBehavior(
+        PrepareConflictBehavior::kIgnoreConflictsAllowWrites);
 
     // Collection scan and insert into index, followed by a drain of writes received in the
     // background.
