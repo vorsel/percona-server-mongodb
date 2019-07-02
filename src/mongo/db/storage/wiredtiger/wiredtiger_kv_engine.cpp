@@ -1566,6 +1566,8 @@ Status WiredTigerKVEngine::hotBackup(OperationContext* opCtx, const std::string&
 }
 
 Status WiredTigerKVEngine::hotBackupTar(OperationContext* opCtx, const std::string& path) {
+    namespace fs = boost::filesystem;
+
     // list of DBs to backup
     std::vector<DBTuple> dbList;
     // list of files to backup
@@ -1590,8 +1592,8 @@ Status WiredTigerKVEngine::hotBackupTar(OperationContext* opCtx, const std::stri
     auto bufptr = buf.get();
 
     for (auto&& file : filesList) {
-        boost::filesystem::path srcFile{std::get<0>(file)};
-        boost::filesystem::path destFile{std::get<1>(file)};
+        fs::path srcFile{std::get<0>(file)};
+        fs::path destFile{std::get<1>(file)};
         auto fsize{std::get<2>(file)};
         auto fmtime{std::get<3>(file)};
 
@@ -1606,19 +1608,24 @@ Status WiredTigerKVEngine::hotBackupTar(OperationContext* opCtx, const std::stri
         archive_entry_set_mtime(entry, fmtime, 0);
         archive_write_header(a, entry);
 
-        std::ifstream src{};
-        src.exceptions(std::ios::failbit | std::ios::badbit);
-        src.open(srcFile.string(), std::ios::binary);
+        try {
+            std::ifstream src{};
+            src.exceptions(std::ios::failbit | std::ios::badbit);
+            src.open(srcFile.string(), std::ios::binary);
 
-        while (fsize > 0) {
-            boost::uintmax_t cnt = bufsize;
-            if (fsize < bufsize)
-                cnt = fsize;
-            src.read(bufptr, cnt);
-            archive_write_data(a, bufptr, cnt);
-            fsize -= cnt;
+            while (fsize > 0) {
+                boost::uintmax_t cnt = bufsize;
+                if (fsize < bufsize)
+                    cnt = fsize;
+                src.read(bufptr, cnt);
+                archive_write_data(a, bufptr, cnt);
+                fsize -= cnt;
+            }
+        } catch (const fs::filesystem_error& ex) {
+            return Status(ErrorCodes::InvalidPath, ex.what());
+        } catch (const std::exception& ex) {
+            return Status(ErrorCodes::InternalError, ex.what());
         }
-        //TODO: add error handling: std::exception, libarchive exit codes
     }
 
     return Status::OK();
