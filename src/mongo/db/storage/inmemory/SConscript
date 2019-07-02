@@ -20,10 +20,6 @@ if inmemory:
         LIBDEPS=[
             '$BUILD_DIR/mongo/db/storage/wiredtiger/storage_wiredtiger_core',
             ],
-        LIBDEPS_TAGS=[
-            # Depends on symbols defined in serverOnlyfiles
-            'incomplete',
-        ],
         )
 
     imEnv.CppUnitTest(
@@ -32,10 +28,10 @@ if inmemory:
                 ],
         LIBDEPS=[
             '$BUILD_DIR/mongo/db/auth/authmocks',
-            '$BUILD_DIR/mongo/db/serveronly',
             '$BUILD_DIR/mongo/db/service_context',
             '$BUILD_DIR/mongo/db/service_context_d',
             '$BUILD_DIR/mongo/db/service_context_test_fixture',
+            '$BUILD_DIR/mongo/db/storage/wiredtiger/storage_wiredtiger_core',
             ],
         )
 
