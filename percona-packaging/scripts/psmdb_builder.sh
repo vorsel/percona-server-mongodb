@@ -21,6 +21,7 @@ Usage: $0 [OPTIONS]
         --psm_ver           PSM_VER(mandatory)
         --psm_release       PSM_RELEASE(mandatory)
         --mongo_tools_tag   MONGO_TOOLS_TAG(mandatory)
+        --special_targets   Special targets for tests
         --debug             build debug tarball
         --help) usage ;;
 Example $0 --builddir=/tmp/PSMDB --get_sources=1 --build_src_rpm=1 --build_rpm=1
@@ -57,6 +58,7 @@ parse_arguments() {
             --psm_release=*) PSM_RELEASE="$val" ;;
             --mongo_tools_tag=*) MONGO_TOOLS_TAG="$val" ;;
             --debug=*) DEBUG="$val" ;;
+            --special_targets=*) SPECIAL_TAR="$val" ;;
             --help) usage ;;
             *)
               if test -n "$pick_args"
@@ -329,7 +331,7 @@ install_deps() {
         sleep 1
         echo "waiting"
       done
-      until apt-get -y install ${INSTALL_LIST}; do
+      until DEBIAN_FRONTEND=noninteractive apt-get -y install ${INSTALL_LIST}; do
         sleep 1
         echo "waiting"
       done
@@ -644,7 +646,7 @@ build_tarball(){
     #
     set_compiler
     #
-    PSM_TARGETS="mongod mongos mongo mongobridge perconadecrypt dbtest"
+    PSM_TARGETS="mongod mongos mongo mongobridge perconadecrypt $SPECIAL_TAR"
     TARBALL_SUFFIX=""
     if [ ${DEBUG} = 1 ]; then
     TARBALL_SUFFIX=".dbg"
