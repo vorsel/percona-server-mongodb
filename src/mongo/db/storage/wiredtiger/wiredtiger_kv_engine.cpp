@@ -698,6 +698,8 @@ void WiredTigerKVEngine::appendGlobalStats(BSONObjBuilder& b) {
 
 void WiredTigerKVEngine::cleanShutdown() {
     log() << "WiredTigerKVEngine shutting down";
+    // Ensure that key db is destroyed on exit
+    ON_BLOCK_EXIT([&] { _encryptionKeyDB.reset(nullptr); });
     if (!_readOnly)
         syncSizeInfo(true);
     if (_conn) {
@@ -794,7 +796,6 @@ void WiredTigerKVEngine::cleanShutdown() {
             invariantWTOK(conn->close(conn, closeConfig));
         }
     }
-    _encryptionKeyDB.reset(nullptr);
 }
 
 Status WiredTigerKVEngine::okToRename(OperationContext* opCtx,
