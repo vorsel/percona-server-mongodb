@@ -874,6 +874,8 @@ void WiredTigerKVEngine::_openWiredTiger(const std::string& path, const std::str
 
 void WiredTigerKVEngine::cleanShutdown() {
     log() << "WiredTigerKVEngine shutting down";
+    // Ensure that key db is destroyed on exit
+    ON_BLOCK_EXIT([&] { _encryptionKeyDB.reset(nullptr); });
     if (!_readOnly)
         syncSizeInfo(true);
     if (!_conn) {
@@ -966,7 +968,6 @@ void WiredTigerKVEngine::cleanShutdown() {
     LOG(1) << "Downgrade compatibility configuration: " << _fileVersion.getDowngradeString();
     invariantWTOK(conn->reconfigure(conn, _fileVersion.getDowngradeString().c_str()));
     invariantWTOK(conn->close(conn, closeConfig.c_str()));
-    _encryptionKeyDB.reset(nullptr);
 }
 
 Status WiredTigerKVEngine::okToRename(OperationContext* opCtx,
