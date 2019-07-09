@@ -66,6 +66,7 @@ public:
 
     virtual void commit(boost::optional<Timestamp>) {
         delete _entry;
+        // This worked in v3.6 but since v4.0 RemoveDBChange is not used
         _engine->keydbDropDatabase(_db);
     }
 
@@ -533,7 +534,14 @@ Status KVStorageEngine::dropDatabase(OperationContext* opCtx, StringData db) {
     // Do not timestamp any of the following writes. This will remove entries from the catalog as
     // well as drop any underlying tables. It's not expected for dropping tables to be reversible
     // on crash/recoverToStableTimestamp.
-    return _dropCollectionsNoTimestamp(opCtx, entry, toDrop.begin(), toDrop.end());
+    auto status = _dropCollectionsNoTimestamp(opCtx, entry, toDrop.begin(), toDrop.end());
+
+    // If all collections were dropped successfully then drop database's encryption key
+    if (status.isOK()) {
+        keydbDropDatabase(db.toString());
+    }
+
+    return status;
 }
 
 /**
