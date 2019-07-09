@@ -569,7 +569,14 @@ Status StorageEngineImpl::dropDatabase(OperationContext* opCtx, StringData db) {
     // Do not timestamp any of the following writes. This will remove entries from the catalog as
     // well as drop any underlying tables. It's not expected for dropping tables to be reversible
     // on crash/recoverToStableTimestamp.
-    return _dropCollectionsNoTimestamp(opCtx, toDrop);
+    auto status = _dropCollectionsNoTimestamp(opCtx, toDrop);
+
+    // If all collections were dropped successfully then drop database's encryption key
+    if (status.isOK()) {
+        keydbDropDatabase(db.toString());
+    }
+
+    return status;
 }
 
 /**
