@@ -53,7 +53,7 @@ Requires: %{name}-shell = %{version}-%{release}
 Requires: %{name}-tools = %{version}-%{release}
 Requires: numactl
 
-Conflicts: Percona-Server-MongoDB < 4.0.0
+Conflicts: Percona-Server-MongoDB < 4.2.0
 Conflicts: Percona-Server-MongoDB-32 Percona-Server-MongoDB-34 Percona-Server-MongoDB-36 mongodb-org
 
 %description
@@ -368,5 +368,5 @@ fi
 #
 %changelog
 
-* Wed Nov 21 2018 Evgeniy Patlan <evgeniy.patlan@percona.com> 4.0
+* Thu Jul 11 2019 Evgeniy Patlan <evgeniy.patlan@percona.com> 4.2
 - Initial RPM release for Percona Server for MongoDB
