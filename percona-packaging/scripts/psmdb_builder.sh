@@ -219,23 +219,6 @@ install_gcc_8_centos(){
 }
 
 install_gcc_8_deb(){
-    if [ x"${DEBIAN}" = xjessie ]; then
-        wget https://jenkins.percona.com/downloads/gcc8/gcc-8.3.0_Debian-jessie-x64.tar.gz -O /tmp/gcc-8.3.0_Debian-jessie-x64.tar.gz
-        tar -zxf /tmp/gcc-8.3.0_Debian-jessie-x64.tar.gz
-        rm -rf /usr/local/gcc-8.3.0
-        mv gcc-8.3.0 /usr/local/
-        apt-get install -y make build-essential libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev wget curl llvm libncurses5-dev libncursesw5-dev xz-utils tk-dev libffi-dev liblzma-dev
-	wget https://www.python.org/ftp/python/3.6.3/Python-3.6.3.tgz -O /tmp/python3.6.tar.gz
-        CUR_DIR=$PWD
-	cd /tmp
-	tar -xvzf python3.6.tar.gz
-	cd Python-3.6.3
-	./configure --enable-optimizations
-	make -j8i || true
-	make altinstall
-	cd ${CUR_DIR}
-
-    fi
     if [ x"${DEBIAN}" = xxenial ]; then
         wget https://jenkins.percona.com/downloads/gcc8/gcc-8.3.0_Ubuntu-xenial-x64.tar.gz -O /tmp/gcc-8.3.0_Ubuntu-xenial-x64.tar.gz
         CUR_DIR=$PWD
@@ -327,6 +310,12 @@ install_deps() {
 #
       install_golang
       install_gcc_8_centos
+      if [ -f /opt/rh/devtoolset-8/enable ]; then
+        source /opt/rh/devtoolset-8/enable
+        source /opt/rh/rh-python36/enable
+      fi
+      pip install --upgrade pip
+
     else
       export DEBIAN=$(lsb_release -sc)
       export ARCH=$(echo $(uname -m) | sed -e 's:i686:i386:g')
@@ -348,14 +337,9 @@ install_deps() {
       install_golang
       install_gcc_8_deb
       wget https://bootstrap.pypa.io/get-pip.py
-      if [ "x${DEBIAN}" = "xjessie" ]; then
-          update-alternatives --install /usr/bin/python python /usr/local/bin/python3.6 1
-          update-alternatives --install /usr/bin/pip python /usr/local/bin/pip3.6 1
-      else
-          update-alternatives --install /usr/bin/python python /usr/bin/python3 1
-          python get-pip.py
-          easy_install pip
-      fi
+      update-alternatives --install /usr/bin/python python /usr/bin/python3 1
+      python get-pip.py
+      easy_install pip
     fi
     return;
 }
@@ -650,16 +634,11 @@ build_tarball(){
     cd $WORKDIR
     TARFILE=$(basename $(find . -name 'percona-server-mongodb*.tar.gz' | sort | tail -n1))
 
-    if [ -f /opt/rh/devtoolset-8/enable ]; then
-        source /opt/rh/devtoolset-8/enable
-        source /opt/rh/rh-python36/enable
-    fi
     #
     export DEBIAN_VERSION="$(lsb_release -sc)"
     export DEBIAN="$(lsb_release -sc)"
     export PATH=/usr/local/go/bin:$PATH
     #
-    set_compiler
     #
     PSM_TARGETS="mongod mongos mongo mongobridge perconadecrypt $SPECIAL_TAR"
     TARBALL_SUFFIX=""
@@ -667,13 +646,26 @@ build_tarball(){
     TARBALL_SUFFIX=".dbg"
     fi
     if [ -f /etc/debian_version ]; then
-    export OS_RELEASE="$(lsb_release -sc)"
+        export OS_RELEASE="$(lsb_release -sc)"
+        set_compiler
     fi
     #
     if [ -f /etc/redhat-release ]; then
     #export OS_RELEASE="centos$(lsb_release -sr | awk -F'.' '{print $1}')"
-    export OS_RELEASE="centos$(rpm --eval %rhel)"
-    RHEL=$(rpm --eval %rhel)
+        export OS_RELEASE="centos$(rpm --eval %rhel)"
+        RHEL=$(rpm --eval %rhel)
+        if [ -f /opt/rh/devtoolset-8/enable ]; then
+            source /opt/rh/devtoolset-8/enable
+            source /opt/rh/rh-python36/enable
+        fi
+        echo "CC and CXX should be modified once correct compiller would be installed on Centos"
+        if [ "x${RHEL}" == "x8" ]; then
+            export CC=/usr/bin/gcc
+            export CXX=/usr/bin/g++
+        else
+            export CC=/opt/rh/devtoolset-8/root/usr/bin/gcc
+            export CXX=/opt/rh/devtoolset-8/root/usr/bin/g++
+        fi
     fi
     #
     ARCH=$(uname -m 2>/dev/null||true)
@@ -704,8 +696,13 @@ build_tarball(){
 
     # Finally build Percona Server for MongoDB with SCons
     cd ${PSMDIR_ABS}
-    pip install --upgrade pip
-    pip install --user -r etc/pip/dev-requirements.txt
+    if [ "x${RHEL}" == "x8" ]; then
+        pip3.6 install --upgrade pip
+        pip3.6 install --user -r etc/pip/dev-requirements.txt
+    else
+        pip install --upgrade pip
+        pip install --user -r etc/pip/dev-requirements.txt
+    fi
     if [ ${DEBUG} = 0 ]; then
         buildscripts/scons.py CC=${CC} CXX=${CXX} --disable-warnings-as-errors --release --ssl --opt=on -j$NJOBS --use-sasl-client --wiredtiger --audit --inmemory --hotbackup CPPPATH=${INSTALLDIR}/include LIBPATH=${INSTALLDIR}/lib ${PSM_TARGETS}
     else
