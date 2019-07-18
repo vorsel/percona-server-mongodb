@@ -35,7 +35,6 @@
 
 #include "mongo/db/background.h"
 #include "mongo/db/catalog/collection_catalog.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/drop_collection.h"
@@ -56,6 +55,7 @@
 #include "mongo/db/s/database_sharding_state.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/views/view_catalog.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
@@ -561,7 +561,8 @@ Status renameBetweenDBs(OperationContext* opCtx,
 
     Collection* tmpColl = nullptr;
     {
-        auto collectionOptions = sourceColl->getCatalogEntry()->getCollectionOptions(opCtx);
+        auto collectionOptions =
+            DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, sourceColl->ns());
 
         // Renaming across databases will result in a new UUID.
         collectionOptions.uuid = UUID::gen();

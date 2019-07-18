@@ -38,7 +38,6 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/collection_catalog_helper.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/index_catalog.h"
@@ -56,6 +55,7 @@
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/views/view_catalog.h"
@@ -187,7 +187,7 @@ BSONObj buildCollectionBson(OperationContext* opCtx,
         return b.obj();
     }
 
-    CollectionOptions options = collection->getCatalogEntry()->getCollectionOptions(opCtx);
+    CollectionOptions options = DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, nss);
 
     // While the UUID is stored as a collection option, from the user's perspective it is an
     // unsettable read-only property, so put it in the 'info' section.
@@ -321,11 +321,7 @@ public:
                     }
                 } else {
                     mongo::catalog::forEachCollectionFromDb(
-                        opCtx,
-                        dbname,
-                        MODE_IS,
-                        [&](const Collection* collection,
-                            const CollectionCatalogEntry* catalogEntry) {
+                        opCtx, dbname, MODE_IS, [&](const Collection* collection) {
                             if (authorizedCollections &&
                                 (!as->isAuthorizedForAnyActionOnResource(
                                     ResourcePattern::forExactNamespace(collection->ns())))) {

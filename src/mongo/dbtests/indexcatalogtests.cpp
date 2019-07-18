@@ -30,11 +30,11 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/dbtests/dbtests.h"
 
 namespace IndexCatalogTests {
@@ -158,7 +158,8 @@ public:
         // Change value of "expireAfterSeconds" on disk.
         {
             WriteUnitOfWork wuow(&opCtx);
-            _coll->getCatalogEntry()->updateTTLSetting(&opCtx, "x_1", 10);
+            opCtx.getServiceContext()->getStorageEngine()->getCatalog()->updateTTLSetting(
+                &opCtx, _nss, "x_1", 10);
             wuow.commit();
         }
 

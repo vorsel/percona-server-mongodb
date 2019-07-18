@@ -49,6 +49,7 @@
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/database_sharding_state.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
@@ -152,7 +153,7 @@ IndexBuildsCoordinator::~IndexBuildsCoordinator() {
 
 StatusWith<std::pair<long long, long long>> IndexBuildsCoordinator::startIndexRebuildForRecovery(
     OperationContext* opCtx,
-    CollectionCatalogEntry* cce,
+    const NamespaceString& nss,
     const std::vector<BSONObj>& specs,
     const UUID& buildUUID) {
     // Index builds in recovery mode have the global write lock.
@@ -169,8 +170,6 @@ StatusWith<std::pair<long long, long long>> IndexBuildsCoordinator::startIndexRe
         }
         indexNames.push_back(name);
     }
-
-    const NamespaceString nss(cce->ns());
 
     ReplIndexBuildState::IndexCatalogStats indexCatalogStats;
 
@@ -193,7 +192,7 @@ StatusWith<std::pair<long long, long long>> IndexBuildsCoordinator::startIndexRe
                 if (!descriptor) {
                     // If it's unfinished index, drop it directly via removeIndex.
                     Status status =
-                        collection->getCatalogEntry()->removeIndex(opCtx, indexNames[i]);
+                        DurableCatalog::get(opCtx)->removeIndex(opCtx, nss, indexNames[i]);
                     continue;
                 }
                 Status s = indexCatalog->dropIndex(opCtx, descriptor);

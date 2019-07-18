@@ -46,7 +46,6 @@
 namespace mongo {
 
 class CollatorInterface;
-class CollectionCatalogEntry;
 class CollectionInfoCache;
 class IndexAccessMethod;
 class IndexDescriptor;
@@ -60,8 +59,7 @@ class IndexCatalogEntryImpl : public IndexCatalogEntry {
 public:
     explicit IndexCatalogEntryImpl(
         OperationContext* opCtx,
-        StringData ns,
-        CollectionCatalogEntry* collection,           // not owned
+        const NamespaceString& nss,
         std::unique_ptr<IndexDescriptor> descriptor,  // ownership passes to me
         CollectionInfoCache* infoCache);              // not owned, optional
 
@@ -156,10 +154,6 @@ public:
      */
     void setMultikey(OperationContext* opCtx, const MultikeyPaths& multikeyPaths) final;
 
-    // TODO SERVER-36385 Remove this function: we don't set the feature tracker bit in 4.4 because
-    // 4.4 can only downgrade to 4.2 which can read long TypeBits.
-    void setIndexKeyStringWithLongTypeBitsExistsOnDisk(OperationContext* opCtx) final;
-
     // if this ready is ready for queries
     bool isReady(OperationContext* opCtx) const final;
 
@@ -200,8 +194,6 @@ private:
 
     NamespaceString _ns;
 
-    CollectionCatalogEntry* _collection;  // not owned here
-
     std::unique_ptr<IndexDescriptor> _descriptor;  // owned here
 
     CollectionInfoCache* _infoCache;  // not owned here
@@ -224,7 +216,7 @@ private:
     bool _indexTracksPathLevelMultikeyInfo = false;
 
     // Set to true if this index is multikey. '_isMultikey' serves as a cache of the information
-    // stored in the NamespaceDetails or KVCatalog.
+    // stored in the NamespaceDetails or DurableCatalog.
     AtomicWord<bool> _isMultikey;
 
     // Controls concurrent access to '_indexMultikeyPaths'. We acquire this mutex rather than the

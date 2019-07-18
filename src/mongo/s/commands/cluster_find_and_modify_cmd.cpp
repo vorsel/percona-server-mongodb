@@ -228,7 +228,7 @@ public:
 
         // findAndModify should only be creating database if upsert is true, but this would require
         // that the parsing be pulled into this function.
-        uassertStatusOK(createShardDatabase(opCtx, nss.db()));
+        createShardDatabase(opCtx, nss.db());
 
         // Append mongoS' runtime constants to the command object before forwarding it to the shard.
         auto cmdObjForShard = appendRuntimeConstantsToCommandObject(opCtx, cmdObj);
@@ -311,12 +311,10 @@ private:
                     // transaction. We call _runCommand recursively, and this second time through
                     // since it will be run as a transaction it will take the other code path to
                     // updateShardKeyValueOnWouldChangeOwningShardError.
-                    auto txnRouterForShardKeyChange =
-                        documentShardKeyUpdateUtil::startTransactionForShardKeyUpdate(opCtx);
+                    documentShardKeyUpdateUtil::startTransactionForShardKeyUpdate(opCtx);
                     _runCommand(opCtx, shardId, shardVersion, nss, cmdObj, result);
                     auto commitResponse =
-                        documentShardKeyUpdateUtil::commitShardKeyUpdateTransaction(
-                            opCtx, txnRouterForShardKeyChange);
+                        documentShardKeyUpdateUtil::commitShardKeyUpdateTransaction(opCtx);
 
                     uassertStatusOK(getStatusFromCommandResult(commitResponse));
                     if (auto wcErrorElem = commitResponse["writeConcernError"]) {
@@ -331,7 +329,7 @@ private:
 
                     auto txnRouterForAbort = TransactionRouter::get(opCtx);
                     if (txnRouterForAbort)
-                        txnRouterForAbort->implicitlyAbortTransaction(opCtx, e.toStatus());
+                        txnRouterForAbort.implicitlyAbortTransaction(opCtx, e.toStatus());
 
                     throw;
                 }

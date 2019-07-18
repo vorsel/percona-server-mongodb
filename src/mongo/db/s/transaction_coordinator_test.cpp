@@ -47,13 +47,15 @@
 namespace mongo {
 namespace {
 
+using CoordinatorCommitDecision = txn::CoordinatorCommitDecision;
 using PrepareResponse = txn::PrepareResponse;
 using TransactionCoordinatorDocument = txn::TransactionCoordinatorDocument;
 
 const Hours kLongFutureTimeout(8);
 
 const StatusWith<BSONObj> kNoSuchTransaction =
-    BSON("ok" << 0 << "code" << ErrorCodes::NoSuchTransaction);
+    BSON("ok" << 0 << "code" << ErrorCodes::NoSuchTransaction << "errmsg"
+              << "No such transaction exists");
 const StatusWith<BSONObj> kOk = BSON("ok" << 1);
 const Timestamp kDummyPrepareTimestamp = Timestamp(1, 1);
 
@@ -62,6 +64,32 @@ StatusWith<BSONObj> makePrepareOkResponse(const Timestamp& timestamp) {
 }
 
 const StatusWith<BSONObj> kPrepareOk = makePrepareOkResponse(kDummyPrepareTimestamp);
+const StatusWith<BSONObj> kPrepareOkNoTimestamp = BSON("ok" << 1);
+
+/**
+ * Searches for a client matching the name and mark the operation context as killed.
+ */
+void killClientOpCtx(ServiceContext* service, const std::string& clientName) {
+    for (int retries = 0; retries < 20; retries++) {
+        for (ServiceContext::LockedClientsCursor cursor(service); auto client = cursor.next();) {
+            invariant(client);
+
+            stdx::lock_guard lk(*client);
+            if (client->desc() == clientName) {
+                if (auto opCtx = client->getOperationContext()) {
+                    opCtx->getServiceContext()->killOperation(
+                        lk, opCtx, ErrorCodes::InterruptedAtShutdown);
+                    return;
+                }
+            }
+        }
+
+        sleepmillis(50);
+    }
+
+    error() << "Timed out trying to find and kill client opCtx with name: " << clientName;
+    ASSERT_FALSE(true);
+}
 
 class TransactionCoordinatorTestBase : public TransactionCoordinatorTestFixture {
 protected:
@@ -273,12 +301,15 @@ TEST_F(TransactionCoordinatorDriverTest,
         getServiceContext(), aws, kTwoShardIdList[0], makeDummyPrepareCommand(_lsid, _txnNumber));
 
     assertPrepareSentAndRespondWithRetryableError();
-    aws.shutdown({ErrorCodes::TransactionCoordinatorReachedAbortDecision, "Retry interrupted"});
+    const auto shutdownStatus =
+        Status{ErrorCodes::TransactionCoordinatorReachedAbortDecision, "Retry interrupted"};
+    aws.shutdown(shutdownStatus);
     advanceClockAndExecuteScheduledTasks();
 
     auto response = future.get();
     ASSERT(response.vote == boost::none);
     ASSERT(response.prepareTimestamp == boost::none);
+    ASSERT_EQ(shutdownStatus.code(), response.abortReason->code());
 }
 
 TEST_F(TransactionCoordinatorDriverTest,
@@ -306,6 +337,8 @@ TEST_F(TransactionCoordinatorDriverTest,
     auto response = future.get();
     ASSERT(response.vote == txn::PrepareVote::kAbort);
     ASSERT(response.prepareTimestamp == boost::none);
+    ASSERT(response.abortReason);
+    ASSERT_EQ(ErrorCodes::NoSuchTransaction, response.abortReason->code());
 }
 
 TEST_F(TransactionCoordinatorDriverTest,
@@ -320,6 +353,8 @@ TEST_F(TransactionCoordinatorDriverTest,
     auto response = future.get();
     ASSERT(response.vote == txn::PrepareVote::kAbort);
     ASSERT(response.prepareTimestamp == boost::none);
+    ASSERT(response.abortReason);
+    ASSERT_EQ(ErrorCodes::NoSuchTransaction, response.abortReason->code());
 }
 
 TEST_F(TransactionCoordinatorDriverTest,
@@ -331,7 +366,10 @@ TEST_F(TransactionCoordinatorDriverTest,
                 [&](const executor::RemoteCommandRequest& request) { return kPrepareOk; }});
 
     auto decision = future.get().decision();
+
     ASSERT(decision.getDecision() == txn::CommitDecision::kAbort);
+    ASSERT(decision.getAbortStatus());
+    ASSERT_EQ(ErrorCodes::NoSuchTransaction, decision.getAbortStatus()->code());
 }
 
 TEST_F(TransactionCoordinatorDriverTest,
@@ -344,6 +382,8 @@ TEST_F(TransactionCoordinatorDriverTest,
 
     auto decision = future.get().decision();
     ASSERT(decision.getDecision() == txn::CommitDecision::kAbort);
+    ASSERT(decision.getAbortStatus());
+    ASSERT_EQ(ErrorCodes::NoSuchTransaction, decision.getAbortStatus()->code());
 }
 
 TEST_F(TransactionCoordinatorDriverTest,
@@ -352,10 +392,12 @@ TEST_F(TransactionCoordinatorDriverTest,
     auto future = txn::sendPrepare(getServiceContext(), aws, _lsid, _txnNumber, kTwoShardIdList);
 
     onCommands({[&](const executor::RemoteCommandRequest& request) { return kNoSuchTransaction; },
-                [&](const executor::RemoteCommandRequest& request) { return kPrepareOk; }});
+                [&](const executor::RemoteCommandRequest& request) { return kNoSuchTransaction; }});
 
     auto decision = future.get().decision();
     ASSERT(decision.getDecision() == txn::CommitDecision::kAbort);
+    ASSERT(decision.getAbortStatus());
+    ASSERT_EQ(ErrorCodes::NoSuchTransaction, decision.getAbortStatus()->code());
 }
 
 TEST_F(TransactionCoordinatorDriverTest,
@@ -371,6 +413,7 @@ TEST_F(TransactionCoordinatorDriverTest,
 
     auto decision = future.get().decision();
     ASSERT(decision.getDecision() == txn::CommitDecision::kCommit);
+    ASSERT(!decision.getAbortStatus());
     ASSERT_EQ(maxPrepareTimestamp, *decision.getCommitTimestamp());
 }
 
@@ -387,6 +430,7 @@ TEST_F(TransactionCoordinatorDriverTest,
 
     auto decision = future.get().decision();
     ASSERT(decision.getDecision() == txn::CommitDecision::kCommit);
+    ASSERT(!decision.getAbortStatus());
     ASSERT_EQ(maxPrepareTimestamp, *decision.getCommitTimestamp());
 }
 
@@ -403,9 +447,27 @@ TEST_F(TransactionCoordinatorDriverTest,
 
     auto decision = future.get().decision();
     ASSERT(decision.getDecision() == txn::CommitDecision::kCommit);
+    ASSERT(!decision.getAbortStatus());
     ASSERT_EQ(maxPrepareTimestamp, *decision.getCommitTimestamp());
 }
 
+TEST_F(TransactionCoordinatorDriverTest,
+       SendPrepareReturnsAbortDecisionWhenNoPreparedTimestampIsReturned) {
+    const auto timestamp = Timestamp(1, 1);
+
+    txn::AsyncWorkScheduler aws(getServiceContext());
+    auto future = txn::sendPrepare(getServiceContext(), aws, _lsid, _txnNumber, kTwoShardIdList);
+
+    assertPrepareSentAndRespondWithSuccess(timestamp);
+    assertCommandSentAndRespondWith(
+        PrepareTransaction::kCommandName, kPrepareOkNoTimestamp, WriteConcernOptions::Majority);
+
+    auto decision = future.get().decision();
+
+    ASSERT(decision.getDecision() == txn::CommitDecision::kAbort);
+    ASSERT(decision.getAbortStatus());
+    ASSERT_EQ(ErrorCodes::InternalError, decision.getAbortStatus()->code());
+}
 
 class TransactionCoordinatorDriverPersistenceTest : public TransactionCoordinatorDriverTest {
 protected:
@@ -464,7 +526,17 @@ protected:
                                       TxnNumber txnNumber,
                                       const std::vector<ShardId>& participants,
                                       const boost::optional<Timestamp>& commitTimestamp) {
-        txn::persistDecision(*_aws, lsid, txnNumber, participants, commitTimestamp).get();
+        txn::persistDecision(*_aws, lsid, txnNumber, participants, [&] {
+            txn::CoordinatorCommitDecision decision;
+            if (commitTimestamp) {
+                decision.setDecision(txn::CommitDecision::kCommit);
+                decision.setCommitTimestamp(commitTimestamp);
+            } else {
+                decision.setDecision(txn::CommitDecision::kAbort);
+                decision.setAbortStatus(Status(ErrorCodes::NoSuchTransaction, "Test abort status"));
+            }
+            return decision;
+        }()).get();
 
         auto allCoordinatorDocs = txn::readAllCoordinatorDocs(opCtx);
         ASSERT_EQUALS(allCoordinatorDocs.size(), size_t(1));
@@ -519,8 +591,7 @@ TEST_F(TransactionCoordinatorDriverPersistenceTest,
     // We should retry until shutdown. The original participants should be persisted.
 
     std::vector<ShardId> smallerParticipantList{ShardId("shard0001"), ShardId("shard0002")};
-    Future<void> future =
-        txn::persistParticipantsList(*_aws, _lsid, _txnNumber, smallerParticipantList);
+    auto future = txn::persistParticipantsList(*_aws, _lsid, _txnNumber, smallerParticipantList);
 
     _aws->shutdown({ErrorCodes::TransactionCoordinatorSteppingDown, "Shutdown for test"});
     advanceClockAndExecuteScheduledTasks();
@@ -572,8 +643,12 @@ TEST_F(TransactionCoordinatorDriverPersistenceTest,
 
 TEST_F(TransactionCoordinatorDriverPersistenceTest,
        PersistCommitDecisionWhenNoDocumentForTransactionExistsCanBeInterruptedAndReturnsError) {
-    Future<void> future = txn::persistDecision(
-        *_aws, _lsid, _txnNumber, _participants, _commitTimestamp /* commit */);
+    Future<repl::OpTime> future =
+        txn::persistDecision(*_aws, _lsid, _txnNumber, _participants, [&] {
+            txn::CoordinatorCommitDecision decision(txn::CommitDecision::kCommit);
+            decision.setCommitTimestamp(_commitTimestamp);
+            return decision;
+        }());
     _aws->shutdown({ErrorCodes::TransactionCoordinatorSteppingDown, "Shutdown for test"});
 
     ASSERT_THROWS_CODE(
@@ -638,7 +713,11 @@ TEST_F(TransactionCoordinatorDriverPersistenceTest,
 
     // Delete the document for the first transaction and check that only the second transaction's
     // document still exists.
-    txn::persistDecision(*_aws, _lsid, txnNumber1, _participants, boost::none /* abort */).get();
+    txn::persistDecision(*_aws, _lsid, txnNumber1, _participants, [&] {
+        txn::CoordinatorCommitDecision decision(txn::CommitDecision::kAbort);
+        decision.setAbortStatus(Status(ErrorCodes::NoSuchTransaction, "Test abort error"));
+        return decision;
+    }()).get();
     txn::deleteCoordinatorDoc(*_aws, _lsid, txnNumber1).get();
 
     allCoordinatorDocs = txn::readAllCoordinatorDocs(operationContext());
@@ -946,6 +1025,8 @@ public:
         // Totals
         std::int64_t totalCreated{0};
         std::int64_t totalStartedTwoPhaseCommit{0};
+        std::int64_t totalAbortedTwoPhaseCommit{0};
+        std::int64_t totalCommittedTwoPhaseCommit{0};
 
         // Current in steps
         std::int64_t currentWritingParticipantList{0};
@@ -960,6 +1041,10 @@ public:
         ASSERT_EQ(expectedMetrics.totalCreated, metrics()->getTotalCreated());
         ASSERT_EQ(expectedMetrics.totalStartedTwoPhaseCommit,
                   metrics()->getTotalStartedTwoPhaseCommit());
+        ASSERT_EQ(expectedMetrics.totalAbortedTwoPhaseCommit,
+                  metrics()->getTotalAbortedTwoPhaseCommit());
+        ASSERT_EQ(expectedMetrics.totalCommittedTwoPhaseCommit,
+                  metrics()->getTotalSuccessfulTwoPhaseCommit());
 
         // Current in steps
         ASSERT_EQ(expectedMetrics.currentWritingParticipantList,
@@ -1018,6 +1103,10 @@ public:
         assertCommitSentAndRespondWithSuccess();
 
         stopCapturingLogMessages();
+
+        // Properly wait for the coordinator to finish all asynchronous tasks.
+        auto future = coordinator.onCompletion();
+        future.getNoThrow().ignore();
     }
 };
 
@@ -1130,12 +1219,12 @@ TEST_F(TransactionCoordinatorMetricsTest, SingleCoordinatorStatsSimpleTwoPhaseCo
     checkStats(stats, expectedStats);
 
     // Stats are updated on onEnd.
-
     expectedStats.endTime = advanceClockSourceAndReturnNewNow();
     coordinatorObserver.onEnd(metrics(),
                               tickSource(),
                               clockSource()->now(),
-                              TransactionCoordinator::Step::kDeletingCoordinatorDoc);
+                              TransactionCoordinator::Step::kDeletingCoordinatorDoc,
+                              CoordinatorCommitDecision(txn::CommitDecision::kCommit));
     checkStats(stats, expectedStats);
 
     // Once onEnd has been called, advancing the time does not cause any duration to increase.
@@ -1188,10 +1277,12 @@ TEST_F(TransactionCoordinatorMetricsTest, ServerWideMetricsSimpleTwoPhaseCommit)
 
     // Metrics are updated on onEnd.
     expectedMetrics.currentDeletingCoordinatorDoc--;
+    expectedMetrics.totalAbortedTwoPhaseCommit++;
     coordinatorObserver.onEnd(metrics(),
                               tickSource(),
                               clockSource()->now(),
-                              TransactionCoordinator::Step::kDeletingCoordinatorDoc);
+                              TransactionCoordinator::Step::kDeletingCoordinatorDoc,
+                              CoordinatorCommitDecision(txn::CommitDecision::kAbort));
     checkMetrics(expectedMetrics);
 }
 
@@ -1268,17 +1359,21 @@ TEST_F(TransactionCoordinatorMetricsTest, ServerWideMetricsSimpleTwoPhaseCommitT
     checkMetrics(expectedMetrics);
 
     expectedMetrics.currentDeletingCoordinatorDoc--;
+    expectedMetrics.totalAbortedTwoPhaseCommit++;
     coordinatorObserver1.onEnd(metrics(),
                                tickSource(),
                                clockSource()->now(),
-                               TransactionCoordinator::Step::kDeletingCoordinatorDoc);
+                               TransactionCoordinator::Step::kDeletingCoordinatorDoc,
+                               CoordinatorCommitDecision(txn::CommitDecision::kAbort));
     checkMetrics(expectedMetrics);
 
     expectedMetrics.currentDeletingCoordinatorDoc--;
+    expectedMetrics.totalCommittedTwoPhaseCommit++;
     coordinatorObserver2.onEnd(metrics(),
                                tickSource(),
                                clockSource()->now(),
-                               TransactionCoordinator::Step::kDeletingCoordinatorDoc);
+                               TransactionCoordinator::Step::kDeletingCoordinatorDoc,
+                               CoordinatorCommitDecision(txn::CommitDecision::kCommit));
     checkMetrics(expectedMetrics);
 }
 
@@ -1439,12 +1534,14 @@ TEST_F(TransactionCoordinatorMetricsTest, SimpleTwoPhaseCommitRealCoordinator) {
     expectedStats.deletingCoordinatorDocDuration =
         *expectedStats.deletingCoordinatorDocDuration + Microseconds(100);
     expectedMetrics.currentDeletingCoordinatorDoc--;
+    expectedMetrics.totalCommittedTwoPhaseCommit++;
 
     setGlobalFailPoint("hangAfterDeletingCoordinatorDoc",
                        BSON("mode"
                             << "off"));
     // The last thing the coordinator will do on the hijacked commit response thread is signal the
     // coordinator's completion.
+
     future.timed_get(kLongFutureTimeout);
     coordinator.onCompletion().get();
 
@@ -1556,7 +1653,6 @@ TEST_F(TransactionCoordinatorMetricsTest,
     expectedMetrics.totalCreated++;
 
     auto aws = std::make_unique<txn::AsyncWorkScheduler>(getServiceContext());
-    auto awsPtr = aws.get();
     TransactionCoordinator coordinator(
         getServiceContext(), _lsid, _txnNumber, std::move(aws), Date_t::max());
     const auto& stats =
@@ -1589,7 +1685,7 @@ TEST_F(TransactionCoordinatorMetricsTest,
         *expectedStats.writingParticipantListDuration + Microseconds(100);
     expectedMetrics.currentWritingParticipantList--;
 
-    awsPtr->shutdown({ErrorCodes::TransactionCoordinatorSteppingDown, "dummy"});
+    killClientOpCtx(getServiceContext(), "hangBeforeWaitingForParticipantListWriteConcern");
     coordinator.onCompletion().get();
 
     checkStats(stats, expectedStats);
@@ -1678,7 +1774,6 @@ TEST_F(TransactionCoordinatorMetricsTest,
     expectedMetrics.totalCreated++;
 
     auto aws = std::make_unique<txn::AsyncWorkScheduler>(getServiceContext());
-    auto awsPtr = aws.get();
     TransactionCoordinator coordinator(
         getServiceContext(), _lsid, _txnNumber, std::move(aws), Date_t::max());
     const auto& stats =
@@ -1716,7 +1811,7 @@ TEST_F(TransactionCoordinatorMetricsTest,
         *expectedStats.writingDecisionDuration + Microseconds(100);
     expectedMetrics.currentWritingDecision--;
 
-    awsPtr->shutdown({ErrorCodes::TransactionCoordinatorSteppingDown, "dummy"});
+    killClientOpCtx(getServiceContext(), "hangBeforeWaitingForDecisionWriteConcern");
     coordinator.onCompletion().get();
 
     checkStats(stats, expectedStats);
@@ -1781,6 +1876,7 @@ TEST_F(TransactionCoordinatorMetricsTest,
     expectedStats.waitingForDecisionAcksDuration =
         *expectedStats.waitingForDecisionAcksDuration + Microseconds(100);
     expectedMetrics.currentWaitingForDecisionAcks--;
+    expectedMetrics.totalCommittedTwoPhaseCommit++;
 
     awsPtr->shutdown({ErrorCodes::TransactionCoordinatorSteppingDown, "dummy"});
     network()->enterNetwork();
@@ -1856,6 +1952,7 @@ TEST_F(TransactionCoordinatorMetricsTest, CoordinatorsAWSIsShutDownWhileCoordina
     expectedStats.deletingCoordinatorDocDuration =
         *expectedStats.deletingCoordinatorDocDuration + Microseconds(100);
     expectedMetrics.currentDeletingCoordinatorDoc--;
+    expectedMetrics.totalCommittedTwoPhaseCommit++;
 
     awsPtr->shutdown({ErrorCodes::TransactionCoordinatorSteppingDown, "dummy"});
     // The last thing the coordinator will do on the hijacked commit response thread is signal
@@ -2010,6 +2107,8 @@ TEST_F(TransactionCoordinatorMetricsTest, SlowLogLineIncludesTerminationCauseFor
     stopCapturingLogMessages();
 
     ASSERT_EQUALS(1, countLogLinesContaining("terminationCause:aborted"));
+    ASSERT_EQUALS(1,
+                  countLogLinesContaining("terminationDetails: NoSuchTransaction: from shard s2"));
 }
 
 TEST_F(TransactionCoordinatorMetricsTest, SlowLogLineIncludesNumParticipants) {

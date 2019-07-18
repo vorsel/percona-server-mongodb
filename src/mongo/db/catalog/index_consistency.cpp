@@ -31,7 +31,6 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/index_consistency.h"
@@ -40,6 +39,7 @@
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/key_string.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/sorted_data_interface.h"
@@ -87,7 +87,7 @@ IndexConsistency::IndexConsistency(OperationContext* opCtx,
 
         indexInfo.indexName = indexName;
         indexInfo.keyPattern = descriptor->keyPattern();
-        indexInfo.isReady = _collection->getCatalogEntry()->isIndexReady(opCtx, indexName);
+        indexInfo.isReady = DurableCatalog::get(opCtx)->isIndexReady(opCtx, nss, indexName);
 
         uint32_t indexNameHash;
         MurmurHash3_x86_32(indexName.c_str(), indexName.size(), 0, &indexNameHash);

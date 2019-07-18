@@ -31,7 +31,6 @@
 
 #include "mongo/bson/simple_bsonelement_comparator.h"
 #include "mongo/db/catalog/collection_catalog.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/health_log.h"
@@ -45,6 +44,7 @@
 #include "mongo/db/repl/dbcheck_gen.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/db/storage/durable_catalog.h"
 
 namespace mongo {
 
@@ -374,14 +374,12 @@ std::vector<BSONObj> collectionIndexInfo(OperationContext* opCtx, Collection* co
     std::vector<std::string> names;
 
     // List the indices,
-    const auto* cce = collection->getCatalogEntry();
-    invariant(cce);
-
-    cce->getAllIndexes(opCtx, &names);
+    auto durableCatalog = DurableCatalog::get(opCtx);
+    durableCatalog->getAllIndexes(opCtx, collection->ns(), &names);
 
     // and get the info for each one.
     for (const auto& name : names) {
-        result.push_back(cce->getIndexSpec(opCtx, name));
+        result.push_back(durableCatalog->getIndexSpec(opCtx, collection->ns(), name));
     }
 
     auto comp = stdx::make_unique<SimpleBSONObjComparator>();
@@ -392,7 +390,7 @@ std::vector<BSONObj> collectionIndexInfo(OperationContext* opCtx, Collection* co
 }
 
 BSONObj collectionOptions(OperationContext* opCtx, Collection* collection) {
-    return collection->getCatalogEntry()->getCollectionOptions(opCtx).toBSON();
+    return DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, collection->ns()).toBSON();
 }
 
 AutoGetDbForDbCheck::AutoGetDbForDbCheck(OperationContext* opCtx, const NamespaceString& nss)

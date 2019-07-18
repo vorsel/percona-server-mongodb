@@ -43,7 +43,6 @@
 #include "mongo/db/audit.h"
 #include "mongo/db/background.h"
 #include "mongo/db/catalog/collection_catalog.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/collection_catalog_helper.h"
 #include "mongo/db/catalog/collection_impl.h"
 #include "mongo/db/catalog/collection_options.h"
@@ -65,7 +64,7 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/top.h"
-#include "mongo/db/storage/kv/kv_catalog.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/storage_engine_init.h"
@@ -155,13 +154,12 @@ void DatabaseImpl::init(OperationContext* const opCtx) const {
     }
 
     // At construction time of the viewCatalog, the CollectionCatalog map wasn't initialized yet,
-    // so no system.views collection would be found. Now we're sufficiently initialized, signal a
-    // version change. Also force a reload, so if there are problems with the catalog contents as
-    // might be caused by incorrect mongod versions or similar, they are found right away.
+    // so no system.views collection would be found. Now that we're sufficiently initialized, reload
+    // the viewCatalog to populate its in-memory state. If there are problems with the catalog
+    // contents as might be caused by incorrect mongod versions or similar, they are found right
+    // away.
     auto views = ViewCatalog::get(this);
-    views->invalidate();
-    Status reloadStatus = views->reloadIfNeeded(opCtx);
-
+    Status reloadStatus = views->reload(opCtx, ViewCatalogLookupBehavior::kValidateDurableViews);
     if (!reloadStatus.isOK()) {
         warning() << "Unable to parse views: " << redact(reloadStatus)
                   << "; remove any invalid views from the " << _viewsName
@@ -172,8 +170,7 @@ void DatabaseImpl::init(OperationContext* const opCtx) const {
 void DatabaseImpl::clearTmpCollections(OperationContext* opCtx) const {
     invariant(opCtx->lockState()->isDbLockedForMode(name(), MODE_IX));
 
-    CollectionCatalog::CollectionInfoFn callback = [&](const Collection* collection,
-                                                       const CollectionCatalogEntry* catalogEntry) {
+    CollectionCatalog::CollectionInfoFn callback = [&](const Collection* collection) {
         try {
             WriteUnitOfWork wuow(opCtx);
             Status status = dropCollection(opCtx, collection->ns(), {});
@@ -190,10 +187,9 @@ void DatabaseImpl::clearTmpCollections(OperationContext* opCtx) const {
         return true;
     };
 
-    CollectionCatalog::CollectionInfoFn predicate =
-        [&](const Collection* collection, const CollectionCatalogEntry* catalogEntry) {
-            return catalogEntry->getCollectionOptions(opCtx).temp;
-        };
+    CollectionCatalog::CollectionInfoFn predicate = [&](const Collection* collection) {
+        return DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, collection->ns()).temp;
+    };
 
     catalog::forEachCollectionFromDb(opCtx, name(), MODE_X, callback, predicate);
 }
@@ -256,10 +252,7 @@ void DatabaseImpl::getStats(OperationContext* opCtx, BSONObjBuilder* output, dou
     invariant(opCtx->lockState()->isDbLockedForMode(name(), MODE_IS));
 
     catalog::forEachCollectionFromDb(
-        opCtx,
-        name(),
-        MODE_IS,
-        [&](const Collection* collection, const CollectionCatalogEntry* catalogEntry) -> bool {
+        opCtx, name(), MODE_IS, [&](const Collection* collection) -> bool {
             nCollections += 1;
             objects += collection->numRecords(opCtx);
             size += collection->dataSize(opCtx);
@@ -465,7 +458,7 @@ void DatabaseImpl::_dropCollectionIndexes(OperationContext* opCtx,
     LOG(1) << "dropCollection: " << nss << " - dropAllIndexes start";
     collection->getIndexCatalog()->dropAllIndexes(opCtx, true);
 
-    invariant(collection->getCatalogEntry()->getTotalIndexCount(opCtx) == 0);
+    invariant(DurableCatalog::get(opCtx)->getTotalIndexCount(opCtx, nss) == 0);
     LOG(1) << "dropCollection: " << nss << " - dropAllIndexes done";
 }
 
@@ -475,16 +468,13 @@ Status DatabaseImpl::_finishDropCollection(OperationContext* opCtx,
     UUID uuid = *collection->uuid();
     log() << "Finishing collection drop for " << nss << " (" << uuid << ").";
 
-    auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
-    auto status = storageEngine->getCatalog()->dropCollection(opCtx, nss);
+    auto status = DurableCatalog::get(opCtx)->dropCollection(opCtx, nss);
     if (!status.isOK())
         return status;
 
-    auto[removedColl, removedCatalogEntry] =
-        CollectionCatalog::get(opCtx).deregisterCollection(uuid);
+    auto removedColl = CollectionCatalog::get(opCtx).deregisterCollection(uuid);
     opCtx->recoveryUnit()->registerChange(
-        CollectionCatalog::get(opCtx).makeFinishDropCollectionChange(
-            std::move(removedColl), std::move(removedCatalogEntry), uuid));
+        CollectionCatalog::get(opCtx).makeFinishDropCollectionChange(std::move(removedColl), uuid));
 
     return Status::OK();
 }
@@ -533,8 +523,7 @@ Status DatabaseImpl::renameCollection(OperationContext* opCtx,
 
     Top::get(opCtx->getServiceContext()).collectionDropped(fromNss);
 
-    auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
-    Status status = storageEngine->getCatalog()->renameCollection(opCtx, fromNss, toNss, stayTemp);
+    Status status = DurableCatalog::get(opCtx)->renameCollection(opCtx, fromNss, toNss, stayTemp);
 
     // Set the namespace of 'collToRename' from within the CollectionCatalog. This is necessary
     // because
@@ -661,17 +650,14 @@ Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
     log() << "createCollection: " << nss << " with " << (generatedUUID ? "generated" : "provided")
           << " UUID: " << optionsWithUUID.uuid.get() << " and options: " << options.toBSON();
 
-    // Create CollectionCatalogEntry
-    auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
-    auto statusWithCatalogEntry = storageEngine->getCatalog()->createCollection(
-        opCtx, nss, optionsWithUUID, true /*allocateDefaultSpace*/);
-    massertStatusOK(statusWithCatalogEntry.getStatus());
-    std::unique_ptr<CollectionCatalogEntry> ownedCatalogEntry =
-        std::move(statusWithCatalogEntry.getValue());
-
     // Create Collection object
-    std::unique_ptr<Collection> ownedCollection =
-        Collection::Factory::get(opCtx)->make(opCtx, ownedCatalogEntry.get());
+    auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
+    auto statusWithRecordStore = storageEngine->getCatalog()->createCollection(
+        opCtx, nss, optionsWithUUID, true /*allocateDefaultSpace*/);
+    massertStatusOK(statusWithRecordStore.getStatus());
+    std::unique_ptr<RecordStore> rs = std::move(statusWithRecordStore.getValue());
+    std::unique_ptr<Collection> ownedCollection = Collection::Factory::get(opCtx)->make(
+        opCtx, nss, optionsWithUUID.uuid.get(), std::move(rs));
     auto collection = ownedCollection.get();
     ownedCollection->init(opCtx);
 
@@ -683,12 +669,8 @@ Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
 
     auto& catalog = CollectionCatalog::get(opCtx);
     auto uuid = ownedCollection->uuid().get();
-    catalog.registerCollection(uuid, std::move(ownedCatalogEntry), std::move(ownedCollection));
-    opCtx->recoveryUnit()->onRollback([uuid, &catalog] {
-        auto[removedColl, removedCatalogEntry] = catalog.deregisterCollection(uuid);
-        removedColl.reset();
-        removedCatalogEntry.reset();
-    });
+    catalog.registerCollection(uuid, std::move(ownedCollection));
+    opCtx->recoveryUnit()->onRollback([uuid, &catalog] { catalog.deregisterCollection(uuid); });
 
     BSONObj fullIdIndexSpec;
 

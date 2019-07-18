@@ -32,11 +32,12 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
+
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/query/internal_plans.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/views/view_catalog.h"
 #include "mongo/util/fail_point_service.h"
@@ -80,6 +81,15 @@ public:
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
+
+    bool allowsAfterClusterTime(const BSONObj& cmd) const override {
+        return false;
+    }
+
+    bool canIgnorePrepareConflicts() const override {
+        return true;
+    }
+
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
                                        std::vector<Privilege>* out) const {
@@ -169,8 +179,8 @@ public:
             return CommandHelpers::appendCommandStatusNoThrow(result, status);
         }
 
-        CollectionCatalogEntry* catalogEntry = collection->getCatalogEntry();
-        CollectionOptions opts = catalogEntry->getCollectionOptions(opCtx);
+        CollectionOptions opts =
+            DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, collection->ns());
 
         // All collections must have a UUID.
         if (!opts.uuid) {

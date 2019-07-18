@@ -1348,6 +1348,32 @@
               testBadDBName(session, 'local');
           }
         },
+        {
+          name: "getMore on change stream executes outside transaction",
+          test: function() {
+              assert.commandWorked(testDB.createCollection(collName1));
+
+              // Starting a $changeStream aggregation within a transaction would fail, so the
+              // override has to execute this as a standalone command.
+              const changeStream = testDB.collName1.watch();
+              assert.commandWorked(testDB.collName1.insert({_id: 1}));
+              endCurrentTransactionIfOpen();
+
+              // Calling the `next` function on the change stream cursor will trigger a getmore,
+              // which the override must also run as a standalone command.
+              assert.eq(changeStream.next()["fullDocument"], {_id: 1});
+
+              // An aggregation without $changeStream runs within a transaction.
+              let aggCursor = testDB.collName1.aggregate([], {cursor: {batchSize: 0}});
+              assert.eq(aggCursor.next(), {_id: 1});
+
+              // Creating a non-$changeStream aggregation cursor and running its getMore in a
+              // different transaction will fail.
+              aggCursor = testDB.collName1.aggregate([], {cursor: {batchSize: 0}});
+              endCurrentTransactionIfOpen();
+              assert.throws(() => aggCursor.next());
+          }
+        },
     ];
 
     // Failpoints, overrides, and post-command functions are set by default to only run once, so
@@ -1804,6 +1830,47 @@
               assert.docEq(coll2.find().toArray(), [{_id: 2}]);
           }
         },
+        {
+          name: 'Dates are copied correctly for SERVER-41917',
+          test: function() {
+              assert.commandWorked(testDB.createCollection(collName1));
+              failCommandWithFailPoint(["commitTransaction"],
+                                       {errorCode: ErrorCodes.NoSuchTransaction});
+
+              let date = new Date();
+              assert.commandWorked(coll1.insert({_id: 3, a: date}));
+              date.setMilliseconds(date.getMilliseconds() + 2);
+              assert.eq(null, coll1.findOne({_id: 3, a: date}));
+              const origDoc = coll1.findOne({_id: 3});
+              const ret = assert.commandWorked(coll1.update({_id: 3}, {$min: {a: date}}));
+              assert.eq(ret.nModified, 0);
+
+              endCurrentTransactionIfOpen();
+
+              assert.eq(coll1.findOne({_id: 3}).a, origDoc.a);
+          }
+        },
+        {
+          name: 'Timestamps are copied correctly for SERVER-41917',
+          test: function() {
+              assert.commandWorked(testDB.createCollection(collName1));
+              failCommandWithFailPoint(["commitTransaction"],
+                                       {errorCode: ErrorCodes.NoSuchTransaction});
+
+              let ts = new Timestamp(5, 6);
+              assert.commandWorked(coll1.insert({_id: 3, a: ts}));
+              ts.t++;
+
+              assert.eq(null, coll1.findOne({_id: 3, a: ts}));
+              const origDoc = coll1.findOne({_id: 3});
+              const ret = assert.commandWorked(coll1.update({_id: 3}, {$min: {a: ts}}));
+              assert.eq(ret.nModified, 0);
+
+              endCurrentTransactionIfOpen();
+
+              assert.eq(coll1.findOne({_id: 3}).a, origDoc.a);
+          }
+        }
     ];
 
     TestData.networkErrorAndTxnOverrideConfig = {};

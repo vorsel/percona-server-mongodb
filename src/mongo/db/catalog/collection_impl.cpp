@@ -43,7 +43,6 @@
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/background.h"
 #include "mongo/db/catalog/collection_catalog.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/collection_info_cache_impl.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/document_validation.h"
@@ -53,6 +52,7 @@
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
@@ -67,6 +67,7 @@
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/key_string.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/update/update_driver.h"
@@ -95,6 +96,9 @@ MONGO_FAIL_POINT_DEFINE(failCollectionInserts);
 //      first_id: <string>
 //  }
 MONGO_FAIL_POINT_DEFINE(hangAfterCollectionInserts);
+
+// This fail point throws a WriteConflictException after a successful call to insertRecords.
+MONGO_FAIL_POINT_DEFINE(failAfterBulkLoadDocInsert);
 
 /**
  * Checks the 'failCollectionInserts' fail point at the beginning of an insert operation to see if
@@ -191,20 +195,17 @@ using std::vector;
 using logger::LogComponent;
 
 CollectionImpl::CollectionImpl(OperationContext* opCtx,
-                               StringData fullNS,
+                               const NamespaceString& nss,
                                OptionalCollectionUUID uuid,
-                               CollectionCatalogEntry* details,
-                               RecordStore* recordStore)
+                               std::unique_ptr<RecordStore> recordStore)
     : _magic(kMagicNumber),
-      _ns(fullNS),
+      _ns(nss),
       _uuid(uuid),
-      _details(details),
-      _recordStore(recordStore),
+      _recordStore(std::move(recordStore)),
       _needCappedLock(supportsDocLocking() && _recordStore && _recordStore->isCapped() &&
                       _ns.db() != "local"),
       _infoCache(std::make_unique<CollectionInfoCacheImpl>(this, _ns)),
-      _indexCatalog(
-          std::make_unique<IndexCatalogImpl>(this, getCatalogEntry()->getMaxAllowedIndexes())),
+      _indexCatalog(std::make_unique<IndexCatalogImpl>(this)),
       _cappedNotifier(_recordStore && _recordStore->isCapped()
                           ? stdx::make_unique<CappedInsertNotifier>()
                           : nullptr) {
@@ -227,22 +228,21 @@ CollectionImpl::~CollectionImpl() {
 }
 
 std::unique_ptr<Collection> CollectionImpl::FactoryImpl::make(
-    OperationContext* opCtx, CollectionCatalogEntry* collectionCatalogEntry) const {
-    auto rs = collectionCatalogEntry->getRecordStore();
-    const auto uuid = collectionCatalogEntry->getCollectionOptions(opCtx).uuid;
-    const auto nss = collectionCatalogEntry->ns();
-    return std::make_unique<CollectionImpl>(opCtx, nss.ns(), uuid, collectionCatalogEntry, rs);
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    CollectionUUID uuid,
+    std::unique_ptr<RecordStore> rs) const {
+    return std::make_unique<CollectionImpl>(opCtx, nss, uuid, std::move(rs));
 }
 
 void CollectionImpl::init(OperationContext* opCtx) {
-    _collator = parseCollation(opCtx, _ns, _details->getCollectionOptions(opCtx).collation);
-    _validatorDoc = _details->getCollectionOptions(opCtx).validator.getOwned();
+    auto collectionOptions = DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, _ns);
+    _collator = parseCollation(opCtx, _ns, collectionOptions.collation);
+    _validatorDoc = collectionOptions.validator.getOwned();
     _validator = uassertStatusOK(
         parseValidator(opCtx, _validatorDoc, MatchExpressionParser::kAllowAllSpecialFeatures));
-    _validationAction = uassertStatusOK(
-        _parseValidationAction(_details->getCollectionOptions(opCtx).validationAction));
-    _validationLevel = uassertStatusOK(
-        _parseValidationLevel(_details->getCollectionOptions(opCtx).validationLevel));
+    _validationAction = uassertStatusOK(_parseValidationAction(collectionOptions.validationAction));
+    _validationLevel = uassertStatusOK(_parseValidationLevel(collectionOptions.validationLevel));
 
     getIndexCatalog()->init(opCtx).transitional_ignore();
     infoCache()->init(opCtx);
@@ -473,8 +473,11 @@ Status CollectionImpl::insertDocumentForBulkLoader(OperationContext* opCtx,
         return loc.getStatus();
 
     status = onRecordInserted(loc.getValue());
-    if (!status.isOK()) {
-        return status;
+
+    if (MONGO_FAIL_POINT(failAfterBulkLoadDocInsert)) {
+        log() << "Failpoint failAfterBulkLoadDocInsert enabled for " << _ns.ns()
+              << ". Throwing WriteConflictException.";
+        throw WriteConflictException();
     }
 
     vector<InsertStatement> inserts;
@@ -740,7 +743,7 @@ StatusWith<RecordData> CollectionImpl::updateDocumentWithDamages(
 }
 
 bool CollectionImpl::isTemporary(OperationContext* opCtx) const {
-    return _details->getCollectionOptions(opCtx).temp;
+    return DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, _ns).temp;
 }
 
 bool CollectionImpl::isCapped() const {
@@ -851,7 +854,8 @@ Status CollectionImpl::setValidator(OperationContext* opCtx, BSONObj validatorDo
     if (!statusWithMatcher.isOK())
         return statusWithMatcher.getStatus();
 
-    _details->updateValidator(opCtx, validatorDoc, getValidationLevel(), getValidationAction());
+    DurableCatalog::get(opCtx)->updateValidator(
+        opCtx, ns(), validatorDoc, getValidationLevel(), getValidationAction());
 
     opCtx->recoveryUnit()->onRollback([
         this,
@@ -899,7 +903,8 @@ Status CollectionImpl::setValidationLevel(OperationContext* opCtx, StringData ne
     auto oldValidationLevel = _validationLevel;
     _validationLevel = levelSW.getValue();
 
-    _details->updateValidator(opCtx, _validatorDoc, getValidationLevel(), getValidationAction());
+    DurableCatalog::get(opCtx)->updateValidator(
+        opCtx, ns(), _validatorDoc, getValidationLevel(), getValidationAction());
     opCtx->recoveryUnit()->onRollback(
         [this, oldValidationLevel]() { this->_validationLevel = oldValidationLevel; });
 
@@ -917,7 +922,9 @@ Status CollectionImpl::setValidationAction(OperationContext* opCtx, StringData n
     auto oldValidationAction = _validationAction;
     _validationAction = actionSW.getValue();
 
-    _details->updateValidator(opCtx, _validatorDoc, getValidationLevel(), getValidationAction());
+
+    DurableCatalog::get(opCtx)->updateValidator(
+        opCtx, ns(), _validatorDoc, getValidationLevel(), getValidationAction());
     opCtx->recoveryUnit()->onRollback(
         [this, oldValidationAction]() { this->_validationAction = oldValidationAction; });
 
@@ -943,7 +950,7 @@ Status CollectionImpl::updateValidator(OperationContext* opCtx,
         this->_validationAction = oldValidationAction;
     });
 
-    _details->updateValidator(opCtx, newValidator, newLevel, newAction);
+    DurableCatalog::get(opCtx)->updateValidator(opCtx, ns(), newValidator, newLevel, newAction);
     _validatorDoc = std::move(newValidator);
 
     auto validatorSW =
@@ -1280,7 +1287,7 @@ void _validateCatalogEntry(OperationContext* opCtx,
                            CollectionImpl* coll,
                            BSONObj validatorDoc,
                            ValidateResults* results) {
-    CollectionOptions options = coll->getCatalogEntry()->getCollectionOptions(opCtx);
+    CollectionOptions options = DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, coll->ns());
     addErrorIfUnequal(options.uuid, coll->uuid(), "UUID", results);
     const CollatorInterface* collation = coll->getDefaultCollator();
     addErrorIfUnequal(options.collation.isEmpty(), !collation, "simple collation", results);
@@ -1324,7 +1331,7 @@ Status CollectionImpl::validate(OperationContext* opCtx,
     try {
         ValidateResultsMap indexNsResultsMap;
         BSONObjBuilder keysPerIndex;  // not using subObjStart to be exception safe
-        IndexConsistency indexConsistency(opCtx, this, ns(), _recordStore, background);
+        IndexConsistency indexConsistency(opCtx, this, ns(), _recordStore.get(), background);
         RecordStoreValidateAdaptor indexValidator = RecordStoreValidateAdaptor(
             opCtx, &indexConsistency, level, _indexCatalog.get(), &indexNsResultsMap);
 
@@ -1333,7 +1340,7 @@ Status CollectionImpl::validate(OperationContext* opCtx,
             << " (UUID: " << (uuid() ? uuid()->toString() : "none") << ")";
         log(LogComponent::kIndex) << "validating collection " << ns() << uuidString;
         _validateRecordStore(
-            opCtx, _recordStore, level, background, &indexValidator, results, output);
+            opCtx, _recordStore.get(), level, background, &indexValidator, results, output);
 
         // Validate in-memory catalog information with the persisted info.
         _validateCatalogEntry(opCtx, this, _validatorDoc, results);
@@ -1353,7 +1360,7 @@ Status CollectionImpl::validate(OperationContext* opCtx,
                     << "Index inconsistencies were detected on collection " << ns()
                     << ". Starting the second phase of index validation to gather concise errors.";
                 _gatherIndexEntryErrors(opCtx,
-                                        _recordStore,
+                                        _recordStore.get(),
                                         _indexCatalog.get(),
                                         &indexConsistency,
                                         &indexValidator,
@@ -1364,8 +1371,11 @@ Status CollectionImpl::validate(OperationContext* opCtx,
 
         // Validate index key count.
         if (results->valid) {
-            _validateIndexKeyCount(
-                opCtx, _indexCatalog.get(), _recordStore, &indexValidator, &indexNsResultsMap);
+            _validateIndexKeyCount(opCtx,
+                                   _indexCatalog.get(),
+                                   _recordStore.get(),
+                                   &indexValidator,
+                                   &indexNsResultsMap);
         }
 
         // Report the validation results for the user to see
@@ -1396,7 +1406,7 @@ Status CollectionImpl::touch(OperationContext* opCtx,
                              BSONObjBuilder* output) const {
     if (touchData) {
         BSONObjBuilder b;
-        Status status = _recordStore->touch(opCtx, &b);
+        Status status = _recordStore.get()->touch(opCtx, &b);
         if (!status.isOK())
             return status;
         output->append("data", b.obj());
@@ -1433,11 +1443,11 @@ void CollectionImpl::setNs(NamespaceString nss) {
     _ns = std::move(nss);
     _indexCatalog->setNs(_ns);
     _infoCache->setNs(_ns);
-    _recordStore->setNs(_ns);
+    _recordStore.get()->setNs(_ns);
 }
 
 void CollectionImpl::indexBuildSuccess(OperationContext* opCtx, IndexCatalogEntry* index) {
-    _details->indexBuildSuccess(opCtx, index->descriptor()->indexName());
+    DurableCatalog::get(opCtx)->indexBuildSuccess(opCtx, ns(), index->descriptor()->indexName());
     _indexCatalog->indexBuildSuccess(opCtx, index);
 }
 

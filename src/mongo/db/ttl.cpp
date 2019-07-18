@@ -37,7 +37,6 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/user_name.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
@@ -52,6 +51,7 @@
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/ttl_collection_cache.h"
 #include "mongo/db/ttl_gen.h"
 #include "mongo/util/background.h"
@@ -123,6 +123,7 @@ public:
 private:
     void doTTLPass() {
         const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
+        auto durableCatalog = DurableCatalog::get(opCtxPtr.get());
         OperationContext& opCtx = *opCtxPtr;
 
         // If part of replSet but not in a readable state (e.g. during initial sync), skip.
@@ -147,11 +148,10 @@ private:
                 continue;
             }
 
-            CollectionCatalogEntry* collEntry = coll->getCatalogEntry();
             std::vector<std::string> indexNames;
-            collEntry->getAllIndexes(&opCtx, &indexNames);
+            durableCatalog->getAllIndexes(&opCtx, coll->ns(), &indexNames);
             for (const std::string& name : indexNames) {
-                BSONObj spec = collEntry->getIndexSpec(&opCtx, name);
+                BSONObj spec = durableCatalog->getIndexSpec(&opCtx, coll->ns(), name);
                 if (spec.hasField(secondsExpireField)) {
                     ttlIndexes.push_back(spec.getOwned());
                 }

@@ -34,7 +34,6 @@
 #include <vector>
 
 #include "mongo/db/catalog/collection_catalog.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/index_catalog.h"
@@ -56,6 +55,7 @@
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/service_context_d_test_fixture.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
@@ -370,8 +370,7 @@ CollectionOptions _getCollectionOptions(OperationContext* opCtx, const Namespace
     auto collection = autoColl.getCollection();
     ASSERT_TRUE(collection) << "Unable to get collections options for " << nss
                             << " because collection does not exist.";
-    auto catalogEntry = collection->getCatalogEntry();
-    return catalogEntry->getCollectionOptions(opCtx);
+    return DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, nss);
 }
 
 /**
@@ -399,8 +398,7 @@ bool _isTempCollection(OperationContext* opCtx, const NamespaceString& nss) {
     auto collection = autoColl.getCollection();
     ASSERT_TRUE(collection) << "Unable to check if " << nss
                             << " is a temporary collection because collection does not exist.";
-    auto catalogEntry = collection->getCatalogEntry();
-    auto options = catalogEntry->getCollectionOptions(opCtx);
+    auto options = _getCollectionOptions(opCtx, nss);
     return options.temp;
 }
 
@@ -1152,45 +1150,6 @@ TEST_F(RenameCollectionTest, CollectionPointerRemainsValidThroughRename) {
     ASSERT_EQ(targetColl->ns(), _targetNss);
 }
 
-TEST_F(RenameCollectionTest, CollectionCatalogEntryPointerRemainsValidThroughRename) {
-    _createCollection(_opCtx.get(), _sourceNss);
-    Lock::GlobalWrite globalWrite(_opCtx.get());
-
-    // Get a pointer to the source collection, and ensure that it reports the expected namespace
-    // string.
-    Collection* sourceColl = _getCollection_inlock(_opCtx.get(), _sourceNss);
-    ASSERT(sourceColl);
-    auto* sourceCatalogEntry = sourceColl->getCatalogEntry();
-    ASSERT(sourceCatalogEntry);
-    ASSERT_EQ(sourceCatalogEntry->ns(), _sourceNss);
-
-    ASSERT_OK(renameCollection(_opCtx.get(), _sourceNss, _targetNss, {}));
-
-    // Verify that the CollectionCatalogEntry reports that its namespace is now the target
-    // namespace.
-    ASSERT_EQ(sourceCatalogEntry->ns(), _targetNss);
-}
-
-TEST_F(RenameCollectionTest, CatalogPointersRenameValidThroughRenameAfterDroppingTarget) {
-    _createCollection(_opCtx.get(), _sourceNss);
-    _createCollection(_opCtx.get(), _targetNss);
-    Lock::GlobalWrite globalWrite(_opCtx.get());
-
-    Collection* sourceColl = _getCollection_inlock(_opCtx.get(), _sourceNss);
-    ASSERT(sourceColl);
-    auto* sourceCatalogEntry = sourceColl->getCatalogEntry();
-    ASSERT(sourceCatalogEntry);
-
-    RenameCollectionOptions options;
-    options.dropTarget = true;
-    ASSERT_OK(renameCollection(_opCtx.get(), _sourceNss, _targetNss, options));
-
-    // The same catalog pointers should now report that they are associated with the target
-    // namespace.
-    ASSERT_EQ(sourceColl->ns(), _targetNss);
-    ASSERT_EQ(sourceCatalogEntry->ns(), _targetNss);
-}
-
 TEST_F(RenameCollectionTest, CatalogPointersRenameValidThroughRenameForApplyOps) {
     _createCollection(_opCtx.get(), _sourceNss);
     Collection* sourceColl = AutoGetCollectionForRead(_opCtx.get(), _sourceNss).getCollection();
@@ -1206,29 +1165,6 @@ TEST_F(RenameCollectionTest, CatalogPointersRenameValidThroughRenameForApplyOps)
     ASSERT(targetColl);
     ASSERT_EQ(targetColl, sourceColl);
     ASSERT_EQ(targetColl->ns(), _targetNss);
-}
-
-TEST_F(RenameCollectionTest, RenameAcrossDatabasesDoesNotPreserveCatalogPointers) {
-    _createCollection(_opCtx.get(), _sourceNss);
-    Lock::GlobalWrite globalWrite(_opCtx.get());
-
-    // Get a pointer to the source collection, and ensure that it reports the expected namespace
-    // string.
-    Collection* sourceColl = _getCollection_inlock(_opCtx.get(), _sourceNss);
-    ASSERT(sourceColl);
-    auto* sourceCatalogEntry = sourceColl->getCatalogEntry();
-    ASSERT(sourceCatalogEntry);
-
-    ASSERT_OK(renameCollection(_opCtx.get(), _sourceNss, _targetNssDifferentDb, {}));
-
-    // Verify that the CollectionCatalogEntry reports that its namespace is now the target
-    // namespace.
-    Collection* targetColl = _getCollection_inlock(_opCtx.get(), _targetNssDifferentDb);
-    ASSERT(targetColl);
-    ASSERT_NE(targetColl, sourceColl);
-    auto* targetCatalogEntry = targetColl->getCatalogEntry();
-    ASSERT(targetCatalogEntry);
-    ASSERT_NE(targetCatalogEntry, sourceCatalogEntry);
 }
 
 TEST_F(RenameCollectionTest, CollectionCatalogMappingRemainsIntactThroughRename) {

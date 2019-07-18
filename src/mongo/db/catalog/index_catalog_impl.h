@@ -56,7 +56,7 @@ struct InsertDeleteOptions;
  */
 class IndexCatalogImpl : public IndexCatalog {
 public:
-    explicit IndexCatalogImpl(Collection* collection, int maxNumIndexesAllowed);
+    explicit IndexCatalogImpl(Collection* collection);
     ~IndexCatalogImpl() override;
 
     // must be called before used
@@ -386,6 +386,16 @@ private:
 
     void _checkMagic() const;
 
+    Status _indexKeys(OperationContext* opCtx,
+                      IndexCatalogEntry* index,
+                      const std::vector<BSONObj>& keys,
+                      const BSONObjSet& multikeyMetadataKeys,
+                      const MultikeyPaths& multikeyPaths,
+                      const BSONObj& obj,
+                      RecordId loc,
+                      const InsertDeleteOptions& options,
+                      int64_t* keysInsertedOut);
+
     Status _indexFilteredRecords(OperationContext* opCtx,
                                  IndexCatalogEntry* index,
                                  const std::vector<BsonRecord>& bsonRecords,
@@ -396,12 +406,28 @@ private:
                          const std::vector<BsonRecord>& bsonRecords,
                          int64_t* keysInsertedOut);
 
-    Status _unindexRecord(OperationContext* opCtx,
-                          IndexCatalogEntry* index,
-                          const BSONObj& obj,
-                          const RecordId& loc,
-                          bool logIfError,
-                          int64_t* keysDeletedOut);
+    Status _updateRecord(OperationContext* const opCtx,
+                         IndexCatalogEntry* index,
+                         const BSONObj& oldDoc,
+                         const BSONObj& newDoc,
+                         const RecordId& recordId,
+                         int64_t* const keysInsertedOut,
+                         int64_t* const keysDeletedOut);
+
+    void _unindexKeys(OperationContext* opCtx,
+                      IndexCatalogEntry* index,
+                      const std::vector<BSONObj>& keys,
+                      const BSONObj& obj,
+                      RecordId loc,
+                      bool logIfError,
+                      int64_t* const keysDeletedOut);
+
+    void _unindexRecord(OperationContext* opCtx,
+                        IndexCatalogEntry* entry,
+                        const BSONObj& obj,
+                        const RecordId& loc,
+                        bool logIfError,
+                        int64_t* keysDeletedOut);
 
     /**
      * this does no sanity checks
@@ -470,7 +496,6 @@ private:
 
     int _magic;
     Collection* const _collection;
-    const int _maxNumIndexesAllowed;
 
     IndexCatalogEntryContainer _readyIndexes;
     IndexCatalogEntryContainer _buildingIndexes;

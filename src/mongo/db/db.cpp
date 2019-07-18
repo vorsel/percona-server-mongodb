@@ -122,6 +122,7 @@
 #include "mongo/db/s/shard_server_op_observer.h"
 #include "mongo/db/s/sharding_initialization_mongod.h"
 #include "mongo/db/s/sharding_state_recovery.h"
+#include "mongo/db/s/wait_for_majority_service.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_entry_point_mongod.h"
@@ -422,11 +423,20 @@ ExitCode _initAndListen(int listenPort) {
         exitCleanly(EXIT_NEED_DOWNGRADE);
     }
 
+    auto replProcess = repl::ReplicationProcess::get(serviceContext);
+    invariant(replProcess);
+    const bool initialSyncFlag =
+        replProcess->getConsistencyMarkers()->getInitialSyncFlag(startupOpCtx.get());
+
     // Assert that the in-memory featureCompatibilityVersion parameter has been explicitly set. If
     // we are part of a replica set and are started up with no data files, we do not set the
     // featureCompatibilityVersion until a primary is chosen. For this case, we expect the in-memory
-    // featureCompatibilityVersion parameter to still be uninitialized until after startup.
-    if (canCallFCVSetIfCleanStartup && (!replSettings.usingReplSets() || nonLocalDatabases)) {
+    // featureCompatibilityVersion parameter to still be uninitialized until after startup. If the
+    // initial sync flag is set and we are part of a replica set, we expect the version to be
+    // initialized as part of initial sync after startup.
+    const bool initializeFCVAtInitialSync = replSettings.usingReplSets() && initialSyncFlag;
+    if (canCallFCVSetIfCleanStartup && (!replSettings.usingReplSets() || nonLocalDatabases) &&
+        !initializeFCVAtInitialSync) {
         invariant(serverGlobalParams.featureCompatibility.isVersionInitialized());
     }
 
@@ -499,6 +509,8 @@ ExitCode _initAndListen(int listenPort) {
                  "data."
               << startupWarningsLog;
     }
+
+    WaitForMajorityService::get(serviceContext).setUp(serviceContext);
 
     // This function may take the global lock.
     auto shardingInitialized = ShardingInitializationMongoD::get(startupOpCtx.get())
@@ -606,7 +618,11 @@ ExitCode _initAndListen(int listenPort) {
     // release periodically in order to avoid storage cache pressure build up.
     if (storageEngine->supportsReadConcernSnapshot()) {
         startPeriodicThreadToAbortExpiredTransactions(serviceContext);
-        startPeriodicThreadToDecreaseSnapshotHistoryIfNotNeeded(serviceContext);
+        // The inMemory engine is not yet used for replica or sharded transactions in production so
+        // it does not currently maintain snapshot history. It is live in testing, however.
+        if (!storageEngine->isEphemeral() || getTestCommandsEnabled()) {
+            startPeriodicThreadToDecreaseSnapshotHistoryCachePressure(serviceContext);
+        }
     }
 
     // Set up the logical session cache
@@ -894,6 +910,8 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
             log() << "Failed to stepDown in non-command initiated shutdown path " << e.toString();
         }
     }
+
+    WaitForMajorityService::get(serviceContext).shutDown();
 
     // Terminate the balancer thread so it doesn't leak memory.
     if (auto balancer = Balancer::get(serviceContext)) {

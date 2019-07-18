@@ -796,7 +796,7 @@ void SyncTail::_oplogApplication(ReplicationCoordinator* replCoord,
         // Apply the operations in this batch. 'multiApply' returns the optime of the last op that
         // was applied, which should be the last optime in the batch.
         auto lastOpTimeAppliedInBatch =
-            fassertNoTrace(34437, multiApply(&opCtx, ops.releaseBatch()));
+            fassertNoTrace(34437, multiApply(&opCtx, ops.releaseBatch(), boost::none));
         invariant(lastOpTimeAppliedInBatch == lastOpTimeInBatch);
 
         // In order to provide resilience in the event of a crash in the middle of batch
@@ -846,6 +846,12 @@ inline bool isCommitApplyOps(const OplogEntry& entry) {
     return entry.getCommandType() == OplogEntry::CommandType::kApplyOps && !entry.shouldPrepare() &&
         !entry.isPartialTransaction() && !entry.getObject().getBoolField("prepare");
 }
+
+// Returns whether a commitTransaction oplog entry is a part of a prepared transaction.
+inline bool isPreparedCommit(const OplogEntry& entry) {
+    return entry.getCommandType() == OplogEntry::CommandType::kCommitTransaction;
+}
+
 
 void SyncTail::shutdown() {
     stdx::lock_guard<stdx::mutex> lock(_mutex);
@@ -1022,6 +1028,14 @@ Status multiSyncApply(OperationContext* opCtx,
     // Explicitly start future read transactions without a timestamp.
     opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
 
+    // When querying indexes, we return the record matching the key if it exists, or an adjacent
+    // document. This means that it is possible for us to hit a prepare conflict if we query for an
+    // incomplete key and an adjacent key is prepared.
+    // We ignore prepare conflicts on secondaries because they may encounter prepare conflicts that
+    // did not occur on the primary.
+    opCtx->recoveryUnit()->setPrepareConflictBehavior(
+        PrepareConflictBehavior::kIgnoreConflictsAllowWrites);
+
     ApplierHelpers::stableSortByNamespace(ops);
 
     // Assume we are recovering if oplog writes are disabled in the options.
@@ -1109,7 +1123,8 @@ void SyncTail::_fillWriterVectors(OperationContext* opCtx,
                                   MultiApplier::Operations* ops,
                                   std::vector<MultiApplier::OperationPtrs>* writerVectors,
                                   std::vector<MultiApplier::Operations>* derivedOps,
-                                  SessionUpdateTracker* sessionUpdateTracker) {
+                                  SessionUpdateTracker* sessionUpdateTracker,
+                                  boost::optional<repl::OplogApplication::Mode> mode) {
     const auto serviceContext = opCtx->getServiceContext();
     const auto storageEngine = serviceContext->getStorageEngine();
 
@@ -1137,7 +1152,8 @@ void SyncTail::_fillWriterVectors(OperationContext* opCtx,
         if (sessionUpdateTracker) {
             if (auto newOplogWrites = sessionUpdateTracker->updateSession(op)) {
                 derivedOps->emplace_back(std::move(*newOplogWrites));
-                _fillWriterVectors(opCtx, &derivedOps->back(), writerVectors, derivedOps, nullptr);
+                _fillWriterVectors(
+                    opCtx, &derivedOps->back(), writerVectors, derivedOps, nullptr, mode);
             }
         }
 
@@ -1199,13 +1215,13 @@ void SyncTail::_fillWriterVectors(OperationContext* opCtx,
                         // messing up the state of the opCtx.  In particular we do not want to
                         // set the ReadSource to kLastApplied.
                         ReadSourceScope readSourceScope(opCtx);
-                        derivedOps->emplace_back(
-                            readTransactionOperationsFromOplogChain(opCtx, op, partialTxnList));
+                        derivedOps->emplace_back(readTransactionOperationsFromOplogChain(
+                            opCtx, op, partialTxnList, boost::none));
                         partialTxnList.clear();
                     }
                     // Transaction entries cannot have different session updates.
                     _fillWriterVectors(
-                        opCtx, &derivedOps->back(), writerVectors, derivedOps, nullptr);
+                        opCtx, &derivedOps->back(), writerVectors, derivedOps, nullptr, mode);
                 } else {
                     // The applyOps entry was not generated as part of a transaction.
                     invariant(!op.getPrevWriteOpTimeInTransaction());
@@ -1213,7 +1229,7 @@ void SyncTail::_fillWriterVectors(OperationContext* opCtx,
 
                     // Nested entries cannot have different session updates.
                     _fillWriterVectors(
-                        opCtx, &derivedOps->back(), writerVectors, derivedOps, nullptr);
+                        opCtx, &derivedOps->back(), writerVectors, derivedOps, nullptr, mode);
                 }
             } catch (...) {
                 fassertFailedWithStatusNoTrace(
@@ -1222,6 +1238,33 @@ void SyncTail::_fillWriterVectors(OperationContext* opCtx,
                                                     << "Unable to extract operations from applyOps "
                                                     << redact(op.toBSON())));
             }
+            continue;
+        }
+
+        // If we see a commitTransaction command that is a part of a prepared transaction during
+        // initial sync, find the prepare oplog entry, extract applyOps operations, and fill writers
+        // with the extracted operations.
+        if (isPreparedCommit(op) && (mode == OplogApplication::Mode::kInitialSync)) {
+            auto logicalSessionId = op.getSessionId();
+            auto& partialTxnList = partialTxnOps[*logicalSessionId];
+
+            {
+                // Traverse the oplog chain with its own snapshot and read timestamp.
+                ReadSourceScope readSourceScope(opCtx);
+
+                // Get the previous oplog entry, which should be a prepare oplog entry.
+                const auto prevOplogEntry = getPreviousOplogEntry(opCtx, op);
+                invariant(prevOplogEntry.shouldPrepare());
+
+                // Extract the operations from the applyOps entry.
+                auto commitOplogEntryOpTime = op.getOpTime();
+                derivedOps->emplace_back(readTransactionOperationsFromOplogChain(
+                    opCtx, prevOplogEntry, partialTxnList, commitOplogEntryOpTime.getTimestamp()));
+                partialTxnList.clear();
+            }
+
+            _fillWriterVectors(
+                opCtx, &derivedOps->back(), writerVectors, derivedOps, nullptr, mode);
             continue;
         }
 
@@ -1236,14 +1279,15 @@ void SyncTail::_fillWriterVectors(OperationContext* opCtx,
 void SyncTail::fillWriterVectors(OperationContext* opCtx,
                                  MultiApplier::Operations* ops,
                                  std::vector<MultiApplier::OperationPtrs>* writerVectors,
-                                 std::vector<MultiApplier::Operations>* derivedOps) {
+                                 std::vector<MultiApplier::Operations>* derivedOps,
+                                 boost::optional<repl::OplogApplication::Mode> mode) {
     SessionUpdateTracker sessionUpdateTracker;
-    _fillWriterVectors(opCtx, ops, writerVectors, derivedOps, &sessionUpdateTracker);
+    _fillWriterVectors(opCtx, ops, writerVectors, derivedOps, &sessionUpdateTracker, mode);
 
     auto newOplogWrites = sessionUpdateTracker.flushAll();
     if (!newOplogWrites.empty()) {
         derivedOps->emplace_back(std::move(newOplogWrites));
-        _fillWriterVectors(opCtx, &derivedOps->back(), writerVectors, derivedOps, nullptr);
+        _fillWriterVectors(opCtx, &derivedOps->back(), writerVectors, derivedOps, nullptr, mode);
     }
 }
 
@@ -1275,10 +1319,13 @@ void SyncTail::_applyOps(std::vector<MultiApplier::OperationPtrs>& writerVectors
     }
 }
 
-StatusWith<OpTime> SyncTail::multiApply(OperationContext* opCtx, MultiApplier::Operations ops) {
+StatusWith<OpTime> SyncTail::multiApply(OperationContext* opCtx,
+                                        MultiApplier::Operations ops,
+                                        boost::optional<repl::OplogApplication::Mode> mode) {
     invariant(!ops.empty());
 
     LOG(2) << "replication batch size is " << ops.size();
+
     // Stop all readers until we're done. This also prevents doc-locking engines from deleting old
     // entries from the oplog until we finish writing.
     Lock::ParallelBatchWriterMode pbwm(opCtx->lockState());
@@ -1318,7 +1365,7 @@ StatusWith<OpTime> SyncTail::multiApply(OperationContext* opCtx, MultiApplier::O
         std::vector<MultiApplier::Operations> derivedOps;
 
         std::vector<MultiApplier::OperationPtrs> writerVectors(_writerPool->getStats().numThreads);
-        fillWriterVectors(opCtx, &ops, &writerVectors, &derivedOps);
+        fillWriterVectors(opCtx, &ops, &writerVectors, &derivedOps, mode);
 
         // Wait for writes to finish before applying ops.
         _writerPool->waitForIdle();

@@ -39,7 +39,7 @@
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/storage/kv/storage_engine_impl.h"
+#include "mongo/db/storage/storage_engine_impl.h"
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/storage/storage_engine_lock_file.h"
 #include "mongo/db/storage/storage_engine_metadata.h"
@@ -101,12 +101,15 @@ public:
             }
         }
         const bool ephemeral = false;
+        const auto maxCacheOverflowMB =
+            static_cast<size_t>(1024 * wiredTigerGlobalOptions.maxCacheOverflowFileSizeGB);
         WiredTigerKVEngine* kv =
             new WiredTigerKVEngine(getCanonicalName().toString(),
                                    params.dbpath,
                                    getGlobalServiceContext()->getFastClockSource(),
                                    wiredTigerGlobalOptions.engineConfig,
                                    cacheMB,
+                                   maxCacheOverflowMB,
                                    params.dur,
                                    ephemeral,
                                    params.repair,
@@ -118,6 +121,10 @@ public:
         auto* param = new WiredTigerEngineRuntimeConfigParameter("wiredTigerEngineRuntimeConfig",
                                                                  ServerParameterType::kRuntimeOnly);
         param->_data.second = kv;
+
+        auto* maxCacheOverflowParam = new WiredTigerMaxCacheOverflowSizeGBParameter(
+            "wiredTigerMaxCacheOverflowSizeGB", ServerParameterType::kRuntimeOnly);
+        maxCacheOverflowParam->_data = {wiredTigerGlobalOptions.maxCacheOverflowFileSizeGB, kv};
 
         StorageEngineOptions options;
         options.directoryPerDB = params.directoryperdb;

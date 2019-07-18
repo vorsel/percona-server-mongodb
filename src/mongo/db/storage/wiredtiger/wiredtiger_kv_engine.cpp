@@ -55,7 +55,6 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/concurrency/locker.h"
@@ -88,6 +87,7 @@
 #include "mongo/util/background.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
 #include "mongo/util/concurrency/ticketholder.h"
+#include "mongo/util/debug_util.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
 #include "mongo/util/processinfo.h"
@@ -597,6 +597,7 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
                                        ClockSource* cs,
                                        const std::string& extraOpenOptions,
                                        size_t cacheSizeMB,
+                                       size_t maxCacheOverflowFileSizeMB,
                                        bool durable,
                                        bool ephemeral,
                                        bool repair,
@@ -725,6 +726,7 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
     std::stringstream ss;
     ss << "create,";
     ss << "cache_size=" << cacheSizeMB << "M,";
+    ss << "cache_overflow=(file_max=" << maxCacheOverflowFileSizeMB << "M),";
     ss << "session_max=33000,";
     ss << "eviction=(threads_min=4,threads_max=4),";
     ss << "config_base=false,";
@@ -749,6 +751,11 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
             ss << "verbose=[recovery_progress,checkpoint_progress,recovery],";
         } else {
             ss << "verbose=[recovery_progress,checkpoint_progress],";
+        }
+
+        // Enable debug write-ahead logging for all tables under debug build.
+        if (kDebugBuild) {
+            ss << "debug_mode=(table_logging=true),";
         }
     }
     ss << WiredTigerCustomizationHooks::get(getGlobalServiceContext())
@@ -828,6 +835,13 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
         _checkpointThread =
             stdx::make_unique<WiredTigerCheckpointThread>(this, _sessionCache.get());
         _checkpointThread->go();
+    }
+
+    if (_ephemeral && !getTestCommandsEnabled()) {
+        // We do not maintain any snapshot history for the ephemeral storage engine in production
+        // because replication and sharded transactions do not currently run on the inMemory engine.
+        // It is live in testing, however.
+        snapshotWindowParams.targetSnapshotHistoryWindowInSeconds.store(0);
     }
 
     _sizeStorerUri = _uri("sizeStorer");
@@ -1560,6 +1574,7 @@ string WiredTigerKVEngine::_uri(StringData ident) const {
 }
 
 Status WiredTigerKVEngine::createGroupedSortedDataInterface(OperationContext* opCtx,
+                                                            const CollectionOptions& collOptions,
                                                             StringData ident,
                                                             const IndexDescriptor* desc,
                                                             KVPrefix prefix) {
@@ -1571,9 +1586,6 @@ Status WiredTigerKVEngine::createGroupedSortedDataInterface(OperationContext* op
     // Treat 'collIndexOptions' as an empty string when the collection member of 'desc' is NULL in
     // order to allow for unit testing WiredTigerKVEngine::createSortedDataInterface().
     if (collection) {
-        const CollectionCatalogEntry* cce = collection->getCatalogEntry();
-        const CollectionOptions collOptions = cce->getCollectionOptions(opCtx);
-
         if (!collOptions.indexOptionDefaults["storageEngine"].eoo()) {
             BSONObj storageEngineOptions = collOptions.indexOptionDefaults["storageEngine"].Obj();
             collIndexOptions =
@@ -1652,13 +1664,19 @@ void WiredTigerKVEngine::alterIdentMetadata(OperationContext* opCtx,
                                             const IndexDescriptor* desc) {
     WiredTigerSession session(_conn);
     std::string uri = _uri(ident);
+    auto sessionHandle = session.getSession();
 
     // Make the alter call to update metadata without taking exclusive lock to avoid conflicts with
     // concurrent operations.
     std::string alterString =
         WiredTigerIndex::generateAppMetadataString(*desc) + "exclusive_refreshed=false,";
-    invariantWTOK(
-        session.getSession()->alter(session.getSession(), uri.c_str(), alterString.c_str()));
+    int ret = sessionHandle->alter(sessionHandle, uri.c_str(), alterString.c_str());
+    if (ret) {
+        severe() << "Failed to alter ident metadata. Uri: " << uri << " Ret: " << ret
+                 << " Ident: " << ident << " alterString: " << redact(alterString)
+                 << " Msg: " << sessionHandle->strerror(sessionHandle, ret);
+        fassertFailed(31013);
+    }
 }
 
 Status WiredTigerKVEngine::dropIdent(OperationContext* opCtx, StringData ident) {
@@ -2005,6 +2023,11 @@ Timestamp WiredTigerKVEngine::_calculateHistoryLagFromStableTimestamp(Timestamp 
     // The oldest_timestamp should lag behind the stable_timestamp by
     // 'targetSnapshotHistoryWindowInSeconds' seconds.
 
+    if (_ephemeral && !getTestCommandsEnabled()) {
+        // No history should be maintained for the inMemory engine because it is not used yet.
+        invariant(snapshotWindowParams.targetSnapshotHistoryWindowInSeconds.load() == 0);
+    }
+
     if (stableTimestamp.getSecs() <
         static_cast<unsigned>(snapshotWindowParams.targetSnapshotHistoryWindowInSeconds.load())) {
         // The history window is larger than the timestamp history thus far. We must wait for
@@ -2261,14 +2284,14 @@ void WiredTigerKVEngine::replicationBatchIsComplete() const {
     _oplogManager->triggerJournalFlush();
 }
 
-int64_t WiredTigerKVEngine::getCacheOverflowTableInsertCount(OperationContext* opCtx) const {
+bool WiredTigerKVEngine::isCacheUnderPressure(OperationContext* opCtx) const {
     WiredTigerSession* session = WiredTigerRecoveryUnit::get(opCtx)->getSessionNoTxn();
     invariant(session);
 
-    int64_t insertCount = uassertStatusOK(WiredTigerUtil::getStatisticsValueAs<int64_t>(
-        session->getSession(), "statistics:", "", WT_STAT_CONN_CACHE_LOOKASIDE_INSERT));
+    int64_t score = uassertStatusOK(WiredTigerUtil::getStatisticsValueAs<int64_t>(
+        session->getSession(), "statistics:", "", WT_STAT_CONN_CACHE_LOOKASIDE_SCORE));
 
-    return insertCount;
+    return (score >= snapshotWindowParams.cachePressureThreshold.load());
 }
 
 Timestamp WiredTigerKVEngine::getStableTimestamp() const {

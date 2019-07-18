@@ -41,7 +41,7 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/inmemory/inmemory_global_options.h"
 #include "mongo/db/storage/storage_engine_init.h"
-#include "mongo/db/storage/kv/storage_engine_impl.h"
+#include "mongo/db/storage/storage_engine_impl.h"
 #include "mongo/db/storage/storage_engine_lock_file.h"
 #include "mongo/db/storage/storage_engine_metadata.h"
 #include "mongo/db/storage/storage_options.h"
@@ -74,6 +74,7 @@ public:
                                                         getGlobalServiceContext()->getFastClockSource(),
                                                         wiredTigerGlobalOptions.engineConfig,
                                                         cacheMB,
+                                                        0,
                                                         durable,
                                                         ephemeral,
                                                         params.repair,

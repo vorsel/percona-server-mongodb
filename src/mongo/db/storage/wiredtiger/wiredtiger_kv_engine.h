@@ -72,7 +72,8 @@ public:
                        const std::string& path,
                        ClockSource* cs,
                        const std::string& extraOpenOptions,
-                       size_t cacheSizeGB,
+                       size_t cacheSizeMB,
+                       size_t maxCacheOverflowFileSizeMB,
                        bool durable,
                        bool ephemeral,
                        bool repair,
@@ -118,9 +119,11 @@ public:
                                                           StringData ident) override;
 
     Status createSortedDataInterface(OperationContext* opCtx,
+                                     const CollectionOptions& collOptions,
                                      StringData ident,
                                      const IndexDescriptor* desc) override {
-        return createGroupedSortedDataInterface(opCtx, ident, desc, KVPrefix::kNotPrefixed);
+        return createGroupedSortedDataInterface(
+            opCtx, collOptions, ident, desc, KVPrefix::kNotPrefixed);
     }
 
     SortedDataInterface* getSortedDataInterface(OperationContext* opCtx,
@@ -142,6 +145,7 @@ public:
                                                        KVPrefix prefix) override;
 
     Status createGroupedSortedDataInterface(OperationContext* opCtx,
+                                            const CollectionOptions& collOptions,
                                             StringData ident,
                                             const IndexDescriptor* desc,
                                             KVPrefix prefix) override;
@@ -248,7 +252,7 @@ public:
      */
     void replicationBatchIsComplete() const override;
 
-    int64_t getCacheOverflowTableInsertCount(OperationContext* opCtx) const override;
+    bool isCacheUnderPressure(OperationContext* opCtx) const override;
 
     bool supportsReadConcernMajority() const final;
 

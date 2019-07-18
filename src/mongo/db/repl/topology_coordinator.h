@@ -434,10 +434,10 @@ public:
 
     /**
      * Goes through the memberData and determines which member that is currently live
-     * has the stalest (earliest) last update time.  Returns (-1, Date_t::max()) if there are
-     * no other members.
+     * has the stalest (earliest) last update time.  Returns (MemberId(), Date_t::max()) if there
+     * are no other members.
      */
-    std::pair<int, Date_t> getStalestLiveMember() const;
+    std::pair<MemberId, Date_t> getStalestLiveMember() const;
 
     /**
      * Go through the memberData, and mark nodes which haven't been updated
@@ -546,9 +546,8 @@ public:
     StatusWith<StepDownAttemptAbortFn> prepareForStepDownAttempt();
 
     /**
-     * Tries to transition the coordinator from the leader role to the follower role.
-     *
-     * A step down succeeds based on the following conditions:
+     * Tries to transition the coordinator's leader mode from kAttemptingStepDown to
+     * kSteppingDown only if we are able to meet the below requirements for stepdown.
      *
      *      C1. 'force' is true and now > waitUntil
      *
@@ -557,21 +556,20 @@ public:
      *
      *      C3. There exists at least one electable secondary node in the majority set M.
      *
-     *
-     * If C1 is true, or if both C2 and C3 are true, then the stepdown occurs and this method
-     * returns true. If the conditions for successful stepdown aren't met yet, but waiting for more
-     * time to pass could make it succeed, returns false.  If the whole stepdown attempt should be
-     * abandoned (for example because the time limit expired or because we've already stepped down),
-     * throws an exception.
+     * If C1 is true, or if both C2 and C3 are true, then the transition succeeds and this
+     * method returns true. If the conditions for successful stepdown aren't met yet, but waiting
+     * for more time to pass could make it succeed, returns false.  If the whole stepdown attempt
+     * should be abandoned (for example because the time limit expired or because we've already
+     * stepped down), throws an exception.
      * TODO(spencer): Unify with the finishUnconditionalStepDown() method.
      */
-    bool attemptStepDown(
+    bool tryToStartStepDown(
         long long termAtStart, Date_t now, Date_t waitUntil, Date_t stepDownUntil, bool force);
 
     /**
      * Returns whether it is safe for a stepdown attempt to complete, ignoring the 'force' argument.
      * This is essentially checking conditions C2 and C3 as described in the comment to
-     * attemptStepDown().
+     * tryToStartStepDown().
      */
     bool isSafeToStepDown();
 
@@ -691,7 +689,8 @@ public:
      * each member in the config. If the member is not up or hasn't responded to a heartbeat since
      * we last restarted, then its value will be boost::none.
      */
-    std::map<int, boost::optional<OpTime>> latestKnownOpTimeSinceHeartbeatRestartPerMember() const;
+    std::map<MemberId, boost::optional<OpTime>> latestKnownOpTimeSinceHeartbeatRestartPerMember()
+        const;
 
     /**
      * Checks if the 'commitQuorum' can be satisifed by 'members'. Returns true if it can be
@@ -761,20 +760,16 @@ private:
      *        |  |   |  |                |    |           |
      *        |  |   |  |                |    |           |
      *        v  |   |  v                v    v           |
-     *  kAttemptingStepDown----------->kSteppingDown      |
-     *        |                              |            |
-     *        |                              |            |
-     *        |                              |            |
-     *        ---------------------------------------------
-     *
+     *  kAttemptingStepDown----------->kSteppingDown------|
      */
     enum class LeaderMode {
         kNotLeader,           // This node is not currently a leader.
         kLeaderElect,         // This node has been elected leader, but can't yet accept writes.
         kMaster,              // This node reports ismaster:true and can accept writes.
-        kSteppingDown,        // This node is in the middle of a (hb/force reconfig) stepdown that
-                              // must complete.
-        kAttemptingStepDown,  // This node is in the middle of a stepdown (cmd) that might fail.
+        kSteppingDown,        // This node is in the middle of a hb, force reconfig or stepdown
+                              // command that must complete.
+        kAttemptingStepDown,  // This node is in the middle of a cmd initiated step down that might
+                              // fail.
     };
 
     enum UnelectableReason {
@@ -871,7 +866,8 @@ private:
 
     /**
      * Returns whether a stepdown attempt should be allowed to proceed.  See the comment for
-     * attemptStepDown() for more details on the rules of when stepdown attempts succeed or fail.
+     * tryToStartStepDown() for more details on the rules of when stepdown attempts succeed
+     * or fail.
      */
     bool _canCompleteStepDownAttempt(Date_t now, Date_t waitUntil, bool force);
 

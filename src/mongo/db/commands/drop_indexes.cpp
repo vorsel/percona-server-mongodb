@@ -36,7 +36,6 @@
 
 #include "mongo/db/background.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/drop_indexes.h"
 #include "mongo/db/catalog/index_catalog.h"
@@ -52,6 +51,7 @@
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/views/view_catalog.h"
 #include "mongo/util/log.h"
 #include "mongo/util/quick_exit.h"
@@ -157,12 +157,13 @@ public:
         vector<BSONObj> all;
         {
             vector<string> indexNames;
-            collection->getCatalogEntry()->getAllIndexes(opCtx, &indexNames);
+            DurableCatalog::get(opCtx)->getAllIndexes(opCtx, collection->ns(), &indexNames);
             all.reserve(indexNames.size());
 
             for (size_t i = 0; i < indexNames.size(); i++) {
                 const string& name = indexNames[i];
-                BSONObj spec = collection->getCatalogEntry()->getIndexSpec(opCtx, name);
+                BSONObj spec =
+                    DurableCatalog::get(opCtx)->getIndexSpec(opCtx, collection->ns(), name);
 
                 {
                     BSONObjBuilder bob;

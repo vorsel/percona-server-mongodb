@@ -227,6 +227,27 @@ CoreIndexInfo indexInfoFromIndexCatalogEntry(const IndexCatalogEntry& ice) {
             projExec};
 }
 
+/**
+ * If query supports index filters, filter params.indices according to any index filters that have
+ * been configured. In addition, sets that there were indeed index filters applied.
+ */
+void applyIndexFilters(Collection* collection,
+                       const CanonicalQuery& canonicalQuery,
+                       QueryPlannerParams* plannerParams) {
+    if (!IDHackStage::supportsQuery(collection, canonicalQuery)) {
+        QuerySettings* querySettings = collection->infoCache()->getQuerySettings();
+        const auto key = canonicalQuery.encodeKey();
+
+        // Filter index catalog if index filters are specified for query.
+        // Also, signal to planner that application hint should be ignored.
+        if (boost::optional<AllowedIndicesFilter> allowedIndicesFilter =
+                querySettings->getAllowedIndicesFilter(key)) {
+            filterAllowedIndexEntries(*allowedIndicesFilter, &plannerParams->indices);
+            plannerParams->indexFiltersApplied = true;
+        }
+    }
+}
+
 void fillOutPlannerParams(OperationContext* opCtx,
                           Collection* collection,
                           CanonicalQuery* canonicalQuery,
@@ -243,18 +264,7 @@ void fillOutPlannerParams(OperationContext* opCtx,
 
     // If query supports index filters, filter params.indices by indices in query settings.
     // Ignore index filters when it is possible to use the id-hack.
-    if (!IDHackStage::supportsQuery(collection, *canonicalQuery)) {
-        QuerySettings* querySettings = collection->infoCache()->getQuerySettings();
-        const auto key = canonicalQuery->encodeKey();
-
-        // Filter index catalog if index filters are specified for query.
-        // Also, signal to planner that application hint should be ignored.
-        if (boost::optional<AllowedIndicesFilter> allowedIndicesFilter =
-                querySettings->getAllowedIndicesFilter(key)) {
-            filterAllowedIndexEntries(*allowedIndicesFilter, &plannerParams->indices);
-            plannerParams->indexFiltersApplied = true;
-        }
-    }
+    applyIndexFilters(collection, *canonicalQuery, plannerParams);
 
     // We will not output collection scans unless there are no indexed solutions. NO_TABLE_SCAN
     // overrides this behavior by not outputting a collscan even if there are no indexed
@@ -1025,27 +1035,31 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorUpdate(
     driver->refreshIndexKeys(&updateIndexData);
 
     if (!parsedUpdate->hasParsedQuery()) {
-        // This is the idhack fast-path for getting a PlanExecutor without doing the work
-        // to create a CanonicalQuery.
-        const BSONObj& unparsedQuery = request->getQuery();
 
-        const IndexDescriptor* descriptor = collection->getIndexCatalog()->findIdIndex(opCtx);
+        // Only consider using the idhack if no hint was provided.
+        if (request->getHint().isEmpty()) {
+            // This is the idhack fast-path for getting a PlanExecutor without doing the work
+            // to create a CanonicalQuery.
+            const BSONObj& unparsedQuery = request->getQuery();
 
-        const bool hasCollectionDefaultCollation = CollatorInterface::collatorsMatch(
-            parsedUpdate->getCollator(), collection->getDefaultCollator());
+            const IndexDescriptor* descriptor = collection->getIndexCatalog()->findIdIndex(opCtx);
 
-        if (descriptor && CanonicalQuery::isSimpleIdQuery(unparsedQuery) &&
-            request->getProj().isEmpty() && hasCollectionDefaultCollation) {
-            LOG(2) << "Using idhack: " << redact(unparsedQuery);
+            const bool hasCollectionDefaultCollation = CollatorInterface::collatorsMatch(
+                parsedUpdate->getCollator(), collection->getDefaultCollator());
 
-            // Working set 'ws' is discarded. InternalPlanner::updateWithIdHack() makes its own
-            // WorkingSet.
-            return InternalPlanner::updateWithIdHack(opCtx,
-                                                     collection,
-                                                     updateStageParams,
-                                                     descriptor,
-                                                     unparsedQuery["_id"].wrap(),
-                                                     policy);
+            if (descriptor && CanonicalQuery::isSimpleIdQuery(unparsedQuery) &&
+                request->getProj().isEmpty() && hasCollectionDefaultCollation) {
+                LOG(2) << "Using idhack: " << redact(unparsedQuery);
+
+                // Working set 'ws' is discarded. InternalPlanner::updateWithIdHack() makes its own
+                // WorkingSet.
+                return InternalPlanner::updateWithIdHack(opCtx,
+                                                         collection,
+                                                         updateStageParams,
+                                                         descriptor,
+                                                         unparsedQuery["_id"].wrap(),
+                                                         policy);
+            }
         }
 
         // If we're here then we don't have a parsed query, but we're also not eligible for
@@ -1528,6 +1542,20 @@ QueryPlannerParams fillOutPlannerParamsForDistinct(OperationContext* opCtx,
             // So, we will not distinct scan a wildcard index that's multikey on the distinct()
             // field, regardless of the value of 'mayUnwindArrays'.
         }
+    }
+
+    const CanonicalQuery* canonicalQuery = parsedDistinct.getQuery();
+    const BSONObj& hint = canonicalQuery->getQueryRequest().getHint();
+
+    applyIndexFilters(collection, *canonicalQuery, &plannerParams);
+
+    // If there exists an index filter, we ignore all hints. Else, we only keep the index specified
+    // by the hint. Since we cannot have an index with name $natural, that case will clear the
+    // plannerParams.indices.
+    if (!plannerParams.indexFiltersApplied && !hint.isEmpty()) {
+        std::vector<IndexEntry> temp =
+            QueryPlannerIXSelect::findIndexesByHint(hint, plannerParams.indices);
+        temp.swap(plannerParams.indices);
     }
 
     return plannerParams;

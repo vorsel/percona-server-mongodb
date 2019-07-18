@@ -465,16 +465,18 @@ bool ReplicationCoordinatorImpl::_startLoadLocalConfig(OperationContext* opCtx) 
 
     _replicationProcess->getConsistencyMarkers()->initializeMinValidDocument(opCtx);
 
+    fassert(51240, _externalState->createLocalLastVoteCollection(opCtx));
+
     StatusWith<LastVote> lastVote = _externalState->loadLocalLastVoteDocument(opCtx);
     if (!lastVote.isOK()) {
-        if (lastVote.getStatus() == ErrorCodes::NoMatchingDocument) {
-            log() << "Did not find local voted for document at startup.";
-        } else {
-            severe() << "Error loading local voted for document at startup; "
-                     << lastVote.getStatus();
-            fassertFailedNoTrace(40367);
-        }
-    } else {
+        severe() << "Error loading local voted for document at startup; " << lastVote.getStatus();
+        fassertFailedNoTrace(40367);
+    }
+    if (lastVote.getValue().getTerm() == OpTime::kInitialTerm) {
+        // This log line is checked in unit tests.
+        log() << "Did not find local initialized voted for document at startup.";
+    }
+    {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
         _topCoord->loadLastVote(lastVote.getValue());
     }
@@ -2044,7 +2046,10 @@ void ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
         ThreadWaiter waiter(lastAppliedOpTime, &waiterWriteConcern, &condVar);
         WaiterGuard guard(lk, &_replicationWaiterList, &waiter);
 
-        while (!_topCoord->attemptStepDown(
+        // If attemptStepDown() succeeds, we are guaranteed that no concurrent step up or
+        // step down can happen afterwards. So, it's safe to release the mutex before
+        // yieldLocksForPreparedTransactions().
+        while (!_topCoord->tryToStartStepDown(
             termAtStart, _replExecutor->now(), waitUntil, stepDownUntil, force)) {
 
             // The stepdown attempt failed. We now release the RSTL to allow secondaries to read the
@@ -2080,18 +2085,23 @@ void ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
 
             // We ignore the case where waitForConditionOrInterruptUntil returns
             // stdx::cv_status::timeout because in that case coming back around the loop and calling
-            // attemptStepDown again will cause attemptStepDown to return ExceededTimeLimit with
-            // the proper error message.
+            // tryToStartStepDown again will cause tryToStartStepDown to return ExceededTimeLimit
+            // with the proper error message.
             opCtx->waitForConditionOrInterruptUntil(
                 condVar, lk, std::min(stepDownUntil, waitUntil));
         }
     }
 
-    // Stepdown success!
+    // Prepare for unconditional stepdown success!
+    // We need to release the mutex before yielding locks for prepared transactions, which might
+    // check out sessions, to avoid deadlocks with checked-out sessions accessing this mutex.
+    lk.unlock();
 
-    // Yield locks for prepared transactions.
     yieldLocksForPreparedTransactions(opCtx);
+
+    lk.lock();
     _updateAndLogStatsOnStepDown(&arsd);
+    _topCoord->finishUnconditionalStepDown();
 
     onExitGuard.dismiss();
     updateMemberState();
@@ -2308,7 +2318,7 @@ HostAndPort ReplicationCoordinatorImpl::getMyHostAndPort() const {
 
 int ReplicationCoordinatorImpl::_getMyId_inlock() const {
     const MemberConfig& self = _rsConfig.getMemberAt(_selfIndex);
-    return self.getId();
+    return self.getId().getData();
 }
 
 Status ReplicationCoordinatorImpl::resyncData(OperationContext* opCtx, bool waitUntilCompleted) {
@@ -2659,7 +2669,14 @@ void ReplicationCoordinatorImpl::_finishReplSetReconfig(OperationContext* opCtx,
         if (_topCoord->isSteppingDownUnconditionally()) {
             invariant(opCtx->lockState()->isRSTLExclusive());
             log() << "stepping down from primary, because we received a new config";
+            // We need to release the mutex before yielding locks for prepared transactions, which
+            // might check out sessions, to avoid deadlocks with checked-out sessions accessing
+            // this mutex.
+            lk.unlock();
+
             yieldLocksForPreparedTransactions(opCtx);
+
+            lk.lock();
             _updateAndLogStatsOnStepDown(&arsd.get());
         } else {
             // Release the rstl lock as the node might have stepped down due to
@@ -3577,11 +3594,17 @@ void ReplicationCoordinatorImpl::_setStableTimestampForStorage(WithLock lk) {
                                                  stableOpTime->opTime.getTimestamp());
                 }
             } else {
-                // When majority read concern is disabled, the stable optime may be ahead of the
-                // commit point, so we set the committed snapshot to the commit point.
                 const auto lastCommittedOpTime = _topCoord->getLastCommittedOpTimeAndWallTime();
                 if (!lastCommittedOpTime.opTime.isNull()) {
-                    _updateCommittedSnapshot_inlock(lastCommittedOpTime);
+                    // When majority read concern is disabled, we set the stable timestamp to
+                    // be less than or equal to the all committed timestamp. This makes sure that
+                    // the committed snapshot is not past the all committed timestamp to guarantee
+                    // we can always read our own majority committed writes. This problem is
+                    // specific to the case where we have a single node replica set and the
+                    // lastCommittedOpTime is set to be the lastApplied which can be ahead of the
+                    // allCommitted.
+                    auto newCommittedSnapshot = std::min(lastCommittedOpTime, *stableOpTime);
+                    _updateCommittedSnapshot_inlock(newCommittedSnapshot);
                 }
                 // Set the stable timestamp regardless of whether the majority commit point moved
                 // forward.

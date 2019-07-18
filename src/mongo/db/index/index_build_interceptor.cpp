@@ -256,8 +256,8 @@ Status IndexBuildInterceptor::_applyWrite(OperationContext* opCtx,
     if (opType == Op::kInsert) {
         InsertResult result;
         auto status = accessMethod->insertKeys(opCtx,
-                                               keySet,
-                                               SimpleBSONObjComparator::kInstance.makeBSONObjSet(),
+                                               {keySet.begin(), keySet.end()},
+                                               {},
                                                MultikeyPaths{},
                                                opRecordId,
                                                options,
@@ -283,7 +283,8 @@ Status IndexBuildInterceptor::_applyWrite(OperationContext* opCtx,
         DEV invariant(strcmp(operation.getStringField("op"), "d") == 0);
 
         int64_t numDeleted;
-        Status s = accessMethod->removeKeys(opCtx, keySet, opRecordId, options, &numDeleted);
+        Status s = accessMethod->removeKeys(
+            opCtx, {keySet.begin(), keySet.end()}, opRecordId, options, &numDeleted);
         if (!s.isOK()) {
             return s;
         }
@@ -338,12 +339,15 @@ bool IndexBuildInterceptor::areAllWritesApplied(OperationContext* opCtx) const {
     // The table is empty only when all writes are applied.
     if (!record) {
         auto writesRecorded = _sideWritesCounter.load();
-        invariant(writesRecorded == _numApplied,
-                  str::stream() << "The number of side writes recorded does not match the number "
-                                   "applied, despite the table appearing empty. Writes recorded: "
-                                << writesRecorded
-                                << ", applied: "
-                                << _numApplied);
+        if (writesRecorded != _numApplied) {
+            const std::string message = str::stream()
+                << "The number of side writes recorded does not match the number "
+                   "applied, despite the table appearing empty. Writes recorded: "
+                << writesRecorded << ", applied: " << _numApplied;
+
+            dassert(writesRecorded == _numApplied, message);
+            warning() << message;
+        }
         return true;
     }
 
@@ -356,36 +360,22 @@ boost::optional<MultikeyPaths> IndexBuildInterceptor::getMultikeyPaths() const {
 }
 
 Status IndexBuildInterceptor::sideWrite(OperationContext* opCtx,
-                                        IndexAccessMethod* indexAccessMethod,
-                                        const BSONObj* obj,
-                                        const InsertDeleteOptions& options,
+                                        const std::vector<BSONObj>& keys,
+                                        const BSONObjSet& multikeyMetadataKeys,
+                                        const MultikeyPaths& multikeyPaths,
                                         RecordId loc,
                                         Op op,
                                         int64_t* const numKeysOut) {
     invariant(opCtx->lockState()->inAWriteUnitOfWork());
 
-    *numKeysOut = 0;
-    BSONObjSet keys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-    BSONObjSet multikeyMetadataKeys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-    MultikeyPaths multikeyPaths;
-
-    // Override key constraints when generating keys for removal. This is the same behavior as
-    // IndexAccessMethod::remove and only applies to keys that do not apply to a partial filter
-    // expression.
-    const auto getKeysMode = op == Op::kInsert
-        ? options.getKeysMode
-        : IndexAccessMethod::GetKeysMode::kRelaxConstraintsUnfiltered;
-    indexAccessMethod->getKeys(*obj, getKeysMode, &keys, &multikeyMetadataKeys, &multikeyPaths);
-
     // Maintain parity with IndexAccessMethods handling of key counting. Only include
     // `multikeyMetadataKeys` when inserting.
     *numKeysOut = keys.size() + (op == Op::kInsert ? multikeyMetadataKeys.size() : 0);
 
-    if (*numKeysOut == 0) {
-        return Status::OK();
-    }
-
-    {
+    if (op == Op::kInsert) {
+        // SERVER-39705: It's worth noting that a document may not generate any keys, but be
+        // described as being multikey. This step must be done to maintain parity with `validate`s
+        // expectations.
         stdx::unique_lock<stdx::mutex> lk(_multikeyPathMutex);
         if (_multikeyPaths) {
             MultikeyPathTracker::mergeMultikeyPaths(&_multikeyPaths.get(), multikeyPaths);
@@ -394,6 +384,10 @@ Status IndexBuildInterceptor::sideWrite(OperationContext* opCtx,
             // "shape". Initialize `_multikeyPaths` with the right shape from the first result.
             _multikeyPaths = multikeyPaths;
         }
+    }
+
+    if (*numKeysOut == 0) {
+        return Status::OK();
     }
 
     std::vector<BSONObj> toInsert;

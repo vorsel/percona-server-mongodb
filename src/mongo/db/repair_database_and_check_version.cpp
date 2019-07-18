@@ -34,7 +34,6 @@
 #include "repair_database_and_check_version.h"
 
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/create_collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
@@ -49,8 +48,10 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repair_database.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl_set_member_in_standalone_mode.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/storage_repair_observer.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/util/exit.h"
@@ -136,10 +137,11 @@ Status restoreMissingFeatureCompatibilityVersionDocument(OperationContext* opCtx
  * Returns true if the collection associated with the given CollectionCatalogEntry has an index on
  * the _id field
  */
-bool checkIdIndexExists(OperationContext* opCtx, const CollectionCatalogEntry* catalogEntry) {
-    auto indexCount = catalogEntry->getTotalIndexCount(opCtx);
+bool checkIdIndexExists(OperationContext* opCtx, const NamespaceString& nss) {
+    auto durableCatalog = DurableCatalog::get(opCtx);
+    auto indexCount = durableCatalog->getTotalIndexCount(opCtx, nss);
     auto indexNames = std::vector<std::string>(indexCount);
-    catalogEntry->getAllIndexes(opCtx, &indexNames);
+    durableCatalog->getAllIndexes(opCtx, nss, &indexNames);
 
     for (auto name : indexNames) {
         if (name == "_id_") {
@@ -208,14 +210,13 @@ Status ensureCollectionProperties(OperationContext* opCtx,
 
             // All user-created replicated collections created since MongoDB 4.0 have _id indexes.
             auto requiresIndex = coll->requiresIdIndex() && coll->ns().isReplicated();
-            auto catalogEntry = coll->getCatalogEntry();
-            auto collOptions = catalogEntry->getCollectionOptions(opCtx);
+            auto collOptions = DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, coll->ns());
             auto hasAutoIndexIdField = collOptions.autoIndexId == CollectionOptions::YES;
 
             // Even if the autoIndexId field is not YES, the collection may still have an _id index
             // that was created manually by the user. Check the list of indexes to confirm index
             // does not exist before attempting to build it or returning an error.
-            if (requiresIndex && !hasAutoIndexIdField && !checkIdIndexExists(opCtx, catalogEntry)) {
+            if (requiresIndex && !hasAutoIndexIdField && !checkIdIndexExists(opCtx, coll->ns())) {
                 log() << "collection " << coll->ns() << " is missing an _id index; building it now";
                 auto status = buildMissingIdIndex(opCtx, coll);
                 if (!status.isOK()) {
@@ -276,15 +277,8 @@ void rebuildIndexes(OperationContext* opCtx, StorageEngine* storageEngine) {
     for (auto&& indexNamespace : indexesToRebuild) {
         NamespaceString collNss(indexNamespace.first);
         const std::string& indexName = indexNamespace.second;
-
-        CollectionCatalogEntry* cce =
-            CollectionCatalog::get(opCtx).lookupCollectionCatalogEntryByNamespace(collNss);
-        invariant(cce,
-                  str::stream() << "couldn't get collection catalog entry for collection "
-                                << collNss.toString());
-
         auto swIndexSpecs = getIndexNameObjs(
-            opCtx, cce, [&indexName](const std::string& name) { return name == indexName; });
+            opCtx, collNss, [&indexName](const std::string& name) { return name == indexName; });
         if (!swIndexSpecs.isOK() || swIndexSpecs.getValue().first.empty()) {
             fassert(40590,
                     {ErrorCodes::InternalError,
@@ -306,14 +300,13 @@ void rebuildIndexes(OperationContext* opCtx, StorageEngine* storageEngine) {
     for (const auto& entry : nsToIndexNameObjMap) {
         NamespaceString collNss(entry.first);
 
-        auto collCatalogEntry =
-            CollectionCatalog::get(opCtx).lookupCollectionCatalogEntryByNamespace(collNss);
+        auto collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(collNss);
         for (const auto& indexName : entry.second.first) {
             log() << "Rebuilding index. Collection: " << collNss << " Index: " << indexName;
         }
 
         std::vector<BSONObj> indexSpecs = entry.second.second;
-        fassert(40592, rebuildIndexesOnCollection(opCtx, collCatalogEntry, indexSpecs));
+        fassert(40592, rebuildIndexesOnCollection(opCtx, collection, indexSpecs));
     }
 }
 
@@ -572,9 +565,16 @@ bool repairDatabasesAndCheckVersion(OperationContext* opCtx) {
         }
     }
 
+    auto replProcess = repl::ReplicationProcess::get(opCtx);
+    auto needInitialSync = false;
+    if (auto initialSyncFlag = false; replProcess) {
+        initialSyncFlag = replProcess->getConsistencyMarkers()->getInitialSyncFlag(opCtx);
+        // The node did not complete the last initial sync. We should attempt initial sync again.
+        needInitialSync = initialSyncFlag && replSettings.usingReplSets();
+    }
     // Fail to start up if there is no featureCompatibilityVersion document and there are non-local
-    // databases present.
-    if (!fcvDocumentExists && nonLocalDatabases) {
+    // databases present and we do not need to start up via initial sync.
+    if (!fcvDocumentExists && nonLocalDatabases && !needInitialSync) {
         severe()
             << "Unable to start up mongod due to missing featureCompatibilityVersion document.";
         severe() << "Please run with --repair to restore the document.";
