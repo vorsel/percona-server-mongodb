@@ -3,7 +3,8 @@
 function getPython3Binary() {
     'use strict';
 
-    let cmd = '/opt/mongodbtoolchain/v3/bin/python3';
+    //let cmd = '/opt/mongodbtoolchain/v3/bin/python3';
+    let cmd = '/usr/bin/python3';
     if (_isWindows()) {
         const paths = ["c:/python36/python.exe", "c:/python/python36/python.exe"];
         for (let p of paths) {
