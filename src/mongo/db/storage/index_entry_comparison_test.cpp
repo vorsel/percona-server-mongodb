@@ -27,34 +27,38 @@
  *    it in the license file.
  */
 
-#pragma once
+#include "mongo/platform/basic.h"
 
-#include "mongo/db/namespace_string.h"
-#include "mongo/db/operation_context.h"
+#include "mongo/db/storage/duplicate_key_error_info.h"
+#include "mongo/db/storage/index_entry_comparison.h"
+#include "mongo/unittest/unittest.h"
 
 namespace mongo {
 
-namespace IndexTimestampHelper {
+TEST(IndexEntryComparison, BuildDupKeyErrorStatusProducesExpectedErrorObject) {
+    NamespaceString collNss("test.foo");
+    std::string indexName("a_1_b_1");
+    auto keyPattern = BSON("a" << 1 << "b" << 1);
+    auto keyValue = BSON("" << 10 << ""
+                            << "abc");
 
-/**
- * If required, sets a timestamp on an active WriteUnitOfWork. A ghost write is when the
- * operation is not committed with an oplog entry, which may be necessary for certain index
- * build operations not associated with a unique optime. This implementation uses the
- * lastApplied OpTime.
- *
- * May throw a WriteConflictException if the timestamp chosen is too old.
- */
-void setGhostCommitTimestampForWrite(OperationContext* opCtx, const NamespaceString& nss);
+    auto dupKeyStatus = buildDupKeyErrorStatus(keyValue, collNss, indexName, keyPattern);
+    ASSERT_NOT_OK(dupKeyStatus);
+    ASSERT_EQUALS(dupKeyStatus.code(), ErrorCodes::DuplicateKey);
 
-/**
- * If required, sets a timestamp on an active WriteUnitOfWork for a catalog write. A ghost write
- * is when the operation is not committed with an oplog entry, which may be necessary for
- * certain index catalog operations not associated with a unique optime. This implementation
- * uses the LogicalClock to timestamp operations.
- * Returns true if a ghost timestamp was set, false if no timestamp was required to be set.  Can
- * also throw WriteConflictException.
- */
-bool setGhostCommitTimestampForCatalogWrite(OperationContext* opCtx, const NamespaceString& nss);
-};
+    auto extraInfo = dupKeyStatus.extraInfo<DuplicateKeyErrorInfo>();
+    ASSERT(extraInfo);
 
-}  // mongo
+    ASSERT_BSONOBJ_EQ(extraInfo->getKeyPattern(), keyPattern);
+
+    auto keyValueWithFieldName = BSON("a" << 10 << "b"
+                                          << "abc");
+    ASSERT_BSONOBJ_EQ(extraInfo->getDuplicatedKeyValue(), keyValueWithFieldName);
+
+    BSONObjBuilder objBuilder;
+    extraInfo->serialize(&objBuilder);
+    ASSERT_BSONOBJ_EQ(objBuilder.obj(),
+                      BSON("keyPattern" << keyPattern << "keyValue" << keyValueWithFieldName));
+}
+
+}  // namespace mongo

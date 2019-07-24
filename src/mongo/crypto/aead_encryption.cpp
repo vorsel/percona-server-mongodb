@@ -154,6 +154,25 @@ Status _aesDecrypt(const SymmetricKey& key,
                               << *resultLen};
     }
 
+    /* Check that padding was removed.
+     *
+     * PKCS7 padding guarantees that the encrypted payload has
+     * between 1 and blocksize bytes of padding which should be
+     * removed during the decrypt process.
+     *
+     * If resultLen is the same as the payload len,
+     * that means no padding was removed.
+     *
+     * macOS CommonCrypto will return such payloads when either the
+     * key or ciphertext are corrupted and its unable to find any
+     * expected padding.  It fails open by returning whatever it can.
+     */
+    if (*resultLen >= dataSize) {
+        return {ErrorCodes::BadValue,
+                "Decrypt error, plaintext is as large or larger than "
+                "the ciphertext. This usually indicates an invalid key."};
+    }
+
     return Status::OK();
 } catch (const AssertionException& ex) {
     return ex.toStatus();
@@ -196,28 +215,7 @@ Status aeadEncrypt(const SymmetricKey& key,
     DataRange dataLenBitsEncoded(dataLenBitsEncodedStorage);
     dataLenBitsEncoded.write<BigEndian<uint64_t>>(associatedDataLen * 8);
 
-    auto keySize = key.getKeySize();
-    if (keySize < kAeadAesHmacKeySize) {
-        return Status(ErrorCodes::BadValue,
-                      "AEAD encryption key too short. "
-                      "Must be either 64 or 96 bytes.");
-    }
-
     ConstDataRange aeadKey(key.getKey(), kAeadAesHmacKeySize);
-
-    if (key.getKeySize() == kAeadAesHmacKeySize) {
-        // local key store key encryption
-        return aeadEncryptWithIV(aeadKey,
-                                 in,
-                                 inLen,
-                                 nullptr,
-                                 0,
-                                 associatedData,
-                                 associatedDataLen,
-                                 dataLenBitsEncoded,
-                                 out,
-                                 outLen);
-    }
 
     if (key.getKeySize() != kFieldLevelEncryptionKeySize) {
         return Status(ErrorCodes::BadValue, "Invalid key size.");
@@ -233,8 +231,9 @@ Status aeadEncrypt(const SymmetricKey& key,
 
     ConstDataRange hmacCDR(nullptr, 0);
     SHA512Block hmacOutput;
-    if (static_cast<int>(associatedData[0]) ==
-        FleAlgorithmInt_serializer(FleAlgorithmInt::kDeterministic)) {
+    if (associatedData != nullptr &&
+        static_cast<int>(associatedData[0]) ==
+            FleAlgorithmInt_serializer(FleAlgorithmInt::kDeterministic)) {
         const uint8_t* ivKey = key.getKey() + kAeadAesHmacKeySize;
         hmacOutput = SHA512Block::computeHmac(ivKey,
                                               sym256KeySize,

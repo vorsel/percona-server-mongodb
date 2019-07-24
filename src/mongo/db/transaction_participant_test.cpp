@@ -42,6 +42,8 @@
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/storage_interface_impl.h"
+#include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/server_transactions_metrics.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/session_catalog_mongod.h"
@@ -227,9 +229,18 @@ class TxnParticipantTest : public MockReplCoordServerFixture {
 protected:
     void setUp() override {
         MockReplCoordServerFixture::setUp();
+        const auto service = opCtx()->getServiceContext();
+        auto _storageInterfaceImpl = std::make_unique<repl::StorageInterfaceImpl>();
+
+        // onStepUp() relies on the storage interface to create the config.transactions table.
+        repl::StorageInterface::set(service, std::move(_storageInterfaceImpl));
         MongoDSessionCatalog::onStepUp(opCtx());
 
-        const auto service = opCtx()->getServiceContext();
+        // We use the mocked storage interface here since StorageInterfaceImpl does not support
+        // getPointInTimeReadTimestamp().
+        auto _storageInterfaceMock = std::make_unique<repl::StorageInterfaceMock>();
+        repl::StorageInterface::set(service, std::move(_storageInterfaceMock));
+
         OpObserverRegistry* opObserverRegistry =
             dynamic_cast<OpObserverRegistry*>(service->getOpObserver());
         auto mockObserver = stdx::make_unique<OpObserverMock>();
@@ -757,51 +768,6 @@ TEST_F(TxnParticipantTest, ThrowDuringOnTransactionPrepareAbortsTransaction) {
                        ErrorCodes::OperationFailed);
     ASSERT_FALSE(_opObserver->transactionPrepared);
     ASSERT(txnParticipant.transactionIsAborted());
-}
-
-TEST_F(TxnParticipantTest, UnstashFailsShouldLeaveTxnResourceStashUnchanged) {
-    auto sessionCheckout = checkOutSession();
-    auto txnParticipant = TransactionParticipant::get(opCtx());
-
-    txnParticipant.unstashTransactionResources(opCtx(), "prepareTransaction");
-    ASSERT_TRUE(opCtx()->lockState()->isLocked());
-
-    // Simulate the locking of an insert.
-    {
-        Lock::DBLock dbLock(opCtx(), "test", MODE_IX);
-        Lock::CollectionLock collLock(opCtx(), NamespaceString("test.foo"), MODE_IX);
-    }
-
-    auto prepareTimestamp = txnParticipant.prepareTransaction(opCtx(), {});
-
-    // Simulate a secondary style lock stashing such that the locks are yielded.
-    {
-        repl::UnreplicatedWritesBlock uwb(opCtx());
-        opCtx()->lockState()->unsetMaxLockTimeout();
-        txnParticipant.stashTransactionResources(opCtx());
-    }
-    ASSERT_FALSE(txnParticipant.getTxnResourceStashLockerForTest()->isLocked());
-
-    // Enable fail point.
-    getGlobalFailPointRegistry()->getFailPoint("restoreLocksFail")->setMode(FailPoint::alwaysOn);
-
-    ASSERT_THROWS_CODE(txnParticipant.unstashTransactionResources(opCtx(), "commitTransaction"),
-                       AssertionException,
-                       ErrorCodes::LockTimeout);
-
-    // Above unstash attempt fail should leave the txnResourceStash unchanged.
-    ASSERT_FALSE(txnParticipant.getTxnResourceStashLockerForTest()->isLocked());
-
-    // Disable fail point.
-    getGlobalFailPointRegistry()->getFailPoint("restoreLocksFail")->setMode(FailPoint::off);
-
-    // Should be successfully able to perform lock restore.
-    txnParticipant.unstashTransactionResources(opCtx(), "commitTransaction");
-    ASSERT_TRUE(opCtx()->lockState()->isLocked());
-
-    // Commit the transaction to release the locks.
-    txnParticipant.commitPreparedTransaction(opCtx(), prepareTimestamp, boost::none);
-    ASSERT_TRUE(txnParticipant.transactionIsCommitted());
 }
 
 TEST_F(TxnParticipantTest, StepDownAfterPrepareDoesNotBlock) {
@@ -1566,6 +1532,9 @@ TEST_F(TxnParticipantTest, ReacquireLocksForPreparedTransactionsOnStepUp) {
 
     // Step-up will restore the locks of prepared transactions.
     ASSERT(opCtx()->writesAreReplicated());
+    const auto service = opCtx()->getServiceContext();
+    // onStepUp() relies on the storage interface to create the config.transactions table.
+    repl::StorageInterface::set(service, std::make_unique<repl::StorageInterfaceImpl>());
     MongoDSessionCatalog::onStepUp(opCtx());
     {
         auto sessionCheckout = checkOutSession({});
