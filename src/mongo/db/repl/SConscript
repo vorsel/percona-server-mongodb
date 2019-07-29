@@ -734,6 +734,16 @@ env.CppUnitTest(
 )
 
 env.CppUnitTest(
+    target='oplog_entry_test',
+    source=[
+        'oplog_entry_test.cpp',
+    ],
+    LIBDEPS=[
+        'idempotency_test_fixture',
+    ],
+)
+
+env.CppUnitTest(
     target='idempotency_document_structure_test',
     source=[
         'idempotency_document_structure_test.cpp',
@@ -753,6 +763,29 @@ env.CppUnitTest(
     ],
 )
 
+env.Library(
+    target='split_horizon',
+    source=[
+        'split_horizon.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/concurrency/lock_manager',
+        '$BUILD_DIR/mongo/util/net/network',
+    ],
+)
+
+env.CppUnitTest(
+    target='split_horizon_test',
+    source=[
+        'split_horizon_test.cpp',
+    ],
+    LIBDEPS=[
+        'split_horizon',
+    ],
+)
+
+
 env.Library('topology_coordinator',
             [
                 'heartbeat_response_action.cpp',
@@ -767,7 +800,10 @@ env.Library('topology_coordinator',
                 'repl_settings',
                 'rslog',
                 'repl_coordinator_interface',
-            ])
+            ],
+            LIBDEPS_PRIVATE=[
+                'split_horizon',
+            ],)
 
 env.CppUnitTest('repl_set_heartbeat_response_test',
                 'repl_set_heartbeat_response_test.cpp',
@@ -1027,7 +1063,8 @@ env.Library('replica_set_messages',
                 '$BUILD_DIR/mongo/rpc/command_status',
                 'optime',
                 'read_concern_args',
-            ])
+                'split_horizon',
+            ],)
 
 env.CppUnitTest('repl_set_config_test',
                 [
@@ -1561,6 +1598,7 @@ env.Library(
         'repl_coordinator_interface',
         'repl_settings',
         'replica_set_messages',
+        'split_horizon',
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/commands/server_status',
@@ -1632,4 +1670,19 @@ env.Library(
         'replmocks',
         '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
     ]
+)
+
+env.Library(
+    target='replication_metrics',
+    source=[
+        'replication_metrics.cpp',
+        env.Idlc('replication_metrics.idl')[0],
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/commands/server_status',
+        '$BUILD_DIR/mongo/db/service_context',
+    ],
 )

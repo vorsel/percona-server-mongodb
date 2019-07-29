@@ -253,7 +253,7 @@ variables:
   - func: "clear OOM messages"
   - command: manifest.load
   - func: "git get project"
-  - func: "get modified patch files"
+  - func: "get all modified patch files"
   # NOTE: To disable the compile bypass feature, comment out the next line.
   #
   - func: "bypass compile and fetch binaries"
@@ -757,50 +757,53 @@ functions:
         # If the android toolchain has not been setup the android sdk will not
         # be available and we should not build the android version of mongodb
         # embedded.
-        if [ "${setup_android_toolchain|}" = "true" ]; then
-            export ANDROID_HOME=$(pwd)/android_sdk
+        if [ "${setup_android_toolchain|}" != "true" ]; then
+            echo "Android toolchain has not been setup, skipping \"build java embedded sdk\""
+            exit 0
+        fi
 
-            cd src/src/mongo/embedded/mongo_embedded/java
+        export ANDROID_HOME=$(pwd)/android_sdk
+        MINOR_VER=$(echo "${version}" | awk -F. '{print $(NF-1)}')
+        if [ $(($MINOR_VER % 2)) != 0 ]; then
+            EMBEDDED_RELEASE_VERSION="${version}-SNAPSHOT"
+        else
+            EMBEDDED_RELEASE_VERSION="${version}"
+        fi
 
-            # TODO: Clean this up later where we can remove duplication
-            if [ ${package_type|embedded-android} = "embedded-jar" ]; then
-                tar zxvf ../../../../../../embedded-sdk-java-linux-x86-64.tgz
-                mkdir -p jniLibs/linux-x86-64
-                cp ./mongo-embedded-sdk-${version}/lib/libmongo_embedded.so jniLibs/linux-x86-64
+        cd src/src/mongo/embedded/mongo_embedded/java
+
+        # TODO: Clean this up later where we can remove duplication
+        if [ "${package_type|embedded-android}" = "embedded-jar" ]; then
+            tar zxvf ../../../../../../embedded-sdk-java-linux-x86-64.tgz
+            mkdir -p jniLibs/linux-x86-64
+            cp ./mongo-embedded-sdk-${version}/lib/libmongo_embedded.so jniLibs/linux-x86-64
+            rm -rf ./mongo-embedded-sdk-${version}
+
+            tar zxvf ../../../../../../embedded-sdk-java-darwin.tgz
+            mkdir -p jniLibs/darwin
+            cp ./mongo-embedded-sdk-${version}/lib/libmongo_embedded.dylib jniLibs/darwin
+            rm -rf ./mongo-embedded-sdk-${version}
+
+            ./gradlew clean :embedded-jar:build :embedded-jar:publishMavenPublicationToLocalRepository
+
+            mkdir -p ../../../../../build/mongo-embedded-sdk-$EMBEDDED_RELEASE_VERSION/java
+            cp -r embedded-jar/build/repo/* ../../../../../build/mongo-embedded-sdk-$EMBEDDED_RELEASE_VERSION/java
+        else
+            for arch in arm64-v8a armeabi-v7a x86_64 ; do
+                tar zxvf ../../../../../../embedded-sdk-android-$arch.tgz
+                mkdir -p jniLibs/$arch
+                cp ./mongo-embedded-sdk-${version}/lib/libmongo_embedded.so jniLibs/$arch
                 rm -rf ./mongo-embedded-sdk-${version}
+            done
 
-                tar zxvf ../../../../../../embedded-sdk-java-darwin.tgz
-                mkdir -p jniLibs/darwin
-                cp ./mongo-embedded-sdk-${version}/lib/libmongo_embedded.dylib jniLibs/darwin
-                rm -rf ./mongo-embedded-sdk-${version}
-
-                ./gradlew clean :embedded-jar:build :embedded-jar:publishMavenPublicationToLocalRepository
-
-                # Is this a release?
-                if [ "${is_release|false}" = "true" ]; then
-                    source ./artifactory_mobile_creds.sh
-                    ./gradlew --info :embedded-jar:artifactoryPublish
-                fi
-
-                mkdir -p ../../../../../build/mongo-embedded-sdk-${version}/java
-                cp -r embedded-jar/build/repo/* ../../../../../build/mongo-embedded-sdk-${version}/java
-            else
-                for arch in arm64-v8a armeabi-v7a x86_64 ; do
-                    tar zxvf ../../../../../../embedded-sdk-android-$arch.tgz
-                    mkdir -p jniLibs/$arch
-                    cp ./mongo-embedded-sdk-${version}/lib/libmongo_embedded.so jniLibs/$arch
-                    rm -rf ./mongo-embedded-sdk-${version}
-                done
-
-                ./gradlew clean :embedded-android:build
-                # Is this a release?
-                if [ "${is_release|false}" = "true" ]; then
-                    ./gradlew :embedded-android:uploadArchives closeAndReleaseRepository
-                fi
-
-                mkdir -p ../../../../../build/mongo-embedded-sdk-${version}/android
-                cp -r embedded-android/build/repo/* ../../../../../build/mongo-embedded-sdk-${version}/android
+            ./gradlew clean :embedded-android:build
+            # Is this a release?
+            if [ "${is_release|false}" = "true" ]; then
+                ./gradlew :embedded-android:uploadArchives closeAndReleaseRepository
             fi
+
+            mkdir -p ../../../../../build/mongo-embedded-sdk-$EMBEDDED_RELEASE_VERSION/android
+            cp -r embedded-android/build/outputs/aar/* ../../../../../build/mongo-embedded-sdk-$EMBEDDED_RELEASE_VERSION/android
         fi
 
   "scons cache pruning" :
@@ -870,7 +873,7 @@ functions:
         mkdir -p ../../../../../../mongo-tools/distsrc
         cp THIRD-PARTY-NOTICES ../../../../../../mongo-tools/distsrc/THIRD-PARTY-NOTICES.gotools
 
-  "get modified patch files" :
+  "get all modified patch files":
     command: shell.exec
     params:
       working_dir: src
@@ -891,7 +894,24 @@ functions:
           fi
         fi
 
-  "determine resmoke jobs" : &determine_resmoke_jobs
+  # This function should only be called from patch-build-only tasks.
+  "get added and modified patch files":
+    command: shell.exec
+    params:
+      working_dir: src
+      shell: bash
+      script: |
+        set -o verbose
+        set -o errexit
+
+        git diff HEAD --name-only --line-prefix="${workdir}/src/" --diff-filter=d >> modified_and_created_patch_files.txt
+        if [ -d src/mongo/db/modules/enterprise ]; then
+          pushd src/mongo/db/modules/enterprise
+          git diff HEAD --name-only --line-prefix="${workdir}/src/src/mongo/db/modules/enterprise/" --diff-filter=d >> ~1/modified_and_created_patch_files.txt
+          popd
+        fi
+
+  "determine resmoke jobs": &determine_resmoke_jobs
     command: shell.exec
     params:
       working_dir: src
@@ -1232,6 +1252,7 @@ functions:
 
     - command: generate.tasks
       params:
+        optional: true
         files:
           - src/generated_resmoke_config/${task}.json
 
@@ -1546,6 +1567,55 @@ functions:
         files:
           - src/generated_resmoke_config/${name}.json
 
+  "setup jstestfuzz":
+    - command: shell.exec
+      params:
+        working_dir: src
+        shell: bash
+        script: |
+          set -o errexit
+          set -o verbose
+
+          ${add_nodejs_to_path}
+
+          git clone git@github.com:10gen/jstestfuzz.git
+
+          pushd jstestfuzz
+            npm install
+            npm run prepare
+          popd
+
+  "lint fuzzer sanity patch":
+    - command: shell.exec
+      type: test
+      params:
+        working_dir: src
+        shell: bash
+        script: |
+          set -eo pipefail
+          set -o verbose
+
+          ${add_nodejs_to_path}
+
+          # Run parse-jsfiles on 50 files at a time with 32 processes in parallel.
+          # Grep returns 1 if it fails to find a match.
+          (grep "\.js$" modified_and_created_patch_files.txt || true) | xargs -P 32 -L 50 npm run --prefix jstestfuzz parse-jsfiles --
+
+  "lint fuzzer sanity all":
+    - command: shell.exec
+      type: test
+      params:
+        working_dir: src
+        shell: bash
+        script: |
+          set -eo pipefail
+          set -o verbose
+
+          ${add_nodejs_to_path}
+
+          # Run parse-jsfiles on 50 files at a time with 32 processes in parallel.
+          find "$PWD/jstests" "$PWD/src/mongo/db/modules/enterprise" -name "*.js" -print | xargs -P 32 -L 50 npm run --prefix jstestfuzz parse-jsfiles --
+
   "run jstestfuzz":
     - command: shell.exec
       params:
@@ -1554,39 +1624,10 @@ functions:
           set -o errexit
           set -o verbose
 
-          git clone git@github.com:10gen/jstestfuzz.git
-
           cp mongodb*/bin/mongod .
-
-    - command: shell.exec
-      params:
-        working_dir: src
-        script: |
-          set -o errexit
-          set -o verbose
 
           git clone --depth 1 git@github.com:10gen/mongo-enterprise-modules.git jstests/enterprise_tests
           git clone --depth 1 git@github.com:10gen/QA.git jstests/qa_tests
-
-    - command: shell.exec
-      params:
-        working_dir: src/jstestfuzz
-        script: |
-          set -o errexit
-          set -o verbose
-
-          # Add node and npm binaries to PATH
-          if [ "Windows_NT" = "$OS" ]; then
-            # An "npm" directory might not have been created in %APPDATA% by the Windows installer.
-            # Work around the issue by specifying a different %APPDATA% path.
-            # See: https://github.com/nodejs/node-v0.x-archive/issues/8141
-            export APPDATA=${workdir}/npm-app-data
-            export PATH="$PATH:/cygdrive/c/Program Files (x86)/nodejs" # Windows location
-          else
-            export PATH="$PATH:/opt/node/bin"
-          fi
-
-          npm install
 
     - command: shell.exec
       type: test
@@ -1596,37 +1637,9 @@ functions:
           set -o errexit
           set -o verbose
 
-          # Add node and npm binaries to PATH
-          if [ "Windows_NT" = "$OS" ]; then
-            # An "npm" directory might not have been created in %APPDATA% by the Windows installer.
-            # Work around the issue by specifying a different %APPDATA% path.
-            # See: https://github.com/nodejs/node-v0.x-archive/issues/8141
-            export APPDATA=${workdir}/npm-app-data
-            export PATH="$PATH:/cygdrive/c/Program Files (x86)/nodejs" # Windows location
-          else
-            export PATH="$PATH:/opt/node/bin"
-          fi
+          ${add_nodejs_to_path}
 
-          echo "jstestfuzz self-tests are starting"
-          set +o errexit
-          npm test > npm_test.log 2>&1
-          if [ $? -ne 0 ]; then
-            echo "jstestfuzz self-tests failure"
-            branch=$(git symbolic-ref --short HEAD)
-            commit=$(git show -s --pretty=format:"%h - %an, %ar: %s")
-            echo "Git branch: $branch, commit: $commit"
-            which node
-            node --version
-            which npm
-            npm --version
-            cat npm_test.log
-            exit 1
-          fi
-          rm -f npm_test.log
-          set -o errexit
-          echo "jstestfuzz self-tests finished"
-
-          npm run ${npm_command|jstestfuzz} -- ${jstestfuzz_vars}
+          npm run ${npm_command|jstestfuzz} -- ${jstestfuzz_vars} --branch ${branch_name}
 
     - command: archive.targz_pack
       params:
@@ -2189,7 +2202,10 @@ functions:
           cmds="$cmds;    fi"
           cmds="$cmds; else echo Cannot change the core pattern and no core dumps will be generated."
           cmds="$cmds; fi"
-          cmds="$cmds; $sudo reboot"
+          # The following line for restarting the machine is based on
+          # https://unix.stackexchange.com/a/349558 in order to ensure the ssh client gets a
+          # response from the remote machine before it restarts.
+          cmds="$cmds; nohup $sudo reboot &>/dev/null & exit"
           ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
           ${activate_virtualenv}
           $python buildscripts/remote_operations.py          \
@@ -2636,6 +2652,20 @@ functions:
             fi
           fi
           echo "python set to $(which $python)"
+      - key: add_nodejs_to_path
+        value: |
+          # Add node and npm binaries to PATH
+          if [ "Windows_NT" = "$OS" ]; then
+            # An "npm" directory might not have been created in %APPDATA% by the Windows installer.
+            # Work around the issue by specifying a different %APPDATA% path.
+            # See: https://github.com/nodejs/node-v0.x-archive/issues/8141
+            export APPDATA=${workdir}/npm-app-data
+            export PATH="$PATH:/cygdrive/c/Program Files (x86)/nodejs" # Windows location
+            # TODO: this is to work around BUILD-8652
+            cd "$(pwd -P | sed 's,cygdrive/c/,cygdrive/z/,')"
+          else
+            export PATH="$PATH:/opt/node/bin"
+          fi
       - key: posix_workdir
         value: eval 'if [ "Windows_NT" = "$OS" ]; then echo $(cygpath -u "${workdir}"); else echo ${workdir}; fi'
       # For ssh disable the options GSSAPIAuthentication, CheckHostIP, StrictHostKeyChecking
@@ -3748,6 +3778,8 @@ tasks:
     - func: "get buildnumber"
     - func: "set up credentials"
     - func: "setup android toolchain" # noop if ${setup_android_toolchain} is not "true"
+    - func: "set task expansion macros"
+    - func: "set up virtualenv"
     - func: "generate compile expansions"
     - func: "apply compile expansions"
     - command: s3.get
@@ -3779,9 +3811,16 @@ tasks:
           set -o errexit
           set -o verbose
 
+          MINOR_VER=$(echo "${version}" | awk -F. '{print $(NF-1)}')
+          if [ $(($MINOR_VER % 2)) != 0 ]; then
+            EMBEDDED_RELEASE_VERSION="${version}-SNAPSHOT"
+          else
+            EMBEDDED_RELEASE_VERSION="${version}"
+          fi
+
           if [ "${setup_android_toolchain|}" = "true" ]; then
             cd src/build
-            tar zcvf mongo-embedded-sdk-${version}.tgz mongo-embedded-sdk-${version}
+            tar zcvf mongo-embedded-sdk-${version}.tgz mongo-embedded-sdk-$EMBEDDED_RELEASE_VERSION
           fi
     - command: s3.put
       params:
@@ -3857,9 +3896,16 @@ tasks:
           set -o errexit
           set -o verbose
 
+          MINOR_VER=$(echo "${version}" | awk -F. '{print $(NF-1)}')
+          if [ $(($MINOR_VER % 2)) != 0 ]; then
+            EMBEDDED_RELEASE_VERSION="${version}-SNAPSHOT"
+          else
+            EMBEDDED_RELEASE_VERSION="${version}"
+          fi
+
           if [ "${setup_android_toolchain|}" = "true" ]; then
             cd src/build
-            tar zcvf mongo-embedded-sdk-${version}.tgz mongo-embedded-sdk-${version}
+            tar zcvf mongo-embedded-sdk-${version}.tgz mongo-embedded-sdk-$EMBEDDED_RELEASE_VERSION
           fi
     - command: s3.put
       params:
@@ -4257,9 +4303,6 @@ tasks:
         script: |
           set -o errexit
           set -o verbose
-
-          echo "Releases disabled on master."
-          exit 0
 
           if [ "${is_release|false}" != "true" ]; then
               echo "Not a release build"
@@ -4912,6 +4955,26 @@ tasks:
       jstestfuzz_vars: --jsTestsDir ../jstests
       resmoke_args: --suites=jstestfuzz_sharded_session --storageEngine=wiredTiger
       name: jstestfuzz_sharded_session
+
+# Check that the mutational fuzzer can parse JS files modified in a patch build.
+- name: lint_fuzzer_sanity_patch
+  patch_only: true
+  commands:
+  - command: manifest.load
+  - func: "git get project"
+  - func: "set task expansion macros"
+  - func: "get added and modified patch files"
+  - func: "setup jstestfuzz"
+  - func: "lint fuzzer sanity patch"
+
+# Check that the mutational fuzzer can parse all JS filess.
+- name: lint_fuzzer_sanity_all
+  commands:
+  - command: manifest.load
+  - func: "git get project"
+  - func: "set task expansion macros"
+  - func: "setup jstestfuzz"
+  - func: "lint fuzzer sanity all"
 
 ## integration test suites ##
 
@@ -7634,6 +7697,27 @@ buildvariants:
   - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_gen
   - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_gen
   - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_gen
+  - name: powercycle
+    distros:
+    - ubuntu1604-powercycle
+  - name: powercycle_fcv3.6
+    distros:
+    - ubuntu1604-powercycle
+  - name: powercycle_kill_mongod
+    distros:
+    - ubuntu1604-powercycle
+  - name: powercycle_replication
+    distros:
+    - ubuntu1604-powercycle
+  - name: powercycle_replication_smalloplog
+    distros:
+    - ubuntu1604-powercycle
+  - name: powercycle_syncdelay
+    distros:
+    - ubuntu1604-powercycle
+  - name: powercycle_write_concern_majority
+    distros:
+    - ubuntu1604-powercycle
   - name: replica_sets
   - name: replica_sets_auth_gen
   - name: replica_sets_jscore_passthrough
@@ -9501,7 +9585,7 @@ buildvariants:
     enable_embedded_tests: android_emulator
     setup_android_toolchain: true
     android_toolchain_system_image_arch: "armeabi-v7a"
-    android_system_image_version: "21"
+    android_system_image_version: "24"
     android_toolchain_target_arch: "arm"
     android_toolchain_api_version: "21"
     dump_scons_config_on_failure: true
@@ -9584,7 +9668,7 @@ buildvariants:
     enable_embedded_tests: android_emulator
     setup_android_toolchain: true
     android_toolchain_system_image_arch: "x86_64"
-    android_system_image_version: "21"
+    android_system_image_version: "24"
     android_toolchain_target_arch: "x86_64"
     android_toolchain_api_version: "21"
     dump_scons_config_on_failure: true
@@ -9600,7 +9684,7 @@ buildvariants:
     compile_env: JAVA_HOME=/opt/java/jdk8/
     setup_android_toolchain: true
     android_toolchain_system_image_arch: "x86_64"
-    android_system_image_version: 21
+    android_system_image_version: 24
     android_toolchain_target_arch: "x86_64"
     android_toolchain_api_version: "21"
   tasks:
@@ -9615,7 +9699,7 @@ buildvariants:
     compile_env: JAVA_HOME=/opt/java/jdk8/
     setup_android_toolchain: true
     android_toolchain_system_image_arch: "x86_64"
-    android_system_image_version: 21
+    android_system_image_version: 24
     android_toolchain_target_arch: "x86_64"
     android_toolchain_api_version: "21"
   tasks:
@@ -9661,12 +9745,14 @@ buildvariants:
     requires:
     - name: burn_in_tests
     - name: lint
+    - name: lint_fuzzer_sanity_patch
     distros:
     - rhel62-large
   - name: compile_benchmarks
     distros:
     - rhel62-large
   - name: lint
+  - name: lint_fuzzer_sanity_patch
   - name: burn_in_tests
     distros:
     - rhel62-large
@@ -12683,17 +12769,18 @@ buildvariants:
     - ubuntu1604-build
 
 - name: tig-daily-cron
+  modules:
+  - enterprise
   display_name: "~ TIG Daily Cron"
   run_on:
-  - rhel62-large
+  - rhel62-small
   batchtime: 1440 # 1 day
   stepback: false
   tasks:
 # Test lifecycle is temporarily disabled to reduce load on Evergreen API.
 # - name: update_test_lifecycle
   - name: fetch_test_lifecycle
-    distros:
-    - rhel62-small
+  - name: lint_fuzzer_sanity_all
 
 - name: enterprise-rhel-62-64-bit-mmapv1
   display_name: Enterprise RHEL 6.2 MMAPv1

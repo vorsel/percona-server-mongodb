@@ -629,6 +629,10 @@ WiredTigerRecordStore::WiredTigerRecordStore(WiredTigerKVEngine* kvEngine,
       _engineName(params.engineName),
       _isCapped(params.isCapped),
       _isEphemeral(params.isEphemeral),
+      _isLogged(WiredTigerUtil::useTableLogging(
+          NamespaceString(ns()),
+          getGlobalReplSettings().usingReplSets() ||
+              repl::ReplSettings::shouldRecoverFromOplogAsStandalone())),
       _isOplog(NamespaceString::oplog(params.ns)),
       _cappedMaxSize(params.cappedMaxSize),
       _cappedMaxSizeSlack(std::min(params.cappedMaxSize / 10, int64_t(16 * 1024 * 1024))),
@@ -661,10 +665,7 @@ WiredTigerRecordStore::WiredTigerRecordStore(WiredTigerKVEngine* kvEngine,
     }
 
     if (!params.isReadOnly) {
-        bool replicatedWrites = getGlobalReplSettings().usingReplSets() ||
-            repl::ReplSettings::shouldRecoverFromOplogAsStandalone();
-        uassertStatusOK(WiredTigerUtil::setTableLogging(
-            ctx, _uri, WiredTigerUtil::useTableLogging(NamespaceString(ns()), replicatedWrites)));
+        uassertStatusOK(WiredTigerUtil::setTableLogging(ctx, _uri, _isLogged));
     }
 
     if (_isOplog) {
@@ -1377,8 +1378,40 @@ Status WiredTigerRecordStore::updateRecord(OperationContext* opCtx,
     }
 
     WiredTigerItem value(data, len);
-    c->set_value(c, value.Get());
-    ret = WT_OP_CHECK(c->insert(c));
+
+    // Check if we should modify rather than doing a full update.  Look for deltas for documents
+    // larger than 1KB, up to 16 changes representing up to 10% of the data.
+    //
+    // Skip modify for logged tables: don't trust WiredTiger's recovery with operations that are not
+    // idempotent.
+    const int kMinLengthForDiff = 1024;
+    const int kMaxEntries = 16;
+    const int kMaxDiffBytes = len / 10;
+
+    bool skip_update = false;
+    if (!_isLogged && len > kMinLengthForDiff && len <= old_length + kMaxDiffBytes) {
+        int nentries = kMaxEntries;
+        std::vector<WT_MODIFY> entries(nentries);
+
+        if ((ret = wiredtiger_calc_modify(
+                 c->session, &old_value, value.Get(), kMaxDiffBytes, entries.data(), &nentries)) ==
+            0) {
+            invariantWTOK(WT_OP_CHECK(nentries == 0 ? c->reserve(c)
+                                                    : c->modify(c, entries.data(), nentries)));
+            WT_ITEM new_value;
+            dassert(nentries == 0 ||
+                    (c->get_value(c, &new_value) == 0 && new_value.size == value.size &&
+                     memcmp(data, new_value.data, len) == 0));
+            skip_update = true;
+        } else if (ret != WT_NOTFOUND) {
+            invariantWTOK(ret);
+        }
+    }
+
+    if (!skip_update) {
+        c->set_value(c, value.Get());
+        ret = WT_OP_CHECK(c->insert(c));
+    }
     invariantWTOK(ret);
 
     _increaseDataSize(opCtx, len - old_length);
