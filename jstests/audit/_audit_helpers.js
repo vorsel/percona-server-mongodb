@@ -149,6 +149,7 @@ var loadAuditEventsIntoCollection = function(m, filename, dbname, collname, prim
                                                 db: dbname,
                                                 collection: collname,
                                                 drop: '',
+                                                legacy: '',
                                                 host: db.hostInfo().system.hostname,
                                                 file: filename,
                                             });
@@ -158,6 +159,7 @@ var loadAuditEventsIntoCollection = function(m, filename, dbname, collname, prim
                                                 db: dbname,
                                                 collection: collname,
                                                 drop: '',
+                                                legacy: '',
                                                 host: db.hostInfo().system.hostname,
                                                 file: filename,
                                             });
