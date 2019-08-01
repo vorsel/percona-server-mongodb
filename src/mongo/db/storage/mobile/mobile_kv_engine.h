@@ -129,7 +129,7 @@ public:
         _journalListener = jl;
     }
 
-    virtual Timestamp getAllCommittedTimestamp() const override {
+    virtual Timestamp getAllDurableTimestamp() const override {
         MONGO_UNREACHABLE;
     }
 
@@ -156,7 +156,7 @@ private:
     std::string _path;
     embedded::MobileOptions _options;
 
-    std::unique_ptr<PeriodicRunner::PeriodicJobHandle> _vacuumJob;
+    PeriodicJobAnchor _vacuumJob;
 };
 
 }  // namespace mongo

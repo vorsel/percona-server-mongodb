@@ -458,6 +458,26 @@ TEST_F(KeyStringTest, DecimalNumbers) {
     ROUNDTRIP(V1, BSON("" << BSONNULL << "" << BSON("a" << Decimal128::kPositiveInfinity)));
 }
 
+TEST_F(KeyStringTest, DoubleInvalidIntegerPartV0) {
+    // Test that an illegally encoded double throws an error.
+    const char* data =
+        // kNumericPositive7ByteInt
+        "\x31"
+        // Encode a 1 bit at the lowest end to indicate that this number has a fractional part.
+        // Then add the value 1 << 53 left-shifted by 1. 1 << 53 is too large to have been encoded
+        // as a  double, and will cause the call to toBsonSafe to fail.
+        "\x40\x00\x00\x00\x00\x00\x01";  // ((1 << 53) << 1) + 1
+    const size_t size = 8;
+
+    mongo::KeyString::TypeBits tb(mongo::KeyString::Version::V0);
+    tb.appendNumberDouble();
+
+    ASSERT_THROWS_CODE(
+        mongo::KeyString::toBsonSafe(data, size, mongo::Ordering::make(mongo::BSONObj()), tb),
+        AssertionException,
+        31209);
+}
+
 TEST_F(KeyStringTest, LotsOfNumbers1) {
     for (int i = 0; i < 64; i++) {
         int64_t x = 1LL << i;
@@ -504,7 +524,6 @@ TEST_F(KeyStringTest, LotsOfNumbers3) {
 
     for (double k = 0; k < 8; k++) {
         futures.push_back(stdx::async(stdx::launch::async, [k, this] {
-
             for (double i = -1100; i < 1100; i++) {
                 for (double j = 0; j < 52; j++) {
                     const auto V1 = KeyString::Version::V1;
@@ -726,10 +745,8 @@ const std::vector<BSONObj>& getInterestingElements(KeyString::Version version) {
         // Something with exceptional typeBits for Decimal
         elements.push_back(
             BSON("" << BSON_ARRAY("" << BSONSymbol("") << Decimal128::kNegativeInfinity
-                                     << Decimal128::kPositiveInfinity
-                                     << Decimal128::kPositiveNaN
-                                     << Decimal128("0.0000000")
-                                     << Decimal128("-0E1000"))));
+                                     << Decimal128::kPositiveInfinity << Decimal128::kPositiveNaN
+                                     << Decimal128("0.0000000") << Decimal128("-0E1000"))));
     }
 
     //

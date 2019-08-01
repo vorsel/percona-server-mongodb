@@ -57,9 +57,9 @@
 
 namespace mongo {
 
-using std::shared_ptr;
 using std::numeric_limits;
 using std::set;
+using std::shared_ptr;
 using std::string;
 using std::vector;
 
@@ -549,7 +549,7 @@ void Refresher::scheduleIsMaster(const HostAndPort& host, WithLock withLock) {
         _set->executor
             ->scheduleRemoteCommand(
                 std::move(request),
-                [ copy = *this, host, timer = Timer() ](
+                [copy = *this, host, timer = Timer()](
                     const executor::TaskExecutor::RemoteCommandCallbackArgs& result) mutable {
                     stdx::lock_guard<stdx::mutex> lk(copy._set->mutex);
                     // Ignore the reply and return if we are no longer the current scan. This might
@@ -679,7 +679,7 @@ void Refresher::receivedIsMaster(const HostAndPort& from,
             // and if this refresher has yet to find the replica set master, we add hosts listed in
             // the reply to the list of possible replica set members.
             if (!_scan->foundUpMaster) {
-                _scan->possibleNodes.insert(reply.normalHosts.begin(), reply.normalHosts.end());
+                _scan->possibleNodes.insert(reply.members.begin(), reply.members.end());
             }
         } else {
             error() << "replset name mismatch: expected \"" << _set->name << "\", "
@@ -690,8 +690,7 @@ void Refresher::receivedIsMaster(const HostAndPort& from,
         failedHost(from,
                    {ErrorCodes::InconsistentReplicaSetNames,
                     str::stream() << "Target replica set name " << reply.setName
-                                  << " does not match the monitored set name "
-                                  << _set->name});
+                                  << " does not match the monitored set name " << _set->name});
         return;
     }
 
@@ -769,12 +768,11 @@ Status Refresher::receivedIsMasterFromMaster(const HostAndPort& from, const IsMa
     // Reject if config version is older. This is for backwards compatibility with nodes in pv0
     // since they don't have the same ordering with pv1 electionId.
     if (reply.configVersion < _set->configVersion) {
-        return {ErrorCodes::NotMaster,
-                str::stream() << "Node " << from
-                              << " believes it is primary, but its config version "
-                              << reply.configVersion
-                              << " is older than the most recent config version "
-                              << _set->configVersion};
+        return {
+            ErrorCodes::NotMaster,
+            str::stream() << "Node " << from << " believes it is primary, but its config version "
+                          << reply.configVersion << " is older than the most recent config version "
+                          << _set->configVersion};
     }
 
     if (reply.electionId.isSet()) {
@@ -783,12 +781,11 @@ Status Refresher::receivedIsMasterFromMaster(const HostAndPort& from, const IsMa
         // because configVersion needs to be incremented whenever the protocol version is changed.
         if (reply.configVersion == _set->configVersion && _set->maxElectionId.isSet() &&
             _set->maxElectionId.compare(reply.electionId) > 0) {
-            return {ErrorCodes::NotMaster,
-                    str::stream() << "Node " << from
-                                  << " believes it is primary, but its election id "
-                                  << reply.electionId
-                                  << " is older than the most recent election id "
-                                  << _set->maxElectionId};
+            return {
+                ErrorCodes::NotMaster,
+                str::stream() << "Node " << from << " believes it is primary, but its election id "
+                              << reply.electionId << " is older than the most recent election id "
+                              << _set->maxElectionId};
         }
 
         _set->maxElectionId = reply.electionId;
@@ -803,35 +800,32 @@ Status Refresher::receivedIsMasterFromMaster(const HostAndPort& from, const IsMa
     }
 
     // Check if the master agrees with our current list of nodes.
-    // REMINDER: both _set->nodes and reply.normalHosts are sorted.
-    if (_set->nodes.size() != reply.normalHosts.size() ||
-        !std::equal(
-            _set->nodes.begin(), _set->nodes.end(), reply.normalHosts.begin(), hostsEqual)) {
+    // REMINDER: both _set->nodes and reply.members are sorted.
+    if (_set->nodes.size() != reply.members.size() ||
+        !std::equal(_set->nodes.begin(), _set->nodes.end(), reply.members.begin(), hostsEqual)) {
         LOG(2) << "Adjusting nodes in our view of replica set " << _set->name
                << " based on master reply: " << redact(reply.raw);
 
         // remove non-members from _set->nodes
         _set->nodes.erase(
-            std::remove_if(_set->nodes.begin(), _set->nodes.end(), HostNotIn(reply.normalHosts)),
+            std::remove_if(_set->nodes.begin(), _set->nodes.end(), HostNotIn(reply.members)),
             _set->nodes.end());
 
         // add new members to _set->nodes
-        for (std::set<HostAndPort>::const_iterator it = reply.normalHosts.begin();
-             it != reply.normalHosts.end();
-             ++it) {
-            _set->findOrCreateNode(*it);
+        for (auto& host : reply.members) {
+            _set->findOrCreateNode(host);
         }
 
         // replace hostToScan queue with untried normal hosts. can both add and remove
         // hosts from the queue.
         _scan->hostsToScan.clear();
-        _scan->enqueAllUntriedHosts(reply.normalHosts, _set->rand);
+        _scan->enqueAllUntriedHosts(reply.members, _set->rand);
 
         if (!_scan->waitingFor.empty()) {
             // make sure we don't wait for any hosts that aren't considered members
             std::set<HostAndPort> newWaitingFor;
-            std::set_intersection(reply.normalHosts.begin(),
-                                  reply.normalHosts.end(),
+            std::set_intersection(reply.members.begin(),
+                                  reply.members.end(),
                                   _scan->waitingFor.begin(),
                                   _scan->waitingFor.end(),
                                   std::inserter(newWaitingFor, newWaitingFor.end()));
@@ -839,18 +833,18 @@ Status Refresher::receivedIsMasterFromMaster(const HostAndPort& from, const IsMa
         }
     }
 
-    bool changedHosts = reply.normalHosts != _set->seedNodes;
+    bool changedHosts = reply.members != _set->seedNodes;
     bool changedPrimary = reply.host != _set->lastSeenMaster;
     if (changedHosts || changedPrimary) {
         ++_set->seedGen;
-        _set->seedNodes = reply.normalHosts;
+        _set->seedNodes = reply.members;
         _set->seedConnStr = _set->confirmedConnectionString();
 
         // LogLevel can be pretty low, since replica set reconfiguration should be pretty rare
         // and we want to record our changes
         log() << "Confirmed replica set for " << _set->name << " is " << _set->seedConnStr;
 
-        _set->notifier->onConfirmedSet(_set->seedConnStr, reply.host);
+        _set->notifier->onConfirmedSet(_set->seedConnStr, reply.host, reply.passives);
     }
 
     // Update our working string
@@ -875,7 +869,7 @@ void Refresher::receivedIsMasterBeforeFoundMaster(const IsMasterReply& reply) {
     invariant(!reply.isMaster);
 
     // Add everyone this host claims is in the set to possibleNodes.
-    _scan->possibleNodes.insert(reply.normalHosts.begin(), reply.normalHosts.end());
+    _scan->possibleNodes.insert(reply.members.begin(), reply.members.end());
 
     // If this node thinks the primary is someone we haven't tried, make that the next
     // hostToScan.
@@ -918,12 +912,13 @@ void IsMasterReply::parse(const BSONObj& obj) {
         primary = primaryString.empty() ? HostAndPort() : HostAndPort(primaryString);
 
         // both hosts and passives, but not arbiters, are considered "normal hosts"
-        normalHosts.clear();
+        members.clear();
         BSONForEach(host, raw.getObjectField("hosts")) {
-            normalHosts.insert(HostAndPort(host.String()));
+            members.insert(HostAndPort(host.String()));
         }
         BSONForEach(host, raw.getObjectField("passives")) {
-            normalHosts.insert(HostAndPort(host.String()));
+            members.insert(HostAndPort(host.String()));
+            passives.insert(HostAndPort(host.String()));
         }
 
         tags = raw.getObjectField("tags");
@@ -1295,9 +1290,7 @@ void SetState::notify(bool finishedScan) {
 Status SetState::makeUnsatisfedReadPrefError(const ReadPreferenceSetting& criteria) const {
     return Status(ErrorCodes::FailedToSatisfyReadPreference,
                   str::stream() << "Could not find host matching read preference "
-                                << criteria.toString()
-                                << " for set "
-                                << name);
+                                << criteria.toString() << " for set " << name);
 }
 
 void SetState::init() {
@@ -1392,4 +1385,4 @@ void ScanState::retryAllTriedHosts(PseudoRandom& rand) {
     std::shuffle(hostsToScan.begin(), hostsToScan.end(), rand.urbg());
     triedHosts = waitingFor;
 }
-}
+}  // namespace mongo

@@ -254,13 +254,14 @@ variables:
   # The python virtual environment is installed in ${workdir}, which is created in
   # "set up virtualenv".
   - func: "set up virtualenv"
+  - func: "configure evergreen api credentials"
   # NOTE: To disable the compile bypass feature, comment out the next line.
-  #
   - func: "bypass compile and fetch binaries"
   - func: "update bypass expansions"
   - func: "get buildnumber"
   - func: "set up credentials"
   - func: "fetch and build OpenSSL"
+  - func: "set up win mount script"
   - func: "generate compile expansions"
   teardown_group:
   - func: "scons cache pruning"
@@ -343,6 +344,7 @@ variables:
     - func: "set task expansion macros"
     - func: "set up virtualenv"
     - func: "get buildnumber"
+    - func: "set up win mount script"
     - func: "generate compile expansions"
   teardown_group:
     - func: "scons cache pruning"
@@ -635,6 +637,18 @@ functions:
         build_phase='${task_name}_${execution}'
         END_OF_CREDS
 
+  "set up win mount script": &set_up_win_mount_script
+    command: shell.exec
+    params:
+      working_dir: src
+      shell: bash
+      silent: true
+      script: |
+        cat <<EOF > win_mount.sh
+        net use X: '\\\\${win_scons_endpoint}\\share' /USER:${win_scons_user} '${win_scons_pass}'
+        EOF
+        chmod +x win_mount.sh
+
   "set up notary client credentials": &set_up_notary_client_credentials
     command: shell.exec
     params:
@@ -888,24 +902,38 @@ functions:
 
 
           set +o errexit
-          mount | grep "\/efs" > /dev/null
+
+          if [ "Windows_NT" = "$OS" ]; then
+            ./win_mount.sh
+          else
+            mount | grep "\/efs" > /dev/null
+          fi
           if [ $? -eq 0 ]; then
             echo "Shared cache is already mounted"
           else
             echo "Shared cache - mounting file system"
-            sudo mount /efs
+            if [ "Windows_NT" = "$OS" ]; then
+              ./win_mount.sh
+            else
+              sudo mount /efs
+            fi
           fi
           set -o errexit
 
-          dirs=$(ls -l /efs | grep -v total | awk '{print $NF}')
+          if [ "Windows_NT" = "$OS" ]; then
+            cache_folder=/cygdrive/x
+          else
+            cache_folder=/efs
+          fi
+          dirs=$(ls -l $cache_folder | grep -v total | awk '{print $NF}')
 
           echo "Pruning shared SCons directories"
 
           for dir in $dirs; do
-            echo "Pruning /efs/$dir/scons-cache"
+            echo "Pruning $cache_folder/$dir/scons-cache"
 
-            if [ -e /efs/$dir/info/distro_name ]; then
-              distro=$(cat /efs/$dir/info/distro_name)
+            if [ -e $cache_folder/$dir/info/distro_name ]; then
+              distro=$(cat $cache_folder/$dir/info/distro_name)
             fi
 
             # Set cache sizes by distro
@@ -919,11 +947,20 @@ functions:
                       ;;
             esac
 
-            sudo python buildscripts/scons_cache_prune.py --cache-dir /efs/$dir/scons-cache --cache-size $cache_size --prune-ratio 1.0
+            if [ "Windows_NT" = "$OS" ]; then
+              echo "dir="$dir
+              python buildscripts/scons_cache_prune.py --cache-dir x:/$dir/scons-cache --cache-size $cache_size --prune-ratio 1.0
+            else
+              sudo python buildscripts/scons_cache_prune.py --cache-dir /efs/$dir/scons-cache --cache-size $cache_size --prune-ratio 1.0
+            fi
             echo ""
           done
 
-          sudo umount /efs || true
+          if [ "Windows_NT" = "$OS" ]; then
+            net use X: /delete || true
+          else
+            sudo umount /efs || true
+          fi
 
         else
           echo "Not on master, shared SCons cache pruning skipped"
@@ -953,8 +990,12 @@ functions:
         set -o verbose
 
         if [ "${scons_cache_scope}" = "shared" ]; then
-            ${set_sudo}
-            $sudo umount /efs || true
+            if [ "Windows_NT" = "$OS" ]; then
+                net use X: /delete || true
+            else
+                ${set_sudo}
+                $sudo umount /efs || true
+            fi
         fi
 
   "build new tools":
@@ -1198,7 +1239,6 @@ functions:
         script: |
           # exit immediately if virtualenv is not found
           set -o errexit
-          set -o verbose
 
           virtualenv_loc=$(which ${virtualenv|virtualenv})
 
@@ -1440,7 +1480,6 @@ functions:
         working_dir: src
         script: |
           set -o errexit
-          set -o verbose
 
           ${activate_virtualenv}
           $python buildscripts/evergreen_generate_resmoke_tasks.py --expansion-file expansions.yml --verbose
@@ -1607,13 +1646,17 @@ functions:
 
           if [ "$scons_cache_scope" = "shared" ]; then
             set +o errexit
-            mount | grep "\/efs" > /dev/null
-            if [ $? -eq 0 ]; then
-              echo "Shared cache is already mounted"
+            if [ "Windows_NT" = "$OS" ]; then
+              ./win_mount.sh
             else
-              echo "Shared cache - mounting file system"
-              ${set_sudo}
-              $sudo mount /efs
+              mount | grep "\/efs" > /dev/null
+              if [ $? -eq 0 ]; then
+                echo "Shared cache is already mounted"
+              else
+                echo "Shared cache - mounting file system"
+                ${set_sudo}
+                $sudo mount /efs
+              fi
             fi
             set -o errexit
           fi
@@ -3937,6 +3980,7 @@ tasks:
     - func: "setup android toolchain" # noop if ${setup_android_toolchain} is not "true"
     - func: "set task expansion macros"
     - func: "set up virtualenv"
+    - func: "set up win mount script"
     - func: "generate compile expansions"
     - func: "apply compile expansions"
     - command: s3.get
@@ -4029,6 +4073,7 @@ tasks:
     - func: "setup android toolchain" # noop if ${setup_android_toolchain} is not "true"
     - func: "set task expansion macros"
     - func: "set up virtualenv"
+    - func: "set up win mount script"
     - func: "generate compile expansions"
     - func: "apply compile expansions"
     - command: s3.get
@@ -4594,6 +4639,7 @@ tasks:
     - func: "set up virtualenv"
     - func: "get buildnumber"
     - func: "set up credentials"
+    - func: "set up win mount script"
     - func: "generate compile expansions"
     # Then we load the generated version data into the agent so we can use it in task definitions
     - func: "apply compile expansions"
@@ -4668,75 +4714,19 @@ tasks:
         ${activate_virtualenv}
         find buildscripts etc jstests -name '*.y*ml' -exec yamllint -c etc/yamllint_config.yml {} +
 
-### This task is deprecated, but left in here in case of need to run burn_in_tests
-### instead of the generated task:
-###  - Rename burn_in_tests_gen task to burn_in_tests_gen_UNUSED
-###  - Rename burn_in_tests_gen to burn_in_tests on the build variants
-- <<: *task_template
-  name: burn_in_tests
-  depends_on:
-  - name: compile
-  commands:
-  - command: manifest.load
-  - func: "git get project"
-    # The repository is cloned in a directory distinct from src for the modified test detection
-    # because the extraction of the artifacts performed in the 'do setup' causes
-    # 'git diff --name-only' to see all tests as modified on Windows (git 1.9.5). See SERVER-30634.
-    vars:
-      git_project_directory: burn_in_tests_clonedir
-  - func: "do setup"
-  - command: shell.exec
-    params:
-      working_dir: burn_in_tests_clonedir
-      shell: bash
-      script: |
-        set -o errexit
-        set -o verbose
-        # If this is a scheduled build, we check for changes against the last scheduled commit.
-        if [ "${is_patch}" != "true" ]; then
-          burn_in_args="--checkEvergreen"
-        fi
-        pushd ../src
-        ${activate_virtualenv}
-        popd
-        # Capture a list of new and modified tests.
-        build_variant=${build_variant}
-        if [ -n "${burn_in_tests_build_variant|}" ]; then
-          build_variant=${burn_in_tests_build_variant|}
-        fi
-        # Evergreen executable is in $HOME.
-        PATH=$PATH:$HOME $python buildscripts/burn_in_tests.py --branch=${branch_name} --buildVariant=$build_variant --testListOutfile=jstests/new_tests.json --noExec $burn_in_args
-        # Copy the results to the src dir.
-        cp jstests/new_tests.json ../src/jstests/new_tests.json
-  - func: "do multiversion setup"
-  - func: "run tests"
-    vars:
-      task_path_suffix: /data/multiversion:$HOME
-      resmoke_wrapper: $python buildscripts/burn_in_tests.py --testListFile=jstests/new_tests.json
-      resmoke_args: --repeatSuites=2
-###
-
 - name: burn_in_tests_gen
   commands:
   - command: manifest.load
   - func: "git get project"
-    # The repository is cloned in a directory distinct from src for the modified test detection
-    # because the extraction of the artifacts performed in the 'do setup' causes
-    # 'git diff --name-only' to see all tests as modified on Windows (git 1.9.5). See SERVER-30634.
-    vars:
-      git_project_directory: burn_in_tests_clonedir
   - func: "set task expansion macros"
   - func: "set up virtualenv"
-    vars:
-      pip_dir: ${workdir}/burn_in_tests_clonedir/etc/pip
   - command: shell.exec
     params:
-      working_dir: burn_in_tests_clonedir
+      working_dir: src
       shell: bash
       script: |
         set -o errexit
         set -o verbose
-        mkdir ../src
         ${activate_virtualenv}
         # If this is a scheduled build, we check for changes against the last scheduled commit.
         if [ "${is_patch}" != "true" ]; then
@@ -4752,7 +4742,7 @@ tasks:
         # Increase the burn_in repetition from 2 to 1000 executions or 10 minutes
         burn_in_args="$burn_in_args --repeatTestsMin=2 --repeatTestsMax=1000 --repeatTestsSecs=600"
         # Evergreen executable is in $HOME.
-        PATH=$PATH:$HOME $python buildscripts/burn_in_tests.py --branch=${branch_name} $build_variant_opts --distro=${distro_id} --generateTasksFile=../src/burn_in_tests_gen.json --noExec $burn_in_args
+        PATH=$PATH:$HOME $python buildscripts/burn_in_tests.py --branch=${branch_name} $build_variant_opts --distro=${distro_id} --generateTasksFile=burn_in_tests_gen.json --noExec $burn_in_args
   - command: archive.targz_pack
     params:
       target: src/burn_in_tests_gen.tgz
@@ -5835,6 +5825,7 @@ tasks:
   - command: manifest.load
   - func: "git get project"
   - func: "do setup"
+  - func: "set up win mount script"
   - func: "generate compile expansions"  # Generate compile expansions needs to be run to mount the shared scons cache.
   - func: "apply compile expansions"
   - func: "scons compile"
@@ -5854,6 +5845,7 @@ tasks:
   - command: manifest.load
   - func: "git get project"
   - func: "do setup"
+  - func: "set up win mount script"
   - func: "generate compile expansions"  # Generate compile expansions needs to be run to mount the shared scons cache.
   - func: "apply compile expansions"
   - func: "scons compile"
@@ -5873,6 +5865,7 @@ tasks:
   - command: manifest.load
   - func: "git get project"
   - func: "do setup"
+  - func: "set up win mount script"
   - func: "generate compile expansions"  # Generate compile expansions needs to be run to mount the shared scons cache.
   - func: "apply compile expansions"
   - func: "scons compile"
@@ -5892,6 +5885,7 @@ tasks:
   - command: manifest.load
   - func: "git get project"
   - func: "do setup"
+  - func: "set up win mount script"
   - func: "generate compile expansions"  # Generate compile expansions needs to be run to mount the shared scons cache.
   - func: "apply compile expansions"
   - func: "scons compile"
@@ -8024,6 +8018,15 @@ tasks:
   - func: "git get project"
   - func: "shared scons cache pruning"
 
+- name: win_shared_scons_cache_pruning
+  exec_timeout_secs: 7200 # 2 hour timeout for the task overall
+  depends_on: []
+  commands:
+  - command: manifest.load
+  - func: "git get project"
+  - func: "set up win mount script"
+  - func: "shared scons cache pruning"
+
 #######################################
 #             Task Groups             #
 #######################################
@@ -8056,6 +8059,7 @@ task_groups:
     - func: "setup android toolchain" # noop if ${setup_android_toolchain} is not "true"
     - func: "set task expansion macros"
     - func: "set up virtualenv"
+    - func: "set up win mount script"
     - func: "generate compile expansions"
   teardown_group:
     - func: "scons cache pruning"
@@ -9060,7 +9064,7 @@ buildvariants:
     num_scons_link_jobs_available: $(( $(grep -c ^processor /proc/cpuinfo) / 4 ))
     python: '/cygdrive/c/python/python37/python.exe'
     ext: zip
-    use_scons_cache: true
+    scons_cache_scope: shared
     multiversion_platform: windows
     multiversion_edition: enterprise
     tooltags: "ssl sasl gssapi"
@@ -9097,7 +9101,7 @@ buildvariants:
     num_scons_link_jobs_available: $(( $(grep -c ^processor /proc/cpuinfo) / 4 ))
     python: '/cygdrive/c/python/python37/python.exe'
     ext: zip
-    use_scons_cache: true
+    scons_cache_scope: shared
     multiversion_platform: windows
     multiversion_edition: enterprise
     tooltags: ""
@@ -9250,7 +9254,7 @@ buildvariants:
     num_scons_link_jobs_available: $(( $(grep -c ^processor /proc/cpuinfo) / 4 ))
     python: '/cygdrive/c/python/python37/python.exe'
     ext: zip
-    use_scons_cache: true
+    scons_cache_scope: shared
     test_flags: |- # Use the ServiceExecutorAdaptive with a reasonable number of starting threads
         --serviceExecutor=adaptive \
         --mongodSetParameters="adaptiveServiceExecutorReservedThreads: 8" \
@@ -9284,7 +9288,7 @@ buildvariants:
     python: '/cygdrive/c/python/python37/python.exe'
     test_flags: --storageEngine=inMemory --excludeWithAnyTags=requires_persistence,requires_journaling,uses_transactions
     ext: zip
-    use_scons_cache: true
+    scons_cache_scope: shared
     multiversion_platform: windows
     multiversion_edition: enterprise
     tooltags: "ssl sasl gssapi"
@@ -9340,7 +9344,7 @@ buildvariants:
     num_scons_link_jobs_available: $(( $(grep -c ^processor /proc/cpuinfo) / 4 ))
     python: '/cygdrive/c/python/python37/python.exe'
     ext: zip
-    use_scons_cache: true
+    scons_cache_scope: shared
     tooltags: "ssl"
     build_mongoreplay: false
     large_distro_name: windows-64-vs2017-compile
@@ -9400,7 +9404,7 @@ buildvariants:
     num_scons_link_jobs_available: $(( $(grep -c ^processor /proc/cpuinfo) / 4 ))
     python: '/cygdrive/c/python/python37/python.exe'
     ext: zip
-    use_scons_cache: true
+    scons_cache_scope: shared
     tooltags: "ssl sasl gssapi"
     build_mongoreplay: false
   tasks:
@@ -12158,3 +12162,13 @@ buildvariants:
   stepback: false
   tasks:
   - name: shared_scons_cache_pruning
+
+
+- name: windows-shared-scons-cache-pruning
+  display_name: "Windows shared SCons Cache Pruning"
+  run_on:
+  - windows-64-vs2017-test
+  batchtime: 1440 # 1 day
+  stepback: false
+  tasks:
+  - name: win_shared_scons_cache_pruning

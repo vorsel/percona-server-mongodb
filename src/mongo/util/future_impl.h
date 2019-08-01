@@ -479,23 +479,29 @@ struct SharedStateImpl final : SharedStateBase {
         }
 
         auto lk = stdx::unique_lock(mx);
+
         auto oldState = state.load(std::memory_order_acquire);
+        if (oldState == SSBState::kInit) {
+            // On the success path, our reads and writes to children are protected by the mutex
+            //
+            // On the failure path, we raced with transitionToFinished() and lost, so we need to
+            // synchronize with it via acquire before accessing the results since it wouldn't have
+            // taken the mutex.
+            state.compare_exchange_strong(oldState,
+                                          SSBState::kWaitingOrHaveChildren,
+                                          std::memory_order_relaxed,
+                                          std::memory_order_acquire);
+        }
         if (oldState == SSBState::kFinished) {
             lk.unlock();
             out->fillFromConst(*this);
             return out;
         }
-
-        if (oldState == SSBState::kInit) {
-            // memory ordering can be relaxed because that will be handled by the mutex.
-            state.compare_exchange_strong(
-                oldState, SSBState::kWaitingOrHaveChildren, std::memory_order_relaxed);
-        }
         dassert(oldState != SSBState::kHaveCallback);
 
-        // If oldState became kFinished after we checked (and therefore after we acquired the lock),
-        // the returned continuation will be completed by the promise side once it acquires the lock
-        // since we are adding ourself to the chain here.
+        // If oldState became kFinished after we checked (or successfully stored
+        // kWaitingOrHaveChildren), the returned continuation will be completed by the promise side
+        // once it acquires the lock since we are adding ourself to the chain here.
 
         children.emplace_front(out.get(), /*add ref*/ false);
         out->threadUnsafeIncRefCountTo(2);
@@ -1023,8 +1029,7 @@ public:
 
         // TODO in C++17 with constexpr if this can be done cleaner and more efficiently by not
         // throwing.
-        return std::move(*this).onError([func =
-                                             std::forward<Func>(func)](Status && status) mutable {
+        return std::move(*this).onError([func = std::forward<Func>(func)](Status&& status) mutable {
             if (status != code)
                 uassertStatusOK(status);
             return throwingCall(func, std::move(status));
@@ -1041,8 +1046,7 @@ public:
         if (_immediate || (isReady() && _shared->status.isOK()))
             return std::move(*this);
 
-        return std::move(*this).onError([func =
-                                             std::forward<Func>(func)](Status && status) mutable {
+        return std::move(*this).onError([func = std::forward<Func>(func)](Status&& status) mutable {
             if (!ErrorCodes::isA<category>(status.code()))
                 uassertStatusOK(status);
             return throwingCall(func, std::move(status));
@@ -1064,9 +1068,8 @@ public:
         static_assert(std::is_void<decltype(call(func, std::declval<const Status&>()))>::value,
                       "func passed to tapError must return void");
 
-        return tapImpl(std::forward<Func>(func),
-                       [](Func && func, const T& val) noexcept {},
-                       [](Func && func, const Status& status) noexcept { call(func, status); });
+        return tapImpl(std::forward<Func>(func), [](Func && func, const T& val) noexcept {}, [
+        ](Func && func, const Status& status) noexcept { call(func, status); });
     }
 
     template <typename Func>

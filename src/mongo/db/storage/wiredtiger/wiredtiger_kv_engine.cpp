@@ -2087,8 +2087,7 @@ StatusWith<Timestamp> WiredTigerKVEngine::recoverToStableTimestamp(OperationCont
                       str::stream()
                           << "No stable timestamp available to recover to. Initial data timestamp: "
                           << initialDataTS.toString()
-                          << ", Stable timestamp: "
-                          << stableTS.toString());
+                          << ", Stable timestamp: " << stableTS.toString());
     }
 
     LOG_FOR_ROLLBACK(2) << "WiredTiger::RecoverToStableTimestamp syncing size storer to disk.";
@@ -2129,8 +2128,8 @@ StatusWith<Timestamp> WiredTigerKVEngine::recoverToStableTimestamp(OperationCont
     return {stableTimestamp};
 }
 
-Timestamp WiredTigerKVEngine::getAllCommittedTimestamp() const {
-    return Timestamp(_oplogManager->fetchAllCommittedValue(_conn));
+Timestamp WiredTigerKVEngine::getAllDurableTimestamp() const {
+    return Timestamp(_oplogManager->fetchAllDurableValue(_conn));
 }
 
 Timestamp WiredTigerKVEngine::getOldestOpenReadTimestamp() const {

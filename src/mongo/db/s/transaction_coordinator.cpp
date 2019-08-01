@@ -249,19 +249,28 @@ TransactionCoordinator::TransactionCoordinator(ServiceContext* serviceContext,
                     _serviceContext->getPreciseClockSource()->now());
             }
 
-            _decisionPromise.emplaceValue(_decision->getDecision());
-
             switch (_decision->getDecision()) {
-                case CommitDecision::kCommit:
+                case CommitDecision::kCommit: {
+                    _decisionPromise.emplaceValue(CommitDecision::kCommit);
+
                     return txn::sendCommit(_serviceContext,
                                            *_scheduler,
                                            _lsid,
                                            _txnNumber,
                                            *_participants,
                                            *_decision->getCommitTimestamp());
-                case CommitDecision::kAbort:
+                }
+                case CommitDecision::kAbort: {
+                    const auto& abortStatus = *_decision->getAbortStatus();
+
+                    if (abortStatus == ErrorCodes::ReadConcernMajorityNotEnabled)
+                        _decisionPromise.setError(abortStatus);
+                    else
+                        _decisionPromise.emplaceValue(CommitDecision::kAbort);
+
                     return txn::sendAbort(
                         _serviceContext, *_scheduler, _lsid, _txnNumber, *_participants);
+                }
                 default:
                     MONGO_UNREACHABLE;
             };
@@ -282,13 +291,13 @@ TransactionCoordinator::TransactionCoordinator(ServiceContext* serviceContext,
 
             return txn::deleteCoordinatorDoc(*_scheduler, _lsid, _txnNumber);
         })
-        .onCompletion([ this, deadlineFuture = std::move(deadlineFuture) ](Status s) mutable {
+        .onCompletion([this, deadlineFuture = std::move(deadlineFuture)](Status s) mutable {
             // Interrupt this coordinator's scheduler hierarchy and join the deadline task's future
             // in order to guarantee that there are no more threads running within the coordinator.
             _scheduler->shutdown(
                 {ErrorCodes::TransactionCoordinatorDeadlineTaskCanceled, "Coordinator completed"});
 
-            return std::move(deadlineFuture).onCompletion([ this, s = std::move(s) ](Status) {
+            return std::move(deadlineFuture).onCompletion([this, s = std::move(s)](Status) {
                 // Notify all the listeners which are interested in the coordinator's lifecycle.
                 // After this call, the coordinator object could potentially get destroyed by its
                 // lifetime controller, so there shouldn't be any accesses to `this` after this
@@ -324,7 +333,7 @@ void TransactionCoordinator::continueCommit(const TransactionCoordinatorDocument
     _kickOffCommitPromise.emplaceValue();
 }
 
-SharedSemiFuture<CommitDecision> TransactionCoordinator::getDecision() {
+SharedSemiFuture<CommitDecision> TransactionCoordinator::getDecision() const {
     return _decisionPromise.getFuture();
 }
 
@@ -364,8 +373,7 @@ void TransactionCoordinator::_done(Status status) {
     if (status == ErrorCodes::TransactionCoordinatorSteppingDown)
         status = Status(ErrorCodes::InterruptedDueToReplStateChange,
                         str::stream() << "Coordinator " << _lsid.getId() << ':' << _txnNumber
-                                      << " stopped due to: "
-                                      << status.reason());
+                                      << " stopped due to: " << status.reason());
 
     LOG(3) << "Two-phase commit for " << _lsid.getId() << ':' << _txnNumber << " completed with "
            << redact(status);

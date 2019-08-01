@@ -1,8 +1,6 @@
 """Module to run git commands on a repository."""
 
 import logging
-import os
-import sys
 import subprocess
 
 LOGGER = logging.getLogger(__name__)
@@ -26,6 +24,10 @@ class Repository(object):  # pylint: disable=too-many-public-methods
     def git_commit(self, args):
         """Run a git commit command."""
         return self._callgito("commit", args)
+
+    def git_checkout(self, args):
+        """Run a git checkout command."""
+        return self._callgito("checkout", args)
 
     def git_diff(self, args):
         """Run a git diff command."""

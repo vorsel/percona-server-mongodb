@@ -280,12 +280,6 @@ void cleanupTask(ServiceContext* serviceContext) {
 
         if (serviceContext) {
             serviceContext->setKillAllOperations();
-
-            // Shut down the background periodic task runner.
-            auto runner = serviceContext->getPeriodicRunner();
-            if (runner) {
-                runner->shutdown();
-            }
         }
 
         // Perform all shutdown operations after setKillAllOperations is called in order to ensure
@@ -430,7 +424,7 @@ public:
     void onConfirmedSet(const State& state) final {
         auto connStr = state.connStr;
 
-        auto fun = [ serviceContext = _serviceContext, connStr ](auto args) {
+        auto fun = [serviceContext = _serviceContext, connStr](auto args) {
             if (ErrorCodes::isCancelationError(args.status.code())) {
                 return;
             }
@@ -564,7 +558,6 @@ ExitCode runMongosServer(ServiceContext* serviceContext) {
     // Set up the periodic runner for background job execution
     {
         auto runner = makePeriodicRunner(serviceContext);
-        runner->startup();
         serviceContext->setPeriodicRunner(std::move(runner));
     }
 

@@ -383,19 +383,21 @@ void WiredTigerRecoveryUnit::_txnClose(bool commit) {
 
     int wtRet;
     if (commit) {
+        StringBuilder conf;
         if (!_commitTimestamp.isNull()) {
             // There is currently no scenario where it is intentional to commit before the current
             // read timestamp.
             invariant(_readAtTimestamp.isNull() || _commitTimestamp >= _readAtTimestamp);
 
-            const std::string conf = "commit_timestamp=" + integerToHex(_commitTimestamp.asULL());
-            invariantWTOK(s->timestamp_transaction(s, conf.c_str()));
+            conf << "commit_timestamp=" << integerToHex(_commitTimestamp.asULL()) << ",";
             _isTimestamped = true;
         }
 
-        const std::string conf = _durableTimestamp.isNull() ? "" : "durable_timestamp=" +
-                integerToHex(_durableTimestamp.asULL());
-        wtRet = s->commit_transaction(s, conf.c_str());
+        if (!_durableTimestamp.isNull()) {
+            conf << "durable_timestamp=" << integerToHex(_durableTimestamp.asULL());
+        }
+
+        wtRet = s->commit_transaction(s, conf.str().c_str());
         LOG(3) << "WT commit_transaction for snapshot id " << _mySnapshotId;
     } else {
         wtRet = s->rollback_transaction(s, nullptr);
@@ -418,8 +420,7 @@ void WiredTigerRecoveryUnit::_txnClose(bool commit) {
               str::stream() << "Cannot have both a _lastTimestampSet and a "
                                "_commitTimestamp. _lastTimestampSet: "
                             << _lastTimestampSet->toString()
-                            << ". _commitTimestamp: "
-                            << _commitTimestamp.toString());
+                            << ". _commitTimestamp: " << _commitTimestamp.toString());
 
     // We reset the _lastTimestampSet between transactions. Since it is legal for one
     // transaction on a RecoveryUnit to call setTimestamp() and another to call
@@ -475,7 +476,7 @@ boost::optional<Timestamp> WiredTigerRecoveryUnit::getPointInTimeReadTimestamp()
         // opened.
         case ReadSource::kNoOverlap:
         case ReadSource::kLastApplied:
-        case ReadSource::kAllCommittedSnapshot:
+        case ReadSource::kAllDurableSnapshot:
             break;
     }
 
@@ -491,7 +492,7 @@ boost::optional<Timestamp> WiredTigerRecoveryUnit::getPointInTimeReadTimestamp()
             }
             return boost::none;
         case ReadSource::kNoOverlap:
-        case ReadSource::kAllCommittedSnapshot:
+        case ReadSource::kAllDurableSnapshot:
             invariant(!_readAtTimestamp.isNull());
             return _readAtTimestamp;
 
@@ -551,9 +552,9 @@ void WiredTigerRecoveryUnit::_txnOpen() {
             _readAtTimestamp = _beginTransactionAtNoOverlapTimestamp(session);
             break;
         }
-        case ReadSource::kAllCommittedSnapshot: {
+        case ReadSource::kAllDurableSnapshot: {
             if (_readAtTimestamp.isNull()) {
-                _readAtTimestamp = _beginTransactionAtAllCommittedTimestamp(session);
+                _readAtTimestamp = _beginTransactionAtAllDurableTimestamp(session);
                 break;
             }
             // Intentionally continue to the next case to read at the _readAtTimestamp.
@@ -577,17 +578,17 @@ void WiredTigerRecoveryUnit::_txnOpen() {
     LOG(3) << "WT begin_transaction for snapshot id " << _mySnapshotId;
 }
 
-Timestamp WiredTigerRecoveryUnit::_beginTransactionAtAllCommittedTimestamp(WT_SESSION* session) {
+Timestamp WiredTigerRecoveryUnit::_beginTransactionAtAllDurableTimestamp(WT_SESSION* session) {
     WiredTigerBeginTxnBlock txnOpen(session,
                                     _prepareConflictBehavior,
                                     _roundUpPreparedTimestamps,
                                     RoundUpReadTimestamp::kRound);
-    Timestamp txnTimestamp = Timestamp(_oplogManager->fetchAllCommittedValue(session->connection));
+    Timestamp txnTimestamp = Timestamp(_oplogManager->fetchAllDurableValue(session->connection));
     auto status = txnOpen.setReadSnapshot(txnTimestamp);
     fassert(50948, status);
 
     // Since this is not in a critical section, we might have rounded to oldest between
-    // calling getAllCommitted and setReadSnapshot.  We need to get the actual read timestamp we
+    // calling getAllDurable and setReadSnapshot.  We need to get the actual read timestamp we
     // used.
     auto readTimestamp = _getTransactionReadTimestamp(session);
     txnOpen.done();
@@ -597,7 +598,7 @@ Timestamp WiredTigerRecoveryUnit::_beginTransactionAtAllCommittedTimestamp(WT_SE
 Timestamp WiredTigerRecoveryUnit::_beginTransactionAtNoOverlapTimestamp(WT_SESSION* session) {
 
     auto lastApplied = _sessionCache->snapshotManager().getLocalSnapshot();
-    Timestamp allCommitted = Timestamp(_oplogManager->fetchAllCommittedValue(session->connection));
+    Timestamp allDurable = Timestamp(_oplogManager->fetchAllDurableValue(session->connection));
 
     // When using timestamps for reads and writes, it's important that readers and writers don't
     // overlap with the timestamps they use. In other words, at any point in the system there should
@@ -605,13 +606,13 @@ Timestamp WiredTigerRecoveryUnit::_beginTransactionAtNoOverlapTimestamp(WT_SESSI
     // at, or earlier than T. This time T is called the no-overlap point. Using the `kNoOverlap`
     // ReadSource will compute the most recent known time that is safe to read at.
 
-    // The no-overlap point is computed as the minimum of the storage engine's all-committed time
+    // The no-overlap point is computed as the minimum of the storage engine's all_durable time
     // and replication's last applied time. On primaries, the last applied time is updated as
     // transactions commit, which is not necessarily in the order they appear in the oplog. Thus
-    // the all-committed time is an appropriate value to read at.
+    // the all_durable time is an appropriate value to read at.
 
-    // On secondaries, however, the all-committed time, as computed by the storage engine, can
-    // advance before oplog application completes a batch. This is because the all-committed time
+    // On secondaries, however, the all_durable time, as computed by the storage engine, can
+    // advance before oplog application completes a batch. This is because the all_durable time
     // is only computed correctly if the storage engine is informed of commit timestamps in
     // increasing order. Because oplog application processes a batch of oplog entries out of order,
     // the timestamping requirement is not satisfied. Secondaries, however, only update the last
@@ -619,11 +620,11 @@ Timestamp WiredTigerRecoveryUnit::_beginTransactionAtNoOverlapTimestamp(WT_SESSI
     // secondaries.
 
     // By taking the minimum of the two values, storage can compute a legal time to read at without
-    // knowledge of the replication state. The no-overlap point is the minimum of the all-committed
+    // knowledge of the replication state. The no-overlap point is the minimum of the all_durable
     // time, which represents the point where no transactions will commit any earlier, and
     // lastApplied, which represents the highest optime a node has applied, a point no readers
     // should read afterward.
-    Timestamp readTimestamp = (lastApplied) ? std::min(*lastApplied, allCommitted) : allCommitted;
+    Timestamp readTimestamp = (lastApplied) ? std::min(*lastApplied, allDurable) : allDurable;
 
     WiredTigerBeginTxnBlock txnOpen(session,
                                     _prepareConflictBehavior,
@@ -632,7 +633,7 @@ Timestamp WiredTigerRecoveryUnit::_beginTransactionAtNoOverlapTimestamp(WT_SESSI
     auto status = txnOpen.setReadSnapshot(readTimestamp);
     fassert(51066, status);
 
-    // We might have rounded to oldest between calling getAllCommitted and setReadSnapshot. We need
+    // We might have rounded to oldest between calling getAllDurable and setReadSnapshot. We need
     // to get the actual read timestamp we used.
     readTimestamp = _getTransactionReadTimestamp(session);
     txnOpen.done();
@@ -656,8 +657,7 @@ Status WiredTigerRecoveryUnit::setTimestamp(Timestamp timestamp) {
     invariant(_prepareTimestamp.isNull());
     invariant(_commitTimestamp.isNull(),
               str::stream() << "Commit timestamp set to " << _commitTimestamp.toString()
-                            << " and trying to set WUOW timestamp to "
-                            << timestamp.toString());
+                            << " and trying to set WUOW timestamp to " << timestamp.toString());
     invariant(_readAtTimestamp.isNull() || timestamp >= _readAtTimestamp,
               str::stream() << "future commit timestamp " << timestamp.toString()
                             << " cannot be older than read timestamp "
@@ -684,12 +684,10 @@ void WiredTigerRecoveryUnit::setCommitTimestamp(Timestamp timestamp) {
     invariant(!_inUnitOfWork() || !_prepareTimestamp.isNull(), toString(_state));
     invariant(_commitTimestamp.isNull(),
               str::stream() << "Commit timestamp set to " << _commitTimestamp.toString()
-                            << " and trying to set it to "
-                            << timestamp.toString());
+                            << " and trying to set it to " << timestamp.toString());
     invariant(!_lastTimestampSet,
               str::stream() << "Last timestamp set is " << _lastTimestampSet->toString()
-                            << " and trying to set commit timestamp to "
-                            << timestamp.toString());
+                            << " and trying to set commit timestamp to " << timestamp.toString());
     invariant(!_isTimestamped);
 
     _commitTimestamp = timestamp;
@@ -703,9 +701,7 @@ void WiredTigerRecoveryUnit::setDurableTimestamp(Timestamp timestamp) {
     invariant(
         _durableTimestamp.isNull(),
         str::stream() << "Trying to reset durable timestamp when it was already set. wasSetTo: "
-                      << _durableTimestamp.toString()
-                      << " setTo: "
-                      << timestamp.toString());
+                      << _durableTimestamp.toString() << " setTo: " << timestamp.toString());
 
     _durableTimestamp = timestamp;
 }
@@ -729,16 +725,13 @@ void WiredTigerRecoveryUnit::setPrepareTimestamp(Timestamp timestamp) {
     invariant(_inUnitOfWork(), toString(_state));
     invariant(_prepareTimestamp.isNull(),
               str::stream() << "Trying to set prepare timestamp to " << timestamp.toString()
-                            << ". It's already set to "
-                            << _prepareTimestamp.toString());
+                            << ". It's already set to " << _prepareTimestamp.toString());
     invariant(_commitTimestamp.isNull(),
               str::stream() << "Commit timestamp is " << _commitTimestamp.toString()
-                            << " and trying to set prepare timestamp to "
-                            << timestamp.toString());
+                            << " and trying to set prepare timestamp to " << timestamp.toString());
     invariant(!_lastTimestampSet,
               str::stream() << "Last timestamp set is " << _lastTimestampSet->toString()
-                            << " and trying to set prepare timestamp to "
-                            << timestamp.toString());
+                            << " and trying to set prepare timestamp to " << timestamp.toString());
 
     _prepareTimestamp = timestamp;
 }
@@ -778,8 +771,7 @@ void WiredTigerRecoveryUnit::setRoundUpPreparedTimestamps(bool value) {
     // This cannot be called after WiredTigerRecoveryUnit::_txnOpen.
     invariant(!_isActive(),
               str::stream() << "Can't change round up prepared timestamps flag "
-                            << "when current state is "
-                            << toString(_state));
+                            << "when current state is " << toString(_state));
     _roundUpPreparedTimestamps =
         (value) ? RoundUpPreparedTimestamps::kRound : RoundUpPreparedTimestamps::kNoRound;
 }
@@ -792,8 +784,7 @@ void WiredTigerRecoveryUnit::setTimestampReadSource(ReadSource readSource,
     invariant(!_isActive() || _timestampReadSource == readSource,
               str::stream() << "Current state: " << toString(_state)
                             << ". Invalid internal state while setting timestamp read source: "
-                            << static_cast<int>(readSource)
-                            << ", provided timestamp: "
+                            << static_cast<int>(readSource) << ", provided timestamp: "
                             << (provided ? provided->toString() : "none"));
     invariant(!provided == (readSource != ReadSource::kProvided));
     invariant(!(provided && provided->isNull()));

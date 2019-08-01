@@ -382,9 +382,9 @@ public:
     }
 
     /**
-     * See `StorageEngine::getAllCommittedTimestamp`
+     * See `StorageEngine::getAllDurableTimestamp`
      */
-    virtual Timestamp getAllCommittedTimestamp() const = 0;
+    virtual Timestamp getAllDurableTimestamp() const = 0;
 
     /**
      * See `StorageEngine::getOldestOpenReadTimestamp`
@@ -440,4 +440,4 @@ protected:
      */
     const int64_t kDefaultCappedSizeBytes = 4096;
 };
-}
+}  // namespace mongo

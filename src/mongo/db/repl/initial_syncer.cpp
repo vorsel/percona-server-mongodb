@@ -107,6 +107,9 @@ MONGO_FAIL_POINT_DEFINE(failAndHangInitialSync);
 // Failpoint which fails initial sync before it applies the next batch of oplog entries.
 MONGO_FAIL_POINT_DEFINE(failInitialSyncBeforeApplyingBatch);
 
+// Failpoint which fasserts if applying a batch fails.
+MONGO_FAIL_POINT_DEFINE(initialSyncFassertIfApplyingBatchFails);
+
 namespace {
 using namespace executor;
 using CallbackArgs = executor::TaskExecutor::CallbackArgs;
@@ -480,8 +483,7 @@ void InitialSyncer::_startInitialSyncAttemptCallback(
     auto status = _checkForShutdownAndConvertStatus_inlock(
         callbackArgs,
         str::stream() << "error while starting initial sync attempt " << (initialSyncAttempt + 1)
-                      << " of "
-                      << initialSyncMaxAttempts);
+                      << " of " << initialSyncMaxAttempts);
     if (!status.isOK()) {
         _finishInitialSyncAttempt(status);
         return;
@@ -516,7 +518,7 @@ void InitialSyncer::_startInitialSyncAttemptCallback(
     auto storageEngine = getGlobalServiceContext()->getStorageEngine();
     if (storageEngine) {
         // Set the oldestTimestamp to one because WiredTiger does not allow us to set it to zero
-        // since that would also set the all committed point to zero. We specifically don't set
+        // since that would also set the all_durable point to zero. We specifically don't set
         // the stable timestamp here because that will trigger taking a first stable checkpoint even
         // though the initialDataTimestamp is still set to kAllowUnstableCheckpointsSentinel.
         storageEngine->setOldestTimestamp(kTimestampOne);
@@ -745,11 +747,8 @@ void InitialSyncer::_getBeginFetchingOpTimeCallback(
             Status(ErrorCodes::TooManyMatchingDocuments,
                    str::stream() << "Expected to receive one document for the oldest active "
                                     "transaction entry, but received: "
-                                 << docs.size()
-                                 << ". First: "
-                                 << redact(docs.front())
-                                 << ". Last: "
-                                 << redact(docs.back())));
+                                 << docs.size() << ". First: " << redact(docs.front())
+                                 << ". Last: " << redact(docs.back())));
         return;
     }
 
@@ -804,7 +803,7 @@ void InitialSyncer::_lastOplogEntryFetcherCallbackForBeginApplyingTimestamp(
     auto filterBob = BSONObjBuilder(queryBob.subobjStart("filter"));
     filterBob.append("_id", FeatureCompatibilityVersionParser::kParameterName);
     filterBob.done();
-    // As part of reading the FCV, we ensure the source node "all committed" timestamp has advanced
+    // As part of reading the FCV, we ensure the source node's all_durable timestamp has advanced
     // to at least the timestamp of the last optime that we found in the lastOplogEntryFetcher.
     // When document locking is used, there could be oplog "holes" which would result in
     // inconsistent initial sync data if we didn't do this.
@@ -856,11 +855,8 @@ void InitialSyncer::_fcvFetcherCallback(const StatusWith<Fetcher::QueryResponse>
             Status(ErrorCodes::TooManyMatchingDocuments,
                    str::stream() << "Expected to receive one feature compatibility version "
                                     "document, but received: "
-                                 << docs.size()
-                                 << ". First: "
-                                 << redact(docs.front())
-                                 << ". Last: "
-                                 << redact(docs.back())));
+                                 << docs.size() << ". First: " << redact(docs.front())
+                                 << ". Last: " << redact(docs.back())));
         return;
     }
     const auto hasDoc = docs.begin() != docs.end();
@@ -1266,6 +1262,14 @@ void InitialSyncer::_multiApplierCallback(const Status& multiApplierStatus,
     stdx::lock_guard<stdx::mutex> lock(_mutex);
     auto status =
         _checkForShutdownAndConvertStatus_inlock(multiApplierStatus, "error applying batch");
+
+    // Set to cause initial sync to fassert instead of restart if applying a batch fails, so that
+    // tests can be robust to network errors but not oplog idempotency errors.
+    if (MONGO_FAIL_POINT(initialSyncFassertIfApplyingBatchFails)) {
+        log() << "initialSyncFassertIfApplyingBatchFails fail point enabled.";
+        fassert(31210, status);
+    }
+
     if (!status.isOK()) {
         error() << "Failed to apply batch due to '" << redact(status) << "'";
         onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
@@ -1517,8 +1521,8 @@ void InitialSyncer::_finishCallback(StatusWith<OpTimeAndWallTime> lastApplied) {
 }
 
 Status InitialSyncer::_scheduleLastOplogEntryFetcher_inlock(Fetcher::CallbackFn callback) {
-    BSONObj query = BSON(
-        "find" << _opts.remoteOplogNS.coll() << "sort" << BSON("$natural" << -1) << "limit" << 1);
+    BSONObj query = BSON("find" << _opts.remoteOplogNS.coll() << "sort" << BSON("$natural" << -1)
+                                << "limit" << 1);
 
     _lastOplogEntryFetcher =
         stdx::make_unique<Fetcher>(_exec,
@@ -1669,13 +1673,12 @@ Status InitialSyncer::_scheduleWorkAtAndSaveHandle_inlock(
     if (_isShuttingDown_inlock()) {
         return Status(ErrorCodes::CallbackCanceled,
                       str::stream() << "failed to schedule work " << name << " at "
-                                    << when.toString()
-                                    << ": initial syncer is shutting down");
+                                    << when.toString() << ": initial syncer is shutting down");
     }
     auto result = _exec->scheduleWorkAt(when, std::move(work));
     if (!result.isOK()) {
-        return result.getStatus().withContext(
-            str::stream() << "failed to schedule work " << name << " at " << when.toString());
+        return result.getStatus().withContext(str::stream() << "failed to schedule work " << name
+                                                            << " at " << when.toString());
     }
     *handle = result.getValue();
     return Status::OK();

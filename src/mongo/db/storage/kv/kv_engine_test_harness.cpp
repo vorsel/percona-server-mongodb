@@ -168,9 +168,7 @@ TEST(KVEngineTestHarness, SimpleSorted1) {
     IndexDescriptor desc(collection.get(),
                          "",
                          BSON("v" << static_cast<int>(IndexDescriptor::kLatestIndexVersion) << "ns"
-                                  << ns.ns()
-                                  << "key"
-                                  << BSON("a" << 1)));
+                                  << ns.ns() << "key" << BSON("a" << 1)));
     std::unique_ptr<SortedDataInterface> sorted;
     {
         MyOperationContext opCtx(engine);
@@ -229,7 +227,7 @@ TEST(KVEngineTestHarness, TemporaryRecordStoreSimple) {
     }
 }
 
-TEST(KVEngineTestHarness, AllCommittedTimestamp) {
+TEST(KVEngineTestHarness, AllDurableTimestamp) {
     std::unique_ptr<KVHarnessHelper> helper(KVHarnessHelper::create());
     KVEngine* engine = helper->getEngine();
     if (!engine->supportsDocLocking())
@@ -258,17 +256,17 @@ TEST(KVEngineTestHarness, AllCommittedTimestamp) {
         auto t12Doc = BSON("ts" << t12);
         auto t21Doc = BSON("ts" << t21);
 
-        Timestamp allCommitted = engine->getAllCommittedTimestamp();
+        Timestamp allDurable = engine->getAllDurableTimestamp();
         MyOperationContext opCtx1(engine);
         WriteUnitOfWork uow1(&opCtx1);
         ASSERT_EQ(invariant(rs->insertRecord(
                       &opCtx1, t11Doc.objdata(), t11Doc.objsize(), Timestamp::min())),
                   RecordId(1, 1));
 
-        Timestamp lastAllCommitted = allCommitted;
-        allCommitted = engine->getAllCommittedTimestamp();
-        ASSERT_GTE(allCommitted, lastAllCommitted);
-        ASSERT_LT(allCommitted, t11);
+        Timestamp lastAllDurable = allDurable;
+        allDurable = engine->getAllDurableTimestamp();
+        ASSERT_GTE(allDurable, lastAllDurable);
+        ASSERT_LT(allDurable, t11);
 
         MyOperationContext opCtx2(engine);
         WriteUnitOfWork uow2(&opCtx2);
@@ -277,26 +275,26 @@ TEST(KVEngineTestHarness, AllCommittedTimestamp) {
                   RecordId(2, 1));
         uow2.commit();
 
-        lastAllCommitted = allCommitted;
-        allCommitted = engine->getAllCommittedTimestamp();
-        ASSERT_GTE(allCommitted, lastAllCommitted);
-        ASSERT_LT(allCommitted, t11);
+        lastAllDurable = allDurable;
+        allDurable = engine->getAllDurableTimestamp();
+        ASSERT_GTE(allDurable, lastAllDurable);
+        ASSERT_LT(allDurable, t11);
 
         ASSERT_EQ(invariant(rs->insertRecord(
                       &opCtx1, t12Doc.objdata(), t12Doc.objsize(), Timestamp::min())),
                   RecordId(1, 2));
 
-        lastAllCommitted = allCommitted;
-        allCommitted = engine->getAllCommittedTimestamp();
-        ASSERT_GTE(allCommitted, lastAllCommitted);
-        ASSERT_LT(allCommitted, t11);
+        lastAllDurable = allDurable;
+        allDurable = engine->getAllDurableTimestamp();
+        ASSERT_GTE(allDurable, lastAllDurable);
+        ASSERT_LT(allDurable, t11);
 
         uow1.commit();
 
-        lastAllCommitted = allCommitted;
-        allCommitted = engine->getAllCommittedTimestamp();
-        ASSERT_GTE(allCommitted, lastAllCommitted);
-        ASSERT_LTE(allCommitted, t21);
+        lastAllDurable = allDurable;
+        allDurable = engine->getAllDurableTimestamp();
+        ASSERT_GTE(allDurable, lastAllDurable);
+        ASSERT_LTE(allDurable, t21);
     }
 }
 
@@ -706,10 +704,7 @@ DEATH_TEST_F(DurableCatalogImplTest, TerminateOnNonNumericIndexVersion, "Fatal A
                          "",
                          BSON("v"
                               << "1"
-                              << "ns"
-                              << ns.ns()
-                              << "key"
-                              << BSON("a" << 1)));
+                              << "ns" << ns.ns() << "key" << BSON("a" << 1)));
     std::unique_ptr<SortedDataInterface> sorted;
     {
         MyOperationContext opCtx(engine);

@@ -1302,9 +1302,9 @@ void toBsonValue(uint8_t ctype,
             break;
         }
 
-        //
-        // Numerics
-        //
+            //
+            // Numerics
+            //
 
         case CType::kNumericNaN: {
             auto type = typeBits->readNumeric();
@@ -1417,7 +1417,7 @@ void toBsonValue(uint8_t ctype,
         case CType::kNumericNegativeSmallMagnitude:
             inverted = !inverted;
             isNegative = true;
-        // fallthrough (format is the same as positive, but inverted)
+            // fallthrough (format is the same as positive, but inverted)
 
         case CType::kNumericPositiveSmallMagnitude: {
             const uint8_t originalType = typeBits->readNumeric();
@@ -1548,7 +1548,7 @@ void toBsonValue(uint8_t ctype,
         case CType::kNumericNegative1ByteInt:
             inverted = !inverted;
             isNegative = true;
-        // fallthrough (format is the same as positive, but inverted)
+            // fallthrough (format is the same as positive, but inverted)
 
         case CType::kNumericPositive1ByteInt:
         case CType::kNumericPositive2ByteInt:
@@ -1600,6 +1600,10 @@ void toBsonValue(uint8_t ctype,
                 uassert(50832,
                         "Expected type double for fractional part.",
                         originalType == TypeBits::kDouble);
+                uassert(31209,
+                        "Integer part is too big to be a double.",
+                        integerPart < kMaxIntForDouble);
+
                 const uint64_t exponent = (64 - countLeadingZeros64(integerPart)) - 1;
                 const size_t fractionalBits = (52 - exponent);
                 const size_t fractionalBytes = (fractionalBits + 7) / 8;
@@ -1784,9 +1788,9 @@ void filterKeyFromKeyString(uint8_t ctype,
             break;
         }
 
-        //
-        // Numerics
-        //
+            //
+            // Numerics
+            //
 
         case CType::kNumericNaN: {
             break;
@@ -1825,7 +1829,7 @@ void filterKeyFromKeyString(uint8_t ctype,
         case CType::kNumericNegativeSmallMagnitude:
             inverted = !inverted;
             isNegative = true;
-        // fallthrough (format is the same as positive, but inverted)
+            // fallthrough (format is the same as positive, but inverted)
 
         case CType::kNumericPositiveSmallMagnitude: {
             uint64_t encoded = readType<uint64_t>(reader, inverted);
@@ -1887,7 +1891,7 @@ void filterKeyFromKeyString(uint8_t ctype,
         case CType::kNumericNegative1ByteInt:
             inverted = !inverted;
             isNegative = true;
-        // fallthrough (format is the same as positive, but inverted)
+            // fallthrough (format is the same as positive, but inverted)
 
         case CType::kNumericPositive1ByteInt:
         case CType::kNumericPositive2ByteInt:

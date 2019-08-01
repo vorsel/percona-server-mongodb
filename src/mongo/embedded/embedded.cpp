@@ -110,9 +110,7 @@ void setUpCatalog(ServiceContext* serviceContext) {
 // Create a minimalistic replication coordinator to provide a limited interface for users. Not
 // functional to provide any replication logic.
 ServiceContext::ConstructorActionRegisterer replicationManagerInitializer(
-    "CreateReplicationManager",
-    {"SSLManager", "default"},
-    [](ServiceContext* serviceContext) {
+    "CreateReplicationManager", {"SSLManager", "default"}, [](ServiceContext* serviceContext) {
         repl::StorageInterface::set(serviceContext, std::make_unique<repl::StorageInterfaceImpl>());
 
         auto logicalClock = stdx::make_unique<LogicalClock>(serviceContext);
@@ -168,11 +166,6 @@ void shutdown(ServiceContext* srvContext) {
             databaseHolder->closeAll(shutdownOpCtx.get());
 
             LogicalSessionCache::set(serviceContext, nullptr);
-
-            // Shut down the background periodic task runner, before the storage engine.
-            if (auto runner = serviceContext->getPeriodicRunner()) {
-                runner->shutdown();
-            }
 
             repl::ReplicationCoordinator::get(serviceContext)->shutdown(shutdownOpCtx.get());
             IndexBuildsCoordinator::get(serviceContext)->shutdown();
@@ -236,7 +229,6 @@ ServiceContext* initialize(const char* yaml_config) {
     // The periodic runner is required by the storage engine to be running beforehand.
     auto periodicRunner = std::make_unique<PeriodicRunnerEmbedded>(
         serviceContext, serviceContext->getPreciseClockSource());
-    periodicRunner->startup();
     serviceContext->setPeriodicRunner(std::move(periodicRunner));
 
     setUpCatalog(serviceContext);

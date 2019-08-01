@@ -296,7 +296,18 @@ void IndexCatalogEntryImpl::setMultikey(OperationContext* opCtx,
         TransactionParticipant::SideTransactionBlock sideTxn(opCtx);
         writeConflictRetry(opCtx, "set index multikey", _ns.ns(), [&] {
             WriteUnitOfWork wuow(opCtx);
-            auto writeTs = LogicalClock::get(opCtx)->getClusterTime().asTimestamp();
+
+            // If we have a prepare optime for recovery, then we always use that. During recovery of
+            // prepared transactions, the logical clock may not yet be initialized, so we use the
+            // prepare timestamp of the transaction for this write. This is safe since the prepare
+            // timestamp is always <= the commit timestamp of a transaction, which satisfies the
+            // correctness requirement for multikey writes i.e. they must occur at or before the
+            // first write that set the multikey flag.
+            auto recoveryPrepareOpTime = txnParticipant.getPrepareOpTimeForRecovery();
+            Timestamp writeTs = recoveryPrepareOpTime.isNull()
+                ? LogicalClock::get(opCtx)->getClusterTime().asTimestamp()
+                : recoveryPrepareOpTime.getTimestamp();
+
             auto status = opCtx->recoveryUnit()->setTimestamp(writeTs);
             if (status.code() == ErrorCodes::BadValue) {
                 log() << "Temporarily could not timestamp the multikey catalog write, retrying. "
@@ -306,8 +317,10 @@ void IndexCatalogEntryImpl::setMultikey(OperationContext* opCtx,
             fassert(31164, status);
             indexMetadataHasChanged = DurableCatalog::get(opCtx)->setIndexIsMultikey(
                 opCtx, _ns, _descriptor->indexName(), paths);
-            opCtx->recoveryUnit()->onCommit([onMultikeyCommitFn, indexMetadataHasChanged](
-                boost::optional<Timestamp>) { onMultikeyCommitFn(indexMetadataHasChanged); });
+            opCtx->recoveryUnit()->onCommit(
+                [onMultikeyCommitFn, indexMetadataHasChanged](boost::optional<Timestamp>) {
+                    onMultikeyCommitFn(indexMetadataHasChanged);
+                });
             wuow.commit();
         });
     } else {
@@ -315,8 +328,10 @@ void IndexCatalogEntryImpl::setMultikey(OperationContext* opCtx,
             opCtx, _ns, _descriptor->indexName(), paths);
     }
 
-    opCtx->recoveryUnit()->onCommit([onMultikeyCommitFn, indexMetadataHasChanged](
-        boost::optional<Timestamp>) { onMultikeyCommitFn(indexMetadataHasChanged); });
+    opCtx->recoveryUnit()->onCommit(
+        [onMultikeyCommitFn, indexMetadataHasChanged](boost::optional<Timestamp>) {
+            onMultikeyCommitFn(indexMetadataHasChanged);
+        });
 
     // Within a multi-document transaction, reads should be able to see the effect of previous
     // writes done within that transaction. If a previous write in a transaction has set the index

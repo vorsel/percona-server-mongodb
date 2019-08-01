@@ -138,7 +138,7 @@ BSONObj EncryptedDBClientBase::encryptDecryptCommand(const BSONObj& object,
         uassert(31096,
                 "Object too deep to be encrypted. Exceeded stack depth.",
                 frameStack.size() < BSONDepth::kDefaultMaxAllowableDepth);
-        auto & [ iterator, builder ] = frameStack.top();
+        auto& [iterator, builder] = frameStack.top();
         if (iterator.more()) {
             BSONElement elem = iterator.next();
             if (elem.type() == BSONType::Object) {
@@ -188,7 +188,8 @@ void EncryptedDBClientBase::decryptPayload(ConstDataRange data,
     UUID uuid = UUID::fromCDR(uuidCdr);
 
     auto key = getDataKey(uuid);
-    std::vector<uint8_t> out(data.length() - kAssociatedDataLength);
+    std::vector<uint8_t> out(uassertStatusOK(
+        crypto::aeadGetMaximumPlainTextLength(data.length() - kAssociatedDataLength)));
     size_t outLen = out.size();
 
     uassertStatusOK(
@@ -499,7 +500,8 @@ void EncryptedDBClientBase::decrypt(mozjs::MozJSImplScope* scope,
     UUID uuid = UUID::fromCDR(uuidCdr);
 
     auto key = getDataKey(uuid);
-    std::vector<uint8_t> out(binData.size() - kAssociatedDataLength);
+    std::vector<uint8_t> out(uassertStatusOK(
+        crypto::aeadGetMaximumPlainTextLength(binData.size() - kAssociatedDataLength)));
     size_t outLen = out.size();
 
     auto decryptStatus = crypto::aeadDecrypt(*key,
@@ -607,7 +609,7 @@ std::shared_ptr<SymmetricKey> EncryptedDBClientBase::getDataKey(const UUID& uuid
     auto ts_new = Date_t::now();
 
     if (_datakeyCache.hasKey(uuid)) {
-        auto[key, ts] = _datakeyCache.find(uuid)->second;
+        auto [key, ts] = _datakeyCache.find(uuid)->second;
         if (ts_new - ts < kCacheInvalidationTime) {
             return key;
         } else {

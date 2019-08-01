@@ -240,7 +240,7 @@ public:
      */
     boost::optional<Timestamp> getLastStableRecoveryTimestamp() const override;
 
-    Timestamp getAllCommittedTimestamp() const override;
+    Timestamp getAllDurableTimestamp() const override;
 
     Timestamp getOldestOpenReadTimestamp() const override;
 
@@ -487,4 +487,4 @@ private:
     // timestamp. Provided by replication layer because WT does not persist timestamps.
     AtomicWord<std::uint64_t> _initialDataTimestamp;
 };
-}
+}  // namespace mongo
