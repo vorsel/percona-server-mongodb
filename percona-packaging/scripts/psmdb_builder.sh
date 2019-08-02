@@ -22,6 +22,7 @@ Usage: $0 [OPTIONS]
         --psm_release       PSM_RELEASE(mandatory)
         --mongo_tools_tag   MONGO_TOOLS_TAG(mandatory)
         --special_targets   Special targets for tests
+        --jenkins_mode      If it is set it means that this script is used on jenkins infrastructure
         --debug             build debug tarball
         --help) usage ;;
 Example $0 --builddir=/tmp/PSMDB --get_sources=1 --build_src_rpm=1 --build_rpm=1
@@ -57,6 +58,7 @@ parse_arguments() {
             --psm_ver=*) PSM_VER="$val" ;;
             --psm_release=*) PSM_RELEASE="$val" ;;
             --mongo_tools_tag=*) MONGO_TOOLS_TAG="$val" ;;
+            --jenkins_mode=*) JENKINS_MODE="$val" ;;
             --debug=*) DEBUG="$val" ;;
             --special_targets=*) SPECIAL_TAR="$val" ;;
             --help) usage ;;
@@ -116,13 +118,8 @@ get_sources(){
     PRODUCT=percona-server-mongodb
     echo "PRODUCT=${PRODUCT}" > percona-server-mongodb-40.properties
 
-    PRODUCT_FULL=${PRODUCT}-${PSM_VER}-${PSM_RELEASE}
-    echo "PRODUCT_FULL=${PRODUCT_FULL}" >> percona-server-mongodb-40.properties
-    echo "VERSION=${PSM_VER}" >> percona-server-mongodb-40.properties
-    echo "RELEASE=$PSM_RELEASE" >> percona-server-mongodb-40.properties
     echo "PSM_BRANCH=${PSM_BRANCH}" >> percona-server-mongodb-40.properties
     echo "JEMALLOC_TAG=${JEMALLOC_TAG}" >> percona-server-mongodb-40.properties
-    echo "MONGO_TOOLS_TAG=${MONGO_TOOLS_TAG}" >> percona-server-mongodb-40.properties
     echo "BUILD_NUMBER=${BUILD_NUMBER}" >> percona-server-mongodb-40.properties
     echo "BUILD_ID=${BUILD_ID}" >> percona-server-mongodb-40.properties
     git clone "$REPO"
@@ -139,14 +136,31 @@ get_sources(){
         git clean -xdf
         git checkout "$BRANCH"
     fi
+
     REVISION=$(git rev-parse --short HEAD)
     # create a proper version.json
     REVISION_LONG=$(git rev-parse HEAD)
+
+    if [ -n "${JENKINS_MODE}" ]; then
+        git remote add upstream https://github.com/mongodb/mongo.git
+        git fetch upstream --tags
+
+        PSM_VER=$(git describe --tags --abbrev=0 | sed 's/^psmdb-//' | sed 's/^r//' | awk -F '-' '{if ($2 ~ /^rc/) {print $0} else {print $1}}')
+        MONGO_TOOLS_TAG="r${PSM_VER}"
+    fi
+
     echo "{" > version.json
     echo "    \"version\": \"${PSM_VER}-${PSM_RELEASE}\"," >> version.json
     echo "    \"githash\": \"${REVISION_LONG}\"" >> version.json
     echo "}" >> version.json
     #
+
+    PRODUCT_FULL=${PRODUCT}-${PSM_VER}-${PSM_RELEASE}
+    echo "PRODUCT_FULL=${PRODUCT_FULL}" >> ${WORKDIR}/percona-server-mongodb-40.properties
+    echo "VERSION=${PSM_VER}" >> ${WORKDIR}/percona-server-mongodb-40.properties
+    echo "RELEASE=${PSM_RELEASE}" >> ${WORKDIR}/percona-server-mongodb-40.properties
+    echo "MONGO_TOOLS_TAG=${MONGO_TOOLS_TAG}" >> ${WORKDIR}/percona-server-mongodb-40.properties
+
     echo "REVISION=${REVISION}" >> ${WORKDIR}/percona-server-mongodb-40.properties
     rm -fr debian rpm
     cp -a percona-packaging/manpages .
