@@ -6,6 +6,9 @@ How to install dependencies:
 How to get sources from github:
   bash -x psmdb_builder.sh --builddir=<absolute path to dir> --branch=v3.6 --psm_ver=3.6.3 --psm_release=1.1 --mongo_tools_tag=r3.6.3 --get_sources=1
 
+How to get sources from github for jenkins needs:
+  bash -x psmdb_builder.sh --builddir=<absolute path to dir> --branch=v4.0 --jenkins_mode=1 --get_sources=1
+
 How to build source rpm:
   bash -x psmdb_builder.sh --builddir=<absolute path to dir> --branch=v3.6 --build_src_rpm=1
 
