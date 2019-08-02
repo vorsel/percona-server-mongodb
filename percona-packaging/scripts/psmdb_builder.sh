@@ -277,16 +277,21 @@ install_deps() {
     CURPLACE=$(pwd)
 
     if [ "x$OS" = "xrpm" ]; then
+      RHEL=$(rpm --eval %rhel)
       yum -y install wget
       add_percona_yum_repo
       wget http://jenkins.percona.com/yum-repo/percona-dev.repo
       mv -f percona-dev.repo /etc/yum.repos.d/
       yum clean all
       yum -y install epel-release
+      if [ x"$RHEL" = x6 ]; then
+          yum -y install centos-release-scl
+	  yum -y install python27 python27-python python27-python-babel python27-python-devel python27-python-docutils python27-python-jinja2 python27-python-libs python27-python-markupsafe python27-python-nose python27-python-pip python27-python-pygments python27-python-setuptools python27-python-simplejson python27-python-sphinx python27-python-sqlalchemy python27-python-virtualenv python27-python-werkzeug python27-python-wheel python27-runtime
+
+      fi
       yum -y install libpcap-devel gcc make cmake gcc-c++ openssl-devel cyrus-sasl-devel snappy-devel zlib-devel bzip2-devel scons rpmlint rpm-build git
       install_golang
       rm -fr /usr/local/gcc-5.4.0
-      RHEL=$(rpm --eval %rhel)
       if [ x"$RHEL" = x6 ]; then
         yum -y install percona-devtoolset-gcc percona-devtoolset-binutils percona-devtoolset-gcc-c++ percona-devtoolset-libstdc++-devel percona-devtoolset-valgrind-devel
       fi
@@ -438,6 +443,7 @@ build_rpm(){
 
     if [ ${RHEL} != 7 ]; then
     source /opt/percona-devtoolset/enable
+    source /opt/rh/python27/enable
     fi
 
     echo "CC and CXX should be modified once correct compiller would be installed on Centosed"
@@ -584,6 +590,7 @@ build_tarball(){
 
     if [ -f /opt/percona-devtoolset/enable ]; then
     source /opt/percona-devtoolset/enable
+    source /opt/rh/python27/enable
     fi
     #
     export DEBIAN_VERSION="$(lsb_release -sc)"
