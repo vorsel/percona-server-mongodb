@@ -952,6 +952,8 @@ void WiredTigerKVEngine::_openWiredTiger(const std::string& path, const std::str
 
 void WiredTigerKVEngine::cleanShutdown() {
     log() << "WiredTigerKVEngine shutting down";
+    // Ensure that key db is destroyed on exit
+    ON_BLOCK_EXIT([&] { _encryptionKeyDB.reset(nullptr); });
     if (!_readOnly)
         syncSizeInfo(true);
     if (!_conn) {
@@ -1013,7 +1015,6 @@ void WiredTigerKVEngine::cleanShutdown() {
 
     invariantWTOK(_conn->close(_conn, closeConfig.c_str()));
     _conn = nullptr;
-    _encryptionKeyDB.reset(nullptr);
 }
 
 Status WiredTigerKVEngine::okToRename(OperationContext* opCtx,
