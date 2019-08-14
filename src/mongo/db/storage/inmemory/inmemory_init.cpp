@@ -74,6 +74,7 @@ public:
                                                         getGlobalServiceContext()->getFastClockSource(),
                                                         wiredTigerGlobalOptions.engineConfig,
                                                         cacheMB,
+                                                        0,
                                                         durable,
                                                         ephemeral,
                                                         params.repair,
