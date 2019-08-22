@@ -339,7 +339,7 @@ install_deps() {
         sleep 1
         echo "waiting"
       done
-      until apt-get -y install ${INSTALL_LIST}; do
+      until DEBIAN_FRONTEND=noninteractive apt-get -y install ${INSTALL_LIST}; do
         sleep 1
         echo "waiting"
       done
