@@ -49,6 +49,8 @@ struct S3BackupParameters {
     bool useVirtualAddressing{true};  // true by default
     std::string bucket;  // S3 bucket name
     std::string path;  // path inside bucket (may be empty)
+    std::string accessKeyId;  // access key id
+    std::string secretAccessKey;  // secret access key
 };
 
 /**
