@@ -243,9 +243,13 @@ void shellHistoryAdd(const char* line) {
     // via runCommand.
     static pcrecpp::RE hiddenCommands(
         "(run|admin)Command\\s*\\(\\s*{\\s*(createUser|updateUser)\\s*:");
+    // Hide createBackup command if it contains s3 credentials
+    static pcrecpp::RE hiddenCreateBackup(
+        "(run|admin)Command\\s*\\(\\s*{\\s*createBackup\\s*:.*s3.*(accessKeyId|secretAccessKey)");
 
     static pcrecpp::RE hiddenFLEConstructor(".*Mongo\\(([\\s\\S]*)secretAccessKey([\\s\\S]*)");
     if (!hiddenHelpers.PartialMatch(line) && !hiddenCommands.PartialMatch(line) &&
+        !hiddenCreateBackup.PartialMatch(line) &&
         !hiddenFLEConstructor.PartialMatch(line)) {
         linenoiseHistoryAdd(line);
     }
