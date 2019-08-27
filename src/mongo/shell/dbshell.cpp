@@ -188,7 +188,11 @@ void shellHistoryAdd(const char* line) {
     // via runCommand.
     static pcrecpp::RE hiddenCommands(
         "(run|admin)Command\\s*\\(\\s*{\\s*(createUser|updateUser)\\s*:");
-    if (!hiddenHelpers.PartialMatch(line) && !hiddenCommands.PartialMatch(line)) {
+    // Hide createBackup command if it contains s3 credentials
+    static pcrecpp::RE hiddenCreateBackup(
+        "(run|admin)Command\\s*\\(\\s*{\\s*createBackup\\s*:.*s3.*(accessKeyId|secretAccessKey)");
+    if (!hiddenHelpers.PartialMatch(line) && !hiddenCommands.PartialMatch(line)
+        && !hiddenCreateBackup.PartialMatch(line)) {
         linenoiseHistoryAdd(line);
     }
 }
