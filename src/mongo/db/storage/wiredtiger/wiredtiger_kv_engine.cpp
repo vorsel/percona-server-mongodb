@@ -1301,10 +1301,18 @@ Status WiredTigerKVEngine::hotBackup(OperationContext* opCtx, const percona::S3B
     config.scheme = Aws::Http::SchemeMapper::FromString(s3params.scheme.c_str());
     if (!s3params.region.empty())
         config.region = s3params.region;
-    // using ProfileConfigFileAWSCredentialsProvider to allow loading of non-default profile
-    auto credentialsProvider = s3params.profile.empty()
-        ? Aws::MakeShared<Aws::Auth::ProfileConfigFileAWSCredentialsProvider>("AWS", 1000 * 3600)
-        : Aws::MakeShared<Aws::Auth::ProfileConfigFileAWSCredentialsProvider>("AWS", s3params.profile.c_str(), 1000 * 3600);
+
+    std::shared_ptr<Aws::Auth::AWSCredentialsProvider> credentialsProvider;
+    if (!s3params.accessKeyId.empty()) {
+        credentialsProvider = Aws::MakeShared<Aws::Auth::SimpleAWSCredentialsProvider>("AWS",
+                                                                                       s3params.accessKeyId,
+                                                                                       s3params.secretAccessKey);
+    } else {
+        // using ProfileConfigFileAWSCredentialsProvider to allow loading of non-default profile
+        credentialsProvider = s3params.profile.empty()
+            ? Aws::MakeShared<Aws::Auth::ProfileConfigFileAWSCredentialsProvider>("AWS", 1000 * 3600)
+            : Aws::MakeShared<Aws::Auth::ProfileConfigFileAWSCredentialsProvider>("AWS", s3params.profile.c_str(), 1000 * 3600);
+    }
     Aws::S3::S3Client s3_client{credentialsProvider, config, Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never, s3params.useVirtualAddressing};
 
     // check if bucket already exists and skip create if it does

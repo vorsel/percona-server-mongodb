@@ -31,6 +31,9 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 
 #include <boost/filesystem.hpp>
 
+#include "mongo/bson/mutable/algorithm.h"
+#include "mongo/bson/mutable/const_element.h"
+#include "mongo/bson/mutable/document.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/backup/backupable.h"
@@ -76,6 +79,7 @@ public:
              const BSONObj& cmdObj,
              std::string& errmsg,
              BSONObjBuilder& result) override;
+    void redactForLogging(mutablebson::Document* cmdObj) const override;
 } createBackupCmd;
 
 bool CreateBackupCommand::errmsgRun(mongo::OperationContext* opCtx,
@@ -149,6 +153,10 @@ bool CreateBackupCommand::errmsgRun(mongo::OperationContext* opCtx,
                 s3params.bucket = elem.String();
             else if (elem.fieldNameStringData() == "path"_sd)
                 s3params.path = elem.String();
+            else if (elem.fieldNameStringData() == "accessKeyId"_sd)
+                s3params.accessKeyId = elem.String();
+            else if (elem.fieldNameStringData() == "secretAccessKey"_sd)
+                s3params.secretAccessKey = elem.String();
             else {
                 errmsg = str::stream()
                     << "s3 subobject contains usupported field or field's name is misspelled: "
@@ -179,6 +187,24 @@ bool CreateBackupCommand::errmsgRun(mongo::OperationContext* opCtx,
     }
 
     return true;
+}
+
+void CreateBackupCommand::redactForLogging(mutablebson::Document* cmdObj) const {
+    namespace mmb = mutablebson;
+    const auto s3FieldName = "s3"_sd;
+    mmb::Element s3Element = mmb::findFirstChildNamed(cmdObj->root(), s3FieldName);
+    if (s3Element.ok()) {
+        const auto f1 = "accessKeyId"_sd;
+        const auto f2 = "secretAccessKey"_sd;
+        auto predicate = [&](const mmb::ConstElement& element){
+            return f1 == element.getFieldName() || f2 == element.getFieldName();
+        };
+        mmb::Element element = mmb::findFirstChild(s3Element, predicate);
+        while (element.ok()) {
+            element.setValueString("xxx").ignore();
+            element = mmb::findElement(element.rightSibling(), predicate);
+        }
+    }
 }
 
 }  // end of percona namespace.
