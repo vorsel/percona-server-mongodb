@@ -19,9 +19,11 @@ timelibSuffix = '-2018.01alpha1'
 tomcryptSuffix = '-1.18.1'
 benchmarkSuffix = '-1.3.0'
 sqliteSuffix = '-amalgamation-3190300'
+libarchiveSuffix = '-3.4.0'
 
 thirdPartyIncludePathList = [
     ('percona_incl', '#/src/third_party/install/include'),
+    ('libarchive', '#/src/third_party/libarchive' + libarchiveSuffix),
     ('s2', '#/src/third_party/s2'),
     ('timelib', '#/src/third_party/timelib' + timelibSuffix),
 ]
@@ -480,3 +482,18 @@ icuEnv.Library(
     source=[
         'shim_icu.cpp',
     ])
+
+libarchiveEnv = env.Clone()
+libarchiveEnv.InjectThirdPartyIncludePaths(libraries=['libarchive'])
+libarchiveEnv.SConscript('libarchive' + libarchiveSuffix + '/libarchive/SConscript', exports={ 'env' : libarchiveEnv})
+libarchiveEnv = libarchiveEnv.Clone(
+    LIBDEPS_INTERFACE=[
+        'libarchive' + libarchiveSuffix + '/libarchive/libarchive',
+    ])
+
+libarchiveEnv.Library(
+    target='shim_libarchive',
+    source=[
+        'shim_libarchive.cpp',
+    ])
+
