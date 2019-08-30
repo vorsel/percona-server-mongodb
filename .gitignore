@@ -1,3 +1,4 @@
+/.ccls_cache
 /build
 /src/mongo/db/modules
 /.jsdbshell
