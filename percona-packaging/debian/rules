@@ -6,7 +6,7 @@ export NJOBS=$(shell grep -c processor /proc/cpuinfo)
 export PSM_TARGETS=mongod mongos mongo perconadecrypt
 export PSMSRC=$(CURDIR)
 export MONGOTOOLS=bsondump mongostat mongofiles mongoexport mongoimport mongorestore mongodump mongotop mongoreplay
-export INSTALLDIR=$(PSMSRC)/install
+export INSTALLDIR=/usr/local
 export TOOLS_TAGS=ssl sasl
 export PORTABLE=1
 export USE_SSE=1
@@ -20,7 +20,7 @@ CXX = g++-5
 override_dh_auto_clean:
 	dh_auto_clean
 	rm -fr $(PSMSRC)/bin
-	rm -fr $(INSTALLDIR)
+	#rm -fr $(INSTALLDIR)
 	buildscripts/scons.py CC=$(CC) CXX=$(CXX) -C $(PSMSRC) -c --disable-warnings-as-errors --audit --release --ssl --opt -j$(NJOBS) --use-sasl-client CPPPATH=$(INSTALLDIR)/include \
 	LIBPATH=$(INSTALLDIR)/lib --wiredtiger --inmemory --hotbackup $(PSM_TARGETS)
 	rm -fr build
