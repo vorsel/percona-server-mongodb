@@ -184,6 +184,15 @@ get_sources(){
     #
 
     mv percona-server-mongodb ${PRODUCT}-${PSM_VER}-${PSM_RELEASE}
+    cd ${PRODUCT}-${PSM_VER}-${PSM_RELEASE}
+        git clone https://github.com/aws/aws-sdk-cpp.git
+            cd aws-sdk-cpp
+                git reset --hard
+                git clean -xdf
+                git checkout 1.7.91
+                mkdir build
+                sed -i 's:AWS_EVENT_STREAM_SHA:AWS_EVENT_STREAM_TAG:g' third-party/cmake/BuildAwsEventStream.cmake
+    cd ../../
     tar --owner=0 --group=0 --exclude=.* -czf ${PRODUCT}-${PSM_VER}-${PSM_RELEASE}.tar.gz ${PRODUCT}-${PSM_VER}-${PSM_RELEASE}
     echo "UPLOAD=UPLOAD/experimental/BUILDS/${PRODUCT}-4.0/${PRODUCT}-${PSM_VER}-${PSM_RELEASE}/${PSM_BRANCH}/${REVISION}/${BUILD_ID}" >> percona-server-mongodb-40.properties
     mkdir $WORKDIR/source_tarball
@@ -275,6 +284,34 @@ fix_rules(){
     sed -i 's:release:release --disable-warnings-as-errors :g' debian/rules
 }
 
+aws_sdk_build(){
+    cd $WORKDIR
+        git clone https://github.com/aws/aws-sdk-cpp.git
+        cd aws-sdk-cpp
+            git reset --hard
+            git clean -xdf
+            git checkout 1.7.91
+            mkdir build
+            sed -i 's:AWS_EVENT_STREAM_SHA:AWS_EVENT_STREAM_TAG:g' third-party/cmake/BuildAwsEventStream.cmake
+            cd build
+            CMAKE_CMD="cmake"
+            if [ -f /etc/redhat-release ]; then
+                RHEL=$(rpm --eval %rhel)
+                if [ x"$RHEL" = x6 ]; then
+                    CMAKE_CMD="cmake3"
+                fi
+            fi
+            set_compiler
+            if [ -z "${CC}" -a -z "${CXX}" ]; then
+                ${CMAKE_CMD} .. -DCMAKE_BUILD_TYPE=Release -DBUILD_ONLY="s3" -DBUILD_SHARED_LIBS=OFF -DMINIMIZE_SIZE=ON
+            else
+                ${CMAKE_CMD} CC=${CC} CXX=${CXX} .. -DCMAKE_BUILD_TYPE=Release -DBUILD_ONLY="s3" -DBUILD_SHARED_LIBS=OFF -DMINIMIZE_SIZE=ON
+            fi
+            make -j4
+            make install
+    cd ${WORKDIR}
+}
+
 install_deps() {
     if [ $INSTALL = 0 ]
     then
@@ -287,7 +324,6 @@ install_deps() {
         exit 1
     fi
     CURPLACE=$(pwd)
-
     if [ "x$OS" = "xrpm" ]; then
       yum -y install wget
       add_percona_yum_repo
@@ -302,21 +338,28 @@ install_deps() {
         yum -y install cyrus-sasl-devel snappy-devel zlib-devel bzip2-devel libpcap-devel
         yum -y install scons make rpm-build rpmbuild percona-devtoolset-gcc percona-devtoolset-binutils 
         yum -y install percona-devtoolset-gcc-c++ percona-devtoolset-libstdc++-devel percona-devtoolset-valgrind-devel
-        yum -y install python27 python27-devel rpmlint libcurl-devel
+        yum -y install python27 python27-devel rpmlint libcurl-devel e2fsprogs-devel expat-devel lz4-devel git cmake3
         wget https://bootstrap.pypa.io/get-pip.py
         python2.7 get-pip.py
         rm -rf /usr/bin/python2
         ln -s /usr/bin/python2.7 /usr/bin/python2
+        wget http://curl.haxx.se/download/curl-7.26.0.tar.gz
+        tar -xvzf curl-7.26.0.tar.gz
+        cd curl-7.26.0
+          ./configure
+          make
+          make install
+        cd ../
       elif [ x"$RHEL" = x7 ]; then
         yum -y install epel-release
         yum -y install rpmbuild rpm-build libpcap-devel gcc make cmake gcc-c++ openssl-devel
         yum -y install cyrus-sasl-devel snappy-devel zlib-devel bzip2-devel scons rpmlint
-        yum -y install rpm-build git python-pip python-devel libopcodes libcurl-devel rpmlint
+        yum -y install rpm-build git python-pip python-devel libopcodes libcurl-devel rpmlint e2fsprogs-devel expat-devel lz4-devel
       else
         yum -y install bzip2-devel libpcap-devel snappy-devel gcc gcc-c++ rpm-build rpmlint
-        yum -y install cmake cyrus-sasl-devel make openssl-devel zlib-devel libcurl-devel
+        yum -y install cmake cyrus-sasl-devel make openssl-devel zlib-devel libcurl-devel git
         yum -y install python2-scons python2-pip python36-devel
-        yum -y install redhat-rpm-config python2-devel
+        yum -y install redhat-rpm-config python2-devel e2fsprogs-devel expat-devel lz4-devel
       fi
       if [ "x${RHEL}" == "x8" ]; then
         /usr/bin/pip3.6 install --user typing pyyaml regex Cheetah3
@@ -328,6 +371,15 @@ install_deps() {
     else
       export DEBIAN=$(lsb_release -sc)
       export ARCH=$(echo $(uname -m) | sed -e 's:i686:i386:g')
+      if [ x"${DEBIAN}" = xjessie ]; then
+        cat >/etc/apt/sources.list.d/stretch.list <<EOL
+deb http://httpredir.debian.org/debian stretch main
+EOL
+        apt-get -y update
+        DEBIAN_FRONTEND=noninteractive apt-get -y install cmake
+        rm -f /etc/apt/sources.list.d/stretch.list
+        apt-get -y update
+      fi
       INSTALL_LIST="python python-dev valgrind scons liblz4-dev devscripts debhelper debconf libpcap-dev libbz2-dev libsnappy-dev pkg-config zlib1g-dev libzlcore-dev dh-systemd libsasl2-dev gcc g++ cmake curl"
       INSTALL_LIST="${INSTALL_LIST} libssl-dev libcurl4-openssl-dev"
       until apt-get -y install dirmngr; do
@@ -343,12 +395,14 @@ install_deps() {
         sleep 1
         echo "waiting"
       done
+      apt-get -y install libext2fs-dev || apt-get -y install e2fslibs-dev
       install_golang
       install_gcc_54_deb
       wget https://bootstrap.pypa.io/get-pip.py
       python get-pip.py
       easy_install pip
     fi
+    aws_sdk_build
     return;
 }
 
@@ -500,6 +554,7 @@ build_rpm(){
         export PATH="/usr/local/go/bin:$PATH:$GOPATH"
         export GOBINPATH="/usr/local/go/bin"
     #fi
+    export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
     rpmbuild --define "_topdir ${WORKDIR}/rpmbuild" --define "dist .$OS_NAME" --rebuild rpmbuild/SRPMS/$SRC_RPM
 
     return_code=$?
@@ -607,7 +662,7 @@ build_deb(){
     sed -i 's|go build|go build -a -x|' mongo-tools/build.sh
     sed -i 's|exit $ec||' mongo-tools/build.sh
     dch -m -D "${DEBIAN}" --force-distribution -v "${VERSION}-${RELEASE}.${DEBIAN}" 'Update distribution'
-
+    export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
     dpkg-buildpackage -rfakeroot -us -uc -b
     mkdir -p $CURDIR/deb
     mkdir -p $WORKDIR/deb
@@ -671,7 +726,7 @@ build_tarball(){
     if [ ${DEBUG} = 1 ]; then
     export CXXFLAGS="${CFLAGS} -Wno-error=deprecated-declarations"
     fi
-    export INSTALLDIR=${WORKDIR}/install
+    export INSTALLDIR=/usr/local
     export PORTABLE=1
     export USE_SSE=1
     #
@@ -679,6 +734,39 @@ build_tarball(){
     # Finally build Percona Server for MongoDB with SCons
     cd ${PSMDIR_ABS}
     pip install --user -r buildscripts/requirements.txt
+    if [ -f /etc/redhat-release ]; then
+        RHEL=$(rpm --eval %rhel)
+        if [ $RHEL = 7 -o $RHEL = 8 ]; then
+            if [ -d aws-sdk-cpp ]; then
+                rm -rf aws-sdk-cpp
+            fi
+            export INSTALLDIR=$PWD/../install
+            export INSTALLDIR_AWS=$PWD/../install_aws
+            git clone https://github.com/aws/aws-sdk-cpp.git
+            cd aws-sdk-cpp
+            git reset --hard
+            git clean -xdf
+            git checkout 1.7.91
+            mkdir build
+            sed -i 's:AWS_EVENT_STREAM_SHA:AWS_EVENT_STREAM_TAG:g' third-party/cmake/BuildAwsEventStream.cmake
+            cd build
+            set_compiler
+            if [ -z "${CC}" -a -z "${CXX}" ]; then
+                cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_ONLY="s3" -DBUILD_SHARED_LIBS=OFF -DMINIMIZE_SIZE=ON -DCMAKE_INSTALL_PREFIX="${INSTALLDIR_AWS}"
+            else
+                cmake CC=${CC} CXX=${CXX} .. -DCMAKE_BUILD_TYPE=Release -DBUILD_ONLY="s3" -DBUILD_SHARED_LIBS=OFF -DMINIMIZE_SIZE=ON -DCMAKE_INSTALL_PREFIX="${INSTALLDIR_AWS}"
+            fi
+            make -j4
+            make install
+            mkdir -p ${INSTALLDIR}/include/
+            mkdir -p ${INSTALLDIR}/lib/
+            mv ${INSTALLDIR_AWS}/include/* ${INSTALLDIR}/include/
+            mv ${INSTALLDIR_AWS}/lib*/* ${INSTALLDIR}/lib/
+            cd ../../
+
+        fi
+    fi
+    export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
     if [ ${DEBUG} = 0 ]; then
         buildscripts/scons.py CC=${CC} CXX=${CXX} --disable-warnings-as-errors --release --ssl --opt=on -j$NJOBS --use-sasl-client --wiredtiger --audit --inmemory --hotbackup CPPPATH=${INSTALLDIR}/include LIBPATH=${INSTALLDIR}/lib ${PSM_TARGETS}
     else
