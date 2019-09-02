@@ -622,69 +622,19 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
                       str::stream() << "Not primary while creating indexes in " << ns.ns());
         }
 
-        // Before potentially taking an exclusive database lock, check if all indexes already exist
-        // while holding an intent lock. Only continue if new indexes need to be built and the
-        // database should be re-locked in exclusive mode.
-        AutoGetCollection autoColl(opCtx, ns, MODE_IX);
-        auto db = autoColl.getDb();
-        auto collection = autoColl.getCollection();
-        if (collection) {
-            invariant(db, str::stream() << "Database missing for index build: " << ns);
-            auto& dss = DatabaseShardingState::get(db);
-            auto dssLock = DatabaseShardingState::DSSLock::lock(opCtx, &dss);
-            dss.checkDbVersion(opCtx, dssLock);
-            collectionUUID = collection->uuid();
-            result.appendBool(kCreateCollectionAutomaticallyFieldName, false);
-            auto specsCopy = resolveDefaultsAndRemoveExistingIndexes(opCtx, collection, specs);
-            // Return from command invocation early if we  are not adding any new indexes.
-            if (specsCopy.size() == 0) {
-                auto numIndexes = collection->getIndexCatalog()->numIndexesTotal(opCtx);
-                result.append(kNumIndexesBeforeFieldName, numIndexes);
-                result.append(kNumIndexesAfterFieldName, numIndexes);
-                result.append(kNoteFieldName, "all indexes already exist");
-                return true;
-            }
-        } else {
-            // Relocking temporarily releases the Database lock while holding a Global IX lock. This
-            // prevents the replication state from changing, but requires abandoning the current
-            // snapshot in case indexes change during the period of time where no database lock is
-            // held.
-            opCtx->recoveryUnit()->abandonSnapshot();
-            dbLock.relockWithMode(MODE_X);
-
-            auto databaseHolder = DatabaseHolder::get(opCtx);
-            db = databaseHolder->getDb(opCtx, ns.db());
-            if (!db) {
-                db = databaseHolder->openDb(opCtx, ns.db());
-            }
-            auto& dss = DatabaseShardingState::get(db);
-            auto dssLock = DatabaseShardingState::DSSLock::lock(opCtx, &dss);
-            dss.checkDbVersion(opCtx, dssLock);
-
-            // We would not reach this point if we were able to check existing indexes on the
-            // collection.
-            invariant(!collection);
-            if (ViewCatalog::get(db)->lookup(opCtx, ns.ns())) {
-                errmsg = str::stream() << "Cannot create indexes on a view: " << ns.ns();
-                uasserted(ErrorCodes::CommandNotSupportedOnView, errmsg);
-            }
-
-            uassertStatusOK(userAllowedCreateNS(ns.db(), ns.coll()));
-
-            collectionUUID = UUID::gen();
-            CollectionOptions options;
-            options.uuid = collectionUUID;
-            writeConflictRetry(opCtx, kCommandName, ns.ns(), [&] {
-                WriteUnitOfWork wunit(opCtx);
-                collection = db->createCollection(opCtx, ns, options);
-                invariant(collection,
-                          str::stream() << "Failed to create collection " << ns.ns()
-                                        << " during index creation: "
-                                        << redact(cmdObj));
-                wunit.commit();
-            });
-            result.appendBool(kCreateCollectionAutomaticallyFieldName, true);
+        if (indexesAlreadyExist(opCtx, ns, specs, &result)) {
+            return true;
         }
+
+        auto db = getOrCreateDatabase(opCtx, ns.db(), &dbLock);
+
+        checkDatabaseShardingState(opCtx, db);
+
+        opCtx->recoveryUnit()->abandonSnapshot();
+        Lock::CollectionLock collLock(opCtx, ns, MODE_X);
+
+        auto collection = getOrCreateCollection(opCtx, db, ns, cmdObj, &errmsg, &result);
+        collectionUUID = collection->uuid();
     }
 
     // Use AutoStatsTracker to update Top.

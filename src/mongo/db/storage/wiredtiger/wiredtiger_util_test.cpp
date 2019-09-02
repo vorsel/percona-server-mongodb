@@ -268,11 +268,10 @@ TEST(WiredTigerUtilTest, GetStatisticsValueMissingTable) {
     WiredTigerRecoveryUnit recoveryUnit(harnessHelper.getSessionCache(),
                                         harnessHelper.getOplogManager());
     WiredTigerSession* session = recoveryUnit.getSession();
-    StatusWith<uint64_t> result =
-        WiredTigerUtil::getStatisticsValue(session->getSession(),
-                                           "statistics:table:no_such_table",
-                                           "statistics=(fast)",
-                                           WT_STAT_DSRC_BLOCK_SIZE);
+    auto result = WiredTigerUtil::getStatisticsValue(session->getSession(),
+                                                     "statistics:table:no_such_table",
+                                                     "statistics=(fast)",
+                                                     WT_STAT_DSRC_BLOCK_SIZE);
     ASSERT_NOT_OK(result.getStatus());
     ASSERT_EQUALS(ErrorCodes::CursorNotFound, result.getStatus().code());
 }
@@ -284,10 +283,10 @@ TEST(WiredTigerUtilTest, GetStatisticsValueStatisticsDisabled) {
     WiredTigerSession* session = recoveryUnit.getSession();
     WT_SESSION* wtSession = session->getSession();
     ASSERT_OK(wtRCToStatus(wtSession->create(wtSession, "table:mytable", NULL)));
-    StatusWith<uint64_t> result = WiredTigerUtil::getStatisticsValue(session->getSession(),
-                                                                     "statistics:table:mytable",
-                                                                     "statistics=(fast)",
-                                                                     WT_STAT_DSRC_BLOCK_SIZE);
+    auto result = WiredTigerUtil::getStatisticsValue(session->getSession(),
+                                                     "statistics:table:mytable",
+                                                     "statistics=(fast)",
+                                                     WT_STAT_DSRC_BLOCK_SIZE);
     ASSERT_NOT_OK(result.getStatus());
     ASSERT_EQUALS(ErrorCodes::CursorNotFound, result.getStatus().code());
 }
@@ -300,10 +299,10 @@ TEST(WiredTigerUtilTest, GetStatisticsValueInvalidKey) {
     WT_SESSION* wtSession = session->getSession();
     ASSERT_OK(wtRCToStatus(wtSession->create(wtSession, "table:mytable", NULL)));
     // Use connection statistics key which does not apply to a table.
-    StatusWith<uint64_t> result = WiredTigerUtil::getStatisticsValue(session->getSession(),
-                                                                     "statistics:table:mytable",
-                                                                     "statistics=(fast)",
-                                                                     WT_STAT_CONN_SESSION_OPEN);
+    auto result = WiredTigerUtil::getStatisticsValue(session->getSession(),
+                                                     "statistics:table:mytable",
+                                                     "statistics=(fast)",
+                                                     WT_STAT_CONN_SESSION_OPEN);
     ASSERT_NOT_OK(result.getStatus());
     ASSERT_EQUALS(ErrorCodes::NoSuchKey, result.getStatus().code());
 }
@@ -316,53 +315,13 @@ TEST(WiredTigerUtilTest, GetStatisticsValueValidKey) {
     WT_SESSION* wtSession = session->getSession();
     ASSERT_OK(wtRCToStatus(wtSession->create(wtSession, "table:mytable", NULL)));
     // Use connection statistics key which does not apply to a table.
-    StatusWith<uint64_t> result = WiredTigerUtil::getStatisticsValue(session->getSession(),
-                                                                     "statistics:table:mytable",
-                                                                     "statistics=(fast)",
-                                                                     WT_STAT_DSRC_LSM_CHUNK_COUNT);
+    auto result = WiredTigerUtil::getStatisticsValue(session->getSession(),
+                                                     "statistics:table:mytable",
+                                                     "statistics=(fast)",
+                                                     WT_STAT_DSRC_LSM_CHUNK_COUNT);
     ASSERT_OK(result.getStatus());
     // Expect statistics value to be zero for a LSM key on a Btree.
     ASSERT_EQUALS(0U, result.getValue());
-}
-
-TEST(WiredTigerUtilTest, GetStatisticsValueAsUInt8) {
-    WiredTigerUtilHarnessHelper harnessHelper("statistics=(all)");
-    WiredTigerRecoveryUnit recoveryUnit(harnessHelper.getSessionCache(),
-                                        harnessHelper.getOplogManager());
-    WiredTigerSession* session = recoveryUnit.getSession();
-    WT_SESSION* wtSession = session->getSession();
-    ASSERT_OK(wtRCToStatus(wtSession->create(wtSession, "table:mytable", NULL)));
-
-    // Use data source statistics that has a value > 256 on an empty table.
-    StatusWith<uint64_t> resultUInt64 =
-        WiredTigerUtil::getStatisticsValue(session->getSession(),
-                                           "statistics:table:mytable",
-                                           "statistics=(fast)",
-                                           WT_STAT_DSRC_ALLOCATION_SIZE);
-    ASSERT_OK(resultUInt64.getStatus());
-    ASSERT_GREATER_THAN(resultUInt64.getValue(),
-                        static_cast<uint64_t>(std::numeric_limits<uint8_t>::max()));
-
-    // Ensure that statistics value retrieved as an 8-bit unsigned value
-    // is capped at maximum value for that type.
-    StatusWith<uint8_t> resultUInt8 =
-        WiredTigerUtil::getStatisticsValueAs<uint8_t>(session->getSession(),
-                                                      "statistics:table:mytable",
-                                                      "statistics=(fast)",
-                                                      WT_STAT_DSRC_ALLOCATION_SIZE);
-    ASSERT_OK(resultUInt8.getStatus());
-    ASSERT_EQUALS(std::numeric_limits<uint8_t>::max(), resultUInt8.getValue());
-
-    // Read statistics value as signed 16-bit value with alternative maximum value to
-    // std::numeric_limits.
-    StatusWith<int16_t> resultInt16 =
-        WiredTigerUtil::getStatisticsValueAs<int16_t>(session->getSession(),
-                                                      "statistics:table:mytable",
-                                                      "statistics=(fast)",
-                                                      WT_STAT_DSRC_ALLOCATION_SIZE,
-                                                      static_cast<int16_t>(100));
-    ASSERT_OK(resultInt16.getStatus());
-    ASSERT_EQUALS(static_cast<uint8_t>(100), resultInt16.getValue());
 }
 
 }  // namespace mongo
