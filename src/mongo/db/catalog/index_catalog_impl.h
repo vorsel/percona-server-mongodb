@@ -168,12 +168,6 @@ public:
 
     std::vector<std::shared_ptr<const IndexCatalogEntry>> getAllReadyEntriesShared() const override;
 
-    /**
-     * Returns a not-ok Status if there are any unfinished index builds. No new indexes should
-     * be built when in this state.
-     */
-    Status checkUnfinished() const override;
-
     using IndexIterator = IndexCatalog::IndexIterator;
     std::unique_ptr<IndexIterator> getIndexIterator(
         OperationContext* const opCtx, const bool includeUnfinishedIndexes) const override;
@@ -206,7 +200,7 @@ public:
      */
     void dropAllIndexes(OperationContext* opCtx,
                         bool includingIdIndex,
-                        stdx::function<void(const IndexDescriptor*)> onDropFn) override;
+                        std::function<void(const IndexDescriptor*)> onDropFn) override;
     void dropAllIndexes(OperationContext* opCtx, bool includingIdIndex) override;
 
     /**
@@ -216,13 +210,6 @@ public:
      * collection.
      */
     Status dropIndex(OperationContext* opCtx, const IndexDescriptor* desc) override;
-
-    /**
-     * will drop all incompleted indexes and return specs
-     * after this, the indexes can be rebuilt
-     */
-    std::vector<BSONObj> getAndClearUnfinishedIndexes(OperationContext* opCtx) override;
-
 
     struct IndexKillCriteria {
         std::string ns;
@@ -386,6 +373,15 @@ private:
 
     void _checkMagic() const;
 
+    Status _indexKeys(OperationContext* opCtx,
+                      IndexCatalogEntry* index,
+                      const std::vector<BSONObj>& keys,
+                      const BSONObjSet& multikeyMetadataKeys,
+                      const MultikeyPaths& multikeyPaths,
+                      RecordId loc,
+                      const InsertDeleteOptions& options,
+                      int64_t* keysInsertedOut);
+
     Status _indexFilteredRecords(OperationContext* opCtx,
                                  IndexCatalogEntry* index,
                                  const std::vector<BsonRecord>& bsonRecords,
@@ -396,12 +392,28 @@ private:
                          const std::vector<BsonRecord>& bsonRecords,
                          int64_t* keysInsertedOut);
 
-    Status _unindexRecord(OperationContext* opCtx,
-                          IndexCatalogEntry* index,
-                          const BSONObj& obj,
-                          const RecordId& loc,
-                          bool logIfError,
-                          int64_t* keysDeletedOut);
+    Status _updateRecord(OperationContext* const opCtx,
+                         IndexCatalogEntry* index,
+                         const BSONObj& oldDoc,
+                         const BSONObj& newDoc,
+                         const RecordId& recordId,
+                         int64_t* const keysInsertedOut,
+                         int64_t* const keysDeletedOut);
+
+    void _unindexKeys(OperationContext* opCtx,
+                      IndexCatalogEntry* index,
+                      const std::vector<BSONObj>& keys,
+                      const BSONObj& obj,
+                      RecordId loc,
+                      bool logIfError,
+                      int64_t* const keysDeletedOut);
+
+    void _unindexRecord(OperationContext* opCtx,
+                        IndexCatalogEntry* entry,
+                        const BSONObj& obj,
+                        const RecordId& loc,
+                        bool logIfError,
+                        int64_t* keysDeletedOut);
 
     /**
      * this does no sanity checks
@@ -474,11 +486,5 @@ private:
 
     IndexCatalogEntryContainer _readyIndexes;
     IndexCatalogEntryContainer _buildingIndexes;
-
-    // These are the index specs of indexes that were "leftover".
-    // "Leftover" means they were unfinished when a mongod shut down.
-    // Certain operations are prohibited until someone fixes.
-    // Retrieve by calling getAndClearUnfinishedIndexes().
-    std::vector<BSONObj> _unfinishedIndexes;
 };
 }  // namespace mongo

@@ -33,6 +33,8 @@
 
 #include "repair_database_and_check_version.h"
 
+#include <functional>
+
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/create_collection.h"
@@ -52,7 +54,6 @@
 #include "mongo/db/repl_set_member_in_standalone_mode.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/storage/storage_repair_observer.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
@@ -162,6 +163,11 @@ Status buildMissingIdIndex(OperationContext* opCtx, Collection* collection) {
     }
 
     auto status = indexer.insertAllDocumentsInCollection(opCtx, collection);
+    if (!status.isOK()) {
+        return status;
+    }
+
+    status = indexer.checkConstraints(opCtx);
     if (!status.isOK()) {
         return status;
     }
@@ -331,12 +337,9 @@ void setReplSetMemberInStandaloneMode(OperationContext* opCtx) {
         return;
     }
 
-    Lock::DBLock dbLock(opCtx, NamespaceString::kSystemReplSetNamespace.db(), MODE_X);
-    auto databaseHolder = DatabaseHolder::get(opCtx);
-    databaseHolder->openDb(opCtx, NamespaceString::kSystemReplSetNamespace.db());
-
-    AutoGetCollectionForRead autoCollection(opCtx, NamespaceString::kSystemReplSetNamespace);
-    Collection* collection = autoCollection.getCollection();
+    invariant(opCtx->lockState()->isW());
+    Collection* collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
+        NamespaceString::kSystemReplSetNamespace);
     if (collection && collection->numRecords(opCtx) > 0) {
         setReplSetMemberInStandaloneMode(opCtx->getServiceContext(), true);
         return;
@@ -389,18 +392,12 @@ bool repairDatabasesAndCheckVersion(OperationContext* opCtx) {
             invariant(dbNames.front() == NamespaceString::kLocalDb);
         }
 
-        stdx::function<void(const std::string& dbName)> onRecordStoreRepair =
-            [opCtx](const std::string& dbName) {
-                if (dbName == NamespaceString::kLocalDb) {
-                    setReplSetMemberInStandaloneMode(opCtx);
-                }
-            };
-
         for (const auto& dbName : dbNames) {
             LOG(1) << "    Repairing database: " << dbName;
-            fassertNoTrace(18506,
-                           repairDatabase(opCtx, storageEngine, dbName, onRecordStoreRepair));
+            fassertNoTrace(18506, repairDatabase(opCtx, storageEngine, dbName));
         }
+
+        setReplSetMemberInStandaloneMode(opCtx);
 
         // All collections must have UUIDs before restoring the FCV document to a version that
         // requires UUIDs.

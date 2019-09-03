@@ -235,7 +235,7 @@ StorageInterfaceImpl::createCollectionForBulkLoading(
             wunit.commit();
         }
 
-        autoColl = stdx::make_unique<AutoGetCollection>(
+        autoColl = std::make_unique<AutoGetCollection>(
             opCtx.get(), nss, fixLockModeForSystemDotViewsChanges(nss, MODE_IX));
 
         // Build empty capped indexes.  Capped indexes cannot be built by the MultiIndexBlock
@@ -271,10 +271,10 @@ StorageInterfaceImpl::createCollectionForBulkLoading(
 
     // Move locks into loader, so it now controls their lifetime.
     auto loader =
-        stdx::make_unique<CollectionBulkLoaderImpl>(Client::releaseCurrent(),
-                                                    std::move(opCtx),
-                                                    std::move(autoColl),
-                                                    options.capped ? BSONObj() : idIndexSpec);
+        std::make_unique<CollectionBulkLoaderImpl>(Client::releaseCurrent(),
+                                                   std::move(opCtx),
+                                                   std::move(autoColl),
+                                                   options.capped ? BSONObj() : idIndexSpec);
 
     status = loader->init(options.capped ? std::vector<BSONObj>() : secondaryIndexSpecs);
     if (!status.isOK()) {
@@ -458,13 +458,14 @@ Status StorageInterfaceImpl::createCollection(OperationContext* opCtx,
 
 Status StorageInterfaceImpl::dropCollection(OperationContext* opCtx, const NamespaceString& nss) {
     return writeConflictRetry(opCtx, "StorageInterfaceImpl::dropCollection", nss.ns(), [&] {
-        AutoGetDb autoDB(opCtx, nss.db(), MODE_X);
-        if (!autoDB.getDb()) {
+        AutoGetDb autoDb(opCtx, nss.db(), MODE_IX);
+        Lock::CollectionLock collLock(opCtx, nss, MODE_X);
+        if (!autoDb.getDb()) {
             // Database does not exist - nothing to do.
             return Status::OK();
         }
         WriteUnitOfWork wunit(opCtx);
-        const auto status = autoDB.getDb()->dropCollectionEvenIfSystem(opCtx, nss);
+        const auto status = autoDb.getDb()->dropCollectionEvenIfSystem(opCtx, nss);
         if (!status.isOK()) {
             return status;
         }

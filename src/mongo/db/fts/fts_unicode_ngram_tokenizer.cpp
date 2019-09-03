@@ -13,7 +13,6 @@
 #include "mongo/db/fts/stemmer.h"
 #include "mongo/db/fts/stop_words.h"
 #include "mongo/db/fts/tokenizer.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
 
 /**

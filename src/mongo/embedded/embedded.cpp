@@ -36,6 +36,7 @@
 #include "mongo/base/initializer.h"
 #include "mongo/config.h"
 #include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/catalog/collection_impl.h"
 #include "mongo/db/catalog/database_holder_impl.h"
 #include "mongo/db/catalog/health_log.h"
 #include "mongo/db/catalog/index_key_validate.h"
@@ -103,6 +104,7 @@ MONGO_INITIALIZER_GENERAL(ForkServer, ("EndStartupOptionHandling"), ("default"))
 void setUpCatalog(ServiceContext* serviceContext) {
     DatabaseHolder::set(serviceContext, std::make_unique<DatabaseHolderImpl>());
     IndexAccessMethodFactory::set(serviceContext, std::make_unique<IndexAccessMethodFactoryImpl>());
+    Collection::Factory::set(serviceContext, std::make_unique<CollectionImpl::FactoryImpl>());
 }
 
 // Create a minimalistic replication coordinator to provide a limited interface for users. Not
@@ -113,7 +115,7 @@ ServiceContext::ConstructorActionRegisterer replicationManagerInitializer(
     [](ServiceContext* serviceContext) {
         repl::StorageInterface::set(serviceContext, std::make_unique<repl::StorageInterfaceImpl>());
 
-        auto logicalClock = stdx::make_unique<LogicalClock>(serviceContext);
+        auto logicalClock = std::make_unique<LogicalClock>(serviceContext);
         LogicalClock::set(serviceContext, std::move(logicalClock));
 
         auto replCoord = std::make_unique<ReplicationCoordinatorEmbedded>(serviceContext);
@@ -311,7 +313,7 @@ ServiceContext* initialize(const char* yaml_config) {
 
     // Set up the logical session cache
     LogicalSessionCache::set(serviceContext,
-                             stdx::make_unique<LogicalSessionCacheImpl>(
+                             std::make_unique<LogicalSessionCacheImpl>(
                                  std::make_unique<ServiceLiaisonMongod>(),
                                  std::make_shared<SessionsCollectionStandalone>(),
                                  [](OperationContext*, SessionsCollection&, Date_t) {

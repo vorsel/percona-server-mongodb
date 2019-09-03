@@ -30,10 +30,10 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <functional>
 #include <string>
 
 #include "mongo/executor/task_executor.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/transport/baton.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/functional.h"
@@ -54,7 +54,8 @@ class NetworkInterface {
 
 public:
     using Response = RemoteCommandResponse;
-    using RemoteCommandCompletionFn = unique_function<void(const TaskExecutor::ResponseStatus&)>;
+    using RemoteCommandCompletionFn =
+        unique_function<void(const TaskExecutor::ResponseOnAnyStatus&)>;
 
     virtual ~NetworkInterface();
 
@@ -144,19 +145,20 @@ public:
      * function will not run.
      */
     virtual Status startCommand(const TaskExecutor::CallbackHandle& cbHandle,
-                                RemoteCommandRequest& request,
+                                RemoteCommandRequestOnAny& request,
                                 RemoteCommandCompletionFn&& onFinish,
                                 const BatonHandle& baton = nullptr) = 0;
 
-    Future<TaskExecutor::ResponseStatus> startCommand(const TaskExecutor::CallbackHandle& cbHandle,
-                                                      RemoteCommandRequest& request,
-                                                      const BatonHandle& baton = nullptr) {
-        auto pf = makePromiseFuture<TaskExecutor::ResponseStatus>();
+    Future<TaskExecutor::ResponseOnAnyStatus> startCommand(
+        const TaskExecutor::CallbackHandle& cbHandle,
+        RemoteCommandRequestOnAny& request,
+        const BatonHandle& baton = nullptr) {
+        auto pf = makePromiseFuture<TaskExecutor::ResponseOnAnyStatus>();
 
         auto status = startCommand(
             cbHandle,
             request,
-            [p = std::move(pf.promise)](const TaskExecutor::ResponseStatus& rs) mutable {
+            [p = std::move(pf.promise)](const TaskExecutor::ResponseOnAnyStatus& rs) mutable {
                 p.emplaceValue(rs);
             },
             baton);

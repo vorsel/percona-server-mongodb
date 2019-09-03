@@ -2,8 +2,6 @@
 // expected.
 // @tags: [
 //   assumes_no_implicit_collection_creation_after_drop,
-//   # mapReduce does not support afterClusterTime.
-//   does_not_support_causal_consistency,
 //   does_not_support_stepdowns,
 //   requires_non_retryable_commands,
 //   requires_non_retryable_writes,
@@ -1973,6 +1971,20 @@
                                       .collation({locale: "en_US", strength: 2})
                                       .hint({str: 1})
                                       .itcount());
+        assert.commandFailedWithCode(err, 51174);
+
+        // This query should fail, because the hinted index does not match the requested
+        // collation, and the 'max' value is a string, which means we cannot ignore the
+        // collation.
+        const caseInsensitive = {locale: "en", strength: 2};
+        assert.commandWorked(coll.dropIndexes());
+        assert.commandWorked(coll.createIndex({str: 1}));
+        err = assert.throws(() => coll.find({}, {_id: 0})
+                                      .min({str: MinKey})
+                                      .max({str: "Hello1"})
+                                      .hint({str: 1})
+                                      .collation(caseInsensitive)
+                                      .toArray());
         assert.commandFailedWithCode(err, 51174);
 
         // After building an index with the case-insensitive US English collation, the query should

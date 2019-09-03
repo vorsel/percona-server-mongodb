@@ -33,6 +33,7 @@
 
 #include <boost/intrusive_ptr.hpp>
 #include <boost/optional.hpp>
+#include <functional>
 #include <list>
 #include <memory>
 #include <string>
@@ -54,7 +55,6 @@
 #include "mongo/db/pipeline/stage_constraints.h"
 #include "mongo/db/pipeline/value.h"
 #include "mongo/db/query/explain_options.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
@@ -129,7 +129,7 @@ class Document;
 
 class DocumentSource : public RefCountable {
 public:
-    using Parser = stdx::function<std::list<boost::intrusive_ptr<DocumentSource>>(
+    using Parser = std::function<std::list<boost::intrusive_ptr<DocumentSource>>(
         BSONElement, const boost::intrusive_ptr<ExpressionContext>&)>;
 
     using ChangeStreamRequirement = StageConstraints::ChangeStreamRequirement;
@@ -482,11 +482,10 @@ protected:
 
     /**
      * Attempt to perform an optimization with the following source in the pipeline. 'container'
-     * refers to the entire pipeline, and 'itr' points to this stage within the pipeline. The caller
-     * must guarantee that std::next(itr) != container->end().
+     * refers to the entire pipeline, and 'itr' points to this stage within the pipeline.
      *
      * The return value is an iterator over the same container which points to the first location
-     * in the container at which an optimization may be possible.
+     * in the container at which an optimization may be possible, or the end of the container().
      *
      * For example, if a swap takes place, the returned iterator should just be the position
      * directly preceding 'itr', if such a position exists, since the stage at that position may be

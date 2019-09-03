@@ -49,7 +49,6 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 #include "mongo/db/storage/wiredtiger/wiredtiger_data_protector.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_encryption_hooks.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
 
@@ -83,7 +82,7 @@ public:
             encryptionGlobalParams.encryptionKeyFile,
             boost::filesystem::owner_read | boost::filesystem::owner_write);
 
-        _encryptionKeyDB = stdx::make_unique<EncryptionKeyDB>(_keydbpath.path());
+        _encryptionKeyDB = std::make_unique<EncryptionKeyDB>(_keydbpath.path());
         _encryptionKeyDB->init();
     }
 

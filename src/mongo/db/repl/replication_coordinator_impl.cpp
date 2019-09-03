@@ -36,6 +36,7 @@
 #include "mongo/db/repl/replication_coordinator_impl.h"
 
 #include <algorithm>
+#include <functional>
 #include <limits>
 
 #include "mongo/base/status.h"
@@ -47,6 +48,7 @@
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/replication_state_transition_lock_guard.h"
+#include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/kill_sessions_local.h"
@@ -82,7 +84,6 @@
 #include "mongo/executor/network_interface.h"
 #include "mongo/rpc/metadata/oplog_query_metadata.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point_service.h"
@@ -97,6 +98,7 @@ namespace repl {
 
 MONGO_FAIL_POINT_DEFINE(stepdownHangBeforePerformingPostMemberStateUpdateActions);
 MONGO_FAIL_POINT_DEFINE(holdStableTimestampAtSpecificTimestamp);
+MONGO_FAIL_POINT_DEFINE(stepdownHangBeforeRSTLEnqueue);
 
 // Tracks the number of operations killed on step down.
 Counter64 userOpsKilled;
@@ -147,7 +149,7 @@ private:
     const bool _initialState;
 };
 
-void lockAndCall(stdx::unique_lock<stdx::mutex>* lk, const stdx::function<void()>& fn) {
+void lockAndCall(stdx::unique_lock<stdx::mutex>* lk, const std::function<void()>& fn) {
     if (!lk->owns_lock()) {
         lk->lock();
     }
@@ -247,8 +249,7 @@ void ReplicationCoordinatorImpl::WaiterList::add_inlock(WaiterType waiter) {
     _list.push_back(waiter);
 }
 
-void ReplicationCoordinatorImpl::WaiterList::signalIf_inlock(
-    stdx::function<bool(WaiterType)> func) {
+void ReplicationCoordinatorImpl::WaiterList::signalIf_inlock(std::function<bool(WaiterType)> func) {
     for (auto it = _list.begin(); it != _list.end();) {
         if (!func(*it)) {
             // This element doesn't match, so we advance the iterator to the next one.
@@ -343,7 +344,7 @@ ReplicationCoordinatorImpl::ReplicationCoordinatorImpl(
       _rsConfigState(kConfigPreStart),
       _selfIndex(-1),
       _sleptLastElection(false),
-      _readWriteAbility(stdx::make_unique<ReadWriteAbility>(!settings.usingReplSets())),
+      _readWriteAbility(std::make_unique<ReadWriteAbility>(!settings.usingReplSets())),
       _replicationProcess(replicationProcess),
       _storage(storage),
       _random(prngSeed) {
@@ -589,7 +590,7 @@ void ReplicationCoordinatorImpl::_finishLoadLocalConfig(
     // Do not check optime, if this node is an arbiter.
     bool isArbiter =
         myIndex.getValue() != -1 && localConfig.getMemberAt(myIndex.getValue()).isArbiter();
-    OpTimeAndWallTime lastOpTimeAndWallTime = {OpTime(), Date_t::min()};
+    OpTimeAndWallTime lastOpTimeAndWallTime = {OpTime(), Date_t()};
     if (!isArbiter) {
         if (!lastOpTimeAndWallTimeStatus.isOK()) {
             warning() << "Failed to load timestamp and/or wall clock time of most recently applied "
@@ -686,7 +687,7 @@ void ReplicationCoordinatorImpl::_stopDataReplication(OperationContext* opCtx) {
 }
 
 void ReplicationCoordinatorImpl::_startDataReplication(OperationContext* opCtx,
-                                                       stdx::function<void()> startCompleted) {
+                                                       std::function<void()> startCompleted) {
     // Check to see if we need to do an initial sync.
     const auto lastOpTime = getMyLastAppliedOpTime();
     const auto needsInitialSync =
@@ -753,8 +754,8 @@ void ReplicationCoordinatorImpl::_startDataReplication(OperationContext* opCtx,
             stdx::lock_guard<stdx::mutex> lock(_mutex);
             initialSyncerCopy = std::make_shared<InitialSyncer>(
                 createInitialSyncerOptions(this, _externalState.get()),
-                stdx::make_unique<DataReplicatorExternalStateInitialSync>(this,
-                                                                          _externalState.get()),
+                std::make_unique<DataReplicatorExternalStateInitialSync>(this,
+                                                                         _externalState.get()),
                 _externalState->getDbWorkThreadPool(),
                 _storage,
                 _replicationProcess,
@@ -789,6 +790,9 @@ void ReplicationCoordinatorImpl::startup(OperationContext* opCtx) {
                 fassertFailedNoTrace(50806);
             }
 
+            // Initialize the cached pointer to the oplog collection.
+            acquireOplogCollectionForLogging(opCtx);
+
             // We pass in "none" for the stable timestamp so that recoverFromOplog asks storage
             // for the recoveryTimestamp just like on replica set recovery.
             const auto stableTimestamp = boost::none;
@@ -814,6 +818,9 @@ void ReplicationCoordinatorImpl::startup(OperationContext* opCtx) {
         _topCoord->setStorageEngineSupportsReadCommitted(
             _externalState->isReadCommittedSupportedByStorageEngine(opCtx));
     }
+
+    // Initialize the cached pointer to the oplog collection.
+    acquireOplogCollectionForLogging(opCtx);
 
     _replExecutor->startup();
 
@@ -1168,8 +1175,8 @@ void ReplicationCoordinatorImpl::_resetMyLastOpTimes(WithLock lk) {
     // Reset to uninitialized OpTime
     bool isRollbackAllowed = true;
     _setMyLastAppliedOpTimeAndWallTime(
-        lk, {OpTime(), Date_t::min()}, isRollbackAllowed, DataConsistency::Inconsistent);
-    _setMyLastDurableOpTimeAndWallTime(lk, {OpTime(), Date_t::min()}, isRollbackAllowed);
+        lk, {OpTime(), Date_t()}, isRollbackAllowed, DataConsistency::Inconsistent);
+    _setMyLastDurableOpTimeAndWallTime(lk, {OpTime(), Date_t()}, isRollbackAllowed);
     _stableOpTimeCandidates.clear();
 }
 
@@ -1542,12 +1549,12 @@ Status ReplicationCoordinatorImpl::setLastDurableOptime_forTest(long long cfgVer
     stdx::lock_guard<stdx::mutex> lock(_mutex);
     invariant(getReplicationMode() == modeReplSet);
 
-    if (wallTime == Date_t::min()) {
+    if (wallTime == Date_t()) {
         wallTime = Date_t() + Seconds(opTime.getSecs());
     }
 
     const UpdatePositionArgs::UpdateInfo update(
-        OpTime(), Date_t::min(), opTime, wallTime, cfgVer, memberId);
+        OpTime(), Date_t(), opTime, wallTime, cfgVer, memberId);
     long long configVersion;
     const auto status = _setLastOptime(lock, update, &configVersion);
     _updateLastCommittedOpTimeAndWallTime(lock);
@@ -1561,12 +1568,12 @@ Status ReplicationCoordinatorImpl::setLastAppliedOptime_forTest(long long cfgVer
     stdx::lock_guard<stdx::mutex> lock(_mutex);
     invariant(getReplicationMode() == modeReplSet);
 
-    if (wallTime == Date_t::min()) {
+    if (wallTime == Date_t()) {
         wallTime = Date_t() + Seconds(opTime.getSecs());
     }
 
     const UpdatePositionArgs::UpdateInfo update(
-        opTime, wallTime, OpTime(), Date_t::min(), cfgVer, memberId);
+        opTime, wallTime, OpTime(), Date_t(), cfgVer, memberId);
     long long configVersion;
     const auto status = _setLastOptime(lock, update, &configVersion);
     _updateLastCommittedOpTimeAndWallTime(lock);
@@ -1866,7 +1873,7 @@ ReplicationCoordinatorImpl::AutoGetRstlForStepUpStepDown::AutoGetRstlForStepUpSt
 
 void ReplicationCoordinatorImpl::AutoGetRstlForStepUpStepDown::_startKillOpThread() {
     invariant(!_killOpThread);
-    _killOpThread = stdx::make_unique<stdx::thread>([this] { _killOpThreadFn(); });
+    _killOpThread = std::make_unique<stdx::thread>([this] { _killOpThreadFn(); });
 }
 
 void ReplicationCoordinatorImpl::AutoGetRstlForStepUpStepDown::_killOpThreadFn() {
@@ -1965,6 +1972,9 @@ void ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
     // other path before we acquire the global exclusive lock.  This check is just to try to save us
     // from acquiring the global X lock unnecessarily.
     uassert(ErrorCodes::NotMaster, "not primary so can't step down", getMemberState().primary());
+
+    CurOpFailpointHelpers::waitWhileFailPointEnabled(
+        &stepdownHangBeforeRSTLEnqueue, opCtx, "stepdownHangBeforeRSTLEnqueue");
 
     // Using 'force' sets the default for the wait time to zero, which means the stepdown will
     // fail if it does not acquire the lock immediately. In such a scenario, we use the
@@ -2303,7 +2313,7 @@ int ReplicationCoordinatorImpl::_getMyId_inlock() const {
 Status ReplicationCoordinatorImpl::resyncData(OperationContext* opCtx, bool waitUntilCompleted) {
     _stopDataReplication(opCtx);
     auto finishedEvent = uassertStatusOK(_replExecutor->makeEvent());
-    stdx::function<void()> f;
+    std::function<void()> f;
     if (waitUntilCompleted)
         f = [&finishedEvent, this]() { _replExecutor->signalEvent(finishedEvent); };
 
@@ -2961,7 +2971,7 @@ void ReplicationCoordinatorImpl::_postWonElectionUpdateMemberState(WithLock lk) 
     // Notify all secondaries of the election win.
     _restartHeartbeats_inlock();
     invariant(!_catchupState);
-    _catchupState = stdx::make_unique<CatchupState>(this);
+    _catchupState = std::make_unique<CatchupState>(this);
     _catchupState->start_inlock();
 }
 
@@ -3076,7 +3086,7 @@ void ReplicationCoordinatorImpl::CatchupState::signalHeartbeatUpdate_inlock() {
             abort_inlock();
         }
     };
-    _waiter = stdx::make_unique<CallbackWaiter>(*targetOpTime, targetOpTimeCB);
+    _waiter = std::make_unique<CallbackWaiter>(*targetOpTime, targetOpTimeCB);
     _repl->_opTimeWaiterList.add_inlock(_waiter.get());
 }
 
@@ -3376,7 +3386,7 @@ void ReplicationCoordinatorImpl::blacklistSyncSource(const HostAndPort& host, Da
 void ReplicationCoordinatorImpl::resetLastOpTimesFromOplog(OperationContext* opCtx,
                                                            DataConsistency consistency) {
     auto lastOpTimeAndWallTimeStatus = _externalState->loadLastOpTimeAndWallTime(opCtx);
-    OpTimeAndWallTime lastOpTimeAndWallTime = {OpTime(), Date_t::min()};
+    OpTimeAndWallTime lastOpTimeAndWallTime = {OpTime(), Date_t()};
     if (!lastOpTimeAndWallTimeStatus.getStatus().isOK()) {
         warning() << "Failed to load timestamp and/or wall clock time of most recently applied "
                      "operation; "
@@ -3923,7 +3933,7 @@ WriteConcernOptions ReplicationCoordinatorImpl::populateUnsetWriteConcernOptions
     return writeConcern;
 }
 
-CallbackFn ReplicationCoordinatorImpl::_wrapAsCallbackFn(const stdx::function<void()>& work) {
+CallbackFn ReplicationCoordinatorImpl::_wrapAsCallbackFn(const std::function<void()>& work) {
     return [work](const CallbackArgs& cbData) {
         if (cbData.status == ErrorCodes::CallbackCanceled) {
             return;
@@ -3947,11 +3957,17 @@ Status ReplicationCoordinatorImpl::stepUpIfEligible(bool skipDryRun) {
     if (finishEvent.isValid()) {
         _replExecutor->waitForEvent(finishEvent);
     }
-    auto state = getMemberState();
-    if (state.primary()) {
-        return Status::OK();
+    {
+        // Step up is considered successful only if we are currently a primary and we are not in the
+        // process of stepping down. If we know we are going to step down, we should fail the
+        // replSetStepUp command so caller can retry if necessary.
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        if (!_getMemberState_inlock().primary())
+            return Status(ErrorCodes::CommandFailed, "Election failed.");
+        else if (_topCoord->isSteppingDown())
+            return Status(ErrorCodes::CommandFailed, "Election failed due to concurrent stepdown.");
     }
-    return Status(ErrorCodes::CommandFailed, "Election failed.");
+    return Status::OK();
 }
 
 executor::TaskExecutor::EventHandle ReplicationCoordinatorImpl::_cancelElectionIfNeeded_inlock() {

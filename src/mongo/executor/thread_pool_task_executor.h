@@ -29,11 +29,11 @@
 
 #pragma once
 
+#include <list>
 #include <memory>
 
 #include "mongo/executor/task_executor.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/list.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/transport/baton.h"
@@ -84,9 +84,10 @@ public:
     void waitForEvent(const EventHandle& event) override;
     StatusWith<CallbackHandle> scheduleWork(CallbackFn&& work) override;
     StatusWith<CallbackHandle> scheduleWorkAt(Date_t when, CallbackFn&& work) override;
-    StatusWith<CallbackHandle> scheduleRemoteCommand(const RemoteCommandRequest& request,
-                                                     const RemoteCommandCallbackFn& cb,
-                                                     const BatonHandle& baton = nullptr) override;
+    StatusWith<CallbackHandle> scheduleRemoteCommandOnAny(
+        const RemoteCommandRequestOnAny& request,
+        const RemoteCommandOnAnyCallbackFn& cb,
+        const BatonHandle& baton = nullptr) override;
     void cancel(const CallbackHandle& cbHandle) override;
     void wait(const CallbackHandle& cbHandle,
               Interruptible* interruptible = Interruptible::notInterruptible()) override;
@@ -101,8 +102,8 @@ public:
 private:
     class CallbackState;
     class EventState;
-    using WorkQueue = stdx::list<std::shared_ptr<CallbackState>>;
-    using EventList = stdx::list<std::shared_ptr<EventState>>;
+    using WorkQueue = std::list<std::shared_ptr<CallbackState>>;
+    using EventList = std::list<std::shared_ptr<EventState>>;
 
     /**
      * Representation of the stage of life of a thread pool.

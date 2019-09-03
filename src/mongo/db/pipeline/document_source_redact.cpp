@@ -80,6 +80,10 @@ Pipeline::SourceContainer::iterator DocumentSourceRedact::doOptimizeAt(
     Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
     invariant(*itr == this);
 
+    if (std::next(itr) == container->end()) {
+        return container->end();
+    }
+
     auto nextMatch = dynamic_cast<DocumentSourceMatch*>((*std::next(itr)).get());
 
     if (nextMatch) {
@@ -131,7 +135,7 @@ Value DocumentSourceRedact::redactValue(const Value& in, const Document& root) {
 
 boost::optional<Document> DocumentSourceRedact::redactObject(const Document& root) {
     auto& variables = pExpCtx->variables;
-    const Value expressionResult = _expression->evaluate(root);
+    const Value expressionResult = _expression->evaluate(root, &variables);
 
     ValueComparator simpleValueCmp;
     if (simpleValueCmp.evaluate(expressionResult == keepVal)) {

@@ -125,8 +125,8 @@ thread_local ServiceExecutorAdaptive::ThreadState* ServiceExecutorAdaptive::_loc
     nullptr;
 
 ServiceExecutorAdaptive::ServiceExecutorAdaptive(ServiceContext* ctx, ReactorHandle reactor)
-    : ServiceExecutorAdaptive(
-          ctx, std::move(reactor), stdx::make_unique<ServerParameterOptions>()) {}
+    : ServiceExecutorAdaptive(ctx, std::move(reactor), std::make_unique<ServerParameterOptions>()) {
+}
 
 ServiceExecutorAdaptive::ServiceExecutorAdaptive(ServiceContext* ctx,
                                                  ReactorHandle reactor,
@@ -602,8 +602,7 @@ void ServiceExecutorAdaptive::_workerThreadRoutine(
                 terminateThread = pctExecuting <= _config->idlePctThreshold();
             }
         } while (terminateThread &&
-                 _threadsRunning.compareAndSwap(runningThreads, runningThreads - 1) !=
-                     runningThreads);
+                 !_threadsRunning.compareAndSwap(&runningThreads, runningThreads - 1));
         if (terminateThread) {
             log() << "Thread was only executing tasks " << pctExecuting << "% over the last "
                   << runTime << ". Exiting thread.";

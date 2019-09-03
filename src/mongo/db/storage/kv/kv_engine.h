@@ -40,6 +40,7 @@
 #include "mongo/db/storage/engine_extension.h"
 #include "mongo/db/storage/kv/kv_prefix.h"
 #include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/sorted_data_interface.h"
 #include "mongo/db/storage/storage_engine.h"
 
 namespace mongo {
@@ -48,7 +49,6 @@ class IndexDescriptor;
 class JournalListener;
 class OperationContext;
 class RecoveryUnit;
-class SortedDataInterface;
 class SnapshotManager;
 
 class KVEngine : public percona::EngineExtension {
@@ -88,9 +88,8 @@ public:
         return getRecordStore(opCtx, ns, ident, options);
     }
 
-    virtual SortedDataInterface* getSortedDataInterface(OperationContext* opCtx,
-                                                        StringData ident,
-                                                        const IndexDescriptor* desc) = 0;
+    virtual std::unique_ptr<SortedDataInterface> getSortedDataInterface(
+        OperationContext* opCtx, StringData ident, const IndexDescriptor* desc) = 0;
 
     /**
      * Get a SortedDataInterface that may share an underlying table with other
@@ -101,10 +100,8 @@ public:
      *        between indexes sharing an underlying table. A value of `KVPrefix::kNotPrefixed`
      *        guarantees the index is the sole resident of the table.
      */
-    virtual SortedDataInterface* getGroupedSortedDataInterface(OperationContext* opCtx,
-                                                               StringData ident,
-                                                               const IndexDescriptor* desc,
-                                                               KVPrefix prefix) {
+    virtual std::unique_ptr<SortedDataInterface> getGroupedSortedDataInterface(
+        OperationContext* opCtx, StringData ident, const IndexDescriptor* desc, KVPrefix prefix) {
         invariant(prefix == KVPrefix::kNotPrefixed);
         return getSortedDataInterface(opCtx, ident, desc);
     }

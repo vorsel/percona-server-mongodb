@@ -33,6 +33,8 @@
 
 #include "mongo/transport/service_state_machine.h"
 
+#include <memory>
+
 #include "mongo/config.h"
 #include "mongo/db/client.h"
 #include "mongo/db/dbmessage.h"
@@ -40,7 +42,6 @@
 #include "mongo/db/traffic_recorder.h"
 #include "mongo/rpc/message.h"
 #include "mongo/rpc/op_msg.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/transport/message_compressor_manager.h"
 #include "mongo/transport/service_entry_point.h"
 #include "mongo/transport/service_executor_task_names.h"
@@ -176,7 +177,8 @@ class ServiceStateMachine::ThreadGuard {
 
 public:
     explicit ThreadGuard(ServiceStateMachine* ssm) : _ssm{ssm} {
-        auto owned = _ssm->_owned.compareAndSwap(Ownership::kUnowned, Ownership::kOwned);
+        auto owned = Ownership::kUnowned;
+        _ssm->_owned.compareAndSwap(&owned, Ownership::kOwned);
         if (owned == Ownership::kStatic) {
             dassert(haveClient());
             dassert(Client::getCurrent() == _ssm->_dbClientPtr);
@@ -607,7 +609,7 @@ void ServiceStateMachine::terminateIfTagsDontMatch(transport::Session::TagMask t
     terminate();
 }
 
-void ServiceStateMachine::setCleanupHook(stdx::function<void()> hook) {
+void ServiceStateMachine::setCleanupHook(std::function<void()> hook) {
     invariant(state() == State::Created);
     _cleanupHook = std::move(hook);
 }

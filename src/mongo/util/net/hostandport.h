@@ -36,7 +36,6 @@
 #include <boost/optional.hpp>
 
 #include "mongo/bson/util/builder.h"
-#include "mongo/util/net/sockaddr.h"
 
 namespace mongo {
 
@@ -51,8 +50,6 @@ class StringData;
  * Composed of some name component, followed optionally by a colon and a numeric port.  The name
  * might be an IPv4 or IPv6 address or a relative or fully qualified host name, or an absolute
  * path to a unix socket.
- *
- * Hostnames are converted to lowercase.
  */
 struct HostAndPort {
     /**
@@ -85,14 +82,6 @@ struct HostAndPort {
      * If "p" is -1, port() returns ServerGlobalParams::DefaultDBPort.
      */
     HostAndPort(const std::string& h, int p);
-
-    /**
-     * Constructs a HostAndPort from a SockAddr
-     *
-     * Used by the TransportLayer to convert raw socket addresses into HostAndPorts to be
-     * accessed via tranport::Session
-     */
-    explicit HostAndPort(SockAddr addr);
 
     /**
      * (Re-)initializes this HostAndPort by parsing "s".  Returns
@@ -137,14 +126,6 @@ struct HostAndPort {
      */
     bool empty() const;
 
-    /**
-     * Returns the SockAddr representation of this address, if available
-     */
-    const boost::optional<SockAddr>& sockAddr() const& {
-        return _addr;
-    }
-    void sockAddr() && = delete;
-
     const std::string& host() const {
         return _host;
     }
@@ -160,7 +141,6 @@ struct HostAndPort {
     }
 
 private:
-    boost::optional<SockAddr> _addr;
     std::string _host;
     int _port;  // -1 indicates unspecified
 };

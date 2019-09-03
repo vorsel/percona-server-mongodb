@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include <list>
 #include <memory>
 #include <queue>
 #include <utility>
@@ -37,7 +38,6 @@
 #include "mongo/executor/network_interface.h"
 #include "mongo/rpc/metadata/metadata_hook.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/list.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/stdx/unordered_set.h"
@@ -76,7 +76,7 @@ class NetworkConnectionHook;
 class NetworkInterfaceMock : public NetworkInterface {
 public:
     class NetworkOperation;
-    using NetworkOperationList = stdx::list<NetworkOperation>;
+    using NetworkOperationList = std::list<NetworkOperation>;
     using NetworkOperationIterator = NetworkOperationList::iterator;
 
     NetworkInterfaceMock();
@@ -110,7 +110,7 @@ public:
     Date_t now() override;
     std::string getHostName() override;
     Status startCommand(const TaskExecutor::CallbackHandle& cbHandle,
-                        RemoteCommandRequest& request,
+                        RemoteCommandRequestOnAny& request,
                         RemoteCommandCompletionFn&& onFinish,
                         const BatonHandle& baton = nullptr) override;
 
@@ -434,7 +434,7 @@ class NetworkInterfaceMock::NetworkOperation {
 public:
     NetworkOperation();
     NetworkOperation(const TaskExecutor::CallbackHandle& cbHandle,
-                     const RemoteCommandRequest& theRequest,
+                     const RemoteCommandRequestOnAny& theRequest,
                      Date_t theRequestDate,
                      RemoteCommandCompletionFn onFinish);
 
@@ -459,6 +459,13 @@ public:
 
     const TaskExecutor::CallbackHandle& getCallbackHandle() const {
         return _cbHandle;
+    }
+
+    /**
+     * Gets the request that initiated this operation.
+     */
+    const RemoteCommandRequestOnAny& getRequestOnAny() const {
+        return _requestOnAny;
     }
 
     /**
@@ -506,6 +513,7 @@ private:
     Date_t _nextConsiderationDate;
     Date_t _responseDate;
     TaskExecutor::CallbackHandle _cbHandle;
+    RemoteCommandRequestOnAny _requestOnAny;
     RemoteCommandRequest _request;
     TaskExecutor::ResponseStatus _response;
     RemoteCommandCompletionFn _onFinish;

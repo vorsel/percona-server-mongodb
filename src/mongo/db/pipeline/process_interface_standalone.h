@@ -30,6 +30,7 @@
 #pragma once
 
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/exec/shard_filterer.h"
 #include "mongo/db/ops/write_ops_exec.h"
 #include "mongo/db/ops/write_ops_gen.h"
 #include "mongo/db/pipeline/mongo_process_common.h"
@@ -57,25 +58,18 @@ public:
     std::unique_ptr<TransactionHistoryIteratorBase> createTransactionHistoryIterator(
         repl::OpTime time) const final;
     bool isSharded(OperationContext* opCtx, const NamespaceString& nss) final;
-    void insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                const NamespaceString& ns,
-                std::vector<BSONObj>&& objs,
-                const WriteConcernOptions& wc,
-                boost::optional<OID> targetEpoch) override;
-    void update(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                const NamespaceString& ns,
-                BatchedObjects&& batch,
-                const WriteConcernOptions& wc,
-                bool upsert,
-                bool multi,
-                boost::optional<OID> targetEpoch) override;
-    WriteResult updateWithResult(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                 const NamespaceString& ns,
-                                 BatchedObjects&& batch,
-                                 const WriteConcernOptions& wc,
-                                 bool upsert,
-                                 bool multi,
-                                 boost::optional<OID> targetEpoch) override;
+    Status insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                  const NamespaceString& ns,
+                  std::vector<BSONObj>&& objs,
+                  const WriteConcernOptions& wc,
+                  boost::optional<OID> targetEpoch) override;
+    StatusWith<UpdateResult> update(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                    const NamespaceString& ns,
+                                    BatchedObjects&& batch,
+                                    const WriteConcernOptions& wc,
+                                    bool upsert,
+                                    bool multi,
+                                    boost::optional<OID> targetEpoch) override;
 
     CollectionIndexUsageMap getIndexStats(OperationContext* opCtx, const NamespaceString& ns) final;
     void appendLatencyStats(OperationContext* opCtx,
@@ -104,6 +98,12 @@ public:
     std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipelineForLocalRead(
         const boost::intrusive_ptr<ExpressionContext>& expCtx, Pipeline* pipeline) override;
     std::string getShardName(OperationContext* opCtx) const final;
+
+    std::unique_ptr<ShardFilterer> getShardFilterer(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx) const override {
+        // We'll never do shard filtering on a standalone.
+        return nullptr;
+    }
     std::pair<std::vector<FieldPath>, bool> collectDocumentKeyFieldsForHostedCollection(
         OperationContext* opCtx, const NamespaceString&, UUID) const override;
     std::vector<FieldPath> collectDocumentKeyFieldsActingAsRouter(

@@ -159,16 +159,6 @@ ActiveTransactionHistory fetchActiveTransactionHistory(OperationContext* opCtx,
                 continue;
             }
 
-            const auto insertRes =
-                result.committedStatements.emplace(*entry.getStatementId(), entry.getOpTime());
-            if (!insertRes.second) {
-                const auto& existingOpTime = insertRes.first->second;
-                fassertOnRepeatedExecution(lsid,
-                                           result.lastTxnRecord->getTxnNum(),
-                                           *entry.getStatementId(),
-                                           existingOpTime,
-                                           entry.getOpTime());
-            }
 
             // State is a new field in FCV 4.2, so look for an applyOps oplog entry without a
             // prepare flag to mark a committed transaction in FCV 4.0 or downgrading to 4.0. Check
@@ -179,6 +169,18 @@ ActiveTransactionHistory fetchActiveTransactionHistory(OperationContext* opCtx,
                 (entry.getCommandType() == repl::OplogEntry::CommandType::kApplyOps &&
                  !entry.shouldPrepare() && !entry.isPartialTransaction())) {
                 result.lastTxnRecord->setState(DurableTxnStateEnum::kCommitted);
+                return result;
+            }
+
+            const auto insertRes =
+                result.committedStatements.emplace(*entry.getStatementId(), entry.getOpTime());
+            if (!insertRes.second) {
+                const auto& existingOpTime = insertRes.first->second;
+                fassertOnRepeatedExecution(lsid,
+                                           result.lastTxnRecord->getTxnNum(),
+                                           *entry.getStatementId(),
+                                           existingOpTime,
+                                           entry.getOpTime());
             }
         } catch (const DBException& ex) {
             if (ex.code() == ErrorCodes::IncompleteTransactionHistory) {
@@ -674,7 +676,7 @@ TransactionParticipant::TxnResources::TxnResources(WithLock wl,
     _ruState = opCtx->getWriteUnitOfWork()->release();
     opCtx->setWriteUnitOfWork(nullptr);
 
-    _locker = opCtx->swapLockState(stdx::make_unique<LockerImpl>());
+    _locker = opCtx->swapLockState(std::make_unique<LockerImpl>());
     // Inherit the locking setting from the original one.
     opCtx->lockState()->setShouldConflictWithSecondaryBatchApplication(
         _locker->shouldConflictWithSecondaryBatchApplication());
@@ -1033,9 +1035,9 @@ Timestamp TransactionParticipant::Participant::prepareTransaction(
         // being prepared. When the OplogSlotReserver goes out of scope and is destroyed, the
         // storage-transaction it uses to keep the hole open will abort and the slot (and
         // corresponding oplog hole) will vanish.
-        if (!gUseMultipleOplogEntryFormatForTransactions ||
-            serverGlobalParams.featureCompatibility.getVersion() <
-                ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42) {
+        // TODO(SERVER-41470): Remove the if-clause here.
+        if (serverGlobalParams.featureCompatibility.getVersion() <
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42) {
             oplogSlotReserver.emplace(opCtx);
         } else {
             // Even if the prepared transaction contained no statements, we always reserve at least
@@ -1128,8 +1130,7 @@ void TransactionParticipant::Participant::addTransactionOperation(
                           << BSONObjMaxInternalSize
                           << " when using featureCompatibilityVersion < 4.2. Actual size is "
                           << p().transactionOperationBytes,
-            (gUseMultipleOplogEntryFormatForTransactions && isFCV42) ||
-                p().transactionOperationBytes <= BSONObjMaxInternalSize);
+            isFCV42 || p().transactionOperationBytes <= BSONObjMaxInternalSize);
 }
 
 std::vector<repl::ReplOperation>&
@@ -1172,20 +1173,6 @@ void TransactionParticipant::Participant::commitUnpreparedTransaction(OperationC
     auto opObserver = opCtx->getServiceContext()->getOpObserver();
     invariant(opObserver);
 
-    auto abortGuard = makeGuard([&] {
-        if (gUseMultipleOplogEntryFormatForTransactions &&
-            serverGlobalParams.featureCompatibility.getVersion() ==
-                ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42) {
-            // We should already be holding the RSTL if we have performed a read or write
-            // as part of this unprepared transaction.
-            invariant(opCtx->lockState()->isRSTLLocked());
-            opCtx->runWithoutInterruptionExceptAtGlobalShutdown([&] {
-                _abortActiveTransaction(
-                    opCtx, TransactionState::kInProgress, true /* writeOplog */);
-            });
-        }
-    });
-
     opObserver->onUnpreparedTransactionCommit(opCtx, txnOps);
 
     // Read-only transactions with all read concerns must wait for any data they read to be majority
@@ -1207,8 +1194,6 @@ void TransactionParticipant::Participant::commitUnpreparedTransaction(OperationC
         // before this point in the function, entry point will abort the transaction.
         o(lk).txnState.transitionTo(TransactionState::kCommittingWithoutPrepare);
     }
-
-    abortGuard.dismiss();
 
     try {
         // Once entering "committing without prepare" we cannot throw an exception.

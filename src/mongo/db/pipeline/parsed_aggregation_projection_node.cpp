@@ -65,6 +65,19 @@ void ProjectionNode::addExpressionForPath(const FieldPath& path,
     addOrGetChild(path.getFieldName(0).toString())->addExpressionForPath(path.tail(), expr);
 }
 
+boost::intrusive_ptr<Expression> ProjectionNode::getExpressionForPath(const FieldPath& path) const {
+    if (path.getPathLength() == 1) {
+        if (_expressions.find(path.getFieldName(0)) != _expressions.end()) {
+            return _expressions.at(path.getFieldName(0));
+        }
+        return nullptr;
+    }
+    if (auto child = getChild(path.getFieldName(0).toString())) {
+        return child->getExpressionForPath(path.tail());
+    }
+    return nullptr;
+}
+
 ProjectionNode* ProjectionNode::addOrGetChild(const std::string& field) {
     auto child = getChild(field);
     return child ? child : addChild(field);
@@ -159,7 +172,10 @@ void ProjectionNode::applyExpressions(const Document& root, MutableDocument* out
         } else {
             auto expressionIt = _expressions.find(field);
             invariant(expressionIt != _expressions.end());
-            outputDoc->setField(field, expressionIt->second->evaluate(root));
+            outputDoc->setField(
+                field,
+                expressionIt->second->evaluate(
+                    root, &expressionIt->second->getExpressionContext()->variables));
         }
     }
 }

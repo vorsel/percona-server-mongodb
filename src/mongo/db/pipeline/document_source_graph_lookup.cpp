@@ -31,6 +31,8 @@
 
 #include "mongo/db/pipeline/document_source_graph_lookup.h"
 
+#include <memory>
+
 #include "mongo/base/init.h"
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/jsobj.h"
@@ -41,7 +43,6 @@
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/value.h"
 #include "mongo/db/query/query_planner_common.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -334,7 +335,7 @@ void DocumentSourceGraphLookUp::performSearch() {
     // Make sure _input is set before calling performSearch().
     invariant(_input);
 
-    Value startingValue = _startWith->evaluate(*_input);
+    Value startingValue = _startWith->evaluate(*_input, &pExpCtx->variables);
 
     // If _startWith evaluates to an array, treat each value as a separate starting point.
     if (startingValue.isArray()) {
@@ -364,6 +365,10 @@ DocumentSource::GetModPathsReturn DocumentSourceGraphLookUp::getModifiedPaths() 
 Pipeline::SourceContainer::iterator DocumentSourceGraphLookUp::doOptimizeAt(
     Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
     invariant(*itr == this);
+
+    if (std::next(itr) == container->end()) {
+        return container->end();
+    }
 
     // If we are not already handling an $unwind stage internally, we can combine with the following
     // $unwind stage.

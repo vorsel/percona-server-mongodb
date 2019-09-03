@@ -84,10 +84,10 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_size_storer.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/background.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
 #include "mongo/util/concurrency/ticketholder.h"
+#include "mongo/util/debug_util.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
 #include "mongo/util/processinfo.h"
@@ -372,7 +372,7 @@ public:
                 // Do KeysDB checkpoint
                 auto encryptionKeyDB = _sessionCache->getKVEngine()->getEncryptionKeyDB();
                 if (encryptionKeyDB) {
-                    std::unique_ptr<WiredTigerSession> sess = stdx::make_unique<WiredTigerSession>(encryptionKeyDB->getConnection());
+                    std::unique_ptr<WiredTigerSession> sess = std::make_unique<WiredTigerSession>(encryptionKeyDB->getConnection());
                     WT_SESSION* s = sess->getSession();
                     invariantWTOK(s->checkpoint(s, "use_timestamp=false"));
                 }
@@ -514,7 +514,7 @@ Status OpenReadTransactionParam::setFromString(const std::string& str) {
 
 namespace {
 
-stdx::function<bool(StringData)> initRsOplogBackgroundThreadCallback = [](StringData) -> bool {
+std::function<bool(StringData)> initRsOplogBackgroundThreadCallback = [](StringData) -> bool {
     fassertFailed(40358);
 };
 
@@ -597,12 +597,13 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
                                        ClockSource* cs,
                                        const std::string& extraOpenOptions,
                                        size_t cacheSizeMB,
+                                       size_t maxCacheOverflowFileSizeMB,
                                        bool durable,
                                        bool ephemeral,
                                        bool repair,
                                        bool readOnly)
     : _clockSource(cs),
-      _oplogManager(stdx::make_unique<WiredTigerOplogManager>()),
+      _oplogManager(std::make_unique<WiredTigerOplogManager>()),
       _canonicalName(canonicalName),
       _path(path),
       _sizeStorerSyncTracker(cs, 100000, Seconds(60)),
@@ -675,7 +676,7 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
                 }
             }
         }
-        auto encryptionKeyDB = stdx::make_unique<EncryptionKeyDB>(just_created, keyDBPath.string());
+        auto encryptionKeyDB = std::make_unique<EncryptionKeyDB>(just_created, keyDBPath.string());
         encryptionKeyDB->init();
         keyDBPathGuard.dismiss();
         // do master key rotation if necessary
@@ -694,7 +695,7 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
                 log() << "error creating rotation directory " << newKeyDBPath.string() << ' ' << e.what();
                 throw;
             }
-            auto rotationKeyDB = stdx::make_unique<EncryptionKeyDB>(newKeyDBPath.string(), true);
+            auto rotationKeyDB = std::make_unique<EncryptionKeyDB>(newKeyDBPath.string(), true);
             rotationKeyDB->init();
             rotationKeyDB->clone(encryptionKeyDB.get());
             // store new key to the Vault
@@ -717,14 +718,15 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
         // setup encryption hooks
         // WiredTigerEncryptionHooks instance should be created after EncryptionKeyDB (depends on it)
         if (encryptionGlobalParams.encryptionCipherMode == "AES256-CBC")
-            EncryptionHooks::set(getGlobalServiceContext(), stdx::make_unique<WiredTigerEncryptionHooksCBC>());
+            EncryptionHooks::set(getGlobalServiceContext(), std::make_unique<WiredTigerEncryptionHooksCBC>());
         else // AES256-GCM
-            EncryptionHooks::set(getGlobalServiceContext(), stdx::make_unique<WiredTigerEncryptionHooksGCM>());
+            EncryptionHooks::set(getGlobalServiceContext(), std::make_unique<WiredTigerEncryptionHooksGCM>());
     }
 
     std::stringstream ss;
     ss << "create,";
     ss << "cache_size=" << cacheSizeMB << "M,";
+    ss << "cache_overflow=(file_max=" << maxCacheOverflowFileSizeMB << "M),";
     ss << "session_max=33000,";
     ss << "eviction=(threads_min=4,threads_max=4),";
     ss << "config_base=false,";
@@ -749,6 +751,11 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
         if (shouldLog(::mongo::logger::LogComponent::kStorageRecovery,
                       logger::LogSeverity::Debug(3))) {
             ss << "verbose=(recovery),";
+        }
+
+        // Enable debug write-ahead logging for all tables under debug build.
+        if (kDebugBuild) {
+            ss << "debug_mode=(table_logging=true),";
         }
     }
     ss << WiredTigerCustomizationHooks::get(getGlobalServiceContext())
@@ -806,11 +813,11 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
 
     _sessionCache.reset(new WiredTigerSessionCache(this));
 
-    _sessionSweeper = stdx::make_unique<WiredTigerSessionSweeper>(_sessionCache.get());
+    _sessionSweeper = std::make_unique<WiredTigerSessionSweeper>(_sessionCache.get());
     _sessionSweeper->go();
 
     if (_durable && !_ephemeral) {
-        _journalFlusher = stdx::make_unique<WiredTigerJournalFlusher>(_sessionCache.get());
+        _journalFlusher = std::make_unique<WiredTigerJournalFlusher>(_sessionCache.get());
         _journalFlusher->go();
     }
 
@@ -825,8 +832,7 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
             setStableTimestamp(_recoveryTimestamp, false);
         }
 
-        _checkpointThread =
-            stdx::make_unique<WiredTigerCheckpointThread>(this, _sessionCache.get());
+        _checkpointThread = std::make_unique<WiredTigerCheckpointThread>(this, _sessionCache.get());
         _checkpointThread->go();
     }
 
@@ -1141,7 +1147,7 @@ Status WiredTigerKVEngine::beginBackup(OperationContext* opCtx) {
     syncSizeInfo(true);
 
     // This cursor will be freed by the backupSession being closed as the session is uncached
-    auto session = stdx::make_unique<WiredTigerSession>(_conn);
+    auto session = std::make_unique<WiredTigerSession>(_conn);
     WT_CURSOR* c = NULL;
     WT_SESSION* s = session->getSession();
     int ret = WT_OP_CHECK(s->open_cursor(s, "backup:", NULL, NULL, &c));
@@ -1171,7 +1177,7 @@ StatusWith<std::vector<std::string>> WiredTigerKVEngine::beginNonBlockingBackup(
     syncSizeInfo(true);
 
     // This cursor will be freed by the backupSession being closed as the session is uncached
-    auto sessionRaii = stdx::make_unique<WiredTigerSession>(_conn);
+    auto sessionRaii = std::make_unique<WiredTigerSession>(_conn);
     WT_CURSOR* cursor = NULL;
     WT_SESSION* session = sessionRaii->getSession();
     int wtRet = session->open_cursor(session, "backup:", NULL, NULL, &cursor);
@@ -1227,7 +1233,7 @@ StatusWith<std::vector<std::string>> WiredTigerKVEngine::extendBackupCursor(
 // Can throw standard exceptions
 static void copy_file_size(const boost::filesystem::path& srcFile, const boost::filesystem::path& destFile, boost::uintmax_t fsize) {
     constexpr int bufsize = 8 * 1024;
-    auto buf = stdx::make_unique<char[]>(bufsize);
+    auto buf = std::make_unique<char[]>(bufsize);
     auto bufptr = buf.get();
 
     std::ifstream src{};
@@ -1268,7 +1274,7 @@ Status WiredTigerKVEngine::hotBackup(OperationContext* opCtx, const std::string&
     // Prevent any DB writes between two backup cursors
     std::unique_ptr<Lock::GlobalRead> global;
     if (_encryptionKeyDB) {
-        global = stdx::make_unique<decltype(global)::element_type>(opCtx);
+        global = std::make_unique<decltype(global)::element_type>(opCtx);
     }
 
     // Open backup cursor in new session, the session will kill the
@@ -1545,9 +1551,9 @@ std::unique_ptr<RecordStore> WiredTigerKVEngine::getGroupedRecordStore(
 
     std::unique_ptr<WiredTigerRecordStore> ret;
     if (prefix == KVPrefix::kNotPrefixed) {
-        ret = stdx::make_unique<StandardWiredTigerRecordStore>(this, opCtx, params);
+        ret = std::make_unique<StandardWiredTigerRecordStore>(this, opCtx, params);
     } else {
-        ret = stdx::make_unique<PrefixedWiredTigerRecordStore>(this, opCtx, params, prefix);
+        ret = std::make_unique<PrefixedWiredTigerRecordStore>(this, opCtx, params, prefix);
     }
     ret->postConstructorInit(opCtx);
 
@@ -1595,15 +1601,13 @@ Status WiredTigerKVEngine::createGroupedSortedDataInterface(OperationContext* op
     return wtRCToStatus(WiredTigerIndex::Create(opCtx, _uri(ident), config));
 }
 
-SortedDataInterface* WiredTigerKVEngine::getGroupedSortedDataInterface(OperationContext* opCtx,
-                                                                       StringData ident,
-                                                                       const IndexDescriptor* desc,
-                                                                       KVPrefix prefix) {
+std::unique_ptr<SortedDataInterface> WiredTigerKVEngine::getGroupedSortedDataInterface(
+    OperationContext* opCtx, StringData ident, const IndexDescriptor* desc, KVPrefix prefix) {
     if (desc->unique()) {
-        return new WiredTigerIndexUnique(opCtx, _uri(ident), desc, prefix, _readOnly);
+        return std::make_unique<WiredTigerIndexUnique>(opCtx, _uri(ident), desc, prefix, _readOnly);
     }
 
-    return new WiredTigerIndexStandard(opCtx, _uri(ident), desc, prefix, _readOnly);
+    return std::make_unique<WiredTigerIndexStandard>(opCtx, _uri(ident), desc, prefix, _readOnly);
 }
 
 std::unique_ptr<RecordStore> WiredTigerKVEngine::makeTemporaryRecordStore(OperationContext* opCtx,
@@ -1641,7 +1645,7 @@ std::unique_ptr<RecordStore> WiredTigerKVEngine::makeTemporaryRecordStore(Operat
     params.cappedMaxDocs = -1;
 
     std::unique_ptr<WiredTigerRecordStore> rs;
-    rs = stdx::make_unique<StandardWiredTigerRecordStore>(this, opCtx, params);
+    rs = std::make_unique<StandardWiredTigerRecordStore>(this, opCtx, params);
     rs->postConstructorInit(opCtx);
 
     return std::move(rs);
@@ -1887,7 +1891,7 @@ void WiredTigerKVEngine::setJournalListener(JournalListener* jl) {
 }
 
 void WiredTigerKVEngine::setInitRsOplogBackgroundThreadCallback(
-    stdx::function<bool(StringData)> cb) {
+    std::function<bool(StringData)> cb) {
     initRsOplogBackgroundThreadCallback = std::move(cb);
 }
 

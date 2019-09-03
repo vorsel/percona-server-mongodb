@@ -194,7 +194,7 @@ bool isExactIdQuery(OperationContext* opCtx,
                     const BSONObj query,
                     const BSONObj collation,
                     ChunkManager* manager) {
-    auto qr = stdx::make_unique<QueryRequest>(nss);
+    auto qr = std::make_unique<QueryRequest>(nss);
     qr->setFilter(query);
     if (!collation.isEmpty()) {
         qr->setCollation(collation);
@@ -340,9 +340,10 @@ ChunkManagerTargeter::ChunkManagerTargeter(const NamespaceString& nss,
 
 
 Status ChunkManagerTargeter::init(OperationContext* opCtx) {
-    auto shardDbStatus = createShardDatabase(opCtx, _nss.db());
-    if (!shardDbStatus.isOK()) {
-        return shardDbStatus.getStatus();
+    try {
+        createShardDatabase(opCtx, _nss.db());
+    } catch (const DBException& e) {
+        return e.toStatus();
     }
 
     const auto routingInfoStatus = getCollectionRoutingInfoForTxnCmd(opCtx, _nss);
@@ -540,7 +541,7 @@ StatusWith<std::vector<ShardEndpoint>> ChunkManagerTargeter::targetDelete(
     // We failed to target a single shard.
 
     // Parse delete query.
-    auto qr = stdx::make_unique<QueryRequest>(getNS());
+    auto qr = std::make_unique<QueryRequest>(getNS());
     qr->setFilter(deleteDoc.getQ());
     if (!collation.isEmpty()) {
         qr->setCollation(collation);

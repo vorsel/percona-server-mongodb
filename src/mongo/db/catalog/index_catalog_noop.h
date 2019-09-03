@@ -128,10 +128,6 @@ public:
         return {};
     }
 
-    Status checkUnfinished() const override {
-        return Status::OK();
-    }
-
     std::unique_ptr<IndexIterator> getIndexIterator(
         OperationContext* const opCtx, const bool includeUnfinishedIndexes) const override {
         return {};
@@ -161,7 +157,7 @@ public:
 
     void dropAllIndexes(OperationContext* opCtx,
                         bool includingIdIndex,
-                        stdx::function<void(const IndexDescriptor*)> onDropFn) override {}
+                        std::function<void(const IndexDescriptor*)> onDropFn) override {}
 
     void dropAllIndexes(OperationContext* opCtx, bool includingIdIndex) override {}
 

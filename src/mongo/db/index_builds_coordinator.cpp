@@ -170,42 +170,46 @@ StatusWith<std::pair<long long, long long>> IndexBuildsCoordinator::startIndexRe
         indexNames.push_back(name);
     }
 
-    const auto& ns = cce->ns().ns();
-    auto rs = cce->getRecordStore();
+    const NamespaceString nss(cce->ns());
 
     ReplIndexBuildState::IndexCatalogStats indexCatalogStats;
 
-    std::unique_ptr<Collection> collection;
+    auto& collectionCatalog = CollectionCatalog::get(getGlobalServiceContext());
+    Collection* collection = collectionCatalog.lookupCollectionByNamespace(nss);
+    auto indexCatalog = collection->getIndexCatalog();
     std::unique_ptr<MultiIndexBlock> indexer;
     {
         // These steps are combined into a single WUOW to ensure there are no commits without
         // the indexes.
         // 1) Drop all indexes.
-        // 2) Open the Collection
+        // 2) Re-create the Collection.
         // 3) Start the index build process.
-
         WriteUnitOfWork wuow(opCtx);
 
-        {  // 1
+        // 1
+        {
             for (size_t i = 0; i < indexNames.size(); i++) {
-                Status s = cce->removeIndex(opCtx, indexNames[i]);
+                auto descriptor = indexCatalog->findIndexByName(opCtx, indexNames[i], false);
+                if (!descriptor) {
+                    // If it's unfinished index, drop it directly via removeIndex.
+                    Status status =
+                        collection->getCatalogEntry()->removeIndex(opCtx, indexNames[i]);
+                    continue;
+                }
+                Status s = indexCatalog->dropIndex(opCtx, descriptor);
                 if (!s.isOK()) {
                     return s;
                 }
             }
         }
 
-        // Indexes must be dropped before we open the Collection otherwise we could attempt to
-        // open a bad index and fail.
-        const auto uuid = cce->getCollectionOptions(opCtx).uuid;
-        auto databaseHolder = DatabaseHolder::get(opCtx);
-        collection = databaseHolder->makeCollection(opCtx, ns, uuid, cce, rs);
+        // We need to initialize the collection to drop and rebuild the indexes.
+        collection->init(opCtx);
 
         // Register the index build. During recovery, collections may not have UUIDs present yet to
         // due upgrading. We don't require collection UUIDs during recovery except to create a
         // ReplIndexBuildState object.
         auto collectionUUID = UUID::gen();
-        auto nss = collection->ns();
         auto dbName = nss.db().toString();
 
         // We run the index build using the single phase protocol as we already hold the global
@@ -228,12 +232,12 @@ StatusWith<std::pair<long long, long long>> IndexBuildsCoordinator::startIndexRe
 
         // Setup the index build.
         indexCatalogStats.numIndexesBefore =
-            _getNumIndexesTotal(opCtx, collection.get()) + indexNames.size();
+            _getNumIndexesTotal(opCtx, collection) + indexNames.size();
 
         IndexBuildsManager::SetupOptions options;
         options.forRecovery = true;
         status = _indexBuildsManager.setUpIndexBuild(
-            opCtx, collection.get(), specs, buildUUID, MultiIndexBlock::kNoopOnInitFn, options);
+            opCtx, collection, specs, buildUUID, MultiIndexBlock::kNoopOnInitFn, options);
         if (!status.isOK()) {
             // An index build failure during recovery is fatal.
             logFailure(status, nss, replIndexBuildState);
@@ -243,7 +247,7 @@ StatusWith<std::pair<long long, long long>> IndexBuildsCoordinator::startIndexRe
         wuow.commit();
     }
 
-    return _runIndexRebuildForRecovery(opCtx, collection.get(), indexCatalogStats, buildUUID);
+    return _runIndexRebuildForRecovery(opCtx, collection, indexCatalogStats, buildUUID);
 }
 
 Future<void> IndexBuildsCoordinator::joinIndexBuilds(const NamespaceString& nss,
@@ -749,9 +753,12 @@ void IndexBuildsCoordinator::_runIndexBuildInner(OperationContext* opCtx,
     // Set up the thread's currentOp information to display createIndexes cmd information.
     _updateCurOpOpDescription(opCtx, *nss, replState->indexSpecs);
 
-    // Do not use AutoGetOrCreateDb because we may relock the database in mode IX.
-    boost::optional<Lock::DBLock> dbLock;
-    dbLock.emplace(opCtx, nss->db(), MODE_X);
+    AutoGetDb autoDb(opCtx, nss->db(), MODE_IX);
+
+    // Do not use AutoGetCollection since the lock will be in various modes throughout the index
+    // build.
+    boost::optional<Lock::CollectionLock> collLock;
+    collLock.emplace(opCtx, *nss, MODE_X);
 
     // Allow the strong lock acquisition above to be interrupted, but from this point forward do
     // not allow locks or re-locks to be interrupted.
@@ -777,21 +784,14 @@ void IndexBuildsCoordinator::_runIndexBuildInner(OperationContext* opCtx,
             // accordingly (checkForInterrupt() will throw an exception while
             // checkForInterruptNoAssert() returns an error Status).
             opCtx->runWithoutInterruptionExceptAtGlobalShutdown(
-                [&, this] { _buildIndex(opCtx, collection, *nss, replState, &*dbLock); });
+                [&, this] { _buildIndex(opCtx, collection, *nss, replState, &collLock); });
         } else {
-            _buildIndex(opCtx, collection, *nss, replState, &*dbLock);
+            _buildIndex(opCtx, collection, *nss, replState, &collLock);
         }
         replState->stats.numIndexesAfter = _getNumIndexesTotal(opCtx, collection);
         status = Status::OK();
     } catch (const DBException& ex) {
         status = ex.toStatus();
-    }
-
-    // We could return from _buildIndex without the DBLock, if the build was interrupted while
-    // yielding.
-    if (!opCtx->lockState()->isDbLockedForMode(replState->dbName, MODE_X)) {
-        dbLock.reset();  // Might still have the Global lock, so be sure to clear it out first here.
-        dbLock.emplace(opCtx, nss->db(), MODE_X);
     }
 
     if (replSetAndNotPrimary && status == ErrorCodes::InterruptedAtShutdown) {
@@ -843,28 +843,27 @@ void IndexBuildsCoordinator::_buildIndex(OperationContext* opCtx,
                                          Collection* collection,
                                          const NamespaceString& nss,
                                          std::shared_ptr<ReplIndexBuildState> replState,
-                                         Lock::DBLock* dbLock) {
-    invariant(opCtx->lockState()->isDbLockedForMode(replState->dbName, MODE_X));
+                                         boost::optional<Lock::CollectionLock>* collLock) {
+    invariant(opCtx->lockState()->isDbLockedForMode(nss.db(), MODE_IX));
+    invariant(opCtx->lockState()->isCollectionLockedForMode(nss, MODE_X));
 
+    // Rebuilding system indexes during startup using the IndexBuildsCoordinator is done by all
+    // storage engines if they're missing. This includes the mobile storage engine which builds
+    // its indexes in the foreground.
+    invariant(_indexBuildsManager.isBackgroundBuilding(replState->buildUUID) ||
+              storageGlobalParams.engine == "mobile");
 
-    // Index builds can safely ignore prepare conflicts. On secondaries, prepare operations wait for
-    // index builds to complete.
+    // Index builds can safely ignore prepare conflicts and perform writes. On secondaries, prepare
+    // operations wait for index builds to complete.
     opCtx->recoveryUnit()->abandonSnapshot();
-    opCtx->recoveryUnit()->setIgnorePrepared(true);
-
-    // If we're a background index, replace exclusive db lock with an intent lock, so that
-    // other readers and writers can proceed during this phase.
-    if (_indexBuildsManager.isBackgroundBuilding(replState->buildUUID)) {
-        dbLock->relockWithMode(MODE_IX);
-    }
+    opCtx->recoveryUnit()->setPrepareConflictBehavior(
+        PrepareConflictBehavior::kIgnoreConflictsAllowWrites);
 
     // Collection scan and insert into index, followed by a drain of writes received in the
     // background.
-    {
-        Lock::CollectionLock colLock(opCtx, nss, MODE_IX);
-        uassertStatusOK(
-            _indexBuildsManager.startBuildingIndex(opCtx, collection, replState->buildUUID));
-    }
+    collLock->emplace(opCtx, nss, MODE_IX);
+    uassertStatusOK(
+        _indexBuildsManager.startBuildingIndex(opCtx, collection, replState->buildUUID));
 
     if (MONGO_FAIL_POINT(hangAfterIndexBuildDumpsInsertsFromBulk)) {
         log() << "Hanging after dumping inserts from bulk builder";
@@ -872,13 +871,10 @@ void IndexBuildsCoordinator::_buildIndex(OperationContext* opCtx,
     }
 
     // Perform the first drain while holding an intent lock.
-    {
-        opCtx->recoveryUnit()->abandonSnapshot();
-        Lock::CollectionLock colLock(opCtx, nss, MODE_IS);
-
-        uassertStatusOK(_indexBuildsManager.drainBackgroundWrites(
-            opCtx, replState->buildUUID, RecoveryUnit::ReadSource::kUnset));
-    }
+    opCtx->recoveryUnit()->abandonSnapshot();
+    collLock->emplace(opCtx, nss, MODE_IS);
+    uassertStatusOK(_indexBuildsManager.drainBackgroundWrites(
+        opCtx, replState->buildUUID, RecoveryUnit::ReadSource::kUnset));
 
     if (MONGO_FAIL_POINT(hangAfterIndexBuildFirstDrain)) {
         log() << "Hanging after index build first drain";
@@ -886,48 +882,45 @@ void IndexBuildsCoordinator::_buildIndex(OperationContext* opCtx,
     }
 
     // Perform the second drain while stopping writes on the collection.
-    {
-        opCtx->recoveryUnit()->abandonSnapshot();
-        Lock::CollectionLock colLock(opCtx, nss, MODE_S);
-
-        uassertStatusOK(_indexBuildsManager.drainBackgroundWrites(
-            opCtx, replState->buildUUID, RecoveryUnit::ReadSource::kUnset));
-    }
+    opCtx->recoveryUnit()->abandonSnapshot();
+    collLock->emplace(opCtx, nss, MODE_S);
+    uassertStatusOK(_indexBuildsManager.drainBackgroundWrites(
+        opCtx, replState->buildUUID, RecoveryUnit::ReadSource::kUnset));
 
     if (MONGO_FAIL_POINT(hangAfterIndexBuildSecondDrain)) {
         log() << "Hanging after index build second drain";
         MONGO_FAIL_POINT_PAUSE_WHILE_SET(hangAfterIndexBuildSecondDrain);
     }
 
-    // Need to return db lock back to exclusive, to complete the index build.
-    if (_indexBuildsManager.isBackgroundBuilding(replState->buildUUID)) {
-        opCtx->recoveryUnit()->abandonSnapshot();
-        dbLock->relockWithMode(MODE_X);
+    // Need to return the collection lock back to exclusive mode, to complete the index build.
+    opCtx->recoveryUnit()->abandonSnapshot();
+    collLock->emplace(opCtx, nss, MODE_X);
 
-        auto db = DatabaseHolder::get(opCtx)->getDb(opCtx, nss.db());
-        if (db) {
-            auto& dss = DatabaseShardingState::get(db);
-            auto dssLock = DatabaseShardingState::DSSLock::lock(opCtx, &dss);
-            dss.checkDbVersion(opCtx, dssLock);
-        }
-
-        invariant(db,
-                  str::stream() << "Database not found after relocking. Index build: "
-                                << replState->buildUUID
-                                << ": "
-                                << nss
-                                << " ("
-                                << replState->collectionUUID
-                                << ")");
-        invariant(db->getCollection(opCtx, nss),
-                  str::stream() << "Collection not found after relocking. Index build: "
-                                << replState->buildUUID
-                                << ": "
-                                << nss
-                                << " ("
-                                << replState->collectionUUID
-                                << ")");
+    // We hold the database MODE_IX lock throughout the index build.
+    auto db = DatabaseHolder::get(opCtx)->getDb(opCtx, nss.db());
+    if (db) {
+        auto& dss = DatabaseShardingState::get(db);
+        auto dssLock = DatabaseShardingState::DSSLock::lock(opCtx, &dss);
+        dss.checkDbVersion(opCtx, dssLock);
     }
+
+    invariant(db,
+              str::stream() << "Database not found after relocking. Index build: "
+                            << replState->buildUUID
+                            << ": "
+                            << nss
+                            << " ("
+                            << replState->collectionUUID
+                            << ")");
+
+    invariant(db->getCollection(opCtx, nss),
+              str::stream() << "Collection not found after relocking. Index build: "
+                            << replState->buildUUID
+                            << ": "
+                            << nss
+                            << " ("
+                            << replState->collectionUUID
+                            << ")");
 
     // Perform the third and final drain after releasing a shared lock and reacquiring an
     // exclusive lock on the database.

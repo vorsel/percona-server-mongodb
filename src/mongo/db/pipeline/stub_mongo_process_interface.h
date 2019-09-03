@@ -63,31 +63,21 @@ public:
         return false;
     }
 
-    void insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                const NamespaceString& ns,
-                std::vector<BSONObj>&& objs,
-                const WriteConcernOptions& wc,
-                boost::optional<OID>) override {
+    Status insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                  const NamespaceString& ns,
+                  std::vector<BSONObj>&& objs,
+                  const WriteConcernOptions& wc,
+                  boost::optional<OID>) override {
         MONGO_UNREACHABLE;
     }
 
-    void update(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                const NamespaceString& ns,
-                BatchedObjects&& batch,
-                const WriteConcernOptions& wc,
-                bool upsert,
-                bool multi,
-                boost::optional<OID>) final {
-        MONGO_UNREACHABLE;
-    }
-
-    WriteResult updateWithResult(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                 const NamespaceString& ns,
-                                 BatchedObjects&& batch,
-                                 const WriteConcernOptions& wc,
-                                 bool upsert,
-                                 bool multi,
-                                 boost::optional<OID> targetEpoch) final override {
+    StatusWith<UpdateResult> update(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                    const NamespaceString& ns,
+                                    BatchedObjects&& batch,
+                                    const WriteConcernOptions& wc,
+                                    bool upsert,
+                                    bool multi,
+                                    boost::optional<OID>) final {
         MONGO_UNREACHABLE;
     }
 
@@ -143,6 +133,11 @@ public:
 
     std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipelineForLocalRead(
         const boost::intrusive_ptr<ExpressionContext>& expCtx, Pipeline* pipeline) override {
+        MONGO_UNREACHABLE;
+    }
+
+    std::unique_ptr<ShardFilterer> getShardFilterer(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx) const override {
         MONGO_UNREACHABLE;
     }
 
