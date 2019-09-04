@@ -184,7 +184,7 @@ void generateCompletions(const std::string& prefix, std::vector<std::string>& al
     try {
         BSONObj args = BSON("0" << prefix);
         shellMainScope->invokeSafe(
-            "function callShellAutocomplete(x) {shellAutocomplete(x)}", &args, NULL);
+            "function callShellAutocomplete(x) {shellAutocomplete(x)}", &args, nullptr);
         BSONObjBuilder b;
         shellMainScope->append(b, "", "__autocomplete__");
         BSONObj res = b.obj();
@@ -543,7 +543,7 @@ static void edit(const std::string& whatToEdit) {
         GetTempPathA(sizeof tempFolder, tempFolder);
         sb << tempFolder << "mongo_edit" << time(0) + i << ".js";
 #else
-        sb << "/tmp/mongo_edit" << time(0) + i << ".js";
+        sb << "/tmp/mongo_edit" << time(nullptr) + i << ".js";
 #endif
         filename = sb.str();
         if (!::mongo::shell_utils::fileExists(filename))
@@ -780,7 +780,7 @@ int _main(int argc, char* argv[], char** envp) {
     rcGlobalLocation = "/etc/mongorc.js";
 #else
     wchar_t programDataPath[MAX_PATH];
-    if (S_OK == SHGetFolderPathW(NULL, CSIDL_COMMON_APPDATA, NULL, 0, programDataPath)) {
+    if (S_OK == SHGetFolderPathW(nullptr, CSIDL_COMMON_APPDATA, nullptr, 0, programDataPath)) {
         rcGlobalLocation = str::stream() << toUtf8String(programDataPath)
                                          << "\\MongoDB\\mongorc.js";
     }
@@ -834,7 +834,7 @@ int _main(int argc, char* argv[], char** envp) {
                 "function() { return typeof TestData === 'object' && TestData !== null && "
                 "TestData.hasOwnProperty('failIfUnterminatedProcesses') && "
                 "TestData.failIfUnterminatedProcesses; }"_sd;
-            shellMainScope->invokeSafe(code.rawData(), 0, 0);
+            shellMainScope->invokeSafe(code.rawData(), nullptr, nullptr);
             failIfUnterminatedProcesses = shellMainScope->getBoolean("__returnValue");
 
             if (failIfUnterminatedProcesses) {
@@ -858,10 +858,10 @@ int _main(int argc, char* argv[], char** envp) {
         std::string rcLocation;
         if (!shellGlobalParams.norc) {
 #ifndef _WIN32
-            if (getenv("HOME") != NULL)
+            if (getenv("HOME") != nullptr)
                 rcLocation = str::stream() << getenv("HOME") << "/.mongorc.js";
 #else
-            if (getenv("HOMEDRIVE") != NULL && getenv("HOMEPATH") != NULL)
+            if (getenv("HOMEDRIVE") != nullptr && getenv("HOMEPATH") != nullptr)
                 rcLocation = str::stream() << toUtf8String(_wgetenv(L"HOMEDRIVE"))
                                            << toUtf8String(_wgetenv(L"HOMEPATH"))
                                            << "\\.mongorc.js";

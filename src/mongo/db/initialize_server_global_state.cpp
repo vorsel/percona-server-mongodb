@@ -177,21 +177,21 @@ static bool forkServer() {
         // this is run in the final child process (the server)
 
         FILE* f = freopen("/dev/null", "w", stdout);
-        if (f == NULL) {
+        if (f == nullptr) {
             cout << "Cant reassign stdout while forking server process: " << strerror(errno)
                  << endl;
             return false;
         }
 
         f = freopen("/dev/null", "w", stderr);
-        if (f == NULL) {
+        if (f == nullptr) {
             cout << "Cant reassign stderr while forking server process: " << strerror(errno)
                  << endl;
             return false;
         }
 
         f = freopen("/dev/null", "r", stdin);
-        if (f == NULL) {
+        if (f == nullptr) {
             cout << "Cant reassign stdin while forking server process: " << strerror(errno) << endl;
             return false;
         }
@@ -360,7 +360,7 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(MungeUmask, ("EndStartupOptionHandling"))
 }
 }  // namespace
 
-bool initializeServerGlobalState(ServiceContext* service) {
+bool initializeServerGlobalState(ServiceContext* service, PidFileWrite pidWrite) {
 #ifndef _WIN32
     if (!serverGlobalParams.noUnixSocket && !fs::is_directory(serverGlobalParams.socket)) {
         cout << serverGlobalParams.socket << " must be a directory" << endl;
@@ -368,7 +368,7 @@ bool initializeServerGlobalState(ServiceContext* service) {
     }
 #endif
 
-    if (!serverGlobalParams.pidFile.empty()) {
+    if (!serverGlobalParams.pidFile.empty() && pidWrite == PidFileWrite::kWrite) {
         if (!writePidFile(serverGlobalParams.pidFile)) {
             // error message logged in writePidFile
             return false;

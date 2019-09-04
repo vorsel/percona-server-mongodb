@@ -1502,7 +1502,7 @@ Status WiredTigerRecordStore::truncate(OperationContext* opCtx) {
     invariantWTOK(ret);
 
     WT_SESSION* session = WiredTigerRecoveryUnit::get(opCtx)->getSession()->getSession();
-    invariantWTOK(WT_OP_CHECK(session->truncate(session, NULL, start, NULL, NULL)));
+    invariantWTOK(WT_OP_CHECK(session->truncate(session, nullptr, start, nullptr, nullptr)));
     _changeNumRecords(opCtx, -numRecords(opCtx));
     _increaseDataSize(opCtx, -dataSize(opCtx));
 
@@ -1714,7 +1714,7 @@ public:
     DataSizeChange(WiredTigerRecordStore* rs, int64_t amount) : _rs(rs), _amount(amount) {}
     virtual void commit(boost::optional<Timestamp>) {}
     virtual void rollback() {
-        _rs->_increaseDataSize(NULL, -_amount);
+        _rs->_increaseDataSize(nullptr, -_amount);
     }
 
 private:
@@ -1854,6 +1854,7 @@ WiredTigerRecordStoreCursorBase::WiredTigerRecordStoreCursorBase(OperationContex
 }
 
 boost::optional<Record> WiredTigerRecordStoreCursorBase::next() {
+    invariant(_hasRestored);
     if (_eof)
         return {};
 
@@ -1908,6 +1909,7 @@ boost::optional<Record> WiredTigerRecordStoreCursorBase::next() {
 }
 
 boost::optional<Record> WiredTigerRecordStoreCursorBase::seekExact(const RecordId& id) {
+    invariant(_hasRestored);
     if (_oplogVisibleTs && id.repr() > *_oplogVisibleTs) {
         _eof = true;
         return {};
@@ -1939,6 +1941,7 @@ void WiredTigerRecordStoreCursorBase::save() {
         if (_cursor)
             _cursor->reset();
         _oplogVisibleTs = boost::none;
+        _hasRestored = false;
     } catch (const WriteConflictException&) {
         // Ignore since this is only called when we are about to kill our transaction
         // anyway.
@@ -1963,6 +1966,7 @@ bool WiredTigerRecordStoreCursorBase::restore() {
     // This will ensure an active session exists, so any restored cursors will bind to it
     invariant(WiredTigerRecoveryUnit::get(_opCtx)->getSession() == _cursor->getSession());
     _skipNextAdvance = false;
+    _hasRestored = true;
 
     // If we've hit EOF, then this iterator is done and need not be restored.
     if (_eof)

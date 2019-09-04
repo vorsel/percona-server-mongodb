@@ -5817,6 +5817,39 @@ tasks:
       resmoke_args: --suites=change_streams_whole_cluster_sharded_collections_passthrough --storageEngine=wiredTiger
 
 - <<: *task_template
+  name: change_streams_multi_stmt_txn_passthrough
+  tags: ["change_streams"]
+  depends_on:
+  - name: change_streams
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=change_streams_multi_stmt_txn_passthrough --storageEngine=wiredTiger
+
+- <<: *task_template
+  name: change_streams_multi_stmt_txn_mongos_passthrough
+  tags: ["change_streams"]
+  depends_on:
+  - name: change_streams
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=change_streams_multi_stmt_txn_mongos_passthrough --storageEngine=wiredTiger
+
+- <<: *task_template
+  name: change_streams_multi_stmt_txn_sharded_collections_passthrough
+  tags: ["change_streams"]
+  depends_on:
+  - name: change_streams
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=change_streams_multi_stmt_txn_sharded_collections_passthrough --storageEngine=wiredTiger
+
+- <<: *task_template
   name: disk_mobile
   commands:
   - func: "do setup"
@@ -6843,6 +6876,24 @@ tasks:
       resmoke_args: --storageEngine=wiredTiger
       fallback_num_sub_suites: 15
 
+- name: sharding_rs_matching_disabled_gen
+  tags: ["sharding", "common"]
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      use_large_distro: "true"
+      resmoke_args: --storageEngine=wiredTiger
+      fallback_num_sub_suites: 15
+
+- name: sharding_rs_matching_match_busiest_node_gen
+  tags: ["sharding", "common"]
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      use_large_distro: "true"
+      resmoke_args: --storageEngine=wiredTiger
+      fallback_num_sub_suites: 15
+
 - name: sharding_csrs_continuous_config_stepdown_gen
   tags: ["sharding", "common", "csrs"]
   commands:
@@ -7203,6 +7254,16 @@ tasks:
   - func: "run tests"
     vars:
       resmoke_args: --suites=free_monitoring --storageEngine=wiredTiger
+      resmoke_jobs_max: 1
+
+- <<: *task_template
+  name: client_encrypt
+  tags: ["ssl"]
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=client_encrypt --storageEngine=wiredTiger
       resmoke_jobs_max: 1
 
 - <<: *task_template
@@ -10280,7 +10341,6 @@ buildvariants:
   - name: sharded_multi_stmt_txn_jscore_passthrough
     distros:
     - rhel62-large
-
 - name: enterprise-rhel-62-64-bit-majority-read-concern-off
   display_name: "Enterprise RHEL 6.2 (majority read concern off)"
   modules:
@@ -10667,7 +10727,6 @@ buildvariants:
     distros:
       - rhel62-large
   - name: disk_wiredtiger
-  - name: fle
   - name: free_monitoring
   - name: .jscore .common
   - name: .jstestfuzz .common
@@ -11769,7 +11828,7 @@ buildvariants:
   expansions:
     # Transactions are not explicitly supported on the ephemeralForTest storage engine.
     # Speculative majority reads are currently only allowed for change streams, which are only supported on WiredTiger.
-    test_flags: --storageEngine=ephemeralForTest --excludeWithAnyTags=requires_persistence,requires_fsync,SERVER-21420,SERVER-21658,requires_journaling,requires_wiredtiger,uses_transactions,requires_document_locking,uses_speculative_majority,requires_snapshot_read,requires_majority_read_concern
+    test_flags: --storageEngine=ephemeralForTest --excludeWithAnyTags=requires_persistence,requires_fsync,SERVER-21420,SERVER-21658,requires_journaling,requires_wiredtiger,uses_transactions,requires_document_locking,uses_speculative_majority,requires_snapshot_read,requires_majority_read_concern,uses_change_streams
     compile_flags: -j$(grep -c ^processor /proc/cpuinfo) --dbg=off --opt=on --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
     multiversion_platform: rhel62
     multiversion_edition: targeted

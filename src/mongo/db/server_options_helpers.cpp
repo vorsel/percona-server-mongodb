@@ -91,7 +91,7 @@ CODE facilitynames[] = {{"auth", LOG_AUTH},     {"cron", LOG_CRON},     {"daemon
                         {"syslog", LOG_SYSLOG}, {"user", LOG_USER},     {"uucp", LOG_UUCP},
                         {"local0", LOG_LOCAL0}, {"local1", LOG_LOCAL1}, {"local2", LOG_LOCAL2},
                         {"local3", LOG_LOCAL3}, {"local4", LOG_LOCAL4}, {"local5", LOG_LOCAL5},
-                        {"local6", LOG_LOCAL6}, {"local7", LOG_LOCAL7}, {NULL, -1}};
+                        {"local6", LOG_LOCAL6}, {"local7", LOG_LOCAL7}, {nullptr, -1}};
 
 #endif  // !defined(INTERNAL_NOPRI)
 #endif  // defined(SYSLOG_NAMES)
@@ -340,7 +340,8 @@ Status storeBaseOptions(const moe::Environment& params) {
         bool set = false;
         // match facility string to facility value
         size_t facilitynamesLength = sizeof(facilitynames) / sizeof(facilitynames[0]);
-        for (unsigned long i = 0; i < facilitynamesLength && facilitynames[i].c_name != NULL; i++) {
+        for (unsigned long i = 0; i < facilitynamesLength && facilitynames[i].c_name != nullptr;
+             i++) {
             if (!facility.compare(facilitynames[i].c_name)) {
                 serverGlobalParams.syslogFacility = facilitynames[i].c_val;
                 set = true;
@@ -399,8 +400,8 @@ Status storeBaseOptions(const moe::Environment& params) {
             ServerParameter* parameter =
                 mapFindWithDefault(ServerParameterSet::getGlobal()->getMap(),
                                    parametersIt->first,
-                                   static_cast<ServerParameter*>(NULL));
-            if (NULL == parameter) {
+                                   static_cast<ServerParameter*>(nullptr));
+            if (nullptr == parameter) {
                 StringBuilder sb;
                 sb << "Illegal --setParameter parameter: \"" << parametersIt->first << "\"";
                 return Status(ErrorCodes::BadValue, sb.str());

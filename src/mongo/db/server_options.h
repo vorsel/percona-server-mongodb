@@ -130,7 +130,7 @@ struct ServerGlobalParams {
         bool storageDetailsCmdEnabled;  // -- enableExperimentalStorageDetailsCmd
     } experimental;
 
-    time_t started = ::time(0);
+    time_t started = ::time(nullptr);
 
     BSONArray argvArray;
     BSONObj parsedOpts;

@@ -258,8 +258,9 @@ Future<void> IndexBuildsCoordinator::joinIndexBuilds(const NamespaceString& nss,
     return std::move(pf.future);
 }
 
-void IndexBuildsCoordinator::interruptAllIndexBuilds(const std::string& reason) {
+void IndexBuildsCoordinator::interruptAllIndexBuildsForShutdown(const std::string& reason) {
     stdx::unique_lock<stdx::mutex> lk(_mutex);
+    _shuttingDown = true;
 
     // Signal all the index builds to stop.
     for (auto& buildStateIt : _allIndexBuilds) {
@@ -557,7 +558,7 @@ IndexBuildsCoordinator::_registerAndSetUpIndexBuild(
                                     << "' because the collection no longer exists.");
     }
 
-    AutoGetCollection autoColl(opCtx, *nss, /*modeDB=*/MODE_IX, /*modeColl=*/MODE_X);
+    AutoGetCollection autoColl(opCtx, *nss, MODE_X);
     if (!autoColl.getDb()) {
         return Status(ErrorCodes::NamespaceNotFound,
                       str::stream() << "Failed to create index(es) on collection '" << *nss
@@ -783,6 +784,20 @@ void IndexBuildsCoordinator::_runIndexBuildInner(OperationContext* opCtx,
             // OperationContext::checkForInterrupt() will see the kill status and respond
             // accordingly (checkForInterrupt() will throw an exception while
             // checkForInterruptNoAssert() returns an error Status).
+
+            // We need to drop the RSTL here, as we do not need synchronization with step up and
+            // step down. Dropping the RSTL is important because otherwise if we held the RSTL it
+            // would create deadlocks with prepared transactions on step up and step down.  A
+            // deadlock could result if the index build was attempting to acquire a Collection S or
+            // X lock while a prepared transaction held a Collection IX lock, and a step down was
+            // waiting to acquire the RSTL in mode X.
+            // We should only drop the RSTL while in FCV 4.2, as prepared transactions can only
+            // occur in FCV 4.2.
+            if (serverGlobalParams.featureCompatibility.getVersion() ==
+                ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42) {
+                const bool unlocked = opCtx->lockState()->unlockRSTLforPrepare();
+                invariant(unlocked);
+            }
             opCtx->runWithoutInterruptionExceptAtGlobalShutdown(
                 [&, this] { _buildIndex(opCtx, collection, *nss, replState, &collLock); });
         } else {
@@ -823,6 +838,11 @@ void IndexBuildsCoordinator::_runIndexBuildInner(OperationContext* opCtx,
 
         // Failed index builds should abort secondary oplog application.
         if (replSetAndNotPrimary) {
+            stdx::unique_lock<stdx::mutex> lk(_mutex);
+            if (_shuttingDown) {
+                // Allow shutdown with success exit status, despite interrupted index builds.
+                return;
+            }
             fassert(51101,
                     status.withContext(str::stream() << "Index build: " << replState->buildUUID
                                                      << "; Database: "
@@ -990,6 +1010,9 @@ StatusWith<std::pair<long long, long long>> IndexBuildsCoordinator::_runIndexReb
 
         std::tie(numRecords, dataSize) = uassertStatusOK(
             _indexBuildsManager.startBuildingIndexForRecovery(opCtx, collection->ns(), buildUUID));
+
+        uassertStatusOK(
+            _indexBuildsManager.checkIndexConstraintViolations(opCtx, replState->buildUUID));
 
         // Commit the index build.
         uassertStatusOK(_indexBuildsManager.commitIndexBuild(opCtx,

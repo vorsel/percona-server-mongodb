@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2018-present MongoDB, Inc.
+ *    Copyright (C) 2019-present MongoDB, Inc.
  *
  *    This program is free software: you can redistribute it and/or modify
  *    it under the terms of the Server Side Public License, version 1,
@@ -27,23 +27,27 @@
  *    it in the license file.
  */
 
-#include "mongo/base/make_string_vector.h"
+#include "mongo/db/query/hint_parser.h"
 
-#include <cstdlib>
-#include <iostream>
-#include <stdarg.h>
+#include "mongo/bson/bsonobjbuilder.h"
 
 namespace mongo {
 
-std::vector<std::string> _makeStringVector(int ignored, ...) {
-    va_list ap;
-    va_start(ap, ignored);
-    std::vector<std::string> result;
-    const char* arg = NULL;
-    while ((arg = va_arg(ap, const char*)))
-        result.push_back(arg);
-    va_end(ap);
-    return result;
+BSONObj parseHint(const BSONElement& element) {
+    if (element.type() == BSONType::String) {
+        return BSON("$hint" << element.valueStringData());
+    } else if (element.type() == BSONType::Object) {
+        return element.Obj();
+    } else {
+        uasserted(ErrorCodes::FailedToParse, "Hint must be a string or an object");
+    }
+    MONGO_UNREACHABLE;
+}
+
+void serializeHintToBSON(const BSONObj& hint, StringData fieldName, BSONObjBuilder* builder) {
+    if (hint.isEmpty())
+        return;
+    builder->append(fieldName, hint);
 }
 
 }  // namespace mongo

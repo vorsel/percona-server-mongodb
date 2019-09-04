@@ -212,7 +212,7 @@ void logStartup(OperationContext* opCtx) {
     toLog.append("_id", id.str());
     toLog.append("hostname", getHostNameCached());
 
-    toLog.appendTimeT("startTime", time(0));
+    toLog.appendTimeT("startTime", time(nullptr));
     toLog.append("startTimeLocal", dateToCtimeString(Date_t::now()));
 
     toLog.append("cmdLine", serverGlobalParams.parsedOpts);
@@ -913,16 +913,16 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
     // Shut down the global dbclient pool so callers stop waiting for connections.
     globalConnPool.shutdown();
 
+    // Inform Flow Control to stop gating writes on ticket admission. This must be done before the
+    // Periodic Runner is shut down (see SERVER-41751).
+    if (auto flowControlTicketholder = FlowControlTicketholder::get(serviceContext)) {
+        flowControlTicketholder->setInShutdown();
+    }
+
     // Shut down the background periodic task runner. This must be done before shutting down the
     // storage engine.
     if (auto runner = serviceContext->getPeriodicRunner()) {
         runner->shutdown();
-    }
-
-    // Inform Flow Control to stop gating writes on ticket admission. This is necessary because the
-    // ticket refresher thread is stopped as part of the shut down process (see SERVER-41345).
-    if (auto flowControlTicketholder = FlowControlTicketholder::get(serviceContext)) {
-        flowControlTicketholder->setInShutdown();
     }
 
     if (serviceContext->getStorageEngine()) {

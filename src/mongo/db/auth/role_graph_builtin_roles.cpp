@@ -252,7 +252,8 @@ MONGO_INITIALIZER(AuthorizationBuiltinRoles)(InitializerContext* context) {
         << ActionType::splitChunk
         << ActionType::moveChunk
         << ActionType::enableSharding
-        << ActionType::splitVector;
+        << ActionType::splitVector
+        << ActionType::refineCollectionShardKey;
 
     return Status::OK();
 }

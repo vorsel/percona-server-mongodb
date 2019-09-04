@@ -60,17 +60,6 @@ long long countParseSkip(const BSONElement& element) {
     return skip;
 }
 
-BSONObj countParseHint(const BSONElement& element) {
-    if (element.type() == BSONType::String) {
-        return BSON("$hint" << element.valueStringData());
-    } else if (element.type() == BSONType::Object) {
-        return element.Obj();
-    } else {
-        uasserted(31012, "Hint must be a string or an object");
-    }
-    MONGO_UNREACHABLE;
-}
-
 long long countParseMaxTime(const BSONElement& element) {
     auto maxTimeVal = uassertStatusOK(QueryRequest::parseMaxTimeMS(element));
     return static_cast<long long>(maxTimeVal);

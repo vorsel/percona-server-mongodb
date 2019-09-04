@@ -58,13 +58,12 @@ AutoGetDb::AutoGetDb(OperationContext* opCtx, StringData dbName, LockMode mode, 
 
 AutoGetCollection::AutoGetCollection(OperationContext* opCtx,
                                      const NamespaceStringOrUUID& nsOrUUID,
-                                     LockMode modeDB,
                                      LockMode modeColl,
                                      ViewMode viewMode,
                                      Date_t deadline)
     : _autoDb(opCtx,
               !nsOrUUID.dbname().empty() ? nsOrUUID.dbname() : nsOrUUID.nss()->db(),
-              modeDB,
+              isSharedLockMode(modeColl) ? MODE_IS : MODE_IX,
               deadline),
       _resolvedNss(resolveNamespaceStringOrUUID(opCtx, nsOrUUID)) {
 
@@ -199,7 +198,9 @@ ConcealCollectionCatalogChangesBlock::~ConcealCollectionCatalogChangesBlock() {
     CollectionCatalog::get(_opCtx).onOpenCatalog(_opCtx);
 }
 
-ReadSourceScope::ReadSourceScope(OperationContext* opCtx)
+ReadSourceScope::ReadSourceScope(OperationContext* opCtx,
+                                 RecoveryUnit::ReadSource readSource,
+                                 boost::optional<Timestamp> provided)
     : _opCtx(opCtx), _originalReadSource(opCtx->recoveryUnit()->getTimestampReadSource()) {
 
     if (_originalReadSource == RecoveryUnit::ReadSource::kProvided) {
@@ -207,7 +208,7 @@ ReadSourceScope::ReadSourceScope(OperationContext* opCtx)
     }
 
     _opCtx->recoveryUnit()->abandonSnapshot();
-    _opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kUnset);
+    _opCtx->recoveryUnit()->setTimestampReadSource(readSource, provided);
 }
 
 ReadSourceScope::~ReadSourceScope() {

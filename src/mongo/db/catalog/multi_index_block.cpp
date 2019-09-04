@@ -122,6 +122,9 @@ void MultiIndexBlock::cleanUpAfterBuild(OperationContext* opCtx, Collection* col
             // instead write a noop entry. A foreground `applyOps` index build may have a commit
             // timestamp already set.
             if (opCtx->recoveryUnit()->getCommitTimestamp().isNull() &&
+                // We need to avoid checking replication state if we do not hold the RSTL.  If we do
+                // not hold the RSTL, we must be a build started on a secondary via replication.
+                opCtx->lockState()->isRSTLLocked() &&
                 replCoord->canAcceptWritesForDatabase(opCtx, "admin")) {
                 opCtx->getServiceContext()->getOpObserver()->onOpMessage(
                     opCtx,
@@ -575,7 +578,7 @@ Status MultiIndexBlock::dumpInsertsFromBulk(OperationContext* opCtx,
 
     invariant(opCtx->lockState()->isNoop() || !opCtx->lockState()->inAWriteUnitOfWork());
     for (size_t i = 0; i < _indexes.size(); i++) {
-        if (_indexes[i].bulk == NULL)
+        if (_indexes[i].bulk == nullptr)
             continue;
 
         // If 'dupRecords' is provided, it will be used to store all records that would result in
@@ -649,6 +652,8 @@ Status MultiIndexBlock::drainBackgroundWrites(OperationContext* opCtx,
 }
 
 Status MultiIndexBlock::checkConstraints(OperationContext* opCtx) {
+    _constraintsChecked = true;
+
     if (State::kAborted == _getState()) {
         return {ErrorCodes::IndexBuildAborted,
                 str::stream() << "Index build aborted: " << _abortReason
@@ -712,6 +717,9 @@ Status MultiIndexBlock::commit(OperationContext* opCtx,
                           << collection->ns()
                           << (_collectionUUID ? (" (" + _collectionUUID->toString() + ")") : "")};
     }
+
+    // Ensure that duplicate key constraints were checked at least once.
+    invariant(_constraintsChecked);
 
     // Do not interfere with writing multikey information when committing index builds.
     auto restartTracker = makeGuard(

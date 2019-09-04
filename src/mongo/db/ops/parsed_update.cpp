@@ -104,6 +104,7 @@ Status ParsedUpdate::parseQueryToCQ() {
     qr->setSort(_request->getSort());
     qr->setCollation(_request->getCollation());
     qr->setExplain(_request->isExplain());
+    qr->setHint(_request->getHint());
 
     // Limit should only used for the findAndModify command when a sort is specified. If a sort
     // is requested, we want to use a top-k sort for efficiency reasons, so should pass the
@@ -203,11 +204,11 @@ PlanExecutor::YieldPolicy ParsedUpdate::yieldPolicy() const {
 }
 
 bool ParsedUpdate::hasParsedQuery() const {
-    return _canonicalQuery.get() != NULL;
+    return _canonicalQuery.get() != nullptr;
 }
 
 std::unique_ptr<CanonicalQuery> ParsedUpdate::releaseParsedQuery() {
-    invariant(_canonicalQuery.get() != NULL);
+    invariant(_canonicalQuery.get() != nullptr);
     return std::move(_canonicalQuery);
 }
 

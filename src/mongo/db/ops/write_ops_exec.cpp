@@ -612,7 +612,7 @@ static SingleWriteResult performSingleUpdateOp(OperationContext* opCtx,
 
     boost::optional<AutoGetCollection> collection;
     while (true) {
-        collection.emplace(opCtx, ns, MODE_IX, fixLockModeForSystemDotViewsChanges(ns, MODE_IX));
+        collection.emplace(opCtx, ns, fixLockModeForSystemDotViewsChanges(ns, MODE_IX));
 
         // If this is an upsert, which is an insert, we must have a collection.
         // An update on a non-existant collection is okay and handled later.
@@ -714,6 +714,7 @@ static SingleWriteResult performSingleUpdateOpWithDupKeyRetry(OperationContext* 
     request.setArrayFilters(write_ops::arrayFiltersOf(op));
     request.setMulti(op.getMulti());
     request.setUpsert(op.getUpsert());
+    request.setHint(op.getHint());
 
     auto readConcernArgs = repl::ReadConcernArgs::get(opCtx);
     request.setYieldPolicy(readConcernArgs.getLevel() ==
@@ -866,8 +867,7 @@ static SingleWriteResult performSingleDeleteOp(OperationContext* opCtx,
         uasserted(ErrorCodes::InternalError, "failAllRemoves failpoint active!");
     }
 
-    AutoGetCollection collection(
-        opCtx, ns, MODE_IX, fixLockModeForSystemDotViewsChanges(ns, MODE_IX));
+    AutoGetCollection collection(opCtx, ns, fixLockModeForSystemDotViewsChanges(ns, MODE_IX));
 
     if (collection.getDb()) {
         curOp.raiseDbProfileLevel(collection.getDb()->getProfilingLevel());

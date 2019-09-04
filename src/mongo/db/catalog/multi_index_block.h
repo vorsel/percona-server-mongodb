@@ -297,7 +297,7 @@ private:
     struct IndexToBuild {
         std::unique_ptr<IndexCatalog::IndexBuildBlockInterface> block;
 
-        IndexAccessMethod* real = NULL;           // owned elsewhere
+        IndexAccessMethod* real = nullptr;        // owned elsewhere
         const MatchExpression* filterExpression;  // might be NULL, owned elsewhere
         std::unique_ptr<IndexAccessMethod::BulkBuilder> bulk;
 
@@ -338,6 +338,9 @@ private:
     // Set to true when no work remains to be done, the object can safely destruct without leaving
     // incorrect state set anywhere.
     bool _buildIsCleanedUp = true;
+
+    // Duplicate key constraints should be checked at least once in the MultiIndexBlock.
+    bool _constraintsChecked = false;
 
     // Protects member variables of this class declared below.
     mutable stdx::mutex _mutex;
