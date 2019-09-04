@@ -144,6 +144,7 @@ variables:
   - name: compile
   commands:
   - func: "do setup"
+  - func: "setup jstestfuzz"
   - func: "run jstestfuzz"
   - *run_jstestfuzz_tests
 
@@ -547,6 +548,22 @@ functions:
         mkdir -p ../../../../../../mongo-tools/distsrc
         cp THIRD-PARTY-NOTICES ../../../../../../mongo-tools/distsrc/THIRD-PARTY-NOTICES.gotools
 
+  # This function should only be called from patch-build-only tasks.
+  "get added and modified patch files":
+    command: shell.exec
+    params:
+      working_dir: src
+      shell: bash
+      script: |
+        set -o verbose
+        set -o errexit
+        git diff HEAD --name-only --line-prefix="${workdir}/src/" --diff-filter=d >> modified_and_created_patch_files.txt
+        if [ -d src/mongo/db/modules/enterprise ]; then
+          pushd src/mongo/db/modules/enterprise
+          git diff HEAD --name-only --line-prefix="${workdir}/src/src/mongo/db/modules/enterprise/" --diff-filter=d >> ~1/modified_and_created_patch_files.txt
+          popd
+        fi
+
   "send benchmark results" :
     command: json.send
     params:
@@ -919,6 +936,55 @@ functions:
             exit $(cat jepsen_system_failure_${task_name}_${execution})
           fi
 
+  "setup jstestfuzz":
+    - command: shell.exec
+      params:
+        working_dir: src
+        shell: bash
+        script: |
+          set -o errexit
+          set -o verbose
+
+          ${add_nodejs_to_path}
+
+          git clone git@github.com:10gen/jstestfuzz.git
+
+          pushd jstestfuzz
+            npm install
+            npm run prepare
+          popd
+
+  "lint fuzzer sanity patch":
+    - command: shell.exec
+      type: test
+      params:
+        working_dir: src
+        shell: bash
+        script: |
+          set -eo pipefail
+          set -o verbose
+
+          ${add_nodejs_to_path}
+
+          # Run parse-jsfiles on 50 files at a time with 32 processes in parallel.
+          # Grep returns 1 if it fails to find a match.
+          (grep "\.js$" modified_and_created_patch_files.txt || true) | xargs -P 32 -L 50 npm run --prefix jstestfuzz parse-jsfiles --
+
+  "lint fuzzer sanity all":
+    - command: shell.exec
+      type: test
+      params:
+        working_dir: src
+        shell: bash
+        script: |
+          set -eo pipefail
+          set -o verbose
+
+          ${add_nodejs_to_path}
+
+          # Run parse-jsfiles on 50 files at a time with 32 processes in parallel.
+          find "$PWD/jstests" "$PWD/src/mongo/db/modules/enterprise" -name "*.js" -print | xargs -P 32 -L 50 npm run --prefix jstestfuzz parse-jsfiles --
+
   "run jstestfuzz":
     - command: shell.exec
       params:
@@ -927,16 +993,7 @@ functions:
           set -o errexit
           set -o verbose
 
-          git clone git@github.com:10gen/jstestfuzz.git
-
           cp mongodb*/bin/mongod .
-
-    - command: shell.exec
-      params:
-        working_dir: src
-        script: |
-          set -o errexit
-          set -o verbose
 
           git clone --depth 1 git@github.com:10gen/mongo-enterprise-modules.git jstests/enterprise_tests
           git clone --depth 1 git@github.com:10gen/QA.git jstests/qa_tests
@@ -948,58 +1005,9 @@ functions:
           set -o errexit
           set -o verbose
 
-          # Add node and npm binaries to PATH
-          if [ "Windows_NT" = "$OS" ]; then
-            # An "npm" directory might not have been created in %APPDATA% by the Windows installer.
-            # Work around the issue by specifying a different %APPDATA% path.
-            # See: https://github.com/nodejs/node-v0.x-archive/issues/8141
-            export APPDATA=${workdir}/npm-app-data
-            export PATH="$PATH:/cygdrive/c/Program Files (x86)/nodejs" # Windows location
-          else
-            export PATH="$PATH:/opt/node/bin"
-          fi
+          ${add_nodejs_to_path}
 
-          npm install
-
-    - command: shell.exec
-      type: test
-      params:
-        working_dir: src/jstestfuzz
-        script: |
-          set -o errexit
-          set -o verbose
-
-          # Add node and npm binaries to PATH
-          if [ "Windows_NT" = "$OS" ]; then
-            # An "npm" directory might not have been created in %APPDATA% by the Windows installer.
-            # Work around the issue by specifying a different %APPDATA% path.
-            # See: https://github.com/nodejs/node-v0.x-archive/issues/8141
-            export APPDATA=${workdir}/npm-app-data
-            export PATH="$PATH:/cygdrive/c/Program Files (x86)/nodejs" # Windows location
-          else
-            export PATH="$PATH:/opt/node/bin"
-          fi
-
-          echo "jstestfuzz self-tests are starting"
-          set +o errexit
-          npm test > npm_test-${task_id}.log 2>&1
-          if [ $? -ne 0 ]; then
-            echo "jstestfuzz self-tests failure"
-            branch=$(git symbolic-ref --short HEAD)
-            commit=$(git show -s --pretty=format:"%h - %an, %ar: %s")
-            echo "Git branch: $branch, commit: $commit"
-            which node
-            node --version
-            which npm
-            npm --version
-            cat npm_test-${task_id}.log
-            exit 1
-          fi
-          rm -f npm_test-${task_id}.log
-          set -o errexit
-          echo "jstestfuzz self-tests finished"
-
-          npm run ${npm_command|jstestfuzz} -- ${jstestfuzz_vars}
+          npm run ${npm_command|jstestfuzz} -- ${jstestfuzz_vars} --branch ${branch_name}
 
     - command: archive.targz_pack
       params:
@@ -2023,6 +2031,20 @@ pre:
             fi
           fi
           echo "python set to $(which $python)"
+       - key: add_nodejs_to_path
+         value: |
+          # Add node and npm binaries to PATH
+          if [ "Windows_NT" = "$OS" ]; then
+            # An "npm" directory might not have been created in %APPDATA% by the Windows installer.
+            # Work around the issue by specifying a different %APPDATA% path.
+            # See: https://github.com/nodejs/node-v0.x-archive/issues/8141
+            export APPDATA=${workdir}/npm-app-data
+            export PATH="$PATH:/cygdrive/c/Program Files (x86)/nodejs" # Windows location
+            # TODO: this is to work around BUILD-8652
+            cd "$(pwd -P | sed 's,cygdrive/c/,cygdrive/z/,')"
+          else
+            export PATH="$PATH:/opt/node/bin"
+          fi
        - key: posix_workdir
          value: eval 'if [ "Windows_NT" = "$OS" ]; then echo $(cygpath -u "${workdir}"); else echo ${workdir}; fi'
        # For ssh disable the options GSSAPIAuthentication, CheckHostIP, StrictHostKeyChecking
@@ -2880,6 +2902,7 @@ tasks:
   commands:
   - func: "do setup"
   - func: "do multiversion setup"
+  - func: "setup jstestfuzz"
   - func: "run jstestfuzz"
     vars:
       npm_command: update-fuzzer
@@ -2895,6 +2918,7 @@ tasks:
   commands:
   - func: "do setup"
   - func: "do multiversion setup"
+  - func: "setup jstestfuzz"
   - func: "run jstestfuzz"
     vars:
       npm_command: update-fuzzer
@@ -2910,6 +2934,7 @@ tasks:
   commands:
   - func: "do setup"
   - func: "do multiversion setup"
+  - func: "setup jstestfuzz"
   - func: "run jstestfuzz"
     vars:
       npm_command: update-fuzzer
@@ -2925,6 +2950,7 @@ tasks:
   commands:
   - func: "do setup"
   - func: "do multiversion setup"
+  - func: "setup jstestfuzz"
   - func: "run jstestfuzz"
     vars:
       npm_command: update-fuzzer
@@ -2939,6 +2965,7 @@ tasks:
   name: rollback_fuzzer
   commands:
   - func: "do setup"
+  - func: "setup jstestfuzz"
   - func: "run jstestfuzz"
     vars:
       jstestfuzz_vars: --numGeneratedFiles 15
@@ -2953,6 +2980,7 @@ tasks:
   name: rollback_fuzzer_WT
   commands:
   - func: "do setup"
+  - func: "setup jstestfuzz"
   - func: "run jstestfuzz"
     vars:
       jstestfuzz_vars: --numGeneratedFiles 15
@@ -2967,6 +2995,7 @@ tasks:
   name: jstestfuzz
   commands:
   - func: "do setup"
+  - func: "setup jstestfuzz"
   - func: "run jstestfuzz"
     vars:
       jstestfuzz_vars: --jsTestsDir ../jstests
@@ -2980,6 +3009,7 @@ tasks:
   name: jstestfuzz_WT
   commands:
   - func: "do setup"
+  - func: "setup jstestfuzz"
   - func: "run jstestfuzz"
     vars:
       jstestfuzz_vars: --jsTestsDir ../jstests
@@ -2993,6 +3023,7 @@ tasks:
   name: jstestfuzz_concurrent
   commands:
   - func: "do setup"
+  - func: "setup jstestfuzz"
   - func: "run jstestfuzz"
     vars:
       jstestfuzz_vars: --numGeneratedFiles 75 --jsTestsDir ../jstests
@@ -3006,6 +3037,7 @@ tasks:
   name: jstestfuzz_concurrent_WT
   commands:
   - func: "do setup"
+  - func: "setup jstestfuzz"
   - func: "run jstestfuzz"
     vars:
       jstestfuzz_vars: --numGeneratedFiles 75 --jsTestsDir ../jstests
@@ -3019,6 +3051,7 @@ tasks:
   name: jstestfuzz_concurrent_replication
   commands:
   - func: "do setup"
+  - func: "setup jstestfuzz"
   - func: "run jstestfuzz"
     vars:
       jstestfuzz_vars: --numGeneratedFiles 75 --jsTestsDir ../jstests
@@ -3032,6 +3065,7 @@ tasks:
   name: jstestfuzz_concurrent_replication_WT
   commands:
   - func: "do setup"
+  - func: "setup jstestfuzz"
   - func: "run jstestfuzz"
     vars:
       jstestfuzz_vars: --numGeneratedFiles 75 --jsTestsDir ../jstests
@@ -3045,6 +3079,7 @@ tasks:
   name: jstestfuzz_concurrent_replication_session
   commands:
   - func: "do setup"
+  - func: "setup jstestfuzz"
   - func: "run jstestfuzz"
     vars:
       jstestfuzz_vars: --numGeneratedFiles 75 --jsTestsDir ../jstests
@@ -3058,6 +3093,7 @@ tasks:
   name: jstestfuzz_concurrent_replication_session_WT
   commands:
   - func: "do setup"
+  - func: "setup jstestfuzz"
   - func: "run jstestfuzz"
     vars:
       jstestfuzz_vars: --numGeneratedFiles 75 --jsTestsDir ../jstests
@@ -3071,6 +3107,7 @@ tasks:
   name: jstestfuzz_concurrent_sharded
   commands:
   - func: "do setup"
+  - func: "setup jstestfuzz"
   - func: "run jstestfuzz"
     vars:
       jstestfuzz_vars: --numGeneratedFiles 75 --jsTestsDir ../jstests
@@ -3084,6 +3121,7 @@ tasks:
   name: jstestfuzz_concurrent_sharded_WT
   commands:
   - func: "do setup"
+  - func: "setup jstestfuzz"
   - func: "run jstestfuzz"
     vars:
       jstestfuzz_vars: --numGeneratedFiles 75 --jsTestsDir ../jstests
@@ -3097,6 +3135,7 @@ tasks:
   name: jstestfuzz_concurrent_sharded_causal_consistency
   commands:
   - func: "do setup"
+  - func: "setup jstestfuzz"
   - func: "run jstestfuzz"
     vars:
       jstestfuzz_vars: --numGeneratedFiles 75 --jsTestsDir ../jstests
@@ -3110,6 +3149,7 @@ tasks:
   name: jstestfuzz_concurrent_sharded_causal_consistency_WT
   commands:
   - func: "do setup"
+  - func: "setup jstestfuzz"
   - func: "run jstestfuzz"
     vars:
       jstestfuzz_vars: --numGeneratedFiles 75 --jsTestsDir ../jstests
@@ -3123,6 +3163,7 @@ tasks:
   name: jstestfuzz_concurrent_sharded_continuous_stepdown
   commands:
   - func: "do setup"
+  - func: "setup jstestfuzz"
   - func: "run jstestfuzz"
     vars:
       jstestfuzz_vars: --numGeneratedFiles 25 --jsTestsDir ../jstests
@@ -3136,6 +3177,7 @@ tasks:
   name: jstestfuzz_concurrent_sharded_session
   commands:
   - func: "do setup"
+  - func: "setup jstestfuzz"
   - func: "run jstestfuzz"
     vars:
       jstestfuzz_vars: --numGeneratedFiles 75 --jsTestsDir ../jstests
@@ -3149,6 +3191,7 @@ tasks:
   name: jstestfuzz_concurrent_sharded_session_WT
   commands:
   - func: "do setup"
+  - func: "setup jstestfuzz"
   - func: "run jstestfuzz"
     vars:
       jstestfuzz_vars: --numGeneratedFiles 75 --jsTestsDir ../jstests
@@ -3162,6 +3205,7 @@ tasks:
   name: jstestfuzz_replication
   commands:
   - func: "do setup"
+  - func: "setup jstestfuzz"
   - func: "run jstestfuzz"
     vars:
       jstestfuzz_vars: --jsTestsDir ../jstests
@@ -3175,6 +3219,7 @@ tasks:
   name: jstestfuzz_replication_WT
   commands:
   - func: "do setup"
+  - func: "setup jstestfuzz"
   - func: "run jstestfuzz"
     vars:
       jstestfuzz_vars: --jsTestsDir ../jstests
@@ -3188,6 +3233,7 @@ tasks:
   name: jstestfuzz_replication_initsync
   commands:
   - func: "do setup"
+  - func: "setup jstestfuzz"
   - func: "run jstestfuzz"
     vars:
       jstestfuzz_vars: --numGeneratedFiles 75 --jsTestsDir ../jstests
@@ -3201,6 +3247,7 @@ tasks:
   name: jstestfuzz_replication_initsync_WT
   commands:
   - func: "do setup"
+  - func: "setup jstestfuzz"
   - func: "run jstestfuzz"
     vars:
       jstestfuzz_vars: --numGeneratedFiles 75 --jsTestsDir ../jstests
@@ -3214,6 +3261,7 @@ tasks:
   name: jstestfuzz_replication_resync
   commands:
   - func: "do setup"
+  - func: "setup jstestfuzz"
   - func: "run jstestfuzz"
     vars:
       jstestfuzz_vars: --numGeneratedFiles 75 --jsTestsDir ../jstests
@@ -3227,6 +3275,7 @@ tasks:
   name: jstestfuzz_replication_resync_WT
   commands:
   - func: "do setup"
+  - func: "setup jstestfuzz"
   - func: "run jstestfuzz"
     vars:
       jstestfuzz_vars: --numGeneratedFiles 75 --jsTestsDir ../jstests
@@ -3240,6 +3289,7 @@ tasks:
   name: jstestfuzz_replication_session
   commands:
   - func: "do setup"
+  - func: "setup jstestfuzz"
   - func: "run jstestfuzz"
     vars:
       jstestfuzz_vars: --jsTestsDir ../jstests
@@ -3253,6 +3303,7 @@ tasks:
   name: jstestfuzz_replication_session_WT
   commands:
   - func: "do setup"
+  - func: "setup jstestfuzz"
   - func: "run jstestfuzz"
     vars:
       jstestfuzz_vars: --jsTestsDir ../jstests
@@ -3266,6 +3317,7 @@ tasks:
   name: jstestfuzz_sharded
   commands:
   - func: "do setup"
+  - func: "setup jstestfuzz"
   - func: "run jstestfuzz"
     vars:
       jstestfuzz_vars: --jsTestsDir ../jstests
@@ -3279,6 +3331,7 @@ tasks:
   name: jstestfuzz_sharded_WT
   commands:
   - func: "do setup"
+  - func: "setup jstestfuzz"
   - func: "run jstestfuzz"
     vars:
       jstestfuzz_vars: --jsTestsDir ../jstests
@@ -3292,6 +3345,7 @@ tasks:
   name: jstestfuzz_sharded_causal_consistency
   commands:
   - func: "do setup"
+  - func: "setup jstestfuzz"
   - func: "run jstestfuzz"
     vars:
       jstestfuzz_vars: --jsTestsDir ../jstests
@@ -3305,6 +3359,7 @@ tasks:
   name: jstestfuzz_sharded_causal_consistency_WT
   commands:
   - func: "do setup"
+  - func: "setup jstestfuzz"
   - func: "run jstestfuzz"
     vars:
       jstestfuzz_vars: --jsTestsDir ../jstests
@@ -3318,6 +3373,7 @@ tasks:
   name: jstestfuzz_sharded_continuous_stepdown
   commands:
   - func: "do setup"
+  - func: "setup jstestfuzz"
   - func: "run jstestfuzz"
     vars:
       jstestfuzz_vars: --numGeneratedFiles 50 --jsTestsDir ../jstests
@@ -3331,6 +3387,7 @@ tasks:
   name: jstestfuzz_sharded_session
   commands:
   - func: "do setup"
+  - func: "setup jstestfuzz"
   - func: "run jstestfuzz"
     vars:
       jstestfuzz_vars: --jsTestsDir ../jstests
@@ -3344,6 +3401,7 @@ tasks:
   name: jstestfuzz_sharded_session_WT
   commands:
   - func: "do setup"
+  - func: "setup jstestfuzz"
   - func: "run jstestfuzz"
     vars:
       jstestfuzz_vars: --jsTestsDir ../jstests
@@ -3351,6 +3409,24 @@ tasks:
     vars:
       <<: *jstestfuzz_config_vars
       resmoke_args: --suites=jstestfuzz_sharded_session --storageEngine=wiredTiger
+
+# Check that the mutational fuzzer can parse JS files modified in a patch build.
+- name: lint_fuzzer_sanity_patch
+  patch_only: true
+  commands:
+  - command: manifest.load
+  - func: "git get project"
+  - func: "get added and modified patch files"
+  - func: "setup jstestfuzz"
+  - func: "lint fuzzer sanity patch"
+
+# Check that the mutational fuzzer can parse all JS filess.
+- name: lint_fuzzer_sanity_all
+  commands:
+  - command: manifest.load
+  - func: "git get project"
+  - func: "setup jstestfuzz"
+  - func: "lint fuzzer sanity all"
 
 ## integration test suites ##
 
@@ -6929,7 +7005,7 @@ buildvariants:
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     ext: zip
     use_scons_cache: true
-    test_flags: --transportLayer=legacy
+    test_flags: --transportLayer=legacy --excludeWithAnyTags=cannot_run_with_legacy_transport
     tooltags: "ssl sasl"
     build_mongoreplay: false
   tasks:
@@ -7433,6 +7509,7 @@ buildvariants:
     requires:
     - name: burn_in_tests
     - name: lint
+    - name: lint_fuzzer_sanity_patch
     distros:
     - rhel62-large
   - name: compile_all
@@ -7442,6 +7519,7 @@ buildvariants:
     distros:
     - rhel62-large
   - name: lint
+  - name: lint_fuzzer_sanity_patch
   - name: burn_in_tests
   - name: rollback_fuzzer_WT
   - name: aggregation_WT
@@ -8423,149 +8501,150 @@ buildvariants:
     distros:
     - rhel70-small
 
-- name: enterprise-rhel-67-s390x
-  display_name: Enterprise RHEL 6.7 s390x
+###########################################
+#          Ubuntu buildvariants           #
+###########################################
+
+- name: ubuntu1404
+  display_name: SSL Ubuntu 14.04
+  run_on:
+  - ubuntu1404-test
+  batchtime: 1440 # 1 day
+  expansions:
+    push_path: linux
+    push_bucket: downloads.mongodb.org
+    push_name: linux
+    push_arch: x86_64-ubuntu1404
+    compile_flags: --ssl MONGO_DISTMOD=ubuntu1404 -j$(grep -c ^processor /proc/cpuinfo) --release --variables-files=etc/scons/mongodbtoolchain_gcc.vars
+    multiversion_platform: ubuntu1404
+    multiversion_edition: targeted
+    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
+    has_packages: true
+    packager_script: packager.py
+    packager_arch: x86_64
+    packager_distro: ubuntu1404
+    repo_edition: org
+    use_scons_cache: true
+    tooltags: "ssl"
+    build_mongoreplay: true
+  tasks:
+  - name: compile
+    distros:
+    - ubuntu1404-build
+  - name: compile_all
+    distros:
+    - ubuntu1404-build
+  - name: aggregation_WT
+  - name: aggregation_auth
+  - name: auth_WT
+  - name: dbtest_WT
+  - name: disk_WT
+  - name: failpoints
+  - name: failpoints_auth
+  - name: gle_auth_WT
+  - name: gle_auth_write_cmd_WT
+  - name: gle_auth_basics_passthrough_WT
+  - name: gle_auth_basics_passthrough_write_cmd_WT
+  - name: sharding_gle_auth_basics_passthrough_WT
+  - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
+  - name: jsCore # TODO SERVER-32036: Remove when jsCore_auth depends on jsCore_WT.
+  - name: jsCore_WT
+  - name: jsCore_auth
+  - name: jsCore_compatibility_WT
+  - name: jsCore_decimal_WT
+  - name: jstestfuzz_WT
+  - name: jstestfuzz_concurrent_WT
+  - name: jstestfuzz_concurrent_replication_WT
+  - name: jstestfuzz_concurrent_sharded_WT
+  - name: jstestfuzz_replication_WT
+  - name: jstestfuzz_sharded_WT
+  - name: mongosTest
+  - name: multiversion_WT
+  - name: noPassthrough_WT
+  - name: noPassthroughWithMongod_WT
+  - name: bulk_gle_passthrough_WT
+  - name: parallel_WT
+  - name: parallel_compatibility_WT
+  - name: concurrency_WT
+  - name: concurrency_replication_WT
+  - name: concurrency_sharded_WT
+  - name: concurrency_simultaneous_WT
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_WT
+  - name: replica_sets_WT
+  - name: replica_sets_auth
+  - name: replica_sets_jscore_passthrough_WT
+  - name: master_slave_WT
+  - name: master_slave_auth
+  - name: master_slave_jscore_passthrough_WT
+  - name: sharding_WT
+  - name: sharding_auth
+  - name: sharding_last_stable_mongos_and_mixed_shards
+  - name: slow1_WT
+  - name: serial_run_WT
+  - name: sharding_jscore_passthrough_WT
+  - name: ssl
+  - name: sslSpecial
+  - name: tool_WT
+  - name: package
+    distros:
+    - ubuntu1604-packer
+  - name: push
+
+- name: enterprise-ubuntu1404-64
+  display_name: Enterprise Ubuntu 14.04
   modules:
   - enterprise
   run_on:
-  - rhel67-zseries-test
+  - ubuntu1404-test
   batchtime: 1440 # 1 day
-  stepback: false
   expansions:
-    compile_flags: --ssl MONGO_DISTMOD=rhel67 --release -j3 CCFLAGS="-march=z9-109 -mtune=z10" --variables-files=etc/scons/mongodbtoolchain_gcc.vars --use-s390x-crc32=off
-    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --excludeWithAnyTags=requires_mmapv1
-    has_packages: true
-    packager_script: packager-enterprise.py
-    packager_arch: s390x
-    packager_distro: rhel67
     push_path: linux
     push_bucket: downloads.10gen.com
     push_name: linux
-    push_arch: s390x-enterprise-rhel67
+    push_arch: x86_64-enterprise-ubuntu1404
+    compile_flags: --ssl MONGO_DISTMOD=ubuntu1404 --release -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars
+    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
+    has_packages: true
+    packager_script: packager-enterprise.py
+    packager_arch: x86_64
+    packager_distro: ubuntu1404
     repo_edition: enterprise
+    use_scons_cache: true
     tooltags: "ssl sasl"
     build_mongoreplay: true
   tasks:
   - name: compile
     distros:
-    - rhel67-zseries-build
+    - ubuntu1404-build
   - name: compile_all
     distros:
-    - rhel67-zseries-build
-  # - name: aggregation
-  - name: aggregation_WT
-  - name: aggregation_WT_ese
-  - name: aggregation_auth
-  - name: aggregation_read_concern_majority_passthrough_WT
-  - name: aggregation_sharded_collections_passthrough_WT
-  # - name: audit
+    - ubuntu1404-build
   - name: audit_WT
-  # - name: auth
-  - name: auth_WT
-  # - name: auth_audit
-  - name: auth_audit_WT
-  # - name: bulk_gle_passthrough
-  - name: bulk_gle_passthrough_WT
-  # - name: concurrency
-  - name: concurrency_WT
-  # - name: concurrency_replication
-  - name: concurrency_replication_WT
-  # - name: concurrency_sharded
-  - name: concurrency_sharded_WT
-  # - name: concurrency_simultaneous
-  - name: concurrency_simultaneous_WT
-  # - name: dbtest
   - name: dbtest_WT
-  # - name: durability
   - name: ese_WT
-  - name: failpoints
-  - name: failpoints_auth
-  # - name: gle_auth
-  - name: gle_auth_WT
-  # - name: gle_auth_basics_passthrough
-  - name: gle_auth_basics_passthrough_WT
-  # - name: gle_auth_basics_passthrough_write_cmd
-  - name: gle_auth_basics_passthrough_write_cmd_WT
-  # - name: gle_auth_write_cmd
-  - name: gle_auth_write_cmd_WT
-  - name: integration_tests_replset
-  - name: integration_tests_standalone
-  # - name: jsCore
-  - name: jsCore_WT
-  - name: jsCore_WT_ese
-  # - name: jsCore_auth
-  # - name: jsCore_compatibility
-  - name: jsCore_compatibility_WT
-  - name: jsCore_decimal_WT
-  # - name: jsCore_minimum_batch_size_WT
-  # - name: jsCore_op_query
-  - name: jsCore_op_query_WT
-  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_WT
-  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_WT
-  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_WT
-  # - name: mmap
-  - name: mongosTest
-  # - name: noPassthrough
-  # - name: noPassthroughWithMongod
-  - name: noPassthroughWithMongod_WT
-  - name: noPassthrough_WT
-  # - name: parallel
-  - name: parallel_WT
-  # - name: parallel_compatibility
-  - name: parallel_compatibility_WT
-  # - name: read_concern_linearizable_passthrough
-  - name: read_concern_linearizable_passthrough_WT
-  - name: read_concern_majority_passthrough_WT
-  # - name: replica_sets
-  - name: replica_sets_WT
-  - name: replica_sets_WT_ese
+  - name: jsCore # TODO SERVER-32036: Replace with jsCore_WT when jsCore_auth depends on jsCore_WT.
+  - name: jsCore_auth
+  - name: jstestfuzz_WT
+  - name: jstestfuzz_concurrent_WT
+  - name: jstestfuzz_concurrent_replication_WT
+  - name: jstestfuzz_concurrent_sharded_WT
+  - name: jstestfuzz_replication_WT
+  - name: jstestfuzz_sharded_WT
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: replica_sets_auth
-  - name: replica_sets_pv0
-  # - name: replica_sets_jscore_passthrough
-  - name: replica_sets_jscore_passthrough_WT
-  # - name: master_slave
-  - name: master_slave_WT
-  - name: master_slave_auth
-  # - name: master_slave_jscore_passthrough
-  - name: master_slave_jscore_passthrough_WT
   - name: sasl
-  - name: secondary_reads_passthrough
-  # - name: sharded_collections_jscore_passthrough
-  - name: sharded_collections_jscore_passthrough_WT
-  # - name: sharding
-  - name: sharding_WT
-  - name: sharding_WT_ese
   - name: sharding_auth
-  - name: sharding_auth_audit_WT
-  - name: sharding_csrs_continuous_config_stepdown_WT
-  # - name: sharding_gle_auth_basics_passthrough
-  - name: sharding_gle_auth_basics_passthrough_WT
-  # - name: sharding_gle_auth_basics_passthrough_write_cmd
-  - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
-  # - name: sharding_jscore_passthrough
-  - name: sharding_jscore_passthrough_WT
-  - name: sharding_jscore_op_query_passthrough_WT
-  - name: sharding_jscore_passthrough_wire_ops_WT
-  - name: sharding_op_query_WT
-  # - name: slow1
-  - name: slow1_WT
-  # - name: serial_run
-  - name: serial_run_WT
-  # - name: snmp
   - name: snmp_WT
   - name: ssl
   - name: sslSpecial
-  # - name: tool
-  - name: tool_WT
-  - name: write_concern_majority_passthrough_WT
-  - name: push
+  - name: package
     distros:
-    - rhel62-large
-
-###########################################
-#          Ubuntu buildvariants           #
-###########################################
+    - ubuntu1604-packer
+  - name: push
 
 - name: enterprise-ubuntu1604-64
   display_name: Enterprise Ubuntu 16.04 (+Dagger)
@@ -10081,7 +10160,7 @@ buildvariants:
     build_mongoreplay: false
     hang_analyzer_dump_core: false
     use_scons_cache: true
-    test_flags: --transportLayer=legacy
+    test_flags: --transportLayer=legacy --excludeWithAnyTags=cannot_run_with_legacy_transport
   tasks:
   - name: compile
   - name: compile_all
@@ -10193,17 +10272,18 @@ buildvariants:
     - ubuntu1604-build
 
 - name: tig-daily-cron
+  modules:
+  - enterprise
   display_name: "~ TIG Daily Cron"
   run_on:
-  - rhel62-large
+  - rhel62-small
   batchtime: 1440 # 1 day
   stepback: false
   tasks:
 # Test lifecycle is temporarily disabled to reduce load on Evergreen API.
 # - name: update_test_lifecycle
   - name: fetch_test_lifecycle
-    distros:
-    - rhel62-small
+  - name: lint_fuzzer_sanity_all
 
 - name: enterprise-rhel-62-64-bit-mmapv1
   display_name: Enterprise RHEL 6.2 MMAPv1

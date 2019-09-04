@@ -1,7 +1,7 @@
 [Unit]
-Description=High-performance, schema-free document-oriented database
-After=network.target
+Description=MongoDB Database Server
 Documentation=https://docs.mongodb.org/manual
+After=network.target
 
 [Service]
 User=mongodb

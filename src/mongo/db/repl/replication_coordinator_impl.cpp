@@ -458,16 +458,18 @@ void ReplicationCoordinatorImpl::appendConnectionStats(executor::ConnectionPoolS
 bool ReplicationCoordinatorImpl::_startLoadLocalConfig(OperationContext* opCtx) {
     _replicationProcess->getConsistencyMarkers()->initializeMinValidDocument(opCtx);
 
+    fassert(51240, _externalState->createLocalLastVoteCollection(opCtx));
+
     StatusWith<LastVote> lastVote = _externalState->loadLocalLastVoteDocument(opCtx);
     if (!lastVote.isOK()) {
-        if (lastVote.getStatus() == ErrorCodes::NoMatchingDocument) {
-            log() << "Did not find local voted for document at startup.";
-        } else {
-            severe() << "Error loading local voted for document at startup; "
-                     << lastVote.getStatus();
-            fassertFailedNoTrace(40367);
-        }
-    } else {
+        severe() << "Error loading local voted for document at startup; " << lastVote.getStatus();
+        fassertFailedNoTrace(40367);
+    }
+    if (lastVote.getValue().getTerm() == OpTime::kInitialTerm) {
+        // This log line is checked in unit tests.
+        log() << "Did not find local initialized voted for document at startup.";
+    }
+    {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
         _topCoord->loadLastVote(lastVote.getValue());
     }
@@ -1013,7 +1015,7 @@ void ReplicationCoordinatorImpl::signalDrainComplete(OperationContext* opCtx,
     _applierState = ApplierState::Stopped;
 
     invariant(_getMemberState_inlock().primary());
-    invariant(!_canAcceptNonLocalWrites);
+    invariant(!_canAcceptNonLocalWrites.loadRelaxed());
 
     {
         lk.unlock();
@@ -1103,7 +1105,7 @@ void ReplicationCoordinatorImpl::setMyLastAppliedOpTimeForward(const OpTime& opT
                       opTime.getTimestamp() < myLastAppliedOpTime.getTimestamp());
         }
 
-        if (consistency == DataConsistency::Consistent && _canAcceptNonLocalWrites &&
+        if (consistency == DataConsistency::Consistent && _canAcceptNonLocalWrites.loadRelaxed() &&
             _rsConfig.getWriteMajority() == 1) {
             // Single vote primaries may have a lagged stable timestamp due to paring back the
             // stable timestamp to the all committed timestamp.
@@ -1785,7 +1787,7 @@ Status ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
     // catch up without allowing new writes in.
     auto action = _updateMemberStateFromTopologyCoordinator_inlock(opCtx);
     invariant(action == PostMemberStateUpdateAction::kActionNone);
-    invariant(!_canAcceptNonLocalWrites);
+    invariant(!_canAcceptNonLocalWrites.loadRelaxed());
 
     // Make sure that we leave _canAcceptNonLocalWrites in the proper state.
     auto updateMemberState = [&] {
@@ -1990,7 +1992,7 @@ bool ReplicationCoordinatorImpl::canAcceptWritesForDatabase_UNSAFE(OperationCont
     // accept writes.  Similarly, writes are always permitted to the "local" database.  Finally,
     // in the event that a node is started with --slave and --master, we allow writes unless the
     // master/slave system has set the replAllDead flag.
-    if (_canAcceptNonLocalWrites || alwaysAllowNonLocalWrites(*opCtx)) {
+    if (_canAcceptNonLocalWrites.loadRelaxed() || alwaysAllowNonLocalWrites(*opCtx)) {
         return true;
     }
     if (dbName == kLocalDB) {
@@ -2019,7 +2021,7 @@ bool ReplicationCoordinatorImpl::canAcceptWritesFor_UNSAFE(OperationContext* opC
     // If we can accept non local writes (ie we're PRIMARY) then we must not be in ROLLBACK.
     // This check is redundant of the check of _memberState below, but since this can be checked
     // without locking, we do it as an optimization.
-    if (_canAcceptNonLocalWrites || alwaysAllowNonLocalWrites(*opCtx)) {
+    if (_canAcceptNonLocalWrites.loadRelaxed() || alwaysAllowNonLocalWrites(*opCtx)) {
         return true;
     }
 
@@ -2168,11 +2170,12 @@ Status ReplicationCoordinatorImpl::processReplSetGetStatus(
     return result;
 }
 
-void ReplicationCoordinatorImpl::fillIsMasterForReplSet(IsMasterResponse* response) {
+void ReplicationCoordinatorImpl::fillIsMasterForReplSet(
+    IsMasterResponse* response, const SplitHorizon::Parameters& horizonParams) {
     invariant(getSettings().usingReplSets());
 
     stdx::lock_guard<stdx::mutex> lk(_mutex);
-    _topCoord->fillIsMasterForReplSet(response);
+    _topCoord->fillIsMasterForReplSet(response, horizonParams);
 
     OpTime lastOpTime = _getMyLastAppliedOpTime_inlock();
     response->setLastWrite(lastOpTime, lastOpTime.getTimestamp().getSecs());
@@ -2181,7 +2184,7 @@ void ReplicationCoordinatorImpl::fillIsMasterForReplSet(IsMasterResponse* respon
                                        _currentCommittedSnapshot->getTimestamp().getSecs());
     }
 
-    if (response->isMaster() && !_canAcceptNonLocalWrites) {
+    if (response->isMaster() && !_canAcceptNonLocalWrites.loadRelaxed()) {
         // Report that we are secondary to ismaster callers until drain completes.
         response->setIsMaster(false);
         response->setIsSecondary(true);
@@ -2672,12 +2675,12 @@ ReplicationCoordinatorImpl::_updateMemberStateFromTopologyCoordinator_inlock(
         // have just failed a stepdown attempt and thus are staying in PRIMARY state but restoring
         // our ability to accept writes.
         bool canAcceptWrites = _topCoord->canAcceptWrites();
-        if (canAcceptWrites != _canAcceptNonLocalWrites) {
+        if (canAcceptWrites != _canAcceptNonLocalWrites.loadRelaxed()) {
             // We must be holding the global X lock to change _canAcceptNonLocalWrites.
             invariant(opCtx);
             invariant(opCtx->lockState()->isW());
         }
-        _canAcceptNonLocalWrites = canAcceptWrites;
+        _canAcceptNonLocalWrites.store(canAcceptWrites);
     }
 
 
@@ -2705,7 +2708,7 @@ ReplicationCoordinatorImpl::_updateMemberStateFromTopologyCoordinator_inlock(
         _stepDownWaiters.notify_all();
 
         // _canAcceptNonLocalWrites should already be set above.
-        invariant(!_canAcceptNonLocalWrites);
+        invariant(!_canAcceptNonLocalWrites.loadRelaxed());
 
         serverGlobalParams.validateFeaturesAsMaster.store(false);
         result = kActionCloseAllConnections;
@@ -3376,7 +3379,7 @@ boost::optional<OpTime> ReplicationCoordinatorImpl::_calculateStableOpTime_inloc
     }
 
     auto maximumStableTimestamp = commitPoint.getTimestamp();
-    if (_canAcceptNonLocalWrites && _storage->supportsDocLocking(_service)) {
+    if (_canAcceptNonLocalWrites.loadRelaxed() && _storage->supportsDocLocking(_service)) {
         // avoid calling getAllCommittedTimestamp on rocksdb in FCV 3.4 mode
         // storageEngine can be nullptr in unit tests
         auto storageEngine = _service->getGlobalStorageEngine();

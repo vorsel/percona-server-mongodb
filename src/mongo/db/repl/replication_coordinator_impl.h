@@ -198,7 +198,8 @@ public:
     virtual Status processReplSetGetStatus(BSONObjBuilder* result,
                                            ReplSetGetStatusResponseStyle responseStyle) override;
 
-    virtual void fillIsMasterForReplSet(IsMasterResponse* result) override;
+    virtual void fillIsMasterForReplSet(IsMasterResponse* result,
+                                        const SplitHorizon::Parameters& horizonParams) override;
 
     virtual void appendSlaveInfoData(BSONObjBuilder* result) override;
 
@@ -1275,7 +1276,7 @@ private:
     // Flag that indicates whether writes to databases other than "local" are allowed.  Used to
     // answer canAcceptWritesForDatabase() and canAcceptWritesFor() questions.
     // Always true for standalone nodes and masters in master-slave relationships.
-    bool _canAcceptNonLocalWrites;  // (GM)
+    AtomicWord<bool> _canAcceptNonLocalWrites;  // (GM)
 
     // Flag that indicates whether reads from databases other than "local" are allowed.  Unlike
     // _canAcceptNonLocalWrites, above, this question is about admission control on secondaries,
