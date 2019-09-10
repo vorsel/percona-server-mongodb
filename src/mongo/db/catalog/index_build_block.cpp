@@ -42,6 +42,7 @@
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 
@@ -68,7 +69,6 @@ Status IndexCatalogImpl::IndexBuildBlock::init(OperationContext* opCtx, Collecti
         collection, IndexNames::findPluginName(keyPattern), _spec);
 
     _indexName = descriptor->indexName();
-    _indexNamespace = descriptor->indexNamespace();
 
     bool isBackgroundIndex =
         _method == IndexBuildMethod::kHybrid || _method == IndexBuildMethod::kBackground;
@@ -81,8 +81,8 @@ Status IndexCatalogImpl::IndexBuildBlock::init(OperationContext* opCtx, Collecti
 
     // Setup on-disk structures.
     const auto protocol = IndexBuildProtocol::kSinglePhase;
-    Status status = collection->getCatalogEntry()->prepareForIndexBuild(
-        opCtx, descriptor.get(), protocol, isBackgroundSecondaryBuild);
+    Status status = DurableCatalog::get(opCtx)->prepareForIndexBuild(
+        opCtx, _nss, descriptor.get(), protocol, isBackgroundSecondaryBuild);
     if (!status.isOK())
         return status;
 
@@ -103,8 +103,8 @@ Status IndexCatalogImpl::IndexBuildBlock::init(OperationContext* opCtx, Collecti
                       _indexBuildInterceptor->getConstraintViolationsTableIdent())
                 : boost::none;
 
-            collection->getCatalogEntry()->setIndexBuildScanning(
-                opCtx, _entry->descriptor()->indexName(), sideWritesIdent, constraintsIdent);
+            DurableCatalog::get(opCtx)->setIndexBuildScanning(
+                opCtx, _nss, _entry->descriptor()->indexName(), sideWritesIdent, constraintsIdent);
         }
     }
 
@@ -145,7 +145,7 @@ void IndexCatalogImpl::IndexBuildBlock::fail(OperationContext* opCtx,
             _entry->setIndexBuildInterceptor(nullptr);
         }
     } else {
-        _catalog->_deleteIndexFromDisk(opCtx, _indexName, _indexNamespace);
+        _catalog->_deleteIndexFromDisk(opCtx, _indexName);
     }
 }
 

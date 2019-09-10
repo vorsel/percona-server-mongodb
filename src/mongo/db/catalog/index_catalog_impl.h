@@ -56,7 +56,7 @@ struct InsertDeleteOptions;
  */
 class IndexCatalogImpl : public IndexCatalog {
 public:
-    explicit IndexCatalogImpl(Collection* collection, int maxNumIndexesAllowed);
+    explicit IndexCatalogImpl(Collection* collection);
     ~IndexCatalogImpl() override;
 
     // must be called before used
@@ -295,7 +295,6 @@ public:
         IndexBuildMethod _method;
 
         std::string _indexName;
-        std::string _indexNamespace;
 
         IndexCatalogEntry* _entry;
 
@@ -423,9 +422,7 @@ private:
 
     // just does disk hanges
     // doesn't change memory state, etc...
-    void _deleteIndexFromDisk(OperationContext* opCtx,
-                              const std::string& indexName,
-                              const std::string& indexNamespace);
+    void _deleteIndexFromDisk(OperationContext* opCtx, const std::string& indexName);
 
     // descriptor ownership passes to _setupInMemoryStructures
     // initFromDisk: Avoids registering a change to undo this operation when set to true.
@@ -483,7 +480,6 @@ private:
 
     int _magic;
     Collection* const _collection;
-    const int _maxNumIndexesAllowed;
 
     IndexCatalogEntryContainer _readyIndexes;
     IndexCatalogEntryContainer _buildingIndexes;

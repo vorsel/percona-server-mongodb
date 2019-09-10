@@ -128,11 +128,6 @@ add_option('lto',
     nargs=0,
 )
 
-add_option('dynamic-windows',
-    help='dynamically link on Windows',
-    nargs=0,
-)
-
 add_option('endian',
     choices=['big', 'little', 'auto'],
     default='auto',
@@ -282,6 +277,11 @@ add_option('opt',
 add_option('sanitize',
     help='enable selected sanitizers',
     metavar='san1,san2,...sanN',
+)
+
+add_option('sanitize-coverage',
+    help='enable selected coverage sanitizers',
+    metavar='cov1,cov2,...covN',
 )
 
 add_option('llvm-symbolizer',
@@ -590,6 +590,15 @@ add_option('jlink',
         nargs='?',
         type=float)
 
+add_option('enable-usdt-probes',
+	choices=["on", "off", "auto"],
+	default="auto",
+	help='Enables USDT probes. Default is auto, which is enabled only on Linux with SystemTap headers',
+	type='choice',
+    nargs='?',
+    const='on',
+)
+
 try:
     with open("version.json", "r") as version_fp:
         version_data = json.load(version_fp)
@@ -673,6 +682,7 @@ def variable_tools_converter(val):
         "mongo_benchmark",
         "mongo_integrationtest",
         "mongo_unittest",
+        "mongo_libfuzzer",
         "textfile",
     ]
 
@@ -972,7 +982,7 @@ def printLocalInfo():
 
 printLocalInfo()
 
-boostLibs = [ "filesystem", "program_options", "system", "iostreams" ]
+boostLibs = [ "filesystem", "program_options", "system", "iostreams", "thread", "log" ]
 
 onlyServer = len( COMMAND_LINE_TARGETS ) == 0 or ( len( COMMAND_LINE_TARGETS ) == 1 and str( COMMAND_LINE_TARGETS[0] ) in [ "mongod" , "mongos" , "test" ] )
 
@@ -1030,6 +1040,8 @@ envDict = dict(BUILD_ROOT=buildDir,
                # TODO: Move unittests.txt to $BUILD_DIR, but that requires
                # changes to MCI.
                UNITTEST_LIST='$BUILD_ROOT/unittests.txt',
+               LIBFUZZER_TEST_ALIAS='libfuzzer_tests',
+               LIBFUZZER_TEST_LIST='$BUILD_ROOT/libfuzzer_tests.txt',
                INTEGRATION_TEST_ALIAS='integration_tests',
                INTEGRATION_TEST_LIST='$BUILD_ROOT/integration_tests.txt',
                BENCHMARK_ALIAS='benchmarks',
@@ -1631,8 +1643,6 @@ elif env.TargetOSIs('openbsd'):
     env.Append( LIBS=[ "kvm" ] )
 
 elif env.TargetOSIs('windows'):
-    dynamicCRT = has_option("dynamic-windows")
-
     env['DIST_ARCHIVE_SUFFIX'] = '.zip'
 
     # If tools configuration fails to set up 'cl' in the path, fall back to importing the whole
@@ -1777,20 +1787,9 @@ elif env.TargetOSIs('windows'):
     env.Append( LINKFLAGS=["/DEBUG"] )
 
     # /MD:  use the multithreaded, DLL version of the run-time library (MSVCRT.lib/MSVCR###.DLL)
-    # /MT:  use the multithreaded, static version of the run-time library (LIBCMT.lib)
     # /MDd: Defines _DEBUG, _MT, _DLL, and uses MSVCRTD.lib/MSVCRD###.DLL
-    # /MTd: Defines _DEBUG, _MT, and causes your application to use the
-    #       debug multithread version of the run-time library (LIBCMTD.lib)
 
-    winRuntimeLibMap = {
-          #dyn   #dbg
-        ( False, False ) : "/MT",
-        ( False, True  ) : "/MTd",
-        ( True,  False ) : "/MD",
-        ( True,  True  ) : "/MDd",
-    }
-
-    env.Append(CCFLAGS=[winRuntimeLibMap[(dynamicCRT, debugBuild)]])
+    env.Append(CCFLAGS=["/MDd" if debugBuild else "/MD"])
 
     if optBuild:
         # /O1:  optimize for size
@@ -2136,6 +2135,7 @@ def doConfigure(myenv):
         env['WIN_VERSION_MIN'] = win_version_min
         win_version_min = win_version_min_choices[win_version_min]
         env.Append( CPPDEFINES=[("_WIN32_WINNT", "0x" + win_version_min[0])] )
+        env.Append( CPPDEFINES=[("BOOST_USE_WINAPI_VERSION", "0x" + win_version_min[0])] )
         env.Append( CPPDEFINES=[("NTDDI_VERSION", "0x" + win_version_min[0] + win_version_min[1])] )
 
     conf.Finish()
@@ -2670,6 +2670,7 @@ def doConfigure(myenv):
         using_asan = 'address' in sanitizer_list or using_lsan
         using_tsan = 'thread' in sanitizer_list
         using_ubsan = 'undefined' in sanitizer_list
+        using_fsan = 'fuzzer' in sanitizer_list
 
         if env['MONGO_ALLOCATOR'] in ['tcmalloc', 'tcmalloc-experimental'] and (using_lsan or using_asan):
             # There are multiply defined symbols between the sanitizer and
@@ -2691,6 +2692,15 @@ def doConfigure(myenv):
             if 'address' in sanitizer_list:
                 sanitizer_list.remove('leak')
 
+        if using_fsan:
+            if not myenv.ToolchainIs('clang'):
+                myenv.FatalError("Using the fuzzer sanitizer requires clang")
+            # We can't include the fuzzer flag with the other sanitize flags
+            # The libfuzzer library already has a main function, which will cause the dependencies check
+            # to fail
+            sanitizer_list.remove('fuzzer')
+            sanitizer_list.append('fuzzer-no-link')
+
         sanitizer_option = '-fsanitize=' + ','.join(sanitizer_list)
 
         if AddToCCFLAGSIfSupported(myenv, sanitizer_option):
@@ -2698,6 +2708,15 @@ def doConfigure(myenv):
             myenv.Append(CCFLAGS=['-fno-omit-frame-pointer'])
         else:
             myenv.ConfError('Failed to enable sanitizers with flag: {0}', sanitizer_option )
+
+        if has_option('sanitize-coverage') and using_fsan:
+            sanitize_coverage_list = get_option('sanitize-coverage')
+            sanitize_coverage_option = '-fsanitize-coverage=' + sanitize_coverage_list
+            if AddToCCFLAGSIfSupported(myenv,sanitize_coverage_option):
+                myenv.Append(LINKFLAGS=[sanitize_coverage_option])
+            else:
+                myenv.ConfError('Failed to enable -fsanitize-coverage with flag: {0}', sanitize_coverage_option )
+
 
         blackfiles_map = {
             "address" : myenv.File("#etc/asan.blacklist"),
@@ -2770,7 +2789,9 @@ def doConfigure(myenv):
             # By default, undefined behavior sanitizer doesn't stop on
             # the first error. Make it so. Newer versions of clang
             # have renamed the flag.
-            if not AddToCCFLAGSIfSupported(myenv, "-fno-sanitize-recover"):
+            # However, this flag cannot be included when using the fuzzer sanitizer
+            # if we want to suppress errors to uncover new ones.
+            if not using_fsan and not AddToCCFLAGSIfSupported(myenv, "-fno-sanitize-recover"):
                 AddToCCFLAGSIfSupported(myenv, "-fno-sanitize-recover=undefined")
             myenv.AppendUnique(CPPDEFINES=['UNDEFINED_BEHAVIOR_SANITIZER'])
 
@@ -2789,7 +2810,9 @@ def doConfigure(myenv):
         # because it is much faster. Don't use it if the user has already configured another linker
         # selection manually.
         if not any(flag.startswith('-fuse-ld=') for flag in env['LINKFLAGS']):
-            AddToLINKFLAGSIfSupported(myenv, '-fuse-ld=gold')
+            if AddToLINKFLAGSIfSupported(myenv, '-fuse-ld=gold'):
+                if link_model.startswith("dynamic"):
+                    AddToLINKFLAGSIfSupported(myenv, '-Wl,--gdb-index')
 
         # Explicitly enable GNU build id's if the linker supports it.
         AddToLINKFLAGSIfSupported(myenv, '-Wl,--build-id')
@@ -3292,11 +3315,20 @@ def doConfigure(myenv):
 
     conf.env.Append(
         CPPDEFINES=[
+            ("BOOST_THREAD_VERSION", "5"),
             "BOOST_SYSTEM_NO_DEPRECATED",
             "BOOST_MATH_NO_LONG_DOUBLE_MATH_FUNCTIONS",
             "BOOST_ENABLE_ASSERT_DEBUG_HANDLER",
+            "BOOST_LOG_NO_SHORTHAND_NAMES",
             "ABSL_FORCE_ALIGNED_ACCESS",
         ]
+    )
+
+    if link_model.startswith("dynamic") and not link_model == 'dynamic-sdk':
+        conf.env.AppendUnique(
+            CPPDEFINES=[
+                "BOOST_LOG_DYN_LINK",
+            ]
     )
 
     if use_system_version_of_library("boost"):
@@ -3603,7 +3635,23 @@ def doConfigure(myenv):
         else:
             myenv.ConfError("Running on ppc64le, but can't find a correct vec_vbpermq output index.  Compiler or platform not supported")
 
+    myenv = conf.Finish()
+
+    conf = Configure(myenv)
+    usdt_enabled = get_option('enable-usdt-probes')
+    usdt_provider = None
+    if usdt_enabled in ('auto', 'on'):
+        if env.TargetOSIs('linux'):
+            if conf.CheckHeader('sys/sdt.h'):
+                usdt_provider = 'SDT'
+        # can put other OS targets here
+        if usdt_enabled == 'on' and not usdt_provider:
+             myenv.ConfError("enable-usdt-probes flag was set to on, but no USDT provider could be found")
+        elif usdt_provider:
+            conf.env.SetConfigHeaderDefine("MONGO_CONFIG_USDT_ENABLED")
+            conf.env.SetConfigHeaderDefine("MONGO_CONFIG_USDT_PROVIDER", usdt_provider)
     return conf.Finish()
+
 
 env = doConfigure( env )
 

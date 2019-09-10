@@ -102,6 +102,18 @@ public:
     int64_t sizeOnDiskForDb(OperationContext* opCtx, StringData dbName) {
         return 0;
     }
+    KVEngine* getEngine() {
+        return nullptr;
+    }
+    const KVEngine* getEngine() const {
+        return nullptr;
+    }
+    DurableCatalog* getCatalog() {
+        return nullptr;
+    }
+    const DurableCatalog* getCatalog() const {
+        return nullptr;
+    }
 };
 
 /**

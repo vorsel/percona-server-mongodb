@@ -43,13 +43,13 @@
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
-#include "mongo/db/index/index_access_method_gen.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/timestamp_block.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/util/log.h"
 #include "mongo/util/progress_meter.h"
@@ -100,16 +100,6 @@ Status checkKeySize(const BSONObj& key) {
 
 }  // namespace
 
-// TODO SERVER-36386: Remove the server parameter
-bool failIndexKeyTooLongParam() {
-    // Always return true in FCV 4.2 although FCV 4.2 actually never needs to
-    // check this value because there shouldn't be any KeyTooLong errors in FCV 4.2.
-    if (serverGlobalParams.featureCompatibility.getVersion() ==
-        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42)
-        return true;
-    return failIndexKeyTooLong.load();
-}
-
 class BtreeExternalSortComparison {
 public:
     BtreeExternalSortComparison(const BSONObj& ordering, IndexVersion version)
@@ -139,11 +129,6 @@ AbstractIndexAccessMethod::AbstractIndexAccessMethod(IndexCatalogEntry* btreeSta
 }
 
 // TODO SERVER-36385: Remove this when there is no KeyTooLong error.
-bool AbstractIndexAccessMethod::ignoreKeyTooLong() {
-    return !failIndexKeyTooLongParam();
-}
-
-// TODO SERVER-36385: Remove this when there is no KeyTooLong error.
 bool AbstractIndexAccessMethod::shouldCheckIndexKeySize(OperationContext* opCtx) {
     // The index key size ought to be checked for nodes in FCV 4.0.  However, it is possible for an
     // index build to have begun on a secondary while in FCV 4.2 and then have FCV drop to 4.0.  For
@@ -167,7 +152,7 @@ bool AbstractIndexAccessMethod::isFatalError(OperationContext* opCtx, Status sta
     // If the status is Status::OK(), or if it is ErrorCodes::KeyTooLong and the user has chosen to
     // ignore this error, return false immediately.
     // TODO SERVER-36385: Remove this when there is no KeyTooLong error.
-    if (status.isOK() || (status == ErrorCodes::KeyTooLong && ignoreKeyTooLong())) {
+    if (status.isOK() || (status == ErrorCodes::KeyTooLong)) {
         return false;
     }
 
@@ -243,7 +228,8 @@ Status AbstractIndexAccessMethod::insertKeys(OperationContext* opCtx,
                 }
 
                 if (status.isOK() && ret.getValue() == SpecialFormatInserted::LongTypeBitsInserted)
-                    _btreeState->setIndexKeyStringWithLongTypeBitsExistsOnDisk(opCtx);
+                    DurableCatalog::get(opCtx)->setIndexKeyStringWithLongTypeBitsExistsOnDisk(
+                        opCtx);
             }
             if (isFatalError(opCtx, status, key)) {
                 return status;
@@ -269,7 +255,8 @@ void AbstractIndexAccessMethod::removeOneKey(OperationContext* opCtx,
     try {
         _newInterface->unindex(opCtx, key, loc, dupsAllowed);
     } catch (AssertionException& e) {
-        log() << "Assertion failure: _unindex failed " << _descriptor->indexNamespace();
+        log() << "Assertion failure: _unindex failed on: " << _descriptor->parentNS()
+              << " for index: " << _descriptor->indexName();
         log() << "Assertion failure: _unindex failed: " << redact(e) << "  key:" << key.toString()
               << "  dl:" << loc;
         logContext();
@@ -487,7 +474,8 @@ Status AbstractIndexAccessMethod::update(OperationContext* opCtx,
                     _newInterface->insert(opCtx, key, recordId, ticket.dupsAllowed);
                 status = ret.getStatus();
                 if (status.isOK() && ret.getValue() == SpecialFormatInserted::LongTypeBitsInserted)
-                    _btreeState->setIndexKeyStringWithLongTypeBitsExistsOnDisk(opCtx);
+                    DurableCatalog::get(opCtx)->setIndexKeyStringWithLongTypeBitsExistsOnDisk(
+                        opCtx);
             }
             if (isFatalError(opCtx, status, key)) {
                 return status;
@@ -688,7 +676,7 @@ Status AbstractIndexAccessMethod::commitBulk(OperationContext* opCtx,
             StatusWith<SpecialFormatInserted> ret = builder->addKey(data.first, data.second);
             status = ret.getStatus();
             if (status.isOK() && ret.getValue() == SpecialFormatInserted::LongTypeBitsInserted)
-                _btreeState->setIndexKeyStringWithLongTypeBitsExistsOnDisk(opCtx);
+                DurableCatalog::get(opCtx)->setIndexKeyStringWithLongTypeBitsExistsOnDisk(opCtx);
         }
 
         if (!status.isOK()) {
@@ -697,7 +685,7 @@ Status AbstractIndexAccessMethod::commitBulk(OperationContext* opCtx,
 
             // Overlong key that's OK to skip?
             // TODO SERVER-36385: Remove this when there is no KeyTooLong error.
-            if (status.code() == ErrorCodes::KeyTooLong && ignoreKeyTooLong()) {
+            if (status.code() == ErrorCodes::KeyTooLong) {
                 continue;
             }
 
@@ -726,7 +714,7 @@ Status AbstractIndexAccessMethod::commitBulk(OperationContext* opCtx,
     // tracker bit so that downgrade binary which cannot read the long TypeBits fails to
     // start up.
     if (specialFormatInserted == SpecialFormatInserted::LongTypeBitsInserted)
-        _btreeState->setIndexKeyStringWithLongTypeBitsExistsOnDisk(opCtx);
+        DurableCatalog::get(opCtx)->setIndexKeyStringWithLongTypeBitsExistsOnDisk(opCtx);
     wunit.commit();
     return Status::OK();
 }

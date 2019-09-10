@@ -65,6 +65,7 @@ public:
                                                           StringData ident) override;
 
     Status createSortedDataInterface(OperationContext* opCtx,
+                                     const CollectionOptions& collOptions,
                                      StringData ident,
                                      const IndexDescriptor* desc) override;
 
@@ -154,7 +155,7 @@ private:
     std::string _path;
     embedded::MobileOptions _options;
 
-    std::unique_ptr<PeriodicRunner::PeriodicJobHandle> _vacuumJob;
+    PeriodicJobAnchor _vacuumJob;
 };
 
 }  // namespace mongo

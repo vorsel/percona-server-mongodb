@@ -27,6 +27,7 @@
  *    it in the license file.
  */
 
+#include <algorithm>
 #include <third_party/murmurhash3/MurmurHash3.h>
 
 #include "mongo/platform/basic.h"
@@ -40,29 +41,42 @@
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/key_string.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/sorted_data_interface.h"
 #include "mongo/util/elapsed_tracker.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo {
 
 namespace {
-// The number of items we can scan before we must yield.
-static const int kScanLimit = 1000;
 
 // TODO SERVER-36385: Completely remove the key size check in 4.4
 bool largeKeyDisallowed() {
     return (serverGlobalParams.featureCompatibility.getVersion() ==
             ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo40);
 }
+
+// The number of items we can scan before we must yield.
+static const int kScanLimit = 1000;
+static const size_t kNumHashBuckets = 1U << 16;
+
+StringSet::hasher hash;
+
 }  // namespace
+
+IndexInfo::IndexInfo(const IndexDescriptor* descriptor)
+    : descriptor(descriptor),
+      indexNameHash(hash(descriptor->indexName())),
+      ord(Ordering::make(descriptor->keyPattern())),
+      ks(std::make_unique<KeyString>(KeyString::Version::kLatestVersion)) {}
 
 IndexConsistency::IndexConsistency(OperationContext* opCtx,
                                    Collection* collection,
                                    NamespaceString nss,
                                    RecordStore* recordStore,
-                                   const bool background)
+                                   bool background)
     : _opCtx(opCtx),
       _collection(collection),
       _nss(nss),
@@ -71,179 +85,48 @@ IndexConsistency::IndexConsistency(OperationContext* opCtx,
                internalQueryExecYieldIterations.load(),
                Milliseconds(internalQueryExecYieldPeriodMS.load())),
       _firstPhase(true) {
+    _indexKeyCount.resize(kNumHashBuckets);
 
     IndexCatalog* indexCatalog = _collection->getIndexCatalog();
     std::unique_ptr<IndexCatalog::IndexIterator> indexIterator =
         indexCatalog->getIndexIterator(_opCtx, false);
 
-    int indexNumber = 0;
     while (indexIterator->more()) {
-
         const IndexDescriptor* descriptor = indexIterator->next()->descriptor();
-        std::string indexName = descriptor->indexName();
-        _indexNumber[indexName] = indexNumber;
-
-        IndexInfo indexInfo;
-
-        indexInfo.indexName = indexName;
-        indexInfo.keyPattern = descriptor->keyPattern();
-        indexInfo.isReady = _collection->getCatalogEntry()->isIndexReady(opCtx, indexName);
-
-        uint32_t indexNameHash;
-        MurmurHash3_x86_32(indexName.c_str(), indexName.size(), 0, &indexNameHash);
-        indexInfo.indexNameHash = indexNameHash;
-        indexInfo.indexScanFinished = false;
-
-        indexInfo.numKeys = 0;
-        indexInfo.numLongKeys = 0;
-        indexInfo.numRecords = 0;
-        indexInfo.numExtraIndexKeys = 0;
-
-        _indexesInfo[indexNumber] = indexInfo;
-
-        indexNumber++;
+        if (DurableCatalog::get(opCtx)->isIndexReady(opCtx, nss, descriptor->indexName()))
+            _indexesInfo.emplace(descriptor->indexName(), IndexInfo(descriptor));
     }
 }
 
-void IndexConsistency::addDocKey(const KeyString& ks,
-                                 int indexNumber,
-                                 const RecordId& recordId,
-                                 const BSONObj& indexKey) {
-
-    if (indexNumber < 0 || indexNumber >= static_cast<int>(_indexesInfo.size())) {
-        return;
-    }
-
-    stdx::lock_guard<stdx::mutex> lock(_classMutex);
-    _addDocKey_inlock(ks, indexNumber, recordId, indexKey);
+void IndexConsistency::addMultikeyMetadataPath(const KeyString& ks, IndexInfo* indexInfo) {
+    indexInfo->hashedMultikeyMetadataPaths.emplace(_hashKeyString(ks, indexInfo->indexNameHash));
 }
 
-void IndexConsistency::addIndexKey(const KeyString& ks,
-                                   int indexNumber,
-                                   const RecordId& recordId,
-                                   const BSONObj& indexKey) {
-
-    if (indexNumber < 0 || indexNumber >= static_cast<int>(_indexesInfo.size())) {
-        return;
-    }
-
-    stdx::lock_guard<stdx::mutex> lock(_classMutex);
-    _addIndexKey_inlock(ks, indexNumber, recordId, indexKey);
+void IndexConsistency::removeMultikeyMetadataPath(const KeyString& ks, IndexInfo* indexInfo) {
+    indexInfo->hashedMultikeyMetadataPaths.erase(_hashKeyString(ks, indexInfo->indexNameHash));
 }
 
-void IndexConsistency::addMultikeyMetadataPath(const KeyString& ks, int indexNumber) {
-    if (indexNumber < 0) {
-        return;
-    }
-    invariant(static_cast<size_t>(indexNumber) < _indexesInfo.size());
-
-    stdx::lock_guard<stdx::mutex> lock(_classMutex);
-    _indexesInfo[indexNumber].hashedMultikeyMetadataPaths.emplace(_hashKeyString(ks, indexNumber));
+size_t IndexConsistency::getMultikeyMetadataPathCount(IndexInfo* indexInfo) {
+    return indexInfo->hashedMultikeyMetadataPaths.size();
 }
 
-void IndexConsistency::removeMultikeyMetadataPath(const KeyString& ks, int indexNumber) {
-    if (indexNumber < 0) {
-        return;
-    }
-    invariant(static_cast<size_t>(indexNumber) < _indexesInfo.size());
-
-    stdx::lock_guard<stdx::mutex> lock(_classMutex);
-    _indexesInfo[indexNumber].hashedMultikeyMetadataPaths.erase(_hashKeyString(ks, indexNumber));
-}
-
-size_t IndexConsistency::getMultikeyMetadataPathCount(int indexNumber) {
-    if (indexNumber < 0) {
-        return 0;
-    }
-    invariant(static_cast<size_t>(indexNumber) < _indexesInfo.size());
-
-    stdx::lock_guard<stdx::mutex> lock(_classMutex);
-    return _indexesInfo[indexNumber].hashedMultikeyMetadataPaths.size();
-}
-
-void IndexConsistency::addLongIndexKey(int indexNumber) {
-
-    stdx::lock_guard<stdx::mutex> lock(_classMutex);
-    if (indexNumber < 0 || indexNumber >= static_cast<int>(_indexesInfo.size())) {
-        return;
-    }
-
-    _indexesInfo[indexNumber].numRecords++;
-    _indexesInfo[indexNumber].numLongKeys++;
-}
-
-int64_t IndexConsistency::getNumKeys(int indexNumber) const {
-
-    stdx::lock_guard<stdx::mutex> lock(_classMutex);
-    if (indexNumber < 0 || indexNumber >= static_cast<int>(_indexesInfo.size())) {
-        return 0;
-    }
-
-    return _indexesInfo.at(indexNumber).numKeys;
-}
-
-int64_t IndexConsistency::getNumLongKeys(int indexNumber) const {
-
-    stdx::lock_guard<stdx::mutex> lock(_classMutex);
-    if (indexNumber < 0 || indexNumber >= static_cast<int>(_indexesInfo.size())) {
-        return 0;
-    }
-
-    return _indexesInfo.at(indexNumber).numLongKeys;
-}
-
-int64_t IndexConsistency::getNumRecords(int indexNumber) const {
-
-    stdx::lock_guard<stdx::mutex> lock(_classMutex);
-    if (indexNumber < 0 || indexNumber >= static_cast<int>(_indexesInfo.size())) {
-        return 0;
-    }
-
-    return _indexesInfo.at(indexNumber).numRecords;
+void IndexConsistency::addLongIndexKey(IndexInfo* indexInfo) {
+    indexInfo->numRecords++;
+    indexInfo->numLongKeys++;
 }
 
 bool IndexConsistency::haveEntryMismatch() const {
-
-    stdx::lock_guard<stdx::mutex> lock(_classMutex);
-    for (auto iterator = _indexKeyCount.begin(); iterator != _indexKeyCount.end(); iterator++) {
-        if (iterator->second != 0) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-int64_t IndexConsistency::getNumExtraIndexKeys(int indexNumber) const {
-
-    stdx::lock_guard<stdx::mutex> lock(_classMutex);
-    if (indexNumber < 0 || indexNumber >= static_cast<int>(_indexesInfo.size())) {
-        return 0;
-    }
-
-    return _indexesInfo.at(indexNumber).numExtraIndexKeys;
-}
-
-int IndexConsistency::getIndexNumber(const std::string& indexName) {
-
-    auto search = _indexNumber.find(indexName);
-    if (search != _indexNumber.end()) {
-        return search->second;
-    }
-
-    return -1;
+    return std::any_of(
+        _indexKeyCount.begin(), _indexKeyCount.end(), [](int count) -> bool { return count; });
 }
 
 void IndexConsistency::setSecondPhase() {
-
-    stdx::lock_guard<stdx::mutex> lock(_classMutex);
     invariant(_firstPhase);
     _firstPhase = false;
 }
 
 void IndexConsistency::addIndexEntryErrors(ValidateResultsMap* indexNsResultsMap,
                                            ValidateResults* results) {
-    stdx::lock_guard<stdx::mutex> lock(_classMutex);
     invariant(!_firstPhase);
 
     // We'll report up to 1MB for extra index entry errors and missing index entry errors.
@@ -337,32 +220,19 @@ void IndexConsistency::addIndexEntryErrors(ValidateResultsMap* indexNsResultsMap
     results->valid = false;
 }
 
-void IndexConsistency::_addDocKey_inlock(const KeyString& ks,
-                                         int indexNumber,
-                                         const RecordId& recordId,
-                                         const BSONObj& indexKey) {
-
-    // Ignore indexes that weren't ready before we started validation.
-    if (!_indexesInfo.at(indexNumber).isReady) {
-        return;
-    }
-
-    const uint32_t hash = _hashKeyString(ks, indexNumber);
+void IndexConsistency::addDocKey(const KeyString& ks,
+                                 IndexInfo* indexInfo,
+                                 RecordId recordId,
+                                 const BSONObj& indexKey) {
+    const uint32_t hash = _hashKeyString(ks, indexInfo->indexNameHash);
 
     if (_firstPhase) {
         // During the first phase of validation we only keep track of the count for the document
         // keys encountered.
         _indexKeyCount[hash]++;
-        _indexesInfo.at(indexNumber).numRecords++;
-    } else {
-        // For the second phase of validation, we keep track of the document keys that mapped to
-        // an inconsistent hash bucket during the first phase.
-        auto searchBuckets = _indexKeyCount.find(hash);
-        invariant(searchBuckets != _indexKeyCount.end());
-        if (searchBuckets->second == 0) {
-            // No inconsistencies in this hash bucket during the first phase.
-            return;
-        }
+        indexInfo->numRecords++;
+    } else if (_indexKeyCount[hash]) {
+        // Found a document key for a hash bucket that had mismatches.
 
         // Get the documents _id index key.
         auto cursor = _recordStore->getCursor(_opCtx);
@@ -376,7 +246,7 @@ void IndexConsistency::_addDocKey_inlock(const KeyString& ks,
         }
 
         std::string key = std::string(ks.getBuffer(), ks.getSize());
-        BSONObj info = _generateInfo(indexNumber, recordId, indexKey, idKey);
+        BSONObj info = _generateInfo(*indexInfo, recordId, indexKey, idKey);
 
         // Cannot have duplicate KeyStrings during the document scan phase.
         invariant(_missingIndexEntries.count(key) == 0);
@@ -384,39 +254,25 @@ void IndexConsistency::_addDocKey_inlock(const KeyString& ks,
     }
 }
 
-void IndexConsistency::_addIndexKey_inlock(const KeyString& ks,
-                                           int indexNumber,
-                                           const RecordId& recordId,
-                                           const BSONObj& indexKey) {
-
-    // Ignore indexes that weren't ready before we started validation.
-    if (!_indexesInfo.at(indexNumber).isReady) {
-        return;
-    }
-
-    const uint32_t hash = _hashKeyString(ks, indexNumber);
+void IndexConsistency::addIndexKey(const KeyString& ks,
+                                   IndexInfo* indexInfo,
+                                   RecordId recordId,
+                                   const BSONObj& indexKey) {
+    const uint32_t hash = _hashKeyString(ks, indexInfo->indexNameHash);
 
     if (_firstPhase) {
         // During the first phase of validation we only keep track of the count for the index entry
         // keys encountered.
         _indexKeyCount[hash]--;
-        _indexesInfo.at(indexNumber).numKeys++;
-    } else {
-        // For the second phase of validation, on the buckets that were inconsistent during the
-        // first phase, we see if there was a corresponding document key for the index entry key
-        // we have.
+        indexInfo->numKeys++;
+    } else if (_indexKeyCount[hash]) {
+        // Found an index key for a bucket that has inconsistencies.
         // If there is a corresponding document key for the index entry key, we remove the key from
         // the '_missingIndexEntries' map. However if there was no document key for the index entry
         // key, we add the key to the '_extraIndexEntries' map.
-        auto searchBuckets = _indexKeyCount.find(hash);
-        invariant(searchBuckets != _indexKeyCount.end());
-        if (searchBuckets->second == 0) {
-            // No inconsistencies in this hash bucket during the first phase.
-            return;
-        }
 
         std::string key = std::string(ks.getBuffer(), ks.getSize());
-        BSONObj info = _generateInfo(indexNumber, recordId, indexKey, boost::none);
+        BSONObj info = _generateInfo(*indexInfo, recordId, indexKey, boost::none);
 
         if (_missingIndexEntries.count(key) == 0) {
             // We may have multiple extra index entries for a given KeyString.
@@ -434,12 +290,12 @@ void IndexConsistency::_addIndexKey_inlock(const KeyString& ks,
     }
 }
 
-BSONObj IndexConsistency::_generateInfo(const int& indexNumber,
-                                        const RecordId& recordId,
+BSONObj IndexConsistency::_generateInfo(const IndexInfo& indexInfo,
+                                        RecordId recordId,
                                         const BSONObj& indexKey,
                                         boost::optional<BSONElement> idKey) {
-    const std::string& indexName = _indexesInfo.at(indexNumber).indexName;
-    const BSONObj& keyPattern = _indexesInfo.at(indexNumber).keyPattern;
+    const std::string& indexName = indexInfo.descriptor->indexName();
+    const BSONObj& keyPattern = indexInfo.descriptor->keyPattern();
 
     // We need to rehydrate the indexKey for improved readability.
     // {"": ObjectId(...)} -> {"_id": ObjectId(...)}
@@ -467,12 +323,10 @@ BSONObj IndexConsistency::_generateInfo(const int& indexNumber,
     }
 }
 
-uint32_t IndexConsistency::_hashKeyString(const KeyString& ks, int indexNumber) const {
-
-    uint32_t indexNameHash = _indexesInfo.at(indexNumber).indexNameHash;
+uint32_t IndexConsistency::_hashKeyString(const KeyString& ks, uint32_t indexNameHash) const {
     MurmurHash3_x86_32(
         ks.getTypeBits().getBuffer(), ks.getTypeBits().getSize(), indexNameHash, &indexNameHash);
     MurmurHash3_x86_32(ks.getBuffer(), ks.getSize(), indexNameHash, &indexNameHash);
-    return indexNameHash % (1U << 22);
+    return indexNameHash % kNumHashBuckets;
 }
 }  // namespace mongo

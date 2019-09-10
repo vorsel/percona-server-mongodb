@@ -156,14 +156,6 @@ ResumeTokenData DocumentSourceChangeStreamTransform::getResumeToken(Value ts,
     if (!uuid.missing())
         resumeTokenData.uuid = uuid.getUuid();
 
-    // If 'needsMerge' is true, 'mergeByPBRT' is false, and FCV is less than 4.2, then we are
-    // running on a sharded cluster that is mid-upgrade, and so we generate v0 resume tokens.
-    // Otherwise, we always generate v1 resume tokens whether the FCV is 4.0 or 4.2.
-    if (pExpCtx->needsMerge && !pExpCtx->mergeByPBRT &&
-        _fcv < ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42) {
-        resumeTokenData.version = 0;
-    }
-
     return resumeTokenData;
 }
 
@@ -336,15 +328,7 @@ Document DocumentSourceChangeStreamTransform::applyTransformation(const Document
 
     // We set the resume token as the document's sort key in both the sharded and non-sharded cases,
     // since we will subsequently rely upon it to generate a correct postBatchResumeToken.
-    // TODO SERVER-38539: when returning results for merging, we first check whether 'mergeByPBRT'
-    // has been set. If not, then the request was sent from an older mongoS which cannot merge by
-    // raw resume tokens, and we must use the old sort key format. This check, and the 'mergeByPBRT'
-    // flag, are no longer necessary in 4.4; all change streams will be merged by resume token.
-    if (pExpCtx->needsMerge && !pExpCtx->mergeByPBRT) {
-        doc.setSortKeyMetaField(BSON("" << ts << "" << uuid << "" << documentKey));
-    } else {
-        doc.setSortKeyMetaField(resumeToken.toBson());
-    }
+    doc.setSortKeyMetaField(resumeToken.toBson());
 
     // "invalidate" and "newShardDetected" entries have fewer fields.
     if (operationType == DocumentSourceChangeStream::kInvalidateOpType ||

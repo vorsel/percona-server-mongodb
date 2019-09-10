@@ -2307,7 +2307,7 @@ HostAndPort ReplicationCoordinatorImpl::getMyHostAndPort() const {
 
 int ReplicationCoordinatorImpl::_getMyId_inlock() const {
     const MemberConfig& self = _rsConfig.getMemberAt(_selfIndex);
-    return self.getId();
+    return self.getId().getData();
 }
 
 Status ReplicationCoordinatorImpl::resyncData(OperationContext* opCtx, bool waitUntilCompleted) {
@@ -2362,7 +2362,6 @@ Status ReplicationCoordinatorImpl::processReplSetGetStatus(
             static_cast<unsigned>(time(nullptr) - serverGlobalParams.started),
             _getCurrentCommittedSnapshotOpTimeAndWallTime_inlock(),
             initialSyncProgress,
-            _storage->getLastStableCheckpointTimestampDeprecated(_service),
             _storage->getLastStableRecoveryTimestamp(_service)},
         response,
         &result);

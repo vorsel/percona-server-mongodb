@@ -178,6 +178,9 @@ public:
     virtual bool compactsInPlace() const {
         return true;
     }
+    virtual bool supportsOnlineCompaction() const {
+        return true;
+    }
 
     virtual Timestamp getPinnedOplog() const final;
 
@@ -339,6 +342,8 @@ private:
     const bool _isCapped;
     // True if the storage engine is an in-memory storage engine
     const bool _isEphemeral;
+    // True if WiredTiger is logging updates to this table
+    const bool _isLogged;
     // True if the namespace of this record store starts with "local.oplog.", and false otherwise.
     const bool _isOplog;
     int64_t _cappedMaxSize;

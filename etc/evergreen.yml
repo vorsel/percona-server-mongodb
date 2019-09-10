@@ -262,6 +262,7 @@ variables:
   - func: "set up credentials"
   - func: "fetch and build OpenSSL"
   - func: "use WiredTiger develop" # noop if ${use_wt_develop} is not "true"
+  - func: "set up win mount script"
   - func: "generate compile expansions"
   teardown_group:
   - func: "scons cache pruning"
@@ -287,7 +288,7 @@ variables:
     exe: ".exe"
     msi_target: msi
     content_type: application/zip
-    compile_flags: --release --ssl MONGO_DISTMOD=windows-64 CPPPATH="c:/sasl/include c:/snmp/include" LIBPATH="c:/sasl/lib c:/snmp/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --dynamic-windows --win-version-min=ws08r2
+    compile_flags: --release --ssl MONGO_DISTMOD=windows-64 CPPPATH="c:/sasl/include c:/snmp/include" LIBPATH="c:/sasl/lib c:/snmp/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --win-version-min=ws08r2
     # We invoke SCons using --jobs = (# of CPUs / 4) to avoid causing out of memory errors due to
     # spawning a large number of linker processes.
     num_scons_link_jobs_available: $(( $(grep -c ^processor /proc/cpuinfo) / 4 ))
@@ -344,6 +345,7 @@ variables:
     - func: "set task expansion macros"
     - func: "set up virtualenv"
     - func: "get buildnumber"
+    - func: "set up win mount script"
     - func: "generate compile expansions"
   teardown_group:
     - func: "scons cache pruning"
@@ -638,6 +640,18 @@ functions:
         build_phase='${task_name}_${execution}'
         END_OF_CREDS
 
+  "set up win mount script": &set_up_win_mount_script
+    command: shell.exec
+    params:
+      working_dir: src
+      shell: bash
+      silent: true
+      script: |
+        cat <<EOF > win_mount.sh
+        net use X: '\\\\${win_scons_endpoint}\\share' /USER:${win_scons_user} '${win_scons_pass}'
+        EOF
+        chmod +x win_mount.sh
+
   "set up notary client credentials": &set_up_notary_client_credentials
     command: shell.exec
     params:
@@ -906,24 +920,38 @@ functions:
 
 
           set +o errexit
-          mount | grep "\/efs" > /dev/null
+
+          if [ "Windows_NT" = "$OS" ]; then
+            ./win_mount.sh
+          else
+            mount | grep "\/efs" > /dev/null
+          fi
           if [ $? -eq 0 ]; then
             echo "Shared cache is already mounted"
           else
             echo "Shared cache - mounting file system"
-            sudo mount /efs
+            if [ "Windows_NT" = "$OS" ]; then
+              ./win_mount.sh
+            else
+              sudo mount /efs
+            fi
           fi
           set -o errexit
 
-          dirs=$(ls -l /efs | grep -v total | awk '{print $NF}')
+          if [ "Windows_NT" = "$OS" ]; then
+            cache_folder=/cygdrive/x
+          else
+            cache_folder=/efs
+          fi
+          dirs=$(ls -l $cache_folder | grep -v total | awk '{print $NF}')
 
           echo "Pruning shared SCons directories"
 
           for dir in $dirs; do
-            echo "Pruning /efs/$dir/scons-cache"
+            echo "Pruning $cache_folder/$dir/scons-cache"
 
-            if [ -e /efs/$dir/info/distro_name ]; then
-              distro=$(cat /efs/$dir/info/distro_name)
+            if [ -e $cache_folder/$dir/info/distro_name ]; then
+              distro=$(cat $cache_folder/$dir/info/distro_name)
             fi
 
             # Set cache sizes by distro
@@ -937,11 +965,20 @@ functions:
                       ;;
             esac
 
-            sudo python buildscripts/scons_cache_prune.py --cache-dir /efs/$dir/scons-cache --cache-size $cache_size --prune-ratio 1.0
+            if [ "Windows_NT" = "$OS" ]; then
+              echo "dir="$dir
+              python buildscripts/scons_cache_prune.py --cache-dir x:/$dir/scons-cache --cache-size $cache_size --prune-ratio 1.0
+            else
+              sudo python buildscripts/scons_cache_prune.py --cache-dir /efs/$dir/scons-cache --cache-size $cache_size --prune-ratio 1.0
+            fi
             echo ""
           done
 
-          sudo umount /efs || true
+          if [ "Windows_NT" = "$OS" ]; then
+            net use X: /delete || true
+          else
+            sudo umount /efs || true
+          fi
 
         else
           echo "Not on master, shared SCons cache pruning skipped"
@@ -971,8 +1008,12 @@ functions:
         set -o verbose
 
         if [ "${scons_cache_scope}" = "shared" ]; then
-            ${set_sudo}
-            $sudo umount /efs || true
+            if [ "Windows_NT" = "$OS" ]; then
+                net use X: /delete || true
+            else
+                ${set_sudo}
+                $sudo umount /efs || true
+            fi
         fi
 
   "build new tools":
@@ -1515,6 +1556,7 @@ functions:
 
     - command: generate.tasks
       params:
+        optional: true
         files:
           - src/generated_resmoke_config/*.json
 
@@ -1655,13 +1697,17 @@ functions:
 
           if [ "$scons_cache_scope" = "shared" ]; then
             set +o errexit
-            mount | grep "\/efs" > /dev/null
-            if [ $? -eq 0 ]; then
-              echo "Shared cache is already mounted"
+            if [ "Windows_NT" = "$OS" ]; then
+              ./win_mount.sh
             else
-              echo "Shared cache - mounting file system"
-              ${set_sudo}
-              $sudo mount /efs
+              mount | grep "\/efs" > /dev/null
+              if [ $? -eq 0 ]; then
+                echo "Shared cache is already mounted"
+              else
+                echo "Shared cache - mounting file system"
+                ${set_sudo}
+                $sudo mount /efs
+              fi
             fi
             set -o errexit
           fi
@@ -4005,6 +4051,7 @@ tasks:
     - func: "setup android toolchain" # noop if ${setup_android_toolchain} is not "true"
     - func: "set task expansion macros"
     - func: "set up virtualenv"
+    - func: "set up win mount script"
     - func: "generate compile expansions"
     - func: "apply compile expansions"
     - command: s3.get
@@ -4097,6 +4144,7 @@ tasks:
     - func: "setup android toolchain" # noop if ${setup_android_toolchain} is not "true"
     - func: "set task expansion macros"
     - func: "set up virtualenv"
+    - func: "set up win mount script"
     - func: "generate compile expansions"
     - func: "apply compile expansions"
     - command: s3.get
@@ -4526,7 +4574,7 @@ tasks:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
         local_file: "mongo-embedded-sdk-${version}-mongo-c-driver.tgz"
-        remote_file: ${push_path}-STAGE/${push_name}/mongo-c-driver-${version}.tgz
+        remote_file: ${push_path}-STAGE/${push_name}/mongo-c-driver-1.13.0-${version}.tgz
         bucket: build-push-testing
         permissions: public-read
         content_type: application/tar
@@ -4567,8 +4615,8 @@ tasks:
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongo-embedded-${version}.tgz', 'bucket': 'build-push-testing'},
                'destination': {'path': '${push_path}/${push_name}/mongo-embedded-${version}.tgz', 'bucket': '${push_bucket}'}}
 
-            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongo-c-driver-${version}.tgz', 'bucket': 'build-push-testing'},
-               'destination': {'path': '${push_path}/${push_name}/mongo-c-driver-${version}.tgz', 'bucket': '${push_bucket}'}}
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongo-c-driver-1.13.0-${version}.tgz', 'bucket': 'build-push-testing'},
+               'destination': {'path': '${push_path}/${push_name}/mongo-c-driver-1.13.0-${version}.tgz', 'bucket': '${push_bucket}'}}
 
     - command: shell.exec
       params:
@@ -4666,6 +4714,7 @@ tasks:
     - func: "get buildnumber"
     - func: "set up credentials"
     - func: "use WiredTiger develop" # noop if ${use_wt_develop} is not "true"
+    - func: "set up win mount script"
     - func: "generate compile expansions"
     # Then we load the generated version data into the agent so we can use it in task definitions
     - func: "apply compile expansions"
@@ -5937,6 +5986,7 @@ tasks:
   - command: manifest.load
   - func: "git get project"
   - func: "do setup"
+  - func: "set up win mount script"
   - func: "generate compile expansions"  # Generate compile expansions needs to be run to mount the shared scons cache.
   - func: "apply compile expansions"
   - func: "scons compile"
@@ -5956,6 +6006,7 @@ tasks:
   - command: manifest.load
   - func: "git get project"
   - func: "do setup"
+  - func: "set up win mount script"
   - func: "generate compile expansions"  # Generate compile expansions needs to be run to mount the shared scons cache.
   - func: "apply compile expansions"
   - func: "scons compile"
@@ -5975,6 +6026,7 @@ tasks:
   - command: manifest.load
   - func: "git get project"
   - func: "do setup"
+  - func: "set up win mount script"
   - func: "generate compile expansions"  # Generate compile expansions needs to be run to mount the shared scons cache.
   - func: "apply compile expansions"
   - func: "scons compile"
@@ -5994,6 +6046,7 @@ tasks:
   - command: manifest.load
   - func: "git get project"
   - func: "do setup"
+  - func: "set up win mount script"
   - func: "generate compile expansions"  # Generate compile expansions needs to be run to mount the shared scons cache.
   - func: "apply compile expansions"
   - func: "scons compile"
@@ -8125,6 +8178,15 @@ tasks:
   - func: "git get project"
   - func: "shared scons cache pruning"
 
+- name: win_shared_scons_cache_pruning
+  exec_timeout_secs: 7200 # 2 hour timeout for the task overall
+  depends_on: []
+  commands:
+  - command: manifest.load
+  - func: "git get project"
+  - func: "set up win mount script"
+  - func: "shared scons cache pruning"
+
 #######################################
 #             Task Groups             #
 #######################################
@@ -8157,6 +8219,7 @@ task_groups:
     - func: "setup android toolchain" # noop if ${setup_android_toolchain} is not "true"
     - func: "set task expansion macros"
     - func: "set up virtualenv"
+    - func: "set up win mount script"
     - func: "generate compile expansions"
   teardown_group:
     - func: "scons cache pruning"
@@ -9163,13 +9226,13 @@ buildvariants:
     msi_target: msi
     mh_target: dist-mh
     content_type: application/zip
-    compile_flags: --release --ssl MONGO_DISTMOD=windows-64 CPPPATH="c:/sasl/include c:/snmp/include" LIBPATH="c:/sasl/lib c:/snmp/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --dynamic-windows --win-version-min=ws08r2
+    compile_flags: --release --ssl MONGO_DISTMOD=windows-64 CPPPATH="c:/sasl/include c:/snmp/include" LIBPATH="c:/sasl/lib c:/snmp/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --win-version-min=ws08r2
     # We invoke SCons using --jobs = (# of CPUs / 4) to avoid causing out of memory errors due to
     # spawning a large number of linker processes.
     num_scons_link_jobs_available: $(( $(grep -c ^processor /proc/cpuinfo) / 4 ))
     python: '/cygdrive/c/python/python37/python.exe'
     ext: zip
-    use_scons_cache: true
+    scons_cache_scope: shared
     multiversion_platform: windows
     multiversion_edition: enterprise
     tooltags: "ssl sasl gssapi"
@@ -9206,7 +9269,7 @@ buildvariants:
     num_scons_link_jobs_available: $(( $(grep -c ^processor /proc/cpuinfo) / 4 ))
     python: '/cygdrive/c/python/python37/python.exe'
     ext: zip
-    use_scons_cache: true
+    scons_cache_scope: shared
     multiversion_platform: windows
     multiversion_edition: enterprise
     tooltags: ""
@@ -9349,7 +9412,7 @@ buildvariants:
   batchtime: 1440 # 1 day
   expansions:
     <<: *enterprise-windows-64-2k8-nopush-expansions-template
-    compile_flags: --release --ssl --ssl-provider=openssl MONGO_DISTMOD=windows-64 CPPPATH="c:/openssl/include c:/sasl/include c:/snmp/include c:/curl/include" LIBPATH="c:/openssl/lib c:/sasl/lib c:/snmp/lib c:/curl/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --dynamic-windows --win-version-min=ws08r2
+    compile_flags: --release --ssl --ssl-provider=openssl MONGO_DISTMOD=windows-64 CPPPATH="c:/openssl/include c:/sasl/include c:/snmp/include c:/curl/include" LIBPATH="c:/openssl/lib c:/sasl/lib c:/snmp/lib c:/curl/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --win-version-min=ws08r2
 
 - name: enterprise-windows-64-2k8-async
   display_name: "~ Enterprise Windows 2008R2 async"
@@ -9364,13 +9427,13 @@ buildvariants:
     exe: ".exe"
     msi_target: msi
     content_type: application/zip
-    compile_flags: --release --ssl MONGO_DISTMOD=windows-64 CPPPATH="c:/sasl/include c:/snmp/include" LIBPATH="c:/sasl/lib c:/snmp/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --dynamic-windows --win-version-min=ws08r2
+    compile_flags: --release --ssl MONGO_DISTMOD=windows-64 CPPPATH="c:/sasl/include c:/snmp/include" LIBPATH="c:/sasl/lib c:/snmp/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --win-version-min=ws08r2
     # We invoke SCons using --jobs = (# of CPUs / 4) to avoid causing out of memory errors due to
     # spawning a large number of linker processes.
     num_scons_link_jobs_available: $(( $(grep -c ^processor /proc/cpuinfo) / 4 ))
     python: '/cygdrive/c/python/python37/python.exe'
     ext: zip
-    use_scons_cache: true
+    scons_cache_scope: shared
     test_flags: |- # Use the ServiceExecutorAdaptive with a reasonable number of starting threads
         --serviceExecutor=adaptive \
         --mongodSetParameters="adaptiveServiceExecutorReservedThreads: 8" \
@@ -9397,14 +9460,14 @@ buildvariants:
     exe: ".exe"
     msi_target: msi
     content_type: application/zip
-    compile_flags: --release --ssl MONGO_DISTMOD=windows-64 CPPPATH="c:/sasl/include c:/snmp/include" LIBPATH="c:/sasl/lib c:/snmp/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --dynamic-windows --win-version-min=ws08r2
+    compile_flags: --release --ssl MONGO_DISTMOD=windows-64 CPPPATH="c:/sasl/include c:/snmp/include" LIBPATH="c:/sasl/lib c:/snmp/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --win-version-min=ws08r2
     # We invoke SCons using --jobs = (# of CPUs / 4) to avoid causing out of memory errors due to
     # spawning a large number of linker processes.
     num_scons_link_jobs_available: $(( $(grep -c ^processor /proc/cpuinfo) / 4 ))
     python: '/cygdrive/c/python/python37/python.exe'
     test_flags: --storageEngine=inMemory --excludeWithAnyTags=requires_persistence,requires_journaling,uses_transactions
     ext: zip
-    use_scons_cache: true
+    scons_cache_scope: shared
     multiversion_platform: windows
     multiversion_edition: enterprise
     tooltags: "ssl sasl gssapi"
@@ -9455,13 +9518,13 @@ buildvariants:
     multiversion_platform_42_or_later: windows_x86_64-2012plus
     msi_target: msi
     content_type: application/zip
-    compile_flags: --release --ssl MONGO_DISTMOD=2012plus -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --dynamic-windows --win-version-min=ws08r2
+    compile_flags: --release --ssl MONGO_DISTMOD=2012plus -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --win-version-min=ws08r2
     # We invoke SCons using --jobs = (# of CPUs / 4) to avoid causing out of memory errors due to
     # spawning a large number of linker processes.
     num_scons_link_jobs_available: $(( $(grep -c ^processor /proc/cpuinfo) / 4 ))
     python: '/cygdrive/c/python/python37/python.exe'
     ext: zip
-    use_scons_cache: true
+    scons_cache_scope: shared
     tooltags: "ssl"
     build_mongoreplay: false
     large_distro_name: windows-64-vs2017-compile
@@ -9516,13 +9579,13 @@ buildvariants:
     platform_decompress: unzip
     exe: ".exe"
     content_type: application/zip
-    compile_flags: --dbg=on --opt=off --ssl MONGO_DISTMOD=2012plus CPPPATH="c:/sasl/include c:/snmp/include" LIBPATH="c:/sasl/lib c:/snmp/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --dynamic-windows --win-version-min=ws08r2
+    compile_flags: --dbg=on --opt=off --ssl MONGO_DISTMOD=2012plus CPPPATH="c:/sasl/include c:/snmp/include" LIBPATH="c:/sasl/lib c:/snmp/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --win-version-min=ws08r2
     # We invoke SCons using --jobs = (# of CPUs / 4) to avoid causing out of memory errors due to
     # spawning a large number of linker processes.
     num_scons_link_jobs_available: $(( $(grep -c ^processor /proc/cpuinfo) / 4 ))
     python: '/cygdrive/c/python/python37/python.exe'
     ext: zip
-    use_scons_cache: true
+    scons_cache_scope: shared
     tooltags: "ssl sasl gssapi"
     build_mongoreplay: false
   tasks:
@@ -10392,7 +10455,6 @@ buildvariants:
     - rhel62-large
   - name: disk_wiredtiger
   - name: .encrypt
-  - name: initial_sync_fuzzer_gen
   - name: .integration
     distros:
     - rhel62-large
@@ -12240,3 +12302,13 @@ buildvariants:
   stepback: false
   tasks:
   - name: shared_scons_cache_pruning
+
+
+- name: windows-shared-scons-cache-pruning
+  display_name: "Windows shared SCons Cache Pruning"
+  run_on:
+  - windows-64-vs2017-test
+  batchtime: 1440 # 1 day
+  stepback: false
+  tasks:
+  - name: win_shared_scons_cache_pruning

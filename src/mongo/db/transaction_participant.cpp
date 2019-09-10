@@ -1222,10 +1222,25 @@ void TransactionParticipant::Participant::commitPreparedTransaction(
     OperationContext* opCtx,
     Timestamp commitTimestamp,
     boost::optional<repl::OpTime> commitOplogEntryOpTime) {
+    // A correctly functioning coordinator could hit this uassert. This could happen if this
+    // participant shard failed over and the new primary majority committed prepare without this
+    // node in its majority. The coordinator could legally send commitTransaction with a
+    // commitTimestamp to this shard but target the old primary (this node) that has yet to prepare
+    // the transaction. We uassert since this node cannot commit the transaction.
+    if (!o().txnState.isPrepared()) {
+        uasserted(ErrorCodes::InvalidOptions,
+                  "commitTransaction cannot provide commitTimestamp to unprepared transaction.");
+    }
+
     // Re-acquire the RSTL to prevent state transitions while committing the transaction. When the
     // transaction was prepared, we dropped the RSTL. We do not need to reacquire the PBWM because
     // if we're not the primary we will uassert anyways.
     repl::ReplicationStateTransitionLockGuard rstl(opCtx, MODE_IX);
+
+    // Prepared transactions cannot hold the RSTL, or else they will deadlock with state
+    // transitions. If we do not commit the transaction we must unlock the RSTL explicitly so two
+    // phase locking doesn't hold onto it.
+    auto unlockGuard = makeGuard([&] { invariant(opCtx->lockState()->unlockRSTLforPrepare()); });
 
     const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
 
@@ -1235,9 +1250,6 @@ void TransactionParticipant::Participant::commitPreparedTransaction(
                 replCoord->canAcceptWritesForDatabase(opCtx, "admin"));
     }
 
-    uassert(ErrorCodes::InvalidOptions,
-            "commitTransaction cannot provide commitTimestamp to unprepared transaction.",
-            o().txnState.isPrepared());
     uassert(
         ErrorCodes::InvalidOptions, "'commitTimestamp' cannot be null", !commitTimestamp.isNull());
 
@@ -1248,6 +1260,14 @@ void TransactionParticipant::Participant::commitPreparedTransaction(
             commitTimestamp >= prepareTimestamp);
 
     if (!commitOplogEntryOpTime) {
+        // A correctly functioning coordinator could hit this uassert. This could happen if this
+        // participant shard failed over and the new primary majority committed prepare but has yet
+        // to communicate that to this node. The coordinator could legally send commitTransaction
+        // with a commitTimestamp to this shard but target the old primary (this node) that does not
+        // yet know prepare is majority committed. We uassert since the commit oplog entry would be
+        // written in an old term and be guaranteed to roll back. This makes it easier to write
+        // correct tests, consider fewer participant commit cases, and catch potential bugs since
+        // hitting this uassert correctly is unlikely.
         uassert(ErrorCodes::InvalidOptions,
                 "commitTransaction for a prepared transaction cannot be run before its prepare "
                 "oplog entry has been majority committed",
@@ -1261,6 +1281,9 @@ void TransactionParticipant::Participant::commitPreparedTransaction(
     }
 
     try {
+        // We can no longer uassert without terminating.
+        unlockGuard.dismiss();
+
         // Once entering "committing with prepare" we cannot throw an exception.
         UninterruptibleLockGuard noInterrupt(opCtx->lockState());
         opCtx->recoveryUnit()->setCommitTimestamp(commitTimestamp);
@@ -1380,20 +1403,33 @@ bool TransactionParticipant::Observer::expiredAsOf(Date_t when) const {
 }
 
 void TransactionParticipant::Participant::abortActiveTransaction(OperationContext* opCtx) {
-    // Re-acquire the RSTL to prevent state transitions while aborting the transaction. If the
-    // transaction was prepared then we dropped it on preparing the transaction. We do not need to
+    if (o().txnState.isPrepared()) {
+        _abortActivePreparedTransaction(opCtx);
+    } else {
+        _abortActiveTransaction(opCtx, TransactionState::kInProgress, false);
+    }
+}
+
+void TransactionParticipant::Participant::_abortActivePreparedTransaction(OperationContext* opCtx) {
+    // Re-acquire the RSTL to prevent state transitions while aborting the transaction. Since the
+    // transaction was prepared, we dropped it on preparing the transaction. We do not need to
     // reacquire the PBWM because if we're not the primary we will uassert anyways.
     repl::ReplicationStateTransitionLockGuard rstl(opCtx, MODE_IX);
-    if (o().txnState.isPrepared() && opCtx->writesAreReplicated()) {
+
+    // Prepared transactions cannot hold the RSTL, or else they will deadlock with state
+    // transitions. If we do not abort the transaction we must unlock the RSTL explicitly so two
+    // phase locking doesn't hold onto it. Unlocking the RSTL may be a noop if it's already
+    // unlocked.
+    ON_BLOCK_EXIT([&] { opCtx->lockState()->unlockRSTLforPrepare(); });
+
+    if (opCtx->writesAreReplicated()) {
         auto replCoord = repl::ReplicationCoordinator::get(opCtx);
         uassert(ErrorCodes::NotMaster,
                 "Not primary so we cannot abort a prepared transaction",
                 replCoord->canAcceptWritesForDatabase(opCtx, "admin"));
     }
 
-    _abortActiveTransaction(opCtx,
-                            TransactionState::kInProgress | TransactionState::kPrepared,
-                            o().txnState.isPrepared());
+    _abortActiveTransaction(opCtx, TransactionState::kPrepared, true);
 }
 
 void TransactionParticipant::Participant::abortActiveUnpreparedOrStashPreparedTransaction(
@@ -1920,51 +1956,48 @@ void TransactionParticipant::Participant::refreshFromStorageIfNeeded(OperationCo
 
 void TransactionParticipant::Participant::onWriteOpCompletedOnPrimary(
     OperationContext* opCtx,
-    TxnNumber txnNumber,
     std::vector<StmtId> stmtIdsWritten,
-    const repl::OpTime& lastStmtIdWriteOpTime,
-    Date_t lastStmtIdWriteDate,
-    boost::optional<DurableTxnStateEnum> txnState,
-    boost::optional<repl::OpTime> startOpTime) {
+    const SessionTxnRecord& sessionTxnRecord) {
     invariant(opCtx->lockState()->inAWriteUnitOfWork());
-    invariant(txnNumber == o().activeTxnNumber);
+    invariant(sessionTxnRecord.getSessionId() == _sessionId());
+    invariant(sessionTxnRecord.getTxnNum() == o().activeTxnNumber);
 
     // Sanity check that we don't double-execute statements
     for (const auto stmtId : stmtIdsWritten) {
         const auto stmtOpTime = _checkStatementExecuted(stmtId);
         if (stmtOpTime) {
-            fassertOnRepeatedExecution(
-                _sessionId(), txnNumber, stmtId, *stmtOpTime, lastStmtIdWriteOpTime);
+            fassertOnRepeatedExecution(_sessionId(),
+                                       sessionTxnRecord.getTxnNum(),
+                                       stmtId,
+                                       *stmtOpTime,
+                                       sessionTxnRecord.getLastWriteOpTime());
         }
     }
 
-    const auto updateRequest =
-        _makeUpdateRequest(lastStmtIdWriteOpTime, lastStmtIdWriteDate, txnState, startOpTime);
+    const auto updateRequest = _makeUpdateRequest(sessionTxnRecord);
 
     repl::UnreplicatedWritesBlock doNotReplicateWrites(opCtx);
 
     updateSessionEntry(opCtx, updateRequest);
-    _registerUpdateCacheOnCommit(opCtx, std::move(stmtIdsWritten), lastStmtIdWriteOpTime);
+    _registerUpdateCacheOnCommit(
+        opCtx, std::move(stmtIdsWritten), sessionTxnRecord.getLastWriteOpTime());
 }
 
 void TransactionParticipant::Participant::onMigrateCompletedOnPrimary(
     OperationContext* opCtx,
-    TxnNumber txnNumber,
     std::vector<StmtId> stmtIdsWritten,
-    const repl::OpTime& lastStmtIdWriteOpTime,
-    Date_t oplogLastStmtIdWriteDate) {
+    const SessionTxnRecord& sessionTxnRecord) {
     invariant(opCtx->lockState()->inAWriteUnitOfWork());
-    invariant(txnNumber == o().activeTxnNumber);
+    invariant(sessionTxnRecord.getSessionId() == _sessionId());
+    invariant(sessionTxnRecord.getTxnNum() == o().activeTxnNumber);
 
-    // We do not migrate transaction oplog entries so don't set the txn state
-    const auto txnState = boost::none;
-    const auto updateRequest = _makeUpdateRequest(
-        lastStmtIdWriteOpTime, oplogLastStmtIdWriteDate, txnState, boost::none /* startOpTime */);
+    const auto updateRequest = _makeUpdateRequest(sessionTxnRecord);
 
     repl::UnreplicatedWritesBlock doNotReplicateWrites(opCtx);
 
     updateSessionEntry(opCtx, updateRequest);
-    _registerUpdateCacheOnCommit(opCtx, std::move(stmtIdsWritten), lastStmtIdWriteOpTime);
+    _registerUpdateCacheOnCommit(
+        opCtx, std::move(stmtIdsWritten), sessionTxnRecord.getLastWriteOpTime());
 }
 
 void TransactionParticipant::Participant::_invalidate(WithLock wl) {
@@ -2078,23 +2111,10 @@ boost::optional<repl::OpTime> TransactionParticipant::Participant::_checkStateme
 }
 
 UpdateRequest TransactionParticipant::Participant::_makeUpdateRequest(
-    const repl::OpTime& newLastWriteOpTime,
-    Date_t newLastWriteDate,
-    boost::optional<DurableTxnStateEnum> newState,
-    boost::optional<repl::OpTime> startOpTime) const {
+    const SessionTxnRecord& sessionTxnRecord) const {
     UpdateRequest updateRequest(NamespaceString::kSessionTransactionsTableNamespace);
 
-    const auto updateBSON = [&] {
-        SessionTxnRecord newTxnRecord;
-        newTxnRecord.setSessionId(_sessionId());
-        newTxnRecord.setTxnNum(o().activeTxnNumber);
-        newTxnRecord.setLastWriteOpTime(newLastWriteOpTime);
-        newTxnRecord.setLastWriteDate(newLastWriteDate);
-        newTxnRecord.setState(newState);
-        newTxnRecord.setStartOpTime(startOpTime);
-        return newTxnRecord.toBSON();
-    }();
-    updateRequest.setUpdateModification(updateBSON);
+    updateRequest.setUpdateModification(sessionTxnRecord.toBSON());
     updateRequest.setQuery(BSON(SessionTxnRecord::kSessionIdFieldName << _sessionId().toBSON()));
     updateRequest.setUpsert(true);
 

@@ -146,7 +146,7 @@ NamespaceString NamespaceString::makeDropPendingNamespace(const repl::OpTime& op
     ss << db() << "." << dropPendingNSPrefix;
     ss << opTime.getSecs() << "i" << opTime.getTimestamp().getInc() << "t" << opTime.getTerm();
     ss << "." << coll();
-    return NamespaceString(ss.stringData().substr(0, MaxNsCollectionLen));
+    return NamespaceString(ss.stringData());
 }
 
 StatusWith<repl::OpTime> NamespaceString::getDropPendingNamespaceOpTime() const {
@@ -199,27 +199,6 @@ StatusWith<repl::OpTime> NamespaceString::getDropPendingNamespaceOpTime() const 
     }
 
     return repl::OpTime(Timestamp(Seconds(seconds), increment), term);
-}
-
-Status NamespaceString::checkLengthForRename(
-    const std::string::size_type longestIndexNameLength) const {
-    auto longestAllowed =
-        std::min(std::string::size_type(NamespaceString::MaxNsCollectionLen),
-                 std::string::size_type(NamespaceString::MaxNsLen - 2U /*strlen(".$")*/ -
-                                        longestIndexNameLength));
-    if (size() > longestAllowed) {
-        StringBuilder sb;
-        sb << "collection name length of " << size() << " exceeds maximum length of "
-           << longestAllowed << ", allowing for index names";
-        return Status(ErrorCodes::InvalidLength, sb.str());
-    }
-    return Status::OK();
-}
-
-NamespaceString NamespaceString::makeIndexNamespace(StringData indexName) const {
-    StringBuilder ss;
-    ss << coll() << ".$" << indexName;
-    return NamespaceString(db(), ss.stringData());
 }
 
 bool NamespaceString::isReplicated() const {

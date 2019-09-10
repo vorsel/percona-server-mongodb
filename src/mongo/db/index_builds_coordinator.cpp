@@ -49,6 +49,7 @@
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/database_sharding_state.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
@@ -193,7 +194,7 @@ StatusWith<std::pair<long long, long long>> IndexBuildsCoordinator::startIndexRe
                 if (!descriptor) {
                     // If it's unfinished index, drop it directly via removeIndex.
                     Status status =
-                        collection->getCatalogEntry()->removeIndex(opCtx, indexNames[i]);
+                        DurableCatalog::get(opCtx)->removeIndex(opCtx, nss, indexNames[i]);
                     continue;
                 }
                 Status s = indexCatalog->dropIndex(opCtx, descriptor);
@@ -387,7 +388,9 @@ void IndexBuildsCoordinator::assertNoIndexBuildInProgress() const {
 void IndexBuildsCoordinator::assertNoIndexBuildInProgForCollection(
     const UUID& collectionUUID) const {
     uassert(ErrorCodes::BackgroundOperationInProgressForNamespace,
-            str::stream() << "cannot perform operation: an index build is currently running",
+            str::stream() << "cannot perform operation: an index build is currently running for "
+                             "collection with UUID: "
+                          << collectionUUID,
             !inProgForCollection(collectionUUID));
 }
 
@@ -760,10 +763,6 @@ void IndexBuildsCoordinator::_runIndexBuildInner(OperationContext* opCtx,
     // build.
     boost::optional<Lock::CollectionLock> collLock;
     collLock.emplace(opCtx, *nss, MODE_X);
-
-    // Allow the strong lock acquisition above to be interrupted, but from this point forward do
-    // not allow locks or re-locks to be interrupted.
-    UninterruptibleLockGuard noInterrupt(opCtx->lockState());
 
     auto collection =
         CollectionCatalog::get(opCtx).lookupCollectionByUUID(replState->collectionUUID);

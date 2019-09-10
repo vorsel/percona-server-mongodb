@@ -100,7 +100,7 @@ MobileKVEngine::MobileKVEngine(const std::string& path,
                                             maybeVacuum(client, Date_t::max());
                                         },
                                         Minutes(options.vacuumCheckIntervalMinutes)));
-        _vacuumJob->start();
+        _vacuumJob.start();
     }
 }
 
@@ -230,6 +230,7 @@ std::unique_ptr<RecordStore> MobileKVEngine::makeTemporaryRecordStore(OperationC
 
 
 Status MobileKVEngine::createSortedDataInterface(OperationContext* opCtx,
+                                                 const CollectionOptions& collOptions,
                                                  StringData ident,
                                                  const IndexDescriptor* desc) {
     return MobileIndex::create(opCtx, ident.toString());
