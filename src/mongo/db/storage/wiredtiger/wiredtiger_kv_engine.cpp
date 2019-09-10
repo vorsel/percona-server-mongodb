@@ -1265,7 +1265,7 @@ public:
     using Base = FormattedLogSystem;
 
     MongoLogSystem() :
-        Base(Aws::Utils::Logging::LogLevel::Info)
+        Base(Aws::Utils::Logging::LogLevel::Trace)
     {}
 
     virtual ~MongoLogSystem() {}
@@ -1286,6 +1286,7 @@ Status WiredTigerKVEngine::hotBackup(OperationContext* opCtx, const percona::S3B
     // list of files to backup
     std::vector<FileTuple> filesList;
 
+    log() << "Starting backup";
     auto status = _hotBackupPopulateLists(opCtx, s3params.path, dbList, filesList);
     if (!status.isOK()) {
         return status;
