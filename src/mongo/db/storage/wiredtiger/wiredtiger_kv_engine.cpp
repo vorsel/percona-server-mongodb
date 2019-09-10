@@ -1300,6 +1300,7 @@ Status WiredTigerKVEngine::hotBackup(OperationContext* opCtx, const percona::S3B
     ON_BLOCK_EXIT([&] { Aws::Utils::Logging::ShutdownAWSLogging(); });
 
     Aws::Client::ClientConfiguration config;
+    config.requestTimeoutMs = 30000;
     config.endpointOverride = s3params.endpoint; // for example "127.0.0.1:9000"
     config.scheme = Aws::Http::SchemeMapper::FromString(s3params.scheme.c_str());
     if (!s3params.region.empty())
