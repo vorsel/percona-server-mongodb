@@ -42,12 +42,13 @@
 namespace mongo {
 namespace {
 
+using unittest::assertGet;
+
 using CommitChunkMigrate = ConfigServerTestFixture;
 
 const NamespaceString kNamespace("TestDB.TestColl");
 
-TEST_F(CommitChunkMigrate, CheckCorrectOpsCommandWithCtl) {
-
+TEST_F(CommitChunkMigrate, ChunksUpdatedCorrectlyWithControlChunk) {
     ShardType shard0;
     shard0.setName("shard0");
     shard0.setHost("shard0:12");
@@ -56,82 +57,78 @@ TEST_F(CommitChunkMigrate, CheckCorrectOpsCommandWithCtl) {
     shard1.setName("shard1");
     shard1.setHost("shard1:12");
 
-    setupShards({shard0, shard1}).transitional_ignore();
+    setupShards({shard0, shard1});
 
-    int origMajorVersion = 12;
-    auto const origVersion = ChunkVersion(origMajorVersion, 7, OID::gen());
+    ChunkType migratedChunk, controlChunk;
+    {
+        ChunkVersion origVersion(12, 7, OID::gen());
 
-    ChunkType chunk0;
-    chunk0.setNS(kNamespace);
-    chunk0.setVersion(origVersion);
-    chunk0.setShard(shard0.getName());
-    chunk0.setHistory({ChunkHistory(Timestamp(100, 0), shard0.getName())});
+        migratedChunk.setNS(kNamespace);
+        migratedChunk.setVersion(origVersion);
+        migratedChunk.setShard(shard0.getName());
+        migratedChunk.setHistory({ChunkHistory(Timestamp(100, 0), shard0.getName())});
+        migratedChunk.setMin(BSON("a" << 1));
+        migratedChunk.setMax(BSON("a" << 10));
 
-    // apportion
-    auto chunkMin = BSON("a" << 1);
-    chunk0.setMin(chunkMin);
-    auto chunkMax = BSON("a" << 10);
-    chunk0.setMax(chunkMax);
+        origVersion.incMinor();
 
-    ChunkType chunk1;
-    chunk1.setNS(kNamespace);
-    chunk1.setVersion(origVersion);
-    chunk1.setShard(shard0.getName());
+        controlChunk.setNS(kNamespace);
+        controlChunk.setVersion(origVersion);
+        controlChunk.setShard(shard0.getName());
+        controlChunk.setHistory({ChunkHistory(Timestamp(50, 0), shard0.getName())});
+        controlChunk.setMin(BSON("a" << 10));
+        controlChunk.setMax(BSON("a" << 20));
+        controlChunk.setJumbo(true);
+    }
 
-    Timestamp ctrlChunkValidAfter = Timestamp(50, 0);
-    chunk1.setHistory({ChunkHistory(ctrlChunkValidAfter, shard0.getName())});
-
-    chunk1.setMin(chunkMax);
-    auto chunkMaxax = BSON("a" << 20);
-    chunk1.setMax(chunkMaxax);
-
-    setupChunks({chunk0, chunk1}).transitional_ignore();
-
-    // use crefs to verify it will take consts:
-    ChunkType const& chunk0cref = chunk0;
+    setupChunks({migratedChunk, controlChunk});
 
     Timestamp validAfter{101, 0};
-
-    StatusWith<BSONObj> resultBSON = ShardingCatalogManager::get(operationContext())
-                                         ->commitChunkMigration(operationContext(),
-                                                                chunk0.getNS(),
-                                                                chunk0cref,
-                                                                origVersion.epoch(),
-                                                                ShardId(shard0.getName()),
-                                                                ShardId(shard1.getName()),
-                                                                validAfter);
-
-    ASSERT_OK(resultBSON.getStatus());
+    BSONObj versions = assertGet(ShardingCatalogManager::get(operationContext())
+                                     ->commitChunkMigration(operationContext(),
+                                                            kNamespace,
+                                                            migratedChunk,
+                                                            migratedChunk.getVersion().epoch(),
+                                                            ShardId(shard0.getName()),
+                                                            ShardId(shard1.getName()),
+                                                            validAfter));
 
     // Verify the versions returned match expected values.
-    BSONObj versions = resultBSON.getValue();
-    auto mver = ChunkVersion::parseWithField(versions, "migratedChunkVersion");
-    ASSERT_OK(mver.getStatus());
-    ASSERT_EQ(ChunkVersion(origMajorVersion + 1, 0, origVersion.epoch()), mver.getValue());
+    auto mver = assertGet(ChunkVersion::parseWithField(versions, "migratedChunkVersion"));
+    ASSERT_EQ(ChunkVersion(migratedChunk.getVersion().majorVersion() + 1,
+                           0,
+                           migratedChunk.getVersion().epoch()),
+              mver);
 
-    auto cver = ChunkVersion::parseWithField(versions, "controlChunkVersion");
-    ASSERT_OK(cver.getStatus());
-    ASSERT_EQ(ChunkVersion(origMajorVersion + 1, 1, origVersion.epoch()), cver.getValue());
+    auto cver = assertGet(ChunkVersion::parseWithField(versions, "controlChunkVersion"));
+    ASSERT_EQ(ChunkVersion(migratedChunk.getVersion().majorVersion() + 1,
+                           1,
+                           migratedChunk.getVersion().epoch()),
+              cver);
 
     // Verify the chunks ended up in the right shards, and versions match the values returned.
-    auto chunkDoc0 = uassertStatusOK(getChunkDoc(operationContext(), chunkMin));
+    auto chunkDoc0 = uassertStatusOK(getChunkDoc(operationContext(), migratedChunk.getMin()));
     ASSERT_EQ("shard1", chunkDoc0.getShard().toString());
-    ASSERT_EQ(mver.getValue(), chunkDoc0.getVersion());
+    ASSERT_EQ(mver, chunkDoc0.getVersion());
 
     // The migrated chunk's history should be updated.
     ASSERT_EQ(2UL, chunkDoc0.getHistory().size());
     ASSERT_EQ(validAfter, chunkDoc0.getHistory().front().getValidAfter());
 
-    auto chunkDoc1 = uassertStatusOK(getChunkDoc(operationContext(), chunkMax));
+    auto chunkDoc1 = uassertStatusOK(getChunkDoc(operationContext(), controlChunk.getMin()));
     ASSERT_EQ("shard0", chunkDoc1.getShard().toString());
-    ASSERT_EQ(cver.getValue(), chunkDoc1.getVersion());
+    ASSERT_EQ(cver, chunkDoc1.getVersion());
 
-    // The control chunk's history should be unchanged.
+    // The control chunk's history and jumbo status should be unchanged.
     ASSERT_EQ(1UL, chunkDoc1.getHistory().size());
-    ASSERT_EQ(ctrlChunkValidAfter, chunkDoc1.getHistory().front().getValidAfter());
+    ASSERT_EQ(controlChunk.getHistory().front().getValidAfter(),
+              chunkDoc1.getHistory().front().getValidAfter());
+    ASSERT_EQ(controlChunk.getHistory().front().getShard(),
+              chunkDoc1.getHistory().front().getShard());
+    ASSERT(chunkDoc1.getJumbo());
 }
 
-TEST_F(CommitChunkMigrate, CheckCorrectOpsCommandNoCtl) {
+TEST_F(CommitChunkMigrate, ChunksUpdatedCorrectlyWithoutControlChunk) {
 
     ShardType shard0;
     shard0.setName("shard0");
@@ -141,7 +138,7 @@ TEST_F(CommitChunkMigrate, CheckCorrectOpsCommandNoCtl) {
     shard1.setName("shard1");
     shard1.setHost("shard1:12");
 
-    setupShards({shard0, shard1}).transitional_ignore();
+    setupShards({shard0, shard1});
 
     int origMajorVersion = 15;
     auto const origVersion = ChunkVersion(origMajorVersion, 4, OID::gen());
@@ -158,7 +155,7 @@ TEST_F(CommitChunkMigrate, CheckCorrectOpsCommandNoCtl) {
     auto chunkMax = BSON("a" << 10);
     chunk0.setMax(chunkMax);
 
-    setupChunks({chunk0}).transitional_ignore();
+    setupChunks({chunk0});
 
     Timestamp validAfter{101, 0};
 
@@ -201,7 +198,7 @@ TEST_F(CommitChunkMigrate, CheckCorrectOpsCommandNoCtlTrimHistory) {
     shard1.setName("shard1");
     shard1.setHost("shard1:12");
 
-    setupShards({shard0, shard1}).transitional_ignore();
+    setupShards({shard0, shard1});
 
     int origMajorVersion = 15;
     auto const origVersion = ChunkVersion(origMajorVersion, 4, OID::gen());
@@ -218,7 +215,7 @@ TEST_F(CommitChunkMigrate, CheckCorrectOpsCommandNoCtlTrimHistory) {
     auto chunkMax = BSON("a" << 10);
     chunk0.setMax(chunkMax);
 
-    setupChunks({chunk0}).transitional_ignore();
+    setupChunks({chunk0});
 
     // Make the time distance between the last history element large enough.
     Timestamp validAfter{200, 0};
@@ -262,7 +259,7 @@ TEST_F(CommitChunkMigrate, RejectOutOfOrderHistory) {
     shard1.setName("shard1");
     shard1.setHost("shard1:12");
 
-    setupShards({shard0, shard1}).transitional_ignore();
+    setupShards({shard0, shard1});
 
     int origMajorVersion = 15;
     auto const origVersion = ChunkVersion(origMajorVersion, 4, OID::gen());
@@ -279,7 +276,7 @@ TEST_F(CommitChunkMigrate, RejectOutOfOrderHistory) {
     auto chunkMax = BSON("a" << 10);
     chunk0.setMax(chunkMax);
 
-    setupChunks({chunk0}).transitional_ignore();
+    setupChunks({chunk0});
 
     // Make the time before the last change to trigger the failure.
     Timestamp validAfter{99, 0};
@@ -306,7 +303,7 @@ TEST_F(CommitChunkMigrate, RejectWrongCollectionEpoch0) {
     shard1.setName("shard1");
     shard1.setHost("shard1:12");
 
-    setupShards({shard0, shard1}).transitional_ignore();
+    setupShards({shard0, shard1});
 
     int origMajorVersion = 12;
     auto const origVersion = ChunkVersion(origMajorVersion, 7, OID::gen());
@@ -331,7 +328,7 @@ TEST_F(CommitChunkMigrate, RejectWrongCollectionEpoch0) {
     auto chunkMaxax = BSON("a" << 20);
     chunk1.setMax(chunkMaxax);
 
-    setupChunks({chunk0, chunk1}).transitional_ignore();
+    setupChunks({chunk0, chunk1});
 
     Timestamp validAfter{1};
 
@@ -357,7 +354,7 @@ TEST_F(CommitChunkMigrate, RejectWrongCollectionEpoch1) {
     shard1.setName("shard1");
     shard1.setHost("shard1:12");
 
-    setupShards({shard0, shard1}).transitional_ignore();
+    setupShards({shard0, shard1});
 
     int origMajorVersion = 12;
     auto const origVersion = ChunkVersion(origMajorVersion, 7, OID::gen());
@@ -384,7 +381,7 @@ TEST_F(CommitChunkMigrate, RejectWrongCollectionEpoch1) {
     chunk1.setMax(chunkMaxax);
 
     // get version from the control chunk this time
-    setupChunks({chunk1, chunk0}).transitional_ignore();
+    setupChunks({chunk1, chunk0});
 
     Timestamp validAfter{1};
 
@@ -410,7 +407,7 @@ TEST_F(CommitChunkMigrate, RejectChunkMissing0) {
     shard1.setName("shard1");
     shard1.setHost("shard1:12");
 
-    setupShards({shard0, shard1}).transitional_ignore();
+    setupShards({shard0, shard1});
 
     int origMajorVersion = 12;
     auto const origVersion = ChunkVersion(origMajorVersion, 7, OID::gen());
@@ -435,7 +432,7 @@ TEST_F(CommitChunkMigrate, RejectChunkMissing0) {
     auto chunkMaxax = BSON("a" << 20);
     chunk1.setMax(chunkMaxax);
 
-    setupChunks({chunk1}).transitional_ignore();
+    setupChunks({chunk1});
 
     Timestamp validAfter{1};
 
@@ -461,7 +458,7 @@ TEST_F(CommitChunkMigrate, CommitWithLastChunkOnShardShouldNotAffectOtherChunks)
     shard1.setName("shard1");
     shard1.setHost("shard1:12");
 
-    setupShards({shard0, shard1}).transitional_ignore();
+    setupShards({shard0, shard1});
 
     int origMajorVersion = 12;
     auto const origVersion = ChunkVersion(origMajorVersion, 7, OID::gen());
@@ -490,7 +487,7 @@ TEST_F(CommitChunkMigrate, CommitWithLastChunkOnShardShouldNotAffectOtherChunks)
     Timestamp ctrlChunkValidAfter = Timestamp(50, 0);
     chunk1.setHistory({ChunkHistory(ctrlChunkValidAfter, shard1.getName())});
 
-    setupChunks({chunk0, chunk1}).transitional_ignore();
+    setupChunks({chunk0, chunk1});
 
     Timestamp validAfter{101, 0};
     StatusWith<BSONObj> resultBSON = ShardingCatalogManager::get(operationContext())

@@ -55,7 +55,6 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/concurrency/locker.h"
@@ -481,7 +480,7 @@ void OpenWriteTransactionParam::append(OperationContext* opCtx,
 
 Status OpenWriteTransactionParam::setFromString(const std::string& str) {
     int num = 0;
-    Status status = parseNumberFromString(str, &num);
+    Status status = NumberParser{}(str, &num);
     if (!status.isOK()) {
         return status;
     }
@@ -502,7 +501,7 @@ void OpenReadTransactionParam::append(OperationContext* opCtx,
 
 Status OpenReadTransactionParam::setFromString(const std::string& str) {
     int num = 0;
-    Status status = parseNumberFromString(str, &num);
+    Status status = NumberParser{}(str, &num);
     if (!status.isOK()) {
         return status;
     }
@@ -806,7 +805,7 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
         invariantWTOK(_conn->query_timestamp(_conn, buf, "get=recovery"));
 
         std::uint64_t tmp;
-        fassert(50758, parseNumberFromStringWithBase(buf, 16, &tmp));
+        fassert(50758, NumberParser().base(16)(buf, &tmp));
         _recoveryTimestamp = Timestamp(tmp);
         LOG_FOR_RECOVERY(0) << "WiredTiger recoveryTimestamp. Ts: " << _recoveryTimestamp;
     }
@@ -834,6 +833,13 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
 
         _checkpointThread = std::make_unique<WiredTigerCheckpointThread>(this, _sessionCache.get());
         _checkpointThread->go();
+    }
+
+    if (_ephemeral && !getTestCommandsEnabled()) {
+        // We do not maintain any snapshot history for the ephemeral storage engine in production
+        // because replication and sharded transactions do not currently run on the inMemory engine.
+        // It is live in testing, however.
+        snapshotWindowParams.targetSnapshotHistoryWindowInSeconds.store(0);
     }
 
     _sizeStorerUri = _uri("sizeStorer");
@@ -2007,6 +2013,11 @@ Timestamp WiredTigerKVEngine::_calculateHistoryLagFromStableTimestamp(Timestamp 
     // The oldest_timestamp should lag behind the stable_timestamp by
     // 'targetSnapshotHistoryWindowInSeconds' seconds.
 
+    if (_ephemeral && !getTestCommandsEnabled()) {
+        // No history should be maintained for the inMemory engine because it is not used yet.
+        invariant(snapshotWindowParams.targetSnapshotHistoryWindowInSeconds.load() == 0);
+    }
+
     if (stableTimestamp.getSecs() <
         static_cast<unsigned>(snapshotWindowParams.targetSnapshotHistoryWindowInSeconds.load())) {
         // The history window is larger than the timestamp history thus far. We must wait for
@@ -2123,7 +2134,7 @@ Timestamp WiredTigerKVEngine::getOldestOpenReadTimestamp() const {
     }
 
     uint64_t tmp;
-    fassert(38802, parseNumberFromStringWithBase(buf, 16, &tmp));
+    fassert(38802, NumberParser().base(16)(buf, &tmp));
     return Timestamp(tmp);
 }
 
@@ -2263,14 +2274,14 @@ void WiredTigerKVEngine::replicationBatchIsComplete() const {
     _oplogManager->triggerJournalFlush();
 }
 
-int64_t WiredTigerKVEngine::getCacheOverflowTableInsertCount(OperationContext* opCtx) const {
+bool WiredTigerKVEngine::isCacheUnderPressure(OperationContext* opCtx) const {
     WiredTigerSession* session = WiredTigerRecoveryUnit::get(opCtx)->getSessionNoTxn();
     invariant(session);
 
-    int64_t insertCount = uassertStatusOK(WiredTigerUtil::getStatisticsValue(
-        session->getSession(), "statistics:", "", WT_STAT_CONN_CACHE_LOOKASIDE_INSERT));
+    int64_t score = uassertStatusOK(WiredTigerUtil::getStatisticsValue(
+        session->getSession(), "statistics:", "", WT_STAT_CONN_CACHE_LOOKASIDE_SCORE));
 
-    return insertCount;
+    return (score >= snapshotWindowParams.cachePressureThreshold.load());
 }
 
 Timestamp WiredTigerKVEngine::getStableTimestamp() const {
@@ -2294,7 +2305,7 @@ std::uint64_t WiredTigerKVEngine::_getCheckpointTimestamp() const {
     invariantWTOK(_conn->query_timestamp(_conn, buf, "get=last_checkpoint"));
 
     std::uint64_t tmp;
-    fassert(50963, parseNumberFromStringWithBase(buf, 16, &tmp));
+    fassert(50963, NumberParser().base(16)(buf, &tmp));
     return tmp;
 }
 

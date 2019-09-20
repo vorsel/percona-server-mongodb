@@ -299,6 +299,7 @@ LogicalTime computeOperationTime(OperationContext* opCtx, LogicalTime startOpera
     invariant(isReplSet);
 
     if (startOperationTime == LogicalTime::kUninitialized) {
+        LOG(5) << "startOperationTime is uninitialized";
         return LogicalTime(replCoord->getMyLastAppliedOpTime().getTimestamp());
     }
 
@@ -346,6 +347,9 @@ void appendClusterAndOperationTime(OperationContext* opCtx,
 
         dassert(signedTime.getTime() >= operationTime);
         rpc::LogicalTimeMetadata(signedTime).writeToMetadata(metadataBob);
+
+        LOG(5) << "Appending operationTime to cmd response for authorized client: "
+               << operationTime;
         operationTime.appendAsOperationTime(commandBodyFieldsBob);
 
         return;
@@ -368,6 +372,8 @@ void appendClusterAndOperationTime(OperationContext* opCtx,
 
     dassert(signedTime.getTime() >= operationTime);
     rpc::LogicalTimeMetadata(signedTime).writeToMetadata(metadataBob);
+
+    LOG(5) << "Appending operationTime to cmd response: " << operationTime;
     operationTime.appendAsOperationTime(commandBodyFieldsBob);
 }
 
@@ -854,15 +860,17 @@ void execCommandDatabase(OperationContext* opCtx,
         }
     } catch (const DBException& e) {
         if (e.code() == ErrorCodes::SnapshotTooOld) {
+            // SnapshotTooOld errors should never be thrown unless we are using a storage engine
+            // that supports snapshot read concern.
+            auto engine = opCtx->getServiceContext()->getStorageEngine();
+            invariant(engine && engine->supportsReadConcernSnapshot());
+
             // SnapshotTooOld errors indicate that PIT ops are failing to find an available snapshot
             // at their specified atClusterTime. Therefore, we'll try to increase the snapshot
             // history window that the storage engine maintains in order to increase the likelihood
             // of successful future PIT atClusterTime requests.
-            auto engine = opCtx->getServiceContext()->getStorageEngine();
-            if (engine && engine->supportsReadConcernSnapshot()) {
-                SnapshotWindowUtil::incrementSnapshotTooOldErrorCount();
-                SnapshotWindowUtil::increaseTargetSnapshotWindowSize(opCtx);
-            }
+            SnapshotWindowUtil::incrementSnapshotTooOldErrorCount();
+            SnapshotWindowUtil::increaseTargetSnapshotWindowSize(opCtx);
         } else {
             behaviors.handleException(e, opCtx);
         }

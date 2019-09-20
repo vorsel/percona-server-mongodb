@@ -1205,6 +1205,8 @@ functions:
             # See: https://github.com/nodejs/node-v0.x-archive/issues/8141
             export APPDATA=${workdir}/npm-app-data
             export PATH="$PATH:/cygdrive/c/Program Files (x86)/nodejs" # Windows location
+            # TODO: this is to work around BUILD-8652
+            cd "$(pwd -P | sed 's,cygdrive/c/,cygdrive/z/,')"
           else
             export PATH="$PATH:/opt/node/bin"
           fi
@@ -1319,6 +1321,8 @@ functions:
   "do benchmark embedded setup":
   - command: manifest.load
   - *git_get_project
+  - *set_task_expansion_macros
+  - *set_up_virtualenv
   - *fetch_artifacts
   - *get_buildnumber
   - *set_up_credentials
@@ -1485,6 +1489,7 @@ functions:
     - command: expansions.write
       params:
         file: expansions.yml
+    - *configure_evergreen_api_credentials
     - command: shell.exec
       params:
         working_dir: src
@@ -3853,7 +3858,7 @@ tasks:
           --install-mode=hygienic
           --js-engine=none
           --opt=size
-          --prefix='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION'
+          --dest-dir='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION'
           --separate-debug
           --ssl=off
           --use-system-mongo-c=on
@@ -4858,6 +4863,14 @@ tasks:
         set -o errexit
         set -o verbose
         mkdir ../src
+  - func: "configure evergreen api credentials"
+  - command: shell.exec
+    params:
+      working_dir: burn_in_tests_clonedir
+      shell: bash
+      script: |
+        set -o errexit
+        set -o verbose
         ${activate_virtualenv}
         # If this is a scheduled build, we check for changes against the last scheduled commit.
         if [ "${is_patch}" != "true" ]; then
@@ -4873,7 +4886,7 @@ tasks:
         # Increase the burn_in repetition from 2 to 1000 executions or 10 minutes
         burn_in_args="$burn_in_args --repeatTestsMin=2 --repeatTestsMax=1000 --repeatTestsSecs=600"
         # Evergreen executable is in $HOME.
-        PATH=$PATH:$HOME $python buildscripts/burn_in_tests.py --branch=${branch_name} $build_variant_opts --distro=${distro_id} --generateTasksFile=../src/burn_in_tests_gen.json --noExec $burn_in_args
+        PATH=$PATH:$HOME $python buildscripts/burn_in_tests.py --branch=${branch_name} --project=${project} $build_variant_opts --distro=${distro_id} --generateTasksFile=../src/burn_in_tests_gen.json --noExec $burn_in_args
   - command: archive.targz_pack
     params:
       target: src/burn_in_tests_gen.tgz
@@ -10569,6 +10582,37 @@ buildvariants:
   - name: snmp
   - name: .updatefuzzer
 
+- name: enterprise-rhel-62-64-bit-alt-create-indexes
+  display_name: "Enterprise RHEL 6.2 (alternate createIndexes implementation)"
+  modules:
+  - enterprise
+  run_on:
+  - rhel62-small
+  expansions: &enterprise-rhel-62-64-bit-alt-create-indexes
+    test_flags: >-
+      --mongodSetParameters="{enableIndexBuildsCoordinatorForCreateIndexesCommand: true}"
+    compile_flags: >-
+      -j$(grep -c ^processor /proc/cpuinfo)
+      --ssl
+      --release
+      --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
+      MONGO_DISTMOD=rhel62
+    multiversion_platform: rhel62
+    multiversion_edition: enterprise
+    repo_edition: enterprise
+    scons_cache_scope: shared
+    tooltags: "ssl sasl gssapi"
+    build_mongoreplay: false
+    large_distro_name: rhel62-large
+  tasks:
+  - name: compile_TG
+    distros:
+    - rhel62-large
+  - name: .jscore .common
+  - name: .replica_sets !.encrypt !.auth
+    distros:
+    - rhel62-large
+
 - name: enterprise-rhel-62-64-bit-coverage
   display_name: "~ Enterprise RHEL 6.2 DEBUG Code Coverage"
   modules:
@@ -12056,6 +12100,7 @@ buildvariants:
     build_mongoreplay: true
     hang_analyzer_dump_core: false
     scons_cache_scope: shared
+    test_flags: --excludeWithAnyTags=requires_fast_memory
   display_tasks:
   - *dbtest
   - *unittests
@@ -12119,6 +12164,7 @@ buildvariants:
     hang_analyzer_dump_core: false
     scons_cache_scope: shared
     target_resmoke_time: 15
+    test_flags: --excludeWithAnyTags=requires_fast_memory
   display_tasks:
   - *dbtest
   - *unittests

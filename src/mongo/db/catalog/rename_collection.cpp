@@ -35,7 +35,6 @@
 
 #include "mongo/db/background.h"
 #include "mongo/db/catalog/collection_catalog.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/drop_collection.h"
@@ -111,7 +110,7 @@ Status checkSourceAndTargetNamespaces(OperationContext* opCtx,
 
     {
         auto& dss = DatabaseShardingState::get(db);
-        auto dssLock = DatabaseShardingState::DSSLock::lock(opCtx, &dss);
+        auto dssLock = DatabaseShardingState::DSSLock::lockShared(opCtx, &dss);
         dss.checkDbVersion(opCtx, dssLock);
     }
 
@@ -429,7 +428,7 @@ Status renameBetweenDBs(OperationContext* opCtx,
 
     {
         auto& dss = DatabaseShardingState::get(sourceDB);
-        auto dssLock = DatabaseShardingState::DSSLock::lock(opCtx, &dss);
+        auto dssLock = DatabaseShardingState::DSSLock::lockShared(opCtx, &dss);
         dss.checkDbVersion(opCtx, dssLock);
     }
 

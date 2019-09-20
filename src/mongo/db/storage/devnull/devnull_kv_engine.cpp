@@ -183,8 +183,8 @@ class DevNullSortedDataBuilderInterface : public SortedDataBuilderInterface {
 public:
     DevNullSortedDataBuilderInterface() {}
 
-    virtual StatusWith<SpecialFormatInserted> addKey(const BSONObj& key, const RecordId& loc) {
-        return StatusWith<SpecialFormatInserted>(SpecialFormatInserted::NoSpecialFormatInserted);
+    virtual Status addKey(const BSONObj& key, const RecordId& loc) {
+        return Status::OK();
     }
 };
 
@@ -196,11 +196,11 @@ public:
         return new DevNullSortedDataBuilderInterface();
     }
 
-    virtual StatusWith<SpecialFormatInserted> insert(OperationContext* opCtx,
-                                                     const BSONObj& key,
-                                                     const RecordId& loc,
-                                                     bool dupsAllowed) {
-        return StatusWith<SpecialFormatInserted>(SpecialFormatInserted::NoSpecialFormatInserted);
+    virtual Status insert(OperationContext* opCtx,
+                          const BSONObj& key,
+                          const RecordId& loc,
+                          bool dupsAllowed) {
+        return Status::OK();
     }
 
     virtual void unindex(OperationContext* opCtx,
@@ -261,13 +261,13 @@ std::unique_ptr<SortedDataInterface> DevNullKVEngine::getSortedDataInterface(
     return std::make_unique<DevNullSortedDataInterface>();
 }
 
-int64_t DevNullKVEngine::getCacheOverflowTableInsertCount(OperationContext* opCtx) const {
-    return _overflowTableInsertCountForTest;
+bool DevNullKVEngine::isCacheUnderPressure(OperationContext* opCtx) const {
+    return (_cachePressureForTest >= snapshotWindowParams.cachePressureThreshold.load());
 }
 
-void DevNullKVEngine::setCacheOverflowTableInsertCountForTest(int insertsCount) {
-    invariant(insertsCount >= 0);
-    _overflowTableInsertCountForTest = insertsCount;
+void DevNullKVEngine::setCachePressureForTest(int pressure) {
+    invariant(pressure >= 0 && pressure <= 100);
+    _cachePressureForTest = pressure;
 }
 
 StatusWith<std::vector<std::string>> DevNullKVEngine::beginNonBlockingBackup(

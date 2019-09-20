@@ -18,7 +18,7 @@
     // enableTestCommands not specified.
     assertFails({
         'setParameter': {
-            enableIndexBuildsCoordinatorForCreateIndexesCommand: 'false',
+            AlwaysRecordTraffic: 'false',
         },
     });
 
@@ -27,7 +27,7 @@
         assertStarts({
             'setParameter': {
                 enableTestCommands: v,
-                enableIndexBuildsCoordinatorForCreateIndexesCommand: 'false',
+                disableIndexSpecNamespaceGeneration: 'false',
             },
         });
     });
@@ -37,7 +37,7 @@
         assertFails({
             'setParameter': {
                 enableTestCommands: v,
-                enableIndexBuildsCoordinatorForCreateIndexesCommand: 'false',
+                AlwaysRecordTraffic: 'false',
             },
         });
     });

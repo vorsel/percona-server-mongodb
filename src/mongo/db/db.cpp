@@ -234,9 +234,8 @@ void logStartup(OperationContext* opCtx) {
     if (!collection) {
         BSONObj options = BSON("capped" << true << "size" << 10 * 1024 * 1024);
         repl::UnreplicatedWritesBlock uwb(opCtx);
-        CollectionOptions collectionOptions;
-        uassertStatusOK(
-            collectionOptions.parse(options, CollectionOptions::ParseKind::parseForCommand));
+        CollectionOptions collectionOptions = uassertStatusOK(
+            CollectionOptions::parse(options, CollectionOptions::ParseKind::parseForCommand));
         uassertStatusOK(db->userCreateNS(opCtx, startupLogCollectionName, collectionOptions));
         collection = db->getCollection(opCtx, startupLogCollectionName);
     }
@@ -612,7 +611,11 @@ ExitCode _initAndListen(int listenPort) {
     // release periodically in order to avoid storage cache pressure build up.
     if (storageEngine->supportsReadConcernSnapshot()) {
         PeriodicThreadToAbortExpiredTransactions::get(serviceContext)->start();
-        PeriodicThreadToDecreaseSnapshotHistoryIfNotNeeded::get(serviceContext)->start();
+        // The inMemory engine is not yet used for replica or sharded transactions in production so
+        // it does not currently maintain snapshot history. It is live in testing, however.
+        if (!storageEngine->isEphemeral() || getTestCommandsEnabled()) {
+            PeriodicThreadToDecreaseSnapshotHistoryCachePressure::get(serviceContext)->start();
+        }
     }
 
     // Set up the logical session cache
@@ -930,7 +933,7 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
     if (auto storageEngine = serviceContext->getStorageEngine()) {
         if (storageEngine->supportsReadConcernSnapshot()) {
             PeriodicThreadToAbortExpiredTransactions::get(serviceContext)->stop();
-            PeriodicThreadToDecreaseSnapshotHistoryIfNotNeeded::get(serviceContext)->stop();
+            PeriodicThreadToDecreaseSnapshotHistoryCachePressure::get(serviceContext)->stop();
         }
 
         ServiceContext::UniqueOperationContext uniqueOpCtx;
@@ -977,6 +980,10 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
     // deadlock.
     if (auto validator = LogicalTimeValidator::get(serviceContext)) {
         validator->shutDown();
+    }
+
+    if (ShardingState::get(serviceContext)->enabled()) {
+        CatalogCacheLoader::get(serviceContext).shutDown();
     }
 
 #if __has_feature(address_sanitizer)

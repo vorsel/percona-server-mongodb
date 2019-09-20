@@ -30,10 +30,11 @@
 #pragma once
 
 #include "mongo/base/string_data.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl_index_build_state.h"
 #include "mongo/db/storage/bson_collection_catalog_entry.h"
 #include "mongo/db/storage/kv/kv_prefix.h"
 #include "mongo/db/storage/storage_engine.h"
@@ -102,10 +103,7 @@ public:
      */
     virtual std::string newInternalIdent() = 0;
 
-    virtual std::unique_ptr<CollectionCatalogEntry> makeCollectionCatalogEntry(
-        OperationContext* opCtx, const NamespaceString& nss, bool forRepair) = 0;
-
-    virtual StatusWith<std::unique_ptr<CollectionCatalogEntry>> createCollection(
+    virtual StatusWith<std::unique_ptr<RecordStore>> createCollection(
         OperationContext* opCtx,
         const NamespaceString& nss,
         const CollectionOptions& options,
@@ -149,10 +147,6 @@ public:
     virtual boost::optional<std::string> getSideWritesIdent(OperationContext* opCtx,
                                                             NamespaceString ns,
                                                             StringData indexName) const = 0;
-
-    // TODO SERVER-36385 Remove this function: we don't set the feature tracker bit in 4.4 because
-    // 4.4 can only downgrade to 4.2 which can read long TypeBits.
-    virtual void setIndexKeyStringWithLongTypeBitsExistsOnDisk(OperationContext* opCtx) = 0;
 
     /**
      * Updates the validator for this collection.

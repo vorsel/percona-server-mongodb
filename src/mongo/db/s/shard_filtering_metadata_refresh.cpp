@@ -153,8 +153,7 @@ ChunkVersion forceShardFilteringMetadataRefresh(OperationContext* opCtx,
     if (!cm) {
         // No chunk manager, so unsharded.
 
-        // Exclusive collection lock needed since we're now changing the metadata
-        AutoGetCollection autoColl(opCtx, nss, MODE_X);
+        AutoGetCollection autoColl(opCtx, nss, MODE_IX);
         CollectionShardingRuntime::get(opCtx, nss)
             ->setFilteringMetadata(opCtx, CollectionMetadata());
 
@@ -181,7 +180,7 @@ ChunkVersion forceShardFilteringMetadataRefresh(OperationContext* opCtx,
     }
 
     // Exclusive collection lock needed since we're now changing the metadata
-    AutoGetCollection autoColl(opCtx, nss, MODE_X);
+    AutoGetCollection autoColl(opCtx, nss, MODE_IX);
     auto* const css = CollectionShardingRuntime::get(opCtx, nss);
 
     {
@@ -249,7 +248,7 @@ void forceDatabaseRefresh(OperationContext* opCtx, const StringData dbName) {
         }
 
         auto& dss = DatabaseShardingState::get(db);
-        auto dssLock = DatabaseShardingState::DSSLock::lock(opCtx, &dss);
+        auto dssLock = DatabaseShardingState::DSSLock::lockShared(opCtx, &dss);
 
         const auto cachedDbVersion = dss.getDbVersion(opCtx, dssLock);
         if (cachedDbVersion && cachedDbVersion->getUuid() == refreshedDbVersion.getUuid() &&

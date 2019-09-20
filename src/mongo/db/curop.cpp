@@ -283,7 +283,7 @@ void CurOp::reportCurrentOpForClient(OperationContext* opCtx,
     }
 
     if (clientOpCtx) {
-        infoBuilder->append("opid", clientOpCtx->getOpID());
+        infoBuilder->append("opid", static_cast<int>(clientOpCtx->getOpID()));
         if (clientOpCtx->isKillPending()) {
             infoBuilder->append("killPending", true);
         }

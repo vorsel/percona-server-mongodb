@@ -37,7 +37,6 @@
 #include <vector>
 
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
@@ -657,9 +656,8 @@ void MigrationDestinationManager::cloneCollectionIndexesAndOptions(OperationCont
             // We do not have a collection by this name. Create the collection with the donor's
             // options.
             WriteUnitOfWork wuow(opCtx);
-            CollectionOptions collectionOptions;
-            uassertStatusOK(collectionOptions.parse(donorOptions,
-                                                    CollectionOptions::ParseKind::parseForStorage));
+            CollectionOptions collectionOptions = uassertStatusOK(CollectionOptions::parse(
+                donorOptions, CollectionOptions::ParseKind::parseForStorage));
             const bool createDefaultIndexes = true;
             uassertStatusOK(db->userCreateNS(
                 opCtx, nss, collectionOptions, createDefaultIndexes, donorIdIndexSpec));

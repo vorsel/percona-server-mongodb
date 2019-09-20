@@ -135,10 +135,12 @@ void appendRequiredFieldsToResponse(OperationContext* opCtx, BSONObjBuilder* res
         // Add operationTime.
         auto operationTime = OperationTimeTracker::get(opCtx)->getMaxOperationTime();
         if (operationTime != LogicalTime::kUninitialized) {
+            LOG(5) << "Appending operationTime: " << operationTime.asTimestamp();
             responseBuilder->append(kOperationTime, operationTime.asTimestamp());
         } else if (now != LogicalTime::kUninitialized) {
             // If we don't know the actual operation time, use the cluster time instead. This is
             // safe but not optimal because we can always return a later operation time than actual.
+            LOG(5) << "Appending clusterTime as operationTime " << now.asTimestamp();
             responseBuilder->append(kOperationTime, now.asTimestamp());
         }
 
@@ -158,10 +160,12 @@ void appendRequiredFieldsToResponse(OperationContext* opCtx, BSONObjBuilder* res
  */
 void invokeInTransactionRouter(OperationContext* opCtx,
                                CommandInvocation* invocation,
-                               TransactionRouter* txnRouter,
                                rpc::ReplyBuilderInterface* result) {
+    auto txnRouter = TransactionRouter::get(opCtx);
+    invariant(txnRouter);
+
     // No-op if the transaction is not running with snapshot read concern.
-    txnRouter->setDefaultAtClusterTime(opCtx);
+    txnRouter.setDefaultAtClusterTime(opCtx);
 
     try {
         invocation->run(opCtx, result);
@@ -173,7 +177,7 @@ void invokeInTransactionRouter(OperationContext* opCtx,
             throw;
         }
 
-        txnRouter->implicitlyAbortTransaction(opCtx, e.toStatus());
+        txnRouter.implicitlyAbortTransaction(opCtx, e.toStatus());
         throw;
     }
 }
@@ -181,12 +185,12 @@ void invokeInTransactionRouter(OperationContext* opCtx,
 /**
  * Adds info from the active transaction and the given reason as context to the active exception.
  */
-void addContextForTransactionAbortingError(TransactionRouter* txnRouter,
+void addContextForTransactionAbortingError(StringData txnIdAsString,
+                                           StmtId latestStmtId,
                                            DBException& ex,
                                            StringData reason) {
-    ex.addContext(str::stream() << "Transaction " << txnRouter->txnIdToString()
-                                << " was aborted on statement "
-                                << txnRouter->getLatestStmtId()
+    ex.addContext(str::stream() << "Transaction " << txnIdAsString << " was aborted on statement "
+                                << latestStmtId
                                 << " due to: "
                                 << reason);
 }
@@ -280,7 +284,7 @@ void execCommandClient(OperationContext* opCtx,
     auto txnRouter = TransactionRouter::get(opCtx);
     if (!supportsWriteConcern) {
         if (txnRouter) {
-            invokeInTransactionRouter(opCtx, invocation, txnRouter, result);
+            invokeInTransactionRouter(opCtx, invocation, result);
         } else {
             invocation->run(opCtx, result);
         }
@@ -291,7 +295,7 @@ void execCommandClient(OperationContext* opCtx,
         opCtx->setWriteConcern(wcResult);
 
         if (txnRouter) {
-            invokeInTransactionRouter(opCtx, invocation, txnRouter, result);
+            invokeInTransactionRouter(opCtx, invocation, result);
         } else {
             invocation->run(opCtx, result);
         }
@@ -314,8 +318,8 @@ void execCommandClient(OperationContext* opCtx,
         c->incrementCommandsFailed();
 
         if (auto txnRouter = TransactionRouter::get(opCtx)) {
-            txnRouter->implicitlyAbortTransaction(opCtx,
-                                                  getStatusFromCommandResult(body.asTempObj()));
+            txnRouter.implicitlyAbortTransaction(opCtx,
+                                                 getStatusFromCommandResult(body.asTempObj()));
         }
     }
 }
@@ -430,7 +434,7 @@ void runCommand(OperationContext* opCtx,
                 return TransactionRouter::TransactionActions::kContinue;
             })();
 
-            txnRouter->beginOrContinueTxn(opCtx, *txnNumber, transactionAction);
+            txnRouter.beginOrContinueTxn(opCtx, *txnNumber, transactionAction);
         }
 
         for (int tries = 0;; ++tries) {
@@ -451,7 +455,7 @@ void runCommand(OperationContext* opCtx,
 
                 auto responseBuilder = replyBuilder->getBodyBuilder();
                 if (auto txnRouter = TransactionRouter::get(opCtx)) {
-                    txnRouter->appendRecoveryToken(&responseBuilder);
+                    txnRouter.appendRecoveryToken(&responseBuilder);
                 }
 
                 return;
@@ -493,21 +497,27 @@ void runCommand(OperationContext* opCtx,
                 // error cannot be retried on.
                 if (auto txnRouter = TransactionRouter::get(opCtx)) {
                     auto abortGuard = makeGuard(
-                        [&] { txnRouter->implicitlyAbortTransaction(opCtx, ex.toStatus()); });
+                        [&] { txnRouter.implicitlyAbortTransaction(opCtx, ex.toStatus()); });
 
                     if (!canRetry) {
-                        addContextForTransactionAbortingError(txnRouter, ex, "exhausted retries");
+                        addContextForTransactionAbortingError(txnRouter.txnIdToString(),
+                                                              txnRouter.getLatestStmtId(),
+                                                              ex,
+                                                              "exhausted retries");
                         throw;
                     }
 
-                    if (!txnRouter->canContinueOnStaleShardOrDbError(commandName)) {
+                    if (!txnRouter.canContinueOnStaleShardOrDbError(commandName)) {
                         addContextForTransactionAbortingError(
-                            txnRouter, ex, "an error from cluster data placement change");
+                            txnRouter.txnIdToString(),
+                            txnRouter.getLatestStmtId(),
+                            ex,
+                            "an error from cluster data placement change");
                         throw;
                     }
 
                     // The error is retryable, so update transaction state before retrying.
-                    txnRouter->onStaleShardOrDbError(opCtx, commandName, ex.toStatus());
+                    txnRouter.onStaleShardOrDbError(opCtx, commandName, ex.toStatus());
 
                     abortGuard.dismiss();
                     continue;
@@ -526,21 +536,27 @@ void runCommand(OperationContext* opCtx,
                 // error cannot be retried on.
                 if (auto txnRouter = TransactionRouter::get(opCtx)) {
                     auto abortGuard = makeGuard(
-                        [&] { txnRouter->implicitlyAbortTransaction(opCtx, ex.toStatus()); });
+                        [&] { txnRouter.implicitlyAbortTransaction(opCtx, ex.toStatus()); });
 
                     if (!canRetry) {
-                        addContextForTransactionAbortingError(txnRouter, ex, "exhausted retries");
+                        addContextForTransactionAbortingError(txnRouter.txnIdToString(),
+                                                              txnRouter.getLatestStmtId(),
+                                                              ex,
+                                                              "exhausted retries");
                         throw;
                     }
 
-                    if (!txnRouter->canContinueOnStaleShardOrDbError(commandName)) {
+                    if (!txnRouter.canContinueOnStaleShardOrDbError(commandName)) {
                         addContextForTransactionAbortingError(
-                            txnRouter, ex, "an error from cluster data placement change");
+                            txnRouter.txnIdToString(),
+                            txnRouter.getLatestStmtId(),
+                            ex,
+                            "an error from cluster data placement change");
                         throw;
                     }
 
                     // The error is retryable, so update transaction state before retrying.
-                    txnRouter->onStaleShardOrDbError(opCtx, commandName, ex.toStatus());
+                    txnRouter.onStaleShardOrDbError(opCtx, commandName, ex.toStatus());
 
                     abortGuard.dismiss();
                     continue;
@@ -557,21 +573,26 @@ void runCommand(OperationContext* opCtx,
                 // error cannot be retried on.
                 if (auto txnRouter = TransactionRouter::get(opCtx)) {
                     auto abortGuard = makeGuard(
-                        [&] { txnRouter->implicitlyAbortTransaction(opCtx, ex.toStatus()); });
+                        [&] { txnRouter.implicitlyAbortTransaction(opCtx, ex.toStatus()); });
 
                     if (!canRetry) {
-                        addContextForTransactionAbortingError(txnRouter, ex, "exhausted retries");
+                        addContextForTransactionAbortingError(txnRouter.txnIdToString(),
+                                                              txnRouter.getLatestStmtId(),
+                                                              ex,
+                                                              "exhausted retries");
                         throw;
                     }
 
-                    if (!txnRouter->canContinueOnSnapshotError()) {
-                        addContextForTransactionAbortingError(
-                            txnRouter, ex, "a non-retryable snapshot error");
+                    if (!txnRouter.canContinueOnSnapshotError()) {
+                        addContextForTransactionAbortingError(txnRouter.txnIdToString(),
+                                                              txnRouter.getLatestStmtId(),
+                                                              ex,
+                                                              "a non-retryable snapshot error");
                         throw;
                     }
 
                     // The error is retryable, so update transaction state before retrying.
-                    txnRouter->onSnapshotError(opCtx, ex.toStatus());
+                    txnRouter.onSnapshotError(opCtx, ex.toStatus());
 
                     abortGuard.dismiss();
                     continue;

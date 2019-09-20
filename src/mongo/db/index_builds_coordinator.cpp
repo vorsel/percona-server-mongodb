@@ -153,7 +153,7 @@ IndexBuildsCoordinator::~IndexBuildsCoordinator() {
 
 StatusWith<std::pair<long long, long long>> IndexBuildsCoordinator::startIndexRebuildForRecovery(
     OperationContext* opCtx,
-    CollectionCatalogEntry* cce,
+    const NamespaceString& nss,
     const std::vector<BSONObj>& specs,
     const UUID& buildUUID) {
     // Index builds in recovery mode have the global write lock.
@@ -170,8 +170,6 @@ StatusWith<std::pair<long long, long long>> IndexBuildsCoordinator::startIndexRe
         }
         indexNames.push_back(name);
     }
-
-    const NamespaceString nss(cce->ns());
 
     ReplIndexBuildState::IndexCatalogStats indexCatalogStats;
 
@@ -808,11 +806,20 @@ void IndexBuildsCoordinator::_runIndexBuildInner(OperationContext* opCtx,
         status = ex.toStatus();
     }
 
-    if (replSetAndNotPrimary && status == ErrorCodes::InterruptedAtShutdown) {
+    if (status == ErrorCodes::InterruptedAtShutdown) {
         // Leave it as-if kill -9 happened. This will be handled on restart.
         _indexBuildsManager.interruptIndexBuild(opCtx, replState->buildUUID, "shutting down");
-        replState->stats.numIndexesAfter = replState->stats.numIndexesBefore;
-        status = Status::OK();
+
+        // On secondaries, a shutdown interruption status is part of normal operation and
+        // should be suppressed, unlike other errors which should be raised to the administrator's
+        // attention via a server crash. The server will attempt to recover the index build during
+        // the next startup.
+        // On primary and standalone nodes, the failed index build will not be replicated so it is
+        // okay to propagate the shutdown error to the client.
+        if (replSetAndNotPrimary) {
+            replState->stats.numIndexesAfter = replState->stats.numIndexesBefore;
+            status = Status::OK();
+        }
     } else if (IndexBuildProtocol::kTwoPhase == replState->protocol) {
         // TODO (SERVER-40807): disabling the following code for the v4.2 release so it does not
         // have downstream impact.
@@ -905,6 +912,7 @@ void IndexBuildsCoordinator::_buildIndex(OperationContext* opCtx,
     collLock->emplace(opCtx, nss, MODE_S);
     uassertStatusOK(_indexBuildsManager.drainBackgroundWrites(
         opCtx, replState->buildUUID, RecoveryUnit::ReadSource::kUnset));
+    collLock->reset();
 
     if (MONGO_FAIL_POINT(hangAfterIndexBuildSecondDrain)) {
         log() << "Hanging after index build second drain";
@@ -919,7 +927,7 @@ void IndexBuildsCoordinator::_buildIndex(OperationContext* opCtx,
     auto db = DatabaseHolder::get(opCtx)->getDb(opCtx, nss.db());
     if (db) {
         auto& dss = DatabaseShardingState::get(db);
-        auto dssLock = DatabaseShardingState::DSSLock::lock(opCtx, &dss);
+        auto dssLock = DatabaseShardingState::DSSLock::lockShared(opCtx, &dss);
         dss.checkDbVersion(opCtx, dssLock);
     }
 

@@ -30,6 +30,7 @@
 #pragma once
 
 #include "mongo/db/repl/replication_metrics_gen.h"
+#include "mongo/db/repl/topology_coordinator.h"
 #include "mongo/db/service_context.h"
 #include "mongo/stdx/mutex.h"
 
@@ -46,6 +47,18 @@ public:
 
     ReplicationMetrics();
     ~ReplicationMetrics();
+
+    void incrementNumElectionsCalledForReason(TopologyCoordinator::StartElectionReason reason);
+    void incrementNumStepDownsCausedByHigherTerm();
+
+    int getNumStepUpCmdsCalled_forTesting();
+    int getNumPriorityTakeoversCalled_forTesting();
+    int getNumCatchUpTakeoversCalled_forTesting();
+    int getNumElectionTimeoutsCalled_forTesting();
+    int getNumFreezeTimeoutsCalled_forTesting();
+    int getNumStepDownsCausedByHigherTerm_forTesting();
+
+    BSONObj getElectionMetricsBSON();
 
 private:
     class ElectionMetricsSSS;

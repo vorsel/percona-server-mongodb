@@ -63,8 +63,6 @@ public:
         // See comments in getBuffer() about short/long encoding schemes.
         static const uint8_t kMaxBytesForShortEncoding = 127;
         static const uint8_t kPrefixBytes = 5;
-        // TODO SERVER-36385: Remove this 1KB limit.
-        static const uint32_t kMaxKeyBytes = 1024;
         static const uint8_t kStoredDecimalExponentBits = 6;
         static const uint32_t kStoredDecimalExponentMask = (1U << kStoredDecimalExponentBits) - 1;
 
@@ -283,6 +281,35 @@ public:
         StackBufBuilder _buf;
     };
 
+    /**
+     * Value owns a buffer that corresponds to a completely generated KeyString.
+     */
+    class Value {
+    public:
+        Value(Version version, TypeBits typeBits, size_t size, ConstSharedBuffer buffer)
+            : _version(version), _typeBits(typeBits), _size(size), _buffer(std::move(buffer)) {}
+
+        int compare(const Value& other) const;
+
+        size_t getSize() const {
+            return _size;
+        }
+
+        const char* getBuffer() const {
+            return _buffer.get();
+        }
+
+        const TypeBits& getTypeBits() const {
+            return _typeBits;
+        }
+
+    private:
+        const Version _version;
+        TypeBits _typeBits;
+        size_t _size;
+        ConstSharedBuffer _buffer;
+    };
+
     enum Discriminator {
         kInclusive,  // Anything to be stored in an index must use this.
         kExclusiveBefore,
@@ -316,6 +343,16 @@ public:
 
     KeyString(Version version, RecordId rid) : version(version), _typeBits(version) {
         appendRecordId(rid);
+    }
+
+    /**
+     * Copies the data held in this buffer into a Value type that holds and owns a copy of the
+     * buffer.
+     */
+    Value getValue() {
+        BufBuilder newBuf;
+        newBuf.appendBuf(_buffer.buf(), _buffer.len());
+        return {version, std::move(_typeBits), static_cast<size_t>(newBuf.len()), newBuf.release()};
     }
 
     static size_t getKeySize(const char* buffer,
@@ -467,6 +504,30 @@ inline bool operator>=(const KeyString& lhs, const KeyString& rhs) {
 }
 
 inline bool operator!=(const KeyString& lhs, const KeyString& rhs) {
+    return !(lhs == rhs);
+}
+
+inline bool operator<(const KeyString::Value& lhs, const KeyString::Value& rhs) {
+    return lhs.compare(rhs) < 0;
+}
+
+inline bool operator<=(const KeyString::Value& lhs, const KeyString::Value& rhs) {
+    return lhs.compare(rhs) <= 0;
+}
+
+inline bool operator==(const KeyString::Value& lhs, const KeyString::Value& rhs) {
+    return lhs.compare(rhs) == 0;
+}
+
+inline bool operator>(const KeyString::Value& lhs, const KeyString::Value& rhs) {
+    return lhs.compare(rhs) > 0;
+}
+
+inline bool operator>=(const KeyString::Value& lhs, const KeyString::Value& rhs) {
+    return lhs.compare(rhs) >= 0;
+}
+
+inline bool operator!=(const KeyString::Value& lhs, const KeyString::Value& rhs) {
     return !(lhs == rhs);
 }
 

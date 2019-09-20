@@ -42,12 +42,14 @@
 #include "mongo/db/database_index_builds_tracker.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl_index_build_state.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/future.h"
 #include "mongo/util/net/hostandport.h"
+#include "mongo/util/string_map.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
@@ -124,7 +126,7 @@ public:
      */
     StatusWith<std::pair<long long, long long>> startIndexRebuildForRecovery(
         OperationContext* opCtx,
-        CollectionCatalogEntry* cce,
+        const NamespaceString& nss,
         const std::vector<BSONObj>& specs,
         const UUID& buildUUID);
 

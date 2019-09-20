@@ -40,7 +40,6 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/catalog/collection_catalog.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/index_catalog.h"
@@ -1253,20 +1252,14 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
                                                          << typeName(optionsField.type()));
                 }
 
-                // Removes the option.uuid field. We do not allow the options.uuid field
-                // to be parsed while in parseForCommand mode in order to ensure that the
-                // user cannot set the UUID of a collection.
-                BSONObj optionsFieldObj = optionsField.Obj();
-                optionsFieldObj = optionsFieldObj.removeField("uuid");
-
-                auto status = options.parse(optionsFieldObj, CollectionOptions::parseForCommand);
-                if (!status.isOK()) {
-                    throw RSFatalException(str::stream() << "Failed to parse options " << info
-                                                         << ": "
-                                                         << status.toString());
+                auto statusWithCollectionOptions = CollectionOptions::parse(
+                    optionsField.Obj(), CollectionOptions::parseForCommand);
+                if (!statusWithCollectionOptions.isOK()) {
+                    throw RSFatalException(
+                        str::stream() << "Failed to parse options " << info << ": "
+                                      << statusWithCollectionOptions.getStatus().toString());
                 }
-                // TODO(SERVER-27992): Set options.uuid.
-
+                options = statusWithCollectionOptions.getValue();
             } else {
                 // Use default options.
             }

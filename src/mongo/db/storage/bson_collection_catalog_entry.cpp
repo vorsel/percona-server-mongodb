@@ -103,10 +103,6 @@ void parseMultikeyPathsFromBytes(BSONObj multikeyPathsObj, MultikeyPaths* multik
 const StringData BSONCollectionCatalogEntry::kIndexBuildScanning = "scanning"_sd;
 const StringData BSONCollectionCatalogEntry::kIndexBuildDraining = "draining"_sd;
 
-BSONCollectionCatalogEntry::BSONCollectionCatalogEntry(StringData ns)
-    : CollectionCatalogEntry(ns) {}
-
-
 // --------------------------
 
 void BSONCollectionCatalogEntry::IndexMetaData::updateTTLSetting(long long newExpireSeconds) {
@@ -216,8 +212,8 @@ void BSONCollectionCatalogEntry::MetaData::parse(const BSONObj& obj) {
     ns = obj["ns"].valuestrsafe();
 
     if (obj["options"].isABSONObj()) {
-        options.parse(obj["options"].Obj(), CollectionOptions::parseForStorage)
-            .transitional_ignore();
+        options = uassertStatusOK(
+            CollectionOptions::parse(obj["options"].Obj(), CollectionOptions::parseForStorage));
     }
 
     BSONElement indexList = obj["indexes"];

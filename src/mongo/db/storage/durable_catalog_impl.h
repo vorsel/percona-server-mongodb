@@ -103,15 +103,10 @@ public:
 
     std::string newInternalIdent();
 
-    std::unique_ptr<CollectionCatalogEntry> makeCollectionCatalogEntry(OperationContext* opCtx,
-                                                                       const NamespaceString& nss,
-                                                                       bool forRepair);
-
-    StatusWith<std::unique_ptr<CollectionCatalogEntry>> createCollection(
-        OperationContext* opCtx,
-        const NamespaceString& nss,
-        const CollectionOptions& options,
-        bool allocateDefaultSpace);
+    StatusWith<std::unique_ptr<RecordStore>> createCollection(OperationContext* opCtx,
+                                                              const NamespaceString& nss,
+                                                              const CollectionOptions& options,
+                                                              bool allocateDefaultSpace);
 
     Status renameCollection(OperationContext* opCtx,
                             const NamespaceString& fromNss,
@@ -136,10 +131,6 @@ public:
     boost::optional<std::string> getSideWritesIdent(OperationContext* opCtx,
                                                     NamespaceString ns,
                                                     StringData indexName) const;
-
-    // TODO SERVER-36385 Remove this function: we don't set the feature tracker bit in 4.4 because
-    // 4.4 can only downgrade to 4.2 which can read long TypeBits.
-    void setIndexKeyStringWithLongTypeBitsExistsOnDisk(OperationContext* opCtx);
 
     void updateValidator(OperationContext* opCtx,
                          NamespaceString ns,

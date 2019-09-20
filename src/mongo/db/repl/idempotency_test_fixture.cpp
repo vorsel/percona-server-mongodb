@@ -37,7 +37,6 @@
 
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/index_catalog.h"
@@ -390,8 +389,7 @@ void IdempotencyTest::testOpsAreIdempotent(std::vector<OplogEntry> ops, Sequence
     std::vector<MultiApplier::OperationPtrs> writerVectors(1);
     std::vector<MultiApplier::Operations> derivedOps;
     // Derive ops for transactions if necessary.
-    syncTail.fillWriterVectors(
-        _opCtx.get(), &ops, &writerVectors, &derivedOps, OplogApplication::Mode::kInitialSync);
+    syncTail.fillWriterVectors(_opCtx.get(), &ops, &writerVectors, &derivedOps);
 
     const auto& opPtrs = writerVectors[0];
     ASSERT_OK(runOpPtrsInitialSync(opPtrs));

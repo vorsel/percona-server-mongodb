@@ -49,7 +49,6 @@
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/stats/server_read_concern_metrics.h"
@@ -479,18 +478,16 @@ public:
             // Throw an assertion if query execution fails for any reason.
             if (PlanExecutor::FAILURE == state) {
                 firstBatch.abandon();
-                LOG(1) << "Plan executor error during find command: "
-                       << PlanExecutor::statestr(state)
-                       << ", stats: " << redact(Explain::getWinningPlanStats(exec.get()));
 
-                uassertStatusOK(WorkingSetCommon::getMemberObjectStatus(obj).withContext(
-                    "Executor error during find command"));
+                // We should always have a valid status member object at this point.
+                auto status = WorkingSetCommon::getMemberObjectStatus(obj);
+                invariant(!status.isOK());
+                warning() << "Plan executor error during find command: "
+                          << PlanExecutor::statestr(state) << ", status: " << status
+                          << ", stats: " << redact(Explain::getWinningPlanStats(exec.get()));
+
+                uassertStatusOK(status.withContext("Executor error during find command"));
             }
-
-            // Before saving the cursor, ensure that whatever plan we established happened with the
-            // expected collection version
-            auto css = CollectionShardingState::get(opCtx, nss);
-            css->checkShardVersionOrThrow(opCtx);
 
             // Set up the cursor for getMore.
             CursorId cursorId = 0;

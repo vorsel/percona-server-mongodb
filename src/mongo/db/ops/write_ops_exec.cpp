@@ -166,6 +166,7 @@ public:
             // guard to fire in that case. Operations on the local DB aren't replicated, so they
             // don't need to bump the lastOp.
             replClientInfo().setLastOpToSystemLastOpTime(_opCtx);
+            LOG(5) << "Set last op to system time: " << replClientInfo().getLastOp().getTimestamp();
         }
     }
 
@@ -215,10 +216,8 @@ void makeCollection(OperationContext* opCtx, const NamespaceString& ns) {
         if (!db.getDb()->getCollection(opCtx, ns)) {  // someone else may have beat us to it.
             uassertStatusOK(userAllowedCreateNS(ns.db(), ns.coll()));
             WriteUnitOfWork wuow(opCtx);
-            CollectionOptions collectionOptions;
-            uassertStatusOK(
-                collectionOptions.parse(BSONObj(), CollectionOptions::ParseKind::parseForCommand));
-            uassertStatusOK(db.getDb()->userCreateNS(opCtx, ns, collectionOptions));
+            CollectionOptions defaultCollectionOptions;
+            uassertStatusOK(db.getDb()->userCreateNS(opCtx, ns, defaultCollectionOptions));
             wuow.commit();
         }
     });
