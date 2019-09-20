@@ -16,9 +16,10 @@ class IndexBuildTest {
      * Returns the op id for the running index build on the provided 'collectionName' and
      * 'indexName', or any index build if either is undefined. Returns -1 if there is no current
      * index build.
+     * Accepts optional filter that can be used to customize the db.currentOp() query.
      */
-    static getIndexBuildOpId(database, collectionName, indexName) {
-        const result = database.currentOp();
+    static getIndexBuildOpId(database, collectionName, indexName, filter) {
+        const result = database.currentOp(filter || true);
         assert.commandWorked(result);
         let indexBuildOpId = -1;
         let indexBuildObj = {};
@@ -51,14 +52,31 @@ class IndexBuildTest {
 
     /**
      * Wait for index build to start and return its op id.
+     * Accepts optional filter that can be used to customize the db.currentOp() query.
+     * The filter may be necessary in situations when the index build is delegated to a thread pool
+     * managed by the IndexBuildsCoordinator and it is necessary to differentiate between the
+     * client connection thread and the IndexBuildsCoordinator thread actively building the index.
      */
-    static waitForIndexBuildToStart(database, collectionName, indexName) {
+    static waitForIndexBuildToStart(database, collectionName, indexName, filter) {
         let opId;
         assert.soon(function() {
             return (opId = IndexBuildTest.getIndexBuildOpId(
-                        database, collectionName, indexName)) !== -1;
+                        database, collectionName, indexName, filter)) !== -1;
         }, "Index build operation not found after starting via parallelShell");
         return opId;
+    }
+
+    /**
+     * Wait for index build to begin its collection scan phase and return its op id.
+     */
+    static waitForIndexBuildToScanCollection(database, collectionName, indexName) {
+        // The collection scan is the only phase of an index build that uses a progress meter.
+        // Since the progress meter can be detected in the db.currentOp() output, we will use this
+        // information to determine when we are scanning the collection during the index build.
+        const filter = {
+            progress: {$exists: true},
+        };
+        return IndexBuildTest.waitForIndexBuildToStart(database, collectionName, indexName, filter);
     }
 
     /**

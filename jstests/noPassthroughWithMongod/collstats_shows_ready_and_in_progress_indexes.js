@@ -37,7 +37,7 @@
         // Note that we cannot use checkLog here to wait for the failpoint logging because this test
         // shares a mongod with other tests that might have already provoked identical failpoint
         // logging.
-        IndexBuildTest.waitForIndexBuildToStart(testDB);
+        IndexBuildTest.waitForIndexBuildToScanCollection(testDB, testColl.getName(), 'b_1');
 
         jsTest.log("Running collStats on collection '" + collName +
                    "' to check for expected 'indexSizes', 'nindexes' and 'indexBuilds' results");
