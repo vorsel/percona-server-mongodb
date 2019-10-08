@@ -101,7 +101,11 @@ export INSTALLDIR=$RPM_BUILD_DIR/install
 export TOOLS_TAGS="ssl sasl"
 export PORTABLE=1
 export USE_SSE=1
-export PATH=/usr/local/go/bin:$PATH
+export PATH=/usr/local/go/bin:${PATH}
+export GOROOT="/usr/local/go/"
+export GOPATH=$(pwd)/
+export PATH="/usr/local/go/bin:$PATH:$GOPATH"
+export GOBINPATH="/usr/local/go/bin"
 
 # RocksDB
 pushd $RPM_BUILD_DIR/%{src_dir}/src/third_party/rocksdb
@@ -122,13 +126,20 @@ popd
 
 # Mongo Tools compilation
 pushd $RPM_BUILD_DIR/%{src_dir}/mongo-tools
-. ./set_gopath.sh
-. ./set_tools_revision.sh
-rm -rf $RPM_BUILD_DIR/%{src_dir}/mongo-tools/vendor/pkg
+mkdir -p build_tools/src/github.com/mongodb/mongo-tools
 mkdir -p $RPM_BUILD_DIR/%{src_dir}/bin
-for tool in bsondump mongostat mongofiles mongoexport mongoimport mongorestore mongodump mongotop mongooplog mongoreplay; do
-  go build -a -x -o $RPM_BUILD_DIR/%{src_dir}/bin/${tool} -ldflags "-X github.com/mongodb/mongo-tools/common/options.Gitspec=${PSMDB_TOOLS_COMMIT_HASH} -X github.com/mongodb/mongo-tools/common/options.VersionStr=${PSMDB_TOOLS_REVISION}" -tags "${TOOLS_TAGS}" $RPM_BUILD_DIR/%{src_dir}/mongo-tools/${tool}/main/${tool}.go
-done
+cp -r $(ls | grep -v build_tools) build_tools/src/github.com/mongodb/mongo-tools/
+pushd build_tools/src/github.com/mongodb/mongo-tools
+sed -i 's|VersionStr="$(git describe)"|VersionStr="$PSMDB_TOOLS_REVISION"|' set_goenv.sh
+sed -i 's|Gitspec="$(git rev-parse HEAD)"|Gitspec="$PSMDB_TOOLS_COMMIT_HASH"|' set_goenv.sh
+sed -i 's|go build|go build -a -x|' build.sh
+sed -i 's|exit $ec||' build.sh
+. ./set_tools_revision.sh
+. ./set_goenv.sh
+mkdir -p bin
+. ./build.sh ${TOOLS_TAGS}
+mv bin/* $RPM_BUILD_DIR/%{src_dir}/bin
+popd
 popd
 
 %install
@@ -148,7 +159,8 @@ install -m 750 -d %{buildroot}/%{mongo_home}
 install -m 755 -d %{buildroot}/%{_sysconfdir}/sysconfig
 #
 install -m 644 %{SOURCE1} %{buildroot}/%{_sysconfdir}/mongod.conf
-sed -i 's:mongodb:mongo:g' %{buildroot}/%{_sysconfdir}/mongod.conf
+sed -i 's|/var/lib/mongodb|/var/lib/mongo|' %{buildroot}/%{_sysconfdir}/mongod.conf
+sed -i 's|/var/log/mongodb/mongod.log|/var/log/mongo/mongod.log|' %{buildroot}/%{_sysconfdir}/mongod.conf
 # startup stuff
 install -m 755 -d %{buildroot}/etc/init.d
 install -m 750 %{SOURCE5} %{buildroot}/etc/init.d/mongod
