@@ -168,8 +168,6 @@ Status WiredTigerGlobalOptions::store(const moe::Environment& params,
         const auto result = validateMaxCacheOverflowFileSizeGB(val);
         if (result.isOK()) {
             wiredTigerGlobalOptions.maxCacheOverflowFileSizeGB = val;
-            log() << "Max cache overflow file size custom option: "
-                  << wiredTigerGlobalOptions.maxCacheOverflowFileSizeGB;
         } else {
             return result;
         }
