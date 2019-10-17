@@ -115,6 +115,10 @@ DBCollection.prototype.bulkWrite = function(operations, options) {
                 operation = operation.upsert();
             }
 
+            if (op.updateOne.hint) {
+                operation = operation.hint(op.updateOne.hint);
+            }
+
             if (op.updateOne.collation) {
                 operation.collation(op.updateOne.collation);
             }
@@ -137,6 +141,10 @@ DBCollection.prototype.bulkWrite = function(operations, options) {
             var operation = bulkOp.find(op.updateMany.filter);
             if (op.updateMany.upsert) {
                 operation = operation.upsert();
+            }
+
+            if (op.updateMany.hint) {
+                operation = operation.hint(op.updateMany.hint);
             }
 
             if (op.updateMany.collation) {
@@ -165,6 +173,10 @@ DBCollection.prototype.bulkWrite = function(operations, options) {
 
             if (op.replaceOne.collation) {
                 operation.collation(op.replaceOne.collation);
+            }
+
+            if (op.replaceOne.hint) {
+                operation.hint(op.replaceOne.hint);
             }
 
             operation.replaceOne(op.replaceOne.replacement);
@@ -487,6 +499,10 @@ DBCollection.prototype.replaceOne = function(filter, replacement, options) {
         op.collation(opts.collation);
     }
 
+    if (opts.hint) {
+        op.hint(opts.hint);
+    }
+
     op.replaceOne(replacement);
 
     try {
@@ -563,6 +579,10 @@ DBCollection.prototype.updateOne = function(filter, update, options) {
     var op = bulk.find(filter);
     if (opts.upsert) {
         op = op.upsert();
+    }
+
+    if (opts.hint) {
+        op.hint(opts.hint);
     }
 
     if (opts.collation) {
@@ -649,6 +669,10 @@ DBCollection.prototype.updateMany = function(filter, update, options) {
     var op = bulk.find(filter);
     if (opts.upsert) {
         op = op.upsert();
+    }
+
+    if (opts.hint) {
+        op.hint(opts.hint);
     }
 
     if (opts.collation) {

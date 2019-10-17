@@ -176,6 +176,7 @@ Status applyCommitTransaction(OperationContext* opCtx,
     invariant(entry.getTxnNumber());
     opCtx->setLogicalSessionId(*entry.getSessionId());
     opCtx->setTxnNumber(*entry.getTxnNumber());
+    opCtx->setInMultiDocumentTransaction();
 
     // The write on transaction table may be applied concurrently, so refreshing state
     // from disk may read that write, causing starting a new transaction on an existing
@@ -212,6 +213,8 @@ Status applyAbortTransaction(OperationContext* opCtx,
     invariant(entry.getTxnNumber());
     opCtx->setLogicalSessionId(*entry.getSessionId());
     opCtx->setTxnNumber(*entry.getTxnNumber());
+    opCtx->setInMultiDocumentTransaction();
+
     // The write on transaction table may be applied concurrently, so refreshing state
     // from disk may read that write, causing starting a new transaction on an existing
     // txnNumber. Thus, we start a new transaction without refreshing state from disk.
@@ -219,7 +222,7 @@ Status applyAbortTransaction(OperationContext* opCtx,
 
     auto transaction = TransactionParticipant::get(opCtx);
     transaction.unstashTransactionResources(opCtx, "abortTransaction");
-    transaction.abortActiveTransaction(opCtx);
+    transaction.abortTransaction(opCtx);
     return Status::OK();
 }
 
@@ -331,6 +334,8 @@ Status _applyPrepareTransaction(OperationContext* opCtx,
     invariant(entry.getTxnNumber());
     opCtx->setLogicalSessionId(*entry.getSessionId());
     opCtx->setTxnNumber(*entry.getTxnNumber());
+    opCtx->setInMultiDocumentTransaction();
+
     // The write on transaction table may be applied concurrently, so refreshing state
     // from disk may read that write, causing starting a new transaction on an existing
     // txnNumber. Thus, we start a new transaction without refreshing state from disk.
@@ -346,8 +351,7 @@ Status _applyPrepareTransaction(OperationContext* opCtx,
     }
 
     auto status = _applyOperationsForTransaction(opCtx, ops, oplogApplicationMode);
-    if (!status.isOK())
-        return status;
+    fassert(31137, status);
 
     if (MONGO_FAIL_POINT(applyOpsHangBeforePreparingTransaction)) {
         LOG(0) << "Hit applyOpsHangBeforePreparingTransaction failpoint";

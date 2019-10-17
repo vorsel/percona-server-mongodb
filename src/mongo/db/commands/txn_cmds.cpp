@@ -114,7 +114,7 @@ public:
 
         uassert(ErrorCodes::NoSuchTransaction,
                 "Transaction isn't in progress",
-                txnParticipant.inMultiDocumentTransaction());
+                txnParticipant.transactionIsOpen());
 
         CurOpFailpointHelpers::waitWhileFailPointEnabled(
             &hangBeforeCommitingTxn, opCtx, "hangBeforeCommitingTxn");
@@ -184,7 +184,7 @@ public:
 
         uassert(ErrorCodes::NoSuchTransaction,
                 "Transaction isn't in progress",
-                txnParticipant.inMultiDocumentTransaction());
+                txnParticipant.transactionIsOpen());
 
         CurOpFailpointHelpers::waitWhileFailPointEnabled(
             &hangBeforeAbortingTxn, opCtx, "hangBeforeAbortingTxn");
@@ -196,7 +196,7 @@ public:
                 opCtx, *opCtx->getLogicalSessionId(), *opCtx->getTxnNumber());
         }
 
-        txnParticipant.abortActiveTransaction(opCtx);
+        txnParticipant.abortTransaction(opCtx);
 
         if (MONGO_FAIL_POINT(participantReturnNetworkErrorForAbortAfterExecutingAbortLogic)) {
             uasserted(ErrorCodes::HostUnreachable,

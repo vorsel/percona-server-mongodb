@@ -93,11 +93,14 @@ boost::optional<BSONObj> advanceExecutor(OperationContext* opCtx,
     }
 
     if (PlanExecutor::FAILURE == state) {
-        error() << "Plan executor error during findAndModify: " << PlanExecutor::statestr(state)
-                << ", stats: " << redact(Explain::getWinningPlanStats(exec));
+        // We should always have a valid status member object at this point.
+        auto status = WorkingSetCommon::getMemberObjectStatus(value);
+        invariant(!status.isOK());
+        warning() << "Plan executor error during findAndModify: " << PlanExecutor::statestr(state)
+                  << ", status: " << status
+                  << ", stats: " << redact(Explain::getWinningPlanStats(exec));
 
-        uassertStatusOKWithContext(WorkingSetCommon::getMemberObjectStatus(value),
-                                   "Plan executor error during findAndModify");
+        uassertStatusOKWithContext(status, "Plan executor error during findAndModify");
         MONGO_UNREACHABLE;
     }
 
@@ -124,11 +127,8 @@ void makeUpdateRequest(OperationContext* opCtx,
     requestOut->setMulti(false);
     requestOut->setExplain(explain);
 
-    const auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
-    requestOut->setYieldPolicy(readConcernArgs.getLevel() ==
-                                       repl::ReadConcernLevel::kSnapshotReadConcern
-                                   ? PlanExecutor::INTERRUPT_ONLY
-                                   : PlanExecutor::YIELD_AUTO);
+    requestOut->setYieldPolicy(opCtx->inMultiDocumentTransaction() ? PlanExecutor::INTERRUPT_ONLY
+                                                                   : PlanExecutor::YIELD_AUTO);
 }
 
 void makeDeleteRequest(OperationContext* opCtx,
@@ -145,11 +145,8 @@ void makeDeleteRequest(OperationContext* opCtx,
     requestOut->setReturnDeleted(true);  // Always return the old value.
     requestOut->setExplain(explain);
 
-    const auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
-    requestOut->setYieldPolicy(readConcernArgs.getLevel() ==
-                                       repl::ReadConcernLevel::kSnapshotReadConcern
-                                   ? PlanExecutor::INTERRUPT_ONLY
-                                   : PlanExecutor::YIELD_AUTO);
+    requestOut->setYieldPolicy(opCtx->inMultiDocumentTransaction() ? PlanExecutor::INTERRUPT_ONLY
+                                                                   : PlanExecutor::YIELD_AUTO);
 }
 
 void appendCommandResponse(const PlanExecutor* exec,
@@ -326,8 +323,7 @@ public:
             maybeDisableValidation.emplace(opCtx);
         }
 
-        const auto txnParticipant = TransactionParticipant::get(opCtx);
-        const auto inTransaction = txnParticipant && txnParticipant.inMultiDocumentTransaction();
+        const auto inTransaction = opCtx->inMultiDocumentTransaction();
         uassert(50781,
                 str::stream() << "Cannot write to system collection " << nsString.ns()
                               << " within a transaction.",

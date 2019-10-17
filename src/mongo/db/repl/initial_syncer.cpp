@@ -110,6 +110,9 @@ MONGO_FAIL_POINT_DEFINE(failInitialSyncBeforeApplyingBatch);
 // Failpoint which fasserts if applying a batch fails.
 MONGO_FAIL_POINT_DEFINE(initialSyncFassertIfApplyingBatchFails);
 
+// Failpoint which skips clearing _initialSyncState after a successful initial sync attempt.
+MONGO_FAIL_POINT_DEFINE(skipClearInitialSyncState);
+
 namespace {
 using namespace executor;
 using CallbackArgs = executor::TaskExecutor::CallbackArgs;
@@ -363,6 +366,16 @@ std::string InitialSyncer::getDiagnosticString() const {
 
 BSONObj InitialSyncer::getInitialSyncProgress() const {
     LockGuard lk(_mutex);
+
+    // We return an empty BSON object after an initial sync attempt has been successfully
+    // completed. When an initial sync attempt completes successfully, initialSyncCompletes is
+    // incremented and then _initialSyncState is cleared. We check that _initialSyncState has been
+    // cleared because an initial sync attempt can fail even after initialSyncCompletes is
+    // incremented, and we also check that initialSyncCompletes is positive because an initial sync
+    // attempt can also fail before _initialSyncState is initialized.
+    if (!_initialSyncState && initialSyncCompletes.get() > 0) {
+        return BSONObj();
+    }
     return _getInitialSyncProgress_inlock();
 }
 
@@ -907,7 +920,7 @@ void InitialSyncer::_fcvFetcherCallback(const StatusWith<Fetcher::QueryResponse>
 
     // Create oplog applier.
     auto consistencyMarkers = _replicationProcess->getConsistencyMarkers();
-    OplogApplier::Options options;
+    OplogApplier::Options options(OplogApplication::Mode::kInitialSync);
     options.allowNamespaceNotFoundErrorsOnCrudOps = true;
     options.missingDocumentSourceForInitialSync = _syncSource;
     options.beginApplyingOpTime = lastOpTime;
@@ -1202,8 +1215,7 @@ void InitialSyncer::_getNextApplierBatchCallback(
         _fetchCount.store(0);
         MultiApplier::MultiApplyFn applyBatchOfOperationsFn = [this](OperationContext* opCtx,
                                                                      MultiApplier::Operations ops) {
-            return _oplogApplier->multiApply(
-                opCtx, std::move(ops), repl::OplogApplication::Mode::kInitialSync);
+            return _oplogApplier->multiApply(opCtx, std::move(ops));
         };
         OpTime lastApplied = ops.back().getOpTime();
         invariant(ops.back().getWallClockTime());
@@ -1518,6 +1530,12 @@ void InitialSyncer::_finishCallback(StatusWith<OpTimeAndWallTime> lastApplied) {
     invariant(_state != State::kComplete);
     _state = State::kComplete;
     _stateCondition.notify_all();
+
+    // Clear the initial sync progress after an initial sync attempt has been successfully
+    // completed.
+    if (lastApplied.isOK() && !MONGO_FAIL_POINT(skipClearInitialSyncState)) {
+        _initialSyncState.reset();
+    }
 }
 
 Status InitialSyncer::_scheduleLastOplogEntryFetcher_inlock(Fetcher::CallbackFn callback) {

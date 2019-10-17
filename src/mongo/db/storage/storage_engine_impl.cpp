@@ -100,8 +100,8 @@ void StorageEngineImpl::loadCatalog(OperationContext* opCtx) {
 
         if (status.code() == ErrorCodes::DataModifiedByRepair) {
             warning() << "Catalog data modified by repair: " << status.reason();
-            repairObserver->onModification(str::stream()
-                                           << "DurableCatalog repaired: " << status.reason());
+            repairObserver->invalidatingModification(str::stream() << "DurableCatalog repaired: "
+                                                                   << status.reason());
         } else {
             fassertNoTrace(50926, status);
         }
@@ -175,8 +175,8 @@ void StorageEngineImpl::loadCatalog(OperationContext* opCtx) {
                                      "build the index.";
 
                         StorageRepairObserver::get(getGlobalServiceContext())
-                            ->onModification(str::stream() << "Orphan collection created: "
-                                                           << statusWithNs.getValue());
+                            ->benignModification(str::stream() << "Orphan collection created: "
+                                                               << statusWithNs.getValue());
 
                     } else {
                         // Log an error message if we cannot create the entry.
@@ -217,8 +217,9 @@ void StorageEngineImpl::loadCatalog(OperationContext* opCtx) {
 
                     if (_options.forRepair) {
                         StorageRepairObserver::get(getGlobalServiceContext())
-                            ->onModification(str::stream() << "Collection " << nss
-                                                           << " dropped: " << status.reason());
+                            ->invalidatingModification(str::stream()
+                                                       << "Collection " << nss
+                                                       << " dropped: " << status.reason());
                     }
                     wuow.commit();
                     continue;
@@ -306,8 +307,8 @@ Status StorageEngineImpl::_recoverOrphanedCollection(OperationContext* opCtx,
     }
     if (dataModified) {
         StorageRepairObserver::get(getGlobalServiceContext())
-            ->onModification(str::stream() << "Collection " << collectionName
-                                           << " recovered: " << status.reason());
+            ->invalidatingModification(str::stream() << "Collection " << collectionName
+                                                     << " recovered: " << status.reason());
     }
     wuow.commit();
     return Status::OK();
@@ -697,8 +698,8 @@ Status StorageEngineImpl::repairRecordStore(OperationContext* opCtx, const Names
     }
 
     if (dataModified) {
-        repairObserver->onModification(str::stream()
-                                       << "Collection " << nss << ": " << status.reason());
+        repairObserver->invalidatingModification(str::stream() << "Collection " << nss << ": "
+                                                               << status.reason());
     }
 
     // After repairing, re-initialize the collection with a valid RecordStore.
@@ -857,11 +858,8 @@ void StorageEngineImpl::_onMinOfCheckpointAndOldestTimestampChanged(const Timest
             log() << "Removing drop-pending idents with drop timestamps before timestamp "
                   << timestamp;
             auto opCtx = cc().getOperationContext();
-            mongo::ServiceContext::UniqueOperationContext uOpCtx;
-            if (!opCtx) {
-                uOpCtx = cc().makeOperationContext();
-                opCtx = uOpCtx.get();
-            }
+            invariant(opCtx);
+
             _dropPendingIdentReaper.dropIdentsOlderThan(opCtx, timestamp);
         }
     }
@@ -922,33 +920,34 @@ void StorageEngineImpl::TimestampMonitor::startup() {
                 checkpoint = _engine->getCheckpointTimestamp();
                 oldest = _engine->getOldestTimestamp();
                 stable = _engine->getStableTimestamp();
-            } catch (const ExceptionFor<ErrorCodes::InterruptedAtShutdown>&) {
+
+                Timestamp minOfCheckpointAndOldest =
+                    (checkpoint.isNull() || (checkpoint > oldest)) ? oldest : checkpoint;
+
+                // Notify listeners if the timestamps changed.
+                if (_currentTimestamps.checkpoint != checkpoint) {
+                    _currentTimestamps.checkpoint = checkpoint;
+                    notifyAll(TimestampType::kCheckpoint, checkpoint);
+                }
+
+                if (_currentTimestamps.oldest != oldest) {
+                    _currentTimestamps.oldest = oldest;
+                    notifyAll(TimestampType::kOldest, oldest);
+                }
+
+                if (_currentTimestamps.stable != stable) {
+                    _currentTimestamps.stable = stable;
+                    notifyAll(TimestampType::kStable, stable);
+                }
+
+                if (_currentTimestamps.minOfCheckpointAndOldest != minOfCheckpointAndOldest) {
+                    _currentTimestamps.minOfCheckpointAndOldest = minOfCheckpointAndOldest;
+                    notifyAll(TimestampType::kMinOfCheckpointAndOldest, minOfCheckpointAndOldest);
+                }
+            } catch (const ExceptionFor<ErrorCodes::InterruptedAtShutdown>& ex) {
                 // If we're interrupted at shutdown, it's fine to give up on future notifications
+                log() << "Timestamp monitor is stopping due to: " + ex.reason();
                 return;
-            }
-
-            Timestamp minOfCheckpointAndOldest =
-                (checkpoint.isNull() || (checkpoint > oldest)) ? oldest : checkpoint;
-
-            // Notify listeners if the timestamps changed.
-            if (_currentTimestamps.checkpoint != checkpoint) {
-                _currentTimestamps.checkpoint = checkpoint;
-                notifyAll(TimestampType::kCheckpoint, checkpoint);
-            }
-
-            if (_currentTimestamps.oldest != oldest) {
-                _currentTimestamps.oldest = oldest;
-                notifyAll(TimestampType::kOldest, oldest);
-            }
-
-            if (_currentTimestamps.stable != stable) {
-                _currentTimestamps.stable = stable;
-                notifyAll(TimestampType::kStable, stable);
-            }
-
-            if (_currentTimestamps.minOfCheckpointAndOldest != minOfCheckpointAndOldest) {
-                _currentTimestamps.minOfCheckpointAndOldest = minOfCheckpointAndOldest;
-                notifyAll(TimestampType::kMinOfCheckpointAndOldest, minOfCheckpointAndOldest);
             }
         },
         Seconds(1));

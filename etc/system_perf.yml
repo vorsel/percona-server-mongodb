@@ -404,6 +404,16 @@ tasks:
     - func: "run test"
     - func: "analyze"
 
+- name: validate_cmd
+  priority: 5
+  commands:
+    - func: "prepare environment"
+      vars:
+        test: "validate_cmd"
+    - func: "deploy cluster"
+    - func: "run test"
+    - func: "analyze"
+
 - name: service_architecture_workloads
   priority: 5
   commands:
@@ -821,7 +831,7 @@ buildvariants:
 - &compile-linux-64-amzn
   name: compile-linux-64-amzn
   display_name: Compile on Linux64 Amazon
-  batchtime: 1440 # 24 hours
+  batchtime: 10080 # 7 days
   expansions: &compile-linux-64-amzn-expansions
     compile_flags: >-
       --ssl
@@ -851,7 +861,7 @@ buildvariants:
   display_name: Compile on Amazon Linux 2
   modules:
     - enterprise
-  batchtime: 1440 # 24 hours
+  batchtime: 10080 # 7 days
   expansions:
     <<: *compile-linux-64-amzn-expansions
     compile_flags: >-
@@ -870,7 +880,7 @@ buildvariants:
   display_name: Compile on Rhel70
   modules:
     - enterprise
-  batchtime: 1440 # 24 hours
+  batchtime: 10080 # 7 days
   expansions:
     <<: *compile-linux-64-amzn-expansions
     compile_flags: >-
@@ -890,7 +900,7 @@ buildvariants:
 #######################################
 - name: linux-1-node-replSet
   display_name: Linux 1-Node ReplSet
-  batchtime: 1440 # 24 hours
+  batchtime: 10080 # 7 days
   modules: &modules
     - dsi
     - genny
@@ -934,7 +944,7 @@ buildvariants:
 
 - name: linux-standalone
   display_name: Linux Standalone
-  batchtime: 1440 # 24 hours
+  batchtime: 10080 # 7 days
   modules: *modules
   expansions:
     setup: standalone
@@ -968,6 +978,7 @@ buildvariants:
     - name: bestbuy_agg_merge_wordcount
     - name: bestbuy_query
     - name: big_update
+    - name: validate_cmd
 
 - name: linux-standalone-audit
   display_name: Linux Standalone Audit
@@ -993,7 +1004,7 @@ buildvariants:
 
 - name: linux-1-node-replSet-ese-cbc
   display_name: Linux 1-Node ReplSet ESE CBC
-  batchtime: 1440 # 24 hours
+  batchtime: 10080 # 7 days
   modules: *modules
   expansions:
     setup: single-replica-ese-cbc
@@ -1014,7 +1025,7 @@ buildvariants:
 
 - name: linux-1-node-replSet-ese-gcm
   display_name: Linux 1-Node ReplSet ESE GCM
-  batchtime: 1440 # 24 hours
+  batchtime: 10080 # 7 days
   modules: *modules
   expansions:
     setup: single-replica-ese-gcm
@@ -1068,7 +1079,7 @@ buildvariants:
 
 - name: linux-shard-lite
   display_name: Linux Shard Lite Cluster
-  batchtime: 1440  # 24 hours
+  batchtime: 10080 # 7 days
   modules: *modules
   expansions:
     setup: shard-lite
@@ -1105,7 +1116,7 @@ buildvariants:
 
 - name: linux-3-node-replSet
   display_name: Linux 3-Node ReplSet
-  batchtime: 1440  # 24 hours
+  batchtime: 10080 # 7 days
   modules: *modules
   expansions:
     setup: replica
@@ -1150,7 +1161,7 @@ buildvariants:
 
 - name: linux-3-node-replSet-noflowcontrol
   display_name: Linux 3-Node ReplSet (Flow Control off)
-  batchtime: 1440  # 24 hours
+  batchtime: 10080 # 7 days
   modules: *modules
   expansions:
     setup: replica-noflowcontrol
@@ -1200,7 +1211,7 @@ buildvariants:
 
 - name: linux-3-node-replSet-initialsync
   display_name: Linux 3-Node ReplSet Initial Sync
-  batchtime: 1440  # 24 hours
+  batchtime: 10080 # 7 days
   modules: *modules
   expansions:
     setup: replica-2node
@@ -1244,7 +1255,7 @@ buildvariants:
 #######################################
 - name: atlas-like-M60
   display_name: M60-Like 3-Node ReplSet
-  batchtime: 1440  # 24 hours
+  batchtime: 10080 # 7 days
   modules: *modules
   expansions:
     setup: atlas-like-replica

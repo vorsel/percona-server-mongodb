@@ -216,8 +216,8 @@ LLLLLLL
 LOGREC
 LOGSCAN
 LOOKASIDE
-LRSVv
 LRU
+LRrSVv
 LSB
 LSM
 LSN
@@ -349,6 +349,7 @@ SSHH
 SSq
 STAILQ
 STEC
+STR
 STRUCT
 Scalability
 Scalable
@@ -411,6 +412,7 @@ VALGRIND
 VARCHAR
 VLDB
 VMSG
+VPM
 VR
 VRFY
 VX
@@ -1072,6 +1074,7 @@ ownp
 pR
 pS
 packv
+pagedump
 pagesize
 parens
 pareto
@@ -1325,6 +1328,7 @@ unmodify
 unordered
 unpackv
 unpadded
+unreconciled
 unreferenced
 unregister
 unsized
@@ -1360,6 +1364,7 @@ versa
 vfprintf
 vm
 vpack
+vpmsum
 vprintf
 vrfy
 vsize

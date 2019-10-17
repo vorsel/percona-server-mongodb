@@ -1620,7 +1620,7 @@ elif env.TargetOSIs('freebsd'):
     env.Append( CCFLAGS=[ "-fno-omit-frame-pointer" ] )
 
 elif env.TargetOSIs('darwin'):
-     env.Append( LIBS=["resolv"] )
+    env.Append( LIBS=["resolv"] )
 
 elif env.TargetOSIs('openbsd'):
     env.Append( LIBS=[ "kvm" ] )
@@ -1919,6 +1919,15 @@ if env.TargetOSIs('posix'):
             env['ENV'][key] = os.environ[key]
         except KeyError:
             pass
+
+    # Python uses APPDATA to determine the location of user installed
+    # site-packages. If we do not pass this variable down to Python
+    # subprocesses then anything installed with `pip install --user`
+    # will be inaccessible leading to import errors.
+    if env.TargetOSIs('windows'):
+        appdata = os.getenv('APPDATA', None)
+        if appdata is not None:
+            env['ENV']['APPDATA'] = appdata
 
     if env.TargetOSIs('linux') and has_option( "gcov" ):
         env.Append( CCFLAGS=["-fprofile-arcs", "-ftest-coverage", "-fprofile-update=single"] )
@@ -2320,6 +2329,10 @@ def doConfigure(myenv):
 
         # Enable sized deallocation support.
         AddToCXXFLAGSIfSupported(myenv, '-fsized-deallocation')
+
+        # This warning was added in Apple clang version 11 and flags many explicitly defaulted move
+        # constructors and assignment operators for being implicitly deleted, which is not useful.
+        AddToCXXFLAGSIfSupported(myenv, "-Wno-defaulted-function-deleted")
 
         # Check if we can set "-Wnon-virtual-dtor" when "-Werror" is set. The only time we can't set it is on
         # clang 3.4, where a class with virtual function(s) and a non-virtual destructor throws a warning when

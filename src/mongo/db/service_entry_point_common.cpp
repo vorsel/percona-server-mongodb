@@ -100,6 +100,7 @@ MONGO_FAIL_POINT_DEFINE(rsStopGetMore);
 MONGO_FAIL_POINT_DEFINE(respondWithNotPrimaryInCommandDispatch);
 MONGO_FAIL_POINT_DEFINE(skipCheckingForNotMasterInCommandDispatch);
 MONGO_FAIL_POINT_DEFINE(waitAfterReadCommandFinishesExecution);
+MONGO_FAIL_POINT_DEFINE(sleepMillisAfterCommandExecutionBegins);
 
 // Tracks the number of times a legacy unacknowledged write failed due to
 // not master error resulted in network disconnection.
@@ -372,6 +373,25 @@ void appendClusterAndOperationTime(OperationContext* opCtx,
     operationTime.appendAsOperationTime(commandBodyFieldsBob);
 }
 
+namespace {
+void _abortUnpreparedOrStashPreparedTransaction(
+    OperationContext* opCtx, TransactionParticipant::Participant* txnParticipant) {
+    const bool isPrepared = txnParticipant->transactionIsPrepared();
+    try {
+        if (isPrepared)
+            txnParticipant->stashTransactionResources(opCtx);
+        else if (txnParticipant->transactionIsOpen())
+            txnParticipant->abortTransaction(opCtx);
+    } catch (...) {
+        // It is illegal for this to throw so we catch and log this here for diagnosability.
+        severe() << "Caught exception during transaction " << opCtx->getTxnNumber()
+                 << (isPrepared ? " stash " : " abort ") << opCtx->getLogicalSessionId()->toBSON()
+                 << ": " << exceptionToStatus();
+        std::terminate();
+    }
+}
+}  // namespace
+
 void invokeWithSessionCheckedOut(OperationContext* opCtx,
                                  CommandInvocation* invocation,
                                  const OperationSessionInfoFromClient& sessionOptions,
@@ -394,7 +414,7 @@ void invokeWithSessionCheckedOut(OperationContext* opCtx,
             if (sessionOptions.getCoordinator() == boost::optional<bool>(true)) {
                 createTransactionCoordinator(opCtx, *sessionOptions.getTxnNumber());
             }
-        } else if (txnParticipant.inMultiDocumentTransaction()) {
+        } else if (txnParticipant.transactionIsOpen()) {
             const auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
             uassert(ErrorCodes::InvalidOptions,
                     "Only the first command in a transaction may specify a readConcern",
@@ -405,8 +425,11 @@ void invokeWithSessionCheckedOut(OperationContext* opCtx,
         // transactions on failure to unstash the transaction resources to opCtx. We don't want to
         // have this error guard for beginOrContinue as it can abort the transaction for any
         // accidental invalid statements in the transaction.
-        auto abortOnError = makeGuard(
-            [&txnParticipant, opCtx] { txnParticipant.abortTransactionIfNotPrepared(opCtx); });
+        auto abortOnError = makeGuard([&txnParticipant, opCtx] {
+            if (txnParticipant.transactionIsInProgress()) {
+                txnParticipant.abortTransaction(opCtx);
+            }
+        });
 
         txnParticipant.unstashTransactionResources(opCtx, invocation->definition()->getName());
 
@@ -414,8 +437,8 @@ void invokeWithSessionCheckedOut(OperationContext* opCtx,
         abortOnError.dismiss();
     }
 
-    auto guard = makeGuard([&txnParticipant, opCtx] {
-        txnParticipant.abortActiveUnpreparedOrStashPreparedTransaction(opCtx);
+    auto guard = makeGuard([opCtx, &txnParticipant] {
+        _abortUnpreparedOrStashPreparedTransaction(opCtx, &txnParticipant);
     });
 
     try {
@@ -636,6 +659,16 @@ void execCommandDatabase(OperationContext* opCtx,
             CurOp::get(opCtx)->setCommand_inlock(command);
         }
 
+        MONGO_FAIL_POINT_BLOCK(sleepMillisAfterCommandExecutionBegins, arg) {
+            const BSONObj& data = arg.getData();
+            auto numMillis = data["millis"].numberInt();
+            auto commands = data["commands"].Obj().getFieldNames<std::set<std::string>>();
+            // Only sleep for one of the specified commands.
+            if (commands.find(command->getName()) != commands.end()) {
+                mongo::sleepmillis(numMillis);
+            }
+        }
+
         // TODO: move this back to runCommands when mongos supports OperationContext
         // see SERVER-18515 for details.
         rpc::readRequestMetadata(opCtx, request.body, command->requiresAuth());
@@ -769,9 +802,10 @@ void execCommandDatabase(OperationContext* opCtx,
         }
 
         auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
-        // If the parent operation runs in snapshot isolation, we don't override the read concern.
-        auto skipReadConcern = opCtx->getClient()->isInDirectClient() &&
-            readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern;
+
+        // If the parent operation runs in a transaction, we don't override the read concern.
+        auto skipReadConcern =
+            opCtx->getClient()->isInDirectClient() && opCtx->inMultiDocumentTransaction();
         if (!skipReadConcern) {
             // If "startTransaction" is present, it must be true due to the parsing above.
             const bool upconvertToSnapshot(sessionOptions.getStartTransaction());
@@ -1017,11 +1051,21 @@ DbResponse receivedCommands(OperationContext* opCtx,
         return {};  // Don't reply.
     }
 
-    auto response = replyBuilder->done();
-    CurOp::get(opCtx)->debug().responseLength = response.header().dataLen();
+    DbResponse dbResponse;
 
-    // TODO exhaust
-    return DbResponse{std::move(response)};
+    if (OpMsg::isFlagSet(message, OpMsg::kExhaustSupported)) {
+        auto responseObj = replyBuilder->getBodyBuilder().asTempObj();
+        auto cursorObj = responseObj.getObjectField("cursor");
+        if (responseObj.getField("ok").trueValue() && !cursorObj.isEmpty()) {
+            dbResponse.exhaustNS = cursorObj.getField("ns").String();
+            dbResponse.exhaustCursorId = cursorObj.getField("id").numberLong();
+        }
+    }
+
+    dbResponse.response = replyBuilder->done();
+    CurOp::get(opCtx)->debug().responseLength = dbResponse.response.header().dataLen();
+
+    return dbResponse;
 }
 
 DbResponse receivedQuery(OperationContext* opCtx,
@@ -1238,10 +1282,9 @@ DbResponse ServiceEntryPointCommon::handleRequest(OperationContext* opCtx,
     Client& c = *opCtx->getClient();
 
     if (c.isInDirectClient()) {
-        if (!opCtx->getLogicalSessionId() || !opCtx->getTxnNumber() ||
-            repl::ReadConcernArgs::get(opCtx).getLevel() !=
-                repl::ReadConcernLevel::kSnapshotReadConcern) {
-            invariant(!opCtx->lockState()->inAWriteUnitOfWork());
+        if (!opCtx->getLogicalSessionId() || !opCtx->getTxnNumber()) {
+            invariant(!opCtx->inMultiDocumentTransaction() &&
+                      !opCtx->lockState()->inAWriteUnitOfWork());
         }
     } else {
         LastError::get(c).startRequest();

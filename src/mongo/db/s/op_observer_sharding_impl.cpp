@@ -42,9 +42,10 @@ namespace {
 const auto getIsMigrating = OperationContext::declareDecoration<bool>();
 
 /**
- * Write operations do shard version checking, but do not perform orphan document filtering. Because
- * of this, if an update operation runs as part of a 'readConcern:snapshot' transaction, it might
- * get routed to a shard which no longer owns the chunk being written to. In such cases, throw a
+ * Write operations do shard version checking, but if an update operation runs as part of a
+ * 'readConcern:snapshot' transaction, the router could have used the metadata at the snapshot
+ * time and yet set the latest shard version on the request. This is why the write can get routed
+ * to a shard which no longer owns the chunk being written to. In such cases, throw a
  * MigrationConflict exception to indicate that the transaction needs to be rolled-back and
  * restarted.
  */
@@ -58,9 +59,11 @@ void assertIntersectingChunkHasNotMoved(OperationContext* opCtx,
     if (!metadata->isSharded())
         return;
 
+    auto chunkManager = metadata->getChunkManager();
+    auto shardKey = chunkManager->getShardKeyPattern().extractShardKeyFromDoc(doc);
+
     // We can assume the simple collation because shard keys do not support non-simple collations.
-    auto chunk = metadata->getChunkManager()->findIntersectingChunkWithSimpleCollation(
-        metadata->extractDocumentKey(doc));
+    auto chunk = chunkManager->findIntersectingChunkWithSimpleCollation(shardKey);
 
     // Throws if the chunk has moved since the timestamp of the running transaction's atClusterTime
     // read concern parameter.
@@ -80,7 +83,7 @@ bool OpObserverShardingImpl::isMigrating(OperationContext* opCtx,
                                          NamespaceString const& nss,
                                          BSONObj const& docToDelete) {
     auto csr = CollectionShardingRuntime::get(opCtx, nss);
-    auto csrLock = CollectionShardingRuntime::CSRLock::lock(opCtx, csr);
+    auto csrLock = CollectionShardingRuntime::CSRLock::lockShared(opCtx, csr);
     return isMigratingWithCSRLock(csr, csrLock, docToDelete);
 }
 
@@ -111,7 +114,7 @@ void OpObserverShardingImpl::shardObserveInsertOp(OperationContext* opCtx,
         return;
     }
 
-    auto csrLock = CollectionShardingRuntime::CSRLock::lock(opCtx, csr);
+    auto csrLock = CollectionShardingRuntime::CSRLock::lockShared(opCtx, csr);
     auto msm = MigrationSourceManager::get(csr, csrLock);
     if (msm) {
         msm->getCloner()->onInsertOp(opCtx, insertedDoc, opTime);
@@ -133,7 +136,7 @@ void OpObserverShardingImpl::shardObserveUpdateOp(OperationContext* opCtx,
         return;
     }
 
-    auto csrLock = CollectionShardingRuntime::CSRLock::lock(opCtx, csr);
+    auto csrLock = CollectionShardingRuntime::CSRLock::lockShared(opCtx, csr);
     auto msm = MigrationSourceManager::get(csr, csrLock);
     if (msm) {
         msm->getCloner()->onUpdateOp(opCtx, preImageDoc, postImageDoc, opTime, prePostImageOpTime);
@@ -154,7 +157,7 @@ void OpObserverShardingImpl::shardObserveDeleteOp(OperationContext* opCtx,
         return;
     }
 
-    auto csrLock = CollectionShardingRuntime::CSRLock::lock(opCtx, csr);
+    auto csrLock = CollectionShardingRuntime::CSRLock::lockShared(opCtx, csr);
     auto msm = MigrationSourceManager::get(csr, csrLock);
 
     if (msm && getIsMigrating(opCtx)) {

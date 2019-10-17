@@ -58,13 +58,18 @@ func newDatabase(client *Client, name string, opts ...*options.DatabaseOptions) 
 		wc = dbOpt.WriteConcern
 	}
 
+	reg := client.registry
+	if dbOpt.Registry != nil {
+		reg = dbOpt.Registry
+	}
+
 	db := &Database{
 		client:         client,
 		name:           name,
 		readPreference: rp,
 		readConcern:    rc,
 		writeConcern:   wc,
-		registry:       client.registry,
+		registry:       reg,
 	}
 
 	db.readSelector = description.CompositeSelector([]description.ServerSelector{
@@ -107,6 +112,7 @@ func (db *Database) Aggregate(ctx context.Context, pipeline interface{},
 		registry:       db.registry,
 		readConcern:    db.readConcern,
 		writeConcern:   db.writeConcern,
+		retryRead:      db.client.retryReads,
 		db:             db.name,
 		readSelector:   db.readSelector,
 		writeSelector:  db.writeSelector,
@@ -272,7 +278,11 @@ func (db *Database) ListCollections(ctx context.Context, filter interface{}, opt
 		return nil, err
 	}
 
-	selector := makePinnedSelector(sess, db.readSelector)
+	selector := description.CompositeSelector([]description.ServerSelector{
+		description.ReadPrefSelector(readpref.Primary()),
+		description.LatencySelector(db.client.localThreshold),
+	})
+	selector = makeReadPrefSelector(sess, selector, db.client.localThreshold)
 
 	lco := options.MergeListCollectionsOptions(opts...)
 	op := operation.NewListCollections(filterDoc).
@@ -282,6 +292,11 @@ func (db *Database) ListCollections(ctx context.Context, filter interface{}, opt
 	if lco.NameOnly != nil {
 		op = op.NameOnly(*lco.NameOnly)
 	}
+	retry := driver.RetryNone
+	if db.client.retryReads {
+		retry = driver.RetryOncePerCommand
+	}
+	op = op.Retry(retry)
 
 	err = op.Execute(ctx)
 	if err != nil {
@@ -307,6 +322,8 @@ func (db *Database) ListCollectionNames(ctx context.Context, filter interface{},
 		return nil, err
 	}
 
+	defer res.Close(ctx)
+
 	names := make([]string, 0)
 	for res.Next(ctx) {
 		next := &bsonx.Doc{}
@@ -328,6 +345,7 @@ func (db *Database) ListCollectionNames(ctx context.Context, filter interface{},
 		names = append(names, elemName)
 	}
 
+	res.Close(ctx)
 	return names, nil
 }
 

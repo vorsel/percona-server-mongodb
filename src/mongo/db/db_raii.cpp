@@ -317,8 +317,9 @@ AutoGetCollectionForReadCommand::AutoGetCollectionForReadCommand(
                                              : kDoNotChangeProfilingLevel,
                     deadline) {
     if (!_autoCollForRead.getView()) {
-        // We have both the DB and collection locked, which is the prerequisite to do a stable shard
-        // version check, but we'd like to do the check after we have a satisfactory snapshot.
+        // Perform the check early so the query planner would be able to extract the correct
+        // shard key. Also make sure that version is compatible if query planner decides to
+        // use an empty plan.
         auto css = CollectionShardingState::get(opCtx, _autoCollForRead.getNss());
         css->checkShardVersionOrThrow(opCtx);
     }
@@ -376,7 +377,7 @@ LockMode getLockModeForQuery(OperationContext* opCtx, const boost::optional<Name
     invariant(opCtx);
 
     // Use IX locks for multi-statement transactions; otherwise, use IS locks.
-    if (opCtx->getWriteUnitOfWork()) {
+    if (opCtx->inMultiDocumentTransaction()) {
         uassert(51071,
                 "Cannot query system.views within a transaction",
                 !nss || !nss->isSystemDotViews());

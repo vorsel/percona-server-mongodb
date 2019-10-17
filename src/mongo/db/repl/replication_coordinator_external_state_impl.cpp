@@ -69,6 +69,7 @@
 #include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/replication_metrics.h"
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/s/balancer/balancer.h"
@@ -110,9 +111,6 @@
 namespace mongo {
 namespace repl {
 namespace {
-
-using UniqueLock = stdx::unique_lock<stdx::mutex>;
-using LockGuard = stdx::lock_guard<stdx::mutex>;
 
 const char localDbName[] = "local";
 const char configCollectionName[] = "local.system.replset";
@@ -207,7 +205,7 @@ bool ReplicationCoordinatorExternalStateImpl::isInitialSyncFlagSet(OperationCont
 void ReplicationCoordinatorExternalStateImpl::startSteadyStateReplication(
     OperationContext* opCtx, ReplicationCoordinator* replCoord) {
 
-    LockGuard lk(_threadMutex);
+    stdx::lock_guard<stdx::mutex> lk(_threadMutex);
 
     // We've shut down the external state, don't start again.
     if (_inShutdown)
@@ -226,15 +224,15 @@ void ReplicationCoordinatorExternalStateImpl::startSteadyStateReplication(
     // interface. During steady state replication, there is no need to log details on every batch
     // we apply (recovery); or track missing documents that are fetched from the sync source
     // (initial sync).
-    _oplogApplier =
-        stdx::make_unique<OplogApplierImpl>(_oplogApplierTaskExecutor.get(),
-                                            _oplogBuffer.get(),
-                                            &noopOplogApplierObserver,
-                                            replCoord,
-                                            _replicationProcess->getConsistencyMarkers(),
-                                            _storageInterface,
-                                            OplogApplier::Options(),
-                                            _writerPool.get());
+    _oplogApplier = stdx::make_unique<OplogApplierImpl>(
+        _oplogApplierTaskExecutor.get(),
+        _oplogBuffer.get(),
+        &noopOplogApplierObserver,
+        replCoord,
+        _replicationProcess->getConsistencyMarkers(),
+        _storageInterface,
+        OplogApplier::Options(OplogApplication::Mode::kSecondary),
+        _writerPool.get());
 
     invariant(!_bgSync);
     _bgSync =
@@ -258,21 +256,21 @@ void ReplicationCoordinatorExternalStateImpl::startSteadyStateReplication(
 }
 
 void ReplicationCoordinatorExternalStateImpl::stopDataReplication(OperationContext* opCtx) {
-    UniqueLock lk(_threadMutex);
-    _stopDataReplication_inlock(opCtx, &lk);
+    stdx::unique_lock<stdx::mutex> lk(_threadMutex);
+    _stopDataReplication_inlock(opCtx, lk);
 }
 
-void ReplicationCoordinatorExternalStateImpl::_stopDataReplication_inlock(OperationContext* opCtx,
-                                                                          UniqueLock* lock) {
+void ReplicationCoordinatorExternalStateImpl::_stopDataReplication_inlock(
+    OperationContext* opCtx, stdx::unique_lock<stdx::mutex>& lock) {
     // Make sue no other _stopDataReplication calls are in progress.
-    _dataReplicationStopped.wait(*lock, [this]() { return !_stoppingDataReplication; });
+    _dataReplicationStopped.wait(lock, [this]() { return !_stoppingDataReplication; });
     _stoppingDataReplication = true;
 
     auto oldSSF = std::move(_syncSourceFeedbackThread);
     auto oldOplogBuffer = std::move(_oplogBuffer);
     auto oldBgSync = std::move(_bgSync);
     auto oldApplier = std::move(_oplogApplier);
-    lock->unlock();
+    lock.unlock();
 
     // _syncSourceFeedbackThread should be joined before _bgSync's shutdown because it has
     // a pointer of _bgSync.
@@ -311,7 +309,7 @@ void ReplicationCoordinatorExternalStateImpl::_stopDataReplication_inlock(Operat
         oldOplogBuffer->shutdown(opCtx);
     }
 
-    lock->lock();
+    lock.lock();
     _stoppingDataReplication = false;
     _dataReplicationStopped.notify_all();
 }
@@ -321,6 +319,9 @@ void ReplicationCoordinatorExternalStateImpl::startThreads(const ReplSettings& s
     stdx::lock_guard<stdx::mutex> lk(_threadMutex);
     if (_startedThreads) {
         return;
+    }
+    if (_inShutdown) {
+        log() << "Not starting replication storage threads because replication is shutting down.";
     }
 
     log() << "Starting replication storage threads";
@@ -338,13 +339,13 @@ void ReplicationCoordinatorExternalStateImpl::startThreads(const ReplSettings& s
 }
 
 void ReplicationCoordinatorExternalStateImpl::shutdown(OperationContext* opCtx) {
-    UniqueLock lk(_threadMutex);
+    stdx::unique_lock<stdx::mutex> lk(_threadMutex);
+    _inShutdown = true;
     if (!_startedThreads) {
         return;
     }
 
-    _inShutdown = true;
-    _stopDataReplication_inlock(opCtx, &lk);
+    _stopDataReplication_inlock(opCtx, lk);
 
     if (_noopWriter) {
         LOG(1) << "Stopping noop writer";
@@ -487,6 +488,12 @@ OpTime ReplicationCoordinatorExternalStateImpl::onTransitionToPrimary(OperationC
     const auto loadLastOpTimeAndWallTimeResult = loadLastOpTimeAndWallTime(opCtx);
     fassert(28665, loadLastOpTimeAndWallTimeResult);
     auto opTimeToReturn = loadLastOpTimeAndWallTimeResult.getValue().opTime;
+
+    auto newTermStartDate = loadLastOpTimeAndWallTimeResult.getValue().wallTime;
+    ReplicationMetrics::get(opCtx).setNewTermStartDate(newTermStartDate);
+
+    auto replCoord = ReplicationCoordinator::get(opCtx);
+    replCoord->createWMajorityWriteAvailabilityDateWaiter(opTimeToReturn);
 
     _shardingOnTransitionToPrimaryHook(opCtx);
 
@@ -819,21 +826,21 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook
 }
 
 void ReplicationCoordinatorExternalStateImpl::signalApplierToChooseNewSyncSource() {
-    LockGuard lk(_threadMutex);
+    stdx::lock_guard<stdx::mutex> lk(_threadMutex);
     if (_bgSync) {
         _bgSync->clearSyncTarget();
     }
 }
 
 void ReplicationCoordinatorExternalStateImpl::stopProducer() {
-    LockGuard lk(_threadMutex);
+    stdx::lock_guard<stdx::mutex> lk(_threadMutex);
     if (_bgSync) {
         _bgSync->stop(false);
     }
 }
 
 void ReplicationCoordinatorExternalStateImpl::startProducerIfStopped() {
-    LockGuard lk(_threadMutex);
+    stdx::lock_guard<stdx::mutex> lk(_threadMutex);
     if (_bgSync) {
         _bgSync->startProducerIfStopped();
     }

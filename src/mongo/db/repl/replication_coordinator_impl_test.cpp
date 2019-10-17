@@ -54,6 +54,7 @@
 #include "mongo/db/repl/replication_coordinator_external_state_mock.h"
 #include "mongo/db/repl/replication_coordinator_impl.h"
 #include "mongo/db/repl/replication_coordinator_test_fixture.h"
+#include "mongo/db/repl/replication_metrics.h"
 #include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/repl/topology_coordinator.h"
 #include "mongo/db/repl/update_position_args.h"
@@ -1546,11 +1547,20 @@ TEST_F(ReplCoordTest, NodeChangesTermAndStepsDownWhenAndOnlyWhenUpdateTermSuppli
     ASSERT_EQUALS(1, getReplCoord()->getTerm());
     ASSERT_TRUE(getReplCoord()->getMemberState().primary());
 
+    // Check that the numStepDownsCausedByHigherTerm election metric is 0 to start with.
+    ServiceContext* svcCtx = getServiceContext();
+    ASSERT_EQUALS(0,
+                  ReplicationMetrics::get(svcCtx).getNumStepDownsCausedByHigherTerm_forTesting());
+
     // higher term, step down and change term
     executor::TaskExecutor::CallbackHandle cbHandle;
     ASSERT_EQUALS(ErrorCodes::StaleTerm, getReplCoord()->updateTerm(opCtx.get(), 2).code());
     ASSERT_EQUALS(2, getReplCoord()->getTerm());
     ASSERT_TRUE(getReplCoord()->getMemberState().secondary());
+
+    // Check that the numStepDownsCausedByHigherTerm election metric has been incremented.
+    ASSERT_EQUALS(1,
+                  ReplicationMetrics::get(svcCtx).getNumStepDownsCausedByHigherTerm_forTesting());
 }
 
 TEST_F(ReplCoordTest, ConcurrentStepDownShouldNotSignalTheSameFinishEventMoreThanOnce) {
@@ -1582,12 +1592,18 @@ TEST_F(ReplCoordTest, ConcurrentStepDownShouldNotSignalTheSameFinishEventMoreTha
     // Prevent _stepDownFinish() from running and becoming secondary by blocking in this
     // exclusive task.
     const auto opCtx = makeOperationContext();
-    boost::optional<ReplicationStateTransitionLockGuard> transitionGuard({opCtx.get(), MODE_X});
+    boost::optional<ReplicationStateTransitionLockGuard> transitionGuard;
+    transitionGuard.emplace(opCtx.get(), MODE_X);
 
     TopologyCoordinator::UpdateTermResult termUpdated2;
     auto updateTermEvh2 = getReplCoord()->updateTerm_forTest(2, &termUpdated2);
     ASSERT(termUpdated2 == TopologyCoordinator::UpdateTermResult::kTriggerStepDown);
     ASSERT(updateTermEvh2.isValid());
+
+    // Check that the numStepDownsCausedByHigherTerm election metric has been incremented.
+    ServiceContext* svcCtx = getServiceContext();
+    ASSERT_EQUALS(1,
+                  ReplicationMetrics::get(svcCtx).getNumStepDownsCausedByHigherTerm_forTesting());
 
     TopologyCoordinator::UpdateTermResult termUpdated3;
     auto updateTermEvh3 = getReplCoord()->updateTerm_forTest(3, &termUpdated3);
@@ -1596,6 +1612,11 @@ TEST_F(ReplCoordTest, ConcurrentStepDownShouldNotSignalTheSameFinishEventMoreTha
     // so no other stepdown can be scheduled again. Term 3 will be remembered and
     // installed once stepdown finishes.
     ASSERT(!updateTermEvh3.isValid());
+
+    // Check that the numStepDownsCausedByHigherTerm election metric has not been incremented a
+    // second time.
+    ASSERT_EQUALS(1,
+                  ReplicationMetrics::get(svcCtx).getNumStepDownsCausedByHigherTerm_forTesting());
 
     // Unblock the tasks for updateTerm and _stepDownFinish.
     transitionGuard.reset();
@@ -2164,6 +2185,22 @@ TEST_F(ReplCoordTest, SingleNodeReplSetUnfreeze) {
     ASSERT_TRUE(getTopoCoord().getMemberState().primary());
     getNet()->exitNetwork();
     ASSERT_TRUE(getReplCoord()->getMemberState().primary());
+
+    // Check that the numFreezeTimeoutsCalled and the numFreezeTimeoutsSuccessful election metrics
+    // have been incremented, and that none of the metrics that track the number of elections called
+    // or successful for other reasons has been incremented.
+    ServiceContext* svcCtx = getServiceContext();
+    ASSERT_EQUALS(0, ReplicationMetrics::get(svcCtx).getNumStepUpCmdsCalled_forTesting());
+    ASSERT_EQUALS(0, ReplicationMetrics::get(svcCtx).getNumPriorityTakeoversCalled_forTesting());
+    ASSERT_EQUALS(0, ReplicationMetrics::get(svcCtx).getNumCatchUpTakeoversCalled_forTesting());
+    ASSERT_EQUALS(0, ReplicationMetrics::get(svcCtx).getNumElectionTimeoutsCalled_forTesting());
+    ASSERT_EQUALS(1, ReplicationMetrics::get(svcCtx).getNumFreezeTimeoutsCalled_forTesting());
+    ASSERT_EQUALS(0, ReplicationMetrics::get(svcCtx).getNumStepUpCmdsSuccessful_forTesting());
+    ASSERT_EQUALS(0,
+                  ReplicationMetrics::get(svcCtx).getNumPriorityTakeoversSuccessful_forTesting());
+    ASSERT_EQUALS(0, ReplicationMetrics::get(svcCtx).getNumCatchUpTakeoversSuccessful_forTesting());
+    ASSERT_EQUALS(0, ReplicationMetrics::get(svcCtx).getNumElectionTimeoutsSuccessful_forTesting());
+    ASSERT_EQUALS(1, ReplicationMetrics::get(svcCtx).getNumFreezeTimeoutsSuccessful_forTesting());
 }
 
 TEST_F(ReplCoordTest, NodeBecomesPrimaryAgainWhenStepDownTimeoutExpiresInASingleNodeSet) {
@@ -2177,6 +2214,22 @@ TEST_F(ReplCoordTest, NodeBecomesPrimaryAgainWhenStepDownTimeoutExpiresInASingle
                        HostAndPort("test1", 1234));
     auto opCtx = makeOperationContext();
     runSingleNodeElection(opCtx.get());
+
+    // Check that the numElectionTimeoutsCalled and the numElectionTimeoutsSuccessful election
+    // metrics have been incremented, and that none of the metrics that track the number of
+    // elections called or successful for other reasons has been incremented.
+    ServiceContext* svcCtx = getServiceContext();
+    ASSERT_EQUALS(0, ReplicationMetrics::get(svcCtx).getNumStepUpCmdsCalled_forTesting());
+    ASSERT_EQUALS(0, ReplicationMetrics::get(svcCtx).getNumPriorityTakeoversCalled_forTesting());
+    ASSERT_EQUALS(0, ReplicationMetrics::get(svcCtx).getNumCatchUpTakeoversCalled_forTesting());
+    ASSERT_EQUALS(1, ReplicationMetrics::get(svcCtx).getNumElectionTimeoutsCalled_forTesting());
+    ASSERT_EQUALS(0, ReplicationMetrics::get(svcCtx).getNumFreezeTimeoutsCalled_forTesting());
+    ASSERT_EQUALS(0, ReplicationMetrics::get(svcCtx).getNumStepUpCmdsSuccessful_forTesting());
+    ASSERT_EQUALS(0,
+                  ReplicationMetrics::get(svcCtx).getNumPriorityTakeoversSuccessful_forTesting());
+    ASSERT_EQUALS(0, ReplicationMetrics::get(svcCtx).getNumCatchUpTakeoversSuccessful_forTesting());
+    ASSERT_EQUALS(1, ReplicationMetrics::get(svcCtx).getNumElectionTimeoutsSuccessful_forTesting());
+    ASSERT_EQUALS(0, ReplicationMetrics::get(svcCtx).getNumFreezeTimeoutsSuccessful_forTesting());
 
     getReplCoord()->stepDown(opCtx.get(), true, Milliseconds(0), Milliseconds(1000));
     getNet()->enterNetwork();  // Must do this before inspecting the topocoord
@@ -2192,6 +2245,23 @@ TEST_F(ReplCoordTest, NodeBecomesPrimaryAgainWhenStepDownTimeoutExpiresInASingle
     ASSERT_TRUE(getTopoCoord().getMemberState().primary());
     getNet()->exitNetwork();
     ASSERT_TRUE(getReplCoord()->getMemberState().primary());
+
+    // Check that the numFreezeTimeoutsCalled and the numFreezeTimeoutsSuccessful election metrics
+    // have been incremented, and that none of the metrics that track the number of elections called
+    // or successful for other reasons has been incremented. When a stepdown timeout expires in a
+    // single node replica set, an election is called for the same reason as is used when a freeze
+    // timeout expires.
+    ASSERT_EQUALS(0, ReplicationMetrics::get(svcCtx).getNumStepUpCmdsCalled_forTesting());
+    ASSERT_EQUALS(0, ReplicationMetrics::get(svcCtx).getNumPriorityTakeoversCalled_forTesting());
+    ASSERT_EQUALS(0, ReplicationMetrics::get(svcCtx).getNumCatchUpTakeoversCalled_forTesting());
+    ASSERT_EQUALS(1, ReplicationMetrics::get(svcCtx).getNumElectionTimeoutsCalled_forTesting());
+    ASSERT_EQUALS(1, ReplicationMetrics::get(svcCtx).getNumFreezeTimeoutsCalled_forTesting());
+    ASSERT_EQUALS(0, ReplicationMetrics::get(svcCtx).getNumStepUpCmdsSuccessful_forTesting());
+    ASSERT_EQUALS(0,
+                  ReplicationMetrics::get(svcCtx).getNumPriorityTakeoversSuccessful_forTesting());
+    ASSERT_EQUALS(0, ReplicationMetrics::get(svcCtx).getNumCatchUpTakeoversSuccessful_forTesting());
+    ASSERT_EQUALS(1, ReplicationMetrics::get(svcCtx).getNumElectionTimeoutsSuccessful_forTesting());
+    ASSERT_EQUALS(1, ReplicationMetrics::get(svcCtx).getNumFreezeTimeoutsSuccessful_forTesting());
 }
 
 TEST_F(
@@ -4620,158 +4690,6 @@ TEST_F(ReplCoordTest,
     ASSERT_EQUALS(OpTime(Timestamp(0, 0), 0), getReplCoord()->getLastCommittedOpTime());
     ASSERT_EQUALS(3, getReplCoord()->getTerm());
     ASSERT_EQUALS(-1, getTopoCoord().getCurrentPrimaryIndex());
-}
-
-TEST_F(ReplCoordTest, LastCommittedOpTimeOnlyUpdatedFromHeartbeatWhenLastAppliedHasTheSameTerm) {
-    // Ensure that the metadata is processed if it is contained in a heartbeat response.
-    assertStartSuccess(BSON("_id"
-                            << "mySet"
-                            << "version" << 2 << "members"
-                            << BSON_ARRAY(BSON("host"
-                                               << "node1:12345"
-                                               << "_id" << 0)
-                                          << BSON("host"
-                                                  << "node2:12345"
-                                                  << "_id" << 1))
-                            << "protocolVersion" << 1),
-                       HostAndPort("node1", 12345));
-    ASSERT_EQUALS(OpTime(), getReplCoord()->getLastCommittedOpTime());
-
-    auto config = getReplCoord()->getConfig();
-
-    auto opTime1 = OpTime({10, 1}, 1);
-    auto opTime2 = OpTime({11, 1}, 2);  // In higher term.
-    auto commitPoint = OpTime({15, 1}, 2);
-    replCoordSetMyLastAppliedOpTime(opTime1, Date_t() + Seconds(100));
-
-    // Node 1 is the current primary. The commit point has a higher term than lastApplied.
-    rpc::ReplSetMetadata metadata(
-        2,                                                         // term
-        {commitPoint, Date_t() + Seconds(commitPoint.getSecs())},  // committed OpTime
-        commitPoint,                                               // visibleOpTime
-        config.getConfigVersion(),
-        {},  // replset id
-        1,   // currentPrimaryIndex,
-        1);  // currentSyncSourceIndex
-
-    auto net = getNet();
-    BSONObjBuilder responseBuilder;
-    ASSERT_OK(metadata.writeToMetadata(&responseBuilder));
-
-    ReplSetHeartbeatResponse hbResp;
-    hbResp.setConfigVersion(config.getConfigVersion());
-    hbResp.setSetName(config.getReplSetName());
-    hbResp.setState(MemberState::RS_PRIMARY);
-    responseBuilder.appendElements(hbResp.toBSON());
-    auto hbRespObj = responseBuilder.obj();
-    {
-        net->enterNetwork();
-        ASSERT_TRUE(net->hasReadyRequests());
-        auto noi = net->getNextReadyRequest();
-        auto& request = noi->getRequest();
-        ASSERT_EQUALS(config.getMemberAt(1).getHostAndPort(), request.target);
-        ASSERT_EQUALS("replSetHeartbeat", request.cmdObj.firstElement().fieldNameStringData());
-
-        net->scheduleResponse(noi, net->now(), makeResponseStatus(hbRespObj));
-        net->runReadyNetworkOperations();
-        net->exitNetwork();
-
-        ASSERT_EQUALS(OpTime(), getReplCoord()->getLastCommittedOpTime());
-        ASSERT_EQUALS(2, getReplCoord()->getTerm());
-    }
-
-    // Update lastApplied, so commit point can be advanced.
-    replCoordSetMyLastAppliedOpTime(opTime2, Date_t() + Seconds(100));
-    {
-        net->enterNetwork();
-        net->runUntil(net->now() + config.getHeartbeatInterval());
-        auto noi = net->getNextReadyRequest();
-        auto& request = noi->getRequest();
-        ASSERT_EQUALS("replSetHeartbeat", request.cmdObj.firstElement().fieldNameStringData());
-
-        net->scheduleResponse(noi, net->now(), makeResponseStatus(hbRespObj));
-        net->runReadyNetworkOperations();
-        net->exitNetwork();
-
-        ASSERT_EQUALS(commitPoint, getReplCoord()->getLastCommittedOpTime());
-    }
-}
-
-TEST_F(ReplCoordTest, LastCommittedOpTimeOnlyUpdatedFromHeartbeatInFCV42) {
-    EnsureFCV guard(ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo40);
-
-    // Ensure that the metadata is processed if it is contained in a heartbeat response.
-    assertStartSuccess(BSON("_id"
-                            << "mySet"
-                            << "version" << 2 << "members"
-                            << BSON_ARRAY(BSON("host"
-                                               << "node1:12345"
-                                               << "_id" << 0)
-                                          << BSON("host"
-                                                  << "node2:12345"
-                                                  << "_id" << 1))
-                            << "protocolVersion" << 1),
-                       HostAndPort("node1", 12345));
-    ASSERT_EQUALS(OpTime(), getReplCoord()->getLastCommittedOpTime());
-
-    auto config = getReplCoord()->getConfig();
-
-    auto lastAppliedOpTime = OpTime({11, 1}, 2);
-    auto commitPoint = OpTime({15, 1}, 2);
-    replCoordSetMyLastAppliedOpTime(lastAppliedOpTime, Date_t() + Seconds(100));
-
-    // Node 1 is the current primary.
-    rpc::ReplSetMetadata metadata(
-        2,                                                         // term
-        {commitPoint, Date_t() + Seconds(commitPoint.getSecs())},  // committed OpTime
-        commitPoint,                                               // visibleOpTime
-        config.getConfigVersion(),
-        {},  // replset id
-        1,   // currentPrimaryIndex,
-        1);  // currentSyncSourceIndex
-
-    auto net = getNet();
-    BSONObjBuilder responseBuilder;
-    ASSERT_OK(metadata.writeToMetadata(&responseBuilder));
-
-    ReplSetHeartbeatResponse hbResp;
-    hbResp.setConfigVersion(config.getConfigVersion());
-    hbResp.setSetName(config.getReplSetName());
-    hbResp.setState(MemberState::RS_PRIMARY);
-    responseBuilder.appendElements(hbResp.toBSON());
-    auto hbRespObj = responseBuilder.obj();
-    {
-        net->enterNetwork();
-        ASSERT_TRUE(net->hasReadyRequests());
-        auto noi = net->getNextReadyRequest();
-        auto& request = noi->getRequest();
-        ASSERT_EQUALS(config.getMemberAt(1).getHostAndPort(), request.target);
-        ASSERT_EQUALS("replSetHeartbeat", request.cmdObj.firstElement().fieldNameStringData());
-
-        net->scheduleResponse(noi, net->now(), makeResponseStatus(hbRespObj));
-        net->runReadyNetworkOperations();
-        net->exitNetwork();
-
-        ASSERT_EQUALS(OpTime(), getReplCoord()->getLastCommittedOpTime());
-        ASSERT_EQUALS(2, getReplCoord()->getTerm());
-    }
-
-    // Set FCV to 4.2, so commit point can be advanced through heartbeats.
-    serverGlobalParams.featureCompatibility.setVersion(
-        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
-    {
-        net->enterNetwork();
-        net->runUntil(net->now() + config.getHeartbeatInterval());
-        auto noi = net->getNextReadyRequest();
-        auto& request = noi->getRequest();
-        ASSERT_EQUALS("replSetHeartbeat", request.cmdObj.firstElement().fieldNameStringData());
-
-        net->scheduleResponse(noi, net->now(), makeResponseStatus(hbRespObj));
-        net->runReadyNetworkOperations();
-        net->exitNetwork();
-
-        ASSERT_EQUALS(commitPoint, getReplCoord()->getLastCommittedOpTime());
-    }
 }
 
 TEST_F(ReplCoordTest, AdvanceCommitPointFromSyncSourceCanSetCommitPointToLastAppliedIgnoringTerm) {

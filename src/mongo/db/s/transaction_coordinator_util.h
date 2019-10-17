@@ -204,8 +204,12 @@ struct PrepareResponse {
 };
 Future<PrepareResponse> sendPrepareToShard(ServiceContext* service,
                                            txn::AsyncWorkScheduler& scheduler,
+                                           const LogicalSessionId& lsid,
+                                           TxnNumber txnNumber,
                                            const ShardId& shardId,
-                                           const BSONObj& prepareCommandObj);
+                                           const BSONObj& prepareCommandObj,
+                                           OperationContextFn operationContextFn =
+                                               [](OperationContext*) {});
 
 /**
  * Sends a command corresponding to a commit decision (i.e. commitTransaction or*
@@ -220,8 +224,17 @@ Future<PrepareResponse> sendPrepareToShard(ServiceContext* service,
  */
 Future<void> sendDecisionToShard(ServiceContext* service,
                                  txn::AsyncWorkScheduler& scheduler,
+                                 const LogicalSessionId& lsid,
+                                 TxnNumber txnNumber,
                                  const ShardId& shardId,
-                                 const BSONObj& commandObj);
+                                 const BSONObj& commandObj,
+                                 OperationContextFn operationContextFn = [](OperationContext*) {});
+
+/**
+ * Returns a string representation of the transaction id represented by the given session id and
+ * transaction number.
+ */
+std::string txnIdToString(const LogicalSessionId& lsid, TxnNumber txnNumber);
 
 }  // namespace txn
 }  // namespace mongo

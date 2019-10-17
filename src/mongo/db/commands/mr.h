@@ -39,6 +39,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/scripting/engine.h"
+#include "mongo/util/debug_util.h"
 
 namespace mongo {
 

@@ -657,8 +657,7 @@ std::string runQuery(OperationContext* opCtx,
     }
     opCtx->checkForInterrupt();  // May trigger maxTimeAlwaysTimeOut fail point.
 
-    CurOpFailpointHelpers::waitWhileFailPointEnabled(
-        &waitInFindBeforeMakingBatch, opCtx, "waitInFindBeforeMakingBatch");
+    FindCommon::waitInFindBeforeMakingBatch(opCtx, *exec->getCanonicalQuery());
 
     // Run the query.
     // bb is used to hold query results
@@ -708,11 +707,6 @@ std::string runQuery(OperationContext* opCtx,
                                    "Executor error during OP_QUERY find");
         MONGO_UNREACHABLE;
     }
-
-    // Before saving the cursor, ensure that whatever plan we established happened with the expected
-    // collection version
-    auto css = CollectionShardingState::get(opCtx, nss);
-    css->checkShardVersionOrThrow(opCtx);
 
     // Fill out CurOp based on query results. If we have a cursorid, we will fill out CurOp with
     // this cursorid later.

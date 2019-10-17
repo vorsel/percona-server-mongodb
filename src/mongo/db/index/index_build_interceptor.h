@@ -29,6 +29,8 @@
 
 #pragma once
 
+#include <memory>
+
 #include "mongo/db/index/duplicate_key_tracker.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/multikey_paths.h"
@@ -45,6 +47,8 @@ class OperationContext;
 class IndexBuildInterceptor {
 public:
     enum class Op { kInsert, kDelete };
+
+    static bool typeCanFastpathMultikeyUpdates(IndexType type);
 
     /**
      * Creates a temporary table for writes during an index build. Additionally creates a temporary
@@ -88,6 +92,7 @@ public:
      * constraint violations on the index.
      */
     Status checkDuplicateKeyConstraints(OperationContext* opCtx) const;
+
 
     /**
      * Performs a resumable scan on the side writes table, and either inserts or removes each key
@@ -155,7 +160,12 @@ private:
 
     int64_t _numApplied{0};
 
-    AtomicWord<long long> _sideWritesCounter{0};
+    // This allows the counter to be used in a RecoveryUnit rollback handler where the
+    // IndexBuildInterceptor is no longer available (e.g. due to index build cleanup). If there are
+    // additional fields that have to be referenced in commit/rollback handlers, this counter should
+    // be moved to a new IndexBuildsInterceptor::InternalState structure that will be managed as a
+    // shared resource.
+    std::shared_ptr<AtomicWord<long long>> _sideWritesCounter;
 
     mutable stdx::mutex _multikeyPathMutex;
     boost::optional<MultikeyPaths> _multikeyPaths;

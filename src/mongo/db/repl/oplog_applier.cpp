@@ -82,8 +82,9 @@ std::size_t OplogApplier::calculateBatchLimitBytes(OperationContext* opCtx,
 
 OplogApplier::OplogApplier(executor::TaskExecutor* executor,
                            OplogBuffer* oplogBuffer,
-                           Observer* observer)
-    : _executor(executor), _oplogBuffer(oplogBuffer), _observer(observer) {}
+                           Observer* observer,
+                           const OplogApplier::Options& options)
+    : _executor(executor), _oplogBuffer(oplogBuffer), _observer(observer), _options(options) {}
 
 OplogBuffer* OplogApplier::getBuffer() const {
     return _oplogBuffer;
@@ -123,7 +124,7 @@ void OplogApplier::enqueue(OperationContext* opCtx,
                            Operations::const_iterator end) {
     OplogBuffer::Batch batch;
     for (auto i = begin; i != end; ++i) {
-        batch.push_back(i->raw);
+        batch.push_back(i->getRaw());
     }
     enqueue(opCtx, batch.cbegin(), batch.cend());
 }
@@ -289,11 +290,9 @@ StatusWith<OplogApplier::Operations> OplogApplier::getNextApplierBatch(
     return std::move(ops);
 }
 
-StatusWith<OpTime> OplogApplier::multiApply(OperationContext* opCtx,
-                                            Operations ops,
-                                            boost::optional<repl::OplogApplication::Mode> mode) {
+StatusWith<OpTime> OplogApplier::multiApply(OperationContext* opCtx, Operations ops) {
     _observer->onBatchBegin(ops);
-    auto lastApplied = _multiApply(opCtx, std::move(ops), mode);
+    auto lastApplied = _multiApply(opCtx, std::move(ops));
     _observer->onBatchEnd(lastApplied, {});
     return lastApplied;
 }

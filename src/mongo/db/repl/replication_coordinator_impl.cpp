@@ -68,6 +68,7 @@
 #include "mongo/db/repl/repl_set_request_votes_args.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_coordinator_impl_gen.h"
+#include "mongo/db/repl/replication_metrics.h"
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/rslog.h"
 #include "mongo/db/repl/storage_interface.h"
@@ -76,7 +77,6 @@
 #include "mongo/db/repl/update_position_args.h"
 #include "mongo/db/repl/vote_requester.h"
 #include "mongo/db/server_options.h"
-#include "mongo/db/transaction_participant.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/executor/connection_pool_stats.h"
@@ -755,6 +755,10 @@ void ReplicationCoordinatorImpl::_startDataReplication(OperationContext* opCtx,
         {
             // Must take the lock to set _initialSyncer, but not call it.
             stdx::lock_guard<stdx::mutex> lock(_mutex);
+            if (_inShutdown) {
+                log() << "Initial Sync not starting because replication is shutting down.";
+                return;
+            }
             initialSyncerCopy = std::make_shared<InitialSyncer>(
                 createInitialSyncerOptions(this, _externalState.get()),
                 stdx::make_unique<DataReplicatorExternalStateInitialSync>(this,
@@ -875,6 +879,7 @@ void ReplicationCoordinatorImpl::shutdown(OperationContext* opCtx) {
         }
         _replicationWaiterList.signalAll_inlock();
         _opTimeWaiterList.signalAll_inlock();
+        _wMajorityWriteAvailabilityWaiter.reset();
         _currentCommittedSnapshotCond.notify_all();
         _initialSyncer.swap(initialSyncerCopy);
     }
@@ -1420,7 +1425,10 @@ Status ReplicationCoordinatorImpl::_waitUntilOpTime(OperationContext* opCtx,
             auto waitStatus =
                 opCtx->waitForConditionOrInterruptNoAssert(_currentCommittedSnapshotCond, lock);
             if (!waitStatus.isOK()) {
-                return waitStatus;
+                return waitStatus.withContext(
+                    str::stream() << "Error waiting for snapshot not less than "
+                                  << targetOpTime.toString() << ", current relevant optime is "
+                                  << getCurrentOpTime().toString() << ".");
             }
             if (!_currentCommittedSnapshot) {
                 // It is possible for the thread to be awoken due to a spurious wakeup, meaning
@@ -1445,17 +1453,21 @@ Status ReplicationCoordinatorImpl::_waitUntilOpTime(OperationContext* opCtx,
         if (deadline) {
             auto waitUntilStatus =
                 opCtx->waitForConditionOrInterruptNoAssertUntil(condVar, lock, *deadline);
-            if (!waitUntilStatus.isOK()) {
-                waitStatus = waitUntilStatus.getStatus();
-            }
-            // If deadline is set no need to wait until the targetTime time is reached.
-            return waitStatus;
+            waitStatus = waitUntilStatus.getStatus();
         } else {
             waitStatus = opCtx->waitForConditionOrInterruptNoAssert(condVar, lock);
         }
 
         if (!waitStatus.isOK()) {
-            return waitStatus;
+            return waitStatus.withContext(str::stream()
+                                          << "Error waiting for optime " << targetOpTime.toString()
+                                          << ", current relevant optime is "
+                                          << getCurrentOpTime().toString() << ".");
+        }
+
+        // If deadline is set no need to wait until the targetTime time is reached.
+        if (deadline) {
+            return Status::OK();
         }
     }
 
@@ -1472,6 +1484,10 @@ Status ReplicationCoordinatorImpl::_waitUntilOpTime(OperationContext* opCtx,
         // We wait only on primaries, because on secondaries, other mechanisms assure that the
         // last applied optime is always hole-free, and waiting for all earlier writes to be visible
         // can deadlock against secondary command application.
+        //
+        // Note that oplog queries by secondary nodes depend on this behavior to wait for
+        // all oplog holes to be filled in, despite providing an afterClusterTime field
+        // with Timestamp(0,1).
         _storage->waitForAllEarlierOplogWritesToBeVisible(opCtx, /* primaryOnly =*/true);
     }
 
@@ -1512,8 +1528,7 @@ Status ReplicationCoordinatorImpl::_waitUntilClusterTimeForRead(OperationContext
 Status ReplicationCoordinatorImpl::_waitUntilOpTimeForReadDeprecated(
     OperationContext* opCtx, const ReadConcernArgs& readConcern) {
     const bool isMajorityCommittedRead =
-        readConcern.getLevel() == ReadConcernLevel::kMajorityReadConcern ||
-        readConcern.getLevel() == ReadConcernLevel::kSnapshotReadConcern;
+        readConcern.getLevel() == ReadConcernLevel::kMajorityReadConcern;
 
     const auto targetOpTime = readConcern.getArgsOpTime().value_or(OpTime());
     return _waitUntilOpTime(opCtx, isMajorityCommittedRead, targetOpTime);
@@ -2101,6 +2116,11 @@ void ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
 
     lk.lock();
     _updateAndLogStatsOnStepDown(&arsd);
+
+    // Clear the node's election candidate metrics since it is no longer primary.
+    ReplicationMetrics::get(opCtx).clearElectionCandidateMetrics();
+    _wMajorityWriteAvailabilityWaiter.reset();
+
     _topCoord->finishUnconditionalStepDown();
 
     onExitGuard.dismiss();
@@ -2159,8 +2179,7 @@ void ReplicationCoordinatorImpl::_handleTimePassing(
 
     // For election protocol v1, call _startElectSelfIfEligibleV1 to avoid race
     // against other elections caused by events like election timeout, replSetStepUp etc.
-    _startElectSelfIfEligibleV1(
-        TopologyCoordinator::StartElectionReason::kSingleNodePromptElection);
+    _startElectSelfIfEligibleV1(StartElectionReasonEnum::kSingleNodePromptElection);
 }
 
 bool ReplicationCoordinatorImpl::isMasterForReportingPurposes() {
@@ -2270,8 +2289,7 @@ Status ReplicationCoordinatorImpl::checkCanServeReadsFor_UNSAFE(OperationContext
         return Status::OK();
     }
 
-    auto txnParticipant = TransactionParticipant::get(opCtx);
-    if (txnParticipant && txnParticipant.inMultiDocumentTransaction()) {
+    if (opCtx->inMultiDocumentTransaction()) {
         if (!_readWriteAbility->canAcceptNonLocalWrites_UNSAFE()) {
             return Status(ErrorCodes::NotMaster,
                           "Multi-document transactions are only allowed on replica set primaries.");
@@ -2365,6 +2383,9 @@ Status ReplicationCoordinatorImpl::processReplSetGetStatus(
         }
     }
 
+    BSONObj electionCandidateMetrics =
+        ReplicationMetrics::get(getServiceContext()).getElectionCandidateMetricsBSON();
+
     stdx::lock_guard<stdx::mutex> lk(_mutex);
     Status result(ErrorCodes::InternalError, "didn't set status in prepareStatusResponse");
     _topCoord->prepareStatusResponse(
@@ -2373,6 +2394,7 @@ Status ReplicationCoordinatorImpl::processReplSetGetStatus(
             static_cast<unsigned>(time(0) - serverGlobalParams.started),
             _getCurrentCommittedSnapshotOpTimeAndWallTime_inlock(),
             initialSyncProgress,
+            electionCandidateMetrics,
             _storage->getLastStableCheckpointTimestampDeprecated(_service),
             _storage->getLastStableRecoveryTimestamp(_service)},
         response,
@@ -2523,8 +2545,7 @@ Status ReplicationCoordinatorImpl::processReplSetFreeze(int secs, BSONObjBuilder
         result.getValue()) {
         // For election protocol v1, call _startElectSelfIfEligibleV1 to avoid race
         // against other elections caused by events like election timeout, replSetStepUp etc.
-        _startElectSelfIfEligibleV1(
-            TopologyCoordinator::StartElectionReason::kSingleNodePromptElection);
+        _startElectSelfIfEligibleV1(StartElectionReasonEnum::kSingleNodePromptElection);
     }
 
     return Status::OK();
@@ -2678,6 +2699,10 @@ void ReplicationCoordinatorImpl::_finishReplSetReconfig(OperationContext* opCtx,
 
             lk.lock();
             _updateAndLogStatsOnStepDown(&arsd.get());
+
+            // Clear the node's election candidate metrics since it is no longer primary.
+            ReplicationMetrics::get(opCtx).clearElectionCandidateMetrics();
+            _wMajorityWriteAvailabilityWaiter.reset();
         } else {
             // Release the rstl lock as the node might have stepped down due to
             // other unconditional step down code paths like learning new term via heartbeat &
@@ -2826,7 +2851,6 @@ ReplicationCoordinatorImpl::_updateMemberStateFromTopologyCoordinator(WithLock l
         _readWriteAbility->setCanAcceptNonLocalWrites(lk, opCtx, canAcceptWrites);
     }
 
-
     const MemberState newState = _topCoord->getMemberState();
     if (newState == _memberState) {
         if (_topCoord->getRole() == TopologyCoordinator::Role::kCandidate) {
@@ -2858,7 +2882,16 @@ ReplicationCoordinatorImpl::_updateMemberStateFromTopologyCoordinator(WithLock l
     // Exit catchup mode if we're in it and enable replication producer and applier on stepdown.
     if (_memberState.primary()) {
         if (_catchupState) {
-            _catchupState->abort_inlock();
+            // _pendingTermUpdateDuringStepDown is set before stepping down due to hearing about a
+            // higher term, so that we can remember the term we heard and update our term as part of
+            // finishing stepdown. It is then unset toward the end of stepdown, after the function
+            // we are in is called. Thus we must be stepping down due to seeing a higher term if and
+            // only if _pendingTermUpdateDuringStepDown is set here.
+            if (_pendingTermUpdateDuringStepDown) {
+                _catchupState->abort_inlock(PrimaryCatchUpConclusionReason::kFailedWithNewTerm);
+            } else {
+                _catchupState->abort_inlock(PrimaryCatchUpConclusionReason::kFailedWithError);
+            }
         }
         _applierState = ApplierState::Running;
         _externalState->startProducerIfStopped();
@@ -2965,7 +2998,7 @@ void ReplicationCoordinatorImpl::_performPostMemberStateUpdateAction(
         case kActionStartSingleNodeElection:
             // In protocol version 1, single node replset will run an election instead of
             // kActionWinElection as in protocol version 0.
-            _startElectSelfV1(TopologyCoordinator::StartElectionReason::kElectionTimeout);
+            _startElectSelfV1(StartElectionReasonEnum::kElectionTimeout);
             break;
         default:
             severe() << "Unknown post member state update action " << static_cast<int>(action);
@@ -3002,7 +3035,7 @@ void ReplicationCoordinatorImpl::CatchupState::start_inlock() {
 
     // No catchup in single node replica set.
     if (_repl->_rsConfig.getNumMembers() == 1) {
-        abort_inlock();
+        abort_inlock(PrimaryCatchUpConclusionReason::kSkipped);
         return;
     }
 
@@ -3011,7 +3044,7 @@ void ReplicationCoordinatorImpl::CatchupState::start_inlock() {
     // When catchUpTimeoutMillis is 0, we skip doing catchup entirely.
     if (catchupTimeout == ReplSetConfig::kCatchUpDisabled) {
         log() << "Skipping primary catchup since the catchup timeout is 0.";
-        abort_inlock();
+        abort_inlock(PrimaryCatchUpConclusionReason::kSkipped);
         return;
     }
 
@@ -3026,7 +3059,7 @@ void ReplicationCoordinatorImpl::CatchupState::start_inlock() {
             return;
         }
         log() << "Catchup timed out after becoming primary.";
-        abort_inlock();
+        abort_inlock(PrimaryCatchUpConclusionReason::kTimedOut);
     };
 
     // Deal with infinity and overflow - no timeout.
@@ -3039,14 +3072,19 @@ void ReplicationCoordinatorImpl::CatchupState::start_inlock() {
     auto status = _repl->_replExecutor->scheduleWorkAt(timeoutDate, std::move(timeoutCB));
     if (!status.isOK()) {
         log() << "Failed to schedule catchup timeout work.";
-        abort_inlock();
+        abort_inlock(PrimaryCatchUpConclusionReason::kFailedWithError);
         return;
     }
     _timeoutCbh = status.getValue();
+
+    _numCatchUpOps = 0;
 }
 
-void ReplicationCoordinatorImpl::CatchupState::abort_inlock() {
+void ReplicationCoordinatorImpl::CatchupState::abort_inlock(PrimaryCatchUpConclusionReason reason) {
     invariant(_repl->_getMemberState_inlock().primary());
+
+    ReplicationMetrics::get(getGlobalServiceContext())
+        .incrementNumCatchUpsConcludedForReason(reason);
 
     log() << "Exited primary catch-up mode.";
     // Clean up its own members.
@@ -3075,7 +3113,10 @@ void ReplicationCoordinatorImpl::CatchupState::signalHeartbeatUpdate_inlock() {
     if (*targetOpTime <= myLastApplied) {
         log() << "Caught up to the latest optime known via heartbeats after becoming primary. "
               << "Target optime: " << *targetOpTime << ". My Last Applied: " << myLastApplied;
-        abort_inlock();
+        // Report the number of ops applied during catchup in replSetGetStatus once the primary is
+        // caught up.
+        ReplicationMetrics::get(getGlobalServiceContext()).setNumCatchUpOps(_numCatchUpOps);
+        abort_inlock(PrimaryCatchUpConclusionReason::kAlreadyCaughtUp);
         return;
     }
 
@@ -3083,6 +3124,8 @@ void ReplicationCoordinatorImpl::CatchupState::signalHeartbeatUpdate_inlock() {
     if (_waiter && _waiter->opTime == *targetOpTime) {
         return;
     }
+
+    ReplicationMetrics::get(getGlobalServiceContext()).setTargetCatchupOpTime(targetOpTime.get());
 
     log() << "Heartbeats updated catchup target optime to " << *targetOpTime;
     log() << "Latest known optime per replica set member:";
@@ -3094,32 +3137,52 @@ void ReplicationCoordinatorImpl::CatchupState::signalHeartbeatUpdate_inlock() {
 
     if (_waiter) {
         _repl->_opTimeWaiterList.remove_inlock(_waiter.get());
+    } else {
+        // Only increment the 'numCatchUps' election metric the first time we add a waiter, so that
+        // we only increment it once each time a primary has to catch up. If there is already an
+        // existing waiter, then the node is catching up and has already been counted.
+        ReplicationMetrics::get(getGlobalServiceContext()).incrementNumCatchUps();
     }
+
     auto targetOpTimeCB = [this, targetOpTime]() {
         // Double check the target time since stepdown may signal us too.
         const auto myLastApplied = _repl->_getMyLastAppliedOpTime_inlock();
         if (*targetOpTime <= myLastApplied) {
             log() << "Caught up to the latest known optime successfully after becoming primary. "
                   << "Target optime: " << *targetOpTime << ". My Last Applied: " << myLastApplied;
-            abort_inlock();
+            // Report the number of ops applied during catchup in replSetGetStatus once the primary
+            // is caught up.
+            ReplicationMetrics::get(getGlobalServiceContext()).setNumCatchUpOps(_numCatchUpOps);
+            abort_inlock(PrimaryCatchUpConclusionReason::kSucceeded);
         }
     };
     _waiter = stdx::make_unique<CallbackWaiter>(*targetOpTime, targetOpTimeCB);
     _repl->_opTimeWaiterList.add_inlock(_waiter.get());
 }
 
-Status ReplicationCoordinatorImpl::abortCatchupIfNeeded() {
+void ReplicationCoordinatorImpl::CatchupState::incrementNumCatchUpOps_inlock(int numOps) {
+    _numCatchUpOps += numOps;
+}
+
+Status ReplicationCoordinatorImpl::abortCatchupIfNeeded(PrimaryCatchUpConclusionReason reason) {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
     if (_catchupState) {
-        _catchupState->abort_inlock();
+        _catchupState->abort_inlock(reason);
         return Status::OK();
     }
     return Status(ErrorCodes::IllegalOperation, "The node is not in catch-up mode.");
 }
 
+void ReplicationCoordinatorImpl::incrementNumCatchUpOpsIfCatchingUp(int numOps) {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    if (_catchupState) {
+        _catchupState->incrementNumCatchUpOps_inlock(numOps);
+    }
+}
+
 void ReplicationCoordinatorImpl::signalDropPendingCollectionsRemovedFromStorage() {
     stdx::lock_guard<stdx::mutex> lock(_mutex);
-    _wakeReadyWaiters_inlock();
+    _wakeReadyWaiters(lock);
 }
 
 boost::optional<Timestamp> ReplicationCoordinatorImpl::getRecoveryTimestamp() {
@@ -3211,10 +3274,26 @@ ReplicationCoordinatorImpl::_setCurrentRSConfig(WithLock lk,
     return action;
 }
 
-void ReplicationCoordinatorImpl::_wakeReadyWaiters_inlock() {
+void ReplicationCoordinatorImpl::_wakeReadyWaiters(WithLock lk) {
     _replicationWaiterList.signalIf_inlock([this](Waiter* waiter) {
         return _doneWaitingForReplication_inlock(waiter->opTime, *waiter->writeConcern);
     });
+
+    if (_wMajorityWriteAvailabilityWaiter) {
+        WriteConcernOptions kMajorityWriteConcern(
+            WriteConcernOptions::kMajority,
+            WriteConcernOptions::SyncMode::UNSET,
+            // The timeout isn't used by _doneWaitingForReplication_inlock.
+            WriteConcernOptions::kNoTimeout);
+        kMajorityWriteConcern =
+            _populateUnsetWriteConcernOptionsSyncMode(lk, kMajorityWriteConcern);
+
+        if (_doneWaitingForReplication_inlock(_wMajorityWriteAvailabilityWaiter->opTime,
+                                              kMajorityWriteConcern)) {
+            _wMajorityWriteAvailabilityWaiter->notify_inlock();
+            _wMajorityWriteAvailabilityWaiter.reset();
+        }
+    }
 }
 
 Status ReplicationCoordinatorImpl::processReplSetUpdatePosition(const UpdatePositionArgs& updates,
@@ -3442,7 +3521,7 @@ void ReplicationCoordinatorImpl::_updateLastCommittedOpTimeAndWallTime(WithLock 
     // check satisfied.  We must do this regardless of whether we updated the lastCommittedOpTime,
     // as lastCommittedOpTime may be based on durable optimes whereas some waiters may be
     // waiting on applied (but not necessarily durable) optimes.
-    _wakeReadyWaiters_inlock();
+    _wakeReadyWaiters(lk);
 }
 
 boost::optional<OpTimeAndWallTime> ReplicationCoordinatorImpl::_chooseStableOpTimeFromCandidates(
@@ -3588,7 +3667,7 @@ void ReplicationCoordinatorImpl::_setStableTimestampForStorage(WithLock lk) {
             if (serverGlobalParams.enableMajorityReadConcern) {
                 // When majority read concern is enabled, the committed snapshot is set to the new
                 // stable optime.
-                if (_updateCommittedSnapshot_inlock(stableOpTime.value())) {
+                if (_updateCommittedSnapshot(lk, stableOpTime.value())) {
                     // Update the stable timestamp for the storage engine.
                     _storage->setStableTimestamp(getServiceContext(),
                                                  stableOpTime->opTime.getTimestamp());
@@ -3604,7 +3683,7 @@ void ReplicationCoordinatorImpl::_setStableTimestampForStorage(WithLock lk) {
                     // lastCommittedOpTime is set to be the lastApplied which can be ahead of the
                     // allCommitted.
                     auto newCommittedSnapshot = std::min(lastCommittedOpTime, *stableOpTime);
-                    _updateCommittedSnapshot_inlock(newCommittedSnapshot);
+                    _updateCommittedSnapshot(lk, newCommittedSnapshot);
                 }
                 // Set the stable timestamp regardless of whether the majority commit point moved
                 // forward.
@@ -3834,6 +3913,7 @@ EventHandle ReplicationCoordinatorImpl::_updateTerm_inlock(
         }
         if (_topCoord->prepareForUnconditionalStepDown()) {
             log() << "stepping down from primary, because a new term has begun: " << term;
+            ReplicationMetrics::get(getServiceContext()).incrementNumStepDownsCausedByHigherTerm();
             return _stepDownStart();
         } else {
             LOG(2) << "Updated term but not triggering stepdown because we are already in the "
@@ -3860,8 +3940,17 @@ size_t ReplicationCoordinatorImpl::getNumUncommittedSnapshots() {
     return _uncommittedSnapshotsSize.load();
 }
 
-bool ReplicationCoordinatorImpl::_updateCommittedSnapshot_inlock(
-    const OpTimeAndWallTime& newCommittedSnapshot) {
+void ReplicationCoordinatorImpl::createWMajorityWriteAvailabilityDateWaiter(OpTime opTime) {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    auto opTimeCB = [this, opTime]() {
+        ReplicationMetrics::get(getServiceContext())
+            .setWMajorityWriteAvailabilityDate(_replExecutor->now());
+    };
+    _wMajorityWriteAvailabilityWaiter = std::make_unique<CallbackWaiter>(opTime, opTimeCB);
+}
+
+bool ReplicationCoordinatorImpl::_updateCommittedSnapshot(
+    WithLock lk, const OpTimeAndWallTime& newCommittedSnapshot) {
     if (gTestingSnapshotBehaviorInIsolation) {
         return false;
     }
@@ -3893,7 +3982,7 @@ bool ReplicationCoordinatorImpl::_updateCommittedSnapshot_inlock(
     _externalState->updateCommittedSnapshot(newCommittedSnapshot.opTime);
 
     // Wake up any threads waiting for read concern or write concern.
-    _wakeReadyWaiters_inlock();
+    _wakeReadyWaiters(lk);
     return true;
 }
 
@@ -3944,11 +4033,16 @@ EventHandle ReplicationCoordinatorImpl::_makeEvent() {
 
 WriteConcernOptions ReplicationCoordinatorImpl::populateUnsetWriteConcernOptionsSyncMode(
     WriteConcernOptions wc) {
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    return _populateUnsetWriteConcernOptionsSyncMode(lock, wc);
+}
 
+WriteConcernOptions ReplicationCoordinatorImpl::_populateUnsetWriteConcernOptionsSyncMode(
+    WithLock lk, WriteConcernOptions wc) {
     WriteConcernOptions writeConcern(wc);
     if (writeConcern.syncMode == WriteConcernOptions::SyncMode::UNSET) {
         if (writeConcern.wMode == WriteConcernOptions::kMajority &&
-            getWriteConcernMajorityShouldJournal()) {
+            getWriteConcernMajorityShouldJournal_inlock()) {
             writeConcern.syncMode = WriteConcernOptions::SyncMode::JOURNAL;
         } else {
             writeConcern.syncMode = WriteConcernOptions::SyncMode::NONE;
@@ -3969,8 +4063,8 @@ CallbackFn ReplicationCoordinatorImpl::_wrapAsCallbackFn(const stdx::function<vo
 
 Status ReplicationCoordinatorImpl::stepUpIfEligible(bool skipDryRun) {
 
-    auto reason = skipDryRun ? TopologyCoordinator::StartElectionReason::kStepUpRequestSkipDryRun
-                             : TopologyCoordinator::StartElectionReason::kStepUpRequest;
+    auto reason = skipDryRun ? StartElectionReasonEnum::kStepUpRequestSkipDryRun
+                             : StartElectionReasonEnum::kStepUpRequest;
     _startElectSelfIfEligibleV1(reason);
 
     EventHandle finishEvent;

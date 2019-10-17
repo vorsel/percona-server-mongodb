@@ -45,6 +45,7 @@
 namespace mongo {
 namespace {
 
+MONGO_FAIL_POINT_DEFINE(hangAfterStartingCoordinateCommit);
 MONGO_FAIL_POINT_DEFINE(participantReturnNetworkErrorForPrepareAfterExecutingPrepareLogic);
 
 class PrepareTransactionCmd : public TypedCommand<PrepareTransactionCmd> {
@@ -110,7 +111,7 @@ public:
 
             uassert(ErrorCodes::NoSuchTransaction,
                     "Transaction isn't in progress",
-                    txnParticipant.inMultiDocumentTransaction());
+                    txnParticipant.transactionIsOpen());
 
             if (txnParticipant.transactionIsPrepared()) {
                 auto& replClient = repl::ReplClientInfo::forClient(opCtx->getClient());
@@ -248,6 +249,12 @@ public:
                     opCtx, *opCtx->getLogicalSessionId(), *opCtx->getTxnNumber());
             }
 
+            if (MONGO_FAIL_POINT(hangAfterStartingCoordinateCommit)) {
+                LOG(0) << "Hit hangAfterStartingCoordinateCommit failpoint";
+                MONGO_FAIL_POINT_PAUSE_WHILE_SET_OR_INTERRUPTED(opCtx,
+                                                                hangAfterStartingCoordinateCommit);
+            }
+
             ON_BLOCK_EXIT([opCtx] {
                 // A decision will most likely have been written from a different OperationContext
                 // (in all cases except the one where this command aborts the local participant), so
@@ -291,16 +298,15 @@ public:
             {
                 MongoDOperationContextSession sessionTxnState(opCtx);
                 auto txnParticipant = TransactionParticipant::get(opCtx);
-
                 txnParticipant.beginOrContinue(opCtx,
                                                *opCtx->getTxnNumber(),
                                                false /* autocommit */,
                                                boost::none /* startTransaction */);
 
-                try {
-                    txnParticipant.abortTransactionIfNotPrepared(opCtx);
-                } catch (const ExceptionFor<ErrorCodes::TransactionCommitted>&) {
+                if (txnParticipant.transactionIsCommitted())
                     return;
+                if (txnParticipant.transactionIsInProgress()) {
+                    txnParticipant.abortTransaction(opCtx);
                 }
 
                 participantExitPrepareFuture = txnParticipant.onExitPrepare();
@@ -319,7 +325,7 @@ public:
                                                false /* autocommit */,
                                                boost::none /* startTransaction */);
 
-                invariant(!txnParticipant.inMultiDocumentTransaction(),
+                invariant(!txnParticipant.transactionIsOpen(),
                           "The participant should not be in progress after we waited for the "
                           "participant to complete");
                 uassert(ErrorCodes::NoSuchTransaction,

@@ -1538,6 +1538,7 @@ TEST_F(TopoCoordTest, ReplSetGetStatus) {
     Timestamp lastStableRecoveryTimestamp(2, 2);
     Timestamp lastStableCheckpointTimestampDeprecated(2, 2);
     BSONObj initialSyncStatus = BSON("failedInitialSyncAttempts" << 1);
+    BSONObj electionCandidateMetrics = BSON("DummyElectionMetrics" << 1);
     std::string setName = "mySet";
 
     ReplSetHeartbeatResponse hb;
@@ -1593,6 +1594,7 @@ TEST_F(TopoCoordTest, ReplSetGetStatus) {
             static_cast<unsigned>(durationCount<Seconds>(uptimeSecs)),
             {readConcernMajorityOpTime, readConcernMajorityWallTime},
             initialSyncStatus,
+            electionCandidateMetrics,
             lastStableCheckpointTimestampDeprecated,
             lastStableRecoveryTimestamp},
         &statusBuilder,
@@ -1702,7 +1704,10 @@ TEST_F(TopoCoordTest, ReplSetGetStatus) {
     ASSERT_FALSE(selfStatus.hasField("pingMs"));
 
     ASSERT_EQUALS(2000, rsStatus["heartbeatIntervalMillis"].numberInt());
+    ASSERT_EQUALS(3, rsStatus["majorityVoteCount"].numberInt());
+    ASSERT_EQUALS(3, rsStatus["writeMajorityCount"].numberInt());
     ASSERT_BSONOBJ_EQ(initialSyncStatus, rsStatus["initialSyncStatus"].Obj());
+    ASSERT_BSONOBJ_EQ(electionCandidateMetrics, rsStatus["electionCandidateMetrics"].Obj());
 
     // Test no lastStableRecoveryTimestamp field.
     BSONObjBuilder statusBuilder2;
@@ -1711,7 +1716,8 @@ TEST_F(TopoCoordTest, ReplSetGetStatus) {
             curTime,
             static_cast<unsigned>(durationCount<Seconds>(uptimeSecs)),
             {readConcernMajorityOpTime, readConcernMajorityWallTime},
-            initialSyncStatus},
+            initialSyncStatus,
+            BSONObj()},
         &statusBuilder2,
         &resultStatus);
     ASSERT_OK(resultStatus);
@@ -1720,7 +1726,51 @@ TEST_F(TopoCoordTest, ReplSetGetStatus) {
     ASSERT_EQUALS(setName, rsStatus["set"].String());
     ASSERT_FALSE(rsStatus.hasField("lastStableRecoveryTimestamp"));
     ASSERT_FALSE(rsStatus.hasField("lastStableCheckpointTimestamp"));
+    ASSERT_FALSE(rsStatus.hasField("electionCandidateMetrics"));
 }
+
+TEST_F(TopoCoordTest, ReplSetGetStatusWriteMajorityDifferentFromMajorityVoteCount) {
+    // This tests that writeMajorityCount differs from majorityVoteCount in replSetGetStatus when
+    // the number of non-arbiter voters is less than majorityVoteCount.
+    Date_t startupTime = Date_t::fromMillisSinceEpoch(100);
+    Date_t heartbeatTime = Date_t::fromMillisSinceEpoch(5000);
+    Seconds uptimeSecs(10);
+    Date_t curTime = heartbeatTime + uptimeSecs;
+    OpTime readConcernMajorityOpTime(Timestamp(4, 1), 20);
+    Date_t readConcernMajorityWallTime = Date_t() + Seconds(readConcernMajorityOpTime.getSecs());
+    BSONObj initialSyncStatus = BSON("failedInitialSyncAttempts" << 1);
+    std::string setName = "mySet";
+
+    updateConfig(BSON("_id" << setName << "version" << 1 << "members"
+                            << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                     << "test0:1234")
+                                          << BSON("_id" << 1 << "host"
+                                                        << "test1:1234")
+                                          << BSON("_id" << 2 << "host"
+                                                        << "test2:1234"
+                                                        << "arbiterOnly" << true)
+                                          << BSON("_id" << 3 << "host"
+                                                        << "test3:1234"
+                                                        << "arbiterOnly" << true))),
+                 3,
+                 startupTime + Milliseconds(1));
+
+    BSONObjBuilder statusBuilder;
+    Status resultStatus(ErrorCodes::InternalError, "prepareStatusResponse didn't set result");
+    getTopoCoord().prepareStatusResponse(
+        TopologyCoordinator::ReplSetStatusArgs{
+            curTime,
+            static_cast<unsigned>(durationCount<Seconds>(uptimeSecs)),
+            {readConcernMajorityOpTime, readConcernMajorityWallTime},
+            initialSyncStatus},
+        &statusBuilder,
+        &resultStatus);
+    ASSERT_OK(resultStatus);
+    BSONObj rsStatus = statusBuilder.obj();
+    ASSERT_EQUALS(3, rsStatus["majorityVoteCount"].numberInt());
+    ASSERT_EQUALS(2, rsStatus["writeMajorityCount"].numberInt());
+}
+
 
 TEST_F(TopoCoordTest, ReplSetGetStatusIPs) {
     BSONObj initialSyncStatus = BSON("failedInitialSyncAttempts" << 1);
@@ -2436,7 +2486,7 @@ TEST_F(TopoCoordTest, NodeReturnsArbiterWhenGetMemberStateRunsAgainstArbiter) {
 
 TEST_F(TopoCoordTest, ShouldNotStandForElectionWhileRemovedFromTheConfig) {
     const auto status = getTopoCoord().becomeCandidateIfElectable(
-        now()++, TopologyCoordinator::StartElectionReason::kElectionTimeout);
+        now()++, StartElectionReasonEnum::kElectionTimeout);
     ASSERT_NOT_OK(status);
     ASSERT_STRING_CONTAINS(status.reason(), "not a member of a valid replica set config");
 }
@@ -3640,8 +3690,8 @@ TEST_F(TopoCoordTest, FreshestNodeDoesCatchupTakeover) {
                                             StatusWith<ReplSetHeartbeatResponse>(hbResp));
     getTopoCoord().updateTerm(1, Date_t());
 
-    ASSERT_OK(getTopoCoord().becomeCandidateIfElectable(
-        Date_t(), TopologyCoordinator::StartElectionReason::kCatchupTakeover));
+    ASSERT_OK(getTopoCoord().becomeCandidateIfElectable(Date_t(),
+                                                        StartElectionReasonEnum::kCatchupTakeover));
 }
 
 TEST_F(TopoCoordTest, StaleNodeDoesntDoCatchupTakeover) {
@@ -3692,7 +3742,7 @@ TEST_F(TopoCoordTest, StaleNodeDoesntDoCatchupTakeover) {
     getTopoCoord().updateTerm(1, Date_t());
 
     Status result = getTopoCoord().becomeCandidateIfElectable(
-        Date_t(), TopologyCoordinator::StartElectionReason::kCatchupTakeover);
+        Date_t(), StartElectionReasonEnum::kCatchupTakeover);
     ASSERT_NOT_OK(result);
     ASSERT_STRING_CONTAINS(result.reason(),
                            "member is either not the most up-to-date member or not ahead of the "
@@ -3744,7 +3794,7 @@ TEST_F(TopoCoordTest, NodeDoesntDoCatchupTakeoverHeartbeatSaysPrimaryCaughtUp) {
     getTopoCoord().updateTerm(1, Date_t());
 
     Status result = getTopoCoord().becomeCandidateIfElectable(
-        Date_t(), TopologyCoordinator::StartElectionReason::kCatchupTakeover);
+        Date_t(), StartElectionReasonEnum::kCatchupTakeover);
     ASSERT_NOT_OK(result);
     ASSERT_STRING_CONTAINS(result.reason(),
                            "member is either not the most up-to-date member or not ahead of the "
@@ -3801,7 +3851,7 @@ TEST_F(TopoCoordTest, NodeDoesntDoCatchupTakeoverIfTermNumbersSayPrimaryCaughtUp
     getTopoCoord().updateTerm(1, Date_t());
 
     Status result = getTopoCoord().becomeCandidateIfElectable(
-        Date_t(), TopologyCoordinator::StartElectionReason::kCatchupTakeover);
+        Date_t(), StartElectionReasonEnum::kCatchupTakeover);
     ASSERT_NOT_OK(result);
     ASSERT_STRING_CONTAINS(result.reason(),
                            "member is either not the most up-to-date member or not ahead of the "
@@ -4955,8 +5005,8 @@ TEST_F(HeartbeatResponseTestV1,
     ASSERT_NO_ACTION(nextAction.getAction());
     ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
     // We are electable now.
-    ASSERT_OK(getTopoCoord().becomeCandidateIfElectable(
-        now(), TopologyCoordinator::StartElectionReason::kElectionTimeout));
+    ASSERT_OK(getTopoCoord().becomeCandidateIfElectable(now(),
+                                                        StartElectionReasonEnum::kElectionTimeout));
     ASSERT_TRUE(TopologyCoordinator::Role::kCandidate == getTopoCoord().getRole());
 }
 
@@ -4981,8 +5031,8 @@ TEST_F(HeartbeatResponseTestV1, ScheduleElectionWhenPrimaryIsMarkedDownAndWeAreE
     ASSERT_EQUALS(-1, getCurrentPrimaryIndex());
     ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
     // We are electable now.
-    ASSERT_OK(getTopoCoord().becomeCandidateIfElectable(
-        now(), TopologyCoordinator::StartElectionReason::kElectionTimeout));
+    ASSERT_OK(getTopoCoord().becomeCandidateIfElectable(now(),
+                                                        StartElectionReasonEnum::kElectionTimeout));
     ASSERT_TRUE(TopologyCoordinator::Role::kCandidate == getTopoCoord().getRole());
 }
 

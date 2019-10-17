@@ -54,7 +54,6 @@
 #include "mongo/db/query/query_planner_common.h"
 #include "mongo/db/query/view_response_formatter.h"
 #include "mongo/db/s/collection_sharding_state.h"
-#include "mongo/db/transaction_participant.h"
 #include "mongo/db/views/resolved_view.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
@@ -184,12 +183,11 @@ public:
 
         // Distinct doesn't filter orphan documents so it is not allowed to run on sharded
         // collections in multi-document transactions.
-        auto txnParticipant = TransactionParticipant::get(opCtx);
         uassert(ErrorCodes::OperationNotSupportedInTransaction,
                 "Cannot run 'distinct' on a sharded collection in a multi-document transaction. "
                 "Please see http://dochub.mongodb.org/core/transaction-distinct for a recommended "
                 "alternative.",
-                !txnParticipant || !txnParticipant.inMultiDocumentTransaction() ||
+                !opCtx->inMultiDocumentTransaction() ||
                     !CollectionShardingState::get(opCtx, nss)->getCurrentMetadata()->isSharded());
 
         const ExtensionsCallbackReal extensionsCallback(opCtx, &nss);
@@ -267,12 +265,15 @@ public:
 
         // Return an error if execution fails for any reason.
         if (PlanExecutor::FAILURE == state) {
-            log() << "Plan executor error during distinct command: "
-                  << redact(PlanExecutor::statestr(state))
-                  << ", stats: " << redact(Explain::getWinningPlanStats(executor.getValue().get()));
+            // We should always have a valid status member object at this point.
+            auto status = WorkingSetCommon::getMemberObjectStatus(obj);
+            invariant(!status.isOK());
+            warning() << "Plan executor error during distinct command: "
+                      << redact(PlanExecutor::statestr(state)) << ", status: " << status
+                      << ", stats: "
+                      << redact(Explain::getWinningPlanStats(executor.getValue().get()));
 
-            uassertStatusOK(WorkingSetCommon::getMemberObjectStatus(obj).withContext(
-                "Executor error during distinct command"));
+            uassertStatusOK(status.withContext("Executor error during distinct command"));
         }
 
 

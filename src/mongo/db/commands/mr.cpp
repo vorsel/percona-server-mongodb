@@ -96,6 +96,9 @@ namespace mr {
 namespace {
 
 Rarely mapParamsDeprecationSampler;  // Used to occasionally log deprecation messages.
+// Used to log occassional deprecation warnings when CodeWScope is used in MapReduce.
+Rarely mapReduceCodeWScopeSampler;
+
 
 /**
  * Runs a count against the namespace specified by 'ns'. If the caller holds the global write lock,
@@ -231,8 +234,12 @@ JSFunction::JSFunction(const std::string& type, const BSONElement& e) {
     _type = type;
     _code = e._asCode();
 
-    if (e.type() == CodeWScope)
+    if (e.type() == CodeWScope) {
+        if (mapReduceCodeWScopeSampler.tick())
+            warning() << "Use of CodeWScope with MapReduce is deprecated. Put all scope "
+                         "variables in the scope parameter of the MapReduce command";
         _wantedScope = e.codeWScopeObject();
+    }
 }
 
 void JSFunction::init(State* state) {
@@ -1462,7 +1469,7 @@ public:
 
         const auto metadata = [&] {
             AutoGetCollectionForReadCommand autoColl(opCtx, config.nss);
-            return CollectionShardingState::get(opCtx, config.nss)->getCurrentMetadata();
+            return CollectionShardingState::get(opCtx, config.nss)->getOrphansFilter(opCtx);
         }();
 
         bool shouldHaveData = false;

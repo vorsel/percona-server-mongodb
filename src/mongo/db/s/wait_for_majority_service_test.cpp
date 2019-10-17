@@ -46,11 +46,11 @@ public:
 
         auto replCoord = std::make_unique<repl::ReplicationCoordinatorMock>(service);
 
-        replCoord->setAwaitReplicationReturnValueFunction([this](OperationContext* opCtx,
-                                                                 const repl::OpTime& opTime) {
-            waitForWriteConcernStub(opCtx, opTime);
-            return repl::ReplicationCoordinator::StatusAndDuration(Status::OK(), Milliseconds(0));
-        });
+        replCoord->setAwaitReplicationReturnValueFunction(
+            [this](OperationContext* opCtx, const repl::OpTime& opTime) {
+                auto status = waitForWriteConcernStub(opCtx, opTime);
+                return repl::ReplicationCoordinator::StatusAndDuration(status, Milliseconds(0));
+            });
 
         repl::ReplicationCoordinator::set(service, std::move(replCoord));
     }
@@ -73,23 +73,37 @@ public:
         }
     }
 
-    void waitForWriteConcernStub(OperationContext* opCtx, const repl::OpTime& opTime) {
+    Status waitForWriteConcernStub(OperationContext* opCtx, const repl::OpTime& opTime) {
         stdx::unique_lock<stdx::mutex> lk(_mutex);
 
+        _waitForMajorityCallCount++;
+        _callCountChangedCV.notify_one();
+
         while (!_isTestReady) {
-            if (!opCtx->waitForConditionOrInterruptNoAssert(_isTestReadyCV, lk).isOK()) {
-                return;
+            auto status = opCtx->waitForConditionOrInterruptNoAssert(_isTestReadyCV, lk);
+            if (!status.isOK()) {
+                _isTestReady = false;
+                _finishWaitingOneOpTimeCV.notify_one();
+
+                return status;
             }
         }
 
         _lastOpTimeWaited = opTime;
         _isTestReady = false;
         _finishWaitingOneOpTimeCV.notify_one();
+
+        return Status::OK();
     }
 
     const repl::OpTime& getLastOpTimeWaited() {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
         return _lastOpTimeWaited;
+    }
+
+    void waitForMajorityCallCountGreaterThan(int expectedCount) {
+        stdx::unique_lock lk(_mutex);
+        _callCountChangedCV.wait(lk, [&] { return _waitForMajorityCallCount > expectedCount; });
     }
 
 private:
@@ -98,9 +112,11 @@ private:
     stdx::mutex _mutex;
     stdx::condition_variable _isTestReadyCV;
     stdx::condition_variable _finishWaitingOneOpTimeCV;
+    stdx::condition_variable _callCountChangedCV;
 
     bool _isTestReady{false};
     repl::OpTime _lastOpTimeWaited;
+    int _waitForMajorityCallCount{0};
 };
 
 TEST_F(WaitForMajorityServiceTest, WaitOneOpTime) {
@@ -138,7 +154,16 @@ TEST_F(WaitForMajorityServiceTest, WaitWithOpTimeEarlierThanLowestQueued) {
     repl::OpTime earlierOpTime(Timestamp(1, 0), 2);
 
     auto laterFuture = waitService()->waitUntilMajority(laterOpTime);
+
+    // Wait until the background thread picks up the queued opTime.
+    waitForMajorityCallCountGreaterThan(0);
+
+    // The 2nd request has an earlier time, so it will interrupt 'laterOpTime' and skip the line.
     auto earlierFuture = waitService()->waitUntilMajority(earlierOpTime);
+
+    // Wait for background thread to finish transitioning from waiting on laterOpTime to
+    // earlierOpTime.
+    waitForMajorityCallCountGreaterThan(1);
 
     ASSERT_FALSE(laterFuture.isReady());
     ASSERT_FALSE(earlierFuture.isReady());

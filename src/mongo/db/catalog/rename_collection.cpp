@@ -133,7 +133,8 @@ bool isReplicatedChanged(OperationContext* opCtx,
 Status checkSourceAndTargetNamespaces(OperationContext* opCtx,
                                       const NamespaceString& source,
                                       const NamespaceString& target,
-                                      RenameCollectionOptions options) {
+                                      RenameCollectionOptions options,
+                                      bool targetExistsAllowed) {
 
     auto replCoord = repl::ReplicationCoordinator::get(opCtx);
     if (opCtx->writesAreReplicated() && !replCoord->canAcceptWritesFor(opCtx, source))
@@ -154,7 +155,7 @@ Status checkSourceAndTargetNamespaces(OperationContext* opCtx,
 
     {
         auto& dss = DatabaseShardingState::get(db);
-        auto dssLock = DatabaseShardingState::DSSLock::lock(opCtx, &dss);
+        auto dssLock = DatabaseShardingState::DSSLock::lockShared(opCtx, &dss);
         dss.checkDbVersion(opCtx, dssLock);
     }
 
@@ -184,7 +185,7 @@ Status checkSourceAndTargetNamespaces(OperationContext* opCtx,
         if (isCollectionSharded(opCtx, target))
             return {ErrorCodes::IllegalOperation, "cannot rename to a sharded collection"};
 
-        if (!options.dropTarget)
+        if (!targetExistsAllowed && !options.dropTarget)
             return Status(ErrorCodes::NamespaceExists, "target namespace exists");
     }
 
@@ -199,6 +200,9 @@ Status renameTargetCollectionToTmp(OperationContext* opCtx,
                                    const UUID& targetUUID) {
     repl::UnreplicatedWritesBlock uwb(opCtx);
 
+    // The generated unique collection name is only guaranteed to exist if the database is
+    // exclusively locked.
+    invariant(opCtx->lockState()->isDbLockedForMode(targetDB->name(), LockMode::MODE_X));
     auto tmpNameResult = targetDB->makeUniqueCollectionNamespace(opCtx, "tmp%%%%%.rename");
     if (!tmpNameResult.isOK()) {
         return tmpNameResult.getStatus().withContext(
@@ -344,7 +348,8 @@ Status renameCollectionWithinDB(OperationContext* opCtx,
         sourceLock.emplace(opCtx, source, MODE_X);
     }
 
-    auto status = checkSourceAndTargetNamespaces(opCtx, source, target, options);
+    auto status = checkSourceAndTargetNamespaces(
+        opCtx, source, target, options, /* targetExistsAllowed */ false);
     if (!status.isOK())
         return status;
 
@@ -377,7 +382,8 @@ Status renameCollectionWithinDBForApplyOps(OperationContext* opCtx,
 
     Lock::DBLock dbWriteLock(opCtx, source.db(), MODE_X);
 
-    auto status = checkSourceAndTargetNamespaces(opCtx, source, target, options);
+    auto status = checkSourceAndTargetNamespaces(
+        opCtx, source, target, options, /* targetExistsAllowed */ true);
     if (!status.isOK())
         return status;
 
@@ -414,7 +420,7 @@ Status renameCollectionWithinDBForApplyOps(OperationContext* opCtx,
                 return Status::OK();
             });
         }
-        if (uuidToDrop && uuidToDrop != targetColl->uuid()) {
+        if (!uuidToDrop || (uuidToDrop && uuidToDrop != targetColl->uuid())) {
             // We need to rename the targetColl to a temporary name.
             auto status = renameTargetCollectionToTmp(
                 opCtx, source, sourceColl->uuid().get(), db, target, targetColl->uuid().get());
@@ -471,7 +477,7 @@ Status renameBetweenDBs(OperationContext* opCtx,
 
     {
         auto& dss = DatabaseShardingState::get(sourceDB);
-        auto dssLock = DatabaseShardingState::DSSLock::lock(opCtx, &dss);
+        auto dssLock = DatabaseShardingState::DSSLock::lockShared(opCtx, &dss);
         dss.checkDbVersion(opCtx, dssLock);
     }
 
@@ -535,6 +541,9 @@ Status renameBetweenDBs(OperationContext* opCtx,
         targetDB = DatabaseHolder::get(opCtx)->openDb(opCtx, target.db());
     }
 
+    // The generated unique collection name is only guaranteed to exist if the database is
+    // exclusively locked.
+    invariant(opCtx->lockState()->isDbLockedForMode(targetDB->name(), LockMode::MODE_X));
     auto tmpNameResult =
         targetDB->makeUniqueCollectionNamespace(opCtx, "tmp%%%%%.renameCollection");
     if (!tmpNameResult.isOK()) {
@@ -738,6 +747,12 @@ Status renameCollection(OperationContext* opCtx,
                       str::stream() << "renameCollection() cannot accept a source "
                                        "collection that is in a drop-pending state: "
                                     << source);
+    }
+
+    if (source.isSystemDotViews() || target.isSystemDotViews()) {
+        return Status(
+            ErrorCodes::IllegalOperation,
+            "renaming system.views collection or renaming to system.views is not allowed");
     }
 
     const std::string dropTargetMsg =

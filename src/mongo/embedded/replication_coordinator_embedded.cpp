@@ -355,7 +355,11 @@ Status ReplicationCoordinatorEmbedded::processReplSetInitiate(OperationContext*,
     UASSERT_NOT_IMPLEMENTED;
 }
 
-Status ReplicationCoordinatorEmbedded::abortCatchupIfNeeded() {
+Status ReplicationCoordinatorEmbedded::abortCatchupIfNeeded(PrimaryCatchUpConclusionReason reason) {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
+void ReplicationCoordinatorEmbedded::incrementNumCatchUpOpsIfCatchingUp(int numOps) {
     UASSERT_NOT_IMPLEMENTED;
 }
 
@@ -457,6 +461,10 @@ void ReplicationCoordinatorEmbedded::waitUntilSnapshotCommitted(OperationContext
 }
 
 size_t ReplicationCoordinatorEmbedded::getNumUncommittedSnapshots() {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
+void ReplicationCoordinatorEmbedded::createWMajorityWriteAvailabilityDateWaiter(OpTime opTime) {
     UASSERT_NOT_IMPLEMENTED;
 }
 

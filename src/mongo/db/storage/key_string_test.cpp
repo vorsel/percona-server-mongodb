@@ -41,6 +41,8 @@
 
 #include "mongo/base/owned_pointer_vector.h"
 #include "mongo/base/simple_string_data_comparator.h"
+#include "mongo/bson/bson_depth.h"
+#include "mongo/bson/bson_validate.h"
 #include "mongo/bson/bsonobj_comparator.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/config.h"
@@ -200,6 +202,50 @@ TEST(TypeBitsTest, AppendLotsOfZeroTypeBits) {
     }
     // TypeBits should still be in short encoding format.
     ASSERT(!typeBits.isLongEncoding());
+}
+
+TEST_F(KeyStringTest, TooManyElementsInCompoundKey) {
+    // Construct an illegal KeyString with more than the limit of 32 elements in a compound index
+    // key. Encode 33 kBoolTrue ('o') values.
+    const char* data = "ooooooooooooooooooooooooooooooooo";
+    const size_t size = 33;
+
+    KeyString ks(KeyString::Version::V1);
+    ks.resetFromBuffer(data, size);
+
+    ASSERT_THROWS_CODE(KeyString::toBsonSafe(data, size, ALL_ASCENDING, ks.getTypeBits()),
+                       AssertionException,
+                       ErrorCodes::Overflow);
+}
+
+TEST_F(KeyStringTest, ExceededBSONDepth) {
+    KeyString ks(KeyString::Version::V1);
+
+    // Construct an illegal KeyString encoding with excessively nested BSON arrays '80' (P).
+    const auto nestedArr = std::string(BSONDepth::getMaxAllowableDepth() + 1, 'P');
+    ks.resetFromBuffer(nestedArr.c_str(), nestedArr.size());
+    ASSERT_THROWS_CODE(
+        KeyString::toBsonSafe(ks.getBuffer(), ks.getSize(), ALL_ASCENDING, ks.getTypeBits()),
+        AssertionException,
+        ErrorCodes::Overflow);
+
+    // Construct an illegal BSON object with excessive nesting.
+    BSONObj nestedObj;
+    for (unsigned i = 0; i < BSONDepth::getMaxAllowableDepth() + 1; i++) {
+        nestedObj = BSON("" << nestedObj);
+    }
+    // This BSON object should not be valid.
+    auto validateStatus =
+        validateBSON(nestedObj.objdata(), nestedObj.objsize(), BSONVersion::kV1_1);
+    ASSERT_EQ(ErrorCodes::Overflow, validateStatus.code());
+
+    // Construct a KeyString from the invalid BSON, and confirm that it fails to convert back to
+    // BSON.
+    ks.resetToKey(nestedObj, ALL_ASCENDING, RecordId());
+    ASSERT_THROWS_CODE(
+        KeyString::toBsonSafe(ks.getBuffer(), ks.getSize(), ALL_ASCENDING, ks.getTypeBits()),
+        AssertionException,
+        ErrorCodes::Overflow);
 }
 
 TEST_F(KeyStringTest, Simple1) {
@@ -476,6 +522,23 @@ TEST_F(KeyStringTest, DoubleInvalidIntegerPartV0) {
         mongo::KeyString::toBsonSafe(data, size, mongo::Ordering::make(mongo::BSONObj()), tb),
         AssertionException,
         31209);
+}
+
+TEST_F(KeyStringTest, InvalidInfinityDecimalV0) {
+    // Encode a Decimal positive infinity in a V1 keystring.
+    mongo::KeyString ks(
+        mongo::KeyString::Version::V1, BSON("" << Decimal128::kPositiveInfinity), ALL_ASCENDING);
+
+    // Construct V0 type bits that indicate a NumberDecimal has been encoded.
+    mongo::KeyString::TypeBits tb(mongo::KeyString::Version::V0);
+    tb.appendNumberDecimal();
+
+    // The conversion to BSON will fail because Decimal positive infinity cannot be encoded with V0
+    // type bits.
+    ASSERT_THROWS_CODE(
+        mongo::KeyString::toBsonSafe(ks.getBuffer(), ks.getSize(), ALL_ASCENDING, tb),
+        AssertionException,
+        31231);
 }
 
 TEST_F(KeyStringTest, LotsOfNumbers1) {

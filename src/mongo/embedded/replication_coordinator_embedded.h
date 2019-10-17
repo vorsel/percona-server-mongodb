@@ -247,9 +247,13 @@ public:
 
     size_t getNumUncommittedSnapshots() override;
 
+    virtual void createWMajorityWriteAvailabilityDateWaiter(repl::OpTime opTime) override;
+
     Status stepUpIfEligible(bool skipDryRun) override;
 
-    Status abortCatchupIfNeeded() override;
+    Status abortCatchupIfNeeded(PrimaryCatchUpConclusionReason reason) override;
+
+    void incrementNumCatchUpOpsIfCatchingUp(int numOps) override;
 
     void signalDropPendingCollectionsRemovedFromStorage() final;
 

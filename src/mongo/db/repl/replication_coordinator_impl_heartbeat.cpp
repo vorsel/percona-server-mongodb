@@ -48,6 +48,7 @@
 #include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
 #include "mongo/db/repl/replication_coordinator_impl.h"
+#include "mongo/db/repl/replication_metrics.h"
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/topology_coordinator.h"
 #include "mongo/db/repl/vote_requester.h"
@@ -194,7 +195,9 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
             const auto isFCV42 = serverGlobalParams.featureCompatibility.isVersionInitialized() &&
                 serverGlobalParams.featureCompatibility.getVersion() ==
                     ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42;
-            if (_getMemberState_inlock().arbiter() || isFCV42) {
+            if (_getMemberState_inlock().arbiter() ||
+                (isFCV42 && !_getMemberState_inlock().startup() &&
+                 !_getMemberState_inlock().startup2())) {
                 // The node that sent the heartbeat is not guaranteed to be our sync source.
                 const bool fromSyncSource = false;
                 _advanceCommitPoint(
@@ -301,8 +304,7 @@ stdx::unique_lock<stdx::mutex> ReplicationCoordinatorImpl::_handleHeartbeatRespo
                 LOG_FOR_ELECTION(0) << "Scheduling priority takeover at " << _priorityTakeoverWhen;
                 _priorityTakeoverCbh = _scheduleWorkAt(
                     _priorityTakeoverWhen, [=](const mongo::executor::TaskExecutor::CallbackArgs&) {
-                        _startElectSelfIfEligibleV1(
-                            TopologyCoordinator::StartElectionReason::kPriorityTakeover);
+                        _startElectSelfIfEligibleV1(StartElectionReasonEnum::kPriorityTakeover);
                     });
             }
             break;
@@ -315,8 +317,7 @@ stdx::unique_lock<stdx::mutex> ReplicationCoordinatorImpl::_handleHeartbeatRespo
                 LOG_FOR_ELECTION(0) << "Scheduling catchup takeover at " << _catchupTakeoverWhen;
                 _catchupTakeoverCbh = _scheduleWorkAt(
                     _catchupTakeoverWhen, [=](const mongo::executor::TaskExecutor::CallbackArgs&) {
-                        _startElectSelfIfEligibleV1(
-                            TopologyCoordinator::StartElectionReason::kCatchupTakeover);
+                        _startElectSelfIfEligibleV1(StartElectionReasonEnum::kCatchupTakeover);
                     });
             }
             break;
@@ -422,6 +423,11 @@ void ReplicationCoordinatorImpl::_stepDownFinish(
 
     lk.lock();
     _updateAndLogStatsOnStepDown(&arsd);
+
+    // Clear the node's election candidate metrics since it is no longer primary.
+    ReplicationMetrics::get(opCtx.get()).clearElectionCandidateMetrics();
+    _wMajorityWriteAvailabilityWaiter.reset();
+
     _topCoord->finishUnconditionalStepDown();
 
     const auto action = _updateMemberStateFromTopologyCoordinator(lk, opCtx.get());
@@ -644,6 +650,10 @@ void ReplicationCoordinatorImpl::_heartbeatReconfigFinish(
 
             lk.lock();
             _updateAndLogStatsOnStepDown(&arsd.get());
+
+            // Clear the node's election candidate metrics since it is no longer primary.
+            ReplicationMetrics::get(opCtx.get()).clearElectionCandidateMetrics();
+            _wMajorityWriteAvailabilityWaiter.reset();
         } else {
             // Release the rstl lock as the node might have stepped down due to
             // other unconditional step down code paths like learning new term via heartbeat &
@@ -863,15 +873,14 @@ void ReplicationCoordinatorImpl::_cancelAndRescheduleElectionTimeout_inlock() {
     _handleElectionTimeoutWhen = when;
     _handleElectionTimeoutCbh =
         _scheduleWorkAt(when, [=](const mongo::executor::TaskExecutor::CallbackArgs&) {
-            _startElectSelfIfEligibleV1(TopologyCoordinator::StartElectionReason::kElectionTimeout);
+            _startElectSelfIfEligibleV1(StartElectionReasonEnum::kElectionTimeout);
         });
 }
 
-void ReplicationCoordinatorImpl::_startElectSelfIfEligibleV1(
-    TopologyCoordinator::StartElectionReason reason) {
+void ReplicationCoordinatorImpl::_startElectSelfIfEligibleV1(StartElectionReasonEnum reason) {
     stdx::lock_guard<stdx::mutex> lock(_mutex);
     // If it is not a single node replica set, no need to start an election after stepdown timeout.
-    if (reason == TopologyCoordinator::StartElectionReason::kSingleNodePromptElection &&
+    if (reason == StartElectionReasonEnum::kSingleNodePromptElection &&
         _rsConfig.getNumMembers() != 1) {
         return;
     }
@@ -891,52 +900,56 @@ void ReplicationCoordinatorImpl::_startElectSelfIfEligibleV1(
     const auto status = _topCoord->becomeCandidateIfElectable(_replExecutor->now(), reason);
     if (!status.isOK()) {
         switch (reason) {
-            case TopologyCoordinator::StartElectionReason::kElectionTimeout:
+            case StartElectionReasonEnum::kElectionTimeout:
                 LOG_FOR_ELECTION(0)
                     << "Not starting an election, since we are not electable due to: "
                     << status.reason();
                 break;
-            case TopologyCoordinator::StartElectionReason::kPriorityTakeover:
+            case StartElectionReasonEnum::kPriorityTakeover:
                 LOG_FOR_ELECTION(0) << "Not starting an election for a priority takeover, "
                                     << "since we are not electable due to: " << status.reason();
                 break;
-            case TopologyCoordinator::StartElectionReason::kStepUpRequest:
-            case TopologyCoordinator::StartElectionReason::kStepUpRequestSkipDryRun:
+            case StartElectionReasonEnum::kStepUpRequest:
+            case StartElectionReasonEnum::kStepUpRequestSkipDryRun:
                 LOG_FOR_ELECTION(0) << "Not starting an election for a replSetStepUp request, "
                                     << "since we are not electable due to: " << status.reason();
                 break;
-            case TopologyCoordinator::StartElectionReason::kCatchupTakeover:
+            case StartElectionReasonEnum::kCatchupTakeover:
                 LOG_FOR_ELECTION(0) << "Not starting an election for a catchup takeover, "
                                     << "since we are not electable due to: " << status.reason();
                 break;
-            case TopologyCoordinator::StartElectionReason::kSingleNodePromptElection:
+            case StartElectionReasonEnum::kSingleNodePromptElection:
                 LOG_FOR_ELECTION(0)
                     << "Not starting an election for a single node replica set prompt election, "
                     << "since we are not electable due to: " << status.reason();
                 break;
+            default:
+                MONGO_UNREACHABLE;
         }
         return;
     }
 
     switch (reason) {
-        case TopologyCoordinator::StartElectionReason::kElectionTimeout:
+        case StartElectionReasonEnum::kElectionTimeout:
             LOG_FOR_ELECTION(0) << "Starting an election, since we've seen no PRIMARY in the past "
                                 << _rsConfig.getElectionTimeoutPeriod();
             break;
-        case TopologyCoordinator::StartElectionReason::kPriorityTakeover:
+        case StartElectionReasonEnum::kPriorityTakeover:
             LOG_FOR_ELECTION(0) << "Starting an election for a priority takeover";
             break;
-        case TopologyCoordinator::StartElectionReason::kStepUpRequest:
-        case TopologyCoordinator::StartElectionReason::kStepUpRequestSkipDryRun:
+        case StartElectionReasonEnum::kStepUpRequest:
+        case StartElectionReasonEnum::kStepUpRequestSkipDryRun:
             LOG_FOR_ELECTION(0) << "Starting an election due to step up request";
             break;
-        case TopologyCoordinator::StartElectionReason::kCatchupTakeover:
+        case StartElectionReasonEnum::kCatchupTakeover:
             LOG_FOR_ELECTION(0) << "Starting an election for a catchup takeover";
             break;
-        case TopologyCoordinator::StartElectionReason::kSingleNodePromptElection:
+        case StartElectionReasonEnum::kSingleNodePromptElection:
             LOG_FOR_ELECTION(0)
                 << "Starting an election due to single node replica set prompt election";
             break;
+        default:
+            MONGO_UNREACHABLE;
     }
 
     _startElectSelfV1_inlock(reason);

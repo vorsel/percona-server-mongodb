@@ -61,6 +61,7 @@ function RollbackTest(name = "RollbackTest", replSet) {
     const SIGTERM = 15;
     const kNumDataBearingNodes = 3;
     const kElectableNodes = 2;
+    const kForeverSecs = 24 * 60 * 60;
 
     let rst;
     let curPrimary;
@@ -240,6 +241,9 @@ function RollbackTest(name = "RollbackTest", replSet) {
 
         log(`Rollback on ${curSecondary.host} (if needed) and awaitReplication completed`, true);
 
+        // Unfreeze the node if it was previously frozen, so that it can run for the election.
+        assert.commandWorked(curSecondary.adminCommand({replSetFreeze: 0}));
+
         // We call transition to steady state ops after awaiting replication has finished,
         // otherwise it could be confusing to see operations being replicated when we're already
         // in rollback complete state.
@@ -361,6 +365,12 @@ function RollbackTest(name = "RollbackTest", replSet) {
     this.transitionToSyncSourceOperationsDuringRollback = function() {
         transitionIfAllowed(State.kSyncSourceOpsDuringRollback);
 
+        // If the nodes are restarted after the rollback node is able to rollback successfully and
+        // catch up to curPrimary's oplog, then the rollback node can become the new primary.
+        // If so, it can lead to unplanned state transitions, like unconditional step down, during
+        // the test. To avoid those problems, prevent rollback node from starting an election.
+        assert.commandWorked(curSecondary.adminCommand({replSetFreeze: kForeverSecs}));
+
         log(`Reconnecting the secondary ${curSecondary.host} so it'll go into rollback`);
         // Reconnect the rollback node to the current primary, which is the node we want to sync
         // from. If we reconnect to both the current primary and the tiebreaker node, the rollback
@@ -423,9 +433,45 @@ function RollbackTest(name = "RollbackTest", replSet) {
         log(`Restarting node ${hostName}`);
         rst.start(nodeId, startOptions, true /* restart */);
 
-        // Ensure that the primary is ready to take operations before continuing. If both nodes are
-        // connected to the tiebreaker node, the primary may switch.
+        // Freeze the node if the restarted node is the rollback node.
+        if (curState === State.kSyncSourceOpsDuringRollback &&
+            rst.getNodeId(curSecondary) === nodeId) {
+            assert.soon(() => {
+                try {
+                    // Try stepping down the rollback node if it became the primary after its
+                    // restart, as it might have caught up with the original primary and facing
+                    // arbitrary machine/network slowness.
+                    curSecondary.adminCommand({"replSetStepDown": kForeverSecs, "force": true});
+                    // Prevent rollback node from running election. There is a chance that this
+                    // node might have started running election or became primary after
+                    // 'replSetStepDown' cmd, so 'replSetFreeze' cmd can fail.
+                    assert.commandWorked(
+                        curSecondary.adminCommand({"replSetFreeze": kForeverSecs}));
+                    return true;
+                } catch (e) {
+                    // Network error can happen if the node simultaneously tries to transition to
+                    // ROLLBACK state.
+                    if (isNetworkError(e) || e.code === ErrorCodes.NotSecondary ||
+                        e.code === ErrorCodes.NotYetInitialized) {
+                        log('Failed to freeze the node.' + tojson(e));
+                        return false;
+                    }
+
+                    throw e;
+                }
+            }, `Failed to run replSetFreeze cmd on ${curSecondary.host}`);
+        }
+
+        const oldPrimary = curPrimary;
+        // Wait for the new primary to be elected and ready to take operations before continuing.
         curPrimary = rst.getPrimary();
+
+        // The primary can change after node restarts only if all the 3 nodes are connected to each
+        // other.
+        if (curState !== State.kSteadyStateOps) {
+            assert.eq(curPrimary, oldPrimary);
+        }
+
         curSecondary = rst.getSecondary();
         assert.neq(curPrimary, curSecondary);
     };

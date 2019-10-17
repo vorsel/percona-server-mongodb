@@ -55,9 +55,7 @@
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/idempotency_test_fixture.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/oplog_buffer_blocking_queue.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/sync_tail.h"
@@ -397,8 +395,9 @@ DEATH_TEST_F(SyncTailTest, MultiApplyAbortsWhenNoOperationsAreGiven, "!ops.empty
                       getConsistencyMarkers(),
                       getStorageInterface(),
                       noopApplyOperationFn,
-                      writerPool.get());
-    syncTail.multiApply(_opCtx.get(), {}, boost::none).getStatus().ignore();
+                      writerPool.get(),
+                      OplogApplier::Options(OplogApplication::Mode::kSecondary));
+    syncTail.multiApply(_opCtx.get(), {}).getStatus().ignore();
 }
 
 bool _testOplogEntryIsForCappedCollection(OperationContext* opCtx,
@@ -422,9 +421,13 @@ bool _testOplogEntryIsForCappedCollection(OperationContext* opCtx,
     auto op = makeInsertDocumentOplogEntry({Timestamp(Seconds(1), 0), 1LL}, nss, BSON("a" << 1));
     ASSERT_FALSE(op.isForCappedCollection);
 
-    SyncTail syncTail(
-        nullptr, consistencyMarkers, storageInterface, applyOperationFn, writerPool.get());
-    auto lastOpTime = unittest::assertGet(syncTail.multiApply(opCtx, {op}, boost::none));
+    SyncTail syncTail(nullptr,
+                      consistencyMarkers,
+                      storageInterface,
+                      applyOperationFn,
+                      writerPool.get(),
+                      OplogApplier::Options(OplogApplication::Mode::kSecondary));
+    auto lastOpTime = unittest::assertGet(syncTail.multiApply(opCtx, {op}));
     ASSERT_EQUALS(op.getOpTime(), lastOpTime);
 
     ASSERT_EQUALS(1U, operationsApplied.size());
@@ -458,7 +461,12 @@ TEST_F(SyncTailTest, MultiSyncApplyUsesSyncApplyToApplyOperation) {
 
     MultiApplier::OperationPtrs ops = {&op};
     WorkerMultikeyPathInfo pathInfo;
-    SyncTail syncTail(nullptr, nullptr, nullptr, {}, nullptr);
+    SyncTail syncTail(nullptr,
+                      nullptr,
+                      nullptr,
+                      {},
+                      nullptr,
+                      OplogApplier::Options(OplogApplication::Mode::kSecondary));
     ASSERT_OK(multiSyncApply(_opCtx.get(), &ops, &syncTail, &pathInfo));
     // Collection should be created after SyncTail::syncApply() processes operation.
     ASSERT_TRUE(AutoGetCollectionForReadCommand(_opCtx.get(), nss).getCollection());
@@ -567,16 +575,20 @@ private:
 };
 
 TEST_F(MultiOplogEntrySyncTailTest, MultiApplyUnpreparedTransactionSeparate) {
-    SyncTail syncTail(
-        nullptr, getConsistencyMarkers(), getStorageInterface(), multiSyncApply, _writerPool.get());
+    SyncTail syncTail(nullptr,
+                      getConsistencyMarkers(),
+                      getStorageInterface(),
+                      multiSyncApply,
+                      _writerPool.get(),
+                      OplogApplier::Options(OplogApplication::Mode::kSecondary));
 
     // Apply a batch with only the first operation.  This should result in the first oplog entry
     // being put in the oplog and updating the transaction table, but not actually being applied
     // because they are part of a pending transaction.
     const auto expectedStartOpTime = _insertOp1->getOpTime();
-    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_insertOp1}, boost::none));
+    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_insertOp1}));
     ASSERT_EQ(1U, oplogDocs().size());
-    ASSERT_BSONOBJ_EQ(oplogDocs().back(), _insertOp1->raw);
+    ASSERT_BSONOBJ_EQ(oplogDocs().back(), _insertOp1->getRaw());
     ASSERT_TRUE(_insertedDocs[_nss1].empty());
     ASSERT_TRUE(_insertedDocs[_nss2].empty());
     checkTxnTable(_lsid,
@@ -589,9 +601,9 @@ TEST_F(MultiOplogEntrySyncTailTest, MultiApplyUnpreparedTransactionSeparate) {
     // Apply a batch with only the second operation.  This should result in the second oplog entry
     // being put in the oplog, but with no effect because the operation is part of a pending
     // transaction.
-    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_insertOp2}, boost::none));
+    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_insertOp2}));
     ASSERT_EQ(2U, oplogDocs().size());
-    ASSERT_BSONOBJ_EQ(oplogDocs().back(), _insertOp2->raw);
+    ASSERT_BSONOBJ_EQ(oplogDocs().back(), _insertOp2->getRaw());
     ASSERT_TRUE(_insertedDocs[_nss1].empty());
     ASSERT_TRUE(_insertedDocs[_nss2].empty());
     // The transaction table should not have been updated for partialTxn operations that are not the
@@ -605,11 +617,11 @@ TEST_F(MultiOplogEntrySyncTailTest, MultiApplyUnpreparedTransactionSeparate) {
 
     // Apply a batch with only the commit.  This should result in the commit being put in the
     // oplog, and the two previous entries being applied.
-    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_commitOp}, boost::none));
+    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_commitOp}));
     ASSERT_EQ(3U, oplogDocs().size());
     ASSERT_EQ(1U, _insertedDocs[_nss1].size());
     ASSERT_EQ(2U, _insertedDocs[_nss2].size());
-    ASSERT_BSONOBJ_EQ(oplogDocs().back(), _commitOp->raw);
+    ASSERT_BSONOBJ_EQ(oplogDocs().back(), _commitOp->getRaw());
     checkTxnTable(_lsid,
                   _txnNum,
                   _commitOp->getOpTime(),
@@ -621,7 +633,7 @@ TEST_F(MultiOplogEntrySyncTailTest, MultiApplyUnpreparedTransactionSeparate) {
 TEST_F(MultiOplogEntrySyncTailTest, MultiApplyUnpreparedTransactionAllAtOnce) {
     // Skipping writes to oplog proves we're testing the code path which does not rely on reading
     // the oplog.
-    OplogApplier::Options applierOpts;
+    OplogApplier::Options applierOpts(OplogApplication::Mode::kSecondary);
     applierOpts.skipWritesToOplog = true;
     SyncTail syncTail(nullptr,
                       getConsistencyMarkers(),
@@ -632,8 +644,7 @@ TEST_F(MultiOplogEntrySyncTailTest, MultiApplyUnpreparedTransactionAllAtOnce) {
 
     // Apply both inserts and the commit in a single batch.  We expect no oplog entries to
     // be inserted (because we've set skipWritesToOplog), and both entries to be committed.
-    ASSERT_OK(
-        syncTail.multiApply(_opCtx.get(), {*_insertOp1, *_insertOp2, *_commitOp}, boost::none));
+    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_insertOp1, *_insertOp2, *_commitOp}));
     ASSERT_EQ(0U, oplogDocs().size());
     ASSERT_EQ(1U, _insertedDocs[_nss1].size());
     ASSERT_EQ(2U, _insertedDocs[_nss2].size());
@@ -677,13 +688,17 @@ TEST_F(MultiOplogEntrySyncTailTest, MultiApplyUnpreparedTransactionTwoBatches) {
                                                                   StmtId(4),
                                                                   insertOps.back().getOpTime());
 
-    SyncTail syncTail(
-        nullptr, getConsistencyMarkers(), getStorageInterface(), multiSyncApply, _writerPool.get());
+    SyncTail syncTail(nullptr,
+                      getConsistencyMarkers(),
+                      getStorageInterface(),
+                      multiSyncApply,
+                      _writerPool.get(),
+                      OplogApplier::Options(OplogApplication::Mode::kSecondary));
 
     // Insert the first entry in its own batch.  This should result in the oplog entry being written
     // but the entry should not be applied as it is part of a pending transaction.
     const auto expectedStartOpTime = insertOps[0].getOpTime();
-    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {insertOps[0]}, boost::none));
+    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {insertOps[0]}));
     ASSERT_EQ(1U, oplogDocs().size());
     ASSERT_EQ(0U, _insertedDocs[_nss1].size());
     ASSERT_EQ(0U, _insertedDocs[_nss2].size());
@@ -696,8 +711,8 @@ TEST_F(MultiOplogEntrySyncTailTest, MultiApplyUnpreparedTransactionTwoBatches) {
 
     // Insert the rest of the entries, including the commit.  These entries should be added to the
     // oplog, and all the entries including the first should be applied.
-    ASSERT_OK(syncTail.multiApply(
-        _opCtx.get(), {insertOps[1], insertOps[2], insertOps[3], commitOp}, boost::none));
+    ASSERT_OK(
+        syncTail.multiApply(_opCtx.get(), {insertOps[1], insertOps[2], insertOps[3], commitOp}));
     ASSERT_EQ(5U, oplogDocs().size());
     ASSERT_EQ(3U, _insertedDocs[_nss1].size());
     ASSERT_EQ(1U, _insertedDocs[_nss2].size());
@@ -789,8 +804,12 @@ TEST_F(MultiOplogEntrySyncTailTest, MultiApplyTwoTransactionsOneBatch) {
                                                                    StmtId(2),
                                                                    insertOps2.back().getOpTime());
 
-    SyncTail syncTail(
-        nullptr, getConsistencyMarkers(), getStorageInterface(), multiSyncApply, _writerPool.get());
+    SyncTail syncTail(nullptr,
+                      getConsistencyMarkers(),
+                      getStorageInterface(),
+                      multiSyncApply,
+                      _writerPool.get(),
+                      OplogApplier::Options(OplogApplication::Mode::kSecondary));
 
     // Note the insert counter so we can check it later.  It is necessary to use opCounters as
     // inserts are idempotent so we will not detect duplicate inserts just by checking inserts in
@@ -800,8 +819,7 @@ TEST_F(MultiOplogEntrySyncTailTest, MultiApplyTwoTransactionsOneBatch) {
     // once.
     ASSERT_OK(syncTail.multiApply(
         _opCtx.get(),
-        {insertOps1[0], insertOps1[1], commitOp1, insertOps2[0], insertOps2[1], commitOp2},
-        boost::none));
+        {insertOps1[0], insertOps1[1], commitOp1, insertOps2[0], insertOps2[1], commitOp2}));
     ASSERT_EQ(6U, oplogDocs().size());
     ASSERT_EQ(4, replOpCounters.getInsert()->load() - insertsBefore);
     ASSERT_EQ(4U, _insertedDocs[_nss1].size());
@@ -893,17 +911,21 @@ private:
 };
 
 TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyPreparedTransactionSteadyState) {
-    SyncTail syncTail(
-        nullptr, getConsistencyMarkers(), getStorageInterface(), multiSyncApply, _writerPool.get());
+    SyncTail syncTail(nullptr,
+                      getConsistencyMarkers(),
+                      getStorageInterface(),
+                      multiSyncApply,
+                      _writerPool.get(),
+                      OplogApplier::Options(OplogApplication::Mode::kSecondary));
 
     // Apply a batch with the insert operations.  This should result in the oplog entries
     // being put in the oplog and updating the transaction table, but not actually being applied
     // because they are part of a pending transaction.
     const auto expectedStartOpTime = _insertOp1->getOpTime();
-    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_insertOp1, *_insertOp2}, boost::none));
+    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_insertOp1, *_insertOp2}));
     ASSERT_EQ(2U, oplogDocs().size());
-    ASSERT_BSONOBJ_EQ(_insertOp1->raw, oplogDocs()[0]);
-    ASSERT_BSONOBJ_EQ(_insertOp2->raw, oplogDocs()[1]);
+    ASSERT_BSONOBJ_EQ(_insertOp1->getRaw(), oplogDocs()[0]);
+    ASSERT_BSONOBJ_EQ(_insertOp2->getRaw(), oplogDocs()[1]);
     ASSERT_TRUE(_insertedDocs[_nss1].empty());
     ASSERT_TRUE(_insertedDocs[_nss2].empty());
     checkTxnTable(_lsid,
@@ -916,9 +938,9 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyPreparedTransactionStea
     // Apply a batch with only the prepare.  This should result in the prepare being put in the
     // oplog, and the two previous entries being applied (but in a transaction) along with the
     // nested insert in the prepare oplog entry.
-    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_prepareWithPrevOp}, boost::none));
+    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_prepareWithPrevOp}));
     ASSERT_EQ(3U, oplogDocs().size());
-    ASSERT_BSONOBJ_EQ(_prepareWithPrevOp->raw, oplogDocs().back());
+    ASSERT_BSONOBJ_EQ(_prepareWithPrevOp->getRaw(), oplogDocs().back());
     ASSERT_EQ(1U, _insertedDocs[_nss1].size());
     ASSERT_EQ(2U, _insertedDocs[_nss2].size());
     checkTxnTable(_lsid,
@@ -930,8 +952,8 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyPreparedTransactionStea
 
     // Apply a batch with only the commit.  This should result in the commit being put in the
     // oplog, and the three previous entries being committed.
-    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_commitPrepareWithPrevOp}, boost::none));
-    ASSERT_BSONOBJ_EQ(_commitPrepareWithPrevOp->raw, oplogDocs().back());
+    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_commitPrepareWithPrevOp}));
+    ASSERT_BSONOBJ_EQ(_commitPrepareWithPrevOp->getRaw(), oplogDocs().back());
     ASSERT_EQ(1U, _insertedDocs[_nss1].size());
     ASSERT_EQ(2U, _insertedDocs[_nss2].size());
     checkTxnTable(_lsid,
@@ -943,14 +965,18 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyPreparedTransactionStea
 }
 
 TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyAbortPreparedTransactionCheckTxnTable) {
-    SyncTail syncTail(
-        nullptr, getConsistencyMarkers(), getStorageInterface(), multiSyncApply, _writerPool.get());
+    SyncTail syncTail(nullptr,
+                      getConsistencyMarkers(),
+                      getStorageInterface(),
+                      multiSyncApply,
+                      _writerPool.get(),
+                      OplogApplier::Options(OplogApplication::Mode::kSecondary));
 
     // Apply a batch with the insert operations.  This should result in the oplog entries
     // being put in the oplog and updating the transaction table, but not actually being applied
     // because they are part of a pending transaction.
     const auto expectedStartOpTime = _insertOp1->getOpTime();
-    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_insertOp1, *_insertOp2}, boost::none));
+    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_insertOp1, *_insertOp2}));
     checkTxnTable(_lsid,
                   _txnNum,
                   _insertOp1->getOpTime(),
@@ -961,7 +987,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyAbortPreparedTransactio
     // Apply a batch with only the prepare.  This should result in the prepare being put in the
     // oplog, and the two previous entries being applied (but in a transaction) along with the
     // nested insert in the prepare oplog entry.
-    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_prepareWithPrevOp}, boost::none));
+    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_prepareWithPrevOp}));
     checkTxnTable(_lsid,
                   _txnNum,
                   _prepareWithPrevOp->getOpTime(),
@@ -971,8 +997,8 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyAbortPreparedTransactio
 
     // Apply a batch with only the abort.  This should result in the abort being put in the
     // oplog and the transaction table being updated accordingly.
-    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_abortPrepareWithPrevOp}, boost::none));
-    ASSERT_BSONOBJ_EQ(_abortPrepareWithPrevOp->raw, oplogDocs().back());
+    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_abortPrepareWithPrevOp}));
+    ASSERT_BSONOBJ_EQ(_abortPrepareWithPrevOp->getRaw(), oplogDocs().back());
     ASSERT_EQ(1U, _insertedDocs[_nss1].size());
     ASSERT_EQ(2U, _insertedDocs[_nss2].size());
     checkTxnTable(_lsid,
@@ -995,11 +1021,10 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyPreparedTransactionInit
     // being put in the oplog and updating the transaction table, but not actually being applied
     // because they are part of a pending transaction.
     const auto expectedStartOpTime = _insertOp1->getOpTime();
-    ASSERT_OK(syncTail.multiApply(
-        _opCtx.get(), {*_insertOp1, *_insertOp2}, OplogApplication::Mode::kInitialSync));
+    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_insertOp1, *_insertOp2}));
     ASSERT_EQ(2U, oplogDocs().size());
-    ASSERT_BSONOBJ_EQ(_insertOp1->raw, oplogDocs()[0]);
-    ASSERT_BSONOBJ_EQ(_insertOp2->raw, oplogDocs()[1]);
+    ASSERT_BSONOBJ_EQ(_insertOp1->getRaw(), oplogDocs()[0]);
+    ASSERT_BSONOBJ_EQ(_insertOp2->getRaw(), oplogDocs()[1]);
     ASSERT_TRUE(_insertedDocs[_nss1].empty());
     ASSERT_TRUE(_insertedDocs[_nss2].empty());
     checkTxnTable(_lsid,
@@ -1011,10 +1036,9 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyPreparedTransactionInit
 
     // Apply a batch with only the prepare applyOps. This should result in the prepare being put in
     // the oplog, but, since this is initial sync, nothing else.
-    ASSERT_OK(syncTail.multiApply(
-        _opCtx.get(), {*_prepareWithPrevOp}, OplogApplication::Mode::kInitialSync));
+    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_prepareWithPrevOp}));
     ASSERT_EQ(3U, oplogDocs().size());
-    ASSERT_BSONOBJ_EQ(_prepareWithPrevOp->raw, oplogDocs().back());
+    ASSERT_BSONOBJ_EQ(_prepareWithPrevOp->getRaw(), oplogDocs().back());
     ASSERT_TRUE(_insertedDocs[_nss1].empty());
     ASSERT_TRUE(_insertedDocs[_nss2].empty());
     checkTxnTable(_lsid,
@@ -1026,9 +1050,8 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyPreparedTransactionInit
 
     // Apply a batch with only the commit.  This should result in the commit being put in the
     // oplog, and the three previous entries being applied.
-    ASSERT_OK(syncTail.multiApply(
-        _opCtx.get(), {*_commitPrepareWithPrevOp}, OplogApplication::Mode::kInitialSync));
-    ASSERT_BSONOBJ_EQ(_commitPrepareWithPrevOp->raw, oplogDocs().back());
+    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_commitPrepareWithPrevOp}));
+    ASSERT_BSONOBJ_EQ(_commitPrepareWithPrevOp->getRaw(), oplogDocs().back());
     ASSERT_EQ(1U, _insertedDocs[_nss1].size());
     ASSERT_EQ(2U, _insertedDocs[_nss2].size());
     checkTxnTable(_lsid,
@@ -1062,7 +1085,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyPreparedTransactionReco
     // Apply a batch with the insert operations.  This should have no effect, because this is
     // recovery.
     const auto expectedStartOpTime = _insertOp1->getOpTime();
-    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_insertOp1, *_insertOp2}, boost::none));
+    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_insertOp1, *_insertOp2}));
     ASSERT_TRUE(oplogDocs().empty());
     ASSERT_TRUE(_insertedDocs[_nss1].empty());
     ASSERT_TRUE(_insertedDocs[_nss2].empty());
@@ -1075,7 +1098,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyPreparedTransactionReco
 
     // Apply a batch with only the prepare applyOps. This should have no effect, since this is
     // recovery.
-    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_prepareWithPrevOp}, boost::none));
+    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_prepareWithPrevOp}));
     ASSERT_TRUE(oplogDocs().empty());
     ASSERT_TRUE(_insertedDocs[_nss1].empty());
     ASSERT_TRUE(_insertedDocs[_nss2].empty());
@@ -1088,7 +1111,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyPreparedTransactionReco
 
     // Apply a batch with only the commit.  This should result in the the three previous entries
     // being applied.
-    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_commitPrepareWithPrevOp}, boost::none));
+    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_commitPrepareWithPrevOp}));
     ASSERT_TRUE(oplogDocs().empty());
     ASSERT_EQ(1U, _insertedDocs[_nss1].size());
     ASSERT_EQ(2U, _insertedDocs[_nss2].size());
@@ -1101,16 +1124,20 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyPreparedTransactionReco
 }
 
 TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplySingleApplyOpsPreparedTransaction) {
-    SyncTail syncTail(
-        nullptr, getConsistencyMarkers(), getStorageInterface(), multiSyncApply, _writerPool.get());
+    SyncTail syncTail(nullptr,
+                      getConsistencyMarkers(),
+                      getStorageInterface(),
+                      multiSyncApply,
+                      _writerPool.get(),
+                      OplogApplier::Options(OplogApplication::Mode::kSecondary));
 
     const auto expectedStartOpTime = _singlePrepareApplyOp->getOpTime();
 
     // Apply a batch with only the prepare applyOps. This should result in the prepare being put in
     // the oplog, and the nested insert being applied (but in a transaction).
-    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_singlePrepareApplyOp}, boost::none));
+    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_singlePrepareApplyOp}));
     ASSERT_EQ(1U, oplogDocs().size());
-    ASSERT_BSONOBJ_EQ(_singlePrepareApplyOp->raw, oplogDocs().back());
+    ASSERT_BSONOBJ_EQ(_singlePrepareApplyOp->getRaw(), oplogDocs().back());
     ASSERT_EQ(1U, _insertedDocs[_nss1].size());
     checkTxnTable(_lsid,
                   _txnNum,
@@ -1121,8 +1148,8 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplySingleApplyOpsPreparedT
 
     // Apply a batch with only the commit.  This should result in the commit being put in the
     // oplog, and prepared insert being committed.
-    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_commitSinglePrepareApplyOp}, boost::none));
-    ASSERT_BSONOBJ_EQ(_commitSinglePrepareApplyOp->raw, oplogDocs().back());
+    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_commitSinglePrepareApplyOp}));
+    ASSERT_BSONOBJ_EQ(_commitSinglePrepareApplyOp->getRaw(), oplogDocs().back());
     ASSERT_EQ(1U, _insertedDocs[_nss1].size());
     ASSERT_TRUE(_insertedDocs[_nss2].empty());
     checkTxnTable(_lsid,
@@ -1134,8 +1161,12 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplySingleApplyOpsPreparedT
 }
 
 TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyEmptyApplyOpsPreparedTransaction) {
-    SyncTail syncTail(
-        nullptr, getConsistencyMarkers(), getStorageInterface(), multiSyncApply, _writerPool.get());
+    SyncTail syncTail(nullptr,
+                      getConsistencyMarkers(),
+                      getStorageInterface(),
+                      multiSyncApply,
+                      _writerPool.get(),
+                      OplogApplier::Options(OplogApplication::Mode::kSecondary));
 
     auto emptyPrepareApplyOp = makeCommandOplogEntryWithSessionInfoAndStmtId(
         {Timestamp(Seconds(1), 3), 1LL},
@@ -1149,9 +1180,9 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyEmptyApplyOpsPreparedTr
 
     // Apply a batch with only the prepare applyOps. This should result in the prepare being put in
     // the oplog, and the nested insert being applied (but in a transaction).
-    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {emptyPrepareApplyOp}, boost::none));
+    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {emptyPrepareApplyOp}));
     ASSERT_EQ(1U, oplogDocs().size());
-    ASSERT_BSONOBJ_EQ(emptyPrepareApplyOp.raw, oplogDocs().back());
+    ASSERT_BSONOBJ_EQ(emptyPrepareApplyOp.getRaw(), oplogDocs().back());
     ASSERT_TRUE(_insertedDocs[_nss1].empty());
     checkTxnTable(_lsid,
                   _txnNum,
@@ -1162,8 +1193,8 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyEmptyApplyOpsPreparedTr
 
     // Apply a batch with only the commit.  This should result in the commit being put in the
     // oplog, and prepared insert being committed.
-    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_commitSinglePrepareApplyOp}, boost::none));
-    ASSERT_BSONOBJ_EQ(_commitSinglePrepareApplyOp->raw, oplogDocs().back());
+    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_commitSinglePrepareApplyOp}));
+    ASSERT_BSONOBJ_EQ(_commitSinglePrepareApplyOp->getRaw(), oplogDocs().back());
     ASSERT_TRUE(_insertedDocs[_nss1].empty());
     ASSERT_TRUE(_insertedDocs[_nss2].empty());
     checkTxnTable(_lsid,
@@ -1175,13 +1206,17 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyEmptyApplyOpsPreparedTr
 }
 
 TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyAbortSingleApplyOpsPreparedTransaction) {
-    SyncTail syncTail(
-        nullptr, getConsistencyMarkers(), getStorageInterface(), multiSyncApply, _writerPool.get());
+    SyncTail syncTail(nullptr,
+                      getConsistencyMarkers(),
+                      getStorageInterface(),
+                      multiSyncApply,
+                      _writerPool.get(),
+                      OplogApplier::Options(OplogApplication::Mode::kSecondary));
 
     const auto expectedStartOpTime = _singlePrepareApplyOp->getOpTime();
     // Apply a batch with only the prepare applyOps. This should result in the prepare being put in
     // the oplog, and the nested insert being applied (but in a transaction).
-    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_singlePrepareApplyOp}, boost::none));
+    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_singlePrepareApplyOp}));
     checkTxnTable(_lsid,
                   _txnNum,
                   _singlePrepareApplyOp->getOpTime(),
@@ -1191,8 +1226,8 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyAbortSingleApplyOpsPrep
 
     // Apply a batch with only the abort.  This should result in the abort being put in the
     // oplog and the transaction table being updated accordingly.
-    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_abortSinglePrepareApplyOp}, boost::none));
-    ASSERT_BSONOBJ_EQ(_abortSinglePrepareApplyOp->raw, oplogDocs().back());
+    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_abortSinglePrepareApplyOp}));
+    ASSERT_BSONOBJ_EQ(_abortSinglePrepareApplyOp->getRaw(), oplogDocs().back());
     ASSERT_EQ(1U, _insertedDocs[_nss1].size());
     ASSERT_TRUE(_insertedDocs[_nss2].empty());
     checkTxnTable(_lsid,
@@ -1216,10 +1251,9 @@ TEST_F(MultiOplogEntryPreparedTransactionTest,
 
     // Apply a batch with only the prepare applyOps. This should result in the prepare being put in
     // the oplog, but, since this is initial sync, nothing else.
-    ASSERT_OK(syncTail.multiApply(
-        _opCtx.get(), {*_singlePrepareApplyOp}, OplogApplication::Mode::kInitialSync));
+    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_singlePrepareApplyOp}));
     ASSERT_EQ(1U, oplogDocs().size());
-    ASSERT_BSONOBJ_EQ(_singlePrepareApplyOp->raw, oplogDocs().back());
+    ASSERT_BSONOBJ_EQ(_singlePrepareApplyOp->getRaw(), oplogDocs().back());
     ASSERT_TRUE(_insertedDocs[_nss1].empty());
     ASSERT_TRUE(_insertedDocs[_nss2].empty());
     checkTxnTable(_lsid,
@@ -1231,9 +1265,8 @@ TEST_F(MultiOplogEntryPreparedTransactionTest,
 
     // Apply a batch with only the commit.  This should result in the commit being put in the
     // oplog, and the previous entry being applied.
-    ASSERT_OK(syncTail.multiApply(
-        _opCtx.get(), {*_commitSinglePrepareApplyOp}, OplogApplication::Mode::kInitialSync));
-    ASSERT_BSONOBJ_EQ(_commitSinglePrepareApplyOp->raw, oplogDocs().back());
+    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_commitSinglePrepareApplyOp}));
+    ASSERT_BSONOBJ_EQ(_commitSinglePrepareApplyOp->getRaw(), oplogDocs().back());
     ASSERT_EQ(1U, _insertedDocs[_nss1].size());
     ASSERT_TRUE(_insertedDocs[_nss2].empty());
     checkTxnTable(_lsid,
@@ -1268,7 +1301,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest,
 
     // Apply a batch with only the prepare applyOps. This should have no effect, since this is
     // recovery.
-    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_singlePrepareApplyOp}, boost::none));
+    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_singlePrepareApplyOp}));
     ASSERT_TRUE(oplogDocs().empty());
     ASSERT_TRUE(_insertedDocs[_nss1].empty());
     ASSERT_TRUE(_insertedDocs[_nss2].empty());
@@ -1281,7 +1314,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest,
 
     // Apply a batch with only the commit.  This should result in the previous entry being
     // applied.
-    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_commitSinglePrepareApplyOp}, boost::none));
+    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {*_commitSinglePrepareApplyOp}));
     ASSERT_TRUE(oplogDocs().empty());
     ASSERT_EQ(1U, _insertedDocs[_nss1].size());
     ASSERT_TRUE(_insertedDocs[_nss2].empty());
@@ -1296,7 +1329,12 @@ TEST_F(MultiOplogEntryPreparedTransactionTest,
 void testWorkerMultikeyPaths(OperationContext* opCtx,
                              const OplogEntry& op,
                              unsigned long numPaths) {
-    SyncTail syncTail(nullptr, nullptr, nullptr, {}, nullptr);
+    SyncTail syncTail(nullptr,
+                      nullptr,
+                      nullptr,
+                      {},
+                      nullptr,
+                      OplogApplier::Options(OplogApplication::Mode::kSecondary));
     WorkerMultikeyPathInfo pathInfo;
     MultiApplier::OperationPtrs ops = {&op};
     ASSERT_OK(multiSyncApply(opCtx, &ops, &syncTail, &pathInfo));
@@ -1352,7 +1390,12 @@ TEST_F(SyncTailTest, MultiSyncApplyAddsMultipleWorkerMultikeyPathInfo) {
         auto opA = makeInsertDocumentOplogEntry({Timestamp(Seconds(4), 0), 1LL}, nss, docA);
         auto docB = BSON("_id" << 2 << "b" << BSON_ARRAY(6 << 7));
         auto opB = makeInsertDocumentOplogEntry({Timestamp(Seconds(5), 0), 1LL}, nss, docB);
-        SyncTail syncTail(nullptr, nullptr, nullptr, {}, nullptr);
+        SyncTail syncTail(nullptr,
+                          nullptr,
+                          nullptr,
+                          {},
+                          nullptr,
+                          OplogApplier::Options(OplogApplication::Mode::kSecondary));
         WorkerMultikeyPathInfo pathInfo;
         MultiApplier::OperationPtrs ops = {&opA, &opB};
         ASSERT_OK(multiSyncApply(_opCtx.get(), &ops, &syncTail, &pathInfo));
@@ -1395,7 +1438,12 @@ TEST_F(SyncTailTest, MultiSyncApplyFailsWhenCollectionCreationTriesToMakeUUID) {
     NamespaceString nss("foo." + _agent.getSuiteName() + "_" + _agent.getTestName());
 
     auto op = makeCreateCollectionOplogEntry({Timestamp(Seconds(1), 0), 1LL}, nss);
-    SyncTail syncTail(nullptr, nullptr, nullptr, {}, nullptr);
+    SyncTail syncTail(nullptr,
+                      nullptr,
+                      nullptr,
+                      {},
+                      nullptr,
+                      OplogApplier::Options(OplogApplication::Mode::kSecondary));
     MultiApplier::OperationPtrs ops = {&op};
     ASSERT_EQUALS(ErrorCodes::InvalidOptions,
                   multiSyncApply(_opCtx.get(), &ops, &syncTail, nullptr));
@@ -1851,56 +1899,6 @@ TEST_F(SyncTailTest, MultiSyncApplyFetchesMissingDocumentIfDocumentIsAvailableFr
     CollectionReader collectionReader(_opCtx.get(), nss);
     ASSERT_BSONOBJ_EQ(updatedDocument, unittest::assertGet(collectionReader.next()));
     ASSERT_EQUALS(ErrorCodes::CollectionIsEmpty, collectionReader.next().getStatus());
-}
-
-namespace {
-
-class ReplicationCoordinatorSignalDrainCompleteThrows : public ReplicationCoordinatorMock {
-public:
-    ReplicationCoordinatorSignalDrainCompleteThrows(ServiceContext* service,
-                                                    const ReplSettings& settings)
-        : ReplicationCoordinatorMock(service, settings) {}
-    void signalDrainComplete(OperationContext*, long long) final {
-        uasserted(ErrorCodes::OperationFailed, "failed to signal drain complete");
-    }
-};
-
-}  // namespace
-
-DEATH_TEST_F(SyncTailTest,
-             OplogApplicationLogsExceptionFromSignalDrainCompleteBeforeAborting,
-             "OperationFailed: failed to signal drain complete") {
-    // Leave oplog buffer empty so that SyncTail calls
-    // ReplicationCoordinator::signalDrainComplete() during oplog application.
-    auto oplogBuffer = std::make_unique<OplogBufferBlockingQueue>();
-
-    auto applyOperationFn =
-        [](OperationContext*, MultiApplier::OperationPtrs*, SyncTail*, WorkerMultikeyPathInfo*) {
-            return Status::OK();
-        };
-    auto writerPool = OplogApplier::makeWriterPool();
-    OplogApplier::Options options;
-    SyncTail syncTail(nullptr,  // observer. not required by oplogApplication().
-                      _consistencyMarkers.get(),
-                      getStorageInterface(),
-                      applyOperationFn,
-                      writerPool.get(),
-                      options);
-
-    auto service = getServiceContext();
-    auto currentReplCoord = ReplicationCoordinator::get(_opCtx.get());
-    ReplicationCoordinatorSignalDrainCompleteThrows replCoord(service,
-                                                              currentReplCoord->getSettings());
-    ASSERT_OK(replCoord.setFollowerMode(MemberState::RS_PRIMARY));
-
-    // SyncTail::oplogApplication() creates its own OperationContext in the current thread context.
-    _opCtx = {};
-    auto getNextApplierBatchFn =
-        [](OperationContext* opCtx,
-           const OplogApplier::BatchLimits& batchLimits) -> StatusWith<OplogApplier::Operations> {
-        return OplogApplier::Operations();
-    };
-    syncTail.oplogApplication(oplogBuffer.get(), getNextApplierBatchFn, &replCoord);
 }
 
 TEST_F(IdempotencyTest, Geo2dsphereIndexFailedOnUpdate) {
@@ -2483,9 +2481,13 @@ TEST_F(SyncTailTxnTableTest, SimpleWriteWithTxn) {
                                    date);
 
     auto writerPool = OplogApplier::makeWriterPool();
-    SyncTail syncTail(
-        nullptr, getConsistencyMarkers(), getStorageInterface(), multiSyncApply, writerPool.get());
-    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {insertOp}, boost::none));
+    SyncTail syncTail(nullptr,
+                      getConsistencyMarkers(),
+                      getStorageInterface(),
+                      multiSyncApply,
+                      writerPool.get(),
+                      OplogApplier::Options(OplogApplication::Mode::kSecondary));
+    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {insertOp}));
 
     checkTxnTable(sessionInfo, {Timestamp(1, 0), 1}, date);
 }
@@ -2514,9 +2516,13 @@ TEST_F(SyncTailTxnTableTest, WriteWithTxnMixedWithDirectWriteToTxnTable) {
                                    Date_t::now());
 
     auto writerPool = OplogApplier::makeWriterPool();
-    SyncTail syncTail(
-        nullptr, getConsistencyMarkers(), getStorageInterface(), multiSyncApply, writerPool.get());
-    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {insertOp, deleteOp}, boost::none));
+    SyncTail syncTail(nullptr,
+                      getConsistencyMarkers(),
+                      getStorageInterface(),
+                      multiSyncApply,
+                      writerPool.get(),
+                      OplogApplier::Options(OplogApplication::Mode::kSecondary));
+    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {insertOp, deleteOp}));
 
     ASSERT_FALSE(docExists(
         _opCtx.get(),
@@ -2558,9 +2564,13 @@ TEST_F(SyncTailTxnTableTest, InterleavedWriteWithTxnMixedWithDirectDeleteToTxnTa
                                     date);
 
     auto writerPool = OplogApplier::makeWriterPool();
-    SyncTail syncTail(
-        nullptr, getConsistencyMarkers(), getStorageInterface(), multiSyncApply, writerPool.get());
-    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {insertOp, deleteOp, insertOp2}, boost::none));
+    SyncTail syncTail(nullptr,
+                      getConsistencyMarkers(),
+                      getStorageInterface(),
+                      multiSyncApply,
+                      writerPool.get(),
+                      OplogApplier::Options(OplogApplication::Mode::kSecondary));
+    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {insertOp, deleteOp, insertOp2}));
 
     checkTxnTable(sessionInfo, {Timestamp(3, 0), 2}, date);
 }
@@ -2590,9 +2600,13 @@ TEST_F(SyncTailTxnTableTest, InterleavedWriteWithTxnMixedWithDirectUpdateToTxnTa
                                    Date_t::now());
 
     auto writerPool = OplogApplier::makeWriterPool();
-    SyncTail syncTail(
-        nullptr, getConsistencyMarkers(), getStorageInterface(), multiSyncApply, writerPool.get());
-    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {insertOp, updateOp}, boost::none));
+    SyncTail syncTail(nullptr,
+                      getConsistencyMarkers(),
+                      getStorageInterface(),
+                      multiSyncApply,
+                      writerPool.get(),
+                      OplogApplier::Options(OplogApplication::Mode::kSecondary));
+    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {insertOp, updateOp}));
 
     checkTxnTable(sessionInfo, newWriteOpTime, date);
 }
@@ -2645,11 +2659,14 @@ TEST_F(SyncTailTxnTableTest, RetryableWriteThenMultiStatementTxnWriteOnSameSessi
                                                       txnInsertOpTime);
 
     auto writerPool = OplogApplier::makeWriterPool();
-    SyncTail syncTail(
-        nullptr, getConsistencyMarkers(), getStorageInterface(), multiSyncApply, writerPool.get());
+    SyncTail syncTail(nullptr,
+                      getConsistencyMarkers(),
+                      getStorageInterface(),
+                      multiSyncApply,
+                      writerPool.get(),
+                      OplogApplier::Options(OplogApplication::Mode::kSecondary));
 
-    ASSERT_OK(syncTail.multiApply(
-        _opCtx.get(), {retryableInsertOp, txnInsertOp, txnCommitOp}, boost::none));
+    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {retryableInsertOp, txnInsertOp, txnCommitOp}));
 
     repl::checkTxnTable(_opCtx.get(),
                         *sessionInfo.getSessionId(),
@@ -2707,11 +2724,14 @@ TEST_F(SyncTailTxnTableTest, MultiStatementTxnWriteThenRetryableWriteOnSameSessi
                                             date);
 
     auto writerPool = OplogApplier::makeWriterPool();
-    SyncTail syncTail(
-        nullptr, getConsistencyMarkers(), getStorageInterface(), multiSyncApply, writerPool.get());
+    SyncTail syncTail(nullptr,
+                      getConsistencyMarkers(),
+                      getStorageInterface(),
+                      multiSyncApply,
+                      writerPool.get(),
+                      OplogApplier::Options(OplogApplication::Mode::kSecondary));
 
-    ASSERT_OK(syncTail.multiApply(
-        _opCtx.get(), {txnInsertOp, txnCommitOp, retryableInsertOp}, boost::none));
+    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {txnInsertOp, txnCommitOp, retryableInsertOp}));
 
     repl::checkTxnTable(_opCtx.get(),
                         *sessionInfo.getSessionId(),
@@ -2772,12 +2792,15 @@ TEST_F(SyncTailTxnTableTest, MultiApplyUpdatesTheTransactionTable) {
         {Timestamp(Seconds(7), 0), 1LL}, ns3, BSON("_id" << 0), info);
 
     auto writerPool = OplogApplier::makeWriterPool();
-    SyncTail syncTail(
-        nullptr, getConsistencyMarkers(), getStorageInterface(), multiSyncApply, writerPool.get());
+    SyncTail syncTail(nullptr,
+                      getConsistencyMarkers(),
+                      getStorageInterface(),
+                      multiSyncApply,
+                      writerPool.get(),
+                      OplogApplier::Options(OplogApplication::Mode::kSecondary));
     ASSERT_OK(syncTail.multiApply(
         _opCtx.get(),
-        {opSingle, opDiffTxnSmaller, opDiffTxnLarger, opSameTxnSooner, opSameTxnLater, opNoTxn},
-        boost::none));
+        {opSingle, opDiffTxnSmaller, opDiffTxnLarger, opSameTxnSooner, opSameTxnLater, opNoTxn}));
 
     // The txnNum and optime of the only write were saved.
     auto resultSingleDoc =
@@ -2847,9 +2870,13 @@ TEST_F(SyncTailTxnTableTest, SessionMigrationNoOpEntriesShouldUpdateTxnTable) {
                                                 outerInsertDate);
 
     auto writerPool = OplogApplier::makeWriterPool();
-    SyncTail syncTail(
-        nullptr, getConsistencyMarkers(), getStorageInterface(), multiSyncApply, writerPool.get());
-    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {insertOplog}, boost::none));
+    SyncTail syncTail(nullptr,
+                      getConsistencyMarkers(),
+                      getStorageInterface(),
+                      multiSyncApply,
+                      writerPool.get(),
+                      OplogApplier::Options(OplogApplication::Mode::kSecondary));
+    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {insertOplog}));
 
     checkTxnTable(insertSessionInfo, {Timestamp(40, 0), 1}, outerInsertDate);
 }
@@ -2870,9 +2897,13 @@ TEST_F(SyncTailTxnTableTest, PreImageNoOpEntriesShouldNotUpdateTxnTable) {
                                                   preImageDate);
 
     auto writerPool = OplogApplier::makeWriterPool();
-    SyncTail syncTail(
-        nullptr, getConsistencyMarkers(), getStorageInterface(), multiSyncApply, writerPool.get());
-    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {preImageOplog}, boost::none));
+    SyncTail syncTail(nullptr,
+                      getConsistencyMarkers(),
+                      getStorageInterface(),
+                      multiSyncApply,
+                      writerPool.get(),
+                      OplogApplier::Options(OplogApplication::Mode::kSecondary));
+    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {preImageOplog}));
 
     ASSERT_FALSE(docExists(_opCtx.get(),
                            NamespaceString::kSessionTransactionsTableNamespace,
@@ -2895,9 +2926,13 @@ TEST_F(SyncTailTxnTableTest, NonMigrateNoOpEntriesShouldNotUpdateTxnTable) {
                                 Date_t::now());
 
     auto writerPool = OplogApplier::makeWriterPool();
-    SyncTail syncTail(
-        nullptr, getConsistencyMarkers(), getStorageInterface(), multiSyncApply, writerPool.get());
-    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {oplog}, boost::none));
+    SyncTail syncTail(nullptr,
+                      getConsistencyMarkers(),
+                      getStorageInterface(),
+                      multiSyncApply,
+                      writerPool.get(),
+                      OplogApplier::Options(OplogApplication::Mode::kSecondary));
+    ASSERT_OK(syncTail.multiApply(_opCtx.get(), {oplog}));
 
     ASSERT_FALSE(docExists(
         _opCtx.get(),

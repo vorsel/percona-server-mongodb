@@ -81,7 +81,7 @@ public:
                 i++;
                 LOG_FOR_RECOVERY(kRecoveryOperationLogLevel)
                     << "Applying op " << i << " of " << batch.size() << " (in batch " << _numBatches
-                    << ") during replication recovery: " << redact(entry.raw);
+                    << ") during replication recovery: " << redact(entry.getRaw());
             }
         }
     }
@@ -90,9 +90,8 @@ public:
     void onMissingDocumentsFetchedAndInserted(const std::vector<FetchInfo>&) final {}
 
     void complete(const OpTime& applyThroughOpTime) const {
-        LOG_FOR_RECOVERY(kRecoveryBatchLogLevel)
-            << "Applied " << _numOpsApplied << " operations in " << _numBatches
-            << " batches. Last operation applied with optime: " << applyThroughOpTime;
+        log() << "Applied " << _numOpsApplied << " operations in " << _numBatches
+              << " batches. Last operation applied with optime: " << applyThroughOpTime;
     }
 
 private:
@@ -373,7 +372,7 @@ void ReplicationRecoveryImpl::_applyToEndOfOplog(OperationContext* opCtx,
     RecoveryOplogApplierStats stats;
 
     auto writerPool = OplogApplier::makeWriterPool();
-    OplogApplier::Options options;
+    OplogApplier::Options options(OplogApplication::Mode::kRecovering);
     options.allowNamespaceNotFoundErrorsOnCrudOps = true;
     options.skipWritesToOplog = true;
     // During replication recovery, the stableTimestampForRecovery refers to the stable timestamp
@@ -402,8 +401,7 @@ void ReplicationRecoveryImpl::_applyToEndOfOplog(OperationContext* opCtx,
     OplogApplier::Operations batch;
     while (
         !(batch = fassert(50763, oplogApplier.getNextApplierBatch(opCtx, batchLimits))).empty()) {
-        applyThroughOpTime = uassertStatusOK(
-            oplogApplier.multiApply(opCtx, std::move(batch), OplogApplication::Mode::kRecovering));
+        applyThroughOpTime = uassertStatusOK(oplogApplier.multiApply(opCtx, std::move(batch)));
     }
     stats.complete(applyThroughOpTime);
     invariant(oplogBuffer.isEmpty(),

@@ -1117,9 +1117,9 @@ var ReplSetTest = function(opts) {
      * Modifies the election timeout to be 24 hours so that no unplanned elections happen. Then
      * runs replSetInitiate on the replica set with the new config.
      */
-    this.initiateWithHighElectionTimeout = function(timeout) {
+    this.initiateWithHighElectionTimeout = function(opts = {}) {
         let cfg = this.getReplSetConfig();
-        cfg.settings = {"electionTimeoutMillis": 24 * 60 * 60 * 1000};
+        cfg.settings = Object.assign(opts, {"electionTimeoutMillis": 24 * 60 * 60 * 1000});
         this.initiate(cfg);
     };
 
@@ -1137,9 +1137,28 @@ var ReplSetTest = function(opts) {
             return;
         }
 
+        jsTest.log("Stepping up: " + node.host + " in stepUp");
         assert.commandWorked(node.adminCommand({replSetStepUp: 1}));
         this.awaitNodesAgreeOnPrimary();
-        assert.eq(this.getPrimary(), node, node.host + " was not primary after stepUp");
+        assert.eq(this.getPrimary(), node, 'failed to step up node ' + node.host + ' in stepUp');
+    };
+
+    /**
+     * Steps up 'node' as primary.
+     */
+    this.stepUpNoAwaitReplication = function(node) {
+        jsTest.log("Stepping up: " + node.host + " in stepUpNoAwaitReplication");
+        assert.soonNoExcept(
+            function() {
+                assert.commandWorked(node.adminCommand({replSetStepUp: 1}));
+                self.awaitNodesAgreeOnPrimary(
+                    self.kDefaultTimeoutMS, self.nodes, self.getNodeId(node));
+                return node.adminCommand('replSetGetStatus').myState === ReplSetTest.State.PRIMARY;
+            },
+            'failed to step up node ' + node.host + ' in stepUpNoAwaitReplication',
+            self.kDefaultTimeoutMS);
+
+        return node;
     };
 
     /**
@@ -1706,9 +1725,9 @@ var ReplSetTest = function(opts) {
     this.getHashes = function(dbName, slaves) {
         assert.neq(dbName, 'local', 'Cannot run getHashes() on the "local" database');
 
-        // getPrimary() repopulates 'self._slaves'.
-        this.getPrimary();
-        slaves = slaves || this._slaves;
+        // _determineLiveSlaves() repopulates both 'self._slaves' and 'self._master'. If we're
+        // passed an explicit set of slaves we don't want to do that.
+        slaves = slaves || _determineLiveSlaves();
 
         const sessions = [
             this._master,
@@ -1839,93 +1858,6 @@ var ReplSetTest = function(opts) {
             return inAOnly.concat(inBOnly);
         }
 
-        function printCollectionInfo(connName, conn, dbName, collName) {
-            var ns = dbName + '.' + collName;
-            var hostColl = `${conn.host}--${ns}`;
-            var alreadyPrinted = collectionPrinted.has(hostColl);
-
-            // Extract basic collection info.
-            var coll = conn.getDB(dbName).getCollection(collName);
-            var res = conn.getDB(dbName).runCommand({listCollections: 1, filter: {name: collName}});
-            var collInfo = null;
-            if (res.ok === 1 && res.cursor.firstBatch.length !== 0) {
-                collInfo = {
-                    ns: ns,
-                    host: conn.host,
-                    UUID: res.cursor.firstBatch[0].info.uuid,
-                    count: coll.find().itcount()
-                };
-            }
-            var infoPrefix = `${connName}(${conn.host}) info for ${ns} : `;
-            if (collInfo !== null) {
-                if (alreadyPrinted) {
-                    print(`${connName} info for ${ns} already printed. Search for ` +
-                          `'${infoPrefix}'`);
-                } else {
-                    print(infoPrefix + tojsononeline(collInfo));
-                }
-            } else {
-                print(infoPrefix + 'collection does not exist');
-            }
-
-            var collStats = conn.getDB(dbName).runCommand({collStats: collName});
-            var statsPrefix = `${connName}(${conn.host}) collStats for ${ns}: `;
-            if (collStats.ok === 1) {
-                if (alreadyPrinted) {
-                    print(`${connName} collStats for ${ns} already printed. Search for ` +
-                          `'${statsPrefix}'`);
-                } else {
-                    print(statsPrefix + tojsononeline(collStats));
-                }
-            } else {
-                print(`${statsPrefix}  error: ${tojsononeline(collStats)}`);
-            }
-
-            collectionPrinted.add(hostColl);
-
-            // Return true if collInfo & collStats can be retrieved for conn.
-            return collInfo !== null && collStats.ok === 1;
-        }
-
-        function dumpCollectionDiff(primary, secondary, dbName, collName) {
-            var ns = dbName + '.' + collName;
-            print('Dumping collection: ' + ns);
-
-            var primaryExists = printCollectionInfo('primary', primary, dbName, collName);
-            var secondaryExists = printCollectionInfo('secondary', secondary, dbName, collName);
-
-            if (!primaryExists || !secondaryExists) {
-                print(`Skipping checking collection differences for ${ns} since it does not ` +
-                      'exist on primary and secondary');
-                return;
-            }
-
-            const primarySession = primary.getDB('test').getSession();
-            const secondarySession = secondary.getDB('test').getSession();
-            const diff = self.getCollectionDiffUsingSessions(
-                primarySession, secondarySession, dbName, collName);
-
-            for (let {
-                     primary: primaryDoc,
-                     secondary: secondaryDoc,
-                 } of diff.docsWithDifferentContents) {
-                print(`Mismatching documents between the primary ${primary.host}` +
-                      ` and the secondary ${secondary.host}:`);
-                print('    primary:   ' + tojsononeline(primaryDoc));
-                print('    secondary: ' + tojsononeline(secondaryDoc));
-            }
-
-            if (diff.docsMissingOnPrimary.length > 0) {
-                print(`The following documents are missing on the primary ${primary.host}:`);
-                print(diff.docsMissingOnPrimary.map(doc => tojsononeline(doc)).join('\n'));
-            }
-
-            if (diff.docsMissingOnSecondary.length > 0) {
-                print(`The following documents are missing on the secondary ${secondary.host}:`);
-                print(diff.docsMissingOnSecondary.map(doc => tojsononeline(doc)).join('\n'));
-            }
-        }
-
         function checkDBHashesForReplSet(rst, dbBlacklist = [], slaves, msgPrefix, ignoreUUIDs) {
             // We don't expect the local database to match because some of its
             // collections are not replicated.
@@ -1941,7 +1873,11 @@ var ReplSetTest = function(opts) {
             var combinedDBs = new Set(primary.getDBNames());
             const replSetConfig = rst.getReplSetConfigFromNode();
 
+            print("checkDBHashesForReplSet checking data hashes against primary: " + primary.host);
+
             slaves.forEach(secondary => {
+                print("checkDBHashesForReplSet going to check data hashes on secondary: " +
+                      secondary.host);
                 secondary.getDBNames().forEach(dbName => combinedDBs.add(dbName));
             });
 
@@ -1950,33 +1886,25 @@ var ReplSetTest = function(opts) {
                     continue;
                 }
 
-                try {
-                    var dbHashes = rst.getHashes(dbName, slaves);
-                    var primaryDBHash = dbHashes.master;
-                    var primaryCollections = Object.keys(primaryDBHash.collections);
-                    assert.commandWorked(primaryDBHash);
+                const dbHashes = rst.getHashes(dbName, slaves);
+                const primaryDBHash = dbHashes.master;
+                const primaryCollections = Object.keys(primaryDBHash.collections);
+                assert.commandWorked(primaryDBHash);
 
-                    // Filter only collections that were retrieved by the dbhash. listCollections
-                    // may include non-replicated collections like system.profile.
-                    var primaryCollInfo =
-                        primary.getDB(dbName).getCollectionInfos({name: {$in: primaryCollections}});
-
-                } catch (e) {
-                    if (jsTest.options().skipValidationOnInvalidViewDefinitions) {
-                        assert.commandFailedWithCode(e, ErrorCodes.InvalidViewDefinition);
-                        print('Skipping dbhash check on ' + dbName +
-                              ' because of invalid views in system.views');
-                        continue;
-                    } else {
-                        throw e;
-                    }
-                }
+                // Filter only collections that were retrieved by the dbhash. listCollections
+                // may include non-replicated collections like system.profile.
+                const primaryCollInfos = new CollInfos(primary, 'primary', dbName);
+                primaryCollInfos.filter(primaryCollections);
 
                 dbHashes.slaves.forEach(secondaryDBHash => {
                     assert.commandWorked(secondaryDBHash);
 
                     var secondary = secondaryDBHash._mongo;
                     var secondaryCollections = Object.keys(secondaryDBHash.collections);
+                    // Check that collection information is consistent on the primary and
+                    // secondaries.
+                    const secondaryCollInfos = new CollInfos(secondary, 'secondary', dbName);
+                    secondaryCollInfos.filter(secondaryCollections);
 
                     if (primaryCollections.length !== secondaryCollections.length) {
                         print(
@@ -1985,13 +1913,16 @@ var ReplSetTest = function(opts) {
                             tojson(dbHashes));
                         for (var diffColl of arraySymmetricDifference(primaryCollections,
                                                                       secondaryCollections)) {
-                            dumpCollectionDiff(primary, secondary, dbName, diffColl);
+                            DataConsistencyChecker.dumpCollectionDiff(this,
+                                                                      collectionPrinted,
+                                                                      primaryCollInfos,
+                                                                      secondaryCollInfos,
+                                                                      diffColl);
                         }
                         success = false;
                     }
 
-                    var nonCappedCollNames = primaryCollections.filter(
-                        collName => !primary.getDB(dbName).getCollection(collName).isCapped());
+                    const nonCappedCollNames = primaryCollInfos.getNonCappedCollNames();
                     // Only compare the dbhashes of non-capped collections because capped
                     // collections are not necessarily truncated at the same points
                     // across replica set members.
@@ -2002,18 +1933,17 @@ var ReplSetTest = function(opts) {
                                   ', the primary and secondary have a different hash for the' +
                                   ' collection ' + dbName + '.' + collName + ': ' +
                                   tojson(dbHashes));
-                            dumpCollectionDiff(primary, secondary, dbName, collName);
+                            DataConsistencyChecker.dumpCollectionDiff(this,
+                                                                      collectionPrinted,
+                                                                      primaryCollInfos,
+                                                                      secondaryCollInfos,
+                                                                      collName);
                             success = false;
                         }
                     });
 
-                    // Check that collection information is consistent on the primary and
-                    // secondaries.
-                    var secondaryCollInfo = secondary.getDB(dbName).getCollectionInfos(
-                        {name: {$in: secondaryCollections}});
-
-                    secondaryCollInfo.forEach(secondaryInfo => {
-                        primaryCollInfo.forEach(primaryInfo => {
+                    secondaryCollInfos.collInfosRes.forEach(secondaryInfo => {
+                        primaryCollInfos.collInfosRes.forEach(primaryInfo => {
                             if (secondaryInfo.name === primaryInfo.name &&
                                 secondaryInfo.type === primaryInfo.type) {
                                 if (ignoreUUIDs) {
@@ -2032,8 +1962,11 @@ var ReplSetTest = function(opts) {
                                           ', the primary and secondary have different ' +
                                           'attributes for the collection or view ' + dbName + '.' +
                                           secondaryInfo.name);
-                                    dumpCollectionDiff(
-                                        primary, secondary, dbName, secondaryInfo.name);
+                                    DataConsistencyChecker.dumpCollectionDiff(this,
+                                                                              collectionPrinted,
+                                                                              primaryCollInfos,
+                                                                              secondaryCollInfos,
+                                                                              secondaryInfo.name);
                                     success = false;
                                 }
                             }
@@ -2054,8 +1987,8 @@ var ReplSetTest = function(opts) {
                             secondary.getDB(dbName).runCommand({collStats: collName});
 
                         if (primaryCollStats.ok !== 1 || secondaryCollStats.ok !== 1) {
-                            printCollectionInfo('primary', primary, dbName, collName);
-                            printCollectionInfo('secondary', secondary, dbName, collName);
+                            primaryCollInfos.print(collectionPrinted, collName);
+                            secondaryCollInfos.print(collectionPrinted, collName);
                             success = false;
                         } else if (primaryCollStats.capped !== secondaryCollStats.capped ||
                                    (hasSecondaryIndexes &&
@@ -2064,7 +1997,11 @@ var ReplSetTest = function(opts) {
                             print(msgPrefix +
                                   ', the primary and secondary have different stats for the ' +
                                   'collection ' + dbName + '.' + collName);
-                            dumpCollectionDiff(primary, secondary, dbName, collName);
+                            DataConsistencyChecker.dumpCollectionDiff(this,
+                                                                      collectionPrinted,
+                                                                      primaryCollInfos,
+                                                                      secondaryCollInfos,
+                                                                      collName);
                             success = false;
                         }
                     });
@@ -2083,6 +2020,7 @@ var ReplSetTest = function(opts) {
 
                     if (!success) {
                         if (!hasDumpedOplog) {
+                            print("checkDBHashesForReplSet dumping oplogs from all nodes");
                             this.dumpOplog(primary, {}, 100);
                             rst.getSecondaries().forEach(secondary =>
                                                              this.dumpOplog(secondary, {}, 100));
@@ -2191,6 +2129,7 @@ var ReplSetTest = function(opts) {
             }
         }
 
+        print("checkOplogs starting oplog checks.");
         if (slaves.length >= 1) {
             let readers = [];
             let smallestTS = new Timestamp(Math.pow(2, 32) - 1, Math.pow(2, 32) - 1);
@@ -2200,14 +2139,17 @@ var ReplSetTest = function(opts) {
                 const node = nodes[i];
 
                 if (rst._master !== node && !slaves.includes(node)) {
+                    print("checkOplogs skipping oplog of node: " + node.host);
                     continue;
                 }
 
                 // Arbiters have no documents in the oplog.
                 if (isNodeArbiter(node)) {
+                    jsTestLog("checkOplogs skipping oplog of arbiter: " + node.host);
                     continue;
                 }
 
+                print("checkOplogs going to check oplog of node: " + node.host);
                 readers[i] = new OplogReader(node);
                 const currTS = readers[i].getFirstDoc().ts;
                 // Find the reader which has the smallestTS. This reader should have the most
@@ -2248,6 +2190,7 @@ var ReplSetTest = function(opts) {
                 prevOplogEntry = oplogEntry;
             }
         }
+        print("checkOplogs oplog checks complete.");
     }
 
     /**
@@ -2568,18 +2511,27 @@ var ReplSetTest = function(opts) {
     this.stopSet = function(signal, forRestart, opts) {
         // Check to make sure data is the same on all nodes.
         if (!jsTest.options().skipCheckDBHashes) {
+            print("ReplSetTest stopSet going to run data consistency checks.");
             // To skip this check add TestData.skipCheckDBHashes = true;
             // Reasons to skip this test include:
             // - the primary goes down and none can be elected (so fsync lock/unlock commands fail)
             // - the replica set is in an unrecoverable inconsistent state. E.g. the replica set
             //   is partitioned.
             //
-            if (_callIsMaster() && this._liveNodes.length > 1) {  // skip for sets with 1 live node
+            let master = _callIsMaster();
+            if (master && this._liveNodes.length > 1) {  // skip for sets with 1 live node
                 // Auth only on live nodes because authutil.assertAuthenticate
                 // refuses to log in live connections if some secondaries are down.
+                print("ReplSetTest stopSet checking oplogs.");
                 asCluster(this._liveNodes, () => this.checkOplogs());
+                print("ReplSetTest stopSet checking replicated data hashes.");
                 asCluster(this._liveNodes, () => this.checkReplicatedDataHashes());
+            } else {
+                print(
+                    "ReplSetTest stopSet skipped data consistency checks. Number of _liveNodes: " +
+                    this._liveNodes.length + ", _callIsMaster response: " + master);
             }
+            print("ReplSetTest stopSet finished data consistency checks.");
         }
 
         // Make shutdown faster in tests, especially when election handoff has no viable candidate.
@@ -2588,6 +2540,9 @@ var ReplSetTest = function(opts) {
             asCluster(this._liveNodes, () => {
                 for (let node of this._liveNodes) {
                     try {
+                        print(
+                            "ReplSetTest stopSet disabling 'waitForStepDownOnNonCommandShutdown' on " +
+                            node.host);
                         assert.commandWorked(node.adminCommand({
                             setParameter: 1,
                             waitForStepDownOnNonCommandShutdown: false,
@@ -2600,19 +2555,24 @@ var ReplSetTest = function(opts) {
             });
         }
 
+        print("ReplSetTest stopSet stopping all replica set nodes.");
         for (var i = 0; i < this.ports.length; i++) {
             this.stop(i, signal, opts);
         }
+        print("ReplSetTest stopSet stopped all replica set nodes.");
 
         if (forRestart) {
+            print("ReplSetTest stopSet returning since forRestart=true.");
             return;
         }
 
         if ((!opts || !opts.noCleanData) && _alldbpaths) {
             print("ReplSetTest stopSet deleting all dbpaths");
             for (var i = 0; i < _alldbpaths.length; i++) {
+                print("ReplSetTest stopSet deleting dbpath: " + _alldbpaths[i]);
                 resetDbpath(_alldbpaths[i]);
             }
+            print("ReplSetTest stopSet deleted all dbpaths");
         }
 
         _forgetReplSet(this.name);
