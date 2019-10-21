@@ -19,10 +19,14 @@ timelibSuffix = '-2018.01'
 tomcryptSuffix = '-1.18.2'
 benchmarkSuffix = '-1.4.1'
 sqliteSuffix = '-amalgamation-3260000'
+libarchiveSuffix = '-3.4.0'
 
 thirdPartyEnvironmentModifications = {
    'percona_incl' : {
         'CPPPATH' : ['#/src/third_party/install/include'],
+   },
+   'libarchive' : {
+        'CPPPATH' : ['#/src/third_party/libarchive' + libarchiveSuffix],
    },
    'fmt' : {
         'CPPPATH' : ['#src/third_party/fmt/dist/include'],
@@ -634,5 +638,19 @@ kmsEnv.Library(
     target="shim_kms_message",
     source=[
         'shim_kms_message.cpp',
+    ])
+
+libarchiveEnv = env.Clone()
+libarchiveEnv.InjectThirdParty(libraries=['libarchive'])
+libarchiveEnv.SConscript('libarchive' + libarchiveSuffix + '/libarchive/SConscript', exports={ 'env' : libarchiveEnv})
+libarchiveEnv = libarchiveEnv.Clone(
+    LIBDEPS_INTERFACE=[
+        'libarchive' + libarchiveSuffix + '/libarchive/libarchive',
+    ])
+
+libarchiveEnv.Library(
+    target='shim_libarchive',
+    source=[
+        'shim_libarchive.cpp',
     ])
 
