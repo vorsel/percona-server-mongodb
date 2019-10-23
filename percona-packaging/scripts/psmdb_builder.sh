@@ -355,6 +355,7 @@ install_deps() {
         yum -y install rpmbuild rpm-build libpcap-devel gcc make cmake gcc-c++ openssl-devel
         yum -y install cyrus-sasl-devel snappy-devel zlib-devel bzip2-devel scons rpmlint
         yum -y install rpm-build git python-pip python-devel libopcodes libcurl-devel rpmlint e2fsprogs-devel expat-devel lz4-devel
+        pip install setuptools --upgrade
       else
         yum -y install bzip2-devel libpcap-devel snappy-devel gcc gcc-c++ rpm-build rpmlint
         yum -y install cmake cyrus-sasl-devel make openssl-devel zlib-devel libcurl-devel git
@@ -401,6 +402,9 @@ EOL
       wget https://bootstrap.pypa.io/get-pip.py
       python get-pip.py
       easy_install pip
+      if [ "x${DEBIAN}" = "xjessie" ]; then
+        pip install setuptools --upgrade
+      fi
     fi
     aws_sdk_build
     return;
