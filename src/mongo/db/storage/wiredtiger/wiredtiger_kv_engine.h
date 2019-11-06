@@ -44,6 +44,7 @@
 #include "mongo/db/storage/wiredtiger/encryption_keydb.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_oplog_manager.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/elapsed_tracker.h"
@@ -63,7 +64,8 @@ public:
                        const std::string& path,
                        ClockSource* cs,
                        const std::string& extraOpenOptions,
-                       size_t cacheSizeGB,
+                       size_t cacheSizeMB,
+                       size_t maxCacheOverflowFileSizeMB,
                        bool durable,
                        bool ephemeral,
                        bool repair,
@@ -295,7 +297,7 @@ private:
 
     std::unique_ptr<EncryptionKeyDB> _encryptionKeyDB;
     WT_CONNECTION* _conn;
-    WT_EVENT_HANDLER _eventHandler;
+    WiredTigerEventHandler _eventHandler;
     std::unique_ptr<WiredTigerSessionCache> _sessionCache;
     ClockSource* const _clockSource;
 

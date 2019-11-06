@@ -74,7 +74,6 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_size_storer.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/background.h"
@@ -438,12 +437,12 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
                                        ClockSource* cs,
                                        const std::string& extraOpenOptions,
                                        size_t cacheSizeMB,
+                                       size_t maxCacheOverflowFileSizeMB,
                                        bool durable,
                                        bool ephemeral,
                                        bool repair,
                                        bool readOnly)
     : _keepDataHistory(serverGlobalParams.enableMajorityReadConcern),
-      _eventHandler(WiredTigerUtil::defaultEventHandlers()),
       _clockSource(cs),
       _oplogManager(stdx::make_unique<WiredTigerOplogManager>()),
       _canonicalName(canonicalName),
@@ -566,6 +565,7 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
     std::stringstream ss;
     ss << "create,";
     ss << "cache_size=" << cacheSizeMB << "M,";
+    ss << "cache_overflow=(file_max=" << maxCacheOverflowFileSizeMB << "M),";
     ss << "session_max=20000,";
     ss << "eviction=(threads_min=4,threads_max=4),";
     ss << "config_base=false,";
@@ -606,7 +606,8 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
             string config = ss.str();
             log() << "Detected WT journal files.  Running recovery from last checkpoint.";
             log() << "journal to nojournal transition config: " << config;
-            int ret = wiredtiger_open(path.c_str(), &_eventHandler, config.c_str(), &_conn);
+            int ret = wiredtiger_open(
+                path.c_str(), _eventHandler.getWtEventHandler(), config.c_str(), &_conn);
             if (ret == EINVAL) {
                 fassertFailedNoTrace(28717);
             } else if (ret != 0) {
@@ -628,7 +629,8 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
     string config = ss.str();
     log() << "wiredtiger_open config: " << config;
     _wtOpenConfig = config;
-    int ret = wiredtiger_open(path.c_str(), &_eventHandler, config.c_str(), &_conn);
+    int ret =
+        wiredtiger_open(path.c_str(), _eventHandler.getWtEventHandler(), config.c_str(), &_conn);
     // Invalid argument (EINVAL) is usually caused by invalid configuration string.
     // We still fassert() but without a stack trace.
     if (ret == EINVAL) {
@@ -764,8 +766,8 @@ void WiredTigerKVEngine::cleanShutdown() {
             WT_CONNECTION* conn;
             std::stringstream openConfig;
             openConfig << _wtOpenConfig << ",log=(archive=false)";
-            invariantWTOK(
-                wiredtiger_open(_path.c_str(), &_eventHandler, openConfig.str().c_str(), &conn));
+            invariantWTOK(wiredtiger_open(
+                _path.c_str(), _eventHandler.getWtEventHandler(), openConfig.str().c_str(), &conn));
 
             WT_SESSION* session;
             conn->open_session(conn, nullptr, "", &session);
@@ -795,7 +797,7 @@ void WiredTigerKVEngine::cleanShutdown() {
             invariantWTOK(conn->reconfigure(conn, "compatibility=(release=2.9)"));
             invariantWTOK(conn->close(conn, closeConfig));
         }
-    }
+    }  // namespace mongo
 }
 
 Status WiredTigerKVEngine::okToRename(OperationContext* opCtx,
@@ -1328,8 +1330,9 @@ bool WiredTigerKVEngine::hasIdent(OperationContext* opCtx, StringData ident) con
 
 bool WiredTigerKVEngine::_hasUri(WT_SESSION* session, const std::string& uri) const {
     // can't use WiredTigerCursor since this is called from constructor.
-    WT_CURSOR* c = NULL;
-    int ret = session->open_cursor(session, "metadata:", NULL, NULL, &c);
+    WT_CURSOR* c = nullptr;
+    // No need for a metadata:create cursor, since it gathers extra information and is slower.
+    int ret = session->open_cursor(session, "metadata:", nullptr, nullptr, &c);
     if (ret == ENOENT)
         return false;
     invariantWTOK(ret);
@@ -1342,6 +1345,7 @@ bool WiredTigerKVEngine::_hasUri(WT_SESSION* session, const std::string& uri) co
 std::vector<std::string> WiredTigerKVEngine::getAllIdents(OperationContext* opCtx) const {
     std::vector<std::string> all;
     int ret;
+    // No need for a metadata:create cursor, since it gathers extra information and is slower.
     WiredTigerCursor cursor("metadata:", WiredTigerSession::kMetadataTableId, false, opCtx);
     WT_CURSOR* c = cursor.get();
     if (!c)

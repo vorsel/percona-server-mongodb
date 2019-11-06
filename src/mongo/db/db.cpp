@@ -290,6 +290,8 @@ Status restoreMissingFeatureCompatibilityVersionDocument(OperationContext* opCtx
 const NamespaceString startupLogCollectionName("local.startup_log");
 const NamespaceString kSystemReplSetCollection("local.system.replset");
 
+MONGO_EXPORT_SERVER_PARAMETER(waitForStepDownOnNonCommandShutdown, bool, true);
+
 #ifdef _WIN32
 const ntservice::NtServiceDefaultStrings defaultServiceStrings = {
     L"MongoDB", L"MongoDB", L"MongoDB Server"};
@@ -1268,11 +1270,46 @@ MONGO_INITIALIZER_GENERAL(setSSLManagerType, MONGO_NO_PREREQUISITES, ("SSLManage
 
 // NOTE: This function may be called at any time after registerShutdownTask is called below. It
 // must not depend on the prior execution of mongo initializers or the existence of threads.
-void shutdownTask() {
-    Client::initThreadIfNotAlready();
+void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
+    // This client initiation pattern is only to be used here, with plans to eliminate this pattern
+    // down the line.
+    if (!haveClient())
+        Client::initThread(getThreadName());
 
     auto const client = Client::getCurrent();
     auto const serviceContext = client->getServiceContext();
+
+    // If we don't have shutdownArgs, we're shutting down from a signal, or other clean shutdown
+    // path.
+    //
+    // In that case, do a default step down, still shutting down if stepDown fails.
+    {
+        auto replCoord = repl::ReplicationCoordinator::get(serviceContext);
+        if (replCoord && !shutdownArgs.isUserInitiated) {
+            replCoord->enterTerminalShutdown();
+            ServiceContext::UniqueOperationContext uniqueOpCtx;
+            OperationContext* opCtx = client->getOperationContext();
+            if (!opCtx) {
+                uniqueOpCtx = client->makeOperationContext();
+                opCtx = uniqueOpCtx.get();
+            }
+
+            try {
+                // For faster tests, we allow a short wait time with setParameter.
+                auto waitTime = waitForStepDownOnNonCommandShutdown.load()
+                    ? Milliseconds(Seconds(10))
+                    : Milliseconds(100);
+
+                uassertStatusOK(
+                    replCoord->stepDown(opCtx, false /* force */, waitTime, Seconds(120)));
+            } catch (const ExceptionFor<ErrorCodes::NotMaster>&) {
+                // ignore not master errors
+            } catch (const DBException& e) {
+                log() << "Failed to stepDown in non-command initiated shutdown path "
+                      << e.toString();
+            }
+        }
+    }
 
     // Terminate the balancer thread so it doesn't leak memory.
     if (auto balancer = Balancer::get(serviceContext)) {

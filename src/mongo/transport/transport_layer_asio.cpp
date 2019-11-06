@@ -34,6 +34,8 @@
 
 #include "mongo/transport/transport_layer_asio.h"
 
+#include <set>
+
 #include "boost/algorithm/string.hpp"
 
 #include "asio.hpp"
@@ -146,6 +148,8 @@ Status TransportLayerASIO::setup() {
         listenAddrs.emplace_back(makeUnixSockPath(_listenerOptions.port));
     }
 #endif
+
+    std::set<SockAddr> boundAddrs;
     for (auto& ip : listenAddrs) {
         std::error_code ec;
         if (ip.empty()) {
@@ -161,6 +165,13 @@ Status TransportLayerASIO::setup() {
         }
 
         for (const auto& addr : addrs) {
+            if (!boundAddrs.insert(addr).second) {
+                // SockAddr::createAll() can return multiple addresses for a single endpoint. This
+                // introduces the possibility that two different endpoints can return the same
+                // address. Hence, we filter our addresses for uniqueness.
+                continue;
+            }
+
             asio::generic::stream_protocol::endpoint endpoint(addr.raw(), addr.addressSize);
 
 #ifndef _WIN32
@@ -248,7 +259,15 @@ Status TransportLayerASIO::start() {
     });
 
     for (auto& acceptor : _acceptors) {
-        acceptor.second.listen(serverGlobalParams.listenBacklog);
+        asio::error_code ec;
+        acceptor.second.listen(serverGlobalParams.listenBacklog, ec);
+        if (ec) {
+            severe() << "Error listening for new connections on " << acceptor.first << ": "
+                     << ec.message();
+            fassertFailed(31339);
+        }
+        log() << "listening via socket bound to " << acceptor.first.getAddr();
+
         _acceptConnection(acceptor.second);
     }
 

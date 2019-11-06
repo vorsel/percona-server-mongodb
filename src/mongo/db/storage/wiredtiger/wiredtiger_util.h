@@ -92,6 +92,27 @@ struct WiredTigerItem : public WT_ITEM {
     }
 };
 
+/**
+ * Returns a WT_EVENT_HANDLER with MongoDB's default handlers.
+ * The default handlers just log so it is recommended that you consider calling them even if
+ * you are capturing the output.
+ *
+ * There is no default "close" handler. You only need to provide one if you need to call a
+ * destructor.
+ */
+class WiredTigerEventHandler : private WT_EVENT_HANDLER {
+public:
+    WiredTigerEventHandler();
+
+    WT_EVENT_HANDLER* getWtEventHandler();
+
+private:
+    int suppressibleStartupErrorLog(WT_EVENT_HANDLER* handler,
+                                    WT_SESSION* sesion,
+                                    int errorCode,
+                                    const char* message);
+};
+
 class WiredTigerUtil {
     MONGO_DISALLOW_COPYING(WiredTigerUtil);
 
@@ -118,9 +139,20 @@ public:
                                     BSONObjBuilder* bob);
 
     /**
-     * Gets entire metadata string for collection/index at URI.
+     * Gets the creation metadata string for a collection or index at a given URI. Accepts an
+     * OperationContext or session.
+     *
+     * This returns more information, but is slower than getMetadata().
+     */
+    static StatusWith<std::string> getMetadataCreate(OperationContext* opCtx, StringData uri);
+    static StatusWith<std::string> getMetadataCreate(WT_SESSION* session, StringData uri);
+
+    /**
+     * Gets the entire metadata string for collection or index at URI. Accepts an OperationContext
+     * or session.
      */
     static StatusWith<std::string> getMetadata(OperationContext* opCtx, StringData uri);
+    static StatusWith<std::string> getMetadata(WT_SESSION* session, StringData uri);
 
     /**
      * Reads app_metadata for collection/index at URI as a BSON document.
@@ -184,16 +216,6 @@ public:
      * option chosen or the amount of available memory on the host.
      */
     static size_t getCacheSizeMB(double requestedCacheSizeGB);
-
-    /**
-     * Returns a WT_EVENT_HANDER with MongoDB's default handlers.
-     * The default handlers just log so it is recommended that you consider calling them even if
-     * you are capturing the output.
-     *
-     * There is no default "close" handler. You only need to provide one if you need to call a
-     * destructor.
-     */
-    static WT_EVENT_HANDLER defaultEventHandlers();
 
     class ErrorAccumulator : public WT_EVENT_HANDLER {
     public:

@@ -72,6 +72,7 @@ selector:
   - jstests/sharding/secondary_shard_versioning.js
   - jstests/sharding/session_info_in_oplog.js
   - jstests/sharding/sessions_collection_auto_healing.js
+  - jstests/sharding/shard_collection_sets_shard_version_on_retry.js
   - jstests/sharding/shard_config_db_collections.js
   - jstests/sharding/time_zone_info_mongos.js
   - jstests/sharding/verify_sessions_expiration_sharded.js
@@ -113,6 +114,9 @@ selector:
   - jstests/sharding/nonreplicated_uuids_on_shardservers.js
   # Added metrics only in v3.6
   - jstests/sharding/server_status_crud_metrics.js
+  # Assumes shard doesn't refresh after a successful splitChunk (which it does
+  # in 3.4)
+  - jstests/sharding/major_version_check.js
 
 executor:
   config:
