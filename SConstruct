@@ -2881,6 +2881,14 @@ def doConfigure(myenv):
     else:
         env.Append( MONGO_CRYPTO=["tom"] )
 
+    if has_option( "hotbackup" ) \
+        and not conf.CheckLibWithHeader(
+        "curl",
+        ["curl/curl.h"], "C",
+        "curl_global_init(0);",
+        autoadd=False):
+        env.ConfError("Could not find <curl/curl.h> and curl lib")
+
     if use_system_version_of_library("pcre"):
         conf.FindSysLibDep("pcre", ["pcre"])
         conf.FindSysLibDep("pcrecpp", ["pcrecpp"])
