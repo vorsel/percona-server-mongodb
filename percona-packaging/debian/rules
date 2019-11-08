@@ -22,7 +22,7 @@ override_dh_auto_clean:
 	rm -fr $(PSMSRC)/bin
 	#rm -fr $(INSTALLDIR)
 	buildscripts/scons.py CC=$(CC) CXX=$(CXX) -C $(PSMSRC) -c --disable-warnings-as-errors --audit --release --ssl --opt -j$(NJOBS) --use-sasl-client CPPPATH=$(INSTALLDIR)/include \
-	LIBPATH=$(INSTALLDIR)/lib --wiredtiger --inmemory --hotbackup $(PSM_TARGETS)
+	LIBPATH=$(INSTALLDIR)/lib LINKFLAGS="$(LINKFLAGS)" --wiredtiger --inmemory --hotbackup $(PSM_TARGETS)
 	rm -fr build
 	find $(PSMSRC) -name '*.pyc' -delete
 
@@ -30,7 +30,7 @@ override_dh_auto_clean:
 percona-server-mongodb:
 	buildscripts/scons.py CC=${CC} CXX=${CXX} --disable-warnings-as-errors --audit --release --ssl --opt=on -j$(NJOBS) \
 	--use-sasl-client --wiredtiger --inmemory --hotbackup \
-	CPPPATH=${INSTALLDIR}/include LIBPATH=${INSTALLDIR}/lib ${PSM_TARGETS}
+	CPPPATH=${INSTALLDIR}/include LIBPATH=${INSTALLDIR}/lib LINKFLAGS="${LINKFLAGS}" ${PSM_TARGETS}
 
 compile-mongo-tools:
 	mkdir $(PSMSRC)/bin || true;
