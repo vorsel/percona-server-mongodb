@@ -114,6 +114,7 @@ export CC=${CC:-gcc}
 export CXX=${CXX:-g++}
 export PSM_TARGETS="mongod mongos mongo perconadecrypt"
 export INSTALLDIR=$RPM_BUILD_DIR/install
+export INSTALLDIR_AWS=$RPM_BUILD_DIR/install_aws
 export TOOLS_TAGS="ssl sasl"
 export PORTABLE=1
 export USE_SSE=1
@@ -134,9 +135,27 @@ mkdir -p ${INSTALLDIR}/lib
 make install-static INSTALL_PATH=${INSTALLDIR}
 popd
 
+#aws-sdk-cpp
+pushd $RPM_BUILD_DIR/%{src_dir}/aws-sdk-cpp
+    pushd build
+%if 0%{?rhel} >= 7
+        cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_ONLY="s3" -DBUILD_SHARED_LIBS=OFF -DMINIMIZE_SIZE=ON -DCMAKE_INSTALL_PREFIX="${INSTALLDIR_AWS}"
+        cmake --build . --target install
+%else
+        cmake3 CC=${CC} CXX=${CXX} .. -DCMAKE_BUILD_TYPE=Release -DBUILD_ONLY="s3" -DBUILD_SHARED_LIBS=OFF -DMINIMIZE_SIZE=ON -DCMAKE_INSTALL_PREFIX="${INSTALLDIR_AWS}"
+        cmake3 --build . --target install
+%endif
+
+    popd
+popd
+mkdir -p ${INSTALLDIR}/include/
+mkdir -p ${INSTALLDIR}/lib/
+mv ${INSTALLDIR_AWS}/include/* ${INSTALLDIR}/include/
+mv ${INSTALLDIR_AWS}/lib*/* ${INSTALLDIR}/lib/
+
 # Build PSfMDB with SCons
 pushd $RPM_BUILD_DIR/%{src_dir}
-buildscripts/scons.py CC=${CC} CXX=${CXX} --audit --release --ssl --opt=on  \
+buildscripts/scons.py CC=${CC} CXX=${CXX} --audit --release --disable-warnings-as-errors --ssl --opt=on  \
 %{?_smp_mflags} --use-sasl-client CPPPATH=${INSTALLDIR}/include LIBPATH=${INSTALLDIR}/lib \
 --rocksdb --wiredtiger --inmemory --hotbackup ${PSM_TARGETS}
 popd
