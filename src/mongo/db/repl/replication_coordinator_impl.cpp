@@ -805,6 +805,11 @@ void ReplicationCoordinatorImpl::startup(OperationContext* opCtx) {
     }
 }
 
+void ReplicationCoordinatorImpl::enterTerminalShutdown() {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    _inTerminalShutdown = true;
+}
+
 void ReplicationCoordinatorImpl::shutdown(OperationContext* opCtx) {
     // Shutdown must:
     // * prevent new threads from blocking in awaitReplication
@@ -1368,7 +1373,12 @@ Status ReplicationCoordinatorImpl::_waitUntilOpTime(OperationContext* opCtx,
             auto waitStatus =
                 opCtx->waitForConditionOrInterruptNoAssert(_currentCommittedSnapshotCond, lock);
             if (!waitStatus.isOK()) {
-                return waitStatus;
+                return waitStatus.withContext(str::stream()
+                                              << "Error waiting for snapshot not less than "
+                                              << targetOpTime.toString()
+                                              << ", current relevant optime is "
+                                              << getCurrentOpTime().toString()
+                                              << ".");
             }
             LOG(3) << "Got notified of new snapshot: " << _currentCommittedSnapshot->toString();
             continue;
@@ -1386,17 +1396,22 @@ Status ReplicationCoordinatorImpl::_waitUntilOpTime(OperationContext* opCtx,
         if (deadline) {
             auto waitUntilStatus =
                 opCtx->waitForConditionOrInterruptNoAssertUntil(condVar, lock, *deadline);
-            if (!waitUntilStatus.isOK()) {
-                waitStatus = waitUntilStatus.getStatus();
-            }
-            // If deadline is set no need to wait until the targetTime time is reached.
-            return waitStatus;
+            waitStatus = waitUntilStatus.getStatus();
         } else {
             waitStatus = opCtx->waitForConditionOrInterruptNoAssert(condVar, lock);
         }
 
         if (!waitStatus.isOK()) {
-            return waitStatus;
+            return waitStatus.withContext(str::stream() << "Error waiting for optime "
+                                                        << targetOpTime.toString()
+                                                        << ", current relevant optime is "
+                                                        << getCurrentOpTime().toString()
+                                                        << ".");
+        }
+
+        // If deadline is set no need to wait until the targetTime time is reached.
+        if (deadline) {
+            return Status::OK();
         }
     }
 
@@ -3031,7 +3046,7 @@ ReplicationCoordinatorImpl::_setCurrentRSConfig_inlock(OperationContext* opCtx,
         log() << "**          in a future version." << startupWarningsLog;
     }
 
-    // Warn if running --nojournal and writeConcernMajorityJournalDefault = false
+    // Warn if running --nojournal and writeConcernMajorityJournalDefault = true
     StorageEngine* storageEngine = opCtx->getServiceContext()->getGlobalStorageEngine();
     if (storageEngine && !storageEngine->isDurable() &&
         (newConfig.getWriteConcernMajorityShouldJournal() &&
@@ -3046,6 +3061,23 @@ ReplicationCoordinatorImpl::_setCurrentRSConfig_inlock(OperationContext* opCtx,
         log() << "**          option to the replica set config must be set to false "
               << startupWarningsLog;
         log() << "**          or w:majority write concerns will never complete."
+              << startupWarningsLog;
+        log() << startupWarningsLog;
+    }
+
+    // Warn if using the in-memory (ephemeral) storage engine with
+    // writeConcernMajorityJournalDefault = true
+    if (storageEngine && storageEngine->isEphemeral() &&
+        (newConfig.getWriteConcernMajorityShouldJournal() &&
+         (!oldConfig.isInitialized() || !oldConfig.getWriteConcernMajorityShouldJournal()))) {
+        log() << startupWarningsLog;
+        log() << "** WARNING: This replica set is using in-memory (ephemeral) storage with the "
+              << startupWarningsLog;
+        log() << "**          writeConcernMajorityJournalDefault option to the replica set config "
+              << startupWarningsLog;
+        log() << "**          set to true. The writeConcernMajorityJournalDefault option to the "
+              << startupWarningsLog;
+        log() << "**          replica set config is unsupported while using in-memory storage."
               << startupWarningsLog;
         log() << startupWarningsLog;
     }
@@ -3530,6 +3562,13 @@ Status ReplicationCoordinatorImpl::processReplSetRequestVotes(
 
     {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
+
+        // We should only enter terminal shutdown from global terminal exit.  In that case, rather
+        // than voting in a term we don't plan to stay alive in, refuse to vote.
+        if (_inTerminalShutdown) {
+            return Status(ErrorCodes::ShutdownInProgress, "In the process of shutting down");
+        }
+
         _topCoord->processReplSetRequestVotes(args, response);
     }
 

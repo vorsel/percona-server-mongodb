@@ -36,6 +36,7 @@
 #include <memory>
 #include <string>
 
+#include <boost/filesystem/path.hpp>
 #include <wiredtiger.h>
 
 #include "mongo/bson/ordering.h"
@@ -44,6 +45,7 @@
 #include "mongo/db/storage/wiredtiger/encryption_keydb.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_oplog_manager.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/elapsed_tracker.h"
@@ -63,7 +65,8 @@ public:
                        const std::string& path,
                        ClockSource* cs,
                        const std::string& extraOpenOptions,
-                       size_t cacheSizeGB,
+                       size_t cacheSizeMB,
+                       size_t maxCacheOverflowFileSizeMB,
                        bool durable,
                        bool ephemeral,
                        bool repair,
@@ -153,6 +156,8 @@ public:
     virtual void endBackup(OperationContext* opCtx);
 
     virtual Status hotBackup(OperationContext* opCtx, const std::string& path) override;
+    virtual Status hotBackupTar(OperationContext* opCtx, const std::string& path) override;
+    virtual Status hotBackup(OperationContext* opCtx, const percona::S3BackupParameters& s3params) override;
 
     virtual int64_t getIdentSize(OperationContext* opCtx, StringData ident);
 
@@ -281,6 +286,13 @@ private:
     class WiredTigerJournalFlusher;
     class WiredTigerCheckpointThread;
 
+    // srcPath, destPath, session, cursor
+    typedef std::tuple<boost::filesystem::path, boost::filesystem::path, std::shared_ptr<WiredTigerSession>, WT_CURSOR*> DBTuple;
+    // srcPath, destPath, filename, size to copy
+    typedef std::tuple<boost::filesystem::path, boost::filesystem::path, boost::uintmax_t, std::time_t> FileTuple;
+
+    Status _hotBackupPopulateLists(OperationContext* opCtx, const std::string& path, std::vector<DBTuple>& dbList, std::vector<FileTuple>& filesList);
+
     Status _salvageIfNeeded(const char* uri);
     void _checkIdentPath(StringData ident);
 
@@ -295,7 +307,7 @@ private:
 
     std::unique_ptr<EncryptionKeyDB> _encryptionKeyDB;
     WT_CONNECTION* _conn;
-    WT_EVENT_HANDLER _eventHandler;
+    WiredTigerEventHandler _eventHandler;
     std::unique_ptr<WiredTigerSessionCache> _sessionCache;
     ClockSource* const _clockSource;
 

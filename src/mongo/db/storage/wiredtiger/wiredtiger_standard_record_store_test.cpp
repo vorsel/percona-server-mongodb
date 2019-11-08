@@ -62,15 +62,16 @@
 namespace mongo {
 namespace {
 
-using std::unique_ptr;
 using std::string;
 using std::stringstream;
+using std::unique_ptr;
 
 class WiredTigerHarnessHelper final : public RecordStoreHarnessHelper {
 public:
     WiredTigerHarnessHelper()
         : _dbpath("wt_test"),
-          _engine(kWiredTigerEngineName, _dbpath.path(), &_cs, "", 1, false, false, false, false) {}
+          _engine(
+              kWiredTigerEngineName, _dbpath.path(), &_cs, "", 1, 0, false, false, false, false) {}
 
     WiredTigerHarnessHelper(StringData extraStrings)
         : _dbpath("wt_test"),
@@ -79,6 +80,7 @@ public:
                   &_cs,
                   extraStrings.toString(),
                   1,
+                  0,
                   false,
                   false,
                   false,
@@ -167,6 +169,16 @@ public:
         params.sizeStorer = nullptr;
 
         auto ret = stdx::make_unique<StandardWiredTigerRecordStore>(&_engine, &opCtx, params);
+
+        // Opening this reverse cursor is not normally required, however the call to
+        // postConstructorInit depends on existing open transaction that is not reading at the oplog
+        // visibility timestamp (i.e. using a reverse cursor). This is here to comply with that
+        // assumption to make the test pass, but would otherwise not be an issue in a normal
+        // circumstances, because the WiredTigerOplogManager does this already.
+        {
+            std::unique_ptr<SeekableRecordCursor> cursor =
+                ret->getCursor(&opCtx, /*forward=*/false);
+        }
         ret->postConstructorInit(&opCtx);
         return std::move(ret);
     }

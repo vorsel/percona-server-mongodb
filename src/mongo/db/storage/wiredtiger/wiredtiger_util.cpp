@@ -96,7 +96,7 @@ void WiredTigerUtil::fetchTypeAndSourceURI(OperationContext* opCtx,
     const size_t colon = tableUri.find(':');
     invariant(colon != string::npos);
     colgroupUri += tableUri.substr(colon);
-    StatusWith<std::string> colgroupResult = getMetadata(opCtx, colgroupUri);
+    StatusWith<std::string> colgroupResult = getMetadataCreate(opCtx, colgroupUri);
     invariantOK(colgroupResult.getStatus());
     WiredTigerConfigParser parser(colgroupResult.getValue());
 
@@ -111,16 +111,8 @@ void WiredTigerUtil::fetchTypeAndSourceURI(OperationContext* opCtx,
     *source = std::string(sourceItem.str, sourceItem.len);
 }
 
-StatusWith<std::string> WiredTigerUtil::getMetadata(OperationContext* opCtx, StringData uri) {
-    invariant(opCtx);
-
-    auto session = WiredTigerRecoveryUnit::get(opCtx)->getSessionNoTxn();
-    WT_CURSOR* cursor =
-        session->getCursor("metadata:create", WiredTigerSession::kMetadataTableId, false);
-    invariant(cursor);
-    auto releaser =
-        MakeGuard([&] { session->releaseCursor(WiredTigerSession::kMetadataTableId, cursor); });
-
+namespace {
+StatusWith<std::string> _getMetadata(WT_CURSOR* cursor, StringData uri) {
     std::string strUri = uri.toString();
     cursor->set_key(cursor, strUri.c_str());
     int ret = cursor->search(cursor);
@@ -137,6 +129,49 @@ StatusWith<std::string> WiredTigerUtil::getMetadata(OperationContext* opCtx, Str
     }
     invariant(metadata);
     return StatusWith<std::string>(metadata);
+}
+}  // namespace
+
+StatusWith<std::string> WiredTigerUtil::getMetadataCreate(WT_SESSION* session, StringData uri) {
+    WT_CURSOR* cursor;
+    invariantWTOK(session->open_cursor(session, "metadata:create", nullptr, "", &cursor));
+    invariant(cursor);
+    ON_BLOCK_EXIT([cursor] { invariantWTOK(cursor->close(cursor)); });
+
+    return _getMetadata(cursor, uri);
+}
+
+StatusWith<std::string> WiredTigerUtil::getMetadataCreate(OperationContext* opCtx, StringData uri) {
+    invariant(opCtx);
+
+    auto session = WiredTigerRecoveryUnit::get(opCtx)->getSessionNoTxn();
+    WT_CURSOR* cursor =
+        session->getCursor("metadata:create", WiredTigerSession::kMetadataCreateTableId, false);
+
+    auto releaser = MakeGuard(
+        [&] { session->releaseCursor(WiredTigerSession::kMetadataCreateTableId, cursor); });
+
+    return _getMetadata(cursor, uri);
+}
+
+StatusWith<std::string> WiredTigerUtil::getMetadata(WT_SESSION* session, StringData uri) {
+    WT_CURSOR* cursor;
+    invariantWTOK(session->open_cursor(session, "metadata:", nullptr, "", &cursor));
+    invariant(cursor);
+    ON_BLOCK_EXIT([cursor] { invariantWTOK(cursor->close(cursor)); });
+
+    return _getMetadata(cursor, uri);
+}
+
+StatusWith<std::string> WiredTigerUtil::getMetadata(OperationContext* opCtx, StringData uri) {
+    invariant(opCtx);
+
+    auto session = WiredTigerRecoveryUnit::get(opCtx)->getSessionNoTxn();
+    WT_CURSOR* cursor = session->getCursor("metadata:", WiredTigerSession::kMetadataTableId, false);
+    auto releaser =
+        MakeGuard([&] { session->releaseCursor(WiredTigerSession::kMetadataTableId, cursor); });
+
+    return _getMetadata(cursor, uri);
 }
 
 Status WiredTigerUtil::getApplicationMetadata(OperationContext* opCtx,
@@ -367,6 +402,27 @@ size_t WiredTigerUtil::getCacheSizeMB(double requestedCacheSizeGB) {
 }
 
 namespace {
+int mdb_handle_error_with_startup_suppression(WT_EVENT_HANDLER* handler,
+                                              WT_SESSION* session,
+                                              int errorCode,
+                                              const char* message) {
+    try {
+        StringData sd(message);
+        error() << "WiredTiger error (" << errorCode << ") " << redact(message)
+                << " Raw: " << message;
+        if (sd.find("this build requires a maximum version of 2, and the file is version 3")) {
+            error()
+                << "An unsupported journal format detected - If you are trying to rollback from "
+                   "version 4.0 to 3.6, please re-start a 4.0 binary and cleanly shut it down so "
+                   "that the journal format will be downgraded.";
+        }
+        fassert(50853, errorCode != WT_PANIC);
+    } catch (...) {
+        std::terminate();
+    }
+    return 0;
+}
+
 int mdb_handle_error(WT_EVENT_HANDLER* handler,
                      WT_SESSION* session,
                      int errorCode,
@@ -401,14 +457,31 @@ int mdb_handle_progress(WT_EVENT_HANDLER* handler,
 
     return 0;
 }
-}
 
-WT_EVENT_HANDLER WiredTigerUtil::defaultEventHandlers() {
+WT_EVENT_HANDLER defaultEventHandlers() {
     WT_EVENT_HANDLER handlers = {};
     handlers.handle_error = mdb_handle_error;
     handlers.handle_message = mdb_handle_message;
     handlers.handle_progress = mdb_handle_progress;
     return handlers;
+}
+}  // namespace
+
+WiredTigerEventHandler::WiredTigerEventHandler() {
+    WT_EVENT_HANDLER* handler = static_cast<WT_EVENT_HANDLER*>(this);
+    invariant((void*)this == (void*)handler);
+
+    handler->handle_error = mdb_handle_error_with_startup_suppression;
+    handler->handle_message = mdb_handle_message;
+    handler->handle_progress = mdb_handle_progress;
+    handler->handle_close = nullptr;
+}
+
+WT_EVENT_HANDLER* WiredTigerEventHandler::getWtEventHandler() {
+    WT_EVENT_HANDLER* ret = static_cast<WT_EVENT_HANDLER*>(this);
+    invariant((void*)this == (void*)ret);
+
+    return ret;
 }
 
 WiredTigerUtil::ErrorAccumulator::ErrorAccumulator(std::vector<std::string>* errors)

@@ -1684,6 +1684,15 @@ if env.TargetOSIs('posix'):
         except KeyError:
             pass
 
+    # Python uses APPDATA to determine the location of user installed
+    # site-packages. If we do not pass this variable down to Python
+    # subprocesses then anything installed with `pip install --user`
+    # will be inaccessible leading to import errors.
+    if env.TargetOSIs('windows'):
+        appdata = os.getenv('APPDATA', None)
+        if appdata is not None:
+            env['ENV']['APPDATA'] = appdata
+
     if env.TargetOSIs('linux') and has_option( "gcov" ):
         env.Append( CCFLAGS=["-fprofile-arcs", "-ftest-coverage"] )
         env.Append( LINKFLAGS=["-fprofile-arcs", "-ftest-coverage"] )
@@ -2871,6 +2880,14 @@ def doConfigure(myenv):
 
     else:
         env.Append( MONGO_CRYPTO=["tom"] )
+
+    if has_option( "hotbackup" ) \
+        and not conf.CheckLibWithHeader(
+        "curl",
+        ["curl/curl.h"], "C",
+        "curl_global_init(0);",
+        autoadd=False):
+        env.ConfError("Could not find <curl/curl.h> and curl lib")
 
     if use_system_version_of_library("pcre"):
         conf.FindSysLibDep("pcre", ["pcre"])

@@ -26,6 +26,7 @@ env.Library(
 
 if wiredtiger:
     wtEnv = env.Clone()
+    wtEnv.InjectThirdPartyIncludePaths(libraries=['libarchive'])
     wtEnv.InjectThirdPartyIncludePaths(libraries=['wiredtiger'])
     wtEnv.InjectThirdPartyIncludePaths(libraries=['zlib'])
     wtEnv.InjectThirdPartyIncludePaths(libraries=['valgrind'])
@@ -72,6 +73,7 @@ if wiredtiger:
             '$BUILD_DIR/mongo/util/concurrency/ticketholder',
             '$BUILD_DIR/mongo/util/elapsed_tracker',
             '$BUILD_DIR/mongo/util/processinfo',
+            '$BUILD_DIR/third_party/shim_libarchive',
             '$BUILD_DIR/third_party/shim_snappy',
             '$BUILD_DIR/third_party/shim_wiredtiger',
             '$BUILD_DIR/third_party/shim_zlib',
@@ -81,6 +83,17 @@ if wiredtiger:
             # SERVER-31802 : remove this.
             '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
             ],
+        SYSLIBDEPS=[
+            # curl is required by S3
+            'curl',
+            # S3 and its dependencies
+            # order is important
+            'aws-cpp-sdk-s3',
+            'aws-cpp-sdk-core',
+            'aws-c-event-stream',
+            'aws-c-common',
+            'aws-checksums',
+            ]
         )
 
     wtEnv.Library(
