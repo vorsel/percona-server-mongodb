@@ -417,6 +417,22 @@ EOL
       python get-pip.py
       easy_install pip
     fi
+    if [ x"${DEBIAN}" = "xstretch" ]; then
+      LIBCURL_DEPS="libidn2-0-dev libkrb5-dev libldap2-dev libnghttp2-dev libnss3-dev libpsl-dev librtmp-dev libssh2-1-dev libssl1.0-dev"
+      until DEBIAN_FRONTEND=noninteractive apt-get -y install ${LIBCURL_DEPS}; do
+        sleep 1
+        echo "waiting"
+      done
+      wget http://curl.haxx.se/download/curl-7.66.0.tar.gz
+      tar -xvzf curl-7.66.0.tar.gz
+        cd curl-7.66.0
+        ./configure --enable-static --disable-shared --disable-dependency-tracking --disable-symbol-hiding --enable-versioned-symbols --enable-threaded-resolver --with-lber-lib=lber --with-gssapi=/usr --with-libssh2 --with-nghttp2 --with-zsh-functions-dir=/usr/share/zsh/vendor-completions --with-ca-path=/etc/ssl/certs --with-ca-bundle=/etc/ssl/certs/ca-certificates.crt --with-ssl
+        make
+        make install
+      cd ../
+      CURL_LINKFLAGS=$(pkg-config libcurl --static --libs)
+      export LDFLAGS="${LDFLAGS} ${CURL_LINKFLAGS}"
+    fi
     aws_sdk_build
     return;
 }
@@ -695,6 +711,10 @@ build_deb(){
     sed -i 's|exit $ec||' mongo-tools/build.sh
     dch -m -D "${DEBIAN}" --force-distribution -v "${VERSION}-${RELEASE}.${DEBIAN}" 'Update distribution'
     export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
+    if [ x"${DEBIAN}" = "xstretch" ]; then
+      CURL_LINKFLAGS=$(pkg-config libcurl --static --libs)
+      export LINKFLAGS="${LINKFLAGS} ${CURL_LINKFLAGS}"
+    fi
     dpkg-buildpackage -rfakeroot -us -uc -b
     mkdir -p $CURDIR/deb
     mkdir -p $WORKDIR/deb
@@ -814,11 +834,15 @@ build_tarball(){
         fi
     fi
     export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
+    if [ x"${DEBIAN}" = "xstretch" ]; then
+      CURL_LINKFLAGS=$(pkg-config libcurl --static --libs)
+      export LINKFLAGS="${LINKFLAGS} ${CURL_LINKFLAGS}"
+    fi
     if [ ${DEBUG} = 0 ]; then
-        buildscripts/scons.py CC=${CC} CXX=${CXX} --disable-warnings-as-errors --release --ssl --opt=on -j$NJOBS --use-sasl-client --wiredtiger --audit --inmemory --hotbackup CPPPATH=${INSTALLDIR}/include LIBPATH=${INSTALLDIR}/lib ${PSM_TARGETS}
+        buildscripts/scons.py CC=${CC} CXX=${CXX} --disable-warnings-as-errors --release --ssl --opt=on -j$NJOBS --use-sasl-client --wiredtiger --audit --inmemory --hotbackup CPPPATH=${INSTALLDIR}/include LIBPATH=${INSTALLDIR}/lib LINKFLAGS="${LINKFLAGS}" ${PSM_TARGETS}
     else
         buildscripts/scons.py CC=${CC} CXX=${CXX} --disable-warnings-as-errors --audit --ssl --dbg=on -j$NJOBS --use-sasl-client \
-        CPPPATH=${INSTALLDIR}/include LIBPATH=${INSTALLDIR}/lib --wiredtiger --inmemory --hotbackup ${PSM_TARGETS}
+        CPPPATH=${INSTALLDIR}/include LIBPATH=${INSTALLDIR}/lib LINKFLAGS="${LINKFLAGS}" --wiredtiger --inmemory --hotbackup ${PSM_TARGETS}
     fi
     #
     # scons install doesn't work - it installs the binaries not linked with fractal tree
