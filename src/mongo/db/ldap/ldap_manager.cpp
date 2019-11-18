@@ -29,36 +29,51 @@ Copyright (C) 2019-present Percona and/or its affiliates. All rights reserved.
     it in the license file.
 ======= */
 
-#pragma once
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
 
-#include <atomic>
-#include <string>
+#include "mongo/db/ldap/ldap_manager.h"
 
-#include "mongo/base/status.h"
-#include "mongo/util/synchronized_value.h"
+#include "mongo/db/ldap/ldap_manager_impl.h"
+#include "mongo/db/ldap_options.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
-namespace optionenvironment {
-class OptionSection;
-class Environment;
-}  // namespace optionenvironment
+std::unique_ptr<LDAPManager> LDAPManager::create() {
+    return std::make_unique<LDAPManagerImpl>();
+}
 
-namespace moe = optionenvironment;
+namespace {
 
-struct LDAPGlobalParams;
-extern LDAPGlobalParams ldapGlobalParams;
-struct LDAPGlobalParams {
-    synchronized_value<std::string> ldapServers;
-    std::string ldapTransportSecurity;
-    std::string ldapBindMethod;
-    std::string ldapBindSaslMechanisms;
-    AtomicWord<int> ldapTimeoutMS;
-    synchronized_value<std::string> ldapQueryUser;
-    synchronized_value<std::string> ldapQueryPassword;
-    synchronized_value<std::string> ldapUserToDNMapping;
-    bool ldapUseConnectionPool;
-    AtomicWord<int> ldapUserCacheInvalidationInterval;
-    synchronized_value<std::string> ldapQueryTemplate;
-};
+const auto getLDAPManager =
+    ServiceContext::declareDecoration<std::unique_ptr<LDAPManager>>();
+
+}  // namespace
+
+LDAPManager* LDAPManager::get(ServiceContext* service) {
+    return getLDAPManager(service).get();
+}
+
+LDAPManager* LDAPManager::get(ServiceContext& service) {
+    return getLDAPManager(service).get();
+}
+
+void LDAPManager::set(ServiceContext* service,
+                      std::unique_ptr<LDAPManager> authzManager) {
+    getLDAPManager(service) = std::move(authzManager);
+}
+
+ServiceContext::ConstructorActionRegisterer createLDAPManager(
+    "CreateLDAPManager",
+    {"EndStartupOptionStorage"},
+    [](ServiceContext* service) {
+        if (!ldapGlobalParams.ldapServers->empty()) {
+            auto ldapManager = LDAPManager::create();
+            Status res = ldapManager->initialize();
+            uassertStatusOKWithContext(res, "Cannot initialize LDAP server connection");
+            LDAPManager::set(service, std::move(ldapManager));
+        }
+    });
+
 }  // namespace mongo
+
