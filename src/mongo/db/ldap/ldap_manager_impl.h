@@ -31,34 +31,23 @@ Copyright (C) 2019-present Percona and/or its affiliates. All rights reserved.
 
 #pragma once
 
-#include <atomic>
-#include <string>
+#include "mongo/db/ldap/ldap_manager.h"
 
-#include "mongo/base/status.h"
-#include "mongo/util/synchronized_value.h"
+#include <ldap.h>
 
 namespace mongo {
 
-namespace optionenvironment {
-class OptionSection;
-class Environment;
-}  // namespace optionenvironment
+class LDAPManagerImpl : public LDAPManager {
+public:
+    LDAPManagerImpl();
+    virtual ~LDAPManagerImpl() override;
 
-namespace moe = optionenvironment;
+    virtual Status initialize() override;
 
-struct LDAPGlobalParams;
-extern LDAPGlobalParams ldapGlobalParams;
-struct LDAPGlobalParams {
-    synchronized_value<std::string> ldapServers;
-    std::string ldapTransportSecurity;
-    std::string ldapBindMethod;
-    std::string ldapBindSaslMechanisms;
-    AtomicWord<int> ldapTimeoutMS;
-    synchronized_value<std::string> ldapQueryUser;
-    synchronized_value<std::string> ldapQueryPassword;
-    synchronized_value<std::string> ldapUserToDNMapping;
-    bool ldapUseConnectionPool;
-    AtomicWord<int> ldapUserCacheInvalidationInterval;
-    synchronized_value<std::string> ldapQueryTemplate;
+    virtual Status queryUserRoles(const UserName& userName, stdx::unordered_set<RoleName>& roles) override;
+
+private:
+    LDAP* _ldap{nullptr};
 };
+
 }  // namespace mongo

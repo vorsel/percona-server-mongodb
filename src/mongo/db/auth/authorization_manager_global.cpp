@@ -42,7 +42,7 @@ namespace {
 
 ServiceContext::ConstructorActionRegisterer createAuthorizationManager(
     "CreateAuthorizationManager",
-    {"OIDGeneration", "EndStartupOptionStorage"},
+    {"OIDGeneration", "EndStartupOptionStorage", "CreateLDAPManager"},
     [](ServiceContext* service) {
         auto authzManager = AuthorizationManager::create(service);
         authzManager->setAuthEnabled(serverGlobalParams.authState ==

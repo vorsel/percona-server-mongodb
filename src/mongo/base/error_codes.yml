@@ -368,3 +368,6 @@ error_codes:
     - {code: 14031,name: OutOfDiskSpace}
     - {code: 17280,name: OSBELETE_KeyTooLong}
 
+    # Percona Server for MongoDB error codes
+    - {code: 9390,name: LDAPLibraryError}
+

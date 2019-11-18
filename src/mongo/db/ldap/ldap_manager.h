@@ -31,34 +31,28 @@ Copyright (C) 2019-present Percona and/or its affiliates. All rights reserved.
 
 #pragma once
 
-#include <atomic>
-#include <string>
-
 #include "mongo/base/status.h"
-#include "mongo/util/synchronized_value.h"
+#include "mongo/db/auth/user_name.h"
+#include "mongo/db/auth/role_name.h"
+#include "mongo/db/service_context.h"
+#include "mongo/stdx/unordered_set.h"
 
 namespace mongo {
 
-namespace optionenvironment {
-class OptionSection;
-class Environment;
-}  // namespace optionenvironment
+class LDAPManager {
+public:
+    static LDAPManager* get(ServiceContext* service);
+    static LDAPManager* get(ServiceContext& service);
+    static void set(ServiceContext* service, std::unique_ptr<LDAPManager> authzManager);
 
-namespace moe = optionenvironment;
+    LDAPManager() = default;
+    virtual ~LDAPManager() = default;
 
-struct LDAPGlobalParams;
-extern LDAPGlobalParams ldapGlobalParams;
-struct LDAPGlobalParams {
-    synchronized_value<std::string> ldapServers;
-    std::string ldapTransportSecurity;
-    std::string ldapBindMethod;
-    std::string ldapBindSaslMechanisms;
-    AtomicWord<int> ldapTimeoutMS;
-    synchronized_value<std::string> ldapQueryUser;
-    synchronized_value<std::string> ldapQueryPassword;
-    synchronized_value<std::string> ldapUserToDNMapping;
-    bool ldapUseConnectionPool;
-    AtomicWord<int> ldapUserCacheInvalidationInterval;
-    synchronized_value<std::string> ldapQueryTemplate;
+    static std::unique_ptr<LDAPManager> create();
+
+    virtual Status initialize() = 0;
+
+    virtual Status queryUserRoles(const UserName& userName, stdx::unordered_set<RoleName>& roles) = 0;
 };
+
 }  // namespace mongo
