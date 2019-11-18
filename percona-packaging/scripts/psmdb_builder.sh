@@ -732,7 +732,8 @@ build_tarball(){
     if [ ${DEBUG} = 1 ]; then
     export CXXFLAGS="${CFLAGS} -Wno-error=deprecated-declarations"
     fi
-    export INSTALLDIR=/usr/local
+    export INSTALLDIR=${WORKDIR}/install
+    export AWS_LIBS=/usr/local
     export PORTABLE=1
     export USE_SSE=1
     export LD_LIBRARY_PATH=/usr/local/gcc-5.4.0/lib:/usr/local/gcc-5.4.0/lib64:$LD_LIBRARY_PATH
@@ -797,10 +798,10 @@ build_tarball(){
       export LINKFLAGS="${LINKFLAGS} ${CURL_LINKFLAGS}"
     fi
     if [ ${DEBUG} = 0 ]; then
-        buildscripts/scons.py CC=${CC} CXX=${CXX} --disable-warnings-as-errors --release --ssl --opt=on -j$NJOBS --use-sasl-client --wiredtiger --audit --rocksdb --inmemory --hotbackup CPPPATH=${INSTALLDIR}/include LIBPATH=${INSTALLDIR}/lib LINKFLAGS="${LINKFLAGS}" ${PSM_TARGETS}
+        buildscripts/scons.py CC=${CC} CXX=${CXX} --disable-warnings-as-errors --release --ssl --opt=on -j$NJOBS --use-sasl-client --wiredtiger --audit --rocksdb --inmemory --hotbackup CPPPATH="${INSTALLDIR}/include ${AWS_LIBS}/include" LIBPATH="${INSTALLDIR}/lib ${AWS_LIBS}/lib" LINKFLAGS="${LINKFLAGS}" ${PSM_TARGETS}
     else
         buildscripts/scons.py CC=${CC} CXX=${CXX} --disable-warnings-as-errors --audit --ssl --dbg=on -j$NJOBS --use-sasl-client \
-        CPPPATH=${INSTALLDIR}/include LIBPATH=${INSTALLDIR}/lib LINKFLAGS="${LINKFLAGS}" --rocksdb --wiredtiger --inmemory --hotbackup ${PSM_TARGETS}
+        CPPPATH="${INSTALLDIR}/include ${AWS_LIBS}/include" LIBPATH="${INSTALLDIR}/lib ${AWS_LIBS}/lib" LINKFLAGS="${LINKFLAGS}" --rocksdb --wiredtiger --inmemory --hotbackup ${PSM_TARGETS}
     fi
     #
     # scons install doesn't work - it installs the binaries not linked with fractal tree
