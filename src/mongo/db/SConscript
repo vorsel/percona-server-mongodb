@@ -539,6 +539,7 @@ env.Library(
         "ratelimit_parameter.cpp",
         env.Idlc('mongod_options_encryption.idl')[0],
         env.Idlc('mongod_options_general.idl')[0],
+        env.Idlc('mongod_options_ldapauthz.idl')[0],
         env.Idlc('mongod_options_legacy.idl')[0],
         env.Idlc('mongod_options_replication.idl')[0],
         env.Idlc('mongod_options_sharding.idl')[0],
