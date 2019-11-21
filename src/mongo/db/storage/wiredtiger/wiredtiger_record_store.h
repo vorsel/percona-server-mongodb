@@ -143,12 +143,6 @@ public:
                                  std::vector<Record>* records,
                                  const std::vector<Timestamp>& timestamps);
 
-    virtual Status insertRecordsWithDocWriter(OperationContext* opCtx,
-                                              const DocWriter* const* docs,
-                                              const Timestamp* timestamps,
-                                              size_t nDocs,
-                                              RecordId* idsOut);
-
     virtual Status updateRecord(OperationContext* opCtx,
                                 const RecordId& recordId,
                                 const char* data,
@@ -191,7 +185,6 @@ public:
     }
 
     virtual void validate(OperationContext* opCtx,
-                          ValidateCmdLevel level,
                           ValidateResults* results,
                           BSONObjBuilder* output);
 
@@ -247,7 +240,9 @@ public:
 
     bool inShutdown() const;
 
-    void reclaimOplog(OperationContext* opCtx);
+    bool yieldAndAwaitOplogDeletionRequest(OperationContext* opCtx) override;
+
+    void reclaimOplog(OperationContext* opCtx) override;
 
     /**
      * The `recoveryTimestamp` is when replication recovery would need to replay from for
@@ -255,9 +250,6 @@ public:
      * truncate oplog entries in front of this time.
      */
     void reclaimOplog(OperationContext* opCtx, Timestamp recoveryTimestamp);
-
-    // Returns false if the oplog was dropped while waiting for a deletion request.
-    bool yieldAndAwaitOplogDeletionRequest(OperationContext* opCtx);
 
     bool haveCappedWaiters();
 

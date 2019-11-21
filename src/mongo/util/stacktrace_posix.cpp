@@ -247,6 +247,11 @@ void printStackTrace(std::ostream& os) {
 
 #endif
 
+void printStackTraceFromSignal(std::ostream& os) {
+    printStackTrace(os);
+}
+
+// From here down, a copy of stacktrace_unwind.cpp.
 namespace {
 
 void addOSComponentsToSoMap(BSONObjBuilder* soMap);

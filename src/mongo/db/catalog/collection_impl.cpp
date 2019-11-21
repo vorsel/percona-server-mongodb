@@ -31,8 +31,6 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/catalog/private/record_store_validate_adaptor.h"
-
 #include "mongo/db/catalog/collection_impl.h"
 
 #include "mongo/base/counter.h"
@@ -49,6 +47,7 @@
 #include "mongo/db/catalog/index_catalog_impl.h"
 #include "mongo/db/catalog/index_consistency.h"
 #include "mongo/db/catalog/index_key_validate.h"
+#include "mongo/db/catalog/record_store_validate_adaptor.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/concurrency/d_concurrency.h"
@@ -196,7 +195,7 @@ using logger::LogComponent;
 
 CollectionImpl::CollectionImpl(OperationContext* opCtx,
                                const NamespaceString& nss,
-                               OptionalCollectionUUID uuid,
+                               UUID uuid,
                                std::unique_ptr<RecordStore> recordStore)
     : _magic(kMagicNumber),
       _ns(nss),
@@ -324,13 +323,15 @@ StatusWithMatchExpression CollectionImpl::parseValidator(
     if (ns().isSystem() && !ns().isDropPendingNamespace()) {
         return {ErrorCodes::InvalidOptions,
                 str::stream() << "Document validators not allowed on system collection " << ns()
-                              << (_uuid ? " with UUID " + _uuid->toString() : "")};
+                              << " with UUID "
+                              << _uuid};
     }
 
     if (ns().isOnInternalDb()) {
         return {ErrorCodes::InvalidOptions,
                 str::stream() << "Document validators are not allowed on collection " << ns().ns()
-                              << (_uuid ? " with UUID " + _uuid->toString() : "")
+                              << " with UUID "
+                              << _uuid
                               << " in the "
                               << ns().db()
                               << " internal database"};
@@ -354,18 +355,15 @@ StatusWithMatchExpression CollectionImpl::parseValidator(
 }
 
 Status CollectionImpl::insertDocumentsForOplog(OperationContext* opCtx,
-                                               const DocWriter* const* docs,
-                                               Timestamp* timestamps,
-                                               size_t nDocs) {
+                                               std::vector<Record>* records,
+                                               const std::vector<Timestamp>& timestamps) {
     dassert(opCtx->lockState()->isWriteLocked());
 
     // Since this is only for the OpLog, we can assume these for simplicity.
-    // This also means that we do not need to forward this object to the OpObserver, which is good
-    // because it would defeat the purpose of using DocWriter.
     invariant(!_validator);
     invariant(!_indexCatalog->haveAnyIndexes());
 
-    Status status = _recordStore->insertRecordsWithDocWriter(opCtx, docs, timestamps, nDocs);
+    Status status = _recordStore->insertRecords(opCtx, records, timestamps);
     if (!status.isOK())
         return status;
 
@@ -704,8 +702,7 @@ RecordId CollectionImpl::updateDocument(OperationContext* opCtx,
     invariant(sid == opCtx->recoveryUnit()->getSnapshotId());
     args->updatedDoc = newDoc;
 
-    invariant(uuid());
-    OplogUpdateEntryArgs entryArgs(*args, ns(), *uuid());
+    OplogUpdateEntryArgs entryArgs(*args, ns(), _uuid);
     getGlobalServiceContext()->getOpObserver()->onUpdate(opCtx, entryArgs);
 
     return {oldLocation};
@@ -735,8 +732,7 @@ StatusWith<RecordData> CollectionImpl::updateDocumentWithDamages(
     if (newRecStatus.isOK()) {
         args->updatedDoc = newRecStatus.getValue().toBson();
 
-        invariant(uuid());
-        OplogUpdateEntryArgs entryArgs(*args, ns(), *uuid());
+        OplogUpdateEntryArgs entryArgs(*args, ns(), _uuid);
         getGlobalServiceContext()->getOpObserver()->onUpdate(opCtx, entryArgs);
     }
     return newRecStatus;
@@ -1092,13 +1088,13 @@ void _validateRecordStore(OperationContext* opCtx,
                           RecordStoreValidateAdaptor* indexValidator,
                           ValidateResults* results,
                           BSONObjBuilder* output) {
-
-    // Validate RecordStore and, if `level == kValidateFull`, use the RecordStore's validate
-    // function.
     if (background) {
-        indexValidator->traverseRecordStore(recordStore, level, results, output);
+        indexValidator->traverseRecordStore(recordStore, results, output);
     } else {
-        recordStore->validate(opCtx, level, results, output);
+        // For 'full' validation we use the record store's validation functionality.
+        if (level == kValidateFull) {
+            recordStore->validate(opCtx, results, output);
+        }
         _genericRecordStoreValidate(opCtx, recordStore, indexValidator, results, output);
     }
 }
@@ -1248,7 +1244,7 @@ void _reportValidationResults(OperationContext* opCtx,
             results->valid = false;
         }
 
-        if (indexDetails.get()) {
+        if (indexDetails) {
             BSONObjBuilder bob(indexDetails->subobjStart(indexNs));
             bob.appendBool("valid", vr.valid);
 
@@ -1267,10 +1263,11 @@ void _reportValidationResults(OperationContext* opCtx,
 
     output->append("nIndexes", indexCatalog->numIndexesReady(opCtx));
     output->append("keysPerIndex", keysPerIndex->done());
-    if (indexDetails.get()) {
+    if (indexDetails) {
         output->append("indexDetails", indexDetails->done());
     }
 }
+
 template <typename T>
 void addErrorIfUnequal(T stored, T cached, StringData name, ValidateResults* results) {
     if (stored != cached) {
@@ -1288,7 +1285,8 @@ void _validateCatalogEntry(OperationContext* opCtx,
                            BSONObj validatorDoc,
                            ValidateResults* results) {
     CollectionOptions options = DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, coll->ns());
-    addErrorIfUnequal(options.uuid, coll->uuid(), "UUID", results);
+    invariant(options.uuid);
+    addErrorIfUnequal(*(options.uuid), coll->uuid(), "UUID", results);
     const CollatorInterface* collation = coll->getDefaultCollator();
     addErrorIfUnequal(options.collation.isEmpty(), !collation, "simple collation", results);
     if (!options.collation.isEmpty() && collation)
@@ -1326,18 +1324,18 @@ Status CollectionImpl::validate(OperationContext* opCtx,
                                 bool background,
                                 ValidateResults* results,
                                 BSONObjBuilder* output) {
-    dassert(opCtx->lockState()->isCollectionLockedForMode(ns(), MODE_IS));
+    invariant(opCtx->lockState()->isCollectionLockedForMode(ns(), MODE_IS));
 
     try {
         ValidateResultsMap indexNsResultsMap;
-        BSONObjBuilder keysPerIndex;  // not using subObjStart to be exception safe
+        BSONObjBuilder keysPerIndex;  // not using subObjStart to be exception safe.
         IndexConsistency indexConsistency(opCtx, this, ns(), _recordStore.get(), background);
         RecordStoreValidateAdaptor indexValidator = RecordStoreValidateAdaptor(
             opCtx, &indexConsistency, level, _indexCatalog.get(), &indexNsResultsMap);
 
-        // Validate the record store
-        std::string uuidString = str::stream()
-            << " (UUID: " << (uuid() ? uuid()->toString() : "none") << ")";
+        std::string uuidString = str::stream() << " (UUID: " << _uuid << ")";
+
+        // Validate the record store.
         log(LogComponent::kIndex) << "validating collection " << ns() << uuidString;
         _validateRecordStore(
             opCtx, _recordStore.get(), level, background, &indexValidator, results, output);
@@ -1378,15 +1376,16 @@ Status CollectionImpl::validate(OperationContext* opCtx,
                                    &indexNsResultsMap);
         }
 
-        // Report the validation results for the user to see
+        // Report the validation results for the user to see.
         _reportValidationResults(
             opCtx, _indexCatalog.get(), &indexNsResultsMap, &keysPerIndex, level, results, output);
 
         if (!results->valid) {
-            log(LogComponent::kIndex) << "validating collection " << ns() << " failed"
-                                      << uuidString;
+            log(LogComponent::kIndex) << "Validation complete for collection " << ns() << uuidString
+                                      << ". Corruption found.";
         } else {
-            log(LogComponent::kIndex) << "validated collection " << ns() << uuidString;
+            log(LogComponent::kIndex) << "Validation complete for collection " << ns() << uuidString
+                                      << ". No corruption found.";
         }
     } catch (DBException& e) {
         if (ErrorCodes::isInterruption(e.code())) {

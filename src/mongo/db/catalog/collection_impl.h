@@ -47,7 +47,7 @@ public:
 
     explicit CollectionImpl(OperationContext* opCtx,
                             const NamespaceString& nss,
-                            OptionalCollectionUUID uuid,
+                            UUID uuid,
                             std::unique_ptr<RecordStore> recordStore);
 
     ~CollectionImpl();
@@ -78,7 +78,7 @@ public:
 
     void setNs(NamespaceString nss) final;
 
-    OptionalCollectionUUID uuid() const {
+    UUID uuid() const {
         return _uuid;
     }
 
@@ -167,9 +167,8 @@ public:
      * this method.
      */
     Status insertDocumentsForOplog(OperationContext* opCtx,
-                                   const DocWriter* const* docs,
-                                   Timestamp* timestamps,
-                                   size_t nDocs) final;
+                                   std::vector<Record>* records,
+                                   const std::vector<Timestamp>& timestamps) final;
 
     /**
      * Inserts a document into the record store for a bulk loader that manages the index building
@@ -227,11 +226,6 @@ public:
      */
     Status truncate(OperationContext* opCtx) final;
 
-    /**
-     * @return OK if the validate run successfully
-     *         OK will be returned even if corruption is found
-     *         deatils will be in result
-     */
     Status validate(OperationContext* opCtx,
                     ValidateCmdLevel level,
                     bool background,
@@ -390,7 +384,7 @@ private:
     int _magic;
 
     NamespaceString _ns;
-    OptionalCollectionUUID _uuid;
+    UUID _uuid;
 
     // The RecordStore may be null during a repair operation.
     std::unique_ptr<RecordStore> _recordStore;  // owned

@@ -108,20 +108,6 @@ public:
         return Status::OK();
     }
 
-    virtual Status insertRecordsWithDocWriter(OperationContext* opCtx,
-                                              const DocWriter* const* docs,
-                                              const Timestamp*,
-                                              size_t nDocs,
-                                              RecordId* idsOut) {
-        _numInserts += nDocs;
-        if (idsOut) {
-            for (size_t i = 0; i < nDocs; i++) {
-                idsOut[i] = RecordId(6, 4);
-            }
-        }
-        return Status::OK();
-    }
-
     virtual Status updateRecord(OperationContext* opCtx,
                                 const RecordId& oldLocation,
                                 const char* data,
@@ -186,10 +172,17 @@ public:
     virtual Status addKey(const BSONObj& key, const RecordId& loc) {
         return Status::OK();
     }
+
+    virtual Status addKey(const KeyString::Builder& keyString, const RecordId& loc) {
+        return Status::OK();
+    }
 };
 
 class DevNullSortedDataInterface : public SortedDataInterface {
 public:
+    DevNullSortedDataInterface()
+        : SortedDataInterface(KeyString::Version::kLatestVersion, Ordering::make(BSONObj())) {}
+
     virtual ~DevNullSortedDataInterface() {}
 
     virtual SortedDataBuilderInterface* getBulkBuilder(OperationContext* opCtx, bool dupsAllowed) {
@@ -203,8 +196,20 @@ public:
         return Status::OK();
     }
 
+    virtual Status insert(OperationContext* opCtx,
+                          const KeyString::Builder& keyString,
+                          const RecordId& loc,
+                          bool dupsAllowed) {
+        return Status::OK();
+    }
+
     virtual void unindex(OperationContext* opCtx,
                          const BSONObj& key,
+                         const RecordId& loc,
+                         bool dupsAllowed) {}
+
+    virtual void unindex(OperationContext* opCtx,
+                         const KeyString::Builder& keyString,
                          const RecordId& loc,
                          bool dupsAllowed) {}
 

@@ -147,13 +147,12 @@ void DatabaseImpl::init(OperationContext* const opCtx) const {
     }
 
     // At construction time of the viewCatalog, the CollectionCatalog map wasn't initialized yet,
-    // so no system.views collection would be found. Now we're sufficiently initialized, signal a
-    // version change. Also force a reload, so if there are problems with the catalog contents as
-    // might be caused by incorrect mongod versions or similar, they are found right away.
+    // so no system.views collection would be found. Now that we're sufficiently initialized, reload
+    // the viewCatalog to populate its in-memory state. If there are problems with the catalog
+    // contents as might be caused by incorrect mongod versions or similar, they are found right
+    // away.
     auto views = ViewCatalog::get(this);
-    views->invalidate();
-    Status reloadStatus = views->reloadIfNeeded(opCtx);
-
+    Status reloadStatus = views->reload(opCtx, ViewCatalogLookupBehavior::kValidateDurableViews);
     if (!reloadStatus.isOK()) {
         warning() << "Unable to parse views: " << redact(reloadStatus)
                   << "; remove any invalid views from the " << _viewsName
@@ -349,13 +348,12 @@ Status DatabaseImpl::dropCollectionEvenIfSystem(OperationContext* opCtx,
     auto numRecords = collection->numRecords(opCtx);
 
     auto uuid = collection->uuid();
-    auto uuidString = uuid ? uuid.get().toString() : "no UUID";
 
     // Make sure no indexes builds are in progress.
     // Use massert() to be consistent with IndexCatalog::dropAllIndexes().
     auto numIndexesInProgress = collection->getIndexCatalog()->numIndexesInProgress(opCtx);
     massert(ErrorCodes::BackgroundOperationInProgressForNamespace,
-            str::stream() << "cannot drop collection " << nss << " (" << uuidString << ") when "
+            str::stream() << "cannot drop collection " << nss << " (" << uuid << ") when "
                           << numIndexesInProgress
                           << " index builds in progress.",
             numIndexesInProgress == 0);
@@ -386,7 +384,7 @@ Status DatabaseImpl::dropCollectionEvenIfSystem(OperationContext* opCtx,
         _dropCollectionIndexes(opCtx, nss, collection);
 
         auto commitTimestamp = opCtx->recoveryUnit()->getCommitTimestamp();
-        log() << "dropCollection: " << nss << " (" << uuidString
+        log() << "dropCollection: " << nss << " (" << uuid
               << ") - storage engine will take ownership of drop-pending collection with optime "
               << dropOpTime << " and commit timestamp " << commitTimestamp;
         if (dropOpTime.isNull()) {
@@ -426,7 +424,7 @@ Status DatabaseImpl::dropCollectionEvenIfSystem(OperationContext* opCtx,
     // Rename collection using drop-pending namespace generated from drop optime.
     auto dpns = nss.makeDropPendingNamespace(dropOpTime);
     const bool stayTemp = true;
-    log() << "dropCollection: " << nss << " (" << uuidString
+    log() << "dropCollection: " << nss << " (" << uuid
           << ") - renaming to drop-pending collection: " << dpns << " with drop optime "
           << dropOpTime;
     {
@@ -455,7 +453,7 @@ void DatabaseImpl::_dropCollectionIndexes(OperationContext* opCtx,
 Status DatabaseImpl::_finishDropCollection(OperationContext* opCtx,
                                            const NamespaceString& nss,
                                            Collection* collection) const {
-    UUID uuid = *collection->uuid();
+    UUID uuid = collection->uuid();
     log() << "Finishing collection drop for " << nss << " (" << uuid << ").";
 
     auto status = DurableCatalog::get(opCtx)->dropCollection(opCtx, nss);
@@ -508,8 +506,8 @@ Status DatabaseImpl::renameCollection(OperationContext* opCtx,
                           << toNss);
     }
 
-    log() << "renameCollection: renaming collection " << collToRename->uuid()->toString()
-          << " from " << fromNss << " to " << toNss;
+    log() << "renameCollection: renaming collection " << collToRename->uuid() << " from " << fromNss
+          << " to " << toNss;
 
     Top::get(opCtx->getServiceContext()).collectionDropped(fromNss);
 
@@ -652,7 +650,7 @@ Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
     });
 
     auto& catalog = CollectionCatalog::get(opCtx);
-    auto uuid = ownedCollection->uuid().get();
+    auto uuid = ownedCollection->uuid();
     catalog.registerCollection(uuid, std::move(ownedCollection));
     opCtx->recoveryUnit()->onRollback([uuid, &catalog] { catalog.deregisterCollection(uuid); });
 

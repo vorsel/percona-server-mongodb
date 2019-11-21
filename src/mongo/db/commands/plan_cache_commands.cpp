@@ -91,9 +91,9 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(SetupPlanCacheCommands, MONGO_NO_PREREQUISI
     // PlanCacheCommand constructors refer to static ActionType instances.
     // Registering commands in a mongo static initializer ensures that
     // the ActionType construction will be completed first.
-    new PlanCacheListQueryShapes();
+    new PlanCacheListQueryShapesDeprecated();
     new PlanCacheClear();
-    new PlanCacheListPlans();
+    new PlanCacheListPlansDeprecated();
 
     return Status::OK();
 }
@@ -220,15 +220,21 @@ StatusWith<unique_ptr<CanonicalQuery>> PlanCacheCommand::canonicalize(OperationC
     return std::move(statusWithCQ.getValue());
 }
 
-PlanCacheListQueryShapes::PlanCacheListQueryShapes()
+PlanCacheListQueryShapesDeprecated::PlanCacheListQueryShapesDeprecated()
     : PlanCacheCommand("planCacheListQueryShapes",
-                       "Displays all query shapes in a collection.",
+                       "Deprecated. Prefer the $planCacheStats aggregation pipeline stage.",
                        ActionType::planCacheRead) {}
 
-Status PlanCacheListQueryShapes::runPlanCacheCommand(OperationContext* opCtx,
-                                                     const string& ns,
-                                                     const BSONObj& cmdObj,
-                                                     BSONObjBuilder* bob) {
+Status PlanCacheListQueryShapesDeprecated::runPlanCacheCommand(OperationContext* opCtx,
+                                                               const string& ns,
+                                                               const BSONObj& cmdObj,
+                                                               BSONObjBuilder* bob) {
+    if (_sampler.tick()) {
+        warning()
+            << "The planCacheListQueryShapes command is deprecated. Prefer the $planCacheStats "
+               "aggregation pipeline stage.";
+    }
+
     // This is a read lock. The query cache is owned by the collection.
     AutoGetCollectionForReadCommand ctx(opCtx, NamespaceString(ns));
 
@@ -244,7 +250,7 @@ Status PlanCacheListQueryShapes::runPlanCacheCommand(OperationContext* opCtx,
 }
 
 // static
-Status PlanCacheListQueryShapes::list(const PlanCache& planCache, BSONObjBuilder* bob) {
+Status PlanCacheListQueryShapesDeprecated::list(const PlanCache& planCache, BSONObjBuilder* bob) {
     invariant(bob);
 
     // Fetch all cached solutions from plan cache.
@@ -342,15 +348,20 @@ Status PlanCacheClear::clear(OperationContext* opCtx,
     return Status::OK();
 }
 
-PlanCacheListPlans::PlanCacheListPlans()
+PlanCacheListPlansDeprecated::PlanCacheListPlansDeprecated()
     : PlanCacheCommand("planCacheListPlans",
-                       "Displays the cached plans for a query shape.",
+                       "Deprecated. Prefer the $planCacheStats aggregation pipeline stage.",
                        ActionType::planCacheRead) {}
 
-Status PlanCacheListPlans::runPlanCacheCommand(OperationContext* opCtx,
-                                               const std::string& ns,
-                                               const BSONObj& cmdObj,
-                                               BSONObjBuilder* bob) {
+Status PlanCacheListPlansDeprecated::runPlanCacheCommand(OperationContext* opCtx,
+                                                         const std::string& ns,
+                                                         const BSONObj& cmdObj,
+                                                         BSONObjBuilder* bob) {
+    if (_sampler.tick()) {
+        warning() << "The planCacheListPlans command is deprecated. Prefer the $planCacheStats "
+                     "aggregation pipeline stage.";
+    }
+
     AutoGetCollectionForReadCommand ctx(opCtx, NamespaceString(ns));
 
     PlanCache* planCache;
@@ -379,7 +390,9 @@ Status listPlansOriginalFormat(std::unique_ptr<CanonicalQuery> cq,
 
     size_t numPlans = entry->plannerData.size();
     invariant(numPlans == entry->decision->stats.size());
-    invariant(numPlans == entry->decision->scores.size());
+    invariant(numPlans ==
+              entry->decision->scores.size() + entry->decision->failedCandidates.size());
+    invariant(entry->decision->candidateOrder.size() == entry->decision->scores.size());
     for (size_t i = 0; i < numPlans; ++i) {
         BSONObjBuilder planBob(plansBuilder.subobjStart());
 
@@ -393,7 +406,12 @@ Status listPlansOriginalFormat(std::unique_ptr<CanonicalQuery> cq,
         // reason is comprised of score and initial stats provided by
         // multi plan runner.
         BSONObjBuilder reasonBob(planBob.subobjStart("reason"));
-        reasonBob.append("score", entry->decision->scores[i]);
+        if (i < entry->decision->candidateOrder.size()) {
+            reasonBob.append("score", entry->decision->scores[i]);
+        } else {
+            reasonBob.append("score", 0.0);
+            reasonBob.append("failed", true);
+        }
         BSONObjBuilder statsBob(reasonBob.subobjStart("stats"));
         PlanStageStats* stats = entry->decision->stats[i].get();
         if (stats) {
@@ -432,11 +450,11 @@ Status listPlansOriginalFormat(std::unique_ptr<CanonicalQuery> cq,
 }  // namespace
 
 // static
-Status PlanCacheListPlans::list(OperationContext* opCtx,
-                                const PlanCache& planCache,
-                                const std::string& ns,
-                                const BSONObj& cmdObj,
-                                BSONObjBuilder* bob) {
+Status PlanCacheListPlansDeprecated::list(OperationContext* opCtx,
+                                          const PlanCache& planCache,
+                                          const std::string& ns,
+                                          const BSONObj& cmdObj,
+                                          BSONObjBuilder* bob) {
     auto statusWithCQ = canonicalize(opCtx, ns, cmdObj);
     if (!statusWithCQ.isOK()) {
         return statusWithCQ.getStatus();

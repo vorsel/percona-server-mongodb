@@ -101,18 +101,6 @@ std::unique_ptr<WriteConcernErrorDetail> getWriteConcernErrorDetailFromBSONObj(c
 
 namespace {
 
-BSONObj appendDbVersionIfPresent(BSONObj cmdObj, const CachedDatabaseInfo& dbInfo) {
-    // Attach the databaseVersion if we have one cached for the database.
-    auto dbVersion = dbInfo.databaseVersion();
-    if (databaseVersion::isFixed(dbVersion)) {
-        return cmdObj;
-    }
-
-    BSONObjBuilder cmdWithVersionBob(std::move(cmdObj));
-    cmdWithVersionBob.append("databaseVersion", dbVersion.toBSON());
-    return cmdWithVersionBob.obj();
-}
-
 const auto kAllowImplicitCollectionCreation = "allowImplicitCollectionCreation"_sd;
 
 /**
@@ -252,6 +240,19 @@ std::vector<AsyncRequestsSender::Response> gatherResponses(
     }
 
     return responses;
+}
+
+BSONObj appendDbVersionIfPresent(BSONObj cmdObj, const CachedDatabaseInfo& dbInfo) {
+    return appendDbVersionIfPresent(std::move(cmdObj), dbInfo.databaseVersion());
+}
+
+BSONObj appendDbVersionIfPresent(BSONObj cmdObj, DatabaseVersion dbVersion) {
+    if (databaseVersion::isFixed(dbVersion)) {
+        return cmdObj;
+    }
+    BSONObjBuilder cmdWithDbVersion(std::move(cmdObj));
+    cmdWithDbVersion.append("databaseVersion", dbVersion.toBSON());
+    return cmdWithDbVersion.obj();
 }
 
 BSONObj appendShardVersion(BSONObj cmdObj, ChunkVersion version) {

@@ -196,11 +196,6 @@ public:
         return status;
     }
 
-
-    virtual void alterIdentMetadata(OperationContext* opCtx,
-                                    StringData ident,
-                                    const IndexDescriptor* desc){};
-
     // optional
     virtual int flushAllFiles(OperationContext* opCtx, bool sync) {
         return 0;
@@ -401,6 +396,13 @@ public:
     }
 
     virtual bool supportsReadConcernMajority() const {
+        return false;
+    }
+
+    /**
+     * See `StorageEngine::supportsOplogStones`
+     */
+    virtual bool supportsOplogStones() const {
         return false;
     }
 

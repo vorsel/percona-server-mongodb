@@ -34,6 +34,7 @@
 #include "mongo/base/owned_pointer_vector.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/exec/cached_plan.h"
+#include "mongo/db/exec/collection_scan.h"
 #include "mongo/db/exec/count_scan.h"
 #include "mongo/db/exec/distinct_scan.h"
 #include "mongo/db/exec/idhack.h"
@@ -331,6 +332,8 @@ void Explain::statsToBSON(const PlanStageStats& stats,
         bob->appendNumber("needYield", stats.common.needYield);
         bob->appendNumber("saveState", stats.common.yields);
         bob->appendNumber("restoreState", stats.common.unyields);
+        if (stats.common.failed)
+            bob->appendBool("failed", stats.common.failed);
         bob->appendNumber("isEOF", stats.common.isEOF);
     }
 
@@ -739,6 +742,8 @@ void Explain::generateSinglePlanExecutionInfo(const PlanStageStats* stats,
 
     out->appendNumber("totalKeysExamined", totalKeysExamined);
     out->appendNumber("totalDocsExamined", totalDocsExamined);
+    if (stats->common.failed)
+        out->appendBool("failed", stats->common.failed);
 
     // Add the tree of stages, with individual execution stats for each stage.
     BSONObjBuilder stagesBob(out->subobjStart("executionStages"));
@@ -1011,6 +1016,13 @@ void Explain::getSummaryStats(const PlanExecutor& exec, PlanSummaryStats* statsO
             statsOut->replanned = cachedStats->replanned;
         } else if (STAGE_MULTI_PLAN == stages[i]->stageType()) {
             statsOut->fromMultiPlanner = true;
+        } else if (STAGE_COLLSCAN == stages[i]->stageType()) {
+            statsOut->collectionScans++;
+            const auto collScan = static_cast<const CollectionScan*>(stages[i]);
+            const auto collScanStats =
+                static_cast<const CollectionScanStats*>(collScan->getSpecificStats());
+            if (!collScanStats->tailable)
+                statsOut->collectionScansNonTailable++;
         }
     }
 }
@@ -1051,6 +1063,11 @@ void Explain::planCacheEntryToBSON(const PlanCacheEntry& entry, BSONObjBuilder* 
     for (double score : entry.decision->scores) {
         scoresBuilder.append(score);
     }
+
+    std::for_each(entry.decision->failedCandidates.begin(),
+                  entry.decision->failedCandidates.end(),
+                  [&scoresBuilder](const auto&) { scoresBuilder.append(0.0); });
+
     scoresBuilder.doneFast();
 
     out->append("indexFilterSet", entry.plannerData[0]->indexFilterApplied);

@@ -74,7 +74,8 @@ IndexBuildsCoordinatorEmbedded::startIndexBuild(OperationContext* opCtx,
         return it->second;
     }();
 
-    _runIndexBuild(opCtx, buildUUID);
+    invariant(!indexBuildOptions.replSetAndNotPrimary);
+    _runIndexBuild(opCtx, buildUUID, indexBuildOptions);
 
     return replState->sharedPromise.getFuture();
 }
@@ -82,18 +83,6 @@ IndexBuildsCoordinatorEmbedded::startIndexBuild(OperationContext* opCtx,
 Status IndexBuildsCoordinatorEmbedded::commitIndexBuild(OperationContext* opCtx,
                                                         const std::vector<BSONObj>& specs,
                                                         const UUID& buildUUID) {
-    MONGO_UNREACHABLE;
-}
-
-void IndexBuildsCoordinatorEmbedded::signalChangeToPrimaryMode() {
-    MONGO_UNREACHABLE;
-}
-
-void IndexBuildsCoordinatorEmbedded::signalChangeToSecondaryMode() {
-    MONGO_UNREACHABLE;
-}
-
-void IndexBuildsCoordinatorEmbedded::signalChangeToInitialSyncMode() {
     MONGO_UNREACHABLE;
 }
 

@@ -136,7 +136,7 @@ void OplogApplier::enqueue(OperationContext* opCtx,
     if (sampler.tick()) {
         LOG(2) << "oplog buffer has " << _oplogBuffer->getSize() << " bytes";
     }
-    _oplogBuffer->pushAllNonBlocking(opCtx, begin, end);
+    _oplogBuffer->push(opCtx, begin, end);
 }
 
 namespace {
@@ -233,7 +233,7 @@ StatusWith<OplogApplier::Operations> OplogApplier::getNextApplierBatch(
     while (_oplogBuffer->peek(opCtx, &op)) {
         auto entry = OplogEntry(op);
 
-        // Check for oplog version change. If it is absent, its value is one.
+        // Check for oplog version change.
         if (entry.getVersion() != OplogEntry::kOplogVersion) {
             std::string message = str::stream()
                 << "expected oplog version " << OplogEntry::kOplogVersion << " but found version "

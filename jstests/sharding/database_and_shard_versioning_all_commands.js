@@ -55,7 +55,7 @@
         addShard: {skip: "not on a user database"},
         addShardToZone: {skip: "not on a user database"},
         aggregate: {
-            sendsDbVersion: false,
+            sendsDbVersion: true,
             sendsShardVersion: true,
             command: {aggregate: collName, pipeline: [{$match: {x: 1}}], cursor: {batchSize: 10}},
         },
@@ -208,12 +208,12 @@
             command: {filemd5: ObjectId(), root: collName}
         },
         find: {
-            sendsDbVersion: false,
+            sendsDbVersion: true,
             sendsShardVersion: true,
             command: {find: collName, filter: {x: 1}},
         },
         findAndModify: {
-            sendsDbVersion: false,
+            sendsDbVersion: true,
             sendsShardVersion: true,
             command: {findAndModify: collName, query: {_id: 0}, remove: true}
         },

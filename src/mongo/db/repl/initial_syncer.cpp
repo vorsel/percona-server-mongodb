@@ -149,20 +149,6 @@ ServiceContext::UniqueOperationContext makeOpCtx() {
     return cc().makeOperationContext();
 }
 
-StatusWith<Timestamp> parseTimestampStatus(const QueryResponseStatus& fetchResult) {
-    if (!fetchResult.isOK()) {
-        return fetchResult.getStatus();
-    } else {
-        const auto docs = fetchResult.getValue().documents;
-        const auto hasDoc = docs.begin() != docs.end();
-        if (!hasDoc || !docs.begin()->hasField("ts")) {
-            return {ErrorCodes::FailedToParse, "Could not find an oplog entry with 'ts' field."};
-        } else {
-            return {docs.begin()->getField("ts").timestamp()};
-        }
-    }
-}
-
 StatusWith<OpTimeAndWallTime> parseOpTimeAndWallTime(const QueryResponseStatus& fetchResult) {
     if (!fetchResult.isOK()) {
         return fetchResult.getStatus();
@@ -1370,20 +1356,6 @@ void InitialSyncer::_rollbackCheckerCheckForRollbackCallback(
                    str::stream() << "Rollback occurred on our sync source " << _syncSource
                                  << " during initial sync"));
         return;
-    }
-
-    // Update all unique indexes belonging to non-replicated collections on secondaries. See comment
-    // in ReplicationCoordinatorExternalStateImpl::initializeReplSetStorage() for the explanation of
-    // why we do this.
-    if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-        serverGlobalParams.featureCompatibility.getVersion() ==
-            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42) {
-        auto opCtx = makeOpCtx();
-        auto updateStatus = _storage->upgradeNonReplicatedUniqueIndexes(opCtx.get());
-        if (!updateStatus.isOK()) {
-            onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, updateStatus);
-            return;
-        }
     }
 
     // Success!

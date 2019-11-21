@@ -109,8 +109,7 @@ void refreshRecipientRoutingTable(OperationContext* opCtx,
         opCtx,
         executor::RemoteCommandRequest::kNoTimeout);
 
-    executor::TaskExecutor* const executor =
-        Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
+    auto executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
     auto noOp = [](const executor::TaskExecutor::RemoteCommandCallbackArgs&) {};
     executor->scheduleRemoteCommand(request, noOp).getStatus().ignore();
 }
@@ -161,9 +160,7 @@ MigrationSourceManager::MigrationSourceManager(OperationContext* opCtx,
                 autoColl.getCollection());
 
         boost::optional<UUID> collectionUUID;
-        if (autoColl.getCollection()->uuid()) {
-            collectionUUID = autoColl.getCollection()->uuid().value();
-        }
+        collectionUUID = autoColl.getCollection()->uuid();
 
         auto optMetadata =
             CollectionShardingState::get(opCtx, getNss())->getCurrentMetadataIfKnown();
@@ -343,12 +340,12 @@ Status MigrationSourceManager::enterCriticalSection(OperationContext* opCtx) {
     // time inclusive of the migration config commit update from accessing secondary data.
     // Note: this write must occur after the critSec flag is set, to ensure the secondary refresh
     // will stall behind the flag.
-    Status signalStatus =
-        updateShardCollectionsEntry(opCtx,
-                                    BSON(ShardCollectionType::ns() << getNss().ns()),
-                                    BSONObj(),
-                                    BSON(ShardCollectionType::enterCriticalSectionCounter() << 1),
-                                    false /*upsert*/);
+    Status signalStatus = updateShardCollectionsEntry(
+        opCtx,
+        BSON(ShardCollectionType::kNssFieldName << getNss().ns()),
+        BSONObj(),
+        BSON(ShardCollectionType::kEnterCriticalSectionCounterFieldName << 1),
+        false /*upsert*/);
     if (!signalStatus.isOK()) {
         return {
             ErrorCodes::OperationFailed,

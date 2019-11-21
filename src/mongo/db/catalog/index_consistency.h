@@ -39,14 +39,6 @@
 namespace mongo {
 
 /**
- * The IndexConsistency class is used to keep track of the index consistency.
- * It does this by using the index keys from index entries and index keys generated from the
- * document to ensure there is a one-to-one mapping for each key.
- * In addition, an IndexObserver class can be hooked into the IndexAccessMethod to inform
- * this class about changes to the indexes during a validation and compensate for them.
- */
-
-/**
  * Contains all the index information and stats throughout the validation.
  */
 struct IndexInfo {
@@ -57,7 +49,7 @@ struct IndexInfo {
     // More efficient representation of the ordering of the descriptor's key pattern.
     const Ordering ord;
     // For conveniently building KeyStrings in a preallocated buffer.
-    std::unique_ptr<KeyString> ks;
+    std::unique_ptr<KeyString::Builder> ks;
     // The number of index entries belonging to the index.
     int64_t numKeys = 0;
     // The number of records that have a key in their document that referenced back to the this
@@ -67,12 +59,18 @@ struct IndexInfo {
     std::set<uint32_t> hashedMultikeyMetadataPaths;
 };
 
+/**
+ * The IndexConsistency class is used to keep track of the index consistency.
+ * It does this by using the index keys from index entries and index keys generated from the
+ * document to ensure there is a one-to-one mapping for each key.
+ * In addition, an IndexObserver class can be hooked into the IndexAccessMethod to inform
+ * this class about changes to the indexes during a validation and compensate for them.
+ */
 class IndexConsistency final {
+    using IndexInfoMap = std::map<std::string, IndexInfo>;
     using ValidateResultsMap = std::map<std::string, ValidateResults>;
 
 public:
-    using IndexInfoMap = std::map<std::string, IndexInfo>;
-
     IndexConsistency(OperationContext* opCtx,
                      Collection* collection,
                      NamespaceString nss,
@@ -85,7 +83,7 @@ public:
      * For the second phase of validation, keep track of the document keys that hashed to
      * inconsistent hash buckets during the first phase of validation.
      */
-    void addDocKey(const KeyString& ks,
+    void addDocKey(const KeyString::Builder& ks,
                    IndexInfo* indexInfo,
                    RecordId recordId,
                    const BSONObj& indexKey);
@@ -96,7 +94,7 @@ public:
      * For the second phase of validation, try to match the index entry keys that hashed to
      * inconsistent hash buckets during the first phase of validation to document keys.
      */
-    void addIndexKey(const KeyString& ks,
+    void addIndexKey(const KeyString::Builder& ks,
                      IndexInfo* indexInfo,
                      RecordId recordId,
                      const BSONObj& indexKey);
@@ -107,8 +105,8 @@ public:
      * entries and remove any path encountered. As we expect the index to contain a super-set of
      * the collection paths, a non-empty set represents an invalid index.
      */
-    void addMultikeyMetadataPath(const KeyString& ks, IndexInfo* indexInfo);
-    void removeMultikeyMetadataPath(const KeyString& ks, IndexInfo* indexInfo);
+    void addMultikeyMetadataPath(const KeyString::Builder& ks, IndexInfo* indexInfo);
+    void removeMultikeyMetadataPath(const KeyString::Builder& ks, IndexInfo* indexInfo);
     size_t getMultikeyMetadataPathCount(IndexInfo* indexInfo);
 
     /**
@@ -199,7 +197,7 @@ private:
     /**
      * Returns a hashed value from the given KeyString and index namespace.
      */
-    uint32_t _hashKeyString(const KeyString& ks, uint32_t indexNameHash) const;
+    uint32_t _hashKeyString(const KeyString::Builder& ks, uint32_t indexNameHash) const;
 
 };  // IndexConsistency
 }  // namespace mongo

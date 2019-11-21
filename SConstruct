@@ -344,92 +344,38 @@ add_option('use-sasl-client',
     nargs=0,
 )
 
-add_option('use-system-tcmalloc',
-    help='use system version of tcmalloc library',
-    nargs=0,
-)
-
-add_option('use-system-fmt',
-    help='use system version of fmt library',
-    nargs=0,
-)
-
-add_option('use-system-pcre',
-    help='use system version of pcre library',
-    nargs=0,
-)
-
-add_option('use-system-wiredtiger',
-    help='use system version of wiredtiger library',
-    nargs=0,
-)
+# Most of the "use-system-*" options follow a simple form.
+for pack in [
+    ('abseil-cpp',),
+    ('asio', 'ASIO',),
+    ('boost',),
+    ('fmt',),
+    ('google-benchmark', 'Google benchmark'),
+    ('icu', 'ICU'),
+    ('intel_decimal128', 'intel decimal128'),
+    ('kms-message',),
+    ('pcre',),
+    ('snappy',),
+    ('sqlite',),
+    ('stemmer',),
+    ('tcmalloc',),
+    ('libunwind',),
+    ('valgrind',),
+    ('wiredtiger',),
+    ('yaml',),
+    ('zlib',),
+    ('zstd', 'Zstandard'),
+    ]:
+    name = pack[0]
+    pretty = name
+    if len(pack) == 2:
+        pretty = pack[1]
+    add_option(f'use-system-{name}',
+               help=f'use system version of {pretty} library',
+               nargs=0)
 
 add_option('system-boost-lib-search-suffixes',
     help='Comma delimited sequence of boost library suffixes to search',
-)
-
-add_option('use-system-abseil-cpp',
-    help='use system version of abseil-cpp libraries',
-    nargs=0,
-)
-
-add_option('use-system-boost',
-    help='use system version of boost libraries',
-    nargs=0,
-)
-
-add_option('use-system-snappy',
-    help='use system version of snappy library',
-    nargs=0,
-)
-
-add_option('use-system-valgrind',
-    help='use system version of valgrind library',
-    nargs=0,
-)
-
-add_option('use-system-google-benchmark',
-    help='use system version of Google benchmark library',
-    nargs=0,
-)
-
-add_option('use-system-zlib',
-    help='use system version of zlib library',
-    nargs=0,
-)
-
-add_option('use-system-zstd',
-    help="use system version of Zstandard library",
-    nargs=0,
-)
-
-add_option('use-system-sqlite',
-    help='use system version of sqlite library',
-    nargs=0,
-)
-
-add_option('use-system-stemmer',
-    help='use system version of stemmer',
-    nargs=0)
-
-add_option('use-system-yaml',
-    help='use system version of yaml',
-    nargs=0,
-)
-
-add_option('use-system-asio',
-    help="use system version of ASIO",
-    nargs=0,
-)
-
-add_option('use-system-icu',
-    help="use system version of ICU",
-    nargs=0,
-)
-
-add_option('use-system-intel_decimal128',
-    help='use system version of intel decimal128',
-    nargs=0,
 )
 
 add_option('use-system-mongo-c',
@@ -439,11 +385,6 @@ add_option('use-system-mongo-c',
     help="use system version of the mongo-c-driver (auto will use it if it's found)",
     nargs='?',
     type='choice',
-)
-
-add_option('use-system-kms-message',
-    help='use system version of kms-message library',
-    nargs=0,
 )
 
 add_option('use-system-all',
@@ -591,6 +532,15 @@ add_option('msvc-debugging-format',
     choices=["codeview", "pdb"],
     default="codeview",
     help='Debugging format in debug builds using msvc. Codeview (/Z7) or Program database (/Zi). Default is codeview.',
+    type='choice',
+)
+
+add_option('use-libunwind',
+    choices=["on", "off"],
+    const="on",
+    default="off",
+    help="Enable libunwind for backtraces (experimental)",
+    nargs="?",
     type='choice',
 )
 
@@ -1030,6 +980,17 @@ usemozjs = (jsEngine.startswith('mozjs'))
 
 if not serverJs and not usemozjs:
     print("Warning: --server-js=off is not needed with --js-engine=none")
+
+use_libunwind = get_option("use-libunwind") == "on"
+if use_libunwind:
+    use_system_libunwind = use_system_version_of_library("libunwind")
+    use_vendored_libunwind = not use_system_libunwind
+else:
+    if use_system_version_of_library("libunwind"):
+        print("Error: --use-system-libunwind requires --use-libunwind")
+        Exit(1)
+
+    use_system_libunwind = use_vendored_libunwind = False
 
 # We defer building the env until we have determined whether we want certain values. Some values
 # in the env actually have semantics for 'None' that differ from being absent, so it is better
@@ -1672,7 +1633,7 @@ elif env.TargetOSIs('freebsd'):
     env.Append( CCFLAGS=[ "-fno-omit-frame-pointer" ] )
 
 elif env.TargetOSIs('darwin'):
-     env.Append( LIBS=["resolv"] )
+    env.Append( LIBS=["resolv"] )
 
 elif env.TargetOSIs('openbsd'):
     env.Append( LIBS=[ "kvm" ] )
@@ -1932,6 +1893,7 @@ if env.TargetOSIs('posix'):
     # -Winvalid-pch Warn if a precompiled header (see Precompiled Headers) is found in the search path but can't be used.
     env.Append( CCFLAGS=["-fno-omit-frame-pointer",
                          "-fno-strict-aliasing",
+                         "-fasynchronous-unwind-tables",
                          "-ggdb" if not env.TargetOSIs('emscripten') else "-g",
                          "-pthread",
                          "-Wall",
@@ -2374,6 +2336,10 @@ def doConfigure(myenv):
         # Enable sized deallocation support.
         AddToCXXFLAGSIfSupported(myenv, '-fsized-deallocation')
 
+        # This warning was added in Apple clang version 11 and flags many explicitly defaulted move
+        # constructors and assignment operators for being implicitly deleted, which is not useful.
+        AddToCXXFLAGSIfSupported(myenv, "-Wno-defaulted-function-deleted")
+
         # Check if we can set "-Wnon-virtual-dtor" when "-Werror" is set. The only time we can't set it is on
         # clang 3.4, where a class with virtual function(s) and a non-virtual destructor throws a warning when
         # it shouldn't.
@@ -2735,6 +2701,9 @@ def doConfigure(myenv):
             # to fail
             sanitizer_list.remove('fuzzer')
             sanitizer_list.append('fuzzer-no-link')
+            # These flags are needed to generate a coverage report
+            myenv.Append(LINKFLAGS=['-fprofile-instr-generate','-fcoverage-mapping'])
+            myenv.Append(CCFLAGS=['-fprofile-instr-generate','-fcoverage-mapping'])
 
         sanitizer_option = '-fsanitize=' + ','.join(sanitizer_list)
 
@@ -3324,6 +3293,9 @@ def doConfigure(myenv):
     if use_system_version_of_library("fmt"):
         conf.FindSysLibDep("fmt", ["fmt"])
 
+    if use_system_version_of_library("libunwind"):
+        conf.FindSysLibDep("unwind", ["unwind"])
+
     if use_system_version_of_library("intel_decimal128"):
         conf.FindSysLibDep("intel_decimal128", ["bid"])
 
@@ -3907,21 +3879,27 @@ module_sconscripts = moduleconfig.get_module_sconscripts(mongo_modules)
 # Currently, however, the SConscript files do need some predicates for
 # conditional decision making that hasn't been moved up to this SConstruct file,
 # and they are exported here, as well.
-Export("get_option")
-Export("has_option")
-Export("use_system_version_of_library")
-Export("serverJs")
-Export("usemozjs")
-Export('module_sconscripts')
-Export("debugBuild optBuild")
-Export("wiredtiger")
-Export("mmapv1")
-Export("mobile_se")
-Export("endian")
-Export("inmemory")
-Export("ssl_provider")
-Export("free_monitoring")
-Export("http_client")
+Export([
+    'debugBuild',
+    'endian',
+    'free_monitoring',
+    'get_option',
+    'has_option',
+    'http_client',
+    'inmemory',
+    'mmapv1',
+    'mobile_se',
+    'module_sconscripts',
+    'optBuild',
+    'serverJs',
+    'ssl_provider',
+    'use_libunwind',
+    'use_system_libunwind',
+    'use_system_version_of_library',
+    'use_vendored_libunwind',
+    'usemozjs',
+    'wiredtiger',
+])
 
 def injectMongoIncludePaths(thisEnv):
     thisEnv.AppendUnique(CPPPATH=['$BUILD_DIR'])

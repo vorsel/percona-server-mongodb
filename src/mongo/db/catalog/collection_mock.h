@@ -122,9 +122,8 @@ public:
     }
 
     Status insertDocumentsForOplog(OperationContext* opCtx,
-                                   const DocWriter* const* docs,
-                                   Timestamp* timestamps,
-                                   size_t nDocs) {
+                                   std::vector<Record>* records,
+                                   const std::vector<Timestamp>& timestamps) {
         std::abort();
     }
 
@@ -274,7 +273,7 @@ public:
         std::abort();
     }
 
-    OptionalCollectionUUID uuid() const {
+    UUID uuid() const {
         return _uuid;
     }
 
@@ -283,7 +282,7 @@ public:
     }
 
 private:
-    OptionalCollectionUUID _uuid = UUID::gen();
+    UUID _uuid = UUID::gen();
     NamespaceString _ns;
     std::unique_ptr<IndexCatalog> _indexCatalog;
 };

@@ -62,22 +62,6 @@ struct CompactOptions {
 struct CompactStats {};
 
 /**
- * Allows inserting a Record "in-place" without creating a copy ahead of time.
- */
-class DocWriter {
-public:
-    virtual void writeDocument(char* buf) const = 0;
-    virtual size_t documentSize() const = 0;
-    virtual bool addPadding() const {
-        return true;
-    }
-
-protected:
-    // Can't delete through base pointer.
-    ~DocWriter() = default;
-};
-
-/**
  * The data items stored in a RecordStore.
  */
 struct Record {
@@ -359,34 +343,6 @@ public:
     }
 
     /**
-     * Inserts nDocs documents into this RecordStore using the DocWriter interface.
-     *
-     * This allows the storage engine to reserve space for a record and have it built in-place
-     * rather than building the record then copying it into its destination.
-     *
-     * On success, if idsOut is non-null the RecordIds of the inserted records will be written into
-     * it. It must have space for nDocs RecordIds.
-     */
-    virtual Status insertRecordsWithDocWriter(OperationContext* opCtx,
-                                              const DocWriter* const* docs,
-                                              const Timestamp* timestamps,
-                                              size_t nDocs,
-                                              RecordId* idsOut = nullptr) = 0;
-
-    /**
-     * A thin wrapper around insertRecordsWithDocWriter() to simplify handling of single DocWriters.
-     */
-    StatusWith<RecordId> insertRecordWithDocWriter(OperationContext* opCtx,
-                                                   const DocWriter* doc,
-                                                   Timestamp timestamp) {
-        RecordId out;
-        Status status = insertRecordsWithDocWriter(opCtx, &doc, &timestamp, 1, &out);
-        if (!status.isOK())
-            return status;
-        return out;
-    }
-
-    /**
      * Updates the record with id 'recordId', replacing its contents with those described by
      * 'data' and 'len'.
      */
@@ -523,7 +479,6 @@ public:
      * structures. If corruption is found, details of the errors will be in the results parameter.
      */
     virtual void validate(OperationContext* opCtx,
-                          ValidateCmdLevel level,
                           ValidateResults* results,
                           BSONObjBuilder* output) {}
 
@@ -603,6 +558,24 @@ public:
         return Status(ErrorCodes::CommandNotSupported,
                       "this storage engine does not support updateCappedSize");
     }
+
+    /**
+     * Returns false if the oplog was dropped while waiting for a deletion request.
+     * This should only be called if StorageEngine::supportsOplogStones() is true.
+     * Storage engines supporting oplog stones must implement this function.
+     */
+    virtual bool yieldAndAwaitOplogDeletionRequest(OperationContext* opCtx) {
+        MONGO_UNREACHABLE;
+    }
+
+    /**
+     * This should only be called if StorageEngine::supportsOplogStones() is true.
+     * Storage engines supporting oplog stones must implement this function.
+     */
+    virtual void reclaimOplog(OperationContext* opCtx) {
+        MONGO_UNREACHABLE;
+    }
+
 
 protected:
     std::string _ns;

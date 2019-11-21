@@ -74,6 +74,7 @@ public:
      */
     struct IndexBuildOptions {
         boost::optional<CommitQuorumOptions> commitQuorum;
+        bool replSetAndNotPrimary = false;
     };
 
     /**
@@ -199,27 +200,9 @@ public:
     void abortDatabaseIndexBuilds(StringData db, const std::string& reason);
 
     /**
-     * Aborts a given index build by name on the given collection.
-     *
-     * TODO: This is not yet implemented.
-     */
-    Future<void> abortIndexBuildByName(const NamespaceString& nss,
-                                       const std::vector<std::string>& indexNames,
-                                       const std::string& reason);
-
-    /**
      * Aborts a given index build by index build UUID.
-     *
-     * TODO: This is not yet implemented.
      */
     Future<void> abortIndexBuildByBuildUUID(const UUID& buildUUID, const std::string& reason);
-
-    /**
-     * Signal replica set member state changes that affect cross replica set index building.
-     */
-    virtual void signalChangeToPrimaryMode() = 0;
-    virtual void signalChangeToSecondaryMode() = 0;
-    virtual void signalChangeToInitialSyncMode() = 0;
 
     /**
      * TODO: This is not yet implemented.
@@ -364,14 +347,19 @@ protected:
     /**
      * Runs the index build on the caller thread. Handles unregistering the index build and setting
      * the index build's Promise with the outcome of the index build.
+     * 'IndexBuildOptios::replSetAndNotPrimary' is determined at the start of the index build.
      */
-    void _runIndexBuild(OperationContext* opCtx, const UUID& buildUUID) noexcept;
+    void _runIndexBuild(OperationContext* opCtx,
+                        const UUID& buildUUID,
+                        const IndexBuildOptions& indexBuildOptions) noexcept;
 
     /**
      * Acquires locks and runs index build. Throws on error.
+     * 'IndexBuildOptios::replSetAndNotPrimary' is determined at the start of the index build.
      */
     void _runIndexBuildInner(OperationContext* opCtx,
-                             std::shared_ptr<ReplIndexBuildState> replState);
+                             std::shared_ptr<ReplIndexBuildState> replState,
+                             const IndexBuildOptions& indexBuildOptions);
 
     /**
      * Modularizes the _indexBuildsManager calls part of _runIndexBuildInner. Throws on error.

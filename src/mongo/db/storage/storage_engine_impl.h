@@ -153,6 +153,8 @@ public:
 
     bool supportsReadConcernMajority() const final;
 
+    bool supportsOplogStones() const final;
+
     bool supportsPendingDrops() const final;
 
     void clearDropPendingState() final;

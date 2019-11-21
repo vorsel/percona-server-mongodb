@@ -63,12 +63,6 @@ public:
                          std::vector<Record>* inOutRecords,
                          const std::vector<Timestamp>& timestamps) override;
 
-    Status insertRecordsWithDocWriter(OperationContext* opCtx,
-                                      const DocWriter* const* docs,
-                                      const Timestamp* timestamps,
-                                      size_t nDocs,
-                                      RecordId* idsOut) override;
-
     Status updateRecord(OperationContext* opCtx,
                         const RecordId& oldLocation,
                         const char* data,
@@ -99,8 +93,10 @@ public:
         return false;
     }
 
+    /**
+     * Validates the entire database file, not just the table used by this record store.
+     */
     void validate(OperationContext* opCtx,
-                  ValidateCmdLevel level,
                   ValidateResults* results,
                   BSONObjBuilder* output) override;
 

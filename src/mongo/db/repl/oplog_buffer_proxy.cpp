@@ -59,27 +59,15 @@ void OplogBufferProxy::shutdown(OperationContext* opCtx) {
     _target->shutdown(opCtx);
 }
 
-void OplogBufferProxy::pushEvenIfFull(OperationContext* opCtx, const Value& value) {
-    stdx::lock_guard<stdx::mutex> lk(_lastPushedMutex);
-    _lastPushed = value;
-    _target->pushEvenIfFull(opCtx, value);
-}
-
-void OplogBufferProxy::push(OperationContext* opCtx, const Value& value) {
-    stdx::lock_guard<stdx::mutex> lk(_lastPushedMutex);
-    _lastPushed = value;
-    _target->push(opCtx, value);
-}
-
-void OplogBufferProxy::pushAllNonBlocking(OperationContext* opCtx,
-                                          Batch::const_iterator begin,
-                                          Batch::const_iterator end) {
+void OplogBufferProxy::push(OperationContext* opCtx,
+                            Batch::const_iterator begin,
+                            Batch::const_iterator end) {
     if (begin == end) {
         return;
     }
     stdx::lock_guard<stdx::mutex> lk(_lastPushedMutex);
     _lastPushed = *(end - 1);
-    _target->pushAllNonBlocking(opCtx, begin, end);
+    _target->push(opCtx, begin, end);
 }
 
 void OplogBufferProxy::waitForSpace(OperationContext* opCtx, std::size_t size) {

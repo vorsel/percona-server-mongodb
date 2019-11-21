@@ -315,21 +315,12 @@ void IndexBuildsCoordinator::abortDatabaseIndexBuilds(StringData db, const std::
     dbIndexBuilds->waitUntilNoIndexBuildsRemain(lk);
 }
 
-Future<void> IndexBuildsCoordinator::abortIndexBuildByName(
-    const NamespaceString& nss,
-    const std::vector<std::string>& indexNames,
-    const std::string& reason) {
-    // TODO: not yet implemented. Some code to make it compile.
-    auto pf = makePromiseFuture<void>();
-    auto promise = std::move(pf.promise);
-    return std::move(pf.future);
-}
-
 Future<void> IndexBuildsCoordinator::abortIndexBuildByBuildUUID(const UUID& buildUUID,
                                                                 const std::string& reason) {
-    // TODO: not yet implemented. Some code to make it compile.
+    _indexBuildsManager.abortIndexBuild(buildUUID, reason);
     auto pf = makePromiseFuture<void>();
     auto promise = std::move(pf.promise);
+    promise.setWith([] {});
     return std::move(pf.future);
 }
 
@@ -700,7 +691,8 @@ IndexBuildsCoordinator::_registerAndSetUpIndexBuild(
 }
 
 void IndexBuildsCoordinator::_runIndexBuild(OperationContext* opCtx,
-                                            const UUID& buildUUID) noexcept {
+                                            const UUID& buildUUID,
+                                            const IndexBuildOptions& indexBuildOptions) noexcept {
     {
         stdx::unique_lock<stdx::mutex> lk(_mutex);
         while (_sleepForTest) {
@@ -719,7 +711,7 @@ void IndexBuildsCoordinator::_runIndexBuild(OperationContext* opCtx,
 
     auto status = [&]() {
         try {
-            _runIndexBuildInner(opCtx, replState);
+            _runIndexBuildInner(opCtx, replState, indexBuildOptions);
         } catch (const DBException& ex) {
             return ex.toStatus();
         }
@@ -741,7 +733,8 @@ void IndexBuildsCoordinator::_runIndexBuild(OperationContext* opCtx,
 }
 
 void IndexBuildsCoordinator::_runIndexBuildInner(OperationContext* opCtx,
-                                                 std::shared_ptr<ReplIndexBuildState> replState) {
+                                                 std::shared_ptr<ReplIndexBuildState> replState,
+                                                 const IndexBuildOptions& indexBuildOptions) {
     // 'status' should always be set to something else before this function exits.
     Status status{ErrorCodes::InternalError,
                   "Uninitialized status value in IndexBuildsCoordinator"};
@@ -768,9 +761,10 @@ void IndexBuildsCoordinator::_runIndexBuildInner(OperationContext* opCtx,
               str::stream() << "Collection " << *nss
                             << " should exist because an index build is in progress.");
 
-    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
-    auto replSetAndNotPrimary = replCoord->getSettings().usingReplSets() &&
-        !replCoord->canAcceptWritesForDatabase(opCtx, replState->dbName);
+    // TODO(SERVER-39484): Since 'replSetAndNotPrimary' is derived from the replication state at the
+    // start of the index build, this value is not resilient to member state changes like
+    // stepup/stepdown.
+    auto replSetAndNotPrimary = indexBuildOptions.replSetAndNotPrimary;
 
     try {
         if (replSetAndNotPrimary) {

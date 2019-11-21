@@ -1584,6 +1584,10 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
     response->append("myState", myState.s);
     response->append("term", _term);
 
+    if (rsStatusArgs.tooStale) {
+        response->append("tooStale", true);
+    }
+
     // Add sync source info
     if (!_syncSource.empty() && !myState.primary() && !myState.removed()) {
         response->append("syncingTo", _syncSource.toString());
@@ -2215,7 +2219,7 @@ void TopologyCoordinator::processLoseElection() {
     _role = Role::kFollower;
 }
 
-bool TopologyCoordinator::attemptStepDown(
+bool TopologyCoordinator::tryToStartStepDown(
     long long termAtStart, Date_t now, Date_t waitUntil, Date_t stepDownUntil, bool force) {
 
     if (_role != Role::kLeader || _leaderMode == LeaderMode::kSteppingDown ||
@@ -2251,7 +2255,7 @@ bool TopologyCoordinator::attemptStepDown(
 
     // Stepdown attempt success!
     _stepDownUntil = stepDownUntil;
-    _stepDownSelfAndReplaceWith(-1);
+    prepareForUnconditionalStepDown();
     return true;
 }
 

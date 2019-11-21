@@ -342,12 +342,6 @@ public:
                                                                  const NamespaceString& nss) = 0;
 
     /**
-     * Updates unique indexes belonging to all non-replicated collections. To be called at the
-     * end of initial sync.
-     */
-    virtual Status upgradeNonReplicatedUniqueIndexes(OperationContext* opCtx) = 0;
-
-    /**
      * Sets the highest timestamp at which the storage engine is allowed to take a checkpoint.
      * This timestamp can never decrease, and thus should be a timestamp that can never roll back.
      */
@@ -378,6 +372,14 @@ public:
      * Returns whether the storage engine can provide a recovery timestamp.
      */
     virtual bool supportsRecoveryTimestamp(ServiceContext* serviceCtx) const = 0;
+
+    /**
+     * Responsible for initializing independent processes for replication that manage
+     * and interact with the storage layer.
+     *
+     * Initializes the OplogCapMaintainerThread to control deletion of oplog stones.
+     */
+    virtual void initializeStorageControlsForReplication(ServiceContext* serviceCtx) const = 0;
 
     /**
      * Returns the stable timestamp that the storage engine recovered to on startup. If the

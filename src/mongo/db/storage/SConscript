@@ -94,6 +94,24 @@ env.Library(
         '$BUILD_DIR/mongo/base',
         ]
     )
+    
+env.Library(
+    target='oplog_cap_maintainer_thread',
+    source=[
+        'oplog_cap_maintainer_thread.cpp',
+    ],
+    LIBDEPS=[
+    	'$BUILD_DIR/mongo/util/background_job',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/catalog/collection',
+        '$BUILD_DIR/mongo/db/catalog/database_holder',
+        '$BUILD_DIR/mongo/db/concurrency/lock_manager',
+        '$BUILD_DIR/mongo/db/namespace_string',
+        '$BUILD_DIR/mongo/db/service_context', 
+    ],
+)
 
 env.Library(
     target='storage_options',
@@ -173,6 +191,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/unittest/unittest',
         'index_entry_comparison',
+        'key_string',
         'test_harness_helper',
     ],
 
@@ -433,3 +452,13 @@ env.Library(
     ],
 )
 
+env.CppLibfuzzerTest(
+    target='key_string_to_bson_fuzzer',
+    source=[
+        'key_string_to_bson_fuzzer.cpp',
+    ],
+    LIBDEPS=[
+        'key_string',
+        '$BUILD_DIR/mongo/base',
+    ],
+)

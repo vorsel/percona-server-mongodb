@@ -40,6 +40,7 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
@@ -48,6 +49,8 @@ namespace mongo {
 using namespace indexbuildentryhelpers;
 
 namespace {
+
+MONGO_FAIL_POINT_DEFINE(hangAfterInitializingIndexBuild);
 
 /**
  * Constructs the options for the loader thread pool.
@@ -121,7 +124,7 @@ IndexBuildsCoordinatorMongod::startIndexBuild(OperationContext* opCtx,
                  "replication states: "
               << buildUUID;
         // Sets up and runs the index build. Sets result and cleans up index build.
-        _runIndexBuild(opCtx, buildUUID);
+        _runIndexBuild(opCtx, buildUUID, indexBuildOptions);
         return replState->sharedPromise.getFuture();
     }
 
@@ -157,6 +160,7 @@ IndexBuildsCoordinatorMongod::startIndexBuild(OperationContext* opCtx,
     _threadPool.schedule([
         this,
         buildUUID,
+        indexBuildOptions,
         deadline,
         timeoutError,
         writesAreReplicated,
@@ -178,6 +182,8 @@ IndexBuildsCoordinatorMongod::startIndexBuild(OperationContext* opCtx,
 
             return;
         }
+
+        MONGO_FAIL_POINT_PAUSE_WHILE_SET(hangAfterInitializingIndexBuild);
 
         auto opCtx = Client::getCurrent()->makeOperationContext();
 
@@ -202,7 +208,7 @@ IndexBuildsCoordinatorMongod::startIndexBuild(OperationContext* opCtx,
         }
 
         // Sets up and runs the index build. Sets result and cleans up index build.
-        _runIndexBuild(opCtx.get(), buildUUID);
+        _runIndexBuild(opCtx.get(), buildUUID, indexBuildOptions);
     });
 
 
@@ -214,21 +220,6 @@ Status IndexBuildsCoordinatorMongod::commitIndexBuild(OperationContext* opCtx,
                                                       const UUID& buildUUID) {
     // TODO: not yet implemented.
     return Status::OK();
-}
-
-void IndexBuildsCoordinatorMongod::signalChangeToPrimaryMode() {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
-    _replMode = ReplState::Primary;
-}
-
-void IndexBuildsCoordinatorMongod::signalChangeToSecondaryMode() {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
-    _replMode = ReplState::Secondary;
-}
-
-void IndexBuildsCoordinatorMongod::signalChangeToInitialSyncMode() {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
-    _replMode = ReplState::InitialSync;
 }
 
 Status IndexBuildsCoordinatorMongod::voteCommitIndexBuild(const UUID& buildUUID,
@@ -256,7 +247,7 @@ Status IndexBuildsCoordinatorMongod::setCommitQuorum(OperationContext* opCtx,
                       str::stream() << "Collection '" << nss << "' was not found.");
     }
 
-    UUID collectionUUID = *collection->uuid();
+    UUID collectionUUID = collection->uuid();
 
     stdx::unique_lock<stdx::mutex> lk(_mutex);
     auto collectionIt = _collectionIndexBuilds.find(collectionUUID);

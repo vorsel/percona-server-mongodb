@@ -581,7 +581,7 @@ bool runCreateIndexes(OperationContext* opCtx,
                            collection,
                            [opCtx, &ns, collection](const BSONObj& spec) {
                                opCtx->getServiceContext()->getOpObserver()->onCreateIndex(
-                                   opCtx, ns, *(collection->uuid()), spec, false);
+                                   opCtx, ns, collection->uuid(), spec, false);
                            },
                            MultiIndexBlock::kNoopOnCommitFn));
 
@@ -687,6 +687,18 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
                 str::stream() << "Index build interrupted: " << buildUUID << ": "
                               << interruptionEx.toString());
             log() << "Index build aborted: " << buildUUID << ": "
+                  << abortIndexFuture.getNoThrow(opCtx);
+            throw;
+        } catch (const ExceptionForCat<ErrorCategory::NotMasterError>& ex) {
+            log() << "Index build interrupted: " << buildUUID
+                  << ": aborting index build due to change in replication state.";
+            auto abortIndexFuture = indexBuildsCoord->abortIndexBuildByBuildUUID(
+                buildUUID,
+                str::stream() << "Index build interrupted due to change in replication state: "
+                              << buildUUID
+                              << ": "
+                              << ex.toString());
+            log() << "Index build aborted due to NotMaster error: " << buildUUID << ": "
                   << abortIndexFuture.getNoThrow(opCtx);
             throw;
         }

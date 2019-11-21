@@ -513,10 +513,6 @@ Status OpenReadTransactionParam::setFromString(const std::string& str) {
 
 namespace {
 
-std::function<bool(StringData)> initRsOplogBackgroundThreadCallback = [](StringData) -> bool {
-    fassertFailed(40358);
-};
-
 StatusWith<std::vector<std::string>> getDataFilesFromBackupCursor(WT_CURSOR* cursor,
                                                                   std::string dbPath,
                                                                   const char* statusPrefix) {
@@ -1655,20 +1651,6 @@ std::unique_ptr<RecordStore> WiredTigerKVEngine::makeTemporaryRecordStore(Operat
     return std::move(rs);
 }
 
-void WiredTigerKVEngine::alterIdentMetadata(OperationContext* opCtx,
-                                            StringData ident,
-                                            const IndexDescriptor* desc) {
-    WiredTigerSession session(_conn);
-    std::string uri = _uri(ident);
-
-    // Make the alter call to update metadata without taking exclusive lock to avoid conflicts with
-    // concurrent operations.
-    std::string alterString =
-        WiredTigerIndex::generateAppMetadataString(*desc) + "exclusive_refreshed=false,";
-    invariantWTOK(
-        session.getSession()->alter(session.getSession(), uri.c_str(), alterString.c_str()));
-}
-
 Status WiredTigerKVEngine::dropIdent(OperationContext* opCtx, StringData ident) {
     string uri = _uri(ident);
 
@@ -1892,15 +1874,6 @@ void WiredTigerKVEngine::_ensureIdentPath(StringData ident) {
 
 void WiredTigerKVEngine::setJournalListener(JournalListener* jl) {
     return _sessionCache->setJournalListener(jl);
-}
-
-void WiredTigerKVEngine::setInitRsOplogBackgroundThreadCallback(
-    std::function<bool(StringData)> cb) {
-    initRsOplogBackgroundThreadCallback = std::move(cb);
-}
-
-bool WiredTigerKVEngine::initRsOplogBackgroundThread(StringData ns) {
-    return initRsOplogBackgroundThreadCallback(ns);
 }
 
 namespace {
@@ -2250,6 +2223,10 @@ bool WiredTigerKVEngine::supportsReadConcernSnapshot() const {
 
 bool WiredTigerKVEngine::supportsReadConcernMajority() const {
     return _keepDataHistory;
+}
+
+bool WiredTigerKVEngine::supportsOplogStones() const {
+    return true;
 }
 
 void WiredTigerKVEngine::startOplogManager(OperationContext* opCtx,

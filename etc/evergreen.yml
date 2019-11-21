@@ -200,6 +200,12 @@ variables:
   - compile_unittests
   - unittests
 
+- &libfuzzertests
+  name: libfuzzertests!
+  execution_tasks:
+  - compile_libfuzzertests
+  - libfuzzertests
+
 - &dbtest
   name: dbtest!
   execution_tasks:
@@ -254,8 +260,8 @@ variables:
   # The python virtual environment is installed in ${workdir}, which is created in
   # "set up virtualenv".
   - func: "set up virtualenv"
+  - func: "configure evergreen api credentials"
   # NOTE: To disable the compile bypass feature, comment out the next line.
-  #
   - func: "bypass compile and fetch binaries"
   - func: "update bypass expansions"
   - func: "get buildnumber"
@@ -319,6 +325,7 @@ variables:
   - name: causally_consistent_jscore_txns_passthrough
   - name: .encrypt !.aggregation !.gcm
   - name: external_auth
+  - name: external_auth_windows
     distros:
     - windows-64-2016
   - name: .jscore .common !.compat !.sharding
@@ -370,6 +377,7 @@ variables:
   - enterprise-rhel-67-s390x
   - enterprise-rhel-70-64-bit
   - enterprise-rhel-70-64-bit-kitchen-sink
+  - enterprise-rhel-70-64-bit-debug-libunwind
   - enterprise-rhel-71-ppc64le
   - enterprise-rhel-71-ppc64le-inmem
   - enterprise-rhel-72-s390x
@@ -398,6 +406,7 @@ variables:
   - ubuntu1804-debug-asan
   - ubuntu1804-debug-ubsan
   - ubuntu1804-debug-aubsan-lite
+  - ubuntu1804-debug-aubsan-lite_fuzzer
   - ubuntu1804-debug-aubsan-async
 
 
@@ -526,6 +535,51 @@ functions:
       remote_file: ${project}/${build_variant}/${revision}/benchrun_json_files.tgz
       bucket: mciuploads
       extract_to: src/benchrun_embedded/testcases
+
+  "fetch corpus": &fetch_corpus
+    command: s3.get
+    params:
+      aws_key: ${s3_access_key_id}
+      aws_secret: ${s3_secret_access_key}
+      remote_file: ${project}/corpus/mongo-${build_variant}-latest.tgz
+      bucket: fuzzer-artifacts
+      local_file: src/corpus.tgz
+
+  "extract corpus": &extract_corpus
+    command: shell.exec
+    type: test
+    params:
+      shell: bash
+      script: |
+        set -o verbose
+        set -o errexit
+
+        target_dir="src/corpus"
+        mkdir -p $target_dir
+        mv src/corpus.tgz $target_dir
+
+        cd $target_dir
+        tar xzf corpus.tgz
+
+  "archive new corpus": &archive_new_corpus
+    command: archive.targz_pack
+    params:
+      target: corpus.tgz
+      source_dir: src/corpus
+      include:
+        - "**"
+
+  "upload new corpus": &upload_new_corpus
+    command: s3.put
+    params:
+      aws_key: ${s3_access_key_id}
+      aws_secret: ${s3_secret_access_key}
+      local_file: corpus.tgz
+      remote_file: ${project}/corpus/mongo-${build_variant}-latest.tgz
+      bucket: fuzzer-artifacts
+      permissions: private
+      content_type: ${content_type|application/gzip}
+      display_name: "Fuzzer Tests Corpus Tar Archive"
 
   "get buildnumber": &get_buildnumber
     command: keyval.inc
@@ -1153,6 +1207,17 @@ functions:
         set -o verbose
         set -o errexit
 
+        if [ -n "${burn_in_bypass}" ]; then
+          ${activate_virtualenv}
+          # Evergreen executable is in $HOME, so add that to the path.
+          PATH=$PATH:$HOME $python buildscripts/burn_in_tags_bypass_compile_and_fetch_binaries.py            \
+            --project ${project}                                               \
+            --build-variant ${burn_in_bypass}                                  \
+            --revision ${revision}                                             \
+            --out-file bypass_compile_expansions.yml                           \
+            --version-id ${version_id}
+        fi
+
         # For patch builds determine if we can bypass compile.
         if [[ "${is_patch}" = "true" && "${task_name}" = "compile" ]]; then
           ${activate_virtualenv}
@@ -1256,7 +1321,6 @@ functions:
         script: |
           # exit immediately if virtualenv is not found
           set -o errexit
-          set -o verbose
 
           virtualenv_loc=$(which ${virtualenv|virtualenv})
 
@@ -1488,7 +1552,7 @@ functions:
   "generate burn in tags":
     - command: expansions.write
       params:
-        file: expansions.yml
+        file: src/expansions.yml
     - *configure_evergreen_api_credentials
     - command: shell.exec
       params:
@@ -1496,9 +1560,9 @@ functions:
         shell: bash
         script: |
           set -o errexit
-          set -o verbose
+
           ${activate_virtualenv}
-          PATH=$PATH:$HOME $python buildscripts/burn_in_tags.py --expansion-file ../expansions.yml
+          PATH=$PATH:$HOME $python buildscripts/burn_in_tags.py --expansion-file expansions.yml
     - command: archive.targz_pack
       params:
         target: burn_in_tags_gen.tgz
@@ -1535,7 +1599,6 @@ functions:
         working_dir: src
         script: |
           set -o errexit
-          set -o verbose
 
           ${activate_virtualenv}
           $python buildscripts/evergreen_generate_resmoke_tasks.py --expansion-file expansions.yml --verbose
@@ -1845,6 +1908,16 @@ functions:
             exit $(cat jepsen_system_failure_${task_name}_${execution})
           fi
 
+  "load aws test credentials":
+    - command: shell.exec
+      params:
+        silent: true
+        working_dir: src
+        script: |
+          set -o errexit
+          echo "const AWS_KMS_SECRET_ID = '${aws_kms_access_key_id}';" >> src/mongo/db/modules/enterprise/jstests/fle/lib/aws_secrets.js
+          echo "const AWS_KMS_SECRET_KEY = '${aws_kms_secret_access_key}';" >> src/mongo/db/modules/enterprise/jstests/fle/lib/aws_secrets.js
+
   "generate fuzzer tasks":
     - command: manifest.load
     - *git_get_project
@@ -1960,7 +2033,7 @@ functions:
 
           ${add_nodejs_to_path}
 
-          npm run ${npm_command|jstestfuzz} -- ${jstestfuzz_vars}
+          npm run ${npm_command|jstestfuzz} -- ${jstestfuzz_vars} --branch ${branch_name}
 
     - command: archive.targz_pack
       params:
@@ -3740,6 +3813,36 @@ tasks:
       vars:
         resmoke_args: --suites=unittests
 
+##compile_libfuzzertests - build libfuzzertests ##
+- name: compile_libfuzzertests
+  commands:
+    - func: "scons compile"
+      vars:
+        targets: libfuzzer_tests
+        task_compile_flags: >-
+          --detect-odr-violations
+
+## libfuzzertests - run libfuzzertests ##
+- name: libfuzzertests
+  commands:
+    - func: "fetch corpus"
+    - func: "extract corpus"
+    - func: "run tests"
+      vars:
+        resmoke_args: --suites=libfuzzer
+    - command: shell.exec
+      type: setup
+      params:
+        working_dir: src
+        shell: bash
+        script: |
+          set -o verbose
+          set -o errexit
+
+          ./buildscripts/merge_corpus.sh
+    - func: "archive new corpus"
+    - func: "upload new corpus"
+
 ## compile_dbtest ##
 - name: compile_dbtest
   commands:
@@ -4794,88 +4897,27 @@ tasks:
         ${activate_virtualenv}
         find buildscripts etc jstests -name '*.y*ml' -exec yamllint -c etc/yamllint_config.yml {} +
 
-### This task is deprecated, but left in here in case of need to run burn_in_tests
-### instead of the generated task:
-###  - Rename burn_in_tests_gen task to burn_in_tests_gen_UNUSED
-###  - Rename burn_in_tests_gen to burn_in_tests on the build variants
-- <<: *task_template
-  name: burn_in_tests
-  depends_on:
-  - name: compile
-  commands:
-  - command: manifest.load
-  - func: "git get project"
-    # The repository is cloned in a directory distinct from src for the modified test detection
-    # because the extraction of the artifacts performed in the 'do setup' causes
-    # 'git diff --name-only' to see all tests as modified on Windows (git 1.9.5). See SERVER-30634.
-    vars:
-      git_project_directory: burn_in_tests_clonedir
-  - func: "do setup"
-  - command: shell.exec
-    params:
-      working_dir: burn_in_tests_clonedir
-      shell: bash
-      script: |
-        set -o errexit
-        set -o verbose
-        # If this is a scheduled build, we check for changes against the last scheduled commit.
-        if [ "${is_patch}" != "true" ]; then
-          burn_in_args="--checkEvergreen"
-        fi
-        pushd ../src
-        ${activate_virtualenv}
-        popd
-        # Capture a list of new and modified tests.
-        build_variant=${build_variant}
-        if [ -n "${burn_in_tests_build_variant|}" ]; then
-          build_variant=${burn_in_tests_build_variant|}
-        fi
-        # Evergreen executable is in $HOME.
-        PATH=$PATH:$HOME $python buildscripts/burn_in_tests.py --branch=${branch_name} --buildVariant=$build_variant --testListOutfile=jstests/new_tests.json --noExec $burn_in_args
-        # Copy the results to the src dir.
-        cp jstests/new_tests.json ../src/jstests/new_tests.json
-  - func: "do multiversion setup"
-  - func: "run tests"
-    vars:
-      task_path_suffix: /data/multiversion:$HOME
-      resmoke_wrapper: $python buildscripts/burn_in_tests.py --testListFile=jstests/new_tests.json
-      resmoke_args: --repeatSuites=2
-###
-
 - name: burn_in_tests_gen
   commands:
   - command: manifest.load
   - func: "git get project"
-    # The repository is cloned in a directory distinct from src for the modified test detection
-    # because the extraction of the artifacts performed in the 'do setup' causes
-    # 'git diff --name-only' to see all tests as modified on Windows (git 1.9.5). See SERVER-30634.
-    vars:
-      git_project_directory: burn_in_tests_clonedir
   - func: "set task expansion macros"
   - func: "set up virtualenv"
-    vars:
-      pip_dir: ${workdir}/burn_in_tests_clonedir/etc/pip
-  - command: shell.exec
-    params:
-      working_dir: burn_in_tests_clonedir
-      shell: bash
-      script: |
-        set -o errexit
-        set -o verbose
-        mkdir ../src
   - func: "configure evergreen api credentials"
   - command: shell.exec
     params:
-      working_dir: burn_in_tests_clonedir
+      working_dir: src
       shell: bash
       script: |
         set -o errexit
         set -o verbose
+
         ${activate_virtualenv}
         # If this is a scheduled build, we check for changes against the last scheduled commit.
         if [ "${is_patch}" != "true" ]; then
           burn_in_args="--checkEvergreen"
         fi
+
         # Capture a list of new and modified tests. The expansion macro burn_in_tests_build_variant
         # is used to for finding the associated tasks from a different build varaint than the
         # burn_in_tests_gen task executes on.
@@ -4883,10 +4925,11 @@ tasks:
         if [ -n "${burn_in_tests_build_variant|}" ]; then
           build_variant_opts="--buildVariant=${burn_in_tests_build_variant} --runBuildVariant=${build_variant}"
         fi
+
         # Increase the burn_in repetition from 2 to 1000 executions or 10 minutes
         burn_in_args="$burn_in_args --repeatTestsMin=2 --repeatTestsMax=1000 --repeatTestsSecs=600"
         # Evergreen executable is in $HOME.
-        PATH=$PATH:$HOME $python buildscripts/burn_in_tests.py --branch=${branch_name} --project=${project} $build_variant_opts --distro=${distro_id} --generateTasksFile=../src/burn_in_tests_gen.json --noExec $burn_in_args
+        PATH=$PATH:$HOME $python buildscripts/burn_in_tests.py --branch=${branch_name} --project=${project} $build_variant_opts --distro=${distro_id} --generateTasksFile=burn_in_tests_gen.json --noExec $burn_in_args
   - command: archive.targz_pack
     params:
       target: src/burn_in_tests_gen.tgz
@@ -5150,7 +5193,7 @@ tasks:
     vars:
       <<: *jstestfuzz_config_vars
       num_files: 10
-      num_tasks: 5
+      num_tasks: 15
       npm_command: initsync-fuzzer
       resmoke_args: --suites=initial_sync_fuzzer
       name: initial_sync_fuzzer
@@ -5184,6 +5227,21 @@ tasks:
       npm_command: agg-expr-fuzzer
       name: aggregation_expression_multiversion_fuzzer
       task_path_suffix: "/data/multiversion"
+
+## Standalone generational fuzzer for checking optimized and unoptimized expression equivalence
+- <<: *jstestfuzz_template
+  name: aggregation_expression_optimization_fuzzer_gen
+  tags: ["aggfuzzer"]
+  commands:
+  - func: "generate fuzzer tasks"
+    vars:
+      <<: *jstestfuzz_config_vars
+      num_files: 5
+      num_tasks: 10
+      jstestfuzz_vars: --diffTestingMode optimization
+      resmoke_args: --suites=generational_fuzzer
+      npm_command: agg-expr-fuzzer
+      name: aggregation_expression_optimization_fuzzer
 
 ## Standalone fuzzer for checking wildcard index correctness ##
 - <<: *jstestfuzz_template
@@ -5714,6 +5772,8 @@ tasks:
       fallback_num_sub_suites: 4
 
 - name: burn_in_tags_gen
+  depends_on:
+    - name: compile
   commands:
   - command: manifest.load
   - func: "git get project"
@@ -5727,7 +5787,6 @@ tasks:
       repeat_tests_secs: 600
       repeat_tests_min: 2
       repeat_tests_max: 1000
-      base_variants: enterprise-rhel-62-64-bit-majority-read-concern-off enterprise-rhel-62-64-bit-inmem linux-64-duroff
 
 - name: auth_audit_gen
   tags: ["auth", "audit"]
@@ -6076,9 +6135,37 @@ tasks:
   name: external_auth
   commands:
   - func: "do setup"
+  - command: shell.exec
+    params:
+      shell: bash
+      script: |
+        set -o errexit
+        set -o verbose
+        ${activate_virtualenv}
+
+        # Not all git get project calls clone into ${workdir}/src so we allow
+        # callers to tell us where the pip requirements files are.
+        pip_dir="${pip_dir}"
+        if [[ -z $pip_dir ]]; then
+          # Default to most common location
+          pip_dir="${workdir}/src/etc/pip"
+        fi
+
+        # Same as above we have to use quotes to preserve the
+        # Windows path separator
+        external_auth_txt="$pip_dir/external-auth-requirements.txt"
+        python -m pip install -r "$external_auth_txt"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=external_auth --storageEngine=wiredTiger
+      resmoke_args: --suites=external_auth --excludeWithAnyTags=requires_domain_controller --storageEngine=wiredTiger
+
+- <<: *task_template
+  name: external_auth_windows
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=external_auth --includeWithAnyTags=requires_domain_controller --storageEngine=wiredTiger
 
 - <<: *task_template
   name: sharding_gle_auth_basics_passthrough
@@ -7324,7 +7411,7 @@ tasks:
 
 - <<: *task_template
   name: client_encrypt
-  tags: ["ssl"]
+  tags: ["ssl", "encrypt"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -7337,6 +7424,7 @@ tasks:
   tags: ["encrypt"]
   commands:
   - func: "do setup"
+  - func: "load aws test credentials"
   - func: "run tests"
     vars:
       resmoke_args: --suites=fle --storageEngine=wiredTiger
@@ -8213,6 +8301,11 @@ task_groups:
   tasks:
   - compile_dbtest
   - dbtest
+- <<: *compile_task_group_template
+  name: libfuzzertests_TG
+  tasks:
+  - compile_libfuzzertests
+  - libfuzzertests
 - <<: *compile_task_group_template
   name: compile_all_run_unittests_TG
   tasks:
@@ -9297,6 +9390,7 @@ buildvariants:
     - windows-64-vs2017-compile
   - name: .aggregation !.auth !.encrypt
   - name: aggregation_expression_multiversion_fuzzer_gen
+  - name: aggregation_expression_optimization_fuzzer_gen
   - name: auth_gen
   - name: bulk_gle_passthrough
   - name: .causally_consistent !.sharding
@@ -9372,6 +9466,7 @@ buildvariants:
     - windows-64-vs2017-compile
   - name: .encrypt !.aggregation !.replica_sets !.sharding !.jscore
   - name: external_auth
+  - name: external_auth_windows
     distros:
     - windows-64-2016
   - name: .jscore .common !.compat !.sharding
@@ -9618,7 +9713,7 @@ buildvariants:
 - name: macos
   display_name: macOS
   run_on:
-  - macos-1014
+  - macos-1014-i7
   batchtime: 1440 # 1 day
   expansions:
     test_flags: --excludeWithAnyTags=requires_ssl_mongo_tools
@@ -9628,7 +9723,7 @@ buildvariants:
     push_arch: x86_64
     compile_env: DEVELOPER_DIR=/Applications/Xcode10.2.app
     compile_flags: --ssl -j$(sysctl -n hw.logicalcpu) --release --libc++ --variables-files=etc/scons/xcode_macosx.vars
-    resmoke_jobs_max: 4
+    resmoke_jobs_max: 6
     tooltags: "ssl"
     build_mongoreplay: true
   display_tasks:
@@ -9671,9 +9766,9 @@ buildvariants:
 - name: macos-debug
   display_name: "* macOS DEBUG"
   run_on:
-  - macos-1014
+  - macos-1014-i7
   expansions:
-    resmoke_jobs_max: 4
+    resmoke_jobs_max: 6
     compile_env: DEVELOPER_DIR=/Applications/Xcode10.2.app
     compile_flags: --ssl --dbg=on --opt=on -j$(sysctl -n hw.logicalcpu) --libc++ --variables-files=etc/scons/xcode_macosx.vars
     tooltags: ""
@@ -9702,7 +9797,7 @@ buildvariants:
   modules:
   - enterprise
   run_on:
-  - macos-1014
+  - macos-1014-i7
   batchtime: 1440 # 1 day
   expansions:
     test_flags: --excludeWithAnyTags=requires_ssl_mongo_tools
@@ -9713,7 +9808,7 @@ buildvariants:
     mh_target: dist-mh
     compile_env: DEVELOPER_DIR=/Applications/Xcode10.2.app
     compile_flags: --ssl -j$(sysctl -n hw.logicalcpu) --release --libc++ --variables-files=etc/scons/xcode_macosx.vars
-    resmoke_jobs_max: 4
+    resmoke_jobs_max: 6
     tooltags: "ssl sasl gssapi"
     build_mongoreplay: true
   display_tasks:
@@ -9740,7 +9835,7 @@ buildvariants:
   modules:
   - enterprise
   run_on:
-  - macos-1014
+  - macos-1014-i7
   batchtime: 1440 # 1 day
   expansions:
     test_flags: --excludeWithAnyTags=requires_ssl_mongo_tools
@@ -9751,7 +9846,7 @@ buildvariants:
     tooltags: "ssl sasl gssapi"
     compile_env: DEVELOPER_DIR=/Applications/Xcode10.2.app
     compile_flags: --ssl --ssl-provider=openssl -j$(sysctl -n hw.logicalcpu) --release --libc++ LIBPATH="$PWD/openssl_install_dir/lib" CPPPATH="$PWD/openssl_install_dir/include" --variables-files=etc/scons/xcode_macosx.vars
-    resmoke_jobs_max: 4
+    resmoke_jobs_max: 6
     build_mongoreplay: true
     build_openssl: true
     openssl_config_flags: "-mmacosx-version-min=10.12"
@@ -9778,7 +9873,7 @@ buildvariants:
 - name: embedded-sdk-macos
   display_name: "Embedded SDK - macOS"
   run_on:
-  - macos-1014
+  - macos-1014-i7
   batchtime: 1440 # 1 day
   expansions:
     test_flags: --excludeWithAnyTags=uses_transactions
@@ -9808,7 +9903,7 @@ buildvariants:
 - name: embedded-sdk-iphoneos
   display_name: "Embedded SDK - iOS"
   run_on:
-  - macos-1014
+  - macos-1014-i7
   batchtime: 1440 # 1 day
   expansions:
     test_flags: --excludeWithAnyTags=uses_transactions
@@ -9840,7 +9935,7 @@ buildvariants:
 - name: embedded-sdk-iphonesimulator
   display_name: "Embedded SDK - iOS Simulator"
   run_on:
-  - macos-1014
+  - macos-1014-i7
   batchtime: 1440 # 1 day
   expansions:
     test_flags: --excludeWithAnyTags=uses_transactions
@@ -9875,7 +9970,7 @@ buildvariants:
 - name: embedded-sdk-appletvos
   display_name: "Embedded SDK - tvOS"
   run_on:
-  - macos-1014
+  - macos-1014-i7
   batchtime: 1440 # 1 day
   expansions:
     cmake_path: /Applications/cmake-3.11.0-Darwin-x86_64/CMake.app/Contents/bin/cmake
@@ -9907,7 +10002,7 @@ buildvariants:
 - name: embedded-sdk-appletvsimulator
   display_name: "Embedded SDK - tvOS Simulator"
   run_on:
-  - macos-1014
+  - macos-1014-i7
   batchtime: 1440 # 1 day
   expansions:
     cmake_path: /Applications/cmake-3.11.0-Darwin-x86_64/CMake.app/Contents/bin/cmake
@@ -9942,7 +10037,7 @@ buildvariants:
 - name: embedded-sdk-watchos
   display_name: "Embedded SDK - watchOS"
   run_on:
-  - macos-1014
+  - macos-1014-i7
   batchtime: 1440 # 1 day
   expansions:
     cmake_path: /Applications/cmake-3.11.0-Darwin-x86_64/CMake.app/Contents/bin/cmake
@@ -9974,7 +10069,7 @@ buildvariants:
 - name: embedded-sdk-watchsimulator
   display_name: "Embedded SDK - watchOS Simulator"
   run_on:
-  - macos-1014
+  - macos-1014-i7
   batchtime: 1440 # 1 day
   expansions:
     cmake_path: /Applications/cmake-3.11.0-Darwin-x86_64/CMake.app/Contents/bin/cmake
@@ -10009,7 +10104,7 @@ buildvariants:
 - name: embedded-sdk-apple-multiarch
   display_name: "Embedded SDK - Apple Multiarch"
   run_on:
-  - macos-1014
+  - macos-1014-i7
   batchtime: 1440 # 1 day
   expansions:
     compile_env: DEVELOPER_DIR=/Applications/Xcode10.2.app
@@ -10231,6 +10326,7 @@ buildvariants:
     jstestfuzz_concurrent_num_files: 10
     target_resmoke_time: 10
     large_distro_name: rhel62-large
+    burn_in_tag_buildvariants: enterprise-rhel-62-64-bit-majority-read-concern-off enterprise-rhel-62-64-bit-inmem linux-64-duroff
   display_tasks:
   - *dbtest
   - *unittests
@@ -10614,6 +10710,7 @@ buildvariants:
   - name: .replica_sets !.encrypt !.auth
     distros:
     - rhel62-large
+  - name: sharding_gen
 
 - name: enterprise-rhel-62-64-bit-coverage
   display_name: "~ Enterprise RHEL 6.2 DEBUG Code Coverage"
@@ -10773,6 +10870,18 @@ buildvariants:
   - name: compile_all_run_unittests_TG
   - name: jsCore
   - name: noPassthrough_gen
+
+- <<: *enterprise-rhel-70-64-bit-template
+  name: enterprise-rhel-70-64-bit-debug-libunwind
+  display_name: "~ Enterprise RHEL 7.0 DEBUG (libunwind)"
+  batchtime: 1440 # 1 day
+  runs_on:
+  - rhel70
+  expansions:
+    <<: *enterprise-rhel-70-64-bit-expansions-template
+    compile_flags: --ssl MONGO_DISTMOD=rhel70 --dbg=on --opt=on -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars --use-libunwind
+    has_packages: false
+    mh_target: ""
 
 - name: ubuntu1604-debug
   display_name: "* Ubuntu 16.04 DEBUG"
@@ -11882,7 +11991,7 @@ buildvariants:
 - name: macos-mobile
   display_name: macOS (mobile)
   run_on:
-  - macos-1014
+  - macos-1014-i7
   batchtime: 1440 # 1 day
   expansions:
     push_path: osx
@@ -12266,6 +12375,30 @@ buildvariants:
   - name: jsCore_txns_large_txns_format
   - name: .logical_session_cache .one_sec
   - name: watchdog_wiredtiger
+
+- name: ubuntu1804-debug-aubsan-lite_fuzzer
+  display_name: "{A,UB}SAN Enterprise SSL Ubuntu 18.04 FUZZER"
+  modules:
+  - enterprise
+  run_on:
+  - ubuntu1804-build
+  stepback: false
+  batchtime: 1440 # 1 day
+  expansions:
+    # We need llvm-symbolizer in the PATH for ASAN for clang-3.7 or later.
+    variant_path_suffix: /opt/mongodbtoolchain/v3/bin
+    lang_environment: LANG=C
+    san_options: UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1" LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=1
+    compile_flags: LINKFLAGS=-nostdlib++ LIBS=stdc++ --variables-files=etc/scons/mongodbtoolchain_v3_clang.vars --dbg=on --opt=on --allocator=system --sanitize=undefined,address,fuzzer --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip --disable-warnings-as-errors
+    resmoke_jobs_factor: 0.3  # Avoid starting too many mongod's under {A,UB}SAN build.
+    tooltags: "ssl"
+    build_mongoreplay: true
+    hang_analyzer_dump_core: false
+    scons_cache_scope: shared
+  display_tasks:
+  - *libfuzzertests
+  tasks:
+   - name: libfuzzertests_TG
 
 - name: ubuntu1804-debug-aubsan-async
   display_name: "~ {A,UB}SAN Enterprise SSL Ubuntu 18.04 async"

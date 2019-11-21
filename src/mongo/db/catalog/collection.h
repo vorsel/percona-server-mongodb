@@ -206,7 +206,7 @@ public:
      */
     virtual void setNs(NamespaceString nss) = 0;
 
-    virtual OptionalCollectionUUID uuid() const = 0;
+    virtual UUID uuid() const = 0;
 
     virtual const IndexCatalog* getIndexCatalog() const = 0;
     virtual IndexCatalog* getIndexCatalog() = 0;
@@ -277,9 +277,8 @@ public:
      * this method.
      */
     virtual Status insertDocumentsForOplog(OperationContext* const opCtx,
-                                           const DocWriter* const* const docs,
-                                           Timestamp* timestamps,
-                                           const size_t nDocs) = 0;
+                                           std::vector<Record>* records,
+                                           const std::vector<Timestamp>& timestamps) = 0;
 
     /**
      * Inserts a document into the record store for a bulk loader that manages the index building
@@ -339,9 +338,11 @@ public:
     virtual Status truncate(OperationContext* const opCtx) = 0;
 
     /**
+     * Expects the caller to hold at least a collection IS lock.
+     *
      * @return OK if the validate run successfully
      *         OK will be returned even if corruption is found
-     *         deatils will be in result.
+     *         details will be in 'results'.
      */
     virtual Status validate(OperationContext* const opCtx,
                             const ValidateCmdLevel level,

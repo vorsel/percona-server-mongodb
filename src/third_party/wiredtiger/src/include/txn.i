@@ -427,7 +427,7 @@ __wt_txn_op_delete_commit_apply_timestamps(
 /*
  * __wt_txn_op_set_timestamp --
  *	Decide whether to copy a commit timestamp into an update. If the op
- *	structure doesn't have a populated update or ref field or in prepared
+ *	structure doesn't have a populated update or ref field or is in prepared
  *      state there won't be any check for an existing timestamp.
  */
 static inline void
@@ -683,7 +683,7 @@ __txn_visible_all_id(WT_SESSION_IMPL *session, uint64_t id)
  */
 static inline bool
 __wt_txn_visible_all(
-    WT_SESSION_IMPL *session, uint64_t id, const wt_timestamp_t timestamp)
+    WT_SESSION_IMPL *session, uint64_t id, wt_timestamp_t timestamp)
 {
 	wt_timestamp_t pinned_ts;
 
@@ -716,7 +716,12 @@ __wt_txn_upd_visible_all(WT_SESSION_IMPL *session, WT_UPDATE *upd)
 	    upd->prepare_state == WT_PREPARE_INPROGRESS)
 		return (false);
 
-	return (__wt_txn_visible_all(session, upd->txnid, upd->start_ts));
+	/*
+	 * This function is used to determine when an update is obsolete: that
+	 * should take into account the durable timestamp which is greater than
+	 * or equal to the start timestamp.
+	 */
+	return (__wt_txn_visible_all(session, upd->txnid, upd->durable_ts));
 }
 
 /*
@@ -778,7 +783,7 @@ __txn_visible_id(WT_SESSION_IMPL *session, uint64_t id)
  */
 static inline bool
 __wt_txn_visible(
-    WT_SESSION_IMPL *session, uint64_t id, const wt_timestamp_t timestamp)
+    WT_SESSION_IMPL *session, uint64_t id, wt_timestamp_t timestamp)
 {
 	WT_TXN *txn;
 

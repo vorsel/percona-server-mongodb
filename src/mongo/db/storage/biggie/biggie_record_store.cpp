@@ -59,12 +59,12 @@ BSONObj const sample = BSON(""
                             << (int64_t)0);
 
 std::string createKey(StringData ident, int64_t recordId) {
-    KeyString ks(version, BSON("" << ident << "" << recordId), allAscending);
+    KeyString::Builder ks(version, BSON("" << ident << "" << recordId), allAscending);
     return std::string(ks.getBuffer(), ks.getSize());
 }
 
 RecordId extractRecordId(const std::string& keyStr) {
-    KeyString ks(version, sample, allAscending);
+    KeyString::Builder ks(version, sample, allAscending);
     ks.resetFromBuffer(keyStr.c_str(), keyStr.size());
     BSONObj obj = KeyString::toBson(keyStr.c_str(), keyStr.size(), allAscending, ks.getTypeBits());
     auto it = BSONObjIterator(obj);
@@ -183,53 +183,6 @@ Status RecordStore::insertRecords(OperationContext* opCtx,
         }
     }
     ru->makeDirty();
-    _cappedDeleteAsNeeded(opCtx, workingCopy);
-    return Status::OK();
-}
-
-Status RecordStore::insertRecordsWithDocWriter(OperationContext* opCtx,
-                                               const DocWriter* const* docs,
-                                               const Timestamp*,
-                                               size_t nDocs,
-                                               RecordId* idsOut) {
-    int64_t totalSize = 0;
-    for (size_t i = 0; i < nDocs; i++)
-        totalSize += docs[i]->documentSize();
-
-    // Caller will retry one element at a time.
-    if (_isCapped && totalSize > _cappedMaxSize)
-        return Status(ErrorCodes::BadValue, "object to insert exceeds cappedMaxSize");
-
-    auto ru = RecoveryUnit::get(opCtx);
-    StringStore* workingCopy(ru->getHead());
-    {
-        SizeAdjuster adjuster(opCtx, this);
-        for (size_t i = 0; i < nDocs; i++) {
-            const size_t len = docs[i]->documentSize();
-
-            std::string buf(len, '\0');
-            docs[i]->writeDocument(&buf[0]);
-
-            int64_t thisRecordId = 0;
-            if (_isOplog) {
-                StatusWith<RecordId> status = oploghack::extractKey(buf.data(), len);
-                if (!status.isOK())
-                    return status.getStatus();
-                thisRecordId = status.getValue().repr();
-                _visibilityManager->addUncommittedRecord(opCtx, this, RecordId(thisRecordId));
-            } else {
-                thisRecordId = _nextRecordId();
-            }
-            std::string key = createKey(_ident, thisRecordId);
-
-            StringStore::value_type vt{key, buf};
-            workingCopy->insert(std::move(vt));
-            if (idsOut)
-                idsOut[i] = RecordId(thisRecordId);
-            ru->makeDirty();
-        }
-    }
-
     _cappedDeleteAsNeeded(opCtx, workingCopy);
     return Status::OK();
 }
