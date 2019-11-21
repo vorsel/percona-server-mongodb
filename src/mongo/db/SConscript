@@ -450,7 +450,6 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
-        'ldap_options_init',
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/util/options_parser/options_parser',

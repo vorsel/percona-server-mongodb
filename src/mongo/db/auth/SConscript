@@ -298,6 +298,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/commands',
         '$BUILD_DIR/mongo/db/commands/authentication_commands',
         '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
+        '$BUILD_DIR/mongo/db/ldap_options_init',
         'sasl_options_init',
     ],
 )
