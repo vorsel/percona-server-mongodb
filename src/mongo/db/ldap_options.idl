@@ -60,6 +60,7 @@ server_parameters:
         description: "Provides mechanism to transform authenticated user name to a LDAP Distinguished Name (DN)"
         set_at: runtime
         cpp_varname: "ldapGlobalParams.ldapUserToDNMapping"
+        default: "[{match: \"(.+)\", substitution: \"{0}\"}]"
     ldapUseConnectionPool:
         description: ""
         set_at: startup
