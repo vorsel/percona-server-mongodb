@@ -29,11 +29,14 @@ Copyright (C) 2019-present Percona and/or its affiliates. All rights reserved.
     it in the license file.
 ======= */
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAccessControl
+
 #include "mongo/db/ldap/ldap_manager_impl.h"
 
 #include <fmt/format.h>
 
 #include "mongo/db/ldap_options.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -105,6 +108,11 @@ Status LDAPManagerImpl::queryUserRoles(const UserName& userName, stdx::unordered
     // if attributes are not specified assume query returns set of entities (groups)
     const bool entitiesonly = !ludp->lud_attrs || !ludp->lud_attrs[0];
 
+    LOGV2_DEBUG(29051, 1, "Parsing LDAP URL: {ldapurl}; dn: {dn}; scope: {scope}; filter: {filter}",
+            "ldapurl"_attr = ldapurl,
+            "scope"_attr = ludp->lud_scope,
+            "dn"_attr = ludp->lud_dn ? ludp->lud_dn : "nullptr",
+            "filter"_attr = ludp->lud_filter ? ludp->lud_filter : "nullptr");
     res = ldap_search_ext_s(_ldap,
             ludp->lud_dn,
             ludp->lud_scope,
