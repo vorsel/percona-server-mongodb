@@ -1018,6 +1018,18 @@ namespace audit {
         _auditEvent(client, "revokePrivilegesFromRole", params.done());
     }
 
+    void logRefineCollectionShardKey(Client* client,
+                                     StringData ns,
+                                     const BSONObj& keyPattern) {
+        if (!_auditLog) {
+            return;
+        }
+
+        const BSONObj params = BSON("ns" << ns <<
+                                    "key" << keyPattern);
+        _auditEvent(client, "refineCollectionShardKey", params);
+    }
+
     void writeImpersonatedUsersToMetadata(OperationContext* txn,
                                           BSONObjBuilder* metadata) PERCONA_AUDIT_STUB
 
