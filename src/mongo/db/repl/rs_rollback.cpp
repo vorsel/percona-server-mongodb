@@ -83,13 +83,13 @@
 
 namespace mongo {
 
-using std::shared_ptr;
-using std::unique_ptr;
 using std::list;
 using std::map;
-using std::set;
-using std::string;
 using std::pair;
+using std::set;
+using std::shared_ptr;
+using std::string;
+using std::unique_ptr;
 
 namespace repl {
 
@@ -199,10 +199,10 @@ Status FixUpInfo::recordDropTargetInfo(const BSONElement& dropTarget,
                                        OpTime opTime) {
     StatusWith<UUID> dropTargetUUIDStatus = UUID::parse(dropTarget);
     if (!dropTargetUUIDStatus.isOK()) {
-        std::string message = str::stream() << "Unable to roll back renameCollection. Cannot parse "
-                                               "dropTarget UUID. Returned status: "
-                                            << redact(dropTargetUUIDStatus.getStatus())
-                                            << ", oplog entry: " << redact(obj);
+        std::string message = str::stream()
+            << "Unable to roll back renameCollection. Cannot parse "
+               "dropTarget UUID. Returned status: "
+            << redact(dropTargetUUIDStatus.getStatus()) << ", oplog entry: " << redact(obj);
         error() << message;
         return dropTargetUUIDStatus.getStatus();
     }
@@ -227,8 +227,8 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(OperationContext* o
     // Checks that the oplog entry is smaller than 512 MB. We do not roll back if the
     // oplog entry is larger than 512 MB.
     if (ourObj.objsize() > 512 * 1024 * 1024)
-        throw RSFatalException(str::stream() << "Rollback too large, oplog size: "
-                                             << ourObj.objsize());
+        throw RSFatalException(str::stream()
+                               << "Rollback too large, oplog size: " << ourObj.objsize());
 
     // If required fields are not present in the BSONObj for an applyOps entry, create these fields
     // and populate them with dummy values before parsing ourObj as an oplog entry.
@@ -738,11 +738,12 @@ void rollbackCreateIndexes(OperationContext* opCtx, UUID uuid, std::set<std::str
 void rollbackDropIndexes(OperationContext* opCtx,
                          UUID uuid,
                          std::map<std::string, BSONObj> indexNames) {
-
     boost::optional<NamespaceString> nss = CollectionCatalog::get(opCtx).lookupNSSByUUID(uuid);
     invariant(nss);
-    Lock::DBLock dbLock(opCtx, nss->db(), MODE_X);
-    Collection* collection = CollectionCatalog::get(opCtx).lookupCollectionByUUID(uuid);
+    Lock::DBLock dbLock(opCtx, nss->db(), MODE_IX);
+    Lock::CollectionLock collLock(opCtx, *nss, MODE_X);
+    Collection* collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(*nss);
+
     // If we cannot find the collection, we skip over dropping the index.
     if (!collection) {
         LOG(2) << "Cannot find the collection with uuid: " << uuid.toString()
@@ -751,17 +752,8 @@ void rollbackDropIndexes(OperationContext* opCtx,
     }
 
     for (auto itIndex = indexNames.begin(); itIndex != indexNames.end(); itIndex++) {
-
         const string indexName = itIndex->first;
         BSONObj indexSpec = itIndex->second;
-        // We replace the namespace field because it is possible that a
-        // renameCollection command has occurred, changing the namespace of the
-        // collection from what it initially was during the creation of this index.
-        BSONObjBuilder updatedNss;
-        updatedNss.append("ns", nss->ns());
-
-        BSONObj updatedNssObj = updatedNss.obj();
-        indexSpec = indexSpec.addField(updatedNssObj.firstElement());
 
         log() << "Creating index in rollback for collection: " << *nss << ", UUID: " << uuid
               << ", index: " << indexName;
@@ -1235,8 +1227,9 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
                 // is rolled back upstream and we restart, we expect to still have the
                 // collection.
 
-                log() << nss->ns() << " not found on remote host, so we do not roll back collmod "
-                                      "operation. Instead, we will drop the collection soon.";
+                log() << nss->ns()
+                      << " not found on remote host, so we do not roll back collmod "
+                         "operation. Instead, we will drop the collection soon.";
                 continue;
             }
 
@@ -1246,18 +1239,18 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
             // Updates the collection flags.
             if (auto optionsField = info["options"]) {
                 if (optionsField.type() != Object) {
-                    throw RSFatalException(str::stream() << "Failed to parse options " << info
-                                                         << ": expected 'options' to be an "
-                                                         << "Object, got "
-                                                         << typeName(optionsField.type()));
+                    throw RSFatalException(str::stream()
+                                           << "Failed to parse options " << info
+                                           << ": expected 'options' to be an "
+                                           << "Object, got " << typeName(optionsField.type()));
                 }
 
                 auto statusWithCollectionOptions = CollectionOptions::parse(
                     optionsField.Obj(), CollectionOptions::parseForCommand);
                 if (!statusWithCollectionOptions.isOK()) {
-                    throw RSFatalException(
-                        str::stream() << "Failed to parse options " << info << ": "
-                                      << statusWithCollectionOptions.getStatus().toString());
+                    throw RSFatalException(str::stream()
+                                           << "Failed to parse options " << info << ": "
+                                           << statusWithCollectionOptions.getStatus().toString());
                 }
                 options = statusWithCollectionOptions.getValue();
             } else {
@@ -1275,13 +1268,10 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
             auto validatorStatus = collection->updateValidator(
                 opCtx, options.validator, options.validationLevel, options.validationAction);
             if (!validatorStatus.isOK()) {
-                throw RSFatalException(
-                    str::stream() << "Failed to update validator for " << nss->toString() << " ("
-                                  << uuid
-                                  << ") with "
-                                  << redact(info)
-                                  << ". Got: "
-                                  << validatorStatus.toString());
+                throw RSFatalException(str::stream()
+                                       << "Failed to update validator for " << nss->toString()
+                                       << " (" << uuid << ") with " << redact(info)
+                                       << ". Got: " << validatorStatus.toString());
             }
 
             wuow.commit();
@@ -1371,8 +1361,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
                                      << " to archive file: " << redact(status);
                             throw RSFatalException(str::stream()
                                                    << "Rollback cannot write document in namespace "
-                                                   << nss->ns()
-                                                   << " to archive file.");
+                                                   << nss->ns() << " to archive file.");
                         }
                     } else {
                         error() << "Rollback cannot find object: " << pattern << " in namespace "

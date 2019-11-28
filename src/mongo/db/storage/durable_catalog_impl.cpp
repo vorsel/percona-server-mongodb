@@ -36,7 +36,6 @@
 
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/bson/util/builder.h"
-#include "mongo/db/catalog/disable_index_spec_namespace_generation_gen.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/namespace_string.h"
@@ -804,7 +803,7 @@ StatusWith<std::unique_ptr<RecordStore>> DurableCatalogImpl::createCollection(
     }
 
     CollectionUUID uuid = options.uuid.get();
-    opCtx->recoveryUnit()->onRollback([ opCtx, catalog = this, nss, ident, uuid ]() {
+    opCtx->recoveryUnit()->onRollback([opCtx, catalog = this, nss, ident, uuid]() {
         // Intentionally ignoring failure
         catalog->_engine->getEngine()->dropIdent(opCtx, ident).ignore();
     });
@@ -871,7 +870,7 @@ Status DurableCatalogImpl::dropCollection(OperationContext* opCtx, const Namespa
 
     // This will notify the storageEngine to drop the collection only on WUOW::commit().
     opCtx->recoveryUnit()->onCommit(
-        [ opCtx, catalog = this, nss, uuid, ident ](boost::optional<Timestamp> commitTimestamp) {
+        [opCtx, catalog = this, nss, uuid, ident](boost::optional<Timestamp> commitTimestamp) {
             StorageEngineInterface* engine = catalog->_engine;
             auto storageEngine = engine->getStorageEngine();
             if (storageEngine->supportsPendingDrops() && commitTimestamp) {
@@ -1205,12 +1204,6 @@ BSONObj DurableCatalogImpl::getIndexSpec(OperationContext* opCtx,
     invariant(offset >= 0);
 
     BSONObj spec = md.indexes[offset].spec.getOwned();
-    if (spec.hasField("ns") || disableIndexSpecNamespaceGeneration.load()) {
-        return spec;
-    }
-
-    BSONObj nsObj = BSON("ns" << ns.ns());
-    spec = spec.addField(nsObj.firstElement());
     return spec;
 }
 

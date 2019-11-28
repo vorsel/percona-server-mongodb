@@ -41,7 +41,6 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_session_id.h"
-#include "mongo/db/logical_session_id.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/rpc/get_status_from_command_result.h"
@@ -403,6 +402,10 @@ LogicalTime TransactionRouter::AtClusterTime::getTime() const {
     return _atClusterTime;
 }
 
+bool TransactionRouter::AtClusterTime::timeHasBeenSet() const {
+    return _atClusterTime != LogicalTime::kUninitialized;
+}
+
 void TransactionRouter::AtClusterTime::setTime(LogicalTime atClusterTime, StmtId currentStmtId) {
     invariant(atClusterTime != LogicalTime::kUninitialized);
     _atClusterTime = atClusterTime;
@@ -520,17 +523,13 @@ void TransactionRouter::Router::_assertAbortStatusIsOkOrNoSuchTransaction(
     auto shardResponse = uassertStatusOKWithContext(
         std::move(response.swResponse),
         str::stream() << "Failed to send abort to shard " << response.shardId
-                      << " between retries of statement "
-                      << p().latestStmtId);
+                      << " between retries of statement " << p().latestStmtId);
 
     auto status = getStatusFromCommandResult(shardResponse.data);
     uassert(ErrorCodes::NoSuchTransaction,
             str::stream() << txnIdToString() << "Transaction aborted between retries of statement "
-                          << p().latestStmtId
-                          << " due to error: "
-                          << status
-                          << " from shard: "
-                          << response.shardId,
+                          << p().latestStmtId << " due to error: " << status
+                          << " from shard: " << response.shardId,
             status.isOK() || status.code() == ErrorCodes::NoSuchTransaction);
 
     // abortTransaction is sent with no write concern, so there's no need to check for a write
@@ -658,8 +657,9 @@ void TransactionRouter::Router::onSnapshotError(OperationContext* opCtx,
                                                 const Status& errorStatus) {
     invariant(canContinueOnSnapshotError());
 
-    LOG(3) << txnIdToString() << " Clearing pending participants and resetting global snapshot "
-                                 "timestamp after snapshot error: "
+    LOG(3) << txnIdToString()
+           << " Clearing pending participants and resetting global snapshot "
+              "timestamp after snapshot error: "
            << errorStatus << ", previous timestamp: " << o().atClusterTime->getTime();
 
     // The transaction must be restarted on all participants because a new read timestamp will be
@@ -684,6 +684,10 @@ void TransactionRouter::Router::setDefaultAtClusterTime(OperationContext* opCtx)
     auto defaultTime = LogicalClock::get(opCtx)->getClusterTime();
     _setAtClusterTime(
         opCtx, repl::ReadConcernArgs::get(opCtx).getArgsAfterClusterTime(), defaultTime);
+}
+
+bool TransactionRouter::Router::_atClusterTimeHasBeenSet() const {
+    return o().atClusterTime.is_initialized() && o().atClusterTime->timeHasBeenSet();
 }
 
 void TransactionRouter::Router::_setAtClusterTime(
@@ -711,17 +715,14 @@ void TransactionRouter::Router::beginOrContinueTxn(OperationContext* opCtx,
         // This transaction is older than the transaction currently in progress, so throw an error.
         uasserted(ErrorCodes::TransactionTooOld,
                   str::stream() << "txnNumber " << txnNumber << " is less than last txnNumber "
-                                << o().txnNumber
-                                << " seen in session "
-                                << _sessionId());
+                                << o().txnNumber << " seen in session " << _sessionId());
     } else if (txnNumber == o().txnNumber) {
         // This is the same transaction as the one in progress.
         switch (action) {
             case TransactionActions::kStart: {
                 uasserted(ErrorCodes::ConflictingOperationInProgress,
                           str::stream() << "txnNumber " << o().txnNumber << " for session "
-                                        << _sessionId()
-                                        << " already started");
+                                        << _sessionId() << " already started");
             }
             case TransactionActions::kContinue: {
                 uassert(ErrorCodes::InvalidOptions,
@@ -767,11 +768,9 @@ void TransactionRouter::Router::beginOrContinueTxn(OperationContext* opCtx,
             }
             case TransactionActions::kContinue: {
                 uasserted(ErrorCodes::NoSuchTransaction,
-                          str::stream() << "cannot continue txnId " << o().txnNumber
-                                        << " for session "
-                                        << _sessionId()
-                                        << " with txnId "
-                                        << txnNumber);
+                          str::stream()
+                              << "cannot continue txnId " << o().txnNumber << " for session "
+                              << _sessionId() << " with txnId " << txnNumber);
             }
             case TransactionActions::kCommit: {
                 _resetRouterState(opCtx, txnNumber);
@@ -896,11 +895,10 @@ BSONObj TransactionRouter::Router::_commitTransaction(
         switch (participant.second.readOnly) {
             case Participant::ReadOnly::kUnset:
                 uasserted(ErrorCodes::NoSuchTransaction,
-                          str::stream() << txnIdToString() << " Failed to commit transaction "
-                                        << "because a previous statement on the transaction "
-                                        << "participant "
-                                        << participant.first
-                                        << " was unsuccessful.");
+                          str::stream()
+                              << txnIdToString() << " Failed to commit transaction "
+                              << "because a previous statement on the transaction "
+                              << "participant " << participant.first << " was unsuccessful.");
             case Participant::ReadOnly::kReadOnly:
                 readOnlyShards.push_back(participant.first);
                 break;
@@ -1019,8 +1017,9 @@ void TransactionRouter::Router::implicitlyAbortTransaction(OperationContext* opC
                                                            const Status& errorStatus) {
     if (o().commitType == CommitType::kTwoPhaseCommit ||
         o().commitType == CommitType::kRecoverWithToken) {
-        LOG(3) << txnIdToString() << " Router not sending implicit abortTransaction because commit "
-                                     "may have been handed off to the coordinator";
+        LOG(3) << txnIdToString()
+               << " Router not sending implicit abortTransaction because commit "
+                  "may have been handed off to the coordinator";
         return;
     }
 
@@ -1149,7 +1148,7 @@ std::string TransactionRouter::Router::_transactionInfoForLog(
 
     sb << "parameters:" << parametersBuilder.obj().toString() << ",";
 
-    if (o().atClusterTime) {
+    if (_atClusterTimeHasBeenSet()) {
         sb << " globalReadTimestamp:" << o().atClusterTime->getTime().toString() << ",";
     }
 

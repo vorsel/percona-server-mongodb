@@ -106,8 +106,8 @@ void DocumentSourceOut::initialize() {
     DBClientBase* conn = pExpCtx->mongoProcessInterface->directClient();
 
     const auto& outputNs = getOutputNs();
-    _tempNs = NamespaceString(str::stream() << outputNs.db() << ".tmp.agg_out."
-                                            << aggOutCounter.addAndFetch(1));
+    _tempNs = NamespaceString(str::stream()
+                              << outputNs.db() << ".tmp.agg_out." << aggOutCounter.addAndFetch(1));
 
     // Save the original collection options and index specs so we can check they didn't change
     // during computation.
@@ -123,8 +123,8 @@ void DocumentSourceOut::initialize() {
 
     // We will write all results into a temporary collection, then rename the temporary
     // collection to be the target collection once we are done.
-    _tempNs = NamespaceString(str::stream() << outputNs.db() << ".tmp.agg_out."
-                                            << aggOutCounter.addAndFetch(1));
+    _tempNs = NamespaceString(str::stream()
+                              << outputNs.db() << ".tmp.agg_out." << aggOutCounter.addAndFetch(1));
 
     // Create temp collection, copying options from the existing output collection if any.
     {
@@ -145,13 +145,9 @@ void DocumentSourceOut::initialize() {
     }
 
     // Copy the indexes of the output collection to the temp collection.
-    std::vector<BSONObj> tempNsIndexes;
-    for (const auto& indexSpec : _originalIndexes) {
-        // Replace the spec's 'ns' field value, which is the original collection, with the temp
-        // collection.
-        tempNsIndexes.push_back(indexSpec.addField(BSON("ns" << _tempNs.ns()).firstElement()));
-    }
     try {
+        std::vector<BSONObj> tempNsIndexes = {std::begin(_originalIndexes),
+                                              std::end(_originalIndexes)};
         conn->createIndexes(_tempNs.ns(), tempNsIndexes);
     } catch (DBException& ex) {
         ex.addContext("Copying indexes for $out failed");

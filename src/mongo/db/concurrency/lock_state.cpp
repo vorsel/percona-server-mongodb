@@ -328,8 +328,7 @@ void LockerImpl::reacquireTicket(OperationContext* opCtx) {
     } else {
         uassert(ErrorCodes::LockTimeout,
                 str::stream() << "Unable to acquire ticket with mode '" << _modeForTicket
-                              << "' within a max lock request timeout of '"
-                              << *_maxLockTimeout
+                              << "' within a max lock request timeout of '" << *_maxLockTimeout
                               << "' milliseconds.",
                 _acquireTicket(opCtx, _modeForTicket, Date_t::now() + *_maxLockTimeout));
     }
@@ -369,8 +368,7 @@ LockResult LockerImpl::_lockGlobalBegin(OperationContext* opCtx, LockMode mode, 
             uassert(ErrorCodes::LockTimeout,
                     str::stream() << "Unable to acquire ticket with mode '" << _modeForTicket
                                   << "' within a max lock request timeout of '"
-                                  << Date_t::now() - beforeAcquire
-                                  << "' milliseconds.",
+                                  << Date_t::now() - beforeAcquire << "' milliseconds.",
                     _acquireTicket(opCtx, mode, deadline));
         }
         _modeForTicket = mode;
@@ -904,7 +902,7 @@ void LockerImpl::lockComplete(OperationContext* opCtx,
 
     // This failpoint is used to time out non-intent locks if they cannot be granted immediately.
     // Testing-only.
-    if (MONGO_FAIL_POINT(failNonIntentLocksIfWaitNeeded)) {
+    if (!_uninterruptibleLocksRequested && MONGO_FAIL_POINT(failNonIntentLocksIfWaitNeeded)) {
         uassert(ErrorCodes::LockTimeout,
                 str::stream() << "Cannot immediately acquire lock '" << resId.toString()
                               << "'. Timing out due to failpoint.",
@@ -966,9 +964,9 @@ void LockerImpl::lockComplete(OperationContext* opCtx,
         // Check if the lock acquisition has timed out. If we have an operation context and client
         // we can provide additional diagnostics data.
         if (waitTime == Milliseconds(0)) {
-            std::string timeoutMessage = str::stream() << "Unable to acquire " << modeName(mode)
-                                                       << " lock on '" << resId.toString()
-                                                       << "' within " << timeout << ".";
+            std::string timeoutMessage = str::stream()
+                << "Unable to acquire " << modeName(mode) << " lock on '" << resId.toString()
+                << "' within " << timeout << ".";
             if (opCtx && opCtx->getClient()) {
                 timeoutMessage = str::stream()
                     << timeoutMessage << " opId: " << opCtx->getOpID()

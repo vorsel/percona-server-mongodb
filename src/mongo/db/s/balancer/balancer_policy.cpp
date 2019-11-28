@@ -33,6 +33,7 @@
 
 #include "mongo/db/s/balancer/balancer_policy.h"
 
+#include "mongo/db/s/balancer/type_migration.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog/type_tags.h"
 #include "mongo/util/log.h"
@@ -126,8 +127,7 @@ Status DistributionStatus::addRangeToZone(const ZoneRange& range) {
 
         return {ErrorCodes::RangeOverlapConflict,
                 str::stream() << "Zone range: " << range.toString()
-                              << " is overlapping with existing: "
-                              << intersectingRange.toString()};
+                              << " is overlapping with existing: " << intersectingRange.toString()};
     }
 
     // Check for containment
@@ -137,8 +137,7 @@ Status DistributionStatus::addRangeToZone(const ZoneRange& range) {
             invariant(SimpleBSONObjComparator::kInstance.evaluate(range.max < nextRange.max));
             return {ErrorCodes::RangeOverlapConflict,
                     str::stream() << "Zone range: " << range.toString()
-                                  << " is overlapping with existing: "
-                                  << nextRange.toString()};
+                                  << " is overlapping with existing: " << nextRange.toString()};
         }
     }
 
@@ -538,7 +537,7 @@ MigrateInfo::MigrateInfo(const ShardId& a_to, const ChunkType& a_chunk) {
 }
 
 std::string MigrateInfo::getName() const {
-    return ChunkType::genID(nss, minKey);
+    return MigrationType::genID(nss, minKey);
 }
 
 string MigrateInfo::toString() const {

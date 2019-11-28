@@ -309,9 +309,9 @@ TEST_F(DocumentSourceSortExecutionTest, NullValue) {
  */
 TEST_F(DocumentSourceSortExecutionTest, TextScore) {
     MutableDocument first(Document{{"_id", 0}});
-    first.setTextScore(10);
+    first.metadata().setTextScore(10);
     MutableDocument second(Document{{"_id", 1}});
-    second.setTextScore(20);
+    second.metadata().setTextScore(20);
 
     checkResults({first.freeze(), second.freeze()},
                  BSON("$computed0" << metaTextScore),
@@ -323,9 +323,9 @@ TEST_F(DocumentSourceSortExecutionTest, TextScore) {
  */
 TEST_F(DocumentSourceSortExecutionTest, RandMeta) {
     MutableDocument first(Document{{"_id", 0}});
-    first.setRandMetaField(0.01);
+    first.metadata().setRandVal(0.01);
     MutableDocument second(Document{{"_id", 1}});
-    second.setRandMetaField(0.02);
+    second.metadata().setRandVal(0.02);
 
     checkResults({first.freeze(), second.freeze()},
                  BSON("$computed0" << BSON("$meta"
@@ -403,7 +403,7 @@ TEST_F(DocumentSourceSortExecutionTest, ShouldBeAbleToPauseLoadingWhileSpilled) 
     expCtx->allowDiskUse = true;
     const size_t maxMemoryUsageBytes = 1000;
 
-    auto sort = DocumentSourceSort::create(expCtx, BSON("_id" << -1), -1, maxMemoryUsageBytes);
+    auto sort = DocumentSourceSort::create(expCtx, BSON("_id" << -1), 0, maxMemoryUsageBytes);
 
     string largeStr(maxMemoryUsageBytes, 'x');
     auto mock =
@@ -438,7 +438,7 @@ TEST_F(DocumentSourceSortExecutionTest,
     expCtx->allowDiskUse = false;
     const size_t maxMemoryUsageBytes = 1000;
 
-    auto sort = DocumentSourceSort::create(expCtx, BSON("_id" << -1), -1, maxMemoryUsageBytes);
+    auto sort = DocumentSourceSort::create(expCtx, BSON("_id" << -1), 0, maxMemoryUsageBytes);
 
     string largeStr(maxMemoryUsageBytes, 'x');
     auto mock = DocumentSourceMock::createForTest({Document{{"_id", 0}, {"largeStr", largeStr}},
@@ -453,7 +453,7 @@ TEST_F(DocumentSourceSortExecutionTest, ShouldCorrectlyTrackMemoryUsageBetweenPa
     expCtx->allowDiskUse = false;
     const size_t maxMemoryUsageBytes = 1000;
 
-    auto sort = DocumentSourceSort::create(expCtx, BSON("_id" << -1), -1, maxMemoryUsageBytes);
+    auto sort = DocumentSourceSort::create(expCtx, BSON("_id" << -1), 0, maxMemoryUsageBytes);
 
     string largeStr(maxMemoryUsageBytes / 2, 'x');
     auto mock =

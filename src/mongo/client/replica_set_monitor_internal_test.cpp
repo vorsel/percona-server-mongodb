@@ -367,22 +367,10 @@ TEST_F(IsMasterReplyTest, IsMasterReplyRSNotInitiated) {
     BSONObj ismaster = BSON(
         "ismaster" << false << "secondary" << false << "info"
                    << "can't get local.system.replset config from self or any seed (EMPTYCONFIG)"
-                   << "isreplicaset"
-                   << true
-                   << "maxBsonObjectSize"
-                   << 16777216
-                   << "maxMessageSizeBytes"
-                   << 48000000
-                   << "maxWriteBatchSize"
-                   << 1000
-                   << "localTime"
-                   << mongo::jsTime()
-                   << "maxWireVersion"
-                   << 2
-                   << "minWireVersion"
-                   << 0
-                   << "ok"
-                   << 1);
+                   << "isreplicaset" << true << "maxBsonObjectSize" << 16777216
+                   << "maxMessageSizeBytes" << 48000000 << "maxWriteBatchSize" << 1000
+                   << "localTime" << mongo::jsTime() << "maxWireVersion" << 2 << "minWireVersion"
+                   << 0 << "ok" << 1);
 
     IsMasterReply imr(HostAndPort(), -1, ismaster);
 
@@ -394,41 +382,22 @@ TEST_F(IsMasterReplyTest, IsMasterReplyRSNotInitiated) {
     ASSERT_EQUALS(imr.configVersion, 0);
     ASSERT(!imr.electionId.isSet());
     ASSERT(imr.primary.empty());
-    ASSERT(imr.normalHosts.empty());
+    ASSERT(imr.members.empty());
     ASSERT(imr.tags.isEmpty());
 }
 
 TEST_F(IsMasterReplyTest, IsMasterReplyRSPrimary) {
     BSONObj ismaster = BSON("setName"
                             << "test"
-                            << "setVersion"
-                            << 1
-                            << "electionId"
-                            << OID("7fffffff0000000000000001")
-                            << "ismaster"
-                            << true
-                            << "secondary"
-                            << false
-                            << "hosts"
-                            << BSON_ARRAY("mongo.example:3000")
-                            << "primary"
+                            << "setVersion" << 1 << "electionId" << OID("7fffffff0000000000000001")
+                            << "ismaster" << true << "secondary" << false << "hosts"
+                            << BSON_ARRAY("mongo.example:3000") << "primary"
                             << "mongo.example:3000"
                             << "me"
                             << "mongo.example:3000"
-                            << "maxBsonObjectSize"
-                            << 16777216
-                            << "maxMessageSizeBytes"
-                            << 48000000
-                            << "maxWriteBatchSize"
-                            << 1000
-                            << "localTime"
-                            << mongo::jsTime()
-                            << "maxWireVersion"
-                            << 2
-                            << "minWireVersion"
-                            << 0
-                            << "ok"
-                            << 1);
+                            << "maxBsonObjectSize" << 16777216 << "maxMessageSizeBytes" << 48000000
+                            << "maxWriteBatchSize" << 1000 << "localTime" << mongo::jsTime()
+                            << "maxWireVersion" << 2 << "minWireVersion" << 0 << "ok" << 1);
 
     IsMasterReply imr(HostAndPort("mongo.example:3000"), -1, ismaster);
 
@@ -441,45 +410,23 @@ TEST_F(IsMasterReplyTest, IsMasterReplyRSPrimary) {
     ASSERT_EQUALS(imr.secondary, false);
     ASSERT_EQUALS(imr.isMaster, true);
     ASSERT_EQUALS(imr.primary.toString(), HostAndPort("mongo.example:3000").toString());
-    ASSERT(imr.normalHosts.count(HostAndPort("mongo.example:3000")));
+    ASSERT(imr.members.count(HostAndPort("mongo.example:3000")));
     ASSERT(imr.tags.isEmpty());
 }
 
 TEST_F(IsMasterReplyTest, IsMasterReplyPassiveSecondary) {
     BSONObj ismaster = BSON("setName"
                             << "test"
-                            << "setVersion"
-                            << 2
-                            << "electionId"
-                            << OID("7fffffff0000000000000001")
-                            << "ismaster"
-                            << false
-                            << "secondary"
-                            << true
-                            << "hosts"
-                            << BSON_ARRAY("mongo.example:3000")
-                            << "passives"
-                            << BSON_ARRAY("mongo.example:3001")
-                            << "primary"
+                            << "setVersion" << 2 << "electionId" << OID("7fffffff0000000000000001")
+                            << "ismaster" << false << "secondary" << true << "hosts"
+                            << BSON_ARRAY("mongo.example:3000") << "passives"
+                            << BSON_ARRAY("mongo.example:3001") << "primary"
                             << "mongo.example:3000"
-                            << "passive"
-                            << true
-                            << "me"
+                            << "passive" << true << "me"
                             << "mongo.example:3001"
-                            << "maxBsonObjectSize"
-                            << 16777216
-                            << "maxMessageSizeBytes"
-                            << 48000000
-                            << "maxWriteBatchSize"
-                            << 1000
-                            << "localTime"
-                            << mongo::jsTime()
-                            << "maxWireVersion"
-                            << 2
-                            << "minWireVersion"
-                            << 0
-                            << "ok"
-                            << 1);
+                            << "maxBsonObjectSize" << 16777216 << "maxMessageSizeBytes" << 48000000
+                            << "maxWriteBatchSize" << 1000 << "localTime" << mongo::jsTime()
+                            << "maxWireVersion" << 2 << "minWireVersion" << 0 << "ok" << 1);
 
     IsMasterReply imr(HostAndPort("mongo.example:3001"), -1, ismaster);
 
@@ -491,8 +438,9 @@ TEST_F(IsMasterReplyTest, IsMasterReplyPassiveSecondary) {
     ASSERT_EQUALS(imr.secondary, true);
     ASSERT_EQUALS(imr.isMaster, false);
     ASSERT_EQUALS(imr.primary.toString(), HostAndPort("mongo.example:3000").toString());
-    ASSERT(imr.normalHosts.count(HostAndPort("mongo.example:3000")));
-    ASSERT(imr.normalHosts.count(HostAndPort("mongo.example:3001")));
+    ASSERT(imr.members.count(HostAndPort("mongo.example:3000")));
+    ASSERT(imr.members.count(HostAndPort("mongo.example:3001")));
+    ASSERT(imr.passives.count(HostAndPort("mongo.example:3001")));
     ASSERT(imr.tags.isEmpty());
     ASSERT(!imr.electionId.isSet());
 }
@@ -500,38 +448,15 @@ TEST_F(IsMasterReplyTest, IsMasterReplyPassiveSecondary) {
 TEST_F(IsMasterReplyTest, IsMasterReplyHiddenSecondary) {
     BSONObj ismaster = BSON("setName"
                             << "test"
-                            << "setVersion"
-                            << 2
-                            << "electionId"
-                            << OID("7fffffff0000000000000001")
-                            << "ismaster"
-                            << false
-                            << "secondary"
-                            << true
-                            << "hosts"
-                            << BSON_ARRAY("mongo.example:3000")
-                            << "primary"
+                            << "setVersion" << 2 << "electionId" << OID("7fffffff0000000000000001")
+                            << "ismaster" << false << "secondary" << true << "hosts"
+                            << BSON_ARRAY("mongo.example:3000") << "primary"
                             << "mongo.example:3000"
-                            << "passive"
-                            << true
-                            << "hidden"
-                            << true
-                            << "me"
+                            << "passive" << true << "hidden" << true << "me"
                             << "mongo.example:3001"
-                            << "maxBsonObjectSize"
-                            << 16777216
-                            << "maxMessageSizeBytes"
-                            << 48000000
-                            << "maxWriteBatchSize"
-                            << 1000
-                            << "localTime"
-                            << mongo::jsTime()
-                            << "maxWireVersion"
-                            << 2
-                            << "minWireVersion"
-                            << 0
-                            << "ok"
-                            << 1);
+                            << "maxBsonObjectSize" << 16777216 << "maxMessageSizeBytes" << 48000000
+                            << "maxWriteBatchSize" << 1000 << "localTime" << mongo::jsTime()
+                            << "maxWireVersion" << 2 << "minWireVersion" << 0 << "ok" << 1);
 
     IsMasterReply imr(HostAndPort("mongo.example:3001"), -1, ismaster);
 
@@ -543,7 +468,7 @@ TEST_F(IsMasterReplyTest, IsMasterReplyHiddenSecondary) {
     ASSERT_EQUALS(imr.secondary, true);
     ASSERT_EQUALS(imr.isMaster, false);
     ASSERT_EQUALS(imr.primary.toString(), HostAndPort("mongo.example:3000").toString());
-    ASSERT(imr.normalHosts.count(HostAndPort("mongo.example:3000")));
+    ASSERT(imr.members.count(HostAndPort("mongo.example:3000")));
     ASSERT(imr.tags.isEmpty());
     ASSERT(!imr.electionId.isSet());
 }
@@ -551,40 +476,22 @@ TEST_F(IsMasterReplyTest, IsMasterReplyHiddenSecondary) {
 TEST_F(IsMasterReplyTest, IsMasterSecondaryWithTags) {
     BSONObj ismaster = BSON("setName"
                             << "test"
-                            << "setVersion"
-                            << 2
-                            << "electionId"
-                            << OID("7fffffff0000000000000001")
-                            << "ismaster"
-                            << false
-                            << "secondary"
-                            << true
-                            << "hosts"
+                            << "setVersion" << 2 << "electionId" << OID("7fffffff0000000000000001")
+                            << "ismaster" << false << "secondary" << true << "hosts"
                             << BSON_ARRAY("mongo.example:3000"
                                           << "mongo.example:3001")
                             << "primary"
                             << "mongo.example:3000"
                             << "me"
                             << "mongo.example:3001"
-                            << "maxBsonObjectSize"
-                            << 16777216
-                            << "maxMessageSizeBytes"
-                            << 48000000
-                            << "maxWriteBatchSize"
-                            << 1000
-                            << "localTime"
-                            << mongo::jsTime()
-                            << "maxWireVersion"
-                            << 2
-                            << "minWireVersion"
-                            << 0
-                            << "tags"
+                            << "maxBsonObjectSize" << 16777216 << "maxMessageSizeBytes" << 48000000
+                            << "maxWriteBatchSize" << 1000 << "localTime" << mongo::jsTime()
+                            << "maxWireVersion" << 2 << "minWireVersion" << 0 << "tags"
                             << BSON("dc"
                                     << "nyc"
                                     << "use"
                                     << "production")
-                            << "ok"
-                            << 1);
+                            << "ok" << 1);
 
     IsMasterReply imr(HostAndPort("mongo.example:3001"), -1, ismaster);
 
@@ -596,8 +503,8 @@ TEST_F(IsMasterReplyTest, IsMasterSecondaryWithTags) {
     ASSERT_EQUALS(imr.secondary, true);
     ASSERT_EQUALS(imr.isMaster, false);
     ASSERT_EQUALS(imr.primary.toString(), HostAndPort("mongo.example:3000").toString());
-    ASSERT(imr.normalHosts.count(HostAndPort("mongo.example:3000")));
-    ASSERT(imr.normalHosts.count(HostAndPort("mongo.example:3001")));
+    ASSERT(imr.members.count(HostAndPort("mongo.example:3000")));
+    ASSERT(imr.members.count(HostAndPort("mongo.example:3001")));
     ASSERT(imr.tags.hasElement("dc"));
     ASSERT(imr.tags.hasElement("use"));
     ASSERT(!imr.electionId.isSet());

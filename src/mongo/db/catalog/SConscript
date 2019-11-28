@@ -114,16 +114,6 @@ env.Library(
 )
 
 env.Library(
-        target='disable_index_spec_namespace_generation',
-        source=[
-            env.Idlc('disable_index_spec_namespace_generation.idl')[0],
-        ],
-        LIBDEPS_PRIVATE=[
-            '$BUILD_DIR/mongo/idl/server_parameter',
-        ],
-)
-
-env.Library(
     target='index_key_validate',
     source=[
         "index_key_validate.cpp",
@@ -137,9 +127,6 @@ env.Library(
         '$BUILD_DIR/mongo/db/matcher/expressions',
         '$BUILD_DIR/mongo/db/query/collation/collator_factory_interface',
         '$BUILD_DIR/mongo/util/fail_point',
-    ],
-    LIBDEPS_PRIVATE=[
-        'disable_index_spec_namespace_generation',
     ],
 )
 
@@ -189,6 +176,7 @@ env.Library(
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/index/index_descriptor',
         '$BUILD_DIR/mongo/db/index_names',
+        '$BUILD_DIR/mongo/db/ttl_collection_cache',
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/index/index_build_interceptor',
@@ -299,7 +287,6 @@ env.Library(
         "index_catalog_entry_impl.cpp",
         "index_catalog_impl.cpp",
         "index_consistency.cpp",
-        "record_store_validate_adaptor.cpp",
     ],
     LIBDEPS=[
         'collection',
@@ -327,12 +314,10 @@ env.Library(
         '$BUILD_DIR/mongo/db/storage/durable_catalog_impl',
         '$BUILD_DIR/mongo/db/storage/storage_engine_impl',
         '$BUILD_DIR/mongo/db/system_index',
-        '$BUILD_DIR/mongo/db/ttl_collection_cache',
         '$BUILD_DIR/mongo/db/views/views_mongod',
     ],
     LIBDEPS_PRIVATE=[
         'index_build_block',
-        'disable_index_spec_namespace_generation',
         '$BUILD_DIR/mongo/db/catalog/collection_catalog_helper',
         '$BUILD_DIR/mongo/db/commands/server_status_core',
         '$BUILD_DIR/mongo/db/index/index_build_interceptor',
@@ -341,6 +326,17 @@ env.Library(
         '$BUILD_DIR/mongo/db/storage/storage_engine_common',
         '$BUILD_DIR/mongo/db/transaction',
     ],
+)
+
+env.Library(
+    target='collection_validation',
+    source=[
+	"collection_validation.cpp",
+	"record_store_validate_adaptor.cpp",
+    ],
+    LIBDEPS=[
+	'catalog_impl',
+    ]
 )
 
 env.Library(
@@ -383,6 +379,7 @@ env.CppUnitTest(
         'collection_catalog_test.cpp',
         'collection_options_test.cpp',
         'collection_test.cpp',
+        'collection_validation_test.cpp',
         'commit_quorum_options_test.cpp',
         'create_collection_test.cpp',
         'database_test.cpp',
@@ -423,6 +420,7 @@ env.CppUnitTest(
         'collection_catalog',
         'collection_catalog_helper',
         'collection_options',
+        'collection_validation',
         'commit_quorum_options',
         'database_holder',
         'index_build_block',

@@ -41,12 +41,12 @@
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/exec/fetch.h"
 #include "mongo/db/exec/index_scan.h"
-#include "mongo/db/exec/working_set_computed_data.h"
 #include "mongo/db/geo/geoconstants.h"
 #include "mongo/db/geo/geoparser.h"
 #include "mongo/db/geo/hash.h"
 #include "mongo/db/index/expression_params.h"
 #include "mongo/db/matcher/expression.h"
+#include "mongo/db/pipeline/value.h"
 #include "mongo/db/query/expression_index.h"
 #include "mongo/db/query/expression_index_knobs_gen.h"
 #include "mongo/util/log.h"
@@ -95,7 +95,7 @@ struct StoredGeometry {
     BSONElement element;
     GeometryContainer geometry;
 };
-}
+}  // namespace
 
 /**
  * Find and parse all geometry elements on the appropriate field path from the document.
@@ -155,7 +155,7 @@ static StatusWith<double> computeGeoNearDistance(const GeoNearParams& nearParams
 
     // Compute the minimum distance of all the geometries in the document
     double minDistance = -1;
-    BSONObj minDistanceObj;
+    Value minDistanceMetadata;
     for (auto it = geometries.begin(); it != geometries.end(); ++it) {
         StoredGeometry& stored = **it;
 
@@ -175,7 +175,7 @@ static StatusWith<double> computeGeoNearDistance(const GeoNearParams& nearParams
 
         if (minDistance < 0 || nextDistance < minDistance) {
             minDistance = nextDistance;
-            minDistanceObj = stored.element.Obj();
+            minDistanceMetadata = Value{stored.element};
         }
     }
 
@@ -189,14 +189,14 @@ static StatusWith<double> computeGeoNearDistance(const GeoNearParams& nearParams
             // Hack for nearSphere
             // TODO: Remove nearSphere?
             invariant(SPHERE == queryCRS);
-            member->addComputed(new GeoDistanceComputedData(minDistance / kRadiusOfEarthInMeters));
+            member->metadata().setGeoNearDistance(minDistance / kRadiusOfEarthInMeters);
         } else {
-            member->addComputed(new GeoDistanceComputedData(minDistance));
+            member->metadata().setGeoNearDistance(minDistance);
         }
     }
 
     if (nearParams.addPointMeta) {
-        member->addComputed(new GeoNearPointComputedData(minDistanceObj));
+        member->metadata().setGeoNearPoint(minDistanceMetadata);
     }
 
     return StatusWith<double>(minDistance);
@@ -555,7 +555,7 @@ private:
     // Owns matcher
     const unique_ptr<MatchExpression> _matcher;
 };
-}
+}  // namespace
 
 static double min2DBoundsIncrement(const GeoNearExpression& query,
                                    const IndexDescriptor* twoDIndex) {
@@ -590,9 +590,9 @@ static R2Annulus projectBoundsToTwoDDegrees(R2Annulus sphereBounds) {
 }
 
 StatusWith<NearStage::CoveredInterval*>  //
-    GeoNear2DStage::nextInterval(OperationContext* opCtx,
-                                 WorkingSet* workingSet,
-                                 const Collection* collection) {
+GeoNear2DStage::nextInterval(OperationContext* opCtx,
+                             WorkingSet* workingSet,
+                             const Collection* collection) {
     // The search is finished if we searched at least once and all the way to the edge
     if (_currBounds.getInner() >= 0 && _currBounds.getOuter() == _fullBounds.getOuter()) {
         return StatusWith<CoveredInterval*>(nullptr);
@@ -829,7 +829,7 @@ S2Region* buildS2Region(const R2Annulus& sphereBounds) {
     // Takes ownership of caps
     return new S2RegionIntersection(&regions);
 }
-}
+}  // namespace
 
 // Estimate the density of data by search the nearest cells level by level around center.
 class GeoNear2DSphereStage::DensityEstimator {
@@ -1010,9 +1010,9 @@ PlanStage::StageState GeoNear2DSphereStage::initialize(OperationContext* opCtx,
 }
 
 StatusWith<NearStage::CoveredInterval*>  //
-    GeoNear2DSphereStage::nextInterval(OperationContext* opCtx,
-                                       WorkingSet* workingSet,
-                                       const Collection* collection) {
+GeoNear2DSphereStage::nextInterval(OperationContext* opCtx,
+                                   WorkingSet* workingSet,
+                                   const Collection* collection) {
     // The search is finished if we searched at least once and all the way to the edge
     if (_currBounds.getInner() >= 0 && _currBounds.getOuter() == _fullBounds.getOuter()) {
         return StatusWith<CoveredInterval*>(nullptr);

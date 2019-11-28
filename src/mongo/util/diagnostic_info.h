@@ -31,45 +31,97 @@
 
 #include "mongo/base/string_data.h"
 #include "mongo/db/service_context.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
-
+MONGO_FAIL_POINT_DECLARE(keepDiagnosticCaptureOnFailedLock);
 /**
  * DiagnosticInfo keeps track of diagnostic information such as a developer provided
  * name, the time when a lock was first acquired, and a partial caller call stack.
  */
 class DiagnosticInfo {
 public:
+    struct Diagnostic {
+        static std::shared_ptr<DiagnosticInfo> get(Client*);
+        static void set(Client*, std::shared_ptr<DiagnosticInfo>);
+        static void clearDiagnostic();
+        stdx::mutex m;
+        std::shared_ptr<DiagnosticInfo> diagnostic;
+    };
+
     virtual ~DiagnosticInfo() = default;
     DiagnosticInfo(const DiagnosticInfo&) = delete;
     DiagnosticInfo& operator=(const DiagnosticInfo&) = delete;
     DiagnosticInfo(DiagnosticInfo&&) = default;
     DiagnosticInfo& operator=(DiagnosticInfo&&) = default;
 
-    Date_t getTimestamp() {
+    struct StackFrame {
+        std::string toString() const;
+        friend bool operator==(const StackFrame& frame1, const StackFrame& frame2);
+        friend bool operator!=(const StackFrame& frame1, const StackFrame& frame2) {
+            return !(frame1 == frame2);
+        }
+
+        StringData objectPath;
+        uintptr_t instructionOffset = 0;
+    };
+    struct StackTrace {
+        std::string toString() const;
+        friend bool operator==(const StackTrace& trace1, const StackTrace& trace2);
+        friend bool operator!=(const StackTrace& trace1, const StackTrace& trace2) {
+            return !(trace1 == trace2);
+        }
+
+        std::vector<StackFrame> frames;
+    };
+
+    Date_t getTimestamp() const {
         return _timestamp;
     }
 
-    StringData getCaptureName() {
+    StringData getCaptureName() const {
         return _captureName;
     }
 
+    StackTrace makeStackTrace() const;
+
+    static std::vector<void*> getBacktraceAddresses();
+
+    std::string toString() const;
     friend DiagnosticInfo takeDiagnosticInfo(const StringData& captureName);
 
 private:
+    friend bool operator==(const DiagnosticInfo& info1, const DiagnosticInfo& info2);
+    friend bool operator!=(const DiagnosticInfo& info1, const DiagnosticInfo& info2) {
+        return !(info1 == info2);
+    }
+    friend std::ostream& operator<<(std::ostream& s, const DiagnosticInfo& info);
+
     Date_t _timestamp;
     StringData _captureName;
+    std::vector<void*> _backtraceAddresses;
 
-
-    DiagnosticInfo(const Date_t& timestamp, const StringData& captureName)
-        : _timestamp(timestamp), _captureName(captureName) {}
+    DiagnosticInfo(const Date_t& timestamp,
+                   const StringData& captureName,
+                   std::vector<void*> backtraceAddresses)
+        : _timestamp(timestamp),
+          _captureName(captureName),
+          _backtraceAddresses(backtraceAddresses) {}
 };
+
+
+inline std::ostream& operator<<(std::ostream& s, const DiagnosticInfo::StackFrame& frame) {
+    return s << frame.toString();
+}
+
+inline std::ostream& operator<<(std::ostream& s, const DiagnosticInfo& info) {
+    return s << info.toString();
+}
 
 /**
  * Captures the diagnostic information based on the caller's context.
  */
 DiagnosticInfo takeDiagnosticInfo(const StringData& captureName);
-
-
-}  // namespace monogo
+}  // namespace mongo

@@ -532,11 +532,10 @@ void State::prepTempCollection() {
             auto incColl = db->createCollection(
                 _opCtx, _config.incLong, options, false /* force no _id index */);
 
-            auto rawIndexSpec =
-                BSON("key" << BSON("0" << 1) << "ns" << _config.incLong.ns() << "name"
-                           << "_temp_0");
+            auto rawIndexSpec = BSON("key" << BSON("0" << 1) << "name"
+                                           << "_temp_0");
             auto indexSpec = uassertStatusOK(index_key_validate::validateIndexSpec(
-                _opCtx, rawIndexSpec, _config.incLong, serverGlobalParams.featureCompatibility));
+                _opCtx, rawIndexSpec, serverGlobalParams.featureCompatibility));
 
             uassertStatusOKWithContext(
                 incColl->getIndexCatalog()->createIndexOnEmptyCollection(_opCtx, indexSpec),
@@ -566,13 +565,12 @@ void State::prepTempCollection() {
             while (ii->more()) {
                 const IndexDescriptor* currIndex = ii->next()->descriptor();
                 BSONObjBuilder b;
-                b.append("ns", _config.tempNamespace.ns());
 
                 // Copy over contents of the index descriptor's infoObj.
                 BSONObjIterator j(currIndex->infoObj());
                 while (j.more()) {
                     BSONElement e = j.next();
-                    if (e.fieldNameStringData() == "_id" || e.fieldNameStringData() == "ns")
+                    if (e.fieldNameStringData() == "_id")
                         continue;
                     b.append(e);
                 }
@@ -656,9 +654,7 @@ void State::appendResults(BSONObjBuilder& final) {
             BSONObj idKey = BSON("_id" << 1);
             if (!_db.runCommand("admin",
                                 BSON("splitVector" << _config.outputOptions.finalNamespace.ns()
-                                                   << "keyPattern"
-                                                   << idKey
-                                                   << "maxChunkSizeBytes"
+                                                   << "keyPattern" << idKey << "maxChunkSizeBytes"
                                                    << _config.splitInfo),
                                 res)) {
                 uasserted(15921, str::stream() << "splitVector failed: " << res);
@@ -746,8 +742,7 @@ long long State::postProcessCollectionNonAtomic(OperationContext* opCtx,
         if (!_db.runCommand("admin",
                             BSON("renameCollection" << _config.tempNamespace.ns() << "to"
                                                     << _config.outputOptions.finalNamespace.ns()
-                                                    << "stayTemp"
-                                                    << _config.shardedFirstPass),
+                                                    << "stayTemp" << _config.shardedFirstPass),
                             info)) {
             uasserted(10076, str::stream() << "rename failed: " << info);
         }
@@ -831,9 +826,7 @@ void State::insert(const NamespaceString& nss, const BSONObj& o) {
         uassert(
             ErrorCodes::PrimarySteppedDown,
             str::stream() << "no longer primary while inserting mapReduce result into collection: "
-                          << nss
-                          << ": "
-                          << redact(o),
+                          << nss << ": " << redact(o),
             repl::ReplicationCoordinator::get(_opCtx)->canAcceptWritesFor(_opCtx, nss));
         assertCollectionNotNull(nss, autoColl);
 
@@ -880,10 +873,8 @@ void State::_insertToInc(BSONObj& o) {
         if (o.objsize() > BSONObjMaxUserSize) {
             uasserted(ErrorCodes::BadValue,
                       str::stream() << "object to insert too large for incremental collection"
-                                    << ". size in bytes: "
-                                    << o.objsize()
-                                    << ", max size: "
-                                    << BSONObjMaxUserSize);
+                                    << ". size in bytes: " << o.objsize()
+                                    << ", max size: " << BSONObjMaxUserSize);
         }
 
         // TODO: Consider whether to pass OpDebug for stats tracking under SERVER-23261.
@@ -932,8 +923,9 @@ State::~State() {
                                 _useIncremental ? _config.incLong : NamespaceString());
         } catch (...) {
             error() << "Unable to drop temporary collection created by mapReduce: "
-                    << _config.tempNamespace << ". This collection will be removed automatically "
-                                                "the next time the server starts up. "
+                    << _config.tempNamespace
+                    << ". This collection will be removed automatically "
+                       "the next time the server starts up. "
                     << exceptionToStatus();
         }
     }

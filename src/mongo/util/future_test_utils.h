@@ -131,14 +131,15 @@ template <typename Func, typename Result = std::result_of_t<Func && ()>>
 Future<Result> async(Func&& func) {
     auto pf = makePromiseFuture<Result>();
 
-    stdx::thread([ promise = std::move(pf.promise), func = std::forward<Func>(func) ]() mutable {
+    stdx::thread([promise = std::move(pf.promise), func = std::forward<Func>(func)]() mutable {
         sleepIfShould();
         try {
             completePromise(&promise, func);
         } catch (const DBException& ex) {
             promise.setError(ex.toStatus());
         }
-    }).detach();
+    })
+        .detach();
 
     return std::move(pf.future);
 }
@@ -175,7 +176,7 @@ void FUTURE_SUCCESS_TEST(const CompletionFunc& completion, const TestFunc& test)
         test(async([&] { return completion(); }));
     }
 
-    IF_CONSTEXPR(doExecutorFuture) {  // immediate executor future
+    if constexpr (doExecutorFuture) {  // immediate executor future
         auto exec = InlineCountingExecutor::make();
         test(Future<CompletionType>::makeReady(completion()).thenRunOn(exec));
     }
@@ -203,7 +204,7 @@ void FUTURE_SUCCESS_TEST(const CompletionFunc& completion, const TestFunc& test)
         test(async([&] { return completion(); }));
     }
 
-    IF_CONSTEXPR(doExecutorFuture) {  // immediate executor future
+    if constexpr (doExecutorFuture) {  // immediate executor future
         completion();
         auto exec = InlineCountingExecutor::make();
         test(Future<CompletionType>::makeReady().thenRunOn(exec));
@@ -229,7 +230,7 @@ void FUTURE_FAIL_TEST(const TestFunc& test) {
             MONGO_UNREACHABLE;
         }));
     }
-    IF_CONSTEXPR(doExecutorFuture) {  // immediate executor future
+    if constexpr (doExecutorFuture) {  // immediate executor future
         auto exec = InlineCountingExecutor::make();
         test(Future<CompletionType>::makeReady(failStatus()).thenRunOn(exec));
     }

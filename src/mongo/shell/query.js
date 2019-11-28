@@ -2,7 +2,6 @@
 
 if (typeof DBQuery == "undefined") {
     DBQuery = function(mongo, db, collection, ns, query, fields, limit, skip, batchSize, options) {
-
         this._mongo = mongo;            // 0
         this._db = db;                  // 1
         this._collection = collection;  // 2
@@ -238,10 +237,6 @@ DBQuery.prototype._convertToCommand = function(canAttachReadPref) {
         cmd["tailable"] = true;
     }
 
-    if ((this._options & DBQuery.Option.oplogReplay) != 0) {
-        cmd["oplogReplay"] = true;
-    }
-
     if ((this._options & DBQuery.Option.noTimeout) != 0) {
         cmd["noCursorTimeout"] = true;
     }
@@ -403,8 +398,8 @@ DBQuery.prototype.countReturn = function() {
 };
 
 /**
-* iterative count - only for testing
-*/
+ * iterative count - only for testing
+ */
 DBQuery.prototype.itcount = function() {
     var num = 0;
 
@@ -559,7 +554,6 @@ DBQuery.prototype.shellPrint = function() {
     } catch (e) {
         print(e);
     }
-
 };
 
 DBQuery.prototype.toString = function() {
@@ -571,12 +565,12 @@ DBQuery.prototype.toString = function() {
 //
 
 /**
-* Get partial results from a mongos if some shards are down (instead of throwing an error).
-*
-* @method
-* @see http://docs.mongodb.org/meta-driver/latest/legacy/mongodb-wire-protocol/#op-query
-* @return {DBQuery}
-*/
+ * Get partial results from a mongos if some shards are down (instead of throwing an error).
+ *
+ * @method
+ * @see http://docs.mongodb.org/meta-driver/latest/legacy/mongodb-wire-protocol/#op-query
+ * @return {DBQuery}
+ */
 DBQuery.prototype.allowPartialResults = function() {
     this._checkModify();
     this.addOption(DBQuery.Option.partial);
@@ -584,13 +578,13 @@ DBQuery.prototype.allowPartialResults = function() {
 };
 
 /**
-* The server normally times out idle cursors after an inactivity period (10 minutes)
-* to prevent excess memory use. Set this option to prevent that.
-*
-* @method
-* @see http://docs.mongodb.org/meta-driver/latest/legacy/mongodb-wire-protocol/#op-query
-* @return {DBQuery}
-*/
+ * The server normally times out idle cursors after an inactivity period (10 minutes)
+ * to prevent excess memory use. Set this option to prevent that.
+ *
+ * @method
+ * @see http://docs.mongodb.org/meta-driver/latest/legacy/mongodb-wire-protocol/#op-query
+ * @return {DBQuery}
+ */
 DBQuery.prototype.noCursorTimeout = function() {
     this._checkModify();
     this.addOption(DBQuery.Option.noTimeout);
@@ -598,26 +592,13 @@ DBQuery.prototype.noCursorTimeout = function() {
 };
 
 /**
-* Internal replication use only - driver should not set
-*
-* @method
-* @see http://docs.mongodb.org/meta-driver/latest/legacy/mongodb-wire-protocol/#op-query
-* @return {DBQuery}
-*/
-DBQuery.prototype.oplogReplay = function() {
-    this._checkModify();
-    this.addOption(DBQuery.Option.oplogReplay);
-    return this;
-};
-
-/**
-* Limits the fields to return for all matching documents.
-*
-* @method
-* @see http://docs.mongodb.org/manual/tutorial/project-fields-from-query-results/
-* @param {object} document Document specifying the projection of the resulting documents.
-* @return {DBQuery}
-*/
+ * Limits the fields to return for all matching documents.
+ *
+ * @method
+ * @see http://docs.mongodb.org/manual/tutorial/project-fields-from-query-results/
+ * @param {object} document Document specifying the projection of the resulting documents.
+ * @return {DBQuery}
+ */
 DBQuery.prototype.projection = function(document) {
     this._checkModify();
     this._fields = document;
@@ -625,14 +606,14 @@ DBQuery.prototype.projection = function(document) {
 };
 
 /**
-* Specify cursor as a tailable cursor, allowing to specify if it will use awaitData
-*
-* @method
-* @see http://docs.mongodb.org/manual/tutorial/create-tailable-cursor/
-* @param {boolean} [awaitData=true] cursor blocks for a few seconds to wait for data if no documents
-*found.
-* @return {DBQuery}
-*/
+ * Specify cursor as a tailable cursor, allowing to specify if it will use awaitData
+ *
+ * @method
+ * @see http://docs.mongodb.org/manual/tutorial/create-tailable-cursor/
+ * @param {boolean} [awaitData=true] cursor blocks for a few seconds to wait for data if no
+ *documents found.
+ * @return {DBQuery}
+ */
 DBQuery.prototype.tailable = function(awaitData) {
     this._checkModify();
     this.addOption(DBQuery.Option.tailable);
@@ -646,13 +627,13 @@ DBQuery.prototype.tailable = function(awaitData) {
 };
 
 /**
-* Specify a document containing modifiers for the query.
-*
-* @method
-* @see http://docs.mongodb.org/manual/reference/operator/query-modifier/
-* @param {object} document A document containing modifers to apply to the cursor.
-* @return {DBQuery}
-*/
+ * Specify a document containing modifiers for the query.
+ *
+ * @method
+ * @see http://docs.mongodb.org/manual/reference/operator/query-modifier/
+ * @param {object} document A document containing modifers to apply to the cursor.
+ * @return {DBQuery}
+ */
 DBQuery.prototype.modifiers = function(document) {
     this._checkModify();
 
@@ -694,7 +675,9 @@ DBQuery.shellBatchSize = 20;
 DBQuery.Option = {
     tailable: 0x2,
     slaveOk: 0x4,
-    oplogReplay: 0x8,
+    // 0x8 is reserved for oplogReplay, but not explicitly defined. This is because the flag no
+    // longer has any meaning to the server, and will be ignored, so there is no reason for it to
+    // be set by clients.
     noTimeout: 0x10,
     awaitData: 0x20,
     exhaust: 0x40,
@@ -817,16 +800,16 @@ DBCommandCursor.prototype._runGetMoreCommand = function() {
     assert.commandWorked(cmdRes, () => "getMore command failed: " + tojson(cmdRes));
 
     if (this._ns !== cmdRes.cursor.ns) {
-        throw Error("unexpected collection in getMore response: " + this._ns + " != " +
-                    cmdRes.cursor.ns);
+        throw Error("unexpected collection in getMore response: " + this._ns +
+                    " != " + cmdRes.cursor.ns);
     }
 
     if (!cmdRes.cursor.id.compare(NumberLong("0"))) {
         this._cursorHandle.zeroCursorId();
         this._cursorid = NumberLong("0");
     } else if (this._cursorid.compare(cmdRes.cursor.id)) {
-        throw Error("unexpected cursor id: " + this._cursorid.toString() + " != " +
-                    cmdRes.cursor.id.toString());
+        throw Error("unexpected cursor id: " + this._cursorid.toString() +
+                    " != " + cmdRes.cursor.id.toString());
     }
 
     // If the command result represents a change stream cursor, update our postBatchResumeToken.

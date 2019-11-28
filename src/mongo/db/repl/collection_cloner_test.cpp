@@ -260,15 +260,15 @@ void CollectionClonerTest::setUp() {
                const BSONObj idIndexSpec,
                const std::vector<BSONObj>& nonIdIndexSpecs)
         -> StatusWith<std::unique_ptr<CollectionBulkLoaderMock>> {
-            auto localLoader = std::make_unique<CollectionBulkLoaderMock>(collectionStats);
-            Status result = localLoader->init(nonIdIndexSpecs);
-            if (!result.isOK())
-                return result;
+        auto localLoader = std::make_unique<CollectionBulkLoaderMock>(collectionStats);
+        Status result = localLoader->init(nonIdIndexSpecs);
+        if (!result.isOK())
+            return result;
 
-            _loader = localLoader.get();
+        _loader = localLoader.get();
 
-            return std::move(localLoader);
-        };
+        return std::move(localLoader);
+    };
     _server = std::make_unique<MockRemoteDBServer>(target.toString());
     _server->assignCollectionUuid(nss.ns(), *options.uuid);
     _client = new FailableMockDBClientConnection(_server.get(), getNet());
@@ -281,13 +281,9 @@ void CollectionClonerTest::setUp() {
 // Return index specs to use for secondary indexes.
 std::vector<BSONObj> CollectionClonerTest::makeSecondaryIndexSpecs(const NamespaceString& nss) {
     return {BSON("v" << 1 << "key" << BSON("a" << 1) << "name"
-                     << "a_1"
-                     << "ns"
-                     << nss.ns()),
+                     << "a_1"),
             BSON("v" << 1 << "key" << BSON("b" << 1) << "name"
-                     << "b_1"
-                     << "ns"
-                     << nss.ns())};
+                     << "b_1")};
 }
 
 void CollectionClonerTest::tearDown() {
@@ -442,8 +438,7 @@ TEST_F(CollectionClonerTest, CollectionClonerPassesThroughCommandStatusErrorFrom
         executor::NetworkInterfaceMock::InNetworkGuard guard(getNet());
         processNetworkResponse(BSON("ok" << 0 << "errmsg"
                                          << "count error"
-                                         << "code"
-                                         << int(ErrorCodes::OperationFailed)));
+                                         << "code" << int(ErrorCodes::OperationFailed)));
     }
     collectionCloner->join();
     ASSERT_EQUALS(ErrorCodes::OperationFailed, getStatus());
@@ -565,15 +560,15 @@ TEST_F(CollectionClonerNoAutoIndexTest, DoNotCreateIDIndexIfAutoIndexIdUsed) {
                                                          const BSONObj idIndexSpec,
                                                          const std::vector<BSONObj>& theIndexSpecs)
         -> StatusWith<std::unique_ptr<CollectionBulkLoader>> {
-            auto loader = std::make_unique<CollectionBulkLoaderMock>(collectionStats);
-            collNss = theNss;
-            collOptions = theOptions;
-            collIndexSpecs = theIndexSpecs;
-            const auto status = loader->init(theIndexSpecs);
-            if (!status.isOK())
-                return status;
-            return std::move(loader);
-        };
+        auto loader = std::make_unique<CollectionBulkLoaderMock>(collectionStats);
+        collNss = theNss;
+        collOptions = theOptions;
+        collIndexSpecs = theIndexSpecs;
+        const auto status = loader->init(theIndexSpecs);
+        if (!status.isOK())
+            return status;
+        return std::move(loader);
+    };
 
     const BSONObj doc = BSON("_id" << 1);
     _server->insert(nss.ns(), doc);
@@ -632,13 +627,14 @@ TEST_F(CollectionClonerTest, ListIndexesReturnedNamespaceNotFound) {
     bool collectionCreated = false;
     bool writesAreReplicatedOnOpCtx = false;
     NamespaceString collNss;
-    storageInterface->createCollFn = [&collNss, &collectionCreated, &writesAreReplicatedOnOpCtx](
-        OperationContext* opCtx, const NamespaceString& nss, const CollectionOptions& options) {
-        writesAreReplicatedOnOpCtx = opCtx->writesAreReplicated();
-        collectionCreated = true;
-        collNss = nss;
-        return Status::OK();
-    };
+    storageInterface->createCollFn =
+        [&collNss, &collectionCreated, &writesAreReplicatedOnOpCtx](
+            OperationContext* opCtx, const NamespaceString& nss, const CollectionOptions& options) {
+            writesAreReplicatedOnOpCtx = opCtx->writesAreReplicated();
+            collectionCreated = true;
+            collNss = nss;
+            return Status::OK();
+        };
     // Using a non-zero cursor to ensure that
     // the cloner stops the fetcher from retrieving more results.
     {
@@ -687,9 +683,9 @@ TEST_F(CollectionClonerTest,
     // status.
     auto exec = &getExecutor();
     collectionCloner->setScheduleDbWorkFn_forTest([exec](
-        executor::TaskExecutor::CallbackFn workFn) {
+                                                      executor::TaskExecutor::CallbackFn workFn) {
         auto wrappedTask = [workFn = std::move(workFn)](
-            const executor::TaskExecutor::CallbackArgs& cbd) {
+                               const executor::TaskExecutor::CallbackArgs& cbd) {
             workFn(executor::TaskExecutor::CallbackArgs(
                 cbd.executor, cbd.myHandle, Status(ErrorCodes::CallbackCanceled, ""), cbd.opCtx));
         };
@@ -697,8 +693,9 @@ TEST_F(CollectionClonerTest,
     });
 
     bool collectionCreated = false;
-    storageInterface->createCollFn = [&collectionCreated](
-        OperationContext*, const NamespaceString& nss, const CollectionOptions&) {
+    storageInterface->createCollFn = [&collectionCreated](OperationContext*,
+                                                          const NamespaceString& nss,
+                                                          const CollectionOptions&) {
         collectionCreated = true;
         return Status::OK();
     };
@@ -1400,9 +1397,7 @@ TEST_F(CollectionClonerRenamedBeforeStartTest, BeginCollectionWithUUID) {
     ASSERT_BSONOBJ_EQ(options.toBSON(), collOptions.toBSON());
 
     BSONObj expectedIdIndexSpec = BSON("v" << 1 << "key" << BSON("_id" << 1) << "name"
-                                           << "_id_"
-                                           << "ns"
-                                           << alternateNss.ns());
+                                           << "_id_");
     ASSERT_BSONOBJ_EQ(collIdIndexSpec, expectedIdIndexSpec);
 
     auto expectedNonIdIndexSpecs = makeSecondaryIndexSpecs(alternateNss);

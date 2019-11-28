@@ -434,7 +434,7 @@ TEST_F(QueryPlannerTest, NotEqualsNullSparseIndex) {
     addIndex(BSON("x" << 1),
              false,  // multikey
              true    // sparse
-             );
+    );
 
     runQuery(fromjson("{x: {$ne: null}}"));
 
@@ -449,7 +449,7 @@ TEST_F(QueryPlannerTest, NotEqualsNullSparseMultiKeyIndex) {
     addIndex(BSON("x" << 1),
              true,  // multikey
              true   // sparse
-             );
+    );
 
     runQuery(fromjson("{x: {$ne: null}}"));
 
@@ -462,7 +462,7 @@ TEST_F(QueryPlannerTest, NotEqualsNullInElemMatchValueSparseMultiKeyIndex) {
     addIndex(BSON("x" << 1),
              true,  // multikey
              true   // sparse
-             );
+    );
 
     runQuery(fromjson("{'x': {$elemMatch: {$ne: null}}}"));
 
@@ -1674,8 +1674,7 @@ TEST_F(QueryPlannerTest, CantUseHashedIndexToProvideSortWithIndexablePred) {
 TEST_F(QueryPlannerTest, CantUseTextIndexToProvideSort) {
     addIndex(BSON("x" << 1 << "_fts"
                       << "text"
-                      << "_ftsx"
-                      << 1));
+                      << "_ftsx" << 1));
     runQuerySortProj(BSONObj(), BSON("x" << 1), BSONObj());
 
     ASSERT_EQUALS(getNumSolutions(), 1U);
@@ -2744,7 +2743,7 @@ TEST_F(QueryPlannerTest, NegationCannotUseSparseIndex) {
     addIndex(fromjson("{a: 1}"),
              false,  // multikey
              true    // sparse
-             );
+    );
     runQuery(fromjson("{a: {$ne: 5}}"));
     assertHasOnlyCollscan();
 
@@ -2758,7 +2757,7 @@ TEST_F(QueryPlannerTest, NegationInElemMatchDoesNotUseSparseIndex) {
     addIndex(fromjson("{a: 1}"),
              true,  // multikey
              true   // sparse
-             );
+    );
     runQuery(fromjson("{a: {$elemMatch: {$ne: 5}}}"));
     assertHasOnlyCollscan();
 
@@ -2770,7 +2769,7 @@ TEST_F(QueryPlannerTest, SparseIndexCannotSupportEqualsNull) {
     addIndex(BSON("i" << 1),
              false,  // multikey
              true    // sparse
-             );
+    );
 
     runQuery(fromjson("{i: {$eq: null}}"));
     assertHasOnlyCollscan();
@@ -2784,7 +2783,7 @@ TEST_F(QueryPlannerTest, SparseIndexCanSupportGTEOrLTENull) {
     addIndex(BSON("i" << 1),
              false,  // multikey
              true    // sparse
-             );
+    );
 
     runQuery(fromjson("{i: {$gte: null}}"));
     assertNumSolutions(1U);
@@ -3325,6 +3324,20 @@ TEST_F(QueryPlannerTest, NENull) {
         "[['MinKey',undefined,true,false],[null,'MaxKey',false,true]]}}}}}");
 }
 
+TEST_F(QueryPlannerTest, NinNull) {
+    addIndex(BSON("a" << 1));
+    runQuery(fromjson("{a: {$nin: [null, 4]}}"));
+
+    assertNumSolutions(2U);
+    assertSolutionExists("{cscan: {dir: 1}}");
+    assertSolutionExists(
+        "{fetch: {filter: null, node: {ixscan: {pattern: {a:1}, "
+        "bounds: {a: [['MinKey',undefined,true,false],"
+        "[null,4,false,false],"
+        "[4,'MaxKey',false,true]]}}}}}");
+}
+
+
 TEST_F(QueryPlannerTest, NENullWithSort) {
     addIndex(BSON("a" << 1));
     runQuerySortProj(fromjson("{a: {$ne: null}}"), BSON("a" << 1), BSONObj());
@@ -3375,7 +3388,7 @@ TEST_F(QueryPlannerTest, NENullWithSortAndProjection) {
 
 // In general, a negated $nin can make use of an index.
 TEST_F(QueryPlannerTest, NinUsesMultikeyIndex) {
-    // true means multikey
+    // 'true' means multikey.
     addIndex(BSON("a" << 1), true);
     runQuery(fromjson("{a: {$nin: [4, 10]}}"));
 
@@ -3390,14 +3403,27 @@ TEST_F(QueryPlannerTest, NinUsesMultikeyIndex) {
 
 // But it can't if the $nin contains a regex because regex bounds can't
 // be complemented.
-TEST_F(QueryPlannerTest, NinCantUseMultikeyIndex) {
-    // true means multikey
+TEST_F(QueryPlannerTest, NinWithRegexCantUseMultikeyIndex) {
+    // 'true' means multikey.
     addIndex(BSON("a" << 1), true);
     runQuery(fromjson("{a: {$nin: [4, /foobar/]}}"));
 
     assertNumSolutions(1U);
     assertSolutionExists("{cscan: {dir: 1}}");
 }
+
+// Or if it contains a null, because null is "equal" to undefined, and undefined can represent an
+// empty array. Therefore negating the bounds [undefined, null], would lead to the query missing
+// values for empty array.
+TEST_F(QueryPlannerTest, NinWithNullCantUseMultikeyIndex) {
+    // 'true' means multikey.
+    addIndex(BSON("a" << 1), true);
+    runQuery(fromjson("{a: {$nin: [4, null]}}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists("{cscan: {dir: 1}}");
+}
+
 
 //
 // Multikey indices

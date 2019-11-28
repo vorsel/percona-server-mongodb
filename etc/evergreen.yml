@@ -377,11 +377,12 @@ variables:
   - enterprise-rhel-67-s390x
   - enterprise-rhel-70-64-bit
   - enterprise-rhel-70-64-bit-kitchen-sink
-  - enterprise-rhel-70-64-bit-debug-libunwind
+  - enterprise-rhel-70-64-bit-libunwind
   - enterprise-rhel-71-ppc64le
   - enterprise-rhel-71-ppc64le-inmem
   - enterprise-rhel-72-s390x
   - enterprise-rhel-72-s390x-inmem
+  - enterprise-rhel-80-64-bit
   - enterprise-suse12-64
   - enterprise-suse15-64
   - enterprise-suse12-s390x
@@ -4913,23 +4914,17 @@ tasks:
         set -o verbose
 
         ${activate_virtualenv}
-        # If this is a scheduled build, we check for changes against the last scheduled commit.
-        if [ "${is_patch}" != "true" ]; then
-          burn_in_args="--checkEvergreen"
-        fi
-
         # Capture a list of new and modified tests. The expansion macro burn_in_tests_build_variant
         # is used to for finding the associated tasks from a different build varaint than the
         # burn_in_tests_gen task executes on.
-        build_variant_opts="--buildVariant=${build_variant}"
+        build_variant_opts="--build-variant=${build_variant}"
         if [ -n "${burn_in_tests_build_variant|}" ]; then
-          build_variant_opts="--buildVariant=${burn_in_tests_build_variant} --runBuildVariant=${build_variant}"
+          build_variant_opts="--build-variant=${burn_in_tests_build_variant} --run-build-variant=${build_variant}"
         fi
 
-        # Increase the burn_in repetition from 2 to 1000 executions or 10 minutes
-        burn_in_args="$burn_in_args --repeatTestsMin=2 --repeatTestsMax=1000 --repeatTestsSecs=600"
+        burn_in_args="$burn_in_args --repeat-tests-min=2 --repeat-tests-max=1000 --repeat-tests-secs=600"
         # Evergreen executable is in $HOME.
-        PATH=$PATH:$HOME $python buildscripts/burn_in_tests.py --branch=${branch_name} --project=${project} $build_variant_opts --distro=${distro_id} --generateTasksFile=burn_in_tests_gen.json --noExec $burn_in_args
+        PATH=$PATH:$HOME $python buildscripts/burn_in_tests.py --project=${project} $build_variant_opts --distro=${distro_id} --generate-tasks-file=burn_in_tests_gen.json $burn_in_args
   - command: archive.targz_pack
     params:
       target: src/burn_in_tests_gen.tgz
@@ -5533,20 +5528,19 @@ tasks:
       resmoke_args: --suites=jstestfuzz_replication_continuous_stepdown --flowControlTicketOverride=1 --storageEngine=wiredTiger
       name: jstestfuzz_replication_continuous_stepdown_flow_control
 
-# TODO(SERVER-41608) Re-enable once root cause of failures has been addressed.
 ## jstestfuzz concurrent replication continuous stepdown with flow control engaged ##
-#- <<: *jstestfuzz_template
-#  name: jstestfuzz_concurrent_replication_continuous_stepdown_flow_control_gen
-#  tags: ["jstestfuzz", "common", "repl", "flow_control"]
-#  commands:
-#  - func: "generate fuzzer tasks"
-#    vars:
-#      <<: *jstestfuzz_config_vars
-#      num_files: ${jstestfuzz_concurrent_num_files|10}
-#      num_tasks: 15
-#      jstestfuzz_vars: --jsTestsDir ../jstests
-#      resmoke_args: --suites=jstestfuzz_replication_continuous_stepdown --flowControlTicketOverride=10 --storageEngine=wiredTiger --numClientsPerFixture=10
-#      name: jstestfuzz_concurrent_replication_continuous_stepdown_flow_control
+- <<: *jstestfuzz_template
+  name: jstestfuzz_concurrent_replication_continuous_stepdown_flow_control_gen
+  tags: ["jstestfuzz", "common", "repl", "flow_control"]
+  commands:
+  - func: "generate fuzzer tasks"
+    vars:
+      <<: *jstestfuzz_config_vars
+      num_files: ${jstestfuzz_concurrent_num_files|10}
+      num_tasks: 15
+      jstestfuzz_vars: --jsTestsDir ../jstests
+      resmoke_args: --suites=jstestfuzz_replication_continuous_stepdown --flowControlTicketOverride=10 --storageEngine=wiredTiger --numClientsPerFixture=10
+      name: jstestfuzz_concurrent_replication_continuous_stepdown_flow_control
 
 ## jstestfuzz replica set ##
 - <<: *jstestfuzz_template
@@ -10345,8 +10339,6 @@ buildvariants:
   - name: lint_fuzzer_sanity_patch
   - name: lint_yaml
   - name: burn_in_tests_gen
-    distros:
-    - rhel62-large
   - name: .aggfuzzer
   - name: .aggregation
   - name: audit
@@ -10704,12 +10696,15 @@ buildvariants:
   - name: compile_TG
     distros:
     - rhel62-large
+  - name: .concurrency !.large !.ubsan !.no_txns
   - name: .jscore .common
+  - name: .jstestfuzz
   - name: noPassthrough_gen
   - name: noPassthroughWithMongod_gen
   - name: .replica_sets !.encrypt !.auth
     distros:
     - rhel62-large
+  - name: .rollbackfuzzer
   - name: sharding_gen
 
 - name: enterprise-rhel-62-64-bit-coverage
@@ -10837,6 +10832,68 @@ buildvariants:
     - ubuntu1604-packer
   - name: .publish
 
+- &enterprise-rhel-80-64-bit-template
+  name: enterprise-rhel-80-64-bit
+  display_name: "Enterprise RHEL 8.0"
+  modules:
+  - enterprise
+  run_on:
+  - rhel80-build
+  expansions:
+    push_path: linux
+    push_bucket: downloads.10gen.com
+    push_name: linux
+    push_arch: x86_64-enterprise-rhel80
+    mh_target: dist-mh
+    compile_flags: --ssl MONGO_DISTMOD=rhel80 -j$(grep -c ^processor /proc/cpuinfo) --release --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
+    multiversion_platform: rhel80
+    multiversion_edition: enterprise
+    has_packages: true
+    packager_script: packager_enterprise.py
+    packager_arch: x86_64
+    packager_distro: rhel80
+    repo_edition: enterprise
+    scons_cache_scope: shared
+    tooltags: "ssl sasl gssapi"
+    build_mongoreplay: true
+  display_tasks:
+  - *dbtest
+  - *unittests
+  tasks:
+  - name: compile_all_run_unittests_TG
+    distros:
+    - rhel80-build
+  - name: compile_benchmarks
+    distros:
+    - rhel80-build
+  - name: .aggfuzzer
+  - name: audit
+  - name: auth_audit_gen
+  - name: auth_gen
+  - name: .benchmarks
+  - name: causally_consistent_jscore_txns_passthrough
+  - name: .encrypt !.sharding !.replica_sets !.aggregation !.jscore
+  - name: external_auth
+  - name: .jscore .common !.compat !.decimal !.sharding
+  - name: jsCore_txns_large_txns_format
+  - name: .jstestfuzz .common
+  - name: .logical_session_cache .one_sec
+  - name: replica_sets_auth_gen
+  - name: replica_sets_jscore_passthrough
+  - name: .replica_sets .multi_oplog
+  - name: sasl
+  - name: search_beta
+  - name: search_beta_auth
+  - name: search_beta_ssl
+  - name: sharding_auth_audit_gen
+  - name: sharding_auth_gen
+  - name: snmp
+  - name: .stitch
+  - name: package
+    distros:
+    - ubuntu1604-packer
+  - name: .publish
+
 # This variant is to intentionally test uncommon features nightly
 - <<: *enterprise-rhel-70-64-bit-template
   name: enterprise-rhel-70-64-bit-kitchen-sink
@@ -10872,14 +10929,14 @@ buildvariants:
   - name: noPassthrough_gen
 
 - <<: *enterprise-rhel-70-64-bit-template
-  name: enterprise-rhel-70-64-bit-debug-libunwind
-  display_name: "~ Enterprise RHEL 7.0 DEBUG (libunwind)"
+  name: enterprise-rhel-70-64-bit-libunwind
+  display_name: "~ Enterprise RHEL 7.0 (libunwind)"
   batchtime: 1440 # 1 day
   runs_on:
   - rhel70
   expansions:
     <<: *enterprise-rhel-70-64-bit-expansions-template
-    compile_flags: --ssl MONGO_DISTMOD=rhel70 --dbg=on --opt=on -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars --use-libunwind
+    compile_flags: --ssl MONGO_DISTMOD=rhel70 --opt=on -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars --use-libunwind
     has_packages: false
     mh_target: ""
 
@@ -10997,6 +11054,61 @@ buildvariants:
   - name: concurrency_replication_causal_consistency
     distros:
       - rhel70
+  - name: disk_wiredtiger
+  - name: free_monitoring
+  - name: .jscore .common
+  - name: .jstestfuzz .common
+  - name: .logical_session_cache .one_sec
+  - name: multiversion
+  - name: replica_sets
+  - name: .replica_sets .common
+  - name: .sharding .txns
+  - name: .sharding .common !.op_query !.csrs
+  - name: .ssl
+  - name: .stitch
+  - name: package
+    distros:
+    - ubuntu1604-packer
+  - name: .publish
+
+- name: rhel80
+  display_name: SSL RHEL 8.0
+  run_on:
+  - rhel80-build
+  batchtime: 1440 # 1 day
+  expansions:
+    push_path: linux
+    push_bucket: downloads.mongodb.org
+    push_name: linux
+    push_arch: x86_64-rhel80
+    compile_flags: --ssl MONGO_DISTMOD=rhel80 -j$(grep -c ^processor /proc/cpuinfo) --release --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
+    multiversion_platform: rhel80
+    multiversion_edition: targeted
+    has_packages: true
+    packager_script: packager.py
+    packager_arch: x86_64
+    packager_distro: rhel80
+    repo_edition: org
+    scons_cache_scope: shared
+    tooltags: "ssl"
+    build_mongoreplay: true
+  display_tasks:
+  - *dbtest
+  - *unittests
+  tasks:
+  - name: compile_all_run_unittests_TG
+    distros:
+    - rhel80-build
+  - name: aggregation
+  - name: .auth !.audit !.multiversion
+  - name: causally_consistent_jscore_txns_passthrough
+  - name: .misc_js
+  - name: .concurrency .common
+    distros:
+      - rhel80-build
+  - name: concurrency_replication_causal_consistency
+    distros:
+      - rhel80-build
   - name: disk_wiredtiger
   - name: free_monitoring
   - name: .jscore .common
@@ -12389,7 +12501,7 @@ buildvariants:
     variant_path_suffix: /opt/mongodbtoolchain/v3/bin
     lang_environment: LANG=C
     san_options: UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1" LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=1
-    compile_flags: LINKFLAGS=-nostdlib++ LIBS=stdc++ --variables-files=etc/scons/mongodbtoolchain_v3_clang.vars --dbg=on --opt=on --allocator=system --sanitize=undefined,address,fuzzer --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip --disable-warnings-as-errors
+    compile_flags: LINKFLAGS=-nostdlib++ LIBS=stdc++ --variables-files=etc/scons/mongodbtoolchain_v3_clang.vars --dbg=on --opt=on --allocator=system --sanitize=undefined,address,fuzzer --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
     resmoke_jobs_factor: 0.3  # Avoid starting too many mongod's under {A,UB}SAN build.
     tooltags: "ssl"
     build_mongoreplay: true

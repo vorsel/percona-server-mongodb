@@ -52,15 +52,15 @@
 
 namespace mongo {
 
-using std::shared_ptr;
 using std::set;
+using std::shared_ptr;
 using std::string;
 using std::vector;
 
 using executor::NetworkInterface;
 using executor::NetworkInterfaceThreadPool;
-using executor::TaskExecutorPool;
 using executor::TaskExecutor;
+using executor::TaskExecutorPool;
 using executor::ThreadPoolTaskExecutor;
 
 ReplicaSetMonitorManager::ReplicaSetMonitorManager() {}
@@ -79,56 +79,41 @@ shared_ptr<ReplicaSetMonitor> ReplicaSetMonitorManager::getMonitor(StringData se
     }
 }
 
-void ReplicaSetMonitorManager::_setupTaskExecutorInLock(const std::string& name) {
-    auto hookList = std::make_unique<rpc::EgressMetadataHookList>();
-
-    // do not restart taskExecutor if is in shutdown
-    if (!_taskExecutor && !_isShutdown) {
-        // construct task executor
-        auto net = executor::makeNetworkInterface(
-            "ReplicaSetMonitor-TaskExecutor", nullptr, std::move(hookList));
-        auto netPtr = net.get();
-        _taskExecutor = std::make_unique<ThreadPoolTaskExecutor>(
-            std::make_unique<NetworkInterfaceThreadPool>(netPtr), std::move(net));
-        LOG(1) << "Starting up task executor for monitoring replica sets in response to request to "
-                  "monitor set: "
-               << redact(name);
-        _taskExecutor->startup();
+void ReplicaSetMonitorManager::_setupTaskExecutorInLock() {
+    if (_isShutdown || _taskExecutor) {
+        // do not restart taskExecutor if is in shutdown
+        return;
     }
+
+    // construct task executor
+    auto hookList = std::make_unique<rpc::EgressMetadataHookList>();
+    auto net = executor::makeNetworkInterface(
+        "ReplicaSetMonitor-TaskExecutor", nullptr, std::move(hookList));
+    auto pool = std::make_unique<NetworkInterfaceThreadPool>(net.get());
+    _taskExecutor = std::make_unique<ThreadPoolTaskExecutor>(std::move(pool), std::move(net));
+    _taskExecutor->startup();
 }
 
 namespace {
 void uassertNotMixingSSL(transport::ConnectSSLMode a, transport::ConnectSSLMode b) {
     uassert(51042, "Mixing ssl modes with a single replica set is disallowed", a == b);
 }
-}
+}  // namespace
 
 shared_ptr<ReplicaSetMonitor> ReplicaSetMonitorManager::getOrCreateMonitor(
     const ConnectionString& connStr) {
-    invariant(connStr.type() == ConnectionString::SET);
-
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-    _setupTaskExecutorInLock(connStr.toString());
-    auto setName = connStr.getSetName();
-    auto monitor = _monitors[setName].lock();
-    if (monitor) {
-        uassertNotMixingSSL(monitor->getOriginalUri().getSSLMode(), transport::kGlobalSSLMode);
-        return monitor;
-    }
-
-    log() << "Starting new replica set monitor for " << connStr.toString();
-
-    auto newMonitor = std::make_shared<ReplicaSetMonitor>(MongoURI(connStr));
-    _monitors[setName] = newMonitor;
-    newMonitor->init();
-    return newMonitor;
+    return getOrCreateMonitor(MongoURI(connStr));
 }
 
 shared_ptr<ReplicaSetMonitor> ReplicaSetMonitorManager::getOrCreateMonitor(const MongoURI& uri) {
     invariant(uri.type() == ConnectionString::SET);
 
     stdx::lock_guard<stdx::mutex> lk(_mutex);
-    _setupTaskExecutorInLock(uri.toString());
+    uassert(ErrorCodes::ShutdownInProgress,
+            str::stream() << "Unable to get monitor for '" << uri << "' due to shutdown",
+            !_isShutdown);
+
+    _setupTaskExecutorInLock();
     const auto& setName = uri.getSetName();
     auto monitor = _monitors[setName].lock();
     if (monitor) {
@@ -169,34 +154,43 @@ void ReplicaSetMonitorManager::removeMonitor(StringData setName) {
 }
 
 void ReplicaSetMonitorManager::shutdown() {
+    // Sadly, this function can run very late in the post-main shutdown because there is still
+    // a globalRSMonitorManager. We have to be very carefully how we log because this can actually
+    // shutdown later than the logging subsystem. This will be less of an issue once SERVER-42437 is
+    // done.
 
+    decltype(_monitors) monitors;
     {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
-        if (!_taskExecutor || _isShutdown) {
+        if (std::exchange(_isShutdown, true)) {
             return;
         }
-        _isShutdown = true;
+
+        monitors = std::exchange(_monitors, {});
     }
 
-    LOG(1) << "Shutting down task executor used for monitoring replica sets";
-    _taskExecutor->shutdown();
-    _taskExecutor->join();
+    if (monitors.size()) {
+        log() << "Dropping all ongoing scans against replica sets";
+    }
+    for (auto& [name, monitor] : monitors) {
+        auto anchor = monitor.lock();
+        if (!anchor) {
+            continue;
+        }
+
+        anchor->markAsRemoved();
+        anchor->drop();
+    }
+
+    if (auto taskExecutor = std::exchange(_taskExecutor, {})) {
+        LOG(1) << "Shutting down task executor used for monitoring replica sets";
+        taskExecutor->shutdown();
+        taskExecutor->join();
+    }
 }
 
 void ReplicaSetMonitorManager::removeAllMonitors() {
-    {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
-        _monitors = ReplicaSetMonitorsMap();
-        if (!_taskExecutor || _isShutdown) {
-            return;
-        }
-        _isShutdown = true;
-    }
-
-    LOG(1) << "Shutting down task executor used for monitoring replica sets";
-    _taskExecutor->shutdown();
-    _taskExecutor->join();
-    _taskExecutor.reset();
+    shutdown();
 
     {
         stdx::lock_guard<stdx::mutex> lk(_mutex);

@@ -53,7 +53,7 @@ void emplaceOrInvariant(Map&& map, Args&&... args) noexcept {
     invariant(ret.second, "Element already existed in map/set");
 }
 
-}  // anonymous
+}  // namespace
 
 Status ShardingTaskExecutorPoolController::validateHostTimeout(const int& hostTimeoutMS) {
     auto toRefreshTimeoutMS = gParameters.toRefreshTimeoutMS.load();
@@ -221,7 +221,7 @@ auto ShardingTaskExecutorPoolController::updateHost(PoolId id, const HostState& 
 
     // If the pool isn't in a groupData, we can return now
     auto groupData = poolData.groupData.lock();
-    if (!groupData) {
+    if (!groupData || groupData->state.passives.count(poolData.host)) {
         return {{poolData.host}, poolData.isAbleToShutdown};
     }
 

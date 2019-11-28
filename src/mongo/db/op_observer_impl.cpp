@@ -64,8 +64,8 @@
 #include "mongo/util/fail_point_service.h"
 
 namespace mongo {
-using repl::OplogEntry;
 using repl::MutableOplogEntry;
+using repl::OplogEntry;
 
 namespace {
 
@@ -243,11 +243,7 @@ void OpObserverImpl::onCreateIndex(OperationContext* opCtx,
                                    bool fromMigrate) {
     BSONObjBuilder builder;
     builder.append("createIndexes", nss.coll());
-
-    for (const auto& e : indexDoc) {
-        if (e.fieldNameStringData() != "ns"_sd)
-            builder.append(e);
-    }
+    builder.appendElements(indexDoc);
 
     MutableOplogEntry oplogEntry;
     oplogEntry.setOpType(repl::OpTypeEnum::kCommand);
@@ -271,12 +267,7 @@ void OpObserverImpl::onStartIndexBuild(OperationContext* opCtx,
 
     BSONArrayBuilder indexesArr(oplogEntryBuilder.subarrayStart("indexes"));
     for (auto indexDoc : indexes) {
-        BSONObjBuilder builder;
-        for (const auto& e : indexDoc) {
-            if (e.fieldNameStringData() != "ns"_sd)
-                builder.append(e);
-        }
-        indexesArr.append(builder.obj());
+        indexesArr.append(indexDoc);
     }
     indexesArr.done();
 
@@ -302,12 +293,7 @@ void OpObserverImpl::onCommitIndexBuild(OperationContext* opCtx,
 
     BSONArrayBuilder indexesArr(oplogEntryBuilder.subarrayStart("indexes"));
     for (auto indexDoc : indexes) {
-        BSONObjBuilder builder;
-        for (const auto& e : indexDoc) {
-            if (e.fieldNameStringData() != "ns"_sd)
-                builder.append(e);
-        }
-        indexesArr.append(builder.obj());
+        indexesArr.append(indexDoc);
     }
     indexesArr.done();
 
@@ -333,12 +319,7 @@ void OpObserverImpl::onAbortIndexBuild(OperationContext* opCtx,
 
     BSONArrayBuilder indexesArr(oplogEntryBuilder.subarrayStart("indexes"));
     for (auto indexDoc : indexes) {
-        BSONObjBuilder builder;
-        for (const auto& e : indexDoc) {
-            if (e.fieldNameStringData() != "ns"_sd)
-                builder.append(e);
-        }
-        indexesArr.append(builder.obj());
+        indexesArr.append(indexDoc);
     }
     indexesArr.done();
 
@@ -436,11 +417,8 @@ void OpObserverImpl::onUpdate(OperationContext* opCtx, const OplogUpdateEntryArg
         if (!collElem || args.nss.ns() == collElem.String()) {
             uasserted(40654,
                       str::stream() << "failCollectionUpdates failpoint enabled, namespace: "
-                                    << args.nss.ns()
-                                    << ", update: "
-                                    << args.updateArgs.update
-                                    << " on document with "
-                                    << args.updateArgs.criteria);
+                                    << args.nss.ns() << ", update: " << args.updateArgs.update
+                                    << " on document with " << args.updateArgs.criteria);
         }
     }
 
@@ -988,7 +966,6 @@ void logCommitOrAbortForPreparedTransaction(OperationContext* opCtx,
 
     writeConflictRetry(
         opCtx, "onPreparedTransactionCommitOrAbort", NamespaceString::kRsOplogNamespace.ns(), [&] {
-
             // Writes to the oplog only require a Global intent lock. Guaranteed by
             // OplogSlotReserver.
             invariant(opCtx->lockState()->isWriteLocked());

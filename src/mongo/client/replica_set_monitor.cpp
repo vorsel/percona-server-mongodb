@@ -57,9 +57,9 @@
 
 namespace mongo {
 
-using std::shared_ptr;
 using std::numeric_limits;
 using std::set;
+using std::shared_ptr;
 using std::string;
 using std::vector;
 
@@ -201,68 +201,96 @@ void ReplicaSetMonitor::init() {
         return;
     }
 
-    _state->init();
+    {
+        stdx::lock_guard lk(_state->mutex);
+        _state->init();
+    }
+}
 
-    stdx::lock_guard<stdx::mutex> lk(_state->mutex);
-    _scheduleRefresh(_state->now(), lk);
+void ReplicaSetMonitor::drop() {
+    {
+        stdx::lock_guard lk(_state->mutex);
+        _state->drop();
+    }
 }
 
 ReplicaSetMonitor::~ReplicaSetMonitor() {
-    _state->drop();
+    drop();
 }
 
-void ReplicaSetMonitor::_scheduleRefresh(Date_t when, WithLock) {
-    // Reschedule the refresh
-    invariant(_state->executor);
+template <typename Callback>
+auto ReplicaSetMonitor::SetState::scheduleWorkAt(Date_t when, Callback&& cb) const {
+    auto wrappedCallback = [cb = std::forward<Callback>(cb),
+                            anchor = shared_from_this()](const CallbackArgs& cbArgs) mutable {
+        if (anchor->isRemovedFromManager.load() || ErrorCodes::isCancelationError(cbArgs.status)) {
+            // Do no more work if we're removed or canceled
+            return;
+        }
+        invariant(cbArgs.status);
 
-    if (_isRemovedFromManager.load()) {  // already removed so no need to refresh
-        LOG(1) << "Stopping refresh for replica set " << getName() << " because its removed";
+        stdx::lock_guard lk(anchor->mutex);
+        cb(cbArgs);
+    };
+    return executor->scheduleWorkAt(std::move(when), std::move(wrappedCallback));
+}
+
+void ReplicaSetMonitor::SetState::rescheduleRefresh(SchedulingStrategy strategy) {
+    // Reschedule the refresh
+
+    if (!executor) {
+        // Without an executor, we can't do refreshes -- we're in a test
         return;
     }
 
-    std::weak_ptr<ReplicaSetMonitor> that(shared_from_this());
-    auto status = _state->executor->scheduleWorkAt(when, [that](const CallbackArgs& cbArgs) {
-        if (!cbArgs.status.isOK())
-            return;
+    if (isRemovedFromManager.load()) {  // already removed so no need to refresh
+        LOG(1) << "Stopping refresh for replica set " << name << " because it's removed";
+        return;
+    }
 
-        if (auto ptr = that.lock()) {
-            ptr->_doScheduledRefresh(cbArgs.myHandle);
-        }
+    Milliseconds period = refreshPeriod;
+    if (isExpedited) {
+        period = std::min<Milliseconds>(period, kExpeditedRefreshPeriod);
+    }
+
+    auto currentTime = now();
+    auto possibleNextScanTime = currentTime + period;
+    if (refresherHandle &&                                   //
+        (strategy == SchedulingStrategy::kKeepEarlyScan) &&  //
+        (nextScanTime > currentTime) &&                      //
+        (possibleNextScanTime >= nextScanTime)) {
+        // If the next scan would be sooner than our desired, why cancel?
+        return;
+    }
+
+    // Cancel out the last refresh
+    if (auto currentHandle = std::exchange(refresherHandle, {})) {
+        executor->cancel(currentHandle);
+    }
+
+    nextScanTime = possibleNextScanTime;
+    LOG(1) << "Next replica set scan scheduled for " << nextScanTime;
+    auto swHandle = scheduleWorkAt(nextScanTime, [this](const CallbackArgs& cbArgs) {
+        if (cbArgs.myHandle != refresherHandle)
+            return;  // We've been replaced!
+
+        _ensureScanInProgress(shared_from_this());
+
+        // And now we set up the next one
+        rescheduleRefresh(SchedulingStrategy::kKeepEarlyScan);
     });
 
-    if (status.getStatus() == ErrorCodes::ShutdownInProgress) {
-        LOG(1) << "Cant schedule refresh for " << getName() << ". Executor shutdown in progress";
+    if (ErrorCodes::isShutdownError(swHandle.getStatus().code())) {
+        LOG(1) << "Cant schedule refresh for " << name << ". Executor shutdown in progress";
         return;
     }
 
-    if (!status.isOK()) {
-        severe() << "Can't continue refresh for replica set " << getName() << " due to "
-                 << redact(status.getStatus());
+    if (!swHandle.isOK()) {
+        severe() << "Can't continue refresh for replica set " << name << " due to "
+                 << redact(swHandle.getStatus());
         fassertFailed(40140);
     }
 
-    _refresherHandle = status.getValue();
-}
-
-void ReplicaSetMonitor::_doScheduledRefresh(const CallbackHandle& currentHandle) {
-    stdx::lock_guard<stdx::mutex> lk(_state->mutex);
-    if (currentHandle != _refresherHandle)
-        return;  // We've been replaced!
-
-    Refresher::ensureScanInProgress(_state, lk);
-
-    Milliseconds period = _state->refreshPeriod;
-    if (_state->isExpedited) {
-        if (_state->waiters.empty()) {
-            // No current waiters so we can stop the expedited scanning.
-            _state->isExpedited = false;
-        } else {
-            period = std::min(period, kExpeditedRefreshPeriod);
-        }
-    }
-
-    // And now we set up the next one
-    _scheduleRefresh(_state->now() + period, lk);
+    refresherHandle = std::move(swHandle.getValue());
 }
 
 SemiFuture<HostAndPort> ReplicaSetMonitor::getHostOrRefresh(const ReadPreferenceSetting& criteria,
@@ -283,12 +311,7 @@ SemiFuture<std::vector<HostAndPort>> ReplicaSetMonitor::getHostsOrRefresh(
 Future<std::vector<HostAndPort>> ReplicaSetMonitor::_getHostsOrRefresh(
     const ReadPreferenceSetting& criteria, Milliseconds maxWait) {
 
-    // If we're in shutdown, don't bother
-    if (globalRSMonitorManager.isShutdown()) {
-        return Status(ErrorCodes::ShutdownInProgress, "Server is shutting down"_sd);
-    }
-
-    if (_isRemovedFromManager.load()) {
+    if (_state->isRemovedFromManager.load()) {
         return Status(ErrorCodes::ReplicaSetMonitorRemoved,
                       str::stream() << "ReplicaSetMonitor for set " << getName() << " is removed");
     }
@@ -311,16 +334,11 @@ Future<std::vector<HostAndPort>> ReplicaSetMonitor::_getHostsOrRefresh(
 
     // This must go after we set up the wait state to correctly handle unittests using
     // MockReplicaSet.
-    Refresher::ensureScanInProgress(_state, lk);
+    _ensureScanInProgress(_state);
 
-    if (!_state->isExpedited && _refresherHandle &&
-        !MONGO_FAIL_POINT(modifyReplicaSetMonitorDefaultRefreshPeriod)) {
-        // We are the first waiter, switch to expedited scanning.
-        _state->isExpedited = true;
-        _state->executor->cancel(_refresherHandle);
-        _refresherHandle = {};
-        _scheduleRefresh(_state->now() + kExpeditedRefreshPeriod, lk);
-    }
+    // Switch to expedited scanning.
+    _state->isExpedited = true;
+    _state->rescheduleRefresh(SetState::SchedulingStrategy::kKeepEarlyScan);
 
     return std::move(pf.future);
 }
@@ -479,63 +497,70 @@ bool ReplicaSetMonitor::isKnownToHaveGoodPrimary() const {
 }
 
 void ReplicaSetMonitor::markAsRemoved() {
-    _isRemovedFromManager.store(true);
+    _state->isRemovedFromManager.store(true);
 }
 
 void ReplicaSetMonitor::runScanForMockReplicaSet() {
     stdx::lock_guard<stdx::mutex> lk(_state->mutex);
-    Refresher::ensureScanInProgress(_state, lk);
+    _ensureScanInProgress(_state);
 
     // This function should only be called from tests using MockReplicaSet and they should use the
     // synchronous path to complete before returning.
     invariant(_state->currentScan == nullptr);
 }
 
-void Refresher::ensureScanInProgress(const SetStatePtr& set, WithLock lk) {
-    Refresher(set).scheduleNetworkRequests(lk);
+void ReplicaSetMonitor::_ensureScanInProgress(const SetStatePtr& state) {
+    Refresher(state).scheduleNetworkRequests();
 }
 
 Refresher::Refresher(const SetStatePtr& setState) : _set(setState), _scan(setState->currentScan) {
     if (_scan) {
+        _set->rescheduleRefresh(SetState::SchedulingStrategy::kKeepEarlyScan);
         _scan->retryAllTriedHosts(_set->rand);
         return;  // participate in in-progress scan
     }
-    LOG(2) << "Starting new refresh of replica set " << _set->name;
-    _scan = startNewScan(_set.get());
-    _set->currentScan = _scan;
+
+    startNewScan();
 }
 
-void Refresher::scheduleNetworkRequests(WithLock withLock) {
-    while (true) {
-        auto ns = getNextStep();
-        if (ns.step != Refresher::NextStep::CONTACT_HOST)
-            break;
+void Refresher::scheduleNetworkRequests() {
+    for (auto ns = getNextStep(); ns.step == NextStep::CONTACT_HOST; ns = getNextStep()) {
+        if (!_set->executor || _set->isMocked) {
+            // If we're mocked, just schedule an isMaster
+            scheduleIsMaster(ns.host);
+            continue;
+        }
 
         // cancel any scheduled isMaster calls that haven't yet been called
         Node* node = _set->findOrCreateNode(ns.host);
-        if (node->scheduledIsMasterHandle) {
-            _set->executor->cancel(node->scheduledIsMasterHandle);
+        if (auto handle = std::exchange(node->scheduledIsMasterHandle, {})) {
+            _set->executor->cancel(handle);
         }
 
         // ensure that the call to isMaster is scheduled at most every 500ms
-        if (_set->executor && (_set->executor->now() < node->nextPossibleIsMasterCall) &&
-            !_set->isMocked) {
-            // schedule a new call
-            node->scheduledIsMasterHandle = uassertStatusOK(_set->executor->scheduleWorkAt(
-                node->nextPossibleIsMasterCall,
-                [ *this, host = ns.host ](const CallbackArgs& cbArgs) mutable {
-                    stdx::lock_guard lk(_set->mutex);
-                    scheduleIsMaster(host, lk);
-                }));
-        } else {
-            scheduleIsMaster(ns.host, withLock);
+        auto swHandle =
+            _set->scheduleWorkAt(node->nextPossibleIsMasterCall,
+                                 [*this, host = ns.host](const CallbackArgs& cbArgs) mutable {
+                                     scheduleIsMaster(host);
+                                 });
+
+        if (ErrorCodes::isShutdownError(swHandle.getStatus().code())) {
+            break;
         }
+
+        if (!swHandle.isOK()) {
+            severe() << "Can't continue scan for replica set " << _set->name << " due to "
+                     << redact(swHandle.getStatus());
+            fassertFailed(31176);
+        }
+
+        node->scheduledIsMasterHandle = uassertStatusOK(std::move(swHandle));
     }
 
     DEV _set->checkInvariants();
 }
 
-void Refresher::scheduleIsMaster(const HostAndPort& host, WithLock withLock) {
+void Refresher::scheduleIsMaster(const HostAndPort& host) {
     if (_set->isMocked) {
         // MockReplicaSet only works with DBClient-style access since it injects itself into the
         // ScopedDbConnection pool connection creation.
@@ -566,14 +591,21 @@ void Refresher::scheduleIsMaster(const HostAndPort& host, WithLock withLock) {
         _set->executor
             ->scheduleRemoteCommand(
                 std::move(request),
-                [ copy = *this, host, timer = Timer() ](
+                [copy = *this, host, timer = Timer()](
                     const executor::TaskExecutor::RemoteCommandCallbackArgs& result) mutable {
-                    stdx::lock_guard<stdx::mutex> lk(copy._set->mutex);
+                    stdx::lock_guard lk(copy._set->mutex);
                     // Ignore the reply and return if we are no longer the current scan. This might
                     // happen if it was decided that the host we were contacting isn't part of the
                     // set.
-                    if (copy._scan != copy._set->currentScan)
+                    if (copy._scan != copy._set->currentScan) {
                         return;
+                    }
+
+                    // ensure that isMaster calls occur at most 500ms after the previous call ended
+                    if (auto node = copy._set->findNode(host)) {
+                        node->nextPossibleIsMasterCall =
+                            copy._set->executor->now() + Milliseconds(500);
+                    }
 
                     if (result.response.isOK()) {
                         // Not using result.response.elapsedMillis because higher precision is
@@ -585,7 +617,7 @@ void Refresher::scheduleIsMaster(const HostAndPort& host, WithLock withLock) {
 
                     // This reply may have discovered new hosts to contact so we need to schedule
                     // them.
-                    copy.scheduleNetworkRequests(lk);
+                    copy.scheduleNetworkRequests();
                 })
             .getStatus();
 
@@ -688,14 +720,6 @@ void Refresher::receivedIsMaster(const HostAndPort& from,
         return;
     }
 
-    // ensure that isMaster calls occur at most 500ms after the previous call ended
-    if (_set->executor) {
-        Node* node = _set->findNode(from);
-        if (node) {
-            node->nextPossibleIsMasterCall = _set->executor->now() + Milliseconds(500);
-        }
-    }
-
     if (reply.setName != _set->name) {
         if (reply.raw["isreplicaset"].trueValue()) {
             // The reply came from a node in the state referred to as RSGhost in the SDAM
@@ -704,7 +728,7 @@ void Refresher::receivedIsMaster(const HostAndPort& from,
             // and if this refresher has yet to find the replica set master, we add hosts listed in
             // the reply to the list of possible replica set members.
             if (!_scan->foundUpMaster) {
-                _scan->possibleNodes.insert(reply.normalHosts.begin(), reply.normalHosts.end());
+                _scan->possibleNodes.insert(reply.members.begin(), reply.members.end());
             }
         } else {
             error() << "replset name mismatch: expected \"" << _set->name << "\", "
@@ -715,8 +739,7 @@ void Refresher::receivedIsMaster(const HostAndPort& from,
         failedHost(from,
                    {ErrorCodes::InconsistentReplicaSetNames,
                     str::stream() << "Target replica set name " << reply.setName
-                                  << " does not match the monitored set name "
-                                  << _set->name});
+                                  << " does not match the monitored set name " << _set->name});
         return;
     }
 
@@ -734,7 +757,7 @@ void Refresher::receivedIsMaster(const HostAndPort& from,
         _set->notify(/*finishedScan*/ false);
     } else {
         // Populate possibleNodes.
-        _scan->possibleNodes.insert(reply.normalHosts.begin(), reply.normalHosts.end());
+        _scan->possibleNodes.insert(reply.members.begin(), reply.members.end());
         _scan->unconfirmedReplies[from] = reply;
     }
 
@@ -753,9 +776,7 @@ void Refresher::failedHost(const HostAndPort& host, const Status& status) {
         node->markFailed(status);
 }
 
-ScanStatePtr Refresher::startNewScan(const SetState* set) {
-    const ScanStatePtr scan = std::make_shared<ScanState>();
-
+void Refresher::startNewScan() {
     // The heuristics we use in deciding the order to contact hosts are designed to find a
     // master as quickly as possible. This is because we can't use any hosts we find until
     // we either get the latest set of members from a master or talk to all possible hosts
@@ -764,28 +785,30 @@ ScanStatePtr Refresher::startNewScan(const SetState* set) {
     // TODO It might make sense to check down nodes first if the last seen master is still
     // marked as up.
 
+    _scan = std::make_shared<ScanState>();
+    _set->currentScan = _scan;
+
     int upNodes = 0;
-    for (Nodes::const_iterator it(set->nodes.begin()), end(set->nodes.end()); it != end; ++it) {
+    for (Nodes::const_iterator it(_set->nodes.begin()), end(_set->nodes.end()); it != end; ++it) {
         if (it->isUp) {
-            // scan the nodes we think are up first
-            scan->hostsToScan.push_front(it->host);
+            // _scan the nodes we think are up first
+            _scan->hostsToScan.push_front(it->host);
             upNodes++;
         } else {
-            scan->hostsToScan.push_back(it->host);
+            _scan->hostsToScan.push_back(it->host);
         }
     }
 
     // shuffle the queue, but keep "up" nodes at the front
-    std::shuffle(scan->hostsToScan.begin(), scan->hostsToScan.begin() + upNodes, set->rand.urbg());
-    std::shuffle(scan->hostsToScan.begin() + upNodes, scan->hostsToScan.end(), set->rand.urbg());
+    std::shuffle(
+        _scan->hostsToScan.begin(), _scan->hostsToScan.begin() + upNodes, _set->rand.urbg());
+    std::shuffle(_scan->hostsToScan.begin() + upNodes, _scan->hostsToScan.end(), _set->rand.urbg());
 
-    if (!set->lastSeenMaster.empty()) {
+    if (!_set->lastSeenMaster.empty()) {
         // move lastSeenMaster to front of queue
         std::stable_partition(
-            scan->hostsToScan.begin(), scan->hostsToScan.end(), HostIs(set->lastSeenMaster));
+            _scan->hostsToScan.begin(), _scan->hostsToScan.end(), HostIs(_set->lastSeenMaster));
     }
-
-    return scan;
 }
 
 Status Refresher::receivedIsMasterFromMaster(const HostAndPort& from, const IsMasterReply& reply) {
@@ -794,12 +817,11 @@ Status Refresher::receivedIsMasterFromMaster(const HostAndPort& from, const IsMa
     // Reject if config version is older. This is for backwards compatibility with nodes in pv0
     // since they don't have the same ordering with pv1 electionId.
     if (reply.configVersion < _set->configVersion) {
-        return {ErrorCodes::NotMaster,
-                str::stream() << "Node " << from
-                              << " believes it is primary, but its config version "
-                              << reply.configVersion
-                              << " is older than the most recent config version "
-                              << _set->configVersion};
+        return {
+            ErrorCodes::NotMaster,
+            str::stream() << "Node " << from << " believes it is primary, but its config version "
+                          << reply.configVersion << " is older than the most recent config version "
+                          << _set->configVersion};
     }
 
     if (reply.electionId.isSet()) {
@@ -808,12 +830,11 @@ Status Refresher::receivedIsMasterFromMaster(const HostAndPort& from, const IsMa
         // because configVersion needs to be incremented whenever the protocol version is changed.
         if (reply.configVersion == _set->configVersion && _set->maxElectionId.isSet() &&
             _set->maxElectionId.compare(reply.electionId) > 0) {
-            return {ErrorCodes::NotMaster,
-                    str::stream() << "Node " << from
-                                  << " believes it is primary, but its election id "
-                                  << reply.electionId
-                                  << " is older than the most recent election id "
-                                  << _set->maxElectionId};
+            return {
+                ErrorCodes::NotMaster,
+                str::stream() << "Node " << from << " believes it is primary, but its election id "
+                              << reply.electionId << " is older than the most recent election id "
+                              << _set->maxElectionId};
         }
 
         _set->maxElectionId = reply.electionId;
@@ -828,35 +849,32 @@ Status Refresher::receivedIsMasterFromMaster(const HostAndPort& from, const IsMa
     }
 
     // Check if the master agrees with our current list of nodes.
-    // REMINDER: both _set->nodes and reply.normalHosts are sorted.
-    if (_set->nodes.size() != reply.normalHosts.size() ||
-        !std::equal(
-            _set->nodes.begin(), _set->nodes.end(), reply.normalHosts.begin(), hostsEqual)) {
+    // REMINDER: both _set->nodes and reply.members are sorted.
+    if (_set->nodes.size() != reply.members.size() ||
+        !std::equal(_set->nodes.begin(), _set->nodes.end(), reply.members.begin(), hostsEqual)) {
         LOG(2) << "Adjusting nodes in our view of replica set " << _set->name
                << " based on master reply: " << redact(reply.raw);
 
         // remove non-members from _set->nodes
         _set->nodes.erase(
-            std::remove_if(_set->nodes.begin(), _set->nodes.end(), HostNotIn(reply.normalHosts)),
+            std::remove_if(_set->nodes.begin(), _set->nodes.end(), HostNotIn(reply.members)),
             _set->nodes.end());
 
         // add new members to _set->nodes
-        for (std::set<HostAndPort>::const_iterator it = reply.normalHosts.begin();
-             it != reply.normalHosts.end();
-             ++it) {
-            _set->findOrCreateNode(*it);
+        for (auto& host : reply.members) {
+            _set->findOrCreateNode(host);
         }
 
         // replace hostToScan queue with untried normal hosts. can both add and remove
         // hosts from the queue.
         _scan->hostsToScan.clear();
-        _scan->enqueAllUntriedHosts(reply.normalHosts, _set->rand);
+        _scan->enqueAllUntriedHosts(reply.members, _set->rand);
 
         if (!_scan->waitingFor.empty()) {
             // make sure we don't wait for any hosts that aren't considered members
             std::set<HostAndPort> newWaitingFor;
-            std::set_intersection(reply.normalHosts.begin(),
-                                  reply.normalHosts.end(),
+            std::set_intersection(reply.members.begin(),
+                                  reply.members.end(),
                                   _scan->waitingFor.begin(),
                                   _scan->waitingFor.end(),
                                   std::inserter(newWaitingFor, newWaitingFor.end()));
@@ -864,18 +882,18 @@ Status Refresher::receivedIsMasterFromMaster(const HostAndPort& from, const IsMa
         }
     }
 
-    bool changedHosts = reply.normalHosts != _set->seedNodes;
+    bool changedHosts = reply.members != _set->seedNodes;
     bool changedPrimary = reply.host != _set->lastSeenMaster;
     if (changedHosts || changedPrimary) {
         ++_set->seedGen;
-        _set->seedNodes = reply.normalHosts;
+        _set->seedNodes = reply.members;
         _set->seedConnStr = _set->confirmedConnectionString();
 
         // LogLevel can be pretty low, since replica set reconfiguration should be pretty rare
         // and we want to record our changes
         log() << "Confirmed replica set for " << _set->name << " is " << _set->seedConnStr;
 
-        _set->notifier->onConfirmedSet(_set->seedConnStr, reply.host);
+        _set->notifier->onConfirmedSet(_set->seedConnStr, reply.host, reply.passives);
     }
 
     // Update our working string
@@ -924,12 +942,13 @@ void IsMasterReply::parse(const BSONObj& obj) {
         primary = primaryString.empty() ? HostAndPort() : HostAndPort(primaryString);
 
         // both hosts and passives, but not arbiters, are considered "normal hosts"
-        normalHosts.clear();
+        members.clear();
         BSONForEach(host, raw.getObjectField("hosts")) {
-            normalHosts.insert(HostAndPort(host.String()));
+            members.insert(HostAndPort(host.String()));
         }
         BSONForEach(host, raw.getObjectField("passives")) {
-            normalHosts.insert(HostAndPort(host.String()));
+            members.insert(HostAndPort(host.String()));
+            passives.insert(HostAndPort(host.String()));
         }
 
         tags = raw.getObjectField("tags");
@@ -1294,26 +1313,28 @@ void SetState::notify(bool finishedScan) {
             it++;
         }
     }
+
+    if (waiters.empty()) {
+        // No current waiters so we can stop the expedited scanning.
+        isExpedited = false;
+        rescheduleRefresh(SchedulingStrategy::kCancelPreviousScan);
+    }
 }
 
 Status SetState::makeUnsatisfedReadPrefError(const ReadPreferenceSetting& criteria) const {
     return Status(ErrorCodes::FailedToSatisfyReadPreference,
                   str::stream() << "Could not find host matching read preference "
-                                << criteria.toString()
-                                << " for set "
-                                << name);
+                                << criteria.toString() << " for set " << name);
 }
 
 void SetState::init() {
+    rescheduleRefresh(SchedulingStrategy::kKeepEarlyScan);
     notifier->onFoundSet(name);
 }
 
 void SetState::drop() {
-    {
-        stdx::lock_guard<stdx::mutex> lk(mutex);
-        currentScan.reset();
-        notify(/*finishedScan*/ true);
-    }
+    currentScan.reset();
+    notify(/*finishedScan*/ true);
 
     // No point in notifying if we never started
     if (workingConnStr.isValid()) {
@@ -1396,4 +1417,4 @@ void ScanState::retryAllTriedHosts(PseudoRandom& rand) {
     std::shuffle(hostsToScan.begin(), hostsToScan.end(), rand.urbg());
     triedHosts = waitingFor;
 }
-}
+}  // namespace mongo

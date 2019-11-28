@@ -29,6 +29,8 @@
 
 #pragma once
 
+#include <third_party/murmurhash3/MurmurHash3.h>
+
 #include <deque>
 #include <fstream>
 #include <memory>
@@ -260,13 +262,17 @@ private:
     std::ofstream _file;
     BufBuilder _buffer;
 
+    // Keeps track of the hash of all data objects spilled to disk. Passed to the FileIterator
+    // to ensure data has not been corrupted after reading from disk.
+    uint32_t _checksum = 0;
+
     // Tracks where in the file we started and finished writing the sorted data range so that the
     // information can be given to the Iterator in done(), and to the user via getFileEndOffset()
     // for the next SortedFileWriter instance using the same file.
     std::streampos _fileStartOffset;
     std::streampos _fileEndOffset;
 };
-}
+}  // namespace mongo
 
 /**
  * #include "mongo/db/sorter/sorter.cpp" and call this in a single translation

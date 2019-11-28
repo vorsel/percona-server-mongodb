@@ -97,7 +97,7 @@ BSONObj RouterStagePipeline::_validateAndConvertToBSON(const Document& event) {
     }
     // Confirm that the document _id field matches the original resume token in the sort key field.
     auto eventBSON = event.toBson();
-    auto resumeToken = event.getSortKeyMetaField();
+    auto resumeToken = event.metadata().getSortKey();
     auto idField = eventBSON.getObjectField("_id");
     invariant(!resumeToken.isEmpty());
     uassert(ErrorCodes::ChangeStreamFatalError,
@@ -106,8 +106,7 @@ BSONObj RouterStagePipeline::_validateAndConvertToBSON(const Document& event) {
                              "event makes it impossible to resume the stream from that point. Only "
                              "transformations that retain the unmodified _id field are allowed. "
                              "Expected: "
-                          << BSON("_id" << resumeToken)
-                          << " but found: "
+                          << BSON("_id" << resumeToken) << " but found: "
                           << (eventBSON["_id"] ? BSON("_id" << eventBSON["_id"]) : BSONObj()),
             idField.binaryEqual(resumeToken));
 

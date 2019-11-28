@@ -89,13 +89,14 @@ void IndexBuildsCoordinatorMongod::shutdown() {
 
 StatusWith<SharedSemiFuture<ReplIndexBuildState::IndexCatalogStats>>
 IndexBuildsCoordinatorMongod::startIndexBuild(OperationContext* opCtx,
+                                              StringData dbName,
                                               CollectionUUID collectionUUID,
                                               const std::vector<BSONObj>& specs,
                                               const UUID& buildUUID,
                                               IndexBuildProtocol protocol,
                                               IndexBuildOptions indexBuildOptions) {
     auto statusWithOptionalResult = _registerAndSetUpIndexBuild(
-        opCtx, collectionUUID, specs, buildUUID, protocol, indexBuildOptions.commitQuorum);
+        opCtx, dbName, collectionUUID, specs, buildUUID, protocol, indexBuildOptions.commitQuorum);
     if (!statusWithOptionalResult.isOK()) {
         return statusWithOptionalResult.getStatus();
     }
@@ -236,8 +237,7 @@ Status IndexBuildsCoordinatorMongod::setCommitQuorum(OperationContext* opCtx,
         return Status(ErrorCodes::IndexNotFound,
                       str::stream()
                           << "Cannot set a new commit quorum on an index build in collection '"
-                          << nss
-                          << "' without providing any indexes.");
+                          << nss << "' without providing any indexes.");
     }
 
     AutoGetCollectionForRead autoColl(opCtx, nss);
@@ -271,10 +271,9 @@ Status IndexBuildsCoordinatorMongod::setCommitQuorum(OperationContext* opCtx,
         buildState->indexNames.begin(), buildState->indexNames.end(), indexNames.begin());
     if (buildState->indexNames.size() != indexNames.size() || !equal) {
         return Status(ErrorCodes::IndexNotFound,
-                      str::stream() << "Provided indexes are not all being "
-                                    << "built by the same index builder in collection '"
-                                    << nss
-                                    << "'.");
+                      str::stream()
+                          << "Provided indexes are not all being "
+                          << "built by the same index builder in collection '" << nss << "'.");
     }
 
     // See if the new commit quorum is satisfiable.

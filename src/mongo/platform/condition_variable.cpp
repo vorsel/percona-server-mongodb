@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2019-present MongoDB, Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
  *    This program is free software: you can redistribute it and/or modify
  *    it under the terms of the Server Side Public License, version 1,
@@ -27,10 +27,18 @@
  *    it in the license file.
  */
 
-#pragma once
+#include "mongo/platform/condition_variable.h"
 
-// Terrible hack to work around clang-format being out of date.
-// TODO sed this away and delete this file when we upgrade clang-format.
-#define IF_CONSTEXPR \
-    if               \
-    constexpr
+namespace mongo {
+void ConditionVariable::wait(lock_t& lock) {
+    _condvar.wait(lock);
+}
+
+void ConditionVariable::notify_one() noexcept {
+    _condvar.notify_one();
+}
+
+void ConditionVariable::notify_all() noexcept {
+    _condvar.notify_all();
+}
+}  // namespace mongo

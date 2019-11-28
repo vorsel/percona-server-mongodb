@@ -154,17 +154,13 @@ StatusWith<ChunkRange> includeFullShardKey(OperationContext* opCtx,
     if (!range.getMin().isFieldNamePrefixOf(shardKeyBSON)) {
         return {ErrorCodes::ShardKeyNotFound,
                 str::stream() << "min: " << range.getMin() << " is not a prefix of the shard key "
-                              << shardKeyBSON
-                              << " of ns: "
-                              << nss.ns()};
+                              << shardKeyBSON << " of ns: " << nss.ns()};
     }
 
     if (!range.getMax().isFieldNamePrefixOf(shardKeyBSON)) {
         return {ErrorCodes::ShardKeyNotFound,
                 str::stream() << "max: " << range.getMax() << " is not a prefix of the shard key "
-                              << shardKeyBSON
-                              << " of ns: "
-                              << nss.ns()};
+                              << shardKeyBSON << " of ns: " << nss.ns()};
     }
 
     return ChunkRange(shardKeyPattern.extendRangeBound(range.getMin(), false),
@@ -373,12 +369,9 @@ Status ShardingCatalogManager::assignKeyRangeToZone(OperationContext* opCtx,
         return overlapStatus;
     }
 
-    BSONObj updateQuery(
-        BSON("_id" << BSON(TagsType::ns(nss.ns()) << TagsType::min(fullShardKeyRange.getMin()))));
+    BSONObj updateQuery(BSON(TagsType::ns(nss.ns()) << TagsType::min(fullShardKeyRange.getMin())));
 
     BSONObjBuilder updateBuilder;
-    updateBuilder.append("_id",
-                         BSON(TagsType::ns(nss.ns()) << TagsType::min(fullShardKeyRange.getMin())));
     updateBuilder.append(TagsType::ns(), nss.ns());
     updateBuilder.append(TagsType::min(), fullShardKeyRange.getMin());
     updateBuilder.append(TagsType::max(), fullShardKeyRange.getMax());
@@ -411,7 +404,8 @@ Status ShardingCatalogManager::removeKeyRangeFromZone(OperationContext* opCtx,
     }
 
     BSONObjBuilder removeBuilder;
-    removeBuilder.append("_id", BSON(TagsType::ns(nss.ns()) << TagsType::min(range.getMin())));
+    removeBuilder.append(TagsType::ns(), nss.ns());
+    removeBuilder.append(TagsType::min(), range.getMin());
     removeBuilder.append(TagsType::max(), range.getMax());
 
     return Grid::get(opCtx)->catalogClient()->removeConfigDocuments(

@@ -361,4 +361,4 @@ typedef std::unique_ptr<WiredTigerSession,
     UniqueWiredTigerSession;
 
 extern const std::string kWTRepairMsg;
-}  // namespace
+}  // namespace mongo

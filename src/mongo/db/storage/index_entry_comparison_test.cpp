@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2018-present MongoDB, Inc.
+ *    Copyright (C) 2019-present MongoDB, Inc.
  *
  *    This program is free software: you can redistribute it and/or modify
  *    it under the terms of the Server Side Public License, version 1,
@@ -27,27 +27,38 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#include "mongo/platform/basic.h"
 
-#include "mongo/db/exec/working_set_computed_data.h"
-
-#include "mongo/util/log.h"
+#include "mongo/db/storage/duplicate_key_error_info.h"
+#include "mongo/db/storage/index_entry_comparison.h"
+#include "mongo/unittest/unittest.h"
 
 namespace mongo {
 
-BSONObj IndexKeyComputedData::rehydrateKey(const BSONObj& keyPattern,
-                                           const BSONObj& dehydratedKey) {
-    BSONObjBuilder bob;
-    BSONObjIterator keyIter(keyPattern);
-    BSONObjIterator valueIter(dehydratedKey);
+TEST(IndexEntryComparison, BuildDupKeyErrorStatusProducesExpectedErrorObject) {
+    NamespaceString collNss("test.foo");
+    std::string indexName("a_1_b_1");
+    auto keyPattern = BSON("a" << 1 << "b" << 1);
+    auto keyValue = BSON("" << 10 << ""
+                            << "abc");
 
-    while (keyIter.more() && valueIter.more()) {
-        bob.appendAs(valueIter.next(), keyIter.next().fieldNameStringData());
-    }
+    auto dupKeyStatus = buildDupKeyErrorStatus(keyValue, collNss, indexName, keyPattern);
+    ASSERT_NOT_OK(dupKeyStatus);
+    ASSERT_EQUALS(dupKeyStatus.code(), ErrorCodes::DuplicateKey);
 
-    invariant(!keyIter.more());
-    invariant(!valueIter.more());
+    auto extraInfo = dupKeyStatus.extraInfo<DuplicateKeyErrorInfo>();
+    ASSERT(extraInfo);
 
-    return bob.obj();
+    ASSERT_BSONOBJ_EQ(extraInfo->getKeyPattern(), keyPattern);
+
+    auto keyValueWithFieldName = BSON("a" << 10 << "b"
+                                          << "abc");
+    ASSERT_BSONOBJ_EQ(extraInfo->getDuplicatedKeyValue(), keyValueWithFieldName);
+
+    BSONObjBuilder objBuilder;
+    extraInfo->serialize(&objBuilder);
+    ASSERT_BSONOBJ_EQ(objBuilder.obj(),
+                      BSON("keyPattern" << keyPattern << "keyValue" << keyValueWithFieldName));
 }
+
 }  // namespace mongo

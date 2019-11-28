@@ -306,6 +306,7 @@ void addDbOwnerPrivileges(PrivilegeVector* privileges, StringData dbName) {
 void addEnableShardingPrivileges(PrivilegeVector* privileges) {
     ActionSet enableShardingActions;
     enableShardingActions.addAction(ActionType::enableSharding);
+    enableShardingActions.addAction(ActionType::refineCollectionShardKey);
     Privilege::addPrivilegeToPrivilegeVector(
         privileges, Privilege(ResourcePattern::forAnyNormalResource(), enableShardingActions));
 }

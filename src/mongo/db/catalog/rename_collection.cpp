@@ -148,15 +148,8 @@ Status renameTargetCollectionToTmp(OperationContext* opCtx,
     if (!tmpNameResult.isOK()) {
         return tmpNameResult.getStatus().withContext(
             str::stream() << "Cannot generate a temporary collection name for the target "
-                          << targetNs
-                          << " ("
-                          << targetUUID
-                          << ") so that the source"
-                          << sourceNs
-                          << " ("
-                          << sourceUUID
-                          << ") could be renamed to "
-                          << targetNs);
+                          << targetNs << " (" << targetUUID << ") so that the source" << sourceNs
+                          << " (" << sourceUUID << ") could be renamed to " << targetNs);
     }
     const auto& tmpName = tmpNameResult.getValue();
     const bool stayTemp = true;
@@ -290,9 +283,10 @@ Status renameCollectionWithinDB(OperationContext* opCtx,
     boost::optional<Lock::CollectionLock> targetLock;
     // To prevent deadlock, always lock system.views collection in the end because concurrent
     // view-related operations always lock system.views in the end.
-    if (!source.isSystemDotViews() && (target.isSystemDotViews() ||
-                                       ResourceId(RESOURCE_COLLECTION, source.ns()) <
-                                           ResourceId(RESOURCE_COLLECTION, target.ns()))) {
+    if (!source.isSystemDotViews() &&
+        (target.isSystemDotViews() ||
+         ResourceId(RESOURCE_COLLECTION, source.ns()) <
+             ResourceId(RESOURCE_COLLECTION, target.ns()))) {
         // To prevent deadlock, always lock source and target in ascending resourceId order.
         sourceLock.emplace(opCtx, source, MODE_X);
         targetLock.emplace(opCtx, target, MODE_X);
@@ -498,8 +492,7 @@ Status renameBetweenDBs(OperationContext* opCtx,
     if (!tmpNameResult.isOK()) {
         return tmpNameResult.getStatus().withContext(
             str::stream() << "Cannot generate temporary collection name to rename " << source
-                          << " to "
-                          << target);
+                          << " to " << target);
     }
     const auto& tmpName = tmpNameResult.getValue();
 
@@ -543,34 +536,21 @@ Status renameBetweenDBs(OperationContext* opCtx,
         }
     });
 
-    // Copy the index descriptions from the source collection, adjusting the ns field.
+    // Copy the index descriptions from the source collection.
     {
         std::vector<BSONObj> indexesToCopy;
         std::unique_ptr<IndexCatalog::IndexIterator> sourceIndIt =
             sourceColl->getIndexCatalog()->getIndexIterator(opCtx, true);
         while (sourceIndIt->more()) {
             auto descriptor = sourceIndIt->next()->descriptor();
-            if (descriptor->isIdIndex()) {
-                continue;
+            if (!descriptor->isIdIndex()) {
+                indexesToCopy.push_back(descriptor->infoObj());
             }
-
-            const BSONObj currIndex = descriptor->infoObj();
-
-            // Process the source index, adding fields in the same order as they were originally.
-            BSONObjBuilder newIndex;
-            for (auto&& elem : currIndex) {
-                if (elem.fieldNameStringData() == "ns") {
-                    newIndex.append("ns", tmpName.ns());
-                } else {
-                    newIndex.append(elem);
-                }
-            }
-            indexesToCopy.push_back(newIndex.obj());
         }
 
-        // Create indexes using the namespace-adjusted index specs on the empty temporary collection
-        // that was just created. Since each index build is possibly replicated to downstream nodes,
-        // each createIndex oplog entry must have a distinct timestamp to support correct rollback
+        // Create indexes using the index specs on the empty temporary collection that was just
+        // created. Since each index build is possibly replicated to downstream nodes, each
+        // createIndex oplog entry must have a distinct timestamp to support correct rollback
         // operation. This is achieved by writing the createIndexes oplog entry *before* creating
         // the index. Using IndexCatalog::createIndexOnEmptyCollection() for the index creation
         // allows us to add and commit the index within a single WriteUnitOfWork and avoids the
@@ -586,7 +566,7 @@ Status renameBetweenDBs(OperationContext* opCtx,
                                           tmpColl->uuid(),
                                           indexToCopy,
                                           false  // fromMigrate
-                                          );
+                );
                 auto indexResult =
                     tmpIndexCatalog->createIndexOnEmptyCollection(opCtx, indexToCopy);
                 if (!indexResult.isOK()) {
@@ -647,7 +627,7 @@ Status renameBetweenDBs(OperationContext* opCtx,
                 }
                 cursor->save();
                 // When this exits via success or WCE, we need to restore the cursor.
-                ON_BLOCK_EXIT([ opCtx, ns = tmpName.ns(), &cursor ]() {
+                ON_BLOCK_EXIT([opCtx, ns = tmpName.ns(), &cursor]() {
                     writeConflictRetry(
                         opCtx, "retryRestoreCursor", ns, [&cursor] { cursor->restore(); });
                 });
@@ -682,6 +662,53 @@ Status renameBetweenDBs(OperationContext* opCtx,
 }
 
 }  // namespace
+void validateAndRunRenameCollection(OperationContext* opCtx,
+                                    const NamespaceString& source,
+                                    const NamespaceString& target,
+                                    bool dropTarget,
+                                    bool stayTemp) {
+    uassert(ErrorCodes::InvalidNamespace,
+            str::stream() << "Invalid source namespace: " << source.ns(),
+            source.isValid());
+    uassert(ErrorCodes::InvalidNamespace,
+            str::stream() << "Invalid target namespace: " << target.ns(),
+            target.isValid());
+
+    if ((repl::ReplicationCoordinator::get(opCtx)->getReplicationMode() !=
+         repl::ReplicationCoordinator::modeNone)) {
+        uassert(ErrorCodes::IllegalOperation,
+                "can't rename live oplog while replicating",
+                !source.isOplog());
+        uassert(ErrorCodes::IllegalOperation,
+                "can't rename to live oplog while replicating",
+                !target.isOplog());
+    }
+
+    uassert(ErrorCodes::IllegalOperation,
+            "If either the source or target of a rename is an oplog name, both must be",
+            source.isOplog() == target.isOplog());
+
+    Status sourceStatus = userAllowedWriteNS(source);
+    uassert(ErrorCodes::IllegalOperation,
+            "error with source namespace: " + sourceStatus.reason(),
+            sourceStatus.isOK());
+    Status targetStatus = userAllowedWriteNS(target);
+    uassert(ErrorCodes::IllegalOperation,
+            "error with target namespace: " + targetStatus.reason(),
+            targetStatus.isOK());
+
+    if (source.isServerConfigurationCollection()) {
+        uasserted(ErrorCodes::IllegalOperation,
+                  "renaming the server configuration "
+                  "collection (admin.system.version) is not "
+                  "allowed");
+    }
+
+    RenameCollectionOptions options;
+    options.dropTarget = dropTarget;
+    options.stayTemp = stayTemp;
+    uassertStatusOK(renameCollection(opCtx, source, target, options));
+}
 
 Status renameCollection(OperationContext* opCtx,
                         const NamespaceString& source,
@@ -707,7 +734,7 @@ Status renameCollection(OperationContext* opCtx,
 
 Status renameCollectionForApplyOps(OperationContext* opCtx,
                                    const std::string& dbName,
-                                   const BSONElement& ui,
+                                   const OptionalCollectionUUID& uuidToRename,
                                    const BSONObj& cmd,
                                    const repl::OpTime& renameOpTime) {
 
@@ -729,9 +756,7 @@ Status renameCollectionForApplyOps(OperationContext* opCtx,
 
     NamespaceString sourceNss(sourceNsElt.valueStringData());
     NamespaceString targetNss(targetNsElt.valueStringData());
-    OptionalCollectionUUID uuidToRename;
-    if (!ui.eoo()) {
-        uuidToRename = uassertStatusOK(UUID::parse(ui));
+    if (uuidToRename) {
         auto nss = CollectionCatalog::get(opCtx).lookupNSSByUUID(uuidToRename.get());
         if (nss)
             sourceNss = *nss;
@@ -814,9 +839,7 @@ Status renameCollectionForRollback(OperationContext* opCtx,
     invariant(source->db() == target.db(),
               str::stream() << "renameCollectionForRollback: source and target namespaces must "
                                "have the same database. source: "
-                            << *source
-                            << ". target: "
-                            << target);
+                            << *source << ". target: " << target);
 
     log() << "renameCollectionForRollback: rename " << *source << " (" << uuid << ") to " << target
           << ".";

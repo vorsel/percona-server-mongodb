@@ -49,9 +49,9 @@
 
 namespace mongo {
 
-using std::unique_ptr;
 using std::endl;
 using std::string;
+using std::unique_ptr;
 
 namespace {
 
@@ -198,7 +198,7 @@ void profile(OperationContext* opCtx, NetworkOp op) {
             }
         }
     } catch (const AssertionException& assertionEx) {
-        if (acquireDbXLock && assertionEx.isA<ErrorCategory::Interruption>()) {
+        if (acquireDbXLock && ErrorCodes::isInterruption(assertionEx)) {
             warning()
                 << "Interrupted while attempting to create profile collection in database "
                 << dbName << " to profile operation " << networkOpToString(op) << " against "

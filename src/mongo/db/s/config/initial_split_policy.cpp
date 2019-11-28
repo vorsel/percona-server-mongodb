@@ -58,6 +58,7 @@ void appendChunk(const NamespaceString& nss,
                  std::vector<ChunkType>* chunks) {
     chunks->emplace_back(nss, ChunkRange(min, max), *version, shardId);
     auto& chunk = chunks->back();
+    chunk.setName(OID::gen());  // TODO SERVER-42299: Remove this line.
     chunk.setHistory({ChunkHistory(validAfter, shardId)});
     version->incMinor();
 }
@@ -222,7 +223,7 @@ InitialSplitPolicy::generateShardCollectionInitialZonedChunks(
 
     const auto& keyPattern = shardKeyPattern.getKeyPattern();
 
-    auto nextShardIdForHole = [&, indx = 0 ]() mutable {
+    auto nextShardIdForHole = [&, indx = 0]() mutable {
         return shardIdsForGaps[indx++ % shardIdsForGaps.size()];
     };
 
@@ -249,10 +250,7 @@ InitialSplitPolicy::generateShardCollectionInitialZonedChunks(
         const auto& shardIdsForChunk = it->second;
         uassert(50973,
                 str::stream()
-                    << "Cannot shard collection "
-                    << nss.ns()
-                    << " due to zone "
-                    << tag.getTag()
+                    << "Cannot shard collection " << nss.ns() << " due to zone " << tag.getTag()
                     << " which is not assigned to a shard. Please assign this zone to a shard.",
                 !shardIdsForChunk.empty());
 
@@ -395,7 +393,7 @@ InitialSplitPolicy::ShardCollectionConfig InitialSplitPolicy::createFirstChunksU
                                                 shardSelectedSplitPoints,
                                                 shardIds,
                                                 1  // numContiguousChunksPerShard
-                                                );
+    );
 }
 
 boost::optional<CollectionType> InitialSplitPolicy::checkIfCollectionAlreadyShardedWithSameOptions(
@@ -420,12 +418,18 @@ boost::optional<CollectionType> InitialSplitPolicy::checkIfCollectionAlreadyShar
     requestedOptions.setDefaultCollation(*request.getCollation());
     requestedOptions.setUnique(request.getUnique());
 
+    // Set the distributionMode to "sharded" because this CollectionType represents the requested
+    // target state for the collection after shardCollection. The requested CollectionType will be
+    // compared with the existing CollectionType below, and if the existing CollectionType either
+    // does not have a distributionMode (FCV 4.2) or has distributionMode "sharded" (FCV 4.4), the
+    // collection will be considered to already be in its target state.
+    requestedOptions.setDistributionMode(CollectionType::DistributionMode::kSharded);
+
     // If the collection is already sharded, fail if the deduced options in this request do not
     // match the options the collection was originally sharded with.
     uassert(ErrorCodes::AlreadyInitialized,
             str::stream() << "sharding already enabled for collection " << nss.ns()
-                          << " with options "
-                          << existingOptions.toString(),
+                          << " with options " << existingOptions.toString(),
             requestedOptions.hasSameOptions(existingOptions));
 
     return existingOptions;

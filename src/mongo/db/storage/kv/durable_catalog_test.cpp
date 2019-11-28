@@ -108,10 +108,9 @@ public:
         std::string indexName = "idx" + std::to_string(numIndexesCreated);
 
         auto collection = std::make_unique<CollectionMock>(_nss);
-        IndexDescriptor desc(
-            collection.get(),
-            indexType,
-            BSON("v" << 1 << "key" << keyPattern << "name" << indexName << "ns" << _nss.ns()));
+        IndexDescriptor desc(collection.get(),
+                             indexType,
+                             BSON("v" << 1 << "key" << keyPattern << "name" << indexName));
 
         {
             WriteUnitOfWork wuow(opCtx.get());
@@ -129,8 +128,7 @@ public:
         bool match = (expected == actual);
         if (!match) {
             FAIL(str::stream() << "Expected: " << dumpMultikeyPaths(expected) << ", "
-                               << "Actual: "
-                               << dumpMultikeyPaths(actual));
+                               << "Actual: " << dumpMultikeyPaths(actual));
         }
         ASSERT(match);
     }

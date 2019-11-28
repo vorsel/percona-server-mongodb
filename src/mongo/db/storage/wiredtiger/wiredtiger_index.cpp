@@ -144,8 +144,7 @@ StatusWith<std::string> WiredTigerIndex::parseIndexOptions(const BSONObj& option
             // Return error on first unrecognized field.
             return StatusWith<std::string>(ErrorCodes::InvalidOptions,
                                            str::stream() << '\'' << elem.fieldNameStringData()
-                                                         << '\''
-                                                         << " is not a supported option.");
+                                                         << '\'' << " is not a supported option.");
         }
     }
     return StatusWith<std::string>(ss.str());
@@ -337,10 +336,10 @@ void WiredTigerIndex::fullValidate(OperationContext* opCtx,
             warning() << msg;
             fullResults->warnings.push_back(msg);
         } else if (err) {
-            std::string msg = str::stream() << "verify() returned " << wiredtiger_strerror(err)
-                                            << ". "
-                                            << "This indicates structural damage. "
-                                            << "Not examining individual index entries.";
+            std::string msg = str::stream()
+                << "verify() returned " << wiredtiger_strerror(err) << ". "
+                << "This indicates structural damage. "
+                << "Not examining individual index entries.";
             error() << msg;
             fullResults->errors.push_back(msg);
             fullResults->valid = false;
@@ -538,12 +537,11 @@ KeyString::Version WiredTigerIndex::_handleVersionInfo(OperationContext* ctx,
         ctx, uri, kMinimumIndexVersion, kMaximumIndexVersion);
     if (!version.isOK()) {
         Status versionStatus = version.getStatus();
-        Status indexVersionStatus(
-            ErrorCodes::UnsupportedFormat,
-            str::stream() << versionStatus.reason() << " Index: {name: " << desc->indexName()
-                          << ", ns: "
-                          << desc->parentNS()
-                          << "} - version either too old or too new for this mongod.");
+        Status indexVersionStatus(ErrorCodes::UnsupportedFormat,
+                                  str::stream()
+                                      << versionStatus.reason() << " Index: {name: "
+                                      << desc->indexName() << ", ns: " << desc->parentNS()
+                                      << "} - version either too old or too new for this mongod.");
         fassertFailedWithStatusNoTrace(28579, indexVersionStatus);
     }
     _dataFormatVersion = version.getValue();
@@ -553,14 +551,13 @@ KeyString::Version WiredTigerIndex::_handleVersionInfo(OperationContext* ctx,
                 _dataFormatVersion == kDataFormatV4KeyStringV1UniqueIndexVersionV2
             ? Status::OK()
             : Status(ErrorCodes::UnsupportedFormat,
-                     str::stream() << "Index: {name: " << desc->indexName() << ", ns: "
-                                   << desc->parentNS()
-                                   << "} has incompatible format version: "
-                                   << _dataFormatVersion
-                                   << ". MongoDB 4.2 onwards, WT secondary unique indexes use "
-                                      "either format version 11 or 12. See "
-                                      "https://dochub.mongodb.org/core/upgrade-4.2-procedures for "
-                                      "detailed instructions on upgrading the index format.");
+                     str::stream()
+                         << "Index: {name: " << desc->indexName() << ", ns: " << desc->parentNS()
+                         << "} has incompatible format version: " << _dataFormatVersion
+                         << ". MongoDB 4.2 onwards, WT secondary unique indexes use "
+                            "either format version 11 or 12. See "
+                            "https://dochub.mongodb.org/core/upgrade-4.2-procedures for "
+                            "detailed instructions on upgrading the index format.");
         fassertNoTrace(31179, versionStatus);
     }
 
@@ -878,8 +875,9 @@ public:
 
         // NOTE: this uses the opposite rules as a normal seek because a forward scan should
         // end after the key if inclusive and before if exclusive.
-        const auto discriminator = _forward == inclusive ? KeyString::Builder::kExclusiveAfter
-                                                         : KeyString::Builder::kExclusiveBefore;
+        const auto discriminator = _forward == inclusive
+            ? KeyString::Discriminator::kExclusiveAfter
+            : KeyString::Discriminator::kExclusiveBefore;
         _endPosition = std::make_unique<KeyString::Builder>(_idx.getKeyStringVersion());
         _endPosition->resetToKey(stripFieldNames(key), _idx.getOrdering(), discriminator);
     }
@@ -889,8 +887,9 @@ public:
                                         RequestedInfo parts) override {
         dassert(_opCtx->lockState()->isReadLocked());
         const BSONObj finalKey = stripFieldNames(key);
-        const auto discriminator = _forward == inclusive ? KeyString::Builder::kExclusiveBefore
-                                                         : KeyString::Builder::kExclusiveAfter;
+        const auto discriminator = _forward == inclusive
+            ? KeyString::Discriminator::kExclusiveBefore
+            : KeyString::Discriminator::kExclusiveAfter;
 
         // By using a discriminator other than kInclusive, there is no need to distinguish
         // unique vs non-unique key formats since both start with the key.
@@ -907,8 +906,8 @@ public:
         BSONObj key = IndexEntryComparison::makeQueryObject(seekPoint, _forward);
 
         // makeQueryObject handles the discriminator in the real exclusive cases.
-        const auto discriminator =
-            _forward ? KeyString::Builder::kExclusiveBefore : KeyString::Builder::kExclusiveAfter;
+        const auto discriminator = _forward ? KeyString::Discriminator::kExclusiveBefore
+                                            : KeyString::Discriminator::kExclusiveAfter;
         _query.resetToKey(key, _idx.getOrdering(), discriminator);
         seekWTCursor(_query);
         updatePosition();

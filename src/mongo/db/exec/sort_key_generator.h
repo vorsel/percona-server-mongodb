@@ -45,7 +45,7 @@ class WorkingSetMember;
 
 /**
  * Passes results from the child through after adding the sort key for each result as
- * WorkingSetMember computed data.
+ * WorkingSetMember metadata.
  */
 class SortKeyGeneratorStage final : public PlanStage {
 public:
@@ -71,16 +71,9 @@ protected:
     StageState doWork(WorkingSetID* out) final;
 
 private:
-    StatusWith<BSONObj> getSortKeyFromIndexKey(const WorkingSetMember& member) const;
-
     WorkingSet* const _ws;
 
-    // The raw sort pattern as expressed by the user.
-    const BSONObj _sortSpec;
-
-    const CollatorInterface* _collator;
-
-    std::unique_ptr<SortKeyGenerator> _sortKeyGen;
+    SortKeyGenerator _sortKeyGen;
 };
 
 }  // namespace mongo

@@ -80,9 +80,6 @@ env.Library(
         '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/db/storage/kv/kv_prefix',
         ],
-    LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/db/catalog/disable_index_spec_namespace_generation',
-        ],
     )
 
 env.Library(
@@ -384,6 +381,7 @@ env.CppUnitTest(
     target='db_storage_test',
     source=[
         'flow_control_test.cpp',
+        'index_entry_comparison_test.cpp',
         'key_string_test.cpp',
         'storage_engine_lock_file_test.cpp',
         'storage_engine_metadata_test.cpp',
@@ -425,9 +423,6 @@ env.Library(
         '$BUILD_DIR/mongo/db/storage/kv/kv_drop_pending_ident_reaper',
         '$BUILD_DIR/mongo/db/storage/kv/kv_prefix',
         '$BUILD_DIR/mongo/db/catalog/collection_catalog',
-    ],
-    LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/db/catalog/disable_index_spec_namespace_generation',
     ]
 )
 

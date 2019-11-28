@@ -45,7 +45,6 @@
 #include "mongo/util/assert_util.h"
 #include "mongo/util/debug_util.h"
 #include "mongo/util/functional.h"
-#include "mongo/util/if_constexpr.h"
 #include "mongo/util/interruptible.h"
 #include "mongo/util/intrusive_counter.h"
 #include "mongo/util/scopeguard.h"
@@ -256,18 +255,16 @@ inline auto statusCall(Func&& func, Args&&... args) noexcept {
     using RawResult = decltype(call(func, std::forward<Args>(args)...));
     using Result = StatusWith<VoidToFakeVoid<UnstatusType<RawResult>>>;
     try {
-        IF_CONSTEXPR(std::is_void_v<RawResult>) {
+        if constexpr (std::is_void_v<RawResult>) {
             call(func, std::forward<Args>(args)...);
             return Result(FakeVoid());
-        }
-        else IF_CONSTEXPR(std::is_same_v<RawResult, Status>) {
+        } else if constexpr (std::is_same_v<RawResult, Status>) {
             auto s = call(func, std::forward<Args>(args)...);
             if (!s.isOK()) {
                 return Result(std::move(s));
             }
             return Result(FakeVoid());
-        }
-        else {
+        } else {
             return Result(call(func, std::forward<Args>(args)...));
         }
     } catch (const DBException& ex) {
@@ -285,18 +282,15 @@ inline auto statusCall(Func&& func, Args&&... args) noexcept {
 template <typename Func, typename... Args>
 inline auto throwingCall(Func&& func, Args&&... args) {
     using Result = decltype(call(func, std::forward<Args>(args)...));
-    IF_CONSTEXPR(std::is_void_v<Result>) {
+    if constexpr (std::is_void_v<Result>) {
         call(func, std::forward<Args>(args)...);
         return FakeVoid{};
-    }
-    else IF_CONSTEXPR(std::is_same_v<Result, Status>) {
+    } else if constexpr (std::is_same_v<Result, Status>) {
         uassertStatusOK(call(func, std::forward<Args>(args)...));
         return FakeVoid{};
-    }
-    else IF_CONSTEXPR(isStatusWith<Result>) {
+    } else if constexpr (isStatusWith<Result>) {
         return uassertStatusOK(call(func, std::forward<Args>(args)...));
-    }
-    else {
+    } else {
         return call(func, std::forward<Args>(args)...);
     }
 }
@@ -519,23 +513,29 @@ struct SharedStateImpl final : SharedStateBase {
         }
 
         auto lk = stdx::unique_lock(mx);
+
         auto oldState = state.load(std::memory_order_acquire);
+        if (oldState == SSBState::kInit) {
+            // On the success path, our reads and writes to children are protected by the mutex
+            //
+            // On the failure path, we raced with transitionToFinished() and lost, so we need to
+            // synchronize with it via acquire before accessing the results since it wouldn't have
+            // taken the mutex.
+            state.compare_exchange_strong(oldState,
+                                          SSBState::kWaitingOrHaveChildren,
+                                          std::memory_order_relaxed,
+                                          std::memory_order_acquire);
+        }
         if (oldState == SSBState::kFinished) {
             lk.unlock();
             out->fillFromConst(*this);
             return out;
         }
-
-        if (oldState == SSBState::kInit) {
-            // memory ordering can be relaxed because that will be handled by the mutex.
-            state.compare_exchange_strong(
-                oldState, SSBState::kWaitingOrHaveChildren, std::memory_order_relaxed);
-        }
         dassert(oldState != SSBState::kHaveCallback);
 
-        // If oldState became kFinished after we checked (and therefore after we acquired the lock),
-        // the returned continuation will be completed by the promise side once it acquires the lock
-        // since we are adding ourself to the chain here.
+        // If oldState became kFinished after we checked (or successfully stored
+        // kWaitingOrHaveChildren), the returned continuation will be completed by the promise side
+        // once it acquires the lock since we are adding ourself to the chain here.
 
         children.emplace_front(out.get(), /*add ref*/ false);
         out->threadUnsafeIncRefCountTo(2);
@@ -586,12 +586,11 @@ struct SharedStateImpl final : SharedStateBase {
     }
 
     void fillChildren(const Children& children) const override {
-        IF_CONSTEXPR(std::is_copy_constructible_v<T>) {  // T has been through VoidToFakeVoid.
+        if constexpr (std::is_copy_constructible_v<T>) {  // T has been through VoidToFakeVoid.
             for (auto&& child : children) {
                 checked_cast<SharedState<T>*>(child.get())->fillFromConst(*this);
             }
-        }
-        else {
+        } else {
             invariant(false, "should never call fillChildren with non-copyable T");
         }
     }
@@ -867,7 +866,7 @@ public:
     template <typename Func>
         auto then(Func&& func) && noexcept {
         using Result = NormalizedCallResult<Func, T>;
-        IF_CONSTEXPR(!isFutureLike<Result>) {
+        if constexpr (!isFutureLike<Result>) {
             return generalImpl(
                 // on ready success:
                 [&](T&& val) {
@@ -885,8 +884,7 @@ public:
                         output->setFromStatusWith(statusCall(func, std::move(*input->data)));
                     });
                 });
-        }
-        else {
+        } else {
             using UnwrappedResult = typename Result::value_type;
             return generalImpl(
                 // on ready success:
@@ -923,7 +921,7 @@ public:
         auto onCompletion(Func&& func) && noexcept {
         using Wrapper = StatusOrStatusWith<T>;
         using Result = NormalizedCallResult<Func, StatusOrStatusWith<T>>;
-        IF_CONSTEXPR(!isFutureLike<Result>) {
+        if constexpr (!isFutureLike<Result>) {
             return generalImpl(
                 // on ready success:
                 [&](T&& val) {
@@ -947,8 +945,7 @@ public:
                             statusCall(func, Wrapper(std::move(*input->data))));
                     });
                 });
-        }
-        else {
+        } else {
             using UnwrappedResult = typename Result::value_type;
             return generalImpl(
                 // on ready success:
@@ -1003,7 +1000,7 @@ public:
             std::is_same<VoidToFakeVoid<UnwrappedType<Result>>, T>::value,
             "func passed to Future<T>::onError must return T, StatusWith<T>, or Future<T>");
 
-        IF_CONSTEXPR(!isFutureLike<Result>) {
+        if constexpr (!isFutureLike<Result>) {
             return generalImpl(
                 // on ready success:
                 [&](T&& val) { return FutureImpl<T>::makeReady(std::move(val)); },
@@ -1021,8 +1018,7 @@ public:
                         output->setFromStatusWith(statusCall(func, std::move(input->status)));
                     });
                 });
-        }
-        else {
+        } else {
             return generalImpl(
                 // on ready success:
                 [&](T&& val) { return FutureImpl<T>::makeReady(std::move(val)); },
@@ -1063,8 +1059,7 @@ public:
 
         // TODO in C++17 with constexpr if this can be done cleaner and more efficiently by not
         // throwing.
-        return std::move(*this).onError([func =
-                                             std::forward<Func>(func)](Status && status) mutable {
+        return std::move(*this).onError([func = std::forward<Func>(func)](Status&& status) mutable {
             if (status != code)
                 uassertStatusOK(status);
             return throwingCall(func, std::move(status));
@@ -1081,9 +1076,8 @@ public:
         if (_immediate || (isReady() && _shared->status.isOK()))
             return std::move(*this);
 
-        return std::move(*this).onError([func =
-                                             std::forward<Func>(func)](Status && status) mutable {
-            if (!ErrorCodes::isA<category>(status.code()))
+        return std::move(*this).onError([func = std::forward<Func>(func)](Status&& status) mutable {
+            if (!ErrorCodes::isA<category>(status))
                 uassertStatusOK(status);
             return throwingCall(func, std::move(status));
         });
@@ -1104,9 +1098,8 @@ public:
         static_assert(std::is_void<decltype(call(func, std::declval<const Status&>()))>::value,
                       "func passed to tapError must return void");
 
-        return tapImpl(std::forward<Func>(func),
-                       [](Func && func, const T& val) noexcept {},
-                       [](Func && func, const Status& status) noexcept { call(func, status); });
+        return tapImpl(std::forward<Func>(func), [](Func && func, const T& val) noexcept {}, [
+        ](Func && func, const Status& status) noexcept { call(func, status); });
     }
 
     template <typename Func>

@@ -55,10 +55,10 @@ using namespace mongo::repl;
 
 namespace ReplTests {
 
-using std::unique_ptr;
 using std::endl;
 using std::string;
 using std::stringstream;
+using std::unique_ptr;
 using std::vector;
 
 /**
@@ -249,8 +249,9 @@ protected:
                     mongo::unittest::log() << "op: " << *i << endl;
                 }
                 repl::UnreplicatedWritesBlock uwb(&_opCtx);
+                auto entry = uassertStatusOK(OplogEntry::parse(*i));
                 uassertStatusOK(applyOperation_inlock(
-                    &_opCtx, ctx.db(), *i, false, OplogApplication::Mode::kSecondary));
+                    &_opCtx, ctx.db(), &entry, false, OplogApplication::Mode::kSecondary));
             }
         }
     }

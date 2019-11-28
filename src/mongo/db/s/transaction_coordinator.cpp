@@ -52,21 +52,36 @@ using TransactionCoordinatorDocument = txn::TransactionCoordinatorDocument;
 MONGO_FAIL_POINT_DEFINE(hangBeforeWaitingForParticipantListWriteConcern);
 MONGO_FAIL_POINT_DEFINE(hangBeforeWaitingForDecisionWriteConcern);
 
-void hangIfFailPointEnabled(ServiceContext* service,
-                            FailPoint& failpoint,
-                            const StringData& failPointName) {
+ExecutorFuture<void> waitForMajorityWithHangFailpoint(ServiceContext* service,
+                                                      FailPoint& failpoint,
+                                                      const std::string& failPointName,
+                                                      repl::OpTime opTime) {
+    auto executor = Grid::get(service)->getExecutorPool()->getFixedExecutor();
+    auto waitForWC = [service, executor](repl::OpTime opTime) {
+        return WaitForMajorityService::get(service).waitUntilMajority(opTime).thenRunOn(executor);
+    };
+
     MONGO_FAIL_POINT_BLOCK(failpoint, fp) {
         LOG(0) << "Hit " << failPointName << " failpoint";
         const BSONObj& data = fp.getData();
-        if (!data["useUninterruptibleSleep"].eoo()) {
-            MONGO_FAIL_POINT_PAUSE_WHILE_SET(failpoint);
-        } else {
-            ThreadClient tc(failPointName, service);
-            auto opCtx = tc->makeOperationContext();
 
-            MONGO_FAIL_POINT_PAUSE_WHILE_SET_OR_INTERRUPTED(opCtx.get(), failpoint);
-        }
+        // Run the hang failpoint asynchronously on a different thread to avoid self deadlocks.
+        return ExecutorFuture<void>(executor).then(
+            [service, &failpoint, failPointName, data, waitForWC, opTime] {
+                if (!data["useUninterruptibleSleep"].eoo()) {
+                    MONGO_FAIL_POINT_PAUSE_WHILE_SET(failpoint);
+                } else {
+                    ThreadClient tc(failPointName, service);
+                    auto opCtx = tc->makeOperationContext();
+
+                    MONGO_FAIL_POINT_PAUSE_WHILE_SET_OR_INTERRUPTED(opCtx.get(), failpoint);
+                }
+
+                return waitForWC(std::move(opTime));
+            });
     }
+
+    return waitForWC(std::move(opTime));
 }
 
 }  // namespace
@@ -142,10 +157,11 @@ TransactionCoordinator::TransactionCoordinator(ServiceContext* serviceContext,
                 *_sendPrepareScheduler, _lsid, _txnNumber, *_participants);
         })
         .then([this](repl::OpTime opTime) {
-            hangIfFailPointEnabled(_serviceContext,
-                                   hangBeforeWaitingForParticipantListWriteConcern,
-                                   "hangBeforeWaitingForParticipantListWriteConcern");
-            return WaitForMajorityService::get(_serviceContext).waitUntilMajority(opTime);
+            return waitForMajorityWithHangFailpoint(
+                _serviceContext,
+                hangBeforeWaitingForParticipantListWriteConcern,
+                "hangBeforeWaitingForParticipantListWriteConcern",
+                std::move(opTime));
         })
         .thenRunOn(Grid::get(_serviceContext)->getExecutorPool()->getFixedExecutor())
         .then([this] {
@@ -221,12 +237,11 @@ TransactionCoordinator::TransactionCoordinator(ServiceContext* serviceContext,
             return txn::persistDecision(*_scheduler, _lsid, _txnNumber, *_participants, *_decision);
         })
         .then([this](repl::OpTime opTime) {
-            hangIfFailPointEnabled(_serviceContext,
-                                   hangBeforeWaitingForDecisionWriteConcern,
-                                   "hangBeforeWaitingForDecisionWriteConcern");
-            return WaitForMajorityService::get(_serviceContext).waitUntilMajority(opTime);
+            return waitForMajorityWithHangFailpoint(_serviceContext,
+                                                    hangBeforeWaitingForDecisionWriteConcern,
+                                                    "hangBeforeWaitingForDecisionWriteConcern",
+                                                    std::move(opTime));
         })
-        .thenRunOn(Grid::get(_serviceContext)->getExecutorPool()->getFixedExecutor())
         .then([this] {
             {
                 stdx::lock_guard<stdx::mutex> lg(_mutex);
@@ -249,19 +264,28 @@ TransactionCoordinator::TransactionCoordinator(ServiceContext* serviceContext,
                     _serviceContext->getPreciseClockSource()->now());
             }
 
-            _decisionPromise.emplaceValue(_decision->getDecision());
-
             switch (_decision->getDecision()) {
-                case CommitDecision::kCommit:
+                case CommitDecision::kCommit: {
+                    _decisionPromise.emplaceValue(CommitDecision::kCommit);
+
                     return txn::sendCommit(_serviceContext,
                                            *_scheduler,
                                            _lsid,
                                            _txnNumber,
                                            *_participants,
                                            *_decision->getCommitTimestamp());
-                case CommitDecision::kAbort:
+                }
+                case CommitDecision::kAbort: {
+                    const auto& abortStatus = *_decision->getAbortStatus();
+
+                    if (abortStatus == ErrorCodes::ReadConcernMajorityNotEnabled)
+                        _decisionPromise.setError(abortStatus);
+                    else
+                        _decisionPromise.emplaceValue(CommitDecision::kAbort);
+
                     return txn::sendAbort(
                         _serviceContext, *_scheduler, _lsid, _txnNumber, *_participants);
+                }
                 default:
                     MONGO_UNREACHABLE;
             };
@@ -282,13 +306,13 @@ TransactionCoordinator::TransactionCoordinator(ServiceContext* serviceContext,
 
             return txn::deleteCoordinatorDoc(*_scheduler, _lsid, _txnNumber);
         })
-        .onCompletion([ this, deadlineFuture = std::move(deadlineFuture) ](Status s) mutable {
+        .onCompletion([this, deadlineFuture = std::move(deadlineFuture)](Status s) mutable {
             // Interrupt this coordinator's scheduler hierarchy and join the deadline task's future
             // in order to guarantee that there are no more threads running within the coordinator.
             _scheduler->shutdown(
                 {ErrorCodes::TransactionCoordinatorDeadlineTaskCanceled, "Coordinator completed"});
 
-            return std::move(deadlineFuture).onCompletion([ this, s = std::move(s) ](Status) {
+            return std::move(deadlineFuture).onCompletion([this, s = std::move(s)](Status) {
                 // Notify all the listeners which are interested in the coordinator's lifecycle.
                 // After this call, the coordinator object could potentially get destroyed by its
                 // lifetime controller, so there shouldn't be any accesses to `this` after this
@@ -324,7 +348,7 @@ void TransactionCoordinator::continueCommit(const TransactionCoordinatorDocument
     _kickOffCommitPromise.emplaceValue();
 }
 
-SharedSemiFuture<CommitDecision> TransactionCoordinator::getDecision() {
+SharedSemiFuture<CommitDecision> TransactionCoordinator::getDecision() const {
     return _decisionPromise.getFuture();
 }
 
@@ -364,8 +388,7 @@ void TransactionCoordinator::_done(Status status) {
     if (status == ErrorCodes::TransactionCoordinatorSteppingDown)
         status = Status(ErrorCodes::InterruptedDueToReplStateChange,
                         str::stream() << "Coordinator " << _lsid.getId() << ':' << _txnNumber
-                                      << " stopped due to: "
-                                      << status.reason());
+                                      << " stopped due to: " << status.reason());
 
     LOG(3) << "Two-phase commit for " << _lsid.getId() << ':' << _txnNumber << " completed with "
            << redact(status);

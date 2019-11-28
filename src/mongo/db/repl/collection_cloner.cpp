@@ -132,8 +132,8 @@ CollectionCloner::CollectionCloner(executor::TaskExecutor* executor,
           _sourceNss.db().toString(),
           makeCommandWithUUIDorCollectionName("listIndexes", _options.uuid, sourceNss),
           [this](const Fetcher::QueryResponseStatus& fetchResult,
-                 Fetcher::NextAction * nextAction,
-                 BSONObjBuilder * getMoreBob) {
+                 Fetcher::NextAction* nextAction,
+                 BSONObjBuilder* getMoreBob) {
               _listIndexesCallback(fetchResult, nextAction, getMoreBob);
           },
           ReadPreferenceSetting::secondaryPreferredMetadata(),
@@ -332,9 +332,7 @@ void CollectionCloner::_countCallback(
             _finishCallback(countStatus.withContext(
                 str::stream() << "There was an error parsing document count from count "
                                  "command result on collection "
-                              << _sourceNss.ns()
-                              << " from "
-                              << _source.toString()));
+                              << _sourceNss.ns() << " from " << _source.toString()));
             return;
         }
     }
@@ -343,8 +341,7 @@ void CollectionCloner::_countCallback(
         _finishCallback({ErrorCodes::BadValue,
                          str::stream() << "Count call on collection " << _sourceNss.ns() << " from "
                                        << _source.toString()
-                                       << " returned negative document count: "
-                                       << count});
+                                       << " returned negative document count: " << count});
         return;
     }
 
@@ -399,22 +396,15 @@ void CollectionCloner::_listIndexesCallback(const Fetcher::QueryResponseStatus& 
     }
 
     UniqueLock lk(_mutex);
-    // When listing indexes by UUID, the sync source may use a different name for the collection
-    // as result of renaming or two-phase drop. As the index spec also includes a 'ns' field, this
-    // must be rewritten.
-    BSONObjBuilder nsFieldReplacementBuilder;
-    nsFieldReplacementBuilder.append("ns", _sourceNss.ns());
-    BSONElement nsFieldReplacementElem = nsFieldReplacementBuilder.done().firstElement();
 
     // We may be called with multiple batches leading to a need to grow _indexSpecs.
     _indexSpecs.reserve(_indexSpecs.size() + documents.size());
     for (auto&& doc : documents) {
-        // The addField replaces the 'ns' field with the correct name, see above.
         if (StringData("_id_") == doc["name"].str()) {
-            _idIndexSpec = doc.addField(nsFieldReplacementElem);
+            _idIndexSpec = doc;
             continue;
         }
-        _indexSpecs.push_back(doc.addField(nsFieldReplacementElem));
+        _indexSpecs.push_back(doc);
     }
     lk.unlock();
 

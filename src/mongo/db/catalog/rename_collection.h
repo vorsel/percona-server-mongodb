@@ -66,7 +66,7 @@ Status renameCollection(OperationContext* opCtx,
  */
 Status renameCollectionForApplyOps(OperationContext* opCtx,
                                    const std::string& dbName,
-                                   const BSONElement& ui,
+                                   const OptionalCollectionUUID& uuidToRename,
                                    const BSONObj& cmd,
                                    const repl::OpTime& renameOpTime);
 
@@ -79,5 +79,14 @@ Status renameCollectionForApplyOps(OperationContext* opCtx,
 Status renameCollectionForRollback(OperationContext* opCtx,
                                    const NamespaceString& target,
                                    const UUID& uuid);
+/**
+ * Runs renameCollection() with preliminary validation checks to ensure source
+ * and target namespaces are elligible for rename.
+ */
+void validateAndRunRenameCollection(OperationContext* opCtx,
+                                    const NamespaceString& source,
+                                    const NamespaceString& target,
+                                    bool dropTarget,
+                                    bool stayTemp);
 
 }  // namespace mongo

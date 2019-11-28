@@ -42,7 +42,6 @@
 
 #include "mongo/base/backtrace_visibility_test.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/if_constexpr.h"
 #include "mongo/util/stacktrace.h"
 
 namespace mongo {
@@ -98,10 +97,9 @@ struct Context {
 // Disable clang-format for the "if constexpr"
 template <int N>
 void callNext(Context& ctx) {
-    IF_CONSTEXPR(N == 0) {
+    if constexpr (N == 0) {
         ctx.s = trace();
-    }
-    else {
+    } else {
         ctx.plan[N - 1](ctx);
     }
 
@@ -135,10 +133,10 @@ void assertTraceContains(const std::string (&names)[size], const std::string sta
         auto pos = remainder.find(name);
 
         if (pos == remainder.npos) {
-            unittest::log().setIsTruncatable(false) << std::endl
-                                                    << "--- BEGIN SAMPLE BACKTRACE ---" << std::endl
-                                                    << std::string(stacktrace)
-                                                    << "--- END SAMPLE BACKTRACE ---";
+            unittest::log().setIsTruncatable(false)
+                << std::endl
+                << "--- BEGIN SAMPLE BACKTRACE ---" << std::endl
+                << std::string(stacktrace) << "--- END SAMPLE BACKTRACE ---";
             FAIL("name '{}' is missing or out of order in sample backtrace"_format(
                 std::string(name)));
         }
@@ -149,7 +147,12 @@ void assertTraceContains(const std::string (&names)[size], const std::string sta
 TEST(Unwind, Demangled) {
     // Trickery with std::vector<std::function> is to hide from the optimizer.
     Context ctx{{
-        callNext<0>, callNext<1>, callNext<2>, callNext<3>, callNext<4>, callNext<5>,
+        callNext<0>,
+        callNext<1>,
+        callNext<2>,
+        callNext<3>,
+        callNext<4>,
+        callNext<5>,
     }};
     ctx.plan.back()(ctx);
     // Check that these function names appear in the trace, in order.

@@ -32,6 +32,7 @@
 #include "mongo/db/index/sort_key_generator.h"
 
 #include "mongo/bson/bsonobj_comparator.h"
+#include "mongo/db/query/collation/collation_index_key.h"
 
 namespace mongo {
 
@@ -52,9 +53,14 @@ SortKeyGenerator::SortKeyGenerator(const BSONObj& sortSpec, const CollatorInterf
             invariant(metaElem.fieldNameStringData() == "$meta"_sd);
             if (metaElem.valueStringData() == "textScore"_sd) {
                 _patternPartTypes.push_back(SortPatternPartType::kMetaTextScore);
-            } else {
-                invariant(metaElem.valueStringData() == "randVal"_sd);
+            } else if (metaElem.valueStringData() == "randVal"_sd) {
                 _patternPartTypes.push_back(SortPatternPartType::kMetaRandVal);
+            } else if (metaElem.valueStringData() == "searchScore"_sd) {
+                uasserted(31218, "$meta sort by 'searchScore' metadata is not supported");
+            } else if (metaElem.valueStringData() == "searchHighlights"_sd) {
+                uasserted(31219, "$meta sort by 'searchHighlights' metadata is not supported");
+            } else {
+                uasserted(31138, "Illegal $meta sort: " + metaElem.valueStringData());
             }
             _sortHasMeta = true;
         }
@@ -82,26 +88,57 @@ SortKeyGenerator::SortKeyGenerator(const BSONObj& sortSpec, const CollatorInterf
     _indexKeyGen = std::make_unique<BtreeKeyGenerator>(fieldNames, fixed, isSparse, _collator);
 }
 
-StatusWith<BSONObj> SortKeyGenerator::getSortKey(const BSONObj& obj,
-                                                 const Metadata* metadata) const {
+StatusWith<BSONObj> SortKeyGenerator::getSortKey(const WorkingSetMember& wsm) const {
+    if (wsm.hasObj()) {
+        SortKeyGenerator::Metadata metadata;
+        if (_sortHasMeta && wsm.metadata().hasTextScore()) {
+            metadata.textScore = wsm.metadata().getTextScore();
+        }
+        return getSortKeyFromDocument(wsm.obj.value(), &metadata);
+    }
+
+    return getSortKeyFromIndexKey(wsm);
+}
+
+StatusWith<BSONObj> SortKeyGenerator::getSortKeyFromIndexKey(const WorkingSetMember& member) const {
+    invariant(member.getState() == WorkingSetMember::RID_AND_IDX);
+    invariant(!_sortHasMeta);
+
+    BSONObjBuilder objBuilder;
+    for (BSONElement specElt : _sortSpecWithoutMeta) {
+        invariant(specElt.isNumber());
+        BSONElement sortKeyElt;
+        invariant(member.getFieldDotted(specElt.fieldName(), &sortKeyElt));
+        // If we were to call 'collationAwareIndexKeyAppend' with a non-simple collation and a
+        // 'sortKeyElt' representing a collated index key we would incorrectly encode for the
+        // collation twice. This is not currently possible as the query planner will ensure that
+        // the plan fetches the data before sort key generation in the case where the index has a
+        // non-simple collation.
+        CollationIndexKey::collationAwareIndexKeyAppend(sortKeyElt, _collator, &objBuilder);
+    }
+    return objBuilder.obj();
+}
+
+StatusWith<BSONObj> SortKeyGenerator::getSortKeyFromDocument(const BSONObj& obj,
+                                                             const Metadata* metadata) const {
     if (_sortHasMeta) {
         invariant(metadata);
     }
 
-    auto indexKey = getIndexKey(obj);
-    if (!indexKey.isOK()) {
-        return indexKey;
+    auto sortKeyNoMetadata = getSortKeyFromDocumentWithoutMetadata(obj);
+    if (!sortKeyNoMetadata.isOK()) {
+        return sortKeyNoMetadata;
     }
 
     if (!_sortHasMeta) {
         // We don't have to worry about $meta sort, so the index key becomes the sort key.
-        return indexKey;
+        return sortKeyNoMetadata;
     }
 
     BSONObjBuilder mergedKeyBob;
 
     // Merge metadata into the key.
-    BSONObjIterator sortKeyIt(indexKey.getValue());
+    BSONObjIterator sortKeyIt(sortKeyNoMetadata.getValue());
     for (auto type : _patternPartTypes) {
         switch (type) {
             case SortPatternPartType::kFieldPath: {
@@ -127,7 +164,8 @@ StatusWith<BSONObj> SortKeyGenerator::getSortKey(const BSONObj& obj,
     return mergedKeyBob.obj();
 }
 
-StatusWith<BSONObj> SortKeyGenerator::getIndexKey(const BSONObj& obj) const {
+StatusWith<BSONObj> SortKeyGenerator::getSortKeyFromDocumentWithoutMetadata(
+    const BSONObj& obj) const {
     // Not sorting by anything in the key, just bail out early.
     if (_sortSpecWithoutMeta.isEmpty()) {
         return BSONObj();

@@ -86,7 +86,6 @@ StatusWith<CompactStats> compactCollection(OperationContext* opCtx,
     DisableDocumentValidation validationDisabler(opCtx);
 
     auto recordStore = collection->getRecordStore();
-    auto indexCatalog = collection->getIndexCatalog();
 
     OldClientContext ctx(opCtx, collectionNss.ns());
 
@@ -103,10 +102,13 @@ StatusWith<CompactStats> compactCollection(OperationContext* opCtx,
 
         // Ensure the collection was not dropped during the re-lock.
         collection = getCollectionForCompact(opCtx, database, collectionNss);
+        recordStore = collection->getRecordStore();
     }
 
     log(LogComponent::kCommand) << "compact " << collectionNss
                                 << " begin, options: " << *compactOptions;
+
+    auto indexCatalog = collection->getIndexCatalog();
 
     if (recordStore->compactsInPlace()) {
         CompactStats stats;
@@ -148,9 +150,7 @@ StatusWith<CompactStats> compactCollection(OperationContext* opCtx,
                 return StatusWith<CompactStats>(
                     ErrorCodes::CannotCreateIndex,
                     str::stream() << "Cannot compact collection due to invalid index " << spec
-                                  << ": "
-                                  << keyStatus.reason()
-                                  << " For more info see"
+                                  << ": " << keyStatus.reason() << " For more info see"
                                   << " http://dochub.mongodb.org/core/index-validation");
             }
             indexSpecs.push_back(spec);

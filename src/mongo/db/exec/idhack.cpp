@@ -39,7 +39,6 @@
 #include "mongo/db/exec/projection.h"
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/exec/working_set_computed_data.h"
 #include "mongo/db/index/btree_access_method.h"
 
 namespace mongo {
@@ -133,8 +132,7 @@ PlanStage::StageState IDHackStage::advance(WorkingSetID id,
 
     if (_addKeyMetadata) {
         BSONObj ownedKeyObj = member->obj.value()["_id"].wrap().getOwned();
-        member->addComputed(
-            new IndexKeyComputedData(IndexKeyComputedData::rehydrateKey(_key, ownedKeyObj)));
+        member->metadata().setIndexKey(IndexKeyEntry::rehydrateKey(_key, ownedKeyObj));
     }
 
     _done = true;
@@ -165,6 +163,7 @@ void IDHackStage::doReattachToOperationContext() {
 // static
 bool IDHackStage::supportsQuery(Collection* collection, const CanonicalQuery& query) {
     return !query.getQueryRequest().showRecordId() && query.getQueryRequest().getHint().isEmpty() &&
+        query.getQueryRequest().getMin().isEmpty() && query.getQueryRequest().getMax().isEmpty() &&
         !query.getQueryRequest().getSkip() &&
         CanonicalQuery::isSimpleIdQuery(query.getQueryRequest().getFilter()) &&
         !query.getQueryRequest().isTailable() &&

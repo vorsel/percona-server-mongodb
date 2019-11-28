@@ -109,7 +109,7 @@ bool nonShardedCollectionCommandPassthrough(OperationContext* opCtx,
 
     uassert(ErrorCodes::IllegalOperation,
             str::stream() << "Can't do command: " << cmdName << " on a sharded collection",
-            !status.isA<ErrorCategory::StaleShardVersionError>());
+            !ErrorCodes::isStaleShardVersionError(status));
 
     out->appendElementsUnique(CommandHelpers::filterCommandReplyForPassthrough(cmdResponse.data));
     return status.isOK();
@@ -503,8 +503,8 @@ public:
         }
 
         return Status(ErrorCodes::Unauthorized,
-                      str::stream() << "Not authorized to list indexes on collection: "
-                                    << ns.coll());
+                      str::stream()
+                          << "Not authorized to list indexes on collection: " << ns.coll());
     }
 
     bool run(OperationContext* opCtx,

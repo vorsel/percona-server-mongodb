@@ -3068,8 +3068,7 @@ var authCommandsLib = {
         },
         {
           testname: "createIndexes",
-          command:
-              {createIndexes: "x", indexes: [{ns: firstDbName + ".x", key: {a: 1}, name: "a_1"}]},
+          command: {createIndexes: "x", indexes: [{key: {a: 1}, name: "a_1"}]},
           teardown: function(db) {
               db.x.drop();
           },
@@ -3962,11 +3961,18 @@ var authCommandsLib = {
           command: {insert: "oplog.rs", documents: [{ts: Timestamp()}]},
           skipSharded: true,
           setup: function(db) {
+              load("jstests/libs/storage_engine_utils.js");
               if (!db.getCollectionNames().includes("oplog.rs")) {
                   assert.commandWorked(
                       db.runCommand({create: "oplog.rs", capped: true, size: 10000}));
               } else {
-                  assert.commandWorked(db.adminCommand({replSetResizeOplog: 1, size: 10000}));
+                  if (storageEngineIsWiredTigerOrInMemory()) {
+                      assert.commandWorked(db.adminCommand({replSetResizeOplog: 1, size: 10000}));
+                  } else {
+                      assert.commandWorked(db.runCommand({drop: "oplog.rs"}));
+                      assert.commandWorked(
+                          db.runCommand({create: "oplog.rs", capped: true, size: 10000}));
+                  }
               }
           },
           teardown: function(db) {
@@ -4759,7 +4765,7 @@ var authCommandsLib = {
           testcases: [
               {
                 runOnDb: adminDbName,
-                roles: roles_clusterManager,
+                roles: Object.extend({enableSharding: 1}, roles_clusterManager),
                 privileges: [{
                     resource: {db: "test", collection: "x"},
                     actions: ["refineCollectionShardKey"]

@@ -70,9 +70,10 @@ struct ReplicaSetMonitor::IsMasterReply {
     bool secondary;
     bool hidden;
     int configVersion{};
-    OID electionId;                     // Set if this isMaster reply is from the primary
-    HostAndPort primary;                // empty if not present
-    std::set<HostAndPort> normalHosts;  // both "hosts" and "passives"
+    OID electionId;                 // Set if this isMaster reply is from the primary
+    HostAndPort primary;            // empty if not present
+    std::set<HostAndPort> members;  // both "hosts" and "passives"
+    std::set<HostAndPort> passives;
     BSONObj tags;
     int minWireVersion{};
     int maxWireVersion{};
@@ -84,7 +85,15 @@ struct ReplicaSetMonitor::IsMasterReply {
     repl::OpTime opTime{};
 };
 
-struct ReplicaSetMonitor::SetState {
+/**
+ * The SetState is the underlying data object behind both the ReplicaSetMonitor and the Refresher
+ *
+ * Note that the SetState only holds its own lock in init() and drop(). Even those uses can probably
+ * be offloaded to the RSM eventually. In all other cases, the RSM and RSM::Refresher use the
+ * SetState lock to synchronize.
+ */
+struct ReplicaSetMonitor::SetState
+    : public std::enable_shared_from_this<ReplicaSetMonitor::SetState> {
     SetState(const SetState&) = delete;
     SetState& operator=(const SetState&) = delete;
 
@@ -196,6 +205,18 @@ public:
 
     Status makeUnsatisfedReadPrefError(const ReadPreferenceSetting& criteria) const;
 
+    // Tiny enum to convey semantics for rescheduleFefresh()
+    enum class SchedulingStrategy {
+        kKeepEarlyScan,
+        kCancelPreviousScan,
+    };
+
+    /**
+     * Schedules a refresh via the task executor and cancel any previous refresh.
+     * (Task is automatically canceled in the d-tor.)
+     */
+    void rescheduleRefresh(SchedulingStrategy strategy);
+
     /**
      *  Notifies all listeners that the ReplicaSet is in use.
      */
@@ -211,13 +232,28 @@ public:
      */
     void checkInvariants() const;
 
+    /**
+     * Wrap the callback and schedule it to run at some time
+     *
+     * The callback wrapper does the following:
+     * * Return before running cb if isRemovedFromManager is true
+     * * Return before running cb if the handle was canceled
+     * * Lock before running cb and unlock after
+     */
+    template <typename Callback>
+    auto scheduleWorkAt(Date_t when, Callback&& cb) const;
+
     const MongoURI setUri;  // URI passed to ctor -- THIS IS NOT UPDATED BY SCANS
     const std::string name;
 
     ReplicaSetChangeNotifier* const notifier;
     executor::TaskExecutor* const executor;
 
-    stdx::mutex mutex;  // You must hold this to access any member below.
+    AtomicWord<bool> isRemovedFromManager{false};
+
+    mutable stdx::mutex mutex;  // You must hold this to access any member below.
+
+    executor::TaskExecutor::CallbackHandle refresherHandle;
 
     // For starting scans
     std::set<HostAndPort> seedNodes;  // updated whenever a master reports set membership changes
@@ -246,7 +282,9 @@ public:
     Seconds refreshPeriod;      // Normal refresh period when not expedited
     bool isExpedited = false;   // True when we are doing more frequent refreshes due to waiters
     std::list<Waiter> waiters;  // Everyone waiting for some ReadPreference to be satisfied
+    uint64_t nextScanId = 0;    // The id for the next scan
     ScanStatePtr currentScan;   // NULL if no scan in progress
+    Date_t nextScanTime;        // The time at which the next scan is scheduled to start
 };
 
 struct ReplicaSetMonitor::ScanState {

@@ -119,8 +119,7 @@ StatusWith<OpMsgRequest> createX509AuthCmd(const BSONObj& params, StringData cli
     return OpMsgRequest::fromDBAndBody(db.getValue(),
                                        BSON("authenticate" << 1 << "mechanism"
                                                            << "MONGODB-X509"
-                                                           << "user"
-                                                           << username));
+                                                           << "user" << username));
 }
 
 // Use the MONGODB-X509 protocol to authenticate as "username." The certificate details
@@ -149,7 +148,7 @@ Future<void> authenticateClient(const BSONObj& params,
                                 const std::string& clientName,
                                 RunCommandHook runCommand) {
     auto errorHandler = [](Status status) {
-        if (serverGlobalParams.transitionToAuth && !status.isA<ErrorCategory::NetworkError>()) {
+        if (serverGlobalParams.transitionToAuth && !ErrorCodes::isNetworkError(status)) {
             // If auth failed in transitionToAuth, just pretend it succeeded.
             log() << "Failed to authenticate in transitionToAuth, falling back to no "
                      "authentication.";
@@ -241,14 +240,11 @@ BSONObj getInternalAuthParams(size_t idx, const std::string& mechanism) {
             internalSecurity.user->getName().getUser().toString(), password);
     }
 
-    return BSON(saslCommandMechanismFieldName << mechanism << saslCommandUserDBFieldName
-                                              << internalSecurity.user->getName().getDB()
-                                              << saslCommandUserFieldName
-                                              << internalSecurity.user->getName().getUser()
-                                              << saslCommandPasswordFieldName
-                                              << password
-                                              << saslCommandDigestPasswordFieldName
-                                              << false);
+    return BSON(saslCommandMechanismFieldName
+                << mechanism << saslCommandUserDBFieldName
+                << internalSecurity.user->getName().getDB() << saslCommandUserFieldName
+                << internalSecurity.user->getName().getUser() << saslCommandPasswordFieldName
+                << password << saslCommandDigestPasswordFieldName << false);
 }
 
 Future<std::string> negotiateSaslMechanism(RunCommandHook runCommand,
@@ -313,14 +309,10 @@ BSONObj buildAuthParams(StringData dbname,
                         StringData username,
                         StringData passwordText,
                         bool digestPassword) {
-    return BSON(saslCommandMechanismFieldName << "SCRAM-SHA-1" << saslCommandUserDBFieldName
-                                              << dbname
-                                              << saslCommandUserFieldName
-                                              << username
-                                              << saslCommandPasswordFieldName
-                                              << passwordText
-                                              << saslCommandDigestPasswordFieldName
-                                              << digestPassword);
+    return BSON(saslCommandMechanismFieldName
+                << "SCRAM-SHA-1" << saslCommandUserDBFieldName << dbname << saslCommandUserFieldName
+                << username << saslCommandPasswordFieldName << passwordText
+                << saslCommandDigestPasswordFieldName << digestPassword);
 }
 
 StringData getSaslCommandUserDBFieldName() {

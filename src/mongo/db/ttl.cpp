@@ -123,7 +123,6 @@ public:
 private:
     void doTTLPass() {
         const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
-        auto durableCatalog = DurableCatalog::get(opCtxPtr.get());
         OperationContext& opCtx = *opCtxPtr;
 
         // If part of replSet but not in a readable state (e.g. during initial sync), skip.
@@ -133,40 +132,58 @@ private:
             return;
 
         TTLCollectionCache& ttlCollectionCache = TTLCollectionCache::get(getGlobalServiceContext());
-        std::vector<std::string> ttlCollections = ttlCollectionCache.getCollections();
-        std::vector<BSONObj> ttlIndexes;
+        std::vector<std::pair<UUID, std::string>> ttlInfos = ttlCollectionCache.getTTLInfos();
+
+        // Pair of collection namespace and index spec.
+        std::vector<std::pair<NamespaceString, BSONObj>> ttlIndexes;
 
         ttlPasses.increment();
 
         // Get all TTL indexes from every collection.
-        for (const std::string& collectionNS : ttlCollections) {
-            NamespaceString collectionNSS(collectionNS);
-            AutoGetCollection autoGetCollection(&opCtx, collectionNSS, MODE_IS);
-            Collection* coll = autoGetCollection.getCollection();
-            if (!coll) {
-                // Skip since collection has been dropped.
+        for (const std::pair<UUID, std::string>& ttlInfo : ttlInfos) {
+            auto uuid = ttlInfo.first;
+            auto indexName = ttlInfo.second;
+
+            auto nss = CollectionCatalog::get(opCtxPtr.get()).lookupNSSByUUID(uuid);
+            if (!nss) {
+                ttlCollectionCache.deregisterTTLInfo(ttlInfo);
                 continue;
             }
 
-            std::vector<std::string> indexNames;
-            durableCatalog->getAllIndexes(&opCtx, coll->ns(), &indexNames);
-            for (const std::string& name : indexNames) {
-                BSONObj spec = durableCatalog->getIndexSpec(&opCtx, coll->ns(), name);
-                if (spec.hasField(secondsExpireField)) {
-                    ttlIndexes.push_back(spec.getOwned());
-                }
+            AutoGetCollection autoColl(&opCtx, *nss, MODE_IS);
+            Collection* coll = autoColl.getCollection();
+            // The collection with `uuid` might be renamed before the lock and the wrong
+            // namespace would be locked and looked up so we double check here.
+            if (!coll || coll->uuid() != uuid)
+                continue;
+
+            if (!DurableCatalog::get(opCtxPtr.get())->isIndexPresent(&opCtx, *nss, indexName)) {
+                ttlCollectionCache.deregisterTTLInfo(ttlInfo);
+                continue;
             }
+
+            BSONObj spec =
+                DurableCatalog::get(opCtxPtr.get())->getIndexSpec(&opCtx, *nss, indexName);
+            if (!spec.hasField(secondsExpireField)) {
+                ttlCollectionCache.deregisterTTLInfo(ttlInfo);
+                continue;
+            }
+
+            if (!DurableCatalog::get(opCtxPtr.get())->isIndexReady(&opCtx, *nss, indexName))
+                continue;
+
+            ttlIndexes.push_back(std::make_pair(*nss, spec.getOwned()));
         }
 
-        for (const BSONObj& idx : ttlIndexes) {
+        for (const auto& it : ttlIndexes) {
             try {
-                doTTLForIndex(&opCtx, idx);
+                doTTLForIndex(&opCtx, it.first, it.second);
             } catch (const ExceptionForCat<ErrorCategory::Interruption>&) {
                 warning() << "TTLMonitor was interrupted, waiting " << ttlMonitorSleepSecs.load()
                           << " seconds before doing another pass";
                 return;
             } catch (const DBException& dbex) {
-                error() << "Error processing ttl index: " << idx << " -- " << dbex.toString();
+                error() << "Error processing ttl index: " << it.second << " -- " << dbex.toString();
                 // Continue on to the next index.
                 continue;
             }
@@ -177,8 +194,7 @@ private:
      * Remove documents from the collection using the specified TTL index after a sufficient amount
      * of time has passed according to its expiry specification.
      */
-    void doTTLForIndex(OperationContext* opCtx, BSONObj idx) {
-        const NamespaceString collectionNSS(idx["ns"].String());
+    void doTTLForIndex(OperationContext* opCtx, NamespaceString collectionNSS, BSONObj idx) {
         if (collectionNSS.isDropPendingNamespace()) {
             return;
         }

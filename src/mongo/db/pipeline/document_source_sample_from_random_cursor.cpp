@@ -92,11 +92,11 @@ DocumentSource::GetNextResult DocumentSourceSampleFromRandomCursor::getNext() {
     _randMetaFieldVal -= smallestFromSampleOfUniform(&prng, _nDocsInColl);
 
     MutableDocument md(nextResult.releaseDocument());
-    md.setRandMetaField(_randMetaFieldVal);
+    md.metadata().setRandVal(_randMetaFieldVal);
     if (pExpCtx->needsMerge) {
         // This stage will be merged by sorting results according to this random metadata field, but
         // the merging logic expects to sort by the sort key metadata.
-        md.setSortKeyMetaField(BSON("" << _randMetaFieldVal));
+        md.metadata().setSortKey(BSON("" << _randMetaFieldVal));
     }
     return md.freeze();
 }
@@ -116,9 +116,7 @@ DocumentSource::GetNextResult DocumentSourceSampleFromRandomCursor::getNextNonDu
                             << _idField
                             << " field in order to de-duplicate results, but encountered a "
                                "document without a "
-                            << _idField
-                            << " field: "
-                            << nextInput.getDocument().toString(),
+                            << _idField << " field: " << nextInput.getDocument().toString(),
                         !idField.missing());
 
                 if (_seenDocs.insert(std::move(idField)).second) {
@@ -163,4 +161,4 @@ intrusive_ptr<DocumentSourceSampleFromRandomCursor> DocumentSourceSampleFromRand
         new DocumentSourceSampleFromRandomCursor(expCtx, size, idField, nDocsInCollection));
     return source;
 }
-}  // mongo
+}  // namespace mongo

@@ -67,7 +67,8 @@ TEST(SharedFuture, isReady_shared_TSAN_OK) {
     auto fut = async([&] {
                    done = true;
                    return 1;
-               }).share();
+               })
+                   .share();
     //(void)*const_cast<volatile bool*>(&done);  // Data Race! Uncomment to make sure TSAN works.
     while (!fut.isReady()) {
     }
@@ -183,7 +184,7 @@ TEST(SharedFuture, NoStackOverflow_Destruction) {
                             // Add 100 children that each use 100K of stack space on destruction.
                             for (int i = 0; i < 100; i++) {
                                 collector.push_back(
-                                    shared.thenRunOn(exec).then([x = Evil()]{}).semi());
+                                    shared.thenRunOn(exec).then([x = Evil()] {}).semi());
                             }
 
                             for (auto&& collected : collector) {
@@ -193,21 +194,20 @@ TEST(SharedFuture, NoStackOverflow_Destruction) {
 }
 
 TEST(SharedFuture, ThenChaining_Sync) {
-    FUTURE_SUCCESS_TEST([] {},
-                        [](/*Future<void>*/ auto&& fut) {
-                            const auto exec = InlineCountingExecutor::make();
+    FUTURE_SUCCESS_TEST(
+        [] {},
+        [](/*Future<void>*/ auto&& fut) {
+            const auto exec = InlineCountingExecutor::make();
 
-                            auto res = std::move(fut).then([] { return SharedSemiFuture(1); });
+            auto res = std::move(fut).then([] { return SharedSemiFuture(1); });
 
-                            IF_CONSTEXPR(
-                                std::is_same_v<std::decay_t<decltype(fut)>, ExecutorFuture<void>>) {
-                                static_assert(std::is_same_v<decltype(res), ExecutorFuture<int>>);
-                            }
-                            else {
-                                static_assert(std::is_same_v<decltype(res), SemiFuture<int>>);
-                            }
-                            ASSERT_EQ(res.get(), 1);
-                        });
+            if constexpr (std::is_same_v<std::decay_t<decltype(fut)>, ExecutorFuture<void>>) {
+                static_assert(std::is_same_v<decltype(res), ExecutorFuture<int>>);
+            } else {
+                static_assert(std::is_same_v<decltype(res), SemiFuture<int>>);
+            }
+            ASSERT_EQ(res.get(), 1);
+        });
 }
 
 TEST(SharedFuture, ThenChaining_Async) {
@@ -218,10 +218,9 @@ TEST(SharedFuture, ThenChaining_Async) {
 
             auto res = std::move(fut).then([] { return async([] { return 1; }).share(); });
 
-            IF_CONSTEXPR(std::is_same_v<std::decay_t<decltype(fut)>, ExecutorFuture<void>>) {
+            if constexpr (std::is_same_v<std::decay_t<decltype(fut)>, ExecutorFuture<void>>) {
                 static_assert(std::is_same_v<decltype(res), ExecutorFuture<int>>);
-            }
-            else {
+            } else {
                 static_assert(std::is_same_v<decltype(res), SemiFuture<int>>);
             }
             ASSERT_EQ(res.get(), 1);

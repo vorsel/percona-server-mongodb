@@ -27,6 +27,8 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/query/sort_pattern.h"
 
 namespace mongo {
@@ -60,7 +62,7 @@ SortPattern::SortPattern(const BSONObj& obj,
         }
 
         uassert(15974,
-                "$sort key ordering must be specified using a number or {$meta: 'textScore'}",
+                str::stream() << "Illegal key in $sort specification: " << keyField,
                 keyField.isNumber());
 
         int sortOrder = keyField.numberInt();

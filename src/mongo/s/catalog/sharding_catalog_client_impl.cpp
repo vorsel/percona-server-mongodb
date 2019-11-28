@@ -203,7 +203,8 @@ Status ShardingCatalogClientImpl::updateShardingCatalogEntryForCollection(
                                         BSON(CollectionType::fullNs(nss.ns())),
                                         coll.toBSON(),
                                         upsert,
-                                        ShardingCatalogClient::kMajorityWriteConcern);
+                                        ShardingCatalogClient::kMajorityWriteConcern,
+                                        false /* multi */);
     return status.getStatus().withContext(str::stream() << "Collection metadata write failed");
 }
 
@@ -259,14 +260,14 @@ StatusWith<repl::OpTimeWith<std::vector<DatabaseType>>> ShardingCatalogClientImp
     for (const BSONObj& doc : findStatus.getValue().value) {
         auto dbRes = DatabaseType::fromBSON(doc);
         if (!dbRes.isOK()) {
-            return dbRes.getStatus().withContext(stream() << "Failed to parse database document "
-                                                          << doc);
+            return dbRes.getStatus().withContext(stream()
+                                                 << "Failed to parse database document " << doc);
         }
 
         Status validateStatus = dbRes.getValue().validate();
         if (!validateStatus.isOK()) {
-            return validateStatus.withContext(stream() << "Failed to validate database document "
-                                                       << doc);
+            return validateStatus.withContext(stream()
+                                              << "Failed to validate database document " << doc);
         }
 
         databases.push_back(dbRes.getValue());
@@ -376,9 +377,7 @@ StatusWith<std::vector<CollectionType>> ShardingCatalogClientImpl::getCollection
         if (!collectionResult.isOK()) {
             return {ErrorCodes::FailedToParse,
                     str::stream() << "error while parsing " << CollectionType::ConfigNS.ns()
-                                  << " document: "
-                                  << obj
-                                  << " : "
+                                  << " document: " << obj << " : "
                                   << collectionResult.getStatus().toString()};
         }
 
@@ -590,14 +589,14 @@ StatusWith<repl::OpTimeWith<std::vector<ShardType>>> ShardingCatalogClientImpl::
     for (const BSONObj& doc : findStatus.getValue().value) {
         auto shardRes = ShardType::fromBSON(doc);
         if (!shardRes.isOK()) {
-            return shardRes.getStatus().withContext(stream() << "Failed to parse shard document "
-                                                             << doc);
+            return shardRes.getStatus().withContext(stream()
+                                                    << "Failed to parse shard document " << doc);
         }
 
         Status validateStatus = shardRes.getValue().validate();
         if (!validateStatus.isOK()) {
-            return validateStatus.withContext(stream() << "Failed to validate shard document "
-                                                       << doc);
+            return validateStatus.withContext(stream()
+                                              << "Failed to validate shard document " << doc);
         }
 
         shards.push_back(shardRes.getValue());
@@ -713,9 +712,9 @@ Status ShardingCatalogClientImpl::applyChunkOpsDeprecated(OperationContext* opCt
     invariant(serverGlobalParams.clusterRole == ClusterRole::ConfigServer ||
               (readConcern == repl::ReadConcernLevel::kMajorityReadConcern &&
                writeConcern.wMode == WriteConcernOptions::kMajority));
-    BSONObj cmd = BSON("applyOps" << updateOps << "preCondition" << preCondition
-                                  << WriteConcernOptions::kWriteConcernField
-                                  << writeConcern.toBSON());
+    BSONObj cmd =
+        BSON("applyOps" << updateOps << "preCondition" << preCondition
+                        << WriteConcernOptions::kWriteConcernField << writeConcern.toBSON());
 
     auto response =
         Grid::get(opCtx)->shardRegistry()->getConfigShard()->runCommandWithFixedRetryAttempts(
@@ -772,11 +771,11 @@ Status ShardingCatalogClientImpl::applyChunkOpsDeprecated(OperationContext* opCt
         const auto& newestChunk = chunkWithStatus.getValue();
 
         if (newestChunk.empty()) {
-            errMsg = str::stream() << "chunk operation commit failed: version "
-                                   << lastChunkVersion.toString()
-                                   << " doesn't exist in namespace: " << nss.ns()
-                                   << ". Unable to save chunk ops. Command: " << cmd
-                                   << ". Result: " << response.getValue().response;
+            errMsg = str::stream()
+                << "chunk operation commit failed: version " << lastChunkVersion.toString()
+                << " doesn't exist in namespace: " << nss.ns()
+                << ". Unable to save chunk ops. Command: " << cmd
+                << ". Result: " << response.getValue().response;
             return status.withContext(errMsg);
         };
 
@@ -809,7 +808,6 @@ Status ShardingCatalogClientImpl::insertConfigDocument(OperationContext* opCtx,
     invariant(nss.db() == NamespaceString::kAdminDb || nss.db() == NamespaceString::kConfigDb);
 
     const BSONElement idField = doc.getField("_id");
-    invariant(!idField.eoo());
 
     BatchedCommandRequest request([&] {
         write_ops::Insert insertOp(nss);
@@ -845,7 +843,7 @@ Status ShardingCatalogClientImpl::insertConfigDocument(OperationContext* opCtx,
                                         ReadPreferenceSetting{ReadPreference::PrimaryOnly},
                                         repl::ReadConcernLevel::kMajorityReadConcern,
                                         nss,
-                                        idField.wrap(),
+                                        idField.eoo() ? doc : idField.wrap(),
                                         BSONObj(),
                                         boost::none);
             if (!fetchDuplicate.isOK()) {
@@ -926,7 +924,19 @@ StatusWith<bool> ShardingCatalogClientImpl::updateConfigDocument(
     const BSONObj& update,
     bool upsert,
     const WriteConcernOptions& writeConcern) {
-    return _updateConfigDocument(opCtx, nss, query, update, upsert, writeConcern);
+    return _updateConfigDocument(
+        opCtx, nss, query, update, upsert, writeConcern, false /* useMultiUpdate */);
+}
+
+StatusWith<bool> ShardingCatalogClientImpl::updateConfigDocuments(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const BSONObj& query,
+    const BSONObj& update,
+    bool upsert,
+    const WriteConcernOptions& writeConcern) {
+    return _updateConfigDocument(
+        opCtx, nss, query, update, upsert, writeConcern, true /* useMultiUpdate */);
 }
 
 StatusWith<bool> ShardingCatalogClientImpl::_updateConfigDocument(
@@ -935,11 +945,9 @@ StatusWith<bool> ShardingCatalogClientImpl::_updateConfigDocument(
     const BSONObj& query,
     const BSONObj& update,
     bool upsert,
-    const WriteConcernOptions& writeConcern) {
+    const WriteConcernOptions& writeConcern,
+    bool useMultiUpdate) {
     invariant(nss.db() == NamespaceString::kConfigDb);
-
-    const BSONElement idField = query.getField("_id");
-    invariant(!idField.eoo());
 
     BatchedCommandRequest request([&] {
         write_ops::Update updateOp(nss);
@@ -948,7 +956,7 @@ StatusWith<bool> ShardingCatalogClientImpl::_updateConfigDocument(
             entry.setQ(query);
             entry.setU(update);
             entry.setUpsert(upsert);
-            entry.setMulti(false);
+            entry.setMulti(useMultiUpdate);
             return entry;
         }()});
         return updateOp;
@@ -965,8 +973,14 @@ StatusWith<bool> ShardingCatalogClientImpl::_updateConfigDocument(
     }
 
     const auto nSelected = response.getN();
-    invariant(nSelected == 0 || nSelected == 1);
-    return (nSelected == 1);
+
+    if (useMultiUpdate) {
+        invariant(nSelected >= 0);
+        return (nSelected > 0);
+    } else {
+        invariant(nSelected == 0 || nSelected == 1);
+        return (nSelected == 1);
+    }
 }
 
 Status ShardingCatalogClientImpl::removeConfigDocuments(OperationContext* opCtx,

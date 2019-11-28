@@ -69,6 +69,20 @@
 
 namespace mongo {
 
+namespace {
+
+/**
+ * Calculates and returns a new murmur hash value based on the prior murmur hash and a new piece
+ * of data.
+ */
+uint32_t addDataToChecksum(const void* startOfData, size_t sizeOfData, uint32_t checksum) {
+    unsigned newChecksum;
+    MurmurHash3_x86_32(startOfData, sizeOfData, checksum, &newChecksum);
+    return newChecksum;
+}
+
+}  // namespace
+
 namespace sorter {
 
 using std::shared_ptr;
@@ -158,12 +172,14 @@ public:
     FileIterator(const std::string& fileName,
                  std::streampos fileStartOffset,
                  std::streampos fileEndOffset,
-                 const Settings& settings)
+                 const Settings& settings,
+                 const uint32_t checksum)
         : _settings(settings),
           _done(false),
           _fileName(fileName),
           _fileStartOffset(fileStartOffset),
-          _fileEndOffset(fileEndOffset) {
+          _fileEndOffset(fileEndOffset),
+          _originalChecksum(checksum) {
         uassert(16815,
                 str::stream() << "unexpected empty file: " << _fileName,
                 boost::filesystem::file_size(_fileName) != 0);
@@ -172,25 +188,34 @@ public:
     void openSource() {
         _file.open(_fileName.c_str(), std::ios::in | std::ios::binary);
         uassert(16814,
-                str::stream() << "error opening file \"" << _fileName << "\": "
-                              << myErrnoWithDescription(),
+                str::stream() << "error opening file \"" << _fileName
+                              << "\": " << myErrnoWithDescription(),
                 _file.good());
         _file.seekg(_fileStartOffset);
         uassert(50979,
                 str::stream() << "error seeking starting offset of '" << _fileStartOffset
-                              << "' in file \""
-                              << _fileName
-                              << "\": "
-                              << myErrnoWithDescription(),
+                              << "' in file \"" << _fileName << "\": " << myErrnoWithDescription(),
                 _file.good());
     }
 
     void closeSource() {
         _file.close();
         uassert(50969,
-                str::stream() << "error closing file \"" << _fileName << "\": "
-                              << myErrnoWithDescription(),
+                str::stream() << "error closing file \"" << _fileName
+                              << "\": " << myErrnoWithDescription(),
                 !_file.fail());
+
+        // If the file iterator reads through all data objects, we can ensure non-corrupt data
+        // by comparing the newly calculated checksum with the original checksum from the data
+        // written to disk. Some iterators do not read back all data from the file, which prohibits
+        // the _afterReadChecksum from obtaining all the information needed. Thus, we only fassert
+        // if all data that was written to disk is read back and the checksums are not equivalent.
+        if (_done && _bufferReader->atEof() && (_originalChecksum != _afterReadChecksum)) {
+            fassert(31182,
+                    Status(ErrorCodes::Error::ChecksumMismatch,
+                           "Data read from disk does not match what was written to disk. Possible "
+                           "corruption of data."));
+        }
     }
 
     bool more() {
@@ -203,12 +228,22 @@ public:
         verify(!_done);
         fillBufferIfNeeded();
 
+        const char* startOfNewData = static_cast<const char*>(_bufferReader->pos());
+
         // Note: calling read() on the _bufferReader buffer in the deserialize function advances the
         // buffer. Since Key comes before Value in the _bufferReader, and C++ makes no function
         // parameter evaluation order guarantees, we cannot deserialize Key and Value straight into
         // the Data constructor
         auto first = Key::deserializeForSorter(*_bufferReader, _settings.first);
         auto second = Value::deserializeForSorter(*_bufferReader, _settings.second);
+
+        // The difference of _bufferReader's position before and after reading the data
+        // will provide the length of the data that was just read.
+        const char* endOfNewData = static_cast<const char*>(_bufferReader->pos());
+
+        _afterReadChecksum =
+            addDataToChecksum(startOfNewData, endOfNewData - startOfNewData, _afterReadChecksum);
+
         return Data(std::move(first), std::move(second));
     }
 
@@ -290,8 +325,8 @@ private:
 
         const std::streampos offset = _file.tellg();
         uassert(51049,
-                str::stream() << "error reading file \"" << _fileName << "\": "
-                              << myErrnoWithDescription(),
+                str::stream() << "error reading file \"" << _fileName
+                              << "\": " << myErrnoWithDescription(),
                 offset >= 0);
 
         if (offset >= _fileEndOffset) {
@@ -302,20 +337,31 @@ private:
 
         _file.read(reinterpret_cast<char*>(out), size);
         uassert(16817,
-                str::stream() << "error reading file \"" << _fileName << "\": "
-                              << myErrnoWithDescription(),
+                str::stream() << "error reading file \"" << _fileName
+                              << "\": " << myErrnoWithDescription(),
                 _file.good());
         verify(_file.gcount() == static_cast<std::streamsize>(size));
     }
 
     const Settings _settings;
     bool _done;
+
     std::unique_ptr<char[]> _buffer;
     std::unique_ptr<BufReader> _bufferReader;
     std::string _fileName;            // File containing the sorted data range.
     std::streampos _fileStartOffset;  // File offset at which the sorted data range starts.
     std::streampos _fileEndOffset;    // File offset at which the sorted data range ends.
     std::ifstream _file;
+
+    // Checksum value that is updated with each read of a data object from disk. We can compare
+    // this value with _originalChecksum to check for data corruption if and only if the
+    // FileIterator is exhausted.
+    uint32_t _afterReadChecksum = 0;
+
+    // Checksum value retrieved from SortedFileWriter that was calculated as data was spilled
+    // to disk. This is not modified, and is only used for comparison against _afterReadChecksum
+    // when the FileIterator is exhausted to ensure no data corruption.
+    const uint32_t _originalChecksum;
 };
 
 /**
@@ -556,8 +602,7 @@ private:
             // need to be revisited.
             uasserted(16819,
                       str::stream()
-                          << "Sort exceeded memory limit of "
-                          << _opts.maxMemoryUsageBytes
+                          << "Sort exceeded memory limit of " << _opts.maxMemoryUsageBytes
                           << " bytes, but did not opt in to external sorting. Aborting operation."
                           << " Pass allowDiskUse:true to opt in.");
         }
@@ -844,8 +889,7 @@ private:
             // need to be revisited.
             uasserted(16820,
                       str::stream()
-                          << "Sort exceeded memory limit of "
-                          << _opts.maxMemoryUsageBytes
+                          << "Sort exceeded memory limit of " << _opts.maxMemoryUsageBytes
                           << " bytes, but did not opt in to external sorting. Aborting operation."
                           << " Pass allowDiskUse:true to opt in.");
         }
@@ -921,8 +965,8 @@ SortedFileWriter<Key, Value>::SortedFileWriter(const SortOptions& opts,
     // limits.
     _file.open(_fileName.c_str(), std::ios::binary | std::ios::app | std::ios::out);
     uassert(16818,
-            str::stream() << "error opening file \"" << _fileName << "\": "
-                          << sorter::myErrnoWithDescription(),
+            str::stream() << "error opening file \"" << _fileName
+                          << "\": " << sorter::myErrnoWithDescription(),
             _file.good());
     // The file descriptor is positioned at the end of a file when opened in append mode, but
     // _file.tellp() is not initialized on all systems to reflect this. Therefore, we must also pass
@@ -935,8 +979,18 @@ SortedFileWriter<Key, Value>::SortedFileWriter(const SortOptions& opts,
 
 template <typename Key, typename Value>
 void SortedFileWriter<Key, Value>::addAlreadySorted(const Key& key, const Value& val) {
+
+    // Offset that points to the place in the buffer where a new data object will be stored.
+    int _nextObjPos = _buffer.len();
+
+    // Add serialized key and value to the buffer.
     key.serializeForSorter(_buffer);
     val.serializeForSorter(_buffer);
+
+    // Serializing the key and value grows the buffer, but _buffer.buf() still points to the
+    // beginning. Use _buffer.len() to determine portion of buffer containing new datum.
+    _checksum =
+        addDataToChecksum(_buffer.buf() + _nextObjPos, _buffer.len() - _nextObjPos, _checksum);
 
     if (_buffer.len() > 64 * 1024)
         spill();
@@ -985,8 +1039,8 @@ void SortedFileWriter<Key, Value>::spill() {
         _file.write(outBuffer, std::abs(size));
     } catch (const std::exception&) {
         msgasserted(16821,
-                    str::stream() << "error writing to file \"" << _fileName << "\": "
-                                  << sorter::myErrnoWithDescription());
+                    str::stream() << "error writing to file \"" << _fileName
+                                  << "\": " << sorter::myErrnoWithDescription());
     }
 
     _buffer.reset();
@@ -998,8 +1052,7 @@ SortIteratorInterface<Key, Value>* SortedFileWriter<Key, Value>::done() {
     std::streampos currentFileOffset = _file.tellp();
     uassert(50980,
             str::stream() << "error fetching current file descriptor offset in file \"" << _fileName
-                          << "\": "
-                          << sorter::myErrnoWithDescription(),
+                          << "\": " << sorter::myErrnoWithDescription(),
             currentFileOffset >= 0);
 
     // In case nothing was written to disk, use _fileStartOffset because tellp() may not be
@@ -1008,7 +1061,7 @@ SortIteratorInterface<Key, Value>* SortedFileWriter<Key, Value>::done() {
     _file.close();
 
     return new sorter::FileIterator<Key, Value>(
-        _fileName, _fileStartOffset, _fileEndOffset, _settings);
+        _fileName, _fileStartOffset, _fileEndOffset, _settings, _checksum);
 }
 
 //
@@ -1047,4 +1100,4 @@ Sorter<Key, Value>* Sorter<Key, Value>::make(const SortOptions& opts,
             return new sorter::TopKSorter<Key, Value, Comparator>(opts, comp, settings);
     }
 }
-}
+}  // namespace mongo

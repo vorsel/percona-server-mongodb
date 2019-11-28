@@ -143,13 +143,11 @@ public:
         dbtests::WriteContextForTests ctx(&opCtx, _nss.ns());
         const std::string indexName = "x_1";
 
-        ASSERT_OK(dbtests::createIndexFromSpec(
-            &opCtx,
-            _nss.ns(),
-            BSON("name" << indexName << "ns" << _nss.ns() << "key" << BSON("x" << 1) << "v"
-                        << static_cast<int>(kIndexVersion)
-                        << "expireAfterSeconds"
-                        << 5)));
+        ASSERT_OK(dbtests::createIndexFromSpec(&opCtx,
+                                               _nss.ns(),
+                                               BSON("name" << indexName << "key" << BSON("x" << 1)
+                                                           << "v" << static_cast<int>(kIndexVersion)
+                                                           << "expireAfterSeconds" << 5)));
 
         const IndexDescriptor* desc = _catalog->findIndexByName(&opCtx, indexName);
         ASSERT(desc);
@@ -194,4 +192,4 @@ public:
 };
 
 SuiteInstance<IndexCatalogTests> indexCatalogTests;
-}
+}  // namespace IndexCatalogTests

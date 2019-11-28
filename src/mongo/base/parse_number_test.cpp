@@ -39,7 +39,6 @@
 #include "mongo/base/parse_number.h"
 #include "mongo/base/status.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/if_constexpr.h"
 #include "mongo/util/str.h"  // for str::stream()!
 
 #define ASSERT_PARSES_WITH_PARSER(type, input_string, parser, expected_value) \
@@ -137,7 +136,10 @@ PARSE_TEST(TestRejectingBadBases) {
     std::vector<Spec> specs = {{-1, "0"}, {1, "10"}, {37, "-10"}, {-1, " "}, {37, "f"}, {-1, "^%"}};
     if (typeid(NumberType) == typeid(double)) {
         std::vector<Spec> doubleSpecs = {
-            {8, "0"}, {10, "0"}, {16, "0"}, {36, "0"},
+            {8, "0"},
+            {10, "0"},
+            {16, "0"},
+            {36, "0"},
         };
         std::copy(doubleSpecs.begin(), doubleSpecs.end(), std::back_inserter(specs));
     }
@@ -156,7 +158,7 @@ PARSE_TEST(TestParsingNonNegatives) {
         StringData spec;
         int expectedValue;
     } specs[] = {{"10", 10}, {"0", 0}, {"1", 1}, {"0xff", 0xff}, {"077", 077}};
-    for (const auto[str, expected] : specs) {
+    for (const auto [str, expected] : specs) {
         ASSERT_PARSES(NumberType, str, expected);
     }
 }
@@ -271,7 +273,7 @@ PARSE_TEST(TestSkipLeadingWhitespace) {
                  {"-077", true}};
     NumberParser defaultParser;
     NumberParser skipWs = NumberParser().skipWhitespace();
-    for (const auto[numStr, is_negative] : specs) {
+    for (const auto [numStr, is_negative] : specs) {
         NumberType expected;
 
         bool shouldParse = !is_negative || (is_negative && std::is_signed_v<NumberType>);
@@ -322,7 +324,7 @@ PARSE_TEST(TestEndOfNum) {
         "g",  // since the largest inferred base is 16, next non-number character will be g
         ""};
     NumberParser defaultParser;
-    for (const auto[numStr, is_negative] : specs) {
+    for (const auto [numStr, is_negative] : specs) {
         NumberType expected;
         bool shouldParse = !is_negative || (is_negative && std::is_signed_v<NumberType>);
         Status parsed = defaultParser(numStr, &expected);
@@ -384,7 +386,7 @@ PARSE_TEST(TestSkipLeadingWsAndEndptr) {
                  {"-077", true}};
     StringData whitespaces[] = {" ", "", "\t  \t", "\r\n\n\t", "\f\v "};
     NumberParser defaultParser;
-    for (const auto[numStr, is_negative] : specs) {
+    for (const auto [numStr, is_negative] : specs) {
         NumberType expected;
         bool shouldParse = !is_negative || (is_negative && std::is_signed_v<NumberType>);
         Status parsed = defaultParser(numStr, &expected);

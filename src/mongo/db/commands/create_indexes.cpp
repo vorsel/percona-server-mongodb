@@ -111,9 +111,9 @@ StatusWith<std::vector<BSONObj>> parseAndValidateIndexSpecs(
         if (kIndexesFieldName == cmdElemFieldName) {
             if (cmdElem.type() != BSONType::Array) {
                 return {ErrorCodes::TypeMismatch,
-                        str::stream() << "The field '" << kIndexesFieldName
-                                      << "' must be an array, but got "
-                                      << typeName(cmdElem.type())};
+                        str::stream()
+                            << "The field '" << kIndexesFieldName << "' must be an array, but got "
+                            << typeName(cmdElem.type())};
             }
 
             for (auto&& indexesElem : cmdElem.Obj()) {
@@ -130,7 +130,7 @@ StatusWith<std::vector<BSONObj>> parseAndValidateIndexSpecs(
                 }
 
                 auto indexSpecStatus = index_key_validate::validateIndexSpec(
-                    opCtx, parsedIndexSpec, ns, featureCompatibility);
+                    opCtx, parsedIndexSpec, featureCompatibility);
                 if (!indexSpecStatus.isOK()) {
                     return indexSpecStatus.getStatus().withContext(
                         str::stream() << "Error in specification " << parsedIndexSpec.toString());
@@ -166,16 +166,15 @@ StatusWith<std::vector<BSONObj>> parseAndValidateIndexSpecs(
             continue;
         } else {
             return {ErrorCodes::BadValue,
-                    str::stream() << "Invalid field specified for " << kCommandName << " command: "
-                                  << cmdElemFieldName};
+                    str::stream() << "Invalid field specified for " << kCommandName
+                                  << " command: " << cmdElemFieldName};
         }
     }
 
     if (!hasIndexesField) {
         return {ErrorCodes::FailedToParse,
                 str::stream() << "The '" << kIndexesFieldName
-                              << "' field is a required argument of the "
-                              << kCommandName
+                              << "' field is a required argument of the " << kCommandName
                               << " command"};
     }
 
@@ -205,15 +204,13 @@ Status validateTTLOptions(OperationContext* opCtx, const BSONObj& cmdObj) {
                     str::stream() << "TTL index '" << kExpireAfterSeconds
                                   << "' option must be numeric, but received a type of '"
                                   << typeName(expireAfterSecondsElt.type())
-                                  << "'. Index spec: "
-                                  << indexObj};
+                                  << "'. Index spec: " << indexObj};
         }
 
         if (expireAfterSecondsElt.safeNumberLong() < 0) {
             return {ErrorCodes::CannotCreateIndex,
                     str::stream() << "TTL index '" << kExpireAfterSeconds
-                                  << "' option cannot be less than 0. Index spec: "
-                                  << indexObj};
+                                  << "' option cannot be less than 0. Index spec: " << indexObj};
         }
 
         const std::string tooLargeErr = str::stream()
@@ -296,8 +293,7 @@ void checkUniqueIndexConstraints(OperationContext* opCtx,
     const ShardKeyPattern shardKeyPattern(metadata->getKeyPattern());
     uassert(ErrorCodes::CannotCreateIndex,
             str::stream() << "cannot create unique index over " << newIdxKey
-                          << " with shard key pattern "
-                          << shardKeyPattern.toBSON(),
+                          << " with shard key pattern " << shardKeyPattern.toBSON(),
             shardKeyPattern.isUniqueIndexCompatible(newIdxKey));
 }
 
@@ -398,11 +394,32 @@ Collection* getOrCreateCollection(OperationContext* opCtx,
         auto collection = db->createCollection(opCtx, ns, options);
         invariant(collection,
                   str::stream() << "Failed to create collection " << ns.ns()
-                                << " during index creation: "
-                                << redact(cmdObj));
+                                << " during index creation: " << redact(cmdObj));
         wunit.commit();
         return collection;
     });
+}
+
+/**
+ * Locks a collection in the database 'dbName' with UUID 'uuid' in the mode 'collectionLockMode',
+ * instantiating the lock in the 'collLock' reference.
+ */
+void lockCollectionByUUID(OperationContext* opCtx,
+                          const std::string& dbName,
+                          const UUID& uuid,
+                          LockMode collectionLockMode,
+                          boost::optional<Lock::CollectionLock>& collLock) {
+    NamespaceString prevResolvedNss;
+    NamespaceString resolvedNss;
+    NamespaceStringOrUUID nssOrUUID(dbName, uuid);
+    do {
+        prevResolvedNss = AutoGetCollection::resolveNamespaceStringOrUUID(opCtx, nssOrUUID);
+        collLock.emplace(opCtx, prevResolvedNss, collectionLockMode);
+
+        // We looked up UUID without a collection lock so it's possible that the
+        // collection name changed now. Look it up again.
+        resolvedNss = AutoGetCollection::resolveNamespaceStringOrUUID(opCtx, nssOrUUID);
+    } while (resolvedNss != prevResolvedNss);
 }
 
 bool runCreateIndexes(OperationContext* opCtx,
@@ -411,7 +428,7 @@ bool runCreateIndexes(OperationContext* opCtx,
                       std::string& errmsg,
                       BSONObjBuilder& result,
                       bool runTwoPhaseBuild) {
-    const NamespaceString ns(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
+    NamespaceString ns(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
     uassertStatusOK(userAllowedWriteNS(ns));
 
     // Disallow users from creating new indexes on config.transactions since the sessions code
@@ -451,7 +468,12 @@ bool runCreateIndexes(OperationContext* opCtx,
     opCtx->recoveryUnit()->setPrepareConflictBehavior(
         PrepareConflictBehavior::kIgnoreConflictsAllowWrites);
 
-    auto collection = getOrCreateCollection(opCtx, db, ns, cmdObj, &errmsg, &result);
+    Collection* collection = getOrCreateCollection(opCtx, db, ns, cmdObj, &errmsg, &result);
+    // Save the db name and collection uuid so we can correctly relock even across a
+    // concurrent rename collection operation. We allow rename collection while an
+    // index is in progress iff the rename is within the same database.
+    const std::string dbName = ns.db().toString();
+    const UUID collectionUUID = collection->uuid();
 
     // Use AutoStatsTracker to update Top.
     boost::optional<AutoStatsTracker> statsTracker;
@@ -522,7 +544,17 @@ bool runCreateIndexes(OperationContext* opCtx,
     // Collection scan and insert into index, followed by a drain of writes received in the
     // background.
     {
-        Lock::CollectionLock colLock(opCtx, ns, MODE_IS);
+        boost::optional<Lock::CollectionLock> colLock;
+        lockCollectionByUUID(opCtx, dbName, collectionUUID, MODE_IS, colLock);
+
+        // Reaquire the collection pointer because we momentarily released the collection lock.
+        collection = CollectionCatalog::get(opCtx).lookupCollectionByUUID(collectionUUID);
+        invariant(collection);
+
+        // Reaquire the 'ns' string in case the collection was renamed while we momentarily released
+        // the collection lock.
+        ns = collection->ns();
+
         uassertStatusOK(indexer.insertAllDocumentsInCollection(opCtx, collection));
     }
 
@@ -534,7 +566,16 @@ bool runCreateIndexes(OperationContext* opCtx,
     // Perform the first drain while holding an intent lock.
     {
         opCtx->recoveryUnit()->abandonSnapshot();
-        Lock::CollectionLock colLock(opCtx, ns, MODE_IS);
+        boost::optional<Lock::CollectionLock> colLock;
+        lockCollectionByUUID(opCtx, dbName, collectionUUID, MODE_IS, colLock);
+
+        // Reaquire the collection pointer because we momentarily released the collection lock.
+        collection = CollectionCatalog::get(opCtx).lookupCollectionByUUID(collectionUUID);
+        invariant(collection);
+
+        // Reaquire the 'ns' string in case the collection was renamed while we momentarily released
+        // the collection lock.
+        ns = collection->ns();
 
         uassertStatusOK(indexer.drainBackgroundWrites(opCtx));
     }
@@ -547,7 +588,16 @@ bool runCreateIndexes(OperationContext* opCtx,
     // Perform the second drain while stopping writes on the collection.
     {
         opCtx->recoveryUnit()->abandonSnapshot();
-        Lock::CollectionLock colLock(opCtx, ns, MODE_S);
+        boost::optional<Lock::CollectionLock> colLock;
+        lockCollectionByUUID(opCtx, dbName, collectionUUID, MODE_S, colLock);
+
+        // Reaquire the collection pointer because we momentarily released the collection lock.
+        collection = CollectionCatalog::get(opCtx).lookupCollectionByUUID(collectionUUID);
+        invariant(collection);
+
+        // Reaquire the 'ns' string in case the collection was renamed while we momentarily released
+        // the collection lock.
+        ns = collection->ns();
 
         uassertStatusOK(indexer.drainBackgroundWrites(opCtx));
     }
@@ -560,7 +610,15 @@ bool runCreateIndexes(OperationContext* opCtx,
     // Need to get exclusive collection lock back to complete the index build.
     if (indexer.isBackgroundBuilding()) {
         opCtx->recoveryUnit()->abandonSnapshot();
-        exclusiveCollectionLock.emplace(opCtx, ns, MODE_X);
+        lockCollectionByUUID(opCtx, dbName, collectionUUID, MODE_X, exclusiveCollectionLock);
+
+        // Reaquire the collection pointer because we momentarily released the collection lock.
+        collection = CollectionCatalog::get(opCtx).lookupCollectionByUUID(collectionUUID);
+        invariant(collection);
+
+        // Reaquire the 'ns' string in case the collection was renamed while we momentarily released
+        // the collection lock.
+        ns = collection->ns();
     }
 
     auto databaseHolder = DatabaseHolder::get(opCtx);
@@ -661,7 +719,7 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
 
     try {
         auto buildIndexFuture = uassertStatusOK(indexBuildsCoord->startIndexBuild(
-            opCtx, *collectionUUID, specs, buildUUID, protocol, indexBuildOptions));
+            opCtx, dbname, *collectionUUID, specs, buildUUID, protocol, indexBuildOptions));
 
         auto deadline = opCtx->getDeadline();
         // Date_t::max() means no deadline.
@@ -695,9 +753,7 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
             auto abortIndexFuture = indexBuildsCoord->abortIndexBuildByBuildUUID(
                 buildUUID,
                 str::stream() << "Index build interrupted due to change in replication state: "
-                              << buildUUID
-                              << ": "
-                              << ex.toString());
+                              << buildUUID << ": " << ex.toString());
             log() << "Index build aborted due to NotMaster error: " << buildUUID << ": "
                   << abortIndexFuture.getNoThrow(opCtx);
             throw;
@@ -717,9 +773,7 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
         // All other errors should be forwarded to the caller with index build information included.
         log() << "Index build failed: " << buildUUID << ": " << ex.toStatus();
         ex.addContext(str::stream() << "Index build failed: " << buildUUID << ": Collection " << ns
-                                    << " ( "
-                                    << *collectionUUID
-                                    << " )");
+                                    << " ( " << *collectionUUID << " )");
 
         // Set last op on error to provide the client with a specific optime to read the state of
         // the server when the createIndexes command failed.
@@ -785,7 +839,9 @@ public:
         bool shouldLogMessageOnAlreadyBuildingError = true;
         while (true) {
             try {
-                if (enableIndexBuildsCoordinatorForCreateIndexesCommand) {
+                // TODO: SERVER-42513 Re-enable on mobile.
+                if (enableIndexBuildsCoordinatorForCreateIndexesCommand &&
+                    storageGlobalParams.engine != "mobile") {
                     return runCreateIndexesWithCoordinator(
                         opCtx, dbname, cmdObj, errmsg, result, false /*two phase build*/);
                 }

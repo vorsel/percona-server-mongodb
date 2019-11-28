@@ -168,7 +168,6 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> attemptToGetExe
     Collection* collection,
     const NamespaceString& nss,
     const intrusive_ptr<ExpressionContext>& pExpCtx,
-    bool oplogReplay,
     BSONObj queryObj,
     BSONObj projectionObj,
     BSONObj sortObj,
@@ -178,7 +177,6 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> attemptToGetExe
     const MatchExpressionParser::AllowedFeatureSet& matcherFeatures) {
     auto qr = std::make_unique<QueryRequest>(nss);
     qr->setTailableMode(pExpCtx->tailableMode);
-    qr->setOplogReplay(oplogReplay);
     qr->setFilter(queryObj);
     qr->setProj(projectionObj);
     qr->setSort(sortObj);
@@ -414,7 +412,7 @@ getSortAndGroupStagesFromPipeline(const Pipeline::SourceContainer& sources) {
     if (sourcesIt != sources.end()) {
         sortStage = dynamic_cast<DocumentSourceSort*>(sourcesIt->get());
         if (sortStage) {
-            if (!sortStage->getLimitSrc()) {
+            if (!sortStage->hasLimit()) {
                 ++sourcesIt;
             } else {
                 // This $sort stage was previously followed by a $limit stage.
@@ -442,12 +440,10 @@ PipelineD::buildInnerQueryExecutorGeneric(Collection* collection,
 
     // Look for an initial match. This works whether we got an initial query or not. If not, it
     // results in a "{}" query, which will be what we want in that case.
-    bool oplogReplay = false;
     const BSONObj queryObj = pipeline->getInitialQuery();
     if (!queryObj.isEmpty()) {
         auto matchStage = dynamic_cast<DocumentSourceMatch*>(sources.front().get());
         if (matchStage) {
-            oplogReplay = dynamic_cast<DocumentSourceOplogMatch*>(matchStage) != nullptr;
             // If a $match query is pulled into the cursor, the $match is redundant, and can be
             // removed from the pipeline.
             sources.pop_front();
@@ -487,7 +483,6 @@ PipelineD::buildInnerQueryExecutorGeneric(Collection* collection,
                                                 nss,
                                                 pipeline,
                                                 expCtx,
-                                                oplogReplay,
                                                 sortStage,
                                                 std::move(rewrittenGroupStage),
                                                 deps,
@@ -513,9 +508,9 @@ PipelineD::buildInnerQueryExecutorGeneric(Collection* collection,
         (pipeline->peekFront() && pipeline->peekFront()->constraints().isChangeStreamStage());
 
     auto attachExecutorCallback = [deps, queryObj, sortObj, projForQuery, trackOplogTS](
-        Collection* collection,
-        std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
-        Pipeline* pipeline) {
+                                      Collection* collection,
+                                      std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
+                                      Pipeline* pipeline) {
         auto cursor = DocumentSourceCursor::create(
             collection, std::move(exec), pipeline->getContext(), trackOplogTS);
         addCursorSource(
@@ -558,7 +553,6 @@ PipelineD::buildInnerQueryExecutorGeoNear(Collection* collection,
                                                 nss,
                                                 pipeline,
                                                 expCtx,
-                                                false,   /* oplogReplay */
                                                 nullptr, /* sortStage */
                                                 nullptr, /* rewrittenGroupStage */
                                                 deps,
@@ -572,15 +566,14 @@ PipelineD::buildInnerQueryExecutorGeoNear(Collection* collection,
               str::stream() << "Unexpectedly got the following sort from the query system: "
                             << sortFromQuerySystem.jsonString());
 
-    auto attachExecutorCallback =
-        [
-          deps,
-          distanceField = geoNearStage->getDistanceField(),
-          locationField = geoNearStage->getLocationField(),
-          distanceMultiplier = geoNearStage->getDistanceMultiplier().value_or(1.0)
-        ](Collection * collection,
-          std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
-          Pipeline * pipeline) {
+    auto attachExecutorCallback = [deps,
+                                   distanceField = geoNearStage->getDistanceField(),
+                                   locationField = geoNearStage->getLocationField(),
+                                   distanceMultiplier =
+                                       geoNearStage->getDistanceMultiplier().value_or(1.0)](
+                                      Collection* collection,
+                                      std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
+                                      Pipeline* pipeline) {
         auto cursor = DocumentSourceGeoNearCursor::create(collection,
                                                           std::move(exec),
                                                           pipeline->getContext(),
@@ -600,7 +593,6 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
     const NamespaceString& nss,
     Pipeline* pipeline,
     const intrusive_ptr<ExpressionContext>& expCtx,
-    bool oplogReplay,
     const boost::intrusive_ptr<DocumentSourceSort>& sortStage,
     std::unique_ptr<GroupFromFirstDocumentTransformation> rewrittenGroupStage,
     const DepsTracker& deps,
@@ -652,7 +644,6 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
                                                       collection,
                                                       nss,
                                                       expCtx,
-                                                      oplogReplay,
                                                       queryObj,
                                                       *projectionObj,
                                                       sortObj ? *sortObj : emptySort,
@@ -664,7 +655,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
         if (swExecutorGrouped.isOK()) {
             // Any $limit stage before the $group stage should make the pipeline ineligible for this
             // optimization.
-            invariant(!sortStage || !sortStage->getLimitSrc());
+            invariant(!sortStage || !sortStage->hasLimit());
 
             // We remove the $sort and $group stages that begin the pipeline, because the executor
             // will handle the sort, and the groupTransform (added below) will handle the $group
@@ -708,7 +699,6 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
                                  collection,
                                  nss,
                                  expCtx,
-                                 oplogReplay,
                                  queryObj,
                                  expCtx->needsMerge ? metaSortProjection : emptyProjection,
                                  *sortObj,
@@ -724,7 +714,6 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
                                      collection,
                                      nss,
                                      expCtx,
-                                     oplogReplay,
                                      queryObj,
                                      *projectionObj,
                                      *sortObj,
@@ -751,9 +740,10 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
             // We know the sort is being handled by the query system, so remove the $sort stage.
             pipeline->_sources.pop_front();
 
-            if (sortStage->getLimitSrc()) {
+            if (sortStage->hasLimit()) {
                 // We need to reinsert the coalesced $limit after removing the $sort.
-                pipeline->_sources.push_front(sortStage->getLimitSrc());
+                pipeline->_sources.push_front(
+                    DocumentSourceLimit::create(expCtx, sortStage->getLimit()));
             }
             return std::move(exec);
         } else if (swExecutorSort == ErrorCodes::QueryPlanKilled) {
@@ -786,7 +776,6 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
                                                collection,
                                                nss,
                                                expCtx,
-                                               oplogReplay,
                                                queryObj,
                                                *projectionObj,
                                                *sortObj,
@@ -811,7 +800,6 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
                                 collection,
                                 nss,
                                 expCtx,
-                                oplogReplay,
                                 queryObj,
                                 *projectionObj,
                                 *sortObj,
@@ -838,7 +826,7 @@ void PipelineD::addCursorSource(Pipeline* pipeline,
     }
 
     if (!projectionObj.isEmpty()) {
-        cursor->setProjection(projectionObj, boost::none);
+        cursor->setProjection(projectionObj, boost::none, deps.getNeedsAnyMetadata());
     } else {
         // There may be fewer dependencies now if the sort was covered.
         if (!sortObj.isEmpty()) {
@@ -847,7 +835,7 @@ void PipelineD::addCursorSource(Pipeline* pipeline,
                                                  : DepsTracker::MetadataAvailable::kNoMetadata);
         }
 
-        cursor->setProjection(deps.toProjection(), deps.toParsedDeps());
+        cursor->setProjection(deps.toProjection(), deps.toParsedDeps(), deps.getNeedsAnyMetadata());
     }
 }
 

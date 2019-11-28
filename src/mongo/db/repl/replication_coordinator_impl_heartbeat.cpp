@@ -174,11 +174,11 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
         if (replMetadata.isOK() && _rsConfig.isInitialized() && _rsConfig.hasReplicaSetId() &&
             replMetadata.getValue().getReplicaSetId().isSet() &&
             _rsConfig.getReplicaSetId() != replMetadata.getValue().getReplicaSetId()) {
-            responseStatus = Status(ErrorCodes::InvalidReplicaSetConfig,
-                                    str::stream() << "replica set IDs do not match, ours: "
-                                                  << _rsConfig.getReplicaSetId()
-                                                  << "; remote node's: "
-                                                  << replMetadata.getValue().getReplicaSetId());
+            responseStatus =
+                Status(ErrorCodes::InvalidReplicaSetConfig,
+                       str::stream()
+                           << "replica set IDs do not match, ours: " << _rsConfig.getReplicaSetId()
+                           << "; remote node's: " << replMetadata.getValue().getReplicaSetId());
             // Ignore metadata.
             replMetadata = responseStatus;
         }
@@ -194,7 +194,9 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
             const auto isFCV42 = serverGlobalParams.featureCompatibility.isVersionInitialized() &&
                 serverGlobalParams.featureCompatibility.getVersion() ==
                     ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42;
-            if (_getMemberState_inlock().arbiter() || isFCV42) {
+            if (_getMemberState_inlock().arbiter() ||
+                (isFCV42 && !_getMemberState_inlock().startup() &&
+                 !_getMemberState_inlock().startup2())) {
                 // The node that sent the heartbeat is not guaranteed to be our sync source.
                 const bool fromSyncSource = false;
                 _advanceCommitPoint(

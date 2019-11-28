@@ -143,8 +143,8 @@ public:
              repl::ReplicationCoordinator::modeNone) &&
             (dbname == NamespaceString::kLocalDb)) {
             uasserted(ErrorCodes::IllegalOperation,
-                      str::stream() << "Cannot drop '" << dbname
-                                    << "' database while replication is active");
+                      str::stream()
+                          << "Cannot drop '" << dbname << "' database while replication is active");
         }
         BSONElement e = cmdObj.firstElement();
         int p = (int)e.number();
@@ -360,7 +360,7 @@ public:
 
             // Perform index spec validation.
             idIndexSpec = uassertStatusOK(index_key_validate::validateIndexSpec(
-                opCtx, idIndexSpec, ns, serverGlobalParams.featureCompatibility));
+                opCtx, idIndexSpec, serverGlobalParams.featureCompatibility));
             uassertStatusOK(index_key_validate::validateIdIndexSpec(idIndexSpec));
 
             // Validate or fill in _id index collation.

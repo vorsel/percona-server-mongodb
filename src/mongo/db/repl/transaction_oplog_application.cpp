@@ -66,7 +66,7 @@ Status _applyOperationsForTransaction(OperationContext* opCtx,
         try {
             AutoGetCollection coll(opCtx, op.getNss(), MODE_IX);
             auto status = repl::applyOperation_inlock(
-                opCtx, coll.getDb(), op.toBSON(), false /*alwaysUpsert*/, oplogApplicationMode);
+                opCtx, coll.getDb(), &op, false /*alwaysUpsert*/, oplogApplicationMode);
             if (!status.isOK()) {
                 return status;
             }
@@ -349,6 +349,12 @@ Status _applyPrepareTransaction(OperationContext* opCtx,
 
     auto transaction = TransactionParticipant::get(opCtx);
     transaction.unstashTransactionResources(opCtx, "prepareTransaction");
+
+    // Set this in case the application of any ops need to use the prepare timestamp of this
+    // transaction. It should be cleared automatically when the transaction finishes.
+    if (mode == repl::OplogApplication::Mode::kRecovering) {
+        transaction.setPrepareOpTimeForRecovery(opCtx, entry.getOpTime());
+    }
 
     auto status = _applyOperationsForTransaction(opCtx, ops, mode);
     fassert(31137, status);

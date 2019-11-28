@@ -454,15 +454,13 @@ ShardVersionMap RoutingTableHistory::_constructShardVersionMap() const {
                           str::stream()
                               << "Gap exists in the routing table between chunks "
                               << _chunkMap.at(_extractKeyString(*lastMax))->getRange().toString()
-                              << " and "
-                              << rangeLast->second->getRange().toString());
+                              << " and " << rangeLast->second->getRange().toString());
             else
                 uasserted(ErrorCodes::ConflictingOperationInProgress,
                           str::stream()
                               << "Overlap exists in the routing table between chunks "
                               << _chunkMap.at(_extractKeyString(*lastMax))->getRange().toString()
-                              << " and "
-                              << rangeLast->second->getRange().toString());
+                              << " and " << rangeLast->second->getRange().toString());
         }
 
         if (!firstMin)
@@ -520,7 +518,8 @@ std::shared_ptr<RoutingTableHistory> RoutingTableHistory::makeUpdated(
         const auto& chunkVersion = chunk.getVersion();
 
         uassert(ErrorCodes::ConflictingOperationInProgress,
-                str::stream() << "Chunk " << chunk.genID(getns(), chunk.getMin())
+                str::stream() << "Chunk with namespace " << chunk.getNS().ns() << " and min key "
+                              << chunk.getMin()
                               << " has epoch different from that of the collection "
                               << chunkVersion.epoch(),
                 collectionVersion.epoch() == chunkVersion.epoch());

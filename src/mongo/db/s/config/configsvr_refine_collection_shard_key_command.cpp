@@ -31,9 +31,11 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/audit.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/shard_key_util.h"
 #include "mongo/s/catalog/dist_lock_manager.h"
 #include "mongo/s/grid.h"
@@ -95,8 +97,7 @@ public:
 
             uassert(ErrorCodes::StaleEpoch,
                     str::stream()
-                        << "refineCollectionShardKey namespace "
-                        << nss.toString()
+                        << "refineCollectionShardKey namespace " << nss.toString()
                         << " has a different epoch than mongos had in its routing table cache",
                     request().getEpoch() == collType.getEpoch());
 
@@ -140,6 +141,13 @@ public:
                                                                  boost::none,
                                                                  collType.getUnique(),
                                                                  false);  // createIndexIfPossible
+
+            LOG(0) << "CMD: refineCollectionShardKey: " << request().toBSON({});
+
+            audit::logRefineCollectionShardKey(opCtx->getClient(), nss.ns(), proposedKey);
+
+            ShardingCatalogManager::get(opCtx)->refineCollectionShardKey(
+                opCtx, nss, newShardKeyPattern);
         }
 
     private:

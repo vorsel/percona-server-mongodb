@@ -99,6 +99,7 @@ selector:
   - jstests/sharding/shard_collection_existing_zones.js
   - jstests/sharding/single_shard_transaction_with_arbiter.js
   - jstests/sharding/single_shard_transaction_without_majority_reads_lagged.js
+  - jstests/sharding/multi_shard_transaction_without_majority_reads.js
   - jstests/sharding/snapshot_cursor_commands_mongos.js
   - jstests/sharding/transactions_causal_consistency.js
   - jstests/sharding/transactions_distinct_not_allowed_on_sharded_collections.js
@@ -140,10 +141,12 @@ selector:
   # Enable when 4.4 becomes last stable
   - jstests/sharding/explain_exec_stats_on_shards.js
   - jstests/sharding/refine_collection_shard_key_basic.js
+  - jstests/sharding/refine_collection_shard_key_jumbo.js
   - jstests/sharding/move_primary_clone_test.js
   - jstests/sharding/database_versioning_safe_secondary_reads.js
   - jstests/sharding/clone_catalog_data.js
   - jstests/sharding/database_and_shard_versioning_all_commands.js
+  - jstests/sharding/shard1.js
   # Enable if SERVER-41813 is backported or 4.4 becomes last-stable
   - jstests/sharding/invalid_system_views_sharded_collection.js
 
