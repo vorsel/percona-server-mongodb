@@ -56,6 +56,7 @@ server_parameters:
         description: "Password used with queryUser to bind to an LDAP server"
         set_at: runtime
         cpp_varname: "ldapGlobalParams.ldapQueryPassword"
+        redact: true
     ldapUserToDNMapping:
         description: "Provides mechanism to transform authenticated user name to a LDAP Distinguished Name (DN)"
         set_at: runtime
@@ -103,6 +104,8 @@ configs:
         description: 'Password used with queryUser to bind to an LDAP server'
         short_name: ldapQueryPassword
         arg_vartype: String
+        implicit: ''
+        redact: true
     'security.ldap.userToDNMapping':
         description: 'Provides mechanism to transform authenticated user name to a LDAP Distinguished Name (DN)'
         short_name: ldapUserToDNMapping
