@@ -1,6 +1,5 @@
-
 /**
- *    Copyright (C) 2018-present MongoDB, Inc.
+ *    Copyright (C) 2019-present MongoDB, Inc.
  *
  *    This program is free software: you can redistribute it and/or modify
  *    it under the terms of the Server Side Public License, version 1,
@@ -28,21 +27,23 @@
  *    it in the license file.
  */
 
-#include "mongo/db/index/fts_access_method.h"
-#include "mongo/db/catalog/index_catalog_entry.h"
-#include "mongo/db/index/expression_keys_private.h"
-#include "mongo/db/index/index_descriptor.h"
+#pragma once
+
+#include "mongo/bson/bsonobjbuilder.h"
 
 namespace mongo {
 
-FTSAccessMethod::FTSAccessMethod(IndexCatalogEntry* btreeState, SortedDataInterface* btree)
-    : IndexAccessMethod(btreeState, btree), _ftsSpec(btreeState->descriptor()->infoObj()) {}
+/**
+ * Namespace for static methods that are shared between explain on mongod and on mongos.
+ */
+namespace explain_common {
 
-void FTSAccessMethod::doGetKeys(const BSONObj& obj,
-                                GetKeysContext context,
-                                BSONObjSet* keys,
-                                MultikeyPaths* multikeyPaths) const {
-    ExpressionKeysPrivate::getFTSKeys(obj, _ftsSpec, keys);
-}
+/**
+ * Adds the 'serverInfo' explain section to the BSON object being built by 'out'.
+ *
+ * This section include the host, port, version, and gitVersion.
+ */
+void generateServerInfo(BSONObjBuilder* out);
 
+}  // namespace explain_common
 }  // namespace mongo

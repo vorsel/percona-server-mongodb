@@ -1,6 +1,5 @@
-
 /**
- *    Copyright (C) 2018-present MongoDB, Inc.
+ *    Copyright (C) 2019-present MongoDB, Inc.
  *
  *    This program is free software: you can redistribute it and/or modify
  *    it under the terms of the Server Side Public License, version 1,
@@ -28,21 +27,26 @@
  *    it in the license file.
  */
 
-#include "mongo/db/index/fts_access_method.h"
-#include "mongo/db/catalog/index_catalog_entry.h"
-#include "mongo/db/index/expression_keys_private.h"
-#include "mongo/db/index/index_descriptor.h"
+#include "mongo/platform/basic.h"
+
+#include "mongo/db/query/explain_common.h"
+
+#include "mongo/db/server_options.h"
+#include "mongo/util/net/sock.h"
+#include "mongo/util/version.h"
 
 namespace mongo {
+namespace explain_common {
 
-FTSAccessMethod::FTSAccessMethod(IndexCatalogEntry* btreeState, SortedDataInterface* btree)
-    : IndexAccessMethod(btreeState, btree), _ftsSpec(btreeState->descriptor()->infoObj()) {}
-
-void FTSAccessMethod::doGetKeys(const BSONObj& obj,
-                                GetKeysContext context,
-                                BSONObjSet* keys,
-                                MultikeyPaths* multikeyPaths) const {
-    ExpressionKeysPrivate::getFTSKeys(obj, _ftsSpec, keys);
+void generateServerInfo(BSONObjBuilder* out) {
+    BSONObjBuilder serverBob(out->subobjStart("serverInfo"));
+    out->append("host", getHostNameCached());
+    out->appendNumber("port", serverGlobalParams.port);
+    auto&& vii = VersionInfoInterface::instance();
+    out->append("version", vii.version());
+    out->append("gitVersion", vii.gitVersion());
+    serverBob.doneFast();
 }
 
+}  // namespace explain_common
 }  // namespace mongo
