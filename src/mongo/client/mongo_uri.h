@@ -39,7 +39,7 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/client/connection_string.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/transport/transport_layer.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/net/hostandport.h"
@@ -238,9 +238,14 @@ public:
     // server (say a member of a replica-set), you can pass in its HostAndPort information to
     // get a new URI with the same info, except type() will be MASTER and getServers() will
     // be the single host you pass in.
-    MongoURI cloneURIForServer(HostAndPort hostAndPort) const {
+    MongoURI cloneURIForServer(HostAndPort hostAndPort, StringData applicationName) const {
         auto out = *this;
         out._connectString = ConnectionString(std::move(hostAndPort));
+
+        if (!out.getAppName()) {
+            out._options["appName"] = applicationName.toString();
+        }
+
         return out;
     }
 

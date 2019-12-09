@@ -57,8 +57,8 @@ MONGO_FAIL_POINT_DEFINE(initialSyncHangBeforeListCollections);
 
 namespace {
 
-using LockGuard = stdx::lock_guard<stdx::mutex>;
-using UniqueLock = stdx::unique_lock<stdx::mutex>;
+using LockGuard = stdx::lock_guard<Latch>;
+using UniqueLock = stdx::unique_lock<Latch>;
 using executor::RemoteCommandRequest;
 
 const char* kNameFieldName = "name";
@@ -112,22 +112,22 @@ DatabaseCloner::DatabaseCloner(executor::TaskExecutor* executor,
       _storageInterface(si),
       _collectionWork(collWork),
       _onCompletion(std::move(onCompletion)),
-      _listCollectionsFetcher(_executor,
-                              _source,
-                              _dbname,
-                              createListCollectionsCommandObject(_listCollectionsFilter),
-                              [=](const StatusWith<Fetcher::QueryResponse>& result,
-                                  Fetcher::NextAction* nextAction,
-                                  BSONObjBuilder* getMoreBob) {
-                                  _listCollectionsCallback(result, nextAction, getMoreBob);
-                              },
-                              ReadPreferenceSetting::secondaryPreferredMetadata(),
-                              RemoteCommandRequest::kNoTimeout /* find network timeout */,
-                              RemoteCommandRequest::kNoTimeout /* getMore network timeout */,
-                              RemoteCommandRetryScheduler::makeRetryPolicy(
-                                  numInitialSyncListCollectionsAttempts.load(),
-                                  executor::RemoteCommandRequest::kNoTimeout,
-                                  RemoteCommandRetryScheduler::kAllRetriableErrors)),
+      _listCollectionsFetcher(
+          _executor,
+          _source,
+          _dbname,
+          createListCollectionsCommandObject(_listCollectionsFilter),
+          [=](const StatusWith<Fetcher::QueryResponse>& result,
+              Fetcher::NextAction* nextAction,
+              BSONObjBuilder* getMoreBob) {
+              _listCollectionsCallback(result, nextAction, getMoreBob);
+          },
+          ReadPreferenceSetting::secondaryPreferredMetadata(),
+          RemoteCommandRequest::kNoTimeout /* find network timeout */,
+          RemoteCommandRequest::kNoTimeout /* getMore network timeout */,
+          RemoteCommandRetryScheduler::makeRetryPolicy<ErrorCategory::RetriableError>(
+              numInitialSyncListCollectionsAttempts.load(),
+              executor::RemoteCommandRequest::kNoTimeout)),
       _startCollectionCloner([](CollectionCloner& cloner) { return cloner.startup(); }) {
     // Fetcher throws an exception on null executor.
     invariant(executor);
@@ -206,7 +206,7 @@ Status DatabaseCloner::startup() noexcept {
 }
 
 void DatabaseCloner::shutdown() {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
     switch (_state) {
         case State::kPreStart:
             // Transition directly from PreStart to Complete if not started yet.
@@ -254,7 +254,7 @@ void DatabaseCloner::setStartCollectionClonerFn(
 }
 
 DatabaseCloner::State DatabaseCloner::getState_forTest() const {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     return _state;
 }
 

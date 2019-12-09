@@ -32,7 +32,7 @@
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/s/wait_for_majority_service.h"
 #include "mongo/db/service_context_d_test_fixture.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -64,7 +64,7 @@ public:
     }
 
     void finishWaitingOneOpTime() {
-        stdx::unique_lock<stdx::mutex> lk(_mutex);
+        stdx::unique_lock<Latch> lk(_mutex);
         _isTestReady = true;
         _isTestReadyCV.notify_one();
 
@@ -74,19 +74,18 @@ public:
     }
 
     Status waitForWriteConcernStub(OperationContext* opCtx, const repl::OpTime& opTime) {
-        stdx::unique_lock<stdx::mutex> lk(_mutex);
+        stdx::unique_lock<Latch> lk(_mutex);
 
         _waitForMajorityCallCount++;
         _callCountChangedCV.notify_one();
 
-        while (!_isTestReady) {
-            auto status = opCtx->waitForConditionOrInterruptNoAssert(_isTestReadyCV, lk);
-            if (!status.isOK()) {
-                _isTestReady = false;
-                _finishWaitingOneOpTimeCV.notify_one();
+        try {
+            opCtx->waitForConditionOrInterrupt(_isTestReadyCV, lk, [&] { return _isTestReady; });
+        } catch (const DBException& e) {
+            _isTestReady = false;
+            _finishWaitingOneOpTimeCV.notify_one();
 
-                return status;
-            }
+            return e.toStatus();
         }
 
         _lastOpTimeWaited = opTime;
@@ -97,7 +96,7 @@ public:
     }
 
     const repl::OpTime& getLastOpTimeWaited() {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
         return _lastOpTimeWaited;
     }
 
@@ -109,7 +108,7 @@ public:
 private:
     WaitForMajorityService _waitForMajorityService;
 
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("WaitForMajorityServiceTest::_mutex");
     stdx::condition_variable _isTestReadyCV;
     stdx::condition_variable _finishWaitingOneOpTimeCV;
     stdx::condition_variable _callCountChangedCV;

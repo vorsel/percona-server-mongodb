@@ -47,6 +47,8 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/platform/process_id.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
+#include "mongo/util/exit.h"
+#include "mongo/util/exit_code.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/log.h"
 #include "mongo/util/timer.h"
@@ -59,7 +61,7 @@ WatchdogPeriodicThread::WatchdogPeriodicThread(Milliseconds period, StringData t
 
 void WatchdogPeriodicThread::start() {
     {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
 
         invariant(_state == State::kNotStarted);
         _state = State::kStarted;
@@ -74,7 +76,7 @@ void WatchdogPeriodicThread::shutdown() {
     stdx::thread thread;
 
     {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
 
         bool started = (_state == State::kStarted);
 
@@ -99,7 +101,7 @@ void WatchdogPeriodicThread::shutdown() {
 }
 
 void WatchdogPeriodicThread::setPeriod(Milliseconds period) {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
 
     bool wasEnabled = _enabled;
 
@@ -128,7 +130,7 @@ void WatchdogPeriodicThread::doLoop() {
     auto preciseClockSource = client->getServiceContext()->getPreciseClockSource();
 
     {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
 
         // Ensure state is starting from a clean slate.
         resetState();
@@ -142,27 +144,29 @@ void WatchdogPeriodicThread::doLoop() {
         Date_t startTime = preciseClockSource->now();
 
         {
-            stdx::unique_lock<stdx::mutex> lock(_mutex);
+            stdx::unique_lock<Latch> lock(_mutex);
             MONGO_IDLE_THREAD_BLOCK;
 
 
             // Check if the period is different?
             // We are signalled on period changes at which point we may be done waiting or need to
             // wait longer.
-            while (startTime + _period > preciseClockSource->now() &&
-                   _state != State::kShutdownRequested) {
-                auto s = opCtx->waitForConditionOrInterruptNoAssertUntil(
-                    _condvar, lock, startTime + _period);
-
-                if (!s.isOK()) {
-                    // The only bad status is when we are in shutdown
-                    if (!opCtx->getServiceContext()->getKillAllOperations()) {
-                        error() << "Watchdog was interrupted, shuting down:, reason: "
-                                << s.getStatus();
-                    }
-
-                    return;
+            try {
+                opCtx->waitForConditionOrInterruptUntil(_condvar, lock, startTime + _period, [&] {
+                    return (startTime + _period) <= preciseClockSource->now() ||
+                        _state == State::kShutdownRequested;
+                });
+            } catch (const DBException& e) {
+                // The only bad status is when we are in shutdown
+                if (!opCtx->getServiceContext()->getKillAllOperations()) {
+                    severe() << "Watchdog was interrupted, shutting down, reason: " << e.toStatus();
+                    exitCleanly(ExitCode::EXIT_ABRUPT);
                 }
+
+                // This interruption ends the WatchdogPeriodicThread. This means it is possible to
+                // killOp this operation and stop it for the lifetime of the process.
+                LOG(1) << "WatchdogPeriodicThread interrupted by: " << e;
+                return;
             }
 
             // Are we done running?
@@ -254,7 +258,7 @@ void WatchdogMonitor::start() {
     _watchdogMonitorThread.start();
 
     {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
 
         invariant(_state == State::kNotStarted);
         _state = State::kStarted;
@@ -263,7 +267,7 @@ void WatchdogMonitor::start() {
 
 void WatchdogMonitor::setPeriod(Milliseconds duration) {
     {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
 
         if (duration > Milliseconds(0)) {
             dassert(duration >= Milliseconds(1));
@@ -287,7 +291,7 @@ void WatchdogMonitor::setPeriod(Milliseconds duration) {
 
 void WatchdogMonitor::shutdown() {
     {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
 
         bool started = (_state == State::kStarted);
 

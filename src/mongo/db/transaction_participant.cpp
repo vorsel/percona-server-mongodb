@@ -1287,13 +1287,15 @@ void TransactionParticipant::Participant::commitUnpreparedTransaction(OperationC
     auto wc = opCtx->getWriteConcern();
     auto needsNoopWrite = txnOps.empty() && !opCtx->getWriteConcern().usedDefault;
 
+    const size_t operationCount = p().transactionOperations.size();
+    const size_t oplogOperationBytes = p().transactionOperationBytes;
     clearOperationsInMemory(opCtx);
 
     try {
         // Once committing we cannot throw an exception.
         UninterruptibleLockGuard noInterrupt(opCtx->lockState());
         _commitStorageTransaction(opCtx);
-        _finishCommitTransaction(opCtx);
+        _finishCommitTransaction(opCtx, operationCount, oplogOperationBytes);
     } catch (...) {
         // It is illegal for committing a transaction to fail for any reason, other than an
         // invalid command, so we crash instead.
@@ -1415,9 +1417,11 @@ void TransactionParticipant::Participant::commitPreparedTransaction(
         opObserver->onPreparedTransactionCommit(
             opCtx, commitOplogSlot, commitTimestamp, retrieveCompletedTransactionOperations(opCtx));
 
+        const size_t operationCount = p().transactionOperations.size();
+        const size_t oplogOperationBytes = p().transactionOperationBytes;
         clearOperationsInMemory(opCtx);
 
-        _finishCommitTransaction(opCtx);
+        _finishCommitTransaction(opCtx, operationCount, oplogOperationBytes);
     } catch (...) {
         // It is illegal for committing a prepared transaction to fail for any reason, other than an
         // invalid command, so we crash instead.
@@ -1448,15 +1452,20 @@ void TransactionParticipant::Participant::_commitStorageTransaction(OperationCon
     std::terminate();
 }
 
-void TransactionParticipant::Participant::_finishCommitTransaction(OperationContext* opCtx) {
+void TransactionParticipant::Participant::_finishCommitTransaction(OperationContext* opCtx,
+                                                                   size_t operationCount,
+                                                                   size_t oplogOperationBytes) {
     {
         auto tickSource = opCtx->getServiceContext()->getTickSource();
         stdx::lock_guard<Client> lk(*opCtx->getClient());
         o(lk).txnState.transitionTo(TransactionState::kCommitted);
 
-        o(lk).transactionMetricsObserver.onCommit(ServerTransactionsMetrics::get(opCtx),
+        o(lk).transactionMetricsObserver.onCommit(opCtx,
+                                                  ServerTransactionsMetrics::get(opCtx),
                                                   tickSource,
-                                                  &Top::get(getGlobalServiceContext()));
+                                                  &Top::get(getGlobalServiceContext()),
+                                                  operationCount,
+                                                  oplogOperationBytes);
         o(lk).transactionMetricsObserver.onTransactionOperation(
             opCtx, CurOp::get(opCtx)->debug().additiveMetrics, o().txnState.isPrepared());
     }
@@ -1522,27 +1531,56 @@ void TransactionParticipant::Participant::_abortActiveTransaction(
         o(lk).transactionMetricsObserver.onTransactionOperation(
             opCtx, CurOp::get(opCtx)->debug().additiveMetrics, o().txnState.isPrepared());
     }
-    // We reserve an oplog slot before aborting the transaction so that no writes that are causally
-    // related to the transaction abort enter the oplog at a timestamp earlier than the abort oplog
-    // entry. On secondaries, we generate a fake empty oplog slot, since it's not used by the
-    // OpObserver.
-    boost::optional<OplogSlotReserver> oplogSlotReserver;
-    boost::optional<OplogSlot> abortOplogSlot;
-    if (opCtx->writesAreReplicated() && p().needToWriteAbortEntry) {
-        oplogSlotReserver.emplace(opCtx);
-        abortOplogSlot = oplogSlotReserver->getLastSlot();
-    }
 
-    // Clean up the transaction resources on the opCtx even if the transaction resources on the
-    // session were not aborted. This actually aborts the storage-transaction.
-    _cleanUpTxnResourceOnOpCtx(opCtx, TerminationCause::kAborted);
-
-    // Write the abort oplog entry. This must be done after aborting the storage transaction, so
-    // that the lock state is reset, and there is no max lock timeout on the locker.
     auto opObserver = opCtx->getServiceContext()->getOpObserver();
     invariant(opObserver);
-    opObserver->onTransactionAbort(opCtx, abortOplogSlot);
 
+    const bool needToWriteAbortEntry = opCtx->writesAreReplicated() && p().needToWriteAbortEntry;
+    if (needToWriteAbortEntry) {
+        // We reserve an oplog slot before aborting the transaction so that no writes that are
+        // causally related to the transaction abort enter the oplog at a timestamp earlier than the
+        // abort oplog entry.
+        OplogSlotReserver oplogSlotReserver(opCtx);
+
+        // Clean up the transaction resources on the opCtx even if the transaction resources on the
+        // session were not aborted. This actually aborts the storage-transaction.
+        _cleanUpTxnResourceOnOpCtx(opCtx, TerminationCause::kAborted);
+
+        try {
+            // If we need to write an abort oplog entry, this function can no longer be interrupted.
+            UninterruptibleLockGuard noInterrupt(opCtx->lockState());
+
+            // Write the abort oplog entry. This must be done after aborting the storage
+            // transaction, so that the lock state is reset, and there is no max lock timeout on the
+            // locker.
+            opObserver->onTransactionAbort(opCtx, oplogSlotReserver.getLastSlot());
+
+            _finishAbortingActiveTransaction(opCtx, expectedStates);
+        } catch (...) {
+            // It is illegal for aborting a transaction that must write an abort oplog entry to fail
+            // after aborting the storage transaction, so we crash instead.
+            severe()
+                << "Caught exception during abort of transaction that must write abort oplog entry "
+                << opCtx->getTxnNumber() << " on " << _sessionId().toBSON() << ": "
+                << exceptionToStatus();
+            std::terminate();
+        }
+    } else {
+        // Clean up the transaction resources on the opCtx even if the transaction resources on the
+        // session were not aborted. This actually aborts the storage-transaction.
+        //
+        // These functions are allowed to throw. We are not writing an oplog entry, so the only risk
+        // is not cleaning up some internal TransactionParticipant state, updating metrics, or
+        // logging the end of the transaction. That will either be cleaned up in the
+        // ServiceEntryPoint's abortGuard or when the next transaction begins.
+        _cleanUpTxnResourceOnOpCtx(opCtx, TerminationCause::kAborted);
+        opObserver->onTransactionAbort(opCtx, boost::none);
+        _finishAbortingActiveTransaction(opCtx, expectedStates);
+    }
+}
+
+void TransactionParticipant::Participant::_finishAbortingActiveTransaction(
+    OperationContext* opCtx, TransactionState::StateSet expectedStates) {
     // Only abort the transaction in session if it's in expected states.
     // When the state of active transaction on session is not expected, it means another
     // thread has already aborted the transaction on session.

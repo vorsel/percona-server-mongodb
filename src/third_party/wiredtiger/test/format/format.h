@@ -63,6 +63,7 @@ typedef struct {
     char *home_backup_init;  /* Initialize backup command */
     char *home_config;       /* Run CONFIG file path */
     char *home_init;         /* Initialize home command */
+    char *home_lasdump;      /* LAS dump filename */
     char *home_log;          /* Operation log file path */
     char *home_pagedump;     /* Page dump filename */
     char *home_rand;         /* RNG log file path */
@@ -90,13 +91,11 @@ typedef struct {
     WT_RAND_STATE rnd; /* Global RNG state */
 
     /*
-     * Prepare will return an error if the prepare timestamp is less than
-     * any active read timestamp. Lock across allocating prepare and read
-     * timestamps.
+     * Prepare will return an error if the prepare timestamp is less than any active read timestamp.
+     * Lock across allocating prepare and read timestamps.
      *
-     * We get the last committed timestamp periodically in order to update
-     * the oldest timestamp, that requires locking out transactional ops
-     * that set a timestamp.
+     * We get the last committed timestamp periodically in order to update the oldest timestamp,
+     * that requires locking out transactional ops that set a timestamp.
      */
     pthread_rwlock_t ts_lock;
 
@@ -178,6 +177,7 @@ typedef struct {
     uint32_t c_prefix_compression_min;
     uint32_t c_prepare;
     uint32_t c_quiet;
+    uint32_t c_random_cursor;
     uint32_t c_read_pct;
     uint32_t c_rebalance;
     uint32_t c_repeat_data_pct;
@@ -345,6 +345,7 @@ void key_gen_insert(WT_RAND_STATE *, WT_ITEM *, uint64_t);
 void key_gen_teardown(WT_ITEM *);
 void key_init(void);
 WT_THREAD_RET lrt(void *);
+WT_THREAD_RET random_kv(void *);
 void path_setup(const char *);
 int read_row_worker(WT_CURSOR *, uint64_t, WT_ITEM *, WT_ITEM *, bool);
 uint32_t rng(WT_RAND_STATE *);

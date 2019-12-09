@@ -181,7 +181,7 @@ Update MongoInterfaceStandalone::buildUpdateOp(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     const NamespaceString& nss,
     BatchedObjects&& batch,
-    bool upsert,
+    UpsertType upsert,
     bool multi) {
     Update updateOp(nss);
     updateOp.setUpdates([&] {
@@ -193,7 +193,9 @@ Update MongoInterfaceStandalone::buildUpdateOp(
                 entry.setQ(std::move(q));
                 entry.setU(std::move(u));
                 entry.setC(std::move(c));
-                entry.setUpsert(upsert);
+                entry.setUpsert(upsert != UpsertType::kNone);
+                entry.setUpsertSupplied({{entry.getUpsert() && expCtx->useNewUpsert,
+                                          upsert == UpsertType::kInsertSuppliedDoc}});
                 entry.setMulti(multi);
                 return entry;
             }());
@@ -232,7 +234,7 @@ StatusWith<MongoProcessInterface::UpdateResult> MongoInterfaceStandalone::update
     const NamespaceString& ns,
     BatchedObjects&& batch,
     const WriteConcernOptions& wc,
-    bool upsert,
+    UpsertType upsert,
     bool multi,
     boost::optional<OID> targetEpoch) {
     auto writeResults =
@@ -536,11 +538,17 @@ bool MongoInterfaceStandalone::fieldsHaveSupportingUniqueIndex(
 }
 
 BSONObj MongoInterfaceStandalone::_reportCurrentOpForClient(
-    OperationContext* opCtx, Client* client, CurrentOpTruncateMode truncateOps) const {
+    OperationContext* opCtx,
+    Client* client,
+    CurrentOpTruncateMode truncateOps,
+    CurrentOpBacktraceMode backtraceMode) const {
     BSONObjBuilder builder;
 
-    CurOp::reportCurrentOpForClient(
-        opCtx, client, (truncateOps == CurrentOpTruncateMode::kTruncateOps), &builder);
+    CurOp::reportCurrentOpForClient(opCtx,
+                                    client,
+                                    (truncateOps == CurrentOpTruncateMode::kTruncateOps),
+                                    (backtraceMode == CurrentOpBacktraceMode::kIncludeBacktrace),
+                                    &builder);
 
     OperationContext* clientOpCtx = client->getOperationContext();
 

@@ -1529,7 +1529,6 @@ TEST_F(TopoCoordTest, ReplSetGetStatus) {
     Date_t appliedWallTime = Date_t() + Seconds(oplogProgress.getSecs());
     OpTime oplogDurable(Timestamp(1, 1), 19);
     Date_t durableWallTime = Date_t() + Seconds(oplogDurable.getSecs());
-    ;
     OpTime lastCommittedOpTime(Timestamp(5, 1), 20);
     Date_t lastCommittedWallTime = Date_t() + Seconds(lastCommittedOpTime.getSecs());
     OpTime readConcernMajorityOpTime(Timestamp(4, 1), 20);
@@ -1538,7 +1537,8 @@ TEST_F(TopoCoordTest, ReplSetGetStatus) {
     Timestamp lastStableRecoveryTimestamp(2, 2);
     Timestamp lastStableCheckpointTimestampDeprecated(2, 2);
     BSONObj initialSyncStatus = BSON("failedInitialSyncAttempts" << 1);
-    BSONObj electionCandidateMetrics = BSON("DummyElectionMetrics" << 1);
+    BSONObj electionCandidateMetrics = BSON("DummyElectionCandidateMetrics" << 1);
+    BSONObj electionParticipantMetrics = BSON("DummyElectionParticipantMetrics" << 1);
     std::string setName = "mySet";
 
     ReplSetHeartbeatResponse hb;
@@ -1595,6 +1595,7 @@ TEST_F(TopoCoordTest, ReplSetGetStatus) {
             {readConcernMajorityOpTime, readConcernMajorityWallTime},
             initialSyncStatus,
             electionCandidateMetrics,
+            electionParticipantMetrics,
             lastStableCheckpointTimestampDeprecated,
             lastStableRecoveryTimestamp},
         &statusBuilder,
@@ -1708,6 +1709,7 @@ TEST_F(TopoCoordTest, ReplSetGetStatus) {
     ASSERT_EQUALS(3, rsStatus["writeMajorityCount"].numberInt());
     ASSERT_BSONOBJ_EQ(initialSyncStatus, rsStatus["initialSyncStatus"].Obj());
     ASSERT_BSONOBJ_EQ(electionCandidateMetrics, rsStatus["electionCandidateMetrics"].Obj());
+    ASSERT_BSONOBJ_EQ(electionParticipantMetrics, rsStatus["electionParticipantMetrics"].Obj());
 
     // Test no lastStableRecoveryTimestamp field.
     BSONObjBuilder statusBuilder2;
@@ -1727,6 +1729,7 @@ TEST_F(TopoCoordTest, ReplSetGetStatus) {
     ASSERT_FALSE(rsStatus.hasField("lastStableRecoveryTimestamp"));
     ASSERT_FALSE(rsStatus.hasField("lastStableCheckpointTimestamp"));
     ASSERT_FALSE(rsStatus.hasField("electionCandidateMetrics"));
+    ASSERT_FALSE(rsStatus.hasField("electionParticipantMetrics"));
 }
 
 TEST_F(TopoCoordTest, ReplSetGetStatusWriteMajorityDifferentFromMajorityVoteCount) {

@@ -38,9 +38,11 @@
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/clock_source_mock.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
+#include "mongo/util/tick_source_mock.h"
 #include "mongo/util/time_support.h"
 
 using mongo::BSONObj;
@@ -169,7 +171,7 @@ public:
 
     void stopTest() {
         {
-            stdx::lock_guard<stdx::mutex> lk(_mutex);
+            stdx::lock_guard<mongo::Latch> lk(_mutex);
             _inShutdown = true;
         }
         for (auto& t : _tasks) {
@@ -193,7 +195,7 @@ private:
                 }
             }
 
-            stdx::lock_guard<stdx::mutex> lk(_mutex);
+            stdx::lock_guard<mongo::Latch> lk(_mutex);
             if (_inShutdown)
                 break;
         }
@@ -216,7 +218,7 @@ private:
             } catch (const std::logic_error&) {
             }
 
-            stdx::lock_guard<stdx::mutex> lk(_mutex);
+            stdx::lock_guard<mongo::Latch> lk(_mutex);
             if (_inShutdown)
                 break;
         }
@@ -225,7 +227,7 @@ private:
     void simpleTask() {
         while (true) {
             static_cast<void>(MONGO_FAIL_POINT(_fp));
-            stdx::lock_guard<stdx::mutex> lk(_mutex);
+            stdx::lock_guard<mongo::Latch> lk(_mutex);
             if (_inShutdown)
                 break;
         }
@@ -239,7 +241,7 @@ private:
                 _fp.setMode(FailPoint::alwaysOn, 0, BSON("a" << 44));
             }
 
-            stdx::lock_guard<stdx::mutex> lk(_mutex);
+            stdx::lock_guard<mongo::Latch> lk(_mutex);
             if (_inShutdown)
                 break;
         }
@@ -247,7 +249,8 @@ private:
 
     FailPoint _fp;
     std::vector<stdx::thread> _tasks;
-    stdx::mutex _mutex;
+
+    mongo::Mutex _mutex = MONGO_MAKE_LATCH();
     bool _inShutdown = false;
 };
 
@@ -448,3 +451,33 @@ TEST(FailPoint, FailPointBlockIfBasicTest) {
     }
 }
 }  // namespace mongo_test
+
+namespace mongo {
+
+TEST(FailPoint, WaitForFailPointTimeout) {
+    FailPoint failPoint;
+    failPoint.setMode(FailPoint::alwaysOn);
+
+    const auto service = ServiceContext::make();
+    const std::shared_ptr<ClockSourceMock> mockClock = std::make_shared<ClockSourceMock>();
+    service->setFastClockSource(std::make_unique<SharedClockSourceAdapter>(mockClock));
+    service->setPreciseClockSource(std::make_unique<SharedClockSourceAdapter>(mockClock));
+    service->setTickSource(std::make_unique<TickSourceMock<>>());
+
+    const auto client = service->makeClient("WaitForFailPointTest");
+    auto opCtx = client->makeOperationContext();
+    opCtx->setDeadlineAfterNowBy(Milliseconds{999}, ErrorCodes::ExceededTimeLimit);
+
+    stdx::thread waitForFailPoint([&] {
+        ASSERT_THROWS_CODE(failPoint.waitForTimesEntered(opCtx.get(), 1),
+                           AssertionException,
+                           ErrorCodes::ExceededTimeLimit);
+    });
+
+    mockClock->advance(Milliseconds{1000});
+    waitForFailPoint.join();
+
+    failPoint.setMode(FailPoint::off);
+}
+
+}  // namespace mongo

@@ -37,8 +37,8 @@
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/type_traits.h"
 #include "mongo/stdx/utility.h"
 #include "mongo/util/assert_util.h"
@@ -50,7 +50,6 @@
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
-
 template <typename T>
 class Promise;
 
@@ -70,6 +69,7 @@ template <typename T>
 class SharedSemiFuture;
 
 namespace future_details {
+
 template <typename T>
 class FutureImpl;
 template <>
@@ -187,6 +187,45 @@ template <typename T>
 using VoidToFakeVoid = std::conditional_t<std::is_void_v<T>, FakeVoid, T>;
 template <typename T>
 using FakeVoidToVoid = std::conditional_t<std::is_same_v<T, FakeVoid>, void, T>;
+
+struct InvalidCallSentinal;  // Nothing actually returns this.
+template <typename Func, typename Arg, typename = void>
+struct FriendlyInvokeResultImpl {
+    using type = InvalidCallSentinal;
+};
+template <typename Func, typename Arg>
+struct FriendlyInvokeResultImpl<
+    Func,
+    Arg,
+    std::enable_if_t<std::is_invocable_v<Func, std::enable_if_t<!std::is_void_v<Arg>, Arg>>>> {
+    using type = std::invoke_result_t<Func, Arg>;
+};
+template <typename Func>
+struct FriendlyInvokeResultImpl<Func, void, std::enable_if_t<std::is_invocable_v<Func>>> {
+    using type = std::invoke_result_t<Func>;
+};
+template <typename Func>
+struct FriendlyInvokeResultImpl<Func, const void, std::enable_if_t<std::is_invocable_v<Func>>> {
+    using type = std::invoke_result_t<Func>;
+};
+
+template <typename Func, typename Arg>
+using FriendlyInvokeResult = typename FriendlyInvokeResultImpl<Func, Arg>::type;
+
+// Like is_invocable_v<Func, Args>, but handles Args == void correctly.
+template <typename Func, typename Arg>
+inline constexpr bool isCallable =
+    !std::is_same_v<FriendlyInvokeResult<Func, Arg>, InvalidCallSentinal>;
+
+// Like is_invocable_r_v<Func, Args>, but handles Args == void correctly and unwraps the return.
+template <typename Ret, typename Func, typename Arg>
+inline constexpr bool isCallableR =
+    (isCallable<Func, Arg> && std::is_same_v<UnwrappedType<FriendlyInvokeResult<Func, Arg>>, Ret>);
+
+// Like isCallableR, but doesn't unwrap the result type.
+template <typename Ret, typename Func, typename Arg>
+inline constexpr bool isCallableExactR = (isCallable<Func, Arg> &&
+                                          std::is_same_v<FriendlyInvokeResult<Func, Arg>, Ret>);
 
 /**
  * call() normalizes arguments to hide the FakeVoid shenanigans from users of Futures.
@@ -328,7 +367,7 @@ public:
         if (state.load(std::memory_order_acquire) == SSBState::kFinished)
             return;
 
-        stdx::unique_lock<stdx::mutex> lk(mx);
+        stdx::unique_lock<Latch> lk(mx);
         if (!cv) {
             cv.emplace();
 
@@ -396,7 +435,7 @@ public:
 
             Children localChildren;
 
-            stdx::unique_lock<stdx::mutex> lk(mx);
+            stdx::unique_lock<Latch> lk(mx);
             localChildren.swap(children);
             if (cv) {
                 // This must be done inside the lock to correctly synchronize with wait().
@@ -449,8 +488,8 @@ public:
 
     // These are only used to signal completion to blocking waiters. Benchmarks showed that it was
     // worth deferring the construction of cv, so it can be avoided when it isn't necessary.
-    stdx::mutex mx;                                // F (not that it matters)
-    boost::optional<stdx::condition_variable> cv;  // F (but guarded by mutex)
+    Mutex mx = MONGO_MAKE_LATCH("FutureResolution");  // F
+    boost::optional<stdx::condition_variable> cv;     // F (but guarded by mutex)
 
     // This holds the children created from a SharedSemiFuture. When this SharedState is completed,
     // the result will be copied in to each of the children. This allows their continuations to have

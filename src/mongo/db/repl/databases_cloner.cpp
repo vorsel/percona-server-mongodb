@@ -56,8 +56,8 @@ namespace {
 
 using Request = executor::RemoteCommandRequest;
 using Response = executor::RemoteCommandResponse;
-using LockGuard = stdx::lock_guard<stdx::mutex>;
-using UniqueLock = stdx::unique_lock<stdx::mutex>;
+using LockGuard = stdx::lock_guard<Latch>;
+using UniqueLock = stdx::unique_lock<Latch>;
 
 }  // namespace
 
@@ -209,10 +209,9 @@ Status DatabasesCloner::startup() noexcept {
         _exec,
         listDBsReq,
         [this](const auto& x) { this->_onListDatabaseFinish(x); },
-        RemoteCommandRetryScheduler::makeRetryPolicy(
+        RemoteCommandRetryScheduler::makeRetryPolicy<ErrorCategory::RetriableError>(
             numInitialSyncListDatabasesAttempts.load(),
-            executor::RemoteCommandRequest::kNoTimeout,
-            RemoteCommandRetryScheduler::kAllRetriableErrors));
+            executor::RemoteCommandRequest::kNoTimeout));
     _status = _listDBsScheduler->startup();
 
     if (!_status.isOK()) {

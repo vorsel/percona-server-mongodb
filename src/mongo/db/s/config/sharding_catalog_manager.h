@@ -34,13 +34,13 @@
 #include "mongo/db/repl/optime_with.h"
 #include "mongo/db/s/config/namespace_serializer.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/shard_key_pattern.h"
-#include "mongo/stdx/mutex.h"
 
 namespace mongo {
 
@@ -50,14 +50,30 @@ class RemoteCommandTargeter;
 class ServiceContext;
 class UUID;
 
-/**
- * Used to indicate to the caller of the removeShard method whether draining of chunks for
- * a particular shard has started, is ongoing, or has been completed.
- */
-enum ShardDrainingStatus {
-    STARTED,
-    ONGOING,
-    COMPLETED,
+struct RemoveShardProgress {
+
+    /**
+     * Used to indicate to the caller of the removeShard method whether draining of chunks for
+     * a particular shard has started, is ongoing, or has been completed.
+     */
+    enum DrainingShardStatus {
+        STARTED,
+        ONGOING,
+        COMPLETED,
+    };
+
+    /**
+     * Used to indicate to the caller of the removeShard method the remaining amount of chunks,
+     * jumbo chunks and databases within the shard
+     */
+    struct DrainingShardUsage {
+        const long long totalChunks;
+        const long long databases;
+        const long long jumboChunks;
+    };
+
+    DrainingShardStatus status;
+    boost::optional<DrainingShardUsage> remainingCounts;
 };
 
 /**
@@ -215,7 +231,7 @@ public:
      *
      * Throws DatabaseDifferCase if the database already exists with a different case.
      */
-    DatabaseType createDatabase(OperationContext* opCtx, const std::string& dbName);
+    DatabaseType createDatabase(OperationContext* opCtx, StringData dbName, ShardId primaryShard);
 
     /**
      * Creates a ScopedLock on the database name in _namespaceSerializer. This is to prevent
@@ -231,7 +247,7 @@ public:
      *
      * Throws DatabaseDifferCase if the database already exists with a different case.
      */
-    void enableSharding(OperationContext* opCtx, const std::string& dbName);
+    void enableSharding(OperationContext* opCtx, StringData dbName, ShardId primaryShard);
 
     /**
      * Retrieves all databases for a shard.
@@ -355,7 +371,7 @@ public:
      * Because of the asynchronous nature of the draining mechanism, this method returns
      * the current draining status. See ShardDrainingStatus enum definition for more details.
      */
-    ShardDrainingStatus removeShard(OperationContext* opCtx, const ShardId& shardId);
+    RemoveShardProgress removeShard(OperationContext* opCtx, const ShardId& shardId);
 
     //
     // Cluster Upgrade Operations
@@ -506,7 +522,7 @@ private:
     // (S) Self-synchronizing; access in any way from any context.
     //
 
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("ShardingCatalogManager::_mutex");
 
     // True if shutDown() has been called. False, otherwise.
     bool _inShutdown{false};  // (M)

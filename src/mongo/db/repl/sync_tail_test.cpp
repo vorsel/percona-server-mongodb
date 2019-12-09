@@ -64,7 +64,7 @@
 #include "mongo/db/session_txn_record_gen.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/transaction_participant_gen.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/clock_source_mock.h"
@@ -231,32 +231,6 @@ auto parseFromOplogEntryArray(const BSONObj& obj, int elem) {
 
     return OpTime(tsArray.Array()[elem].timestamp(), termArray.Array()[elem].Long());
 };
-
-TEST_F(SyncTailTest, SyncApplyNoNamespaceBadOp) {
-    const BSONObj op = BSON("op"
-                            << "x");
-    ASSERT_THROWS(
-        SyncTail::syncApply(_opCtx.get(), op, OplogApplication::Mode::kInitialSync, boost::none),
-        ExceptionFor<ErrorCodes::BadValue>);
-}
-
-TEST_F(SyncTailTest, SyncApplyNoNamespaceNoOp) {
-    ASSERT_OK(SyncTail::syncApply(_opCtx.get(),
-                                  BSON("op"
-                                       << "n"),
-                                  OplogApplication::Mode::kInitialSync,
-                                  boost::none));
-}
-
-TEST_F(SyncTailTest, SyncApplyBadOp) {
-    const BSONObj op = BSON("op"
-                            << "x"
-                            << "ns"
-                            << "test.t");
-    ASSERT_THROWS(
-        SyncTail::syncApply(_opCtx.get(), op, OplogApplication::Mode::kInitialSync, boost::none),
-        ExceptionFor<ErrorCodes::BadValue>);
-}
 
 TEST_F(SyncTailTest, SyncApplyInsertDocumentDatabaseMissing) {
     NamespaceString nss("test.t");
@@ -524,7 +498,7 @@ protected:
             _insertOp2->getOpTime());
         _opObserver->onInsertsFn =
             [&](OperationContext*, const NamespaceString& nss, const std::vector<BSONObj>& docs) {
-                stdx::lock_guard<stdx::mutex> lock(_insertMutex);
+                stdx::lock_guard<Latch> lock(_insertMutex);
                 if (nss.isOplog() || nss == _nss1 || nss == _nss2 ||
                     nss == NamespaceString::kSessionTransactionsTableNamespace) {
                     _insertedDocs[nss].insert(_insertedDocs[nss].end(), docs.begin(), docs.end());
@@ -571,7 +545,7 @@ protected:
     std::unique_ptr<ThreadPool> _writerPool;
 
 private:
-    stdx::mutex _insertMutex;
+    Mutex _insertMutex = MONGO_MAKE_LATCH("MultiOplogEntrySyncTailTest::_insertMutex");
 };
 
 TEST_F(MultiOplogEntrySyncTailTest, MultiApplyUnpreparedTransactionSeparate) {
@@ -907,7 +881,7 @@ protected:
         _abortSinglePrepareApplyOp;
 
 private:
-    stdx::mutex _insertMutex;
+    Mutex _insertMutex = MONGO_MAKE_LATCH("MultiOplogEntryPreparedTransactionTest::_insertMutex");
 };
 
 TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyPreparedTransactionSteadyState) {
@@ -2127,10 +2101,6 @@ TEST_F(IdempotencyTest, CreateCollectionWithCollation) {
     CollectionUUID uuid = UUID::gen();
 
     auto runOpsAndValidate = [this, uuid]() {
-        auto insertOp1 = insert(fromjson("{ _id: 'foo' }"));
-        auto insertOp2 = insert(fromjson("{ _id: 'Foo', x: 1 }"));
-        auto updateOp = update("foo", BSON("$set" << BSON("x" << 2)));
-        auto dropColl = makeCommandOplogEntry(nextOpTime(), nss, BSON("drop" << nss.coll()));
         auto options = BSON("collation"
                             << BSON("locale"
                                     << "en"
@@ -2144,6 +2114,9 @@ TEST_F(IdempotencyTest, CreateCollectionWithCollation) {
                                     << "57.1")
                             << "uuid" << uuid);
         auto createColl = makeCreateCollectionOplogEntry(nextOpTime(), nss, options);
+        auto insertOp1 = insert(fromjson("{ _id: 'foo' }"));
+        auto insertOp2 = insert(fromjson("{ _id: 'Foo', x: 1 }"));
+        auto updateOp = update("foo", BSON("$set" << BSON("x" << 2)));
 
         // We don't drop and re-create the collection since we don't have ways
         // to wait until second-phase drop to completely finish.

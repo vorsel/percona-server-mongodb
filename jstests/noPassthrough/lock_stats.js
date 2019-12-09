@@ -11,9 +11,11 @@ function testBlockTime(blockTimeMillis) {
     var startStats = db.serverStatus().locks.Global;
     var startTime = new Date();
     var minBlockedMillis = blockTimeMillis;
-    // This is just some command that requires a MODE_X global lock that conflicts.
-    var s = startParallelShell(
-        'assert.commandWorked(db.getSiblingDB(\'nonexisting\').dropDatabase());', conn.port);
+
+    let awaitSleepCmd = startParallelShell(() => {
+        assert.commandWorked(
+            db.adminCommand({sleep: 1, millis: 100, lock: "w", $comment: "Lock sleep"}));
+    }, conn.port);
 
     // Wait until we see somebody waiting to acquire the lock, defend against unset stats.
     assert.soon((function() {
@@ -31,8 +33,7 @@ function testBlockTime(blockTimeMillis) {
     sleep(minBlockedMillis);
     db.fsyncUnlock();
 
-    // Wait for the parallel shell to finish, so its stats will have been recorded.
-    s();
+    awaitSleepCmd();
 
     // The fsync command from the shell cannot have possibly been blocked longer than this.
     var maxBlockedMillis = new Date() - startTime;

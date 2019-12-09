@@ -36,8 +36,8 @@
 #include "mongo/bson/inline_decls.h"
 #include "mongo/db/client.h"
 #include "mongo/db/service_context.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/platform/random.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/transport/baton.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/clock_source.h"
@@ -261,7 +261,7 @@ Status OperationContext::checkForInterruptNoAssert() noexcept {
 // - _baton is notified (someone's queuing work for the baton)
 // - _baton::run returns (timeout fired / networking is ready / socket disconnected)
 StatusWith<stdx::cv_status> OperationContext::waitForConditionOrInterruptNoAssertUntil(
-    stdx::condition_variable& cv, stdx::unique_lock<stdx::mutex>& m, Date_t deadline) noexcept {
+    stdx::condition_variable& cv, BasicLockableAdapter m, Date_t deadline) noexcept {
     invariant(getClient());
 
     if (auto status = checkForInterruptNoAssert(); !status.isOK()) {

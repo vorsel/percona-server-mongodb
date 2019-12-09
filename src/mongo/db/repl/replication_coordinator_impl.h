@@ -325,7 +325,7 @@ public:
 
     virtual Status abortCatchupIfNeeded(PrimaryCatchUpConclusionReason reason) override;
 
-    virtual void incrementNumCatchUpOpsIfCatchingUp(int numOps) override;
+    virtual void incrementNumCatchUpOpsIfCatchingUp(long numOps) override;
 
     void signalDropPendingCollectionsRemovedFromStorage() final;
 
@@ -569,7 +569,7 @@ private:
         // Tracks number of operations left running on step down.
         size_t _userOpsRunning = 0;
         // Protects killSignaled and stopKillingOps cond. variable.
-        stdx::mutex _mutex;
+        Mutex _mutex = MONGO_MAKE_LATCH("AutoGetRstlForStepUpStepDown::_mutex");
         // Signals thread about the change of killSignaled value.
         stdx::condition_variable _stopKillingOps;
         // Once this is set to true, the killOpThreadFn method will terminate.
@@ -607,6 +607,17 @@ private:
             return false;
         }
 
+        // This predicate is an extremely simple way to never miss a notification. When the
+        // ThreadWater::notify_inlock() is called, notifyCount is incremented. As should be obvious,
+        // this predicate should only be called "inlock" as well. The ThreadWaiter itself goes away
+        // with SERVER-43135 so this function and notifyCount as a concept is a v4.2 only measure.
+        auto makePredicate() {
+            return [this, startingNotifyCount = notifyCount]() -> bool {
+                return notifyCount != startingNotifyCount;
+            };
+        }
+
+        uint64_t notifyCount = 0;
         stdx::condition_variable* condVar = nullptr;
     };
 
@@ -677,7 +688,7 @@ private:
         // Heartbeat calls this function to update the target optime.
         void signalHeartbeatUpdate_inlock();
         // Increment the counter for the number of ops applied during catchup.
-        void incrementNumCatchUpOps_inlock(int numOps);
+        void incrementNumCatchUpOps_inlock(long numOps);
 
     private:
         ReplicationCoordinatorImpl* _repl;  // Not owned.
@@ -687,7 +698,7 @@ private:
         // we can exit catchup mode.
         std::unique_ptr<CallbackWaiter> _waiter;
         // Counter for the number of ops applied during catchup.
-        int _numCatchUpOps;
+        long _numCatchUpOps = 0;
     };
 
     // Inner class to manage the concurrency of _canAcceptNonLocalWrites and _canServeNonLocalReads.
@@ -800,7 +811,7 @@ private:
      * Helper method for _awaitReplication that takes an already locked unique_lock, but leaves
      * operation timing to the caller.
      */
-    Status _awaitReplication_inlock(stdx::unique_lock<stdx::mutex>* lock,
+    Status _awaitReplication_inlock(stdx::unique_lock<Latch>* lock,
                                     OperationContext* opCtx,
                                     const OpTime& opTime,
                                     const WriteConcernOptions& writeConcern);
@@ -852,7 +863,7 @@ private:
      *
      * Lock will be released after this method finishes.
      */
-    void _reportUpstream_inlock(stdx::unique_lock<stdx::mutex> lock);
+    void _reportUpstream_inlock(stdx::unique_lock<Latch> lock);
 
     /**
      * Helpers to set the last applied and durable OpTime.
@@ -1135,10 +1146,10 @@ private:
      *
      * Requires "lock" to own _mutex, and returns the same unique_lock.
      */
-    stdx::unique_lock<stdx::mutex> _handleHeartbeatResponseAction_inlock(
+    stdx::unique_lock<Latch> _handleHeartbeatResponseAction_inlock(
         const HeartbeatResponseAction& action,
         const StatusWith<ReplSetHeartbeatResponse>& responseStatus,
-        stdx::unique_lock<stdx::mutex> lock);
+        stdx::unique_lock<Latch> lock);
 
     /**
      * Updates the last committed OpTime to be 'committedOpTime' if it is more recent than the
@@ -1360,7 +1371,7 @@ private:
     // (I)  Independently synchronized, see member variable comment.
 
     // Protects member data of this ReplicationCoordinator.
-    mutable stdx::mutex _mutex;  // (S)
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("ReplicationCoordinatorImpl::_mutex");  // (S)
 
     // Handles to actively queued heartbeats.
     HeartbeatHandles _heartbeatHandles;  // (M)

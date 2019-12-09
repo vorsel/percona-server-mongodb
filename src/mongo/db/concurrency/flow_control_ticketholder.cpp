@@ -80,7 +80,7 @@ void FlowControlTicketholder::set(ServiceContext* service,
 
 void FlowControlTicketholder::refreshTo(int numTickets) {
     invariant(numTickets >= 0);
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     LOG(4) << "Refreshing tickets. Before: " << _tickets << " Now: " << numTickets;
     _tickets = numTickets;
     _cv.notify_all();
@@ -88,7 +88,7 @@ void FlowControlTicketholder::refreshTo(int numTickets) {
 
 void FlowControlTicketholder::getTicket(OperationContext* opCtx,
                                         FlowControlTicketholder::CurOp* stats) {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
     if (_inShutdown) {
         return;
     }
@@ -98,31 +98,25 @@ void FlowControlTicketholder::getTicket(OperationContext* opCtx,
         ++stats->acquireWaitCount;
     }
 
-    // Make sure operations already waiting on a Flow Control ticket during shut down do not
-    // hang if the ticket refresher thread has been shut down.
-    while (_tickets == 0 && !_inShutdown) {
-        stats->waiting = true;
-        const std::uint64_t startWaitTime = curTimeMicros64();
+    auto currentWaitTime = curTimeMicros64();
+    auto updateTotalTime = [&]() {
+        auto oldWaitTime = std::exchange(currentWaitTime, curTimeMicros64());
+        _totalTimeAcquiringMicros.fetchAndAddRelaxed(currentWaitTime - oldWaitTime);
+    };
 
-        // This method will wait forever for a ticket. However, it will wake up every so often to
-        // update the time spent waiting on the ticket.
-        auto waitDeadline = Date_t::now() + Milliseconds(500);
-        StatusWith<stdx::cv_status> swCondStatus =
-            opCtx->waitForConditionOrInterruptNoAssertUntil(_cv, lk, waitDeadline);
+    stats->waiting = true;
+    ON_BLOCK_EXIT([&] {
+        // When this block exits, update the time one last time and note that getTicket() is no
+        // longer waiting.
+        updateTotalTime();
+        stats->waiting = false;
+    });
 
-        auto waitTime = curTimeMicros64() - startWaitTime;
-        _totalTimeAcquiringMicros.fetchAndAddRelaxed(waitTime);
-        stats->timeAcquiringMicros += waitTime;
-
-        // If the operation context state interrupted this wait, the StatusWith result will contain
-        // the error. If the `waitDeadline` expired, the Status variable will be OK, and the
-        // `cv_status` value will be `cv_status::timeout`. In either case where Status::OK is
-        // returned, the loop must re-check the predicate. If the operation context is interrupted
-        // (and an error status is returned), the intended behavior is to bubble an exception up to
-        // the user.
-        uassertStatusOK(swCondStatus);
+    // getTicket() should block until there are tickets or the Ticketholder is in shutdown
+    while (!opCtx->waitForConditionOrInterruptFor(
+        _cv, lk, Milliseconds(500), [&] { return _tickets > 0 || _inShutdown; })) {
+        updateTotalTime();
     }
-    stats->waiting = false;
 
     if (_inShutdown) {
         return;
@@ -135,7 +129,7 @@ void FlowControlTicketholder::getTicket(OperationContext* opCtx,
 // Should only be called once, during shutdown.
 void FlowControlTicketholder::setInShutdown() {
     LOG(0) << "Stopping further Flow Control ticket acquisitions.";
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     _inShutdown = true;
     _cv.notify_all();
 }

@@ -83,6 +83,7 @@
 #include "mongo/db/storage/journal_listener.h"
 #include "mongo/db/storage/storage_file_util.h"
 #include "mongo/db/storage/storage_options.h"
+#include "mongo/db/storage/storage_parameters_gen.h"
 #include "mongo/db/storage/storage_repair_observer.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_cursor.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_customization_hooks.h"
@@ -201,7 +202,7 @@ public:
 
         while (!_shuttingDown.load()) {
             {
-                stdx::unique_lock<stdx::mutex> lock(_mutex);
+                stdx::unique_lock<Latch> lock(_mutex);
                 MONGO_IDLE_THREAD_BLOCK;
                 // Check every 10 seconds or sooner in the debug builds
                 _condvar.wait_for(lock, stdx::chrono::seconds(kDebugBuild ? 1 : 10));
@@ -216,7 +217,7 @@ public:
     void shutdown() {
         _shuttingDown.store(true);
         {
-            stdx::unique_lock<stdx::mutex> lock(_mutex);
+            stdx::unique_lock<Latch> lock(_mutex);
             // Wake up the session sweeper thread early, we do not want the shutdown
             // to wait for us too long.
             _condvar.notify_one();
@@ -228,7 +229,7 @@ private:
     WiredTigerSessionCache* _sessionCache;
     AtomicWord<bool> _shuttingDown{false};
 
-    stdx::mutex _mutex;  // protects _condvar
+    Mutex _mutex = MONGO_MAKE_LATCH("WiredTigerSessionSweeper::_mutex");  // protects _condvar
     // The session sweeper thread idles on this condition variable for a particular time duration
     // between cleaning up expired sessions. It can be triggered early to expediate shutdown.
     stdx::condition_variable _condvar;
@@ -306,7 +307,7 @@ public:
 
         while (!_shuttingDown.load()) {
             {
-                stdx::unique_lock<stdx::mutex> lock(_mutex);
+                stdx::unique_lock<Latch> lock(_mutex);
                 MONGO_IDLE_THREAD_BLOCK;
                 _condvar.wait_for(lock,
                                   stdx::chrono::seconds(static_cast<std::int64_t>(
@@ -377,7 +378,7 @@ public:
                     if (oplogNeededForRollback.isOK()) {
                         // Now that the checkpoint is durable, publish the oplog needed to recover
                         // from it.
-                        stdx::lock_guard<stdx::mutex> lk(_oplogNeededForCrashRecoveryMutex);
+                        stdx::lock_guard<Latch> lk(_oplogNeededForCrashRecoveryMutex);
                         _oplogNeededForCrashRecovery.store(
                             oplogNeededForRollback.getValue().asULL());
                     }
@@ -429,7 +430,7 @@ public:
             _hasTriggeredFirstStableCheckpoint = true;
             log() << "Triggering the first stable checkpoint. Initial Data: " << initialData
                   << " PrevStable: " << prevStable << " CurrStable: " << currStable;
-            stdx::unique_lock<stdx::mutex> lock(_mutex);
+            stdx::unique_lock<Latch> lock(_mutex);
             _condvar.notify_one();
         }
     }
@@ -443,14 +444,14 @@ public:
      * _oplogNeededForCrashRecovery will not change during assignment.
      */
     void assignOplogNeededForCrashRecoveryTo(boost::optional<Timestamp>* timestamp) {
-        stdx::lock_guard<stdx::mutex> lk(_oplogNeededForCrashRecoveryMutex);
+        stdx::lock_guard<Latch> lk(_oplogNeededForCrashRecoveryMutex);
         *timestamp = Timestamp(_oplogNeededForCrashRecovery.load());
     }
 
     void shutdown() {
         _shuttingDown.store(true);
         {
-            stdx::unique_lock<stdx::mutex> lock(_mutex);
+            stdx::unique_lock<Latch> lock(_mutex);
             // Wake up the checkpoint thread early, to take a final checkpoint before shutting
             // down, if one has not coincidentally just been taken.
             _condvar.notify_one();
@@ -462,7 +463,8 @@ private:
     WiredTigerKVEngine* _wiredTigerKVEngine;
     WiredTigerSessionCache* _sessionCache;
 
-    stdx::mutex _mutex;  // protects _condvar
+    Mutex _mutex = MONGO_MAKE_LATCH("WiredTigerCheckpointThread::_mutex");
+    ;  // protects _condvar
     // The checkpoint thread idles on this condition variable for a particular time duration between
     // taking checkpoints. It can be triggered early to expediate immediate checkpointing.
     stdx::condition_variable _condvar;
@@ -471,7 +473,8 @@ private:
 
     bool _hasTriggeredFirstStableCheckpoint = false;
 
-    stdx::mutex _oplogNeededForCrashRecoveryMutex;
+    Mutex _oplogNeededForCrashRecoveryMutex =
+        MONGO_MAKE_LATCH("WiredTigerCheckpointThread::_oplogNeededForCrashRecoveryMutex");
     AtomicWord<std::uint64_t> _oplogNeededForCrashRecovery;
 };
 
@@ -1191,7 +1194,7 @@ StatusWith<std::vector<std::string>> WiredTigerKVEngine::beginNonBlockingBackup(
     uassert(51034, "Cannot open backup cursor with in-memory mode.", !isEphemeral());
 
     // Oplog truncation thread won't remove oplog since the checkpoint pinned by the backup cursor.
-    stdx::lock_guard<stdx::mutex> lock(_oplogPinnedByBackupMutex);
+    stdx::lock_guard<Latch> lock(_oplogPinnedByBackupMutex);
     _checkpointThread->assignOplogNeededForCrashRecoveryTo(&_oplogPinnedByBackup);
     auto pinOplogGuard = makeGuard([&] { _oplogPinnedByBackup = boost::none; });
 
@@ -1226,7 +1229,7 @@ StatusWith<std::vector<std::string>> WiredTigerKVEngine::beginNonBlockingBackup(
 void WiredTigerKVEngine::endNonBlockingBackup(OperationContext* opCtx) {
     _backupSession.reset();
     // Oplog truncation thread can now remove the pinned oplog.
-    stdx::lock_guard<stdx::mutex> lock(_oplogPinnedByBackupMutex);
+    stdx::lock_guard<Latch> lock(_oplogPinnedByBackupMutex);
     _oplogPinnedByBackup = boost::none;
     _backupCursor = nullptr;
 }
@@ -1659,7 +1662,7 @@ void WiredTigerKVEngine::syncSizeInfo(bool sync) const {
 
 void WiredTigerKVEngine::setOldestActiveTransactionTimestampCallback(
     StorageEngine::OldestActiveTransactionTimestampCallback callback) {
-    stdx::lock_guard<stdx::mutex> lk(_oldestActiveTransactionTimestampCallbackMutex);
+    stdx::lock_guard<Latch> lk(_oldestActiveTransactionTimestampCallbackMutex);
     _oldestActiveTransactionTimestampCallback = std::move(callback);
 };
 
@@ -1954,7 +1957,7 @@ Status WiredTigerKVEngine::dropIdent(OperationContext* opCtx, StringData ident) 
     if (ret == EBUSY) {
         // this is expected, queue it up
         {
-            stdx::lock_guard<stdx::mutex> lk(_identToDropMutex);
+            stdx::lock_guard<Latch> lk(_identToDropMutex);
             _identToDrop.push_front(uri);
         }
         _sessionCache->closeCursorsForQueuedDrops();
@@ -1984,7 +1987,7 @@ std::list<WiredTigerCachedCursor> WiredTigerKVEngine::filterCursorsWithQueuedDro
     std::list<WiredTigerCachedCursor>* cache) {
     std::list<WiredTigerCachedCursor> toDrop;
 
-    stdx::lock_guard<stdx::mutex> lk(_identToDropMutex);
+    stdx::lock_guard<Latch> lk(_identToDropMutex);
     if (_identToDrop.empty())
         return toDrop;
 
@@ -2018,7 +2021,7 @@ bool WiredTigerKVEngine::haveDropsQueued() const {
     _previousCheckedDropsQueued = now;
 
     // Don't wait for the mutex: if we can't get it, report that no drops are queued.
-    stdx::unique_lock<stdx::mutex> lk(_identToDropMutex, stdx::defer_lock);
+    stdx::unique_lock<Latch> lk(_identToDropMutex, stdx::defer_lock);
     return lk.try_lock() && !_identToDrop.empty();
 }
 
@@ -2028,7 +2031,7 @@ void WiredTigerKVEngine::dropSomeQueuedIdents() {
     WiredTigerSession session(_conn);
 
     {
-        stdx::lock_guard<stdx::mutex> lk(_identToDropMutex);
+        stdx::lock_guard<Latch> lk(_identToDropMutex);
         numInQueue = _identToDrop.size();
     }
 
@@ -2041,7 +2044,7 @@ void WiredTigerKVEngine::dropSomeQueuedIdents() {
     for (int i = 0; i < numToDelete; i++) {
         string uri;
         {
-            stdx::lock_guard<stdx::mutex> lk(_identToDropMutex);
+            stdx::lock_guard<Latch> lk(_identToDropMutex);
             if (_identToDrop.empty())
                 break;
             uri = _identToDrop.front();
@@ -2052,7 +2055,7 @@ void WiredTigerKVEngine::dropSomeQueuedIdents() {
         LOG(1) << "WT queued drop of  " << uri << " res " << ret;
 
         if (ret == EBUSY) {
-            stdx::lock_guard<stdx::mutex> lk(_identToDropMutex);
+            stdx::lock_guard<Latch> lk(_identToDropMutex);
             _identToDrop.push_back(uri);
         } else {
             invariantWTOK(ret);
@@ -2444,7 +2447,7 @@ StatusWith<Timestamp> WiredTigerKVEngine::getOplogNeededForRollback() const {
     auto stableTimestamp = _stableTimestamp.load();
 
     // Only one thread can set or execute this callback.
-    stdx::lock_guard<stdx::mutex> lk(_oldestActiveTransactionTimestampCallbackMutex);
+    stdx::lock_guard<Latch> lk(_oldestActiveTransactionTimestampCallbackMutex);
     boost::optional<Timestamp> oldestActiveTransactionTimestamp;
     if (_oldestActiveTransactionTimestampCallback) {
         auto status = _oldestActiveTransactionTimestampCallback(Timestamp(stableTimestamp));
@@ -2477,7 +2480,7 @@ boost::optional<Timestamp> WiredTigerKVEngine::getOplogNeededForCrashRecovery() 
 
 Timestamp WiredTigerKVEngine::getPinnedOplog() const {
     {
-        stdx::lock_guard<stdx::mutex> lock(_oplogPinnedByBackupMutex);
+        stdx::lock_guard<Latch> lock(_oplogPinnedByBackupMutex);
         if (!storageGlobalParams.allowOplogTruncation) {
             // If oplog truncation is not allowed, then return the min timestamp so that no history
             // is
@@ -2520,14 +2523,14 @@ bool WiredTigerKVEngine::supportsReadConcernMajority() const {
 void WiredTigerKVEngine::startOplogManager(OperationContext* opCtx,
                                            const std::string& uri,
                                            WiredTigerRecordStore* oplogRecordStore) {
-    stdx::lock_guard<stdx::mutex> lock(_oplogManagerMutex);
+    stdx::lock_guard<Latch> lock(_oplogManagerMutex);
     if (_oplogManagerCount == 0)
         _oplogManager->start(opCtx, uri, oplogRecordStore);
     _oplogManagerCount++;
 }
 
 void WiredTigerKVEngine::haltOplogManager() {
-    stdx::unique_lock<stdx::mutex> lock(_oplogManagerMutex);
+    stdx::unique_lock<Latch> lock(_oplogManagerMutex);
     invariant(_oplogManagerCount > 0);
     _oplogManagerCount--;
     if (_oplogManagerCount == 0) {

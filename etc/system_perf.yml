@@ -46,6 +46,7 @@ post:
             mark_idle.sh
           fi
 
+    - func: "upload pip requirements"
     - command: shell.exec
       params:
         working_dir: src
@@ -218,6 +219,10 @@ functions:
           production: true
           authentication: ${authentication}
           overrides:
+            infrastructure_provisioning:
+              tfvars:
+                # This is currently only used by initialsync-logkeeper. It is empty and not used for other tests.
+                mongod_seeded_ebs_snapshot_id: ${snapshotId}
             workload_setup:
               local_repos:
                 workloads: ../src/workloads/workloads
@@ -226,6 +231,8 @@ functions:
                 tpcc: ../src/tpcc/tpcc
                 genny: ../src/genny/genny
             mongodb_setup:
+              # This is currently only used by initialsync-logkeeper-short. It is empty and not used for other tests.
+              mongodb_dataset: ${dataset}
               mongodb_binary_archive: "https://s3.amazonaws.com/mciuploads/${project_dir}/${version_id}/${revision}/${platform}/mongodb${compile-variant|}-${version_id}.tar.gz"
           EOF
 
@@ -325,7 +332,16 @@ functions:
       params:
         working_dir: work
         script: |
-          ../src/dsi/dsi/run-dsi detect-changes
+          is_patch=${is_patch}
+          task_id=${task_id}
+          perf_jira_user=${perf_jira_user}
+          perf_jira_pw=${perf_jira_pw}
+          dsi_analysis_atlas_user=${dsi_analysis_atlas_user}
+          dsi_analysis_atlas_pw=${dsi_analysis_atlas_pw}
+          evergreen_api_key=${evergreen_api_key}
+          evergreen_api_user=${evergreen_api_user}
+          source ../src/buildscripts/signal_processing_setup.sh
+          detect-changes --evergreen-api-config .evergreen.yml
     - command: shell.exec
       type: test
       params:
@@ -341,7 +357,8 @@ functions:
       params:
         working_dir: work
         script: |
-          ../src/dsi/dsi/run-dsi detect-outliers
+          source ../src/buildscripts/signal_processing_setup.sh
+          detect-outliers --evergreen-api-config .evergreen.yml
     - command: shell.exec
       type: setup
       params:
@@ -361,6 +378,18 @@ functions:
         script: |
           set -o verbose
           exit $(cat post_run_check.status)
+
+  "upload pip requirements":
+    command: s3.put
+    params:
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      local_file: pip-requirements.txt
+      remote_file: ${project}/${build_variant}/${revision}/pip-requirements-${task_id}-${execution}.txt
+      bucket: mciuploads
+      permissions: public-read
+      content_type: atext-plain
+      display_name: Pip Requirements
 
 #######################################
 #               Tasks                 #
@@ -740,6 +769,8 @@ tasks:
       vars:
         test: "initialsync-logkeeper"
         setup: "initialsync-logkeeper-short"
+        # Logkeeper dataset with FCV set to 4.0
+        dataset: "https://s3-us-west-2.amazonaws.com/dsi-donot-remove/InitialSyncLogKeeper/logkeeper-slice-data.tgz"
     - func: "deploy cluster"
     - func: "run test"
     - func: "analyze"
@@ -1237,6 +1268,8 @@ buildvariants:
   expansions:
     setup: initialsync-logkeeper
     cluster: initialsync-logkeeper
+    # EBS logkeeper snapshot with FCV set to 4.0
+    snapshotId: snap-041c3c57a1a4f5bba
     platform: linux
     # TODO(TIG-1506): enabled authentication on initialsync variants
     authentication: disabled

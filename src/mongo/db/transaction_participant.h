@@ -660,7 +660,9 @@ public:
         // Finishes committing the multi-document transaction after the storage-transaction has been
         // committed, the oplog entry has been inserted into the oplog, and the transactions table
         // has been updated.
-        void _finishCommitTransaction(OperationContext* opCtx);
+        void _finishCommitTransaction(OperationContext* opCtx,
+                                      size_t operationCount,
+                                      size_t oplogOperationBytes);
 
         // Commits the storage-transaction on the OperationContext.
         //
@@ -675,6 +677,10 @@ public:
         // needToWriteAbortEntry state bool.
         void _abortActiveTransaction(OperationContext* opCtx,
                                      TransactionState::StateSet expectedStates);
+
+        // Factors out code for clarity from _abortActiveTransaction.
+        void _finishAbortingActiveTransaction(OperationContext* opCtx,
+                                              TransactionState::StateSet expectedStates);
 
         // Aborts a prepared transaction.
         void _abortActivePreparedTransaction(OperationContext* opCtx);

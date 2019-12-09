@@ -365,6 +365,12 @@ function RollbackTest(name = "RollbackTest", replSet) {
     this.transitionToSyncSourceOperationsDuringRollback = function() {
         transitionIfAllowed(State.kSyncSourceOpsDuringRollback);
 
+        // If the rollback node was restarted, make sure it has finished restarting and become a
+        // secondary again. Otherwise, the subsequent 'replSetFreeze' command could fail with
+        // NotYetInitialized if the node is still in the process of restarting (e.g. not yet loaded
+        // the local config or reached the STARTUP2 state).
+        waitForState(curSecondary, ReplSetTest.State.SECONDARY);
+
         // If the nodes are restarted after the rollback node is able to rollback successfully and
         // catch up to curPrimary's oplog, then the rollback node can become the new primary.
         // If so, it can lead to unplanned state transitions, like unconditional step down, during
@@ -396,8 +402,7 @@ function RollbackTest(name = "RollbackTest", replSet) {
         return curSecondary;
     };
 
-    this.restartNode = function(
-        nodeId, signal, startOptions, allowedExitCode, {skipValidation = false} = {}) {
+    this.restartNode = function(nodeId, signal, startOptions, allowedExitCode) {
         assert(signal === SIGKILL || signal === SIGTERM, `Received unknown signal: ${signal}`);
         assert.gte(nodeId, 0, "Invalid argument to RollbackTest.restartNode()");
 
@@ -420,7 +425,10 @@ function RollbackTest(name = "RollbackTest", replSet) {
             signal = SIGTERM;
         }
 
-        let opts = {skipValidation};
+        // We may attempt to restart a node while it is in rollback or recovery, in which case
+        // the validation checks will fail. We will still validate collections during the
+        // RollbackTest's full consistency checks, so we do not lose much validation coverage.
+        let opts = {skipValidation: true};
 
         if (allowedExitCode !== undefined) {
             Object.assign(opts, {allowedExitCode: allowedExitCode});

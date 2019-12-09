@@ -186,7 +186,7 @@ protected:
         size_t target = 0;
     };
 
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("LimitController::_mutex");
     stdx::unordered_map<PoolId, PoolData> _poolData;
 };
 
@@ -199,7 +199,7 @@ protected:
  */
 class ConnectionPool::SpecificPool final
     : public std::enable_shared_from_this<ConnectionPool::SpecificPool> {
-    static constexpr int kDiagnosticLogLevel = 3;
+    static constexpr int kDiagnosticLogLevel = 4;
 
 public:
     /**

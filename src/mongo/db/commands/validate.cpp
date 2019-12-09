@@ -55,7 +55,7 @@ MONGO_FAIL_POINT_DEFINE(validateCmdCollectionNotValid);
 namespace {
 
 // Protects `_validationQueue`
-stdx::mutex _validationMutex;
+Mutex _validationMutex;
 
 // Wakes up `_validationQueue`
 stdx::condition_variable _validationNotifier;
@@ -88,6 +88,10 @@ public:
 
     bool canIgnorePrepareConflicts() const override {
         return true;
+    }
+
+    bool maintenanceOk() const override {
+        return false;
     }
 
     virtual void addRequiredPrivileges(const std::string& dbname,
@@ -148,11 +152,11 @@ public:
 
         // Only one validation per collection can be in progress, the rest wait in order.
         {
-            stdx::unique_lock<stdx::mutex> lock(_validationMutex);
+            stdx::unique_lock<Latch> lock(_validationMutex);
             try {
-                while (_validationsInProgress.find(nss.ns()) != _validationsInProgress.end()) {
-                    opCtx->waitForConditionOrInterrupt(_validationNotifier, lock);
-                }
+                opCtx->waitForConditionOrInterrupt(_validationNotifier, lock, [&] {
+                    return _validationsInProgress.find(nss.ns()) == _validationsInProgress.end();
+                });
             } catch (AssertionException& e) {
                 CommandHelpers::appendCommandStatusNoThrow(
                     result,
@@ -165,7 +169,7 @@ public:
         }
 
         ON_BLOCK_EXIT([&] {
-            stdx::lock_guard<stdx::mutex> lock(_validationMutex);
+            stdx::lock_guard<Latch> lock(_validationMutex);
             _validationsInProgress.erase(nss.ns());
             _validationNotifier.notify_all();
         });

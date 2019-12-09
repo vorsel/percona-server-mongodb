@@ -44,8 +44,8 @@
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/record_id.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/util/fail_point_service.h"
 
 namespace mongo {
@@ -273,6 +273,8 @@ public:
      */
     bool isBackgroundBuilding() const;
 
+    void setIndexBuildMethod(IndexBuildMethod indexBuildMethod);
+
     /**
      * State transitions:
      *
@@ -339,8 +341,11 @@ private:
     // incorrect state set anywhere.
     bool _buildIsCleanedUp = true;
 
+    // Duplicate key constraints should be checked at least once in the MultiIndexBlock.
+    bool _constraintsChecked = false;
+
     // Protects member variables of this class declared below.
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("MultiIndexBlock::_mutex");
 
     State _state = State::kUninitialized;
     std::string _abortReason;

@@ -52,6 +52,7 @@
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/shared_buffer.h"
 #include "mongo/util/signal_handlers_synchronous.h"
+#include "mongo/util/text.h"
 
 namespace moe = mongo::optionenvironment;
 
@@ -238,7 +239,7 @@ TEST_F(MongodbCAPITest, CreateIndex) {
     mongo::BSONObj inputObj = mongo::fromjson(
         R"raw_delimiter({
             createIndexes: 'items',
-            indexes: 
+            indexes:
             [
                 {
                     key: {
@@ -265,7 +266,7 @@ TEST_F(MongodbCAPITest, CreateBackgroundIndex) {
     mongo::BSONObj inputObj = mongo::fromjson(
         R"raw_delimiter({
             createIndexes: 'items',
-            indexes: 
+            indexes:
             [
                 {
                     key: {
@@ -291,7 +292,7 @@ TEST_F(MongodbCAPITest, CreateTTLIndex) {
     mongo::BSONObj inputObj = mongo::fromjson(
         R"raw_delimiter({
             createIndexes: 'items',
-            indexes: 
+            indexes:
             [
                 {
                     key: {
@@ -560,7 +561,6 @@ TEST_F(MongodbCAPITest, InsertAndUpdate) {
 
 TEST_F(MongodbCAPITest, RunListCommands) {
     auto client = createClient();
-
     std::vector<std::string> whitelist = {
         "_hashBSONElement",
         "auditGetOptions",
@@ -622,9 +622,9 @@ TEST_F(MongodbCAPITest, RunListCommands) {
         "sleep",
         "startSession",
         "trimMemory",
-        "twoPhaseCreateIndexes",
         "update",
         "validate",
+        "waitForFailPoint",
     };
     std::sort(whitelist.begin(), whitelist.end());
 
@@ -664,8 +664,8 @@ TEST_F(MongodbCAPITest, RunListCommands) {
         std::cout << cmd << "\n";
     }
 
-    ASSERT(missing.empty());
-    ASSERT(unsupported.empty());
+    ASSERT(missing.empty()) << mongo::StringSplitter::join(missing, ", ");
+    ASSERT(unsupported.empty()) << mongo::StringSplitter::join(unsupported, ", ");
 }
 
 // This test is temporary to make sure that only one database can be created

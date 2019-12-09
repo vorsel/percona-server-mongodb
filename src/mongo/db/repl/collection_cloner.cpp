@@ -57,8 +57,8 @@ namespace mongo {
 namespace repl {
 namespace {
 
-using LockGuard = stdx::lock_guard<stdx::mutex>;
-using UniqueLock = stdx::unique_lock<stdx::mutex>;
+using LockGuard = stdx::lock_guard<Latch>;
+using UniqueLock = stdx::unique_lock<Latch>;
 using executor::RemoteCommandRequest;
 
 constexpr auto kCountResponseDocumentCountFieldName = "n"_sd;
@@ -122,10 +122,9 @@ CollectionCloner::CollectionCloner(executor::TaskExecutor* executor,
                       [this](const executor::TaskExecutor::RemoteCommandCallbackArgs& args) {
                           return _countCallback(args);
                       },
-                      RemoteCommandRetryScheduler::makeRetryPolicy(
+                      RemoteCommandRetryScheduler::makeRetryPolicy<ErrorCategory::RetriableError>(
                           numInitialSyncCollectionCountAttempts.load(),
-                          executor::RemoteCommandRequest::kNoTimeout,
-                          RemoteCommandRetryScheduler::kAllRetriableErrors)),
+                          executor::RemoteCommandRequest::kNoTimeout)),
       _listIndexesFetcher(
           _executor,
           _source,
@@ -139,10 +138,9 @@ CollectionCloner::CollectionCloner(executor::TaskExecutor* executor,
           ReadPreferenceSetting::secondaryPreferredMetadata(),
           RemoteCommandRequest::kNoTimeout /* find network timeout */,
           RemoteCommandRequest::kNoTimeout /* getMore network timeout */,
-          RemoteCommandRetryScheduler::makeRetryPolicy(
+          RemoteCommandRetryScheduler::makeRetryPolicy<ErrorCategory::RetriableError>(
               numInitialSyncListIndexesAttempts.load(),
-              executor::RemoteCommandRequest::kNoTimeout,
-              RemoteCommandRetryScheduler::kAllRetriableErrors)),
+              executor::RemoteCommandRequest::kNoTimeout)),
       _indexSpecs(),
       _documentsToInsert(),
       _dbWorkTaskRunner(_dbWorkThreadPool),
@@ -201,7 +199,7 @@ bool CollectionCloner::_isActive_inlock() const {
 }
 
 bool CollectionCloner::_isShuttingDown() const {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
     return State::kShuttingDown == _state;
 }
 
@@ -232,7 +230,7 @@ Status CollectionCloner::startup() noexcept {
 }
 
 void CollectionCloner::shutdown() {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
     switch (_state) {
         case State::kPreStart:
             // Transition directly from PreStart to Complete if not started yet.
@@ -265,12 +263,12 @@ void CollectionCloner::_cancelRemainingWork_inlock() {
 }
 
 CollectionCloner::Stats CollectionCloner::getStats() const {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
     return _stats;
 }
 
 void CollectionCloner::join() {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
     _condition.wait(lk, [this]() {
         return (_queryState == QueryState::kNotStarted || _queryState == QueryState::kFinished) &&
             !_isActive_inlock();
@@ -290,7 +288,7 @@ void CollectionCloner::setScheduleDbWorkFn_forTest(ScheduleDbWorkFn scheduleDbWo
 }
 
 void CollectionCloner::setCreateClientFn_forTest(const CreateClientFn& createClientFn) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     _createClientFn = createClientFn;
 }
 
@@ -480,7 +478,7 @@ void CollectionCloner::_beginCollectionCallback(const executor::TaskExecutor::Ca
             auto cancelRemainingWorkInLock = [this]() { _cancelRemainingWork_inlock(); };
             auto finishCallbackFn = [this](const Status& status) {
                 {
-                    stdx::lock_guard<stdx::mutex> lock(_mutex);
+                    stdx::lock_guard<Latch> lock(_mutex);
                     _queryState = QueryState::kFinished;
                     _clientConnection.reset();
                 }
@@ -500,13 +498,13 @@ void CollectionCloner::_beginCollectionCallback(const executor::TaskExecutor::Ca
 void CollectionCloner::_runQuery(const executor::TaskExecutor::CallbackArgs& callbackData,
                                  std::shared_ptr<OnCompletionGuard> onCompletionGuard) {
     if (!callbackData.status.isOK()) {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, callbackData.status);
         return;
     }
     bool queryStateOK = false;
     {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         queryStateOK = _queryState == QueryState::kNotStarted;
         if (queryStateOK) {
             _queryState = QueryState::kRunning;
@@ -531,12 +529,12 @@ void CollectionCloner::_runQuery(const executor::TaskExecutor::CallbackArgs& cal
 
     Status clientConnectionStatus = _clientConnection->connect(_source, StringData());
     if (!clientConnectionStatus.isOK()) {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, clientConnectionStatus);
         return;
     }
     if (!replAuthenticate(_clientConnection.get())) {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         onCompletionGuard->setResultAndCancelRemainingWork_inlock(
             lock,
             {ErrorCodes::AuthenticationFailed,
@@ -563,7 +561,7 @@ void CollectionCloner::_runQuery(const executor::TaskExecutor::CallbackArgs& cal
     } catch (const DBException& e) {
         auto queryStatus = e.toStatus().withContext(str::stream() << "Error querying collection '"
                                                                   << _sourceNss.ns());
-        stdx::unique_lock<stdx::mutex> lock(_mutex);
+        stdx::unique_lock<Latch> lock(_mutex);
         if (queryStatus.code() == ErrorCodes::OperationFailed ||
             queryStatus.code() == ErrorCodes::CursorNotFound ||
             queryStatus.code() == ErrorCodes::QueryPlanKilled) {
@@ -583,7 +581,7 @@ void CollectionCloner::_runQuery(const executor::TaskExecutor::CallbackArgs& cal
         }
     }
     waitForDbWorker();
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
     onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, Status::OK());
 }
 
@@ -591,7 +589,7 @@ void CollectionCloner::_handleNextBatch(std::shared_ptr<OnCompletionGuard> onCom
                                         DBClientCursorBatchIterator& iter) {
     _stats.receivedBatches++;
     {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
         uassert(ErrorCodes::CallbackCanceled,
                 "Collection cloning cancelled.",
                 _queryState != QueryState::kCanceling);
@@ -630,7 +628,7 @@ void CollectionCloner::_handleNextBatch(std::shared_ptr<OnCompletionGuard> onCom
 }
 
 void CollectionCloner::_verifyCollectionWasDropped(
-    const stdx::unique_lock<stdx::mutex>& lk,
+    const stdx::unique_lock<Latch>& lk,
     Status batchStatus,
     std::shared_ptr<OnCompletionGuard> onCompletionGuard) {
     // If we already have a _verifyCollectionDroppedScheduler, just return; the existing
@@ -693,7 +691,7 @@ void CollectionCloner::_insertDocumentsCallback(
     const executor::TaskExecutor::CallbackArgs& cbd,
     std::shared_ptr<OnCompletionGuard> onCompletionGuard) {
     if (!cbd.status.isOK()) {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, cbd.status);
         return;
     }

@@ -72,7 +72,7 @@ public:
                                     const NamespaceString& ns,
                                     BatchedObjects&& batch,
                                     const WriteConcernOptions& wc,
-                                    bool upsert,
+                                    UpsertType upsert,
                                     bool multi,
                                     boost::optional<OID> targetEpoch) override;
 
@@ -153,7 +153,8 @@ public:
 protected:
     BSONObj _reportCurrentOpForClient(OperationContext* opCtx,
                                       Client* client,
-                                      CurrentOpTruncateMode truncateOps) const final;
+                                      CurrentOpTruncateMode truncateOps,
+                                      CurrentOpBacktraceMode backtraceMode) const final;
 
     void _reportCurrentOpsForIdleSessions(OperationContext* opCtx,
                                           CurrentOpUserMode userMode,
@@ -175,7 +176,7 @@ protected:
     Update buildUpdateOp(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                          const NamespaceString& nss,
                          BatchedObjects&& batch,
-                         bool upsert,
+                         UpsertType upsert,
                          bool multi);
 
 private:

@@ -85,12 +85,19 @@ public:
         std::tuple<BSONObj, write_ops::UpdateModification, boost::optional<BSONObj>>;
     using BatchedObjects = std::vector<BatchObject>;
 
+    enum class UpsertType {
+        kNone,              // This operation is not an upsert.
+        kGenerateNewDoc,    // If no documents match, generate a new document using the update spec.
+        kInsertSuppliedDoc  // If no documents match, insert the document supplied in 'c.new' as-is.
+    };
+
     enum class CurrentOpConnectionsMode { kIncludeIdle, kExcludeIdle };
     enum class CurrentOpUserMode { kIncludeAll, kExcludeOthers };
     enum class CurrentOpTruncateMode { kNoTruncation, kTruncateOps };
     enum class CurrentOpLocalOpsMode { kLocalMongosOps, kRemoteShardOps };
     enum class CurrentOpSessionsMode { kIncludeIdle, kExcludeIdle };
     enum class CurrentOpCursorMode { kIncludeCursors, kExcludeCursors };
+    enum class CurrentOpBacktraceMode { kIncludeBacktrace, kExcludeBacktrace };
 
     /**
      * Factory function to create MongoProcessInterface of the right type. The implementation will
@@ -166,7 +173,7 @@ public:
                                             const NamespaceString& ns,
                                             BatchedObjects&& batch,
                                             const WriteConcernOptions& wc,
-                                            bool upsert,
+                                            UpsertType upsert,
                                             bool multi,
                                             boost::optional<OID> targetEpoch) = 0;
 
@@ -277,7 +284,8 @@ public:
         CurrentOpSessionsMode sessionMode,
         CurrentOpUserMode userMode,
         CurrentOpTruncateMode,
-        CurrentOpCursorMode) const = 0;
+        CurrentOpCursorMode,
+        CurrentOpBacktraceMode) const = 0;
 
     /**
      * Returns the name of the local shard if sharding is enabled, or an empty string.

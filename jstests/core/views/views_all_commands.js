@@ -501,10 +501,6 @@ let viewsCommandTests = {
         command: {touch: "view", data: true},
         expectFailure: true,
     },
-    twoPhaseCreateIndexes: {
-        command: {twoPhaseCreateIndexes: "view", indexes: [{key: {x: 1}, name: "x_1"}]},
-        expectFailure: true,
-    },
     unsetSharding: {skip: isAnInternalCommand},
     update: {command: {update: "view", updates: [{q: {x: 1}, u: {x: 2}}]}, expectFailure: true},
     updateRole: {
@@ -528,6 +524,7 @@ let viewsCommandTests = {
     voteCommitIndexBuild: {skip: isUnrelated},
     voteCommitTransaction: {skip: isUnrelated},
     voteAbortTransaction: {skip: isUnrelated},
+    waitForFailPoint: {skip: isUnrelated},
     whatsmyuri: {skip: isUnrelated},
 
     // Percona commands

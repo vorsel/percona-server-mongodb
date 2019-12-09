@@ -159,7 +159,7 @@ public:
     BSONObj encryptDataKey(ConstDataRange cdr, StringData keyId) final;
 
 private:
-    void initRequest(kms_request_t* request, StringData region);
+    void initRequest(kms_request_t* request, StringData host, StringData region);
 
 private:
     // SSL Manager
@@ -181,7 +181,7 @@ void uassertKmsRequestInternal(kms_request_t* request, bool ok) {
 
 #define uassertKmsRequest(X) uassertKmsRequestInternal(request, (X));
 
-void AWSKMSService::initRequest(kms_request_t* request, StringData region) {
+void AWSKMSService::initRequest(kms_request_t* request, StringData host, StringData region) {
 
     // use current time
     uassertKmsRequest(kms_request_set_date(request, nullptr));
@@ -193,6 +193,9 @@ void AWSKMSService::initRequest(kms_request_t* request, StringData region) {
 
     uassertKmsRequest(kms_request_set_access_key_id(request, _config.accessKeyId.c_str()));
     uassertKmsRequest(kms_request_set_secret_key(request, _config.secretAccessKey->c_str()));
+
+    // Set host to be the host we are targeting instead of defaulting to kms.<region>.amazonaws.com
+    uassertKmsRequest(kms_request_add_header_field(request, "Host", host.toString().c_str()));
 
     if (!_config.sessionToken.value_or("").empty()) {
         // TODO: move this into kms-message
@@ -250,7 +253,7 @@ std::vector<uint8_t> AWSKMSService::encrypt(ConstDataRange cdr, StringData kmsKe
         _server = getDefaultHost(region);
     }
 
-    initRequest(request.get(), region);
+    initRequest(request.get(), _server.host(), region);
 
     auto buffer = UniqueKmsCharBuffer(kms_request_get_signed(request.get()));
     auto buffer_len = strlen(buffer.get());
@@ -265,14 +268,21 @@ std::vector<uint8_t> AWSKMSService::encrypt(ConstDataRange cdr, StringData kmsKe
     auto field = obj["__type"];
 
     if (!field.eoo()) {
-        auto awsResponse = AwsKMSError::parse(IDLParserErrorContext("root"), obj);
+        AwsKMSError awsResponse;
+        try {
+            awsResponse = AwsKMSError::parse(IDLParserErrorContext("awsEncryptError"), obj);
+        } catch (DBException& dbe) {
+            uasserted(51274,
+                      str::stream() << "AWS KMS failed to parse error message: " << dbe.toString()
+                                    << ", Response : " << obj);
+        }
 
         uasserted(51224,
                   str::stream() << "AWS KMS failed to encrypt: " << awsResponse.getType() << " : "
                                 << awsResponse.getMessage());
     }
 
-    auto awsResponse = AwsEncryptResponse::parse(IDLParserErrorContext("root"), obj);
+    auto awsResponse = AwsEncryptResponse::parse(IDLParserErrorContext("awsEncryptResponse"), obj);
 
     auto blobStr = base64::decode(awsResponse.getCiphertextBlob().toString());
 
@@ -295,16 +305,16 @@ BSONObj AWSKMSService::encryptDataKey(ConstDataRange cdr, StringData keyId) {
 }
 
 SecureVector<uint8_t> AWSKMSService::decrypt(ConstDataRange cdr, BSONObj masterKey) {
-    auto awsMasterKey = AwsMasterKey::parse(IDLParserErrorContext("root"), masterKey);
+    auto awsMasterKey = AwsMasterKey::parse(IDLParserErrorContext("awsMasterKey"), masterKey);
 
     auto request = UniqueKmsRequest(kms_decrypt_request_new(
         reinterpret_cast<const uint8_t*>(cdr.data()), cdr.length(), nullptr));
 
-    initRequest(request.get(), awsMasterKey.getRegion());
-
     if (_server.empty()) {
         _server = getDefaultHost(awsMasterKey.getRegion());
     }
+
+    initRequest(request.get(), _server.host(), awsMasterKey.getRegion());
 
     auto buffer = UniqueKmsCharBuffer(kms_request_get_signed(request.get()));
     auto buffer_len = strlen(buffer.get());
@@ -318,14 +328,21 @@ SecureVector<uint8_t> AWSKMSService::decrypt(ConstDataRange cdr, BSONObj masterK
     auto field = obj["__type"];
 
     if (!field.eoo()) {
-        auto awsResponse = AwsKMSError::parse(IDLParserErrorContext("root"), obj);
+        AwsKMSError awsResponse;
+        try {
+            awsResponse = AwsKMSError::parse(IDLParserErrorContext("awsDecryptError"), obj);
+        } catch (DBException& dbe) {
+            uasserted(51275,
+                      str::stream() << "AWS KMS failed to parse error message: " << dbe.toString()
+                                    << ", Response : " << obj);
+        }
 
         uasserted(51225,
                   str::stream() << "AWS KMS failed to decrypt: " << awsResponse.getType() << " : "
                                 << awsResponse.getMessage());
     }
 
-    auto awsResponse = AwsDecryptResponse::parse(IDLParserErrorContext("root"), obj);
+    auto awsResponse = AwsDecryptResponse::parse(IDLParserErrorContext("awsDecryptResponse"), obj);
 
     auto blobStr = base64::decode(awsResponse.getPlaintext().toString());
 
@@ -339,9 +356,15 @@ void AWSConnection::connect(const HostAndPort& host) {
             str::stream() << "AWS KMS server address " << host.host() << " is invalid.",
             server.isValid());
 
+    int attempt = 0;
+    bool connected = false;
+    while ((connected == false) && (attempt < 3)) {
+        connected = _socket->connect(server);
+        attempt++;
+    }
     uassert(51137,
             str::stream() << "Could not connect to AWS KMS server " << server.toString(),
-            _socket->connect(server));
+            connected);
 
     uassert(51138,
             str::stream() << "Failed to perform SSL handshake with the AWS KMS server "

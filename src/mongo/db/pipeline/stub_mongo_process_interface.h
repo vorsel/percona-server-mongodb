@@ -75,7 +75,7 @@ public:
                                     const NamespaceString& ns,
                                     BatchedObjects&& batch,
                                     const WriteConcernOptions& wc,
-                                    bool upsert,
+                                    UpsertType upsert,
                                     bool multi,
                                     boost::optional<OID>) final {
         MONGO_UNREACHABLE;
@@ -146,7 +146,8 @@ public:
                                        CurrentOpSessionsMode sessionMode,
                                        CurrentOpUserMode userMode,
                                        CurrentOpTruncateMode truncateMode,
-                                       CurrentOpCursorMode cursorMode) const override {
+                                       CurrentOpCursorMode cursorMode,
+                                       CurrentOpBacktraceMode backtraceMode) const override {
         MONGO_UNREACHABLE;
     }
 

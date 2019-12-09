@@ -254,10 +254,10 @@ public:
     }
 
     void checkForInterruptForTimeout(OperationContext* opCtx) {
-        stdx::mutex m;
+        auto m = MONGO_MAKE_LATCH();
         stdx::condition_variable cv;
-        stdx::unique_lock<stdx::mutex> lk(m);
-        opCtx->waitForConditionOrInterrupt(cv, lk);
+        stdx::unique_lock<Latch> lk(m);
+        opCtx->waitForConditionOrInterrupt(cv, lk, [] { return false; });
     }
 
     const std::shared_ptr<ClockSourceMock> mockClock = std::make_shared<ClockSourceMock>();
@@ -334,22 +334,24 @@ TEST_F(OperationDeadlineTests, VeryLargeRelativeDeadlinesNanoseconds) {
 TEST_F(OperationDeadlineTests, WaitForMaxTimeExpiredCV) {
     auto opCtx = client->makeOperationContext();
     opCtx->setDeadlineByDate(mockClock->now(), ErrorCodes::ExceededTimeLimit);
-    stdx::mutex m;
+    auto m = MONGO_MAKE_LATCH();
     stdx::condition_variable cv;
-    stdx::unique_lock<stdx::mutex> lk(m);
-    ASSERT_EQ(ErrorCodes::ExceededTimeLimit, opCtx->waitForConditionOrInterruptNoAssert(cv, lk));
+    stdx::unique_lock<Latch> lk(m);
+    ASSERT_THROWS_CODE(opCtx->waitForConditionOrInterrupt(cv, lk, [] { return false; }),
+                       DBException,
+                       ErrorCodes::ExceededTimeLimit);
 }
 
 TEST_F(OperationDeadlineTests, WaitForMaxTimeExpiredCVWithWaitUntilSet) {
     auto opCtx = client->makeOperationContext();
     opCtx->setDeadlineByDate(mockClock->now(), ErrorCodes::ExceededTimeLimit);
-    stdx::mutex m;
+    auto m = MONGO_MAKE_LATCH();
     stdx::condition_variable cv;
-    stdx::unique_lock<stdx::mutex> lk(m);
-    ASSERT_EQ(
-        ErrorCodes::ExceededTimeLimit,
-        opCtx->waitForConditionOrInterruptNoAssertUntil(cv, lk, mockClock->now() + Seconds{10})
-            .getStatus());
+    stdx::unique_lock<Latch> lk(m);
+    ASSERT_THROWS_CODE(opCtx->waitForConditionOrInterruptUntil(
+                           cv, lk, mockClock->now() + Seconds{10}, [] { return false; }),
+                       DBException,
+                       ErrorCodes::ExceededTimeLimit);
 }
 
 TEST_F(OperationDeadlineTests, NestedTimeoutsTimeoutInOrder) {
@@ -598,38 +600,38 @@ TEST_F(OperationDeadlineTests, DeadlineAfterRunWithoutInterruptDoesntSeeUnviolat
 TEST_F(OperationDeadlineTests, WaitForKilledOpCV) {
     auto opCtx = client->makeOperationContext();
     opCtx->markKilled();
-    stdx::mutex m;
+    auto m = MONGO_MAKE_LATCH();
     stdx::condition_variable cv;
-    stdx::unique_lock<stdx::mutex> lk(m);
-    ASSERT_EQ(ErrorCodes::Interrupted, opCtx->waitForConditionOrInterruptNoAssert(cv, lk));
+    stdx::unique_lock<Latch> lk(m);
+    ASSERT_THROWS_CODE(opCtx->waitForConditionOrInterrupt(cv, lk, [] { return false; }),
+                       DBException,
+                       ErrorCodes::Interrupted);
 }
 
 TEST_F(OperationDeadlineTests, WaitForUntilExpiredCV) {
     auto opCtx = client->makeOperationContext();
-    stdx::mutex m;
+    auto m = MONGO_MAKE_LATCH();
     stdx::condition_variable cv;
-    stdx::unique_lock<stdx::mutex> lk(m);
-    ASSERT(stdx::cv_status::timeout ==
-           unittest::assertGet(
-               opCtx->waitForConditionOrInterruptNoAssertUntil(cv, lk, mockClock->now())));
+    stdx::unique_lock<Latch> lk(m);
+    ASSERT_FALSE(
+        opCtx->waitForConditionOrInterruptUntil(cv, lk, mockClock->now(), [] { return false; }));
 }
 
 TEST_F(OperationDeadlineTests, WaitForUntilExpiredCVWithMaxTimeSet) {
     auto opCtx = client->makeOperationContext();
     opCtx->setDeadlineByDate(mockClock->now() + Seconds{10}, ErrorCodes::ExceededTimeLimit);
-    stdx::mutex m;
+    auto m = MONGO_MAKE_LATCH();
     stdx::condition_variable cv;
-    stdx::unique_lock<stdx::mutex> lk(m);
-    ASSERT(stdx::cv_status::timeout ==
-           unittest::assertGet(
-               opCtx->waitForConditionOrInterruptNoAssertUntil(cv, lk, mockClock->now())));
+    stdx::unique_lock<Latch> lk(m);
+    ASSERT_FALSE(
+        opCtx->waitForConditionOrInterruptUntil(cv, lk, mockClock->now(), [] { return false; }));
 }
 
 TEST_F(OperationDeadlineTests, WaitForDurationExpired) {
     auto opCtx = client->makeOperationContext();
-    stdx::mutex m;
+    auto m = MONGO_MAKE_LATCH();
     stdx::condition_variable cv;
-    stdx::unique_lock<stdx::mutex> lk(m);
+    stdx::unique_lock<Latch> lk(m);
     ASSERT_FALSE(opCtx->waitForConditionOrInterruptFor(
         cv, lk, Milliseconds(-1000), []() -> bool { return false; }));
 }
@@ -637,28 +639,30 @@ TEST_F(OperationDeadlineTests, WaitForDurationExpired) {
 TEST_F(OperationDeadlineTests, DuringWaitMaxTimeExpirationDominatesUntilExpiration) {
     auto opCtx = client->makeOperationContext();
     opCtx->setDeadlineByDate(mockClock->now(), ErrorCodes::ExceededTimeLimit);
-    stdx::mutex m;
+    auto m = MONGO_MAKE_LATCH();
     stdx::condition_variable cv;
-    stdx::unique_lock<stdx::mutex> lk(m);
-    ASSERT(ErrorCodes::ExceededTimeLimit ==
-           opCtx->waitForConditionOrInterruptNoAssertUntil(cv, lk, mockClock->now()));
+    stdx::unique_lock<Latch> lk(m);
+    ASSERT_THROWS_CODE(
+        opCtx->waitForConditionOrInterruptUntil(cv, lk, mockClock->now(), [] { return false; }),
+        DBException,
+        ErrorCodes::ExceededTimeLimit);
 }
 
 class ThreadedOperationDeadlineTests : public OperationDeadlineTests {
 public:
     using CvPred = stdx::function<bool()>;
     using WaitFn = stdx::function<bool(
-        OperationContext*, stdx::condition_variable&, stdx::unique_lock<stdx::mutex>&, CvPred)>;
+        OperationContext*, stdx::condition_variable&, stdx::unique_lock<Latch>&, CvPred)>;
 
     struct WaitTestState {
         void signal() {
-            stdx::lock_guard<stdx::mutex> lk(mutex);
+            stdx::lock_guard<Latch> lk(mutex);
             invariant(!isSignaled);
             isSignaled = true;
             cv.notify_all();
         }
 
-        stdx::mutex mutex;
+        Mutex mutex = MONGO_MAKE_LATCH("WaitTestState::mutex");
         stdx::condition_variable cv;
         bool isSignaled = false;
     };
@@ -674,7 +678,7 @@ public:
                 opCtx->setDeadlineByDate(maxTime, ErrorCodes::ExceededTimeLimit);
             }
             auto predicate = [state] { return state->isSignaled; };
-            stdx::unique_lock<stdx::mutex> lk(state->mutex);
+            stdx::unique_lock<Latch> lk(state->mutex);
             barrier->countDownAndWait();
             return waitFn(opCtx, state->cv, lk, predicate);
         });
@@ -684,7 +688,7 @@ public:
 
         // Now we know that the waiter task must own the mutex, because it does not signal the
         // barrier until it does.
-        stdx::lock_guard<stdx::mutex> lk(state->mutex);
+        stdx::lock_guard<Latch> lk(state->mutex);
 
         // Assuming that opCtx has not already been interrupted and that maxTime and until are
         // unexpired, we know that the waiter must be blocked in the condition variable, because it
@@ -699,7 +703,7 @@ public:
                                                       Date_t maxTime) {
         const auto waitFn = [until](OperationContext* opCtx,
                                     stdx::condition_variable& cv,
-                                    stdx::unique_lock<stdx::mutex>& lk,
+                                    stdx::unique_lock<Latch>& lk,
                                     CvPred predicate) {
             if (until < Date_t::max()) {
                 return opCtx->waitForConditionOrInterruptUntil(cv, lk, until, predicate);
@@ -718,7 +722,7 @@ public:
                                                          Date_t maxTime) {
         const auto waitFn = [duration](OperationContext* opCtx,
                                        stdx::condition_variable& cv,
-                                       stdx::unique_lock<stdx::mutex>& lk,
+                                       stdx::unique_lock<Latch>& lk,
                                        CvPred predicate) {
             return opCtx->waitForConditionOrInterruptFor(cv, lk, duration, predicate);
         };
@@ -735,7 +739,7 @@ public:
                                                            Date_t maxTime) {
         auto waitFn = [sleepUntil](OperationContext* opCtx,
                                    stdx::condition_variable& cv,
-                                   stdx::unique_lock<stdx::mutex>& lk,
+                                   stdx::unique_lock<Latch>& lk,
                                    CvPred predicate) {
             lk.unlock();
             opCtx->sleepUntil(sleepUntil);
@@ -752,7 +756,7 @@ public:
                                                          Date_t maxTime) {
         auto waitFn = [sleepFor](OperationContext* opCtx,
                                  stdx::condition_variable& cv,
-                                 stdx::unique_lock<stdx::mutex>& lk,
+                                 stdx::unique_lock<Latch>& lk,
                                  CvPred predicate) {
             lk.unlock();
             opCtx->sleepFor(sleepFor);
@@ -937,17 +941,17 @@ TEST_F(ThreadedOperationDeadlineTests, SleepForWithExpiredForDoesNotBlock) {
     ASSERT_FALSE(waiterResult.get());
 }
 
-TEST(OperationContextTest, TestWaitForConditionOrInterruptNoAssertUntilAPI) {
-    // `waitForConditionOrInterruptNoAssertUntil` can have three outcomes:
+TEST(OperationContextTest, TestWaitForConditionOrInterruptUntilAPI) {
+    // `waitForConditionOrInterruptUntil` can have three outcomes:
     //
     // 1) The condition is satisfied before any timeouts.
     // 2) The explicit `deadline` function argument is triggered.
     // 3) The operation context implicitly times out, or is interrupted from a killOp command or
     //    shutdown, etc.
     //
-    // Case (1) must return a Status::OK with a value of `cv_status::no_timeout`. Case (2) must also
-    // return a Status::OK with a value of `cv_status::timeout`. Case (3) must return an error
-    // status. The error status returned is otherwise configurable.
+    // Case (1) must return true.
+    // Case (2) must return false.
+    // Case (3) must throw a DBException.
     //
     // Case (1) is the hardest to test. The condition variable must be notified by a second thread
     // when the client is waiting on it. Case (1) is also the least in need of having the API
@@ -956,23 +960,22 @@ TEST(OperationContextTest, TestWaitForConditionOrInterruptNoAssertUntilAPI) {
     auto client = serviceCtx->makeClient("OperationContextTest");
     auto opCtx = client->makeOperationContext();
 
-    stdx::mutex mutex;
+    auto mutex = MONGO_MAKE_LATCH();
     stdx::condition_variable cv;
-    stdx::unique_lock<stdx::mutex> lk(mutex);
+    stdx::unique_lock<Latch> lk(mutex);
 
     // Case (2). Expect a Status::OK with a cv_status::timeout.
     Date_t deadline = Date_t::now() + Milliseconds(500);
-    StatusWith<stdx::cv_status> ret =
-        opCtx->waitForConditionOrInterruptNoAssertUntil(cv, lk, deadline);
-    ASSERT_OK(ret.getStatus());
-    ASSERT(ret.getValue() == stdx::cv_status::timeout);
+    ASSERT_EQ(opCtx->waitForConditionOrInterruptUntil(cv, lk, deadline, [] { return false; }),
+              false);
 
     // Case (3). Expect an error of `MaxTimeMSExpired`.
     opCtx->setDeadlineByDate(Date_t::now(), ErrorCodes::MaxTimeMSExpired);
     deadline = Date_t::now() + Seconds(500);
-    ret = opCtx->waitForConditionOrInterruptNoAssertUntil(cv, lk, deadline);
-    ASSERT_FALSE(ret.isOK());
-    ASSERT_EQUALS(ErrorCodes::MaxTimeMSExpired, ret.getStatus().code());
+    ASSERT_THROWS_CODE(
+        opCtx->waitForConditionOrInterruptUntil(cv, lk, deadline, [] { return false; }),
+        DBException,
+        ErrorCodes::MaxTimeMSExpired);
 }
 
 }  // namespace

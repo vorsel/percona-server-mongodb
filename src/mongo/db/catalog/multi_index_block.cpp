@@ -758,6 +758,8 @@ Status MultiIndexBlock::drainBackgroundWrites(OperationContext* opCtx,
 }
 
 Status MultiIndexBlock::checkConstraints(OperationContext* opCtx) {
+    _constraintsChecked = true;
+
     if (State::kAborted == _getState()) {
         return {ErrorCodes::IndexBuildAborted,
                 str::stream() << "Index build aborted: " << _abortReason
@@ -820,6 +822,9 @@ Status MultiIndexBlock::commit(OperationContext* opCtx,
                           << ". Cannot commit index builder: " << collection->ns()
                           << (_collectionUUID ? (" (" + _collectionUUID->toString() + ")") : "")};
     }
+
+    // Ensure that duplicate key constraints were checked at least once.
+    invariant(_constraintsChecked);
 
     // Do not interfere with writing multikey information when committing index builds.
     auto restartTracker = makeGuard(
@@ -898,23 +903,28 @@ bool MultiIndexBlock::isBackgroundBuilding() const {
     return _method == IndexBuildMethod::kBackground || _method == IndexBuildMethod::kHybrid;
 }
 
+void MultiIndexBlock::setIndexBuildMethod(IndexBuildMethod indexBuildMethod) {
+    invariant(_getState() == State::kUninitialized);
+    _method = indexBuildMethod;
+}
+
 MultiIndexBlock::State MultiIndexBlock::getState_forTest() const {
     return _getState();
 }
 
 MultiIndexBlock::State MultiIndexBlock::_getState() const {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
     return _state;
 }
 
 void MultiIndexBlock::_setState(State newState) {
     invariant(State::kAborted != newState);
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
     _state = newState;
 }
 
 void MultiIndexBlock::_setStateToAbortedIfNotCommitted(StringData reason) {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
     if (State::kCommitted == _state) {
         return;
     }
