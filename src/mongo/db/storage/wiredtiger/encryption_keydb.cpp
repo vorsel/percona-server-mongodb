@@ -356,7 +356,7 @@ int EncryptionKeyDB::get_key_by_id(const char *keyid, size_t len, unsigned char 
     // open cursor
     WT_CURSOR *cursor;
     {
-        stdx::lock_guard<stdx::mutex> lk(_lock_sess);
+        stdx::lock_guard<Latch> lk(_lock_sess);
         res = _sess->open_cursor(_sess, "table:key", nullptr, nullptr, &cursor);
         if (res){
             error() << "get_key_by_id: error opening cursor: " << wiredtiger_strerror(res);
@@ -371,7 +371,7 @@ int EncryptionKeyDB::get_key_by_id(const char *keyid, size_t len, unsigned char 
         });
 
     // search/write of db encryption key should be atomic
-    stdx::lock_guard<stdx::mutex> lk(_lock_key);
+    stdx::lock_guard<Latch> lk(_lock_key);
     // read key from DB
     std::string c_str(keyid, len);
     LOG(4) << "trying to load encryption key for keyid: " << c_str;
@@ -419,7 +419,7 @@ int EncryptionKeyDB::delete_key_by_id(const std::string&  keyid) {
     // open cursor
     WT_CURSOR *cursor;
     {
-        stdx::lock_guard<stdx::mutex> lk(_lock_sess);
+        stdx::lock_guard<Latch> lk(_lock_sess);
         res = _sess->open_cursor(_sess, "table:key", nullptr, nullptr, &cursor);
         if (res){
             error() << "delete_key_by_id: error opening cursor: " << wiredtiger_strerror(res);
@@ -461,7 +461,7 @@ int EncryptionKeyDB::store_gcm_iv_reserved() {
     // open cursor
     WT_CURSOR *cursor;
     {
-        stdx::lock_guard<stdx::mutex> lk(_lock_sess);
+        stdx::lock_guard<Latch> lk(_lock_sess);
         res = _sess->open_cursor(_sess, "table:parameters", nullptr, nullptr, &cursor);
         if (res){
             error() << "store_gcm_iv_reserved: error opening cursor: " << wiredtiger_strerror(res);
