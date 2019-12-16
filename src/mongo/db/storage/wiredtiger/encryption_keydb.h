@@ -36,8 +36,8 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 #include <boost/multiprecision/cpp_int.hpp>
 #include <wiredtiger.h>
 
+#include "mongo/platform/mutex.h"
 #include "mongo/platform/random.h"
-#include "mongo/stdx/mutex.h"
 
 namespace mongo {
 
@@ -96,8 +96,8 @@ private:
     unsigned char _masterkey[_key_len];
     WT_CONNECTION *_conn = nullptr;
     stdx::recursive_mutex _lock;  // _prng, _gcm_iv, _gcm_iv_reserved
-    stdx::mutex _lock_sess;  // _sess
-    stdx::mutex _lock_key;  // serialize access to the encryption keys table, also protects _srng
+    Mutex _lock_sess = MONGO_MAKE_LATCH("EncryptionKeyDB::_lock_sess");  // _sess
+    Mutex _lock_key = MONGO_MAKE_LATCH("EncryptionKeyDB::_lock_key");  // serialize access to the encryption keys table, also protects _srng
     WT_SESSION *_sess = nullptr;
     std::unique_ptr<SecureRandom> _srng;
     std::unique_ptr<PseudoRandom> _prng;

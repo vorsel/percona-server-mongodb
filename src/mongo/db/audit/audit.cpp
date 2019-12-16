@@ -63,8 +63,8 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/matcher.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/logger/auditlog.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/exit_code.h"
 #include "mongo/util/log.h"
@@ -449,16 +449,16 @@ namespace audit {
         }
 
         static StringMap<std::string> hostToIpCache;
-        static stdx::mutex cacheMutex;
+        static auto cacheMutex = MONGO_MAKE_LATCH("audit::getIpByHost::cacheMutex");
 
         std::string ip;
         {
-            stdx::lock_guard<stdx::mutex> lk(cacheMutex);
+            stdx::lock_guard<Latch> lk(cacheMutex);
             ip = hostToIpCache[host];
         }
         if (ip.empty()) {
             ip = hostbyname(host.c_str());
-            stdx::lock_guard<stdx::mutex> lk(cacheMutex);
+            stdx::lock_guard<Latch> lk(cacheMutex);
             hostToIpCache[host] = ip;
         }
         return ip;
