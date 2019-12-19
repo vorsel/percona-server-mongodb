@@ -69,6 +69,7 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/replication_metrics.h"
 #include "mongo/db/repl/session_update_tracker.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
@@ -420,6 +421,17 @@ Status SyncTail::syncApply(OperationContext* opCtx,
     if (opType == OpTypeEnum::kNoop) {
         if (nss.db() == "") {
             incrementOpsAppliedStats();
+
+            auto oplogEntry = OplogEntryBase::parse(IDLParserErrorContext("syncApply"), op);
+            auto opObj = oplogEntry.getObject();
+            if (opObj.hasField(ReplicationCoordinator::newPrimaryMsgField) &&
+                opObj.getField(ReplicationCoordinator::newPrimaryMsgField).str() ==
+                    ReplicationCoordinator::newPrimaryMsg) {
+
+                invariant(oplogEntry.getWallClockTime());
+                ReplicationMetrics::get(opCtx).setParticipantNewTermDates(
+                    oplogEntry.getWallClockTime().get(), applyStartTime);
+            }
             return Status::OK();
         }
         Lock::DBLock dbLock(opCtx, nss.db(), MODE_X);
@@ -957,15 +969,7 @@ void SyncTail::_oplogApplication(OplogBuffer* oplogBuffer,
         if (MONGO_FAIL_POINT(rsSyncApplyStop)) {
             log() << "sync tail - rsSyncApplyStop fail point enabled. Blocking until fail point is "
                      "disabled.";
-            while (MONGO_FAIL_POINT(rsSyncApplyStop)) {
-                // Tests should not trigger clean shutdown while that failpoint is active. If we
-                // think we need this, we need to think hard about what the behavior should be.
-                if (inShutdown()) {
-                    severe() << "Turn off rsSyncApplyStop before attempting clean shutdown";
-                    fassertFailedNoTrace(40304);
-                }
-                sleepmillis(10);
-            }
+            MONGO_FAIL_POINT_PAUSE_WHILE_SET(rsSyncApplyStop);
         }
 
         // Get the current value of 'minValid'.
@@ -1166,6 +1170,12 @@ void SyncTail::_consume(OperationContext* opCtx, OplogBuffer* oplogBuffer) {
 }
 
 void SyncTail::shutdown() {
+    // Shutdown will hang if this failpoint is enabled.
+    if (MONGO_FAIL_POINT(rsSyncApplyStop)) {
+        severe() << "Turn off rsSyncApplyStop before attempting clean shutdown";
+        fassertFailedNoTrace(40304);
+    }
+
     stdx::lock_guard<stdx::mutex> lock(_mutex);
     _inShutdown = true;
 }
@@ -1598,6 +1608,10 @@ StatusWith<OpTime> SyncTail::multiApply(OperationContext* opCtx, MultiApplier::O
                         opCtx, info.nss, info.indexName, info.multikeyPaths, firstTimeInBatch));
         }
     }
+
+    // Increment the counter for the number of ops applied during catchup if the node is in catchup
+    // mode.
+    replCoord->incrementNumCatchUpOpsIfCatchingUp(ops.size());
 
     // We have now written all database writes and updated the oplog to match.
     return ops.back().getOpTime();
