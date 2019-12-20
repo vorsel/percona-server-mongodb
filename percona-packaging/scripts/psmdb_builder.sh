@@ -490,9 +490,11 @@ build_rpm(){
     if [ "x${RHEL}" == "x8" ]; then
         pip3.6 install --upgrade pip
         pip3.6 install --user -r etc/pip/dev-requirements.txt
+        pip3.6 install --user -r etc/pip/evgtest-requirements.txt
     else
         pip install --upgrade pip
         pip install --user -r etc/pip/dev-requirements.txt
+        pip install --user -r etc/pip/evgtest-requirements.txt
     fi
     #
     cd $WORKDIR
@@ -571,6 +573,7 @@ build_source_deb(){
     cd ${BUILDDIR}
     pip install --upgrade pip
     pip install --user -r etc/pip/dev-requirements.txt
+    pip install --user -r etc/pip/evgtest-requirements.txt
 
     set_compiler
     fix_rules
@@ -622,6 +625,7 @@ build_deb(){
     cd ${PRODUCT}-${VERSION}
     pip install --upgrade pip
     pip install --user -r etc/pip/dev-requirements.txt
+    pip install --user -r etc/pip/evgtest-requirements.txt
     #
     cp -av percona-packaging/debian/rules debian/
     set_compiler
@@ -705,6 +709,7 @@ build_tarball(){
     cd ${PSMDIR_ABS}
     pip install --upgrade pip
     pip install --user -r etc/pip/dev-requirements.txt
+    pip install --user -r etc/pip/evgtest-requirements.txt
     if [ ${DEBUG} = 0 ]; then
         buildscripts/scons.py CC=${CC} CXX=${CXX} --disable-warnings-as-errors --release --ssl --opt=on -j$NJOBS --use-sasl-client --wiredtiger --audit --inmemory --hotbackup CPPPATH=${INSTALLDIR}/include LIBPATH=${INSTALLDIR}/lib ${PSM_TARGETS}
     else
