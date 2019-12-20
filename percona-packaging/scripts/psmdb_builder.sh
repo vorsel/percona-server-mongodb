@@ -568,9 +568,11 @@ build_rpm(){
     if [ "x${RHEL}" == "x8" ]; then
         pip3.6 install --upgrade pip
         pip3.6 install --user -r etc/pip/dev-requirements.txt
+        pip3.6 install --user -r etc/pip/evgtest-requirements.txt
     else
         pip install --upgrade pip
         pip install --user -r etc/pip/dev-requirements.txt
+        pip install --user -r etc/pip/evgtest-requirements.txt
     fi
     #
     cd $WORKDIR
@@ -650,6 +652,7 @@ build_source_deb(){
     cd ${BUILDDIR}
     pip install --upgrade pip
     pip install --user -r etc/pip/dev-requirements.txt
+    pip install --user -r etc/pip/evgtest-requirements.txt
 
     set_compiler
     fix_rules
@@ -701,6 +704,7 @@ build_deb(){
     cd ${PRODUCT}-${VERSION}
     pip install --upgrade pip
     pip install --user -r etc/pip/dev-requirements.txt
+    pip install --user -r etc/pip/evgtest-requirements.txt
     #
     cp -av percona-packaging/debian/rules debian/
     set_compiler
@@ -797,9 +801,11 @@ build_tarball(){
     if [ "x${RHEL}" == "x8" ]; then
         pip3.6 install --upgrade pip
         pip3.6 install --user -r etc/pip/dev-requirements.txt
+        pip3.6 install --user -r etc/pip/evgtest-requirements.txt
     else
         pip install --upgrade pip
         pip install --user -r etc/pip/dev-requirements.txt
+        pip install --user -r etc/pip/evgtest-requirements.txt
     fi
     if [ -f /etc/redhat-release ]; then
         RHEL=$(rpm --eval %rhel)
