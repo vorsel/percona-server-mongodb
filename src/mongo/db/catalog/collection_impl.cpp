@@ -41,7 +41,6 @@
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/background.h"
 #include "mongo/db/catalog/collection_catalog.h"
-#include "mongo/db/catalog/collection_info_cache_impl.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/index_catalog_impl.h"
@@ -61,6 +60,7 @@
 #include "mongo/db/ops/update_request.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/replication_coordinator.h"
@@ -194,13 +194,11 @@ CollectionImpl::CollectionImpl(OperationContext* opCtx,
                                const NamespaceString& nss,
                                UUID uuid,
                                std::unique_ptr<RecordStore> recordStore)
-    : _magic(kMagicNumber),
-      _ns(nss),
+    : _ns(nss),
       _uuid(uuid),
       _recordStore(std::move(recordStore)),
       _needCappedLock(supportsDocLocking() && _recordStore && _recordStore->isCapped() &&
                       _ns.db() != "local"),
-      _infoCache(std::make_unique<CollectionInfoCacheImpl>(this, _ns)),
       _indexCatalog(std::make_unique<IndexCatalogImpl>(this)),
       _cappedNotifier(_recordStore && _recordStore->isCapped()
                           ? std::make_unique<CappedInsertNotifier>()
@@ -210,7 +208,6 @@ CollectionImpl::CollectionImpl(OperationContext* opCtx,
 }
 
 CollectionImpl::~CollectionImpl() {
-    invariant(ok());
     if (isCapped()) {
         _recordStore->setCappedCallback(nullptr);
         _cappedNotifier->kill();
@@ -219,8 +216,6 @@ CollectionImpl::~CollectionImpl() {
     if (ns().isOplog()) {
         repl::clearLocalOplogPtr();
     }
-
-    _magic = 0;
 }
 
 std::unique_ptr<Collection> CollectionImpl::FactoryImpl::make(
@@ -241,7 +236,6 @@ void CollectionImpl::init(OperationContext* opCtx) {
     _validationLevel = uassertStatusOK(_parseValidationLevel(collectionOptions.validationLevel));
 
     getIndexCatalog()->init(opCtx).transitional_ignore();
-    infoCache()->init(opCtx);
     _initialized = true;
 }
 
@@ -268,7 +262,6 @@ bool CollectionImpl::requiresIdIndex() const {
 std::unique_ptr<SeekableRecordCursor> CollectionImpl::getCursor(OperationContext* opCtx,
                                                                 bool forward) const {
     dassert(opCtx->lockState()->isCollectionLockedForMode(ns(), MODE_IS));
-    invariant(ok());
 
     return _recordStore->getCursor(opCtx, forward);
 }
@@ -1051,7 +1044,6 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> CollectionImpl::makePlanExe
 
 void CollectionImpl::setNs(NamespaceString nss) {
     _ns = std::move(nss);
-    _infoCache->setNs(_ns);
     _recordStore.get()->setNs(_ns);
 }
 

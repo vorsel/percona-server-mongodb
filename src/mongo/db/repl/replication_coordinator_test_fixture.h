@@ -52,7 +52,6 @@ class ReplicationCoordinatorExternalStateMock;
 class ReplicationCoordinatorImpl;
 class StorageInterfaceMock;
 class TopologyCoordinator;
-class UpdatePositionArgs;
 
 using executor::NetworkInterfaceMock;
 
@@ -104,17 +103,6 @@ protected:
      */
     ReplicationCoordinatorImpl* getReplCoord() {
         return _repl.get();
-    }
-
-    Status updatePositionArgsInitialize(UpdatePositionArgs& args,
-                                        const BSONObj& argsObj,
-                                        bool requireWallTime = true) {
-        return args.initialize(argsObj, requireWallTime);
-    }
-
-    StatusWith<rpc::ReplSetMetadata> replReadFromMetadata(const BSONObj& doc,
-                                                          bool requireWallTime = true) {
-        return rpc::ReplSetMetadata::readFromMetadata(doc, requireWallTime);
     }
 
     void replCoordSetMyLastAppliedOpTime(const OpTime& opTime, Date_t wallTime = Date_t()) {

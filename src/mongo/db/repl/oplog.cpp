@@ -115,11 +115,6 @@ MONGO_FAIL_POINT_DEFINE(sleepBetweenInsertOpTimeGenerationAndLogOp);
 // are visible, but before we have advanced 'lastApplied' for the write.
 MONGO_FAIL_POINT_DEFINE(hangBeforeLogOpAdvancesLastApplied);
 
-// so we can fail the same way
-void checkOplogInsert(Status result) {
-    massert(17322, str::stream() << "write to oplog failed: " << result.toString(), result.isOK());
-}
-
 bool shouldBuildInForeground(OperationContext* opCtx,
                              const BSONObj& index,
                              const NamespaceString& indexNss,
@@ -323,11 +318,15 @@ void _logOpsInner(OperationContext* opCtx,
     auto replCoord = ReplicationCoordinator::get(opCtx);
     if (nss.size() && replCoord->getReplicationMode() == ReplicationCoordinator::modeReplSet &&
         !replCoord->canAcceptWritesFor(opCtx, nss)) {
-        uasserted(17405,
+        uasserted(ErrorCodes::NotMaster,
                   str::stream() << "logOp() but can't accept write to collection " << nss.ns());
     }
 
-    checkOplogInsert(oplogCollection->insertDocumentsForOplog(opCtx, records, timestamps));
+    Status result = oplogCollection->insertDocumentsForOplog(opCtx, records, timestamps);
+    if (!result.isOK()) {
+        severe() << "write to oplog failed: " << result.toString();
+        fassertFailed(17322);
+    }
 
     // Set replCoord last optime only after we're sure the WUOW didn't abort and roll back.
     opCtx->recoveryUnit()->onCommit(
@@ -1350,8 +1349,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
                 // [2] This upsert behavior exists to support idempotency guarantees outside
                 //     steady-state replication and existing users of applyOps.
 
-                const auto txnParticipant = TransactionParticipant::get(opCtx);
-                const bool inTxn = txnParticipant && txnParticipant.inMultiDocumentTransaction();
+                const bool inTxn = opCtx->inMultiDocumentTransaction();
                 bool needToDoUpsert = haveWrappingWriteUnitOfWork && !inTxn;
 
                 Timestamp timestamp;
@@ -1500,7 +1498,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
                         // specifiers in the query for idempotence
                     } else {
                         // this could happen benignly on an oplog duplicate replay of an upsert
-                        // (because we are idempotent), if an regular non-mod update fails the item
+                        // (because we are idempotent), if a regular non-mod update fails the item
                         // is (presumably) missing.
                         if (!upsert) {
                             string msg = str::stream()

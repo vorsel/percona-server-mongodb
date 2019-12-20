@@ -45,6 +45,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/plan_ranker.h"
 #include "mongo/util/hex.h"
@@ -70,10 +71,7 @@ static Status getPlanCache(OperationContext* opCtx,
         return Status(ErrorCodes::BadValue, "no such collection");
     }
 
-    CollectionInfoCache* infoCache = collection->infoCache();
-    invariant(infoCache);
-
-    PlanCache* planCache = infoCache->getPlanCache();
+    PlanCache* planCache = CollectionQueryInfo::get(collection).getPlanCache();
     invariant(planCache);
 
     *planCacheOut = planCache;
@@ -398,9 +396,8 @@ Status listPlansOriginalFormat(std::unique_ptr<CanonicalQuery> cq,
 
         // Create the plan details field. Currently, this is a simple string representation of
         // SolutionCacheData.
-        SolutionCacheData* scd = entry->plannerData[i];
         BSONObjBuilder detailsBob(planBob.subobjStart("details"));
-        detailsBob.append("solution", scd->toString());
+        detailsBob.append("solution", entry->plannerData[i]->toString());
         detailsBob.doneFast();
 
         // reason is comprised of score and initial stats provided by
@@ -433,7 +430,7 @@ Status listPlansOriginalFormat(std::unique_ptr<CanonicalQuery> cq,
         }
         feedbackBob.doneFast();
 
-        planBob.append("filterSet", scd->indexFilterApplied);
+        planBob.append("filterSet", entry->plannerData[i]->indexFilterApplied);
     }
 
     plansBuilder.doneFast();

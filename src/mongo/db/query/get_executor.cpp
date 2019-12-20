@@ -61,6 +61,7 @@
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/canonical_query_encoder.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
+#include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/index_bounds_builder.h"
 #include "mongo/db/query/internal_plans.h"
@@ -159,7 +160,7 @@ IndexEntry indexEntryFromIndexCatalogEntry(OperationContext* opCtx,
     auto accessMethod = ice.accessMethod();
     invariant(accessMethod);
 
-    const bool isMultikey = desc->isMultikey(opCtx);
+    const bool isMultikey = desc->isMultikey();
 
     const ProjectionExecAgg* projExec = nullptr;
     std::set<FieldRef> multikeyPathSet;
@@ -204,26 +205,6 @@ IndexEntry indexEntryFromIndexCatalogEntry(OperationContext* opCtx,
             projExec};
 }
 
-CoreIndexInfo indexInfoFromIndexCatalogEntry(const IndexCatalogEntry& ice) {
-    auto desc = ice.descriptor();
-    invariant(desc);
-
-    auto accessMethod = ice.accessMethod();
-    invariant(accessMethod);
-
-    const ProjectionExecAgg* projExec = nullptr;
-    if (desc->getIndexType() == IndexType::INDEX_WILDCARD)
-        projExec = static_cast<const WildcardAccessMethod*>(accessMethod)->getProjectionExec();
-
-    return {desc->keyPattern(),
-            desc->getIndexType(),
-            desc->isSparse(),
-            IndexEntry::Identifier{desc->indexName()},
-            ice.getFilterExpression(),
-            ice.getCollator(),
-            projExec};
-}
-
 /**
  * If query supports index filters, filter params.indices according to any index filters that have
  * been configured. In addition, sets that there were indeed index filters applied.
@@ -232,7 +213,7 @@ void applyIndexFilters(Collection* collection,
                        const CanonicalQuery& canonicalQuery,
                        QueryPlannerParams* plannerParams) {
     if (!IDHackStage::supportsQuery(collection, canonicalQuery)) {
-        QuerySettings* querySettings = collection->infoCache()->getQuerySettings();
+        QuerySettings* querySettings = CollectionQueryInfo::get(collection).getQuerySettings();
         const auto key = canonicalQuery.encodeKey();
 
         // Filter index catalog if index filters are specified for query.
@@ -401,7 +382,8 @@ StatusWith<PrepareExecutionResult> prepareExecution(OperationContext* opCtx,
         if (plannerParams.options & QueryPlannerParams::INCLUDE_SHARD_FILTER) {
             root = std::make_unique<ShardFilterStage>(
                 opCtx,
-                CollectionShardingState::get(opCtx, canonicalQuery->nss())->getOrphansFilter(opCtx),
+                CollectionShardingState::get(opCtx, canonicalQuery->nss())
+                    ->getOrphansFilter(opCtx, collection),
                 ws,
                 root.release());
         }
@@ -414,11 +396,10 @@ StatusWith<PrepareExecutionResult> prepareExecution(OperationContext* opCtx,
             // Add a SortKeyGeneratorStage if there is a $meta sortKey projection.
             if (canonicalQuery->getProj()->wantSortKey()) {
                 root = std::make_unique<SortKeyGeneratorStage>(
-                    opCtx,
+                    canonicalQuery->getExpCtx(),
                     root.release(),
                     ws,
-                    canonicalQuery->getQueryRequest().getSort(),
-                    canonicalQuery->getCollator());
+                    canonicalQuery->getQueryRequest().getSort());
             }
 
             // Stuff the right data into the params depending on what proj impl we use.
@@ -452,18 +433,19 @@ StatusWith<PrepareExecutionResult> prepareExecution(OperationContext* opCtx,
     }
 
     // Check that the query should be cached.
-    if (collection->infoCache()->getPlanCache()->shouldCacheQuery(*canonicalQuery)) {
+    if (CollectionQueryInfo::get(collection).getPlanCache()->shouldCacheQuery(*canonicalQuery)) {
         // Fill in opDebug information.
         const auto planCacheKey =
-            collection->infoCache()->getPlanCache()->computeKey(*canonicalQuery);
+            CollectionQueryInfo::get(collection).getPlanCache()->computeKey(*canonicalQuery);
         CurOp::get(opCtx)->debug().queryHash =
             canonical_query_encoder::computeHash(planCacheKey.getStableKeyStringData());
         CurOp::get(opCtx)->debug().planCacheKey =
             canonical_query_encoder::computeHash(planCacheKey.toString());
 
         // Try to look up a cached solution for the query.
-        if (auto cs =
-                collection->infoCache()->getPlanCache()->getCacheEntryIfActive(planCacheKey)) {
+        if (auto cs = CollectionQueryInfo::get(collection)
+                          .getPlanCache()
+                          ->getCacheEntryIfActive(planCacheKey)) {
             // We have a CachedSolution.  Have the planner turn it into a QuerySolution.
             auto statusWithQs = QueryPlanner::planFromCache(*canonicalQuery, plannerParams, *cs);
 
@@ -630,10 +612,7 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorFind(
     unique_ptr<CanonicalQuery> canonicalQuery,
     bool permitYield,
     size_t plannerOptions) {
-    const auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
-    auto yieldPolicy =
-        (permitYield &&
-         (readConcernArgs.getLevel() != repl::ReadConcernLevel::kSnapshotReadConcern))
+    auto yieldPolicy = (permitYield && !opCtx->inMultiDocumentTransaction())
         ? PlanExecutor::YIELD_AUTO
         : PlanExecutor::INTERRUPT_ONLY;
     return _getExecutorFind(
@@ -890,7 +869,7 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorUpdate(
 
     // Pass index information to the update driver, so that it can determine for us whether the
     // update affects indices.
-    const auto& updateIndexData = collection->infoCache()->getIndexKeys(opCtx);
+    const auto& updateIndexData = CollectionQueryInfo::get(collection).getIndexKeys(opCtx);
     driver->refreshIndexKeys(&updateIndexData);
 
     if (!parsedUpdate->hasParsedQuery()) {
@@ -1117,11 +1096,8 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorCount(
     }
     unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
-    const auto readConcernArgs = repl::ReadConcernArgs::get(opCtx);
-    const auto yieldPolicy =
-        readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern
-        ? PlanExecutor::INTERRUPT_ONLY
-        : PlanExecutor::YIELD_AUTO;
+    const auto yieldPolicy = opCtx->inMultiDocumentTransaction() ? PlanExecutor::INTERRUPT_ONLY
+                                                                 : PlanExecutor::YIELD_AUTO;
 
     const auto skip = request.getSkip().value_or(0);
     const auto limit = request.getLimit().value_or(0);
@@ -1373,7 +1349,7 @@ QueryPlannerParams fillOutPlannerParamsForDistinct(OperationContext* opCtx,
         if (desc->keyPattern().hasField(parsedDistinct.getKey())) {
             if (!mayUnwindArrays &&
                 isAnyComponentOfPathMultikey(desc->keyPattern(),
-                                             desc->isMultikey(opCtx),
+                                             desc->isMultikey(),
                                              desc->getMultikeyPaths(opCtx),
                                              parsedDistinct.getKey())) {
                 // If the caller requested "strict" distinct that does not "pre-unwind" arrays,
@@ -1574,11 +1550,8 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDistinct(
     Collection* collection,
     size_t plannerOptions,
     ParsedDistinct* parsedDistinct) {
-    const auto readConcernArgs = repl::ReadConcernArgs::get(opCtx);
-    const auto yieldPolicy =
-        readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern
-        ? PlanExecutor::INTERRUPT_ONLY
-        : PlanExecutor::YIELD_AUTO;
+    const auto yieldPolicy = opCtx->inMultiDocumentTransaction() ? PlanExecutor::INTERRUPT_ONLY
+                                                                 : PlanExecutor::YIELD_AUTO;
 
     if (!collection) {
         // Treat collections that do not exist as empty collections.

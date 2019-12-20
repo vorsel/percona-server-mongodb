@@ -47,6 +47,7 @@
 #include "mongo/db/multi_key_path_tracker.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/storage/storage_options.h"
@@ -82,7 +83,7 @@ void MultiIndexBlock::cleanUpAfterBuild(OperationContext* opCtx, Collection* col
     }
 
     if (!_needToCleanup && !_indexes.empty()) {
-        collection->infoCache()->clearQueryCache();
+        CollectionQueryInfo::get(collection).clearQueryCache();
     }
 
     // Make lock acquisition uninterruptible.
@@ -239,10 +240,6 @@ StatusWith<std::vector<BSONObj>> MultiIndexBlock::init(OperationContext* opCtx,
 
     const auto& ns = collection->ns().ns();
 
-    const auto idxCat = collection->getIndexCatalog();
-    invariant(idxCat);
-    invariant(idxCat->ok());
-
     const bool enableHybrid = areHybridIndexBuildsEnabled();
 
     // Parse the specs if this builder is not building hybrid indexes, otherwise log a message.
@@ -300,6 +297,9 @@ StatusWith<std::vector<BSONObj>> MultiIndexBlock::init(OperationContext* opCtx,
         if (!status.isOK())
             return status;
 
+        auto indexCleanupGuard =
+            makeGuard([opCtx, &index] { index.block->deleteTemporaryTables(opCtx); });
+
         index.real = index.block->getEntry()->accessMethod();
         status = index.real->initializeAsEmpty(opCtx);
         if (!status.isOK())
@@ -339,6 +339,7 @@ StatusWith<std::vector<BSONObj>> MultiIndexBlock::init(OperationContext* opCtx,
         // TODO SERVER-14888 Suppress this in cases we don't want to audit.
         audit::logCreateIndex(opCtx->getClient(), &info, descriptor->indexName(), ns);
 
+        indexCleanupGuard.dismiss();
         _indexes.push_back(std::move(index));
     }
 

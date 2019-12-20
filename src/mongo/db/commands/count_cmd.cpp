@@ -39,6 +39,7 @@
 #include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/count.h"
+#include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/query/count_command_as_aggregation_command.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/get_executor.h"
@@ -110,8 +111,8 @@ public:
 
         const auto hasTerm = false;
         return authSession->checkAuthForFind(
-            AutoGetCollection::resolveNamespaceStringOrUUID(
-                opCtx, CommandHelpers::parseNsOrUUID(dbname, cmdObj)),
+            CollectionCatalog::get(opCtx).resolveNamespaceStringOrUUID(
+                CommandHelpers::parseNsOrUUID(dbname, cmdObj)),
             hasTerm);
     }
 
@@ -243,7 +244,7 @@ public:
         PlanSummaryStats summaryStats;
         Explain::getSummaryStats(*exec, &summaryStats);
         if (collection) {
-            collection->infoCache()->notifyOfQuery(opCtx, summaryStats);
+            CollectionQueryInfo::get(collection).notifyOfQuery(opCtx, summaryStats);
         }
         curOp->debug().setPlanSummaryMetrics(summaryStats);
 

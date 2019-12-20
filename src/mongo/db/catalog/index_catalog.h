@@ -158,8 +158,6 @@ public:
     // Must be called before used.
     virtual Status init(OperationContext* const opCtx) = 0;
 
-    virtual bool ok() const = 0;
-
     // ---- accessors -----
 
     virtual bool haveAnyIndexes() const = 0;
@@ -383,7 +381,7 @@ public:
     /**
      * Returns true if the index 'idx' is multikey, and returns false otherwise.
      */
-    virtual bool isMultikey(OperationContext* const opCtx, const IndexDescriptor* const idx) = 0;
+    virtual bool isMultikey(const IndexDescriptor* const idx) = 0;
 
     /**
      * Returns the path components that cause the index 'idx' to be multikey if the index supports

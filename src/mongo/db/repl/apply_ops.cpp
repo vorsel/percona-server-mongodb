@@ -485,14 +485,14 @@ Status applyOps(OperationContext* opCtx,
 // static
 MultiApplier::Operations ApplyOps::extractOperations(const OplogEntry& applyOpsOplogEntry) {
     MultiApplier::Operations result;
-    extractOperationsTo(applyOpsOplogEntry, applyOpsOplogEntry.toBSON(), &result, boost::none);
+    extractOperationsTo(applyOpsOplogEntry, applyOpsOplogEntry.toBSON(), &result);
     return result;
 }
 
+// static
 void ApplyOps::extractOperationsTo(const OplogEntry& applyOpsOplogEntry,
                                    const BSONObj& topLevelDoc,
-                                   MultiApplier::Operations* operations,
-                                   boost::optional<Timestamp> commitOplogEntryTS) {
+                                   MultiApplier::Operations* operations) {
     uassert(ErrorCodes::TypeMismatch,
             str::stream() << "ApplyOps::extractOperations(): not a command: "
                           << redact(applyOpsOplogEntry.toBSON()),
@@ -504,20 +504,17 @@ void ApplyOps::extractOperationsTo(const OplogEntry& applyOpsOplogEntry,
             OplogEntry::CommandType::kApplyOps == applyOpsOplogEntry.getCommandType());
 
     auto cmdObj = applyOpsOplogEntry.getOperationToApply();
-    auto operationDocs = cmdObj.firstElement().Obj();
+    auto info = ApplyOpsCommandInfo::parse(cmdObj);
+    auto operationDocs = info.getOperations();
+    bool alwaysUpsert = info.getAlwaysUpsert() && !applyOpsOplogEntry.getTxnNumber();
 
-    if (operationDocs.isEmpty()) {
-        return;
-    }
-
-    for (const auto& elem : operationDocs) {
-        auto operationDoc = elem.Obj();
+    for (const auto& operationDoc : operationDocs) {
         BSONObjBuilder builder(operationDoc);
 
-        // Apply the ts field first if we have a commitOplogEntryTS so that appendElementsUnique
-        // will not overwrite this value.
-        if (commitOplogEntryTS) {
-            builder.append("ts", *commitOplogEntryTS);
+        // Oplog entries can have an oddly-named "b" field for "upsert". MongoDB stopped creating
+        // such entries in 4.0, but we can use the "b" field for the extracted entry here.
+        if (alwaysUpsert && !operationDoc.hasField("b")) {
+            builder.append("b", true);
         }
 
         builder.appendElementsUnique(topLevelDoc);

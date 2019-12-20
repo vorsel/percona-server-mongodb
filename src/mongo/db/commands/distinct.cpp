@@ -46,6 +46,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/find_common.h"
@@ -55,7 +56,6 @@
 #include "mongo/db/query/query_planner_common.h"
 #include "mongo/db/query/view_response_formatter.h"
 #include "mongo/db/s/collection_sharding_state.h"
-#include "mongo/db/transaction_participant.h"
 #include "mongo/db/views/resolved_view.h"
 #include "mongo/util/log.h"
 
@@ -109,8 +109,8 @@ public:
 
         const auto hasTerm = false;
         return authSession->checkAuthForFind(
-            AutoGetCollection::resolveNamespaceStringOrUUID(
-                opCtx, CommandHelpers::parseNsOrUUID(dbname, cmdObj)),
+            CollectionCatalog::get(opCtx).resolveNamespaceStringOrUUID(
+                CommandHelpers::parseNsOrUUID(dbname, cmdObj)),
             hasTerm);
     }
 
@@ -184,12 +184,11 @@ public:
 
         // Distinct doesn't filter orphan documents so it is not allowed to run on sharded
         // collections in multi-document transactions.
-        auto txnParticipant = TransactionParticipant::get(opCtx);
         uassert(ErrorCodes::OperationNotSupportedInTransaction,
                 "Cannot run 'distinct' on a sharded collection in a multi-document transaction. "
                 "Please see http://dochub.mongodb.org/core/transaction-distinct for a recommended "
                 "alternative.",
-                !txnParticipant || !txnParticipant.inMultiDocumentTransaction() ||
+                !opCtx->inMultiDocumentTransaction() ||
                     !CollectionShardingState::get(opCtx, nss)->getCurrentMetadata()->isSharded());
 
         const ExtensionsCallbackReal extensionsCallback(opCtx, &nss);
@@ -285,7 +284,7 @@ public:
         PlanSummaryStats stats;
         Explain::getSummaryStats(*executor.getValue(), &stats);
         if (collection) {
-            collection->infoCache()->notifyOfQuery(opCtx, stats);
+            CollectionQueryInfo::get(collection).notifyOfQuery(opCtx, stats);
         }
         curOp->debug().setPlanSummaryMetrics(stats);
 

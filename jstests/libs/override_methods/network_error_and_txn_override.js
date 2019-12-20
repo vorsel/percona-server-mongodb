@@ -204,9 +204,9 @@ function isRetryableShardCollectionResponse(res) {
     // shardCollection can bury the original error code in the error message.
     return RetryableWritesUtil.errmsgContainsRetryableCodeName(res.errmsg) ||
         // shardCollection creates collections on each shard that will receive a chunk using
-        // _cloneCollectionsOptionsFromPrimaryShard, which may fail with either of the following
-        // codes if interupted by a failover.
-        res.code === ErrorCodes.CallbackCanceled || res.code === 17405;
+        // _cloneCollectionsOptionsFromPrimaryShard, which may fail with the following code if
+        // interupted by a failover.
+        res.code === ErrorCodes.CallbackCanceled;
 }
 
 function hasError(res) {
@@ -819,12 +819,6 @@ function shouldRetryWithNetworkErrorOverride(
             res.code === ErrorCodes.OperationFailed && res.hasOwnProperty("errmsg") &&
             res.errmsg.indexOf("failed to read command response from shard") >= 0) {
             logError("Retrying failed mongos cursor command");
-            return kContinue;
-        }
-
-        // Thrown when an index build is interrupted during its collection scan.
-        if (cmdName === "createIndexes" && res.codeName === "InterruptedDueToReplStateChange") {
-            logError("Retrying because of interrupted collection scan");
             return kContinue;
         }
 

@@ -142,11 +142,16 @@ selector:
   - jstests/sharding/explain_exec_stats_on_shards.js
   - jstests/sharding/refine_collection_shard_key_basic.js
   - jstests/sharding/refine_collection_shard_key_jumbo.js
+  - jstests/sharding/refine_collection_shard_key_drops_chunks.js
   - jstests/sharding/move_primary_clone_test.js
   - jstests/sharding/database_versioning_safe_secondary_reads.js
   - jstests/sharding/clone_catalog_data.js
   - jstests/sharding/database_and_shard_versioning_all_commands.js
   - jstests/sharding/shard1.js
+  - jstests/sharding/track_unsharded_collections_create_collection.js
+  - jstests/sharding/track_unsharded_collections_check_shard_version.js
+  - jstests/sharding/banned_txn_databases_sharded.js
+  - jstests/sharding/split_large_key.js
   # Enable if SERVER-41813 is backported or 4.4 becomes last-stable
   - jstests/sharding/invalid_system_views_sharded_collection.js
 

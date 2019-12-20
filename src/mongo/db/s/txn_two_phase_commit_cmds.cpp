@@ -103,14 +103,9 @@ public:
                 << opCtx->getTxnNumber() << " on session "
                 << opCtx->getLogicalSessionId()->toBSON();
 
-            uassert(ErrorCodes::CommandNotSupported,
-                    "'prepareTransaction' is only supported in feature compatibility version 4.2",
-                    (serverGlobalParams.featureCompatibility.getVersion() ==
-                     ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42));
-
             uassert(ErrorCodes::NoSuchTransaction,
                     "Transaction isn't in progress",
-                    txnParticipant.inMultiDocumentTransaction());
+                    txnParticipant.transactionIsOpen());
 
             if (txnParticipant.transactionIsPrepared()) {
                 auto& replClient = repl::ReplClientInfo::forClient(opCtx->getClient());
@@ -226,12 +221,6 @@ public:
                 uassertStatusOK(ShardingState::get(opCtx)->canAcceptShardedCommands());
             }
 
-            uassert(ErrorCodes::CommandNotSupported,
-                    "'coordinateCommitTransaction' is only supported in feature compatibility "
-                    "version 4.2",
-                    (serverGlobalParams.featureCompatibility.getVersion() ==
-                     ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42));
-
             const auto& cmd = request();
             const auto tcs = TransactionCoordinatorService::get(opCtx);
 
@@ -319,7 +308,7 @@ public:
                                                false /* autocommit */,
                                                boost::none /* startTransaction */);
 
-                invariant(!txnParticipant.inMultiDocumentTransaction(),
+                invariant(!txnParticipant.transactionIsOpen(),
                           "The participant should not be in progress after we waited for the "
                           "participant to complete");
                 uassert(ErrorCodes::NoSuchTransaction,

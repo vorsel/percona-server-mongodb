@@ -21,6 +21,7 @@ const kNsName = kDbName + '.' + kCollName;
 const kConfigCollections = 'config.collections';
 const kConfigChunks = 'config.chunks';
 const kConfigTags = 'config.tags';
+const kConfigChangelog = 'config.changelog';
 const kUnrelatedName = kDbName + '.bar';
 let oldEpoch = null;
 
@@ -53,6 +54,17 @@ function validateConfigCollections(keyDoc, oldEpoch) {
     assert.neq(oldEpoch, collArr[0].lastmodEpoch);
 }
 
+function validateConfigChangelog(count) {
+    assert.eq(count,
+              mongos.getCollection(kConfigChangelog)
+                  .find({what: 'refineCollectionShardKey.start', ns: kNsName})
+                  .itcount());
+    assert.eq(count,
+              mongos.getCollection(kConfigChangelog)
+                  .find({what: 'refineCollectionShardKey.end', ns: kNsName})
+                  .itcount());
+}
+
 function validateConfigCollectionsUnique(unique) {
     const collArr = mongos.getCollection(kConfigCollections).find({_id: kNsName}).toArray();
     assert.eq(1, collArr.length);
@@ -74,7 +86,8 @@ function setupCRUDBeforeRefine() {
 }
 
 function validateCRUDAfterRefine() {
-    // Force a refresh on each shard to simulate the asynchronous 'setShardVersion' completing.
+    // Force a refresh on the mongos and each shard because refineCollectionShardKey only triggers
+    // best-effort shard refreshes.
     flushRoutersAndRefreshShardMetadata(st, {ns: kNsName});
 
     const session = mongos.startSession({retryWrites: true});
@@ -389,6 +402,7 @@ oldEpoch = mongos.getCollection(kConfigCollections).findOne({_id: kNsName}).last
 assert.commandWorked(
     mongos.adminCommand({refineCollectionShardKey: kNsName, key: {_id: 1, aKey: 1}}));
 validateConfigCollections({_id: 1, aKey: 1}, oldEpoch);
+validateConfigChangelog(1);
 
 // Should fail because only an index with missing or incomplete shard key entries exists for new
 // shard key {_id: 1, aKey: 1}.
@@ -444,6 +458,7 @@ oldEpoch = mongos.getCollection(kConfigCollections).findOne({_id: kNsName}).last
 assert.commandWorked(
     mongos.adminCommand({refineCollectionShardKey: kNsName, key: {_id: 1, aKey: 1}}));
 validateConfigCollections({_id: 1, aKey: 1}, oldEpoch);
+validateConfigChangelog(2);
 
 // Should work because a 'useful' index exists for new shard key {a: 1, b.c: 1}. NOTE: We are
 // explicitly verifying that refineCollectionShardKey works with a dotted field.
@@ -454,6 +469,7 @@ oldEpoch = mongos.getCollection(kConfigCollections).findOne({_id: kNsName}).last
 assert.commandWorked(
     mongos.adminCommand({refineCollectionShardKey: kNsName, key: {a: 1, 'b.c': 1}}));
 validateConfigCollections({a: 1, 'b.c': 1}, oldEpoch);
+validateConfigChangelog(3);
 
 assert.commandWorked(mongos.getDB(kDbName).dropDatabase());
 
@@ -576,6 +592,31 @@ assert.eq(3, oldTagsArr.length);
 
 assert.commandWorked(mongos.adminCommand({refineCollectionShardKey: kNsName, key: newKeyDoc}));
 validateUnrelatedCollAfterRefine(oldCollArr, oldChunkArr, oldTagsArr);
+
+// Verify that all shards containing chunks in the namespace 'db.foo' eventually refresh (i.e. the
+// secondary shard will not refresh because it does not contain any chunks in 'db.foo'). NOTE: This
+// will only succeed in a linear jstest without failovers.
+dropAndReshardColl(oldKeyDoc);
+assert.commandWorked(mongos.getCollection(kNsName).createIndex(newKeyDoc));
+
+assert.commandWorked(
+    mongos.adminCommand({moveChunk: kNsName, find: {a: 0, b: 0}, to: secondaryShard}));
+assert.commandWorked(
+    mongos.adminCommand({moveChunk: kNsName, find: {a: 0, b: 0}, to: primaryShard}));
+
+const oldPrimaryEpoch = st.shard0.adminCommand({getShardVersion: kNsName, fullMetadata: true})
+                            .metadata.shardVersionEpoch.toString();
+const oldSecondaryEpoch = st.shard1.adminCommand({getShardVersion: kNsName, fullMetadata: true})
+                              .metadata.shardVersionEpoch.toString();
+
+assert.commandWorked(mongos.adminCommand({refineCollectionShardKey: kNsName, key: newKeyDoc}));
+
+assert.soon(() => oldPrimaryEpoch !==
+                st.shard0.adminCommand({getShardVersion: kNsName, fullMetadata: true})
+                    .metadata.shardVersionEpoch.toString());
+assert.soon(() => oldSecondaryEpoch ===
+                st.shard1.adminCommand({getShardVersion: kNsName, fullMetadata: true})
+                    .metadata.shardVersionEpoch.toString());
 
 st.stop();
 })();

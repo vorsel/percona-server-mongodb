@@ -378,6 +378,25 @@ BSONObj BSONObj::replaceFieldNames(const BSONObj& names) const {
     return b.obj();
 }
 
+BSONObj BSONObj::stripFieldNames(const BSONObj& obj) {
+    if (!obj.hasFieldNames())
+        return obj;
+
+    BSONObjBuilder bb;
+    for (auto e : obj) {
+        bb.appendAs(e, StringData());
+    }
+    return bb.obj();
+}
+
+bool BSONObj::hasFieldNames() const {
+    for (auto e : *this) {
+        if (e.fieldName()[0])
+            return true;
+    }
+    return false;
+}
+
 Status BSONObj::storageValidEmbedded() const {
     BSONObjIterator i(*this);
 
@@ -622,8 +641,11 @@ void BSONObj::toString(
     s << (isArray ? " ]" : " }");
 }
 
-Status DataType::Handler<BSONObj>::store(
-    const BSONObj& bson, char* ptr, size_t length, size_t* advanced, std::ptrdiff_t debug_offset) {
+Status DataType::Handler<BSONObj>::store(const BSONObj& bson,
+                                         char* ptr,
+                                         size_t length,
+                                         size_t* advanced,
+                                         std::ptrdiff_t debug_offset) noexcept try {
     if (bson.objsize() > static_cast<int>(length)) {
         str::stream ss;
         ss << "buffer too small to write bson of size (" << bson.objsize()
@@ -640,6 +662,8 @@ Status DataType::Handler<BSONObj>::store(
     }
 
     return Status::OK();
+} catch (const DBException& e) {
+    return e.toStatus();
 }
 
 std::ostream& operator<<(std::ostream& s, const BSONObj& o) {

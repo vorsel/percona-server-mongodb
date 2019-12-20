@@ -62,18 +62,10 @@ AutoGetCollection::AutoGetCollection(OperationContext* opCtx,
     : _autoDb(opCtx,
               !nsOrUUID.dbname().empty() ? nsOrUUID.dbname() : nsOrUUID.nss()->db(),
               isSharedLockMode(modeColl) ? MODE_IS : MODE_IX,
-              deadline),
-      _resolvedNss(resolveNamespaceStringOrUUID(opCtx, nsOrUUID)) {
+              deadline) {
 
-    NamespaceString prevResolvedNss;
-    do {
-        _collLock.emplace(opCtx, _resolvedNss, modeColl, deadline);
-
-        // We looked up nsOrUUID without a collection lock so it's possible that the
-        // collection is dropped now. Look it up again.
-        prevResolvedNss = _resolvedNss;
-        _resolvedNss = resolveNamespaceStringOrUUID(opCtx, nsOrUUID);
-    } while (_resolvedNss != prevResolvedNss);
+    _collLock.emplace(opCtx, nsOrUUID, modeColl, deadline);
+    _resolvedNss = CollectionCatalog::get(opCtx).resolveNamespaceStringOrUUID(nsOrUUID);
 
     // Wait for a configured amount of time after acquiring locks if the failpoint is enabled
     MONGO_FAIL_POINT_BLOCK(setAutoGetCollectionWait, customWait) {
@@ -107,11 +99,12 @@ AutoGetCollection::AutoGetCollection(OperationContext* opCtx,
                             << nsOrUUID.toString());
 
     if (_coll) {
-        // Unlike read concern majority, read concern snapshot cannot yield and wait when there are
-        // pending catalog changes. Instead, we must return an error in such situations. We ignore
-        // this restriction for the oplog, since it never has pending catalog changes.
-        auto readConcernLevel = repl::ReadConcernArgs::get(opCtx).getLevel();
-        if (readConcernLevel == repl::ReadConcernLevel::kSnapshotReadConcern &&
+        // If we are in a transaction and have a read timestamp, we cannot yield and wait when there
+        // are pending catalog changes. Instead, we must return an error in such situations. We
+        // ignore this restriction for the oplog, since it never has pending catalog changes.
+        if (opCtx->inMultiDocumentTransaction() &&
+            opCtx->recoveryUnit()->getTimestampReadSource() !=
+                RecoveryUnit::ReadSource::kNoTimestamp &&
             _resolvedNss != NamespaceString::kRsOplogNamespace) {
             auto mySnapshot = opCtx->recoveryUnit()->getPointInTimeReadTimestamp();
             if (mySnapshot) {
@@ -134,30 +127,6 @@ AutoGetCollection::AutoGetCollection(OperationContext* opCtx,
     uassert(ErrorCodes::CommandNotSupportedOnView,
             str::stream() << "Namespace " << _resolvedNss.ns() << " is a view, not a collection",
             !_view || viewMode == kViewsPermitted);
-}
-
-NamespaceString AutoGetCollection::resolveNamespaceStringOrUUID(OperationContext* opCtx,
-                                                                NamespaceStringOrUUID nsOrUUID) {
-    if (auto& nss = nsOrUUID.nss()) {
-        uassert(ErrorCodes::InvalidNamespace,
-                str::stream() << "Namespace " << *nss << " is not a valid collection name",
-                nss->isValid());
-        return *nss;
-    }
-
-    CollectionCatalog& catalog = CollectionCatalog::get(opCtx);
-    auto resolvedNss = catalog.lookupNSSByUUID(*nsOrUUID.uuid());
-
-    uassert(ErrorCodes::NamespaceNotFound,
-            str::stream() << "Unable to resolve " << nsOrUUID.toString(),
-            resolvedNss && resolvedNss->isValid());
-
-    uassert(ErrorCodes::NamespaceNotFound,
-            str::stream() << "UUID " << nsOrUUID.toString() << " specified in " << nsOrUUID.dbname()
-                          << " resolved to a collection in a different database: " << *resolvedNss,
-            resolvedNss->db() == nsOrUUID.dbname());
-
-    return *resolvedNss;
 }
 
 AutoGetOrCreateDb::AutoGetOrCreateDb(OperationContext* opCtx,

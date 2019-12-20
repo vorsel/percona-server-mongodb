@@ -117,24 +117,37 @@ env.Library(
 )
 
 env.Library(
+    target='expression_javascript',
+    source=[
+        'expression_javascript.cpp'
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/scripting/scripting_common',
+        'expression',
+    ]
+)
+
+env.Library(
     target='accumulator',
     source=[
         'accumulation_statement.cpp',
         'accumulator_add_to_set.cpp',
         'accumulator_avg.cpp',
         'accumulator_first.cpp',
+        'accumulator_js_reduce.cpp',
         'accumulator_last.cpp',
+        'accumulator_merge_objects.cpp',
         'accumulator_min_max.cpp',
         'accumulator_push.cpp',
         'accumulator_std_dev.cpp',
         'accumulator_sum.cpp',
-        'accumulator_merge_objects.cpp'
         ],
     LIBDEPS=[
         'document_value',
         '$BUILD_DIR/mongo/util/summation',
         'expression',
         'field_path',
+        '$BUILD_DIR/mongo/scripting/scripting_common'
     ]
 )
 
@@ -228,6 +241,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/session_catalog',
         '$BUILD_DIR/mongo/db/storage/backup_cursor_hooks',
         '$BUILD_DIR/mongo/db/transaction',
+        '$BUILD_DIR/mongo/scripting/scripting_common',
     ],
 )
 
@@ -357,6 +371,7 @@ pipelineEnv.Library(
         'document_value',
         'expression',
         'expression_context',
+        'expression_javascript',
         'granularity_rounder',
         'parsed_aggregation_projection',
     ],

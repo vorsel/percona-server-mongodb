@@ -53,6 +53,7 @@ env.Library(
             '$BUILD_DIR/mongo/db/mongohasher',
             '$BUILD_DIR/mongo/db/projection_exec_agg',
             '$BUILD_DIR/mongo/db/query/collation/collator_interface',
+            '$BUILD_DIR/mongo/db/query/sort_pattern',
             '$BUILD_DIR/third_party/s2/s2',
             'expression_params',
             'index_descriptor',
@@ -101,6 +102,7 @@ serveronlyEnv.Library(
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
         '$BUILD_DIR/mongo/db/storage/encryption_hooks',
         '$BUILD_DIR/mongo/db/storage/index_entry_comparison',
+        '$BUILD_DIR/mongo/db/storage/key_string',
         '$BUILD_DIR/mongo/db/storage/storage_options',
         '$BUILD_DIR/third_party/shim_snappy',
         'index_descriptor',
@@ -163,5 +165,6 @@ env.CppUnitTest(
         "$BUILD_DIR/mongo/db/matcher/expressions",
         '$BUILD_DIR/mongo/db/mongohasher',
         '$BUILD_DIR/mongo/db/query/collation/collator_interface_mock',
+        '$BUILD_DIR/mongo/db/query/query_test_service_context',
     ],
 )

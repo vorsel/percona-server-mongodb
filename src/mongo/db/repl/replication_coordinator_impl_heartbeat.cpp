@@ -49,6 +49,7 @@
 #include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
 #include "mongo/db/repl/replication_coordinator_impl.h"
+#include "mongo/db/repl/replication_metrics.h"
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/topology_coordinator.h"
 #include "mongo/db/repl/vote_requester.h"
@@ -150,17 +151,9 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
     BSONObj resp;
     if (responseStatus.isOK()) {
         resp = cbData.response.data;
-        // Wall clock times are required in ReplSetHeartbeatResponse when FCV is 4.2. Arbiters
-        // trivially have FCV equal to 4.2, so they are excluded from this check.
-        bool isArbiter = _topCoord->getMemberState() == MemberState::RS_ARBITER;
-        bool requireWallTime =
-            (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-             serverGlobalParams.featureCompatibility.getVersion() ==
-                 ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42 &&
-             !isArbiter);
-        responseStatus = hbResponse.initialize(resp, _topCoord->getTerm(), requireWallTime);
+        responseStatus = hbResponse.initialize(resp, _topCoord->getTerm());
         StatusWith<rpc::ReplSetMetadata> replMetadata =
-            rpc::ReplSetMetadata::readFromMetadata(cbData.response.data, requireWallTime);
+            rpc::ReplSetMetadata::readFromMetadata(cbData.response.data);
 
         LOG_FOR_HEARTBEATS(2) << "Received response to heartbeat (requestId: " << cbData.request.id
                               << ") from " << target << ", " << resp;
@@ -183,20 +176,11 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
             replMetadata = responseStatus;
         }
         if (replMetadata.isOK()) {
-
-            // The majority commit point can be propagated through heartbeats as long as there are
-            // no 4.0 nodes in the replica set. If there are 4.0 nodes, propagating the majority
-            // commit point through heartbeats can cause a sync source cycle due to SERVER-33248.
-            // Note that FCV may not be initialized, since for a new replica set, the first primary
-            // initializes the FCV after it is elected.
-            // TODO SERVER-40211: Always propagate the majority commit point through heartbeats,
-            // regardless of FCV.
-            const auto isFCV42 = serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-                serverGlobalParams.featureCompatibility.getVersion() ==
-                    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42;
+            // It is safe to update our commit point via heartbeat propagation as long as the
+            // the new commit point we learned of is on the same branch of history as our own
+            // oplog.
             if (_getMemberState_inlock().arbiter() ||
-                (isFCV42 && !_getMemberState_inlock().startup() &&
-                 !_getMemberState_inlock().startup2())) {
+                (!_getMemberState_inlock().startup() && !_getMemberState_inlock().startup2())) {
                 // The node that sent the heartbeat is not guaranteed to be our sync source.
                 const bool fromSyncSource = false;
                 _advanceCommitPoint(
@@ -424,6 +408,10 @@ void ReplicationCoordinatorImpl::_stepDownFinish(
 
     lk.lock();
     _updateAndLogStatsOnStepDown(&arsd);
+
+    // Clear the node's election candidate metrics since it is no longer primary.
+    ReplicationMetrics::get(opCtx.get()).clearElectionCandidateMetrics();
+
     _topCoord->finishUnconditionalStepDown();
 
     const auto action = _updateMemberStateFromTopologyCoordinator(lk, opCtx.get());
@@ -646,6 +634,9 @@ void ReplicationCoordinatorImpl::_heartbeatReconfigFinish(
 
             lk.lock();
             _updateAndLogStatsOnStepDown(&arsd.get());
+
+            // Clear the node's election candidate metrics since it is no longer primary.
+            ReplicationMetrics::get(opCtx.get()).clearElectionCandidateMetrics();
         } else {
             // Release the rstl lock as the node might have stepped down due to
             // other unconditional step down code paths like learning new term via heartbeat &

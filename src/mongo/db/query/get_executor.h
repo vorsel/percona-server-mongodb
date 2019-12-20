@@ -91,13 +91,6 @@ IndexEntry indexEntryFromIndexCatalogEntry(OperationContext* opCtx,
                                            const CanonicalQuery* canonicalQuery = nullptr);
 
 /**
- * Converts the catalog metadata for an index into a CoreIndexInfo, which is a format that is meant
- * to be used to update the plan cache. This function has no side effects and is safe to call in
- * all contexts.
- */
-CoreIndexInfo indexInfoFromIndexCatalogEntry(const IndexCatalogEntry& ice);
-
-/**
  * Determines whether or not to wait for oplog visibility for a query. This is only used for
  * collection scans on the oplog.
  */
@@ -122,8 +115,8 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutor(
 
 /**
  * Get a plan executor for a .find() operation. The executor will have a 'YIELD_AUTO' yield policy
- * unless a false value for 'permitYield' or a snapshot read concern (according to the
- * OperationContext) forces it to have a 'NO_INTERRUPT' yield policy.
+ * unless a false value for 'permitYield' or being part of a multi-document transaction forces it to
+ * have a 'NO_INTERRUPT' yield policy.
  *
  * If the query is valid and an executor could be created, returns a StatusWith with the
  * PlanExecutor.

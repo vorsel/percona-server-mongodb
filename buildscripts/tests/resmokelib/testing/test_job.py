@@ -9,6 +9,7 @@ import mock
 from buildscripts.resmokelib import errors
 from buildscripts.resmokelib.testing import job
 from buildscripts.resmokelib.testing import queue_element
+from buildscripts.resmokelib.testing.fixtures import interface as _fixtures
 from buildscripts.resmokelib.utils import queue as _queue
 
 # pylint: disable=missing-docstring,protected-access
@@ -232,7 +233,12 @@ class TestFixtureSetupAndTeardown(unittest.TestCase):
         self.__job_object(queue, interrupt_flag, setup_flag, teardown_flag)
 
         self.assertEqual(setup_succeeded, not interrupt_flag.is_set())
+        self.assertEqual(setup_succeeded, not setup_flag.is_set())
         self.assertEqual(teardown_succeeded, not teardown_flag.is_set())
+
+        # teardown_fixture() should be called even if setup_fixture() raises an exception.
+        self.__job_object.setup_fixture.assert_called()
+        self.__job_object.teardown_fixture.assert_called()
 
     def test_setup_and_teardown_both_succeed(self):
         self.__assert_when_run_tests()
@@ -264,3 +270,28 @@ class TestFixtureSetupAndTeardown(unittest.TestCase):
         self.__job_object.teardown_fixture.side_effect = Exception(
             "Generic error intentionally raised in unit test")
         self.__assert_when_run_tests(teardown_succeeded=False)
+
+
+class TestNoOpFixtureSetupAndTeardown(unittest.TestCase):
+    """Test cases for NoOpFixture handling in setup_fixture() and teardown_fixture()."""
+
+    def setUp(self):
+        logger = logging.getLogger("job_unittest")
+        self.__noop_fixture = _fixtures.NoOpFixture(logger=logger, job_num=0)
+        self.__noop_fixture.setup = mock.Mock()
+        self.__noop_fixture.teardown = mock.Mock()
+
+        test_report = mock.Mock()
+        test_report.find_test_info().status = "pass"
+
+        self.__job_object = job.Job(job_num=0, logger=logger, fixture=self.__noop_fixture, hooks=[],
+                                    report=test_report, archival=None, suite_options=None,
+                                    test_queue_logger=logger)
+
+    def test_setup_called_for_noop_fixture(self):
+        self.assertTrue(self.__job_object.setup_fixture())
+        self.__noop_fixture.setup.assert_called_once_with()
+
+    def test_teardown_called_for_noop_fixture(self):
+        self.assertTrue(self.__job_object.teardown_fixture())
+        self.__noop_fixture.teardown.assert_called_once_with(finished=True)

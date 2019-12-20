@@ -43,10 +43,6 @@ public:
         return Status::OK();
     }
 
-    bool ok() const override {
-        return true;
-    }
-
     bool haveAnyIndexes() const override {
         return false;
     }
@@ -182,7 +178,7 @@ public:
         return {};
     }
 
-    bool isMultikey(OperationContext* const opCtx, const IndexDescriptor* const idx) {
+    bool isMultikey(const IndexDescriptor* const idx) {
         return false;
     }
 

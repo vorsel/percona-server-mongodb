@@ -57,6 +57,7 @@
 #include "mongo/db/ops/parsed_update.h"
 #include "mongo/db/ops/update_request.h"
 #include "mongo/db/ops/write_ops_retryability.h"
+#include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/find_and_modify_request.h"
 #include "mongo/db/query/get_executor.h"
@@ -127,11 +128,8 @@ void makeUpdateRequest(OperationContext* opCtx,
     requestOut->setMulti(false);
     requestOut->setExplain(explain);
 
-    const auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
-    requestOut->setYieldPolicy(readConcernArgs.getLevel() ==
-                                       repl::ReadConcernLevel::kSnapshotReadConcern
-                                   ? PlanExecutor::INTERRUPT_ONLY
-                                   : PlanExecutor::YIELD_AUTO);
+    requestOut->setYieldPolicy(opCtx->inMultiDocumentTransaction() ? PlanExecutor::INTERRUPT_ONLY
+                                                                   : PlanExecutor::YIELD_AUTO);
 }
 
 void makeDeleteRequest(OperationContext* opCtx,
@@ -148,11 +146,8 @@ void makeDeleteRequest(OperationContext* opCtx,
     requestOut->setReturnDeleted(true);  // Always return the old value.
     requestOut->setExplain(explain);
 
-    const auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
-    requestOut->setYieldPolicy(readConcernArgs.getLevel() ==
-                                       repl::ReadConcernLevel::kSnapshotReadConcern
-                                   ? PlanExecutor::INTERRUPT_ONLY
-                                   : PlanExecutor::YIELD_AUTO);
+    requestOut->setYieldPolicy(opCtx->inMultiDocumentTransaction() ? PlanExecutor::INTERRUPT_ONLY
+                                                                   : PlanExecutor::YIELD_AUTO);
 }
 
 void appendCommandResponse(const PlanExecutor* exec,
@@ -174,7 +169,7 @@ void appendCommandResponse(const PlanExecutor* exec,
     }
 }
 
-void assertCanWrite(OperationContext* opCtx, const NamespaceString& nsString) {
+void assertCanWrite(OperationContext* opCtx, const NamespaceString& nsString, bool isCollection) {
     uassert(ErrorCodes::NotMaster,
             str::stream() << "Not primary while running findAndModify command on collection "
                           << nsString.ns(),
@@ -182,7 +177,7 @@ void assertCanWrite(OperationContext* opCtx, const NamespaceString& nsString) {
 
     // Check for shard version match
     auto css = CollectionShardingState::get(opCtx, nsString);
-    css->checkShardVersionOrThrow(opCtx);
+    css->checkShardVersionOrThrow(opCtx, isCollection);
 }
 
 void recordStatsForTopCommand(OperationContext* opCtx) {
@@ -275,7 +270,7 @@ public:
                     autoColl.getDb());
 
             auto css = CollectionShardingState::get(opCtx, nsString);
-            css->checkShardVersionOrThrow(opCtx);
+            css->checkShardVersionOrThrow(opCtx, autoColl.getCollection());
 
             Collection* const collection = autoColl.getCollection();
             const auto exec =
@@ -300,7 +295,7 @@ public:
                     autoColl.getDb());
 
             auto css = CollectionShardingState::get(opCtx, nsString);
-            css->checkShardVersionOrThrow(opCtx);
+            css->checkShardVersionOrThrow(opCtx, autoColl.getCollection());
 
             Collection* const collection = autoColl.getCollection();
             const auto exec =
@@ -329,8 +324,7 @@ public:
             maybeDisableValidation.emplace(opCtx);
         }
 
-        const auto txnParticipant = TransactionParticipant::get(opCtx);
-        const auto inTransaction = txnParticipant && txnParticipant.inMultiDocumentTransaction();
+        const auto inTransaction = opCtx->inMultiDocumentTransaction();
         uassert(50781,
                 str::stream() << "Cannot write to system collection " << nsString.ns()
                               << " within a transaction.",
@@ -388,7 +382,7 @@ public:
                     CurOp::get(opCtx)->enter_inlock(nsString.ns().c_str(), dbProfilingLevel);
                 }
 
-                assertCanWrite(opCtx, nsString);
+                assertCanWrite(opCtx, nsString, autoColl.getCollection());
 
                 Collection* const collection = autoColl.getCollection();
                 checkIfTransactionOnCappedColl(collection, inTransaction);
@@ -409,7 +403,7 @@ public:
                 PlanSummaryStats summaryStats;
                 Explain::getSummaryStats(*exec, &summaryStats);
                 if (collection) {
-                    collection->infoCache()->notifyOfQuery(opCtx, summaryStats);
+                    CollectionQueryInfo::get(collection).notifyOfQuery(opCtx, summaryStats);
                 }
                 opDebug->setPlanSummaryMetrics(summaryStats);
 
@@ -454,7 +448,7 @@ public:
                     CurOp::get(opCtx)->enter_inlock(nsString.ns().c_str(), dbProfilingLevel);
                 }
 
-                assertCanWrite(opCtx, nsString);
+                assertCanWrite(opCtx, nsString, autoColl->getCollection());
 
                 Collection* collection = autoColl->getCollection();
 
@@ -471,7 +465,8 @@ public:
                     autoColl.reset();
                     autoDb.emplace(opCtx, dbName, MODE_X);
 
-                    assertCanWrite(opCtx, nsString);
+                    assertCanWrite(
+                        opCtx, nsString, autoDb->getDb()->getCollection(opCtx, nsString));
 
                     collection = autoDb->getDb()->getCollection(opCtx, nsString);
 
@@ -509,7 +504,7 @@ public:
                 PlanSummaryStats summaryStats;
                 Explain::getSummaryStats(*exec, &summaryStats);
                 if (collection) {
-                    collection->infoCache()->notifyOfQuery(opCtx, summaryStats);
+                    CollectionQueryInfo::get(collection).notifyOfQuery(opCtx, summaryStats);
                 }
                 UpdateStage::recordUpdateStatsInOpDebug(UpdateStage::getUpdateStats(exec.get()),
                                                         opDebug);

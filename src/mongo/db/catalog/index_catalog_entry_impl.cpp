@@ -38,7 +38,6 @@
 
 #include "mongo/base/init.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/collection_info_cache_impl.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/index/index_access_method.h"
@@ -49,6 +48,7 @@
 #include "mongo/db/multi_key_path_tracker.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
+#include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/transaction_participant.h"
@@ -61,9 +61,9 @@ using std::string;
 
 IndexCatalogEntryImpl::IndexCatalogEntryImpl(OperationContext* const opCtx,
                                              std::unique_ptr<IndexDescriptor> descriptor,
-                                             CollectionInfoCache* const infoCache)
+                                             CollectionQueryInfo* const queryInfo)
     : _descriptor(std::move(descriptor)),
-      _infoCache(infoCache),
+      _queryInfo(queryInfo),
       _ordering(Ordering::make(_descriptor->keyPattern())),
       _isReady(false),
       _prefix(DurableCatalog::get(opCtx)->getIndexPrefix(
@@ -125,12 +125,11 @@ void IndexCatalogEntryImpl::init(std::unique_ptr<IndexAccessMethod> accessMethod
 }
 
 bool IndexCatalogEntryImpl::isReady(OperationContext* opCtx) const {
-    auto txnParticipant = TransactionParticipant::get(opCtx);
     // For multi-document transactions, we can open a snapshot prior to checking the
     // minimumSnapshotVersion on a collection.  This means we are unprotected from reading
     // out-of-sync index catalog entries.  To fix this, we uassert if we detect that the
     // in-memory catalog is out-of-sync with the on-disk catalog.
-    if (txnParticipant && txnParticipant.inMultiDocumentTransaction()) {
+    if (opCtx->inMultiDocumentTransaction()) {
         if (!_catalogIsPresent(opCtx) || _catalogIsReady(opCtx) != _isReady) {
             uasserted(ErrorCodes::SnapshotUnavailable,
                       str::stream() << "Unable to read from a snapshot due to pending collection"
@@ -142,49 +141,13 @@ bool IndexCatalogEntryImpl::isReady(OperationContext* opCtx) const {
     return _isReady;
 }
 
-bool IndexCatalogEntryImpl::isMultikey(OperationContext* opCtx) const {
-    auto ret = _isMultikey.load();
-    if (ret) {
-        return true;
-    }
-
-    // Multikey updates are only persisted, to disk and in memory, when the transaction
-    // commits. In the case of multi-statement transactions, a client attempting to read their own
-    // transactions writes can return wrong results if their writes include multikey changes.
-    //
-    // To accomplish this, the write-path will persist multikey changes on the `Session` object
-    // and the read-path will query this state before determining there is no interesting multikey
-    // state. Note, it's always legal, though potentially wasteful, to return `true`.
-    auto txnParticipant = TransactionParticipant::get(opCtx);
-    if (!txnParticipant || !txnParticipant.inMultiDocumentTransaction()) {
-        return false;
-    }
-
-    for (const MultikeyPathInfo& path : txnParticipant.getUncommittedMultikeyPathInfos()) {
-        if (path.nss == ns() && path.indexName == _descriptor->indexName()) {
-            return true;
-        }
-    }
-
-    return false;
+bool IndexCatalogEntryImpl::isMultikey() const {
+    return _isMultikey.load();
 }
 
 MultikeyPaths IndexCatalogEntryImpl::getMultikeyPaths(OperationContext* opCtx) const {
     stdx::lock_guard<stdx::mutex> lk(_indexMultikeyPathsMutex);
-
-    auto txnParticipant = TransactionParticipant::get(opCtx);
-    if (!txnParticipant || !txnParticipant.inMultiDocumentTransaction()) {
-        return _indexMultikeyPaths;
-    }
-
-    MultikeyPaths ret = _indexMultikeyPaths;
-    for (const MultikeyPathInfo& path : txnParticipant.getUncommittedMultikeyPathInfos()) {
-        if (path.nss == ns() && path.indexName == _descriptor->indexName()) {
-            MultikeyPathTracker::mergeMultikeyPaths(&ret, path.multikeyPaths);
-        }
-    }
-
-    return ret;
+    return _indexMultikeyPaths;
 }
 
 // ---
@@ -201,7 +164,7 @@ void IndexCatalogEntryImpl::setIsReady(bool newIsReady) {
 
 void IndexCatalogEntryImpl::setMultikey(OperationContext* opCtx,
                                         const MultikeyPaths& multikeyPaths) {
-    if (!_indexTracksPathLevelMultikeyInfo && isMultikey(opCtx)) {
+    if (!_indexTracksPathLevelMultikeyInfo && isMultikey()) {
         // If the index is already set as multikey and we don't have any path-level information to
         // update, then there's nothing more for us to do.
         return;
@@ -282,10 +245,10 @@ void IndexCatalogEntryImpl::setMultikey(OperationContext* opCtx,
             }
         }
 
-        if (indexMetadataHasChanged && _infoCache) {
+        if (indexMetadataHasChanged && _queryInfo) {
             LOG(1) << ns() << ": clearing plan cache - index " << _descriptor->keyPattern()
                    << " set to multi key.";
-            _infoCache->clearQueryCache();
+            _queryInfo->clearQueryCache();
         }
     };
 
@@ -296,7 +259,7 @@ void IndexCatalogEntryImpl::setMultikey(OperationContext* opCtx,
     // multikey flag write and the parent transaction. We can do this write separately and commit it
     // before the parent transaction commits.
     auto txnParticipant = TransactionParticipant::get(opCtx);
-    if (txnParticipant && txnParticipant.inMultiDocumentTransaction()) {
+    if (opCtx->inMultiDocumentTransaction()) {
         TransactionParticipant::SideTransactionBlock sideTxn(opCtx);
         writeConflictRetry(opCtx, "set index multikey", ns().ns(), [&] {
             WriteUnitOfWork wuow(opCtx);
@@ -336,18 +299,6 @@ void IndexCatalogEntryImpl::setMultikey(OperationContext* opCtx,
         [onMultikeyCommitFn, indexMetadataHasChanged](boost::optional<Timestamp>) {
             onMultikeyCommitFn(indexMetadataHasChanged);
         });
-
-    // Within a multi-document transaction, reads should be able to see the effect of previous
-    // writes done within that transaction. If a previous write in a transaction has set the index
-    // to be multikey, then a subsequent read MUST know that fact in order to return correct
-    // results. This is true in general for multikey writes. Since we don't update the in-memory
-    // multikey flag until after the transaction commits, we track extra information here to let
-    // subsequent readers within the same transaction know if this index was set as multikey by a
-    // previous write in the transaction.
-    if (txnParticipant && txnParticipant.inMultiDocumentTransaction()) {
-        txnParticipant.addUncommittedMultikeyPathInfo(
-            MultikeyPathInfo{ns(), _descriptor->indexName(), std::move(paths)});
-    }
 }
 
 // ----

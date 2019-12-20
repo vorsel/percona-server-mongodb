@@ -57,6 +57,7 @@
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/pipeline/pipeline_d.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
+#include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/query/get_executor.h"
@@ -69,7 +70,6 @@
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_options.h"
-#include "mongo/db/transaction_participant.h"
 #include "mongo/db/views/view.h"
 #include "mongo/db/views/view_catalog.h"
 #include "mongo/util/log.h"
@@ -385,9 +385,7 @@ boost::intrusive_ptr<ExpressionContext> makeExpressionContext(
                               uassertStatusOK(resolveInvolvedNamespaces(opCtx, request)),
                               uuid);
     expCtx->tempDir = storageGlobalParams.dbpath + "/_tmp";
-    auto txnParticipant = TransactionParticipant::get(opCtx);
-    expCtx->inMultiDocumentTransaction =
-        txnParticipant && txnParticipant.inMultiDocumentTransaction();
+    expCtx->inMultiDocumentTransaction = opCtx->inMultiDocumentTransaction();
 
     return expCtx;
 }
@@ -522,10 +520,9 @@ Status runAggregate(OperationContext* opCtx,
             liteParsedPipeline.assertSupportsReadConcern(
                 opCtx, request.getExplain(), serverGlobalParams.enableMajorityReadConcern);
         } catch (const DBException& ex) {
-            auto txnParticipant = TransactionParticipant::get(opCtx);
             // If we are in a multi-document transaction, we intercept the 'readConcern'
             // assertion in order to provide a more descriptive error message and code.
-            if (txnParticipant && txnParticipant.inMultiDocumentTransaction()) {
+            if (opCtx->inMultiDocumentTransaction()) {
                 return {ErrorCodes::OperationNotSupportedInTransaction,
                         ex.toStatus("Operation not permitted in transaction").reason()};
             }
@@ -788,7 +785,7 @@ Status runAggregate(OperationContext* opCtx,
         // For an optimized away pipeline, signal the cache that a query operation has completed.
         // For normal pipelines this is done in DocumentSourceCursor.
         if (ctx && ctx->getCollection()) {
-            ctx->getCollection()->infoCache()->notifyOfQuery(opCtx, stats);
+            CollectionQueryInfo::get(ctx->getCollection()).notifyOfQuery(opCtx, stats);
         }
     }
 

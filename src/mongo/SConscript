@@ -463,6 +463,7 @@ mongod = env.Program(
     ],
     AIB_COMPONENT="servers",
     AIB_COMPONENTS_EXTRA=[
+        "dist",
         "default",
         "core",
     ],
@@ -470,9 +471,7 @@ mongod = env.Program(
 
 hygienic = get_option('install-mode') == 'hygienic'
 
-if hygienic:
-    env.Default('$INSTALL_DIR/bin/mongod$PROGSUFFIX')
-else:
+if not hygienic:
     env.Default(env.Install('#/', mongod))
 
 # tools
@@ -568,6 +567,7 @@ mongos = env.Program(
     ],
     AIB_COMPONENT="servers",
     AIB_COMPONENTS_EXTRA=[
+        "dist",
         "core",
     ]
 )
@@ -662,6 +662,7 @@ if not has_option('noshell') and usemozjs:
         ],
         AIB_COMPONENT="shell",
         AIB_COMPONENTS_EXTRA=[
+            "dist",
             "core",
         ],
     )
@@ -730,7 +731,7 @@ def installBinary( e, name ):
     else:
         distBinaries.append(name)
 
-    inst = e.Install( "$INSTALL_DIR/bin", name )
+    inst = e.Install( "$DESTDIR/bin", name )
 
     if env.TargetOSIs('posix'):
         e.AddPostAction( inst, 'chmod 755 $TARGET' )
@@ -742,18 +743,19 @@ def installExternalBinary( e, name_str ):
 
     if hygienic:
         env.AutoInstall(
-            target='$PREFIX_BIN_DIR',
+            target='$PREFIX_BINDIR',
             source=[
                 name
             ],
             AIB_COMPONENT='tools',
+            AIB_COMPONENTS_EXTRA=['dist'],
             AIB_ROLE='runtime',
         )
         return
 
     distBinaries.append(name)
 
-    inst = e.Install( "$INSTALL_DIR/bin", name )
+    inst = e.Install( "$DESTDIR/bin", name )
 
     if env.TargetOSIs('posix'):
         e.AddPostAction( inst, 'chmod 755 $TARGET' )
@@ -764,9 +766,10 @@ if has_option("use-new-tools"):
 
     if hygienic:
         env.AutoInstall(
-            target='$INSTALL_DIR',
+            target='$DESTDIR',
             source=env.File('#/src/mongo-tools/distsrc/THIRD-PARTY-NOTICES.gotools'),
             AIB_COMPONENT='tools',
+            AIB_COMPONENTS_EXTRA=['dist'],
             AIB_ROLE='base',
         )
     else:
@@ -798,7 +801,7 @@ if not hygienic:
 distsrc = env.Dir('#distsrc')
 if hygienic:
     env.AutoInstall(
-        target='$INSTALL_DIR',
+        target='$DESTDIR',
         source=[
             distsrc.File('README'),
             # TODO: we need figure out what to do when we use a different
@@ -807,6 +810,7 @@ if hygienic:
             distsrc.File('MPL-2'),
         ],
         AIB_COMPONENT='common',
+        AIB_COMPONENTS_EXTRA=['dist'],
         AIB_ROLE='base',
     )
 else:
@@ -817,12 +821,13 @@ else:
 enterprise_license = [banner for banner in env["MODULE_BANNERS"] if banner.name ==  "LICENSE-Enterprise.txt"]
 if hygienic:
     env.AutoInstall(
-        target='$INSTALL_DIR',
+        target='$DESTDIR',
         source=[
             enterprise_license[0]
             if enterprise_license else distsrc.File('LICENSE-Community.txt'),
         ],
         AIB_COMPONENT='common',
+        AIB_COMPONENTS_EXTRA=['dist'],
         AIB_ROLE='base',
     )
 # If no module has introduced a file named LICENSE-Enterprise.txt then this
@@ -876,14 +881,15 @@ compass_installer = env.Substfile('#/src/mongo/installer/compass/' + compass_scr
 distBinaries.append(compass_installer)
 
 if not hygienic:
-    compass_script_installer = env.Install("$INSTALL_DIR/bin", compass_installer)
+    compass_script_installer = env.Install("$DESTDIR/bin", compass_installer)
 else:
     compass_script_installer = env.AutoInstall(
-        target='$PREFIX_BIN_DIR',
+        target='$PREFIX_BINDIR',
         source=[
             compass_installer,
         ],
         AIB_COMPONENT='tools',
+        AIB_COMPONENTS_EXTRA=['dist'],
         AIB_ROLE='runtime',
     )
 
@@ -942,4 +948,4 @@ env.NoCache(debug_symbols_dist)
 
 #final alias
 if not hygienic:
-    env.Alias( "install", "$INSTALL_DIR" )
+    env.Alias( "install", "$DESTDIR" )

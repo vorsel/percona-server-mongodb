@@ -46,7 +46,7 @@
 namespace mongo {
 
 class CollatorInterface;
-class CollectionInfoCache;
+class CollectionQueryInfo;
 class IndexAccessMethod;
 class IndexDescriptor;
 class MatchExpression;
@@ -57,10 +57,9 @@ class IndexCatalogEntryImpl : public IndexCatalogEntry {
     IndexCatalogEntryImpl& operator=(const IndexCatalogEntryImpl&) = delete;
 
 public:
-    explicit IndexCatalogEntryImpl(
-        OperationContext* opCtx,
-        std::unique_ptr<IndexDescriptor> descriptor,  // ownership passes to me
-        CollectionInfoCache* infoCache);              // not owned, optional
+    IndexCatalogEntryImpl(OperationContext* opCtx,
+                          std::unique_ptr<IndexDescriptor> descriptor,  // ownership passes to me
+                          CollectionQueryInfo* queryInfo);              // not owned, optional
 
     ~IndexCatalogEntryImpl() final;
 
@@ -119,7 +118,7 @@ public:
     /**
      * Returns true if this index is multikey, and returns false otherwise.
      */
-    bool isMultikey(OperationContext* opCtx) const final;
+    bool isMultikey() const final;
 
     /**
      * Returns the path components that cause this index to be multikey if this index supports
@@ -189,7 +188,7 @@ private:
 
     std::unique_ptr<IndexDescriptor> _descriptor;  // owned here
 
-    CollectionInfoCache* _infoCache;  // not owned here
+    CollectionQueryInfo* _queryInfo;  // not owned here
 
     std::unique_ptr<IndexAccessMethod> _accessMethod;
 

@@ -95,14 +95,22 @@ SetOption('random', 1)
 #   using the nargs='const' mechanism.
 #
 
-add_option('prefix',
-    default='$BUILD_ROOT/install',
-    help='installation prefix',
+add_option('ninja',
+    choices=['true', 'false'],
+    default='false',
+    nargs='?',
+    const='true',
+    type='choice',
+    help='Enable the build.ninja generator tool',
 )
 
-add_option('dest-dir',
-    default=None,
-    help='root of installation as a subdirectory of $BUILD_DIR'
+add_option('ccache',
+    choices=['true', 'false'],
+    default='false',
+    nargs='?',
+    const='true',
+    type='choice',
+    help='Enable ccache support',
 )
 
 add_option('legacy-tarball',
@@ -657,7 +665,7 @@ def variable_distsrc_converter(val):
 
 variables_files = variable_shlex_converter(get_option('variables-files'))
 for file in variables_files:
-    print(("Using variable customization file %s" % file))
+    print("Using variable customization file {}".format(file))
 
 env_vars = Variables(
     files=variables_files,
@@ -677,6 +685,9 @@ env_vars.Add('AR',
 env_vars.Add('ARFLAGS',
     help='Sets flags for the archiver',
     converter=variable_shlex_converter)
+
+env_vars.Add('CCACHE',
+    help='Path to ccache used for the --ccache option. Defaults to first ccache in PATH.')
 
 env_vars.Add(
     'CACHE_SIZE',
@@ -718,6 +729,10 @@ env_vars.Add('CXX',
 env_vars.Add('CXXFLAGS',
     help='Sets flags for the C++ compiler',
     converter=variable_shlex_converter)
+
+env_vars.Add('DESTDIR',
+    help='Where hygienic builds will install files',
+    default='$BUILD_ROOT/install')
 
 # Note: This probably is only really meaningful when configured via a variables file. It will
 # also override whatever the SCons platform defaults would be.
@@ -820,9 +835,27 @@ env_vars.Add('MSVC_USE_SCRIPT',
 env_vars.Add('MSVC_VERSION',
     help='Sets the version of Visual Studio to use (e.g.  12.0, 11.0, 10.0)')
 
+env_vars.Add('NINJA_SUFFIX',
+    help="""A suffix to add to the end of generated build.ninja
+files. Useful for when compiling multiple build ninja files for
+different configurations, for instance:
+
+    scons --sanitize=asan --ninja NINJA_SUFFIX=asan ninja-install-all-meta
+    scons --sanitize=tsan --ninja NINJA_SUFFIX=tsan ninja-install-all-meta
+          
+Will generate the files (respectively):
+
+    install-all-meta.build.ninja.asan
+    install-all-meta.build.ninja.tsan
+""")
+
 env_vars.Add('OBJCOPY',
     help='Sets the path to objcopy',
     default=WhereIs('objcopy'))
+
+env_vars.Add('PREFIX',
+    help='Final installation location of files, will be made into a sub dir of $DESTDIR',
+    default='')
 
 # Exposed to be able to cross compile Android/*nix from Windows without ending up with the .exe suffix.
 env_vars.Add('PROGSUFFIX',
@@ -930,12 +963,6 @@ if cacheDir[0] not in ['$', '#']:
         print("Do not use relative paths with --cache-dir")
         Exit(1)
 
-prefix = get_option('prefix').rstrip('/')
-if prefix[0] not in ['$', '#']:
-    if not os.path.isabs(prefix):
-        print("Do not use relative paths with --prefix")
-        Exit(1)
-
 sconsDataDir = Dir(buildDir).Dir('scons')
 SConsignFile(str(sconsDataDir.File('sconsign.py3')))
 
@@ -1023,32 +1050,13 @@ envDict = dict(BUILD_ROOT=buildDir,
                BENCHMARK_LIST='$BUILD_ROOT/benchmarks.txt',
                CONFIGUREDIR='$BUILD_ROOT/scons/$VARIANT_DIR/sconf_temp',
                CONFIGURELOG='$BUILD_ROOT/scons/config.log',
-               PREFIX=get_option('prefix'),
                CONFIG_HEADER_DEFINES={},
                LIBDEPS_TAG_EXPANSIONS=[],
+               AIB_PACKAGE_PREFIX='mongodb-',
                )
 
 env = Environment(variables=env_vars, **envDict)
 
-if get_option('dest-dir') is None:
-    destDir = env.Dir('$BUILD_ROOT/install')
-    prefix = env.Dir(get_option('prefix'))
-    if destDir != prefix:
-        installDir = destDir.Dir(get_option('prefix')[1:])
-    else:
-        installDir = destDir
-else:
-    destDir = get_option('dest-dir')
-    if destDir[0] not in ['$', '#']:
-        if not os.path.isabs(destDir):
-            print("Do not use relative paths with --dest-dir")
-            Exit(1)
-    installDir = destDir
-
-env['INSTALL_DIR'] = installDir
-env['DEST_DIR'] = destDir
-if get_option('legacy-tarball') == 'true':
-    env['INSTALL_DIR'] = env.Dir('$INSTALL_DIR').Dir('$SERVER_DIST_BASENAME')
 
 del envDict
 
@@ -1073,12 +1081,12 @@ env.AddMethod(mongo_platform.env_os_is_wrapper, 'TargetOSIs')
 env.AddMethod(mongo_platform.env_get_os_name_wrapper, 'GetTargetOSName')
 
 def fatal_error(env, msg, *args):
-    print((msg.format(*args)))
+    print(msg.format(*args))
     Exit(1)
 
 def conf_error(env, msg, *args):
-    print((msg.format(*args)))
-    print(("See {0} for details".format(env.File('$CONFIGURELOG').abspath)))
+    print(msg.format(*args))
+    print("See {0} for details".format(env.File('$CONFIGURELOG').abspath))
     Exit(1)
 
 env.AddMethod(fatal_error, 'FatalError')
@@ -1097,7 +1105,7 @@ else:
 env.AddMethod(lambda env: env['VERBOSE'], 'Verbose')
 
 if has_option('variables-help'):
-    print((env_vars.GenerateHelpText(env)))
+    print(env_vars.GenerateHelpText(env))
     Exit(0)
 
 unknown_vars = env_vars.UnknownVariables()
@@ -1311,7 +1319,7 @@ else:
     env['TARGET_ARCH'] = detected_processor
 
 if env['TARGET_OS'] not in os_macros:
-    print(("No special config for [{0}] which probably means it won't work".format(env['TARGET_OS'])))
+    print("No special config for [{0}] which probably means it won't work".format(env['TARGET_OS']))
 elif not detectConf.CheckForOS(env['TARGET_OS']):
     env.ConfError("TARGET_OS ({0}) is not supported by compiler", env['TARGET_OS'])
 
@@ -1446,8 +1454,8 @@ if link_model.startswith("dynamic"):
 
     if env.TargetOSIs('darwin'):
         if link_model.startswith('dynamic'):
-            print(("WARNING: Building MongoDB server with dynamic linking " +
-                  "on macOS is not supported. Static linking is recommended."))
+            print("WARNING: Building MongoDB server with dynamic linking " +
+                  "on macOS is not supported. Static linking is recommended.")
 
         if link_model == "dynamic-strict":
             # Darwin is strict by default
@@ -1496,12 +1504,18 @@ if link_model.startswith("dynamic"):
 if optBuild:
     env.SetConfigHeaderDefine("MONGO_CONFIG_OPTIMIZED_BUILD")
 
-# Enable the fast decider if exlicltly requested or if in 'auto' mode and not in conflict with other
-# options.
-if get_option('build-fast-and-loose') == 'on' or \
-   (get_option('build-fast-and-loose') == 'auto' and \
-    not has_option('release') and \
-    not has_option('cache')):
+# Enable the fast decider if explicitly requested or if in 'auto' mode
+# and not in conflict with other options like the ninja option which
+# sets it's own decider
+if (
+        not get_option('ninja') == 'true' and
+        get_option('build-fast-and-loose') == 'on' or
+        (
+            get_option('build-fast-and-loose') == 'auto' and
+            not has_option('release') and
+            not has_option('cache')
+         )
+):
     # See http://www.scons.org/wiki/GoFastButton for details
     env.Decider('MD5-timestamp')
     env.SetOption('max_drift', 1)
@@ -1560,12 +1574,9 @@ if env['_LIBDEPS'] == '$_LIBDEPS_OBJS':
             fake_lib.write(str(uuid.uuid4()))
             fake_lib.write('\n')
 
-    def noop_action(env, target, source):
-        pass
-
     env['ARCOM'] = write_uuid_to_file
     env['ARCOMSTR'] = 'Generating placeholder library $TARGET'
-    env['RANLIBCOM'] = noop_action
+    env['RANLIBCOM'] = ''
     env['RANLIBCOMSTR'] = 'Skipping ranlib for $TARGET'
 
 libdeps.setup_environment(env, emitting_shared=(link_model.startswith("dynamic")))
@@ -2803,7 +2814,7 @@ def doConfigure(myenv):
         llvm_symbolizer = get_option('llvm-symbolizer')
         if os.path.isabs(llvm_symbolizer):
             if not myenv.File(llvm_symbolizer).exists():
-                print(("WARNING: Specified symbolizer '%s' not found" % llvm_symbolizer))
+                print("WARNING: Specified symbolizer '%s' not found" % llvm_symbolizer)
                 llvm_symbolizer = None
         else:
             llvm_symbolizer = myenv.WhereIs(llvm_symbolizer)
@@ -3267,7 +3278,7 @@ def doConfigure(myenv):
         # Either crypto engine is native,
         # or it's OpenSSL and has been checked to be working.
         conf.env.SetConfigHeaderDefine("MONGO_CONFIG_SSL")
-        print(("Using SSL Provider: {0}".format(ssl_provider)))
+        print("Using SSL Provider: {0}".format(ssl_provider))
     else:
         ssl_provider = "none"
 
@@ -3289,7 +3300,7 @@ def doConfigure(myenv):
         files = ['ssleay32.dll', 'libeay32.dll']
         for extra_file in files:
             if not addOpenSslLibraryToDistArchive(extra_file):
-                print(("WARNING: Cannot find SSL library '%s'" % extra_file))
+                print("WARNING: Cannot find SSL library '%s'" % extra_file)
 
     def checkHTTPLib(required=False):
         # WinHTTP available on Windows
@@ -3702,6 +3713,70 @@ def doConfigure(myenv):
 
 
 env = doConfigure( env )
+env["NINJA_SYNTAX"] = "#site_scons/third_party/ninja_syntax.py"
+
+# Now that we are done with configure checks, enable icecream, if available.
+env.Tool('icecream')
+
+if get_option('ninja') == 'true':
+    env.Tool("ninja")
+    def test_txt_writer(alias_name):
+        """Find all the tests registered to alias_name and write them to a file via ninja."""
+        rule_written = False
+
+        def wrapper(env, ninja, node, dependencies):
+            """Make a Ninja-able version of the test files."""
+            rule = alias_name.upper() + "_GENERATOR"
+            if not rule_written:
+                ninja.rule(
+                    rule,
+                    description="Generate test list text file",
+                    command="echo $in > $out",
+                )
+                rule_written = True
+
+            alias = env.Alias(alias_name)
+            paths = []
+            children = alias.children()
+            for child in children:
+                paths.append('\t' + str(child))
+
+            ninja.build(
+                str(node),
+                rule,
+                inputs='\n'.join(paths),
+                implicit=dependencies,
+            )
+
+        return wrapper
+    env.NinjaRegisterFunctionHandler("unit_test_list_builder_action", test_txt_writer('$UNITTEST_ALIAS'))
+    env.NinjaRegisterFunctionHandler("integration_test_list_builder_action", test_txt_writer('$INTEGRATION_TEST_ALIAS'))
+    env.NinjaRegisterFunctionHandler("benchmark_list_builder_action", test_txt_writer('$BENCHMARK_ALIAS'))
+
+    def fakelib_in_ninja():
+        """Generates empty .a files"""
+        rule_written = False
+
+        def wrapper(env, ninja, node, dependencies):
+            if not rule_written:
+                cmd = "touch $out"
+                if not env.TargetOSIs("posix"):
+                    cmd = "cmd /c copy NUL $out"
+                ninja.rule(
+                    "FAKELIB",
+                    command=cmd,
+                )
+                rule_written = True
+
+            ninja.build(node.get_path(), rule='FAKELIB', implicit=dependencies)
+
+        return wrapper
+
+    env.NinjaRegisterFunctionHandler("write_uuid_to_file", fakelib_in_ninja())
+
+    # Load ccache after icecream since order matters when we're both changing CCCOM
+    if get_option('ccache') == 'true':
+        env.Tool('ccache')
 
 # TODO: Later, this should live somewhere more graceful.
 if get_option('install-mode') == 'hygienic':
@@ -3709,59 +3784,67 @@ if get_option('install-mode') == 'hygienic':
     if get_option('separate-debug') == "on":
         env.Tool('separate_debug')
 
+    env["AIB_TARBALL_SUFFIX"] = "tgz"
     env.Tool('auto_install_binaries')
+
     env.AddSuffixMapping({
         "$PROGSUFFIX": env.SuffixMap(
-            directory="$PREFIX_BIN_DIR",
+            directory="$PREFIX_BINDIR",
             default_roles=[
                 "runtime",
             ]
         ),
         
         "$LIBSUFFIX": env.SuffixMap(
-            directory="$PREFIX_LIB_DIR",
+            directory="$PREFIX_LIBDIR",
             default_roles=[
                 "dev",
             ]
         ),
 
         "$SHLIBSUFFIX": env.SuffixMap(
-            directory="$PREFIX_BIN_DIR" \
+            directory="$PREFIX_BINDIR" \
             if mongo_platform.get_running_os_name() == "windows" \
-            else "$PREFIX_LIB_DIR",
+            else "$PREFIX_LIBDIR",
             default_roles=[
                 "runtime",
             ]
         ),
 
         ".debug": env.SuffixMap(
-            directory="$PREFIX_DEBUG_DIR",
+            directory="$PREFIX_DEBUGDIR",
             default_roles=[
                 "debug",
             ]
         ),
         
         ".dSYM": env.SuffixMap(
-            directory="$PREFIX_DEBUG_DIR",
+            directory="$PREFIX_DEBUGDIR",
             default_roles=[
                 "debug"
             ]
         ),
         
         ".lib": env.SuffixMap(
-            directory="$PREFIX_LIB_DIR",
+            directory="$PREFIX_LIBDIR",
             default_roles=[
                 "dev"
             ]
         ),
         
         ".h": env.SuffixMap(
-            directory="$PREFIX_INCLUDE_DIR",
+            directory="$PREFIX_INCLUDEDIR",
             default_roles=[
                 "dev",
             ]
         ),
     })
+
+    env.AddPackageNameAlias(
+        component="dist",
+        role="runtime",
+        name="${{SERVER_DIST_BASENAME[{PREFIX_LEN}:]}}".format(PREFIX_LEN=len(env.get("AIB_PACKAGE_PREFIX")))
+    )
 
     if env['PLATFORM'] == 'posix':
         env.AppendUnique(
@@ -3796,8 +3879,6 @@ if get_option('install-mode') == 'hygienic':
 elif get_option('separate-debug') == "on":
     env.FatalError('Cannot use --separate-debug without --install-mode=hygienic')
 
-# Now that we are done with configure checks, enable icecream, if available.
-env.Tool('icecream')
 
 # If the flags in the environment are configured for -gsplit-dwarf,
 # inject the necessary emitter.
@@ -3908,6 +3989,12 @@ def add_version_to_distsrc(env, archive):
 env.AddDistSrcCallback(add_version_to_distsrc)
 
 env['SERVER_DIST_BASENAME'] = env.subst('mongodb-%s-$MONGO_DISTNAME' % (getSystemInstallName()))
+if get_option('legacy-tarball') == 'true':
+    if ('tar-dist' not in COMMAND_LINE_TARGETS and
+        'zip-dist' not in COMMAND_LINE_TARGETS and
+        'archive-dist' not in COMMAND_LINE_TARGETS):
+        env.FatalError('option --legacy-tarball only valid with an archive-dist target')
+    env['PREFIX'] = '$SERVER_DIST_BASENAME'
 
 module_sconscripts = moduleconfig.get_module_sconscripts(mongo_modules)
 
@@ -4083,6 +4170,19 @@ env.SConscript(
     variant_dir='$BUILD_DIR',
 )
 
+# TODO: find a way to consolidate SConscript calls to one call in
+# SConstruct so they all use variant_dir
+env.SConscript(
+    dirs=[
+        'jstests',
+    ],
+    duplicate=False,
+    exports=[
+        'env',
+    ],
+)
+
+
 allTargets = ['core', 'tools', 'unittests', 'integration_tests', 'benchmarks']
 
 if not has_option('noshell') and usemozjs:
@@ -4111,6 +4211,12 @@ env.Alias('cache-prune', cachePrune)
 
 if get_option('install-mode') == 'hygienic':
     env.FinalizeInstallDependencies()
+    # TODO: Remove once hygienic is driving all builds and we can make
+    # the evergreen.yml make this decision
+    if env.TargetOSIs("windows"):
+        env.Alias("archive-dist", "zip-dist")
+    else:
+        env.Alias("archive-dist", "tar-dist")
 
 # We don't want installing files to cause them to flow into the cache,	
 # since presumably we can re-install them from the origin if needed.	
@@ -4119,7 +4225,7 @@ env.NoCache(env.FindInstalledFiles())
 # Substitute environment variables in any build targets so that we can
 # say, for instance:
 #
-# > scons --prefix=/foo/bar '$INSTALL_DIR'
+# > scons --prefix=/foo/bar '$DESTDIR'
 # or
 # > scons \$BUILD_DIR/mongo/base
 #

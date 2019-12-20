@@ -38,6 +38,7 @@
 
 #include "mongo/base/data_cursor.h"
 #include "mongo/base/data_view.h"
+#include "mongo/bson/bson_depth.h"
 #include "mongo/platform/bits.h"
 #include "mongo/platform/strnlen.h"
 #include "mongo/util/decimal_counter.h"
@@ -1145,24 +1146,36 @@ void toBsonValue(uint8_t ctype,
                  TypeBits::Reader* typeBits,
                  bool inverted,
                  Version version,
-                 BSONObjBuilderValueStream* stream);
+                 BSONObjBuilderValueStream* stream,
+                 uint32_t depth);
 
 void toBson(BufReader* reader,
             TypeBits::Reader* typeBits,
             bool inverted,
             Version version,
-            BSONObjBuilder* builder) {
+            BSONObjBuilder* builder,
+            uint32_t depth) {
     while (readType<uint8_t>(reader, inverted) != 0) {
         if (inverted) {
             std::string name = readInvertedCString(reader);
             BSONObjBuilderValueStream& stream = *builder << name;
-            toBsonValue(
-                readType<uint8_t>(reader, inverted), reader, typeBits, inverted, version, &stream);
+            toBsonValue(readType<uint8_t>(reader, inverted),
+                        reader,
+                        typeBits,
+                        inverted,
+                        version,
+                        &stream,
+                        depth);
         } else {
             StringData name = readCString(reader);
             BSONObjBuilderValueStream& stream = *builder << name;
-            toBsonValue(
-                readType<uint8_t>(reader, inverted), reader, typeBits, inverted, version, &stream);
+            toBsonValue(readType<uint8_t>(reader, inverted),
+                        reader,
+                        typeBits,
+                        inverted,
+                        version,
+                        &stream,
+                        depth);
         }
     }
 }
@@ -1196,7 +1209,12 @@ void toBsonValue(uint8_t ctype,
                  TypeBits::Reader* typeBits,
                  bool inverted,
                  Version version,
-                 BSONObjBuilderValueStream* stream) {
+                 BSONObjBuilderValueStream* stream,
+                 uint32_t depth) {
+    uassert(ErrorCodes::Overflow,
+            "KeyString encoding exceeded maximum allowable BSON nesting depth",
+            depth <= BSONDepth::getMaxAllowableDepth());
+
     // This is only used by the kNumeric.*ByteInt types, but needs to be declared up here
     // since it is used across a fallthrough.
     bool isNegative = false;
@@ -1288,7 +1306,7 @@ void toBsonValue(uint8_t ctype,
             }
             // Not going to optimize CodeWScope.
             BSONObjBuilder scope;
-            toBson(reader, typeBits, inverted, version, &scope);
+            toBson(reader, typeBits, inverted, version, &scope, depth + 1);
             *stream << BSONCodeWScope(code, scope.done());
             break;
         }
@@ -1343,7 +1361,7 @@ void toBsonValue(uint8_t ctype,
 
         case CType::kObject: {
             BSONObjBuilder subObj(stream->subobjStart());
-            toBson(reader, typeBits, inverted, version, &subObj);
+            toBson(reader, typeBits, inverted, version, &subObj, depth + 1);
             break;
         }
 
@@ -1352,8 +1370,13 @@ void toBsonValue(uint8_t ctype,
             DecimalCounter<unsigned> index;
             uint8_t elemType;
             while ((elemType = readType<uint8_t>(reader, inverted)) != 0) {
-                toBsonValue(
-                    elemType, reader, typeBits, inverted, version, &(subArr << StringData{index}));
+                toBsonValue(elemType,
+                            reader,
+                            typeBits,
+                            inverted,
+                            version,
+                            &(subArr << StringData{index}),
+                            depth + 1);
                 ++index;
             }
             break;
@@ -1412,7 +1435,9 @@ void toBsonValue(uint8_t ctype,
         // fallthrough (format is the same as positive, but inverted)
         case CType::kNumericPositiveLargeMagnitude: {
             const uint8_t originalType = typeBits->readNumeric();
-            invariant(version > Version::V0 || originalType != TypeBits::kDecimal);
+            uassert(31231,
+                    "Unexpected decimal encoding for V0 KeyString.",
+                    version > Version::V0 || originalType != TypeBits::kDecimal);
             uint64_t encoded = readType<uint64_t>(reader, inverted);
             encoded = endian::bigToNative(encoded);
             bool hasDecimalContinuation = false;
@@ -2074,72 +2099,36 @@ std::string BuilderBase<BufferT>::toString() const {
     return toHex(getBuffer(), getSize());
 }
 
-template <class BufferT>
-int BuilderBase<BufferT>::compare(const BuilderBase<BufferT>& other) const {
-    int a = getSize();
-    int b = other.getSize();
-
-    int min = std::min(a, b);
-
-    int cmp = memcmp(getBuffer(), other.getBuffer(), min);
-
-    if (cmp) {
-        if (cmp < 0)
-            return -1;
-        return 1;
-    }
-
-    // keys match
-
-    if (a == b)
-        return 0;
-
-    return a < b ? -1 : 1;
+std::string Value::toString() const {
+    return toHex(getBuffer(), getSize());
 }
 
-template <class BufferT>
-int BuilderBase<BufferT>::compareWithoutRecordId(const BuilderBase<BufferT>& other) const {
-    int a = !isEmpty() ? sizeWithoutRecordIdAtEnd(getBuffer(), getSize()) : 0;
-    int b = !other.isEmpty() ? sizeWithoutRecordIdAtEnd(other.getBuffer(), other.getSize()) : 0;
-
-    int min = std::min(a, b);
-
-    int cmp = memcmp(getBuffer(), other.getBuffer(), min);
-
-    if (cmp) {
-        if (cmp < 0)
-            return -1;
-        return 1;
+TypeBits& TypeBits::operator=(const TypeBits& tb) {
+    if (&tb == this) {
+        return *this;
     }
 
-    // keys match
+    version = tb.version;
+    _curBit = tb._curBit;
+    _isAllZeros = tb._isAllZeros;
 
-    if (a == b)
-        return 0;
+    _buf.reset();
+    _buf.appendBuf(tb._buf.buf(), tb._buf.len());
 
-    return a < b ? -1 : 1;
+    return *this;
 }
 
-int Value::compare(const Value& other) const {
-    int a = getSize();
-    int b = other.getSize();
-
-    int min = std::min(a, b);
-
-    int cmp = memcmp(getBuffer(), other.getBuffer(), min);
-
-    if (cmp) {
-        if (cmp < 0)
-            return -1;
-        return 1;
+Value& Value::operator=(const Value& other) {
+    if (&other == this) {
+        return *this;
     }
 
-    // keys match
+    _version = other._version;
+    _typeBits = other._typeBits;
+    _size = other._size;
+    _buffer = other._buffer;
 
-    if (a == b)
-        return 0;
-
-    return a < b ? -1 : 1;
+    return *this;
 }
 
 uint32_t TypeBits::readSizeFromBuffer(BufReader* reader) {
@@ -2345,7 +2334,7 @@ BSONObj toBsonSafe(const char* buffer, size_t len, Ordering ord, const TypeBits&
 
         if (ctype == kEnd)
             break;
-        toBsonValue(ctype, &reader, &typeBitsReader, invert, typeBits.version, &(builder << ""));
+        toBsonValue(ctype, &reader, &typeBitsReader, invert, typeBits.version, &(builder << ""), 1);
     }
     return builder.obj();
 }
@@ -2390,6 +2379,25 @@ RecordId decodeRecordId(BufReader* reader) {
     invariant((lastByte & 0x7) == numExtraBytes);
     repr = (repr << 5) | (lastByte >> 3);  // fold in high 5 bits of last byte
     return RecordId(repr);
+}
+
+int compare(const char* leftBuf, const char* rightBuf, size_t leftSize, size_t rightSize) {
+    int min = std::min(leftSize, rightSize);
+
+    int cmp = memcmp(leftBuf, rightBuf, min);
+
+    if (cmp) {
+        if (cmp < 0)
+            return -1;
+        return 1;
+    }
+
+    // keys match
+
+    if (leftSize == rightSize)
+        return 0;
+
+    return leftSize < rightSize ? -1 : 1;
 }
 
 template class BuilderBase<BufBuilder>;

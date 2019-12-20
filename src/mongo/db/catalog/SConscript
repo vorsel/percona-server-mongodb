@@ -74,6 +74,16 @@ env.Library(
 )
 
 env.Library(
+    target='max_validate_mb_per_sec_idl',
+    source=[
+        env.Idlc('max_validate_mb_per_sec.idl')[0],
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/idl/server_parameter',
+    ],
+)
+
+env.Library(
     target='index_build_entry_idl',
     source=[
         env.Idlc('index_build_entry.idl')[0],
@@ -174,6 +184,7 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/catalog/collection_query_info',
         '$BUILD_DIR/mongo/db/index/index_descriptor',
         '$BUILD_DIR/mongo/db/index_names',
         '$BUILD_DIR/mongo/db/ttl_collection_cache',
@@ -281,7 +292,6 @@ env.Library(
     target='catalog_impl',
     source=[
         "collection_impl.cpp",
-        "collection_info_cache_impl.cpp",
         "database_holder_impl.cpp",
         "database_impl.cpp",
         "index_catalog_entry_impl.cpp",
@@ -336,6 +346,7 @@ env.Library(
     ],
     LIBDEPS=[
 	'catalog_impl',
+	'max_validate_mb_per_sec_idl',
     ]
 )
 
@@ -368,6 +379,22 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         'database_holder',
+    ],
+)
+
+env.Library(
+    target="collection_query_info",
+    source=[
+        "$BUILD_DIR/mongo/db/query/collection_query_info.cpp",
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/collection_index_usage_tracker',
+        '$BUILD_DIR/mongo/db/concurrency/lock_manager',
+        '$BUILD_DIR/mongo/db/curop',
+        '$BUILD_DIR/mongo/db/query/query_planner',
+        '$BUILD_DIR/mongo/db/update_index_data',
+        '$BUILD_DIR/mongo/db/service_context',
     ],
 )
 

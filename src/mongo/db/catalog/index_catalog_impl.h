@@ -57,12 +57,9 @@ struct InsertDeleteOptions;
 class IndexCatalogImpl : public IndexCatalog {
 public:
     explicit IndexCatalogImpl(Collection* collection);
-    ~IndexCatalogImpl() override;
 
     // must be called before used
     Status init(OperationContext* opCtx) override;
-
-    bool ok() const override;
 
     // ---- accessors -----
 
@@ -228,7 +225,7 @@ public:
     /**
      * Returns true if the index 'idx' is multikey, and returns false otherwise.
      */
-    bool isMultikey(OperationContext* opCtx, const IndexDescriptor* idx) override;
+    bool isMultikey(const IndexDescriptor* const idx) override;
 
     /**
      * Returns the path components that cause the index 'idx' to be multikey if the index supports
@@ -309,12 +306,10 @@ private:
      */
     std::string _getAccessMethodName(const BSONObj& keyPattern) const;
 
-    void _checkMagic() const;
-
     Status _indexKeys(OperationContext* opCtx,
                       IndexCatalogEntry* index,
-                      const std::vector<BSONObj>& keys,
-                      const BSONObjSet& multikeyMetadataKeys,
+                      const std::vector<KeyString::Value>& keys,
+                      const KeyStringSet& multikeyMetadataKeys,
                       const MultikeyPaths& multikeyPaths,
                       const BSONObj& obj,
                       RecordId loc,
@@ -341,7 +336,7 @@ private:
 
     void _unindexKeys(OperationContext* opCtx,
                       IndexCatalogEntry* index,
-                      const std::vector<BSONObj>& keys,
+                      const std::vector<KeyString::Value>& keys,
                       const BSONObj& obj,
                       RecordId loc,
                       bool logIfError,
@@ -398,7 +393,6 @@ private:
                            const std::vector<std::string>& indexNamesToDrop,
                            bool haveIdIndex);
 
-    int _magic;
     Collection* const _collection;
 
     IndexCatalogEntryContainer _readyIndexes;

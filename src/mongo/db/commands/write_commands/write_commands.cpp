@@ -51,7 +51,6 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/storage/duplicate_key_error_info.h"
-#include "mongo/db/transaction_participant.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/s/stale_exception.h"
 
@@ -94,7 +93,8 @@ void serializeReply(OperationContext* opCtx,
     if (continueOnError && !result.results.empty()) {
         const auto& lastResult = result.results.back();
         if (lastResult == ErrorCodes::StaleConfig ||
-            lastResult == ErrorCodes::CannotImplicitlyCreateCollection) {
+            lastResult == ErrorCodes::CannotImplicitlyCreateCollection ||
+            lastResult == ErrorCodes::StaleDbVersion) {
             // For ordered:false commands we need to duplicate these error results for all ops
             // after we stopped. See handleError() in write_ops_exec.cpp for more info.
             auto err = result.results.back();
@@ -261,8 +261,7 @@ private:
     }
 
     void _transactionChecks(OperationContext* opCtx) const {
-        auto txnParticipant = TransactionParticipant::get(opCtx);
-        if (!txnParticipant || !txnParticipant.inMultiDocumentTransaction())
+        if (!opCtx->inMultiDocumentTransaction())
             return;
         uassert(50791,
                 str::stream() << "Cannot write to system collection " << ns().toString()

@@ -56,16 +56,6 @@ public:
         _ns = std::move(nss);
     }
 
-    bool ok() const {
-        std::abort();
-    }
-
-    CollectionInfoCache* infoCache() {
-        std::abort();
-    }
-    const CollectionInfoCache* infoCache() const {
-        std::abort();
-    }
     const IndexCatalog* getIndexCatalog() const {
         return _indexCatalog.get();
     }
