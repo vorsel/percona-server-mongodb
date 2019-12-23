@@ -374,7 +374,7 @@ namespace audit {
         if (!_auditEnabledOnCommandLine()) {
             // Write audit events into the void for debug builds, so we get
             // coverage on the code that generates audit log objects.
-            DEV {
+            if (kDebugBuild) {
                 log() << "Initializing dev null audit..." << std::endl;
                 _setGlobalAuditLog(new VoidAuditLog(fromjson(auditOptions.filter)));
             }

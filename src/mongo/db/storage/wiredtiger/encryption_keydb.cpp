@@ -107,7 +107,7 @@ EncryptionKeyDB::EncryptionKeyDB(const bool just_created, const std::string& pat
 }
 
 EncryptionKeyDB::~EncryptionKeyDB() {
-    DEV if (_sess)
+    if (kDebugBuild && _sess)
         dump_table(_sess, _key_len, "dump_table from destructor");
     if (_sess) {
         _gcm_iv_reserved = _gcm_iv;
@@ -249,14 +249,14 @@ void EncryptionKeyDB::init() {
             throw std::runtime_error(std::string("error opening wiredTiger session: ") + wiredtiger_strerror(res));
         }
 
-        DEV dump_table(_sess, _key_len, "before create");
+        if (kDebugBuild) dump_table(_sess, _key_len, "before create");
         // try to create 'key' table
         // ignore error if table already exists
         res = _sess->create(_sess, "table:key", "key_format=S,value_format=u,access_pattern_hint=random");
         if (res) {
             throw std::runtime_error(std::string("error creating/opening key table: ") + wiredtiger_strerror(res));
         }
-        DEV dump_table(_sess, _key_len, "after create");
+        if (kDebugBuild) dump_table(_sess, _key_len, "after create");
 
         // try to create 'parameters' table
         // ignore error if table already exists
@@ -348,7 +348,7 @@ int EncryptionKeyDB::get_key_by_id(const char *keyid, size_t len, unsigned char 
     // return key from keyfile if len == 0
     if (len == 0) {
         memcpy(key, _masterkey, _key_len);
-        DEV dump_key(key, _key_len, "returning masterkey");
+        if (kDebugBuild) dump_key(key, _key_len, "returning masterkey");
         return 0;
     }
 
@@ -382,7 +382,7 @@ int EncryptionKeyDB::get_key_by_id(const char *keyid, size_t len, unsigned char 
         cursor->get_value(cursor, &v);
         invariant(v.size == _key_len);
         memcpy(key, v.data, _key_len);
-        DEV dump_key(key, _key_len, "loaded key from key DB");
+        if (kDebugBuild) dump_key(key, _key_len, "loaded key from key DB");
         _encryptors[c_str] = pe;
         return 0;
     }
@@ -407,7 +407,7 @@ int EncryptionKeyDB::get_key_by_id(const char *keyid, size_t len, unsigned char 
         return res;
     }
 
-    DEV dump_key(key, _key_len, "generated and stored key");
+    if (kDebugBuild) dump_key(key, _key_len, "generated and stored key");
     _encryptors[c_str] = pe;
     return 0;
 }
