@@ -145,6 +145,8 @@ public:
 
         ASSERT(c->getIndexCatalog()->haveIdIndex(&_opCtx));
         wuow.commit();
+
+        _opCtx.getServiceContext()->getStorageEngine()->setOldestTimestamp(_lastSetOldestTimestamp);
     }
     ~Base() {
         // Replication is not supported by mobile SE.
@@ -239,6 +241,8 @@ protected:
                     if (auto tsElem = ops.front()["ts"]) {
                         _opCtx.getServiceContext()->getStorageEngine()->setOldestTimestamp(
                             tsElem.timestamp());
+                        _lastSetOldestTimestamp =
+                            std::max(_lastSetOldestTimestamp, tsElem.timestamp());
                     }
                 }
             }
@@ -306,6 +310,7 @@ protected:
             repl::UnreplicatedWritesBlock uwb(&_opCtx);
             coll->insertDocument(&_opCtx, InsertStatement(o), nullOpDebug, true)
                 .transitional_ignore();
+            ASSERT_OK(_opCtx.recoveryUnit()->setTimestamp(_lastSetOldestTimestamp));
             wunit.commit();
             return;
         }
@@ -318,6 +323,7 @@ protected:
         repl::UnreplicatedWritesBlock uwb(&_opCtx);
         coll->insertDocument(&_opCtx, InsertStatement(b.obj()), nullOpDebug, true)
             .transitional_ignore();
+        ASSERT_OK(_opCtx.recoveryUnit()->setTimestamp(_lastSetOldestTimestamp));
         wunit.commit();
     }
     static BSONObj wid(const char* json) {
@@ -328,6 +334,8 @@ protected:
         b.appendElements(fromjson(json));
         return b.obj();
     }
+
+    Timestamp _lastSetOldestTimestamp = Timestamp(1, 1);
 };
 
 
@@ -1356,96 +1364,6 @@ public:
     }
 };
 
-class SyncTest : public SyncTail {
-public:
-    bool returnEmpty;
-    explicit SyncTest(OplogApplier::Observer* observer)
-        : SyncTail(observer,
-                   nullptr,
-                   nullptr,
-                   SyncTail::MultiSyncApplyFunc(),
-                   nullptr,
-                   OplogApplier::Options(OplogApplication::Mode::kInitialSync)),
-          returnEmpty(false) {}
-    virtual ~SyncTest() {}
-    BSONObj getMissingDoc(OperationContext* opCtx, const OplogEntry& oplogEntry) override {
-        if (returnEmpty) {
-            BSONObj o;
-            return o;
-        }
-        return BSON("_id"
-                    << "on remote"
-                    << "foo"
-                    << "baz");
-    }
-};
-
-class FetchAndInsertMissingDocumentObserver : public OplogApplier::Observer {
-public:
-    void onBatchBegin(const OplogApplier::Operations&) final {}
-    void onBatchEnd(const StatusWith<OpTime>&, const OplogApplier::Operations&) final {}
-    void onMissingDocumentsFetchedAndInserted(const std::vector<FetchInfo>&) final {
-        fetched = true;
-    }
-    bool fetched = false;
-};
-
-class FetchAndInsertMissingDocument : public Base {
-public:
-    void run() {
-        // Replication is not supported by mobile SE.
-        if (mongo::storageGlobalParams.engine == "mobile") {
-            return;
-        }
-        bool threw = false;
-        auto oplogEntry = makeOplogEntry(OpTime(Timestamp(100, 1), 1LL),  // optime
-                                         OpTypeEnum::kUpdate,             // op type
-                                         NamespaceString(ns()),           // namespace
-                                         BSON("foo"
-                                              << "bar"),  // o
-                                         BSON("_id"
-                                              << "in oplog"
-                                              << "foo"
-                                              << "bar"));  // o2
-
-        Lock::GlobalWrite lk(&_opCtx);
-
-        // this should fail because we can't connect
-        try {
-            OplogApplier::Options options(OplogApplication::Mode::kInitialSync);
-            options.allowNamespaceNotFoundErrorsOnCrudOps = true;
-            options.missingDocumentSourceForInitialSync = HostAndPort("localhost", 123);
-            SyncTail badSource(
-                nullptr, nullptr, nullptr, SyncTail::MultiSyncApplyFunc(), nullptr, options);
-
-            OldClientContext ctx(&_opCtx, ns());
-            badSource.getMissingDoc(&_opCtx, oplogEntry);
-        } catch (DBException&) {
-            threw = true;
-        }
-        verify(threw);
-
-        // now this should succeed
-        FetchAndInsertMissingDocumentObserver observer;
-        SyncTest t(&observer);
-        t.fetchAndInsertMissingDocument(&_opCtx, oplogEntry);
-        ASSERT(observer.fetched);
-        verify(!_client
-                    .findOne(ns(),
-                             BSON("_id"
-                                  << "on remote"))
-                    .isEmpty());
-
-        // Reset flag in observer before next test case.
-        observer.fetched = false;
-
-        // force it not to find an obj
-        t.returnEmpty = true;
-        t.fetchAndInsertMissingDocument(&_opCtx, oplogEntry);
-        ASSERT_FALSE(observer.fetched);
-    }
-};
-
 class All : public Suite {
 public:
     All() : Suite("repl") {}
@@ -1503,7 +1421,6 @@ public:
         add<Idempotence::ReplaySetPreexistingNoOpPull>();
         add<Idempotence::ReplayArrayFieldNotAppended>();
         add<DeleteOpIsIdBased>();
-        add<FetchAndInsertMissingDocument>();
     }
 };
 

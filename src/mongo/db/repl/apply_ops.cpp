@@ -215,8 +215,8 @@ Status _applyOps(OperationContext* opCtx,
                         auto entry = uassertStatusOK(OplogEntry::parse(builder.done()));
                         if (*opType == 'c') {
                             invariant(opCtx->lockState()->isW());
-                            uassertStatusOK(applyCommand_inlock(
-                                opCtx, entry, oplogApplicationMode, boost::none));
+                            uassertStatusOK(
+                                applyCommand_inlock(opCtx, entry, oplogApplicationMode));
                             return Status::OK();
                         }
 
@@ -381,6 +381,7 @@ Status applyOps(OperationContext* opCtx,
     uassert(
         ErrorCodes::BadValue, "applyOps command can't have 'prepare' field", !info.getPrepare());
     uassert(31056, "applyOps command can't have 'partialTxn' field.", !info.getPartialTxn());
+    uassert(31240, "applyOps command can't have 'count' field.", !info.getCount());
 
     // There's only one case where we are allowed to take the database lock instead of the global
     // lock - no preconditions; only CRUD ops; and non-atomic mode.

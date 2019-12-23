@@ -39,6 +39,7 @@
 
 #include "mongo/bson/ordering.h"
 #include "mongo/bson/timestamp.h"
+#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/storage/kv/kv_engine.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/wiredtiger/encryption_keydb.h"
@@ -57,7 +58,7 @@ class WiredTigerSessionCache;
 class WiredTigerSizeStorer;
 
 struct WiredTigerFileVersion {
-    enum class StartupVersion { IS_34, IS_36, IS_40, IS_42 };
+    enum class StartupVersion { IS_34, IS_36, IS_40, IS_42, IS_44 };
 
     StartupVersion _startupVersion;
     bool shouldDowngrade(bool readOnly, bool repairMode, bool hasRecoveryTimestamp);
@@ -81,12 +82,21 @@ public:
 
     ~WiredTigerKVEngine();
 
+    void startAsyncThreads() override;
+
     void setRecordStoreExtraOptions(const std::string& options);
     void setSortedDataInterfaceExtraOptions(const std::string& options);
 
     bool supportsDocLocking() const override;
 
     bool supportsDirectoryPerDB() const override;
+
+    /**
+     * WiredTiger supports checkpoints when it isn't running in memory.
+     */
+    bool supportsCheckpoints() const override {
+        return !isEphemeral();
+    }
 
     bool isDurable() const override {
         return _durable;
@@ -351,6 +361,12 @@ public:
         return _clockSource;
     }
 
+    /**
+     * Returns a CheckpointLockImpl RAII instance holding the _checkpointMutex.
+     */
+    std::unique_ptr<StorageEngine::CheckpointLock> getCheckpointLock(
+        OperationContext* opCtx) override;
+
 private:
     class WiredTigerSessionSweeper;
     class WiredTigerJournalFlusher;
@@ -468,5 +484,9 @@ private:
     // Timestamp of data at startup. Used internally to advise checkpointing and recovery to a
     // timestamp. Provided by replication layer because WT does not persist timestamps.
     AtomicWord<std::uint64_t> _initialDataTimestamp;
+
+    // Required for taking a checkpoint; and can be used to ensure multiple checkpoint cursors
+    // target the same checkpoint.
+    Lock::ResourceMutex _checkpointMutex = Lock::ResourceMutex("checkpointCursorMutex");
 };
 }  // namespace mongo

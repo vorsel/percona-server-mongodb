@@ -34,10 +34,14 @@
 #include "mongo/db/catalog/collection_validation.h"
 
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/max_validate_mb_per_sec_gen.h"
+#include "mongo/db/catalog/index_consistency.h"
+#include "mongo/db/catalog/throttle_cursor.h"
+#include "mongo/db/db_raii.h"
+#include "mongo/db/index/index_access_method.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/record_store.h"
+#include "mongo/db/views/view_catalog.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -53,128 +57,136 @@ namespace {
 using ValidateResultsMap = std::map<string, ValidateResults>;
 
 /**
- * General validation logic for any RecordStore. Performs sanity checks to confirm that each
- * record in the store is valid according to the given RecordStoreValidateAdaptor and updates
- * record store stats to match.
+ * Opens a cursor on each index in the given 'indexCatalog'.
+ *
+ * Returns a map from indexName -> indexCursor.
  */
-void _genericRecordStoreValidate(OperationContext* opCtx,
-                                 RecordStore* recordStore,
-                                 RecordStoreValidateAdaptor* indexValidator,
-                                 ValidateResults* results,
-                                 BSONObjBuilder* output) {
-    long long nrecords = 0;
-    long long dataSizeTotal = 0;
-    long long nInvalid = 0;
-
-    results->valid = true;
-    std::unique_ptr<SeekableRecordCursor> cursor = recordStore->getCursor(opCtx, true);
-    int interruptInterval = 4096;
-    RecordId prevRecordId;
-
-    while (auto record = cursor->next()) {
-        if (!(nrecords % interruptInterval)) {
-            opCtx->checkForInterrupt();
-        }
-        ++nrecords;
-        auto dataSize = record->data.size();
-        dataSizeTotal += dataSize;
-        size_t validatedSize;
-        Status status = indexValidator->validate(record->id, record->data, &validatedSize);
-
-        // Check to ensure isInRecordIdOrder() is being used properly.
-        if (prevRecordId.isValid()) {
-            invariant(prevRecordId < record->id);
-        }
-
-        // ValidatedSize = dataSize is not a general requirement as some storage engines may use
-        // padding, but we still require that they return the unpadded record data.
-        if (!status.isOK() || validatedSize != static_cast<size_t>(dataSize)) {
-            if (results->valid) {
-                // Only log once.
-                results->errors.push_back("detected one or more invalid documents (see logs)");
-            }
-            nInvalid++;
-            results->valid = false;
-            log() << "document at location: " << record->id << " is corrupted";
-        }
-
-        prevRecordId = record->id;
+std::map<std::string, std::unique_ptr<SortedDataInterfaceThrottleCursor>> _openIndexCursors(
+    OperationContext* opCtx,
+    IndexCatalog* indexCatalog,
+    std::shared_ptr<DataThrottle> dataThrottle) {
+    std::map<std::string, std::unique_ptr<SortedDataInterfaceThrottleCursor>> indexCursors;
+    const std::unique_ptr<IndexCatalog::IndexIterator> it =
+        indexCatalog->getIndexIterator(opCtx, false);
+    while (it->more()) {
+        const IndexCatalogEntry* entry = it->next();
+        indexCursors.emplace(entry->descriptor()->indexName(),
+                             std::make_unique<SortedDataInterfaceThrottleCursor>(
+                                 opCtx, entry->accessMethod(), dataThrottle));
     }
-
-    if (results->valid) {
-        recordStore->updateStatsAfterRepair(opCtx, nrecords, dataSizeTotal);
-    }
-
-    output->append("nInvalidDocuments", nInvalid);
-    output->appendNumber("nrecords", nrecords);
+    return indexCursors;
 }
 
-void _validateRecordStore(OperationContext* opCtx,
-                          RecordStore* recordStore,
-                          ValidateCmdLevel level,
-                          bool background,
-                          RecordStoreValidateAdaptor* indexValidator,
-                          ValidateResults* results,
-                          BSONObjBuilder* output) {
-    if (background) {
-        indexValidator->traverseRecordStore(recordStore, results, output);
-    } else {
-        // For 'full' validation we use the record store's validation functionality.
-        if (level == kValidateFull) {
-            recordStore->validate(opCtx, results, output);
-        }
-        _genericRecordStoreValidate(opCtx, recordStore, indexValidator, results, output);
-    }
-}
+/**
+ * Validates the internal structure of each index in the Index Catalog 'indexCatalog', ensuring that
+ * the index files have not been corrupted or compromised.
+ *
+ * May close or invalidate open cursors.
+ *
+ * Returns a map from indexName -> number of keys validated.
+ */
+std::map<std::string, int64_t> _validateIndexesInternalStructure(
+    OperationContext* opCtx,
+    IndexCatalog* indexCatalog,
+    ValidateResultsMap* indexNsResultsMap,
+    ValidateResults* results) {
+    std::map<std::string, int64_t> numIndexKeysPerIndex;
+    const std::unique_ptr<IndexCatalog::IndexIterator> it =
+        indexCatalog->getIndexIterator(opCtx, false);
 
-void _validateIndexes(OperationContext* opCtx,
-                      IndexCatalog* indexCatalog,
-                      BSONObjBuilder* keysPerIndex,
-                      RecordStoreValidateAdaptor* indexValidator,
-                      ValidateCmdLevel level,
-                      ValidateResultsMap* indexNsResultsMap,
-                      ValidateResults* results) {
-
-    std::unique_ptr<IndexCatalog::IndexIterator> it = indexCatalog->getIndexIterator(opCtx, false);
-
-    // Validate Indexes.
+    // Validate Indexes Internal Structure, checking if index files have been compromised or
+    // corrupted.
     while (it->more()) {
         opCtx->checkForInterrupt();
+
         const IndexCatalogEntry* entry = it->next();
         const IndexDescriptor* descriptor = entry->descriptor();
         const IndexAccessMethod* iam = entry->accessMethod();
 
-        log(LogComponent::kIndex) << "validating index " << descriptor->indexName()
-                                  << " on collection " << descriptor->parentNS();
+        log(LogComponent::kIndex) << "validating the internal structure of index "
+                                  << descriptor->indexName() << " on collection "
+                                  << descriptor->parentNS();
         ValidateResults& curIndexResults = (*indexNsResultsMap)[descriptor->indexName()];
-        bool checkCounts = false;
-        int64_t numTraversedKeys;
-        int64_t numValidatedKeys;
 
+        int64_t numValidated;
+        iam->validate(opCtx, &numValidated, &curIndexResults);
+
+        numIndexKeysPerIndex[descriptor->indexName()] = numValidated;
+    }
+    return numIndexKeysPerIndex;
+}
+
+/**
+ * Validates each index in the Index Catalog using the cursors in 'indexCursors'.
+ *
+ * If 'level' is kValidateFull, then we will compare new index entry counts with a previously taken
+ * count saved in 'numIndexKeysPerIndex'.
+ */
+void _validateIndexes(
+    OperationContext* opCtx,
+    IndexCatalog* indexCatalog,
+    BSONObjBuilder* keysPerIndex,
+    ValidateAdaptor* indexValidator,
+    ValidateCmdLevel level,
+    const std::map<std::string, std::unique_ptr<SortedDataInterfaceThrottleCursor>>& indexCursors,
+    const std::map<std::string, int64_t>& numIndexKeysPerIndex,
+    ValidateResultsMap* indexNsResultsMap,
+    ValidateResults* results) {
+
+    const std::unique_ptr<IndexCatalog::IndexIterator> it =
+        indexCatalog->getIndexIterator(opCtx, false);
+
+    // Validate Indexes, checking for mismatch between index entries and collection records.
+    while (it->more()) {
+        opCtx->checkForInterrupt();
+
+        const IndexDescriptor* descriptor = it->next()->descriptor();
+
+        log(LogComponent::kIndex) << "validating index consistency " << descriptor->indexName()
+                                  << " on collection " << descriptor->parentNS();
+
+        // Ensure that this index had an index cursor opened in _openIndexCursors.
+        const auto indexCursorIt = indexCursors.find(descriptor->indexName());
+        invariant(indexCursorIt != indexCursors.end());
+
+        ValidateResults& curIndexResults = (*indexNsResultsMap)[descriptor->indexName()];
+        int64_t numTraversedKeys;
+        indexValidator->traverseIndex(
+            opCtx, &numTraversedKeys, indexCursorIt->second, descriptor, &curIndexResults);
+
+        // If we are performing a full validation, we have information on the number of index keys
+        // validated in _validateIndexesInternalStructure (when we validated the internal structure
+        // of the index). Check if this is consistent with 'numTraversedKeys' from traverseIndex
+        // above.
         if (level == kValidateFull) {
-            iam->validate(opCtx, &numValidatedKeys, &curIndexResults);
-            checkCounts = true;
+            // Ensure that this index was validated in _validateIndexesInternalStructure.
+            const auto numIndexKeysIt = numIndexKeysPerIndex.find(descriptor->indexName());
+            invariant(numIndexKeysIt != numIndexKeysPerIndex.end());
+
+            // The number of keys counted in _validateIndexesInternalStructure, when checking the
+            // internal structure of the index.
+            const int64_t numIndexKeys = numIndexKeysIt->second;
+
+            // Check if currIndexResults is valid to ensure that this index is not corrupted or
+            // comprised (which was set in _validateIndexesInternalStructure). If the index is
+            // corrupted, there is no use in checking if the traversal yielded the same key count.
+            if (curIndexResults.valid) {
+
+                if (numIndexKeys != numTraversedKeys) {
+                    curIndexResults.valid = false;
+                    string msg = str::stream()
+                        << "number of traversed index entries (" << numTraversedKeys
+                        << ") does not match the number of expected index entries (" << numIndexKeys
+                        << ")";
+                    results->errors.push_back(msg);
+                    results->valid = false;
+                }
+            }
         }
 
         if (curIndexResults.valid) {
-            indexValidator->traverseIndex(iam, descriptor, &curIndexResults, &numTraversedKeys);
-
-            if (checkCounts && (numValidatedKeys != numTraversedKeys)) {
-                curIndexResults.valid = false;
-                string msg = str::stream()
-                    << "number of traversed index entries (" << numTraversedKeys
-                    << ") does not match the number of expected index entries (" << numValidatedKeys
-                    << ")";
-                results->errors.push_back(msg);
-                results->valid = false;
-            }
-
-            if (curIndexResults.valid) {
-                keysPerIndex->appendNumber(descriptor->indexName(),
-                                           static_cast<long long>(numTraversedKeys));
-            } else {
-                results->valid = false;
-            }
+            keysPerIndex->appendNumber(descriptor->indexName(),
+                                       static_cast<long long>(numTraversedKeys));
         } else {
             results->valid = false;
         }
@@ -185,26 +197,33 @@ void _validateIndexes(OperationContext* opCtx,
  * Executes the second phase of validation for improved error reporting. This is only done if
  * any index inconsistencies are found during the first phase of validation.
  */
-void _gatherIndexEntryErrors(OperationContext* opCtx,
-                             RecordStore* recordStore,
-                             IndexCatalog* indexCatalog,
-                             IndexConsistency* indexConsistency,
-                             RecordStoreValidateAdaptor* indexValidator,
-                             ValidateResultsMap* indexNsResultsMap,
-                             ValidateResults* result) {
+void _gatherIndexEntryErrors(
+    OperationContext* opCtx,
+    Collection* coll,
+    IndexConsistency* indexConsistency,
+    ValidateAdaptor* indexValidator,
+    const RecordId& firstRecordId,
+    const std::unique_ptr<SeekableRecordThrottleCursor>& traverseRecordStoreCursor,
+    const std::unique_ptr<SeekableRecordThrottleCursor>& seekRecordStoreCursor,
+    const std::map<std::string, std::unique_ptr<SortedDataInterfaceThrottleCursor>>& indexCursors,
+    ValidateResultsMap* indexNsResultsMap,
+    ValidateResults* result) {
     indexConsistency->setSecondPhase();
 
     log(LogComponent::kIndex) << "Starting to traverse through all the document key sets.";
 
     // During the second phase of validation, iterate through each documents key set and only record
     // the keys that were inconsistent during the first phase of validation.
-    std::unique_ptr<SeekableRecordCursor> cursor = recordStore->getCursor(opCtx, true);
-    while (auto record = cursor->next()) {
+    for (auto record = traverseRecordStoreCursor->seekExact(opCtx, firstRecordId); record;
+         record = traverseRecordStoreCursor->next(opCtx)) {
         opCtx->checkForInterrupt();
 
         // We can ignore the status of validate as it was already checked during the first phase.
         size_t validatedSize;
-        indexValidator->validate(record->id, record->data, &validatedSize).ignore();
+        indexValidator
+            ->validateRecord(
+                opCtx, coll, record->id, record->data, seekRecordStoreCursor, &validatedSize)
+            .ignore();
     }
 
     log(LogComponent::kIndex) << "Finished traversing through all the document key sets.";
@@ -212,18 +231,25 @@ void _gatherIndexEntryErrors(OperationContext* opCtx,
 
     // Iterate through all the indexes in the collection and only record the index entry keys that
     // had inconsistencies during the first phase.
-    std::unique_ptr<IndexCatalog::IndexIterator> it = indexCatalog->getIndexIterator(opCtx, false);
+    std::unique_ptr<IndexCatalog::IndexIterator> it =
+        coll->getIndexCatalog()->getIndexIterator(opCtx, false);
     while (it->more()) {
         opCtx->checkForInterrupt();
 
-        const IndexCatalogEntry* entry = it->next();
-        const IndexDescriptor* descriptor = entry->descriptor();
-        const IndexAccessMethod* iam = entry->accessMethod();
+        const IndexDescriptor* descriptor = it->next()->descriptor();
 
         log(LogComponent::kIndex) << "Traversing through the index entries for index "
                                   << descriptor->indexName() << ".";
-        indexValidator->traverseIndex(
-            iam, descriptor, /*ValidateResults=*/nullptr, /*numTraversedKeys=*/nullptr);
+
+        // Ensure that this index had an index cursor opened in _openIndexCursors.
+        const auto indexCursorIt = indexCursors.find(descriptor->indexName());
+        invariant(indexCursorIt != indexCursors.end());
+
+        indexValidator->traverseIndex(opCtx,
+                                      /*numTraversedKeys=*/nullptr,
+                                      indexCursorIt->second,
+                                      descriptor,
+                                      /*ValidateResults=*/nullptr);
     }
 
     log(LogComponent::kIndex) << "Finished traversing through all the indexes.";
@@ -232,20 +258,19 @@ void _gatherIndexEntryErrors(OperationContext* opCtx,
 }
 
 void _validateIndexKeyCount(OperationContext* opCtx,
-                            IndexCatalog* indexCatalog,
-                            RecordStore* recordStore,
-                            RecordStoreValidateAdaptor* indexValidator,
+                            Collection* coll,
+                            ValidateAdaptor* indexValidator,
                             ValidateResultsMap* indexNsResultsMap) {
 
-    std::unique_ptr<IndexCatalog::IndexIterator> indexIterator =
-        indexCatalog->getIndexIterator(opCtx, false);
+    const std::unique_ptr<IndexCatalog::IndexIterator> indexIterator =
+        coll->getIndexCatalog()->getIndexIterator(opCtx, false);
     while (indexIterator->more()) {
         const IndexDescriptor* descriptor = indexIterator->next()->descriptor();
         ValidateResults& curIndexResults = (*indexNsResultsMap)[descriptor->indexName()];
 
         if (curIndexResults.valid) {
             indexValidator->validateIndexKeyCount(
-                descriptor, recordStore->numRecords(opCtx), curIndexResults);
+                descriptor, coll->getRecordStore()->numRecords(opCtx), curIndexResults);
         }
     }
 }
@@ -311,8 +336,12 @@ void _validateCatalogEntry(OperationContext* opCtx,
                            BSONObj validatorDoc,
                            ValidateResults* results) {
     CollectionOptions options = DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, coll->ns());
-    invariant(options.uuid);
-    addErrorIfUnequal(*(options.uuid), coll->uuid(), "UUID", results);
+    if (options.uuid) {
+        addErrorIfUnequal(*(options.uuid), coll->uuid(), "UUID", results);
+    } else {
+        results->valid = false;
+        results->errors.push_back("UUID missing on collection.");
+    }
     const CollatorInterface* collation = coll->getDefaultCollator();
     addErrorIfUnequal(options.collation.isEmpty(), !collation, "simple collation", results);
     if (!options.collation.isEmpty() && collation)
@@ -346,50 +375,126 @@ void _validateCatalogEntry(OperationContext* opCtx,
 }  // namespace
 
 Status validate(OperationContext* opCtx,
-                Collection* coll,
+                const NamespaceString& nss,
                 ValidateCmdLevel level,
                 bool background,
                 ValidateResults* results,
                 BSONObjBuilder* output) {
-    invariant(opCtx->lockState()->isCollectionLockedForMode(coll->ns(), MODE_IS));
+    invariant(!opCtx->lockState()->isLocked());
+    invariant(!(background && (level == kValidateFull)));
+
+    AutoGetDb autoDB(opCtx, nss.db(), MODE_IX);
+    boost::optional<Lock::CollectionLock> collLock;
+    if (background) {
+        collLock.emplace(opCtx, nss, MODE_IX);
+    } else {
+        collLock.emplace(opCtx, nss, MODE_X);
+    }
+
+    Collection* collection = autoDB.getDb() ? autoDB.getDb()->getCollection(opCtx, nss) : nullptr;
+    if (!collection) {
+        if (autoDB.getDb() && ViewCatalog::get(autoDB.getDb())->lookup(opCtx, nss.ns())) {
+            return {ErrorCodes::CommandNotSupportedOnView, "Cannot validate a view"};
+        }
+
+        return {ErrorCodes::NamespaceNotFound,
+                str::stream() << "Collection '" << nss << "' does not exist to validate."};
+    }
+
+    output->append("ns", nss.ns());
+
+    ValidateResultsMap indexNsResultsMap;
+    BSONObjBuilder keysPerIndex;  // not using subObjStart to be exception safe.
+    IndexConsistency indexConsistency(opCtx, collection);
+    ValidateAdaptor indexValidator = ValidateAdaptor(&indexConsistency, level, &indexNsResultsMap);
 
     try {
-        ValidateResultsMap indexNsResultsMap;
-        BSONObjBuilder keysPerIndex;  // not using subObjStart to be exception safe.
-        IndexConsistency indexConsistency(
-            opCtx, coll, coll->ns(), coll->getRecordStore(), background);
-        RecordStoreValidateAdaptor indexValidator = RecordStoreValidateAdaptor(
-            opCtx, &indexConsistency, level, coll->getIndexCatalog(), &indexNsResultsMap);
+        std::map<std::string, int64_t> numIndexKeysPerIndex;
 
-        string uuidString = str::stream() << " (UUID: " << coll->uuid() << ")";
+        // Full validation code is executed before we open cursors because it may close
+        // and/or invalidate all open cursors.
+        if (level == kValidateFull) {
+            // For full validation we use the storage engine's validation functionality.
+            collection->getRecordStore()->validate(opCtx, results, output);
+            // For full validation, we validate the internal structure of each index and save the
+            // number of keys in the index to compare against _validateIndexes()'s count results.
+            numIndexKeysPerIndex = _validateIndexesInternalStructure(
+                opCtx, collection->getIndexCatalog(), &indexNsResultsMap, results);
+        }
+
+        // We want to share the same data throttle instance across all the cursors used during this
+        // validation. Validations started on other collections will not share the same data
+        // throttle instance.
+        std::shared_ptr<DataThrottle> dataThrottle = std::make_shared<DataThrottle>();
+
+        if (!background) {
+            dataThrottle->turnThrottlingOff();
+        }
+
+        // Open all cursors at once before running non-full validation code so that all steps of
+        // validation during background validation use the same view of the data.
+        const std::map<std::string, std::unique_ptr<SortedDataInterfaceThrottleCursor>>
+            indexCursors = _openIndexCursors(opCtx, collection->getIndexCatalog(), dataThrottle);
+        const std::unique_ptr<SeekableRecordThrottleCursor> traverseRecordStoreCursor =
+            std::make_unique<SeekableRecordThrottleCursor>(
+                opCtx, collection->getRecordStore(), dataThrottle);
+        const std::unique_ptr<SeekableRecordThrottleCursor> seekRecordStoreCursor =
+            std::make_unique<SeekableRecordThrottleCursor>(
+                opCtx, collection->getRecordStore(), dataThrottle);
+
+        // Because SeekableRecordCursors don't have a method to reset to the start, we save and then
+        // use a seek to the first RecordId to reset the cursor (and reuse it) as needed. When
+        // iterating through a Record Store cursor, we initialize the loop (and obtain the first
+        // Record) with a seek to the first Record (using firstRecordId). Subsequent loop iterations
+        // use cursor->next() to get subsequent Records. However, if the Record Store is empty,
+        // there is no first record. In this case, we set the first Record Id to an invalid RecordId
+        // (RecordId()), which will halt iteration at the initialization step.
+        const boost::optional<Record> record = traverseRecordStoreCursor->next(opCtx);
+        const RecordId firstRecordId = record ? record->id : RecordId();
+
+        const string uuidString = str::stream() << " (UUID: " << collection->uuid() << ")";
 
         // Validate the record store.
-        log(LogComponent::kIndex) << "validating collection " << coll->ns() << uuidString;
-        _validateRecordStore(
-            opCtx, coll->getRecordStore(), level, background, &indexValidator, results, output);
+        log(LogComponent::kIndex) << "validating collection " << collection->ns() << uuidString;
+        // In traverseRecordStore(), the index validator keeps track the records in the record
+        // store so that _validateIndexes() can confirm that the index entries match the records in
+        // the collection.
+        indexValidator.traverseRecordStore(opCtx,
+                                           collection,
+                                           firstRecordId,
+                                           traverseRecordStoreCursor,
+                                           seekRecordStoreCursor,
+                                           background,
+                                           results,
+                                           output);
 
-        // Validate in-memory catalog information with the persisted info.
-        _validateCatalogEntry(opCtx, coll, coll->getValidatorDoc(), results);
+        // Validate in-memory catalog information with persisted info.
+        _validateCatalogEntry(opCtx, collection, collection->getValidatorDoc(), results);
 
         // Validate indexes and check for mismatches.
         if (results->valid) {
             _validateIndexes(opCtx,
-                             coll->getIndexCatalog(),
+                             collection->getIndexCatalog(),
                              &keysPerIndex,
                              &indexValidator,
                              level,
+                             indexCursors,
+                             numIndexKeysPerIndex,
                              &indexNsResultsMap,
                              results);
 
             if (indexConsistency.haveEntryMismatch()) {
                 log(LogComponent::kIndex)
-                    << "Index inconsistencies were detected on collection " << coll->ns()
+                    << "Index inconsistencies were detected on collection " << collection->ns()
                     << ". Starting the second phase of index validation to gather concise errors.";
                 _gatherIndexEntryErrors(opCtx,
-                                        coll->getRecordStore(),
-                                        coll->getIndexCatalog(),
+                                        collection,
                                         &indexConsistency,
                                         &indexValidator,
+                                        firstRecordId,
+                                        traverseRecordStoreCursor,
+                                        seekRecordStoreCursor,
+                                        indexCursors,
                                         &indexNsResultsMap,
                                         results);
             }
@@ -397,16 +502,12 @@ Status validate(OperationContext* opCtx,
 
         // Validate index key count.
         if (results->valid) {
-            _validateIndexKeyCount(opCtx,
-                                   coll->getIndexCatalog(),
-                                   coll->getRecordStore(),
-                                   &indexValidator,
-                                   &indexNsResultsMap);
+            _validateIndexKeyCount(opCtx, collection, &indexValidator, &indexNsResultsMap);
         }
 
         // Report the validation results for the user to see.
         _reportValidationResults(opCtx,
-                                 coll->getIndexCatalog(),
+                                 collection->getIndexCatalog(),
                                  &indexNsResultsMap,
                                  &keysPerIndex,
                                  level,
@@ -414,10 +515,10 @@ Status validate(OperationContext* opCtx,
                                  output);
 
         if (!results->valid) {
-            log(LogComponent::kIndex) << "Validation complete for collection " << coll->ns()
+            log(LogComponent::kIndex) << "Validation complete for collection " << collection->ns()
                                       << uuidString << ". Corruption found.";
         } else {
-            log(LogComponent::kIndex) << "Validation complete for collection " << coll->ns()
+            log(LogComponent::kIndex) << "Validation complete for collection " << collection->ns()
                                       << uuidString << ". No corruption found.";
         }
     } catch (DBException& e) {

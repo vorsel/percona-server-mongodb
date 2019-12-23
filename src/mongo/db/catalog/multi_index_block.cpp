@@ -50,6 +50,7 @@
 #include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/write_unit_of_work.h"
 #include "mongo/logger/redaction.h"
@@ -62,6 +63,25 @@
 #include "mongo/util/uuid.h"
 
 namespace mongo {
+
+namespace {
+
+/**
+ * We do not need synchronization with step up and step down. Dropping the RSTL is important because
+ * otherwise if we held the RSTL it would create deadlocks with prepared transactions on step up and
+ * step down.  A deadlock could result if the index build was attempting to acquire a Collection S
+ * or X lock while a prepared transaction held a Collection IX lock, and a step down was waiting to
+ * acquire the RSTL in mode X.
+ */
+void _unlockRSTLForIndexCleanup(OperationContext* opCtx) {
+    if (!serverGlobalParams.featureCompatibility.isVersionInitialized()) {
+        return;
+    }
+    opCtx->lockState()->unlockRSTLforPrepare();
+    invariant(!opCtx->lockState()->isRSTLLocked());
+}
+
+}  // namespace
 
 MONGO_FAIL_POINT_DEFINE(hangAfterSettingUpIndexBuild);
 MONGO_FAIL_POINT_DEFINE(hangAfterStartingIndexBuild);
@@ -82,8 +102,33 @@ void MultiIndexBlock::cleanUpAfterBuild(OperationContext* opCtx, Collection* col
         invariant(_collectionUUID.get() == collection->uuid());
     }
 
-    if (!_needToCleanup && !_indexes.empty()) {
+    if (_indexes.empty()) {
+        _buildIsCleanedUp = true;
+        return;
+    }
+
+    if (!_needToCleanup) {
         CollectionQueryInfo::get(collection).clearQueryCache();
+
+        // The temp tables cannot be dropped in commit() because commit() can be called multiple
+        // times on write conflict errors and the drop does not rollback in WUOWs.
+
+        // Make lock acquisition uninterruptible.
+        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
+
+        // Lock if it's not already locked, to ensure storage engine cannot be destructed out from
+        // underneath us.
+        boost::optional<Lock::GlobalLock> lk;
+        if (!opCtx->lockState()->isWriteLocked()) {
+            lk.emplace(opCtx, MODE_IS);
+        }
+
+        for (auto& index : _indexes) {
+            index.block->deleteTemporaryTables(opCtx);
+        }
+
+        _buildIsCleanedUp = true;
+        return;
     }
 
     // Make lock acquisition uninterruptible.
@@ -96,18 +141,13 @@ void MultiIndexBlock::cleanUpAfterBuild(OperationContext* opCtx, Collection* col
 
     if (!opCtx->lockState()->isCollectionLockedForMode(nss, MODE_X)) {
         dbLock.emplace(opCtx, nss.db(), MODE_IX);
+        // Since DBLock implicitly acquires RSTL, we release the RSTL after acquiring the database
+        // lock. Additionally, the RSTL has to be released before acquiring a strong lock (MODE_X)
+        // on the collection to avoid potential deadlocks.
+        _unlockRSTLForIndexCleanup(opCtx);
         collLock.emplace(opCtx, nss, MODE_X);
-    }
-
-    if (!_needToCleanup || _indexes.empty()) {
-        // The temp tables cannot be dropped in commit() because commit() can be called multiple
-        // times on write conflict errors and the drop does not rollback in WUOWs.
-        for (auto& index : _indexes) {
-            index.block->deleteTemporaryTables(opCtx);
-        }
-
-        _buildIsCleanedUp = true;
-        return;
+    } else {
+        _unlockRSTLForIndexCleanup(opCtx);
     }
 
     while (true) {
@@ -120,7 +160,6 @@ void MultiIndexBlock::cleanUpAfterBuild(OperationContext* opCtx, Collection* col
                 _indexes[i].block->deleteTemporaryTables(opCtx);
             }
 
-            auto replCoord = repl::ReplicationCoordinator::get(opCtx);
             // Nodes building an index on behalf of a user (e.g: `createIndexes`, `applyOps`) may
             // fail, removing the existence of the index from the catalog. This update must be
             // timestamped (unless the build is on an unreplicated collection). A failure from
@@ -130,20 +169,10 @@ void MultiIndexBlock::cleanUpAfterBuild(OperationContext* opCtx, Collection* col
                 // We must choose a timestamp to write with, as we don't have one handy in the
                 // recovery unit already.
 
-                // We need to avoid checking replication state if we do not hold the RSTL.  If we do
-                // not hold the RSTL, we must be a build started on a secondary via replication.
-                if (opCtx->lockState()->isRSTLLocked() &&
-                    replCoord->canAcceptWritesForDatabase(opCtx, "admin")) {
-                    opCtx->getServiceContext()->getOpObserver()->onOpMessage(
-                        opCtx,
-                        BSON("msg" << std::string(str::stream()
-                                                  << "Failing index builds. Coll: " << nss)));
-                } else {
-                    // Simply get a timestamp to write with here; we can't write to the oplog.
-                    repl::UnreplicatedWritesBlock uwb(opCtx);
-                    if (!IndexTimestampHelper::setGhostCommitTimestampForCatalogWrite(opCtx, nss)) {
-                        log() << "Did not timestamp index abort write.";
-                    }
+                // Simply get a timestamp to write with here; we can't write to the oplog.
+                repl::UnreplicatedWritesBlock uwb(opCtx);
+                if (!IndexTimestampHelper::setGhostCommitTimestampForCatalogWrite(opCtx, nss)) {
+                    log() << "Did not timestamp index abort write.";
                 }
             }
             wunit.commit();
@@ -184,17 +213,29 @@ MultiIndexBlock::OnInitFn MultiIndexBlock::kNoopOnInitFn =
 MultiIndexBlock::OnInitFn MultiIndexBlock::makeTimestampedIndexOnInitFn(OperationContext* opCtx,
                                                                         const Collection* coll) {
     return [opCtx, ns = coll->ns()](std::vector<BSONObj>& specs) -> Status {
-        auto replCoord = repl::ReplicationCoordinator::get(opCtx);
-        if (opCtx->recoveryUnit()->getCommitTimestamp().isNull() &&
-            replCoord->canAcceptWritesForDatabase(opCtx, "admin")) {
-            // Only primaries must timestamp this write. Secondaries run this from within a
-            // `TimestampBlock`. Primaries performing an index build via `applyOps` may have a
-            // wrapping commit timestamp that will be used instead.
-            opCtx->getServiceContext()->getOpObserver()->onOpMessage(
-                opCtx,
-                BSON("msg" << std::string(str::stream() << "Creating indexes. Coll: " << ns)));
-        }
+        // This function sets a timestamp for the initial catalog write when beginning an index
+        // build, if necessary.  There are four scenarios:
 
+        // 1. A timestamp is already set -- replication application sets a timestamp ahead of time.
+        // This could include the phase of initial sync where it applies oplog entries.  Also,
+        // primaries performing an index build via `applyOps` may have a wrapping commit timestamp.
+        if (!opCtx->recoveryUnit()->getCommitTimestamp().isNull())
+            return Status::OK();
+
+        // 2. If the node is initial syncing, we do not set a timestamp.
+        auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+        if (replCoord->isReplEnabled() && replCoord->getMemberState().startup2())
+            return Status::OK();
+
+        // 3. If the index build is on the local database, do not timestamp.
+        if (ns.isLocal())
+            return Status::OK();
+
+        // 4. All other cases, we generate a timestamp by writing a no-op oplog entry.  This is
+        // better than using a ghost timestamp.  Writing an oplog entry ensures this node is
+        // primary.
+        opCtx->getServiceContext()->getOpObserver()->onOpMessage(
+            opCtx, BSON("msg" << std::string(str::stream() << "Creating indexes. Coll: " << ns)));
         return Status::OK();
     };
 }
@@ -561,7 +602,7 @@ Status MultiIndexBlock::insert(OperationContext* opCtx, const BSONObj& doc, cons
         }
 
         InsertResult result;
-        Status idxStatus(ErrorCodes::InternalError, "");
+        Status idxStatus = Status::OK();
         if (_indexes[i].bulk) {
             idxStatus = _indexes[i].bulk->insert(opCtx, doc, loc, _indexes[i].options);
         } else {

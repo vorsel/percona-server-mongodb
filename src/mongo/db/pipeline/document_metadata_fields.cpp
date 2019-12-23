@@ -31,7 +31,15 @@
 
 #include "mongo/db/pipeline/document_metadata_fields.h"
 
+#include "mongo/bson/bsonobjbuilder.h"
+
 namespace mongo {
+
+namespace {
+Value missingToNull(Value maybeMissing) {
+    return maybeMissing.missing() ? Value(BSONNULL) : maybeMissing;
+}
+}  // namespace
 
 DocumentMetadataFields::DocumentMetadataFields(const DocumentMetadataFields& other)
     : _holder(other._holder ? std::make_unique<MetadataHolder>(*other._holder) : nullptr) {}
@@ -133,35 +141,35 @@ void DocumentMetadataFields::serializeForSorter(BufBuilder& buf) const {
     }
 
     if (hasTextScore()) {
-        buf.appendNum(static_cast<char>(MetaType::TEXT_SCORE + 1));
+        buf.appendNum(static_cast<char>(MetaType::kTextScore + 1));
         buf.appendNum(getTextScore());
     }
     if (hasRandVal()) {
-        buf.appendNum(static_cast<char>(MetaType::RAND_VAL + 1));
+        buf.appendNum(static_cast<char>(MetaType::kRandVal + 1));
         buf.appendNum(getRandVal());
     }
     if (hasSortKey()) {
-        buf.appendNum(static_cast<char>(MetaType::SORT_KEY + 1));
+        buf.appendNum(static_cast<char>(MetaType::kSortKey + 1));
         getSortKey().appendSelfToBufBuilder(buf);
     }
     if (hasGeoNearDistance()) {
-        buf.appendNum(static_cast<char>(MetaType::GEONEAR_DIST + 1));
+        buf.appendNum(static_cast<char>(MetaType::kGeoNearDist + 1));
         buf.appendNum(getGeoNearDistance());
     }
     if (hasGeoNearPoint()) {
-        buf.appendNum(static_cast<char>(MetaType::GEONEAR_POINT + 1));
+        buf.appendNum(static_cast<char>(MetaType::kGeoNearPoint + 1));
         getGeoNearPoint().serializeForSorter(buf);
     }
     if (hasSearchScore()) {
-        buf.appendNum(static_cast<char>(MetaType::SEARCH_SCORE + 1));
+        buf.appendNum(static_cast<char>(MetaType::kSearchScore + 1));
         buf.appendNum(getSearchScore());
     }
     if (hasSearchHighlights()) {
-        buf.appendNum(static_cast<char>(MetaType::SEARCH_HIGHLIGHTS + 1));
+        buf.appendNum(static_cast<char>(MetaType::kSearchHighlights + 1));
         getSearchHighlights().serializeForSorter(buf);
     }
     if (hasIndexKey()) {
-        buf.appendNum(static_cast<char>(MetaType::INDEX_KEY + 1));
+        buf.appendNum(static_cast<char>(MetaType::kIndexKey + 1));
         getIndexKey().appendSelfToBufBuilder(buf);
     }
     buf.appendNum(static_cast<char>(0));
@@ -171,30 +179,57 @@ void DocumentMetadataFields::deserializeForSorter(BufReader& buf, DocumentMetada
     invariant(out);
 
     while (char marker = buf.read<char>()) {
-        if (marker == static_cast<char>(MetaType::TEXT_SCORE) + 1) {
+        if (marker == static_cast<char>(MetaType::kTextScore) + 1) {
             out->setTextScore(buf.read<LittleEndian<double>>());
-        } else if (marker == static_cast<char>(MetaType::RAND_VAL) + 1) {
+        } else if (marker == static_cast<char>(MetaType::kRandVal) + 1) {
             out->setRandVal(buf.read<LittleEndian<double>>());
-        } else if (marker == static_cast<char>(MetaType::SORT_KEY) + 1) {
+        } else if (marker == static_cast<char>(MetaType::kSortKey) + 1) {
             out->setSortKey(
                 BSONObj::deserializeForSorter(buf, BSONObj::SorterDeserializeSettings()));
-        } else if (marker == static_cast<char>(MetaType::GEONEAR_DIST) + 1) {
+        } else if (marker == static_cast<char>(MetaType::kGeoNearDist) + 1) {
             out->setGeoNearDistance(buf.read<LittleEndian<double>>());
-        } else if (marker == static_cast<char>(MetaType::GEONEAR_POINT) + 1) {
+        } else if (marker == static_cast<char>(MetaType::kGeoNearPoint) + 1) {
             out->setGeoNearPoint(
                 Value::deserializeForSorter(buf, Value::SorterDeserializeSettings()));
-        } else if (marker == static_cast<char>(MetaType::SEARCH_SCORE) + 1) {
+        } else if (marker == static_cast<char>(MetaType::kSearchScore) + 1) {
             out->setSearchScore(buf.read<LittleEndian<double>>());
-        } else if (marker == static_cast<char>(MetaType::SEARCH_HIGHLIGHTS) + 1) {
+        } else if (marker == static_cast<char>(MetaType::kSearchHighlights) + 1) {
             out->setSearchHighlights(
                 Value::deserializeForSorter(buf, Value::SorterDeserializeSettings()));
-        } else if (marker == static_cast<char>(MetaType::INDEX_KEY) + 1) {
+        } else if (marker == static_cast<char>(MetaType::kIndexKey) + 1) {
             out->setIndexKey(
                 BSONObj::deserializeForSorter(buf, BSONObj::SorterDeserializeSettings()));
         } else {
             uasserted(28744, "Unrecognized marker, unable to deserialize buffer");
         }
     }
+}
+
+BSONObj DocumentMetadataFields::serializeSortKey(bool isSingleElementKey, const Value& value) {
+    // Missing values don't serialize correctly in this format, so use nulls instead, since they are
+    // considered equivalent with woCompare().
+    if (isSingleElementKey) {
+        return BSON("" << missingToNull(value));
+    }
+    invariant(value.isArray());
+    BSONObjBuilder bb;
+    for (auto&& val : value.getArray()) {
+        bb << "" << missingToNull(val);
+    }
+    return bb.obj();
+}
+
+Value DocumentMetadataFields::deserializeSortKey(bool isSingleElementKey,
+                                                 const BSONObj& bsonSortKey) {
+    std::vector<Value> keys;
+    for (auto&& elt : bsonSortKey) {
+        keys.push_back(Value{elt});
+    }
+    if (isSingleElementKey) {
+        // As a special case for a sort on a single field, we do not put the keys into an array.
+        return keys[0];
+    }
+    return Value{std::move(keys)};
 }
 
 }  // namespace mongo

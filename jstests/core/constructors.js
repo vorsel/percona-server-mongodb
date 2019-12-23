@@ -3,6 +3,7 @@
 // @tags: [
 //   does_not_support_stepdowns,
 //   requires_non_retryable_commands,
+//   uses_map_reduce_with_temp_collections,
 // ]
 
 // Takes a list of constructors and returns a new list with an extra entry for each constructor with
@@ -77,7 +78,7 @@ function whereConstructorTest(constructorList) {
     constructorList = addConstructorsWithNew(constructorList);
     t = db.where_constructors;
     t.drop();
-    assert.writeOK(t.insert({x: 1}));
+    assert.commandWorked(t.insert({x: 1}));
 
     constructorList.valid.forEach(function(constructor) {
         try {

@@ -62,7 +62,6 @@
 #include "mongo/platform/overflow_arithmetic.h"
 #include "mongo/s/is_mongos.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/bufreader.h"
 #include "mongo/util/destructor_guard.h"
 #include "mongo/util/str.h"
 #include "mongo/util/unowned_ptr.h"
@@ -143,7 +142,7 @@ public:
         return !_data.empty();
     }
     Data next() {
-        Data out = _data.front();
+        Data out = std::move(_data.front());
         _data.pop_front();
         return out;
     }

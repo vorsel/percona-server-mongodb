@@ -355,23 +355,6 @@ Status collatorCompatibleWithPipeline(OperationContext* opCtx,
     return Status::OK();
 }
 
-/**
- * Resolves the collator to either the user-specified collation or, if none was specified, to the
- * collection-default collation.
- */
-std::unique_ptr<CollatorInterface> resolveCollator(OperationContext* opCtx,
-                                                   const AggregationRequest& request,
-                                                   const Collection* collection) {
-    if (!request.getCollation().isEmpty()) {
-        return uassertStatusOK(CollatorFactoryInterface::get(opCtx->getServiceContext())
-                                   ->makeFromBSON(request.getCollation()));
-    }
-
-    return (collection && collection->getDefaultCollator()
-                ? collection->getDefaultCollator()->clone()
-                : nullptr);
-}
-
 boost::intrusive_ptr<ExpressionContext> makeExpressionContext(
     OperationContext* opCtx,
     const AggregationRequest& request,
@@ -419,8 +402,9 @@ void _adjustChangeStreamReadConcern(OperationContext* opCtx) {
     }
 
     // Wait for read concern again since we changed the original read concern.
-    uassertStatusOK(waitForReadConcern(
-        opCtx, readConcernArgs, true, PrepareConflictBehavior::kIgnoreConflicts));
+    uassertStatusOK(waitForReadConcern(opCtx, readConcernArgs, true));
+    setPrepareConflictBehaviorForReadConcern(
+        opCtx, readConcernArgs, PrepareConflictBehavior::kIgnoreConflicts);
 }
 
 /**
@@ -552,7 +536,8 @@ Status runAggregate(OperationContext* opCtx,
             // If the user specified an explicit collation, adopt it; otherwise, use the simple
             // collation. We do not inherit the collection's default collation or UUID, since
             // the stream may be resuming from a point before the current UUID existed.
-            collatorToUse.emplace(resolveCollator(opCtx, request, nullptr));
+            collatorToUse.emplace(
+                PipelineD::resolveCollator(opCtx, request.getCollation(), nullptr));
 
             // Obtain collection locks on the execution namespace; that is, the oplog.
             ctx.emplace(opCtx, nss, AutoGetCollection::ViewMode::kViewsForbidden);
@@ -563,11 +548,13 @@ Status runAggregate(OperationContext* opCtx,
                                  Top::LockType::NotLocked,
                                  AutoStatsTracker::LogMode::kUpdateTopAndCurop,
                                  0);
-            collatorToUse.emplace(resolveCollator(opCtx, request, nullptr));
+            collatorToUse.emplace(
+                PipelineD::resolveCollator(opCtx, request.getCollation(), nullptr));
         } else {
             // This is a regular aggregation. Lock the collection or view.
             ctx.emplace(opCtx, nss, AutoGetCollection::ViewMode::kViewsPermitted);
-            collatorToUse.emplace(resolveCollator(opCtx, request, ctx->getCollection()));
+            collatorToUse.emplace(
+                PipelineD::resolveCollator(opCtx, request.getCollation(), ctx->getCollection()));
             if (ctx->getCollection()) {
                 uuid = ctx->getCollection()->uuid();
             }

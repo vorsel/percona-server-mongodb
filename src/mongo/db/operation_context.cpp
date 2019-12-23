@@ -33,7 +33,6 @@
 
 #include "mongo/db/operation_context.h"
 
-#include "mongo/bson/inline_decls.h"
 #include "mongo/db/client.h"
 #include "mongo/db/service_context.h"
 #include "mongo/platform/random.h"
@@ -226,6 +225,12 @@ Status OperationContext::checkForInterruptNoAssert() noexcept {
 
     const auto killStatus = getKillStatus();
     if (killStatus != ErrorCodes::OK) {
+        if (killStatus == ErrorCodes::TransactionExceededLifetimeLimitSeconds)
+            return Status(
+                killStatus,
+                "operation was interrupted because the transaction exceeded the configured "
+                "'transactionLifetimeLimitSeconds'");
+
         return Status(killStatus, "operation was interrupted");
     }
 

@@ -1,5 +1,6 @@
 // @tags: [
 //   does_not_support_stepdowns,
+//   uses_map_reduce_with_temp_collections,
 // ]
 
 /**
@@ -13,7 +14,7 @@
 
 var col = db.function_string_representations;
 col.drop();
-assert.writeOK(col.insert({
+assert.commandWorked(col.insert({
     _id: "abc123",
     ord_date: new Date("Oct 04, 2012"),
     status: 'A',

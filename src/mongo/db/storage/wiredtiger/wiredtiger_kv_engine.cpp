@@ -121,13 +121,14 @@ bool WiredTigerFileVersion::shouldDowngrade(bool readOnly,
     if (!serverGlobalParams.featureCompatibility.isVersionInitialized()) {
         // If the FCV document hasn't been read, trust the WT compatibility. MongoD will
         // downgrade to the same compatibility it discovered on startup.
-        return _startupVersion == StartupVersion::IS_40 ||
-            _startupVersion == StartupVersion::IS_36 || _startupVersion == StartupVersion::IS_34;
+        return _startupVersion == StartupVersion::IS_42 ||
+            _startupVersion == StartupVersion::IS_40 || _startupVersion == StartupVersion::IS_36 ||
+            _startupVersion == StartupVersion::IS_34;
     }
 
     if (serverGlobalParams.featureCompatibility.getVersion() !=
-        ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo40) {
-        // Only consider downgrading when FCV is set to 4.0
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo42) {
+        // Only consider downgrading when FCV is set to 4.2
         return false;
     }
 
@@ -151,7 +152,7 @@ bool WiredTigerFileVersion::shouldDowngrade(bool readOnly,
 
 std::string WiredTigerFileVersion::getDowngradeString() {
     if (!serverGlobalParams.featureCompatibility.isVersionInitialized()) {
-        invariant(_startupVersion != StartupVersion::IS_42);
+        invariant(_startupVersion != StartupVersion::IS_44);
 
         switch (_startupVersion) {
             case StartupVersion::IS_34:
@@ -160,11 +161,13 @@ std::string WiredTigerFileVersion::getDowngradeString() {
                 return "compatibility=(release=3.0)";
             case StartupVersion::IS_40:
                 return "compatibility=(release=3.1)";
+            case StartupVersion::IS_42:
+                return "compatibility=(release=3.2)";
             default:
                 MONGO_UNREACHABLE;
         }
     }
-    return "compatibility=(release=3.1)";
+    return "compatibility=(release=3.2)";
 }
 
 using std::set;
@@ -234,10 +237,11 @@ public:
         LOG(1) << "starting " << name() << " thread";
 
         while (!_shuttingDown.load()) {
+            auto opCtx = tc->makeOperationContext();
             try {
                 const bool forceCheckpoint = false;
                 const bool stableCheckpoint = false;
-                _sessionCache->waitUntilDurable(forceCheckpoint, stableCheckpoint);
+                _sessionCache->waitUntilDurable(opCtx.get(), forceCheckpoint, stableCheckpoint);
             } catch (const AssertionException& e) {
                 invariant(e.code() == ErrorCodes::ShutdownInProgress);
             }
@@ -259,6 +263,33 @@ private:
     WiredTigerSessionCache* _sessionCache;
     AtomicWord<bool> _shuttingDown{false};
 };
+
+namespace {
+
+/**
+ * RAII class that holds an exclusive lock on the checkpoint resource mutex.
+ *
+ * Instances are created via getCheckpointLock(), which passes in the checkpoint resource mutex.
+ */
+class CheckpointLockImpl : public StorageEngine::CheckpointLock {
+    CheckpointLockImpl(const CheckpointLockImpl&) = delete;
+    CheckpointLockImpl& operator=(const CheckpointLockImpl&) = delete;
+    CheckpointLockImpl(CheckpointLockImpl&& other) = delete;
+
+public:
+    CheckpointLockImpl() = delete;
+    CheckpointLockImpl(OperationContext* opCtx, Lock::ResourceMutex mutex)
+        : _lk(opCtx->lockState(), mutex) {
+        invariant(_lk.isLocked());
+    }
+
+    ~CheckpointLockImpl() = default;
+
+private:
+    Lock::ExclusiveLock _lk;
+};
+
+}  // namespace
 
 std::string toString(const StorageEngine::OldestActiveTransactionTimestampResult& r) {
     if (r.isOK()) {
@@ -291,6 +322,8 @@ public:
         LOG(1) << "starting " << name() << " thread";
 
         while (!_shuttingDown.load()) {
+            auto opCtx = tc->makeOperationContext();
+
             {
                 stdx::unique_lock<stdx::mutex> lock(_mutex);
                 MONGO_IDLE_THREAD_BLOCK;
@@ -342,6 +375,7 @@ public:
                 if (initialDataTimestamp.asULL() <= 1) {
                     UniqueWiredTigerSession session = _sessionCache->getSession();
                     WT_SESSION* s = session->getSession();
+                    auto checkpointLock = _wiredTigerKVEngine->getCheckpointLock(opCtx.get());
                     invariantWTOK(s->checkpoint(s, "use_timestamp=false"));
                 } else if (stableTimestamp < initialDataTimestamp) {
                     LOG_FOR_RECOVERY(2)
@@ -358,6 +392,7 @@ public:
 
                     UniqueWiredTigerSession session = _sessionCache->getSession();
                     WT_SESSION* s = session->getSession();
+                    auto checkpointLock = _wiredTigerKVEngine->getCheckpointLock(opCtx.get());
                     invariantWTOK(s->checkpoint(s, "use_timestamp=true"));
 
                     if (oplogNeededForRollback.isOK()) {
@@ -739,6 +774,7 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
         ss << "log=(enabled=true,archive=true,path=journal,compressor=";
         ss << wiredTigerGlobalOptions.journalCompressor << "),";
         ss << "file_manager=(close_idle_time=" << gWiredTigerFileHandleCloseIdleTime
+           << ",close_scan_interval=" << gWiredTigerFileHandleCloseScanInterval
            << ",close_handle_minimum=" << gWiredTigerFileHandleCloseMinimum << "),";
         ss << "statistics_log=(wait=" << wiredTigerGlobalOptions.statisticsLogDelaySecs << "),";
 
@@ -749,9 +785,15 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
             ss << "verbose=[recovery_progress,checkpoint_progress,compact_progress],";
         }
 
-        // Enable debug write-ahead logging for all tables under debug build.
         if (kDebugBuild) {
-            ss << "debug_mode=(table_logging=true),";
+            // Enable debug write-ahead logging for all tables under debug build.
+            ss << "debug_mode=(table_logging=true,";
+            // For select debug builds, support enabling WiredTiger eviction debug mode. This uses
+            // more aggressive eviction tactics, but may have a negative performance impact.
+            if (gWiredTigerEvictionDebugMode) {
+                ss << "eviction=true,";
+            }
+            ss << "),";
         }
     }
     ss << WiredTigerCustomizationHooks::get(getGlobalServiceContext())
@@ -812,11 +854,6 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
     _sessionSweeper = std::make_unique<WiredTigerSessionSweeper>(_sessionCache.get());
     _sessionSweeper->go();
 
-    if (_durable && !_ephemeral) {
-        _journalFlusher = std::make_unique<WiredTigerJournalFlusher>(_sessionCache.get());
-        _journalFlusher->go();
-    }
-
     // Until the Replication layer installs a real callback, prevent truncating the oplog.
     setOldestActiveTransactionTimestampCallback(
         [](Timestamp) { return StatusWith(boost::make_optional(Timestamp::min())); });
@@ -827,9 +864,6 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
             setOldestTimestamp(_recoveryTimestamp, false);
             setStableTimestamp(_recoveryTimestamp, false);
         }
-
-        _checkpointThread = std::make_unique<WiredTigerCheckpointThread>(this, _sessionCache.get());
-        _checkpointThread->go();
     }
 
     if (_ephemeral && !getTestCommandsEnabled()) {
@@ -854,7 +888,6 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
     Locker::setGlobalThrottling(&openReadTransaction, &openWriteTransaction);
 }
 
-
 WiredTigerKVEngine::~WiredTigerKVEngine() {
     if (_conn) {
         cleanShutdown();
@@ -862,6 +895,20 @@ WiredTigerKVEngine::~WiredTigerKVEngine() {
 
     _sessionCache.reset(nullptr);
     _encryptionKeyDB.reset(nullptr);
+}
+
+void WiredTigerKVEngine::startAsyncThreads() {
+    if (!_ephemeral) {
+        if (_durable) {
+            _journalFlusher = std::make_unique<WiredTigerJournalFlusher>(_sessionCache.get());
+            _journalFlusher->go();
+        }
+        if (!_readOnly) {
+            _checkpointThread =
+                std::make_unique<WiredTigerCheckpointThread>(this, _sessionCache.get());
+            _checkpointThread->go();
+        }
+    }
 }
 
 void WiredTigerKVEngine::appendGlobalStats(BSONObjBuilder& b) {
@@ -890,7 +937,7 @@ void WiredTigerKVEngine::_openWiredTiger(const std::string& path, const std::str
 
     int ret = wiredtiger_open(path.c_str(), wtEventHandler, configStr.c_str(), &_conn);
     if (!ret) {
-        _fileVersion = {WiredTigerFileVersion::StartupVersion::IS_40};
+        _fileVersion = {WiredTigerFileVersion::StartupVersion::IS_42};
         return;
     }
 
@@ -1133,7 +1180,7 @@ int WiredTigerKVEngine::flushAllFiles(OperationContext* opCtx, bool sync) {
     const bool forceCheckpoint = true;
     // If there's no journal, we must take a full checkpoint.
     const bool stableCheckpoint = _durable;
-    _sessionCache->waitUntilDurable(forceCheckpoint, stableCheckpoint);
+    _sessionCache->waitUntilDurable(opCtx, forceCheckpoint, stableCheckpoint);
 
     return 1;
 }
@@ -1539,6 +1586,7 @@ std::unique_ptr<RecordStore> WiredTigerKVEngine::getGroupedRecordStore(
     params.cappedCallback = nullptr;
     params.sizeStorer = _sizeStorer.get();
     params.isReadOnly = _readOnly;
+    params.tracksSizeAdjustments = true;
 
     params.cappedMaxSize = -1;
     if (options.capped) {
@@ -1640,6 +1688,8 @@ std::unique_ptr<RecordStore> WiredTigerKVEngine::makeTemporaryRecordStore(Operat
     params.cappedCallback = nullptr;
     // Temporary collections do not need to persist size information to the size storer.
     params.sizeStorer = nullptr;
+    // Temporary collections do not need to reconcile collection size/counts.
+    params.tracksSizeAdjustments = false;
     params.isReadOnly = false;
 
     params.cappedMaxSize = -1;
@@ -2215,6 +2265,11 @@ Timestamp WiredTigerKVEngine::getPinnedOplog() const {
 
     // If getOplogNeededForRollback fails, don't truncate any oplog right now.
     return Timestamp::min();
+}
+
+std::unique_ptr<StorageEngine::CheckpointLock> WiredTigerKVEngine::getCheckpointLock(
+    OperationContext* opCtx) {
+    return std::make_unique<CheckpointLockImpl>(opCtx, _checkpointMutex);
 }
 
 bool WiredTigerKVEngine::supportsReadConcernSnapshot() const {

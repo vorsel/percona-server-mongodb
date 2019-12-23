@@ -554,6 +554,13 @@ void TransactionParticipant::Participant::beginOrContinueTransactionUnconditiona
     if (o().activeTxnNumber != txnNumber) {
         _beginMultiDocumentTransaction(opCtx, txnNumber);
     }
+
+    // Assume we need to write an abort if we abort this transaction.  This method is called only
+    // on secondaries (in which case we never write anything) and when a new primary knows about
+    // an in-progress transaction.  If a new primary knows about an in-progress transaction, it
+    // needs an abort oplog entry to be written if aborted (because the new primary could not
+    // have found out if there wasn't an oplog entry for the new primary).
+    p().needToWriteAbortEntry = true;
 }
 
 SharedSemiFuture<void> TransactionParticipant::Participant::onExitPrepare() const {
@@ -1040,11 +1047,11 @@ Timestamp TransactionParticipant::Participant::prepareTransaction(
 
         try {
             // This shouldn't cause deadlocks with other prepared txns, because the acquisition
-            // of RSTL lock inside abortActiveTransaction will be no-op since we already have it.
+            // of RSTL lock inside abortTransaction will be no-op since we already have it.
             // This abortGuard gets dismissed before we release the RSTL while transitioning to
             // prepared.
             UninterruptibleLockGuard noInterrupt(opCtx->lockState());
-            abortActiveTransaction(opCtx);
+            abortTransaction(opCtx);
         } catch (...) {
             // It is illegal for aborting a prepared transaction to fail for any reason, so we crash
             // instead.
@@ -1119,6 +1126,7 @@ Timestamp TransactionParticipant::Participant::prepareTransaction(
     }
     opCtx->recoveryUnit()->setPrepareTimestamp(prepareOplogSlot.getTimestamp());
     opCtx->getWriteUnitOfWork()->prepare();
+    p().needToWriteAbortEntry = true;
     opCtx->getServiceContext()->getOpObserver()->onTransactionPrepare(
         opCtx, reservedSlots, completedTransactionOperations);
 
@@ -1185,11 +1193,9 @@ std::vector<repl::ReplOperation>&
 TransactionParticipant::Participant::retrieveCompletedTransactionOperations(
     OperationContext* opCtx) {
 
-    // Ensure that we only ever retrieve a transaction's completed operations when in progress,
-    // committing with prepare, or prepared.
-    invariant(o().txnState.isInSet(TransactionState::kInProgress |
-                                   TransactionState::kCommittingWithPrepare |
-                                   TransactionState::kPrepared),
+    // Ensure that we only ever retrieve a transaction's completed operations when in progress
+    // or prepared.
+    invariant(o().txnState.isInSet(TransactionState::kInProgress | TransactionState::kPrepared),
               str::stream() << "Current state: " << o().txnState);
 
     return p().transactionOperations;
@@ -1203,9 +1209,8 @@ TxnResponseMetadata TransactionParticipant::Participant::getResponseMetadata() {
 }
 
 void TransactionParticipant::Participant::clearOperationsInMemory(OperationContext* opCtx) {
-    // Ensure that we only ever end a transaction when committing with prepare or in progress.
-    invariant(o().txnState.isInSet(TransactionState::kCommittingWithPrepare |
-                                   TransactionState::kInProgress),
+    // Ensure that we only ever end a prepared or in-progress transaction.
+    invariant(o().txnState.isInSet(TransactionState::kPrepared | TransactionState::kInProgress),
               str::stream() << "Current state: " << o().txnState);
     invariant(p().autoCommit);
     p().transactionOperationBytes = 0;
@@ -1234,22 +1239,11 @@ void TransactionParticipant::Participant::commitUnpreparedTransaction(OperationC
     auto needsNoopWrite = txnOps.empty() && !opCtx->getWriteConcern().usedDefault;
 
     clearOperationsInMemory(opCtx);
-    {
-        stdx::lock_guard<Client> lk(*opCtx->getClient());
-        // The oplog entry is written in the same WUOW with the data change for unprepared
-        // transactions.  We can still consider the state is InProgress until now, since no
-        // externally visible changes have been made yet by the commit operation. If anything throws
-        // before this point in the function, entry point will abort the transaction.
-        o(lk).txnState.transitionTo(TransactionState::kCommittingWithoutPrepare);
-    }
 
     try {
-        // Once entering "committing without prepare" we cannot throw an exception.
+        // Once committing we cannot throw an exception.
         UninterruptibleLockGuard noInterrupt(opCtx->lockState());
         _commitStorageTransaction(opCtx);
-        invariant(o().txnState.isCommittingWithoutPrepare(),
-                  str::stream() << "Current state: " << o().txnState);
-
         _finishCommitTransaction(opCtx);
     } catch (...) {
         // It is illegal for committing a transaction to fail for any reason, other than an
@@ -1321,11 +1315,6 @@ void TransactionParticipant::Participant::commitPreparedTransaction(
                 "oplog entry has been majority committed",
                 replCoord->getLastCommittedOpTime().getTimestamp() >= prepareTimestamp ||
                     MONGO_FAIL_POINT(skipCommitTxnCheckPrepareMajorityCommitted));
-    }
-
-    {
-        stdx::lock_guard<Client> lk(*opCtx->getClient());
-        o(lk).txnState.transitionTo(TransactionState::kCommittingWithPrepare);
     }
 
     try {
@@ -1434,26 +1423,22 @@ void TransactionParticipant::Participant::shutdown(OperationContext* opCtx) {
     o(lock).txnResourceStash = boost::none;
 }
 
-void TransactionParticipant::Participant::abortTransactionIfNotPrepared(OperationContext* opCtx) {
-    if (!o().txnState.isInProgress()) {
-        // We do not want to abort transactions that are prepared unless we get an
-        // 'abortTransaction' command.
-        return;
-    }
-
-    _abortTransactionOnSession(opCtx);
-}
-
 bool TransactionParticipant::Observer::expiredAsOf(Date_t when) const {
     return o().txnState.isInProgress() && o().transactionExpireDate &&
         o().transactionExpireDate < when;
 }
 
-void TransactionParticipant::Participant::abortActiveTransaction(OperationContext* opCtx) {
-    if (o().txnState.isPrepared()) {
+void TransactionParticipant::Participant::abortTransaction(OperationContext* opCtx) {
+    // Normally, absence of a transaction resource stash indicates an inactive transaction.
+    // However, in the case of a failed "unstash", an active transaction may exist without a stash
+    // and be killed externally.  In that case, the opCtx will not have a transaction number.
+    if (o().txnResourceStash || !opCtx->getTxnNumber()) {
+        // Aborting an inactive transaction.
+        _abortTransactionOnSession(opCtx);
+    } else if (o().txnState.isPrepared()) {
         _abortActivePreparedTransaction(opCtx);
     } else {
-        _abortActiveTransaction(opCtx, TransactionState::kInProgress, false);
+        _abortActiveTransaction(opCtx, TransactionState::kInProgress);
     }
 }
 
@@ -1476,40 +1461,12 @@ void TransactionParticipant::Participant::_abortActivePreparedTransaction(Operat
                 replCoord->canAcceptWritesForDatabase(opCtx, "admin"));
     }
 
-    _abortActiveTransaction(opCtx, TransactionState::kPrepared, true);
-}
-
-void TransactionParticipant::Participant::abortActiveUnpreparedOrStashPreparedTransaction(
-    OperationContext* opCtx) try {
-    if (o().txnState.isInSet(TransactionState::kNone | TransactionState::kCommitted |
-                             TransactionState::kExecutedRetryableWrite)) {
-        // If there is no active transaction, do nothing.
-        return;
-    }
-
-    // Stash the transaction if it's in prepared state.
-    if (o().txnState.isInSet(TransactionState::kPrepared)) {
-        _stashActiveTransaction(opCtx);
-        return;
-    }
-
-    _abortActiveTransaction(opCtx, TransactionState::kInProgress, false /* writeOplog */);
-} catch (...) {
-    // It is illegal for this to throw so we catch and log this here for diagnosability.
-    severe() << "Caught exception during transaction " << opCtx->getTxnNumber()
-             << " abort or stash on " << _sessionId().toBSON() << " in state " << o().txnState
-             << ": " << exceptionToStatus();
-    std::terminate();
-}
-
-void TransactionParticipant::Participant::abortTransactionForStepUp(OperationContext* opCtx) {
-    _abortActiveTransaction(opCtx, TransactionState::kInProgress, true);
+    _abortActiveTransaction(opCtx, TransactionState::kPrepared);
 }
 
 void TransactionParticipant::Participant::_abortActiveTransaction(
-    OperationContext* opCtx, TransactionState::StateSet expectedStates, bool writeOplog) {
+    OperationContext* opCtx, TransactionState::StateSet expectedStates) {
     invariant(!o().txnResourceStash);
-    invariant(!o().txnState.isCommittingWithPrepare());
 
     if (!o().txnState.isInRetryableWriteMode()) {
         stdx::lock_guard<Client> lk(*opCtx->getClient());
@@ -1522,7 +1479,7 @@ void TransactionParticipant::Participant::_abortActiveTransaction(
     // OpObserver.
     boost::optional<OplogSlotReserver> oplogSlotReserver;
     boost::optional<OplogSlot> abortOplogSlot;
-    if (opCtx->writesAreReplicated() && writeOplog) {
+    if (opCtx->writesAreReplicated() && p().needToWriteAbortEntry) {
         oplogSlotReserver.emplace(opCtx);
         abortOplogSlot = oplogSlotReserver->getLastSlot();
     }
@@ -1552,8 +1509,6 @@ void TransactionParticipant::Participant::_abortActiveTransaction(
 
         // Cannot abort these states unless they are specified in expectedStates explicitly.
         const auto unabortableStates = TransactionState::kPrepared  //
-            | TransactionState::kCommittingWithPrepare              //
-            | TransactionState::kCommittingWithoutPrepare           //
             | TransactionState::kCommitted;                         //
         invariant(!o().txnState.isInSet(unabortableStates),
                   str::stream() << "Cannot abort transaction in " << o().txnState);
@@ -1603,7 +1558,10 @@ void TransactionParticipant::Participant::_cleanUpTxnResourceOnOpCtx(
 
     // Reset the WUOW. We should be able to abort empty transactions that don't have WUOW.
     if (opCtx->getWriteUnitOfWork()) {
-        invariant(opCtx->lockState()->isRSTLLocked());
+        // We could have failed trying to get the initial global lock; in that case we will have a
+        // WriteUnitOfWork but not have allocated the storage transaction.  That is the only case
+        // where it is legal to abort a unit of work without the RSTL.
+        invariant(opCtx->lockState()->isRSTLLocked() || !opCtx->recoveryUnit()->inActiveTxn());
         opCtx->setWriteUnitOfWork(nullptr);
     }
 
@@ -1694,10 +1652,6 @@ std::string TransactionParticipant::TransactionState::toString(StateFlag state) 
             return "TxnState::InProgress";
         case TransactionParticipant::TransactionState::kPrepared:
             return "TxnState::Prepared";
-        case TransactionParticipant::TransactionState::kCommittingWithoutPrepare:
-            return "TxnState::CommittingWithoutPrepare";
-        case TransactionParticipant::TransactionState::kCommittingWithPrepare:
-            return "TxnState::CommittingWithPrepare";
         case TransactionParticipant::TransactionState::kCommitted:
             return "TxnState::Committed";
         case TransactionParticipant::TransactionState::kAbortedWithoutPrepare:
@@ -1727,7 +1681,7 @@ bool TransactionParticipant::TransactionState::_isLegalTransition(StateFlag oldS
             switch (newState) {
                 case kNone:
                 case kPrepared:
-                case kCommittingWithoutPrepare:
+                case kCommitted:
                 case kAbortedWithoutPrepare:
                     return true;
                 default:
@@ -1736,26 +1690,8 @@ bool TransactionParticipant::TransactionState::_isLegalTransition(StateFlag oldS
             MONGO_UNREACHABLE;
         case kPrepared:
             switch (newState) {
-                case kCommittingWithPrepare:
                 case kAbortedWithPrepare:
-                    return true;
-                default:
-                    return false;
-            }
-            MONGO_UNREACHABLE;
-        case kCommittingWithPrepare:
-            switch (newState) {
                 case kCommitted:
-                    return true;
-                default:
-                    return false;
-            }
-            MONGO_UNREACHABLE;
-        case kCommittingWithoutPrepare:
-            switch (newState) {
-                case kNone:
-                case kCommitted:
-                case kAbortedWithoutPrepare:
                     return true;
                 default:
                     return false;
@@ -1926,8 +1862,7 @@ void TransactionParticipant::Participant::_setNewTxnNumber(OperationContext* opC
                                                            const TxnNumber& txnNumber) {
     uassert(ErrorCodes::PreparedTransactionInProgress,
             "Cannot change transaction number while the session has a prepared transaction",
-            !o().txnState.isInSet(TransactionState::kPrepared |
-                                  TransactionState::kCommittingWithPrepare));
+            !o().txnState.isInSet(TransactionState::kPrepared));
 
     LOG_FOR_TRANSACTION(4) << "New transaction started with txnNumber: " << txnNumber
                            << " on session with lsid " << _sessionId().getId();
@@ -2072,6 +2007,7 @@ void TransactionParticipant::Participant::_resetTransactionState(
     o(wl).prepareOpTime = repl::OpTime();
     o(wl).recoveryPrepareOpTime = repl::OpTime();
     p().autoCommit = boost::none;
+    p().needToWriteAbortEntry = false;
 
     // Release any locks held by this participant and abort the storage transaction.
     o(wl).txnResourceStash = boost::none;
@@ -2082,30 +2018,12 @@ void TransactionParticipant::Participant::invalidate(OperationContext* opCtx) {
 
     uassert(ErrorCodes::PreparedTransactionInProgress,
             "Cannot invalidate prepared transaction",
-            !o().txnState.isInSet(TransactionState::kPrepared |
-                                  TransactionState::kCommittingWithPrepare));
+            !o().txnState.isInSet(TransactionState::kPrepared));
 
     // Invalidate the session and clear both the retryable writes and transactional states on
     // this participant.
     _invalidate(lg);
     _resetRetryableWriteState();
-    _resetTransactionState(lg, TransactionState::kNone);
-}
-
-void TransactionParticipant::Participant::abortPreparedTransactionForRollback(
-    OperationContext* opCtx) {
-    uassert(51030,
-            str::stream() << "Cannot call abortPreparedTransactionForRollback on unprepared "
-                          << "transaction.",
-            o().txnState.isPrepared());
-
-    stdx::lock_guard<Client> lg(*opCtx->getClient());
-
-    // It should be safe to clear transactionOperationBytes and transactionOperations because
-    // we only modify these variables when adding an operation to a transaction. Since this
-    // transaction is already prepared, we cannot add more operations to it. We will have this
-    // in the prepare oplog entry.
-    _invalidate(lg);
     _resetTransactionState(lg, TransactionState::kNone);
 }
 

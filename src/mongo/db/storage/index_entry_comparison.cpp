@@ -35,6 +35,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/storage/duplicate_key_error_info.h"
+#include "mongo/db/storage/key_string.h"
 
 namespace mongo {
 
@@ -168,6 +169,19 @@ BSONObj IndexEntryComparison::makeQueryObject(const BSONObj& keyPrefix,
     return bb.obj();
 }
 
+KeyString::Value IndexEntryComparison::makeKeyStringForSeekPoint(const IndexSeekPoint& seekPoint,
+                                                                 KeyString::Version version,
+                                                                 Ordering ord,
+                                                                 bool isForward) {
+    BSONObj key = IndexEntryComparison::makeQueryObject(seekPoint, isForward);
+
+    const auto discriminator = isForward ? KeyString::Discriminator::kExclusiveBefore
+                                         : KeyString::Discriminator::kExclusiveAfter;
+
+    KeyString::Builder builder(version, key, ord, discriminator);
+    return builder.getValueCopy();
+}
+
 Status buildDupKeyErrorStatus(const BSONObj& key,
                               const NamespaceString& collectionNamespace,
                               const std::string& indexName,
@@ -197,6 +211,17 @@ Status buildDupKeyErrorStatus(const BSONObj& key,
     auto keyValueWithName = builder.obj();
     sb << keyValueWithName;
     return Status(DuplicateKeyErrorInfo(keyPattern, keyValueWithName), sb.str());
+}
+
+Status buildDupKeyErrorStatus(const KeyString::Value& keyString,
+                              const NamespaceString& collectionNamespace,
+                              const std::string& indexName,
+                              const BSONObj& keyPattern,
+                              const Ordering& ordering) {
+    const BSONObj key = KeyString::toBson(
+        keyString.getBuffer(), keyString.getSize(), ordering, keyString.getTypeBits());
+
+    return buildDupKeyErrorStatus(key, collectionNamespace, indexName, keyPattern);
 }
 
 }  // namespace mongo

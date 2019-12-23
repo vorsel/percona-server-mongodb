@@ -4,6 +4,7 @@
 //   does_not_support_stepdowns,
 //   requires_fastcount,
 //   requires_getmore,
+//   uses_map_reduce_with_temp_collections,
 // ]
 
 t = db.mr1;
@@ -167,7 +168,7 @@ if (true) {
             correct[k] = 1;
         bulk.insert({x: i, tags: [k]});
     }
-    assert.writeOK(bulk.execute());
+    assert.commandWorked(bulk.execute());
 
     res = db.runCommand({mapreduce: "mr1", out: "mr1_foo", map: m, reduce: r});
     d(res);

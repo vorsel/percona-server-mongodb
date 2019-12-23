@@ -32,60 +32,40 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/catalog/database_holder.h"
-#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/index_consistency.h"
-#include "mongo/db/concurrency/d_concurrency.h"
+
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/index_names.h"
 #include "mongo/db/storage/durable_catalog.h"
-#include "mongo/db/storage/key_string.h"
-#include "mongo/db/storage/record_store.h"
-#include "mongo/db/storage/sorted_data_interface.h"
-#include "mongo/util/elapsed_tracker.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
 
 namespace {
 
-// The number of items we can scan before we must yield.
-static const int kScanLimit = 1000;
-static const size_t kNumHashBuckets = 1U << 16;
+const size_t kNumHashBuckets = 1U << 16;
 
 StringSet::hasher hash;
 
 }  // namespace
 
 IndexInfo::IndexInfo(const IndexDescriptor* descriptor)
-    : descriptor(descriptor),
+    : indexName(descriptor->indexName()),
+      keyPattern(descriptor->keyPattern()),
       indexNameHash(hash(descriptor->indexName())),
       ord(Ordering::make(descriptor->keyPattern())),
       ks(std::make_unique<KeyString::Builder>(KeyString::Version::kLatestVersion)) {}
 
-IndexConsistency::IndexConsistency(OperationContext* opCtx,
-                                   Collection* collection,
-                                   NamespaceString nss,
-                                   RecordStore* recordStore,
-                                   bool background)
-    : _opCtx(opCtx),
-      _collection(collection),
-      _nss(nss),
-      _recordStore(recordStore),
-      _tracker(opCtx->getServiceContext()->getFastClockSource(),
-               internalQueryExecYieldIterations.load(),
-               Milliseconds(internalQueryExecYieldPeriodMS.load())),
-      _firstPhase(true) {
+IndexConsistency::IndexConsistency(OperationContext* opCtx, Collection* coll) : _firstPhase(true) {
     _indexKeyCount.resize(kNumHashBuckets);
 
-    IndexCatalog* indexCatalog = _collection->getIndexCatalog();
     std::unique_ptr<IndexCatalog::IndexIterator> indexIterator =
-        indexCatalog->getIndexIterator(_opCtx, false);
+        coll->getIndexCatalog()->getIndexIterator(opCtx, false);
 
     while (indexIterator->more()) {
         const IndexDescriptor* descriptor = indexIterator->next()->descriptor();
-        if (DurableCatalog::get(opCtx)->isIndexReady(opCtx, nss, descriptor->indexName()))
+        if (DurableCatalog::get(opCtx)->isIndexReady(opCtx, coll->ns(), descriptor->indexName()))
             _indexesInfo.emplace(descriptor->indexName(), IndexInfo(descriptor));
     }
 }
@@ -208,10 +188,13 @@ void IndexConsistency::addIndexEntryErrors(ValidateResultsMap* indexNsResultsMap
     results->valid = false;
 }
 
-void IndexConsistency::addDocKey(const KeyString::Builder& ks,
-                                 IndexInfo* indexInfo,
-                                 RecordId recordId,
-                                 const BSONObj& indexKey) {
+void IndexConsistency::addDocKey(
+    OperationContext* opCtx,
+    const KeyString::Builder& ks,
+    IndexInfo* indexInfo,
+    RecordId recordId,
+    const std::unique_ptr<SeekableRecordThrottleCursor>& seekRecordStoreCursor,
+    const BSONObj& indexKey) {
     const uint32_t hash = _hashKeyString(ks, indexInfo->indexNameHash);
 
     if (_firstPhase) {
@@ -223,8 +206,7 @@ void IndexConsistency::addDocKey(const KeyString::Builder& ks,
         // Found a document key for a hash bucket that had mismatches.
 
         // Get the documents _id index key.
-        auto cursor = _recordStore->getCursor(_opCtx);
-        auto record = cursor->seekExact(recordId);
+        auto record = seekRecordStoreCursor->seekExact(opCtx, recordId);
         invariant(record);
 
         BSONObj data = record->data.toBson();
@@ -282,8 +264,8 @@ BSONObj IndexConsistency::_generateInfo(const IndexInfo& indexInfo,
                                         RecordId recordId,
                                         const BSONObj& indexKey,
                                         boost::optional<BSONElement> idKey) {
-    const std::string& indexName = indexInfo.descriptor->indexName();
-    const BSONObj& keyPattern = indexInfo.descriptor->keyPattern();
+    const std::string& indexName = indexInfo.indexName;
+    const BSONObj& keyPattern = indexInfo.keyPattern;
 
     // We need to rehydrate the indexKey for improved readability.
     // {"": ObjectId(...)} -> {"_id": ObjectId(...)}

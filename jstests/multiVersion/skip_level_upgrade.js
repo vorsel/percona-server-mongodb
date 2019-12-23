@@ -33,7 +33,8 @@ const defaultOptions = {
 const versions = [
     {binVersion: '3.2', testCollection: 'three_two'},
     {binVersion: '3.4', testCollection: 'three_four'},
-    {binVersion: '3.6', testCollection: 'three_six'}
+    {binVersion: '3.6', testCollection: 'three_six'},
+    {binVersion: '4.0', testCollection: 'four_zero'}
 ];
 
 // Iterate through versions specified in the versions list, and follow the steps outlined at
@@ -53,7 +54,7 @@ for (let i = 0; i < versions.length; i++) {
     // then shut it down.
     let testDB = conn.getDB('test');
     assert.commandWorked(testDB.createCollection(version.testCollection));
-    assert.writeOK(testDB[version.testCollection].insert({a: 1}));
+    assert.commandWorked(testDB[version.testCollection].insert({a: 1}));
     assert.commandWorked(testDB[version.testCollection].createIndex({a: 1}));
     MongoRunner.stopMongod(conn);
 

@@ -138,7 +138,6 @@ protected:
         });
     }
 
-    // TODO: SERVER-42654
     void expectSetFeatureCompatibilityVersion(const HostAndPort& target,
                                               StatusWith<BSONObj> response,
                                               BSONObj writeConcern) {
@@ -147,7 +146,7 @@ protected:
             ASSERT_EQ(request.dbname, "admin");
             ASSERT_BSONOBJ_EQ(request.cmdObj,
                               BSON("setFeatureCompatibilityVersion"
-                                   << "4.2"
+                                   << "4.4"
                                    << "writeConcern" << writeConcern));
 
             return response;
@@ -363,7 +362,7 @@ TEST_F(AddShardTest, CreateShardIdentityUpsertForAddShard) {
         << BSON("w"
                 << "majority"
                 << "wtimeout" << 60000)
-        << "allowImplicitCollectionCreation" << true);
+        << "allowImplicitCollectionCreation" << false);
     auto addShardCmd = add_shard_util::createAddShardCmd(operationContext(), shardName);
     auto actualBSON = add_shard_util::createShardIdentityUpsertForAddShard(addShardCmd);
     ASSERT_BSONOBJ_EQ(expectedBSON, actualBSON);

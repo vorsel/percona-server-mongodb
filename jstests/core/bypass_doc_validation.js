@@ -4,6 +4,7 @@
 //   does_not_support_stepdowns,
 //   requires_fastcount,
 //   requires_non_retryable_commands,
+//   uses_map_reduce_with_temp_collections,
 // ]
 
 /**
@@ -47,8 +48,8 @@ function runBypassDocumentValidationTest(validator) {
     coll.drop({writeConcern: {w: "majority"}});
 
     // Insert documents into the collection that would not be valid before setting 'validator'.
-    assert.writeOK(coll.insert({_id: 1}));
-    assert.writeOK(coll.insert({_id: 2}));
+    assert.commandWorked(coll.insert({_id: 1}));
+    assert.commandWorked(coll.insert({_id: 2}));
     assert.commandWorked(myDb.runCommand({collMod: collName, validator: validator}));
 
     const isMongos = db.runCommand({isdbgrid: 1}).isdbgrid;
@@ -117,7 +118,7 @@ function runBypassDocumentValidationTest(validator) {
     assertFailsValidation(BulkWriteResult(res));
     res = myDb.runCommand(
         {insert: collName, documents: [{}, {_id: 6}], bypassDocumentValidation: true});
-    assert.writeOK(res);
+    assert.commandWorked(res);
 
     // Test the update command.
     res = myDb.runCommand({
@@ -132,7 +133,7 @@ function runBypassDocumentValidationTest(validator) {
         updates: [{q: {}, u: {$set: {update: 1}}}],
         bypassDocumentValidation: true
     });
-    assert.writeOK(res);
+    assert.commandWorked(res);
     assert.eq(1, coll.count({update: 1}));
 
     // Pipeline-style update is only supported for commands and not for OP_UPDATE which cannot

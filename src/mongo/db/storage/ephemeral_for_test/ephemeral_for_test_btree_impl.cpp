@@ -87,7 +87,7 @@ public:
         invariant(_data->empty());
     }
 
-    Status addKey(const BSONObj& key, const RecordId& loc) {
+    Status _addKey(const BSONObj& key, const RecordId& loc) {
         // inserts should be in ascending (key, RecordId) order.
 
         invariant(loc.isValid());
@@ -111,12 +111,14 @@ public:
         return Status::OK();
     }
 
-    Status addKey(const KeyString::Value& keyString, const RecordId& loc) {
-        dassert(loc == KeyString::decodeRecordIdAtEnd(keyString.getBuffer(), keyString.getSize()));
+    Status addKey(const KeyString::Value& keyString) {
+        dassert(
+            KeyString::decodeRecordIdAtEnd(keyString.getBuffer(), keyString.getSize()).isValid());
+        RecordId loc = KeyString::decodeRecordIdAtEnd(keyString.getBuffer(), keyString.getSize());
 
         auto key = KeyString::toBson(keyString, _ordering);
 
-        return addKey(key, loc);
+        return _addKey(key, loc);
     }
 
 private:
@@ -235,11 +237,17 @@ public:
         return _currentKeySize + (sizeof(IndexKeyEntry) * _data->size());
     }
 
-    virtual Status dupKeyCheck(OperationContext* opCtx, const BSONObj& key) {
+    Status _dupKeyCheck(OperationContext* opCtx, const BSONObj& key) {
         invariant(!key.hasFieldNames());
         if (isDup(*_data, key))
             return buildDupKeyErrorStatus(key, _collectionNamespace, _indexName, _keyPattern);
         return Status::OK();
+    }
+
+    virtual Status dupKeyCheck(OperationContext* opCtx, const KeyString::Value& keyString) {
+        const BSONObj key = KeyString::toBson(
+            keyString.getBuffer(), keyString.getSize(), _ordering, keyString.getTypeBits());
+        return _dupKeyCheck(opCtx, key);
     }
 
     virtual bool isEmpty(OperationContext* opCtx) {
@@ -253,11 +261,16 @@ public:
 
     class Cursor final : public SortedDataInterface::Cursor {
     public:
-        Cursor(OperationContext* opCtx, const IndexSet& data, bool isForward, bool isUnique)
+        Cursor(OperationContext* opCtx,
+               const IndexSet& data,
+               bool isForward,
+               bool isUnique,
+               const Ordering ordering)
             : _opCtx(opCtx),
               _data(data),
               _forward(isForward),
               _isUnique(isUnique),
+              _ordering(ordering),
               _it(data.end()) {}
 
         boost::optional<IndexKeyEntry> next(RequestedInfo parts) override {
@@ -291,7 +304,7 @@ public:
 
         boost::optional<IndexKeyEntry> seek(const BSONObj& key,
                                             bool inclusive,
-                                            RequestedInfo parts) override {
+                                            RequestedInfo) override {
             if (key.isEmpty()) {
                 _it = inclusive ? _data.begin() : _data.end();
                 _isEOF = (_it == _data.end());
@@ -311,16 +324,51 @@ public:
             return *_it;
         }
 
-        boost::optional<IndexKeyEntry> seek(const IndexSeekPoint& seekPoint,
-                                            RequestedInfo parts) override {
-            // Query encodes exclusive case so it can be treated as an inclusive query.
-            const BSONObj query = IndexEntryComparison::makeQueryObject(seekPoint, _forward);
+        boost::optional<IndexKeyEntry> seek(
+            const KeyString::Value& keyString,
+            RequestedInfo parts = RequestedInfo::kKeyAndLoc) override {
+            const BSONObj query = KeyString::toBsonSafeWithDiscriminator(
+                keyString.getBuffer(), keyString.getSize(), _ordering, keyString.getTypeBits());
             locate(query, _forward ? RecordId::min() : RecordId::max());
             _lastMoveWasRestore = false;
             if (_isEOF)
                 return {};
             dassert(compareKeys(_it->key, query) >= 0);
             return *_it;
+        }
+
+        boost::optional<KeyStringEntry> seekForKeyString(const KeyString::Value& keyStringValue) {
+            auto indexKeyEntry = seek(keyStringValue);
+            if (indexKeyEntry) {
+                KeyString::Builder builder(KeyString::Version::V1, indexKeyEntry->key, _ordering);
+                builder.appendRecordId(indexKeyEntry->loc);
+                return KeyStringEntry(builder.getValueCopy(), indexKeyEntry->loc);
+            } else {
+                return {};
+            }
+        }
+
+        boost::optional<IndexKeyEntry> seekExact(const BSONObj& key, RequestedInfo) {
+            auto kv = seek(key, true, kKeyAndLoc);
+            if (kv && kv->key.woCompare(key, BSONObj(), /*considerFieldNames*/ false) == 0)
+                return kv;
+            return {};
+        }
+
+        boost::optional<KeyStringEntry> seekExact(const KeyString::Value& keyStringValue) {
+            const BSONObj query = KeyString::toBson(keyStringValue.getBuffer(),
+                                                    keyStringValue.getSize(),
+                                                    _ordering,
+                                                    keyStringValue.getTypeBits());
+            auto kv = seekExact(query, kKeyAndLoc);
+            if (kv) {
+                // We have retrived a valid result from seekExact(). Convert to KeyString
+                // and return
+                KeyString::Builder ks(KeyString::Version::V1, kv->key, _ordering);
+                ks.appendRecordId(kv->loc);
+                return KeyStringEntry(ks.getValueCopy(), kv->loc);
+            }
+            return {};
         }
 
         void save() override {
@@ -478,6 +526,7 @@ public:
         const IndexSet& _data;
         const bool _forward;
         const bool _isUnique;
+        const Ordering _ordering;
         bool _isEOF = true;
         IndexSet::const_iterator _it;
 
@@ -502,7 +551,7 @@ public:
 
     virtual std::unique_ptr<SortedDataInterface::Cursor> newCursor(OperationContext* opCtx,
                                                                    bool isForward) const {
-        return std::make_unique<Cursor>(opCtx, *_data, isForward, _isUnique);
+        return std::make_unique<Cursor>(opCtx, *_data, isForward, _isUnique, _ordering);
     }
 
     virtual Status initAsEmpty(OperationContext* opCtx) {

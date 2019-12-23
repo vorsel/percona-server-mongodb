@@ -25,7 +25,10 @@ function configureReplSetFailpoint(name, modeValue) {
         assert.commandWorked(node.getDB("admin").runCommand({
             configureFailPoint: name,
             mode: modeValue,
-            data: {shouldCheckForInterrupt: true},
+            data: {
+                shouldCheckForInterrupt: true,
+                nss: kDbName + ".test",
+            },
         }));
     });
 }
@@ -131,9 +134,9 @@ function walkThroughBehavior({primaryFollows, secondaryFollows}) {
     dropConnections();
 }
 
-assert.writeOK(mongos.test.insert({x: 1}));
-assert.writeOK(mongos.test.insert({x: 2}));
-assert.writeOK(mongos.test.insert({x: 3}));
+assert.commandWorked(mongos.test.insert({x: 1}));
+assert.commandWorked(mongos.test.insert({x: 2}));
+assert.commandWorked(mongos.test.insert({x: 3}));
 st.rs0.awaitReplication();
 
 jsTestLog("Following disabled");

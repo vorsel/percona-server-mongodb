@@ -58,7 +58,8 @@ MONGO_FAIL_POINT_DEFINE(hangDuringIndexBuildDrainYield);
 IndexBuildInterceptor::IndexBuildInterceptor(OperationContext* opCtx, IndexCatalogEntry* entry)
     : _indexCatalogEntry(entry),
       _sideWritesTable(
-          opCtx->getServiceContext()->getStorageEngine()->makeTemporaryRecordStore(opCtx)) {
+          opCtx->getServiceContext()->getStorageEngine()->makeTemporaryRecordStore(opCtx)),
+      _sideWritesCounter(std::make_shared<AtomicWord<long long>>()) {
 
     if (entry->descriptor()->unique()) {
         _duplicateKeyTracker = std::make_unique<DuplicateKeyTracker>(opCtx, entry);
@@ -127,7 +128,7 @@ Status IndexBuildInterceptor::drainWritesIntoIndex(OperationContext* opCtx,
     // Force the progress meter to log at the end of every batch. By default, the progress meter
     // only logs after a large number of calls to hit(), but since we use such large batch sizes,
     // progress would rarely be displayed.
-    progress->reset(_sideWritesCounter.load() - appliedAtStart /* total */,
+    progress->reset(_sideWritesCounter->load() - appliedAtStart /* total */,
                     3 /* secondsBetween */,
                     1 /* checkInterval */);
 
@@ -217,7 +218,7 @@ Status IndexBuildInterceptor::drainWritesIntoIndex(OperationContext* opCtx,
         _tryYield(opCtx);
 
         // Account for more writes coming in during a batch.
-        progress->setTotalWhileRunning(_sideWritesCounter.loadRelaxed() - appliedAtStart);
+        progress->setTotalWhileRunning(_sideWritesCounter->loadRelaxed() - appliedAtStart);
         return Status::OK();
     };
 
@@ -256,7 +257,7 @@ Status IndexBuildInterceptor::_applyWrite(OperationContext* opCtx,
         key,
         _indexCatalogEntry->ordering(),
         opRecordId);
-    const KeyStringSet keySet{std::move(keyString.release())};
+    const KeyStringSet keySet{keyString.release()};
 
     auto accessMethod = _indexCatalogEntry->accessMethod();
     if (opType == Op::kInsert) {
@@ -286,7 +287,8 @@ Status IndexBuildInterceptor::_applyWrite(OperationContext* opCtx,
             [keysInserted, numInserted] { *keysInserted -= numInserted; });
     } else {
         invariant(opType == Op::kDelete);
-        DEV invariant(strcmp(operation.getStringField("op"), "d") == 0);
+        if (kDebugBuild)
+            invariant(strcmp(operation.getStringField("op"), "d") == 0);
 
         int64_t numDeleted;
         Status s = accessMethod->removeKeys(
@@ -310,7 +312,7 @@ void IndexBuildInterceptor::_tryYield(OperationContext* opCtx) {
     if (opCtx->lockState()->isCollectionLockedForMode(nss, MODE_S)) {
         return;
     }
-    DEV {
+    if (kDebugBuild) {
         invariant(!opCtx->lockState()->isCollectionLockedForMode(nss, MODE_X));
         invariant(!opCtx->lockState()->isDbLockedForMode(nss.db(), MODE_X));
     }
@@ -344,7 +346,7 @@ bool IndexBuildInterceptor::areAllWritesApplied(OperationContext* opCtx) const {
 
     // The table is empty only when all writes are applied.
     if (!record) {
-        auto writesRecorded = _sideWritesCounter.load();
+        auto writesRecorded = _sideWritesCounter->load();
         if (writesRecorded != _numApplied) {
             const std::string message = str::stream()
                 << "The number of side writes recorded does not match the number "
@@ -422,12 +424,13 @@ Status IndexBuildInterceptor::sideWrite(OperationContext* opCtx,
         }
     }
 
-    _sideWritesCounter.fetchAndAdd(toInsert.size());
+    _sideWritesCounter->fetchAndAdd(toInsert.size());
     // This insert may roll back, but not necessarily from inserting into this table. If other write
     // operations outside this table and in the same transaction are rolled back, this counter also
     // needs to be rolled back.
-    opCtx->recoveryUnit()->onRollback(
-        [this, size = toInsert.size()] { _sideWritesCounter.fetchAndSubtract(size); });
+    opCtx->recoveryUnit()->onRollback([sharedCounter = _sideWritesCounter, size = toInsert.size()] {
+        sharedCounter->fetchAndSubtract(size);
+    });
 
     std::vector<Record> records;
     for (auto& doc : toInsert) {

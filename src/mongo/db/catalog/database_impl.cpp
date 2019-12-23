@@ -397,7 +397,8 @@ Status DatabaseImpl::dropCollectionEvenIfSystem(OperationContext* opCtx,
             auto opTime = opObserver->onDropCollection(
                 opCtx, nss, uuid, numRecords, OpObserver::CollectionDropType::kOnePhase);
             // OpObserver::onDropCollection should not be writing to the oplog on the secondary.
-            invariant(opTime.isNull());
+            invariant(opTime.isNull(),
+                      str::stream() << "OpTime is not null. OpTime: " << opTime.toString());
         }
 
         return _finishDropCollection(opCtx, nss, collection);
@@ -433,7 +434,7 @@ Status DatabaseImpl::dropCollectionEvenIfSystem(OperationContext* opCtx,
 
     // Register this drop-pending namespace with DropPendingCollectionReaper to remove when the
     // committed optime reaches the drop optime.
-    repl::DropPendingCollectionReaper::get(opCtx)->addDropPendingNamespace(dropOpTime, dpns);
+    repl::DropPendingCollectionReaper::get(opCtx)->addDropPendingNamespace(opCtx, dropOpTime, dpns);
 
     return Status::OK();
 }
@@ -592,7 +593,9 @@ Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
 
     uassert(CannotImplicitlyCreateCollectionInfo(nss),
             "request doesn't allow collection to be created implicitly",
-            OperationShardingState::get(opCtx).allowImplicitCollectionCreation());
+            serverGlobalParams.clusterRole != ClusterRole::ShardServer ||
+                OperationShardingState::get(opCtx).allowImplicitCollectionCreation() ||
+                options.temp);
 
     auto coordinator = repl::ReplicationCoordinator::get(opCtx);
     bool canAcceptWrites =
@@ -758,7 +761,8 @@ void DatabaseImpl::checkForIdIndexesAndDropPendingCollections(OperationContext* 
         if (nss.isDropPendingNamespace()) {
             auto dropOpTime = fassert(40459, nss.getDropPendingNamespaceOpTime());
             log() << "Found drop-pending namespace " << nss << " with drop optime " << dropOpTime;
-            repl::DropPendingCollectionReaper::get(opCtx)->addDropPendingNamespace(dropOpTime, nss);
+            repl::DropPendingCollectionReaper::get(opCtx)->addDropPendingNamespace(
+                opCtx, dropOpTime, nss);
         }
 
         if (nss.isSystem())
@@ -829,11 +833,11 @@ Status DatabaseImpl::userCreateNS(OperationContext* opCtx,
         // Save this to a variable to avoid reading the atomic variable multiple times.
         const auto currentFCV = serverGlobalParams.featureCompatibility.getVersion();
 
-        // If the feature compatibility version is not 4.2, and we are validating features as
-        // master, ban the use of new agg features introduced in 4.2 to prevent them from being
+        // If the feature compatibility version is not 4.4, and we are validating features as
+        // master, ban the use of new agg features introduced in 4.4 to prevent them from being
         // persisted in the catalog.
         if (serverGlobalParams.validateFeaturesAsMaster.load() &&
-            currentFCV != ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42) {
+            currentFCV != ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
             expCtx->maxFeatureCompatibilityVersion = currentFCV;
         }
         auto statusWithMatcher =

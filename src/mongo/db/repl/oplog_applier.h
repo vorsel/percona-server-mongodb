@@ -71,17 +71,9 @@ public:
         bool relaxUniqueIndexConstraints = false;
         bool skipWritesToOplog = false;
 
-        // For initial sync only. If an update fails, the missing document is fetched from
-        // this sync source to insert into the local collection.
-        boost::optional<HostAndPort> missingDocumentSourceForInitialSync;
-
         // Used to determine which operations should be applied. Only initial sync will set this to
         // be something other than the null optime.
         OpTime beginApplyingOpTime = OpTime();
-
-        // For replication recovery only. During replication rollback, this is used to keep track
-        // of the stable timestamp from which we replay the oplog.
-        boost::optional<Timestamp> stableTimestampForRecovery;
 
         const OplogApplication::Mode mode;
     };
@@ -273,18 +265,15 @@ public:
      */
     virtual void onBatchEnd(const StatusWith<OpTime>& lastOpTimeApplied,
                             const OplogApplier::Operations& operations) = 0;
-
-    /**
-     * Called when documents are fetched and inserted into the collection in order to
-     * apply an update operation.
-     * Applies to initial sync only.
-     *
-     * TODO: Delegate fetching behavior to OplogApplier owner.
-     */
-    using FetchInfo = std::pair<OplogEntry, BSONObj>;
-    virtual void onMissingDocumentsFetchedAndInserted(
-        const std::vector<FetchInfo>& documentsFetchedAndInserted) = 0;
 };
+
+class NoopOplogApplierObserver : public repl::OplogApplier::Observer {
+public:
+    void onBatchBegin(const repl::OplogApplier::Operations&) final {}
+    void onBatchEnd(const StatusWith<repl::OpTime>&, const repl::OplogApplier::Operations&) final {}
+};
+
+extern NoopOplogApplierObserver noopOplogApplierObserver;
 
 }  // namespace repl
 }  // namespace mongo

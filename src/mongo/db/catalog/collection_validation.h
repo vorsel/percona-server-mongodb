@@ -29,7 +29,7 @@
 
 #pragma once
 
-#include "mongo/db/catalog/record_store_validate_adaptor.h"
+#include "mongo/db/catalog/validate_adaptor.h"
 
 namespace mongo {
 
@@ -42,14 +42,17 @@ class Status;
 namespace CollectionValidation {
 
 /**
- * Expects the caller to hold at least a collection IS lock.
+ * Expects the caller to hold no locks.
+ *
+ * Background validation does not support full validation and so the combination of level =
+ * 'kValidateTrue' and background = 'True' is prohibited.
  *
  * @return OK if the validate run successfully
  *         OK will be returned even if corruption is found
  *         details will be in 'results'.
  */
 Status validate(OperationContext* opCtx,
-                Collection* coll,
+                const NamespaceString& nss,
                 ValidateCmdLevel level,
                 bool background,
                 ValidateResults* results,

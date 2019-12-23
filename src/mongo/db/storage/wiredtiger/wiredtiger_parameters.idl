@@ -121,6 +121,18 @@ server_parameters:
         override_set: true
       condition: { expr: false }
 
+    wiredTigerEvictionDebugMode:
+      description: >-
+         If true, modify internal WiredTiger algorithms to force lookaside eviction to happen more
+         aggressively.
+      set_at: startup
+      cpp_vartype: 'bool'
+      cpp_varname: gWiredTigerEvictionDebugMode
+      default: false
+      # This parameter is only allowed in debug builds.
+      condition:
+        constexpr: 'kDebugBuild'
+
     wiredTigerFileHandleCloseIdleTime:
       description: >-
         The amount of time in seconds a file handle in WiredTiger needs to be idle before attempting
@@ -139,5 +151,15 @@ server_parameters:
       cpp_vartype: 'std::int32_t'
       cpp_varname: gWiredTigerFileHandleCloseMinimum
       default: 250
+      validator:
+        gte: 1
+
+    wiredTigerFileHandleCloseScanInterval:
+      description: >-
+        The interval in seconds at which WiredTiger checks for inactive files and closes them.
+      set_at: startup
+      cpp_vartype: 'std::int32_t'
+      cpp_varname: gWiredTigerFileHandleCloseScanInterval
+      default: 10
       validator:
         gte: 1

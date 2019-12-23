@@ -36,6 +36,7 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/session_catalog.h"
+#include "mongo/db/stats/single_transaction_stats.h"
 #include "mongo/s/async_requests_sender.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/shard_id.h"
@@ -133,15 +134,59 @@ public:
          */
         Microseconds getCommitDuration(TickSource* tickSource, TickSource::Tick curTicks) const;
 
+        /**
+         * Returns the total active time of the transaction, given the current time value. A
+         * transaction is active when there is a running operation that is part of the transaction.
+         */
+        Microseconds getTimeActiveMicros(TickSource* tickSource, TickSource::Tick curTicks) const;
+
+        /**
+         * Returns the total inactive time of the transaction, given the current time value. A
+         * transaction is inactive when it is idly waiting for a new operation to occur.
+         */
+        Microseconds getTimeInactiveMicros(TickSource* tickSource, TickSource::Tick curTicks) const;
+
+        /**
+         * Marks the transaction as active and sets the start of the transaction's active time and
+         * overall start time the first time it is called.
+         *
+         * This method is a no-op if the transaction is currently active or has already ended.
+         */
+        void trySetActive(OperationContext* opCtx, TickSource::Tick curTicks);
+
+        /**
+         * Marks the transaction as inactive and sets the total active time of the transaction. The
+         * total active time will only be set if the transaction was active prior to this call.
+         *
+         * This method is a no-op if the transaction is not currently active or has already ended.
+         */
+        void trySetInactive(TickSource* tickSource, TickSource::Tick curTicks);
+
+        // The start time of the transaction in millisecond resolution. Used only for diagnostics
+        // reporting.
+        Date_t startWallClockTime;
+
         // The start time of the transaction. Note that tick values should only ever be used to
-        // measure distance from other tick values, not for reporting absolute wall clock time.
+        // measure distance from other tick values, not for reporting absolute wall clock time. A
+        // value of zero means the transaction hasn't started yet.
         TickSource::Tick startTime{0};
 
-        // When commit was started.
+        // The start time of the transaction commit in millisecond resolution. Used only for
+        // diagnostics reporting.
+        Date_t commitStartWallClockTime;
+
+        // When commit was started. A value of zero means the commit hasn't started yet.
         TickSource::Tick commitStartTime{0};
 
-        // The end time of the transaction.
+        // The end time of the transaction. A value of zero means the transaction hasn't ended yet.
         TickSource::Tick endTime{0};
+
+        // The total amount of active time spent by the transaction.
+        Microseconds timeActiveMicros = Microseconds{0};
+
+        // The time at which the transaction was last marked as active. The transaction is
+        // considered active if this value is not equal to 0.
+        TickSource::Tick lastTimeActiveStart{0};
     };
 
     enum class TransactionActions { kStart, kContinue, kCommit };
@@ -197,12 +242,39 @@ public:
     public:
         explicit Observer(const ObservableSession& session);
 
+        /**
+         * Report the current state of an session. The sessionIsActive boolean indicates whether
+         * the session and transaction are currently active.
+         *
+         * The Client lock for the given OperationContext must be held when calling this method in
+         * the case where sessionIsActive is true.
+         */
+        BSONObj reportState(OperationContext* opCtx, bool sessionIsActive) const;
+        void reportState(OperationContext* opCtx,
+                         BSONObjBuilder* builder,
+                         bool sessionIsActive) const;
+
     protected:
         explicit Observer(TransactionRouter* tr) : _tr(tr) {}
 
         const TransactionRouter::ObservableState& o() const {
             return _tr->_o;
         }
+
+        // Reports the current state of the session using the provided builder.
+        void _reportState(OperationContext* opCtx,
+                          BSONObjBuilder* builder,
+                          bool sessionIsActive) const;
+
+        // Reports the 'transaction' state of this transaction for currentOp using the provided
+        // builder.
+        void _reportTransactionState(OperationContext* opCtx, BSONObjBuilder* builder) const;
+
+        // Returns true if the atClusterTime has been changed from the default uninitialized value.
+        bool _atClusterTimeHasBeenSet() const;
+
+        // Shortcut to obtain the id of the session under which this transaction router runs
+        const LogicalSessionId& _sessionId() const;
 
         TransactionRouter* _tr;
     };  // class Observer
@@ -226,6 +298,11 @@ public:
         void beginOrContinueTxn(OperationContext* opCtx,
                                 TxnNumber txnNumber,
                                 TransactionActions action);
+
+        /**
+         * Updates transaction diagnostics when the transaction's session is checked in.
+         */
+        void stash(OperationContext* opCtx);
 
         /**
          * Attaches the required transaction related fields for a request to be sent to the given
@@ -408,11 +485,6 @@ public:
         BSONObj _handOffCommitToCoordinator(OperationContext* opCtx);
 
         /**
-         * Returns true if the atClusterTime has been changed from the default uninitialized value.
-         */
-        bool _atClusterTimeHasBeenSet() const;
-
-        /**
          * Sets the given logical time as the atClusterTime for the transaction to be the greater of
          * the given time and the user's afterClusterTime, if one was provided.
          */
@@ -490,6 +562,11 @@ public:
         void _onNonRetryableCommitError(OperationContext* opCtx, Status commitStatus);
 
         /**
+         * Updates relevent metrics when a transaction is continued.
+         */
+        void _onContinue(OperationContext* opCtx);
+
+        /**
          * The first time this method is called it marks the transaction as over in the router's
          * diagnostics and will log transaction information if its duration is over the global
          * slowMS threshold or the transaction log componenet verbosity >= 1. Only meant to be
@@ -515,8 +592,15 @@ public:
         std::string _transactionInfoForLog(OperationContext* opCtx,
                                            TerminationCause terminationCause) const;
 
-        // Shortcut to obtain the id of the session under which this transaction router runs
-        const LogicalSessionId& _sessionId() const;
+        /**
+         * Returns the LastClientInfo object.
+         */
+        const SingleTransactionStats::LastClientInfo& _getLastClientInfo() const;
+
+        /**
+         * Updates the LastClientInfo object with the given Client's information.
+         */
+        void _updateLastClientInfo(Client* client);
 
         TransactionRouter::PrivateState& p() {
             return _tr->_p;
@@ -577,6 +661,10 @@ private:
 
         // Stats used for calculating durations for the active transaction.
         TimingStats timingStats;
+
+        // Information about the last client to run a transaction operation on this transaction
+        // router.
+        SingleTransactionStats::LastClientInfo lastClientInfo;
     } _o;
 
     /**

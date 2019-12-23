@@ -28,6 +28,8 @@ env.Library(
         "planner_wildcard_helpers.cpp",
         "planner_analysis.cpp",
         "planner_ixselect.cpp",
+        "projection_ast_util.cpp",
+        "projection_parser.cpp",
         "query_planner.cpp",
         "expression_index.cpp",
         "index_bounds.cpp",
@@ -86,6 +88,9 @@ env.Library(
         "query_planner",
         "query_request",
     ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/curop_failpoint_helpers',
+    ],
 )
 
 env.Library(
@@ -95,6 +100,17 @@ env.Library(
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/base",
+    ],
+)
+
+env.Library(
+    target='map_reduce_output_format',
+    source=[
+        'map_reduce_output_format.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/namespace_string',
     ],
 )
 
@@ -234,12 +250,14 @@ env.CppUnitTest(
         "killcursors_request_test.cpp",
         "killcursors_response_test.cpp",
         "lru_key_value_test.cpp",
+        'map_reduce_output_format_test.cpp',
         "parsed_distinct_test.cpp",
         "parsed_projection_test.cpp",
         "plan_cache_indexability_test.cpp",
         "plan_cache_test.cpp",
         "planner_analysis_test.cpp",
         "planner_ixselect_test.cpp",
+        "projection_ast_test.cpp",
         "query_planner_array_test.cpp",
         "query_planner_collation_test.cpp",
         "query_planner_geo_test.cpp",
@@ -266,6 +284,7 @@ env.CppUnitTest(
         "command_request_response",
         "explain_options",
         "hint_parser",
+        "map_reduce_output_format",
         "query_common",
         "query_planner",
         "query_planner_test_fixture",

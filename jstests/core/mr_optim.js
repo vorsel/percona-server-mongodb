@@ -3,6 +3,7 @@
 //   does_not_support_causal_consistency,
 //   does_not_support_stepdowns,
 //   requires_getmore,
+//   uses_map_reduce_with_temp_collections,
 // ]
 
 t = db.mr_optim;
@@ -18,7 +19,7 @@ if (res.ok !== 1) {
 }
 
 for (var i = 0; i < 1000; ++i) {
-    assert.writeOK(t.save({a: Math.random(1000), b: Math.random(10000)}));
+    assert.commandWorked(t.save({a: Math.random(1000), b: Math.random(10000)}));
 }
 
 function m() {

@@ -687,10 +687,8 @@ NamespaceString extractNsFromUUIDorNs(OperationContext* opCtx,
     return ui ? extractNsFromUUID(opCtx, ui) : extractNs(ns, cmd);
 }
 
-using OpApplyFn = std::function<Status(OperationContext* opCtx,
-                                       const OplogEntry& entry,
-                                       OplogApplication::Mode mode,
-                                       boost::optional<Timestamp> stableTimestampForRecovery)>;
+using OpApplyFn = std::function<Status(
+    OperationContext* opCtx, const OplogEntry& entry, OplogApplication::Mode mode)>;
 
 struct ApplyOpMetadata {
     OpApplyFn applyFunc;
@@ -708,10 +706,7 @@ struct ApplyOpMetadata {
 
 const StringMap<ApplyOpMetadata> kOpsMap = {
     {"create",
-     {[](OperationContext* opCtx,
-         const OplogEntry& entry,
-         OplogApplication::Mode mode,
-         boost::optional<Timestamp> stableTimestampForRecovery) -> Status {
+     {[](OperationContext* opCtx, const OplogEntry& entry, OplogApplication::Mode mode) -> Status {
           const auto& ui = entry.getUuid();
           const auto& cmd = entry.getObject();
           const NamespaceString nss(extractNs(entry.getNss(), cmd));
@@ -734,10 +729,7 @@ const StringMap<ApplyOpMetadata> kOpsMap = {
       },
       {ErrorCodes::NamespaceExists}}},
     {"createIndexes",
-     {[](OperationContext* opCtx,
-         const OplogEntry& entry,
-         OplogApplication::Mode mode,
-         boost::optional<Timestamp> stableTimestampForRecovery) -> Status {
+     {[](OperationContext* opCtx, const OplogEntry& entry, OplogApplication::Mode mode) -> Status {
           const auto& cmd = entry.getObject();
           const NamespaceString nss(
               extractNsFromUUIDorNs(opCtx, entry.getNss(), entry.getUuid(), cmd));
@@ -756,10 +748,7 @@ const StringMap<ApplyOpMetadata> kOpsMap = {
        ErrorCodes::IndexBuildAlreadyInProgress,
        ErrorCodes::NamespaceNotFound}}},
     {"startIndexBuild",
-     {[](OperationContext* opCtx,
-         const OplogEntry& entry,
-         OplogApplication::Mode mode,
-         boost::optional<Timestamp> stableTimestampForRecovery) -> Status {
+     {[](OperationContext* opCtx, const OplogEntry& entry, OplogApplication::Mode mode) -> Status {
          // {
          //     "startIndexBuild" : "coll",
          //     "indexBuildUUID" : <UUID>,
@@ -813,69 +802,66 @@ const StringMap<ApplyOpMetadata> kOpsMap = {
          return startIndexBuild(opCtx, nss, collUUID, indexBuildUUID, indexesElem, mode);
      }}},
     {"commitIndexBuild",
-     {[](OperationContext* opCtx,
-         const OplogEntry& entry,
-         OplogApplication::Mode mode,
-         boost::optional<Timestamp> stableTimestampForRecovery) -> Status {
-         // {
-         //     "commitIndexBuild" : "coll",
-         //     "indexBuildUUID" : <UUID>,
-         //     "indexes" : [
-         //         {
-         //             "key" : {
-         //                 "x" : 1
-         //             },
-         //             "name" : "x_1",
-         //             "v" : 2
-         //         },
-         //         {
-         //             "key" : {
-         //                 "k" : 1
-         //             },
-         //             "name" : "k_1",
-         //             "v" : 2
-         //         }
-         //     ]
-         // }
+     {[](OperationContext* opCtx, const OplogEntry& entry, OplogApplication::Mode mode) -> Status {
+          // {
+          //     "commitIndexBuild" : "coll",
+          //     "indexBuildUUID" : <UUID>,
+          //     "indexes" : [
+          //         {
+          //             "key" : {
+          //                 "x" : 1
+          //             },
+          //             "name" : "x_1",
+          //             "v" : 2
+          //         },
+          //         {
+          //             "key" : {
+          //                 "k" : 1
+          //             },
+          //             "name" : "k_1",
+          //             "v" : 2
+          //         }
+          //     ]
+          // }
 
-         if (OplogApplication::Mode::kApplyOpsCmd == mode) {
-             return {ErrorCodes::CommandNotSupported,
-                     "The commitIndexBuild operation is not supported in applyOps mode"};
-         }
+          if (OplogApplication::Mode::kApplyOpsCmd == mode) {
+              return {ErrorCodes::CommandNotSupported,
+                      "The commitIndexBuild operation is not supported in applyOps mode"};
+          }
 
-         const auto& cmd = entry.getObject();
-         // Ensure the collection name is specified
-         BSONElement first = cmd.firstElement();
-         invariant(first.fieldNameStringData() == "commitIndexBuild");
-         uassert(ErrorCodes::InvalidNamespace,
-                 "commitIndexBuild value must be a string",
-                 first.type() == mongo::String);
+          const auto& cmd = entry.getObject();
+          // Ensure the collection name is specified
+          BSONElement first = cmd.firstElement();
+          invariant(first.fieldNameStringData() == "commitIndexBuild");
+          uassert(ErrorCodes::InvalidNamespace,
+                  "commitIndexBuild value must be a string",
+                  first.type() == mongo::String);
 
-         const NamespaceString nss(
-             extractNsFromUUIDorNs(opCtx, entry.getNss(), entry.getUuid(), cmd));
+          const NamespaceString nss(
+              extractNsFromUUIDorNs(opCtx, entry.getNss(), entry.getUuid(), cmd));
 
-         auto buildUUIDElem = cmd.getField("indexBuildUUID");
-         uassert(ErrorCodes::BadValue,
-                 "Error parsing 'commitIndexBuild' oplog entry, missing required field "
-                 "'indexBuildUUID'.",
-                 !buildUUIDElem.eoo());
-         UUID indexBuildUUID = uassertStatusOK(UUID::parse(buildUUIDElem));
+          auto buildUUIDElem = cmd.getField("indexBuildUUID");
+          uassert(ErrorCodes::BadValue,
+                  "Error parsing 'commitIndexBuild' oplog entry, missing required field "
+                  "'indexBuildUUID'.",
+                  !buildUUIDElem.eoo());
+          UUID indexBuildUUID = uassertStatusOK(UUID::parse(buildUUIDElem));
 
-         auto indexesElem = cmd.getField("indexes");
-         uassert(ErrorCodes::BadValue,
-                 "Error parsing 'commitIndexBuild' oplog entry, missing required field 'indexes'.",
-                 !indexesElem.eoo());
-         uassert(ErrorCodes::BadValue,
-                 "Error parsing 'commitIndexBuild' oplog entry, field 'indexes' must be an array.",
-                 indexesElem.type() == Array);
+          auto indexesElem = cmd.getField("indexes");
+          uassert(ErrorCodes::BadValue,
+                  "Error parsing 'commitIndexBuild' oplog entry, missing required field 'indexes'.",
+                  !indexesElem.eoo());
+          uassert(ErrorCodes::BadValue,
+                  "Error parsing 'commitIndexBuild' oplog entry, field 'indexes' must be an array.",
+                  indexesElem.type() == Array);
 
-         return commitIndexBuild(opCtx, nss, indexBuildUUID, indexesElem, mode);
-     }}},
+          return commitIndexBuild(opCtx, nss, indexBuildUUID, indexesElem, mode);
+      },
+      // TODO(SERVER-39239): Remove NamespaceNotFound from acceptable errors for commitIndexBuild.
+      // It should be impossible to commit an index build on a dropped collection.
+      {ErrorCodes::NamespaceNotFound}}},
     {"abortIndexBuild",
-     {[](OperationContext* opCtx,
-         const OplogEntry& entry,
-         OplogApplication::Mode mode,
-         boost::optional<Timestamp> stableTimestampForRecovery) -> Status {
+     {[](OperationContext* opCtx, const OplogEntry& entry, OplogApplication::Mode mode) -> Status {
          // {
          //     "abortIndexBuild" : "coll",
          //     "indexBuildUUID" : <UUID>,
@@ -931,10 +917,7 @@ const StringMap<ApplyOpMetadata> kOpsMap = {
          return abortIndexBuild(opCtx, indexBuildUUID, mode);
      }}},
     {"collMod",
-     {[](OperationContext* opCtx,
-         const OplogEntry& entry,
-         OplogApplication::Mode mode,
-         boost::optional<Timestamp> stableTimestampForRecovery) -> Status {
+     {[](OperationContext* opCtx, const OplogEntry& entry, OplogApplication::Mode mode) -> Status {
           NamespaceString nss;
           BSONObjBuilder resultWeDontCareAbout;
           const auto& cmd = entry.getObject();
@@ -945,18 +928,12 @@ const StringMap<ApplyOpMetadata> kOpsMap = {
       {ErrorCodes::IndexNotFound, ErrorCodes::NamespaceNotFound}}},
     {"dbCheck", {dbCheckOplogCommand, {}}},
     {"dropDatabase",
-     {[](OperationContext* opCtx,
-         const OplogEntry& entry,
-         OplogApplication::Mode mode,
-         boost::optional<Timestamp> stableTimestampForRecovery) -> Status {
+     {[](OperationContext* opCtx, const OplogEntry& entry, OplogApplication::Mode mode) -> Status {
           return dropDatabase(opCtx, entry.getNss().db().toString());
       },
       {ErrorCodes::NamespaceNotFound}}},
     {"drop",
-     {[](OperationContext* opCtx,
-         const OplogEntry& entry,
-         OplogApplication::Mode mode,
-         boost::optional<Timestamp> stableTimestampForRecovery) -> Status {
+     {[](OperationContext* opCtx, const OplogEntry& entry, OplogApplication::Mode mode) -> Status {
           BSONObjBuilder resultWeDontCareAbout;
           const auto& cmd = entry.getObject();
           auto nss = extractNsFromUUIDorNs(opCtx, entry.getNss(), entry.getUuid(), cmd);
@@ -982,10 +959,7 @@ const StringMap<ApplyOpMetadata> kOpsMap = {
       {ErrorCodes::NamespaceNotFound}}},
     // deleteIndex(es) is deprecated but still works as of April 10, 2015
     {"deleteIndex",
-     {[](OperationContext* opCtx,
-         const OplogEntry& entry,
-         OplogApplication::Mode mode,
-         boost::optional<Timestamp> stableTimestampForRecovery) -> Status {
+     {[](OperationContext* opCtx, const OplogEntry& entry, OplogApplication::Mode mode) -> Status {
           BSONObjBuilder resultWeDontCareAbout;
           const auto& cmd = entry.getObject();
           return dropIndexes(opCtx,
@@ -995,10 +969,7 @@ const StringMap<ApplyOpMetadata> kOpsMap = {
       },
       {ErrorCodes::NamespaceNotFound, ErrorCodes::IndexNotFound}}},
     {"deleteIndexes",
-     {[](OperationContext* opCtx,
-         const OplogEntry& entry,
-         OplogApplication::Mode mode,
-         boost::optional<Timestamp> stableTimestampForRecovery) -> Status {
+     {[](OperationContext* opCtx, const OplogEntry& entry, OplogApplication::Mode mode) -> Status {
           BSONObjBuilder resultWeDontCareAbout;
           const auto& cmd = entry.getObject();
           return dropIndexes(opCtx,
@@ -1008,10 +979,7 @@ const StringMap<ApplyOpMetadata> kOpsMap = {
       },
       {ErrorCodes::NamespaceNotFound, ErrorCodes::IndexNotFound}}},
     {"dropIndex",
-     {[](OperationContext* opCtx,
-         const OplogEntry& entry,
-         OplogApplication::Mode mode,
-         boost::optional<Timestamp> stableTimestampForRecovery) -> Status {
+     {[](OperationContext* opCtx, const OplogEntry& entry, OplogApplication::Mode mode) -> Status {
           BSONObjBuilder resultWeDontCareAbout;
           const auto& cmd = entry.getObject();
           return dropIndexes(opCtx,
@@ -1021,10 +989,7 @@ const StringMap<ApplyOpMetadata> kOpsMap = {
       },
       {ErrorCodes::NamespaceNotFound, ErrorCodes::IndexNotFound}}},
     {"dropIndexes",
-     {[](OperationContext* opCtx,
-         const OplogEntry& entry,
-         OplogApplication::Mode mode,
-         boost::optional<Timestamp> stableTimestampForRecovery) -> Status {
+     {[](OperationContext* opCtx, const OplogEntry& entry, OplogApplication::Mode mode) -> Status {
           BSONObjBuilder resultWeDontCareAbout;
           const auto& cmd = entry.getObject();
           return dropIndexes(opCtx,
@@ -1034,10 +999,7 @@ const StringMap<ApplyOpMetadata> kOpsMap = {
       },
       {ErrorCodes::NamespaceNotFound, ErrorCodes::IndexNotFound}}},
     {"renameCollection",
-     {[](OperationContext* opCtx,
-         const OplogEntry& entry,
-         OplogApplication::Mode mode,
-         boost::optional<Timestamp> stableTimestampForRecovery) -> Status {
+     {[](OperationContext* opCtx, const OplogEntry& entry, OplogApplication::Mode mode) -> Status {
           // Parse optime from oplog entry unless we are applying this command in standalone or on a
           // primary (replicated writes enabled).
           OpTime opTime;
@@ -1049,22 +1011,12 @@ const StringMap<ApplyOpMetadata> kOpsMap = {
       },
       {ErrorCodes::NamespaceNotFound, ErrorCodes::NamespaceExists}}},
     {"applyOps",
-     {[](OperationContext* opCtx,
-         const OplogEntry& entry,
-         OplogApplication::Mode mode,
-         boost::optional<Timestamp> stableTimestampForRecovery) -> Status {
-         // The 'applyOps' is either an implicit prepare oplog entry or is an entry that was not
-         // generated by a transaction. Partial and unprepared commit applyOps should
-         // have been dispatched before this point.
-         invariant(!entry.isPartialTransaction());
+     {[](OperationContext* opCtx, const OplogEntry& entry, OplogApplication::Mode mode) -> Status {
          return entry.shouldPrepare() ? applyPrepareTransaction(opCtx, entry, mode)
                                       : applyApplyOpsOplogEntry(opCtx, entry, mode);
      }}},
     {"convertToCapped",
-     {[](OperationContext* opCtx,
-         const OplogEntry& entry,
-         OplogApplication::Mode mode,
-         boost::optional<Timestamp> stableTimestampForRecovery) -> Status {
+     {[](OperationContext* opCtx, const OplogEntry& entry, OplogApplication::Mode mode) -> Status {
           const auto& cmd = entry.getObject();
           convertToCapped(opCtx,
                           extractNsFromUUIDorNs(opCtx, entry.getNss(), entry.getUuid(), cmd),
@@ -1073,27 +1025,18 @@ const StringMap<ApplyOpMetadata> kOpsMap = {
       },
       {ErrorCodes::NamespaceNotFound}}},
     {"emptycapped",
-     {[](OperationContext* opCtx,
-         const OplogEntry& entry,
-         OplogApplication::Mode mode,
-         boost::optional<Timestamp> stableTimestampForRecovery) -> Status {
+     {[](OperationContext* opCtx, const OplogEntry& entry, OplogApplication::Mode mode) -> Status {
           return emptyCapped(
               opCtx,
               extractNsFromUUIDorNs(opCtx, entry.getNss(), entry.getUuid(), entry.getObject()));
       },
       {ErrorCodes::NamespaceNotFound}}},
     {"commitTransaction",
-     {[](OperationContext* opCtx,
-         const OplogEntry& entry,
-         OplogApplication::Mode mode,
-         boost::optional<Timestamp> stableTimestampForRecovery) -> Status {
+     {[](OperationContext* opCtx, const OplogEntry& entry, OplogApplication::Mode mode) -> Status {
          return applyCommitTransaction(opCtx, entry, mode);
      }}},
     {"abortTransaction",
-     {[](OperationContext* opCtx,
-         const OplogEntry& entry,
-         OplogApplication::Mode mode,
-         boost::optional<Timestamp> stableTimestampForRecovery) -> Status {
+     {[](OperationContext* opCtx, const OplogEntry& entry, OplogApplication::Mode mode) -> Status {
          return applyAbortTransaction(opCtx, entry, mode);
      }}},
 };
@@ -1571,14 +1514,9 @@ Status applyOperation_inlock(OperationContext* opCtx,
 
 Status applyCommand_inlock(OperationContext* opCtx,
                            const OplogEntry& entry,
-                           OplogApplication::Mode mode,
-                           boost::optional<Timestamp> stableTimestampForRecovery) {
-    // We should only have a stableTimestampForRecovery during replication recovery.
-    invariant(stableTimestampForRecovery == boost::none ||
-              mode == OplogApplication::Mode::kRecovering);
+                           OplogApplication::Mode mode) {
     LOG(3) << "applying command op: " << redact(entry.toBSON())
-           << ", oplog application mode: " << OplogApplication::modeToString(mode)
-           << ", stable timestamp for recovery: " << stableTimestampForRecovery;
+           << ", oplog application mode: " << OplogApplication::modeToString(mode);
 
     // Only commands are processed here.
     invariant(entry.getOpType() == OpTypeEnum::kCommand);
@@ -1685,7 +1623,7 @@ Status applyCommand_inlock(OperationContext* opCtx,
                 // If 'writeTime' is not null, any writes in this scope will be given 'writeTime' as
                 // their timestamp at commit.
                 TimestampBlock tsBlock(opCtx, writeTime);
-                return curOpToApply.applyFunc(opCtx, entry, mode, stableTimestampForRecovery);
+                return curOpToApply.applyFunc(opCtx, entry, mode);
             } catch (const DBException& ex) {
                 return ex.toStatus();
             }

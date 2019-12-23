@@ -86,6 +86,20 @@ public:
     }
 
     /**
+     * Return the first path component.
+     */
+    StringData front() const {
+        return getFieldName(0);
+    }
+
+    /**
+     * Return the last path component.
+     */
+    StringData back() const {
+        return getFieldName(getPathLength() - 1);
+    }
+
+    /**
      * Return the ith field name from this path using zero-based indexes.
      */
     StringData getFieldName(size_t i) const {

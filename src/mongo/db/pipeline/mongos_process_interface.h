@@ -239,7 +239,7 @@ public:
                                            boost::optional<ChunkVersion> targetCollectionVersion,
                                            const NamespaceString& outputNs) const override;
 
-    std::pair<JsExecution*, bool> getJsExec() override {
+    std::pair<JsExecution*, bool> getJsExec(const BSONObj&) override {
         // Javascript engine is not support on mongos.
         MONGO_UNREACHABLE;
     }
@@ -254,10 +254,7 @@ protected:
 
     void _reportCurrentOpsForIdleSessions(OperationContext* opCtx,
                                           CurrentOpUserMode userMode,
-                                          std::vector<BSONObj>* ops) const final {
-        // This implementation is a no-op, since mongoS does not maintain a SessionCatalog or
-        // hold stashed locks for idle sessions.
-    }
+                                          std::vector<BSONObj>* ops) const final;
 };
 
 }  // namespace mongo

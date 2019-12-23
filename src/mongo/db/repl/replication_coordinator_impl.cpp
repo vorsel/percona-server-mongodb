@@ -754,6 +754,10 @@ void ReplicationCoordinatorImpl::_startDataReplication(OperationContext* opCtx,
         {
             // Must take the lock to set _initialSyncer, but not call it.
             stdx::lock_guard<stdx::mutex> lock(_mutex);
+            if (_inShutdown) {
+                log() << "Initial Sync not starting because replication is shutting down.";
+                return;
+            }
             initialSyncerCopy = std::make_shared<InitialSyncer>(
                 createInitialSyncerOptions(this, _externalState.get()),
                 std::make_unique<DataReplicatorExternalStateInitialSync>(this,
@@ -1474,6 +1478,10 @@ Status ReplicationCoordinatorImpl::_waitUntilOpTime(OperationContext* opCtx,
         // We wait only on primaries, because on secondaries, other mechanisms assure that the
         // last applied optime is always hole-free, and waiting for all earlier writes to be visible
         // can deadlock against secondary command application.
+        //
+        // Note that oplog queries by secondary nodes depend on this behavior to wait for
+        // all oplog holes to be filled in, despite providing an afterClusterTime field
+        // with Timestamp(0,1).
         _storage->waitForAllEarlierOplogWritesToBeVisible(opCtx, /* primaryOnly =*/true);
     }
 
@@ -2208,7 +2216,7 @@ bool ReplicationCoordinatorImpl::canAcceptNonLocalWrites() const {
 
 bool ReplicationCoordinatorImpl::canAcceptWritesFor(OperationContext* opCtx,
                                                     const NamespaceString& ns) {
-    invariant(opCtx->lockState()->isRSTLLocked());
+    invariant(opCtx->lockState()->isRSTLLocked(), ns.ns());
     return canAcceptWritesFor_UNSAFE(opCtx, ns);
 }
 
@@ -2952,7 +2960,7 @@ ReplicationCoordinatorImpl::_updateMemberStateFromTopologyCoordinator(WithLock l
     // receive the replicated version. This is to avoid bugs like SERVER-32639.
     if (newState.arbiter()) {
         serverGlobalParams.featureCompatibility.setVersion(
-            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44);
     }
 
     _memberState = newState;
@@ -3062,6 +3070,8 @@ void ReplicationCoordinatorImpl::CatchupState::start_inlock() {
         return;
     }
     _timeoutCbh = status.getValue();
+
+    _numCatchUpOps = 0;
 }
 
 void ReplicationCoordinatorImpl::CatchupState::abort_inlock(PrimaryCatchUpConclusionReason reason) {
@@ -3097,6 +3107,9 @@ void ReplicationCoordinatorImpl::CatchupState::signalHeartbeatUpdate_inlock() {
     if (*targetOpTime <= myLastApplied) {
         log() << "Caught up to the latest optime known via heartbeats after becoming primary. "
               << "Target optime: " << *targetOpTime << ". My Last Applied: " << myLastApplied;
+        // Report the number of ops applied during catchup in replSetGetStatus once the primary is
+        // caught up.
+        ReplicationMetrics::get(getGlobalServiceContext()).setNumCatchUpOps(_numCatchUpOps);
         abort_inlock(PrimaryCatchUpConclusionReason::kAlreadyCaughtUp);
         return;
     }
@@ -3131,11 +3144,18 @@ void ReplicationCoordinatorImpl::CatchupState::signalHeartbeatUpdate_inlock() {
         if (*targetOpTime <= myLastApplied) {
             log() << "Caught up to the latest known optime successfully after becoming primary. "
                   << "Target optime: " << *targetOpTime << ". My Last Applied: " << myLastApplied;
+            // Report the number of ops applied during catchup in replSetGetStatus once the primary
+            // is caught up.
+            ReplicationMetrics::get(getGlobalServiceContext()).setNumCatchUpOps(_numCatchUpOps);
             abort_inlock(PrimaryCatchUpConclusionReason::kSucceeded);
         }
     };
     _waiter = std::make_unique<CallbackWaiter>(*targetOpTime, targetOpTimeCB);
     _repl->_opTimeWaiterList.add_inlock(_waiter.get());
+}
+
+void ReplicationCoordinatorImpl::CatchupState::incrementNumCatchUpOps_inlock(int numOps) {
+    _numCatchUpOps += numOps;
 }
 
 Status ReplicationCoordinatorImpl::abortCatchupIfNeeded(PrimaryCatchUpConclusionReason reason) {
@@ -3145,6 +3165,13 @@ Status ReplicationCoordinatorImpl::abortCatchupIfNeeded(PrimaryCatchUpConclusion
         return Status::OK();
     }
     return Status(ErrorCodes::IllegalOperation, "The node is not in catch-up mode.");
+}
+
+void ReplicationCoordinatorImpl::incrementNumCatchUpOpsIfCatchingUp(int numOps) {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    if (_catchupState) {
+        _catchupState->incrementNumCatchUpOps_inlock(numOps);
+    }
 }
 
 void ReplicationCoordinatorImpl::signalDropPendingCollectionsRemovedFromStorage() {

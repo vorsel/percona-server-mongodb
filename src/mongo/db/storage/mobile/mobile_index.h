@@ -53,19 +53,9 @@ public:
     virtual ~MobileIndex() {}
 
     Status insert(OperationContext* opCtx,
-                  const BSONObj& key,
-                  const RecordId& recId,
-                  bool dupsAllowed) override;
-
-    Status insert(OperationContext* opCtx,
                   const KeyString::Value& keyString,
                   const RecordId& recId,
                   bool dupsAllowed) override;
-
-    void unindex(OperationContext* opCtx,
-                 const BSONObj& key,
-                 const RecordId& recId,
-                 bool dupsAllowed) override;
 
     void unindex(OperationContext* opCtx,
                  const KeyString::Value& keyString,
@@ -88,7 +78,7 @@ public:
 
     Status initAsEmpty(OperationContext* opCtx) override;
 
-    Status dupKeyCheck(OperationContext* opCtx, const BSONObj& key) override;
+    Status dupKeyCheck(OperationContext* opCtx, const KeyString::Value& key) override;
 
     // Beginning of MobileIndex-specific methods
 
@@ -108,7 +98,7 @@ public:
                     const ValueType& value,
                     bool isTransactional = true);
 
-    bool isUnique() {
+    bool isUnique() const {
         return _isUnique;
     }
 
@@ -117,7 +107,7 @@ public:
     }
 
 protected:
-    bool _isDup(OperationContext* opCtx, const BSONObj& key);
+    bool _isDup(OperationContext* opCtx, const KeyString::Value& key);
 
     /**
      * Performs the deletion from the table matching the given key.

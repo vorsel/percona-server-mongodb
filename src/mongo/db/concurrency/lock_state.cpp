@@ -760,7 +760,6 @@ bool LockerImpl::saveLockStateAndUnlock(Locker::LockSnapshot* stateOut) {
 
         // We should never have to save and restore metadata locks.
         invariant(RESOURCE_DATABASE == resType || RESOURCE_COLLECTION == resType ||
-                  (RESOURCE_GLOBAL == resType && isSharedLockMode(it->mode)) ||
                   (RESOURCE_PBWM == resType && isSharedLockMode(it->mode)) ||
                   (RESOURCE_RSTL == resType && it->mode == MODE_IX));
 
@@ -856,7 +855,7 @@ LockResult LockerImpl::lockBegin(OperationContext* opCtx, ResourceId resId, Lock
     } else if (resType != RESOURCE_MUTEX) {
         // This is all sanity checks that the global locks are always be acquired
         // before any other lock has been acquired and they must be in sync with the nesting.
-        DEV {
+        if (kDebugBuild) {
             const LockRequestsMap::Iterator itGlobal = _requests.find(resourceIdGlobal);
             invariant(itGlobal->recursiveCount > 0);
             invariant(itGlobal->mode != MODE_NONE);

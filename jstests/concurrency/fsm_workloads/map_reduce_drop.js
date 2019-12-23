@@ -41,8 +41,8 @@ var $config = (function() {
         function dropDB(db, collName) {
             var mapReduceDb = db.getSiblingDB(this.mapReduceDBName);
 
-            var res = mapReduceDb.dropDatabase();
-            assertAlways.commandWorked(res);
+            // Concurrent dropDatabase calls can result in transient errors.
+            mapReduceDb.dropDatabase();
         }
 
         function mapReduce(db, collName) {
@@ -58,7 +58,7 @@ var $config = (function() {
                 bulk.insert({key: Random.randInt(10000)});
             }
             var res = bulk.execute();
-            assertAlways.writeOK(res);
+            assertAlways.commandWorked(res);
 
             var options = {
                 finalize: function finalize(key, reducedValue) {

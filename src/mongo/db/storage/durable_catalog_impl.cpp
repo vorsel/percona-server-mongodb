@@ -31,11 +31,13 @@
 
 #include "mongo/db/storage/durable_catalog_impl.h"
 
+#include <fmt/format.h>
 #include <memory>
 #include <stdlib.h>
 
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/bson/util/builder.h"
+#include "mongo/db/catalog/index_timestamp_helper.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/namespace_string.h"
@@ -583,9 +585,26 @@ void DurableCatalogImpl::putMetaData(OperationContext* opCtx,
         if (obj["idxIdent"].isABSONObj())
             oldIdentMap = obj["idxIdent"].Obj();
 
-        // fix ident map
         for (size_t i = 0; i < md.indexes.size(); i++) {
-            string name = md.indexes[i].name();
+            const auto index = md.indexes[i];
+            string name = index.name();
+
+            // It is illegal for multikey paths to exist without the multikey flag set on the index,
+            // but it may be possible for multikey to be set on the index while having no multikey
+            // paths. If any of the paths are multikey, then the entire index should also be marked
+            // multikey.
+            const bool hasMultiKeyPaths =
+                std::any_of(index.multikeyPaths.begin(),
+                            index.multikeyPaths.end(),
+                            [](auto& pathSet) { return pathSet.size() > 0; });
+            invariant(!hasMultiKeyPaths || index.multikey,
+                      fmt::format("The 'multikey' field for index {} was false with non-empty "
+                                  "'multikeyPaths'. New metadata: {}, catalog document: {}",
+                                  name,
+                                  md.toBSON().toString(),
+                                  obj.toString()));
+
+            // fix ident map
             BSONElement e = oldIdentMap[name];
             if (e.type() == String) {
                 newIdentMap.append(e);
@@ -601,9 +620,14 @@ void DurableCatalogImpl::putMetaData(OperationContext* opCtx,
         obj = b.obj();
     }
 
+    if (IndexTimestampHelper::requiresGhostCommitTimestampForCatalogWrite(opCtx, nss) &&
+        !nss.isDropPendingNamespace()) {
+        opCtx->recoveryUnit()->setMustBeTimestamped();
+    }
+
     LOG(3) << "recording new metadata: " << obj;
     Status status = _rs->updateRecord(opCtx, loc, obj.objdata(), obj.objsize());
-    fassert(28521, status.isOK());
+    fassert(28521, status);
 }
 
 Status DurableCatalogImpl::_replaceEntry(OperationContext* opCtx,
@@ -628,7 +652,7 @@ Status DurableCatalogImpl::_replaceEntry(OperationContext* opCtx,
 
         BSONObj obj = b.obj();
         Status status = _rs->updateRecord(opCtx, loc, obj.objdata(), obj.objsize());
-        fassert(28522, status.isOK());
+        fassert(28522, status);
     }
 
     stdx::lock_guard<stdx::mutex> lk(_identsLock);
@@ -641,6 +665,11 @@ Status DurableCatalogImpl::_replaceEntry(OperationContext* opCtx,
 
     _idents.erase(fromIt);
     _idents[toNss.toString()] = Entry(old["ident"].String(), loc);
+
+    if (IndexTimestampHelper::requiresGhostCommitTimestampForCatalogWrite(opCtx, fromNss) &&
+        !fromNss.isDropPendingNamespace()) {
+        opCtx->recoveryUnit()->setMustBeTimestamped();
+    }
 
     return Status::OK();
 }

@@ -45,6 +45,7 @@
 namespace mongo {
 namespace {
 
+MONGO_FAIL_POINT_DEFINE(hangAfterStartingCoordinateCommit);
 MONGO_FAIL_POINT_DEFINE(participantReturnNetworkErrorForPrepareAfterExecutingPrepareLogic);
 
 class PrepareTransactionCmd : public TypedCommand<PrepareTransactionCmd> {
@@ -224,17 +225,19 @@ public:
             const auto& cmd = request();
             const auto tcs = TransactionCoordinatorService::get(opCtx);
 
-            boost::optional<Future<txn::CommitDecision>> coordinatorDecisionFuture;
+            // Coordinate the commit, or recover the commit decision from disk if this command was
+            // sent without a participant list.
+            auto coordinatorDecisionFuture = cmd.getParticipants().empty()
+                ? tcs->recoverCommit(opCtx, *opCtx->getLogicalSessionId(), *opCtx->getTxnNumber())
+                : tcs->coordinateCommit(opCtx,
+                                        *opCtx->getLogicalSessionId(),
+                                        *opCtx->getTxnNumber(),
+                                        validateParticipants(opCtx, cmd.getParticipants()));
 
-            if (!cmd.getParticipants().empty()) {
-                coordinatorDecisionFuture =
-                    tcs->coordinateCommit(opCtx,
-                                          *opCtx->getLogicalSessionId(),
-                                          *opCtx->getTxnNumber(),
-                                          validateParticipants(opCtx, cmd.getParticipants()));
-            } else {
-                coordinatorDecisionFuture = tcs->recoverCommit(
-                    opCtx, *opCtx->getLogicalSessionId(), *opCtx->getTxnNumber());
+            if (MONGO_FAIL_POINT(hangAfterStartingCoordinateCommit)) {
+                LOG(0) << "Hit hangAfterStartingCoordinateCommit failpoint";
+                MONGO_FAIL_POINT_PAUSE_WHILE_SET_OR_INTERRUPTED(opCtx,
+                                                                hangAfterStartingCoordinateCommit);
             }
 
             ON_BLOCK_EXIT([opCtx] {
@@ -280,16 +283,15 @@ public:
             {
                 MongoDOperationContextSession sessionTxnState(opCtx);
                 auto txnParticipant = TransactionParticipant::get(opCtx);
-
                 txnParticipant.beginOrContinue(opCtx,
                                                *opCtx->getTxnNumber(),
                                                false /* autocommit */,
                                                boost::none /* startTransaction */);
 
-                try {
-                    txnParticipant.abortTransactionIfNotPrepared(opCtx);
-                } catch (const ExceptionFor<ErrorCodes::TransactionCommitted>&) {
+                if (txnParticipant.transactionIsCommitted())
                     return;
+                if (txnParticipant.transactionIsInProgress()) {
+                    txnParticipant.abortTransaction(opCtx);
                 }
 
                 participantExitPrepareFuture = txnParticipant.onExitPrepare();

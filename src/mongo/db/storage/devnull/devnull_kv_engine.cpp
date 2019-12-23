@@ -169,11 +169,7 @@ class DevNullSortedDataBuilderInterface : public SortedDataBuilderInterface {
 public:
     DevNullSortedDataBuilderInterface() {}
 
-    virtual Status addKey(const BSONObj& key, const RecordId& loc) {
-        return Status::OK();
-    }
-
-    virtual Status addKey(const KeyString::Value& keyString, const RecordId& loc) {
+    virtual Status addKey(const KeyString::Value& keyString) {
         return Status::OK();
     }
 };
@@ -190,13 +186,6 @@ public:
     }
 
     virtual Status insert(OperationContext* opCtx,
-                          const BSONObj& key,
-                          const RecordId& loc,
-                          bool dupsAllowed) {
-        return Status::OK();
-    }
-
-    virtual Status insert(OperationContext* opCtx,
                           const KeyString::Value& keyString,
                           const RecordId& loc,
                           bool dupsAllowed) {
@@ -204,16 +193,11 @@ public:
     }
 
     virtual void unindex(OperationContext* opCtx,
-                         const BSONObj& key,
-                         const RecordId& loc,
-                         bool dupsAllowed) {}
-
-    virtual void unindex(OperationContext* opCtx,
                          const KeyString::Value& keyString,
                          const RecordId& loc,
                          bool dupsAllowed) {}
 
-    virtual Status dupKeyCheck(OperationContext* opCtx, const BSONObj& key) {
+    virtual Status dupKeyCheck(OperationContext* opCtx, const KeyString::Value& keyString) {
         return Status::OK();
     }
 

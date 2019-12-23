@@ -342,14 +342,59 @@ void BuilderBase<BufferT>::resetToKey(const BSONObj& obj,
 }
 
 template <class BufferT>
-void BuilderBase<BufferT>::appendBSONElement(const BSONElement& elem) {
-    const int elemIdx = _elemCount++;
-    const bool invert = (_ordering.get(elemIdx) == -1);
+void BuilderBase<BufferT>::appendBSONElement(const BSONElement& elem, const StringTransformFn& f) {
+    _verifyAppendingState();
+    _appendBsonValue(elem, _shouldInvertOnAppend(), nullptr, f);
+    _elemCount++;
+}
 
-    if (_state == BuildState::kEmpty) {
-        _transition(BuildState::kAppendingBSONElements);
-    }
-    _appendBsonValue(elem, invert, nullptr);
+template <class BufferT>
+void BuilderBase<BufferT>::appendString(StringData val) {
+    _verifyAppendingState();
+    _appendString(val, _shouldInvertOnAppend(), nullptr);
+    _elemCount++;
+}
+
+template <class BufferT>
+void BuilderBase<BufferT>::appendNumberDouble(double num) {
+    _verifyAppendingState();
+    _appendNumberDouble(num, _shouldInvertOnAppend());
+    _elemCount++;
+}
+
+template <class BufferT>
+void BuilderBase<BufferT>::appendNumberLong(long long num) {
+    _verifyAppendingState();
+    _appendNumberLong(num, _shouldInvertOnAppend());
+    _elemCount++;
+}
+
+template <class BufferT>
+void BuilderBase<BufferT>::appendNull() {
+    _verifyAppendingState();
+    _append(CType::kNullish, _shouldInvertOnAppend());
+    _elemCount++;
+}
+
+template <class BufferT>
+void BuilderBase<BufferT>::appendUndefined() {
+    _verifyAppendingState();
+    _append(CType::kUndefined, _shouldInvertOnAppend());
+    _elemCount++;
+}
+
+template <class BufferT>
+void BuilderBase<BufferT>::appendBinData(const BSONBinData& data) {
+    _verifyAppendingState();
+    _appendBinData(data, _shouldInvertOnAppend());
+    _elemCount++;
+}
+
+template <class BufferT>
+void BuilderBase<BufferT>::appendSetAsArray(const BSONElementSet& set, const StringTransformFn& f) {
+    _verifyAppendingState();
+    _appendSetAsArray(set, _shouldInvertOnAppend(), nullptr);
+    _elemCount++;
 }
 
 template <class BufferT>
@@ -409,6 +454,7 @@ void BuilderBase<BufferT>::_appendAllElementsForIndexing(const BSONObj& obj,
 
 template <class BufferT>
 void BuilderBase<BufferT>::appendRecordId(RecordId loc) {
+    _doneAppending();
     _transition(BuildState::kAppendedRecordID);
     // The RecordId encoding must be able to determine the full length starting from the last
     // byte, without knowing where the first byte is since it is stored at the end of a
@@ -494,10 +540,14 @@ void BuilderBase<BufferT>::_appendOID(OID val, bool invert) {
 }
 
 template <class BufferT>
-void BuilderBase<BufferT>::_appendString(StringData val, bool invert) {
+void BuilderBase<BufferT>::_appendString(StringData val, bool invert, const StringTransformFn& f) {
     _typeBits.appendString();
     _append(CType::kStringLike, invert);
-    _appendStringLike(val, invert);
+    if (f) {
+        _appendStringLike(f(val), invert);
+    } else {
+        _appendStringLike(val, invert);
+    }
 }
 
 template <class BufferT>
@@ -517,7 +567,7 @@ template <class BufferT>
 void BuilderBase<BufferT>::_appendCodeWString(const BSONCodeWScope& val, bool invert) {
     _append(CType::kCodeWithScope, invert);
     _appendStringLike(val.code, invert);
-    _appendBson(val.scope, invert);
+    _appendBson(val.scope, invert, nullptr);
 }
 
 template <class BufferT>
@@ -554,19 +604,35 @@ void BuilderBase<BufferT>::_appendDBRef(const BSONDBRef& val, bool invert) {
 }
 
 template <class BufferT>
-void BuilderBase<BufferT>::_appendArray(const BSONArray& val, bool invert) {
+void BuilderBase<BufferT>::_appendArray(const BSONArray& val,
+                                        bool invert,
+                                        const StringTransformFn& f) {
     _append(CType::kArray, invert);
-    BSONForEach(elem, val) {
+    for (const auto& elem : val) {
         // No generic ctype byte needed here since no name is encoded.
-        _appendBsonValue(elem, invert, nullptr);
+        _appendBsonValue(elem, invert, nullptr, f);
     }
     _append(int8_t(0), invert);
 }
 
 template <class BufferT>
-void BuilderBase<BufferT>::_appendObject(const BSONObj& val, bool invert) {
+void BuilderBase<BufferT>::_appendSetAsArray(const BSONElementSet& val,
+                                             bool invert,
+                                             const StringTransformFn& f) {
+    _append(CType::kArray, invert);
+    for (const auto& elem : val) {
+        // No generic ctype byte needed here since no name is encoded.
+        _appendBsonValue(elem, invert, nullptr, f);
+    }
+    _append(int8_t(0), invert);
+}
+
+template <class BufferT>
+void BuilderBase<BufferT>::_appendObject(const BSONObj& val,
+                                         bool invert,
+                                         const StringTransformFn& f) {
     _append(CType::kObject, invert);
-    _appendBson(val, invert);
+    _appendBson(val, invert, f);
 }
 
 template <class BufferT>
@@ -823,7 +889,8 @@ void BuilderBase<BufferT>::_appendNumberDecimal(const Decimal128 dec, bool inver
 template <class BufferT>
 void BuilderBase<BufferT>::_appendBsonValue(const BSONElement& elem,
                                             bool invert,
-                                            const StringData* name) {
+                                            const StringData* name,
+                                            const StringTransformFn& f) {
     if (name) {
         _appendBytes(name->rawData(), name->size() + 1, invert);  // + 1 for NUL
     }
@@ -841,13 +908,13 @@ void BuilderBase<BufferT>::_appendBsonValue(const BSONElement& elem,
             _appendNumberDouble(elem._numberDouble(), invert);
             break;
         case String:
-            _appendString(elem.valueStringData(), invert);
+            _appendString(elem.valueStringData(), invert, f);
             break;
         case Object:
-            _appendObject(elem.Obj(), invert);
+            _appendObject(elem.Obj(), invert, f);
             break;
         case Array:
-            _appendArray(BSONArray(elem.Obj()), invert);
+            _appendArray(BSONArray(elem.Obj()), invert, f);
             break;
         case BinData: {
             int len;
@@ -873,6 +940,13 @@ void BuilderBase<BufferT>::_appendBsonValue(const BSONElement& elem,
             _appendDBRef(BSONDBRef(elem.dbrefNS(), elem.dbrefOID()), invert);
             break;
         case Symbol:
+            if (f) {
+                uasserted(
+                    ErrorCodes::CannotBuildIndexKeys,
+                    str::stream()
+                        << "Cannot index type Symbol with a collation. Failed to index element: "
+                        << elem << ".");
+            }
             _appendSymbol(elem.valueStringData(), invert);
             break;
         case Code:
@@ -924,12 +998,14 @@ void BuilderBase<BufferT>::_appendStringLike(StringData str, bool invert) {
 }
 
 template <class BufferT>
-void BuilderBase<BufferT>::_appendBson(const BSONObj& obj, bool invert) {
+void BuilderBase<BufferT>::_appendBson(const BSONObj& obj,
+                                       bool invert,
+                                       const StringTransformFn& f) {
     BSONForEach(elem, obj) {
         // Force the order to be based on (ctype, name, value).
         _append(bsonTypeToGenericKeyStringType(elem.type()), invert);
         StringData name = elem.fieldNameStringData();
-        _appendBsonValue(elem, invert, &name);
+        _appendBsonValue(elem, invert, &name, f);
     }
     _append(int8_t(0), invert);
 }
@@ -2118,19 +2194,6 @@ TypeBits& TypeBits::operator=(const TypeBits& tb) {
     return *this;
 }
 
-Value& Value::operator=(const Value& other) {
-    if (&other == this) {
-        return *this;
-    }
-
-    _version = other._version;
-    _typeBits = other._typeBits;
-    _size = other._size;
-    _buffer = other._buffer;
-
-    return *this;
-}
-
 uint32_t TypeBits::readSizeFromBuffer(BufReader* reader) {
     const uint8_t firstByte = reader->peek<uint8_t>();
 
@@ -2317,6 +2380,94 @@ size_t getKeySize(const char* buffer, size_t len, Ordering ord, const TypeBits& 
     return (len - (remainingBytes - 1));
 }
 
+// Unlike toBsonSafe(), this function will convert the discriminator byte back.
+// This discriminator byte only exists in KeyStrings for queries, not in KeyStrings stored in an
+// index. This function is only used by EphemeralForTest because it uses BSON with discriminator
+// rather than KeyString to compare.
+BSONObj toBsonSafeWithDiscriminator(const char* buffer,
+                                    size_t len,
+                                    Ordering ord,
+                                    const TypeBits& typeBits) {
+    boost::optional<std::string> discriminatorBit;
+    int fieldNo = -1;
+
+    // First pass, get the discriminatorBit if there is any.
+    {
+        BSONObjBuilder builder;
+        BufReader reader(buffer, len);
+        TypeBits::Reader typeBitsReader(typeBits);
+        for (int i = 0; reader.remaining(); i++) {
+            const bool invert = (ord.get(i) == -1);
+            uint8_t ctype = readType<uint8_t>(&reader, invert);
+            if (ctype == kLess || ctype == kGreater) {
+                discriminatorBit = ctype == kLess ? "l" : "r";
+                fieldNo = i - 1;
+                ctype = readType<uint8_t>(&reader, invert);
+                invariant(ctype == kEnd);
+            }
+
+            if (ctype == kEnd) {
+                break;
+            }
+
+            toBsonValue(
+                ctype, &reader, &typeBitsReader, invert, typeBits.version, &(builder << ""), 1);
+        }
+        // Early return if there is no discriminatorBit.
+        if (!discriminatorBit)
+            return builder.obj();
+    }
+
+    // Second pass, add discriminatorBit as the fieldName.
+    {
+        BSONObjBuilder builder;
+        BufReader reader(buffer, len);
+        TypeBits::Reader typeBitsReader(typeBits);
+        for (int i = 0; reader.remaining(); i++) {
+            const bool invert = (ord.get(i) == -1);
+            uint8_t ctype = readType<uint8_t>(&reader, invert);
+            if (ctype == kLess || ctype == kGreater) {
+                ctype = readType<uint8_t>(&reader, invert);
+                invariant(ctype == kEnd);
+            }
+
+            if (ctype == kEnd) {
+                break;
+            }
+
+            auto fn = i == fieldNo ? discriminatorBit.get() : "";
+            toBsonValue(
+                ctype, &reader, &typeBitsReader, invert, typeBits.version, &(builder << fn), 1);
+        }
+        return builder.obj();
+    }
+}
+
+// This discriminator byte only exists in KeyStrings for queries, not in KeyStrings stored in an
+// index. This function is only used by Biggie because it needs to extract the discriminator to do
+// the query.
+Discriminator decodeDiscriminator(const char* buffer,
+                                  size_t len,
+                                  Ordering ord,
+                                  const TypeBits& typeBits) {
+    BSONObjBuilder builder;
+    BufReader reader(buffer, len);
+    TypeBits::Reader typeBitsReader(typeBits);
+    for (int i = 0; reader.remaining(); i++) {
+        const bool invert = (ord.get(i) == -1);
+        uint8_t ctype = readType<uint8_t>(&reader, invert);
+        if (ctype == kLess || ctype == kGreater) {
+            return ctype == kLess ? Discriminator::kExclusiveBefore
+                                  : Discriminator::kExclusiveAfter;
+        }
+
+        if (ctype == kEnd)
+            break;
+        toBsonValue(ctype, &reader, &typeBitsReader, invert, typeBits.version, &(builder << ""), 1);
+    }
+    return Discriminator::kInclusive;
+}
+
 BSONObj toBsonSafe(const char* buffer, size_t len, Ordering ord, const TypeBits& typeBits) {
     BSONObjBuilder builder;
     BufReader reader(buffer, len);
@@ -2382,6 +2533,12 @@ RecordId decodeRecordId(BufReader* reader) {
 }
 
 int compare(const char* leftBuf, const char* rightBuf, size_t leftSize, size_t rightSize) {
+    // memcmp has undefined behavior if either leftBuf or rightBuf is a null pointer.
+    if (MONGO_unlikely(leftSize == 0))
+        return rightSize == 0 ? 0 : -1;
+    else if (MONGO_unlikely(rightSize == 0))
+        return 1;
+
     int min = std::min(leftSize, rightSize);
 
     int cmp = memcmp(leftBuf, rightBuf, min);

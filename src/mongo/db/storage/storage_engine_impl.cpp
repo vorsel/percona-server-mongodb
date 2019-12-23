@@ -545,6 +545,11 @@ void StorageEngineImpl::cleanShutdown() {
 StorageEngineImpl::~StorageEngineImpl() {}
 
 void StorageEngineImpl::finishInit() {
+    // A storage engine may need to start threads that require OperationsContexts with real Lockers,
+    // as opposed to LockerNoops. Placing the start logic here, after the StorageEngine has been
+    // instantiated, causes makeOperationContext() to create LockerImpls instead of LockerNoops.
+    _engine->startAsyncThreads();
+
     if (_engine->supportsRecoveryTimestamp()) {
         _timestampMonitor = std::make_unique<TimestampMonitor>(
             _engine.get(), getGlobalServiceContext()->getPeriodicRunner());
@@ -666,6 +671,10 @@ void StorageEngineImpl::endNonBlockingBackup(OperationContext* opCtx) {
 StatusWith<std::vector<std::string>> StorageEngineImpl::extendBackupCursor(
     OperationContext* opCtx) {
     return _engine->extendBackupCursor(opCtx);
+}
+
+bool StorageEngineImpl::supportsCheckpoints() const {
+    return _engine->supportsCheckpoints();
 }
 
 bool StorageEngineImpl::isDurable() const {
@@ -862,11 +871,8 @@ void StorageEngineImpl::_onMinOfCheckpointAndOldestTimestampChanged(const Timest
             log() << "Removing drop-pending idents with drop timestamps before timestamp "
                   << timestamp;
             auto opCtx = cc().getOperationContext();
-            mongo::ServiceContext::UniqueOperationContext uOpCtx;
-            if (!opCtx) {
-                uOpCtx = cc().makeOperationContext();
-                opCtx = uOpCtx.get();
-            }
+            invariant(opCtx);
+
             _dropPendingIdentReaper.dropIdentsOlderThan(opCtx, timestamp);
         }
     }

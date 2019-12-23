@@ -33,8 +33,6 @@ bool runAggregationMapReduce(OperationContext* opCtx,
                              const std::string& dbname,
                              const BSONObj& cmd,
                              std::string& errmsg,
-                             BSONObjBuilder& result) {
-    return false;
-}
+                             BSONObjBuilder& result);
 
 }  // namespace mongo

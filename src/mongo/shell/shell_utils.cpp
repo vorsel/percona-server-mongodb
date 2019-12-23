@@ -121,6 +121,7 @@ extern const JSFile servers;
 extern const JSFile shardingtest;
 extern const JSFile servers_misc;
 extern const JSFile replsettest;
+extern const JSFile data_consistency_checker;
 extern const JSFile bridge;
 }  // namespace JSFiles
 
@@ -300,9 +301,7 @@ BSONObj JSGetMemInfo(const BSONObj& args, void* data) {
     return b.obj();
 }
 
-#if !defined(_WIN32)
-thread_local unsigned int _randomSeed = 0;
-#endif
+thread_local auto _prng = PseudoRandom(0);
 
 BSONObj JSSrand(const BSONObj& a, void* data) {
     unsigned int seed;
@@ -314,23 +313,13 @@ BSONObj JSSrand(const BSONObj& a, void* data) {
         std::unique_ptr<SecureRandom> rand(SecureRandom::create());
         seed = static_cast<unsigned int>(rand->nextInt64());
     }
-#if !defined(_WIN32)
-    _randomSeed = seed;
-#else
-    srand(seed);
-#endif
+    _prng = PseudoRandom(seed);
     return BSON("" << static_cast<double>(seed));
 }
 
 BSONObj JSRand(const BSONObj& a, void* data) {
     uassert(12519, "rand accepts no arguments", a.nFields() == 0);
-    unsigned r;
-#if !defined(_WIN32)
-    r = rand_r(&_randomSeed);
-#else
-    r = rand();
-#endif
-    return BSON("" << double(r) / (double(RAND_MAX) + 1));
+    return BSON("" << _prng.nextCanonicalDouble());
 }
 
 BSONObj isWindows(const BSONObj& a, void* data) {
@@ -406,8 +395,8 @@ BSONObj computeSHA256Block(const BSONObj& a, void* data) {
  * > sh.shardCollection("mydb.mycollection", { x: "hashed" })
  * > // And a sample object like so:
  * > var obj = { x: "Whatever key", y: 2, z: 10.0 }
- * > // The hashed value of the shard key can be acquired from the shard key-value pair like so:
- * > convertShardKeyToHashed({x: "Whatever key"})
+ * > // The hashed value of the shard key can be acquired by passing in the shard key value:
+ * > convertShardKeyToHashed("Whatever key")
  */
 BSONObj convertShardKeyToHashed(const BSONObj& a, void* data) {
     const auto& objEl = a[0];
@@ -528,6 +517,7 @@ void initScope(Scope& scope) {
     scope.execSetup(JSFiles::shardingtest);
     scope.execSetup(JSFiles::servers_misc);
     scope.execSetup(JSFiles::replsettest);
+    scope.execSetup(JSFiles::data_consistency_checker);
     scope.execSetup(JSFiles::bridge);
 
     initializeEnterpriseScope(scope);

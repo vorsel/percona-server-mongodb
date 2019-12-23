@@ -145,7 +145,6 @@ class DoNothingOplogApplierObserver : public repl::OplogApplier::Observer {
 public:
     void onBatchBegin(const repl::OplogApplier::Operations&) final {}
     void onBatchEnd(const StatusWith<repl::OpTime>&, const repl::OplogApplier::Operations&) final {}
-    void onMissingDocumentsFetchedAndInserted(const std::vector<FetchInfo>&) final {}
 };
 
 class StorageTimestampTest {
@@ -231,6 +230,9 @@ public:
             if (collRaii.getCollection()) {
                 WriteUnitOfWork wunit(_opCtx);
                 invariant(collRaii.getCollection()->truncate(_opCtx).isOK());
+                if (_opCtx->recoveryUnit()->getCommitTimestamp().isNull()) {
+                    ASSERT_OK(_opCtx->recoveryUnit()->setTimestamp(Timestamp(1, 1)));
+                }
                 collRaii.getCollection()->getIndexCatalog()->dropAllIndexes(_opCtx, false);
                 wunit.commit();
                 return;
@@ -238,6 +240,9 @@ public:
 
             AutoGetOrCreateDb dbRaii(_opCtx, nss.db(), LockMode::MODE_X);
             WriteUnitOfWork wunit(_opCtx);
+            if (_opCtx->recoveryUnit()->getCommitTimestamp().isNull()) {
+                ASSERT_OK(_opCtx->recoveryUnit()->setTimestamp(Timestamp(1, 1)));
+            }
             invariant(dbRaii.getDb()->createCollection(_opCtx, nss));
             wunit.commit();
         });
@@ -771,7 +776,7 @@ public:
 
         repl::OplogEntryBatch groupedInsertBatch(opPtrs.cbegin(), opPtrs.cend());
         ASSERT_OK(repl::SyncTail::syncApply(
-            _opCtx, groupedInsertBatch, repl::OplogApplication::Mode::kSecondary, boost::none));
+            _opCtx, groupedInsertBatch, repl::OplogApplication::Mode::kSecondary));
 
         for (std::int32_t idx = 0; idx < docsToInsert; ++idx) {
             OneOffRead oor(_opCtx, firstInsertTime.addTicks(idx).asTimestamp());
@@ -1374,7 +1379,6 @@ public:
         auto writerPool = repl::OplogApplier::makeWriterPool();
         repl::OplogApplier::Options options(repl::OplogApplication::Mode::kInitialSync);
         options.allowNamespaceNotFoundErrorsOnCrudOps = true;
-        options.missingDocumentSourceForInitialSync = HostAndPort("localhost", 123);
 
         repl::OplogApplierImpl oplogApplier(
             nullptr,  // task executor. not required for multiApply().
@@ -3139,7 +3143,7 @@ public:
 
         txnParticipant.unstashTransactionResources(_opCtx, "abortTransaction");
 
-        txnParticipant.abortActiveTransaction(_opCtx);
+        txnParticipant.abortTransaction(_opCtx);
 
         txnParticipant.stashTransactionResources(_opCtx);
         {
@@ -3361,7 +3365,7 @@ public:
         }
         txnParticipant.unstashTransactionResources(_opCtx, "abortTransaction");
 
-        txnParticipant.abortActiveTransaction(_opCtx);
+        txnParticipant.abortTransaction(_opCtx);
         assertNoStartOpTime();
 
         txnParticipant.stashTransactionResources(_opCtx);

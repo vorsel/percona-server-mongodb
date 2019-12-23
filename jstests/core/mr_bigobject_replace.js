@@ -5,6 +5,7 @@
 //   # mapReduce does not support afterClusterTime.
 //   does_not_support_causal_consistency,
 //   does_not_support_stepdowns,
+//   uses_map_reduce_with_temp_collections,
 // ]
 
 /**
@@ -45,7 +46,7 @@ function runTest(testOptions) {
     db.mr_bigobject_replace.drop();
 
     // Insert a document so the mapper gets run.
-    assert.writeOK(db.input.insert({}));
+    assert.commandWorked(db.input.insert({}));
 
     var res = db.runCommand(Object.extend({
         mapReduce: "input",

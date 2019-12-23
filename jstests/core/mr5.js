@@ -2,6 +2,7 @@
 //   # mapReduce does not support afterClusterTime.
 //   does_not_support_causal_consistency,
 //   does_not_support_stepdowns,
+//   uses_map_reduce_with_temp_collections,
 // ]
 
 (function() {
@@ -12,12 +13,12 @@ load("jstests/aggregation/extras/utils.js");  // For resultsEq.
 const t = db.mr5;
 t.drop();
 
-assert.writeOK(t.insert({"partner": 1, "visits": 9}));
-assert.writeOK(t.insert({"partner": 2, "visits": 9}));
-assert.writeOK(t.insert({"partner": 1, "visits": 11}));
-assert.writeOK(t.insert({"partner": 1, "visits": 30}));
-assert.writeOK(t.insert({"partner": 2, "visits": 41}));
-assert.writeOK(t.insert({"partner": 2, "visits": 41}));
+assert.commandWorked(t.insert({"partner": 1, "visits": 9}));
+assert.commandWorked(t.insert({"partner": 2, "visits": 9}));
+assert.commandWorked(t.insert({"partner": 1, "visits": 11}));
+assert.commandWorked(t.insert({"partner": 1, "visits": 30}));
+assert.commandWorked(t.insert({"partner": 2, "visits": 41}));
+assert.commandWorked(t.insert({"partner": 2, "visits": 41}));
 
 let mapper = function() {
     emit(this.partner, {stats: [this.visits]});

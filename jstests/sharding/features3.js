@@ -37,7 +37,7 @@ var bulk = dbForTest.foo.initializeUnorderedBulkOp();
 for (var i = 0; i < numDocs; i++) {
     bulk.insert({_id: i});
 }
-assert.writeOK(bulk.execute());
+assert.commandWorked(bulk.execute());
 
 var x = dbForTest.foo.stats();
 
@@ -48,7 +48,7 @@ assert.eq(numDocs, x.count, "total count");
 assert.eq(numDocs / 2, x.shards[s.shard0.shardName].count, "count on " + s.shard0.shardName);
 assert.eq(numDocs / 2, x.shards[s.shard1.shardName].count, "count on " + s.shard1.shardName);
 assert(x.totalIndexSize > 0);
-assert(x.totalSize > 0);
+assert(x.size > 0);
 
 // insert one doc into a non-sharded collection
 dbForTest.bar.insert({x: 1});

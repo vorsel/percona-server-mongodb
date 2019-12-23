@@ -283,7 +283,6 @@ Lock::CollectionLock::CollectionLock(OperationContext* opCtx,
                                      LockMode mode,
                                      Date_t deadline)
     : _opCtx(opCtx) {
-
     LockMode actualLockMode = mode;
     if (!supportsDocLocking()) {
         actualLockMode = isSharedLockMode(mode) ? MODE_S : MODE_X;
@@ -304,8 +303,6 @@ Lock::CollectionLock::CollectionLock(OperationContext* opCtx,
     // 'nsOrUUID' must be a UUID and dbName.
 
     auto& collectionCatalog = CollectionCatalog::get(opCtx);
-
-    NamespaceString prevResolvedNss;
     auto nss = collectionCatalog.resolveNamespaceStringOrUUID(nssOrUUID);
 
     // The UUID cannot move between databases so this one dassert is sufficient.
@@ -316,6 +313,7 @@ Lock::CollectionLock::CollectionLock(OperationContext* opCtx,
     // namespace from the UUID without the safety of a lock. Therefore, we will continue to re-lock
     // until the namespace we resolve from the UUID before and after taking the lock is the same.
     bool locked = false;
+    NamespaceString prevResolvedNss;
     do {
         if (locked) {
             _opCtx->lockState()->unlock(_id);

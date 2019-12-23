@@ -51,6 +51,7 @@ const BSONObj key5 = BSON("" << 5);
 const BSONObj key6 = BSON("" << 6);
 const BSONObj key7 = BSON(""
                           << "\x00");
+
 const BSONObj key8 = BSON(""
                           << "\xff");
 
@@ -91,6 +92,7 @@ public:
     virtual std::unique_ptr<SortedDataInterface> newSortedDataInterface(bool unique,
                                                                         bool partial) = 0;
 
+    virtual std::unique_ptr<SortedDataInterface> newIdIndexSortedDataInterface() = 0;
     /**
      * Creates a new SDI with some initial data.
      *
@@ -99,6 +101,10 @@ public:
     std::unique_ptr<SortedDataInterface> newSortedDataInterface(
         bool unique, bool partial, std::initializer_list<IndexKeyEntry> toInsert);
 };
+
+KeyString::Value makeKeyString(SortedDataInterface* sorted,
+                               BSONObj bsonKey,
+                               boost::optional<RecordId> rid = boost::none);
 
 /**
  * Inserts all entries in toInsert into index.

@@ -37,6 +37,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/record_id.h"
+#include "mongo/db/storage/key_string.h"
 
 namespace mongo {
 
@@ -79,6 +80,18 @@ inline bool operator==(const IndexKeyEntry& lhs, const IndexKeyEntry& rhs) {
 inline bool operator!=(const IndexKeyEntry& lhs, const IndexKeyEntry& rhs) {
     return !(lhs == rhs);
 }
+
+/**
+ * Represents KeyString struct containing a KeyString::Value and its RecordId
+ */
+struct KeyStringEntry {
+    KeyStringEntry(KeyString::Value ks, RecordId loc) : keyString(ks), loc(loc) {
+        invariant(loc == KeyString::decodeRecordIdAtEnd(ks.getBuffer(), ks.getSize()));
+    }
+
+    const KeyString::Value keyString;
+    const RecordId loc;
+};
 
 /**
  * Describes a query that can be compared against an IndexKeyEntry in a way that allows
@@ -219,6 +232,22 @@ public:
                                isForward ? 1 : -1);
     }
 
+    /**
+     * Encodes the SeekPoint into a Keystring object suitable to pass in to compare().
+     *
+     * A KeyString is used for seeking an iterator to a position in a sorted index. The difference
+     * between a query KeyString and the KeyStrings inserted into indexes is that query KeyString
+     * can be exclusive. This means that the first matching entry in the index is the first key in
+     * the index after the query. The meaning of "after" depends on isForward.
+     *
+     * Returned KeyString are for use in lookups only and should never be inserted into the
+     * database.
+     */
+    static KeyString::Value makeKeyStringForSeekPoint(const IndexSeekPoint& seekPoint,
+                                                      KeyString::Version version,
+                                                      Ordering ord,
+                                                      bool isForward);
+
 private:
     // Ordering is used in comparison() to compare BSONElements
     const Ordering _order;
@@ -232,5 +261,14 @@ Status buildDupKeyErrorStatus(const BSONObj& key,
                               const NamespaceString& collectionNamespace,
                               const std::string& indexName,
                               const BSONObj& keyPattern);
+
+/**
+ * Returns the formatted error status about the duplicate KeyString.
+ */
+Status buildDupKeyErrorStatus(const KeyString::Value& keyString,
+                              const NamespaceString& collectionNamespace,
+                              const std::string& indexName,
+                              const BSONObj& keyPattern,
+                              const Ordering& ordering);
 
 }  // namespace mongo

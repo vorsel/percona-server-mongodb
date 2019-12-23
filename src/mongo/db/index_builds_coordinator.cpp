@@ -780,13 +780,8 @@ void IndexBuildsCoordinator::_runIndexBuildInner(OperationContext* opCtx,
             // deadlock could result if the index build was attempting to acquire a Collection S or
             // X lock while a prepared transaction held a Collection IX lock, and a step down was
             // waiting to acquire the RSTL in mode X.
-            // We should only drop the RSTL while in FCV 4.2, as prepared transactions can only
-            // occur in FCV 4.2.
-            if (serverGlobalParams.featureCompatibility.getVersion() ==
-                ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42) {
-                const bool unlocked = opCtx->lockState()->unlockRSTLforPrepare();
-                invariant(unlocked);
-            }
+            const bool unlocked = opCtx->lockState()->unlockRSTLforPrepare();
+            invariant(unlocked);
             opCtx->runWithoutInterruptionExceptAtGlobalShutdown(
                 [&, this] { _buildIndex(opCtx, collection, *nss, replState, &collLock); });
         } else {
@@ -955,26 +950,19 @@ void IndexBuildsCoordinator::_buildIndex(
         _indexBuildsManager.checkIndexConstraintViolations(opCtx, replState->buildUUID));
 
     auto collectionUUID = replState->collectionUUID;
-    auto onCommitFn = MultiIndexBlock::kNoopOnCommitFn;
-    auto onCreateEachFn = MultiIndexBlock::kNoopOnCreateEachFn;
-    if (IndexBuildProtocol::kTwoPhase == replState->protocol) {
-        // Two-phase index builds write one oplog entry for all indexes that are completed.
-        onCommitFn = [&] {
-            opCtx->getServiceContext()->getOpObserver()->onCommitIndexBuild(
-                opCtx,
-                nss,
-                collectionUUID,
-                replState->buildUUID,
-                replState->indexSpecs,
-                false /* fromMigrate */);
-        };
-    } else {
-        // Single-phase index builds write an oplog entry per index being built.
-        onCreateEachFn = [opCtx, &nss, &collectionUUID](const BSONObj& spec) {
-            opCtx->getServiceContext()->getOpObserver()->onCreateIndex(
-                opCtx, nss, collectionUUID, spec, false);
-        };
-    }
+
+    // Generate both createIndexes and commitIndexBuild oplog entries.
+    // Secondaries currently interpret commitIndexBuild commands as noops.
+    auto opObserver = opCtx->getServiceContext()->getOpObserver();
+    auto fromMigrate = false;
+    auto onCommitFn = [&] {
+        opObserver->onCommitIndexBuild(
+            opCtx, nss, collectionUUID, replState->buildUUID, replState->indexSpecs, fromMigrate);
+    };
+
+    auto onCreateEachFn = [&](const BSONObj& spec) {
+        opObserver->onCreateIndex(opCtx, nss, collectionUUID, spec, fromMigrate);
+    };
 
     // Commit index build.
     uassertStatusOK(_indexBuildsManager.commitIndexBuild(

@@ -92,19 +92,9 @@ public:
                     bool readOnly);
 
     virtual Status insert(OperationContext* opCtx,
-                          const BSONObj& key,
-                          const RecordId& id,
-                          bool dupsAllowed);
-
-    virtual Status insert(OperationContext* opCtx,
                           const KeyString::Value& keyString,
                           const RecordId& id,
                           bool dupsAllowed);
-
-    virtual void unindex(OperationContext* opCtx,
-                         const BSONObj& key,
-                         const RecordId& id,
-                         bool dupsAllowed);
 
     virtual void unindex(OperationContext* opCtx,
                          const KeyString::Value& keyString,
@@ -117,7 +107,7 @@ public:
     virtual bool appendCustomStats(OperationContext* opCtx,
                                    BSONObjBuilder* output,
                                    double scale) const;
-    virtual Status dupKeyCheck(OperationContext* opCtx, const BSONObj& key);
+    virtual Status dupKeyCheck(OperationContext* opCtx, const KeyString::Value& keyString);
 
     virtual bool isEmpty(OperationContext* opCtx);
 
@@ -135,7 +125,7 @@ public:
 
     // WiredTigerIndex additions
 
-    virtual bool isDup(OperationContext* opCtx, WT_CURSOR* c, const BSONObj& key);
+    virtual bool isDup(OperationContext* opCtx, WT_CURSOR* c, const KeyString::Value& keyString);
 
     uint64_t tableId() const {
         return _tableId;
@@ -222,7 +212,7 @@ public:
 
     bool isTimestampSafeUniqueIdx() const override;
 
-    bool isDup(OperationContext* opCtx, WT_CURSOR* c, const BSONObj& key) override;
+    bool isDup(OperationContext* opCtx, WT_CURSOR* c, const KeyString::Value& keyString) override;
 
     Status _insert(OperationContext* opCtx,
                    WT_CURSOR* c,

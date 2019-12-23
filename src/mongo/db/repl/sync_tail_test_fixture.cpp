@@ -94,7 +94,6 @@ void SyncTailOpObserver::onCreateCollection(OperationContext* opCtx,
 OplogApplier::Options SyncTailTest::makeInitialSyncOptions() {
     OplogApplier::Options options(OplogApplication::Mode::kInitialSync);
     options.allowNamespaceNotFoundErrorsOnCrudOps = true;
-    options.missingDocumentSourceForInitialSync = HostAndPort("localhost", 123);
     return options;
 }
 
@@ -134,7 +133,7 @@ void SyncTailTest::setUp() {
     // test fixture does not create a featureCompatibilityVersion document from which to initialize
     // the server parameter.
     serverGlobalParams.featureCompatibility.setVersion(
-        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44);
 }
 
 void SyncTailTest::tearDown() {
@@ -193,9 +192,8 @@ void SyncTailTest::_testSyncApplyCrudOperation(ErrorCodes::Error expectedError,
     };
     ASSERT_TRUE(_opCtx->writesAreReplicated());
     ASSERT_FALSE(documentValidationDisabled(_opCtx.get()));
-    ASSERT_EQ(
-        SyncTail::syncApply(_opCtx.get(), &op, OplogApplication::Mode::kSecondary, boost::none),
-        expectedError);
+    ASSERT_EQ(SyncTail::syncApply(_opCtx.get(), &op, OplogApplication::Mode::kSecondary),
+              expectedError);
     ASSERT_EQ(applyOpCalled, expectedApplyOpCalled);
 }
 

@@ -67,7 +67,7 @@ class StorageEngineImpl final : public StorageEngineInterface, public StorageEng
 
 public:
     /**
-     * @param engine - ownership passes to me
+     * @param engine - ownership passes to me.
      */
     StorageEngineImpl(KVEngine* engine, StorageEngineOptions options = StorageEngineOptions());
 
@@ -106,6 +106,8 @@ public:
     virtual void endNonBlockingBackup(OperationContext* opCtx);
 
     virtual StatusWith<std::vector<std::string>> extendBackupCursor(OperationContext* opCtx);
+
+    virtual bool supportsCheckpoints() const override;
 
     virtual bool isDurable() const;
 
@@ -165,8 +167,6 @@ public:
 
     void setJournalListener(JournalListener* jl) final;
 
-    // ------ kv ------
-
     /**
      * A TimestampMonitor is used to listen for any changes in the timestamps implemented by the
      * storage engine and to notify any registered listeners upon changes to these timestamps.
@@ -224,19 +224,19 @@ public:
             }
 
         private:
-            void _onCheckpointTimestampChanged(Timestamp newTimestamp) noexcept {
+            void _onCheckpointTimestampChanged(Timestamp newTimestamp) {
                 _callback(newTimestamp);
             }
 
-            void _onOldestTimestampChanged(Timestamp newTimestamp) noexcept {
+            void _onOldestTimestampChanged(Timestamp newTimestamp) {
                 _callback(newTimestamp);
             }
 
-            void _onStableTimestampChanged(Timestamp newTimestamp) noexcept {
+            void _onStableTimestampChanged(Timestamp newTimestamp) {
                 _callback(newTimestamp);
             }
 
-            void _onMinOfCheckpointAndOldestTimestampChanged(Timestamp newTimestamp) noexcept {
+            void _onMinOfCheckpointAndOldestTimestampChanged(Timestamp newTimestamp) {
                 _callback(newTimestamp);
             }
 
@@ -311,6 +311,7 @@ public:
     KVEngine* getEngine() {
         return _engine.get();
     }
+
     const KVEngine* getEngine() const {
         return _engine.get();
     }
@@ -322,8 +323,13 @@ public:
     DurableCatalog* getCatalog() {
         return _catalog.get();
     }
+
     const DurableCatalog* getCatalog() const {
         return _catalog.get();
+    }
+
+    std::unique_ptr<CheckpointLock> getCheckpointLock(OperationContext* opCtx) {
+        return _engine->getCheckpointLock(opCtx);
     }
 
     /**

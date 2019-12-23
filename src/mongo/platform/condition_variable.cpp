@@ -30,9 +30,8 @@
 #include "mongo/platform/condition_variable.h"
 
 namespace mongo {
-void ConditionVariable::wait(lock_t& lock) {
-    _condvar.wait(lock);
-}
+
+std::unique_ptr<ConditionVariableActions> ConditionVariable::_conditionVariableActions;
 
 void ConditionVariable::notify_one() noexcept {
     _condvar.notify_one();
@@ -40,5 +39,10 @@ void ConditionVariable::notify_one() noexcept {
 
 void ConditionVariable::notify_all() noexcept {
     _condvar.notify_all();
+}
+
+void ConditionVariable::setConditionVariableActions(
+    std::unique_ptr<ConditionVariableActions> actions) {
+    _conditionVariableActions = std::move(actions);
 }
 }  // namespace mongo

@@ -87,7 +87,6 @@ public:
     }
 
     void onBatchEnd(const StatusWith<OpTime>&, const OplogApplier::Operations&) final {}
-    void onMissingDocumentsFetchedAndInserted(const std::vector<FetchInfo>&) final {}
 
     void complete(const OpTime& applyThroughOpTime) const {
         log() << "Applied " << _numOpsApplied << " operations in " << _numBatches
@@ -325,11 +324,11 @@ void ReplicationRecoveryImpl::_recoverFromUnstableCheckpoint(OperationContext* o
     //
     // Not waiting for checkpoint durability here can result in a scenario where the node takes
     // writes and persists them to the oplog, but crashes before a stable checkpoint persists a
-    // "recovery timestamp". The typical startup path for data-bearing nodes with 4.0 is to use
-    // the recovery timestamp to determine where to play oplog forward from. As this method shows,
-    // when a recovery timestamp does not exist, the applied through is used to determine where to
-    // start playing oplog entries from.
-    opCtx->recoveryUnit()->waitUntilUnjournaledWritesDurable();
+    // "recovery timestamp". The typical startup path for data-bearing nodes is to use the recovery
+    // timestamp to determine where to play oplog forward from. As this method shows, when a
+    // recovery timestamp does not exist, the applied through is used to determine where to start
+    // playing oplog entries from.
+    opCtx->recoveryUnit()->waitUntilUnjournaledWritesDurable(opCtx);
 }
 
 void ReplicationRecoveryImpl::_applyToEndOfOplog(OperationContext* opCtx,
@@ -361,15 +360,6 @@ void ReplicationRecoveryImpl::_applyToEndOfOplog(OperationContext* opCtx,
     OplogApplier::Options options(OplogApplication::Mode::kRecovering);
     options.allowNamespaceNotFoundErrorsOnCrudOps = true;
     options.skipWritesToOplog = true;
-    // During replication recovery, the stableTimestampForRecovery refers to the stable timestamp
-    // from which we replay the oplog.
-    // For startup recovery, this will be the recovery timestamp, which is the stable timestamp that
-    // the storage engine recovered to on startup. For rollback recovery, this will be the last
-    // stable timestamp, returned when we call recoverToStableTimestamp.
-    // We keep track of this for prepared transactions so that when we apply a commitTransaction
-    // oplog entry, we can check if it occurs before or after the stable timestamp and decide
-    // whether the operations would have already been reflected in the data.
-    options.stableTimestampForRecovery = oplogApplicationStartPoint;
     OplogApplierImpl oplogApplier(nullptr,
                                   &oplogBuffer,
                                   &stats,
@@ -514,7 +504,7 @@ void ReplicationRecoveryImpl::_truncateOplogIfNeededAndThenClearOplogTruncateAft
     // Clear the oplogTruncateAfterPoint now that we have removed any holes that might exist in the
     // oplog -- and so that we do not truncate future entries erroneously.
     _consistencyMarkers->setOplogTruncateAfterPoint(opCtx, {});
-    opCtx->recoveryUnit()->waitUntilDurable();
+    opCtx->recoveryUnit()->waitUntilDurable(opCtx);
 }
 
 }  // namespace repl

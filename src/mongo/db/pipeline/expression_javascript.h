@@ -44,11 +44,13 @@ namespace mongo {
  */
 class ExpressionInternalJsEmit final : public Expression {
 public:
-    Value evaluate(const Document& root, Variables* variables) const final;
     static boost::intrusive_ptr<Expression> parse(
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         BSONElement expr,
         const VariablesParseState& vps);
+
+    Value evaluate(const Document& root, Variables* variables) const final;
+
     Value serialize(bool explain) const final;
 
     void acceptVisitor(ExpressionVisitor* visitor) final {
@@ -56,21 +58,45 @@ public:
     }
 
 private:
-    const boost::intrusive_ptr<Expression>& _thisRef;
-
     ExpressionInternalJsEmit(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                              boost::intrusive_ptr<Expression> thisRef,
                              std::string funcSourceString);
 
-    // Vector needs to be a member on the class so that it can be attached to the JS scope in the
-    // constructor and stay alive through the lifetime of the Expression object.
-    std::vector<BSONObj> _emittedObjects{};
-
     void _doAddDependencies(DepsTracker* deps) const final override;
 
+    const boost::intrusive_ptr<Expression>& _thisRef;
     std::string _funcSource;
-    ScriptingFunction _func;
 
     static constexpr auto kExpressionName = "$_internalJsEmit"_sd;
+};
+
+/**
+ * This expression takes a Javascript function and an array of arguments to pass to it. It returns
+ * the return value of the Javascript function with the given arguments.
+ */
+class ExpressionInternalJs final : public Expression {
+public:
+    static boost::intrusive_ptr<Expression> parse(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        BSONElement expr,
+        const VariablesParseState& vps);
+
+    Value evaluate(const Document& root, Variables* variables) const final;
+
+    Value serialize(bool explain) const final;
+
+    void acceptVisitor(ExpressionVisitor* visitor) final {
+        return visitor->visit(this);
+    }
+
+private:
+    ExpressionInternalJs(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                         boost::intrusive_ptr<Expression> passedArgs,
+                         std::string funcSourceString);
+    void _doAddDependencies(DepsTracker* deps) const final override;
+
+    const boost::intrusive_ptr<Expression>& _passedArgs;
+    std::string _funcSource;
+    static constexpr auto kExpressionName = "$_internalJs"_sd;
 };
 }  // namespace mongo

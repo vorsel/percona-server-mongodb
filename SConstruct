@@ -27,8 +27,8 @@ import mongo.platform as mongo_platform
 import mongo.toolchain as mongo_toolchain
 import mongo.generators as mongo_generators
 
-EnsurePythonVersion(3, 5)
-EnsureSConsVersion(3, 0, 4)
+EnsurePythonVersion(3, 6)
+EnsureSConsVersion(3, 1, 1)
 
 from buildscripts import utils
 from buildscripts import moduleconfig
@@ -3824,7 +3824,14 @@ if get_option('install-mode') == 'hygienic':
                 "debug"
             ]
         ),
-        
+
+        ".pdb": env.SuffixMap(
+            directory="$PREFIX_DEBUGDIR",
+            default_roles=[
+                "debug"
+            ]
+        ),
+
         ".lib": env.SuffixMap(
             directory="$PREFIX_LIBDIR",
             default_roles=[
@@ -3840,10 +3847,21 @@ if get_option('install-mode') == 'hygienic':
         ),
     })
 
+    if env.TargetOSIs('windows'):
+        # On windows, we want the runtime role to depend on the debug role so that PDBs
+        # end in the runtime package.
+        env.AddRoleDependencies(role="runtime", dependencies=["debug"])
+
     env.AddPackageNameAlias(
         component="dist",
         role="runtime",
         name="${{SERVER_DIST_BASENAME[{PREFIX_LEN}:]}}".format(PREFIX_LEN=len(env.get("AIB_PACKAGE_PREFIX")))
+    )
+
+    env.AddPackageNameAlias(
+        component="dist",
+        role="debug",
+        name="${{SERVER_DIST_BASENAME[{PREFIX_LEN}:]}}-debugsymbols".format(PREFIX_LEN=len(env.get("AIB_PACKAGE_PREFIX")))
     )
 
     if env['PLATFORM'] == 'posix':
@@ -4215,8 +4233,10 @@ if get_option('install-mode') == 'hygienic':
     # the evergreen.yml make this decision
     if env.TargetOSIs("windows"):
         env.Alias("archive-dist", "zip-dist")
+        env.Alias("archive-dist-debug", "zip-dist-debug")
     else:
         env.Alias("archive-dist", "tar-dist")
+        env.Alias("archive-dist-debug", "tar-dist-debug")
 
 # We don't want installing files to cause them to flow into the cache,	
 # since presumably we can re-install them from the origin if needed.	

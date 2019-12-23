@@ -65,9 +65,9 @@
 #include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/initial_syncer.h"
 #include "mongo/db/repl/multiapplier.h"
-#include "mongo/db/repl/oplogreader.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/repl_set_config.h"
+#include "mongo/db/repl/replication_auth.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/transaction_oplog_application.h"
 #include "mongo/db/session.h"
@@ -206,7 +206,7 @@ void ApplyBatchFinalizerForJournal::_run() {
         }
 
         auto opCtx = cc().makeOperationContext();
-        opCtx->recoveryUnit()->waitUntilDurable();
+        opCtx->recoveryUnit()->waitUntilDurable(opCtx.get());
         _recordDurable(latestOpTimeAndWallTime);
     }
 }
@@ -276,8 +276,7 @@ LockMode fixLockModeForSystemDotViewsChanges(const NamespaceString& nss, LockMod
 // static
 Status SyncTail::syncApply(OperationContext* opCtx,
                            const OplogEntryBatch& batch,
-                           OplogApplication::Mode oplogApplicationMode,
-                           boost::optional<Timestamp> stableTimestampForRecovery) {
+                           OplogApplication::Mode oplogApplicationMode) {
     auto op = batch.getOp();
     // Count each log op application as a separate operation, for reporting purposes
     CurOp individualOp(opCtx);
@@ -361,8 +360,7 @@ Status SyncTail::syncApply(OperationContext* opCtx,
     } else if (opType == OpTypeEnum::kCommand) {
         return finishApply(writeConflictRetry(opCtx, "syncApply_command", nss.ns(), [&] {
             // A special case apply for commands to avoid implicit database creation.
-            Status status =
-                applyCommand_inlock(opCtx, op, oplogApplicationMode, stableTimestampForRecovery);
+            Status status = applyCommand_inlock(opCtx, op, oplogApplicationMode);
             incrementOpsAppliedStats();
             return status;
         }));
@@ -585,7 +583,16 @@ public:
 
     OpQueue getNextBatch(Seconds maxWaitTime) {
         stdx::unique_lock<stdx::mutex> lk(_mutex);
-        if (_ops.empty() && !_ops.mustShutdown()) {
+        // _ops can indicate the following cases:
+        // 1. A new batch is ready to consume.
+        // 2. Shutdown.
+        // 3. The batch has (or had) exhausted the buffer in draining mode.
+        // 4. Empty batch since the batch has/had exhausted the buffer but not in draining mode,
+        //    so there could be new oplog entries coming.
+        // 5. Empty batch since the batcher is still running.
+        //
+        // In case (4) and (5), we wait for up to "maxWaitTime".
+        if (_ops.empty() && !_ops.mustShutdown() && !_ops.termWhenExhausted()) {
             // We intentionally don't care about whether this returns due to signaling or timeout
             // since we do the same thing either way: return whatever is in _ops.
             (void)_cv.wait_for(lk, maxWaitTime.toSystemDuration());
@@ -594,7 +601,6 @@ public:
         OpQueue ops = std::move(_ops);
         _ops = OpQueue(0);
         _cv.notify_all();
-
         return ops;
     }
 
@@ -652,20 +658,45 @@ private:
                     if (_syncTail->inShutdown()) {
                         ops.setMustShutdownFlag();
                     } else {
-                        // Block up to 1 second. We still return true in this case because we want
-                        // this op to be the first in a new batch with a new start time.
+                        // Block up to 1 second.
                         _oplogBuffer->waitForData(Seconds(1));
                     }
                 }
             }
 
             if (ops.empty() && !ops.mustShutdown()) {
-                continue;  // Don't emit empty batches.
+                // Check whether we have drained the oplog buffer. The states checked here can be
+                // stale when it's used by the applier. signalDrainComplete() needs to check the
+                // applier is still draining in the same term to make sure these states have not
+                // changed.
+                auto replCoord = ReplicationCoordinator::get(cc().getServiceContext());
+                // Check the term first to detect DRAINING -> RUNNING -> DRAINING when signaling
+                // drain complete.
+                //
+                // Batcher can delay arbitrarily. After stepup, if the batcher drained the buffer
+                // and blocks when it's about to notify the applier to signal drain complete, the
+                // node may step down and fetch new data into the buffer and then step up again.
+                // Now the batcher will resume and let the applier signal drain complete even if
+                // the buffer has new data. Checking the term before and after ensures nothing
+                // changed in between.
+                auto termWhenBufferIsEmpty = replCoord->getTerm();
+                // Draining state guarantees the producer has already been fully stopped and no more
+                // operations will be pushed in to the oplog buffer until the applier state changes.
+                auto isDraining =
+                    replCoord->getApplierState() == ReplicationCoordinator::ApplierState::Draining;
+                // Check the oplog buffer after the applier state to ensure the producer is stopped.
+                if (isDraining && _oplogBuffer->isEmpty()) {
+                    ops.setTermWhenExhausted(termWhenBufferIsEmpty);
+                    log() << "Oplog buffer has been drained in term " << termWhenBufferIsEmpty;
+                } else {
+                    // Don't emit empty batches.
+                    continue;
+                }
             }
 
             stdx::unique_lock<stdx::mutex> lk(_mutex);
             // Block until the previous batch has been taken.
-            _cv.wait(lk, [&] { return _ops.empty(); });
+            _cv.wait(lk, [&] { return _ops.empty() && !_ops.termWhenExhausted(); });
             _ops = std::move(ops);
             _cv.notify_all();
             if (_ops.mustShutdown()) {
@@ -745,7 +776,6 @@ void SyncTail::_oplogApplication(ReplicationCoordinator* replCoord,
         // Transition to SECONDARY state, if possible.
         tryToGoLiveAsASecondary(&opCtx, replCoord, minValid);
 
-        long long termWhenBufferIsEmpty = replCoord->getTerm();
         // Blocks up to a second waiting for a batch to be ready to apply. If one doesn't become
         // ready in time, we'll loop again so we can do the above checks periodically.
         OpQueue ops = batcher->getNextBatch(Seconds(1));
@@ -757,8 +787,14 @@ void SyncTail::_oplogApplication(ReplicationCoordinator* replCoord,
             if (MONGO_FAIL_POINT(rsSyncApplyStop)) {
                 continue;
             }
-            // Signal drain complete if we're in Draining state and the buffer is empty.
-            replCoord->signalDrainComplete(&opCtx, termWhenBufferIsEmpty);
+            if (ops.termWhenExhausted()) {
+                // Signal drain complete if we're in Draining state and the buffer is empty.
+                // Since we check the states of batcher and oplog buffer without synchronization,
+                // they can be stale. We make sure the applier is still draining in the given term
+                // before and after the check, so that if the oplog buffer was exhausted, then
+                // it still will be.
+                replCoord->signalDrainComplete(&opCtx, *ops.termWhenExhausted());
+            }
             continue;  // Try again.
         }
 
@@ -837,154 +873,6 @@ bool SyncTail::inShutdown() const {
     return _inShutdown;
 }
 
-BSONObj SyncTail::getMissingDoc(OperationContext* opCtx, const OplogEntry& oplogEntry) {
-    OplogReader missingObjReader;  // why are we using OplogReader to run a non-oplog query?
-
-    if (MONGO_FAIL_POINT(initialSyncHangBeforeGettingMissingDocument)) {
-        log() << "initial sync - initialSyncHangBeforeGettingMissingDocument fail point enabled. "
-                 "Blocking until fail point is disabled.";
-        while (MONGO_FAIL_POINT(initialSyncHangBeforeGettingMissingDocument)) {
-            mongo::sleepsecs(1);
-        }
-    }
-
-    auto source = _options.missingDocumentSourceForInitialSync;
-    invariant(source);
-
-    const int retryMax = 3;
-    for (int retryCount = 1; retryCount <= retryMax; ++retryCount) {
-        if (retryCount != 1) {
-            // if we are retrying, sleep a bit to let the network possibly recover
-            sleepsecs(retryCount * retryCount);
-        }
-        try {
-            bool ok = missingObjReader.connect(*source);
-            if (!ok) {
-                warning() << "network problem detected while connecting to the "
-                          << "sync source, attempt " << retryCount << " of " << retryMax;
-                continue;  // try again
-            }
-        } catch (const NetworkException&) {
-            warning() << "network problem detected while connecting to the "
-                      << "sync source, attempt " << retryCount << " of " << retryMax;
-            continue;  // try again
-        }
-
-        // get _id from oplog entry to create query to fetch document.
-        const auto idElem = oplogEntry.getIdElement();
-
-        if (idElem.eoo()) {
-            severe() << "cannot fetch missing document without _id field: "
-                     << redact(oplogEntry.toBSON());
-            fassertFailedNoTrace(28742);
-        }
-
-        BSONObj query = BSONObjBuilder().append(idElem).obj();
-        BSONObj missingObj;
-        auto nss = oplogEntry.getNss();
-        try {
-            auto uuid = oplogEntry.getUuid();
-            if (!uuid) {
-                missingObj = missingObjReader.findOne(nss.ns().c_str(), query);
-            } else {
-                auto dbname = nss.db();
-                // If a UUID exists for the command object, find the document by UUID.
-                missingObj = missingObjReader.findOneByUUID(dbname.toString(), *uuid, query);
-            }
-        } catch (const NetworkException&) {
-            warning() << "network problem detected while fetching a missing document from the "
-                      << "sync source, attempt " << retryCount << " of " << retryMax;
-            continue;  // try again
-        } catch (DBException& e) {
-            error() << "assertion fetching missing object: " << redact(e);
-            throw;
-        }
-
-        // success!
-        return missingObj;
-    }
-    // retry count exceeded
-    msgasserted(15916,
-                str::stream() << "Can no longer connect to initial sync source: "
-                              << source->toString());
-}
-
-void SyncTail::fetchAndInsertMissingDocument(OperationContext* opCtx,
-                                             const OplogEntry& oplogEntry) {
-    // Note that using the local UUID/NamespaceString mapping is sufficient for checking
-    // whether the collection is capped on the remote because convertToCapped creates a
-    // new collection with a different UUID.
-    const NamespaceString nss(parseUUIDOrNs(opCtx, oplogEntry));
-
-    {
-        // If the document is in a capped collection then it's okay for it to be missing.
-        AutoGetCollectionForRead autoColl(opCtx, nss);
-        Collection* const collection = autoColl.getCollection();
-        if (collection && collection->isCapped()) {
-            log() << "Not fetching missing document in capped collection (" << nss << ")";
-            return;
-        }
-    }
-
-    log() << "Fetching missing document: " << redact(oplogEntry.toBSON());
-    BSONObj missingObj = getMissingDoc(opCtx, oplogEntry);
-
-    if (missingObj.isEmpty()) {
-        BSONObj object2;
-        if (auto optionalObject2 = oplogEntry.getObject2()) {
-            object2 = *optionalObject2;
-        }
-        log() << "Missing document not found on source; presumably deleted later in oplog. o first "
-                 "field: "
-              << redact(oplogEntry.getObject()) << ", o2: " << redact(object2);
-
-        return;
-    }
-
-    return writeConflictRetry(opCtx, "fetchAndInsertMissingDocument", nss.ns(), [&] {
-        // Take an X lock on the database in order to preclude other modifications.
-        AutoGetDb autoDb(opCtx, nss.db(), MODE_X);
-        Database* const db = autoDb.getDb();
-
-        WriteUnitOfWork wunit(opCtx);
-
-        Collection* coll = nullptr;
-        auto uuid = oplogEntry.getUuid();
-        if (!uuid) {
-            if (!db) {
-                return;
-            }
-            coll = db->getOrCreateCollection(opCtx, nss);
-        } else {
-            // If the oplog entry has a UUID, use it to find the collection in which to insert the
-            // missing document.
-            auto& catalog = CollectionCatalog::get(opCtx);
-            coll = catalog.lookupCollectionByUUID(*uuid);
-            if (!coll) {
-                // TODO(SERVER-30819) insert this UUID into the missing UUIDs set.
-                return;
-            }
-        }
-
-        invariant(coll);
-
-        OpDebug* const nullOpDebug = nullptr;
-        Status status = coll->insertDocument(opCtx, InsertStatement(missingObj), nullOpDebug, true);
-        uassert(15917,
-                str::stream() << "Failed to insert missing document: " << status.toString(),
-                status.isOK());
-
-        LOG(1) << "Inserted missing document: " << redact(missingObj);
-
-        wunit.commit();
-
-        if (_observer) {
-            const OplogApplier::Observer::FetchInfo fetchInfo(oplogEntry, missingObj);
-            _observer->onMissingDocumentsFetchedAndInserted({fetchInfo});
-        }
-    });
-}
-
 // This free function is used by the writer threads to apply each op
 Status multiSyncApply(OperationContext* opCtx,
                       MultiApplier::OperationPtrs* ops,
@@ -1033,19 +921,13 @@ Status multiSyncApply(OperationContext* opCtx,
 
             // If we didn't create a group, try to apply the op individually.
             try {
-                auto stableTimestampForRecovery = st->getOptions().stableTimestampForRecovery;
-                const Status status = SyncTail::syncApply(
-                    opCtx, &entry, oplogApplicationMode, stableTimestampForRecovery);
+                const Status status = SyncTail::syncApply(opCtx, &entry, oplogApplicationMode);
 
                 if (!status.isOK()) {
-                    // In initial sync, update operations can cause documents to be missed during
-                    // collection cloning. As a result, it is possible that a document that we
-                    // need to update is not present locally. In that case we fetch the document
-                    // from the sync source.
+                    // Tried to apply an update operation but the document is missing, there must be
+                    // a delete operation for the document later in the oplog.
                     if (status == ErrorCodes::UpdateOperationFailed &&
-                        st->getOptions().missingDocumentSourceForInitialSync) {
-                        // We might need to fetch the missing docs from the sync source.
-                        st->fetchAndInsertMissingDocument(opCtx, entry);
+                        oplogApplicationMode == OplogApplication::Mode::kInitialSync) {
                         continue;
                     }
 
@@ -1379,6 +1261,10 @@ StatusWith<OpTime> SyncTail::multiApply(OperationContext* opCtx, MultiApplier::O
                         opCtx, info.nss, info.indexName, info.multikeyPaths, firstTimeInBatch));
         }
     }
+
+    // Increment the counter for the number of ops applied during catchup if the node is in catchup
+    // mode.
+    replCoord->incrementNumCatchUpOpsIfCatchingUp(ops.size());
 
     // We have now written all database writes and updated the oplog to match.
     return ops.back().getOpTime();

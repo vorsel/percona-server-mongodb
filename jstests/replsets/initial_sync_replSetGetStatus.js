@@ -18,8 +18,8 @@ replSet.initiate();
 var primary = replSet.getPrimary();
 
 var coll = primary.getDB('test').foo;
-assert.writeOK(coll.insert({a: 1}));
-assert.writeOK(coll.insert({a: 2}));
+assert.commandWorked(coll.insert({a: 1}));
+assert.commandWorked(coll.insert({a: 2}));
 
 // Add a secondary node but make it hang before copying databases.
 var secondary = replSet.add();
@@ -47,8 +47,8 @@ assert(!res.initialSyncStatus,
 assert.commandFailedWithCode(secondary.adminCommand({replSetGetStatus: 1, initialSync: "t"}),
                              ErrorCodes.TypeMismatch);
 
-assert.writeOK(coll.insert({a: 3}));
-assert.writeOK(coll.insert({a: 4}));
+assert.commandWorked(coll.insert({a: 3}));
+assert.commandWorked(coll.insert({a: 4}));
 
 // Let initial sync continue working.
 assert.commandWorked(secondary.getDB('admin').runCommand(
@@ -61,7 +61,6 @@ checkLog.contains(secondary, 'initial sync - initialSyncHangBeforeFinish fail po
 res = assert.commandWorked(secondary.adminCommand({replSetGetStatus: 1}));
 assert(res.initialSyncStatus,
        () => "Response should have an 'initialSyncStatus' field: " + tojson(res));
-assert.eq(res.initialSyncStatus.fetchedMissingDocs, 0);
 assert.eq(res.initialSyncStatus.appliedOps, 3);
 assert.eq(res.initialSyncStatus.failedInitialSyncAttempts, 0);
 assert.eq(res.initialSyncStatus.maxFailedInitialSyncAttempts, 10);

@@ -29,21 +29,24 @@
 
 #pragma once
 
-#include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/db/index/index_descriptor.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/db/catalog/throttle_cursor.h"
 #include "mongo/db/storage/key_string.h"
 #include "mongo/db/storage/record_store.h"
-#include "mongo/db/storage/sorted_data_interface.h"
-#include "mongo/util/elapsed_tracker.h"
 
 namespace mongo {
+
+class IndexDescriptor;
 
 /**
  * Contains all the index information and stats throughout the validation.
  */
 struct IndexInfo {
     IndexInfo(const IndexDescriptor* descriptor);
-    const IndexDescriptor* const descriptor;
+    // Index name.
+    const std::string indexName;
+    // Contains the indexes key pattern.
+    const BSONObj keyPattern;
     // Contains the pre-computed hash of the index name.
     const uint32_t indexNameHash;
     // More efficient representation of the ordering of the descriptor's key pattern.
@@ -71,11 +74,7 @@ class IndexConsistency final {
     using ValidateResultsMap = std::map<std::string, ValidateResults>;
 
 public:
-    IndexConsistency(OperationContext* opCtx,
-                     Collection* collection,
-                     NamespaceString nss,
-                     RecordStore* recordStore,
-                     bool background);
+    IndexConsistency(OperationContext* opCtx, Collection* coll);
 
     /**
      * During the first phase of validation, given the document's key KeyString, increment the
@@ -83,9 +82,11 @@ public:
      * For the second phase of validation, keep track of the document keys that hashed to
      * inconsistent hash buckets during the first phase of validation.
      */
-    void addDocKey(const KeyString::Builder& ks,
+    void addDocKey(OperationContext* opCtx,
+                   const KeyString::Builder& ks,
                    IndexInfo* indexInfo,
                    RecordId recordId,
+                   const std::unique_ptr<SeekableRecordThrottleCursor>& cursor,
                    const BSONObj& indexKey);
 
     /**
@@ -139,12 +140,6 @@ public:
 
 private:
     IndexConsistency() = delete;
-
-    OperationContext* _opCtx;
-    Collection* _collection;
-    const NamespaceString _nss;
-    const RecordStore* _recordStore;
-    ElapsedTracker _tracker;
 
     // We map the hashed KeyString values to a bucket that contains the count of how many
     // index keys and document keys we've seen in each bucket. This counter is unsigned to avoid

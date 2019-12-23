@@ -79,8 +79,7 @@ public:
      */
     static Status syncApply(OperationContext* opCtx,
                             const OplogEntryBatch& batch,
-                            OplogApplication::Mode oplogApplicationMode,
-                            boost::optional<Timestamp> stableTimestampForRecovery);
+                            OplogApplication::Mode oplogApplicationMode);
     /**
      *
      * Constructs a SyncTail.
@@ -177,6 +176,18 @@ public:
         }
 
         /**
+         * If the oplog buffer is exhausted, return the term before we learned that the buffer was
+         * empty.
+         */
+        boost::optional<long long> termWhenExhausted() const {
+            return _termWhenExhausted;
+        }
+        void setTermWhenExhausted(long long term) {
+            invariant(empty());
+            _termWhenExhausted = term;
+        }
+
+        /**
          * Leaves this object in an unspecified state. Only assignment and destruction are valid.
          */
         std::vector<OplogEntry> releaseBatch() {
@@ -187,26 +198,10 @@ public:
         std::vector<OplogEntry> _batch;
         size_t _bytes;
         bool _mustShutdown = false;
+        boost::optional<long long> _termWhenExhausted;
     };
 
     using BatchLimits = OplogApplier::BatchLimits;
-
-    /**
-     * Fetch a single document referenced in the operation from the sync source.
-     *
-     * The sync source is specified at construction in
-     * OplogApplier::Options::missingDocumentSourceForInitialSync.
-     */
-    virtual BSONObj getMissingDoc(OperationContext* opCtx, const OplogEntry& oplogEntry);
-
-    /**
-     * If an update fails, fetches the missing document and inserts it into the local collection.
-     *
-     * Calls OplogApplier::Observer::onMissingDocumentsFetchedAndInserted() if the document was
-     * fetched and inserted successfully.
-     */
-    virtual void fetchAndInsertMissingDocument(OperationContext* opCtx,
-                                               const OplogEntry& oplogEntry);
 
     /**
      * Applies a batch of oplog entries by writing the oplog entries to the local oplog and then

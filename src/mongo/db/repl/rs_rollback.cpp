@@ -419,6 +419,11 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(OperationContext* o
 
                 return Status::OK();
             }
+            // TODO(SERVER-39452): Ignore no-op commitIndexBuild command for now. Revisit when we
+            // are ready to implement rollback logic.
+            case OplogEntry::CommandType::kCommitIndexBuild: {
+                return Status::OK();
+            }
             case OplogEntry::CommandType::kRenameCollection: {
                 // Example rename collection obj
                 // o:{
@@ -1498,7 +1503,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
         // are persisted to disk before truncating oplog.
         log() << "Waiting for an unstable checkpoint";
         const bool stableCheckpoint = false;
-        opCtx->recoveryUnit()->waitUntilUnjournaledWritesDurable(stableCheckpoint);
+        opCtx->recoveryUnit()->waitUntilUnjournaledWritesDurable(opCtx, stableCheckpoint);
     }
 
     log() << "Truncating the oplog at " << fixUpInfo.commonPoint.toString() << " ("
@@ -1536,7 +1541,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
         // Take an unstable checkpoint to ensure the appliedThrough write is persisted to disk.
         log() << "Waiting for an unstable checkpoint";
         const bool stableCheckpoint = false;
-        opCtx->recoveryUnit()->waitUntilUnjournaledWritesDurable(stableCheckpoint);
+        opCtx->recoveryUnit()->waitUntilUnjournaledWritesDurable(opCtx, stableCheckpoint);
 
         // Ensure that appliedThrough is unset in the next stable checkpoint.
         log() << "Clearing appliedThrough";
@@ -1671,7 +1676,7 @@ void rollback(OperationContext* opCtx,
     // so that if we wind up shutting down uncleanly in response to something we rolled back
     // we know that we won't wind up right back in the same situation when we start back up
     // because the rollback wasn't durable.
-    opCtx->recoveryUnit()->waitUntilDurable();
+    opCtx->recoveryUnit()->waitUntilDurable(opCtx);
 
     // If we detected that we rolled back the shardIdentity document as part of this rollback
     // then we must shut down to clear the in-memory ShardingState associated with the

@@ -100,6 +100,7 @@ MONGO_FAIL_POINT_DEFINE(rsStopGetMore);
 MONGO_FAIL_POINT_DEFINE(respondWithNotPrimaryInCommandDispatch);
 MONGO_FAIL_POINT_DEFINE(skipCheckingForNotMasterInCommandDispatch);
 MONGO_FAIL_POINT_DEFINE(waitAfterReadCommandFinishesExecution);
+MONGO_FAIL_POINT_DEFINE(sleepMillisAfterCommandExecutionBegins);
 
 // Tracks the number of times a legacy unacknowledged write failed due to
 // not master error resulted in network disconnection.
@@ -378,6 +379,25 @@ void appendClusterAndOperationTime(OperationContext* opCtx,
     operationTime.appendAsOperationTime(commandBodyFieldsBob);
 }
 
+namespace {
+void _abortUnpreparedOrStashPreparedTransaction(
+    OperationContext* opCtx, TransactionParticipant::Participant* txnParticipant) {
+    const bool isPrepared = txnParticipant->transactionIsPrepared();
+    try {
+        if (isPrepared)
+            txnParticipant->stashTransactionResources(opCtx);
+        else if (txnParticipant->transactionIsOpen())
+            txnParticipant->abortTransaction(opCtx);
+    } catch (...) {
+        // It is illegal for this to throw so we catch and log this here for diagnosability.
+        severe() << "Caught exception during transaction " << opCtx->getTxnNumber()
+                 << (isPrepared ? " stash " : " abort ") << opCtx->getLogicalSessionId()->toBSON()
+                 << ": " << exceptionToStatus();
+        std::terminate();
+    }
+}
+}  // namespace
+
 void invokeWithSessionCheckedOut(OperationContext* opCtx,
                                  CommandInvocation* invocation,
                                  const OperationSessionInfoFromClient& sessionOptions,
@@ -411,8 +431,11 @@ void invokeWithSessionCheckedOut(OperationContext* opCtx,
         // transactions on failure to unstash the transaction resources to opCtx. We don't want to
         // have this error guard for beginOrContinue as it can abort the transaction for any
         // accidental invalid statements in the transaction.
-        auto abortOnError = makeGuard(
-            [&txnParticipant, opCtx] { txnParticipant.abortTransactionIfNotPrepared(opCtx); });
+        auto abortOnError = makeGuard([&txnParticipant, opCtx] {
+            if (txnParticipant.transactionIsInProgress()) {
+                txnParticipant.abortTransaction(opCtx);
+            }
+        });
 
         txnParticipant.unstashTransactionResources(opCtx, invocation->definition()->getName());
 
@@ -420,8 +443,8 @@ void invokeWithSessionCheckedOut(OperationContext* opCtx,
         abortOnError.dismiss();
     }
 
-    auto guard = makeGuard([&txnParticipant, opCtx] {
-        txnParticipant.abortActiveUnpreparedOrStashPreparedTransaction(opCtx);
+    auto guard = makeGuard([opCtx, &txnParticipant] {
+        _abortUnpreparedOrStashPreparedTransaction(opCtx, &txnParticipant);
     });
 
     try {
@@ -526,7 +549,7 @@ bool runCommandImpl(OperationContext* opCtx,
         auto waitForWriteConcern = [&](auto&& bb) {
             MONGO_FAIL_POINT_BLOCK_IF(failCommand, data, [&](const BSONObj& data) {
                 return CommandHelpers::shouldActivateFailCommandFailPoint(
-                           data, request.getCommandName(), opCtx->getClient()) &&
+                           data, request.getCommandName(), opCtx->getClient(), invocation->ns()) &&
                     data.hasField("writeConcernError");
             }) {
                 bb.append(data.getData()["writeConcernError"]);
@@ -642,6 +665,16 @@ void execCommandDatabase(OperationContext* opCtx,
             CurOp::get(opCtx)->setCommand_inlock(command);
         }
 
+        MONGO_FAIL_POINT_BLOCK(sleepMillisAfterCommandExecutionBegins, arg) {
+            const BSONObj& data = arg.getData();
+            auto numMillis = data["millis"].numberInt();
+            auto commands = data["commands"].Obj().getFieldNames<std::set<std::string>>();
+            // Only sleep for one of the specified commands.
+            if (commands.find(command->getName()) != commands.end()) {
+                mongo::sleepmillis(numMillis);
+            }
+        }
+
         // TODO: move this back to runCommands when mongos supports OperationContext
         // see SERVER-18515 for details.
         rpc::readRequestMetadata(opCtx, request.body, command->requiresAuth());
@@ -656,7 +689,7 @@ void execCommandDatabase(OperationContext* opCtx,
             replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet,
             opCtx->getServiceContext()->getStorageEngine()->supportsDocLocking());
 
-        CommandHelpers::evaluateFailCommandFailPoint(opCtx, command->getName());
+        CommandHelpers::evaluateFailCommandFailPoint(opCtx, command->getName(), invocation->ns());
 
         const auto dbname = request.getDatabase().toString();
         uassert(
@@ -859,6 +892,7 @@ void execCommandDatabase(OperationContext* opCtx,
         }
 
         behaviors.waitForReadConcern(opCtx, invocation.get(), request);
+        behaviors.setPrepareConflictBehaviorForReadConcern(opCtx, invocation.get());
 
         try {
             if (!runCommandImpl(opCtx,
@@ -1087,19 +1121,18 @@ void receivedKillCursors(OperationContext* opCtx, const Message& m) {
     DbMessage dbmessage(m);
     int n = dbmessage.pullInt();
 
+    if (n > 2000) {
+        (n < 30000 ? warning() : error()) << "receivedKillCursors, n=" << n;
+        uassert(51250, "must kill fewer than 30000 cursors", n < 30000);
+    }
+
     uassert(13659, "sent 0 cursors to kill", n != 0);
     massert(13658,
             str::stream() << "bad kill cursors size: " << m.dataSize(),
             m.dataSize() == 8 + (8 * n));
     uassert(13004, str::stream() << "sent negative cursors to kill: " << n, n >= 1);
 
-    if (n > 2000) {
-        (n < 30000 ? warning() : error()) << "receivedKillCursors, n=" << n;
-        verify(n < 30000);
-    }
-
     const char* cursorArray = dbmessage.getArray(n);
-
     int found = runOpKillCursors(opCtx, static_cast<size_t>(n), cursorArray);
 
     if (shouldLog(logger::LogSeverity::Debug(1)) || found != n) {

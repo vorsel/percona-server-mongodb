@@ -35,8 +35,9 @@ const versions = [
     {binVersion: '3.4', featureCompatibilityVersion: '3.4', testCollection: 'three_four'},
     {binVersion: '3.6', featureCompatibilityVersion: '3.6', testCollection: 'three_six'},
     {binVersion: '4.0', featureCompatibilityVersion: '4.0', testCollection: 'four_zero'},
+    {binVersion: '4.2', featureCompatibilityVersion: '4.2', testCollection: 'four_two'},
     {binVersion: 'last-stable', testCollection: 'last_stable'},
-    {binVersion: 'latest', featureCompatibilityVersion: '4.2', testCollection: 'latest'},
+    {binVersion: 'latest', featureCompatibilityVersion: '4.4', testCollection: 'latest'},
 ];
 
 // These key patterns are considered valid for existing v:0 and v:1 indexes, but are considered
@@ -175,7 +176,7 @@ for (let i = 0; i < versions.length; i++) {
     assert.commandWorked(testDB.createCollection(version.testCollection));
 
     // Insert a document into the new collection.
-    assert.writeOK(testDB[version.testCollection].insert({a: 1}));
+    assert.commandWorked(testDB[version.testCollection].insert({a: 1}));
     assert.eq(1,
               testDB[version.testCollection].count(),
               `mongo should have inserted 1 document into collection ${version.testCollection}; ` +
@@ -236,7 +237,7 @@ for (let i = 0; i < versions.length; i++) {
     // Connect to the 'test' database.
     let testDB = primary.getDB('test');
     assert.commandWorked(testDB.createCollection(version.testCollection));
-    assert.writeOK(testDB[version.testCollection].insert({a: 1}));
+    assert.commandWorked(testDB[version.testCollection].insert({a: 1}));
     assert.eq(1,
               testDB[version.testCollection].count(),
               `mongo should have inserted 1 document into collection ${version.testCollection}; ` +
@@ -262,7 +263,7 @@ for (let i = 0; i < versions.length; i++) {
     assert.binVersion(primary, version.binVersion);
     testDB = primary.getDB('test');
 
-    assert.writeOK(testDB[version.testCollection].insert({b: 1}));
+    assert.commandWorked(testDB[version.testCollection].insert({b: 1}));
     assert.eq(2,
               testDB[version.testCollection].count(),
               `mongo should have inserted 2 documents into collection ${version.testCollection}; ` +
