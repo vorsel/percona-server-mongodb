@@ -81,7 +81,7 @@ namespace mongo {
 
 namespace audit {
 
-    NOINLINE_DECL void realexit( ExitCode rc ) {
+    MONGO_COMPILER_NOINLINE void realexit( ExitCode rc ) {
 #ifdef _COVERAGE
         // Need to make sure coverage data is properly flushed before exit.
         // It appears that ::_exit() does not do this.
