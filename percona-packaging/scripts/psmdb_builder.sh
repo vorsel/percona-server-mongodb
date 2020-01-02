@@ -311,11 +311,11 @@ aws_sdk_build(){
             fi
             set_compiler
             if [ -z "${CC}" -a -z "${CXX}" ]; then
-                ${CMAKE_CMD} .. -DCMAKE_BUILD_TYPE=Release -DBUILD_ONLY="s3" -DBUILD_SHARED_LIBS=OFF -DMINIMIZE_SIZE=ON
+                ${CMAKE_CMD} .. -DCMAKE_BUILD_TYPE=Release -DBUILD_ONLY="s3" -DBUILD_SHARED_LIBS=OFF -DMINIMIZE_SIZE=ON || exit $?
             else
-                ${CMAKE_CMD} CC=${CC} CXX=${CXX} .. -DCMAKE_BUILD_TYPE=Release -DBUILD_ONLY="s3" -DBUILD_SHARED_LIBS=OFF -DMINIMIZE_SIZE=ON
+                ${CMAKE_CMD} CC=${CC} CXX=${CXX} .. -DCMAKE_BUILD_TYPE=Release -DBUILD_ONLY="s3" -DBUILD_SHARED_LIBS=OFF -DMINIMIZE_SIZE=ON || exit $?
             fi
-            make -j4
+            make -j4 || exit $?
             make install
     cd ${WORKDIR}
 }
@@ -819,11 +819,11 @@ build_tarball(){
             cd build
             set_compiler
             if [ -z "${CC}" -a -z "${CXX}" ]; then
-                cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_ONLY="s3" -DBUILD_SHARED_LIBS=OFF -DMINIMIZE_SIZE=ON -DCMAKE_INSTALL_PREFIX="${INSTALLDIR_AWS}"
+                cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_ONLY="s3" -DBUILD_SHARED_LIBS=OFF -DMINIMIZE_SIZE=ON -DCMAKE_INSTALL_PREFIX="${INSTALLDIR_AWS}" || exit $?
             else
-                cmake CC=${CC} CXX=${CXX} .. -DCMAKE_BUILD_TYPE=Release -DBUILD_ONLY="s3" -DBUILD_SHARED_LIBS=OFF -DMINIMIZE_SIZE=ON -DCMAKE_INSTALL_PREFIX="${INSTALLDIR_AWS}"
+                cmake CC=${CC} CXX=${CXX} .. -DCMAKE_BUILD_TYPE=Release -DBUILD_ONLY="s3" -DBUILD_SHARED_LIBS=OFF -DMINIMIZE_SIZE=ON -DCMAKE_INSTALL_PREFIX="${INSTALLDIR_AWS}" || exit $?
             fi
-            make -j4
+            make -j4 || exit $?
             make install
             mkdir -p ${INSTALLDIR}/include/
             mkdir -p ${INSTALLDIR}/lib/
@@ -839,10 +839,10 @@ build_tarball(){
       export LINKFLAGS="${LINKFLAGS} ${CURL_LINKFLAGS}"
     fi
     if [ ${DEBUG} = 0 ]; then
-        buildscripts/scons.py CC=${CC} CXX=${CXX} --disable-warnings-as-errors --release --ssl --opt=on -j$NJOBS --use-sasl-client --wiredtiger --audit --inmemory --hotbackup CPPPATH=${INSTALLDIR}/include LIBPATH=${INSTALLDIR}/lib LINKFLAGS="${LINKFLAGS}" ${PSM_TARGETS}
+        buildscripts/scons.py CC=${CC} CXX=${CXX} --disable-warnings-as-errors --release --ssl --opt=on -j$NJOBS --use-sasl-client --wiredtiger --audit --inmemory --hotbackup CPPPATH=${INSTALLDIR}/include LIBPATH=${INSTALLDIR}/lib LINKFLAGS="${LINKFLAGS}" ${PSM_TARGETS} || exit $?
     else
         buildscripts/scons.py CC=${CC} CXX=${CXX} --disable-warnings-as-errors --audit --ssl --dbg=on -j$NJOBS --use-sasl-client \
-        CPPPATH=${INSTALLDIR}/include LIBPATH=${INSTALLDIR}/lib LINKFLAGS="${LINKFLAGS}" --wiredtiger --inmemory --hotbackup ${PSM_TARGETS}
+        CPPPATH=${INSTALLDIR}/include LIBPATH=${INSTALLDIR}/lib LINKFLAGS="${LINKFLAGS}" --wiredtiger --inmemory --hotbackup ${PSM_TARGETS} || exit $?
     fi
     #
     # scons install doesn't work - it installs the binaries not linked with fractal tree
