@@ -23,7 +23,7 @@ override_dh_auto_clean:
 	rm -fr $(PSMSRC)/bin
 	rm -fr $(INSTALLDIR)
 	buildscripts/scons.py CC=$(CC) CXX=$(CXX) -C $(PSMSRC) -c --audit --release --ssl --opt -j$(NJOBS) --use-sasl-client CPPPATH="$(INSTALLDIR)/include $(AWS_LIBS)/include" \
-	LIBPATH="$(INSTALLDIR)/lib $(AWS_LIBS)/lib" LINKFLAGS="$(LINKFLAGS)" --rocksdb --wiredtiger --inmemory --hotbackup $(PSM_TARGETS)
+	LIBPATH="$(INSTALLDIR)/lib $(AWS_LIBS)/lib" LINKFLAGS="$(LINKFLAGS)" --rocksdb --wiredtiger --inmemory --hotbackup $(PSM_TARGETS) || exit $?
 	rm -fr build
 	find $(PSMSRC) -name '*.pyc' -delete
 
@@ -40,7 +40,7 @@ RocksDB:
 percona-server-mongodb:
 	buildscripts/scons.py CC=${CC} CXX=${CXX} --audit --release --ssl --opt=on -j$(NJOBS) \
 	--use-sasl-client --wiredtiger --rocksdb --inmemory --hotbackup \
-	CPPPATH="${INSTALLDIR}/include $(AWS_LIBS)/include" LIBPATH="${INSTALLDIR}/lib $(AWS_LIBS)/lib" LINKFLAGS="$(LINKFLAGS)" ${PSM_TARGETS}
+	CPPPATH="${INSTALLDIR}/include $(AWS_LIBS)/include" LIBPATH="${INSTALLDIR}/lib $(AWS_LIBS)/lib" LINKFLAGS="$(LINKFLAGS)" ${PSM_TARGETS} || exit $?
 
 compile-mongo-tools:
 	mkdir $(PSMSRC)/bin || true;
