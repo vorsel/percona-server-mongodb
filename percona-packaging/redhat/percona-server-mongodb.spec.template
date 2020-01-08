@@ -151,7 +151,7 @@ mv ${INSTALLDIR_AWS}/lib*/* ${INSTALLDIR}/lib/
 pushd $RPM_BUILD_DIR/%{src_dir}
 buildscripts/scons.py CC=${CC} CXX=${CXX} --audit --release --ssl --opt=on  \
 %{?_smp_mflags} --use-sasl-client CPPPATH=${INSTALLDIR}/include LIBPATH=${INSTALLDIR}/lib \
---wiredtiger --inmemory --hotbackup ${PSM_TARGETS}
+--wiredtiger --inmemory --hotbackup ${PSM_TARGETS} || exit $?
 popd
 
 # Mongo Tools compilation
