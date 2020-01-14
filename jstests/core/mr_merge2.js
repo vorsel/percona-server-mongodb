@@ -7,7 +7,6 @@
 //   does_not_support_stepdowns,
 //   uses_map_reduce_with_temp_collections,
 // ]
-
 t = db.mr_merge2;
 t.drop();
 

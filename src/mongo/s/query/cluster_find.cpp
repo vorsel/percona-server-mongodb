@@ -94,7 +94,7 @@ StatusWith<std::unique_ptr<QueryRequest>> transformQueryForShards(
     boost::optional<long long> newLimit;
     if (qr.getLimit()) {
         long long newLimitValue;
-        if (mongoSignedAddOverflow64(*qr.getLimit(), qr.getSkip().value_or(0), &newLimitValue)) {
+        if (overflow::add(*qr.getLimit(), qr.getSkip().value_or(0), &newLimitValue)) {
             return Status(
                 ErrorCodes::Overflow,
                 str::stream()
@@ -110,8 +110,7 @@ StatusWith<std::unique_ptr<QueryRequest>> transformQueryForShards(
         // !wantMore and ntoreturn mean the same as !wantMore and limit, so perform the conversion.
         if (!qr.wantMore()) {
             long long newLimitValue;
-            if (mongoSignedAddOverflow64(
-                    *qr.getNToReturn(), qr.getSkip().value_or(0), &newLimitValue)) {
+            if (overflow::add(*qr.getNToReturn(), qr.getSkip().value_or(0), &newLimitValue)) {
                 return Status(ErrorCodes::Overflow,
                               str::stream()
                                   << "sum of ntoreturn and skip cannot be represented as a 64-bit "
@@ -121,8 +120,7 @@ StatusWith<std::unique_ptr<QueryRequest>> transformQueryForShards(
             newLimit = newLimitValue;
         } else {
             long long newNToReturnValue;
-            if (mongoSignedAddOverflow64(
-                    *qr.getNToReturn(), qr.getSkip().value_or(0), &newNToReturnValue)) {
+            if (overflow::add(*qr.getNToReturn(), qr.getSkip().value_or(0), &newNToReturnValue)) {
                 return Status(ErrorCodes::Overflow,
                               str::stream()
                                   << "sum of ntoreturn and skip cannot be represented as a 64-bit "
@@ -603,7 +601,7 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
 
     // If the 'waitAfterPinningCursorBeforeGetMoreBatch' fail point is enabled, set the 'msg'
     // field of this operation's CurOp to signal that we've hit this point.
-    if (MONGO_FAIL_POINT(waitAfterPinningCursorBeforeGetMoreBatch)) {
+    if (MONGO_unlikely(waitAfterPinningCursorBeforeGetMoreBatch.shouldFail())) {
         CurOpFailpointHelpers::waitWhileFailPointEnabled(
             &waitAfterPinningCursorBeforeGetMoreBatch,
             opCtx,
@@ -626,7 +624,7 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
 
     // If the 'waitWithPinnedCursorDuringGetMoreBatch' fail point is enabled, set the 'msg'
     // field of this operation's CurOp to signal that we've hit this point.
-    if (MONGO_FAIL_POINT(waitWithPinnedCursorDuringGetMoreBatch)) {
+    if (MONGO_unlikely(waitWithPinnedCursorDuringGetMoreBatch.shouldFail())) {
         CurOpFailpointHelpers::waitWhileFailPointEnabled(&waitWithPinnedCursorDuringGetMoreBatch,
                                                          opCtx,
                                                          "waitWithPinnedCursorDuringGetMoreBatch");
@@ -703,7 +701,7 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
     CurOp::get(opCtx)->debug().cursorExhausted = (idToReturn == 0);
     CurOp::get(opCtx)->debug().nreturned = batch.size();
 
-    if (MONGO_FAIL_POINT(waitBeforeUnpinningOrDeletingCursorAfterGetMoreBatch)) {
+    if (MONGO_unlikely(waitBeforeUnpinningOrDeletingCursorAfterGetMoreBatch.shouldFail())) {
         CurOpFailpointHelpers::waitWhileFailPointEnabled(
             &waitBeforeUnpinningOrDeletingCursorAfterGetMoreBatch,
             opCtx,

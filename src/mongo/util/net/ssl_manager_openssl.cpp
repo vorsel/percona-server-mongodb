@@ -59,12 +59,14 @@
 #include "mongo/util/net/private/ssl_expiration.h"
 #include "mongo/util/net/socket_exception.h"
 #include "mongo/util/net/ssl_options.h"
+#include "mongo/util/net/ssl_parameters_gen.h"
 #include "mongo/util/net/ssl_types.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
 #include "mongo/util/text.h"
 
 #ifndef _WIN32
+#include <arpa/inet.h>
 #include <netinet/in.h>
 #endif
 #include <openssl/asn1.h>
@@ -240,9 +242,20 @@ IMPLEMENT_ASN1_ENCODE_FUNCTIONS_const_fname(ASN1_SEQUENCE_ANY, ASN1_SET_ANY, ASN
 const STACK_OF(X509_EXTENSION) * X509_get0_extensions(const X509* peerCert) {
     return peerCert->cert_info->extensions;
 }
+
+inline ASN1_TIME* X509_get0_notAfter(const X509* cert) {
+    return X509_get_notAfter(cert);
+}
+
 inline int X509_NAME_ENTRY_set(const X509_NAME_ENTRY* ne) {
     return ne->set;
 }
+
+#if OPENSSL_VERSION_NUMBER < 0x10002000L
+inline bool ASN1_TIME_diff(int*, int*, const ASN1_TIME*, const ASN1_TIME*) {
+    return false;
+}
+#endif
 
 int DH_set0_pqg(DH* dh, BIGNUM* p, BIGNUM* q, BIGNUM* g) {
     dh->p = p;
@@ -333,7 +346,7 @@ private:
     class ThreadIDManager {
     public:
         unsigned long reserveID() {
-            stdx::unique_lock<stdx::mutex> lock(_idMutex);
+            stdx::unique_lock<Latch> lock(_idMutex);
             if (!_idLast.empty()) {
                 unsigned long ret = _idLast.top();
                 _idLast.pop();
@@ -343,13 +356,14 @@ private:
         }
 
         void releaseID(unsigned long id) {
-            stdx::unique_lock<stdx::mutex> lock(_idMutex);
+            stdx::unique_lock<Latch> lock(_idMutex);
             _idLast.push(id);
         }
 
     private:
         // Machinery for producing IDs that are unique for the life of a thread.
-        stdx::mutex _idMutex;       // Protects _idNext and _idLast.
+        Mutex _idMutex =
+            MONGO_MAKE_LATCH("ThreadIDManager::_idMutex");  // Protects _idNext and _idLast.
         unsigned long _idNext = 0;  // Stores the next thread ID to use, if none already allocated.
         std::stack<unsigned long, std::vector<unsigned long>>
             _idLast;  // Stores old thread IDs, for reuse.
@@ -463,7 +477,7 @@ private:
 
         /** Either returns a cached password, or prompts the user to enter one. */
         StatusWith<StringData> fetchPassword() {
-            stdx::lock_guard<stdx::mutex> lock(_mutex);
+            stdx::lock_guard<Latch> lock(_mutex);
             if (_password->size()) {
                 return StringData(_password->c_str());
             }
@@ -488,7 +502,7 @@ private:
         }
 
     private:
-        stdx::mutex _mutex;
+        Mutex _mutex = MONGO_MAKE_LATCH("PasswordFetcher::_mutex");
         SecureString _password;  // Protected by _mutex
 
         std::string _prompt;
@@ -1429,9 +1443,17 @@ SSLConnectionInterface* SSLManagerOpenSSL::connect(Socket* socket) {
         _clientContext.get(), socket, (const char*)nullptr, 0);
 
     const auto undotted = removeFQDNRoot(socket->remoteAddr().hostOrIp());
-    int ret = ::SSL_set_tlsext_host_name(sslConn->ssl, undotted.c_str());
-    if (ret != 1)
-        _handleSSLError(sslConn.get(), ret);
+
+    // only have TLS advertise host name if it is not an IP address
+    int ret;
+    std::array<uint8_t, INET6_ADDRSTRLEN> unusedBuf;
+    if ((inet_pton(AF_INET, undotted.c_str(), unusedBuf.data()) == 0) &&
+        (inet_pton(AF_INET6, undotted.c_str(), unusedBuf.data()) == 0)) {
+        ret = ::SSL_set_tlsext_host_name(sslConn->ssl, undotted.c_str());
+        if (ret != 1) {
+            _handleSSLError(sslConn.get(), ret);
+        }
+    }
 
     do {
         ret = ::SSL_connect(sslConn->ssl);
@@ -1531,21 +1553,38 @@ StatusWith<SSLPeerInfo> SSLManagerOpenSSL::parseAndValidatePeerCertificate(
     auto peerSubject = getCertificateSubjectX509Name(peerCert);
     LOG(2) << "Accepted TLS connection from peer: " << peerSubject;
 
-    // If this is a server and client and server certificate are the same, log a warning.
-    if (remoteHost.empty() && _sslConfiguration.serverSubjectName() == peerSubject) {
-        warning() << "Client connecting with server's own TLS certificate";
-    }
-
     StatusWith<stdx::unordered_set<RoleName>> swPeerCertificateRoles = _parsePeerRoles(peerCert);
     if (!swPeerCertificateRoles.isOK()) {
         return swPeerCertificateRoles.getStatus();
     }
 
-    // If this is an SSL client context (on a MongoDB server or client)
-    // perform hostname validation of the remote server
+    // Server side.
     if (remoteHost.empty()) {
+        const auto exprThreshold = tlsX509ExpirationWarningThresholdDays;
+        if (exprThreshold > 0) {
+            const auto expiration = X509_get0_notAfter(peerCert);
+            time_t threshold = (Date_t::now() + Days(exprThreshold)).toTimeT();
+
+            if (X509_cmp_time(expiration, &threshold) < 0) {
+                int days = 0, secs = 0;
+                if (!ASN1_TIME_diff(&days, &secs, nullptr /* now */, expiration)) {
+                    tlsEmitWarningExpiringClientCertificate(peerSubject);
+                } else {
+                    tlsEmitWarningExpiringClientCertificate(peerSubject, Days(days));
+                }
+            }
+        }
+
+        // If client and server certificate are the same, log a warning.
+        if (_sslConfiguration.serverSubjectName() == peerSubject) {
+            warning() << "Client connecting with server's own TLS certificate";
+        }
+
         return SSLPeerInfo(peerSubject, sniName, std::move(swPeerCertificateRoles.getValue()));
     }
+
+    // If this is an SSL client context (on a MongoDB server or client)
+    // perform hostname validation of the remote server.
 
     // This is to standardize the IPAddress format for comparison.
     auto swCIDRRemoteHost = CIDR::parse(remoteHost);

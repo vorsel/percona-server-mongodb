@@ -74,7 +74,7 @@ const char* CountScan::kStageType = "COUNT_SCAN";
 // the CountScanParams rather than resolving them via the IndexDescriptor, since these may differ
 // from the descriptor's contents.
 CountScan::CountScan(OperationContext* opCtx, CountScanParams params, WorkingSet* workingSet)
-    : RequiresIndexStage(kStageType, opCtx, params.indexDescriptor),
+    : RequiresIndexStage(kStageType, opCtx, params.indexDescriptor, workingSet),
       _workingSet(workingSet),
       _keyPattern(std::move(params.keyPattern)),
       _shouldDedup(params.isMultiKey),
@@ -115,7 +115,13 @@ PlanStage::StageState CountScan::doWork(WorkingSetID* out) {
             _cursor = indexAccessMethod()->newCursor(getOpCtx());
             _cursor->setEndPosition(_endKey, _endKeyInclusive);
 
-            entry = _cursor->seek(_startKey, _startKeyInclusive, kWantLoc);
+            auto keyStringForSeek = IndexEntryComparison::makeKeyStringFromBSONKeyForSeek(
+                _startKey,
+                indexAccessMethod()->getSortedDataInterface()->getKeyStringVersion(),
+                indexAccessMethod()->getSortedDataInterface()->getOrdering(),
+                true, /* forward */
+                _startKeyInclusive);
+            entry = _cursor->seek(keyStringForSeek);
         } else {
             entry = _cursor->next(kWantLoc);
         }

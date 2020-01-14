@@ -21,7 +21,7 @@ const replSet = new ReplSetTest({
 });
 
 // Allow the createIndexes command to use the index builds coordinator in single-phase mode.
-replSet.startSet({setParameter: {enableIndexBuildsCoordinatorForCreateIndexesCommand: true}});
+replSet.startSet();
 replSet.initiate();
 
 const testDB = replSet.getPrimary().getDB('test');
@@ -60,7 +60,7 @@ try {
     awaitShell = startParallelShell(function() {
         // Use the index builds coordinator for a two-phase index build.
         assert.commandWorked(db.runCommand({
-            twoPhaseCreateIndexes: 'twoPhaseIndexBuild',
+            createIndexes: 'twoPhaseIndexBuild',
             indexes: [{key: {a: 1}, name: 'a_1'}],
             commitQuorum: "majority"
         }));

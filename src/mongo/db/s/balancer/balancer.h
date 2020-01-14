@@ -32,8 +32,8 @@
 #include "mongo/db/s/balancer/balancer_chunk_selection_policy.h"
 #include "mongo/db/s/balancer/balancer_random.h"
 #include "mongo/db/s/balancer/migration_manager.h"
-#include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/condition_variable.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/thread.h"
 
 namespace mongo {
@@ -172,13 +172,13 @@ private:
      * Signals the beginning and end of a balancing round.
      */
     void _beginRound(OperationContext* opCtx);
-    void _endRound(OperationContext* opCtx, Seconds waitTimeout);
+    void _endRound(OperationContext* opCtx, Milliseconds waitTimeout);
 
     /**
      * Blocks the caller for the specified timeout or until the balancer condition variable is
      * signaled, whichever comes first.
      */
-    void _sleepFor(OperationContext* opCtx, Seconds waitTimeout);
+    void _sleepFor(OperationContext* opCtx, Milliseconds waitTimeout);
 
     /**
      * Returns true if all the servers listed in configdb as being shards are reachable and are
@@ -208,7 +208,7 @@ private:
                            const BSONObj& minKey);
 
     // Protects the state below
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("Balancer::_mutex");
 
     // Indicates the current state of the balancer
     State _state{kStopped};

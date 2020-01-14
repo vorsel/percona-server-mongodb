@@ -57,6 +57,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/stats/server_read_concern_write_concern_metrics',
         '$BUILD_DIR/mongo/db/transaction',
         '$BUILD_DIR/mongo/idl/idl_parser',
+        '$BUILD_DIR/mongo/rpc/command_status',
     ],
 )
 
@@ -481,8 +482,20 @@ env.Library(
     ],
     LIBDEPS=[
         'optime',
+        'optime_and_wall_time_base',
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/logical_session_id',
+        '$BUILD_DIR/mongo/idl/idl_parser',
+    ],
+)
+
+env.Library(
+    target='optime_and_wall_time_base',
+    source=[
+        env.Idlc('optime_and_wall_time_base.idl')[0],
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/idl/idl_parser',
     ],
 )
@@ -508,7 +521,7 @@ env.Library(
 env.Library(
     target='oplog_application',
     source=[
-        'applier_helpers.cpp',
+        'insert_group.cpp',
         'oplog_applier_impl.cpp',
         'session_update_tracker.cpp',
         'sync_tail.cpp',
@@ -689,6 +702,7 @@ env.Library(
     source=[
         'repl_client_info.cpp',
         'replication_coordinator.cpp',
+        'replication_coordinator_noop.cpp',
     ],
     LIBDEPS=[
         'optime',
@@ -991,6 +1005,7 @@ env.Library(target='optime',
                 'optime.cpp',
             ],
             LIBDEPS=[
+                'optime_and_wall_time_base',
                 '$BUILD_DIR/mongo/base',
                 '$BUILD_DIR/mongo/bson/util/bson_extract',
             ],

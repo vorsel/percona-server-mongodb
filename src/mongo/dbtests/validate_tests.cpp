@@ -72,6 +72,8 @@ public:
             _isInRecordIdOrder =
                 autoGetCollection.getCollection()->getRecordStore()->isInRecordIdOrder();
         }
+        _engineSupportsCheckpoints =
+            _opCtx.getServiceContext()->getStorageEngine()->supportsCheckpoints();
     }
 
     ~ValidateBase() {
@@ -81,15 +83,23 @@ public:
 
 protected:
     ValidateResults runValidate() {
+        // validate() will set a kCheckpoint read source. Callers continue to do operations after
+        // running validate, so we must reset the read source back to normal before returning.
+        auto originalReadSource = _opCtx.recoveryUnit()->getTimestampReadSource();
+        ON_BLOCK_EXIT([&] {
+            _opCtx.recoveryUnit()->abandonSnapshot();
+            _opCtx.recoveryUnit()->setTimestampReadSource(originalReadSource);
+        });
+
+        // This function will force a checkpoint, so background validation can then read from that
+        // checkpoint and see all the new data.
+        _opCtx.recoveryUnit()->waitUntilUnjournaledWritesDurable(&_opCtx);
+
         ValidateResults results;
         BSONObjBuilder output;
 
-        ASSERT_OK(CollectionValidation::validate(&_opCtx,
-                                                 _nss,
-                                                 _full ? kValidateFull : kValidateNormal,
-                                                 _background,
-                                                 &results,
-                                                 &output));
+        ASSERT_OK(
+            CollectionValidation::validate(&_opCtx, _nss, _full, _background, &results, &output));
 
         //  Check if errors are reported if and only if valid is set to false.
         ASSERT_EQ(results.valid, results.errors.empty());
@@ -170,6 +180,7 @@ protected:
     unique_ptr<AutoGetDb> _autoDb;
     Database* _db;
     bool _isInRecordIdOrder;
+    bool _engineSupportsCheckpoints;
 };
 
 template <bool full, bool background>
@@ -179,8 +190,10 @@ public:
 
     void run() {
 
-        // Can't do it in background if the RecordStore is not in RecordId order.
-        if (_background && !_isInRecordIdOrder) {
+        // Cannot run validate with {background:true} if either
+        //  - the RecordStore cursor does not retrieve documents in RecordId order
+        //  - or the storage engine does not support checkpoints.
+        if (_background && (!_isInRecordIdOrder || !_engineSupportsCheckpoints)) {
             return;
         }
 
@@ -239,8 +252,10 @@ public:
     ValidateSecondaryIndexCount() : ValidateBase(full, background) {}
     void run() {
 
-        // Can't do it in background if the RecordStore is not in RecordId order.
-        if (_background && !_isInRecordIdOrder) {
+        // Cannot run validate with {background:true} if either
+        //  - the RecordStore cursor does not retrieve documents in RecordId order
+        //  - or the storage engine does not support checkpoints.
+        if (_background && (!_isInRecordIdOrder || !_engineSupportsCheckpoints)) {
             return;
         }
 
@@ -308,8 +323,10 @@ public:
     ValidateSecondaryIndex() : ValidateBase(full, background) {}
     void run() {
 
-        // Can't do it in background if the RecordStore is not in RecordId order.
-        if (_background && !_isInRecordIdOrder) {
+        // Cannot run validate with {background:true} if either
+        //  - the RecordStore cursor does not retrieve documents in RecordId order
+        //  - or the storage engine does not support checkpoints.
+        if (_background && (!_isInRecordIdOrder || !_engineSupportsCheckpoints)) {
             return;
         }
 
@@ -369,8 +386,10 @@ public:
 
     void run() {
 
-        // Can't do it in background if the RecordStore is not in RecordId order.
-        if (_background && !_isInRecordIdOrder) {
+        // Cannot run validate with {background:true} if either
+        //  - the RecordStore cursor does not retrieve documents in RecordId order
+        //  - or the storage engine does not support checkpoints.
+        if (_background && (!_isInRecordIdOrder || !_engineSupportsCheckpoints)) {
             return;
         }
 
@@ -447,8 +466,10 @@ public:
 
     void run() {
 
-        // Can't do it in background if the RecordStore is not in RecordId order.
-        if (_background && !_isInRecordIdOrder) {
+        // Cannot run validate with {background:true} if either
+        //  - the RecordStore cursor does not retrieve documents in RecordId order
+        //  - or the storage engine does not support checkpoints.
+        if (_background && (!_isInRecordIdOrder || !_engineSupportsCheckpoints)) {
             return;
         }
 
@@ -531,8 +552,10 @@ public:
 
     void run() {
 
-        // Can't do it in background if the RecordStore is not in RecordId order.
-        if (_background && !_isInRecordIdOrder) {
+        // Cannot run validate with {background:true} if either
+        //  - the RecordStore cursor does not retrieve documents in RecordId order
+        //  - or the storage engine does not support checkpoints.
+        if (_background && (!_isInRecordIdOrder || !_engineSupportsCheckpoints)) {
             return;
         }
 
@@ -593,8 +616,10 @@ public:
 
     void run() {
 
-        // Can't do it in background if the RecordStore is not in RecordId order.
-        if (_background && !_isInRecordIdOrder) {
+        // Cannot run validate with {background:true} if either
+        //  - the RecordStore cursor does not retrieve documents in RecordId order
+        //  - or the storage engine does not support checkpoints.
+        if (_background && (!_isInRecordIdOrder || !_engineSupportsCheckpoints)) {
             return;
         }
 
@@ -661,8 +686,10 @@ public:
 
     void run() {
 
-        // Can't do it in background if the RecordStore is not in RecordId order.
-        if (_background && !_isInRecordIdOrder) {
+        // Cannot run validate with {background:true} if either
+        //  - the RecordStore cursor does not retrieve documents in RecordId order
+        //  - or the storage engine does not support checkpoints.
+        if (_background && (!_isInRecordIdOrder || !_engineSupportsCheckpoints)) {
             return;
         }
 
@@ -722,8 +749,10 @@ public:
 
     void run() {
 
-        // Can't do it in background if the RecordStore is not in RecordId order.
-        if (_background && !_isInRecordIdOrder) {
+        // Cannot run validate with {background:true} if either
+        //  - the RecordStore cursor does not retrieve documents in RecordId order
+        //  - or the storage engine does not support checkpoints.
+        if (_background && (!_isInRecordIdOrder || !_engineSupportsCheckpoints)) {
             return;
         }
 
@@ -803,8 +832,10 @@ public:
 
     void run() {
 
-        // Can't do it in background if the RecordStore is not in RecordId order.
-        if (_background && !_isInRecordIdOrder) {
+        // Cannot run validate with {background:true} if either
+        //  - the RecordStore cursor does not retrieve documents in RecordId order
+        //  - or the storage engine does not support checkpoints.
+        if (_background && (!_isInRecordIdOrder || !_engineSupportsCheckpoints)) {
             return;
         }
 
@@ -886,8 +917,10 @@ public:
 
     void run() {
 
-        // Can't do it in background if the RecordStore is not in RecordId order.
-        if (_background && !_isInRecordIdOrder) {
+        // Cannot run validate with {background:true} if either
+        //  - the RecordStore cursor does not retrieve documents in RecordId order
+        //  - or the storage engine does not support checkpoints.
+        if (_background && (!_isInRecordIdOrder || !_engineSupportsCheckpoints)) {
             return;
         }
 
@@ -942,8 +975,10 @@ public:
     ValidateWildCardIndex() : ValidateBase(full, background) {}
 
     void run() {
-        // Can't perform background validation if the RecordStore is not in RecordId order.
-        if (_background && !_isInRecordIdOrder) {
+        // Cannot run validate with {background:true} if either
+        //  - the RecordStore cursor does not retrieve documents in RecordId order
+        //  - or the storage engine does not support checkpoints.
+        if (_background && (!_isInRecordIdOrder || !_engineSupportsCheckpoints)) {
             return;
         }
 
@@ -1024,7 +1059,7 @@ public:
                                        recordId)
                     .release();
             auto insertStatus =
-                sortedDataInterface->insert(&_opCtx, indexKey, recordId, true /* dupsAllowed */);
+                sortedDataInterface->insert(&_opCtx, indexKey, true /* dupsAllowed */);
             ASSERT_OK(insertStatus);
             wunit.commit();
         }
@@ -1046,7 +1081,7 @@ public:
                                        sortedDataInterface->getOrdering(),
                                        recordId)
                     .release();
-            sortedDataInterface->unindex(&_opCtx, indexKey, recordId, true /* dupsAllowed */);
+            sortedDataInterface->unindex(&_opCtx, indexKey, true /* dupsAllowed */);
             wunit.commit();
         }
 
@@ -1063,8 +1098,10 @@ public:
     ValidateWildCardIndexWithProjection() : ValidateBase(full, background) {}
 
     void run() {
-        // Can't perform background validation if the RecordStore is not in RecordId order.
-        if (_background && !_isInRecordIdOrder) {
+        // Cannot run validate with {background:true} if either
+        //  - the RecordStore cursor does not retrieve documents in RecordId order
+        //  - or the storage engine does not support checkpoints.
+        if (_background && (!_isInRecordIdOrder || !_engineSupportsCheckpoints)) {
             return;
         }
 
@@ -1145,7 +1182,7 @@ public:
                                        sortedDataInterface->getOrdering(),
                                        recordId)
                     .release();
-            sortedDataInterface->unindex(&_opCtx, indexKey, recordId, true /* dupsAllowed */);
+            sortedDataInterface->unindex(&_opCtx, indexKey, true /* dupsAllowed */);
             wunit.commit();
         }
         releaseDb();
@@ -1159,8 +1196,10 @@ public:
     ValidateMissingAndExtraIndexEntryResults() : ValidateBase(full, background) {}
 
     void run() {
-        // Can't perform background validation if the RecordStore is not in RecordId order.
-        if (_background && !_isInRecordIdOrder) {
+        // Cannot run validate with {background:true} if either
+        //  - the RecordStore cursor does not retrieve documents in RecordId order
+        //  - or the storage engine does not support checkpoints.
+        if (_background && (!_isInRecordIdOrder || !_engineSupportsCheckpoints)) {
             return;
         }
 
@@ -1217,11 +1256,15 @@ public:
         releaseDb();
 
         {
+            // This function will force a checkpoint, so background validation can then read from
+            // that checkpoint and see all the new data.
+            _opCtx.recoveryUnit()->waitUntilUnjournaledWritesDurable(&_opCtx);
+
             ValidateResults results;
             BSONObjBuilder output;
 
             ASSERT_OK(CollectionValidation::validate(
-                &_opCtx, _nss, kValidateFull, _background, &results, &output));
+                &_opCtx, _nss, /*fullValidate=*/true, _background, &results, &output));
 
             ASSERT_EQ(false, results.valid);
             ASSERT_EQ(static_cast<size_t>(1), results.errors.size());
@@ -1238,8 +1281,10 @@ public:
     ValidateMissingIndexEntryResults() : ValidateBase(full, background) {}
 
     void run() {
-        // Can't perform background validation if the RecordStore is not in RecordId order.
-        if (_background && !_isInRecordIdOrder) {
+        // Cannot run validate with {background:true} if either
+        //  - the RecordStore cursor does not retrieve documents in RecordId order
+        //  - or the storage engine does not support checkpoints.
+        if (_background && (!_isInRecordIdOrder || !_engineSupportsCheckpoints)) {
             return;
         }
 
@@ -1316,11 +1361,15 @@ public:
         }
 
         {
+            // This function will force a checkpoint, so background validation can then read from
+            // that checkpoint and see all the new data.
+            _opCtx.recoveryUnit()->waitUntilUnjournaledWritesDurable(&_opCtx);
+
             ValidateResults results;
             BSONObjBuilder output;
 
             ASSERT_OK(CollectionValidation::validate(
-                &_opCtx, _nss, kValidateFull, _background, &results, &output));
+                &_opCtx, _nss, /*fullValidate=*/true, _background, &results, &output));
 
             ASSERT_EQ(false, results.valid);
             ASSERT_EQ(static_cast<size_t>(1), results.errors.size());
@@ -1337,8 +1386,10 @@ public:
     ValidateExtraIndexEntryResults() : ValidateBase(full, background) {}
 
     void run() {
-        // Can't perform background validation if the RecordStore is not in RecordId order.
-        if (_background && !_isInRecordIdOrder) {
+        // Cannot run validate with {background:true} if either
+        //  - the RecordStore cursor does not retrieve documents in RecordId order
+        //  - or the storage engine does not support checkpoints.
+        if (_background && (!_isInRecordIdOrder || !_engineSupportsCheckpoints)) {
             return;
         }
 
@@ -1393,11 +1444,15 @@ public:
         }
 
         {
+            // This function will force a checkpoint, so background validation can then read from
+            // that checkpoint and see all the new data.
+            _opCtx.recoveryUnit()->waitUntilUnjournaledWritesDurable(&_opCtx);
+
             ValidateResults results;
             BSONObjBuilder output;
 
             ASSERT_OK(CollectionValidation::validate(
-                &_opCtx, _nss, kValidateFull, _background, &results, &output));
+                &_opCtx, _nss, /*fullValidate=*/true, _background, &results, &output));
 
             ASSERT_EQ(false, results.valid);
             ASSERT_EQ(static_cast<size_t>(2), results.errors.size());

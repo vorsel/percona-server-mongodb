@@ -43,7 +43,7 @@
 #include "mongo/db/repl/replication_consistency_markers.h"
 #include "mongo/db/repl/session_update_tracker.h"
 #include "mongo/db/repl/storage_interface.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/util/concurrency/thread_pool.h"
 
 namespace mongo {
@@ -73,14 +73,6 @@ public:
                              WorkerMultikeyPathInfo* workerMultikeyPathInfo)>;
 
     /**
-     * Applies the operations that is in param ops.
-     * Functions for applying operations/commands and increment server status counters may
-     * be overridden for testing.
-     */
-    static Status syncApply(OperationContext* opCtx,
-                            const OplogEntryBatch& batch,
-                            OplogApplication::Mode oplogApplicationMode);
-    /**
      *
      * Constructs a SyncTail.
      * During steady state replication, oplogApplication() obtains batches of operations to apply
@@ -107,9 +99,9 @@ public:
      * Retrieves operations from the OplogBuffer in batches that will be applied in parallel using
      * multiApply().
      */
-    void oplogApplication(OplogBuffer* oplogBuffer,
-                          OplogApplier::GetNextApplierBatchFn getNextApplierBatchFn,
-                          ReplicationCoordinator* replCoord);
+    void runLoop(OplogBuffer* oplogBuffer,
+                 OplogApplier::GetNextApplierBatchFn getNextApplierBatchFn,
+                 ReplicationCoordinator* replCoord);
 
     /**
      * Shuts down oplogApplication() processing.
@@ -227,26 +219,15 @@ public:
 private:
     class OpQueueBatcher;
 
-    void _oplogApplication(ReplicationCoordinator* replCoord, OpQueueBatcher* batcher) noexcept;
-
-    void _fillWriterVectors(OperationContext* opCtx,
-                            MultiApplier::Operations* ops,
-                            std::vector<MultiApplier::OperationPtrs>* writerVectors,
-                            std::vector<MultiApplier::Operations>* derivedOps,
-                            SessionUpdateTracker* sessionUpdateTracker) noexcept;
-
-    /**
-     * Doles out all the work to the writer pool threads. Does not modify writerVectors, but passes
-     * non-const pointers to inner vectors into func.
-     */
-    void _applyOps(std::vector<MultiApplier::OperationPtrs>& writerVectors,
-                   std::vector<Status>* statusVector,
-                   std::vector<WorkerMultikeyPathInfo>* workerMultikeyPathInfo);
-
     OplogApplier::Observer* const _observer;
     ReplicationConsistencyMarkers* const _consistencyMarkers;
     StorageInterface* const _storageInterface;
 
+    void _deriveOpsAndFillWriterVectors(OperationContext* opCtx,
+                                        MultiApplier::Operations* ops,
+                                        std::vector<MultiApplier::OperationPtrs>* writerVectors,
+                                        std::vector<MultiApplier::Operations>* derivedOps,
+                                        SessionUpdateTracker* sessionUpdateTracker) noexcept;
     // Function to use during applyOps
     MultiSyncApplyFunc _applyFunc;
 
@@ -258,16 +239,25 @@ private:
     const OplogApplier::Options _options;
 
     // Protects member data of SyncTail.
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("SyncTail::_mutex");
 
     // Set to true if shutdown() has been called.
     bool _inShutdown = false;
 };
 
-// This free function is used by the thread pool workers to write ops to the db.
-// This consumes the passed in OperationPtrs and callers should not make any assumptions about the
-// state of the container after calling. However, this function cannot modify the pointed-to
-// operations because the OperationPtrs container contains const pointers.
+/**
+ * Applies a batch of operations.
+ */
+Status syncApply(OperationContext* opCtx,
+                 const OplogEntryBatch& batch,
+                 OplogApplication::Mode oplogApplicationMode);
+
+/**
+ * This free function is used by the thread pool workers to write ops to the db.
+ * This consumes the passed in OperationPtrs and callers should not make any assumptions about the
+ * state of the container after calling. However, this function cannot modify the pointed-to
+ * operations because the OperationPtrs container contains const pointers.
+ */
 Status multiSyncApply(OperationContext* opCtx,
                       MultiApplier::OperationPtrs* ops,
                       SyncTail* st,

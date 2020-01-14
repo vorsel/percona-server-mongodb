@@ -50,7 +50,7 @@ MONGO_FAIL_POINT_DEFINE(validateCmdCollectionNotValid);
 namespace {
 
 // Protects the state below.
-stdx::mutex _validationMutex;
+Mutex _validationMutex;
 
 // Holds the set of full `databaseName.collectionName` namespace strings in progress. Validation
 // commands register themselves in this data structure so that subsequent commands on the same
@@ -109,30 +109,29 @@ public:
              const std::string& dbname,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) {
-        if (MONGO_FAIL_POINT(validateCmdCollectionNotValid)) {
+        if (MONGO_unlikely(validateCmdCollectionNotValid.shouldFail())) {
             result.appendBool("valid", false);
             return true;
         }
 
         const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
 
-        const bool full = cmdObj["full"].trueValue();
-
-        ValidateCmdLevel level = kValidateNormal;
-        if (full) {
-            level = kValidateFull;
-        }
-
-        // TODO (SERVER-30357): Add support for background validation.
-        const bool background = false;
+        const bool background = cmdObj["background"].trueValue();
 
         // Background validation requires the storage engine to support checkpoints because it
         // performs the validation on a checkpoint using checkpoint cursors.
         if (background && !opCtx->getServiceContext()->getStorageEngine()->supportsCheckpoints()) {
-            uasserted(ErrorCodes::CommandFailed,
+            uasserted(ErrorCodes::CommandNotSupported,
                       str::stream() << "Running validate on collection " << nss
                                     << " with { background: true } is not supported on the "
                                     << storageGlobalParams.engine << " storage engine");
+        }
+
+        const bool fullValidate = cmdObj["full"].trueValue();
+        if (background && fullValidate) {
+            uasserted(ErrorCodes::CommandNotSupported,
+                      str::stream() << "Running the validate command with both { background: true }"
+                                    << " and { full: true } is not supported.");
         }
 
         if (!serverGlobalParams.quiet.load()) {
@@ -141,7 +140,7 @@ public:
 
         // Only one validation per collection can be in progress, the rest wait.
         {
-            stdx::unique_lock<stdx::mutex> lock(_validationMutex);
+            stdx::unique_lock<Latch> lock(_validationMutex);
             try {
                 while (_validationsInProgress.find(nss.ns()) != _validationsInProgress.end()) {
                     opCtx->waitForConditionOrInterrupt(_validationNotifier, lock);
@@ -158,21 +157,16 @@ public:
         }
 
         ON_BLOCK_EXIT([&] {
-            stdx::lock_guard<stdx::mutex> lock(_validationMutex);
+            stdx::lock_guard<Latch> lock(_validationMutex);
             _validationsInProgress.erase(nss.ns());
             _validationNotifier.notify_all();
         });
 
         ValidateResults validateResults;
         Status status = CollectionValidation::validate(
-            opCtx, nss, level, background, &validateResults, &result);
+            opCtx, nss, fullValidate, background, &validateResults, &result);
         if (!status.isOK()) {
             return CommandHelpers::appendCommandStatusNoThrow(result, status);
-        }
-
-        if (!full) {
-            validateResults.warnings.push_back(
-                "Some checks omitted for speed. use {full:true} option to do more thorough scan.");
         }
 
         result.appendBool("valid", validateResults.valid);

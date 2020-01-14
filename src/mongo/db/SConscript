@@ -133,6 +133,9 @@ env.Library(
         'server_options',
         'generic_cursor',
     ],
+    LIBDEPS_PRIVATE=[
+        'prepare_conflict_tracker',
+    ],
 )
 
 env.Library(
@@ -187,6 +190,9 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/repl/optime',
+    ],
+    LIBDEPS_PRIVATE=[
+        'server_options_core',
     ],
 )
 
@@ -763,6 +769,7 @@ env.Library(
         "collection_index_builds_tracker.cpp",
         "database_index_builds_tracker.cpp",
         "index_builds_coordinator.cpp",
+        env.Idlc('enable_two_phase_index_build.idl')[0],
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/base",
@@ -774,12 +781,14 @@ env.Library(
         'catalog/database_holder',
         'db_raii',
         'index_build_entry_helpers',
+        'server_options_core',
         '$BUILD_DIR/mongo/db/catalog/index_build_entry_idl',
         '$BUILD_DIR/mongo/db/catalog/collection',
         '$BUILD_DIR/mongo/db/catalog/collection_catalog',
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
         '$BUILD_DIR/mongo/db/s/sharding_api_d',
+        '$BUILD_DIR/mongo/idl/server_parameter',
         '$BUILD_DIR/mongo/util/fail_point',
     ],
 )
@@ -963,6 +972,16 @@ env.Library(
 )
 
 env.Library(
+    target='projection_executor',
+    source=[
+        'exec/find_projection_executor.cpp',
+    ],
+    LIBDEPS=[
+        'matcher/expressions'
+    ],
+)
+
+env.Library(
     target='query_exec',
     source=[
         'clientcursor.cpp',
@@ -979,7 +998,6 @@ env.Library(
         'exec/ensure_sorted.cpp',
         'exec/eof.cpp',
         'exec/fetch.cpp',
-        'exec/find_projection_executor.cpp',
         'exec/geo_near.cpp',
         'exec/idhack.cpp',
         'exec/index_scan.cpp',
@@ -998,6 +1016,7 @@ env.Library(
         'exec/requires_all_indices_stage.cpp',
         'exec/requires_collection_stage.cpp',
         'exec/requires_index_stage.cpp',
+        'exec/return_key.cpp',
         'exec/shard_filter.cpp',
         'exec/shard_filterer_impl.cpp',
         'exec/skip.cpp',
@@ -1058,6 +1077,7 @@ env.Library(
         'matcher/expressions_mongod_only',
         'ops/parsed_update',
         'pipeline/pipeline',
+        'projection_executor',
         'query/query_common',
         'query/query_planner',
         'repl/repl_coordinator_interface',
@@ -1779,6 +1799,7 @@ envWithAsio.CppUnitTest(
         '$BUILD_DIR/mongo/executor/async_timer_mock',
         '$BUILD_DIR/mongo/idl/idl_parser',
         '$BUILD_DIR/mongo/idl/server_parameter',
+        '$BUILD_DIR/mongo/rpc/command_status',
         '$BUILD_DIR/mongo/rpc/rpc',
         '$BUILD_DIR/mongo/transport/transport_layer_mock',
         '$BUILD_DIR/mongo/util/clock_source_mock',

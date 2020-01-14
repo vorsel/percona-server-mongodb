@@ -98,7 +98,8 @@ public:
             WorkingSetID id = ws->allocate();
             WorkingSetMember* member = ws->get(id);
             member->recordId = *it;
-            member->obj = coll->docFor(&_opCtx, *it);
+            auto snapshotBson = coll->docFor(&_opCtx, *it);
+            member->doc = {snapshotBson.snapshotId(), Document{snapshotBson.value()}};
             ws->transitionToRecordIdAndObj(id);
             ms->pushBack(id);
         }
@@ -115,14 +116,12 @@ public:
         auto queuedDataStage = std::make_unique<QueuedDataStage>(&_opCtx, ws.get());
         insertVarietyOfObjects(ws.get(), queuedDataStage.get(), coll);
 
-        SortStageParams params;
-        params.pattern = BSON("foo" << 1);
-        params.limit = limit();
-
+        auto sortPattern = BSON("foo" << 1);
         auto keyGenStage = std::make_unique<SortKeyGeneratorStage>(
-            _pExpCtx, queuedDataStage.release(), ws.get(), params.pattern);
+            _expCtx, std::move(queuedDataStage), ws.get(), sortPattern);
 
-        auto ss = std::make_unique<SortStage>(&_opCtx, params, ws.get(), keyGenStage.release());
+        auto ss = std::make_unique<SortStage>(
+            _expCtx, ws.get(), sortPattern, limit(), maxMemoryUsageBytes(), std::move(keyGenStage));
 
         // The PlanExecutor will be automatically registered on construction due to the auto
         // yield policy, so it can receive invalidations when we remove documents later.
@@ -153,18 +152,15 @@ public:
         // Insert a mix of the various types of data.
         insertVarietyOfObjects(ws.get(), queuedDataStage.get(), coll);
 
-        SortStageParams params;
-        params.pattern = BSON("foo" << direction);
-        params.limit = limit();
-
+        auto sortPattern = BSON("foo" << direction);
         auto keyGenStage = std::make_unique<SortKeyGeneratorStage>(
-            _pExpCtx, queuedDataStage.release(), ws.get(), params.pattern);
+            _expCtx, std::move(queuedDataStage), ws.get(), sortPattern);
 
-        auto sortStage =
-            std::make_unique<SortStage>(&_opCtx, params, ws.get(), keyGenStage.release());
+        auto sortStage = std::make_unique<SortStage>(
+            _expCtx, ws.get(), sortPattern, limit(), maxMemoryUsageBytes(), std::move(keyGenStage));
 
         auto fetchStage =
-            std::make_unique<FetchStage>(&_opCtx, ws.get(), sortStage.release(), nullptr, coll);
+            std::make_unique<FetchStage>(&_opCtx, ws.get(), std::move(sortStage), nullptr, coll);
 
         // Must fetch so we can look at the doc as a BSONObj.
         auto statusWithPlanExecutor = PlanExecutor::make(
@@ -184,7 +180,7 @@ public:
         BSONObj current;
         PlanExecutor::ExecState state;
         while (PlanExecutor::ADVANCED == (state = exec->getNext(&current, nullptr))) {
-            int cmp = sgn(dps::compareObjectsAccordingToSort(current, last, params.pattern));
+            int cmp = sgn(dps::compareObjectsAccordingToSort(current, last, sortPattern));
             // The next object should be equal to the previous or oriented according to the sort
             // pattern.
             ASSERT(cmp == 0 || cmp == 1);
@@ -216,6 +212,9 @@ public:
         return 0;
     };
 
+    uint64_t maxMemoryUsageBytes() const {
+        return internalQueryExecMaxBlockingSortBytes.load();
+    }
 
     static const char* ns() {
         return "unittests.QueryStageSort";
@@ -227,7 +226,7 @@ public:
 protected:
     const ServiceContext::UniqueOperationContext _txnPtr = cc().makeOperationContext();
     OperationContext& _opCtx = *_txnPtr;
-    boost::intrusive_ptr<ExpressionContext> _pExpCtx = new ExpressionContext(&_opCtx, nullptr);
+    boost::intrusive_ptr<ExpressionContext> _expCtx = new ExpressionContext(&_opCtx, nullptr);
     DBDirectClient _client;
 };
 
@@ -403,10 +402,10 @@ public:
             }
             WorkingSetMember* member = exec->getWorkingSet()->get(id);
             ASSERT(member->hasObj());
-            if (member->obj.value().getField("_id").OID() == updatedId) {
-                ASSERT(idBeforeUpdate == member->obj.snapshotId());
+            if (member->doc.value().getField("_id").getOid() == updatedId) {
+                ASSERT(idBeforeUpdate == member->doc.snapshotId());
             }
-            thisVal = member->obj.value().getField("foo").Int();
+            thisVal = member->doc.value().getField("foo").getInt();
             ASSERT_LTE(lastVal, thisVal);
             // Expect docs in range [0, limit)
             ASSERT_LTE(0, thisVal);
@@ -541,31 +540,31 @@ public:
             {
                 WorkingSetID id = ws->allocate();
                 WorkingSetMember* member = ws->get(id);
-                member->obj = Snapshotted<BSONObj>(
-                    SnapshotId(), fromjson("{a: [1,2,3], b:[1,2,3], c:[1,2,3], d:[1,2,3,4]}"));
+                member->doc = {
+                    SnapshotId(),
+                    Document{fromjson("{a: [1,2,3], b:[1,2,3], c:[1,2,3], d:[1,2,3,4]}")}};
                 member->transitionToOwnedObj();
                 queuedDataStage->pushBack(id);
             }
             {
                 WorkingSetID id = ws->allocate();
                 WorkingSetMember* member = ws->get(id);
-                member->obj = Snapshotted<BSONObj>(SnapshotId(), fromjson("{a:1, b:1, c:1}"));
+                member->doc = {SnapshotId(), Document{fromjson("{a:1, b:1, c:1}")}};
                 member->transitionToOwnedObj();
                 queuedDataStage->pushBack(id);
             }
         }
 
-        SortStageParams params;
-        params.pattern = BSON("b" << -1 << "c" << 1 << "a" << 1);
+        auto sortPattern = BSON("b" << -1 << "c" << 1 << "a" << 1);
 
         auto keyGenStage = std::make_unique<SortKeyGeneratorStage>(
-            _pExpCtx, queuedDataStage.release(), ws.get(), params.pattern);
+            _expCtx, std::move(queuedDataStage), ws.get(), sortPattern);
 
-        auto sortStage =
-            std::make_unique<SortStage>(&_opCtx, params, ws.get(), keyGenStage.release());
+        auto sortStage = std::make_unique<SortStage>(
+            _expCtx, ws.get(), sortPattern, 0u, maxMemoryUsageBytes(), std::move(keyGenStage));
 
         auto fetchStage =
-            std::make_unique<FetchStage>(&_opCtx, ws.get(), sortStage.release(), nullptr, coll);
+            std::make_unique<FetchStage>(&_opCtx, ws.get(), std::move(sortStage), nullptr, coll);
 
         // We don't get results back since we're sorting some parallel arrays.
         auto statusWithPlanExecutor = PlanExecutor::make(

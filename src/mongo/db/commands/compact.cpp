@@ -105,12 +105,10 @@ public:
             return false;
         }
 
-        CompactOptions compactOptions;
+        StatusWith<int64_t> status = compactCollection(opCtx, nss);
+        uassertStatusOK(status.getStatus());
+        result.appendNumber("bytesFreed", static_cast<long long>(status.getValue()));
 
-        if (cmdObj.hasElement("validate"))
-            compactOptions.validateDocuments = cmdObj["validate"].trueValue();
-
-        uassertStatusOK(compactCollection(opCtx, nss, &compactOptions));
         return true;
     }
 };

@@ -73,7 +73,7 @@ public:
      */
     std::tuple<bool, std::shared_ptr<Notification<Status>>> getOrCreateWriteRequest(
         LogicalTime clusterTime) {
-        stdx::unique_lock<stdx::mutex> lock(_mutex);
+        stdx::unique_lock<Latch> lock(_mutex);
         auto lastEl = _writeRequests.rbegin();
         if (lastEl != _writeRequests.rend() && lastEl->first >= clusterTime.asTimestamp()) {
             return std::make_tuple(false, lastEl->second);
@@ -88,7 +88,7 @@ public:
      * Erases writeRequest that happened at clusterTime
      */
     void deleteWriteRequest(LogicalTime clusterTime) {
-        stdx::unique_lock<stdx::mutex> lock(_mutex);
+        stdx::unique_lock<Latch> lock(_mutex);
         auto el = _writeRequests.find(clusterTime.asTimestamp());
         invariant(el != _writeRequests.end());
         invariant(el->second);
@@ -97,7 +97,7 @@ public:
     }
 
 private:
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("WriteRequestSynchronizer::_mutex");
     std::map<Timestamp, std::shared_ptr<Notification<Status>>> _writeRequests;
 };
 
@@ -207,8 +207,14 @@ Status makeNoopWriteIfNeeded(OperationContext* opCtx, LogicalTime clusterTime) {
 /**
  * Evaluates if it's safe for the command to ignore prepare conflicts.
  */
-bool canIgnorePrepareConflicts(const repl::ReadConcernArgs& readConcernArgs) {
+bool canIgnorePrepareConflicts(OperationContext* opCtx,
+                               const repl::ReadConcernArgs& readConcernArgs) {
+    if (opCtx->inMultiDocumentTransaction()) {
+        return false;
+    }
+
     auto readConcernLevel = readConcernArgs.getLevel();
+
     // Only these read concern levels are eligible for ignoring prepare conflicts.
     if (readConcernLevel != repl::ReadConcernLevel::kLocalReadConcern &&
         readConcernLevel != repl::ReadConcernLevel::kAvailableReadConcern &&
@@ -240,7 +246,7 @@ MONGO_REGISTER_SHIM(setPrepareConflictBehaviorForReadConcern)
 
     // Enforce prepare conflict behavior if the command is not eligible to ignore prepare conflicts.
     if (!(prepareConflictBehavior == PrepareConflictBehavior::kEnforce ||
-          canIgnorePrepareConflicts(readConcernArgs))) {
+          canIgnorePrepareConflicts(opCtx, readConcernArgs))) {
         prepareConflictBehavior = PrepareConflictBehavior::kEnforce;
     }
 

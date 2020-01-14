@@ -356,22 +356,19 @@ void ReplicationRecoveryImpl::_applyToEndOfOplog(OperationContext* opCtx,
 
     RecoveryOplogApplierStats stats;
 
-    auto writerPool = OplogApplier::makeWriterPool();
-    OplogApplier::Options options(OplogApplication::Mode::kRecovering);
-    options.allowNamespaceNotFoundErrorsOnCrudOps = true;
-    options.skipWritesToOplog = true;
+    auto writerPool = makeReplWriterPool();
     OplogApplierImpl oplogApplier(nullptr,
                                   &oplogBuffer,
                                   &stats,
                                   nullptr,
                                   _consistencyMarkers,
                                   _storageInterface,
-                                  options,
+                                  OplogApplier::Options(OplogApplication::Mode::kRecovering),
                                   writerPool.get());
 
     OplogApplier::BatchLimits batchLimits;
-    batchLimits.bytes = OplogApplier::calculateBatchLimitBytes(opCtx, _storageInterface);
-    batchLimits.ops = OplogApplier::getBatchLimitOperations();
+    batchLimits.bytes = getBatchLimitOplogBytes(opCtx, _storageInterface);
+    batchLimits.ops = getBatchLimitOplogEntries();
 
     OpTime applyThroughOpTime;
     OplogApplier::Operations batch;

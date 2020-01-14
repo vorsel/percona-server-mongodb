@@ -126,10 +126,6 @@ void setPrePostImageTs(const ProcessOplogResult& lastResult, repl::MutableOplogE
 repl::MutableOplogEntry parseOplog(const BSONObj& oplogBSON) {
     auto oplogEntry = uassertStatusOK(repl::MutableOplogEntry::parse(oplogBSON));
 
-    // Session oplog entries must always contain wall clock time, because we will not be
-    // transferring anything from a previous version of the server
-    invariant(oplogEntry.getWallClockTime());
-
     const auto& sessionInfo = oplogEntry.getOperationSessionInfo();
 
     uassert(ErrorCodes::UnsupportedFormat,
@@ -292,7 +288,7 @@ ProcessOplogResult processSessionOplog(const BSONObj& oplogBSON,
                 sessionTxnRecord.setSessionId(result.sessionId);
                 sessionTxnRecord.setTxnNum(result.txnNum);
                 sessionTxnRecord.setLastWriteOpTime(oplogOpTime);
-                sessionTxnRecord.setLastWriteDate(*oplogEntry.getWallClockTime());
+                sessionTxnRecord.setLastWriteDate(oplogEntry.getWallClockTime());
                 // We do not migrate transaction oplog entries so don't set the txn state.
                 txnParticipant.onMigrateCompletedOnPrimary(opCtx, {stmtId}, sessionTxnRecord);
             }
@@ -320,7 +316,7 @@ SessionCatalogMigrationDestination::~SessionCatalogMigrationDestination() {
 
 void SessionCatalogMigrationDestination::start(ServiceContext* service) {
     {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
         invariant(_state == State::NotStarted);
         _state = State::Migrating;
         _isStateChanged.notify_all();
@@ -344,7 +340,7 @@ void SessionCatalogMigrationDestination::start(ServiceContext* service) {
 }
 
 void SessionCatalogMigrationDestination::finish() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     if (_state != State::ErrorOccurred) {
         _state = State::Committing;
         _isStateChanged.notify_all();
@@ -370,8 +366,8 @@ void SessionCatalogMigrationDestination::join() {
  * 6. Wait for writes to be committed to majority of the replica set.
  */
 void SessionCatalogMigrationDestination::_retrieveSessionStateFromSource(ServiceContext* service) {
-    Client::initThread(
-        "sessionCatalogMigrationProducer-" + _migrationSessionId.toString(), service, nullptr);
+    Client::initKillableThread("sessionCatalogMigrationProducer-" + _migrationSessionId.toString(),
+                               service);
 
     bool oplogDrainedAfterCommiting = false;
     ProcessOplogResult lastResult;
@@ -379,7 +375,7 @@ void SessionCatalogMigrationDestination::_retrieveSessionStateFromSource(Service
 
     while (true) {
         {
-            stdx::lock_guard<stdx::mutex> lk(_mutex);
+            stdx::lock_guard<Latch> lk(_mutex);
             if (_state == State::ErrorOccurred) {
                 return;
             }
@@ -397,7 +393,7 @@ void SessionCatalogMigrationDestination::_retrieveSessionStateFromSource(Service
 
             if (oplogArray.isEmpty()) {
                 {
-                    stdx::lock_guard<stdx::mutex> lk(_mutex);
+                    stdx::lock_guard<Latch> lk(_mutex);
                     if (_state == State::Committing) {
                         // The migration is considered done only when it gets an empty result from
                         // the source shard while this is in state committing. This is to make sure
@@ -418,7 +414,7 @@ void SessionCatalogMigrationDestination::_retrieveSessionStateFromSource(Service
 
                 // We depleted the buffer at least once, transition to ready for commit.
                 {
-                    stdx::lock_guard<stdx::mutex> lk(_mutex);
+                    stdx::lock_guard<Latch> lk(_mutex);
                     // Note: only transition to "ready to commit" if state is not error/force stop.
                     if (_state == State::Migrating) {
                         _state = State::ReadyToCommit;
@@ -459,19 +455,19 @@ void SessionCatalogMigrationDestination::_retrieveSessionStateFromSource(Service
         waitForWriteConcern(uniqueOpCtx.get(), lastResult.oplogTime, kMajorityWC, &unusedWCResult));
 
     {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
         _state = State::Done;
         _isStateChanged.notify_all();
     }
 }
 
 std::string SessionCatalogMigrationDestination::getErrMsg() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     return _errMsg;
 }
 
 void SessionCatalogMigrationDestination::_errorOccurred(StringData errMsg) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     _state = State::ErrorOccurred;
     _errMsg = errMsg.toString();
 
@@ -479,7 +475,7 @@ void SessionCatalogMigrationDestination::_errorOccurred(StringData errMsg) {
 }
 
 SessionCatalogMigrationDestination::State SessionCatalogMigrationDestination::getState() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     return _state;
 }
 

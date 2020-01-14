@@ -40,7 +40,7 @@
 #include "mongo/db/record_id.h"
 #include "mongo/db/storage/kv/kv_prefix.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/util/debug_util.h"
 
 namespace mongo {
@@ -89,6 +89,9 @@ public:
     /// ---------------------
 
     virtual void setIsReady(const bool newIsReady) = 0;
+
+    virtual void setDropped() = 0;
+    virtual bool isDropped() const = 0;
 
     // --
 

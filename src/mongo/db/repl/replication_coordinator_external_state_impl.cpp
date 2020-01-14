@@ -198,7 +198,7 @@ bool ReplicationCoordinatorExternalStateImpl::isInitialSyncFlagSet(OperationCont
 void ReplicationCoordinatorExternalStateImpl::startSteadyStateReplication(
     OperationContext* opCtx, ReplicationCoordinator* replCoord) {
 
-    stdx::lock_guard<stdx::mutex> lk(_threadMutex);
+    stdx::lock_guard<Latch> lk(_threadMutex);
 
     // We've shut down the external state, don't start again.
     if (_inShutdown)
@@ -248,12 +248,12 @@ void ReplicationCoordinatorExternalStateImpl::startSteadyStateReplication(
 }
 
 void ReplicationCoordinatorExternalStateImpl::stopDataReplication(OperationContext* opCtx) {
-    stdx::unique_lock<stdx::mutex> lk(_threadMutex);
+    stdx::unique_lock<Latch> lk(_threadMutex);
     _stopDataReplication_inlock(opCtx, lk);
 }
 
 void ReplicationCoordinatorExternalStateImpl::_stopDataReplication_inlock(
-    OperationContext* opCtx, stdx::unique_lock<stdx::mutex>& lock) {
+    OperationContext* opCtx, stdx::unique_lock<Latch>& lock) {
     // Make sue no other _stopDataReplication calls are in progress.
     _dataReplicationStopped.wait(lock, [this]() { return !_stoppingDataReplication; });
     _stoppingDataReplication = true;
@@ -308,7 +308,7 @@ void ReplicationCoordinatorExternalStateImpl::_stopDataReplication_inlock(
 
 
 void ReplicationCoordinatorExternalStateImpl::startThreads(const ReplSettings& settings) {
-    stdx::lock_guard<stdx::mutex> lk(_threadMutex);
+    stdx::lock_guard<Latch> lk(_threadMutex);
     if (_startedThreads) {
         return;
     }
@@ -325,13 +325,13 @@ void ReplicationCoordinatorExternalStateImpl::startThreads(const ReplSettings& s
     _taskExecutor = makeTaskExecutor(_service, "replication");
     _taskExecutor->startup();
 
-    _writerPool = OplogApplier::makeWriterPool();
+    _writerPool = makeReplWriterPool();
 
     _startedThreads = true;
 }
 
 void ReplicationCoordinatorExternalStateImpl::shutdown(OperationContext* opCtx) {
-    stdx::unique_lock<stdx::mutex> lk(_threadMutex);
+    stdx::unique_lock<Latch> lk(_threadMutex);
     _inShutdown = true;
     if (!_startedThreads) {
         return;
@@ -460,6 +460,9 @@ OpTime ReplicationCoordinatorExternalStateImpl::onTransitionToPrimary(OperationC
 
     auto newTermStartDate = loadLastOpTimeAndWallTimeResult.getValue().wallTime;
     ReplicationMetrics::get(opCtx).setNewTermStartDate(newTermStartDate);
+
+    auto replCoord = ReplicationCoordinator::get(opCtx);
+    replCoord->createWMajorityWriteAvailabilityDateWaiter(opTimeToReturn);
 
     _shardingOnTransitionToPrimaryHook(opCtx);
 
@@ -648,32 +651,9 @@ StatusWith<OpTimeAndWallTime> ReplicationCoordinatorExternalStateImpl::loadLastO
                                                      << "Did not find any entries in "
                                                      << NamespaceString::kRsOplogNamespace.ns());
         }
-        BSONElement tsElement = oplogEntry[tsFieldName];
-        if (tsElement.eoo()) {
-            return StatusWith<OpTimeAndWallTime>(
-                ErrorCodes::NoSuchKey,
-                str::stream() << "Most recent entry in " << NamespaceString::kRsOplogNamespace.ns()
-                              << " missing \"" << tsFieldName << "\" field");
-        }
-        if (tsElement.type() != bsonTimestamp) {
-            return StatusWith<OpTimeAndWallTime>(
-                ErrorCodes::TypeMismatch,
-                str::stream() << "Expected type of \"" << tsFieldName << "\" in most recent "
-                              << NamespaceString::kRsOplogNamespace.ns()
-                              << " entry to have type Timestamp, but found "
-                              << typeName(tsElement.type()));
-        }
 
-        auto opTimeStatus = OpTime::parseFromOplogEntry(oplogEntry);
-        if (!opTimeStatus.isOK()) {
-            return opTimeStatus.getStatus();
-        }
-        auto wallTimeStatus = OpTime::parseWallTimeFromOplogEntry(oplogEntry);
-        if (!wallTimeStatus.isOK()) {
-            return wallTimeStatus.getStatus();
-        }
-        OpTimeAndWallTime parseResult = {opTimeStatus.getValue(), wallTimeStatus.getValue()};
-        return parseResult;
+        return OpTimeAndWallTime::parseOpTimeAndWallTimeFromOplogEntry(oplogEntry);
+
     } catch (const DBException& ex) {
         return StatusWith<OpTimeAndWallTime>(ex.toStatus());
     }
@@ -792,28 +772,28 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook
 }
 
 void ReplicationCoordinatorExternalStateImpl::signalApplierToChooseNewSyncSource() {
-    stdx::lock_guard<stdx::mutex> lk(_threadMutex);
+    stdx::lock_guard<Latch> lk(_threadMutex);
     if (_bgSync) {
         _bgSync->clearSyncTarget();
     }
 }
 
 void ReplicationCoordinatorExternalStateImpl::stopProducer() {
-    stdx::lock_guard<stdx::mutex> lk(_threadMutex);
+    stdx::lock_guard<Latch> lk(_threadMutex);
     if (_bgSync) {
         _bgSync->stop(false);
     }
 }
 
 void ReplicationCoordinatorExternalStateImpl::startProducerIfStopped() {
-    stdx::lock_guard<stdx::mutex> lk(_threadMutex);
+    stdx::lock_guard<Latch> lk(_threadMutex);
     if (_bgSync) {
         _bgSync->startProducerIfStopped();
     }
 }
 
 bool ReplicationCoordinatorExternalStateImpl::tooStale() {
-    stdx::lock_guard<stdx::mutex> lk(_threadMutex);
+    stdx::lock_guard<Latch> lk(_threadMutex);
     if (_bgSync) {
         return _bgSync->tooStale();
     }
@@ -878,12 +858,12 @@ void ReplicationCoordinatorExternalStateImpl::notifyOplogMetadataWaiters(
             scheduleWork(
                 _taskExecutor.get(),
                 [committedOpTime, reaper](const executor::TaskExecutor::CallbackArgs& args) {
-                    if (MONGO_FAIL_POINT(dropPendingCollectionReaperHang)) {
+                    if (MONGO_unlikely(dropPendingCollectionReaperHang.shouldFail())) {
                         log() << "fail point dropPendingCollectionReaperHang enabled. "
                                  "Blocking until fail point is disabled. "
                                  "committedOpTime: "
                               << committedOpTime;
-                        MONGO_FAIL_POINT_PAUSE_WHILE_SET(dropPendingCollectionReaperHang);
+                        dropPendingCollectionReaperHang.pauseWhileSet();
                     }
                     auto opCtx = cc().makeOperationContext();
                     reaper->dropCollectionsOlderThan(opCtx.get(), committedOpTime);

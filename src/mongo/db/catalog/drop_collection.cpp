@@ -59,18 +59,23 @@ Status _dropView(OperationContext* opCtx,
     if (!db) {
         return Status(ErrorCodes::NamespaceNotFound, "ns not found");
     }
-    auto view = ViewCatalog::get(db)->lookup(opCtx, collectionName.ns());
+    auto view =
+        ViewCatalog::get(db)->lookupWithoutValidatingDurableViews(opCtx, collectionName.ns());
     if (!view) {
         return Status(ErrorCodes::NamespaceNotFound, "ns not found");
     }
+
+    // Validates the view or throws an "invalid view" error.
+    ViewCatalog::get(db)->lookup(opCtx, collectionName.ns());
+
     Lock::CollectionLock collLock(opCtx, collectionName, MODE_IX);
     // Operations all lock system.views in the end to prevent deadlock.
     Lock::CollectionLock systemViewsLock(opCtx, db->getSystemViewsName(), MODE_X);
 
-    if (MONGO_FAIL_POINT(hangDuringDropCollection)) {
+    if (MONGO_unlikely(hangDuringDropCollection.shouldFail())) {
         log() << "hangDuringDropCollection fail point enabled. Blocking until fail point is "
                  "disabled.";
-        MONGO_FAIL_POINT_PAUSE_WHILE_SET(hangDuringDropCollection);
+        hangDuringDropCollection.pauseWhileSet();
     }
 
     AutoStatsTracker statsTracker(opCtx,
@@ -108,10 +113,10 @@ Status _dropCollection(OperationContext* opCtx,
         return Status(ErrorCodes::NamespaceNotFound, "ns not found");
     }
 
-    if (MONGO_FAIL_POINT(hangDuringDropCollection)) {
+    if (MONGO_unlikely(hangDuringDropCollection.shouldFail())) {
         log() << "hangDuringDropCollection fail point enabled. Blocking until fail point is "
                  "disabled.";
-        MONGO_FAIL_POINT_PAUSE_WHILE_SET(hangDuringDropCollection);
+        hangDuringDropCollection.pauseWhileSet();
     }
 
     AutoStatsTracker statsTracker(opCtx,
@@ -156,9 +161,9 @@ Status dropCollection(OperationContext* opCtx,
         log() << "CMD: drop " << collectionName;
     }
 
-    if (MONGO_FAIL_POINT(hangDropCollectionBeforeLockAcquisition)) {
+    if (MONGO_unlikely(hangDropCollectionBeforeLockAcquisition.shouldFail())) {
         log() << "Hanging drop collection before lock acquisition while fail point is set";
-        MONGO_FAIL_POINT_PAUSE_WHILE_SET(hangDropCollectionBeforeLockAcquisition);
+        hangDropCollectionBeforeLockAcquisition.pauseWhileSet();
     }
     return writeConflictRetry(opCtx, "drop", collectionName.ns(), [&] {
         AutoGetDb autoDb(opCtx, collectionName.db(), MODE_IX);

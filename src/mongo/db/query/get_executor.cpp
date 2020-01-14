@@ -49,6 +49,7 @@
 #include "mongo/db/exec/multi_plan.h"
 #include "mongo/db/exec/projection.h"
 #include "mongo/db/exec/record_store_fast_count.h"
+#include "mongo/db/exec/return_key.h"
 #include "mongo/db/exec/shard_filter.h"
 #include "mongo/db/exec/sort_key_generator.h"
 #include "mongo/db/exec/subplan.h"
@@ -385,26 +386,35 @@ StatusWith<PrepareExecutionResult> prepareExecution(OperationContext* opCtx,
                 CollectionShardingState::get(opCtx, canonicalQuery->nss())
                     ->getOrphansFilter(opCtx, collection),
                 ws,
-                root.release());
+                std::move(root));
         }
 
-        // There might be a projection. The idhack stage will always fetch the full
-        // document, so we don't support covered projections. However, we might use the
-        // simple inclusion fast path.
-        if (nullptr != canonicalQuery->getProj()) {
+        // Add a SortKeyGeneratorStage if there is a $meta sortKey projection.
+        if (canonicalQuery->getProj() && canonicalQuery->getProj()->wantSortKey()) {
+            root = std::make_unique<SortKeyGeneratorStage>(
+                canonicalQuery->getExpCtx(),
+                std::move(root),
+                ws,
+                canonicalQuery->getQueryRequest().getSort());
+        }
 
-            // Add a SortKeyGeneratorStage if there is a $meta sortKey projection.
-            if (canonicalQuery->getProj()->wantSortKey()) {
-                root = std::make_unique<SortKeyGeneratorStage>(
-                    canonicalQuery->getExpCtx(),
-                    root.release(),
-                    ws,
-                    canonicalQuery->getQueryRequest().getSort());
-            }
-
+        if (canonicalQuery->getQueryRequest().returnKey()) {
+            // If returnKey was requested, add ReturnKeyStage to return only the index keys in the
+            // resulting documents. If a projection was also specified, it will be ignored, with
+            // the exception the $meta sortKey projection, which can be used along with the
+            // returnKey.
+            root = std::make_unique<ReturnKeyStage>(
+                opCtx,
+                QueryPlannerCommon::extractSortKeyMetaFieldsFromProjection(
+                    canonicalQuery->getQueryRequest().getProj()),
+                ws,
+                std::move(root));
+        } else if (canonicalQuery->getProj()) {
+            // There might be a projection. The idhack stage will always fetch the full
+            // document, so we don't support covered projections. However, we might use the
+            // simple inclusion fast path.
             // Stuff the right data into the params depending on what proj impl we use.
             if (canonicalQuery->getProj()->requiresDocument() ||
-                canonicalQuery->getProj()->wantIndexKey() ||
                 canonicalQuery->getProj()->wantSortKey() ||
                 canonicalQuery->getProj()->hasDottedFieldPath()) {
                 root = std::make_unique<ProjectionStageDefault>(
@@ -456,23 +466,23 @@ StatusWith<PrepareExecutionResult> prepareExecution(OperationContext* opCtx,
                     LOG(2) << "Using fast count: " << redact(canonicalQuery->toStringShort());
                 }
 
-                PlanStage* rawRoot;
-                verify(StageBuilder::build(
-                    opCtx, collection, *canonicalQuery, *querySolution, ws, &rawRoot));
+                auto root =
+                    StageBuilder::build(opCtx, collection, *canonicalQuery, *querySolution, ws);
 
                 // Add a CachedPlanStage on top of the previous root.
                 //
                 // 'decisionWorks' is used to determine whether the existing cache entry should
                 // be evicted, and the query replanned.
-                root = std::make_unique<CachedPlanStage>(opCtx,
-                                                         collection,
-                                                         ws,
-                                                         canonicalQuery.get(),
-                                                         plannerParams,
-                                                         cs->decisionWorks,
-                                                         rawRoot);
-                return PrepareExecutionResult(
-                    std::move(canonicalQuery), std::move(querySolution), std::move(root));
+                auto cachedPlanStage = std::make_unique<CachedPlanStage>(opCtx,
+                                                                         collection,
+                                                                         ws,
+                                                                         canonicalQuery.get(),
+                                                                         plannerParams,
+                                                                         cs->decisionWorks,
+                                                                         std::move(root));
+                return PrepareExecutionResult(std::move(canonicalQuery),
+                                              std::move(querySolution),
+                                              std::move(cachedPlanStage));
             }
         }
     }
@@ -507,10 +517,8 @@ StatusWith<PrepareExecutionResult> prepareExecution(OperationContext* opCtx,
         for (size_t i = 0; i < solutions.size(); ++i) {
             if (turnIxscanIntoCount(solutions[i].get())) {
                 // We're not going to cache anything that's fast count.
-                PlanStage* rawRoot;
-                verify(StageBuilder::build(
-                    opCtx, collection, *canonicalQuery, *solutions[i], ws, &rawRoot));
-                root.reset(rawRoot);
+                auto root =
+                    StageBuilder::build(opCtx, collection, *canonicalQuery, *solutions[i], ws);
 
                 LOG(2) << "Using fast count: " << redact(canonicalQuery->toStringShort())
                        << ", planSummary: " << Explain::getPlanSummary(root.get());
@@ -523,10 +531,7 @@ StatusWith<PrepareExecutionResult> prepareExecution(OperationContext* opCtx,
 
     if (1 == solutions.size()) {
         // Only one possible plan.  Run it.  Build the stages from the solution.
-        PlanStage* rawRoot;
-        verify(
-            StageBuilder::build(opCtx, collection, *canonicalQuery, *solutions[0], ws, &rawRoot));
-        root.reset(rawRoot);
+        auto root = StageBuilder::build(opCtx, collection, *canonicalQuery, *solutions[0], ws);
 
         LOG(2) << "Only one plan is available; it will be run but will not be cached. "
                << redact(canonicalQuery->toStringShort())
@@ -545,13 +550,11 @@ StatusWith<PrepareExecutionResult> prepareExecution(OperationContext* opCtx,
                 solutions[ix]->cacheData->indexFilterApplied = plannerParams.indexFiltersApplied;
             }
 
-            // version of StageBuild::build when WorkingSet is shared
-            PlanStage* nextPlanRoot;
-            verify(StageBuilder::build(
-                opCtx, collection, *canonicalQuery, *solutions[ix], ws, &nextPlanRoot));
+            auto nextPlanRoot =
+                StageBuilder::build(opCtx, collection, *canonicalQuery, *solutions[ix], ws);
 
             // Takes ownership of 'nextPlanRoot'.
-            multiPlanStage->addPlan(std::move(solutions[ix]), nextPlanRoot, ws);
+            multiPlanStage->addPlan(std::move(solutions[ix]), std::move(nextPlanRoot), ws);
         }
 
         root = std::move(multiPlanStage);
@@ -1450,10 +1453,8 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorForS
     invariant(soln);
 
     unique_ptr<WorkingSet> ws = std::make_unique<WorkingSet>();
-    PlanStage* rawRoot;
-    verify(StageBuilder::build(
-        opCtx, collection, *parsedDistinct->getQuery(), *soln, ws.get(), &rawRoot));
-    unique_ptr<PlanStage> root(rawRoot);
+    auto root =
+        StageBuilder::build(opCtx, collection, *parsedDistinct->getQuery(), *soln, ws.get());
 
     LOG(2) << "Using fast distinct: " << redact(parsedDistinct->getQuery()->toStringShort())
            << ", planSummary: " << Explain::getPlanSummary(root.get());
@@ -1493,14 +1494,8 @@ getExecutorDistinctFromIndexSolutions(OperationContext* opCtx,
             // Build and return the SSR over solutions[i].
             unique_ptr<WorkingSet> ws = std::make_unique<WorkingSet>();
             unique_ptr<QuerySolution> currentSolution = std::move(solutions[i]);
-            PlanStage* rawRoot;
-            verify(StageBuilder::build(opCtx,
-                                       collection,
-                                       *parsedDistinct->getQuery(),
-                                       *currentSolution,
-                                       ws.get(),
-                                       &rawRoot));
-            unique_ptr<PlanStage> root(rawRoot);
+            auto root = StageBuilder::build(
+                opCtx, collection, *parsedDistinct->getQuery(), *currentSolution, ws.get());
 
             LOG(2) << "Using fast distinct: " << redact(parsedDistinct->getQuery()->toStringShort())
                    << ", planSummary: " << Explain::getPlanSummary(root.get());

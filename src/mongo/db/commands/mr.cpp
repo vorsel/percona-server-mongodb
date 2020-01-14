@@ -64,6 +64,7 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/durable_catalog.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/parallel.h"
 #include "mongo/s/client/shard_connection.h"
@@ -72,7 +73,6 @@
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/scripting/engine.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/util/debug_util.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
@@ -612,18 +612,46 @@ void State::prepTempCollection() {
         auto const tempColl =
             db->createCollection(_opCtx, _config.tempNamespace, options, buildIdIndex);
 
-        for (const auto& indexToInsert : indexesToInsert) {
-            try {
-                uassertStatusOK(tempColl->getIndexCatalog()->createIndexOnEmptyCollection(
-                    _opCtx, indexToInsert));
-            } catch (const ExceptionFor<ErrorCodes::IndexAlreadyExists>&) {
-                continue;
+        if (!indexesToInsert.empty()) {
+            // Emit startIndexBuild and commitIndexBuild oplog entries if supported by the
+            // current FCV.
+            auto opObserver = _opCtx->getServiceContext()->getOpObserver();
+            const auto& tmpName = _config.tempNamespace;
+            auto fromMigrate = false;
+            auto buildUUID = serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+                    serverGlobalParams.featureCompatibility.getVersion() ==
+                        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44
+                ? boost::make_optional(UUID::gen())
+                : boost::none;
+
+            if (buildUUID) {
+                opObserver->onStartIndexBuild(
+                    _opCtx, tmpName, tempColl->uuid(), *buildUUID, indexesToInsert, fromMigrate);
             }
 
-            // Log the createIndex operation.
-            _opCtx->getServiceContext()->getOpObserver()->onCreateIndex(
-                _opCtx, _config.tempNamespace, tempColl->uuid(), indexToInsert, false);
+            for (const auto& indexToInsert : indexesToInsert) {
+                try {
+                    uassertStatusOK(tempColl->getIndexCatalog()->createIndexOnEmptyCollection(
+                        _opCtx, indexToInsert));
+                } catch (const ExceptionFor<ErrorCodes::IndexAlreadyExists>&) {
+                    continue;
+                }
+
+                // If two phase index builds is enabled, index build will be coordinated using
+                // startIndexBuild and commitIndexBuild oplog entries.
+                if (!IndexBuildsCoordinator::get(_opCtx)->supportsTwoPhaseIndexBuild()) {
+                    // Log the createIndex operation.
+                    opObserver->onCreateIndex(
+                        _opCtx, tmpName, tempColl->uuid(), indexToInsert, fromMigrate);
+                }
+            }
+
+            if (buildUUID) {
+                opObserver->onCommitIndexBuild(
+                    _opCtx, tmpName, tempColl->uuid(), *buildUUID, indexesToInsert, fromMigrate);
+            }
         }
+
         wuow.commit();
 
         CollectionShardingRuntime::get(_opCtx, _config.tempNamespace)
@@ -948,8 +976,6 @@ State::~State() {
  */
 void State::init() {
     // setup js
-    const string userToken =
-        AuthorizationSession::get(Client::getCurrent())->getAuthenticatedUserNamesToken();
     _scope.reset(getGlobalScriptEngine()->newScopeForCurrentThread());
     _scope->requireOwnedObjects();
     _scope->registerOperation(_opCtx);

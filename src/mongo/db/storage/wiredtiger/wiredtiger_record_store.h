@@ -43,8 +43,8 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_size_storer.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/condition_variable.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/fail_point_service.h"
 
@@ -53,13 +53,14 @@
  * conflict exception if the WTWriteConflictException failpoint is enabled. This is only checked
  * on cursor methods that make modifications.
  */
-#define WT_OP_CHECK(x) (((MONGO_FAIL_POINT(WTWriteConflictException))) ? (WT_ROLLBACK) : (x))
+#define WT_OP_CHECK(x) \
+    (((MONGO_unlikely(WTWriteConflictException.shouldFail()))) ? (WT_ROLLBACK) : (x))
 
 /**
  * Identical to WT_OP_CHECK except this is checked on cursor seeks/advancement.
  */
 #define WT_READ_CHECK(x) \
-    (((MONGO_FAIL_POINT(WTWriteConflictExceptionForReads))) ? (WT_ROLLBACK) : (x))
+    (((MONGO_unlikely(WTWriteConflictExceptionForReads.shouldFail()))) ? (WT_ROLLBACK) : (x))
 
 namespace mongo {
 
@@ -170,9 +171,6 @@ public:
     virtual bool compactSupported() const {
         return !_isEphemeral;
     }
-    virtual bool compactsInPlace() const {
-        return true;
-    }
     virtual bool supportsOnlineCompaction() const {
         return true;
     }
@@ -214,7 +212,7 @@ public:
     Status updateCappedSize(OperationContext* opCtx, long long cappedSize) final;
 
     void setCappedCallback(CappedCallback* cb) {
-        stdx::lock_guard<stdx::mutex> lk(_cappedCallbackMutex);
+        stdx::lock_guard<Latch> lk(_cappedCallbackMutex);
         _cappedCallback = cb;
     }
 
@@ -345,9 +343,12 @@ private:
     RecordId _cappedFirstRecord;
     AtomicWord<long long> _cappedSleep;
     AtomicWord<long long> _cappedSleepMS;
+
+    // guards _cappedCallback and _shuttingDown
+    mutable Mutex _cappedCallbackMutex =
+        MONGO_MAKE_LATCH("WiredTigerRecordStore::_cappedCallbackMutex");
     CappedCallback* _cappedCallback;
     bool _shuttingDown;
-    mutable stdx::mutex _cappedCallbackMutex;  // guards _cappedCallback and _shuttingDown
 
     // See comment in ::cappedDeleteAsNeeded
     int _cappedDeleteCheckCount;
@@ -520,11 +521,11 @@ private:
 
 
 // WT failpoint to throw write conflict exceptions randomly
-MONGO_FAIL_POINT_DECLARE(WTWriteConflictException);
-MONGO_FAIL_POINT_DECLARE(WTWriteConflictExceptionForReads);
+extern FailPoint WTWriteConflictException;
+extern FailPoint WTWriteConflictExceptionForReads;
 
 // Prevents oplog writes from being considered durable on the primary. Once activated, new writes
 // will not be considered durable until deactivated. It is unspecified whether writes that commit
 // before activation will become visible while active.
-MONGO_FAIL_POINT_DECLARE(WTPausePrimaryOplogDurabilityLoop);
+extern FailPoint WTPausePrimaryOplogDurabilityLoop;
 }  // namespace mongo

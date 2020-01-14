@@ -60,10 +60,10 @@
 #include "mongo/db/multi_key_path_tracker.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/query_knobs_gen.h"
-#include "mongo/db/repl/applier_helpers.h"
 #include "mongo/db/repl/apply_ops.h"
 #include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/initial_syncer.h"
+#include "mongo/db/repl/insert_group.h"
 #include "mongo/db/repl/multiapplier.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/repl_set_config.h"
@@ -98,11 +98,6 @@ ServerStatusMetricField<Counter64> displayOpsApplied("repl.apply.ops", &opsAppli
 Counter64 oplogApplicationBatchSize;
 ServerStatusMetricField<Counter64> displayOplogApplicationBatchSize("repl.apply.batchSize",
                                                                     &oplogApplicationBatchSize);
-
-// Number of times we tried to go live as a secondary.
-Counter64 attemptsToBecomeSecondary;
-ServerStatusMetricField<Counter64> displayAttemptsToBecomeSecondary(
-    "repl.apply.attemptsToBecomeSecondary", &attemptsToBecomeSecondary);
 
 // Number and time of each ApplyOps worker pool round
 TimerStats applyBatchStats;
@@ -156,7 +151,7 @@ private:
     void _run();
 
     // Protects _cond, _shutdownSignaled, and _latestOpTime.
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("ApplyBatchFinalizerForJournal::_mutex");
     // Used to alert our thread of a new OpTime.
     stdx::condition_variable _cond;
     // The next OpTime to set as the ReplicationCoordinator's lastOpTime after flushing.
@@ -168,7 +163,7 @@ private:
 };
 
 ApplyBatchFinalizerForJournal::~ApplyBatchFinalizerForJournal() {
-    stdx::unique_lock<stdx::mutex> lock(_mutex);
+    stdx::unique_lock<Latch> lock(_mutex);
     _shutdownSignaled = true;
     _cond.notify_all();
     lock.unlock();
@@ -180,7 +175,7 @@ void ApplyBatchFinalizerForJournal::record(const OpTimeAndWallTime& newOpTimeAnd
                                            ReplicationCoordinator::DataConsistency consistency) {
     _recordApplied(newOpTimeAndWallTime, consistency);
 
-    stdx::unique_lock<stdx::mutex> lock(_mutex);
+    stdx::unique_lock<Latch> lock(_mutex);
     _latestOpTimeAndWallTime = newOpTimeAndWallTime;
     _cond.notify_all();
 }
@@ -192,7 +187,7 @@ void ApplyBatchFinalizerForJournal::_run() {
         OpTimeAndWallTime latestOpTimeAndWallTime = {OpTime(), Date_t()};
 
         {
-            stdx::unique_lock<stdx::mutex> lock(_mutex);
+            stdx::unique_lock<Latch> lock(_mutex);
             while (_latestOpTimeAndWallTime.opTime.isNull() && !_shutdownSignaled) {
                 _cond.wait(lock);
             }
@@ -272,102 +267,6 @@ LockMode fixLockModeForSystemDotViewsChanges(const NamespaceString& nss, LockMod
 }
 
 }  // namespace
-
-// static
-Status SyncTail::syncApply(OperationContext* opCtx,
-                           const OplogEntryBatch& batch,
-                           OplogApplication::Mode oplogApplicationMode) {
-    auto op = batch.getOp();
-    // Count each log op application as a separate operation, for reporting purposes
-    CurOp individualOp(opCtx);
-
-    const NamespaceString nss(op.getNss());
-
-    auto incrementOpsAppliedStats = [] { opsAppliedStats.increment(1); };
-
-    auto applyOp = [&](Database* db) {
-        // For non-initial-sync, we convert updates to upserts
-        // to suppress errors when replaying oplog entries.
-        UnreplicatedWritesBlock uwb(opCtx);
-        DisableDocumentValidation validationDisabler(opCtx);
-
-        // We convert updates to upserts when not in initial sync because after rollback and during
-        // startup we may replay an update after a delete and crash since we do not ignore
-        // errors. In initial sync we simply ignore these update errors so there is no reason to
-        // upsert.
-        //
-        // TODO (SERVER-21700): Never upsert during oplog application unless an external applyOps
-        // wants to. We should ignore these errors intelligently while in RECOVERING and STARTUP
-        // mode (similar to initial sync) instead so we do not accidentally ignore real errors.
-        bool shouldAlwaysUpsert = (oplogApplicationMode != OplogApplication::Mode::kInitialSync);
-        Status status = applyOperation_inlock(
-            opCtx, db, batch, shouldAlwaysUpsert, oplogApplicationMode, incrementOpsAppliedStats);
-        if (!status.isOK() && status.code() == ErrorCodes::WriteConflict) {
-            throw WriteConflictException();
-        }
-        return status;
-    };
-
-    auto clockSource = opCtx->getServiceContext()->getFastClockSource();
-    auto applyStartTime = clockSource->now();
-
-    if (MONGO_FAIL_POINT(hangAfterRecordingOpApplicationStartTime)) {
-        log() << "syncApply - fail point hangAfterRecordingOpApplicationStartTime enabled. "
-              << "Blocking until fail point is disabled. ";
-        MONGO_FAIL_POINT_PAUSE_WHILE_SET(hangAfterRecordingOpApplicationStartTime);
-    }
-
-    auto opType = op.getOpType();
-
-    auto finishApply = [&](Status status) {
-        return finishAndLogApply(clockSource, status, applyStartTime, batch);
-    };
-
-    if (opType == OpTypeEnum::kNoop) {
-        incrementOpsAppliedStats();
-        return Status::OK();
-    } else if (OplogEntry::isCrudOpType(opType)) {
-        return finishApply(writeConflictRetry(opCtx, "syncApply_CRUD", nss.ns(), [&] {
-            // Need to throw instead of returning a status for it to be properly ignored.
-            try {
-                AutoGetCollection autoColl(
-                    opCtx, getNsOrUUID(nss, op), fixLockModeForSystemDotViewsChanges(nss, MODE_IX));
-                auto db = autoColl.getDb();
-                uassert(ErrorCodes::NamespaceNotFound,
-                        str::stream() << "missing database (" << nss.db() << ")",
-                        db);
-                OldClientContext ctx(opCtx, autoColl.getNss().ns(), db);
-                return applyOp(ctx.db());
-            } catch (ExceptionFor<ErrorCodes::NamespaceNotFound>& ex) {
-                if (oplogApplicationMode == OplogApplication::Mode::kRecovering) {
-                    return Status::OK();
-                }
-
-                // Delete operations on non-existent namespaces can be treated as successful for
-                // idempotency reasons.
-                // During RECOVERING mode, we ignore NamespaceNotFound for all CRUD ops since
-                // storage does not wait for drops to be checkpointed (SERVER-33161).
-                if (opType == OpTypeEnum::kDelete ||
-                    oplogApplicationMode == OplogApplication::Mode::kRecovering) {
-                    return Status::OK();
-                }
-
-                ex.addContext(str::stream()
-                              << "Failed to apply operation: " << redact(batch.toBSON()));
-                throw;
-            }
-        }));
-    } else if (opType == OpTypeEnum::kCommand) {
-        return finishApply(writeConflictRetry(opCtx, "syncApply_command", nss.ns(), [&] {
-            // A special case apply for commands to avoid implicit database creation.
-            Status status = applyCommand_inlock(opCtx, op, oplogApplicationMode);
-            incrementOpsAppliedStats();
-            return status;
-        }));
-    }
-
-    MONGO_UNREACHABLE;
-}
 
 SyncTail::SyncTail(OplogApplier::Observer* observer,
                    ReplicationConsistencyMarkers* consistencyMarkers,
@@ -506,56 +405,66 @@ private:
     StringMap<CollectionProperties> _cache;
 };
 
-void tryToGoLiveAsASecondary(OperationContext* opCtx,
-                             ReplicationCoordinator* replCoord,
-                             OpTime minValid) {
-    // Check to see if we can immediately return without taking any locks.
-    if (replCoord->isInPrimaryOrSecondaryState_UNSAFE()) {
-        return;
+/**
+ * Updates a CRUD op's hash and isForCappedCollection field if necessary.
+ */
+void processCrudOp(OperationContext* opCtx,
+                   OplogEntry* op,
+                   uint32_t* hash,
+                   StringMapHashedKey* hashedNs,
+                   CachedCollectionProperties* collPropertiesCache) {
+    const bool supportsDocLocking =
+        opCtx->getServiceContext()->getStorageEngine()->supportsDocLocking();
+    auto collProperties = collPropertiesCache->getCollectionProperties(opCtx, *hashedNs);
+
+    // For doc locking engines, include the _id of the document in the hash so we get
+    // parallelism even if all writes are to a single collection.
+    //
+    // For capped collections, this is illegal, since capped collections must preserve
+    // insertion order.
+    if (supportsDocLocking && !collProperties.isCapped) {
+        BSONElement id = op->getIdElement();
+        BSONElementComparator elementHasher(BSONElementComparator::FieldNamesMode::kIgnore,
+                                            collProperties.collator);
+        const size_t idHash = elementHasher.hash(id);
+        MurmurHash3_x86_32(&idHash, sizeof(idHash), *hash, hash);
     }
 
-    // This needs to happen after the attempt so readers can be sure we've already tried.
-    ON_BLOCK_EXIT([] { attemptsToBecomeSecondary.increment(); });
-
-    // Need the RSTL in mode X to transition to SECONDARY
-    ReplicationStateTransitionLockGuard transitionGuard(opCtx, MODE_X);
-
-    // Check if we are primary or secondary again now that we have the RSTL in mode X.
-    if (replCoord->isInPrimaryOrSecondaryState(opCtx)) {
-        return;
+    if (op->getOpType() == OpTypeEnum::kInsert && collProperties.isCapped) {
+        // Mark capped collection ops before storing them to ensure we do not attempt to
+        // bulk insert them.
+        op->isForCappedCollection = true;
     }
+}
 
-    // Maintenance mode will force us to remain in RECOVERING state, no matter what.
-    if (replCoord->getMaintenanceMode()) {
-        LOG(1) << "We cannot transition to SECONDARY state while in maintenance mode.";
-        return;
+/**
+ * Adds a single oplog entry to the appropriate writer vector.
+ */
+void addToWriterVector(OplogEntry* op,
+                       std::vector<MultiApplier::OperationPtrs>* writerVectors,
+                       uint32_t hash) {
+    const uint32_t numWriters = writerVectors->size();
+    auto& writer = (*writerVectors)[hash % numWriters];
+    if (writer.empty()) {
+        writer.reserve(8);  // Skip a few growth rounds
     }
+    writer.push_back(op);
+}
 
-    // We can only transition to SECONDARY from RECOVERING state.
-    MemberState state(replCoord->getMemberState());
-    if (!state.recovering()) {
-        LOG(2) << "We cannot transition to SECONDARY state since we are not currently in "
-                  "RECOVERING state. Current state: "
-               << state.toString();
-        return;
-    }
-
-    // We can't go to SECONDARY state until we reach 'minValid', since the database may be in an
-    // inconsistent state before this point. If our state is inconsistent, we need to disallow reads
-    // from clients, which is why we stay in RECOVERING state.
-    auto lastApplied = replCoord->getMyLastAppliedOpTime();
-    if (lastApplied < minValid) {
-        LOG(2) << "We cannot transition to SECONDARY state because our 'lastApplied' optime is "
-                  "less than the 'minValid' optime. minValid optime: "
-               << minValid << ", lastApplied optime: " << lastApplied;
-        return;
-    }
-
-    // Execute the transition to SECONDARY.
-    auto status = replCoord->setFollowerMode(MemberState::RS_SECONDARY);
-    if (!status.isOK()) {
-        warning() << "Failed to transition into " << MemberState(MemberState::RS_SECONDARY)
-                  << ". Current state: " << replCoord->getMemberState() << causedBy(status);
+/**
+ * Adds a set of derivedOps to writerVectors.
+ */
+void addDerivedOps(OperationContext* opCtx,
+                   MultiApplier::Operations* derivedOps,
+                   std::vector<MultiApplier::OperationPtrs>* writerVectors,
+                   CachedCollectionProperties* collPropertiesCache) {
+    for (auto&& op : *derivedOps) {
+        auto hashedNs = StringMapHasher().hashed_key(op.getNss().ns());
+        uint32_t hash = static_cast<uint32_t>(hashedNs.hash());
+        if (op.isCrudOpType()) {
+            processCrudOp(opCtx, &op, &hash, &hashedNs, collPropertiesCache);
+        }
+        addToWriterVector(&op, writerVectors, hash);
     }
 }
 
@@ -582,7 +491,7 @@ public:
     }
 
     OpQueue getNextBatch(Seconds maxWaitTime) {
-        stdx::unique_lock<stdx::mutex> lk(_mutex);
+        stdx::unique_lock<Latch> lk(_mutex);
         // _ops can indicate the following cases:
         // 1. A new batch is ready to consume.
         // 2. Shutdown.
@@ -626,14 +535,12 @@ private:
         BatchLimits batchLimits;
 
         while (true) {
-            MONGO_FAIL_POINT_PAUSE_WHILE_SET(rsSyncApplyStop);
+            rsSyncApplyStop.pauseWhileSet();
 
             batchLimits.slaveDelayLatestTimestamp = _calculateSlaveDelayLatestTimestamp();
 
             // Check the limits once per batch since users can change them at runtime.
-            batchLimits.ops = OplogApplier::getBatchLimitOperations();
-            batchLimits.bytes = OplogApplier::calculateBatchLimitBytes(
-                cc().makeOperationContext().get(), _storageInterface);
+            batchLimits.ops = getBatchLimitOplogEntries();
 
             OpQueue ops(batchLimits.ops);
             {
@@ -646,6 +553,9 @@ private:
                 // interruption would be shutdown, and the ReplBatcher thread has its own shutdown
                 // handling.
                 UninterruptibleLockGuard noInterrupt(opCtx->lockState());
+
+                // Locks the oplog to check its max size, do this in the UninterruptibleLockGuard.
+                batchLimits.bytes = getBatchLimitOplogBytes(opCtx.get(), _storageInterface);
 
                 auto oplogEntries =
                     fassertNoTrace(31004, _getNextApplierBatchFn(opCtx.get(), batchLimits));
@@ -694,7 +604,7 @@ private:
                 }
             }
 
-            stdx::unique_lock<stdx::mutex> lk(_mutex);
+            stdx::unique_lock<Latch> lk(_mutex);
             // Block until the previous batch has been taken.
             _cv.wait(lk, [&] { return _ops.empty() && !_ops.termWhenExhausted(); });
             _ops = std::move(ops);
@@ -711,7 +621,7 @@ private:
     OplogBuffer* const _oplogBuffer;
     OplogApplier::GetNextApplierBatchFn const _getNextApplierBatchFn;
 
-    stdx::mutex _mutex;  // Guards _ops.
+    Mutex _mutex = MONGO_MAKE_LATCH("OpQueueBatcher::_mutex");  // Guards _ops.
     stdx::condition_variable _cv;
     OpQueue _ops;
 
@@ -722,27 +632,19 @@ private:
     stdx::thread _thread;  // Must be last so all other members are initialized before starting.
 };
 
-void SyncTail::oplogApplication(OplogBuffer* oplogBuffer,
-                                OplogApplier::GetNextApplierBatchFn getNextApplierBatchFn,
-                                ReplicationCoordinator* replCoord) {
+void SyncTail::runLoop(OplogBuffer* oplogBuffer,
+                       OplogApplier::GetNextApplierBatchFn getNextApplierBatchFn,
+                       ReplicationCoordinator* replCoord) {
     // We don't start data replication for arbiters at all and it's not allowed to reconfig
     // arbiterOnly field for any member.
     invariant(!replCoord->getMemberState().arbiter());
 
     OpQueueBatcher batcher(this, _storageInterface, oplogBuffer, getNextApplierBatchFn);
 
-    _oplogApplication(replCoord, &batcher);
-}
-
-void SyncTail::_oplogApplication(ReplicationCoordinator* replCoord,
-                                 OpQueueBatcher* batcher) noexcept {
     std::unique_ptr<ApplyBatchFinalizer> finalizer{
         getGlobalServiceContext()->getStorageEngine()->isDurable()
             ? new ApplyBatchFinalizerForJournal(replCoord)
             : new ApplyBatchFinalizer(replCoord)};
-
-    // Get replication consistency markers.
-    OpTime minValid;
 
     while (true) {  // Exits on message from OpQueueBatcher.
         // Use a new operation context each iteration, as otherwise we may appear to use a single
@@ -756,10 +658,10 @@ void SyncTail::_oplogApplication(ReplicationCoordinator* replCoord,
         opCtx.setShouldParticipateInFlowControl(false);
 
         // For pausing replication in tests.
-        if (MONGO_FAIL_POINT(rsSyncApplyStop)) {
+        if (MONGO_unlikely(rsSyncApplyStop.shouldFail())) {
             log() << "sync tail - rsSyncApplyStop fail point enabled. Blocking until fail point is "
                      "disabled.";
-            while (MONGO_FAIL_POINT(rsSyncApplyStop)) {
+            while (MONGO_unlikely(rsSyncApplyStop.shouldFail())) {
                 // Tests should not trigger clean shutdown while that failpoint is active. If we
                 // think we need this, we need to think hard about what the behavior should be.
                 if (inShutdown()) {
@@ -770,21 +672,18 @@ void SyncTail::_oplogApplication(ReplicationCoordinator* replCoord,
             }
         }
 
-        // Get the current value of 'minValid'.
-        minValid = _consistencyMarkers->getMinValid(&opCtx);
-
         // Transition to SECONDARY state, if possible.
-        tryToGoLiveAsASecondary(&opCtx, replCoord, minValid);
+        replCoord->finishRecoveryIfEligible(&opCtx);
 
         // Blocks up to a second waiting for a batch to be ready to apply. If one doesn't become
         // ready in time, we'll loop again so we can do the above checks periodically.
-        OpQueue ops = batcher->getNextBatch(Seconds(1));
+        OpQueue ops = batcher.getNextBatch(Seconds(1));
         if (ops.empty()) {
             if (ops.mustShutdown()) {
                 // Shut down and exit oplog application loop.
                 return;
             }
-            if (MONGO_FAIL_POINT(rsSyncApplyStop)) {
+            if (MONGO_unlikely(rsSyncApplyStop.shouldFail())) {
                 continue;
             }
             if (ops.termWhenExhausted()) {
@@ -824,14 +723,6 @@ void SyncTail::_oplogApplication(ReplicationCoordinator* replCoord,
             fassertNoTrace(34437, multiApply(&opCtx, ops.releaseBatch()));
         invariant(lastOpTimeAppliedInBatch == lastOpTimeInBatch);
 
-        // In order to provide resilience in the event of a crash in the middle of batch
-        // application, 'multiApply' will update 'minValid' so that it is at least as great as the
-        // last optime that it applied in this batch. If 'minValid' was moved forward, we make sure
-        // to update our view of it here.
-        if (lastOpTimeInBatch > minValid) {
-            minValid = lastOpTimeInBatch;
-        }
-
         // Update various things that care about our last applied optime. Tests rely on 1 happening
         // before 2 even though it isn't strictly necessary.
 
@@ -852,25 +743,126 @@ void SyncTail::_oplogApplication(ReplicationCoordinator* replCoord,
             &opCtx, lastOpTimeInBatch.getTimestamp(), orderedCommit);
 
         // 4. Finalize this batch. We are at a consistent optime if our current optime is >= the
-        // current 'minValid' optime. Note that recording the lastOpTime in the finalizer includes
-        // advancing the global timestamp to at least its timestamp.
+        // current 'minValid' optime. In case we crash while applying a batch, multiApply advances
+        // minValid to the last opTime in the batch, so check minValid *after* calling multiApply.
+        const auto minValid = _consistencyMarkers->getMinValid(&opCtx);
         auto consistency = (lastOpTimeInBatch >= minValid)
             ? ReplicationCoordinator::DataConsistency::Consistent
             : ReplicationCoordinator::DataConsistency::Inconsistent;
-        // Wall clock time is non-optional post 3.6.
-        invariant(lastWallTimeInBatch);
-        finalizer->record({lastOpTimeInBatch, lastWallTimeInBatch.get()}, consistency);
+
+        // The finalizer advances the global timestamp to lastOpTimeInBatch.
+        finalizer->record({lastOpTimeInBatch, lastWallTimeInBatch}, consistency);
     }
 }
 
 void SyncTail::shutdown() {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
     _inShutdown = true;
 }
 
 bool SyncTail::inShutdown() const {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
     return _inShutdown;
+}
+
+Status syncApply(OperationContext* opCtx,
+                 const OplogEntryBatch& batch,
+                 OplogApplication::Mode oplogApplicationMode) {
+    // Guarantees that syncApply's context matches that of its calling function, multiSyncApply.
+    invariant(!opCtx->writesAreReplicated());
+    invariant(documentValidationDisabled(opCtx));
+
+    auto op = batch.getOp();
+    // Count each log op application as a separate operation, for reporting purposes
+    CurOp individualOp(opCtx);
+
+    const NamespaceString nss(op.getNss());
+
+    auto incrementOpsAppliedStats = [] { opsAppliedStats.increment(1); };
+
+    auto applyOp = [&](Database* db) {
+        // We convert updates to upserts when not in initial sync because after rollback and during
+        // startup we may replay an update after a delete and crash since we do not ignore
+        // errors. In initial sync we simply ignore these update errors so there is no reason to
+        // upsert.
+        //
+        // TODO (SERVER-21700): Never upsert during oplog application unless an external applyOps
+        // wants to. We should ignore these errors intelligently while in RECOVERING and STARTUP
+        // mode (similar to initial sync) instead so we do not accidentally ignore real errors.
+        bool shouldAlwaysUpsert = (oplogApplicationMode != OplogApplication::Mode::kInitialSync);
+        Status status = applyOperation_inlock(
+            opCtx, db, batch, shouldAlwaysUpsert, oplogApplicationMode, incrementOpsAppliedStats);
+        if (!status.isOK() && status.code() == ErrorCodes::WriteConflict) {
+            throw WriteConflictException();
+        }
+        return status;
+    };
+
+    auto clockSource = opCtx->getServiceContext()->getFastClockSource();
+    auto applyStartTime = clockSource->now();
+
+    if (MONGO_unlikely(hangAfterRecordingOpApplicationStartTime.shouldFail())) {
+        log() << "syncApply - fail point hangAfterRecordingOpApplicationStartTime enabled. "
+              << "Blocking until fail point is disabled. ";
+        hangAfterRecordingOpApplicationStartTime.pauseWhileSet();
+    }
+
+    auto opType = op.getOpType();
+
+    auto finishApply = [&](Status status) {
+        return finishAndLogApply(clockSource, status, applyStartTime, batch);
+    };
+
+    if (opType == OpTypeEnum::kNoop) {
+        incrementOpsAppliedStats();
+        return Status::OK();
+    } else if (OplogEntry::isCrudOpType(opType)) {
+        return finishApply(writeConflictRetry(opCtx, "syncApply_CRUD", nss.ns(), [&] {
+            // Need to throw instead of returning a status for it to be properly ignored.
+            try {
+                AutoGetCollection autoColl(
+                    opCtx, getNsOrUUID(nss, op), fixLockModeForSystemDotViewsChanges(nss, MODE_IX));
+                auto db = autoColl.getDb();
+                uassert(ErrorCodes::NamespaceNotFound,
+                        str::stream() << "missing database (" << nss.db() << ")",
+                        db);
+                OldClientContext ctx(opCtx, autoColl.getNss().ns(), db);
+                return applyOp(ctx.db());
+            } catch (ExceptionFor<ErrorCodes::NamespaceNotFound>& ex) {
+                // Delete operations on non-existent namespaces can be treated as successful for
+                // idempotency reasons.
+                // During RECOVERING mode, we ignore NamespaceNotFound for all CRUD ops since
+                // storage does not wait for drops to be checkpointed (SERVER-33161).
+                if (opType == OpTypeEnum::kDelete ||
+                    oplogApplicationMode == OplogApplication::Mode::kRecovering) {
+                    return Status::OK();
+                }
+
+                ex.addContext(str::stream()
+                              << "Failed to apply operation: " << redact(batch.toBSON()));
+                throw;
+            }
+        }));
+    } else if (opType == OpTypeEnum::kCommand) {
+        return finishApply(writeConflictRetry(opCtx, "syncApply_command", nss.ns(), [&] {
+            // A special case apply for commands to avoid implicit database creation.
+            Status status = applyCommand_inlock(opCtx, op, oplogApplicationMode);
+            incrementOpsAppliedStats();
+            return status;
+        }));
+    }
+
+    MONGO_UNREACHABLE;
+}
+
+void stableSortByNamespace(MultiApplier::OperationPtrs* oplogEntryPointers) {
+    if (oplogEntryPointers->size() < 1U) {
+        return;
+    }
+    auto nssComparator = [](const OplogEntry* l, const OplogEntry* r) {
+        return l->getNss() < r->getNss();
+    };
+    std::stable_sort(oplogEntryPointers->begin(), oplogEntryPointers->end(), nssComparator);
 }
 
 // This free function is used by the writer threads to apply each op
@@ -898,11 +890,11 @@ Status multiSyncApply(OperationContext* opCtx,
     opCtx->recoveryUnit()->setPrepareConflictBehavior(
         PrepareConflictBehavior::kIgnoreConflictsAllowWrites);
 
-    ApplierHelpers::stableSortByNamespace(ops);
+    stableSortByNamespace(ops);
 
     const auto oplogApplicationMode = st->getOptions().mode;
 
-    ApplierHelpers::InsertGroup insertGroup(ops, opCtx, oplogApplicationMode);
+    InsertGroup insertGroup(ops, opCtx, oplogApplicationMode);
 
     {  // Ensure that the MultikeyPathTracker stops tracking paths.
         ON_BLOCK_EXIT([opCtx] { MultikeyPathTracker::get(opCtx).stopTrackingMultikeyPathInfo(); });
@@ -921,7 +913,7 @@ Status multiSyncApply(OperationContext* opCtx,
 
             // If we didn't create a group, try to apply the op individually.
             try {
-                const Status status = SyncTail::syncApply(opCtx, &entry, oplogApplicationMode);
+                const Status status = syncApply(opCtx, &entry, oplogApplicationMode);
 
                 if (!status.isOK()) {
                     // Tried to apply an update operation but the document is missing, there must be
@@ -969,20 +961,15 @@ Status multiSyncApply(OperationContext* opCtx,
  *      with transactions.
  * sessionUpdateTracker - if provided, keeps track of session info from ops.
  */
-void SyncTail::_fillWriterVectors(OperationContext* opCtx,
-                                  MultiApplier::Operations* ops,
-                                  std::vector<MultiApplier::OperationPtrs>* writerVectors,
-                                  std::vector<MultiApplier::Operations>* derivedOps,
-                                  SessionUpdateTracker* sessionUpdateTracker) noexcept {
-    const auto serviceContext = opCtx->getServiceContext();
-    const auto storageEngine = serviceContext->getStorageEngine();
+void SyncTail::_deriveOpsAndFillWriterVectors(
+    OperationContext* opCtx,
+    MultiApplier::Operations* ops,
+    std::vector<MultiApplier::OperationPtrs>* writerVectors,
+    std::vector<MultiApplier::Operations>* derivedOps,
+    SessionUpdateTracker* sessionUpdateTracker) noexcept {
 
-    const bool supportsDocLocking = storageEngine->supportsDocLocking();
-    const uint32_t numWriters = writerVectors->size();
-
-    CachedCollectionProperties collPropertiesCache;
     LogicalSessionIdMap<std::vector<OplogEntry*>> partialTxnOps;
-
+    CachedCollectionProperties collPropertiesCache;
     for (auto&& op : *ops) {
         // If the operation's optime is before or the same as the beginApplyingOpTime we don't want
         // to apply it, so don't include it in writerVectors.
@@ -1001,9 +988,10 @@ void SyncTail::_fillWriterVectors(OperationContext* opCtx,
         if (sessionUpdateTracker) {
             if (auto newOplogWrites = sessionUpdateTracker->updateSession(op)) {
                 derivedOps->emplace_back(std::move(*newOplogWrites));
-                _fillWriterVectors(opCtx, &derivedOps->back(), writerVectors, derivedOps, nullptr);
+                addDerivedOps(opCtx, &derivedOps->back(), writerVectors, &collPropertiesCache);
             }
         }
+
 
         // If this entry is part of a multi-oplog-entry transaction, ignore it until the commit.
         // We must save it here because we are not guaranteed it has been written to the oplog
@@ -1025,29 +1013,8 @@ void SyncTail::_fillWriterVectors(OperationContext* opCtx,
             partialTxnList.clear();
         }
 
-        if (op.isCrudOpType()) {
-            auto collProperties = collPropertiesCache.getCollectionProperties(opCtx, hashedNs);
-
-            // For doc locking engines, include the _id of the document in the hash so we get
-            // parallelism even if all writes are to a single collection.
-            //
-            // For capped collections, this is illegal, since capped collections must preserve
-            // insertion order.
-            if (supportsDocLocking && !collProperties.isCapped) {
-                BSONElement id = op.getIdElement();
-                BSONElementComparator elementHasher(BSONElementComparator::FieldNamesMode::kIgnore,
-                                                    collProperties.collator);
-                const size_t idHash = elementHasher.hash(id);
-                MurmurHash3_x86_32(&idHash, sizeof(idHash), hash, &hash);
-            }
-
-            if (op.getOpType() == OpTypeEnum::kInsert && collProperties.isCapped) {
-                // Mark capped collection ops before storing them to ensure we do not attempt to
-                // bulk insert them.
-                op.isForCappedCollection = true;
-            }
-        }
-
+        if (op.isCrudOpType())
+            processCrudOp(opCtx, &op, &hash, &hashedNs, &collPropertiesCache);
         // Extract applyOps operations and fill writers with extracted operations using this
         // function.
         if (op.isTerminalApplyOps()) {
@@ -1065,14 +1032,15 @@ void SyncTail::_fillWriterVectors(OperationContext* opCtx,
                 partialTxnList.clear();
 
                 // Transaction entries cannot have different session updates.
-                _fillWriterVectors(opCtx, &derivedOps->back(), writerVectors, derivedOps, nullptr);
+                addDerivedOps(opCtx, &derivedOps->back(), writerVectors, &collPropertiesCache);
             } else {
                 // The applyOps entry was not generated as part of a transaction.
                 invariant(!op.getPrevWriteOpTimeInTransaction());
+
                 derivedOps->emplace_back(ApplyOps::extractOperations(op));
 
                 // Nested entries cannot have different session updates.
-                _fillWriterVectors(opCtx, &derivedOps->back(), writerVectors, derivedOps, nullptr);
+                addDerivedOps(opCtx, &derivedOps->back(), writerVectors, &collPropertiesCache);
             }
             continue;
         }
@@ -1088,15 +1056,11 @@ void SyncTail::_fillWriterVectors(OperationContext* opCtx,
                 readTransactionOperationsFromOplogChain(opCtx, op, partialTxnList));
             partialTxnList.clear();
 
-            _fillWriterVectors(opCtx, &derivedOps->back(), writerVectors, derivedOps, nullptr);
+            addDerivedOps(opCtx, &derivedOps->back(), writerVectors, &collPropertiesCache);
             continue;
         }
 
-        auto& writer = (*writerVectors)[hash % numWriters];
-        if (writer.empty()) {
-            writer.reserve(8);  // Skip a few growth rounds
-        }
-        writer.push_back(&op);
+        addToWriterVector(&op, writerVectors, hash);
     }
 }
 
@@ -1104,41 +1068,15 @@ void SyncTail::fillWriterVectors(OperationContext* opCtx,
                                  MultiApplier::Operations* ops,
                                  std::vector<MultiApplier::OperationPtrs>* writerVectors,
                                  std::vector<MultiApplier::Operations>* derivedOps) noexcept {
+
     SessionUpdateTracker sessionUpdateTracker;
-    _fillWriterVectors(opCtx, ops, writerVectors, derivedOps, &sessionUpdateTracker);
+    _deriveOpsAndFillWriterVectors(opCtx, ops, writerVectors, derivedOps, &sessionUpdateTracker);
 
     auto newOplogWrites = sessionUpdateTracker.flushAll();
     if (!newOplogWrites.empty()) {
         derivedOps->emplace_back(std::move(newOplogWrites));
-        _fillWriterVectors(opCtx, &derivedOps->back(), writerVectors, derivedOps, nullptr);
-    }
-}
-
-void SyncTail::_applyOps(std::vector<MultiApplier::OperationPtrs>& writerVectors,
-                         std::vector<Status>* statusVector,
-                         std::vector<WorkerMultikeyPathInfo>* workerMultikeyPathInfo) {
-    invariant(writerVectors.size() == statusVector->size());
-    for (size_t i = 0; i < writerVectors.size(); i++) {
-        if (writerVectors[i].empty())
-            continue;
-
-        _writerPool->schedule(
-            [this,
-             &writer = writerVectors.at(i),
-             &status = statusVector->at(i),
-             &workerMultikeyPathInfo = workerMultikeyPathInfo->at(i)](auto scheduleStatus) {
-                invariant(scheduleStatus);
-
-                auto opCtx = cc().makeOperationContext();
-
-                // This code path is only executed on secondaries and initial syncing nodes, so it
-                // is safe to exclude any writes from Flow Control.
-                opCtx->setShouldParticipateInFlowControl(false);
-
-                status = opCtx->runWithoutInterruptionExceptAtGlobalShutdown([&] {
-                    return _applyFunc(opCtx.get(), &writer, this, &workerMultikeyPathInfo);
-                });
-            });
+        _deriveOpsAndFillWriterVectors(
+            opCtx, &derivedOps->back(), writerVectors, derivedOps, nullptr);
     }
 }
 
@@ -1193,11 +1131,10 @@ StatusWith<OpTime> SyncTail::multiApply(OperationContext* opCtx, MultiApplier::O
 
         // Use this fail point to hold the PBWM lock after we have written the oplog entries but
         // before we have applied them.
-        if (MONGO_FAIL_POINT(pauseBatchApplicationAfterWritingOplogEntries)) {
+        if (MONGO_unlikely(pauseBatchApplicationAfterWritingOplogEntries.shouldFail())) {
             log() << "pauseBatchApplicationAfterWritingOplogEntries fail point enabled. Blocking "
                      "until fail point is disabled.";
-            MONGO_FAIL_POINT_PAUSE_WHILE_SET_OR_INTERRUPTED(
-                opCtx, pauseBatchApplicationAfterWritingOplogEntries);
+            pauseBatchApplicationAfterWritingOplogEntries.pauseWhileSet(opCtx);
         }
 
         // Reset consistency markers in case the node fails while applying ops.
@@ -1208,7 +1145,33 @@ StatusWith<OpTime> SyncTail::multiApply(OperationContext* opCtx, MultiApplier::O
 
         {
             std::vector<Status> statusVector(_writerPool->getStats().numThreads, Status::OK());
-            _applyOps(writerVectors, &statusVector, &multikeyVector);
+
+            // Doles out all the work to the writer pool threads. writerVectors is not modified,
+            // but  multiSyncApply will modify the vectors that it contains.
+            invariant(writerVectors.size() == statusVector.size());
+            for (size_t i = 0; i < writerVectors.size(); i++) {
+                if (writerVectors[i].empty())
+                    continue;
+
+                _writerPool->schedule(
+                    [this,
+                     &writer = writerVectors.at(i),
+                     &status = statusVector.at(i),
+                     &multikeyVector = multikeyVector.at(i)](auto scheduleStatus) {
+                        invariant(scheduleStatus);
+
+                        auto opCtx = cc().makeOperationContext();
+
+                        // This code path is only executed on secondaries and initial syncing nodes,
+                        // so it is safe to exclude any writes from Flow Control.
+                        opCtx->setShouldParticipateInFlowControl(false);
+
+                        status = opCtx->runWithoutInterruptionExceptAtGlobalShutdown([&] {
+                            return _applyFunc(opCtx.get(), &writer, this, &multikeyVector);
+                        });
+                    });
+            }
+
             _writerPool->waitForIdle();
 
             // If any of the statuses is not ok, return error.
@@ -1234,10 +1197,10 @@ StatusWith<OpTime> SyncTail::multiApply(OperationContext* opCtx, MultiApplier::O
     storageEngine->replicationBatchIsComplete();
 
     // Use this fail point to hold the PBWM lock and prevent the batch from completing.
-    if (MONGO_FAIL_POINT(pauseBatchApplicationBeforeCompletion)) {
+    if (MONGO_unlikely(pauseBatchApplicationBeforeCompletion.shouldFail())) {
         log() << "pauseBatchApplicationBeforeCompletion fail point enabled. Blocking until fail "
                  "point is disabled.";
-        while (MONGO_FAIL_POINT(pauseBatchApplicationBeforeCompletion)) {
+        while (MONGO_unlikely(pauseBatchApplicationBeforeCompletion.shouldFail())) {
             if (inShutdown()) {
                 severe() << "Turn off pauseBatchApplicationBeforeCompletion before attempting "
                             "clean shutdown";

@@ -363,7 +363,7 @@ bool repairDatabasesAndCheckVersion(OperationContext* opCtx) {
     if (storageGlobalParams.repair) {
         invariant(!storageGlobalParams.readOnly);
 
-        if (MONGO_FAIL_POINT(exitBeforeDataRepair)) {
+        if (MONGO_unlikely(exitBeforeDataRepair.shouldFail())) {
             log() << "Exiting because 'exitBeforeDataRepair' fail point was set.";
             quickExit(EXIT_ABRUPT);
         }
@@ -420,7 +420,7 @@ bool repairDatabasesAndCheckVersion(OperationContext* opCtx) {
     }
 
     if (storageGlobalParams.repair) {
-        if (MONGO_FAIL_POINT(exitBeforeRepairInvalidatesConfig)) {
+        if (MONGO_unlikely(exitBeforeRepairInvalidatesConfig.shouldFail())) {
             log() << "Exiting because 'exitBeforeRepairInvalidatesConfig' fail point was set.";
             quickExit(EXIT_ABRUPT);
         }
@@ -428,16 +428,24 @@ bool repairDatabasesAndCheckVersion(OperationContext* opCtx) {
         // config.
         auto repairObserver = StorageRepairObserver::get(opCtx->getServiceContext());
         repairObserver->onRepairDone(opCtx);
-        if (repairObserver->isDataModified()) {
+        if (repairObserver->getModifications().size() > 0) {
             warning() << "Modifications made by repair:";
             const auto& mods = repairObserver->getModifications();
             for (const auto& mod : mods) {
-                warning() << "  " << mod;
+                warning() << "  " << mod.getDescription();
             }
+        }
+        if (repairObserver->isDataInvalidated()) {
             if (hasReplSetConfigDoc(opCtx)) {
                 warning() << "WARNING: Repair may have modified replicated data. This node will no "
                              "longer be able to join a replica set without a full re-sync";
             }
+        }
+
+        // There were modifications, but only benign ones.
+        if (repairObserver->getModifications().size() > 0 && !repairObserver->isDataInvalidated()) {
+            log() << "Repair has made modifications to unreplicated data. The data is healthy and "
+                     "the node is eligible to be returned to the replica set.";
         }
     }
 

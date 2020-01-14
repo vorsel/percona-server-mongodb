@@ -203,6 +203,7 @@ void abortInProgressTransactions(OperationContext* opCtx) {
             IDLParserErrorContext("abort-in-progress-transactions"), cursor->next());
         opCtx->setLogicalSessionId(txnRecord.getSessionId());
         opCtx->setTxnNumber(txnRecord.getTxnNum());
+        opCtx->setInMultiDocumentTransaction();
         MongoDOperationContextSessionWithoutRefresh ocs(opCtx);
         auto txnParticipant = TransactionParticipant::get(opCtx);
         LOG(3) << "Aborting transaction sessionId: " << txnRecord.getSessionId().toBSON()
@@ -307,7 +308,8 @@ void MongoDSessionCatalog::observeDirectWriteToConfigTransactions(OperationConte
                               << " because it is in the prepared state",
                 !participant.transactionIsPrepared());
 
-        opCtx->recoveryUnit()->registerChange(new KillSessionTokenOnCommit(opCtx, session.kill()));
+        opCtx->recoveryUnit()->registerChange(
+            std::make_unique<KillSessionTokenOnCommit>(opCtx, session.kill()));
     });
 }
 
@@ -408,19 +410,13 @@ MongoDOperationContextSession::MongoDOperationContextSession(OperationContext* o
 MongoDOperationContextSession::~MongoDOperationContextSession() = default;
 
 void MongoDOperationContextSession::checkIn(OperationContext* opCtx) {
-    if (auto txnParticipant = TransactionParticipant::get(opCtx)) {
-        txnParticipant.stashTransactionResources(opCtx);
-    }
-
     OperationContextSession::checkIn(opCtx);
 }
 
-void MongoDOperationContextSession::checkOut(OperationContext* opCtx, const std::string& cmdName) {
+void MongoDOperationContextSession::checkOut(OperationContext* opCtx) {
     OperationContextSession::checkOut(opCtx);
-
-    if (auto txnParticipant = TransactionParticipant::get(opCtx)) {
-        txnParticipant.unstashTransactionResources(opCtx, cmdName);
-    }
+    auto txnParticipant = TransactionParticipant::get(opCtx);
+    txnParticipant.refreshFromStorageIfNeeded(opCtx);
 }
 
 MongoDOperationContextSessionWithoutRefresh::MongoDOperationContextSessionWithoutRefresh(

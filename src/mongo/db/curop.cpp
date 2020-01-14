@@ -45,10 +45,10 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/locker.h"
 #include "mongo/db/json.h"
+#include "mongo/db/prepare_conflict_tracker.h"
 #include "mongo/db/query/getmore_request.h"
 #include "mongo/platform/random.h"
 #include "mongo/db/query/plan_summary_stats.h"
-#include "mongo/platform/mutex.h"
 #include "mongo/rpc/metadata/client_metadata.h"
 #include "mongo/rpc/metadata/client_metadata_ismaster.h"
 #include "mongo/rpc/metadata/impersonated_user_metadata.h"
@@ -234,28 +234,12 @@ CurOp* CurOp::get(const OperationContext& opCtx) {
     return _curopStack(opCtx).top();
 }
 
-namespace {
-
-struct {
-    Mutex mutex = Mutex("TestMutex"_sd, Seconds(1));
-    stdx::unique_lock<Mutex> lock = stdx::unique_lock<Mutex>(mutex, stdx::defer_lock);
-} gHangLock;
-
-}  // namespace
 void CurOp::reportCurrentOpForClient(OperationContext* opCtx,
                                      Client* client,
                                      bool truncateOps,
                                      bool backtraceMode,
                                      BSONObjBuilder* infoBuilder) {
     invariant(client);
-    if (MONGO_FAIL_POINT(keepDiagnosticCaptureOnFailedLock)) {
-        gHangLock.lock.lock();
-        try {
-            stdx::lock_guard testLock(gHangLock.mutex);
-        } catch (const DBException& e) {
-            log() << "Successfully caught " << e;
-        }
-    }
 
     OperationContext* clientOpCtx = client->getOperationContext();
 
@@ -322,12 +306,11 @@ void CurOp::reportCurrentOpForClient(OperationContext* opCtx,
         CurOp::get(clientOpCtx)->reportState(infoBuilder, truncateOps);
     }
 
-    std::shared_ptr<DiagnosticInfo> diagnostic = DiagnosticInfo::Diagnostic::get(client);
-    if (diagnostic && backtraceMode) {
+    if (auto diagnostic = DiagnosticInfo::get(*client)) {
         BSONObjBuilder waitingForLatchBuilder(infoBuilder->subobjStart("waitingForLatch"));
         waitingForLatchBuilder.append("timestamp", diagnostic->getTimestamp());
         waitingForLatchBuilder.append("captureName", diagnostic->getCaptureName());
-        {
+        if (backtraceMode) {
             BSONArrayBuilder backtraceBuilder(waitingForLatchBuilder.subarrayStart("backtrace"));
             for (const auto& frame : diagnostic->makeStackTrace().frames) {
                 BSONObjBuilder backtraceObj(backtraceBuilder.subobjStart());
@@ -335,10 +318,6 @@ void CurOp::reportCurrentOpForClient(OperationContext* opCtx,
                 backtraceObj.append("path", frame.objectPath);
             }
         }
-    }
-
-    if (MONGO_FAIL_POINT(keepDiagnosticCaptureOnFailedLock)) {
-        gHangLock.lock.unlock();
     }
 }
 
@@ -476,6 +455,11 @@ bool CurOp::completeAndLogOperation(OperationContext* opCtx,
                                       "operation due to interrupt";
             }
         }
+
+        // Gets the time spent blocked on prepare conflicts.
+        _debug.prepareConflictDurationMicros = durationCount<Microseconds>(
+            PrepareConflictTracker::get(opCtx).getPrepareConflictDuration());
+
         log(component) << _debug.report(client,
                                         *this,
                                         (lockerInfo ? &lockerInfo->stats : nullptr),
@@ -725,6 +709,10 @@ string OpDebug::report(Client* client,
 
     if (!curop.getPlanSummary().empty()) {
         s << " planSummary: " << curop.getPlanSummary().toString();
+    }
+
+    if (prepareConflictDurationMicros > 0) {
+        s << " prepareConflictDuration: " << (prepareConflictDurationMicros / 1000) << "ms";
     }
 
     OPDEBUG_TOSTRING_HELP(nShards);

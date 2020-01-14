@@ -41,7 +41,7 @@
 #include "mongo/db/record_id.h"
 #include "mongo/db/storage/kv/kv_prefix.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 
 namespace mongo {
 
@@ -112,6 +112,14 @@ public:
     /// ---------------------
 
     void setIsReady(bool newIsReady) final;
+
+    void setDropped() final {
+        _isDropped.store(true);
+    }
+
+    bool isDropped() const final {
+        return _isDropped.load();
+    }
 
     // --
 
@@ -199,8 +207,9 @@ private:
 
     // cached stuff
 
-    Ordering _ordering;  // TODO: this might be b-tree specific
-    bool _isReady;       // cache of NamespaceDetails info
+    Ordering _ordering;           // TODO: this might be b-tree specific
+    bool _isReady;                // cache of NamespaceDetails info
+    AtomicWord<bool> _isDropped;  // Whether the index drop is committed.
 
     // Set to true if this index supports path-level multikey tracking.
     // '_indexTracksPathLevelMultikeyInfo' is effectively const after IndexCatalogEntry::init() is
@@ -214,7 +223,8 @@ private:
     // Controls concurrent access to '_indexMultikeyPaths'. We acquire this mutex rather than the
     // RESOURCE_METADATA lock as a performance optimization so that it is cheaper to detect whether
     // there is actually any path-level multikey information to update or not.
-    mutable stdx::mutex _indexMultikeyPathsMutex;
+    mutable Mutex _indexMultikeyPathsMutex =
+        MONGO_MAKE_LATCH("IndexCatalogEntryImpl::_indexMultikeyPathsMutex");
 
     // Non-empty only if '_indexTracksPathLevelMultikeyInfo' is true.
     //

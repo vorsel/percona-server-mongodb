@@ -57,8 +57,8 @@ namespace mongo {
 namespace repl {
 namespace {
 
-using LockGuard = stdx::lock_guard<stdx::mutex>;
-using UniqueLock = stdx::unique_lock<stdx::mutex>;
+using LockGuard = stdx::lock_guard<Latch>;
+using UniqueLock = stdx::unique_lock<Latch>;
 using executor::RemoteCommandRequest;
 
 constexpr auto kCountResponseDocumentCountFieldName = "n"_sd;
@@ -122,10 +122,9 @@ CollectionCloner::CollectionCloner(executor::TaskExecutor* executor,
                       [this](const executor::TaskExecutor::RemoteCommandCallbackArgs& args) {
                           return _countCallback(args);
                       },
-                      RemoteCommandRetryScheduler::makeRetryPolicy(
+                      RemoteCommandRetryScheduler::makeRetryPolicy<ErrorCategory::RetriableError>(
                           numInitialSyncCollectionCountAttempts.load(),
-                          executor::RemoteCommandRequest::kNoTimeout,
-                          RemoteCommandRetryScheduler::kAllRetriableErrors)),
+                          executor::RemoteCommandRequest::kNoTimeout)),
       _listIndexesFetcher(
           _executor,
           _source,
@@ -139,10 +138,9 @@ CollectionCloner::CollectionCloner(executor::TaskExecutor* executor,
           ReadPreferenceSetting::secondaryPreferredMetadata(),
           RemoteCommandRequest::kNoTimeout /* find network timeout */,
           RemoteCommandRequest::kNoTimeout /* getMore network timeout */,
-          RemoteCommandRetryScheduler::makeRetryPolicy(
+          RemoteCommandRetryScheduler::makeRetryPolicy<ErrorCategory::RetriableError>(
               numInitialSyncListIndexesAttempts.load(),
-              executor::RemoteCommandRequest::kNoTimeout,
-              RemoteCommandRetryScheduler::kAllRetriableErrors)),
+              executor::RemoteCommandRequest::kNoTimeout)),
       _indexSpecs(),
       _documentsToInsert(),
       _dbWorkTaskRunner(_dbWorkThreadPool),
@@ -201,7 +199,7 @@ bool CollectionCloner::_isActive_inlock() const {
 }
 
 bool CollectionCloner::_isShuttingDown() const {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
     return State::kShuttingDown == _state;
 }
 
@@ -232,7 +230,7 @@ Status CollectionCloner::startup() noexcept {
 }
 
 void CollectionCloner::shutdown() {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
     switch (_state) {
         case State::kPreStart:
             // Transition directly from PreStart to Complete if not started yet.
@@ -265,12 +263,12 @@ void CollectionCloner::_cancelRemainingWork_inlock() {
 }
 
 CollectionCloner::Stats CollectionCloner::getStats() const {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
     return _stats;
 }
 
 void CollectionCloner::join() {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
     _condition.wait(lk, [this]() {
         return (_queryState == QueryState::kNotStarted || _queryState == QueryState::kFinished) &&
             !_isActive_inlock();
@@ -290,7 +288,7 @@ void CollectionCloner::setScheduleDbWorkFn_forTest(ScheduleDbWorkFn scheduleDbWo
 }
 
 void CollectionCloner::setCreateClientFn_forTest(const CreateClientFn& createClientFn) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     _createClientFn = createClientFn;
 }
 
@@ -337,12 +335,13 @@ void CollectionCloner::_countCallback(
         }
     }
 
+    // The count command may return a negative value after an unclean shutdown,
+    // so we set it to zero here to avoid aborting the collection clone.
+    // Note that this count value is only used for reporting purposes.
     if (count < 0) {
-        _finishCallback({ErrorCodes::BadValue,
-                         str::stream() << "Count call on collection " << _sourceNss.ns() << " from "
-                                       << _source.toString()
-                                       << " returned negative document count: " << count});
-        return;
+        warning() << "Count command returned negative value. Updating to 0 to allow progress "
+                     "meter to function properly. ";
+        count = 0;
     }
 
     {
@@ -430,20 +429,22 @@ void CollectionCloner::_beginCollectionCallback(const executor::TaskExecutor::Ca
         _finishCallback(cbd.status);
         return;
     }
-    MONGO_FAIL_POINT_BLOCK(initialSyncHangCollectionClonerBeforeEstablishingCursor, nssData) {
-        const BSONObj& data = nssData.getData();
-        auto nss = data["nss"].str();
-        // Only hang when cloning the specified collection, or if no collection was specified.
-        if (nss.empty() || _destNss.toString() == nss) {
-            while (MONGO_FAIL_POINT(initialSyncHangCollectionClonerBeforeEstablishingCursor) &&
+    initialSyncHangCollectionClonerBeforeEstablishingCursor.executeIf(
+        [&](const BSONObj& data) {
+            while (MONGO_unlikely(
+                       initialSyncHangCollectionClonerBeforeEstablishingCursor.shouldFail()) &&
                    !_isShuttingDown()) {
                 log() << "initialSyncHangCollectionClonerBeforeEstablishingCursor fail point "
                          "enabled for "
                       << _destNss.toString() << ". Blocking until fail point is disabled.";
                 mongo::sleepsecs(1);
             }
-        }
-    }
+        },
+        [&](const BSONObj& data) {
+            auto nss = data["nss"].str();
+            // Only hang when cloning the specified collection, or if no collection was specified.
+            return nss.empty() || nss == _destNss.toString();
+        });
     if (!_idIndexSpec.isEmpty() && _options.autoIndexId == CollectionOptions::NO) {
         warning()
             << "Found the _id_ index spec but the collection specified autoIndexId of false on ns:"
@@ -473,7 +474,7 @@ void CollectionCloner::_beginCollectionCallback(const executor::TaskExecutor::Ca
             auto cancelRemainingWorkInLock = [this]() { _cancelRemainingWork_inlock(); };
             auto finishCallbackFn = [this](const Status& status) {
                 {
-                    stdx::lock_guard<stdx::mutex> lock(_mutex);
+                    stdx::lock_guard<Latch> lock(_mutex);
                     _queryState = QueryState::kFinished;
                     _clientConnection.reset();
                 }
@@ -493,13 +494,13 @@ void CollectionCloner::_beginCollectionCallback(const executor::TaskExecutor::Ca
 void CollectionCloner::_runQuery(const executor::TaskExecutor::CallbackArgs& callbackData,
                                  std::shared_ptr<OnCompletionGuard> onCompletionGuard) {
     if (!callbackData.status.isOK()) {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, callbackData.status);
         return;
     }
     bool queryStateOK = false;
     {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         queryStateOK = _queryState == QueryState::kNotStarted;
         if (queryStateOK) {
             _queryState = QueryState::kRunning;
@@ -511,25 +512,25 @@ void CollectionCloner::_runQuery(const executor::TaskExecutor::CallbackArgs& cal
         }
     }
 
-    MONGO_FAIL_POINT_BLOCK(initialSyncHangBeforeCollectionClone, options) {
-        const BSONObj& data = options.getData();
-        if (data["namespace"].String() == _destNss.ns()) {
+    initialSyncHangBeforeCollectionClone.executeIf(
+        [&](const BSONObj&) {
             log() << "initial sync - initialSyncHangBeforeCollectionClone fail point "
                      "enabled. Blocking until fail point is disabled.";
-            while (MONGO_FAIL_POINT(initialSyncHangBeforeCollectionClone) && !_isShuttingDown()) {
+            while (MONGO_unlikely(initialSyncHangBeforeCollectionClone.shouldFail()) &&
+                   !_isShuttingDown()) {
                 mongo::sleepsecs(1);
             }
-        }
-    }
+        },
+        [&](const BSONObj& data) { return data["namespace"].String() == _destNss.ns(); });
 
     Status clientConnectionStatus = _clientConnection->connect(_source, StringData());
     if (!clientConnectionStatus.isOK()) {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, clientConnectionStatus);
         return;
     }
     if (!replAuthenticate(_clientConnection.get())) {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         onCompletionGuard->setResultAndCancelRemainingWork_inlock(
             lock,
             {ErrorCodes::AuthenticationFailed,
@@ -551,7 +552,7 @@ void CollectionCloner::_runQuery(const executor::TaskExecutor::CallbackArgs& cal
     } catch (const DBException& e) {
         auto queryStatus = e.toStatus().withContext(str::stream() << "Error querying collection '"
                                                                   << _sourceNss.ns());
-        stdx::unique_lock<stdx::mutex> lock(_mutex);
+        stdx::unique_lock<Latch> lock(_mutex);
         if (queryStatus.code() == ErrorCodes::OperationFailed ||
             queryStatus.code() == ErrorCodes::CursorNotFound ||
             queryStatus.code() == ErrorCodes::QueryPlanKilled) {
@@ -571,7 +572,7 @@ void CollectionCloner::_runQuery(const executor::TaskExecutor::CallbackArgs& cal
         }
     }
     waitForDbWorker();
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
     onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, Status::OK());
 }
 
@@ -579,7 +580,7 @@ void CollectionCloner::_handleNextBatch(std::shared_ptr<OnCompletionGuard> onCom
                                         DBClientCursorBatchIterator& iter) {
     _stats.receivedBatches++;
     {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
         uassert(ErrorCodes::CallbackCanceled,
                 "Collection cloning cancelled.",
                 _queryState != QueryState::kCanceling);
@@ -601,24 +602,26 @@ void CollectionCloner::_handleNextBatch(std::shared_ptr<OnCompletionGuard> onCom
         uassertStatusOK(newStatus);
     }
 
-    MONGO_FAIL_POINT_BLOCK(initialSyncHangCollectionClonerAfterHandlingBatchResponse, nssData) {
-        const BSONObj& data = nssData.getData();
-        auto nss = data["nss"].str();
-        // Only hang when cloning the specified collection, or if no collection was specified.
-        if (nss.empty() || _destNss.toString() == nss) {
-            while (MONGO_FAIL_POINT(initialSyncHangCollectionClonerAfterHandlingBatchResponse) &&
+    initialSyncHangCollectionClonerAfterHandlingBatchResponse.executeIf(
+        [&](const BSONObj&) {
+            while (MONGO_unlikely(
+                       initialSyncHangCollectionClonerAfterHandlingBatchResponse.shouldFail()) &&
                    !_isShuttingDown()) {
                 log() << "initialSyncHangCollectionClonerAfterHandlingBatchResponse fail point "
                          "enabled for "
                       << _destNss.toString() << ". Blocking until fail point is disabled.";
                 mongo::sleepsecs(1);
             }
-        }
-    }
+        },
+        [&](const BSONObj& data) {
+            // Only hang when cloning the specified collection, or if no collection was specified.
+            auto nss = data["nss"].str();
+            return nss.empty() || nss == _destNss.toString();
+        });
 }
 
 void CollectionCloner::_verifyCollectionWasDropped(
-    const stdx::unique_lock<stdx::mutex>& lk,
+    const stdx::unique_lock<Latch>& lk,
     Status batchStatus,
     std::shared_ptr<OnCompletionGuard> onCompletionGuard) {
     // If we already have a _verifyCollectionDroppedScheduler, just return; the existing
@@ -681,7 +684,7 @@ void CollectionCloner::_insertDocumentsCallback(
     const executor::TaskExecutor::CallbackArgs& cbd,
     std::shared_ptr<OnCompletionGuard> onCompletionGuard) {
     if (!cbd.status.isOK()) {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, cbd.status);
         return;
     }
@@ -703,19 +706,21 @@ void CollectionCloner::_insertDocumentsCallback(
         return;
     }
 
-    MONGO_FAIL_POINT_BLOCK(initialSyncHangDuringCollectionClone, options) {
-        const BSONObj& data = options.getData();
-        if (data["namespace"].String() == _destNss.ns() &&
-            static_cast<int>(_stats.documentsCopied) >= data["numDocsToClone"].numberInt()) {
+    initialSyncHangDuringCollectionClone.executeIf(
+        [&](const BSONObj&) {
             lk.unlock();
             log() << "initial sync - initialSyncHangDuringCollectionClone fail point "
                      "enabled. Blocking until fail point is disabled.";
-            while (MONGO_FAIL_POINT(initialSyncHangDuringCollectionClone) && !_isShuttingDown()) {
+            while (MONGO_unlikely(initialSyncHangDuringCollectionClone.shouldFail()) &&
+                   !_isShuttingDown()) {
                 mongo::sleepsecs(1);
             }
             lk.lock();
-        }
-    }
+        },
+        [&](const BSONObj& data) {
+            return data["namespace"].String() == _destNss.ns() &&
+                static_cast<int>(_stats.documentsCopied) >= data["numDocsToClone"].numberInt();
+        });
 }
 
 void CollectionCloner::_finishCallback(const Status& status) {

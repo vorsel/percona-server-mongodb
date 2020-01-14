@@ -234,11 +234,16 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(OperationContext* o
     // and populate them with dummy values before parsing ourObj as an oplog entry.
     BSONObjBuilder bob;
     if (isNestedApplyOpsCommand) {
-        if (!ourObj.hasField("ts")) {
-            bob.appendTimestamp("ts");
+        if (!ourObj.hasField(OplogEntry::kTimestampFieldName)) {
+            bob.appendTimestamp(OplogEntry::kTimestampFieldName);
+        }
+        if (!ourObj.hasField(OplogEntry::kWallClockTimeFieldName)) {
+            bob.append(OplogEntry::kWallClockTimeFieldName, Date_t());
         }
     }
+
     bob.appendElements(ourObj);
+
     BSONObj fixedObj = bob.obj();
 
     // Parse the oplog entry.
@@ -296,8 +301,6 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(OperationContext* o
             // If this is a transaction which did not commit, we need do nothing more than
             // rollback the transaction table entry.  If it did commit, we will have rolled it
             // back when we rolled back the commit.
-            //
-            // TODO(SERVER-39797): Roll back partial transactions when they commit.
             return Status::OK();
         }
     }
@@ -419,8 +422,15 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(OperationContext* o
 
                 return Status::OK();
             }
-            // TODO(SERVER-39452): Ignore no-op commitIndexBuild command for now. Revisit when we
-            // are ready to implement rollback logic.
+            // TODO(SERVER-39452): Ignore no-op startIndexBuild, abortIndexBuild, and
+            // commitIndexBuild commands.
+            // Revisit when we are ready to implement rollback logic.
+            case OplogEntry::CommandType::kStartIndexBuild: {
+                return Status::OK();
+            }
+            case OplogEntry::CommandType::kAbortIndexBuild: {
+                return Status::OK();
+            }
             case OplogEntry::CommandType::kCommitIndexBuild: {
                 return Status::OK();
             }
@@ -658,12 +668,12 @@ void checkRbidAndUpdateMinValid(OperationContext* opCtx,
     replicationProcess->getConsistencyMarkers()->clearAppliedThrough(opCtx, {});
     replicationProcess->getConsistencyMarkers()->setMinValid(opCtx, minValid);
 
-    if (MONGO_FAIL_POINT(rollbackHangThenFailAfterWritingMinValid)) {
+    if (MONGO_unlikely(rollbackHangThenFailAfterWritingMinValid.shouldFail())) {
 
         // This log output is used in jstests so please leave it.
         log() << "rollback - rollbackHangThenFailAfterWritingMinValid fail point "
                  "enabled. Blocking until fail point is disabled.";
-        while (MONGO_FAIL_POINT(rollbackHangThenFailAfterWritingMinValid)) {
+        while (MONGO_unlikely(rollbackHangThenFailAfterWritingMinValid.shouldFail())) {
             invariant(!globalInShutdownDeprecated());  // It is an error to shutdown while enabled.
             mongo::sleepsecs(1);
         }
@@ -763,7 +773,7 @@ void rollbackDropIndexes(OperationContext* opCtx,
         log() << "Creating index in rollback for collection: " << *nss << ", UUID: " << uuid
               << ", index: " << indexName;
 
-        createIndexForApplyOps(opCtx, indexSpec, *nss, {}, OplogApplication::Mode::kRecovering);
+        createIndexForApplyOps(opCtx, indexSpec, *nss, OplogApplication::Mode::kRecovering);
 
         LOG(1) << "Created index in rollback for collection: " << *nss << ", UUID: " << uuid
                << ", index: " << indexName;
@@ -843,6 +853,9 @@ void renameOutOfTheWay(OperationContext* opCtx, RenameCollectionInfo info, Datab
     auto collection = db->getCollection(opCtx, info.renameTo);
     invariant(collection);
 
+    // The generated unique collection name is only guaranteed to exist if the database is
+    // exclusively locked.
+    invariant(opCtx->lockState()->isDbLockedForMode(db->name(), LockMode::MODE_X));
     // Creates the oplog entry to temporarily rename the collection that is
     // preventing the renameCollection command from rolling back to a unique
     // namespace.
@@ -989,7 +1002,7 @@ Status _syncRollback(OperationContext* opCtx,
         });
         syncFixUp(opCtx, how, rollbackSource, replCoord, replicationProcess);
 
-        if (MONGO_FAIL_POINT(rollbackExitEarlyAfterCollectionDrop)) {
+        if (MONGO_unlikely(rollbackExitEarlyAfterCollectionDrop.shouldFail())) {
             log() << "rollbackExitEarlyAfterCollectionDrop fail point enabled. Returning early "
                      "until fail point is disabled.";
             return Status(ErrorCodes::NamespaceNotFound,
@@ -1001,11 +1014,11 @@ Status _syncRollback(OperationContext* opCtx,
         return Status(ErrorCodes::UnrecoverableRollbackError, e.what());
     }
 
-    if (MONGO_FAIL_POINT(rollbackHangBeforeFinish)) {
+    if (MONGO_unlikely(rollbackHangBeforeFinish.shouldFail())) {
         // This log output is used in js tests so please leave it.
         log() << "rollback - rollbackHangBeforeFinish fail point "
                  "enabled. Blocking until fail point is disabled.";
-        while (MONGO_FAIL_POINT(rollbackHangBeforeFinish)) {
+        while (MONGO_unlikely(rollbackHangBeforeFinish.shouldFail())) {
             invariant(!globalInShutdownDeprecated());  // It is an error to shutdown while enabled.
             mongo::sleepsecs(1);
         }
@@ -1169,7 +1182,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
         }
     }
 
-    if (MONGO_FAIL_POINT(rollbackExitEarlyAfterCollectionDrop)) {
+    if (MONGO_unlikely(rollbackExitEarlyAfterCollectionDrop.shouldFail())) {
         return;
     }
 
@@ -1631,11 +1644,10 @@ void rollback(OperationContext* opCtx,
         }
     }
 
-    if (MONGO_FAIL_POINT(rollbackHangAfterTransitionToRollback)) {
+    if (MONGO_unlikely(rollbackHangAfterTransitionToRollback.shouldFail())) {
         log() << "rollbackHangAfterTransitionToRollback fail point enabled. Blocking until fail "
                  "point is disabled (rs_rollback).";
-        MONGO_FAIL_POINT_PAUSE_WHILE_SET_OR_INTERRUPTED(opCtx,
-                                                        rollbackHangAfterTransitionToRollback);
+        rollbackHangAfterTransitionToRollback.pauseWhileSet(opCtx);
     }
 
     try {

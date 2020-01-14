@@ -58,6 +58,7 @@ namespace mongo {
 namespace {
 
 MONGO_FAIL_POINT_DEFINE(migrationCommitVersionError);
+MONGO_FAIL_POINT_DEFINE(skipExpiringOldChunkHistory);
 
 /**
  * Append min, max and version information from chunk to the buffer for logChange purposes.
@@ -662,7 +663,7 @@ StatusWith<BSONObj> ShardingCatalogManager::commitChunkMigration(
         return findResponse.getStatus();
     }
 
-    if (MONGO_FAIL_POINT(migrationCommitVersionError)) {
+    if (MONGO_unlikely(migrationCommitVersionError.shouldFail())) {
         uassert(ErrorCodes::StaleEpoch,
                 "failpoint 'migrationCommitVersionError' generated error",
                 false);
@@ -729,10 +730,12 @@ StatusWith<BSONObj> ShardingCatalogManager::commitChunkMigration(
     // Update the history of the migrated chunk.
     // Drop the history that is too old (10 seconds of history for now).
     // TODO SERVER-33831 to update the old history removal policy.
-    while (!newHistory.empty() &&
-           newHistory.back().getValidAfter().getSecs() + kHistorySecs <
-               validAfter.get().getSecs()) {
-        newHistory.pop_back();
+    if (!MONGO_unlikely(skipExpiringOldChunkHistory.shouldFail())) {
+        while (!newHistory.empty() &&
+               newHistory.back().getValidAfter().getSecs() + kHistorySecs <
+                   validAfter.get().getSecs()) {
+            newHistory.pop_back();
+        }
     }
 
     if (!newHistory.empty() && newHistory.front().getValidAfter() >= validAfter.get()) {

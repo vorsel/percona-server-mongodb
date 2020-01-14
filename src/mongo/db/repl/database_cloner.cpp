@@ -57,8 +57,8 @@ MONGO_FAIL_POINT_DEFINE(initialSyncHangBeforeListCollections);
 
 namespace {
 
-using LockGuard = stdx::lock_guard<stdx::mutex>;
-using UniqueLock = stdx::unique_lock<stdx::mutex>;
+using LockGuard = stdx::lock_guard<Latch>;
+using UniqueLock = stdx::unique_lock<Latch>;
 using executor::RemoteCommandRequest;
 
 const char* kNameFieldName = "name";
@@ -112,22 +112,22 @@ DatabaseCloner::DatabaseCloner(executor::TaskExecutor* executor,
       _storageInterface(si),
       _collectionWork(collWork),
       _onCompletion(std::move(onCompletion)),
-      _listCollectionsFetcher(_executor,
-                              _source,
-                              _dbname,
-                              createListCollectionsCommandObject(_listCollectionsFilter),
-                              [=](const StatusWith<Fetcher::QueryResponse>& result,
-                                  Fetcher::NextAction* nextAction,
-                                  BSONObjBuilder* getMoreBob) {
-                                  _listCollectionsCallback(result, nextAction, getMoreBob);
-                              },
-                              ReadPreferenceSetting::secondaryPreferredMetadata(),
-                              RemoteCommandRequest::kNoTimeout /* find network timeout */,
-                              RemoteCommandRequest::kNoTimeout /* getMore network timeout */,
-                              RemoteCommandRetryScheduler::makeRetryPolicy(
-                                  numInitialSyncListCollectionsAttempts.load(),
-                                  executor::RemoteCommandRequest::kNoTimeout,
-                                  RemoteCommandRetryScheduler::kAllRetriableErrors)),
+      _listCollectionsFetcher(
+          _executor,
+          _source,
+          _dbname,
+          createListCollectionsCommandObject(_listCollectionsFilter),
+          [=](const StatusWith<Fetcher::QueryResponse>& result,
+              Fetcher::NextAction* nextAction,
+              BSONObjBuilder* getMoreBob) {
+              _listCollectionsCallback(result, nextAction, getMoreBob);
+          },
+          ReadPreferenceSetting::secondaryPreferredMetadata(),
+          RemoteCommandRequest::kNoTimeout /* find network timeout */,
+          RemoteCommandRequest::kNoTimeout /* getMore network timeout */,
+          RemoteCommandRetryScheduler::makeRetryPolicy<ErrorCategory::RetriableError>(
+              numInitialSyncListCollectionsAttempts.load(),
+              executor::RemoteCommandRequest::kNoTimeout)),
       _startCollectionCloner([](CollectionCloner& cloner) { return cloner.startup(); }) {
     // Fetcher throws an exception on null executor.
     invariant(executor);
@@ -178,19 +178,21 @@ Status DatabaseCloner::startup() noexcept {
             return Status(ErrorCodes::ShutdownInProgress, "database cloner completed");
     }
 
-    MONGO_FAIL_POINT_BLOCK(initialSyncHangBeforeListCollections, customArgs) {
-        const auto& data = customArgs.getData();
-        const auto databaseElem = data["database"];
-        if (!databaseElem || databaseElem.checkAndGetStringData() == _dbname) {
+    initialSyncHangBeforeListCollections.executeIf(
+        [&](const BSONObj&) {
             lk.unlock();
             log() << "initial sync - initialSyncHangBeforeListCollections fail point "
                      "enabled. Blocking until fail point is disabled.";
-            while (MONGO_FAIL_POINT(initialSyncHangBeforeListCollections) && !_isShuttingDown()) {
+            while (MONGO_unlikely(initialSyncHangBeforeListCollections.shouldFail()) &&
+                   !_isShuttingDown()) {
                 mongo::sleepsecs(1);
             }
             lk.lock();
-        }
-    }
+        },
+        [&](const BSONObj& data) {
+            const auto databaseElem = data["database"];
+            return !databaseElem || databaseElem.checkAndGetStringData() == _dbname;
+        });
 
     _stats.start = _executor->now();
     LOG(1) << "Scheduling listCollections call for database: " << _dbname;
@@ -206,7 +208,7 @@ Status DatabaseCloner::startup() noexcept {
 }
 
 void DatabaseCloner::shutdown() {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
     switch (_state) {
         case State::kPreStart:
             // Transition directly from PreStart to Complete if not started yet.
@@ -254,7 +256,7 @@ void DatabaseCloner::setStartCollectionClonerFn(
 }
 
 DatabaseCloner::State DatabaseCloner::getState_forTest() const {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     return _state;
 }
 
@@ -294,16 +296,13 @@ void DatabaseCloner::_listCollectionsCallback(const StatusWith<Fetcher::QueryRes
         return;
     }
 
-    MONGO_FAIL_POINT_BLOCK(initialSyncHangAfterListCollections, options) {
-        const BSONObj& data = options.getData();
-        if (data["database"].String() == _dbname) {
+    initialSyncHangAfterListCollections.executeIf(
+        [&](const BSONObj&) {
             log() << "initial sync - initialSyncHangAfterListCollections fail point "
                      "enabled. Blocking until fail point is disabled.";
-            while (MONGO_FAIL_POINT(initialSyncHangAfterListCollections)) {
-                mongo::sleepsecs(1);
-            }
-        }
-    }
+            initialSyncHangAfterListCollections.pauseWhileSet();
+        },
+        [&](const BSONObj& data) { return data["database"].String() == _dbname; });
 
     _collectionNamespaces.reserve(_collectionInfos.size());
     std::set<std::string> seen;

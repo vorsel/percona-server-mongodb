@@ -53,9 +53,9 @@ const char* ShardFilterStage::kStageType = "SHARDING_FILTER";
 ShardFilterStage::ShardFilterStage(OperationContext* opCtx,
                                    ScopedCollectionMetadata metadata,
                                    WorkingSet* ws,
-                                   PlanStage* child)
+                                   std::unique_ptr<PlanStage> child)
     : PlanStage(kStageType, opCtx), _ws(ws), _shardFilterer(std::move(metadata)) {
-    _children.emplace_back(child);
+    _children.emplace_back(std::move(child));
 }
 
 ShardFilterStage::~ShardFilterStage() {}
@@ -91,8 +91,9 @@ PlanStage::StageState ShardFilterStage::doWork(WorkingSetID* out) {
 
                     // Skip this working set member with a warning - no shard key should not be
                     // possible unless manually inserting data into a shard
-                    warning() << "no shard key found in document " << redact(member->obj.value())
-                              << " for shard key pattern " << _shardFilterer.getKeyPattern() << ", "
+                    warning() << "no shard key found in document "
+                              << redact(member->doc.value().toBson()) << " for shard key pattern "
+                              << _shardFilterer.getKeyPattern() << ", "
                               << "document may have been inserted manually into shard";
                 } else {
                     invariant(res == ShardFilterer::DocumentBelongsResult::kDoesNotBelong);

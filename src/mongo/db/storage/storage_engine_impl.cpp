@@ -101,8 +101,8 @@ void StorageEngineImpl::loadCatalog(OperationContext* opCtx) {
 
         if (status.code() == ErrorCodes::DataModifiedByRepair) {
             warning() << "Catalog data modified by repair: " << status.reason();
-            repairObserver->onModification(str::stream()
-                                           << "DurableCatalog repaired: " << status.reason());
+            repairObserver->invalidatingModification(str::stream() << "DurableCatalog repaired: "
+                                                                   << status.reason());
         } else {
             fassertNoTrace(50926, status);
         }
@@ -176,8 +176,8 @@ void StorageEngineImpl::loadCatalog(OperationContext* opCtx) {
                                      "build the index.";
 
                         StorageRepairObserver::get(getGlobalServiceContext())
-                            ->onModification(str::stream() << "Orphan collection created: "
-                                                           << statusWithNs.getValue());
+                            ->benignModification(str::stream() << "Orphan collection created: "
+                                                               << statusWithNs.getValue());
 
                     } else {
                         // Log an error message if we cannot create the entry.
@@ -218,8 +218,9 @@ void StorageEngineImpl::loadCatalog(OperationContext* opCtx) {
 
                     if (_options.forRepair) {
                         StorageRepairObserver::get(getGlobalServiceContext())
-                            ->onModification(str::stream() << "Collection " << nss
-                                                           << " dropped: " << status.reason());
+                            ->invalidatingModification(str::stream()
+                                                       << "Collection " << nss
+                                                       << " dropped: " << status.reason());
                     }
                     wuow.commit();
                     continue;
@@ -307,8 +308,8 @@ Status StorageEngineImpl::_recoverOrphanedCollection(OperationContext* opCtx,
     }
     if (dataModified) {
         StorageRepairObserver::get(getGlobalServiceContext())
-            ->onModification(str::stream() << "Collection " << collectionName
-                                           << " recovered: " << status.reason());
+            ->invalidatingModification(str::stream() << "Collection " << collectionName
+                                                     << " recovered: " << status.reason());
     }
     wuow.commit();
     return Status::OK();
@@ -425,6 +426,21 @@ StorageEngineImpl::reconcileCatalogAndIdents(OperationContext* opCtx) {
         for (const auto& indexMetaData : metaData.indexes) {
             const std::string& indexName = indexMetaData.name();
             std::string indexIdent = _catalog->getIndexIdent(opCtx, coll, indexName);
+
+            // Warn in case of incorrect "multikeyPath" information in catalog documents. This is
+            // the result of a concurrency bug which has since been fixed, but may persist in
+            // certain catalog documents. See https://jira.mongodb.org/browse/SERVER-43074
+            const bool hasMultiKeyPaths =
+                std::any_of(indexMetaData.multikeyPaths.begin(),
+                            indexMetaData.multikeyPaths.end(),
+                            [](auto& pathSet) { return pathSet.size() > 0; });
+            if (!indexMetaData.multikey && hasMultiKeyPaths) {
+                warning() << "The 'multikey' field for index " << indexName << " on collection "
+                          << coll << " was false with non-empty 'multikeyPaths'. This indicates "
+                          << "corruption of the catalog. Consider either dropping and recreating "
+                          << "the index, or rerunning with the --repair option. See "
+                          << "http://dochub.mongodb.org/core/repair for more information.";
+            }
 
             const bool foundIdent = engineIdents.find(indexIdent) != engineIdents.end();
             // An index drop will immediately remove the ident, but the `indexMetaData` catalog
@@ -700,8 +716,8 @@ Status StorageEngineImpl::repairRecordStore(OperationContext* opCtx, const Names
     }
 
     if (dataModified) {
-        repairObserver->onModification(str::stream()
-                                       << "Collection " << nss << ": " << status.reason());
+        repairObserver->invalidatingModification(str::stream() << "Collection " << nss << ": "
+                                                               << status.reason());
     }
 
     // After repairing, re-initialize the collection with a valid RecordStore.
@@ -892,7 +908,7 @@ StorageEngineImpl::TimestampMonitor::TimestampMonitor(KVEngine* engine, Periodic
 
 StorageEngineImpl::TimestampMonitor::~TimestampMonitor() {
     log() << "Timestamp monitor shutting down";
-    stdx::lock_guard<stdx::mutex> lock(_monitorMutex);
+    stdx::lock_guard<Latch> lock(_monitorMutex);
     invariant(_listeners.empty());
 }
 
@@ -904,7 +920,7 @@ void StorageEngineImpl::TimestampMonitor::startup() {
         "TimestampMonitor",
         [&](Client* client) {
             {
-                stdx::lock_guard<stdx::mutex> lock(_monitorMutex);
+                stdx::lock_guard<Latch> lock(_monitorMutex);
                 if (_listeners.empty()) {
                     return;
                 }
@@ -971,7 +987,7 @@ void StorageEngineImpl::TimestampMonitor::startup() {
 }
 
 void StorageEngineImpl::TimestampMonitor::notifyAll(TimestampType type, Timestamp newTimestamp) {
-    stdx::lock_guard<stdx::mutex> lock(_monitorMutex);
+    stdx::lock_guard<Latch> lock(_monitorMutex);
     for (auto& listener : _listeners) {
         if (listener->getType() == type) {
             listener->notify(newTimestamp);
@@ -980,7 +996,7 @@ void StorageEngineImpl::TimestampMonitor::notifyAll(TimestampType type, Timestam
 }
 
 void StorageEngineImpl::TimestampMonitor::addListener(TimestampListener* listener) {
-    stdx::lock_guard<stdx::mutex> lock(_monitorMutex);
+    stdx::lock_guard<Latch> lock(_monitorMutex);
     if (std::find(_listeners.begin(), _listeners.end(), listener) != _listeners.end()) {
         bool listenerAlreadyRegistered = true;
         invariant(!listenerAlreadyRegistered);
@@ -989,7 +1005,7 @@ void StorageEngineImpl::TimestampMonitor::addListener(TimestampListener* listene
 }
 
 void StorageEngineImpl::TimestampMonitor::removeListener(TimestampListener* listener) {
-    stdx::lock_guard<stdx::mutex> lock(_monitorMutex);
+    stdx::lock_guard<Latch> lock(_monitorMutex);
     if (std::find(_listeners.begin(), _listeners.end(), listener) == _listeners.end()) {
         bool listenerNotRegistered = true;
         invariant(!listenerNotRegistered);

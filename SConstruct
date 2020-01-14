@@ -1945,6 +1945,15 @@ if env.TargetOSIs('posix'):
         except KeyError:
             pass
 
+    # Python uses APPDATA to determine the location of user installed
+    # site-packages. If we do not pass this variable down to Python
+    # subprocesses then anything installed with `pip install --user`
+    # will be inaccessible leading to import errors.
+    if env.TargetOSIs('windows'):
+        appdata = os.getenv('APPDATA', None)
+        if appdata is not None:
+            env['ENV']['APPDATA'] = appdata
+
     if env.TargetOSIs('linux') and has_option( "gcov" ):
         env.Append( CCFLAGS=["-fprofile-arcs", "-ftest-coverage", "-fprofile-update=single"] )
         env.Append( LINKFLAGS=["-fprofile-arcs", "-ftest-coverage", "-fprofile-update=single"] )
@@ -3248,12 +3257,12 @@ def doConfigure(myenv):
     if ssl_provider == 'native':
         if conf.env.TargetOSIs('windows'):
             ssl_provider = 'windows'
-            env.SetConfigHeaderDefine("MONGO_CONFIG_SSL_PROVIDER", "MONGO_CONFIG_SSL_PROVIDER_WINDOWS")
+            conf.env.SetConfigHeaderDefine("MONGO_CONFIG_SSL_PROVIDER", "MONGO_CONFIG_SSL_PROVIDER_WINDOWS")
             conf.env.Append( MONGO_CRYPTO=["windows"] )
 
         elif conf.env.TargetOSIs('darwin', 'macOS'):
             ssl_provider = 'apple'
-            env.SetConfigHeaderDefine("MONGO_CONFIG_SSL_PROVIDER", "MONGO_CONFIG_SSL_PROVIDER_APPLE")
+            conf.env.SetConfigHeaderDefine("MONGO_CONFIG_SSL_PROVIDER", "MONGO_CONFIG_SSL_PROVIDER_APPLE")
             conf.env.Append( MONGO_CRYPTO=["apple"] )
             conf.env.AppendUnique(FRAMEWORKS=[
                 'CoreFoundation',
@@ -3267,7 +3276,7 @@ def doConfigure(myenv):
         if require_ssl:
             checkOpenSSL(conf)
             # Working OpenSSL available, use it.
-            env.SetConfigHeaderDefine("MONGO_CONFIG_SSL_PROVIDER", "MONGO_CONFIG_SSL_PROVIDER_OPENSSL")
+            conf.env.SetConfigHeaderDefine("MONGO_CONFIG_SSL_PROVIDER", "MONGO_CONFIG_SSL_PROVIDER_OPENSSL")
 
             conf.env.Append( MONGO_CRYPTO=["openssl"] )
         else:
@@ -3613,7 +3622,7 @@ def doConfigure(myenv):
 
     # Resolve --enable-free-mon
     if free_monitoring == "auto":
-        if 'enterprise' not in env['MONGO_MODULES']:
+        if 'enterprise' not in conf.env['MONGO_MODULES']:
             free_monitoring = "on"
         else:
             free_monitoring = "off"
@@ -3787,6 +3796,44 @@ if get_option('install-mode') == 'hygienic':
     env["AIB_TARBALL_SUFFIX"] = "tgz"
     env.Tool('auto_install_binaries')
 
+    env.DeclareRoles(
+        roles=[
+
+            env.Role(
+                name="base",
+            ),
+
+            env.Role(
+                name="debug",
+            ),
+
+            env.Role(
+                name="dev",
+                dependencies=[
+                    "runtime"
+                ],
+            ),
+
+            env.Role(
+                name="meta",
+            ),
+
+            env.Role(
+                name="runtime",
+                dependencies=[
+                    # On windows, we want the runtime role to depend
+                    # on the debug role so that PDBs end in the
+                    # runtime package.
+                    "debug" if env.TargetOSIs('windows') else None,
+                ],
+                transitive=True,
+                silent=True,
+            ),
+        ],
+        base_role="base",
+        meta_role="meta",
+    )
+
     env.AddSuffixMapping({
         "$PROGSUFFIX": env.SuffixMap(
             directory="$PREFIX_BINDIR",
@@ -3794,7 +3841,7 @@ if get_option('install-mode') == 'hygienic':
                 "runtime",
             ]
         ),
-        
+
         "$LIBSUFFIX": env.SuffixMap(
             directory="$PREFIX_LIBDIR",
             default_roles=[
@@ -3817,7 +3864,7 @@ if get_option('install-mode') == 'hygienic':
                 "debug",
             ]
         ),
-        
+
         ".dSYM": env.SuffixMap(
             directory="$PREFIX_DEBUGDIR",
             default_roles=[
@@ -3832,25 +3879,7 @@ if get_option('install-mode') == 'hygienic':
             ]
         ),
 
-        ".lib": env.SuffixMap(
-            directory="$PREFIX_LIBDIR",
-            default_roles=[
-                "dev"
-            ]
-        ),
-        
-        ".h": env.SuffixMap(
-            directory="$PREFIX_INCLUDEDIR",
-            default_roles=[
-                "dev",
-            ]
-        ),
     })
-
-    if env.TargetOSIs('windows'):
-        # On windows, we want the runtime role to depend on the debug role so that PDBs
-        # end in the runtime package.
-        env.AddRoleDependencies(role="runtime", dependencies=["debug"])
 
     env.AddPackageNameAlias(
         component="dist",

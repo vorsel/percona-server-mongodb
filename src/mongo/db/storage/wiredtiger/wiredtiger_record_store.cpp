@@ -147,7 +147,7 @@ public:
         _oplogStones->_currentRecords.store(0);
         _oplogStones->_currentBytes.store(0);
 
-        stdx::lock_guard<stdx::mutex> lk(_oplogStones->_mutex);
+        stdx::lock_guard<Latch> lk(_oplogStones->_mutex);
         _oplogStones->_stones.clear();
     }
 
@@ -159,7 +159,7 @@ private:
 
 WiredTigerRecordStore::OplogStones::OplogStones(OperationContext* opCtx, WiredTigerRecordStore* rs)
     : _rs(rs) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
 
     invariant(rs->isCapped());
     invariant(rs->cappedMaxSize() > 0);
@@ -178,13 +178,13 @@ WiredTigerRecordStore::OplogStones::OplogStones(OperationContext* opCtx, WiredTi
 }
 
 bool WiredTigerRecordStore::OplogStones::isDead() {
-    stdx::lock_guard<stdx::mutex> lk(_oplogReclaimMutex);
+    stdx::lock_guard<Latch> lk(_oplogReclaimMutex);
     return _isDead;
 }
 
 void WiredTigerRecordStore::OplogStones::kill() {
     {
-        stdx::lock_guard<stdx::mutex> lk(_oplogReclaimMutex);
+        stdx::lock_guard<Latch> lk(_oplogReclaimMutex);
         _isDead = true;
     }
     _oplogReclaimCv.notify_one();
@@ -192,11 +192,11 @@ void WiredTigerRecordStore::OplogStones::kill() {
 
 void WiredTigerRecordStore::OplogStones::awaitHasExcessStonesOrDead() {
     // Wait until kill() is called or there are too many oplog stones.
-    stdx::unique_lock<stdx::mutex> lock(_oplogReclaimMutex);
+    stdx::unique_lock<Latch> lock(_oplogReclaimMutex);
     while (!_isDead) {
         {
             MONGO_IDLE_THREAD_BLOCK;
-            stdx::lock_guard<stdx::mutex> lk(_mutex);
+            stdx::lock_guard<Latch> lk(_mutex);
             if (hasExcessStones_inlock()) {
                 // There are now excess oplog stones. However, there it may be necessary to keep
                 // additional oplog.
@@ -219,7 +219,7 @@ void WiredTigerRecordStore::OplogStones::awaitHasExcessStonesOrDead() {
 
 boost::optional<WiredTigerRecordStore::OplogStones::Stone>
 WiredTigerRecordStore::OplogStones::peekOldestStoneIfNeeded() const {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
 
     if (!hasExcessStones_inlock()) {
         return {};
@@ -229,12 +229,12 @@ WiredTigerRecordStore::OplogStones::peekOldestStoneIfNeeded() const {
 }
 
 void WiredTigerRecordStore::OplogStones::popOldestStone() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     _stones.pop_front();
 }
 
 void WiredTigerRecordStore::OplogStones::createNewStoneIfNeeded(RecordId lastRecord) {
-    stdx::unique_lock<stdx::mutex> lk(_mutex, stdx::try_to_lock);
+    stdx::unique_lock<Latch> lk(_mutex, stdx::try_to_lock);
     if (!lk) {
         // Someone else is either already creating a new stone or popping the oldest one. In the
         // latter case, we let the next insert trigger the new stone's creation.
@@ -266,16 +266,16 @@ void WiredTigerRecordStore::OplogStones::updateCurrentStoneAfterInsertOnCommit(
     RecordId highestInserted,
     int64_t countInserted) {
     opCtx->recoveryUnit()->registerChange(
-        new InsertChange(this, bytesInserted, highestInserted, countInserted));
+        std::make_unique<InsertChange>(this, bytesInserted, highestInserted, countInserted));
 }
 
 void WiredTigerRecordStore::OplogStones::clearStonesOnCommit(OperationContext* opCtx) {
-    opCtx->recoveryUnit()->registerChange(new TruncateChange(this));
+    opCtx->recoveryUnit()->registerChange(std::make_unique<TruncateChange>(this));
 }
 
 void WiredTigerRecordStore::OplogStones::updateStonesAfterCappedTruncateAfter(
     int64_t recordsRemoved, int64_t bytesRemoved, RecordId firstRemovedId) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
 
     int64_t numStonesToRemove = 0;
     int64_t recordsInStonesToRemove = 0;
@@ -305,7 +305,7 @@ void WiredTigerRecordStore::OplogStones::updateStonesAfterCappedTruncateAfter(
 void WiredTigerRecordStore::OplogStones::setMinBytesPerStone(int64_t size) {
     invariant(size > 0);
 
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
 
     // Only allow changing the minimum bytes per stone if no data has been inserted.
     invariant(_stones.size() == 0 && _currentRecords.load() == 0);
@@ -457,7 +457,7 @@ void WiredTigerRecordStore::OplogStones::_pokeReclaimThreadIfNeeded() {
 }
 
 void WiredTigerRecordStore::OplogStones::adjust(int64_t maxSize) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     const unsigned long long kMinStonesToKeep = 10ULL;
     const unsigned long long kMaxStonesToKeep = 100ULL;
 
@@ -517,7 +517,7 @@ public:
     }
 
     void save() final {
-        if (_cursor && !wt_keeptxnopen()) {
+        if (_cursor) {
             try {
                 _cursor->reset(_cursor);
             } catch (const WriteConflictException&) {
@@ -699,7 +699,7 @@ WiredTigerRecordStore::WiredTigerRecordStore(WiredTigerKVEngine* kvEngine,
 
 WiredTigerRecordStore::~WiredTigerRecordStore() {
     {
-        stdx::lock_guard<stdx::mutex> lk(_cappedCallbackMutex);
+        stdx::lock_guard<Latch> lk(_cappedCallbackMutex);
         _shuttingDown = true;
     }
 
@@ -784,7 +784,7 @@ const char* WiredTigerRecordStore::name() const {
 }
 
 bool WiredTigerRecordStore::inShutdown() const {
-    stdx::lock_guard<stdx::mutex> lk(_cappedCallbackMutex);
+    stdx::lock_guard<Latch> lk(_cappedCallbackMutex);
     return _shuttingDown;
 }
 
@@ -1060,7 +1060,7 @@ int64_t WiredTigerRecordStore::_cappedDeleteAsNeeded_inlock(OperationContext* op
             ++docsRemoved;
             sizeSaved += old_value.size;
 
-            stdx::lock_guard<stdx::mutex> cappedCallbackLock(_cappedCallbackMutex);
+            stdx::lock_guard<Latch> cappedCallbackLock(_cappedCallbackMutex);
             if (_shuttingDown)
                 break;
 
@@ -1332,12 +1332,12 @@ bool WiredTigerRecordStore::isOpHidden_forTest(const RecordId& id) const {
 }
 
 bool WiredTigerRecordStore::haveCappedWaiters() {
-    stdx::lock_guard<stdx::mutex> cappedCallbackLock(_cappedCallbackMutex);
+    stdx::lock_guard<Latch> cappedCallbackLock(_cappedCallbackMutex);
     return _cappedCallback && _cappedCallback->haveCappedWaiters();
 }
 
 void WiredTigerRecordStore::notifyCappedWaitersIfNeeded() {
-    stdx::lock_guard<stdx::mutex> cappedCallbackLock(_cappedCallbackMutex);
+    stdx::lock_guard<Latch> cappedCallbackLock(_cappedCallbackMutex);
     // This wakes up cursors blocking in await_data.
     if (_cappedCallback) {
         _cappedCallback->notifyCappedWaitersIfNeeded();
@@ -1674,7 +1674,7 @@ void WiredTigerRecordStore::_changeNumRecords(OperationContext* opCtx, int64_t d
         return;
     }
 
-    opCtx->recoveryUnit()->registerChange(new NumRecordsChange(this, diff));
+    opCtx->recoveryUnit()->registerChange(std::make_unique<NumRecordsChange>(this, diff));
     if (_sizeInfo->numRecords.fetchAndAdd(diff) < 0)
         _sizeInfo->numRecords.store(std::max(diff, int64_t(0)));
 }
@@ -1702,7 +1702,7 @@ void WiredTigerRecordStore::_increaseDataSize(OperationContext* opCtx, int64_t a
     }
 
     if (opCtx)
-        opCtx->recoveryUnit()->registerChange(new DataSizeChange(this, amount));
+        opCtx->recoveryUnit()->registerChange(std::make_unique<DataSizeChange>(this, amount));
 
     if (_sizeInfo->dataSize.fetchAndAdd(amount) < 0)
         _sizeInfo->dataSize.store(std::max(amount, int64_t(0)));
@@ -1743,7 +1743,7 @@ void WiredTigerRecordStore::cappedTruncateAfter(OperationContext* opCtx,
 
     // Compute the number and associated sizes of the records to delete.
     {
-        stdx::lock_guard<stdx::mutex> cappedCallbackLock(_cappedCallbackMutex);
+        stdx::lock_guard<Latch> cappedCallbackLock(_cappedCallbackMutex);
         do {
             if (_cappedCallback) {
                 uassertStatusOK(
@@ -2026,7 +2026,8 @@ std::unique_ptr<SeekableRecordCursor> StandardWiredTigerRecordStore::getCursor(
         // If we already have a snapshot we don't know what it can see, unless we know no one
         // else could be writing (because we hold an exclusive lock).
         invariant(!wru->inActiveTxn() ||
-                  opCtx->lockState()->isCollectionLockedForMode(NamespaceString(_ns), MODE_X));
+                  opCtx->lockState()->isCollectionLockedForMode(NamespaceString(_ns), MODE_X) ||
+                  wru->getIsOplogReader());
         wru->setIsOplogReader();
     }
 
@@ -2077,7 +2078,8 @@ std::unique_ptr<SeekableRecordCursor> PrefixedWiredTigerRecordStore::getCursor(
         // If we already have a snapshot we don't know what it can see, unless we know no one
         // else could be writing (because we hold an exclusive lock).
         invariant(!wru->inActiveTxn() ||
-                  opCtx->lockState()->isCollectionLockedForMode(NamespaceString(_ns), MODE_X));
+                  opCtx->lockState()->isCollectionLockedForMode(NamespaceString(_ns), MODE_X) ||
+                  wru->getIsOplogReader());
         wru->setIsOplogReader();
     }
 

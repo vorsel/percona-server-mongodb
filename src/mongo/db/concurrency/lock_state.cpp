@@ -52,6 +52,7 @@
 namespace mongo {
 
 MONGO_FAIL_POINT_DEFINE(failNonIntentLocksIfWaitNeeded);
+MONGO_FAIL_POINT_DEFINE(enableTestOnlyFlagforRSTL);
 
 namespace {
 
@@ -219,7 +220,7 @@ void CondVarLockGrantNotification::clear() {
 }
 
 LockResult CondVarLockGrantNotification::wait(Milliseconds timeout) {
-    stdx::unique_lock<stdx::mutex> lock(_mutex);
+    stdx::unique_lock<Latch> lock(_mutex);
     return _cond.wait_for(
                lock, timeout.toSystemDuration(), [this] { return _result != LOCK_INVALID; })
         ? _result
@@ -228,7 +229,7 @@ LockResult CondVarLockGrantNotification::wait(Milliseconds timeout) {
 
 LockResult CondVarLockGrantNotification::wait(OperationContext* opCtx, Milliseconds timeout) {
     invariant(opCtx);
-    stdx::unique_lock<stdx::mutex> lock(_mutex);
+    stdx::unique_lock<Latch> lock(_mutex);
     if (opCtx->waitForConditionOrInterruptFor(
             _cond, lock, timeout, [this] { return _result != LOCK_INVALID; })) {
         // Because waitForConditionOrInterruptFor evaluates the predicate before checking for
@@ -242,7 +243,7 @@ LockResult CondVarLockGrantNotification::wait(OperationContext* opCtx, Milliseco
 }
 
 void CondVarLockGrantNotification::notify(ResourceId resId, LockResult result) {
-    stdx::unique_lock<stdx::mutex> lock(_mutex);
+    stdx::unique_lock<Latch> lock(_mutex);
     invariant(_result == LOCK_INVALID);
     _result = result;
 
@@ -303,13 +304,6 @@ Locker::ClientState LockerImpl::getClientState() const {
     return state;
 }
 
-void LockerImpl::lockGlobal(OperationContext* opCtx, LockMode mode) {
-    LockResult result = _lockGlobalBegin(opCtx, mode, Date_t::max());
-    if (result == LOCK_WAITING) {
-        lockGlobalComplete(opCtx, Date_t::max());
-    }
-}
-
 void LockerImpl::reacquireTicket(OperationContext* opCtx) {
     invariant(_modeForTicket != MODE_NONE);
     auto clientState = _clientState.load();
@@ -355,7 +349,7 @@ bool LockerImpl::_acquireTicket(OperationContext* opCtx, LockMode mode, Date_t d
     return true;
 }
 
-LockResult LockerImpl::_lockGlobalBegin(OperationContext* opCtx, LockMode mode, Date_t deadline) {
+void LockerImpl::lockGlobal(OperationContext* opCtx, LockMode mode, Date_t deadline) {
     dassert(isLocked() == (_modeForTicket != MODE_NONE));
     if (_modeForTicket == MODE_NONE) {
         if (_uninterruptibleLocksRequested) {
@@ -382,13 +376,13 @@ LockResult LockerImpl::_lockGlobalBegin(OperationContext* opCtx, LockMode mode, 
         }
     }
 
-    const LockResult result = lockBegin(opCtx, resourceIdGlobal, actualLockMode);
-    invariant(result == LOCK_OK || result == LOCK_WAITING);
-    return result;
-}
+    const LockResult result = _lockBegin(opCtx, resourceIdGlobal, actualLockMode);
+    // Fast, uncontended path
+    if (result == LOCK_OK)
+        return;
 
-void LockerImpl::lockGlobalComplete(OperationContext* opCtx, Date_t deadline) {
-    lockComplete(opCtx, resourceIdGlobal, getLockMode(resourceIdGlobal), deadline);
+    invariant(result == LOCK_WAITING);
+    _lockComplete(opCtx, resourceIdGlobal, actualLockMode, deadline);
 }
 
 bool LockerImpl::unlockGlobal() {
@@ -517,14 +511,14 @@ void LockerImpl::lock(OperationContext* opCtx, ResourceId resId, LockMode mode, 
     // `lockGlobal` must be called to lock `resourceIdGlobal`.
     invariant(resId != resourceIdGlobal);
 
-    const LockResult result = lockBegin(opCtx, resId, mode);
+    const LockResult result = _lockBegin(opCtx, resId, mode);
 
     // Fast, uncontended path
     if (result == LOCK_OK)
         return;
 
     invariant(result == LOCK_WAITING);
-    lockComplete(opCtx, resId, mode, deadline);
+    _lockComplete(opCtx, resId, mode, deadline);
 }
 
 void LockerImpl::downgrade(ResourceId resId, LockMode newMode) {
@@ -811,7 +805,7 @@ void LockerImpl::restoreLockState(OperationContext* opCtx, const Locker::LockSna
     invariant(_modeForTicket != MODE_NONE);
 }
 
-LockResult LockerImpl::lockBegin(OperationContext* opCtx, ResourceId resId, LockMode mode) {
+LockResult LockerImpl::_lockBegin(OperationContext* opCtx, ResourceId resId, LockMode mode) {
     dassert(!getWaitingResource().isValid());
 
     LockRequest* request;
@@ -887,10 +881,10 @@ LockResult LockerImpl::lockBegin(OperationContext* opCtx, ResourceId resId, Lock
     return result;
 }
 
-void LockerImpl::lockComplete(OperationContext* opCtx,
-                              ResourceId resId,
-                              LockMode mode,
-                              Date_t deadline) {
+void LockerImpl::_lockComplete(OperationContext* opCtx,
+                               ResourceId resId,
+                               LockMode mode,
+                               Date_t deadline) {
 
     // Clean up the state on any failed lock attempts.
     auto unlockOnErrorGuard = makeGuard([&] {
@@ -901,7 +895,8 @@ void LockerImpl::lockComplete(OperationContext* opCtx,
 
     // This failpoint is used to time out non-intent locks if they cannot be granted immediately.
     // Testing-only.
-    if (!_uninterruptibleLocksRequested && MONGO_FAIL_POINT(failNonIntentLocksIfWaitNeeded)) {
+    if (!_uninterruptibleLocksRequested &&
+        MONGO_unlikely(failNonIntentLocksIfWaitNeeded.shouldFail())) {
         uassert(ErrorCodes::LockTimeout,
                 str::stream() << "Cannot immediately acquire lock '" << resId.toString()
                               << "'. Timing out due to failpoint.",
@@ -995,12 +990,18 @@ void LockerImpl::getFlowControlTicket(OperationContext* opCtx, LockMode lockMode
 }
 
 LockResult LockerImpl::lockRSTLBegin(OperationContext* opCtx, LockMode mode) {
-    invariant(mode == MODE_IX || mode == MODE_X);
-    return lockBegin(opCtx, resourceIdReplicationStateTransitionLock, mode);
+    bool testOnly = false;
+
+    if (MONGO_unlikely(enableTestOnlyFlagforRSTL.shouldFail())) {
+        testOnly = true;
+    }
+
+    invariant(testOnly || mode == MODE_IX || mode == MODE_X);
+    return _lockBegin(opCtx, resourceIdReplicationStateTransitionLock, mode);
 }
 
 void LockerImpl::lockRSTLComplete(OperationContext* opCtx, LockMode mode, Date_t deadline) {
-    lockComplete(opCtx, resourceIdReplicationStateTransitionLock, mode, deadline);
+    _lockComplete(opCtx, resourceIdReplicationStateTransitionLock, mode, deadline);
 }
 
 void LockerImpl::releaseTicket() {

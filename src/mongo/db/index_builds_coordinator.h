@@ -43,8 +43,8 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl_index_build_state.h"
 #include "mongo/db/storage/durable_catalog.h"
-#include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/condition_variable.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/future.h"
@@ -101,6 +101,12 @@ public:
     static IndexBuildsCoordinator* get(OperationContext* operationContext);
 
     /**
+     * Returns true if two phase index builds are supported.
+     * This is determined by the current FCV and the server parameter 'enableTwoPhaseIndexBuild'.
+     */
+    bool supportsTwoPhaseIndexBuild() const;
+
+    /**
      * Sets up the in-memory and persisted state of the index build. A Future is returned upon which
      * the user can await the build result.
      *
@@ -140,22 +146,20 @@ public:
 
     /**
      * Commits the index build identified by 'buildUUID'.
-     *
-     * TODO: not yet implemented.
      */
-    virtual Status commitIndexBuild(OperationContext* opCtx,
-                                    const std::vector<BSONObj>& specs,
-                                    const UUID& buildUUID) = 0;
+    Status commitIndexBuild(OperationContext* opCtx,
+                            const std::vector<BSONObj>& specs,
+                            const UUID& buildUUID);
 
     /**
-     * Signals all the index builds to stop and then waits for them to finish. Leaves the index
-     * builds in a recoverable state.
+     * Waits for all index builds to stop after they have been interrupted during shutdown.
+     * Leaves the index builds in a recoverable state.
      *
      * This should only be called when certain the server will not start any new index builds --
      * i.e. when the server is not accepting user requests and no internal operations are
      * concurrently starting new index builds.
      */
-    void interruptAllIndexBuildsForShutdown(const std::string& reason);
+    void waitForAllIndexBuildsToStopForShutdown();
 
     /**
      * Signals all of the index builds on the specified collection to abort and then waits until the
@@ -203,7 +207,9 @@ public:
     /**
      * Aborts a given index build by index build UUID.
      */
-    Future<void> abortIndexBuildByBuildUUID(const UUID& buildUUID, const std::string& reason);
+    Future<void> abortIndexBuildByBuildUUID(OperationContext* opCtx,
+                                            const UUID& buildUUID,
+                                            const std::string& reason);
 
     /**
      * TODO: This is not yet implemented.
@@ -367,9 +373,9 @@ protected:
      * Modularizes the _indexBuildsManager calls part of _runIndexBuildInner. Throws on error.
      */
     void _buildIndex(OperationContext* opCtx,
-                     Collection* collection,
-                     const NamespaceString& nss,
+                     const NamespaceStringOrUUID& dbAndUUID,
                      std::shared_ptr<ReplIndexBuildState> replState,
+                     const IndexBuildOptions& indexBuildOptions,
                      boost::optional<Lock::CollectionLock>* collLock);
     /**
      * Returns total number of indexes in collection, including unfinished/in-progress indexes.
@@ -408,8 +414,13 @@ protected:
         ReplIndexBuildState::IndexCatalogStats& indexCatalogStats,
         const UUID& buildUUID) noexcept;
 
+    /**
+     * Looks up active index build by UUID.
+     */
+    StatusWith<std::shared_ptr<ReplIndexBuildState>> _getIndexBuild(const UUID& buildUUID) const;
+
     // Protects the below state.
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("IndexBuildsCoordinator::_mutex");
 
     // New index builds are not allowed on a collection or database if the collection or database is
     // in either of these maps. These are used when concurrent operations need to abort index builds
@@ -442,7 +453,6 @@ protected:
     IndexBuildsManager _indexBuildsManager;
 
     bool _sleepForTest = false;
-    bool _shuttingDown = false;
 };
 
 /**
@@ -509,8 +519,8 @@ private:
 
 // These fail points are used to control index build progress. Declared here to be shared
 // temporarily between createIndexes command and IndexBuildsCoordinator.
-MONGO_FAIL_POINT_DECLARE(hangAfterIndexBuildFirstDrain);
-MONGO_FAIL_POINT_DECLARE(hangAfterIndexBuildSecondDrain);
-MONGO_FAIL_POINT_DECLARE(hangAfterIndexBuildDumpsInsertsFromBulk);
+extern FailPoint hangAfterIndexBuildFirstDrain;
+extern FailPoint hangAfterIndexBuildSecondDrain;
+extern FailPoint hangAfterIndexBuildDumpsInsertsFromBulk;
 
 }  // namespace mongo

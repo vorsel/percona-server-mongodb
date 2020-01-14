@@ -55,6 +55,18 @@ namespace mongo {
 
 MONGO_FAIL_POINT_DEFINE(hangDuringIndexBuildDrainYield);
 
+bool IndexBuildInterceptor::typeCanFastpathMultikeyUpdates(IndexType indexType) {
+    // Ensure no new indexes are added without considering whether they use the multikeyPaths
+    // vector.
+    invariant(indexType == INDEX_BTREE || indexType == INDEX_2D || indexType == INDEX_HAYSTACK ||
+              indexType == INDEX_2DSPHERE || indexType == INDEX_TEXT || indexType == INDEX_HASHED ||
+              indexType == INDEX_WILDCARD);
+    // Only BTREE indexes are guaranteed to use the multikeyPaths vector. Other index types either
+    // do not track path-level multikey information or have "special" handling of multikey
+    // information.
+    return (indexType == INDEX_BTREE);
+}
+
 IndexBuildInterceptor::IndexBuildInterceptor(OperationContext* opCtx, IndexCatalogEntry* entry)
     : _indexCatalogEntry(entry),
       _sideWritesTable(
@@ -63,6 +75,15 @@ IndexBuildInterceptor::IndexBuildInterceptor(OperationContext* opCtx, IndexCatal
 
     if (entry->descriptor()->unique()) {
         _duplicateKeyTracker = std::make_unique<DuplicateKeyTracker>(opCtx, entry);
+    }
+    // `mergeMultikeyPaths` is sensitive to the two inputs having the same multikey
+    // "shape". Initialize `_multikeyPaths` with the right shape from the IndexCatalogEntry.
+    auto indexType = entry->descriptor()->getIndexType();
+    if (typeCanFastpathMultikeyUpdates(indexType)) {
+        auto numFields = entry->descriptor()->getNumFields();
+        _multikeyPaths = MultikeyPaths{};
+        auto it = _multikeyPaths->begin();
+        _multikeyPaths->insert(it, numFields, {});
     }
 }
 
@@ -247,17 +268,20 @@ Status IndexBuildInterceptor::_applyWrite(OperationContext* opCtx,
                                           const InsertDeleteOptions& options,
                                           int64_t* const keysInserted,
                                           int64_t* const keysDeleted) {
-    const BSONObj key = operation["key"].Obj();
-    const RecordId opRecordId = RecordId(operation["recordId"].Long());
+    // Deserialize the encoded KeyString::Value.
+    int keyLen;
+    const char* binKey = operation["key"].binData(keyLen);
+    BufReader reader(binKey, keyLen);
+    const KeyString::Value keyString = KeyString::Value::deserialize(
+        reader,
+        _indexCatalogEntry->accessMethod()->getSortedDataInterface()->getKeyStringVersion());
+
     const Op opType =
         (strcmp(operation.getStringField("op"), "i") == 0) ? Op::kInsert : Op::kDelete;
 
-    KeyString::HeapBuilder keyString(
-        _indexCatalogEntry->accessMethod()->getSortedDataInterface()->getKeyStringVersion(),
-        key,
-        _indexCatalogEntry->ordering(),
-        opRecordId);
-    const KeyStringSet keySet{keyString.release()};
+    const KeyStringSet keySet{keyString};
+    const RecordId opRecordId =
+        KeyString::decodeRecordIdAtEnd(keyString.getBuffer(), keyString.getSize());
 
     auto accessMethod = _indexCatalogEntry->accessMethod();
     if (opType == Op::kInsert) {
@@ -328,13 +352,14 @@ void IndexBuildInterceptor::_tryYield(OperationContext* opCtx) {
     // Track the number of yields in CurOp.
     CurOp::get(opCtx)->yielded();
 
-    MONGO_FAIL_POINT_BLOCK(hangDuringIndexBuildDrainYield, config) {
-        StringData ns{config.getData().getStringField("namespace")};
-        if (ns == _indexCatalogEntry->ns().ns()) {
+    hangDuringIndexBuildDrainYield.executeIf(
+        [&](auto&&) {
             log() << "Hanging index build during drain yield";
-            MONGO_FAIL_POINT_PAUSE_WHILE_SET(hangDuringIndexBuildDrainYield);
-        }
-    }
+            hangDuringIndexBuildDrainYield.pauseWhileSet();
+        },
+        [&](auto&& config) {
+            return config.getStringField("namespace") == _indexCatalogEntry->ns().ns();
+        });
 
     locker->restoreLockState(opCtx, snapshot);
 }
@@ -363,7 +388,7 @@ bool IndexBuildInterceptor::areAllWritesApplied(OperationContext* opCtx) const {
 }
 
 boost::optional<MultikeyPaths> IndexBuildInterceptor::getMultikeyPaths() const {
-    stdx::unique_lock<stdx::mutex> lk(_multikeyPathMutex);
+    stdx::unique_lock<Latch> lk(_multikeyPathMutex);
     return _multikeyPaths;
 }
 
@@ -375,19 +400,28 @@ Status IndexBuildInterceptor::sideWrite(OperationContext* opCtx,
                                         Op op,
                                         int64_t* const numKeysOut) {
     invariant(opCtx->lockState()->inAWriteUnitOfWork());
-
     // Maintain parity with IndexAccessMethods handling of key counting. Only include
     // `multikeyMetadataKeys` when inserting.
     *numKeysOut = keys.size() + (op == Op::kInsert ? multikeyMetadataKeys.size() : 0);
 
-    if (op == Op::kInsert) {
+    auto indexType = _indexCatalogEntry->descriptor()->getIndexType();
+
+    // No need to take the multikeyPaths mutex if this is a trivial multikey update.
+    bool canBypassMultikeyMutex = typeCanFastpathMultikeyUpdates(indexType) &&
+        MultikeyPathTracker::isMultikeyPathsTrivial(multikeyPaths);
+
+    if (op == Op::kInsert && !canBypassMultikeyMutex) {
         // SERVER-39705: It's worth noting that a document may not generate any keys, but be
         // described as being multikey. This step must be done to maintain parity with `validate`s
         // expectations.
-        stdx::unique_lock<stdx::mutex> lk(_multikeyPathMutex);
+        stdx::unique_lock<Latch> lk(_multikeyPathMutex);
         if (_multikeyPaths) {
             MultikeyPathTracker::mergeMultikeyPaths(&_multikeyPaths.get(), multikeyPaths);
         } else {
+            // All indexes that support pre-initialization of _multikeyPaths during
+            // IndexBuildInterceptor construction time should have been initialized already.
+            invariant(!typeCanFastpathMultikeyUpdates(indexType));
+
             // `mergeMultikeyPaths` is sensitive to the two inputs having the same multikey
             // "shape". Initialize `_multikeyPaths` with the right shape from the first result.
             _multikeyPaths = multikeyPaths;
@@ -398,6 +432,8 @@ Status IndexBuildInterceptor::sideWrite(OperationContext* opCtx,
         return Status::OK();
     }
 
+    // Reuse the same builder to avoid an allocation per key.
+    BufBuilder builder;
     std::vector<BSONObj> toInsert;
     for (const auto& keyString : keys) {
         // Documents inserted into this table must be consumed in insert-order.
@@ -405,9 +441,14 @@ Status IndexBuildInterceptor::sideWrite(OperationContext* opCtx,
         // other writes making up this operation are given. When index builds can cope with
         // replication rollbacks, side table writes associated with a CUD operation should
         // remain/rollback along with the corresponding oplog entry.
-        auto key = KeyString::toBson(keyString, _indexCatalogEntry->ordering());
-        toInsert.emplace_back(BSON("op" << (op == Op::kInsert ? "i" : "d") << "key" << key
-                                        << "recordId" << loc.repr()));
+
+        // Serialize the KeyString::Value into a binary format for storage. Since the
+        // KeyString::Value also contains TypeBits information, it is not sufficient to just read
+        // from getBuffer().
+        builder.reset();
+        keyString.serialize(builder);
+        BSONBinData binData(builder.buf(), builder.getSize(), BinDataGeneral);
+        toInsert.emplace_back(BSON("op" << (op == Op::kInsert ? "i" : "d") << "key" << binData));
     }
 
     if (op == Op::kInsert) {
@@ -415,12 +456,12 @@ Status IndexBuildInterceptor::sideWrite(OperationContext* opCtx,
         // document, to the index itself. Multikey information is never deleted, so we only need
         // to add this data on the insert path.
         for (const auto& keyString : multikeyMetadataKeys) {
-            auto key = KeyString::toBson(keyString, _indexCatalogEntry->ordering());
+            builder.reset();
+            keyString.serialize(builder);
+            BSONBinData binData(builder.buf(), builder.getSize(), BinDataGeneral);
             toInsert.emplace_back(BSON("op"
                                        << "i"
-                                       << "key" << key << "recordId"
-                                       << static_cast<int64_t>(
-                                              RecordId::ReservedId::kWildcardMultikeyMetadataId)));
+                                       << "key" << binData));
         }
     }
 

@@ -90,8 +90,13 @@ protected:
 class ParsedInclusionProjection : public ParsedAggregationProjection {
 public:
     ParsedInclusionProjection(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                              ProjectionPolicies policies,
+                              std::unique_ptr<InclusionNode> root)
+        : ParsedAggregationProjection(expCtx, policies), _root(std::move(root)) {}
+
+    ParsedInclusionProjection(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                               ProjectionPolicies policies)
-        : ParsedAggregationProjection(expCtx, policies), _root(new InclusionNode(policies)) {}
+        : ParsedInclusionProjection(expCtx, policies, std::make_unique<InclusionNode>(policies)) {}
 
     TransformerType getType() const final {
         return TransformerType::kInclusionProjection;
@@ -123,15 +128,25 @@ public:
      * Optimize any computed expressions.
      */
     void optimize() final {
+        ParsedAggregationProjection::optimize();
         _root->optimize();
     }
 
     DepsTracker::State addDependencies(DepsTracker* deps) const final {
         _root->reportDependencies(deps);
+        if (_rootReplacementExpression) {
+            _rootReplacementExpression->addDependencies(deps);
+        }
         return DepsTracker::State::EXHAUSTIVE_FIELDS;
     }
 
     DocumentSource::GetModPathsReturn getModifiedPaths() const final {
+        // A root-replacement expression can replace the entire root document, so all paths are
+        // considered as modified.
+        if (_rootReplacementExpression) {
+            return {DocumentSource::GetModPathsReturn::Type::kAllPaths, {}, {}};
+        }
+
         std::set<std::string> preservedPaths;
         _root->reportProjectedPaths(&preservedPaths);
 

@@ -115,7 +115,7 @@ void batchErrorToLastError(const BatchedCommandRequest& request,
         }
 
         const int numUpserted = response.isUpsertDetailsSet() ? response.sizeUpsertDetails() : 0;
-        const int numMatched = response.getN() - numUpserted;
+        const auto numMatched = response.getN() - numUpserted;
         invariant(numMatched >= 0);
 
         // Wrap upserted id in "upserted" field
@@ -204,10 +204,9 @@ bool handleWouldChangeOwningShardError(OperationContext* opCtx,
     bool updatedShardKey = false;
     boost::optional<BSONObj> upsertedId;
     if (isRetryableWrite) {
-        if (MONGO_FAIL_POINT(hangAfterThrowWouldChangeOwningShardRetryableWrite)) {
+        if (MONGO_unlikely(hangAfterThrowWouldChangeOwningShardRetryableWrite.shouldFail())) {
             log() << "Hit hangAfterThrowWouldChangeOwningShardRetryableWrite failpoint";
-            MONGO_FAIL_POINT_PAUSE_WHILE_SET_OR_INTERRUPTED(
-                opCtx, hangAfterThrowWouldChangeOwningShardRetryableWrite);
+            hangAfterThrowWouldChangeOwningShardRetryableWrite.pauseWhileSet(opCtx);
         }
         RouterOperationContextSession routerSession(opCtx);
         try {
@@ -221,6 +220,8 @@ bool handleWouldChangeOwningShardError(OperationContext* opCtx,
             ClusterWriter::write(opCtx, request, &stats, response);
             wouldChangeOwningShardErrorInfo =
                 getWouldChangeOwningShardErrorInfo(opCtx, request, response, !isRetryableWrite);
+            if (!wouldChangeOwningShardErrorInfo)
+                uassertStatusOK(response->toStatus());
 
             // If we do not get WouldChangeOwningShard when re-running the update, the document has
             // been modified or deleted concurrently and we do not need to delete it and insert a
@@ -367,7 +368,13 @@ private:
         // Assemble requests
         std::vector<AsyncRequestsSender::Request> requests;
         for (const auto& endpoint : swEndpoints.getValue()) {
-            requests.emplace_back(endpoint.shardName, command);
+            BSONObj cmdObjWithVersions = BSONObj(command);
+            if (endpoint.databaseVersion) {
+                cmdObjWithVersions =
+                    appendDbVersionIfPresent(cmdObjWithVersions, *endpoint.databaseVersion);
+            }
+            cmdObjWithVersions = appendShardVersion(cmdObjWithVersions, endpoint.shardVersion);
+            requests.emplace_back(endpoint.shardName, cmdObjWithVersions);
         }
 
         // Send the requests.

@@ -18,6 +18,7 @@ env.Library(
         'sharded_connection_info.cpp',
         'sharding_migration_critical_section.cpp',
         'sharding_state.cpp',
+        'transaction_coordinator_curop.cpp',
         'transaction_coordinator_factory.cpp',
         'transaction_coordinator_worker_curop_repository.cpp',
     ],
@@ -70,6 +71,8 @@ env.Library(
         'split_chunk.cpp',
         'split_vector.cpp',
         env.Idlc('sharding_runtime_d_params.idl')[0],
+        env.Idlc('deletion_task.idl')[0],
+
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/catalog/multi_index_block',
@@ -81,6 +84,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/repl/oplog',
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
         '$BUILD_DIR/mongo/db/rw_concern_d',
+        '$BUILD_DIR/mongo/db/server_options_core',
         '$BUILD_DIR/mongo/db/storage/remove_saver',
         '$BUILD_DIR/mongo/db/transaction',
         '$BUILD_DIR/mongo/s/client/shard_local',
@@ -93,6 +97,7 @@ env.Library(
         'transaction_coordinator',
     ],
     LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/index_builds_coordinator_interface',
         '$BUILD_DIR/mongo/db/session_catalog',
         '$BUILD_DIR/mongo/idl/server_parameter',
     ],
@@ -127,6 +132,7 @@ env.Library(
         'server_transaction_coordinators_metrics.cpp',
         'single_transaction_coordinator_stats.cpp',
         'transaction_coordinator_catalog.cpp',
+        'transaction_coordinator_curop_mongod.cpp',
         'transaction_coordinator_factory_mongod.cpp',
         'transaction_coordinator_futures_util.cpp',
         'transaction_coordinator_metrics_observer.cpp',

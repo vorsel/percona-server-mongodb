@@ -68,23 +68,12 @@ IndexBuildsCoordinatorEmbedded::startIndexBuild(OperationContext* opCtx,
         return statusWithOptionalResult.getValue().get();
     }
 
-    auto replState = [&]() {
-        stdx::unique_lock<stdx::mutex> lk(_mutex);
-        auto it = _allIndexBuilds.find(buildUUID);
-        invariant(it != _allIndexBuilds.end());
-        return it->second;
-    }();
+    auto replState = invariant(_getIndexBuild(buildUUID));
 
     invariant(!indexBuildOptions.replSetAndNotPrimary);
     _runIndexBuild(opCtx, buildUUID, indexBuildOptions);
 
     return replState->sharedPromise.getFuture();
-}
-
-Status IndexBuildsCoordinatorEmbedded::commitIndexBuild(OperationContext* opCtx,
-                                                        const std::vector<BSONObj>& specs,
-                                                        const UUID& buildUUID) {
-    MONGO_UNREACHABLE;
 }
 
 Status IndexBuildsCoordinatorEmbedded::voteCommitIndexBuild(const UUID& buildUUID,

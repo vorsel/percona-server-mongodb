@@ -83,6 +83,7 @@ private:
 
 class ExternalLDAPServerFactory : public MakeServerFactory<SaslExternalLDAPServerMechanism> {
 public:
+    using MakeServerFactory<SaslExternalLDAPServerMechanism>::MakeServerFactory;
     static constexpr bool isInternal = false;
 
     bool canMakeMechanismForUser(const User* user) const final {

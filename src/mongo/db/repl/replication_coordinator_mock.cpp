@@ -509,6 +509,10 @@ size_t ReplicationCoordinatorMock::getNumUncommittedSnapshots() {
     return 0;
 }
 
+void ReplicationCoordinatorMock::createWMajorityWriteAvailabilityDateWaiter(OpTime opTime) {
+    return;
+}
+
 WriteConcernOptions ReplicationCoordinatorMock::populateUnsetWriteConcernOptionsSyncMode(
     WriteConcernOptions wc) {
     if (wc.syncMode == WriteConcernOptions::SyncMode::UNSET) {
@@ -551,6 +555,10 @@ bool ReplicationCoordinatorMock::setContainsArbiter() const {
 }
 
 void ReplicationCoordinatorMock::attemptToAdvanceStableTimestamp() {
+    return;
+}
+
+void ReplicationCoordinatorMock::finishRecoveryIfEligible(OperationContext* opCtx) {
     return;
 }
 

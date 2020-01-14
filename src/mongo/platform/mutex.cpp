@@ -31,29 +31,19 @@
 
 namespace mongo {
 
-namespace {
-std::unique_ptr<LockActions> gLockActions;
-}
-
 void Mutex::lock() {
-    auto hasLock = _mutex.try_lock_for(kContendedLockTimeout.toSystemDuration());
+    auto hasLock = _mutex.try_lock();
     if (hasLock) {
         return;
     }
-    if (gLockActions) {
-        gLockActions->onContendedLock(_name);
+    if (auto actions = LockActions::getState().actions.load()) {
+        actions->onContendedLock(_name);
     }
-    hasLock = _mutex.try_lock_for(_lockTimeout.toSystemDuration() -
-                                  kContendedLockTimeout.toSystemDuration());
-    if (gLockActions && !hasLock) {
-        gLockActions->onFailedLock();
-    }
-    uassert(
-        ErrorCodes::InternalError, "Unable to take latch, wait time exceeds set timeout", hasLock);
+    _mutex.lock();
 }
 void Mutex::unlock() {
-    if (gLockActions) {
-        gLockActions->onUnlock();
+    if (auto actions = LockActions::getState().actions.load()) {
+        actions->onUnlock(_name);
     }
     _mutex.unlock();
 }
@@ -61,8 +51,8 @@ bool Mutex::try_lock() {
     return _mutex.try_lock();
 }
 
-void Mutex::setLockActions(std::unique_ptr<LockActions> actions) {
-    gLockActions = std::move(actions);
+void Mutex::LockActions::add(LockActions* actions) {
+    getState().actions.store(actions);
 }
 
 }  // namespace mongo

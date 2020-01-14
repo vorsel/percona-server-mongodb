@@ -29,7 +29,7 @@
 
 #pragma once
 
-#include "mongo/db/catalog/validate_adaptor.h"
+#include "mongo/db/namespace_string.h"
 
 namespace mongo {
 
@@ -53,10 +53,15 @@ namespace CollectionValidation {
  */
 Status validate(OperationContext* opCtx,
                 const NamespaceString& nss,
-                ValidateCmdLevel level,
+                const bool fullValidate,
                 bool background,
                 ValidateResults* results,
                 BSONObjBuilder* output);
+
+/**
+ * Checks whether a failpoint has been hit in the above validate() code..
+ */
+bool getIsValidationPausedForTest();
 
 }  // namespace CollectionValidation
 }  // namespace mongo

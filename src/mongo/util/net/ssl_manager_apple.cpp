@@ -53,6 +53,9 @@
 #include "mongo/util/net/ssl/apple.hpp"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/net/ssl_options.h"
+#include "mongo/util/net/ssl_parameters_gen.h"
+
+#include <arpa/inet.h>
 
 using asio::ssl::apple::CFUniquePtr;
 
@@ -1076,6 +1079,11 @@ boost::optional<std::string> getRawSNIServerName(::SSLContextRef _ssl) {
         return boost::none;
     }
     ret.resize(len);
+
+    while (!ret.empty() && ret.back() == '\0') {
+        ret.pop_back();
+    }
+
     return ret;
 }
 
@@ -1107,7 +1115,9 @@ public:
         uassertOSStatusOK(::SSLSetProtocolVersionMin(_ssl.get(), ctx->protoMin));
         uassertOSStatusOK(::SSLSetProtocolVersionMax(_ssl.get(), ctx->protoMax));
 
-        if (!hostname.empty()) {
+        std::array<uint8_t, INET6_ADDRSTRLEN> unusedBuf;
+        if (!hostname.empty() && (inet_pton(AF_INET, hostname.c_str(), unusedBuf.data()) == 0) &&
+            (inet_pton(AF_INET6, hostname.c_str(), unusedBuf.data()) == 0)) {
             uassertOSStatusOK(
                 ::SSLSetPeerDomainName(_ssl.get(), hostname.c_str(), hostname.size()));
         }
@@ -1534,9 +1544,10 @@ StatusWith<SSLPeerInfo> SSLManagerApple::parseAndValidatePeerCertificate(
     }
 
     CFUniquePtr<::CFMutableArrayRef> oids(
-        ::CFArrayCreateMutable(nullptr, remoteHost.empty() ? 3 : 2, &::kCFTypeArrayCallBacks));
+        ::CFArrayCreateMutable(nullptr, remoteHost.empty() ? 4 : 3, &::kCFTypeArrayCallBacks));
     ::CFArrayAppendValue(oids.get(), ::kSecOIDX509V1SubjectName);
     ::CFArrayAppendValue(oids.get(), ::kSecOIDSubjectAltName);
+    ::CFArrayAppendValue(oids.get(), ::kSecOIDX509V1ValidityNotAfter);
     if (remoteHost.empty()) {
         ::CFArrayAppendValue(oids.get(), kMongoDBRolesOID);
     }
@@ -1556,18 +1567,37 @@ StatusWith<SSLPeerInfo> SSLManagerApple::parseAndValidatePeerCertificate(
     const auto peerSubjectName = std::move(swPeerSubjectName.getValue());
     LOG(2) << "Accepted TLS connection from peer: " << peerSubjectName;
 
-    // If this is a server and client and server certificate are the same, log a warning.
-    if (_sslConfiguration.serverSubjectName() == peerSubjectName) {
-        warning() << "Client connecting with server's own TLS certificate";
-    }
-
+    // Server side.
     if (remoteHost.empty()) {
+        const auto exprThreshold = tlsX509ExpirationWarningThresholdDays;
+        if (exprThreshold > 0) {
+            auto swExpiration =
+                extractValidityDate(cfdict.get(), ::kSecOIDX509V1ValidityNotAfter, "valid-until");
+            if (!swExpiration.isOK()) {
+                return badCert("Unable to parse expiration date from certificate",
+                               _allowInvalidCertificates);
+            }
+            const auto expiration = swExpiration.getValue();
+            const auto now = Date_t::now();
+
+            if ((now + Days(exprThreshold)) > expiration) {
+                tlsEmitWarningExpiringClientCertificate(peerSubjectName,
+                                                        duration_cast<Days>(expiration - now));
+            }
+        }
+
+        // If client and server certificate are the same, log a warning.
+        if (_sslConfiguration.serverSubjectName() == peerSubjectName) {
+            warning() << "Client connecting with server's own TLS certificate";
+        }
+
         // If this is an SSL server context (on a mongod/mongos)
         // parse any client roles out of the client certificate.
         auto swPeerCertificateRoles = parsePeerRoles(cfdict.get());
         if (!swPeerCertificateRoles.isOK()) {
             return swPeerCertificateRoles.getStatus();
         }
+
         return SSLPeerInfo(peerSubjectName, sniName, std::move(swPeerCertificateRoles.getValue()));
     }
 

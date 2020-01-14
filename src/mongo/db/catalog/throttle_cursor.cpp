@@ -41,8 +41,9 @@ namespace mongo {
 // 512KB.
 MONGO_FAIL_POINT_DEFINE(fixedCursorDataSizeOf512KBForDataThrottle);
 
-SeekableRecordThrottleCursor::SeekableRecordThrottleCursor(
-    OperationContext* opCtx, const RecordStore* rs, std::shared_ptr<DataThrottle> dataThrottle) {
+SeekableRecordThrottleCursor::SeekableRecordThrottleCursor(OperationContext* opCtx,
+                                                           const RecordStore* rs,
+                                                           DataThrottle* dataThrottle) {
     _cursor = rs->getCursor(opCtx, /*forward=*/true);
     _dataThrottle = dataThrottle;
 }
@@ -68,17 +69,16 @@ boost::optional<Record> SeekableRecordThrottleCursor::next(OperationContext* opC
     return record;
 }
 
-SortedDataInterfaceThrottleCursor::SortedDataInterfaceThrottleCursor(
-    OperationContext* opCtx,
-    const IndexAccessMethod* iam,
-    std::shared_ptr<DataThrottle> dataThrottle) {
+SortedDataInterfaceThrottleCursor::SortedDataInterfaceThrottleCursor(OperationContext* opCtx,
+                                                                     const IndexAccessMethod* iam,
+                                                                     DataThrottle* dataThrottle) {
     _cursor = iam->newCursor(opCtx, /*forward=*/true);
     _dataThrottle = dataThrottle;
 }
 
-boost::optional<IndexKeyEntry> SortedDataInterfaceThrottleCursor::seek(OperationContext* opCtx,
-                                                                       const BSONObj& key) {
-    boost::optional<IndexKeyEntry> entry = _cursor->seek(key, /*inclusive=*/true);
+boost::optional<IndexKeyEntry> SortedDataInterfaceThrottleCursor::seek(
+    OperationContext* opCtx, const KeyString::Value& key) {
+    boost::optional<IndexKeyEntry> entry = _cursor->seek(key);
     if (entry) {
         const int64_t dataSize = entry->key.objsize() + sizeof(entry->loc.repr());
         _dataThrottle->awaitIfNeeded(opCtx, dataSize);
@@ -118,7 +118,7 @@ void DataThrottle::awaitIfNeeded(OperationContext* opCtx, const int64_t dataSize
         _bytesProcessed = 0;
     }
 
-    _bytesProcessed += MONGO_FAIL_POINT(fixedCursorDataSizeOf512KBForDataThrottle)
+    _bytesProcessed += MONGO_unlikely(fixedCursorDataSizeOf512KBForDataThrottle.shouldFail())
         ? /*512KB*/ 1 * 1024 * 512
         : dataSize;
 

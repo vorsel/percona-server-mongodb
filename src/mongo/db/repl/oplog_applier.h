@@ -40,7 +40,7 @@
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/functional.h"
 #include "mongo/util/future.h"
@@ -64,18 +64,20 @@ public:
     class Options {
     public:
         Options() = delete;
-        explicit Options(OplogApplication::Mode inputMode) : mode(inputMode) {}
-
-        // TODO (SERVER-42039): Remove fields here that are redundant with the mode.
-        bool allowNamespaceNotFoundErrorsOnCrudOps = false;
-        bool relaxUniqueIndexConstraints = false;
-        bool skipWritesToOplog = false;
+        explicit Options(OplogApplication::Mode inputMode)
+            : mode(inputMode),
+              allowNamespaceNotFoundErrorsOnCrudOps(
+                  inputMode == OplogApplication::Mode::kInitialSync ||
+                  inputMode == OplogApplication::Mode::kRecovering),
+              skipWritesToOplog(inputMode == OplogApplication::Mode::kRecovering) {}
 
         // Used to determine which operations should be applied. Only initial sync will set this to
         // be something other than the null optime.
         OpTime beginApplyingOpTime = OpTime();
 
         const OplogApplication::Mode mode;
+        const bool allowNamespaceNotFoundErrorsOnCrudOps;
+        const bool skipWritesToOplog;
     };
 
     /**
@@ -105,25 +107,6 @@ public:
     // Used by SyncTail to access batching logic.
     using GetNextApplierBatchFn = std::function<StatusWith<OplogApplier::Operations>(
         OperationContext* opCtx, const BatchLimits& batchLimits)>;
-
-    /**
-     * Creates thread pool for writer tasks.
-     */
-    static std::unique_ptr<ThreadPool> makeWriterPool();
-    static std::unique_ptr<ThreadPool> makeWriterPool(int threadCount);
-
-    /**
-     * Returns maximum number of operations in each batch that can be applied using multiApply().
-     */
-    static std::size_t getBatchLimitOperations();
-
-    /**
-     * Calculates batch limit size (in bytes) using the maximum capped collection size of the oplog
-     * size.
-     * Batches are limited to 10% of the oplog.
-     */
-    static std::size_t calculateBatchLimitBytes(OperationContext* opCtx,
-                                                StorageInterface* storageInterface);
 
     /**
      * Constructs this OplogApplier with specific options.
@@ -236,7 +219,7 @@ private:
     Observer* const _observer;
 
     // Protects member data of OplogApplier.
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("OplogApplier::_mutex");
 
     // Set to true if shutdown() has been called.
     bool _inShutdown = false;
@@ -274,6 +257,24 @@ public:
 };
 
 extern NoopOplogApplierObserver noopOplogApplierObserver;
+
+/**
+ * Creates thread pool for writer tasks.
+ */
+std::unique_ptr<ThreadPool> makeReplWriterPool();
+std::unique_ptr<ThreadPool> makeReplWriterPool(int threadCount);
+
+/**
+ * Returns maximum number of operations in each batch that can be applied using multiApply().
+ */
+std::size_t getBatchLimitOplogEntries();
+
+/**
+ * Calculates batch limit size (in bytes) using the maximum capped collection size of the oplog
+ * size.
+ * Batches are limited to 10% of the oplog.
+ */
+std::size_t getBatchLimitOplogBytes(OperationContext* opCtx, StorageInterface* storageInterface);
 
 }  // namespace repl
 }  // namespace mongo

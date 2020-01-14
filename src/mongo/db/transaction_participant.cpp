@@ -505,6 +505,7 @@ void TransactionParticipant::Participant::beginOrContinue(OperationContext* opCt
     // autocommit be given as an argument on the request, and currently it can only be false, which
     // is verified earlier when parsing the request.
     invariant(*autocommit == false);
+    invariant(opCtx->inMultiDocumentTransaction());
 
     if (!startTransaction) {
         _continueMultiDocumentTransaction(opCtx, txnNumber);
@@ -546,6 +547,7 @@ void TransactionParticipant::Participant::beginOrContinue(OperationContext* opCt
 
 void TransactionParticipant::Participant::beginOrContinueTransactionUnconditionally(
     OperationContext* opCtx, TxnNumber txnNumber) {
+    invariant(opCtx->inMultiDocumentTransaction());
 
     // We don't check or fetch any on-disk state, so treat the transaction as 'valid' for the
     // purposes of this method and continue the transaction unconditionally
@@ -586,7 +588,7 @@ void TransactionParticipant::Participant::_setReadSnapshot(OperationContext* opC
 
         stdx::lock_guard<Client> lk(*opCtx->getClient());
         o(lk).transactionMetricsObserver.onChooseReadTimestamp(readTimestamp);
-    } else if (readConcernArgs.getOriginalLevel() == repl::ReadConcernLevel::kSnapshotReadConcern) {
+    } else if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern) {
         // For transactions with read concern level specified as 'snapshot', we will use
         // 'kAllDurableSnapshot' which ensures a snapshot with no 'holes'; that is, it is a state
         // of the system that could be reconstructed from the oplog.
@@ -637,11 +639,11 @@ TransactionParticipant::OplogSlotReserver::OplogSlotReserver(OperationContext* o
 }
 
 TransactionParticipant::OplogSlotReserver::~OplogSlotReserver() {
-    if (MONGO_FAIL_POINT(hangBeforeReleasingTransactionOplogHole)) {
+    if (MONGO_unlikely(hangBeforeReleasingTransactionOplogHole.shouldFail())) {
         log()
             << "transaction - hangBeforeReleasingTransactionOplogHole fail point enabled. Blocking "
                "until fail point is disabled.";
-        MONGO_FAIL_POINT_PAUSE_WHILE_SET(hangBeforeReleasingTransactionOplogHole);
+        hangBeforeReleasingTransactionOplogHole.pauseWhileSet();
     }
 
     // If the constructor did not complete, we do not attempt to abort the units of work.
@@ -744,7 +746,7 @@ void TransactionParticipant::TxnResources::release(OperationContext* opCtx) {
     }
     _locker->reacquireTicket(opCtx);
 
-    if (MONGO_FAIL_POINT(restoreLocksFail)) {
+    if (MONGO_unlikely(restoreLocksFail.shouldFail())) {
         uasserted(ErrorCodes::LockTimeout, str::stream() << "Lock restore failed due to failpoint");
     }
 
@@ -1002,7 +1004,7 @@ void TransactionParticipant::Participant::unstashTransactionResources(OperationC
 
     // The Client lock must not be held when executing this failpoint as it will block currentOp
     // execution.
-    if (MONGO_FAIL_POINT(hangAfterPreallocateSnapshot)) {
+    if (MONGO_unlikely(hangAfterPreallocateSnapshot.shouldFail())) {
         CurOpFailpointHelpers::waitWhileFailPointEnabled(
             &hangAfterPreallocateSnapshot, opCtx, "hangAfterPreallocateSnapshot");
     }
@@ -1116,12 +1118,12 @@ Timestamp TransactionParticipant::Participant::prepareTransaction(
             o(lk).prepareOpTime = prepareOplogSlot;
         }
 
-        if (MONGO_FAIL_POINT(hangAfterReservingPrepareTimestamp)) {
+        if (MONGO_unlikely(hangAfterReservingPrepareTimestamp.shouldFail())) {
             // This log output is used in js tests so please leave it.
             log() << "transaction - hangAfterReservingPrepareTimestamp fail point "
                      "enabled. Blocking until fail point is disabled. Prepare OpTime: "
                   << prepareOplogSlot;
-            MONGO_FAIL_POINT_PAUSE_WHILE_SET(hangAfterReservingPrepareTimestamp);
+            hangAfterReservingPrepareTimestamp.pauseWhileSet();
         }
     }
     opCtx->recoveryUnit()->setPrepareTimestamp(prepareOplogSlot.getTimestamp());
@@ -1145,10 +1147,10 @@ Timestamp TransactionParticipant::Participant::prepareTransaction(
         o(lk).lastWriteOpTime = prepareOplogSlot;
     }
 
-    if (MONGO_FAIL_POINT(hangAfterSettingPrepareStartTime)) {
+    if (MONGO_unlikely(hangAfterSettingPrepareStartTime.shouldFail())) {
         log() << "transaction - hangAfterSettingPrepareStartTime fail point enabled. Blocking "
                  "until fail point is disabled.";
-        MONGO_FAIL_POINT_PAUSE_WHILE_SET(hangAfterSettingPrepareStartTime);
+        hangAfterSettingPrepareStartTime.pauseWhileSet();
     }
 
     // We unlock the RSTL to allow prepared transactions to survive state transitions. This should
@@ -1314,7 +1316,7 @@ void TransactionParticipant::Participant::commitPreparedTransaction(
                 "commitTransaction for a prepared transaction cannot be run before its prepare "
                 "oplog entry has been majority committed",
                 replCoord->getLastCommittedOpTime().getTimestamp() >= prepareTimestamp ||
-                    MONGO_FAIL_POINT(skipCommitTxnCheckPrepareMajorityCommitted));
+                    MONGO_unlikely(skipCommitTxnCheckPrepareMajorityCommitted.shouldFail()));
     }
 
     try {
@@ -1473,27 +1475,56 @@ void TransactionParticipant::Participant::_abortActiveTransaction(
         o(lk).transactionMetricsObserver.onTransactionOperation(
             opCtx, CurOp::get(opCtx)->debug().additiveMetrics, o().txnState.isPrepared());
     }
-    // We reserve an oplog slot before aborting the transaction so that no writes that are causally
-    // related to the transaction abort enter the oplog at a timestamp earlier than the abort oplog
-    // entry. On secondaries, we generate a fake empty oplog slot, since it's not used by the
-    // OpObserver.
-    boost::optional<OplogSlotReserver> oplogSlotReserver;
-    boost::optional<OplogSlot> abortOplogSlot;
-    if (opCtx->writesAreReplicated() && p().needToWriteAbortEntry) {
-        oplogSlotReserver.emplace(opCtx);
-        abortOplogSlot = oplogSlotReserver->getLastSlot();
-    }
 
-    // Clean up the transaction resources on the opCtx even if the transaction resources on the
-    // session were not aborted. This actually aborts the storage-transaction.
-    _cleanUpTxnResourceOnOpCtx(opCtx, TerminationCause::kAborted);
-
-    // Write the abort oplog entry. This must be done after aborting the storage transaction, so
-    // that the lock state is reset, and there is no max lock timeout on the locker.
     auto opObserver = opCtx->getServiceContext()->getOpObserver();
     invariant(opObserver);
-    opObserver->onTransactionAbort(opCtx, abortOplogSlot);
 
+    const bool needToWriteAbortEntry = opCtx->writesAreReplicated() && p().needToWriteAbortEntry;
+    if (needToWriteAbortEntry) {
+        // We reserve an oplog slot before aborting the transaction so that no writes that are
+        // causally related to the transaction abort enter the oplog at a timestamp earlier than the
+        // abort oplog entry.
+        OplogSlotReserver oplogSlotReserver(opCtx);
+
+        // Clean up the transaction resources on the opCtx even if the transaction resources on the
+        // session were not aborted. This actually aborts the storage-transaction.
+        _cleanUpTxnResourceOnOpCtx(opCtx, TerminationCause::kAborted);
+
+        try {
+            // If we need to write an abort oplog entry, this function can no longer be interrupted.
+            UninterruptibleLockGuard noInterrupt(opCtx->lockState());
+
+            // Write the abort oplog entry. This must be done after aborting the storage
+            // transaction, so that the lock state is reset, and there is no max lock timeout on the
+            // locker.
+            opObserver->onTransactionAbort(opCtx, oplogSlotReserver.getLastSlot());
+
+            _finishAbortingActiveTransaction(opCtx, expectedStates);
+        } catch (...) {
+            // It is illegal for aborting a transaction that must write an abort oplog entry to fail
+            // after aborting the storage transaction, so we crash instead.
+            severe()
+                << "Caught exception during abort of transaction that must write abort oplog entry "
+                << opCtx->getTxnNumber() << " on " << _sessionId().toBSON() << ": "
+                << exceptionToStatus();
+            std::terminate();
+        }
+    } else {
+        // Clean up the transaction resources on the opCtx even if the transaction resources on the
+        // session were not aborted. This actually aborts the storage-transaction.
+        //
+        // These functions are allowed to throw. We are not writing an oplog entry, so the only risk
+        // is not cleaning up some internal TransactionParticipant state, updating metrics, or
+        // logging the end of the transaction. That will either be cleaned up in the
+        // ServiceEntryPoint's abortGuard or when the next transaction begins.
+        _cleanUpTxnResourceOnOpCtx(opCtx, TerminationCause::kAborted);
+        opObserver->onTransactionAbort(opCtx, boost::none);
+        _finishAbortingActiveTransaction(opCtx, expectedStates);
+    }
+}
+
+void TransactionParticipant::Participant::_finishAbortingActiveTransaction(
+    OperationContext* opCtx, TransactionState::StateSet expectedStates) {
     // Only abort the transaction in session if it's in expected states.
     // When the state of active transaction on session is not expected, it means another
     // thread has already aborted the transaction on session.
@@ -2122,9 +2153,7 @@ void TransactionParticipant::Participant::_registerUpdateCacheOnCommit(
         }
     });
 
-    MONGO_FAIL_POINT_BLOCK(onPrimaryTransactionalWrite, customArgs) {
-        const auto& data = customArgs.getData();
-
+    onPrimaryTransactionalWrite.execute([&](const BSONObj& data) {
         const auto closeConnectionElem = data["closeConnection"];
         if (closeConnectionElem.eoo() || closeConnectionElem.Bool()) {
             opCtx->getClient()->session()->end();
@@ -2138,7 +2167,7 @@ void TransactionParticipant::Participant::_registerUpdateCacheOnCommit(
                           << "Failing write for " << _sessionId() << ":" << o().activeTxnNumber
                           << " due to failpoint. The write must not be reflected.");
         }
-    }
+    });
 }
 
 }  // namespace mongo

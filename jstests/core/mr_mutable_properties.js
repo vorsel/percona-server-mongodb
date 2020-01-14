@@ -7,7 +7,6 @@
 // See SERVER-9448
 // Test argument and receiver (aka 'this') objects and their children can be mutated
 // in Map, Reduce and Finalize functions
-
 var collection = db.mrMutableReceiver;
 collection.drop();
 collection.insert({a: 1});

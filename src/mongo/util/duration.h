@@ -55,6 +55,7 @@ using Milliseconds = Duration<std::milli>;
 using Seconds = Duration<std::ratio<1>>;
 using Minutes = Duration<std::ratio<60>>;
 using Hours = Duration<std::ratio<3600>>;
+using Days = Duration<std::ratio<86400>>;
 
 //
 // Streaming output operators for common duration types. Writes the numerical value followed by
@@ -70,6 +71,7 @@ std::ostream& operator<<(std::ostream& os, Milliseconds ms);
 std::ostream& operator<<(std::ostream& os, Seconds s);
 std::ostream& operator<<(std::ostream& os, Minutes m);
 std::ostream& operator<<(std::ostream& os, Hours h);
+std::ostream& operator<<(std::ostream& os, Days h);
 
 template <typename Allocator>
 StringBuilderImpl<Allocator>& operator<<(StringBuilderImpl<Allocator>& os, Nanoseconds ns);
@@ -88,6 +90,9 @@ StringBuilderImpl<Allocator>& operator<<(StringBuilderImpl<Allocator>& os, Minut
 
 template <typename Allocator>
 StringBuilderImpl<Allocator>& operator<<(StringBuilderImpl<Allocator>& os, Hours h);
+
+template <typename Allocator>
+StringBuilderImpl<Allocator>& operator<<(StringBuilderImpl<Allocator>& os, Days h);
 
 
 template <typename Duration1, typename Duration2>
@@ -110,7 +115,7 @@ constexpr ToDuration duration_cast(const Duration<FromPeriod>& from) {
         typename ToDuration::rep toCount = 0;
         uassert(ErrorCodes::DurationOverflow,
                 "Overflow casting from a lower-precision duration to a higher-precision duration",
-                !mongoSignedMultiplyOverflow64(from.count(), FromOverTo::num, &toCount));
+                !overflow::mul(from.count(), FromOverTo::num, &toCount));
         return ToDuration{toCount};
     }
     return ToDuration{from.count() / FromOverTo::den};
@@ -281,7 +286,7 @@ public:
         }
         using OtherOverThis = std::ratio_divide<OtherPeriod, period>;
         rep otherCount;
-        if (mongoSignedMultiplyOverflow64(other.count(), OtherOverThis::num, &otherCount)) {
+        if (overflow::mul(other.count(), OtherOverThis::num, &otherCount)) {
             return other.count() < 0 ? 1 : -1;
         }
         if (count() < otherCount) {
@@ -329,14 +334,14 @@ public:
     Duration& operator+=(const Duration& other) {
         uassert(ErrorCodes::DurationOverflow,
                 str::stream() << "Overflow while adding " << other << " to " << *this,
-                !mongoSignedAddOverflow64(count(), other.count(), &_count));
+                !overflow::add(count(), other.count(), &_count));
         return *this;
     }
 
     Duration& operator-=(const Duration& other) {
         uassert(ErrorCodes::DurationOverflow,
                 str::stream() << "Overflow while subtracting " << other << " from " << *this,
-                !mongoSignedSubtractOverflow64(count(), other.count(), &_count));
+                !overflow::sub(count(), other.count(), &_count));
         return *this;
     }
 
@@ -347,7 +352,7 @@ public:
             "Durations may only be multiplied by values of signed integral type");
         uassert(ErrorCodes::DurationOverflow,
                 str::stream() << "Overflow while multiplying " << *this << " by " << scale,
-                !mongoSignedMultiplyOverflow64(count(), scale, &_count));
+                !overflow::mul(count(), scale, &_count));
         return *this;
     }
 

@@ -304,15 +304,6 @@ public:
         }
 
         /**
-         * Returns true if we are in an active multi-document transaction or if the transaction has
-         * been aborted. This is used to cover the case where a transaction has been aborted, but
-         * the OperationContext state has not been cleared yet.
-         */
-        bool inActiveOrKilledMultiDocumentTransaction() const {
-            return o().txnState.isOpen() || o().txnState.isAborted();
-        }
-
-        /**
          * If this session is holding stashed locks in txnResourceStash, reports the current state
          * of the session using the provided builder.
          */
@@ -666,6 +657,10 @@ public:
         // needToWriteAbortEntry state bool.
         void _abortActiveTransaction(OperationContext* opCtx,
                                      TransactionState::StateSet expectedStates);
+
+        // Factors out code for clarity from _abortActiveTransaction.
+        void _finishAbortingActiveTransaction(OperationContext* opCtx,
+                                              TransactionState::StateSet expectedStates);
 
         // Aborts a prepared transaction.
         void _abortActivePreparedTransaction(OperationContext* opCtx);

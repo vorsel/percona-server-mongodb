@@ -39,6 +39,7 @@
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression.h"
+#include "mongo/db/pipeline/document.h"
 #include "mongo/db/record_id.h"
 #include "mongo/util/log.h"
 #include "mongo/util/str.h"
@@ -79,7 +80,7 @@ double textScore(const WorkingSetMember& member) {
 void transitionMemberToOwnedObj(const BSONObj& bo, WorkingSetMember* member) {
     member->keyData.clear();
     member->recordId = RecordId();
-    member->obj = Snapshotted<BSONObj>(SnapshotId(), bo);
+    member->resetDocument(SnapshotId(), bo);
     member->transitionToOwnedObj();
 }
 
@@ -92,7 +93,7 @@ StatusWith<BSONObj> provideMetaFieldsAndPerformExec(const ProjectionExec& exec,
         return Status(ErrorCodes::InternalError, "near loc proj requested but no data available");
 
     return member.hasObj()
-        ? exec.project(member.obj.value(),
+        ? exec.project(member.doc.value().toBson(),
                        exec.needsGeoNearDistance()
                            ? boost::optional<const double>(geoDistance(member))
                            : boost::none,
@@ -204,19 +205,7 @@ Status ProjectionStageDefault::transform(WorkingSetMember* member) const {
         return Status(ErrorCodes::InternalError,
                       "sortKey meta-projection requested but no data available");
 
-    if (_exec.returnKey()) {
-        auto keys = _exec.computeReturnKeyProjection(
-            member->metadata().hasIndexKey() ? indexKey(*member) : BSONObj(),
-            _exec.needsSortKey() ? sortKey(*member) : BSONObj());
-        if (!keys.isOK())
-            return keys.getStatus();
-
-        transitionMemberToOwnedObj(keys.getValue(), member);
-        return Status::OK();
-    }
-
     auto projected = provideMetaFieldsAndPerformExec(_exec, *member);
-
     if (!projected.isOK())
         return projected.getStatus();
 
@@ -277,7 +266,6 @@ Status ProjectionStageCovered::transform(WorkingSetMember* member) const {
         }
         ++keyIndex;
     }
-
     transitionMemberToOwnedObj(bob.obj(), member);
     return Status::OK();
 }
@@ -300,12 +288,10 @@ Status ProjectionStageSimple::transform(WorkingSetMember* member) const {
 
     // Apply the SIMPLE_DOC projection.
     // Look at every field in the source document and see if we're including it.
-    BSONObjIterator inputIt(member->obj.value());
-    while (inputIt.more()) {
-        BSONElement elt = inputIt.next();
+    auto objToProject = member->doc.value().toBson();
+    for (auto&& elt : objToProject) {
         auto fieldIt = _includedFields.find(elt.fieldNameStringData());
         if (_includedFields.end() != fieldIt) {
-            // If so, add it to the builder.
             bob.append(elt);
         }
     }

@@ -60,6 +60,10 @@ public:
         return std::to_string(_id);
     }
 
+    uint64_t toNumber() const {
+        return _id;
+    }
+
 private:
     uint64_t _id;
 };
@@ -82,6 +86,11 @@ public:
     SnapshotId snapshotId() const {
         return _id;
     }
+
+    void setSnapshotId(SnapshotId id) {
+        _id = id;
+    }
+
     const T& value() const {
         return _value;
     }

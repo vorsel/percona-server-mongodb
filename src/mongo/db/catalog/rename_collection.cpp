@@ -102,7 +102,7 @@ Status checkSourceAndTargetNamespaces(OperationContext* opCtx,
                                     << target);
 
     // TODO: SERVER-42638 Replace checks of cm() with cm()->distributionMode() == sharded
-    if (!MONGO_FAIL_POINT(useRenameCollectionPathThroughConfigsvr)) {
+    if (!MONGO_unlikely(useRenameCollectionPathThroughConfigsvr.shouldFail())) {
         if (isCollectionSharded(opCtx, source))
             return {ErrorCodes::IllegalOperation, "source namespace cannot be sharded"};
     }
@@ -151,6 +151,9 @@ Status renameTargetCollectionToTmp(OperationContext* opCtx,
                                    const UUID& targetUUID) {
     repl::UnreplicatedWritesBlock uwb(opCtx);
 
+    // The generated unique collection name is only guaranteed to exist if the database is
+    // exclusively locked.
+    invariant(opCtx->lockState()->isDbLockedForMode(targetDB->name(), LockMode::MODE_X));
     auto tmpNameResult = targetDB->makeUniqueCollectionNamespace(opCtx, "tmp%%%%%.rename");
     if (!tmpNameResult.isOK()) {
         return tmpNameResult.getStatus().withContext(
@@ -470,7 +473,7 @@ Status renameBetweenDBs(OperationContext* opCtx,
     }
 
     // TODO: SERVER-42638 Replace checks of cm() with cm()->distributionMode() == sharded
-    if (!MONGO_FAIL_POINT(useRenameCollectionPathThroughConfigsvr)) {
+    if (!MONGO_unlikely(useRenameCollectionPathThroughConfigsvr.shouldFail())) {
         if (isCollectionSharded(opCtx, source))
             return {ErrorCodes::IllegalOperation, "source namespace cannot be sharded"};
     }
@@ -512,6 +515,9 @@ Status renameBetweenDBs(OperationContext* opCtx,
         targetDB = DatabaseHolder::get(opCtx)->openDb(opCtx, target.db());
     }
 
+    // The generated unique collection name is only guaranteed to exist if the database is
+    // exclusively locked.
+    invariant(opCtx->lockState()->isDbLockedForMode(targetDB->name(), LockMode::MODE_X));
     auto tmpNameResult =
         targetDB->makeUniqueCollectionNamespace(opCtx, "tmp%%%%%.renameCollection");
     if (!tmpNameResult.isOK()) {
@@ -562,42 +568,64 @@ Status renameBetweenDBs(OperationContext* opCtx,
     });
 
     // Copy the index descriptions from the source collection.
-    {
-        std::vector<BSONObj> indexesToCopy;
-        std::unique_ptr<IndexCatalog::IndexIterator> sourceIndIt =
-            sourceColl->getIndexCatalog()->getIndexIterator(opCtx, true);
-        while (sourceIndIt->more()) {
-            auto descriptor = sourceIndIt->next()->descriptor();
-            if (!descriptor->isIdIndex()) {
-                indexesToCopy.push_back(descriptor->infoObj());
-            }
+    std::vector<BSONObj> indexesToCopy;
+    for (auto sourceIndIt = sourceColl->getIndexCatalog()->getIndexIterator(opCtx, true);
+         sourceIndIt->more();) {
+        auto descriptor = sourceIndIt->next()->descriptor();
+        if (descriptor->isIdIndex()) {
+            continue;
         }
+        indexesToCopy.push_back(descriptor->infoObj());
+    }
 
-        // Create indexes using the index specs on the empty temporary collection that was just
-        // created. Since each index build is possibly replicated to downstream nodes, each
-        // createIndex oplog entry must have a distinct timestamp to support correct rollback
-        // operation. This is achieved by writing the createIndexes oplog entry *before* creating
-        // the index. Using IndexCatalog::createIndexOnEmptyCollection() for the index creation
-        // allows us to add and commit the index within a single WriteUnitOfWork and avoids the
-        // possibility of seeing the index in an unfinished state. For more information on assigning
-        // timestamps to multiple index builds, please see SERVER-35780 and SERVER-35070.
+    // Create indexes using the index specs on the empty temporary collection that was just created.
+    // Since each index build is possibly replicated to downstream nodes, each createIndex oplog
+    // entry must have a distinct timestamp to support correct rollback operation. This is achieved
+    // by writing the createIndexes oplog entry *before* creating the index. Using
+    // IndexCatalog::createIndexOnEmptyCollection() for the index creation allows us to add and
+    // commit the index within a single WriteUnitOfWork and avoids the possibility of seeing the
+    // index in an unfinished state. For more information on assigning timestamps to multiple index
+    // builds, please see SERVER-35780 and SERVER-35070.
+    if (!indexesToCopy.empty()) {
         Status status = writeConflictRetry(opCtx, "renameCollection", tmpName.ns(), [&] {
             WriteUnitOfWork wunit(opCtx);
             auto tmpIndexCatalog = tmpColl->getIndexCatalog();
             auto opObserver = opCtx->getServiceContext()->getOpObserver();
+            auto fromMigrate = false;
+
+            // Emit startIndexBuild and commitIndexBuild oplog entries if supported by the
+            // current FCV.
+            auto buildUUID = serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+                    serverGlobalParams.featureCompatibility.getVersion() ==
+                        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44
+                ? boost::make_optional(UUID::gen())
+                : boost::none;
+
+            if (buildUUID) {
+                opObserver->onStartIndexBuild(
+                    opCtx, tmpName, tmpColl->uuid(), *buildUUID, indexesToCopy, fromMigrate);
+            }
+
             for (const auto& indexToCopy : indexesToCopy) {
-                opObserver->onCreateIndex(opCtx,
-                                          tmpName,
-                                          tmpColl->uuid(),
-                                          indexToCopy,
-                                          false  // fromMigrate
-                );
+                // If two phase index builds is enabled, index build will be coordinated using
+                // startIndexBuild and commitIndexBuild oplog entries.
+                if (!IndexBuildsCoordinator::get(opCtx)->supportsTwoPhaseIndexBuild()) {
+                    opObserver->onCreateIndex(
+                        opCtx, tmpName, tmpColl->uuid(), indexToCopy, fromMigrate);
+                }
+
                 auto indexResult =
                     tmpIndexCatalog->createIndexOnEmptyCollection(opCtx, indexToCopy);
                 if (!indexResult.isOK()) {
                     return indexResult.getStatus();
                 }
             };
+
+            if (buildUUID) {
+                opObserver->onCommitIndexBuild(
+                    opCtx, tmpName, tmpColl->uuid(), *buildUUID, indexesToCopy, fromMigrate);
+            }
+
             wunit.commit();
             return Status::OK();
         });
@@ -657,7 +685,7 @@ Status renameBetweenDBs(OperationContext* opCtx,
                         opCtx, "retryRestoreCursor", ns, [&cursor] { cursor->restore(); });
                 });
                 // Used to make sure that a WCE can be handled by this logic without data loss.
-                if (MONGO_FAIL_POINT(writeConflictInRenameCollCopyToTmp)) {
+                if (MONGO_unlikely(writeConflictInRenameCollCopyToTmp.shouldFail())) {
                     throw WriteConflictException();
                 }
                 wunit.commit();
@@ -745,6 +773,12 @@ Status renameCollection(OperationContext* opCtx,
                       str::stream() << "renameCollection() cannot accept a source "
                                        "collection that is in a drop-pending state: "
                                     << source);
+    }
+
+    if (source.isSystemDotViews() || target.isSystemDotViews()) {
+        return Status(
+            ErrorCodes::IllegalOperation,
+            "renaming system.views collection or renaming to system.views is not allowed");
     }
 
     const std::string dropTargetMsg =

@@ -72,7 +72,7 @@ namespace repl {
 class BackgroundSync;
 class IsMasterResponse;
 class OpTime;
-struct OpTimeAndWallTime;
+class OpTimeAndWallTime;
 class ReadConcernArgs;
 class ReplSetConfig;
 class ReplSetHeartbeatArgsV1;
@@ -853,6 +853,12 @@ public:
     virtual size_t getNumUncommittedSnapshots() = 0;
 
     /**
+     * Creates a CallbackWaiter that waits for w:majority write concern to be satisfied up to opTime
+     * before setting the 'wMajorityWriteAvailabilityDate' election candidate metric.
+     */
+    virtual void createWMajorityWriteAvailabilityDateWaiter(OpTime opTime) = 0;
+
+    /**
      * Returns a new WriteConcernOptions based on "wc" but with UNSET syncMode reset to JOURNAL or
      * NONE based on our rsConfig.
      */
@@ -890,10 +896,17 @@ public:
     virtual void signalDropPendingCollectionsRemovedFromStorage() = 0;
 
     /**
-     * Returns true if logOp() should not append an entry to the oplog for the namespace for this
-     * operation.
+     * Returns true if logOp() should not append an entry to the oplog for this operation.
      */
-    bool isOplogDisabledFor(OperationContext* opCtx, const NamespaceString& nss);
+    bool isOplogDisabledFor(OperationContext* opCtx, const NamespaceString& nss) const;
+
+    /**
+     * Returns true if logOp() should never append an entry to the oplog for this namespace. logOp()
+     * may not want to append an entry to the oplog for other reasons, even if the namespace is
+     * allowed to be replicated in the oplog (e.g. being a secondary).
+     */
+    static bool isOplogDisabledForNS(const NamespaceString& nss);
+
 
     /**
      * Returns the stable timestamp that the storage engine recovered to on startup. If the
@@ -912,6 +925,10 @@ public:
      */
     virtual void attemptToAdvanceStableTimestamp() = 0;
 
+    /**
+     * If our state is RECOVERING and lastApplied is at least minValid, transition to SECONDARY.
+     */
+    virtual void finishRecoveryIfEligible(OperationContext* opCtx) = 0;
 
 protected:
     ReplicationCoordinator();

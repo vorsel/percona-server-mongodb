@@ -323,11 +323,6 @@ OperationContext* PlanExecutorImpl::getOpCtx() const {
 void PlanExecutorImpl::saveState() {
     invariant(_currentState == kUsable || _currentState == kSaved);
 
-    // The query stages inside this stage tree might buffer record ids (e.g. text, geoNear,
-    // mergeSort, sort) which are no longer protected by the storage engine's transactional
-    // boundaries.
-    WorkingSetCommon::prepareForSnapshotChange(_workingSet.get());
-
     if (!isMarkedAsKilled()) {
         _root->saveState();
     }
@@ -472,7 +467,7 @@ PlanExecutor::ExecState PlanExecutorImpl::_waitForInserts(CappedInsertNotifierDa
 
 PlanExecutor::ExecState PlanExecutorImpl::_getNextImpl(Snapshotted<BSONObj>* objOut,
                                                        RecordId* dlOut) {
-    if (MONGO_FAIL_POINT(planExecutorAlwaysFails)) {
+    if (MONGO_unlikely(planExecutorAlwaysFails.shouldFail())) {
         Status status(ErrorCodes::InternalError,
                       str::stream() << "PlanExecutor hit planExecutorAlwaysFails fail point");
         *objOut =
@@ -546,7 +541,11 @@ PlanExecutor::ExecState PlanExecutorImpl::_getNextImpl(Snapshotted<BSONObj>* obj
                         *objOut = Snapshotted<BSONObj>(SnapshotId(), member->keyData[0].keyData);
                     }
                 } else if (member->hasObj()) {
-                    *objOut = member->obj;
+                    *objOut =
+                        Snapshotted<BSONObj>(member->doc.snapshotId(),
+                                             member->metadata() && member->doc.value().metadata()
+                                                 ? member->doc.value().toBsonWithMetaData()
+                                                 : member->doc.value().toBson());
                 } else {
                     _workingSet->free(id);
                     hasRequestedData = false;
@@ -569,7 +568,8 @@ PlanExecutor::ExecState PlanExecutorImpl::_getNextImpl(Snapshotted<BSONObj>* obj
             // This result didn't have the data the caller wanted, try again.
         } else if (PlanStage::NEED_YIELD == code) {
             invariant(id == WorkingSet::INVALID_ID);
-            if (!_yieldPolicy->canAutoYield() || MONGO_FAIL_POINT(skipWriteConflictRetries)) {
+            if (!_yieldPolicy->canAutoYield() ||
+                MONGO_unlikely(skipWriteConflictRetries.shouldFail())) {
                 throw WriteConflictException();
             }
 
@@ -585,10 +585,10 @@ PlanExecutor::ExecState PlanExecutorImpl::_getNextImpl(Snapshotted<BSONObj>* obj
         } else if (PlanStage::NEED_TIME == code) {
             // Fall through to yield check at end of large conditional.
         } else if (PlanStage::IS_EOF == code) {
-            if (MONGO_FAIL_POINT(planExecutorHangBeforeShouldWaitForInserts)) {
+            if (MONGO_unlikely(planExecutorHangBeforeShouldWaitForInserts.shouldFail())) {
                 log() << "PlanExecutor - planExecutorHangBeforeShouldWaitForInserts fail point "
                          "enabled. Blocking until fail point is disabled.";
-                MONGO_FAIL_POINT_PAUSE_WHILE_SET(planExecutorHangBeforeShouldWaitForInserts);
+                planExecutorHangBeforeShouldWaitForInserts.pauseWhileSet();
             }
             if (!_shouldWaitForInserts()) {
                 return PlanExecutor::IS_EOF;
@@ -603,9 +603,9 @@ PlanExecutor::ExecState PlanExecutorImpl::_getNextImpl(Snapshotted<BSONObj>* obj
             invariant(PlanStage::FAILURE == code);
 
             if (nullptr != objOut) {
-                BSONObj statusObj;
                 invariant(WorkingSet::INVALID_ID != id);
-                WorkingSetCommon::getStatusMemberObject(*_workingSet, id, &statusObj);
+                BSONObj statusObj =
+                    WorkingSetCommon::getStatusMemberDocument(*_workingSet, id)->toBson();
                 *objOut = Snapshotted<BSONObj>(SnapshotId(), statusObj);
             }
 

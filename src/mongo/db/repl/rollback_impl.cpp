@@ -182,11 +182,10 @@ Status RollbackImpl::runRollback(OperationContext* opCtx) {
     }
     _listener->onTransitionToRollback();
 
-    if (MONGO_FAIL_POINT(rollbackHangAfterTransitionToRollback)) {
+    if (MONGO_unlikely(rollbackHangAfterTransitionToRollback.shouldFail())) {
         log() << "rollbackHangAfterTransitionToRollback fail point enabled. Blocking until fail "
                  "point is disabled (rollback_impl).";
-        MONGO_FAIL_POINT_PAUSE_WHILE_SET_OR_INTERRUPTED(opCtx,
-                                                        rollbackHangAfterTransitionToRollback);
+        rollbackHangAfterTransitionToRollback.pauseWhileSet(opCtx);
     }
 
     // We clear the SizeRecoveryState before we recover to a stable timestamp. This ensures that we
@@ -259,12 +258,12 @@ Status RollbackImpl::runRollback(OperationContext* opCtx) {
 }
 
 void RollbackImpl::shutdown() {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
     _inShutdown = true;
 }
 
 bool RollbackImpl::_isInShutdown() const {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
     return _inShutdown;
 }
 
@@ -432,8 +431,11 @@ StatusWith<std::set<NamespaceString>> RollbackImpl::_namespacesForOp(const Oplog
                 }
                 break;
             }
-            // TODO(SERVER-39451): Ignore no-op commitIndexBuild command for now. Revisit when we
-            // are ready to implement rollback logic.
+            // TODO(SERVER-39451): Ignore no-op startIndexBuild, abortIndexBuild, and
+            // commitIndexBuild commands.
+            // Revisit when we are ready to implement rollback logic.
+            case OplogEntry::CommandType::kStartIndexBuild:
+            case OplogEntry::CommandType::kAbortIndexBuild:
             case OplogEntry::CommandType::kCommitIndexBuild:
             case OplogEntry::CommandType::kCommitTransaction:
             case OplogEntry::CommandType::kAbortTransaction: {
@@ -969,42 +971,33 @@ Status RollbackImpl::_checkAgainstTimeLimit(
 
     _rollbackStats.lastLocalOptime = topOfOplog.getOpTime();
 
-    auto topOfOplogWallOpt = topOfOplog.getWallClockTime();
+    auto topOfOplogWallTime = topOfOplog.getWallClockTime();
     // We check the difference between the top of the oplog and the first oplog entry after the
     // common point when computing the rollback time limit.
-    auto firstOpWallClockTimeAfterCommonPointOpt =
+    auto firstOpWallClockTimeAfterCommonPoint =
         commonPoint.getFirstOpWallClockTimeAfterCommonPoint();
 
+    if (topOfOplogWallTime >= firstOpWallClockTimeAfterCommonPoint) {
 
-    // Only compute the difference if both the top of the oplog and the first oplog entry after the
-    // common point have wall clock times.
-    if (firstOpWallClockTimeAfterCommonPointOpt && topOfOplogWallOpt) {
-        auto topOfOplogWallTime = topOfOplogWallOpt.get();
-        auto firstOpWallClockTimeAfterCommonPoint = firstOpWallClockTimeAfterCommonPointOpt.get();
+        unsigned long long diff = durationCount<Seconds>(
+            Milliseconds(topOfOplogWallTime - firstOpWallClockTimeAfterCommonPoint));
 
-        if (topOfOplogWallTime >= firstOpWallClockTimeAfterCommonPoint) {
+        _rollbackStats.lastLocalWallClockTime = topOfOplogWallTime;
+        _rollbackStats.firstOpWallClockTimeAfterCommonPoint = firstOpWallClockTimeAfterCommonPoint;
 
-            unsigned long long diff = durationCount<Seconds>(
-                Milliseconds(topOfOplogWallTime - firstOpWallClockTimeAfterCommonPoint));
-
-            _rollbackStats.lastLocalWallClockTime = topOfOplogWallTime;
-            _rollbackStats.firstOpWallClockTimeAfterCommonPoint =
-                firstOpWallClockTimeAfterCommonPoint;
-
-            auto timeLimit = static_cast<unsigned long long>(gRollbackTimeLimitSecs.loadRelaxed());
-            if (diff > timeLimit) {
-                return Status(ErrorCodes::UnrecoverableRollbackError,
-                              str::stream() << "not willing to roll back more than " << timeLimit
-                                            << " seconds of data. Have: " << diff << " seconds.");
-            }
-
-        } else {
-            warning()
-                << "Wall clock times on oplog entries not monotonically increasing. This "
-                   "might indicate a backward clock skew. Time at first oplog after common point: "
-                << firstOpWallClockTimeAfterCommonPoint
-                << ". Time at top of oplog: " << topOfOplogWallTime;
+        auto timeLimit = static_cast<unsigned long long>(gRollbackTimeLimitSecs.loadRelaxed());
+        if (diff > timeLimit) {
+            return Status(ErrorCodes::UnrecoverableRollbackError,
+                          str::stream() << "not willing to roll back more than " << timeLimit
+                                        << " seconds of data. Have: " << diff << " seconds.");
         }
+
+    } else {
+        warning()
+            << "Wall clock times on oplog entries not monotonically increasing. This "
+               "might indicate a backward clock skew. Time at first oplog after common point: "
+            << firstOpWallClockTimeAfterCommonPoint
+            << ". Time at top of oplog: " << topOfOplogWallTime;
     }
 
     return Status::OK();

@@ -21,6 +21,7 @@
 
 stepback: true
 command_type: system
+pre_error_fails_task: true
 
 # Files that match an ignore-list pattern will not trigger a build, if they're the only modified
 # files in the patch.
@@ -360,6 +361,7 @@ variables:
 - mongocryptd_variants: &mongocryptd_variants
   - enterprise-amazon2
   - enterprise-debian92-64
+  - enterprise-debian10-64
   - enterprise-linux-64-amazon-ami
   - enterprise-macos
   - enterprise-macos-openssl
@@ -1304,12 +1306,15 @@ functions:
           if command -V cygpath; then
             # Sad note: We have to use the Windows path instead of the posix path here.
             # Otherwise, virtualenv may mistakenly resolve paths relative to c:\cygdrive.
+            # Creating a virtualenv in cygwin with 'python -m venv', will not work correctly
+            # since the paths will be wrong.  We need to use virtualenv and specify the
+            # python path as 'C:\python\python_version'
             python_loc=$(cygpath -w $python_loc)
             venv_dir="$(cygpath -w "$venv_dir")"
+            "$virtualenv_loc" --python "$python_loc" --system-site-packages "$venv_dir"
+          else
+            "$python_loc" -m venv --system-site-packages "$venv_dir"
           fi
-
-          # Set up virtualenvs in ${workdir}
-          "$virtualenv_loc" --python "$python_loc" --system-site-packages "$venv_dir"
 
           export VIRTUAL_ENV_DISABLE_PROMPT=yes
 
@@ -1404,6 +1409,14 @@ functions:
               ulimit -c unlimited
             fi
           fi
+        fi
+
+        if [ $(uname -s) == "Darwin" ]; then
+            core_pattern_mac=$(/usr/sbin/sysctl -n "kern.corefile")
+            if [ "$core_pattern_mac" = "dump_%N.%P.core" ]; then
+              echo "Enabling coredumps"
+              ulimit -c unlimited
+            fi
         fi
 
         extra_args="$extra_args --jobs=${resmoke_jobs|1}"
@@ -2241,6 +2254,7 @@ functions:
         set -o verbose
 
         rm -rf src /data/db/* mongo-diskstats* mongo-*.tgz ~/.aws ~/.boto venv
+        exit 0
 
   "kill processes":
     command: shell.exec
@@ -3789,6 +3803,19 @@ tasks:
         files:
           - src/artifacts.json
 
+## compile_core_tools - minimal version of compile used for commit queue ##
+- name: compile_core_tools
+  depends_on: []
+  commands:
+    - func: "build new tools"
+    - func: "scons compile"
+      vars:
+        targets: core tools
+        task_compile_flags: >-
+          --use-new-tools
+          --build-mongoreplay="${build_mongoreplay}"
+          --detect-odr-violations
+
 ## compile_all - build all scons targets ##
 - name: compile_all
   commands:
@@ -4857,6 +4884,10 @@ tasks:
 - name: lint
   depends_on: []
   commands:
+    - command: timeout.update
+      params:
+        # 40 minutes
+        exec_timeout_secs: 2400
     - command: manifest.load
     - func: "git get project"
     - func: "set task expansion macros"
@@ -5502,6 +5533,8 @@ tasks:
   - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
+      num_files: 5
+      num_tasks: 30
       jstestfuzz_vars: --jsTestsDir ../jstests
       resmoke_args: --suites=jstestfuzz_interrupt_replication --flowControlTicketOverride=1 --storageEngine=wiredTiger
       name: jstestfuzz_interrupt_replication_flow_control
@@ -5542,6 +5575,8 @@ tasks:
   - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
+      num_files: 5
+      num_tasks: 30
       jstestfuzz_vars: --jsTestsDir ../jstests
       resmoke_args: --suites=jstestfuzz_replication_continuous_stepdown --flowControlTicketOverride=1 --storageEngine=wiredTiger
       name: jstestfuzz_replication_continuous_stepdown_flow_control
@@ -6304,6 +6339,24 @@ tasks:
       resmoke_args: --suites=core_txns_large_txns_format --storageEngine=wiredTiger
 
 - <<: *task_template
+  name: jsCore_map_reduce_agg
+  tags: ["jscore", "common"]
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=core_map_reduce_agg --storageEngine=wiredTiger
+
+- <<: *task_template
+  name: sharding_map_reduce_agg
+  tags: ["sharding"]
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_map_reduce_agg --storageEngine=wiredTiger
+
+- <<: *task_template
   name: sharded_jscore_txns
   tags: ["sharding", "jscore", "txns"]
   commands:
@@ -6528,6 +6581,15 @@ tasks:
       task_path_suffix: /data/multiversion
       resmoke_args: --suites=multiversion --storageEngine=wiredTiger
 
+- name: unittest_peer_pids_gen
+  tags: ["misc_js"]
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      suite: unittest_peer_pids
+      resmoke_args: --storageEngine=wiredTiger
+      fallback_num_sub_suites: 1
+
 - name: noPassthrough_gen
   tags: ["misc_js"]
   commands:
@@ -6535,7 +6597,7 @@ tasks:
     vars:
       suite: no_passthrough
       resmoke_args: --storageEngine=wiredTiger
-      fallback_num_sub_suites: 11
+      fallback_num_sub_suites: 12
 
 - name: noPassthroughWithMongod_gen
   tags: ["misc_js"]
@@ -6617,7 +6679,7 @@ tasks:
       suite: sharding_jscore_passthrough
       depends_on: jsCore
       resmoke_args: --storageEngine=wiredTiger --shellReadMode=legacy --shellWriteMode=compatibility --excludeWithAnyTags=requires_find_command
-      fallback_num_sub_suites: 4
+      fallback_num_sub_suites: 11
 
 - <<: *task_template
   name: sharded_multi_stmt_txn_jscore_passthrough
@@ -6652,7 +6714,7 @@ tasks:
     vars:
       depends_on: jsCore
       resmoke_args: --storageEngine=wiredTiger
-      fallback_num_sub_suites: 4
+      fallback_num_sub_suites: 21
 
 - name: multi_stmt_txn_jscore_passthrough_with_migration_gen
   tags: ["multi_stmt"]
@@ -6676,7 +6738,7 @@ tasks:
       depends_on: jsCore
       use_large_distro: "true"
       resmoke_args: --storageEngine=wiredTiger
-      fallback_num_sub_suites: 19
+      fallback_num_sub_suites: 48
 
 - name: multi_shard_multi_stmt_txn_stepdown_primary_jscore_passthrough_gen
   tags: ["multi_shard"]
@@ -6688,7 +6750,7 @@ tasks:
       depends_on: jsCore
       use_large_distro: "true"
       resmoke_args: --storageEngine=wiredTiger
-      fallback_num_sub_suites: 19
+      fallback_num_sub_suites: 37
 
 - name: parallel_gen
   tags: ["misc_js", "non_mobile"]
@@ -6699,7 +6761,7 @@ tasks:
     vars:
       depends_on: jsCore
       resmoke_args: --storageEngine=wiredTiger
-      fallback_num_sub_suites: 1
+      fallback_num_sub_suites: 2
       resmoke_jobs_max: 1
 
 - <<: *task_template
@@ -6877,7 +6939,7 @@ tasks:
 
 - <<: *task_template
   name: concurrency_sharded_with_stepdowns
-  tags: ["concurrency"]
+  tags: ["concurrency", "stepdowns"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -6887,12 +6949,32 @@ tasks:
 
 - <<: *task_template
   name: concurrency_sharded_with_stepdowns_and_balancer
-  tags: ["concurrency"]
+  tags: ["concurrency", "stepdowns"]
   commands:
   - func: "do setup"
   - func: "run tests"
     vars:
       resmoke_args: --suites=concurrency_sharded_with_stepdowns_and_balancer --storageEngine=wiredTiger
+      resmoke_jobs_max: 1
+
+- <<: *task_template
+  name: concurrency_sharded_terminate_primary_with_balancer
+  tags: ["concurrency", "stepdowns", "kill_terminate"]
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=concurrency_sharded_terminate_primary_with_balancer --storageEngine=wiredTiger
+      resmoke_jobs_max: 1
+
+- <<: *task_template
+  name: concurrency_sharded_kill_primary_with_balancer
+  tags: ["concurrency", "stepdowns", "kill_terminate"]
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=concurrency_sharded_kill_primary_with_balancer --storageEngine=wiredTiger
       resmoke_jobs_max: 1
 
 - <<: *task_template
@@ -6943,6 +7025,26 @@ tasks:
   - func: "run tests"
     vars:
       resmoke_args: --suites=concurrency_sharded_multi_stmt_txn_with_stepdowns --storageEngine=wiredTiger
+      resmoke_jobs_max: 1
+
+- <<: *task_template
+  name: concurrency_sharded_multi_stmt_txn_terminate_primary
+  tags: ["concurrency", "stepdowns", "kill_terminate"]
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=concurrency_sharded_multi_stmt_txn_terminate_primary --storageEngine=wiredTiger
+      resmoke_jobs_max: 1
+
+- <<: *task_template
+  name: concurrency_sharded_multi_stmt_txn_kill_primary
+  tags: ["concurrency", "stepdowns", "kill_terminate"]
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=concurrency_sharded_multi_stmt_txn_kill_primary --storageEngine=wiredTiger
       resmoke_jobs_max: 1
 
 - <<: *task_template
@@ -7006,7 +7108,7 @@ tasks:
       depends_on: jsCore
       use_large_distro: "true"
       resmoke_args: --storageEngine=wiredTiger
-      fallback_num_sub_suites: 7
+      fallback_num_sub_suites: 10
 
 - <<: *task_template
   name: write_concern_majority_passthrough
@@ -7028,7 +7130,7 @@ tasks:
       depends_on: jsCore
       use_large_distro: "true"
       resmoke_args: --storageEngine=wiredTiger
-      fallback_num_sub_suites: 11
+      fallback_num_sub_suites: 12
 
 - <<: *task_template
   name: replica_sets
@@ -7046,7 +7148,7 @@ tasks:
     vars:
       use_large_distro: "true"
       resmoke_args: --storageEngine=wiredTiger
-      fallback_num_sub_suites: 7
+      fallback_num_sub_suites: 15
 
 - name: replica_sets_ese_gcm_gen
   tags: ["replica_sets", "encrypt", "san", "gcm"]
@@ -7055,7 +7157,7 @@ tasks:
     vars:
       use_large_distro: "true"
       resmoke_args: --storageEngine=wiredTiger
-      fallback_num_sub_suites: 7
+      fallback_num_sub_suites: 15
 
 - name: replica_sets_auth_gen
   tags: ["replica_sets", "common", "san", "auth"]
@@ -7064,7 +7166,7 @@ tasks:
     vars:
       use_large_distro: "true"
       resmoke_args: --storageEngine=wiredTiger
-      fallback_num_sub_suites: 7
+      fallback_num_sub_suites: 14
 
 - name: replica_sets_large_txns_format_gen
   tags: ["replica_sets", "multi_oplog", "san"]
@@ -7072,7 +7174,7 @@ tasks:
   - func: "generate resmoke tasks"
     vars:
       resmoke_args: --storageEngine=wiredTiger
-      fallback_num_sub_suites: 1
+      fallback_num_sub_suites: 15
 
 - <<: *task_template
   name: sasl
@@ -7089,7 +7191,7 @@ tasks:
     vars:
       use_large_distro: "true"
       resmoke_args: --storageEngine=wiredTiger
-      fallback_num_sub_suites: 15
+      fallback_num_sub_suites: 32
 
 - name: sharding_rs_matching_disabled_gen
   tags: ["sharding", "common"]
@@ -7098,7 +7200,7 @@ tasks:
     vars:
       use_large_distro: "true"
       resmoke_args: --storageEngine=wiredTiger
-      fallback_num_sub_suites: 15
+      fallback_num_sub_suites: 32
 
 - name: sharding_rs_matching_match_busiest_node_gen
   tags: ["sharding", "common"]
@@ -7107,7 +7209,7 @@ tasks:
     vars:
       use_large_distro: "true"
       resmoke_args: --storageEngine=wiredTiger
-      fallback_num_sub_suites: 15
+      fallback_num_sub_suites: 32
 
 - name: sharding_csrs_continuous_config_stepdown_gen
   tags: ["sharding", "common", "csrs"]
@@ -7117,7 +7219,7 @@ tasks:
       suite: sharding_continuous_config_stepdown
       use_large_distro: "true"
       resmoke_args: --storageEngine=wiredTiger
-      fallback_num_sub_suites: 22
+      fallback_num_sub_suites: 25
 
 - name: sharding_ese_gen
   tags: ["sharding", "encrypt"]
@@ -7126,7 +7228,7 @@ tasks:
     vars:
       use_large_distro: "true"
       resmoke_args: --storageEngine=wiredTiger
-      fallback_num_sub_suites: 21
+      fallback_num_sub_suites: 32
 
 - name: sharding_ese_gcm_gen
   tags: ["sharding", "encrypt", "gcm"]
@@ -7135,7 +7237,7 @@ tasks:
     vars:
       use_large_distro: "true"
       resmoke_args: --storageEngine=wiredTiger
-      fallback_num_sub_suites: 21
+      fallback_num_sub_suites: 32
 
 - name: sharding_op_query_gen
   tags: ["sharding", "common", "op_query"]
@@ -7145,7 +7247,7 @@ tasks:
       suite: sharding
       use_large_distro: "true"
       resmoke_args: --shellReadMode=legacy --storageEngine=wiredTiger --excludeWithAnyTags=requires_find_command
-      fallback_num_sub_suites: 12
+      fallback_num_sub_suites: 31
 
 - name: sharding_auth_gen
   tags: ["sharding", "auth"]
@@ -7154,7 +7256,7 @@ tasks:
     vars:
       use_large_distro: "true"
       resmoke_args: --storageEngine=wiredTiger
-      fallback_num_sub_suites: 20
+      fallback_num_sub_suites: 31
 
 - name: sharding_auth_audit_gen
   tags: ["auth", "audit"]
@@ -7166,7 +7268,7 @@ tasks:
       depends_on: sharding_auth
       use_large_distro: "true"
       resmoke_args: --storageEngine=wiredTiger
-      fallback_num_sub_suites: 20
+      fallback_num_sub_suites: 31
 
 - name: sharding_last_stable_mongos_and_mixed_shards_gen
   tags: ["sharding", "common", "mixed_version"]
@@ -7176,7 +7278,7 @@ tasks:
       use_large_distro: "true"
       use_multiversion: /data/multiversion
       resmoke_args: ""
-      fallback_num_sub_suites: 12
+      fallback_num_sub_suites: 24
 
 - <<: *task_template
   name: snmp
@@ -7260,7 +7362,7 @@ tasks:
     vars:
       depends_on: jsCore
       resmoke_args: --storageEngine=wiredTiger
-      fallback_num_sub_suites: 6
+      fallback_num_sub_suites: 14
 
 - name: causally_consistent_jscore_passthrough_auth_gen
   tags: ["causally_consistent"]
@@ -7271,7 +7373,7 @@ tasks:
     vars:
       depends_on: jsCore
       resmoke_args: --storageEngine=wiredTiger
-      fallback_num_sub_suites: 7
+      fallback_num_sub_suites: 15
 
 - name: sharded_causally_consistent_jscore_passthrough_gen
   tags: ["causally_consistent"]
@@ -7282,7 +7384,7 @@ tasks:
     vars:
       depends_on: jsCore
       resmoke_args: --storageEngine=wiredTiger
-      fallback_num_sub_suites: 6
+      fallback_num_sub_suites: 15
 
 - name: retryable_writes_jscore_passthrough_gen
   tags: ["retry"]
@@ -7294,7 +7396,7 @@ tasks:
       depends_on: jsCore
       use_large_distro: "true"
       resmoke_args: --storageEngine=wiredTiger
-      fallback_num_sub_suites: 8
+      fallback_num_sub_suites: 9
 
 - name: logical_session_cache_replication_default_refresh_jscore_passthrough_gen
   tags: ["logical_session_cache", "repl"]
@@ -7305,7 +7407,7 @@ tasks:
     vars:
       depends_on: jsCore
       resmoke_args: --storageEngine=wiredTiger
-      fallback_num_sub_suites: 7
+      fallback_num_sub_suites: 17
 
 - name: logical_session_cache_replication_100ms_refresh_jscore_passthrough_gen
   tags: ["logical_session_cache", "repl"]
@@ -7316,7 +7418,7 @@ tasks:
     vars:
       depends_on: jsCore
       resmoke_args: --storageEngine=wiredTiger
-      fallback_num_sub_suites: 8
+      fallback_num_sub_suites: 17
 
 - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_gen
   tags: ["logical_session_cache", "one_sec", "repl"]
@@ -7327,7 +7429,7 @@ tasks:
     vars:
       depends_on: jsCore
       resmoke_args: --storageEngine=wiredTiger
-      fallback_num_sub_suites: 7
+      fallback_num_sub_suites: 16
 
 - name: logical_session_cache_replication_10sec_refresh_jscore_passthrough_gen
   tags: ["logical_session_cache", "repl"]
@@ -7338,7 +7440,7 @@ tasks:
     vars:
       depends_on: jsCore
       resmoke_args: --storageEngine=wiredTiger
-      fallback_num_sub_suites: 7
+      fallback_num_sub_suites: 16
 
 - name: logical_session_cache_sharding_default_refresh_jscore_passthrough_gen
   tags: ["logical_session_cache"]
@@ -7349,7 +7451,7 @@ tasks:
     vars:
       depends_on: jsCore
       resmoke_args: --storageEngine=wiredTiger
-      fallback_num_sub_suites: 1
+      fallback_num_sub_suites: 12
 
 - name: logical_session_cache_sharding_100ms_refresh_jscore_passthrough_gen
   tags: ["logical_session_cache"]
@@ -7360,7 +7462,7 @@ tasks:
     vars:
       depends_on: jsCore
       resmoke_args: --storageEngine=wiredTiger
-      fallback_num_sub_suites: 1
+      fallback_num_sub_suites: 48
 
 - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_gen
   tags: ["logical_session_cache", "one_sec"]
@@ -7371,7 +7473,7 @@ tasks:
     vars:
       depends_on: jsCore
       resmoke_args: --storageEngine=wiredTiger
-      fallback_num_sub_suites: 3
+      fallback_num_sub_suites: 20
 
 - name: logical_session_cache_sharding_10sec_refresh_jscore_passthrough_gen
   tags: ["logical_session_cache"]
@@ -7382,7 +7484,7 @@ tasks:
     vars:
       depends_on: jsCore
       resmoke_args: --storageEngine=wiredTiger
-      fallback_num_sub_suites: 1
+      fallback_num_sub_suites: 14
 
 - name: logical_session_cache_standalone_default_refresh_jscore_passthrough_gen
   tags: ["logical_session_cache"]
@@ -7393,7 +7495,7 @@ tasks:
     vars:
       depends_on: jsCore
       resmoke_args: --storageEngine=wiredTiger
-      fallback_num_sub_suites: 1
+      fallback_num_sub_suites: 5
 
 - name: logical_session_cache_standalone_100ms_refresh_jscore_passthrough_gen
   tags: ["logical_session_cache"]
@@ -7404,7 +7506,7 @@ tasks:
     vars:
       depends_on: jsCore
       resmoke_args: --storageEngine=wiredTiger
-      fallback_num_sub_suites: 1
+      fallback_num_sub_suites: 5
 
 - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_gen
   tags: ["logical_session_cache", "one_sec"]
@@ -7415,7 +7517,7 @@ tasks:
     vars:
       depends_on: jsCore
       resmoke_args: --storageEngine=wiredTiger
-      fallback_num_sub_suites: 3
+      fallback_num_sub_suites: 5
 
 - name: logical_session_cache_standalone_10sec_refresh_jscore_passthrough_gen
   tags: ["logical_session_cache"]
@@ -7426,7 +7528,7 @@ tasks:
     vars:
       depends_on: jsCore
       resmoke_args: --storageEngine=wiredTiger
-      fallback_num_sub_suites: 1
+      fallback_num_sub_suites: 5
 
 - <<: *task_template
   name: retryable_writes_jscore_stepdown_passthrough
@@ -8367,6 +8469,10 @@ task_groups:
   tasks:
   - compile
 - <<: *compile_task_group_template
+  name: compile_core_tools_TG
+  tasks:
+  - compile_core_tools
+- <<: *compile_task_group_template
   name: dbtest_TG
   tasks:
   - dbtest
@@ -8477,7 +8583,7 @@ buildvariants:
   - name: jsCore_txns
   - name: .logical_session_cache
   - name: parallel_gen
-  - name: .concurrency .common
+  - name: .concurrency .common !.kill_terminate
     distros:
       - rhel62-large
   - name: concurrency_replication_causal_consistency
@@ -9366,6 +9472,7 @@ buildvariants:
         - windows-64-vs2017-compile
     - name: burn_in_tests_gen
     - name: buildscripts_test
+    - name: unittest_peer_pids_gen
     - name: dbtest_TG
       distros:
         - windows-64-vs2017-compile
@@ -9405,7 +9512,7 @@ buildvariants:
   - name: .misc_js !.non_win_dbg
     # Some concurrency workloads require a lot of memory, so we use machines
     # with more RAM for these suites.
-  - name: .concurrency !.ubsan !.no_txns
+  - name: .concurrency !.ubsan !.no_txns !.kill_terminate
     distros:
       - windows-64-vs2017-compile
   - name: disk_wiredtiger
@@ -9710,7 +9817,7 @@ buildvariants:
 - name: macos
   display_name: macOS
   run_on:
-  - macos-1014-i7
+  - macos-1014
   batchtime: 1440 # 1 day
   expansions:
     test_flags: --excludeWithAnyTags=requires_ssl_mongo_tools
@@ -9731,7 +9838,7 @@ buildvariants:
   - name: .causally_consistent !.sharding
   - name: .change_streams !.secondary_reads
   - name: .misc_js
-  - name: .concurrency !.ubsan !.no_txns !.debug_only
+  - name: .concurrency !.ubsan !.no_txns !.debug_only !.kill_terminate
   - name: disk_wiredtiger
   - name: free_monitoring
   - name: initial_sync_fuzzer_gen
@@ -9760,7 +9867,7 @@ buildvariants:
 - name: macos-debug
   display_name: "* macOS DEBUG"
   run_on:
-  - macos-1014-i7
+  - macos-1014
   expansions:
     resmoke_jobs_max: 6
     compile_env: DEVELOPER_DIR=/Applications/Xcode10.2.app
@@ -9788,7 +9895,7 @@ buildvariants:
   modules:
   - enterprise
   run_on:
-  - macos-1014-i7
+  - macos-1014
   batchtime: 1440 # 1 day
   expansions:
     test_flags: --excludeWithAnyTags=requires_ssl_mongo_tools
@@ -9823,7 +9930,7 @@ buildvariants:
   modules:
   - enterprise
   run_on:
-  - macos-1014-i7
+  - macos-1014
   batchtime: 1440 # 1 day
   expansions:
     test_flags: --excludeWithAnyTags=requires_ssl_mongo_tools
@@ -9858,7 +9965,7 @@ buildvariants:
 - name: embedded-sdk-macos
   display_name: "Embedded SDK - macOS"
   run_on:
-  - macos-1014-i7
+  - macos-1014
   batchtime: 1440 # 1 day
   expansions:
     test_flags: --excludeWithAnyTags=uses_transactions
@@ -9888,7 +9995,7 @@ buildvariants:
 - name: embedded-sdk-iphoneos
   display_name: "Embedded SDK - iOS"
   run_on:
-  - macos-1014-i7
+  - macos-1014
   batchtime: 1440 # 1 day
   expansions:
     test_flags: --excludeWithAnyTags=uses_transactions
@@ -9920,7 +10027,7 @@ buildvariants:
 - name: embedded-sdk-iphonesimulator
   display_name: "Embedded SDK - iOS Simulator"
   run_on:
-  - macos-1014-i7
+  - macos-1014
   batchtime: 1440 # 1 day
   expansions:
     test_flags: --excludeWithAnyTags=uses_transactions
@@ -9955,7 +10062,7 @@ buildvariants:
 - name: embedded-sdk-appletvos
   display_name: "Embedded SDK - tvOS"
   run_on:
-  - macos-1014-i7
+  - macos-1014
   batchtime: 1440 # 1 day
   expansions:
     cmake_path: /Applications/cmake-3.11.0-Darwin-x86_64/CMake.app/Contents/bin/cmake
@@ -9987,7 +10094,7 @@ buildvariants:
 - name: embedded-sdk-appletvsimulator
   display_name: "Embedded SDK - tvOS Simulator"
   run_on:
-  - macos-1014-i7
+  - macos-1014
   batchtime: 1440 # 1 day
   expansions:
     cmake_path: /Applications/cmake-3.11.0-Darwin-x86_64/CMake.app/Contents/bin/cmake
@@ -10022,7 +10129,7 @@ buildvariants:
 - name: embedded-sdk-watchos
   display_name: "Embedded SDK - watchOS"
   run_on:
-  - macos-1014-i7
+  - macos-1014
   batchtime: 1440 # 1 day
   expansions:
     cmake_path: /Applications/cmake-3.11.0-Darwin-x86_64/CMake.app/Contents/bin/cmake
@@ -10054,7 +10161,7 @@ buildvariants:
 - name: embedded-sdk-watchsimulator
   display_name: "Embedded SDK - watchOS Simulator"
   run_on:
-  - macos-1014-i7
+  - macos-1014
   batchtime: 1440 # 1 day
   expansions:
     cmake_path: /Applications/cmake-3.11.0-Darwin-x86_64/CMake.app/Contents/bin/cmake
@@ -10089,7 +10196,7 @@ buildvariants:
 - name: embedded-sdk-apple-multiarch
   display_name: "Embedded SDK - Apple Multiarch"
   run_on:
-  - macos-1014-i7
+  - macos-1014
   batchtime: 1440 # 1 day
   expansions:
     compile_env: DEVELOPER_DIR=/Applications/Xcode10.2.app
@@ -10332,6 +10439,7 @@ buildvariants:
     distros:
     - centos6-perf
   - name: buildscripts_test
+  - name: unittest_peer_pids_gen
   - name: .causally_consistent !.sharding
   - name: .change_streams
   - name: .misc_js
@@ -10619,15 +10727,15 @@ buildvariants:
   - name: snmp
   - name: .updatefuzzer
 
-- name: enterprise-rhel-62-64-bit-alt-create-indexes
-  display_name: "Enterprise RHEL 6.2 (alternate createIndexes implementation)"
+- name: enterprise-rhel-62-64-bit-two-phase-index-builds
+  display_name: "Enterprise RHEL 6.2 (two phase index builds)"
   modules:
   - enterprise
   run_on:
   - rhel62-small
-  expansions: &enterprise-rhel-62-64-bit-alt-create-indexes
+  expansions: &enterprise-rhel-62-64-bit-two-phase-index-builds
     test_flags: >-
-      --mongodSetParameters="{enableIndexBuildsCoordinatorForCreateIndexesCommand: true}"
+      --mongodSetParameters="{enableTwoPhaseIndexBuild: true}"
     compile_flags: >-
       -j$(grep -c ^processor /proc/cpuinfo)
       --ssl
@@ -10645,16 +10753,7 @@ buildvariants:
   - name: compile_TG
     distros:
     - rhel62-large
-  - name: .concurrency !.large !.ubsan !.no_txns !.debug_only
   - name: .jscore .common
-  - name: .jstestfuzz
-  - name: noPassthrough_gen
-  - name: noPassthroughWithMongod_gen
-  - name: .replica_sets !.encrypt !.auth
-    distros:
-    - rhel62-large
-  - name: .rollbackfuzzer
-  - name: sharding_gen
 
 - name: enterprise-rhel-62-64-bit-coverage
   display_name: "~ Enterprise RHEL 6.2 DEBUG Code Coverage"
@@ -10687,7 +10786,7 @@ buildvariants:
     - name: causally_consistent_jscore_txns_passthrough
     - name: .change_streams
     - name: .misc_js !.tool
-    - name: .concurrency !.ubsan !.no_txns !.stepdowns
+    - name: .concurrency !.ubsan !.no_txns !.stepdowns !.kill_terminate
     - name: disk_wiredtiger
     - name: .encrypt
     - name: initial_sync_fuzzer_gen
@@ -11578,99 +11677,93 @@ buildvariants:
   - name: .stitch
   - name: .publish
 
-# - name: enterprise-suse15-64
-#   display_name: Enterprise SLES 15
-#   modules:
-#   - enterprise
-#   run_on:
-#   - suse15-test
-#   batchtime: 1440 # 1 day
-#   expansions:
-#     push_path: linux
-#     push_bucket: downloads.10gen.com
-#     push_name: linux
-#     push_arch: x86_64-enterprise-suse15
-#     compile_flags: --ssl MONGO_DISTMOD=suse15 --release -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
-#     has_packages: true
-#     packager_script: packager_enterprise.py
-#     packager_arch: x86_64
-#     packager_distro: suse15
-#     repo_edition: enterprise
-#     scons_cache_scope: shared
-#     tooltags: "ssl sasl"
-#     build_mongoreplay: true
-#   display_tasks:
-#   - *dbtest
-#   - *unittests
-#   tasks:
-#   - name: compile_all_run_unittests_TG
-#     distros:
-#     - suse15-build
-#   - name: .aggfuzzer .common
-#   - name: audit
-#   - name: causally_consistent_jscore_txns_passthrough
-#   - name: .encrypt !.replica_sets !.aggregation !.sharding !.jscore
-#   - name: .jscore .common !.decimal !.compat !.sharding
-#   - name: .jstestfuzz .common
-#   - name: .logical_session_cache .one_sec
-#   - name: replica_sets_auth_gen
-#   - name: replica_sets_jscore_passthrough
-#   - name: sasl
-#   - name: sharding_auth_gen
-#   - name: snmp
-#   - name: .stitch
-#   - name: .publish
+- name: enterprise-suse15-64
+  display_name: Enterprise SLES 15
+  modules:
+  - enterprise
+  run_on:
+  - suse15-test
+  batchtime: 1440 # 1 day
+  expansions:
+    push_path: linux
+    push_bucket: downloads.10gen.com
+    push_name: linux
+    push_arch: x86_64-enterprise-suse15
+    compile_flags: --ssl MONGO_DISTMOD=suse15 --release -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
+    has_packages: true
+    packager_script: packager_enterprise.py
+    packager_arch: x86_64
+    packager_distro: suse15
+    repo_edition: enterprise
+    scons_cache_scope: shared
+    tooltags: "ssl sasl"
+    build_mongoreplay: true
+  tasks:
+  - name: compile_all_run_unittests_TG
+    distros:
+    - suse15-build
+  - name: .aggfuzzer .common
+  - name: audit
+  - name: causally_consistent_jscore_txns_passthrough
+  - name: .encrypt !.replica_sets !.aggregation !.sharding !.jscore
+  - name: .jscore .common !.decimal !.compat !.sharding
+  - name: .jstestfuzz .common
+  - name: .logical_session_cache .one_sec
+  - name: replica_sets_auth_gen
+  - name: replica_sets_jscore_passthrough
+  - name: sasl
+  - name: sharding_auth_gen
+  - name: snmp
+  - name: .stitch
+  - name: .publish
 
-# - name: suse15
-#   display_name: SUSE 15
-#   run_on:
-#   - suse15-test
-#   batchtime: 1440 # 1 day
-#   expansions:
-#     push_path: linux
-#     push_bucket: downloads.mongodb.org
-#     push_name: linux
-#     push_arch: x86_64-suse15
-#     compile_flags: --ssl MONGO_DISTMOD=suse15 -j$(grep -c ^processor /proc/cpuinfo) --release --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
-#     multiversion_platform: suse15
-#     multiversion_edition: targeted
-#     has_packages: true
-#     packager_script: packager.py
-#     packager_arch: x86_64
-#     packager_distro: suse15
-#     repo_edition: org
-#     scons_cache_scope: shared
-#     tooltags: "ssl"
-#     build_mongoreplay: true
-#   display_tasks:
-#   - *dbtest
-#   - *unittests
-#   tasks:
-#   - name: compile_all_run_unittests_TG
-#     distros:
-#     - suse15-build
-#   - name: .aggfuzzer .common
-#   - name: aggregation
-#   - name: .auth !.audit !.multiversion
-#   - name: causally_consistent_jscore_txns_passthrough
-#   - name: .misc_js
-#   - name: .concurrency .common
-#   - name: concurrency_replication_causal_consistency
-#     distros:
-#       - suse15-build
-#   - name: disk_wiredtiger
-#   - name: free_monitoring
-#   - name: .jscore .common !.decimal
-#   - name: .jstestfuzz .common
-#   - name: .logical_session_cache .one_sec
-#   - name: multiversion
-#   - name: replica_sets
-#   - name: .replica_sets .common
-#   - name: .sharding .txns
-#   - name: .sharding .common !.op_query !.csrs
-#   - name: .ssl
-#   - name: .stitch
-#   - name: .publish
+- name: suse15
+  display_name: SUSE 15
+  run_on:
+  - suse15-test
+  batchtime: 1440 # 1 day
+  expansions:
+    push_path: linux
+    push_bucket: downloads.mongodb.org
+    push_name: linux
+    push_arch: x86_64-suse15
+    compile_flags: --ssl MONGO_DISTMOD=suse15 -j$(grep -c ^processor /proc/cpuinfo) --release --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
+    multiversion_platform: suse15
+    multiversion_edition: targeted
+    has_packages: true
+    packager_script: packager.py
+    packager_arch: x86_64
+    packager_distro: suse15
+    repo_edition: org
+    scons_cache_scope: shared
+    tooltags: "ssl"
+    build_mongoreplay: true
+  tasks:
+  - name: compile_all_run_unittests_TG
+    distros:
+    - suse15-build
+  - name: .aggfuzzer .common
+  - name: aggregation
+  - name: .auth !.audit !.multiversion
+  - name: causally_consistent_jscore_txns_passthrough
+  - name: .misc_js
+  - name: .concurrency .common
+  - name: concurrency_replication_causal_consistency
+    distros:
+      - suse15-build
+  - name: disk_wiredtiger
+  - name: free_monitoring
+  - name: .jscore .common !.decimal
+  - name: .jstestfuzz .common
+  - name: .logical_session_cache .one_sec
+  - name: multiversion
+  - name: replica_sets
+  - name: .replica_sets .common
+  - name: .sharding .txns
+  - name: .sharding .common !.op_query !.csrs
+  - name: .ssl
+  - name: .stitch
+  - name: .publish
 
 ###########################################
 #          Debian buildvariants           #
@@ -11780,6 +11873,110 @@ buildvariants:
     - ubuntu1604-packer
   - name: .publish
 
+- name: enterprise-debian10-64
+  display_name: Enterprise Debian 10
+  modules:
+  - enterprise
+  run_on:
+  - debian10-test
+  batchtime: 1440 # 1 day
+  expansions:
+    push_path: linux
+    push_bucket: downloads.10gen.com
+    push_name: linux
+    push_arch: x86_64-enterprise-debian10
+    mh_target: dist-mh
+    compile_flags: --ssl MONGO_DISTMOD=debian10 --release -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
+    multiversion_platform: debian10
+    multiversion_edition: enterprise
+    # We invoke SCons using --jobs = (# of CPUs / 4) to avoid causing out of memory errors due to
+    # spawning a large number of linker processes.
+    num_scons_link_jobs_available: $(( $(grep -c ^processor /proc/cpuinfo) / 4 ))
+    has_packages: true
+    packager_script: packager_enterprise.py
+    packager_arch: x86_64
+    packager_distro: debian10
+    repo_edition: enterprise
+    tooltags: "ssl sasl gssapi"
+    scons_cache_scope: shared
+    build_mongoreplay: true
+  tasks:
+  - name: compile_all_run_unittests_TG
+    distros:
+    - debian10-build
+  - name: .aggfuzzer .common
+  - name: audit
+  - name: causally_consistent_jscore_txns_passthrough
+  - name: .encrypt !.replica_sets !.aggregation !.sharding !.jscore
+  - name: .jscore .common !.decimal !.compat !.sharding
+  - name: .jstestfuzz .common
+  - name: .logical_session_cache .one_sec
+  - name: replica_sets_auth_gen
+  - name: replica_sets_jscore_passthrough
+  - name: sasl
+  - name: sharding_auth_gen
+  - name: snmp
+  - name: .stitch
+  - name: package
+    distros:
+    - ubuntu1604-packer
+  - name: .publish
+
+- name: debian10
+  display_name: Debian 10
+  run_on:
+  - debian10-test
+  batchtime: 1440 # 1 day
+  expansions:
+    push_path: linux
+    push_bucket: downloads.mongodb.org
+    push_name: linux
+    push_arch: x86_64-debian10
+    compile_flags: --ssl MONGO_DISTMOD=debian10 -j$(grep -c ^processor /proc/cpuinfo) --release --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
+    # We invoke SCons using --jobs = (# of CPUs / 4) to avoid causing out of memory errors due to
+    # spawning a large number of linker processes.
+    num_scons_link_jobs_available: $(( $(grep -c ^processor /proc/cpuinfo) / 4 ))
+    multiversion_platform: debian10
+    multiversion_edition: targeted
+    has_packages: true
+    packager_script: packager.py
+    packager_arch: x86_64
+    packager_distro: debian10
+    repo_edition: org
+    tooltags: "ssl"
+    scons_cache_scope: shared
+    build_mongoreplay: true
+  tasks:
+  - name: compile_all_run_unittests_TG
+    distros:
+    - debian10-build
+  - name: .aggfuzzer .common
+  - name: aggregation
+  - name: aggregation_auth
+  - name: .auth !.audit !.multiversion
+  - name: causally_consistent_jscore_txns_passthrough
+  - name: .misc_js
+  - name: .concurrency .common
+  - name: concurrency_replication_causal_consistency
+    distros:
+      - debian10-build
+  - name: disk_wiredtiger
+  - name: free_monitoring
+  - name: .jscore .common !.decimal
+  - name: .jstestfuzz .common
+  - name: .logical_session_cache .one_sec
+  - name: multiversion
+  - name: replica_sets
+  - name: .replica_sets .common
+  - name: .sharding .jscore !.wo_snapshot !.multi_stmt
+  - name: .sharding .common !.op_query !.csrs
+  - name: .ssl
+  - name: .stitch
+  - name: package
+    distros:
+    - ubuntu1604-packer
+  - name: .publish
+
 ################################
 # storage engine buildvariants #
 ################################
@@ -11829,7 +12026,7 @@ buildvariants:
   - name: .causally_consistent !.wo_snapshot
   - name: .change_streams !.secondary_reads
   - name: .misc_js
-  - name: .concurrency !.ubsan !.no_txns !.debug_only
+  - name: .concurrency !.ubsan !.no_txns !.debug_only !.kill_terminate
     distros:
     - rhel62-large  # Some workloads require a lot of memory, use a bigger machine for this suite.
   - name: initial_sync_fuzzer_gen
@@ -11982,7 +12179,7 @@ buildvariants:
 - name: macos-mobile
   display_name: macOS (mobile)
   run_on:
-  - macos-1014-i7
+  - macos-1014
   batchtime: 1440 # 1 day
   expansions:
     push_path: osx
@@ -12200,7 +12397,7 @@ buildvariants:
   - name: .causally_consistent !.wo_snapshot
   - name: .change_streams
   - name: .misc_js
-  - name: .concurrency !.ubsan !.no_txns
+  - name: .concurrency !.ubsan !.no_txns !.kill_terminate
   - name: disk_wiredtiger
   - name: .encrypt
   - name: free_monitoring
@@ -12287,7 +12484,7 @@ buildvariants:
   - name: .causally_consistent !.wo_snapshot
   - name: .change_streams
   - name: .misc_js
-  - name: .concurrency !.no_txns !.repl
+  - name: .concurrency !.no_txns !.repl !.kill_terminate
   - name: disk_wiredtiger
   - name: .encrypt
   - name: free_monitoring
@@ -12400,7 +12597,7 @@ buildvariants:
   - name: audit
   - name: .causally_consistent !.wo_snapshot
   - name: .misc_js
-  - name: .concurrency .common
+  - name: .concurrency .common !.kill_terminate
   - name: concurrency_replication_causal_consistency
   - name: disk_wiredtiger
   - name: .encrypt
@@ -12462,5 +12659,30 @@ buildvariants:
     - rhel62-small
   batchtime: 10080 # 7 days
   stepback: false
+  expansions:
+    push_path: linux
+    push_bucket: downloads.10gen.com
+    push_name: linux
+    push_arch: x86_64-enterprise-rhel62
+    mh_target: dist-mh
+    compile_flags: --ssl MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) --release --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
+    multiversion_platform: rhel62
+    multiversion_edition: enterprise
+    has_packages: true
+    packager_script: packager_enterprise.py
+    packager_arch: x86_64
+    packager_distro: rhel62
+    repo_edition: enterprise
+    scons_cache_scope: shared
+    tooltags: "ssl sasl gssapi"
+    build_mongoreplay: true
+    jstestfuzz_num_generated_files: 40
+    jstestfuzz_concurrent_num_files: 10
+    target_resmoke_time: 10
+    large_distro_name: rhel62-large
+    burn_in_tag_buildvariants: enterprise-rhel-62-64-bit-majority-read-concern-off enterprise-rhel-62-64-bit-inmem linux-64-duroff
   tasks:
-    - name: commit_queue_placeholder
+  - name: commit_queue_placeholder
+  - name: compile_core_tools_TG
+    distros:
+    - rhel62-large

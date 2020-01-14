@@ -42,8 +42,6 @@ namespace mongo {
 
 class CappedCallback;
 class Collection;
-struct CompactOptions;
-struct CompactStats;
 class MAdvise;
 class OperationContext;
 
@@ -51,15 +49,6 @@ class RecordStore;
 
 struct ValidateResults;
 class ValidateAdaptor;
-
-struct CompactOptions {
-    // other
-    bool validateDocuments = true;
-
-    std::string toString() const;
-};
-
-struct CompactStats {};
 
 /**
  * The data items stored in a RecordStore.
@@ -168,13 +157,9 @@ public:
 };
 
 /**
- * Adds explicit seeking of records. This functionality is separated out from RecordCursor,
- * because some cursors, such as repair cursors, are not required to support seeking.
- *
- * Warning: MMAPv1 cannot detect if RecordIds are valid. Therefore callers should only pass
- * potentially deleted RecordIds to seek methods if they know that MMAPv1 is not the current
- * storage engine. All new storage engines must support detecting the existence of Records.
- *
+ * Adds explicit seeking of records. This functionality is separated out from RecordCursor, because
+ * some cursors are not required to support seeking. All storage engines must support detecting the
+ * existence of Records.
  */
 class SeekableRecordCursor : public RecordCursor {
 public:
@@ -213,7 +198,6 @@ public:
  *
  * This class must be thread-safe for document-level locking storage engines. In addition, for
  * storage engines implementing the KVEngine some methods must be thread safe, see DurableCatalog.
- * Only for MMAPv1 is this class not thread-safe.
  */
 class RecordStore {
     RecordStore(const RecordStore&) = delete;
@@ -299,10 +283,6 @@ public:
      *
      * In general prefer RecordCursor::seekExact since it can avoid copying data in more
      * storageEngines.
-     *
-     * Warning: MMAPv1 cannot detect if RecordIds are valid. Therefore callers should only pass
-     * potentially deleted RecordIds to seek methods if they know that MMAPv1 is not the current
-     * storage engine. All new storage engines must support detecting the existence of Records.
      */
     virtual bool findRecord(OperationContext* opCtx, const RecordId& loc, RecordData* out) const {
         auto cursor = getCursor(opCtx);
@@ -383,15 +363,6 @@ public:
                                                             bool forward = true) const = 0;
 
     /**
-     * Constructs a cursor over a potentially corrupted store, which can be used to salvage
-     * damaged records. The iterator might return every record in the store if all of them
-     * are reachable and not corrupted.  Returns NULL if not supported.
-     */
-    virtual std::unique_ptr<RecordCursor> getCursorForRepair(OperationContext* opCtx) const {
-        return {};
-    }
-
-    /**
      * Constructs a cursor over a record store that returns documents in a randomized order, and
      * allows storage engines to provide a more efficient way of random sampling of a record store
      * than MongoDB's default sampling methods, which is used when this method returns {}.
@@ -429,15 +400,6 @@ public:
      */
     virtual bool compactSupported() const {
         return false;
-    }
-
-    /**
-     * Does compact() leave RecordIds alone or can they change.
-     *
-     * Only called if compactSupported() returns true.
-     */
-    virtual bool compactsInPlace() const {
-        MONGO_UNREACHABLE;
     }
 
     /**

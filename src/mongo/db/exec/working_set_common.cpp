@@ -40,21 +40,6 @@
 
 namespace mongo {
 
-void WorkingSetCommon::prepareForSnapshotChange(WorkingSet* workingSet) {
-    for (auto id : workingSet->getAndClearYieldSensitiveIds()) {
-        if (workingSet->isFree(id)) {
-            continue;
-        }
-
-        // We may see the same member twice, so anything we do here should be idempotent.
-        WorkingSetMember* member = workingSet->get(id);
-        if (member->getState() == WorkingSetMember::RID_AND_IDX) {
-            member->isSuspicious = true;
-        }
-    }
-}
-
-// static
 bool WorkingSetCommon::fetch(OperationContext* opCtx,
                              WorkingSet* workingSet,
                              WorkingSetID id,
@@ -65,35 +50,42 @@ bool WorkingSetCommon::fetch(OperationContext* opCtx,
     // state appropriately.
     invariant(member->hasRecordId());
 
-    member->obj.reset();
     auto record = cursor->seekExact(member->recordId);
     if (!record) {
         return false;
     }
 
-    member->obj = {opCtx->recoveryUnit()->getSnapshotId(), record->data.releaseToBson()};
+    auto currentSnapshotId = opCtx->recoveryUnit()->getSnapshotId();
+    member->resetDocument(currentSnapshotId, record->data.releaseToBson());
 
-    if (member->isSuspicious) {
-        // Make sure that all of the keyData is still valid for this copy of the document.
-        // This ensures both that index-provided filters and sort orders still hold.
-        // TODO provide a way for the query planner to opt out of this checking if it is
-        // unneeded due to the structure of the plan.
-        invariant(!member->keyData.empty());
+    // Make sure that all of the keyData is still valid for this copy of the document.  This ensures
+    // both that index-provided filters and sort orders still hold.
+    //
+    // TODO provide a way for the query planner to opt out of this checking if it is unneeded due to
+    // the structure of the plan.
+    if (member->getState() == WorkingSetMember::RID_AND_IDX) {
         for (size_t i = 0; i < member->keyData.size(); i++) {
+            auto&& memberKey = member->keyData[i];
+            // For storage engines that support document-level concurrency, if this key was obtained
+            // in the current snapshot, then move on to the next key.
+            if (supportsDocLocking() && memberKey.snapshotId == currentSnapshotId) {
+                continue;
+            }
+
             KeyStringSet keys;
             // There's no need to compute the prefixes of the indexed fields that cause the index to
             // be multikey when ensuring the keyData is still valid.
             KeyStringSet* multikeyMetadataKeys = nullptr;
             MultikeyPaths* multikeyPaths = nullptr;
-            auto* iam = member->keyData[i].index;
-            iam->getKeys(member->obj.value(),
+            auto* iam = workingSet->retrieveIndexAccessMethod(memberKey.indexId);
+            iam->getKeys(member->doc.value().toBson(),
                          IndexAccessMethod::GetKeysMode::kEnforceConstraints,
                          &keys,
                          multikeyMetadataKeys,
                          multikeyPaths,
                          member->recordId);
             KeyString::HeapBuilder keyString(iam->getSortedDataInterface()->getKeyStringVersion(),
-                                             member->keyData[i].keyData,
+                                             memberKey.keyData,
                                              iam->getSortedDataInterface()->getOrdering(),
                                              member->recordId);
             if (!keys.count(keyString.release())) {
@@ -101,8 +93,6 @@ bool WorkingSetCommon::fetch(OperationContext* opCtx,
                 return false;
             }
         }
-
-        member->isSuspicious = false;
     }
 
     member->keyData.clear();
@@ -110,7 +100,6 @@ bool WorkingSetCommon::fetch(OperationContext* opCtx,
     return true;
 }
 
-// static
 BSONObj WorkingSetCommon::buildMemberStatusObject(const Status& status) {
     BSONObjBuilder bob;
     bob.append("ok", status.isOK() ? 1.0 : 0.0);
@@ -123,45 +112,37 @@ BSONObj WorkingSetCommon::buildMemberStatusObject(const Status& status) {
     return bob.obj();
 }
 
-// static
 WorkingSetID WorkingSetCommon::allocateStatusMember(WorkingSet* ws, const Status& status) {
     invariant(ws);
 
     WorkingSetID wsid = ws->allocate();
     WorkingSetMember* member = ws->get(wsid);
-    member->obj = Snapshotted<BSONObj>(SnapshotId(), buildMemberStatusObject(status));
+    member->resetDocument(SnapshotId(), buildMemberStatusObject(status));
     member->transitionToOwnedObj();
 
     return wsid;
 }
 
-// static
 bool WorkingSetCommon::isValidStatusMemberObject(const BSONObj& obj) {
     return obj.hasField("ok") && obj["code"].type() == NumberInt && obj["errmsg"].type() == String;
 }
 
-// static
-void WorkingSetCommon::getStatusMemberObject(const WorkingSet& ws,
-                                             WorkingSetID wsid,
-                                             BSONObj* objOut) {
-    invariant(objOut);
-
-    // Validate ID and working set member.
+boost::optional<Document> WorkingSetCommon::getStatusMemberDocument(const WorkingSet& ws,
+                                                                    WorkingSetID wsid) {
     if (WorkingSet::INVALID_ID == wsid) {
-        return;
+        return boost::none;
     }
-    WorkingSetMember* member = ws.get(wsid);
+    auto member = ws.get(wsid);
     if (!member->hasOwnedObj()) {
-        return;
+        return boost::none;
     }
-    BSONObj obj = member->obj.value();
+    BSONObj obj = member->doc.value().toBson();
     if (!isValidStatusMemberObject(obj)) {
-        return;
+        return boost::none;
     }
-    *objOut = obj;
+    return member->doc.value();
 }
 
-// static
 Status WorkingSetCommon::getMemberObjectStatus(const BSONObj& memberObj) {
     invariant(WorkingSetCommon::isValidStatusMemberObject(memberObj));
     return Status(ErrorCodes::Error(memberObj["code"].numberInt()),
@@ -169,13 +150,11 @@ Status WorkingSetCommon::getMemberObjectStatus(const BSONObj& memberObj) {
                   memberObj);
 }
 
-// static
 Status WorkingSetCommon::getMemberStatus(const WorkingSetMember& member) {
     invariant(member.hasObj());
-    return getMemberObjectStatus(member.obj.value());
+    return getMemberObjectStatus(member.doc.value().toBson());
 }
 
-// static
 std::string WorkingSetCommon::toStatusString(const BSONObj& obj) {
     if (!isValidStatusMemberObject(obj)) {
         Status unknownStatus(ErrorCodes::UnknownError, "no details available");

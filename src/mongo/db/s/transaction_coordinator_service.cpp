@@ -78,14 +78,47 @@ void TransactionCoordinatorService::createCoordinator(OperationContext* opCtx,
         latestCoordinator->cancelIfCommitNotYetStarted();
     }
 
-    catalog.insert(opCtx,
-                   lsid,
-                   txnNumber,
-                   std::make_shared<TransactionCoordinator>(opCtx->getServiceContext(),
-                                                            lsid,
-                                                            txnNumber,
-                                                            scheduler.makeChildScheduler(),
-                                                            commitDeadline));
+    auto coordinator = std::make_shared<TransactionCoordinator>(
+        opCtx, lsid, txnNumber, scheduler.makeChildScheduler(), commitDeadline);
+
+    catalog.insert(opCtx, lsid, txnNumber, coordinator);
+}
+
+
+void TransactionCoordinatorService::reportCoordinators(OperationContext* opCtx,
+                                                       bool includeIdle,
+                                                       std::vector<BSONObj>* ops) {
+    std::shared_ptr<CatalogAndScheduler> cas;
+    try {
+        cas = _getCatalogAndScheduler(opCtx);
+    } catch (ExceptionFor<ErrorCodes::NotMaster>&) {
+        // If we are not master, don't include any output for transaction coordinators in
+        // the curOp command.
+        return;
+    }
+
+    auto& catalog = cas->catalog;
+
+    auto predicate =
+        [includeIdle](const LogicalSessionId lsid,
+                      const TxnNumber txnNumber,
+                      const std::shared_ptr<TransactionCoordinator> transactionCoordinator) {
+            TransactionCoordinator::Step step = transactionCoordinator->getStep();
+            if (includeIdle || step > TransactionCoordinator::Step::kInactive) {
+                return true;
+            }
+            return false;
+        };
+
+    auto reporter = [ops](const LogicalSessionId lsid,
+                          const TxnNumber txnNumber,
+                          const std::shared_ptr<TransactionCoordinator> transactionCoordinator) {
+        BSONObjBuilder doc;
+        transactionCoordinator->reportState(doc);
+        ops->push_back(doc.obj());
+    };
+
+    catalog.filter(predicate, reporter);
 }
 
 boost::optional<SharedSemiFuture<txn::CommitDecision>>
@@ -101,7 +134,8 @@ TransactionCoordinatorService::coordinateCommit(OperationContext* opCtx,
         return boost::none;
     }
 
-    coordinator->runCommit(std::vector<ShardId>{participantList.begin(), participantList.end()});
+    coordinator->runCommit(opCtx,
+                           std::vector<ShardId>{participantList.begin(), participantList.end()});
 
     return coordinator->onCompletion();
 
@@ -137,7 +171,7 @@ void TransactionCoordinatorService::onStepUp(OperationContext* opCtx,
                                              Milliseconds recoveryDelayForTesting) {
     joinPreviousRound();
 
-    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    stdx::lock_guard<Latch> lg(_mutex);
     invariant(!_catalogAndScheduler);
     _catalogAndScheduler = std::make_shared<CatalogAndScheduler>(opCtx->getServiceContext());
 
@@ -180,7 +214,7 @@ void TransactionCoordinatorService::onStepUp(OperationContext* opCtx,
                         const auto txnNumber = *doc.getId().getTxnNumber();
 
                         auto coordinator = std::make_shared<TransactionCoordinator>(
-                            service,
+                            opCtx,
                             lsid,
                             txnNumber,
                             scheduler.makeChildScheduler(),
@@ -200,7 +234,7 @@ void TransactionCoordinatorService::onStepUp(OperationContext* opCtx,
 
 void TransactionCoordinatorService::onStepDown() {
     {
-        stdx::lock_guard<stdx::mutex> lg(_mutex);
+        stdx::lock_guard<Latch> lg(_mutex);
         if (!_catalogAndScheduler)
             return;
 
@@ -215,7 +249,7 @@ void TransactionCoordinatorService::onShardingInitialization(OperationContext* o
     if (!isPrimary)
         return;
 
-    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    stdx::lock_guard<Latch> lg(_mutex);
 
     invariant(!_catalogAndScheduler);
     _catalogAndScheduler = std::make_shared<CatalogAndScheduler>(opCtx->getServiceContext());
@@ -226,7 +260,7 @@ void TransactionCoordinatorService::onShardingInitialization(OperationContext* o
 
 std::shared_ptr<TransactionCoordinatorService::CatalogAndScheduler>
 TransactionCoordinatorService::_getCatalogAndScheduler(OperationContext* opCtx) {
-    stdx::unique_lock<stdx::mutex> ul(_mutex);
+    stdx::unique_lock<Latch> ul(_mutex);
     uassert(
         ErrorCodes::NotMaster, "Transaction coordinator is not a primary", _catalogAndScheduler);
 

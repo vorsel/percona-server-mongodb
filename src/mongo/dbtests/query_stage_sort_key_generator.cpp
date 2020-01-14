@@ -72,13 +72,13 @@ BSONObj extractSortKey(const char* sortSpec, const char* doc, const CollatorInte
     auto mockStage = std::make_unique<QueuedDataStage>(opCtx.get(), &workingSet);
     auto wsid = workingSet.allocate();
     auto wsm = workingSet.get(wsid);
-    wsm->obj = Snapshotted<BSONObj>(SnapshotId(), fromjson(doc));
+    wsm->doc = {SnapshotId(), Document{fromjson(doc)}};
     wsm->transitionToOwnedObj();
     mockStage->pushBack(wsid);
 
     BSONObj sortPattern = fromjson(sortSpec);
     SortKeyGeneratorStage sortKeyGen{
-        pExpCtx, mockStage.release(), &workingSet, std::move(sortPattern)};
+        pExpCtx, std::move(mockStage), &workingSet, std::move(sortPattern)};
     return extractKeyFromKeyGenStage(&sortKeyGen, &workingSet);
 }
 
@@ -107,7 +107,7 @@ BSONObj extractSortKeyCovered(const char* sortSpec,
 
     BSONObj sortPattern = fromjson(sortSpec);
     SortKeyGeneratorStage sortKeyGen{
-        pExpCtx, mockStage.release(), &workingSet, std::move(sortPattern)};
+        pExpCtx, std::move(mockStage), &workingSet, std::move(sortPattern)};
     return extractKeyFromKeyGenStage(&sortKeyGen, &workingSet);
 }
 
@@ -155,7 +155,7 @@ TEST(SortKeyGeneratorStageTest, SortKeyArray) {
 TEST(SortKeyGeneratorStageTest, SortKeyCoveredNormal) {
     CollatorInterface* collator = nullptr;
     BSONObj actualOut = extractSortKeyCovered(
-        "{a: 1}", IndexKeyDatum(BSON("a" << 1), BSON("" << 5), nullptr), collator);
+        "{a: 1}", IndexKeyDatum(BSON("a" << 1), BSON("" << 5), 0, SnapshotId{}), collator);
     BSONObj expectedOut = BSON("" << 5);
     ASSERT_BSONOBJ_EQ(actualOut, expectedOut);
 }
@@ -164,7 +164,7 @@ TEST(SortKeyGeneratorStageTest, SortKeyCoveredEmbedded) {
     CollatorInterface* collator = nullptr;
     BSONObj actualOut = extractSortKeyCovered(
         "{'a.c': 1}",
-        IndexKeyDatum(BSON("a.c" << 1 << "c" << 1), BSON("" << 5 << "" << 6), nullptr),
+        IndexKeyDatum(BSON("a.c" << 1 << "c" << 1), BSON("" << 5 << "" << 6), 0, SnapshotId{}),
         collator);
     BSONObj expectedOut = BSON("" << 5);
     ASSERT_BSONOBJ_EQ(actualOut, expectedOut);
@@ -174,7 +174,7 @@ TEST(SortKeyGeneratorStageTest, SortKeyCoveredCompound) {
     CollatorInterface* collator = nullptr;
     BSONObj actualOut = extractSortKeyCovered(
         "{a: 1, c: 1}",
-        IndexKeyDatum(BSON("a" << 1 << "c" << 1), BSON("" << 5 << "" << 6), nullptr),
+        IndexKeyDatum(BSON("a" << 1 << "c" << 1), BSON("" << 5 << "" << 6), 0, SnapshotId{}),
         collator);
     BSONObj expectedOut = BSON("" << 5 << "" << 6);
     ASSERT_BSONOBJ_EQ(actualOut, expectedOut);
@@ -185,7 +185,8 @@ TEST(SortKeyGeneratorStageTest, SortKeyCoveredCompound2) {
     BSONObj actualOut = extractSortKeyCovered("{a: 1, b: 1}",
                                               IndexKeyDatum(BSON("a" << 1 << "b" << 1 << "c" << 1),
                                                             BSON("" << 5 << "" << 6 << "" << 4),
-                                                            nullptr),
+                                                            0,
+                                                            SnapshotId{}),
                                               collator);
     BSONObj expectedOut = BSON("" << 5 << "" << 6);
     ASSERT_BSONOBJ_EQ(actualOut, expectedOut);
@@ -197,7 +198,8 @@ TEST(SortKeyGeneratorStageTest, SortKeyCoveredCompound3) {
         extractSortKeyCovered("{b: 1, c: 1}",
                               IndexKeyDatum(BSON("a" << 1 << "b" << 1 << "c" << 1 << "d" << 1),
                                             BSON("" << 5 << "" << 6 << "" << 4 << "" << 9000),
-                                            nullptr),
+                                            0,
+                                            SnapshotId{}),
                               collator);
     BSONObj expectedOut = BSON("" << 6 << "" << 4);
     ASSERT_BSONOBJ_EQ(actualOut, expectedOut);
@@ -225,7 +227,8 @@ TEST(SortKeyGeneratorStageTest, CollatorAppliesWhenExtractingCoveredSortKeyStrin
                                               IndexKeyDatum(BSON("a" << 1 << "b" << 1),
                                                             BSON("" << 4 << ""
                                                                     << "foo"),
-                                                            nullptr),
+                                                            0,
+                                                            SnapshotId{}),
                                               &collator);
     BSONObj expectedOut = BSON(""
                                << "oof");

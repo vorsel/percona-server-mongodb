@@ -31,9 +31,7 @@ selector:
   - jstests/concurrency/fsm_workloads/map_reduce_inline.js
   - jstests/concurrency/fsm_workloads/map_reduce_interrupt.js
   - jstests/concurrency/fsm_workloads/map_reduce_merge.js
-  - jstests/concurrency/fsm_workloads/map_reduce_merge_nonatomic.js
   - jstests/concurrency/fsm_workloads/map_reduce_reduce.js
-  - jstests/concurrency/fsm_workloads/map_reduce_reduce_nonatomic.js
   - jstests/concurrency/fsm_workloads/map_reduce_replace.js
   - jstests/concurrency/fsm_workloads/map_reduce_replace_nonexistent.js
   - jstests/concurrency/fsm_workloads/map_reduce_replace_remove.js
@@ -79,6 +77,10 @@ selector:
 
   # reIndex is not supported in mongos.
   - jstests/concurrency/fsm_workloads/reindex.js
+  - jstests/concurrency/fsm_workloads/reindex_writeconflict.js
+
+  # The WTWriteConflictException failpoint is not supported on mongos.
+  - jstests/concurrency/fsm_workloads/collmod_writeconflict.js
 
   # our .remove(query, {justOne: true}) calls lack shard keys
   - jstests/concurrency/fsm_workloads/remove_single_document.js
@@ -106,6 +108,7 @@ selector:
 
   exclude_with_any_tags:
   - does_not_support_causal_consistency
+  - assumes_balancer_on
   # This suite uses secondary read preference, which isn't currently compatible with transactions.
   - uses_transactions
   - requires_replication

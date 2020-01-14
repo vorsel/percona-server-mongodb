@@ -31,6 +31,8 @@
 
 #include "mongo/db/query/query_solution.h"
 
+#include <boost/algorithm/string/join.hpp>
+
 #include "mongo/bson/bsontypes.h"
 #include "mongo/bson/mutable/document.h"
 #include "mongo/bson/simple_bsonelement_comparator.h"
@@ -848,6 +850,27 @@ bool IndexScanNode::operator==(const IndexScanNode& other) const {
 }
 
 //
+// ReturnKeyNode
+//
+
+void ReturnKeyNode::appendToString(str::stream* ss, int indent) const {
+    addIndent(ss, indent);
+    *ss << "RETURN_KEY\n";
+    addIndent(ss, indent + 1);
+    *ss << "sortKeyMetaFields = [" << boost::algorithm::join(sortKeyMetaFields, ", ") << "]\n";
+    addCommon(ss, indent);
+    addIndent(ss, indent + 1);
+    *ss << "Child:" << '\n';
+    children[0]->appendToString(ss, indent + 2);
+}
+
+QuerySolutionNode* ReturnKeyNode::clone() const {
+    auto copy = std::make_unique<ReturnKeyNode>(
+        std::unique_ptr<QuerySolutionNode>(children[0]->clone()), std::vector(sortKeyMetaFields));
+    return copy.release();
+}
+
+//
 // ProjectionNode
 //
 
@@ -974,7 +997,6 @@ QuerySolutionNode* SortNode::clone() const {
     copy->_sorts = this->_sorts;
     copy->pattern = this->pattern;
     copy->limit = this->limit;
-    copy->allowDiskUse = this->allowDiskUse;
 
     return copy;
 }

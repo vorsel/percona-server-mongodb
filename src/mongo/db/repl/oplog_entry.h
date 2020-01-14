@@ -121,6 +121,18 @@ public:
         getDurableReplOperation().setUpsert(std::move(value));
     }
 
+    void setTimestamp(Timestamp value) & {
+        getOpTimeAndWallTimeBase().setTimestamp(std::move(value));
+    }
+
+    void setTerm(boost::optional<std::int64_t> value) & {
+        getOpTimeAndWallTimeBase().setTerm(std::move(value));
+    }
+
+    void setWallClockTime(Date_t value) & {
+        getOpTimeAndWallTimeBase().setWallClockTime(std::move(value));
+    }
+
     /**
      * Sets the OpTime of the oplog entry.
      */
@@ -236,7 +248,7 @@ public:
                const boost::optional<BSONObj>& o2Field,
                const OperationSessionInfo& sessionInfo,
                const boost::optional<bool>& isUpsert,
-               const boost::optional<mongo::Date_t>& wallClockTime,
+               const mongo::Date_t& wallClockTime,
                const boost::optional<StmtId>& statementId,
                const boost::optional<OpTime>& prevWriteOpTimeInTransaction,
                const boost::optional<OpTime>& preImageOpTime,

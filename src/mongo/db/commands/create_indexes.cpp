@@ -44,7 +44,6 @@
 #include "mongo/db/catalog/multi_index_block.h"
 #include "mongo/db/command_generic_argument.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/commands/enable_coordinator_for_create_indexes_command_gen.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
@@ -74,7 +73,6 @@ constexpr auto kIndexesFieldName = "indexes"_sd;
 constexpr auto kCommandName = "createIndexes"_sd;
 constexpr auto kCommitQuorumFieldName = "commitQuorum"_sd;
 constexpr auto kIgnoreUnknownIndexOptionsName = "ignoreUnknownIndexOptions"_sd;
-constexpr auto kTwoPhaseCommandName = "twoPhaseCreateIndexes"_sd;
 constexpr auto kCreateCollectionAutomaticallyFieldName = "createdCollectionAutomatically"_sd;
 constexpr auto kNumIndexesBeforeFieldName = "numIndexesBefore"_sd;
 constexpr auto kNumIndexesAfterFieldName = "numIndexesAfter"_sd;
@@ -160,7 +158,6 @@ StatusWith<std::vector<BSONObj>> parseAndValidateIndexSpecs(
 
             hasIndexesField = true;
         } else if (kCommandName == cmdElemFieldName || kCommitQuorumFieldName == cmdElemFieldName ||
-                   kTwoPhaseCommandName == cmdElemFieldName ||
                    kIgnoreUnknownIndexOptionsName == cmdElemFieldName ||
                    isGenericArgument(cmdElemFieldName)) {
             continue;
@@ -400,12 +397,16 @@ Collection* getOrCreateCollection(OperationContext* opCtx,
     });
 }
 
-bool runCreateIndexes(OperationContext* opCtx,
-                      const std::string& dbname,
-                      const BSONObj& cmdObj,
-                      std::string& errmsg,
-                      BSONObjBuilder& result,
-                      bool runTwoPhaseBuild) {
+/**
+ * Creates indexes using the given specs for the mobile storage engine.
+ * TODO(SERVER-42513): Remove this function.
+ */
+bool runCreateIndexesForMobile(OperationContext* opCtx,
+                               const std::string& dbname,
+                               const BSONObj& cmdObj,
+                               std::string& errmsg,
+                               BSONObjBuilder& result,
+                               bool runTwoPhaseBuild) {
     NamespaceString ns(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
     uassertStatusOK(userAllowedWriteNS(ns));
 
@@ -489,7 +490,7 @@ bool runCreateIndexes(OperationContext* opCtx,
     // The 'indexer' can throw, so ensure the build cleanup occurs.
     ON_BLOCK_EXIT([&] {
         opCtx->recoveryUnit()->abandonSnapshot();
-        if (MONGO_FAIL_POINT(leaveIndexBuildUnfinishedForShutdown)) {
+        if (MONGO_unlikely(leaveIndexBuildUnfinishedForShutdown.shouldFail())) {
             // Set a flag to leave the persisted index build state intact when cleanUpAfterBuild()
             // is called below. The index build will be found on server startup.
             //
@@ -535,9 +536,9 @@ bool runCreateIndexes(OperationContext* opCtx,
         uassertStatusOK(indexer.insertAllDocumentsInCollection(opCtx, collection));
     }
 
-    if (MONGO_FAIL_POINT(hangAfterIndexBuildDumpsInsertsFromBulk)) {
+    if (MONGO_unlikely(hangAfterIndexBuildDumpsInsertsFromBulk.shouldFail())) {
         log() << "Hanging after dumping inserts from bulk builder";
-        MONGO_FAIL_POINT_PAUSE_WHILE_SET(hangAfterIndexBuildDumpsInsertsFromBulk);
+        hangAfterIndexBuildDumpsInsertsFromBulk.pauseWhileSet();
     }
 
     // Perform the first drain while holding an intent lock.
@@ -556,9 +557,9 @@ bool runCreateIndexes(OperationContext* opCtx,
         uassertStatusOK(indexer.drainBackgroundWrites(opCtx));
     }
 
-    if (MONGO_FAIL_POINT(hangAfterIndexBuildFirstDrain)) {
+    if (MONGO_unlikely(hangAfterIndexBuildFirstDrain.shouldFail())) {
         log() << "Hanging after index build first drain";
-        MONGO_FAIL_POINT_PAUSE_WHILE_SET(hangAfterIndexBuildFirstDrain);
+        hangAfterIndexBuildFirstDrain.pauseWhileSet();
     }
 
     // Perform the second drain while stopping writes on the collection.
@@ -577,9 +578,9 @@ bool runCreateIndexes(OperationContext* opCtx,
         uassertStatusOK(indexer.drainBackgroundWrites(opCtx));
     }
 
-    if (MONGO_FAIL_POINT(hangAfterIndexBuildSecondDrain)) {
+    if (MONGO_unlikely(hangAfterIndexBuildSecondDrain.shouldFail())) {
         log() << "Hanging after index build second drain";
-        MONGO_FAIL_POINT_PAUSE_WHILE_SET(hangAfterIndexBuildSecondDrain);
+        hangAfterIndexBuildSecondDrain.pauseWhileSet();
     }
 
     // Need to get exclusive collection lock back to complete the index build.
@@ -717,6 +718,7 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
             // this be a no-op.
             log() << "Index build interrupted: " << buildUUID << ": aborting index build.";
             auto abortIndexFuture = indexBuildsCoord->abortIndexBuildByBuildUUID(
+                opCtx,
                 buildUUID,
                 str::stream() << "Index build interrupted: " << buildUUID << ": "
                               << interruptionEx.toString());
@@ -727,6 +729,7 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
             log() << "Index build interrupted: " << buildUUID
                   << ": aborting index build due to change in replication state.";
             auto abortIndexFuture = indexBuildsCoord->abortIndexBuildByBuildUUID(
+                opCtx,
                 buildUUID,
                 str::stream() << "Index build interrupted due to change in replication state: "
                               << buildUUID << ": " << ex.toString());
@@ -815,13 +818,13 @@ public:
         bool shouldLogMessageOnAlreadyBuildingError = true;
         while (true) {
             try {
-                // TODO: SERVER-42513 Re-enable on mobile.
-                if (enableIndexBuildsCoordinatorForCreateIndexesCommand &&
-                    storageGlobalParams.engine != "mobile") {
-                    return runCreateIndexesWithCoordinator(
+                // TODO(SERVER-42513): Remove runCreateIndexesForMobile() when the mobile storage
+                // engine is supported by runCreateIndexesWithCoordinator().
+                if (storageGlobalParams.engine == "mobile") {
+                    return runCreateIndexesForMobile(
                         opCtx, dbname, cmdObj, errmsg, result, false /*two phase build*/);
                 }
-                return runCreateIndexes(
+                return runCreateIndexesWithCoordinator(
                     opCtx, dbname, cmdObj, errmsg, result, false /*two phase build*/);
             } catch (const DBException& ex) {
                 if (ex.toStatus() != ErrorCodes::IndexBuildAlreadyInProgress) {
@@ -852,50 +855,6 @@ public:
     }
 
 } cmdCreateIndex;
-
-/**
- * A temporary duplicate of the createIndexes command that runs two phase index builds for gradual
- * testing purposes. Otherwise, all of the necessary replication changes for the Simultaneous Index
- * Builds project would have to be turned on all at once because so much testing already exists that
- * would break with incremental changes.
- *
- * {twoPhaseCreateIndexes : "bar",
- *  indexes : [ { ns : "test.bar", key : { x : 1 }, name: "x_1" } ],
- *  commitQuorum: "majority" }
- */
-class CmdTwoPhaseCreateIndex : public ErrmsgCommandDeprecated {
-public:
-    CmdTwoPhaseCreateIndex() : ErrmsgCommandDeprecated(kTwoPhaseCommandName) {}
-
-    bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return true;
-    }
-
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
-        return AllowedOnSecondary::kNever;
-    }
-
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const override {
-        ActionSet actions;
-        actions.addAction(ActionType::createIndex);
-        Privilege p(parseResourcePattern(dbname, cmdObj), actions);
-        if (AuthorizationSession::get(client)->isAuthorizedForPrivilege(p))
-            return Status::OK();
-        return Status(ErrorCodes::Unauthorized, "Unauthorized");
-    }
-
-    bool errmsgRun(OperationContext* opCtx,
-                   const std::string& dbname,
-                   const BSONObj& cmdObj,
-                   std::string& errmsg,
-                   BSONObjBuilder& result) override {
-        return runCreateIndexesWithCoordinator(
-            opCtx, dbname, cmdObj, errmsg, result, true /*two phase build*/);
-    }
-
-} cmdTwoPhaseCreateIndex;
 
 }  // namespace
 }  // namespace mongo

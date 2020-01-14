@@ -79,11 +79,11 @@ Status SessionsCollectionConfigServer::_shardCollectionIfNeeded(OperationContext
 
 Status SessionsCollectionConfigServer::_generateIndexesIfNeeded(OperationContext* opCtx) {
     try {
-        scatterGatherOnlyVersionIfUnsharded(opCtx,
-                                            NamespaceString::kLogicalSessionsNamespace,
-                                            SessionsCollection::generateCreateIndexesCmd(),
-                                            ReadPreferenceSetting::get(opCtx),
-                                            Shard::RetryPolicy::kNoRetry);
+        dispatchCommandAssertCollectionExistsOnAtLeastOneShard(
+            opCtx,
+            NamespaceString::kLogicalSessionsNamespace,
+            SessionsCollection::generateCreateIndexesCmd());
+
         return Status::OK();
     } catch (const DBException& ex) {
         return ex.toStatus();
@@ -96,7 +96,7 @@ Status SessionsCollectionConfigServer::setupSessionsCollection(OperationContext*
         return {ErrorCodes::ShardingStateNotInitialized, "sharding state is not yet initialized"};
     }
 
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     {
         auto res = _shardCollectionIfNeeded(opCtx);
         if (!res.isOK()) {
@@ -107,8 +107,8 @@ Status SessionsCollectionConfigServer::setupSessionsCollection(OperationContext*
 
         res = _generateIndexesIfNeeded(opCtx);
         if (!res.isOK()) {
-            log() << "Failed to generate TTL index for config.system.sessions on all shards, "
-                  << "will try again on the next refresh interval";
+            log() << "Failed to generate TTL index for config.system.sessions on all shards: "
+                  << res.reason() << ", will try again on the next refresh interval";
         }
 
         return res;

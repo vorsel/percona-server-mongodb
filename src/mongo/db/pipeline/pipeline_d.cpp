@@ -67,7 +67,6 @@
 #include "mongo/db/pipeline/document_source_single_document_transformation.h"
 #include "mongo/db/pipeline/document_source_sort.h"
 #include "mongo/db/pipeline/pipeline.h"
-#include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_summary_stats.h"
@@ -146,12 +145,12 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> createRandomCursorEx
             sampleSize / (numRecords * kMaxSampleRatioForRandCursor), kMaxSampleRatioForRandCursor);
         // The trial plan is SHARDING_FILTER-MULTI_ITERATOR.
         auto randomCursorPlan =
-            std::make_unique<ShardFilterStage>(opCtx, shardMetadata, ws.get(), root.release());
+            std::make_unique<ShardFilterStage>(opCtx, shardMetadata, ws.get(), std::move(root));
         // The backup plan is SHARDING_FILTER-COLLSCAN.
         std::unique_ptr<PlanStage> collScanPlan = std::make_unique<CollectionScan>(
             opCtx, coll, CollectionScanParams{}, ws.get(), nullptr);
         collScanPlan = std::make_unique<ShardFilterStage>(
-            opCtx, shardMetadata, ws.get(), collScanPlan.release());
+            opCtx, shardMetadata, ws.get(), std::move(collScanPlan));
         // Place a TRIAL stage at the root of the plan tree, and pass it the trial and backup plans.
         root = std::make_unique<TrialStage>(opCtx,
                                             ws.get(),
@@ -878,19 +877,6 @@ void PipelineD::getPlanSummaryStats(const Pipeline* pipeline, PlanSummaryStats* 
     }
     statsOut->hasSortStage = hasSortStage;
     statsOut->usedDisk = usedDisk;
-}
-
-std::unique_ptr<CollatorInterface> PipelineD::resolveCollator(OperationContext* opCtx,
-                                                              BSONObj userCollation,
-                                                              const Collection* collection) {
-    if (!userCollation.isEmpty()) {
-        return uassertStatusOK(
-            CollatorFactoryInterface::get(opCtx->getServiceContext())->makeFromBSON(userCollation));
-    }
-
-    return (collection && collection->getDefaultCollator()
-                ? collection->getDefaultCollator()->clone()
-                : nullptr);
 }
 
 }  // namespace mongo

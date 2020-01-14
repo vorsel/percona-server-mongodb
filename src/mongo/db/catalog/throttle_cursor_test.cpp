@@ -46,6 +46,7 @@ namespace mongo {
 namespace {
 
 const NamespaceString kNss = NamespaceString("test.throttleCursor");
+const KeyString::Value kMinKeyString = KeyString::Value();
 
 class ThrottleCursorTest : public CatalogTestFixture {
 private:
@@ -59,7 +60,7 @@ public:
     int64_t getDifferenceInMillis(Date_t start, Date_t end);
     SortedDataInterfaceThrottleCursor getIdIndex(Collection* coll);
 
-    std::shared_ptr<DataThrottle> _dataThrottle;
+    DataThrottle _dataThrottle;
 };
 
 void ThrottleCursorTest::setUp() {
@@ -91,12 +92,9 @@ void ThrottleCursorTest::setUp() {
     clkSource->advance(Milliseconds(999));
 
     operationContext()->getServiceContext()->setFastClockSource(std::move(clkSource));
-
-    _dataThrottle = std::make_shared<DataThrottle>();
 }
 
 void ThrottleCursorTest::tearDown() {
-    _dataThrottle.reset();
     CatalogTestFixture::tearDown();
 }
 
@@ -117,7 +115,7 @@ SortedDataInterfaceThrottleCursor ThrottleCursorTest::getIdIndex(Collection* col
     const IndexCatalogEntry* idEntry = coll->getIndexCatalog()->getEntry(idDesc);
     const IndexAccessMethod* iam = idEntry->accessMethod();
 
-    return SortedDataInterfaceThrottleCursor(operationContext(), iam, _dataThrottle);
+    return SortedDataInterfaceThrottleCursor(operationContext(), iam, &_dataThrottle);
 }
 
 TEST_F(ThrottleCursorTest, TestSeekableRecordThrottleCursorOff) {
@@ -129,7 +127,7 @@ TEST_F(ThrottleCursorTest, TestSeekableRecordThrottleCursorOff) {
     FailPointEnableBlock failPoint("fixedCursorDataSizeOf512KBForDataThrottle");
 
     SeekableRecordThrottleCursor cursor =
-        SeekableRecordThrottleCursor(opCtx, coll->getRecordStore(), _dataThrottle);
+        SeekableRecordThrottleCursor(opCtx, coll->getRecordStore(), &_dataThrottle);
 
     // With the data throttle off, all operations should finish within a second.
     setMaxMbPerSec(0);
@@ -162,7 +160,7 @@ TEST_F(ThrottleCursorTest, TestSeekableRecordThrottleCursorOn) {
     FailPointEnableBlock failPoint("fixedCursorDataSizeOf512KBForDataThrottle");
 
     SeekableRecordThrottleCursor cursor =
-        SeekableRecordThrottleCursor(opCtx, coll->getRecordStore(), _dataThrottle);
+        SeekableRecordThrottleCursor(opCtx, coll->getRecordStore(), &_dataThrottle);
 
     // Using a throttle with a limit of 1MB per second, all operations should take at least 5
     // seconds to finish. We have 10 records, each of which is 0.5MB courtesy of the fail point, so
@@ -219,7 +217,7 @@ TEST_F(ThrottleCursorTest, TestSortedDataInterfaceThrottleCursorOff) {
     setMaxMbPerSec(0);
     Date_t start = getTime();
 
-    ASSERT_TRUE(cursor.seek(opCtx, BSONObj()));
+    ASSERT_TRUE(cursor.seek(opCtx, kMinKeyString));
     int numRecords = 1;
 
     while (cursor.next(opCtx)) {
@@ -249,7 +247,7 @@ TEST_F(ThrottleCursorTest, TestSortedDataInterfaceThrottleCursorOn) {
         setMaxMbPerSec(1);
         Date_t start = getTime();
 
-        ASSERT_TRUE(cursor.seek(opCtx, BSONObj()));
+        ASSERT_TRUE(cursor.seek(opCtx, kMinKeyString));
         int numRecords = 1;
 
         while (cursor.next(opCtx)) {
@@ -269,7 +267,7 @@ TEST_F(ThrottleCursorTest, TestSortedDataInterfaceThrottleCursorOn) {
         setMaxMbPerSec(5);
         Date_t start = getTime();
 
-        ASSERT_TRUE(cursor.seek(opCtx, BSONObj()));
+        ASSERT_TRUE(cursor.seek(opCtx, kMinKeyString));
         int numRecords = 1;
 
         while (cursor.next(opCtx)) {
@@ -292,17 +290,17 @@ TEST_F(ThrottleCursorTest, TestMixedCursorsWithSharedThrottleOff) {
     FailPointEnableBlock failPoint("fixedCursorDataSizeOf512KBForDataThrottle");
 
     SeekableRecordThrottleCursor recordCursor =
-        SeekableRecordThrottleCursor(opCtx, coll->getRecordStore(), _dataThrottle);
+        SeekableRecordThrottleCursor(opCtx, coll->getRecordStore(), &_dataThrottle);
 
     SortedDataInterfaceThrottleCursor indexCursor = getIdIndex(coll);
 
     // With the data throttle off, all operations should finish within a second, regardless if
     // the 'maxValidateMBperSec' server parameter is set.
-    _dataThrottle->turnThrottlingOff();
+    _dataThrottle.turnThrottlingOff();
     setMaxMbPerSec(10);
     Date_t start = getTime();
 
-    ASSERT_TRUE(indexCursor.seek(opCtx, BSONObj()));
+    ASSERT_TRUE(indexCursor.seek(opCtx, kMinKeyString));
     int numRecords = 1;
 
     while (indexCursor.next(opCtx)) {
@@ -334,7 +332,7 @@ TEST_F(ThrottleCursorTest, TestMixedCursorsWithSharedThrottleOn) {
     FailPointEnableBlock failPoint("fixedCursorDataSizeOf512KBForDataThrottle");
 
     SeekableRecordThrottleCursor recordCursor =
-        SeekableRecordThrottleCursor(opCtx, coll->getRecordStore(), _dataThrottle);
+        SeekableRecordThrottleCursor(opCtx, coll->getRecordStore(), &_dataThrottle);
 
     SortedDataInterfaceThrottleCursor indexCursor = getIdIndex(coll);
 
@@ -345,7 +343,7 @@ TEST_F(ThrottleCursorTest, TestMixedCursorsWithSharedThrottleOn) {
         setMaxMbPerSec(2);
         Date_t start = getTime();
 
-        ASSERT_TRUE(indexCursor.seek(opCtx, BSONObj()));
+        ASSERT_TRUE(indexCursor.seek(opCtx, kMinKeyString));
         ASSERT_TRUE(recordCursor.seekExact(opCtx, RecordId(1)));
         int numRecords = 2;
 
@@ -367,7 +365,7 @@ TEST_F(ThrottleCursorTest, TestMixedCursorsWithSharedThrottleOn) {
         setMaxMbPerSec(5);
         Date_t start = getTime();
 
-        ASSERT_TRUE(indexCursor.seek(opCtx, BSONObj()));
+        ASSERT_TRUE(indexCursor.seek(opCtx, kMinKeyString));
         ASSERT_TRUE(recordCursor.seekExact(opCtx, RecordId(1)));
         int numRecords = 2;
 

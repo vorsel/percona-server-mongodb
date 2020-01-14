@@ -82,11 +82,9 @@ public:
                                                        bool dupsAllowed) override;
     virtual Status insert(OperationContext* opCtx,
                           const KeyString::Value& keyString,
-                          const RecordId& loc,
                           bool dupsAllowed) override;
     virtual void unindex(OperationContext* opCtx,
                          const KeyString::Value& keyString,
-                         const RecordId& loc,
                          bool dupsAllowed) override;
     virtual Status dupKeyCheck(OperationContext* opCtx, const KeyString::Value& keyString) override;
     virtual void fullValidate(OperationContext* opCtx,
@@ -120,17 +118,14 @@ public:
                std::string KSForIdentEnd);
         virtual void setEndPosition(const BSONObj& key, bool inclusive) override;
         virtual boost::optional<IndexKeyEntry> next(RequestedInfo parts = kKeyAndLoc) override;
-        virtual boost::optional<IndexKeyEntry> seek(const BSONObj& key,
-                                                    bool inclusive,
-                                                    RequestedInfo parts = kKeyAndLoc) override;
         virtual boost::optional<IndexKeyEntry> seek(const KeyString::Value& keyString,
                                                     RequestedInfo parts = kKeyAndLoc) override;
         virtual boost::optional<KeyStringEntry> seekForKeyString(
             const KeyString::Value& keyStringValue) override;
-        virtual boost::optional<IndexKeyEntry> seekExact(const BSONObj& key,
-                                                         RequestedInfo parts = kKeyAndLoc) override;
-        virtual boost::optional<KeyStringEntry> seekExact(
+        virtual boost::optional<KeyStringEntry> seekExactForKeyString(
             const KeyString::Value& keyStringValue) override;
+        virtual boost::optional<IndexKeyEntry> seekExact(const KeyString::Value& keyStringValue,
+                                                         RequestedInfo) override;
         virtual void save() override;
         virtual void restore() override;
         virtual void detachFromOperationContext() override;

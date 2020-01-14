@@ -27,12 +27,15 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/storage/wiredtiger/wiredtiger_cursor.h"
 
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -48,15 +51,40 @@ WiredTigerCursor::WiredTigerCursor(const std::string& uri,
         (_ru->getTimestampReadSource() == WiredTigerRecoveryUnit::ReadSource::kCheckpoint);
 
     str::stream builder;
-    builder << ((allowOverwrite) ? "" : "overwrite=false,");
-    builder << ((_readOnce) ? "read_once=true," : "");
-    builder << ((_isCheckpoint) ? "checkpoint=WiredTigerCheckpoint," : "");
+    if (_readOnce) {
+        builder << "read_once=true,";
+    }
+    if (_isCheckpoint) {
+        // Type can be "lsm" or "file".
+        std::string type, sourceURI;
+        WiredTigerUtil::fetchTypeAndSourceURI(opCtx, uri, &type, &sourceURI);
+        uassert(ErrorCodes::InvalidOptions,
+                str::stream() << "LSM does not support opening cursors by checkpoint",
+                type != "lsm");
+
+        builder << "checkpoint=WiredTigerCheckpoint,";
+    }
+    // Add this option last to avoid needing a trailing comma. This enables an optimization in
+    // WiredTiger to skip parsing the config string. See SERVER-43232 for details.
+    if (!allowOverwrite) {
+        builder << "overwrite=false";
+    }
 
     const std::string config = builder;
-    if (_readOnce || _isCheckpoint) {
-        _cursor = _session->getNewCursor(uri, config.c_str());
-    } else {
-        _cursor = _session->getCachedCursor(uri, tableID, config.c_str());
+    try {
+        if (_readOnce || _isCheckpoint) {
+            _cursor = _session->getNewCursor(uri, config.c_str());
+        } else {
+            _cursor = _session->getCachedCursor(uri, tableID, config.c_str());
+        }
+    } catch (const ExceptionFor<ErrorCodes::CursorNotFound>& ex) {
+        // A WiredTiger table will not be available in the latest checkpoint if the checkpoint
+        // thread hasn't ran after the initial WiredTiger table was created.
+        if (!_isCheckpoint) {
+            error() << ex;
+            fassertFailedNoTrace(50883);
+        }
+        throw;
     }
 }
 

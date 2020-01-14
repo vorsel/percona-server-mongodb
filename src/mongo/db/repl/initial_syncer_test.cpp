@@ -60,7 +60,7 @@
 #include "mongo/db/service_context_test_fixture.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/fail_point_service.h"
@@ -104,9 +104,9 @@ using executor::RemoteCommandRequest;
 using executor::RemoteCommandResponse;
 using unittest::log;
 
-using LockGuard = stdx::lock_guard<stdx::mutex>;
+using LockGuard = stdx::lock_guard<Latch>;
 using NetworkGuard = executor::NetworkInterfaceMock::InNetworkGuard;
-using UniqueLock = stdx::unique_lock<stdx::mutex>;
+using UniqueLock = stdx::unique_lock<Latch>;
 
 struct CollectionCloneInfo {
     std::shared_ptr<CollectionMockStats> stats = std::make_shared<CollectionMockStats>();
@@ -244,7 +244,9 @@ protected:
         int documentsInsertedCount = 0;
     };
 
-    stdx::mutex _storageInterfaceWorkDoneMutex;  // protects _storageInterfaceWorkDone.
+    // protects _storageInterfaceWorkDone.
+    Mutex _storageInterfaceWorkDoneMutex =
+        MONGO_MAKE_LATCH("InitialSyncerTest::_storageInterfaceWorkDoneMutex");
     StorageInterfaceResults _storageInterfaceWorkDone;
 
     void setUp() override {
@@ -1429,7 +1431,10 @@ TEST_F(InitialSyncerTest,
     }
 
     initialSyncer->join();
-    ASSERT_EQUALS(ErrorCodes::NoSuchKey, _lastApplied);
+
+    // OpTimeAndWallTime now uses the IDL parser, so the status code returned is from
+    // IDLParserErrorContext
+    ASSERT_EQUALS(_lastApplied.getStatus().code(), 40414);
 }
 
 TEST_F(InitialSyncerTest,
@@ -1888,7 +1893,7 @@ TEST_F(InitialSyncerTest,
     ASSERT_OK(_lastApplied.getStatus());
     auto dummyEntry = makeOplogEntry(1);
     ASSERT_EQUALS(dummyEntry.getOpTime(), _lastApplied.getValue().opTime);
-    ASSERT_EQUALS(dummyEntry.getWallClockTime().get(), _lastApplied.getValue().wallTime);
+    ASSERT_EQUALS(dummyEntry.getWallClockTime(), _lastApplied.getValue().wallTime);
 }
 
 TEST_F(
@@ -1954,7 +1959,7 @@ TEST_F(
     ASSERT_OK(_lastApplied.getStatus());
     auto dummyEntry = makeOplogEntry(3);
     ASSERT_EQUALS(dummyEntry.getOpTime(), _lastApplied.getValue().opTime);
-    ASSERT_EQUALS(dummyEntry.getWallClockTime().get(), _lastApplied.getValue().wallTime);
+    ASSERT_EQUALS(dummyEntry.getWallClockTime(), _lastApplied.getValue().wallTime);
 }
 
 TEST_F(
@@ -3222,7 +3227,7 @@ TEST_F(InitialSyncerTest, LastOpTimeShouldBeSetEvenIfNoOperationsAreAppliedAfter
     initialSyncer->join();
     ASSERT_OK(_lastApplied.getStatus());
     ASSERT_EQUALS(oplogEntry.getOpTime(), _lastApplied.getValue().opTime);
-    ASSERT_EQUALS(oplogEntry.getWallClockTime().get(), _lastApplied.getValue().wallTime);
+    ASSERT_EQUALS(oplogEntry.getWallClockTime(), _lastApplied.getValue().wallTime);
     ASSERT_FALSE(_replicationProcess->getConsistencyMarkers()->getInitialSyncFlag(opCtx.get()));
 }
 
@@ -3495,7 +3500,7 @@ TEST_F(
 
     // Enable 'rsSyncApplyStop' so that _getNextApplierBatch_inlock() returns an empty batch of
     // operations instead of a batch containing an oplog entry with a bad version.
-    auto failPoint = getGlobalFailPointRegistry()->getFailPoint("rsSyncApplyStop");
+    auto failPoint = globalFailPointRegistry().find("rsSyncApplyStop");
     failPoint->setMode(FailPoint::alwaysOn);
     ON_BLOCK_EXIT([failPoint]() { failPoint->setMode(FailPoint::off); });
 
@@ -3823,7 +3828,7 @@ void InitialSyncerTest::doSuccessfulInitialSyncWithOneBatch() {
     serverGlobalParams.featureCompatibility.reset();
     ASSERT_OK(_lastApplied.getStatus());
     ASSERT_EQUALS(lastOp.getOpTime(), _lastApplied.getValue().opTime);
-    ASSERT_EQUALS(lastOp.getWallClockTime().get(), _lastApplied.getValue().wallTime);
+    ASSERT_EQUALS(lastOp.getWallClockTime(), _lastApplied.getValue().wallTime);
 
     ASSERT_EQUALS(lastOp.getOpTime().getTimestamp(), _storageInterface->getInitialDataTimestamp());
 }
@@ -3945,7 +3950,7 @@ TEST_F(InitialSyncerTest,
     initialSyncer->join();
     ASSERT_OK(_lastApplied.getStatus());
     ASSERT_EQUALS(lastOp.getOpTime(), _lastApplied.getValue().opTime);
-    ASSERT_EQUALS(lastOp.getWallClockTime().get(), _lastApplied.getValue().wallTime);
+    ASSERT_EQUALS(lastOp.getWallClockTime(), _lastApplied.getValue().wallTime);
 }
 
 TEST_F(InitialSyncerTest,
@@ -3954,7 +3959,7 @@ TEST_F(InitialSyncerTest,
     auto opCtx = makeOpCtx();
 
     // This fail point makes chooseSyncSourceCallback fail with an InvalidSyncSource error.
-    auto failPoint = getGlobalFailPointRegistry()->getFailPoint("failInitialSyncWithBadHost");
+    auto failPoint = globalFailPointRegistry().find("failInitialSyncWithBadHost");
     failPoint->setMode(FailPoint::alwaysOn);
     ON_BLOCK_EXIT([failPoint]() { failPoint->setMode(FailPoint::off); });
 
@@ -4270,7 +4275,7 @@ TEST_F(InitialSyncerTest, GetInitialSyncProgressReturnsCorrectProgress) {
     ASSERT_OK(_lastApplied.getStatus());
     auto dummyEntry = makeOplogEntry(7);
     ASSERT_EQUALS(dummyEntry.getOpTime(), _lastApplied.getValue().opTime);
-    ASSERT_EQUALS(dummyEntry.getWallClockTime().get(), _lastApplied.getValue().wallTime);
+    ASSERT_EQUALS(dummyEntry.getWallClockTime(), _lastApplied.getValue().wallTime);
 
     progress = initialSyncer->getInitialSyncProgress();
     log() << "Progress at end: " << progress;

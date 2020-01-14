@@ -122,7 +122,8 @@ public:
             WorkingSetID id = ws.allocate();
             WorkingSetMember* mockMember = ws.get(id);
             mockMember->recordId = *recordIds.begin();
-            mockMember->obj = coll->docFor(&_opCtx, mockMember->recordId);
+            auto snapshotBson = coll->docFor(&_opCtx, mockMember->recordId);
+            mockMember->doc = {snapshotBson.snapshotId(), Document{snapshotBson.value()}};
             ws.transitionToRecordIdAndObj(id);
             // Points into our DB.
             mockStage->pushBack(id);
@@ -131,14 +132,14 @@ public:
             WorkingSetID id = ws.allocate();
             WorkingSetMember* mockMember = ws.get(id);
             mockMember->recordId = RecordId();
-            mockMember->obj = Snapshotted<BSONObj>(SnapshotId(), BSON("foo" << 6));
+            mockMember->doc = {SnapshotId(), Document{BSON("foo" << 6)}};
             mockMember->transitionToOwnedObj();
-            ASSERT_TRUE(mockMember->obj.value().isOwned());
+            ASSERT_TRUE(mockMember->doc.value().isOwned());
             mockStage->pushBack(id);
         }
 
-        unique_ptr<FetchStage> fetchStage(
-            new FetchStage(&_opCtx, &ws, mockStage.release(), nullptr, coll));
+        auto fetchStage =
+            std::make_unique<FetchStage>(&_opCtx, &ws, std::move(mockStage), nullptr, coll);
 
         WorkingSetID id = WorkingSet::INVALID_ID;
         PlanStage::StageState state;
@@ -206,8 +207,8 @@ public:
         unique_ptr<MatchExpression> filterExpr = std::move(statusWithMatcher.getValue());
 
         // Matcher requires that foo==6 but we only have data with foo==5.
-        unique_ptr<FetchStage> fetchStage(
-            new FetchStage(&_opCtx, &ws, mockStage.release(), filterExpr.get(), coll));
+        auto fetchStage = std::make_unique<FetchStage>(
+            &_opCtx, &ws, std::move(mockStage), filterExpr.get(), coll);
 
         // First call should return a fetch request as it's not in memory.
         WorkingSetID id = WorkingSet::INVALID_ID;

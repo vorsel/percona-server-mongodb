@@ -38,6 +38,12 @@ selector:
 
   # This workload assumes no locks are taken outside of the workload.
   - jstests/concurrency/fsm_workloads/access_collection_in_transaction_after_catalog_changes.js
+
+  # SERVER-43053 These workloads set a failpoint that causes intermittent WriteConflict errors,
+  # which presently can cause other simultaneous workloads to fail.
+  - jstests/concurrency/fsm_workloads/collmod_writeconflict.js
+  - jstests/concurrency/fsm_workloads/reindex_writeconflict.js
+
   exclude_with_any_tags:
   - requires_sharding
 
@@ -73,6 +79,9 @@ executor:
     mongod_options:
       oplogSize: 1024
       set_parameters:
+        # Increase the timeout of the cursor so that the cursor will continue to stay alive even
+        # when there is a delay in lock acquisition during a getMore command.
+        cursorTimeoutMillis: 3600000
         enableTestCommands: 1
         # We have historically had deadlocks occur due to lock acquisition issues involving the
         # system running out of WiredTiger write tickets. We intentionally lower the number of

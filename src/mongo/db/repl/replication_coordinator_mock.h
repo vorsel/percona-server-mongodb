@@ -275,6 +275,8 @@ public:
 
     virtual size_t getNumUncommittedSnapshots() override;
 
+    virtual void createWMajorityWriteAvailabilityDateWaiter(OpTime opTime) override;
+
     virtual WriteConcernOptions populateUnsetWriteConcernOptionsSyncMode(
         WriteConcernOptions wc) override;
 
@@ -314,6 +316,8 @@ public:
     virtual bool setContainsArbiter() const override;
 
     virtual void attemptToAdvanceStableTimestamp() override;
+
+    virtual void finishRecoveryIfEligible(OperationContext* opCtx) override;
 
     virtual void setCanAcceptNonLocalWrites(bool canAcceptNonLocalWrites);
 

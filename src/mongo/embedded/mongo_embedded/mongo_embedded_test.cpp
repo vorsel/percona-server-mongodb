@@ -52,6 +52,7 @@
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/shared_buffer.h"
 #include "mongo/util/signal_handlers_synchronous.h"
+#include "mongo/util/text.h"
 
 namespace moe = mongo::optionenvironment;
 
@@ -561,71 +562,69 @@ TEST_F(MongodbCAPITest, InsertAndUpdate) {
 TEST_F(MongodbCAPITest, RunListCommands) {
     auto client = createClient();
 
-    std::vector<std::string> whitelist = {
-        "_hashBSONElement",
-        "auditGetOptions",
-        "logApplicationMessage",
-        "aggregate",
-        "buildInfo",
-        "collMod",
-        "collStats",
-        "configureFailPoint",
-        "count",
-        "create",
-        "createIndexes",
-        "currentOp",
-        "dataSize",
-        "dbStats",
-        "delete",
-        "distinct",
-        "drop",
-        "dropDatabase",
-        "dropIndexes",
-        "echo",
-        "endSessions",
-        "explain",
-        "find",
-        "findAndModify",
-        "getLastError",
-        "getMore",
-        "getParameter",
-        "httpClientRequest",
-        "insert",
-        "isMaster",
-        "killCursors",
-        "killOp",
-        "killSessions",
-        "killAllSessions",
-        "killAllSessionsByPattern",
-        "listCollections",
-        "listCommands",
-        "listDatabases",
-        "listIndexes",
-        "lockInfo",
-        "ping",
-        "planCacheClear",
-        "planCacheClearFilters",
-        "planCacheListFilters",
-        "planCacheListPlans",
-        "planCacheListQueryShapes",
-        "planCacheSetFilter",
-        "reIndex",
-        "refreshLogicalSessionCacheNow",
-        "refreshSessions",
-        "renameCollection",
-        "repairCursor",
-        "repairDatabase",
-        "resetError",
-        "serverStatus",
-        "setBatteryLevel",
-        "setParameter",
-        "sleep",
-        "startSession",
-        "trimMemory",
-        "twoPhaseCreateIndexes",
-        "update",
-        "validate",
-    };
+    std::vector<std::string> whitelist = {"_hashBSONElement",
+                                          "auditGetOptions",
+                                          "logApplicationMessage",
+                                          "aggregate",
+                                          "buildInfo",
+                                          "collMod",
+                                          "collStats",
+                                          "configureFailPoint",
+                                          "count",
+                                          "create",
+                                          "createIndexes",
+                                          "currentOp",
+                                          "dataSize",
+                                          "dbStats",
+                                          "delete",
+                                          "distinct",
+                                          "drop",
+                                          "dropDatabase",
+                                          "dropIndexes",
+                                          "echo",
+                                          "endSessions",
+                                          "explain",
+                                          "find",
+                                          "findAndModify",
+                                          "getLastError",
+                                          "getMore",
+                                          "getParameter",
+                                          "httpClientRequest",
+                                          "insert",
+                                          "isMaster",
+                                          "killCursors",
+                                          "killOp",
+                                          "killSessions",
+                                          "killAllSessions",
+                                          "killAllSessionsByPattern",
+                                          "listCollections",
+                                          "listCommands",
+                                          "listDatabases",
+                                          "listIndexes",
+                                          "lockInfo",
+                                          "ping",
+                                          "planCacheClear",
+                                          "planCacheClearFilters",
+                                          "planCacheListFilters",
+                                          "planCacheListPlans",
+                                          "planCacheListQueryShapes",
+                                          "planCacheSetFilter",
+                                          "reIndex",
+                                          "refreshLogicalSessionCacheNow",
+                                          "refreshSessions",
+                                          "renameCollection",
+                                          "repairDatabase",
+                                          "resetError",
+                                          "serverStatus",
+                                          "setBatteryLevel",
+                                          "setParameter",
+                                          "sleep",
+                                          "startSession",
+                                          "trimMemory",
+                                          "update",
+                                          "validate",
+                                          "whatsmysni"};
+
     std::sort(whitelist.begin(), whitelist.end());
 
     mongo::BSONObj listCommandsObj = mongo::fromjson("{ listCommands: 1 }");
@@ -664,8 +663,8 @@ TEST_F(MongodbCAPITest, RunListCommands) {
         std::cout << cmd << "\n";
     }
 
-    ASSERT(missing.empty());
-    ASSERT(unsupported.empty());
+    ASSERT(missing.empty()) << mongo::StringSplitter::join(missing, ", ");
+    ASSERT(unsupported.empty()) << mongo::StringSplitter::join(unsupported, ", ");
 }
 
 // This test is temporary to make sure that only one database can be created

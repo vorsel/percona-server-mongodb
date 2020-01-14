@@ -101,6 +101,7 @@ MONGO_FAIL_POINT_DEFINE(respondWithNotPrimaryInCommandDispatch);
 MONGO_FAIL_POINT_DEFINE(skipCheckingForNotMasterInCommandDispatch);
 MONGO_FAIL_POINT_DEFINE(waitAfterReadCommandFinishesExecution);
 MONGO_FAIL_POINT_DEFINE(sleepMillisAfterCommandExecutionBegins);
+MONGO_FAIL_POINT_DEFINE(waitAfterNewStatementBlocksBehindPrepare);
 
 // Tracks the number of times a legacy unacknowledged write failed due to
 // not master error resulted in network disconnection.
@@ -227,7 +228,7 @@ private:
  */
 StatusWith<repl::ReadConcernArgs> _extractReadConcern(const CommandInvocation* invocation,
                                                       const BSONObj& cmdObj,
-                                                      bool upconvertToSnapshot) {
+                                                      bool startTransaction) {
     repl::ReadConcernArgs readConcernArgs;
 
     auto readConcernParseStatus = readConcernArgs.initialize(cmdObj);
@@ -235,26 +236,31 @@ StatusWith<repl::ReadConcernArgs> _extractReadConcern(const CommandInvocation* i
         return readConcernParseStatus;
     }
 
-    if (upconvertToSnapshot) {
-        auto upconvertToSnapshotStatus = readConcernArgs.upconvertReadConcernLevelToSnapshot();
-        if (!upconvertToSnapshotStatus.isOK()) {
-            return upconvertToSnapshotStatus;
-        }
+    auto readConcernLevel = readConcernArgs.getLevel();
+    if (startTransaction && readConcernLevel != repl::ReadConcernLevel::kSnapshotReadConcern &&
+        readConcernLevel != repl::ReadConcernLevel::kMajorityReadConcern &&
+        readConcernLevel != repl::ReadConcernLevel::kLocalReadConcern) {
+        return Status(
+            ErrorCodes::InvalidOptions,
+            "The readConcern level must be either 'local' (default), 'majority' or 'snapshot' in "
+            "order to run in a transaction");
     }
 
-    if (!invocation->supportsReadConcern(readConcernArgs.getLevel())) {
-        // We must be in a transaction if the readConcern level was upconverted to snapshot and the
-        // command must support readConcern level snapshot in order to be supported in transactions.
-        if (upconvertToSnapshot) {
-            return {
-                ErrorCodes::OperationNotSupportedInTransaction,
-                str::stream() << "Command is not supported as the first command in a transaction"};
-        }
+    if (startTransaction && readConcernArgs.getArgsOpTime()) {
+        return Status(ErrorCodes::InvalidOptions,
+                      str::stream()
+                          << "The readConcern cannot specify '"
+                          << repl::ReadConcernArgs::kAfterOpTimeFieldName << "' in a transaction");
+    }
+
+    // There is no need to check if the command supports the read concern while in a transaction
+    // because all commands that are allowed to run in a transaction must support all the read
+    // concerns that can be used with a transaction.
+    if (!startTransaction && !invocation->supportsReadConcern(readConcernLevel)) {
         return {ErrorCodes::InvalidOptions,
                 str::stream() << "Command does not support read concern "
                               << readConcernArgs.toString()};
     }
-
 
     // If this command invocation asked for 'majority' read concern, supports blocking majority
     // reads, and storage engine support for majority reads is disabled, then we set the majority
@@ -409,10 +415,31 @@ void invokeWithSessionCheckedOut(OperationContext* opCtx,
     auto txnParticipant = TransactionParticipant::get(opCtx);
 
     if (!opCtx->getClient()->isInDirectClient()) {
-        txnParticipant.beginOrContinue(opCtx,
-                                       *sessionOptions.getTxnNumber(),
-                                       sessionOptions.getAutocommit(),
-                                       sessionOptions.getStartTransaction());
+        bool beganOrContinuedTxn{false};
+        // This loop allows new transactions on a session to block behind a previous prepared
+        // transaction on that session.
+        while (!beganOrContinuedTxn) {
+            try {
+                txnParticipant.beginOrContinue(opCtx,
+                                               *sessionOptions.getTxnNumber(),
+                                               sessionOptions.getAutocommit(),
+                                               sessionOptions.getStartTransaction());
+                beganOrContinuedTxn = true;
+            } catch (const ExceptionFor<ErrorCodes::PreparedTransactionInProgress>&) {
+                auto prepareCompleted = txnParticipant.onExitPrepare();
+
+                CurOpFailpointHelpers::waitWhileFailPointEnabled(
+                    &waitAfterNewStatementBlocksBehindPrepare,
+                    opCtx,
+                    "waitAfterNewStatementBlocksBehindPrepare");
+
+                // Check the session back in and wait for ongoing prepared transaction to complete.
+                MongoDOperationContextSession::checkIn(opCtx);
+                prepareCompleted.wait(opCtx);
+                MongoDOperationContextSession::checkOut(opCtx);
+            }
+        }
+
         // Create coordinator if needed. If "startTransaction" is present, it must be true.
         if (sessionOptions.getStartTransaction()) {
             // If this shard has been selected as the coordinator, set up the coordinator state
@@ -547,16 +574,23 @@ bool runCommandImpl(OperationContext* opCtx,
         }
 
         auto waitForWriteConcern = [&](auto&& bb) {
-            MONGO_FAIL_POINT_BLOCK_IF(failCommand, data, [&](const BSONObj& data) {
-                return CommandHelpers::shouldActivateFailCommandFailPoint(
-                           data, request.getCommandName(), opCtx->getClient(), invocation->ns()) &&
-                    data.hasField("writeConcernError");
-            }) {
-                bb.append(data.getData()["writeConcernError"]);
-                return;  // Don't do normal waiting.
+            bool reallyWait = true;
+            failCommand.executeIf(
+                [&](const BSONObj& data) {
+                    bb.append(data["writeConcernError"]);
+                    reallyWait = false;
+                },
+                [&](const BSONObj& data) {
+                    return CommandHelpers::shouldActivateFailCommandFailPoint(
+                               data,
+                               request.getCommandName(),
+                               opCtx->getClient(),
+                               invocation->ns()) &&
+                        data.hasField("writeConcernError");
+                });
+            if (reallyWait) {
+                behaviors.waitForWriteConcern(opCtx, invocation, lastOpBeforeRun, bb);
             }
-
-            behaviors.waitForWriteConcern(opCtx, invocation, lastOpBeforeRun, bb);
         };
 
         try {
@@ -596,8 +630,7 @@ bool runCommandImpl(OperationContext* opCtx,
     // This failpoint should affect both getMores and commands which are read-only and thus don't
     // support writeConcern.
     if (!shouldWaitForWriteConcern || command->getLogicalOp() == LogicalOp::opGetMore) {
-        MONGO_FAIL_POINT_BLOCK(waitAfterReadCommandFinishesExecution, options) {
-            const BSONObj& data = options.getData();
+        waitAfterReadCommandFinishesExecution.execute([&](const BSONObj& data) {
             auto db = data["db"].str();
             if (db.empty() || request.getDatabase() == db) {
                 CurOpFailpointHelpers::waitWhileFailPointEnabled(
@@ -605,7 +638,7 @@ bool runCommandImpl(OperationContext* opCtx,
                     opCtx,
                     "waitAfterReadCommandFinishesExecution");
             }
-        }
+        });
     }
 
     behaviors.waitForLinearizableReadConcern(opCtx);
@@ -665,15 +698,14 @@ void execCommandDatabase(OperationContext* opCtx,
             CurOp::get(opCtx)->setCommand_inlock(command);
         }
 
-        MONGO_FAIL_POINT_BLOCK(sleepMillisAfterCommandExecutionBegins, arg) {
-            const BSONObj& data = arg.getData();
+        sleepMillisAfterCommandExecutionBegins.execute([&](const BSONObj& data) {
             auto numMillis = data["millis"].numberInt();
             auto commands = data["commands"].Obj().getFieldNames<std::set<std::string>>();
             // Only sleep for one of the specified commands.
             if (commands.find(command->getName()) != commands.end()) {
                 mongo::sleepmillis(numMillis);
             }
-        }
+        });
 
         // TODO: move this back to runCommands when mongos supports OperationContext
         // see SERVER-18515 for details.
@@ -749,7 +781,7 @@ void execCommandDatabase(OperationContext* opCtx,
         const bool iAmPrimary = replCoord->canAcceptWritesForDatabase_UNSAFE(opCtx, dbname);
 
         if (!opCtx->getClient()->isInDirectClient() &&
-            !MONGO_FAIL_POINT(skipCheckingForNotMasterInCommandDispatch)) {
+            !MONGO_unlikely(skipCheckingForNotMasterInCommandDispatch.shouldFail())) {
             const bool inMultiDocumentTransaction = (sessionOptions.getAutocommit() == false);
             auto allowed = command->secondaryAllowed(opCtx->getServiceContext());
             bool alwaysAllowed = allowed == Command::AllowedOnSecondary::kAlways;
@@ -762,7 +794,7 @@ void execCommandDatabase(OperationContext* opCtx,
                 uasserted(ErrorCodes::NotMasterNoSlaveOk, "not master and slaveOk=false");
             }
 
-            if (MONGO_FAIL_POINT(respondWithNotPrimaryInCommandDispatch)) {
+            if (MONGO_unlikely(respondWithNotPrimaryInCommandDispatch.shouldFail())) {
                 uassert(ErrorCodes::NotMaster, "not primary", canRunHere);
             } else {
                 uassert(ErrorCodes::NotMaster, "not master", canRunHere);
@@ -820,11 +852,10 @@ void execCommandDatabase(OperationContext* opCtx,
         // If the parent operation runs in a transaction, we don't override the read concern.
         auto skipReadConcern =
             opCtx->getClient()->isInDirectClient() && opCtx->inMultiDocumentTransaction();
+        bool startTransaction = static_cast<bool>(sessionOptions.getStartTransaction());
         if (!skipReadConcern) {
-            // If "startTransaction" is present, it must be true due to the parsing above.
-            const bool upconvertToSnapshot(sessionOptions.getStartTransaction());
             auto newReadConcernArgs = uassertStatusOK(
-                _extractReadConcern(invocation.get(), request.body, upconvertToSnapshot));
+                _extractReadConcern(invocation.get(), request.body, startTransaction));
             {
                 // We must obtain the client lock to set the ReadConcernArgs on the operation
                 // context as it may be concurrently read by CurrentOp.
@@ -833,17 +864,12 @@ void execCommandDatabase(OperationContext* opCtx,
             }
         }
 
-        if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern) {
-            uassert(ErrorCodes::InvalidOptions,
-                    "readConcern level snapshot is only valid for the first transaction operation",
-                    opCtx->getClient()->isInDirectClient() || sessionOptions.getStartTransaction());
-            uassert(ErrorCodes::InvalidOptions,
-                    "readConcern level snapshot requires a session ID",
-                    opCtx->getLogicalSessionId());
-            uassert(ErrorCodes::InvalidOptions,
-                    "readConcern level snapshot requires a txnNumber",
-                    opCtx->getTxnNumber());
+        uassert(ErrorCodes::InvalidOptions,
+                "read concern level snapshot is only valid in a transaction",
+                opCtx->inMultiDocumentTransaction() ||
+                    readConcernArgs.getLevel() != repl::ReadConcernLevel::kSnapshotReadConcern);
 
+        if (startTransaction) {
             opCtx->lockState()->setSharedLocksShouldTwoPhaseLock(true);
             opCtx->lockState()->setShouldConflictWithSecondaryBatchApplication(false);
         }
@@ -1126,11 +1152,10 @@ void receivedKillCursors(OperationContext* opCtx, const Message& m) {
         uassert(51250, "must kill fewer than 30000 cursors", n < 30000);
     }
 
-    uassert(13659, "sent 0 cursors to kill", n != 0);
+    uassert(31289, str::stream() << "must kill at least 1 cursor, n=" << n, n >= 1);
     massert(13658,
             str::stream() << "bad kill cursors size: " << m.dataSize(),
             m.dataSize() == 8 + (8 * n));
-    uassert(13004, str::stream() << "sent negative cursors to kill: " << n, n >= 1);
 
     const char* cursorArray = dbmessage.getArray(n);
     int found = runOpKillCursors(opCtx, static_cast<size_t>(n), cursorArray);
@@ -1225,7 +1250,7 @@ DbResponse receivedGetMore(OperationContext* opCtx,
         audit::logGetMoreAuthzCheck(opCtx->getClient(), nsString, cursorid, status.code());
         uassertStatusOK(status);
 
-        while (MONGO_FAIL_POINT(rsStopGetMore)) {
+        while (MONGO_unlikely(rsStopGetMore.shouldFail())) {
             sleepmillis(0);
         }
 

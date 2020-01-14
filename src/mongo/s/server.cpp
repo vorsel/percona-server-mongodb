@@ -232,7 +232,9 @@ void implicitlyAbortAllTransactions(OperationContext* opCtx) {
         newOpCtx->setLogicalSessionId(session->getSessionId());
 
         auto txnRouter = TransactionRouter::get(newOpCtx);
-        txnRouter.implicitlyAbortTransaction(newOpCtx, shutDownStatus);
+        if (txnRouter.isInitialized()) {
+            txnRouter.implicitlyAbortTransaction(newOpCtx, shutDownStatus);
+        }
     }
 }
 
@@ -369,12 +371,30 @@ Status initializeSharding(OperationContext* opCtx) {
     CatalogCacheLoader::set(opCtx->getServiceContext(),
                             std::make_unique<ConfigServerCatalogCacheLoader>());
 
+    auto catalogCache = std::make_unique<CatalogCache>(CatalogCacheLoader::get(opCtx));
+
+    // List of hooks which will be called by the ShardRegistry when it discovers a shard has been
+    // removed.
+    std::vector<ShardRegistry::ShardRemovalHook> shardRemovalHooks = {
+        // Invalidate appropriate entries in the catalog cache when a shard is removed. It's safe to
+        // capture the catalog cache pointer since the Grid (and therefore CatalogCache and
+        // ShardRegistry) are never destroyed.
+        [catCache = catalogCache.get()](const ShardId& removedShard) {
+            catCache->invalidateEntriesThatReferenceShard(removedShard);
+        }};
+
+    if (mongosGlobalParams.configdbs.type() == ConnectionString::INVALID) {
+        return {ErrorCodes::BadValue, "Unrecognized connection string."};
+    }
+
+    auto shardRegistry = std::make_unique<ShardRegistry>(
+        std::move(shardFactory), mongosGlobalParams.configdbs, std::move(shardRemovalHooks));
+
     Status status = initializeGlobalShardingState(
         opCtx,
-        mongosGlobalParams.configdbs,
         generateDistLockProcessId(opCtx),
-        std::move(shardFactory),
-        std::make_unique<CatalogCache>(CatalogCacheLoader::get(opCtx)),
+        std::move(catalogCache),
+        std::move(shardRegistry),
         [opCtx]() {
             auto hookList = std::make_unique<rpc::EgressMetadataHookList>();
             hookList->addHook(
@@ -439,7 +459,7 @@ public:
 
                 Grid::get(serviceContext)->shardRegistry()->updateReplSetHosts(connStr);
 
-                if (MONGO_FAIL_POINT(failReplicaSetChangeConfigServerUpdateHook)) {
+                if (MONGO_unlikely(failReplicaSetChangeConfigServerUpdateHook.shouldFail())) {
                     return;
                 }
                 ShardRegistry::updateReplicaSetOnConfigServer(serviceContext, connStr);

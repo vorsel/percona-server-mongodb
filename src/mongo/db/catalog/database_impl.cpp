@@ -50,6 +50,7 @@
 #include "mongo/db/catalog/drop_indexes.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/clientcursor.h"
+#include "mongo/db/commands/feature_compatibility_version_parser.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
@@ -121,7 +122,8 @@ DatabaseImpl::DatabaseImpl(const StringData name, uint64_t epoch)
     : _name(name.toString()),
       _epoch(epoch),
       _profileName(_name + ".system.profile"),
-      _viewsName(_name + "." + DurableViewCatalog::viewsCollectionName().toString()) {
+      _viewsName(_name + "." + DurableViewCatalog::viewsCollectionName().toString()),
+      _uniqueCollectionNamespacePseudoRandom(Date_t::now().asInt64()) {
     auto durableViewCatalog = std::make_unique<DurableViewCatalogImpl>(this);
     auto viewCatalog = std::make_unique<ViewCatalog>(std::move(durableViewCatalog));
 
@@ -227,7 +229,7 @@ void DatabaseImpl::setDropPending(OperationContext* opCtx, bool dropPending) {
 }
 
 bool DatabaseImpl::isDropPending(OperationContext* opCtx) const {
-    invariant(opCtx->lockState()->isDbLockedForMode(name(), MODE_X));
+    invariant(opCtx->lockState()->isDbLockedForMode(name(), MODE_IS));
     return _dropPending.load();
 }
 
@@ -559,6 +561,13 @@ void DatabaseImpl::_checkCanCreateCollection(OperationContext* opCtx,
             str::stream() << "Cannot create collection " << nss
                           << " - database is in the process of being dropped.",
             !_dropPending.load());
+
+    uassert(ErrorCodes::IncompatibleServerVersion,
+            str::stream() << "Cannot create collection with a long name " << nss
+                          << " - upgrade to feature compatibility version "
+                          << FeatureCompatibilityVersionParser::kVersion44
+                          << " to be able to do so.",
+            nss.checkLengthForFCV());
 }
 
 Status DatabaseImpl::createView(OperationContext* opCtx,
@@ -677,7 +686,7 @@ Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
         }
     }
 
-    MONGO_FAIL_POINT_PAUSE_WHILE_SET(hangBeforeLoggingCreateCollection);
+    hangBeforeLoggingCreateCollection.pauseWhileSet();
 
     opCtx->getServiceContext()->getOpObserver()->onCreateCollection(
         opCtx, collection, nss, optionsWithUUID, fullIdIndexSpec, createOplogSlot);
@@ -696,7 +705,7 @@ Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
 
 StatusWith<NamespaceString> DatabaseImpl::makeUniqueCollectionNamespace(
     OperationContext* opCtx, StringData collectionNameModel) {
-    invariant(opCtx->lockState()->isDbLockedForMode(name(), MODE_X));
+    invariant(opCtx->lockState()->isDbLockedForMode(name(), MODE_IX));
 
     // There must be at least one percent sign in the collection name model.
     auto numPercentSign = std::count(collectionNameModel.begin(), collectionNameModel.end(), '%');
@@ -708,22 +717,17 @@ StatusWith<NamespaceString> DatabaseImpl::makeUniqueCollectionNamespace(
                           << collectionNameModel << " must contain at least one percent sign.");
     }
 
-    if (!_uniqueCollectionNamespacePseudoRandom) {
-        _uniqueCollectionNamespacePseudoRandom =
-            std::make_unique<PseudoRandom>(Date_t::now().asInt64());
-    }
-
     const auto charsToChooseFrom =
         "0123456789"
         "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
         "abcdefghijklmnopqrstuvwxyz"_sd;
     invariant((10U + 26U * 2) == charsToChooseFrom.size());
 
-    auto replacePercentSign = [&, this](const auto& c) {
+    auto replacePercentSign = [&, this](char c) {
         if (c != '%') {
             return c;
         }
-        auto i = _uniqueCollectionNamespacePseudoRandom->nextInt32(charsToChooseFrom.size());
+        auto i = _uniqueCollectionNamespacePseudoRandom.nextInt32(charsToChooseFrom.size());
         return charsToChooseFrom[i];
     };
 

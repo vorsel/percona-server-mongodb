@@ -51,7 +51,8 @@
 #include "mongo/db/repl/speculative_majority_read_info.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
-#include "mongo/db/s/transaction_coordinator_worker_curop_info.h"
+#include "mongo/db/s/transaction_coordinator_curop.h"
+#include "mongo/db/s/transaction_coordinator_worker_curop_repository.h"
 #include "mongo/db/session_catalog.h"
 #include "mongo/db/session_catalog_mongod.h"
 #include "mongo/db/stats/fill_locker_info.h"
@@ -85,6 +86,10 @@ public:
 
         Session* const session = OperationContextSession::get(opCtx);
         if (session) {
+            if (auto txnParticipant = TransactionParticipant::get(opCtx)) {
+                txnParticipant.stashTransactionResources(opCtx);
+            }
+
             MongoDOperationContextSession::checkIn(opCtx);
         }
         _yielded = (session != nullptr);
@@ -97,13 +102,14 @@ public:
             // unblocking this thread of execution. However, we must wait until the child operation
             // on this shard finishes so we can get the session back. This may limit the throughput
             // of the operation, but it's correct.
-            MongoDOperationContextSession::checkOut(opCtx,
-                                                    // Assumes this is only called from the
-                                                    // 'aggregate' or 'getMore' commands.  The code
-                                                    // which relies on this parameter does not
-                                                    // distinguish/care about the difference so we
-                                                    // simply always pass 'aggregate'.
-                                                    "aggregate");
+            MongoDOperationContextSession::checkOut(opCtx);
+
+            if (auto txnParticipant = TransactionParticipant::get(opCtx)) {
+                // Assumes this is only called from the 'aggregate' or 'getMore' commands.  The code
+                // which relies on this parameter does not distinguish/care about the difference so
+                // we simply always pass 'aggregate'.
+                txnParticipant.unstashTransactionResources(opCtx, "aggregate");
+            }
         }
     }
 
@@ -609,6 +615,11 @@ BSONObj MongoInterfaceStandalone::_reportCurrentOpForClient(
     }
 
     return builder.obj();
+}
+
+void MongoInterfaceStandalone::_reportCurrentOpsForTransactionCoordinators(
+    OperationContext* opCtx, bool includeIdle, std::vector<BSONObj>* ops) const {
+    reportCurrentOpsForTransactionCoordinators(opCtx, includeIdle, ops);
 }
 
 void MongoInterfaceStandalone::_reportCurrentOpsForIdleSessions(OperationContext* opCtx,

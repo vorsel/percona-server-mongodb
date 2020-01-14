@@ -215,10 +215,10 @@ private:
                 std::piecewise_construct, std::forward_as_tuple(id), std::forward_as_tuple());
         };
 
-        if (MONGO_FAIL_POINT(ScopedTaskExecutorHangBeforeSchedule)) {
+        if (MONGO_unlikely(ScopedTaskExecutorHangBeforeSchedule.shouldFail())) {
             ScopedTaskExecutorHangBeforeSchedule.setMode(FailPoint::off);
 
-            MONGO_FAIL_POINT_PAUSE_WHILE_SET(ScopedTaskExecutorHangExitBeforeSchedule);
+            ScopedTaskExecutorHangExitBeforeSchedule.pauseWhileSet();
         }
 
         // State 2 - Indeterminate state.  We don't know yet if the task will get scheduled.
@@ -226,7 +226,7 @@ private:
             [id, work = std::forward<Work>(work), self = shared_from_this()](const auto& cargs) {
                 using ArgsT = std::decay_t<decltype(cargs)>;
 
-                stdx::unique_lock<stdx::mutex> lk(self->_mutex);
+                stdx::unique_lock<Latch> lk(self->_mutex);
 
                 auto doWorkAndNotify = [&](const ArgsT& x) noexcept {
                     lk.unlock();
@@ -259,7 +259,7 @@ private:
                 doWorkAndNotify(args);
             });
 
-        MONGO_FAIL_POINT_PAUSE_WHILE_SET(ScopedTaskExecutorHangAfterSchedule);
+        ScopedTaskExecutorHangAfterSchedule.pauseWhileSet();
 
         stdx::unique_lock lk(_mutex);
 
@@ -301,7 +301,7 @@ private:
         }
     }
 
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("ScopedTaskExecutor::_mutex");
     bool _inShutdown = false;
     std::shared_ptr<TaskExecutor> _executor;
     size_t _id = 0;

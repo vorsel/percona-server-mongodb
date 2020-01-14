@@ -938,8 +938,7 @@ StatusWith<DERToken> DERToken::parse(ConstDataRange cdr, size_t* outLength) {
     const uint64_t tagAndLengthByteCount = kTagLength + encodedLengthBytesCount;
 
     // This may overflow since derLength is from user data so check our arithmetic carefully.
-    if (mongoUnsignedAddOverflow64(tagAndLengthByteCount, derLength, outLength) ||
-        *outLength > cdr.length()) {
+    if (overflow::add(tagAndLengthByteCount, derLength, outLength) || *outLength > cdr.length()) {
         return Status(ErrorCodes::InvalidSSLConfiguration, "Invalid DER length");
     }
 
@@ -1170,6 +1169,14 @@ bool hostNameMatchForX509Certificates(std::string nameToMatch, std::string certH
     } else {
         return !str::caseInsensitiveCompare(nameToMatch.c_str(), certHostName.c_str());
     }
+}
+
+void tlsEmitWarningExpiringClientCertificate(const SSLX509Name& peer) {
+    warning() << "Peer certificate '" << peer << "' expires soon";
+}
+
+void tlsEmitWarningExpiringClientCertificate(const SSLX509Name& peer, Days days) {
+    warning() << "Peer certificate '" << peer << "' expires in " << days;
 }
 
 }  // namespace mongo

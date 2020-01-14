@@ -126,7 +126,7 @@ Status _applyOps(OperationContext* opCtx,
         if (*opType != 'c' && !nss.isValid())
             return {ErrorCodes::InvalidNamespace, "invalid ns: " + nss.ns()};
 
-        Status status(ErrorCodes::InternalError, "");
+        Status status = Status::OK();
 
         if (haveWrappingWUOW) {
             // Only CRUD operations are allowed in atomic mode.
@@ -162,8 +162,15 @@ Status _applyOps(OperationContext* opCtx,
 
             BSONObjBuilder builder;
             builder.appendElements(opObj);
+
+            // If required fields are not present in the BSONObj for an applyOps entry, create these
+            // fields and populate them with dummy values before parsing the BSONObj as an oplog
+            // entry.
             if (!builder.hasField(OplogEntry::kTimestampFieldName)) {
                 builder.append(OplogEntry::kTimestampFieldName, Timestamp());
+            }
+            if (!builder.hasField(OplogEntry::kWallClockTimeFieldName)) {
+                builder.append(OplogEntry::kWallClockTimeFieldName, Date_t());
             }
             // Reject malformed operations in an atomic applyOps.
             auto entry = OplogEntry::parse(builder.done());
@@ -211,6 +218,9 @@ Status _applyOps(OperationContext* opCtx,
                         }
                         if (!builder.hasField(OplogEntry::kHashFieldName)) {
                             builder.append(OplogEntry::kHashFieldName, 0LL);
+                        }
+                        if (!builder.hasField(OplogEntry::kWallClockTimeFieldName)) {
+                            builder.append(OplogEntry::kWallClockTimeFieldName, Date_t());
                         }
                         auto entry = uassertStatusOK(OplogEntry::parse(builder.done()));
                         if (*opType == 'c') {
@@ -261,8 +271,8 @@ Status _applyOps(OperationContext* opCtx,
 
         (*numApplied)++;
 
-        if (MONGO_FAIL_POINT(applyOpsPauseBetweenOperations)) {
-            MONGO_FAIL_POINT_PAUSE_WHILE_SET(applyOpsPauseBetweenOperations);
+        if (MONGO_unlikely(applyOpsPauseBetweenOperations.shouldFail())) {
+            applyOpsPauseBetweenOperations.pauseWhileSet();
         }
     }
 

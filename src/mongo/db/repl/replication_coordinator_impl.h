@@ -316,6 +316,8 @@ public:
 
     virtual size_t getNumUncommittedSnapshots() override;
 
+    virtual void createWMajorityWriteAvailabilityDateWaiter(OpTime opTime) override;
+
     virtual WriteConcernOptions populateUnsetWriteConcernOptionsSyncMode(
         WriteConcernOptions wc) override;
 
@@ -332,6 +334,8 @@ public:
     virtual bool setContainsArbiter() const override;
 
     virtual void attemptToAdvanceStableTimestamp() override;
+
+    virtual void finishRecoveryIfEligible(OperationContext* opCtx) override;
 
     // ================== Test support API ===================
 
@@ -567,7 +571,7 @@ private:
         // Tracks number of operations left running on step down.
         size_t _userOpsRunning = 0;
         // Protects killSignaled and stopKillingOps cond. variable.
-        stdx::mutex _mutex;
+        Mutex _mutex = MONGO_MAKE_LATCH("AutoGetRstlForStepUpStepDown::_mutex");
         // Signals thread about the change of killSignaled value.
         stdx::condition_variable _stopKillingOps;
         // Once this is set to true, the killOpThreadFn method will terminate.
@@ -733,6 +737,13 @@ private:
     void _resetMyLastOpTimes(WithLock lk);
 
     /**
+     * Returns a new WriteConcernOptions based on "wc" but with UNSET syncMode reset to JOURNAL or
+     * NONE based on our rsConfig.
+     */
+    WriteConcernOptions _populateUnsetWriteConcernOptionsSyncMode(WithLock lk,
+                                                                  WriteConcernOptions wc);
+
+    /**
      * Returns the _writeConcernMajorityJournalDefault of our current _rsConfig.
      */
     bool getWriteConcernMajorityShouldJournal_inlock() const;
@@ -773,7 +784,7 @@ private:
     /**
      * Helper to wake waiters in _replicationWaiterList that are doneWaitingForReplication.
      */
-    void _wakeReadyWaiters_inlock();
+    void _wakeReadyWaiters(WithLock lk);
 
     /**
      * Scheduled to cause the ReplicationCoordinator to reconsider any state that might
@@ -791,7 +802,7 @@ private:
      * Helper method for _awaitReplication that takes an already locked unique_lock, but leaves
      * operation timing to the caller.
      */
-    Status _awaitReplication_inlock(stdx::unique_lock<stdx::mutex>* lock,
+    Status _awaitReplication_inlock(stdx::unique_lock<Latch>* lock,
                                     OperationContext* opCtx,
                                     const OpTime& opTime,
                                     const WriteConcernOptions& writeConcern);
@@ -843,7 +854,7 @@ private:
      *
      * Lock will be released after this method finishes.
      */
-    void _reportUpstream_inlock(stdx::unique_lock<stdx::mutex> lock);
+    void _reportUpstream_inlock(stdx::unique_lock<Latch> lock);
 
     /**
      * Helpers to set the last applied and durable OpTime.
@@ -1130,10 +1141,10 @@ private:
      *
      * Requires "lock" to own _mutex, and returns the same unique_lock.
      */
-    stdx::unique_lock<stdx::mutex> _handleHeartbeatResponseAction_inlock(
+    stdx::unique_lock<Latch> _handleHeartbeatResponseAction_inlock(
         const HeartbeatResponseAction& action,
         const StatusWith<ReplSetHeartbeatResponse>& responseStatus,
-        stdx::unique_lock<stdx::mutex> lock);
+        stdx::unique_lock<Latch> lock);
 
     /**
      * Updates the last committed OpTime to be 'committedOpTime' if it is more recent than the
@@ -1195,7 +1206,7 @@ private:
      *
      * Returns true if the value was updated to `newCommittedSnapshot`.
      */
-    bool _updateCommittedSnapshot_inlock(const OpTimeAndWallTime& newCommittedSnapshot);
+    bool _updateCommittedSnapshot(WithLock lk, const OpTimeAndWallTime& newCommittedSnapshot);
 
     /**
      * A helper method that returns the current stable optime based on the current commit point and
@@ -1355,7 +1366,7 @@ private:
     // (I)  Independently synchronized, see member variable comment.
 
     // Protects member data of this ReplicationCoordinator.
-    mutable stdx::mutex _mutex;  // (S)
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("ReplicationCoordinatorImpl::_mutex");  // (S)
 
     // Handles to actively queued heartbeats.
     HeartbeatHandles _heartbeatHandles;  // (M)
@@ -1390,6 +1401,9 @@ private:
     // list of information about clients waiting for a particular opTime.
     // Does *not* own the WaiterInfos.
     WaiterList _opTimeWaiterList;  // (M)
+
+    // Waiter waiting on w:majority write availability.
+    std::unique_ptr<CallbackWaiter> _wMajorityWriteAvailabilityWaiter;  // (M)
 
     // Set to true when we are in the process of shutting down replication.
     bool _inShutdown;  // (M)

@@ -83,7 +83,7 @@ DocumentSource::GetNextResult DocumentSourceSort::doGetNext() {
         invariant(populationResult.isEOF());
     }
 
-    auto result = _sortExecutor->getNext();
+    auto result = _sortExecutor->getNextDoc();
     if (!result)
         return GetNextResult::makeEOF();
     return GetNextResult(std::move(*result));
@@ -130,11 +130,10 @@ Pipeline::SourceContainer::iterator DocumentSourceSort::doOptimizeAt(
 
         // The skip and limit values can be very large, so we need to make sure the sum doesn't
         // overflow before applying an optimization to pull the limit into the sort stage.
-        if (nextSkip && !mongoSignedAddOverflow64(skipSum, nextSkip->getSkip(), &safeSum)) {
+        if (nextSkip && !overflow::add(skipSum, nextSkip->getSkip(), &safeSum)) {
             skipSum = safeSum;
             ++stageItr;
-        } else if (nextLimit &&
-                   !mongoSignedAddOverflow64(nextLimit->getLimit(), skipSum, &safeSum)) {
+        } else if (nextLimit && !overflow::add(nextLimit->getLimit(), skipSum, &safeSum)) {
             _sortExecutor->setLimit(safeSum);
             container->erase(stageItr);
             stageItr = std::next(itr);
@@ -203,7 +202,7 @@ void DocumentSourceSort::loadDocument(Document&& doc) {
     // already computed the sort key we'd have split the pipeline there, would be merging presorted
     // documents, and wouldn't use this method.
     std::tie(sortKey, docForSorter) = extractSortKey(std::move(doc));
-    _sortExecutor->add(sortKey, docForSorter);
+    _sortExecutor->add(sortKey, std::move(docForSorter));
 }
 
 void DocumentSourceSort::loadingDone() {

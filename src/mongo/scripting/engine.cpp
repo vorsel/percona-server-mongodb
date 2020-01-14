@@ -199,7 +199,7 @@ public:
 };
 
 void Scope::storedFuncMod(OperationContext* opCtx) {
-    opCtx->recoveryUnit()->registerChange(new StoredFuncModLogOpHandler());
+    opCtx->recoveryUnit()->registerChange(std::make_unique<StoredFuncModLogOpHandler>());
 }
 
 void Scope::validateObjectIdString(const string& str) {
@@ -237,7 +237,7 @@ void Scope::loadStored(OperationContext* opCtx, bool ignoreNotConnected) {
         uassert(10209, str::stream() << "name has to be a string: " << n, n.type() == String);
         uassert(10210, "value has to be set", v.type() != EOO);
 
-        if (MONGO_FAIL_POINT(mr_killop_test_fp)) {
+        if (MONGO_unlikely(mr_killop_test_fp.shouldFail())) {
 
             /* This thread sleep makes the interrupts in the test come in at a time
              *  where the js misses the interrupt and throw an exception instead of
@@ -332,7 +332,7 @@ namespace {
 class ScopeCache {
 public:
     void release(const string& poolName, const std::shared_ptr<Scope>& scope) {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
 
         if (scope->hasOutOfMemoryException()) {
             // make some room
@@ -358,7 +358,7 @@ public:
     }
 
     std::shared_ptr<Scope> tryAcquire(OperationContext* opCtx, const string& poolName) {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
 
         for (Pools::iterator it = _pools.begin(); it != _pools.end(); ++it) {
             if (it->poolName == poolName) {
@@ -374,7 +374,7 @@ public:
     }
 
     void clear() {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
 
         _pools.clear();
     }
@@ -391,7 +391,7 @@ private:
 
     typedef std::deque<ScopeAndPool> Pools;  // More-recently used Scopes are kept at the front.
     Pools _pools;                            // protected by _mutex
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("ScopeCache::_mutex");
 };
 
 ScopeCache scopeCache;

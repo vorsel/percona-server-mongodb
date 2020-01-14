@@ -64,7 +64,7 @@ repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
                                 repl::OpTypeEnum opType,
                                 BSONObj object,
                                 OperationSessionInfo sessionInfo,
-                                boost::optional<Date_t> wallClockTime,
+                                Date_t wallClockTime,
                                 boost::optional<StmtId> stmtId,
                                 boost::optional<repl::OpTime> prevWriteOpTimeInTransaction) {
     return repl::OplogEntry(
@@ -554,7 +554,7 @@ TEST_F(TransactionParticipantRetryableWritesTest, IncompleteHistoryDueToOpLogTru
             sessionRecord.setSessionId(sessionId);
             sessionRecord.setTxnNum(txnNum);
             sessionRecord.setLastWriteOpTime(entry2.getOpTime());
-            sessionRecord.setLastWriteDate(*entry2.getWallClockTime());
+            sessionRecord.setLastWriteDate(entry2.getWallClockTime());
             return sessionRecord.toBSON();
         }());
     }
@@ -685,6 +685,7 @@ TEST_F(ShardTxnParticipantRetryableWritesTest,
 
     const auto& sessionId = *opCtx()->getLogicalSessionId();
     const TxnNumber txnNum = 20;
+    opCtx()->setTxnNumber(txnNum);
     const auto uuid = UUID::gen();
 
     txnParticipant.beginOrContinue(opCtx(), txnNum, boost::none, boost::none);
@@ -705,6 +706,7 @@ TEST_F(ShardTxnParticipantRetryableWritesTest,
 
     auto autocommit = false;
     auto startTransaction = true;
+    opCtx()->setInMultiDocumentTransaction();
 
     ASSERT_THROWS_CODE(
         txnParticipant.beginOrContinue(opCtx(), txnNum, autocommit, startTransaction),

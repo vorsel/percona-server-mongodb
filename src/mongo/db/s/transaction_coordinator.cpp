@@ -61,20 +61,19 @@ ExecutorFuture<void> waitForMajorityWithHangFailpoint(ServiceContext* service,
         return WaitForMajorityService::get(service).waitUntilMajority(opTime).thenRunOn(executor);
     };
 
-    MONGO_FAIL_POINT_BLOCK(failpoint, fp) {
+    if (auto sfp = failpoint.scoped(); MONGO_unlikely(sfp.isActive())) {
+        const BSONObj& data = sfp.getData();
         LOG(0) << "Hit " << failPointName << " failpoint";
-        const BSONObj& data = fp.getData();
 
         // Run the hang failpoint asynchronously on a different thread to avoid self deadlocks.
         return ExecutorFuture<void>(executor).then(
             [service, &failpoint, failPointName, data, waitForWC, opTime] {
                 if (!data["useUninterruptibleSleep"].eoo()) {
-                    MONGO_FAIL_POINT_PAUSE_WHILE_SET(failpoint);
+                    failpoint.pauseWhileSet();
                 } else {
                     ThreadClient tc(failPointName, service);
                     auto opCtx = tc->makeOperationContext();
-
-                    MONGO_FAIL_POINT_PAUSE_WHILE_SET_OR_INTERRUPTED(opCtx.get(), failpoint);
+                    failpoint.pauseWhileSet(opCtx.get());
                 }
 
                 return waitForWC(std::move(opTime));
@@ -86,18 +85,19 @@ ExecutorFuture<void> waitForMajorityWithHangFailpoint(ServiceContext* service,
 
 }  // namespace
 
-TransactionCoordinator::TransactionCoordinator(ServiceContext* serviceContext,
+TransactionCoordinator::TransactionCoordinator(OperationContext* operationContext,
                                                const LogicalSessionId& lsid,
                                                TxnNumber txnNumber,
                                                std::unique_ptr<txn::AsyncWorkScheduler> scheduler,
                                                Date_t deadline)
-    : _serviceContext(serviceContext),
+    : _serviceContext(operationContext->getServiceContext()),
       _lsid(lsid),
       _txnNumber(txnNumber),
       _scheduler(std::move(scheduler)),
       _sendPrepareScheduler(_scheduler->makeChildScheduler()),
       _transactionCoordinatorMetricsObserver(
-          std::make_unique<TransactionCoordinatorMetricsObserver>()) {
+          std::make_unique<TransactionCoordinatorMetricsObserver>()),
+      _deadline(deadline) {
 
     auto kickOffCommitPF = makePromiseFuture<void>();
     _kickOffCommitPromise = std::move(kickOffCommitPF.promise);
@@ -123,6 +123,7 @@ TransactionCoordinator::TransactionCoordinator(ServiceContext* serviceContext,
             });
 
     // TODO: The duration will be meaningless after failover.
+    _updateAssociatedClient(operationContext->getClient());
     _transactionCoordinatorMetricsObserver->onCreate(
         ServerTransactionCoordinatorsMetrics::get(_serviceContext),
         _serviceContext->getTickSource(),
@@ -138,12 +139,11 @@ TransactionCoordinator::TransactionCoordinator(ServiceContext* serviceContext,
             //         _participantsDurable (optional)
             //  Output: _participantsDurable = true
             {
-                stdx::lock_guard<stdx::mutex> lg(_mutex);
+                stdx::lock_guard<Latch> lg(_mutex);
                 invariant(_participants);
 
                 _step = Step::kWritingParticipantList;
 
-                // TODO: The duration will be meaningless after failover.
                 _transactionCoordinatorMetricsObserver->onStartWritingParticipantList(
                     ServerTransactionCoordinatorsMetrics::get(_serviceContext),
                     _serviceContext->getTickSource(),
@@ -166,7 +166,7 @@ TransactionCoordinator::TransactionCoordinator(ServiceContext* serviceContext,
         .thenRunOn(Grid::get(_serviceContext)->getExecutorPool()->getFixedExecutor())
         .then([this] {
             {
-                stdx::lock_guard<stdx::mutex> lg(_mutex);
+                stdx::lock_guard<Latch> lg(_mutex);
                 _participantsDurable = true;
             }
 
@@ -177,12 +177,11 @@ TransactionCoordinator::TransactionCoordinator(ServiceContext* serviceContext,
             //         _decision (optional)
             //  Output: _decision is set
             {
-                stdx::lock_guard<stdx::mutex> lg(_mutex);
+                stdx::lock_guard<Latch> lg(_mutex);
                 invariant(_participantsDurable);
 
                 _step = Step::kWaitingForVotes;
 
-                // TODO: The duration will be meaningless after failover.
                 _transactionCoordinatorMetricsObserver->onStartWaitingForVotes(
                     ServerTransactionCoordinatorsMetrics::get(_serviceContext),
                     _serviceContext->getTickSource(),
@@ -196,7 +195,7 @@ TransactionCoordinator::TransactionCoordinator(ServiceContext* serviceContext,
                        _serviceContext, *_sendPrepareScheduler, _lsid, _txnNumber, *_participants)
                 .then([this](PrepareVoteConsensus consensus) mutable {
                     {
-                        stdx::lock_guard<stdx::mutex> lg(_mutex);
+                        stdx::lock_guard<Latch> lg(_mutex);
                         _decision = consensus.decision();
                     }
 
@@ -219,12 +218,11 @@ TransactionCoordinator::TransactionCoordinator(ServiceContext* serviceContext,
             //         _decisionDurable (optional)
             //  Output: _decisionDurable = true
             {
-                stdx::lock_guard<stdx::mutex> lg(_mutex);
+                stdx::lock_guard<Latch> lg(_mutex);
                 invariant(_decision);
 
                 _step = Step::kWritingDecision;
 
-                // TODO: The duration will be meaningless after failover.
                 _transactionCoordinatorMetricsObserver->onStartWritingDecision(
                     ServerTransactionCoordinatorsMetrics::get(_serviceContext),
                     _serviceContext->getTickSource(),
@@ -244,7 +242,7 @@ TransactionCoordinator::TransactionCoordinator(ServiceContext* serviceContext,
         })
         .then([this] {
             {
-                stdx::lock_guard<stdx::mutex> lg(_mutex);
+                stdx::lock_guard<Latch> lg(_mutex);
                 _decisionDurable = true;
             }
 
@@ -252,12 +250,11 @@ TransactionCoordinator::TransactionCoordinator(ServiceContext* serviceContext,
             //  Input: _decisionDurable
             //  Output: (none)
             {
-                stdx::lock_guard<stdx::mutex> lg(_mutex);
+                stdx::lock_guard<Latch> lg(_mutex);
                 invariant(_decisionDurable);
 
                 _step = Step::kWaitingForDecisionAcks;
 
-                // TODO: The duration will be meaningless after failover.
                 _transactionCoordinatorMetricsObserver->onStartWaitingForDecisionAcks(
                     ServerTransactionCoordinatorsMetrics::get(_serviceContext),
                     _serviceContext->getTickSource(),
@@ -294,7 +291,7 @@ TransactionCoordinator::TransactionCoordinator(ServiceContext* serviceContext,
             // Do a best-effort attempt (i.e., writeConcern w:1) to delete the coordinator's durable
             // state.
             {
-                stdx::lock_guard<stdx::mutex> lg(_mutex);
+                stdx::lock_guard<Latch> lg(_mutex);
 
                 _step = Step::kDeletingCoordinatorDoc;
 
@@ -326,10 +323,11 @@ TransactionCoordinator::~TransactionCoordinator() {
     invariant(_completionPromise.getFuture().isReady());
 }
 
-void TransactionCoordinator::runCommit(std::vector<ShardId> participants) {
+void TransactionCoordinator::runCommit(OperationContext* opCtx, std::vector<ShardId> participants) {
     if (!_reserveKickOffCommitPromise())
         return;
-
+    invariant(opCtx != nullptr && opCtx->getClient() != nullptr);
+    _updateAssociatedClient(opCtx->getClient());
     _participants = std::move(participants);
     _kickOffCommitPromise.emplaceValue();
 }
@@ -337,6 +335,8 @@ void TransactionCoordinator::runCommit(std::vector<ShardId> participants) {
 void TransactionCoordinator::continueCommit(const TransactionCoordinatorDocument& doc) {
     if (!_reserveKickOffCommitPromise())
         return;
+
+    _transactionCoordinatorMetricsObserver->onRecoveryFromFailover();
 
     _participants = std::move(doc.getParticipants());
     if (doc.getDecision()) {
@@ -364,7 +364,7 @@ void TransactionCoordinator::cancelIfCommitNotYetStarted() {
 }
 
 bool TransactionCoordinator::_reserveKickOffCommitPromise() {
-    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    stdx::lock_guard<Latch> lg(_mutex);
     if (_kickOffCommitPromiseSet)
         return false;
 
@@ -385,7 +385,7 @@ void TransactionCoordinator::_done(Status status) {
     LOG(3) << txn::txnIdToString(_lsid, _txnNumber) << " Two-phase commit completed with "
            << redact(status);
 
-    stdx::unique_lock<stdx::mutex> ul(_mutex);
+    stdx::unique_lock<Latch> ul(_mutex);
 
     const auto tickSource = _serviceContext->getTickSource();
 
@@ -484,6 +484,67 @@ std::string TransactionCoordinator::_twoPhaseCommitInfoForLog(
              singleTransactionCoordinatorStats.getTwoPhaseCommitDuration(tickSource, curTick));
 
     return s.str();
+}
+
+TransactionCoordinator::Step TransactionCoordinator::getStep() const {
+    stdx::lock_guard<Latch> lk(_mutex);
+    return _step;
+}
+
+void TransactionCoordinator::reportState(BSONObjBuilder& parent) const {
+    BSONObjBuilder doc;
+    TickSource* tickSource = _serviceContext->getTickSource();
+    TickSource::Tick currentTick = tickSource->getTicks();
+
+    stdx::lock_guard<Latch> lk(_mutex);
+
+    BSONObjBuilder lsidBuilder(doc.subobjStart("lsid"));
+    _lsid.serialize(&lsidBuilder);
+    lsidBuilder.doneFast();
+    doc.append("txnNumber", _txnNumber);
+
+    if (_participants) {
+        doc.append("numParticipants", static_cast<long long>(_participants->size()));
+    }
+
+    doc.append("state", toString(_step));
+
+    const auto& singleStats =
+        _transactionCoordinatorMetricsObserver->getSingleTransactionCoordinatorStats();
+    singleStats.reportMetrics(doc, tickSource, currentTick);
+    singleStats.reportLastClient(parent);
+
+    if (_decision)
+        doc.append("decision", _decision->toBSON());
+
+    doc.append("deadline", _deadline);
+
+    parent.append("desc", "transaction coordinator");
+    parent.append("twoPhaseCommitCoordinator", doc.obj());
+}
+
+std::string TransactionCoordinator::toString(Step step) const {
+    switch (step) {
+        case Step::kInactive:
+            return "inactive";
+        case Step::kWritingParticipantList:
+            return "writingParticipantList";
+        case Step::kWaitingForVotes:
+            return "waitingForVotes";
+        case Step::kWritingDecision:
+            return "writingDecision";
+        case Step::kWaitingForDecisionAcks:
+            return "waitingForDecisionAck";
+        case Step::kDeletingCoordinatorDoc:
+            return "deletingCoordinatorDoc";
+        default:
+            MONGO_UNREACHABLE;
+    }
+}
+
+void TransactionCoordinator::_updateAssociatedClient(Client* client) {
+    stdx::lock_guard<Latch> lk(_mutex);
+    _transactionCoordinatorMetricsObserver->updateLastClientInfo(client);
 }
 
 }  // namespace mongo

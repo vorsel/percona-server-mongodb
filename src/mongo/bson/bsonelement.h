@@ -467,23 +467,7 @@ public:
         return ConstDataView(value() + 4).read<LittleEndian<int>>();
     }
 
-    /** Get the scope SavedContext of a CodeWScope data element.
-     *
-     *  This function is DEPRECATED, since it can error if there are
-     *  null chars in the codeWScopeCode. However, some existing indexes
-     *  may be based on an incorrect ordering derived from this function,
-     *  so it may still need to be used in certain cases.
-     *   */
-    const char* codeWScopeScopeDataUnsafe() const {
-        // This can error if there are null chars in the codeWScopeCode
-        return codeWScopeCode() + strlen(codeWScopeCode()) + 1;
-    }
-
     /* Get the scope SavedContext of a CodeWScope data element.
-     *
-     * This is the corrected version of codeWScopeScopeDataUnsafe(),
-     * but note that existing uses might rely on the behavior of
-     * that function so be careful in choosing which version to use.
      */
     const char* codeWScopeScopeData() const {
         return codeWScopeCode() + codeWScopeCodeLen();
@@ -510,9 +494,18 @@ public:
         if (binDataType() != ByteArrayDeprecated) {
             return binData(len);
         } else {
-            // Skip extra size
-            len = valuestrsize() - 4;
-            return value() + 5 + 4;
+            // Because, for some time, the shell has incorrectly created type 2 binary objects
+            // without the extra length, we try to identify if this object does or doesn't start
+            // with a length and skip past it when its present. See SERVER-41994
+            if (valuestrsize() >= 4 &&
+                ConstDataView(value() + 5).read<LittleEndian<int>>() == valuestrsize() - 4) {
+                // Skip extra size
+                len = valuestrsize() - 4;
+                return value() + 5 + 4;
+            } else {
+                len = valuestrsize();
+                return value() + 5;
+            }
         }
     }
 

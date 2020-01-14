@@ -265,7 +265,10 @@ private:
 /// Storage class used by both Document and MutableDocument
 class DocumentStorage : public RefCountable {
 public:
-    DocumentStorage() : DocumentStorage(BSONObj(), false, false) {}
+    DocumentStorage() : DocumentStorage(BSONObj(), false, false) {
+        // Aggregation assumes ownership of underlying BSON even if it is empty.
+        makeOwned();
+    }
     /**
      * Construct a storage from the BSON. The BSON is lazily processed as fields are requested from
      * the document. If we know that the BSON does not contain any metadata fields we can set the
@@ -277,7 +280,7 @@ public:
           _usedBytes(0),
           _numFields(0),
           _hashTabMask(0),
-          _bson(bson.getOwned()),
+          _bson(bson),
           _bsonIt(_bson),
           _stripMetadata(stripMetadata),
           _modified(modified) {}
@@ -368,6 +371,15 @@ public:
         return _bson.objsize();
     }
 
+    bool isOwned() const {
+        return _bson.isOwned();
+    }
+
+    void makeOwned() {
+        _bson = _bson.getOwned();
+        _bsonIt = BSONObjIterator(_bson);
+    }
+
     /**
      * Compute the space allocated for the metadata fields. Will account for space allocated for
      * unused metadata fields as well.
@@ -394,7 +406,9 @@ public:
      * WorkingSetMember.
      */
     const DocumentMetadataFields& metadata() const {
-        loadLazyMetadata();
+        if (_stripMetadata) {
+            loadLazyMetadata();
+        }
         return _metadataFields;
     }
 
@@ -408,6 +422,7 @@ public:
     }
 
     DocumentMetadataFields releaseMetadata() {
+        loadLazyMetadata();
         return std::move(_metadataFields);
     }
 
@@ -440,6 +455,7 @@ public:
     auto isModified() const {
         return _modified;
     }
+
     auto bsonObj() const {
         return _bson;
     }
@@ -517,6 +533,11 @@ private:
 
     BSONObj _bson;
     mutable BSONObjIterator _bsonIt;
+
+    // If '_stripMetadata' is true, tracks whether or not the metadata has been lazy-loaded from the
+    // backing '_bson' object. If so, then no attempt will be made to load the metadata again, even
+    // if the metadata has been released by a call to 'releaseMetadata()'.
+    mutable bool _haveLazyLoadedMetadata = false;
 
     mutable DocumentMetadataFields _metadataFields;
 

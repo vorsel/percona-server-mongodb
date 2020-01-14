@@ -29,7 +29,9 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/s/single_transaction_coordinator_stats.h"
+#include "mongo/util/net/socket_utils.h"
 
 namespace mongo {
 
@@ -92,6 +94,10 @@ void SingleTransactionCoordinatorStats::setDeletingCoordinatorDocStartTime(
 
     _deletingCoordinatorDocStartTime = curTick;
     _deletingCoordinatorDocStartWallClockTime = curWallClockTime;
+}
+
+void SingleTransactionCoordinatorStats::setRecoveredFromFailover() {
+    _hasRecoveredFromFailover = true;
 }
 
 Microseconds SingleTransactionCoordinatorStats::getDurationSinceCreation(
@@ -187,5 +193,59 @@ Microseconds SingleTransactionCoordinatorStats::getDeletingCoordinatorDocDuratio
     }
 
     return tickSource->ticksTo<Microseconds>(curTick - _deletingCoordinatorDocStartTime);
+}
+
+void SingleTransactionCoordinatorStats::reportMetrics(BSONObjBuilder& parent,
+                                                      TickSource* tickSource,
+                                                      TickSource::Tick curTick) const {
+    BSONObjBuilder stepDurationsBuilder;
+
+    invariant(_createTime);
+    parent.append("commitStartTime", _createWallClockTime);
+    parent.append("hasRecoveredFromFailover", _hasRecoveredFromFailover);
+
+    if (_writingParticipantListStartTime) {
+        const auto statValue = getWritingParticipantListDuration(tickSource, curTick);
+        stepDurationsBuilder.append("writingParticipantListMicros",
+                                    durationCount<Microseconds>(statValue));
+
+        const auto statValue2 = getTwoPhaseCommitDuration(tickSource, curTick);
+        stepDurationsBuilder.append("totalCommitDurationMicros",
+                                    durationCount<Microseconds>(statValue2));
+    }
+
+    if (_waitingForVotesStartTime) {
+        const auto statValue = getWaitingForVotesDuration(tickSource, curTick);
+        stepDurationsBuilder.append("waitingForVotesMicros",
+                                    durationCount<Microseconds>(statValue));
+    }
+
+    if (_writingDecisionStartTime) {
+        const auto statValue = getWritingDecisionDuration(tickSource, curTick);
+        stepDurationsBuilder.append("writingDecisionMicros",
+                                    durationCount<Microseconds>(statValue));
+    }
+
+    if (_waitingForDecisionAcksStartTime) {
+        const auto statValue = getWaitingForDecisionAcksDuration(tickSource, curTick);
+        stepDurationsBuilder.append("waitingForDecisionAcksMicros",
+                                    durationCount<Microseconds>(statValue));
+    }
+
+    if (_deletingCoordinatorDocStartTime) {
+        const auto statValue = getDeletingCoordinatorDocDuration(tickSource, curTick);
+        stepDurationsBuilder.append("deletingCoordinatorDocMicros",
+                                    durationCount<Microseconds>(statValue));
+    }
+
+    parent.append("stepDurations", stepDurationsBuilder.obj());
+}
+
+void SingleTransactionCoordinatorStats::reportLastClient(BSONObjBuilder& parent) const {
+    parent.append("client", _lastClientInfo.clientHostAndPort);
+    parent.append("host", getHostNameCachedAndPort());
+    parent.append("connectionId", _lastClientInfo.connectionId);
+    parent.append("appName", _lastClientInfo.appName);
+    parent.append("clientMetadata", _lastClientInfo.clientMetadata);
 }
 }  // namespace mongo

@@ -607,7 +607,7 @@ void UpdateStage::doInsert() {
         }
     }
 
-    if (MONGO_FAIL_POINT(hangBeforeUpsertPerformsInsert)) {
+    if (MONGO_unlikely(hangBeforeUpsertPerformsInsert.shouldFail())) {
         CurOpFailpointHelpers::waitWhileFailPointEnabled(
             &hangBeforeUpsertPerformsInsert, getOpCtx(), "hangBeforeUpsertPerformsInsert");
     }
@@ -662,8 +662,8 @@ PlanStage::StageState UpdateStage::doWork(WorkingSetID* out) {
                 BSONObj newObj = _specificStats.objInserted;
                 *out = _ws->allocate();
                 WorkingSetMember* member = _ws->get(*out);
-                member->obj = Snapshotted<BSONObj>(getOpCtx()->recoveryUnit()->getSnapshotId(),
-                                                   newObj.getOwned());
+                member->resetDocument(getOpCtx()->recoveryUnit()->getSnapshotId(),
+                                      newObj.getOwned());
                 member->transitionToOwnedObj();
                 return PlanStage::ADVANCED;
             }
@@ -749,8 +749,7 @@ PlanStage::StageState UpdateStage::doWork(WorkingSetID* out) {
         // is allowed to free the memory.
         member->makeObjOwnedIfNeeded();
 
-        // Save state before making changes
-        WorkingSetCommon::prepareForSnapshotChange(_ws);
+        // Save state before making changes.
         try {
             child()->saveState();
         } catch (const WriteConflictException&) {
@@ -759,14 +758,15 @@ PlanStage::StageState UpdateStage::doWork(WorkingSetID* out) {
 
         // If we care about the pre-updated version of the doc, save it out here.
         BSONObj oldObj;
+        SnapshotId oldSnapshot = member->doc.snapshotId();
         if (_params.request->shouldReturnOldDocs()) {
-            oldObj = member->obj.value().getOwned();
+            oldObj = member->doc.value().toBson().getOwned();
         }
 
         BSONObj newObj;
         try {
             // Do the update, get us the new version of the doc.
-            newObj = transformAndUpdate(member->obj, recordId);
+            newObj = transformAndUpdate({oldSnapshot, member->doc.value().toBson()}, recordId);
         } catch (const WriteConflictException&) {
             memberFreer.dismiss();  // Keep this member around so we can retry updating it.
             return prepareToRetryWSM(id, out);
@@ -775,11 +775,11 @@ PlanStage::StageState UpdateStage::doWork(WorkingSetID* out) {
         // Set member's obj to be the doc we want to return.
         if (_params.request->shouldReturnAnyDocs()) {
             if (_params.request->shouldReturnNewDocs()) {
-                member->obj = Snapshotted<BSONObj>(getOpCtx()->recoveryUnit()->getSnapshotId(),
-                                                   newObj.getOwned());
+                member->resetDocument(getOpCtx()->recoveryUnit()->getSnapshotId(),
+                                      newObj.getOwned());
             } else {
                 invariant(_params.request->shouldReturnOldDocs());
-                member->obj.setValue(oldObj);
+                member->resetDocument(oldSnapshot, oldObj);
             }
             member->recordId = RecordId();
             member->transitionToOwnedObj();
@@ -971,10 +971,9 @@ bool UpdateStage::checkUpdateChangesShardKeyFields(ScopedCollectionMetadata meta
             getOpCtx()->getTxnNumber() || !getOpCtx()->writesAreReplicated());
 
     if (!metadata->keyBelongsToMe(newShardKey)) {
-        if (MONGO_FAIL_POINT(hangBeforeThrowWouldChangeOwningShard)) {
+        if (MONGO_unlikely(hangBeforeThrowWouldChangeOwningShard.shouldFail())) {
             log() << "Hit hangBeforeThrowWouldChangeOwningShard failpoint";
-            MONGO_FAIL_POINT_PAUSE_WHILE_SET_OR_INTERRUPTED(getOpCtx(),
-                                                            hangBeforeThrowWouldChangeOwningShard);
+            hangBeforeThrowWouldChangeOwningShard.pauseWhileSet(getOpCtx());
         }
 
         uasserted(WouldChangeOwningShardInfo(oldObj.value(), newObj, false /* upsert */),

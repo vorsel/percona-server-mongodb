@@ -788,11 +788,6 @@ void IndexCatalogImpl::dropAllIndexes(OperationContext* opCtx,
             str::stream() << "cannot perform operation: an index build is currently running",
             !haveAnyIndexesInProgress());
 
-    // make sure nothing in progress
-    massert(17348,
-            "cannot dropAllIndexes when index builds in progress",
-            numIndexesTotal(opCtx) == numIndexesReady(opCtx));
-
     bool haveIdIndex = false;
 
     invariant(_buildingIndexes.size() == 0);
@@ -886,6 +881,7 @@ public:
             // future, and we will need to do another write to reach the minimum visible snapshot.
             commitTime = LogicalClock::getClusterTimeForReplicaSet(_opCtx).asTimestamp();
         }
+        _entry->setDropped();
         _collection->setMinimumVisibleSnapshot(commitTime.get());
     }
 
@@ -919,13 +915,13 @@ Status IndexCatalogImpl::dropIndexEntry(OperationContext* opCtx, IndexCatalogEnt
     auto released = _readyIndexes.release(entry->descriptor());
     if (released) {
         invariant(released.get() == entry);
-        opCtx->recoveryUnit()->registerChange(
-            new IndexRemoveChange(opCtx, _collection, &_readyIndexes, std::move(released)));
+        opCtx->recoveryUnit()->registerChange(std::make_unique<IndexRemoveChange>(
+            opCtx, _collection, &_readyIndexes, std::move(released)));
     } else {
         released = _buildingIndexes.release(entry->descriptor());
         invariant(released.get() == entry);
-        opCtx->recoveryUnit()->registerChange(
-            new IndexRemoveChange(opCtx, _collection, &_buildingIndexes, std::move(released)));
+        opCtx->recoveryUnit()->registerChange(std::make_unique<IndexRemoveChange>(
+            opCtx, _collection, &_buildingIndexes, std::move(released)));
     }
 
     CollectionQueryInfo::get(_collection).droppedIndex(opCtx, indexName);
@@ -1103,7 +1099,7 @@ const IndexDescriptor* IndexCatalogImpl::findShardKeyPrefixedIndex(OperationCont
         const IndexDescriptor* desc = ii->next()->descriptor();
         bool hasSimpleCollation = desc->infoObj().getObjectField("collation").isEmpty();
 
-        if (desc->isPartial())
+        if (desc->isPartial() || desc->isSparse())
             continue;
 
         if (!shardKey.isPrefixOf(desc->keyPattern(), SimpleBSONElementComparator::kInstance))
@@ -1170,8 +1166,8 @@ const IndexDescriptor* IndexCatalogImpl::refreshEntry(OperationContext* opCtx,
     // CollectionQueryInfo.
     auto oldEntry = _readyIndexes.release(oldDesc);
     invariant(oldEntry);
-    opCtx->recoveryUnit()->registerChange(
-        new IndexRemoveChange(opCtx, _collection, &_readyIndexes, std::move(oldEntry)));
+    opCtx->recoveryUnit()->registerChange(std::make_unique<IndexRemoveChange>(
+        opCtx, _collection, &_readyIndexes, std::move(oldEntry)));
     CollectionQueryInfo::get(_collection).droppedIndex(opCtx, indexName);
 
     // Ask the CollectionCatalogEntry for the new index spec.

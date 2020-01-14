@@ -29,17 +29,18 @@
 
 #pragma once
 
-#include "mongo/base/status_with.h"
+#include "mongo/base/status.h"
 #include "mongo/db/storage/record_store.h"
 
 namespace mongo {
 
 /**
  * Compacts collection.
- * See record_store.h for CompactStats and CompactOptions definitions.
+ *
+ * Returns the number of bytes of stable storage and index size that were freed. If the total
+ * size decreased, the return value is positive. Otherwise, the return value is negative.
  */
-StatusWith<CompactStats> compactCollection(OperationContext* opCtx,
-                                           const NamespaceString& collectionNss,
-                                           const CompactOptions* options);
+StatusWith<int64_t> compactCollection(OperationContext* opCtx,
+                                      const NamespaceString& collectionNss);
 
 }  // namespace mongo

@@ -269,17 +269,18 @@ public:
         : _wsid(_workingSet.allocate()), _member(_workingSet.get(_wsid)) {}
 
     void setRecordIdAndObj(BSONObj obj) {
-        _member->obj = {SnapshotId(), std::move(obj)};
+        _member->doc = {SnapshotId(), Document{obj}};
         _workingSet.transitionToRecordIdAndObj(_wsid);
     }
 
     void setOwnedObj(BSONObj obj) {
-        _member->obj = {SnapshotId(), std::move(obj)};
+        _member->doc = {SnapshotId(), Document{obj}};
         _workingSet.transitionToOwnedObj(_wsid);
     }
 
     void setRecordIdAndIdx(BSONObj keyPattern, BSONObj key) {
-        _member->keyData.push_back(IndexKeyDatum(std::move(keyPattern), std::move(key), nullptr));
+        _member->keyData.push_back(
+            IndexKeyDatum(std::move(keyPattern), std::move(key), 0, SnapshotId{}));
         _workingSet.transitionToRecordIdAndIdx(_wsid);
     }
 

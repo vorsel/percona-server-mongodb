@@ -37,6 +37,9 @@
 #include "asio/detail/push_options.hpp"
 #include "asio/detail/throw_error.hpp"
 #include "asio/error.hpp"
+#include "asio/ip/address.hpp"
+
+#include <arpa/inet.h>
 
 #include "mongo/util/log.h"
 #include "mongo/util/net/ssl/apple.hpp"
@@ -187,8 +190,12 @@ bool engine::_initSSL(stream_base::handshake_type type, asio::error_code& ec) {
     }
 
     if (!_remoteHostName.empty() && (status == ::errSecSuccess)) {
-        status =
-            ::SSLSetPeerDomainName(_ssl.get(), _remoteHostName.c_str(), _remoteHostName.size());
+        error_code ec;
+        ip::make_address(_remoteHostName, ec);
+        if (ec) {
+            status =
+                ::SSLSetPeerDomainName(_ssl.get(), _remoteHostName.c_str(), _remoteHostName.size());
+        }
     }
 
     if (status != ::errSecSuccess) {

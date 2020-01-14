@@ -42,6 +42,7 @@
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/storage/durable_catalog_feature_tracker.h"
 #include "mongo/db/storage/kv/kv_engine.h"
 #include "mongo/db/storage/record_store.h"
@@ -150,7 +151,7 @@ public:
 
     virtual void commit(boost::optional<Timestamp>) {}
     virtual void rollback() {
-        stdx::lock_guard<stdx::mutex> lk(_catalog->_identsLock);
+        stdx::lock_guard<Latch> lk(_catalog->_identsLock);
         _catalog->_idents.erase(_ident);
     }
 
@@ -165,7 +166,7 @@ public:
 
     virtual void commit(boost::optional<Timestamp>) {}
     virtual void rollback() {
-        stdx::lock_guard<stdx::mutex> lk(_catalog->_identsLock);
+        stdx::lock_guard<Latch> lk(_catalog->_identsLock);
         _catalog->_idents[_ident] = _entry;
     }
 
@@ -470,7 +471,7 @@ void DurableCatalogImpl::init(OperationContext* opCtx) {
 }
 
 std::vector<NamespaceString> DurableCatalogImpl::getAllCollections() const {
-    stdx::lock_guard<stdx::mutex> lk(_identsLock);
+    stdx::lock_guard<Latch> lk(_identsLock);
     std::vector<NamespaceString> result;
     for (NSToIdentMap::const_iterator it = _idents.begin(); it != _idents.end(); ++it) {
         result.push_back(NamespaceString(it->first));
@@ -486,13 +487,13 @@ Status DurableCatalogImpl::_addEntry(OperationContext* opCtx,
 
     const string ident = _newUniqueIdent(nss, "collection");
 
-    stdx::lock_guard<stdx::mutex> lk(_identsLock);
+    stdx::lock_guard<Latch> lk(_identsLock);
     Entry& old = _idents[nss.toString()];
     if (!old.ident.empty()) {
         return Status(ErrorCodes::NamespaceExists, "collection already exists");
     }
 
-    opCtx->recoveryUnit()->registerChange(new AddIdentChange(this, nss.ns()));
+    opCtx->recoveryUnit()->registerChange(std::make_unique<AddIdentChange>(this, nss.ns()));
 
     BSONObj obj;
     {
@@ -516,7 +517,7 @@ Status DurableCatalogImpl::_addEntry(OperationContext* opCtx,
 }
 
 std::string DurableCatalogImpl::getCollectionIdent(const NamespaceString& nss) const {
-    stdx::lock_guard<stdx::mutex> lk(_identsLock);
+    stdx::lock_guard<Latch> lk(_identsLock);
     NSToIdentMap::const_iterator it = _idents.find(nss.toString());
     invariant(it != _idents.end());
     return it->second.ident;
@@ -535,7 +536,7 @@ BSONObj DurableCatalogImpl::_findEntry(OperationContext* opCtx,
                                        RecordId* out) const {
     RecordId dl;
     {
-        stdx::lock_guard<stdx::mutex> lk(_identsLock);
+        stdx::lock_guard<Latch> lk(_identsLock);
         NSToIdentMap::const_iterator it = _idents.find(nss.toString());
         invariant(it != _idents.end(), str::stream() << "Did not find collection. Ns: " << nss);
         dl = it->second.storedLoc;
@@ -576,6 +577,17 @@ void DurableCatalogImpl::putMetaData(OperationContext* opCtx,
     BSONObj obj = _findEntry(opCtx, nss, &loc);
 
     {
+        // Remove the index spec 'ns' field if FCV is set to 4.4.
+        if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+            serverGlobalParams.featureCompatibility.getVersion() ==
+                ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
+            for (size_t i = 0; i < md.indexes.size(); i++) {
+                if (md.indexes[i].spec.hasField("ns")) {
+                    md.indexes[i].spec = md.indexes[i].spec.removeField("ns");
+                }
+            }
+        }
+
         // rebuilt doc
         BSONObjBuilder b;
         b.append("md", md.toBSON());
@@ -588,21 +600,6 @@ void DurableCatalogImpl::putMetaData(OperationContext* opCtx,
         for (size_t i = 0; i < md.indexes.size(); i++) {
             const auto index = md.indexes[i];
             string name = index.name();
-
-            // It is illegal for multikey paths to exist without the multikey flag set on the index,
-            // but it may be possible for multikey to be set on the index while having no multikey
-            // paths. If any of the paths are multikey, then the entire index should also be marked
-            // multikey.
-            const bool hasMultiKeyPaths =
-                std::any_of(index.multikeyPaths.begin(),
-                            index.multikeyPaths.end(),
-                            [](auto& pathSet) { return pathSet.size() > 0; });
-            invariant(!hasMultiKeyPaths || index.multikey,
-                      fmt::format("The 'multikey' field for index {} was false with non-empty "
-                                  "'multikeyPaths'. New metadata: {}, catalog document: {}",
-                                  name,
-                                  md.toBSON().toString(),
-                                  obj.toString()));
 
             // fix ident map
             BSONElement e = oldIdentMap[name];
@@ -655,13 +652,13 @@ Status DurableCatalogImpl::_replaceEntry(OperationContext* opCtx,
         fassert(28522, status);
     }
 
-    stdx::lock_guard<stdx::mutex> lk(_identsLock);
+    stdx::lock_guard<Latch> lk(_identsLock);
     const NSToIdentMap::iterator fromIt = _idents.find(fromNss.toString());
     invariant(fromIt != _idents.end());
 
     opCtx->recoveryUnit()->registerChange(
-        new RemoveIdentChange(this, fromNss.ns(), fromIt->second));
-    opCtx->recoveryUnit()->registerChange(new AddIdentChange(this, toNss.ns()));
+        std::make_unique<RemoveIdentChange>(this, fromNss.ns(), fromIt->second));
+    opCtx->recoveryUnit()->registerChange(std::make_unique<AddIdentChange>(this, toNss.ns()));
 
     _idents.erase(fromIt);
     _idents[toNss.toString()] = Entry(old["ident"].String(), loc);
@@ -676,13 +673,14 @@ Status DurableCatalogImpl::_replaceEntry(OperationContext* opCtx,
 
 Status DurableCatalogImpl::_removeEntry(OperationContext* opCtx, const NamespaceString& nss) {
     invariant(opCtx->lockState()->isCollectionLockedForMode(nss, MODE_X));
-    stdx::lock_guard<stdx::mutex> lk(_identsLock);
+    stdx::lock_guard<Latch> lk(_identsLock);
     const NSToIdentMap::iterator it = _idents.find(nss.toString());
     if (it == _idents.end()) {
         return Status(ErrorCodes::NamespaceNotFound, "collection not found");
     }
 
-    opCtx->recoveryUnit()->registerChange(new RemoveIdentChange(this, nss.ns(), it->second));
+    opCtx->recoveryUnit()->registerChange(
+        std::make_unique<RemoveIdentChange>(this, nss.ns(), it->second));
 
     LOG(1) << "deleting metadata for " << nss << " @ " << it->second.storedLoc;
     _rs->deleteRecord(opCtx, it->second.storedLoc);
@@ -695,7 +693,7 @@ std::vector<std::string> DurableCatalogImpl::getAllIdentsForDB(StringData db) co
     std::vector<std::string> v;
 
     {
-        stdx::lock_guard<stdx::mutex> lk(_identsLock);
+        stdx::lock_guard<Latch> lk(_identsLock);
         for (NSToIdentMap::const_iterator it = _idents.begin(); it != _idents.end(); ++it) {
             NamespaceString ns(it->first);
             if (ns.db() != db)
@@ -763,13 +761,13 @@ StatusWith<std::string> DurableCatalogImpl::newOrphanedIdent(OperationContext* o
                                      NamespaceString::kOrphanCollectionPrefix + identNs)
                          .ns();
 
-    stdx::lock_guard<stdx::mutex> lk(_identsLock);
+    stdx::lock_guard<Latch> lk(_identsLock);
     Entry& old = _idents[ns];
     if (!old.ident.empty()) {
         return Status(ErrorCodes::NamespaceExists,
                       str::stream() << ns << " already exists in the catalog");
     }
-    opCtx->recoveryUnit()->registerChange(new AddIdentChange(this, ns));
+    opCtx->recoveryUnit()->registerChange(std::make_unique<AddIdentChange>(this, ns));
 
     // Generate a new UUID for the orphaned collection.
     CollectionOptions optionsWithUUID;
@@ -985,7 +983,7 @@ Status DurableCatalogImpl::removeIndex(OperationContext* opCtx,
 
     // Lazily remove to isolate underlying engine from rollback.
     opCtx->recoveryUnit()->registerChange(
-        new RemoveIndexChange(opCtx, _engine, md.options.uuid, ns, indexName, ident));
+        std::make_unique<RemoveIndexChange>(opCtx, _engine, md.options.uuid, ns, indexName, ident));
     return Status::OK();
 }
 
@@ -1030,7 +1028,8 @@ Status DurableCatalogImpl::prepareForIndexBuild(OperationContext* opCtx,
     const Status status = kvEngine->createGroupedSortedDataInterface(
         opCtx, getCollectionOptions(opCtx, ns), ident, spec, prefix);
     if (status.isOK()) {
-        opCtx->recoveryUnit()->registerChange(new AddIndexChange(opCtx, _engine, ident));
+        opCtx->recoveryUnit()->registerChange(
+            std::make_unique<AddIndexChange>(opCtx, _engine, ident));
     }
 
     return status;

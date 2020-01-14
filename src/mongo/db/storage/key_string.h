@@ -347,6 +347,31 @@ public:
      */
     std::string toString() const;
 
+    // Serializes this Value into a storable format with TypeBits information. The serialized
+    // format takes the following form:
+    //   [keystring size][keystring encoding][typebits encoding]
+    void serialize(BufBuilder& buf) const {
+        buf.appendNum(_ksSize);                  // Serialize size of Keystring
+        buf.appendBuf(_buffer.get(), _bufSize);  // Serialize Keystring + Typebits
+    }
+
+    // Deserialize the Value from a serialized format.
+    static Value deserialize(BufReader& buf, KeyString::Version version) {
+        const int32_t sizeOfKeystring = buf.read<LittleEndian<int32_t>>();
+        const void* keystringPtr = buf.skip(sizeOfKeystring);
+
+        BufBuilder newBuf;
+        newBuf.appendBuf(keystringPtr, sizeOfKeystring);
+
+        auto typeBits = TypeBits::fromBuffer(version, &buf);  // advances the buf
+        if (typeBits.isAllZeros()) {
+            newBuf.appendChar(0);
+        } else {
+            newBuf.appendBuf(typeBits.getBuffer(), typeBits.getSize());
+        }
+        return {version, sizeOfKeystring, newBuf.len(), newBuf.release()};
+    }
+
     /// Members for Sorter
     struct SorterDeserializeSettings {
         SorterDeserializeSettings(Version version) : keyStringVersion(version) {}
@@ -354,29 +379,16 @@ public:
     };
 
     void serializeForSorter(BufBuilder& buf) const {
-        buf.appendNum(_ksSize);                                      // Serialize size of Keystring
-        buf.appendBuf(_buffer.get(), _ksSize);                       // Serialize Keystring
-        buf.appendBuf(_buffer.get() + _ksSize, _bufSize - _ksSize);  // Serialize Typebits
+        serialize(buf);
     }
 
     static Value deserializeForSorter(BufReader& buf, const SorterDeserializeSettings& settings) {
-        const int32_t sizeOfKeystring = buf.read<LittleEndian<int32_t>>();
-        const void* keystringPtr = buf.skip(sizeOfKeystring);
-
-        BufBuilder newBuf;
-        newBuf.appendBuf(keystringPtr, sizeOfKeystring);
-
-        auto typeBits = TypeBits::fromBuffer(settings.keyStringVersion, &buf);  // advances the buf
-        if (typeBits.isAllZeros()) {
-            newBuf.appendChar(0);
-        } else {
-            newBuf.appendBuf(typeBits.getBuffer(), typeBits.getSize());
-        }
-        return {settings.keyStringVersion, sizeOfKeystring, newBuf.len(), newBuf.release()};
+        return deserialize(buf, settings.keyStringVersion);
     }
 
     int memUsageForSorter() const {
-        return sizeof(Value) + _bufSize;
+        // Use buffer capacity as a more accurate measure of memory usage.
+        return sizeof(Value) + _buffer.capacity();
     }
     /// Members for Sorter
 
@@ -545,6 +557,11 @@ public:
     void appendSetAsArray(const BSONElementSet& set, const StringTransformFn& f = nullptr);
 
     /**
+     * Appends a Discriminator byte and kEnd byte to a key string.
+     */
+    void appendDiscriminator(const Discriminator discriminator);
+
+    /**
      * Resets to an empty state.
      * Equivalent to but faster than *this = Builder(ord, discriminator)
      */
@@ -652,7 +669,6 @@ private:
     void _appendDoubleWithoutTypeBits(const double num, DecimalContinuationMarker dcm, bool invert);
     void _appendHugeDecimalWithoutTypeBits(const Decimal128 dec, bool invert);
     void _appendTinyDecimalWithoutTypeBits(const Decimal128 dec, const double bin, bool invert);
-    void _appendDiscriminator(const Discriminator discriminator);
     void _appendEnd();
 
     template <typename T>
@@ -664,7 +680,7 @@ private:
 
     void _doneAppending() {
         if (_state == BuildState::kAppendingBSONElements) {
-            _appendDiscriminator(_discriminator);
+            appendDiscriminator(_discriminator);
         }
     }
 
@@ -685,7 +701,7 @@ private:
 
         switch (_state) {
             case BuildState::kEmpty:
-                invariant(to == BuildState::kAppendingBSONElements ||
+                invariant(to == BuildState::kAppendingBSONElements || to == BuildState::kEndAdded ||
                           to == BuildState::kAppendedRecordID);
                 break;
             case BuildState::kAppendingBSONElements:

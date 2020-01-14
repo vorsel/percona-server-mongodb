@@ -58,6 +58,12 @@ public:
                            Date_t commitDeadline);
 
     /**
+     * Outputs a vector of BSON documents to the ops out-param containing information about active
+     * and idle coordinators in the system.
+     */
+    void reportCoordinators(OperationContext* opCtx, bool includeIdle, std::vector<BSONObj>* ops);
+
+    /**
      * If a coordinator for the (lsid, txnNumber) exists, delivers the participant list to the
      * coordinator, which will cause the coordinator to start coordinating the commit if the
      * coordinator had not yet received a list, and returns a Future that will contain the decision
@@ -140,7 +146,7 @@ private:
     std::shared_ptr<CatalogAndScheduler> _catalogAndSchedulerToCleanup;
 
     // Protects the state below
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("TransactionCoordinatorService::_mutex");
 
     // The catalog + scheduler instantiated at the last step-up attempt. When nullptr, it means
     // onStepUp has not been called yet after the last stepDown (or construction).

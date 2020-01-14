@@ -55,6 +55,7 @@
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/idempotency_test_fixture.h"
 #include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/oplog_applier.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/storage_interface.h"
@@ -64,7 +65,7 @@
 #include "mongo/db/session_txn_record_gen.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/transaction_participant_gen.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/clock_source_mock.h"
@@ -91,7 +92,7 @@ OplogEntry makeOplogEntry(OpTypeEnum opType, NamespaceString nss, OptionalCollec
                       boost::none,                 // o2
                       {},                          // sessionInfo
                       boost::none,                 // upsert
-                      boost::none,                 // wall clock time
+                      Date_t(),                    // wall clock time
                       boost::none,                 // statement id
                       boost::none,   // optime of previous write within same transaction
                       boost::none,   // pre-image optime
@@ -112,7 +113,7 @@ SyncTailForTest::SyncTailForTest()
                nullptr,  // storage interface
                SyncTail::MultiSyncApplyFunc(),
                nullptr,  // writer pool
-               SyncTailTest::makeInitialSyncOptions()) {}
+               repl::OplogApplier::Options(repl::OplogApplication::Mode::kInitialSync)) {}
 
 /**
  * Creates collection options suitable for oplog.
@@ -190,7 +191,7 @@ auto parseFromOplogEntryArray(const BSONObj& obj, int elem) {
 TEST_F(SyncTailTest, SyncApplyInsertDocumentDatabaseMissing) {
     NamespaceString nss("test.t");
     auto op = makeOplogEntry(OpTypeEnum::kInsert, nss, {});
-    ASSERT_THROWS(SyncTail::syncApply(_opCtx.get(), &op, OplogApplication::Mode::kSecondary),
+    ASSERT_THROWS(_syncApplyWrapper(_opCtx.get(), &op, OplogApplication::Mode::kSecondary),
                   ExceptionFor<ErrorCodes::NamespaceNotFound>);
 }
 
@@ -205,7 +206,7 @@ TEST_F(SyncTailTest, SyncApplyInsertDocumentCollectionLookupByUUIDFails) {
     createDatabase(_opCtx.get(), nss.db());
     NamespaceString otherNss(nss.getSisterNS("othername"));
     auto op = makeOplogEntry(OpTypeEnum::kInsert, otherNss, kUuid);
-    ASSERT_THROWS(SyncTail::syncApply(_opCtx.get(), &op, OplogApplication::Mode::kSecondary),
+    ASSERT_THROWS(_syncApplyWrapper(_opCtx.get(), &op, OplogApplication::Mode::kSecondary),
                   ExceptionFor<ErrorCodes::NamespaceNotFound>);
 }
 
@@ -224,7 +225,7 @@ TEST_F(SyncTailTest, SyncApplyInsertDocumentCollectionMissing) {
     // which in the case of this test just ignores such errors. This tests mostly that we don't
     // implicitly create the collection and lock the database in MODE_X.
     auto op = makeOplogEntry(OpTypeEnum::kInsert, nss, {});
-    ASSERT_THROWS(SyncTail::syncApply(_opCtx.get(), &op, OplogApplication::Mode::kSecondary),
+    ASSERT_THROWS(_syncApplyWrapper(_opCtx.get(), &op, OplogApplication::Mode::kSecondary),
                   ExceptionFor<ErrorCodes::NamespaceNotFound>);
     ASSERT_FALSE(collectionExists(_opCtx.get(), nss));
 }
@@ -277,10 +278,11 @@ TEST_F(SyncTailTest, SyncApplyDeleteDocumentCollectionLockedByUUID) {
 
 TEST_F(SyncTailTest, SyncApplyCommand) {
     NamespaceString nss("test.t");
-    auto op = BSON("op"
-                   << "c"
-                   << "ns" << nss.getCommandNS().ns() << "o" << BSON("create" << nss.coll()) << "ts"
-                   << Timestamp(1, 1) << "ui" << UUID::gen());
+    auto op =
+        BSON("op"
+             << "c"
+             << "ns" << nss.getCommandNS().ns() << "wall" << Date_t() << "o"
+             << BSON("create" << nss.coll()) << "ts" << Timestamp(1, 1) << "ui" << UUID::gen());
     bool applyCmdCalled = false;
     _opObserver->onCreateCollectionFn = [&](OperationContext* opCtx,
                                             Collection*,
@@ -290,20 +292,16 @@ TEST_F(SyncTailTest, SyncApplyCommand) {
         applyCmdCalled = true;
         ASSERT_TRUE(opCtx);
         ASSERT_TRUE(opCtx->lockState()->isDbLockedForMode(nss.db(), MODE_X));
-        ASSERT_TRUE(opCtx->writesAreReplicated());
-        ASSERT_FALSE(documentValidationDisabled(opCtx));
         ASSERT_EQUALS(nss, collNss);
         return Status::OK();
     };
-    ASSERT_TRUE(_opCtx->writesAreReplicated());
-    ASSERT_FALSE(documentValidationDisabled(_opCtx.get()));
     auto entry = OplogEntry(op);
-    ASSERT_OK(SyncTail::syncApply(_opCtx.get(), &entry, OplogApplication::Mode::kInitialSync));
+    ASSERT_OK(_syncApplyWrapper(_opCtx.get(), &entry, OplogApplication::Mode::kInitialSync));
     ASSERT_TRUE(applyCmdCalled);
 }
 
 DEATH_TEST_F(SyncTailTest, MultiApplyAbortsWhenNoOperationsAreGiven, "!ops.empty()") {
-    auto writerPool = OplogApplier::makeWriterPool();
+    auto writerPool = makeReplWriterPool();
     SyncTail syncTail(nullptr,
                       getConsistencyMarkers(),
                       getStorageInterface(),
@@ -318,7 +316,7 @@ bool _testOplogEntryIsForCappedCollection(OperationContext* opCtx,
                                           StorageInterface* const storageInterface,
                                           const NamespaceString& nss,
                                           const CollectionOptions& options) {
-    auto writerPool = OplogApplier::makeWriterPool();
+    auto writerPool = makeReplWriterPool();
     MultiApplier::Operations operationsApplied;
     auto applyOperationFn = [&operationsApplied](OperationContext* opCtx,
                                                  MultiApplier::OperationPtrs* operationsToApply,
@@ -381,7 +379,7 @@ TEST_F(SyncTailTest, MultiSyncApplyUsesSyncApplyToApplyOperation) {
                       nullptr,
                       OplogApplier::Options(OplogApplication::Mode::kSecondary));
     ASSERT_OK(multiSyncApply(_opCtx.get(), &ops, &syncTail, &pathInfo));
-    // Collection should be created after SyncTail::syncApply() processes operation.
+    // Collection should be created after syncApply() processes operation.
     ASSERT_TRUE(AutoGetCollectionForReadCommand(_opCtx.get(), nss).getCollection());
 }
 
@@ -437,7 +435,7 @@ protected:
             _insertOp2->getOpTime());
         _opObserver->onInsertsFn =
             [&](OperationContext*, const NamespaceString& nss, const std::vector<BSONObj>& docs) {
-                stdx::lock_guard<stdx::mutex> lock(_insertMutex);
+                stdx::lock_guard<Latch> lock(_insertMutex);
                 if (nss.isOplog() || nss == _nss1 || nss == _nss2 ||
                     nss == NamespaceString::kSessionTransactionsTableNamespace) {
                     _insertedDocs[nss].insert(_insertedDocs[nss].end(), docs.begin(), docs.end());
@@ -445,7 +443,7 @@ protected:
                     FAIL("Unexpected insert") << " into " << nss << " first doc: " << docs.front();
             };
 
-        _writerPool = OplogApplier::makeWriterPool();
+        _writerPool = makeReplWriterPool();
     }
 
     void tearDown() override {
@@ -484,7 +482,7 @@ protected:
     std::unique_ptr<ThreadPool> _writerPool;
 
 private:
-    stdx::mutex _insertMutex;
+    Mutex _insertMutex = MONGO_MAKE_LATCH("MultiOplogEntrySyncTailTest::_insertMutex");
 };
 
 TEST_F(MultiOplogEntrySyncTailTest, MultiApplyUnpreparedTransactionSeparate) {
@@ -507,7 +505,7 @@ TEST_F(MultiOplogEntrySyncTailTest, MultiApplyUnpreparedTransactionSeparate) {
     checkTxnTable(_lsid,
                   _txnNum,
                   _insertOp1->getOpTime(),
-                  *_insertOp1->getWallClockTime(),
+                  _insertOp1->getWallClockTime(),
                   expectedStartOpTime,
                   DurableTxnStateEnum::kInProgress);
 
@@ -524,7 +522,7 @@ TEST_F(MultiOplogEntrySyncTailTest, MultiApplyUnpreparedTransactionSeparate) {
     checkTxnTable(_lsid,
                   _txnNum,
                   _insertOp1->getOpTime(),
-                  *_insertOp1->getWallClockTime(),
+                  _insertOp1->getWallClockTime(),
                   expectedStartOpTime,
                   DurableTxnStateEnum::kInProgress);
 
@@ -538,7 +536,7 @@ TEST_F(MultiOplogEntrySyncTailTest, MultiApplyUnpreparedTransactionSeparate) {
     checkTxnTable(_lsid,
                   _txnNum,
                   _commitOp->getOpTime(),
-                  *_commitOp->getWallClockTime(),
+                  _commitOp->getWallClockTime(),
                   boost::none,
                   DurableTxnStateEnum::kCommitted);
 }
@@ -546,14 +544,12 @@ TEST_F(MultiOplogEntrySyncTailTest, MultiApplyUnpreparedTransactionSeparate) {
 TEST_F(MultiOplogEntrySyncTailTest, MultiApplyUnpreparedTransactionAllAtOnce) {
     // Skipping writes to oplog proves we're testing the code path which does not rely on reading
     // the oplog.
-    OplogApplier::Options applierOpts(OplogApplication::Mode::kSecondary);
-    applierOpts.skipWritesToOplog = true;
     SyncTail syncTail(nullptr,
                       getConsistencyMarkers(),
                       getStorageInterface(),
                       multiSyncApply,
                       _writerPool.get(),
-                      applierOpts);
+                      OplogApplier::Options(OplogApplication::Mode::kRecovering));
 
     // Apply both inserts and the commit in a single batch.  We expect no oplog entries to
     // be inserted (because we've set skipWritesToOplog), and both entries to be committed.
@@ -564,7 +560,7 @@ TEST_F(MultiOplogEntrySyncTailTest, MultiApplyUnpreparedTransactionAllAtOnce) {
     checkTxnTable(_lsid,
                   _txnNum,
                   _commitOp->getOpTime(),
-                  *_commitOp->getWallClockTime(),
+                  _commitOp->getWallClockTime(),
                   boost::none,
                   DurableTxnStateEnum::kCommitted);
 }
@@ -618,7 +614,7 @@ TEST_F(MultiOplogEntrySyncTailTest, MultiApplyUnpreparedTransactionTwoBatches) {
     checkTxnTable(_lsid,
                   _txnNum,
                   insertOps[0].getOpTime(),
-                  *insertOps[0].getWallClockTime(),
+                  insertOps[0].getWallClockTime(),
                   expectedStartOpTime,
                   DurableTxnStateEnum::kInProgress);
 
@@ -632,7 +628,7 @@ TEST_F(MultiOplogEntrySyncTailTest, MultiApplyUnpreparedTransactionTwoBatches) {
     checkTxnTable(_lsid,
                   _txnNum,
                   commitOp.getOpTime(),
-                  *commitOp.getWallClockTime(),
+                  commitOp.getWallClockTime(),
                   boost::none,
                   DurableTxnStateEnum::kCommitted);
 
@@ -739,7 +735,7 @@ TEST_F(MultiOplogEntrySyncTailTest, MultiApplyTwoTransactionsOneBatch) {
     checkTxnTable(_lsid,
                   txnNum2,
                   commitOp2.getOpTime(),
-                  *commitOp2.getWallClockTime(),
+                  commitOp2.getWallClockTime(),
                   boost::none,
                   DurableTxnStateEnum::kCommitted);
 
@@ -820,7 +816,7 @@ protected:
         _abortSinglePrepareApplyOp;
 
 private:
-    stdx::mutex _insertMutex;
+    Mutex _insertMutex = MONGO_MAKE_LATCH("MultiOplogEntryPreparedTransactionTest::_insertMutex");
 };
 
 TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyPreparedTransactionSteadyState) {
@@ -844,7 +840,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyPreparedTransactionStea
     checkTxnTable(_lsid,
                   _txnNum,
                   _insertOp1->getOpTime(),
-                  *_insertOp1->getWallClockTime(),
+                  _insertOp1->getWallClockTime(),
                   expectedStartOpTime,
                   DurableTxnStateEnum::kInProgress);
 
@@ -859,7 +855,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyPreparedTransactionStea
     checkTxnTable(_lsid,
                   _txnNum,
                   _prepareWithPrevOp->getOpTime(),
-                  *_prepareWithPrevOp->getWallClockTime(),
+                  _prepareWithPrevOp->getWallClockTime(),
                   expectedStartOpTime,
                   DurableTxnStateEnum::kPrepared);
 
@@ -872,7 +868,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyPreparedTransactionStea
     checkTxnTable(_lsid,
                   _txnNum,
                   _commitPrepareWithPrevOp->getOpTime(),
-                  *_commitPrepareWithPrevOp->getWallClockTime(),
+                  _commitPrepareWithPrevOp->getWallClockTime(),
                   boost::none,
                   DurableTxnStateEnum::kCommitted);
 }
@@ -893,7 +889,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyAbortPreparedTransactio
     checkTxnTable(_lsid,
                   _txnNum,
                   _insertOp1->getOpTime(),
-                  *_insertOp1->getWallClockTime(),
+                  _insertOp1->getWallClockTime(),
                   expectedStartOpTime,
                   DurableTxnStateEnum::kInProgress);
 
@@ -904,7 +900,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyAbortPreparedTransactio
     checkTxnTable(_lsid,
                   _txnNum,
                   _prepareWithPrevOp->getOpTime(),
-                  *_prepareWithPrevOp->getWallClockTime(),
+                  _prepareWithPrevOp->getWallClockTime(),
                   expectedStartOpTime,
                   DurableTxnStateEnum::kPrepared);
 
@@ -917,7 +913,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyAbortPreparedTransactio
     checkTxnTable(_lsid,
                   _txnNum,
                   _abortPrepareWithPrevOp->getOpTime(),
-                  *_abortPrepareWithPrevOp->getWallClockTime(),
+                  _abortPrepareWithPrevOp->getWallClockTime(),
                   boost::none,
                   DurableTxnStateEnum::kAborted);
 }
@@ -928,7 +924,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyPreparedTransactionInit
                       getStorageInterface(),
                       multiSyncApply,
                       _writerPool.get(),
-                      SyncTailTest::makeInitialSyncOptions());
+                      repl::OplogApplier::Options(repl::OplogApplication::Mode::kInitialSync));
 
     // Apply a batch with the insert operations.  This should result in the oplog entries
     // being put in the oplog and updating the transaction table, but not actually being applied
@@ -943,7 +939,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyPreparedTransactionInit
     checkTxnTable(_lsid,
                   _txnNum,
                   _insertOp1->getOpTime(),
-                  *_insertOp1->getWallClockTime(),
+                  _insertOp1->getWallClockTime(),
                   expectedStartOpTime,
                   DurableTxnStateEnum::kInProgress);
 
@@ -957,7 +953,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyPreparedTransactionInit
     checkTxnTable(_lsid,
                   _txnNum,
                   _prepareWithPrevOp->getOpTime(),
-                  *_prepareWithPrevOp->getWallClockTime(),
+                  _prepareWithPrevOp->getWallClockTime(),
                   expectedStartOpTime,
                   DurableTxnStateEnum::kPrepared);
 
@@ -970,7 +966,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyPreparedTransactionInit
     checkTxnTable(_lsid,
                   _txnNum,
                   _commitPrepareWithPrevOp->getOpTime(),
-                  *_commitPrepareWithPrevOp->getWallClockTime(),
+                  _commitPrepareWithPrevOp->getWallClockTime(),
                   boost::none,
                   DurableTxnStateEnum::kCommitted);
 }
@@ -993,7 +989,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyPreparedTransactionReco
                       getStorageInterface(),
                       multiSyncApply,
                       _writerPool.get(),
-                      SyncTailTest::makeRecoveryOptions());
+                      OplogApplier::Options(OplogApplication::Mode::kRecovering));
 
     // Apply a batch with the insert operations.  This should have no effect, because this is
     // recovery.
@@ -1005,7 +1001,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyPreparedTransactionReco
     checkTxnTable(_lsid,
                   _txnNum,
                   _insertOp1->getOpTime(),
-                  *_insertOp1->getWallClockTime(),
+                  _insertOp1->getWallClockTime(),
                   expectedStartOpTime,
                   DurableTxnStateEnum::kInProgress);
 
@@ -1018,7 +1014,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyPreparedTransactionReco
     checkTxnTable(_lsid,
                   _txnNum,
                   _prepareWithPrevOp->getOpTime(),
-                  *_prepareWithPrevOp->getWallClockTime(),
+                  _prepareWithPrevOp->getWallClockTime(),
                   expectedStartOpTime,
                   DurableTxnStateEnum::kPrepared);
 
@@ -1031,7 +1027,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyPreparedTransactionReco
     checkTxnTable(_lsid,
                   _txnNum,
                   _commitPrepareWithPrevOp->getOpTime(),
-                  *_commitPrepareWithPrevOp->getWallClockTime(),
+                  _commitPrepareWithPrevOp->getWallClockTime(),
                   boost::none,
                   DurableTxnStateEnum::kCommitted);
 }
@@ -1055,7 +1051,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplySingleApplyOpsPreparedT
     checkTxnTable(_lsid,
                   _txnNum,
                   _singlePrepareApplyOp->getOpTime(),
-                  *_singlePrepareApplyOp->getWallClockTime(),
+                  _singlePrepareApplyOp->getWallClockTime(),
                   expectedStartOpTime,
                   DurableTxnStateEnum::kPrepared);
 
@@ -1068,7 +1064,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplySingleApplyOpsPreparedT
     checkTxnTable(_lsid,
                   _txnNum,
                   _commitSinglePrepareApplyOp->getOpTime(),
-                  *_commitSinglePrepareApplyOp->getWallClockTime(),
+                  _commitSinglePrepareApplyOp->getWallClockTime(),
                   boost::none,
                   DurableTxnStateEnum::kCommitted);
 }
@@ -1100,7 +1096,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyEmptyApplyOpsPreparedTr
     checkTxnTable(_lsid,
                   _txnNum,
                   emptyPrepareApplyOp.getOpTime(),
-                  *emptyPrepareApplyOp.getWallClockTime(),
+                  emptyPrepareApplyOp.getWallClockTime(),
                   expectedStartOpTime,
                   DurableTxnStateEnum::kPrepared);
 
@@ -1113,7 +1109,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyEmptyApplyOpsPreparedTr
     checkTxnTable(_lsid,
                   _txnNum,
                   _commitSinglePrepareApplyOp->getOpTime(),
-                  *_commitSinglePrepareApplyOp->getWallClockTime(),
+                  _commitSinglePrepareApplyOp->getWallClockTime(),
                   boost::none,
                   DurableTxnStateEnum::kCommitted);
 }
@@ -1133,7 +1129,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyAbortSingleApplyOpsPrep
     checkTxnTable(_lsid,
                   _txnNum,
                   _singlePrepareApplyOp->getOpTime(),
-                  *_singlePrepareApplyOp->getWallClockTime(),
+                  _singlePrepareApplyOp->getWallClockTime(),
                   expectedStartOpTime,
                   DurableTxnStateEnum::kPrepared);
 
@@ -1146,7 +1142,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyAbortSingleApplyOpsPrep
     checkTxnTable(_lsid,
                   _txnNum,
                   _abortSinglePrepareApplyOp->getOpTime(),
-                  *_abortSinglePrepareApplyOp->getWallClockTime(),
+                  _abortSinglePrepareApplyOp->getWallClockTime(),
                   boost::none,
                   DurableTxnStateEnum::kAborted);
 }
@@ -1158,7 +1154,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest,
                       getStorageInterface(),
                       multiSyncApply,
                       _writerPool.get(),
-                      SyncTailTest::makeInitialSyncOptions());
+                      repl::OplogApplier::Options(repl::OplogApplication::Mode::kInitialSync));
 
     const auto expectedStartOpTime = _singlePrepareApplyOp->getOpTime();
 
@@ -1172,7 +1168,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest,
     checkTxnTable(_lsid,
                   _txnNum,
                   _singlePrepareApplyOp->getOpTime(),
-                  *_singlePrepareApplyOp->getWallClockTime(),
+                  _singlePrepareApplyOp->getWallClockTime(),
                   expectedStartOpTime,
                   DurableTxnStateEnum::kPrepared);
 
@@ -1185,7 +1181,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest,
     checkTxnTable(_lsid,
                   _txnNum,
                   _commitSinglePrepareApplyOp->getOpTime(),
-                  *_commitSinglePrepareApplyOp->getWallClockTime(),
+                  _commitSinglePrepareApplyOp->getWallClockTime(),
                   boost::none,
                   DurableTxnStateEnum::kCommitted);
 }
@@ -1208,7 +1204,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest,
                       getStorageInterface(),
                       multiSyncApply,
                       _writerPool.get(),
-                      SyncTailTest::makeRecoveryOptions());
+                      OplogApplier::Options(OplogApplication::Mode::kRecovering));
 
     const auto expectedStartOpTime = _singlePrepareApplyOp->getOpTime();
 
@@ -1221,7 +1217,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest,
     checkTxnTable(_lsid,
                   _txnNum,
                   _singlePrepareApplyOp->getOpTime(),
-                  *_singlePrepareApplyOp->getWallClockTime(),
+                  _singlePrepareApplyOp->getWallClockTime(),
                   expectedStartOpTime,
                   DurableTxnStateEnum::kPrepared);
 
@@ -1234,7 +1230,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest,
     checkTxnTable(_lsid,
                   _txnNum,
                   _commitSinglePrepareApplyOp->getOpTime(),
-                  *_commitSinglePrepareApplyOp->getWallClockTime(),
+                  _commitSinglePrepareApplyOp->getWallClockTime(),
                   boost::none,
                   DurableTxnStateEnum::kCommitted);
 }
@@ -2199,11 +2195,12 @@ TEST_F(SyncTailTest, LogSlowOpApplicationWhenSuccessful) {
     auto entry = makeOplogEntry(OpTypeEnum::kInsert, nss, {});
 
     startCapturingLogMessages();
-    ASSERT_OK(SyncTail::syncApply(_opCtx.get(), &entry, OplogApplication::Mode::kSecondary));
+    ASSERT_OK(_syncApplyWrapper(_opCtx.get(), &entry, OplogApplication::Mode::kSecondary));
 
     // Use a builder for easier escaping. We expect the operation to be logged.
     StringBuilder expected;
-    expected << "applied op: CRUD { ts: Timestamp(1, 1), t: 1, v: 2, op: \"i\", ns: \"test.t\", o: "
+    expected << "applied op: CRUD { ts: Timestamp(1, 1), t: 1, v: 2, op: \"i\", ns: \"test.t\", "
+                "wall: new Date(0), o: "
                 "{ _id: 0 } }, took "
              << applyDuration << "ms";
     ASSERT_EQUALS(1, countLogLinesContaining(expected.str()));
@@ -2220,7 +2217,7 @@ TEST_F(SyncTailTest, DoNotLogSlowOpApplicationWhenFailed) {
     auto entry = makeOplogEntry(OpTypeEnum::kInsert, nss, {});
 
     startCapturingLogMessages();
-    ASSERT_THROWS(SyncTail::syncApply(_opCtx.get(), &entry, OplogApplication::Mode::kSecondary),
+    ASSERT_THROWS(_syncApplyWrapper(_opCtx.get(), &entry, OplogApplication::Mode::kSecondary),
                   ExceptionFor<ErrorCodes::NamespaceNotFound>);
 
     // Use a builder for easier escaping. We expect the operation to *not* be logged
@@ -2244,7 +2241,7 @@ TEST_F(SyncTailTest, DoNotLogNonSlowOpApplicationWhenSuccessful) {
     auto entry = makeOplogEntry(OpTypeEnum::kInsert, nss, {});
 
     startCapturingLogMessages();
-    ASSERT_OK(SyncTail::syncApply(_opCtx.get(), &entry, OplogApplication::Mode::kSecondary));
+    ASSERT_OK(_syncApplyWrapper(_opCtx.get(), &entry, OplogApplication::Mode::kSecondary));
 
     // Use a builder for easier escaping. We expect the operation to *not* be logged,
     // since it wasn't slow to apply.
@@ -2363,7 +2360,7 @@ TEST_F(SyncTailTxnTableTest, SimpleWriteWithTxn) {
                                    sessionInfo,
                                    date);
 
-    auto writerPool = OplogApplier::makeWriterPool();
+    auto writerPool = makeReplWriterPool();
     SyncTail syncTail(nullptr,
                       getConsistencyMarkers(),
                       getStorageInterface(),
@@ -2398,7 +2395,7 @@ TEST_F(SyncTailTxnTableTest, WriteWithTxnMixedWithDirectWriteToTxnTable) {
                                    {},
                                    Date_t::now());
 
-    auto writerPool = OplogApplier::makeWriterPool();
+    auto writerPool = makeReplWriterPool();
     SyncTail syncTail(nullptr,
                       getConsistencyMarkers(),
                       getStorageInterface(),
@@ -2446,7 +2443,7 @@ TEST_F(SyncTailTxnTableTest, InterleavedWriteWithTxnMixedWithDirectDeleteToTxnTa
                                     sessionInfo,
                                     date);
 
-    auto writerPool = OplogApplier::makeWriterPool();
+    auto writerPool = makeReplWriterPool();
     SyncTail syncTail(nullptr,
                       getConsistencyMarkers(),
                       getStorageInterface(),
@@ -2482,7 +2479,7 @@ TEST_F(SyncTailTxnTableTest, InterleavedWriteWithTxnMixedWithDirectUpdateToTxnTa
                                    {},
                                    Date_t::now());
 
-    auto writerPool = OplogApplier::makeWriterPool();
+    auto writerPool = makeReplWriterPool();
     SyncTail syncTail(nullptr,
                       getConsistencyMarkers(),
                       getStorageInterface(),
@@ -2541,7 +2538,7 @@ TEST_F(SyncTailTxnTableTest, RetryableWriteThenMultiStatementTxnWriteOnSameSessi
                                                       StmtId(1),
                                                       txnInsertOpTime);
 
-    auto writerPool = OplogApplier::makeWriterPool();
+    auto writerPool = makeReplWriterPool();
     SyncTail syncTail(nullptr,
                       getConsistencyMarkers(),
                       getStorageInterface(),
@@ -2555,7 +2552,7 @@ TEST_F(SyncTailTxnTableTest, RetryableWriteThenMultiStatementTxnWriteOnSameSessi
                         *sessionInfo.getSessionId(),
                         *sessionInfo.getTxnNumber(),
                         txnCommitOpTime,
-                        *txnCommitOp.getWallClockTime(),
+                        txnCommitOp.getWallClockTime(),
                         boost::none,
                         DurableTxnStateEnum::kCommitted);
 }
@@ -2606,7 +2603,7 @@ TEST_F(SyncTailTxnTableTest, MultiStatementTxnWriteThenRetryableWriteOnSameSessi
                                             sessionInfo,
                                             date);
 
-    auto writerPool = OplogApplier::makeWriterPool();
+    auto writerPool = makeReplWriterPool();
     SyncTail syncTail(nullptr,
                       getConsistencyMarkers(),
                       getStorageInterface(),
@@ -2620,7 +2617,7 @@ TEST_F(SyncTailTxnTableTest, MultiStatementTxnWriteThenRetryableWriteOnSameSessi
                         *sessionInfo.getSessionId(),
                         *sessionInfo.getTxnNumber(),
                         retryableInsertOpTime,
-                        *retryableInsertOp.getWallClockTime(),
+                        retryableInsertOp.getWallClockTime(),
                         boost::none,
                         boost::none);
 }
@@ -2674,7 +2671,7 @@ TEST_F(SyncTailTxnTableTest, MultiApplyUpdatesTheTransactionTable) {
     auto opNoTxn = makeInsertDocumentOplogEntryWithSessionInfo(
         {Timestamp(Seconds(7), 0), 1LL}, ns3, BSON("_id" << 0), info);
 
-    auto writerPool = OplogApplier::makeWriterPool();
+    auto writerPool = makeReplWriterPool();
     SyncTail syncTail(nullptr,
                       getConsistencyMarkers(),
                       getStorageInterface(),
@@ -2752,7 +2749,7 @@ TEST_F(SyncTailTxnTableTest, SessionMigrationNoOpEntriesShouldUpdateTxnTable) {
                                                 insertSessionInfo,
                                                 outerInsertDate);
 
-    auto writerPool = OplogApplier::makeWriterPool();
+    auto writerPool = makeReplWriterPool();
     SyncTail syncTail(nullptr,
                       getConsistencyMarkers(),
                       getStorageInterface(),
@@ -2779,7 +2776,7 @@ TEST_F(SyncTailTxnTableTest, PreImageNoOpEntriesShouldNotUpdateTxnTable) {
                                                   preImageSessionInfo,
                                                   preImageDate);
 
-    auto writerPool = OplogApplier::makeWriterPool();
+    auto writerPool = makeReplWriterPool();
     SyncTail syncTail(nullptr,
                       getConsistencyMarkers(),
                       getStorageInterface(),
@@ -2808,7 +2805,7 @@ TEST_F(SyncTailTxnTableTest, NonMigrateNoOpEntriesShouldNotUpdateTxnTable) {
                                 sessionInfo,
                                 Date_t::now());
 
-    auto writerPool = OplogApplier::makeWriterPool();
+    auto writerPool = makeReplWriterPool();
     SyncTail syncTail(nullptr,
                       getConsistencyMarkers(),
                       getStorageInterface(),
@@ -2880,7 +2877,7 @@ TEST_F(IdempotencyTestTxns, CommitUnpreparedTransaction) {
                         lsid,
                         txnNum,
                         commitOp.getOpTime(),
-                        *commitOp.getWallClockTime(),
+                        commitOp.getWallClockTime(),
                         boost::none,
                         DurableTxnStateEnum::kCommitted);
     ASSERT_TRUE(docExists(_opCtx.get(), nss, doc));
@@ -2918,7 +2915,7 @@ TEST_F(IdempotencyTestTxns, CommitUnpreparedTransactionDataPartiallyApplied) {
                         lsid,
                         txnNum,
                         commitOp.getOpTime(),
-                        *commitOp.getWallClockTime(),
+                        commitOp.getWallClockTime(),
                         boost::none,
                         DurableTxnStateEnum::kCommitted);
     ASSERT_TRUE(docExists(_opCtx.get(), nss, doc));
@@ -2944,7 +2941,7 @@ TEST_F(IdempotencyTestTxns, CommitPreparedTransaction) {
                         lsid,
                         txnNum,
                         commitOp.getOpTime(),
-                        *commitOp.getWallClockTime(),
+                        commitOp.getWallClockTime(),
                         boost::none,
                         DurableTxnStateEnum::kCommitted);
     ASSERT_TRUE(docExists(_opCtx.get(), nss, doc));
@@ -2984,7 +2981,7 @@ TEST_F(IdempotencyTestTxns, CommitPreparedTransactionDataPartiallyApplied) {
                         lsid,
                         txnNum,
                         commitOp.getOpTime(),
-                        *commitOp.getWallClockTime(),
+                        commitOp.getWallClockTime(),
                         boost::none,
                         DurableTxnStateEnum::kCommitted);
     ASSERT_TRUE(docExists(_opCtx.get(), nss, doc));
@@ -3009,7 +3006,7 @@ TEST_F(IdempotencyTestTxns, AbortPreparedTransaction) {
                         lsid,
                         txnNum,
                         abortOp.getOpTime(),
-                        *abortOp.getWallClockTime(),
+                        abortOp.getWallClockTime(),
                         boost::none,
                         DurableTxnStateEnum::kAborted);
     ASSERT_FALSE(docExists(_opCtx.get(), nss, doc));
@@ -3033,7 +3030,7 @@ TEST_F(IdempotencyTestTxns, SinglePartialTxnOp) {
                         lsid,
                         txnNum,
                         partialOp.getOpTime(),
-                        *partialOp.getWallClockTime(),
+                        partialOp.getWallClockTime(),
                         expectedStartOpTime,
                         DurableTxnStateEnum::kInProgress);
 
@@ -3063,7 +3060,7 @@ TEST_F(IdempotencyTestTxns, MultiplePartialTxnOps) {
                         lsid,
                         txnNum,
                         partialOp1.getOpTime(),
-                        *partialOp1.getWallClockTime(),
+                        partialOp1.getWallClockTime(),
                         expectedStartOpTime,
                         DurableTxnStateEnum::kInProgress);
     // Document should not be visible yet.
@@ -3094,7 +3091,7 @@ TEST_F(IdempotencyTestTxns, CommitUnpreparedTransactionWithPartialTxnOps) {
                         lsid,
                         txnNum,
                         commitOp.getOpTime(),
-                        *commitOp.getWallClockTime(),
+                        commitOp.getWallClockTime(),
                         boost::none,
                         DurableTxnStateEnum::kCommitted);
     ASSERT_TRUE(docExists(_opCtx.get(), nss, doc));
@@ -3133,7 +3130,7 @@ TEST_F(IdempotencyTestTxns, CommitTwoUnpreparedTransactionsWithPartialTxnOpsAtOn
                         lsid,
                         txnNum2,
                         commitOp2.getOpTime(),
-                        *commitOp2.getWallClockTime(),
+                        commitOp2.getWallClockTime(),
                         boost::none,
                         DurableTxnStateEnum::kCommitted);
     ASSERT_TRUE(docExists(_opCtx.get(), nss, doc));
@@ -3171,7 +3168,7 @@ TEST_F(IdempotencyTestTxns, CommitAndAbortTwoTransactionsWithPartialTxnOpsAtOnce
                         lsid,
                         txnNum2,
                         commitOp2.getOpTime(),
-                        *commitOp2.getWallClockTime(),
+                        commitOp2.getWallClockTime(),
                         boost::none,
                         DurableTxnStateEnum::kCommitted);
     ASSERT_FALSE(docExists(_opCtx.get(), nss, doc));
@@ -3210,7 +3207,7 @@ TEST_F(IdempotencyTestTxns, CommitUnpreparedTransactionWithPartialTxnOpsAndDataP
                         lsid,
                         txnNum,
                         commitOp.getOpTime(),
-                        *commitOp.getWallClockTime(),
+                        commitOp.getWallClockTime(),
                         boost::none,
                         DurableTxnStateEnum::kCommitted);
     ASSERT_TRUE(docExists(_opCtx.get(), nss, doc));
@@ -3239,7 +3236,7 @@ TEST_F(IdempotencyTestTxns, PrepareTransactionWithPartialTxnOps) {
                         lsid,
                         txnNum,
                         prepareOp.getOpTime(),
-                        *prepareOp.getWallClockTime(),
+                        prepareOp.getWallClockTime(),
                         partialOp.getOpTime(),
                         DurableTxnStateEnum::kPrepared);
     // Document should not be visible yet.
@@ -3262,7 +3259,7 @@ TEST_F(IdempotencyTestTxns, EmptyPrepareTransaction) {
                         lsid,
                         txnNum,
                         prepareOp.getOpTime(),
-                        *prepareOp.getWallClockTime(),
+                        prepareOp.getWallClockTime(),
                         prepareOp.getOpTime(),
                         DurableTxnStateEnum::kPrepared);
 }
@@ -3290,7 +3287,7 @@ TEST_F(IdempotencyTestTxns, CommitPreparedTransactionWithPartialTxnOps) {
                         lsid,
                         txnNum,
                         commitOp.getOpTime(),
-                        *commitOp.getWallClockTime(),
+                        commitOp.getWallClockTime(),
                         boost::none,
                         DurableTxnStateEnum::kCommitted);
     ASSERT_TRUE(docExists(_opCtx.get(), nss, doc));
@@ -3329,7 +3326,7 @@ TEST_F(IdempotencyTestTxns, CommitTwoPreparedTransactionsWithPartialTxnOpsAtOnce
                         lsid,
                         txnNum2,
                         commitOp2.getOpTime(),
-                        *commitOp2.getWallClockTime(),
+                        commitOp2.getWallClockTime(),
                         boost::none,
                         DurableTxnStateEnum::kCommitted);
     ASSERT_TRUE(docExists(_opCtx.get(), nss, doc));
@@ -3368,7 +3365,7 @@ TEST_F(IdempotencyTestTxns, CommitPreparedTransactionWithPartialTxnOpsAndDataPar
                         lsid,
                         txnNum,
                         commitOp.getOpTime(),
-                        *commitOp.getWallClockTime(),
+                        commitOp.getWallClockTime(),
                         boost::none,
                         DurableTxnStateEnum::kCommitted);
     ASSERT_TRUE(docExists(_opCtx.get(), nss, doc));
@@ -3398,7 +3395,7 @@ TEST_F(IdempotencyTestTxns, AbortPreparedTransactionWithPartialTxnOps) {
                         lsid,
                         txnNum,
                         abortOp.getOpTime(),
-                        *abortOp.getWallClockTime(),
+                        abortOp.getWallClockTime(),
                         boost::none,
                         DurableTxnStateEnum::kAborted);
     ASSERT_FALSE(docExists(_opCtx.get(), nss, doc));
@@ -3423,7 +3420,7 @@ TEST_F(IdempotencyTestTxns, AbortInProgressTransaction) {
                         lsid,
                         txnNum,
                         abortOp.getOpTime(),
-                        *abortOp.getWallClockTime(),
+                        abortOp.getWallClockTime(),
                         boost::none,
                         DurableTxnStateEnum::kAborted);
     ASSERT_FALSE(docExists(_opCtx.get(), nss, doc));

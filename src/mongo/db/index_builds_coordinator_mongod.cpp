@@ -80,8 +80,8 @@ void IndexBuildsCoordinatorMongod::shutdown() {
     // Stop new scheduling.
     _threadPool.shutdown();
 
-    // Signal active builds to stop and wait for them to stop.
-    interruptAllIndexBuildsForShutdown("Index build interrupted due to shutdown.");
+    // Wait for all active builds to stop.
+    waitForAllIndexBuildsToStopForShutdown();
 
     // Wait for active threads to finish.
     _threadPool.join();
@@ -110,12 +110,7 @@ IndexBuildsCoordinatorMongod::startIndexBuild(OperationContext* opCtx,
         return statusWithOptionalResult.getValue().get();
     }
 
-    auto replState = [&]() {
-        stdx::unique_lock<stdx::mutex> lk(_mutex);
-        auto it = _allIndexBuilds.find(buildUUID);
-        invariant(it != _allIndexBuilds.end());
-        return it->second;
-    }();
+    auto replState = invariant(_getIndexBuild(buildUUID));
 
     // Run index build in-line if we are transitioning between replication modes.
     // While the RSTLExclusive is being held, an async thread in the thread pool would not be
@@ -172,7 +167,7 @@ IndexBuildsCoordinatorMongod::startIndexBuild(OperationContext* opCtx,
     ](auto status) noexcept {
         // Clean up the index build if we failed to schedule it.
         if (!status.isOK()) {
-            stdx::unique_lock<stdx::mutex> lk(_mutex);
+            stdx::unique_lock<Latch> lk(_mutex);
 
             // Unregister the index build before setting the promises,
             // so callers do not see the build again.
@@ -184,7 +179,7 @@ IndexBuildsCoordinatorMongod::startIndexBuild(OperationContext* opCtx,
             return;
         }
 
-        MONGO_FAIL_POINT_PAUSE_WHILE_SET(hangAfterInitializingIndexBuild);
+        hangAfterInitializingIndexBuild.pauseWhileSet();
 
         auto opCtx = Client::getCurrent()->makeOperationContext();
 
@@ -216,13 +211,6 @@ IndexBuildsCoordinatorMongod::startIndexBuild(OperationContext* opCtx,
     return replState->sharedPromise.getFuture();
 }
 
-Status IndexBuildsCoordinatorMongod::commitIndexBuild(OperationContext* opCtx,
-                                                      const std::vector<BSONObj>& specs,
-                                                      const UUID& buildUUID) {
-    // TODO: not yet implemented.
-    return Status::OK();
-}
-
 Status IndexBuildsCoordinatorMongod::voteCommitIndexBuild(const UUID& buildUUID,
                                                           const HostAndPort& hostAndPort) {
     // TODO: not yet implemented.
@@ -249,7 +237,7 @@ Status IndexBuildsCoordinatorMongod::setCommitQuorum(OperationContext* opCtx,
 
     UUID collectionUUID = collection->uuid();
 
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
     auto collectionIt = _collectionIndexBuilds.find(collectionUUID);
     if (collectionIt == _collectionIndexBuilds.end()) {
         return Status(ErrorCodes::IndexNotFound,

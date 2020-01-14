@@ -34,8 +34,8 @@
 
 #include "mongo/base/status.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/condition_variable.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/util/fail_point_service.h"
 
@@ -107,9 +107,9 @@ private:
     std::shared_ptr<TaskExecutor> _executor;
 };
 
-MONGO_FAIL_POINT_DECLARE(ScopedTaskExecutorHangBeforeSchedule);
-MONGO_FAIL_POINT_DECLARE(ScopedTaskExecutorHangExitBeforeSchedule);
-MONGO_FAIL_POINT_DECLARE(ScopedTaskExecutorHangAfterSchedule);
+extern FailPoint ScopedTaskExecutorHangBeforeSchedule;
+extern FailPoint ScopedTaskExecutorHangExitBeforeSchedule;
+extern FailPoint ScopedTaskExecutorHangAfterSchedule;
 
 }  // namespace executor
 }  // namespace mongo

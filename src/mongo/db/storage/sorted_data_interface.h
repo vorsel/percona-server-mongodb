@@ -78,7 +78,8 @@ public:
                                                        bool dupsAllowed) = 0;
 
     /**
-     * Insert an entry into the index with the specified KeyString and RecordId.
+     * Insert an entry into the index with the specified KeyString, which must have a RecordId
+     * appended to the end.
      *
      * @param opCtx the transaction under which the insert takes place
      * @param dupsAllowed true if duplicate keys are allowed, and false
@@ -91,11 +92,11 @@ public:
      */
     virtual Status insert(OperationContext* opCtx,
                           const KeyString::Value& keyString,
-                          const RecordId& loc,
                           bool dupsAllowed) = 0;
 
     /**
-     * Remove the entry from the index with the specified KeyString and RecordId.
+     * Remove the entry from the index with the specified KeyString, which must have a RecordId
+     * appended to the end.
      *
      * @param opCtx the transaction under which the remove takes place
      * @param dupsAllowed true if duplicate keys are allowed, and false
@@ -103,7 +104,6 @@ public:
      */
     virtual void unindex(OperationContext* opCtx,
                          const KeyString::Value& keyString,
-                         const RecordId& loc,
                          bool dupsAllowed) = 0;
 
     /**
@@ -271,18 +271,6 @@ public:
         //
 
         /**
-         * Seeks to the provided key and returns current position.
-         *
-         * TODO consider removing once IndexSeekPoint has been cleaned up a bit. In particular,
-         * need a way to specify use whole keyPrefix and nothing else and to support the
-         * combination of empty and exclusive. Should also make it easier to construct for the
-         * common cases.
-         */
-        virtual boost::optional<IndexKeyEntry> seek(const BSONObj& key,
-                                                    bool inclusive,
-                                                    RequestedInfo parts = kKeyAndLoc) = 0;
-
-        /**
          * Seeks to the provided keyString and returns the KeyStringEntry.
          * The provided keyString has discriminator information encoded.
          */
@@ -300,11 +288,26 @@ public:
          * Seeks to a key with a hint to the implementation that you only want exact matches. If
          * an exact match can't be found, boost::none will be returned and the resulting
          * position of the cursor is unspecified.
+         *
+         * This will not accept a KeyString with a Discriminator other than kInclusive. Since
+         * keys are not stored with Discriminators, an exact match would never be found.
          */
-        virtual boost::optional<IndexKeyEntry> seekExact(const BSONObj& key,
-                                                         RequestedInfo parts = kKeyAndLoc) = 0;
+        virtual boost::optional<KeyStringEntry> seekExactForKeyString(
+            const KeyString::Value& keyString) = 0;
 
-        virtual boost::optional<KeyStringEntry> seekExact(const KeyString::Value& keyString) = 0;
+        /**
+         * Seeks to a key with a hint to the implementation that you only want exact matches. If
+         * an exact match can't be found, boost::none will be returned and the resulting
+         * position of the cursor is unspecified.
+         *
+         * This will not accept a KeyString with a Discriminator other than kInclusive. Since
+         * keys are not stored with Discriminators, an exact match would never be found.
+         *
+         * Unlike the previous method, this one will return IndexKeyEntry if an exact match is
+         * found.
+         */
+        virtual boost::optional<IndexKeyEntry> seekExact(const KeyString::Value& keyString,
+                                                         RequestedInfo parts = kKeyAndLoc) = 0;
 
         //
         // Saving and restoring state

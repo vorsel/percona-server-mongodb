@@ -82,8 +82,16 @@ void ValueStorage::verifyRefCountingIfShould() const {
         case RegEx:
         case Code:
         case Symbol:
-            // the above types reference data when not using short-string optimization
-            verify(refCounter == !shortStr);
+            // If this is using the short-string optimization, it must not have a ref-counted
+            // pointer.
+            invariant(!shortStr || !refCounter);
+
+            // If this is _not_ using the short string optimization, it must be storing a
+            // ref-counted pointer. One exception: in the BSONElement constructor of Value, it is
+            // possible for this ValueStorage to get constructed as a type but never initialized;
+            // the ValueStorage gets left as a nullptr and not marked as ref-counted, which is ok
+            // (SERVER-43205).
+            invariant(shortStr || (refCounter || !genericRCPtr));
             break;
 
         case NumberDecimal:
@@ -92,13 +100,13 @@ void ValueStorage::verifyRefCountingIfShould() const {
         case DBRef:
         case CodeWScope:
             // the above types always reference external data.
-            verify(refCounter);
-            verify(bool(genericRCPtr));
+            invariant(refCounter);
+            invariant(bool(genericRCPtr));
             break;
 
         case Object:
             // Objects either hold a NULL ptr or should be ref-counting
-            verify(refCounter == bool(genericRCPtr));
+            invariant(refCounter == bool(genericRCPtr));
             break;
     }
 }
@@ -151,7 +159,8 @@ Document ValueStorage::getDocument() const {
 }
 
 // not in header because document is fwd declared
-Value::Value(const BSONObj& obj) : _storage(Object, Document(obj)) {}
+Value::Value(const BSONObj& obj) : _storage(Object, Document(obj.getOwned())) {}
+Value::Value(const Document& doc) : _storage(Object, doc.isOwned() ? doc : doc.getOwned()) {}
 
 Value::Value(const BSONElement& elem) : _storage(elem.type()) {
     switch (elem.type()) {
@@ -174,7 +183,7 @@ Value::Value(const BSONElement& elem) : _storage(elem.type()) {
             break;
 
         case Object: {
-            _storage.putDocument(Document(elem.embeddedObject()));
+            _storage.putDocument(Document(elem.embeddedObject().getOwned()));
             break;
         }
 

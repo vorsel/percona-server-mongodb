@@ -144,7 +144,7 @@ ShardingCatalogClientImpl::ShardingCatalogClientImpl(
 ShardingCatalogClientImpl::~ShardingCatalogClientImpl() = default;
 
 void ShardingCatalogClientImpl::startup() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     if (_started) {
         return;
     }
@@ -156,7 +156,7 @@ void ShardingCatalogClientImpl::startup() {
 void ShardingCatalogClientImpl::shutDown(OperationContext* opCtx) {
     LOG(1) << "ShardingCatalogClientImpl::shutDown() called.";
     {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
         _inShutdown = true;
     }
 
@@ -709,7 +709,7 @@ Status ShardingCatalogClientImpl::applyChunkOpsDeprecated(OperationContext* opCt
     // TODO (Dianna) This fail point needs to be reexamined when CommitChunkMigration is in:
     // migrations will no longer be able to exercise it, so split or merge will need to do so.
     // SERVER-22659.
-    if (MONGO_FAIL_POINT(failApplyChunkOps)) {
+    if (MONGO_unlikely(failApplyChunkOps.shouldFail())) {
         status = Status(ErrorCodes::InternalError, "Failpoint 'failApplyChunkOps' generated error");
     }
 

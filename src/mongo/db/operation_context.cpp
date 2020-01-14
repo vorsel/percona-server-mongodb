@@ -35,8 +35,8 @@
 
 #include "mongo/db/client.h"
 #include "mongo/db/service_context.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/platform/random.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/transport/baton.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/clock_source.h"
@@ -139,10 +139,10 @@ bool OperationContext::hasDeadlineExpired() const {
     if (!hasDeadline()) {
         return false;
     }
-    if (MONGO_FAIL_POINT(maxTimeNeverTimeOut)) {
+    if (MONGO_unlikely(maxTimeNeverTimeOut.shouldFail())) {
         return false;
     }
-    if (MONGO_FAIL_POINT(maxTimeAlwaysTimeOut)) {
+    if (MONGO_unlikely(maxTimeAlwaysTimeOut.shouldFail())) {
         return true;
     }
 
@@ -216,12 +216,12 @@ Status OperationContext::checkForInterruptNoAssert() noexcept {
         return Status::OK();
     }
 
-    MONGO_FAIL_POINT_BLOCK(checkForInterruptFail, scopedFailPoint) {
-        if (opShouldFail(getClient(), scopedFailPoint.getData())) {
+    checkForInterruptFail.executeIf(
+        [&](auto&&) {
             log() << "set pending kill on op " << getOpID() << ", for checkForInterruptFail";
             markKilled();
-        }
-    }
+        },
+        [&](auto&& data) { return opShouldFail(getClient(), data); });
 
     const auto killStatus = getKillStatus();
     if (killStatus != ErrorCodes::OK) {
@@ -266,7 +266,7 @@ Status OperationContext::checkForInterruptNoAssert() noexcept {
 // - _baton is notified (someone's queuing work for the baton)
 // - _baton::run returns (timeout fired / networking is ready / socket disconnected)
 StatusWith<stdx::cv_status> OperationContext::waitForConditionOrInterruptNoAssertUntil(
-    stdx::condition_variable& cv, stdx::unique_lock<stdx::mutex>& m, Date_t deadline) noexcept {
+    stdx::condition_variable& cv, BasicLockableAdapter m, Date_t deadline) noexcept {
     invariant(getClient());
 
     if (auto status = checkForInterruptNoAssert(); !status.isOK()) {
@@ -281,7 +281,7 @@ StatusWith<stdx::cv_status> OperationContext::waitForConditionOrInterruptNoAsser
     // maxTimeNeverTimeOut is set) then we assume that the incongruity is due to a clock mismatch
     // and return _timeoutError regardless. To prevent this behaviour, only consider the op's
     // deadline in the event that the maxTimeNeverTimeOut failpoint is not set.
-    bool opHasDeadline = (hasDeadline() && !MONGO_FAIL_POINT(maxTimeNeverTimeOut));
+    bool opHasDeadline = (hasDeadline() && !MONGO_unlikely(maxTimeNeverTimeOut.shouldFail()));
 
     if (opHasDeadline) {
         deadline = std::min(deadline, getDeadline());

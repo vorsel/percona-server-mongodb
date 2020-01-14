@@ -669,7 +669,7 @@ ExitCode _initAndListen(int listenPort) {
     }
 #endif
 
-    if (MONGO_FAIL_POINT(shutdownAtStartup)) {
+    if (MONGO_unlikely(shutdownAtStartup.shouldFail())) {
         log() << "starting clean exit via failpoint";
         exitCleanly(EXIT_CLEAN);
     }
@@ -894,17 +894,21 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
             opCtx = uniqueOpCtx.get();
         }
 
-        try {
-            // For faster tests, we allow a short wait time with setParameter.
-            auto waitTime = repl::waitForStepDownOnNonCommandShutdown.load()
-                ? Milliseconds(Seconds(10))
-                : Milliseconds(100);
-
-            replCoord->stepDown(opCtx, false /* force */, waitTime, Seconds(120));
-        } catch (const ExceptionFor<ErrorCodes::NotMaster>&) {
-            // ignore not master errors
-        } catch (const DBException& e) {
-            log() << "Failed to stepDown in non-command initiated shutdown path " << e.toString();
+        // If this is a single node replica set, then we don't have to wait
+        // for any secondaries. Ignore stepdown.
+        if (repl::ReplicationCoordinator::get(serviceContext)->getConfig().getNumMembers() != 1) {
+            try {
+                // For faster tests, we allow a short wait time with setParameter.
+                auto waitTime = repl::waitForStepDownOnNonCommandShutdown.load()
+                    ? Milliseconds(Seconds(10))
+                    : Milliseconds(100);
+                replCoord->stepDown(opCtx, false /* force */, waitTime, Seconds(120));
+            } catch (const ExceptionFor<ErrorCodes::NotMaster>&) {
+                // ignore not master errors
+            } catch (const DBException& e) {
+                log() << "Failed to stepDown in non-command initiated shutdown path "
+                      << e.toString();
+            }
         }
     }
 
@@ -1023,18 +1027,11 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
 
     // We should always be able to acquire the global lock at shutdown.
     //
-    // TODO: This call chain uses the locker directly, because we do not want to start an
-    // operation context, which also instantiates a recovery unit. Also, using the
-    // lockGlobalBegin/lockGlobalComplete sequence, we avoid taking the flush lock.
-    //
     // For a Windows service, dbexit does not call exit(), so we must leak the lock outside
     // of this function to prevent any operations from running that need a lock.
     //
     LockerImpl* globalLocker = new LockerImpl();
-    LockResult result = globalLocker->lockGlobalBegin(MODE_X, Date_t::max());
-    if (result == LOCK_WAITING) {
-        globalLocker->lockGlobalComplete(Date_t::max());
-    }
+    globalLocker->lockGlobal(MODE_X);
 
     // Global storage engine may not be started in all cases before we exit
     if (serviceContext->getStorageEngine()) {

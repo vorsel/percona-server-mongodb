@@ -50,6 +50,11 @@ public:
                   Date_t curWallClockTime);
 
     /**
+     * Called when the transaction coordinator has recovered and continues the commit.
+     */
+    void onRecoveryFromFailover();
+
+    /**
      * Updates relevant metrics when a transaction coordinator is about to write the participant
      * list.
      */
@@ -111,6 +116,12 @@ public:
     const SingleTransactionCoordinatorStats& getSingleTransactionCoordinatorStats() const {
         return _singleTransactionCoordinatorStats;
     }
+
+
+    /**
+     * Save information about the last client that interacted with this transaction.
+     */
+    void updateLastClientInfo(Client* client);
 
 private:
     /**

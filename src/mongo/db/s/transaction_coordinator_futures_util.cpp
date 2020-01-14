@@ -60,14 +60,14 @@ AsyncWorkScheduler::AsyncWorkScheduler(ServiceContext* serviceContext)
 
 AsyncWorkScheduler::~AsyncWorkScheduler() {
     {
-        stdx::lock_guard<stdx::mutex> lg(_mutex);
+        stdx::lock_guard<Latch> lg(_mutex);
         invariant(_quiesced(lg));
     }
 
     if (!_parent)
         return;
 
-    stdx::lock_guard<stdx::mutex> lg(_parent->_mutex);
+    stdx::lock_guard<Latch> lg(_parent->_mutex);
     _parent->_childSchedulers.erase(_itToRemove);
     _parent->_notifyAllTasksComplete(lg);
     _parent = nullptr;
@@ -95,9 +95,9 @@ Future<executor::TaskExecutor::ResponseStatus> AsyncWorkScheduler::scheduleRemot
             AuthorizationSession::get(opCtx->getClient())
                 ->grantInternalAuthorization(opCtx->getClient());
 
-            if (MONGO_FAIL_POINT(hangWhileTargetingLocalHost)) {
+            if (MONGO_unlikely(hangWhileTargetingLocalHost.shouldFail())) {
                 LOG(0) << "Hit hangWhileTargetingLocalHost failpoint";
-                MONGO_FAIL_POINT_PAUSE_WHILE_SET_OR_INTERRUPTED(opCtx, hangWhileTargetingLocalHost);
+                hangWhileTargetingLocalHost.pauseWhileSet(opCtx);
             }
 
             const auto service = opCtx->getServiceContext();
@@ -129,7 +129,7 @@ Future<executor::TaskExecutor::ResponseStatus> AsyncWorkScheduler::scheduleRemot
 
             auto pf = makePromiseFuture<ResponseStatus>();
 
-            stdx::unique_lock<stdx::mutex> ul(_mutex);
+            stdx::unique_lock<Latch> ul(_mutex);
             uassertStatusOK(_shutdownStatus);
 
             auto scheduledCommandHandle =
@@ -157,7 +157,7 @@ Future<executor::TaskExecutor::ResponseStatus> AsyncWorkScheduler::scheduleRemot
                     } else {
                         promise->setError([&] {
                             if (status == ErrorCodes::CallbackCanceled) {
-                                stdx::unique_lock<stdx::mutex> ul(_mutex);
+                                stdx::unique_lock<Latch> ul(_mutex);
                                 return _shutdownStatus.isOK() ? status : _shutdownStatus;
                             }
                             return status;
@@ -172,7 +172,7 @@ Future<executor::TaskExecutor::ResponseStatus> AsyncWorkScheduler::scheduleRemot
 
             return std::move(pf.future).tapAll(
                 [this, it = std::move(it)](StatusWith<ResponseStatus> s) {
-                    stdx::lock_guard<stdx::mutex> lg(_mutex);
+                    stdx::lock_guard<Latch> lg(_mutex);
                     _activeHandles.erase(it);
                     _notifyAllTasksComplete(lg);
                 });
@@ -182,7 +182,7 @@ Future<executor::TaskExecutor::ResponseStatus> AsyncWorkScheduler::scheduleRemot
 std::unique_ptr<AsyncWorkScheduler> AsyncWorkScheduler::makeChildScheduler() {
     auto child = std::make_unique<AsyncWorkScheduler>(_serviceContext);
 
-    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    stdx::lock_guard<Latch> lg(_mutex);
     if (!_shutdownStatus.isOK())
         child->shutdown(_shutdownStatus);
 
@@ -195,7 +195,7 @@ std::unique_ptr<AsyncWorkScheduler> AsyncWorkScheduler::makeChildScheduler() {
 void AsyncWorkScheduler::shutdown(Status status) {
     invariant(!status.isOK());
 
-    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    stdx::lock_guard<Latch> lg(_mutex);
     if (!_shutdownStatus.isOK())
         return;
 
@@ -216,7 +216,7 @@ void AsyncWorkScheduler::shutdown(Status status) {
 }
 
 void AsyncWorkScheduler::join() {
-    stdx::unique_lock<stdx::mutex> ul(_mutex);
+    stdx::unique_lock<Latch> ul(_mutex);
     _allListsEmptyCV.wait(ul, [&] {
         return _activeOpContexts.empty() && _activeHandles.empty() && _childSchedulers.empty();
     });
@@ -231,9 +231,9 @@ Future<AsyncWorkScheduler::HostAndShard> AsyncWorkScheduler::_targetHostAsync(
         const auto shardRegistry = Grid::get(opCtx)->shardRegistry();
         const auto shard = uassertStatusOK(shardRegistry->getShard(opCtx, shardId));
 
-        if (MONGO_FAIL_POINT(hangWhileTargetingRemoteHost)) {
+        if (MONGO_unlikely(hangWhileTargetingRemoteHost.shouldFail())) {
             LOG(0) << "Hit hangWhileTargetingRemoteHost failpoint for shard " << shardId;
-            MONGO_FAIL_POINT_PAUSE_WHILE_SET_OR_INTERRUPTED(opCtx, hangWhileTargetingRemoteHost);
+            hangWhileTargetingRemoteHost.pauseWhileSet(opCtx);
         }
 
         // TODO (SERVER-35678): Return a SemiFuture<HostAndShard> rather than using a blocking call
