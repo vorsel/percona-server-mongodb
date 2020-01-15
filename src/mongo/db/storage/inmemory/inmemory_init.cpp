@@ -53,6 +53,10 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
 #include "mongo/util/log.h"
 
+#if __has_feature(address_sanitizer)
+#include <sanitizer/lsan_interface.h>
+#endif
+
 namespace mongo {
 
 namespace {
@@ -81,8 +85,23 @@ public:
                                                         readOnly);
         kv->setRecordStoreExtraOptions(wiredTigerGlobalOptions.collectionConfig);
         kv->setSortedDataInterfaceExtraOptions(wiredTigerGlobalOptions.indexConfig);
-        // Intentionally leaked.
-        new WiredTigerServerStatusSection(kv);
+
+        // We must only add the server parameters to the global registry once during unit testing.
+        static int setupCountForUnitTests = 0;
+        if (setupCountForUnitTests == 0) {
+            ++setupCountForUnitTests;
+
+            // Intentionally leaked.
+            MONGO_COMPILER_VARIABLE_UNUSED auto leakedSection =
+                new WiredTigerServerStatusSection(kv);
+
+            // This allows unit tests to run this code without encountering memory leaks
+            // TODO (SERVER-43063): to fix the global server parameter registry memory leak. The
+            // server status section leak will still exist after SERVER-43063.
+#if __has_feature(address_sanitizer)
+            __lsan_ignore_object(leakedSection);
+#endif
+        }
 
         StorageEngineOptions options;
         options.directoryPerDB = params.directoryperdb;
