@@ -62,6 +62,8 @@ server_parameters:
         set_at: runtime
         cpp_varname: "ldapGlobalParams.ldapUserToDNMapping"
         default: "[{match: \"(.+)\", substitution: \"{0}\"}]"
+        validator:
+            callback: validateLDAPUserToDNMapping
     ldapUseConnectionPool:
         description: ""
         set_at: startup
@@ -82,11 +84,15 @@ configs:
         short_name: ldapTransportSecurity
         arg_vartype: String
         default: tls
+        validator:
+            callback: validateLDAPTransportSecurity
     'security.ldap.bind.method':
         description: 'The method used to authenticate to an LDAP server. simple or sasl. Default is simple'
         short_name: ldapBindMethod
         arg_vartype: String
         default: simple
+        validator:
+            callback: validateLDAPBindMethod
     'security.ldap.bind.saslMechanisms':
         description: 'Comma-separated list of SASL mechanisms which can be used to authenticate to an LDAP server. Default is DIGEST-MD5'
         short_name: ldapBindSaslMechanisms
@@ -110,4 +116,6 @@ configs:
         description: 'Provides mechanism to transform authenticated user name to a LDAP Distinguished Name (DN)'
         short_name: ldapUserToDNMapping
         arg_vartype: String
+        validator:
+            callback: validateLDAPUserToDNMapping
 
