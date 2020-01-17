@@ -61,4 +61,9 @@ struct LDAPGlobalParams {
     AtomicWord<int> ldapUserCacheInvalidationInterval;
     synchronized_value<std::string> ldapQueryTemplate;
 };
+
+Status validateLDAPBindMethod(const std::string&);
+Status validateLDAPTransportSecurity(const std::string&);
+Status validateLDAPUserToDNMapping(const std::string&);
+
 }  // namespace mongo
