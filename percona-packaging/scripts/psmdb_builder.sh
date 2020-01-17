@@ -305,11 +305,11 @@ aws_sdk_build(){
             fi
             set_compiler
             if [ -z "${CC}" -a -z "${CXX}" ]; then
-                ${CMAKE_CMD} .. -DCMAKE_BUILD_TYPE=Release -DBUILD_ONLY="s3" -DBUILD_SHARED_LIBS=OFF -DMINIMIZE_SIZE=ON || exit $?
+                ${CMAKE_CMD} .. -DCMAKE_BUILD_TYPE=Release -DBUILD_ONLY="s3" -DBUILD_SHARED_LIBS=OFF -DMINIMIZE_SIZE=ON?
             else
-                ${CMAKE_CMD} CC=${CC} CXX=${CXX} .. -DCMAKE_BUILD_TYPE=Release -DBUILD_ONLY="s3" -DBUILD_SHARED_LIBS=OFF -DMINIMIZE_SIZE=ON || exit $?
+                ${CMAKE_CMD} CC=${CC} CXX=${CXX} .. -DCMAKE_BUILD_TYPE=Release -DBUILD_ONLY="s3" -DBUILD_SHARED_LIBS=OFF -DMINIMIZE_SIZE=ON
             fi
-            make -j4 || exit $?
+            make -j4
             make install
     cd ${WORKDIR}
 }
@@ -333,7 +333,9 @@ install_deps() {
       wget http://jenkins.percona.com/yum-repo/percona-dev.repo
       mv -f percona-dev.repo /etc/yum.repos.d/
       yum clean all
-      yum -y install epel-release
+      if [ x"$RHEL" != "x8" ]; then
+          yum -y install epel-release
+      fi
       rm -fr /usr/local/gcc-5.4.0
       RHEL=$(rpm --eval %rhel)
       if [ x"$RHEL" = x6 ]; then
@@ -349,8 +351,16 @@ install_deps() {
           make
           make install
         cd ../
-      else
+      elif [ x"$RHEL" = x7 ]; then
         yum -y install rpmbuild rpm-build libpcap-devel gcc make cmake gcc-c++ openssl-devel cyrus-sasl-devel snappy-devel zlib-devel bzip2-devel scons rpmlint rpm-build git python-pip python-devel libopcodes libcurl-devel e2fsprogs-devel expat-devel lz4-devel
+      else
+        yum -y install bzip2-devel libpcap-devel snappy-devel gcc gcc-c++ rpm-build rpmlint
+        yum -y install cmake cyrus-sasl-devel make openssl-devel zlib-devel libcurl-devel git
+        yum -y install python2-scons python2-pip python36-devel
+        yum -y install redhat-rpm-config python2-devel e2fsprogs-devel expat-devel lz4-devel
+        pip2.7 install --user setuptools --upgrade
+        pip3.6 install --user typing pyyaml regex Cheetah3
+        pip2.7 install --user typing pyyaml regex Cheetah
       fi
       install_golang
       install_gcc_54_centos
@@ -527,8 +537,10 @@ build_rpm(){
     tar vxzf ${TARF} --wildcards '*/buildscripts' --strip=1
     if [ "x${RHEL}" == "x6" ]; then
     pip2.7 install --user -r buildscripts/requirements.txt
-    else
+    elif [ x"$RHEL" = x7 ]; then
     pip install --user -r buildscripts/requirements.txt
+    else
+    pip3 install --user -r buildscripts/requirements.txt
     fi
     #
     cd $WORKDIR
@@ -690,8 +702,10 @@ build_tarball(){
     source /opt/percona-devtoolset/enable
     fi
     #
+    if [ "x$OS" = "xdeb" ]; then
     export DEBIAN_VERSION="$(lsb_release -sc)"
     export DEBIAN="$(lsb_release -sc)"
+    fi
     export PATH=/usr/local/go/bin:$PATH
     #
     set_compiler
@@ -759,10 +773,14 @@ build_tarball(){
     #
     # Finally build Percona Server for MongoDB with SCons
     cd ${PSMDIR_ABS}
-    pip install --user -r buildscripts/requirements.txt
+    PIP_CMD=pip
+    if [ x"$RHEL" = "x8" ]; then
+    PIP_CMD=pip3
+    fi
+    ${PIP_CMD} install --user -r buildscripts/requirements.txt
     if [ -f /etc/redhat-release ]; then
         RHEL=$(rpm --eval %rhel)
-        if [ $RHEL = 7 -o $RHEL = 8 ]; then
+        if [ $RHEL = 7 ]; then
             if [ -d aws-sdk-cpp ]; then
                 rm -rf aws-sdk-cpp
             fi
@@ -798,10 +816,10 @@ build_tarball(){
       export LINKFLAGS="${LINKFLAGS} ${CURL_LINKFLAGS}"
     fi
     if [ ${DEBUG} = 0 ]; then
-        buildscripts/scons.py CC=${CC} CXX=${CXX} --disable-warnings-as-errors --release --ssl --opt=on -j$NJOBS --use-sasl-client --wiredtiger --audit --rocksdb --inmemory --hotbackup CPPPATH="${INSTALLDIR}/include ${AWS_LIBS}/include" LIBPATH="${INSTALLDIR}/lib ${AWS_LIBS}/lib" LINKFLAGS="${LINKFLAGS}" ${PSM_TARGETS} || exit $?
+        buildscripts/scons.py CC=${CC} CXX=${CXX} --disable-warnings-as-errors --release --ssl --opt=on -j$NJOBS --use-sasl-client --wiredtiger --audit --rocksdb --inmemory --hotbackup CPPPATH="${INSTALLDIR}/include ${AWS_LIBS}/include" LIBPATH="${INSTALLDIR}/lib ${AWS_LIBS}/lib ${AWS_LIBS}/lib64" LINKFLAGS="${LINKFLAGS}" ${PSM_TARGETS} || exit $?
     else
         buildscripts/scons.py CC=${CC} CXX=${CXX} --disable-warnings-as-errors --audit --ssl --dbg=on -j$NJOBS --use-sasl-client \
-        CPPPATH="${INSTALLDIR}/include ${AWS_LIBS}/include" LIBPATH="${INSTALLDIR}/lib ${AWS_LIBS}/lib" LINKFLAGS="${LINKFLAGS}" --rocksdb --wiredtiger --inmemory --hotbackup ${PSM_TARGETS} || exit $?
+        CPPPATH="${INSTALLDIR}/include ${AWS_LIBS}/include" LIBPATH="${INSTALLDIR}/lib ${AWS_LIBS}/lib ${AWS_LIBS}/lib64" LINKFLAGS="${LINKFLAGS}" --rocksdb --wiredtiger --inmemory --hotbackup ${PSM_TARGETS} || exit $?
     fi
     #
     # scons install doesn't work - it installs the binaries not linked with fractal tree
