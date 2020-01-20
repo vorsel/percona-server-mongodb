@@ -618,6 +618,18 @@ void TransactionParticipant::Participant::_setReadSnapshot(OperationContext* opC
         // Using 'kNoTimestamp' ensures that transactions with mode 'local' are always able to read
         // writes from earlier transactions with mode 'local' on the same connection.
         opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
+        // Catalog conflicting timestamps must be set on primaries performing transactions.
+        // However, secondaries performing oplog application must avoid setting
+        // _catalogConflictTimestamp. Currently, only oplog application on secondaries can run
+        // inside a transaction, thus `writesAreReplicated` is a suitable proxy to single out
+        // transactions on primaries.
+        if (opCtx->writesAreReplicated()) {
+            // Since this snapshot may reflect oplog holes, record the most visible timestamp before
+            // opening a storage transaction. This timestamp will be used later to detect any
+            // changes in the catalog after a storage transaction is opened.
+            opCtx->recoveryUnit()->setCatalogConflictingTimestamp(
+                opCtx->getServiceContext()->getStorageEngine()->getAllDurableTimestamp());
+        }
     }
 
     opCtx->recoveryUnit()->preallocateSnapshot();
@@ -664,13 +676,6 @@ TransactionParticipant::OplogSlotReserver::~OplogSlotReserver() {
         // side transaction.
         _recoveryUnit->abortUnitOfWork();
     }
-
-    // After releasing the oplog hole, the all_durable timestamp can advance past this oplog hole,
-    // if there are no other open holes. Check if we can advance the stable timestamp any further
-    // since a majority write may be waiting on the stable timestamp to advance beyond this oplog
-    // hole to acknowledge the write to the user.
-    auto replCoord = repl::ReplicationCoordinator::get(_opCtx);
-    replCoord->attemptToAdvanceStableTimestamp();
 }
 
 TransactionParticipant::TxnResources::TxnResources(WithLock wl,
