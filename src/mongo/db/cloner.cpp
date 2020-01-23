@@ -52,6 +52,7 @@
 #include "mongo/db/curop.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer.h"
@@ -62,7 +63,7 @@
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
@@ -116,7 +117,7 @@ struct Cloner::Fun {
         bool createdCollection = false;
         Collection* collection = nullptr;
 
-        collection = db->getCollection(opCtx, to_collection);
+        collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(to_collection);
         if (!collection) {
             massert(17321,
                     str::stream() << "collection dropped during clone [" << to_collection.ns()
@@ -137,7 +138,8 @@ struct Cloner::Fun {
                           str::stream() << "collection creation failed during clone ["
                                         << to_collection.ns() << "]");
                 wunit.commit();
-                collection = db->getCollection(opCtx, to_collection);
+                collection =
+                    CollectionCatalog::get(opCtx).lookupCollectionByNamespace(to_collection);
                 invariant(collection,
                           str::stream()
                               << "Missing collection during clone [" << to_collection.ns() << "]");
@@ -178,7 +180,8 @@ struct Cloner::Fun {
                         str::stream() << "Database " << _dbName << " dropped while cloning",
                         db != nullptr);
 
-                collection = db->getCollection(opCtx, to_collection);
+                collection =
+                    CollectionCatalog::get(opCtx).lookupCollectionByNamespace(to_collection);
                 uassert(28594,
                         str::stream()
                             << "Collection " << to_collection.ns() << " dropped while cloning",
@@ -325,7 +328,8 @@ void Cloner::copyIndexes(OperationContext* opCtx,
     auto databaseHolder = DatabaseHolder::get(opCtx);
     auto db = databaseHolder->openDb(opCtx, toDBName);
 
-    Collection* collection = db->getCollection(opCtx, to_collection);
+    Collection* collection =
+        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(to_collection);
     if (!collection) {
         writeConflictRetry(opCtx, "createCollection", to_collection.ns(), [&] {
             opCtx->checkForInterrupt();
@@ -343,7 +347,7 @@ void Cloner::copyIndexes(OperationContext* opCtx,
                           << "Collection creation failed while copying indexes from "
                           << from_collection.ns() << " to " << to_collection.ns() << " (Cloner)");
             wunit.commit();
-            collection = db->getCollection(opCtx, to_collection);
+            collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(to_collection);
             invariant(collection,
                       str::stream() << "Missing collection " << to_collection.ns() << " (Cloner)");
         });
@@ -366,20 +370,53 @@ void Cloner::copyIndexes(OperationContext* opCtx,
     // The code below throws, so ensure build cleanup occurs.
     ON_BLOCK_EXIT([&] { indexer.cleanUpAfterBuild(opCtx, collection); });
 
-    auto indexInfoObjs = uassertStatusOK(
-        indexer.init(opCtx, collection, indexesToBuild, MultiIndexBlock::kNoopOnInitFn));
+    // Emit startIndexBuild and commitIndexBuild oplog entries if supported by the current FCV.
+    auto opObserver = opCtx->getServiceContext()->getOpObserver();
+    auto fromMigrate = false;
+    auto buildUUID = serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+            serverGlobalParams.featureCompatibility.getVersion() ==
+                ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44
+        ? boost::make_optional(UUID::gen())
+        : boost::none;
+
+    MultiIndexBlock::OnInitFn onInitFn;
+    if (opCtx->writesAreReplicated() && buildUUID) {
+        onInitFn = [&](std::vector<BSONObj>& specs) {
+            opObserver->onStartIndexBuild(
+                opCtx, to_collection, collection->uuid(), *buildUUID, specs, fromMigrate);
+            return Status::OK();
+        };
+    } else {
+        onInitFn = MultiIndexBlock::kNoopOnInitFn;
+    }
+
+    auto indexInfoObjs = uassertStatusOK(indexer.init(opCtx, collection, indexesToBuild, onInitFn));
     uassertStatusOK(indexer.insertAllDocumentsInCollection(opCtx, collection));
     uassertStatusOK(indexer.checkConstraints(opCtx));
 
     WriteUnitOfWork wunit(opCtx);
-    uassertStatusOK(indexer.commit(
-        opCtx, collection, MultiIndexBlock::kNoopOnCreateEachFn, MultiIndexBlock::kNoopOnCommitFn));
-    if (opCtx->writesAreReplicated()) {
-        for (auto&& infoObj : indexInfoObjs) {
-            getGlobalServiceContext()->getOpObserver()->onCreateIndex(
-                opCtx, collection->ns(), collection->uuid(), infoObj, false);
-        }
-    }
+    uassertStatusOK(
+        indexer.commit(opCtx,
+                       collection,
+                       [&](const BSONObj& spec) {
+                           // If two phase index builds are enabled, the index build will be
+                           // coordinated using startIndexBuild and commitIndexBuild oplog entries.
+                           if (opCtx->writesAreReplicated() &&
+                               !IndexBuildsCoordinator::get(opCtx)->supportsTwoPhaseIndexBuild()) {
+                               opObserver->onCreateIndex(
+                                   opCtx, collection->ns(), collection->uuid(), spec, fromMigrate);
+                           }
+                       },
+                       [&] {
+                           if (opCtx->writesAreReplicated() && buildUUID) {
+                               opObserver->onCommitIndexBuild(opCtx,
+                                                              collection->ns(),
+                                                              collection->uuid(),
+                                                              *buildUUID,
+                                                              indexInfoObjs,
+                                                              fromMigrate);
+                           }
+                       }));
     wunit.commit();
 }
 
@@ -430,7 +467,7 @@ bool Cloner::copyCollection(OperationContext* opCtx,
     }
     BSONObj options = optionsBob.obj();
 
-    auto sourceIndexes = _conn->getIndexSpecs(nss.ns(), QueryOption_SlaveOk);
+    auto sourceIndexes = _conn->getIndexSpecs(nss, QueryOption_SlaveOk);
     auto idIndexSpec = getIdIndexSpec(sourceIndexes);
 
     Lock::DBLock dbWrite(opCtx, dbname, MODE_X);
@@ -548,7 +585,7 @@ Status Cloner::createCollectionsForDb(
             opCtx->checkForInterrupt();
             WriteUnitOfWork wunit(opCtx);
 
-            Collection* collection = db->getCollection(opCtx, nss);
+            Collection* collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(nss);
             if (collection) {
                 if (!params.shardedColl) {
                     // If the collection is unsharded then we want to fail when a collection
@@ -715,8 +752,7 @@ Status Cloner::copyDb(OperationContext* opCtx,
         Lock::TempRelease tempRelease(opCtx->lockState());
         for (auto&& params : createCollectionParams) {
             const NamespaceString nss(opts.fromDB, params.collectionName);
-            auto indexSpecs =
-                _conn->getIndexSpecs(nss.ns(), opts.slaveOk ? QueryOption_SlaveOk : 0);
+            auto indexSpecs = _conn->getIndexSpecs(nss, opts.slaveOk ? QueryOption_SlaveOk : 0);
 
             collectionIndexSpecs[params.collectionName] = indexSpecs;
 

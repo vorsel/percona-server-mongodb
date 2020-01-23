@@ -195,7 +195,7 @@ void WiredTigerSession::closeCursorsForQueuedDrops(WiredTigerKVEngine* engine) {
 }
 
 namespace {
-AtomicWord<unsigned long long> nextTableId(1);
+AtomicWord<unsigned long long> nextTableId(WiredTigerSession::kLastTableId);
 }
 // static
 uint64_t WiredTigerSession::genTableId() {
@@ -233,6 +233,10 @@ void WiredTigerSessionCache::shuttingDown() {
     }
 
     closeAll();
+}
+
+bool WiredTigerSessionCache::isShuttingDown() {
+    return _shuttingDown.load() & kShuttingDownMask;
 }
 
 void WiredTigerSessionCache::waitUntilDurable(OperationContext* opCtx,

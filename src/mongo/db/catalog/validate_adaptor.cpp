@@ -37,12 +37,14 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/index_consistency.h"
+#include "mongo/db/catalog/throttle_cursor.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index/wildcard_access_method.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/storage/key_string.h"
+#include "mongo/db/storage/record_store.h"
 #include "mongo/rpc/object_check.h"
 #include "mongo/util/log.h"
 
@@ -53,14 +55,6 @@ namespace {
 const long long kInterruptIntervalNumRecords = 4096;
 const long long kInterruptIntervalNumBytes = 50 * 1024 * 1024;  // 50MB.
 
-KeyString::Builder makeWildCardMultikeyMetadataKeyString(const BSONObj& indexKey) {
-    const auto multikeyMetadataOrd = Ordering::make(BSON("" << 1 << "" << 1));
-    const RecordId multikeyMetadataRecordId(RecordId::ReservedId::kWildcardMultikeyMetadataId);
-    return {KeyString::Version::kLatestVersion,
-            indexKey,
-            multikeyMetadataOrd,
-            multikeyMetadataRecordId};
-}
 }  // namespace
 
 Status ValidateAdaptor::validateRecord(OperationContext* opCtx,
@@ -87,13 +81,9 @@ Status ValidateAdaptor::validateRecord(OperationContext* opCtx,
         return status;
     }
 
-    for (auto& it : _indexConsistency->getIndexInfo()) {
-        IndexInfo& indexInfo = it.second;
-        const IndexDescriptor* descriptor = indexCatalog->findIndexByName(
-            opCtx, indexInfo.indexName, /*includeUnfinishedIndexes=*/false);
-        invariant(descriptor);
-
-        const IndexAccessMethod* iam = indexCatalog->getEntry(descriptor)->accessMethod();
+    for (const auto& index : _validateState->getIndexes()) {
+        const IndexDescriptor* descriptor = index->descriptor();
+        const IndexAccessMethod* iam = index->accessMethod();
 
         if (descriptor->isPartial()) {
             const IndexCatalogEntry* ice = indexCatalog->getEntry(descriptor);
@@ -125,14 +115,10 @@ Status ValidateAdaptor::validateRecord(OperationContext* opCtx,
             curRecordResults.valid = false;
         }
 
+        IndexInfo& indexInfo = _indexConsistency->getIndexInfo(descriptor->indexName());
         for (const auto& keyString : multikeyMetadataKeys) {
             try {
-                auto key = KeyString::toBsonSafe(keyString.getBuffer(),
-                                                 keyString.getSize(),
-                                                 indexInfo.ord,
-                                                 keyString.getTypeBits());
-                _indexConsistency->addMultikeyMetadataPath(
-                    makeWildCardMultikeyMetadataKeyString(key), &indexInfo);
+                _indexConsistency->addMultikeyMetadataPath(keyString, &indexInfo);
             } catch (...) {
                 return exceptionToStatus();
             }
@@ -140,12 +126,7 @@ Status ValidateAdaptor::validateRecord(OperationContext* opCtx,
 
         for (const auto& keyString : documentKeySet) {
             try {
-                auto key = KeyString::toBsonSafe(keyString.getBuffer(),
-                                                 keyString.getSize(),
-                                                 indexInfo.ord,
-                                                 keyString.getTypeBits());
-                indexInfo.ks->resetToKey(key, indexInfo.ord, recordId);
-                _indexConsistency->addDocKey(opCtx, *indexInfo.ks, &indexInfo, recordId, key);
+                _indexConsistency->addDocKey(opCtx, keyString, &indexInfo, recordId);
             } catch (...) {
                 return exceptionToStatus();
             }
@@ -155,34 +136,31 @@ Status ValidateAdaptor::validateRecord(OperationContext* opCtx,
 }
 
 void ValidateAdaptor::traverseIndex(OperationContext* opCtx,
-                                    const IndexDescriptor* descriptor,
+                                    const IndexCatalogEntry* index,
                                     int64_t* numTraversedKeys,
                                     ValidateResults* results) {
+    const IndexDescriptor* descriptor = index->descriptor();
     auto indexName = descriptor->indexName();
-    IndexInfo* indexInfo = &_indexConsistency->getIndexInfo(indexName);
+    IndexInfo& indexInfo = _indexConsistency->getIndexInfo(indexName);
     int64_t numKeys = 0;
 
-    const auto& key = descriptor->keyPattern();
-    const Ordering ord = Ordering::make(key);
     bool isFirstEntry = true;
 
-    // We want to use the latest version of KeyString here.
-    const KeyString::Version version = KeyString::Version::kLatestVersion;
-    std::unique_ptr<KeyString::Builder> indexKeyStringBuilder =
-        std::make_unique<KeyString::Builder>(version);
-    std::unique_ptr<KeyString::Builder> prevIndexKeyStringBuilder =
-        std::make_unique<KeyString::Builder>(version);
-
+    const KeyString::Version version =
+        index->accessMethod()->getSortedDataInterface()->getKeyStringVersion();
     KeyString::Builder firstKeyString(
-        version, BSONObj(), ord, KeyString::Discriminator::kExclusiveBefore);
+        version, BSONObj(), indexInfo.ord, KeyString::Discriminator::kExclusiveBefore);
+
+    KeyString::Value prevIndexKeyStringValue;
 
     // Ensure that this index has an open index cursor.
     const auto indexCursorIt = _validateState->getIndexCursors().find(indexName);
     invariant(indexCursorIt != _validateState->getIndexCursors().end());
 
     const std::unique_ptr<SortedDataInterfaceThrottleCursor>& indexCursor = indexCursorIt->second;
-    for (auto indexEntry = indexCursor->seek(opCtx, firstKeyString.getValueCopy()); indexEntry;
-         indexEntry = indexCursor->next(opCtx)) {
+    for (auto indexEntry = indexCursor->seekForKeyString(opCtx, firstKeyString.getValueCopy());
+         indexEntry;
+         indexEntry = indexCursor->nextKeyString(opCtx)) {
         if (numKeys % kInterruptIntervalNumRecords == 0) {
             opCtx->checkForInterrupt();
 
@@ -191,10 +169,9 @@ void ValidateAdaptor::traverseIndex(OperationContext* opCtx,
                 _validateState->yieldLocks(opCtx);
             }
         }
-        indexKeyStringBuilder->resetToKey(indexEntry->key, ord, indexEntry->loc);
 
         // Ensure that the index entries are in increasing or decreasing order.
-        if (!isFirstEntry && *indexKeyStringBuilder < *prevIndexKeyStringBuilder) {
+        if (!isFirstEntry && indexEntry->keyString < prevIndexKeyStringValue) {
             if (results && results->valid) {
                 results->errors.push_back(
                     "one or more indexes are not in strictly ascending or descending order");
@@ -209,21 +186,18 @@ void ValidateAdaptor::traverseIndex(OperationContext* opCtx,
             RecordId::ReservedId::kWildcardMultikeyMetadataId};
         if (descriptor->getIndexType() == IndexType::INDEX_WILDCARD &&
             indexEntry->loc == kWildcardMultikeyMetadataRecordId) {
-            _indexConsistency->removeMultikeyMetadataPath(
-                makeWildCardMultikeyMetadataKeyString(indexEntry->key), indexInfo);
+            _indexConsistency->removeMultikeyMetadataPath(indexEntry->keyString, &indexInfo);
             numKeys++;
             continue;
         }
 
-        _indexConsistency->addIndexKey(
-            *indexKeyStringBuilder, indexInfo, indexEntry->loc, indexEntry->key);
-
+        _indexConsistency->addIndexKey(indexEntry->keyString, &indexInfo, indexEntry->loc);
         numKeys++;
         isFirstEntry = false;
-        prevIndexKeyStringBuilder.swap(indexKeyStringBuilder);
+        prevIndexKeyStringValue = indexEntry->keyString;
     }
 
-    if (results && _indexConsistency->getMultikeyMetadataPathCount(indexInfo) > 0) {
+    if (results && _indexConsistency->getMultikeyMetadataPathCount(&indexInfo) > 0) {
         results->errors.push_back(str::stream()
                                   << "Index '" << descriptor->indexName()
                                   << "' has one or more missing multikey metadata index keys");
@@ -238,7 +212,7 @@ void ValidateAdaptor::traverseIndex(OperationContext* opCtx,
 void ValidateAdaptor::traverseRecordStore(OperationContext* opCtx,
                                           ValidateResults* results,
                                           BSONObjBuilder* output) {
-    long long nrecords = 0;
+    _numRecords = 0;  // need to reset it because this function can be called more than once.
     long long dataSizeTotal = 0;
     long long interruptIntervalNumBytes = 0;
     long long nInvalid = 0;
@@ -252,9 +226,9 @@ void ValidateAdaptor::traverseRecordStore(OperationContext* opCtx,
              traverseRecordStoreCursor->seekExact(opCtx, _validateState->getFirstRecordId());
          record;
          record = traverseRecordStoreCursor->next(opCtx)) {
-        ++nrecords;
+        ++_numRecords;
         interruptIntervalNumBytes += record->data.size();
-        if (nrecords % kInterruptIntervalNumRecords == 0 ||
+        if (_numRecords % kInterruptIntervalNumRecords == 0 ||
             interruptIntervalNumBytes >= kInterruptIntervalNumBytes) {
             opCtx->checkForInterrupt();
 
@@ -309,29 +283,29 @@ void ValidateAdaptor::traverseRecordStore(OperationContext* opCtx,
     // checkpoint and it may not have the most up-to-date changes.
     if (results->valid && !_validateState->isBackground()) {
         _validateState->getCollection()->getRecordStore()->updateStatsAfterRepair(
-            opCtx, nrecords, dataSizeTotal);
+            opCtx, _numRecords, dataSizeTotal);
     }
 
     output->appendNumber("nInvalidDocuments", nInvalid);
-    output->appendNumber("nrecords", nrecords);
+    output->appendNumber("nrecords", _numRecords);
 }
 
-void ValidateAdaptor::validateIndexKeyCount(const IndexDescriptor* idx,
-                                            int64_t numRecs,
-                                            ValidateResults& results) {
+void ValidateAdaptor::validateIndexKeyCount(const IndexDescriptor* idx, ValidateResults& results) {
+    // Fetch the total number of index entries we previously found traversing the index.
     const std::string indexName = idx->indexName();
     IndexInfo* indexInfo = &_indexConsistency->getIndexInfo(indexName);
     auto numTotalKeys = indexInfo->numKeys;
 
+    // Do not fail on finding too few index entries compared to collection entries when full:false.
     bool hasTooFewKeys = false;
     bool noErrorOnTooFewKeys = !_validateState->isFullValidate();
 
-    if (idx->isIdIndex() && numTotalKeys != numRecs) {
-        hasTooFewKeys = numTotalKeys < numRecs ? true : hasTooFewKeys;
+    if (idx->isIdIndex() && numTotalKeys != _numRecords) {
+        hasTooFewKeys = numTotalKeys < _numRecords ? true : hasTooFewKeys;
         std::string msg = str::stream()
             << "number of _id index entries (" << numTotalKeys
-            << ") does not match the number of documents in the index (" << numRecs << ")";
-        if (noErrorOnTooFewKeys && (numTotalKeys < numRecs)) {
+            << ") does not match the number of documents in the index (" << _numRecords << ")";
+        if (noErrorOnTooFewKeys && (numTotalKeys < _numRecords)) {
             results.warnings.push_back(msg);
         } else {
             results.errors.push_back(msg);
@@ -344,21 +318,22 @@ void ValidateAdaptor::validateIndexKeyCount(const IndexDescriptor* idx,
     // produce an index key per array entry) and not $** indexes which can produce index keys for
     // multiple paths within a single document.
     if (results.valid && !idx->isMultikey() && idx->getIndexType() != IndexType::INDEX_WILDCARD &&
-        numTotalKeys > numRecs) {
+        numTotalKeys > _numRecords) {
         std::string err = str::stream()
             << "index " << idx->indexName() << " is not multi-key, but has more entries ("
-            << numTotalKeys << ") than documents in the index (" << numRecs << ")";
+            << numTotalKeys << ") than documents in the index (" << _numRecords << ")";
         results.errors.push_back(err);
         results.valid = false;
     }
+
     // Ignore any indexes with a special access method. If an access method name is given, the
     // index may be a full text, geo or special index plugin with different semantics.
     if (results.valid && !idx->isSparse() && !idx->isPartial() && !idx->isIdIndex() &&
-        idx->getAccessMethodName() == "" && numTotalKeys < numRecs) {
+        idx->getAccessMethodName() == "" && numTotalKeys < _numRecords) {
         hasTooFewKeys = true;
         std::string msg = str::stream()
             << "index " << idx->indexName() << " is not sparse or partial, but has fewer entries ("
-            << numTotalKeys << ") than documents in the index (" << numRecs << ")";
+            << numTotalKeys << ") than documents in the index (" << _numRecords << ")";
         if (noErrorOnTooFewKeys) {
             results.warnings.push_back(msg);
         } else {

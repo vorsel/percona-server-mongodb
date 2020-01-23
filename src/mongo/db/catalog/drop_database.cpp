@@ -48,14 +48,14 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/util/duration.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
-MONGO_FAIL_POINT_DEFINE(dropDatabaseHangBeforeLog);
 MONGO_FAIL_POINT_DEFINE(dropDatabaseHangAfterAllCollectionsDrop);
+MONGO_FAIL_POINT_DEFINE(dropDatabaseHangBeforeInMemoryDrop);
 
 namespace {
 
@@ -78,24 +78,23 @@ void _finishDropDatabase(OperationContext* opCtx,
     BackgroundOperation::assertNoBgOpInProgForDb(dbName);
     IndexBuildsCoordinator::get(opCtx)->assertNoBgOpInProgForDb(dbName);
 
+    writeConflictRetry(opCtx, "dropDatabase_database", dbName, [&] {
+        WriteUnitOfWork wunit(opCtx);
+        opCtx->getServiceContext()->getOpObserver()->onDropDatabase(opCtx, dbName);
+        wunit.commit();
+    });
+
+    if (MONGO_unlikely(dropDatabaseHangBeforeInMemoryDrop.shouldFail())) {
+        log() << "dropDatabase - fail point dropDatabaseHangBeforeInMemoryDrop enabled.";
+        dropDatabaseHangBeforeInMemoryDrop.pauseWhileSet();
+    }
+
     auto databaseHolder = DatabaseHolder::get(opCtx);
     databaseHolder->dropDb(opCtx, db);
     dropPendingGuard.dismiss();
 
     log() << "dropDatabase " << dbName << " - dropped " << numCollections << " collection(s)";
     log() << "dropDatabase " << dbName << " - finished";
-
-    if (MONGO_unlikely(dropDatabaseHangBeforeLog.shouldFail())) {
-        log() << "dropDatabase - fail point dropDatabaseHangBeforeLog enabled. "
-                 "Blocking until fail point is disabled. ";
-        dropDatabaseHangBeforeLog.pauseWhileSet();
-    }
-
-    writeConflictRetry(opCtx, "dropDatabase_database", dbName, [&] {
-        WriteUnitOfWork wunit(opCtx);
-        getGlobalServiceContext()->getOpObserver()->onDropDatabase(opCtx, dbName);
-        wunit.commit();
-    });
 }
 
 }  // namespace
@@ -194,7 +193,7 @@ Status dropDatabase(OperationContext* opCtx, const std::string& dbName) {
 
             BackgroundOperation::assertNoBgOpInProgForNs(nss.ns());
             IndexBuildsCoordinator::get(opCtx)->assertNoIndexBuildInProgForCollection(
-                db->getCollection(opCtx, nss)->uuid());
+                CollectionCatalog::get(opCtx).lookupCollectionByNamespace(nss)->uuid());
 
             writeConflictRetry(opCtx, "dropDatabase_collection", nss.ns(), [&] {
                 WriteUnitOfWork wunit(opCtx);

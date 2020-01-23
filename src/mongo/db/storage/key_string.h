@@ -390,6 +390,10 @@ public:
         // Use buffer capacity as a more accurate measure of memory usage.
         return sizeof(Value) + _buffer.capacity();
     }
+
+    Value getOwned() const {
+        return *this;
+    }
     /// Members for Sorter
 
 private:
@@ -603,6 +607,11 @@ public:
     bool isEmpty() const {
         invariant(_state != BuildState::kReleased);
         return _buffer.len() == 0;
+    }
+
+    void setTypeBits(const TypeBits& typeBits) {
+        invariant(_state != BuildState::kReleased);
+        _typeBits = typeBits;
     }
 
     const TypeBits& getTypeBits() const {

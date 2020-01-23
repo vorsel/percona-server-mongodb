@@ -32,6 +32,7 @@
 #include <fmt/format.h>
 
 #include "mongo/db/exec/find_projection_executor.h"
+#include "mongo/db/matcher/copyable_match_expression.h"
 #include "mongo/db/pipeline/expression.h"
 
 namespace mongo {
@@ -44,21 +45,29 @@ namespace mongo {
 class ExpressionInternalFindPositional final : public Expression {
 public:
     ExpressionInternalFindPositional(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                     boost::intrusive_ptr<Expression> child,
+                                     boost::intrusive_ptr<Expression> preImageExpr,
+                                     boost::intrusive_ptr<Expression> postImageExpr,
                                      FieldPath path,
-                                     const MatchExpression* matchExpr)
-        : Expression{expCtx, {child}}, _path{std::move(path)}, _matchExpr{matchExpr} {}
+                                     CopyableMatchExpression matchExpr)
+        : Expression{expCtx, {preImageExpr, postImageExpr}},
+          _path{std::move(path)},
+          _matchExpr{std::move(matchExpr)} {}
 
     Value evaluate(const Document& root, Variables* variables) const final {
         using namespace fmt::literals;
 
-        auto postImage = _children[0]->evaluate(root, variables);
+        auto preImage = _children[0]->evaluate(root, variables);
+        auto postImage = _children[1]->evaluate(root, variables);
         uassert(51255,
-                "Positional operator can only be applied to an object, but got {}"_format(
+                "Positional operator pre-image can only be an object, but got {}"_format(
+                    typeName(preImage.getType())),
+                preImage.getType() == BSONType::Object);
+        uassert(51258,
+                "Positional operator post-image can only be an object, but got {}"_format(
                     typeName(postImage.getType())),
                 postImage.getType() == BSONType::Object);
         return Value{projection_executor::applyPositionalProjection(
-            postImage.getDocument(), *_matchExpr, _path)};
+            preImage.getDocument(), postImage.getDocument(), *_matchExpr, _path)};
     }
 
     void acceptVisitor(ExpressionVisitor* visitor) final {
@@ -76,16 +85,33 @@ public:
         return {{_path.front().toString()}, {}};
     }
 
+    boost::intrusive_ptr<Expression> optimize() final {
+        for (const auto& child : _children) {
+            child->optimize();
+        }
+        // SERVER-43740: ideally we'd want to optimize '_matchExpr' here as well. However, given
+        // that the match expression is stored as a shared copyable expression in this class, and
+        // 'MatchExpression::optimize()' takes and returns a unique pointer on a match expression,
+        // there is no easy way to replace a copyable match expression with its optimized
+        // equivalent. So, for now we will assume that the copyable match expression is passed to
+        // this expression already optimized. Once we have MatchExpression and Expression combined,
+        // we should revisit this code and make sure that 'optimized()' method is called on
+        // _matchExpr.
+        return this;
+    }
+
 protected:
     void _doAddDependencies(DepsTracker* deps) const final {
-        _children[0]->addDependencies(deps);
-        deps->needWholeDocument = true;
+        for (const auto& child : _children) {
+            child->addDependencies(deps);
+        }
         _matchExpr->addDependencies(deps);
+        deps->needWholeDocument = true;
     }
 
 private:
     const FieldPath _path;
-    const MatchExpression* _matchExpr;
+    const CopyableMatchExpression _matchExpr;
 };
 
 /**
@@ -97,11 +123,11 @@ private:
 class ExpressionInternalFindSlice final : public Expression {
 public:
     ExpressionInternalFindSlice(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                boost::intrusive_ptr<Expression> child,
+                                boost::intrusive_ptr<Expression> postImageExpr,
                                 FieldPath path,
                                 boost::optional<int> skip,
                                 int limit)
-        : Expression{expCtx, {child}}, _path{std::move(path)}, _skip{skip}, _limit{limit} {}
+        : Expression{expCtx, {postImageExpr}}, _path{std::move(path)}, _skip{skip}, _limit{limit} {}
 
     Value evaluate(const Document& root, Variables* variables) const final {
         using namespace fmt::literals;
@@ -130,8 +156,17 @@ public:
         return {{_path.front().toString()}, {}};
     }
 
+    boost::intrusive_ptr<Expression> optimize() final {
+        invariant(_children.size() == 1ul);
+
+        _children[0]->optimize();
+        return this;
+    }
+
 protected:
     void _doAddDependencies(DepsTracker* deps) const final {
+        invariant(_children.size() == 1ul);
+
         _children[0]->addDependencies(deps);
         deps->needWholeDocument = true;
     }
@@ -151,7 +186,7 @@ public:
     ExpressionInternalFindElemMatch(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                     boost::intrusive_ptr<Expression> child,
                                     FieldPath path,
-                                    std::unique_ptr<MatchExpression> matchExpr)
+                                    CopyableMatchExpression matchExpr)
         : Expression{expCtx, {child}}, _path{std::move(path)}, _matchExpr{std::move(matchExpr)} {}
 
     Value evaluate(const Document& root, Variables* variables) const final {
@@ -174,15 +209,32 @@ public:
         MONGO_UNREACHABLE;
     }
 
+    boost::intrusive_ptr<Expression> optimize() final {
+        invariant(_children.size() == 1ul);
+
+        _children[0]->optimize();
+        // SERVER-43740: ideally we'd want to optimize '_matchExpr' here as well. However, given
+        // that the match expression is stored as a shared copyable expression in this class, and
+        // 'MatchExpression::optimize()' takes and returns a unique pointer on a match expression,
+        // there is no easy way to replace a copyable match expression with its optimized
+        // equivalent. So, for now we will assume that the copyable match expression is passed to
+        // this expression already optimized. Once we have MatchExpression and Expression combined,
+        // we should revisit this code and make sure that 'optimized()' method is called on
+        // _matchExpr.
+        return this;
+    }
+
 protected:
     void _doAddDependencies(DepsTracker* deps) const final {
+        invariant(_children.size() == 1ul);
+
         _children[0]->addDependencies(deps);
-        deps->needWholeDocument = true;
         _matchExpr->addDependencies(deps);
+        deps->needWholeDocument = true;
     }
 
 private:
     const FieldPath _path;
-    const std::unique_ptr<MatchExpression> _matchExpr;
+    const CopyableMatchExpression _matchExpr;
 };
 }  // namespace mongo

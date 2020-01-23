@@ -104,7 +104,9 @@ public:
 
     using Operations = std::vector<OplogEntry>;
 
-    // Used by SyncTail to access batching logic.
+    // TODO (SERVER-43001): This potentially violates layering as OpQueueBatcher calls an
+    // OplogApplier method.
+    // Used to access batching logic.
     using GetNextApplierBatchFn = std::function<StatusWith<OplogApplier::Operations>(
         OperationContext* opCtx, const BatchLimits& batchLimits)>;
 
@@ -141,6 +143,11 @@ public:
      * Returns true if we are shutting down.
      */
     bool inShutdown() const;
+
+    /**
+     * Blocks until enough space is available.
+     */
+    void waitForSpace(OperationContext* opCtx, std::size_t size);
 
     /**
      * Pushes operations read into oplog buffer.
@@ -182,6 +189,8 @@ public:
      */
     StatusWith<OpTime> multiApply(OperationContext* opCtx, Operations ops);
 
+    const Options& getOptions() const;
+
 private:
     /**
      * Pops the operation at the front of the OplogBuffer.
@@ -194,13 +203,6 @@ private:
      * Implemented in subclasses but not visible otherwise.
      */
     virtual void _run(OplogBuffer* oplogBuffer) = 0;
-
-    /**
-     * Called from shutdown to signals oplog application loop to stop running.
-     * Currently applicable to steady state replication only.
-     * Implemented in subclasses but not visible otherwise.
-     */
-    virtual void _shutdown() = 0;
 
     /**
      * Called from multiApply() to apply a batch of operations in parallel.

@@ -349,7 +349,7 @@ void MongoInterfaceStandalone::renameIfOptionsAndIndexesHaveNotChanged(
     const NamespaceString& targetNs,
     const BSONObj& originalCollectionOptions,
     const std::list<BSONObj>& originalIndexes) {
-    Lock::DBLock(opCtx, targetNs.db(), MODE_X);
+    Lock::DBLock lk(opCtx, targetNs.db(), MODE_X);
 
     uassert(ErrorCodes::CommandFailed,
             str::stream() << "collection options of target collection " << targetNs.ns()
@@ -359,7 +359,7 @@ void MongoInterfaceStandalone::renameIfOptionsAndIndexesHaveNotChanged(
             SimpleBSONObjComparator::kInstance.evaluate(originalCollectionOptions ==
                                                         getCollectionOptions(targetNs)));
 
-    auto currentIndexes = _client.getIndexSpecs(targetNs.ns());
+    auto currentIndexes = _client.getIndexSpecs(targetNs);
     uassert(ErrorCodes::CommandFailed,
             str::stream() << "indexes of target collection " << targetNs.ns()
                           << " changed during processing.",
@@ -565,7 +565,7 @@ bool MongoInterfaceStandalone::fieldsHaveSupportingUniqueIndex(
     Lock::CollectionLock collLock(opCtx, nss, MODE_IS);
     auto databaseHolder = DatabaseHolder::get(opCtx);
     auto db = databaseHolder->getDb(opCtx, nss.db());
-    auto collection = db ? db->getCollection(opCtx, nss) : nullptr;
+    auto collection = db ? CollectionCatalog::get(opCtx).lookupCollectionByNamespace(nss) : nullptr;
     if (!collection) {
         return fieldPaths == std::set<FieldPath>{"_id"};
     }

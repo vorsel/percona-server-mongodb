@@ -154,9 +154,16 @@ public:
     static uint64_t genTableId();
 
     /**
-     * For "metadata:" cursors. Guaranteed never to collide with genTableId() ids.
+     * For special cursors. Guaranteed never to collide with genTableId() ids.
      */
-    static const uint64_t kMetadataTableId = 0;
+    enum TableId {
+        /* For "metadata:" cursors */
+        kMetadataTableId,
+        /* For "metadata:create" cursors */
+        kMetadataCreateTableId,
+        /* The start of non-special table ids for genTableId() */
+        kLastTableId
+    };
 
     void setIdleExpireTime(Date_t idleExpireTime) {
         _idleExpireTime = idleExpireTime;
@@ -168,6 +175,7 @@ public:
 
 private:
     friend class WiredTigerSessionCache;
+    friend class WiredTigerKVEngine;
 
     // The cursor cache is a list of pairs that contain an ID and cursor
     typedef std::list<WiredTigerCachedCursor> CursorCache;
@@ -256,6 +264,11 @@ public:
      * lock in exclusive mode to avoid races with getSession.
      */
     void shuttingDown();
+
+    /**
+     * True when in the process of shutting down.
+     */
+    bool isShuttingDown();
 
     bool isEphemeral();
 

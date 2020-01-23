@@ -31,10 +31,10 @@
 
 #include <memory>
 
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/pipeline/accumulation_statement.h"
 #include "mongo/db/pipeline/accumulator.h"
-#include "mongo/db/pipeline/document.h"
-#include "mongo/db/pipeline/document_value_test_util.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/pipeline/process_interface_standalone.h"
 #include "mongo/db/service_context_d_test_fixture.h"
@@ -231,8 +231,7 @@ TEST_F(MapReduceFixture, InternalJsReduceFailsIfEvalArgumentNotOfTypeStringOrCod
         "eval", "function(key, values) { return Array.sum(values); };", BSONObj());
     objBuilder.append("data", BSON("k" << std::string("foo") << "v" << Value(2)));
 
-    assertProcessFailsWithCode(
-        "$_internalJsReduce", getExpCtx(), Value(objBuilder.obj()), ErrorCodes::BadValue);
+    assertProcessFailsWithCode("$_internalJsReduce", getExpCtx(), Value(objBuilder.obj()), 31244);
 }
 
 TEST_F(MapReduceFixture, InternalJsReduceFailsIfDataArgumentNotDocument) {

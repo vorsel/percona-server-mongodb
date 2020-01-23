@@ -77,7 +77,7 @@
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/cannot_implicitly_create_collection_info.h"
 #include "mongo/s/would_change_owning_shard_exception.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 #include "mongo/util/log_and_backoff.h"
 #include "mongo/util/scopeguard.h"
@@ -212,8 +212,10 @@ void makeCollection(OperationContext* opCtx, const NamespaceString& ns) {
         AutoGetOrCreateDb db(opCtx, ns.db(), MODE_IX);
         Lock::CollectionLock collLock(opCtx, ns, MODE_X);
 
-        assertCanWrite_inlock(opCtx, ns, db.getDb()->getCollection(opCtx, ns));
-        if (!db.getDb()->getCollection(opCtx, ns)) {  // someone else may have beat us to it.
+        assertCanWrite_inlock(
+            opCtx, ns, CollectionCatalog::get(opCtx).lookupCollectionByNamespace(ns));
+        if (!CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
+                ns)) {  // someone else may have beat us to it.
             uassertStatusOK(userAllowedCreateNS(ns.db(), ns.coll()));
             WriteUnitOfWork wuow(opCtx);
             CollectionOptions defaultCollectionOptions;

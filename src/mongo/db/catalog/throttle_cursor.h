@@ -34,7 +34,7 @@
 
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/sorted_data_interface.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 
 namespace mongo {
 
@@ -81,8 +81,11 @@ public:
                                       DataThrottle* dataThrottle);
 
     boost::optional<IndexKeyEntry> seek(OperationContext* opCtx, const KeyString::Value& key);
+    boost::optional<KeyStringEntry> seekForKeyString(OperationContext* opCtx,
+                                                     const KeyString::Value& key);
 
     boost::optional<IndexKeyEntry> next(OperationContext* opCtx);
+    boost::optional<KeyStringEntry> nextKeyString(OperationContext* opCtx);
 
     void save() {
         _cursor->save();

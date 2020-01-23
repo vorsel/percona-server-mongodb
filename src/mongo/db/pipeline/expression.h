@@ -41,12 +41,12 @@
 #include <vector>
 
 #include "mongo/base/init.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/dependencies.h"
-#include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/expression_visitor.h"
 #include "mongo/db/pipeline/field_path.h"
-#include "mongo/db/pipeline/value.h"
 #include "mongo/db/pipeline/variables.h"
 #include "mongo/db/query/datetime/date_time_support.h"
 #include "mongo/db/server_options.h"
@@ -128,7 +128,7 @@ public:
      * Add the fields and variables used in this expression to 'deps'. References to variables which
      * are local to a particular expression will be filtered out of the tracker upon return.
      */
-    void addDependencies(DepsTracker* deps) {
+    void addDependencies(DepsTracker* deps) const {
         _doAddDependencies(deps);
 
         // Filter out references to any local variables.
@@ -1667,7 +1667,7 @@ public:
         return visitor->visit(this);
     }
 
-    DocumentMetadataFields::MetaType getMetaType() {
+    DocumentMetadataFields::MetaType getMetaType() const {
         return _metaType;
     }
 

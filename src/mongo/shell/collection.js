@@ -776,13 +776,13 @@ DBCollection.prototype._printExtraInfo = function(action, startTime) {
     }
 };
 
-DBCollection.prototype.validate = function(full) {
-    var cmd = {validate: this.getName()};
+DBCollection.prototype.validate = function(options) {
+    if (typeof (options) != 'object' && typeof (options) != 'undefined') {
+        return "expected optional options to be of the following format: {full: <bool>, background: <bool>}.";
+    }
 
-    if (typeof (full) == 'object')  // support arbitrary options here
-        Object.extend(cmd, full);
-    else
-        cmd.full = full;
+    var cmd = {validate: this.getName()};
+    Object.assign(cmd, options || {});
 
     var res = this._db.runCommand(cmd);
 
@@ -1012,44 +1012,6 @@ DBCollection.prototype.aggregate = function(pipeline, aggregateOptions) {
     return this._db._runAggregate(cmdObj, aggregateOptions);
 };
 
-MapReduceResult = function(db, o) {
-    Object.extend(this, o);
-    this._o = o;
-    this._keys = Object.keySet(o);
-    this._db = db;
-    if (this.result != null) {
-        this._coll = this._db.getCollection(this.result);
-    }
-};
-
-MapReduceResult.prototype._simpleKeys = function() {
-    return this._o;
-};
-
-MapReduceResult.prototype.find = function() {
-    if (this.results)
-        return this.results;
-    return DBCollection.prototype.find.apply(this._coll, arguments);
-};
-
-MapReduceResult.prototype.drop = function() {
-    if (this._coll) {
-        return this._coll.drop();
-    }
-};
-
-/**
- * just for debugging really
- */
-MapReduceResult.prototype.convertToSingleObject = function() {
-    var z = {};
-    var it = this.results != null ? this.results : this._coll.find();
-    it.forEach(function(a) {
-        z[a._id] = a.value;
-    });
-    return z;
-};
-
 DBCollection.prototype.convertToSingleObject = function(valueField) {
     var z = {};
     this.find().forEach(function(a) {
@@ -1070,21 +1032,21 @@ DBCollection.prototype.mapReduce = function(map, reduce, optionsOrOutString) {
     else
         Object.extend(c, optionsOrOutString);
 
-    var raw;
+    var output;
 
     if (c["out"].hasOwnProperty("inline") && c["out"]["inline"] === 1) {
         // if inline output is specified, we need to apply readPreference on the command
         // as it could be run on a secondary
-        raw = this._db.runReadCommand(c);
+        output = this._db.runReadCommand(c);
     } else {
-        raw = this._db.runCommand(c);
+        output = this._db.runCommand(c);
     }
 
-    if (!raw.ok) {
-        __mrerror__ = raw;
-        throw _getErrorWithCode(raw, "map reduce failed:" + tojson(raw));
+    if (!output.ok) {
+        __mrerror__ = output;
+        throw _getErrorWithCode(output, "map reduce failed:" + tojson(output));
     }
-    return new MapReduceResult(this._db, raw);
+    return output;
 };
 
 DBCollection.prototype.toString = function() {

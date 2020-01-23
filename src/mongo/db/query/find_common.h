@@ -29,7 +29,7 @@
 
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 
 namespace mongo {
 
@@ -115,17 +115,6 @@ public:
      * our budget to fit 'nextDoc'.
      */
     static bool haveSpaceForNext(const BSONObj& nextDoc, long long numDocs, int bytesBuffered);
-
-    /**
-     * Transforms the raw sort spec into one suitable for use as the ordering specification in
-     * BSONObj::woCompare().
-     *
-     * In particular, eliminates text score meta-sort from 'sortSpec'.
-     *
-     * The input must be validated (each BSON element must be either a number or text score
-     * meta-sort specification).
-     */
-    static BSONObj transformSortSpec(const BSONObj& sortSpec);
 
     /**
      * This function wraps waitWhileFailPointEnabled() on waitInFindBeforeMakingBatch.

@@ -32,6 +32,7 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/pipeline/expression_javascript.h"
+#include "mongo/db/query/query_knobs_gen.h"
 
 namespace mongo {
 
@@ -62,7 +63,8 @@ ExpressionInternalJsEmit::ExpressionInternalJsEmit(
     std::string funcSource)
     : Expression(expCtx, {std::move(thisRef)}),
       _thisRef(_children[0]),
-      _funcSource(std::move(funcSource)) {}
+      _funcSource(std::move(funcSource)),
+      _byteLimit(internalQueryMaxJsEmitBytes.load()) {}
 
 void ExpressionInternalJsEmit::_doAddDependencies(mongo::DepsTracker* deps) const {
     _children[0]->addDependencies(deps);
@@ -85,11 +87,8 @@ boost::intrusive_ptr<Expression> ExpressionInternalJsEmit::parse(
     BSONElement evalField = expr["eval"];
 
     uassert(31222, str::stream() << "The map function must be specified.", evalField);
-    uassert(ErrorCodes::BadValue,
-            str::stream() << kExpressionName << " with CodeWScope 'eval' argument is not supported",
-            evalField.type() != BSONType::CodeWScope);
     uassert(31224,
-            "The map function must be of type string, code, or code w/ scope",
+            "The map function must be of type string or code",
             evalField.type() == BSONType::String || evalField.type() == BSONType::Code);
 
     std::string funcSourceString = evalField._asCode();
@@ -140,7 +139,13 @@ Value ExpressionInternalJsEmit::evaluate(const Document& root, Variables* variab
 
     std::vector<Value> output;
 
+    size_t bytesUsed = 0;
     for (const auto& obj : emittedObjects) {
+        bytesUsed += obj.objsize();
+        uassert(31292,
+                str::stream() << "Size of emitted values exceeds the set size limit of "
+                              << _byteLimit << " bytes",
+                bytesUsed < _byteLimit);
         output.push_back(Value(obj));
     }
 
@@ -182,7 +187,7 @@ boost::intrusive_ptr<Expression> ExpressionInternalJs::parse(
 
     uassert(31261, "The eval function must be specified.", evalField);
     uassert(31262,
-            "The eval function must be of type string, code, or code w/ scope",
+            "The eval function must be of type string or code",
             evalField.type() == BSONType::String || evalField.type() == BSONType::Code);
 
     BSONElement argsField = expr["args"];
@@ -211,14 +216,9 @@ Value ExpressionInternalJs::evaluate(const Document& root, Variables* variables)
     uassert(
         31266, "The args field must be of type array", argExpressions.getType() == BSONType::Array);
 
-    const auto& args = argExpressions.getArray();
-    uassert(31267,
-            str::stream() << kExpressionName << " args field must have length 2",
-            args.size() == 2);
-
     int argNum = 0;
     BSONObjBuilder bob;
-    for (const auto& arg : args) {
+    for (const auto& arg : argExpressions.getArray()) {
         arg.addToBsonObj(&bob, "arg" + std::to_string(argNum++));
     }
     return jsExec->callFunction(func, bob.done(), {});

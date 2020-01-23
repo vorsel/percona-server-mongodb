@@ -254,11 +254,6 @@ public:
         return _data->empty();
     }
 
-    virtual Status touch(OperationContext* opCtx) const {
-        // already in memory...
-        return Status::OK();
-    }
-
     class Cursor final : public SortedDataInterface::Cursor {
     public:
         Cursor(OperationContext* opCtx,
@@ -286,6 +281,18 @@ public:
             if (_isEOF)
                 return {};
             return *_it;
+        }
+
+        boost::optional<KeyStringEntry> nextKeyString() override {
+            boost::optional<IndexKeyEntry> indexKeyEntry = next(RequestedInfo::kKeyAndLoc);
+            if (!indexKeyEntry) {
+                return {};
+            }
+
+            KeyString::Builder builder(
+                KeyString::Version::kLatestVersion, indexKeyEntry->key, _ordering);
+            builder.appendRecordId(indexKeyEntry->loc);
+            return KeyStringEntry(builder.getValueCopy(), indexKeyEntry->loc);
         }
 
         void setEndPosition(const BSONObj& key, bool inclusive) override {

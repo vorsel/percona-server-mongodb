@@ -32,16 +32,16 @@
 #include <boost/filesystem/operations.hpp>
 #include <memory>
 
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/document_value/value_comparator.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/pipeline/accumulation_statement.h"
 #include "mongo/db/pipeline/accumulator.h"
-#include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_source_group.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
-#include "mongo/db/pipeline/value.h"
-#include "mongo/db/pipeline/value_comparator.h"
 #include "mongo/util/destructor_guard.h"
 
 namespace mongo {
@@ -356,8 +356,11 @@ namespace {
 intrusive_ptr<Expression> parseIdExpression(const intrusive_ptr<ExpressionContext>& expCtx,
                                             BSONElement groupField,
                                             const VariablesParseState& vps) {
-    if (groupField.type() == Object && !groupField.Obj().isEmpty()) {
+    if (groupField.type() == Object) {
         // {_id: {}} is treated as grouping on a constant, not an expression
+        if (groupField.Obj().isEmpty()) {
+            return ExpressionConstant::create(expCtx, Value(groupField));
+        }
 
         const BSONObj idKeyObj = groupField.Obj();
         if (idKeyObj.firstElementFieldName()[0] == '$') {
@@ -371,12 +374,8 @@ intrusive_ptr<Expression> parseIdExpression(const intrusive_ptr<ExpressionContex
             }
             return ExpressionObject::parse(expCtx, idKeyObj, vps);
         }
-    } else if (groupField.type() == String && groupField.valuestr()[0] == '$') {
-        // grouping on a field path.
-        return ExpressionFieldPath::parse(expCtx, groupField.str(), vps);
     } else {
-        // constant id - single group
-        return ExpressionConstant::create(expCtx, Value(groupField));
+        return Expression::parseOperand(expCtx, groupField, vps);
     }
 }
 

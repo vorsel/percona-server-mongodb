@@ -55,7 +55,7 @@
 #include "mongo/platform/condition_variable.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/util/concurrency/thread_pool.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/net/hostandport.h"
 
 namespace mongo {
@@ -96,7 +96,7 @@ struct InitialSyncerOptions {
 
     // InitialSyncer waits this long before retrying getApplierBatchCallback() if there are
     // currently no operations available to apply or if the 'rsSyncApplyStop' failpoint is active.
-    // This default value is based on the duration in SyncTail::OpQueueBatcher::run().
+    // This default value is based on the duration in OpQueueBatcher::run().
     Milliseconds getApplierBatchCallbackRetryWait{1000};
 
     // Replication settings
@@ -622,8 +622,10 @@ private:
     HostAndPort _syncSource;                               // (M)
     OpTime _lastFetched;                                   // (MX)
     OpTimeAndWallTime _lastApplied;                        // (MX)
-    std::unique_ptr<OplogBuffer> _oplogBuffer;             // (M)
-    std::unique_ptr<OplogApplier> _oplogApplier;           // (M)
+    // TODO (SERVER-43001): The ownership of this will pass to either OplogApplier or
+    // OpQueueBatcher.
+    std::unique_ptr<OplogBuffer> _oplogBuffer;    // (M)
+    std::unique_ptr<OplogApplier> _oplogApplier;  // (M)
 
     // Used to signal changes in _state.
     mutable stdx::condition_variable _stateCondition;

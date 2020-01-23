@@ -37,13 +37,13 @@
 
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/document_value/document_comparator.h"
+#include "mongo/db/exec/document_value/value_comparator.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/aggregation_request.h"
-#include "mongo/db/pipeline/document_comparator.h"
 #include "mongo/db/pipeline/mongo_process_interface.h"
 #include "mongo/db/pipeline/runtime_constants_gen.h"
-#include "mongo/db/pipeline/value_comparator.h"
 #include "mongo/db/pipeline/variables.h"
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/datetime/date_time_support.h"
@@ -116,7 +116,6 @@ public:
      */
     ExpressionContext(OperationContext* opCtx,
                       const boost::optional<ExplainOptions::Verbosity>& explain,
-                      StringData comment,
                       bool fromMongos,
                       bool needsmerge,
                       bool allowDiskUse,
@@ -235,9 +234,6 @@ public:
     // The explain verbosity requested by the user, or boost::none if no explain was requested.
     boost::optional<ExplainOptions::Verbosity> explain;
 
-    // The comment provided by the user, or the empty string if no comment was provided.
-    std::string comment;
-
     bool fromMongos = false;
     bool needsMerge = false;
     bool inMongos = false;
@@ -280,6 +276,10 @@ public:
     // If set, this will disallow use of features introduced in versions above the provided version.
     boost::optional<ServerGlobalParams::FeatureCompatibility::Version>
         maxFeatureCompatibilityVersion;
+
+    // True if this ExpressionContext is associated with a Change Stream that should serialize its
+    // "$sortKey" using the 4.2 format.
+    bool use42ChangeStreamSortKeys = false;
 
 protected:
     static const int kInterruptCheckPeriod = 128;

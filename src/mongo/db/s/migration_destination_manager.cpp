@@ -64,7 +64,7 @@
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/stdx/chrono.h"
 #include "mongo/util/concurrency/notification.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 #include "mongo/util/producer_consumer_queue.h"
 #include "mongo/util/scopeguard.h"
@@ -651,7 +651,7 @@ void MigrationDestinationManager::cloneCollectionIndexesAndOptions(OperationCont
         AutoGetOrCreateDb autoCreateDb(opCtx, nss.db(), MODE_X);
         auto db = autoCreateDb.getDb();
 
-        auto collection = db->getCollection(opCtx, nss);
+        auto collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(nss);
         if (collection) {
             checkUUIDsMatch(collection);
         } else {
@@ -664,7 +664,7 @@ void MigrationDestinationManager::cloneCollectionIndexesAndOptions(OperationCont
             uassertStatusOK(db->userCreateNS(
                 opCtx, nss, collectionOptions, createDefaultIndexes, donorIdIndexSpec));
             wuow.commit();
-            collection = db->getCollection(opCtx, nss);
+            collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(nss);
         }
 
         auto indexSpecs = checkEmptyOrGetMissingIndexesFromDonor(collection);
@@ -852,7 +852,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* opCtx) {
                         batchNumCloned);
                     _clonedBytes += batchClonedBytes;
                 }
-                if (_writeConcern.shouldWaitForOtherNodes()) {
+                if (_writeConcern.needToWaitForOtherNodes()) {
                     repl::ReplicationCoordinator::StatusAndDuration replStatus =
                         repl::ReplicationCoordinator::get(opCtx)->awaitReplication(
                             opCtx,

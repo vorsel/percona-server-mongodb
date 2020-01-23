@@ -43,10 +43,10 @@
 #include "mongo/db/cursor_manager.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/change_stream_proxy.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/accumulator.h"
-#include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_exchange.h"
 #include "mongo/db/pipeline/document_source_geo_near.h"
@@ -287,7 +287,7 @@ StatusWith<StringMap<ExpressionContext::ResolvedNamespace>> resolveInvolvedNames
             // from a $merge to a collection in a different database. Since we cannot write to
             // views, simply assume that the namespace is a collection.
             resolvedNamespaces[involvedNs.coll()] = {involvedNs, std::vector<BSONObj>{}};
-        } else if (!db || db->getCollection(opCtx, involvedNs)) {
+        } else if (!db || CollectionCatalog::get(opCtx).lookupCollectionByNamespace(involvedNs)) {
             // If the aggregation database exists and 'involvedNs' refers to a collection namespace,
             // then we resolve it as an empty pipeline in order to read directly from the underlying
             // collection. If the database doesn't exist, then we still resolve it as an empty
@@ -338,7 +338,7 @@ Status collatorCompatibleWithPipeline(OperationContext* opCtx,
         return Status::OK();
     }
     for (auto&& potentialViewNs : liteParsedPipeline.getInvolvedNamespaces()) {
-        if (db->getCollection(opCtx, potentialViewNs)) {
+        if (CollectionCatalog::get(opCtx).lookupCollectionByNamespace(potentialViewNs)) {
             continue;
         }
 
@@ -456,6 +456,8 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> createOuterPipelineProxyExe
     const NamespaceString& nss,
     std::unique_ptr<Pipeline, PipelineDeleter> pipeline,
     bool hasChangeStream) {
+    boost::intrusive_ptr<ExpressionContext> expCtx(pipeline->getContext());
+
     // Transfer ownership of the Pipeline to the PipelineProxyStage.
     auto ws = std::make_unique<WorkingSet>();
     auto proxy = hasChangeStream
@@ -467,8 +469,8 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> createOuterPipelineProxyExe
     // invalidations. The Pipeline may contain PlanExecutors which *are* yielding
     // PlanExecutors and which *are* registered with their respective collection's
     // CursorManager
-    return uassertStatusOK(
-        PlanExecutor::make(opCtx, std::move(ws), std::move(proxy), nss, PlanExecutor::NO_YIELD));
+    return uassertStatusOK(PlanExecutor::make(
+        std::move(expCtx), std::move(ws), std::move(proxy), nullptr, PlanExecutor::NO_YIELD, nss));
 }
 }  // namespace
 

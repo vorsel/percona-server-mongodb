@@ -72,7 +72,7 @@
 
 #include "mongo/db/auth/user_document_parser.h"  // XXX-ANDY
 #include "mongo/rpc/object_check.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -1001,38 +1001,6 @@ StatusWith<std::vector<BSONObj>> CollectionImpl::addCollationDefaultsToIndexSpec
     }
 
     return newIndexSpecs;
-}
-
-Status CollectionImpl::touch(OperationContext* opCtx,
-                             bool touchData,
-                             bool touchIndexes,
-                             BSONObjBuilder* output) const {
-    if (touchData) {
-        BSONObjBuilder b;
-        Status status = _recordStore.get()->touch(opCtx, &b);
-        if (!status.isOK())
-            return status;
-        output->append("data", b.obj());
-    }
-
-    if (touchIndexes) {
-        Timer t;
-        std::unique_ptr<IndexCatalog::IndexIterator> ii =
-            _indexCatalog->getIndexIterator(opCtx, false);
-        while (ii->more()) {
-            const IndexCatalogEntry* entry = ii->next();
-            const IndexAccessMethod* iam = entry->accessMethod();
-            Status status = iam->touch(opCtx);
-            if (!status.isOK())
-                return status;
-        }
-
-        output->append(
-            "indexes",
-            BSON("num" << _indexCatalog->numIndexesTotal(opCtx) << "millis" << t.millis()));
-    }
-
-    return Status::OK();
 }
 
 std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> CollectionImpl::makePlanExecutor(

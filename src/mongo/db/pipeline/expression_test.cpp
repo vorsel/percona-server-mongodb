@@ -31,14 +31,14 @@
 
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/config.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_value_test_util.h"
+#include "mongo/db/exec/document_value/value_comparator.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
 #include "mongo/db/pipeline/accumulator.h"
-#include "mongo/db/pipeline/document.h"
-#include "mongo/db/pipeline/document_value_test_util.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
-#include "mongo/db/pipeline/value_comparator.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/unittest/unittest.h"
@@ -6199,10 +6199,10 @@ TEST(ExpressionMetaTest, ExpressionMetaSortKey) {
         ExpressionMeta::parse(expCtx, expr.firstElement(), expCtx->variablesParseState);
 
     MutableDocument doc;
-    BSONObj sortKey = BSON("" << 1 << "" << 2);
-    doc.metadata().setSortKey(sortKey);
+    Value sortKey = Value(std::vector<Value>{Value(1), Value(2)});
+    doc.metadata().setSortKey(sortKey, /* isSingleElementSortKey = */ false);
     Value val = expressionMeta->evaluate(doc.freeze(), &expCtx->variables);
-    ASSERT_DOCUMENT_EQ(val.getDocument(), Document(sortKey));
+    ASSERT_BSONOBJ_EQ(val.getDocument().toBson(), BSON("" << 1 << "" << 2));
 }
 
 TEST(ExpressionMetaTest, ExpressionMetaTextScore) {
@@ -6354,9 +6354,10 @@ TEST(ExpressionRegexTest, InvalidUTF8InRegex) {
 
 }  // namespace ExpressionRegexTest
 
-class All : public Suite {
+class All : public OldStyleSuiteSpecification {
 public:
-    All() : Suite("expression") {}
+    All() : OldStyleSuiteSpecification("expression") {}
+
     void setupTests() {
         add<Add::NullDocument>();
         add<Add::NoOperands>();
@@ -6559,7 +6560,7 @@ public:
     }
 };
 
-SuiteInstance<All> myall;
+OldStyleSuiteInitializer<All> myall;
 
 namespace NowAndClusterTime {
 TEST(NowAndClusterTime, BasicTest) {

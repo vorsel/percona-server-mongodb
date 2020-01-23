@@ -9,8 +9,14 @@
 (function() {
 'use strict';
 
-// TODO: SERVER-33601 remove shardAsReplicaSet: false
-var s = new ShardingTest({shards: 2, other: {shardAsReplicaSet: false}});
+var checkDocCounts = function(expectedShardCount) {
+    for (var shardName in expectedShardCount) {
+        var shard = (shardName == s.shard0.shardName ? s.shard0 : s.shard1);
+        assert.eq(expectedShardCount[shardName], shard.getDB('test').user.find().count());
+    }
+};
+
+var s = new ShardingTest({shards: 2});
 
 var db = s.getDB("test");
 var admin = s.getDB("admin");
@@ -42,14 +48,8 @@ assert.throws(function() {
 // create usable index
 assert.commandWorked(coll.ensureIndex({num: 1, x: 1}));
 
-// usable index, but doc with empty 'num' value, so still should throw
+// usable index, doc with empty 'num' value
 assert.commandWorked(coll.insert({x: -5}));
-assert.throws(function() {
-    s.adminCommand({shardCollection: coll.getFullName(), key: {num: 1}});
-});
-
-// remove the bad doc.  now should finally succeed
-assert.commandWorked(coll.remove({x: -5}));
 assert.commandWorked(s.s0.adminCommand({shardCollection: coll.getFullName(), key: {num: 1}}));
 
 // make sure extra index is not created
@@ -107,7 +107,7 @@ assert.commandWorked(admin.runCommand({
     _waitForDelete: true
 }));
 
-var expectedShardCount = {shard0000: 0, shard0001: 0};
+var expectedShardCount = {};
 config.chunks.find({ns: 'test.user'}).forEach(function(chunkDoc) {
     var min = chunkDoc.min.num;
     var max = chunkDoc.max.num;
@@ -120,18 +120,18 @@ config.chunks.find({ns: 'test.user'}).forEach(function(chunkDoc) {
         max = 1000;
     }
 
+    if (!(chunkDoc.shard in expectedShardCount)) {
+        expectedShardCount[chunkDoc.shard] = 0;
+    }
+
     if (max > 0) {
         expectedShardCount[chunkDoc.shard] += (max - min);
     }
 });
 
-assert.eq(expectedShardCount['shard0000'], s.shard0.getDB('test').user.find().count());
-assert.eq(expectedShardCount['shard0001'], s.shard1.getDB('test').user.find().count());
-
+checkDocCounts(expectedShardCount);
 assert.commandWorked(admin.runCommand({split: 'test.user', middle: {num: 70}}));
-
-assert.eq(expectedShardCount['shard0000'], s.shard0.getDB('test').user.find().count());
-assert.eq(expectedShardCount['shard0001'], s.shard1.getDB('test').user.find().count());
+checkDocCounts(expectedShardCount);
 
 //******************Part 3********************
 

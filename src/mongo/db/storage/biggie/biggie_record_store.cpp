@@ -191,7 +191,7 @@ Status RecordStore::updateRecord(OperationContext* opCtx,
                                  const char* data,
                                  int len) {
     StringStore* workingCopy(RecoveryUnit::get(opCtx)->getHead());
-    SizeAdjuster(opCtx, this);
+    SizeAdjuster adjuster(opCtx, this);
     {
         std::string key = createKey(_ident, oldLocation.repr());
         StringStore::const_iterator it = workingCopy->find(key);
@@ -296,10 +296,6 @@ void RecordStore::appendCustomStats(OperationContext* opCtx,
         result->appendIntOrLL("max", _cappedMaxDocs);
         result->appendIntOrLL("maxSize", _cappedMaxSize / scale);
     }
-}
-
-Status RecordStore::touch(OperationContext* opCtx, BSONObjBuilder* output) const {
-    return Status::OK();  // All data is already in 'cache'.
 }
 
 void RecordStore::updateStatsAfterRepair(OperationContext* opCtx,

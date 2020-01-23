@@ -38,7 +38,7 @@
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/record_store.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
@@ -69,6 +69,7 @@ stdx::condition_variable _validationNotifier;
  *   {
  *       validate: "collectionNameWithoutTheDBPart",
  *       full: <bool>  // If true, a more thorough (and slower) collection validation is performed.
+ *       background: <bool>  // If true, performs validation on the checkpoint of the collection.
  *   }
  */
 class ValidateCmd : public BasicCommand {
@@ -80,9 +81,11 @@ public:
     }
 
     std::string help() const override {
-        return "Validate contents of a namespace by scanning its data structures for correctness.  "
-               "Slow.\n"
-               "Add full:true option to do a more thorough check";
+        return str::stream() << "Validate contents of a namespace by scanning its data structures "
+                             << "for correctness.\nThis is a slow operation.\n"
+                             << "\tAdd {full: true} option to do a more thorough check.\n"
+                             << "\tAdd {background: true} to validate in the background.\n"
+                             << "Cannot specify both {full: true, background: true}.";
     }
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
@@ -95,6 +98,10 @@ public:
 
     bool canIgnorePrepareConflicts() const override {
         return true;
+    }
+
+    bool maintenanceOk() const override {
+        return false;
     }
 
     virtual void addRequiredPrivileges(const std::string& dbname,
@@ -135,7 +142,8 @@ public:
         }
 
         if (!serverGlobalParams.quiet.load()) {
-            LOG(0) << "CMD: validate " << nss.ns();
+            LOG(0) << "CMD: validate " << nss.ns() << (background ? ", background:true" : "")
+                   << (fullValidate ? ", full:true" : "");
         }
 
         // Only one validation per collection can be in progress, the rest wait.

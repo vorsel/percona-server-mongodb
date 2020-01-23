@@ -450,20 +450,6 @@ public:
                                    double scale) const = 0;
 
     /**
-     * Load all data into cache.
-     * What cache depends on implementation.
-     *
-     * If the underlying storage engine does not support the operation,
-     * returns ErrorCodes::CommandNotSupported
-     *
-     * @param output (optional) - where to put detailed stats
-     */
-    virtual Status touch(OperationContext* opCtx, BSONObjBuilder* output) const {
-        return Status(ErrorCodes::CommandNotSupported,
-                      "this storage engine does not support touch");
-    }
-
-    /**
      * Return the RecordId of an oplog entry as close to startingPosition as possible without
      * being higher. If there are no entries <= startingPosition, return RecordId().
      *
@@ -532,6 +518,15 @@ public:
      * Storage engines supporting oplog stones must implement this function.
      */
     virtual void reclaimOplog(OperationContext* opCtx) {
+        MONGO_UNREACHABLE;
+    }
+
+    /**
+     * This should only be called if StorageEngine::supportsOplogStones() is true.
+     * Storage engines supporting oplog stones must implement this function.
+     * Populates `builder` with various statistics pertaining to oplog stones and oplog truncation.
+     */
+    virtual void getOplogTruncateStats(BSONObjBuilder& builder) const {
         MONGO_UNREACHABLE;
     }
 

@@ -46,7 +46,7 @@
 #include "mongo/platform/condition_variable.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/stdx/thread.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 
 /**
  * Either executes the specified operation and returns it's value or randomly throws a write
@@ -117,6 +117,8 @@ public:
     };
 
     WiredTigerRecordStore(WiredTigerKVEngine* kvEngine, OperationContext* opCtx, Params params);
+
+    virtual void getOplogTruncateStats(BSONObjBuilder& builder) const;
 
     virtual ~WiredTigerRecordStore();
 
@@ -191,8 +193,6 @@ public:
                                    BSONObjBuilder* result,
                                    double scale) const;
 
-    virtual Status touch(OperationContext* opCtx, BSONObjBuilder* output) const;
-
     virtual void cappedTruncateAfter(OperationContext* opCtx, RecordId end, bool inclusive);
 
     virtual boost::optional<RecordId> oplogStartHack(OperationContext* opCtx,
@@ -230,6 +230,13 @@ public:
     uint64_t tableId() const {
         return _tableId;
     }
+
+    /*
+     * Check the size information for this RecordStore. This function opens a cursor on the
+     * RecordStore to determine if it is empty. If it is empty, it will mark the collection as
+     * needing size adjustment as a result of a rollback or storage recovery event.
+     */
+    void checkSize(OperationContext* opCtx);
 
     void setSizeStorer(WiredTigerSizeStorer* ss) {
         _sizeStorer = ss;
@@ -279,10 +286,17 @@ private:
                           const Timestamp* timestamps,
                           size_t nRecords);
 
-    RecordId _nextId();
-    void _setId(RecordId id);
+    RecordId _nextId(OperationContext* opCtx);
     bool cappedAndNeedDelete() const;
     RecordData _getData(const WiredTigerCursor& cursor) const;
+
+
+    /**
+     * Initialize the largest known RecordId if it is not already. This is designed to be called
+     * immediately before operations that may need this Recordid. This is to support lazily
+     * initializing the value instead of all at once during startup.
+     */
+    void _initNextIdIfNeeded(OperationContext* opCtx);
 
     /**
      * Position the cursor at the first key. The previously known first key is
@@ -354,7 +368,9 @@ private:
     int _cappedDeleteCheckCount;
     mutable stdx::timed_mutex _cappedDeleterMutex;
 
-    AtomicWord<long long> _nextIdNum;
+    // Protects initialization of the _nextIdNum.
+    mutable Mutex _initNextIdMutex = MONGO_MAKE_LATCH("WiredTigerRecordStore::_initNextIdMutex");
+    AtomicWord<long long> _nextIdNum{0};
 
     WiredTigerSizeStorer* _sizeStorer;  // not owned, can be NULL
     std::shared_ptr<WiredTigerSizeStorer::SizeInfo> _sizeInfo;
@@ -363,6 +379,10 @@ private:
 
     // Non-null if this record store is underlying the active oplog.
     std::shared_ptr<OplogStones> _oplogStones;
+
+    AtomicWord<int64_t>
+        _totalTimeTruncating;            // Cumulative amount of time spent truncating the oplog.
+    AtomicWord<int64_t> _truncateCount;  // Cumulative number of truncates of the oplog.
 };
 
 

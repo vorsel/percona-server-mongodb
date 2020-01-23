@@ -56,16 +56,20 @@ ValidateState::ValidateState(OperationContext* opCtx,
                              bool background,
                              bool fullValidate)
     : _nss(nss), _background(background), _fullValidate(fullValidate) {
-    _databaseLock.emplace(opCtx, _nss.db(), MODE_IX);
-    _database = _databaseLock->getDb() ? _databaseLock->getDb() : nullptr;
 
     // Subsequent re-locks will use the UUID when 'background' is true.
     if (_background) {
-        _collectionLock.emplace(opCtx, _nss, MODE_IX);
+        _databaseLock.emplace(opCtx, _nss.db(), MODE_IS);
+        _collectionLock.emplace(opCtx, _nss, MODE_IS);
     } else {
+        _databaseLock.emplace(opCtx, _nss.db(), MODE_IX);
         _collectionLock.emplace(opCtx, _nss, MODE_X);
     }
-    _collection = _database ? _database->getCollection(opCtx, _nss) : nullptr;
+
+    _database = _databaseLock->getDb() ? _databaseLock->getDb() : nullptr;
+    _collection =
+        _database ? CollectionCatalog::get(opCtx).lookupCollectionByNamespace(_nss) : nullptr;
+
 
     if (!_collection) {
         if (_database && ViewCatalog::get(_database)->lookup(opCtx, _nss.ns())) {
@@ -77,21 +81,19 @@ ValidateState::ValidateState(OperationContext* opCtx,
     }
 
     _uuid = _collection->uuid();
+    _catalogGeneration = opCtx->getServiceContext()->getCatalogGeneration();
 }
 
 void ValidateState::yieldLocks(OperationContext* opCtx) {
     invariant(_background);
 
-    // Save all the cursors.
-    for (const auto& indexCursor : _indexCursors) {
-        indexCursor.second->save();
-    }
-
-    _traverseRecordStoreCursor->save();
-    _seekRecordStoreCursor->save();
-
     // Drop and reacquire the locks.
     _relockDatabaseAndCollection(opCtx);
+
+    uassert(ErrorCodes::Interrupted,
+            str::stream() << "Interrupted due to: catalog restart: " << _nss << " (" << *_uuid
+                          << ") while validating the collection",
+            _catalogGeneration == opCtx->getServiceContext()->getCatalogGeneration());
 
     // Check if any of the indexes we were validating were dropped. Indexes created while
     // yielding will be ignored.
@@ -102,23 +104,6 @@ void ValidateState::yieldLocks(OperationContext* opCtx) {
                     << _nss << " (" << *_uuid << "), index: " << index->descriptor()->indexName(),
                 !index->isDropped());
     }
-
-    // Restore all the cursors.
-    for (const auto& indexCursor : _indexCursors) {
-        indexCursor.second->restore();
-    }
-
-    uassert(
-        ErrorCodes::Interrupted,
-        str::stream() << "Interrupted due to: cursor cannot be restored after yield on collection: "
-                      << _nss.db() << " (" << *_uuid << ")",
-        _traverseRecordStoreCursor->restore());
-
-    uassert(
-        ErrorCodes::Interrupted,
-        str::stream() << "Interrupted due to: cursor cannot be restored after yield on collection: "
-                      << _nss.db() << " (" << *_uuid << ")",
-        _seekRecordStoreCursor->restore());
 };
 
 void ValidateState::initializeCursors(OperationContext* opCtx) {
@@ -131,6 +116,7 @@ void ValidateState::initializeCursors(OperationContext* opCtx) {
     // the same checkpoint, i.e. a consistent view of the collection data.
     std::unique_ptr<StorageEngine::CheckpointLock> checkpointCursorsLock;
     if (_background) {
+        invariant(!opCtx->lockState()->isCollectionLockedForMode(_nss, MODE_X));
         auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
         invariant(storageEngine->supportsCheckpoints());
         opCtx->recoveryUnit()->abandonSnapshot();
@@ -145,41 +131,59 @@ void ValidateState::initializeCursors(OperationContext* opCtx) {
         _dataThrottle.turnThrottlingOff();
     }
 
-    std::vector<std::string> readyDurableIndexes;
-    try {
-        DurableCatalog::get(opCtx)->getReadyIndexes(opCtx, _nss, &readyDurableIndexes);
-    } catch (const ExceptionFor<ErrorCodes::CursorNotFound>& ex) {
-        log() << "Skipping validation on collection with name " << _nss
-              << " because there is no checkpoint available for the MDB catalog yet (" << ex
-              << ").";
-        throw;
-    }
-
     try {
         _traverseRecordStoreCursor = std::make_unique<SeekableRecordThrottleCursor>(
             opCtx, _collection->getRecordStore(), &_dataThrottle);
         _seekRecordStoreCursor = std::make_unique<SeekableRecordThrottleCursor>(
             opCtx, _collection->getRecordStore(), &_dataThrottle);
     } catch (const ExceptionFor<ErrorCodes::CursorNotFound>& ex) {
+        invariant(_background);
         // End the validation if we can't open a checkpoint cursor on the collection.
-        log() << "Skipping validation on collection with name " << _nss << " due to " << ex;
+        log() << "Skipping background validation on collection '" << _nss
+              << "' because the collection is not yet in a checkpoint: " << ex;
+        throw;
+    }
+
+    std::vector<std::string> readyDurableIndexes;
+    try {
+        DurableCatalog::get(opCtx)->getReadyIndexes(opCtx, _nss, &readyDurableIndexes);
+    } catch (const ExceptionFor<ErrorCodes::CursorNotFound>& ex) {
+        invariant(_background);
+        log() << "Skipping background validation on collection '" << _nss
+              << "' because the data is not yet in a checkpoint: " << ex;
         throw;
     }
 
     const IndexCatalog* indexCatalog = _collection->getIndexCatalog();
     const std::unique_ptr<IndexCatalog::IndexIterator> it =
-        indexCatalog->getIndexIterator(opCtx, false);
+        indexCatalog->getIndexIterator(opCtx, /*includeUnfinished*/ false);
     while (it->more()) {
         const IndexCatalogEntry* entry = it->next();
         const IndexDescriptor* desc = entry->descriptor();
 
-        // Skip indexes that are not yet durable and ready in the checkpointed MDB catalog.
+        // Filter out any in-memory index in the collection that is not in our PIT view of the MDB
+        // catalog. This is only important when background:true because we are then reading from the
+        // checkpoint's view of the MDB catalog and data.
         bool isIndexDurable =
             std::find(readyDurableIndexes.begin(), readyDurableIndexes.end(), desc->indexName()) !=
             readyDurableIndexes.end();
         if (_background && !isIndexDurable) {
-            log() << "Skipping validation on index with name " << desc->indexName()
-                  << " as it is not ready in the checkpoint yet.";
+            log() << "Skipping validation on index '" << desc->indexName() << "' in collection '"
+                  << _nss << "' because the index is not yet in a checkpoint.";
+            continue;
+        }
+
+        // Read the index's ident from disk (the checkpoint if background:true). If it does not
+        // match the in-memory ident saved in the IndexCatalogEntry, then our PIT view of the index
+        // is old and the index has been dropped and recreated. In this case we will skip it since
+        // there is no utility in checking a dropped index (we also cannot currently access it
+        // because its in-memory representation is gone).
+        auto diskIndexIdent =
+            opCtx->getServiceContext()->getStorageEngine()->getCatalog()->getIndexIdent(
+                opCtx, _nss, desc->indexName());
+        if (entry->getIdent() != diskIndexIdent) {
+            log() << "Skipping validation on index '" << desc->indexName() << "' in collection '"
+                  << _nss << "' because the index was recreated and is not yet in a checkpoint.";
             continue;
         }
 
@@ -188,8 +192,11 @@ void ValidateState::initializeCursors(OperationContext* opCtx) {
                                   std::make_unique<SortedDataInterfaceThrottleCursor>(
                                       opCtx, entry->accessMethod(), &_dataThrottle));
         } catch (const ExceptionFor<ErrorCodes::CursorNotFound>& ex) {
-            log() << "Skipping validation on index with name " << desc->indexName() << " due to "
-                  << ex;
+            invariant(_background);
+            // This can only happen if the checkpoint has the MDB catalog entry for the index, but
+            // not the corresponding index table.
+            log() << "Skipping validation on index '" << desc->indexName() << "' in collection '"
+                  << _nss << "' because the index data is not in a checkpoint: " << ex;
             continue;
         }
 
@@ -222,7 +229,7 @@ void ValidateState::_relockDatabaseAndCollection(OperationContext* opCtx) {
         << "Interrupted due to: database drop: " << _nss.db()
         << " while validating collection: " << _nss << " (" << *_uuid << ")";
 
-    _databaseLock.emplace(opCtx, _nss.db(), MODE_IX);
+    _databaseLock.emplace(opCtx, _nss.db(), MODE_IS);
     _database = DatabaseHolder::get(opCtx)->getDb(opCtx, _nss.db());
     uassert(ErrorCodes::Interrupted, dbErrMsg, _database);
     uassert(ErrorCodes::Interrupted, dbErrMsg, !_database->isDropPending(opCtx));
@@ -232,7 +239,7 @@ void ValidateState::_relockDatabaseAndCollection(OperationContext* opCtx) {
 
     try {
         NamespaceStringOrUUID nssOrUUID(std::string(_nss.db()), *_uuid);
-        _collectionLock.emplace(opCtx, nssOrUUID, MODE_IX);
+        _collectionLock.emplace(opCtx, nssOrUUID, MODE_IS);
     } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
         uasserted(ErrorCodes::Interrupted, collErrMsg);
     }

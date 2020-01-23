@@ -58,7 +58,7 @@
 #include "mongo/rpc/protocol.h"
 #include "mongo/rpc/write_concern_error_detail.h"
 #include "mongo/s/stale_exception.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/invariant.h"
 #include "mongo/util/log.h"
 #include "mongo/util/str.h"
@@ -488,6 +488,10 @@ bool CommandHelpers::shouldActivateFailCommandFailPoint(const BSONObj& data,
         if (!data.hasField("failInternalCommands") || !data.getBoolField("failInternalCommands")) {
             return false;
         }
+    }
+
+    if (!client->session()) {
+        return false;
     }
 
     if (data.hasField("namespace") && nss != NamespaceString(data.getStringField("namespace"))) {

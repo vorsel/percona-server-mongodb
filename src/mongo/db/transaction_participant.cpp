@@ -63,7 +63,7 @@
 #include "mongo/db/stats/fill_locker_info.h"
 #include "mongo/db/transaction_history_iterator.h"
 #include "mongo/db/transaction_participant_gen.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/socket_utils.h"
 
@@ -347,7 +347,7 @@ TransactionParticipant::getOldestActiveTimestamp(Timestamp stableTimestamp) {
             return boost::none;
         }
 
-        auto collection = db->getCollection(opCtx.get(), nss);
+        auto collection = CollectionCatalog::get(opCtx.get()).lookupCollectionByNamespace(nss);
         if (!collection) {
             return boost::none;
         }
@@ -369,7 +369,6 @@ TransactionParticipant::getOldestActiveTimestamp(Timestamp stableTimestamp) {
                 continue;
             }
             // A prepared transaction must have a start timestamp.
-            // TODO(SERVER-40013): Handle entries with state "prepared" and no "startTimestamp".
             invariant(txnRecord.getStartOpTime());
             auto ts = txnRecord.getStartOpTime()->getTimestamp();
             if (!oldestTxnTimestamp || ts < oldestTxnTimestamp.value()) {

@@ -30,28 +30,44 @@
 
 #pragma once
 
+#include "mongo/db/commands/fsync.h"
+#include "mongo/db/commands/server_status_metric.h"
+#include "mongo/db/concurrency/replication_state_transition_lock_guard.h"
+#include "mongo/db/repl/initial_syncer.h"
 #include "mongo/db/repl/oplog_applier.h"
+#include "mongo/db/repl/opqueue_batcher.h"
 #include "mongo/db/repl/replication_consistency_markers.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/session_update_tracker.h"
 #include "mongo/db/repl/storage_interface.h"
-#include "mongo/db/repl/sync_tail.h"
 
 namespace mongo {
 namespace repl {
 
 /**
  * Applies oplog entries.
- * Reads from an OplogBuffer batches of operations that may be applied in parallel.
+ * Primarily used to apply batches of operations fetched from a sync source during steady state
+ * replication and initial sync.
+ *
+ * When used for steady state replication, runs a thread that reads batches of operations from
+ * an oplog buffer (through the BackgroundSync interface), writes them into the oplog collection,
+ * and applies the batch of operations.
  */
 class OplogApplierImpl : public OplogApplier {
     OplogApplierImpl(const OplogApplierImpl&) = delete;
     OplogApplierImpl& operator=(const OplogApplierImpl&) = delete;
 
 public:
+    using ApplyGroupFunc = std::function<Status(OperationContext* opCtx,
+                                                MultiApplier::OperationPtrs* ops,
+                                                OplogApplierImpl* oai,
+                                                WorkerMultikeyPathInfo* workerMultikeyPathInfo)>;
     /**
      * Constructs this OplogApplier with specific options.
-     * Obtains batches of operations from the OplogBuffer to apply.
-     * Reports oplog application progress using the Observer.
+     * During steady state replication, _run() obtains batches of operations to apply
+     * from the oplogBuffer. During the oplog application phase, the batch of operations is
+     * distributed across writer threads in 'writerPool'. Each writer thread applies its own vector
+     * of operations using 'func'. The writer thread pool is not owned by us.
      */
     OplogApplierImpl(executor::TaskExecutor* executor,
                      OplogBuffer* oplogBuffer,
@@ -59,26 +75,82 @@ public:
                      ReplicationCoordinator* replCoord,
                      ReplicationConsistencyMarkers* consistencyMarkers,
                      StorageInterface* storageInterface,
+                     ApplyGroupFunc func,
                      const Options& options,
                      ThreadPool* writerPool);
 
+
 private:
+    /**
+     * Runs oplog application in a loop until shutdown() is called.
+     * Retrieves operations from the OplogBuffer in batches that will be applied in parallel using
+     * multiApply().
+     */
     void _run(OplogBuffer* oplogBuffer) override;
 
-    void _shutdown() override;
+    /**
+     * Applies a batch of oplog entries by writing the oplog entries to the local oplog and then
+     * using a set of threads to apply the operations. It writes all entries to the oplog, but only
+     * applies entries with timestamp >= beginApplyingTimestamp.
+     *
+     * If the batch application is successful, returns the optime of the last op applied, which
+     * should be the last op in the batch.
+     * Returns ErrorCodes::CannotApplyOplogWhilePrimary if the node has become primary.
+     *
+     * To provide crash resilience, this function will advance the persistent value of 'minValid'
+     * to at least the last optime of the batch. If 'minValid' is already greater than or equal
+     * to the last optime of this batch, it will not be updated.
+     */
+    StatusWith<OpTime> _multiApply(OperationContext* opCtx, MultiApplier::Operations ops);
 
-    StatusWith<OpTime> _multiApply(OperationContext* opCtx, Operations ops) override;
+    void _deriveOpsAndFillWriterVectors(OperationContext* opCtx,
+                                        MultiApplier::Operations* ops,
+                                        std::vector<MultiApplier::OperationPtrs>* writerVectors,
+                                        std::vector<MultiApplier::Operations>* derivedOps,
+                                        SessionUpdateTracker* sessionUpdateTracker) noexcept;
 
     // Not owned by us.
     ReplicationCoordinator* const _replCoord;
 
-    // Used to run oplog application loop.
-    SyncTail _syncTail;
+    // Pool of worker threads for writing ops to the databases.
+    // Not owned by us.
+    ThreadPool* const _writerPool;
+
+    StorageInterface* _storageInterface;
+
+    ReplicationConsistencyMarkers* const _consistencyMarkers;
+
+    // Function to use during _multiApply
+    ApplyGroupFunc _applyFunc;
 
     // Used to determine which operations should be applied during initial sync. If this is null,
     // we will apply all operations that were fetched.
     OpTime _beginApplyingOpTime = OpTime();
+
+protected:
+    // Marked as protected for use in unit tests.
+    void fillWriterVectors(OperationContext* opCtx,
+                           MultiApplier::Operations* ops,
+                           std::vector<MultiApplier::OperationPtrs>* writerVectors,
+                           std::vector<MultiApplier::Operations>* derivedOps) noexcept;
 };
 
+/**
+ * Applies a batch of operations.
+ */
+Status applyOplogEntryBatch(OperationContext* opCtx,
+                            const OplogEntryBatch& batch,
+                            OplogApplication::Mode oplogApplicationMode);
+
+/**
+ * This free function is used by the thread pool workers to write ops to the db.
+ * This consumes the passed in OperationPtrs and callers should not make any assumptions about the
+ * state of the container after calling. However, this function cannot modify the pointed-to
+ * operations because the OperationPtrs container contains const pointers.
+ */
+Status applyOplogGroup(OperationContext* opCtx,
+                       MultiApplier::OperationPtrs* ops,
+                       OplogApplierImpl* oai,
+                       WorkerMultikeyPathInfo* workerMultikeyPathInfo);
 }  // namespace repl
 }  // namespace mongo

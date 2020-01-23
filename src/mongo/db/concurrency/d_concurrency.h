@@ -98,7 +98,8 @@ public:
             }
         }
 
-        void lock(LockMode mode);
+        void lock(LockMode mode);                           // Uninterruptible
+        void lock(OperationContext* opCtx, LockMode mode);  // Interruptible
         void unlock();
 
         bool isLocked() const {
@@ -156,6 +157,16 @@ public:
     public:
         ExclusiveLock(Locker* locker, ResourceMutex mutex)
             : ResourceLock(locker, mutex.rid(), MODE_X) {}
+
+        using ResourceLock::lock;
+
+        /**
+         * Parameterless overload to allow ExclusiveLock to be used with stdx::unique_lock and
+         * stdx::condition_variable_any
+         */
+        void lock() {
+            lock(MODE_X);
+        }
     };
 
     /**

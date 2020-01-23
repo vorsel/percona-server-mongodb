@@ -92,7 +92,7 @@ WriteConcernOptions::WriteConcernOptions(const std::string& mode,
     : syncMode(sync), wNumNodes(0), wMode(mode), wTimeout(durationCount<Milliseconds>(timeout)) {}
 
 Status WriteConcernOptions::parse(const BSONObj& obj) {
-    reset();
+    *this = WriteConcernOptions();
     if (obj.isEmpty()) {
         return Status(ErrorCodes::FailedToParse, "write concern object cannot be empty");
     }
@@ -148,6 +148,7 @@ Status WriteConcernOptions::parse(const BSONObj& obj) {
         wNumNodes = wEl.numberInt();
         usedDefaultW = false;
     } else if (wEl.type() == String) {
+        wNumNodes = 0;
         wMode = wEl.valuestrsafe();
         usedDefaultW = false;
     } else if (wEl.eoo() || wEl.type() == jstNULL || wEl.type() == Undefined) {
@@ -160,19 +161,15 @@ Status WriteConcernOptions::parse(const BSONObj& obj) {
 }
 
 WriteConcernOptions WriteConcernOptions::deserializerForIDL(const BSONObj& obj) {
-    WriteConcernOptions writeConcernOptions;
-    uassertStatusOK(writeConcernOptions.parse(obj));
-    return writeConcernOptions;
+    WriteConcernOptions writeConcern;
+    if (!obj.isEmpty()) {
+        uassertStatusOK(writeConcern.parse(obj));
+    }
+    return writeConcern;
 }
 
-StatusWith<WriteConcernOptions> WriteConcernOptions::extractWCFromCommand(
-    const BSONObj& cmdObj, const WriteConcernOptions& defaultWC) {
-    WriteConcernOptions writeConcern = defaultWC;
-    writeConcern.usedDefault = true;
-    writeConcern.usedDefaultW = true;
-    if (writeConcern.wNumNodes == 0 && writeConcern.wMode.empty()) {
-        writeConcern.wNumNodes = 1;
-    }
+StatusWith<WriteConcernOptions> WriteConcernOptions::extractWCFromCommand(const BSONObj& cmdObj) {
+    WriteConcernOptions writeConcern;
 
     // Return the default write concern if no write concern is provided. We check for the existence
     // of the write concern field up front in order to avoid the expense of constructing an error
@@ -225,7 +222,7 @@ BSONObj WriteConcernOptions::toBSON() const {
     return builder.obj();
 }
 
-bool WriteConcernOptions::shouldWaitForOtherNodes() const {
+bool WriteConcernOptions::needToWaitForOtherNodes() const {
     return !wMode.empty() || wNumNodes > 1;
 }
 

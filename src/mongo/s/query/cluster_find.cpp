@@ -63,7 +63,7 @@
 #include "mongo/s/query/store_possible_cursor.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/s/transaction_router.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
@@ -83,6 +83,34 @@ static const BSONObj kGeoNearDistanceMetaProjection = BSON("$meta"
 static const int kPerDocumentOverheadBytesUpperBound = 10;
 
 const char kFindCmdName[] = "find";
+
+/**
+ * Transforms the raw sort spec into one suitable for use as the ordering specification in
+ * BSONObj::woCompare().
+ *
+ * In particular, eliminates text score meta-sort from 'sortSpec'.
+ *
+ * The input must be validated (each BSON element must be either a number or text score meta-sort
+ * specification).
+ */
+BSONObj transformSortSpec(const BSONObj& sortSpec) {
+    BSONObjBuilder comparatorBob;
+
+    for (BSONElement elt : sortSpec) {
+        if (elt.isNumber()) {
+            comparatorBob.append(elt);
+        } else if (QueryRequest::isTextScoreMeta(elt)) {
+            // Sort text score decreasing by default. Field name doesn't matter but we choose
+            // something that a user shouldn't ever have.
+            comparatorBob.append("$metaTextScore", -1);
+        } else {
+            // Sort spec should have been validated before here.
+            fassertFailed(28784);
+        }
+    }
+
+    return comparatorBob.obj();
+}
 
 /**
  * Given the QueryRequest 'qr' being executed by mongos, returns a copy of the query which is
@@ -158,6 +186,9 @@ StatusWith<std::unique_ptr<QueryRequest>> transformQueryForShards(
     // multiple batches from a shard in order to return the single requested batch to the client.
     // Therefore, we must always send singleBatch=false (wantMore=true) to the shards.
     newQR->setWantMore(true);
+
+    // Any expansion of the 'showRecordId' flag should have already happened on mongos.
+    newQR->setShowRecordId(false);
 
     invariant(newQR->validate());
     return std::move(newQR);
@@ -243,7 +274,7 @@ CursorId runQueryWithoutRetrying(OperationContext* opCtx,
     // sort on mongos. Including a $natural anywhere in the sort spec results in the whole sort
     // being considered a hint to use a collection scan.
     if (!query.getQueryRequest().getSort().hasField("$natural")) {
-        params.sort = FindCommon::transformSortSpec(query.getQueryRequest().getSort());
+        params.sort = transformSortSpec(query.getQueryRequest().getSort());
     }
 
     bool appendGeoNearDistanceProjection = false;
@@ -368,6 +399,12 @@ Status setUpOperationContextStateForGetMore(OperationContext* opCtx,
         ReadPreferenceSetting::get(opCtx) = *readPref;
     }
 
+    // If the originating command had a 'comment' field, we extract it and set it on opCtx. Note
+    // that if the 'getMore' command itself has a 'comment' field, we give precedence to it.
+    auto comment = cursor->getOriginatingCommand()["comment"];
+    if (!opCtx->getComment() && comment) {
+        opCtx->setComment(comment.wrap());
+    }
     if (cursor->isTailableAndAwaitData()) {
         // For tailable + awaitData cursors, the request may have indicated a maximum amount of time
         // to wait for new data. If not, default it to 1 second.  We track the deadline instead via

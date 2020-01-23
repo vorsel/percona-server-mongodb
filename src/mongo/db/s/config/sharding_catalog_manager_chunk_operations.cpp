@@ -50,7 +50,7 @@
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/shard_key_pattern.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
@@ -553,6 +553,12 @@ Status ShardingCatalogManager::commitChunkMerge(OperationContext* opCtx,
         return {ErrorCodes::StaleEpoch,
                 "epoch of chunk does not match epoch of request. This most likely means "
                 "that the collection was dropped and re-created."};
+    }
+
+    // Check if the chunk(s) have already been merged. If so, return success.
+    auto minChunkOnDisk = uassertStatusOK(_findChunkOnConfig(opCtx, nss, chunkBoundaries.front()));
+    if (minChunkOnDisk.getMax().woCompare(chunkBoundaries.back()) == 0) {
+        return Status::OK();
     }
 
     // Build chunks to be merged

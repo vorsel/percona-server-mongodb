@@ -94,7 +94,7 @@ public:
     }
 
     size_t count(const BSONObj& query) {
-        return _client.count(nss.ns(), query, 0, 0, 0);
+        return _client.count(nss, query, 0, 0, 0);
     }
 
     unique_ptr<CanonicalQuery> canonicalize(const BSONObj& query) {
@@ -272,8 +272,7 @@ public:
             OpDebug* opDebug = &curOp.debug();
             const CollatorInterface* collator = nullptr;
             UpdateDriver driver(new ExpressionContext(&_opCtx, collator));
-            Database* db = ctx.db();
-            Collection* coll = db->getCollection(&_opCtx, nss);
+            Collection* coll = CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(nss);
             ASSERT(coll);
 
             // Get the RecordIds that would be returned by an in-order scan.
@@ -550,9 +549,9 @@ public:
     }
 };
 
-class All : public Suite {
+class All : public OldStyleSuiteSpecification {
 public:
-    All() : Suite("query_stage_update") {}
+    All() : OldStyleSuiteSpecification("query_stage_update") {}
 
     void setupTests() {
         // Stage-specific tests below.
@@ -563,6 +562,6 @@ public:
     }
 };
 
-SuiteInstance<All> all;
+OldStyleSuiteInitializer<All> all;
 
 }  // namespace QueryStageUpdate

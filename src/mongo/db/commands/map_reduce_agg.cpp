@@ -42,6 +42,7 @@
 #include "mongo/db/commands/map_reduce_agg.h"
 #include "mongo/db/commands/map_reduce_javascript_code.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_group.h"
@@ -58,7 +59,6 @@
 #include "mongo/db/pipeline/parsed_aggregation_projection_node.h"
 #include "mongo/db/pipeline/parsed_inclusion_projection.h"
 #include "mongo/db/pipeline/pipeline_d.h"
-#include "mongo/db/pipeline/value.h"
 #include "mongo/db/query/map_reduce_output_format.h"
 #include "mongo/db/query/util/make_data_structure.h"
 #include "mongo/util/intrusive_counter.h"
@@ -206,20 +206,24 @@ auto makeExpressionContext(OperationContext* opCtx, const MapReduce& parsedMr) {
     auto uuid =
         ctx.getCollection() ? boost::make_optional(ctx.getCollection()->uuid()) : boost::none;
 
+    auto runtimeConstants = Variables::generateRuntimeConstants(opCtx);
+    if (parsedMr.getScope()) {
+        runtimeConstants.setJsScope(parsedMr.getScope()->getObj());
+    }
+
     // Manually build an ExpressionContext with the desired options for the translated
     // aggregation. The one option worth noting here is allowDiskUse, which is required to allow
     // the $group stage of the translated pipeline to spill to disk.
     return make_intrusive<ExpressionContext>(
         opCtx,
-        boost::none,    // explain
-        std::string{},  // comment
-        false,          // fromMongos
-        false,          // needsmerge
-        true,           // allowDiskUse
+        boost::none,  // explain
+        false,        // fromMongos
+        false,        // needsmerge
+        true,         // allowDiskUse
         parsedMr.getBypassDocumentValidation().get_value_or(false),
         parsedMr.getNamespace(),
         parsedMr.getCollation().get_value_or(BSONObj()),
-        boost::none,  // runtimeConstants
+        runtimeConstants,
         std::move(resolvedCollator),
         MongoProcessInterface::create(opCtx),
         StringMap<ExpressionContext::ResolvedNamespace>{},  // resolvedNamespaces

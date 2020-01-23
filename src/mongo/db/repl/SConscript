@@ -523,8 +523,8 @@ env.Library(
     source=[
         'insert_group.cpp',
         'oplog_applier_impl.cpp',
+        'opqueue_batcher.cpp',
         'session_update_tracker.cpp',
-        'sync_tail.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/auth/authorization_manager_global',
@@ -557,7 +557,7 @@ env.Library(
         'idempotency_test_fixture.cpp',
     ],
     LIBDEPS=[
-        'sync_tail_test_fixture',
+        'oplog_applier_impl_test_fixture',
         '$BUILD_DIR/mongo/db/auth/authmocks',
         '$BUILD_DIR/mongo/db/catalog/collection_validation',
         '$BUILD_DIR/mongo/db/index_builds_coordinator_interface',
@@ -565,9 +565,9 @@ env.Library(
 )
 
 env.Library(
-    target='sync_tail_test_fixture',
+    target='oplog_applier_impl_test_fixture',
     source=[
-        'sync_tail_test_fixture.cpp',
+        'oplog_applier_impl_test_fixture.cpp',
     ],
     LIBDEPS=[
         'drop_pending_collection_reaper',
@@ -590,7 +590,7 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/common',
-        '$BUILD_DIR/mongo/db/pipeline/document_value'
+        '$BUILD_DIR/mongo/db/exec/document_value/document_value'
     ],
 )
 
@@ -1230,6 +1230,7 @@ env.CppUnitTest(
         'isself_test.cpp',
         'member_config_test.cpp',
         'multiapplier_test.cpp',
+        'oplog_applier_impl_test.cpp',
         'oplog_applier_test.cpp',
         'oplog_buffer_collection_test.cpp',
         'oplog_buffer_proxy_test.cpp',
@@ -1255,7 +1256,6 @@ env.CppUnitTest(
         'split_horizon_test.cpp',
         'storage_interface_impl_test.cpp',
         'sync_source_resolver_test.cpp',
-        'sync_tail_test.cpp',
         'task_runner_test.cpp',
         'task_runner_test_fixture.cpp',
         'vote_requester_test.cpp',
@@ -1303,6 +1303,7 @@ env.CppUnitTest(
         'multiapplier',
         'oplog',
         'oplog_application_interface',
+        'oplog_applier_impl_test_fixture',
         'oplog_buffer_collection',
         'oplog_buffer_proxy',
         'oplog_entry',
@@ -1329,7 +1330,6 @@ env.CppUnitTest(
         'storage_interface_impl',
         'sync_source_resolver',
         'sync_source_selector_mock',
-        'sync_tail_test_fixture',
         'task_executor_mock',
         'task_runner',
     ],

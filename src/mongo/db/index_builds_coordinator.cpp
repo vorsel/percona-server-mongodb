@@ -524,14 +524,35 @@ Status IndexBuildsCoordinator::_registerIndexBuild(
     if (collIndexBuildsIt != _collectionIndexBuilds.end()) {
         for (const auto& name : replIndexBuildState->indexNames) {
             if (collIndexBuildsIt->second->hasIndexBuildState(lk, name)) {
-                auto registeredIndexBuilds =
-                    collIndexBuildsIt->second->getIndexBuildState(lk, name);
-                return Status(ErrorCodes::IndexBuildAlreadyInProgress,
-                              str::stream()
-                                  << "There's already an index with name '" << name
-                                  << "' being built on the collection: "
-                                  << " ( " << replIndexBuildState->collectionUUID
-                                  << " ). Index build: " << registeredIndexBuilds->buildUUID);
+                auto existingIndexBuild = collIndexBuildsIt->second->getIndexBuildState(lk, name);
+                str::stream ss;
+                ss << "Index build conflict: " << replIndexBuildState->buildUUID
+                   << ": There's already an index with name '" << name
+                   << "' being built on the collection "
+                   << " ( " << replIndexBuildState->collectionUUID
+                   << " ) under an existing index build: " << existingIndexBuild->buildUUID;
+                auto aborted = false;
+                {
+                    // We have to lock the mutex in order to read the committed/aborted state.
+                    stdx::unique_lock<Latch> lk(existingIndexBuild->mutex);
+                    if (existingIndexBuild->isCommitReady) {
+                        ss << " (ready to commit with timestamp: "
+                           << existingIndexBuild->commitTimestamp.toString() << ")";
+                    } else if (existingIndexBuild->aborted) {
+                        ss << " (aborted with reason: " << existingIndexBuild->abortReason
+                           << " and timestamp: " << existingIndexBuild->abortTimestamp.toString()
+                           << ")";
+                        aborted = true;
+                    } else {
+                        ss << " (in-progress)";
+                    }
+                }
+                std::string msg = ss;
+                log() << msg;
+                if (aborted) {
+                    return {ErrorCodes::IndexBuildAborted, msg};
+                }
+                return Status(ErrorCodes::IndexBuildAlreadyInProgress, msg);
             }
         }
     }
@@ -870,14 +891,36 @@ void IndexBuildsCoordinator::_runIndexBuildInner(OperationContext* opCtx,
                                 << replState->buildUUID);
         nss = collection->ns();
 
-        _indexBuildsManager.tearDownIndexBuild(opCtx, collection, replState->buildUUID);
+        // If the index build was not completely successfully, we'll need to acquire some locks to
+        // clean it up.
+        if (!status.isOK()) {
+            UninterruptibleLockGuard noInterrupt(opCtx->lockState());
+
+            Lock::DBLock dbLock(opCtx, nss.db(), MODE_IX);
+
+            // Since DBLock implicitly acquires RSTL, we release the RSTL after acquiring the
+            // database lock. Additionally, the RSTL has to be released before acquiring a strong
+            // lock (MODE_X) on the collection to avoid potential deadlocks.
+            opCtx->lockState()->unlockRSTLforPrepare();
+            invariant(!opCtx->lockState()->isRSTLLocked());
+
+            Lock::CollectionLock collLock(opCtx, nss, MODE_X);
+
+            _indexBuildsManager.tearDownIndexBuild(opCtx, collection, replState->buildUUID);
+        } else {
+            _indexBuildsManager.tearDownIndexBuild(opCtx, collection, replState->buildUUID);
+        }
     }
 
     if (!status.isOK()) {
         logFailure(status, nss, replState);
 
-        // Failed index builds should abort secondary oplog application.
+        // Failed index builds should abort secondary oplog application, except when the index build
+        // was stopped due to processing an abortIndexBuild oplog entry.
         if (replSetAndNotPrimary) {
+            if (status == ErrorCodes::IndexBuildAborted) {
+                return;
+            }
             fassert(51101,
                     status.withContext(str::stream() << "Index build: " << replState->buildUUID
                                                      << "; Database: " << replState->dbName));
@@ -991,7 +1034,20 @@ void IndexBuildsCoordinator::_buildIndex(
         hangAfterIndexBuildSecondDrain.pauseWhileSet();
     }
 
-    if (supportsTwoPhaseIndexBuild() && indexBuildOptions.replSetAndNotPrimary) {
+    if (supportsTwoPhaseIndexBuild() && indexBuildOptions.replSetAndNotPrimary &&
+        IndexBuildProtocol::kTwoPhase == replState->protocol) {
+
+        log() << "Index build waiting for commit or abort before completing final phase: "
+              << replState->buildUUID;
+
+        // Yield locks and storage engine resources before blocking.
+        opCtx->recoveryUnit()->abandonSnapshot();
+        Lock::TempRelease release(opCtx->lockState());
+        invariant(!opCtx->lockState()->isLocked(),
+                  str::stream()
+                      << "failed to yield locks for index build while waiting for commit or abort: "
+                      << replState->buildUUID);
+
         stdx::unique_lock<Latch> lk(replState->mutex);
         auto isReadyToCommitOrAbort = [rs = replState] { return rs->isCommitReady || rs->aborted; };
         opCtx->waitForConditionOrInterrupt(replState->condVar, lk, isReadyToCommitOrAbort);

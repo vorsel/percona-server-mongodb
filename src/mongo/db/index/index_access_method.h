@@ -118,7 +118,7 @@ public:
                                const BSONObj& to,
                                const RecordId& loc,
                                const InsertDeleteOptions& options,
-                               UpdateTicket* ticket) = 0;
+                               UpdateTicket* ticket) const = 0;
 
     /**
      * Perform a validated update.  The keys for the 'from' object will be removed, and the keys
@@ -153,19 +153,6 @@ public:
      * if called multiple times, is an error
      */
     virtual Status initializeAsEmpty(OperationContext* opCtx) = 0;
-
-    /**
-     * Try to page-in the pages that contain the keys generated from 'obj'.
-     * This can be used to speed up future accesses to an index by trying to ensure the
-     * appropriate pages are not swapped out.
-     * See prefetch.cpp.
-     */
-    virtual Status touch(OperationContext* opCtx, const BSONObj& obj) = 0;
-
-    /**
-     * this pages in the entire index
-     */
-    virtual Status touch(OperationContext* opCtx) const = 0;
 
     /**
      * Walk the entire index, checking the internal structure for consistency.
@@ -473,7 +460,7 @@ public:
                        const BSONObj& to,
                        const RecordId& loc,
                        const InsertDeleteOptions& options,
-                       UpdateTicket* ticket) final;
+                       UpdateTicket* ticket) const final;
 
     Status update(OperationContext* opCtx,
                   const UpdateTicket& ticket,
@@ -485,10 +472,6 @@ public:
     std::unique_ptr<SortedDataInterface::Cursor> newCursor(OperationContext* opCtx) const final;
 
     Status initializeAsEmpty(OperationContext* opCtx) final;
-
-    Status touch(OperationContext* opCtx, const BSONObj& obj) final;
-
-    Status touch(OperationContext* opCtx) const final;
 
     void validate(OperationContext* opCtx,
                   int64_t* numKeys,

@@ -199,7 +199,7 @@ public:
         ASSERT(resRefresh.isOK());
 
         // Ensure that the right number of timestamps were updated.
-        auto n = db.count(ns(), BSON("lastUse" << now));
+        auto n = db.count(NamespaceString(ns()), BSON("lastUse" << now));
         ASSERT_EQ(n, notRefreshed);
     }
 };
@@ -269,9 +269,9 @@ public:
     }
 };
 
-class All : public Suite {
+class All : public OldStyleSuiteSpecification {
 public:
-    All() : Suite("logical_sessions") {}
+    All() : OldStyleSuiteSpecification("logical_sessions") {}
 
     void setupTests() {
         add<SessionsCollectionStandaloneRemoveTest>();
@@ -280,7 +280,7 @@ public:
     }
 };
 
-SuiteInstance<All> all;
+OldStyleSuiteInitializer<All> all;
 
 }  // namespace
 }  // namespace mongo

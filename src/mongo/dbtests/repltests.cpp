@@ -45,7 +45,6 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
-#include "mongo/db/repl/sync_tail.h"
 #include "mongo/db/s/op_observer_sharding_impl.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/transport/transport_layer_asio.h"
@@ -138,7 +137,7 @@ public:
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         WriteUnitOfWork wuow(&_opCtx);
 
-        Collection* c = ctx.db()->getCollection(&_opCtx, nss());
+        Collection* c = CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(nss());
         if (!c) {
             c = ctx.db()->createCollection(&_opCtx, nss());
         }
@@ -147,6 +146,9 @@ public:
         wuow.commit();
 
         _opCtx.getServiceContext()->getStorageEngine()->setOldestTimestamp(_lastSetOldestTimestamp);
+
+        // Start with a fresh oplog.
+        deleteAll(cllNS());
     }
     ~Base() {
         // Replication is not supported by mobile SE.
@@ -201,14 +203,11 @@ protected:
         }
         ASSERT_BSONOBJ_EQ(expected, got);
     }
-    BSONObj oneOp() const {
-        return _client.findOne(cllNS(), BSONObj());
-    }
     int count() const {
         Lock::GlobalWrite lk(&_opCtx);
         OldClientContext ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        Collection* coll = db->getCollection(&_opCtx, nss());
+        Collection* coll = CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(nss());
         if (!coll) {
             WriteUnitOfWork wunit(&_opCtx);
             coll = db->createCollection(&_opCtx, nss());
@@ -265,7 +264,7 @@ protected:
         NamespaceString nss(ns);
 
         Database* db = ctx.db();
-        Collection* coll = db->getCollection(&_opCtx, nss);
+        Collection* coll = CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(nss);
         if (!coll) {
             WriteUnitOfWork wunit(&_opCtx);
             coll = db->createCollection(&_opCtx, nss);
@@ -286,7 +285,7 @@ protected:
             OldClientContext ctx(&_opCtx, ns);
             WriteUnitOfWork wunit(&_opCtx);
             Database* db = ctx.db();
-            Collection* coll = db->getCollection(&_opCtx, nss);
+            Collection* coll = CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(nss);
             if (!coll) {
                 coll = db->createCollection(&_opCtx, nss);
             }
@@ -300,7 +299,7 @@ protected:
         OldClientContext ctx(&_opCtx, ns());
         WriteUnitOfWork wunit(&_opCtx);
         Database* db = ctx.db();
-        Collection* coll = db->getCollection(&_opCtx, nss());
+        Collection* coll = CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(nss());
         if (!coll) {
             coll = db->createCollection(&_opCtx, nss());
         }
@@ -346,9 +345,9 @@ public:
         if (mongo::storageGlobalParams.engine == "mobile") {
             return;
         }
-        ASSERT_EQUALS(1, opCount());
+        ASSERT_EQUALS(0, opCount());
         _client.insert(ns(), fromjson("{\"a\":\"b\"}"));
-        ASSERT_EQUALS(2, opCount());
+        ASSERT_EQUALS(1, opCount());
     }
 };
 
@@ -979,21 +978,6 @@ public:
     }
 };
 
-class PushWithDollarSigns : public Base {
-    void doIt() const {
-        _client.update(ns(), BSON("_id" << 0), BSON("$push" << BSON("a" << BSON("$foo" << 1))));
-    }
-    using ReplTests::Base::check;
-    void check() const {
-        ASSERT_EQUALS(1, count());
-        check(fromjson("{'_id':0, a:[0, {'$foo':1}]}"), one(fromjson("{'_id':0}")));
-    }
-    void reset() const {
-        deleteAll(ns());
-        insert(BSON("_id" << 0 << "a" << BSON_ARRAY(0)));
-    }
-};
-
 class PushSlice : public Base {
     void doIt() const {
         _client.update(
@@ -1279,21 +1263,6 @@ public:
     }
 };
 
-class AddToSetWithDollarSigns : public Base {
-    void doIt() const {
-        _client.update(ns(), BSON("_id" << 0), BSON("$addToSet" << BSON("a" << BSON("$foo" << 1))));
-    }
-    using ReplTests::Base::check;
-    void check() const {
-        ASSERT_EQUALS(1, count());
-        check(fromjson("{'_id':0, a:[0, {'$foo':1}]}"), one(fromjson("{'_id':0}")));
-    }
-    void reset() const {
-        deleteAll(ns());
-        insert(BSON("_id" << 0 << "a" << BSON_ARRAY(0)));
-    }
-};
-
 //
 // replay cases
 //
@@ -1352,21 +1321,21 @@ public:
         insert(BSON("_id" << 1 << "a" << 11));
         insert(BSON("_id" << 3 << "a" << 10));
         _client.remove(ns(), BSON("a" << 10));
-        ASSERT_EQUALS(1U, _client.count(ns(), BSONObj()));
+        ASSERT_EQUALS(1U, _client.count(nss(), BSONObj()));
         insert(BSON("_id" << 0 << "a" << 11));
         insert(BSON("_id" << 2 << "a" << 10));
         insert(BSON("_id" << 3 << "a" << 10));
 
         applyAllOperations();
-        ASSERT_EQUALS(2U, _client.count(ns(), BSONObj()));
+        ASSERT_EQUALS(2U, _client.count(nss(), BSONObj()));
         ASSERT(!one(BSON("_id" << 1)).isEmpty());
         ASSERT(!one(BSON("_id" << 2)).isEmpty());
     }
 };
 
-class All : public Suite {
+class All : public OldStyleSuiteSpecification {
 public:
-    All() : Suite("repl") {}
+    All() : OldStyleSuiteSpecification("repl") {}
 
     void setupTests() {
         add<LogBasic>();
@@ -1424,6 +1393,6 @@ public:
     }
 };
 
-SuiteInstance<All> myall;
+OldStyleSuiteInitializer<All> myall;
 
 }  // namespace ReplTests

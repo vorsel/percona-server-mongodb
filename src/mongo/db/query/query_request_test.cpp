@@ -35,7 +35,6 @@
 
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/collection_mock.h"
-#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/json.h"
 #include "mongo/db/namespace_string.h"
@@ -430,7 +429,7 @@ TEST(QueryRequestTest, ParseFromCommandReadOnceDefaultsToFalse) {
     ASSERT(!qr->isReadOnce());
 }
 
-TEST(QueryRequestTest, ParseFromCommandCommentWithValidMinMax) {
+TEST(QueryRequestTest, ParseFromCommandValidMinMax) {
     BSONObj cmdObj = fromjson(
         "{find: 'testns',"
         "comment: 'the comment',"
@@ -441,7 +440,6 @@ TEST(QueryRequestTest, ParseFromCommandCommentWithValidMinMax) {
     unique_ptr<QueryRequest> qr(
         assertGet(QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain)));
 
-    ASSERT_EQUALS("the comment", qr->getComment());
     BSONObj expectedMin = BSON("a" << 1);
     ASSERT_EQUALS(0, expectedMin.woCompare(qr->getMin()));
     BSONObj expectedMax = BSON("a" << 2);
@@ -601,17 +599,6 @@ TEST(QueryRequestTest, ParseFromCommandSingleBatchWrongType) {
         "filter:  {a: 1},"
         "singleBatch: 'false',"
         "projection: {a: 1}}");
-    const NamespaceString nss("test.testns");
-    bool isExplain = false;
-    auto result = QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain);
-    ASSERT_NOT_OK(result.getStatus());
-}
-
-TEST(QueryRequestTest, ParseFromCommandCommentWrongType) {
-    BSONObj cmdObj = fromjson(
-        "{find: 'testns',"
-        "filter:  {a: 1},"
-        "comment: 1}");
     const NamespaceString nss("test.testns");
     bool isExplain = false;
     auto result = QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain);
@@ -1094,10 +1081,6 @@ TEST(QueryRequestTest, DefaultQueryParametersCorrect) {
 }
 
 TEST(QueryRequestTest, ParseCommandAllowDiskUseTrue) {
-    const bool oldTestCommandsEnabledVal = getTestCommandsEnabled();
-    ON_BLOCK_EXIT([&] { setTestCommandsEnabled(oldTestCommandsEnabledVal); });
-    setTestCommandsEnabled(true);
-
     BSONObj cmdObj = fromjson("{find: 'testns', allowDiskUse: true}");
     const NamespaceString nss("test.testns");
     const bool isExplain = false;
@@ -1108,10 +1091,6 @@ TEST(QueryRequestTest, ParseCommandAllowDiskUseTrue) {
 }
 
 TEST(QueryRequestTest, ParseCommandAllowDiskUseFalse) {
-    const bool oldTestCommandsEnabledVal = getTestCommandsEnabled();
-    ON_BLOCK_EXIT([&] { setTestCommandsEnabled(oldTestCommandsEnabledVal); });
-    setTestCommandsEnabled(true);
-
     BSONObj cmdObj = fromjson("{find: 'testns', allowDiskUse: false}");
     const NamespaceString nss("test.testns");
     const bool isExplain = false;
@@ -1119,22 +1098,6 @@ TEST(QueryRequestTest, ParseCommandAllowDiskUseFalse) {
 
     ASSERT_OK(result.getStatus());
     ASSERT_EQ(false, result.getValue()->allowDiskUse());
-}
-
-TEST(QueryRequestTest, ParseCommandAllowDiskUseTestCommandsDisabled) {
-    const bool oldTestCommandsEnabledVal = getTestCommandsEnabled();
-    ON_BLOCK_EXIT([&] { setTestCommandsEnabled(oldTestCommandsEnabledVal); });
-    setTestCommandsEnabled(false);
-
-    BSONObj cmdObj = fromjson("{find: 'testns', allowDiskUse: true}");
-    const NamespaceString nss("test.testns");
-    const bool isExplain = false;
-    auto result = QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain);
-
-    ASSERT_NOT_OK(result.getStatus());
-    ASSERT_EQ(ErrorCodes::FailedToParse, result.getStatus().code());
-    ASSERT_STRING_CONTAINS(result.getStatus().toString(),
-                           "allowDiskUse is not allowed unless test commands are enabled.");
 }
 
 //
@@ -1270,17 +1233,6 @@ TEST(QueryRequestTest, ConvertToAggregationWithReturnKeyFails) {
     QueryRequest qr(testns);
     qr.setReturnKey(true);
     ASSERT_NOT_OK(qr.asAggregationCommand());
-}
-
-TEST(QueryRequestTest, ConvertToAggregationWithCommentSucceeds) {
-    QueryRequest qr(testns);
-    qr.setComment("test");
-    const auto aggCmd = qr.asAggregationCommand();
-    ASSERT_OK(aggCmd);
-
-    auto ar = AggregationRequest::parseFromBSON(testns, aggCmd.getValue());
-    ASSERT_OK(ar.getStatus());
-    ASSERT_EQ(qr.getComment(), ar.getValue().getComment());
 }
 
 TEST(QueryRequestTest, ConvertToAggregationWithShowRecordIdFails) {
@@ -1468,31 +1420,6 @@ TEST(QueryRequestTest, ConvertToFindWithAllowDiskUseFalseSucceeds) {
     const auto findCmd = qr.asFindCommand();
 
     ASSERT_FALSE(findCmd[QueryRequest::kAllowDiskUseField]);
-}
-
-TEST(QueryRequestTest, ParseFromLegacyObjMetaOpComment) {
-    BSONObj queryObj = fromjson(
-        "{$query: {a: 1},"
-        "$comment: {b: 2, c: {d: 'ParseFromLegacyObjMetaOpComment'}}}");
-    const NamespaceString nss("test.testns");
-    unique_ptr<QueryRequest> qr(
-        assertGet(QueryRequest::fromLegacyQuery(nss, queryObj, BSONObj(), 0, 0, 0)));
-
-    // Ensure that legacy comment meta-operator is parsed to a string comment
-    ASSERT_EQ(qr->getComment(), "{ b: 2, c: { d: \"ParseFromLegacyObjMetaOpComment\" } }");
-    ASSERT_BSONOBJ_EQ(qr->getFilter(), fromjson("{a: 1}"));
-}
-
-TEST(QueryRequestTest, ParseFromLegacyStringMetaOpComment) {
-    BSONObj queryObj = fromjson(
-        "{$query: {a: 1},"
-        "$comment: 'ParseFromLegacyStringMetaOpComment'}");
-    const NamespaceString nss("test.testns");
-    unique_ptr<QueryRequest> qr(
-        assertGet(QueryRequest::fromLegacyQuery(nss, queryObj, BSONObj(), 0, 0, 0)));
-
-    ASSERT_EQ(qr->getComment(), "ParseFromLegacyStringMetaOpComment");
-    ASSERT_BSONOBJ_EQ(qr->getFilter(), fromjson("{a: 1}"));
 }
 
 TEST(QueryRequestTest, ParseFromLegacyQuery) {

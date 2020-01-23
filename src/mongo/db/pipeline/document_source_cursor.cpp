@@ -34,13 +34,13 @@
 #include "mongo/db/pipeline/document_source_cursor.h"
 
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/pipeline/document.h"
 #include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/storage/storage_options.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
@@ -238,8 +238,9 @@ Value DocumentSourceCursor::serialize(boost::optional<ExplainOptions::Verbosity>
         auto lockMode = getLockModeForQuery(opCtx, _exec->nss());
         AutoGetDb dbLock(opCtx, _exec->nss().db(), lockMode);
         Lock::CollectionLock collLock(opCtx, _exec->nss(), lockMode);
-        auto collection =
-            dbLock.getDb() ? dbLock.getDb()->getCollection(opCtx, _exec->nss()) : nullptr;
+        auto collection = dbLock.getDb()
+            ? CollectionCatalog::get(opCtx).lookupCollectionByNamespace(_exec->nss())
+            : nullptr;
 
         Explain::explainStages(_exec.get(),
                                collection,

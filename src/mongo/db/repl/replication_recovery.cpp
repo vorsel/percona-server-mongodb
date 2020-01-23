@@ -360,9 +360,10 @@ void ReplicationRecoveryImpl::_applyToEndOfOplog(OperationContext* opCtx,
     OplogApplierImpl oplogApplier(nullptr,
                                   &oplogBuffer,
                                   &stats,
-                                  nullptr,
+                                  ReplicationCoordinator::get(opCtx),
                                   _consistencyMarkers,
                                   _storageInterface,
+                                  applyOplogGroup,
                                   OplogApplier::Options(OplogApplication::Mode::kRecovering),
                                   writerPool.get());
 
@@ -423,7 +424,8 @@ void ReplicationRecoveryImpl::_truncateOplogTo(OperationContext* opCtx,
     const NamespaceString oplogNss(NamespaceString::kRsOplogNamespace);
     AutoGetDb autoDb(opCtx, oplogNss.db(), MODE_IX);
     Lock::CollectionLock oplogCollectionLoc(opCtx, oplogNss, MODE_X);
-    Collection* oplogCollection = autoDb.getDb()->getCollection(opCtx, oplogNss);
+    Collection* oplogCollection =
+        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(oplogNss);
     if (!oplogCollection) {
         fassertFailedWithStatusNoTrace(
             34418,

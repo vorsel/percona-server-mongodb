@@ -205,9 +205,8 @@ void createCollectionOrValidateExisting(OperationContext* opCtx,
     //    Useful Index:
     //         i. contains proposedKey as a prefix
     //         ii. is not a sparse index, partial index, or index with a non-simple collation
-    //         iii. contains no null values
-    //         iv. is not multikey (maybe lift this restriction later)
-    //         v. if a hashed index, has default seed (lift this restriction later)
+    //         iii. is not multikey (maybe lift this restriction later)
+    //         iv. if a hashed index, has default seed (lift this restriction later)
     //
     // 3. If the proposed shard key is specified as unique, there must exist a useful,
     //    unique index exactly equal to the proposedKey (not just a prefix).
@@ -220,7 +219,7 @@ void createCollectionOrValidateExisting(OperationContext* opCtx,
     // 5. If the collection is empty, and it's still possible to create an index
     //    on the proposed key, we go ahead and do so.
     DBDirectClient localClient(opCtx);
-    std::list<BSONObj> indexes = localClient.getIndexSpecs(nss.ns());
+    std::list<BSONObj> indexes = localClient.getIndexSpecs(nss);
 
     // 1. Verify consistency with existing unique indexes
     for (const auto& idx : indexes) {
@@ -284,8 +283,7 @@ void createCollectionOrValidateExisting(OperationContext* opCtx,
     }
 
     if (hasUsefulIndexForKey) {
-        // Check 2.iii and 2.iv. Make sure no null entries in the sharding index
-        // and that there is a useful, non-multikey index available
+        // Check 2.iii Make sure that there is a useful, non-multikey index available.
         BSONObjBuilder checkShardingIndexCmd;
         checkShardingIndexCmd.append("checkShardingIndex", nss.ns());
         checkShardingIndexCmd.append("keyPattern", proposedKey);

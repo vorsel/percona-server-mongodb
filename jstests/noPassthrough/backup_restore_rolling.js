@@ -11,13 +11,22 @@
  *
  * Some methods for backup used in this test checkpoint the files in the dbpath. This technique will
  * not work for ephemeral storage engines, as they do not store any data in the dbpath.
- * @tags: [requires_persistence, requires_wiredtiger]
+ * @tags: [
+ *     requires_persistence,
+ *     requires_wiredtiger,
+ * ]
  */
 
 load("jstests/noPassthrough/libs/backup_restore.js");
 
 (function() {
 "use strict";
+
+// Windows doesn't guarantee synchronous file operations.
+if (_isWindows()) {
+    print("Skipping test on windows");
+    return;
+}
 
 // Grab the storage engine, default is wiredTiger
 var storageEngine = jsTest.options().storageEngine || "wiredTiger";

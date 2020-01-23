@@ -41,7 +41,7 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/pipeline/document.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/pipeline/document_source_cursor.h"
 #include "mongo/db/pipeline/document_source_sort.h"
 #include "mongo/db/pipeline/expression_context.h"
@@ -105,7 +105,8 @@ Document DocumentSourceGeoNearCursor::transformBSONObjToDocument(const BSONObj& 
 
     // In a cluster, $geoNear will be merged via $sort, so add the sort key.
     if (pExpCtx->needsMerge) {
-        output.metadata().setSortKey(BSON("" << distance));
+        const bool isSingleElementKey = true;
+        output.metadata().setSortKey(Value(distance), isSingleElementKey);
     }
 
     return output.freeze();

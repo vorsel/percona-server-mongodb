@@ -35,9 +35,9 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/json.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/aggregation_request.h"
-#include "mongo/db/pipeline/document.h"
 #include "mongo/db/views/resolved_view.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/unittest/unittest.h"
@@ -171,15 +171,6 @@ TEST(ResolvedViewTest, ExpandingAggRequestPreservesDefaultCollationOfView) {
     ASSERT_BSONOBJ_EQ(result.getCollation(),
                       BSON("locale"
                            << "fr_CA"));
-}
-
-TEST(ResolvedViewTest, ExpandingAggRequestPreservesComment) {
-    const ResolvedView resolvedView{backingNss, emptyPipeline, kSimpleCollation};
-    AggregationRequest aggRequest(viewNss, {});
-    aggRequest.setComment("agg_comment");
-
-    auto result = resolvedView.asExpandedViewAggregation(aggRequest);
-    ASSERT_EQ(result.getComment(), "agg_comment");
 }
 
 TEST(ResolvedViewTest, FromBSONFailsIfMissingResolvedView) {

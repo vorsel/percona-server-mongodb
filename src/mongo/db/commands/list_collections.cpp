@@ -310,7 +310,8 @@ public:
                         }
 
                         Lock::CollectionLock clk(opCtx, nss, MODE_IS);
-                        Collection* collection = db->getCollection(opCtx, nss);
+                        Collection* collection =
+                            CollectionCatalog::get(opCtx).lookupCollectionByNamespace(nss);
                         BSONObj collBson =
                             buildCollectionBson(opCtx, collection, includePendingDrops, nameOnly);
                         if (!collBson.isEmpty()) {
@@ -358,7 +359,7 @@ public:
             }
 
             exec = uassertStatusOK(PlanExecutor::make(
-                opCtx, std::move(ws), std::move(root), cursorNss, PlanExecutor::NO_YIELD));
+                opCtx, std::move(ws), std::move(root), nullptr, PlanExecutor::NO_YIELD, cursorNss));
 
             for (long long objCount = 0; objCount < batchSize; objCount++) {
                 BSONObj next;

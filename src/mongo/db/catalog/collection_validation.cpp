@@ -129,7 +129,7 @@ void _validateIndexes(OperationContext* opCtx,
 
         ValidateResults& curIndexResults = (*indexNsResultsMap)[descriptor->indexName()];
         int64_t numTraversedKeys;
-        indexValidator->traverseIndex(opCtx, descriptor, &numTraversedKeys, &curIndexResults);
+        indexValidator->traverseIndex(opCtx, index.get(), &numTraversedKeys, &curIndexResults);
 
         // If we are performing a full validation, we have information on the number of index keys
         // validated in _validateIndexesInternalStructure (when we validated the internal structure
@@ -207,7 +207,7 @@ void _gatherIndexEntryErrors(OperationContext* opCtx,
                                   << descriptor->indexName() << ".";
 
         indexValidator->traverseIndex(opCtx,
-                                      descriptor,
+                                      index.get(),
                                       /*numTraversedKeys=*/nullptr,
                                       /*ValidateResults=*/nullptr);
     }
@@ -226,10 +226,7 @@ void _validateIndexKeyCount(OperationContext* opCtx,
         ValidateResults& curIndexResults = (*indexNsResultsMap)[descriptor->indexName()];
 
         if (curIndexResults.valid) {
-            indexValidator->validateIndexKeyCount(
-                descriptor,
-                validateState->getCollection()->getRecordStore()->numRecords(opCtx),
-                curIndexResults);
+            indexValidator->validateIndexKeyCount(descriptor, curIndexResults);
         }
     }
 }
@@ -393,14 +390,20 @@ Status validate(OperationContext* opCtx,
     invariant(!opCtx->lockState()->isLocked());
     invariant(!(background && fullValidate));
 
-    ValidateResultsMap indexNsResultsMap;
-    BSONObjBuilder keysPerIndex;  // not using subObjStart to be exception safe.
-
+    // This is deliberately outside of the try-catch block, so that any errors thrown in the
+    // constructor fail the cmd, as opposed to returning OK with valid:false.
     ValidateState validateState(opCtx, nss, background, fullValidate);
+
+    const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    // Check whether we are allowed to read from this node after acquiring our locks. If we are
+    // in a state where we cannot read, we should not run validate.
+    uassertStatusOK(replCoord->checkCanServeReadsFor(
+        opCtx, nss, ReadPreferenceSetting::get(opCtx).canRunOnSecondary()));
 
     try {
         std::map<std::string, int64_t> numIndexKeysPerIndex;
-
+        ValidateResultsMap indexNsResultsMap;
+        BSONObjBuilder keysPerIndex;  // not using subObjStart to be exception safe.
 
         // Full validation code is executed before we open cursors because it may close
         // and/or invalidate all open cursors.

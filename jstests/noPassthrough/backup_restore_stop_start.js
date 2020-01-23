@@ -11,7 +11,10 @@
  *
  * Some methods for backup used in this test checkpoint the files in the dbpath. This technique will
  * not work for ephemeral storage engines, as they do not store any data in the dbpath.
- * @tags: [requires_persistence, requires_replication]
+ * @tags: [
+ *     requires_persistence,
+ *     requires_replication,
+ * ]
  */
 
 load("jstests/noPassthrough/libs/backup_restore.js");

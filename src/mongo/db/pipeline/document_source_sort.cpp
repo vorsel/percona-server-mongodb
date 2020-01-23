@@ -31,13 +31,13 @@
 
 #include "mongo/db/pipeline/document_source_sort.h"
 
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_source_skip.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
-#include "mongo/db/pipeline/value.h"
 #include "mongo/db/query/collation/collation_index_key.h"
 #include "mongo/platform/overflow_arithmetic.h"
 #include "mongo/s/query/document_source_merge_cursors.h"
@@ -215,20 +215,17 @@ bool DocumentSourceSort::usedDisk() {
 }
 
 std::pair<Value, Document> DocumentSourceSort::extractSortKey(Document&& doc) const {
-    Value inMemorySortKey = _sortKeyGen->computeSortKeyFromDocument(doc);
+    Value sortKey = _sortKeyGen->computeSortKeyFromDocument(doc);
 
     if (pExpCtx->needsMerge) {
         // If this sort stage is part of a merged pipeline, make sure that each Document's sort key
         // gets saved with its metadata.
-        auto serializedSortKey = DocumentMetadataFields::serializeSortKey(
-            _sortKeyGen->isSingleElementKey(), inMemorySortKey);
-
         MutableDocument toBeSorted(std::move(doc));
-        toBeSorted.metadata().setSortKey(serializedSortKey);
+        toBeSorted.metadata().setSortKey(sortKey, _sortKeyGen->isSingleElementKey());
 
-        return std::make_pair(std::move(inMemorySortKey), toBeSorted.freeze());
+        return std::make_pair(std::move(sortKey), toBeSorted.freeze());
     } else {
-        return std::make_pair(std::move(inMemorySortKey), std::move(doc));
+        return std::make_pair(std::move(sortKey), std::move(doc));
     }
 }
 

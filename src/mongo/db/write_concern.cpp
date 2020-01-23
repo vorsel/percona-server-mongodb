@@ -46,7 +46,7 @@
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/rpc/protocol.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -72,13 +72,23 @@ StatusWith<WriteConcernOptions> extractWriteConcern(OperationContext* opCtx,
                                                     const BSONObj& cmdObj) {
     // The default write concern if empty is {w:1}. Specifying {w:0} is/was allowed, but is
     // interpreted identically to {w:1}.
-    auto wcResult = WriteConcernOptions::extractWCFromCommand(
-        cmdObj, repl::ReplicationCoordinator::get(opCtx)->getGetLastErrorDefault());
+    auto wcResult = WriteConcernOptions::extractWCFromCommand(cmdObj);
     if (!wcResult.isOK()) {
         return wcResult.getStatus();
     }
 
     WriteConcernOptions writeConcern = wcResult.getValue();
+
+    // Get the default write concern specified in ReplSetConfig only if no write concern is
+    // specified in the command (when usedDefault is true) to avoid locking the
+    // ReplicationCoordinator mutex unconditionally.
+    if (writeConcern.usedDefault) {
+        writeConcern = repl::ReplicationCoordinator::get(opCtx)->getGetLastErrorDefault();
+        if (writeConcern.wNumNodes == 0 && writeConcern.wMode.empty()) {
+            writeConcern.wNumNodes = 1;
+        }
+        writeConcern.usedDefaultW = true;
+    }
 
     if (writeConcern.usedDefault && serverGlobalParams.clusterRole == ClusterRole::ConfigServer &&
         !opCtx->getClient()->isInDirectClient() &&
@@ -218,8 +228,7 @@ Status waitForWriteConcern(OperationContext* opCtx,
     }
 
     // needed to avoid incrementing gleWtimeStats SERVER-9005
-    if (writeConcernWithPopulatedSyncMode.wNumNodes <= 1 &&
-        writeConcernWithPopulatedSyncMode.wMode.empty()) {
+    if (!writeConcernWithPopulatedSyncMode.needToWaitForOtherNodes()) {
         // no desired replication check
         return Status::OK();
     }
@@ -233,10 +242,6 @@ Status waitForWriteConcern(OperationContext* opCtx,
         result->wTimedOut = true;
     }
 
-    // Add stats
-    result->writtenTo = replCoord->getHostsWrittenTo(replOpTime,
-                                                     writeConcernWithPopulatedSyncMode.syncMode ==
-                                                         WriteConcernOptions::SyncMode::JOURNAL);
     gleWtimeStats.recordMillis(durationCount<Milliseconds>(replStatus.duration));
     result->wTime = durationCount<Milliseconds>(replStatus.duration);
 

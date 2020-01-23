@@ -93,7 +93,7 @@ void profile(OperationContext* opCtx, NetworkOp op) {
         Locker::LockerInfo lockerInfo;
         opCtx->lockState()->getLockerInfo(&lockerInfo, CurOp::get(opCtx)->getLockStatsBase());
         CurOp::get(opCtx)->debug().append(
-            *CurOp::get(opCtx), lockerInfo.stats, opCtx->lockState()->getFlowControlStats(), b);
+            opCtx, lockerInfo.stats, opCtx->lockState()->getFlowControlStats(), b);
     }
 
     b.appendDate("ts", jsTime());
@@ -176,7 +176,9 @@ void profile(OperationContext* opCtx, NetworkOp op) {
             // not allowed while performing writes, so temporarily enforce prepare conflicts.
             EnforcePrepareConflictsBlock enforcePrepare(opCtx);
 
-            Collection* const coll = db->getCollection(opCtx, db->getProfilingNS());
+            Collection* const coll =
+                CollectionCatalog::get(opCtx).lookupCollectionByNamespace(db->getProfilingNS());
+
             if (coll) {
                 invariant(!opCtx->shouldParticipateInFlowControl());
                 WriteUnitOfWork wuow(opCtx);
@@ -217,7 +219,8 @@ Status createProfileCollection(OperationContext* opCtx, Database* db) {
     invariant(!opCtx->shouldParticipateInFlowControl());
 
     auto& dbProfilingNS = db->getProfilingNS();
-    Collection* const collection = db->getCollection(opCtx, dbProfilingNS);
+    Collection* const collection =
+        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(dbProfilingNS);
     if (collection) {
         if (!collection->isCapped()) {
             return Status(ErrorCodes::NamespaceExists,

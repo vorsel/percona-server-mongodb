@@ -303,7 +303,7 @@ void CurOp::reportCurrentOpForClient(OperationContext* opCtx,
             lsid->serialize(&lsidBuilder);
         }
 
-        CurOp::get(clientOpCtx)->reportState(infoBuilder, truncateOps);
+        CurOp::get(clientOpCtx)->reportState(clientOpCtx, infoBuilder, truncateOps);
     }
 
     if (auto diagnostic = DiagnosticInfo::get(*client)) {
@@ -457,13 +457,9 @@ bool CurOp::completeAndLogOperation(OperationContext* opCtx,
         }
 
         // Gets the time spent blocked on prepare conflicts.
-        _debug.prepareConflictDurationMicros = durationCount<Microseconds>(
-            PrepareConflictTracker::get(opCtx).getPrepareConflictDuration());
-
-        log(component) << _debug.report(client,
-                                        *this,
-                                        (lockerInfo ? &lockerInfo->stats : nullptr),
-                                        opCtx->lockState()->getFlowControlStats());
+        _debug.prepareConflictDurationMicros =
+            PrepareConflictTracker::get(opCtx).getPrepareConflictDuration();
+        log(component) << _debug.report(opCtx, (lockerInfo ? &lockerInfo->stats : nullptr));
     }
 
     // Return 'true' if this operation should also be added to the profiler.
@@ -488,6 +484,11 @@ Command::ReadWriteType CurOp::getReadWriteType() const {
 }
 
 namespace {
+
+BSONObj appendCommentField(OperationContext* opCtx, const BSONObj& cmdObj) {
+    return opCtx->getComment() && !cmdObj["comment"] ? cmdObj.addField(*opCtx->getComment())
+                                                     : cmdObj;
+}
 
 /**
  * Appends {<name>: obj} to the provided builder.  If obj is greater than maxSize, appends a string
@@ -562,7 +563,7 @@ BSONObj CurOp::truncateAndSerializeGenericCursor(GenericCursor* cursor,
     return serialized;
 }
 
-void CurOp::reportState(BSONObjBuilder* builder, bool truncateOps) {
+void CurOp::reportState(OperationContext* opCtx, BSONObjBuilder* builder, bool truncateOps) {
     if (_start) {
         builder->append("secs_running", durationCount<Seconds>(elapsedTimeTotal()));
         builder->append("microsecs_running", durationCount<Microseconds>(elapsedTimeTotal()));
@@ -577,7 +578,9 @@ void CurOp::reportState(BSONObjBuilder* builder, bool truncateOps) {
     // is true, limit the size of each op to 1000 bytes. Otherwise, do not truncate.
     const boost::optional<size_t> maxQuerySize{truncateOps, 1000};
 
-    appendAsObjOrString("command", _opDescription, maxQuerySize, builder);
+    appendAsObjOrString(
+        "command", appendCommentField(opCtx, _opDescription), maxQuerySize, builder);
+
 
     if (!_planSummary.empty()) {
         builder->append("planSummary", _planSummary);
@@ -660,10 +663,10 @@ StringData getProtoString(int op) {
     if (y)                                   \
     s << " " x ":" << (*y)
 
-string OpDebug::report(Client* client,
-                       const CurOp& curop,
-                       const SingleThreadedLockStats* lockStats,
-                       FlowControlTicketholder::CurOp flowControlStats) const {
+string OpDebug::report(OperationContext* opCtx, const SingleThreadedLockStats* lockStats) const {
+    Client* client = opCtx->getClient();
+    auto& curop = *CurOp::get(opCtx);
+    auto flowControlStats = opCtx->lockState()->getFlowControlStats();
     StringBuilder s;
     if (iscommand)
         s << "command ";
@@ -680,7 +683,7 @@ string OpDebug::report(Client* client,
         }
     }
 
-    auto query = curop.opDescription();
+    auto query = appendCommentField(opCtx, curop.opDescription());
     if (!query.isEmpty()) {
         s << " command: ";
         if (iscommand) {
@@ -801,10 +804,11 @@ string OpDebug::report(Client* client,
     if (y)                            \
     b.appendNumber(x, (*y))
 
-void OpDebug::append(const CurOp& curop,
+void OpDebug::append(OperationContext* opCtx,
                      const SingleThreadedLockStats& lockStats,
                      FlowControlTicketholder::CurOp flowControlStats,
                      BSONObjBuilder& b) const {
+    auto& curop = *CurOp::get(opCtx);
     const size_t maxElementSize = 50 * 1024;
 
     b.append("op", logicalOpToString(logicalOp));
@@ -812,7 +816,8 @@ void OpDebug::append(const CurOp& curop,
     NamespaceString nss = NamespaceString(curop.getNS());
     b.append("ns", nss.ns());
 
-    appendAsObjOrString("command", curop.opDescription(), maxElementSize, &b);
+    appendAsObjOrString(
+        "command", appendCommentField(opCtx, curop.opDescription()), maxElementSize, &b);
 
     auto originatingCommand = curop.originatingCommand();
     if (!originatingCommand.isEmpty()) {

@@ -46,6 +46,9 @@ public:
 
     LogOptions(LogTag tags) : _tags(tags) {}
 
+    LogOptions(LogComponent component, LogDomain* domain, LogTag tags)
+        : _domain(domain), _tags(tags), _component(component) {}
+
     LogComponent component() const {
         return _component;
     }
@@ -61,7 +64,11 @@ public:
 private:
     LogDomain* _domain = &LogManager::global().getGlobalDomain();
     LogTag _tags;
+#ifdef MONGO_LOGV2_DEFAULT_COMPONENT
     LogComponent _component = MongoLogV2DefaultComponent_component;
+#else
+    LogComponent _component = LogComponent::kDefault;
+#endif  // MONGO_LOGV2_DEFAULT_COMPONENT
 };
 
 }  // namespace logv2

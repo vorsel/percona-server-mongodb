@@ -37,7 +37,6 @@
 #include "mongo/db/commands/txn_cmds_gen.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/repl_server_parameters_gen.h"
-#include "mongo/db/repl/sync_tail.h"
 #include "mongo/util/log.h"
 #include "mongo/util/time_support.h"
 
@@ -51,7 +50,7 @@ using CallbackArgs = executor::TaskExecutor::CallbackArgs;
 OplogApplier::OplogApplier(executor::TaskExecutor* executor,
                            OplogBuffer* oplogBuffer,
                            Observer* observer,
-                           const OplogApplier::Options& options)
+                           const Options& options)
     : _executor(executor), _oplogBuffer(oplogBuffer), _observer(observer), _options(options) {}
 
 OplogBuffer* OplogApplier::getBuffer() const {
@@ -73,7 +72,11 @@ Future<void> OplogApplier::startup() {
 }
 
 void OplogApplier::shutdown() {
-    _shutdown();
+    // Shutdown will hang if this failpoint is enabled.
+    if (globalFailPointRegistry().find("rsSyncApplyStop")->shouldFail()) {
+        severe() << "Turn off rsSyncApplyStop before attempting clean shutdown";
+        fassertFailedNoTrace(40304);
+    }
 
     stdx::lock_guard<Latch> lock(_mutex);
     _inShutdown = true;
@@ -82,6 +85,10 @@ void OplogApplier::shutdown() {
 bool OplogApplier::inShutdown() const {
     stdx::lock_guard<Latch> lock(_mutex);
     return _inShutdown;
+}
+
+void OplogApplier::waitForSpace(OperationContext* opCtx, std::size_t size) {
+    _oplogBuffer->waitForSpace(opCtx, size);
 }
 
 /**
@@ -263,6 +270,10 @@ StatusWith<OpTime> OplogApplier::multiApply(OperationContext* opCtx, Operations 
     auto lastApplied = _multiApply(opCtx, std::move(ops));
     _observer->onBatchEnd(lastApplied, {});
     return lastApplied;
+}
+
+const OplogApplier::Options& OplogApplier::getOptions() const {
+    return _options;
 }
 
 void OplogApplier::_consume(OperationContext* opCtx, OplogBuffer* oplogBuffer) {

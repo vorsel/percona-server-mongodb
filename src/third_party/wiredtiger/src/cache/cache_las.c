@@ -396,7 +396,6 @@ bool
 __wt_las_page_skip_locked(WT_SESSION_IMPL *session, WT_REF *ref)
 {
     WT_TXN *txn;
-    wt_timestamp_t unstable_timestamp;
 
     txn = &session->txn;
 
@@ -425,13 +424,17 @@ __wt_las_page_skip_locked(WT_SESSION_IMPL *session, WT_REF *ref)
 
     /*
      * If some of the page's history overlaps with the reader's snapshot then we have to read it.
-     * This is only relevant if we chose versions that were unstable when the page was written.
      */
-    if (ref->page_las->skew_newest && WT_TXNID_LE(txn->snap_min, ref->page_las->unstable_txn))
+    if (WT_TXNID_LE(txn->snap_min, ref->page_las->max_txn))
         return (false);
 
+    /*
+     * Otherwise, if not reading at a timestamp, the page's history is in the past, so the page
+     * image is correct if it contains the most recent versions of everything and nothing was
+     * prepared.
+     */
     if (!F_ISSET(txn, WT_TXN_HAS_TS_READ))
-        return (ref->page_las->skew_newest);
+        return (!ref->page_las->has_prepares && ref->page_las->min_skipped_ts == WT_TS_MAX);
 
     /*
      * Skip lookaside history if reading as of a timestamp, we evicted new
@@ -439,21 +442,18 @@ __wt_las_page_skip_locked(WT_SESSION_IMPL *session, WT_REF *ref)
      * possible for prepared updates, because the commit timestamp was not
      * known when the page was evicted.
      *
-     * Skip lookaside pages if reading as of a timestamp, we evicted old
-     * versions of data and all the unstable updates are in the future.
-     *
-     * Checkpoint should respect durable timestamps, other reads should
-     * respect ordinary visibility.  Checking for just the unstable updates
-     * during checkpoint would end up reading more content from lookaside
-     * than necessary.
+     * Otherwise, skip reading lookaside history if everything on the page
+     * is older than the read timestamp, and the oldest update in lookaside
+     * newer than the page is in the future of the reader.  This seems
+     * unlikely, but is exactly what eviction tries to do when a checkpoint
+     * is running.
      */
-    unstable_timestamp = WT_SESSION_IS_CHECKPOINT(session) ?
-      ref->page_las->unstable_durable_timestamp :
-      ref->page_las->unstable_timestamp;
-    if (ref->page_las->skew_newest && !ref->page_las->has_prepares &&
-      txn->read_timestamp > unstable_timestamp)
+    if (!ref->page_las->has_prepares && ref->page_las->min_skipped_ts == WT_TS_MAX &&
+      txn->read_timestamp >= ref->page_las->max_ondisk_ts)
         return (true);
-    if (!ref->page_las->skew_newest && txn->read_timestamp < unstable_timestamp)
+
+    if (txn->read_timestamp >= ref->page_las->max_ondisk_ts &&
+      txn->read_timestamp < ref->page_las->min_skipped_ts)
         return (true);
 
     return (false);
@@ -502,6 +502,7 @@ __las_remove_block(WT_CURSOR *cursor, uint64_t pageid, bool lock_wait, uint64_t 
     bool local_txn;
 
     *remove_cntp = 0;
+    saved_isolation = 0; /*[-Wconditional-uninitialized] */
 
     session = (WT_SESSION_IMPL *)cursor->session;
     conn = S2C(session);
@@ -513,8 +514,8 @@ __las_remove_block(WT_CURSOR *cursor, uint64_t pageid, bool lock_wait, uint64_t 
     else
         WT_RET(__wt_try_writelock(session, &conn->cache->las_sweepwalk_lock));
 
-    __las_set_isolation(session, &saved_isolation);
     WT_ERR(__wt_txn_begin(session, NULL));
+    __las_set_isolation(session, &saved_isolation);
     local_txn = true;
 
     /*
@@ -539,9 +540,9 @@ err:
             ret = __wt_txn_commit(session, NULL);
         else
             WT_TRET(__wt_txn_rollback(session, NULL));
+        __las_restore_isolation(session, saved_isolation);
     }
 
-    __las_restore_isolation(session, saved_isolation);
     __wt_writeunlock(session, &conn->cache->las_sweepwalk_lock);
     return (ret);
 }
@@ -586,16 +587,15 @@ __las_insert_block_verbose(WT_SESSION_IMPL *session, WT_BTREE *btree, WT_MULTI *
           "file ID %" PRIu32 ", page ID %" PRIu64
           ". "
           "Max txn ID %" PRIu64
-          ", unstable timestamp %s,"
-          " unstable durable timestamp %s, %s. "
+          ", max ondisk timestamp %s, "
+          "first skipped ts %s. "
           "Entries now in lookaside file: %" PRId64
           ", "
           "cache dirty: %2.3f%% , "
           "cache use: %2.3f%%",
           btree_id, multi->page_las.las_pageid, multi->page_las.max_txn,
-          __wt_timestamp_to_string(multi->page_las.unstable_timestamp, ts_string[0]),
-          __wt_timestamp_to_string(multi->page_las.unstable_durable_timestamp, ts_string[1]),
-          multi->page_las.skew_newest ? "newest" : "not newest",
+          __wt_timestamp_to_string(multi->page_las.max_ondisk_ts, ts_string[0]),
+          __wt_timestamp_to_string(multi->page_las.min_skipped_ts, ts_string[1]),
           WT_STAT_READ(conn->stats, cache_lookaside_entries), pct_dirty, pct_full);
     }
 
@@ -629,6 +629,7 @@ __wt_las_insert_block(
     session = (WT_SESSION_IMPL *)cursor->session;
     conn = S2C(session);
     WT_CLEAR(las_value);
+    saved_isolation = 0; /*[-Wconditional-uninitialized] */
     insert_cnt = prepared_insert_cnt = 0;
     btree_id = btree->id;
     local_txn = false;
@@ -650,8 +651,8 @@ __wt_las_insert_block(
 #endif
 
     /* Wrap all the updates in a transaction. */
-    __las_set_isolation(session, &saved_isolation);
     WT_ERR(__wt_txn_begin(session, NULL));
+    __las_set_isolation(session, &saved_isolation);
     local_txn = true;
 
     /* Enter each update in the boundary's list into the lookaside store. */
@@ -746,18 +747,14 @@ __wt_las_insert_block(
             if (upd == list->onpage_upd && upd->size > 0 &&
               (upd->type == WT_UPDATE_STANDARD || upd->type == WT_UPDATE_MODIFY)) {
                 las_value.size = 0;
-                WT_ASSERT(session, upd != first_upd || multi->page_las.skew_newest);
                 cursor->set_value(cursor, upd->txnid, upd->start_ts, upd->durable_ts,
                   upd->prepare_state, WT_UPDATE_BIRTHMARK, &las_value);
             } else
                 cursor->set_value(cursor, upd->txnid, upd->start_ts, upd->durable_ts,
                   upd->prepare_state, upd->type, &las_value);
 
-            /*
-             * Using update looks a little strange because the keys are guaranteed to not exist, but
-             * since we're appending, we want the cursor to stay positioned in between inserts.
-             */
-            WT_ERR(cursor->update(cursor));
+            /* Using insert so we don't keep the page pinned longer than necessary. */
+            WT_ERR(cursor->insert(cursor));
             ++insert_cnt;
             if (upd->prepare_state == WT_PREPARE_INPROGRESS)
                 ++prepared_insert_cnt;
@@ -780,6 +777,7 @@ err:
             ret = __wt_txn_commit(session, NULL);
         else
             WT_TRET(__wt_txn_rollback(session, NULL));
+        __las_restore_isolation(session, saved_isolation);
 
         /* Adjust the entry count. */
         if (ret == 0) {
@@ -788,8 +786,6 @@ err:
               session, txn_prepared_updates_lookaside_inserts, prepared_insert_cnt);
         }
     }
-
-    __las_restore_isolation(session, saved_isolation);
 
     if (ret == 0 && insert_cnt > 0) {
         multi->page_las.las_pageid = las_pageid;
@@ -1044,6 +1040,7 @@ __wt_las_sweep(WT_SESSION_IMPL *session)
     cache = S2C(session)->cache;
     cursor = NULL;
     sweep_key = &cache->las_sweep_key;
+    saved_isolation = 0; /*[-Wconditional-uninitialized] */
     remove_cnt = 0;
     session_flags = 0; /* [-Werror=maybe-uninitialized] */
     local_txn = locked = removing_key_block = false;
@@ -1063,8 +1060,8 @@ __wt_las_sweep(WT_SESSION_IMPL *session)
      */
     __wt_las_cursor(session, &cursor, &session_flags);
     WT_ASSERT(session, cursor->session == &session->iface);
-    __las_set_isolation(session, &saved_isolation);
     WT_ERR(__wt_txn_begin(session, NULL));
+    __las_set_isolation(session, &saved_isolation);
     local_txn = true;
 
     /* Encourage a race */
@@ -1246,11 +1243,11 @@ err:
             ret = __wt_txn_commit(session, NULL);
         else
             WT_TRET(__wt_txn_rollback(session, NULL));
+        __las_restore_isolation(session, saved_isolation);
         if (ret == 0)
             (void)__wt_atomic_add64(&cache->las_remove_count, remove_cnt);
     }
 
-    __las_restore_isolation(session, saved_isolation);
     WT_TRET(__wt_las_cursor_close(session, &cursor, session_flags));
 
     if (locked)

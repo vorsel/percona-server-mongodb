@@ -143,10 +143,7 @@ public:
 
     OpDebug() = default;
 
-    std::string report(Client* client,
-                       const CurOp& curop,
-                       const SingleThreadedLockStats* lockStats,
-                       FlowControlTicketholder::CurOp flowControlStats) const;
+    std::string report(OperationContext* opCtx, const SingleThreadedLockStats* lockStats) const;
 
     /**
      * Appends information about the current operation to "builder"
@@ -154,7 +151,7 @@ public:
      * @param curop reference to the CurOp that owns this OpDebug
      * @param lockStats lockStats object containing locking information about the operation
      */
-    void append(const CurOp& curop,
+    void append(OperationContext* opCtx,
                 const SingleThreadedLockStats& lockStats,
                 FlowControlTicketholder::CurOp flowControlStats,
                 BSONObjBuilder& builder) const;
@@ -230,7 +227,7 @@ public:
     int nShards{-1};
 
     // Stores the duration of time spent blocked on prepare conflicts.
-    long long prepareConflictDurationMicros{0};
+    unsigned long long prepareConflictDurationMicros{0};
 
     // Stores additive metrics.
     AdditiveMetrics additiveMetrics;
@@ -557,7 +554,7 @@ public:
      * If called from a thread other than the one executing the operation associated with this
      * CurOp, it is necessary to lock the associated Client object before executing this method.
      */
-    void reportState(BSONObjBuilder* builder, bool truncateOps = false);
+    void reportState(OperationContext* opCtx, BSONObjBuilder* builder, bool truncateOps = false);
 
     /**
      * Sets the message for this CurOp.

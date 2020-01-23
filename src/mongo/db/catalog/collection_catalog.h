@@ -63,7 +63,7 @@ public:
         iterator(StringData dbName, uint64_t genNum, const CollectionCatalog& catalog);
         iterator(
             std::map<std::pair<std::string, CollectionUUID>, Collection*>::const_iterator mapIter);
-        const value_type operator*();
+        value_type operator*();
         iterator operator++();
         iterator operator++(int);
         boost::optional<CollectionUUID> uuid();
@@ -202,6 +202,8 @@ public:
     /**
      * This functions gets all the database names. The result is sorted in alphabetical ascending
      * order.
+     *
+     * Unlike DatabaseHolder::getNames(), this does not return databases that are empty.
      */
     std::vector<std::string> getAllDbNames() const;
 

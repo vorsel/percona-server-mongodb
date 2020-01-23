@@ -853,8 +853,8 @@ public:
     virtual size_t getNumUncommittedSnapshots() = 0;
 
     /**
-     * Creates a CallbackWaiter that waits for w:majority write concern to be satisfied up to opTime
-     * before setting the 'wMajorityWriteAvailabilityDate' election candidate metric.
+     * Creates a waiter that waits for w:majority write concern to be satisfied up to opTime before
+     * setting the 'wMajorityWriteAvailabilityDate' election candidate metric.
      */
     virtual void createWMajorityWriteAvailabilityDateWaiter(OpTime opTime) = 0;
 
@@ -888,7 +888,7 @@ public:
      * Increment the counter for the number of ops applied during catchup if the node is in catchup
      * mode.
      */
-    virtual void incrementNumCatchUpOpsIfCatchingUp(int numOps) = 0;
+    virtual void incrementNumCatchUpOpsIfCatchingUp(long numOps) = 0;
 
     /**
      * Signals that drop pending collections have been removed from storage.

@@ -77,7 +77,7 @@
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/exit.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
@@ -850,7 +850,7 @@ void dropCollection(OperationContext* opCtx,
 void renameOutOfTheWay(OperationContext* opCtx, RenameCollectionInfo info, Database* db) {
 
     // Finds the UUID of the collection that we are renaming out of the way.
-    auto collection = db->getCollection(opCtx, info.renameTo);
+    auto collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(info.renameTo);
     invariant(collection);
 
     // The generated unique collection name is only guaranteed to exist if the database is
@@ -1528,7 +1528,8 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
         Lock::DBLock oplogDbLock(opCtx, oplogNss.db(), MODE_IX);
         Lock::CollectionLock oplogCollectionLoc(opCtx, oplogNss, MODE_X);
         OldClientContext ctx(opCtx, oplogNss.ns());
-        Collection* oplogCollection = ctx.db()->getCollection(opCtx, oplogNss);
+        Collection* oplogCollection =
+            CollectionCatalog::get(opCtx).lookupCollectionByNamespace(oplogNss);
         if (!oplogCollection) {
             fassertFailedWithStatusNoTrace(
                 40495,
@@ -1626,12 +1627,12 @@ void rollback(OperationContext* opCtx,
     // rolling back. If we successfully enter ROLLBACK we will only exit this function fatally or
     // after transitioning to RECOVERING. We always transition to RECOVERING regardless of success
     // or (recoverable) failure since we may be in an inconsistent state. If rollback failed before
-    // writing anything, SyncTail will quickly take us to SECONDARY since are are still at our
-    // original MinValid, which is fine because we may choose a sync source that doesn't require
-    // rollback. If it failed after we wrote to MinValid, then we will pick a sync source that will
-    // cause us to roll back to the same common point, which is fine. If we succeeded, we will be
-    // consistent as soon as we apply up to/through MinValid and SyncTail will make us SECONDARY
-    // then.
+    // writing anything, the Replication Coordinator will quickly take us to SECONDARY since we are
+    // still at our original MinValid, which is fine because we may choose a sync source that
+    // doesn't require rollback. If it failed after we wrote to MinValid, then we will pick a sync
+    // source that will cause us to roll back to the same common point, which is fine. If we
+    // succeeded, we will be consistent as soon as we apply up to/through MinValid and the
+    // Replication Coordinator will make us SECONDARY then.
 
     {
         ReplicationStateTransitionLockGuard transitionGuard(opCtx, MODE_X);

@@ -30,18 +30,14 @@
 #pragma once
 
 #include "mongo/db/jsobj.h"
+#include "mongo/db/matcher/copyable_match_expression.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/query/projection_ast_visitor.h"
-#include "mongo/util/str.h"
 
 namespace mongo {
-
-class ProjectionASTVisitor;
-
 namespace projection_ast {
-
 /*
  * A tree representation of a projection. The main purpose of this class is to offer a typed,
  * walkable representation of a projection. It's mostly meant to be used while doing validation and
@@ -81,6 +77,10 @@ public:
         return _parent;
     }
 
+    const bool isRoot() const {
+        return !_parent;
+    }
+
 protected:
     virtual void addChildToInternalVector(std::unique_ptr<ASTNode> node) {
         node->_parent = this;
@@ -94,13 +94,10 @@ protected:
 
 class MatchExpressionASTNode final : public ASTNode {
 public:
-    MatchExpressionASTNode(BSONObj bson, std::unique_ptr<MatchExpression> me)
-        : _bson(bson), _matchExpr(std::move(me)) {}
+    MatchExpressionASTNode(CopyableMatchExpression matchExpr) : _matchExpr{matchExpr} {}
 
     MatchExpressionASTNode(const MatchExpressionASTNode& other)
-        // Performing a shallowClone() on the match expression and maintaining a pointer to the
-        // underlying BSON is equivalent to a deep clone.
-        : ASTNode(other), _bson(other._bson), _matchExpr(other._matchExpr->shallowClone()) {}
+        : ASTNode{other}, _matchExpr{other._matchExpr} {}
 
     std::unique_ptr<ASTNode> clone() const override final {
         return std::make_unique<MatchExpressionASTNode>(*this);
@@ -110,14 +107,12 @@ public:
         visitor->visit(this);
     }
 
-    const MatchExpression* matchExpression() const {
-        return _matchExpr.get();
+    CopyableMatchExpression matchExpression() const {
+        return _matchExpr;
     }
 
 private:
-    // Must carry the BSON around as well since _matchExpr maintains pointers into it.
-    BSONObj _bson;
-    std::unique_ptr<MatchExpression> _matchExpr;
+    CopyableMatchExpression _matchExpr;
 };
 
 class ProjectionPathASTNode final : public ASTNode {
@@ -137,7 +132,7 @@ public:
         return std::make_unique<ProjectionPathASTNode>(*this);
     }
 
-    ASTNode* getChild(StringData fieldName) {
+    ASTNode* getChild(StringData fieldName) const {
         invariant(_fieldNames.size() == _children.size());
         for (size_t i = 0; i < _fieldNames.size(); ++i) {
             if (_fieldNames[i] == fieldName) {
@@ -241,8 +236,12 @@ public:
         return std::make_unique<ExpressionASTNode>(*this);
     }
 
-    const Expression* expression() const {
+    Expression* expressionRaw() const {
         return _expr.get();
+    }
+
+    boost::intrusive_ptr<Expression> expression() const {
+        return _expr;
     }
 
 private:
@@ -268,28 +267,5 @@ public:
 private:
     bool _val;
 };
-
-//
-// Not part of the AST, just used to represent a projection by itself.
-//
-enum class ProjectType { kInclusion, kExclusion };
-class Projection {
-public:
-    Projection(ProjectionPathASTNode root, ProjectType type)
-        : _root(std::move(root)), _type(type) {}
-
-    ProjectionPathASTNode* root() {
-        return &_root;
-    }
-
-    ProjectType type() const {
-        return _type;
-    }
-
-private:
-    ProjectionPathASTNode _root;
-    ProjectType _type;
-};
-
 }  // namespace projection_ast
 }  // namespace mongo

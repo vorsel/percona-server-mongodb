@@ -541,14 +541,15 @@ void Explain::statsToBSON(const PlanStageStats& stats,
     } else if (STAGE_SORT == stats.stageType) {
         SortStats* spec = static_cast<SortStats*>(stats.specific.get());
         bob->append("sortPattern", spec->sortPattern);
-
-        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-            bob->appendNumber("memUsage", spec->memUsage);
-            bob->appendNumber("memLimit", spec->memLimit);
-        }
+        bob->appendIntOrLL("memLimit", spec->maxMemoryUsageBytes);
 
         if (spec->limit > 0) {
-            bob->appendNumber("limitAmount", spec->limit);
+            bob->appendIntOrLL("limitAmount", spec->limit);
+        }
+
+        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
+            bob->appendIntOrLL("totalDataSizeSorted", spec->totalDataSizeBytes);
+            bob->appendBool("usedDisk", spec->wasDiskUsed);
         }
     } else if (STAGE_SORT_MERGE == stats.stageType) {
         MergeSortStats* spec = static_cast<MergeSortStats*>(stats.specific.get());
@@ -892,9 +893,10 @@ void Explain::explainStages(PlanExecutor* exec,
     if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
         executePlanStatus = exec->executePlan();
 
-        // If executing the query failed because it was killed, then the collection may no longer be
-        // valid. We indicate this by setting our collection pointer to null.
-        if (executePlanStatus == ErrorCodes::QueryPlanKilled) {
+        // If executing the query failed, for any number of reasons other than a planning failure,
+        // then the collection may no longer be valid. We conservatively set our collection pointer
+        // to null in case it is invalid.
+        if (executePlanStatus != ErrorCodes::NoQueryExecutionPlans) {
             collection = nullptr;
         }
     }

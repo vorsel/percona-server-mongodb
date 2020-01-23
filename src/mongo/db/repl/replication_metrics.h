@@ -49,8 +49,8 @@ public:
     ~ReplicationMetrics();
 
     // Election metrics
-    void incrementNumElectionsCalledForReason(TopologyCoordinator::StartElectionReason reason);
-    void incrementNumElectionsSuccessfulForReason(TopologyCoordinator::StartElectionReason reason);
+    void incrementNumElectionsCalledForReason(StartElectionReasonEnum reason);
+    void incrementNumElectionsSuccessfulForReason(StartElectionReasonEnum reason);
     void incrementNumStepDownsCausedByHigherTerm();
     void incrementNumCatchUps();
     void incrementNumCatchUpsConcludedForReason(
@@ -81,9 +81,17 @@ public:
     // All the election candidate metrics that should be set when a node calls an election are set
     // in this one function, so that the 'electionCandidateMetrics' section of replSetStatus shows a
     // consistent state.
-    void setElectionCandidateMetrics(Date_t lastElectionDate);
+    void setElectionCandidateMetrics(const StartElectionReasonEnum reason,
+                                     const Date_t lastElectionDate,
+                                     const long long electionTerm,
+                                     const OpTime lastCommittedOpTime,
+                                     const OpTime lastSeenOpTime,
+                                     const int numVotesNeeded,
+                                     const double priorityAtElection,
+                                     const Milliseconds electionTimeoutMillis,
+                                     const boost::optional<int> priorPrimary);
     void setTargetCatchupOpTime(OpTime opTime);
-    void setNumCatchUpOps(int numCatchUpOps);
+    void setNumCatchUpOps(long numCatchUpOps);
     void setNewTermStartDate(Date_t newTermStartDate);
     void setWMajorityWriteAvailabilityDate(Date_t wMajorityWriteAvailabilityDate);
 
@@ -92,6 +100,22 @@ public:
     BSONObj getElectionMetricsBSON();
     BSONObj getElectionCandidateMetricsBSON();
     void clearElectionCandidateMetrics();
+
+    // Election participant metrics
+
+    // All the election participant metrics that should be set when a node votes in an election are
+    // set in this one function, so that the 'electionParticipantMetrics' section of replSetStatus
+    // shows a consistent state.
+    void setElectionParticipantMetrics(const bool votedForCandidate,
+                                       const long long electionTerm,
+                                       const Date_t lastVoteDate,
+                                       const int electionCandidateMemberId,
+                                       const std::string voteReason,
+                                       const OpTime lastAppliedOpTime,
+                                       const OpTime maxAppliedOpTimeInSet,
+                                       const double priorityAtElection);
+
+    BSONObj getElectionParticipantMetricsBSON();
 
 private:
     class ElectionMetricsSSS;
@@ -104,6 +128,7 @@ private:
     ElectionParticipantMetrics _electionParticipantMetrics;
 
     bool _nodeIsCandidateOrPrimary = false;
+    bool _nodeHasVotedInElection = false;
 
     // This field is a double so that the division result in _updateAverageCatchUpOps will be a
     // double without any casting.

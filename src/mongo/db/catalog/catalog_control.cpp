@@ -168,7 +168,7 @@ void openCatalog(OperationContext* opCtx, const MinVisibleTimestampMap& minVisib
         for (auto&& collNss :
              CollectionCatalog::get(opCtx).getAllCollectionNamesFromDb(opCtx, dbName)) {
             // Note that the collection name already includes the database component.
-            auto collection = db->getCollection(opCtx, collNss);
+            auto collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(collNss);
             invariant(collection,
                       str::stream()
                           << "failed to get valid collection pointer for namespace " << collNss);
@@ -189,6 +189,7 @@ void openCatalog(OperationContext* opCtx, const MinVisibleTimestampMap& minVisib
     // Opening CollectionCatalog: The collection catalog is now in sync with the storage engine
     // catalog. Clear the pre-closing state.
     CollectionCatalog::get(opCtx).onOpenCatalog(opCtx);
+    opCtx->getServiceContext()->incrementCatalogGeneration();
     log() << "openCatalog: finished reloading collection catalog";
 }
 }  // namespace catalog

@@ -50,7 +50,7 @@ TEST(CommandTests, InputDocumentSequeceWorksEndToEnd) {
     NamespaceString nss("test", "doc_seq");
     DBDirectClient db(opCtx);
     db.dropCollection(nss.ns());
-    ASSERT_EQ(db.count(nss.ns()), 0u);
+    ASSERT_EQ(db.count(nss), 0u);
 
     OpMsgRequest request;
     request.body = BSON("insert" << nss.coll() << "$db" << nss.db());
@@ -66,7 +66,7 @@ TEST(CommandTests, InputDocumentSequeceWorksEndToEnd) {
     const auto reply = db.runCommand(std::move(request));
     ASSERT_EQ(int(reply->getProtocol()), int(rpc::Protocol::kOpMsg));
     ASSERT_BSONOBJ_EQ(reply->getCommandReply(), BSON("n" << 5 << "ok" << 1.0));
-    ASSERT_EQ(db.count(nss.ns()), 5u);
+    ASSERT_EQ(db.count(nss), 5u);
 }
 
 using std::string;
@@ -341,25 +341,6 @@ public:
         }
     }
 };
-
-class Touch : Base {
-public:
-    void run() {
-        ASSERT(db.createCollection(nss().ns()));
-        {
-            BSONObjBuilder cmd;
-            cmd.appendSymbol("touch", nsColl());  // Use Symbol for SERVER-16260
-            cmd.append("data", true);
-            cmd.append("index", true);
-
-            BSONObj result;
-            bool ok = db.runCommand(nsDb(), cmd.obj(), result);
-            log() << result.jsonString();
-            ASSERT(ok || result["code"].Int() == ErrorCodes::CommandNotSupported);
-        }
-    }
-};
-
 }  // namespace SymbolArgument
 
 /**
@@ -380,9 +361,9 @@ public:
     }
 };
 
-class All : public Suite {
+class All : public OldStyleSuiteSpecification {
 public:
-    All() : Suite("commands") {}
+    All() : OldStyleSuiteSpecification("commands") {}
 
     void setupTests() {
         add<FileMD5::Type0>();
@@ -390,7 +371,6 @@ public:
         add<FileMD5::Type2>();
         add<SymbolArgument::DropIndexes>();
         add<SymbolArgument::FindAndModify>();
-        add<SymbolArgument::Touch>();
         add<SymbolArgument::Drop>();
         add<SymbolArgument::GeoSearch>();
         add<SymbolArgument::CreateIndexWithNoKey>();
@@ -400,5 +380,5 @@ public:
     }
 };
 
-SuiteInstance<All> all;
+OldStyleSuiteInitializer<All> all;
 }  // namespace CommandTests
