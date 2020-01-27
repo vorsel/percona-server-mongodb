@@ -127,9 +127,7 @@ EncryptionKeyDB::~EncryptionKeyDB() {
 // this function uses _srng without synchronization
 // caller must ensure it is safe
 void EncryptionKeyDB::generate_secure_key(char key[]) {
-    for (int i = 0; i < 4; ++i) {
-        ((int64_t*)key)[i] = _srng->nextInt64();
-    }
+    _srng->fill(key, _key_len);
 }
 
 void EncryptionKeyDB::init_masterkey() {
@@ -219,7 +217,7 @@ void EncryptionKeyDB::init_masterkey() {
 }
 
 void EncryptionKeyDB::init() {
-    _srng = SecureRandom::create();
+    _srng = std::make_unique<SecureRandom>();
     _prng = std::make_unique<PseudoRandom>(_srng->nextInt64());
     try {
         init_masterkey();
@@ -392,10 +390,8 @@ int EncryptionKeyDB::get_key_by_id(const char *keyid, size_t len, unsigned char 
     }
 
     // create key if it does not exist
-    for (int i = 0; i < 4; ++i) {
-        // call to nextInt64() is protected by _lock_key above
-        ((int64_t*)key)[i] = _srng->nextInt64();
-    }
+    // call to fill() is protected by _lock_key above
+    _srng->fill(key, _key_len);
     WT_ITEM v;
     v.size = _key_len;
     v.data = key;

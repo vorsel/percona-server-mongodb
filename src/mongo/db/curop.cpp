@@ -622,7 +622,7 @@ void CurOp::reportState(OperationContext* opCtx, BSONObjBuilder* builder, bool t
 
 bool CurOp::_shouldDBProfileWithRateLimit() {
     // Pseudo RNG for rate limiter feature
-    static PseudoRandom _prng(std::unique_ptr<SecureRandom>(SecureRandom::create())->nextInt64());
+    static PseudoRandom _prng(SecureRandom().nextInt64());
 
     const int64_t RATE_LIMIT_MULTIPLIER = 1LL << 52;
     static_assert( RATE_LIMIT_MAX * RATE_LIMIT_MULTIPLIER <= std::numeric_limits<int64_t>::max(),
