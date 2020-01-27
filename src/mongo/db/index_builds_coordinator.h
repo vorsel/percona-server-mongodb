@@ -43,8 +43,8 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl_index_build_state.h"
 #include "mongo/db/storage/durable_catalog.h"
-#include "mongo/platform/condition_variable.h"
 #include "mongo/platform/mutex.h"
+#include "mongo/stdx/condition_variable.h"
 #include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/future.h"
@@ -74,7 +74,7 @@ public:
      */
     struct IndexBuildOptions {
         boost::optional<CommitQuorumOptions> commitQuorum;
-        bool replSetAndNotPrimary = false;
+        bool replSetAndNotPrimaryAtStart = false;
     };
 
     /**
@@ -139,17 +139,16 @@ public:
         const UUID& buildUUID);
 
     /**
-     * TODO: not yet implemented.
+     * Waits for the index build identified by 'buildUUID' to complete.
      */
-    Future<void> joinIndexBuilds(const NamespaceString& nss,
-                                 const std::vector<BSONObj>& indexSpecs);
+    void joinIndexBuild(OperationContext* opCtx, const UUID& buildUUID);
 
     /**
      * Commits the index build identified by 'buildUUID'.
      */
-    Status commitIndexBuild(OperationContext* opCtx,
-                            const std::vector<BSONObj>& specs,
-                            const UUID& buildUUID);
+    void commitIndexBuild(OperationContext* opCtx,
+                          const std::vector<BSONObj>& specs,
+                          const UUID& buildUUID);
 
     /**
      * Waits for all index builds to stop after they have been interrupted during shutdown.
@@ -207,9 +206,21 @@ public:
     /**
      * Aborts a given index build by index build UUID.
      */
-    Future<void> abortIndexBuildByBuildUUID(OperationContext* opCtx,
-                                            const UUID& buildUUID,
-                                            const std::string& reason);
+    void abortIndexBuildByBuildUUID(OperationContext* opCtx,
+                                    const UUID& buildUUID,
+                                    const std::string& reason);
+
+    /**
+     * Invoked when the node enters the primary state.
+     * Unblocks index builds that have been waiting to commit/abort during the secondary state.
+     */
+    void onStepUp(OperationContext* opCtx);
+
+    /**
+     * Invoked when the node enters the rollback state.
+     * Unblocks index builds that have been waiting to commit/abort during the secondary state.
+     */
+    void onRollback(OperationContext* opCtx);
 
     /**
      * TODO: This is not yet implemented.
@@ -418,6 +429,12 @@ protected:
      * Looks up active index build by UUID.
      */
     StatusWith<std::shared_ptr<ReplIndexBuildState>> _getIndexBuild(const UUID& buildUUID) const;
+
+    /**
+     * Returns a snapshot of active index builds. Since each index build state is reference counted,
+     * it is fine to examine the returned index builds without re-locking 'mutex'.
+     */
+    std::vector<std::shared_ptr<ReplIndexBuildState>> _getIndexBuilds() const;
 
     // Protects the below state.
     mutable Mutex _mutex = MONGO_MAKE_LATCH("IndexBuildsCoordinator::_mutex");

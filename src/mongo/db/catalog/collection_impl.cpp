@@ -330,6 +330,10 @@ StatusWithMatchExpression CollectionImpl::parseValidator(
     // Enforce a maximum feature version if requested.
     expCtx->maxFeatureCompatibilityVersion = maxFeatureCompatibilityVersion;
 
+    // The match expression parser needs to know that we're parsing an expression for a
+    // validator to apply some additional checks.
+    expCtx->isParsingCollectionValidator = true;
+
     auto statusWithMatcher =
         MatchExpressionParser::parse(validator, expCtx, ExtensionsCallbackNoop(), allowedFeatures);
     if (!statusWithMatcher.isOK())
@@ -449,8 +453,8 @@ Status CollectionImpl::insertDocumentForBulkLoader(OperationContext* opCtx,
 
     dassert(opCtx->lockState()->isCollectionLockedForMode(ns(), MODE_IX));
 
-    // TODO SERVER-30638: using timestamp 0 for these inserts, which are non-oplog so we don't yet
-    // care about their correct timestamps.
+    // Using timestamp 0 for these inserts, which are non-oplog so we don't have an appropriate
+    // timestamp to use.
     StatusWith<RecordId> loc =
         _recordStore->insertRecord(opCtx, doc.objdata(), doc.objsize(), Timestamp());
 

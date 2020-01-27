@@ -39,6 +39,7 @@
 #define NVALGRIND
 #endif
 
+#include <fmt/format.h>
 #include <memory>
 #include <regex>
 
@@ -101,6 +102,15 @@
 using namespace fmt::literals;
 
 namespace mongo {
+
+namespace {
+
+MONGO_FAIL_POINT_DEFINE(WTPreserveSnapshotHistoryIndefinitely);
+MONGO_FAIL_POINT_DEFINE(WTSetOldestTSToStableTS);
+
+MONGO_FAIL_POINT_DEFINE(pauseCheckpointThread);
+
+}  // namespace
 
 bool WiredTigerFileVersion::shouldDowngrade(bool readOnly,
                                             bool repairMode,
@@ -333,6 +343,8 @@ public:
                                       wiredTigerGlobalOptions.checkpointDelaySecs)));
             }
 
+            pauseCheckpointThread.pauseWhileSet();
+
             // Might have been awakened by another thread shutting us down.
             if (_shuttingDown.load()) {
                 break;
@@ -377,6 +389,7 @@ public:
                     UniqueWiredTigerSession session = _sessionCache->getSession();
                     WT_SESSION* s = session->getSession();
                     auto checkpointLock = _wiredTigerKVEngine->getCheckpointLock(opCtx.get());
+                    _wiredTigerKVEngine->clearIndividuallyCheckpointedIndexesList();
                     invariantWTOK(s->checkpoint(s, "use_timestamp=false"));
                 } else if (stableTimestamp < initialDataTimestamp) {
                     LOG_FOR_RECOVERY(2)
@@ -393,8 +406,11 @@ public:
 
                     UniqueWiredTigerSession session = _sessionCache->getSession();
                     WT_SESSION* s = session->getSession();
-                    auto checkpointLock = _wiredTigerKVEngine->getCheckpointLock(opCtx.get());
-                    invariantWTOK(s->checkpoint(s, "use_timestamp=true"));
+                    {
+                        auto checkpointLock = _wiredTigerKVEngine->getCheckpointLock(opCtx.get());
+                        _wiredTigerKVEngine->clearIndividuallyCheckpointedIndexesList();
+                        invariantWTOK(s->checkpoint(s, "use_timestamp=true"));
+                    }
 
                     if (oplogNeededForRollback.isOK()) {
                         // Now that the checkpoint is durable, publish the oplog needed to recover
@@ -551,11 +567,10 @@ Status OpenReadTransactionParam::setFromString(const std::string& str) {
 
 namespace {
 
-StatusWith<std::vector<std::string>> getDataFilesFromBackupCursor(WT_CURSOR* cursor,
-                                                                  std::string dbPath,
-                                                                  const char* statusPrefix) {
+StatusWith<std::vector<StorageEngine::BackupBlock>> getDataBlocksFromBackupCursor(
+    WT_CURSOR* cursor, std::string dbPath, const char* statusPrefix) {
     int wtRet;
-    std::vector<std::string> files;
+    std::vector<StorageEngine::BackupBlock> blocks;
     const char* filename;
     const auto directoryPath = boost::filesystem::path(dbPath);
     const auto wiredTigerLogFilePrefix = "WiredTigerLog";
@@ -571,12 +586,19 @@ StatusWith<std::vector<std::string>> getDataFilesFromBackupCursor(WT_CURSOR* cur
         }
         filePath /= name;
 
-        files.push_back(filePath.string());
+        boost::system::error_code errorCode;
+        const std::uint64_t filesize = boost::filesystem::file_size(filePath, errorCode);
+        uassert(31317,
+                "Failed to get a file's size. Filename: {} Error: {}"_format(filePath.string(),
+                                                                             errorCode.message()),
+                !errorCode);
+        blocks.push_back({filePath.string(), 0, filesize});
     }
+
     if (wtRet != WT_NOTFOUND) {
         return wtRCToStatus(wtRet, statusPrefix);
     }
-    return files;
+    return blocks;
 }
 
 }  // namespace
@@ -1219,7 +1241,7 @@ void WiredTigerKVEngine::endBackup(OperationContext* opCtx) {
     _backupSession.reset();
 }
 
-StatusWith<std::vector<std::string>> WiredTigerKVEngine::beginNonBlockingBackup(
+StatusWith<std::vector<StorageEngine::BackupBlock>> WiredTigerKVEngine::beginNonBlockingBackup(
     OperationContext* opCtx) {
     uassert(51034, "Cannot open backup cursor with in-memory mode.", !isEphemeral());
 
@@ -1242,18 +1264,18 @@ StatusWith<std::vector<std::string>> WiredTigerKVEngine::beginNonBlockingBackup(
         return wtRCToStatus(wtRet);
     }
 
-    auto swFilesToCopy =
-        getDataFilesFromBackupCursor(cursor, _path, "Error opening backup cursor.");
+    auto swBlocksToCopy =
+        getDataBlocksFromBackupCursor(cursor, _path, "Error opening backup cursor.");
 
-    if (!swFilesToCopy.isOK()) {
-        return swFilesToCopy;
+    if (!swBlocksToCopy.isOK()) {
+        return swBlocksToCopy;
     }
 
     pinOplogGuard.dismiss();
     _backupSession = std::move(sessionRaii);
     _backupCursor = cursor;
 
-    return swFilesToCopy;
+    return swBlocksToCopy;
 }
 
 void WiredTigerKVEngine::endNonBlockingBackup(OperationContext* opCtx) {
@@ -1276,15 +1298,28 @@ StatusWith<std::vector<std::string>> WiredTigerKVEngine::extendBackupCursor(
         return wtRCToStatus(wtRet);
     }
 
-    auto swFilesToCopy =
-        getDataFilesFromBackupCursor(cursor, _path, "Error extending backup cursor.");
+    StatusWith<std::vector<StorageEngine::BackupBlock>> swBlocksToCopy =
+        getDataBlocksFromBackupCursor(cursor, _path, "Error extending backup cursor.");
 
     wtRet = cursor->close(cursor);
     if (wtRet != 0) {
         return wtRCToStatus(wtRet);
     }
 
-    return swFilesToCopy;
+    if (!swBlocksToCopy.isOK()) {
+        return swBlocksToCopy.getStatus();
+    }
+
+    // Journal files returned from the future backup cursor are not intended to have block level
+    // information. For now, this is being explicitly codified by transforming the result into a
+    // vector of filename strings. The lack of block/filesize information instructs the client to
+    // copy the whole file.
+    std::vector<std::string> filenames;
+    for (const auto& block : swBlocksToCopy.getValue()) {
+        filenames.push_back(std::move(block.filename));
+    }
+
+    return {filenames};
 }
 
 // Can throw standard exceptions
@@ -1946,13 +1981,6 @@ void WiredTigerKVEngine::setJournalListener(JournalListener* jl) {
     return _sessionCache->setJournalListener(jl);
 }
 
-namespace {
-
-MONGO_FAIL_POINT_DEFINE(WTPreserveSnapshotHistoryIndefinitely);
-MONGO_FAIL_POINT_DEFINE(WTSetOldestTSToStableTS);
-
-}  // namespace
-
 void WiredTigerKVEngine::setStableTimestamp(Timestamp stableTimestamp, bool force) {
     if (stableTimestamp.isNull()) {
         return;
@@ -2289,6 +2317,15 @@ Timestamp WiredTigerKVEngine::getPinnedOplog() const {
 std::unique_ptr<StorageEngine::CheckpointLock> WiredTigerKVEngine::getCheckpointLock(
     OperationContext* opCtx) {
     return std::make_unique<CheckpointLockImpl>(opCtx, _checkpointMutex);
+}
+
+bool WiredTigerKVEngine::isInIndividuallyCheckpointedIndexesList(const std::string& ident) const {
+    for (auto it = _checkpointedIndexes.begin(); it != _checkpointedIndexes.end(); ++it) {
+        if (*it == ident) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool WiredTigerKVEngine::supportsReadConcernSnapshot() const {

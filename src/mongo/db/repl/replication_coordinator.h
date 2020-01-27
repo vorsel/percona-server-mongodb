@@ -279,17 +279,6 @@ public:
         const CommitQuorumOptions& commitQuorum) const = 0;
 
     /**
-     * Checks if the 'commitQuorum' has been satisfied by the 'commitReadyMembers', if it has been
-     * satisfied, return true.
-     *
-     * Prior to checking if the 'commitQuorum' is satisfied by 'commitReadyMembers', it calls
-     * 'checkIfCommitQuorumCanBeSatisfied()' with all the replica set members.
-     */
-    virtual StatusWith<bool> checkIfCommitQuorumIsSatisfied(
-        const CommitQuorumOptions& commitQuorum,
-        const std::vector<HostAndPort>& commitReadyMembers) const = 0;
-
-    /**
      * Returns Status::OK() if it is valid for this node to serve reads on the given collection
      * and an errorcode indicating why the node cannot if it cannot.
      */
@@ -846,13 +835,6 @@ public:
     virtual void appendConnectionStats(executor::ConnectionPoolStats* stats) const = 0;
 
     /**
-     * Gets the number of uncommitted snapshots currently held.
-     * Warning: This value can change at any time and may not even be accurate at the time of
-     * return. It should not be used when an exact amount is needed.
-     */
-    virtual size_t getNumUncommittedSnapshots() = 0;
-
-    /**
      * Creates a waiter that waits for w:majority write concern to be satisfied up to opTime before
      * setting the 'wMajorityWriteAvailabilityDate' election candidate metric.
      */
@@ -929,6 +911,31 @@ public:
      * If our state is RECOVERING and lastApplied is at least minValid, transition to SECONDARY.
      */
     virtual void finishRecoveryIfEligible(OperationContext* opCtx) = 0;
+
+    /**
+     * Field name of the newPrimaryMsg within the 'o' field in the new term oplog entry.
+     */
+    inline static constexpr StringData newPrimaryMsgField = "msg"_sd;
+
+    /**
+     * Message string passed in the new term oplog entry after a primary has stepped up.
+     */
+    inline static constexpr StringData newPrimaryMsg = "new primary"_sd;
+
+    /*
+     * Specifies the state transitions that kill user operations. Used for tracking state transition
+     * metrics.
+     */
+    enum class OpsKillingStateTransitionEnum { kStepUp, kStepDown, kRollback };
+
+    /**
+     * Updates metrics around user ops when a state transition that kills user ops and select
+     * internal operations occurs (i.e. step up, step down, or rollback). Also logs the metrics.
+     */
+    virtual void updateAndLogStateTransitionMetrics(
+        const ReplicationCoordinator::OpsKillingStateTransitionEnum stateTransition,
+        const size_t numOpsKilled,
+        const size_t numOpsRunning) const = 0;
 
 protected:
     ReplicationCoordinator();

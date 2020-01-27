@@ -30,7 +30,8 @@
 #pragma once
 
 #include "mongo/logv2/log_domain.h"
-#include "mongo/logv2/log_domain_impl.h"
+#include "mongo/logv2/log_domain_global.h"
+#include "mongo/logv2/log_domain_internal.h"
 #include "mongo/logv2/log_manager.h"
 #include "mongo/unittest/unittest.h"
 
@@ -49,56 +50,28 @@ class LogTestV2 : public unittest::Test {
 
 public:
     LogTestV2() {
-        LogManager::global().detachDefaultBackends();
-        /*auto backend = boost::make_shared<LogTestBackend>(_logLines);
-        _sink = boost::make_shared<boost::log::sinks::synchronous_sink<LogTestBackend>>(
-            std::move(backend));*/
+        LogDomainGlobal::ConfigurationOptions config;
+        config.makeDisabled();
+
+        ASSERT_OK(LogManager::global().getGlobalDomainInternal().configure(config));
     }
 
-    virtual ~LogTestV2() {
-        LogManager::global().reattachDefaultBackends();
-        // LogManager::global().getGlobalDomain().impl().core()->remove_sink(_sink);
-        LogManager::global().getGlobalDomain().impl().core()->remove_all_sinks();
+    ~LogTestV2() override {
+        for (auto&& sink : _attachedSinks) {
+            boost::log::core::get()->remove_sink(sink);
+        }
+
+        ASSERT_OK(LogManager::global().getGlobalDomainInternal().configure({}));
     }
 
     void attach(boost::shared_ptr<boost::log::sinks::sink> sink) {
-        LogManager::global().getGlobalDomain().impl().core()->add_sink(std::move(sink));
+        boost::log::core::get()->add_sink(std::move(sink));
+        _attachedSinks.push_back(sink);
     }
 
-    /* void attach(std::function<bool(boost::log::attribute_value_set const&)> filter,
-                 std::function<void(boost::log::record_view const&,
-     boost::log::formatting_ostream&)>
-                     formatter) {
-         _sink->set_filter(std::move(filter));
-         _sink->set_formatter(std::move(formatter));
-         LogManager::global().getGlobalDomain().impl().core()->add_sink(_sink);
-     }
-
-     std::string const& last() {
-         return _logLines.back();
-     }
-
-     std::size_t count() {
-         return _logLines.size();
-     }*/
 
 private:
-    /*class LogTestBackend
-        : public boost::log::sinks::
-              basic_formatted_sink_backend<char, boost::log::sinks::synchronized_feeding> {
-    public:
-        LogTestBackend(std::vector<std::string>& logLines) : _logLines(logLines) {}
-
-        void consume(boost::log::record_view const& rec, string_type const& formatted_string) {
-            _logLines.push_back(formatted_string);
-        }
-
-    private:
-        std::vector<std::string>& _logLines;
-    };
-
-    std::vector<std::string> _logLines;
-    boost::shared_ptr<boost::log::sinks::synchronous_sink<LogTestBackend>> _sink;*/
+    std::vector<boost::shared_ptr<boost::log::sinks::sink>> _attachedSinks;
 };
 
 }  // namespace logv2

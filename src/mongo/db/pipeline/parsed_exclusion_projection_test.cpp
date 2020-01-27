@@ -84,14 +84,6 @@ ParsedExclusionProjection makeExclusionProjectionWithNoArrayRecursion() {
 //
 
 DEATH_TEST(ExclusionProjectionExecutionTest,
-           ShouldRejectComputedField,
-           "Invariant failure fieldName[0] != '$'") {
-    // Top-level expression.
-    auto exclusion = makeExclusionProjectionWithDefaultPolicies();
-    exclusion.parse(BSON("a" << false << "b" << BSON("$literal" << 1)));
-}
-
-DEATH_TEST(ExclusionProjectionExecutionTest,
            ShouldFailWhenGivenIncludedNonIdField,
            "Invariant failure !elem.trueValue() || elem.fieldNameStringData() == \"_id\"_sd") {
     auto exclusion = makeExclusionProjectionWithDefaultPolicies();
@@ -149,7 +141,7 @@ TEST(ExclusionProjectionExecutionTest, ShouldNotAddAnyDependencies) {
 
     ASSERT_EQ(deps.fields.size(), 0UL);
     ASSERT_FALSE(deps.needWholeDocument);
-    ASSERT_FALSE(deps.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
+    ASSERT_FALSE(deps.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
 
 TEST(ExclusionProjectionExecutionTest, ShouldReportExcludedFieldsAsModified) {
@@ -413,6 +405,18 @@ TEST(ExclusionProjectionExecutionTest, ShouldAllowExclusionOfIdSubfieldWithDefau
     auto result = exclusion.applyProjection(
         Document{{"_id", Document{{"id1", 1}, {"id2", 2}}}, {"a", 3}, {"b", 4}});
     auto expectedResult = Document{{"_id", Document{{"id2", 2}}}, {"b", 4}};
+
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST(ExclusionProjectionExecutionTest, ShouldAllowLimitedDollarPrefixedFields) {
+    auto exclusion = makeExclusionProjectionWithDefaultIdExclusion();
+    exclusion.parse(
+        BSON("$id" << false << "$db" << false << "$ref" << false << "$sortKey" << false));
+
+    auto result = exclusion.applyProjection(
+        Document{{"$id", 5}, {"$db", 3}, {"$ref", 4}, {"$sortKey", 5}, {"someField", 6}});
+    auto expectedResult = Document{{"someField", 6}};
 
     ASSERT_DOCUMENT_EQ(result, expectedResult);
 }

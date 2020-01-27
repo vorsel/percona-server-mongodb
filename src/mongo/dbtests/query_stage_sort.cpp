@@ -221,7 +221,7 @@ public:
     };
 
     uint64_t maxMemoryUsageBytes() const {
-        return internalQueryExecMaxBlockingSortBytes.load();
+        return internalQueryMaxBlockingSortMemoryUsageBytes.load();
     }
 
     static const char* ns() {
@@ -583,7 +583,8 @@ public:
             &_opCtx, std::move(ws), std::move(fetchStage), coll, PlanExecutor::NO_YIELD);
         auto exec = std::move(statusWithPlanExecutor.getValue());
 
-        PlanExecutor::ExecState runnerState = exec->getNext(nullptr, nullptr);
+        PlanExecutor::ExecState runnerState =
+            exec->getNext(static_cast<BSONObj*>(nullptr), nullptr);
         ASSERT_EQUALS(PlanExecutor::FAILURE, runnerState);
     }
 };

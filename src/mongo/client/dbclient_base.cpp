@@ -319,7 +319,7 @@ bool DBClientBase::runPseudoCommand(StringData db,
     return success;
 }
 
-unsigned long long DBClientBase::count(
+long long DBClientBase::count(
     const NamespaceStringOrUUID nsOrUuid, const BSONObj& query, int options, int limit, int skip) {
     auto dbName = (nsOrUuid.uuid() ? nsOrUuid.dbname() : (*nsOrUuid.nss()).db().toString());
     BSONObj cmd = _countCmd(nsOrUuid, query, options, limit, skip);
@@ -586,6 +586,42 @@ list<BSONObj> DBClientBase::getCollectionInfos(const string& db, const BSONObj& 
     // command failed
 
     uasserted(18630, str::stream() << "listCollections failed: " << res);
+}
+
+vector<BSONObj> DBClientBase::getDatabaseInfos(const BSONObj& filter,
+                                               const bool nameOnly,
+                                               const bool authorizedDatabases) {
+    vector<BSONObj> infos;
+
+    BSONObjBuilder bob;
+    bob.append("listDatabases", 1);
+    bob.append("filter", filter);
+
+    if (nameOnly) {
+        bob.append("nameOnly", 1);
+    }
+    if (authorizedDatabases) {
+        bob.append("authorizedDatabases", 1);
+    }
+
+    BSONObj cmd = bob.done();
+
+    BSONObj res;
+    if (runCommand("admin", cmd, res, QueryOption_SlaveOk)) {
+        BSONObj dbs = res["databases"].Obj();
+        BSONObjIterator it(dbs);
+        while (it.more()) {
+            BSONElement e = it.next();
+            infos.push_back(e.Obj().getOwned());
+        }
+
+        return infos;
+    }
+
+    uassertStatusOKWithContext(getStatusFromCommandResult(res),
+                               str::stream()
+                                   << "Command 'listDatabases' failed. Full command: " << cmd);
+    MONGO_UNREACHABLE;
 }
 
 bool DBClientBase::exists(const string& ns) {

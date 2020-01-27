@@ -328,7 +328,7 @@ auto produceCoveredKeyObj(QuerySolutionNode* solnRoot) {
  */
 std::unique_ptr<QuerySolutionNode> addSortKeyGeneratorStageIfNeeded(
     const CanonicalQuery& query, bool hasSortStage, std::unique_ptr<QuerySolutionNode> solnRoot) {
-    if (!hasSortStage && query.getProj() && query.getProj()->wantSortKey()) {
+    if (!hasSortStage && query.metadataDeps()[DocumentMetadataFields::kSortKey]) {
         auto keyGenNode = std::make_unique<SortKeyGeneratorNode>();
         keyGenNode->sortSpec = query.getQueryRequest().getSort();
         keyGenNode->children.push_back(solnRoot.release());
@@ -619,12 +619,6 @@ QuerySolutionNode* QueryPlannerAnalysis::analyzeSort(const CanonicalQuery& query
 
     // If we're here, we need to add a sort stage.
 
-    // If we're not allowed to put a blocking sort in, bail out.
-    if (params.options & QueryPlannerParams::NO_BLOCKING_SORT) {
-        delete solnRoot;
-        return nullptr;
-    }
-
     if (!solnRoot->fetched()) {
         const bool sortIsCovered =
             std::all_of(sortObj.begin(), sortObj.end(), [solnRoot](BSONElement e) {
@@ -795,7 +789,9 @@ std::unique_ptr<QuerySolution> QueryPlannerAnalysis::analyzeDataAccess(
         // is that the projection is ignored when returnKey is specified.
         solnRoot = std::make_unique<ReturnKeyNode>(
             addSortKeyGeneratorStageIfNeeded(query, hasSortStage, std::move(solnRoot)),
-            QueryPlannerCommon::extractSortKeyMetaFieldsFromProjection(qr.getProj()));
+            query.getProj()
+                ? QueryPlannerCommon::extractSortKeyMetaFieldsFromProjection(*query.getProj())
+                : std::vector<FieldPath>{});
     } else if (query.getProj()) {
         solnRoot = analyzeProjection(query, std::move(solnRoot), hasSortStage);
         // If we don't have a covered project, and we're not allowed to put an uncovered one in,
@@ -803,6 +799,9 @@ std::unique_ptr<QuerySolution> QueryPlannerAnalysis::analyzeDataAccess(
         if (solnRoot->fetched() && params.options & QueryPlannerParams::NO_UNCOVERED_PROJECTIONS)
             return nullptr;
     } else {
+        // Even if there's no projection, the client may want sort key metadata.
+        solnRoot = addSortKeyGeneratorStageIfNeeded(query, hasSortStage, std::move(solnRoot));
+
         // If there's no projection, we must fetch, as the user wants the entire doc.
         if (!solnRoot->fetched() && !(params.options & QueryPlannerParams::IS_COUNT)) {
             FetchNode* fetch = new FetchNode();

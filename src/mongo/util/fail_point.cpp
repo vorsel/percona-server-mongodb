@@ -33,7 +33,10 @@
 #include "mongo/util/fail_point.h"
 
 #include <fmt/format.h>
+
+#include <limits>
 #include <memory>
+#include <random>
 
 #include "mongo/base/init.h"
 #include "mongo/bson/json.h"
@@ -58,38 +61,13 @@ MONGO_INITIALIZER_GENERAL(AllFailPointsRegistered, (), ())
     return Status::OK();
 }
 
-/**
- * Type representing the per-thread PRNG used by fail-points.
- */
-class FailPointPRNG {
-public:
-    FailPointPRNG() : _prng(std::unique_ptr<SecureRandom>(SecureRandom::create())->nextInt64()) {}
-
-    void resetSeed(int32_t seed) {
-        _prng = PseudoRandom(seed);
-    }
-
-    int32_t nextPositiveInt32() {
-        return _prng.nextInt32() & ~(1 << 31);
-    }
-
-    static FailPointPRNG* current() {
-        if (!_failPointPrng)
-            _failPointPrng = std::make_unique<FailPointPRNG>();
-        return _failPointPrng.get();
-    }
-
-private:
-    PseudoRandom _prng;
-    static thread_local std::unique_ptr<FailPointPRNG> _failPointPrng;
-};
-
-thread_local std::unique_ptr<FailPointPRNG> FailPointPRNG::_failPointPrng;
+/** The per-thread PRNG used by fail-points. */
+thread_local PseudoRandom threadPrng{SecureRandom().nextInt64()};
 
 }  // namespace
 
 void FailPoint::setThreadPRNGSeed(int32_t seed) {
-    FailPointPRNG::current()->resetSeed(seed);
+    threadPrng = PseudoRandom(seed);
 }
 
 FailPoint::FailPoint() = default;
@@ -98,7 +76,7 @@ void FailPoint::_shouldFailCloseBlock() {
     _fpInfo.subtractAndFetch(1);
 }
 
-void FailPoint::setMode(Mode mode, ValType val, BSONObj extra) {
+int64_t FailPoint::setMode(Mode mode, ValType val, BSONObj extra) {
     /**
      * Outline:
      *
@@ -125,6 +103,20 @@ void FailPoint::setMode(Mode mode, ValType val, BSONObj extra) {
     if (_mode != off) {
         _enable();
     }
+
+    return _timesEntered.load();
+}
+
+void FailPoint::waitForTimesEntered(int64_t timesEntered) {
+    while (_timesEntered.load() < timesEntered) {
+        sleepmillis(100);
+    };
+}
+
+void FailPoint::waitForTimesEntered(OperationContext* opCtx, int64_t timesEntered) {
+    while (_timesEntered.load() < timesEntered) {
+        opCtx->sleepFor(Milliseconds(100));
+    }
 }
 
 const BSONObj& FailPoint::_getData() const {
@@ -139,7 +131,7 @@ void FailPoint::_disable() {
     _fpInfo.fetchAndBitAnd(~kActiveBit);
 }
 
-FailPoint::RetCode FailPoint::_slowShouldFailOpenBlock(
+FailPoint::RetCode FailPoint::_slowShouldFailOpenBlockImpl(
     std::function<bool(const BSONObj&)> cb) noexcept {
     ValType localFpInfo = _fpInfo.addAndFetch(1);
 
@@ -155,24 +147,24 @@ FailPoint::RetCode FailPoint::_slowShouldFailOpenBlock(
         case alwaysOn:
             return slowOn;
         case random: {
-            const int maxActivationValue = _timesOrPeriod.load();
-            if (FailPointPRNG::current()->nextPositiveInt32() < maxActivationValue)
+            std::uniform_int_distribution<int> distribution{};
+            if (distribution(threadPrng.urbg()) < _timesOrPeriod.load()) {
                 return slowOn;
-
+            }
             return slowOff;
         }
         case nTimes: {
             if (_timesOrPeriod.subtractAndFetch(1) <= 0)
                 _disable();
-
             return slowOn;
         }
         case skip: {
             // Ensure that once the skip counter reaches within some delta from 0 we don't continue
             // decrementing it unboundedly because at some point it will roll over and become
             // positive again
-            if (_timesOrPeriod.load() <= 0 || _timesOrPeriod.subtractAndFetch(1) < 0)
+            if (_timesOrPeriod.load() <= 0 || _timesOrPeriod.subtractAndFetch(1) < 0) {
                 return slowOn;
+            }
 
             return slowOff;
         }
@@ -180,6 +172,15 @@ FailPoint::RetCode FailPoint::_slowShouldFailOpenBlock(
             error() << "FailPoint Mode not supported: " << static_cast<int>(_mode);
             fassertFailed(16444);
     }
+}
+
+FailPoint::RetCode FailPoint::_slowShouldFailOpenBlock(
+    std::function<bool(const BSONObj&)> cb) noexcept {
+    auto ret = _slowShouldFailOpenBlockImpl(cb);
+    if (ret == slowOn) {
+        _timesEntered.addAndFetch(1);
+    }
+    return ret;
 }
 
 StatusWith<FailPoint::ModeOptions> FailPoint::parseBSON(const BSONObj& obj) {
@@ -276,6 +277,7 @@ BSONObj FailPoint::toBSON() const {
     stdx::lock_guard<Latch> scoped(_modMutex);
     builder.append("mode", _mode);
     builder.append("data", _data);
+    builder.append("timesEntered", _timesEntered.load());
 
     return builder.obj();
 }
@@ -289,12 +291,13 @@ FailPointRegistry& globalFailPointRegistry() {
     return p;
 }
 
-void setGlobalFailPoint(const std::string& failPointName, const BSONObj& cmdObj) {
+int64_t setGlobalFailPoint(const std::string& failPointName, const BSONObj& cmdObj) {
     FailPoint* failPoint = globalFailPointRegistry().find(failPointName);
     if (failPoint == nullptr)
         uasserted(ErrorCodes::FailPointSetFailed, failPointName + " not found");
-    failPoint->setMode(uassertStatusOK(FailPoint::parseBSON(cmdObj)));
+    auto timesEntered = failPoint->setMode(uassertStatusOK(FailPoint::parseBSON(cmdObj)));
     warning() << "failpoint: " << failPointName << " set to: " << failPoint->toBSON();
+    return timesEntered;
 }
 
 FailPointEnableBlock::FailPointEnableBlock(std::string failPointName)

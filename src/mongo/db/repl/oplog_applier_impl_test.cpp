@@ -99,27 +99,6 @@ OplogEntry makeOplogEntry(OpTypeEnum opType, NamespaceString nss, OptionalCollec
 }
 
 /**
- * Testing-only OplogApplierImpl
- */
-
-class OplogApplierImplForTest : public OplogApplierImpl {
-public:
-    OplogApplierImplForTest();
-};
-
-// Minimal constructor that takes options, the only member accessed in fillWriterVectors.
-OplogApplierImplForTest::OplogApplierImplForTest()
-    : OplogApplierImpl(nullptr,
-                       nullptr,
-                       nullptr,
-                       nullptr,
-                       nullptr,
-                       nullptr,
-                       nullptr,
-                       repl::OplogApplier::Options(repl::OplogApplication::Mode::kInitialSync),
-                       nullptr) {}
-
-/**
  * Creates collection options suitable for oplog.
  */
 CollectionOptions createOplogCollectionOptions() {
@@ -138,7 +117,8 @@ void createCollection(OperationContext* opCtx,
                       const NamespaceString& nss,
                       const CollectionOptions& options) {
     writeConflictRetry(opCtx, "createCollection", nss.ns(), [&] {
-        Lock::DBLock dblk(opCtx, nss.db(), MODE_X);
+        Lock::DBLock dblk(opCtx, nss.db(), MODE_IX);
+        Lock::CollectionLock collLk(opCtx, nss, MODE_X);
         OldClientContext ctx(opCtx, nss.ns());
         auto db = ctx.db();
         ASSERT_TRUE(db);
@@ -192,86 +172,88 @@ auto parseFromOplogEntryArray(const BSONObj& obj, int elem) {
     return OpTime(tsArray.Array()[elem].timestamp(), termArray.Array()[elem].Long());
 };
 
-TEST_F(OplogApplierImplTest, applyOplogEntryBatchInsertDocumentDatabaseMissing) {
+TEST_F(OplogApplierImplTest, applyOplogEntryOrGroupedInsertsInsertDocumentDatabaseMissing) {
     NamespaceString nss("test.t");
     auto op = makeOplogEntry(OpTypeEnum::kInsert, nss, {});
-    ASSERT_THROWS(
-        _applyOplogEntryBatchWrapper(_opCtx.get(), &op, OplogApplication::Mode::kSecondary),
-        ExceptionFor<ErrorCodes::NamespaceNotFound>);
+    ASSERT_THROWS(_applyOplogEntryOrGroupedInsertsWrapper(
+                      _opCtx.get(), &op, OplogApplication::Mode::kSecondary),
+                  ExceptionFor<ErrorCodes::NamespaceNotFound>);
 }
 
-TEST_F(OplogApplierImplTest, applyOplogEntryBatchDeleteDocumentDatabaseMissing) {
+TEST_F(OplogApplierImplTest, applyOplogEntryOrGroupedInsertsDeleteDocumentDatabaseMissing) {
     NamespaceString otherNss("test.othername");
     auto op = makeOplogEntry(OpTypeEnum::kDelete, otherNss, {});
-    _testApplyOplogEntryBatchCrudOperation(ErrorCodes::OK, op, false);
+    _testApplyOplogEntryOrGroupedInsertsCrudOperation(ErrorCodes::OK, op, false);
 }
 
-TEST_F(OplogApplierImplTest, applyOplogEntryBatchInsertDocumentCollectionLookupByUUIDFails) {
+TEST_F(OplogApplierImplTest,
+       applyOplogEntryOrGroupedInsertsInsertDocumentCollectionLookupByUUIDFails) {
     const NamespaceString nss("test.t");
     createDatabase(_opCtx.get(), nss.db());
     NamespaceString otherNss(nss.getSisterNS("othername"));
     auto op = makeOplogEntry(OpTypeEnum::kInsert, otherNss, kUuid);
-    ASSERT_THROWS(
-        _applyOplogEntryBatchWrapper(_opCtx.get(), &op, OplogApplication::Mode::kSecondary),
-        ExceptionFor<ErrorCodes::NamespaceNotFound>);
+    ASSERT_THROWS(_applyOplogEntryOrGroupedInsertsWrapper(
+                      _opCtx.get(), &op, OplogApplication::Mode::kSecondary),
+                  ExceptionFor<ErrorCodes::NamespaceNotFound>);
 }
 
-TEST_F(OplogApplierImplTest, applyOplogEntryBatchDeleteDocumentCollectionLookupByUUIDFails) {
+TEST_F(OplogApplierImplTest,
+       applyOplogEntryOrGroupedInsertsDeleteDocumentCollectionLookupByUUIDFails) {
     const NamespaceString nss("test.t");
     createDatabase(_opCtx.get(), nss.db());
     NamespaceString otherNss(nss.getSisterNS("othername"));
     auto op = makeOplogEntry(OpTypeEnum::kDelete, otherNss, kUuid);
-    _testApplyOplogEntryBatchCrudOperation(ErrorCodes::OK, op, false);
+    _testApplyOplogEntryOrGroupedInsertsCrudOperation(ErrorCodes::OK, op, false);
 }
 
-TEST_F(OplogApplierImplTest, applyOplogEntryBatchInsertDocumentCollectionMissing) {
+TEST_F(OplogApplierImplTest, applyOplogEntryOrGroupedInsertsInsertDocumentCollectionMissing) {
     const NamespaceString nss("test.t");
     createDatabase(_opCtx.get(), nss.db());
     // Even though the collection doesn't exist, this is handled in the actual application function,
     // which in the case of this test just ignores such errors. This tests mostly that we don't
-    // implicitly create the collection and lock the database in MODE_X.
+    // implicitly create the collection.
     auto op = makeOplogEntry(OpTypeEnum::kInsert, nss, {});
-    ASSERT_THROWS(
-        _applyOplogEntryBatchWrapper(_opCtx.get(), &op, OplogApplication::Mode::kSecondary),
-        ExceptionFor<ErrorCodes::NamespaceNotFound>);
+    ASSERT_THROWS(_applyOplogEntryOrGroupedInsertsWrapper(
+                      _opCtx.get(), &op, OplogApplication::Mode::kSecondary),
+                  ExceptionFor<ErrorCodes::NamespaceNotFound>);
     ASSERT_FALSE(collectionExists(_opCtx.get(), nss));
 }
 
-TEST_F(OplogApplierImplTest, applyOplogEntryBatchDeleteDocumentCollectionMissing) {
+TEST_F(OplogApplierImplTest, applyOplogEntryOrGroupedInsertsDeleteDocumentCollectionMissing) {
     const NamespaceString nss("test.t");
     createDatabase(_opCtx.get(), nss.db());
     // Even though the collection doesn't exist, this is handled in the actual application function,
     // which in the case of this test just ignores such errors. This tests mostly that we don't
-    // implicitly create the collection and lock the database in MODE_X.
+    // implicitly create the collection.
     auto op = makeOplogEntry(OpTypeEnum::kDelete, nss, {});
-    _testApplyOplogEntryBatchCrudOperation(ErrorCodes::OK, op, false);
+    _testApplyOplogEntryOrGroupedInsertsCrudOperation(ErrorCodes::OK, op, false);
     ASSERT_FALSE(collectionExists(_opCtx.get(), nss));
 }
 
-TEST_F(OplogApplierImplTest, applyOplogEntryBatchInsertDocumentCollectionExists) {
+TEST_F(OplogApplierImplTest, applyOplogEntryOrGroupedInsertsInsertDocumentCollectionExists) {
     const NamespaceString nss("test.t");
     createCollection(_opCtx.get(), nss, {});
     auto op = makeOplogEntry(OpTypeEnum::kInsert, nss, {});
-    _testApplyOplogEntryBatchCrudOperation(ErrorCodes::OK, op, true);
+    _testApplyOplogEntryOrGroupedInsertsCrudOperation(ErrorCodes::OK, op, true);
 }
 
-TEST_F(OplogApplierImplTest, applyOplogEntryBatchDeleteDocumentCollectionExists) {
+TEST_F(OplogApplierImplTest, applyOplogEntryOrGroupedInsertsDeleteDocumentCollectionExists) {
     const NamespaceString nss("test.t");
     createCollection(_opCtx.get(), nss, {});
     auto op = makeOplogEntry(OpTypeEnum::kDelete, nss, {});
-    _testApplyOplogEntryBatchCrudOperation(ErrorCodes::OK, op, false);
+    _testApplyOplogEntryOrGroupedInsertsCrudOperation(ErrorCodes::OK, op, false);
 }
 
-TEST_F(OplogApplierImplTest, applyOplogEntryBatchInsertDocumentCollectionLockedByUUID) {
+TEST_F(OplogApplierImplTest, applyOplogEntryOrGroupedInsertsInsertDocumentCollectionLockedByUUID) {
     const NamespaceString nss("test.t");
     auto uuid = createCollectionWithUuid(_opCtx.get(), nss);
     // Test that the collection to lock is determined by the UUID and not the 'ns' field.
     NamespaceString otherNss(nss.getSisterNS("othername"));
     auto op = makeOplogEntry(OpTypeEnum::kInsert, otherNss, uuid);
-    _testApplyOplogEntryBatchCrudOperation(ErrorCodes::OK, op, true);
+    _testApplyOplogEntryOrGroupedInsertsCrudOperation(ErrorCodes::OK, op, true);
 }
 
-TEST_F(OplogApplierImplTest, applyOplogEntryBatchDeleteDocumentCollectionLockedByUUID) {
+TEST_F(OplogApplierImplTest, applyOplogEntryOrGroupedInsertsDeleteDocumentCollectionLockedByUUID) {
     const NamespaceString nss("test.t");
     CollectionOptions options;
     options.uuid = kUuid;
@@ -280,10 +262,10 @@ TEST_F(OplogApplierImplTest, applyOplogEntryBatchDeleteDocumentCollectionLockedB
     // Test that the collection to lock is determined by the UUID and not the 'ns' field.
     NamespaceString otherNss(nss.getSisterNS("othername"));
     auto op = makeOplogEntry(OpTypeEnum::kDelete, otherNss, options.uuid);
-    _testApplyOplogEntryBatchCrudOperation(ErrorCodes::OK, op, false);
+    _testApplyOplogEntryOrGroupedInsertsCrudOperation(ErrorCodes::OK, op, false);
 }
 
-TEST_F(OplogApplierImplTest, applyOplogEntryBatchCommand) {
+TEST_F(OplogApplierImplTest, applyOplogEntryOrGroupedInsertsCommand) {
     NamespaceString nss("test.t");
     auto op =
         BSON("op"
@@ -298,30 +280,52 @@ TEST_F(OplogApplierImplTest, applyOplogEntryBatchCommand) {
                                             const BSONObj&) {
         applyCmdCalled = true;
         ASSERT_TRUE(opCtx);
-        ASSERT_TRUE(opCtx->lockState()->isDbLockedForMode(nss.db(), MODE_X));
+        ASSERT_TRUE(opCtx->lockState()->isDbLockedForMode(nss.db(), MODE_IX));
         ASSERT_EQUALS(nss, collNss);
         return Status::OK();
     };
     auto entry = OplogEntry(op);
-    ASSERT_OK(
-        _applyOplogEntryBatchWrapper(_opCtx.get(), &entry, OplogApplication::Mode::kInitialSync));
+    ASSERT_OK(_applyOplogEntryOrGroupedInsertsWrapper(
+        _opCtx.get(), &entry, OplogApplication::Mode::kInitialSync));
     ASSERT_TRUE(applyCmdCalled);
+}
+
+/**
+ * Test only subclass of OplogApplierImpl that does not apply oplog entries, but tracks ops.
+ */
+class TrackOpsAppliedApplier : public OplogApplierImpl {
+public:
+    using OplogApplierImpl::OplogApplierImpl;
+
+    Status applyOplogBatchPerWorker(OperationContext* opCtx,
+                                    MultiApplier::OperationPtrs* ops,
+                                    WorkerMultikeyPathInfo* workerMultikeyPathInfo) override;
+    MultiApplier::Operations operationsApplied;
+};
+
+Status TrackOpsAppliedApplier::applyOplogBatchPerWorker(
+    OperationContext* opCtx,
+    MultiApplier::OperationPtrs* ops,
+    WorkerMultikeyPathInfo* workerMultikeyPathInfo) {
+    for (auto&& opPtr : *ops) {
+        operationsApplied.push_back(*opPtr);
+    }
+    return Status::OK();
 }
 
 DEATH_TEST_F(OplogApplierImplTest, MultiApplyAbortsWhenNoOperationsAreGiven, "!ops.empty()") {
     auto writerPool = makeReplWriterPool();
     NoopOplogApplierObserver observer;
-    OplogApplierImpl oplogApplier(
+    TrackOpsAppliedApplier oplogApplier(
         nullptr,  // executor
         nullptr,  // oplogBuffer
         &observer,
         ReplicationCoordinator::get(_opCtx.get()),
         getConsistencyMarkers(),
         getStorageInterface(),
-        noopApplyOperationFn,
         repl::OplogApplier::Options(repl::OplogApplication::Mode::kSecondary),
         writerPool.get());
-    oplogApplier.multiApply(_opCtx.get(), {}).getStatus().ignore();
+    oplogApplier.applyOplogBatch(_opCtx.get(), {}).getStatus().ignore();
 }
 
 bool _testOplogEntryIsForCappedCollection(OperationContext* opCtx,
@@ -331,37 +335,26 @@ bool _testOplogEntryIsForCappedCollection(OperationContext* opCtx,
                                           const NamespaceString& nss,
                                           const CollectionOptions& options) {
     auto writerPool = makeReplWriterPool();
-    MultiApplier::Operations operationsApplied;
-    auto applyOperationFn = [&operationsApplied](OperationContext* opCtx,
-                                                 MultiApplier::OperationPtrs* operationsToApply,
-                                                 OplogApplierImpl* oai,
-                                                 WorkerMultikeyPathInfo*) -> Status {
-        for (auto&& opPtr : *operationsToApply) {
-            operationsApplied.push_back(*opPtr);
-        }
-        return Status::OK();
-    };
     createCollection(opCtx, nss, options);
 
     auto op = makeInsertDocumentOplogEntry({Timestamp(Seconds(1), 0), 1LL}, nss, BSON("a" << 1));
     ASSERT_FALSE(op.isForCappedCollection);
 
     NoopOplogApplierObserver observer;
-    OplogApplierImpl oplogApplier(
+    TrackOpsAppliedApplier oplogApplier(
         nullptr,  // executor
         nullptr,  // oplogBuffer
         &observer,
         replCoord,
         consistencyMarkers,
         storageInterface,
-        applyOperationFn,
         repl::OplogApplier::Options(repl::OplogApplication::Mode::kSecondary),
         writerPool.get());
-    auto lastOpTime = unittest::assertGet(oplogApplier.multiApply(opCtx, {op}));
+    auto lastOpTime = unittest::assertGet(oplogApplier.applyOplogBatch(opCtx, {op}));
     ASSERT_EQUALS(op.getOpTime(), lastOpTime);
 
-    ASSERT_EQUALS(1U, operationsApplied.size());
-    const auto& opApplied = operationsApplied.front();
+    ASSERT_EQUALS(1U, oplogApplier.operationsApplied.size());
+    const auto& opApplied = oplogApplier.operationsApplied.front();
     ASSERT_EQUALS(op, opApplied);
     // "isForCappedCollection" is not parsed from raw oplog entry document.
     return opApplied.isForCappedCollection;
@@ -390,24 +383,18 @@ TEST_F(OplogApplierImplTest,
                                                      createOplogCollectionOptions()));
 }
 
-TEST_F(OplogApplierImplTest, ApplyGroupUsesApplyOplogEntryBatchToApplyOperation) {
+TEST_F(OplogApplierImplTest,
+       OplogApplicationThreadFuncUsesApplyOplogEntryOrGroupedInsertsToApplyOperation) {
     NamespaceString nss("local." + _agent.getSuiteName() + "_" + _agent.getTestName());
     auto op = makeCreateCollectionOplogEntry({Timestamp(Seconds(1), 0), 1LL}, nss);
 
     MultiApplier::OperationPtrs ops = {&op};
     WorkerMultikeyPathInfo pathInfo;
 
-    OplogApplierImpl oplogApplier(nullptr,
-                                  nullptr,
-                                  nullptr,
-                                  nullptr,
-                                  nullptr,
-                                  nullptr,
-                                  nullptr,
-                                  OplogApplier::Options(OplogApplication::Mode::kSecondary),
-                                  nullptr);
-    ASSERT_OK(applyOplogGroup(_opCtx.get(), &ops, &oplogApplier, &pathInfo));
-    // Collection should be created after applyOplogEntryBatch() processes operation.
+    TestApplyOplogGroupApplier oplogApplier(
+        nullptr, nullptr, OplogApplier::Options(OplogApplication::Mode::kSecondary));
+    ASSERT_OK(oplogApplier.applyOplogBatchPerWorker(_opCtx.get(), &ops, &pathInfo));
+    // Collection should be created after applyOplogEntryOrGroupedInserts() processes operation.
     ASSERT_TRUE(AutoGetCollectionForReadCommand(_opCtx.get(), nss).getCollection());
 }
 
@@ -523,7 +510,6 @@ TEST_F(MultiOplogEntryOplogApplierImplTest, MultiApplyUnpreparedTransactionSepar
         ReplicationCoordinator::get(_opCtx.get()),
         getConsistencyMarkers(),
         getStorageInterface(),
-        applyOplogGroup,
         repl::OplogApplier::Options(repl::OplogApplication::Mode::kSecondary),
         _writerPool.get());
 
@@ -531,7 +517,7 @@ TEST_F(MultiOplogEntryOplogApplierImplTest, MultiApplyUnpreparedTransactionSepar
     // being put in the oplog and updating the transaction table, but not actually being applied
     // because they are part of a pending transaction.
     const auto expectedStartOpTime = _insertOp1->getOpTime();
-    ASSERT_OK(oplogApplier.multiApply(_opCtx.get(), {*_insertOp1}));
+    ASSERT_OK(oplogApplier.applyOplogBatch(_opCtx.get(), {*_insertOp1}));
     ASSERT_EQ(1U, oplogDocs().size());
     ASSERT_BSONOBJ_EQ(oplogDocs().back(), _insertOp1->getRaw());
     ASSERT_TRUE(_insertedDocs[_nss1].empty());
@@ -546,7 +532,7 @@ TEST_F(MultiOplogEntryOplogApplierImplTest, MultiApplyUnpreparedTransactionSepar
     // Apply a batch with only the second operation.  This should result in the second oplog entry
     // being put in the oplog, but with no effect because the operation is part of a pending
     // transaction.
-    ASSERT_OK(oplogApplier.multiApply(_opCtx.get(), {*_insertOp2}));
+    ASSERT_OK(oplogApplier.applyOplogBatch(_opCtx.get(), {*_insertOp2}));
     ASSERT_EQ(2U, oplogDocs().size());
     ASSERT_BSONOBJ_EQ(oplogDocs().back(), _insertOp2->getRaw());
     ASSERT_TRUE(_insertedDocs[_nss1].empty());
@@ -562,7 +548,7 @@ TEST_F(MultiOplogEntryOplogApplierImplTest, MultiApplyUnpreparedTransactionSepar
 
     // Apply a batch with only the commit.  This should result in the commit being put in the
     // oplog, and the two previous entries being applied.
-    ASSERT_OK(oplogApplier.multiApply(_opCtx.get(), {*_commitOp}));
+    ASSERT_OK(oplogApplier.applyOplogBatch(_opCtx.get(), {*_commitOp}));
     ASSERT_EQ(3U, oplogDocs().size());
     ASSERT_EQ(1U, _insertedDocs[_nss1].size());
     ASSERT_EQ(2U, _insertedDocs[_nss2].size());
@@ -586,13 +572,12 @@ TEST_F(MultiOplogEntryOplogApplierImplTest, MultiApplyUnpreparedTransactionAllAt
         ReplicationCoordinator::get(_opCtx.get()),
         getConsistencyMarkers(),
         getStorageInterface(),
-        applyOplogGroup,
         repl::OplogApplier::Options(repl::OplogApplication::Mode::kRecovering),
         _writerPool.get());
 
     // Apply both inserts and the commit in a single batch.  We expect no oplog entries to
     // be inserted (because we've set skipWritesToOplog), and both entries to be committed.
-    ASSERT_OK(oplogApplier.multiApply(_opCtx.get(), {*_insertOp1, *_insertOp2, *_commitOp}));
+    ASSERT_OK(oplogApplier.applyOplogBatch(_opCtx.get(), {*_insertOp1, *_insertOp2, *_commitOp}));
     ASSERT_EQ(0U, oplogDocs().size());
     ASSERT_EQ(1U, _insertedDocs[_nss1].size());
     ASSERT_EQ(2U, _insertedDocs[_nss2].size());
@@ -644,14 +629,13 @@ TEST_F(MultiOplogEntryOplogApplierImplTest, MultiApplyUnpreparedTransactionTwoBa
         ReplicationCoordinator::get(_opCtx.get()),
         getConsistencyMarkers(),
         getStorageInterface(),
-        applyOplogGroup,
         repl::OplogApplier::Options(repl::OplogApplication::Mode::kSecondary),
         _writerPool.get());
 
     // Insert the first entry in its own batch.  This should result in the oplog entry being written
     // but the entry should not be applied as it is part of a pending transaction.
     const auto expectedStartOpTime = insertOps[0].getOpTime();
-    ASSERT_OK(oplogApplier.multiApply(_opCtx.get(), {insertOps[0]}));
+    ASSERT_OK(oplogApplier.applyOplogBatch(_opCtx.get(), {insertOps[0]}));
     ASSERT_EQ(1U, oplogDocs().size());
     ASSERT_EQ(0U, _insertedDocs[_nss1].size());
     ASSERT_EQ(0U, _insertedDocs[_nss2].size());
@@ -664,8 +648,8 @@ TEST_F(MultiOplogEntryOplogApplierImplTest, MultiApplyUnpreparedTransactionTwoBa
 
     // Insert the rest of the entries, including the commit.  These entries should be added to the
     // oplog, and all the entries including the first should be applied.
-    ASSERT_OK(oplogApplier.multiApply(_opCtx.get(),
-                                      {insertOps[1], insertOps[2], insertOps[3], commitOp}));
+    ASSERT_OK(oplogApplier.applyOplogBatch(_opCtx.get(),
+                                           {insertOps[1], insertOps[2], insertOps[3], commitOp}));
     ASSERT_EQ(5U, oplogDocs().size());
     ASSERT_EQ(3U, _insertedDocs[_nss1].size());
     ASSERT_EQ(1U, _insertedDocs[_nss2].size());
@@ -765,7 +749,6 @@ TEST_F(MultiOplogEntryOplogApplierImplTest, MultiApplyTwoTransactionsOneBatch) {
         ReplicationCoordinator::get(_opCtx.get()),
         getConsistencyMarkers(),
         getStorageInterface(),
-        applyOplogGroup,
         repl::OplogApplier::Options(repl::OplogApplication::Mode::kSecondary),
         _writerPool.get());
 
@@ -775,7 +758,7 @@ TEST_F(MultiOplogEntryOplogApplierImplTest, MultiApplyTwoTransactionsOneBatch) {
     int insertsBefore = replOpCounters.getInsert()->load();
     // Insert all the oplog entries in one batch.  All inserts should be executed, in order, exactly
     // once.
-    ASSERT_OK(oplogApplier.multiApply(
+    ASSERT_OK(oplogApplier.applyOplogBatch(
         _opCtx.get(),
         {insertOps1[0], insertOps1[1], commitOp1, insertOps2[0], insertOps2[1], commitOp2}));
     ASSERT_EQ(6U, oplogDocs().size());
@@ -877,7 +860,6 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyPreparedTransactionStea
         ReplicationCoordinator::get(_opCtx.get()),
         getConsistencyMarkers(),
         getStorageInterface(),
-        applyOplogGroup,
         repl::OplogApplier::Options(repl::OplogApplication::Mode::kSecondary),
         _writerPool.get());
 
@@ -885,7 +867,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyPreparedTransactionStea
     // being put in the oplog and updating the transaction table, but not actually being applied
     // because they are part of a pending transaction.
     const auto expectedStartOpTime = _insertOp1->getOpTime();
-    ASSERT_OK(oplogApplier.multiApply(_opCtx.get(), {*_insertOp1, *_insertOp2}));
+    ASSERT_OK(oplogApplier.applyOplogBatch(_opCtx.get(), {*_insertOp1, *_insertOp2}));
     ASSERT_EQ(2U, oplogDocs().size());
     ASSERT_BSONOBJ_EQ(_insertOp1->getRaw(), oplogDocs()[0]);
     ASSERT_BSONOBJ_EQ(_insertOp2->getRaw(), oplogDocs()[1]);
@@ -901,7 +883,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyPreparedTransactionStea
     // Apply a batch with only the prepare.  This should result in the prepare being put in the
     // oplog, and the two previous entries being applied (but in a transaction) along with the
     // nested insert in the prepare oplog entry.
-    ASSERT_OK(oplogApplier.multiApply(_opCtx.get(), {*_prepareWithPrevOp}));
+    ASSERT_OK(oplogApplier.applyOplogBatch(_opCtx.get(), {*_prepareWithPrevOp}));
     ASSERT_EQ(3U, oplogDocs().size());
     ASSERT_BSONOBJ_EQ(_prepareWithPrevOp->getRaw(), oplogDocs().back());
     ASSERT_EQ(1U, _insertedDocs[_nss1].size());
@@ -915,7 +897,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyPreparedTransactionStea
 
     // Apply a batch with only the commit.  This should result in the commit being put in the
     // oplog, and the three previous entries being committed.
-    ASSERT_OK(oplogApplier.multiApply(_opCtx.get(), {*_commitPrepareWithPrevOp}));
+    ASSERT_OK(oplogApplier.applyOplogBatch(_opCtx.get(), {*_commitPrepareWithPrevOp}));
     ASSERT_BSONOBJ_EQ(_commitPrepareWithPrevOp->getRaw(), oplogDocs().back());
     ASSERT_EQ(1U, _insertedDocs[_nss1].size());
     ASSERT_EQ(2U, _insertedDocs[_nss2].size());
@@ -936,7 +918,6 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyAbortPreparedTransactio
         ReplicationCoordinator::get(_opCtx.get()),
         getConsistencyMarkers(),
         getStorageInterface(),
-        applyOplogGroup,
         repl::OplogApplier::Options(repl::OplogApplication::Mode::kSecondary),
         _writerPool.get());
 
@@ -944,7 +925,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyAbortPreparedTransactio
     // being put in the oplog and updating the transaction table, but not actually being applied
     // because they are part of a pending transaction.
     const auto expectedStartOpTime = _insertOp1->getOpTime();
-    ASSERT_OK(oplogApplier.multiApply(_opCtx.get(), {*_insertOp1, *_insertOp2}));
+    ASSERT_OK(oplogApplier.applyOplogBatch(_opCtx.get(), {*_insertOp1, *_insertOp2}));
     checkTxnTable(_lsid,
                   _txnNum,
                   _insertOp1->getOpTime(),
@@ -955,7 +936,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyAbortPreparedTransactio
     // Apply a batch with only the prepare.  This should result in the prepare being put in the
     // oplog, and the two previous entries being applied (but in a transaction) along with the
     // nested insert in the prepare oplog entry.
-    ASSERT_OK(oplogApplier.multiApply(_opCtx.get(), {*_prepareWithPrevOp}));
+    ASSERT_OK(oplogApplier.applyOplogBatch(_opCtx.get(), {*_prepareWithPrevOp}));
     checkTxnTable(_lsid,
                   _txnNum,
                   _prepareWithPrevOp->getOpTime(),
@@ -965,7 +946,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyAbortPreparedTransactio
 
     // Apply a batch with only the abort.  This should result in the abort being put in the
     // oplog and the transaction table being updated accordingly.
-    ASSERT_OK(oplogApplier.multiApply(_opCtx.get(), {*_abortPrepareWithPrevOp}));
+    ASSERT_OK(oplogApplier.applyOplogBatch(_opCtx.get(), {*_abortPrepareWithPrevOp}));
     ASSERT_BSONOBJ_EQ(_abortPrepareWithPrevOp->getRaw(), oplogDocs().back());
     ASSERT_EQ(1U, _insertedDocs[_nss1].size());
     ASSERT_EQ(2U, _insertedDocs[_nss2].size());
@@ -986,14 +967,13 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyPreparedTransactionInit
         ReplicationCoordinator::get(_opCtx.get()),
         getConsistencyMarkers(),
         getStorageInterface(),
-        applyOplogGroup,
         repl::OplogApplier::Options(repl::OplogApplication::Mode::kInitialSync),
         _writerPool.get());
     // Apply a batch with the insert operations.  This should result in the oplog entries
     // being put in the oplog and updating the transaction table, but not actually being applied
     // because they are part of a pending transaction.
     const auto expectedStartOpTime = _insertOp1->getOpTime();
-    ASSERT_OK(oplogApplier.multiApply(_opCtx.get(), {*_insertOp1, *_insertOp2}));
+    ASSERT_OK(oplogApplier.applyOplogBatch(_opCtx.get(), {*_insertOp1, *_insertOp2}));
     ASSERT_EQ(2U, oplogDocs().size());
     ASSERT_BSONOBJ_EQ(_insertOp1->getRaw(), oplogDocs()[0]);
     ASSERT_BSONOBJ_EQ(_insertOp2->getRaw(), oplogDocs()[1]);
@@ -1008,7 +988,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyPreparedTransactionInit
 
     // Apply a batch with only the prepare applyOps. This should result in the prepare being put in
     // the oplog, but, since this is initial sync, nothing else.
-    ASSERT_OK(oplogApplier.multiApply(_opCtx.get(), {*_prepareWithPrevOp}));
+    ASSERT_OK(oplogApplier.applyOplogBatch(_opCtx.get(), {*_prepareWithPrevOp}));
     ASSERT_EQ(3U, oplogDocs().size());
     ASSERT_BSONOBJ_EQ(_prepareWithPrevOp->getRaw(), oplogDocs().back());
     ASSERT_TRUE(_insertedDocs[_nss1].empty());
@@ -1022,7 +1002,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyPreparedTransactionInit
 
     // Apply a batch with only the commit.  This should result in the commit being put in the
     // oplog, and the three previous entries being applied.
-    ASSERT_OK(oplogApplier.multiApply(_opCtx.get(), {*_commitPrepareWithPrevOp}));
+    ASSERT_OK(oplogApplier.applyOplogBatch(_opCtx.get(), {*_commitPrepareWithPrevOp}));
     ASSERT_BSONOBJ_EQ(_commitPrepareWithPrevOp->getRaw(), oplogDocs().back());
     ASSERT_EQ(1U, _insertedDocs[_nss1].size());
     ASSERT_EQ(2U, _insertedDocs[_nss2].size());
@@ -1055,14 +1035,13 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyPreparedTransactionReco
         ReplicationCoordinator::get(_opCtx.get()),
         getConsistencyMarkers(),
         getStorageInterface(),
-        applyOplogGroup,
         repl::OplogApplier::Options(repl::OplogApplication::Mode::kRecovering),
         _writerPool.get());
 
     // Apply a batch with the insert operations.  This should have no effect, because this is
     // recovery.
     const auto expectedStartOpTime = _insertOp1->getOpTime();
-    ASSERT_OK(oplogApplier.multiApply(_opCtx.get(), {*_insertOp1, *_insertOp2}));
+    ASSERT_OK(oplogApplier.applyOplogBatch(_opCtx.get(), {*_insertOp1, *_insertOp2}));
     ASSERT_TRUE(oplogDocs().empty());
     ASSERT_TRUE(_insertedDocs[_nss1].empty());
     ASSERT_TRUE(_insertedDocs[_nss2].empty());
@@ -1075,7 +1054,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyPreparedTransactionReco
 
     // Apply a batch with only the prepare applyOps. This should have no effect, since this is
     // recovery.
-    ASSERT_OK(oplogApplier.multiApply(_opCtx.get(), {*_prepareWithPrevOp}));
+    ASSERT_OK(oplogApplier.applyOplogBatch(_opCtx.get(), {*_prepareWithPrevOp}));
     ASSERT_TRUE(oplogDocs().empty());
     ASSERT_TRUE(_insertedDocs[_nss1].empty());
     ASSERT_TRUE(_insertedDocs[_nss2].empty());
@@ -1088,7 +1067,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyPreparedTransactionReco
 
     // Apply a batch with only the commit.  This should result in the the three previous entries
     // being applied.
-    ASSERT_OK(oplogApplier.multiApply(_opCtx.get(), {*_commitPrepareWithPrevOp}));
+    ASSERT_OK(oplogApplier.applyOplogBatch(_opCtx.get(), {*_commitPrepareWithPrevOp}));
     ASSERT_TRUE(oplogDocs().empty());
     ASSERT_EQ(1U, _insertedDocs[_nss1].size());
     ASSERT_EQ(2U, _insertedDocs[_nss2].size());
@@ -1109,14 +1088,13 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplySingleApplyOpsPreparedT
         ReplicationCoordinator::get(_opCtx.get()),
         getConsistencyMarkers(),
         getStorageInterface(),
-        applyOplogGroup,
         repl::OplogApplier::Options(repl::OplogApplication::Mode::kSecondary),
         _writerPool.get());
     const auto expectedStartOpTime = _singlePrepareApplyOp->getOpTime();
 
     // Apply a batch with only the prepare applyOps. This should result in the prepare being put in
     // the oplog, and the nested insert being applied (but in a transaction).
-    ASSERT_OK(oplogApplier.multiApply(_opCtx.get(), {*_singlePrepareApplyOp}));
+    ASSERT_OK(oplogApplier.applyOplogBatch(_opCtx.get(), {*_singlePrepareApplyOp}));
     ASSERT_EQ(1U, oplogDocs().size());
     ASSERT_BSONOBJ_EQ(_singlePrepareApplyOp->getRaw(), oplogDocs().back());
     ASSERT_EQ(1U, _insertedDocs[_nss1].size());
@@ -1129,7 +1107,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplySingleApplyOpsPreparedT
 
     // Apply a batch with only the commit.  This should result in the commit being put in the
     // oplog, and prepared insert being committed.
-    ASSERT_OK(oplogApplier.multiApply(_opCtx.get(), {*_commitSinglePrepareApplyOp}));
+    ASSERT_OK(oplogApplier.applyOplogBatch(_opCtx.get(), {*_commitSinglePrepareApplyOp}));
     ASSERT_BSONOBJ_EQ(_commitSinglePrepareApplyOp->getRaw(), oplogDocs().back());
     ASSERT_EQ(1U, _insertedDocs[_nss1].size());
     ASSERT_TRUE(_insertedDocs[_nss2].empty());
@@ -1150,7 +1128,6 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyEmptyApplyOpsPreparedTr
         ReplicationCoordinator::get(_opCtx.get()),
         getConsistencyMarkers(),
         getStorageInterface(),
-        applyOplogGroup,
         repl::OplogApplier::Options(repl::OplogApplication::Mode::kSecondary),
         _writerPool.get());
 
@@ -1166,7 +1143,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyEmptyApplyOpsPreparedTr
 
     // Apply a batch with only the prepare applyOps. This should result in the prepare being put in
     // the oplog, and the nested insert being applied (but in a transaction).
-    ASSERT_OK(oplogApplier.multiApply(_opCtx.get(), {emptyPrepareApplyOp}));
+    ASSERT_OK(oplogApplier.applyOplogBatch(_opCtx.get(), {emptyPrepareApplyOp}));
     ASSERT_EQ(1U, oplogDocs().size());
     ASSERT_BSONOBJ_EQ(emptyPrepareApplyOp.getRaw(), oplogDocs().back());
     ASSERT_TRUE(_insertedDocs[_nss1].empty());
@@ -1179,7 +1156,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyEmptyApplyOpsPreparedTr
 
     // Apply a batch with only the commit.  This should result in the commit being put in the
     // oplog, and prepared insert being committed.
-    ASSERT_OK(oplogApplier.multiApply(_opCtx.get(), {*_commitSinglePrepareApplyOp}));
+    ASSERT_OK(oplogApplier.applyOplogBatch(_opCtx.get(), {*_commitSinglePrepareApplyOp}));
     ASSERT_BSONOBJ_EQ(_commitSinglePrepareApplyOp->getRaw(), oplogDocs().back());
     ASSERT_TRUE(_insertedDocs[_nss1].empty());
     ASSERT_TRUE(_insertedDocs[_nss2].empty());
@@ -1200,14 +1177,13 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyAbortSingleApplyOpsPrep
         ReplicationCoordinator::get(_opCtx.get()),
         getConsistencyMarkers(),
         getStorageInterface(),
-        applyOplogGroup,
         repl::OplogApplier::Options(repl::OplogApplication::Mode::kSecondary),
         _writerPool.get());
 
     const auto expectedStartOpTime = _singlePrepareApplyOp->getOpTime();
     // Apply a batch with only the prepare applyOps. This should result in the prepare being put in
     // the oplog, and the nested insert being applied (but in a transaction).
-    ASSERT_OK(oplogApplier.multiApply(_opCtx.get(), {*_singlePrepareApplyOp}));
+    ASSERT_OK(oplogApplier.applyOplogBatch(_opCtx.get(), {*_singlePrepareApplyOp}));
     checkTxnTable(_lsid,
                   _txnNum,
                   _singlePrepareApplyOp->getOpTime(),
@@ -1217,7 +1193,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest, MultiApplyAbortSingleApplyOpsPrep
 
     // Apply a batch with only the abort.  This should result in the abort being put in the
     // oplog and the transaction table being updated accordingly.
-    ASSERT_OK(oplogApplier.multiApply(_opCtx.get(), {*_abortSinglePrepareApplyOp}));
+    ASSERT_OK(oplogApplier.applyOplogBatch(_opCtx.get(), {*_abortSinglePrepareApplyOp}));
     ASSERT_BSONOBJ_EQ(_abortSinglePrepareApplyOp->getRaw(), oplogDocs().back());
     ASSERT_EQ(1U, _insertedDocs[_nss1].size());
     ASSERT_TRUE(_insertedDocs[_nss2].empty());
@@ -1239,7 +1215,6 @@ TEST_F(MultiOplogEntryPreparedTransactionTest,
         ReplicationCoordinator::get(_opCtx.get()),
         getConsistencyMarkers(),
         getStorageInterface(),
-        applyOplogGroup,
         repl::OplogApplier::Options(repl::OplogApplication::Mode::kInitialSync),
         _writerPool.get());
 
@@ -1247,7 +1222,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest,
 
     // Apply a batch with only the prepare applyOps. This should result in the prepare being put in
     // the oplog, but, since this is initial sync, nothing else.
-    ASSERT_OK(oplogApplier.multiApply(_opCtx.get(), {*_singlePrepareApplyOp}));
+    ASSERT_OK(oplogApplier.applyOplogBatch(_opCtx.get(), {*_singlePrepareApplyOp}));
     ASSERT_EQ(1U, oplogDocs().size());
     ASSERT_BSONOBJ_EQ(_singlePrepareApplyOp->getRaw(), oplogDocs().back());
     ASSERT_TRUE(_insertedDocs[_nss1].empty());
@@ -1261,7 +1236,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest,
 
     // Apply a batch with only the commit.  This should result in the commit being put in the
     // oplog, and the previous entry being applied.
-    ASSERT_OK(oplogApplier.multiApply(_opCtx.get(), {*_commitSinglePrepareApplyOp}));
+    ASSERT_OK(oplogApplier.applyOplogBatch(_opCtx.get(), {*_commitSinglePrepareApplyOp}));
     ASSERT_BSONOBJ_EQ(_commitSinglePrepareApplyOp->getRaw(), oplogDocs().back());
     ASSERT_EQ(1U, _insertedDocs[_nss1].size());
     ASSERT_TRUE(_insertedDocs[_nss2].empty());
@@ -1294,7 +1269,6 @@ TEST_F(MultiOplogEntryPreparedTransactionTest,
         ReplicationCoordinator::get(_opCtx.get()),
         getConsistencyMarkers(),
         getStorageInterface(),
-        applyOplogGroup,
         repl::OplogApplier::Options(repl::OplogApplication::Mode::kRecovering),
         _writerPool.get());
 
@@ -1302,7 +1276,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest,
 
     // Apply a batch with only the prepare applyOps. This should have no effect, since this is
     // recovery.
-    ASSERT_OK(oplogApplier.multiApply(_opCtx.get(), {*_singlePrepareApplyOp}));
+    ASSERT_OK(oplogApplier.applyOplogBatch(_opCtx.get(), {*_singlePrepareApplyOp}));
     ASSERT_TRUE(oplogDocs().empty());
     ASSERT_TRUE(_insertedDocs[_nss1].empty());
     ASSERT_TRUE(_insertedDocs[_nss2].empty());
@@ -1315,7 +1289,7 @@ TEST_F(MultiOplogEntryPreparedTransactionTest,
 
     // Apply a batch with only the commit.  This should result in the previous entry being
     // applied.
-    ASSERT_OK(oplogApplier.multiApply(_opCtx.get(), {*_commitSinglePrepareApplyOp}));
+    ASSERT_OK(oplogApplier.applyOplogBatch(_opCtx.get(), {*_commitSinglePrepareApplyOp}));
     ASSERT_TRUE(oplogDocs().empty());
     ASSERT_EQ(1U, _insertedDocs[_nss1].size());
     ASSERT_TRUE(_insertedDocs[_nss2].empty());
@@ -1330,23 +1304,15 @@ TEST_F(MultiOplogEntryPreparedTransactionTest,
 void testWorkerMultikeyPaths(OperationContext* opCtx,
                              const OplogEntry& op,
                              unsigned long numPaths) {
-
-    OplogApplierImpl oplogApplier(nullptr,
-                                  nullptr,
-                                  nullptr,
-                                  nullptr,
-                                  nullptr,
-                                  nullptr,
-                                  nullptr,
-                                  OplogApplier::Options(OplogApplication::Mode::kSecondary),
-                                  nullptr);
+    TestApplyOplogGroupApplier oplogApplier(
+        nullptr, nullptr, OplogApplier::Options(OplogApplication::Mode::kSecondary));
     WorkerMultikeyPathInfo pathInfo;
     MultiApplier::OperationPtrs ops = {&op};
-    ASSERT_OK(applyOplogGroup(opCtx, &ops, &oplogApplier, &pathInfo));
+    ASSERT_OK(oplogApplier.applyOplogBatchPerWorker(opCtx, &ops, &pathInfo));
     ASSERT_EQ(pathInfo.size(), numPaths);
 }
 
-TEST_F(OplogApplierImplTest, ApplyGroupAddsWorkerMultikeyPathInfoOnInsert) {
+TEST_F(OplogApplierImplTest, OplogApplicationThreadFuncAddsWorkerMultikeyPathInfoOnInsert) {
     NamespaceString nss("local." + _agent.getSuiteName() + "_" + _agent.getTestName());
 
     {
@@ -1367,7 +1333,7 @@ TEST_F(OplogApplierImplTest, ApplyGroupAddsWorkerMultikeyPathInfoOnInsert) {
     }
 }
 
-TEST_F(OplogApplierImplTest, ApplyGroupAddsMultipleWorkerMultikeyPathInfo) {
+TEST_F(OplogApplierImplTest, OplogApplicationThreadFuncAddsMultipleWorkerMultikeyPathInfo) {
     NamespaceString nss("local." + _agent.getSuiteName() + "_" + _agent.getTestName());
 
     {
@@ -1396,23 +1362,17 @@ TEST_F(OplogApplierImplTest, ApplyGroupAddsMultipleWorkerMultikeyPathInfo) {
         auto docB = BSON("_id" << 2 << "b" << BSON_ARRAY(6 << 7));
         auto opB = makeInsertDocumentOplogEntry({Timestamp(Seconds(5), 0), 1LL}, nss, docB);
 
-        OplogApplierImpl oplogApplier(nullptr,
-                                      nullptr,
-                                      nullptr,
-                                      nullptr,
-                                      nullptr,
-                                      nullptr,
-                                      nullptr,
-                                      OplogApplier::Options(OplogApplication::Mode::kSecondary),
-                                      nullptr);
+        TestApplyOplogGroupApplier oplogApplier(
+            nullptr, nullptr, OplogApplier::Options(OplogApplication::Mode::kSecondary));
         WorkerMultikeyPathInfo pathInfo;
         MultiApplier::OperationPtrs ops = {&opA, &opB};
-        ASSERT_OK(applyOplogGroup(_opCtx.get(), &ops, &oplogApplier, &pathInfo));
+        ASSERT_OK(oplogApplier.applyOplogBatchPerWorker(_opCtx.get(), &ops, &pathInfo));
         ASSERT_EQ(pathInfo.size(), 2UL);
     }
 }
 
-TEST_F(OplogApplierImplTest, ApplyGroupDoesNotAddWorkerMultikeyPathInfoOnCreateIndex) {
+TEST_F(OplogApplierImplTest,
+       OplogApplicationThreadFuncDoesNotAddWorkerMultikeyPathInfoOnCreateIndex) {
     NamespaceString nss("local." + _agent.getSuiteName() + "_" + _agent.getTestName());
 
     {
@@ -1441,28 +1401,22 @@ TEST_F(OplogApplierImplTest, ApplyGroupDoesNotAddWorkerMultikeyPathInfoOnCreateI
     }
 }
 
-TEST_F(OplogApplierImplTest, ApplyGroupFailsWhenCollectionCreationTriesToMakeUUID) {
+TEST_F(OplogApplierImplTest, OplogApplicationThreadFuncFailsWhenCollectionCreationTriesToMakeUUID) {
     ASSERT_OK(
         ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_SECONDARY));
     NamespaceString nss("foo." + _agent.getSuiteName() + "_" + _agent.getTestName());
 
     auto op = makeCreateCollectionOplogEntry({Timestamp(Seconds(1), 0), 1LL}, nss);
 
-    OplogApplierImpl oplogApplier(nullptr,
-                                  nullptr,
-                                  nullptr,
-                                  nullptr,
-                                  nullptr,
-                                  nullptr,
-                                  nullptr,
-                                  OplogApplier::Options(OplogApplication::Mode::kSecondary),
-                                  nullptr);
+    TestApplyOplogGroupApplier oplogApplier(
+        nullptr, nullptr, OplogApplier::Options(OplogApplication::Mode::kSecondary));
     MultiApplier::OperationPtrs ops = {&op};
     ASSERT_EQUALS(ErrorCodes::InvalidOptions,
-                  applyOplogGroup(_opCtx.get(), &ops, &oplogApplier, nullptr));
+                  oplogApplier.applyOplogBatchPerWorker(_opCtx.get(), &ops, nullptr));
 }
 
-TEST_F(OplogApplierImplTest, ApplyGroupDisablesDocumentValidationWhileApplyingOperations) {
+TEST_F(OplogApplierImplTest,
+       OplogApplicationThreadFuncDisablesDocumentValidationWhileApplyingOperations) {
     NamespaceString nss("local." + _agent.getSuiteName() + "_" + _agent.getTestName());
     bool onInsertsCalled = false;
     _opObserver->onInsertsFn =
@@ -1479,15 +1433,17 @@ TEST_F(OplogApplierImplTest, ApplyGroupDisablesDocumentValidationWhileApplyingOp
     ASSERT(onInsertsCalled);
 }
 
-TEST_F(OplogApplierImplTest,
-       ApplyGroupPassesThroughApplyOplogEntryBatchErrorAfterFailingToApplyOperation) {
+TEST_F(
+    OplogApplierImplTest,
+    OplogApplicationThreadFuncPassesThroughApplyOplogEntryOrGroupedInsertsErrorAfterFailingToApplyOperation) {
     NamespaceString nss("local." + _agent.getSuiteName() + "_" + _agent.getTestName());
     // Delete operation without _id in 'o' field.
     auto op = makeDeleteDocumentOplogEntry({Timestamp(Seconds(1), 0), 1LL}, nss, {});
     ASSERT_EQUALS(ErrorCodes::NoSuchKey, runOpSteadyState(op));
 }
 
-TEST_F(OplogApplierImplTest, ApplyGroupPassesThroughApplyOplogEntryBatchException) {
+TEST_F(OplogApplierImplTest,
+       OplogApplicationThreadFuncPassesThroughApplyOplogEntryOrGroupedInsertsException) {
     NamespaceString nss("local." + _agent.getSuiteName() + "_" + _agent.getTestName());
     bool onInsertsCalled = false;
     _opObserver->onInsertsFn =
@@ -1502,7 +1458,8 @@ TEST_F(OplogApplierImplTest, ApplyGroupPassesThroughApplyOplogEntryBatchExceptio
     ASSERT(onInsertsCalled);
 }
 
-TEST_F(OplogApplierImplTest, ApplyGroupSortsOperationsStablyByNamespaceBeforeApplying) {
+TEST_F(OplogApplierImplTest,
+       OplogApplicationThreadFuncSortsOperationsStablyByNamespaceBeforeApplying) {
     NamespaceString nss1("test.t1");
     NamespaceString nss2("test.t2");
     NamespaceString nss3("test.t3");
@@ -1547,7 +1504,8 @@ TEST_F(OplogApplierImplTest, ApplyGroupSortsOperationsStablyByNamespaceBeforeApp
     ASSERT(onInsertsCalled);
 }
 
-TEST_F(OplogApplierImplTest, ApplyGroupGroupsInsertOperationByNamespaceBeforeApplying) {
+TEST_F(OplogApplierImplTest,
+       OplogApplicationThreadFuncGroupsInsertOperationByNamespaceBeforeApplying) {
     int seconds = 1;
     auto makeOp = [&seconds](const NamespaceString& nss) {
         return makeInsertDocumentOplogEntry(
@@ -1588,7 +1546,8 @@ TEST_F(OplogApplierImplTest, ApplyGroupGroupsInsertOperationByNamespaceBeforeApp
     ASSERT_BSONOBJ_EQ(insertOp2b.getObject(), group2[1]);
 }
 
-TEST_F(OplogApplierImplTest, ApplyGroupLimitsBatchCountWhenGroupingInsertOperation) {
+TEST_F(OplogApplierImplTest,
+       OplogApplicationThreadFuncLimitsBatchCountWhenGroupingInsertOperation) {
     int seconds = 1;
     auto makeOp = [&seconds](const NamespaceString& nss) {
         return makeInsertDocumentOplogEntry(
@@ -1617,7 +1576,7 @@ TEST_F(OplogApplierImplTest, ApplyGroupLimitsBatchCountWhenGroupingInsertOperati
 
     ASSERT_OK(runOpsSteadyState(operationsToApply));
 
-    // applyOplogGroup should combine operations as follows:
+    // applyOplogBatchPerWorker should combine operations as follows:
     // {create}, {grouped_insert}, {insert_(limit+1)}
     // Ignore {create} since we are only tracking inserts.
     ASSERT_EQUALS(2U, docsInserted.size());
@@ -1643,7 +1602,8 @@ OplogEntry makeSizedInsertOp(const NamespaceString& nss, int size, int id) {
                                         BSON("_id" << id << "data" << std::string(size, '*')));
 };
 
-TEST_F(OplogApplierImplTest, ApplyGroupLimitsBatchSizeWhenGroupingInsertOperations) {
+TEST_F(OplogApplierImplTest,
+       OplogApplicationThreadFuncLimitsBatchSizeWhenGroupingInsertOperations) {
     int seconds = 1;
     NamespaceString nss("test." + _agent.getSuiteName() + "_" + _agent.getTestName());
     auto createOp = makeCreateCollectionOplogEntry({Timestamp(Seconds(seconds++), 0), 1LL}, nss);
@@ -1692,7 +1652,8 @@ TEST_F(OplogApplierImplTest, ApplyGroupLimitsBatchSizeWhenGroupingInsertOperatio
     ASSERT_BSONOBJ_EQ(insertOps[3].getObject(), singleInsertDocumentGroup[0]);
 }
 
-TEST_F(OplogApplierImplTest, ApplyGroupAppliesOpIndividuallyWhenOpIndividuallyExceedsBatchSize) {
+TEST_F(OplogApplierImplTest,
+       OplogApplicationThreadFuncAppliesOpIndividuallyWhenOpIndividuallyExceedsBatchSize) {
     int seconds = 1;
     NamespaceString nss("test." + _agent.getSuiteName() + "_" + _agent.getTestName());
     auto createOp = makeCreateCollectionOplogEntry({Timestamp(Seconds(seconds++), 0), 1LL}, nss);
@@ -1727,7 +1688,7 @@ TEST_F(OplogApplierImplTest, ApplyGroupAppliesOpIndividuallyWhenOpIndividuallyEx
 }
 
 TEST_F(OplogApplierImplTest,
-       ApplyGroupAppliesInsertOpsIndividuallyWhenUnableToCreateGroupByNamespace) {
+       OplogApplicationThreadFuncAppliesInsertOpsIndividuallyWhenUnableToCreateGroupByNamespace) {
     int seconds = 1;
     auto makeOp = [&seconds](const NamespaceString& nss) {
         return makeInsertDocumentOplogEntry(
@@ -1767,7 +1728,7 @@ TEST_F(OplogApplierImplTest,
 }
 
 TEST_F(OplogApplierImplTest,
-       ApplyGroupFallsBackOnApplyingInsertsIndividuallyWhenGroupedInsertFails) {
+       OplogApplicationThreadFuncFallsBackOnApplyingInsertsIndividuallyWhenGroupedInsertFails) {
     int seconds = 1;
     auto makeOp = [&seconds](const NamespaceString& nss) {
         return makeInsertDocumentOplogEntry(
@@ -1802,10 +1763,9 @@ TEST_F(OplogApplierImplTest,
 
     ASSERT_OK(runOpsSteadyState(operationsToApply));
 
-    // On failing to apply the grouped insert operation, applyOplogGroup should apply the operations
-    // as given in "operationsToApply":
-    // {create}, {insert_1}, {insert_2}, .. {insert_(limit)}, {insert_(limit+1)}
-    // Ignore {create} since we are only tracking inserts.
+    // On failing to apply the grouped insert operation, applyOplogBatchPerWorker should
+    // apply the operations as given in "operationsToApply": {create}, {insert_1}, {insert_2}, ..
+    // {insert_(limit)}, {insert_(limit+1)} Ignore {create} since we are only tracking inserts.
     ASSERT_EQUALS(limit + 1, docsInserted.size());
 
     for (std::size_t i = 0; i < limit + 1; ++i) {
@@ -1815,13 +1775,14 @@ TEST_F(OplogApplierImplTest,
         ASSERT_BSONOBJ_EQ(insertOp.getObject(), group[0]);
     }
 
-    // Ensure that applyOplogGroup does not attempt to group remaining operations in first failed
-    // grouped insert operation.
+    // Ensure that applyOplogBatchPerWorker does not attempt to group remaining operations
+    // in first failed grouped insert operation.
     ASSERT_EQUALS(1U, numFailedGroupedInserts);
 }
 
 TEST_F(OplogApplierImplTest, ApplyGroupIgnoresUpdateOperationIfDocumentIsMissingFromSyncSource) {
-    OplogApplierImplForTest oplogApplier;
+    TestApplyOplogGroupApplier oplogApplier(
+        nullptr, nullptr, OplogApplier::Options(OplogApplication::Mode::kInitialSync));
     NamespaceString nss("test.t");
     {
         Lock::GlobalWrite globalLock(_opCtx.get());
@@ -1835,16 +1796,18 @@ TEST_F(OplogApplierImplTest, ApplyGroupIgnoresUpdateOperationIfDocumentIsMissing
         {Timestamp(Seconds(1), 0), 1LL}, nss, BSON("_id" << 0), BSON("_id" << 0 << "x" << 2));
     MultiApplier::OperationPtrs ops = {&op};
     WorkerMultikeyPathInfo pathInfo;
-    ASSERT_OK(applyOplogGroup(_opCtx.get(), &ops, &oplogApplier, &pathInfo));
+    ASSERT_OK(oplogApplier.applyOplogBatchPerWorker(_opCtx.get(), &ops, &pathInfo));
 
     // Since the document was missing when we cloned data from the sync source, the collection
     // referenced by the failed operation should not be automatically created.
     ASSERT_FALSE(AutoGetCollectionForReadCommand(_opCtx.get(), nss).getCollection());
 }
 
-TEST_F(OplogApplierImplTest, ApplyGroupSkipsDocumentOnNamespaceNotFoundDuringInitialSync) {
+TEST_F(OplogApplierImplTest,
+       OplogApplicationThreadFuncSkipsDocumentOnNamespaceNotFoundDuringInitialSync) {
     BSONObj emptyDoc;
-    OplogApplierImplForTest oplogApplier;
+    TestApplyOplogGroupApplier oplogApplier(
+        nullptr, nullptr, OplogApplier::Options(OplogApplication::Mode::kInitialSync));
     NamespaceString nss("local." + _agent.getSuiteName() + "_" + _agent.getTestName());
     NamespaceString badNss("local." + _agent.getSuiteName() + "_" + _agent.getTestName() + "bad");
     auto doc1 = BSON("_id" << 1);
@@ -1856,7 +1819,7 @@ TEST_F(OplogApplierImplTest, ApplyGroupSkipsDocumentOnNamespaceNotFoundDuringIni
     auto op3 = makeInsertDocumentOplogEntry({Timestamp(Seconds(4), 0), 1LL}, nss, doc3);
     MultiApplier::OperationPtrs ops = {&op0, &op1, &op2, &op3};
     WorkerMultikeyPathInfo pathInfo;
-    ASSERT_OK(applyOplogGroup(_opCtx.get(), &ops, &oplogApplier, &pathInfo));
+    ASSERT_OK(oplogApplier.applyOplogBatchPerWorker(_opCtx.get(), &ops, &pathInfo));
 
     CollectionReader collectionReader(_opCtx.get(), nss);
     ASSERT_BSONOBJ_EQ(doc1, unittest::assertGet(collectionReader.next()));
@@ -1864,9 +1827,11 @@ TEST_F(OplogApplierImplTest, ApplyGroupSkipsDocumentOnNamespaceNotFoundDuringIni
     ASSERT_EQUALS(ErrorCodes::CollectionIsEmpty, collectionReader.next().getStatus());
 }
 
-TEST_F(OplogApplierImplTest, ApplyGroupSkipsIndexCreationOnNamespaceNotFoundDuringInitialSync) {
+TEST_F(OplogApplierImplTest,
+       OplogApplicationThreadFuncSkipsIndexCreationOnNamespaceNotFoundDuringInitialSync) {
     BSONObj emptyDoc;
-    OplogApplierImplForTest oplogApplier;
+    TestApplyOplogGroupApplier oplogApplier(
+        nullptr, nullptr, OplogApplier::Options(OplogApplication::Mode::kInitialSync));
     NamespaceString nss("local." + _agent.getSuiteName() + "_" + _agent.getTestName());
     NamespaceString badNss("local." + _agent.getSuiteName() + "_" + _agent.getTestName() + "bad");
     auto doc1 = BSON("_id" << 1);
@@ -1880,7 +1845,7 @@ TEST_F(OplogApplierImplTest, ApplyGroupSkipsIndexCreationOnNamespaceNotFoundDuri
     auto op3 = makeInsertDocumentOplogEntry({Timestamp(Seconds(4), 0), 1LL}, nss, doc3);
     MultiApplier::OperationPtrs ops = {&op0, &op1, &op2, &op3};
     WorkerMultikeyPathInfo pathInfo;
-    ASSERT_OK(applyOplogGroup(_opCtx.get(), &ops, &oplogApplier, &pathInfo));
+    ASSERT_OK(oplogApplier.applyOplogBatchPerWorker(_opCtx.get(), &ops, &pathInfo));
 
     CollectionReader collectionReader(_opCtx.get(), nss);
     ASSERT_BSONOBJ_EQ(doc1, unittest::assertGet(collectionReader.next()));
@@ -2301,8 +2266,8 @@ TEST_F(OplogApplierImplTest, LogSlowOpApplicationWhenSuccessful) {
     auto entry = makeOplogEntry(OpTypeEnum::kInsert, nss, {});
 
     startCapturingLogMessages();
-    ASSERT_OK(
-        _applyOplogEntryBatchWrapper(_opCtx.get(), &entry, OplogApplication::Mode::kSecondary));
+    ASSERT_OK(_applyOplogEntryOrGroupedInsertsWrapper(
+        _opCtx.get(), &entry, OplogApplication::Mode::kSecondary));
 
     // Use a builder for easier escaping. We expect the operation to be logged.
     StringBuilder expected;
@@ -2324,9 +2289,9 @@ TEST_F(OplogApplierImplTest, DoNotLogSlowOpApplicationWhenFailed) {
     auto entry = makeOplogEntry(OpTypeEnum::kInsert, nss, {});
 
     startCapturingLogMessages();
-    ASSERT_THROWS(
-        _applyOplogEntryBatchWrapper(_opCtx.get(), &entry, OplogApplication::Mode::kSecondary),
-        ExceptionFor<ErrorCodes::NamespaceNotFound>);
+    ASSERT_THROWS(_applyOplogEntryOrGroupedInsertsWrapper(
+                      _opCtx.get(), &entry, OplogApplication::Mode::kSecondary),
+                  ExceptionFor<ErrorCodes::NamespaceNotFound>);
 
     // Use a builder for easier escaping. We expect the operation to *not* be logged
     // even thought it was slow, since we couldn't apply it successfully.
@@ -2349,8 +2314,8 @@ TEST_F(OplogApplierImplTest, DoNotLogNonSlowOpApplicationWhenSuccessful) {
     auto entry = makeOplogEntry(OpTypeEnum::kInsert, nss, {});
 
     startCapturingLogMessages();
-    ASSERT_OK(
-        _applyOplogEntryBatchWrapper(_opCtx.get(), &entry, OplogApplication::Mode::kSecondary));
+    ASSERT_OK(_applyOplogEntryOrGroupedInsertsWrapper(
+        _opCtx.get(), &entry, OplogApplication::Mode::kSecondary));
 
     // Use a builder for easier escaping. We expect the operation to *not* be logged,
     // since it wasn't slow to apply.
@@ -2478,11 +2443,10 @@ TEST_F(OplogApplierImplTxnTableTest, SimpleWriteWithTxn) {
         ReplicationCoordinator::get(_opCtx.get()),
         getConsistencyMarkers(),
         getStorageInterface(),
-        applyOplogGroup,
         repl::OplogApplier::Options(repl::OplogApplication::Mode::kSecondary),
         writerPool.get());
 
-    ASSERT_OK(oplogApplier.multiApply(_opCtx.get(), {insertOp}));
+    ASSERT_OK(oplogApplier.applyOplogBatch(_opCtx.get(), {insertOp}));
 
     checkTxnTable(sessionInfo, {Timestamp(1, 0), 1}, date);
 }
@@ -2519,12 +2483,11 @@ TEST_F(OplogApplierImplTxnTableTest, WriteWithTxnMixedWithDirectWriteToTxnTable)
         ReplicationCoordinator::get(_opCtx.get()),
         getConsistencyMarkers(),
         getStorageInterface(),
-        applyOplogGroup,
         repl::OplogApplier::Options(repl::OplogApplication::Mode::kSecondary),
         writerPool.get());
 
 
-    ASSERT_OK(oplogApplier.multiApply(_opCtx.get(), {insertOp, deleteOp}));
+    ASSERT_OK(oplogApplier.applyOplogBatch(_opCtx.get(), {insertOp, deleteOp}));
 
     ASSERT_FALSE(docExists(
         _opCtx.get(),
@@ -2574,11 +2537,10 @@ TEST_F(OplogApplierImplTxnTableTest, InterleavedWriteWithTxnMixedWithDirectDelet
         ReplicationCoordinator::get(_opCtx.get()),
         getConsistencyMarkers(),
         getStorageInterface(),
-        applyOplogGroup,
         repl::OplogApplier::Options(repl::OplogApplication::Mode::kSecondary),
         writerPool.get());
 
-    ASSERT_OK(oplogApplier.multiApply(_opCtx.get(), {insertOp, deleteOp, insertOp2}));
+    ASSERT_OK(oplogApplier.applyOplogBatch(_opCtx.get(), {insertOp, deleteOp, insertOp2}));
 
     checkTxnTable(sessionInfo, {Timestamp(3, 0), 2}, date);
 }
@@ -2616,11 +2578,10 @@ TEST_F(OplogApplierImplTxnTableTest, InterleavedWriteWithTxnMixedWithDirectUpdat
         ReplicationCoordinator::get(_opCtx.get()),
         getConsistencyMarkers(),
         getStorageInterface(),
-        applyOplogGroup,
         repl::OplogApplier::Options(repl::OplogApplication::Mode::kSecondary),
         writerPool.get());
 
-    ASSERT_OK(oplogApplier.multiApply(_opCtx.get(), {insertOp, updateOp}));
+    ASSERT_OK(oplogApplier.applyOplogBatch(_opCtx.get(), {insertOp, updateOp}));
 
     checkTxnTable(sessionInfo, newWriteOpTime, date);
 }
@@ -2681,11 +2642,11 @@ TEST_F(OplogApplierImplTxnTableTest, RetryableWriteThenMultiStatementTxnWriteOnS
         ReplicationCoordinator::get(_opCtx.get()),
         getConsistencyMarkers(),
         getStorageInterface(),
-        applyOplogGroup,
         repl::OplogApplier::Options(repl::OplogApplication::Mode::kSecondary),
         writerPool.get());
 
-    ASSERT_OK(oplogApplier.multiApply(_opCtx.get(), {retryableInsertOp, txnInsertOp, txnCommitOp}));
+    ASSERT_OK(
+        oplogApplier.applyOplogBatch(_opCtx.get(), {retryableInsertOp, txnInsertOp, txnCommitOp}));
 
     repl::checkTxnTable(_opCtx.get(),
                         *sessionInfo.getSessionId(),
@@ -2751,11 +2712,11 @@ TEST_F(OplogApplierImplTxnTableTest, MultiStatementTxnWriteThenRetryableWriteOnS
         ReplicationCoordinator::get(_opCtx.get()),
         getConsistencyMarkers(),
         getStorageInterface(),
-        applyOplogGroup,
         repl::OplogApplier::Options(repl::OplogApplication::Mode::kSecondary),
         writerPool.get());
 
-    ASSERT_OK(oplogApplier.multiApply(_opCtx.get(), {txnInsertOp, txnCommitOp, retryableInsertOp}));
+    ASSERT_OK(
+        oplogApplier.applyOplogBatch(_opCtx.get(), {txnInsertOp, txnCommitOp, retryableInsertOp}));
 
     repl::checkTxnTable(_opCtx.get(),
                         *sessionInfo.getSessionId(),
@@ -2824,11 +2785,10 @@ TEST_F(OplogApplierImplTxnTableTest, MultiApplyUpdatesTheTransactionTable) {
         ReplicationCoordinator::get(_opCtx.get()),
         getConsistencyMarkers(),
         getStorageInterface(),
-        applyOplogGroup,
         repl::OplogApplier::Options(repl::OplogApplication::Mode::kSecondary),
         writerPool.get());
 
-    ASSERT_OK(oplogApplier.multiApply(
+    ASSERT_OK(oplogApplier.applyOplogBatch(
         _opCtx.get(),
         {opSingle, opDiffTxnSmaller, opDiffTxnLarger, opSameTxnSooner, opSameTxnLater, opNoTxn}));
 
@@ -2908,11 +2868,10 @@ TEST_F(OplogApplierImplTxnTableTest, SessionMigrationNoOpEntriesShouldUpdateTxnT
         ReplicationCoordinator::get(_opCtx.get()),
         getConsistencyMarkers(),
         getStorageInterface(),
-        applyOplogGroup,
         repl::OplogApplier::Options(repl::OplogApplication::Mode::kSecondary),
         writerPool.get());
 
-    ASSERT_OK(oplogApplier.multiApply(_opCtx.get(), {insertOplog}));
+    ASSERT_OK(oplogApplier.applyOplogBatch(_opCtx.get(), {insertOplog}));
 
     checkTxnTable(insertSessionInfo, {Timestamp(40, 0), 1}, outerInsertDate);
 }
@@ -2941,11 +2900,10 @@ TEST_F(OplogApplierImplTxnTableTest, PreImageNoOpEntriesShouldNotUpdateTxnTable)
         ReplicationCoordinator::get(_opCtx.get()),
         getConsistencyMarkers(),
         getStorageInterface(),
-        applyOplogGroup,
         repl::OplogApplier::Options(repl::OplogApplication::Mode::kSecondary),
         writerPool.get());
 
-    ASSERT_OK(oplogApplier.multiApply(_opCtx.get(), {preImageOplog}));
+    ASSERT_OK(oplogApplier.applyOplogBatch(_opCtx.get(), {preImageOplog}));
 
     ASSERT_FALSE(docExists(_opCtx.get(),
                            NamespaceString::kSessionTransactionsTableNamespace,
@@ -2976,11 +2934,10 @@ TEST_F(OplogApplierImplTxnTableTest, NonMigrateNoOpEntriesShouldNotUpdateTxnTabl
         ReplicationCoordinator::get(_opCtx.get()),
         getConsistencyMarkers(),
         getStorageInterface(),
-        applyOplogGroup,
         repl::OplogApplier::Options(repl::OplogApplication::Mode::kSecondary),
         writerPool.get());
 
-    ASSERT_OK(oplogApplier.multiApply(_opCtx.get(), {oplog}));
+    ASSERT_OK(oplogApplier.applyOplogBatch(_opCtx.get(), {oplog}));
 
     ASSERT_FALSE(docExists(
         _opCtx.get(),

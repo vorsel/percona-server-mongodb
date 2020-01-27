@@ -273,10 +273,6 @@ DocumentSourceMergeSpec parseMergeSpecAndResolveTargetNamespace(const BSONElemen
         }
     }
 
-    uassert(ErrorCodes::InvalidNamespace,
-            "Invalid {} target namespace: '{}'"_format(kStageName, targetNss.ns()),
-            targetNss.isValid());
-
     mergeSpec.setTargetNss(std::move(targetNss));
 
     return mergeSpec;
@@ -293,6 +289,11 @@ std::unique_ptr<DocumentSourceMerge::LiteParsed> DocumentSourceMerge::LiteParsed
     auto mergeSpec =
         parseMergeSpecAndResolveTargetNamespace(spec, request.getNamespaceString().db());
     auto targetNss = mergeSpec.getTargetNss();
+
+    uassert(ErrorCodes::InvalidNamespace,
+            "Invalid {} target namespace: '{}'"_format(kStageName, targetNss.ns()),
+            targetNss.isValid());
+
     auto whenMatched =
         mergeSpec.getWhenMatched() ? mergeSpec.getWhenMatched()->mode : kDefaultWhenMatched;
     auto whenNotMatched = mergeSpec.getWhenNotMatched().value_or(kDefaultWhenNotMatched);
@@ -363,6 +364,10 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceMerge::create(
             "the aggregation collection"_format(kStageName),
             expCtx->ns != outputNs);
 
+    uassert(ErrorCodes::InvalidNamespace,
+            "Invalid {} target namespace: '{}'"_format(kStageName, outputNs.ns()),
+            outputNs.isValid());
+
     uassert(ErrorCodes::OperationNotSupportedInTransaction,
             "{} cannot be used in a transaction"_format(kStageName),
             !expCtx->inMultiDocumentTransaction);
@@ -371,6 +376,14 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceMerge::create(
     uassert(ErrorCodes::InvalidOptions,
             "{} cannot be used with a 'linearizable' read concern level"_format(kStageName),
             readConcernLevel != repl::ReadConcernLevel::kLinearizableReadConcern);
+
+    uassert(31319,
+            "Cannot {} to special collection: {}"_format(kStageName, outputNs.coll()),
+            !outputNs.isSystem());
+
+    uassert(31320,
+            "Cannot {} to internal database: {}"_format(kStageName, outputNs.db()),
+            !outputNs.isOnInternalDb());
 
     if (whenMatched == WhenMatched::kPipeline) {
         if (!letVariables) {

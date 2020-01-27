@@ -472,33 +472,59 @@ extended to support a sharded cluster and use a **Lamport Clock** to provide **c
 
 ## Step Up
 
-A node runs for election when it does a priority takeover or when it doesn't see a primary within
-the election timeout.
+There are a number of ways that a node will run for election:
+* If it hasn't seen a primary within the election timeout (which defaults to 10 seconds).
+* If it realizes that it has higher priority than the primary, it will wait and run for
+  election (also known as a **priority takeover**). The amount of time the node waits before calling
+  an election is directly related to its priority in comparison to the priority of rest of the set
+  (so higher priority nodes will call for a priority takeover faster than lower priority nodes).
+  Priority takeovers allow users to specify a node that they would prefer be the primary.
+* Newly elected primaries attempt to catchup to the latest applied OpTime in the replica
+  set. Until this process (called primary catchup) completes, the new primary will not accept
+  writes. If a secondary realizes that it is more up-to-date than the primary and the primary takes
+  longer than `catchUpTakeoverDelayMillis` (default 30 seconds), it will run for election. This
+  behvarior is known as a **catchup takeover**. If primary catchup is taking too long, catchup
+  takeover can help allow the replica set to accept writes sooner, since a more up-to-date node will
+  not spend as much time (or any time) in catchup. See the "Transitioning to PRIMARY" section for
+  further details on primary catchup.
+* The `replSetStepUp` command can be run on an eligible node to cause it to run for election
+  immediately. We don't expect users to call this command, but it is run internally for election
+  handoff and testing.
+* When a node is stepped down via the `replSetStepDown` command, if the `enableElectionHandoff`
+  parameter is set to true (the default), it will choose an eligible secondary to run the
+  `replSetStepUp` command on a best-effort basis. This behavior is called **election handoff**. This
+  will mean that the replica set can shorten failover time, since it skips waiting for the election
+  timeout. If `replSetStepDown` was called with `force: true` or the node was stepped down while
+  `enableElectionHandoff` is false, then nodes in the replica set will wait until the election
+  timeout triggers to run for election.
 
-#### Candidate Perspective
 
-A candidate node first runs a dry-run election. In a **dry-run election**, a node sends out
-`replSetRequestVotes` commands to every node asking if that node would vote for it, but the
-candidate node does not increase its term. If a primary ever sees a higher term than its own, it
-steps down. By first conducting a dry-run election, we prevent nodes from increasing their own term
-when they would not win and prevent needless primary stepdowns. If the node fails the dry-run
-election, it just continues replicating as normal. If the node wins the dry-run election, it begins
-a real election.
+### Candidate Perspective
 
-In the real election, the node first increments its term and votes for itself. It then starts a
-[`VoteRequester`](https://github.com/mongodb/mongo/blob/r3.4.2/src/mongo/db/repl/vote_requester.h),
+A candidate node first runs a dry-run election. In a **dry-run election**, a node starts a
+[`VoteRequester`](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/db/repl/vote_requester.h),
 which uses a
-[`ScatterGatherRunner`](https://github.com/mongodb/mongo/blob/r3.4.2/src/mongo/db/repl/scatter_gather_runner.h)
-to send a `replSetRequestVotes` command to every single node. Each node then decides if it should
-vote "aye" or "nay" and responds to the candidate with their vote. When nodes respond, the
-`ReplicationCoordinator` updates its `SlaveInfo` map to say that those nodes are still up for
-liveness information. The candidate node must be at least as up to date as a majority of voting
+[`ScatterGatherRunner`](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/db/repl/scatter_gather_runner.h)
+to send a `replSetRequestVotes` command to every node asking if that node would vote for it. The
+candidate node does not increase its term during a dry-run because if a primary ever sees a higher
+term than its own, it steps down. By first conducting a dry-run election, we make it unlikely that
+nodes will increase their own term when they would not win and prevent needless primary stepdowns.
+If the node fails the dry-run election, it just continues replicating as normal. If the node wins
+the dry-run election, it begins a real election.
+
+If the candidate was stepped up as a result of an election handoff, it will skip the dry-run and
+immediately call for a real election.
+
+In the real election, the node first increments its term and votes for itself. It then follows the
+same process as the dry-run to start a `VoteRequester` to send a `replSetRequestVotes` command to
+every single node. Each node then decides if it should vote "aye" or "nay" and responds to the
+candidate with their vote. The candidate node must be at least as up to date as a majority of voting
 members in order to get elected.
 
 If the candidate received votes from a majority of nodes, including itself, the candidate wins the
 election.
 
-#### Voter Perspective
+### Voter Perspective
 
 When a node receives a `replSetRequestVotes` command, it first checks if the term is up to date and
 updates its own term accordingly. The `ReplicationCoordinator` then asks the `TopologyCoordinator`
@@ -507,7 +533,7 @@ if it should grant a vote. The vote is rejected if:
 1. It's from an older term.
 2. The config versions do not match.
 3. The replica set name does not match.
-4. The last committed OpTime that comes in the vote request is older than the voter's last applied
+4. The last applied OpTime that comes in the vote request is older than the voter's last applied
    OpTime.
 5. If it's not a dry-run election and the voter has already voted in this term.
 6. If the voter is an arbiter and it can see a healthy primary of greater or equal priority. This is
@@ -519,32 +545,40 @@ the `local.replset.election` collection. This information is read into memory at
 future elections. This ensures that even if a node restarts, it does not vote for two nodes in the
 same term.
 
-#### Transitioning to PRIMARY
+### Transitioning to PRIMARY
 
-Now that the candidate has won, it must become PRIMARY. First it notifies all nodes that it won the
-election via a round of heartbeats. Then the node checks if it needs to catch up from the former
-primary. Since the node can be elected without the former primary's vote, the primary-elect will
-attempt to replicate any remaining oplog entries it has not yet replicated from any viable sync
-source. While these are guaranteed to not be committed, it is still good to minimize rollback when
-possible.
+Now that the candidate has won, it must become PRIMARY. First it clears its sync source and notifies
+all nodes that it won the election via a round of heartbeats. Then the node checks if it needs to
+catch up from the former primary. Since the node can be elected without the former primary's vote,
+the primary-elect will attempt to replicate any remaining oplog entries it has not yet replicated
+from any viable sync source. While these are guaranteed to not be committed, it is still good to
+minimize rollback when possible.
 
-The primary-elect uses the
-[`FreshnessScanner`](https://github.com/mongodb/mongo/blob/r3.4.2/src/mongo/db/repl/freshness_scanner.h)
-to send a `replSetGetStatus` request to every other node to see the last applied OpTime of every
-other node. If the primary-elect’s last applied OpTime is less than the newest last applied OpTime
-it sees, it will schedule a timer for the catchup-timeout. If that timeout expires or if the node
-reaches the old primary's last applied OpTime, then the node ends catch-up phase. The node then
-stops the `OplogFetcher`.
+The primary-elect uses the responses from the recent round of heartbeats to see the latest applied
+OpTime of every other node. If the primary-elect’s last applied OpTime is less than the newest last
+applied OpTime it sees, it will set that as its target OpTime to catch up to. At the beginning of
+catchup, the primary-elect will schedule a timer for the catchup-timeout. If that timeout expires or
+if the node reaches the target OpTime, then the node ends the catch-up phase. The node then clears
+its sync source and stops the `OplogFetcher`.
 
-At this point the node goes into "drain mode". This is when the node has already logged "transition
-to PRIMARY", but has not yet applied all of the oplog entries in its oplog buffer.
-`replSetGetStatus` will now say the node is in PRIMARY state. The applier keeps running, and when it
-completely drains the buffer, it signals to the `ReplicationCoordinator` to finish the step up
-process. The node marks that it can begin to accept writes. According to the Raft Protocol, no oplog
-entries from previous terms can be committed until an oplog entry in the current term is committed.
-The node now writes a "new primary" noop oplog entry so that it can commit older writes as soon as
-possible. Finally, the node drops all temporary collections and logs “transition to primary
-complete”.
+We will ignore whether or not **chaining** is enabled for primary catchup so that the primary-elect
+can find a sync source. And one thing to note is that the primary-elect will not necessarily sync
+from the most up-to-date node, but its sync source will sync from a more up-to-date node. This will
+mean that the primary-elect will still be able to catchup to its target OpTime. Since catchup is
+best-effort, it could time out before the node has applied operations through the target OpTime.
+Even if this happens, the primary-elect will not step down.
+
+At this point, whether catchup was successful or not, the node goes into "drain mode". This is when
+the node has already logged "transition to PRIMARY", but has not yet applied all of the oplog
+entries in its oplog buffer. `replSetGetStatus` will now say the node is in PRIMARY state. The
+applier keeps running, and when it completely drains the buffer, it signals to the
+`ReplicationCoordinator` to finish the step up process. The node marks that it can begin to accept
+writes. According to the Raft Protocol, we cannot update the commit point to reflect oplog entries
+from previous terms until the commit point is updated to reflect an oplog entry in the current term.
+The node writes a "new primary" noop oplog entry so that it can commit older writes as soon as
+possible. Once the commit point is updated to reflect the "new primary" oplog entry, older writes
+will automatically be part of the commit point by nature of happening before the term change.
+Finally, the node drops all temporary collections and logs “transition to primary complete”.
 
 ## Step Down
 
@@ -565,91 +599,161 @@ Once the node begins to step down, it first sets its state to `follower` in the
 
 # Rollback
 
-Rollback is the process whereby a node that diverges from its sync source undoes the divergent
-operations and gets back to a consistent point.
+Rollback is the process whereby a node that diverges from its sync source gets back to a consistent
+point in time on the sync source's branch of history. We currently support two rollback algorithms,
+Recover To A Timestamp (RTT) and Rollback via Refetch. This section will cover the RTT method.
 
-This can occur if there is a partition in the network for some time and a node runs for election
-because it doesn't hear from the primary. There will be some time with 2 primaries and in this time
-both can take writes. When the partition is healed, the smaller half of the partition may have to
-roll back its changes and roll forward to match the other one.
+Situations that require rollback can occur due to network partitions. Consider a scenario where a
+secondary can no longer hear from the primary and subsequently runs for an election. We now have
+two primaries that can both accept writes, creating two different branches of history (one of the
+primaries will detect this situation soon and step down). If the smaller half, meaning less than a
+majority of the set, accepts writes during this time, those writes will be uncommitted. A node with
+uncommitted writes will roll back its changes and roll forward to match its sync source. Note that a
+rollback is not necessary if there are no uncommitted writes.
 
-Nodes go into rollback if after they receive the first batch of writes from their sync source, they
-realize that the greater than or equal to predicate did not return the last op in their oplog. When
-rolling back, nodes are in the `ROLLBACK` state and reads are prohibited. When a node goes into
-rollback it drops all snapshots.
+As of 4.0, Replication supports the [`Recover To A Timestamp`](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/db/repl/rollback_impl.h#L158)
+algorithm (RTT), in which a node recovers to a consistent point in time and applies operations until
+it catches up to the sync source's branch of history. RTT uses the WiredTiger storage engine to
+recover to a stable timestamp, which is the highest timestamp at which the storage engine can take
+a checkpoint. This can be considered a consistent, majority committed point in time for replication
+and storage.
 
-The rolling-back node first finds the common point between its oplog and its sync source's oplog. It
-then goes through all of the operations in its oplog back to the common point and figures out how to
-undo them.
+A node goes into rollback when its last fetched OpTime is greater than its sync source's last
+applied OpTime, but it is in a lower term. In this case, the `OplogFetcher` will return an empty
+batch and fail with an `OplogStartMissing` error.
 
-Simply doing the "inverse" operation is sometimes impossible, such as a document remove where we do
-not log the entire document that is removed. Instead, the node simply refetches the problematic
-documents, or entire collections in the case of undoing a `drop`, from the sync source and replaces
-the local version with that version. Some operations also have special handling, and some just fail,
-such as `dropDatabase`, causing the entire node to shut down.
+During [rollback](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/db/repl/rollback_impl.cpp#L176),
+nodes first transition to the `ROLLBACK` state and kill all user operations to ensure that we can
+successfully acquire the RSTL. (TODO SERVER-43789: link to RSTL section) Reads are prohibited while
+we are in the `ROLLBACK` state.
 
-The node first compiles a list of documents, collections, and indexes to fetch and drop. Before
-actually doing the undo steps, the node "fixes up" the operations by "cancelling out" operations
-that negate each other to reduce work. The node then drops and fetches all data it needs and
-replaces the local version with the remote versions.
+We then wait for background index builds to complete before finding the `common point` between the
+rolling back node and the sync source node. The `common point` is the OpTime after which the nodes'
+oplogs start to differ. During this step, we keep track of the operations that are rolled back up
+until the `common point` and update necessary data structures. This includes metadata that we may
+write out to rollback files and and use to roll back collection fast-counts. Then, we increment
+the Rollback ID (RBID), a monotonically increasing number that is incremented every time a rollback
+occurs. We can use the RBID to check if a rollback has occurred on our sync source since the
+baseline RBID was set.
 
-The node gets the last applied OpTime from the sync source and the Rollback ID to check if a
-rollback has happened during this rollback, in which case it fails rollback and shuts down. The last
-applied OpTime is set as the `minValid` for the node and the node goes into RECOVERING state. The
-node resumes fetching and applying operations like a normal secondary until it hits that `minValid`.
-Only at that point does the node go into SECONDARY state.
+Now, we enter the data modification section of the rollback algorithm, which begins with
+aborting prepared transactions and ends with reconstructing them at the end. If we fail at any point
+during this phase, we must terminate the rollback attempt because we cannot safely recover.
 
-This process is very similar to initial sync and startup after an unclean shutdown in that
-operations are applied on data that may already reflect those operations and operations in the
-future. This leads to all of the same idempotency concerns and index constraint relaxation.
+Before we actually recover to the `stableTimestamp`, we must abort the storage transaction of any
+prepared transaction. In doing so, we release any resources held by those transactions and
+invalidate any in-memory state we recorded.
 
-This code is about to change radically in version 3.6.
+If `createRollbackDataFiles` was set to `true` (the default), we begin writing rollback files for
+our rolled back documents. It is important that we do this after we abort any prepared transactions
+in order to avoid unnecessary prepare conflicts when trying to read documents that were modified by
+those transactions, which must be aborted for rollback anyway. Finally, if we have rolled back any
+operations, we invalidate all sessions on this server.
+
+Now, we are ready to tell the storage engine to recover to the last stable timestamp. Upon success,
+the storage engine restores the data reflected in the database to the data reflected at the last
+stable timestamp. This does not, however, revert the oplog. In order to revert the oplog, rollback
+must remove all oplog entries after the `common point`. This is called the truncate point and is
+written into the `oplogTruncateAfterPoint` document. Now, the recovery process knows where to
+truncate the oplog on the rollback node.
+
+During the last few steps of the data modification section, we clear the state of the
+`DropPendingCollectionReaper`, which manages collections that are marked as drop-pending by the Two
+Phase Drop algorithm, and make sure it aligns with what is currently on disk. After doing so, we can
+run through the oplog recovery process, which truncates the oplog after the `common point` (at the
+truncate point) and applies all oplog entries through the end of the sync source's oplog.
+
+The last thing we do before exiting the data modification section is reconstruct prepared
+transactions. (TODO SERVER-43783: add link to prepared transactions recovery process). We must also
+restore their in-memory state to what it was prior to the rollback in order to fulfill the
+durability guarantees of prepared transactions.
+
+At this point, the last applied and durable OpTimes still point to the divergent branch of history,
+so we must update them to be at the top of the oplog, which should be the `common point`.
+
+Now, we can trigger the rollback `OpObserver` and notify any external subsystems that a rollback has
+occurred. For example, the config server must update its shard registry in order to make sure it
+does not have data that has just been rolled back. Finally, we log a summary of the rollback process
+and transition to the `SECONDARY` state. This transition must succeed if we ever entered the
+`ROLLBACK` state in the first place. Otherwise, we shut down.
 
 # Initial Sync
 
 Initial sync is the process that we use to add a new node to a replica set. Initial sync is
 initiated by the `ReplicationCoordinator` and done in the
-[**`DataReplicator`**](https://github.com/mongodb/mongo/blob/r3.4.2/src/mongo/db/repl/data_replicator.h).
-When a node begins initial sync or `resync` is called, it goes into `STARTUP2` state. `STARTUP` is
-reserved for the time before initial sync when a node may need to recover from unclean shutdown.
+[**`InitialSyncer`**](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/db/repl/initial_syncer.h).
+When a node begins initial sync, it goes into the `STARTUP2` state. `STARTUP` is reserved for the
+time before the node has loaded its local configuration of the replica set.
 
-The `DataReplicator` first gets a sync source. Second, the node drops all of its data except for the
-local database and recreates the oplog. It then gets the Rollback ID from the sync source to ensure
-at the end that no rollbacks occurred during initial sync. Finally, it creates an `OplogFetcher` and
-starts fetching and buffering oplog entries from the sync source to be applied later. Operations are
-buffered to a collection so that they are not limited by the amount of memory available.
+At a high level, there are two phases to initial sync: the data clone phase and the oplog
+application phase. During the data clone phase, the node will copy all of another node's data. After
+that phase is completed, it will start the oplog application phase where it will apply all the oplog
+entries that were written since it started copying data. Finally, it will reconstruct any
+transactions in the prepared state.
+
+Before the data clone phase begins, the node will do the following:
+
+1. Set the initial sync flag to record that initial sync is in progress and make it durable. If a
+   node restarts while this flag is set, it will restart initial sync even though it may already
+   have data because it means that initial sync didn't complete. We also check this flag to prevent
+   reading from the oplog while initial sync is in progress.
+2. Find a sync source.
+3. Drop all of its data except for the local database and recreate the oplog.
+4. Get the Rollback ID (RBID) from the sync source to ensure at the end that no rollbacks occurred
+   during initial sync.
+5. Query its sync source's transactions table for the oldest starting OpTime of all active
+   transactions. This will be the `beginFetchingTimestamp` or the timestamp that it begins fetching
+   oplog entries from, so that the node will have the oplog entries for all active transactions in
+   its oplog.
+6. Query its sync source's oplog for its lastest OpTime. This will be the `beginApplyingTimestamp`,
+   or the timestamp that it begins applying oplog entries at once it has completed the data clone
+   phase. If there was no active transaction on the sync source, the `beginFetchingTimestamp` will
+   be the same as the `beginApplyingTimestamp`.
+7. Create an `OplogFetcher` and start fetching and buffering oplog entries from the sync source
+   to be applied later. Operations are buffered to a collection so that they are not limited by the
+   amount of memory available.
 
 #### Data clone phase
 
-The new node then begins to clone data from its sync source. The `DataReplicator` constructs a
-[`DatabasesCloner`](https://github.com/mongodb/mongo/blob/r3.4.2/src/mongo/db/repl/databases_cloner.h)
+The new node then begins to clone data from its sync source. The `InitialSyncer` constructs a
+[`DatabasesCloner`](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/db/repl/databases_cloner.h)
 that's used to clone all of the databases on the upstream node. The `DatabasesCloner` asks the sync
 source for a list of its databases and then for each one it creates a
-[`DatabaseCloner`](https://github.com/mongodb/mongo/blob/r3.4.2/src/mongo/db/repl/database_cloner.h)
+[`DatabaseCloner`](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/db/repl/database_cloner.h)
 to clone that database. Each `DatabaseCloner` asks the sync source for a list of its collections and
-then creates a
-[`CollectionCloner`](https://github.com/mongodb/mongo/blob/r3.4.2/src/mongo/db/repl/collection_cloner.h)
+for each one creates a
+[`CollectionCloner`](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/db/repl/collection_cloner.h)
 to clone that collection. The `CollectionCloner` calls `listIndexes` on the sync source and creates
 a
-[`CollectionBulkLoader`](https://github.com/mongodb/mongo/blob/r3.4.2/src/mongo/db/repl/collection_bulk_loader.h)
-to create all of the indexes in parallel with the data cloning. The `CollectionCloner` then just
-runs `find` and `getMore` requests on the sync source repeatedly, inserting the fetched documents
-each time, until it fetches all of the documents.
+[`CollectionBulkLoader`](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/db/repl/collection_bulk_loader.h)
+to create all of the indexes in parallel with the data cloning. The `CollectionCloner` then uses an
+**exhaust cursor** to run a `find` request on the sync source for each collection, inserting the
+fetched documents each time, until it fetches all of the documents. Instead of explicitly needing to
+run a `getMore` on an open cursor to get the next batch, exhaust cursors make it so that if the
+`find` does not exhaust the cursor, the sync source will keep sending batches until there are none
+left.
 
 #### Oplog application phase
 
 After the cloning phase of initial sync has finished, the oplog application phase begins. The new
-node first asks its sync source for its last applied OpTime and this is saved as `minValid`, the
-oplog entry it must apply before it's consistent and can become a secondary.
+node first asks its sync source for its last applied OpTime and this is saved as the
+`stopTimestamp`, the oplog entry it must apply before it's consistent and can become a secondary. If
+the `beginFetchingTimestamp` is the same as the `stopTimestamp`, then it indicates that there are no
+oplog entries that need to be written to the oplog and no operations that need to be applied. In
+this case, the node will seed its oplog with the last oplog entry applied on its sync source and
+finish initial sync.
 
-The new node iterates through all of the buffered operations and applies them to the data on disk.
+Otherwise, the new node iterates through all of the buffered operations, writes them to the oplog,
+and if their timestamp is after the `beginApplyingTimestamp`, applies them to the data on disk.
 Oplog entries continue to be fetched and added to the buffer while this is occurring.
 
-If an error occurs on application of an entry, it retries the operation by fetching the entire
-document from the source and just replacing the local document with that one. The last applied
-OpTime is again fetched from the sync source and `minValid` is pushed back to this new OpTime. This
-can occur if a document that needs to be updated was deleted before it was cloned, so the `update`
-op refers to a document that does not exist on the initial syncing node.
+One notable exception is that the node will not apply "prepareTransaction" oplog entries. Similar
+to how we reconstruct prepared transactions in startup and rollback recovery, we will update the
+transactions table every time we see a "prepareTransaction" oplog entry. Because the nodes wrote
+all oplog entries starting at the `beginFetchingTimestamp` into the oplog, the node will have all
+the oplog entries it needs to reconstruct the state for all prepared transactions after the oplog
+application phase is done.
+<!-- TODO SERVER-43783: Link to process for reconstructing prepared transactions -->
 
 #### Idempotency concerns
 
@@ -668,11 +772,51 @@ following:
 
 As seen here, there can be operations on collections that have since been dropped or indexes could
 conflict with the data being added. As a result, many errors that occur here are ignored and assumed
-to resolve themselves. If known problematic operations such as `renameCollection` are received,
-where we cannot assume a drop will come and fix them, we abort and retry initial sync.
+to resolve themselves, such as `DuplicateKey` errors (like in the example above). If known
+problematic operations such as `renameCollection` are received, where we cannot assume a drop will
+come and fix them, we abort and retry initial sync.
 
 #### Finishing initial sync
 
-The oplog application phase concludes when the node applies `minValid`. The node checks its sync
-source's Rollback ID to see if a rollback occurred and if so, restarts initial sync. Otherwise, the
-`DataReplicator` shuts down and the `ReplicationCoordinator` starts steady state replication.
+The oplog application phase concludes when the node applies an oplog entry at `stopTimestamp`. The
+node checks its sync source's Rollback ID to see if a rollback occurred and if so, restarts initial
+sync. Otherwise, the `InitialSyncer` will begin tear down.
+
+It will register the node's `lastApplied` OpTime with the storage engine to make sure that all oplog
+entries prior to that will be visible when querying the oplog. After that it will reconstruct all
+prepared transactions. The node will then clear the initial sync flag and tell the storage engine
+that the `initialDataTimestamp` is the node's last applied OpTime. Finally, the `InitialSyncer`
+shuts down and the `ReplicationCoordinator` starts steady state replication.
+
+# Dropping Collections and Databases
+
+In 3.6, the Two Phase Drop Algorithm was added in the replication layer for supporting collection
+and database drops. It made it easy to support rollbacks for drop operations. In 4.2, the
+implementation for collection drops was moved to the storage engine. This section will cover the
+behavior for the implementation in the replication layer, which currently runs on nodes where
+<!-- TODO SERVER-43788: Link to the section describing enableMajorityReadConcern=false -->
+`enableMajorityReadConcern` is set to false.
+
+## Dropping Collections
+
+Dropping an unreplicated collection happens immediately. However, the process for dropping a
+replicated collection requires two phases.
+
+In the first phase, if the node is the primary, it will write a "dropCollection" oplog entry. The
+collection will be flagged as dropped by being added to a list in the `DropPendingCollectionReaper`
+(along with its OpTime), but the storage engine won't delete the collection data yet. Every time the
+`ReplicationCoordinator` advances the commit point, the node will check to see if any drop's OpTime
+is before or at the majority commit point. If any are, those drops will then move to phase 2 and
+the `DropPendingCollectionReaper` will tell the storage engine to drop the collection.
+
+By waiting until the "dropCollection" oplog entry is majority committed to drop the collection, it
+guarantees that only drops in phase 1 can be rolled back. This means that the storage engine will
+still have the collection's data and in the case of a rollback, it can then easily restore the
+collection.
+
+## Dropping Databases
+
+When a node receives a `dropDatabase` command, it will initiate a Two Phase Drop as described above
+for each collection in the relevant database. Once all collection drops are replicated to a majority
+of nodes, the node will drop the now empty database and a `dropDatabase` command oplog entry is
+written to the oplog.

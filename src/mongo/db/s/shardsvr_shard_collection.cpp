@@ -62,6 +62,7 @@
 #include "mongo/s/request_types/clone_collection_options_from_primary_shard_gen.h"
 #include "mongo/s/request_types/shard_collection_gen.h"
 #include "mongo/s/shard_util.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
@@ -69,6 +70,8 @@
 namespace mongo {
 
 namespace {
+
+MONGO_FAIL_POINT_DEFINE(pauseShardCollectionBeforeReturning);
 
 struct ShardCollectionTargetState {
     UUID uuid;
@@ -584,16 +587,19 @@ void createCollectionOnShardsReceivingChunks(OperationContext* opCtx,
         // If any shards fail to create the collection, fail the entire shardCollection command
         // (potentially leaving incomplely created sharded collection)
         for (const auto& response : responses) {
-            auto shardResponse = uassertStatusOKWithContext(
-                std::move(response.swResponse),
-                str::stream() << "Unable to create collection on " << response.shardId);
+            auto shardResponse =
+                uassertStatusOKWithContext(std::move(response.swResponse),
+                                           str::stream() << "Unable to create collection "
+                                                         << nss.ns() << " on " << response.shardId);
             auto status = getStatusFromCommandResult(shardResponse.data);
-            uassertStatusOK(status.withContext(str::stream() << "Unable to create collection on "
-                                                             << response.shardId));
+            uassertStatusOK(status.withContext(str::stream()
+                                               << "Unable to create collection " << nss.ns()
+                                               << " on " << response.shardId));
 
             auto wcStatus = getWriteConcernStatusFromCommandResult(shardResponse.data);
-            uassertStatusOK(wcStatus.withContext(str::stream() << "Unable to create collection on "
-                                                               << response.shardId));
+            uassertStatusOK(wcStatus.withContext(str::stream()
+                                                 << "Unable to create collection " << nss.ns()
+                                                 << " on " << response.shardId));
         }
     }
 }
@@ -604,7 +610,12 @@ void writeFirstChunksToConfig(OperationContext* opCtx,
     std::vector<BSONObj> chunkObjs;
     chunkObjs.reserve(initialChunks.chunks.size());
     for (const auto& chunk : initialChunks.chunks) {
-        chunkObjs.push_back(chunk.toConfigBSON());
+        if (serverGlobalParams.featureCompatibility.getVersion() >=
+            ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo44) {
+            chunkObjs.push_back(chunk.toConfigBSON());
+        } else {
+            chunkObjs.push_back(chunk.toConfigBSONLegacyID());
+        }
     }
 
     Grid::get(opCtx)->catalogClient()->insertConfigDocumentsAsRetryableWrite(
@@ -852,6 +863,11 @@ public:
             uassert(ErrorCodes::InvalidUUID,
                     str::stream() << "Collection " << nss << " is sharded without UUID",
                     uuid);
+
+            if (MONGO_unlikely(pauseShardCollectionBeforeReturning.shouldFail())) {
+                log() << "Hit pauseShardCollectionBeforeReturning";
+                pauseShardCollectionBeforeReturning.pauseWhileSet(opCtx);
+            }
 
             scopedShardCollection.emplaceUUID(uuid);
         }

@@ -52,6 +52,7 @@
 #include "mongo/db/curop.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/read_write_concern_defaults.h"
 #include "mongo/rpc/factory.h"
 #include "mongo/rpc/metadata/client_metadata_ismaster.h"
 #include "mongo/rpc/op_msg_rpc_impls.h"
@@ -607,6 +608,7 @@ public:
 
 private:
     void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* result) override {
+        opCtx->lockState()->setDebugInfo(redact(_request->body));
         BSONObjBuilder bob = result->getBodyBuilder();
         bool ok = _command->run(opCtx, _dbName, _request->body, bob);
         if (!ok)
@@ -627,7 +629,7 @@ private:
         return _command->supportsWriteConcern(cmdObj());
     }
 
-    bool supportsReadConcern(repl::ReadConcernLevel level) const override {
+    ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level) const override {
         return _command->supportsReadConcern(_dbName, cmdObj(), level);
     }
 

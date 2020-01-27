@@ -249,6 +249,7 @@ MONGO_INITIALIZER(AuthorizationBuiltinRoles)(InitializerContext* context) {
         << ActionType::setFreeMonitoring;
 
     clusterManagerRoleDatabaseActions
+        << ActionType::clearJumboFlag
         << ActionType::splitChunk
         << ActionType::moveChunk
         << ActionType::enableSharding

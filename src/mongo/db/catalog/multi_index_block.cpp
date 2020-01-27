@@ -42,7 +42,6 @@
 #include "mongo/db/catalog/multi_index_block_gen.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
-#include "mongo/db/index/index_build_interceptor.h"
 #include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/multi_key_path_tracker.h"
 #include "mongo/db/op_observer.h"
@@ -50,6 +49,7 @@
 #include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/write_unit_of_work.h"
 #include "mongo/logger/redaction.h"
@@ -75,7 +75,11 @@ MultiIndexBlock::~MultiIndexBlock() {
     invariant(_buildIsCleanedUp);
 }
 
-void MultiIndexBlock::cleanUpAfterBuild(OperationContext* opCtx, Collection* collection) {
+MultiIndexBlock::OnCleanUpFn MultiIndexBlock::kNoopOnCleanUpFn = []() {};
+
+void MultiIndexBlock::cleanUpAfterBuild(OperationContext* opCtx,
+                                        Collection* collection,
+                                        OnCleanUpFn onCleanUp) {
     if (_collectionUUID) {
         // init() was previously called with a collection pointer, so ensure that the same
         // collection is being provided for clean up and the interface in not being abused.
@@ -140,6 +144,9 @@ void MultiIndexBlock::cleanUpAfterBuild(OperationContext* opCtx, Collection* col
                     log() << "Did not timestamp index abort write.";
                 }
             }
+
+            onCleanUp();
+
             wunit.commit();
             _buildIsCleanedUp = true;
             return;
@@ -668,8 +675,10 @@ Status MultiIndexBlock::dumpInsertsFromBulk(OperationContext* opCtx,
     return Status::OK();
 }
 
-Status MultiIndexBlock::drainBackgroundWrites(OperationContext* opCtx,
-                                              RecoveryUnit::ReadSource readSource) {
+Status MultiIndexBlock::drainBackgroundWrites(
+    OperationContext* opCtx,
+    RecoveryUnit::ReadSource readSource,
+    IndexBuildInterceptor::DrainYieldPolicy drainYieldPolicy) {
     if (State::kAborted == _getState()) {
         return {ErrorCodes::IndexBuildAborted,
                 str::stream() << "Index build aborted: " << _abortReason
@@ -690,7 +699,8 @@ Status MultiIndexBlock::drainBackgroundWrites(OperationContext* opCtx,
         if (!interceptor)
             continue;
 
-        auto status = interceptor->drainWritesIntoIndex(opCtx, _indexes[i].options, readSource);
+        auto status = interceptor->drainWritesIntoIndex(
+            opCtx, _indexes[i].options, readSource, drainYieldPolicy);
         if (!status.isOK()) {
             return status;
         }
@@ -811,6 +821,29 @@ Status MultiIndexBlock::commit(OperationContext* opCtx,
                               _indexes[i].block->getEntry()->descriptor()->getIndexType()));
                 _indexes[i].block->getEntry()->setMultikey(opCtx, *multikeyPaths);
             }
+        }
+
+        if (opCtx->getServiceContext()->getStorageEngine()->supportsCheckpoints()) {
+            // Add the new index ident to a list so that the validate cmd with {background:true}
+            // can ignore the new index until it is regularly checkpoint'ed with the rest of the
+            // storage data.
+            //
+            // Index builds use the bulk loader, which can provoke a checkpoint of just that index.
+            // This makes the checkpoint's PIT view of the collection and indexes inconsistent until
+            // the next storage-wide checkpoint is taken, at which point the list will be reset.
+            //
+            // Note that it is okay if the index commit fails: background validation will never try
+            // to look at the index and the list will be reset by the next periodic storage-wide
+            // checkpoint.
+            //
+            // TODO (SERVER-44012): to remove this workaround.
+            auto checkpointLock =
+                opCtx->getServiceContext()->getStorageEngine()->getCheckpointLock(opCtx);
+            auto indexIdent =
+                opCtx->getServiceContext()->getStorageEngine()->getCatalog()->getIndexIdent(
+                    opCtx, collection->ns(), _indexes[i].block->getIndexName());
+            opCtx->getServiceContext()->getStorageEngine()->addIndividuallyCheckpointedIndexToList(
+                indexIdent);
         }
     }
 

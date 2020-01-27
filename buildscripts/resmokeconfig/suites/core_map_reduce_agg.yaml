@@ -4,14 +4,20 @@ test_kind: js_test
 
 selector:
   roots:
+  - jstests/core/commands_namespace_parsing.js
+  - jstests/core/map_reduce_validation.js
   - jstests/core/mr_index.js
+  - jstests/core/mr_index2.js
   - jstests/core/mr_merge2.js
   - jstests/core/mr_mutable_properties.js
+  - jstests/core/mr_outreduce.js
+  - jstests/core/mr_outreduce2.js
   - jstests/core/mr_sort.js
   - jstests/core/mr_tolerates_js_exception.js
   - jstests/core/mr_undef.js
   - jstests/core/mr4.js
   - jstests/core/mr5.js
+
 executor:
   archive:
     hooks:

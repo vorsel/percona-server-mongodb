@@ -137,20 +137,19 @@ StorageInterface* OplogApplierImplTest::getStorageInterface() const {
     return StorageInterface::get(serviceContext);
 }
 
-// Since applyOplogEntryBatch is being tested outside of its calling function (applyOplogGroup), we
-// recreate the necessary calling context.
-Status OplogApplierImplTest::_applyOplogEntryBatchWrapper(
+// Since applyOplogEntryOrGroupedInserts is being tested outside of its calling function
+// (applyOplogBatchPerWorker), we recreate the necessary calling context.
+Status OplogApplierImplTest::_applyOplogEntryOrGroupedInsertsWrapper(
     OperationContext* opCtx,
-    const OplogEntryBatch& batch,
+    const OplogEntryOrGroupedInserts& batch,
     OplogApplication::Mode oplogApplicationMode) {
     UnreplicatedWritesBlock uwb(opCtx);
     DisableDocumentValidation validationDisabler(opCtx);
-    return applyOplogEntryBatch(opCtx, batch, oplogApplicationMode);
+    return applyOplogEntryOrGroupedInserts(opCtx, batch, oplogApplicationMode);
 }
 
-void OplogApplierImplTest::_testApplyOplogEntryBatchCrudOperation(ErrorCodes::Error expectedError,
-                                                                  const OplogEntry& op,
-                                                                  bool expectedApplyOpCalled) {
+void OplogApplierImplTest::_testApplyOplogEntryOrGroupedInsertsCrudOperation(
+    ErrorCodes::Error expectedError, const OplogEntry& op, bool expectedApplyOpCalled) {
     bool applyOpCalled = false;
 
     auto checkOpCtx = [](OperationContext* opCtx) {
@@ -187,7 +186,8 @@ void OplogApplierImplTest::_testApplyOplogEntryBatchCrudOperation(ErrorCodes::Er
         return Status::OK();
     };
 
-    ASSERT_EQ(_applyOplogEntryBatchWrapper(_opCtx.get(), &op, OplogApplication::Mode::kSecondary),
+    ASSERT_EQ(_applyOplogEntryOrGroupedInsertsWrapper(
+                  _opCtx.get(), &op, OplogApplication::Mode::kSecondary),
               expectedError);
     ASSERT_EQ(applyOpCalled, expectedApplyOpCalled);
 }
@@ -204,22 +204,16 @@ Status OplogApplierImplTest::runOpSteadyState(const OplogEntry& op) {
 }
 
 Status OplogApplierImplTest::runOpsSteadyState(std::vector<OplogEntry> ops) {
-    OplogApplierImpl oplogApplier(
-        nullptr,  // executor
-        nullptr,  // oplogBuffer
-        nullptr,  // observer
-        nullptr,  // replCoord
+    TestApplyOplogGroupApplier oplogApplier(
         getConsistencyMarkers(),
         getStorageInterface(),
-        OplogApplierImpl::ApplyGroupFunc(),
-        repl::OplogApplier::Options(repl::OplogApplication::Mode::kSecondary),
-        nullptr);
+        repl::OplogApplier::Options(repl::OplogApplication::Mode::kSecondary));
     MultiApplier::OperationPtrs opsPtrs;
     for (auto& op : ops) {
         opsPtrs.push_back(&op);
     }
     WorkerMultikeyPathInfo pathInfo;
-    return applyOplogGroup(_opCtx.get(), &opsPtrs, &oplogApplier, &pathInfo);
+    return oplogApplier.applyOplogBatchPerWorker(_opCtx.get(), &opsPtrs, &pathInfo);
 }
 
 Status OplogApplierImplTest::runOpInitialSync(const OplogEntry& op) {
@@ -237,12 +231,11 @@ Status OplogApplierImplTest::runOpsInitialSync(std::vector<OplogEntry> ops) {
         ReplicationCoordinator::get(_opCtx.get()),
         getConsistencyMarkers(),
         storageInterface,
-        applyOplogGroup,
         repl::OplogApplier::Options(repl::OplogApplication::Mode::kInitialSync),
         writerPool.get());
     // Idempotency tests apply the same batch of oplog entries multiple times in a loop, which would
     // result in out-of-order oplog inserts. So we truncate the oplog collection first before
-    // calling multiApply.
+    // calling applyOplogBatch.
     ASSERT_OK(
         storageInterface->truncateCollection(_opCtx.get(), NamespaceString::kRsOplogNamespace));
     // Apply each operation in a batch of one because 'ops' may contain a mix of commands and CRUD
@@ -253,7 +246,7 @@ Status OplogApplierImplTest::runOpsInitialSync(std::vector<OplogEntry> ops) {
     // its own batch and update oplog visibility after each batch to make sure all previously
     // applied entries are visible to subsequent batches.
     for (auto& op : ops) {
-        auto status = oplogApplier.multiApply(_opCtx.get(), {op});
+        auto status = oplogApplier.applyOplogBatch(_opCtx.get(), {op});
         if (!status.isOK()) {
             return status.getStatus();
         }

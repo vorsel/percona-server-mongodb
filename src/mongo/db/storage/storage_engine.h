@@ -69,6 +69,12 @@ public:
     using OldestActiveTransactionTimestampCallback =
         std::function<OldestActiveTransactionTimestampResult(Timestamp stableTimestamp)>;
 
+    struct BackupBlock {
+        std::string filename;
+        std::uint64_t offset;
+        std::uint64_t length;
+    };
+
     /**
      * The interface for creating new instances of storage engines.
      *
@@ -294,7 +300,7 @@ public:
      */
     virtual void endBackup(OperationContext* opCtx) = 0;
 
-    virtual StatusWith<std::vector<std::string>> beginNonBlockingBackup(
+    virtual StatusWith<std::vector<BackupBlock>> beginNonBlockingBackup(
         OperationContext* opCtx) = 0;
 
     virtual void endNonBlockingBackup(OperationContext* opCtx) = 0;
@@ -557,6 +563,12 @@ public:
      * opening several checkpoint cursors to ensure the same checkpoint is targeted.
      */
     virtual std::unique_ptr<CheckpointLock> getCheckpointLock(OperationContext* opCtx) = 0;
+
+    virtual void addIndividuallyCheckpointedIndexToList(const std::string& ident) = 0;
+
+    virtual void clearIndividuallyCheckpointedIndexesList() = 0;
+
+    virtual bool isInIndividuallyCheckpointedIndexesList(const std::string& ident) const = 0;
 };
 
 }  // namespace mongo

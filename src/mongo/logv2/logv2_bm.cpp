@@ -35,7 +35,7 @@
 #include "mongo/logger/message_event_utf8_encoder.h"
 #include "mongo/logv2/component_settings_filter.h"
 #include "mongo/logv2/log.h"
-#include "mongo/logv2/log_domain_impl.h"
+#include "mongo/logv2/log_domain_global.h"
 #include "mongo/logv2/text_formatter.h"
 #include "mongo/platform/basic.h"
 #include "mongo/util/log.h"
@@ -133,7 +133,9 @@ public:
 
 private:
     void setupAppender() {
-        logv2::LogManager::global().detachDefaultBackends();
+        logv2::LogDomainGlobal::ConfigurationOptions config;
+        config.makeDisabled();
+        invariant(logv2::LogManager::global().getGlobalDomainInternal().configure(config).isOK());
 
         auto backend = boost::make_shared<boost::log::sinks::text_ostream_backend>();
         backend->add_stream(makeNullStream());
@@ -141,15 +143,16 @@ private:
 
         _sink = boost::make_shared<
             boost::log::sinks::synchronous_sink<boost::log::sinks::text_ostream_backend>>(backend);
-        _sink->set_filter(logv2::ComponentSettingsFilter(
-            logv2::LogManager::global().getGlobalDomain().settings()));
+        _sink->set_filter(
+            logv2::ComponentSettingsFilter(logv2::LogManager::global().getGlobalDomain(),
+                                           logv2::LogManager::global().getGlobalSettings()));
         _sink->set_formatter(logv2::TextFormatter());
-        logv2::LogManager::global().getGlobalDomain().impl().core()->add_sink(_sink);
+        boost::log::core::get()->add_sink(_sink);
     }
 
     void tearDownAppender() {
-        logv2::LogManager::global().getGlobalDomain().impl().core()->remove_sink(_sink);
-        logv2::LogManager::global().reattachDefaultBackends();
+        boost::log::core::get()->remove_sink(_sink);
+        invariant(logv2::LogManager::global().getGlobalDomainInternal().configure({}).isOK());
     }
 
     boost::shared_ptr<boost::log::sinks::synchronous_sink<boost::log::sinks::text_ostream_backend>>

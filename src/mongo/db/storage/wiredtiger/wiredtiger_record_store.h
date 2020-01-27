@@ -43,8 +43,8 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_size_storer.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/platform/condition_variable.h"
 #include "mongo/platform/mutex.h"
+#include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/fail_point.h"
 
@@ -249,6 +249,8 @@ public:
     bool yieldAndAwaitOplogDeletionRequest(OperationContext* opCtx) override;
 
     void reclaimOplog(OperationContext* opCtx) override;
+
+    StatusWith<Timestamp> getLatestOplogTimestamp(OperationContext* opCtx) const override;
 
     /**
      * The `recoveryTimestamp` is when replication recovery would need to replay from for

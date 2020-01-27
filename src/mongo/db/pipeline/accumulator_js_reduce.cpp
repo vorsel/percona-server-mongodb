@@ -37,7 +37,8 @@
 
 namespace mongo {
 
-REGISTER_ACCUMULATOR(_internalJsReduce, AccumulatorInternalJsReduce::create);
+REGISTER_ACCUMULATOR(_internalJsReduce,
+                     genericParseSingleExpressionAccumulator<AccumulatorInternalJsReduce>);
 
 void AccumulatorInternalJsReduce::processInternal(const Value& input, bool merging) {
     if (input.missing()) {
@@ -99,7 +100,8 @@ Value AccumulatorInternalJsReduce::getValue(bool toBeMerged) {
         }
 
         auto expCtx = getExpressionContext();
-        auto [jsExec, newlyCreated] = expCtx->getJsExecWithScope();
+        auto jsExec = expCtx->getJsExecWithScope();
+
         ScriptingFunction func = jsExec->getScope()->createFunction(_funcSource.c_str());
 
         uassert(31247, "The reduce function failed to parse in the javascript engine", func);
@@ -143,5 +145,4 @@ void AccumulatorInternalJsReduce::reset() {
     _memUsageBytes = sizeof(*this);
     _key = Value{};
 }
-
 }  // namespace mongo

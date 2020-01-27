@@ -44,6 +44,7 @@ let testCases = {
     _configsvrBalancerStart: {skip: "primary only"},
     _configsvrBalancerStatus: {skip: "primary only"},
     _configsvrBalancerStop: {skip: "primary only"},
+    _configsvrClearJumboFlag: {skip: "primary only"},
     _configsvrCommitChunkMerge: {skip: "primary only"},
     _configsvrCommitChunkMigration: {skip: "primary only"},
     _configsvrCommitChunkSplit: {skip: "primary only"},
@@ -94,6 +95,7 @@ let testCases = {
     captrunc: {skip: "primary only"},
     checkShardingIndex: {skip: "primary only"},
     cleanupOrphaned: {skip: "primary only"},
+    clearJumboFlag: {skip: "primary only"},
     clearLog: {skip: "does not return user data"},
     clone: {skip: "primary only"},
     cloneCollectionAsCapped: {skip: "primary only"},
@@ -307,6 +309,7 @@ let testCases = {
     usersInfo: {skip: "primary only"},
     validate: {skip: "does not return user data"},
     waitForOngoingChunkSplits: {skip: "does not return user data"},
+    waitForFailPoint: {skip: "does not return user data"},
     whatsmyuri: {skip: "does not return user data"},
 
     // Percona commands

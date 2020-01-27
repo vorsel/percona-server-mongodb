@@ -112,10 +112,6 @@ public:
     Status checkIfCommitQuorumCanBeSatisfied(
         const CommitQuorumOptions& commitQuorum) const override;
 
-    StatusWith<bool> checkIfCommitQuorumIsSatisfied(
-        const CommitQuorumOptions& commitQuorum,
-        const std::vector<HostAndPort>& commitReadyMembers) const override;
-
     void setMyLastAppliedOpTimeAndWallTime(
         const repl::OpTimeAndWallTime& opTimeAndWallTime) override;
     void setMyLastDurableOpTimeAndWallTime(
@@ -245,8 +241,6 @@ public:
 
     void appendConnectionStats(executor::ConnectionPoolStats* stats) const override;
 
-    size_t getNumUncommittedSnapshots() override;
-
     virtual void createWMajorityWriteAvailabilityDateWaiter(repl::OpTime opTime) override;
 
     Status stepUpIfEligible(bool skipDryRun) override;
@@ -264,6 +258,11 @@ public:
     void attemptToAdvanceStableTimestamp() override;
 
     void finishRecoveryIfEligible(OperationContext* opCtx) override;
+
+    void updateAndLogStateTransitionMetrics(
+        const ReplicationCoordinator::OpsKillingStateTransitionEnum stateTransition,
+        const size_t numOpsKilled,
+        const size_t numOpsRunning) const override;
 
 private:
     // Back pointer to the ServiceContext that has started the instance.

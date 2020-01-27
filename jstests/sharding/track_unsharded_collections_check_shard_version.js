@@ -75,6 +75,7 @@ let testCases = {
     balancerStatus: {skip: "not on a user database"},
     balancerStop: {skip: "not on a user database"},
     buildInfo: {skip: "executes locally on mongos (not sent to any remote node)"},
+    clearJumboFlag: {skip: "does not forward command to primary shard"},
     clearLog: {skip: "executes locally on mongos (not sent to any remote node)"},
     collMod: {
         whenNamespaceDoesNotExistFailsWith: ErrorCodes.NamespaceNotFound,
@@ -335,6 +336,7 @@ let testCases = {
             return {validate: collName};
         },
     },
+    waitForFailPoint: {skip: "executes locally on mongos (not sent to any remote node)"},
     whatsmyuri: {skip: "executes locally on mongos (not sent to any remote node)"},
 };
 

@@ -43,6 +43,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/s/sharding_logging.h"
+#include "mongo/db/server_options.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_chunk.h"
@@ -60,6 +61,15 @@ namespace {
 MONGO_FAIL_POINT_DEFINE(migrationCommitVersionError);
 MONGO_FAIL_POINT_DEFINE(skipExpiringOldChunkHistory);
 
+const WriteConcernOptions kNoWaitWriteConcern(1, WriteConcernOptions::SyncMode::UNSET, Seconds(0));
+
+bool isUpgradingOrDowngradingFCV() {
+    return (serverGlobalParams.featureCompatibility.getVersion() ==
+            ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo44) ||
+        (serverGlobalParams.featureCompatibility.getVersion() ==
+         ServerGlobalParams::FeatureCompatibility::Version::kDowngradingTo42);
+}
+
 /**
  * Append min, max and version information from chunk to the buffer for logChange purposes.
  */
@@ -76,6 +86,8 @@ void appendShortVersion(BufBuilder* out, const ChunkType& chunk) {
 BSONArray buildMergeChunksTransactionUpdates(const std::vector<ChunkType>& chunksToMerge,
                                              const ChunkVersion& mergeVersion,
                                              const boost::optional<Timestamp>& validAfter) {
+    invariant(!isUpgradingOrDowngradingFCV());
+
     BSONArrayBuilder updates;
 
     // Build an update operation to expand the first chunk into the newly merged chunk
@@ -96,10 +108,18 @@ BSONArray buildMergeChunksTransactionUpdates(const std::vector<ChunkType>& chunk
         mergedChunk.setHistory({ChunkHistory(validAfter.get(), mergedChunk.getShard())});
 
         // add the new chunk information as the update object
-        op.append("o", mergedChunk.toConfigBSON());
+        if (serverGlobalParams.featureCompatibility.getVersion() >=
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
+            op.append("o", mergedChunk.toConfigBSON());
 
-        // query object
-        op.append("o2", BSON(ChunkType::name(mergedChunk.getName())));
+            // query object
+            op.append("o2", BSON(ChunkType::name(mergedChunk.getName())));
+        } else {
+            op.append("o", mergedChunk.toConfigBSONLegacyID());
+
+            // query object
+            op.append("o2", BSON(ChunkType::legacyName(mergedChunk.getLegacyName())));
+        }
 
         updates.append(op.obj());
     }
@@ -111,7 +131,12 @@ BSONArray buildMergeChunksTransactionUpdates(const std::vector<ChunkType>& chunk
         op.append("op", "d");
         op.append("ns", ChunkType::ConfigNS.ns());
 
-        op.append("o", BSON(ChunkType::name(chunksToMerge[i].getName())));
+        if (serverGlobalParams.featureCompatibility.getVersion() >=
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
+            op.append("o", BSON(ChunkType::name(chunksToMerge[i].getName())));
+        } else {
+            op.append("o", BSON(ChunkType::legacyName(chunksToMerge[i].getLegacyName())));
+        }
 
         updates.append(op.obj());
     }
@@ -177,6 +202,7 @@ BSONObj makeCommitChunkTransactionCommand(const NamespaceString& nss,
                                           const boost::optional<ChunkType>& controlChunk,
                                           StringData fromShard,
                                           StringData toShard) {
+    invariant(!isUpgradingOrDowngradingFCV());
 
     // Update migratedChunk's version and shard.
     BSONArrayBuilder updates;
@@ -187,7 +213,12 @@ BSONObj makeCommitChunkTransactionCommand(const NamespaceString& nss,
         op.append("ns", ChunkType::ConfigNS.ns());
 
         BSONObjBuilder n(op.subobjStart("o"));
-        n.append(ChunkType::name(), migratedChunk.getName());
+        if (serverGlobalParams.featureCompatibility.getVersion() >=
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
+            n.append(ChunkType::name(), migratedChunk.getName());
+        } else {
+            n.append(ChunkType::legacyName(), ChunkType::genLegacyID(nss, migratedChunk.getMin()));
+        }
         migratedChunk.getVersion().appendLegacyWithField(&n, ChunkType::lastmod());
         n.append(ChunkType::ns(), nss.ns());
         n.append(ChunkType::min(), migratedChunk.getMin());
@@ -197,7 +228,12 @@ BSONObj makeCommitChunkTransactionCommand(const NamespaceString& nss,
         n.done();
 
         BSONObjBuilder q(op.subobjStart("o2"));
-        q.append(ChunkType::name(), migratedChunk.getName());
+        if (serverGlobalParams.featureCompatibility.getVersion() >=
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
+            q.append(ChunkType::name(), migratedChunk.getName());
+        } else {
+            n.append(ChunkType::legacyName(), ChunkType::genLegacyID(nss, migratedChunk.getMin()));
+        }
         q.done();
 
         updates.append(op.obj());
@@ -211,7 +247,12 @@ BSONObj makeCommitChunkTransactionCommand(const NamespaceString& nss,
         op.append("ns", ChunkType::ConfigNS.ns());
 
         BSONObjBuilder n(op.subobjStart("o"));
-        n.append(ChunkType::name(), controlChunk->getName());
+        if (serverGlobalParams.featureCompatibility.getVersion() >=
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
+            n.append(ChunkType::name(), controlChunk->getName());
+        } else {
+            n.append(ChunkType::legacyName(), ChunkType::genLegacyID(nss, controlChunk->getMin()));
+        }
         controlChunk->getVersion().appendLegacyWithField(&n, ChunkType::lastmod());
         n.append(ChunkType::ns(), nss.ns());
         n.append(ChunkType::min(), controlChunk->getMin());
@@ -222,7 +263,12 @@ BSONObj makeCommitChunkTransactionCommand(const NamespaceString& nss,
         n.done();
 
         BSONObjBuilder q(op.subobjStart("o2"));
-        q.append(ChunkType::name(), controlChunk->getName());
+        if (serverGlobalParams.featureCompatibility.getVersion() >=
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
+            q.append(ChunkType::name(), controlChunk->getName());
+        } else {
+            q.append(ChunkType::legacyName(), controlChunk->getLegacyName());
+        }
         q.done();
 
         updates.append(op.obj());
@@ -296,6 +342,14 @@ Status ShardingCatalogManager::commitChunkSplit(OperationContext* opCtx,
     // move chunks on different collections to proceed in parallel
     Lock::ExclusiveLock lk(opCtx->lockState(), _kChunkOpLock);
 
+    // The _id format for chunk documents changed in 4.4, so during an upgrade or downgrade it is
+    // not known which format the chunks are currently in. Splitting a chunk requires knowing the
+    // _id of the chunk being split, so to avoid confusing failures, splitting is disabled.
+    uassert(ErrorCodes::ConflictingOperationInProgress,
+            "Chunks cannot be split while a feature compatibility version upgrade or downgrade is "
+            "in progress",
+            !isUpgradingOrDowngradingFCV());
+
     // Get the max chunk version for this namespace.
     auto swCollVersion = getMaxChunkVersionFromQueryResponse(
         nss,
@@ -364,7 +418,8 @@ Status ShardingCatalogManager::commitChunkSplit(OperationContext* opCtx,
     newChunkBounds.push_back(range.getMax());
 
     auto shouldTakeOriginalChunkID = true;
-    std::string chunkID;
+    OID chunkID;
+    std::string legacyChunkID;
 
     BSONArrayBuilder updates;
 
@@ -404,8 +459,13 @@ Status ShardingCatalogManager::commitChunkSplit(OperationContext* opCtx,
         // First chunk takes ID of the original chunk and all other chunks get new IDs. This occurs
         // because we perform an update operation below (with upsert true). Keeping the original ID
         // ensures we overwrite the old chunk (before the split) without having to perform a delete.
-        chunkID =
-            shouldTakeOriginalChunkID ? origChunk.getValue().getName() : OID::gen().toString();
+        if (serverGlobalParams.featureCompatibility.getVersion() >=
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
+            chunkID = shouldTakeOriginalChunkID ? origChunk.getValue().getName() : OID::gen();
+        } else {
+            legacyChunkID = shouldTakeOriginalChunkID ? origChunk.getValue().getLegacyName()
+                                                      : ChunkType::genLegacyID(nss, startKey);
+        }
         shouldTakeOriginalChunkID = false;
 
         // build an update operation against the chunks collection of the config database
@@ -417,7 +477,12 @@ Status ShardingCatalogManager::commitChunkSplit(OperationContext* opCtx,
 
         // add the modified (new) chunk information as the update object
         BSONObjBuilder n(op.subobjStart("o"));
-        n.append(ChunkType::name(), chunkID);
+        if (serverGlobalParams.featureCompatibility.getVersion() >=
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
+            n.append(ChunkType::name(), chunkID);
+        } else {
+            n.append(ChunkType::legacyName(), legacyChunkID);
+        }
         currentMaxVersion.appendLegacyWithField(&n, ChunkType::lastmod());
         n.append(ChunkType::ns(), nss.ns());
         n.append(ChunkType::min(), startKey);
@@ -430,7 +495,12 @@ Status ShardingCatalogManager::commitChunkSplit(OperationContext* opCtx,
 
         // add the chunk's _id as the query part of the update statement
         BSONObjBuilder q(op.subobjStart("o2"));
-        q.append(ChunkType::name(), chunkID);
+        if (serverGlobalParams.featureCompatibility.getVersion() >=
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
+            q.append(ChunkType::name(), chunkID);
+        } else {
+            q.append(ChunkType::legacyName(), legacyChunkID);
+        }
         q.done();
 
         updates.append(op.obj());
@@ -525,6 +595,14 @@ Status ShardingCatalogManager::commitChunkMerge(OperationContext* opCtx,
     // move chunks on different collections to proceed in parallel
     Lock::ExclusiveLock lk(opCtx->lockState(), _kChunkOpLock);
 
+    // The _id format for chunk documents changed in 4.4, so during an upgrade or downgrade it is
+    // not known which format the chunks are currently in. Merging a chunk requires knowing the
+    // _id of the chunks being merged, so to avoid confusing failures, merging is disabled.
+    uassert(ErrorCodes::ConflictingOperationInProgress,
+            "Chunks cannot be merged while a feature compatibility version upgrade or downgrade is "
+            "in progress",
+            !isUpgradingOrDowngradingFCV());
+
     if (!validAfter) {
         return {ErrorCodes::IllegalOperation, "chunk operation requires validAfter timestamp"};
     }
@@ -578,7 +656,11 @@ Status ShardingCatalogManager::commitChunkMerge(OperationContext* opCtx,
         if (!itOrigChunk.isOK()) {
             return itOrigChunk.getStatus();
         }
-        itChunk.setName(itOrigChunk.getValue().getName());
+
+        if (serverGlobalParams.featureCompatibility.getVersion() >=
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
+            itChunk.setName(itOrigChunk.getValue().getName());
+        }
 
         // Ensure the chunk boundaries are strictly increasing
         if (chunkBoundaries[i].woCompare(itChunk.getMin()) <= 0) {
@@ -652,6 +734,14 @@ StatusWith<BSONObj> ShardingCatalogManager::commitChunkMigration(
     // (Note: This is not needed while we have a global lock, taken here only for consistency.)
     Lock::ExclusiveLock lk(opCtx->lockState(), _kChunkOpLock);
 
+    // The _id format for chunk documents changed in 4.4, so during an upgrade or downgrade it is
+    // not known which format the chunks are currently in. Moving a chunk requires knowing the
+    // _id of the chunks being moved, so to avoid confusing failures, migrations are disabled.
+    uassert(ErrorCodes::ConflictingOperationInProgress,
+            "Chunks cannot be migrated while a feature compatibility version upgrade or downgrade "
+            "is in progress",
+            !isUpgradingOrDowngradingFCV());
+
     if (!validAfter) {
         return {ErrorCodes::IllegalOperation, "chunk operation requires validAfter timestamp"};
     }
@@ -722,7 +812,10 @@ StatusWith<BSONObj> ShardingCatalogManager::commitChunkMigration(
     // Generate the new versions of migratedChunk and controlChunk. Migrating chunk's minor version
     // will be 0.
     ChunkType newMigratedChunk = migratedChunk;
-    newMigratedChunk.setName(origChunk.getValue().getName());
+    if (serverGlobalParams.featureCompatibility.getVersion() >=
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
+        newMigratedChunk.setName(origChunk.getValue().getName());
+    }
     newMigratedChunk.setShard(toShard);
     newMigratedChunk.setVersion(ChunkVersion(
         currentCollectionVersion.majorVersion() + 1, 0, currentCollectionVersion.epoch()));
@@ -766,7 +859,10 @@ StatusWith<BSONObj> ShardingCatalogManager::commitChunkMigration(
         }
 
         newControlChunk = origControlChunk.getValue();
-        newControlChunk->setName(origControlChunk.getValue().getName());
+        if (serverGlobalParams.featureCompatibility.getVersion() >=
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
+            newControlChunk->setName(origControlChunk.getValue().getName());
+        }
         newControlChunk->setVersion(ChunkVersion(
             currentCollectionVersion.majorVersion() + 1, 1, currentCollectionVersion.epoch()));
     }
@@ -872,6 +968,109 @@ StatusWith<ChunkVersion> ShardingCatalogManager::_findCollectionVersion(
     }
 
     return currentCollectionVersion;
+}
+
+void ShardingCatalogManager::clearJumboFlag(OperationContext* opCtx,
+                                            const NamespaceString& nss,
+                                            const OID& collectionEpoch,
+                                            const ChunkRange& chunk) {
+    auto const configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
+
+    // Take _kChunkOpLock in exclusive mode to prevent concurrent chunk splits, merges, and
+    // migrations.
+    //
+    // ConfigSvrClearJumboFlag commands must be run serially because the new ChunkVersions
+    // for the modified chunks are generated within the command and must be committed to the
+    // database before another chunk operation generates new ChunkVersions in the same manner.
+    //
+    // TODO(SERVER-25359): Replace with a collection-specific lock map to allow splits/merges/
+    // move chunks on different collections to proceed in parallel.
+    // (Note: This is not needed while we have a global lock, taken here only for consistency.)
+    Lock::ExclusiveLock lk(opCtx->lockState(), _kChunkOpLock);
+
+    auto targetChunkResult = uassertStatusOK(configShard->exhaustiveFindOnConfig(
+        opCtx,
+        ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+        repl::ReadConcernLevel::kLocalReadConcern,
+        ChunkType::ConfigNS,
+        BSON(ChunkType::ns(nss.ns())
+             << ChunkType::min(chunk.getMin()) << ChunkType::max(chunk.getMax())),
+        {},
+        1));
+
+    const auto targetChunkVector = std::move(targetChunkResult.docs);
+    uassert(51262,
+            str::stream() << "Unable to locate chunk " << chunk.toString()
+                          << " from ns: " << nss.ns(),
+            !targetChunkVector.empty());
+
+    const auto targetChunk = uassertStatusOK(ChunkType::fromConfigBSON(targetChunkVector.front()));
+
+    if (!targetChunk.getJumbo()) {
+        return;
+    }
+
+    // Must use local read concern because we will perform subsequent writes.
+    auto findResponse = uassertStatusOK(
+        configShard->exhaustiveFindOnConfig(opCtx,
+                                            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                                            repl::ReadConcernLevel::kLocalReadConcern,
+                                            ChunkType::ConfigNS,
+                                            BSON(ChunkType::ns(nss.ns())),
+                                            BSON(ChunkType::lastmod << -1),
+                                            1));
+
+    const auto chunksVector = std::move(findResponse.docs);
+    uassert(ErrorCodes::IncompatibleShardingMetadata,
+            str::stream() << "Tried to find max chunk version for collection '" << nss.ns()
+                          << ", but found no chunks",
+            !chunksVector.empty());
+
+    const auto highestVersionChunk =
+        uassertStatusOK(ChunkType::fromConfigBSON(chunksVector.front()));
+    const auto currentCollectionVersion = highestVersionChunk.getVersion();
+
+    // It is possible for a migration to end up running partly without the protection of the
+    // distributed lock if the config primary stepped down since the start of the migration and
+    // failed to recover the migration. Check that the collection has not been dropped and recreated
+    // since the migration began, unbeknown to the shard when the command was sent.
+    uassert(ErrorCodes::StaleEpoch,
+            str::stream() << "The collection '" << nss.ns()
+                          << "' has been dropped and recreated since the migration began."
+                             " The config server's collection version epoch is now '"
+                          << currentCollectionVersion.epoch().toString() << "', but the shard's is "
+                          << collectionEpoch.toString() << "'. Aborting clear jumbo on chunk ("
+                          << chunk.toString() << ").",
+            currentCollectionVersion.epoch() == collectionEpoch);
+
+    ChunkVersion newVersion(
+        currentCollectionVersion.majorVersion() + 1, 0, currentCollectionVersion.epoch());
+
+    BSONObj chunkQuery(BSON(ChunkType::ns(nss.ns())
+                            << ChunkType::epoch(collectionEpoch) << ChunkType::min(chunk.getMin())
+                            << ChunkType::max(chunk.getMax())));
+
+    BSONObjBuilder updateBuilder;
+    updateBuilder.append("$unset", BSON(ChunkType::jumbo() << ""));
+
+    BSONObjBuilder updateVersionClause(updateBuilder.subobjStart("$set"));
+    newVersion.appendLegacyWithField(&updateVersionClause, ChunkType::lastmod());
+    updateVersionClause.doneFast();
+
+    auto chunkUpdate = updateBuilder.obj();
+
+    auto didUpdate = uassertStatusOK(
+        Grid::get(opCtx)->catalogClient()->updateConfigDocument(opCtx,
+                                                                ChunkType::ConfigNS,
+                                                                chunkQuery,
+                                                                chunkUpdate,
+                                                                false /* upsert */,
+                                                                kNoWaitWriteConcern));
+
+    uassert(51263,
+            str::stream() << "failed to clear jumbo flag due to " << chunkQuery
+                          << " not matching any existing chunks",
+            didUpdate);
 }
 
 }  // namespace mongo

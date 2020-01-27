@@ -103,7 +103,9 @@ protected:
         auto specObj = builder.obj();
 
         MultiIndexBlock indexer;
-        ON_BLOCK_EXIT([&] { indexer.cleanUpAfterBuild(&_opCtx, _collection); });
+        ON_BLOCK_EXIT([&] {
+            indexer.cleanUpAfterBuild(&_opCtx, _collection, MultiIndexBlock::kNoopOnCleanUpFn);
+        });
         {
             WriteUnitOfWork wunit(&_opCtx);
             uassertStatusOK(
@@ -111,7 +113,10 @@ protected:
             wunit.commit();
         }
         uassertStatusOK(indexer.insertAllDocumentsInCollection(&_opCtx, _collection));
-        uassertStatusOK(indexer.drainBackgroundWrites(&_opCtx));
+        uassertStatusOK(
+            indexer.drainBackgroundWrites(&_opCtx,
+                                          RecoveryUnit::ReadSource::kUnset,
+                                          IndexBuildInterceptor::DrainYieldPolicy::kNoYield));
         uassertStatusOK(indexer.checkConstraints(&_opCtx));
         {
             WriteUnitOfWork wunit(&_opCtx);
@@ -1820,6 +1825,61 @@ public:
     }
 };
 
+class GetDatabaseInfosTest : public CollectionBase {
+public:
+    GetDatabaseInfosTest() : CollectionBase("GetDatabaseInfosTest") {}
+
+    void run() {
+        const char* ns1 = "unittestsdb1.querytests.coll1";
+        {
+            Lock::GlobalWrite lk(&_opCtx);
+            OldClientContext context(&_opCtx, ns1);
+            WriteUnitOfWork wunit(&_opCtx);
+            context.db()->createCollection(&_opCtx, NamespaceString(ns1));
+            wunit.commit();
+        }
+        insert(ns1, BSON("a" << 1));
+        auto dbInfos = _client.getDatabaseInfos(BSONObj(), true /*nameOnly*/);
+        checkNewDBInResults(dbInfos, 1);
+
+
+        const char* ns2 = "unittestsdb2.querytests.coll2";
+        {
+            Lock::GlobalWrite lk(&_opCtx);
+            OldClientContext context(&_opCtx, ns2);
+            WriteUnitOfWork wunit(&_opCtx);
+            context.db()->createCollection(&_opCtx, NamespaceString(ns2));
+            wunit.commit();
+        }
+        insert(ns2, BSON("b" << 2));
+        dbInfos = _client.getDatabaseInfos(BSONObj(), true /*nameOnly*/);
+        checkNewDBInResults(dbInfos, 2);
+
+
+        const char* ns3 = "unittestsdb3.querytests.coll3";
+        {
+            Lock::GlobalWrite lk(&_opCtx);
+            OldClientContext context(&_opCtx, ns3);
+            WriteUnitOfWork wunit(&_opCtx);
+            context.db()->createCollection(&_opCtx, NamespaceString(ns3));
+            wunit.commit();
+        }
+        insert(ns3, BSON("c" << 3));
+        dbInfos = _client.getDatabaseInfos(BSONObj(), true /*nameOnly*/);
+        checkNewDBInResults(dbInfos, 3);
+    }
+
+    void checkNewDBInResults(const std::vector<BSONObj> results, const int dbNum) {
+        std::string target = "unittestsdb" + std::to_string(dbNum);
+        for (auto res : results) {
+            if (res["name"].str() == target) {
+                return;
+            }
+        }
+        ASSERT(false);  // Should not hit this unless we failed to find the database.
+    }
+};
+
 class CollectionInternalBase : public CollectionBase {
 public:
     CollectionInternalBase(const char* nsLeaf)
@@ -1983,6 +2043,8 @@ public:
         add<WhatsMyUri>();
         add<QueryByUuid>();
         add<GetIndexSpecsByUUID>();
+        add<CountByUUID>();
+        add<GetDatabaseInfosTest>();
         add<Exhaust>();
         add<QueryReadsAll>();
         add<queryobjecttests::names1>();

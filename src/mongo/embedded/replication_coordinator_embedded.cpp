@@ -386,12 +386,6 @@ Status ReplicationCoordinatorEmbedded::checkIfCommitQuorumCanBeSatisfied(
     UASSERT_NOT_IMPLEMENTED;
 }
 
-StatusWith<bool> ReplicationCoordinatorEmbedded::checkIfCommitQuorumIsSatisfied(
-    const CommitQuorumOptions& commitQuorum,
-    const std::vector<HostAndPort>& commitReadyMembers) const {
-    UASSERT_NOT_IMPLEMENTED;
-}
-
 Status ReplicationCoordinatorEmbedded::checkReplEnabledForCommand(BSONObjBuilder*) {
     return Status(ErrorCodes::NoReplicationEnabled, "no replication on embedded");
 }
@@ -460,10 +454,6 @@ void ReplicationCoordinatorEmbedded::waitUntilSnapshotCommitted(OperationContext
     UASSERT_NOT_IMPLEMENTED;
 }
 
-size_t ReplicationCoordinatorEmbedded::getNumUncommittedSnapshots() {
-    UASSERT_NOT_IMPLEMENTED;
-}
-
 void ReplicationCoordinatorEmbedded::createWMajorityWriteAvailabilityDateWaiter(OpTime opTime) {
     UASSERT_NOT_IMPLEMENTED;
 }
@@ -493,6 +483,13 @@ void ReplicationCoordinatorEmbedded::attemptToAdvanceStableTimestamp() {
 }
 
 void ReplicationCoordinatorEmbedded::finishRecoveryIfEligible(OperationContext* opCtx) {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
+void ReplicationCoordinatorEmbedded::updateAndLogStateTransitionMetrics(
+    const ReplicationCoordinator::OpsKillingStateTransitionEnum stateTransition,
+    const size_t numOpsKilled,
+    const size_t numOpsRunning) const {
     UASSERT_NOT_IMPLEMENTED;
 }
 

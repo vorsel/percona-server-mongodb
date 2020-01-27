@@ -3,7 +3,11 @@
 //
 // This test triggers a compiler bug that causes a crash when compiling with optimizations on, see
 // SERVER-36321.
-// @tags: [requires_persistence, blacklist_from_rhel_67_s390x, uses_change_streams]
+// @tags: [
+//     blacklist_from_rhel_67_s390x,
+//     requires_persistence,
+//     uses_change_streams,
+// ]
 (function() {
 "use strict";
 

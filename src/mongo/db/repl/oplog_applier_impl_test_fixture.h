@@ -45,6 +45,26 @@ class BSONObj;
 class OperationContext;
 
 namespace repl {
+
+/**
+ * Test only subclass of OplogApplierImpl that makes applyOplogBatchPerWorker a public method.
+ */
+class TestApplyOplogGroupApplier : public OplogApplierImpl {
+public:
+    TestApplyOplogGroupApplier(ReplicationConsistencyMarkers* consistencyMarkers,
+                               StorageInterface* storageInterface,
+                               const OplogApplier::Options& options)
+        : OplogApplierImpl(nullptr,
+                           nullptr,
+                           nullptr,
+                           nullptr,
+                           consistencyMarkers,
+                           storageInterface,
+                           options,
+                           nullptr) {}
+    using OplogApplierImpl::applyOplogBatchPerWorker;
+};
+
 /**
  * OpObserver for OplogApplierImpl test fixture.
  */
@@ -103,26 +123,18 @@ public:
 
 class OplogApplierImplTest : public ServiceContextMongoDTest {
 protected:
-    void _testApplyOplogEntryBatchCrudOperation(ErrorCodes::Error expectedError,
-                                                const OplogEntry& op,
-                                                bool expectedApplyOpCalled);
+    void _testApplyOplogEntryOrGroupedInsertsCrudOperation(ErrorCodes::Error expectedError,
+                                                           const OplogEntry& op,
+                                                           bool expectedApplyOpCalled);
 
-    Status _applyOplogEntryBatchWrapper(OperationContext* opCtx,
-                                        const OplogEntryBatch& batch,
-                                        OplogApplication::Mode oplogApplicationMode);
+    Status _applyOplogEntryOrGroupedInsertsWrapper(OperationContext* opCtx,
+                                                   const OplogEntryOrGroupedInserts& batch,
+                                                   OplogApplication::Mode oplogApplicationMode);
 
     ServiceContext::UniqueOperationContext _opCtx;
     std::unique_ptr<ReplicationConsistencyMarkers> _consistencyMarkers;
     ServiceContext* serviceContext;
     OplogApplierImplOpObserver* _opObserver = nullptr;
-
-    // Implements the OplogApplierImpl::ApplyGroupFn interface and does nothing.
-    static Status noopApplyOperationFn(OperationContext*,
-                                       MultiApplier::OperationPtrs*,
-                                       OplogApplierImpl* oai,
-                                       WorkerMultikeyPathInfo*) {
-        return Status::OK();
-    }
 
     OpTime nextOpTime() {
         static long long lastSecond = 1;

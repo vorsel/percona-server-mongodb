@@ -38,6 +38,7 @@
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/index_consistency.h"
 #include "mongo/db/catalog/throttle_cursor.h"
+#include "mongo/db/curop.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index/wildcard_access_method.h"
@@ -104,7 +105,7 @@ Status ValidateAdaptor::validateRecord(OperationContext* opCtx,
 
         if (!descriptor->isMultikey() &&
             iam->shouldMarkIndexAsMultikey(
-                {documentKeySet.begin(), documentKeySet.end()},
+                documentKeySet.size(),
                 {multikeyMetadataKeys.begin(), multikeyMetadataKeys.end()},
                 multikeyPaths)) {
             std::string msg = str::stream()
@@ -126,6 +127,7 @@ Status ValidateAdaptor::validateRecord(OperationContext* opCtx,
 
         for (const auto& keyString : documentKeySet) {
             try {
+                _totalIndexKeys++;
                 _indexConsistency->addDocKey(opCtx, keyString, &indexInfo, recordId);
             } catch (...) {
                 return exceptionToStatus();
@@ -146,6 +148,14 @@ void ValidateAdaptor::traverseIndex(OperationContext* opCtx,
 
     bool isFirstEntry = true;
 
+    // The progress meter will be inactive after traversing the record store to allow the message
+    // and the total to be set to different values.
+    if (!_progress->isActive()) {
+        const char* curopMessage = "Validate: scanning index entries";
+        stdx::unique_lock<Client> lk(*opCtx->getClient());
+        _progress.set(CurOp::get(opCtx)->setProgress_inlock(curopMessage, _totalIndexKeys));
+    }
+
     const KeyString::Version version =
         index->accessMethod()->getSortedDataInterface()->getKeyStringVersion();
     KeyString::Builder firstKeyString(
@@ -161,15 +171,6 @@ void ValidateAdaptor::traverseIndex(OperationContext* opCtx,
     for (auto indexEntry = indexCursor->seekForKeyString(opCtx, firstKeyString.getValueCopy());
          indexEntry;
          indexEntry = indexCursor->nextKeyString(opCtx)) {
-        if (numKeys % kInterruptIntervalNumRecords == 0) {
-            opCtx->checkForInterrupt();
-
-            // Periodically yield locks.
-            if (_validateState->isBackground()) {
-                _validateState->yieldLocks(opCtx);
-            }
-        }
-
         // Ensure that the index entries are in increasing or decreasing order.
         if (!isFirstEntry && indexEntry->keyString < prevIndexKeyStringValue) {
             if (results && results->valid) {
@@ -187,14 +188,22 @@ void ValidateAdaptor::traverseIndex(OperationContext* opCtx,
         if (descriptor->getIndexType() == IndexType::INDEX_WILDCARD &&
             indexEntry->loc == kWildcardMultikeyMetadataRecordId) {
             _indexConsistency->removeMultikeyMetadataPath(indexEntry->keyString, &indexInfo);
+            _progress->hit();
             numKeys++;
             continue;
         }
 
         _indexConsistency->addIndexKey(indexEntry->keyString, &indexInfo, indexEntry->loc);
+        _progress->hit();
         numKeys++;
         isFirstEntry = false;
         prevIndexKeyStringValue = indexEntry->keyString;
+
+        if (numKeys % kInterruptIntervalNumRecords == 0) {
+            // Periodically checks for interrupts and yields.
+            opCtx->checkForInterrupt();
+            _validateState->yield(opCtx);
+        }
     }
 
     if (results && _indexConsistency->getMultikeyMetadataPathCount(&indexInfo) > 0) {
@@ -220,29 +229,30 @@ void ValidateAdaptor::traverseRecordStore(OperationContext* opCtx,
     results->valid = true;
     RecordId prevRecordId;
 
+    // In case validation occurs twice and the progress meter persists after index traversal
+    if (_progress.get() && _progress->isActive()) {
+        _progress->finished();
+    }
+
+    // Because the progress meter is intended as an approximation, it's sufficient to get the number
+    // of records when we begin traversing, even if this number may deviate from the final number.
+    const char* curopMessage = "Validate: scanning documents";
+    const auto totalRecords = _validateState->getCollection()->getRecordStore()->numRecords(opCtx);
+    {
+        stdx::unique_lock<Client> lk(*opCtx->getClient());
+        _progress.set(CurOp::get(opCtx)->setProgress_inlock(curopMessage, totalRecords));
+    }
+
     const std::unique_ptr<SeekableRecordThrottleCursor>& traverseRecordStoreCursor =
         _validateState->getTraverseRecordStoreCursor();
     for (auto record =
              traverseRecordStoreCursor->seekExact(opCtx, _validateState->getFirstRecordId());
          record;
          record = traverseRecordStoreCursor->next(opCtx)) {
+        _progress->hit();
         ++_numRecords;
-        interruptIntervalNumBytes += record->data.size();
-        if (_numRecords % kInterruptIntervalNumRecords == 0 ||
-            interruptIntervalNumBytes >= kInterruptIntervalNumBytes) {
-            opCtx->checkForInterrupt();
-
-            // Periodically yield locks.
-            if (_validateState->isBackground()) {
-                _validateState->yieldLocks(opCtx);
-            }
-
-            if (interruptIntervalNumBytes >= kInterruptIntervalNumBytes) {
-                interruptIntervalNumBytes = 0;
-            }
-        }
-
         auto dataSize = record->data.size();
+        interruptIntervalNumBytes += dataSize;
         dataSizeTotal += dataSize;
         size_t validatedSize;
         Status status = validateRecord(opCtx, record->id, record->data, &validatedSize);
@@ -277,6 +287,17 @@ void ValidateAdaptor::traverseRecordStore(OperationContext* opCtx,
         }
 
         prevRecordId = record->id;
+
+        if (_numRecords % kInterruptIntervalNumRecords == 0 ||
+            interruptIntervalNumBytes >= kInterruptIntervalNumBytes) {
+            // Periodically checks for interrupts and yields.
+            opCtx->checkForInterrupt();
+            _validateState->yield(opCtx);
+
+            if (interruptIntervalNumBytes >= kInterruptIntervalNumBytes) {
+                interruptIntervalNumBytes = 0;
+            }
+        }
     }
 
     // Do not update the record store stats if we're in the background as we've validated a
@@ -285,6 +306,8 @@ void ValidateAdaptor::traverseRecordStore(OperationContext* opCtx,
         _validateState->getCollection()->getRecordStore()->updateStatsAfterRepair(
             opCtx, _numRecords, dataSizeTotal);
     }
+
+    _progress->finished();
 
     output->appendNumber("nInvalidDocuments", nInvalid);
     output->appendNumber("nrecords", _numRecords);
@@ -301,7 +324,7 @@ void ValidateAdaptor::validateIndexKeyCount(const IndexDescriptor* idx, Validate
     bool noErrorOnTooFewKeys = !_validateState->isFullValidate();
 
     if (idx->isIdIndex() && numTotalKeys != _numRecords) {
-        hasTooFewKeys = numTotalKeys < _numRecords ? true : hasTooFewKeys;
+        hasTooFewKeys = (numTotalKeys < _numRecords);
         std::string msg = str::stream()
             << "number of _id index entries (" << numTotalKeys
             << ") does not match the number of documents in the index (" << _numRecords << ")";

@@ -46,8 +46,8 @@
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/create_collection_gen.h"
 
-#include "mongo/platform/condition_variable.h"
 #include "mongo/platform/mutex.h"
+#include "mongo/stdx/condition_variable.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -72,16 +72,14 @@ public:
     Status onCannotImplicitlyCreateCollection(OperationContext* opCtx) noexcept {
         invariant(!opCtx->lockState()->isLocked());
 
-        {
+        try {
             stdx::unique_lock<Latch> lg(_mutex);
-            while (_isInProgress) {
-                auto status = opCtx->waitForConditionOrInterruptNoAssert(_cvIsInProgress, lg);
-                if (!status.isOK()) {
-                    return status;
-                }
-            }
+
+            opCtx->waitForConditionOrInterrupt(_cvIsInProgress, lg, [&] { return !_isInProgress; });
 
             _isInProgress = true;
+        } catch (const DBException& e) {
+            return e.toStatus();
         }
 
         ON_BLOCK_EXIT([&] {

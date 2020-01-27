@@ -44,6 +44,7 @@
 #include "mongo/db/repl/collection_cloner.h"
 #include "mongo/db/repl/data_replicator_external_state.h"
 #include "mongo/db/repl/database_cloner.h"
+#include "mongo/db/repl/initial_sync_shared_data.h"
 #include "mongo/db/repl/multiapplier.h"
 #include "mongo/db/repl/oplog_applier.h"
 #include "mongo/db/repl/oplog_buffer.h"
@@ -52,8 +53,8 @@
 #include "mongo/db/repl/rollback_checker.h"
 #include "mongo/db/repl/sync_source_selector.h"
 #include "mongo/dbtests/mock/mock_dbclient_connection.h"
-#include "mongo/platform/condition_variable.h"
 #include "mongo/platform/mutex.h"
+#include "mongo/stdx/condition_variable.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/net/hostandport.h"
@@ -640,6 +641,8 @@ private:
     // Contains stats on the current initial sync request (includes all attempts).
     // To access these stats in a user-readable format, use getInitialSyncProgress().
     Stats _stats;  // (M)
+    // Data shared by cloners and fetcher.  Follow InitialSyncSharedData synchronization rules.
+    std::unique_ptr<InitialSyncSharedData> _sharedData;  // (S)
 };
 
 }  // namespace repl

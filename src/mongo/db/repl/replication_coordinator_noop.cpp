@@ -361,12 +361,6 @@ Status ReplicationCoordinatorNoOp::checkIfCommitQuorumCanBeSatisfied(
     MONGO_UNREACHABLE;
 }
 
-StatusWith<bool> ReplicationCoordinatorNoOp::checkIfCommitQuorumIsSatisfied(
-    const CommitQuorumOptions& commitQuorum,
-    const std::vector<HostAndPort>& commitReadyMembers) const {
-    MONGO_UNREACHABLE;
-}
-
 Status ReplicationCoordinatorNoOp::checkReplEnabledForCommand(BSONObjBuilder*) {
     return Status(ErrorCodes::NoReplicationEnabled, "no replication on embedded");
 }
@@ -434,10 +428,6 @@ void ReplicationCoordinatorNoOp::waitUntilSnapshotCommitted(OperationContext*, c
     MONGO_UNREACHABLE;
 }
 
-size_t ReplicationCoordinatorNoOp::getNumUncommittedSnapshots() {
-    MONGO_UNREACHABLE;
-}
-
 void ReplicationCoordinatorNoOp::createWMajorityWriteAvailabilityDateWaiter(OpTime opTime) {
     MONGO_UNREACHABLE;
 }
@@ -467,6 +457,13 @@ void ReplicationCoordinatorNoOp::attemptToAdvanceStableTimestamp() {
 }
 
 void ReplicationCoordinatorNoOp::finishRecoveryIfEligible(OperationContext* opCtx) {
+    MONGO_UNREACHABLE;
+}
+
+void ReplicationCoordinatorNoOp::updateAndLogStateTransitionMetrics(
+    const ReplicationCoordinator::OpsKillingStateTransitionEnum stateTransition,
+    const size_t numOpsKilled,
+    const size_t numOpsRunning) const {
     MONGO_UNREACHABLE;
 }
 

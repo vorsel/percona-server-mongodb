@@ -38,6 +38,7 @@
 #include "mongo/db/repl/opqueue_batcher.h"
 #include "mongo/db/repl/replication_consistency_markers.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/replication_metrics.h"
 #include "mongo/db/repl/session_update_tracker.h"
 #include "mongo/db/repl/storage_interface.h"
 
@@ -58,10 +59,6 @@ class OplogApplierImpl : public OplogApplier {
     OplogApplierImpl& operator=(const OplogApplierImpl&) = delete;
 
 public:
-    using ApplyGroupFunc = std::function<Status(OperationContext* opCtx,
-                                                MultiApplier::OperationPtrs* ops,
-                                                OplogApplierImpl* oai,
-                                                WorkerMultikeyPathInfo* workerMultikeyPathInfo)>;
     /**
      * Constructs this OplogApplier with specific options.
      * During steady state replication, _run() obtains batches of operations to apply
@@ -75,7 +72,6 @@ public:
                      ReplicationCoordinator* replCoord,
                      ReplicationConsistencyMarkers* consistencyMarkers,
                      StorageInterface* storageInterface,
-                     ApplyGroupFunc func,
                      const Options& options,
                      ThreadPool* writerPool);
 
@@ -84,7 +80,7 @@ private:
     /**
      * Runs oplog application in a loop until shutdown() is called.
      * Retrieves operations from the OplogBuffer in batches that will be applied in parallel using
-     * multiApply().
+     * applyOplogBatch().
      */
     void _run(OplogBuffer* oplogBuffer) override;
 
@@ -101,7 +97,7 @@ private:
      * to at least the last optime of the batch. If 'minValid' is already greater than or equal
      * to the last optime of this batch, it will not be updated.
      */
-    StatusWith<OpTime> _multiApply(OperationContext* opCtx, MultiApplier::Operations ops);
+    StatusWith<OpTime> _applyOplogBatch(OperationContext* opCtx, MultiApplier::Operations ops);
 
     void _deriveOpsAndFillWriterVectors(OperationContext* opCtx,
                                         MultiApplier::Operations* ops,
@@ -120,37 +116,37 @@ private:
 
     ReplicationConsistencyMarkers* const _consistencyMarkers;
 
-    // Function to use during _multiApply
-    ApplyGroupFunc _applyFunc;
-
     // Used to determine which operations should be applied during initial sync. If this is null,
     // we will apply all operations that were fetched.
     OpTime _beginApplyingOpTime = OpTime();
 
-protected:
-    // Marked as protected for use in unit tests.
     void fillWriterVectors(OperationContext* opCtx,
                            MultiApplier::Operations* ops,
                            std::vector<MultiApplier::OperationPtrs>* writerVectors,
                            std::vector<MultiApplier::Operations>* derivedOps) noexcept;
+
+protected:
+    // Marked as protected for use in unit tests.
+    /**
+     * This function is used by the thread pool workers to write ops to the db.
+     * This consumes the passed in OperationPtrs and callers should not make any assumptions about
+     * the state of the container after calling. However, this function cannot modify the pointed-to
+     * operations because the OperationPtrs container contains const pointers.
+     *
+     * This function has been marked as virtual to allow certain unit tests to skip oplog
+     * application.
+     */
+    virtual Status applyOplogBatchPerWorker(OperationContext* opCtx,
+                                            MultiApplier::OperationPtrs* ops,
+                                            WorkerMultikeyPathInfo* workerMultikeyPathInfo);
 };
 
 /**
- * Applies a batch of operations.
+ * Applies either a single oplog entry or a set of grouped insert operations.
  */
-Status applyOplogEntryBatch(OperationContext* opCtx,
-                            const OplogEntryBatch& batch,
-                            OplogApplication::Mode oplogApplicationMode);
+Status applyOplogEntryOrGroupedInserts(OperationContext* opCtx,
+                                       const OplogEntryOrGroupedInserts& entryOrGroupedInserts,
+                                       OplogApplication::Mode oplogApplicationMode);
 
-/**
- * This free function is used by the thread pool workers to write ops to the db.
- * This consumes the passed in OperationPtrs and callers should not make any assumptions about the
- * state of the container after calling. However, this function cannot modify the pointed-to
- * operations because the OperationPtrs container contains const pointers.
- */
-Status applyOplogGroup(OperationContext* opCtx,
-                       MultiApplier::OperationPtrs* ops,
-                       OplogApplierImpl* oai,
-                       WorkerMultikeyPathInfo* workerMultikeyPathInfo);
 }  // namespace repl
 }  // namespace mongo

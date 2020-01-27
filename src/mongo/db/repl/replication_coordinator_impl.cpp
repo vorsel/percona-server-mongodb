@@ -105,15 +105,20 @@ Counter64 attemptsToBecomeSecondary;
 ServerStatusMetricField<Counter64> displayAttemptsToBecomeSecondary(
     "repl.apply.attemptsToBecomeSecondary", &attemptsToBecomeSecondary);
 
-// Tracks the number of operations killed on step down.
+// Tracks the last state transition performed in this replca set.
+std::string lastStateTransition;
+ServerStatusMetricField<std::string> displayLastStateTransition(
+    "repl.stateTransition.lastStateTransition", &lastStateTransition);
+
+// Tracks the number of operations killed on state transition.
 Counter64 userOpsKilled;
-ServerStatusMetricField<Counter64> displayuserOpsKilled("repl.stepDown.userOperationsKilled",
+ServerStatusMetricField<Counter64> displayUserOpsKilled("repl.stateTransition.userOperationsKilled",
                                                         &userOpsKilled);
 
-// Tracks the number of operations left running on step down.
+// Tracks the number of operations left running on state transition.
 Counter64 userOpsRunning;
-ServerStatusMetricField<Counter64> displayUserOpsRunning("repl.stepDown.userOperationsRunning",
-                                                         &userOpsRunning);
+ServerStatusMetricField<Counter64> displayUserOpsRunning(
+    "repl.stateTransition.userOperationsRunning", &userOpsRunning);
 
 using CallbackArgs = executor::TaskExecutor::CallbackArgs;
 using CallbackFn = executor::TaskExecutor::CallbackFn;
@@ -167,13 +172,13 @@ void lockAndCall(stdx::unique_lock<Latch>* lk, const std::function<void()>& fn) 
  */
 BSONObj incrementConfigVersionByRandom(BSONObj config) {
     BSONObjBuilder builder;
+    SecureRandom generator;
     for (BSONObjIterator iter(config); iter.more(); iter.next()) {
         BSONElement elem = *iter;
         if (elem.fieldNameStringData() == ReplSetConfig::kVersionFieldName && elem.isNumber()) {
-            std::unique_ptr<SecureRandom> generator(SecureRandom::create());
-            const int random = std::abs(static_cast<int>(generator->nextInt64()) % 100000);
+            const int random = generator.nextInt32(100'000);
             builder.appendIntOrLL(ReplSetConfig::kVersionFieldName,
-                                  elem.numberLong() + 10000 + random);
+                                  elem.numberLong() + 10'000 + random);
         } else {
             builder.append(elem);
         }
@@ -394,10 +399,6 @@ OpTimeAndWallTime ReplicationCoordinatorImpl::_getCurrentCommittedSnapshotOpTime
         return _currentCommittedSnapshot.get();
     }
     return OpTimeAndWallTime();
-}
-
-LogicalTime ReplicationCoordinatorImpl::_getCurrentCommittedLogicalTime_inlock() const {
-    return LogicalTime(_getCurrentCommittedSnapshotOpTime_inlock().getTimestamp());
 }
 
 void ReplicationCoordinatorImpl::appendDiagnosticBSON(mongo::BSONObjBuilder* bob) {
@@ -996,7 +997,8 @@ void ReplicationCoordinatorImpl::signalDrainComplete(OperationContext* opCtx,
     // internal operations. Although secondaries cannot accept writes, a step up can kill writes
     // that were blocked behind the RSTL lock held by a step down attempt. These writes will be
     // killed with a retryable error code during step up.
-    AutoGetRstlForStepUpStepDown arsu(this, opCtx);
+    AutoGetRstlForStepUpStepDown arsu(
+        this, opCtx, ReplicationCoordinator::OpsKillingStateTransitionEnum::kStepUp);
     lk.lock();
 
     // Exit drain mode only if we're actually in draining mode, the apply buffer is empty in the
@@ -1023,10 +1025,6 @@ void ReplicationCoordinatorImpl::signalDrainComplete(OperationContext* opCtx,
         }
         invariant(status);
     }
-
-    // Reset the counters on step up.
-    userOpsKilled.decrement(userOpsKilled.get());
-    userOpsRunning.decrement(userOpsRunning.get());
 
     // Must calculate the commit level again because firstOpTimeOfMyTerm wasn't set when we logged
     // our election in onTransitionToPrimary(), above.
@@ -1380,27 +1378,36 @@ Status ReplicationCoordinatorImpl::_waitUntilOpTime(OperationContext* opCtx,
             return {ErrorCodes::ShutdownInProgress, "Shutdown in progress"};
         }
 
-        // If we are doing a majority committed read we only need to wait for a new snapshot.
         if (isMajorityCommittedRead) {
+            // If we are doing a majority committed read we only need to wait for a new snapshot to
+            // update getCurrentOpTime() past targetOpTime. This block should only run once and
+            // return without further looping.
+
             LOG(3) << "waitUntilOpTime: waiting for a new snapshot until " << opCtx->getDeadline();
 
-            auto waitStatus =
-                opCtx->waitForConditionOrInterruptNoAssert(_currentCommittedSnapshotCond, lock);
-            if (!waitStatus.isOK()) {
-                return waitStatus.withContext(
+            try {
+                opCtx->waitForConditionOrInterrupt(_currentCommittedSnapshotCond, lock, [&] {
+                    return _inShutdown || (targetOpTime <= getCurrentOpTime());
+                });
+            } catch (const DBException& e) {
+                return e.toStatus().withContext(
                     str::stream() << "Error waiting for snapshot not less than "
                                   << targetOpTime.toString() << ", current relevant optime is "
                                   << getCurrentOpTime().toString() << ".");
             }
-            if (!_currentCommittedSnapshot) {
-                // It is possible for the thread to be awoken due to a spurious wakeup, meaning
-                // the condition variable was never set.
-                LOG(3) << "waitUntilOpTime: awoken but current committed snapshot is null."
-                       << " Continuing to wait for new snapshot.";
-            } else {
+
+            if (_inShutdown) {
+                return {ErrorCodes::ShutdownInProgress, "Shutdown in progress"};
+            }
+
+            if (_currentCommittedSnapshot) {
+                // It seems that targetOpTime can sometimes be default OpTime{}. When there is no
+                // _currentCommittedSnapshot, _getCurrentCommittedSnapshotOpTime_inlock() and thus
+                // getCurrentOpTime() also return default OpTime{}. Hence this branch that only runs
+                // if _currentCommittedSnapshot actually exists.
                 LOG(3) << "Got notified of new snapshot: " << _currentCommittedSnapshot->toString();
             }
-            continue;
+            return Status::OK();
         }
 
         // We just need to wait for the opTime to catch up to what we need (not majority RC).
@@ -1785,15 +1792,38 @@ void ReplicationCoordinatorImpl::waitForStepDownAttempt_forTest() {
     }
 }
 
-void ReplicationCoordinatorImpl::_updateAndLogStatsOnStepDown(
-    const AutoGetRstlForStepUpStepDown* arsd) const {
-    userOpsRunning.increment(arsd->getUserOpsRunning());
+void ReplicationCoordinatorImpl::updateAndLogStateTransitionMetrics(
+    const ReplicationCoordinator::OpsKillingStateTransitionEnum stateTransition,
+    const size_t numOpsKilled,
+    const size_t numOpsRunning) const {
+
+    // Clear the current metrics before setting.
+    userOpsKilled.decrement(userOpsKilled.get());
+    userOpsRunning.decrement(userOpsRunning.get());
+
+    switch (stateTransition) {
+        case ReplicationCoordinator::OpsKillingStateTransitionEnum::kStepUp:
+            lastStateTransition = "stepUp";
+            break;
+        case ReplicationCoordinator::OpsKillingStateTransitionEnum::kStepDown:
+            lastStateTransition = "stepDown";
+            break;
+        case ReplicationCoordinator::OpsKillingStateTransitionEnum::kRollback:
+            lastStateTransition = "rollback";
+            break;
+        default:
+            MONGO_UNREACHABLE;
+    }
+
+    userOpsKilled.increment(numOpsKilled);
+    userOpsRunning.increment(numOpsRunning);
 
     BSONObjBuilder bob;
+    bob.append("lastStateTransition", lastStateTransition);
     bob.appendNumber("userOpsKilled", userOpsKilled.get());
     bob.appendNumber("userOpsRunning", userOpsRunning.get());
 
-    log() << "Stepping down from primary, stats: " << bob.obj();
+    log() << "State transition ops metrics: " << bob.obj();
 }
 
 void ReplicationCoordinatorImpl::_killConflictingOpsOnStepUpAndStepDown(
@@ -1816,18 +1846,24 @@ void ReplicationCoordinatorImpl::_killConflictingOpsOnStepUpAndStepDown(
             if (locker->wasGlobalLockTakenInModeConflictingWithWrites() ||
                 PrepareConflictTracker::get(toKill).isWaitingOnPrepareConflict()) {
                 serviceCtx->killOperation(lk, toKill, reason);
-                userOpsKilled.increment();
+                arsc->incrementUserOpsKilled();
             } else {
-                arsc->incrUserOpsRunningBy();
+                arsc->incrementUserOpsRunning();
             }
         }
     }
 }
 
 ReplicationCoordinatorImpl::AutoGetRstlForStepUpStepDown::AutoGetRstlForStepUpStepDown(
-    ReplicationCoordinatorImpl* repl, OperationContext* opCtx, Date_t deadline)
-    : _replCord(repl), _opCtx(opCtx) {
+    ReplicationCoordinatorImpl* repl,
+    OperationContext* opCtx,
+    const ReplicationCoordinator::OpsKillingStateTransitionEnum stateTransition,
+    Date_t deadline)
+    : _replCord(repl), _opCtx(opCtx), _stateTransition(stateTransition) {
     invariant(_replCord && _opCtx);
+
+    // The state transition should never be rollback within this class.
+    invariant(_stateTransition != ReplicationCoordinator::OpsKillingStateTransitionEnum::kRollback);
 
     // Enqueues RSTL in X mode.
     _rstlLock.emplace(_opCtx, MODE_X, ReplicationStateTransitionLockGuard::EnqueueOnly());
@@ -1878,6 +1914,8 @@ void ReplicationCoordinatorImpl::AutoGetRstlForStepUpStepDown::_killOpThreadFn()
             if (_stopKillingOps.wait_for(
                     lock, Milliseconds(10).toSystemDuration(), [this] { return _killSignaled; })) {
                 log() << "Stopped killing user operations";
+                _replCord->updateAndLogStateTransitionMetrics(
+                    _stateTransition, getUserOpsKilled(), getUserOpsRunning());
                 _killSignaled = false;
                 return;
             }
@@ -1898,11 +1936,19 @@ void ReplicationCoordinatorImpl::AutoGetRstlForStepUpStepDown::_stopAndWaitForKi
     _killOpThread.reset();
 }
 
+size_t ReplicationCoordinatorImpl::AutoGetRstlForStepUpStepDown::getUserOpsKilled() const {
+    return _userOpsKilled;
+}
+
+void ReplicationCoordinatorImpl::AutoGetRstlForStepUpStepDown::incrementUserOpsKilled(size_t val) {
+    _userOpsKilled += val;
+}
+
 size_t ReplicationCoordinatorImpl::AutoGetRstlForStepUpStepDown::getUserOpsRunning() const {
     return _userOpsRunning;
 }
 
-void ReplicationCoordinatorImpl::AutoGetRstlForStepUpStepDown::incrUserOpsRunningBy(size_t val) {
+void ReplicationCoordinatorImpl::AutoGetRstlForStepUpStepDown::incrementUserOpsRunning(size_t val) {
     _userOpsRunning += val;
 }
 
@@ -1948,7 +1994,8 @@ void ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
     // fail if it does not acquire the lock immediately. In such a scenario, we use the
     // stepDownUntil deadline instead.
     auto deadline = force ? stepDownUntil : waitUntil;
-    AutoGetRstlForStepUpStepDown arsd(this, opCtx, deadline);
+    AutoGetRstlForStepUpStepDown arsd(
+        this, opCtx, ReplicationCoordinator::OpsKillingStateTransitionEnum::kStepDown, deadline);
 
     stdx::unique_lock<Latch> lk(_mutex);
 
@@ -2067,7 +2114,6 @@ void ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
     yieldLocksForPreparedTransactions(opCtx);
 
     lk.lock();
-    _updateAndLogStatsOnStepDown(&arsd);
 
     // Clear the node's election candidate metrics since it is no longer primary.
     ReplicationMetrics::get(opCtx).clearElectionCandidateMetrics();
@@ -2637,7 +2683,7 @@ void ReplicationCoordinatorImpl::_finishReplSetReconfig(OperationContext* opCtx,
 
         // Primary node won't be electable or removed after the configuration change.
         // So, finish the reconfig under RSTL, so that the step down occurs safely.
-        arsd.emplace(this, opCtx);
+        arsd.emplace(this, opCtx, ReplicationCoordinator::OpsKillingStateTransitionEnum::kStepDown);
 
         lk.lock();
         if (_topCoord->isSteppingDownUnconditionally()) {
@@ -2651,7 +2697,6 @@ void ReplicationCoordinatorImpl::_finishReplSetReconfig(OperationContext* opCtx,
             yieldLocksForPreparedTransactions(opCtx);
 
             lk.lock();
-            _updateAndLogStatsOnStepDown(&arsd.get());
 
             // Clear the node's election candidate metrics since it is no longer primary.
             ReplicationMetrics::get(opCtx).clearElectionCandidateMetrics();
@@ -2890,8 +2935,6 @@ ReplicationCoordinatorImpl::_updateMemberStateFromTopologyCoordinator(WithLock l
         // When we try to make (1,2) the commit point, we'd find (0,2) as the newest snapshot
         // before the commit point, but it would be invalid to mark it as the committed snapshot
         // since it was never committed.
-        //
-        // TODO SERVER-19209 We also need to clear snapshots before a resync.
         _dropAllSnapshots_inlock();
     }
 
@@ -3358,22 +3401,6 @@ Status ReplicationCoordinatorImpl::_checkIfCommitQuorumCanBeSatisfied(
     return Status::OK();
 }
 
-StatusWith<bool> ReplicationCoordinatorImpl::checkIfCommitQuorumIsSatisfied(
-    const CommitQuorumOptions& commitQuorum,
-    const std::vector<HostAndPort>& commitReadyMembers) const {
-    // If the 'commitQuorum' cannot be satisfied with all the members of this replica set, we
-    // need to inform the caller to avoid hanging while waiting for satisfiability of the
-    // 'commitQuorum' with 'commitReadyMembers' due to replica set reconfigurations.
-    stdx::lock_guard<Latch> lock(_mutex);
-    Status status = _checkIfCommitQuorumCanBeSatisfied(lock, commitQuorum);
-    if (!status.isOK()) {
-        return status;
-    }
-
-    // Return whether or not the 'commitQuorum' is satisfied by the 'commitReadyMembers'.
-    return _topCoord->checkIfCommitQuorumIsSatisfied(commitQuorum, commitReadyMembers);
-}
-
 WriteConcernOptions ReplicationCoordinatorImpl::getGetLastErrorDefault() {
     stdx::lock_guard<Latch> lock(_mutex);
     if (_rsConfig.isInitialized()) {
@@ -3757,7 +3784,9 @@ Status ReplicationCoordinatorImpl::processReplSetRequestVotes(
         const int candidateIndex = args.getCandidateIndex();
         LastVote lastVote{args.getTerm(), candidateIndex};
 
-        if (response->getVoteGranted()) {
+        const bool votedForCandidate = response->getVoteGranted();
+
+        if (votedForCandidate) {
             Status status = _externalState->storeLocalLastVoteDocument(opCtx, lastVote);
             if (!status.isOK()) {
                 error() << "replSetRequestVotes failed to store LastVote document; " << status;
@@ -3767,7 +3796,6 @@ Status ReplicationCoordinatorImpl::processReplSetRequestVotes(
 
         // If the vote was not granted to the candidate, we still want to track metrics around the
         // node's participation in the election.
-        const bool votedForCandidate = response->getVoteGranted();
         const long long electionTerm = args.getTerm();
         const Date_t lastVoteDate = _replExecutor->now();
         const int electionCandidateMemberId =
@@ -3926,6 +3954,10 @@ EventHandle ReplicationCoordinatorImpl::_updateTerm_inlock(
     auto now = _replExecutor->now();
     TopologyCoordinator::UpdateTermResult localUpdateTermResult = _topCoord->updateTerm(term, now);
     if (localUpdateTermResult == TopologyCoordinator::UpdateTermResult::kUpdatedTerm) {
+        // When the node discovers a new term, the new term date metrics are now out-of-date, so we
+        // clear them.
+        ReplicationMetrics::get(getServiceContext()).clearParticipantNewTermDates();
+
         _termShadow.store(term);
         _cancelPriorityTakeover_inlock();
         _cancelAndRescheduleElectionTimeout_inlock();
@@ -3958,14 +3990,11 @@ void ReplicationCoordinatorImpl::waitUntilSnapshotCommitted(OperationContext* op
     uassert(ErrorCodes::NotYetInitialized,
             "Cannot use snapshots until replica set is finished initializing.",
             _rsConfigState != kConfigUninitialized && _rsConfigState != kConfigInitiating);
-    while (!_currentCommittedSnapshot ||
-           _currentCommittedSnapshot->opTime.getTimestamp() < untilSnapshot) {
-        opCtx->waitForConditionOrInterrupt(_currentCommittedSnapshotCond, lock);
-    }
-}
 
-size_t ReplicationCoordinatorImpl::getNumUncommittedSnapshots() {
-    return _uncommittedSnapshotsSize.load();
+    opCtx->waitForConditionOrInterrupt(_currentCommittedSnapshotCond, lock, [&] {
+        return _currentCommittedSnapshot &&
+            _currentCommittedSnapshot->opTime.getTimestamp() >= untilSnapshot;
+    });
 }
 
 void ReplicationCoordinatorImpl::createWMajorityWriteAvailabilityDateWaiter(OpTime opTime) {

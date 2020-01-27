@@ -53,6 +53,7 @@
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/free_mon/free_mon_mongod.h"
+#include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/kill_sessions_local.h"
 #include "mongo/db/logical_clock.h"
@@ -223,7 +224,6 @@ void ReplicationCoordinatorExternalStateImpl::startSteadyStateReplication(
         replCoord,
         _replicationProcess->getConsistencyMarkers(),
         _storageInterface,
-        applyOplogGroup,
         OplogApplier::Options(OplogApplication::Mode::kSecondary),
         _writerPool.get());
 
@@ -451,8 +451,8 @@ OpTime ReplicationCoordinatorExternalStateImpl::onTransitionToPrimary(OperationC
         WriteUnitOfWork wuow(opCtx);
         opCtx->getClient()->getServiceContext()->getOpObserver()->onOpMessage(
             opCtx,
-            BSON("msg"
-                 << "new primary"));
+            BSON(ReplicationCoordinator::newPrimaryMsgField
+                 << ReplicationCoordinator::newPrimaryMsg));
         wuow.commit();
     });
     const auto loadLastOpTimeAndWallTimeResult = loadLastOpTimeAndWallTime(opCtx);
@@ -460,7 +460,7 @@ OpTime ReplicationCoordinatorExternalStateImpl::onTransitionToPrimary(OperationC
     auto opTimeToReturn = loadLastOpTimeAndWallTimeResult.getValue().opTime;
 
     auto newTermStartDate = loadLastOpTimeAndWallTimeResult.getValue().wallTime;
-    ReplicationMetrics::get(opCtx).setNewTermStartDate(newTermStartDate);
+    ReplicationMetrics::get(opCtx).setCandidateNewTermStartDate(newTermStartDate);
 
     auto replCoord = ReplicationCoordinator::get(opCtx);
     replCoord->createWMajorityWriteAvailabilityDateWaiter(opTimeToReturn);
@@ -468,6 +468,8 @@ OpTime ReplicationCoordinatorExternalStateImpl::onTransitionToPrimary(OperationC
     _shardingOnTransitionToPrimaryHook(opCtx);
 
     _dropAllTempCollections(opCtx);
+
+    IndexBuildsCoordinator::get(opCtx)->onStepUp(opCtx);
 
     notifyFreeMonitoringOnTransitionToPrimary();
 

@@ -101,7 +101,7 @@ public:
 
     virtual void endBackup(OperationContext* opCtx) override;
 
-    virtual StatusWith<std::vector<std::string>> beginNonBlockingBackup(
+    virtual StatusWith<std::vector<BackupBlock>> beginNonBlockingBackup(
         OperationContext* opCtx) override;
 
     virtual void endNonBlockingBackup(OperationContext* opCtx) override;
@@ -332,6 +332,18 @@ public:
 
     std::unique_ptr<CheckpointLock> getCheckpointLock(OperationContext* opCtx) override {
         return _engine->getCheckpointLock(opCtx);
+    }
+
+    void addIndividuallyCheckpointedIndexToList(const std::string& ident) override {
+        return _engine->addIndividuallyCheckpointedIndexToList(ident);
+    }
+
+    void clearIndividuallyCheckpointedIndexesList() override {
+        return _engine->clearIndividuallyCheckpointedIndexesList();
+    }
+
+    bool isInIndividuallyCheckpointedIndexesList(const std::string& ident) const override {
+        return _engine->isInIndividuallyCheckpointedIndexesList(ident);
     }
 
     /**

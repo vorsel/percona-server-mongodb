@@ -46,6 +46,11 @@ class OperationContext;
 
 class IndexBuildInterceptor {
 public:
+    /**
+     * Determines if we will yield locks while draining the side tables.
+     */
+    enum class DrainYieldPolicy { kNoYield, kYield };
+
     enum class Op { kInsert, kDelete };
 
     static bool typeCanFastpathMultikeyUpdates(IndexType type);
@@ -112,7 +117,8 @@ public:
      */
     Status drainWritesIntoIndex(OperationContext* opCtx,
                                 const InsertDeleteOptions& options,
-                                RecoveryUnit::ReadSource readSource);
+                                RecoveryUnit::ReadSource readSource,
+                                DrainYieldPolicy drainYieldPolicy);
 
     /**
      * Returns 'true' if there are no visible records remaining to be applied from the side writes
@@ -145,10 +151,9 @@ private:
                        int64_t* const keysDeleted);
 
     /**
-     * Yield lock manager locks, but only when holding intent locks. Does nothing otherwise. If this
-     * yields locks, it will also abandon the current storage engine snapshot.
+     * Yield lock manager locks and abandon the current storage engine snapshot.
      */
-    void _tryYield(OperationContext*);
+    void _yield(OperationContext* opCtx);
 
     // The entry for the index that is being built.
     IndexCatalogEntry* _indexCatalogEntry;

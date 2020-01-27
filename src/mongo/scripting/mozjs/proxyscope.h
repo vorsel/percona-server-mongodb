@@ -32,9 +32,9 @@
 #include "vm/PosixNSPR.h"
 
 #include "mongo/client/dbclient_cursor.h"
-#include "mongo/platform/condition_variable.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/scripting/mozjs/engine.h"
+#include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/functional.h"
 
@@ -186,7 +186,7 @@ private:
     void runOnImplThread(unique_function<void()> f);
 
     void shutdownThread();
-    static void implThread(void* proxy);
+    static void implThread(MozJSProxyScope* proxy);
 
     MozJSScriptEngine* const _engine;
     MozJSImplScope* _implScope;
@@ -203,7 +203,7 @@ private:
 
     stdx::condition_variable _proxyCondvar;
     stdx::condition_variable _implCondvar;
-    PRThread* _thread;
+    stdx::thread _thread;
 };
 
 }  // namespace mozjs

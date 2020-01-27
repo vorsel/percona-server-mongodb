@@ -40,6 +40,7 @@
 #include <jsfriendapi.h>
 
 #include "mongo/base/error_codes.h"
+#include "mongo/config.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/platform/decimal128.h"
 #include "mongo/platform/mutex.h"
@@ -151,7 +152,7 @@ void MozJSImplScope::kill() {
 
         // If we are on the right thread, in the middle of an operation, and we have a registered
         // opCtx, then we should check the opCtx for interrupts.
-        if (_mr._thread.get() == PR_GetCurrentThread() && _inOp > 0 && _opCtx) {
+        if (_mr._thread.get_id() == stdx::this_thread::get_id() && _inOp > 0 && _opCtx) {
             _killStatus = _opCtx->checkForInterruptNoAssert();
         }
 
@@ -273,23 +274,6 @@ MozJSImplScope::MozRuntime::MozRuntime(const MozJSScriptEngine* engine) {
     }
     size_t mallocMemoryLimit = 1024ul * 1024 * jsHeapLimit;
     mongo::sm::reset(mallocMemoryLimit);
-
-    // If this runtime isn't running on an NSPR thread, then it is
-    // running on a mongo thread. In that case, we need to insert a
-    // fake NSPR thread so that the SM runtime can call PR functions
-    // without falling over.
-    auto thread = PR_GetCurrentThread();
-    if (!thread) {
-        _thread = std::unique_ptr<PRThread, std::function<void(PRThread*)>>(
-            PR_CreateFakeThread(), [](PRThread* ptr) {
-                if (ptr) {
-                    invariant(PR_GetCurrentThread() == ptr);
-                    PR_DestroyFakeThread(ptr);
-                    PR_BindThread(nullptr);
-                }
-            });
-        PR_BindThread(_thread.get());
-    }
 
     {
         stdx::unique_lock<Latch> lk(gRuntimeCreationMutex);

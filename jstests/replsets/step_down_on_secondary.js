@@ -18,6 +18,7 @@ load('jstests/libs/parallelTester.js');
 load("jstests/libs/curop_helpers.js");  // for waitForCurOpByFailPoint().
 load("jstests/core/txns/libs/prepare_helpers.js");
 load("jstests/libs/check_log.js");
+load("jstests/libs/fail_point_util.js");
 
 const dbName = "test";
 const collName = "coll";
@@ -90,8 +91,7 @@ TestData.clusterTimeAfterPrepare =
 rst.awaitReplication();
 
 jsTestLog("Do a read that hits a prepare conflict on the old primary");
-assert.commandWorked(
-    primary.adminCommand({configureFailPoint: "WTPrintPrepareConflictLog", mode: "alwaysOn"}));
+const wTPrintPrepareConflictLogFailPoint = configureFailPoint(primary, "WTPrintPrepareConflictLog");
 
 const joinReadThread = startParallelShell(() => {
     db.getMongo().setSlaveOk(true);
@@ -106,7 +106,7 @@ const joinReadThread = startParallelShell(() => {
 }, primary.port);
 
 jsTestLog("Wait to hit a prepare conflict");
-checkLog.contains(primary, "WTPrintPrepareConflictLog fail point enabled");
+wTPrintPrepareConflictLogFailPoint.wait();
 
 jsTestLog("Allow step down to complete");
 assert.commandWorked(
@@ -124,7 +124,8 @@ joinReadThread();
 
 // Validate that the read operation got killed during step down.
 const replMetrics = assert.commandWorked(primary.adminCommand({serverStatus: 1})).metrics.repl;
-assert.eq(replMetrics.stepDown.userOperationsKilled, 1, replMetrics);
+assert.eq(replMetrics.stateTransition.lastStateTransition, "stepDown");
+assert.eq(replMetrics.stateTransition.userOperationsKilled, 1, replMetrics);
 
 jsTestLog("Check nodes have correct data");
 assert.docEq(newPrimary.getDB(dbName)[collName].find({_id: 0}).toArray(), [{_id: 0, b: 1}]);

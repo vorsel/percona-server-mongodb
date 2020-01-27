@@ -45,6 +45,7 @@
 #include "mongo/db/catalog/index_build_block.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/index/index_access_method.h"
+#include "mongo/db/index/index_build_interceptor.h"
 #include "mongo/db/record_id.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/util/fail_point.h"
@@ -85,8 +86,17 @@ public:
      *
      * By only requiring this call after init(), we allow owners of the object to exit without
      * further handling if they never use the object.
+     *
+     * `onCleanUp` will be called after all indexes have been removed from the catalog.
      */
-    void cleanUpAfterBuild(OperationContext* opCtx, Collection* collection);
+    using OnCleanUpFn = std::function<void()>;
+    void cleanUpAfterBuild(OperationContext* opCtx, Collection* collection, OnCleanUpFn onCleanUp);
+
+    /**
+     * Not all index aborts need this function, in particular index builds that do not need
+     * to timestamp catalog writes. This is a no-op.
+     */
+    static OnCleanUpFn kNoopOnCleanUpFn;
 
     static bool areHybridIndexBuildsEnabled();
 
@@ -186,9 +196,9 @@ public:
      *
      * Must not be in a WriteUnitOfWork.
      */
-    Status drainBackgroundWrites(
-        OperationContext* opCtx,
-        RecoveryUnit::ReadSource readSource = RecoveryUnit::ReadSource::kUnset);
+    Status drainBackgroundWrites(OperationContext* opCtx,
+                                 RecoveryUnit::ReadSource readSource,
+                                 IndexBuildInterceptor::DrainYieldPolicy drainYieldPolicy);
 
     /**
      * Check any constraits that may have been temporarily violated during the index build for

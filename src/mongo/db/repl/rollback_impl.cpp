@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -267,13 +266,13 @@ bool RollbackImpl::_isInShutdown() const {
     return _inShutdown;
 }
 
-namespace {
-void killAllUserOperations(OperationContext* opCtx) {
+void RollbackImpl::_killAllUserOperations(OperationContext* opCtx) {
     invariant(opCtx);
     ServiceContext* serviceCtx = opCtx->getServiceContext();
     invariant(serviceCtx);
 
     int numOpsKilled = 0;
+    int numOpsRunning = 0;
 
     for (ServiceContext::LockedClientsCursor cursor(serviceCtx); Client* client = cursor.next();) {
         stdx::lock_guard<Client> lk(*client);
@@ -291,12 +290,17 @@ void killAllUserOperations(OperationContext* opCtx) {
         if (toKill && !toKill->isKillPending()) {
             serviceCtx->killOperation(lk, toKill, ErrorCodes::InterruptedDueToReplStateChange);
             numOpsKilled++;
+        } else {
+            numOpsRunning++;
         }
     }
 
-    log() << "Killed {} operation(s) while transitioning to ROLLBACK"_format(numOpsKilled);
+    // Update the metrics for tracking user operations during state transitions.
+    _replicationCoordinator->updateAndLogStateTransitionMetrics(
+        ReplicationCoordinator::OpsKillingStateTransitionEnum::kRollback,
+        numOpsKilled,
+        numOpsRunning);
 }
-}  // namespace
 
 Status RollbackImpl::_transitionToRollback(OperationContext* opCtx) {
     invariant(opCtx);
@@ -312,7 +316,7 @@ Status RollbackImpl::_transitionToRollback(OperationContext* opCtx) {
         // Kill all user operations to ensure we can successfully acquire the RSTL. Since the node
         // must be a secondary, this is only killing readers, whose connections will be closed
         // shortly regardless.
-        killAllUserOperations(opCtx);
+        _killAllUserOperations(opCtx);
 
         rstlLock.waitForLockUntil(Date_t::max());
 
@@ -587,7 +591,8 @@ void RollbackImpl::_correctRecordStoreCounts(OperationContext* opCtx) {
                 opCtx, PlanExecutor::INTERRUPT_ONLY, Collection::ScanDirection::kForward);
             long long countFromScan = 0;
             PlanExecutor::ExecState state;
-            while (PlanExecutor::ADVANCED == (state = exec->getNext(nullptr, nullptr))) {
+            while (PlanExecutor::ADVANCED ==
+                   (state = exec->getNext(static_cast<BSONObj*>(nullptr), nullptr))) {
                 ++countFromScan;
             }
             if (PlanExecutor::IS_EOF != state) {

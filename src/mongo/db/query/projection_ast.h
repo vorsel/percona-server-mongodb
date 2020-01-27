@@ -67,17 +67,23 @@ public:
 
     virtual std::unique_ptr<ASTNode> clone() const = 0;
 
-    virtual void acceptVisitor(ProjectionASTVisitor* visitor) = 0;
+    virtual void acceptVisitor(ProjectionASTMutableVisitor* visitor) = 0;
+    virtual void acceptVisitor(ProjectionASTConstVisitor* visitor) const = 0;
 
     const ASTNodeVector& children() const {
         return _children;
+    }
+
+    ASTNode* child(size_t index) const {
+        invariant(index < _children.size());
+        return _children[index].get();
     }
 
     const ASTNode* parent() const {
         return _parent;
     }
 
-    const bool isRoot() const {
+    bool isRoot() const {
         return !_parent;
     }
 
@@ -103,7 +109,11 @@ public:
         return std::make_unique<MatchExpressionASTNode>(*this);
     }
 
-    void acceptVisitor(ProjectionASTVisitor* visitor) override {
+    void acceptVisitor(ProjectionASTMutableVisitor* visitor) override {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(ProjectionASTConstVisitor* visitor) const override {
         visitor->visit(this);
     }
 
@@ -124,7 +134,11 @@ public:
         invariant(_children.size() == _fieldNames.size());
     }
 
-    void acceptVisitor(ProjectionASTVisitor* visitor) override {
+    void acceptVisitor(ProjectionASTMutableVisitor* visitor) override {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(ProjectionASTConstVisitor* visitor) const override {
         visitor->visit(this);
     }
 
@@ -147,6 +161,21 @@ public:
         _fieldNames.push_back(fieldName.toString());
     }
 
+    /**
+     * Remove a node which is a direct child of this tree. Returns true if anything was removed,
+     * false otherwise.
+     */
+    bool removeChild(StringData fieldName) {
+        if (auto it = std::find(_fieldNames.begin(), _fieldNames.end(), fieldName);
+            it != _fieldNames.end()) {
+            _children.erase(_children.begin() + std::distance(_fieldNames.begin(), it));
+            _fieldNames.erase(it);
+            return true;
+        }
+
+        return false;
+    }
+
     const std::vector<std::string>& fieldNames() const {
         return _fieldNames;
     }
@@ -163,7 +192,11 @@ public:
         addChildToInternalVector(std::move(child));
     }
 
-    void acceptVisitor(ProjectionASTVisitor* visitor) override {
+    void acceptVisitor(ProjectionASTMutableVisitor* visitor) override {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(ProjectionASTConstVisitor* visitor) const override {
         visitor->visit(this);
     }
 
@@ -176,7 +209,11 @@ class ProjectionSliceASTNode final : public ASTNode {
 public:
     ProjectionSliceASTNode(boost::optional<int> skip, int limit) : _skip(skip), _limit(limit) {}
 
-    void acceptVisitor(ProjectionASTVisitor* visitor) override {
+    void acceptVisitor(ProjectionASTMutableVisitor* visitor) override {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(ProjectionASTConstVisitor* visitor) const override {
         visitor->visit(this);
     }
 
@@ -204,7 +241,11 @@ public:
         addChildToInternalVector(std::move(child));
     }
 
-    void acceptVisitor(ProjectionASTVisitor* visitor) override {
+    void acceptVisitor(ProjectionASTMutableVisitor* visitor) override {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(ProjectionASTConstVisitor* visitor) const override {
         visitor->visit(this);
     }
 
@@ -228,7 +269,11 @@ public:
         _expr = clonedExpr;
     }
 
-    void acceptVisitor(ProjectionASTVisitor* visitor) override {
+    void acceptVisitor(ProjectionASTMutableVisitor* visitor) override {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(ProjectionASTConstVisitor* visitor) const override {
         visitor->visit(this);
     }
 
@@ -252,7 +297,11 @@ class BooleanConstantASTNode final : public ASTNode {
 public:
     BooleanConstantASTNode(bool val) : _val(val) {}
 
-    void acceptVisitor(ProjectionASTVisitor* visitor) override {
+    void acceptVisitor(ProjectionASTMutableVisitor* visitor) override {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(ProjectionASTConstVisitor* visitor) const override {
         visitor->visit(this);
     }
 

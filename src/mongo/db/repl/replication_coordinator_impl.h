@@ -149,10 +149,6 @@ public:
     virtual Status checkIfCommitQuorumCanBeSatisfied(
         const CommitQuorumOptions& commitQuorum) const override;
 
-    virtual StatusWith<bool> checkIfCommitQuorumIsSatisfied(
-        const CommitQuorumOptions& commitQuorum,
-        const std::vector<HostAndPort>& commitReadyMembers) const override;
-
     virtual Status checkCanServeReadsFor(OperationContext* opCtx,
                                          const NamespaceString& ns,
                                          bool slaveOk);
@@ -316,8 +312,6 @@ public:
 
     virtual void appendConnectionStats(executor::ConnectionPoolStats* stats) const override;
 
-    virtual size_t getNumUncommittedSnapshots() override;
-
     virtual void createWMajorityWriteAvailabilityDateWaiter(OpTime opTime) override;
 
     virtual WriteConcernOptions populateUnsetWriteConcernOptionsSyncMode(
@@ -338,6 +332,11 @@ public:
     virtual void attemptToAdvanceStableTimestamp() override;
 
     virtual void finishRecoveryIfEligible(OperationContext* opCtx) override;
+
+    virtual void updateAndLogStateTransitionMetrics(
+        const ReplicationCoordinator::OpsKillingStateTransitionEnum stateTransition,
+        const size_t numOpsKilled,
+        const size_t numOpsRunning) const override;
 
     // ================== Test support API ===================
 
@@ -491,9 +490,11 @@ private:
     // operations (user/system) and aborts stashed running transactions.
     class AutoGetRstlForStepUpStepDown {
     public:
-        AutoGetRstlForStepUpStepDown(ReplicationCoordinatorImpl* repl,
-                                     OperationContext* opCtx,
-                                     Date_t deadline = Date_t::max());
+        AutoGetRstlForStepUpStepDown(
+            ReplicationCoordinatorImpl* repl,
+            OperationContext* opCtx,
+            ReplicationCoordinator::OpsKillingStateTransitionEnum stateTransition,
+            Date_t deadline = Date_t::max());
 
         // Disallows copying.
         AutoGetRstlForStepUpStepDown(const AutoGetRstlForStepUpStepDown&) = delete;
@@ -510,6 +511,16 @@ private:
         void rstlReacquire();
 
         /*
+         * Returns _userOpsKilled value.
+         */
+        size_t getUserOpsKilled() const;
+
+        /*
+         * Increments _userOpsKilled by val.
+         */
+        void incrementUserOpsKilled(size_t val = 1);
+
+        /*
          * Returns _userOpsRunning value.
          */
         size_t getUserOpsRunning() const;
@@ -517,7 +528,7 @@ private:
         /*
          * Increments _userOpsRunning by val.
          */
-        void incrUserOpsRunningBy(size_t val = 1);
+        void incrementUserOpsRunning(size_t val = 1);
 
         /*
          * Returns the step up/step down opCtx.
@@ -570,7 +581,9 @@ private:
         boost::optional<ReplicationStateTransitionLockGuard> _rstlLock;
         // Thread that will run killOpThreadFn().
         std::unique_ptr<stdx::thread> _killOpThread;
-        // Tracks number of operations left running on step down.
+        // Tracks number of operations killed on step up / step down.
+        size_t _userOpsKilled = 0;
+        // Tracks number of operations left running on step up / step down.
         size_t _userOpsRunning = 0;
         // Protects killSignaled and stopKillingOps cond. variable.
         Mutex _mutex = MONGO_MAKE_LATCH("AutoGetRstlForStepUpStepDown::_mutex");
@@ -578,6 +591,9 @@ private:
         stdx::condition_variable _stopKillingOps;
         // Once this is set to true, the killOpThreadFn method will terminate.
         bool _killSignaled = false;
+        // The state transition that is in progress. Should never be set to rollback within this
+        // class.
+        ReplicationCoordinator::OpsKillingStateTransitionEnum _stateTransition;
     };
 
     struct Waiter {
@@ -724,11 +740,6 @@ private:
     OpTimeAndWallTime _getCurrentCommittedSnapshotOpTimeAndWallTime_inlock() const;
 
     /**
-     * Returns the OpTime of the current committed snapshot converted to LogicalTime.
-     */
-    LogicalTime _getCurrentCommittedLogicalTime_inlock() const;
-
-    /**
      *  Verifies that ReadConcernArgs match node's readConcern.
      */
     Status _validateReadConcern(OperationContext* opCtx, const ReadConcernArgs& readConcern);
@@ -790,8 +801,6 @@ private:
 
     Status _checkIfCommitQuorumCanBeSatisfied(WithLock,
                                               const CommitQuorumOptions& commitQuorum) const;
-
-    bool _canAcceptWritesFor_inlock(const NamespaceString& ns);
 
     int _getMyId_inlock() const;
 
@@ -1047,12 +1056,6 @@ private:
     executor::TaskExecutor::EventHandle _stepDownStart();
 
     /**
-     * Update the "repl.stepDown.userOperationsRunning" counter and log number of operations
-     * killed and left running on step down.
-     */
-    void _updateAndLogStatsOnStepDown(const AutoGetRstlForStepUpStepDown* arsd) const;
-
-    /**
      * kill all conflicting operations that are blocked either on prepare conflict or have taken
      * global lock not in MODE_IS. The conflicting operations can be either user or system
      * operations marked as killable.
@@ -1243,6 +1246,7 @@ private:
      * Callback which starts an election if this node is electable and using protocolVersion 1.
      */
     void _startElectSelfIfEligibleV1(StartElectionReasonEnum reason);
+    void _startElectSelfIfEligibleV1(WithLock, StartElectionReasonEnum reason);
 
     /**
      * Schedules work to be run no sooner than 'when' and returns handle to callback.
@@ -1421,20 +1425,9 @@ private:
     std::shared_ptr<InitialSyncer>
         _initialSyncer;  // (I) pointer set under mutex, copied by callers.
 
-    // Hands out the next snapshot name.
-    AtomicWord<unsigned long long> _snapshotNameGenerator;  // (S)
-
-    // The OpTimes and SnapshotNames for all snapshots newer than the current commit point, kept in
-    // sorted order. Any time this is changed, you must also update _uncommitedSnapshotsSize.
-    std::deque<OpTime> _uncommittedSnapshots;  // (M)
-
-    // A cache of the size of _uncommittedSnaphots that can be read without any locking.
-    // May only be written to while holding _mutex.
-    AtomicWord<unsigned long long> _uncommittedSnapshotsSize;  // (I)
-
     // The non-null OpTimeAndWallTime and SnapshotName of the current snapshot used for committed
     // reads, if there is one.
-    // When engaged, this must be <= _lastCommittedOpTime and < _uncommittedSnapshots.front().
+    // When engaged, this must be <= _lastCommittedOpTime.
     boost::optional<OpTimeAndWallTime> _currentCommittedSnapshot;  // (M)
 
     // A set of optimes that are used for computing the replication system's current 'stable'

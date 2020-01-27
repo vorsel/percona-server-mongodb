@@ -188,7 +188,7 @@ Status startIndexBuild(OperationContext* opCtx,
 
     IndexBuildsCoordinator::IndexBuildOptions indexBuildOptions;
     invariant(!indexBuildOptions.commitQuorum);
-    indexBuildOptions.replSetAndNotPrimary = true;
+    indexBuildOptions.replSetAndNotPrimaryAtStart = true;
 
     // We don't pass in a commit quorum here because secondary nodes don't have any knowledge of it.
     return IndexBuildsCoordinator::get(opCtx)
@@ -212,8 +212,10 @@ Status commitIndexBuild(OperationContext* opCtx,
     if (!statusWithIndexes.isOK()) {
         return statusWithIndexes.getStatus();
     }
-    return IndexBuildsCoordinator::get(opCtx)->commitIndexBuild(
-        opCtx, statusWithIndexes.getValue(), indexBuildUUID);
+    auto indexBuildsCoord = IndexBuildsCoordinator::get(opCtx);
+    indexBuildsCoord->commitIndexBuild(opCtx, statusWithIndexes.getValue(), indexBuildUUID);
+    indexBuildsCoord->joinIndexBuild(opCtx, indexBuildUUID);
+    return Status::OK();
 }
 
 Status abortIndexBuild(OperationContext* opCtx,
@@ -221,11 +223,12 @@ Status abortIndexBuild(OperationContext* opCtx,
                        const Status& cause,
                        OplogApplication::Mode mode) {
     // Wait until the index build finishes aborting.
-    Future<void> abort = IndexBuildsCoordinator::get(opCtx)->abortIndexBuildByBuildUUID(
+    IndexBuildsCoordinator::get(opCtx)->abortIndexBuildByBuildUUID(
         opCtx,
         indexBuildUUID,
         str::stream() << "abortIndexBuild oplog entry encountered: " << cause);
-    return abort.waitNoThrow();
+    IndexBuildsCoordinator::get(opCtx)->joinIndexBuild(opCtx, indexBuildUUID);
+    return Status::OK();
 }
 
 void createIndexForApplyOps(OperationContext* opCtx,
@@ -275,7 +278,7 @@ void createIndexForApplyOps(OperationContext* opCtx,
         // it.
         IndexBuildsCoordinator::IndexBuildOptions indexBuildOptions;
         invariant(!indexBuildOptions.commitQuorum);
-        indexBuildOptions.replSetAndNotPrimary = true;
+        indexBuildOptions.replSetAndNotPrimaryAtStart = true;
 
         // This spawns a new thread and returns immediately.
         MONGO_COMPILER_VARIABLE_UNUSED auto fut = uassertStatusOK(
@@ -1099,7 +1102,7 @@ StatusWith<OplogApplication::Mode> OplogApplication::parseMode(const std::string
 // See replset initial sync code.
 Status applyOperation_inlock(OperationContext* opCtx,
                              Database* db,
-                             const OplogEntryBatch& opOrGroupedInserts,
+                             const OplogEntryOrGroupedInserts& opOrGroupedInserts,
                              bool alwaysUpsert,
                              OplogApplication::Mode mode,
                              IncrementOpsAppliedStatsFn incrementOpsAppliedStats) {

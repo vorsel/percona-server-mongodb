@@ -3,13 +3,17 @@
  * of initial sync.  Additionally, we will test that a background index build blocks this particular
  * situation until the index build is finished.
  *
- * @tags: [uses_transactions, uses_prepare_transaction]
+ * TODO(SERVER-44042): Remove two_phase_index_builds_unsupported tag.
+ * @tags: [
+ *     uses_transactions,
+ *     uses_prepare_transaction,
+ *     two_phase_index_builds_unsupported,
+ * ]
  */
 
 (function() {
 "use strict";
 
-load("jstests/libs/check_log.js");
 load("jstests/core/txns/libs/prepare_helpers.js");
 
 const replTest = new ReplSetTest({nodes: 2});
@@ -54,7 +58,8 @@ secondary = replTest.start(
     true /* wait */);
 
 // Wait for failpoint to be reached so we know that collection cloning is paused.
-checkLog.contains(secondary, "initialSyncHangDuringCollectionClone fail point enabled");
+assert.commandWorked(secondary.adminCommand(
+    {waitForFailPoint: "initialSyncHangDuringCollectionClone", timesEntered: 1}));
 
 jsTestLog("Running operations while collection cloning is paused");
 

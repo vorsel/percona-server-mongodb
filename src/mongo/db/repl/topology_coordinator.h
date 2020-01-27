@@ -407,14 +407,14 @@ public:
         const StatusWith<ReplSetHeartbeatResponse>& hbResponse);
 
     /**
-     *  Returns whether or not at least 'numNodes' have reached the given opTime.
+     *  Returns whether or not at least 'numNodes' have reached the given opTime with the same term.
      * "durablyWritten" indicates whether the operation has to be durably applied.
      */
     bool haveNumNodesReachedOpTime(const OpTime& opTime, int numNodes, bool durablyWritten);
 
     /**
-     * Returns whether or not at least one node matching the tagPattern has reached
-     * the given opTime.
+     * Returns whether or not at least one node matching the tagPattern has reached the given opTime
+     * with the same term.
      * "durablyWritten" indicates whether the operation has to be durably applied.
      */
     bool haveTaggedNodesReachedOpTime(const OpTime& opTime,
@@ -696,14 +696,6 @@ public:
      */
     bool checkIfCommitQuorumCanBeSatisfied(const CommitQuorumOptions& commitQuorum,
                                            const std::vector<MemberConfig>& members) const;
-
-    /**
-     * Returns 'true' if the 'commitQuorum' is satisifed by the 'commitReadyMembers'.
-     *
-     * 'commitReadyMembers' must be part of the replica set configuration.
-     */
-    bool checkIfCommitQuorumIsSatisfied(const CommitQuorumOptions& commitQuorum,
-                                        const std::vector<HostAndPort>& commitReadyMembers) const;
 
     ////////////////////////////////////////////////////////////
     //

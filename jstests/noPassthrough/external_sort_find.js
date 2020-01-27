@@ -14,13 +14,16 @@ load("jstests/libs/analyze_plan.js");
 // Only allow blocking sort execution to use 100 kB of memory.
 const kMaxMemoryUsageBytes = 100 * 1024;
 
-const kNumDocsWithinMemLimit = 70;
-const kNumDocsExceedingMemLimit = 100;
+// TODO (SERVER-43993): Documents can occupy twice as much memory as needed to just store the BSON
+// contents of the documents, which is why we can exceed the 100kB memory limit with just 50
+// documents, instead of the roughly 100 documents we might expect.
+const kNumDocsWithinMemLimit = 35;
+const kNumDocsExceedingMemLimit = 50;
 
 const kMemoryLimitExceededErrCode = 16819;
 
 const options = {
-    setParameter: "internalQueryExecMaxBlockingSortBytes=" + kMaxMemoryUsageBytes
+    setParameter: "internalQueryMaxBlockingSortMemoryUsageBytes=" + kMaxMemoryUsageBytes
 };
 const conn = MongoRunner.runMongod(options);
 assert.neq(null, conn, "mongod was unable to start up with options: " + tojson(options));
@@ -95,6 +98,17 @@ assert.eq(sortStats.usedDisk, true);
 // limit.
 assert.eq(kNumDocsWithinMemLimit,
           collection.find().sort({sequenceNumber: -1}).limit(kNumDocsWithinMemLimit).itcount());
+
+// Create a view on top of the collection. When a find command is run against the view without disk
+// use allowed, the command should fail with the expected error code. When the find command allows
+// disk use, however, the command should succeed.
+assert.commandWorked(testDb.createView("identityView", collection.getName(), []));
+const identityView = testDb.identityView;
+assert.commandFailedWithCode(
+    testDb.runCommand({find: identityView.getName(), sort: {sequenceNumber: -1}}),
+    kMemoryLimitExceededErrCode);
+assert.eq(kNumDocsExceedingMemLimit,
+          identityView.find().sort({sequenceNumber: -1}).allowDiskUse().itcount());
 
 MongoRunner.stopMongod(conn);
 }());

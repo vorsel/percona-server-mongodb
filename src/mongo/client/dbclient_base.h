@@ -351,11 +351,11 @@ public:
     /** count number of objects in collection ns that match the query criteria specified
         throws UserAssertion if database returns an error
     */
-    virtual unsigned long long count(NamespaceStringOrUUID nsOrUuid,
-                                     const BSONObj& query = BSONObj(),
-                                     int options = 0,
-                                     int limit = 0,
-                                     int skip = 0);
+    virtual long long count(NamespaceStringOrUUID nsOrUuid,
+                            const BSONObj& query = BSONObj(),
+                            int options = 0,
+                            int limit = 0,
+                            int skip = 0);
 
     static std::string createPasswordDigest(const std::string& username,
                                             const std::string& clearTextPassword);
@@ -461,6 +461,16 @@ public:
      * }
      */
     std::list<BSONObj> getCollectionInfos(const std::string& db, const BSONObj& filter = BSONObj());
+
+    /**
+     * Lists databases available on the server.
+     * @param filter A filter for the results
+     * @param nameOnly Only return the names of the databases
+     * @param authorizedDatabases Only return the databases the user is authorized on
+     */
+    std::vector<BSONObj> getDatabaseInfos(const BSONObj& filter = BSONObj(),
+                                          const bool nameOnly = false,
+                                          const bool authorizedDatabases = false);
 
     bool exists(const std::string& ns);
 

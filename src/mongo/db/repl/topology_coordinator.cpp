@@ -65,7 +65,8 @@ namespace mongo {
 namespace repl {
 
 MONGO_FAIL_POINT_DEFINE(forceSyncSourceCandidate);
-MONGO_FAIL_POINT_DEFINE(forceVoteInElection);
+MONGO_FAIL_POINT_DEFINE(voteNoInElection);
+MONGO_FAIL_POINT_DEFINE(voteYesInDryRunButNoInRealElection);
 
 // If this fail point is enabled, TopologyCoordinator::shouldChangeSyncSource() will ignore
 // the option TopologyCoordinator::Options::maxSyncSourceLagSecs. The sync source will not be
@@ -829,6 +830,12 @@ bool TopologyCoordinator::haveNumNodesReachedOpTime(const OpTime& targetOpTime,
         return false;
     }
 
+    // Invariants that we only wait for an OpTime in the term that this node is currently writing
+    // to. In other words, we do not support waiting for an OpTime written by a previous primary
+    // because comparing members' lastApplied/lastDurable alone is not sufficient to tell if the
+    // OpTime has been replicated.
+    invariant(targetOpTime.getTerm() == getMyLastAppliedOpTime().getTerm());
+
     for (auto&& memberData : _memberData) {
         const auto isArbiter = _rsConfig.getMemberAt(memberData.getConfigIndex()).isArbiter();
 
@@ -840,7 +847,14 @@ bool TopologyCoordinator::haveNumNodesReachedOpTime(const OpTime& targetOpTime,
         const OpTime& memberOpTime =
             durablyWritten ? memberData.getLastDurableOpTime() : memberData.getLastAppliedOpTime();
 
-        if (memberOpTime >= targetOpTime) {
+        // In addition to checking if a member has a greater/equal timestamp field we also need to
+        // make sure that the memberOpTime is in the same term as the OpTime we wait for. If a
+        // member's OpTime has a higher term, it indicates that this node will be stepping down. And
+        // thus we do not know if the target OpTime in our previous term has been replicated to the
+        // member because the memberOpTime in a higher term could correspond to an operation in a
+        // divergent branch of history regardless of its timestamp.
+        if (memberOpTime.getTerm() == targetOpTime.getTerm() &&
+            memberOpTime.getTimestamp() >= targetOpTime.getTimestamp()) {
             --numNodes;
         }
 
@@ -855,10 +869,25 @@ bool TopologyCoordinator::haveTaggedNodesReachedOpTime(const OpTime& opTime,
                                                        const ReplSetTagPattern& tagPattern,
                                                        bool durablyWritten) {
     ReplSetTagMatch matcher(tagPattern);
+
+    // Invariants that we only wait for an OpTime in the term that this node is currently writing
+    // to. In other words, we do not support waiting for an OpTime written by a previous primary
+    // because comparing members' lastApplied/lastDurable alone is not sufficient to tell if the
+    // OpTime has been replicated.
+    invariant(opTime.getTerm() == getMyLastAppliedOpTime().getTerm());
+
     for (auto&& memberData : _memberData) {
         const OpTime& memberOpTime =
             durablyWritten ? memberData.getLastDurableOpTime() : memberData.getLastAppliedOpTime();
-        if (memberOpTime >= opTime) {
+
+        // In addition to checking if a member has a greater/equal timestamp field we also need to
+        // make sure that the memberOpTime is in the same term as the OpTime we wait for. If a
+        // member's OpTime has a higher term, it indicates that this node will be stepping down. And
+        // thus we do not know if the target OpTime in our previous term has been replicated to the
+        // member because the memberOpTime in a higher term could correspond to an operation in a
+        // divergent branch of history regardless of its timestamp.
+        if (memberOpTime.getTerm() == opTime.getTerm() &&
+            memberOpTime.getTimestamp() >= opTime.getTimestamp()) {
             // This node has reached the desired optime, now we need to check if it is a part
             // of the tagPattern.
             int memberIndex = memberData.getConfigIndex();
@@ -2694,13 +2723,25 @@ void TopologyCoordinator::processReplSetRequestVotes(const ReplSetRequestVotesAr
                                                      ReplSetRequestVotesResponse* response) {
     response->setTerm(_term);
 
-    if (MONGO_unlikely(forceVoteInElection.shouldFail())) {
+    if (MONGO_unlikely(voteNoInElection.shouldFail())) {
+        log() << "failpoint voteNoInElection enabled";
+        response->setVoteGranted(false);
+        response->setReason(str::stream() << "forced to vote no during dry run election due to "
+                                             "failpoint voteNoInElection set");
+        return;
+    }
+
+    if (MONGO_unlikely(voteYesInDryRunButNoInRealElection.shouldFail())) {
+        log() << "failpoint voteYesInDryRunButNoInRealElection enabled";
         if (args.isADryRun()) {
             response->setVoteGranted(true);
+            response->setReason(str::stream() << "forced to vote yes in dry run due to failpoint "
+                                                 "voteYesInDryRunButNoInRealElection set");
         } else {
             response->setVoteGranted(false);
             response->setReason(str::stream()
-                                << "forced to vote no due to failpoint forceVoteInElection set");
+                                << "forced to vote no in real election due to failpoint "
+                                   "voteYesInDryRunButNoInRealElection set");
         }
         return;
     }
@@ -2914,24 +2955,6 @@ bool TopologyCoordinator::checkIfCommitQuorumCanBeSatisfied(
         }
         return false;
     }
-}
-
-bool TopologyCoordinator::checkIfCommitQuorumIsSatisfied(
-    const CommitQuorumOptions& commitQuorum,
-    const std::vector<HostAndPort>& commitReadyMembers) const {
-    std::vector<MemberConfig> commitReadyMemberConfigs;
-    for (auto& commitReadyMember : commitReadyMembers) {
-        const MemberConfig* memberConfig = _rsConfig.findMemberByHostAndPort(commitReadyMember);
-
-        invariant(memberConfig);
-        commitReadyMemberConfigs.push_back(*memberConfig);
-    }
-
-    // Calling this with commit ready members only is the same as checking if the commit quorum is
-    // satisfied. Because the 'commitQuorum' is based on the participation of all the replica set
-    // members, and if the 'commitQuorum' can be satisfied with all the commit ready members, then
-    // the commit quorum is satisfied in this replica set configuration.
-    return checkIfCommitQuorumCanBeSatisfied(commitQuorum, commitReadyMemberConfigs);
 }
 
 }  // namespace repl

@@ -14,9 +14,7 @@ function login(userObj) {
 var adminUser = {db: "admin", username: "foo", password: "bar"};
 
 // set up a 2 shard cluster with keyfile
-// TODO: Remove 'shardAsReplicaSet: false' when SERVER-32672 is fixed.
-var st = new ShardingTest(
-    {shards: 1, mongos: 1, other: {keyFile: 'jstests/libs/key1', shardAsReplicaSet: false}});
+var st = new ShardingTest({shards: 1, mongos: 1, other: {keyFile: 'jstests/libs/key1'}});
 
 var mongos = st.s0;
 var admin = mongos.getDB("admin");
@@ -34,21 +32,26 @@ login(adminUser);
 assert.eq(1, st.config.shards.count(), "initial server count wrong");
 
 // start a mongod with NO keyfile
-var conn = MongoRunner.runMongod({shardsvr: ""});
-print(conn);
+var rst = new ReplSetTest({nodes: 1});
+rst.startSet({shardsvr: ""});
+rst.initiateWithAnyNodeAsPrimary();
 
 // --------------- Test 1 --------------------
 // Add shard to the existing cluster (should fail because it was added without a keyfile)
-printjson(assert.commandFailed(admin.runCommand({addShard: conn.host})));
+printjson(assert.commandFailed(admin.runCommand({addShard: rst.getURL()})));
 
 // stop mongod
-MongoRunner.stopMongod(conn);
+rst.stopSet();
 
 //--------------- Test 2 --------------------
 // start mongod again, this time with keyfile
-var conn = MongoRunner.runMongod({keyFile: "jstests/libs/key1", shardsvr: ""});
+rst = new ReplSetTest({nodes: 1});
+rst.startSet({keyFile: "jstests/libs/key1", shardsvr: ""});
+rst.initiateWithAnyNodeAsPrimary();
+
 // try adding the new shard
-assert.commandWorked(admin.runCommand({addShard: conn.host}));
+var addShardRes = admin.runCommand({addShard: rst.getURL()});
+assert.commandWorked(addShardRes);
 
 // Add some data
 var db = mongos.getDB("foo");
@@ -56,7 +59,7 @@ var collA = mongos.getCollection("foo.bar");
 
 // enable sharding on a collection
 assert.commandWorked(admin.runCommand({enableSharding: "" + collA.getDB()}));
-st.ensurePrimaryShard("foo", "shard0000");
+st.ensurePrimaryShard("foo", st.shard0.shardName);
 
 assert.commandWorked(admin.runCommand({shardCollection: "" + collA, key: {_id: 1}}));
 
@@ -67,7 +70,8 @@ for (var i = 0; i < 4; i++) {
 }
 
 // move a chunk
-assert.commandWorked(admin.runCommand({moveChunk: "foo.bar", find: {_id: 1}, to: "shard0001"}));
+assert.commandWorked(
+    admin.runCommand({moveChunk: "foo.bar", find: {_id: 1}, to: addShardRes.shardAdded}));
 
 // verify the chunk was moved
 admin.runCommand({flushRouterConfig: 1});
@@ -80,11 +84,11 @@ st.startBalancer();
 
 //--------------- Test 3 --------------------
 // now drain the shard
-assert.commandWorked(admin.runCommand({removeShard: conn.host}));
+assert.commandWorked(admin.runCommand({removeShard: rst.getURL()}));
 
 // give it some time to drain
 assert.soon(function() {
-    var result = admin.runCommand({removeShard: conn.host});
+    var result = admin.runCommand({removeShard: rst.getURL()});
     printjson(result);
 
     return result.ok && result.state == "completed";
@@ -92,7 +96,7 @@ assert.soon(function() {
 
 assert.eq(1, st.config.shards.count(), "removed server still appears in count");
 
-MongoRunner.stopMongod(conn);
+rst.stopSet();
 
 st.stop();
 })();

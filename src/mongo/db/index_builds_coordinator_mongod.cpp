@@ -130,18 +130,6 @@ IndexBuildsCoordinatorMongod::startIndexBuild(OperationContext* opCtx,
     const auto deadline = opCtx->getDeadline();
     const auto timeoutError = opCtx->getTimeoutError();
 
-    // TODO: SERVER-39484 Because both 'writesAreReplicated' and
-    // 'shouldNotConflictWithSecondaryBatchApplication' depend on the current replication state,
-    // just passing the state here is not resilient to member state changes like stepup/stepdown.
-
-    // If the calling thread is replicating oplog writes (primary), this state should be passed to
-    // the builder.
-    const bool writesAreReplicated = opCtx->writesAreReplicated();
-    // Index builds on secondaries can't hold the PBWM lock because it would conflict with
-    // replication.
-    const bool shouldNotConflictWithSecondaryBatchApplication =
-        !opCtx->lockState()->shouldConflictWithSecondaryBatchApplication();
-
     // Task in thread pool should have similar CurOp representation to the caller so that it can be
     // identified as a createIndexes operation.
     LogicalOp logicalOp = LogicalOp::opInvalid;
@@ -159,8 +147,6 @@ IndexBuildsCoordinatorMongod::startIndexBuild(OperationContext* opCtx,
         indexBuildOptions,
         deadline,
         timeoutError,
-        writesAreReplicated,
-        shouldNotConflictWithSecondaryBatchApplication,
         logicalOp,
         opDesc,
         replState
@@ -185,16 +171,10 @@ IndexBuildsCoordinatorMongod::startIndexBuild(OperationContext* opCtx,
 
         opCtx->setDeadlineByDate(deadline, timeoutError);
 
-        boost::optional<repl::UnreplicatedWritesBlock> unreplicatedWrites;
-        if (!writesAreReplicated) {
-            unreplicatedWrites.emplace(opCtx.get());
-        }
-
-        // If the calling thread should not take the PBWM lock, neither should this thread.
-        boost::optional<ShouldNotConflictWithSecondaryBatchApplicationBlock> shouldNotConflictBlock;
-        if (shouldNotConflictWithSecondaryBatchApplication) {
-            shouldNotConflictBlock.emplace(opCtx->lockState());
-        }
+        // Index builds should never take the PBWM lock, even on a primary. This allows the index
+        // to continue running after the node steps down to a secondary.
+        ShouldNotConflictWithSecondaryBatchApplicationBlock shouldNotConflictBlock(
+            opCtx->lockState());
 
         {
             stdx::unique_lock<Client> lk(*opCtx->getClient());

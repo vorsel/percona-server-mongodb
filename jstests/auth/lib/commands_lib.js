@@ -4784,6 +4784,22 @@ var authCommandsLib = {
           ]
         },
         {
+          testname: "_configsvrRefineCollectionShardKey",
+          command:
+            {_configsvrRefineCollectionShardKey: "test.x", key: {aKey: 1}, epoch: ObjectId()},
+          skipSharded: true,
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: {__system: 1},
+                privileges: [{resource: {cluster: true}, actions: ["internal"]}],
+                expectFail: true
+              },
+              {runOnDb: firstDbName, roles: {}},
+              {runOnDb: secondDbName, roles: {}}
+          ]
+        },
+        {
           testname: "renameCollection_sameDb",
           command: {renameCollection: firstDbName + ".x", to: firstDbName + ".y", dropTarget: true},
           setup: function(db) {
@@ -5595,6 +5611,35 @@ var authCommandsLib = {
           setup: function(db) {
               db.runCommand({startRecordingTraffic: 1, filename: "notARealPath"});
           }
+        },
+        {
+          testname: "clearJumboFlag",
+          command: {clearJumboFlag: "test.x"},
+          skipUnlessSharded: true,
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: roles_clusterManager,
+                privileges: [{resource: {db: "test", collection: "x"}, actions: ["clearJumboFlag"]}],
+                expectFail: true
+              },
+              {runOnDb: firstDbName, roles: {}},
+              {runOnDb: secondDbName, roles: {}}
+          ]
+        },
+        {
+          testname: "_configsvrClearJumboFlag",
+          command: {_configsvrClearJumboFlag: "x.y", epoch: ObjectId(), minKey: {x: 0}, maxKey: {x: 10}},
+          skipSharded: true,
+          expectFail: true,
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: {__system: 1},
+                privileges: [{resource: {cluster: true}, actions: ["internal"]}],
+                expectFail: true
+              },
+          ]
         },
     ],
 

@@ -86,6 +86,8 @@ ReplCoordTest::ReplCoordTest() {
 }
 
 ReplCoordTest::~ReplCoordTest() {
+    logger::globalLogDomain()->clearMinimumLoggedSeverity(
+        logger::LogComponent::kReplicationElection);
     globalFailPointRegistry().find("blockHeartbeatReconfigFinish")->setMode(FailPoint::off);
 
     if (_callShutdown) {
@@ -332,7 +334,7 @@ void ReplCoordTest::simulateSuccessfulV1ElectionWithoutExitingDrainMode(Date_t e
         log() << request.target.toString() << " processing " << request.cmdObj;
         ReplSetHeartbeatArgsV1 hbArgs;
         Status status = hbArgs.initialize(request.cmdObj);
-        if (hbArgs.initialize(request.cmdObj).isOK()) {
+        if (status.isOK()) {
             ReplSetHeartbeatResponse hbResp;
             hbResp.setSetName(rsConfig.getReplSetName());
             hbResp.setState(MemberState::RS_SECONDARY);

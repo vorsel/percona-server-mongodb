@@ -62,6 +62,10 @@
  *     settings {object}: Setting used in the replica set config document.
  *        Example:
  *              settings: { chainingAllowed: false, ... }
+ *
+ *     seedRandomNumberGenerator {boolean}: Indicates whether the random number generator should
+ *        be seeded when randomBinVersions is true. For ReplSetTests started by ShardingTest, the
+ *        seed is generated as part of ShardingTest.
  *   }
  *
  * Member variables:
@@ -567,6 +571,7 @@ var ReplSetTest = function(opts) {
      */
     this.startSet = function(options, restart) {
         print("ReplSetTest starting set");
+        let startTime = new Date();  // Measure the execution time of this function.
 
         if (options && options.keyFile) {
             self.keyFile = options.keyFile;
@@ -578,9 +583,11 @@ var ReplSetTest = function(opts) {
 
         var nodes = [];
 
-        if (jsTest.options().randomBinVersions) {
+        if (jsTest.options().useRandomBinVersionsWithinReplicaSet &&
+            self.seedRandomNumberGenerator) {
             // Set the random seed to the value passed in by TestData. The seed is undefined
-            // by default.
+            // by default. For sharded clusters, the seed is already initialized as part of
+            // ShardingTest.
             Random.setRandomSeed(jsTest.options().seed);
         }
 
@@ -589,6 +596,8 @@ var ReplSetTest = function(opts) {
         }
 
         this.nodes = nodes;
+        print("ReplSetTest startSet took " + (new Date() - startTime) + "ms for " +
+              this.nodes.length + " nodes.");
         return this.nodes;
     };
 
@@ -995,6 +1004,7 @@ var ReplSetTest = function(opts) {
     this.initiateWithAnyNodeAsPrimary = function(cfg, initCmd, {
         doNotWaitForStableRecoveryTimestamp: doNotWaitForStableRecoveryTimestamp = false
     } = {}) {
+        let startTime = new Date();  // Measure the execution time of this function.
         var master = this.nodes[0].getDB("admin");
         var config = cfg || this.getReplSetConfig();
         var cmd = {};
@@ -1031,18 +1041,36 @@ var ReplSetTest = function(opts) {
         // nodes are subsequently added to the set, since such nodes cannot set their FCV to
         // "latest". Therefore, we make sure the primary is "last-stable" FCV before adding in
         // nodes of different binary versions to the replica set.
-        let isMultiversion = false;
+        let lastStableBinVersionWasSpecifiedForSomeNode = false;
         Object.keys(this.nodeOptions).forEach(function(key, index) {
             let val = self.nodeOptions[key];
             if (typeof (val) === "object" && val.hasOwnProperty("binVersion") &&
                 MongoRunner.areBinVersionsTheSame(val.binVersion, lastStableFCV)) {
-                isMultiversion = true;
+                lastStableBinVersionWasSpecifiedForSomeNode = true;
             }
         });
-        if (isMultiversion || jsTest.options().randomBinVersions) {
-            assert.commandWorked(
-                self.getPrimary().adminCommand({setFeatureCompatibilityVersion: lastStableFCV}));
-            checkFCV(self.getPrimary().getDB("admin"), lastStableFCV);
+
+        // Set the FCV to 'last-stable' if we are running a mixed version replica set. If this is a
+        // config server, the FCV will be set as part of ShardingTest.
+        let setLastStableFCV = (lastStableBinVersionWasSpecifiedForSomeNode ||
+                                jsTest.options().useRandomBinVersionsWithinReplicaSet) &&
+            !self.isConfigServer;
+        if (setLastStableFCV && jsTest.options().replSetFeatureCompatibilityVersion) {
+            throw new Error(
+                "The FCV will be set to 'last-stable' automatically when starting up a replica " +
+                "set with mixed binary versions. Therefore, we expect an empty value for " +
+                "'replSetFeatureCompatibilityVersion'.");
+        }
+
+        if (setLastStableFCV) {
+            // Authenticate before running the command.
+            asCluster(self.nodes, function setFCV() {
+                let fcv = lastStableFCV;
+                print("Setting feature compatibility version for replica set to '" + fcv + "'");
+                assert.commandWorked(
+                    self.getPrimary().adminCommand({setFeatureCompatibilityVersion: fcv}));
+                checkFCV(self.getPrimary().getDB("admin"), lastStableFCV);
+            });
         }
 
         // Reconfigure the set to contain the correct number of nodes (if necessary).
@@ -1148,6 +1176,8 @@ var ReplSetTest = function(opts) {
         if (!doNotWaitForStableRecoveryTimestamp) {
             self.awaitLastStableRecoveryTimestamp();
         }
+        print("ReplSetTest initiateWithAnyNodeAsPrimary took " + (new Date() - startTime) +
+              "ms for " + this.nodes.length + " nodes.");
     };
 
     /**
@@ -1156,6 +1186,7 @@ var ReplSetTest = function(opts) {
      * ReplSetTest to be authorized to run replSetGetStatus.
      */
     this.initiateWithNodeZeroAsPrimary = function(cfg, initCmd) {
+        let startTime = new Date();  // Measure the execution time of this function.
         this.initiateWithAnyNodeAsPrimary(cfg, initCmd);
 
         // stepUp() calls awaitReplication() which requires all nodes to be authorized to run
@@ -1163,6 +1194,8 @@ var ReplSetTest = function(opts) {
         asCluster(this.nodes, function() {
             self.stepUp(self.nodes[0]);
         });
+        print("ReplSetTest initiateWithNodeZeroAsPrimary took " + (new Date() - startTime) +
+              "ms for " + this.nodes.length + " nodes.");
     };
 
     /**
@@ -1637,7 +1670,6 @@ var ReplSetTest = function(opts) {
 
     this.getHashesUsingSessions = function(sessions, dbName, {
         filterCapped: filterCapped = true,
-        filterMapReduce: filterMapReduce = true,
         readAtClusterTime,
     } = {}) {
         return sessions.map(session => {
@@ -1657,13 +1689,7 @@ var ReplSetTest = function(opts) {
                 // replica set members and may therefore not have the same md5sum. We remove them
                 // from the dbHash command response to avoid an already known case of a mismatch.
                 // See SERVER-16049 for more details.
-                //
-                // If a map-reduce operation is interrupted by the server stepping down, then an
-                // unreplicated "tmp.mr." collection may be left behind. We remove it from the
-                // dbHash command response to avoid an already known case of a mismatch.
-                // TODO SERVER-27147: Stop filtering out "tmp.mr." collections.
-                if (cappedCollections.has(collName) ||
-                    (filterMapReduce && collName.startsWith("tmp.mr."))) {
+                if (cappedCollections.has(collName)) {
                     delete res.collections[collName];
                     // The "uuids" field in the dbHash command response is new as of MongoDB 4.0.
                     if (res.hasOwnProperty("uuids")) {
@@ -2342,8 +2368,10 @@ var ReplSetTest = function(opts) {
             dbpath: "$set-$node"
         };
 
-        if (options && options.binVersion && jsTest.options().randomBinVersions) {
-            throw new Error("Can only specify one of binVersion and randomBinVersion, not both.");
+        if (options && options.binVersion &&
+            jsTest.options().useRandomBinVersionsWithinReplicaSet) {
+            throw new Error(
+                "Can only specify one of binVersion and useRandomBinVersionsWithinReplicaSet, not both.");
         }
 
         //
@@ -2370,11 +2398,16 @@ var ReplSetTest = function(opts) {
         }
         delete options.rsConfig;
 
-        if (jsTest.options().randomBinVersions) {
-            const rand = Random.rand();
-            const version = rand < 0.5 ? "latest" : "last-stable";
-            print("Randomly assigned binary version: " + version + " to node: " + n);
-            options.binVersion = version;
+        if (jsTest.options().useRandomBinVersionsWithinReplicaSet) {
+            if (self.isConfigServer) {
+                // Our documented upgrade/downgrade paths for a sharded cluster lets us assume that
+                // config server nodes will always be fully upgraded before the shard nodes.
+                options.binVersion = "latest";
+            } else {
+                const rand = Random.rand();
+                options.binVersion = rand < 0.5 ? "latest" : "last-stable";
+            }
+            print("Randomly assigned binary version: " + options.binVersion + " to node: " + n);
         }
 
         options.restart = options.restart || restart;
@@ -2592,6 +2625,7 @@ var ReplSetTest = function(opts) {
     this.stopSet = function(signal, forRestart, opts) {
         // Check to make sure data is the same on all nodes.
         if (!jsTest.options().skipCheckDBHashes) {
+            let startTime = new Date();  // Measure the execution time of consistency checks.
             print("ReplSetTest stopSet going to run data consistency checks.");
             // To skip this check add TestData.skipCheckDBHashes = true;
             // Reasons to skip this test include:
@@ -2612,7 +2646,8 @@ var ReplSetTest = function(opts) {
                     "ReplSetTest stopSet skipped data consistency checks. Number of _liveNodes: " +
                     this._liveNodes.length + ", _callIsMaster response: " + master);
             }
-            print("ReplSetTest stopSet finished data consistency checks.");
+            print("ReplSetTest stopSet data consistency checks finished, took " +
+                  (new Date() - startTime) + "ms for " + this.nodes.length + " nodes.");
         }
 
         // Make shutdown faster in tests, especially when election handoff has no viable candidate.
@@ -2637,10 +2672,12 @@ var ReplSetTest = function(opts) {
         }
 
         print("ReplSetTest stopSet stopping all replica set nodes.");
+        let startTime = new Date();  // Measure the execution time of shutting down nodes.
         for (var i = 0; i < this.ports.length; i++) {
             this.stop(i, signal, opts);
         }
-        print("ReplSetTest stopSet stopped all replica set nodes.");
+        print("ReplSetTest stopSet stopped all replica set nodes, took " +
+              (new Date() - startTime) + "ms for " + this.ports.length + " nodes.");
 
         if (forRestart) {
             print("ReplSetTest stopSet returning since forRestart=true.");
@@ -2715,6 +2752,9 @@ var ReplSetTest = function(opts) {
         self.keyFile = opts.keyFile;
         self.protocolVersion = opts.protocolVersion;
         self.waitForKeys = opts.waitForKeys;
+
+        self.seedRandomNumberGenerator = opts.seedRandomNumberGenerator || true;
+        self.isConfigServer = opts.isConfigServer;
 
         _useBridge = opts.useBridge || false;
         _bridgeOptions = opts.bridgeOptions || {};

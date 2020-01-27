@@ -199,12 +199,14 @@ StatusWith<std::pair<long long, long long>> IndexBuildsManager::startBuildingInd
     return std::make_pair(numRecords, dataSize);
 }
 
-Status IndexBuildsManager::drainBackgroundWrites(OperationContext* opCtx,
-                                                 const UUID& buildUUID,
-                                                 RecoveryUnit::ReadSource readSource) {
+Status IndexBuildsManager::drainBackgroundWrites(
+    OperationContext* opCtx,
+    const UUID& buildUUID,
+    RecoveryUnit::ReadSource readSource,
+    IndexBuildInterceptor::DrainYieldPolicy drainYieldPolicy) {
     auto builder = _getBuilder(buildUUID);
 
-    return builder->drainBackgroundWrites(opCtx, readSource);
+    return builder->drainBackgroundWrites(opCtx, readSource, drainYieldPolicy);
 }
 
 Status IndexBuildsManager::finishBuildingPhase(const UUID& buildUUID) {
@@ -288,10 +290,11 @@ bool IndexBuildsManager::interruptIndexBuild(OperationContext* opCtx,
 
 void IndexBuildsManager::tearDownIndexBuild(OperationContext* opCtx,
                                             Collection* collection,
-                                            const UUID& buildUUID) {
+                                            const UUID& buildUUID,
+                                            OnCleanUpFn onCleanUpFn) {
     // TODO verify that the index builder is in a finished state before allowing its destruction.
     auto builder = _getBuilder(buildUUID);
-    builder->cleanUpAfterBuild(opCtx, collection);
+    builder->cleanUpAfterBuild(opCtx, collection, onCleanUpFn);
     _unregisterIndexBuild(buildUUID);
 }
 

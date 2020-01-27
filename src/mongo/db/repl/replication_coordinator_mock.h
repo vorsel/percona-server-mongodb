@@ -116,10 +116,6 @@ public:
 
     virtual Status checkIfCommitQuorumCanBeSatisfied(const CommitQuorumOptions& commitQuorum) const;
 
-    virtual StatusWith<bool> checkIfCommitQuorumIsSatisfied(
-        const CommitQuorumOptions& commitQuorum,
-        const std::vector<HostAndPort>& commitReadyMembers) const;
-
     virtual Status checkCanServeReadsFor(OperationContext* opCtx,
                                          const NamespaceString& ns,
                                          bool slaveOk);
@@ -273,8 +269,6 @@ public:
     virtual void waitUntilSnapshotCommitted(OperationContext* opCtx,
                                             const Timestamp& untilSnapshot) override;
 
-    virtual size_t getNumUncommittedSnapshots() override;
-
     virtual void createWMajorityWriteAvailabilityDateWaiter(OpTime opTime) override;
 
     virtual WriteConcernOptions populateUnsetWriteConcernOptionsSyncMode(
@@ -319,10 +313,14 @@ public:
 
     virtual void finishRecoveryIfEligible(OperationContext* opCtx) override;
 
+    virtual void updateAndLogStateTransitionMetrics(
+        const ReplicationCoordinator::OpsKillingStateTransitionEnum stateTransition,
+        const size_t numOpsKilled,
+        const size_t numOpsRunning) const override;
+
     virtual void setCanAcceptNonLocalWrites(bool canAcceptNonLocalWrites);
 
 private:
-    AtomicWord<unsigned long long> _snapshotNameGenerator;
     ServiceContext* const _service;
     ReplSettings _settings;
     StorageInterface* _storage = nullptr;

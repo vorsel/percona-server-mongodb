@@ -43,7 +43,7 @@ namespace mongo {
 
 using boost::intrusive_ptr;
 
-REGISTER_ACCUMULATOR(sum, AccumulatorSum::create);
+REGISTER_ACCUMULATOR(sum, genericParseSingleExpressionAccumulator<AccumulatorSum>);
 REGISTER_EXPRESSION(sum, ExpressionFromAccumulator<AccumulatorSum>::parse);
 
 const char* AccumulatorSum::getOpName() const {
@@ -120,15 +120,7 @@ Value AccumulatorSum::getValue(bool toBeMerged) {
         case NumberDouble:
             return Value(nonDecimalTotal.getDouble());
         case NumberDecimal: {
-            double sum, error;
-            std::tie(sum, error) = nonDecimalTotal.getDoubleDouble();
-            Decimal128 total;  // zero
-            if (sum != 0) {
-                total = total.add(Decimal128(sum, Decimal128::kRoundTo34Digits));
-                total = total.add(Decimal128(error, Decimal128::kRoundTo34Digits));
-            }
-            total = total.add(decimalTotal);
-            return Value(total);
+            return Value(decimalTotal.add(nonDecimalTotal.getDecimal()));
         }
         default:
             MONGO_UNREACHABLE;

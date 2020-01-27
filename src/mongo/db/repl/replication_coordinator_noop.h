@@ -110,10 +110,6 @@ public:
 
     Status checkIfCommitQuorumCanBeSatisfied(const CommitQuorumOptions& commitQuorum) const final;
 
-    StatusWith<bool> checkIfCommitQuorumIsSatisfied(
-        const CommitQuorumOptions& commitQuorum,
-        const std::vector<HostAndPort>& commitReadyMembers) const final;
-
     void setMyLastAppliedOpTimeAndWallTime(const OpTimeAndWallTime& opTimeAndWallTime) final;
     void setMyLastDurableOpTimeAndWallTime(const OpTimeAndWallTime& opTimeAndWallTime) final;
     void setMyLastAppliedOpTimeAndWallTimeForward(const OpTimeAndWallTime& opTimeAndWallTime,
@@ -237,8 +233,6 @@ public:
 
     void appendConnectionStats(executor::ConnectionPoolStats* stats) const final;
 
-    size_t getNumUncommittedSnapshots() final;
-
     virtual void createWMajorityWriteAvailabilityDateWaiter(OpTime opTime) final;
 
     Status stepUpIfEligible(bool skipDryRun) final;
@@ -256,6 +250,11 @@ public:
     void attemptToAdvanceStableTimestamp() final;
 
     void finishRecoveryIfEligible(OperationContext* opCtx) final;
+
+    void updateAndLogStateTransitionMetrics(
+        const ReplicationCoordinator::OpsKillingStateTransitionEnum stateTransition,
+        const size_t numOpsKilled,
+        const size_t numOpsRunning) const final;
 
 private:
     ServiceContext* const _service;

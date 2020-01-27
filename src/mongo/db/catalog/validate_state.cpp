@@ -55,7 +55,7 @@ ValidateState::ValidateState(OperationContext* opCtx,
                              const NamespaceString& nss,
                              bool background,
                              bool fullValidate)
-    : _nss(nss), _background(background), _fullValidate(fullValidate) {
+    : _nss(nss), _background(background), _fullValidate(fullValidate), _dataThrottle(opCtx) {
 
     // Subsequent re-locks will use the UUID when 'background' is true.
     if (_background) {
@@ -70,7 +70,6 @@ ValidateState::ValidateState(OperationContext* opCtx,
     _collection =
         _database ? CollectionCatalog::get(opCtx).lookupCollectionByNamespace(_nss) : nullptr;
 
-
     if (!_collection) {
         if (_database && ViewCatalog::get(_database)->lookup(opCtx, _nss.ns())) {
             uasserted(ErrorCodes::CommandNotSupportedOnView, "Cannot validate a view");
@@ -84,7 +83,15 @@ ValidateState::ValidateState(OperationContext* opCtx,
     _catalogGeneration = opCtx->getServiceContext()->getCatalogGeneration();
 }
 
-void ValidateState::yieldLocks(OperationContext* opCtx) {
+void ValidateState::yield(OperationContext* opCtx) {
+    if (_background) {
+        _yieldLocks(opCtx);
+    } else {
+        _yieldCursors(opCtx);
+    }
+}
+
+void ValidateState::_yieldLocks(OperationContext* opCtx) {
     invariant(_background);
 
     // Drop and reacquire the locks.
@@ -105,6 +112,32 @@ void ValidateState::yieldLocks(OperationContext* opCtx) {
                 !index->isDropped());
     }
 };
+
+void ValidateState::_yieldCursors(OperationContext* opCtx) {
+    invariant(!_background);
+
+    // Mobile does not support saving and restoring cursors, so we skip yielding cursors for it.
+    if (storageGlobalParams.engine == "mobile") {
+        return;
+    }
+
+    // Save all the cursors.
+    for (const auto& indexCursor : _indexCursors) {
+        indexCursor.second->save();
+    }
+
+    _traverseRecordStoreCursor->save();
+    _seekRecordStoreCursor->save();
+
+    // Restore all the cursors.
+    for (const auto& indexCursor : _indexCursors) {
+        indexCursor.second->restore();
+    }
+
+    // Restore cannot fail while holding an exclusive collection lock.
+    invariant(_traverseRecordStoreCursor->restore());
+    invariant(_seekRecordStoreCursor->restore());
+}
 
 void ValidateState::initializeCursors(OperationContext* opCtx) {
     invariant(!_traverseRecordStoreCursor && !_seekRecordStoreCursor && _indexCursors.size() == 0 &&
@@ -197,6 +230,17 @@ void ValidateState::initializeCursors(OperationContext* opCtx) {
             // not the corresponding index table.
             log() << "Skipping validation on index '" << desc->indexName() << "' in collection '"
                   << _nss << "' because the index data is not in a checkpoint: " << ex;
+            continue;
+        }
+
+        // Skip any newly created indexes that, because they were built with a WT bulk loader, are
+        // checkpoint'ed but not yet consistent with the rest of checkpoint's PIT view of the data.
+        if (_background &&
+            opCtx->getServiceContext()->getStorageEngine()->isInIndividuallyCheckpointedIndexesList(
+                diskIndexIdent)) {
+            _indexCursors.erase(desc->indexName());
+            log() << "Skipping validation on index '" << desc->indexName() << "' in collection '"
+                  << _nss << "' because the index data is not yet consistent in the checkpoint.";
             continue;
         }
 

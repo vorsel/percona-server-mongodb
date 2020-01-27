@@ -124,7 +124,8 @@ void LogicalSessionCacheImpl::_periodicRefresh(Client* client) {
     try {
         _refresh(client);
     } catch (...) {
-        log() << "Failed to refresh session cache: " << exceptionToStatus();
+        log() << "Failed to refresh session cache: " << exceptionToStatus()
+              << ", will try again at the next refresh interval";
     }
 }
 
@@ -241,11 +242,12 @@ void LogicalSessionCacheImpl::_refresh(Client* client) {
 
     ON_BLOCK_EXIT([&opCtx] { clearShardingOperationFailedStatus(opCtx); });
 
-    auto setupStatus = _sessionsColl->setupSessionsCollection(opCtx);
+    try {
+        _sessionsColl->setupSessionsCollection(opCtx);
 
-    if (!setupStatus.isOK()) {
-        log() << "Sessions collection is not set up; "
-              << "waiting until next sessions refresh interval: " << setupStatus.reason();
+    } catch (DBException& ex) {
+        log() << "Failed to refresh session cache: " << ex.reason()
+              << ", will try again at the next refresh interval";
         return;
     }
 
@@ -369,9 +371,15 @@ LogicalSessionCacheStats LogicalSessionCacheImpl::getStats() {
 
 Status LogicalSessionCacheImpl::_addToCache(WithLock, LogicalSessionRecord record) {
     if (_activeSessions.size() >= size_t(maxSessions)) {
-        return {ErrorCodes::TooManyLogicalSessions,
-                "Unable to add session into the cache because the number of active sessions is too "
-                "high"};
+        Status status = {ErrorCodes::TooManyLogicalSessions,
+                         str::stream()
+                             << "Unable to add session ID " << record.getId()
+                             << " into the cache because the number of active sessions is too "
+                                "high"};
+        auto severity =
+            MONGO_GET_LIMITED_SEVERITY(ErrorCodes::TooManyLogicalSessions, Seconds{1}, 0, 2);
+        LOG(severity) << status.toString();
+        return status;
     }
 
     _activeSessions.insert(std::make_pair(record.getId(), std::move(record)));

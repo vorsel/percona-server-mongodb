@@ -66,6 +66,7 @@
 #include "mongo/db/pipeline/document_source_sample_from_random_cursor.h"
 #include "mongo/db/pipeline/document_source_single_document_transformation.h"
 #include "mongo/db/pipeline/document_source_sort.h"
+#include "mongo/db/pipeline/parsed_inclusion_projection.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/get_executor.h"
@@ -187,41 +188,38 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> createRandomCursorEx
 }
 
 StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> attemptToGetExecutor(
-    OperationContext* opCtx,
+    const intrusive_ptr<ExpressionContext>& expCtx,
     Collection* collection,
     const NamespaceString& nss,
-    const intrusive_ptr<ExpressionContext>& pExpCtx,
     BSONObj queryObj,
     BSONObj projectionObj,
+    const QueryMetadataBitSet& metadataRequested,
     BSONObj sortObj,
+    boost::optional<long long> limit,
     boost::optional<std::string> groupIdForDistinctScan,
     const AggregationRequest* aggRequest,
     const size_t plannerOpts,
     const MatchExpressionParser::AllowedFeatureSet& matcherFeatures) {
     auto qr = std::make_unique<QueryRequest>(nss);
-    qr->setTailableMode(pExpCtx->tailableMode);
+    qr->setTailableMode(expCtx->tailableMode);
     qr->setFilter(queryObj);
     qr->setProj(projectionObj);
     qr->setSort(sortObj);
+    qr->setLimit(limit);
     if (aggRequest) {
         qr->setExplain(static_cast<bool>(aggRequest->getExplain()));
         qr->setHint(aggRequest->getHint());
     }
 
-    // If the pipeline has a non-null collator, set the collation option to the result of
-    // serializing the collator's spec back into BSON. We do this in order to fill in all options
-    // that the user omitted.
-    //
-    // If pipeline has a null collator (representing the "simple" collation), we simply set the
-    // collation option to the original user BSON, which is either the empty object (unspecified),
-    // or the specification for the "simple" collation.
-    qr->setCollation(pExpCtx->getCollator() ? pExpCtx->getCollator()->getSpec().toBSON()
-                                            : pExpCtx->collation);
+    // The collation on the ExpressionContext has been resolved to either the user-specified
+    // collation or the collection default. This BSON should never be empty even if the resolved
+    // collator is simple.
+    qr->setCollation(expCtx->getCollatorBSON());
 
-    const ExtensionsCallbackReal extensionsCallback(pExpCtx->opCtx, &nss);
+    const ExtensionsCallbackReal extensionsCallback(expCtx->opCtx, &nss);
 
     auto cq = CanonicalQuery::canonicalize(
-        opCtx, std::move(qr), pExpCtx, extensionsCallback, matcherFeatures);
+        expCtx->opCtx, std::move(qr), expCtx, extensionsCallback, matcherFeatures);
 
     if (!cq.isOK()) {
         // Return an error instead of uasserting, since there are cases where the combination of
@@ -231,6 +229,9 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> attemptToGetExe
         // another attempt.
         return {cq.getStatus()};
     }
+
+    // Mark the metadata that's requested by the pipeline on the CQ.
+    cq.getValue()->requestAdditionalMetadata(metadataRequested);
 
     if (groupIdForDistinctScan) {
         // When the pipeline includes a $group that groups by a single field
@@ -247,7 +248,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> attemptToGetExe
         // example, if we have a document {a: [1,2]} and group by "a" a DISTINCT_SCAN on an "a"
         // index would produce one result for '1' and another for '2', which would be incorrect.
         auto distinctExecutor =
-            getExecutorDistinct(opCtx,
+            getExecutorDistinct(expCtx->opCtx,
                                 collection,
                                 plannerOpts | QueryPlannerParams::STRICT_DISTINCT_ONLY,
                                 &parsedDistinct);
@@ -263,14 +264,8 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> attemptToGetExe
     }
 
     bool permitYield = true;
-    return getExecutorFind(opCtx, collection, std::move(cq.getValue()), permitYield, plannerOpts);
-}
-
-BSONObj removeSortKeyMetaProjection(BSONObj projectionObj) {
-    if (!projectionObj[Document::metaFieldSortKey]) {
-        return projectionObj;
-    }
-    return projectionObj.removeField(Document::metaFieldSortKey);
+    return getExecutorFind(
+        expCtx->opCtx, collection, std::move(cq.getValue()), permitYield, plannerOpts);
 }
 
 /**
@@ -366,14 +361,16 @@ PipelineD::buildInnerQueryExecutor(Collection* collection,
 
                 // TODO SERVER-37453 this should no longer be necessary when we no don't need locks
                 // to destroy a PlanExecutor.
-                auto deps = pipeline->getDependencies(DepsTracker::MetadataAvailable::kNoMetadata);
+                auto deps = pipeline->getDependencies(DepsTracker::kNoMetadata);
+                const bool shouldProduceEmptyDocs = deps.hasNoRequirements();
                 auto attachExecutorCallback =
-                    [deps](Collection* collection,
-                           std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
-                           Pipeline* pipeline) {
+                    [shouldProduceEmptyDocs](
+                        Collection* collection,
+                        std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
+                        Pipeline* pipeline) {
                         auto cursor = DocumentSourceCursor::create(
                             collection, std::move(exec), pipeline->getContext());
-                        addCursorSource(pipeline, std::move(cursor), std::move(deps));
+                        addCursorSource(pipeline, std::move(cursor), shouldProduceEmptyDocs);
                     };
                 return std::make_pair(std::move(attachExecutorCallback), std::move(exec));
             }
@@ -451,6 +448,20 @@ getSortAndGroupStagesFromPipeline(const Pipeline::SourceContainer& sources) {
     return std::make_pair(sortStage, groupStage);
 }
 
+boost::optional<long long> extractLimitForPushdown(Pipeline* pipeline) {
+    auto&& sources = pipeline->getSources();
+    auto limit = DocumentSourceSort::extractLimitForPushdown(sources.begin(), &sources);
+    if (limit) {
+        // Removing $limit stages may have produced the opportunity for additional optimizations.
+        //
+        // In addition, since a stage was removed from the middle of the pipeline, we need to
+        // re-stitch the pipeline in order to ensure that each stage has a valid pointer to the
+        // previous document source. 'optimizePipeline()' will take care of re-stitching for us.
+        pipeline->optimizePipeline();
+    }
+    return limit;
+}
+
 }  // namespace
 
 std::pair<PipelineD::AttachExecutorCallback, std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>>
@@ -477,43 +488,52 @@ PipelineD::buildInnerQueryExecutorGeneric(Collection* collection,
         }
     }
 
-    // Find the set of fields in the source documents depended on by this pipeline.
-    DepsTracker deps = pipeline->getDependencies(DocumentSourceMatch::isTextQuery(queryObj)
-                                                     ? DepsTracker::MetadataAvailable::kTextScore
-                                                     : DepsTracker::MetadataAvailable::kNoMetadata);
-
-    BSONObj projForQuery = deps.toProjection();
-
     boost::intrusive_ptr<DocumentSourceSort> sortStage;
     boost::intrusive_ptr<DocumentSourceGroup> groupStage;
     std::tie(sortStage, groupStage) = getSortAndGroupStagesFromPipeline(pipeline->_sources);
-
-    BSONObj sortObj;
-    if (sortStage) {
-        sortObj = sortStage->getSortKeyPattern()
-                      .serialize(SortPattern::SortKeySerialization::kForPipelineSerialization)
-                      .toBson();
-    }
 
     std::unique_ptr<GroupFromFirstDocumentTransformation> rewrittenGroupStage;
     if (groupStage) {
         rewrittenGroupStage = groupStage->rewriteGroupAsTransformOnFirstDocument();
     }
 
+    // If there is a $limit stage (or multiple $limit stages) that could be pushed down into the
+    // PlanStage layer, obtain the value of the limit and remove the $limit stages from the
+    // pipeline.
+    //
+    // This analysis is done here rather than in 'optimizePipeline()' because swapping $limit before
+    // stages such as $project is not always useful, and can sometimes defeat other optimizations.
+    // In particular, in a sharded scenario a pipeline such as [$project, $limit] is preferable to
+    // [$limit, $project]. The former permits the execution of the projection operation to be
+    // parallelized across all targeted shards, whereas the latter would bring all of the data to a
+    // merging shard first, and then apply the projection serially. See SERVER-24981 for a more
+    // detailed discussion.
+    //
+    // This only handles the case in which the the $limit can logically be swapped to the front of
+    // the pipeline. We can also push down a $limit which comes after a $sort into the PlanStage
+    // layer, but that is handled elsewhere.
+    const auto limit = extractLimitForPushdown(pipeline);
+
+    auto metadataAvailable = DocumentSourceMatch::isTextQuery(queryObj)
+        ? DepsTracker::kOnlyTextScore
+        : DepsTracker::kNoMetadata;
+
     // Create the PlanExecutor.
-    auto exec = uassertStatusOK(prepareExecutor(expCtx->opCtx,
+    BSONObj projForQuery;
+    bool shouldProduceEmptyDocs = false;
+    auto exec = uassertStatusOK(prepareExecutor(expCtx,
                                                 collection,
                                                 nss,
                                                 pipeline,
-                                                expCtx,
                                                 sortStage,
                                                 std::move(rewrittenGroupStage),
-                                                deps,
+                                                metadataAvailable,
                                                 queryObj,
+                                                limit,
                                                 aggRequest,
                                                 Pipeline::kAllowedMatcherFeatures,
-                                                &sortObj,
-                                                &projForQuery));
+                                                &projForQuery,
+                                                &shouldProduceEmptyDocs));
 
 
     if (!projForQuery.isEmpty() && !sources.empty()) {
@@ -521,8 +541,14 @@ PipelineD::buildInnerQueryExecutorGeneric(Collection* collection,
         // projection generated by the dependency optimization.
         auto proj =
             dynamic_cast<DocumentSourceSingleDocumentTransformation*>(sources.front().get());
-        if (proj && proj->isSubsetOfProjection(projForQuery)) {
-            sources.pop_front();
+        if (proj &&
+            proj->getType() == TransformerInterface::TransformerType::kInclusionProjection) {
+            auto&& inclusionProj =
+                static_cast<const parsed_aggregation_projection::ParsedInclusionProjection&>(
+                    proj->getTransformer());
+            if (inclusionProj.isEquivalentToDependencySet(projForQuery)) {
+                sources.pop_front();
+            }
         }
     }
 
@@ -530,14 +556,13 @@ PipelineD::buildInnerQueryExecutorGeneric(Collection* collection,
     const bool trackOplogTS =
         (pipeline->peekFront() && pipeline->peekFront()->constraints().isChangeStreamStage());
 
-    auto attachExecutorCallback = [deps, queryObj, sortObj, projForQuery, trackOplogTS](
+    auto attachExecutorCallback = [shouldProduceEmptyDocs, trackOplogTS](
                                       Collection* collection,
                                       std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
                                       Pipeline* pipeline) {
         auto cursor = DocumentSourceCursor::create(
             collection, std::move(exec), pipeline->getContext(), trackOplogTS);
-        addCursorSource(
-            pipeline, std::move(cursor), std::move(deps), queryObj, sortObj, projForQuery);
+        addCursorSource(pipeline, std::move(cursor), shouldProduceEmptyDocs);
     };
     return std::make_pair(std::move(attachExecutorCallback), std::move(exec));
 }
@@ -557,8 +582,6 @@ PipelineD::buildInnerQueryExecutorGeoNear(Collection* collection,
     const auto geoNearStage = dynamic_cast<DocumentSourceGeoNear*>(sources.front().get());
     invariant(geoNearStage);
 
-    auto deps = pipeline->getDependencies(DepsTracker::kAllGeoNearDataAvailable);
-
     // If the user specified a "key" field, use that field to satisfy the "near" query. Otherwise,
     // look for a geo-indexed field in 'collection' that can.
     auto nearFieldName =
@@ -569,27 +592,24 @@ PipelineD::buildInnerQueryExecutorGeoNear(Collection* collection,
     // Create a PlanExecutor whose query is the "near" predicate on 'nearFieldName' combined with
     // the optional "query" argument in the $geoNear stage.
     BSONObj fullQuery = geoNearStage->asNearQuery(nearFieldName);
-    BSONObj proj = deps.toProjection();
-    BSONObj sortFromQuerySystem;
-    auto exec = uassertStatusOK(prepareExecutor(expCtx->opCtx,
+
+    BSONObj proj;
+    bool shouldProduceEmptyDocs = false;
+    auto exec = uassertStatusOK(prepareExecutor(expCtx,
                                                 collection,
                                                 nss,
                                                 pipeline,
-                                                expCtx,
                                                 nullptr, /* sortStage */
                                                 nullptr, /* rewrittenGroupStage */
-                                                deps,
+                                                DepsTracker::kAllGeoNearData,
                                                 std::move(fullQuery),
+                                                boost::none, /* limit */
                                                 aggRequest,
                                                 Pipeline::kGeoNearMatcherFeatures,
-                                                &sortFromQuerySystem,
-                                                &proj));
+                                                &proj,
+                                                &shouldProduceEmptyDocs));
 
-    invariant(sortFromQuerySystem.isEmpty(),
-              str::stream() << "Unexpectedly got the following sort from the query system: "
-                            << sortFromQuerySystem.jsonString());
-
-    auto attachExecutorCallback = [deps,
+    auto attachExecutorCallback = [shouldProduceEmptyDocs,
                                    distanceField = geoNearStage->getDistanceField(),
                                    locationField = geoNearStage->getLocationField(),
                                    distanceMultiplier =
@@ -603,7 +623,7 @@ PipelineD::buildInnerQueryExecutorGeoNear(Collection* collection,
                                                           distanceField,
                                                           locationField,
                                                           distanceMultiplier);
-        addCursorSource(pipeline, std::move(cursor), std::move(deps));
+        addCursorSource(pipeline, std::move(cursor), shouldProduceEmptyDocs);
     };
     // Remove the initial $geoNear; it will be replaced by $geoNearCursor.
     sources.pop_front();
@@ -611,44 +631,23 @@ PipelineD::buildInnerQueryExecutorGeoNear(Collection* collection,
 }
 
 StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prepareExecutor(
-    OperationContext* opCtx,
+    const intrusive_ptr<ExpressionContext>& expCtx,
     Collection* collection,
     const NamespaceString& nss,
     Pipeline* pipeline,
-    const intrusive_ptr<ExpressionContext>& expCtx,
     const boost::intrusive_ptr<DocumentSourceSort>& sortStage,
     std::unique_ptr<GroupFromFirstDocumentTransformation> rewrittenGroupStage,
-    const DepsTracker& deps,
+    QueryMetadataBitSet metadataAvailable,
     const BSONObj& queryObj,
+    boost::optional<long long> limit,
     const AggregationRequest* aggRequest,
     const MatchExpressionParser::AllowedFeatureSet& matcherFeatures,
-    BSONObj* sortObj,
-    BSONObj* projectionObj) {
-    // The query system has the potential to use an index to provide a non-blocking sort and/or to
-    // use the projection to generate a covered plan. If this is possible, it is more efficient to
-    // let the query system handle those parts of the pipeline. If not, it is more efficient to use
-    // a $sort and/or a ParsedDeps object. Thus, we will determine whether the query system can
-    // provide a non-blocking sort or a covered projection before we commit to a PlanExecutor.
-    //
-    // To determine if the query system can provide a non-blocking sort, we pass the
-    // NO_BLOCKING_SORT planning option, meaning 'getExecutor' will not produce a PlanExecutor if
-    // the query system would use a blocking sort stage.
-    //
-    // To determine if the query system can provide a covered projection, we pass the
-    // NO_UNCOVERED_PROJECTS planning option, meaning 'getExecutor' will not produce a PlanExecutor
-    // if the query system would need to fetch the document to do the projection. The following
-    // logic uses the above strategies, with multiple calls to 'attemptToGetExecutor' to determine
-    // the most efficient way to handle the $sort and $project stages.
-    //
-    // LATER - We should attempt to determine if the results from the query are returned in some
-    // order so we can then apply other optimizations there are tickets for, such as SERVER-4507.
-    size_t plannerOpts = QueryPlannerParams::DEFAULT | QueryPlannerParams::NO_BLOCKING_SORT;
+    BSONObj* projectionObj,
+    bool* hasNoRequirements) {
+    invariant(projectionObj);
+    invariant(hasNoRequirements);
 
-    if (deps.hasNoRequirements()) {
-        // If we don't need any fields from the input document, performing a count is faster, and
-        // will output empty documents, which is okay.
-        plannerOpts |= QueryPlannerParams::IS_COUNT;
-    }
+    size_t plannerOpts = QueryPlannerParams::DEFAULT;
 
     if (pipeline->peekFront() && pipeline->peekFront()->constraints().isChangeStreamStage()) {
         invariant(expCtx->tailableMode == TailableModeEnum::kTailableAndAwaitData);
@@ -660,6 +659,43 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
         expCtx->use42ChangeStreamSortKeys = true;
     }
 
+    // If there is a sort stage eligible for pushdown, serialize its SortPattern to a BSONObj. The
+    // BSONObj format is currently necessary to request that the sort is computed by the query layer
+    // inside the inner PlanExecutor. We also remove the $sort stage from the Pipeline, since it
+    // will be handled instead by PlanStage execution.
+    BSONObj sortObj;
+    if (sortStage && canSortBePushedDown(sortStage->getSortKeyPattern())) {
+        sortObj = sortStage->getSortKeyPattern()
+                      .serialize(SortPattern::SortKeySerialization::kForPipelineSerialization)
+                      .toBson();
+
+        // If the $sort has a coalesced $limit, then we push it down as well. Since the $limit was
+        // after a $sort in the pipeline, it should not have been provided by the caller.
+        invariant(!limit);
+        limit = sortStage->getLimit();
+
+        pipeline->popFrontWithName(DocumentSourceSort::kStageName);
+    }
+
+    // Perform dependency analysis. In order to minimize the dependency set, we only analyze the
+    // stages that remain in the pipeline after pushdown. In particular, any dependencies for a
+    // $match or $sort pushed down into the query layer will not be reflected here.
+    auto deps = pipeline->getDependencies(metadataAvailable);
+    *hasNoRequirements = deps.hasNoRequirements();
+    *projectionObj = deps.toProjectionWithoutMetadata();
+
+    // If we're pushing down a sort, and a merge will be required later, then we need the query
+    // system to produce sortKey metadata.
+    if (!sortObj.isEmpty() && expCtx->needsMerge) {
+        deps.setNeedsMetadata(DocumentMetadataFields::kSortKey, true);
+    }
+
+    if (deps.hasNoRequirements()) {
+        // This query might be eligible for count optimizations, since the remaining stages in the
+        // pipeline don't actually need to read any data produced by the query execution layer.
+        plannerOpts |= QueryPlannerParams::IS_COUNT;
+    }
+
     if (rewrittenGroupStage) {
         BSONObj emptySort;
 
@@ -668,13 +704,14 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
         // attemptToGetExecutor() calls below) causes getExecutorDistinct() to ignore some otherwise
         // valid DISTINCT_SCAN plans, so we pass the projection and exclude the
         // NO_UNCOVERED_PROJECTIONS planner parameter.
-        auto swExecutorGrouped = attemptToGetExecutor(opCtx,
+        auto swExecutorGrouped = attemptToGetExecutor(expCtx,
                                                       collection,
                                                       nss,
-                                                      expCtx,
                                                       queryObj,
                                                       *projectionObj,
-                                                      sortObj ? *sortObj : emptySort,
+                                                      deps.metadataDeps(),
+                                                      sortObj,
+                                                      boost::none, /* limit */
                                                       rewrittenGroupStage->groupId(),
                                                       aggRequest,
                                                       plannerOpts,
@@ -707,101 +744,44 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
         }
     }
 
-    const BSONObj emptyProjection;
-    const BSONObj metaSortProjection = BSON("$sortKey" << BSON("$meta"
-                                                               << "sortKey"));
-
+    // Unlike stages such as $match and limit which always get pushed down into the inner
+    // PlanExecutor when present at the front of the pipeline, 'projectionObj' may not always be
+    // pushed down. (Note that 'projectionObj' is generated based on the dependency set, and
+    // therefore is not always identical to a $project stage in the pipeline.) The query system has
+    // the potential to use an index produce a covered plan, computing the projection based on index
+    // keys rather than documents fetched from the collection. If this is possible, it is more
+    // efficient to let the query system handle the projection, since covered plans typically have a
+    // large performance advantage. If not, it is more currently more efficient to compute the
+    // projection in the agg layer.
+    //
+    // To determine if the query system can provide a covered projection, we pass the
+    // NO_UNCOVERED_PROJECTIONS planning option, meaning 'getExecutor' will not produce a
+    // PlanExecutor if the query system would need to fetch the document to do the projection. If
+    // planning fails due to the NO_COVERED_PROJECTIONS option, then we invoke the planner a second
+    // time without passing 'projectionObj', resulting in a plan where the agg layer handles the
+    // projection.
+    //
     // The only way to get meta information (e.g. the text score) is to let the query system handle
     // the projection. In all other cases, unless the query system can do an index-covered
-    // projection and avoid going to the raw record at all, it is faster to have ParsedDeps filter
-    // the fields we need.
+    // projection and avoid going to the raw record at all, it is faster to have the agg system
+    // perform the projection.
+    //
+    // TODO SERVER-42905: It should be possible to push down all eligible projections to the query
+    // layer.  This code assumes that metadata is passed from the query layer to the DocumentSource
+    // layer via a projection, which is no longer true.
     if (!deps.getNeedsAnyMetadata()) {
         plannerOpts |= QueryPlannerParams::NO_UNCOVERED_PROJECTIONS;
     }
 
-    SortPattern userSortPattern(*sortObj, expCtx);
-    if (sortStage && canSortBePushedDown(userSortPattern)) {
-        // See if the query system can provide a non-blocking sort.
-        auto swExecutorSort =
-            attemptToGetExecutor(opCtx,
-                                 collection,
-                                 nss,
-                                 expCtx,
-                                 queryObj,
-                                 expCtx->needsMerge ? metaSortProjection : emptyProjection,
-                                 *sortObj,
-                                 boost::none, /* groupIdForDistinctScan */
-                                 aggRequest,
-                                 plannerOpts,
-                                 matcherFeatures);
-
-        if (swExecutorSort.isOK()) {
-            // Success! Now see if the query system can also cover the projection.
-            auto swExecutorSortAndProj =
-                attemptToGetExecutor(opCtx,
-                                     collection,
-                                     nss,
-                                     expCtx,
-                                     queryObj,
-                                     *projectionObj,
-                                     *sortObj,
-                                     boost::none, /* groupIdForDistinctScan */
-                                     aggRequest,
-                                     plannerOpts,
-                                     matcherFeatures);
-
-            std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec;
-            if (swExecutorSortAndProj.isOK()) {
-                // Success! We have a non-blocking sort and a covered projection.
-                exec = std::move(swExecutorSortAndProj.getValue());
-            } else if (swExecutorSortAndProj != ErrorCodes::NoQueryExecutionPlans) {
-
-                return swExecutorSortAndProj.getStatus().withContext(
-                    "Failed to determine whether query system can provide a "
-                    "covered projection in addition to a non-blocking sort");
-            } else {
-                // The query system couldn't cover the projection.
-                *projectionObj = BSONObj();
-                exec = std::move(swExecutorSort.getValue());
-            }
-
-            // We know the sort is being handled by the query system, so remove the $sort stage.
-            pipeline->_sources.pop_front();
-
-            if (sortStage->hasLimit()) {
-                // We need to reinsert the coalesced $limit after removing the $sort.
-                pipeline->_sources.push_front(
-                    DocumentSourceLimit::create(expCtx, sortStage->getLimit()));
-            }
-            return std::move(exec);
-        } else if (swExecutorSort != ErrorCodes::NoQueryExecutionPlans) {
-            return swExecutorSort.getStatus().withContext(
-                "Failed to determine whether query system can provide a non-blocking sort");
-        }
-    }
-
-    // Either there's no sort or the query system can't provide a non-blocking sort.
-    *sortObj = BSONObj();
-
-    *projectionObj = removeSortKeyMetaProjection(*projectionObj);
-    const auto metadataRequired = deps.getAllRequiredMetadataTypes();
-    if (metadataRequired.size() == 1 &&
-        metadataRequired.front() == DepsTracker::MetadataType::SORT_KEY) {
-        // A sort key requirement would have prevented us from being able to add this parameter
-        // before, but now we know the query system won't cover the sort, so we will be able to
-        // compute the sort key ourselves during the $sort stage, and thus don't need a query
-        // projection to do so.
-        plannerOpts |= QueryPlannerParams::NO_UNCOVERED_PROJECTIONS;
-    }
-
-    // See if the query system can cover the projection.
-    auto swExecutorProj = attemptToGetExecutor(opCtx,
+    // See if the query layer can use the projection to produce a covered plan.
+    auto swExecutorProj = attemptToGetExecutor(expCtx,
                                                collection,
                                                nss,
-                                               expCtx,
                                                queryObj,
                                                *projectionObj,
-                                               *sortObj,
+                                               deps.metadataDeps(),
+                                               sortObj,
+                                               limit,
                                                boost::none, /* groupIdForDistinctScan */
                                                aggRequest,
                                                plannerOpts,
@@ -814,16 +794,19 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
             "Failed to determine whether query system can provide a covered projection");
     }
 
-    // The query system couldn't provide a covered or simple uncovered projection.
+    // The query system couldn't generate a covered plan for the projection. Make another attempt
+    // without the projection. We need not request any metadata: if there are metadata dependencies,
+    // then we always push the projection down to the query layer (which is implemented by
+    // refraining from setting the 'NO_UNCOVERED_PROJECTIONS' parameter).
     *projectionObj = BSONObj();
-    // If this doesn't work, nothing will.
-    return attemptToGetExecutor(opCtx,
+    return attemptToGetExecutor(expCtx,
                                 collection,
                                 nss,
-                                expCtx,
                                 queryObj,
                                 *projectionObj,
-                                *sortObj,
+                                DepsTracker::kNoMetadata,
+                                sortObj,
+                                limit,
                                 boost::none, /* groupIdForDistinctScan */
                                 aggRequest,
                                 plannerOpts,
@@ -832,31 +815,13 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
 
 void PipelineD::addCursorSource(Pipeline* pipeline,
                                 boost::intrusive_ptr<DocumentSourceCursor> cursor,
-                                DepsTracker deps,
-                                const BSONObj& queryObj,
-                                const BSONObj& sortObj,
-                                const BSONObj& projectionObj) {
+                                bool shouldProduceEmptyDocs) {
     // Add the cursor to the pipeline first so that it's correctly disposed of as part of the
     // pipeline if an exception is thrown during this method.
     pipeline->addInitialSource(cursor);
 
-    cursor->setQuery(queryObj);
-    cursor->setSort(sortObj);
-    if (deps.hasNoRequirements()) {
+    if (shouldProduceEmptyDocs) {
         cursor->shouldProduceEmptyDocs();
-    }
-
-    if (!projectionObj.isEmpty()) {
-        cursor->setProjection(projectionObj, boost::none, deps.getNeedsAnyMetadata());
-    } else {
-        // There may be fewer dependencies now if the sort was covered.
-        if (!sortObj.isEmpty()) {
-            deps = pipeline->getDependencies(DocumentSourceMatch::isTextQuery(queryObj)
-                                                 ? DepsTracker::MetadataAvailable::kTextScore
-                                                 : DepsTracker::MetadataAvailable::kNoMetadata);
-        }
-
-        cursor->setProjection(deps.toProjection(), deps.toParsedDeps(), deps.getNeedsAnyMetadata());
     }
 }
 

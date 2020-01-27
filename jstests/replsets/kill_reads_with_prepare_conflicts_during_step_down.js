@@ -9,10 +9,10 @@
 "use strict";
 
 load("jstests/core/txns/libs/prepare_helpers.js");
-load("jstests/libs/check_log.js");
+load("jstests/libs/fail_point_util.js");
 
 // Start one of the nodes with priority: 0 to avoid elections.
-var rst = new ReplSetTest({nodes: [{}, {rsConfig: {priority: 0}}]});
+const rst = new ReplSetTest({nodes: [{}, {rsConfig: {priority: 0}}]});
 rst.startSet();
 rst.initiate();
 
@@ -32,8 +32,7 @@ const sessionID = session.getSessionId();
 let sessionDB = session.getDatabase(dbName);
 const sessionColl = sessionDB.getCollection(collName);
 
-assert.commandWorked(
-    primaryAdmin.adminCommand({configureFailPoint: "WTPrintPrepareConflictLog", mode: "alwaysOn"}));
+let failPoint = configureFailPoint(primaryAdmin, "WTPrintPrepareConflictLog");
 
 // Insert a document that we will later modify in a transaction.
 assert.commandWorked(primaryColl.insert({_id: 1}));
@@ -70,7 +69,7 @@ const readBlockedOnPrepareConflictThread = startParallelShell(() => {
 }, primary.port);
 
 jsTestLog("Waiting for failpoint");
-checkLog.contains(primary, "WTPrintPrepareConflictLog fail point enabled");
+failPoint.wait();
 
 // Once we have confirmed that the find command has hit a prepare conflict, we can perform
 // a step down.
@@ -84,7 +83,8 @@ rst.waitForState(primary, ReplSetTest.State.SECONDARY);
 
 // Validate that the read operation got killed during step down.
 let replMetrics = assert.commandWorked(primaryAdmin.adminCommand({serverStatus: 1})).metrics.repl;
-assert.eq(replMetrics.stepDown.userOperationsKilled, 1);
+assert.eq(replMetrics.stateTransition.lastStateTransition, "stepDown");
+assert.eq(replMetrics.stateTransition.userOperationsKilled, 1);
 
 // Allow the primary to be re-elected, and wait for it.
 assert.commandWorked(primaryAdmin.adminCommand({replSetFreeze: 0}));

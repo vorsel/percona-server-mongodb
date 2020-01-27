@@ -208,6 +208,10 @@ if (typeof _threadInject != "undefined") {
             // This test works close to the BSON document limit for entries in the durable catalog,
             // so running it in parallel with other tests will cause failures.
             "long_collection_names.js",
+
+            // This test causes collMod commands to hang, which interferes with other tests running
+            // collMod.
+            "crud_ops_do_not_throw_locktimeout.js",
         ]);
 
         // The following tests cannot run when shell readMode is legacy.
@@ -368,7 +372,13 @@ if (typeof _threadInject != "undefined") {
         for (var i in params) {
             var param = params[i];
             var test = param.shift();
-            var t = new Thread(wrapper, test, param, {TestData: TestData});
+
+            // Make a shallow copy of TestData so we can override the test name to
+            // prevent tests on different threads that to use jsTestName() as the
+            // collection name from colliding.
+            const clonedTestData = Object.assign({}, TestData);
+            clonedTestData.testName = `ParallelTesterThread${i}`;
+            var t = new Thread(wrapper, test, param, {TestData: clonedTestData});
             runners.push(t);
         }
 

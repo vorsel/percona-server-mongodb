@@ -47,17 +47,12 @@ const StringDataSet kAllowedDollarPrefixedFields = {
 
     // Metadata fields.
 
-    // TODO SERVER-42560: It may be possible to eliminate some of these, if they're only used for
-    // creating the "dependency" projection. Some of them ($dis and $sortKey) may be used in
-    // sharded queries and are necessary.
+    // This is necessary for sharded query execution of find() commands. mongos may attach a
+    // $sortKey field to the projection sent to shards so that it can merge the results correctly.
     "$sortKey",
-    "$pt",
-    "$dis",
-    "$textScore",
-    "$recordId",
 
-    // Used internally for forcing projections to be of a certain type.
-    "$__INTERNAL_QUERY_PROJECTION_RESERVED"};
+    // This is necessary for the "showRecordId" feature.
+    "$recordId"};
 
 }  // namespace
 
@@ -108,5 +103,39 @@ void FieldPath::uassertValidFieldName(StringData fieldName) {
         16411, "FieldPath field names may not contain '\0'.", fieldName.find('\0') == string::npos);
     uassert(
         16412, "FieldPath field names may not contain '.'.", fieldName.find('.') == string::npos);
+}
+
+FieldPath FieldPath::concat(const FieldPath& tail) const {
+    const FieldPath& head = *this;
+
+    std::string concat;
+    const auto expectedStringSize = _fieldPath.size() + 1 + tail._fieldPath.size();
+    concat.reserve(expectedStringSize);
+    concat.insert(concat.begin(), head._fieldPath.begin(), head._fieldPath.end());
+    concat.push_back('.');
+    concat.insert(concat.end(), tail._fieldPath.begin(), tail._fieldPath.end());
+    invariant(concat.size() == expectedStringSize);
+
+    std::vector<size_t> newDots;
+    // Subtract 2 since both contain std::string::npos at the beginning and the entire size at
+    // the end. Add one because we inserted a dot in order to concatenate the two paths.
+    const auto expectedDotSize =
+        head._fieldPathDotPosition.size() + tail._fieldPathDotPosition.size() - 2 + 1;
+    newDots.reserve(expectedDotSize);
+
+    // The first one in head._fieldPathDotPosition is npos. The last one, is, conveniently, the
+    // size of head fieldPath, which also happens to be the index at which we added a new dot.
+    newDots.insert(
+        newDots.begin(), head._fieldPathDotPosition.begin(), head._fieldPathDotPosition.end());
+
+    invariant(tail._fieldPathDotPosition.size() >= 2);
+    for (size_t i = 1; i < tail._fieldPathDotPosition.size(); ++i) {
+        // Move each index back by size of the first field path, plus one, for the newly added dot.
+        newDots.push_back(tail._fieldPathDotPosition[i] + head._fieldPath.size() + 1);
+    }
+    invariant(newDots.back() == concat.size());
+    invariant(newDots.size() == expectedDotSize);
+
+    return FieldPath(std::move(concat), std::move(newDots));
 }
 }  // namespace mongo

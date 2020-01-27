@@ -40,12 +40,14 @@
 #include "mongo/db/concurrency/lock_request_list.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/compiler.h"
-#include "mongo/platform/condition_variable.h"
 #include "mongo/platform/mutex.h"
+#include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/util/concurrency/mutex.h"
 
 namespace mongo {
+
+class ServiceContext;
 
 /**
  * Entry point for the lock manager scheduling functionality. Don't use it directly, but
@@ -56,6 +58,12 @@ class LockManager {
     LockManager& operator=(const LockManager&) = delete;
 
 public:
+    /**
+     * Gets a mapping of lock to client info.
+     * Used by dump() and the lockInfo command.
+     */
+    static std::map<LockerId, BSONObj> getLockToClientMap(ServiceContext* serviceContext);
+
     LockManager();
     ~LockManager();
 
@@ -172,7 +180,8 @@ private:
     /**
      * Prints the contents of a bucket to the log.
      */
-    void _dumpBucket(const LockBucket* bucket) const;
+    void _dumpBucket(const std::map<LockerId, BSONObj>& lockToClientMap,
+                     const LockBucket* bucket) const;
 
     /**
      * Dump the contents of a bucket to the BSON.

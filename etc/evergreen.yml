@@ -1488,7 +1488,6 @@ functions:
           path_value="$path_value:${task_path_suffix}"
         fi
 
-        resmoke_cmd_args="${resmoke_args}"
 
         # The "resmoke_wrapper" expansion is used by the 'burn_in_tests' task to wrap the resmoke.py
         # invocation. It doesn't set any environment variables and should therefore come last in
@@ -1503,7 +1502,7 @@ functions:
             ${snmp_config_path}                         \
             ${resmoke_wrapper}                          \
             $python buildscripts/evergreen_run_tests.py \
-                $resmoke_cmd_args                       \
+                ${resmoke_args}                         \
                 $extra_args                             \
                 ${test_flags}                           \
                 --log=buildlogger                       \
@@ -1705,6 +1704,33 @@ functions:
             exit $(cat run_tests_infrastructure_failure)
           fi
 
+  "scons lint":
+    - command: shell.exec
+      type: test
+      params:
+        working_dir: src
+        script: |
+          set -o errexit
+          set -o verbose
+
+          ${activate_virtualenv}
+          export MYPY="$(
+            if command -V cygpath 2>/dev/null; then
+                PATH+=":$(cypath "${workdir}")/venv_3/Scripts"
+            else
+                PATH+=":${workdir}/venv_3/bin"
+            fi
+            PATH+=':/opt/mongodbtoolchain/v3/bin'
+            which mypy
+          )"
+          echo "Found mypy executable at '$MYPY'"
+          export extra_flags=""
+          if [[ ${is_patch|false} == "true" ]]; then
+            extra_flags="--lint-scope=changed"
+          fi
+
+          ${compile_env|} python3 ./buildscripts/scons.py ${compile_flags|} $extra_flags --stack-size=1024 GITDIFFFLAGS="--cached" ${targets}
+
   "scons compile":
     command: shell.exec
     type: test
@@ -1740,8 +1766,8 @@ functions:
         # SCons multiple times on the same machine by allowing SCons
         # to assume that implicit dependencies are cacheable across
         # runs.
-        if [ "${is_patch|false}" = "true" ] || [ -z "${push_bucket|}" ]; then
-          extra_args="$extra_args --implicit-cache"
+        if [ "${is_patch|false}" = "true" ] || [ -z "${push_bucket|}" ] || [ "${compiling_for_test|false}" = "true" ]; then
+          extra_args="$extra_args --implicit-cache --build-fast-and-loose=on"
         else
           extra_args="$extra_args --release"
         fi
@@ -3899,6 +3925,7 @@ tasks:
     - func: "scons compile"
       vars:
         targets: core tools ${mh_target|}
+        compiling_for_test: true
         task_compile_flags: >-
           --use-new-tools
           --build-mongoreplay="${build_mongoreplay}"
@@ -3906,6 +3933,7 @@ tasks:
     - func: "scons compile"
       vars:
         targets: archive-dist
+        compiling_for_test: true
         additional_targets: ""
         task_compile_flags: >-
           --use-new-tools
@@ -3921,6 +3949,7 @@ tasks:
     - func: "scons compile"
       vars:
         targets: all
+        compiling_for_test: true
         task_compile_flags: >-
           --use-new-tools
           --build-mongoreplay="${build_mongoreplay}"
@@ -3946,6 +3975,7 @@ tasks:
         targets: generated-sources compiledb
         task_compile_flags: >-
           --detect-odr-violations
+        compiling_for_test: true
     - command: shell.exec
       type: test
       timeout_secs: 14400
@@ -3965,6 +3995,7 @@ tasks:
         targets: unittests
         task_compile_flags: >-
           --detect-odr-violations
+        compiling_for_test: true
     - func: "run diskstats"
     - func: "monitor process threads"
     - func: "collect system resource info"
@@ -3980,6 +4011,7 @@ tasks:
         targets: libfuzzer_tests
         task_compile_flags: >-
           --detect-odr-violations
+        compiling_for_test: true
     - command: shell.exec
       params:
         working_dir: "src"
@@ -4016,6 +4048,7 @@ tasks:
         targets: dbtest
         task_compile_flags: >-
           --detect-odr-violations
+        compiling_for_test: true
     # Tar unstripped dbtest, to be archived in case of failure
     - command: archive.targz_pack
       params:
@@ -4193,6 +4226,7 @@ tasks:
     - func: "scons compile"
       vars:
         targets: install-embedded-test
+        compiling_for_test: true
         task_compile_flags: *embedded_sdk_compile_flags
         task_compile_flags_extra: >-
           --link-model=dynamic
@@ -4958,6 +4992,7 @@ tasks:
     - func: "scons compile"
       vars:
         targets: install-stitch-support-test
+        compiling_for_test: true
         task_compile_flags: >-
           --install-mode=hygienic
           --dbg=off
@@ -4998,6 +5033,7 @@ tasks:
     - func: "scons compile"
       vars:
         targets: benchmarks
+        compiling_for_test: true
     - command: archive.targz_pack
       params:
         target: "benchmarks.tgz"
@@ -5020,8 +5056,7 @@ tasks:
         display_name: Benchmarks
 
 ## lint ##
-- name: lint
-  depends_on: []
+- name: lint_pylinters
   commands:
     - command: timeout.update
       params:
@@ -5032,26 +5067,54 @@ tasks:
     - func: "set task expansion macros"
     - func: "set up virtualenv"
     - func: "upload pip requirements"
-    - command: shell.exec
-      type: test
-      params:
-        working_dir: src
-        script: |
-          set -o errexit
-          set -o verbose
+    - func: "scons lint"
+      vars:
+        targets: lint-pylinters
 
-          ${activate_virtualenv}
-          export MYPY="$(
-            if command -V cygpath 2>/dev/null; then
-                PATH+=":$(cypath "${workdir}")/venv_3/Scripts"
-            else
-                PATH+=":${workdir}/venv_3/bin"
-            fi
-            PATH+=':/opt/mongodbtoolchain/v3/bin'
-            which mypy
-          )"
-          echo "Found mypy executable at '$MYPY'"
-          ${compile_env|} python3 ./buildscripts/scons.py ${compile_flags|} --stack-size=1024 lint
+- name: lint_clang_format
+  commands:
+    - command: timeout.update
+      params:
+        # 40 minutes
+        exec_timeout_secs: 2400
+    - command: manifest.load
+    - func: "git get project"
+    - func: "set task expansion macros"
+    - func: "set up virtualenv"
+    - func: "upload pip requirements"
+    - func: "scons lint"
+      vars:
+        targets: lint-clang-format
+
+- name: lint_eslint
+  commands:
+    - command: timeout.update
+      params:
+        # 40 minutes
+        exec_timeout_secs: 2400
+    - command: manifest.load
+    - func: "git get project"
+    - func: "set task expansion macros"
+    - func: "set up virtualenv"
+    - func: "upload pip requirements"
+    - func: "scons lint"
+      vars:
+        targets: lint-eslint
+
+- name: lint_cpplint
+  commands:
+    - command: timeout.update
+      params:
+        # 40 minutes
+        exec_timeout_secs: 2400
+    - command: manifest.load
+    - func: "git get project"
+    - func: "set task expansion macros"
+    - func: "set up virtualenv"
+    - func: "upload pip requirements"
+    - func: "scons lint"
+      vars:
+        targets: lint-lint.py
 
 - name: lint_yaml
   depends_on: []
@@ -5356,6 +5419,21 @@ tasks:
       jepsen_test_name: read-concern-majority
       jepsen_write_concern: --write-concern w1
 
+## initial sync multiversion fuzzer ##
+- <<: *jstestfuzz_template
+  name: initial_sync_multiversion_fuzzer_gen
+  tags: ["multiversion_fuzzer"]
+  commands:
+  - func: "generate fuzzer tasks"
+    vars:
+      <<: *jstestfuzz_config_vars
+      num_files: 10
+      num_tasks: 15
+      npm_command: initsync-fuzzer
+      resmoke_args: --suites=initial_sync_multiversion_fuzzer
+      name: initial_sync_multiversion_fuzzer
+      task_path_suffix: "/data/multiversion"
+
 ## initial sync generational fuzzer ##
 - <<: *jstestfuzz_template
   name: initial_sync_fuzzer_gen
@@ -5366,7 +5444,7 @@ tasks:
       num_files: 10
       num_tasks: 15
       npm_command: initsync-fuzzer
-      resmoke_args: --suites=initial_sync_fuzzer
+      resmoke_args: "--suites=initial_sync_fuzzer --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: initial_sync_fuzzer
 
 ## Standalone generational fuzzer for multiversion aggregation pipelines ##
@@ -5379,7 +5457,7 @@ tasks:
       <<: *jstestfuzz_config_vars
       num_files: 5
       num_tasks: 10
-      resmoke_args: --suites=generational_fuzzer
+      resmoke_args: "--suites=generational_fuzzer --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       npm_command: agg-fuzzer
       name: aggregation_multiversion_fuzzer
       task_path_suffix: "/data/multiversion"
@@ -5394,7 +5472,7 @@ tasks:
       <<: *jstestfuzz_config_vars
       num_files: 5
       num_tasks: 10
-      resmoke_args: --suites=generational_fuzzer
+      resmoke_args: "--suites=generational_fuzzer --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       npm_command: agg-expr-fuzzer
       name: aggregation_expression_multiversion_fuzzer
       task_path_suffix: "/data/multiversion"
@@ -5410,7 +5488,7 @@ tasks:
       num_files: 5
       num_tasks: 10
       jstestfuzz_vars: --diffTestingMode optimization
-      resmoke_args: --suites=generational_fuzzer
+      resmoke_args: "--suites=generational_fuzzer --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       npm_command: agg-expr-fuzzer
       name: aggregation_expression_optimization_fuzzer
 
@@ -5425,7 +5503,7 @@ tasks:
       num_files: 5
       num_tasks: 10
       jstestfuzz_vars: --diffTestingMode optimization
-      resmoke_args: --suites=generational_fuzzer
+      resmoke_args: "--suites=generational_fuzzer --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       npm_command: agg-fuzzer
       name: aggregation_optimization_fuzzer
 
@@ -5441,7 +5519,7 @@ tasks:
       num_tasks: 10
       jstestfuzz_vars: --diffTestingMode wildcard
       npm_command: agg-fuzzer
-      resmoke_args: --suites=generational_fuzzer
+      resmoke_args: "--suites=generational_fuzzer --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: aggregation_wildcard_fuzzer
 
 ## jstestfuzz standalone fuzzer for checking find and aggregate equivalence ##
@@ -5456,7 +5534,7 @@ tasks:
       num_tasks: 10
       jstestfuzz_vars: --diffTestingMode standalone
       npm_command: query-fuzzer
-      resmoke_args: --suites=generational_fuzzer
+      resmoke_args: "--suites=generational_fuzzer --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: query_fuzzer_standalone
 
 ## jstestfuzz sharded fuzzer for checking find and aggregate equivalence ##
@@ -5471,7 +5549,7 @@ tasks:
       num_tasks: 10
       jstestfuzz_vars: --diffTestingMode sharded
       npm_command: query-fuzzer
-      resmoke_args: --suites=generational_fuzzer
+      resmoke_args: "--suites=generational_fuzzer --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: query_fuzzer_sharded
 
 ## jstestfuzz standalone update generational fuzzer ##
@@ -5485,7 +5563,7 @@ tasks:
       num_files: 5
       num_tasks: 10
       npm_command: update-fuzzer
-      resmoke_args: --suites=generational_fuzzer
+      resmoke_args: "--suites=generational_fuzzer --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: update_fuzzer
       task_path_suffix: "/data/multiversion"
 
@@ -5500,8 +5578,23 @@ tasks:
       num_files: 5
       num_tasks: 10
       npm_command: update-fuzzer
-      resmoke_args: --suites=generational_fuzzer_replication
+      resmoke_args: "--suites=generational_fuzzer_replication --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: update_fuzzer_replication
+      task_path_suffix: "/data/multiversion"
+
+## rollback multiversion fuzzer ##
+- <<: *jstestfuzz_template
+  name: rollback_multiversion_fuzzer_gen
+  tags: ["multiversion_fuzzer"]
+  commands:
+  - func: "generate fuzzer tasks"
+    vars:
+      <<: *jstestfuzz_config_vars
+      num_files: 3
+      num_tasks: 5
+      npm_command: rollback-fuzzer
+      resmoke_args: --suites=rollback_multiversion_fuzzer
+      name: rollback_multiversion_fuzzer
       task_path_suffix: "/data/multiversion"
 
 ## rollback generational fuzzer ##
@@ -5515,7 +5608,7 @@ tasks:
       num_files: 3
       num_tasks: 5
       npm_command: rollback-fuzzer
-      resmoke_args: --suites=rollback_fuzzer
+      resmoke_args: "--suites=rollback_fuzzer --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: rollback_fuzzer
 
 ## rollback generational fuzzer with clean shutdowns ##
@@ -5530,7 +5623,7 @@ tasks:
       num_tasks: 4
       jstestfuzz_vars: --numLinesPerFile 300 --maxLinesBetweenEvents 50
       npm_command: rollback-fuzzer
-      resmoke_args: --suites=rollback_fuzzer_clean_shutdowns
+      resmoke_args: "--suites=rollback_fuzzer_clean_shutdowns --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: rollback_fuzzer_clean_shutdowns
 
 ## rollback generational fuzzer with unclean shutdowns ##
@@ -5545,7 +5638,7 @@ tasks:
       num_tasks: 4
       jstestfuzz_vars: --numLinesPerFile 300 --maxLinesBetweenEvents 50
       npm_command: rollback-fuzzer
-      resmoke_args: --suites=rollback_fuzzer_unclean_shutdowns
+      resmoke_args: "--suites=rollback_fuzzer_unclean_shutdowns --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: rollback_fuzzer_unclean_shutdowns
 
 ## jstestfuzz ##
@@ -5557,7 +5650,7 @@ tasks:
     vars:
       <<: *jstestfuzz_config_vars
       jstestfuzz_vars: --jsTestsDir ../jstests
-      resmoke_args: --suites=jstestfuzz --storageEngine=wiredTiger
+      resmoke_args: "--suites=jstestfuzz --storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       npm_command: jstestfuzz
       name: jstestfuzz
 
@@ -5668,7 +5761,7 @@ tasks:
     vars:
       <<: *jstestfuzz_config_vars
       jstestfuzz_vars: --jsTestsDir ../jstests
-      resmoke_args: --suites=jstestfuzz_interrupt --storageEngine=wiredTiger
+      resmoke_args: "--suites=jstestfuzz_interrupt --storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: jstestfuzz_interrupt
 
 # jstestfuzz interrupt #
@@ -5680,7 +5773,7 @@ tasks:
     vars:
       <<: *jstestfuzz_config_vars
       jstestfuzz_vars: --jsTestsDir ../jstests
-      resmoke_args: --suites=jstestfuzz_interrupt_replication --storageEngine=wiredTiger
+      resmoke_args: "--suites=jstestfuzz_interrupt_replication --storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: jstestfuzz_interrupt_replication
 
 # jstestfuzz interrupt with flow control engaged #
@@ -5694,7 +5787,7 @@ tasks:
       num_files: 5
       num_tasks: 30
       jstestfuzz_vars: --jsTestsDir ../jstests
-      resmoke_args: --suites=jstestfuzz_interrupt_replication --flowControlTicketOverride=1 --storageEngine=wiredTiger
+      resmoke_args: "--suites=jstestfuzz_interrupt_replication --flowControlTicketOverride=1 --storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: jstestfuzz_interrupt_replication_flow_control
 
 ## jstestfuzz sharded cluster continuous stepdown with flow control engaged ##
@@ -5708,7 +5801,7 @@ tasks:
       num_files: 5
       num_tasks: 10
       jstestfuzz_vars: --jsTestsDir ../jstests
-      resmoke_args: --suites=jstestfuzz_sharded_continuous_stepdown --flowControlTicketOverride=3 --storageEngine=wiredTiger
+      resmoke_args: "--suites=jstestfuzz_sharded_continuous_stepdown --flowControlTicketOverride=3 --storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: jstestfuzz_sharded_continuous_stepdown_flow_control
 
 ## jstestfuzz concurrent sharded cluster continuous stepdown with flow control engaged ##
@@ -5736,7 +5829,7 @@ tasks:
       num_files: 5
       num_tasks: 30
       jstestfuzz_vars: --jsTestsDir ../jstests
-      resmoke_args: --suites=jstestfuzz_replication_continuous_stepdown --flowControlTicketOverride=1 --storageEngine=wiredTiger
+      resmoke_args: "--suites=jstestfuzz_replication_continuous_stepdown --flowControlTicketOverride=1 --storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: jstestfuzz_replication_continuous_stepdown_flow_control
 
 ## jstestfuzz concurrent replication continuous stepdown with flow control engaged ##
@@ -5762,7 +5855,7 @@ tasks:
     vars:
       <<: *jstestfuzz_config_vars
       jstestfuzz_vars: --jsTestsDir ../jstests
-      resmoke_args: --suites=jstestfuzz_replication --storageEngine=wiredTiger
+      resmoke_args: "--suites=jstestfuzz_replication --storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: jstestfuzz_replication
 
 ## jstestfuzz initial sync replica set ##
@@ -5776,7 +5869,7 @@ tasks:
       num_files: 8
       num_tasks: 10
       jstestfuzz_vars: --jsTestsDir ../jstests
-      resmoke_args: --suites=jstestfuzz_replication_initsync --storageEngine=wiredTiger
+      resmoke_args: "--suites=jstestfuzz_replication_initsync --storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: jstestfuzz_replication_initsync
 
 ## jstestfuzz replica set with logical session ##
@@ -5788,7 +5881,7 @@ tasks:
     vars:
       <<: *jstestfuzz_config_vars
       jstestfuzz_vars: --jsTestsDir ../jstests
-      resmoke_args: --suites=jstestfuzz_replication_session --storageEngine=wiredTiger
+      resmoke_args: "--suites=jstestfuzz_replication_session --storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: jstestfuzz_replication_session
 
 ## jstestfuzz sharded cluster ##
@@ -5800,7 +5893,7 @@ tasks:
     vars:
       <<: *jstestfuzz_config_vars
       jstestfuzz_vars: --jsTestsDir ../jstests
-      resmoke_args: --suites=jstestfuzz_sharded --storageEngine=wiredTiger
+      resmoke_args: "--suites=jstestfuzz_sharded --storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: jstestfuzz_sharded
 
 ## jstestfuzz sharded cluster causal consistency ##
@@ -5812,7 +5905,7 @@ tasks:
     vars:
       <<: *jstestfuzz_config_vars
       jstestfuzz_vars: --jsTestsDir ../jstests
-      resmoke_args: --suites=jstestfuzz_sharded_causal_consistency --storageEngine=wiredTiger
+      resmoke_args: "--suites=jstestfuzz_sharded_causal_consistency --storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: jstestfuzz_sharded_causal_consistency
 
 ## jstestfuzz sharded cluster continuous stepdown ##
@@ -5826,7 +5919,7 @@ tasks:
       num_files: 5
       num_tasks: 10
       jstestfuzz_vars: --jsTestsDir ../jstests
-      resmoke_args: --suites=jstestfuzz_sharded_continuous_stepdown --storageEngine=wiredTiger
+      resmoke_args: "--suites=jstestfuzz_sharded_continuous_stepdown --storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: jstestfuzz_sharded_continuous_stepdown
 
 ## jstestfuzz sharded cluster with logical session ##
@@ -5838,7 +5931,7 @@ tasks:
     vars:
       <<: *jstestfuzz_config_vars
       jstestfuzz_vars: --jsTestsDir ../jstests
-      resmoke_args: --suites=jstestfuzz_sharded_session --storageEngine=wiredTiger
+      resmoke_args: "--suites=jstestfuzz_sharded_session --storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: jstestfuzz_sharded_session
 
 - <<: *multiversion_template
@@ -6281,6 +6374,7 @@ tasks:
   - func: "scons compile"
     vars:
       targets: integration_tests
+      compiling_for_test: true
       bypass_compile: false
       task_compile_flags: >-
         --detect-odr-violations
@@ -6301,6 +6395,7 @@ tasks:
   - func: "scons compile"
     vars:
       targets: integration_tests
+      compiling_for_test: true
       bypass_compile: false
       task_compile_flags: >-
         --detect-odr-violations
@@ -6321,6 +6416,7 @@ tasks:
   - func: "scons compile"
     vars:
       targets: integration_tests
+      compiling_for_test: true
       bypass_compile: false
       task_compile_flags: >-
         --detect-odr-violations
@@ -6341,6 +6437,7 @@ tasks:
   - func: "scons compile"
     vars:
       targets: integration_tests
+      compiling_for_test: true
       bypass_compile: false
       task_compile_flags: >-
         --detect-odr-violations
@@ -6751,12 +6848,12 @@ tasks:
       task_path_suffix: /data/multiversion
       resmoke_args: --suites=multiversion --storageEngine=wiredTiger
 
-- name: unittest_peer_pids_gen
+- name: unittest_shell_hang_analyzer_gen
   tags: ["misc_js"]
   commands:
   - func: "generate resmoke tasks"
     vars:
-      suite: unittest_peer_pids
+      suite: unittest_shell_hang_analyzer
       resmoke_args: --storageEngine=wiredTiger
       fallback_num_sub_suites: 1
 
@@ -7374,6 +7471,16 @@ tasks:
       resmoke_args: --storageEngine=wiredTiger
       fallback_num_sub_suites: 32
 
+- name: sharding_multiversion_gen
+  tags: ["random_multiversion_replica_sets"]
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      use_large_distro: "true"
+      resmoke_args: --storageEngine=wiredTiger --dryRun=tests
+      fallback_num_sub_suites: 32
+      use_multiversion: /data/multiversion
+
 - name: sharding_rs_matching_disabled_gen
   tags: ["sharding", "common"]
   commands:
@@ -7566,6 +7673,18 @@ tasks:
       depends_on: jsCore
       resmoke_args: --storageEngine=wiredTiger
       fallback_num_sub_suites: 15
+
+- <<: *multiversion_template
+  name: sharded_causally_consistent_jscore_multiversion_passthrough_gen
+  tags: ["multiversion_passthrough"]
+  commands:
+  - func: "generate multiversion tasks"
+    vars:
+      suite: replica_sets_jscore_passthrough
+      resmoke_args: --storageEngine=wiredTiger
+      task_path_suffix: /data/multiversion
+      fallback_num_sub_suites: 4
+      is_sharded: true
 
 - name: retryable_writes_jscore_passthrough_gen
   tags: ["retry"]
@@ -8992,6 +9111,7 @@ buildvariants:
   - name: jsCore_auth
   - name: .jstestfuzz .common
   - name: .logical_session_cache .one_sec
+  - name: .multiversion_fuzzer
   - name: .multiversion_passthrough
   - name: .random_multiversion_replica_sets
   - name: replica_sets_auth_gen
@@ -9675,7 +9795,7 @@ buildvariants:
         - windows-64-vs2017-compile
     - name: burn_in_tests_gen
     - name: buildscripts_test
-    - name: unittest_peer_pids_gen
+    - name: unittest_shell_hang_analyzer_gen
     - name: dbtest_TG
       distros:
         - windows-64-vs2017-compile
@@ -10625,7 +10745,10 @@ buildvariants:
   - name: compile_benchmarks
     distros:
     - rhel62-large
-  - name: lint
+  - name: lint_pylinters
+  - name: lint_clang_format
+  - name: lint_eslint
+  - name: lint_cpplint
   - name: lint_fuzzer_sanity_patch
   - name: lint_yaml
   - name: burn_in_tests_gen
@@ -10638,7 +10761,7 @@ buildvariants:
     distros:
     - centos6-perf
   - name: buildscripts_test
-  - name: unittest_peer_pids_gen
+  - name: unittest_shell_hang_analyzer_gen
   - name: .causally_consistent !.sharding
   - name: .change_streams
   - name: .misc_js
@@ -10954,6 +11077,10 @@ buildvariants:
   - name: .jscore .common
   - name: noPassthrough_gen
   - name: noPassthroughWithMongod_gen
+  - name: replica_sets
+    distros:
+    - rhel62-large
+  - name: sharding_gen
 
 - name: enterprise-rhel-62-64-bit-coverage
   display_name: "~ Enterprise RHEL 6.2 DEBUG Code Coverage"
@@ -10998,6 +11125,7 @@ buildvariants:
     - name: .logical_session_cache .one_sec
     - name: .multi_shard .common
     - name: multiversion
+    - name: .multiversion_fuzzer
     - name: .multiversion_passthrough
     - name: .query_fuzzer
     - name: .random_multiversion_replica_sets
@@ -12626,6 +12754,7 @@ buildvariants:
   - name: .logical_session_cache
   - name: .multi_shard .common
   - name: multiversion
+  - name: .multiversion_fuzzer
   - name: .multiversion_passthrough
   - name: .query_fuzzer
   - name: .random_multiversion_replica_sets
@@ -12715,6 +12844,7 @@ buildvariants:
   - name: .logical_session_cache .one_sec
   - name: .multi_shard .common
   - name: multiversion
+  - name: .multiversion_fuzzer
   - name: .multiversion_passthrough
   - name: .random_multiversion_replica_sets
   - name: .read_write_concern

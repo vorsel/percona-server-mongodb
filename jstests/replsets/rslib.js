@@ -15,6 +15,8 @@ var awaitRSClientHosts;
 var getLastOpTime;
 var setLogVerbosity;
 var stopReplicationAndEnforceNewPrimaryToCatchUp;
+var setFailPoint;
+var clearFailPoint;
 
 (function() {
 "use strict";
@@ -487,5 +489,25 @@ stopReplicationAndEnforceNewPrimaryToCatchUp = function(rst, node) {
         latestOpOnOldPrimary: latestOpOnOldPrimary,
         latestOpOnNewPrimary: latestOpOnNewPrimary
     };
+};
+
+/**
+ * Sets the specified failpoint to 'alwaysOn' on the node and returns the number of
+ * times the fail point has been entered so far.
+ */
+setFailPoint = function(node, failpoint, data = {}) {
+    jsTestLog("Setting fail point " + failpoint);
+    let configureFailPointRes =
+        node.adminCommand({configureFailPoint: failpoint, mode: "alwaysOn", data: data});
+    assert.commandWorked(configureFailPointRes);
+    return configureFailPointRes.count;
+};
+
+/**
+ * Sets the specified failpoint to 'off' on the node.
+ */
+clearFailPoint = function(node, failpoint) {
+    jsTestLog("Clearing fail point " + failpoint);
+    assert.commandWorked(node.adminCommand({configureFailPoint: failpoint, mode: "off"}));
 };
 }());

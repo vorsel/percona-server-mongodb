@@ -405,8 +405,7 @@ bool runCreateIndexesForMobile(OperationContext* opCtx,
                                const std::string& dbname,
                                const BSONObj& cmdObj,
                                std::string& errmsg,
-                               BSONObjBuilder& result,
-                               bool runTwoPhaseBuild) {
+                               BSONObjBuilder& result) {
     NamespaceString ns(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
     uassertStatusOK(userAllowedWriteNS(ns));
 
@@ -499,7 +498,17 @@ bool runCreateIndexesForMobile(OperationContext* opCtx,
             // commit() clears the state.
             indexer.abortWithoutCleanup(opCtx);
         }
-        indexer.cleanUpAfterBuild(opCtx, collection);
+
+        if (!indexer.isCommitted()) {
+            opCtx->recoveryUnit()->abandonSnapshot();
+            exclusiveCollectionLock.reset();
+            UninterruptibleLockGuard noInterrupt(opCtx->lockState());
+            Lock::DBLock dbLock(opCtx, ns.db(), MODE_IX);
+            Lock::CollectionLock colLock(opCtx, {dbName, collectionUUID}, MODE_X);
+            indexer.cleanUpAfterBuild(opCtx, collection, MultiIndexBlock::kNoopOnCleanUpFn);
+        } else {
+            indexer.cleanUpAfterBuild(opCtx, collection, MultiIndexBlock::kNoopOnCleanUpFn);
+        }
     });
 
     std::vector<BSONObj> indexInfoObjs =
@@ -554,7 +563,10 @@ bool runCreateIndexesForMobile(OperationContext* opCtx,
         // the collection lock.
         ns = collection->ns();
 
-        uassertStatusOK(indexer.drainBackgroundWrites(opCtx));
+        uassertStatusOK(
+            indexer.drainBackgroundWrites(opCtx,
+                                          RecoveryUnit::ReadSource::kUnset,
+                                          IndexBuildInterceptor::DrainYieldPolicy::kYield));
     }
 
     if (MONGO_unlikely(hangAfterIndexBuildFirstDrain.shouldFail())) {
@@ -575,7 +587,10 @@ bool runCreateIndexesForMobile(OperationContext* opCtx,
         // the collection lock.
         ns = collection->ns();
 
-        uassertStatusOK(indexer.drainBackgroundWrites(opCtx));
+        uassertStatusOK(
+            indexer.drainBackgroundWrites(opCtx,
+                                          RecoveryUnit::ReadSource::kUnset,
+                                          IndexBuildInterceptor::DrainYieldPolicy::kNoYield));
     }
 
     if (MONGO_unlikely(hangAfterIndexBuildSecondDrain.shouldFail())) {
@@ -603,7 +618,10 @@ bool runCreateIndexesForMobile(OperationContext* opCtx,
     invariant(CollectionCatalog::get(opCtx).lookupCollectionByNamespace(ns));
 
     // Perform the third and final drain while holding the exclusive collection lock.
-    uassertStatusOK(indexer.drainBackgroundWrites(opCtx));
+    uassertStatusOK(
+        indexer.drainBackgroundWrites(opCtx,
+                                      RecoveryUnit::ReadSource::kUnset,
+                                      IndexBuildInterceptor::DrainYieldPolicy::kNoYield));
 
     // This is required before completion.
     uassertStatusOK(indexer.checkConstraints(opCtx));
@@ -632,8 +650,7 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
                                      const std::string& dbname,
                                      const BSONObj& cmdObj,
                                      std::string& errmsg,
-                                     BSONObjBuilder& result,
-                                     bool runTwoPhaseBuild) {
+                                     BSONObjBuilder& result) {
     const NamespaceString ns(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
     uassertStatusOK(userAllowedWriteNS(ns));
 
@@ -688,8 +705,9 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
 
     auto indexBuildsCoord = IndexBuildsCoordinator::get(opCtx);
     auto buildUUID = UUID::gen();
-    auto protocol =
-        (runTwoPhaseBuild) ? IndexBuildProtocol::kTwoPhase : IndexBuildProtocol::kSinglePhase;
+    auto protocol = indexBuildsCoord->supportsTwoPhaseIndexBuild()
+        ? IndexBuildProtocol::kTwoPhase
+        : IndexBuildProtocol::kSinglePhase;
     log() << "Registering index build: " << buildUUID;
     ReplIndexBuildState::IndexCatalogStats stats;
     IndexBuildsCoordinator::IndexBuildOptions indexBuildOptions = {commitQuorum};
@@ -711,30 +729,48 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
         try {
             stats = buildIndexFuture.get(opCtx);
         } catch (const ExceptionForCat<ErrorCategory::Interruption>& interruptionEx) {
+            log() << "Index build interrupted: " << buildUUID << ": " << interruptionEx;
+
+            // If this node is no longer a primary, the index build will continue to run in the
+            // background and will complete when this node receives a commitIndexBuild oplog entry
+            // from the new primary.
+            if (indexBuildsCoord->supportsTwoPhaseIndexBuild() &&
+                ErrorCodes::InterruptedDueToReplStateChange == interruptionEx.code()) {
+                log() << "Index build continuing in background: " << buildUUID;
+                throw;
+            }
+
             // It is unclear whether the interruption originated from the current opCtx instance
             // for the createIndexes command or that the IndexBuildsCoordinator task was interrupted
             // independently of this command invocation. We'll defensively abort the index build
             // with the assumption that if the index build was already in the midst of tearing down,
             // this be a no-op.
-            log() << "Index build interrupted: " << buildUUID << ": aborting index build.";
-            auto abortIndexFuture = indexBuildsCoord->abortIndexBuildByBuildUUID(
+            indexBuildsCoord->abortIndexBuildByBuildUUID(
                 opCtx,
                 buildUUID,
                 str::stream() << "Index build interrupted: " << buildUUID << ": "
                               << interruptionEx.toString());
-            log() << "Index build aborted: " << buildUUID << ": "
-                  << abortIndexFuture.getNoThrow(opCtx);
+            log() << "Index build aborted: " << buildUUID;
+
             throw;
         } catch (const ExceptionForCat<ErrorCategory::NotMasterError>& ex) {
-            log() << "Index build interrupted: " << buildUUID
-                  << ": aborting index build due to change in replication state.";
-            auto abortIndexFuture = indexBuildsCoord->abortIndexBuildByBuildUUID(
+            log() << "Index build interrupted due to change in replication state: " << buildUUID
+                  << ": " << ex;
+
+            // The index build will continue to run in the background and will complete when this
+            // node receives a commitIndexBuild oplog entry from the new primary.
+            if (indexBuildsCoord->supportsTwoPhaseIndexBuild()) {
+                log() << "Index build continuing in background: " << buildUUID;
+                throw;
+            }
+
+            indexBuildsCoord->abortIndexBuildByBuildUUID(
                 opCtx,
                 buildUUID,
                 str::stream() << "Index build interrupted due to change in replication state: "
                               << buildUUID << ": " << ex.toString());
-            log() << "Index build aborted due to NotMaster error: " << buildUUID << ": "
-                  << abortIndexFuture.getNoThrow(opCtx);
+            log() << "Index build aborted due to NotMaster error: " << buildUUID;
+
             throw;
         }
 
@@ -821,11 +857,9 @@ public:
                 // TODO(SERVER-42513): Remove runCreateIndexesForMobile() when the mobile storage
                 // engine is supported by runCreateIndexesWithCoordinator().
                 if (storageGlobalParams.engine == "mobile") {
-                    return runCreateIndexesForMobile(
-                        opCtx, dbname, cmdObj, errmsg, result, false /*two phase build*/);
+                    return runCreateIndexesForMobile(opCtx, dbname, cmdObj, errmsg, result);
                 }
-                return runCreateIndexesWithCoordinator(
-                    opCtx, dbname, cmdObj, errmsg, result, false /*two phase build*/);
+                return runCreateIndexesWithCoordinator(opCtx, dbname, cmdObj, errmsg, result);
             } catch (const DBException& ex) {
                 if (ex.toStatus() != ErrorCodes::IndexBuildAlreadyInProgress) {
                     throw;

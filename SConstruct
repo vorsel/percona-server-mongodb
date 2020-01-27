@@ -30,6 +30,12 @@ import mongo.generators as mongo_generators
 EnsurePythonVersion(3, 6)
 EnsureSConsVersion(3, 1, 1)
 
+# Monkey patch SCons.FS.File.release_target_info to be a no-op.
+# See https://github.com/SCons/scons/issues/3454
+def release_target_info_noop(self):
+    pass
+SCons.Node.FS.File.release_target_info = release_target_info_noop
+
 from buildscripts import utils
 from buildscripts import moduleconfig
 
@@ -120,6 +126,13 @@ add_option('legacy-tarball',
     nargs='?',
     type='choice',
     help='Build a tarball matching the old MongoDB dist targets',
+)
+
+add_option('lint-scope',
+    choices=['all', 'changed'],
+    default='all',
+    type='choice',
+    help='Lint files in the current git diff instead of all files'
 )
 
 add_option('install-mode',
@@ -725,6 +738,10 @@ env_vars.Add('DESTDIR',
     help='Where hygienic builds will install files',
     default='$BUILD_ROOT/install')
 
+env_vars.Add('GITDIFFFLAGS',
+    help='Sets flags for git diff',
+    default='')
+
 # Note: This probably is only really meaningful when configured via a variables file. It will
 # also override whatever the SCons platform defaults would be.
 env_vars.Add('ENV',
@@ -833,7 +850,7 @@ different configurations, for instance:
 
     scons --sanitize=asan --ninja NINJA_SUFFIX=asan ninja-install-all-meta
     scons --sanitize=tsan --ninja NINJA_SUFFIX=tsan ninja-install-all-meta
-          
+
 Will generate the files (respectively):
 
     install-all-meta.build.ninja.asan
@@ -1357,6 +1374,15 @@ if link_model == "auto":
 if env.TargetOSIs('windows') and link_model not in ['object', 'static', 'dynamic-sdk']:
     env.FatalError("Windows builds must use the 'object', 'dynamic-sdk', or 'static' link models")
 
+
+# The mongodbtoolchain currently doesn't produce working binaries if
+# you combine a dynamic build with a non-system allocator, but the
+# failure mode is non-obvious. For now, prevent people from wandering
+# inadvertantly into this trap. Remove this constraint when
+# https://jira.mongodb.org/browse/SERVER-27675 is resolved.
+if (link_model == 'dynamic') and ('mongodbtoolchain' in env['CXX']) and (env['MONGO_ALLOCATOR'] != 'system'):
+    env.FatalError('Cannot combine the MongoDB toolchain, a dynamic build, and a non-system allocator. Choose two.')
+
 # The 'object' mode for libdeps is enabled by setting _LIBDEPS to $_LIBDEPS_OBJS. The other two
 # modes operate in library mode, enabled by setting _LIBDEPS to $_LIBDEPS_LIBS.
 env['_LIBDEPS'] = '$_LIBDEPS_OBJS' if link_model == "object" else '$_LIBDEPS_LIBS'
@@ -1516,11 +1542,18 @@ if get_option('git-decider') == 'on':
 # executable (like -fPIE), vs those being used to target a (shared) library (like -fPIC). To do so,
 # we inject a new family of SCons variables PROG*FLAGS, by reaching into the various COMs.
 if not env.TargetOSIs('windows'):
-    env["CCCOM"] = env["CCCOM"].replace("$CFLAGS", "$CFLAGS $PROGCFLAGS")
-    env["CXXCOM"] = env["CXXCOM"].replace("$CXXFLAGS", "$CXXFLAGS $PROGCXXFLAGS")
-    env["CCCOM"] = env["CCCOM"].replace("$CCFLAGS", "$CCFLAGS $PROGCCFLAGS")
-    env["CXXCOM"] = env["CXXCOM"].replace("$CCFLAGS", "$CCFLAGS $PROGCCFLAGS")
-    env["LINKCOM"] = env["LINKCOM"].replace("$LINKFLAGS", "$LINKFLAGS $PROGLINKFLAGS")
+    env["CCCOM"] = env["CCCOM"].replace("$CCFLAGS", "$PROGCCFLAGS")
+    env["CXXCOM"] = env["CXXCOM"].replace("$CCFLAGS", "$PROGCCFLAGS")
+    env["PROGCCFLAGS"] = ['$CCFLAGS']
+
+    env["CCCOM"] = env["CCCOM"].replace("$CFLAGS", "$PROGCFLAGS")
+    env["PROGCFLAGS"] = ['$CFLAGS']
+
+    env["CXXCOM"] = env["CXXCOM"].replace("$CXXFLAGS", "$PROGCXXFLAGS")
+    env['PROGCXXFLAGS'] = ['$CXXFLAGS']
+
+    env["LINKCOM"] = env["LINKCOM"].replace("$LINKFLAGS", "$PROGLINKFLAGS")
+    env["PROGLINKFLAGS"] = ['$LINKFLAGS']
 
 if not env.Verbose():
     env.Append( CCCOMSTR = "Compiling $TARGET" )
@@ -1876,8 +1909,19 @@ if env.TargetOSIs('posix'):
             ],
         )
 
-    # Everything on OS X is position independent by default. Solaris doesn't support PIE.
-    if not env.TargetOSIs('darwin', 'solaris'):
+    # If shared and static object files stripped of their rightmost
+    # dot-delimited suffix would collide, modify the shared library
+    # ones so that they won't. We do this because if split dwarf is in
+    # play, static and dynamic builds would otherwise overwrite each
+    # other's .dwo files, because GCC strips the last suffix and adds
+    # .dwo, rather than simply appending .dwo to the full filename.
+    objsuffelts = env.subst('$OBJSUFFIX').split('.')
+    shobjsuffelts = env.subst('$SHOBJSUFFIX').split('.')
+    if objsuffelts[0:-1] == shobjsuffelts[0:-1]:
+        env['SHOBJSUFFIX'] = '.dyn${OBJSUFFIX}'
+
+    # Everything on OS X is position independent by default.
+    if not env.TargetOSIs('darwin'):
         if get_option('runtime-hardening') == "on":
             # If runtime hardening is requested, then build anything
             # destined for an executable with the necessary flags for PIE.
@@ -2850,9 +2894,12 @@ def doConfigure(myenv):
         # because it is much faster. Don't use it if the user has already configured another linker
         # selection manually.
         if not any(flag.startswith('-fuse-ld=') for flag in env['LINKFLAGS']):
-            if AddToLINKFLAGSIfSupported(myenv, '-fuse-ld=gold'):
+            if AddToLINKFLAGSIfSupported(myenv, '-fuse-ld=lld') or AddToLINKFLAGSIfSupported(myenv, '-fuse-ld=gold'):
                 if link_model.startswith("dynamic"):
                     AddToLINKFLAGSIfSupported(myenv, '-Wl,--gdb-index')
+
+            # Our build is already parallel.
+            AddToLINKFLAGSIfSupported(myenv, '-Wl,--no-threads')
 
         # Explicitly enable GNU build id's if the linker supports it.
         AddToLINKFLAGSIfSupported(myenv, '-Wl,--build-id')
@@ -3943,26 +3990,79 @@ env.AddMethod(env_windows_resource_file, 'WindowsResourceFile')
 
 # --- lint ----
 
-def doLint( env , target , source ):
-    import buildscripts.eslint
-    if not buildscripts.eslint.lint(None, dirmode=True, glob=["jstests/", "src/mongo/"]):
-        raise Exception("ESLint errors")
+if get_option('lint-scope') == 'changed':
+    patch_file = env.Command(
+        target="$BUILD_DIR/current.git.patch",
+        source=[env.WhereIs("git")],
+        action="${SOURCES[0]} diff $GITDIFFFLAGS > $TARGET"
+    )
 
-    import buildscripts.clang_format
-    if not buildscripts.clang_format.lint_all(None):
-        raise Exception("clang-format lint errors")
+    env.AlwaysBuild(patch_file)
 
-    import buildscripts.pylinters
-    buildscripts.pylinters.lint_all(None, {}, [])
+    pylinters = env.Command(
+        target="#lint-pylinters",
+        source=[
+            "buildscripts/pylinters.py",
+            patch_file,
+        ],
+        action="$PYTHON ${SOURCES[0]} lint-patch ${SOURCES[1]}"
+    )
 
-run_lint = env.Command(
-    target="#run_lint",
-    source=["buildscripts/lint.py", "src/mongo"],
-    action="$PYTHON ${SOURCES[0]} ${SOURCES[1]}",
+    clang_format = env.Command(
+        target="#lint-clang-format",
+        source=[
+            "buildscripts/clang_format.py",
+            patch_file,
+        ],
+        action="$PYTHON ${SOURCES[0]} lint-patch ${SOURCES[1]}"
+    )
+
+    eslint = env.Command(
+        target="#lint-eslint",
+        source=[
+            "buildscripts/eslint.py",
+            patch_file,
+        ],
+        action="$PYTHON ${SOURCES[0]} lint-patch ${SOURCES[1]}"
+    )
+
+else:
+    pylinters = env.Command(
+        target="#lint-pylinters",
+        source=[
+            "buildscripts/pylinters.py",
+        ],
+        action="$PYTHON ${SOURCES[0]} lint-all"
+    )
+
+    clang_format = env.Command(
+        target="#lint-clang-format",
+        source=[
+            "buildscripts/clang_format.py",
+        ],
+        action="$PYTHON ${SOURCES[0]} lint-all"
+    )
+
+    eslint = env.Command(
+        target="#lint-eslint",
+        source=[
+            "buildscripts/eslint.py",
+            "jstests/",
+            "src/mongo/",
+        ],
+        action="$PYTHON ${SOURCES[0]} --dirmode lint ${SOURCES[1:]}",
+    )
+
+lint_py = env.Command(
+    target="#lint-lint.py",
+    source=["buildscripts/quickcpplint.py"],
+    action="$PYTHON ${SOURCES[0]} lint",
 )
 
-env.Alias( "lint" , [ run_lint ] , [ doLint ] )
+env.Alias( "lint" , [ lint_py, eslint, clang_format, pylinters ] )
+env.Alias( "lint-fast" , [ eslint, clang_format, pylinters ] )
 env.AlwaysBuild( "lint" )
+env.AlwaysBuild( "lint-fast" )
 
 
 #  ----  INSTALL -------
@@ -4243,8 +4343,8 @@ if get_option('install-mode') == 'hygienic':
         env.Alias("archive-dist", "tar-dist")
         env.Alias("archive-dist-debug", "tar-dist-debug")
 
-# We don't want installing files to cause them to flow into the cache,	
-# since presumably we can re-install them from the origin if needed.	
+# We don't want installing files to cause them to flow into the cache,
+# since presumably we can re-install them from the origin if needed.
 env.NoCache(env.FindInstalledFiles())
 
 # Substitute environment variables in any build targets so that we can

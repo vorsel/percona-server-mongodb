@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
 #include "mongo/db/query/projection_ast.h"
 #include "mongo/util/str.h"
 
@@ -47,12 +48,9 @@ struct ProjectionDependencies {
     // Which fields are necessary to perform the projection, or boost::none if all are required.
     boost::optional<std::vector<std::string>> requiredFields;
 
-    bool needsGeoDistance = false;
-    bool needsGeoPoint = false;
-    bool needsSortKey = false;
-    bool needsTextScore = false;
-
     bool hasDottedPath = false;
+
+    QueryMetadataBitSet metadataRequested;
 };
 
 /**
@@ -61,9 +59,13 @@ struct ProjectionDependencies {
 enum class ProjectType { kInclusion, kExclusion };
 class Projection {
 public:
-    Projection(ProjectionPathASTNode root, ProjectType type, const BSONObj& bson);
+    Projection(ProjectionPathASTNode root, ProjectType type);
 
     ProjectionPathASTNode* root() {
+        return &_root;
+    }
+
+    const ProjectionPathASTNode* root() const {
         return &_root;
     }
 
@@ -95,23 +97,8 @@ public:
         return *_deps.requiredFields;
     }
 
-    /**
-     * Does the projection want geoNear metadata?  If so any geoNear stage should include them.
-     */
-    bool wantGeoNearDistance() const {
-        return _deps.needsGeoDistance;
-    }
-
-    bool wantGeoNearPoint() const {
-        return _deps.needsGeoPoint;
-    }
-
-    bool wantSortKey() const {
-        return _deps.needsSortKey;
-    }
-
-    bool wantTextScore() const {
-        return _deps.needsTextScore;
+    const QueryMetadataBitSet& metadataDeps() const {
+        return _deps.metadataRequested;
     }
 
     /**
@@ -122,31 +109,18 @@ public:
     bool isFieldRetainedExactly(StringData path);
 
     /**
-     * TODO SERVER-42423: Delete this method and _bson.
-     *
-     * This method is deprecated and new call sites should not be added.
-     */
-    BSONObj getProjObj() const {
-        return _bson;
-    }
-
-    /**
      * A projection is considered "simple" if it doesn't require the full document, operates only
      * on top-level fields, has no positional projection, and doesn't require the sort key.
      */
     bool isSimple() const {
-        return !_deps.hasDottedPath && !_deps.requiresMatchDetails && !_deps.needsSortKey &&
-            !_deps.requiresDocument;
+        return !_deps.hasDottedPath && !_deps.requiresMatchDetails &&
+            !_deps.metadataRequested.any() && !_deps.requiresDocument;
     }
 
 private:
     ProjectionPathASTNode _root;
     ProjectType _type;
-
     ProjectionDependencies _deps;
-
-    // Do NOT add new usages of this.
-    BSONObj _bson;
 };
 
 }  // namespace projection_ast

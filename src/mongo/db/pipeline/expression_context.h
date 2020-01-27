@@ -42,6 +42,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/aggregation_request.h"
+#include "mongo/db/pipeline/javascript_execution.h"
 #include "mongo/db/pipeline/mongo_process_interface.h"
 #include "mongo/db/pipeline/runtime_constants_gen.h"
 #include "mongo/db/pipeline/variables.h"
@@ -93,7 +94,6 @@ public:
 
         boost::intrusive_ptr<ExpressionContext> _expCtx;
 
-        BSONObj _originalCollation;
         std::unique_ptr<CollatorInterface> _originalCollatorOwned;
         const CollatorInterface* _originalCollatorUnowned{nullptr};
     };
@@ -121,7 +121,6 @@ public:
                       bool allowDiskUse,
                       bool bypassDocumentValidation,
                       const NamespaceString& ns,
-                      const BSONObj& collation,
                       const boost::optional<RuntimeConstants>& runtimeConstants,
                       std::unique_ptr<CollatorInterface> collator,
                       const std::shared_ptr<MongoProcessInterface>& mongoProcessInterface,
@@ -131,6 +130,8 @@ public:
     /**
      * Constructs an ExpressionContext suitable for use outside of the aggregation system, including
      * for MatchExpression parsing and executing pipeline-style operations in the Update system.
+     *
+     * If 'collator' is null, the simple collator will be used.
      */
     ExpressionContext(OperationContext* opCtx,
                       const CollatorInterface* collator,
@@ -165,6 +166,19 @@ public:
 
     const CollatorInterface* getCollator() const {
         return _unownedCollator;
+    }
+
+    /**
+     * Returns the BSON spec for the ExpressionContext's collator, or the simple collator spec if
+     * the collator is null.
+     *
+     * The ExpressionContext is always set up with the fully-resolved collation. So even though
+     * SERVER-24433 describes an ambiguity between a null collator, here we can say confidently that
+     * null must mean simple since we have already handled "absence of a collator" before creating
+     * the ExpressionContext.
+     */
+    BSONObj getCollatorBSON() const {
+        return _unownedCollator ? _unownedCollator->getSpec().toBSON() : CollationSpec::kSimpleSpec;
     }
 
     void setCollator(const CollatorInterface* collator);
@@ -228,7 +242,7 @@ public:
     auto getJsExecWithScope() const {
         RuntimeConstants runtimeConstants = getRuntimeConstants();
         const boost::optional<mongo::BSONObj>& scope = runtimeConstants.getJsScope();
-        return mongoProcessInterface->getJsExec(scope.get_value_or(BSONObj()));
+        return JsExecution::get(opCtx, scope.get_value_or(BSONObj()));
     }
 
     // The explain verbosity requested by the user, or boost::none if no explain was requested.
@@ -258,10 +272,6 @@ public:
 
     const TimeZoneDatabase* timeZoneDatabase;
 
-    // Collation requested by the user for this pipeline. Empty if the user did not request a
-    // collation.
-    BSONObj collation;
-
     Variables variables;
     VariablesParseState variablesParseState;
 
@@ -280,6 +290,12 @@ public:
     // True if this ExpressionContext is associated with a Change Stream that should serialize its
     // "$sortKey" using the 4.2 format.
     bool use42ChangeStreamSortKeys = false;
+
+    // True if this ExpressionContext is used to parse a view definition pipeline.
+    bool isParsingViewDefinition = false;
+
+    // True if this ExpressionContext is used to parse a collection validator expression.
+    bool isParsingCollectionValidator = false;
 
 protected:
     static const int kInterruptCheckPeriod = 128;

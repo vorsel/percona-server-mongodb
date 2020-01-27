@@ -41,13 +41,13 @@
 
 namespace mongo::map_reduce_agg {
 
+/**
+ * Executes a mapReduce command against a replica set/standalone.
+ */
 bool runAggregationMapReduce(OperationContext* opCtx,
                              const std::string& dbname,
                              const BSONObj& cmd,
                              std::string& errmsg,
                              BSONObjBuilder& result);
-
-std::unique_ptr<Pipeline, PipelineDeleter> translateFromMR(
-    MapReduce parsedMr, boost::intrusive_ptr<ExpressionContext> expCtx);
 
 }  // namespace mongo::map_reduce_agg

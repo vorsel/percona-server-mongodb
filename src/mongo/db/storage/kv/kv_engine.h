@@ -226,7 +226,8 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    virtual StatusWith<std::vector<std::string>> beginNonBlockingBackup(OperationContext* opCtx) {
+    virtual StatusWith<std::vector<StorageEngine::BackupBlock>> beginNonBlockingBackup(
+        OperationContext* opCtx) {
         return Status(ErrorCodes::CommandNotSupported,
                       "The current storage engine doesn't support backup mode");
     }
@@ -245,6 +246,21 @@ public:
      */
     virtual std::unique_ptr<StorageEngine::CheckpointLock> getCheckpointLock(
         OperationContext* opCtx) {
+        uasserted(ErrorCodes::CommandNotSupported,
+                  "The current storage engine does not support checkpoints");
+    }
+
+    virtual void addIndividuallyCheckpointedIndexToList(const std::string& ident) {
+        uasserted(ErrorCodes::CommandNotSupported,
+                  "The current storage engine does not support checkpoints");
+    }
+
+    virtual void clearIndividuallyCheckpointedIndexesList() {
+        uasserted(ErrorCodes::CommandNotSupported,
+                  "The current storage engine does not support checkpoints");
+    }
+
+    virtual bool isInIndividuallyCheckpointedIndexesList(const std::string& ident) const {
         uasserted(ErrorCodes::CommandNotSupported,
                   "The current storage engine does not support checkpoints");
     }

@@ -44,7 +44,8 @@ class MapReduceJavascriptCode {
 public:
     static MapReduceJavascriptCode parseFromBSON(const BSONElement& element) {
         uassert(ErrorCodes::BadValue,
-                "'scope' must be of string or code type",
+                str::stream() << "'" << element.fieldNameStringData()
+                              << "' must be of string or code type",
                 element.type() == String || element.type() == Code);
         return MapReduceJavascriptCode(element._asCode());
     }
