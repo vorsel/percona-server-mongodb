@@ -340,7 +340,7 @@ install_deps() {
       RHEL=$(rpm --eval %rhel)
       if [ x"$RHEL" = x6 ]; then
         yum -y install rpmbuild rpm-build libpcap-devel gcc make cmake gcc-c++ openssl-devel cyrus-sasl-devel snappy-devel zlib-devel bzip2-devel libpcap-devel scons make rpm-build rpmbuild percona-devtoolset-gcc percona-devtoolset-binutils percona-devtoolset-gcc-c++ percona-devtoolset-libstdc++-devel percona-devtoolset-valgrind-devel python27 python27-devel libcurl-devel e2fsprogs-devel expat-devel lz4-devel git cmake3
-        yum -y openldap-devel
+        yum -y install openldap-devel
         wget https://bootstrap.pypa.io/get-pip.py
         python2.7 get-pip.py
         rm -rf /usr/bin/python2
@@ -354,13 +354,13 @@ install_deps() {
         cd ../
       elif [ x"$RHEL" = x7 ]; then
         yum -y install rpmbuild rpm-build libpcap-devel gcc make cmake gcc-c++ openssl-devel cyrus-sasl-devel snappy-devel zlib-devel bzip2-devel scons rpmlint rpm-build git python-pip python-devel libopcodes libcurl-devel e2fsprogs-devel expat-devel lz4-devel
-        yum -y openldap-devel
+        yum -y install openldap-devel
       else
         yum -y install bzip2-devel libpcap-devel snappy-devel gcc gcc-c++ rpm-build rpmlint
         yum -y install cmake cyrus-sasl-devel make openssl-devel zlib-devel libcurl-devel git
         yum -y install python2-scons python2-pip python36-devel
         yum -y install redhat-rpm-config python2-devel e2fsprogs-devel expat-devel lz4-devel
-        yum -y openldap-devel
+        yum -y install openldap-devel
         pip2.7 install --user setuptools --upgrade
         pip3.6 install --user typing pyyaml regex Cheetah3
         pip2.7 install --user typing pyyaml regex Cheetah
