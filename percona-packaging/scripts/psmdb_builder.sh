@@ -309,6 +309,7 @@ install_deps() {
         yum -y install scons make rpm-build rpmbuild percona-devtoolset-gcc percona-devtoolset-binutils 
         yum -y install percona-devtoolset-gcc-c++ percona-devtoolset-libstdc++-devel percona-devtoolset-valgrind-devel
         yum -y install python27 python27-devel rpmlint libcurl-devel
+        yum -y openldap-devel
         wget https://bootstrap.pypa.io/get-pip.py
         python2.7 get-pip.py
         rm -rf /usr/bin/python2
@@ -318,11 +319,13 @@ install_deps() {
         yum -y install rpmbuild rpm-build libpcap-devel gcc make cmake gcc-c++ openssl-devel
         yum -y install cyrus-sasl-devel snappy-devel zlib-devel bzip2-devel scons rpmlint
         yum -y install rpm-build git python-pip python-devel libopcodes libcurl-devel rpmlint
+        yum -y openldap-devel
       else
         yum -y install bzip2-devel libpcap-devel snappy-devel gcc gcc-c++ rpm-build rpmlint
         yum -y install cmake cyrus-sasl-devel make openssl-devel zlib-devel libcurl-devel
         yum -y install python2-scons python2-pip python36-devel
         yum -y install redhat-rpm-config python2-devel
+        yum -y openldap-devel
       fi
       if [ "x${RHEL}" == "x8" ]; then
         /usr/bin/pip3.6 install --user typing pyyaml regex Cheetah3
@@ -335,7 +338,7 @@ install_deps() {
       export DEBIAN=$(lsb_release -sc)
       export ARCH=$(echo $(uname -m) | sed -e 's:i686:i386:g')
       INSTALL_LIST="python3 python3-dev python3-pip valgrind scons liblz4-dev devscripts debhelper debconf libpcap-dev libbz2-dev libsnappy-dev pkg-config zlib1g-dev libzlcore-dev dh-systemd libsasl2-dev gcc g++ cmake curl"
-      INSTALL_LIST="${INSTALL_LIST} libssl-dev libcurl4-openssl-dev"
+      INSTALL_LIST="${INSTALL_LIST} libssl-dev libcurl4-openssl-dev libldap2-dev"
       until apt-get -y install dirmngr; do
         sleep 1
         echo "waiting"
