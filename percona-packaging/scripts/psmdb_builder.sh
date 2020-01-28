@@ -795,6 +795,7 @@ build_tarball(){
     export CXXFLAGS="${CFLAGS} -Wno-error=deprecated-declarations"
     fi
     export INSTALLDIR=/usr/local
+    export AWS_LIBS=/usr/local
     export PORTABLE=1
     export USE_SSE=1
     #
@@ -848,10 +849,10 @@ build_tarball(){
       export LINKFLAGS="${LINKFLAGS} ${CURL_LINKFLAGS}"
     fi
     if [ ${DEBUG} = 0 ]; then
-        buildscripts/scons.py CC=${CC} CXX=${CXX} --disable-warnings-as-errors --release --ssl --opt=on -j$NJOBS --use-sasl-client --wiredtiger --audit --inmemory --hotbackup CPPPATH=${INSTALLDIR}/include LIBPATH=${INSTALLDIR}/lib LINKFLAGS="${LINKFLAGS}" ${PSM_TARGETS} || exit $?
+        buildscripts/scons.py CC=${CC} CXX=${CXX} --disable-warnings-as-errors --release --ssl --opt=on -j$NJOBS --use-sasl-client --wiredtiger --audit --inmemory --hotbackup CPPPATH="${INSTALLDIR}/include ${AWS_LIBS}/include" LIBPATH="${INSTALLDIR}/lib ${AWS_LIBS}/lib ${AWS_LIBS}/lib64" LINKFLAGS="${LINKFLAGS}" ${PSM_TARGETS} || exit $?
     else
         buildscripts/scons.py CC=${CC} CXX=${CXX} --disable-warnings-as-errors --audit --ssl --dbg=on -j$NJOBS --use-sasl-client \
-        CPPPATH=${INSTALLDIR}/include LIBPATH=${INSTALLDIR}/lib LINKFLAGS="${LINKFLAGS}" --wiredtiger --inmemory --hotbackup ${PSM_TARGETS} || exit $?
+        CPPPATH="${INSTALLDIR}/include ${AWS_LIBS}/include" LIBPATH="${INSTALLDIR}/lib ${AWS_LIBS}/lib ${AWS_LIBS}/lib64" LINKFLAGS="${LINKFLAGS}" --wiredtiger --inmemory --hotbackup ${PSM_TARGETS} || exit $?
     fi
     #
     # scons install doesn't work - it installs the binaries not linked with fractal tree
