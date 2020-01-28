@@ -132,6 +132,8 @@ env.Library('authorization_manager_global',
             ],
             LIBDEPS=[
                 'authcore',
+                '$BUILD_DIR/mongo/db/ldap/ldapmanager',
+                '$BUILD_DIR/mongo/db/ldap_options',
                 '$BUILD_DIR/mongo/db/server_options_core',
                 '$BUILD_DIR/mongo/db/service_context',
             ])
