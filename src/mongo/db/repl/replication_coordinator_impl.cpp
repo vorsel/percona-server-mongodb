@@ -95,6 +95,8 @@ namespace repl {
 
 MONGO_FAIL_POINT_DEFINE(stepdownHangBeforePerformingPostMemberStateUpdateActions);
 MONGO_FAIL_POINT_DEFINE(transitionToPrimaryHangBeforeTakingGlobalExclusiveLock);
+// Fail setMaintenanceMode with ErrorCodes::NotSecondary to simulate a concurrent election.
+MONGO_FAIL_POINT_DEFINE(setMaintenanceModeFailsWithNotSecondary);
 
 using CallbackArgs = executor::TaskExecutor::CallbackArgs;
 using CallbackFn = executor::TaskExecutor::CallbackFn;
@@ -756,6 +758,10 @@ void ReplicationCoordinatorImpl::_startDataReplication(OperationContext* opCtx,
         {
             // Must take the lock to set _initialSyncer, but not call it.
             stdx::lock_guard<stdx::mutex> lock(_mutex);
+            if (_inShutdown) {
+                log() << "Initial Sync not starting because replication is shutting down.";
+                return;
+            }
             initialSyncerCopy = std::make_shared<InitialSyncer>(
                 createInitialSyncerOptions(this, _externalState.get()),
                 stdx::make_unique<DataReplicatorExternalStateInitialSync>(this,
@@ -2238,7 +2244,8 @@ Status ReplicationCoordinatorImpl::setMaintenanceMode(bool activate) {
     }
 
     stdx::unique_lock<stdx::mutex> lk(_mutex);
-    if (_topCoord->getRole() == TopologyCoordinator::Role::kCandidate) {
+    if (_topCoord->getRole() == TopologyCoordinator::Role::kCandidate ||
+        MONGO_unlikely(setMaintenanceModeFailsWithNotSecondary.shouldFail())) {
         return Status(ErrorCodes::NotSecondary, "currently running for election");
     }
 
@@ -3051,7 +3058,7 @@ ReplicationCoordinatorImpl::_setCurrentRSConfig_inlock(OperationContext* opCtx,
         (newConfig.getWriteConcernMajorityShouldJournal() &&
          (!oldConfig.isInitialized() || !oldConfig.getWriteConcernMajorityShouldJournal()))) {
         log() << startupWarningsLog;
-        log() << "** WARNING: This replica set is running without journaling enabled but the "
+        log() << "** WARNING: This replica set node is running without journaling enabled but the "
               << startupWarningsLog;
         log() << "**          writeConcernMajorityJournalDefault option to the replica set config "
               << startupWarningsLog;
@@ -3061,6 +3068,9 @@ ReplicationCoordinatorImpl::_setCurrentRSConfig_inlock(OperationContext* opCtx,
               << startupWarningsLog;
         log() << "**          or w:majority write concerns will never complete."
               << startupWarningsLog;
+        log() << "**          In addition, this node's memory consumption may increase until all"
+              << startupWarningsLog;
+        log() << "**          available free RAM is exhausted." << startupWarningsLog;
         log() << startupWarningsLog;
     }
 
@@ -3070,14 +3080,18 @@ ReplicationCoordinatorImpl::_setCurrentRSConfig_inlock(OperationContext* opCtx,
         (newConfig.getWriteConcernMajorityShouldJournal() &&
          (!oldConfig.isInitialized() || !oldConfig.getWriteConcernMajorityShouldJournal()))) {
         log() << startupWarningsLog;
-        log() << "** WARNING: This replica set is using in-memory (ephemeral) storage with the "
+        log() << "** WARNING: This replica set node is using in-memory (ephemeral) storage with the"
               << startupWarningsLog;
         log() << "**          writeConcernMajorityJournalDefault option to the replica set config "
               << startupWarningsLog;
         log() << "**          set to true. The writeConcernMajorityJournalDefault option to the "
               << startupWarningsLog;
-        log() << "**          replica set config is unsupported while using in-memory storage."
+        log() << "**          replica set config must be set to false " << startupWarningsLog;
+        log() << "**          or w:majority write concerns will never complete."
               << startupWarningsLog;
+        log() << "**          In addition, this node's memory consumption may increase until all"
+              << startupWarningsLog;
+        log() << "**          available free RAM is exhausted." << startupWarningsLog;
         log() << startupWarningsLog;
     }
 

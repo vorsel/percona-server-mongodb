@@ -79,6 +79,7 @@ selector:
   - jstests/sharding/change_stream_resume_from_different_mongos.js
   - jstests/sharding/change_stream_shard_failover.js
   - jstests/sharding/transactions_prohibited_in_sharded_cluster.js
+  - jstests/sharding/clear_jumbo.js
   # Requires count command to be accurate on sharded clusters, introduced in v4.0.
   - jstests/sharding/accurate_count_with_predicate.js
   # The 3.6 mongos does not support using localOps to find failpoints.
@@ -113,7 +114,10 @@ selector:
   - jstests/sharding/enable_sharding_with_primary.js
   # Enable after SERVER-38691 gets backported to 4.2 and becomes the last stable.
   - jstests/sharding/explain_cmd.js
-
+  # Enable when SERVER-44733 is backported
+  - jstests/sharding/change_streams_update_lookup_shard_metadata_missing.js
+   # Enable after SERVER-44477 is backported and available on older binaries.
+  - jstests/sharding/mr_merge_to_existing.js
 executor:
   config:
     shell_options:
