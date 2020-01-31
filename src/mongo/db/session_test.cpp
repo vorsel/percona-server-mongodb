@@ -698,12 +698,9 @@ TEST_F(SessionTest, StashAndUnstashResources) {
 }
 
 TEST_F(SessionTest, ReportStashedResources) {
-    Date_t startTime = Date_t::now();
-
-    // Sleep a bit after recording the startTime but before starting the transaction to account for
-    // any clock discrepancy between the Date_t clock and the clock used to track the transaction
-    // stats start time.
-    mongo::sleepmillis(10);
+    // The transaction participant uses the precise clock source for timing,
+    // so ensure we use the same clock source for testing.
+    Date_t startTime = opCtx()->getServiceContext()->getPreciseClockSource()->now();
 
     const auto sessionId = makeLogicalSessionIdForTest();
     const TxnNumber txnNum = 20;
@@ -803,12 +800,9 @@ TEST_F(SessionTest, ReportStashedResources) {
 }
 
 TEST_F(SessionTest, ReportUnstashedResources) {
-    Date_t startTime = Date_t::now();
-
-    // Sleep a bit after recording the startTime but before starting the transaction to account for
-    // any clock discrepancy between the Date_t clock and the clock used to track the transaction
-    // stats start time.
-    mongo::sleepmillis(10);
+    // The transaction participant uses the precise clock source for timing,
+    // so ensure we use the same clock source for testing.
+    Date_t startTime = opCtx()->getServiceContext()->getPreciseClockSource()->now();
 
     const auto sessionId = makeLogicalSessionIdForTest();
     const TxnNumber txnNum = 20;
@@ -1688,6 +1682,9 @@ TEST_F(TransactionsMetricsTest, SingleTransactionStatsDurationShouldKeepIncreasi
               txnDurationAfterStart);
     sleepmillis(10);
     session.commitTransaction(opCtx());
+    // Sleep here to allow enough time to elapse.
+    sleepmillis(10);
+
     unsigned long long txnDurationAfterCommit =
         session.getSingleTransactionStats()->getDuration(curTimeMicros64());
 
@@ -1722,6 +1719,9 @@ TEST_F(TransactionsMetricsTest, SingleTransactionStatsDurationShouldKeepIncreasi
               txnDurationAfterStart);
     sleepmillis(10);
     session.abortArbitraryTransaction();
+    // Sleep here to allow enough time to elapse.
+    sleepmillis(10);
+
     unsigned long long txnDurationAfterAbort =
         session.getSingleTransactionStats()->getDuration(curTimeMicros64());
 
@@ -2123,6 +2123,8 @@ TEST_F(TransactionsMetricsTest, TimeInactiveMicrosShouldBeSetUponUnstashAndStash
     // The transaction machinery cannot store an empty locker.
     { Lock::GlobalLock lk(opCtx(), MODE_IX, Date_t::now(), Lock::InterruptBehavior::kThrow); }
     session.stashTransactionResources(opCtx());
+    // Sleep here to allow enough time to elapse.
+    sleepmillis(10);
 
     // The transaction is inactive again, so time inactive should have increased.
     ASSERT_GT(session.getSingleTransactionStats()->getTimeInactiveMicros(curTimeMicros64()),
