@@ -34,7 +34,6 @@
 #include <memory>
 
 #include "mongo/base/checked_cast.h"
-#include "mongo/base/transaction_error.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
@@ -46,6 +45,7 @@
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/curop_metrics.h"
+#include "mongo/db/error_labels.h"
 #include "mongo/db/exec/delete.h"
 #include "mongo/db/exec/update_stage.h"
 #include "mongo/db/introspect.h"
@@ -97,6 +97,7 @@ MONGO_FAIL_POINT_DEFINE(hangAfterAllChildRemoveOpsArePopped);
 MONGO_FAIL_POINT_DEFINE(hangDuringBatchInsert);
 MONGO_FAIL_POINT_DEFINE(hangDuringBatchUpdate);
 MONGO_FAIL_POINT_DEFINE(hangDuringBatchRemove);
+MONGO_FAIL_POINT_DEFINE(hangAndFailAfterDocumentInsertsReserveOpTimes);
 // The withLock fail points are for testing interruptability of these operations, so they will not
 // themselves check for interrupt.
 MONGO_FAIL_POINT_DEFINE(hangWithLockDuringBatchInsert);
@@ -248,7 +249,7 @@ bool handleError(OperationContext* opCtx,
     auto txnParticipant = TransactionParticipant::get(opCtx);
     if (txnParticipant && opCtx->inMultiDocumentTransaction()) {
         if (isTransientTransactionError(
-                ex.code(), false /* hasWriteConcernError */, false /* isCommitTransaction */)) {
+                ex.code(), false /* hasWriteConcernError */, false /* isCommitOrAbort */)) {
             // Tell the client to try the whole txn again, by returning ok: 0 with errorLabels.
             throw;
         }
@@ -316,6 +317,17 @@ void insertDocuments(OperationContext* opCtx,
             }
         }
     }
+
+    hangAndFailAfterDocumentInsertsReserveOpTimes.executeIf(
+        [&](const BSONObj& data) {
+            hangAndFailAfterDocumentInsertsReserveOpTimes.pauseWhileSet(opCtx);
+            uasserted(51269, "hangAndFailAfterDocumentInsertsReserveOpTimes fail point enabled");
+        },
+        [&](const BSONObj& data) {
+            // Check if the failpoint specifies no collection or matches the existing one.
+            const auto collElem = data["collectionNS"];
+            return !collElem || collection->ns().ns() == collElem.str();
+        });
 
     uassertStatusOK(
         collection->insertDocuments(opCtx, begin, end, &CurOp::get(opCtx)->debug(), fromMigrate));
@@ -636,8 +648,11 @@ static SingleWriteResult performSingleUpdateOp(OperationContext* opCtx,
 
     assertCanWrite_inlock(opCtx, ns, collection->getCollection());
 
-    auto exec = uassertStatusOK(
-        getExecutorUpdate(opCtx, &curOp.debug(), collection->getCollection(), &parsedUpdate));
+    auto exec = uassertStatusOK(getExecutorUpdate(opCtx,
+                                                  &curOp.debug(),
+                                                  collection->getCollection(),
+                                                  &parsedUpdate,
+                                                  boost::none /* verbosity */));
 
     {
         stdx::lock_guard<Client> lk(*opCtx->getClient());
@@ -865,8 +880,11 @@ static SingleWriteResult performSingleDeleteOp(OperationContext* opCtx,
     CurOpFailpointHelpers::waitWhileFailPointEnabled(
         &hangWithLockDuringBatchRemove, opCtx, "hangWithLockDuringBatchRemove");
 
-    auto exec = uassertStatusOK(
-        getExecutorDelete(opCtx, &curOp.debug(), collection.getCollection(), &parsedDelete));
+    auto exec = uassertStatusOK(getExecutorDelete(opCtx,
+                                                  &curOp.debug(),
+                                                  collection.getCollection(),
+                                                  &parsedDelete,
+                                                  boost::none /* verbosity */));
 
     {
         stdx::lock_guard<Client> lk(*opCtx->getClient());

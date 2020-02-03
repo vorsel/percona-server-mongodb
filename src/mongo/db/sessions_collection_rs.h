@@ -57,7 +57,7 @@ public:
     /**
      * Checks if the sessions collection exists and has the proper indexes.
      */
-    Status checkSessionsCollectionExists(OperationContext* opCtx) override;
+    void checkSessionsCollectionExists(OperationContext* opCtx) override;
 
     /**
      * Updates the last-use times on the given sessions to be greater than
@@ -65,15 +65,14 @@ public:
      *
      * If a step-down happens on this node as this method is running, it may fail.
      */
-    Status refreshSessions(OperationContext* opCtx,
-                           const LogicalSessionRecordSet& sessions) override;
+    void refreshSessions(OperationContext* opCtx, const LogicalSessionRecordSet& sessions) override;
 
     /**
      * Removes the authoritative records for the specified sessions.
      *
      * If a step-down happens on this node as this method is running, it may fail.
      */
-    Status removeRecords(OperationContext* opCtx, const LogicalSessionIdSet& sessions) override;
+    void removeRecords(OperationContext* opCtx, const LogicalSessionIdSet& sessions) override;
 
     /**
      * Returns the subset of sessions from the given set that do not have entries
@@ -82,8 +81,8 @@ public:
      * If a step-down happens on this node as this method is running, it may
      * return stale results.
      */
-    StatusWith<LogicalSessionIdSet> findRemovedSessions(
-        OperationContext* opCtx, const LogicalSessionIdSet& sessions) override;
+    LogicalSessionIdSet findRemovedSessions(OperationContext* opCtx,
+                                            const LogicalSessionIdSet& sessions) override;
 
 private:
     auto _makePrimaryConnection(OperationContext* opCtx);
@@ -97,7 +96,8 @@ private:
         static_assert(std::is_same_v<LocalReturnType, RemoteReturnType>,
                       "LocalCallback and RemoteCallback must have the same return type");
 
-        using Type = RemoteReturnType;
+        using Type =
+            std::conditional_t<std::is_void<LocalReturnType>::value, void, LocalReturnType>;
     };
     template <typename LocalCallback, typename RemoteCallback>
     using CommonResultT = typename CommonResult<LocalCallback, RemoteCallback>::Type;

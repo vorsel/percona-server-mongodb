@@ -426,7 +426,8 @@ StatusWith<size_t> StorageInterfaceImpl::getOplogMaxSize(OperationContext* opCtx
         return collectionResult.getStatus();
     }
 
-    const auto options = DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, nss);
+    const auto options = DurableCatalog::get(opCtx)->getCollectionOptions(
+        opCtx, collectionResult.getValue()->getCatalogId());
     if (!options.capped)
         return {ErrorCodes::BadValue, str::stream() << nss.ns() << " isn't capped"};
 
@@ -863,8 +864,8 @@ Status _updateWithQuery(OperationContext* opCtx,
             uassertStatusOK(opCtx->recoveryUnit()->setTimestamp(ts));
         }
 
-        auto planExecutorResult =
-            mongo::getExecutorUpdate(opCtx, nullptr, collection, &parsedUpdate);
+        auto planExecutorResult = mongo::getExecutorUpdate(
+            opCtx, nullptr, collection, &parsedUpdate, boost::none /* verbosity */);
         if (!planExecutorResult.isOK()) {
             return planExecutorResult.getStatus();
         }
@@ -992,8 +993,8 @@ Status StorageInterfaceImpl::deleteByFilter(OperationContext* opCtx,
         }
         auto collection = collectionResult.getValue();
 
-        auto planExecutorResult =
-            mongo::getExecutorDelete(opCtx, nullptr, collection, &parsedDelete);
+        auto planExecutorResult = mongo::getExecutorDelete(
+            opCtx, nullptr, collection, &parsedDelete, boost::none /* verbosity */);
         if (!planExecutorResult.isOK()) {
             return planExecutorResult.getStatus();
         }

@@ -46,81 +46,81 @@ BSONObj lsidQuery(const LogicalSessionId& lsid) {
 }  // namespace
 
 void SessionsCollectionStandalone::setupSessionsCollection(OperationContext* opCtx) {
-    auto existsStatus = checkSessionsCollectionExists(opCtx);
-    if (existsStatus.isOK()) {
-        return;
-    }
+    try {
+        checkSessionsCollectionExists(opCtx);
+    } catch (DBException& ex) {
 
-    DBDirectClient client(opCtx);
-    BSONObj cmd;
+        DBDirectClient client(opCtx);
+        BSONObj cmd;
 
-    if (existsStatus.code() == ErrorCodes::IndexOptionsConflict) {
-        cmd = generateCollModCmd();
-    } else {
-        cmd = generateCreateIndexesCmd();
-    }
+        if (ex.code() == ErrorCodes::IndexOptionsConflict) {
+            cmd = generateCollModCmd();
+        } else {
+            cmd = generateCreateIndexesCmd();
+        }
 
-    BSONObj info;
-    if (!client.runCommand(NamespaceString::kLogicalSessionsNamespace.db().toString(), cmd, info)) {
-        uassertStatusOKWithContext(getStatusFromCommandResult(info),
-                                   str::stream() << "Failed to create "
-                                                 << NamespaceString::kLogicalSessionsNamespace);
+        BSONObj info;
+        if (!client.runCommand(
+                NamespaceString::kLogicalSessionsNamespace.db().toString(), cmd, info)) {
+            uassertStatusOKWithContext(getStatusFromCommandResult(info),
+                                       str::stream() << "Failed to create "
+                                                     << NamespaceString::kLogicalSessionsNamespace);
+        }
     }
 }
 
-Status SessionsCollectionStandalone::checkSessionsCollectionExists(OperationContext* opCtx) {
+void SessionsCollectionStandalone::checkSessionsCollectionExists(OperationContext* opCtx) {
     DBDirectClient client(opCtx);
 
     auto indexes = client.getIndexSpecs(NamespaceString::kLogicalSessionsNamespace);
 
-    if (indexes.size() == 0u) {
-        return Status{ErrorCodes::NamespaceNotFound, "config.system.sessions does not exist"};
-    }
+    uassert(ErrorCodes::NamespaceNotFound,
+            str::stream() << NamespaceString::kLogicalSessionsNamespace << " does not exist",
+            indexes.size() != 0u);
 
     auto index = std::find_if(indexes.begin(), indexes.end(), [](const BSONObj& index) {
         return index.getField("name").String() == kSessionsTTLIndex;
     });
 
-    if (index == indexes.end()) {
-        return Status{ErrorCodes::IndexNotFound,
-                      "config.system.sessions does not have the required TTL index"};
-    };
+    uassert(ErrorCodes::IndexNotFound,
+            str::stream() << NamespaceString::kLogicalSessionsNamespace
+                          << " does not have the required TTL index",
+            index != indexes.end());
 
-    if (!index->hasField("expireAfterSeconds") ||
-        index->getField("expireAfterSeconds").Int() != (localLogicalSessionTimeoutMinutes * 60)) {
-        return Status{
-            ErrorCodes::IndexOptionsConflict,
-            "config.system.sessions currently has the incorrect timeout for the TTL index"};
-    }
-
-    return Status::OK();
+    uassert(ErrorCodes::IndexOptionsConflict,
+            str::stream() << NamespaceString::kLogicalSessionsNamespace
+                          << " currently has the incorrect timeout for the TTL index",
+            index->hasField("expireAfterSeconds") &&
+                index->getField("expireAfterSeconds").Int() ==
+                    (localLogicalSessionTimeoutMinutes * 60));
 }
 
-Status SessionsCollectionStandalone::refreshSessions(OperationContext* opCtx,
-                                                     const LogicalSessionRecordSet& sessions) {
+void SessionsCollectionStandalone::refreshSessions(OperationContext* opCtx,
+                                                   const LogicalSessionRecordSet& sessions) {
     const std::vector<LogicalSessionRecord> sessionsVector(sessions.begin(), sessions.end());
     DBDirectClient client(opCtx);
-    return doRefresh(NamespaceString::kLogicalSessionsNamespace,
-                     sessionsVector,
-                     makeSendFnForBatchWrite(NamespaceString::kLogicalSessionsNamespace, &client));
+    _doRefresh(NamespaceString::kLogicalSessionsNamespace,
+               sessionsVector,
+               makeSendFnForBatchWrite(NamespaceString::kLogicalSessionsNamespace, &client));
 }
 
-Status SessionsCollectionStandalone::removeRecords(OperationContext* opCtx,
-                                                   const LogicalSessionIdSet& sessions) {
+void SessionsCollectionStandalone::removeRecords(OperationContext* opCtx,
+                                                 const LogicalSessionIdSet& sessions) {
     const std::vector<LogicalSessionId> sessionsVector(sessions.begin(), sessions.end());
     DBDirectClient client(opCtx);
-    return doRemove(NamespaceString::kLogicalSessionsNamespace,
-                    sessionsVector,
-                    makeSendFnForBatchWrite(NamespaceString::kLogicalSessionsNamespace, &client));
+    _doRemove(NamespaceString::kLogicalSessionsNamespace,
+              sessionsVector,
+              makeSendFnForBatchWrite(NamespaceString::kLogicalSessionsNamespace, &client));
 }
 
-StatusWith<LogicalSessionIdSet> SessionsCollectionStandalone::findRemovedSessions(
+LogicalSessionIdSet SessionsCollectionStandalone::findRemovedSessions(
     OperationContext* opCtx, const LogicalSessionIdSet& sessions) {
     const std::vector<LogicalSessionId> sessionsVector(sessions.begin(), sessions.end());
     DBDirectClient client(opCtx);
-    return doFindRemoved(NamespaceString::kLogicalSessionsNamespace,
-                         sessionsVector,
-                         makeFindFnForCommand(NamespaceString::kLogicalSessionsNamespace, &client));
+    return _doFindRemoved(
+        NamespaceString::kLogicalSessionsNamespace,
+        sessionsVector,
+        makeFindFnForCommand(NamespaceString::kLogicalSessionsNamespace, &client));
 }
 
 }  // namespace mongo

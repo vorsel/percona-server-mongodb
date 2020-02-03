@@ -40,9 +40,9 @@
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/pipeline/accumulator_js_reduce.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_group.h"
-#include "mongo/db/pipeline/document_source_limit.h"
 #include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/pipeline/document_source_merge.h"
 #include "mongo/db/pipeline/document_source_out.h"
@@ -65,10 +65,46 @@ Rarely nonAtomicDeprecationSampler;  // Used to occasionally log deprecation mes
 
 using namespace std::string_literals;
 
-auto translateSort(boost::intrusive_ptr<ExpressionContext> expCtx,
-                   const BSONObj& sort,
-                   const boost::optional<std::int64_t>& limit) {
-    return DocumentSourceSort::create(expCtx, sort, limit.get_value_or(0));
+Status interpretTranslationError(DBException* ex, const MapReduce& parsedMr) {
+    auto status = ex->toStatus();
+    auto outOptions = parsedMr.getOutOptions();
+    auto outNss = NamespaceString{outOptions.getDatabaseName() ? *outOptions.getDatabaseName()
+                                                               : parsedMr.getNamespace().db(),
+                                  outOptions.getCollectionName()};
+    std::string error;
+    switch (static_cast<int>(ex->code())) {
+        case ErrorCodes::InvalidNamespace:
+            error = "Invalid output namespace {} for MapReduce"_format(outNss.ns());
+            break;
+        case 15976:
+            error = "The mapReduce sort option must have at least one sort key";
+            break;
+        case 15958:
+            error = "The limit specified to mapReduce must be positive";
+            break;
+        case 17017:
+            error =
+                "Cannot run mapReduce against an existing *sharded* output collection when using "
+                "the replace action";
+            break;
+        case 17385:
+        case 31319:
+            error = "Can't output mapReduce results to special collection {}"_format(outNss.coll());
+            break;
+        case 31320:
+        case 31321:
+            error = "Can't output mapReduce results to internal DB {}"_format(outNss.db());
+            break;
+        default:
+            // Prepend MapReduce context in the event of an unknown exception.
+            ex->addContext("MapReduce internal error");
+            throw;
+    }
+    return status.withReason(std::move(error));
+}
+
+auto translateSort(boost::intrusive_ptr<ExpressionContext> expCtx, const BSONObj& sort) {
+    return DocumentSourceSort::create(expCtx, sort);
 }
 
 auto translateMap(boost::intrusive_ptr<ExpressionContext> expCtx, std::string code) {
@@ -87,15 +123,12 @@ auto translateMap(boost::intrusive_ptr<ExpressionContext> expCtx, std::string co
 }
 
 auto translateReduce(boost::intrusive_ptr<ExpressionContext> expCtx, std::string code) {
-    auto accumulatorArguments = ExpressionObject::create(
-        expCtx,
-        make_vector<std::pair<std::string, boost::intrusive_ptr<Expression>>>(
-            std::pair{"data"s,
-                      ExpressionFieldPath::parse(expCtx, "$emits", expCtx->variablesParseState)},
-            std::pair{"eval"s, ExpressionConstant::create(expCtx, Value{code})}));
-    auto jsReduce = AccumulationStatement{"value", std::move(accumulatorArguments), [expCtx]() {
-                                              return AccumulatorInternalJsReduce::create(expCtx);
-                                          }};
+    auto accumulatorArgument =
+        ExpressionFieldPath::parse(expCtx, "$emits", expCtx->variablesParseState);
+    auto reduceFactory = [expCtx, funcSource = code]() {
+        return AccumulatorInternalJsReduce::create(expCtx, funcSource);
+    };
+    AccumulationStatement jsReduce("value", std::move(accumulatorArgument), reduceFactory);
     auto groupExpr = ExpressionFieldPath::parse(expCtx, "$emits.k", expCtx->variablesParseState);
     return DocumentSourceGroup::create(expCtx,
                                        std::move(groupExpr),
@@ -333,26 +366,40 @@ std::unique_ptr<Pipeline, PipelineDeleter> translateFromMR(
                 shardKey == std::set<FieldPath>{FieldPath("_id"s)});
     }
 
-    // TODO: It would be good to figure out what kind of errors this would produce in the Status.
-    // It would be better not to produce something incomprehensible out of an internal translation.
-    return uassertStatusOK(Pipeline::create(
-        makeFlattenedList<boost::intrusive_ptr<DocumentSource>>(
-            parsedMr.getQuery().map(
-                [&](auto&& query) { return DocumentSourceMatch::create(query, expCtx); }),
-            parsedMr.getSort().map(
-                [&](auto&& sort) { return translateSort(expCtx, sort, parsedMr.getLimit()); }),
-            translateMap(expCtx, parsedMr.getMap().getCode()),
-            DocumentSourceUnwind::create(expCtx, "emits", false, boost::none),
-            translateReduce(expCtx, parsedMr.getReduce().getCode()),
-            parsedMr.getFinalize().map([&](auto&& finalize) {
-                return translateFinalize(expCtx, parsedMr.getFinalize()->getCode());
-            }),
-            translateOut(expCtx,
-                         outType,
-                         parsedMr.getNamespace().db(),
-                         std::move(outNss),
-                         parsedMr.getReduce().getCode())),
-        expCtx));
+    // If sharded option is set to true and the replace action is specified, verify that this isn't
+    // running on mongos.
+    if (outType == OutputType::Replace && parsedMr.getOutOptions().isSharded()) {
+        uassert(31327,
+                "Cannot replace output collection when specifying sharded: true",
+                !expCtx->inMongos);
+    }
+
+    try {
+        auto pipeline = uassertStatusOK(Pipeline::create(
+            makeFlattenedList<boost::intrusive_ptr<DocumentSource>>(
+                parsedMr.getQuery().map(
+                    [&](auto&& query) { return DocumentSourceMatch::create(query, expCtx); }),
+                parsedMr.getSort().map([&](auto&& sort) { return translateSort(expCtx, sort); }),
+                parsedMr.getLimit().map(
+                    [&](auto&& limit) { return DocumentSourceLimit::create(expCtx, limit); }),
+                translateMap(expCtx, parsedMr.getMap().getCode()),
+                DocumentSourceUnwind::create(expCtx, "emits", false, boost::none),
+                translateReduce(expCtx, parsedMr.getReduce().getCode()),
+                parsedMr.getFinalize().map([&](auto&& finalize) {
+                    return translateFinalize(expCtx, parsedMr.getFinalize()->getCode());
+                }),
+                translateOut(expCtx,
+                             outType,
+                             parsedMr.getNamespace().db(),
+                             std::move(outNss),
+                             parsedMr.getReduce().getCode())),
+            expCtx));
+        pipeline->optimizePipeline();
+        return pipeline;
+    } catch (DBException& ex) {
+        uassertStatusOK(interpretTranslationError(&ex, parsedMr));
+    }
+    MONGO_UNREACHABLE;
 }
 
 }  // namespace mongo::map_reduce_common

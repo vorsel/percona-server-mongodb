@@ -86,7 +86,6 @@ baseEnv.Library(
         'base/simple_string_data_comparator.cpp',
         'base/status.cpp',
         'base/string_data.cpp',
-        'base/transaction_error.cpp',
         'base/validate_locale.cpp',
         'bson/bson_comparator_interface_base.cpp',
         'bson/bson_depth.cpp',
@@ -124,7 +123,6 @@ baseEnv.Library(
         'logv2/log_domain_global.cpp',
         'logv2/log_domain_internal.cpp',
         'logv2/log_manager.cpp',
-        'logv2/log_record.cpp',
         'logv2/log_severity.cpp',
         'logv2/log_tag.cpp',
         'logv2/ramlog.cpp',
@@ -875,20 +873,23 @@ compass_type = 'compass-community'
 if 'enterprise' in env['MONGO_MODULES']:
     compass_type = 'compass'
 
-compass_script = "install_compass"
+compass_script = "install_compass.in"
 if env.TargetOSIs('windows'):
-    # On windows the .in needs to be explicitly added to the file.
     compass_script = "Install-Compass.ps1.in"
 
 compass_python_interpreter = '/usr/bin/env python2'
 if env.TargetOSIs('darwin'):
     compass_python_interpreter = '/usr/bin/env python'
 
-compass_installer = env.Substfile('#/src/mongo/installer/compass/' + compass_script,
-                                  SUBST_DICT=[
-                                      ('@compass_type@', compass_type),
-                                      ('@python_interpreter@', compass_python_interpreter),
-                                  ])
+compass_installer = env.Substfile(
+  target="$BUILD_DIR/mongo/installer/compass/" + compass_script[:-3],
+  source='installer/compass/' + compass_script,
+  SUBST_DICT=[
+    ('@compass_type@', compass_type),
+    ('@python_interpreter@', compass_python_interpreter),
+  ],
+)
+
 distBinaries.append(compass_installer)
 
 if not hygienic:

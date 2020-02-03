@@ -297,6 +297,37 @@ public:
      */
     void onReplicaSetReconfig();
 
+    //
+    // Helper functions for creating indexes that do not have to be managed by the
+    // IndexBuildsCoordinator.
+    //
+
+    /**
+     * Creates indexes in collection.
+     * Assumes callers has necessary locks.
+     * For two phase index builds, writes both startIndexBuild and commitIndexBuild oplog entries
+     * on success. No two phase index build oplog entries, including abortIndexBuild, will be
+     * written on failure.
+     * Throws exception on error.
+     */
+    void createIndexes(OperationContext* opCtx,
+                       UUID collectionUUID,
+                       const std::vector<BSONObj>& specs,
+                       bool fromMigrate);
+
+    /**
+     * Creates indexes on an empty collection.
+     * Assumes we are enclosed in a WriteUnitOfWork and caller has necessary locks.
+     * For two phase index builds, writes both startIndexBuild and commitIndexBuild oplog entries
+     * on success. No two phase index build oplog entries, including abortIndexBuild, will be
+     * written on failure.
+     * Throws exception on error.
+     */
+    void createIndexesOnEmptyCollection(OperationContext* opCtx,
+                                        UUID collectionUUID,
+                                        const std::vector<BSONObj>& specs,
+                                        bool fromMigrate);
+
     void sleepIndexBuilds_forTestOnly(bool sleep);
 
     void verifyNoIndexBuilds_forTestOnly();
@@ -388,6 +419,81 @@ protected:
                      std::shared_ptr<ReplIndexBuildState> replState,
                      const IndexBuildOptions& indexBuildOptions,
                      boost::optional<Lock::CollectionLock>* collLock);
+
+    /**
+     * Builds the indexes single-phased.
+     * This method matches pre-4.4 behavior for a background index build driven by a single
+     * createIndexes oplog entry.
+     */
+    void _buildIndexSinglePhase(OperationContext* opCtx,
+                                const NamespaceStringOrUUID& dbAndUUID,
+                                std::shared_ptr<ReplIndexBuildState> replState,
+                                const IndexBuildOptions& indexBuildOptions,
+                                boost::optional<Lock::CollectionLock>* collLock);
+
+    /**
+     * Builds the indexes two-phased.
+     * The beginning and completion of a index build is driven by the startIndexBuild and
+     * commitIndexBuild oplog entries, respectively.
+     */
+    void _buildIndexTwoPhase(OperationContext* opCtx,
+                             const NamespaceStringOrUUID& dbAndUUID,
+                             std::shared_ptr<ReplIndexBuildState> replState,
+                             const IndexBuildOptions& indexBuildOptions,
+                             boost::optional<Lock::CollectionLock>* collLock);
+
+    /**
+     * First phase is the collection scan and insertion of the keys into the sorter.
+     */
+    void _scanCollectionAndInsertKeysIntoSorter(
+        OperationContext* opCtx,
+        const NamespaceStringOrUUID& dbAndUUID,
+        std::shared_ptr<ReplIndexBuildState> replState,
+        boost::optional<Lock::CollectionLock>* exclusiveCollectionLock);
+
+    /**
+     * Second phase is extracting the sorted keys and writing them into the new index table.
+     * On completion, this function returns the namespace of the collection, which may have changed
+     * after the previous phase. The namespace is used in two phase index builds to determine the
+     * current replication state in _waitForCommitOrAbort().
+     */
+    NamespaceString _insertKeysFromSideTablesWithoutBlockingWrites(
+        OperationContext* opCtx,
+        const NamespaceStringOrUUID& dbAndUUID,
+        std::shared_ptr<ReplIndexBuildState> replState);
+
+    /**
+     * Waits for commit or abort signal from primary.
+     * 'preAbortStatus' holds any indexing errors from the prior phases during oplog application.
+     * If 'preAbortStatus' is not OK, we need to ensure that we get a abortIndexBuild oplog entry
+     * from the primary, not commitIndexBuild.
+     *
+     * On completion, this function returns a timestamp, which may be null, that may be used to
+     * update the mdb catalog as we commit the index build. The commit index build timestamp is
+     * obtained from a commitIndexBuild oplog entry during secondary oplog application.
+     * This function returns a null timestamp on receiving a abortIndexBuild oplog entry; or if we
+     * are currently a primary, in which case we do not need to wait any external signal to commit
+     * the index build.
+     */
+    Timestamp _waitForCommitOrAbort(OperationContext* opCtx,
+                                    const NamespaceString& nss,
+                                    std::shared_ptr<ReplIndexBuildState> replState,
+                                    const Status& preAbortStatus);
+
+    /**
+     * Third phase is catching up on all the writes that occurred during the first two phases.
+     * Accepts a commit timestamp for the index, which could be null. See _waitForCommitOrAbort()
+     * comments. This timestamp is used only for committing the index, which sets the ready flag to
+     * true, to the catalog; it is not used for the catch-up writes during the final drain phase.
+     */
+    void _insertKeysFromSideTablesAndCommit(
+        OperationContext* opCtx,
+        const NamespaceStringOrUUID& dbAndUUID,
+        std::shared_ptr<ReplIndexBuildState> replState,
+        const IndexBuildOptions& indexBuildOptions,
+        boost::optional<Lock::CollectionLock>* exclusiveCollectionLock,
+        const Timestamp& commitIndexBuildTimestamp);
+
     /**
      * Returns total number of indexes in collection, including unfinished/in-progress indexes.
      *

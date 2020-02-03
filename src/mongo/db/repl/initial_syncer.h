@@ -41,9 +41,7 @@
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/callback_completion_guard.h"
-#include "mongo/db/repl/collection_cloner.h"
 #include "mongo/db/repl/data_replicator_external_state.h"
-#include "mongo/db/repl/database_cloner.h"
 #include "mongo/db/repl/initial_sync_shared_data.h"
 #include "mongo/db/repl/multiapplier.h"
 #include "mongo/db/repl/oplog_applier.h"
@@ -147,7 +145,12 @@ public:
      */
     using OnCompletionGuard = CallbackCompletionGuard<StatusWith<OpTimeAndWallTime>>;
 
-    using StartCollectionClonerFn = DatabaseCloner::StartCollectionClonerFn;
+    /**
+     * Type of function to create a database client
+     *
+     * Used for testing only.
+     */
+    using CreateClientFn = std::function<std::unique_ptr<DBClientConnection>()>;
 
     struct InitialSyncAttemptInfo {
         int durationMillis;
@@ -212,18 +215,30 @@ public:
     BSONObj getInitialSyncProgress() const;
 
     /**
-     * Overrides how executor schedules database work.
      *
-     * For testing only.
+     * Overrides how the initial syncer creates the client.
+     *
+     * For testing only
      */
-    void setScheduleDbWorkFn_forTest(const DatabaseCloner::ScheduleDbWorkFn& scheduleDbWorkFn);
+    void setCreateClientFn_forTest(const CreateClientFn& createClientFn);
 
     /**
-     * Overrides how executor starts a collection cloner.
      *
-     * For testing only.
+     * Provides a separate executor for the cloners, so network operations based on
+     * TaskExecutor::scheduleRemoteCommand() can use the NetworkInterfaceMock while the cloners
+     * are stopped on a failpoint.
+     *
+     * For testing only
      */
-    void setStartCollectionClonerFn(const StartCollectionClonerFn& startCollectionCloner);
+    void setClonerExecutor_forTest(executor::TaskExecutor* clonerExec);
+
+    /**
+     *
+     * Wait for the cloner thread to finish.
+     *
+     * For testing only
+     */
+    void waitForCloner_forTest();
 
     // State transitions:
     // PreStart --> Running --> ShuttingDown --> Complete
@@ -296,6 +311,10 @@ private:
      *         |
      *         |
      *         V
+     *   _lastOplogEntryFetcherCallbackForDefaultBeginFetchingOpTime()
+     *         |
+     *         |
+     *         V
      *   _getBeginFetchingOpTimeCallback()
      *         |
      *         |
@@ -311,7 +330,7 @@ private:
      *         |                              |
      *         |                              |
      *         V                              V
-     *    _oplogFetcherCallback()         _databasesClonerCallback
+     *    _oplogFetcherCallback()         _allDatabaseClonerCallback
      *         |                              |
      *         |                              |
      *         |                              V
@@ -391,21 +410,13 @@ private:
 
     /**
      * Callback for first '_lastOplogEntryFetcher' callback. A successful response lets us
-     * determine the starting point for tailing the oplog using the OplogFetcher as well as
-     * setting a reference point for the state of the sync source's oplog when data cloning
-     * completes.
+     * determine the default starting point for tailing the oplog using the OplogFetcher if there
+     * are no active transactions on the sync source. This will be used as the default for the
+     * beginFetchingTimestamp.
      */
-    void _lastOplogEntryFetcherCallbackForBeginApplyingTimestamp(
+    void _lastOplogEntryFetcherCallbackForDefaultBeginFetchingOpTime(
         const StatusWith<Fetcher::QueryResponse>& result,
-        std::shared_ptr<OnCompletionGuard> onCompletionGuard,
-        OpTime& beginFetchingOpTime);
-
-    /**
-     * Callback that gets the optime of the oldest active transaction in the sync source's
-     * transaction table. It will be used as the beginFetchingTimestamp.
-     */
-    void _getBeginFetchingOpTimeCallback(const StatusWith<Fetcher::QueryResponse>& result,
-                                         std::shared_ptr<OnCompletionGuard> onCompletionGuard);
+        std::shared_ptr<OnCompletionGuard> onCompletionGuard);
 
     /**
      * Schedules a remote command to issue a find command on sync source's transaction table, which
@@ -413,7 +424,27 @@ private:
      * beginFetchingTimestamp.
      */
     Status _scheduleGetBeginFetchingOpTime_inlock(
-        std::shared_ptr<OnCompletionGuard> onCompletionGuard);
+        std::shared_ptr<OnCompletionGuard> onCompletionGuard,
+        const OpTime& defaultBeginFetchingOpTime);
+
+    /**
+     * Callback that gets the optime of the oldest active transaction in the sync source's
+     * transaction table. It will be used as the beginFetchingTimestamp.
+     */
+    void _getBeginFetchingOpTimeCallback(const StatusWith<Fetcher::QueryResponse>& result,
+                                         std::shared_ptr<OnCompletionGuard> onCompletionGuard,
+                                         const OpTime& defaultBeginFetchingOpTime);
+
+    /**
+     * Callback for second '_lastOplogEntryFetcher' callback. A successful response lets us
+     * determine the starting point for applying oplog entries during the oplog application phase
+     * as well as setting a reference point for the state of the sync source's oplog when data
+     * cloning completes.
+     */
+    void _lastOplogEntryFetcherCallbackForBeginApplyingTimestamp(
+        const StatusWith<Fetcher::QueryResponse>& result,
+        std::shared_ptr<OnCompletionGuard> onCompletionGuard,
+        OpTime& beginFetchingOpTime);
 
     /**
      * Callback for the '_fCVFetcher'. A successful response lets us check if the remote node
@@ -433,8 +464,8 @@ private:
     /**
      * Callback for DatabasesCloner.
      */
-    void _databasesClonerCallback(const Status& status,
-                                  std::shared_ptr<OnCompletionGuard> onCompletionGuard);
+    void _allDatabaseClonerCallback(const Status& status,
+                                    std::shared_ptr<OnCompletionGuard> onCompletionGuard);
 
     /**
      * Callback for second '_lastOplogEntryFetcher' callback. This is scheduled to obtain the stop
@@ -585,9 +616,14 @@ private:
     const InitialSyncerOptions _opts;                                           // (R)
     std::unique_ptr<DataReplicatorExternalState> _dataReplicatorExternalState;  // (R)
     executor::TaskExecutor* _exec;                                              // (R)
-    ThreadPool* _writerPool;                                                    // (R)
-    StorageInterface* _storage;                                                 // (R)
-    ReplicationProcess* _replicationProcess;                                    // (S)
+    // The executor that the Cloner thread runs on.  In production code this is the same as _exec,
+    // but for unit testing, _exec is single-threaded and our NetworkInterfaceMock runs it in
+    // lockstep with the unit test code.  If we pause the cloners using failpoints
+    // NetworkInterfaceMock is unaware of this and this causes our unit tests to deadlock.
+    executor::TaskExecutor* _clonerExec;      // (R)
+    ThreadPool* _writerPool;                  // (R)
+    StorageInterface* _storage;               // (R)
+    ReplicationProcess* _replicationProcess;  // (S)
 
     // This is invoked with the final status of the initial sync. If startup() fails, this callback
     // is never invoked. The caller gets the last applied optime when the initial sync completes
@@ -621,6 +657,7 @@ private:
     std::unique_ptr<Fetcher> _fCVFetcher;                  // (S)
     std::unique_ptr<MultiApplier> _applier;                // (M)
     HostAndPort _syncSource;                               // (M)
+    std::unique_ptr<DBClientConnection> _client;           // (M)
     OpTime _lastFetched;                                   // (MX)
     OpTimeAndWallTime _lastApplied;                        // (MX)
     // TODO (SERVER-43001): The ownership of this will pass to either OplogApplier or
@@ -634,13 +671,13 @@ private:
     // Current initial syncer state. See comments for State enum class for details.
     State _state = State::kPreStart;  // (M)
 
-    // Passed to CollectionCloner via DatabasesCloner.
-    DatabaseCloner::ScheduleDbWorkFn _scheduleDbWorkFn;  // (M)
-    StartCollectionClonerFn _startCollectionClonerFn;    // (M)
+    // Used to create the DBClientConnection for the cloners
+    CreateClientFn _createClientFn;
 
     // Contains stats on the current initial sync request (includes all attempts).
     // To access these stats in a user-readable format, use getInitialSyncProgress().
     Stats _stats;  // (M)
+
     // Data shared by cloners and fetcher.  Follow InitialSyncSharedData synchronization rules.
     std::unique_ptr<InitialSyncSharedData> _sharedData;  // (S)
 };

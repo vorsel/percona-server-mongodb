@@ -358,17 +358,49 @@ TEST(StackTrace, WindowsFormat) {
         << "of trace: `" << trace << "`";
 }
 
-class StringSink : public StackTraceSink {
+std::string traceString() {
+    std::ostringstream os;
+    printStackTrace(os);
+    return os.str();
+}
+
+/** Emit a stack trace before main() runs, for use in the EarlyTraceSanity test. */
+std::string earlyTrace = traceString();
+
+/**
+ * Verify that the JSON object emitted as part of a stack trace contains a "processInfo"
+ * field, and that it, in turn, contains the fields expected by mongosymb.py. Verify in
+ * particular that a stack trace emitted before main() and before the MONGO_INITIALIZERS
+ * have run will be valid according to mongosymb.py.
+ */
+TEST(StackTrace, EarlyTraceSanity) {
+    if (kIsWindows) {
+        return;
+    }
+
+    const std::string trace = traceString();
+    const std::string substrings[] = {
+        R"("processInfo":)",
+        R"("gitVersion":)",
+        R"("compiledModules":)",
+        R"("uname":)",
+        R"("somap":)",
+    };
+    for (const auto& sub : substrings) {
+        ASSERT_STRING_CONTAINS(earlyTrace, sub);
+    }
+    for (const auto& sub : substrings) {
+        ASSERT_STRING_CONTAINS(trace, sub);
+    }
+}
+
+class StringSink : public stack_trace::Sink {
 public:
     StringSink(std::string& s) : _s{s} {}
 
 private:
     void doWrite(StringData v) override {
         format_to(std::back_inserter(_s), FMT_STRING("{}"), v);
-    }
-
-    void doWrite(uint64_t v) override {
-        format_to(std::back_inserter(_s), FMT_STRING("{:d}"), v);
     }
 
     std::string& _s;
@@ -380,33 +412,35 @@ public:
 };
 
 TEST_F(CheapJsonTest, Appender) {
+    using Dec = stack_trace::Dec;
+    using Hex = stack_trace::Hex;
     std::string s;
     StringSink sink{s};
     sink << "Hello"
-         << ":" << 0 << ":" << 255 << ":" << 1234567890;
-    ASSERT_EQ(s, "Hello:0:255:1234567890");
+         << ":" << Dec(0) << ":" << Hex(255) << ":" << Dec(1234567890);
+    ASSERT_EQ(s, "Hello:0:FF:1234567890");
 }
 
 TEST_F(CheapJsonTest, Hex) {
-    using Hex = stacktrace_detail::Hex;
-    ASSERT_EQ(Hex(0).str(), "0");
-    ASSERT_EQ(Hex(0xffff).str(), "FFFF");
-    ASSERT_EQ(Hex(0xfff0).str(), "FFF0");
-    ASSERT_EQ(Hex(0x8000'0000'0000'0000).str(), "8000000000000000");
+    using Hex = stack_trace::Hex;
+    ASSERT_EQ(StringData(Hex(0)), "0");
+    ASSERT_EQ(StringData(Hex(0xffff)), "FFFF");
+    ASSERT_EQ(Hex(0xfff0), "FFF0");
+    ASSERT_EQ(Hex(0x8000'0000'0000'0000), "8000000000000000");
     ASSERT_EQ(Hex::fromHex("FFFF"), 0xffff);
     ASSERT_EQ(Hex::fromHex("0"), 0);
     ASSERT_EQ(Hex::fromHex("FFFFFFFFFFFFFFFF"), 0xffff'ffff'ffff'ffff);
 
     std::string s;
     StringSink sink{s};
-    sink << Hex(0xffff).str();
+    sink << Hex(0xffff);
     ASSERT_EQ(s, R"(FFFF)");
 }
 
 TEST_F(CheapJsonTest, DocumentObject) {
     std::string s;
     StringSink sink{s};
-    stacktrace_detail::CheapJson env{sink};
+    stack_trace::CheapJson env{sink};
     auto doc = env.doc();
     ASSERT_EQ(s, "");
     {
@@ -419,7 +453,7 @@ TEST_F(CheapJsonTest, DocumentObject) {
 TEST_F(CheapJsonTest, ScalarStringData) {
     std::string s;
     StringSink sink{s};
-    stacktrace_detail::CheapJson env{sink};
+    stack_trace::CheapJson env{sink};
     auto doc = env.doc();
     doc.append(123);
     ASSERT_EQ(s, R"(123)");
@@ -428,7 +462,7 @@ TEST_F(CheapJsonTest, ScalarStringData) {
 TEST_F(CheapJsonTest, ScalarInt) {
     std::string s;
     StringSink sink{s};
-    stacktrace_detail::CheapJson env{sink};
+    stack_trace::CheapJson env{sink};
     auto doc = env.doc();
     doc.append("hello");
     ASSERT_EQ(s, R"("hello")");
@@ -437,7 +471,7 @@ TEST_F(CheapJsonTest, ScalarInt) {
 TEST_F(CheapJsonTest, ObjectNesting) {
     std::string s;
     StringSink sink{s};
-    stacktrace_detail::CheapJson env{sink};
+    stack_trace::CheapJson env{sink};
     auto doc = env.doc();
     {
         auto obj = doc.appendObj();
@@ -453,7 +487,7 @@ TEST_F(CheapJsonTest, ObjectNesting) {
 TEST_F(CheapJsonTest, Arrays) {
     std::string s;
     StringSink sink{s};
-    stacktrace_detail::CheapJson env{sink};
+    stack_trace::CheapJson env{sink};
     auto doc = env.doc();
     {
         auto obj = doc.appendObj();
@@ -472,7 +506,7 @@ TEST_F(CheapJsonTest, Arrays) {
 TEST_F(CheapJsonTest, AppendBSONElement) {
     std::string s;
     StringSink sink{s};
-    stacktrace_detail::CheapJson env{sink};
+    stack_trace::CheapJson env{sink};
     {
         auto obj = env.doc().appendObj();
         for (auto& e : fromjson(R"({"a":1,"arr":[2,123],"emptyO":{},"emptyA":[]})"))
@@ -480,6 +514,30 @@ TEST_F(CheapJsonTest, AppendBSONElement) {
     }
     ASSERT_EQ(s, R"({"a":1,"arr":[2,123],"emptyO":{},"emptyA":[]})");
 }
+
+TEST_F(CheapJsonTest, Pretty) {
+    std::string s;
+    StringSink sink{s};
+    stack_trace::CheapJson env{sink};
+    env.pretty();
+    auto doc = env.doc();
+    {
+        auto obj = doc.appendObj();
+        obj.appendKey("headerKey").append(255);
+        {
+            auto inner = obj.appendKey("inner").appendObj();
+            inner.appendKey("innerKey").append("hi");
+        }
+        obj.appendKey("footerKey").append(123);
+    }
+
+    ASSERT_EQ(s, R"({
+  "headerKey":255,
+  "inner":{
+    "innerKey":"hi"},
+  "footerKey":123})"_sd);
+}
+
 
 }  // namespace
 }  // namespace mongo

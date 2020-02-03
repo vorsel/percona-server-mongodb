@@ -197,7 +197,7 @@ bool BackgroundSync::_inShutdown_inlock() const {
 }
 
 void BackgroundSync::_run() {
-    Client::initThread("rsBackgroundSync");
+    Client::initThread("BackgroundSync");
     AuthorizationSession::get(cc())->grantInternalAuthorization(&cc());
 
     while (!inShutdown()) {
@@ -249,13 +249,6 @@ void BackgroundSync::_produce() {
         // This log output is used in js tests so please leave it.
         log() << "bgsync - stopReplProducer fail point "
                  "enabled. Blocking until fail point is disabled.";
-
-        // TODO(SERVER-27120): Remove the return statement and uncomment the while loop.
-        // Currently we cannot block here or we prevent primaries from being fully elected since
-        // we'll never call _signalNoNewDataForApplier.
-        //        while (MONGO_unlikely(stopReplProducer.shouldFail()) && !inShutdown()) {
-        //            mongo::sleepsecs(1);
-        //        }
         mongo::sleepsecs(1);
         return;
     }
@@ -341,7 +334,7 @@ void BackgroundSync::_produce() {
             return;
         }
 
-        if (_tooStale.swap(true)) {
+        if (_tooStale.load()) {
             // We had already marked ourselves too stale.
             return;
         }
@@ -359,12 +352,17 @@ void BackgroundSync::_produce() {
         auto status = _replCoord->setMaintenanceMode(true);
         if (!status.isOK()) {
             warning() << "Failed to transition into maintenance mode: " << status;
+            // Do not mark ourselves too stale on errors so we can try again next time.
+            return;
         }
         status = _replCoord->setFollowerMode(MemberState::RS_RECOVERING);
         if (!status.isOK()) {
             warning() << "Failed to transition into " << MemberState(MemberState::RS_RECOVERING)
                       << ". Current state: " << _replCoord->getMemberState() << causedBy(status);
+            // Do not mark ourselves too stale on errors so we can try again next time.
+            return;
         }
+        _tooStale.store(true);
         return;
     } else if (syncSourceResp.isOK() && !syncSourceResp.getSyncSource().empty()) {
         {

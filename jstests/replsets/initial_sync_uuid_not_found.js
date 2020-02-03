@@ -7,6 +7,8 @@
 (function() {
 'use strict';
 
+load("jstests/libs/fail_point_util.js");
+
 const basename = 'initial_sync_rename_collection';
 
 jsTestLog('Bring up set');
@@ -42,8 +44,11 @@ function ResyncWithFailpoint(failpointName, failpointData) {
     const secondaryColl = secondaryDB[primaryColl.getName()];
 
     rst.reInitiate();
-    assert.commandWorked(
-        secondary.adminCommand({waitForFailPoint: failpointName, timesEntered: 1}));
+    assert.commandWorked(secondary.adminCommand({
+        waitForFailPoint: failpointName,
+        timesEntered: 1,
+        maxTimeMS: kDefaultWaitForFailPointTimeout
+    }));
 
     jsTestLog('Remove collection on the primary and insert a new document, recreating it.');
     assert(primaryColl.drop());
@@ -64,7 +69,11 @@ function ResyncWithFailpoint(failpointName, failpointData) {
     jsTestLog('Check consistency and shut down replica-set');
     rst.checkReplicatedDataHashes();
 }
-ResyncWithFailpoint('initialSyncHangBeforeCollectionClone', {namespace: primaryColl.getFullName()});
-ResyncWithFailpoint('initialSyncHangAfterListCollections', {database: primaryDB.getName()});
+ResyncWithFailpoint(
+    'hangBeforeClonerStage',
+    {cloner: 'CollectionCloner', stage: 'count', namespace: primaryColl.getFullName()});
+ResyncWithFailpoint(
+    'hangAfterClonerStage',
+    {cloner: 'DatabaseCloner', stage: 'listCollections', database: primaryDB.getName()});
 rst.stopSet();
 })();

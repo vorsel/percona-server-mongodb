@@ -115,7 +115,9 @@ public:
 
     virtual bool isEphemeral() const override;
 
-    virtual Status repairRecordStore(OperationContext* opCtx, const NamespaceString& nss) override;
+    virtual Status repairRecordStore(OperationContext* opCtx,
+                                     RecordId catalogId,
+                                     const NamespaceString& nss) override;
 
     virtual std::unique_ptr<TemporaryRecordStore> makeTemporaryRecordStore(
         OperationContext* opCtx) override;
@@ -163,7 +165,7 @@ public:
 
     void clearDropPendingState() final;
 
-    virtual void replicationBatchIsComplete() const override;
+    void triggerJournalFlush() const final;
 
     SnapshotManager* getSnapshotManager() const final;
 
@@ -347,9 +349,9 @@ public:
     }
 
     /**
-     * Drop abandoned idents. Returns a parallel list of index name, index spec pairs to rebuild.
+     * Drop abandoned idents. Returns a list of indexes to rebuild.
      */
-    StatusWith<std::vector<StorageEngine::CollectionIndexNamePair>> reconcileCatalogAndIdents(
+    StatusWith<std::vector<StorageEngine::IndexIdentifier>> reconcileCatalogAndIdents(
         OperationContext* opCtx) override;
 
     std::string getFilesystemPathForDb(const std::string& dbName) const override;
@@ -380,7 +382,10 @@ public:
 private:
     using CollIter = std::list<std::string>::iterator;
 
-    void _initCollection(OperationContext* opCtx, const NamespaceString& nss, bool forRepair);
+    void _initCollection(OperationContext* opCtx,
+                         RecordId catalogId,
+                         const NamespaceString& nss,
+                         bool forRepair);
 
     Status _dropCollectionsNoTimestamp(OperationContext* opCtx,
                                        std::vector<NamespaceString>& toDrop);
@@ -396,6 +401,7 @@ private:
      * collection.
      */
     Status _recoverOrphanedCollection(OperationContext* opCtx,
+                                      RecordId catalogId,
                                       const NamespaceString& collectionName,
                                       StringData collectionIdent);
 

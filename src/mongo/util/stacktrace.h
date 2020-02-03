@@ -35,43 +35,30 @@
 
 #include <iosfwd>
 
-#if defined(_WIN32)
-#include "mongo/platform/windows_basic.h"  // for CONTEXT
-#endif
-
 #include "mongo/base/string_data.h"
 
 namespace mongo {
+namespace stack_trace {
+
+const size_t kFrameMax = 100;
+
 
 /** Abstract sink onto which stacktrace is piecewise emitted. */
-class StackTraceSink {
+class Sink {
 public:
-    StackTraceSink& operator<<(StringData v) {
-        doWrite(v);
-        return *this;
-    }
-
-    StackTraceSink& operator<<(uint64_t v) {
+    Sink& operator<<(StringData v) {
         doWrite(v);
         return *this;
     }
 
 private:
     virtual void doWrite(StringData v) = 0;
-    virtual void doWrite(uint64_t v) = 0;
 };
+
+}  // namespace stack_trace
 
 // Print stack trace information to "os", default to the log stream.
 void printStackTrace(std::ostream& os);
 void printStackTrace();
-
-// Signal-safe variant.
-void printStackTraceFromSignal(std::ostream& os);
-
-#if defined(_WIN32)
-// Print stack trace (using a specified stack context) to "os", default to the log stream.
-void printWindowsStackTrace(CONTEXT& context, std::ostream& os);
-void printWindowsStackTrace(CONTEXT& context);
-#endif
 
 }  // namespace mongo

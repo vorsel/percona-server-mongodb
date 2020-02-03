@@ -72,10 +72,11 @@ perconadecrypt = env.Program(
 )
 
 
-hygienic = get_option('install-mode') == 'hygienic'
-if not hygienic:
-    env.Install("#/", mongobridge)
-    env.Install("#/", mongoebench)
-    env.Install("#/", perconadecrypt)
+# TODO: remove this when hygienic is driving all tarball creation
+install_mongoebench = env.Install("#/", mongoebench)
+env.Alias("install-embedded-test", [install_mongoebench[0]])
+install_mongobridge = env.Install("#/", mongobridge)
+install_perconadecrypt = env.Install("#/", perconadecrypt)
+env.Alias("install-tools", [install_mongobridge[0], install_perconadecrypt[0]])
 
 env.Alias('all', mongoebench)  # This ensures it compiles and links, but doesn't copy it anywhere.

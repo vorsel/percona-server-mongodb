@@ -22,8 +22,14 @@ selector:
   - jstests/sharding/mongos_wait_csrs_initiate.js
   # Enable after SERVER-40258 gets backported and available in the official 4.2 binaries.
   - jstests/sharding/prepared_txn_metadata_refresh.js
+  # Enable after SERVER-38691 gets backported to 4.2 and becomes the last stable.
+  - jstests/sharding/explain_cmd.js
   # Enable when 4.4 becomes last stable
+  - jstests/sharding/agg_explain_fmt.js
+  - jstests/sharding/allow_partial_results_nshards.js
+  - jstests/sharding/array_shard_key.js
   - jstests/sharding/banned_txn_databases_sharded.js
+  - jstests/sharding/mongos_precache_routing_info.js
   - jstests/sharding/bulk_insert.js
   - jstests/sharding/change_streams_establishment_finds_new_shards.js
   - jstests/sharding/change_streams_new_shard_new_database.js
@@ -56,9 +62,15 @@ selector:
   - jstests/sharding/track_unsharded_collections_rename_collection.js
   - jstests/sharding/update_compound_shard_key.js
   - jstests/sharding/update_replace_id.js
-  # Enable if SERVER-41813 is backported or 4.4 becomes last-stable
-  - jstests/sharding/invalid_system_views_sharded_collection.js
-
+  - jstests/sharding/update_sharded.js
+  - jstests/sharding/upsert_sharded.js
+    # Enable if SERVER-42273 is backported or 4.4 becomes last-stable
+  - jstests/sharding/move_jumbo_chunk.js
+  - jstests/sharding/movechunk_interrupt_at_primary_stepdown.js
+  # Enable after SERVER-31083 is backported and available on 4.2 and 4.0 binaries
+  - jstests/sharding/enable_sharding_with_primary.js
+  # Enable after SERVER-43941 is backported or 4.4 becomes last-stable
+  - jstests/sharding/transactions_error_labels.js
 executor:
   config:
     shell_options:

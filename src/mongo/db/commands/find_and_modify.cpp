@@ -120,6 +120,7 @@ void makeUpdateRequest(OperationContext* opCtx,
     requestOut->setRuntimeConstants(
         args.getRuntimeConstants().value_or(Variables::generateRuntimeConstants(opCtx)));
     requestOut->setSort(args.getSort());
+    requestOut->setHint(args.getHint());
     requestOut->setCollation(args.getCollation());
     requestOut->setArrayFilters(args.getArrayFilters());
     requestOut->setUpsert(args.isUpsert());
@@ -266,8 +267,8 @@ public:
             css->checkShardVersionOrThrow(opCtx, autoColl.getCollection());
 
             Collection* const collection = autoColl.getCollection();
-            const auto exec =
-                uassertStatusOK(getExecutorDelete(opCtx, opDebug, collection, &parsedDelete));
+            const auto exec = uassertStatusOK(
+                getExecutorDelete(opCtx, opDebug, collection, &parsedDelete, verbosity));
 
             auto bodyBuilder = result->getBodyBuilder();
             Explain::explainStages(exec.get(), collection, verbosity, BSONObj(), &bodyBuilder);
@@ -291,8 +292,8 @@ public:
             css->checkShardVersionOrThrow(opCtx, autoColl.getCollection());
 
             Collection* const collection = autoColl.getCollection();
-            const auto exec =
-                uassertStatusOK(getExecutorUpdate(opCtx, opDebug, collection, &parsedUpdate));
+            const auto exec = uassertStatusOK(
+                getExecutorUpdate(opCtx, opDebug, collection, &parsedUpdate, verbosity));
 
             auto bodyBuilder = result->getBodyBuilder();
             Explain::explainStages(exec.get(), collection, verbosity, BSONObj(), &bodyBuilder);
@@ -380,8 +381,8 @@ public:
                 Collection* const collection = autoColl.getCollection();
                 checkIfTransactionOnCappedColl(collection, inTransaction);
 
-                const auto exec =
-                    uassertStatusOK(getExecutorDelete(opCtx, opDebug, collection, &parsedDelete));
+                const auto exec = uassertStatusOK(getExecutorDelete(
+                    opCtx, opDebug, collection, &parsedDelete, boost::none /* verbosity */));
 
                 {
                     stdx::lock_guard<Client> lk(*opCtx->getClient());
@@ -486,8 +487,8 @@ public:
 
                 checkIfTransactionOnCappedColl(collection, inTransaction);
 
-                const auto exec =
-                    uassertStatusOK(getExecutorUpdate(opCtx, opDebug, collection, &parsedUpdate));
+                const auto exec = uassertStatusOK(getExecutorUpdate(
+                    opCtx, opDebug, collection, &parsedUpdate, boost::none /* verbosity */));
 
                 {
                     stdx::lock_guard<Client> lk(*opCtx->getClient());

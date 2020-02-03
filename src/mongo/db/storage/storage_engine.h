@@ -314,7 +314,9 @@ public:
      * Generally, this method should not be called directly except by the repairDatabase()
      * free function.
      */
-    virtual Status repairRecordStore(OperationContext* opCtx, const NamespaceString& nss) = 0;
+    virtual Status repairRecordStore(OperationContext* opCtx,
+                                     RecordId catalogId,
+                                     const NamespaceString& nss) = 0;
 
     /**
      * Creates a temporary RecordStore on the storage engine. This record store will drop itself
@@ -485,22 +487,21 @@ public:
     virtual void setCachePressureForTest(int pressure) = 0;
 
     /**
-     *  Notifies the storage engine that a replication batch has completed.
-     *  This means that all the writes associated with the oplog entries in the batch are
-     *  finished and no new writes with timestamps associated with those oplog entries will show
-     *  up in the future.
-     *  This function can be used to ensure oplog visibility rules are not broken, for example.
+     * Prompts an immediate journal flush.
      */
-    virtual void replicationBatchIsComplete() const = 0;
+    virtual void triggerJournalFlush() const = 0;
 
-    // (CollectionName, IndexName)
-    typedef std::pair<std::string, std::string> CollectionIndexNamePair;
+    struct IndexIdentifier {
+        const RecordId catalogId;
+        const NamespaceString nss;
+        const std::string indexName;
+    };
 
     /**
      * Drop abandoned idents. In the successful case, returns a list of collection, index name
      * pairs to rebuild.
      */
-    virtual StatusWith<std::vector<CollectionIndexNamePair>> reconcileCatalogAndIdents(
+    virtual StatusWith<std::vector<IndexIdentifier>> reconcileCatalogAndIdents(
         OperationContext* opCtx) = 0;
 
     /**

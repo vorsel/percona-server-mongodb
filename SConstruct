@@ -447,11 +447,18 @@ add_option('osx-version-min',
     help='minimum OS X version to support',
 )
 
+# https://docs.microsoft.com/en-us/cpp/porting/modifying-winver-and-win32-winnt?view=vs-2017
+# https://docs.microsoft.com/en-us/windows-server/get-started/windows-server-release-info
 win_version_min_choices = {
-    'win7'    : ('0601', '0000'),
-    'ws08r2'  : ('0601', '0000'),
-    'win8'    : ('0602', '0000'),
-    'win81'   : ('0603', '0000'),
+    'win7'     : ('0601', '0000'),
+    'ws08r2'   : ('0601', '0000'),
+    'win8'     : ('0602', '0000'),
+    'ws2012'   : ('0602', '0000'),
+    'win81'    : ('0603', '0000'),
+    'ws2012r2' : ('0603', '0000'),
+    'win10'    : ('0A00', '0000'),
+    'ws2016'   : ('0A00', '1607'),
+    'ws2019'   : ('0A00', '1809')
 }
 
 add_option('win-version-min',
@@ -1060,7 +1067,6 @@ envDict = dict(BUILD_ROOT=buildDir,
                CONFIGURELOG='$BUILD_ROOT/scons/config.log',
                CONFIG_HEADER_DEFINES={},
                LIBDEPS_TAG_EXPANSIONS=[],
-               AIB_PACKAGE_PREFIX='mongodb-',
                )
 
 env = Environment(variables=env_vars, **envDict)
@@ -2176,7 +2182,7 @@ def doConfigure(myenv):
             win_version_min = get_option('win-version-min')
         else:
             # If no minimum version has beeen specified, use our default
-            win_version_min = 'ws08r2'
+            win_version_min = 'win10'
 
         env['WIN_VERSION_MIN'] = win_version_min
         win_version_min = win_version_min_choices[win_version_min]
@@ -3908,13 +3914,31 @@ if get_option('install-mode') == 'hygienic':
     env.AddPackageNameAlias(
         component="dist",
         role="runtime",
-        name="${{SERVER_DIST_BASENAME[{PREFIX_LEN}:]}}".format(PREFIX_LEN=len(env.get("AIB_PACKAGE_PREFIX")))
+        name="${SERVER_DIST_BASENAME}",
     )
 
     env.AddPackageNameAlias(
         component="dist",
         role="debug",
-        name="${{SERVER_DIST_BASENAME[{PREFIX_LEN}:]}}-debugsymbols".format(PREFIX_LEN=len(env.get("AIB_PACKAGE_PREFIX")))
+        name="${SERVER_DIST_BASENAME}-debugsymbols",
+    )
+
+    env.AddPackageNameAlias(
+        component="mh",
+        role="runtime",
+        # TODO: we should be able to move this to where the mqlrun binary is
+        # defined when AIB correctly uses environments instead of hooking into
+        # the first environment used.
+        name="${MH_DIST_BASENAME}",
+    )
+
+    env.AddPackageNameAlias(
+        component="mh",
+        role="debug",
+        # TODO: we should be able to move this to where the mqlrun binary is
+        # defined when AIB correctly uses environments instead of hooking into
+        # the first environment used.
+        name="${MH_DIST_BASENAME}-debugsymbols",
     )
 
     if env['PLATFORM'] == 'posix':
@@ -4113,6 +4137,7 @@ def add_version_to_distsrc(env, archive):
 env.AddDistSrcCallback(add_version_to_distsrc)
 
 env['SERVER_DIST_BASENAME'] = env.subst('mongodb-%s-$MONGO_DISTNAME' % (getSystemInstallName()))
+env['MH_DIST_BASENAME'] = env.subst('mh-%s-$MONGO_DISTNAME' % (getSystemInstallName()))
 if get_option('legacy-tarball') == 'true':
     if ('tar-dist' not in COMMAND_LINE_TARGETS and
         'zip-dist' not in COMMAND_LINE_TARGETS and
@@ -4165,11 +4190,16 @@ env.AddMethod(injectModule, 'InjectModule')
 compileCommands = env.CompilationDatabase('compile_commands.json')
 compileDb = env.Alias("compiledb", compileCommands)
 
+
+msvc_version = ""
+if 'MSVC_VERSION' in env and env['MSVC_VERSION']:
+    msvc_version = "--version " + env['MSVC_VERSION'] + " "
+
 # Microsoft Visual Studio Project generation for code browsing
 vcxprojFile = env.Command(
     "mongodb.vcxproj",
     compileCommands,
-    r"$PYTHON buildscripts\make_vcxproj.py mongodb")
+    r"$PYTHON buildscripts\make_vcxproj.py " + msvc_version + "mongodb")
 vcxproj = env.Alias("vcxproj", vcxprojFile)
 
 distSrc = env.DistSrc("mongodb-src-${MONGO_VERSION}.tar")
@@ -4339,9 +4369,13 @@ if get_option('install-mode') == 'hygienic':
     if env.TargetOSIs("windows"):
         env.Alias("archive-dist", "zip-dist")
         env.Alias("archive-dist-debug", "zip-dist-debug")
+        env.Alias("archive-mh", "zip-mh")
+        env.Alias("archive-mh-debug", "zip-mh-debug")
     else:
         env.Alias("archive-dist", "tar-dist")
         env.Alias("archive-dist-debug", "tar-dist-debug")
+        env.Alias("archive-mh", "tar-mh")
+        env.Alias("archive-mh-debug", "tar-mh-debug")
 
 # We don't want installing files to cause them to flow into the cache,
 # since presumably we can re-install them from the origin if needed.

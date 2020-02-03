@@ -40,6 +40,7 @@
 #include "mongo/db/s/chunk_splitter.h"
 #include "mongo/db/s/database_sharding_state.h"
 #include "mongo/db/s/migration_source_manager.h"
+#include "mongo/db/s/range_deletion_task_gen.h"
 #include "mongo/db/s/shard_identity_rollback_notifier.h"
 #include "mongo/db/s/sharding_initialization_mongod.h"
 #include "mongo/db/s/type_shard_identity.h"
@@ -271,8 +272,8 @@ void ShardServerOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateE
             // Need the WUOW to retain the lock for CollectionVersionLogOpHandler::commit()
             AutoGetCollection autoColl(opCtx, updatedNss, MODE_IX);
 
-            if (setField.hasField(ShardCollectionType::kLastRefreshedCollectionVersionFieldName) &&
-                !setField.getBoolField("refreshing")) {
+            auto refreshingField = setField.getField(ShardCollectionType::kRefreshingFieldName);
+            if (refreshingField.isBoolean() && !refreshingField.boolean()) {
                 opCtx->recoveryUnit()->registerChange(
                     std::make_unique<CollectionVersionLogOpHandler>(opCtx, updatedNss));
             }
@@ -317,6 +318,41 @@ void ShardServerOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateE
                 auto dss = DatabaseShardingState::get(opCtx, db);
                 auto dssLock = DatabaseShardingState::DSSLock::lockExclusive(opCtx, dss);
                 dss->setDbVersion(opCtx, boost::none, dssLock);
+            }
+        }
+    }
+
+    if (args.nss == NamespaceString::kRangeDeletionNamespace) {
+        if (!isStandaloneOrPrimary(opCtx))
+            return;
+
+        BSONElement unsetElement;
+        Status status = bsonExtractTypedField(
+            args.updateArgs.update, StringData("$unset"), Object, &unsetElement);
+
+        if (unsetElement.Obj().hasField("pending")) {
+            auto deletionTask = RangeDeletionTask::parse(
+                IDLParserErrorContext("ShardServerOpObserver"), args.updateArgs.updatedDoc);
+
+            const auto whenToClean = deletionTask.getWhenToClean() == CleanWhenEnum::kNow
+                ? CollectionShardingRuntime::kNow
+                : CollectionShardingRuntime::kDelayed;
+
+            AutoGetCollection autoColl(opCtx, deletionTask.getNss(), MODE_IS);
+
+            if (!autoColl.getCollection() ||
+                autoColl.getCollection()->uuid() != deletionTask.getCollectionUuid()) {
+                LOG(0) << "Collection UUID doesn't match the one marked for deletion: "
+                       << autoColl.getCollection()->uuid()
+                       << " != " << deletionTask.getCollectionUuid();
+            } else {
+                LOG(0) << "Scheduling range " << deletionTask.getRange() << " in namespace "
+                       << deletionTask.getNss() << " for deletion.";
+
+                auto notification = CollectionShardingRuntime::get(opCtx, deletionTask.getNss())
+                                        ->cleanUpRange(*deletionTask.getRange(), whenToClean);
+
+                notification.abandon();
             }
         }
     }

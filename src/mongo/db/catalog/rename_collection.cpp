@@ -449,7 +449,10 @@ Status renameBetweenDBs(OperationContext* opCtx,
     boost::optional<Lock::DBLock> sourceDbLock;
     boost::optional<Lock::CollectionLock> sourceCollLock;
     if (!opCtx->lockState()->isCollectionLockedForMode(source, MODE_S)) {
-        sourceDbLock.emplace(opCtx, source.db(), MODE_IS);
+        // Lock the DB using MODE_IX to ensure we have the global lock in that mode, as to prevent
+        // upgrade from MODE_IS to MODE_IX, which caused deadlock on systems not supporting Database
+        // locking and should be avoided in general.
+        sourceDbLock.emplace(opCtx, source.db(), MODE_IX);
         sourceCollLock.emplace(opCtx, source, MODE_S);
     }
 
@@ -548,7 +551,7 @@ Status renameBetweenDBs(OperationContext* opCtx,
     Collection* tmpColl = nullptr;
     {
         auto collectionOptions =
-            DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, sourceColl->ns());
+            DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, sourceColl->getCatalogId());
 
         // Renaming across databases will result in a new UUID.
         collectionOptions.uuid = UUID::gen();
@@ -604,43 +607,13 @@ Status renameBetweenDBs(OperationContext* opCtx,
     if (!indexesToCopy.empty()) {
         Status status = writeConflictRetry(opCtx, "renameCollection", tmpName.ns(), [&] {
             WriteUnitOfWork wunit(opCtx);
-            auto tmpIndexCatalog = tmpColl->getIndexCatalog();
-            auto opObserver = opCtx->getServiceContext()->getOpObserver();
             auto fromMigrate = false;
-
-            // Emit startIndexBuild and commitIndexBuild oplog entries if supported by the
-            // current FCV.
-            auto buildUUID = serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-                    serverGlobalParams.featureCompatibility.getVersion() ==
-                        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44
-                ? boost::make_optional(UUID::gen())
-                : boost::none;
-
-            if (buildUUID) {
-                opObserver->onStartIndexBuild(
-                    opCtx, tmpName, tmpColl->uuid(), *buildUUID, indexesToCopy, fromMigrate);
+            try {
+                IndexBuildsCoordinator::get(opCtx)->createIndexesOnEmptyCollection(
+                    opCtx, tmpColl->uuid(), indexesToCopy, fromMigrate);
+            } catch (DBException& ex) {
+                return ex.toStatus();
             }
-
-            for (const auto& indexToCopy : indexesToCopy) {
-                // If two phase index builds is enabled, index build will be coordinated using
-                // startIndexBuild and commitIndexBuild oplog entries.
-                if (!IndexBuildsCoordinator::get(opCtx)->supportsTwoPhaseIndexBuild()) {
-                    opObserver->onCreateIndex(
-                        opCtx, tmpName, tmpColl->uuid(), indexToCopy, fromMigrate);
-                }
-
-                auto indexResult =
-                    tmpIndexCatalog->createIndexOnEmptyCollection(opCtx, indexToCopy);
-                if (!indexResult.isOK()) {
-                    return indexResult.getStatus();
-                }
-            };
-
-            if (buildUUID) {
-                opObserver->onCommitIndexBuild(
-                    opCtx, tmpName, tmpColl->uuid(), *buildUUID, indexesToCopy, fromMigrate);
-            }
-
             wunit.commit();
             return Status::OK();
         });
@@ -688,6 +661,12 @@ Status renameBetweenDBs(OperationContext* opCtx,
                     }
                     record = cursor->next();
                 }
+
+                // Time to yield; make a safe copy of the current record before releasing our
+                // cursor.
+                if (record)
+                    record->data.makeOwned();
+
                 cursor->save();
                 // When this exits via success or WCE, we need to restore the cursor.
                 ON_BLOCK_EXIT([opCtx, ns = tmpName.ns(), &cursor]() {

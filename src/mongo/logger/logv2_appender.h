@@ -31,6 +31,7 @@
 
 #include "mongo/base/status.h"
 #include "mongo/logger/appender.h"
+#include "mongo/logger/log_version_util.h"
 #include "mongo/logv2/attribute_argument_set.h"
 #include "mongo/logv2/log_component.h"
 #include "mongo/logv2/log_detail.h"
@@ -67,7 +68,8 @@ public:
     LogV2Appender(const LogV2Appender&) = delete;
     LogV2Appender& operator=(const LogV2Appender&) = delete;
 
-    explicit LogV2Appender(logv2::LogDomain* domain) : _domain(domain) {}
+    explicit LogV2Appender(logv2::LogDomain* domain, logv2::LogTag extraTag = logv2::LogTag::kNone)
+        : _domain(domain), _tag(extraTag) {}
 
     Status append(const Event& event) override {
 
@@ -78,25 +80,26 @@ public:
             // We need to cast from the v1 logging severity to the equivalent v2 severity
             logv2::LogSeverity::cast(event.getSeverity().toInt()),
 
-            // Similarly, we need to transcode the options. They don't offer a cast
-            // operator, so we need to do some metaprogramming on the types.
-            logv2::LogOptions{logv2::LogComponent(static_cast<logv2::LogComponent::Value>(
-                                  static_cast<std::underlying_type_t<LogComponent::Value>>(
-                                      static_cast<LogComponent::Value>(event.getComponent())))),
-                              _domain,
-                              logv2::LogTag{logTagValue}},
-
             // stable id doesn't exist in logv1
             StringData{},
 
-            "{} {}",  // TODO remove this lv2 when it's no longer fun to have
-            "engine"_attr = "lv2",
+            // Similarly, we need to transcode the options. They don't offer a cast
+            // operator, so we need to do some metaprogramming on the types.
+            logv2::LogOptions{
+                logComponentV1toV2(event.getComponent()),
+                _domain,
+                logv2::LogTag{static_cast<logv2::LogTag::Value>(
+                    static_cast<std::underlying_type_t<logv2::LogTag::Value>>(logTagValue) |
+                    static_cast<std::underlying_type_t<logv2::LogTag::Value>>(_tag))}},
+
+            "{}",
             "message"_attr = event.getMessage());
         return Status::OK();
     }
 
 private:
     logv2::LogDomain* _domain;
+    logv2::LogTag _tag;
 };
 
 }  // namespace logger

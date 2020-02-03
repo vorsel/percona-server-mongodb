@@ -137,8 +137,9 @@ ServerStatusMetricField<Counter64> displayBufferMaxSize("repl.buffer.maxSizeByte
 /**
  * Returns new thread pool for thread pool task executor.
  */
-auto makeThreadPool(const std::string& poolName) {
+auto makeThreadPool(const std::string& poolName, const std::string& threadName) {
     ThreadPool::Options threadPoolOptions;
+    threadPoolOptions.threadNamePrefix = threadName + "-";
     threadPoolOptions.poolName = poolName;
     threadPoolOptions.onCreateThread = [](const std::string& threadName) {
         Client::initThread(threadName.c_str());
@@ -150,12 +151,15 @@ auto makeThreadPool(const std::string& poolName) {
 /**
  * Returns a new thread pool task executor.
  */
-auto makeTaskExecutor(ServiceContext* service, const std::string& poolName) {
+auto makeTaskExecutor(ServiceContext* service,
+                      const std::string& poolName,
+                      const std::string& threadName) {
     auto hookList = std::make_unique<rpc::EgressMetadataHookList>();
     hookList->addHook(std::make_unique<rpc::LogicalTimeMetadataHook>(service));
+    auto networkName = threadName + "Network";
     return std::make_unique<executor::ThreadPoolTaskExecutor>(
-        makeThreadPool(poolName),
-        executor::makeNetworkInterface("RS", nullptr, std::move(hookList)));
+        makeThreadPool(poolName, threadName),
+        executor::makeNetworkInterface(networkName, nullptr, std::move(hookList)));
 }
 
 /**
@@ -320,10 +324,11 @@ void ReplicationCoordinatorExternalStateImpl::startThreads(const ReplSettings& s
     log() << "Starting replication storage threads";
     _service->getStorageEngine()->setJournalListener(this);
 
-    _oplogApplierTaskExecutor = makeTaskExecutor(_service, "rsSync");
+    _oplogApplierTaskExecutor =
+        makeTaskExecutor(_service, "OplogApplierThreadPool", "OplogApplier");
     _oplogApplierTaskExecutor->startup();
 
-    _taskExecutor = makeTaskExecutor(_service, "replication");
+    _taskExecutor = makeTaskExecutor(_service, "ReplCoordExternThreadPool", "ReplCoordExtern");
     _taskExecutor->startup();
 
     _writerPool = makeReplWriterPool();
@@ -696,6 +701,26 @@ void ReplicationCoordinatorExternalStateImpl::shardingOnStepDownHook() {
             validator->enableKeyGenerator(opCtxPtr.get(), false);
         }
     }
+}
+
+void ReplicationCoordinatorExternalStateImpl::clearOplogVisibilityStateForStepDown() {
+    auto opCtx = cc().getOperationContext();
+    // Temporarily turn off flow control ticketing. Getting a ticket can stall on a ticket being
+    // available, which may have to wait for the ticket refresher to run, which in turn blocks on
+    // the repl _mutex to check whether we are primary or not: this is a deadlock because stepdown
+    // already holds the repl _mutex!
+    auto originalFlowControlSetting = opCtx->shouldParticipateInFlowControl();
+    ON_BLOCK_EXIT([&] { opCtx->setShouldParticipateInFlowControl(originalFlowControlSetting); });
+    opCtx->setShouldParticipateInFlowControl(false);
+
+    // We can clear the oplogTruncateAfterPoint because we know there are no concurrent user writes
+    // during stepdown and therefore presently no oplog holes.
+    //
+    // This value is updated periodically while in PRIMARY mode to protect against oplog holes on
+    // unclean shutdown. The value must then be cleared on stepdown because stepup expects the value
+    // to be unset. Batch application, in mode SECONDARY, also uses the value to protect against
+    // unclean shutdown, and will handle both setting AND unsetting the value.
+    _replicationProcess->getConsistencyMarkers()->setOplogTruncateAfterPoint(opCtx, Timestamp());
 }
 
 void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook(

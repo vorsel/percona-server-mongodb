@@ -560,8 +560,8 @@ void State::prepTempCollection() {
 
         auto const finalColl = autoGetFinalColl.getCollection();
         if (finalColl) {
-            finalOptions =
-                DurableCatalog::get(_opCtx)->getCollectionOptions(_opCtx, finalColl->ns());
+            finalOptions = DurableCatalog::get(_opCtx)->getCollectionOptions(
+                _opCtx, finalColl->getCatalogId());
 
             std::unique_ptr<IndexCatalog::IndexIterator> ii =
                 finalColl->getIndexCatalog()->getIndexIterator(_opCtx, true);
@@ -616,44 +616,16 @@ void State::prepTempCollection() {
         auto const tempColl =
             db->createCollection(_opCtx, _config.tempNamespace, options, buildIdIndex);
 
-        if (!indexesToInsert.empty()) {
-            // Emit startIndexBuild and commitIndexBuild oplog entries if supported by the
-            // current FCV.
-            auto opObserver = _opCtx->getServiceContext()->getOpObserver();
-            const auto& tmpName = _config.tempNamespace;
+        // Secondary index builds do not filter existing indexes so we have to do this on the
+        // primary.
+        auto removeIndexBuildsToo = false;
+        auto filteredIndexes = tempColl->getIndexCatalog()->removeExistingIndexes(
+            _opCtx, indexesToInsert, removeIndexBuildsToo);
+
+        if (!filteredIndexes.empty()) {
             auto fromMigrate = false;
-            auto buildUUID = serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-                    serverGlobalParams.featureCompatibility.getVersion() ==
-                        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44
-                ? boost::make_optional(UUID::gen())
-                : boost::none;
-
-            if (buildUUID) {
-                opObserver->onStartIndexBuild(
-                    _opCtx, tmpName, tempColl->uuid(), *buildUUID, indexesToInsert, fromMigrate);
-            }
-
-            for (const auto& indexToInsert : indexesToInsert) {
-                try {
-                    uassertStatusOK(tempColl->getIndexCatalog()->createIndexOnEmptyCollection(
-                        _opCtx, indexToInsert));
-                } catch (const ExceptionFor<ErrorCodes::IndexAlreadyExists>&) {
-                    continue;
-                }
-
-                // If two phase index builds is enabled, index build will be coordinated using
-                // startIndexBuild and commitIndexBuild oplog entries.
-                if (!IndexBuildsCoordinator::get(_opCtx)->supportsTwoPhaseIndexBuild()) {
-                    // Log the createIndex operation.
-                    opObserver->onCreateIndex(
-                        _opCtx, tmpName, tempColl->uuid(), indexToInsert, fromMigrate);
-                }
-            }
-
-            if (buildUUID) {
-                opObserver->onCommitIndexBuild(
-                    _opCtx, tmpName, tempColl->uuid(), *buildUUID, indexesToInsert, fromMigrate);
-            }
+            IndexBuildsCoordinator::get(_opCtx)->createIndexesOnEmptyCollection(
+                _opCtx, tempColl->uuid(), filteredIndexes, fromMigrate);
         }
 
         wuow.commit();

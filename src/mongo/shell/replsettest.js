@@ -75,6 +75,8 @@
 var ReplSetTest = function(opts) {
     'use strict';
 
+    load("jstests/libs/parallelTester.js");  // For Thread.
+
     if (!(this instanceof ReplSetTest)) {
         return new ReplSetTest(opts);
     }
@@ -581,8 +583,6 @@ var ReplSetTest = function(opts) {
             self.startOptions = options;
         }
 
-        var nodes = [];
-
         if (jsTest.options().useRandomBinVersionsWithinReplicaSet &&
             self.seedRandomNumberGenerator) {
             // Set the random seed to the value passed in by TestData. The seed is undefined
@@ -591,11 +591,37 @@ var ReplSetTest = function(opts) {
             Random.setRandomSeed(jsTest.options().seed);
         }
 
-        for (var n = 0; n < this.ports.length; n++) {
-            nodes.push(this.start(n, options, restart));
+        // If the caller has explicitly specified 'waitForConnect:false', then we will start up all
+        // replica set nodes and return without waiting to connect to any of them.
+        const skipWaitingForAllConnections = (options && options.waitForConnect === false);
+
+        // If the caller has explicitly set 'waitForConnect', then we prefer that. Otherwise we
+        // default to not waiting for a connection. We merge the options object with a new field so
+        // as to not modify the original options object that was passed in.
+        options = options || {};
+        options = (options.waitForConnect === undefined)
+            ? Object.merge(options, {waitForConnect: false})
+            : options;
+
+        // Start up each node without waiting to connect. This allows startup of replica set nodes
+        // to proceed in parallel.
+        for (let n = 0; n < this.ports.length; n++) {
+            this.start(n, options, restart);
         }
 
-        this.nodes = nodes;
+        // Avoid waiting for connections to each node.
+        if (skipWaitingForAllConnections) {
+            print("ReplSetTest startSet skipping waiting for connections to all nodes.");
+            return this.nodes;
+        }
+
+        // Wait until we can establish a connection to each node before proceeding.
+        for (let n = 0; n < this.ports.length; n++) {
+            this._waitForInitialConnection(n);
+        }
+
+        print("ReplSetTest startSet, nodes: " + tojson(this.nodes));
+
         print("ReplSetTest startSet took " + (new Date() - startTime) + "ms for " +
               this.nodes.length + " nodes.");
         return this.nodes;
@@ -637,7 +663,7 @@ var ReplSetTest = function(opts) {
                 status = node.getDB("admin").runCommand({replSetGetStatus: 1});
                 for (var j = 0; j < status.members.length; j++) {
                     if (status.members[j].self) {
-                        return status.members[j].syncingTo === upstreamNode.host;
+                        return status.members[j].syncSourceHost === upstreamNode.host;
                     }
                 }
                 return false;
@@ -2094,9 +2120,22 @@ var ReplSetTest = function(opts) {
                                    (hasSecondaryIndexes &&
                                     primaryCollStats.nindexes !== secondaryCollStats.nindexes) ||
                                    primaryCollStats.ns !== secondaryCollStats.ns) {
+                            // Provide hint on where to look within stats.
+                            let reasons = [];
+                            if (primaryCollStats.capped !== secondaryCollStats.capped) {
+                                reasons.push('capped');
+                            }
+                            if (hasSecondaryIndexes &&
+                                primaryCollStats.nindexes !== secondaryCollStats.nindexes) {
+                                reasons.push('indexes');
+                            }
+                            if (primaryCollStats.ns !== secondaryCollStats.ns) {
+                                reasons.push('ns');
+                            }
                             print(msgPrefix +
                                   ', the primary and secondary have different stats for the ' +
-                                  'collection ' + dbName + '.' + collName);
+                                  'collection ' + dbName + '.' + collName + ': ' +
+                                  reasons.join(', '));
                             DataConsistencyChecker.dumpCollectionDiff(this,
                                                                       collectionPrinted,
                                                                       primaryCollInfos,
@@ -2342,6 +2381,54 @@ var ReplSetTest = function(opts) {
     };
 
     /**
+     * Waits for an initial connection to a given node. Should only be called after the node's
+     * process has already been started. Updates the corresponding entry in 'this.nodes' with the
+     * newly established connection object.
+     *
+     * @param {int} [n] the node id.
+     * @param {boolean} [waitForHealth] If true, wait for the health indicator of the replica set
+     *     node after waiting for a connection. Default: false.
+     * @returns a new Mongo connection object to the node.
+     */
+    this._waitForInitialConnection = function(n, waitForHealth) {
+        print("ReplSetTest waiting for an initial connection to node " + n);
+
+        // If we are using a bridge, then we want to get at the underlying mongod node object.
+        let node = _useBridge ? _unbridgedNodes[n] : this.nodes[n];
+        let pid = node.pid;
+        let port = node.port;
+        let conn = MongoRunner.awaitConnection(pid, port);
+        if (!conn) {
+            throw new Error("Failed to connect to node " + n);
+        }
+
+        // Attach the original node properties to the connection object.
+        Object.assign(conn, node);
+
+        // Save the new connection object. If we are using a bridge, then we need to connect to it.
+        if (_useBridge) {
+            this.nodes[n].connectToBridge();
+            this.nodes[n].nodeId = n;
+            _unbridgedNodes[n] = conn;
+        } else {
+            this.nodes[n] = conn;
+        }
+
+        print("ReplSetTest made initial connection to node: " + tojson(this.nodes[n]));
+
+        waitForHealth = waitForHealth || false;
+        if (waitForHealth) {
+            // Wait for node to start up.
+            _waitForHealth(this.nodes[n], Health.UP);
+        }
+
+        if (_causalConsistency) {
+            this.nodes[n].setCausalConsistency(true);
+        }
+        return this.nodes[n];
+    };
+
+    /**
      * Starts up a server.  Options are saved by default for subsequent starts.
      *
      *
@@ -2354,9 +2441,11 @@ var ReplSetTest = function(opts) {
      * @param {object} [options]
      * @param {boolean} [restart] If false, the data directory will be cleared
      *   before the server starts.  Default: false.
-     *
+     * @param {boolean} [waitForHealth] If true, wait for the health indicator of the replica set
+     *     node after waiting for a connection. Default: false.
      */
-    this.start = _nodeParamToSingleNode(_nodeParamToId(function(n, options, restart, wait) {
+    this.start = _nodeParamToSingleNode(_nodeParamToId(function(
+        n, options, restart, waitForHealth) {
         print("ReplSetTest n is : " + n);
 
         var defaults = {
@@ -2459,6 +2548,11 @@ var ReplSetTest = function(opts) {
             this.nodes[n] = new MongoBridge(bridgeOptions);
         }
 
+        // Save this property since it may be deleted inside 'runMongod'.
+        var waitForConnect = options.waitForConnect;
+
+        // Never wait for a connection inside runMongod. We will do so below if needed.
+        options.waitForConnect = false;
         var conn = MongoRunner.runMongod(options);
         if (!conn) {
             throw new Error("Failed to start node " + n);
@@ -2467,17 +2561,16 @@ var ReplSetTest = function(opts) {
         // Make sure to call _addPath, otherwise folders won't be cleaned.
         this._addPath(conn.dbpath);
 
+        // We don't want to persist 'waitForConnect' across node restarts.
+        delete conn.fullOptions.waitForConnect;
+
+        // Save the node object in the appropriate location.
         if (_useBridge) {
-            this.nodes[n].connectToBridge();
             _unbridgedNodes[n] = conn;
         } else {
             this.nodes[n] = conn;
+            this.nodes[n].nodeId = n;
         }
-
-        // Add replica set specific attributes.
-        this.nodes[n].nodeId = n;
-
-        printjson(this.nodes);
 
         // Clean up after noReplSet to ensure it doesn't effect future restarts.
         if (options.noReplSet) {
@@ -2485,24 +2578,12 @@ var ReplSetTest = function(opts) {
             delete this.nodes[n].fullOptions.noReplSet;
         }
 
-        wait = wait || false;
-        if (!wait.toFixed) {
-            if (wait)
-                wait = 0;
-            else
-                wait = -1;
+        // Wait for a connection to the node if necessary.
+        if (waitForConnect === false) {
+            print("ReplSetTest start skip waiting for a connection to node " + n);
+            return this.nodes[n];
         }
-
-        if (wait >= 0) {
-            // Wait for node to start up.
-            _waitForHealth(this.nodes[n], Health.UP, wait);
-        }
-
-        if (_causalConsistency) {
-            this.nodes[n].setCausalConsistency(true);
-        }
-
-        return this.nodes[n];
+        return this._waitForInitialConnection(n, waitForHealth);
     }));
 
     /**
@@ -2586,9 +2667,11 @@ var ReplSetTest = function(opts) {
      * @param {Object} [extraOptions={}]
      * @param {boolean} [extraOptions.forRestart=false] indicates whether stop() is being called
      * with the intent to call start() with restart=true for the same node(s) n.
+     * @param {boolean} [extraOptions.waitPid=true] if true, we will wait for the process to
+     * terminate after stopping it.
      */
     this.stop = _nodeParamToSingleNode(_nodeParamToConn(function(
-        n, signal, opts, {forRestart: forRestart = false} = {}) {
+        n, signal, opts, {forRestart: forRestart = false, waitpid: waitPid = true} = {}) {
         // Can specify wait as second parameter, if using default signal
         if (signal == true || signal == false) {
             signal = undefined;
@@ -2597,11 +2680,15 @@ var ReplSetTest = function(opts) {
         n = this.getNodeId(n);
 
         var conn = _useBridge ? _unbridgedNodes[n] : this.nodes[n];
-        print('ReplSetTest stop *** Shutting down mongod in port ' + conn.port + ' ***');
-        var ret = MongoRunner.stopMongod(conn, signal, opts);
+        print('ReplSetTest stop *** Shutting down mongod in port ' + conn.port +
+              ', wait for process termination: ' + waitPid + ' ***');
+        var ret = MongoRunner.stopMongod(conn, signal, opts, waitPid);
 
-        print('ReplSetTest stop *** Mongod in port ' + conn.port + ' shutdown with code (' + ret +
-              ') ***');
+        // We only expect the process to have terminated if we actually called 'waitpid'.
+        if (waitPid) {
+            print('ReplSetTest stop *** Mongod in port ' + conn.port + ' shutdown with code (' +
+                  ret + ') ***');
+        }
 
         if (_useBridge && !forRestart) {
             // We leave the mongobridge process running when the mongod process is being restarted.
@@ -2614,6 +2701,25 @@ var ReplSetTest = function(opts) {
 
         return ret;
     }));
+
+    /**
+     * Performs collection validation on all nodes in the given 'ports' array in parallel.
+     *
+     * @param {int[]} ports the array of mongo ports to run validation on
+     */
+    this.validateNodes = function(ports) {
+        // Perform collection validation on each node in parallel.
+        let validators = [];
+        for (let i = 0; i < ports.length; i++) {
+            let validator = new Thread(MongoRunner.validateCollectionsCallback, this.ports[i]);
+            validators.push(validator);
+            validators[i].start();
+        }
+        // Wait for all validators to finish.
+        for (let i = 0; i < ports.length; i++) {
+            validators[i].join();
+        }
+    };
 
     /**
      * Kill all members of this replica set.
@@ -2671,11 +2777,33 @@ var ReplSetTest = function(opts) {
             });
         }
 
-        print("ReplSetTest stopSet stopping all replica set nodes.");
         let startTime = new Date();  // Measure the execution time of shutting down nodes.
-        for (var i = 0; i < this.ports.length; i++) {
-            this.stop(i, signal, opts);
+
+        // Optionally validate collections on all nodes.
+        if (opts && opts.skipValidation) {
+            print("ReplSetTest stopSet skipping validation before stopping nodes.");
+        } else {
+            print("ReplSetTest stopSet validating all replica set nodes before stopping them.");
+            this.validateNodes(this.ports);
         }
+
+        // Stop all nodes without waiting for them to terminate. We also skip validation since we
+        // have already done it above.
+        opts = Object.merge(opts, {skipValidation: true});
+        for (let i = 0; i < this.ports.length; i++) {
+            this.stop(i, signal, opts, {waitpid: false});
+        }
+
+        // Wait for all processes to terminate.
+        for (let i = 0; i < this.ports.length; i++) {
+            let conn = _useBridge ? _unbridgedNodes[i] : this.nodes[i];
+            let port = parseInt(conn.port);
+            print("ReplSetTest stopSet waiting for mongo program on port " + port + " to stop.");
+            let exitCode = waitMongoProgram(port);
+            print("ReplSetTest stopSet mongo program on port " + port + " shut down with code " +
+                  exitCode);
+        }
+
         print("ReplSetTest stopSet stopped all replica set nodes, took " +
               (new Date() - startTime) + "ms for " + this.ports.length + " nodes.");
 

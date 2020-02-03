@@ -23,15 +23,19 @@ import yaml
 from git import Repo
 from evergreen.api import RetryingEvergreenApi, EvergreenApi
 from shrub.config import Configuration
+from shrub.variant import DisplayTaskDefinition
 
 # Get relative imports to work when the package is not installed on the PYTHONPATH.
 if __name__ == "__main__" and __package__ is None:
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # pylint: disable=wrong-import-position
+import buildscripts.evergreen_gen_multiversion_tests as gen_multiversion
+import buildscripts.evergreen_generate_resmoke_tasks as gen_resmoke
 from buildscripts.patch_builds.change_data import find_changed_files
 import buildscripts.resmokelib.parser
-from buildscripts.resmokelib.suitesconfig import create_test_membership_map, get_suites
+from buildscripts.resmokelib.suitesconfig import create_test_membership_map, get_suites, \
+    get_named_suites_with_root_level_key_and_value
 from buildscripts.resmokelib.utils import default_if_none, globstar
 from buildscripts.ciconfig.evergreen import parse_evergreen_file, ResmokeArgs, \
     EvergreenProjectConfig, VariantTask
@@ -68,6 +72,10 @@ SUPPORTED_TEST_KINDS = ("fsm_workload_test", "js_test", "json_schema_test",
 BURN_IN_TESTS_GEN_TASK = "burn_in_tests_gen"
 BURN_IN_TESTS_TASK = "burn_in_tests"
 
+MULTIVERSION_CONFIG_KEY = gen_multiversion.BURN_IN_CONFIG_KEY
+MULTIVERSION_TAG = gen_multiversion.PASSTHROUGH_TAG
+BURN_IN_MULTIVERSION_TASK = gen_multiversion.BURN_IN_TASK
+
 
 class RepeatConfig(object):
     """Configuration for how tests should be repeated."""
@@ -88,25 +96,30 @@ class RepeatConfig(object):
         self.repeat_tests_max = repeat_tests_max
         self.repeat_tests_num = repeat_tests_num
 
-    def validate(self):
+    def validate(self, use_multiversion=False):
         """
         Raise an exception if this configuration is invalid.
 
         :return: self.
         """
-        if self.repeat_tests_num and self.repeat_tests_secs:
-            raise ValueError("Cannot specify --repeat-tests and --repeat-tests-secs")
+        if use_multiversion:
+            if (self.repeat_tests_num or self.repeat_tests_min or self.repeat_tests_max
+                    or self.repeat_tests_num):
+                raise ValueError(
+                    "Cannot specify a repeat configuration when --use-multiversion is true.")
+        else:
+            if self.repeat_tests_num and self.repeat_tests_secs:
+                raise ValueError("Cannot specify --repeat-tests and --repeat-tests-secs")
 
-        if self.repeat_tests_max:
-            if not self.repeat_tests_secs:
-                raise ValueError("Must specify --repeat-tests-secs with --repeat-tests-max")
+            if self.repeat_tests_max:
+                if not self.repeat_tests_secs:
+                    raise ValueError("Must specify --repeat-tests-secs with --repeat-tests-max")
 
-            if self.repeat_tests_min and self.repeat_tests_min > self.repeat_tests_max:
-                raise ValueError("--repeat-tests-secs-min is greater than --repeat-tests-max")
+                if self.repeat_tests_min and self.repeat_tests_min > self.repeat_tests_max:
+                    raise ValueError("--repeat-tests-secs-min is greater than --repeat-tests-max")
 
-        if self.repeat_tests_min and not self.repeat_tests_secs:
-            raise ValueError("Must specify --repeat-tests-secs with --repeat-tests-min")
-
+            if self.repeat_tests_min and not self.repeat_tests_secs:
+                raise ValueError("Must specify --repeat-tests-secs with --repeat-tests-min")
         return self
 
     def generate_resmoke_options(self) -> str:
@@ -138,7 +151,9 @@ class GenerateConfig(object):
     """Configuration for how to generate tasks."""
 
     def __init__(self, build_variant: str, project: str, run_build_variant: Optional[str] = None,
-                 distro: Optional[str] = None):
+                 distro: Optional[str] = None, task_id: Optional[str] = None,
+                 use_multiversion: bool = False):
+        # pylint: disable=too-many-arguments,too-many-locals
         """
         Create a GenerateConfig.
 
@@ -146,11 +161,15 @@ class GenerateConfig(object):
         :param project: Project to run tasks on.
         :param run_build_variant: Build variant to run new tasks on.
         :param distro: Distro to run tasks on.
+        :param task_id: Evergreen task being run under.
+        :param use_multiversion: Should multiversion tests be generated.
         """
         self.build_variant = build_variant
         self._run_build_variant = run_build_variant
         self.distro = distro
         self.project = project
+        self.task_id = task_id
+        self.use_multiversion = use_multiversion
 
     @property
     def run_build_variant(self):
@@ -159,15 +178,17 @@ class GenerateConfig(object):
             return self._run_build_variant
         return self.build_variant
 
-    def validate(self, evg_conf: EvergreenProjectConfig):
+    def validate(self, evg_conf: EvergreenProjectConfig, local_mode: bool = False):
         """
         Raise an exception if this configuration is invalid.
 
         :param evg_conf: Evergreen configuration.
+        :param local_mode: Run burn_in in local mode.
         :return: self.
         """
         self._check_variant(self.build_variant, evg_conf)
-
+        if self.use_multiversion:
+            _validate_multiversion_config(local_mode)
         return self
 
     @staticmethod
@@ -180,6 +201,16 @@ class GenerateConfig(object):
         """
         if not evg_conf.get_variant(build_variant):
             raise ValueError(f"Build variant '{build_variant}' not found in Evergreen file")
+
+
+def _validate_multiversion_config(local_mode: bool):
+    """
+    Check that the burn_in_tests_multiversion task can not be run in local mode.
+
+    :param local_mode: The value of the --local flag.
+    """
+    if local_mode:
+        raise ValueError("Cannot specify both --local and --use-multiversion together.")
 
 
 def _is_file_a_test_file(file_path: str) -> bool:
@@ -414,7 +445,7 @@ def _set_resmoke_cmd(repeat_config: RepeatConfig, resmoke_args: [str]) -> [str]:
     return new_args
 
 
-def _parse_avg_test_runtime(test: str, task_avg_test_runtime_stats: TestStats) -> Optional[float]:
+def _parse_avg_test_runtime(test: str, task_avg_test_runtime_stats: [TestStats]) -> Optional[float]:
     """
     Parse list of teststats to find runtime for particular test.
 
@@ -463,7 +494,7 @@ def _calculate_exec_timeout(repeat_config: RepeatConfig, avg_test_runtime: float
 
 
 def _generate_timeouts(repeat_config: RepeatConfig, test: str,
-                       task_avg_test_runtime_stats: TestStats) -> TimeoutInfo:
+                       task_avg_test_runtime_stats: [TestStats]) -> TimeoutInfo:
     """
     Add timeout.update command to list of commands for a burn in execution task.
 
@@ -568,6 +599,62 @@ def create_generate_tasks_config(evg_config: Configuration, tests_by_task: Dict,
     return evg_config
 
 
+def create_multiversion_generate_tasks_config(evg_config: Configuration, tests_by_task: Dict,
+                                              evg_api: EvergreenApi,
+                                              generate_config: GenerateConfig) -> Configuration:
+    """
+    Create the multiversion config for the Evergreen generate.tasks file.
+
+    :param evg_config: Shrub configuration to add to.
+    :param tests_by_task: Dictionary of tests to generate tasks for.
+    :param evg_api: Evergreen API.
+    :param generate_config: Configuration of what to generate.
+    :return: Shrub configuration with added tasks.
+    """
+
+    dt = DisplayTaskDefinition(BURN_IN_MULTIVERSION_TASK)
+
+    if tests_by_task:
+        multiversion_suites = get_named_suites_with_root_level_key_and_value(
+            MULTIVERSION_CONFIG_KEY, True)
+        for suite in multiversion_suites:
+            idx = 0
+            if suite not in tests_by_task.keys():
+                # Only generate burn in multiversion tasks for suites that would run the detected
+                # changed tests.
+                continue
+            LOGGER.debug("Generating multiversion suite", suite=suite)
+
+            # We hardcode the number of fallback sub suites and the target resmoke time here
+            # since burn_in_tests cares about individual tests and not entire suites. The config
+            # options here are purely used to generate the proper multiversion suites to run
+            # tests against.
+            config_options = {
+                "suite": suite,
+                "fallback_num_sub_suites": 1,
+                "project": generate_config.project,
+                "build_variant": generate_config.build_variant,
+                "task_id": generate_config.task_id,
+                "task_name": suite,
+                "target_resmoke_time": 60,
+            }
+            config_options.update(gen_resmoke.DEFAULT_CONFIG_VALUES)
+
+            config_generator = gen_multiversion.EvergreenConfigGenerator(
+                evg_api, evg_config, gen_resmoke.ConfigOptions(config_options))
+            test_list = tests_by_task[suite]["tests"]
+            for test in test_list:
+                # Generate the multiversion tasks for each test.
+                config_generator.generate_evg_tasks(test, idx)
+                idx += 1
+            dt.execution_tasks(config_generator.task_names)
+            evg_config.variant(generate_config.build_variant).tasks(config_generator.task_specs)
+
+    dt.execution_task(f"{BURN_IN_MULTIVERSION_TASK}_gen")
+    evg_config.variant(generate_config.build_variant).display_task(dt)
+    return evg_config
+
+
 def create_task_list_for_tests(
         changed_tests: Set[str], build_variant: str, evg_conf: EvergreenProjectConfig,
         exclude_suites: Optional[List] = None, exclude_tasks: Optional[List] = None) -> Dict:
@@ -586,8 +673,6 @@ def create_task_list_for_tests(
     if not exclude_tasks:
         exclude_tasks = []
 
-    # Populate the config values that get_suites reads
-    buildscripts.resmokelib.parser.set_options()
     suites = get_suites(suite_files=SUITE_FILES, test_files=changed_tests)
     LOGGER.debug("Found suites to run", suites=suites)
 
@@ -610,6 +695,7 @@ def create_tests_by_task(build_variant: str, repo: Repo, evg_conf: EvergreenProj
     exclude_suites, exclude_tasks, exclude_tests = find_excludes(SELECTOR_FILE)
     changed_tests = filter_tests(changed_tests, exclude_tests)
 
+    buildscripts.resmokelib.parser.set_options()
     if changed_tests:
         return create_task_list_for_tests(changed_tests, build_variant, evg_conf, exclude_suites,
                                           exclude_tasks)
@@ -634,9 +720,14 @@ def create_generate_tasks_file(tests_by_task: Dict, generate_config: GenerateCon
     :returns: Configuration to pass to 'generate.tasks'.
     """
     evg_config = Configuration()
-    evg_config = create_generate_tasks_config(
-        evg_config, tests_by_task, generate_config, repeat_config, evg_api,
-        include_gen_task=include_gen_task, task_prefix=task_prefix)
+    if generate_config.use_multiversion:
+        evg_config = create_multiversion_generate_tasks_config(evg_config, tests_by_task, evg_api,
+                                                               generate_config)
+    else:
+        evg_config = create_generate_tasks_config(
+            evg_config, tests_by_task, generate_config, repeat_config, evg_api,
+            include_gen_task=include_gen_task, task_prefix=task_prefix)
+
     json_config = evg_config.to_map()
     tasks_to_create = len(json_config.get('tasks', []))
     if tasks_to_create > MAX_TASKS_TO_CREATE:
@@ -697,6 +788,47 @@ def _get_evg_api(evg_api_config: str, local_mode: bool) -> Optional[EvergreenApi
     return None
 
 
+def burn_in(repeat_config: RepeatConfig, generate_config: GenerateConfig, resmoke_args: str,
+            generate_tasks_file: str, no_exec: bool, evg_conf: EvergreenProjectConfig, repo: Repo,
+            evg_api: EvergreenApi):
+    """
+    Run burn_in_tests with the given configuration.
+
+    :param repeat_config: Config on how much to repeat tests.
+    :param generate_config: Config on how to generate tests.
+    :param resmoke_args: Arguments to pass to resmoke.
+    :param generate_tasks_file: File to write generated config to.
+    :param no_exec: Do not execute tests, just discover tests to run.
+    :param evg_conf: Evergreen configuration.
+    :param repo: Git repository.
+    :param evg_api: Evergreen API client.
+    """
+    # Populate the config values in order to use the helpers from resmokelib.suitesconfig.
+    resmoke_cmd = _set_resmoke_cmd(repeat_config, list(resmoke_args))
+
+    tests_by_task = create_tests_by_task(generate_config.build_variant, repo, evg_conf)
+    LOGGER.debug("tests and tasks found", tests_by_task=tests_by_task)
+
+    if generate_tasks_file:
+        if generate_config.use_multiversion:
+            multiversion_tasks = evg_conf.get_task_names_by_tag(MULTIVERSION_TAG)
+            LOGGER.debug("Multiversion tasks by tag", tasks=multiversion_tasks,
+                         tag=MULTIVERSION_TAG)
+            # We expect the number of suites with MULTIVERSION_TAG to be the same as in
+            # multiversion_suites. Multiversion passthrough suites must include BURN_IN_CONFIG_KEY
+            # as a root level key and must be set to true.
+            multiversion_suites = get_named_suites_with_root_level_key_and_value(
+                MULTIVERSION_CONFIG_KEY, True)
+            assert len(multiversion_tasks) == len(multiversion_suites)
+        json_config = create_generate_tasks_file(tests_by_task, generate_config, repeat_config,
+                                                 evg_api)
+        _write_json_file(json_config, generate_tasks_file)
+    elif not no_exec:
+        run_tests(tests_by_task, resmoke_cmd)
+    else:
+        LOGGER.info("Not running tests due to 'no_exec' option.")
+
+
 @click.command()
 @click.option("--no-exec", "no_exec", default=False, is_flag=True,
               help="Do not execute the found tests.")
@@ -723,11 +855,15 @@ def _get_evg_api(evg_api_config: str, local_mode: bool) -> Optional[EvergreenApi
 @click.option("--local", "local_mode", default=False, is_flag=True,
               help="Local mode. Do not call out to evergreen api.")
 @click.option("--verbose", "verbose", default=False, is_flag=True, help="Enable extra logging.")
+@click.option("--use-multiversion", "use_multiversion", default=False, is_flag=True,
+              help="Generate burn in tests for multiversion passthrough suites only.")
+@click.option("--task_id", "task_id", default=None, metavar='TASK_ID',
+              help="The evergreen task id.")
 @click.argument("resmoke_args", nargs=-1, type=click.UNPROCESSED)
 # pylint: disable=too-many-arguments,too-many-locals
 def main(build_variant, run_build_variant, distro, project, generate_tasks_file, no_exec,
          repeat_tests_num, repeat_tests_min, repeat_tests_max, repeat_tests_secs, resmoke_args,
-         local_mode, evg_api_config, verbose):
+         local_mode, evg_api_config, verbose, use_multiversion, task_id):
     """
     Run new or changed tests in repeated mode to validate their stability.
 
@@ -737,6 +873,13 @@ def main(build_variant, run_build_variant, distro, project, generate_tasks_file,
     The `--repeat-*` arguments allow configuration of how burn_in_tests repeats tests. Tests can
     either be repeated a specified number of times with the `--repeat-tests` option, or they can
     be repeated for a certain time period with the `--repeat-tests-secs` option.
+
+    When the `--use-multiversion` flag is set to True, burn_in_tests will run new or changed tests
+    against the appropriate generated multiversion suites. The purpose of these tests are to signal
+    bugs in the generated multiversion suites as these tasks are excluded from the required build
+    variants and are only run in certain daily build variants. As such, we only expect the burn-in
+    multiversion tests to be run once for each binary version configuration, and `--repeat-*`
+    arguments should be None when `--use-multiversion` is True.
 
     There are two modes that burn_in_tests can run in:
 
@@ -775,26 +918,21 @@ def main(build_variant, run_build_variant, distro, project, generate_tasks_file,
     repeat_config = RepeatConfig(repeat_tests_secs=repeat_tests_secs,
                                  repeat_tests_min=repeat_tests_min,
                                  repeat_tests_max=repeat_tests_max,
-                                 repeat_tests_num=repeat_tests_num).validate()  # yapf: disable
+                                 repeat_tests_num=repeat_tests_num)  # yapf: disable
+    repeat_config.validate(use_multiversion)
     generate_config = GenerateConfig(build_variant=build_variant,
                                      run_build_variant=run_build_variant,
                                      distro=distro,
-                                     project=project).validate(evg_conf)  # yapf: disable
+                                     project=project,
+                                     task_id=task_id,
+                                     use_multiversion=use_multiversion)  # yapf: disable
+    generate_config.validate(evg_conf, local_mode)
+
     evg_api = _get_evg_api(evg_api_config, local_mode)
     repo = Repo(".")
-    resmoke_cmd = _set_resmoke_cmd(repeat_config, list(resmoke_args))
 
-    tests_by_task = create_tests_by_task(build_variant, repo, evg_conf)
-    LOGGER.debug("tests and tasks found", tests_by_task=tests_by_task)
-
-    if generate_tasks_file:
-        json_config = create_generate_tasks_file(tests_by_task, generate_config, repeat_config,
-                                                 evg_api)
-        _write_json_file(json_config, generate_tasks_file)
-    elif not no_exec:
-        run_tests(tests_by_task, resmoke_cmd)
-    else:
-        LOGGER.info("Not running tests due to 'no_exec' option.")
+    burn_in(repeat_config, generate_config, resmoke_args, generate_tasks_file, no_exec, evg_conf,
+            repo, evg_api)
 
 
 if __name__ == "__main__":

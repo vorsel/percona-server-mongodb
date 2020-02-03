@@ -99,6 +99,8 @@ namespace repl {
 MONGO_FAIL_POINT_DEFINE(stepdownHangBeforePerformingPostMemberStateUpdateActions);
 MONGO_FAIL_POINT_DEFINE(holdStableTimestampAtSpecificTimestamp);
 MONGO_FAIL_POINT_DEFINE(stepdownHangBeforeRSTLEnqueue);
+// Fail setMaintenanceMode with ErrorCodes::NotSecondary to simulate a concurrent election.
+MONGO_FAIL_POINT_DEFINE(setMaintenanceModeFailsWithNotSecondary);
 
 // Number of times we tried to go live as a secondary.
 Counter64 attemptsToBecomeSecondary;
@@ -414,6 +416,10 @@ bool ReplicationCoordinatorImpl::_startLoadLocalConfig(OperationContext* opCtx) 
     // Create necessary replication collections to guarantee that if a checkpoint sees data after
     // initial sync has completed, it also sees these collections.
     fassert(50708, _replicationProcess->getConsistencyMarkers()->createInternalCollections(opCtx));
+
+    // Ensure (update if needed) the in-memory count for the oplogTruncateAfterPoint collection
+    // matches the collection contents.
+    _replicationProcess->getConsistencyMarkers()->ensureFastCountOnOplogTruncateAfterPoint(opCtx);
 
     _replicationProcess->getConsistencyMarkers()->initializeMinValidDocument(opCtx);
 
@@ -2481,7 +2487,8 @@ Status ReplicationCoordinatorImpl::setMaintenanceMode(bool activate) {
     }
 
     stdx::unique_lock<Latch> lk(_mutex);
-    if (_topCoord->getRole() == TopologyCoordinator::Role::kCandidate) {
+    if (_topCoord->getRole() == TopologyCoordinator::Role::kCandidate ||
+        MONGO_unlikely(setMaintenanceModeFailsWithNotSecondary.shouldFail())) {
         return Status(ErrorCodes::NotSecondary, "currently running for election");
     }
 
@@ -2989,8 +2996,10 @@ void ReplicationCoordinatorImpl::_performPostMemberStateUpdateAction(
             _externalState->closeConnections();
         /* FALLTHROUGH */
         case kActionSteppedDown:
+            // This code must be safe to run on node rollback and node removal!
             _externalState->shardingOnStepDownHook();
             _externalState->stopNoopWriter();
+            _externalState->clearOplogVisibilityStateForStepDown();
             break;
         case kActionStartSingleNodeElection:
             // In protocol version 1, single node replset will run an election instead of

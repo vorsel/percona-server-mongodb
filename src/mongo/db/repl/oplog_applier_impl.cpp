@@ -365,18 +365,25 @@ OplogApplierImpl::OplogApplierImpl(executor::TaskExecutor* executor,
       _writerPool(writerPool),
       _storageInterface(storageInterface),
       _consistencyMarkers(consistencyMarkers),
-      _beginApplyingOpTime(options.beginApplyingOpTime) {}
-
-void OplogApplierImpl::_run(OplogBuffer* oplogBuffer) {
+      _beginApplyingOpTime(options.beginApplyingOpTime) {
     auto getNextApplierBatchFn = [this](OperationContext* opCtx, const BatchLimits& batchLimits) {
         return getNextApplierBatch(opCtx, batchLimits);
     };
 
+    _opQueueBatcher = std::make_unique<OpQueueBatcher>(
+        this, _storageInterface, oplogBuffer, getNextApplierBatchFn);
+}
+
+void OplogApplierImpl::_run(OplogBuffer* oplogBuffer) {
+    // Start up a thread from the batcher to pull from the oplog buffer into the batcher's oplog
+    // queue.
+    _opQueueBatcher->startup();
+
+    ON_BLOCK_EXIT([this] { _opQueueBatcher->shutdown(); });
+
     // We don't start data replication for arbiters at all and it's not allowed to reconfig
     // arbiterOnly field for any member.
     invariant(!_replCoord->getMemberState().arbiter());
-
-    OpQueueBatcher batcher(this, _storageInterface, oplogBuffer, getNextApplierBatchFn);
 
     std::unique_ptr<ApplyBatchFinalizer> finalizer{
         getGlobalServiceContext()->getStorageEngine()->isDurable()
@@ -406,7 +413,7 @@ void OplogApplierImpl::_run(OplogBuffer* oplogBuffer) {
 
         // Blocks up to a second waiting for a batch to be ready to apply. If one doesn't become
         // ready in time, we'll loop again so we can do the above checks periodically.
-        OpQueue ops = batcher.getNextBatch(Seconds(1));
+        OpQueue ops = _opQueueBatcher->getNextBatch(Seconds(1));
         if (ops.empty()) {
             if (ops.mustShutdown()) {
                 // Shut down and exit oplog application loop.
@@ -562,8 +569,6 @@ StatusWith<OpTime> OplogApplierImpl::_applyOplogBatch(OperationContext* opCtx,
     // entries from the oplog until we finish writing.
     Lock::ParallelBatchWriterMode pbwm(opCtx->lockState());
 
-    // TODO (SERVER-42996): This is a temporary invariant to protect against segfaults. This will
-    // be removed once ApplierState is moved from ReplicationCoordinator to OplogApplier.
     invariant(_replCoord);
     if (_replCoord->getApplierState() == ReplicationCoordinator::ApplierState::Stopped) {
         severe() << "attempting to replicate ops while primary";
@@ -665,11 +670,13 @@ StatusWith<OpTime> OplogApplierImpl::_applyOplogBatch(OperationContext* opCtx,
         }
     }
 
-    // Notify the storage engine that a replication batch has completed. This means that all the
-    // writes associated with the oplog entries in the batch are finished and no new writes with
-    // timestamps associated with those oplog entries will show up in the future.
+    // Tell the storage engine to flush the journal now that a replication batch has completed. This
+    // means that all the writes associated with the oplog entries in the batch are finished and no
+    // new writes with timestamps associated with those oplog entries will show up in the future. We
+    // want to flush the journal as soon as possible in order to free ops waiting with 'j' write
+    // concern.
     const auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
-    storageEngine->replicationBatchIsComplete();
+    storageEngine->triggerJournalFlush();
 
     // Use this fail point to hold the PBWM lock and prevent the batch from completing.
     if (MONGO_unlikely(pauseBatchApplicationBeforeCompletion.shouldFail())) {

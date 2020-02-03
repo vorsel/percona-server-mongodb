@@ -87,14 +87,14 @@ void LogicalSessionCacheImpl::joinOnShutDown() {
 Status LogicalSessionCacheImpl::startSession(OperationContext* opCtx,
                                              const LogicalSessionRecord& record) {
     stdx::lock_guard lg(_mutex);
-    return _addToCache(lg, record);
+    return _addToCacheIfNotFull(lg, record);
 }
 
 Status LogicalSessionCacheImpl::vivify(OperationContext* opCtx, const LogicalSessionId& lsid) {
     stdx::lock_guard lg(_mutex);
     auto it = _activeSessions.find(lsid);
     if (it == _activeSessions.end())
-        return _addToCache(lg, makeLogicalSessionRecord(opCtx, lsid, _service->now()));
+        return _addToCacheIfNotFull(lg, makeLogicalSessionRecord(opCtx, lsid, _service->now()));
 
     auto& cacheEntry = it->second;
     cacheEntry.setLastUse(_service->now());
@@ -102,17 +102,17 @@ Status LogicalSessionCacheImpl::vivify(OperationContext* opCtx, const LogicalSes
     return Status::OK();
 }
 
-Status LogicalSessionCacheImpl::refreshNow(Client* client) {
+Status LogicalSessionCacheImpl::refreshNow(OperationContext* opCtx) {
     try {
-        _refresh(client);
+        _refresh(opCtx->getClient());
     } catch (...) {
         return exceptionToStatus();
     }
     return Status::OK();
 }
 
-Status LogicalSessionCacheImpl::reapNow(Client* client) {
-    return _reap(client);
+void LogicalSessionCacheImpl::reapNow(OperationContext* opCtx) {
+    uassertStatusOK(_reap(opCtx->getClient()));
 }
 
 size_t LogicalSessionCacheImpl::size() {
@@ -166,22 +166,20 @@ Status LogicalSessionCacheImpl::_reap(Client* client) {
 
     try {
         ON_BLOCK_EXIT([&opCtx] { clearShardingOperationFailedStatus(opCtx); });
-
-        auto existsStatus = _sessionsColl->checkSessionsCollectionExists(opCtx);
-        if (!existsStatus.isOK()) {
+        try {
+            _sessionsColl->checkSessionsCollectionExists(opCtx);
+        } catch (const DBException& ex) {
             StringData notSetUpWarning =
                 "Sessions collection is not set up; "
                 "waiting until next sessions reap interval";
-            if (existsStatus.code() != ErrorCodes::NamespaceNotFound ||
-                existsStatus.code() != ErrorCodes::NamespaceNotSharded) {
-                log() << notSetUpWarning << ": " << existsStatus.reason();
+            if (ex.code() != ErrorCodes::NamespaceNotFound ||
+                ex.code() != ErrorCodes::NamespaceNotSharded) {
+                log() << notSetUpWarning << ": " << ex.reason();
             } else {
                 log() << notSetUpWarning;
             }
-
             return Status::OK();
         }
-
         numReaped = _reapSessionsOlderThanFn(opCtx,
                                              *_sessionsColl,
                                              _service->now() -
@@ -244,10 +242,9 @@ void LogicalSessionCacheImpl::_refresh(Client* client) {
 
     try {
         _sessionsColl->setupSessionsCollection(opCtx);
-
-    } catch (DBException& ex) {
-        log() << "Failed to refresh session cache: " << ex.reason()
-              << ", will try again at the next refresh interval";
+    } catch (const DBException& ex) {
+        log() << "Failed to refresh session cache, will try again at the next refresh interval"
+              << causedBy(redact(ex));
         return;
     }
 
@@ -299,7 +296,7 @@ void LogicalSessionCacheImpl::_refresh(Client* client) {
     }
 
     // Refresh the active sessions in the sessions collection.
-    uassertStatusOK(_sessionsColl->refreshSessions(opCtx, activeSessionRecords));
+    _sessionsColl->refreshSessions(opCtx, activeSessionRecords);
     activeSessionsBackSwapper.dismiss();
     {
         stdx::lock_guard<Latch> lk(_mutex);
@@ -307,7 +304,7 @@ void LogicalSessionCacheImpl::_refresh(Client* client) {
     }
 
     // Remove the ending sessions from the sessions collection.
-    uassertStatusOK(_sessionsColl->removeRecords(opCtx, explicitlyEndingSessions));
+    _sessionsColl->removeRecords(opCtx, explicitlyEndingSessions);
     explicitlyEndingBackSwaper.dismiss();
     {
         stdx::lock_guard<Latch> lk(_mutex);
@@ -334,14 +331,13 @@ void LogicalSessionCacheImpl::_refresh(Client* client) {
     }
 
     // think about pruning ending and active out of openCursorSessions
-    auto statusAndRemovedSessions = _sessionsColl->findRemovedSessions(opCtx, openCursorSessions);
+    try {
+        auto removedSessions = _sessionsColl->findRemovedSessions(opCtx, openCursorSessions);
 
-    if (statusAndRemovedSessions.isOK()) {
-        auto removedSessions = statusAndRemovedSessions.getValue();
         for (const auto& lsid : removedSessions) {
             patterns.emplace(makeKillAllSessionsByPattern(opCtx, lsid));
         }
-    } else {
+    } catch (...) {
         // Ignore errors.
     }
 
@@ -369,7 +365,7 @@ LogicalSessionCacheStats LogicalSessionCacheImpl::getStats() {
     return _stats;
 }
 
-Status LogicalSessionCacheImpl::_addToCache(WithLock, LogicalSessionRecord record) {
+Status LogicalSessionCacheImpl::_addToCacheIfNotFull(WithLock, LogicalSessionRecord record) {
     if (_activeSessions.size() >= size_t(maxSessions)) {
         Status status = {ErrorCodes::TooManyLogicalSessions,
                          str::stream()

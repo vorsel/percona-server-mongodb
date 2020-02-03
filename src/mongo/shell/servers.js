@@ -114,6 +114,10 @@ function pathJoin(...parts) {
  *     child processes started by `MongoRunner.runMongo*()` etc.
  */
 function runHangAnalyzer(pids) {
+    if (typeof TestData === 'undefined') {
+        print("Skipping runHangAnalyzer: no TestData (not running from resmoke)");
+        return;
+    }
     if (typeof pids === 'undefined') {
         pids = getPids();
     }
@@ -550,6 +554,8 @@ MongoRunner.mongoOptions = function(opts) {
         (!opts.restart && !opts.noRemember) || (opts.restart && opts.appendOptions);
     if (shouldRemember) {
         MongoRunner.savedOptions[opts.runId] = Object.merge(opts, {});
+        // We don't want to persist 'waitForConnect' across node restarts.
+        delete MongoRunner.savedOptions[opts.runId].waitForConnect;
     }
 
     if (jsTestOptions().networkMessageCompressors) {
@@ -912,11 +918,12 @@ MongoRunner.validateCollectionsCallback = function(port) {};
  *      skipValidation: <bool>,
  *      allowedExitCode: <int>
  *    }
+ * @param {boolean} waitpid should we wait for the process to terminate after stopping it.
  *
  * Note: The auth option is required in a authenticated mongod running in Windows since
  *  it uses the shutdown command, which requires admin credentials.
  */
-MongoRunner.stopMongod = function(conn, signal, opts) {
+MongoRunner.stopMongod = function(conn, signal, opts, waitpid) {
     if (!conn.pid) {
         throw new Error("first arg must have a `pid` property; " +
                         "it is usually the object returned from MongoRunner.runMongod/s");
@@ -929,6 +936,7 @@ MongoRunner.stopMongod = function(conn, signal, opts) {
 
     signal = parseInt(signal) || 15;
     opts = opts || {};
+    waitpid = (waitpid === undefined) ? true : waitpid;
 
     var allowedExitCode = MongoRunner.EXIT_CLEAN;
 
@@ -959,7 +967,12 @@ MongoRunner.stopMongod = function(conn, signal, opts) {
             MongoRunner.validateCollectionsCallback(port);
         }
 
-        returnCode = _stopMongoProgram(port, signal, opts);
+        returnCode = _stopMongoProgram(port, signal, opts, waitpid);
+    }
+
+    // If we are not waiting for shutdown, then there is no exit code to check.
+    if (!waitpid) {
+        return 0;
     }
     if (allowedExitCode !== returnCode) {
         throw new MongoRunner.StopError(returnCode);
@@ -1273,6 +1286,38 @@ function appendSetParameterArgs(argArray) {
 }
 
 /**
+ * Continuously tries to establish a connection to the server on the specified port.
+ *
+ * If a connection cannot be established within a time limit, an exception will be thrown. If the
+ * process for the given 'pid' is found to no longer be running, this function will terminate and
+ * return null.
+ *
+ * @param {int} [pid] the process id of the node to connect to.
+ * @param {int} [port] the port of the node to connect to.
+ * @returns a new Mongo connection object, or null if the process is not running.
+ */
+MongoRunner.awaitConnection = function(pid, port) {
+    var conn = null;
+    assert.soon(function() {
+        try {
+            conn = new Mongo("127.0.0.1:" + port);
+            conn.pid = pid;
+            return true;
+        } catch (e) {
+            var res = checkProgram(pid);
+            if (!res.alive) {
+                print("mongo program was not running at " + port +
+                      ", process ended with exit code: " + res.exitCode);
+                serverExitCodeMap[port] = res.exitCode;
+                return true;
+            }
+        }
+        return false;
+    }, "unable to connect to mongo program on port " + port, 600 * 1000);
+    return conn;
+};
+
+/**
  * Start a mongo process with a particular argument array.
  * If we aren't waiting for connect, return {pid: <pid>}.
  * If we are waiting for connect:
@@ -1293,31 +1338,14 @@ MongoRunner._startWithArgs = function(argArray, env, waitForConnect) {
 
     delete serverExitCodeMap[port];
     if (!waitForConnect) {
+        print("Skip waiting to connect to node with pid=" + pid + ", port=" + port);
         return {
             pid: pid,
             port: port,
         };
     }
 
-    var conn = null;
-    assert.soon(function() {
-        try {
-            conn = new Mongo("127.0.0.1:" + port);
-            conn.pid = pid;
-            return true;
-        } catch (e) {
-            var res = checkProgram(pid);
-            if (!res.alive) {
-                print("Could not start mongo program at " + port +
-                      ", process ended with exit code: " + res.exitCode);
-                serverExitCodeMap[port] = res.exitCode;
-                return true;
-            }
-        }
-        return false;
-    }, "unable to connect to mongo program on port " + port, 600 * 1000);
-
-    return conn;
+    return MongoRunner.awaitConnection(pid, port);
 };
 
 /**

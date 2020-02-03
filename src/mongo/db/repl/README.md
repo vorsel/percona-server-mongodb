@@ -57,13 +57,13 @@ satisfy write concerns.
 
 A secondary keeps its data synchronized with its sync source by fetching oplog entries from its sync
 source. This is done via the
-[`OplogFetcher`](https://github.com/mongodb/mongo/blob/r3.4.2/src/mongo/db/repl/oplog_fetcher.h).
+[`OplogFetcher`](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/db/repl/oplog_fetcher.h).
 
 The `OplogFetcher` first sends a `find` command to the sync source's oplog, and then follows with a
 series of `getMore`s on the cursor.
 
 The `OplogFetcher` makes use of the
-[`Fetcher`](https://github.com/mongodb/mongo/blob/r3.4.2/src/mongo/client/fetcher.h) for this task,
+[`Fetcher`](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/client/fetcher.h) for this task,
 which is a generic class used for fetching data from a collection on a remote node. A `Fetcher` is
 given a `find` command and then follows that command with `getMore` requests. The `Fetcher` also
 takes in a callback function that is called with the results of every batch.
@@ -92,8 +92,8 @@ the `Fetcher` with a new `find` command each time it receives an error for a max
 If it expires its retries then the `OplogFetcher` shuts down with an error status.
 
 The `OplogFetcher` is owned by the
-[`BackgroundSync`](https://github.com/mongodb/mongo/blob/r3.4.2/src/mongo/db/repl/bgsync.h) thread.
-The `BackgroundSync` thread runs continuously while a node is in SECONDARY state. `BackgroundSync`
+[`BackgroundSync`](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/db/repl/bgsync.h) thread.
+The `BackgroundSync` thread runs continuously while a node is in `SECONDARY` state. `BackgroundSync`
 sits in a loop, where each iteration it first chooses a sync source with the `SyncSourceResolver`
 and then starts up the `OplogFetcher`. When the `OplogFetcher` terminates, `BackgroundSync` restarts
 sync source selection, exits, or goes into ROLLBACK depending on the return status. The
@@ -111,12 +111,12 @@ state replication; there is a similar collection-backed buffer used for initial 
 Whenever a node starts initial sync, creates a new `BackgroundSync` (when it stops being primary),
 or errors on its current `OplogFetcher`, it must get a new sync source. Sync source selection is
 done by the
-[`SyncSourceResolver`](https://github.com/mongodb/mongo/blob/r3.4.2/src/mongo/db/repl/sync_source_resolver.h).
+[`SyncSourceResolver`](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/db/repl/sync_source_resolver.h).
 
 The `SyncSourceResolver` delegates the duty of choosing a "sync source candidate" to the
-[**`ReplicationCoordinator`**](https://github.com/mongodb/mongo/blob/r3.4.2/src/mongo/db/repl/replication_coordinator.h),
+[**`ReplicationCoordinator`**](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/db/repl/replication_coordinator.h),
 which in turn asks the
-[**`TopologyCoordinator`**](https://github.com/mongodb/mongo/blob/r3.4.2/src/mongo/db/repl/topology_coordinator.h)
+[**`TopologyCoordinator`**](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/db/repl/topology_coordinator.h)
 to choose a new sync source.
 
 #### Choosing a sync source candidate
@@ -134,10 +134,10 @@ Otherwise, it iterates through all of the nodes and sees which one is the best.
 * First the secondary checks the `TopologyCoordinator`'s cached view of the replica set for the
   latest OpTime known to be on the primary. Secondaries do not sync from nodes whose newest oplog
   entry is more than
-  [`maxSyncSourceLagSecs`](https://github.com/mongodb/mongo/blob/r3.4.2/src/mongo/db/repl/topology_coordinator_impl.cpp#L227-L240)
+  [`maxSyncSourceLagSecs`](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/db/repl/topology_coordinator.cpp#L302-L315)
   seconds behind the primary's newest oplog entry.
 * Secondaries then loop through each node and choose the closest node that satisfies [various
-  criteria](https://github.com/mongodb/mongo/blob/r3.4.2/src/mongo/db/repl/topology_coordinator_impl.cpp#L162-L363).
+  criteria](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/db/repl/topology_coordinator.cpp#L200-L438).
   “Closest” here is determined by the lowest ping time to each node.
 * If no node satisfies the necessary criteria, then the `BackgroundSync` waits 1 second and restarts
   the sync source selection process.
@@ -154,7 +154,7 @@ make sure it actually is able to fetch from the sync source candidate’s oplog.
   ahead.
 * During initial sync, rollback, or recovery from unclean shutdown, nodes will set a specific
   OpTime, **`minValid`**, that they must reach before it is safe to read from the node and before
-  the node can transition into SECONDARY state. If the secondary has a `minValid`, then the sync
+  the node can transition into `SECONDARY` state. If the secondary has a `minValid`, then the sync
   source candidate is checked for that `minValid` entry.
 * The sync source's **RollbackID** is also fetched to be checked after the first batch is returned
   by the `OplogFetcher`.
@@ -166,13 +166,11 @@ Otherwise, the secondary found a sync source! At that point `BackgroundSync` sta
 
 ### Oplog Entry Application
 
-A separate thread,
-[`RSDataSync`](https://github.com/mongodb/mongo/blob/r3.4.2/src/mongo/db/repl/rs_sync.h) is used for
-pulling oplog entries off of the oplog buffer and applying them. `RSDataSync` constructs a
-[`SyncTail`](https://github.com/mongodb/mongo/blob/r3.4.2/src/mongo/db/repl/sync_tail.h) in a loop
-which is used to actually apply the operations. The `SyncTail` instance does some oplog application,
-and terminates when there is a state change where we need to pause oplog application. After it
-terminates, `RSDataSync` loops back and decides if it should make a new `SyncTail` and continue.
+A separate thread, `RSDataSync` is used for pulling oplog entries off of the oplog buffer and
+applying them. `RSDataSync` constructs a `SyncTail` in a loop which is used to actually apply the
+operations. The `SyncTail` instance does some oplog application, and terminates when there is a state
+change where we need to pause oplog application. After it terminates, `RSDataSync` loops back and
+decides if it should make a new `SyncTail` and continue.
 
 `SyncTail` creates multiple threads that apply buffered oplog entries in parallel. Operations are
 pulled off of the oplog buffer in batches to be applied. Nodes keep track of their “last applied
@@ -188,7 +186,7 @@ The `ReplicationCoordinator` is the public api that replication presents to the 
 base. It is in charge of coordinating the interaction of replication with the rest of the system.
 
 The `ReplicationCoordinator` communicates with the storage layer and other nodes through the
-[`ReplicationCoordinatorExternalState`](https://github.com/mongodb/mongo/blob/r3.4.2/src/mongo/db/repl/replication_coordinator_external_state.h).
+[`ReplicationCoordinatorExternalState`](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/db/repl/replication_coordinator_external_state.h).
 The external state also manages and owns all of the replication threads.
 
 The `TopologyCoordinator` is in charge of maintaining state about the topology of the cluster. It is
@@ -204,7 +202,7 @@ Each node has a copy of the **`ReplicaSetConfig`** in the `ReplicationCoordinato
 nodes in the replica set. This config lets each node talk to every other node.
 
 Each node uses the internal client, the legacy c++ driver code in the
-[`src/mongo/client`](https://github.com/mongodb/mongo/tree/r3.4.2/src/mongo/client) directory, to
+[`src/mongo/client`](https://github.com/mongodb/mongo/tree/r4.2.0/src/mongo/client) directory, to
 talk to each other node. Nodes talk to each other by sending a mixture of external and internal
 commands over the same incoming port as user commands. All commands take the same code path as
 normal user commands. For security, nodes use the keyfile to authenticate to each other. You need to
@@ -333,10 +331,6 @@ take: no action, priority takeover, or reconfig,
 The `ReplicationCoordinator` then updates the `SlaveInfo` for the receiving node with its most
 recently acquired OpTimes.
 
-If the sending node is primary, this updates the commit point if the sending node sees that a
-majority of its nodes have reached a newer OpTime. Any threads blocking on a writeConcern are woken
-up to check if they now fulfill their requested writeConcern.
-
 The next heartbeat is scheduled and then the next action set by the `TopologyCoordinator` is
 executed.
 
@@ -345,20 +339,42 @@ assigns itself a priority takeover timeout proportional to its rank. After that 
 node will check if it's eligible to run for election and if so will begin an election. The timeout
 is simply: `(election timeout) * (priority rank + 1)`.
 
+### Commit Point Propagation
+
+The replication majority *commit point* refers to an OpTime such that all oplog entries with an
+OpTime earlier or equal to it have been replicated to a majority of nodes in the replica set. It is
+influenced by the [`lastApplied`](#replication-timestamp-glossary) and the
+[`lastDurable`](#replication-timestamp-glossary) OpTimes.
+
+On the primary, we advance the commit point by checking what the highest `lastApplied` or
+`lastDurable` is on a majority of the nodes. This OpTime must be greater than the current
+`commit point` for the primary to advance it. Any threads blocking on a writeConcern are woken up
+to check if they now fulfill their requested writeConcern.
+
+When `getWriteConcernMajorityShouldJournal` is set to true, the
+[`_lastCommittedOpTime`](#replication-timestamp-glossary) is set to the `lastDurable` OpTime. This
+means that the server acknowledges a write operation after a majority has written to the on-disk
+journal. Otherwise, `_lastCommittedOpTime` is set using the `lastApplied`.
+
+Secondaries advance their commit point via heartbeats by checking if the commit point is in the
+same term as their `lastApplied` OpTime. This ensures that the secondary is on the same branch of
+history as the commit point. Additionally, they can update their commit point via the spanning tree
+by taking the minimum of the learned commit point and their `lastApplied`.
+
 ### Update Position Commands
 
 The last way that replica set nodes regularly communicate with each other is through
 `replSetUpdatePosition` commands. The `ReplicationCoordinatorExternalState` creates a
-[**`SyncSourceFeedback`**](https://github.com/mongodb/mongo/blob/r3.4.2/src/mongo/db/repl/sync_source_feedback.h)
+[**`SyncSourceFeedback`**](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/db/repl/sync_source_feedback.h)
 object at startup that is responsible for sending `replSetUpdatePosition` commands.
 
 The `SyncSourceFeedback` starts a loop. In each iteration it first waits on a condition variable
 that is notified whenever the `ReplicationCoordinator` discovers that a node in the replica set has
-replicated more operations and become more up-to-date. It checks that it is not in PRIMARY or
+replicated more operations and become more up-to-date. It checks that it is not in `PRIMARY` or
 STARTUP state before moving on.
 
 It then gets the node's sync source and creates a
-[**`Reporter`**](https://github.com/mongodb/mongo/blob/r3.4.2/src/mongo/db/repl/reporter.h) that
+[**`Reporter`**](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/db/repl/reporter.h) that
 actually sends the `replSetUpdatePosition` command to the sync source. This command keeps getting
 sent every `keepAliveInterval` milliseconds (`(electionTimeout / 2)`) to maintain liveness
 information about the nodes in the replica set.
@@ -468,6 +484,47 @@ the local snapshot is beyond the specified OpTime. If read concern majority is s
 wait until the committed snapshot is beyond the specified OpTime. In 3.6 this feature will be
 extended to support a sharded cluster and use a **Lamport Clock** to provide **causal consistency**.
 
+# Concurrency Control
+
+## Parallel Batch Writer Mode
+
+The **Parallel Batch Writer Mode** lock (also known as the PBWM or the Peanut Butter Lock) is a
+global resource that helps manage the concurrency of running operations while a secondary is
+applying a batch of oplog entries. Since secondary oplog application applies batches in parallel,
+operations will not necessarily be applied in order, so a node will hold the PBWM while it is
+waiting for the entire batch to be applied. For secondaries, in order to read at a consistent state
+without needing the PBWM lock, a node will try to read at the
+[`lastApplied`](#replication-timestamp-glossary) timestamp. Since `lastApplied` is set after a batch
+is completed, it is guaranteed to be at a batch boundary. However, during initial sync there could
+be changes from a background index build that occur after the `lastApplied` timestamp. Since there
+is no guarantee that `lastApplied` will be advanced again, if a node sees that there are pending
+changes ahead of `lastApplied`, it will acquire the PBWM to make sure that there isn't an in-progress
+batch when reading, and read without a timestamp to ensure all writes are visible, including those
+later than the `lastApplied`.
+
+## Replication State Transition Lock
+
+When a node goes through state transitions, it needs something to manage the concurrency of that
+state transition with other ongoing operations. For example, a node that is stepping down used to be
+able to accept writes, but shouldn't be able to do so until it becomes primary again. As a result,
+there is the **Replication State Transition Lock** (or RSTL), a global resource that manages the
+concurrency of state transitions.
+
+It is acquired in exclusive mode for the following replication state transitions: `PRIMARY` to
+`SECONDARY` (step down), `SECONDARY` to `PRIMARY` (step up), `SECONDARY` to `ROLLBACK` (rollback),
+`ROLLBACK` to `SECONDARY`, and `SECONDARY` to `RECOVERING`. Operations can hold it when they need to
+ensure that the node won't go through any of the above state transitions. Some examples of
+operations that do this are preparing a transaction, committing or aborting a prepared transaction,
+and checking/setting if the node can accept writes or serve reads.
+
+## Global Lock Acquisition Ordering
+
+Both the PBWM and RSTL are global resources that must be acquired before the global lock is
+acquired. The node must first acquire the PBWM in [intent
+shared](https://docs.mongodb.com/manual/reference/glossary/#term-intent-lock) mode. Next, it must
+acquire the RSTL in intent exclusive mode. Only then can it acquire the global lock in its desired
+mode.
+
 # Elections
 
 ## Step Up
@@ -485,7 +542,7 @@ There are a number of ways that a node will run for election:
   longer than `catchUpTakeoverDelayMillis` (default 30 seconds), it will run for election. This
   behvarior is known as a **catchup takeover**. If primary catchup is taking too long, catchup
   takeover can help allow the replica set to accept writes sooner, since a more up-to-date node will
-  not spend as much time (or any time) in catchup. See the "Transitioning to PRIMARY" section for
+  not spend as much time (or any time) in catchup. See the "Transitioning to `PRIMARY`" section for
   further details on primary catchup.
 * The `replSetStepUp` command can be run on an eligible node to cause it to run for election
   immediately. We don't expect users to call this command, but it is run internally for election
@@ -545,14 +602,14 @@ the `local.replset.election` collection. This information is read into memory at
 future elections. This ensures that even if a node restarts, it does not vote for two nodes in the
 same term.
 
-### Transitioning to PRIMARY
+### Transitioning to `PRIMARY`
 
-Now that the candidate has won, it must become PRIMARY. First it clears its sync source and notifies
-all nodes that it won the election via a round of heartbeats. Then the node checks if it needs to
-catch up from the former primary. Since the node can be elected without the former primary's vote,
-the primary-elect will attempt to replicate any remaining oplog entries it has not yet replicated
-from any viable sync source. While these are guaranteed to not be committed, it is still good to
-minimize rollback when possible.
+Now that the candidate has won, it must become `PRIMARY`. First it clears its sync source and
+notifies all nodes that it won the election via a round of heartbeats. Then the node checks if it
+needs to catch up from the former primary. Since the node can be elected without the former
+primary's vote, the primary-elect will attempt to replicate any remaining oplog entries it has not
+yet replicated from any viable sync source. While these are guaranteed to not be committed, it is
+still good to minimize rollback when possible.
 
 The primary-elect uses the responses from the recent round of heartbeats to see the latest applied
 OpTime of every other node. If the primary-elect’s last applied OpTime is less than the newest last
@@ -569,8 +626,8 @@ best-effort, it could time out before the node has applied operations through th
 Even if this happens, the primary-elect will not step down.
 
 At this point, whether catchup was successful or not, the node goes into "drain mode". This is when
-the node has already logged "transition to PRIMARY", but has not yet applied all of the oplog
-entries in its oplog buffer. `replSetGetStatus` will now say the node is in PRIMARY state. The
+the node has already logged "transition to `PRIMARY`", but has not yet applied all of the oplog
+entries in its oplog buffer. `replSetGetStatus` will now say the node is in `PRIMARY` state. The
 applier keeps running, and when it completely drains the buffer, it signals to the
 `ReplicationCoordinator` to finish the step up process. The node marks that it can begin to accept
 writes. According to the Raft Protocol, we cannot update the commit point to reflect oplog entries
@@ -582,20 +639,62 @@ Finally, the node drops all temporary collections and logs “transition to prim
 
 ## Step Down
 
+### Conditional
+
+The `replSetStepDown` command is one way that a node relinquishes its position as primary. We
+consider this a conditional step down because it can fail if the following conditions are not met:
+* `force` is true and now > `waitUntil` deadline, which is the amount of time we will wait before
+stepping down (Note: If `force` is true, only this condition needs to be met)
+* The [`lastApplied`](#replication-timestamp-glossary) OpTime of the primary must be replicated to
+a majority of the nodes
+* At least one of the up-to-date secondaries is also electable
+
 When a `replSetStepDown` command comes in, the node begins to check if it can step down. First, the
-node kills all user operations and they return an error to the user. Then the node loops trying to
-step down. It repeatedly checks if a majority of nodes are caught up and if one of those caught up
-nodes is electable or if the user requested it to force a stepdown. It then begins to step down.
+node attempts to acquire the RSTL. In order to do so, it must kill all conflicting user/system
+operations and abort all unprepared transactions.
 
-Stepdowns also occur if a primary sees a higher term than themselves or if a primary stops being
-able to transitively communicate with a majority of nodes. The primary does not need to be able to
-communicate directly with a majority of nodes. If primary A can’t communicate with node B, but A can
-communicate with C which can communicate with B, that is okay. If you consider the minimum spanning
-tree on the cluster where edges are connections from nodes to their sync source, then as long as the
-primary is connected to a majority of nodes, it will stay primary.
+Now, the node loops trying to step down. If force is `false`, it repeatedly checks if a majority of
+nodes have reached the `lastApplied` optime, meaning that they are caught up. It must also check
+that at least one of those nodes is electable. If force is `true`, it does not wait for these
+conditions and steps down immediately after it reaches the `waitUntil` deadline.
 
-Once the node begins to step down, it first sets its state to `follower` in the
-`TopologyCoordinator`. It then transitioning to SECONDARY in the `ReplicationCoordinator`.
+Upon a successful stepdown, it yields locks held by prepared transactions because we are now a
+secondary. Finally, we log stepdown metrics and update our member state to `SECONDARY`.
+<!-- TODO SERVER-43781: Link to process for reconstructing prepared transactions -->
+
+### Unconditional
+
+Stepdowns can also occur for the following reasons:
+* If the primary learns of a higher term
+* Liveness timeout: If a primary stops being able to transitively communicate with a majority of
+nodes. The primary does not need to be able to communicate directly with a majority of nodes. If
+primary A can’t communicate with node B, but A can communicate with C which can communicate with B,
+that is okay. If you consider the minimum spanning tree on the cluster where edges are connections
+from nodes to their sync source, then as long as the primary is connected to a majority of nodes, it
+will stay primary.
+* Force reconfig via the `replSetReconfig` command
+* Force reconfig via heartbeat: If we learn of a newer config version through heartbeats, we will
+schedule a replica set config change.
+
+During unconditional stepdown, we do not check preconditions before attempting to step down. Similar
+to conditional stepdowns, we must kill any conflicting user/system operations before acquiring the
+RSTL and yield locks to prepared transactions following a successful stepdown.
+
+### Concurrent Stepdown Attempts
+
+It is possible to have concurrent conditional and unconditional stepdown attempts. In this case,
+the unconditional stepdown will supercede the conditional stepdown, which causes the conditional
+stepdown attempt to fail.
+
+Because concurrent unconditional stepdowns can cause conditional stepdowns to fail, we stop
+accepting writes once we confirm that we are allowed to step down. This way, if our stepdown
+attempt fails, we can release the RSTL and allow secondaries to catch up without new writes coming
+in.
+
+We try to prevent concurrent conditional stepdown attempts by setting `_leaderMode` to
+`kSteppingDown` in the `TopologyCoordinator`. By tracking the current stepdown state, we prevent
+another conditional stepdown attempt from occurring, but still allow unconditional attempts to
+supersede.
 
 # Rollback
 
@@ -614,9 +713,9 @@ rollback is not necessary if there are no uncommitted writes.
 As of 4.0, Replication supports the [`Recover To A Timestamp`](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/db/repl/rollback_impl.h#L158)
 algorithm (RTT), in which a node recovers to a consistent point in time and applies operations until
 it catches up to the sync source's branch of history. RTT uses the WiredTiger storage engine to
-recover to a stable timestamp, which is the highest timestamp at which the storage engine can take
-a checkpoint. This can be considered a consistent, majority committed point in time for replication
-and storage.
+recover to a [`stable_timestamp`](#replication-timestamp-glossary), which is the highest timestamp
+at which the storage engine can take a checkpoint. This can be considered a consistent, majority
+committed point in time for replication and storage.
 
 A node goes into rollback when its last fetched OpTime is greater than its sync source's last
 applied OpTime, but it is in a lower term. In this case, the `OplogFetcher` will return an empty
@@ -624,7 +723,7 @@ batch and fail with an `OplogStartMissing` error.
 
 During [rollback](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/db/repl/rollback_impl.cpp#L176),
 nodes first transition to the `ROLLBACK` state and kill all user operations to ensure that we can
-successfully acquire the RSTL. (TODO SERVER-43789: link to RSTL section) Reads are prohibited while
+successfully acquire [the RSTL](#replication-state-transition-lock). Reads are prohibited while
 we are in the `ROLLBACK` state.
 
 We then wait for background index builds to complete before finding the `common point` between the
@@ -650,23 +749,25 @@ in order to avoid unnecessary prepare conflicts when trying to read documents th
 those transactions, which must be aborted for rollback anyway. Finally, if we have rolled back any
 operations, we invalidate all sessions on this server.
 
-Now, we are ready to tell the storage engine to recover to the last stable timestamp. Upon success,
-the storage engine restores the data reflected in the database to the data reflected at the last
-stable timestamp. This does not, however, revert the oplog. In order to revert the oplog, rollback
-must remove all oplog entries after the `common point`. This is called the truncate point and is
-written into the `oplogTruncateAfterPoint` document. Now, the recovery process knows where to
+Now, we are ready to tell the storage engine to recover to the last `stable_timestamp`. Upon
+success, the storage engine restores the data reflected in the database to the data reflected at the
+last `stable_timestamp`. This does not, however, revert the oplog. In order to revert the oplog,
+rollback must remove all oplog entries after the `common point`. This is called the truncate point
+and is written into the `oplogTruncateAfterPoint` document. Now, the recovery process knows where to
 truncate the oplog on the rollback node.
 
 During the last few steps of the data modification section, we clear the state of the
 `DropPendingCollectionReaper`, which manages collections that are marked as drop-pending by the Two
 Phase Drop algorithm, and make sure it aligns with what is currently on disk. After doing so, we can
 run through the oplog recovery process, which truncates the oplog after the `common point` (at the
-truncate point) and applies all oplog entries through the end of the sync source's oplog.
+truncate point) and applies all oplog entries through the end of the sync source's oplog. See the
+[Startup Recovery](#startup-recovery) section for more information on truncating the oplog and
+applying oplog entries.
 
 The last thing we do before exiting the data modification section is reconstruct prepared
-transactions. (TODO SERVER-43783: add link to prepared transactions recovery process). We must also
-restore their in-memory state to what it was prior to the rollback in order to fulfill the
-durability guarantees of prepared transactions.
+transactions. We must also restore their in-memory state to what it was prior to the rollback in
+order to fulfill the durability guarantees of prepared transactions.
+<!-- TODO SERVER-43783: Link to process for reconstructing prepared transactions -->
 
 At this point, the last applied and durable OpTimes still point to the divergent branch of history,
 so we must update them to be at the top of the oplog, which should be the `common point`.
@@ -701,15 +802,20 @@ Before the data clone phase begins, the node will do the following:
 3. Drop all of its data except for the local database and recreate the oplog.
 4. Get the Rollback ID (RBID) from the sync source to ensure at the end that no rollbacks occurred
    during initial sync.
-5. Query its sync source's transactions table for the oldest starting OpTime of all active
-   transactions. This will be the `beginFetchingTimestamp` or the timestamp that it begins fetching
-   oplog entries from, so that the node will have the oplog entries for all active transactions in
-   its oplog.
-6. Query its sync source's oplog for its lastest OpTime. This will be the `beginApplyingTimestamp`,
+5. Query its sync source's oplog for its latest OpTime and save it as the
+   `defaultBeginFetchingOpTime`. If there are no open transactions on the sync source, this will be
+   used as the `beginFetchingTimestamp` or the timestamp that it begins fetching oplog entries from.
+6. Query its sync source's transactions table for the oldest starting OpTime of all active
+   transactions. If this timestamp exists (meaning there is an open transaction on the sync source)
+   this will be used as the `beginFetchingTimestamp`. If this timestamp doesn't exist, the node will
+   use the `defaultBeginFetchingOpTime` instead. This will ensure that even if a transaction was
+   started on the sync source after it was queried for the oldest active transaction timestamp, the
+   syncing node will have all the oplog entries associated with an active transaction in its oplog.
+7. Query its sync source's oplog for its lastest OpTime. This will be the `beginApplyingTimestamp`,
    or the timestamp that it begins applying oplog entries at once it has completed the data clone
    phase. If there was no active transaction on the sync source, the `beginFetchingTimestamp` will
    be the same as the `beginApplyingTimestamp`.
-7. Create an `OplogFetcher` and start fetching and buffering oplog entries from the sync source
+8. Create an `OplogFetcher` and start fetching and buffering oplog entries from the sync source
    to be applied later. Operations are buffered to a collection so that they are not limited by the
    amount of memory available.
 
@@ -747,9 +853,9 @@ Otherwise, the new node iterates through all of the buffered operations, writes 
 and if their timestamp is after the `beginApplyingTimestamp`, applies them to the data on disk.
 Oplog entries continue to be fetched and added to the buffer while this is occurring.
 
-One notable exception is that the node will not apply "prepareTransaction" oplog entries. Similar
+One notable exception is that the node will not apply `prepareTransaction` oplog entries. Similar
 to how we reconstruct prepared transactions in startup and rollback recovery, we will update the
-transactions table every time we see a "prepareTransaction" oplog entry. Because the nodes wrote
+transactions table every time we see a `prepareTransaction` oplog entry. Because the nodes wrote
 all oplog entries starting at the `beginFetchingTimestamp` into the oplog, the node will have all
 the oplog entries it needs to reconstruct the state for all prepared transactions after the oplog
 application phase is done.
@@ -782,11 +888,56 @@ The oplog application phase concludes when the node applies an oplog entry at `s
 node checks its sync source's Rollback ID to see if a rollback occurred and if so, restarts initial
 sync. Otherwise, the `InitialSyncer` will begin tear down.
 
-It will register the node's `lastApplied` OpTime with the storage engine to make sure that all oplog
-entries prior to that will be visible when querying the oplog. After that it will reconstruct all
-prepared transactions. The node will then clear the initial sync flag and tell the storage engine
-that the `initialDataTimestamp` is the node's last applied OpTime. Finally, the `InitialSyncer`
-shuts down and the `ReplicationCoordinator` starts steady state replication.
+It will register the node's [`lastApplied`](#replication-timestamp-glossary) OpTime with the storage
+engine to make sure that all oplog entries prior to that will be visible when querying the oplog.
+After that it will reconstruct all prepared transactions. The node will then clear the initial sync
+flag and tell the storage engine that the [`initialDataTimestamp`](#replication-timestamp-glossary)
+is the node's last applied OpTime. Finally, the `InitialSyncer` shuts down and the
+`ReplicationCoordinator` starts steady state replication.
+
+# Startup Recovery
+
+*Startup recovery* is a node's process for putting both the oplog and data into a consistent state
+during startup (and happens while the node is in the `STARTUP` state). If a node has an empty or
+non-existent oplog, or already has the initial sync flag set when starting up, then it will skip
+startup recovery and go through [initial sync](#initial-sync) instead.
+
+If the node already has data, it will go through
+[startup recovery](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/db/repl/replication_recovery.cpp).
+It will first get the *recovery timestamp* from the storage engine, which is the timestamp through
+which changes are reflected in the data at startup (and the timestamp used to set the
+`initialDataTimestamp`). The recovery timestamp will be a `stable_timestamp` so that the node
+recovers from a *stable checkpoint*, which is a durable view of the data at a particular timestamp.
+It should be noted that due to journaling, the oplog and many collections in the local database are
+an exception and are up-to-date at startup rather than reflecting the recovery timestamp.
+
+If a node went through an unclean shutdown, then it might have been in the middle of writing a batch
+of oplog entries to its oplog. Since this is done in parallel, it could mean that there are gaps in
+the oplog from entries in the batch that weren't written yet, called *oplog holes*. During startup,
+a node wouldn't be able to tell which oplog entries were successfully written into the oplog. To fix
+this, after getting the recovery timestamp, the node will truncate its oplog to a point that it can
+guarantee didn't have any oplog holes using the `oplogTruncateAfterPoint` document. This document is
+journaled and untimestamped so that it will reflect information more recent than the latest stable
+checkpoint even after a shutdown. During oplog application, before writing a batch of oplog entries
+to the oplog, the node will set the `oplogTruncateAfterPoint` to be the first entry in the batch. If
+the node shuts down before finishing writing the batch, then during startup recovery, the node will
+truncate the oplog to the point before the batch (meaning it will truncate inclusive of the
+`oplogTruncateAfterPoint`). If the node successfully finishes writing the batch to the oplog during
+oplog application, it will reset the `oplogTruncateAfterPoint` since there are no oplog holes and
+the oplog wouldn't need to be truncated if the node restarted.
+
+After truncating the oplog, the node will see if the recovery timestamp differs from the top of the
+newly truncated oplog. If it does, this means that there are oplog entries that must be applied to
+make the data consistent with the oplog. The node will apply all the operations starting at the
+recovery timestamp through the top of the oplog. The one exception is that it will not apply
+`prepareTransaction` oplog entries. Similar to how a node reconstructs prepared transactions during
+initial sync and rollback, the node will update the transactions table every time it see a
+`prepareTransaction` oplog entry. Once the node has finished applying all the oplog entries through
+<!-- TODO SERVER-43783: Link to process for reconstructing prepared transactions -->
+the top of the oplog, it will reconstruct all transactions still in the prepare state.
+
+Finally, the node will finish loading the replica set configuration, set its `lastApplied` and
+`lastDurable` timestamps to the top of the oplog and start steady state replication.
 
 # Dropping Collections and Databases
 
@@ -820,3 +971,85 @@ When a node receives a `dropDatabase` command, it will initiate a Two Phase Drop
 for each collection in the relevant database. Once all collection drops are replicated to a majority
 of nodes, the node will drop the now empty database and a `dropDatabase` command oplog entry is
 written to the oplog.
+
+# Replication Timestamp Glossary
+
+In this section, when we refer to the word "transaction" without any other qualifier, we are talking
+about a storage transaction. Transactions in the replication layer will be referred to as
+multi-document or prepared transactions.
+
+`all_durable`: All transactions with timestamps earlier than the `all_durable` timestamp are
+committed. This is the point at which the oplog has no gaps, which are created when we reserve
+timestamps before executing the associated write. Since this timestamp is used to maintain the oplog
+visibility point, it is important that all operations up to and including this timestamp are
+committed and durable on disk. This is so that we can replicate the oplog without any gaps.
+
+`stable_timestamp`: The newest timestamp at which the storage engine is allowed to take a
+checkpoint, which can be thought of as a consistent snapshot of the data. Replication informs the
+storage engine of where it is safe to take its next checkpoint. This timestamp is guaranteed to be
+majority committed so that RTT rollback can use it. In the case when `eMRC=false`, the stable
+<!-- TODO SERVER-43788: Link to eMRC=false section -->
+timestamp may not be majority committed, which is why we must use the Rollback via Refetch rollback
+algorithm.
+
+This timestamp is also required to increase monotonically except when `eMRC=false`, where in a
+special case during rollback it is possible for the `stableTimestamp` to move backwards.
+
+`oldest_timestamp`: The earliest timestamp that the storage engine is guaranteed to have history
+for. New transactions can never start a timestamp earlier than this timestamp. Since we advance this
+as we advance the `stable_timestamp`, it will be less than or equal to the `stable_timestamp`.
+
+`initialDataTimestamp`: A timestamp used to indicate the timestamp at which history “begins”. When
+a node comes out of initial sync, we inform the storage engine that the `initialDataTimestamp` is
+the node's `lastApplied`.
+
+By setting this value to 0, it informs the storage engine to take unstable checkpoints. Stable
+checkpoints can be viewed as timestamped reads that persist the data they read into a checkpoint.
+Unstable checkpoints simply open a transaction and read all data that is currently committed at the
+time the transaction is opened. They read a consistent snapshot of data, but the snapshot they read
+from is not associated with any particular timestamp.
+
+`lastApplied`: In-memory record of the latest applied oplog entry optime. It may lag behind the
+optime of the newest oplog entry that is visible in the storage engine because it is updated after
+a storage transaction commits.
+
+`lastDurable`: Optime of the latest oplog entry that has been flushed to the journal. It is
+asynchronously updated by the storage engine as new writes become durable. Default journaling
+frequency is 100ms, so this could lag up to that amount behind lastApplied.
+
+`lastCommittedOpTime`: A node’s local view of the latest majority committed optime. Every time we
+update this optime, we also recalculate the `stable_timestamp`. Note that the `lastCommittedOpTime`
+can advance beyond a node's `lastApplied` if it has not yet replicated the most recent majority
+committed oplog entry. For more information about how the `lastCommittedOpTime` is updated and
+propagated, please see [Commit Point Propagation](#commit-point-propagation).
+
+`currentCommittedSnapshot`: An optime maintained in `ReplicationCoordinator` that is used to serve
+majority reads and is always guaranteed to be <= `lastCommittedOpTime`. When `eMRC=true`, this is
+currently set to the stable optime, which is guaranteed to be in a node’s oplog. Since it is reset
+every time we recalculate the stable optime, it will also be up to date.
+
+When `eMRC=false`, this is set to the `lastCommittedOpTime`, so it may not be in the node’s oplog. The
+`stable_timestamp` is not allowed to advance past the `all_durable`. So, this value shouldn’t be
+ahead of `all_durable` unless `eMRC=false`.
+
+`readConcernMajorityOpTime`: Exposed in replSetGetStatus as “readConcernMajorityOpTime” but is
+populated internally from the `currentCommittedSnapshot` timestamp inside `ReplicationCoordinator`.
+
+`prepareTimestamp`: The timestamp of the ‘prepare’ oplog entry for a prepared transaction. This is
+the earliest timestamp at which it is legal to commit the transaction. This timestamp is provided to
+the storage engine to block reads that are trying to read prepared data until the storage engines
+knows whether the prepared transaction has committed or aborted.
+
+`commit oplog entry timestamp`: The timestamp of the ‘commitTransaction’ oplog entry for a prepared
+transaction, or the timestamp of the ‘applyOps’ oplog entry for a non-prepared transaction. In a
+cross-shard transaction each shard may have a different commit oplog entry timestamp. This is
+guaranteed to be greater than the `prepareTimestamp`.
+
+`commitTimestamp`: The timestamp at which we committed a multi-document transaction. This will be
+the `commitTimestamp` field in the `commitTransaction` oplog entry for a prepared transaction, or
+the timestamp of the ‘applyOps’ oplog entry for a non-prepared transaction. In a cross-shard
+transaction this timestamp is the same across all shards. The effects of the transaction are visible
+as of this timestamp. Note that `commitTimestamp` and the `commit oplog entry timestamp` are the
+same for non-prepared transactions because we do not write down the oplog entry until we commit the
+transaction. For a prepared transaction, we have the following guarantee: `prepareTimestamp` <=
+`commitTimestamp` <= `commit oplog entry timestamp`

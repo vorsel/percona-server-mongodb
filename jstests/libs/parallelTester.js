@@ -155,8 +155,7 @@ if (typeof _threadInject != "undefined") {
             "index_bigkeys_nofail.js",
             "index_bigkeys_validation.js",
 
-            "mr3.js",
-            "evald.js",
+            "mr_fail_invalid_js.js",
             "run_program1.js",
             "notablescan.js",
             "bench_test1.js",
@@ -282,13 +281,6 @@ if (typeof _threadInject != "undefined") {
             parallelFilesDir + "/profile_query_hash.js",
             parallelFilesDir + "/profile_sampling.js",
             parallelFilesDir + "/profile_update.js",
-
-            // These tests can't be run in parallel because they expect an awaitData cursor to
-            // return after maxTimeMS, however this doesn't work if a long running blocking
-            // operation is running in parallel.
-            // TODO: Remove this restriction as part of SERVER-33942.
-            parallelFilesDir + "/compact_keeps_indexes.js",
-            parallelFilesDir + "/awaitdata_getmore_cmd.js",
 
             // These tests rely on a deterministically refreshable logical session cache. If they
             // run in parallel, they could interfere with the cache and cause failures.
