@@ -105,7 +105,7 @@ namespace mongo {
 
     private:
         LDAP* _ld{nullptr};
-        mutable char* _principal{nullptr};
+        std::string _principal;
         std::string _mechanism;
 
         virtual Status start(StringData authenticationDatabase,

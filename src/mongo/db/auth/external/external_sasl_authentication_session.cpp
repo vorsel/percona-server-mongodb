@@ -317,7 +317,6 @@ OpenLDAPAuthenticationSession::OpenLDAPAuthenticationSession(
     SaslAuthenticationSession(authzSession) {}
 
 OpenLDAPAuthenticationSession::~OpenLDAPAuthenticationSession() {
-    ldap_memfree(_principal);
     if (_ld) {
         ldap_unbind_ext(_ld, nullptr, nullptr);
         _ld = nullptr;
@@ -402,6 +401,7 @@ Status OpenLDAPAuthenticationSession::step(StringData inputData, std::string* ou
             return Status(ErrorCodes::OperationFailed,
                           "Unknown bind method: {}"_format(ldapGlobalParams.ldapBindMethod));
         }
+        _principal = dn;
         _done = true;
         return Status::OK();
     }
@@ -412,12 +412,7 @@ Status OpenLDAPAuthenticationSession::step(StringData inputData, std::string* ou
 }
 
 std::string OpenLDAPAuthenticationSession::getPrincipalId() const {
-    if (_principal
-        || (_ld && LDAP_OPT_SUCCESS == ldap_get_option(_ld, LDAP_OPT_X_SASL_USERNAME, &_principal))) {
-        return _principal;
-    }
-
-    return "";
+    return _principal;
 }
 
 const char* OpenLDAPAuthenticationSession::getMechanism() const {
