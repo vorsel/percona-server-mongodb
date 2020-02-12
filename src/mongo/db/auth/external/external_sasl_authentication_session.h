@@ -35,7 +35,6 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 
 #include <string>
 
-#include <ldap.h>
 #include <sasl/sasl.h>
 
 #include "mongo/base/status.h"
@@ -82,22 +81,16 @@ private:
     StatusWith<std::tuple<bool, std::string>> getStepResult() const;
 };
 
-class OpenLDAPServerMechanism : public MakeServerMechanism<PLAINPolicy> {
+class ExternalLDAPServerFactory : public MakeServerFactory<SaslExternalLDAPServerMechanism> {
 public:
-    explicit OpenLDAPServerMechanism(std::string authenticationDatabase)
-        : MakeServerMechanism<PLAINPolicy>(std::move(authenticationDatabase)) {}
+    static constexpr bool isInternal = false;
 
-    virtual ~OpenLDAPServerMechanism();
-
-private:
-    int _step{0};
-    LDAP* _ld{nullptr};
-    mutable char* _principal{nullptr};
-
-    StatusWith<std::tuple<bool, std::string>> stepImpl(OperationContext* opCtx,
-                                                       StringData input) final;
-
-    virtual StringData getPrincipalName() const override final;
+    bool canMakeMechanismForUser(const User* user) const final {
+        auto credentials = user->getCredentials();
+        return credentials.isExternal && (credentials.scram<SHA1Block>().isValid() ||
+                                          credentials.scram<SHA256Block>().isValid());
+    }
 };
+
 
 }  // namespace mongo
