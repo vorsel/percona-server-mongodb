@@ -51,8 +51,9 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/auth/sasl_options.h"
 #include "mongo/db/auth/external/external_sasl_authentication_session.h"
+#include "mongo/db/auth/sasl_options.h"
+#include "mongo/db/ldap/ldap_manager.h"
 #include "mongo/db/ldap_options.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
@@ -347,6 +348,20 @@ Status OpenLDAPAuthenticationSession::start(StringData authenticationDatabase,
 
 Status OpenLDAPAuthenticationSession::step(StringData inputData, std::string* outputData) {
     if (_saslStep++ == 0) {
+        const char* userid = inputData.rawData();
+        const char* dn = userid + std::strlen(userid) + 1; // authentication id
+        const char* pw = dn + std::strlen(dn) + 1; // password
+
+        // transform user to DN
+        std::string mappedUser;
+        {
+            auto ldapManager = LDAPManager::get(_opCtx->getServiceContext());
+            auto mapRes = ldapManager->mapUserToDN(dn, mappedUser);
+            if (!mapRes.isOK())
+                return mapRes;
+            dn = mappedUser.c_str();
+        }
+
         auto uri = "ldap://{}/"_format(ldapGlobalParams.ldapServers.get());
         int res = ldap_initialize(&_ld, uri.c_str());
         if (res != LDAP_SUCCESS) {
@@ -361,9 +376,7 @@ Status OpenLDAPAuthenticationSession::step(StringData inputData, std::string* ou
                           "Cannot set LDAP version option; LDAP error: {}"_format(
                               ldap_err2string(res)));
         }
-        const char* userid = inputData.rawData();
-        const char* dn = userid + std::strlen(userid) + 1; // authentication id
-        const char* pw = dn + std::strlen(dn) + 1; // password
+
         if (ldapGlobalParams.ldapBindMethod == "simple") {
             // ldap_simple_bind_s was deprecated in favor of ldap_sasl_bind_s
             berval cred;
@@ -401,7 +414,7 @@ Status OpenLDAPAuthenticationSession::step(StringData inputData, std::string* ou
             return Status(ErrorCodes::OperationFailed,
                           "Unknown bind method: {}"_format(ldapGlobalParams.ldapBindMethod));
         }
-        _principal = dn;
+        _principal = userid;
         _done = true;
         return Status::OK();
     }
