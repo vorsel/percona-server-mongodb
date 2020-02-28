@@ -53,7 +53,7 @@ Requires: %{name}-shell = %{version}-%{release}
 Requires: %{name}-tools = %{version}-%{release}
 Requires: numactl, openldap
 
-Conflicts: Percona-Server-MongoDB < 4.0.0
+Conflicts: Percona-Server-MongoDB < 4.4.0
 Conflicts: Percona-Server-MongoDB-32 Percona-Server-MongoDB-34 Percona-Server-MongoDB-36 mongodb-org
 
 %description
@@ -115,6 +115,8 @@ export CC=${CC:-gcc}
 export CXX=${CXX:-g++}
 export PSM_TARGETS="mongod mongos mongo perconadecrypt"
 export INSTALLDIR=$RPM_BUILD_DIR/install
+export INSTALLDIR_AWS=$RPM_BUILD_DIR/install_aws
+export AWS_LIBS="/usr/local"
 export TOOLS_TAGS="ssl sasl"
 export PORTABLE=1
 export USE_SSE=1
@@ -126,11 +128,29 @@ export GOPATH=$(pwd)/
 export PATH="/usr/local/go/bin:$PATH:$GOPATH"
 export GOBINPATH="/usr/local/go/bin"
 
+#aws-sdk-cpp
+pushd $RPM_BUILD_DIR/%{src_dir}/aws-sdk-cpp
+    pushd build
+%if 0%{?rhel} >= 7
+        cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_ONLY="s3" -DBUILD_SHARED_LIBS=OFF -DMINIMIZE_SIZE=ON -DCMAKE_INSTALL_PREFIX="${INSTALLDIR_AWS}"
+        cmake --build . --target install
+%else
+        cmake3 CC=${CC} CXX=${CXX} .. -DCMAKE_BUILD_TYPE=Release -DBUILD_ONLY="s3" -DBUILD_SHARED_LIBS=OFF -DMINIMIZE_SIZE=ON -DCMAKE_INSTALL_PREFIX="${INSTALLDIR_AWS}"
+        cmake3 --build . --target install
+%endif
+
+    popd
+popd
+mkdir -p ${INSTALLDIR}/include/
+mkdir -p ${INSTALLDIR}/lib/
+mv ${INSTALLDIR_AWS}/include/* ${INSTALLDIR}/include/
+mv ${INSTALLDIR_AWS}/lib*/* ${INSTALLDIR}/lib/
+
 # Build PSfMDB with SCons
 pushd $RPM_BUILD_DIR/%{src_dir}
 buildscripts/scons.py CC=${CC} CXX=${CXX} --audit --release --ssl --opt=on  \
-%{?_smp_mflags} --use-sasl-client CPPPATH=${INSTALLDIR}/include LIBPATH=${INSTALLDIR}/lib \
---wiredtiger --inmemory --hotbackup ${PSM_TARGETS}
+%{?_smp_mflags} --use-sasl-client CPPPATH=${INSTALLDIR}/include LIBPATH="${INSTALLDIR}/lib ${AWS_LIBS}/lib ${AWS_LIBS}/lib64" \
+--wiredtiger --inmemory --hotbackup ${PSM_TARGETS} || exit $?
 popd
 
 # Mongo Tools compilation
@@ -368,5 +388,5 @@ fi
 #
 %changelog
 
-* Wed Nov 21 2018 Evgeniy Patlan <evgeniy.patlan@percona.com> 4.0
-- Initial RPM release for Percona Server for MongoDB
+* Thu Feb 27 2020 Oleksandr Miroshnychenko <alex.miroshnychenko@percona.com> - 4.4
+- Initial RPM release for Percona Server for MongoDB 4.4

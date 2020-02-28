@@ -116,12 +116,11 @@ get_sources(){
         return 0
     fi
     PRODUCT=percona-server-mongodb
-    echo "PRODUCT=${PRODUCT}" > percona-server-mongodb-40.properties
-
-    echo "PSM_BRANCH=${PSM_BRANCH}" >> percona-server-mongodb-40.properties
-    echo "JEMALLOC_TAG=${JEMALLOC_TAG}" >> percona-server-mongodb-40.properties
-    echo "BUILD_NUMBER=${BUILD_NUMBER}" >> percona-server-mongodb-40.properties
-    echo "BUILD_ID=${BUILD_ID}" >> percona-server-mongodb-40.properties
+    echo "PRODUCT=${PRODUCT}" > percona-server-mongodb-44.properties
+    echo "PSM_BRANCH=${PSM_BRANCH}" >> percona-server-mongodb-44.properties
+    echo "JEMALLOC_TAG=${JEMALLOC_TAG}" >> percona-server-mongodb-44.properties
+    echo "BUILD_NUMBER=${BUILD_NUMBER}" >> percona-server-mongodb-44.properties
+    echo "BUILD_ID=${BUILD_ID}" >> percona-server-mongodb-44.properties
     git clone "$REPO"
     retval=$?
     if [ $retval != 0 ]
@@ -156,12 +155,12 @@ get_sources(){
     #
 
     PRODUCT_FULL=${PRODUCT}-${PSM_VER}-${PSM_RELEASE}
-    echo "PRODUCT_FULL=${PRODUCT_FULL}" >> ${WORKDIR}/percona-server-mongodb-40.properties
-    echo "VERSION=${PSM_VER}" >> ${WORKDIR}/percona-server-mongodb-40.properties
-    echo "RELEASE=${PSM_RELEASE}" >> ${WORKDIR}/percona-server-mongodb-40.properties
-    echo "MONGO_TOOLS_TAG=${MONGO_TOOLS_TAG}" >> ${WORKDIR}/percona-server-mongodb-40.properties
+    echo "PRODUCT_FULL=${PRODUCT_FULL}" >> ${WORKDIR}/percona-server-mongodb-44.properties
+    echo "VERSION=${PSM_VER}" >> ${WORKDIR}/percona-server-mongodb-44.properties
+    echo "RELEASE=${PSM_RELEASE}" >> ${WORKDIR}/percona-server-mongodb-44.properties
+    echo "MONGO_TOOLS_TAG=${MONGO_TOOLS_TAG}" >> ${WORKDIR}/percona-server-mongodb-44.properties
 
-    echo "REVISION=${REVISION}" >> ${WORKDIR}/percona-server-mongodb-40.properties
+    echo "REVISION=${REVISION}" >> ${WORKDIR}/percona-server-mongodb-44.properties
     rm -fr debian rpm
     cp -a percona-packaging/manpages .
     cp -a percona-packaging/docs/* .
@@ -177,15 +176,21 @@ get_sources(){
     echo "export PSMDB_TOOLS_REVISION=\"${PSM_VER}-${PSM_RELEASE}\"" >> set_tools_revision.sh
     chmod +x set_tools_revision.sh
     cd ${WORKDIR}
-    #
-    #source ${WORKDIR}/percona-server-mongodb-40.properties
-    #
-    source percona-server-mongodb-40.properties
+    source percona-server-mongodb-44.properties
     #
 
     mv percona-server-mongodb ${PRODUCT}-${PSM_VER}-${PSM_RELEASE}
+    cd ${PRODUCT}-${PSM_VER}-${PSM_RELEASE}
+        git clone https://github.com/aws/aws-sdk-cpp.git
+            cd aws-sdk-cpp
+                git reset --hard
+                git clean -xdf
+                git checkout 1.7.91
+                mkdir build
+                sed -i 's:AWS_EVENT_STREAM_SHA:AWS_EVENT_STREAM_TAG:g' third-party/cmake/BuildAwsEventStream.cmake
+    cd ../../
     tar --owner=0 --group=0 --exclude=.* -czf ${PRODUCT}-${PSM_VER}-${PSM_RELEASE}.tar.gz ${PRODUCT}-${PSM_VER}-${PSM_RELEASE}
-    echo "UPLOAD=UPLOAD/experimental/BUILDS/${PRODUCT}-4.0/${PRODUCT}-${PSM_VER}-${PSM_RELEASE}/${PSM_BRANCH}/${REVISION}/${BUILD_ID}" >> percona-server-mongodb-40.properties
+    echo "UPLOAD=UPLOAD/experimental/BUILDS/${PRODUCT}-4.4/${PRODUCT}-${PSM_VER}-${PSM_RELEASE}/${PSM_BRANCH}/${REVISION}/${BUILD_ID}" >> percona-server-mongodb-44.properties
     mkdir $WORKDIR/source_tarball
     mkdir $CURDIR/source_tarball
     cp ${PRODUCT}-${PSM_VER}-${PSM_RELEASE}.tar.gz $WORKDIR/source_tarball
@@ -233,12 +238,6 @@ install_gcc_8_centos(){
 }
 
 install_gcc_8_deb(){
-    if [ x"${DEBIAN}" = xjessie ]; then
-        wget https://jenkins.percona.com/downloads/gcc8/gcc-8.3.0_Debian-jessie-x64.tar.gz -O /tmp/gcc-8.3.0_Debian-jessie-x64.tar.gz
-        tar -zxf /tmp/gcc-8.3.0_Debian-jessie-x64.tar.gz
-        rm -rf /usr/local/gcc-8.3.0
-        mv gcc-8.3.0 /usr/local/
-    fi
     if [ x"${DEBIAN}" = xxenial ]; then
         wget https://jenkins.percona.com/downloads/gcc8/gcc-8.3.0_Ubuntu-xenial-x64.tar.gz -O /tmp/gcc-8.3.0_Ubuntu-xenial-x64.tar.gz
         CUR_DIR=$PWD
@@ -248,7 +247,7 @@ install_gcc_8_deb(){
         mv gcc-8.3.0 /usr/local/
         cd $CUR_DIR
     fi
-    if [ x"${DEBIAN}" = xcosmic -o x"${DEBIAN}" = xbionic -o x"${DEBIAN}" = xdisco ]; then
+    if [ x"${DEBIAN}" = xcosmic -o x"${DEBIAN}" = xbionic -o x"${DEBIAN}" = xdisco -o x"${DEBIAN}" = xbuster ]; then
         apt-get -y install gcc-8 g++-8
     fi
     if [ x"${DEBIAN}" = xstretch ]; then
@@ -260,17 +259,27 @@ install_gcc_8_deb(){
 }
 
 set_compiler(){
-    if [ x"${DEBIAN}" = xcosmic -o x"${DEBIAN}" = xbionic -o x"${DEBIAN}" = xdisco ]; then
-        export CC=/usr/bin/gcc-8
-        export CXX=/usr/bin/g++-8
+    if [ "x$OS" = "xdeb" ]; then
+        if [ x"${DEBIAN}" = xcosmic -o x"${DEBIAN}" = xbionic -o x"${DEBIAN}" = xdisco -o x"${DEBIAN}" = xbuster ]; then
+            export CC=/usr/bin/gcc-8
+            export CXX=/usr/bin/g++-8
+        else
+            export CC=/usr/local/gcc-8.3.0/bin/gcc-8.3
+            export CXX=/usr/local/gcc-8.3.0/bin/g++-8.3
+        fi
     else
-        export CC=/usr/local/gcc-8.3.0/bin/gcc-8.3
-        export CXX=/usr/local/gcc-8.3.0/bin/g++-8.3
+        if [ "x${RHEL}" == "x8" ]; then
+            export CC=/usr/bin/gcc
+            export CXX=/usr/bin/g++
+        else
+            export CC=/opt/rh/devtoolset-8/root/usr/bin/gcc
+            export CXX=/opt/rh/devtoolset-8/root/usr/bin/g++
+        fi
     fi
 }
 
 fix_rules(){
-    if [ x"${DEBIAN}" = xcosmic -o x"${DEBIAN}" = xbionic -o x"${DEBIAN}" = xdisco ]; then
+    if [ x"${DEBIAN}" = xcosmic -o x"${DEBIAN}" = xbionic -o x"${DEBIAN}" = xdisco -o x"${DEBIAN}" = xbuster ]; then
         sed -i 's|CC = gcc-5|CC = /usr/bin/gcc-8|' debian/rules
         sed -i 's|CXX = g++-5|CXX = /usr/bin/g++-8|' debian/rules
     else
@@ -278,6 +287,34 @@ fix_rules(){
         sed -i 's|CXX = g++-5|CXX = /usr/local/gcc-8.3.0/bin/g++-8.3|' debian/rules
     fi
     sed -i 's:release:release --disable-warnings-as-errors :g' debian/rules
+}
+
+aws_sdk_build(){
+    cd $WORKDIR
+        git clone https://github.com/aws/aws-sdk-cpp.git
+        cd aws-sdk-cpp
+            git reset --hard
+            git clean -xdf
+            git checkout 1.7.91
+            mkdir build
+            sed -i 's:AWS_EVENT_STREAM_SHA:AWS_EVENT_STREAM_TAG:g' third-party/cmake/BuildAwsEventStream.cmake
+            cd build
+            CMAKE_CMD="cmake"
+            if [ -f /etc/redhat-release ]; then
+                RHEL=$(rpm --eval %rhel)
+                if [ x"$RHEL" = x6 ]; then
+                    CMAKE_CMD="cmake3"
+                fi
+            fi
+            set_compiler
+            if [ -z "${CC}" -a -z "${CXX}" ]; then
+                ${CMAKE_CMD} .. -DCMAKE_BUILD_TYPE=Release -DBUILD_ONLY="s3" -DBUILD_SHARED_LIBS=OFF -DMINIMIZE_SIZE=ON || exit $?
+            else
+                ${CMAKE_CMD} CC=${CC} CXX=${CXX} .. -DCMAKE_BUILD_TYPE=Release -DBUILD_ONLY="s3" -DBUILD_SHARED_LIBS=OFF -DMINIMIZE_SIZE=ON || exit $?
+            fi
+            make -j4 || exit $?
+            make install
+    cd ${WORKDIR}
 }
 
 install_deps() {
@@ -292,14 +329,12 @@ install_deps() {
         exit 1
     fi
     CURPLACE=$(pwd)
-
     if [ "x$OS" = "xrpm" ]; then
       yum -y install wget
       add_percona_yum_repo
       wget http://jenkins.percona.com/yum-repo/percona-dev.repo
       mv -f percona-dev.repo /etc/yum.repos.d/
       yum clean all
-      rm -fr /usr/local/gcc-5.4.0
       RHEL=$(rpm --eval %rhel)
       if [ x"$RHEL" = x6 ]; then
         yum -y update
@@ -308,23 +343,30 @@ install_deps() {
         yum -y install cyrus-sasl-devel snappy-devel zlib-devel bzip2-devel libpcap-devel
         yum -y install scons make rpm-build rpmbuild percona-devtoolset-gcc percona-devtoolset-binutils 
         yum -y install percona-devtoolset-gcc-c++ percona-devtoolset-libstdc++-devel percona-devtoolset-valgrind-devel
-        yum -y install python27 python27-devel rpmlint libcurl-devel
+        yum -y install python27 python27-devel rpmlint libcurl-devel e2fsprogs-devel expat-devel lz4-devel git cmake3
         yum -y install openldap-devel
         wget https://bootstrap.pypa.io/get-pip.py
         python2.7 get-pip.py
         rm -rf /usr/bin/python2
         ln -s /usr/bin/python2.7 /usr/bin/python2
+        wget http://curl.haxx.se/download/curl-7.26.0.tar.gz
+        tar -xvzf curl-7.26.0.tar.gz
+        cd curl-7.26.0
+          ./configure
+          make
+          make install
+        cd ../
       elif [ x"$RHEL" = x7 ]; then
         yum -y install epel-release
         yum -y install rpmbuild rpm-build libpcap-devel gcc make cmake gcc-c++ openssl-devel
         yum -y install cyrus-sasl-devel snappy-devel zlib-devel bzip2-devel scons rpmlint
-        yum -y install rpm-build git python-pip python-devel libopcodes libcurl-devel rpmlint
+        yum -y install rpm-build git python-pip python-devel libopcodes libcurl-devel rpmlint e2fsprogs-devel expat-devel lz4-devel
         yum -y install openldap-devel
       else
         yum -y install bzip2-devel libpcap-devel snappy-devel gcc gcc-c++ rpm-build rpmlint
-        yum -y install cmake cyrus-sasl-devel make openssl-devel zlib-devel libcurl-devel
+        yum -y install cmake cyrus-sasl-devel make openssl-devel zlib-devel libcurl-devel git
         yum -y install python2-scons python2-pip python36-devel
-        yum -y install redhat-rpm-config python2-devel
+        yum -y install redhat-rpm-config python2-devel e2fsprogs-devel expat-devel lz4-devel
         yum -y install openldap-devel
       fi
       if [ "x${RHEL}" == "x8" ]; then
@@ -334,6 +376,12 @@ install_deps() {
 #
       install_golang
       install_gcc_8_centos
+      if [ -f /opt/rh/devtoolset-8/enable ]; then
+        source /opt/rh/devtoolset-8/enable
+        source /opt/rh/rh-python36/enable
+      fi
+      pip install --upgrade pip
+
     else
       export DEBIAN=$(lsb_release -sc)
       export ARCH=$(echo $(uname -m) | sed -e 's:i686:i386:g')
@@ -352,6 +400,7 @@ install_deps() {
         sleep 1
         echo "waiting"
       done
+      apt-get -y install libext2fs-dev || apt-get -y install e2fslibs-dev
       install_golang
       install_gcc_8_deb
       wget https://bootstrap.pypa.io/get-pip.py
@@ -359,6 +408,23 @@ install_deps() {
       python get-pip.py
       easy_install pip
     fi
+    if [ x"${DEBIAN}" = "xstretch" ]; then
+      LIBCURL_DEPS="libidn2-0-dev libkrb5-dev libldap2-dev libnghttp2-dev libnss3-dev libpsl-dev librtmp-dev libssh2-1-dev libssl1.0-dev"
+      until DEBIAN_FRONTEND=noninteractive apt-get -y install ${LIBCURL_DEPS}; do
+        sleep 1
+        echo "waiting"
+      done
+      wget http://curl.haxx.se/download/curl-7.66.0.tar.gz
+      tar -xvzf curl-7.66.0.tar.gz
+        cd curl-7.66.0
+        ./configure --enable-static --disable-shared --disable-dependency-tracking --disable-symbol-hiding --enable-versioned-symbols --enable-threaded-resolver --with-lber-lib=lber --with-gssapi=/usr --with-libssh2 --with-nghttp2 --with-zsh-functions-dir=/usr/share/zsh/vendor-completions --with-ca-path=/etc/ssl/certs --with-ca-bundle=/etc/ssl/certs/ca-certificates.crt --with-ssl
+        make
+        make install
+      cd ../
+      CURL_LINKFLAGS=$(pkg-config libcurl --static --libs)
+      export LDFLAGS="${LDFLAGS} ${CURL_LINKFLAGS}"
+    fi
+    aws_sdk_build
     return;
 }
 
@@ -515,8 +581,8 @@ build_rpm(){
         export CXX=/opt/rh/devtoolset-8/root/usr/bin/g++
     fi
     #
-    echo "RHEL=${RHEL}" >> percona-server-mongodb-40.properties
-    echo "ARCH=${ARCH}" >> percona-server-mongodb-40.properties
+    echo "RHEL=${RHEL}" >> percona-server-mongodb-44.properties
+    echo "ARCH=${ARCH}" >> percona-server-mongodb-44.properties
     #
     file /usr/bin/scons
     #
@@ -527,6 +593,7 @@ build_rpm(){
         export PATH="/usr/local/go/bin:$PATH:$GOPATH"
         export GOBINPATH="/usr/local/go/bin"
     #fi
+    export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
     rpmbuild --define "_topdir ${WORKDIR}/rpmbuild" --define "dist .$OS_NAME" --rebuild rpmbuild/SRPMS/$SRC_RPM
 
     return_code=$?
@@ -542,7 +609,7 @@ build_rpm(){
 build_source_deb(){
     if [ $SDEB = 0 ]
     then
-        echo "source deb package will not be created"
+        echo "Source deb package will not be created"
         return;
     fi
     if [ "x$OS" = "xrpm" ]
@@ -599,12 +666,12 @@ build_source_deb(){
 build_deb(){
     if [ $DEB = 0 ]
     then
-        echo "source deb package will not be created"
+        echo "Deb package will not be created"
         return;
     fi
     if [ "x$OS" = "xrmp" ]
     then
-        echo "It is not possible to build source deb here"
+        echo "It is not possible to build deb here"
         exit 1
     fi
     for file in 'dsc' 'orig.tar.gz' 'changes' 'debian.tar*'
@@ -617,8 +684,8 @@ build_deb(){
     export DEBIAN=$(lsb_release -sc)
     export ARCH=$(echo $(uname -m) | sed -e 's:i686:i386:g')
     #
-    echo "DEBIAN=${DEBIAN}" >> percona-server-mongodb-40.properties
-    echo "ARCH=${ARCH}" >> percona-server-mongodb-40.properties
+    echo "DEBIAN=${DEBIAN}" >> percona-server-mongodb-44.properties
+    echo "ARCH=${ARCH}" >> percona-server-mongodb-44.properties
 
     #
     DSC=$(basename $(find . -name '*.dsc' | sort | tail -n1))
@@ -638,7 +705,11 @@ build_deb(){
     sed -i 's|go build|go build -a -x|' mongo-tools/build.sh
     sed -i 's|exit $ec||' mongo-tools/build.sh
     dch -m -D "${DEBIAN}" --force-distribution -v "${VERSION}-${RELEASE}.${DEBIAN}" 'Update distribution'
-
+    export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
+    if [ x"${DEBIAN}" = "xstretch" ]; then
+      CURL_LINKFLAGS=$(pkg-config libcurl --static --libs)
+      export LINKFLAGS="${LINKFLAGS} ${CURL_LINKFLAGS}"
+    fi
     dpkg-buildpackage -rfakeroot -us -uc -b
     mkdir -p $CURDIR/deb
     mkdir -p $WORKDIR/deb
@@ -656,16 +727,11 @@ build_tarball(){
     cd $WORKDIR
     TARFILE=$(basename $(find . -name 'percona-server-mongodb*.tar.gz' | sort | tail -n1))
 
-    if [ -f /opt/rh/devtoolset-8/enable ]; then
-        source /opt/rh/devtoolset-8/enable
-        source /opt/rh/rh-python36/enable
-    fi
     #
     export DEBIAN_VERSION="$(lsb_release -sc)"
     export DEBIAN="$(lsb_release -sc)"
     export PATH=/usr/local/go/bin:$PATH
     #
-    set_compiler
     #
     PSM_TARGETS="mongod mongos mongo mongobridge perconadecrypt $SPECIAL_TAR"
     TARBALL_SUFFIX=""
@@ -673,13 +739,26 @@ build_tarball(){
     TARBALL_SUFFIX=".dbg"
     fi
     if [ -f /etc/debian_version ]; then
-    export OS_RELEASE="$(lsb_release -sc)"
+        export OS_RELEASE="$(lsb_release -sc)"
+        set_compiler
     fi
     #
     if [ -f /etc/redhat-release ]; then
     #export OS_RELEASE="centos$(lsb_release -sr | awk -F'.' '{print $1}')"
-    export OS_RELEASE="centos$(rpm --eval %rhel)"
-    RHEL=$(rpm --eval %rhel)
+        export OS_RELEASE="centos$(rpm --eval %rhel)"
+        RHEL=$(rpm --eval %rhel)
+        if [ -f /opt/rh/devtoolset-8/enable ]; then
+            source /opt/rh/devtoolset-8/enable
+            source /opt/rh/rh-python36/enable
+        fi
+        echo "CC and CXX should be modified once correct compiller would be installed on Centos"
+        if [ "x${RHEL}" == "x8" ]; then
+            export CC=/usr/bin/gcc
+            export CXX=/usr/bin/g++
+        else
+            export CC=/opt/rh/devtoolset-8/root/usr/bin/gcc
+            export CXX=/opt/rh/devtoolset-8/root/usr/bin/g++
+        fi
     fi
     #
     ARCH=$(uname -m 2>/dev/null||true)
@@ -703,21 +782,65 @@ build_tarball(){
     if [ ${DEBUG} = 1 ]; then
     export CXXFLAGS="${CFLAGS} -Wno-error=deprecated-declarations"
     fi
-    export INSTALLDIR=${WORKDIR}/install
+    export INSTALLDIR=/usr/local
+    export AWS_LIBS=/usr/local
     export PORTABLE=1
     export USE_SSE=1
     #
 
     # Finally build Percona Server for MongoDB with SCons
     cd ${PSMDIR_ABS}
-    pip install --upgrade pip
-    pip install --user -r etc/pip/dev-requirements.txt
-    pip install --user -r etc/pip/evgtest-requirements.txt
+    if [ "x${RHEL}" == "x8" ]; then
+        pip3.6 install --upgrade pip
+        pip3.6 install --user -r etc/pip/dev-requirements.txt
+        pip3.6 install --user -r etc/pip/evgtest-requirements.txt
+    else
+        pip install --upgrade pip
+        pip install --user -r etc/pip/dev-requirements.txt
+        pip install --user -r etc/pip/evgtest-requirements.txt
+    fi
+    if [ -f /etc/redhat-release ]; then
+        RHEL=$(rpm --eval %rhel)
+        if [ $RHEL = 7 -o $RHEL = 8 ]; then
+            if [ -d aws-sdk-cpp ]; then
+                rm -rf aws-sdk-cpp
+            fi
+            export INSTALLDIR=$PWD/../install
+            export INSTALLDIR_AWS=$PWD/../install_aws
+            git clone https://github.com/aws/aws-sdk-cpp.git
+            cd aws-sdk-cpp
+            git reset --hard
+            git clean -xdf
+            git checkout 1.7.91
+            mkdir build
+            sed -i 's:AWS_EVENT_STREAM_SHA:AWS_EVENT_STREAM_TAG:g' third-party/cmake/BuildAwsEventStream.cmake
+            cd build
+            set_compiler
+            if [ -z "${CC}" -a -z "${CXX}" ]; then
+                cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_ONLY="s3" -DBUILD_SHARED_LIBS=OFF -DMINIMIZE_SIZE=ON -DCMAKE_INSTALL_PREFIX="${INSTALLDIR_AWS}" || exit $?
+            else
+                cmake CC=${CC} CXX=${CXX} .. -DCMAKE_BUILD_TYPE=Release -DBUILD_ONLY="s3" -DBUILD_SHARED_LIBS=OFF -DMINIMIZE_SIZE=ON -DCMAKE_INSTALL_PREFIX="${INSTALLDIR_AWS}" || exit $?
+            fi
+            make -j4 || exit $?
+            make install
+            mkdir -p ${INSTALLDIR}/include/
+            mkdir -p ${INSTALLDIR}/lib/
+            mv ${INSTALLDIR_AWS}/include/* ${INSTALLDIR}/include/
+            mv ${INSTALLDIR_AWS}/lib*/* ${INSTALLDIR}/lib/
+            cd ../../
+
+        fi
+    fi
+    export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
+    if [ x"${DEBIAN}" = "xstretch" ]; then
+      CURL_LINKFLAGS=$(pkg-config libcurl --static --libs)
+      export LINKFLAGS="${LINKFLAGS} ${CURL_LINKFLAGS}"
+    fi
     if [ ${DEBUG} = 0 ]; then
-        buildscripts/scons.py CC=${CC} CXX=${CXX} --disable-warnings-as-errors --release --ssl --opt=on -j$NJOBS --use-sasl-client --wiredtiger --audit --inmemory --hotbackup CPPPATH=${INSTALLDIR}/include LIBPATH=${INSTALLDIR}/lib ${PSM_TARGETS}
+        buildscripts/scons.py CC=${CC} CXX=${CXX} --disable-warnings-as-errors --release --ssl --opt=on -j$NJOBS --use-sasl-client --wiredtiger --audit --inmemory --hotbackup CPPPATH="${INSTALLDIR}/include ${AWS_LIBS}/include" LIBPATH="${INSTALLDIR}/lib ${AWS_LIBS}/lib ${AWS_LIBS}/lib64" LINKFLAGS="${LINKFLAGS}" ${PSM_TARGETS} || exit $?
     else
         buildscripts/scons.py CC=${CC} CXX=${CXX} --disable-warnings-as-errors --audit --ssl --dbg=on -j$NJOBS --use-sasl-client \
-        CPPPATH=${INSTALLDIR}/include LIBPATH=${INSTALLDIR}/lib --wiredtiger --inmemory --hotbackup ${PSM_TARGETS}
+        CPPPATH="${INSTALLDIR}/include ${AWS_LIBS}/include" LIBPATH="${INSTALLDIR}/lib ${AWS_LIBS}/lib ${AWS_LIBS}/lib64" LINKFLAGS="${LINKFLAGS}" --wiredtiger --inmemory --hotbackup ${PSM_TARGETS} || exit $?
     fi
     #
     # scons install doesn't work - it installs the binaries not linked with fractal tree
@@ -794,9 +917,9 @@ DEB_RELEASE=1
 REVISION=0
 BRANCH="master"
 REPO="https://github.com/percona/percona-server-mongodb.git"
-PSM_VER="4.0.9"
+PSM_VER="4.4.0"
 PSM_RELEASE="1"
-MONGO_TOOLS_TAG="r4.0.9"
+MONGO_TOOLS_TAG="master"
 PRODUCT=percona-server-mongodb
 DEBUG=0
 parse_arguments PICK-ARGS-FROM-ARGV "$@"
