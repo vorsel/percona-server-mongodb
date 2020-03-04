@@ -33,6 +33,8 @@ Copyright (C) 2019-present Percona and/or its affiliates. All rights reserved.
 
 #include "mongo/db/ldap/ldap_manager.h"
 
+#include <fmt/format.h>
+
 #include "mongo/base/init.h"
 #include "mongo/db/ldap/ldap_manager_impl.h"
 #include "mongo/db/ldap_options.h"
@@ -72,7 +74,9 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(CreateLDAPManager,
         auto ldapManager = LDAPManager::create();
         Status res = ldapManager->initialize();
         if (!res.isOK()) {
-            error() << "Cannot initialize LDAP server connection";
+            using namespace fmt::literals;
+            error() << "Cannot initialize LDAP server connection (parameters are: {})"_format(
+                ldapGlobalParams.logString());
             return res;
         }
         LDAPManager::set(getGlobalServiceContext(), std::move(ldapManager));
