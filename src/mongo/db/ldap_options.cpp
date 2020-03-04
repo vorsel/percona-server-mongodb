@@ -44,6 +44,18 @@ using namespace fmt::literals;
 
 LDAPGlobalParams ldapGlobalParams;
 
+std::string LDAPGlobalParams::logString() const {
+    return fmt::format(
+        "ldapServers: {}; "
+        "ldapTransportSecurity: {}; "
+        "ldapBindMethod: {}; "
+        "ldapBindSaslMechanisms: {}",
+        std::string{*ldapServers},
+        ldapTransportSecurity,
+        ldapBindMethod,
+        ldapBindSaslMechanisms);
+}
+
 Status validateLDAPBindMethod(const std::string& value) {
     constexpr auto kSimple = "simple"_sd;
     constexpr auto kSasl = "sasl"_sd;

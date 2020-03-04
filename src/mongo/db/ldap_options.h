@@ -60,6 +60,8 @@ struct LDAPGlobalParams {
     bool ldapUseConnectionPool;
     AtomicWord<int> ldapUserCacheInvalidationInterval;
     synchronized_value<std::string> ldapQueryTemplate;
+
+    std::string logString() const;
 };
 
 Status validateLDAPBindMethod(const std::string&);
