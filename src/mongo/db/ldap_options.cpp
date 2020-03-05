@@ -119,4 +119,39 @@ Status validateLDAPUserToDNMapping(const std::string& mapping) {
     return Status::OK();
 }
 
+Status validateLDAPAuthzQueryTemplate(const std::string& templ) {
+    // validate placeholders in template
+    // only {USER} and {PROVIDED_USER} are supported
+    try {
+        // validate placeholders in template
+        std::regex placeholder_rex{R"(\{\{|\}\}|\{(.*?)\})"};
+        std::sregex_iterator it{templ.begin(), templ.end(), placeholder_rex};
+        std::sregex_iterator end;
+        for(; it != end; ++it){
+            auto w = (*it)[0].str();
+            if (w == "{{" || w == "}}")
+                continue;
+            auto v = (*it)[1].str();
+            if (v != "USER" && v != "PROVIDED_USER")
+                return {ErrorCodes::BadValue,
+                        "security.ldap.authz.queryTemplate: "
+                        "{} placeholder is invalid. Only {{USER}} and {{PROVIDED_USER}} placeholders are supported"_format((*it)[0].str())};
+        }
+        // test format (throws fmt::format_error if something is wrong)
+        fmt::format(templ,
+            fmt::arg("USER", "test user"),
+            fmt::arg("PROVIDED_USER", "test user"));
+    } catch (std::regex_error& e) {
+        return {ErrorCodes::BadValue,
+                "security.ldap.authz.queryTemplate: std::regex_error exception while validating '{}'. "
+                "Error message is: {}"_format(templ, e.what())};
+    } catch (fmt::format_error& e) {
+        return {ErrorCodes::BadValue,
+                "security.ldap.authz.queryTemplate is malformed, attempt to substitute placeholders thrown an exception. "
+                "Error message is: {}"_format(e.what())};
+    }
+
+    return Status::OK();
+}
+
 }  // namespace mongo

@@ -67,5 +67,6 @@ struct LDAPGlobalParams {
 Status validateLDAPBindMethod(const std::string&);
 Status validateLDAPTransportSecurity(const std::string&);
 Status validateLDAPUserToDNMapping(const std::string&);
+Status validateLDAPAuthzQueryTemplate(const std::string&);
 
 }  // namespace mongo

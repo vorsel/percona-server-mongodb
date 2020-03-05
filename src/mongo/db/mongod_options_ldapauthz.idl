@@ -43,6 +43,8 @@ server_parameters:
         description: "Template of LDAP query to get list of user's roles"
         set_at: runtime
         cpp_varname: "ldapGlobalParams.ldapQueryTemplate"
+        validator:
+            callback: validateLDAPAuthzQueryTemplate
 
 configs:
     'security.ldap.authz.queryTemplate':
@@ -50,4 +52,6 @@ configs:
         short_name: ldapAuthzQueryTemplate
         arg_vartype: String
         requires: 'security.ldap.servers'
+        validator:
+            callback: validateLDAPAuthzQueryTemplate
 
