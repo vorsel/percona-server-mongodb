@@ -67,7 +67,6 @@
 #include "mongo/db/pipeline/document_source_sample_from_random_cursor.h"
 #include "mongo/db/pipeline/document_source_single_document_transformation.h"
 #include "mongo/db/pipeline/document_source_sort.h"
-#include "mongo/db/pipeline/parsed_inclusion_projection.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/get_executor.h"
@@ -100,7 +99,6 @@ using std::unique_ptr;
 using write_ops::Insert;
 
 namespace {
-
 /**
  * Return whether the given sort spec can be used in a find() sort.
  */
@@ -219,8 +217,12 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> attemptToGetExe
 
     const ExtensionsCallbackReal extensionsCallback(expCtx->opCtx, &nss);
 
-    auto cq = CanonicalQuery::canonicalize(
-        expCtx->opCtx, std::move(qr), expCtx, extensionsCallback, matcherFeatures);
+    auto cq = CanonicalQuery::canonicalize(expCtx->opCtx,
+                                           std::move(qr),
+                                           expCtx,
+                                           extensionsCallback,
+                                           matcherFeatures,
+                                           ProjectionPolicies::aggregateProjectionPolicies());
 
     if (!cq.isOK()) {
         // Return an error instead of uasserting, since there are cases where the combination of

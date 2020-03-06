@@ -50,10 +50,6 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    DBClientBase* directClient() override {
-        MONGO_UNREACHABLE;
-    }
-
     std::unique_ptr<TransactionHistoryIteratorBase> createTransactionHistoryIterator(
         repl::OpTime time) const override {
         MONGO_UNREACHABLE;
@@ -75,7 +71,7 @@ public:
                                     const NamespaceString& ns,
                                     BatchedObjects&& batch,
                                     const WriteConcernOptions& wc,
-                                    bool upsert,
+                                    UpsertType upsert,
                                     bool multi,
                                     boost::optional<OID>) final {
         MONGO_UNREACHABLE;
@@ -83,6 +79,12 @@ public:
 
     CollectionIndexUsageMap getIndexStats(OperationContext* opCtx,
                                           const NamespaceString& ns) override {
+        MONGO_UNREACHABLE;
+    }
+
+    std::list<BSONObj> getIndexSpecs(OperationContext* opCtx,
+                                     const NamespaceString& ns,
+                                     bool includeBuildUUIDs) override {
         MONGO_UNREACHABLE;
     }
 
@@ -112,7 +114,7 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    BSONObj getCollectionOptions(const NamespaceString& nss) override {
+    BSONObj getCollectionOptions(OperationContext* opCtx, const NamespaceString& nss) override {
         MONGO_UNREACHABLE;
     }
 
@@ -122,6 +124,21 @@ public:
         const NamespaceString& targetNs,
         const BSONObj& originalCollectionOptions,
         const std::list<BSONObj>& originalIndexes) override {
+        MONGO_UNREACHABLE;
+    }
+
+    void createCollection(OperationContext* opCtx,
+                          const std::string& dbName,
+                          const BSONObj& cmdObj) override {
+        MONGO_UNREACHABLE;
+    }
+
+    void createIndexes(OperationContext* opCtx,
+                       const NamespaceString& ns,
+                       const std::vector<BSONObj>& indexSpecs) override {
+        MONGO_UNREACHABLE;
+    }
+    void dropCollection(OperationContext* opCtx, const NamespaceString& ns) override {
         MONGO_UNREACHABLE;
     }
 

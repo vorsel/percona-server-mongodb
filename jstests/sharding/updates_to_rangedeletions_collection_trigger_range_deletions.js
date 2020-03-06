@@ -1,7 +1,7 @@
 /**
  * Ensure that orphaned documents are deleted when the pending = true field is removed from the
  * config.rangeDeletions collection.
- *
+ * @tags: [multiversion_incompatible]
  */
 
 (function() {
@@ -66,7 +66,7 @@ let testColl = testDB.foo;
     let deletionTask = {
         nss: ns,
         collectionUuid: collectionUuid,
-        pending: "true",
+        pending: true,
         range: {min: {x: 70}, max: {x: 90}},
         whenToClean: "now"
     };
@@ -114,7 +114,7 @@ let testColl = testDB.foo;
     let deletionTask = {
         nss: ns,
         collectionUuid: UUID(),
-        pending: "true",
+        pending: true,
         range: {min: {x: 70}, max: {x: 90}},
         whenToClean: "now"
     };

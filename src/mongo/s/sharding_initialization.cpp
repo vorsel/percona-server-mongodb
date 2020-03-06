@@ -45,9 +45,12 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/time_proof_service.h"
+#include "mongo/executor/async_multicaster.h"
 #include "mongo/executor/connection_pool.h"
+#include "mongo/executor/connection_pool_stats.h"
 #include "mongo/executor/network_interface_factory.h"
 #include "mongo/executor/network_interface_thread_pool.h"
+#include "mongo/executor/scoped_task_executor.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/executor/thread_pool_task_executor.h"
@@ -57,6 +60,7 @@
 #include "mongo/s/catalog/dist_lock_catalog_impl.h"
 #include "mongo/s/catalog/replset_dist_lock_manager.h"
 #include "mongo/s/catalog/sharding_catalog_client_impl.h"
+#include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_factory.h"
 #include "mongo/s/client/sharding_network_connection_hook.h"
@@ -66,6 +70,7 @@
 #include "mongo/s/sharding_task_executor.h"
 #include "mongo/s/sharding_task_executor_pool_controller.h"
 #include "mongo/s/sharding_task_executor_pool_gen.h"
+#include "mongo/s/warmup_server_parameters.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/exit.h"
@@ -138,6 +143,26 @@ std::unique_ptr<TaskExecutorPool> makeShardingTaskExecutorPool(
     auto executorPool = std::make_unique<TaskExecutorPool>();
     executorPool->addExecutors(std::move(executors), std::move(fixedExec));
     return executorPool;
+}
+
+/**
+ * Uses an AsyncMulticaster to ping all of the hosts in order to establish
+ * ShardingTaskExecutorPoolMinSize connections. This does not wait
+ * for the connections to be established nor does it check how many were established.
+ */
+void preWarmConnections(OperationContext* opCtx, std::vector<HostAndPort> allHosts) {
+    auto const grid = Grid::get(opCtx);
+    auto arbi = grid->getExecutorPool()->getArbitraryExecutor();
+    auto executor = executor::ScopedTaskExecutor(arbi);
+    executor::AsyncMulticaster::Options options;
+
+    auto results =
+        executor::AsyncMulticaster(*executor, options)
+            .multicast(allHosts,
+                       "admin",
+                       BSON("ping" << 1),
+                       opCtx,
+                       Milliseconds(gWarmMinConnectionsInShardingTaskExecutorPoolOnStartupWaitMS));
 }
 
 }  // namespace
@@ -238,9 +263,14 @@ Status waitForShardRegistryReload(OperationContext* opCtx) {
 }
 
 Status preCacheMongosRoutingInfo(OperationContext* opCtx) {
+    if (!gLoadRoutingTableOnStartup) {
+        return Status::OK();
+    }
+
     if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
         return Status::OK();
     }
+
     auto grid = Grid::get(opCtx);
 
     auto shardingCatalogClient = grid->catalogClient();
@@ -261,6 +291,49 @@ Status preCacheMongosRoutingInfo(OperationContext* opCtx) {
             }
         }
     }
+    return Status::OK();
+}
+
+Status preWarmConnectionPool(OperationContext* opCtx) {
+    if (!gWarmMinConnectionsInShardingTaskExecutorPoolOnStartup) {
+        return Status::OK();
+    }
+
+    if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+        return Status::OK();
+    }
+
+    std::vector<HostAndPort> allHosts;
+    auto const grid = Grid::get(opCtx);
+    auto allShardsStatus =
+        grid->catalogClient()->getAllShards(opCtx, repl::ReadConcernLevel::kMajorityReadConcern);
+    if (!allShardsStatus.isOK()) {
+        return allShardsStatus.getStatus();
+    }
+    auto allShards = allShardsStatus.getValue().value;
+
+    for (auto& shard : allShards) {
+        auto connStrStatus = ConnectionString::parse(shard.getHost());
+        if (!connStrStatus.isOK()) {
+            return connStrStatus.getStatus();
+        }
+        auto connStr = connStrStatus.getValue();
+        for (const auto& hostEntry : connStr.getServers()) {
+            allHosts.push_back(hostEntry);
+        }
+    }
+    try {
+        opCtx->runWithDeadline(
+            opCtx->getServiceContext()->getPreciseClockSource()->now() +
+                Milliseconds(gWarmMinConnectionsInShardingTaskExecutorPoolOnStartupWaitMS),
+            ErrorCodes::ExceededTimeLimit,
+            [&] { preWarmConnections(opCtx, allHosts); });
+    } catch (const ExceptionFor<ErrorCodes::ExceededTimeLimit>&) {
+        // if we've timed out, eat the exception and continue
+    } catch (const DBException& ex) {
+        return ex.toStatus();
+    }
+
     return Status::OK();
 }
 

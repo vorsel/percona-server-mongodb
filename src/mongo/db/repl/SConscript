@@ -47,6 +47,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/background',
         '$BUILD_DIR/mongo/db/catalog/catalog_helpers',
         '$BUILD_DIR/mongo/db/catalog/database_holder',
+        '$BUILD_DIR/mongo/db/catalog/multi_index_block',
         '$BUILD_DIR/mongo/db/commands/feature_compatibility_parsers',
         '$BUILD_DIR/mongo/db/db_raii',
         '$BUILD_DIR/mongo/db/dbdirectclient',
@@ -505,6 +506,7 @@ env.Library(
     target='oplog_application_interface',
     source=[
         'oplog_applier.cpp',
+        'opqueue_batcher.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
@@ -524,7 +526,6 @@ env.Library(
     source=[
         'insert_group.cpp',
         'oplog_applier_impl.cpp',
-        'opqueue_batcher.cpp',
         'session_update_tracker.cpp',
     ],
     LIBDEPS=[
@@ -558,10 +559,14 @@ env.Library(
     target='tla_plus_trace_repl',
     source=[
         'tla_plus_trace_repl.cpp',
+        env.Idlc('tla_plus_trace_repl.idl')[0],
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/server_options',
+        '$BUILD_DIR/mongo/idl/idl_parser',
         '$BUILD_DIR/mongo/util/fail_point',
+        'repl_coordinator_interface',
     ],
 )
 
@@ -626,6 +631,7 @@ env.Library('topology_coordinator',
                 'member_data.cpp',
                 'topology_coordinator.cpp',
                 env.Idlc('topology_coordinator.idl')[0],
+                env.Idlc('topology_version.idl')[0],
             ],
             LIBDEPS=[
                 '$BUILD_DIR/mongo/db/audit',
@@ -639,6 +645,7 @@ env.Library('topology_coordinator',
             LIBDEPS_PRIVATE=[
                 '$BUILD_DIR/mongo/db/catalog/commit_quorum_options',
                 '$BUILD_DIR/mongo/idl/server_parameter',
+                'isself',
                 'split_horizon',
             ])
 
@@ -1332,6 +1339,7 @@ env.CppUnitTest(
         'topology_coordinator_v1_test.cpp',
     ],
     LIBDEPS=[
+        'isself',
         'repl_coordinator_impl',
         'repl_coordinator_test_fixture',
         'topology_coordinator',

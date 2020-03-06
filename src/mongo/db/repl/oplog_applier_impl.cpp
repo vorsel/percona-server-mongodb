@@ -43,6 +43,7 @@
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/repl/apply_ops.h"
 #include "mongo/db/repl/insert_group.h"
+#include "mongo/db/repl/tla_plus_trace_repl.h"
 #include "mongo/db/repl/transaction_oplog_application.h"
 #include "mongo/db/stats/timer_stats.h"
 #include "mongo/platform/basic.h"
@@ -365,19 +366,12 @@ OplogApplierImpl::OplogApplierImpl(executor::TaskExecutor* executor,
       _writerPool(writerPool),
       _storageInterface(storageInterface),
       _consistencyMarkers(consistencyMarkers),
-      _beginApplyingOpTime(options.beginApplyingOpTime) {
-    auto getNextApplierBatchFn = [this](OperationContext* opCtx, const BatchLimits& batchLimits) {
-        return getNextApplierBatch(opCtx, batchLimits);
-    };
-
-    _opQueueBatcher = std::make_unique<OpQueueBatcher>(
-        this, _storageInterface, oplogBuffer, getNextApplierBatchFn);
-}
+      _beginApplyingOpTime(options.beginApplyingOpTime) {}
 
 void OplogApplierImpl::_run(OplogBuffer* oplogBuffer) {
     // Start up a thread from the batcher to pull from the oplog buffer into the batcher's oplog
     // queue.
-    _opQueueBatcher->startup();
+    _opQueueBatcher->startup(_storageInterface);
 
     ON_BLOCK_EXIT([this] { _opQueueBatcher->shutdown(); });
 
@@ -668,6 +662,10 @@ StatusWith<OpTime> OplogApplierImpl::_applyOplogBatch(OperationContext* opCtx,
                 }
             }
         }
+    }
+
+    if (MONGO_unlikely(logForTLAPlusSpecs.shouldFail())) {
+        tlaPlusRaftMongoEvent(opCtx, RaftMongoSpecActionEnum::kAppendOplog);
     }
 
     // Tell the storage engine to flush the journal now that a replication batch has completed. This

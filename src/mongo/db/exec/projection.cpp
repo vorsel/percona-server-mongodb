@@ -36,6 +36,7 @@
 
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/projection_executor_builder.h"
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/jsobj.h"
@@ -174,7 +175,8 @@ ProjectionStageDefault::ProjectionStageDefault(boost::intrusive_ptr<ExpressionCo
     : ProjectionStage{expCtx, projObj, ws, std::move(child), "PROJECTION_DEFAULT"},
       _wantRecordId{projection->metadataDeps()[DocumentMetadataFields::kRecordId]},
       _projectType{projection->type()},
-      _executor{projection_executor::buildProjectionExecutor(expCtx, projection, {})} {}
+      _executor{projection_executor::buildProjectionExecutor(
+          expCtx, projection, {}, true /* optimizeExecutor */)} {}
 
 Status ProjectionStageDefault::transform(WorkingSetMember* member) const {
     Document input;

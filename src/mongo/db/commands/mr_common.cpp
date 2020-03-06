@@ -39,6 +39,8 @@
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/exec/inclusion_projection_executor.h"
+#include "mongo/db/exec/projection_node.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/pipeline/accumulator_js_reduce.h"
 #include "mongo/db/pipeline/document_source.h"
@@ -51,8 +53,6 @@
 #include "mongo/db/pipeline/document_source_sort.h"
 #include "mongo/db/pipeline/document_source_unwind.h"
 #include "mongo/db/pipeline/expression_javascript.h"
-#include "mongo/db/pipeline/parsed_aggregation_projection_node.h"
-#include "mongo/db/pipeline/parsed_inclusion_projection.h"
 #include "mongo/db/query/util/make_data_structure.h"
 #include "mongo/util/intrusive_counter.h"
 #include "mongo/util/log.h"
@@ -110,11 +110,11 @@ auto translateSort(boost::intrusive_ptr<ExpressionContext> expCtx, const BSONObj
 auto translateMap(boost::intrusive_ptr<ExpressionContext> expCtx, std::string code) {
     auto emitExpression = ExpressionInternalJsEmit::create(
         expCtx, ExpressionFieldPath::parse(expCtx, "$$ROOT", expCtx->variablesParseState), code);
-    auto node = std::make_unique<parsed_aggregation_projection::InclusionNode>(
+    auto node = std::make_unique<projection_executor::InclusionNode>(
         ProjectionPolicies{ProjectionPolicies::DefaultIdPolicy::kExcludeId});
     node->addExpressionForPath(FieldPath{"emits"s}, std::move(emitExpression));
     auto inclusion = std::unique_ptr<TransformerInterface>{
-        std::make_unique<parsed_aggregation_projection::ParsedInclusionProjection>(
+        std::make_unique<projection_executor::InclusionProjectionExecutor>(
             expCtx,
             ProjectionPolicies{ProjectionPolicies::DefaultIdPolicy::kExcludeId},
             std::move(node))};
@@ -145,12 +145,12 @@ auto translateFinalize(boost::intrusive_ptr<ExpressionContext> expCtx, std::stri
                 ExpressionFieldPath::parse(expCtx, "$_id", expCtx->variablesParseState),
                 ExpressionFieldPath::parse(expCtx, "$value", expCtx->variablesParseState))),
         code);
-    auto node = std::make_unique<parsed_aggregation_projection::InclusionNode>(
+    auto node = std::make_unique<projection_executor::InclusionNode>(
         ProjectionPolicies{ProjectionPolicies::DefaultIdPolicy::kIncludeId});
     node->addProjectionForPath(FieldPath{"_id"s});
     node->addExpressionForPath(FieldPath{"value"s}, std::move(jsExpression));
     auto inclusion = std::unique_ptr<TransformerInterface>{
-        std::make_unique<parsed_aggregation_projection::ParsedInclusionProjection>(
+        std::make_unique<projection_executor::InclusionProjectionExecutor>(
             expCtx,
             ProjectionPolicies{ProjectionPolicies::DefaultIdPolicy::kIncludeId},
             std::move(node))};
@@ -159,13 +159,8 @@ auto translateFinalize(boost::intrusive_ptr<ExpressionContext> expCtx, std::stri
 }
 
 auto translateOutReplace(boost::intrusive_ptr<ExpressionContext> expCtx,
-                         const StringData inputDatabase,
                          NamespaceString targetNss) {
-    uassert(31278,
-            "MapReduce must output to the database belonging to its input collection - Input: "s +
-                inputDatabase + " Output: " + targetNss.db(),
-            inputDatabase == targetNss.db());
-    return DocumentSourceOut::create(std::move(targetNss), expCtx);
+    return DocumentSourceOut::createAndAllowDifferentDB(std::move(targetNss), expCtx);
 }
 
 auto translateOutMerge(boost::intrusive_ptr<ExpressionContext> expCtx, NamespaceString targetNss) {
@@ -181,18 +176,31 @@ auto translateOutMerge(boost::intrusive_ptr<ExpressionContext> expCtx, Namespace
 
 auto translateOutReduce(boost::intrusive_ptr<ExpressionContext> expCtx,
                         NamespaceString targetNss,
-                        std::string code) {
+                        std::string reduceCode,
+                        boost::optional<MapReduceJavascriptCode> finalizeCode) {
     // Because of communication for sharding, $merge must hold on to a serializable BSON object
     // at the moment so we reparse here. Note that the reduce function signature expects 2
     // arguments, the first being the key and the second being the array of values to reduce.
     auto reduceObj = BSON("args" << BSON_ARRAY("$_id" << BSON_ARRAY("$value"
                                                                     << "$$new.value"))
-                                 << "eval" << code);
+                                 << "eval" << reduceCode);
 
-    auto finalProjectSpec =
+    auto reduceSpec =
         BSON(DocumentSourceProject::kStageName
              << BSON("value" << BSON(ExpressionInternalJs::kExpressionName << reduceObj)));
-    auto pipelineSpec = boost::make_optional(std::vector<BSONObj>{finalProjectSpec});
+    auto pipelineSpec = boost::make_optional(std::vector<BSONObj>{reduceSpec});
+
+    // Build finalize $project stage if given.
+    if (finalizeCode) {
+        auto finalizeObj = BSON("args" << BSON_ARRAY("$_id"
+                                                     << "$value")
+                                       << "eval" << finalizeCode->getCode());
+        auto finalizeSpec =
+            BSON(DocumentSourceProject::kStageName
+                 << BSON("value" << BSON(ExpressionInternalJs::kExpressionName << finalizeObj)));
+        pipelineSpec->emplace_back(std::move(finalizeSpec));
+    }
+
     return DocumentSourceMerge::create(targetNss,
                                        expCtx,
                                        MergeWhenMatchedModeEnum::kPipeline,
@@ -205,16 +213,17 @@ auto translateOutReduce(boost::intrusive_ptr<ExpressionContext> expCtx,
 
 auto translateOut(boost::intrusive_ptr<ExpressionContext> expCtx,
                   const OutputType outputType,
-                  const StringData inputDatabase,
                   NamespaceString targetNss,
-                  std::string reduceCode) {
+                  std::string reduceCode,
+                  boost::optional<MapReduceJavascriptCode> finalizeCode) {
     switch (outputType) {
         case OutputType::Replace:
-            return boost::make_optional(translateOutReplace(expCtx, inputDatabase, targetNss));
+            return boost::make_optional(translateOutReplace(expCtx, targetNss));
         case OutputType::Merge:
             return boost::make_optional(translateOutMerge(expCtx, targetNss));
         case OutputType::Reduce:
-            return boost::make_optional(translateOutReduce(expCtx, targetNss, reduceCode));
+            return boost::make_optional(translateOutReduce(
+                expCtx, targetNss, std::move(reduceCode), std::move(finalizeCode)));
         case OutputType::InMemory:;
     }
     return boost::optional<boost::intrusive_ptr<mongo::DocumentSource>>{};
@@ -337,22 +346,12 @@ bool mrSupportsWriteConcern(const BSONObj& cmd) {
 
 std::unique_ptr<Pipeline, PipelineDeleter> translateFromMR(
     MapReduce parsedMr, boost::intrusive_ptr<ExpressionContext> expCtx) {
-    // Verify that source and output collections are different.
-    // Note that $out allows for the source and the destination to match, so only reject
-    // in the case that the out option is being converted to a $merge.
-    auto& inNss = parsedMr.getNamespace();
     auto outNss = NamespaceString{parsedMr.getOutOptions().getDatabaseName()
                                       ? *parsedMr.getOutOptions().getDatabaseName()
                                       : parsedMr.getNamespace().db(),
                                   parsedMr.getOutOptions().getCollectionName()};
 
     auto outType = parsedMr.getOutOptions().getOutputType();
-    if (outType == OutputType::Merge || outType == OutputType::Reduce) {
-        uassert(ErrorCodes::InvalidOptions,
-                "Source collection cannot be the same as destination collection in MapReduce when "
-                "using merge or reduce actions",
-                inNss != outNss);
-    }
 
     // If non-inline output, verify that the target collection is *not* sharded by anything other
     // than _id.
@@ -390,9 +389,9 @@ std::unique_ptr<Pipeline, PipelineDeleter> translateFromMR(
                 }),
                 translateOut(expCtx,
                              outType,
-                             parsedMr.getNamespace().db(),
                              std::move(outNss),
-                             parsedMr.getReduce().getCode())),
+                             parsedMr.getReduce().getCode(),
+                             parsedMr.getFinalize())),
             expCtx));
         pipeline->optimizePipeline();
         return pipeline;

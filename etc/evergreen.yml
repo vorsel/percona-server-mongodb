@@ -427,6 +427,53 @@ variables:
   - enterprise-ubuntu1804-64
   - enterprise-windows
 
+# List of all variants that use the packages.tgz
+- package_variants: &package_variants
+  - amazon
+  - enterprise-linux-64-amazon-ami
+  - amazon2
+  - enterprise-amazon2
+  - debian10
+  - enterprise-debian10-64
+  - debian92
+  - enterprise-debian92-64
+  - rhel62
+  - enterprise-rhel-62-64-bit
+  - enterprise-rhel-62-64-bit-coverage
+  - rhel-67-s390x
+  - enterprise-rhel-67-s390x
+  - rhel70
+  - rhel76_compile_rhel70
+  - enterprise-rhel-70-64-bit
+  - rhel-72-s390x
+  - enterprise-rhel-71-ppc64le
+  - enterprise-rhel-72-s390x
+  - rhel80
+  - enterprise-rhel-80-64-bit
+  - suse12
+  - suse12-s390x
+  - enterprise-suse12-64
+  - enterprise-suse12-s390x
+  - suse15
+  - enterprise-suse15-64
+  - ubuntu1604
+  - ubuntu1604-debug
+  - enterprise-ubuntu1604-64
+  - enterprise-ubuntu1604-arm64
+  - enterprise-ubuntu-dynamic-1604-64-bit
+  - enterprise-ubuntu-dynamic-1604-clang
+  - enterprise-ubuntu-dynamic-1604-clang-tidy
+  - ubuntu-dynamic-1604-clang
+  - ubuntu1804
+  - ubuntu1804-arm64
+  - ubuntu1804-debug-aubsan-async
+  - ubuntu1804-s390x
+  - enterprise-ubuntu1804-64
+  - enterprise-ubuntu1804-arm64
+  - enterprise-ubuntu1804-ppc64le
+  - enterprise-ubuntu1804-s390x
+
+
 #######################################
 #            Functions                #
 #######################################
@@ -487,6 +534,7 @@ functions:
       remote_file: ${project}/${build_variant}/${revision}/artifacts/${build_id}-packages.tgz
       bucket: mciuploads
       extract_to: src
+      build_variants: *package_variants
 
   "fetch binaries": &fetch_binaries
     command: s3.get
@@ -847,101 +895,6 @@ functions:
         done
         fi
 
-  "setup gradle signing keys":
-    command: shell.exec
-    params:
-      silent: true
-      shell: bash
-      script: |
-        cd src/src/mongo/embedded/mongo_embedded/java
-
-        echo '${mongodb_mobile_release_secring}' | base64 -d > embedded-android/secring.gpg
-
-        cat <<EOF > local.properties
-        signing.keyId=${mongodb_mobile_release_signing_keyid}
-        signing.password=${mongodb_mobile_release_signing_password}
-        signing.secretKeyRingFile=${mongodb_mobile_release_signing_secretkeyringfile}
-
-        ossrhUsername=${mongodb_mobile_ossrh_username}
-        ossrhPassword=${mongodb_mobile_ossrh_password}
-        EOF
-
-        cat <<EOF > artifactory_mobile_creds.sh
-        export artifactory_mobile_user=${artifactory_mobile_user}
-        export artifactory_mobile_pass=${artifactory_mobile_pass}
-        EOF
-
-  "setup android toolchain":
-    command: shell.exec
-    params:
-      script: |
-        set -o errexit
-        set -o verbose
-        if [ "${setup_android_toolchain|}" = "true" ]; then
-            ${activate_virtualenv}
-            PYTHON=$python ${compile_env|} src/buildscripts/setup-android-toolchain.sh $(pwd)/android_sdk
-        fi
-
-  "build java embedded sdk":
-    command: shell.exec
-    params:
-      shell: bash
-      script: |
-        set -o errexit
-        set -o verbose
-
-        # If the android toolchain has not been setup the android sdk will not
-        # be available and we should not build the android version of mongodb
-        # embedded.
-        if [ "${setup_android_toolchain|}" != "true" ]; then
-            echo "Android toolchain has not been setup, skipping \"build java embedded sdk\""
-            exit 0
-        fi
-
-        export ANDROID_HOME=$(pwd)/android_sdk
-        MINOR_VER=$(echo "${version}" | awk -F. '{print $(NF-1)}')
-        if [ $(($MINOR_VER % 2)) != 0 ]; then
-            EMBEDDED_RELEASE_VERSION="${version}-SNAPSHOT"
-        else
-            EMBEDDED_RELEASE_VERSION="${version}"
-        fi
-
-        cd src/src/mongo/embedded/mongo_embedded/java
-
-        # TODO: Clean this up later where we can remove duplication
-        if [ "${package_type|embedded-android}" = "embedded-jar" ]; then
-            tar zxvf ../../../../../../embedded-sdk-java-linux-x86-64.tgz
-            mkdir -p jniLibs/linux-x86-64
-            cp ./mongo-embedded-sdk-${version}/lib/libmongo_embedded.so jniLibs/linux-x86-64
-            rm -rf ./mongo-embedded-sdk-${version}
-
-            tar zxvf ../../../../../../embedded-sdk-java-darwin.tgz
-            mkdir -p jniLibs/darwin
-            cp ./mongo-embedded-sdk-${version}/lib/libmongo_embedded.dylib jniLibs/darwin
-            rm -rf ./mongo-embedded-sdk-${version}
-
-            ./gradlew clean :embedded-jar:build :embedded-jar:publishMavenPublicationToLocalRepository
-
-            mkdir -p ../../../../../build/mongo-embedded-sdk-$EMBEDDED_RELEASE_VERSION/java
-            cp -r embedded-jar/build/repo/* ../../../../../build/mongo-embedded-sdk-$EMBEDDED_RELEASE_VERSION/java
-        else
-            for arch in arm64-v8a armeabi-v7a x86_64 ; do
-                tar zxvf ../../../../../../embedded-sdk-android-$arch.tgz
-                mkdir -p jniLibs/$arch
-                cp ./mongo-embedded-sdk-${version}/lib/libmongo_embedded.so jniLibs/$arch
-                rm -rf ./mongo-embedded-sdk-${version}
-            done
-
-            ./gradlew clean :embedded-android:build
-            # Is this a release?
-            if [ "${is_release|false}" = "true" ]; then
-                ./gradlew :embedded-android:uploadArchives closeAndReleaseRepository
-            fi
-
-            mkdir -p ../../../../../build/mongo-embedded-sdk-$EMBEDDED_RELEASE_VERSION/android
-            cp -r embedded-android/build/outputs/aar/* ../../../../../build/mongo-embedded-sdk-$EMBEDDED_RELEASE_VERSION/android
-        fi
-
   "shared scons cache pruning":
     command: shell.exec
     type: system
@@ -1278,6 +1231,8 @@ functions:
         value: ${project}/${build_variant}/${revision}/binaries/mongo-cryptd-${build_id}.${ext|tgz}
       - key: mh_archive
         value: ${project}/${build_variant}/${revision}/binaries/mh-${build_id}.${ext|tgz}
+      - key: mh_debugsymbols
+        value: ${project}/${build_variant}/${revision}/debugsymbols/mh-debugsymbols-${build_id}.${ext|tgz}
       - key: mongo_debugsymbols
         value: ${project}/${build_variant}/${revision}/debugsymbols/debugsymbols-${build_id}.${ext|tgz}
       - key: mongo_shell
@@ -1430,7 +1385,7 @@ functions:
           --edition $edition                                 \
           --platform $platform                               \
           --architecture $architecture                       \
-          --useLatest 4.2
+          --useLatest 4.2 4.2.1
 
   "execute resmoke tests": &execute_resmoke_tests
     command: shell.exec
@@ -1931,7 +1886,7 @@ functions:
           fi
 
           echo "Shared Cache with setting: ${scons_cache_scope}"
-          MONGO_VERSION=$MONGO_VERSION SCONS_CACHE_MODE=${scons_cache_mode|nolinked} SCONS_CACHE_SCOPE=$scons_cache_scope IS_PATCH=${is_patch} $python buildscripts/generate_compile_expansions_shared_cache.py --out compile_expansions.yml
+          MONGO_VERSION=$MONGO_VERSION SCONS_CACHE_MODE=${scons_cache_mode|nolinked} SCONS_CACHE_SCOPE=$scons_cache_scope IS_PATCH=${is_patch} IS_COMMIT_QUEUE=${is_commit_queue|false} $python buildscripts/generate_compile_expansions_shared_cache.py --out compile_expansions.yml
 
         # Legacy Expansion generation
         else
@@ -2154,7 +2109,7 @@ functions:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
         local_file: generate_tasks_config.tgz
-        remote_file: ${project}/${build_variant}/${revision}/generate_tasks/${task_id}-${execution}.tgz
+        remote_file: ${project}/${build_variant}/${revision}/generate_tasks/${name}_gen-${build_id}.tgz
         bucket: mciuploads
         permissions: public-read
         content_type: ${content_type|application/gzip}
@@ -3772,8 +3727,6 @@ tasks:
           mv mongodb-src-*.${ext|tgz} distsrc.${ext|tgz}
           mv mongodb-*-debugsymbols.${ext|tgz} mongo-debugsymbols.tgz || true
           mv mongodb-*.${ext|tgz} mongodb-binaries.tgz
-          mv mh-*-debugsymbols.${ext|tgz} mh-debugsymbols.${ext|tgz} || true
-          mv mh-mongodb*.${ext|tgz} mh-binaries.${ext|tgz} || true
 
     # Tar unstripped dbtest, to be archived in case of failure
     - command: archive.targz_pack
@@ -3859,6 +3812,7 @@ tasks:
           - "src/mongo/util/options_parser/test_config_files/**"
           - "library_dependency_graph.json"
           - "src/third_party/JSON-Schema-Test-Suite/tests/draft4/**"
+          - "src/third_party/mock_ocsp_responder/**"
           - "bypass_compile_expansions.yml"
           - "patch_files.txt"
           - "artifacts.json"
@@ -3905,7 +3859,7 @@ tasks:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
         local_file: src/mh-debugsymbols.${ext|tgz}
-        remote_file: ${mh_archive}
+        remote_file: ${mh_debugsymbols}
         bucket: mciuploads
         permissions: public-read
         content_type: ${content_type|application/gzip}
@@ -3991,6 +3945,20 @@ tasks:
           --detect-odr-violations
           --install-mode=hygienic
           --separate-debug
+
+- name: compile_ninja
+  commands:
+    - func: "scons compile"
+      vars:
+        task_compile_flags: >-
+          --ninja
+        targets:
+          all.build.ninja
+    - command: shell.exec
+      params:
+        working_dir: src
+        shell: bash
+        script: ninja -f all.build.ninja
 
 ## compile_all - build all scons targets ##
 - name: compile_all
@@ -4213,31 +4181,6 @@ tasks:
         task_compile_flags_extra: >-
           --link-model=dynamic-sdk
 
-    # Unfortunately, it is very hard to get the symbol map filename
-    # correct in SCons. We work around that here by letting SCons give
-    # them a well known name, and then renaming them appropriately
-    # once we have finished the build.
-    - command: shell.exec
-      params:
-        working_dir: "src/build"
-        script: |
-          set -o errexit
-          set -o verbose
-
-          cd mongo-embedded-sdk-${version}
-
-          if [ -e Frameworks/mongo_embedded.framework/BCSymbolMaps ]; then
-              pushd Frameworks/mongo_embedded.framework
-              mv BCSymbolMaps/libmongo_embedded.dylib.bcsymbolmap BCSymbolMaps/$(dwarfdump -u mongo_embedded | awk '{ print $2 }').bcsymbolmap
-              popd
-          fi
-
-          if [ -e Frameworks/mongoc_embedded.framework/BCSymbolMaps ]; then
-              pushd Frameworks/mongoc_embedded.framework
-              mv BCSymbolMaps/libmongoc_embedded.dylib.bcsymbolmap BCSymbolMaps/$(dwarfdump -u mongoc_embedded | awk '{ print $2 }').bcsymbolmap
-              popd
-          fi
-
 - name: embedded_sdk_s3_put
   commands:
     # Not using archive.targz_pack here because I can't get it to work.
@@ -4309,18 +4252,6 @@ tasks:
 - name: embedded_sdk_run_tests
   commands:
     - command: shell.exec
-      params:
-        working_dir: "src/build/mongo-embedded-sdk-${version}"
-        script: |
-          set -o errexit
-          set -o verbose
-
-          if [ ${enable_embedded_tests|false} = "ios_tvos_simulator" -a $(command -v xcrun) ]; then
-            find ./lib -type f -name "*.dylib" -print0 | xargs -0 -L 1 xcrun codesign -s -
-            find ./Frameworks -type f -name "*" '!' -name "*.*" -print0 | xargs -0 -L 1 xcrun codesign -s -
-          fi
-
-    - command: shell.exec
       type: test
       params:
         working_dir: src
@@ -4329,18 +4260,8 @@ tasks:
           set -o errexit
 
           ${activate_virtualenv}
-          if [ ${enable_embedded_tests|false} = "ios_tvos_simulator" ]; then
-              ${compile_env|} buildscripts/runiossim.sh ${ios_sim_device} ${ios_sim_runtime} "build/mongo-embedded-sdk-${version}/bin/mongo_embedded_test" --tempPath /data
-              ${compile_env|} buildscripts/runiossim.sh ${ios_sim_device} ${ios_sim_runtime} "build/mongo-embedded-sdk-${version}/bin/mongoc_embedded_test" --tempPath /data
-          elif [ ${enable_embedded_tests|false} = "android_emulator" ]; then
-              cp -r build/mongo-embedded-sdk-${version} build/mongo-embedded-sdk-${version}-exec
-              find build/mongo-embedded-sdk-${version}-exec/bin build/mongo-embedded-sdk-${version}-exec/lib -type f -name "*.debug" -delete
-              ${compile_env|} buildscripts/runandroidsim.sh $(dirname $(pwd))/android_sdk ${android_toolchain_system_image_arch} ${android_system_image_version} "build/mongo-embedded-sdk-${version}-exec" "bin/mongo_embedded_test" --tempPath /data
-              ${compile_env|} buildscripts/runandroidsim.sh $(dirname $(pwd))/android_sdk ${android_toolchain_system_image_arch} ${android_system_image_version} "build/mongo-embedded-sdk-${version}-exec" "bin/mongoc_embedded_test" --tempPath /data
-          elif [ ${enable_embedded_tests|false} = "native" ]; then
-            "build/mongo-embedded-sdk-${version}/bin/mongo_embedded_test"
-            "build/mongo-embedded-sdk-${version}/bin/mongoc_embedded_test"
-          fi
+          "build/mongo-embedded-sdk-${version}/bin/mongo_embedded_test"
+          "build/mongo-embedded-sdk-${version}/bin/mongoc_embedded_test"
 
     # If this is a patch build, blow away the file so our subsequent and optional s3.put
     # doesn't run. That way, we won't overwrite the latest part in our patches.
@@ -4387,627 +4308,11 @@ tasks:
         permissions: public-read
         content_type: ${content_type|application/x-gzip}
 
-- name: embedded_sdk_multiarch_android_package
-  depends_on:
-    - name: embedded_sdk_s3_put
-      variant: embedded-sdk-android-arm32
-    - name: embedded_sdk_s3_put
-      variant: embedded-sdk-android-arm64
-    - name: embedded_sdk_s3_put
-      variant: embedded-sdk-android-x86_64
-  commands:
-    - command: manifest.load
-    - func: "git get project"
-    - func: "get buildnumber"
-    - func: "set up credentials"
-    - func: "setup android toolchain" # noop if ${setup_android_toolchain} is not "true"
-    - func: "set task expansion macros"
-    - func: "set up virtualenv"
-    - func: "upload pip requirements"
-    - func: "set up win mount script"
-    - func: "generate compile expansions"
-    - func: "apply compile expansions"
-    - command: s3.get
-      params:
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        remote_file: ${project}/embedded-sdk/embedded-sdk-android-arm32/${revision}/mongo-embedded-sdk-${version}.tgz
-        bucket: mciuploads
-        local_file: "embedded-sdk-android-armeabi-v7a.tgz"
-    - command: s3.get
-      params:
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        remote_file: ${project}/embedded-sdk/embedded-sdk-android-arm64/${revision}/mongo-embedded-sdk-${version}.tgz
-        bucket: mciuploads
-        local_file: "embedded-sdk-android-arm64-v8a.tgz"
-    - command: s3.get
-      params:
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        remote_file: ${project}/embedded-sdk/embedded-sdk-android-x86_64/${revision}/mongo-embedded-sdk-${version}.tgz
-        bucket: mciuploads
-        local_file: "embedded-sdk-android-x86_64.tgz"
-    - func: "setup gradle signing keys"
-    - func: "build java embedded sdk"
-    - command: shell.exec
-      params:
-        script: |
-          set -o errexit
-          set -o verbose
-
-          MINOR_VER=$(echo "${version}" | awk -F. '{print $(NF-1)}')
-          if [ $(($MINOR_VER % 2)) != 0 ]; then
-            EMBEDDED_RELEASE_VERSION="${version}-SNAPSHOT"
-          else
-            EMBEDDED_RELEASE_VERSION="${version}"
-          fi
-
-          if [ "${setup_android_toolchain|}" = "true" ]; then
-            cd src/build
-            tar zcvf mongo-embedded-sdk-${version}.tgz mongo-embedded-sdk-$EMBEDDED_RELEASE_VERSION
-          fi
-    - command: s3.put
-      params:
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        local_file: "src/build/mongo-embedded-sdk-${version}.tgz"
-        remote_file: "${project}/embedded-sdk/embedded-sdk-android-multiarch/${revision}/mongo-embedded-sdk-${version}.tgz"
-        bucket: mciuploads
-        permissions: public-read
-        content_type: application/tar
-        display_name: "Embedded SDK Tar Archive"
-
-    # If this is a patch build, blow away the file so our subsequent and optional s3.put
-    # doesn't run. That way, we won't overwrite the latest part in our patches.
-    - command: shell.exec
-      params:
-        script: |
-          set -o errexit
-          set -o verbose
-
-          if [ "${is_patch}" = "true" ]; then
-            rm -f src/build/mongo-embedded-sdk-${version}.tgz
-          fi
-    # A second put, this time to -latest, to give devs a reasonable
-    # way to get the most recent build.
-    - command: s3.put
-      params:
-        visibility: none
-        optional: true
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        local_file: "src/build/mongo-embedded-sdk-${version}.tgz"
-        remote_file: ${project}/embedded-sdk/mongo-${build_variant}-latest.tgz
-        bucket: mciuploads
-        permissions: public-read
-        content_type: application/tar
-
-- name: embedded_sdk_multiarch_java_package
-  depends_on:
-    - name: embedded_sdk_s3_put
-      variant: embedded-sdk-ubuntu-1604-x86_64
-    - name: embedded_sdk_s3_put
-      variant: embedded-sdk-macos
-  commands:
-    - command: manifest.load
-    - func: "git get project"
-    - func: "get buildnumber"
-    - func: "set up credentials"
-    - func: "setup android toolchain" # noop if ${setup_android_toolchain} is not "true"
-    - func: "set task expansion macros"
-    - func: "set up virtualenv"
-    - func: "upload pip requirements"
-    - func: "set up win mount script"
-    - func: "generate compile expansions"
-    - func: "apply compile expansions"
-    - command: s3.get
-      params:
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        remote_file: ${project}/embedded-sdk/embedded-sdk-ubuntu-1604-x86_64/${revision}/mongo-embedded-sdk-${version}.tgz
-        bucket: mciuploads
-        local_file: "embedded-sdk-java-linux-x86-64.tgz"
-    - command: s3.get
-      params:
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        remote_file: ${project}/embedded-sdk/embedded-sdk-macos/${revision}/mongo-embedded-sdk-${version}.tgz
-        bucket: mciuploads
-        local_file: "embedded-sdk-java-darwin.tgz"
-    - func: "setup gradle signing keys"
-    - func: "build java embedded sdk"
-      vars:
-        package_type: embedded-jar
-    - command: shell.exec
-      params:
-        script: |
-          set -o errexit
-          set -o verbose
-
-          MINOR_VER=$(echo "${version}" | awk -F. '{print $(NF-1)}')
-          if [ $(($MINOR_VER % 2)) != 0 ]; then
-            EMBEDDED_RELEASE_VERSION="${version}-SNAPSHOT"
-          else
-            EMBEDDED_RELEASE_VERSION="${version}"
-          fi
-
-          if [ "${setup_android_toolchain|}" = "true" ]; then
-            cd src/build
-            tar zcvf mongo-embedded-sdk-${version}.tgz mongo-embedded-sdk-$EMBEDDED_RELEASE_VERSION
-          fi
-    - command: s3.put
-      params:
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        local_file: "src/build/mongo-embedded-sdk-${version}.tgz"
-        remote_file: "${project}/embedded-sdk/embedded-sdk-java-multiarch/${revision}/mongo-embedded-sdk-${version}.tgz"
-        bucket: mciuploads
-        permissions: public-read
-        content_type: application/tar
-        display_name: "Embedded SDK Tar Archive"
-    # If this is a patch build, blow away the file so our subsequent and optional s3.put
-    # doesn't run. That way, we won't overwrite the latest part in our patches.
-    - command: shell.exec
-      params:
-        script: |
-          set -o errexit
-          set -o verbose
-
-          if [ "${is_patch}" = "true" ]; then
-            rm -f src/build/mongo-embedded-sdk-${version}.tgz
-          fi
-    # A second put, this time to -latest, to give devs a reasonable
-    # way to get the most recent build.
-    - command: s3.put
-      params:
-        visibility: none
-        optional: true
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        local_file: "src/build/mongo-embedded-sdk-${version}.tgz"
-        remote_file: ${project}/embedded-sdk/mongo-${build_variant}-latest.tgz
-        bucket: mciuploads
-        permissions: public-read
-        content_type: application/tar
-
-
-- name: embedded_sdk_multiarch_apple_package
-  depends_on:
-    - name: embedded_sdk_s3_put
-      variant: embedded-sdk-macos
-    - name: embedded_sdk_s3_put
-      variant: embedded-sdk-iphoneos
-    - name: embedded_sdk_s3_put
-      variant: embedded-sdk-iphonesimulator
-    - name: embedded_sdk_s3_put
-      variant: embedded-sdk-appletvos
-    - name: embedded_sdk_s3_put
-      variant: embedded-sdk-appletvsimulator
-    - name: embedded_sdk_s3_put
-      variant: embedded-sdk-watchos
-    - name: embedded_sdk_s3_put
-      variant: embedded-sdk-watchsimulator
-
-  commands:
-    - command: manifest.load
-    - func: "git get project"
-    - func: "get buildnumber"
-    - func: "set up credentials"
-    - func: "generate compile expansions"
-    - func: "apply compile expansions"
-
-    - command: s3.get
-      params:
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        remote_file: ${project}/embedded-sdk/embedded-sdk-macos/${revision}/mongo-embedded-sdk-${version}.tgz
-        bucket: mciuploads
-        local_file: "mongo-embedded-sdk-${version}/MacOS/embedded-sdk.tgz"
-
-    - command: s3.get
-      params:
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        remote_file: ${project}/embedded-sdk/embedded-sdk-iphoneos/${revision}/mongo-embedded-sdk-${version}.tgz
-        bucket: mciuploads
-        local_file: "mongo-embedded-sdk-${version}/iPhoneOS/embedded-sdk.tgz"
-
-    - command: s3.get
-      params:
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        remote_file: ${project}/embedded-sdk/embedded-sdk-iphonesimulator/${revision}/mongo-embedded-sdk-${version}.tgz
-        bucket: mciuploads
-        local_file: "mongo-embedded-sdk-${version}/iPhoneSimulator/embedded-sdk.tgz"
-
-    - command: s3.get
-      params:
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        remote_file: ${project}/embedded-sdk/embedded-sdk-appletvos/${revision}/mongo-embedded-sdk-${version}.tgz
-        bucket: mciuploads
-        local_file: "mongo-embedded-sdk-${version}/AppleTVOS/embedded-sdk.tgz"
-
-    - command: s3.get
-      params:
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        remote_file: ${project}/embedded-sdk/embedded-sdk-appletvsimulator/${revision}/mongo-embedded-sdk-${version}.tgz
-        bucket: mciuploads
-        local_file: "mongo-embedded-sdk-${version}/AppleTVSimulator/embedded-sdk.tgz"
-
-    - command: s3.get
-      params:
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        remote_file: ${project}/embedded-sdk/embedded-sdk-watchos/${revision}/mongo-embedded-sdk-${version}.tgz
-        bucket: mciuploads
-        local_file: "mongo-embedded-sdk-${version}/WatchOS/embedded-sdk.tgz"
-
-    - command: s3.get
-      params:
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        remote_file: ${project}/embedded-sdk/embedded-sdk-watchsimulator/${revision}/mongo-embedded-sdk-${version}.tgz
-        bucket: mciuploads
-        local_file: "mongo-embedded-sdk-${version}/WatchSimulator/embedded-sdk.tgz"
-
-    - command: shell.exec
-      params:
-        script: |
-          set -o errexit
-          set -o verbose
-
-          pushd mongo-embedded-sdk-${version}
-
-          for directory in *OS *Simulator; do
-              pushd $directory
-              tar --include "*/Frameworks/*" --strip-components=1 -xf ./embedded-sdk.tgz
-              popd
-          done
-
-          for platform in iPhone AppleTV Watch; do
-              for framework in bson mongoc mongo_embedded mongoc_embedded; do
-                  _OSFile=$(printf ./%sOS/Frameworks/%s.framework/%s $platform $framework $framework)
-                  _SimulatorFile=$(printf ./%sSimulator/Frameworks/%s.framework/%s $platform $framework $framework)
-                  ${compile_env|} xcrun lipo $_OSFile $_SimulatorFile -create -output $_OSFile
-              done
-          done
-
-          for platform in iPhone AppleTV Watch; do
-              for framework in bson mongoc; do
-                  _OSDSYM=$(printf ./%sOS/Frameworks/%s.framework.dSYM/Contents/Resources/DWARF/%s $platform $framework $framework)
-                  _SimulatorDSYM=$(printf ./%sSimulator/Frameworks/%s.framework.dSYM/Contents/Resources/DWARF/%s $platform $framework $framework)
-                  ${compile_env|} xcrun lipo $_OSDSYM $_SimulatorDSYM -create -output $_OSDSYM
-              done
-
-              for framework in mongo_embedded mongoc_embedded; do
-                  _OSDSYM=$(printf ./%sOS/Frameworks/%s.framework.dSYM/Contents/Resources/DWARF/lib%s.dylib $platform $framework $framework)
-                  _SimulatorDSYM=$(printf ./%sSimulator/Frameworks/%s.framework.dSYM/Contents/Resources/DWARF/lib%s.dylib $platform $framework $framework)
-                  ${compile_env|} xcrun lipo $_OSDSYM $_SimulatorDSYM -create -output $_OSDSYM
-              done
-          done
-
-          for platform in iPhone AppleTV Watch; do
-              for framework in mongo_embedded mongoc_embedded; do
-                  _OSBCSymbolMaps=$(printf ./%sOS/Frameworks/%s.framework/BCSymbolMaps $platform $framework)
-                  _SimulatorBCSymbolMaps=$(printf ./%sSimulator/Frameworks/%s.framework/BCSymbolMaps $platform $framework)
-                  if [ -e $_SimulatorBCSymbolMaps -a -e $_OSBCSymbolMaps ]; then
-                      cp $_SimulatorBCSymbolMaps/* $_OSBCSymbolMaps/
-                  fi
-              done
-          done
-
-          popd
-
-          cat <<EOF > mongo-embedded-sdk-${version}/README-Licenses.txt
-          The software accompanying this file is Copyright (C) 2018 MongoDB, Inc. and
-          is licensed to you on the terms set forth in the following files:
-            - mongo-c-driver: iPhoneOS/Frameworks/mongoc.framework/COPYING
-            - mongo_embedded: iPhoneOS/Frameworks/mongo_embedded.framework/LICENSE-Embedded.txt
-            - mongoc_embedded: iPhoneOS/Frameworks/mongoc_embedded.framework/LICENSE-Embedded.txt
-          EOF
-          tar --exclude "mongo-embedded-sdk-${version}/*/*.tgz" -zcvf mongo-embedded-sdk-${version}.tgz \
-              ./mongo-embedded-sdk-${version}/*OS \
-              ./mongo-embedded-sdk-${version}/README-Licenses.txt
-
-          cat <<EOF > mongo-embedded-sdk-${version}/README-Licenses.txt
-          The software accompanying this file is Copyright (C) 2018 MongoDB, Inc. and
-          is licensed to you on the terms set forth in the following files:
-            - mongo-c-driver: iPhoneOS/Frameworks/mongoc.framework/COPYING
-          EOF
-          tar --exclude "mongo-embedded-sdk-${version}/*/*.tgz" -zcvf mongo-embedded-sdk-${version}-mongo-c-driver.tgz \
-              ./mongo-embedded-sdk-${version}/*OS/Frameworks/bson.framework{,.dSYM} \
-              ./mongo-embedded-sdk-${version}/*OS/Frameworks/mongoc.framework{,.dSYM} \
-              ./mongo-embedded-sdk-${version}/README-Licenses.txt
-
-          cat <<EOF > mongo-embedded-sdk-${version}/README-Licenses.txt
-          The software accompanying this file is Copyright (C) 2018 MongoDB, Inc. and
-          is licensed to you on the terms set forth in the following files:
-            - mongo_embedded: iPhoneOS/Frameworks/mongo_embedded.framework/LICENSE-Embedded.txt
-          EOF
-          tar --exclude "mongo-embedded-sdk-${version}/*/*.tgz" -zcvf mongo-embedded-sdk-${version}-mongo-embedded.tgz \
-              ./mongo-embedded-sdk-${version}/*OS/Frameworks/mongo_embedded.framework{,.dSYM} \
-              ./mongo-embedded-sdk-${version}/README-Licenses.txt
-
-          cat <<EOF > mongo-embedded-sdk-${version}/README-Licenses.txt
-          The software accompanying this file is Copyright (C) 2018 MongoDB, Inc. and
-          is licensed to you on the terms set forth in the following files:
-            - mongoc_embedded: iPhoneOS/Frameworks/mongoc_embedded.framework/LICENSE-Embedded.txt
-          EOF
-          tar --exclude "mongo-embedded-sdk-${version}/*/*.tgz" -zcvf mongo-embedded-sdk-${version}-mongoc-embedded.tgz \
-              ./mongo-embedded-sdk-${version}/*OS/Frameworks/mongoc_embedded.framework{,.dSYM} \
-              ./mongo-embedded-sdk-${version}/README-Licenses.txt
-
-    - command: s3.put
-      params:
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        local_file: "mongo-embedded-sdk-${version}.tgz"
-        remote_file: "${project}/embedded-sdk/embedded-sdk-apple-multiarch/${revision}/mongo-embedded-sdk-${version}.tgz"
-        bucket: mciuploads
-        permissions: public-read
-        content_type: application/tar
-        display_name: "Embedded SDK Tar Archive"
-
-    - command: s3.put
-      params:
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        local_file: "mongo-embedded-sdk-${version}-mongo-c-driver.tgz"
-        remote_file: "${project}/embedded-sdk/mongo-c-driver-apple-multiarch/${revision}/mongo-embedded-sdk-${version}.tgz"
-        bucket: mciuploads
-        permissions: public-read
-        content_type: application/tar
-        display_name: "MongoDB C Driver Tar Archive"
-
-    - command: s3.put
-      params:
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        local_file: "mongo-embedded-sdk-${version}-mongo-embedded.tgz"
-        remote_file: "${project}/embedded-sdk/mongo-embedded-apple-multiarch/${revision}/mongo-embedded-sdk-${version}.tgz"
-        bucket: mciuploads
-        permissions: public-read
-        content_type: application/tar
-        display_name: "MongoDB Embedded Tar Archive"
-
-    - command: s3.put
-      params:
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        local_file: "mongo-embedded-sdk-${version}-mongoc-embedded.tgz"
-        remote_file: "${project}/embedded-sdk/mongoc-embedded-apple-multiarch/${revision}/mongo-embedded-sdk-${version}.tgz"
-        bucket: mciuploads
-        permissions: public-read
-        content_type: application/tar
-        display_name: "MongoDB Embedded C Driver Transport Tar Archive"
-
-- name: embedded_sdk_multiarch_apple_release
-  depends_on:
-    - name: embedded_sdk_multiarch_apple_package
-      variant: embedded-sdk-apple-multiarch
-
-  commands:
-    - command: manifest.load
-    - func: "git get project"
-    - func: "get buildnumber"
-    - func: "set up credentials"
-    - func: "generate compile expansions"
-    - func: "apply compile expansions"
-
-    - command: s3.get
-      params:
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        local_file: "mongo-embedded-sdk-${version}.tgz"
-        remote_file: "${project}/embedded-sdk/embedded-sdk-apple-multiarch/${revision}/mongo-embedded-sdk-${version}.tgz"
-        bucket: mciuploads
-
-    - command: s3.get
-      params:
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        local_file: "mongo-embedded-sdk-${version}-mongo-c-driver.tgz"
-        remote_file: "${project}/embedded-sdk/mongo-c-driver-apple-multiarch/${revision}/mongo-embedded-sdk-${version}.tgz"
-        bucket: mciuploads
-
-    - command: s3.get
-      params:
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        local_file: "mongo-embedded-sdk-${version}-mongo-embedded.tgz"
-        remote_file: "${project}/embedded-sdk/mongo-embedded-apple-multiarch/${revision}/mongo-embedded-sdk-${version}.tgz"
-        bucket: mciuploads
-
-    - command: s3.get
-      params:
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        local_file: "mongo-embedded-sdk-${version}-mongoc-embedded.tgz"
-        remote_file: "${project}/embedded-sdk/mongoc-embedded-apple-multiarch/${revision}/mongo-embedded-sdk-${version}.tgz"
-        bucket: mciuploads
-
-    # If this is a patch build, blow away the file so our subsequent and optional s3.put
-    # doesn't run. That way, we won't overwrite the latest part in our patches.
-    - command: shell.exec
-      params:
-        script: |
-          set -o errexit
-          set -o verbose
-
-          if [ "${is_patch}" = "true" ]; then
-            rm -f mongo-embedded-sdk-${version}.tgz
-            rm -f mongo-embedded-sdk-${version}-mongo-c-driver.tgz
-            rm -f mongo-embedded-sdk-${version}-mongo-embedded.tgz
-            rm -f mongo-embedded-sdk-${version}-mongoc-embedded.tgz
-          fi
-
-    # A second put, this time to -latest, to give devs a reasonable
-    # way to get the most recent build.
-    - command: s3.put
-      params:
-        visibility: none
-        optional: true
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        local_file: "mongo-embedded-sdk-${version}.tgz"
-        remote_file: ${project}/embedded-sdk/mongo-${build_variant}-latest.tgz
-        bucket: mciuploads
-        permissions: public-read
-        content_type: application/tar
-
-    - command: s3.put
-      params:
-        visibility: none
-        optional: true
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        local_file: "mongo-embedded-sdk-${version}-mongo-c-driver.tgz"
-        remote_file: ${project}/embedded-sdk/mongo-c-driver-cocoapod-latest.tgz
-        bucket: mciuploads
-        permissions: public-read
-        content_type: application/tar
-
-    - command: s3.put
-      params:
-        visibility: none
-        optional: true
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        local_file: "mongo-embedded-sdk-${version}-mongo-embedded.tgz"
-        remote_file: ${project}/embedded-sdk/mongo-embedded-cocoapod-latest.tgz
-        bucket: mciuploads
-        permissions: public-read
-        content_type: application/tar
-
-    - command: s3.put
-      params:
-        visibility: none
-        optional: true
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        local_file: "mongo-embedded-sdk-${version}-mongoc-embedded.tgz"
-        remote_file: ${project}/embedded-sdk/mongoc-embedded-cocoapod-latest.tgz
-        bucket: mciuploads
-        permissions: public-read
-        content_type: application/tar
-
-    # If this is not a release build, blow away the file so our subsequent and optional s3.put
-    # doesn't run. That way, we won't overwrite the latest part in our patches.
-    - command: shell.exec
-      params:
-        script: |
-          set -o errexit
-          set -o verbose
-
-          if [ "${is_release}" != "true" ]; then
-            rm -f mongo-embedded-sdk-${version}.tgz
-            rm -f mongo-embedded-sdk-${version}-mongo-c-driver.tgz
-            rm -f mongo-embedded-sdk-${version}-mongo-embedded.tgz
-            rm -f mongo-embedded-sdk-${version}-mongoc-embedded.tgz
-          fi
-
-    - command: s3.put
-      params:
-        visibility: none
-        optional: true
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        local_file: "mongo-embedded-sdk-${version}.tgz"
-        remote_file: ${push_path}-STAGE/${push_name}/mongo-${build_variant}-${version}.tgz
-        bucket: build-push-testing
-        permissions: public-read
-        content_type: application/tar
-
-    - command: s3.put
-      params:
-        visibility: none
-        optional: true
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        local_file: "mongo-embedded-sdk-${version}-mongo-c-driver.tgz"
-        remote_file: ${push_path}-STAGE/${push_name}/mongo-c-driver-1.13.0-${version}.tgz
-        bucket: build-push-testing
-        permissions: public-read
-        content_type: application/tar
-
-    - command: s3.put
-      params:
-        visibility: none
-        optional: true
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        local_file: "mongo-embedded-sdk-${version}-mongo-embedded.tgz"
-        remote_file: ${push_path}-STAGE/${push_name}/mongo-embedded-${version}.tgz
-        bucket: build-push-testing
-        permissions: public-read
-        content_type: application/tar
-
-    - command: s3.put
-      params:
-        visibility: none
-        optional: true
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        local_file: "mongo-embedded-sdk-${version}-mongoc-embedded.tgz"
-        remote_file: ${push_path}-STAGE/${push_name}/mongoc-embedded-${version}.tgz
-        bucket: build-push-testing
-        permissions: public-read
-        content_type: application/tar
-
-    - command: s3Copy.copy
-      params:
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        optional: true
-        s3_copy_files:
-            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongoc-embedded-${version}.tgz', 'bucket': 'build-push-testing'},
-               'destination': {'path': '${push_path}/${push_name}/mongoc-embedded-${version}.tgz', 'bucket': '${push_bucket}'}}
-
-            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongo-embedded-${version}.tgz', 'bucket': 'build-push-testing'},
-               'destination': {'path': '${push_path}/${push_name}/mongo-embedded-${version}.tgz', 'bucket': '${push_bucket}'}}
-
-            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongo-c-driver-1.13.0-${version}.tgz', 'bucket': 'build-push-testing'},
-               'destination': {'path': '${push_path}/${push_name}/mongo-c-driver-1.13.0-${version}.tgz', 'bucket': '${push_bucket}'}}
-
-    - command: shell.exec
-      params:
-        script: |
-          set -o errexit
-          set -o verbose
-
-          echo "Releases disabled on master."
-          exit 0
-
-          if [ "${is_release|false}" != "true" ]; then
-              echo "Not a release build"
-              exit 0
-          fi
-
-          sed s/@VERSION@/1.13.0/g src/src/mongo/embedded/mongoc_embedded/mongo-embedded-c-driver.podspec.in | tee mongo-embedded-c-driver.podspec
-          DRIVER_SHA=`shasum -a 256 mongo-embedded-sdk-${version}-mongo-c-driver.tgz  | awk '{ print $1 }'`
-          sed -i '' s/@SHA256@/$DRIVER_SHA/g mongo-embedded-c-driver.podspec
-          sed -i '' s/@MONGO_VERSION@/${version}/g mongo-embedded-c-driver.podspec
-
-          sed s/@VERSION@/${version}/g src/src/mongo/embedded/mongo_embedded/mongo_embedded.podspec.in | tee mongo_embedded.podspec
-          MONGO_SHA=`shasum -a 256 mongo-embedded-sdk-${version}-mongo-embedded.tgz  | awk '{ print $1 }'`
-          sed -i '' s/@SHA256@/$MONGO_SHA/g mongo_embedded.podspec
-
-          sed s/@VERSION@/${version}/g src/src/mongo/embedded/mongoc_embedded/mongoc_embedded.podspec.in | tee mongoc_embedded.podspec
-          MONGOC_SHA=`shasum -a 256 mongo-embedded-sdk-${version}-mongoc-embedded.tgz  | awk '{ print $1 }'`
-          sed -i '' s/@SHA256@/$MONGOC_SHA/g mongoc_embedded.podspec
-
-          pod trunk push mongo-embedded-c-driver.podspec
-          pod trunk push mongo_embedded.podspec
-          pod trunk push mongoc_embedded.podspec
-
 - name: stitch_support_create_lib
   commands:
     - func: "scons compile"
       vars:
-        targets: install-stitch-support install-stitch-support-debug
+        targets: install-stitch-support install-stitch-support-debug install-stitch-support-dev
         task_compile_flags: >-
           --install-mode=hygienic
           --dbg=off
@@ -5551,7 +4856,8 @@ tasks:
       num_files: 10
       num_tasks: 15
       npm_command: initsync-fuzzer
-      resmoke_args: --suites=initial_sync_multiversion_fuzzer
+      suite: initial_sync_multiversion_fuzzer
+      resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: initial_sync_multiversion_fuzzer
       task_path_suffix: "/data/multiversion"
 
@@ -5565,7 +4871,8 @@ tasks:
       num_files: 10
       num_tasks: 15
       npm_command: initsync-fuzzer
-      resmoke_args: "--suites=initial_sync_fuzzer --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
+      suite: initial_sync_fuzzer
+      resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: initial_sync_fuzzer
 
 ## Standalone generational fuzzer for multiversion aggregation pipelines ##
@@ -5578,7 +4885,8 @@ tasks:
       <<: *jstestfuzz_config_vars
       num_files: 5
       num_tasks: 10
-      resmoke_args: "--suites=generational_fuzzer --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
+      suite: generational_fuzzer
+      resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       npm_command: agg-fuzzer
       name: aggregation_multiversion_fuzzer
       task_path_suffix: "/data/multiversion"
@@ -5593,7 +4901,8 @@ tasks:
       <<: *jstestfuzz_config_vars
       num_files: 5
       num_tasks: 10
-      resmoke_args: "--suites=generational_fuzzer --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
+      suite: generational_fuzzer
+      resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       npm_command: agg-expr-fuzzer
       name: aggregation_expression_multiversion_fuzzer
       task_path_suffix: "/data/multiversion"
@@ -5609,7 +4918,8 @@ tasks:
       num_files: 5
       num_tasks: 10
       jstestfuzz_vars: --diffTestingMode optimization
-      resmoke_args: "--suites=generational_fuzzer --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
+      suite: generational_fuzzer
+      resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       npm_command: agg-expr-fuzzer
       name: aggregation_expression_optimization_fuzzer
 
@@ -5624,7 +4934,8 @@ tasks:
       num_files: 5
       num_tasks: 10
       jstestfuzz_vars: --diffTestingMode optimization
-      resmoke_args: "--suites=generational_fuzzer --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
+      suite: generational_fuzzer
+      resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       npm_command: agg-fuzzer
       name: aggregation_optimization_fuzzer
 
@@ -5640,7 +4951,8 @@ tasks:
       num_tasks: 10
       jstestfuzz_vars: --diffTestingMode wildcard
       npm_command: agg-fuzzer
-      resmoke_args: "--suites=generational_fuzzer --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
+      suite: generational_fuzzer
+      resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: aggregation_wildcard_fuzzer
 
 ## jstestfuzz standalone fuzzer for checking find and aggregate equivalence ##
@@ -5655,7 +4967,8 @@ tasks:
       num_tasks: 10
       jstestfuzz_vars: --diffTestingMode standalone
       npm_command: query-fuzzer
-      resmoke_args: "--suites=generational_fuzzer --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
+      suite: generational_fuzzer
+      resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: query_fuzzer_standalone
 
 ## jstestfuzz sharded fuzzer for checking find and aggregate equivalence ##
@@ -5670,7 +4983,8 @@ tasks:
       num_tasks: 10
       jstestfuzz_vars: --diffTestingMode sharded
       npm_command: query-fuzzer
-      resmoke_args: "--suites=generational_fuzzer --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
+      suite: generational_fuzzer
+      resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: query_fuzzer_sharded
 
 ## jstestfuzz standalone update generational fuzzer ##
@@ -5684,7 +4998,8 @@ tasks:
       num_files: 5
       num_tasks: 10
       npm_command: update-fuzzer
-      resmoke_args: "--suites=generational_fuzzer --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
+      suite: generational_fuzzer
+      resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: update_fuzzer
       task_path_suffix: "/data/multiversion"
 
@@ -5699,7 +5014,8 @@ tasks:
       num_files: 5
       num_tasks: 10
       npm_command: update-fuzzer
-      resmoke_args: "--suites=generational_fuzzer_replication --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
+      suite: generational_fuzzer_replication
+      resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: update_fuzzer_replication
       task_path_suffix: "/data/multiversion"
 
@@ -5714,7 +5030,8 @@ tasks:
       num_files: 3
       num_tasks: 5
       npm_command: rollback-fuzzer
-      resmoke_args: --suites=rollback_multiversion_fuzzer
+      suite: rollback_multiversion_fuzzer
+      resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: rollback_multiversion_fuzzer
       task_path_suffix: "/data/multiversion"
 
@@ -5729,7 +5046,8 @@ tasks:
       num_files: 3
       num_tasks: 5
       npm_command: rollback-fuzzer
-      resmoke_args: "--suites=rollback_fuzzer --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
+      suite: rollback_fuzzer
+      resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: rollback_fuzzer
 
 ## rollback generational fuzzer with clean shutdowns ##
@@ -5744,7 +5062,8 @@ tasks:
       num_tasks: 4
       jstestfuzz_vars: --numLinesPerFile 300 --maxLinesBetweenEvents 50
       npm_command: rollback-fuzzer
-      resmoke_args: "--suites=rollback_fuzzer_clean_shutdowns --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
+      suite: rollback_fuzzer_clean_shutdowns
+      resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: rollback_fuzzer_clean_shutdowns
 
 ## rollback generational fuzzer with unclean shutdowns ##
@@ -5759,7 +5078,8 @@ tasks:
       num_tasks: 4
       jstestfuzz_vars: --numLinesPerFile 300 --maxLinesBetweenEvents 50
       npm_command: rollback-fuzzer
-      resmoke_args: "--suites=rollback_fuzzer_unclean_shutdowns --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
+      suite: rollback_fuzzer_unclean_shutdowns
+      resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: rollback_fuzzer_unclean_shutdowns
 
 ## jstestfuzz ##
@@ -5771,7 +5091,8 @@ tasks:
     vars:
       <<: *jstestfuzz_config_vars
       jstestfuzz_vars: --jsTestsDir ../jstests
-      resmoke_args: "--suites=jstestfuzz --storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
+      suite: jstestfuzz
+      resmoke_args: "--storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       npm_command: jstestfuzz
       name: jstestfuzz
 
@@ -5786,7 +5107,8 @@ tasks:
       num_files: ${jstestfuzz_concurrent_num_files|10}
       num_tasks: 15
       jstestfuzz_vars: --jsTestsDir ../jstests
-      resmoke_args: --suites=jstestfuzz --storageEngine=wiredTiger --numClientsPerFixture=10
+      suite: jstestfuzz
+      resmoke_args: --storageEngine=wiredTiger --numClientsPerFixture=10
       name: jstestfuzz_concurrent
 
 ## jstestfuzz concurrent replica set ##
@@ -5800,7 +5122,8 @@ tasks:
       num_files: ${jstestfuzz_concurrent_num_files|10}
       num_tasks: 15
       jstestfuzz_vars: --jsTestsDir ../jstests
-      resmoke_args: --suites=jstestfuzz_replication --storageEngine=wiredTiger --numClientsPerFixture=10
+      suite: jstestfuzz_replication
+      resmoke_args: --storageEngine=wiredTiger --numClientsPerFixture=10
       name: jstestfuzz_concurrent_replication
 
 ## jstestfuzz concurrent replica set with logical session ##
@@ -5814,7 +5137,8 @@ tasks:
       num_files: ${jstestfuzz_concurrent_num_files|10}
       num_tasks: 15
       jstestfuzz_vars: --jsTestsDir ../jstests
-      resmoke_args: --suites=jstestfuzz_replication_session --storageEngine=wiredTiger --numClientsPerFixture=10
+      suite: jstestfuzz_replication_session
+      resmoke_args: --storageEngine=wiredTiger --numClientsPerFixture=10
       name: jstestfuzz_concurrent_replication_session
 
 ## jstestfuzz concurrent sharded cluster ##
@@ -5828,7 +5152,8 @@ tasks:
       num_files: ${jstestfuzz_concurrent_num_files|10}
       num_tasks: 15
       jstestfuzz_vars: --jsTestsDir ../jstests
-      resmoke_args: --suites=jstestfuzz_sharded --storageEngine=wiredTiger --numClientsPerFixture=10
+      suite: jstestfuzz_sharded
+      resmoke_args: --storageEngine=wiredTiger --numClientsPerFixture=10
       name: jstestfuzz_concurrent_sharded
 
 ## jstestfuzz concurrent sharded cluster causal consistency ##
@@ -5842,7 +5167,8 @@ tasks:
       num_files: ${jstestfuzz_concurrent_num_files|10}
       num_tasks: 15
       jstestfuzz_vars: --jsTestsDir ../jstests
-      resmoke_args: --suites=jstestfuzz_sharded_causal_consistency --storageEngine=wiredTiger --numClientsPerFixture=10
+      suite: jstestfuzz_sharded_causal_consistency
+      resmoke_args: --storageEngine=wiredTiger --numClientsPerFixture=10
       name: jstestfuzz_concurrent_sharded_causal_consistency
 
 ## jstestfuzz concurrent sharded cluster continuous stepdown ##
@@ -5856,7 +5182,8 @@ tasks:
       num_files: ${jstestfuzz_concurrent_num_files|10}
       num_tasks: 2
       jstestfuzz_vars: --jsTestsDir ../jstests
-      resmoke_args: --suites=jstestfuzz_sharded_continuous_stepdown --storageEngine=wiredTiger --numClientsPerFixture=10
+      suite: jstestfuzz_sharded_continuous_stepdown
+      resmoke_args: --storageEngine=wiredTiger --numClientsPerFixture=10
       name: jstestfuzz_concurrent_sharded_continuous_stepdown
 
 ## jstestfuzz concurrent sharded cluster with logical session ##
@@ -5870,7 +5197,8 @@ tasks:
       num_files: ${jstestfuzz_concurrent_num_files|10}
       num_tasks: 15
       jstestfuzz_vars: --jsTestsDir ../jstests
-      resmoke_args: --suites=jstestfuzz_sharded_session --storageEngine=wiredTiger --numClientsPerFixture=10
+      suite: jstestfuzz_sharded_session
+      resmoke_args: --storageEngine=wiredTiger --numClientsPerFixture=10
       name: jstestfuzz_concurrent_sharded_session
 
 # jstestfuzz interrupt #
@@ -5882,7 +5210,8 @@ tasks:
     vars:
       <<: *jstestfuzz_config_vars
       jstestfuzz_vars: --jsTestsDir ../jstests
-      resmoke_args: "--suites=jstestfuzz_interrupt --storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
+      suite: jstestfuzz_interrupt
+      resmoke_args: "--storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: jstestfuzz_interrupt
 
 # jstestfuzz interrupt #
@@ -5894,7 +5223,8 @@ tasks:
     vars:
       <<: *jstestfuzz_config_vars
       jstestfuzz_vars: --jsTestsDir ../jstests
-      resmoke_args: "--suites=jstestfuzz_interrupt_replication --storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
+      suite: jstestfuzz_interrupt_replication
+      resmoke_args: "--storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: jstestfuzz_interrupt_replication
 
 # jstestfuzz interrupt with flow control engaged #
@@ -5908,7 +5238,8 @@ tasks:
       num_files: 5
       num_tasks: 30
       jstestfuzz_vars: --jsTestsDir ../jstests
-      resmoke_args: "--suites=jstestfuzz_interrupt_replication --flowControlTicketOverride=1 --storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
+      suite: jstestfuzz_interrupt_replication
+      resmoke_args: "--flowControlTicketOverride=1 --storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: jstestfuzz_interrupt_replication_flow_control
 
 ## jstestfuzz sharded cluster continuous stepdown with flow control engaged ##
@@ -5922,7 +5253,8 @@ tasks:
       num_files: 5
       num_tasks: 10
       jstestfuzz_vars: --jsTestsDir ../jstests
-      resmoke_args: "--suites=jstestfuzz_sharded_continuous_stepdown --flowControlTicketOverride=3 --storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
+      suite: jstestfuzz_sharded_continuous_stepdown
+      resmoke_args: "--flowControlTicketOverride=3 --storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: jstestfuzz_sharded_continuous_stepdown_flow_control
 
 ## jstestfuzz concurrent sharded cluster continuous stepdown with flow control engaged ##
@@ -5936,7 +5268,8 @@ tasks:
       num_files: ${jstestfuzz_concurrent_num_files|10}
       num_tasks: 2
       jstestfuzz_vars: --jsTestsDir ../jstests
-      resmoke_args: --suites=jstestfuzz_sharded_continuous_stepdown --flowControlTicketOverride=30 --storageEngine=wiredTiger --numClientsPerFixture=10
+      suite: jstestfuzz_sharded_continuous_stepdown
+      resmoke_args: --flowControlTicketOverride=30 --storageEngine=wiredTiger --numClientsPerFixture=10
       name: jstestfuzz_concurrent_sharded_continuous_stepdown_flow_control
 
 # jstestfuzz replication continuous stepdown with flow control engaged #
@@ -5950,7 +5283,8 @@ tasks:
       num_files: 5
       num_tasks: 30
       jstestfuzz_vars: --jsTestsDir ../jstests
-      resmoke_args: "--suites=jstestfuzz_replication_continuous_stepdown --flowControlTicketOverride=1 --storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
+      suite: jstestfuzz_replication_continuous_stepdown
+      resmoke_args: "--flowControlTicketOverride=1 --storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: jstestfuzz_replication_continuous_stepdown_flow_control
 
 ## jstestfuzz concurrent replication continuous stepdown with flow control engaged ##
@@ -5964,7 +5298,8 @@ tasks:
       num_files: ${jstestfuzz_concurrent_num_files|10}
       num_tasks: 15
       jstestfuzz_vars: --jsTestsDir ../jstests
-      resmoke_args: --suites=jstestfuzz_replication_continuous_stepdown --flowControlTicketOverride=10 --storageEngine=wiredTiger --numClientsPerFixture=10
+      suite: jstestfuzz_replication_continuous_stepdown
+      resmoke_args: --flowControlTicketOverride=10 --storageEngine=wiredTiger --numClientsPerFixture=10
       name: jstestfuzz_concurrent_replication_continuous_stepdown_flow_control
 
 ## jstestfuzz replica set ##
@@ -5976,8 +5311,24 @@ tasks:
     vars:
       <<: *jstestfuzz_config_vars
       jstestfuzz_vars: --jsTestsDir ../jstests
-      resmoke_args: "--suites=jstestfuzz_replication --storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
+      suite: jstestfuzz_replication
+      resmoke_args: "--storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: jstestfuzz_replication
+
+## jstestfuzz replica set ##
+- <<: *jstestfuzz_template
+  name: jstestfuzz_replication_multiversion_gen
+  tags: ["jstestfuzz_multiversion_gen"]
+  commands:
+  - func: "generate multiversion tasks"
+    vars:
+      <<: *jstestfuzz_config_vars
+      jstestfuzz_vars: --jsTestsDir ../jstests
+      resmoke_args: "--storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
+      suite: jstestfuzz_replication
+      is_jstestfuzz: true
+      use_multiversion: /data/multiversion
+      npm_command: jstestfuzz
 
 ## jstestfuzz initial sync replica set ##
 - <<: *jstestfuzz_template
@@ -5990,7 +5341,8 @@ tasks:
       num_files: 8
       num_tasks: 10
       jstestfuzz_vars: --jsTestsDir ../jstests
-      resmoke_args: "--suites=jstestfuzz_replication_initsync --storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
+      suite: jstestfuzz_replication_initsync
+      resmoke_args: "--storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: jstestfuzz_replication_initsync
 
 ## jstestfuzz replica set with logical session ##
@@ -6002,7 +5354,8 @@ tasks:
     vars:
       <<: *jstestfuzz_config_vars
       jstestfuzz_vars: --jsTestsDir ../jstests
-      resmoke_args: "--suites=jstestfuzz_replication_session --storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
+      suite: jstestfuzz_replication_session
+      resmoke_args: "--storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: jstestfuzz_replication_session
 
 ## jstestfuzz sharded cluster ##
@@ -6014,8 +5367,24 @@ tasks:
     vars:
       <<: *jstestfuzz_config_vars
       jstestfuzz_vars: --jsTestsDir ../jstests
-      resmoke_args: "--suites=jstestfuzz_sharded --storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
+      suite: jstestfuzz_sharded
+      resmoke_args: "--storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: jstestfuzz_sharded
+
+## jstestfuzz sharded multiversion cluster ##
+- <<: *jstestfuzz_template
+  name: jstestfuzz_sharded_multiversion_gen
+  tags: [jstestfuzz_multiversion_gen]
+  commands:
+  - func: "generate multiversion tasks"
+    vars:
+      <<: *jstestfuzz_config_vars
+      jstestfuzz_vars: --jsTestsDir ../jstests
+      resmoke_args: "--storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
+      suite: jstestfuzz_sharded
+      is_jstestfuzz: true
+      use_multiversion: /data/multiversion
+      npm_command: jstestfuzz
 
 ## jstestfuzz sharded cluster causal consistency ##
 - <<: *jstestfuzz_template
@@ -6026,7 +5395,8 @@ tasks:
     vars:
       <<: *jstestfuzz_config_vars
       jstestfuzz_vars: --jsTestsDir ../jstests
-      resmoke_args: "--suites=jstestfuzz_sharded_causal_consistency --storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
+      suite: jstestfuzz_sharded_causal_consistency
+      resmoke_args: "--storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: jstestfuzz_sharded_causal_consistency
 
 ## jstestfuzz sharded cluster continuous stepdown ##
@@ -6040,7 +5410,8 @@ tasks:
       num_files: 5
       num_tasks: 10
       jstestfuzz_vars: --jsTestsDir ../jstests
-      resmoke_args: "--suites=jstestfuzz_sharded_continuous_stepdown --storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
+      suite: jstestfuzz_sharded_continuous_stepdown
+      resmoke_args: "--storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: jstestfuzz_sharded_continuous_stepdown
 
 ## jstestfuzz sharded cluster with logical session ##
@@ -6052,7 +5423,8 @@ tasks:
     vars:
       <<: *jstestfuzz_config_vars
       jstestfuzz_vars: --jsTestsDir ../jstests
-      resmoke_args: "--suites=jstestfuzz_sharded_session --storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
+      suite: jstestfuzz_sharded_session
+      resmoke_args: "--storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: jstestfuzz_sharded_session
 
 - name: replica_sets_jscore_multiversion_passthrough_gen
@@ -6771,7 +6143,7 @@ tasks:
 
 - <<: *task_template
   name: sharding_map_reduce_agg
-  tags: ["sharding"]
+  tags: ["sharding", "common"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -7661,7 +7033,7 @@ tasks:
   - func: "run tests"
     vars:
       task_path_suffix: /data/multiversion
-      resmoke_args: --suites=replica_sets_multiversion --dryRun=tests --storageEngine=wiredTiger
+      resmoke_args: --suites=replica_sets_multiversion --storageEngine=wiredTiger
 
 - <<: *task_template
   name: sasl
@@ -7686,7 +7058,7 @@ tasks:
   - func: "generate randomized multiversion tasks"
     vars:
       use_large_distro: "true"
-      resmoke_args: --storageEngine=wiredTiger --dryRun=tests
+      resmoke_args: --storageEngine=wiredTiger
       fallback_num_sub_suites: 32
       use_multiversion: /data/multiversion
       suite: sharding_multiversion
@@ -8093,6 +7465,16 @@ tasks:
       resmoke_jobs_max: 1
 
 - <<: *task_template
+  name: ocsp
+  tags: ["ocsp"]
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=ocsp
+      resmoke_jobs_max: 1
+
+- <<: *task_template
   name: jsonSchema
   commands:
   - func: "do setup"
@@ -8414,7 +7796,7 @@ tasks:
           mv distsrc.${ext|tgz} mongodb-src-${src_suffix}.${ext|tar.gz} || true
           /usr/bin/find build/ -type f | grep msi$ | xargs -I original_filename cp original_filename mongodb-${push_arch}-${suffix}.msi || true
 
-          /usr/local/bin/notary-client.py --key-name "server-4.4" --auth-token-file ${workdir}/src/signing_auth_token --comment "Evergreen Automatic Signing ${revision} - ${build_variant} - ${branch_name}" --notary-url http://notary-service.build.10gen.cc:5000 --skip-missing mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz} mongodb-win32-${push_arch}-${suffix}.msi mongodb-src-${src_suffix}.${ext|tar.gz} mongodb-cryptd-${push_name}-${push_arch}-${suffix}.${ext|tgz}
+          /usr/local/bin/notary-client.py --key-name "server-4.4" --auth-token-file ${workdir}/src/signing_auth_token --comment "Evergreen Automatic Signing ${revision} - ${build_variant} - ${branch_name}" --notary-url http://notary-service.build.10gen.cc:5000 --skip-missing mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz} mongodb-${push_arch}-${suffix}.msi mongodb-src-${src_suffix}.${ext|tar.gz} mongodb-cryptd-${push_name}-${push_arch}-${suffix}.${ext|tgz}
 
     # Put the binaries tarball/zipfile
     - command: s3.put
@@ -8547,10 +7929,10 @@ tasks:
         aws_secret: ${aws_secret}
         permissions: public-read
         build_variants: ["enterprise-windows", "windows"]
-        local_file: src/mongodb-${push_arch}-${suffix}.msi
+        local_file: src/mongodb-${push_arch}-${suffix}-signed.msi
         bucket: build-push-testing
         content_type: application/x-msi
-        remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_arch}-${suffix}-${task_id}.msi
+        remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_arch}-${suffix}-${task_id}-signed.msi
 
     # Put the binaries tarball sha1
     - command: s3.put
@@ -8617,10 +7999,10 @@ tasks:
         aws_secret: ${aws_secret}
         permissions: public-read
         build_variants: ["enterprise-windows", "windows"]
-        local_file: src/mongodb-${push_arch}-${suffix}.msi.sha1
+        local_file: src/mongodb-${push_arch}-${suffix}-signed.msi.sha1
         bucket: build-push-testing
         content_type: text/plain
-        remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_arch}-${suffix}-${task_id}.msi.sha1
+        remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_arch}-${suffix}-${task_id}-signed.msi.sha1
 
     # Put the binaries tarball sha256
     - command: s3.put
@@ -8686,10 +8068,10 @@ tasks:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
         build_variants: ["enterprise-windows", "windows"]
-        local_file: src/mongodb-${push_arch}-${suffix}.msi.sha256
+        local_file: src/mongodb-${push_arch}-${suffix}-signed.msi.sha256
         bucket: build-push-testing
         permissions: public-read
-        remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_arch}-${suffix}-${task_id}.msi.sha256
+        remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_arch}-${suffix}-${task_id}-signed.msi.sha256
         content_type: text/plain
 
     # Put the binaries tarball md5
@@ -8756,11 +8138,11 @@ tasks:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
         build_variants: ["enterprise-windows", "windows"]
-        local_file: src/mongodb-${push_arch}-${suffix}.msi.md5
+        local_file: src/mongodb-${push_arch}-${suffix}-signed.msi.md5
         bucket: build-push-testing
         permissions: public-read
         content_type: text/plain
-        remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_arch}-${suffix}-${task_id}.msi.md5
+        remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_arch}-${suffix}-${task_id}-signed.msi.md5
 
     - command: s3Copy.copy
       params:
@@ -8791,8 +8173,8 @@ tasks:
                'build_variants': ['rhel70', 'windows']}
 
             #MSI (Windows only)
-            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_arch}-${suffix}-${task_id}.msi', 'bucket': 'build-push-testing'},
-               'destination': {'path': '${push_path}/mongodb-${push_arch}-${suffix}.msi', 'bucket': '${push_bucket}'},
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_arch}-${suffix}-${task_id}-signed.msi', 'bucket': 'build-push-testing'},
+               'destination': {'path': '${push_path}/mongodb-${push_arch}-${suffix}-signed.msi', 'bucket': '${push_bucket}'},
                'build_variants': ['enterprise-windows', 'windows']}
 
             #Binaries Signature
@@ -8832,8 +8214,8 @@ tasks:
                'build_variants': ['rhel70', 'windows']}
 
             #SHA1 for MSI
-            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_arch}-${suffix}-${task_id}.msi.sha1', 'bucket': 'build-push-testing'},
-               'destination': {'path': '${push_path}/mongodb-${push_arch}-${suffix}.msi.sha1', 'bucket': '${push_bucket}'},
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_arch}-${suffix}-${task_id}-signed.msi.sha1', 'bucket': 'build-push-testing'},
+               'destination': {'path': '${push_path}/mongodb-${push_arch}-${suffix}-signed.msi.sha1', 'bucket': '${push_bucket}'},
                'build_variants': ['enterprise-windows', 'windows']}
 
             #SHA256 for binaries
@@ -8855,8 +8237,8 @@ tasks:
                'build_variants': ['rhel70', 'windows']}
 
             #SHA256 for MSI files
-            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_arch}-${suffix}-${task_id}.msi.sha256', 'bucket': 'build-push-testing'},
-               'destination': {'path': '${push_path}/mongodb-${push_arch}-${suffix}.msi.sha256', 'bucket': '${push_bucket}'},
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_arch}-${suffix}-${task_id}-signed.msi.sha256', 'bucket': 'build-push-testing'},
+               'destination': {'path': '${push_path}/mongodb-${push_arch}-${suffix}-signed.msi.sha256', 'bucket': '${push_bucket}'},
                'build_variants': ['enterprise-windows', 'windows']}
 
             #MD5 for binaries
@@ -8878,8 +8260,8 @@ tasks:
                'build_variants': ['rhel70', 'windows']}
 
             #MD5 for MSIs
-            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_arch}-${suffix}-${task_id}.msi.md5', 'bucket': 'build-push-testing'},
-               'destination': {'path': '${push_path}/mongodb-${push_arch}-${suffix}.msi.md5', 'bucket': '${push_bucket}'},
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_arch}-${suffix}-${task_id}-signed.msi.md5', 'bucket': 'build-push-testing'},
+               'destination': {'path': '${push_path}/mongodb-${push_arch}-${suffix}-signed.msi.md5', 'bucket': '${push_bucket}'},
                'build_variants': ['enterprise-windows', 'windows']}
 
     # Debug symbols are not created for all variants and the copy is optional.
@@ -8974,6 +8356,22 @@ task_groups:
   tasks:
   - compile_core_tools
 - <<: *compile_task_group_template
+  name: compile_ninja_TG
+  tasks:
+  - compile_ninja
+  teardown_task:
+    - command: s3.put
+      params:
+        optional: true
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: src/all.build.ninja
+        remote_file: ${project}/${build_variant}/${revision}/artifacts/all.${build_id}.build.ninja
+        bucket: mciuploads
+        permissions: public-read
+        content_type: text/plain
+        display_name: build.ninja
+- <<: *compile_task_group_template
   name: dbtest_TG
   tasks:
   - dbtest
@@ -9022,7 +8420,6 @@ task_groups:
     - func: "git get project"
     - func: "get buildnumber"
     - func: "set up credentials"
-    - func: "setup android toolchain" # noop if ${setup_android_toolchain} is not "true"
     - func: "set task expansion macros"
     - func: "set up virtualenv"
     - func: "upload pip requirements"
@@ -9043,6 +8440,7 @@ task_groups:
   - "embedded_sdk_run_tests"
   - "embedded_sdk_s3_put_latest"
   - "embedded_sdk_tests_s3_put_latest"
+
 - <<: *stitch_support_task_group_template
   name: stitch_support_lib_build_and_archive
   tags: ["stitch"]
@@ -9149,6 +8547,7 @@ buildvariants:
   - name: .logical_session_cache
   - name: .multi_shard
   - name: multi_stmt_txn_jscore_passthrough_with_migration_gen
+  - name: .ocsp
   - name: .read_write_concern
   - name: .replica_sets !.encrypt
   - name: .retry
@@ -9262,6 +8661,7 @@ buildvariants:
   - enterprise
   run_on:
   - ubuntu1804-test
+  stepback: false
   expansions:
     push_path: linux
     push_bucket: downloads.10gen.com
@@ -9283,6 +8683,7 @@ buildvariants:
   - name: compile_all_run_unittests_TG
     distros:
     - ubuntu1804-build
+  - name: compile_ninja_TG
   - name: .aggfuzzer .common
   - name: audit
   - name: causally_consistent_jscore_txns_passthrough
@@ -9290,6 +8691,7 @@ buildvariants:
   - name: .jscore .common !.compat !.decimal !.sharding
   - name: jsCore_auth
   - name: .jstestfuzz .common
+  - name: .jstestfuzz_multiversion_gen
   - name: .logical_session_cache .one_sec
   - name: .multiversion_fuzzer
   - name: .multiversion_passthrough
@@ -10350,7 +9752,6 @@ buildvariants:
     distros:
     - rhel70-small
 
-
 ###########################################
 #          Mobile SDK buildvariants       #
 ###########################################
@@ -10380,227 +9781,9 @@ buildvariants:
         -DENABLE_ZLIB=BUNDLED
         -DCMAKE_C_FLAGS="-Wunguarded-availability"
     disable_unit_tests: true
-    enable_embedded_tests: native
     dump_scons_config_on_failure: true
   tasks:
   - name: embedded_sdk_build_and_test
-
-- name: embedded-sdk-iphoneos
-  display_name: "Embedded SDK - iOS"
-  run_on:
-  - macos-1014
-  batchtime: 10080 # 7 days
-  expansions:
-    test_flags: --excludeWithAnyTags=uses_transactions
-    cmake_path: /Applications/cmake-3.11.0-Darwin-x86_64/CMake.app/Contents/bin/cmake
-    compile_env: DEVELOPER_DIR=/Applications/Xcode10.2.app
-    compile_flags: >-
-      --lto
-      --variables-files=etc/scons/xcode_ios.vars
-      -j$(sysctl -n hw.logicalcpu)
-      FRAMEWORKPATH='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/Frameworks'
-    cdriver_cmake_osx_deployment_target: "11.0"
-    cdriver_cmake_flags: >-
-        -DCMAKE_BUILD_TYPE=RelWithDebInfo
-        -DCMAKE_OSX_SYSROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
-        -DCMAKE_OSX_ARCHITECTURES=arm64
-        -DENABLE_APPLE_FRAMEWORK=ON
-        -DCMAKE_INSTALL_BINDIR=Frameworks
-        -DENABLE_SSL=OFF
-        -DENABLE_SASL=OFF
-        -DENABLE_ZLIB=OFF
-        -DENABLE_SNAPPY=OFF
-        -DCMAKE_C_FLAGS="-fembed-bitcode -Wunguarded-availability"
-        -DCMAKE_SHARED_LINKER_FLAGS="-fembed-bitcode"
-    disable_unit_tests: true
-    dump_scons_config_on_failure: true
-  tasks:
-  - name: embedded_sdk_build_and_test
-
-- name: embedded-sdk-iphonesimulator
-  display_name: "Embedded SDK - iOS Simulator"
-  run_on:
-  - macos-1014
-  batchtime: 10080 # 7 days
-  expansions:
-    test_flags: --excludeWithAnyTags=uses_transactions
-    cmake_path: /Applications/cmake-3.11.0-Darwin-x86_64/CMake.app/Contents/bin/cmake
-    compile_env: DEVELOPER_DIR=/Applications/Xcode10.2.app
-    compile_flags: >-
-      --lto
-      --variables-files=etc/scons/xcode_ios_sim.vars
-      -j$(sysctl -n hw.logicalcpu)
-      FRAMEWORKPATH='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/Frameworks'
-    cdriver_cmake_osx_deployment_target: "11.0"
-    cdriver_cmake_flags: >-
-        -DCMAKE_BUILD_TYPE=RelWithDebInfo
-        -DCMAKE_OSX_SYSROOT="$(xcrun --sdk iphonesimulator --show-sdk-path)"
-        -DCMAKE_OSX_ARCHITECTURES=x86_64
-        -DENABLE_APPLE_FRAMEWORK=ON
-        -DCMAKE_INSTALL_BINDIR=Frameworks
-        -DENABLE_SSL=OFF
-        -DENABLE_SASL=OFF
-        -DENABLE_ZLIB=OFF
-        -DENABLE_SNAPPY=OFF
-        -DCMAKE_C_FLAGS="-fembed-bitcode -Wunguarded-availability"
-        -DCMAKE_SHARED_LINKER_FLAGS="-fembed-bitcode"
-    disable_unit_tests: true
-    enable_embedded_tests: ios_tvos_simulator
-    ios_sim_device: iPhone-7
-    ios_sim_runtime: iOS-11-0
-    dump_scons_config_on_failure: true
-  tasks:
-  - name: embedded_sdk_build_and_test
-
-- name: embedded-sdk-appletvos
-  display_name: "Embedded SDK - tvOS"
-  run_on:
-  - macos-1014
-  batchtime: 10080 # 7 days
-  expansions:
-    cmake_path: /Applications/cmake-3.11.0-Darwin-x86_64/CMake.app/Contents/bin/cmake
-    test_flags: --excludeWithAnyTags=uses_transactions
-    compile_env: DEVELOPER_DIR=/Applications/Xcode10.2.app
-    compile_flags: >-
-      --lto
-      --variables-files=etc/scons/xcode_tvos.vars
-      -j$(sysctl -n hw.logicalcpu)
-      FRAMEWORKPATH='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/Frameworks'
-    cdriver_cmake_osx_deployment_target: "11.0"
-    cdriver_cmake_flags: >-
-        -DCMAKE_BUILD_TYPE=RelWithDebInfo
-        -DCMAKE_OSX_SYSROOT="$(xcrun --sdk appletvos --show-sdk-path)"
-        -DCMAKE_OSX_ARCHITECTURES=arm64
-        -DENABLE_APPLE_FRAMEWORK=ON
-        -DCMAKE_INSTALL_BINDIR=Frameworks
-        -DENABLE_SSL=OFF
-        -DENABLE_SASL=OFF
-        -DENABLE_ZLIB=OFF
-        -DENABLE_SNAPPY=OFF
-        -DCMAKE_C_FLAGS="-fembed-bitcode -Wunguarded-availability"
-        -DCMAKE_SHARED_LINKER_FLAGS="-fembed-bitcode"
-    disable_unit_tests: true
-    dump_scons_config_on_failure: true
-  tasks:
-  - name: embedded_sdk_build_and_test
-
-- name: embedded-sdk-appletvsimulator
-  display_name: "Embedded SDK - tvOS Simulator"
-  run_on:
-  - macos-1014
-  batchtime: 10080 # 7 days
-  expansions:
-    cmake_path: /Applications/cmake-3.11.0-Darwin-x86_64/CMake.app/Contents/bin/cmake
-    test_flags: --excludeWithAnyTags=uses_transactions
-    compile_env: DEVELOPER_DIR=/Applications/Xcode10.2.app
-    compile_flags: >-
-      --lto
-      --variables-files=etc/scons/xcode_tvos_sim.vars
-      -j$(sysctl -n hw.logicalcpu)
-      FRAMEWORKPATH='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/Frameworks'
-    cdriver_cmake_osx_deployment_target: "11.0"
-    cdriver_cmake_flags: >-
-        -DCMAKE_BUILD_TYPE=RelWithDebInfo
-        -DCMAKE_OSX_SYSROOT="$(xcrun --sdk appletvsimulator --show-sdk-path)"
-        -DCMAKE_OSX_ARCHITECTURES=x86_64
-        -DENABLE_APPLE_FRAMEWORK=ON
-        -DCMAKE_INSTALL_BINDIR=Frameworks
-        -DENABLE_SSL=OFF
-        -DENABLE_SASL=OFF
-        -DENABLE_ZLIB=OFF
-        -DENABLE_SNAPPY=OFF
-        -DCMAKE_C_FLAGS="-fembed-bitcode -Wunguarded-availability"
-        -DCMAKE_SHARED_LINKER_FLAGS="-fembed-bitcode"
-    disable_unit_tests: true
-    enable_embedded_tests: ios_tvos_simulator
-    ios_sim_device: Apple-TV-1080p
-    ios_sim_runtime: tvOS-11-0
-    dump_scons_config_on_failure: true
-  tasks:
-  - name: embedded_sdk_build_and_test
-
-- name: embedded-sdk-watchos
-  display_name: "Embedded SDK - watchOS"
-  run_on:
-  - macos-1014
-  batchtime: 10080 # 7 days
-  expansions:
-    cmake_path: /Applications/cmake-3.11.0-Darwin-x86_64/CMake.app/Contents/bin/cmake
-    test_flags: --excludeWithAnyTags=requires_mmapv1,uses_transactions,requires_http_client
-    compile_env: DEVELOPER_DIR=/Applications/Xcode10.2.app
-    compile_flags: >-
-      --lto
-      --variables-files=etc/scons/xcode_watchos.vars
-      -j$(sysctl -n hw.logicalcpu)
-      FRAMEWORKPATH='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/Frameworks'
-    cdriver_cmake_osx_deployment_target: "4.2"
-    cdriver_cmake_flags: >-
-        -DCMAKE_BUILD_TYPE=RelWithDebInfo
-        -DCMAKE_OSX_SYSROOT="$(xcrun --sdk watchos --show-sdk-path)"
-        -DCMAKE_OSX_ARCHITECTURES=armv7k
-        -DENABLE_APPLE_FRAMEWORK=ON
-        -DCMAKE_INSTALL_BINDIR=Frameworks
-        -DENABLE_SSL=OFF
-        -DENABLE_SASL=OFF
-        -DENABLE_ZLIB=OFF
-        -DENABLE_SNAPPY=OFF
-        -DCMAKE_C_FLAGS="-fembed-bitcode -fapplication-extension -Wunguarded-availability"
-        -DCMAKE_SHARED_LINKER_FLAGS="-fembed-bitcode -fapplication-extension"
-    disable_unit_tests: true
-    dump_scons_config_on_failure: true
-  tasks:
-  - name: embedded_sdk_build_and_test
-
-- name: embedded-sdk-watchsimulator
-  display_name: "Embedded SDK - watchOS Simulator"
-  run_on:
-  - macos-1014
-  batchtime: 10080 # 7 days
-  expansions:
-    cmake_path: /Applications/cmake-3.11.0-Darwin-x86_64/CMake.app/Contents/bin/cmake
-    test_flags: --excludeWithAnyTags=requires_mmapv1,uses_transactions,requires_http_client
-    compile_env: DEVELOPER_DIR=/Applications/Xcode10.2.app
-    compile_flags: >-
-      --lto
-      --variables-files=etc/scons/xcode_watchos_sim.vars
-      -j$(sysctl -n hw.logicalcpu)
-      FRAMEWORKPATH='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/Frameworks'
-    cdriver_cmake_osx_deployment_target: "4.2"
-    cdriver_cmake_flags: >-
-        -DCMAKE_BUILD_TYPE=RelWithDebInfo
-        -DCMAKE_OSX_SYSROOT="$(xcrun --sdk watchsimulator --show-sdk-path)"
-        -DCMAKE_OSX_ARCHITECTURES=i386
-        -DENABLE_APPLE_FRAMEWORK=ON
-        -DCMAKE_INSTALL_BINDIR=Frameworks
-        -DENABLE_SSL=OFF
-        -DENABLE_SASL=OFF
-        -DENABLE_ZLIB=OFF
-        -DENABLE_SNAPPY=OFF
-        -DCMAKE_C_FLAGS="-fembed-bitcode -fapplication-extension -Wunguarded-availability"
-        -DCMAKE_SHARED_LINKER_FLAGS="-fembed-bitcode -fapplication-extension"
-    disable_unit_tests: true
-    enable_embedded_tests: ios_tvos_simulator
-    ios_sim_device: Apple-Watch-Series-3-42mm
-    ios_sim_runtime: watchOS-4-2
-    dump_scons_config_on_failure: true
-  tasks:
-  - name: embedded_sdk_build_and_test
-
-- name: embedded-sdk-apple-multiarch
-  display_name: "Embedded SDK - Apple Multiarch"
-  run_on:
-  - macos-1014
-  batchtime: 10080 # 7 days
-  expansions:
-    compile_env: DEVELOPER_DIR=/Applications/Xcode10.2.app
-    push_path: mobile
-    push_name: apple
-    push_bucket: downloads.mongodb.org
-  tasks:
-  - name: embedded_sdk_multiarch_apple_package
-  - name: embedded_sdk_multiarch_apple_release
-    run_on:
-      - macos-release
 
 - name: embedded-sdk-ubuntu-1604-x86_64
   display_name: "Embedded SDK - Ubuntu 16.04 x86_64"
@@ -10620,164 +9803,9 @@ buildvariants:
         -DCMAKE_C_FLAGS="-flto"
         -DCMAKE_INSTALL_RPATH=\$ORIGIN/../lib
     disable_unit_tests: true
-    enable_embedded_tests: native
     dump_scons_config_on_failure: true
   tasks:
   - name: embedded_sdk_build_and_test
-
-- name: embedded-sdk-android-arm32
-  display_name: "Embedded SDK - Android arm32"
-  run_on:
-  - ubuntu1604-build
-  batchtime: 10080 # 7 days
-  expansions:
-    test_flags: --excludeWithAnyTags=uses_transactions
-    compile_env: JAVA_HOME=/opt/java/jdk8/
-    compile_flags: >-
-      --lto
-      --toolchain-root=$(dirname $(pwd))/android_sdk
-      --variables-files=etc/scons/armv7a-linux-androideabi_toolchain.vars
-      -j$(grep -c ^processor /proc/cpuinfo)
-      LIBPATH="\$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
-    cdriver_cmake_flags: >-
-        -DANDROID_ABI=armeabi-v7a
-        -DANDROID_PLATFORM=android-21
-        -DANDROID_TOOLCHAIN=clang
-        -DCMAKE_BUILD_TYPE=RelWithDebInfo
-        -DCMAKE_C_FLAGS="-flto"
-        -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
-        -DCMAKE_FIND_ROOT_PATH="$WORKDIR/src/build/mongo-embedded-sdk-$VERSION"
-        -DCMAKE_INSTALL_RPATH=\$ORIGIN/../lib
-        -DCMAKE_SHARED_LINKER_FLAGS="-flto"
-        -DCMAKE_TOOLCHAIN_FILE=$WORKDIR/android_sdk/ndk-bundle/build/cmake/android.toolchain.cmake
-        -DENABLE_SRV=OFF
-        -DENABLE_ZLIB=OFF
-    disable_unit_tests: true
-    enable_embedded_tests: android_emulator
-    setup_android_toolchain: true
-    android_toolchain_system_image_arch: "armeabi-v7a"
-    android_system_image_version: 24
-    android_toolchain_target_arch: "arm"
-    android_toolchain_api_version: "21"
-    dump_scons_config_on_failure: true
-  tasks:
-  - name: embedded_sdk_build_and_test
-
-- name: embedded-sdk-android-arm64
-  display_name: "Embedded SDK - Android arm64"
-  run_on:
-  - ubuntu1604-build
-  batchtime: 10080 # 7 days
-  expansions:
-    test_flags: --excludeWithAnyTags=uses_transactions
-    compile_env: JAVA_HOME=/opt/java/jdk8/
-    compile_flags: >-
-      --lto
-      --toolchain-root=$(dirname $(pwd))/android_sdk
-      --variables-files=etc/scons/aarch64-linux-android_toolchain.vars
-      -j$(grep -c ^processor /proc/cpuinfo)
-      LIBPATH="\$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
-    cdriver_cmake_flags: >-
-        -DANDROID_ABI=arm64-v8a
-        -DANDROID_PLATFORM=android-21
-        -DANDROID_TOOLCHAIN=clang
-        -DCMAKE_BUILD_TYPE=RelWithDebInfo
-        -DCMAKE_C_FLAGS="-flto"
-        -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
-        -DCMAKE_FIND_ROOT_PATH="$WORKDIR/src/build/mongo-embedded-sdk-$VERSION"
-        -DCMAKE_INSTALL_RPATH=\$ORIGIN/../lib
-        -DCMAKE_SHARED_LINKER_FLAGS="-flto"
-        -DCMAKE_TOOLCHAIN_FILE=$WORKDIR/android_sdk/ndk-bundle/build/cmake/android.toolchain.cmake
-        -DENABLE_SRV=OFF
-        -DENABLE_ZLIB=OFF
-    disable_unit_tests: true
-    enable_embedded_tests: android_emulator
-    setup_android_toolchain: true
-    android_toolchain_system_image_arch: "arm64-v8a"
-    android_system_image_version: 24
-    android_toolchain_target_arch: "arm64"
-    android_toolchain_api_version: "21"
-    dump_scons_config_on_failure: true
-  tasks:
-  - name: embedded_sdk_build_and_test
-
-- name: embedded-sdk-android-x86_64
-  display_name: "Embedded SDK - Android x86_64"
-  run_on:
-  - ubuntu1604-build
-  batchtime: 10080 # 7 days
-  expansions:
-    test_flags: --excludeWithAnyTags=uses_transactions
-    compile_env: JAVA_HOME=/opt/java/jdk8/
-    compile_flags: >-
-      --lto
-      --toolchain-root=$(dirname $(pwd))/android_sdk
-      --variables-files=etc/scons/x86_64-linux-android_toolchain.vars
-      -j$(grep -c ^processor /proc/cpuinfo)
-      LIBPATH="\$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
-    cdriver_cmake_flags: >-
-        -DANDROID_ABI=x86_64
-        -DANDROID_PLATFORM=android-21
-        -DANDROID_TOOLCHAIN=clang
-        -DCMAKE_BUILD_TYPE=RelWithDebInfo
-        -DCMAKE_C_FLAGS="-flto"
-        -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
-        -DCMAKE_FIND_ROOT_PATH="$WORKDIR/src/build/mongo-embedded-sdk-$VERSION"
-        -DCMAKE_INSTALL_RPATH=\$ORIGIN/../lib
-        -DCMAKE_SHARED_LINKER_FLAGS="-flto"
-        -DCMAKE_TOOLCHAIN_FILE=$WORKDIR/android_sdk/ndk-bundle/build/cmake/android.toolchain.cmake
-        -DENABLE_SRV=OFF
-        -DENABLE_ZLIB=OFF
-    disable_unit_tests: true
-    # The Android x86_64 emulator requires KVM.
-    enable_embedded_tests: android_emulator
-    setup_android_toolchain: true
-    android_toolchain_system_image_arch: "x86_64"
-    android_system_image_version: 24
-    android_toolchain_target_arch: "x86_64"
-    android_toolchain_api_version: "21"
-    dump_scons_config_on_failure: true
-  tasks:
-  - name: embedded_sdk_build_and_test
-
-- name: embedded-sdk-android-multiarch
-  display_name: "Embedded SDK - Android Multiarch Package"
-  run_on:
-  - ubuntu1604-build
-  batchtime: 10080 # 7 days
-  expansions:
-    compile_env: JAVA_HOME=/opt/java/jdk8/
-    setup_android_toolchain: true
-    android_toolchain_system_image_arch: "x86_64"
-    android_system_image_version: 24
-    android_toolchain_target_arch: "x86_64"
-    android_toolchain_api_version: "21"
-  tasks:
-  - name: embedded_sdk_multiarch_android_package
-
-- name: embedded-sdk-java-multiarch
-  display_name: "Embedded SDK - Java Multiarch Package"
-  run_on:
-  - ubuntu1604-build
-  batchtime: 10080 # 7 days
-  expansions:
-    compile_env: JAVA_HOME=/opt/java/jdk8/
-    setup_android_toolchain: true
-    android_toolchain_system_image_arch: "x86_64"
-    android_system_image_version: 24
-    android_toolchain_target_arch: "x86_64"
-    android_toolchain_api_version: "21"
-  tasks:
-  - name: embedded_sdk_multiarch_java_package
 
 ###########################################
 #          Redhat buildvariants           #
@@ -10816,9 +9844,6 @@ buildvariants:
   - name: compile_all_run_unittests_TG
     distros:
     - rhel62-large
-  - name: compile_benchmarks
-    distros:
-    - rhel62-large
   - name: lint_pylinters
   - name: lint_clang_format
   - name: lint_eslint
@@ -10832,9 +9857,6 @@ buildvariants:
   - name: audit
   - name: .auth
   - name: burn_in_tags_gen
-  - name: .benchmarks
-    distros:
-    - centos6-perf
   - name: buildscripts_test
   - name: unittest_shell_hang_analyzer_gen
   - name: .causally_consistent !.sharding
@@ -10861,6 +9883,7 @@ buildvariants:
   - name: .multi_shard
   - name: multi_stmt_txn_jscore_passthrough_with_migration_gen
   - name: multiversion
+  - name: .ocsp
   - name: .query_fuzzer
   - name: .read_write_concern .large
     distros:
@@ -11151,12 +10174,14 @@ buildvariants:
   - name: compile_TG
     distros:
     - rhel62-large
+  - name: .concurrency !.large !.ubsan !.no_txns !.stepdowns !.kill_terminate !.debug_only
   - name: .jscore .common
   - name: noPassthrough_gen
   - name: noPassthroughWithMongod_gen
   - name: replica_sets
     distros:
     - rhel62-large
+  - name: rollback_fuzzer_gen
   - name: sharding_gen
 
 - name: enterprise-rhel-62-64-bit-coverage
@@ -11199,6 +10224,7 @@ buildvariants:
     - name: jsCore_txns_large_txns_format
     - name: jsCore_minimum_batch_size
     - name: jsCore_op_query
+    - name: .jstestfuzz_multiversion_gen
     - name: .logical_session_cache .one_sec
     - name: .multi_shard .common
     - name: multiversion
@@ -12440,13 +11466,29 @@ buildvariants:
     - rhel62-large
   - name: jsCore
 
+- name: enterprise-rhel-62-benchmarks
+  display_name: Enterprise RHEL 6.2 (Benchmarks)
+  modules:
+  - enterprise
+  run_on:
+  - centos6-perf
+  expansions:
+    compile_flags: --ssl MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
+  tasks:
+  - name: compile_benchmarks
+    distros:
+    - rhel62-large
+  - name: .benchmarks
+    distros:
+    - centos6-perf
+
 - name: enterprise-rhel-62-64-bit-inmem
   display_name: Enterprise RHEL 6.2 (inMemory)
   modules:
   - enterprise
   run_on:
   - rhel62-small
-  expansions: &enterprise-rhel-62-64-bit-inmem-expansions
+  expansions:
     test_flags: --storageEngine=inMemory --excludeWithAnyTags=requires_persistence,requires_journaling
     compile_flags: --ssl MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
     multiversion_platform: rhel62
@@ -12807,7 +11849,7 @@ buildvariants:
   - enterprise
   run_on:
   - ubuntu1804-build
-  stepback: true
+  stepback: false
   expansions:
     # We need llvm-symbolizer in the PATH for ASAN for clang-3.7 or later.
     variant_path_suffix: /opt/mongodbtoolchain/v3/bin
@@ -12841,6 +11883,7 @@ buildvariants:
   - name: jsCore_op_query
   - name: jsCore_txns_large_txns_format
   - name: jsonSchema
+  - name: .jstestfuzz_multiversion_gen
   - name: .logical_session_cache
   - name: .multi_shard .common
   - name: multiversion
@@ -12897,7 +11940,7 @@ buildvariants:
   - enterprise
   run_on:
   - ubuntu1804-build
-  stepback: true
+  stepback: false
   expansions:
     # We need llvm-symbolizer in the PATH for UBSAN.
     variant_path_suffix: /opt/mongodbtoolchain/v3/bin
@@ -12929,6 +11972,7 @@ buildvariants:
   - name: jsCore_op_query
   - name: jsCore_txns_large_txns_format
   - name: jsonSchema
+  - name: .jstestfuzz_multiversion_gen
   - name: .logical_session_cache .one_sec
   - name: .multi_shard .common
   - name: multiversion

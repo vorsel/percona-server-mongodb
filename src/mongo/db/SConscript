@@ -981,26 +981,6 @@ env.Library(
 )
 
 env.Library(
-    target='projection_exec_agg',
-    source=[
-        'exec/projection_exec_agg.cpp',
-    ],
-    LIBDEPS=[
-        'pipeline/parsed_aggregation_projection',
-    ],
-)
-
-env.Library(
-    target='projection_executor',
-    source=[
-        'exec/find_projection_executor.cpp',
-    ],
-    LIBDEPS=[
-        'matcher/expressions'
-    ],
-)
-
-env.Library(
     target='query_exec',
     source=[
         'clientcursor.cpp',
@@ -1029,7 +1009,6 @@ env.Library(
         'exec/pipeline_proxy.cpp',
         'exec/plan_stage.cpp',
         'exec/projection.cpp',
-        'exec/projection_executor.cpp',
         'exec/queued_data_stage.cpp',
         'exec/record_store_fast_count.cpp',
         'exec/requires_all_indices_stage.cpp',
@@ -1047,6 +1026,7 @@ env.Library(
         'exec/text_or.cpp',
         'exec/trial_stage.cpp',
         'exec/update_stage.cpp',
+        'exec/upsert_stage.cpp',
         'exec/working_set_common.cpp',
         'exec/write_stage_common.cpp',
         'ops/parsed_delete.cpp',
@@ -1086,6 +1066,7 @@ env.Library(
         'cursor_server_params',
         'db_raii',
         'dbdirectclient',
+        'exec/projection_executor',
         'exec/scoped_timer',
         'exec/sort_executor',
         'exec/working_set',
@@ -1096,7 +1077,6 @@ env.Library(
         'matcher/expressions_mongod_only',
         'ops/parsed_update',
         'pipeline/pipeline',
-        'projection_executor',
         'query/query_common',
         'query/query_planner',
         'repl/repl_coordinator_interface',

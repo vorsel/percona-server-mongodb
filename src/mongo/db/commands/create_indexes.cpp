@@ -398,6 +398,20 @@ Collection* getOrCreateCollection(OperationContext* opCtx,
 }
 
 /**
+ * Returns true if index specs include any unique indexes. Due to uniqueness constraints set up at
+ * the start of the index build, we are not able to support failing over a two phase index build on
+ * a unique index to a new primary on stepdown.
+ */
+bool containsUniqueIndexes(const std::vector<BSONObj>& specs) {
+    for (const auto& spec : specs) {
+        if (spec["unique"].trueValue()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
  * Creates indexes using the given specs for the mobile storage engine.
  * TODO(SERVER-42513): Remove this function.
  */
@@ -652,6 +666,10 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
                                      std::string& errmsg,
                                      BSONObjBuilder& result) {
     const NamespaceString ns(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
+
+    // Disallows drops and renames on this namespace.
+    BackgroundOperation backgroundOp(ns.ns());
+
     uassertStatusOK(userAllowedWriteNS(ns));
 
     // Disallow users from creating new indexes on config.transactions since the sessions code
@@ -684,6 +702,13 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
         if (indexesAlreadyExist(opCtx, ns, specs, &result)) {
             return true;
         }
+
+        // Multi-document transactions should not take exclusive locks, so do not proceed further
+        // if we are in a multi-document transaction.
+        uassert(ErrorCodes::OperationNotSupportedInTransaction,
+                str::stream() << "Cannot create new indexes on " << ns.ns()
+                              << " in a multi-document transaction.",
+                !opCtx->inMultiDocumentTransaction());
 
         auto db = getOrCreateDatabase(opCtx, ns.db(), &dbLock);
 
@@ -734,7 +759,8 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
             // If this node is no longer a primary, the index build will continue to run in the
             // background and will complete when this node receives a commitIndexBuild oplog entry
             // from the new primary.
-            if (indexBuildsCoord->supportsTwoPhaseIndexBuild() &&
+            // TODO(SERVER-44654): re-enable failover support for unique indexes.
+            if (indexBuildsCoord->supportsTwoPhaseIndexBuild() && !containsUniqueIndexes(specs) &&
                 ErrorCodes::InterruptedDueToReplStateChange == interruptionEx.code()) {
                 log() << "Index build continuing in background: " << buildUUID;
                 throw;
@@ -759,7 +785,8 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
 
             // The index build will continue to run in the background and will complete when this
             // node receives a commitIndexBuild oplog entry from the new primary.
-            if (indexBuildsCoord->supportsTwoPhaseIndexBuild()) {
+            // TODO(SERVER-44654): re-enable failover support for unique indexes.
+            if (indexBuildsCoord->supportsTwoPhaseIndexBuild() && !containsUniqueIndexes(specs)) {
                 log() << "Index build continuing in background: " << buildUUID;
                 throw;
             }
@@ -849,7 +876,8 @@ public:
                    std::string& errmsg,
                    BSONObjBuilder& result) override {
         // If we encounter an IndexBuildAlreadyInProgress error for any of the requested index
-        // specs, then we will wait for the build(s) to finish before trying again.
+        // specs, then we will wait for the build(s) to finish before trying again unless we are in
+        // a multi-document transaction.
         const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
         bool shouldLogMessageOnAlreadyBuildingError = true;
         while (true) {
@@ -861,7 +889,11 @@ public:
                 }
                 return runCreateIndexesWithCoordinator(opCtx, dbname, cmdObj, errmsg, result);
             } catch (const DBException& ex) {
-                if (ex.toStatus() != ErrorCodes::IndexBuildAlreadyInProgress) {
+                // We can only wait for an existing index build to finish if we are able to release
+                // our locks, in order to allow the existing index build to proceed. We cannot
+                // release locks in transactions, so we bypass the below logic in transactions.
+                if (ex.toStatus() != ErrorCodes::IndexBuildAlreadyInProgress ||
+                    opCtx->inMultiDocumentTransaction()) {
                     throw;
                 }
                 if (shouldLogMessageOnAlreadyBuildingError) {
@@ -877,8 +909,8 @@ public:
                 // Unset the response fields so we do not write duplicate fields.
                 errmsg = "";
                 result.resetToEmpty();
-                // Reset the snapshot because we have released locks and may reacquire them again
-                // later.
+                // Reset the snapshot because we have released locks and need a fresh snapshot
+                // if we reacquire the locks again later.
                 opCtx->recoveryUnit()->abandonSnapshot();
                 // This is a bit racy since we are not holding a lock across discovering an
                 // in-progress build and starting to listen for completion. It is good enough,

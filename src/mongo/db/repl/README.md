@@ -484,6 +484,79 @@ the local snapshot is beyond the specified OpTime. If read concern majority is s
 wait until the committed snapshot is beyond the specified OpTime. In 3.6 this feature will be
 extended to support a sharded cluster and use a **Lamport Clock** to provide **causal consistency**.
 
+# Transactions
+
+## Life of a Multi-Document Transaction
+
+**Multi-document transactions** were introduced in MongoDB to provide atomicity for reads and writes
+to multiple documents either in the same collection or across multiple collections. Atomicity in
+transactions refers to an "all-or-nothing" principle. This means that when a transaction commits,
+it will not commit some of its changes while rolling back others. Likewise, when a transaction
+aborts, all of its operations abort and all corresponding data changes are aborted.
+
+All transactions are associated with a server session and at any given time, only one open
+transaction can be associated with a single session. The state of a transaction is maintained
+through the `TransactionParticipant`, which is a decoration on the session. Any thread that attempts
+to modify the state of the transaction, which can include committing, aborting, or adding an
+operation to the transaction, must have the correct session checked out before doing so. Only one
+operation can check out a session at a time, so other operations that need to use the same session
+must wait for it to be checked back in.
+
+Transactions are started on the server by the first operation in the transaction, indicated by a
+`startTransaction: true` parameter. All operations in a transaction must include an `lsid`, which is
+a unique ID for a session, a `txnNumber`, and an `autocommit:false` parameter. The `txnNumber` must
+be higher than the previous `txnNumber` on this session. Otherwise, we will throw a
+`TransactionTooOld` error.
+
+When starting a new transaction, we implicitly abort the previously running transaction (if one
+exists) on the session by updating our `txnNumber`. Next, we update our `txnState` to
+`kInProgress`. The `txnState` maintains the state of the transaction and allows us to determine
+legal state transitions. Finally, we reset the in memory state of the transaction as well as any
+corresponding transaction metrics from a previous transaction.
+
+When we start a transaction, we also open a `WriteUnitOfWork`, which begins a storage engine write
+unit of work on the `RecoveryUnit`. The `RecoveryUnit` is responsible for making sure data is
+persisted and all on-disk data must be modified through this interface. The WUOW for a transaction
+is updated every time an operation comes in so that we can read our own writes within a transaction.
+These changes are not visible to outside operations because we haven't committed the transaction (
+and therefore, the WUOW) yet.
+
+From here, we can continue this multi-document transaction by running more commands on the same
+session. These operations are then stored in memory. Once a write completes on the primary, we
+update the corresponding `sessionTxnRecord` in the transactions table (`config.transactions`) with
+information about the transaction. This includes things like the `lsid`, the `txnNumber`
+currently associated with the session, and the `txnState`.
+
+This table was introduced for retryable writes and is used to keep track of retryable write and
+transaction progress on a session. When checking out a session, this table can be used to restore
+the transaction's state. See the Recovering Transactions section for information on how the
+transactions table is used during transaction recovery.
+<!-- TODO SERVER-43783: Link to recovery process for transactions -->
+
+If we decide to commit this transaction, we retrieve those operations, group them into an `applyOps`
+command and write down an `applyOps` oplog entry. Since an `applyOps` oplog entry can only be up to
+16MB, transactions larger than this require multiple `applyOps` oplog entries upon committing.
+
+If we are committing a read-only transaction, meaning that we did not modify any data, it must wait
+for any data it reads to be majority committed regardless of the `readConcern` level.
+
+Once we log the transaction oplog entries, we must commit the storage-transaction on the
+`OperationContext`. This involves calling commit() on the WUOW. Once commit() is called on the WUOW
+associated with a transaction, all writes that occurred during its lifetime will commit in the
+storage engine.
+
+Finally, we update the transactions table, update our local `txnState` to `kCommitted`, log any
+transactions metrics, and clear our txnResources.
+
+The process for aborting a multi-document transaction is simpler than committing since none of the
+operations are visible at this point. We abort the storage transaction, update the
+`sessionTxnRecord` in the transactions table, and write an abort oplog entry. Finally, we change
+our local `txnState` to `kAbortedWithoutPrepare`. We now log any transactions metrics and reset the
+in memory state of the `TransactionParticipant`.
+
+Note that transactions can abort for reasons outside of the `abortTransaction` command. For example,
+we abort non-prepared transactions that encounter write conflicts or state transitions.
+
 # Concurrency Control
 
 ## Parallel Batch Writer Mode
@@ -984,20 +1057,28 @@ timestamps before executing the associated write. Since this timestamp is used t
 visibility point, it is important that all operations up to and including this timestamp are
 committed and durable on disk. This is so that we can replicate the oplog without any gaps.
 
-`stable_timestamp`: The newest timestamp at which the storage engine is allowed to take a
-checkpoint, which can be thought of as a consistent snapshot of the data. Replication informs the
-storage engine of where it is safe to take its next checkpoint. This timestamp is guaranteed to be
-majority committed so that RTT rollback can use it. In the case when `eMRC=false`, the stable
-<!-- TODO SERVER-43788: Link to eMRC=false section -->
-timestamp may not be majority committed, which is why we must use the Rollback via Refetch rollback
-algorithm.
+`commit oplog entry timestamp`: The timestamp of the ‘commitTransaction’ oplog entry for a prepared
+transaction, or the timestamp of the ‘applyOps’ oplog entry for a non-prepared transaction. In a
+cross-shard transaction each shard may have a different commit oplog entry timestamp. This is
+guaranteed to be greater than the `prepareTimestamp`.
 
-This timestamp is also required to increase monotonically except when `eMRC=false`, where in a
-special case during rollback it is possible for the `stableTimestamp` to move backwards.
+`commitTimestamp`: The timestamp at which we committed a multi-document transaction. This will be
+the `commitTimestamp` field in the `commitTransaction` oplog entry for a prepared transaction, or
+the timestamp of the ‘applyOps’ oplog entry for a non-prepared transaction. In a cross-shard
+transaction this timestamp is the same across all shards. The effects of the transaction are visible
+as of this timestamp. Note that `commitTimestamp` and the `commit oplog entry timestamp` are the
+same for non-prepared transactions because we do not write down the oplog entry until we commit the
+transaction. For a prepared transaction, we have the following guarantee: `prepareTimestamp` <=
+`commitTimestamp` <= `commit oplog entry timestamp`
 
-`oldest_timestamp`: The earliest timestamp that the storage engine is guaranteed to have history
-for. New transactions can never start a timestamp earlier than this timestamp. Since we advance this
-as we advance the `stable_timestamp`, it will be less than or equal to the `stable_timestamp`.
+`currentCommittedSnapshot`: An optime maintained in `ReplicationCoordinator` that is used to serve
+majority reads and is always guaranteed to be <= `lastCommittedOpTime`. When `eMRC=true`, this is
+currently set to the stable optime, which is guaranteed to be in a node’s oplog. Since it is reset
+every time we recalculate the stable optime, it will also be up to date.
+
+When `eMRC=false`, this is set to the `lastCommittedOpTime`, so it may not be in the node’s oplog.
+The `stable_timestamp` is not allowed to advance past the `all_durable`. So, this value shouldn’t be
+ahead of `all_durable` unless `eMRC=false`.
 
 `initialDataTimestamp`: A timestamp used to indicate the timestamp at which history “begins”. When
 a node comes out of initial sync, we inform the storage engine that the `initialDataTimestamp` is
@@ -1013,43 +1094,35 @@ from is not associated with any particular timestamp.
 optime of the newest oplog entry that is visible in the storage engine because it is updated after
 a storage transaction commits.
 
-`lastDurable`: Optime of the latest oplog entry that has been flushed to the journal. It is
-asynchronously updated by the storage engine as new writes become durable. Default journaling
-frequency is 100ms, so this could lag up to that amount behind lastApplied.
-
 `lastCommittedOpTime`: A node’s local view of the latest majority committed optime. Every time we
 update this optime, we also recalculate the `stable_timestamp`. Note that the `lastCommittedOpTime`
 can advance beyond a node's `lastApplied` if it has not yet replicated the most recent majority
 committed oplog entry. For more information about how the `lastCommittedOpTime` is updated and
 propagated, please see [Commit Point Propagation](#commit-point-propagation).
 
-`currentCommittedSnapshot`: An optime maintained in `ReplicationCoordinator` that is used to serve
-majority reads and is always guaranteed to be <= `lastCommittedOpTime`. When `eMRC=true`, this is
-currently set to the stable optime, which is guaranteed to be in a node’s oplog. Since it is reset
-every time we recalculate the stable optime, it will also be up to date.
+`lastDurable`: Optime of the latest oplog entry that has been flushed to the journal. It is
+asynchronously updated by the storage engine as new writes become durable. Default journaling
+frequency is 100ms, so this could lag up to that amount behind lastApplied.
 
-When `eMRC=false`, this is set to the `lastCommittedOpTime`, so it may not be in the node’s oplog. The
-`stable_timestamp` is not allowed to advance past the `all_durable`. So, this value shouldn’t be
-ahead of `all_durable` unless `eMRC=false`.
-
-`readConcernMajorityOpTime`: Exposed in replSetGetStatus as “readConcernMajorityOpTime” but is
-populated internally from the `currentCommittedSnapshot` timestamp inside `ReplicationCoordinator`.
+`oldest_timestamp`: The earliest timestamp that the storage engine is guaranteed to have history
+for. New transactions can never start a timestamp earlier than this timestamp. Since we advance this
+as we advance the `stable_timestamp`, it will be less than or equal to the `stable_timestamp`.
 
 `prepareTimestamp`: The timestamp of the ‘prepare’ oplog entry for a prepared transaction. This is
 the earliest timestamp at which it is legal to commit the transaction. This timestamp is provided to
 the storage engine to block reads that are trying to read prepared data until the storage engines
 knows whether the prepared transaction has committed or aborted.
 
-`commit oplog entry timestamp`: The timestamp of the ‘commitTransaction’ oplog entry for a prepared
-transaction, or the timestamp of the ‘applyOps’ oplog entry for a non-prepared transaction. In a
-cross-shard transaction each shard may have a different commit oplog entry timestamp. This is
-guaranteed to be greater than the `prepareTimestamp`.
+`readConcernMajorityOpTime`: Exposed in replSetGetStatus as “readConcernMajorityOpTime” but is
+populated internally from the `currentCommittedSnapshot` timestamp inside `ReplicationCoordinator`.
 
-`commitTimestamp`: The timestamp at which we committed a multi-document transaction. This will be
-the `commitTimestamp` field in the `commitTransaction` oplog entry for a prepared transaction, or
-the timestamp of the ‘applyOps’ oplog entry for a non-prepared transaction. In a cross-shard
-transaction this timestamp is the same across all shards. The effects of the transaction are visible
-as of this timestamp. Note that `commitTimestamp` and the `commit oplog entry timestamp` are the
-same for non-prepared transactions because we do not write down the oplog entry until we commit the
-transaction. For a prepared transaction, we have the following guarantee: `prepareTimestamp` <=
-`commitTimestamp` <= `commit oplog entry timestamp`
+`stable_timestamp`: The newest timestamp at which the storage engine is allowed to take a
+checkpoint, which can be thought of as a consistent snapshot of the data. Replication informs the
+storage engine of where it is safe to take its next checkpoint. This timestamp is guaranteed to be
+majority committed so that RTT rollback can use it. In the case when `eMRC=false`, the stable
+<!-- TODO SERVER-43788: Link to eMRC=false section -->
+timestamp may not be majority committed, which is why we must use the Rollback via Refetch rollback
+algorithm.
+
+This timestamp is also required to increase monotonically except when `eMRC=false`, where in a
+special case during rollback it is possible for the `stableTimestamp` to move backwards.

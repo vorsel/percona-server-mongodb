@@ -20,7 +20,6 @@ selector:
   - jstests/sharding/autosplit.js
   - jstests/sharding/auto_rebalance_parallel.js
   - jstests/sharding/auto_rebalance_parallel_replica_sets.js
-  - jstests/sharding/autosplit_heuristics.js
   - jstests/sharding/basic_drop_coll.js
   - jstests/sharding/basic_merge.js
   - jstests/sharding/count1.js
@@ -79,7 +78,6 @@ selector:
   # Balancer writes (direct write to config database with no retries)
   - jstests/sharding/convert_to_and_from_sharded.js
   - jstests/sharding/remove2.js
-  - jstests/sharding/autosplit_with_balancer.js
   - jstests/sharding/features3.js
   - jstests/sharding/in_memory_sort_limit.js
   - jstests/sharding/parallel.js

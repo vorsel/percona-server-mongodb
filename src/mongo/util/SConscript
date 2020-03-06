@@ -284,6 +284,17 @@ env.Library(
     ],
 )
 
+env.Library(
+    target='latch_analyzer',
+    source= [
+        'latch_analyzer.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        "$BUILD_DIR/mongo/db/service_context",
+    ],
+)
+
 env.Benchmark(
     target='clock_source_bm',
     source=[
@@ -552,6 +563,8 @@ icuEnv.CppUnitTest(
         'icu_test.cpp',
         'invalidating_lru_cache_test.cpp',
         'itoa_test.cpp',
+        # TODO Uncomment after SERVER-44746
+        # 'latch_analyzer_test.cpp',
         'lockable_adapter_test.cpp',
         'lru_cache_test.cpp',
         'md5_test.cpp',
@@ -584,6 +597,7 @@ icuEnv.CppUnitTest(
         'clock_source_mock',
         'clock_sources',
         'diagnostic_info',
+        'latch_analyzer',
         'dns_query',
         'fail_point',
         'icu',
@@ -614,19 +628,6 @@ if env.TargetOSIs('windows'):
             env['LIBS']
         ],
     )
-
-generateItoATable = env.Command(
-    target=[
-        'itoa_table_4.h',
-    ],
-    source=[
-        'generate_itoa_table.py',
-    ],
-    action=[
-        '$PYTHON ${SOURCES[0]} --digit_count=4 --output=${TARGETS[0]}'
-    ],
-)
-env.Alias('generated-sources', generateItoATable)
 
 stacktraceEnv = env.Clone()
 if use_libunwind:

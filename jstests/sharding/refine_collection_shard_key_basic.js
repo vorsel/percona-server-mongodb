@@ -3,7 +3,7 @@
 //
 // Tag this test as 'requires_find_command' to prevent it from running in the legacy passthroughs
 // and as 'requires_document_locking' because it uses retryable writes.
-// @tags: [requires_find_command, requires_document_locking]
+// @tags: [requires_find_command, requires_document_locking, requires_fcv_44]
 //
 
 (function() {
@@ -340,7 +340,7 @@ const awaitShellToTriggerStaleEpoch = startParallelShell(() => {
         db.adminCommand({refineCollectionShardKey: 'db.foo', key: {_id: 1, aKey: 1}}),
         ErrorCodes.StaleEpoch);
 }, staleMongos.port);
-hangAfterRefreshFailPoint.wait(2);
+hangAfterRefreshFailPoint.wait();
 
 // Drop and re-shard namespace 'db.foo' without staleMongos refreshing its metadata.
 dropAndReshardColl({_id: 1});
