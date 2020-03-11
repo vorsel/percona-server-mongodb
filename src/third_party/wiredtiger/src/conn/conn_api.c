@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2019 MongoDB, Inc.
+ * Copyright (c) 2014-2020 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -1796,6 +1796,12 @@ __wt_debug_mode_config(WT_SESSION_IMPL *session, const char *cfg[])
     else
         WT_RET(__wt_calloc_def(session, conn->debug_ckpt_cnt, &conn->debug_ckpt));
 
+    WT_RET(__wt_config_gets(session, cfg, "debug_mode.cursor_copy", &cval));
+    if (cval.val)
+        F_SET(conn, WT_CONN_DEBUG_CURSOR_COPY);
+    else
+        F_CLR(conn, WT_CONN_DEBUG_CURSOR_COPY);
+
     WT_RET(__wt_config_gets(session, cfg, "debug_mode.eviction", &cval));
     if (cval.val)
         F_SET(cache, WT_CACHE_EVICT_DEBUG_MODE);
@@ -2670,6 +2676,12 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler, const char *c
     WT_ERR(__wt_metadata_set_base_write_gen(session));
 
     WT_ERR(__wt_metadata_cursor(session, NULL));
+
+    /*
+     * Load any incremental backup information. This reads the metadata so must be done after the
+     * turtle file is initialized.
+     */
+    WT_ERR(__wt_backup_open(session));
 
     /* Start the worker threads and run recovery. */
     WT_ERR(__wt_connection_workers(session, cfg));

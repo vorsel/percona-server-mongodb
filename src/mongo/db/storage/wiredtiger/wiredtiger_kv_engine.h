@@ -55,6 +55,8 @@ class JournalListener;
 class WiredTigerRecordStore;
 class WiredTigerSessionCache;
 class WiredTigerSizeStorer;
+class WiredTigerEngineRuntimeConfigParameter;
+class WiredTigerMaxCacheOverflowSizeGBParameter;
 
 struct WiredTigerFileVersion {
     enum class StartupVersion { IS_34, IS_36, IS_40, IS_42 };
@@ -175,7 +177,10 @@ public:
 
     void endBackup(OperationContext* opCtx) override;
 
-    StatusWith<std::vector<std::string>> beginNonBlockingBackup(OperationContext* opCtx) override;
+    Status disableIncrementalBackup(OperationContext* opCtx) override;
+
+    StatusWith<StorageEngine::BackupInformation> beginNonBlockingBackup(
+        OperationContext* opCtx, const StorageEngine::BackupOptions& options) override;
 
     void endNonBlockingBackup(OperationContext* opCtx) override;
 
@@ -497,5 +502,8 @@ private:
     // Timestamp of data at startup. Used internally to advise checkpointing and recovery to a
     // timestamp. Provided by replication layer because WT does not persist timestamps.
     AtomicWord<std::uint64_t> _initialDataTimestamp;
+
+    std::unique_ptr<WiredTigerEngineRuntimeConfigParameter> _runTimeConfigParam;
+    std::unique_ptr<WiredTigerMaxCacheOverflowSizeGBParameter> _maxCacheOverflowParam;
 };
 }  // namespace mongo

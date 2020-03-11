@@ -76,7 +76,10 @@ public:
                                     bool multi,
                                     boost::optional<OID> targetEpoch) override;
 
-    CollectionIndexUsageMap getIndexStats(OperationContext* opCtx, const NamespaceString& ns) final;
+    std::vector<Document> getIndexStats(OperationContext* opCtx,
+                                        const NamespaceString& ns,
+                                        StringData host,
+                                        bool addShardName) final;
     void appendLatencyStats(OperationContext* opCtx,
                             const NamespaceString& nss,
                             bool includeHistograms,
@@ -122,7 +125,8 @@ public:
         bool allowSpeculativeMajorityRead = false) final;
     std::vector<GenericCursor> getIdleCursors(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                               CurrentOpUserMode userMode) const final;
-    BackupCursorState openBackupCursor(OperationContext* opCtx) final;
+    BackupCursorState openBackupCursor(OperationContext* opCtx,
+                                       const StorageEngine::BackupOptions& options) final;
     void closeBackupCursor(OperationContext* opCtx, const UUID& backupId) final;
     BackupCursorExtendState extendBackupCursor(OperationContext* opCtx,
                                                const UUID& backupId,

@@ -39,6 +39,8 @@
 #include <limits>
 
 #include "mongo/base/status.h"
+#include "mongo/bson/json.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/client/fetcher.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/catalog/commit_quorum_options.h"
@@ -54,6 +56,7 @@
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_time.h"
 #include "mongo/db/logical_time_validator.h"
+#include "mongo/db/mongod_options_storage_gen.h"
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/prepare_conflict_tracker.h"
 #include "mongo/db/repl/check_quorum_for_config_change.h"
@@ -77,6 +80,7 @@
 #include "mongo/db/repl/update_position_args.h"
 #include "mongo/db/repl/vote_requester.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/executor/connection_pool_stats.h"
@@ -588,9 +592,11 @@ void ReplicationCoordinatorImpl::_finishLoadLocalConfig(
         myIndex = StatusWith<int>(-1);
     }
 
-    if (serverGlobalParams.enableMajorityReadConcern && localConfig.containsArbiter()) {
+    if (serverGlobalParams.enableMajorityReadConcern && localConfig.getNumMembers() == 3 &&
+        localConfig.getNumDataBearingMembers() == 2) {
         log() << startupWarningsLog;
-        log() << "** WARNING: This replica set uses arbiters, but readConcern:majority is enabled "
+        log() << "** WARNING: This replica set has a Primary-Secondary-Arbiter architecture, but "
+                 "readConcern:majority is enabled "
               << startupWarningsLog;
         log() << "**          for this node. This is not a recommended configuration. Please see "
               << startupWarningsLog;
@@ -794,7 +800,37 @@ void ReplicationCoordinatorImpl::_startDataReplication(OperationContext* opCtx,
 void ReplicationCoordinatorImpl::startup(OperationContext* opCtx) {
     if (!isReplEnabled()) {
         if (ReplSettings::shouldRecoverFromOplogAsStandalone()) {
+            uassert(ErrorCodes::InvalidOptions,
+                    str::stream() << "Cannot set parameter 'recoverToOplogTimestamp' "
+                                  << "when recovering from the oplog as a standalone",
+                    recoverToOplogTimestamp.empty());
             _replicationProcess->getReplicationRecovery()->recoverFromOplogAsStandalone(opCtx);
+        }
+
+        if (storageGlobalParams.readOnly && !recoverToOplogTimestamp.empty()) {
+            BSONObj recoverToTimestampObj = fromjson(recoverToOplogTimestamp);
+            uassert(ErrorCodes::BadValue,
+                    str::stream() << "'recoverToOplogTimestamp' needs to have a 'timestamp' field",
+                    recoverToTimestampObj.hasField("timestamp"));
+
+            Timestamp recoverToTimestamp = recoverToTimestampObj.getField("timestamp").timestamp();
+            uassert(ErrorCodes::BadValue,
+                    str::stream() << "'recoverToOplogTimestamp' needs to be a valid timestamp",
+                    !recoverToTimestamp.isNull());
+
+            StatusWith<BSONObj> cfg = _externalState->loadLocalConfigDocument(opCtx);
+            uassert(ErrorCodes::InvalidReplicaSetConfig,
+                    str::stream()
+                        << "No replica set config document was found, 'recoverToOplogTimestamp' "
+                        << "must be used with a node that was previously part of a replica set",
+                    cfg.isOK());
+
+            // Need to perform replication recovery up to and including the given timestamp.
+            // Temporarily turn off read-only mode for this procedure as we'll have to do writes.
+            storageGlobalParams.readOnly = false;
+            ON_BLOCK_EXIT([&] { storageGlobalParams.readOnly = true; });
+            _replicationProcess->getReplicationRecovery()->recoverFromOplogUpTo(opCtx,
+                                                                                recoverToTimestamp);
         }
 
         stdx::lock_guard<Latch> lk(_mutex);
@@ -2781,6 +2817,14 @@ Status ReplicationCoordinatorImpl::processReplSetInitiate(OperationContext* opCt
 
     auto configStateGuard =
         makeGuard([&] { lockAndCall(&lk, [=] { _setConfigState_inlock(kConfigUninitialized); }); });
+
+    // When writing our first oplog entry below, disable advancement of the stable timestamp so that
+    // we don't set it before setting our initial data timestamp. We will set it after we set our
+    // initialDataTimestamp. This will ensure we trigger an initial stable checkpoint properly.
+    if (!serverGlobalParams.enableMajorityReadConcern) {
+        _shouldSetStableTimestamp = false;
+    }
+
     lk.unlock();
 
     ReplSetConfig newConfig;
@@ -2837,6 +2881,14 @@ Status ReplicationCoordinatorImpl::processReplSetInitiate(OperationContext* opCt
     // to data on disk. We do this after writing the "initiating set" oplog entry.
     _storage->setInitialDataTimestamp(getServiceContext(),
                                       lastAppliedOpTimeAndWallTime.opTime.getTimestamp());
+
+    // Set our stable timestamp for storage and re-enable stable timestamp advancement after we have
+    // set our initial data timestamp.
+    if (!serverGlobalParams.enableMajorityReadConcern) {
+        stdx::unique_lock<Latch> lk(_mutex);
+        _shouldSetStableTimestamp = true;
+        _setStableTimestampForStorage(lk);
+    }
 
     _finishReplSetInitiate(opCtx, newConfig, myIndex.getValue());
 
@@ -3689,6 +3741,10 @@ boost::optional<OpTimeAndWallTime> ReplicationCoordinatorImpl::_recalculateStabl
 MONGO_FAIL_POINT_DEFINE(disableSnapshotting);
 
 void ReplicationCoordinatorImpl::_setStableTimestampForStorage(WithLock lk) {
+    if (!_shouldSetStableTimestamp) {
+        LOG(2) << "Not setting stable timestamp for storage.";
+        return;
+    }
     // Get the current stable optime.
     auto stableOpTime = _recalculateStableOpTime(lk);
 

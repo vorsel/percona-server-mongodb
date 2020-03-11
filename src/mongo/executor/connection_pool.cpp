@@ -39,6 +39,7 @@
 #include "mongo/executor/connection_pool_stats.h"
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/debug_util.h"
 #include "mongo/util/destructor_guard.h"
 #include "mongo/util/log.h"
 #include "mongo/util/lru_cache.h"
@@ -69,6 +70,10 @@ template <typename Map, typename... Args>
 void emplaceOrInvariant(Map&& map, Args&&... args) noexcept {
     auto ret = std::forward<Map>(map).emplace(std::forward<Args>(args)...);
     invariant(ret.second, "Element already existed in map/set");
+}
+
+bool shouldInvariantOnPoolCorrectness() noexcept {
+    return kDebugBuild;
 }
 
 }  // namespace
@@ -189,6 +194,11 @@ protected:
     Mutex _mutex = MONGO_MAKE_LATCH("LimitController::_mutex");
     stdx::unordered_map<PoolId, PoolData> _poolData;
 };
+
+
+auto ConnectionPool::makeLimitController() noexcept -> std::shared_ptr<ControllerInterface> {
+    return std::make_shared<LimitController>();
+}
 
 /**
  * A pool for a specific HostAndPort
@@ -434,15 +444,13 @@ ConnectionPool::ConnectionPool(std::shared_ptr<DependentTypeFactoryInterface> im
     : _name(std::move(name)),
       _factory(std::move(impl)),
       _options(std::move(options)),
-      _controller(std::move(_options.controller)),
+      _controller(_options.controllerFactory()),
       _manager(options.egressTagCloserManager) {
     if (_manager) {
         _manager->add(this);
     }
 
-    if (!_controller) {
-        _controller = std::make_shared<LimitController>();
-    }
+    invariant(_controller);
     _controller->init(this);
 }
 
@@ -585,8 +593,10 @@ ConnectionPool::SpecificPool::SpecificPool(std::shared_ptr<ConnectionPool> paren
 ConnectionPool::SpecificPool::~SpecificPool() {
     DESTRUCTOR_GUARD(_eventTimer->cancelTimeout();)
 
-    invariant(_requests.empty());
-    invariant(_checkedOutPool.empty());
+    if (shouldInvariantOnPoolCorrectness()) {
+        invariant(_requests.empty());
+        invariant(_checkedOutPool.empty());
+    }
 }
 
 size_t ConnectionPool::SpecificPool::inUseConnections() const {
@@ -1075,14 +1085,26 @@ void ConnectionPool::SpecificPool::updateController() {
             }
 
             auto& pool = it->second;
+            if (!pool->_health.isExpired) {
+                // Just because a HostGroup "canShutdown" doesn't mean that a SpecificPool should
+                // shutdown. For example, it is always inappropriate to shutdown a SpecificPool with
+                // connections in use or requests outstanding unless its parent ConnectionPool is
+                // also shutting down.
+                warning() << "Controller requested shutdown but connections still in use. "
+                          << "Connection pool will stay active. "
+                          << "host: " << pool->_hostAndPort;
+                continue;
+            }
 
             // At the moment, controllers will never mark for shutdown a pool with active
             // connections or pending requests. isExpired is never true if these invariants are
             // false. That's not to say that it's a terrible idea, but if this happens then we
             // should review what it means to be expired.
 
-            invariant(pool->_checkedOutPool.empty());
-            invariant(pool->_requests.empty());
+            if (shouldInvariantOnPoolCorrectness()) {
+                invariant(pool->_checkedOutPool.empty());
+                invariant(pool->_requests.empty());
+            }
 
             pool->triggerShutdown(Status(ErrorCodes::ShutdownInProgress,
                                          str::stream() << "Pool for " << host << " has expired."));

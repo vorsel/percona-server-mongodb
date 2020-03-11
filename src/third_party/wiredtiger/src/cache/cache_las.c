@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2019 MongoDB, Inc.
+ * Copyright (c) 2014-2020 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -142,7 +142,7 @@ __wt_las_stats_update(WT_SESSION_IMPL *session)
      * namespace so we don't have to worry about users seeing inconsistent data source information.
      */
     if (FLD_ISSET(conn->stat_flags, WT_STAT_CLEAR)) {
-        WT_STAT_SET(session, dstats, cursor_insert, 0);
+        WT_STAT_SET(session, dstats, cursor_update, 0);
         WT_STAT_SET(session, dstats, cursor_remove, 0);
     }
 }

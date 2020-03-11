@@ -81,8 +81,10 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    CollectionIndexUsageMap getIndexStats(OperationContext* opCtx,
-                                          const NamespaceString& ns) override {
+    std::vector<Document> getIndexStats(OperationContext* opCtx,
+                                        const NamespaceString& ns,
+                                        StringData host,
+                                        bool addShardName) override {
         MONGO_UNREACHABLE;
     }
 
@@ -180,7 +182,8 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    BackupCursorState openBackupCursor(OperationContext* opCtx) final {
+    BackupCursorState openBackupCursor(OperationContext* opCtx,
+                                       const StorageEngine::BackupOptions& options) final {
         return BackupCursorState{UUID::gen(), boost::none, {}};
     }
 

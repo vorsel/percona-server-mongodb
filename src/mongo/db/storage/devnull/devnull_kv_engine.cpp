@@ -270,10 +270,12 @@ void DevNullKVEngine::setCachePressureForTest(int pressure) {
     _cachePressureForTest = pressure;
 }
 
-StatusWith<std::vector<std::string>> DevNullKVEngine::beginNonBlockingBackup(
-    OperationContext* opCtx) {
-    std::vector<std::string> filesToCopy = {"filename.wt"};
-    return filesToCopy;
+StatusWith<StorageEngine::BackupInformation> DevNullKVEngine::beginNonBlockingBackup(
+    OperationContext* opCtx, const StorageEngine::BackupOptions& options) {
+    StorageEngine::BackupInformation backupInformation;
+    StorageEngine::BackupFile backupFile(0);
+    backupInformation.insert({"filename.wt", backupFile});
+    return backupInformation;
 }
 
 StatusWith<std::vector<std::string>> DevNullKVEngine::extendBackupCursor(OperationContext* opCtx) {

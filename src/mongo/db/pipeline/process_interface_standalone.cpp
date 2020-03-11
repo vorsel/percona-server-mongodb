@@ -85,6 +85,10 @@ public:
 
         Session* const session = OperationContextSession::get(opCtx);
         if (session) {
+            if (auto txnParticipant = TransactionParticipant::get(opCtx)) {
+                txnParticipant.stashTransactionResources(opCtx);
+            }
+
             MongoDOperationContextSession::checkIn(opCtx);
         }
         _yielded = (session != nullptr);
@@ -97,13 +101,14 @@ public:
             // unblocking this thread of execution. However, we must wait until the child operation
             // on this shard finishes so we can get the session back. This may limit the throughput
             // of the operation, but it's correct.
-            MongoDOperationContextSession::checkOut(opCtx,
-                                                    // Assumes this is only called from the
-                                                    // 'aggregate' or 'getMore' commands.  The code
-                                                    // which relies on this parameter does not
-                                                    // distinguish/care about the difference so we
-                                                    // simply always pass 'aggregate'.
-                                                    "aggregate");
+            MongoDOperationContextSession::checkOut(opCtx);
+
+            if (auto txnParticipant = TransactionParticipant::get(opCtx)) {
+                // Assumes this is only called from the 'aggregate' or 'getMore' commands.  The code
+                // which relies on this parameter does not distinguish/care about the difference so
+                // we simply always pass 'aggregate'.
+                txnParticipant.unstashTransactionResources(opCtx, "aggregate");
+            }
         }
     }
 
@@ -253,17 +258,51 @@ StatusWith<MongoProcessInterface::UpdateResult> MongoInterfaceStandalone::update
     return updateResult;
 }
 
-CollectionIndexUsageMap MongoInterfaceStandalone::getIndexStats(OperationContext* opCtx,
-                                                                const NamespaceString& ns) {
+std::vector<Document> MongoInterfaceStandalone::getIndexStats(OperationContext* opCtx,
+                                                              const NamespaceString& ns,
+                                                              StringData host,
+                                                              bool addShardName) {
     AutoGetCollectionForReadCommand autoColl(opCtx, ns);
 
     Collection* collection = autoColl.getCollection();
+    std::vector<Document> indexStats;
     if (!collection) {
         LOG(2) << "Collection not found on index stats retrieval: " << ns.ns();
-        return CollectionIndexUsageMap();
+        return indexStats;
     }
 
-    return collection->infoCache()->getIndexUsageStats();
+    auto indexStatsMap = collection->infoCache()->getIndexUsageStats();
+    for (auto&& indexStatsMapIter : indexStatsMap) {
+        auto indexName = indexStatsMapIter.first;
+        auto stats = indexStatsMapIter.second;
+        MutableDocument doc;
+        doc["name"] = Value(indexName);
+        doc["key"] = Value(stats.indexKey);
+        doc["host"] = Value(host);
+        doc["accesses"]["ops"] = Value(stats.accesses.loadRelaxed());
+        doc["accesses"]["since"] = Value(stats.trackerStartTime);
+
+        if (addShardName)
+            doc["shard"] = Value(getShardName(opCtx));
+
+        // Retrieve the relevant index entry.
+        auto idxCatalog = collection->getIndexCatalog();
+        auto idx = idxCatalog->findIndexByName(opCtx,
+                                               indexName,
+                                               /* includeUnfinishedIndexes */ true);
+        uassert(ErrorCodes::IndexNotFound,
+                "Could not find entry in IndexCatalog for index " + indexName,
+                idx);
+        auto entry = idxCatalog->getEntry(idx);
+        doc["spec"] = Value(idx->infoObj());
+
+        if (!entry->isReady(opCtx)) {
+            doc["building"] = Value(true);
+        }
+
+        indexStats.push_back(doc.freeze());
+    }
+    return indexStats;
 }
 
 void MongoInterfaceStandalone::appendLatencyStats(OperationContext* opCtx,
@@ -462,10 +501,11 @@ boost::optional<Document> MongoInterfaceStandalone::lookupSingleDocument(
     return lookedUpDocument;
 }
 
-BackupCursorState MongoInterfaceStandalone::openBackupCursor(OperationContext* opCtx) {
+BackupCursorState MongoInterfaceStandalone::openBackupCursor(
+    OperationContext* opCtx, const StorageEngine::BackupOptions& options) {
     auto backupCursorHooks = BackupCursorHooks::get(opCtx->getServiceContext());
     if (backupCursorHooks->enabled()) {
-        return backupCursorHooks->openBackupCursor(opCtx);
+        return backupCursorHooks->openBackupCursor(opCtx, options);
     } else {
         uasserted(50956, "Backup cursors are an enterprise only feature.");
     }

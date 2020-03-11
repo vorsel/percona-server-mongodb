@@ -39,6 +39,8 @@
 #define NVALGRIND
 #endif
 
+#include <fmt/format.h>
+#include <iomanip>
 #include <memory>
 #include <regex>
 
@@ -105,6 +107,7 @@
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
 #include "mongo/util/processinfo.h"
+#include "mongo/util/quick_exit.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/time_support.h"
 
@@ -534,11 +537,15 @@ stdx::function<bool(StringData)> initRsOplogBackgroundThreadCallback = [](String
     fassertFailed(40358);
 };
 
-StatusWith<std::vector<std::string>> getDataFilesFromBackupCursor(WT_CURSOR* cursor,
-                                                                  std::string dbPath,
-                                                                  const char* statusPrefix) {
+StatusWith<StorageEngine::BackupInformation> getBackupInformationFromBackupCursor(
+    WT_SESSION* session,
+    WT_CURSOR* cursor,
+    bool incrementalBackup,
+    bool fullBackup,
+    std::string dbPath,
+    const char* statusPrefix) {
     int wtRet;
-    std::vector<std::string> files;
+    StorageEngine::BackupInformation backupInformation;
     const char* filename;
     const auto directoryPath = boost::filesystem::path(dbPath);
     const auto wiredTigerLogFilePrefix = "WiredTigerLog";
@@ -547,19 +554,66 @@ StatusWith<std::vector<std::string>> getDataFilesFromBackupCursor(WT_CURSOR* cur
 
         std::string name(filename);
 
-        auto filePath = directoryPath;
+        boost::filesystem::path filePath = directoryPath;
         if (name.find(wiredTigerLogFilePrefix) == 0) {
             // TODO SERVER-13455:replace `journal/` with the configurable journal path.
             filePath /= boost::filesystem::path("journal");
         }
         filePath /= name;
 
-        files.push_back(filePath.string());
+        boost::system::error_code errorCode;
+        const std::uint64_t fileSize = boost::filesystem::file_size(filePath, errorCode);
+        uassert(31403,
+                "Failed to get a file's size. Filename: {} Error: {}"_format(filePath.string(),
+                                                                             errorCode.message()),
+                !errorCode);
+
+        StorageEngine::BackupFile backupFile(fileSize);
+        backupInformation.insert({filePath.string(), backupFile});
+
+        // For the first full incremental backup, include the offset and length.
+        if (incrementalBackup && fullBackup) {
+            backupInformation.at(filePath.string()).blocksToCopy.push_back({0, fileSize});
+        }
+
+        // Full backups cannot open an incremental cursor, even if they are the first full backup
+        // for incremental.
+        if (!incrementalBackup || fullBackup) {
+            continue;
+        }
+
+        // For each file listed, open a duplicate backup cursor and get the blocks to copy.
+        std::stringstream ss;
+        ss << "incremental=(file=" << filename << ")";
+        const std::string config = ss.str();
+        WT_CURSOR* dupCursor;
+        wtRet = session->open_cursor(session, nullptr, cursor, config.c_str(), &dupCursor);
+        if (wtRet != 0) {
+            return wtRCToStatus(wtRet);
+        }
+
+        while ((wtRet = dupCursor->next(dupCursor)) == 0) {
+            uint64_t offset, size, type;
+            invariantWTOK(dupCursor->get_key(dupCursor, &offset, &size, &type));
+            LOG(2) << "Block to copy for incremental backup: filename: " << filePath.string()
+                   << ", offset: " << offset << ", size: " << size << ", type: " << type;
+            backupInformation.at(filePath.string()).blocksToCopy.push_back({offset, size});
+        }
+
+        if (wtRet != WT_NOTFOUND) {
+            return wtRCToStatus(wtRet);
+        }
+
+        wtRet = dupCursor->close(dupCursor);
+        if (wtRet != 0) {
+            return wtRCToStatus(wtRet);
+        }
     }
+
     if (wtRet != WT_NOTFOUND) {
         return wtRCToStatus(wtRet, statusPrefix);
     }
-    return files;
+    return backupInformation;
 }
 
 }  // namespace
@@ -755,36 +809,30 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
     // The setting may have a later setting override it if not using the journal.  We make it
     // unconditional here because even nojournal may need this setting if it is a transition
     // from using the journal.
-    if (!_readOnly) {
-        // If we're readOnly skip all WAL-related settings.
-        ss << "log=(enabled=true,archive=true,path=journal,compressor=";
-        ss << wiredTigerGlobalOptions.journalCompressor << "),";
-        ss << "file_manager=(close_idle_time=" << gWiredTigerFileHandleCloseIdleTime
-           << ",close_scan_interval=" << gWiredTigerFileHandleCloseScanInterval
-           << ",close_handle_minimum=" << gWiredTigerFileHandleCloseMinimum << "),";
-        ss << "statistics_log=(wait=" << wiredTigerGlobalOptions.statisticsLogDelaySecs << "),";
+    ss << "log=(enabled=true,archive=" << (_readOnly ? "false" : "true")
+       << ",path=journal,compressor=";
+    ss << wiredTigerGlobalOptions.journalCompressor << "),";
+    ss << "file_manager=(close_idle_time=" << gWiredTigerFileHandleCloseIdleTime
+       << ",close_scan_interval=" << gWiredTigerFileHandleCloseScanInterval
+       << ",close_handle_minimum=" << gWiredTigerFileHandleCloseMinimum << "),";
+    ss << "statistics_log=(wait=" << wiredTigerGlobalOptions.statisticsLogDelaySecs << "),";
 
-        if (shouldLog(::mongo::logger::LogComponent::kStorageRecovery,
-                      logger::LogSeverity::Debug(3))) {
-            ss << "verbose=[recovery_progress,checkpoint_progress,recovery],";
-        } else {
-            ss << "verbose=[recovery_progress,checkpoint_progress],";
-        }
+    if (shouldLog(::mongo::logger::LogComponent::kStorageRecovery, logger::LogSeverity::Debug(3))) {
+        ss << "verbose=[recovery_progress,checkpoint_progress,recovery],";
+    } else {
+        ss << "verbose=[recovery_progress,checkpoint_progress],";
+    }
 
-        // Enable debug write-ahead logging for all tables under debug build.
-        if (kDebugBuild) {
-            ss << "debug_mode=(table_logging=true),";
-        }
+    // Enable debug write-ahead logging for all tables under debug build.
+    if (kDebugBuild) {
+        ss << "debug_mode=(table_logging=true),";
     }
     ss << WiredTigerCustomizationHooks::get(getGlobalServiceContext())
               ->getTableCreateConfig("system");
     ss << WiredTigerExtensions::get(getGlobalServiceContext())->getOpenExtensionsConfig();
     ss << extraOpenOptions;
-    if (_readOnly) {
-        invariant(!_durable);
-        ss << ",readonly=true,";
-    }
-    if (!_durable && !_readOnly) {
+
+    if (!_durable) {
         // If we started without the journal, but previously used the journal then open with the
         // WT log enabled to perform any unclean shutdown recovery and then close and reopen in
         // the normal path without the journal.
@@ -875,14 +923,22 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
     _sizeStorer = std::make_unique<WiredTigerSizeStorer>(_conn, _sizeStorerUri, _readOnly);
 
     Locker::setGlobalThrottling(&openReadTransaction, &openWriteTransaction);
+    _runTimeConfigParam.reset(new WiredTigerEngineRuntimeConfigParameter(
+        "wiredTigerEngineRuntimeConfig", ServerParameterType::kRuntimeOnly));
+    _runTimeConfigParam->_data.second = this;
+    _maxCacheOverflowParam.reset(new WiredTigerMaxCacheOverflowSizeGBParameter(
+        "wiredTigerMaxCacheOverflowSizeGB", ServerParameterType::kRuntimeOnly));
+    _maxCacheOverflowParam->_data = {maxCacheOverflowFileSizeMB / 1024, this};
 }
 
 
 WiredTigerKVEngine::~WiredTigerKVEngine() {
-    if (_conn) {
-        cleanShutdown();
-    }
+    // Remove server parameters that we added in the constructor, to enable unit tests to reload the
+    // storage engine again in this same process.
+    ServerParameterSet::getGlobal()->remove("wiredTigerEngineRuntimeConfig");
+    ServerParameterSet::getGlobal()->remove("wiredTigerMaxCacheOverflowSizeGB");
 
+    cleanShutdown();
     _sessionCache.reset(NULL);
     _encryptionKeyDB.reset(nullptr);
 }
@@ -1031,7 +1087,16 @@ void WiredTigerKVEngine::cleanShutdown() {
         closeConfig += "use_timestamp=false,";
     }
 
-    invariantWTOK(_conn->close(_conn, closeConfig.c_str()));
+    const Timestamp stableTimestamp = getStableTimestamp();
+    const Timestamp initialDataTimestamp = getInitialDataTimestamp();
+    if (stableTimestamp >= initialDataTimestamp) {
+        invariantWTOK(_conn->close(_conn, closeConfig.c_str()));
+    } else {
+        log() << "Skipping checkpoint during clean shutdown because stableTimestamp ("
+              << stableTimestamp << ") is less than the initialDataTimestamp ("
+              << initialDataTimestamp << ")";
+        quickExit(EXIT_SUCCESS);
+    }
     _conn = nullptr;
 }
 
@@ -1189,9 +1254,44 @@ void WiredTigerKVEngine::endBackup(OperationContext* opCtx) {
     _backupSession.reset();
 }
 
-StatusWith<std::vector<std::string>> WiredTigerKVEngine::beginNonBlockingBackup(
-    OperationContext* opCtx) {
+Status WiredTigerKVEngine::disableIncrementalBackup(OperationContext* opCtx) {
+    // Opening an incremental backup cursor with the "force_stop=true" configuration option then
+    // closing the cursor will set a flag in WiredTiger that causes it to release all incremental
+    // information and resources.
+    // Opening a subsequent incremental backup cursor will reset the flag in WiredTiger and
+    // reinstate incremental backup history.
+    uassert(31401, "Cannot open backup cursor with in-memory storage engine.", !isEphemeral());
+
+    auto sessionRaii = std::make_unique<WiredTigerSession>(_conn);
+    WT_CURSOR* cursor = nullptr;
+    WT_SESSION* session = sessionRaii->getSession();
+    int wtRet =
+        session->open_cursor(session, "backup:", nullptr, "incremental=(force_stop=true)", &cursor);
+    if (wtRet != 0) {
+        error() << "Could not open a backup cursor to disable incremental backups";
+        return wtRCToStatus(wtRet);
+    }
+
+    return Status::OK();
+}
+
+StatusWith<StorageEngine::BackupInformation> WiredTigerKVEngine::beginNonBlockingBackup(
+    OperationContext* opCtx, const StorageEngine::BackupOptions& options) {
     uassert(51034, "Cannot open backup cursor with in-memory mode.", !isEphemeral());
+
+    std::stringstream ss;
+    if (options.incrementalBackup) {
+        invariant(options.thisBackupName);
+        ss << "incremental=(enabled=true,force_stop=false,";
+        ss << "granularity=" << options.blockSizeMB << "MB,";
+        ss << "this_id=" << std::quoted(str::escape(*options.thisBackupName)) << ",";
+
+        if (options.srcBackupName) {
+            ss << "src_id=" << std::quoted(str::escape(*options.srcBackupName)) << ",";
+        }
+
+        ss << ")";
+    }
 
     // Oplog truncation thread won't remove oplog since the checkpoint pinned by the backup cursor.
     stdx::lock_guard<Latch> lock(_oplogPinnedByBackupMutex);
@@ -1207,23 +1307,29 @@ StatusWith<std::vector<std::string>> WiredTigerKVEngine::beginNonBlockingBackup(
     auto sessionRaii = stdx::make_unique<WiredTigerSession>(_conn);
     WT_CURSOR* cursor = NULL;
     WT_SESSION* session = sessionRaii->getSession();
-    int wtRet = session->open_cursor(session, "backup:", NULL, NULL, &cursor);
+    const std::string config = ss.str();
+    int wtRet = session->open_cursor(session, "backup:", nullptr, config.c_str(), &cursor);
     if (wtRet != 0) {
         return wtRCToStatus(wtRet);
     }
 
-    auto swFilesToCopy =
-        getDataFilesFromBackupCursor(cursor, _path, "Error opening backup cursor.");
+    const bool fullBackup = !options.srcBackupName;
+    auto swBackupInfo = getBackupInformationFromBackupCursor(session,
+                                                             cursor,
+                                                             options.incrementalBackup,
+                                                             fullBackup,
+                                                             _path,
+                                                             "Error opening backup cursor.");
 
-    if (!swFilesToCopy.isOK()) {
-        return swFilesToCopy;
+    if (!swBackupInfo.isOK()) {
+        return swBackupInfo;
     }
 
     pinOplogGuard.dismiss();
     _backupSession = std::move(sessionRaii);
     _backupCursor = cursor;
 
-    return swFilesToCopy;
+    return swBackupInfo;
 }
 
 void WiredTigerKVEngine::endNonBlockingBackup(OperationContext* opCtx) {
@@ -1239,22 +1345,43 @@ StatusWith<std::vector<std::string>> WiredTigerKVEngine::extendBackupCursor(
     uassert(51033, "Cannot extend backup cursor with in-memory mode.", !isEphemeral());
     invariant(_backupCursor);
 
-    WT_CURSOR* cursor = NULL;
+    // The "target=(\"log:\")" configuration string for the cursor will ensure that we only see the
+    // log files when iterating on the cursor.
+    WT_CURSOR* cursor = nullptr;
     WT_SESSION* session = _backupSession->getSession();
     int wtRet = session->open_cursor(session, NULL, _backupCursor, "target=(\"log:\")", &cursor);
     if (wtRet != 0) {
         return wtRCToStatus(wtRet);
     }
 
-    auto swFilesToCopy =
-        getDataFilesFromBackupCursor(cursor, _path, "Error extending backup cursor.");
+    StatusWith<StorageEngine::BackupInformation> swBackupInfo =
+        getBackupInformationFromBackupCursor(session,
+                                             cursor,
+                                             /*incrementalBackup=*/false,
+                                             /*fullBackup=*/true,
+                                             _path,
+                                             "Error extending backup cursor.");
 
     wtRet = cursor->close(cursor);
     if (wtRet != 0) {
         return wtRCToStatus(wtRet);
     }
 
-    return swFilesToCopy;
+    if (!swBackupInfo.isOK()) {
+        return swBackupInfo.getStatus();
+    }
+
+    // Once all the backup cursors have been opened on a sharded cluster, we need to ensure that the
+    // data being copied from each shard is at the same point-in-time across the entire cluster to
+    // have a consistent view of the data. For shards that opened their backup cursor before the
+    // established point-in-time for backup, they will need to create a full copy of the additional
+    // journal files returned by this method to ensure a consistent backup of the data is taken.
+    std::vector<std::string> filenames;
+    for (const auto& entry : swBackupInfo.getValue()) {
+        filenames.push_back(entry.first);
+    }
+
+    return {filenames};
 }
 
 // Can throw standard exceptions

@@ -86,6 +86,8 @@ function RollbackTest(name = "RollbackTest", replSet) {
     const kNumDataBearingNodes = 3;
     const kElectableNodes = 2;
 
+    let awaitSecondaryNodesForRollbackTimeout;
+
     let rst;
     let curPrimary;
     let curSecondary;
@@ -245,28 +247,21 @@ function RollbackTest(name = "RollbackTest", replSet) {
      * be replicated to all nodes and should not be rolled back.
      */
     this.transitionToSteadyStateOperations = function({skipDataConsistencyChecks = false} = {}) {
-        if (this.isMajorityReadConcernEnabledOnRollbackNode) {
-            log(`Waiting for rollback to complete on ${curSecondary.host}`, true);
-            let rbid = -1;
-            assert.soon(() => {
-                try {
-                    rbid = assert.commandWorked(curSecondary.adminCommand("replSetGetRBID")).rbid;
-                } catch (e) {
-                    // Command can fail when sync source is being cleared.
-                }
-                // Fail early if the rbid is greater than lastRBID+1.
-                assert.lte(rbid,
-                           lastRBID + 1,
-                           `RBID is too large. current RBID: ${rbid}, last RBID: ${lastRBID}`);
+        log(`Waiting for rollback to complete on ${curSecondary.host}`, true);
+        let rbid = -1;
+        assert.soon(() => {
+            try {
+                rbid = assert.commandWorked(curSecondary.adminCommand("replSetGetRBID")).rbid;
+            } catch (e) {
+                // Command can fail when sync source is being cleared.
+            }
+            // Fail early if the rbid is greater than lastRBID+1.
+            assert.lte(rbid,
+                       lastRBID + 1,
+                       `RBID is too large. current RBID: ${rbid}, last RBID: ${lastRBID}`);
 
-                return rbid === lastRBID + 1;
-            }, "Timed out waiting for RBID to increment on " + curSecondary.host);
-        } else {
-            // TODO: After fixing SERVER-45178, we can remove the else block as we are guaranteed
-            // that the rollback id will get updated if the rollback has happened on that node.
-            log(`Skipping RBID check on ${curSecondary.host} because shutdowns ` +
-                `may prevent a rollback here.`);
-        }
+            return rbid === lastRBID + 1;
+        }, "Timed out waiting for RBID to increment on " + curSecondary.host);
 
         // Ensure that the tiebreaker node is connected to the other nodes. We must do this after
         // we are sure that rollback has completed on the rollback node.
@@ -275,7 +270,26 @@ function RollbackTest(name = "RollbackTest", replSet) {
         // Allow replication temporarily so the following checks succeed.
         restartServerReplication(tiebreakerNode);
 
-        rst.awaitSecondaryNodes();
+        // If the rollback node has {enableMajorityReadConcern:false} set, it will use the
+        // rollbackViaRefetch algorithm. That can lead to unrecoverable rollbacks, particularly
+        // in unclean shutdown suites, as it it is possible in rare cases for the sync source to
+        // lose the entry corresponding to the optime the rollback node chose as its minValid.
+        try {
+            rst.awaitSecondaryNodesForRollbackTest(
+                awaitSecondaryNodesForRollbackTimeout,
+                [curSecondary, tiebreakerNode],
+                curSecondary /* connToCheckForUnrecoverableRollback */);
+        } catch (e) {
+            if (e.unrecoverableRollbackDetected) {
+                log(`Detected unrecoverable rollback on ${curSecondary.host}. Ending test.`,
+                    true /* important */);
+                TestData.skipCheckDBHashes = true;
+                rst.stopSet();
+                quit();
+            }
+            // Re-throw the original exception in all other cases.
+            throw e;
+        }
         rst.awaitReplication();
 
         log(`Rollback on ${curSecondary.host} (if needed) and awaitReplication completed`, true);
@@ -311,12 +325,6 @@ function RollbackTest(name = "RollbackTest", replSet) {
         // rolled back.
         rst.awaitSecondaryNodes();
         rst.awaitReplication(null, null, [curSecondary]);
-
-        // The current primary will be the node that rolls back. Check if it supports majority reads
-        // here while we are in a steady state.
-        this.isMajorityReadConcernEnabledOnRollbackNode =
-            assert.commandWorked(curPrimary.adminCommand({serverStatus: 1}))
-                .storageEngine.supportsCommittedReads;
 
         transitionIfAllowed(State.kRollbackOps);
 
@@ -518,5 +526,14 @@ function RollbackTest(name = "RollbackTest", replSet) {
      */
     this.getTestFixture = function() {
         return rst;
+    };
+
+    /**
+     * Use this to control the timeout being used in the awaitSecondaryNodesForRollbackTest call
+     * in transitionToSteadyStateOperations.
+     * For use only in tests that expect unrecoverable rollbacks.
+     */
+    this.setAwaitSecondaryNodesForRollbackTimeout = function(timeoutMillis) {
+        awaitSecondaryNodesForRollbackTimeout = timeoutMillis;
     };
 }

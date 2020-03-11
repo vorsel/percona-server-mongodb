@@ -235,7 +235,7 @@ TEST_F(DConcurrencyTestFixture, ResourceMutex) {
         state.finish(3);
 
         // Step 4: Try to regain the shared lock // transfers control to t1
-        lk.lock(MODE_IS);
+        lk.lock(nullptr, MODE_IS);
 
         // Step 6: CHeck we actually got back the shared lock
         ASSERT(lk.isLocked());
@@ -468,68 +468,98 @@ TEST_F(DConcurrencyTestFixture, RSTLmodeX_Timeout) {
         MODE_NONE);
 }
 
+TEST_F(DConcurrencyTestFixture, PBWMmodeX_Timeout) {
+    auto clients = makeKClientsWithLockers(2);
+    Lock::ParallelBatchWriterMode pbwm(clients[0].second.get()->lockState());
+    ASSERT_EQ(clients[0].second.get()->lockState()->getLockMode(resourceIdParallelBatchWriterMode),
+              MODE_X);
+
+    ASSERT_THROWS_CODE(Lock::GlobalLock(clients[1].second.get(),
+                                        MODE_X,
+                                        Date_t::now() + Milliseconds(1),
+                                        Lock::InterruptBehavior::kThrow),
+                       AssertionException,
+                       ErrorCodes::LockTimeout);
+    ASSERT_EQ(clients[0].second.get()->lockState()->getLockMode(resourceIdParallelBatchWriterMode),
+              MODE_X);
+    ASSERT_EQ(clients[1].second.get()->lockState()->getLockMode(resourceIdParallelBatchWriterMode),
+              MODE_NONE);
+}
+
 TEST_F(DConcurrencyTestFixture, GlobalLockXSetsGlobalWriteLockedOnOperationContext) {
     auto clients = makeKClientsWithLockers(1);
     auto opCtx = clients[0].second.get();
     ASSERT_FALSE(opCtx->lockState()->wasGlobalLockTakenForWrite());
+    ASSERT_FALSE(opCtx->lockState()->wasGlobalLockTaken());
 
     {
         Lock::GlobalLock globalWrite(opCtx, MODE_X, Date_t::now(), Lock::InterruptBehavior::kThrow);
         ASSERT(globalWrite.isLocked());
     }
     ASSERT_TRUE(opCtx->lockState()->wasGlobalLockTakenForWrite());
+    ASSERT_TRUE(opCtx->lockState()->wasGlobalLockTaken());
 }
 
 TEST_F(DConcurrencyTestFixture, GlobalLockIXSetsGlobalWriteLockedOnOperationContext) {
     auto clients = makeKClientsWithLockers(1);
     auto opCtx = clients[0].second.get();
     ASSERT_FALSE(opCtx->lockState()->wasGlobalLockTakenForWrite());
+    ASSERT_FALSE(opCtx->lockState()->wasGlobalLockTaken());
     {
         Lock::GlobalLock globalWrite(
             opCtx, MODE_IX, Date_t::now(), Lock::InterruptBehavior::kThrow);
         ASSERT(globalWrite.isLocked());
     }
     ASSERT_TRUE(opCtx->lockState()->wasGlobalLockTakenForWrite());
+    ASSERT_TRUE(opCtx->lockState()->wasGlobalLockTaken());
 }
 
 TEST_F(DConcurrencyTestFixture, GlobalLockSDoesNotSetGlobalWriteLockedOnOperationContext) {
     auto clients = makeKClientsWithLockers(1);
     auto opCtx = clients[0].second.get();
     ASSERT_FALSE(opCtx->lockState()->wasGlobalLockTakenForWrite());
+    ASSERT_FALSE(opCtx->lockState()->wasGlobalLockTaken());
     {
         Lock::GlobalLock globalRead(opCtx, MODE_S, Date_t::now(), Lock::InterruptBehavior::kThrow);
         ASSERT(globalRead.isLocked());
     }
     ASSERT_FALSE(opCtx->lockState()->wasGlobalLockTakenForWrite());
+    ASSERT_TRUE(opCtx->lockState()->wasGlobalLockTaken());
 }
 
 TEST_F(DConcurrencyTestFixture, GlobalLockISDoesNotSetGlobalWriteLockedOnOperationContext) {
     auto clients = makeKClientsWithLockers(1);
     auto opCtx = clients[0].second.get();
     ASSERT_FALSE(opCtx->lockState()->wasGlobalLockTakenForWrite());
+    ASSERT_FALSE(opCtx->lockState()->wasGlobalLockTaken());
     {
         Lock::GlobalLock globalRead(opCtx, MODE_IS, Date_t::now(), Lock::InterruptBehavior::kThrow);
         ASSERT(globalRead.isLocked());
     }
     ASSERT_FALSE(opCtx->lockState()->wasGlobalLockTakenForWrite());
+    ASSERT_TRUE(opCtx->lockState()->wasGlobalLockTaken());
 }
 
 TEST_F(DConcurrencyTestFixture, DBLockXSetsGlobalWriteLockedOnOperationContext) {
     auto clients = makeKClientsWithLockers(1);
     auto opCtx = clients[0].second.get();
     ASSERT_FALSE(opCtx->lockState()->wasGlobalLockTakenForWrite());
+    ASSERT_FALSE(opCtx->lockState()->wasGlobalLockTaken());
 
     { Lock::DBLock dbWrite(opCtx, "db", MODE_X); }
     ASSERT_TRUE(opCtx->lockState()->wasGlobalLockTakenForWrite());
+    ASSERT_TRUE(opCtx->lockState()->wasGlobalLockTaken());
 }
 
 TEST_F(DConcurrencyTestFixture, DBLockSDoesNotSetGlobalWriteLockedOnOperationContext) {
     auto clients = makeKClientsWithLockers(1);
     auto opCtx = clients[0].second.get();
     ASSERT_FALSE(opCtx->lockState()->wasGlobalLockTakenForWrite());
+    ASSERT_FALSE(opCtx->lockState()->wasGlobalLockTaken());
 
     { Lock::DBLock dbRead(opCtx, "db", MODE_S); }
     ASSERT_FALSE(opCtx->lockState()->wasGlobalLockTakenForWrite());
+    ASSERT_TRUE(opCtx->lockState()->wasGlobalLockTaken());
 }
 
 TEST_F(DConcurrencyTestFixture, GlobalLockXDoesNotSetGlobalWriteLockedWhenLockAcquisitionTimesOut) {
@@ -542,6 +572,7 @@ TEST_F(DConcurrencyTestFixture, GlobalLockXDoesNotSetGlobalWriteLockedWhenLockAc
 
     auto opCtx = clients[1].second.get();
     ASSERT_FALSE(opCtx->lockState()->wasGlobalLockTakenForWrite());
+    ASSERT_FALSE(opCtx->lockState()->wasGlobalLockTaken());
     {
         ASSERT_THROWS_CODE(
             Lock::GlobalLock(
@@ -550,6 +581,7 @@ TEST_F(DConcurrencyTestFixture, GlobalLockXDoesNotSetGlobalWriteLockedWhenLockAc
             ErrorCodes::LockTimeout);
     }
     ASSERT_FALSE(opCtx->lockState()->wasGlobalLockTakenForWrite());
+    ASSERT_FALSE(opCtx->lockState()->wasGlobalLockTaken());
 }
 
 TEST_F(DConcurrencyTestFixture, GlobalLockSSetsGlobalLockTakenInModeConflictingWithWrites) {
@@ -2342,6 +2374,22 @@ TEST_F(DConcurrencyTestFixture, FailPointInLockDoesNotFailUninterruptibleNonInte
     }
 
     locker1.unlockGlobal();
+}
+
+TEST_F(DConcurrencyTestFixture, PBWMRespectsMaxTimeMS) {
+    auto clientOpCtxPairs = makeKClientsWithLockers(2);
+    auto opCtx1 = clientOpCtxPairs[0].second.get();
+    auto opCtx2 = clientOpCtxPairs[1].second.get();
+
+    Lock::ResourceLock pbwm1(opCtx1->lockState(), resourceIdParallelBatchWriterMode);
+    pbwm1.lock(nullptr, MODE_X);
+
+    opCtx2->setDeadlineAfterNowBy(Seconds{1}, ErrorCodes::ExceededTimeLimit);
+
+    Lock::ResourceLock pbwm2(opCtx2->lockState(), resourceIdParallelBatchWriterMode);
+
+    ASSERT_THROWS_CODE(
+        pbwm2.lock(opCtx2, MODE_X), AssertionException, ErrorCodes::ExceededTimeLimit);
 }
 
 }  // namespace

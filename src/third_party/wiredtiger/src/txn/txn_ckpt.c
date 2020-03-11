@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2019 MongoDB, Inc.
+ * Copyright (c) 2014-2020 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -1112,6 +1112,7 @@ static void
 __drop(WT_CKPT *ckptbase, const char *name, size_t len)
 {
     WT_CKPT *ckpt;
+    u_int max_ckpt_drop;
 
     /*
      * If we're dropping internal checkpoints, match to the '.' separating the checkpoint name from
@@ -1120,9 +1121,20 @@ __drop(WT_CKPT *ckptbase, const char *name, size_t len)
      * it's one we want to drop.
      */
     if (strncmp(WT_CHECKPOINT, name, len) == 0) {
+        /*
+         * Currently, hot backup cursors block checkpoint drop, which means releasing a hot backup
+         * cursor can result in immediately attempting to drop lots of checkpoints, which involves a
+         * fair amount of work while holding locks. Limit the number of standard checkpoints dropped
+         * per checkpoint.
+         */
+        max_ckpt_drop = 0;
         WT_CKPT_FOREACH (ckptbase, ckpt)
-            if (WT_PREFIX_MATCH(ckpt->name, WT_CHECKPOINT))
+            if (WT_PREFIX_MATCH(ckpt->name, WT_CHECKPOINT)) {
                 F_SET(ckpt, WT_CKPT_DELETE);
+#define WT_MAX_CHECKPOINT_DROP 4
+                if (++max_ckpt_drop >= WT_MAX_CHECKPOINT_DROP)
+                    break;
+            }
     } else
         WT_CKPT_FOREACH (ckptbase, ckpt)
             if (WT_STRING_MATCH(ckpt->name, name, len))
@@ -1226,6 +1238,7 @@ __checkpoint_lock_dirty_tree_int(WT_SESSION_IMPL *session, bool is_checkpoint, b
               "cannot be deleted during a hot backup",
               ckpt->name);
         }
+
     /*
      * Mark old checkpoints that are being deleted and figure out which trees we can skip in this
      * checkpoint.

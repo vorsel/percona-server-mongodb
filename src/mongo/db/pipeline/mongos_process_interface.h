@@ -119,8 +119,10 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    CollectionIndexUsageMap getIndexStats(OperationContext* opCtx,
-                                          const NamespaceString& ns) final {
+    std::vector<Document> getIndexStats(OperationContext* opCtx,
+                                        const NamespaceString& ns,
+                                        StringData host,
+                                        bool addShardName) final {
         MONGO_UNREACHABLE;
     }
 
@@ -188,7 +190,8 @@ public:
      * The following methods only make sense for data-bearing nodes and should never be called on
      * a mongos.
      */
-    BackupCursorState openBackupCursor(OperationContext* opCtx) final {
+    BackupCursorState openBackupCursor(OperationContext* opCtx,
+                                       const StorageEngine::BackupOptions& options) final {
         MONGO_UNREACHABLE;
     }
 

@@ -1,6 +1,6 @@
 {
-    "vendor": "tools",
-    "github": "mongodb/mongo-tools.git",
-    "branch": "v4.2",
-    "commit": "786081105685430d48020e888d0f58c4dde52727"
+    "commit": "f8447b92a52fe0b57b62f557e9d2956298fb17c4", 
+    "github": "mongodb/mongo-tools.git", 
+    "vendor": "tools", 
+    "branch": "v4.2"
 }

@@ -69,6 +69,35 @@ public:
     using OldestActiveTransactionTimestampCallback =
         std::function<OldestActiveTransactionTimestampResult(Timestamp stableTimestamp)>;
 
+    struct BackupOptions {
+        bool disableIncrementalBackup = false;
+        bool incrementalBackup = false;
+        int blockSizeMB = 16;
+        boost::optional<std::string> thisBackupName;
+        boost::optional<std::string> srcBackupName;
+    };
+
+    struct BackupBlock {
+        std::uint64_t offset = 0;
+        std::uint64_t length = 0;
+    };
+
+    /**
+     * Contains the size of the file to be backed up. This allows the backup application to safely
+     * truncate the file for incremental backups. Files that have had changes since the last
+     * incremental backup will have their changed file blocks listed.
+     */
+    struct BackupFile {
+        BackupFile() = delete;
+        explicit BackupFile(std::uint64_t fileSize) : fileSize(fileSize){};
+
+        std::uint64_t fileSize;
+        std::vector<BackupBlock> blocksToCopy;
+    };
+
+    // Map of filenames to backup file information.
+    using BackupInformation = stdx::unordered_map<std::string, BackupFile>;
+
     /**
      * The interface for creating new instances of storage engines.
      *
@@ -268,10 +297,31 @@ public:
         return;
     }
 
-    virtual StatusWith<std::vector<std::string>> beginNonBlockingBackup(OperationContext* opCtx) {
-        return Status(ErrorCodes::CommandNotSupported,
-                      "The current storage engine does not support a concurrent mode.");
-    }
+    /**
+     * Disables the storage of incremental backup history until a subsequent incremental backup
+     * cursor is requested.
+     *
+     * The storage engine must release all incremental backup information and resources.
+     */
+    virtual Status disableIncrementalBackup(OperationContext* opCtx) = 0;
+
+    /**
+     * When performing an incremental backup, we first need a basis for future incremental backups.
+     * The basis will be a full backup called 'thisBackupName'. For future incremental backups, the
+     * storage engine will take a backup called 'thisBackupName' which will contain the changes made
+     * to data files since the backup named 'srcBackupName'.
+     *
+     * The storage engine must use an upper bound limit of 'blockSizeMB' when returning changed
+     * file blocks.
+     *
+     * The first full backup meant for incremental and future incremental backups must pass
+     * 'incrementalBackup' as true.
+     * 'thisBackupName' must exist only if 'incrementalBackup' is true.
+     * 'srcBackupName' must not exist when 'incrementalBackup' is false but may or may not exist
+     * when 'incrementalBackup' is true.
+     */
+    virtual StatusWith<StorageEngine::BackupInformation> beginNonBlockingBackup(
+        OperationContext* opCtx, const BackupOptions& options) = 0;
 
     virtual void endNonBlockingBackup(OperationContext* opCtx) {
         return;

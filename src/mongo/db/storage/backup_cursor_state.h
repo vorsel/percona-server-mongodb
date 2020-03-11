@@ -34,13 +34,14 @@
 #include <vector>
 
 #include "mongo/db/pipeline/document.h"
+#include "mongo/db/storage/storage_engine.h"
 
 namespace mongo {
 
 struct BackupCursorState {
     UUID backupId;
     boost::optional<Document> preamble;
-    std::vector<std::string> filenames;
+    StorageEngine::BackupInformation backupInformation;
 };
 
 struct BackupCursorExtendState {

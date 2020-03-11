@@ -117,6 +117,9 @@ size_t getSize(const BSONObj& o) {
 // Failpoint which causes rollback to hang before starting.
 MONGO_FAIL_POINT_DEFINE(rollbackHangBeforeStart);
 
+// Failpoint which causes rollback to hang after completing.
+MONGO_FAIL_POINT_DEFINE(bgSyncHangAfterRunRollback);
+
 BackgroundSync::BackgroundSync(
     ReplicationCoordinator* replicationCoordinator,
     ReplicationCoordinatorExternalState* replicationCoordinatorExternalState,
@@ -135,7 +138,7 @@ void BackgroundSync::startup(OperationContext* opCtx) {
 void BackgroundSync::shutdown(OperationContext* opCtx) {
     stdx::lock_guard<Latch> lock(_mutex);
 
-    _state = ProducerState::Stopped;
+    setState(lock, ProducerState::Stopped);
 
     if (_syncSourceResolver) {
         _syncSourceResolver->shutdown();
@@ -188,9 +191,13 @@ void BackgroundSync::_run() {
 }
 
 void BackgroundSync::_runProducer() {
-    if (getState() == ProducerState::Stopped) {
-        sleepsecs(1);
-        return;
+    {
+        // This wait keeps us from spinning.  We will re-check the condition in _produce(), so if
+        // the state changes after we release the lock, the behavior is still correct.
+        stdx::unique_lock<Latch> lk(_mutex);
+        _stateCv.wait(lk, [&]() { return _inShutdown || _state != ProducerState::Stopped; });
+        if (_inShutdown)
+            return;
     }
 
     auto memberState = _replCoord->getMemberState();
@@ -476,6 +483,13 @@ void BackgroundSync::_produce() {
         auto storageInterface = StorageInterface::get(opCtx.get());
         _runRollback(
             opCtx.get(), fetcherReturnStatus, source, syncSourceResp.rbid, storageInterface);
+
+        if (bgSyncHangAfterRunRollback.shouldFail()) {
+            log() << "bgSyncHangAfterRunRollback failpoint is set.";
+            while (MONGO_unlikely(bgSyncHangAfterRunRollback.shouldFail()) && !inShutdown()) {
+                mongo::sleepmillis(100);
+            }
+        }
     } else if (fetcherReturnStatus == ErrorCodes::InvalidBSON) {
         Seconds blacklistDuration(60);
         warning() << "Fetcher got invalid BSON while querying oplog. Blacklisting sync source "
@@ -686,7 +700,7 @@ void BackgroundSync::clearSyncTarget() {
 void BackgroundSync::stop(bool resetLastFetchedOptime) {
     stdx::lock_guard<Latch> lock(_mutex);
 
-    _state = ProducerState::Stopped;
+    setState(lock, ProducerState::Stopped);
     log() << "Stopping replication producer";
 
     _syncSourceHost = HostAndPort();
@@ -724,7 +738,7 @@ void BackgroundSync::start(OperationContext* opCtx) {
         if (!_oplogApplier->getBuffer()->isEmpty()) {
             log() << "going to start syncing, but buffer is not empty";
         }
-        _state = ProducerState::Running;
+        setState(lk, ProducerState::Running);
 
         // When a node steps down during drain mode, the last fetched optime would be newer than
         // the last applied.
@@ -788,11 +802,16 @@ BackgroundSync::ProducerState BackgroundSync::getState() const {
     return _state;
 }
 
+void BackgroundSync::setState(WithLock, ProducerState newState) {
+    _state = newState;
+    _stateCv.notify_one();
+}
+
 void BackgroundSync::startProducerIfStopped() {
     stdx::lock_guard<Latch> lock(_mutex);
     // Let producer run if it's already running.
     if (_state == ProducerState::Stopped) {
-        _state = ProducerState::Starting;
+        setState(lock, ProducerState::Starting);
     }
 }
 

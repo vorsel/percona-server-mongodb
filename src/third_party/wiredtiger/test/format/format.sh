@@ -17,16 +17,18 @@ onintr()
 trap 'onintr' 2
 
 usage() {
-	echo "usage: $0 [-aFSv] [-c config] "
-	echo "    [-b format-binary] [-h home] [-j parallel-jobs] [-n total-jobs] [-t minutes] [format-configuration]"
+	echo "usage: $0 [-aEFSv] [-b format-binary] [-c config] "
+	echo "    [-h home] [-j parallel-jobs] [-n total-jobs] [-t minutes] [format-configuration]"
 	echo
 	echo "    -a           abort/recovery testing (defaults to off)"
 	echo "    -b binary    format binary (defaults to "./t")"
 	echo "    -c config    format configuration file (defaults to CONFIG.stress)"
+	echo "    -E           skip known errors (defaults to off)"
 	echo "    -F           quit on first failure (defaults to off)"
 	echo "    -h home      run directory (defaults to .)"
 	echo "    -j parallel  jobs to execute in parallel (defaults to 8)"
 	echo "    -n total     total jobs to execute (defaults to no limit)"
+	echo "    -R           run timing stress split test configurations (defaults to off)"
 	echo "    -S           run smoke-test configurations (defaults to off)"
 	echo "    -t minutes   minutes to run (defaults to no limit)"
 	echo "    -v           verbose output (defaults to off)"
@@ -69,7 +71,9 @@ format_args=""
 home="."
 minutes=0
 parallel_jobs=8
+skip_errors=0
 smoke_test=0
+timing_stress_split_test=0
 total_jobs=0
 verbose=0
 format_binary="./t"
@@ -85,6 +89,9 @@ while :; do
 	-c)
 		config="$2"
 		shift ; shift ;;
+	-E)
+		skip_errors=1
+		shift ;;
 	-F)
 		first_failure=1
 		shift ;;
@@ -105,6 +112,9 @@ while :; do
 			exit 1
 		}
 		shift ; shift ;;
+	-R)
+		timing_stress_split_test=1
+		shift ;;
 	-S)
 		smoke_test=1
 		shift ;;
@@ -141,7 +151,7 @@ verbose "$name: run starting at $(date)"
 	echo "$name: directory \"$home\" not found"
 	exit 1
 }
-home=$(cd $home && echo $PWD)
+home=$(cd $home > /dev/null || exit 1 && echo $PWD)
 
 # Config is possibly relative to our current directory and we're about to change directories.
 # Get an absolute path for config if it's local.
@@ -194,6 +204,43 @@ success=0
 running=0
 status="format.sh-status"
 
+# skip_known_errors
+# return 0 - Error found and skip
+# return 1 - skip_errors flag not set or no (known error) match found
+skip_known_errors()
+{
+	# Return if "skip_errors" is not set or -E option is not passed
+	[[ $skip_errors -ne 1 ]] && return 1
+
+	log=$1
+
+	# Define each array with multi-signature matching for a single known error
+	# and append it to the skip_error_list
+	err_1=("heap-buffer-overflow" "__split_parent") # Delete this error line post WT-5518 fix
+	err_2=("heap-use-after-free" "__wt_btcur_next_random") # Delete this error line post WT-5552 fix
+
+	# skip_error_list is the list of errors to skip, and each error could
+	# have multiple signatures to be able to reach a finer match
+	skip_error_list=( err_1[@] err_2[@] )
+
+	# Loop through the skip list and search in the log file.
+	err_count=${#skip_error_list[@]}
+	for ((i=0; i<$err_count; i++))
+	do
+		# Tokenize the multi-signature error
+		err_tokens[0]=${!skip_error_list[i]:0:1}
+		err_tokens[1]=${!skip_error_list[i]:1:1}
+
+		grep -q "${err_tokens[0]}" $log && grep -q "${err_tokens[1]}" $log
+		
+		[[ $? -eq 0 ]] && {
+			echo "Skip error :  { ${err_tokens[0]} && ${err_tokens[1]} }"
+			return 0
+		}
+	done
+	return 1
+}
+
 # Report a failure.
 # $1 directory name
 report_failure()
@@ -201,15 +248,20 @@ report_failure()
 	dir=$1
 	log="$dir.log"
 
+	skip_known_errors $log
+	skip_ret=$?
+
 	echo "$name: failure status reported" > $dir/$status
-	failure=$(($failure + 1))
+	[[ $skip_ret -ne 0 ]] && failure=$(($failure + 1))
 
 	# Forcibly quit if first-failure configured.
 	[[ $first_failure -ne 0 ]] && force_quit=1
 
 	echo "$name: job in $dir failed"
 	echo "$name: $dir log:"
-	sed 's/^/    > /' < $log
+	sed 's/^/    /' < $log
+	echo "$name: $dir/CONFIG:"
+	sed 's/^/    /' < $dir/CONFIG
 }
 
 # Resolve/cleanup completed jobs.
@@ -361,14 +413,20 @@ format()
 	if [[ $smoke_test -ne 0 ]]; then
 		args=${smoke_list[$smoke_next]}
 		smoke_next=$(($smoke_next + 1))
-		echo "$name: starting smoke-test job in $dir"
+		echo "$name: starting smoke-test job in $dir ($(date))"
+	elif [[ $timing_stress_split_test -ne 0 ]]; then
+		args=$format_args
+		for k in {1..7}; do
+			args+=" timing_stress_split_$k=$(($RANDOM%2))"
+		done
+		echo "$name: starting timing-stress-split job in $dir ($(date))"
 	else
 		args=$format_args
 
 		# If abort/recovery testing is configured, do it 5% of the time.
 		[[ $abort_test -ne 0 ]] && [[ $(($count_jobs % 20)) -eq 0 ]] && args="$args abort=1"
 
-		echo "$name: starting job in $dir"
+		echo "$name: starting job in $dir ($(date))"
 	fi
 
 	cmd="$format_binary -c "$config" -h "$dir" -1 $args quiet=1"
