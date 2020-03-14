@@ -3,7 +3,16 @@ Import("env")
 
 env = env.Clone()
 
-env.Library('externalsaslauth',
-            ['external_sasl_authentication_session.cpp'],
-            LIBDEPS=['$BUILD_DIR/mongo/db/auth/saslauth'],
-            SYSLIBDEPS=['sasl2'])
+env.Library(
+    target='externalsaslauth',
+    source=[
+        'external_sasl_authentication_session.cpp',
+        'gssapi_server_mechanism.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/auth/saslauth',
+    ],
+    SYSLIBDEPS=[
+        'sasl2',
+    ],
+)
