@@ -40,14 +40,15 @@ Copyright (C) 2020-present Percona and/or its affiliates. All rights reserved.
 namespace mongo {
 
 GSSAPIServerMechanism::~GSSAPIServerMechanism() {
-    //if (_saslConnection) {
-    //    sasl_dispose(&_saslConnection);
-    //}
 }
 
 StatusWith<std::tuple<bool, std::string>> GSSAPIServerMechanism::stepImpl(
     OperationContext* opCtx, StringData inputData) {
-    return Status::OK();
+    return _sess.step(inputData);
+}
+
+StringData GSSAPIServerMechanism::getPrincipalName() const {
+    return _sess.getPrincipalName();
 }
 
 namespace {
