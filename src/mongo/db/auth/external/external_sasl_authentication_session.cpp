@@ -59,7 +59,7 @@ static Status getInitializationError(int result) {
     return Status(ErrorCodes::OperationFailed,
                   str::stream() <<
                   "Could not initialize sasl server session (" <<
-                  sasl_errstring(result, NULL, NULL) <<
+                  sasl_errstring(result, nullptr, nullptr) <<
                   ")");
 }
 
@@ -71,17 +71,17 @@ StatusWith<std::tuple<bool, std::string>> SaslExternalLDAPServerMechanism::getSt
     return Status(ErrorCodes::OperationFailed,
                   str::stream() <<
                   "SASL step did not complete: (" <<
-                  sasl_errstring(_results.result, NULL, NULL) <<
+                  sasl_errstring(_results.result, nullptr, nullptr) <<
                   ")");
 }
 
 Status SaslExternalLDAPServerMechanism::initializeConnection() {
     int result = sasl_server_new(saslDefaultServiceName.rawData(),
-                                 prettyHostName().c_str(), // Fully Qualified Domain Name (FQDN), NULL => gethostname()
-                                 NULL, // User Realm string, NULL forces default value: FQDN.
-                                 NULL, // Local IP address
-                                 NULL, // Remote IP address
-                                 NULL, // Callbacks specific to this connection.
+                                 prettyHostName().c_str(), // Fully Qualified Domain Name (FQDN), nullptr => gethostname()
+                                 nullptr, // User Realm string, nullptr forces default value: FQDN.
+                                 nullptr, // Local IP address
+                                 nullptr, // Remote IP address
+                                 nullptr, // Callbacks specific to this connection.
                                  0,    // Security flags.
                                  &_saslConnection); // Connection object output parameter.
     if (result != SASL_OK) {
@@ -139,7 +139,6 @@ StringData SaslExternalLDAPServerMechanism::getPrincipalName() const {
 
     return "";
 }
-
 
 OpenLDAPServerMechanism::~OpenLDAPServerMechanism() {
     if (_ld) {
@@ -199,19 +198,30 @@ StringData OpenLDAPServerMechanism::getPrincipalName() const {
     return _principal;
 }
 
+namespace {
+
+int saslServerLog(void* context, int priority, const char* message) throw() {
+    log() << "SASL server message: (" << priority << ") " << message;
+    return SASL_OK;  // do nothing
+}
+
 // Mongo initializers will run before any ServiceContext is created
 // and before any ServiceContext::ConstructorActionRegisterer is executed
 // (see SERVER-36258 and SERVER-34798)
 MONGO_INITIALIZER(SaslExternalLDAPServerMechanism)(InitializerContext*) {
-    int result = sasl_server_init(NULL, saslDefaultServiceName.rawData());
+    typedef int (*SaslCallbackFn)();
+    static sasl_callback_t saslServerGlobalCallbacks[] = {
+        {SASL_CB_LOG, SaslCallbackFn(saslServerLog), nullptr /* context */},
+        {SASL_CB_LIST_END}
+    };
+    int result = sasl_server_init(saslServerGlobalCallbacks, saslDefaultServiceName.rawData());
     if (result != SASL_OK) {
-        log() << "Failed Initializing SASL " << std::endl;
+        error() << "SASL server initialization failed";
         return getInitializationError(result);
     }
     return Status::OK();
 }
 
-namespace {
 
 /** Instantiates a SaslExternalLDAPServerMechanism or OpenLDAPServerMechanism 
  * depending on current server configuration. */
