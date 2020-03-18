@@ -29,6 +29,7 @@ env.SConscript(
         'ftdc',
         'geo',
         'index',
+        'ldap',
         'matcher',
         'ops',
         'pipeline',
@@ -412,6 +413,32 @@ if env.TargetOSIs('windows'):
     )
 
 env.Library(
+    target='ldap_options',
+    source=[
+        'ldap_options.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/idl/server_parameter',
+    ],
+)
+
+env.Library(
+  target='ldap_options_init',
+  source=[
+      'ldap_options_init.cpp',
+       env.Idlc('ldap_options.idl')[0],
+  ],
+  LIBDEPS=[
+    'ldap_options'
+  ],
+  LIBDEPS_PRIVATE=[
+       '$BUILD_DIR/mongo/util/options_parser/options_parser',
+       '$BUILD_DIR/mongo/util/net/network',
+  ],
+)     
+
+env.Library(
     target='server_options_base',
     source=[
         'server_options_base.cpp',
@@ -511,6 +538,7 @@ env.Library(
         "ratelimit_parameter.cpp",
         env.Idlc('mongod_options_encryption.idl')[0],
         env.Idlc('mongod_options_general.idl')[0],
+        env.Idlc('mongod_options_ldapauthz.idl')[0],
         env.Idlc('mongod_options_legacy.idl')[0],
         env.Idlc('mongod_options_replication.idl')[0],
         env.Idlc('mongod_options_sharding.idl')[0],

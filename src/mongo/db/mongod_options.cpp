@@ -46,6 +46,7 @@
 #include "mongo/db/keyfile_option_gen.h"
 #include "mongo/db/mongod_options_encryption_gen.h"
 #include "mongo/db/mongod_options_general_gen.h"
+#include "mongo/db/mongod_options_ldapauthz_gen.h"
 #include "mongo/db/mongod_options_legacy_gen.h"
 #include "mongo/db/mongod_options_replication_gen.h"
 #include "mongo/db/mongod_options_sharding_gen.h"
@@ -88,6 +89,7 @@ Status addMongodOptions(moe::OptionSection* options) try {
     uassertStatusOK(addMongodShardingOptions(options));
     uassertStatusOK(addMongodStorageOptions(options));
     uassertStatusOK(addMongodEncryptionOptions(options));
+    uassertStatusOK(addMongodLDAPAuthzOptions(options));
     uassertStatusOK(addMongodLegacyOptions(options));
     uassertStatusOK(addKeyfileServerOption(options));
     uassertStatusOK(addClusterAuthModeServerOption(options));
@@ -484,6 +486,10 @@ Status storeMongodOptions(const moe::Environment& params) {
 
     if (params.count("security.vault.disableTLSForTesting")) {
         encryptionGlobalParams.vaultDisableTLS = params["security.vault.disableTLSForTesting"].as<bool>();
+    }
+
+    if (params.count("security.ldap.authz.queryTemplate")) {
+        ldapGlobalParams.ldapQueryTemplate = params["security.ldap.authz.queryTemplate"].as<std::string>();
     }
 
     if (params.count("cpu")) {
