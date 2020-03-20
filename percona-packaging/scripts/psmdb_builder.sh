@@ -97,18 +97,6 @@ add_percona_yum_repo(){
     return
 }
 
-add_percona_apt_repo(){
-  if [ ! -f /etc/apt/sources.list.d/percona-dev.list ]; then
-    cat >/etc/apt/sources.list.d/percona-dev.list <<EOL
-deb http://jenkins.percona.com/apt-repo/ @@DIST@@ main
-deb-src http://jenkins.percona.com/apt-repo/ @@DIST@@ main
-EOL
-    sed -i "s:@@DIST@@:$OS_NAME:g" /etc/apt/sources.list.d/percona-dev.list
-  fi
-  wget -qO - http://jenkins.percona.com/apt-repo/8507EFA5.pub | apt-key add -
-  return
-}
-
 get_sources(){
     cd "${WORKDIR}"
     if [ "${SOURCE}" = 0 ]
@@ -248,7 +236,7 @@ install_gcc_54_deb(){
             mv libstdc++.so /usr/local/gcc-5.4.0/lib64/
         fi
     fi
-    if [ x"${DEBIAN}" = xtrusty -o x"${DEBIAN}" = xxenial ]; then
+    if [ x"${DEBIAN}" = xtrusty -o x"${DEBIAN}" = xxenial -o x"${DEBIAN}" = xfocal ]; then
         wget https://jenkins.percona.com/downloads/gcc-5.4.0/gcc-5.4.0_ubuntu-${DEBIAN}-x64.tar.gz -O /tmp/gcc-5.4.0_ubuntu-${DEBIAN}-x64.tar.gz
         tar -zxf /tmp/gcc-5.4.0_ubuntu-${DEBIAN}-x64.tar.gz
         rm -rf /usr/local/gcc-5.4.0
@@ -379,13 +367,14 @@ EOL
         rm -f /etc/apt/sources.list.d/stretch.list
         apt-get -y update
       fi
-      INSTALL_LIST="python python-dev valgrind scons liblz4-dev devscripts debhelper debconf libpcap-dev libbz2-dev libsnappy-dev pkg-config zlib1g-dev libzlcore-dev dh-systemd libsasl2-dev gcc g++ cmake curl libcurl4-openssl-dev libssl-dev libldap2-dev"
+      apt-get -y update
+      INSTALL_LIST="valgrind scons liblz4-dev devscripts debhelper debconf libpcap-dev libbz2-dev libsnappy-dev pkg-config zlib1g-dev libzlcore-dev dh-systemd libsasl2-dev gcc g++ cmake curl libcurl4-openssl-dev libssl-dev libldap2-dev"
+      if [ x"${DEBIAN}" = xfocal ]; then
+        INSTALL_LIST="${INSTALL_LIST} python2 python2-dev "
+      else
+        INSTALL_LIST="${INSTALL_LIST} python python-dev "
+      fi
       until apt-get -y install dirmngr; do
-        sleep 1
-        echo "waiting"
-      done
-      add_percona_apt_repo
-      until apt-get update; do
         sleep 1
         echo "waiting"
       done
@@ -397,6 +386,9 @@ EOL
       install_golang
       install_gcc_54_deb
       wget https://bootstrap.pypa.io/get-pip.py
+      if [ x"${DEBIAN}" = "xfocal" ]; then
+        ln -s /usr/bin/python2 /usr/bin/python
+      fi
       python get-pip.py
       easy_install pip
     fi
