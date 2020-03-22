@@ -72,6 +72,7 @@
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/session_catalog.h"
@@ -154,10 +155,10 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> createRandomCursorEx
     }
 
     // If we're in a sharded environment, we need to filter out documents we don't own.
-    if (ShardingState::get(opCtx)->needCollectionMetadata(opCtx, collection->ns().ns())) {
+    if (OperationShardingState::isOperationVersioned(opCtx)) {
         auto shardFilterStage = stdx::make_unique<ShardFilterStage>(
             opCtx,
-            CollectionShardingState::get(opCtx, collection->ns())->getMetadata(opCtx),
+            CollectionShardingState::get(opCtx, collection->ns())->getOrphansFilter(opCtx),
             ws.get(),
             stage.release());
         return PlanExecutor::make(opCtx,
@@ -217,7 +218,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> attemptToGetExe
         return {cq.getStatus()};
     }
 
-    return getExecutorFind(opCtx, collection, nss, std::move(cq.getValue()), plannerOpts);
+    return getExecutorFind(opCtx, collection, std::move(cq.getValue()), plannerOpts);
 }
 
 BSONObj removeSortKeyMetaProjection(BSONObj projectionObj) {
@@ -610,7 +611,7 @@ DBClientBase* PipelineD::MongoDInterface::directClient() {
 bool PipelineD::MongoDInterface::isSharded(OperationContext* opCtx, const NamespaceString& nss) {
     AutoGetCollectionForReadCommand autoColl(opCtx, nss);
     auto const css = CollectionShardingState::get(opCtx, nss);
-    return css->getMetadata(opCtx)->isSharded();
+    return css->getCurrentMetadata()->isSharded();
 }
 
 BSONObj PipelineD::MongoDInterface::insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
@@ -752,7 +753,7 @@ Status PipelineD::MongoDInterface::attachCursorSourceToPipeline(
     auto css = CollectionShardingState::get(expCtx->opCtx, expCtx->ns);
     uassert(4567,
             str::stream() << "from collection (" << expCtx->ns.ns() << ") cannot be sharded",
-            !css->getMetadata(expCtx->opCtx)->isSharded());
+            !css->getCurrentMetadata()->isSharded());
 
     PipelineD::prepareCursorSource(autoColl->getCollection(), expCtx->ns, nullptr, pipeline);
 
@@ -800,7 +801,7 @@ std::pair<std::vector<FieldPath>, bool> PipelineD::MongoDInterface::collectDocum
 
     auto scm = [opCtx, &nss]() -> ScopedCollectionMetadata {
         AutoGetCollection autoColl(opCtx, nss, MODE_IS);
-        return CollectionShardingState::get(opCtx, nss)->getMetadata(opCtx);
+        return CollectionShardingState::get(opCtx, nss)->getCurrentMetadata();
     }();
 
     // Collection is not sharded or UUID mismatch implies collection has been dropped and recreated
