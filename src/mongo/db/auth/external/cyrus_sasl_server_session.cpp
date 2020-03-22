@@ -33,9 +33,12 @@ Copyright (C) 2020-present Percona and/or its affiliates. All rights reserved.
 
 #include "mongo/db/auth/external/cyrus_sasl_server_session.h"
 
+#include <gssapi/gssapi.h>
 #include <fmt/format.h>
 
 #include "mongo/db/auth/sasl_options.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -66,13 +69,134 @@ StatusWith<std::tuple<bool, std::string>> CyrusSASLServerSession::getStepResult(
                               sasl_errstring(_results.result, nullptr, nullptr)));
 }
 
+namespace {
+
+void saslSetError(sasl_conn_t* conn, const std::string& msg) {
+    sasl_seterror(conn, 0, "%s", msg.c_str());
+}
+
+struct gss_result {
+    OM_uint32 major = 0;
+    OM_uint32 minor = 0;
+    void check(const char* loc) const {
+        if (major != GSS_S_COMPLETE)
+            throw std::runtime_error(fmt::format("{} error: major: {}; minor: {}",
+                                                 loc, major, minor));
+    }
+};
+
+class auto_gss_name_t {
+public:
+    auto_gss_name_t() : _v(nullptr) {}
+    ~auto_gss_name_t() {
+        gss_result gr;
+        gr.major = gss_release_name(&gr.minor, &_v);
+    }
+    operator gss_name_t() const {
+        return _v;
+    }
+    gss_name_t* operator &() {
+        return &_v;
+    }
+private:
+    gss_name_t _v;
+};
+
+class auto_gss_buffer_desc : public gss_buffer_desc {
+public:
+    auto_gss_buffer_desc() : gss_buffer_desc{.length = 0, .value = nullptr} {}
+    ~auto_gss_buffer_desc() {
+        gss_result gr;
+        gr.major = gss_release_buffer(&gr.minor, this);
+    }
+    operator std::string() const {
+        return {(const char*)value, length};
+    }
+};
+
+void canonicalizeGSSAPIUser(const std::string v, std::string& o) {
+    // It is possible to get OID using gss_str_to_oid("1.2.840.113554.1.2.2")
+    // But result will be the same
+    // https://docs.oracle.com/cd/E19683-01/816-1331/6m7oo9sno/index.html
+    static gss_OID_desc mech_krb5 = { 9, (void*)"\052\206\110\206\367\022\001\002\002" };
+    gss_OID mech_type = &mech_krb5;
+
+    gss_result gr;
+    gss_buffer_desc input_name_buffer{.length = v.length(), .value = (void*)v.c_str()};
+    auto_gss_name_t gssname;
+    gr.major = gss_import_name(&gr.minor, &input_name_buffer, GSS_C_NT_USER_NAME, &gssname);
+    gr.check("gss_import_name");
+
+    auto_gss_name_t canonname;
+    gr.major = gss_canonicalize_name(&gr.minor, gssname, mech_type, &canonname);
+    gr.check("gss_canonicalize_name");
+
+    auto_gss_buffer_desc displayname;
+    gss_OID nt;
+    gr.major = gss_display_name(&gr.minor, canonname, &displayname, &nt);
+    gr.check("gss_display_name");
+
+    o = displayname;
+}
+
+/* improved callback to verify authorization;
+ *     canonicalization now handled elsewhere
+ *  conn           -- connection context
+ *  requested_user -- the identity/username to authorize (NUL terminated)
+ *  rlen           -- length of requested_user
+ *  auth_identity  -- the identity associated with the secret (NUL terminated)
+ *  alen           -- length of auth_identity
+ *  default_realm  -- default user realm, as passed to sasl_server_new if
+ *  urlen          -- length of default realm
+ *  propctx        -- auxiliary properties
+ * returns SASL_OK on success,
+ *         SASL_NOAUTHZ or other SASL response on failure
+ */
+int saslSessionProxyPolicy(sasl_conn_t *conn,
+                           void *context,
+                           const char *requested_user, unsigned rlen,
+                           const char *auth_identity, unsigned alen,
+                           const char *def_realm, unsigned urlen,
+                           struct propctx *propctx) throw() {
+    try {
+        LOG(2) << fmt::format("saslSessionProxyPolicy: {{ "
+                "requested_user: '{}', "
+                "auth_identity: '{}', "
+                "default_realm: '{}'"
+                " }}",
+                requested_user ? requested_user : "nullptr",
+                auth_identity ? auth_identity : "nullptr",
+                def_realm ? def_realm : "nullptr");
+        std::string canon_auth_identity;
+        canonicalizeGSSAPIUser(std::string{auth_identity, alen}, canon_auth_identity);
+        const std::string str_requested_user{requested_user, rlen};
+        if (str_requested_user != canon_auth_identity) {
+            saslSetError(conn, fmt::format("{} is not authorized to act as {}",
+                         canon_auth_identity, str_requested_user));
+            return SASL_NOAUTHZ;
+        }
+    } catch (...) {
+        saslSetError(conn, fmt::format("Caught unhandled exception in saslSessionProxyPolicy: {}",
+                     exceptionToStatus().reason()));
+        return SASL_FAIL;
+    }
+    return SASL_OK;
+}
+
+}  // namespace
+
 Status CyrusSASLServerSession::initializeConnection() {
+    typedef int (*SaslCallbackFn)();
+    static const sasl_callback_t callbacks[] = {
+        {SASL_CB_PROXY_POLICY, SaslCallbackFn(saslSessionProxyPolicy), nullptr},
+        {SASL_CB_LIST_END}
+    };
     int result = sasl_server_new(saslGlobalParams.serviceName.c_str(),
-                                 saslGlobalParams.hostName.c_str(), // Fully Qualified Domain Name (FQDN), NULL => gethostname()
-                                 NULL, // User Realm string, NULL forces default value: FQDN.
-                                 NULL, // Local IP address
-                                 NULL, // Remote IP address
-                                 NULL, // Callbacks specific to this connection.
+                                 saslGlobalParams.hostName.c_str(), // Fully Qualified Domain Name (FQDN), nullptr => gethostname()
+                                 nullptr, // User Realm string, nullptr forces default value: FQDN.
+                                 nullptr, // Local IP address
+                                 nullptr, // Remote IP address
+                                 callbacks, // Callbacks specific to this connection.
                                  0,    // Security flags.
                                  &_saslConnection); // Connection object output parameter.
     if (result != SASL_OK) {
