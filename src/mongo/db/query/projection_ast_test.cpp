@@ -378,28 +378,6 @@ TEST_F(ProjectionASTTest, TestDebugBSONWithNestedPositional) {
     ASSERT_BSONOBJ_EQ(output, expected);
 }
 
-TEST_F(ProjectionASTTest, TestDebugBSONWithPositionalInTheMiddleOfFieldPaths) {
-    // Should treat "c.d.$.e" the same as "c.d.$".
-    Projection proj = parseWithFindFeaturesEnabled(fromjson("{'a.b': 1, b: 1, 'c.d.$.e': 1}"),
-                                                   fromjson("{'c.d': 1}"));
-
-    BSONObj output = projection_ast::astToDebugBSON(proj.root());
-    BSONObj expected =
-        fromjson("{a: {b: true}, b: true, c: {'d.$': {'c.d': {$eq: 1}}}, _id: true}");
-    ASSERT_BSONOBJ_EQ(output, expected);
-}
-
-TEST_F(ProjectionASTTest, TestDebugBSONWithPositionalInTheMiddleOfFieldPathsWithDollarPrefixField) {
-    // Should treat "c.$id.$.e" the same as "c.$id.$".
-    Projection proj = parseWithFindFeaturesEnabled(fromjson("{'a.b': 1, b: 1, 'c.$id.$.e': 1}"),
-                                                   fromjson("{'c.$id': 1}"));
-
-    BSONObj output = projection_ast::astToDebugBSON(proj.root());
-    BSONObj expected =
-        fromjson("{a: {b: true}, b: true, c: {'$id.$': {'c.$id': {$eq: 1}}}, _id: true}");
-    ASSERT_BSONOBJ_EQ(output, expected);
-}
-
 TEST_F(ProjectionASTTest, TestDebugBSONWithSliceLimit) {
     Projection proj = parseWithFindFeaturesEnabled(fromjson("{'a.b': 1, b: 1, f: {$slice: 2}}"));
 
@@ -569,7 +547,7 @@ TEST_F(ProjectionASTTest, ParserErrorsOnElemMatchOnDottedField) {
 TEST_F(ProjectionASTTest, ParserErrorsOnMultiplePositionalInOnePath) {
     ASSERT_THROWS_CODE(parseWithFindFeaturesEnabled(fromjson("{'a.$.b.$': 1}"), fromjson("{a: 1}")),
                        DBException,
-                       31287);
+                       31394);
 }
 
 TEST_F(ProjectionASTTest, ParserErrorsOnMultiplePositionalInProjection) {
@@ -580,23 +558,15 @@ TEST_F(ProjectionASTTest, ParserErrorsOnMultiplePositionalInProjection) {
 
     ASSERT_THROWS_CODE(parseWithFindFeaturesEnabled(fromjson("{'a.b.$.': 1}"), fromjson("{a: 1}")),
                        DBException,
-                       31270);
+                       31394);
 
     ASSERT_THROWS_CODE(parseWithFindFeaturesEnabled(fromjson("{'a.$.b.$': 1}"), fromjson("{a: 1}")),
                        DBException,
-                       31287);
+                       31394);
 
     ASSERT_THROWS_CODE(parseWithFindFeaturesEnabled(fromjson("{'a.$.$': 1}"), fromjson("{a: 1}")),
                        DBException,
-                       31287);
-}
-
-TEST_F(ProjectionASTTest, ParserErrorsOnPositionalProjectionNotMatchingQuery) {
-    ASSERT_THROWS_CODE(parseWithFindFeaturesEnabled(fromjson("{'a.$': 1}"), fromjson("{b: 1}")),
-                       DBException,
-                       31277);
-    ASSERT_THROWS_CODE(
-        parseWithFindFeaturesEnabled(fromjson("{'a.$': 1}"), boost::none), DBException, 51050);
+                       31394);
 }
 
 TEST_F(ProjectionASTTest, ParserErrorsOnSubfieldPrefixedByDbRefField) {
@@ -606,7 +576,7 @@ TEST_F(ProjectionASTTest, ParserErrorsOnSubfieldPrefixedByDbRefField) {
 
 TEST_F(ProjectionASTTest, ParserErrorsOnJustPositionalProjection) {
     ASSERT_THROWS_CODE(
-        parseWithFindFeaturesEnabled(fromjson("{'$': 1}"), fromjson("{a: 1}")), DBException, 31277);
+        parseWithFindFeaturesEnabled(fromjson("{'$': 1}"), fromjson("{a: 1}")), DBException, 16410);
 
     // {$: 1} is an invalid match expression.
     ASSERT_THROWS_CODE(parseWithFindFeaturesEnabled(fromjson("{$: 1}"), fromjson("{$: 1}")),
@@ -614,7 +584,7 @@ TEST_F(ProjectionASTTest, ParserErrorsOnJustPositionalProjection) {
                        ErrorCodes::BadValue);
 
     ASSERT_THROWS_CODE(
-        parseWithFindFeaturesEnabled(fromjson("{'$': 1}"), fromjson("{}")), DBException, 31277);
+        parseWithFindFeaturesEnabled(fromjson("{'$': 1}"), fromjson("{}")), DBException, 16410);
 }
 
 TEST_F(ProjectionASTTest, ParserErrorsOnPositionalAndSlice) {
@@ -638,6 +608,10 @@ TEST_F(ProjectionASTTest, ParserErrorsOnPositionalAndSubObj) {
         parseWithFindFeaturesEnabled(fromjson("{'a': {'b.$': {c: 1}}}")), DBException, 31271);
 }
 
+TEST_F(ProjectionASTTest, ParserErrorsOnInvalidPositionalSyntax) {
+    ASSERT_THROWS_CODE(parseWithFindFeaturesEnabled(fromjson("{'.$': 1}")), DBException, 51050);
+}
+
 TEST_F(ProjectionASTTest, ParserDoesNotErrorOnPositionalOfDbRefField) {
     Projection idProj = parseWithFindFeaturesEnabled(fromjson("{'a.$id.b.$': 1, x: 1}"),
                                                      fromjson("{'a.$id.b': 1}"));
@@ -650,6 +624,32 @@ TEST_F(ProjectionASTTest, ParserDoesNotErrorOnPositionalOfDbRefField) {
     Projection refProj = parseWithFindFeaturesEnabled(fromjson("{'a.$ref.b.$': 1, x: 1}"),
                                                       fromjson("{'a.$ref.b': 1}"));
     ASSERT(refProj.type() == ProjectType::kInclusion);
+}
+
+TEST_F(ProjectionASTTest, ParserDoesNotErrorOnPositionalOfNonQueryField) {
+    {
+        Projection proj =
+            parseWithFindFeaturesEnabled(fromjson("{'a.$': 1, x: 1}"), fromjson("{'a.b': 1}"));
+        ASSERT(proj.type() == ProjectType::kInclusion);
+    }
+
+    {
+        Projection proj = parseWithFindFeaturesEnabled(fromjson("{'a.b.$': 1, x: 1}"),
+                                                       fromjson("{'a.b.$db': 1}"));
+        ASSERT(proj.type() == ProjectType::kInclusion);
+    }
+
+    {
+        Projection proj =
+            parseWithFindFeaturesEnabled(fromjson("{'b.$': 1, x: 1}"), fromjson("{'a.b.c': 1}"));
+        ASSERT(proj.type() == ProjectType::kInclusion);
+    }
+
+    {
+        Projection proj =
+            parseWithFindFeaturesEnabled(fromjson("{'b.c.$': 1, x: 1}"), fromjson("{'a.b.c': 1}"));
+        ASSERT(proj.type() == ProjectType::kInclusion);
+    }
 }
 
 TEST_F(ProjectionASTTest, ShouldThrowWhenParsingInvalidExpression) {
@@ -693,4 +693,21 @@ TEST_F(ProjectionASTTest, ShouldThrowWhenParsingPositionalWithFindFeaturesOff) {
         31324);
 }
 
+TEST_F(ProjectionASTTest, ShouldThrowWithPositionalInTheMiddleOfFieldPaths) {
+    ASSERT_THROWS_CODE(parseWithFindFeaturesEnabled(fromjson("{'a.b': 1, b: 1, 'c.d.$.e': 1}"),
+                                                    fromjson("{'c.d': 1}")),
+                       DBException,
+                       31394);
+    ASSERT_THROWS_CODE(parseWithFindFeaturesEnabled(fromjson("{'a.b': 1, b: 1, 'c.$id.$.e': 1}"),
+                                                    fromjson("{'c.$id': 1}")),
+                       DBException,
+                       31394);
+}
+
+TEST_F(ProjectionASTTest, ShouldThrowWithPositionalOnExclusion) {
+    ASSERT_THROWS_CODE(
+        parseWithFindFeaturesEnabled(fromjson("{'c.d.$': 0}"), fromjson("{'c.d': 1}")),
+        DBException,
+        31395);
+}
 }  // namespace

@@ -126,6 +126,7 @@ RemoteCursor openChangeStreamNewShardMonitor(const boost::intrusive_ptr<Expressi
               << BSON(DocumentSourceChangeStreamSpec::kStartAtOperationTimeFieldName
                       << startMonitoringAtTime
                       << DocumentSourceChangeStreamSpec::kAllowToRunOnConfigDBFieldName << true))});
+    aggReq.setUse44SortKeys(true);
     aggReq.setFromMongos(true);
     aggReq.setNeedsMerge(true);
     aggReq.setBatchSize(0);
@@ -184,9 +185,13 @@ BSONObj genericTransformForShards(MutableDocument&& cmdForShards,
         // there will only be one sort key format for changes streams, so there will be no need to
         // set this flag anymore. This flag has no effect on pipelines without a change stream.
         cmdForShards[AggregationRequest::kUse44SortKeys] = Value(true);
+        // TODO SERVER-44884: We set this flag to indicate that the shards should always use the new
+        // upsert mechanism when executing relevant $merge modes. After branching for 4.5, supported
+        // upgrade versions will all use the new mechanism, and we can remove this flag.
+        cmdForShards[AggregationRequest::kUseNewUpsert] = Value(true);
     }
 
-    return appendAllowImplicitCreate(cmdForShards.freeze().toBson(), false);
+    return cmdForShards.freeze().toBson();
 }
 
 std::vector<RemoteCursor> establishShardCursors(
@@ -296,17 +301,22 @@ Status appendExplainResults(sharded_agg_helpers::DispatchShardPipelineResults&& 
         *result << "mergeType" << mergeType;
 
         MutableDocument pipelinesDoc;
+        // We specify "queryPlanner" verbosity when building the output for "shardsPart" because
+        // execution stats are reported by each shard individually.
         pipelinesDoc.addField("shardsPart",
                               Value(dispatchResults.splitPipeline->shardsPipeline->writeExplainOps(
-                                  *mergeCtx->explain)));
+                                  ExplainOptions::Verbosity::kQueryPlanner)));
         if (dispatchResults.exchangeSpec) {
             BSONObjBuilder bob;
             dispatchResults.exchangeSpec->exchangeSpec.serialize(&bob);
             bob.append("consumerShards", dispatchResults.exchangeSpec->consumerShards);
             pipelinesDoc.addField("exchange", Value(bob.obj()));
         }
-        pipelinesDoc.addField("mergerPart",
-                              Value(mergePipeline->writeExplainOps(*mergeCtx->explain)));
+        // We specify "queryPlanner" verbosity because execution stats are not currently
+        // supported when building the output for "mergerPart".
+        pipelinesDoc.addField(
+            "mergerPart",
+            Value(mergePipeline->writeExplainOps(ExplainOptions::Verbosity::kQueryPlanner)));
 
         *result << "splitPipeline" << pipelinesDoc.freeze();
     } else {
@@ -497,7 +507,7 @@ BSONObj createCommandForMergingShard(Document serializedCommand,
         mergeCmd.remove("readConcern");
     }
 
-    return appendAllowImplicitCreate(mergeCmd.freeze().toBson(), false);
+    return mergeCmd.freeze().toBson();
 }
 
 BSONObj createPassthroughCommandForShard(
@@ -586,15 +596,18 @@ DispatchShardPipelineResults dispatchShardPipeline(
     }
 
     // Generate the command object for the targeted shards.
-    BSONObj targetedCommand = splitPipeline
-        ? createCommandForTargetedShards(
-              expCtx, serializedCommand, *splitPipeline, exchangeSpec, true)
-        : createPassthroughCommandForShard(expCtx,
-                                           serializedCommand,
-                                           expCtx->explain,
-                                           expCtx->getRuntimeConstants(),
-                                           pipeline.get(),
-                                           collationObj);
+    BSONObj targetedCommand = applyReadWriteConcern(
+        opCtx,
+        true,             /* appendRC */
+        !expCtx->explain, /* appendWC */
+        splitPipeline ? createCommandForTargetedShards(
+                            expCtx, serializedCommand, *splitPipeline, exchangeSpec, true)
+                      : createPassthroughCommandForShard(expCtx,
+                                                         serializedCommand,
+                                                         expCtx->explain,
+                                                         expCtx->getRuntimeConstants(),
+                                                         pipeline.get(),
+                                                         collationObj));
 
     // A $changeStream pipeline must run on all shards, and will also open an extra cursor on the
     // config server in order to monitor for new shards. To guarantee that we do not miss any
@@ -1072,9 +1085,12 @@ Status runPipelineOnPrimaryShard(const boost::intrusive_ptr<ExpressionContext>& 
 
     // Format the command for the shard. This adds the 'fromMongos' field, wraps the command as an
     // explain if necessary, and rewrites the result into a format safe to forward to shards.
-    BSONObj cmdObj =
+    BSONObj cmdObj = applyReadWriteConcern(
+        opCtx,
+        true,     /* appendRC */
+        !explain, /* appendWC */
         CommandHelpers::filterCommandRequestForPassthrough(createPassthroughCommandForShard(
-            expCtx, serializedCommand, explain, boost::none, nullptr, BSONObj()));
+            expCtx, serializedCommand, explain, boost::none, nullptr, BSONObj())));
 
     const auto shardId = dbInfo.primary()->getId();
     const auto cmdObjWithShardVersion = (shardId != ShardRegistry::kConfigServerShardId)

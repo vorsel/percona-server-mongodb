@@ -44,6 +44,7 @@
 #include "mongo/db/storage/duplicate_key_error_info.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/s/client/num_hosts_targeted_metrics.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/cluster_last_error_info.h"
@@ -310,6 +311,30 @@ bool handleWouldChangeOwningShardError(OperationContext* opCtx,
     return updatedShardKey;
 }
 
+void updateHostsTargetedMetrics(OperationContext* opCtx,
+                                BatchedCommandRequest::BatchType batchType,
+                                int nShardsOwningChunks,
+                                int nShardsTargeted) {
+    NumHostsTargetedMetrics::QueryType writeType;
+    switch (batchType) {
+        case BatchedCommandRequest::BatchType_Insert:
+            writeType = NumHostsTargetedMetrics::QueryType::kInsertCmd;
+            break;
+        case BatchedCommandRequest::BatchType_Update:
+            writeType = NumHostsTargetedMetrics::QueryType::kUpdateCmd;
+            break;
+        case BatchedCommandRequest::BatchType_Delete:
+            writeType = NumHostsTargetedMetrics::QueryType::kDeleteCmd;
+            break;
+
+            MONGO_UNREACHABLE;
+    }
+
+    auto targetType = NumHostsTargetedMetrics::get(opCtx).parseTargetType(
+        opCtx, nShardsTargeted, nShardsOwningChunks);
+    NumHostsTargetedMetrics::get(opCtx).addNumHostsTargeted(writeType, targetType);
+}
+
 /**
  * Base class for mongos write commands.
  */
@@ -497,6 +522,13 @@ private:
         CurOp::get(opCtx)->debug().nShards =
             stats.getTargetedShards().size() + (updatedShardKey ? 1 : 0);
 
+        if (stats.getNumShardsOwningChunks().is_initialized())
+            updateHostsTargetedMetrics(opCtx,
+                                       _batchedRequest.getBatchType(),
+                                       stats.getNumShardsOwningChunks().get(),
+                                       stats.getTargetedShards().size() +
+                                           (updatedShardKey ? 1 : 0));
+
         if (auto txnRouter = TransactionRouter::get(opCtx)) {
             auto writeCmdStatus = response.toStatus();
             if (!writeCmdStatus.isOK()) {
@@ -549,8 +581,7 @@ private:
     }
 
     ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level) const final {
-        return {ReadConcernSupportResult::ReadConcern::kSupported,
-                ReadConcernSupportResult::DefaultReadConcern::kPermitted};
+        return ReadConcernSupportResult::allSupportedAndDefaultPermitted();
     }
 
     void doCheckAuthorization(OperationContext* opCtx) const final {

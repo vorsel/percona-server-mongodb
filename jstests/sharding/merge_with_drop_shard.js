@@ -1,11 +1,17 @@
 // Tests that the $merge aggregation stage is resilient to drop shard in both the source and
 // output collection during execution.
+// @tags: [multiversion_incompatible]
 (function() {
 'use strict';
 
 load("jstests/aggregation/extras/merge_helpers.js");  // For withEachMergeMode.
 
 const st = new ShardingTest({shards: 2, rs: {nodes: 1}});
+
+assert.commandWorked(st.shard0.adminCommand(
+    {configureFailPoint: "disableWritingPendingRangeDeletionEntries", mode: "alwaysOn"}));
+assert.commandWorked(st.shard1.adminCommand(
+    {configureFailPoint: "disableWritingPendingRangeDeletionEntries", mode: "alwaysOn"}));
 
 const mongosDB = st.s.getDB(jsTestName());
 const sourceColl = mongosDB["source"];
@@ -48,6 +54,7 @@ function addShard(shard) {
     assert.commandWorked(
         st.s.adminCommand({moveChunk: sourceColl.getFullName(), find: {shardKey: 0}, to: shard}));
 }
+
 function runMergeWithMode(
     whenMatchedMode, whenNotMatchedMode, shardedColl, dropShard, expectFailCode) {
     // Set the failpoint to hang in the first call to DocumentSourceCursor's getNext().
@@ -79,15 +86,24 @@ function runMergeWithMode(
     let mergeShell = startParallelShell(outFn, st.s.port);
 
     // Wait for the parallel shell to hit the failpoint.
-    assert.soon(() => mongosDB
-                          .currentOp({
-                              $or: [
-                                  {op: "command", "command.comment": comment},
-                                  {op: "getmore", "cursor.originatingCommand.comment": comment}
-                              ]
-                          })
-                          .inprog.length >= 1,
-                () => tojson(mongosDB.currentOp().inprog));
+    // currentOp can fail with ShardNotFound since we remove
+    // the shard on some test runs.
+    assert.soon(
+        () => {
+            const response = assert.commandWorkedOrFailedWithCode(mongosDB.currentOp({
+                $or: [
+                    {op: "command", "command.comment": comment},
+                    {op: "getmore", "cursor.originatingCommand.comment": comment}
+                ]
+            }),
+                                                                  [ErrorCodes.ShardNotFound]);
+            return (response.ok) ? response.inprog.length >= 1 : false;
+        },
+        () => {
+            const msg = "Timeout waiting for parallel shell to hit the failpoint";
+            const response = mongosDB.currentOp();
+            return (response.ok) ? msg + ":\n" + tojson(response.inprog) : msg;
+        });
 
     if (dropShard) {
         removeShard(st.shard0);

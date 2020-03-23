@@ -247,8 +247,7 @@ error_codes:
     - {code: 225,name: TransactionTooOld,categories: [VoteAbortError]}
     - {code: 226,name: AtomicityFailure}
     - {code: 227,name: CannotImplicitlyCreateCollection,
-                  extra: CannotImplicitlyCreateCollectionInfo,
-                  categories: [NeedRetargettingError]}
+                  extra: CannotImplicitlyCreateCollectionInfo}
     - {code: 228,name: SessionTransferIncomplete}
     - {code: 229,name: MustDowngrade}
     - {code: 230,name: DNSHostNotFound}
@@ -286,7 +285,7 @@ error_codes:
     - {code: 259,name: KeyedExecutorRetry}
     - {code: 260,name: InvalidResumeToken}
     - {code: 261,name: TooManyLogicalSessions}
-    - {code: 262,name: ExceededTimeLimit,categories: [Interruption,ExceededTimeLimitError]}
+    - {code: 262,name: ExceededTimeLimit,categories: [Interruption,ExceededTimeLimitError, RetriableError]}
     - {code: 263,name: OperationNotSupportedInTransaction}
     - {code: 264,name: TooManyFilesOpen}
     - {code: 265,name: OrphanedRangeCleanUpFailed}
@@ -307,7 +306,8 @@ error_codes:
     - {code: 280,name: ChangeStreamFatalError,categories: [NonResumableChangeStreamError]}
 
     # The two codes below are for internal use only and must never be returned in a network response
-    - {code: 281,name: TransactionCoordinatorSteppingDown} # Gets converted to InterruptedDueToReplStateChange
+    # TransactionCoordinatorSteppingDown gets converted to InterruptedDueToReplStateChange
+    - {code: 281,name: TransactionCoordinatorSteppingDown,categories: [Interruption]}
     - {code: 282,name: TransactionCoordinatorReachedAbortDecision}
 
     - {code: 283,name: WouldChangeOwningShard,extra: WouldChangeOwningShardInfo}
@@ -331,6 +331,10 @@ error_codes:
     - {code: 295,name: InvalidHeartBeatFrequency}
     - {code: 296,name: TopologySetNameRequired}
     - {code: 297,name: HierarchicalAcquisitionLevelViolation}
+    - {code: 298,name: InvalidServerType}
+    - {code: 299,name: OCSPCertificateStatusRevoked}
+    - {code: 300,name: RangeDeletionAbandonedBecauseCollectionWithUUIDDoesNotExist}
+    - {code: 301,name: DataCorruptionDetected}
 
     # Error codes 4000-8999 are reserved.
 

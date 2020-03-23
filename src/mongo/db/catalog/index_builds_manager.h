@@ -36,6 +36,7 @@
 
 #include "mongo/db/catalog/multi_index_block.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/repair_database.h"
 #include "mongo/db/repl_index_build_state.h"
 #include "mongo/platform/mutex.h"
 
@@ -107,13 +108,13 @@ public:
                               const UUID& buildUUID);
 
     /**
-     * Iterates through every record in the collection to index it while also removing documents
-     * that are not valid BSON objects.
+     * Iterates through every record in the collection to index it. May also remove documents
+     * that are not valid BSON objects, if repair is set to kYes.
      *
      * Returns the number of records and the size of the data iterated over.
      */
     StatusWith<std::pair<long long, long long>> startBuildingIndexForRecovery(
-        OperationContext* opCtx, NamespaceString ns, const UUID& buildUUID);
+        OperationContext* opCtx, NamespaceString ns, const UUID& buildUUID, RepairData repair);
 
     /**
      * Document inserts observed during the scanning/insertion phase of an index build are not
@@ -164,15 +165,15 @@ public:
     bool abortIndexBuild(const UUID& buildUUID, const std::string& reason);
 
     /**
-     * Signals the index build to be interrupted and returns without waiting for it to stop. Does
-     * nothing if the index build has already been cleared away.
+     * Signals the index build to be aborted without being cleaned up and returns without waiting
+     * for it to stop. Does nothing if the index build has already been cleared away.
      *
      * Returns true if a build existed to be signaled, as opposed to having already finished and
      * been cleared away, or not having yet started..
      */
-    bool interruptIndexBuild(OperationContext* opCtx,
-                             const UUID& buildUUID,
-                             const std::string& reason);
+    bool abortIndexBuildWithoutCleanup(OperationContext* opCtx,
+                                       const UUID& buildUUID,
+                                       const std::string& reason);
 
     /**
      * Cleans up the index build state and unregisters it from the manager.

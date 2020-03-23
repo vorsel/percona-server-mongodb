@@ -308,7 +308,6 @@ void BatchWriteExec::executeBatch(OperationContext* opCtx,
                     TrackedErrors trackedErrors;
                     trackedErrors.startTracking(ErrorCodes::StaleShardVersion);
                     trackedErrors.startTracking(ErrorCodes::StaleDbVersion);
-                    trackedErrors.startTracking(ErrorCodes::CannotImplicitlyCreateCollection);
 
                     LOG(4) << "Write results received from " << shardHost.toString() << ": "
                            << redact(batchedCommandResponse.toStatus());
@@ -354,20 +353,6 @@ void BatchWriteExec::executeBatch(OperationContext* opCtx,
                         invariant(staleShardErrors.empty());
                         noteStaleDbResponses(staleDbErrors, &targeter);
                         ++stats->numStaleDbBatches;
-                    }
-
-                    const auto& cannotImplicitlyCreateErrors =
-                        trackedErrors.getErrors(ErrorCodes::CannotImplicitlyCreateCollection);
-                    if (!cannotImplicitlyCreateErrors.empty()) {
-                        // This forces the chunk manager to reload so we can attach the correct
-                        // version on retry and make sure we route to the correct shard.
-                        targeter.noteCouldNotTarget();
-
-                        // It is also possible that information about which shard is the primary
-                        // for this collection collection is stale, so refresh the database as
-                        // well.
-                        Grid::get(opCtx)->catalogCache()->invalidateDatabaseEntry(
-                            targeter.getNS().db());
                     }
 
                     // Remember that we successfully wrote to this shard
@@ -455,6 +440,10 @@ void BatchWriteExec::executeBatch(OperationContext* opCtx,
         }
     }
 
+    auto nShardsOwningChunks = batchOp.getNShardsOwningChunks();
+    if (nShardsOwningChunks.is_initialized())
+        stats->noteNumShardsOwningChunks(nShardsOwningChunks.get());
+
     batchOp.buildClientResponse(clientResponse);
 
     LOG(4) << "Finished execution of write batch"
@@ -476,12 +465,20 @@ void BatchWriteExecStats::noteWriteAt(const HostAndPort& host,
     _writeOpTimes[ConnectionString(host)] = HostOpTime(opTime, electionId);
 }
 
+void BatchWriteExecStats::noteNumShardsOwningChunks(const int nShardsOwningChunks) {
+    _numShardsOwningChunks.emplace(nShardsOwningChunks);
+}
+
 const std::set<ShardId>& BatchWriteExecStats::getTargetedShards() const {
     return _targetedShards;
 }
 
 const HostOpTimeMap& BatchWriteExecStats::getWriteOpTimes() const {
     return _writeOpTimes;
+}
+
+const boost::optional<int> BatchWriteExecStats::getNumShardsOwningChunks() const {
+    return _numShardsOwningChunks;
 }
 
 }  // namespace mongo

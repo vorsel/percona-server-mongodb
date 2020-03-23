@@ -5,7 +5,7 @@
  * enableMajorityReadConcern=true.
  * Rollback after restarting with enableMajorityReadConcern=true succeeds if the common point is at
  * least the stable timestamp, i.e. we do not attempt to roll back operations that were included in
- * @tags: [requires_persistence]
+ * @tags: [requires_persistence, requires_fcv_44]
  */
 (function() {
 "use strict";
@@ -27,7 +27,7 @@ config.members[2].priority = 0;
 config.settings = {
     chainingAllowed: false
 };
-replTest.initiate(config);
+replTest.initiateWithHighElectionTimeout(config);
 let rollbackTest = new RollbackTest(name, replTest);
 
 jsTest.log("Ensure the stable timestamp is ahead of the common point on the rollback node.");

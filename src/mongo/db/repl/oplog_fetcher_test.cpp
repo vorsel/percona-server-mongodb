@@ -34,6 +34,8 @@
 #include "mongo/db/repl/abstract_oplog_fetcher_test_fixture.h"
 #include "mongo/db/repl/data_replicator_external_state_mock.h"
 #include "mongo/db/repl/oplog_fetcher.h"
+#include "mongo/db/repl/task_executor_mock.h"
+#include "mongo/dbtests/mock/mock_dbclient_connection.h"
 #include "mongo/rpc/metadata.h"
 #include "mongo/rpc/metadata/oplog_query_metadata.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
@@ -41,6 +43,7 @@
 #include "mongo/unittest/ensure_fcv.h"
 #include "mongo/unittest/task_executor_proxy.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/scopeguard.h"
 
 namespace {
@@ -1022,5 +1025,460 @@ TEST_F(OplogFetcherTest,
     ASSERT_EQUALS(0U, info.toApplyDocumentBytes);
 
     ASSERT_EQUALS(OpTime(), info.lastDocument);
+}
+
+BSONObj makeNoopOplogEntry(OpTime opTime) {
+    auto oplogEntry =
+        repl::OplogEntry(opTime,                           // optime
+                         boost::none,                      // hash
+                         OpTypeEnum ::kNoop,               // opType
+                         NamespaceString("test.t"),        // namespace
+                         boost::none,                      // uuid
+                         boost::none,                      // fromMigrate
+                         repl::OplogEntry::kOplogVersion,  // version
+                         BSONObj(),                        // o
+                         boost::none,                      // o2
+                         {},                               // sessionInfo
+                         boost::none,                      // upsert
+                         Date_t(),                         // wall clock time
+                         boost::none,                      // statement id
+                         boost::none,   // optime of previous write within same transaction
+                         boost::none,   // pre-image optime
+                         boost::none);  // post-image optime
+    return oplogEntry.toBSON();
+}
+
+BSONObj makeNoopOplogEntry(Seconds seconds) {
+    return makeNoopOplogEntry({{seconds, 0}, 1LL});
+}
+
+BSONObj makeOplogBatchMetadata(boost::optional<const rpc::ReplSetMetadata&> replMetadata,
+                               boost::optional<const rpc::OplogQueryMetadata&> oqMetadata) {
+    BSONObjBuilder bob;
+    if (replMetadata) {
+        ASSERT_OK(replMetadata->writeToMetadata(&bob));
+    }
+    if (oqMetadata) {
+        ASSERT_OK(oqMetadata->writeToMetadata(&bob));
+    }
+    return bob.obj();
+}
+
+Message makeFirstBatch(CursorId cursorId,
+                       const NewOplogFetcher::Documents& oplogEntries,
+                       const BSONObj& metadata) {
+    return MockDBClientConnection::mockFindResponse(
+        NamespaceString::kRsOplogNamespace, cursorId, oplogEntries, metadata);
+}
+
+Message makeSubsequentBatch(CursorId cursorId,
+                            const NewOplogFetcher::Documents& oplogEntries,
+                            const BSONObj& metadata,
+                            bool moreToCome) {
+    return MockDBClientConnection::mockGetMoreResponse(
+        NamespaceString::kRsOplogNamespace, cursorId, oplogEntries, metadata, moreToCome);
+}
+
+bool blockedOnNetworkSoon(MockDBClientConnection* conn) {
+    // Wait up to 10 seconds.
+    for (auto i = 0; i < 100; i++) {
+        if (conn->isBlockedOnNetwork()) {
+            return true;
+        }
+        mongo::sleepmillis(100);
+    }
+    return false;
+}
+
+// Simulate a response to a single outgoing client request and return the client request. Use this
+// function to simulate responses to client find/getMore requests.
+Message processSingleRequestResponse(DBClientConnection* conn,
+                                     const Message& response,
+                                     bool expectReadyNetworkOperationsAfterProcessing = false) {
+    auto* mockConn = dynamic_cast<MockDBClientConnection*>(conn);
+    ASSERT_TRUE(blockedOnNetworkSoon(mockConn));
+    auto request = mockConn->getLastSentMessage();
+    mockConn->setCallResponses({response});
+    if (expectReadyNetworkOperationsAfterProcessing) {
+        ASSERT_TRUE(blockedOnNetworkSoon(mockConn));
+    }
+    return request;
+}
+
+// Simulate a response to a single network recv() call. Use this function to simulate responses to
+// exhaust stream where a client expects to receive responses without sending out new requests.
+void processSingleExhaustResponse(DBClientConnection* conn,
+                                  const Message& response,
+                                  bool expectReadyNetworkOperationsAfterProcessing = false) {
+    auto* mockConn = dynamic_cast<MockDBClientConnection*>(conn);
+    ASSERT_TRUE(blockedOnNetworkSoon(mockConn));
+    mockConn->setRecvResponses({response});
+    if (expectReadyNetworkOperationsAfterProcessing) {
+        ASSERT_TRUE(blockedOnNetworkSoon(mockConn));
+    }
+}
+
+
+class NewOplogFetcherTest : public executor::ThreadPoolExecutorTest {
+protected:
+    static const OpTime remoteNewerOpTime;
+    static const OpTime staleOpTime;
+    static const Date_t staleWallTime;
+    static const int rbid = 2;
+    static const int primaryIndex = 2;
+    static const int syncSourceIndex = 2;
+    static const rpc::OplogQueryMetadata staleOqMetadata;
+
+    // 16MB max batch size / 12 byte min doc size * 10 (for good measure) = defaultBatchSize to use.
+    const int defaultBatchSize = (16 * 1024 * 1024) / 12 * 10;
+
+    void setUp() override;
+
+    std::unique_ptr<NewOplogFetcher> makeOplogFetcher();
+    std::unique_ptr<NewOplogFetcher> makeOplogFetcherWithDifferentExecutor(
+        executor::TaskExecutor* executor, NewOplogFetcher::OnShutdownCallbackFn fn);
+
+    std::unique_ptr<ShutdownState> processSingleBatch(const Message& response,
+                                                      bool requireFresherSyncSource = true);
+
+    /**
+     * Tests checkSyncSource result handling.
+     */
+    void testSyncSourceChecking(boost::optional<const rpc::ReplSetMetadata&> replMetadata,
+                                boost::optional<const rpc::OplogQueryMetadata&> oqMetadata);
+
+    std::unique_ptr<DataReplicatorExternalStateMock> dataReplicatorExternalState;
+
+    NewOplogFetcher::Documents lastEnqueuedDocuments;
+    NewOplogFetcher::DocumentsInfo lastEnqueuedDocumentsInfo;
+    NewOplogFetcher::EnqueueDocumentsFn enqueueDocumentsFn;
+
+    // The last OpTime fetched by the oplog fetcher.
+    OpTime lastFetched;
+};
+
+const OpTime NewOplogFetcherTest::remoteNewerOpTime = OpTime(Timestamp(124, 1), 2);
+const OpTime NewOplogFetcherTest::staleOpTime = OpTime(Timestamp(1, 1), 0);
+const Date_t NewOplogFetcherTest::staleWallTime = Date_t() + Seconds(staleOpTime.getSecs());
+const rpc::OplogQueryMetadata NewOplogFetcherTest::staleOqMetadata = rpc::OplogQueryMetadata(
+    {staleOpTime, staleWallTime}, staleOpTime, rbid, primaryIndex, syncSourceIndex);
+
+void NewOplogFetcherTest::setUp() {
+    executor::ThreadPoolExecutorTest::setUp();
+    launchExecutorThread();
+
+    lastFetched = {{123, 0}, 1};
+
+    dataReplicatorExternalState = std::make_unique<DataReplicatorExternalStateMock>();
+    dataReplicatorExternalState->currentTerm = lastFetched.getTerm();
+    dataReplicatorExternalState->lastCommittedOpTime = {{9999, 0}, lastFetched.getTerm()};
+
+    enqueueDocumentsFn = [this](NewOplogFetcher::Documents::const_iterator begin,
+                                NewOplogFetcher::Documents::const_iterator end,
+                                const NewOplogFetcher::DocumentsInfo& info) -> Status {
+        lastEnqueuedDocuments = {begin, end};
+        lastEnqueuedDocumentsInfo = info;
+        return Status::OK();
+    };
+}
+
+std::unique_ptr<NewOplogFetcher> NewOplogFetcherTest::makeOplogFetcher() {
+    return makeOplogFetcherWithDifferentExecutor(&getExecutor(), [](Status) {});
+}
+
+std::unique_ptr<NewOplogFetcher> NewOplogFetcherTest::makeOplogFetcherWithDifferentExecutor(
+    executor::TaskExecutor* executor, NewOplogFetcher::OnShutdownCallbackFn fn) {
+    auto oplogFetcher = std::make_unique<NewOplogFetcher>(
+        executor,
+        lastFetched,
+        source,
+        _createConfig(),
+        std::make_unique<NewOplogFetcher::OplogFetcherRestartDecisionDefault>(1),
+        -1,
+        true,
+        dataReplicatorExternalState.get(),
+        enqueueDocumentsFn,
+        fn,
+        defaultBatchSize,
+        NewOplogFetcher::StartingPoint::kSkipFirstDoc);
+    oplogFetcher->setCreateClientFn_forTest(
+        []() { return std::unique_ptr<DBClientConnection>(new MockDBClientConnection()); });
+    return oplogFetcher;
+}
+
+std::unique_ptr<ShutdownState> NewOplogFetcherTest::processSingleBatch(
+    const Message& response, bool requireFresherSyncSource) {
+    auto shutdownState = std::make_unique<ShutdownState>();
+    NewOplogFetcher oplogFetcher(
+        &getExecutor(),
+        lastFetched,
+        source,
+        _createConfig(),
+        std::make_unique<NewOplogFetcher::OplogFetcherRestartDecisionDefault>(0),
+        rbid,
+        requireFresherSyncSource,
+        dataReplicatorExternalState.get(),
+        enqueueDocumentsFn,
+        std::ref(*shutdownState),
+        defaultBatchSize,
+        NewOplogFetcher::StartingPoint::kSkipFirstDoc);
+    oplogFetcher.setCreateClientFn_forTest(
+        []() { return std::unique_ptr<DBClientConnection>(new MockDBClientConnection()); });
+
+    ASSERT_FALSE(oplogFetcher.isActive());
+    ASSERT_OK(oplogFetcher.startup());
+    ASSERT_TRUE(oplogFetcher.isActive());
+
+    auto m = processSingleRequestResponse(oplogFetcher.getDBClientConnection_forTest(), response);
+    auto msg = mongo::OpMsg::parse(m);
+    ASSERT_EQ(mongo::StringData(msg.body.firstElement().fieldName()), "find");
+    ASSERT_TRUE(msg.body.getBoolField("tailable"));
+    ASSERT_TRUE(msg.body.getBoolField("oplogReplay"));
+    ASSERT_TRUE(msg.body.getBoolField("awaitData"));
+    ASSERT_EQUALS(60000, msg.body.getIntField("maxTimeMS"));
+    // TODO SERVER-45468: Test the find command and the metadata sent.
+
+    oplogFetcher.shutdown();
+    oplogFetcher.join();
+
+    return shutdownState;
+}
+
+void NewOplogFetcherTest::testSyncSourceChecking(
+    boost::optional<const rpc::ReplSetMetadata&> replMetadata,
+    boost::optional<const rpc::OplogQueryMetadata&> oqMetadata) {
+    auto firstEntry = makeNoopOplogEntry(lastFetched);
+    auto secondEntry = makeNoopOplogEntry({{Seconds(456), 0}, lastFetched.getTerm()});
+    auto thirdEntry = makeNoopOplogEntry({{Seconds(789), 0}, lastFetched.getTerm()});
+
+    auto metadataObj = makeOplogBatchMetadata(replMetadata, oqMetadata);
+
+    dataReplicatorExternalState->shouldStopFetchingResult = true;
+
+    auto shutdownState =
+        processSingleBatch(makeFirstBatch(0, {firstEntry, secondEntry, thirdEntry}, metadataObj));
+
+    ASSERT_EQUALS(ErrorCodes::InvalidSyncSource, shutdownState->getStatus());
+}
+
+TEST_F(NewOplogFetcherTest, ShuttingExecutorDownShouldPreventOplogFetcherFromStarting) {
+    getExecutor().shutdown();
+
+    auto oplogFetcher = makeOplogFetcher();
+
+    // Last optime fetched should match values passed to constructor.
+    ASSERT_EQUALS(lastFetched, oplogFetcher->getLastOpTimeFetched_forTest());
+
+    ASSERT_FALSE(oplogFetcher->isActive());
+    ASSERT_EQUALS(ErrorCodes::ShutdownInProgress, oplogFetcher->startup());
+    ASSERT_FALSE(oplogFetcher->isActive());
+
+    // Last optime fetched should not change.
+    ASSERT_EQUALS(lastFetched, oplogFetcher->getLastOpTimeFetched_forTest());
+}
+
+TEST_F(NewOplogFetcherTest, OplogFetcherReturnsOperationFailedIfExecutorFailsToScheduleRunQuery) {
+    TaskExecutorMock taskExecutorMock(&getExecutor());
+    taskExecutorMock.shouldFailScheduleWorkRequest = []() { return true; };
+
+    // The onShutdownFn should not be called because the oplog fetcher should fail during startup.
+    auto oplogFetcher =
+        makeOplogFetcherWithDifferentExecutor(&taskExecutorMock, [](Status) { MONGO_UNREACHABLE; });
+
+    // Last optime fetched should match values passed to constructor.
+    ASSERT_EQUALS(lastFetched, oplogFetcher->getLastOpTimeFetched_forTest());
+
+    ASSERT_FALSE(oplogFetcher->isActive());
+    ASSERT_EQUALS(ErrorCodes::OperationFailed, oplogFetcher->startup());
+    ASSERT_FALSE(oplogFetcher->isActive());
+
+    // Last optime fetched should not change.
+    ASSERT_EQUALS(lastFetched, oplogFetcher->getLastOpTimeFetched_forTest());
+}
+
+TEST_F(NewOplogFetcherTest, ShuttingExecutorDownAfterStartupButBeforeRunQueryScheduled) {
+    ShutdownState shutdownState;
+
+    // Defer scheduling work so that the executor's shutdown happens before startup's work is
+    // scheduled.
+    TaskExecutorMock taskExecutorMock(&getExecutor());
+    taskExecutorMock.shouldDeferScheduleWorkRequestByOneSecond = []() { return true; };
+
+    auto oplogFetcher =
+        makeOplogFetcherWithDifferentExecutor(&taskExecutorMock, std::ref(shutdownState));
+
+    ASSERT_FALSE(oplogFetcher->isActive());
+    ASSERT_OK(oplogFetcher->startup());
+    ASSERT_TRUE(oplogFetcher->isActive());
+
+    getExecutor().shutdown();
+
+    oplogFetcher->join();
+
+    ASSERT_EQUALS(ErrorCodes::CallbackCanceled, shutdownState.getStatus());
+}
+
+TEST_F(NewOplogFetcherTest, OplogFetcherReturnsCallbackCanceledIfShutdownBeforeRunQueryScheduled) {
+    ShutdownState shutdownState;
+
+    // Defer scheduling work so that the oplog fetcher's shutdown happens before startup's work is
+    // scheduled.
+    TaskExecutorMock taskExecutorMock(&getExecutor());
+    taskExecutorMock.shouldDeferScheduleWorkRequestByOneSecond = []() { return true; };
+
+    auto oplogFetcher =
+        makeOplogFetcherWithDifferentExecutor(&taskExecutorMock, std::ref(shutdownState));
+
+    ASSERT_FALSE(oplogFetcher->isActive());
+    ASSERT_OK(oplogFetcher->startup());
+    ASSERT_TRUE(oplogFetcher->isActive());
+
+    oplogFetcher->shutdown();
+
+    oplogFetcher->join();
+
+    ASSERT_EQUALS(ErrorCodes::CallbackCanceled, shutdownState.getStatus());
+}
+
+TEST_F(NewOplogFetcherTest, OplogFetcherReturnsCallbackCanceledIfShutdownAfterRunQueryScheduled) {
+    ShutdownState shutdownState;
+
+    auto oplogFetcher =
+        makeOplogFetcherWithDifferentExecutor(&getExecutor(), std::ref(shutdownState));
+
+    auto waitForCallbackScheduledFailPoint =
+        globalFailPointRegistry().find("hangAfterOplogFetcherCallbackScheduled");
+    auto timesEnteredFailPoint = waitForCallbackScheduledFailPoint->setMode(FailPoint::alwaysOn, 0);
+
+    ASSERT_FALSE(oplogFetcher->isActive());
+    ASSERT_OK(oplogFetcher->startup());
+    ASSERT_TRUE(oplogFetcher->isActive());
+
+    waitForCallbackScheduledFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
+    waitForCallbackScheduledFailPoint->setMode(FailPoint::off);
+
+    // Only call shutdown once we have confirmed that the callback is paused at the fail point.
+    oplogFetcher->shutdown();
+
+    oplogFetcher->join();
+
+    ASSERT_EQUALS(ErrorCodes::CallbackCanceled, shutdownState.getStatus());
+}
+
+TEST_F(NewOplogFetcherTest,
+       FindQueryContainsTermIfGetCurrentTermAndLastCommittedOpTimeReturnsValidTerm) {
+    // Test that the correct maxTimeMS is set if this is the initial 'find' query.
+    auto queryObj = makeOplogFetcher()->getFindQuery_forTest(true);
+    ASSERT_EQUALS(60000, queryObj.getIntField("maxTimeMS"));
+
+    ASSERT_EQUALS(mongo::BSONType::Object, queryObj["query"].type());
+    ASSERT_BSONOBJ_EQ(BSON("ts" << BSON("$gte" << lastFetched.getTimestamp())),
+                      queryObj["query"].Obj());
+    ASSERT_EQUALS(mongo::BSONType::Object, queryObj["readConcern"].type());
+    ASSERT_BSONOBJ_EQ(BSON("afterClusterTime" << Timestamp(0, 1)), queryObj["readConcern"].Obj());
+    ASSERT_EQUALS(dataReplicatorExternalState->currentTerm, queryObj["term"].numberLong());
+}
+
+TEST_F(NewOplogFetcherTest,
+       FindQueryDoesNotContainTermIfGetCurrentTermAndLastCommittedOpTimeReturnsUninitializedTerm) {
+    dataReplicatorExternalState->currentTerm = OpTime::kUninitializedTerm;
+
+    // Test that the correct maxTimeMS is set if we are retrying the 'find' query.
+    auto queryObj = makeOplogFetcher()->getFindQuery_forTest(false);
+    ASSERT_EQUALS(2000, queryObj.getIntField("maxTimeMS"));
+
+    ASSERT_EQUALS(mongo::BSONType::Object, queryObj["query"].type());
+    ASSERT_BSONOBJ_EQ(BSON("ts" << BSON("$gte" << lastFetched.getTimestamp())),
+                      queryObj["query"].Obj());
+    ASSERT_EQUALS(mongo::BSONType::Object, queryObj["readConcern"].type());
+    ASSERT_BSONOBJ_EQ(BSON("afterClusterTime" << Timestamp(0, 1)), queryObj["readConcern"].Obj());
+    ASSERT_FALSE(queryObj.hasField("term"));
+}
+
+TEST_F(NewOplogFetcherTest, AwaitDataTimeoutShouldEqualHalfElectionTimeout) {
+    auto config = _createConfig();
+    auto timeout = makeOplogFetcher()->getAwaitDataTimeout_forTest();
+    ASSERT_EQUALS(config.getElectionTimeoutPeriod() / 2, timeout);
+}
+
+TEST_F(NewOplogFetcherTest, AwaitDataTimeoutSmallerWhenFailPointSet) {
+    auto failPoint = globalFailPointRegistry().find("setSmallOplogGetMoreMaxTimeMS");
+    failPoint->setMode(FailPoint::alwaysOn);
+    auto timeout = makeOplogFetcher()->getAwaitDataTimeout_forTest();
+    ASSERT_EQUALS(Milliseconds(50), timeout);
+    failPoint->setMode(FailPoint::off);
+}
+
+TEST_F(
+    NewOplogFetcherTest,
+    NoDataAvailableAfterFirstTwoBatchesShouldCauseTheOplogFetcherToShutDownWithSuccessfulStatus) {
+    // TODO SERVER-45468: Enable this test.
+    return;
+
+    ShutdownState shutdownState;
+
+    NewOplogFetcher oplogFetcher(
+        &getExecutor(),
+        lastFetched,
+        source,
+        _createConfig(),
+        std::make_unique<NewOplogFetcher::OplogFetcherRestartDecisionDefault>(0),
+        rbid,
+        true,
+        dataReplicatorExternalState.get(),
+        enqueueDocumentsFn,
+        std::ref(shutdownState),
+        defaultBatchSize,
+        NewOplogFetcher::StartingPoint::kSkipFirstDoc);
+    oplogFetcher.setCreateClientFn_forTest(
+        []() { return std::unique_ptr<DBClientConnection>(new MockDBClientConnection()); });
+
+    ASSERT_EQUALS(OplogFetcher::State::kPreStart, oplogFetcher.getState_forTest());
+
+    ASSERT_OK(oplogFetcher.startup());
+    ASSERT_EQUALS(OplogFetcher::State::kRunning, oplogFetcher.getState_forTest());
+
+    CursorId cursorId = 22LL;
+    auto firstEntry = makeNoopOplogEntry(lastFetched);
+    auto secondEntry = makeNoopOplogEntry({{Seconds(456), 0}, lastFetched.getTerm()});
+
+    auto metadataObj = makeOplogBatchMetadata(boost::none, staleOqMetadata);
+
+    processSingleRequestResponse(oplogFetcher.getDBClientConnection_forTest(),
+                                 makeFirstBatch(cursorId, {firstEntry, secondEntry}, metadataObj),
+                                 true);
+
+    ASSERT_EQUALS(1U, lastEnqueuedDocuments.size());
+    ASSERT_BSONOBJ_EQ(secondEntry, lastEnqueuedDocuments[0]);
+
+    auto thirdEntry = makeNoopOplogEntry({{Seconds(789), 0}, lastFetched.getTerm()});
+    auto fourthEntry = makeNoopOplogEntry({{Seconds(1200), 0}, lastFetched.getTerm()});
+
+    // Set cursor ID to 0 in getMore response to indicate no more data available.
+    const auto moreToCome = false;
+    auto m = processSingleRequestResponse(
+        oplogFetcher.getDBClientConnection_forTest(),
+        makeSubsequentBatch(0, {thirdEntry, fourthEntry}, metadataObj, moreToCome),
+        false);
+    auto msg = mongo::OpMsg::parse(m);
+
+    ASSERT_EQ(mongo::StringData(msg.body.firstElement().fieldName()), "getMore");
+    ASSERT_EQUALS(NamespaceString::kRsOplogNamespace.coll(), msg.body["collection"].String());
+    ASSERT_EQUALS(int(durationCount<Milliseconds>(oplogFetcher.getAwaitDataTimeout_forTest())),
+                  msg.body.getIntField("maxTimeMS"));
+
+    ASSERT_EQUALS(2U, lastEnqueuedDocuments.size());
+    ASSERT_BSONOBJ_EQ(thirdEntry, lastEnqueuedDocuments[0]);
+    ASSERT_BSONOBJ_EQ(fourthEntry, lastEnqueuedDocuments[1]);
+
+    oplogFetcher.join();
+    ASSERT_EQUALS(OplogFetcher::State::kComplete, oplogFetcher.getState_forTest());
+
+    ASSERT_OK(shutdownState.getStatus());
+
+    ASSERT_EQUALS(dataReplicatorExternalState->currentTerm, msg.body["term"].numberLong());
+    ASSERT_EQUALS(dataReplicatorExternalState->lastCommittedOpTime,
+                  unittest::assertGet(
+                      OpTime::parseFromOplogEntry(msg.body["lastKnownCommittedOpTime"].Obj())));
 }
 }  // namespace

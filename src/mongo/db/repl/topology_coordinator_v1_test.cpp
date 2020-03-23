@@ -46,8 +46,8 @@
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/log_global_settings.h"
 #include "mongo/util/net/hostandport.h"
-#include "mongo/util/net/socket_utils.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/time_support.h"
 
@@ -106,7 +106,7 @@ protected:
     }
 
     int64_t countLogLinesContaining(const std::string& needle) {
-        const auto& msgs = getCapturedLogMessages();
+        const auto& msgs = getCapturedTextFormatLogMessages();
         return std::count_if(
             msgs.begin(), msgs.end(), [&](const auto& s) { return stringContains(s, needle); });
     }
@@ -663,6 +663,22 @@ TEST_F(TopoCoordTest, ChooseOnlyPrimaryAsSyncSourceWhenChainingIsDisallowed) {
                         OpTime(Timestamp(0, 0), 0),
                         Milliseconds(300));
     ASSERT_EQUALS(2, getCurrentPrimaryIndex());
+
+    // h3 is primary, but its last applied isn't as up-to-date as ours, so it cannot be chosen
+    // as the sync source.
+    ASSERT_EQUALS(HostAndPort(),
+                  getTopoCoord().chooseNewSyncSource(
+                      now()++,
+                      OpTime(Timestamp(10, 0), 0),
+                      TopologyCoordinator::ChainingPreference::kUseConfiguration));
+    ASSERT_EQUALS(HostAndPort(), getTopoCoord().getSyncSourceAddress());
+
+    // Update the primary's position.
+    heartbeatFromMember(HostAndPort("h3"),
+                        "rs0",
+                        MemberState::RS_PRIMARY,
+                        OpTime(Timestamp(10, 0), 0),
+                        Milliseconds(300));
 
     // h3 is primary and should be chosen as the sync source when we are not in catch-up mode,
     // despite being further away than h2 and the primary (h3) being behind our most recently
@@ -1773,48 +1789,6 @@ TEST_F(TopoCoordTest, ReplSetGetStatusWriteMajorityDifferentFromMajorityVoteCoun
     ASSERT_EQUALS(2, rsStatus["writeMajorityCount"].numberInt());
 }
 
-
-TEST_F(TopoCoordTest, ReplSetGetStatusIPs) {
-    BSONObj initialSyncStatus = BSON("failedInitialSyncAttempts" << 1);
-    std::string setName = "mySet";
-    auto now = Date_t::fromMillisSinceEpoch(100);
-    auto originalIPv6Enabled = IPv6Enabled();
-    ON_BLOCK_EXIT([&] { enableIPv6(originalIPv6Enabled); });
-
-    auto testIP = [&](const std::string& hostAndIP) -> std::string {
-        // Test framework requires that time moves forward.
-        now += Milliseconds(10);
-        updateConfig(BSON("_id" << setName << "version" << 1 << "members"
-                                << BSON_ARRAY(BSON("_id" << 0 << "host" << hostAndIP))),
-                     0,
-                     now);
-
-        BSONObjBuilder statusBuilder;
-        Status resultStatus(ErrorCodes::InternalError, "prepareStatusResponse didn't set result");
-        getTopoCoord().prepareStatusResponse({}, &statusBuilder, &resultStatus);
-        ASSERT_OK(resultStatus);
-        BSONObj rsStatus = statusBuilder.obj();
-        unittest::log() << rsStatus;
-        auto elem = rsStatus["members"].Array()[0]["ip"];
-        return elem.isNull() ? "null" : elem.String();
-    };
-
-    // We can't rely on any hostname like mongodb.org that requires DNS from the CI machine, test
-    // localhost and IP literals.
-    enableIPv6(false);
-    ASSERT_EQUALS("127.0.0.1", testIP("localhost:1234"));
-    enableIPv6(true);
-    // localhost can resolve to IPv4 or IPv6 depending on precedence.
-    auto localhostIP = testIP("localhost:1234");
-    if (localhostIP != "127.0.0.1" && localhostIP != "::1") {
-        FAIL(str::stream() << "Expected localhost IP to be 127.0.0.1 or ::1, not " << localhostIP);
-    }
-
-    ASSERT_EQUALS("1.2.3.4", testIP("1.2.3.4:1234"));
-    ASSERT_EQUALS("::1", testIP("[::1]:1234"));
-    ASSERT_EQUALS("null", testIP("test0:1234"));
-}
-
 TEST_F(TopoCoordTest, NodeReturnsInvalidReplicaSetConfigInResponseToGetStatusWhenAbsentFromConfig) {
     // This test starts by configuring a TopologyCoordinator to NOT be a member of a 3 node
     // replica set. Then running prepareStatusResponse should fail.
@@ -2510,7 +2484,8 @@ TEST_F(TopoCoordTest, NodeDoesNotGrantVotesToTwoDifferentNodesInTheSameTerm) {
     args.initialize(BSON("replSetRequestVotes" << 1 << "setName"
                                                << "rs0"
                                                << "term" << 1LL << "candidateIndex" << 0LL
-                                               << "configVersion" << 1LL << "lastCommittedOp"
+                                               << "configVersion" << 1LL << "configTerm" << 1LL
+                                               << "lastCommittedOp"
                                                << BSON("ts" << Timestamp(10, 0) << "term" << 0LL)))
         .transitional_ignore();
     ReplSetRequestVotesResponse response;
@@ -2524,7 +2499,8 @@ TEST_F(TopoCoordTest, NodeDoesNotGrantVotesToTwoDifferentNodesInTheSameTerm) {
         .initialize(BSON("replSetRequestVotes" << 1 << "setName"
                                                << "rs0"
                                                << "term" << 1LL << "candidateIndex" << 1LL
-                                               << "configVersion" << 1LL << "lastCommittedOp"
+                                               << "configVersion" << 1LL << "configTerm" << 1LL
+                                               << "lastCommittedOp"
                                                << BSON("ts" << Timestamp(10, 0) << "term" << 0LL)))
         .transitional_ignore();
     ReplSetRequestVotesResponse response2;
@@ -2535,6 +2511,39 @@ TEST_F(TopoCoordTest, NodeDoesNotGrantVotesToTwoDifferentNodesInTheSameTerm) {
                   response2.getReason());
     ASSERT_FALSE(response2.getVoteGranted());
 }
+
+TEST_F(TopoCoordTest, UpdateLastCommittedInPrevConfigSetsToLastCommittedOpTime) {
+    updateConfig(BSON("_id"
+                      << "rs0"
+                      << "version" << 1 << "members"
+                      << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                               << "host1:27017")
+                                    << BSON("_id" << 2 << "host"
+                                                  << "host2:27017"))),
+                 0);
+
+    // Make sure the lastCommittedInPrevConfig is set to be the current committed optime.
+    const OpTime commitPoint1 = OpTime({10, 0}, 1);
+    makeSelfPrimary(Timestamp(1, 0));
+    topoCoordSetMyLastAppliedOpTime(commitPoint1, Date_t(), false);
+    topoCoordSetMyLastDurableOpTime(commitPoint1, Date_t(), false);
+    topoCoordAdvanceLastCommittedOpTime(commitPoint1);
+    getTopoCoord().updateLastCommittedInPrevConfig();
+    ASSERT_EQ(commitPoint1, getTopoCoord().getLastCommittedInPrevConfig());
+
+    // Should not change.
+    getTopoCoord().updateLastCommittedInPrevConfig();
+    ASSERT_EQ(commitPoint1, getTopoCoord().getLastCommittedInPrevConfig());
+
+    // Update commit point again.
+    const OpTime commitPoint2 = OpTime({11, 0}, 1);
+    topoCoordSetMyLastAppliedOpTime(commitPoint2, Date_t(), false);
+    topoCoordSetMyLastDurableOpTime(commitPoint2, Date_t(), false);
+    topoCoordAdvanceLastCommittedOpTime(commitPoint2);
+    getTopoCoord().updateLastCommittedInPrevConfig();
+    ASSERT_EQ(commitPoint2, getTopoCoord().getLastCommittedInPrevConfig());
+}
+
 
 TEST_F(TopoCoordTest, DryRunVoteRequestShouldNotPreventSubsequentDryRunsForThatTerm) {
     updateConfig(BSON("_id"
@@ -2555,7 +2564,7 @@ TEST_F(TopoCoordTest, DryRunVoteRequestShouldNotPreventSubsequentDryRunsForThatT
                                                << "rs0"
                                                << "dryRun" << true << "term" << 1LL
                                                << "candidateIndex" << 0LL << "configVersion" << 1LL
-                                               << "lastCommittedOp"
+                                               << "configTerm" << 1LL << "lastCommittedOp"
                                                << BSON("ts" << Timestamp(10, 0) << "term" << 0LL)))
         .transitional_ignore();
     ReplSetRequestVotesResponse response;
@@ -2571,7 +2580,7 @@ TEST_F(TopoCoordTest, DryRunVoteRequestShouldNotPreventSubsequentDryRunsForThatT
                                                << "rs0"
                                                << "dryRun" << true << "term" << 1LL
                                                << "candidateIndex" << 0LL << "configVersion" << 1LL
-                                               << "lastCommittedOp"
+                                               << "configTerm" << 1LL << "lastCommittedOp"
                                                << BSON("ts" << Timestamp(10, 0) << "term" << 0LL)))
         .transitional_ignore();
     ReplSetRequestVotesResponse response2;
@@ -2587,7 +2596,7 @@ TEST_F(TopoCoordTest, DryRunVoteRequestShouldNotPreventSubsequentDryRunsForThatT
                                                << "rs0"
                                                << "dryRun" << false << "term" << 1LL
                                                << "candidateIndex" << 0LL << "configVersion" << 1LL
-                                               << "lastCommittedOp"
+                                               << "configTerm" << 1LL << "lastCommittedOp"
                                                << BSON("ts" << Timestamp(10, 0) << "term" << 0LL)))
         .transitional_ignore();
     ReplSetRequestVotesResponse response3;
@@ -2603,7 +2612,7 @@ TEST_F(TopoCoordTest, DryRunVoteRequestShouldNotPreventSubsequentDryRunsForThatT
                                                << "rs0"
                                                << "dryRun" << false << "term" << 1LL
                                                << "candidateIndex" << 0LL << "configVersion" << 1LL
-                                               << "lastCommittedOp"
+                                               << "configTerm" << 1LL << "lastCommittedOp"
                                                << BSON("ts" << Timestamp(10, 0) << "term" << 0LL)))
         .transitional_ignore();
     ReplSetRequestVotesResponse response4;
@@ -2633,7 +2642,7 @@ TEST_F(TopoCoordTest, VoteRequestShouldNotPreventDryRunsForThatTerm) {
                                                << "rs0"
                                                << "dryRun" << false << "term" << 1LL
                                                << "candidateIndex" << 0LL << "configVersion" << 1LL
-                                               << "lastCommittedOp"
+                                               << "configTerm" << 1LL << "lastCommittedOp"
                                                << BSON("ts" << Timestamp(10, 0) << "term" << 0LL)))
         .transitional_ignore();
     ReplSetRequestVotesResponse response;
@@ -2649,7 +2658,7 @@ TEST_F(TopoCoordTest, VoteRequestShouldNotPreventDryRunsForThatTerm) {
                                                << "rs0"
                                                << "dryRun" << false << "term" << 1LL
                                                << "candidateIndex" << 0LL << "configVersion" << 1LL
-                                               << "lastCommittedOp"
+                                               << "configTerm" << 1LL << "lastCommittedOp"
                                                << BSON("ts" << Timestamp(10, 0) << "term" << 0LL)))
         .transitional_ignore();
     ReplSetRequestVotesResponse response2;
@@ -2678,7 +2687,8 @@ TEST_F(TopoCoordTest, NodeDoesNotGrantVoteWhenReplSetNameDoesNotMatch) {
     args.initialize(BSON("replSetRequestVotes" << 1 << "setName"
                                                << "wrongName"
                                                << "term" << 1LL << "candidateIndex" << 0LL
-                                               << "configVersion" << 1LL << "lastCommittedOp"
+                                               << "configVersion" << 1LL << "configTerm" << 1LL
+                                               << "lastCommittedOp"
                                                << BSON("ts" << Timestamp(10, 0) << "term" << 0LL)))
         .transitional_ignore();
     ReplSetRequestVotesResponse response;
@@ -2688,10 +2698,10 @@ TEST_F(TopoCoordTest, NodeDoesNotGrantVoteWhenReplSetNameDoesNotMatch) {
     ASSERT_FALSE(response.getVoteGranted());
 }
 
-TEST_F(TopoCoordTest, NodeDoesNotGrantVoteWhenConfigVersionDoesNotMatch) {
+TEST_F(TopoCoordTest, NodeDoesNotGrantVoteWhenConfigVersionIsLower) {
     updateConfig(BSON("_id"
                       << "rs0"
-                      << "version" << 1 << "members"
+                      << "version" << 1 << "term" << 1LL << "members"
                       << BSON_ARRAY(BSON("_id" << 10 << "host"
                                                << "hself")
                                     << BSON("_id" << 20 << "host"
@@ -2706,13 +2716,47 @@ TEST_F(TopoCoordTest, NodeDoesNotGrantVoteWhenConfigVersionDoesNotMatch) {
     args.initialize(BSON("replSetRequestVotes" << 1 << "setName"
                                                << "rs0"
                                                << "term" << 1LL << "candidateIndex" << 1LL
-                                               << "configVersion" << 0LL << "lastCommittedOp"
+                                               << "configVersion" << 0LL << "configTerm" << 1LL
+                                               << "lastCommittedOp"
                                                << BSON("ts" << Timestamp(10, 0) << "term" << 0LL)))
         .transitional_ignore();
     ReplSetRequestVotesResponse response;
 
     getTopoCoord().processReplSetRequestVotes(args, &response);
-    ASSERT_EQUALS("candidate's config version (0) differs from mine (1)", response.getReason());
+    ASSERT_EQUALS(
+        "ignoring term of -1 for comparison, candidate's version in config(term, version): (1, 0) "
+        "is lower than mine (1, 1)",
+        response.getReason());
+    ASSERT_FALSE(response.getVoteGranted());
+}
+
+TEST_F(TopoCoordTest, NodeDoesNotGrantVoteWhenConfigTermIsLower) {
+    updateConfig(BSON("_id"
+                      << "rs0"
+                      << "version" << 1 << "term" << 2LL << "members"
+                      << BSON_ARRAY(BSON("_id" << 10 << "host"
+                                               << "hself")
+                                    << BSON("_id" << 20 << "host"
+                                                  << "h2")
+                                    << BSON("_id" << 30 << "host"
+                                                  << "h3"))),
+                 0);
+    setSelfMemberState(MemberState::RS_SECONDARY);
+
+    // lower configTerm
+    ReplSetRequestVotesArgs args;
+    args.initialize(BSON("replSetRequestVotes" << 1 << "setName"
+                                               << "rs0"
+                                               << "term" << 1LL << "candidateIndex" << 1LL
+                                               << "configVersion" << 1LL << "configTerm" << 1LL
+                                               << "lastCommittedOp"
+                                               << BSON("ts" << Timestamp(10, 0) << "term" << 0LL)))
+        .transitional_ignore();
+    ReplSetRequestVotesResponse response;
+
+    getTopoCoord().processReplSetRequestVotes(args, &response);
+    ASSERT_EQUALS("candidate's term in config(term, version): (1, 1) is lower than mine (2, 1)",
+                  response.getReason());
     ASSERT_FALSE(response.getVoteGranted());
 }
 
@@ -2738,7 +2782,8 @@ TEST_F(TopoCoordTest, NodeDoesNotGrantVoteWhenTermIsStale) {
     args.initialize(BSON("replSetRequestVotes" << 1 << "setName"
                                                << "rs0"
                                                << "term" << 1LL << "candidateIndex" << 1LL
-                                               << "configVersion" << 1LL << "lastCommittedOp"
+                                               << "configVersion" << 1LL << "configTerm" << 1LL
+                                               << "lastCommittedOp"
                                                << BSON("ts" << Timestamp(10, 0) << "term" << 0LL)))
         .transitional_ignore();
     ReplSetRequestVotesResponse response;
@@ -2768,7 +2813,8 @@ TEST_F(TopoCoordTest, NodeDoesNotGrantVoteWhenOpTimeIsStale) {
     args.initialize(BSON("replSetRequestVotes" << 1 << "setName"
                                                << "rs0"
                                                << "term" << 3LL << "candidateIndex" << 1LL
-                                               << "configVersion" << 1LL << "lastCommittedOp"
+                                               << "configVersion" << 1LL << "configTerm" << 1LL
+                                               << "lastCommittedOp"
                                                << BSON("ts" << Timestamp(10, 0) << "term" << 0LL)))
         .transitional_ignore();
     ReplSetRequestVotesResponse response;
@@ -2804,7 +2850,8 @@ TEST_F(TopoCoordTest, NodeDoesNotGrantDryRunVoteWhenReplSetNameDoesNotMatch) {
         .initialize(BSON("replSetRequestVotes" << 1 << "setName"
                                                << "rs0"
                                                << "term" << 1LL << "candidateIndex" << 0LL
-                                               << "configVersion" << 1LL << "lastCommittedOp"
+                                               << "configVersion" << 1LL << "configTerm" << 1LL
+                                               << "lastCommittedOp"
                                                << BSON("ts" << Timestamp(10, 0) << "term" << 0LL)))
         .transitional_ignore();
     ReplSetRequestVotesResponse responseForRealVote;
@@ -2820,7 +2867,7 @@ TEST_F(TopoCoordTest, NodeDoesNotGrantDryRunVoteWhenReplSetNameDoesNotMatch) {
                                                << "wrongName"
                                                << "dryRun" << true << "term" << 2LL
                                                << "candidateIndex" << 0LL << "configVersion" << 1LL
-                                               << "lastCommittedOp"
+                                               << "configTerm" << 1LL << "lastCommittedOp"
                                                << BSON("ts" << Timestamp(10, 0) << "term" << 0LL)))
         .transitional_ignore();
     ReplSetRequestVotesResponse response;
@@ -2831,10 +2878,10 @@ TEST_F(TopoCoordTest, NodeDoesNotGrantDryRunVoteWhenReplSetNameDoesNotMatch) {
     ASSERT_FALSE(response.getVoteGranted());
 }
 
-TEST_F(TopoCoordTest, NodeDoesNotGrantDryRunVoteWhenConfigVersionDoesNotMatch) {
+TEST_F(TopoCoordTest, NodeDoesNotGrantDryRunVoteWhenConfigVersionIsLower) {
     updateConfig(BSON("_id"
                       << "rs0"
-                      << "version" << 1 << "members"
+                      << "version" << 1 << "term" << 1LL << "members"
                       << BSON_ARRAY(BSON("_id" << 10 << "host"
                                                << "hself")
                                     << BSON("_id" << 20 << "host"
@@ -2852,7 +2899,8 @@ TEST_F(TopoCoordTest, NodeDoesNotGrantDryRunVoteWhenConfigVersionDoesNotMatch) {
         .initialize(BSON("replSetRequestVotes" << 1 << "setName"
                                                << "rs0"
                                                << "term" << 1LL << "candidateIndex" << 0LL
-                                               << "configVersion" << 1LL << "lastCommittedOp"
+                                               << "configVersion" << 1LL << "configTerm" << 1LL
+                                               << "lastCommittedOp"
                                                << BSON("ts" << Timestamp(10, 0) << "term" << 0LL)))
         .transitional_ignore();
     ReplSetRequestVotesResponse responseForRealVote;
@@ -2868,13 +2916,16 @@ TEST_F(TopoCoordTest, NodeDoesNotGrantDryRunVoteWhenConfigVersionDoesNotMatch) {
                                                << "rs0"
                                                << "dryRun" << true << "term" << 2LL
                                                << "candidateIndex" << 1LL << "configVersion" << 0LL
-                                               << "lastCommittedOp"
+                                               << "configTerm" << 1LL << "lastCommittedOp"
                                                << BSON("ts" << Timestamp(10, 0) << "term" << 0LL)))
         .transitional_ignore();
     ReplSetRequestVotesResponse response;
 
     getTopoCoord().processReplSetRequestVotes(args, &response);
-    ASSERT_EQUALS("candidate's config version (0) differs from mine (1)", response.getReason());
+    ASSERT_EQUALS(
+        "ignoring term of -1 for comparison, candidate's version in config(term, version): (1, 0) "
+        "is lower than mine (1, 1)",
+        response.getReason());
     ASSERT_EQUALS(1, response.getTerm());
     ASSERT_FALSE(response.getVoteGranted());
 }
@@ -2900,7 +2951,8 @@ TEST_F(TopoCoordTest, NodeDoesNotGrantDryRunVoteWhenTermIsStale) {
         .initialize(BSON("replSetRequestVotes" << 1 << "setName"
                                                << "rs0"
                                                << "term" << 1LL << "candidateIndex" << 0LL
-                                               << "configVersion" << 1LL << "lastCommittedOp"
+                                               << "configVersion" << 1LL << "configTerm" << 1LL
+                                               << "lastCommittedOp"
                                                << BSON("ts" << Timestamp(10, 0) << "term" << 0LL)))
         .transitional_ignore();
     ReplSetRequestVotesResponse responseForRealVote;
@@ -2915,7 +2967,7 @@ TEST_F(TopoCoordTest, NodeDoesNotGrantDryRunVoteWhenTermIsStale) {
                                                << "rs0"
                                                << "dryRun" << true << "term" << 0LL
                                                << "candidateIndex" << 1LL << "configVersion" << 1LL
-                                               << "lastCommittedOp"
+                                               << "configTerm" << 1LL << "lastCommittedOp"
                                                << BSON("ts" << Timestamp(10, 0) << "term" << 0LL)))
         .transitional_ignore();
     ReplSetRequestVotesResponse response;
@@ -2924,6 +2976,40 @@ TEST_F(TopoCoordTest, NodeDoesNotGrantDryRunVoteWhenTermIsStale) {
     ASSERT_EQUALS("candidate's term (0) is lower than mine (1)", response.getReason());
     ASSERT_EQUALS(1, response.getTerm());
     ASSERT_FALSE(response.getVoteGranted());
+}
+
+TEST_F(TopoCoordTest, NodeGrantsVoteWhenTermIsHigherButConfigVersionIsLower) {
+    updateConfig(BSON("_id"
+                      << "rs0"
+                      << "version" << 2 << "term" << 1LL << "members"
+                      << BSON_ARRAY(BSON("_id" << 10 << "host"
+                                               << "hself")
+                                    << BSON("_id" << 20 << "host"
+                                                  << "h2")
+                                    << BSON("_id" << 30 << "host"
+                                                  << "h3"))),
+                 0);
+    setSelfMemberState(MemberState::RS_SECONDARY);
+
+    // set term to 2
+    ASSERT(TopologyCoordinator::UpdateTermResult::kUpdatedTerm ==
+           getTopoCoord().updateTerm(2, now()));
+
+    // mismatched configVersion
+    ReplSetRequestVotesArgs args;
+    args.initialize(BSON("replSetRequestVotes" << 1 << "setName"
+                                               << "rs0"
+                                               << "term" << 2LL << "candidateIndex" << 1LL
+                                               << "configVersion" << 1LL << "configTerm" << 2LL
+                                               << "lastCommittedOp"
+                                               << BSON("ts" << Timestamp(10, 0) << "term" << 0LL)))
+        .transitional_ignore();
+    ReplSetRequestVotesResponse response;
+
+    getTopoCoord().processReplSetRequestVotes(args, &response);
+    // Candidates config(t, v) is (2, 1) and our config is (1, 2). Even though the candidate's
+    // config version is lower, we grant our vote because the candidate's config term is higher.
+    ASSERT_TRUE(response.getVoteGranted());
 }
 
 TEST_F(TopoCoordTest, GrantDryRunVoteEvenWhenTermHasBeenSeen) {
@@ -2947,7 +3033,8 @@ TEST_F(TopoCoordTest, GrantDryRunVoteEvenWhenTermHasBeenSeen) {
         .initialize(BSON("replSetRequestVotes" << 1 << "setName"
                                                << "rs0"
                                                << "term" << 1LL << "candidateIndex" << 0LL
-                                               << "configVersion" << 1LL << "lastCommittedOp"
+                                               << "configVersion" << 1LL << "configTerm" << 1LL
+                                               << "lastCommittedOp"
                                                << BSON("ts" << Timestamp(10, 0) << "term" << 0LL)))
         .transitional_ignore();
     ReplSetRequestVotesResponse responseForRealVote;
@@ -2963,7 +3050,7 @@ TEST_F(TopoCoordTest, GrantDryRunVoteEvenWhenTermHasBeenSeen) {
                                                << "rs0"
                                                << "dryRun" << true << "term" << 1LL
                                                << "candidateIndex" << 1LL << "configVersion" << 1LL
-                                               << "lastCommittedOp"
+                                               << "configTerm" << 1LL << "lastCommittedOp"
                                                << BSON("ts" << Timestamp(10, 0) << "term" << 0LL)))
         .transitional_ignore();
     ReplSetRequestVotesResponse response;
@@ -2995,7 +3082,8 @@ TEST_F(TopoCoordTest, DoNotGrantDryRunVoteWhenOpTimeIsStale) {
         .initialize(BSON("replSetRequestVotes" << 1 << "setName"
                                                << "rs0"
                                                << "term" << 1LL << "candidateIndex" << 0LL
-                                               << "configVersion" << 1LL << "lastCommittedOp"
+                                               << "configVersion" << 1LL << "configTerm" << 1LL
+                                               << "lastCommittedOp"
                                                << BSON("ts" << Timestamp(10, 0) << "term" << 0LL)))
         .transitional_ignore();
     ReplSetRequestVotesResponse responseForRealVote;
@@ -3011,7 +3099,7 @@ TEST_F(TopoCoordTest, DoNotGrantDryRunVoteWhenOpTimeIsStale) {
                                                << "rs0"
                                                << "dryRun" << true << "term" << 3LL
                                                << "candidateIndex" << 1LL << "configVersion" << 1LL
-                                               << "lastCommittedOp"
+                                               << "configTerm" << 1LL << "lastCommittedOp"
                                                << BSON("ts" << Timestamp(10, 0) << "term" << 0LL)))
         .transitional_ignore();
     ReplSetRequestVotesResponse response;
@@ -5778,12 +5866,12 @@ public:
     virtual void setUp() {
         HeartbeatResponseTestV1::setUp();
         // set verbosity as high as the highest verbosity log message we'd like to check for
-        logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogSeverity::Debug(3));
+        setMinimumLoggedSeverity(logger::LogSeverity::Debug(3));
     }
 
     virtual void tearDown() {
         HeartbeatResponseTestV1::tearDown();
-        logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogSeverity::Log());
+        setMinimumLoggedSeverity(logger::LogSeverity::Log());
     }
 };
 

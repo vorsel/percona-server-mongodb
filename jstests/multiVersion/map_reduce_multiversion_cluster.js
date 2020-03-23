@@ -10,8 +10,9 @@ TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 
 load("jstests/multiVersion/libs/multi_cluster.js");  // For upgradeCluster.
 
-const dbName = "test";
-const collName = jsTestName();
+const testName = "map_reduce_multiversion_cluster";
+const dbName = "test_" + testName;
+const collName = testName;
 
 // Start a sharded cluster in which all mongod and mongos processes are "last-stable" binVersion.
 var st = new ShardingTest({
@@ -169,13 +170,6 @@ runValidMrTests(sourceColl);
 //
 st.upgradeCluster("latest", {upgradeShards: true, upgradeConfigs: true, upgradeMongos: false});
 
-// Now that we've upgraded the shards to the latest binary version, switch on the query knob to
-// enable MR in agg.
-assert.commandWorked(st.rs0.getPrimary().getDB(dbName).adminCommand(
-    {setParameter: 1, internalQueryUseAggMapReduce: true}));
-assert.commandWorked(st.rs1.getPrimary().getDB(dbName).adminCommand(
-    {setParameter: 1, internalQueryUseAggMapReduce: true}));
-
 //
 // Test against a mixed version cluster where the shards are upgraded to the latest binary but still
 // in FCV 4.2. Mongos is still on the 4.2 binary version.
@@ -188,8 +182,6 @@ runValidMrTests(sourceColl);
 st.upgradeCluster("latest", {upgradeShards: false, upgradeConfigs: false, upgradeMongos: true});
 mongosConn = st.s;
 sourceColl = mongosConn.getDB(dbName)[collName];
-assert.commandWorked(
-    mongosConn.getDB(dbName).adminCommand({setParameter: 1, internalQueryUseAggMapReduce: true}));
 
 //
 // Test against a cluster where both mongos and the shards are upgraded to the latest binary

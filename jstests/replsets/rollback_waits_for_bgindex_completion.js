@@ -3,6 +3,7 @@
  * starting the rollback process. Only applies to Recoverable Rollback via WiredTiger checkpoints.
  *
  * @tags: [
+ *     requires_fcv_44,
  *     requires_wiredtiger,
  *     requires_journaling,
  *     requires_majority_read_concern,
@@ -11,7 +12,6 @@
 (function() {
 'use strict';
 
-load('jstests/libs/check_log.js');
 load("jstests/replsets/rslib.js");
 load('jstests/replsets/libs/rollback_test.js');
 
@@ -46,6 +46,11 @@ function CommonOps(node) {
     // Create a collection on both data bearing nodes, so we can create an index on it.
     const testDB = node.getDB(dbName);
     assert.commandWorked(testDB.createCollection(collName));
+
+    // Insert document into collection to avoid optimization for index creation on an empty
+    // collection. This allows us to pause index builds on the collection using a fail point.
+    const testColl = testDB.getCollection(collName);
+    assert.commandWorked(testColl.insert({a: 1}));
 
     // Hang background index builds.
     hangIndexBuildsFailpoint(node, "alwaysOn");

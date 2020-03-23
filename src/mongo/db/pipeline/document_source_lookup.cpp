@@ -42,6 +42,7 @@
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/query/query_knobs_gen.h"
+#include "mongo/platform/overflow_arithmetic.h"
 #include "mongo/util/fail_point.h"
 
 namespace mongo {
@@ -202,6 +203,7 @@ StageConstraints DocumentSourceLookUp::constraints(Pipeline::SplitState) const {
                                  LookupRequirement::kAllowed);
 
     constraints.canSwapWithMatch = true;
+    constraints.canSwapWithLimitAndSample = !_unwindSrc;
     return constraints;
 }
 
@@ -254,16 +256,19 @@ DocumentSource::GetNextResult DocumentSourceLookUp::doGetNext() {
     auto pipeline = buildPipeline(inputDoc);
 
     std::vector<Value> results;
-    int objsize = 0;
+    long long objsize = 0;
     const auto maxBytes = internalLookupStageIntermediateDocumentMaxSizeBytes.load();
+
     while (auto result = pipeline->getNext()) {
-        objsize += result->getApproximateSize();
+        long long safeSum = 0;
+        bool hasOverflowed = overflow::add(objsize, result->getApproximateSize(), &safeSum);
         uassert(4568,
                 str::stream() << "Total size of documents in " << _fromNs.coll()
                               << " matching pipeline's $lookup stage exceeds " << maxBytes
                               << " bytes",
 
-                objsize <= maxBytes);
+                !hasOverflowed && objsize <= maxBytes);
+        objsize = safeSum;
         results.emplace_back(std::move(*result));
     }
     _usedDisk = _usedDisk || pipeline->usedDisk();
@@ -724,12 +729,12 @@ DepsTracker::State DocumentSourceLookUp::getDependencies(DepsTracker* deps) cons
         // We will use the introspection pipeline which we prebuilt during construction.
         invariant(_resolvedIntrospectionPipeline);
 
-        // We are not attempting to enforce that any referenced metadata are in fact available,
+        // We are not attempting to enforce that any referenced metadata are in fact unavailable,
         // this is done elsewhere. We only need to know what variable dependencies exist in the
         // subpipeline for the top-level pipeline. So without knowledge of what metadata is in fact
-        // available, we "lie" and say that all metadata is available to avoid tripping any
+        // unavailable, we "lie" and say that all metadata is available to avoid tripping any
         // assertions.
-        DepsTracker subDeps(DepsTracker::kAllMetadata);
+        DepsTracker subDeps(DepsTracker::kNoMetadata);
 
         // Get the subpipeline dependencies. Subpipeline stages may reference both 'let' variables
         // declared by this $lookup and variables declared externally.

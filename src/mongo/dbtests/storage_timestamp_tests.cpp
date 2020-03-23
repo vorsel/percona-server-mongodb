@@ -145,8 +145,8 @@ BSONCollectionCatalogEntry::IndexMetaData getIndexMetaData(
 
 class DoNothingOplogApplierObserver : public repl::OplogApplier::Observer {
 public:
-    void onBatchBegin(const repl::OplogApplier::Operations&) final {}
-    void onBatchEnd(const StatusWith<repl::OpTime>&, const repl::OplogApplier::Operations&) final {}
+    void onBatchBegin(const std::vector<repl::OplogEntry>&) final {}
+    void onBatchEnd(const StatusWith<repl::OpTime>&, const std::vector<repl::OplogEntry>&) final {}
 };
 
 class StorageTimestampTest {
@@ -1626,7 +1626,7 @@ public:
         expectedMinValidWithUnsetFlag.setAppliedThrough(repl::OpTime(presentTs, presentTerm));
 
         assertMinValidDocumentAtTimestamp(nss, nullTs, expectedMinValidWithUnsetFlag);
-        assertMinValidDocumentAtTimestamp(nss, pastTs, expectedMinValidWithSetFlag);
+        assertMinValidDocumentAtTimestamp(nss, pastTs, expectedMinValidWithUnsetFlag);
         assertMinValidDocumentAtTimestamp(nss, presentTs, expectedMinValidWithUnsetFlag);
         assertMinValidDocumentAtTimestamp(nss, futureTs, expectedMinValidWithUnsetFlag);
     }
@@ -2157,30 +2157,45 @@ public:
             client.createIndexes(nss.ns(), indexes);
         }
 
-        const Timestamp indexCreateInitTs = queryOplog(BSON("op"
-                                                            << "c"
-                                                            << "o.startIndexBuild" << nss.coll()
-                                                            << "o.indexes.0.name"
-                                                            << "a_1"))["ts"]
-                                                .timestamp();
-
         // Two phase index builds do not emit an createIndexes oplog entry for each index.
+        Timestamp indexCreateInitTs;
         Timestamp indexAComplete;
-        if (!IndexBuildsCoordinator::get(_opCtx)->supportsTwoPhaseIndexBuild()) {
+        Timestamp indexBComplete;
+        if (IndexBuildsCoordinator::supportsTwoPhaseIndexBuild()) {
+            indexCreateInitTs =
+                queryOplog(BSON("op"
+                                << "c"
+                                << "o.startIndexBuild" << nss.coll() << "o.indexes.0.name"
+                                << "a_1"))["ts"]
+                    .timestamp();
+            auto commitIndexBuildTs =
+                queryOplog(BSON("op"
+                                << "c"
+                                << "o.commitIndexBuild" << nss.coll() << "o.indexes.0.name"
+                                << "a_1"))["ts"]
+                    .timestamp();
+            indexBComplete = commitIndexBuildTs;
+        } else {
+            indexCreateInitTs =
+                queryOplog(BSON("op"
+                                << "n"
+                                << "ns"
+                                << ""
+                                << "o.msg"
+                                << std::string(str::stream()
+                                               << "Creating indexes. Coll: " << nss)))["ts"]
+                    .timestamp();
             indexAComplete = queryOplog(BSON("op"
                                              << "c"
                                              << "o.createIndexes" << nss.coll() << "o.name"
                                              << "a_1"))["ts"]
                                  .timestamp();
+            indexBComplete = queryOplog(BSON("op"
+                                             << "c"
+                                             << "o.createIndexes" << nss.coll() << "o.name"
+                                             << "b_1"))["ts"]
+                                 .timestamp();
         }
-
-        auto commitIndexBuildTs = queryOplog(BSON("op"
-                                                  << "c"
-                                                  << "o.commitIndexBuild" << nss.coll()
-                                                  << "o.indexes.0.name"
-                                                  << "a_1"))["ts"]
-                                      .timestamp();
-        const auto indexBComplete = commitIndexBuildTs;
 
         AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_S);
         RecordId catalogId = autoColl.getCollection()->getCatalogId();
@@ -2271,28 +2286,23 @@ public:
             BSON("renameCollection" << nss.ns() << "to" << renamedNss.ns() << "dropTarget" << true),
             renameResult);
 
-        const auto commitIndexBuildDocument = queryOplog(
-            BSON("ns" << renamedNss.db() + ".$cmd"
-                      << "o.commitIndexBuild" << BSON("$exists" << true) << "o.indexes.0.name"
-                      << "a_1"
-                      << "o.indexes.1.name"
-                      << "b_1"));
-
-        // Find index creation timestamps.
-        const auto commitIndexBuildString =
-            commitIndexBuildDocument["o"].embeddedObject()["commitIndexBuild"].toString();
-        const std::string filterString = "commitIndexBuild: \"";
-        const NamespaceString tmpName(
-            renamedNss.db(),
-            commitIndexBuildString.substr(filterString.size(),
-                                          commitIndexBuildString.size() - filterString.size() - 1));
-
+        NamespaceString tmpName;
+        Timestamp indexCommitTs;
+        // Empty temporary collections generate createIndexes oplog entry even if the node
+        // supports 2 phase index build.
+        const auto createIndexesDocument =
+            queryOplog(BSON("ns" << renamedNss.db() + ".$cmd"
+                                 << "o.createIndexes" << BSON("$exists" << true) << "o.name"
+                                 << "b_1"));
+        const auto tmpCollName =
+            createIndexesDocument.getObjectField("o").getStringField("createIndexes");
+        tmpName = NamespaceString(renamedNss.db(), tmpCollName);
+        indexCommitTs = createIndexesDocument["ts"].timestamp();
         const Timestamp indexCreateInitTs = queryOplog(BSON("op"
                                                             << "c"
                                                             << "o.create" << tmpName.coll()))["ts"]
                                                 .timestamp();
 
-        const Timestamp indexCommitTs = commitIndexBuildDocument["ts"].timestamp();
 
         // We expect one new collection ident and one new index ident (the _id index) during this
         // rename.
@@ -2306,8 +2316,9 @@ public:
             durableCatalog, origIdents, /*expectedNewIndexIdents*/ 3, indexCommitTs);
 
         // Assert the 'a_1' and `b_1` indexes becomes ready at the last oplog entry time.
-        RecordId renamedCatalogId =
-            CollectionCatalog::get(_opCtx).lookupCollectionByNamespace(renamedNss)->getCatalogId();
+        RecordId renamedCatalogId = CollectionCatalog::get(_opCtx)
+                                        .lookupCollectionByNamespace(_opCtx, renamedNss)
+                                        ->getCatalogId();
         ASSERT_TRUE(getIndexMetaData(
                         getMetaDataAtTime(durableCatalog, renamedCatalogId, indexCommitTs), "a_1")
                         .ready);
@@ -2373,28 +2384,55 @@ public:
 
         // Confirm that startIndexBuild and abortIndexBuild oplog entries have been written to the
         // oplog.
-        auto indexStartDocument =
-            queryOplog(BSON("ns" << nss.db() + ".$cmd"
-                                 << "o.startIndexBuild" << nss.coll() << "o.indexes.0.name"
-                                 << "a_1"));
-        auto indexStartTs = indexStartDocument["ts"].timestamp();
-        auto indexAbortDocument =
-            queryOplog(BSON("ns" << nss.db() + ".$cmd"
-                                 << "o.abortIndexBuild" << nss.coll() << "o.indexes.0.name"
-                                 << "a_1"));
-        auto indexAbortTs = indexAbortDocument["ts"].timestamp();
+        Timestamp indexStartTs;
+        Timestamp indexAbortTs;
+        if (IndexBuildsCoordinator::supportsTwoPhaseIndexBuild()) {
+            auto indexStartDocument =
+                queryOplog(BSON("ns" << nss.db() + ".$cmd"
+                                     << "o.startIndexBuild" << nss.coll() << "o.indexes.0.name"
+                                     << "a_1"));
+            indexStartTs = indexStartDocument["ts"].timestamp();
+            auto indexAbortDocument =
+                queryOplog(BSON("ns" << nss.db() + ".$cmd"
+                                     << "o.abortIndexBuild" << nss.coll() << "o.indexes.0.name"
+                                     << "a_1"));
+            indexAbortTs = indexAbortDocument["ts"].timestamp();
+
+        } else {
+            auto indexStartDocument =
+                queryOplog(BSON("op"
+                                << "n"
+                                << "ns"
+                                << ""
+                                << "o.msg"
+                                << std::string(str::stream()
+                                               << "Creating indexes. Coll: " << nss)));
+            indexStartTs = indexStartDocument["ts"].timestamp();
+            // Set abort timestamp to some future value greater than the ghost timestamp used to
+            // remove the index from the mdb catalog.
+            indexAbortTs = _clock->reserveTicks(1).asTimestamp();
+        }
 
         // Check index state in catalog at oplog entry times for both startIndexBuild and
         // abortIndexBuild.
         AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_X);
         RecordId catalogId = autoColl.getCollection()->getCatalogId();
 
-        // We expect one new one new index ident during this index build.
-        assertRenamedCollectionIdentsAtTimestamp(
-            durableCatalog, origIdents, /*expectedNewIndexIdents*/ 1, indexStartTs);
-        ASSERT_FALSE(
-            getIndexMetaData(getMetaDataAtTime(durableCatalog, catalogId, indexStartTs), "a_1")
-                .ready);
+        if (IndexBuildsCoordinator::supportsTwoPhaseIndexBuild()) {
+            // We expect one new one new index ident during this index build.
+            assertRenamedCollectionIdentsAtTimestamp(
+                durableCatalog, origIdents, /*expectedNewIndexIdents*/ 1, indexStartTs);
+            ASSERT_FALSE(
+                getIndexMetaData(getMetaDataAtTime(durableCatalog, catalogId, indexStartTs), "a_1")
+                    .ready);
+        } else {
+            // In the absence of an abortIndexBuild oplog entry, the index entry will be removed
+            // from the mdb catalog using a ghost timestamp which should be equal to 'indexStartTs'.
+            // In this case, we won't be able to determine if the index entry is present with
+            // ready: false.
+            assertRenamedCollectionIdentsAtTimestamp(
+                durableCatalog, origIdents, /*expectedNewIndexIdents*/ 0, indexStartTs);
+        }
 
         // We expect all new idents to be removed after the index build has aborted.
         assertRenamedCollectionIdentsAtTimestamp(
@@ -2513,7 +2551,7 @@ public:
           _taskFuture(taskFuture) {}
 
     Status applyOplogBatchPerWorker(OperationContext* opCtx,
-                                    repl::MultiApplier::OperationPtrs* operationsToApply,
+                                    std::vector<const repl::OplogEntry*>* operationsToApply,
                                     WorkerMultikeyPathInfo* pathInfo) override;
 
 private:
@@ -2530,7 +2568,7 @@ private:
 // and this test case fails without crashing the entire suite.
 Status SecondaryReadsDuringBatchApplicationAreAllowedApplier::applyOplogBatchPerWorker(
     OperationContext* opCtx,
-    repl::MultiApplier::OperationPtrs* operationsToApply,
+    std::vector<const repl::OplogEntry*>* operationsToApply,
     WorkerMultikeyPathInfo* pathInfo) {
     if (!_testOpCtx->lockState()->isLockHeldForMode(resourceIdParallelBatchWriterMode, MODE_X)) {
         return {ErrorCodes::BadValue, "Batch applied was not holding PBWM lock in MODE_X"};
@@ -2797,30 +2835,20 @@ public:
         ASSERT_EQ(op.getTimestamp(), futureTs) << op.toBSON();
 
         // The index build emits three oplog entries.
-        auto indexStartTs = repl::OplogEntry(queryOplog(BSON("op"
-                                                             << "c"
-                                                             << "ns" << nss.getCommandNS().ns()
-                                                             << "o.startIndexBuild" << nss.coll()
-                                                             << "o.indexes.0.name"
-                                                             << "user_1_db_1")))
-                                .getTimestamp();
+        Timestamp indexStartTs;
         Timestamp indexCreateTs;
-        if (!IndexBuildsCoordinator::get(_opCtx)->supportsTwoPhaseIndexBuild()) {
-            indexCreateTs =
-                repl::OplogEntry(queryOplog(BSON("op"
-                                                 << "c"
-                                                 << "ns" << nss.getCommandNS().ns()
-                                                 << "o.createIndexes" << nss.coll() << "o.name"
-                                                 << "user_1_db_1")))
-                    .getTimestamp();
-        }
-        auto indexCompleteTs = repl::OplogEntry(queryOplog(BSON("op"
-                                                                << "c"
-                                                                << "ns" << nss.getCommandNS().ns()
-                                                                << "o.commitIndexBuild"
-                                                                << nss.coll() << "o.indexes.0.name"
-                                                                << "user_1_db_1")))
-                                   .getTimestamp();
+        Timestamp indexCompleteTs;
+        // Empty collections generate createIndexes oplog entry even if the node
+        // supports 2 phase index build.
+        indexStartTs = op.getTimestamp();
+        indexCreateTs =
+            repl::OplogEntry(queryOplog(BSON("op"
+                                             << "c"
+                                             << "ns" << nss.getCommandNS().ns() << "o.createIndexes"
+                                             << nss.coll() << "o.name"
+                                             << "user_1_db_1")))
+                .getTimestamp();
+        indexCompleteTs = indexCreateTs;
 
         assertNamespaceInIdents(nss, pastTs, false);
         assertNamespaceInIdents(nss, presentTs, false);

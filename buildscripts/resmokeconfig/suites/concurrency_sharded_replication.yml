@@ -1,5 +1,5 @@
 test_kind: fsm_workload_test
-use_in_multiversion_burn_in_tests: true
+use_in_multiversion: concurrency_sharded_replication_multiversion
 
 selector:
   roots:
@@ -105,8 +105,8 @@ selector:
   # router tries to commit, it may not know the full participant list.
   - jstests/concurrency/fsm_workloads/multi_statement_transaction_all_commands_same_session.js
 
-  # TODO SERVER-44652: Investigate and remove blacklist
-  - jstests/concurrency/fsm_workloads/agg_out.js
+  # SERVER-44160 Modify cleanupOrphaned to wait for overlapping ranges to finish
+  - jstests/concurrency/fsm_workloads/cleanupOrphanedWhileMigrating.js
 
   exclude_with_any_tags:
   - requires_replication

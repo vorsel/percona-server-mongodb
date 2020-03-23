@@ -71,6 +71,7 @@ functions:
         genny: ${genny_rev}
         workloads: ${workloads_rev}
         wtdevelop: ${wtdevelop_rev}
+        mongo-tools: ${mongo-tools_rev}
 
   "compile mongodb":
     # We create a virtual environment with the Python dependencies for compiling the server
@@ -95,6 +96,8 @@ functions:
           set -o errexit
           set -o verbose
 
+          mkdir -p mongodb/bin
+
           # We get the raw version string (r1.2.3-45-gabcdef) from git
           MONGO_VERSION=$(git describe --abbrev=7)
 
@@ -118,28 +121,33 @@ functions:
     - command: expansions.update
       params:
         file: src/compile_expansions.yml
+
     - command: shell.exec
       params:
-        working_dir: src/src/mongo/gotools/src/github.com/mongodb/mongo-tools
+        working_dir: src/mongo-tools/src/github.com/mongodb/mongo-tools
         script: |
           set -o verbose
           set -o errexit
+
           # make sure newlines in the scripts are handled correctly by windows
           if [ "Windows_NT" = "$OS" ]; then
             set -o igncr
           fi;
+
           # set_goenv provides set_goenv(), print_ldflags() and print_tags() used below
           . ./set_goenv.sh
           GOROOT="" set_goenv || exit
           go version
+
           build_tools="bsondump mongostat mongofiles mongoexport mongoimport mongorestore mongodump mongotop"
           if [ "${build_mongoreplay}" = "true" ]; then
               build_tools="$build_tools mongoreplay"
           fi
           for i in $build_tools; do
-              go build -ldflags "$(print_ldflags)" ${args} -tags "$(print_tags ${tooltags})" -o "../../../../../../mongo-tools/$i${exe|}" $i/main/$i.go
-              "../../../../../../mongo-tools/$i${exe|}" --version
+              go build -ldflags "$(print_ldflags)" ${args} -tags "$(print_tags ${tooltags})" -o "../../../../../mongodb/bin/$i${exe|}" $i/main/$i.go
+              "../../../../../mongodb/bin/$i${exe|}" --version
           done
+
     - command: shell.exec
       params:
         working_dir: src
@@ -147,14 +155,12 @@ functions:
           set -o errexit
           set -o verbose
           source "${workdir}/compile_venv/bin/activate"
-          python ./buildscripts/scons.py ${compile_flags|} ${scons_cache_args|} mongo${extension} --use-new-tools mongod${extension} mongos${extension} MONGO_VERSION=${version}
-          mkdir -p mongodb/bin
+          python ./buildscripts/scons.py ${compile_flags|} ${scons_cache_args|} mongo${extension} mongod${extension} mongos${extension} MONGO_VERSION=${version}
           mkdir -p mongodb/jstests/hooks
           mv mongo${extension|} mongodb/bin
           mv mongod${extension|} mongodb/bin
           mv mongos${extension|} mongodb/bin
           mv mongocryptd mongodb/bin || /bin/true
-          mv src/mongo-tools/* mongodb/bin
           if [ -d jstests/hooks ]
           then
             echo "Fetching JS test DB correctness checks from directory jstests"
@@ -212,6 +218,10 @@ functions:
         production: true
         authentication: ${authentication}
         overrides:
+          infrastructure_provisioning:
+            tfvars:
+              # This is currently only used by initialsync-logkeeper. It is empty and not used for other tests.
+              mongod_seeded_ebs_snapshot_id: ${snapshotId}
           workload_setup:
             local_repos:
               workloads: ../src/workloads/workloads
@@ -220,6 +230,8 @@ functions:
               tpcc: ../src/tpcc/tpcc
               genny: ../src/genny/genny
           mongodb_setup:
+            # This is currently only used by initialsync-logkeeper-short. It is empty and not used for other tests.
+            mongodb_dataset: ${dataset}
             mongodb_binary_archive: "https://s3.amazonaws.com/mciuploads/${project_dir}/${version_id}/${revision}/${platform}/mongodb${compile-variant|}-${version_id}.tar.gz"
         EOF
 
@@ -330,16 +342,24 @@ functions:
     - command: shell.exec
       params:
         working_dir: work
+        silent: true
         script: |
+          set -o errexit
           is_patch=${is_patch}
           task_id=${task_id}
           perf_jira_user=${perf_jira_user}
           perf_jira_pw=${perf_jira_pw}
-          dsi_analysis_atlas_user=${dsi_analysis_atlas_user}
-          dsi_analysis_atlas_pw=${dsi_analysis_atlas_pw}
+          analysis_user=${dsi_analysis_atlas_user}
+          analysis_password=${dsi_analysis_atlas_pw}
           evergreen_api_key=${evergreen_api_key}
           evergreen_api_user=${evergreen_api_user}
           source ../src/buildscripts/signal_processing_setup.sh
+    - command: shell.exec
+      params:
+        working_dir: work
+        script: |
+          set -o verbose
+          source ./signal_processing_venv/bin/activate
           detect-changes --evergreen-api-config .evergreen.yml
     - command: shell.exec
       type: test
@@ -356,7 +376,8 @@ functions:
       params:
         working_dir: work
         script: |
-          source ../src/buildscripts/signal_processing_setup.sh
+          set -o verbose
+          source ./signal_processing_venv/bin/activate
           detect-outliers --evergreen-api-config .evergreen.yml
     - command: shell.exec
       type: setup
@@ -535,16 +556,6 @@ tasks:
     - func: "prepare environment"
       vars:
         test: "short"
-    - func: "deploy cluster"
-    - func: "run test"
-    - func: "analyze"
-
-- name: jasper_smoke
-  priority: 5
-  commands:
-    - func: "prepare environment"
-      vars:
-        test: "jasper_smoke"
     - func: "deploy cluster"
     - func: "run test"
     - func: "analyze"
@@ -738,6 +749,8 @@ tasks:
       vars:
         test: "initialsync-logkeeper"
         setup: "initialsync-logkeeper-short"
+        # Logkeeper dataset with FCV set to 4.4
+        dataset: "https://s3-us-west-2.amazonaws.com/dsi-donot-remove/InitialSyncLogKeeper/logkeeper-slice-data-mongodb-4.4.tgz"
     - func: "deploy cluster"
     - func: "run test"
     - func: "analyze"
@@ -802,6 +815,7 @@ tasks:
         working_dir: src
         script: |
           genny/genny/scripts/genny_auto_tasks.sh --generate-all-tasks --output build/all_tasks.json
+          cat ../src/genny/genny/build/all_tasks.json
     - command: generate.tasks
       params:
         files:
@@ -883,6 +897,11 @@ modules:
   prefix: src/mongo/db/modules
   branch: master
 
+- name: mongo-tools
+  repo: git@github.com:mongodb/mongo-tools.git
+  prefix: mongo-tools/src/github.com/mongodb
+  branch: master
+
 #######################################
 #         Buildvariants               #
 #######################################
@@ -894,6 +913,7 @@ buildvariants:
   name: compile-amazon2
   display_name: Compile
   modules:
+    - mongo-tools
     - enterprise
     - genny
   batchtime: 1440 # 24 hours
@@ -919,8 +939,10 @@ buildvariants:
   name: wtdevelop-compile-amazon2
   display_name: WT Develop Compile
   modules:
+  - mongo-tools
   - wtdevelop
   - enterprise
+  - genny # needed for genny_generate_all_tasks
   expansions:
     <<: *compile-expansions
     compile-variant: -wtdevelop
@@ -928,6 +950,7 @@ buildvariants:
 - name: compile-rhel70
   display_name: Compile for Atlas-like
   modules:
+  - mongo-tools
   - enterprise
   batchtime: 1440 # 24 hours
   expansions:
@@ -989,7 +1012,6 @@ buildvariants:
     - name: snapshot_reads
     - name: linkbench
     - name: tpcc
-    - name: jasper_smoke
     - name: genny_patch_tasks
     - name: genny_auto_tasks
 
@@ -1015,7 +1037,6 @@ buildvariants:
     - name: industry_benchmarks
     - name: ycsb_60GB
     - name: crud_workloads
-    - name: jasper_smoke
     - name: genny_canaries
     - name: cursor_manager
     - name: mixed_workloads
@@ -1083,7 +1104,7 @@ buildvariants:
 
 - name: linux-1-node-replSet-ese-cbc
   display_name: Linux 1-Node ReplSet ESE CBC
-  batchtime: 10080 # 7 days
+  batchtime: 1440 # 24 hours
   modules: *modules
   expansions:
     setup: single-replica-ese-cbc
@@ -1107,7 +1128,7 @@ buildvariants:
 
 - name: linux-1-node-replSet-ese-gcm
   display_name: Linux 1-Node ReplSet ESE GCM
-  batchtime: 10080 # 7 days
+  batchtime: 1440 # 24 hours
   modules: *modules
   expansions:
     setup: single-replica-ese-gcm
@@ -1174,7 +1195,6 @@ buildvariants:
   tasks:
     - name: industry_benchmarks
     - name: crud_workloads
-    - name: jasper_smoke
     - name: mixed_workloads
     - name: misc_workloads
     - name: map_reduce_workloads
@@ -1231,7 +1251,7 @@ buildvariants:
 
 - name: linux-3-node-replSet
   display_name: Linux 3-Node ReplSet
-  batchtime: 2880  # 48 hours
+  batchtime: 1440 # 24 hours
   modules: *modules
   expansions:
     setup: replica
@@ -1253,7 +1273,6 @@ buildvariants:
     - name: industry_benchmarks_secondary_reads
     - name: crud_workloads
     - name: crud_workloads_majority
-    - name: jasper_smoke
     - name: mixed_workloads
     - name: misc_workloads
     - name: map_reduce_workloads
@@ -1336,13 +1355,12 @@ buildvariants:
 
 - name: linux-3-node-replSet-initialsync
   display_name: Linux 3-Node ReplSet Initial Sync
-  batchtime: 10080  # 7 days
+  batchtime: 1440 # 24 hours
   modules: *modules
   expansions:
     setup: replica-2node
     cluster: replica
     platform: linux
-    # TODO(TIG-1506): enabled authentication on initialsync variants
     authentication: disabled
     storageEngine: wiredTiger
     project_dir: *project_dir
@@ -1367,8 +1385,9 @@ buildvariants:
   expansions:
     setup: initialsync-logkeeper
     cluster: initialsync-logkeeper
+    # EBS logkeeper snapshot with FCV set to 4.4
+    snapshotId: snap-0b0b8b2ad16e8f14e
     platform: linux
-    # TODO(TIG-1506): enabled authentication on initialsync variants
     authentication: disabled
     storageEngine: wiredTiger
     project_dir: *project_dir
@@ -1412,7 +1431,6 @@ buildvariants:
     - name: industry_benchmarks_secondary_reads
     - name: crud_workloads
     - name: crud_workloads_majority
-    - name: jasper_smoke
     - name: mixed_workloads
     - name: misc_workloads
     - name: map_reduce_workloads

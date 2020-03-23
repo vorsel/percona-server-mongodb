@@ -51,6 +51,7 @@
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/request_types/balancer_collection_status_gen.h"
 #include "mongo/s/shard_util.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
 #include "mongo/util/exit.h"
@@ -78,6 +79,13 @@ const Seconds kBalanceRoundDefaultInterval(10);
 const Seconds kShortBalanceRoundInterval(1);
 
 const auto getBalancer = ServiceContext::declareDecoration<std::unique_ptr<Balancer>>();
+
+/**
+ * Balancer status response
+ */
+static constexpr StringData kBalancerPolicyStatusDraining = "draining"_sd;
+static constexpr StringData kBalancerPolicyStatusZoneViolation = "zoneViolation"_sd;
+static constexpr StringData kBalancerPolicyStatusChunksImbalance = "chunksImbalance"_sd;
 
 /**
  * Utility class to generate timing and statistics for a single balancer round.
@@ -199,6 +207,7 @@ void Balancer::interruptBalancer() {
         return;
 
     _state = kStopping;
+    _thread.detach();
 
     // Interrupt the balancer thread if it has been started. We are guaranteed that the operation
     // context of that thread is still alive, because we hold the balancer mutex.
@@ -217,22 +226,9 @@ void Balancer::interruptBalancer() {
 }
 
 void Balancer::waitForBalancerToStop() {
-    {
-        stdx::lock_guard<Latch> scopedLock(_mutex);
-        if (_state == kStopped)
-            return;
+    stdx::unique_lock<Latch> scopedLock(_mutex);
 
-        invariant(_state == kStopping);
-        invariant(_thread.joinable());
-    }
-
-    _thread.join();
-
-    stdx::lock_guard<Latch> scopedLock(_mutex);
-    _state = kStopped;
-    _thread = {};
-
-    LOG(1) << "Balancer thread terminated";
+    _joinCond.wait(scopedLock, [this] { return _state == kStopped; });
 }
 
 void Balancer::joinCurrentRound(OperationContext* opCtx) {
@@ -285,7 +281,8 @@ Status Balancer::moveSingleChunk(OperationContext* opCtx,
         MigrateInfo(newShardId,
                     chunk,
                     forceJumbo ? MoveChunkRequest::ForceJumbo::kForceManual
-                               : MoveChunkRequest::ForceJumbo::kDoNotForce),
+                               : MoveChunkRequest::ForceJumbo::kDoNotForce,
+                    MigrateInfo::chunksImbalance),
         maxChunkSizeBytes,
         secondaryThrottle,
         waitForDelete);
@@ -304,6 +301,15 @@ void Balancer::report(OperationContext* opCtx, BSONObjBuilder* builder) {
 }
 
 void Balancer::_mainThread() {
+    ON_BLOCK_EXIT([this] {
+        stdx::lock_guard<Latch> scopedLock(_mutex);
+
+        _state = kStopped;
+        _joinCond.notify_all();
+
+        LOG(1) << "Balancer thread terminated";
+    });
+
     Client::initThread("Balancer");
     auto opCtx = cc().makeOperationContext();
     auto shardingContext = Grid::get(opCtx.get());
@@ -688,6 +694,30 @@ void Balancer::_splitOrMarkJumbo(OperationContext* opCtx,
 void Balancer::notifyPersistedBalancerSettingsChanged() {
     stdx::unique_lock<Latch> lock(_mutex);
     _condVar.notify_all();
+}
+
+Balancer::BalancerStatus Balancer::getBalancerStatusForNs(OperationContext* opCtx,
+                                                          const NamespaceString& ns) {
+    auto splitChunks = uassertStatusOK(_chunkSelectionPolicy->selectChunksToSplit(opCtx, ns));
+    if (!splitChunks.empty()) {
+        return {false, kBalancerPolicyStatusZoneViolation.toString()};
+    }
+    auto chunksToMove = uassertStatusOK(_chunkSelectionPolicy->selectChunksToMove(opCtx, ns));
+    if (chunksToMove.empty()) {
+        return {true, boost::none};
+    }
+    const auto& migrationInfo = chunksToMove.front();
+
+    switch (migrationInfo.reason) {
+        case MigrateInfo::drain:
+            return {false, kBalancerPolicyStatusDraining.toString()};
+        case MigrateInfo::zoneViolation:
+            return {false, kBalancerPolicyStatusZoneViolation.toString()};
+        case MigrateInfo::chunksImbalance:
+            return {false, kBalancerPolicyStatusChunksImbalance.toString()};
+    }
+
+    return {true, boost::none};
 }
 
 }  // namespace mongo

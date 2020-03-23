@@ -70,6 +70,7 @@
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
+#include "mongo/util/system_clock_source.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/timer.h"
 
@@ -122,7 +123,6 @@ using namespace executor;
 using CallbackArgs = executor::TaskExecutor::CallbackArgs;
 using Event = executor::TaskExecutor::EventHandle;
 using Handle = executor::TaskExecutor::CallbackHandle;
-using Operations = MultiApplier::Operations;
 using QueryResponseStatus = StatusWith<Fetcher::QueryResponse>;
 using UniqueLock = stdx::unique_lock<Latch>;
 using LockGuard = stdx::lock_guard<Latch>;
@@ -298,6 +298,8 @@ void InitialSyncer::_cancelRemainingWork_inlock() {
 
     _shutdownComponent_inlock(_oplogFetcher);
     if (_sharedData) {
+        // We actually hold the required lock, but the lock object itself is not passed through.
+        _clearRetriableError(WithLock::withoutLock());
         stdx::lock_guard<InitialSyncSharedData> lock(*_sharedData);
         _sharedData->setInitialSyncStatusIfOK(
             lock, Status{ErrorCodes::CallbackCanceled, "Initial sync attempt canceled"});
@@ -324,6 +326,15 @@ InitialSyncer::State InitialSyncer::getState_forTest() const {
 Date_t InitialSyncer::getWallClockTime_forTest() const {
     stdx::lock_guard<Latch> lk(_mutex);
     return _lastApplied.wallTime;
+}
+
+void InitialSyncer::setAllowedOutageDuration_forTest(Milliseconds allowedOutageDuration) {
+    stdx::lock_guard<Latch> lk(_mutex);
+    _allowedOutageDuration = allowedOutageDuration;
+    if (_sharedData) {
+        stdx::lock_guard<InitialSyncSharedData> lk(*_sharedData);
+        _sharedData->setAllowedOutageDuration_forTest(lk, allowedOutageDuration);
+    }
 }
 
 bool InitialSyncer::_isShuttingDown() const {
@@ -381,6 +392,17 @@ void InitialSyncer::_appendInitialSyncProgressMinimal_inlock(BSONObjBuilder* bob
     if (!_initialSyncState->stopTimestamp.isNull()) {
         bob->append("initialSyncOplogEnd", _initialSyncState->stopTimestamp);
     }
+    if (_sharedData) {
+        stdx::lock_guard<InitialSyncSharedData> sdLock(*_sharedData);
+        auto unreachableSince = _sharedData->getSyncSourceUnreachableSince(sdLock);
+        if (unreachableSince != Date_t()) {
+            bob->append("syncSourceUnreachableSince", unreachableSince);
+            bob->append("currentOutageDurationMillis",
+                        durationCount<Milliseconds>(_sharedData->getCurrentOutageDuration(sdLock)));
+        }
+        bob->append("totalTimeUnreachableMillis",
+                    durationCount<Milliseconds>(_sharedData->getTotalTimeUnreachable(sdLock)));
+    }
 }
 
 BSONObj InitialSyncer::_getInitialSyncProgress_inlock() const {
@@ -431,6 +453,8 @@ void InitialSyncer::_setUp_inlock(OperationContext* opCtx, std::uint32_t initial
     _stats.initialSyncStart = _exec->now();
     _stats.maxFailedInitialSyncAttempts = initialSyncMaxAttempts;
     _stats.failedInitialSyncAttempts = 0;
+
+    _allowedOutageDuration = Seconds(initialSyncTransientErrorRetryPeriodSeconds.load());
 }
 
 void InitialSyncer::_tearDown_inlock(OperationContext* opCtx,
@@ -461,7 +485,6 @@ void InitialSyncer::_tearDown_inlock(OperationContext* opCtx,
     // All updates that represent initial sync must be completed before setting the initial data
     // timestamp.
     _storage->setInitialDataTimestamp(opCtx->getServiceContext(), initialDataTimestamp);
-
     auto currentLastAppliedOpTime = _opts.getMyLastOptime();
     if (currentLastAppliedOpTime.isNull()) {
         _opts.setMyLastOptime(lastApplied.getValue(),
@@ -679,13 +702,18 @@ void InitialSyncer::_rollbackCheckerResetCallback(
         return;
     }
 
+    // Since the beginFetchingOpTime is retrieved before significant work is done copying
+    // data from the sync source, we allow the OplogEntryFetcher to use its default retry strategy
+    // which retries up to 'numInitialSyncOplogFindAttempts' times'.  This will fail relatively
+    // quickly in the presence of network errors, allowing us to choose a different sync source.
     status = _scheduleLastOplogEntryFetcher_inlock(
         [=](const StatusWith<mongo::Fetcher::QueryResponse>& response,
             mongo::Fetcher::NextAction*,
             mongo::BSONObjBuilder*) mutable {
             _lastOplogEntryFetcherCallbackForDefaultBeginFetchingOpTime(response,
                                                                         onCompletionGuard);
-        });
+        },
+        kFetcherHandlesRetries);
     if (!status.isOK()) {
         onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
         return;
@@ -822,13 +850,18 @@ void InitialSyncer::_getBeginFetchingOpTimeCallback(
         initialSyncHangAfterGettingBeginFetchingTimestamp.pauseWhileSet();
     }
 
+    // Since the beginFetchingOpTime is retrieved before significant work is done copying
+    // data from the sync source, we allow the OplogEntryFetcher to use its default retry strategy
+    // which retries up to 'numInitialSyncOplogFindAttempts' times'.  This will fail relatively
+    // quickly in the presence of network errors, allowing us to choose a different sync source.
     status = _scheduleLastOplogEntryFetcher_inlock(
         [=](const StatusWith<mongo::Fetcher::QueryResponse>& response,
             mongo::Fetcher::NextAction*,
             mongo::BSONObjBuilder*) mutable {
             _lastOplogEntryFetcherCallbackForBeginApplyingTimestamp(
                 response, onCompletionGuard, beginFetchingOpTime);
-        });
+        },
+        kFetcherHandlesRetries);
     if (!status.isOK()) {
         onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
         return;
@@ -950,7 +983,11 @@ void InitialSyncer::_fcvFetcherCallback(const StatusWith<Fetcher::QueryResponse>
     // This is where the flow of control starts to split into two parallel tracks:
     // - oplog fetcher
     // - data cloning and applier
-    _sharedData = std::make_unique<InitialSyncSharedData>(version, _rollbackChecker->getBaseRBID());
+    _sharedData =
+        std::make_unique<InitialSyncSharedData>(version,
+                                                _rollbackChecker->getBaseRBID(),
+                                                _allowedOutageDuration,
+                                                getGlobalServiceContext()->getFastClockSource());
     _client = _createClientFn();
     _initialSyncState = std::make_unique<InitialSyncState>(std::make_unique<AllDatabaseCloner>(
         _sharedData.get(), _syncSource, _client.get(), _storage, _writerPool));
@@ -998,7 +1035,8 @@ void InitialSyncer::_fcvFetcherCallback(const StatusWith<Fetcher::QueryResponse>
         _syncSource,
         _opts.remoteOplogNS,
         config,
-        _opts.oplogFetcherMaxFetcherRestarts,
+        std::make_unique<OplogFetcherRestartDecisionInitialSyncer>(
+            _sharedData.get(), _opts.oplogFetcherMaxFetcherRestarts),
         _rollbackChecker->getBaseRBID(),
         false /* requireFresherSyncSource */,
         _dataReplicatorExternalState.get(),
@@ -1039,19 +1077,27 @@ void InitialSyncer::_fcvFetcherCallback(const StatusWith<Fetcher::QueryResponse>
 
     _initialSyncState->allDatabaseClonerFuture =
         _initialSyncState->allDatabaseCloner->runOnExecutor(_clonerExec)
-            .onCompletion([this, onCompletionGuard](Status status) {
+            .onCompletion([this, onCompletionGuard](Status status) mutable {
                 // The completion guard must run on the main executor.  This only makes a difference
                 // for unit tests, but we always schedule it that way to avoid special casing test
                 // code.
+                stdx::unique_lock<Latch> lock(_mutex);
                 auto exec_status = _exec->scheduleWork(
                     [this, status, onCompletionGuard](executor::TaskExecutor::CallbackArgs args) {
                         _allDatabaseClonerCallback(status, onCompletionGuard);
                     });
                 if (!exec_status.isOK()) {
-                    stdx::unique_lock<Latch> lock(_mutex);
                     onCompletionGuard->setResultAndCancelRemainingWork_inlock(
                         lock, exec_status.getStatus());
+                    // In the shutdown case, it is possible the completion guard will be run
+                    // from this thread (since the lambda holding another copy didn't schedule).
+                    // If it does, we will self-deadlock if we're holding the lock, so release it.
+                    lock.unlock();
                 }
+                // In unit tests, this reset ensures the completion guard does not run during the
+                // destruction of the lambda (which occurs on the wrong executor), except in the
+                // shutdown case.
+                onCompletionGuard.reset();
             });
 
     if (!status.isOK()) {
@@ -1120,12 +1166,18 @@ void InitialSyncer::_allDatabaseClonerCallback(
         return;
     }
 
+    // Since the stopTimestamp is retrieved after we have done all the work of retrieving collection
+    // data, we handle retries within this class by retrying for
+    // 'initialSyncTransientErrorRetryPeriodSeconds' (default 24 hours).  This is the same retry
+    // strategy used when retrieving collection data, and avoids retrieving all the data and then
+    // throwing it away due to a transient network outage.
     status = _scheduleLastOplogEntryFetcher_inlock(
         [=](const StatusWith<mongo::Fetcher::QueryResponse>& status,
             mongo::Fetcher::NextAction*,
             mongo::BSONObjBuilder*) {
             _lastOplogEntryFetcherCallbackForStopTimestamp(status, onCompletionGuard);
-        });
+        },
+        kInitialSyncerHandlesRetries);
     if (!status.isOK()) {
         onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
         return;
@@ -1140,6 +1192,35 @@ void InitialSyncer::_lastOplogEntryFetcherCallbackForStopTimestamp(
         stdx::lock_guard<Latch> lock(_mutex);
         auto status = _checkForShutdownAndConvertStatus_inlock(
             result.getStatus(), "error fetching last oplog entry for stop timestamp");
+        if (_shouldRetryError(lock, status)) {
+            auto scheduleStatus = _exec->scheduleWork(
+                [this, onCompletionGuard](executor::TaskExecutor::CallbackArgs args) {
+                    // It is not valid to schedule the retry from within this callback,
+                    // hence we schedule a lambda to schedule the retry.
+                    stdx::lock_guard<Latch> lock(_mutex);
+                    // Since the stopTimestamp is retrieved after we have done all the work of
+                    // retrieving collection data, we handle retries within this class by retrying
+                    // for 'initialSyncTransientErrorRetryPeriodSeconds' (default 24 hours).  This
+                    // is the same retry strategy used when retrieving collection data, and avoids
+                    // retrieving all the data and then throwing it away due to a transient network
+                    // outage.
+                    auto status = _scheduleLastOplogEntryFetcher_inlock(
+                        [=](const StatusWith<mongo::Fetcher::QueryResponse>& status,
+                            mongo::Fetcher::NextAction*,
+                            mongo::BSONObjBuilder*) {
+                            _lastOplogEntryFetcherCallbackForStopTimestamp(status,
+                                                                           onCompletionGuard);
+                        },
+                        kInitialSyncerHandlesRetries);
+                    if (!status.isOK()) {
+                        onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
+                    }
+                });
+            if (scheduleStatus.isOK())
+                return;
+            // If scheduling failed, we're shutting down and cannot retry.
+            // So just continue with the original failed status.
+        }
         if (!status.isOK()) {
             onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
             return;
@@ -1240,7 +1321,7 @@ void InitialSyncer::_getNextApplierBatchCallback(
     if (!ops.empty()) {
         _fetchCount.store(0);
         MultiApplier::MultiApplyFn applyBatchOfOperationsFn = [this](OperationContext* opCtx,
-                                                                     MultiApplier::Operations ops) {
+                                                                     std::vector<OplogEntry> ops) {
             return _oplogApplier->applyOplogBatch(opCtx, std::move(ops));
         };
         OpTime lastApplied = ops.back().getOpTime();
@@ -1336,6 +1417,12 @@ void InitialSyncer::_rollbackCheckerCheckForRollbackCallback(
     stdx::lock_guard<Latch> lock(_mutex);
     auto status = _checkForShutdownAndConvertStatus_inlock(result.getStatus(),
                                                            "error while getting last rollback ID");
+    if (_shouldRetryError(lock, status)) {
+        LOG(1) << "Retrying rollback checker because of network error " << status;
+        _scheduleRollbackCheckerCheckForRollback_inlock(lock, onCompletionGuard);
+        return;
+    }
+
     if (!status.isOK()) {
         onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
         return;
@@ -1388,8 +1475,24 @@ void InitialSyncer::_finishInitialSyncAttempt(const StatusWith<OpTimeAndWallTime
     log() << "Initial Sync Attempt Statistics: " << redact(_getInitialSyncProgress_inlock());
 
     auto runTime = _initialSyncState ? _initialSyncState->timer.millis() : 0;
+    int rollBackId = -1;
+    int operationsRetried = 0;
+    int totalTimeUnreachableMillis = 0;
+    if (_sharedData) {
+        stdx::lock_guard<InitialSyncSharedData> sdLock(*_sharedData);
+        rollBackId = _sharedData->getRollBackId();
+        operationsRetried = _sharedData->getTotalRetries(sdLock);
+        totalTimeUnreachableMillis =
+            durationCount<Milliseconds>(_sharedData->getTotalTimeUnreachable(sdLock));
+    }
+
     _stats.initialSyncAttemptInfos.emplace_back(
-        InitialSyncer::InitialSyncAttemptInfo{runTime, result.getStatus(), _syncSource});
+        InitialSyncer::InitialSyncAttemptInfo{runTime,
+                                              result.getStatus(),
+                                              _syncSource,
+                                              rollBackId,
+                                              operationsRetried,
+                                              totalTimeUnreachableMillis});
 
     if (MONGO_unlikely(failAndHangInitialSync.shouldFail())) {
         log() << "failAndHangInitialSync fail point enabled.";
@@ -1460,7 +1563,6 @@ void InitialSyncer::_finishCallback(StatusWith<OpTimeAndWallTime> lastApplied) {
         stdx::lock_guard<Latch> lock(_mutex);
         auto opCtx = makeOpCtx();
         _tearDown_inlock(opCtx.get(), lastApplied);
-
         invariant(_onCompletion);
         std::swap(_onCompletion, onCompletion);
     }
@@ -1499,7 +1601,8 @@ void InitialSyncer::_finishCallback(StatusWith<OpTimeAndWallTime> lastApplied) {
     }
 }
 
-Status InitialSyncer::_scheduleLastOplogEntryFetcher_inlock(Fetcher::CallbackFn callback) {
+Status InitialSyncer::_scheduleLastOplogEntryFetcher_inlock(
+    Fetcher::CallbackFn callback, LastOplogEntryFetcherRetryStrategy retryStrategy) {
     BSONObj query = BSON("find" << _opts.remoteOplogNS.coll() << "sort" << BSON("$natural" << -1)
                                 << "limit" << 1);
 
@@ -1512,8 +1615,11 @@ Status InitialSyncer::_scheduleLastOplogEntryFetcher_inlock(Fetcher::CallbackFn 
         ReadPreferenceSetting::secondaryPreferredMetadata(),
         RemoteCommandRequest::kNoTimeout /* find network timeout */,
         RemoteCommandRequest::kNoTimeout /* getMore network timeout */,
-        RemoteCommandRetryScheduler::makeRetryPolicy<ErrorCategory::RetriableError>(
-            numInitialSyncOplogFindAttempts.load(), executor::RemoteCommandRequest::kNoTimeout));
+        (retryStrategy == kFetcherHandlesRetries)
+            ? RemoteCommandRetryScheduler::makeRetryPolicy<ErrorCategory::RetriableError>(
+                  numInitialSyncOplogFindAttempts.load(),
+                  executor::RemoteCommandRequest::kNoTimeout)
+            : RemoteCommandRetryScheduler::makeNoRetryPolicy());
     Status scheduleStatus = _lastOplogEntryFetcher->schedule();
     if (!scheduleStatus.isOK()) {
         _lastOplogEntryFetcher.reset();
@@ -1606,6 +1712,21 @@ void InitialSyncer::_scheduleRollbackCheckerCheckForRollback_inlock(
     return;
 }
 
+bool InitialSyncer::_shouldRetryError(WithLock lk, Status status) {
+    if (ErrorCodes::isRetriableError(status)) {
+        stdx::lock_guard<InitialSyncSharedData> sharedDataLock(*_sharedData);
+        return _sharedData->shouldRetryOperation(sharedDataLock, &_retryingOperation);
+    }
+    // The status was OK or some error other than a retriable error, so clear the retriable error
+    // state and indicate that we should not retry.
+    _clearRetriableError(lk);
+    return false;
+}
+
+void InitialSyncer::_clearRetriableError(WithLock lk) {
+    _retryingOperation = boost::none;
+}
+
 Status InitialSyncer::_checkForShutdownAndConvertStatus_inlock(
     const executor::TaskExecutor::CallbackArgs& callbackArgs, const std::string& message) {
     return _checkForShutdownAndConvertStatus_inlock(callbackArgs.status, message);
@@ -1688,12 +1809,12 @@ void InitialSyncer::_shutdownComponent_inlock(Component& component) {
     component->shutdown();
 }
 
-StatusWith<Operations> InitialSyncer::_getNextApplierBatch_inlock() {
+StatusWith<std::vector<OplogEntry>> InitialSyncer::_getNextApplierBatch_inlock() {
     // If the fail-point is active, delay the apply batch by returning an empty batch so that
     // _getNextApplierBatchCallback() will reschedule itself at a later time.
     // See InitialSyncerOptions::getApplierBatchCallbackRetryWait.
     if (MONGO_unlikely(rsSyncApplyStop.shouldFail())) {
-        return Operations();
+        return std::vector<OplogEntry>();
     }
 
     // Obtain next batch of operations from OplogApplier.
@@ -1789,6 +1910,29 @@ void InitialSyncer::InitialSyncAttemptInfo::append(BSONObjBuilder* builder) cons
     builder->appendNumber("durationMillis", durationMillis);
     builder->append("status", status.toString());
     builder->append("syncSource", syncSource.toString());
+    if (rollBackId >= 0) {
+        builder->append("rollBackId", rollBackId);
+    }
+    builder->append("operationsRetried", operationsRetried);
+    builder->append("totalTimeUnreachableMillis", totalTimeUnreachableMillis);
+}
+
+bool InitialSyncer::OplogFetcherRestartDecisionInitialSyncer::shouldContinue(
+    AbstractOplogFetcher* fetcher, Status status) {
+    if (ErrorCodes::isRetriableError(status)) {
+        stdx::lock_guard<InitialSyncSharedData> lk(*_sharedData);
+        return _sharedData->shouldRetryOperation(lk, &_retryingOperation);
+    }
+    // A non-network error occured, so clear any network error and use the default restart
+    // strategy.
+    _retryingOperation = boost::none;
+    return _defaultDecision.shouldContinue(fetcher, status);
+}
+
+void InitialSyncer::OplogFetcherRestartDecisionInitialSyncer::fetchSuccessful(
+    AbstractOplogFetcher* fetcher) {
+    _retryingOperation = boost::none;
+    _defaultDecision.fetchSuccessful(fetcher);
 }
 
 }  // namespace repl

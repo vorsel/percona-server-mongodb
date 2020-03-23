@@ -33,6 +33,7 @@
 #include "mongo/logv2/attribute_storage.h"
 #include "mongo/logv2/attributes.h"
 #include "mongo/logv2/constants.h"
+#include "mongo/util/str_escape.h"
 
 #include <boost/container/small_vector.hpp>
 #include <boost/log/attributes/value_extraction.hpp>
@@ -47,12 +48,25 @@ namespace {
 
 struct TextValueExtractor {
     void operator()(StringData name, CustomAttributeValue const& val) {
-        _storage.push_back(val.toString());
+        std::string unescapedStr;
+        if (val.stringSerialize) {
+            fmt::memory_buffer buffer;
+            val.stringSerialize(buffer);
+            unescapedStr = fmt::to_string(buffer);
+        } else {
+            unescapedStr = val.toString();
+        }
+        _storage.push_back(unescapedStr);
         operator()(name, _storage.back());
     }
 
     void operator()(StringData name, const BSONObj* val) {
-        _storage.push_back(val->jsonString());
+        _storage.push_back(val->jsonString(JsonStringFormat::ExtendedRelaxedV2_0_0));
+        operator()(name, _storage.back());
+    }
+
+    void operator()(StringData name, const BSONArray* val) {
+        _storage.push_back(val->jsonString(JsonStringFormat::ExtendedRelaxedV2_0_0, 0, true));
         operator()(name, _storage.back());
     }
 
@@ -82,7 +96,7 @@ void PlainFormatter::operator()(boost::log::record_view const& rec,
     extractor.args.reserve(attrs.size());
     attrs.apply(extractor);
     fmt::memory_buffer buffer;
-    fmt::internal::vformat_to(
+    fmt::vformat_to(
         buffer,
         to_string_view(message),
         fmt::basic_format_args<fmt::format_context>(extractor.args.data(), extractor.args.size()));

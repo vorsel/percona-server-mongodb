@@ -115,6 +115,17 @@ boost::intrusive_ptr<ExpressionContext> makeExpressionContext(
                                           boost::none  // uuid
         );
     expCtx->tempDir = storageGlobalParams.dbpath + "/_tmp";
+    // TODO (SERVER-43361): We will not need to set 'sortKeyFormat' after branching for 4.5.
+    auto assumeInternalClient = !opCtx->getClient()->session() ||
+        (opCtx->getClient()->session()->getTags() & transport::Session::kInternalClient);
+    if (assumeInternalClient) {
+        expCtx->sortKeyFormat =
+            queryRequest.use44SortKeys() ? SortKeyFormat::k44SortKey : SortKeyFormat::k42SortKey;
+    } else {
+        // The client is not a mongoS, so we will not need to use an older sort key format to
+        // support it. Use default value for the ExpressionContext's 'sortKeyFormat' member
+        // variable, which is the newest format.
+    }
     return expCtx;
 }
 
@@ -178,8 +189,7 @@ public:
         }
 
         ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level) const final {
-            return {ReadConcernSupportResult::ReadConcern::kSupported,
-                    ReadConcernSupportResult::DefaultReadConcern::kPermitted};
+            return ReadConcernSupportResult::allSupportedAndDefaultPermitted();
         }
 
         bool canIgnorePrepareConflicts() const override {
@@ -208,7 +218,7 @@ public:
             const auto hasTerm = _request.body.hasField(kTermField);
             uassertStatusOK(authSession->checkAuthForFind(
                 CollectionCatalog::get(opCtx).resolveNamespaceStringOrUUID(
-                    CommandHelpers::parseNsOrUUID(_dbName, _request.body)),
+                    opCtx, CommandHelpers::parseNsOrUUID(_dbName, _request.body)),
                 hasTerm));
         }
 
@@ -504,6 +514,9 @@ public:
                     exec->enqueue(obj);
                     break;
                 }
+
+                // If this executor produces a postBatchResumeToken, add it to the response.
+                firstBatch.setPostBatchResumeToken(exec->getPostBatchResumeToken());
 
                 // Add result to output buffer.
                 firstBatch.append(obj);

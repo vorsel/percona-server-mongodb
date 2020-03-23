@@ -112,7 +112,7 @@ boost::optional<ServerDescriptionPtr> TopologyDescription::installServerDescript
     if (getType() == TopologyType::kSingle) {
         // For Single, there is always one ServerDescription in TopologyDescription.servers;
         // the ServerDescription in TopologyDescription.servers MUST be replaced with the new
-        // ServerDescription.
+        // ServerDescription if the new topologyVersion is >= the old.
         invariant(_servers.size() == 1);
         previousDescription = _servers[0];
         _servers[0] = std::shared_ptr<ServerDescription>(newServerDescription);
@@ -121,6 +121,7 @@ boost::optional<ServerDescriptionPtr> TopologyDescription::installServerDescript
             const auto& currentDescription = *it;
             if (currentDescription->getAddress() == newServerDescription->getAddress()) {
                 previousDescription = *it;
+
                 *it = std::shared_ptr<ServerDescription>(newServerDescription);
                 break;
             }
@@ -147,7 +148,7 @@ void TopologyDescription::removeServerDescription(const ServerAddress& serverAdd
 }
 
 void TopologyDescription::checkWireCompatibilityVersions() {
-    const WireVersionInfo supportedWireVersion = WireSpec::instance().outgoing;
+    const WireVersionInfo supportedWireVersion = {BATCH_COMMANDS, LATEST_WIRE_VERSION};
     std::ostringstream errorOss;
 
     _compatible = true;
@@ -228,6 +229,47 @@ void TopologyDescription::calculateLogicalSessionTimeout() {
         (foundNone || !hasDataBearingServer) ? boost::none : boost::make_optional(min);
 }
 
+BSONObj TopologyDescription::toBSON() {
+    BSONObjBuilder bson;
+
+    bson << "id" << _id.toString();
+    bson << "topologyType" << mongo::sdam::toString(_type);
+
+    BSONObjBuilder bsonServers;
+    for (auto server : this->getServers()) {
+        bsonServers << server->getAddress() << server->toBson();
+    }
+    bson.append("servers", bsonServers.obj());
+
+    if (_logicalSessionTimeoutMinutes) {
+        bson << "logicalSessionTimeoutMinutes" << *_logicalSessionTimeoutMinutes;
+    }
+
+    if (_setName) {
+        bson << "setName" << *_setName;
+    }
+
+    if (_compatible) {
+        bson << "compatible" << true;
+    } else {
+        bson << "compatible" << false;
+        bson << "compatibleError" << *_compatibleError;
+    }
+
+    if (_maxSetVersion) {
+        bson << "maxSetVersion" << *_maxSetVersion;
+    }
+
+    if (_maxElectionId) {
+        bson << "maxElectionId" << *_maxElectionId;
+    }
+
+    return bson.obj();
+}
+
+std::string TopologyDescription::toString() {
+    return toBSON().toString();
+}
 
 ////////////////////////
 // SdamConfiguration

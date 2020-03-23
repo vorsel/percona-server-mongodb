@@ -2,11 +2,17 @@
 //   assumes_superuser_permissions,
 //   does_not_support_stepdowns,
 //   requires_fastcount,
+//   requires_fcv_44,
 //   requires_getmore,
 //   requires_non_retryable_commands,
 //   requires_non_retryable_writes,
 //   uses_map_reduce_with_temp_collections,
 // ]
+//
+// Tagged as 'requires_fcv_44', since this test cannot run against versions less then 4.4. This is
+// because 'planCacheListPlans' and 'planCacheListQueryShapes' were deleted in 4.4, and thus not
+// tested here. But this test asserts that all commands are covered, so will fail against a version
+// of the server which implements these commands.
 
 /*
  * Declaratively-defined tests for views for all database commands. This file contains a map of test
@@ -75,6 +81,7 @@ let viewsCommandTests = {
     _cloneCollectionOptionsFromPrimaryShard: {skip: isAnInternalCommand},
     _configsvrAddShard: {skip: isAnInternalCommand},
     _configsvrAddShardToZone: {skip: isAnInternalCommand},
+    _configsvrBalancerCollectionStatus: {skip: isAnInternalCommand},
     _configsvrBalancerStart: {skip: isAnInternalCommand},
     _configsvrBalancerStatus: {skip: isAnInternalCommand},
     _configsvrBalancerStop: {skip: isAnInternalCommand},
@@ -88,6 +95,7 @@ let viewsCommandTests = {
     _configsvrDropCollection: {skip: isAnInternalCommand},
     _configsvrDropDatabase: {skip: isAnInternalCommand},
     _configsvrEnableSharding: {skip: isAnInternalCommand},
+    _configsvrEnsureChunkVersionIsGreaterThan: {skip: isAnInternalCommand},
     _configsvrMoveChunk: {skip: isAnInternalCommand},
     _configsvrMovePrimary: {skip: isAnInternalCommand},
     _configsvrRefineCollectionShardKey: {skip: isAnInternalCommand},
@@ -104,6 +112,7 @@ let viewsCommandTests = {
     _getUserCacheGeneration: {skip: isAnInternalCommand},
     _hashBSONElement: {skip: isAnInternalCommand},
     _isSelf: {skip: isAnInternalCommand},
+    _killOperations: {skip: isUnrelated},
     _mergeAuthzCollections: {skip: isAnInternalCommand},
     _migrateClone: {skip: isAnInternalCommand},
     _movePrimary: {skip: wasRemovedInBinaryVersion44},
@@ -128,6 +137,16 @@ let viewsCommandTests = {
     },
     authenticate: {skip: isUnrelated},
     availableQueryOptions: {skip: isAnInternalCommand},
+    balancerCollectionStatus: {
+        command: {balancerCollectionStatus: "test.view"},
+        setup: function(conn) {
+            assert.commandWorked(conn.adminCommand({enableSharding: "test"}));
+        },
+        skipStandalone: true,
+        expectFailure: true,
+        isAdminCommand: true,
+        expectedErrorCode: ErrorCodes.NamespaceNotSharded,
+    },
     balancerStart: {skip: isUnrelated},
     balancerStatus: {skip: isUnrelated},
     balancerStop: {skip: isUnrelated},
@@ -213,7 +232,7 @@ let viewsCommandTests = {
             assert.eq(hash1, hash3, "hash should be the same again after removing 'view2'");
         }
     },
-    dbStats: {skip: "TODO(SERVER-25948)"},
+    dbStats: {command: {dbStats: 1}},
     delete: {command: {delete: "view", deletes: [{q: {x: 1}, limit: 1}]}, expectFailure: true},
     distinct: {command: {distinct: "view", key: "_id"}},
     driverOIDTest: {skip: isUnrelated},
@@ -408,8 +427,6 @@ let viewsCommandTests = {
     planCacheClear: {command: {planCacheClear: "view"}, expectFailure: true},
     planCacheClearFilters: {command: {planCacheClearFilters: "view"}, expectFailure: true},
     planCacheListFilters: {command: {planCacheListFilters: "view"}, expectFailure: true},
-    planCacheListPlans: {command: {planCacheListPlans: "view"}, expectFailure: true},
-    planCacheListQueryShapes: {command: {planCacheListQueryShapes: "view"}, expectFailure: true},
     planCacheSetFilter: {command: {planCacheSetFilter: "view"}, expectFailure: true},
     prepareTransaction: {skip: isUnrelated},
     profile: {skip: isUnrelated},

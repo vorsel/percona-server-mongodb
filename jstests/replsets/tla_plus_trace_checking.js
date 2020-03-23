@@ -1,10 +1,17 @@
 /**
  * This test enables TLA+ Trace Checking and ensures that it succeeds.
+ *
+ * @tags: [
+ *     requires_fcv_44,
+ *     requires_journaling,
+ *     requires_persistence,
+ *     requires_replication,
+ *     requires_wiredtiger,
+ * ]
  */
 
 (function() {
 "use strict";
-load("jstests/libs/check_log.js");
 
 const failpointData = {
     mode: 'alwaysOn',
@@ -29,7 +36,7 @@ const coll = rst.getPrimary().getDB('test').collection;
 jsTestLog("Insert one document");
 assert.commandWorked(coll.insert({_id: 0}, {writeConcern: {w: "majority"}}));
 
-checkLog.contains(rst.getSecondary(), '{ spec: \"RaftMongo\", action: \"AppendOplog\",');
+checkLog.contains(rst.getSecondary(), '\"spec\" : \"RaftMongo\", \"action\" : \"AppendOplog\"');
 
 rst.stopSet();
 })();

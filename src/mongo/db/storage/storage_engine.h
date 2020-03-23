@@ -36,6 +36,7 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/storage/engine_extension.h"
 #include "mongo/bson/timestamp.h"
+#include "mongo/db/catalog/index_builds.h"
 #include "mongo/db/storage/temporary_record_store.h"
 #include "mongo/util/functional.h"
 #include "mongo/util/str.h"
@@ -69,11 +70,34 @@ public:
     using OldestActiveTransactionTimestampCallback =
         std::function<OldestActiveTransactionTimestampResult(Timestamp stableTimestamp)>;
 
-    struct BackupBlock {
-        std::string filename;
-        std::uint64_t offset;
-        std::uint64_t length;
+    struct BackupOptions {
+        bool disableIncrementalBackup = false;
+        bool incrementalBackup = false;
+        int blockSizeMB = 16;
+        boost::optional<std::string> thisBackupName;
+        boost::optional<std::string> srcBackupName;
     };
+
+    struct BackupBlock {
+        std::uint64_t offset = 0;
+        std::uint64_t length = 0;
+    };
+
+    /**
+     * Contains the size of the file to be backed up. This allows the backup application to safely
+     * truncate the file for incremental backups. Files that have had changes since the last
+     * incremental backup will have their changed file blocks listed.
+     */
+    struct BackupFile {
+        BackupFile() = delete;
+        explicit BackupFile(std::uint64_t fileSize) : fileSize(fileSize){};
+
+        std::uint64_t fileSize;
+        std::vector<BackupBlock> blocksToCopy;
+    };
+
+    // Map of filenames to backup file information.
+    using BackupInformation = stdx::unordered_map<std::string, BackupFile>;
 
     /**
      * The interface for creating new instances of storage engines.
@@ -300,8 +324,31 @@ public:
      */
     virtual void endBackup(OperationContext* opCtx) = 0;
 
-    virtual StatusWith<std::vector<BackupBlock>> beginNonBlockingBackup(
-        OperationContext* opCtx) = 0;
+    /**
+     * Disables the storage of incremental backup history until a subsequent incremental backup
+     * cursor is requested.
+     *
+     * The storage engine must release all incremental backup information and resources.
+     */
+    virtual Status disableIncrementalBackup(OperationContext* opCtx) = 0;
+
+    /**
+     * When performing an incremental backup, we first need a basis for future incremental backups.
+     * The basis will be a full backup called 'thisBackupName'. For future incremental backups, the
+     * storage engine will take a backup called 'thisBackupName' which will contain the changes made
+     * to data files since the backup named 'srcBackupName'.
+     *
+     * The storage engine must use an upper bound limit of 'blockSizeMB' when returning changed
+     * file blocks.
+     *
+     * The first full backup meant for incremental and future incremental backups must pass
+     * 'incrementalBackup' as true.
+     * 'thisBackupName' must exist only if 'incrementalBackup' is true.
+     * 'srcBackupName' must not exist when 'incrementalBackup' is false but may or may not exist
+     * when 'incrementalBackup' is true.
+     */
+    virtual StatusWith<StorageEngine::BackupInformation> beginNonBlockingBackup(
+        OperationContext* opCtx, const BackupOptions& options) = 0;
 
     virtual void endNonBlockingBackup(OperationContext* opCtx) = 0;
 
@@ -394,6 +441,11 @@ public:
      * Used primarily by rollback after recovering to a stable timestamp.
      */
     virtual void clearDropPendingState() = 0;
+
+    /**
+     * Returns true if the storage engine supports two phase index builds.
+     */
+    virtual bool supportsTwoPhaseIndexBuild() const = 0;
 
     /**
      * Recovers the storage engine state to the last stable timestamp. "Stable" in this case
@@ -497,19 +549,6 @@ public:
         const std::string indexName;
     };
 
-    /**
-     * Describes an index build on a collection that should be restarted.
-     */
-    struct IndexBuildToRestart {
-        IndexBuildToRestart(UUID collUUID) : collUUID(collUUID) {}
-
-        // Collection UUID.
-        const UUID collUUID;
-
-        // Index specs for the build.
-        std::vector<BSONObj> indexSpecs;
-    };
-
     /*
      * ReconcileResult is the result of reconciling abandoned storage engine idents and unfinished
      * index builds.
@@ -521,7 +560,7 @@ public:
         // A map of unfinished two-phase indexes that must be restarted in the background, but
         // not to completion; they will wait for replicated commit or abort operations. This is a
         // mapping from index build UUID to index build.
-        std::map<UUID, IndexBuildToRestart> indexBuildsToRestart;
+        IndexBuilds indexBuildsToRestart;
     };
 
     /**

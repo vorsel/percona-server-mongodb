@@ -72,11 +72,9 @@ public:
         return false;
     }
 
-    ReadConcernSupportResult supportsReadConcern(const std::string& dbName,
-                                                 const BSONObj& cmdObj,
+    ReadConcernSupportResult supportsReadConcern(const BSONObj& cmdObj,
                                                  repl::ReadConcernLevel level) const final {
-        return {ReadConcernSupportResult::ReadConcern::kSupported,
-                ReadConcernSupportResult::DefaultReadConcern::kPermitted};
+        return ReadConcernSupportResult::allSupportedAndDefaultPermitted();
     }
 
     void addRequiredPrivileges(const std::string& dbname,

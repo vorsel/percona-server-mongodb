@@ -161,10 +161,12 @@ TEST(QueryRequestTest, ValidSortOrder) {
     ASSERT_OK(qr.validate());
 }
 
-TEST(QueryRequestTest, InvalidSortOrderString) {
+TEST(QueryRequestTest, DoesNotErrorOnInvalidSortPattern) {
     QueryRequest qr(testns);
     qr.setSort(fromjson("{a: \"\"}"));
-    ASSERT_NOT_OK(qr.validate());
+    // QueryRequest isn't responsible for validating the sort pattern, so it is considered valid
+    // even though the sort pattern {a: ""} is not well-formed.
+    ASSERT_OK(qr.validate());
 }
 
 TEST(QueryRequestTest, MinFieldsNotPrefixOfMax) {
@@ -239,28 +241,18 @@ TEST(QueryRequestTest, ValidSortProj) {
     ASSERT_OK(metaQR.validate());
 }
 
-TEST(QueryRequestTest, ForbidNonMetaSortOnFieldWithMetaProject) {
-    QueryRequest badQR(testns);
-    badQR.setProj(fromjson("{a: {$meta: \"textScore\"}}"));
-    badQR.setSort(fromjson("{a: 1}"));
-    ASSERT_NOT_OK(badQR.validate());
-
-    QueryRequest goodQR(testns);
-    goodQR.setProj(fromjson("{a: {$meta: \"textScore\"}}"));
-    goodQR.setSort(fromjson("{b: 1}"));
-    ASSERT_OK(goodQR.validate());
+TEST(QueryRequestTest, TextScoreMetaSortOnFieldDoesNotRequireMetaProjection) {
+    QueryRequest qr(testns);
+    qr.setProj(fromjson("{b: 1}"));
+    qr.setSort(fromjson("{a: {$meta: 'textScore'}}"));
+    ASSERT_OK(qr.validate());
 }
 
-TEST(QueryRequestTest, ForbidMetaSortOnFieldWithoutMetaProject) {
-    QueryRequest qrMatching(testns);
-    qrMatching.setProj(fromjson("{a: 1}"));
-    qrMatching.setSort(fromjson("{a: {$meta: \"textScore\"}}"));
-    ASSERT_NOT_OK(qrMatching.validate());
-
-    QueryRequest qrNonMatching(testns);
-    qrNonMatching.setProj(fromjson("{b: 1}"));
-    qrNonMatching.setSort(fromjson("{a: {$meta: \"textScore\"}}"));
-    ASSERT_NOT_OK(qrNonMatching.validate());
+TEST(QueryRequestTest, TextScoreMetaProjectionDoesNotRequireTextScoreMetaSort) {
+    QueryRequest qr(testns);
+    qr.setProj(fromjson("{a: {$meta: \"textScore\"}}"));
+    qr.setSort(fromjson("{b: 1}"));
+    ASSERT_OK(qr.validate());
 }
 
 TEST(QueryRequestTest, RequestResumeTokenWithHint) {
@@ -288,20 +280,20 @@ TEST(QueryRequestTest, RequestResumeTokenWithSort) {
 TEST(QueryRequestTest, InvalidResumeAfterWrongRecordIdType) {
     QueryRequest qr(testns);
     BSONObj resumeAfter = BSON("$recordId" << 1);
-    qr.setResumeAfterResumeToken(resumeAfter);
+    qr.setResumeAfter(resumeAfter);
     qr.setRequestResumeToken(true);
     // Hint must be explicitly set for the query request to validate.
     qr.setHint(fromjson("{$natural: 1}"));
     ASSERT_NOT_OK(qr.validate());
     resumeAfter = BSON("$recordId" << 1LL);
-    qr.setResumeAfterResumeToken(resumeAfter);
+    qr.setResumeAfter(resumeAfter);
     ASSERT_OK(qr.validate());
 }
 
 TEST(QueryRequestTest, InvalidResumeAfterExtraField) {
     QueryRequest qr(testns);
     BSONObj resumeAfter = BSON("$recordId" << 1LL << "$extra" << 1);
-    qr.setResumeAfterResumeToken(resumeAfter);
+    qr.setResumeAfter(resumeAfter);
     qr.setRequestResumeToken(true);
     // Hint must be explicitly set for the query request to validate.
     qr.setHint(fromjson("{$natural: 1}"));
@@ -311,7 +303,7 @@ TEST(QueryRequestTest, InvalidResumeAfterExtraField) {
 TEST(QueryRequestTest, ResumeAfterWithHint) {
     QueryRequest qr(testns);
     BSONObj resumeAfter = BSON("$recordId" << 1LL);
-    qr.setResumeAfterResumeToken(resumeAfter);
+    qr.setResumeAfter(resumeAfter);
     qr.setRequestResumeToken(true);
     ASSERT_NOT_OK(qr.validate());
     qr.setHint(fromjson("{a: 1}"));
@@ -323,7 +315,7 @@ TEST(QueryRequestTest, ResumeAfterWithHint) {
 TEST(QueryRequestTest, ResumeAfterWithSort) {
     QueryRequest qr(testns);
     BSONObj resumeAfter = BSON("$recordId" << 1LL);
-    qr.setResumeAfterResumeToken(resumeAfter);
+    qr.setResumeAfter(resumeAfter);
     qr.setRequestResumeToken(true);
     // Hint must be explicitly set for the query request to validate.
     qr.setHint(fromjson("{$natural: 1}"));
@@ -337,7 +329,7 @@ TEST(QueryRequestTest, ResumeAfterWithSort) {
 TEST(QueryRequestTest, ResumeNoSpecifiedRequestResumeToken) {
     QueryRequest qr(testns);
     BSONObj resumeAfter = BSON("$recordId" << 1LL);
-    qr.setResumeAfterResumeToken(resumeAfter);
+    qr.setResumeAfter(resumeAfter);
     // Hint must be explicitly set for the query request to validate.
     qr.setHint(fromjson("{$natural: 1}"));
     ASSERT_NOT_OK(qr.validate());
@@ -350,7 +342,7 @@ TEST(QueryRequestTest, ExplicitEmptyResumeAfter) {
     BSONObj resumeAfter = fromjson("{}");
     // Hint must be explicitly set for the query request to validate.
     qr.setHint(fromjson("{$natural: 1}"));
-    qr.setResumeAfterResumeToken(resumeAfter);
+    qr.setResumeAfter(resumeAfter);
     ASSERT_OK(qr.validate());
     qr.setRequestResumeToken(true);
     ASSERT_OK(qr.validate());
@@ -377,46 +369,6 @@ TEST(QueryRequestTest, IsTextScoreMeta) {
     ASSERT_FALSE(isFirstElementTextScoreMeta("{a: {$meta: \"image\"}}"));
     ASSERT_FALSE(isFirstElementTextScoreMeta("{a: {$world: \"textScore\"}}"));
     ASSERT_FALSE(isFirstElementTextScoreMeta("{a: {$meta: \"textScore\", b: 1}}"));
-}
-
-//
-// Sort order validation
-// In a valid sort order, each element satisfies one of:
-// 1. a number with value 1
-// 2. a number with value -1
-// 3. isTextScoreMeta
-//
-
-TEST(QueryRequestTest, ValidateSortOrder) {
-    // Valid sorts
-    ASSERT(QueryRequest::isValidSortOrder(fromjson("{}")));
-    ASSERT(QueryRequest::isValidSortOrder(fromjson("{a: 1}")));
-    ASSERT(QueryRequest::isValidSortOrder(fromjson("{a: -1}")));
-    ASSERT(QueryRequest::isValidSortOrder(fromjson("{a: {$meta: \"textScore\"}}")));
-
-    // Invalid sorts
-    ASSERT_FALSE(QueryRequest::isValidSortOrder(fromjson("{a: 100}")));
-    ASSERT_FALSE(QueryRequest::isValidSortOrder(fromjson("{a: 0}")));
-    ASSERT_FALSE(QueryRequest::isValidSortOrder(fromjson("{a: -100}")));
-    ASSERT_FALSE(QueryRequest::isValidSortOrder(fromjson("{a: Infinity}")));
-    ASSERT_FALSE(QueryRequest::isValidSortOrder(fromjson("{a: -Infinity}")));
-    ASSERT_FALSE(QueryRequest::isValidSortOrder(fromjson("{a: true}")));
-    ASSERT_FALSE(QueryRequest::isValidSortOrder(fromjson("{a: false}")));
-    ASSERT_FALSE(QueryRequest::isValidSortOrder(fromjson("{a: null}")));
-    ASSERT_FALSE(QueryRequest::isValidSortOrder(fromjson("{a: {}}")));
-    ASSERT_FALSE(QueryRequest::isValidSortOrder(fromjson("{a: {b: 1}}")));
-    ASSERT_FALSE(QueryRequest::isValidSortOrder(fromjson("{a: []}")));
-    ASSERT_FALSE(QueryRequest::isValidSortOrder(fromjson("{a: [1, 2, 3]}")));
-    ASSERT_FALSE(QueryRequest::isValidSortOrder(fromjson("{a: \"\"}")));
-    ASSERT_FALSE(QueryRequest::isValidSortOrder(fromjson("{a: \"bb\"}")));
-    ASSERT_FALSE(QueryRequest::isValidSortOrder(fromjson("{a: {$meta: 1}}")));
-    ASSERT_FALSE(QueryRequest::isValidSortOrder(fromjson("{a: {$meta: \"image\"}}")));
-    ASSERT_FALSE(QueryRequest::isValidSortOrder(fromjson("{a: {$world: \"textScore\"}}")));
-    ASSERT_FALSE(
-        QueryRequest::isValidSortOrder(fromjson("{a: {$meta: \"textScore\","
-                                                " b: 1}}")));
-    ASSERT_FALSE(QueryRequest::isValidSortOrder(fromjson("{'': 1}")));
-    ASSERT_FALSE(QueryRequest::isValidSortOrder(fromjson("{'': -1}")));
 }
 
 //
@@ -496,6 +448,7 @@ TEST(QueryRequestTest, ParseFromCommandAllFlagsTrue) {
         "awaitData: true,"
         "allowPartialResults: true,"
         "readOnce: true,"
+        "_use44SortKeys: true,"
         "allowSpeculativeMajorityRead: true}");
     const NamespaceString nss("test.testns");
     bool isExplain = false;
@@ -510,6 +463,7 @@ TEST(QueryRequestTest, ParseFromCommandAllFlagsTrue) {
     ASSERT(qr->isTailableAndAwaitData());
     ASSERT(qr->isAllowPartialResults());
     ASSERT(qr->isReadOnce());
+    ASSERT(qr->use44SortKeys());
     ASSERT(qr->allowSpeculativeMajorityRead());
 }
 
@@ -520,6 +474,15 @@ TEST(QueryRequestTest, ParseFromCommandReadOnceDefaultsToFalse) {
     unique_ptr<QueryRequest> qr(
         assertGet(QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain)));
     ASSERT(!qr->isReadOnce());
+}
+
+TEST(QueryRequestTest, ParseFromCommandUse44SortKeysDefaultsToFalse) {
+    BSONObj cmdObj = fromjson("{find: 'testns'}");
+    const NamespaceString nss("test.testns");
+    bool isExplain = false;
+    unique_ptr<QueryRequest> qr(
+        assertGet(QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain)));
+    ASSERT(!qr->use44SortKeys());
 }
 
 TEST(QueryRequestTest, ParseFromCommandValidMinMax) {
@@ -901,6 +864,17 @@ TEST(QueryRequestTest, ParseFromCommandRuntimeConstantsSubfieldsWrongType) {
                        ErrorCodes::TypeMismatch);
 }
 
+TEST(QueryRequestTest, ParseFromCommandUse44SortKeysWrongType) {
+    BSONObj cmdObj = BSON("find"
+                          << "testns"
+                          << "_use44SortKeys"
+                          << "shouldBeBool");
+    const NamespaceString nss("test.testns");
+    bool isExplain = false;
+    auto result = QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain);
+    ASSERT_NOT_OK(result.getStatus());
+}
+
 //
 // Parsing errors where a field has the right type but a bad value.
 //
@@ -1010,7 +984,7 @@ TEST(QueryRequestTest, ParseFromCommandResumeToken) {
     bool isExplain = false;
     unique_ptr<QueryRequest> qr(
         assertGet(QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain)));
-    ASSERT(!qr->getResumeAfterResumeToken().isEmpty());
+    ASSERT(!qr->getResumeAfter().isEmpty());
     ASSERT(qr->getRequestResumeToken());
 }
 
@@ -1025,7 +999,7 @@ TEST(QueryRequestTest, ParseFromCommandEmptyResumeToken) {
     unique_ptr<QueryRequest> qr(
         assertGet(QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain)));
     ASSERT(qr->getRequestResumeToken());
-    ASSERT(qr->getResumeAfterResumeToken().isEmpty());
+    ASSERT(qr->getResumeAfter().isEmpty());
 }
 
 //
@@ -1130,7 +1104,7 @@ TEST(QueryRequestTest, ParseFromCommandMinMaxDifferentFieldsError) {
     ASSERT_NOT_OK(result.getStatus());
 }
 
-TEST(QueryRequestTest, ParseCommandForbidNonMetaSortOnFieldWithMetaProject) {
+TEST(QueryRequestTest, ParseCommandAllowNonMetaSortOnFieldWithMetaProject) {
     BSONObj cmdObj;
 
     cmdObj = fromjson(
@@ -1140,7 +1114,7 @@ TEST(QueryRequestTest, ParseCommandForbidNonMetaSortOnFieldWithMetaProject) {
     const NamespaceString nss("test.testns");
     bool isExplain = false;
     auto result = QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain);
-    ASSERT_NOT_OK(result.getStatus());
+    ASSERT_OK(result.getStatus());
 
     cmdObj = fromjson(
         "{find: 'testns',"
@@ -1149,7 +1123,7 @@ TEST(QueryRequestTest, ParseCommandForbidNonMetaSortOnFieldWithMetaProject) {
     ASSERT_OK(QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain).getStatus());
 }
 
-TEST(QueryRequestTest, ParseCommandForbidMetaSortOnFieldWithoutMetaProject) {
+TEST(QueryRequestTest, ParseCommandAllowMetaSortOnFieldWithoutMetaProject) {
     BSONObj cmdObj;
 
     cmdObj = fromjson(
@@ -1159,14 +1133,14 @@ TEST(QueryRequestTest, ParseCommandForbidMetaSortOnFieldWithoutMetaProject) {
     const NamespaceString nss("test.testns");
     bool isExplain = false;
     auto result = QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain);
-    ASSERT_NOT_OK(result.getStatus());
+    ASSERT_OK(result.getStatus());
 
     cmdObj = fromjson(
         "{find: 'testns',"
         "projection: {b: 1},"
         "sort: {a: {$meta: 'textScore'}}}");
     result = QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain);
-    ASSERT_NOT_OK(result.getStatus());
+    ASSERT_OK(result.getStatus());
 }
 
 TEST(QueryRequestTest, ParseCommandForbidExhaust) {
@@ -1445,7 +1419,7 @@ TEST(QueryRequestTest, ConvertToAggregationWithRequestResumeTokenFails) {
 TEST(QueryRequestTest, ConvertToAggregationWithResumeAfterFails) {
     QueryRequest qr(testns);
     BSONObj resumeAfter = BSON("$recordId" << 1LL);
-    qr.setResumeAfterResumeToken(resumeAfter);
+    qr.setResumeAfter(resumeAfter);
     ASSERT_NOT_OK(qr.asAggregationCommand());
 }
 
@@ -1661,9 +1635,9 @@ TEST_F(QueryRequestTest, ParseFromUUID) {
     // Register a UUID/Collection pair in the CollectionCatalog.
     const CollectionUUID uuid = UUID::gen();
     const NamespaceString nss("test.testns");
-    auto coll = std::make_unique<CollectionMock>(nss);
+    std::unique_ptr<Collection> collection = std::make_unique<CollectionMock>(nss);
     CollectionCatalog& catalog = CollectionCatalog::get(opCtx.get());
-    catalog.registerCollection(uuid, std::move(coll));
+    catalog.registerCollection(uuid, &collection);
     QueryRequest qr(NamespaceStringOrUUID("test", uuid));
     // Ensure a call to refreshNSS succeeds.
     qr.refreshNSS(opCtx.get());

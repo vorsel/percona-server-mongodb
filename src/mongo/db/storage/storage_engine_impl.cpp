@@ -45,6 +45,7 @@
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/storage/durable_catalog_feature_tracker.h"
+#include "mongo/db/storage/enable_two_phase_index_build_gen.h"
 #include "mongo/db/storage/kv/kv_engine.h"
 #include "mongo/db/storage/kv/temporary_kv_record_store.h"
 #include "mongo/db/storage/storage_repair_observer.h"
@@ -277,7 +278,7 @@ void StorageEngineImpl::_initCollection(OperationContext* opCtx,
     auto collection = collectionFactory->make(opCtx, nss, catalogId, uuid, std::move(rs));
 
     auto& collectionCatalog = CollectionCatalog::get(getGlobalServiceContext());
-    collectionCatalog.registerCollection(uuid, std::move(collection));
+    collectionCatalog.registerCollection(uuid, &collection);
 }
 
 void StorageEngineImpl::closeCatalog(OperationContext* opCtx) {
@@ -398,7 +399,7 @@ StatusWith<StorageEngine::ReconcileResult> StorageEngineImpl::reconcileCatalogAn
         const auto& toRemove = it;
         log() << "Dropping unknown ident: " << toRemove;
         WriteUnitOfWork wuow(opCtx);
-        fassert(40591, _engine->dropIdent(opCtx, toRemove));
+        fassert(40591, _engine->dropIdent(opCtx, opCtx->recoveryUnit(), toRemove));
         wuow.commit();
     }
 
@@ -466,49 +467,23 @@ StatusWith<StorageEngine::ReconcileResult> StorageEngineImpl::reconcileCatalogAn
             // be associated with multiple indexes.
             if (indexMetaData.buildUUID) {
                 invariant(!indexMetaData.ready);
-                invariant(indexMetaData.runTwoPhaseBuild);
 
                 auto collUUID = metaData.options.uuid;
                 invariant(collUUID);
                 auto buildUUID = *indexMetaData.buildUUID;
 
-                log() << "Found index from unfinished build. Collection: " << coll << "("
+                log() << "Found index from unfinished build. Collection: " << coll << " ("
                       << *collUUID << "), index: " << indexName << ", build UUID: " << buildUUID;
 
                 // Insert in the map if a build has not already been registered.
                 auto existingIt = ret.indexBuildsToRestart.find(buildUUID);
                 if (existingIt == ret.indexBuildsToRestart.end()) {
-                    ret.indexBuildsToRestart.insert({buildUUID, IndexBuildToRestart(*collUUID)});
+                    ret.indexBuildsToRestart.insert({buildUUID, IndexBuildDetails(*collUUID)});
                     existingIt = ret.indexBuildsToRestart.find(buildUUID);
                 }
 
                 existingIt->second.indexSpecs.emplace_back(indexMetaData.spec);
                 continue;
-            }
-
-            // If this index was draining, do not delete any internal idents that it may have owned.
-            // Instead, the idents can be used later on to resume draining instead of a
-            // performing a full rebuild. This is only done for background secondary builds, because
-            // the index must be rebuilt, and it is dropped otherwise.
-            // TODO: SERVER-37952 Do not drop these idents for background index builds on
-            // primaries once index builds are resumable from draining.
-            if (!indexMetaData.ready && indexMetaData.isBackgroundSecondaryBuild &&
-                indexMetaData.buildPhase ==
-                    BSONCollectionCatalogEntry::kIndexBuildDraining.toString()) {
-
-                if (indexMetaData.constraintViolationsIdent) {
-                    auto it = internalIdentsToDrop.find(*indexMetaData.constraintViolationsIdent);
-                    if (it != internalIdentsToDrop.end()) {
-                        internalIdentsToDrop.erase(it);
-                    }
-                }
-
-                if (indexMetaData.sideWritesIdent) {
-                    auto it = internalIdentsToDrop.find(*indexMetaData.sideWritesIdent);
-                    if (it != internalIdentsToDrop.end()) {
-                        internalIdentsToDrop.erase(it);
-                    }
-                }
             }
 
             // If the index was kicked off as a background secondary index build, replication
@@ -520,7 +495,7 @@ StatusWith<StorageEngine::ReconcileResult> StorageEngineImpl::reconcileCatalogAn
                     log() << "Dropping an unfinished index because --noIndexBuildRetry is set. "
                              "Collection: "
                           << coll << " Index: " << indexName;
-                    fassert(51197, _engine->dropIdent(opCtx, indexIdent));
+                    fassert(51197, _engine->dropIdent(opCtx, opCtx->recoveryUnit(), indexIdent));
                     indexesToDrop.push_back(indexName);
                     continue;
                 }
@@ -542,7 +517,7 @@ StatusWith<StorageEngine::ReconcileResult> StorageEngineImpl::reconcileCatalogAn
                 log() << "Dropping unfinished index. Collection: " << coll
                       << " Index: " << indexName;
                 // Ensure the `ident` is dropped while we have the `indexIdent` value.
-                fassert(50713, _engine->dropIdent(opCtx, indexIdent));
+                fassert(50713, _engine->dropIdent(opCtx, opCtx->recoveryUnit(), indexIdent));
                 indexesToDrop.push_back(indexName);
                 continue;
             }
@@ -563,7 +538,7 @@ StatusWith<StorageEngine::ReconcileResult> StorageEngineImpl::reconcileCatalogAn
     for (auto&& temp : internalIdentsToDrop) {
         log() << "Dropping internal ident: " << temp;
         WriteUnitOfWork wuow(opCtx);
-        fassert(51067, _engine->dropIdent(opCtx, temp));
+        fassert(51067, _engine->dropIdent(opCtx, opCtx->recoveryUnit(), temp));
         wuow.commit();
     }
 
@@ -676,7 +651,7 @@ Status StorageEngineImpl::_dropCollectionsNoTimestamp(OperationContext* opCtx,
     WriteUnitOfWork untimestampedDropWuow(opCtx);
     for (auto& nss : toDrop) {
         invariant(getCatalog());
-        auto coll = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(nss);
+        auto coll = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
         Status result = getCatalog()->dropCollection(opCtx, coll->getCatalogId());
 
         if (!result.isOK() && firstError.isOK()) {
@@ -714,9 +689,13 @@ void StorageEngineImpl::endBackup(OperationContext* opCtx) {
     _inBackupMode = false;
 }
 
-StatusWith<std::vector<StorageEngine::BackupBlock>> StorageEngineImpl::beginNonBlockingBackup(
-    OperationContext* opCtx) {
-    return _engine->beginNonBlockingBackup(opCtx);
+Status StorageEngineImpl::disableIncrementalBackup(OperationContext* opCtx) {
+    return _engine->disableIncrementalBackup(opCtx);
+}
+
+StatusWith<StorageEngine::BackupInformation> StorageEngineImpl::beginNonBlockingBackup(
+    OperationContext* opCtx, const StorageEngine::BackupOptions& options) {
+    return _engine->beginNonBlockingBackup(opCtx, options);
 }
 
 void StorageEngineImpl::endNonBlockingBackup(OperationContext* opCtx) {
@@ -763,7 +742,7 @@ Status StorageEngineImpl::repairRecordStore(OperationContext* opCtx,
 
     // After repairing, re-initialize the collection with a valid RecordStore.
     auto& collectionCatalog = CollectionCatalog::get(getGlobalServiceContext());
-    auto uuid = collectionCatalog.lookupUUIDByNSS(nss).get();
+    auto uuid = collectionCatalog.lookupUUIDByNSS(opCtx, nss).get();
     collectionCatalog.deregisterCollection(uuid);
     _initCollection(opCtx, catalogId, nss, false);
     return Status::OK();
@@ -872,6 +851,23 @@ bool StorageEngineImpl::supportsPendingDrops() const {
 
 void StorageEngineImpl::clearDropPendingState() {
     _dropPendingIdentReaper.clearDropPendingState();
+}
+
+bool StorageEngineImpl::supportsTwoPhaseIndexBuild() const {
+    if (!enableTwoPhaseIndexBuild) {
+        return false;
+    }
+
+    if (!serverGlobalParams.featureCompatibility.isVersionInitialized()) {
+        return false;
+    }
+
+    if (serverGlobalParams.featureCompatibility.getVersion() !=
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
+        return false;
+    }
+
+    return true;
 }
 
 void StorageEngineImpl::triggerJournalFlush() const {

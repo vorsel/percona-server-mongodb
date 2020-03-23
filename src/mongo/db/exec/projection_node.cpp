@@ -40,6 +40,7 @@ ProjectionNode::ProjectionNode(ProjectionPolicies policies, std::string pathToNo
     : _policies(policies), _pathToNode(std::move(pathToNode)) {}
 
 void ProjectionNode::addProjectionForPath(const FieldPath& path) {
+    makeOptimizationsStale();
     if (path.getPathLength() == 1) {
         _projectedFields.insert(path.fullPath());
         return;
@@ -50,8 +51,14 @@ void ProjectionNode::addProjectionForPath(const FieldPath& path) {
 
 void ProjectionNode::addExpressionForPath(const FieldPath& path,
                                           boost::intrusive_ptr<Expression> expr) {
+    makeOptimizationsStale();
     // If the computed fields policy is 'kBanComputedFields', we should never reach here.
     invariant(_policies.computedFieldsPolicy == ComputedFieldsPolicy::kAllowComputedFields);
+
+    // We're going to add an expression either to this node, or to some child of this node.
+    // In any case, the entire subtree will contain at least one computed field.
+    _subtreeContainsComputedFields = true;
+
     if (path.getPathLength() == 1) {
         auto fieldName = path.fullPath();
         _expressions[fieldName] = expr;
@@ -63,24 +70,29 @@ void ProjectionNode::addExpressionForPath(const FieldPath& path,
 }
 
 boost::intrusive_ptr<Expression> ProjectionNode::getExpressionForPath(const FieldPath& path) const {
+    // The FieldPath always conatins at least one field.
+    auto fieldName = path.getFieldName(0).toString();
+
     if (path.getPathLength() == 1) {
-        if (_expressions.find(path.getFieldName(0)) != _expressions.end()) {
-            return _expressions.at(path.getFieldName(0));
+        if (_expressions.find(fieldName) != _expressions.end()) {
+            return _expressions.at(fieldName);
         }
         return nullptr;
     }
-    if (auto child = getChild(path.getFieldName(0).toString())) {
+    if (auto child = getChild(fieldName)) {
         return child->getExpressionForPath(path.tail());
     }
     return nullptr;
 }
 
 ProjectionNode* ProjectionNode::addOrGetChild(const std::string& field) {
+    makeOptimizationsStale();
     auto child = getChild(field);
     return child ? child : addChild(field);
 }
 
 ProjectionNode* ProjectionNode::addChild(const std::string& field) {
+    makeOptimizationsStale();
     invariant(!str::contains(field, "."));
     _orderToProcessAdditionsAndChildren.push_back(field);
     auto insertedPair = _children.emplace(std::make_pair(field, makeChild(field)));
@@ -96,39 +108,42 @@ Document ProjectionNode::applyToDocument(const Document& inputDoc) const {
     // Defer to the derived class to initialize the output document, then apply.
     MutableDocument outputDoc{initializeOutputDocument(inputDoc)};
     applyProjections(inputDoc, &outputDoc);
-    applyExpressions(inputDoc, &outputDoc);
+
+    if (_subtreeContainsComputedFields) {
+        applyExpressions(inputDoc, &outputDoc);
+    }
 
     // Make sure that we always pass through any metadata present in the input doc.
-    outputDoc.copyMetaDataFrom(inputDoc);
+    if (inputDoc.metadata()) {
+        outputDoc.copyMetaDataFrom(inputDoc);
+    }
     return outputDoc.freeze();
 }
 
 void ProjectionNode::applyProjections(const Document& inputDoc, MutableDocument* outputDoc) const {
     // Iterate over the input document so that the projected document retains its field ordering.
     auto it = inputDoc.fieldIterator();
+    size_t projectedFields = 0;
+
     while (it.more()) {
-        auto fieldPair = it.next();
-        auto fieldName = fieldPair.first.toString();
-        if (_projectedFields.count(fieldName)) {
+        auto fieldName = it.fieldName();
+        absl::string_view fieldNameKey{fieldName.rawData(), fieldName.size()};
+
+        if (_projectedFields.find(fieldNameKey) != _projectedFields.end()) {
             outputProjectedField(
-                fieldName, applyLeafProjectionToValue(fieldPair.second), outputDoc);
-            continue;
+                fieldName, applyLeafProjectionToValue(it.next().second), outputDoc);
+            ++projectedFields;
+        } else if (auto childIt = _children.find(fieldNameKey); childIt != _children.end()) {
+            outputProjectedField(
+                fieldName, childIt->second->applyProjectionsToValue(it.next().second), outputDoc);
+            ++projectedFields;
+        } else {
+            it.advance();
         }
 
-        auto childIt = _children.find(fieldName);
-        if (childIt != _children.end()) {
-            outputProjectedField(
-                fieldName, childIt->second->applyProjectionsToValue(fieldPair.second), outputDoc);
-        }
-    }
-
-    // Ensure we project all specified fields, including those not present in the input document.
-    // TODO SERVER-37791: This block is only necessary due to a bug in exclusion semantics.
-    if (applyLeafProjectionToValue(Value(true)).missing()) {
-        for (auto&& fieldName : _projectedFields) {
-            if (inputDoc[fieldName].missing()) {
-                outputProjectedField(fieldName, Value(), outputDoc);
-            }
+        // Check if we can avoid reading from the document any further.
+        if (_maxFieldsToProject && _maxFieldsToProject <= projectedFields) {
+            break;
         }
     }
 }
@@ -189,7 +204,7 @@ Value ProjectionNode::applyExpressionsToValue(const Document& root, Value inputV
         }
         return Value(std::move(values));
     } else {
-        if (subtreeContainsComputedFields()) {
+        if (_subtreeContainsComputedFields) {
             // Our semantics in this case are to replace whatever existing value we find with a new
             // document of all the computed values. This case represents applying a projection like
             // {"a.b": {$literal: 1}} to the document {a: 1}. This should yield {a: {b: 1}}.
@@ -200,13 +215,6 @@ Value ProjectionNode::applyExpressionsToValue(const Document& root, Value inputV
         // We didn't have any expressions, so just skip this value.
         return transformSkippedValueForOutput(inputValue);
     }
-}
-
-bool ProjectionNode::subtreeContainsComputedFields() const {
-    return (!_expressions.empty()) ||
-        std::any_of(_children.begin(), _children.end(), [](const auto& childPair) {
-               return childPair.second->subtreeContainsComputedFields();
-           });
 }
 
 void ProjectionNode::reportProjectedPaths(std::set<std::string>* projectedPaths) const {
@@ -244,6 +252,8 @@ void ProjectionNode::optimize() {
     for (auto&& childPair : _children) {
         childPair.second->optimize();
     }
+
+    _maxFieldsToProject = maxFieldsToProject();
 }
 
 Document ProjectionNode::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {

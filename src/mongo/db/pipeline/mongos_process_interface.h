@@ -49,8 +49,6 @@ public:
 
     virtual ~MongoSInterface() = default;
 
-    void setOperationContext(OperationContext* opCtx) final {}
-
     boost::optional<Document> lookupSingleDocument(
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         const NamespaceString& nss,
@@ -87,10 +85,13 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    CollectionIndexUsageMap getIndexStats(OperationContext* opCtx,
-                                          const NamespaceString& ns) final {
+    std::vector<Document> getIndexStats(OperationContext* opCtx,
+                                        const NamespaceString& ns,
+                                        StringData host,
+                                        bool addShardName) final {
         MONGO_UNREACHABLE;
     }
+
     std::list<BSONObj> getIndexSpecs(OperationContext* opCtx,
                                      const NamespaceString& ns,
                                      bool includeBuildUUIDs) final {
@@ -141,9 +142,9 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    void createIndexes(OperationContext* opCtx,
-                       const NamespaceString& ns,
-                       const std::vector<BSONObj>& indexSpecs) final {
+    void createIndexesOnEmptyCollection(OperationContext* opCtx,
+                                        const NamespaceString& ns,
+                                        const std::vector<BSONObj>& indexSpecs) final {
         MONGO_UNREACHABLE;
     }
 
@@ -184,9 +185,7 @@ public:
      * a mongos.
      */
     BackupCursorState openBackupCursor(OperationContext* opCtx,
-                                       bool incrementalBackup,
-                                       boost::optional<std::string> thisBackupName,
-                                       boost::optional<std::string> srcBackupName) final {
+                                       const StorageEngine::BackupOptions& options) final {
         MONGO_UNREACHABLE;
     }
 

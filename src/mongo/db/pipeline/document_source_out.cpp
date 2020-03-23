@@ -35,11 +35,13 @@
 
 #include <fmt/format.h>
 
+#include "mongo/db/background.h"
 #include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/pipeline/document_path_support.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/util/destructor_guard.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 #include "mongo/util/uuid.h"
 
@@ -47,6 +49,7 @@ namespace mongo {
 using namespace fmt::literals;
 
 MONGO_FAIL_POINT_DEFINE(hangWhileBuildingDocumentSourceOutBatch);
+MONGO_FAIL_POINT_DEFINE(outWaitAfterTempCollectionCreation);
 REGISTER_DOCUMENT_SOURCE(out,
                          DocumentSourceOut::LiteParsed::parse,
                          DocumentSourceOut::createFromBson);
@@ -69,11 +72,6 @@ DocumentSourceOut::~DocumentSourceOut() {
 
             DocumentSourceWriteBlock writeBlock(cleanupOpCtx.get());
 
-            // Reset the operation context back to original once dropCollection is done.
-            ON_BLOCK_EXIT(
-                [this] { pExpCtx->mongoProcessInterface->setOperationContext(pExpCtx->opCtx); });
-
-            pExpCtx->mongoProcessInterface->setOperationContext(cleanupOpCtx.get());
             pExpCtx->mongoProcessInterface->dropCollection(cleanupOpCtx.get(), _tempNs);
         });
 }
@@ -151,6 +149,10 @@ void DocumentSourceOut::initialize() {
             _originalOutOptions["capped"].eoo());
 
     // Create temp collection, copying options from the existing output collection if any.
+    // Disallows drops and renames on this namespace. This is required to ensure
+    // 'createIndexesOnEmptyCollection' is called on a namespace that both exists and is empty as
+    // the function expects.
+    BackgroundOperation backgroundOp(_tempNs.ns());
     {
         BSONObjBuilder cmd;
         cmd << "create" << _tempNs.coll();
@@ -161,6 +163,14 @@ void DocumentSourceOut::initialize() {
             pExpCtx->opCtx, _tempNs.db().toString(), cmd.done());
     }
 
+    CurOpFailpointHelpers::waitWhileFailPointEnabled(
+        &outWaitAfterTempCollectionCreation,
+        pExpCtx->opCtx,
+        "outWaitAfterTempCollectionCreation",
+        []() {
+            log() << "Hanging aggregation due to 'outWaitAfterTempCollectionCreation' "
+                  << "failpoint";
+        });
     if (_originalIndexes.empty()) {
         return;
     }
@@ -169,7 +179,8 @@ void DocumentSourceOut::initialize() {
     try {
         std::vector<BSONObj> tempNsIndexes = {std::begin(_originalIndexes),
                                               std::end(_originalIndexes)};
-        pExpCtx->mongoProcessInterface->createIndexes(pExpCtx->opCtx, _tempNs, tempNsIndexes);
+        pExpCtx->mongoProcessInterface->createIndexesOnEmptyCollection(
+            pExpCtx->opCtx, _tempNs, tempNsIndexes);
     } catch (DBException& ex) {
         ex.addContext("Copying indexes for $out failed");
         throw;
@@ -206,11 +217,6 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceOut::createAndAllowDifferentD
     uassert(ErrorCodes::OperationNotSupportedInTransaction,
             "{} cannot be used in a transaction"_format(kStageName),
             !expCtx->inMultiDocumentTransaction);
-
-    auto readConcernLevel = repl::ReadConcernArgs::get(expCtx->opCtx).getLevel();
-    uassert(ErrorCodes::InvalidOptions,
-            "{} cannot be used with a 'linearizable' read concern level"_format(kStageName),
-            readConcernLevel != repl::ReadConcernLevel::kLinearizableReadConcern);
 
     uassert(ErrorCodes::InvalidNamespace,
             "Invalid {} target namespace, {}"_format(kStageName, outputNs.ns()),

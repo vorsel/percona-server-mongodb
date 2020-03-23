@@ -25,7 +25,6 @@
 (function() {
 "use strict";
 
-load("jstests/libs/check_log.js");
 load("jstests/libs/parallel_shell_helpers.js");
 load('jstests/libs/test_background_ops.js');
 
@@ -44,11 +43,13 @@ const indexSpecC = {
 
 testColl.drop();
 assert.commandWorked(testDB.adminCommand({clearLog: 'global'}));
-
-// TODO (SERVER-40952): currently createIndexes will hold an X lock for the duration of the
-// build if the collection is not created beforehand. This test needs that not to happen, so we
-// can pause a build and a subsequently issued request can get an IX lock.
+// This test depends on using the IndexBuildsCoordinator to build this index, which as of
+// SERVER-44405, will not occur in this test unless the collection is created beforehand.
 assert.commandWorked(testDB.runCommand({create: collName}));
+
+// Insert document into collection to avoid optimization for index creation on an empty collection.
+// This allows us to pause index builds on the collection using a fail point.
+assert.commandWorked(testColl.insert({a: 1}));
 
 function runSuccessfulIndexBuild(dbName, collName, indexSpec, requestNumber) {
     jsTest.log("Index build request " + requestNumber + " starting...");

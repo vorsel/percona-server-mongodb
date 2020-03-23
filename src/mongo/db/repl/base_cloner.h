@@ -41,7 +41,6 @@
 #include "mongo/platform/mutex.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/future.h"
-#include "mongo/util/system_clock_source.h"
 
 namespace mongo {
 namespace repl {
@@ -53,8 +52,7 @@ public:
                HostAndPort source,
                DBClientConnection* client,
                StorageInterface* storageInterface,
-               ThreadPool* dbPool,
-               ClockSource* clock = SystemClockSource::get());
+               ThreadPool* dbPool);
 
     virtual ~BaseCloner() = default;
 
@@ -105,7 +103,7 @@ protected:
          * Returns true if the Status represents an error which should be retried.
          */
         virtual bool isTransientError(const Status& status) {
-            return ErrorCodes::isNetworkError(status);
+            return ErrorCodes::isRetriableError(status);
         }
 
         /**
@@ -170,10 +168,6 @@ protected:
 
     ThreadPool* getDBPool() const {
         return _dbPool;
-    }
-
-    ClockSource* getClock() const {
-        return _clock;
     }
 
     bool isActive(WithLock) const {
@@ -259,7 +253,6 @@ private:
     StorageInterface* _storageInterface;  // (X)
     ThreadPool* _dbPool;                  // (X)
     HostAndPort _source;                  // (R)
-    ClockSource* _clock;                  // (S)
 
     // _active indicates this cloner is being run, and is used only for status reporting and
     // invariant checking.
@@ -275,8 +268,8 @@ private:
     // stage.
     std::string _stopAfterStage;  // (X)
 
-    // Are we currently retrying?
-    bool _retrying = false;  // (X)
+    // Operation that may currently be retrying.
+    InitialSyncSharedData::RetryableOperation _retryableOp;  // (X)
 };
 
 }  // namespace repl

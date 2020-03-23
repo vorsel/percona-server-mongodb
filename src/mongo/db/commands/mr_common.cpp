@@ -136,26 +136,29 @@ auto translateReduce(boost::intrusive_ptr<ExpressionContext> expCtx, std::string
                                        boost::none);
 }
 
-auto translateFinalize(boost::intrusive_ptr<ExpressionContext> expCtx, std::string code) {
-    auto jsExpression = ExpressionInternalJs::create(
-        expCtx,
-        ExpressionArray::create(
+auto translateFinalize(boost::intrusive_ptr<ExpressionContext> expCtx,
+                       MapReduceJavascriptCodeOrNull codeObj) {
+    return codeObj.getCode().map([&](auto&& code) {
+        auto jsExpression = ExpressionInternalJs::create(
             expCtx,
-            make_vector<boost::intrusive_ptr<Expression>>(
-                ExpressionFieldPath::parse(expCtx, "$_id", expCtx->variablesParseState),
-                ExpressionFieldPath::parse(expCtx, "$value", expCtx->variablesParseState))),
-        code);
-    auto node = std::make_unique<projection_executor::InclusionNode>(
-        ProjectionPolicies{ProjectionPolicies::DefaultIdPolicy::kIncludeId});
-    node->addProjectionForPath(FieldPath{"_id"s});
-    node->addExpressionForPath(FieldPath{"value"s}, std::move(jsExpression));
-    auto inclusion = std::unique_ptr<TransformerInterface>{
-        std::make_unique<projection_executor::InclusionProjectionExecutor>(
-            expCtx,
-            ProjectionPolicies{ProjectionPolicies::DefaultIdPolicy::kIncludeId},
-            std::move(node))};
-    return make_intrusive<DocumentSourceSingleDocumentTransformation>(
-        expCtx, std::move(inclusion), DocumentSourceProject::kStageName, false);
+            ExpressionArray::create(
+                expCtx,
+                make_vector<boost::intrusive_ptr<Expression>>(
+                    ExpressionFieldPath::parse(expCtx, "$_id", expCtx->variablesParseState),
+                    ExpressionFieldPath::parse(expCtx, "$value", expCtx->variablesParseState))),
+            code);
+        auto node = std::make_unique<projection_executor::InclusionNode>(
+            ProjectionPolicies{ProjectionPolicies::DefaultIdPolicy::kIncludeId});
+        node->addProjectionForPath(FieldPath{"_id"s});
+        node->addExpressionForPath(FieldPath{"value"s}, std::move(jsExpression));
+        auto inclusion = std::unique_ptr<TransformerInterface>{
+            std::make_unique<projection_executor::InclusionProjectionExecutor>(
+                expCtx,
+                ProjectionPolicies{ProjectionPolicies::DefaultIdPolicy::kIncludeId},
+                std::move(node))};
+        return make_intrusive<DocumentSourceSingleDocumentTransformation>(
+            expCtx, std::move(inclusion), DocumentSourceProject::kStageName, false);
+    });
 }
 
 auto translateOutReplace(boost::intrusive_ptr<ExpressionContext> expCtx,
@@ -163,21 +166,24 @@ auto translateOutReplace(boost::intrusive_ptr<ExpressionContext> expCtx,
     return DocumentSourceOut::createAndAllowDifferentDB(std::move(targetNss), expCtx);
 }
 
-auto translateOutMerge(boost::intrusive_ptr<ExpressionContext> expCtx, NamespaceString targetNss) {
-    return DocumentSourceMerge::create(targetNss,
+auto translateOutMerge(boost::intrusive_ptr<ExpressionContext> expCtx,
+                       NamespaceString targetNss,
+                       boost::optional<ChunkVersion> targetCollectionVersion) {
+    return DocumentSourceMerge::create(std::move(targetNss),
                                        expCtx,
                                        MergeWhenMatchedModeEnum::kReplace,
                                        MergeWhenNotMatchedModeEnum::kInsert,
                                        boost::none,  // Let variables
                                        boost::none,  // pipeline
                                        std::set<FieldPath>{FieldPath("_id"s)},
-                                       boost::none);  // targetCollectionVersion
+                                       std::move(targetCollectionVersion));
 }
 
 auto translateOutReduce(boost::intrusive_ptr<ExpressionContext> expCtx,
                         NamespaceString targetNss,
+                        boost::optional<ChunkVersion> targetCollectionVersion,
                         std::string reduceCode,
-                        boost::optional<MapReduceJavascriptCode> finalizeCode) {
+                        boost::optional<MapReduceJavascriptCodeOrNull> finalizeCode) {
     // Because of communication for sharding, $merge must hold on to a serializable BSON object
     // at the moment so we reparse here. Note that the reduce function signature expects 2
     // arguments, the first being the key and the second being the array of values to reduce.
@@ -191,39 +197,61 @@ auto translateOutReduce(boost::intrusive_ptr<ExpressionContext> expCtx,
     auto pipelineSpec = boost::make_optional(std::vector<BSONObj>{reduceSpec});
 
     // Build finalize $project stage if given.
-    if (finalizeCode) {
+    if (finalizeCode && finalizeCode->hasCode()) {
         auto finalizeObj = BSON("args" << BSON_ARRAY("$_id"
                                                      << "$value")
-                                       << "eval" << finalizeCode->getCode());
+                                       << "eval" << finalizeCode->getCode().get());
         auto finalizeSpec =
             BSON(DocumentSourceProject::kStageName
                  << BSON("value" << BSON(ExpressionInternalJs::kExpressionName << finalizeObj)));
         pipelineSpec->emplace_back(std::move(finalizeSpec));
     }
 
-    return DocumentSourceMerge::create(targetNss,
+    return DocumentSourceMerge::create(std::move(targetNss),
                                        expCtx,
                                        MergeWhenMatchedModeEnum::kPipeline,
                                        MergeWhenNotMatchedModeEnum::kInsert,
                                        boost::none,  // Let variables
                                        pipelineSpec,
                                        std::set<FieldPath>{FieldPath("_id"s)},
-                                       boost::none);  // targetCollectionVersion
+                                       std::move(targetCollectionVersion));
+}
+
+void rejectRequestsToCreateShardedCollections(
+    const MapReduceOutOptions& outOptions,
+    const boost::optional<ChunkVersion>& targetCollectionVersion) {
+    uassert(ErrorCodes::InvalidOptions,
+            "Combination of 'out.sharded' and 'replace' output mode is not supported. Cannot "
+            "replace an existing sharded collection or create a new sharded collection. Please "
+            "create the sharded collection first and use a different output mode or consider using "
+            "an unsharded collection.",
+            !(outOptions.getOutputType() == OutputType::Replace && outOptions.isSharded()));
+    uassert(ErrorCodes::InvalidOptions,
+            "Cannot use mapReduce to create a new sharded collection. Please create and shard the"
+            " target collection before proceeding.",
+            targetCollectionVersion || !outOptions.isSharded());
 }
 
 auto translateOut(boost::intrusive_ptr<ExpressionContext> expCtx,
-                  const OutputType outputType,
+                  const MapReduceOutOptions& outOptions,
                   NamespaceString targetNss,
+                  boost::optional<ChunkVersion> targetCollectionVersion,
                   std::string reduceCode,
-                  boost::optional<MapReduceJavascriptCode> finalizeCode) {
-    switch (outputType) {
+                  boost::optional<MapReduceJavascriptCodeOrNull> finalizeCode) {
+    rejectRequestsToCreateShardedCollections(outOptions, targetCollectionVersion);
+
+    switch (outOptions.getOutputType()) {
         case OutputType::Replace:
-            return boost::make_optional(translateOutReplace(expCtx, targetNss));
+            return boost::make_optional(translateOutReplace(expCtx, std::move(targetNss)));
         case OutputType::Merge:
-            return boost::make_optional(translateOutMerge(expCtx, targetNss));
+            return boost::make_optional(translateOutMerge(
+                expCtx, std::move(targetNss), std::move(targetCollectionVersion)));
         case OutputType::Reduce:
-            return boost::make_optional(translateOutReduce(
-                expCtx, targetNss, std::move(reduceCode), std::move(finalizeCode)));
+            return boost::make_optional(translateOutReduce(expCtx,
+                                                           std::move(targetNss),
+                                                           std::move(targetCollectionVersion),
+                                                           std::move(reduceCode),
+                                                           std::move(finalizeCode)));
         case OutputType::InMemory:;
     }
     return boost::optional<boost::intrusive_ptr<mongo::DocumentSource>>{};
@@ -351,26 +379,18 @@ std::unique_ptr<Pipeline, PipelineDeleter> translateFromMR(
                                       : parsedMr.getNamespace().db(),
                                   parsedMr.getOutOptions().getCollectionName()};
 
-    auto outType = parsedMr.getOutOptions().getOutputType();
-
+    std::set<FieldPath> shardKey;
+    boost::optional<ChunkVersion> targetCollectionVersion;
     // If non-inline output, verify that the target collection is *not* sharded by anything other
     // than _id.
-    if (outType != OutputType::InMemory) {
-        auto [shardKey, targetCollectionVersion] =
+    if (parsedMr.getOutOptions().getOutputType() != OutputType::InMemory) {
+        std::tie(shardKey, targetCollectionVersion) =
             expCtx->mongoProcessInterface->ensureFieldsUniqueOrResolveDocumentKey(
                 expCtx, boost::none, boost::none, outNss);
         uassert(31313,
                 "The mapReduce target collection must either be unsharded or sharded by {_id: 1} "
                 "or {_id: 'hashed'}",
                 shardKey == std::set<FieldPath>{FieldPath("_id"s)});
-    }
-
-    // If sharded option is set to true and the replace action is specified, verify that this isn't
-    // running on mongos.
-    if (outType == OutputType::Replace && parsedMr.getOutOptions().isSharded()) {
-        uassert(31327,
-                "Cannot replace output collection when specifying sharded: true",
-                !expCtx->inMongos);
     }
 
     try {
@@ -384,12 +404,12 @@ std::unique_ptr<Pipeline, PipelineDeleter> translateFromMR(
                 translateMap(expCtx, parsedMr.getMap().getCode()),
                 DocumentSourceUnwind::create(expCtx, "emits", false, boost::none),
                 translateReduce(expCtx, parsedMr.getReduce().getCode()),
-                parsedMr.getFinalize().map([&](auto&& finalize) {
-                    return translateFinalize(expCtx, parsedMr.getFinalize()->getCode());
-                }),
+                parsedMr.getFinalize().flat_map(
+                    [&](auto&& finalize) { return translateFinalize(expCtx, finalize); }),
                 translateOut(expCtx,
-                             outType,
+                             parsedMr.getOutOptions(),
                              std::move(outNss),
+                             std::move(targetCollectionVersion),
                              parsedMr.getReduce().getCode(),
                              parsedMr.getFinalize())),
             expCtx));

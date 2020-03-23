@@ -9,14 +9,13 @@
  * the batches being applied are of the expected size and that only one batch was applied per step()
  * call.
  *
- * @tags: [uses_transactions, uses_prepare_transaction]
+ * @tags: [uses_transactions, uses_prepare_transaction, requires_fcv_44]
  */
 
 (function() {
 "use strict";
 
 load("jstests/core/txns/libs/prepare_helpers.js");
-load("jstests/libs/check_log.js");
 load("jstests/replsets/libs/initial_sync_test.js");
 
 /**

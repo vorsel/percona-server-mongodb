@@ -27,78 +27,88 @@
  *    it in the license file.
  */
 
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/service_context_test_fixture.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/platform/source_location.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/hierarchical_acquisition.h"
+#include "mongo/util/latch_analyzer.h"
 
 namespace mongo {
 namespace {
 
 using Level = HierarchicalAcquisitionLevel;
 
-class LatchAnalyzerTest : public ServiceContextTest {};
+class LatchAnalyzerTest : public ServiceContextTest {
+    void setUp() override {
+        ServiceContextTest::setUp();
+        setTestCommandsEnabled(true);
+    }
+
+    void tearDown() override {
+        setTestCommandsEnabled(false);
+        ServiceContextTest::tearDown();
+    }
+};
 
 DEATH_TEST_F(LatchAnalyzerTest, AddInvalidWasAbsent, "Fatal assertion 31360") {
 
-    Mutex lowerLevel = MONGO_MAKE_LATCH(
-        Level(1), (SourceLocationHolder)MONGO_SOURCE_LOCATION(), "AddInvalidWasAbsent::lowerLevel");
+    Mutex lowerLevel = MONGO_MAKE_LATCH(Level(1), "AddInvalidWasAbsent::lowerLevel");
+    Mutex higherLevel = MONGO_MAKE_LATCH(Level(2), "AddInvalidWasAbsent::higherLevel");
+
     lowerLevel.lock();
-    Mutex higherLevel = MONGO_MAKE_LATCH(Level(2),
-                                         (SourceLocationHolder)MONGO_SOURCE_LOCATION(),
-                                         "AddInvalidWasAbsent::higherLevel");
     higherLevel.lock();
 }
 
 DEATH_TEST_F(LatchAnalyzerTest, AddInvalidWasPresent, "Fatal assertion 31360") {
-    Mutex m1 = MONGO_MAKE_LATCH(
-        Level(1), (SourceLocationHolder)MONGO_SOURCE_LOCATION(), "AddInvalidWasPresent::m1");
-    Mutex m2 = MONGO_MAKE_LATCH(
-        Level(1), (SourceLocationHolder)MONGO_SOURCE_LOCATION(), "AddInvalidWasPresent::m2");
+    Mutex m1 = MONGO_MAKE_LATCH(Level(1), "AddInvalidWasPresent::m1");
+    Mutex m2 = MONGO_MAKE_LATCH(Level(1), "AddInvalidWasPresent::m2");
+
     m1.lock();
     m2.lock();
 }
 
 DEATH_TEST_F(LatchAnalyzerTest, RemoveInvalidWasAbsent, "Fatal assertion 31361") {
-    Mutex m = MONGO_MAKE_LATCH(
-        Level(1), (SourceLocationHolder)MONGO_SOURCE_LOCATION(), "RemoveInvalidWasAbsent::m");
-    m.unlock();
+    Mutex m = MONGO_MAKE_LATCH(Level(1), "RemoveInvalidWasAbsent::m");
+
     m.unlock();
 }
 
 DEATH_TEST_F(LatchAnalyzerTest, RemoveInvalidWasPresent, "Fatal assertion 31361") {
-    Mutex higherLevel = MONGO_MAKE_LATCH(Level(2),
-                                         (SourceLocationHolder)MONGO_SOURCE_LOCATION(),
-                                         "RemoveInvalidWasPresent::higherLevel");
+    Mutex higherLevel = MONGO_MAKE_LATCH(Level(2), "RemoveInvalidWasPresent::higherLevel");
+    Mutex lowerLevel = MONGO_MAKE_LATCH(Level(1), "RemoveInvalidWasPresent::lowerLevel");
+
     higherLevel.lock();
-    Mutex lowerLevel = MONGO_MAKE_LATCH(Level(1),
-                                        (SourceLocationHolder)MONGO_SOURCE_LOCATION(),
-                                        "RemoveInvalidWasPresent::lowerLevel");
     lowerLevel.lock();
     higherLevel.unlock();
 }
 
 TEST_F(LatchAnalyzerTest, AddValidWasAbsent) {
-    Mutex higherLevel = MONGO_MAKE_LATCH(
-        Level(2), (SourceLocationHolder)MONGO_SOURCE_LOCATION(), "AddValidWasAbsent::higherLevel");
+    Mutex higherLevel = MONGO_MAKE_LATCH(Level(2), "AddValidWasAbsent::higherLevel");
+    Mutex lowerLevel = MONGO_MAKE_LATCH(Level(1), "AddValidWasAbsent::lowerLevel");
+
     higherLevel.lock();
-    Mutex lowerLevel = MONGO_MAKE_LATCH(
-        Level(1), (SourceLocationHolder)MONGO_SOURCE_LOCATION(), "AddValidWasAbsent::lowerLevel");
     lowerLevel.lock();
+
+    {
+        LatchAnalyzerDisabledBlock block;
+        higherLevel.unlock();
+        lowerLevel.unlock();
+    }
 }
 
 TEST_F(LatchAnalyzerTest, RemoveValidWasPresent) {
 
-    Mutex higherLevel = MONGO_MAKE_LATCH(Level(2),
-                                         (SourceLocationHolder)MONGO_SOURCE_LOCATION(),
-                                         "RemoveValidWasPresent::higherLevel");
-    higherLevel.lock();
-    Mutex lowerLevel = MONGO_MAKE_LATCH(Level(1),
-                                        (SourceLocationHolder)MONGO_SOURCE_LOCATION(),
-                                        "RemoveValidWasPresent::lowerLevel");
-    lowerLevel.lock();
+    Mutex higherLevel = MONGO_MAKE_LATCH(Level(2), "RemoveValidWasPresent::higherLevel");
+    Mutex lowerLevel = MONGO_MAKE_LATCH(Level(1), "RemoveValidWasPresent::lowerLevel");
+
+    {
+        LatchAnalyzerDisabledBlock block;
+        higherLevel.lock();
+        lowerLevel.lock();
+    }
 
     lowerLevel.unlock();
     higherLevel.unlock();

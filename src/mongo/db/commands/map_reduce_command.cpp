@@ -62,6 +62,13 @@ public:
         return FindCommon::kInitReplyBufferSize;
     }
 
+    void _explainImpl(OperationContext* opCtx,
+                      const BSONObj& cmd,
+                      BSONObjBuilder& result,
+                      boost::optional<ExplainOptions::Verbosity> verbosity) const override {
+        map_reduce_agg::runAggregationMapReduce(opCtx, cmd, result, verbosity);
+    }
+
 private:
     bool _runImpl(OperationContext* opCtx,
                   const std::string& dbname,
@@ -71,11 +78,9 @@ private:
         // Execute the mapReduce as an aggregation pipeline only if fully upgraded to 4.4, since
         // a 4.2 mongos in a mixed version cluster expects a fundamentally different response that
         // is not supported by the aggregation equivalent.
-        if (internalQueryUseAggMapReduce.load() &&
-            serverGlobalParams.featureCompatibility.getVersion() ==
-                ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
-            return map_reduce_agg::runAggregationMapReduce(opCtx, dbname, cmd, errmsg, result);
-        }
+        if (serverGlobalParams.featureCompatibility.getVersion() ==
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44)
+            return map_reduce_agg::runAggregationMapReduce(opCtx, cmd, result, boost::none);
         return mr::runMapReduce(opCtx, dbname, cmd, errmsg, result);
     }
 } mapReduceCommand;

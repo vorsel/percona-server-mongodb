@@ -310,27 +310,6 @@ TEST_F(MongodbCAPITest, CreateTTLIndex) {
     ASSERT(output.getField("ok").numberDouble() != 1.0) << output;
 }
 
-TEST_F(MongodbCAPITest, TrimMemory) {
-    // create the client object
-    auto client = createClient();
-
-    // craft the isMaster message
-    mongo::BSONObj inputObj = mongo::fromjson("{trimMemory: 'aggressive'}");
-    auto inputOpMsg = mongo::OpMsgRequest::fromDBAndBody("admin", inputObj);
-    performRpc(client, inputOpMsg);
-}
-
-TEST_F(MongodbCAPITest, BatteryLevel) {
-    // create the client object
-    auto client = createClient();
-
-    // craft the isMaster message
-    mongo::BSONObj inputObj = mongo::fromjson("{setBatteryLevel: 'low'}");
-    auto inputOpMsg = mongo::OpMsgRequest::fromDBAndBody("admin", inputObj);
-    performRpc(client, inputOpMsg);
-}
-
-
 TEST_F(MongodbCAPITest, InsertDocument) {
     auto client = createClient();
 
@@ -563,6 +542,7 @@ TEST_F(MongodbCAPITest, RunListCommands) {
     auto client = createClient();
 
     std::vector<std::string> whitelist = {"_hashBSONElement",
+                                          "_killOperations",
                                           "auditGetOptions",
                                           "logApplicationMessage",
                                           "aggregate",
@@ -606,8 +586,6 @@ TEST_F(MongodbCAPITest, RunListCommands) {
                                           "planCacheClear",
                                           "planCacheClearFilters",
                                           "planCacheListFilters",
-                                          "planCacheListPlans",
-                                          "planCacheListQueryShapes",
                                           "planCacheSetFilter",
                                           "reIndex",
                                           "refreshLogicalSessionCacheNow",
@@ -616,11 +594,9 @@ TEST_F(MongodbCAPITest, RunListCommands) {
                                           "repairDatabase",
                                           "resetError",
                                           "serverStatus",
-                                          "setBatteryLevel",
                                           "setParameter",
                                           "sleep",
                                           "startSession",
-                                          "trimMemory",
                                           "update",
                                           "validate",
                                           "waitForFailPoint",
@@ -790,7 +766,7 @@ int main(const int argc, const char* const* const argv) {
         return EXIT_FAILURE;
     }
 
-    const auto result = ::mongo::unittest::Suite::run(std::vector<std::string>(), "", 1);
+    const auto result = ::mongo::unittest::Suite::run(std::vector<std::string>(), "", "", 1);
 
     globalTempDir.reset();
     mongo::quickExit(result);

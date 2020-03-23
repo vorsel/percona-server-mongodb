@@ -110,13 +110,8 @@ add_option('ninja',
     help='Enable the build.ninja generator tool',
 )
 
-add_option('ccache',
-    choices=['true', 'false'],
-    default='false',
-    nargs='?',
-    const='true',
-    type='choice',
-    help='Enable ccache support',
+add_option('prefix',
+    help='installation prefix (conficts with DESTDIR, PREFIX, and --install-mode=hygienic)',
 )
 
 add_option('legacy-tarball',
@@ -182,14 +177,6 @@ add_option('ssl',
     default='on',
     const='on',
     nargs='?',
-    type='choice',
-)
-
-add_option('ssl-provider',
-    choices=['auto', 'openssl', 'native'],
-    default='auto',
-    help='Select the SSL engine to use',
-    nargs=1,
     type='choice',
 )
 
@@ -332,6 +319,11 @@ add_option('gdbserver',
     nargs=0,
 )
 
+add_option('lldb-server',
+    help='build in lldb server support',
+    nargs=0,
+)
+
 add_option('gcov',
     help='compile with flags for gcov',
     nargs=0,
@@ -402,16 +394,6 @@ add_option('use-system-mongo-c',
 add_option('use-system-all',
     help='use all system libraries',
     nargs=0,
-)
-
-add_option('use-new-tools',
-    help='put new tools in the tarball',
-    nargs=0,
-)
-
-add_option('build-mongoreplay',
-    help='when building with --use-new-tools, build mongoreplay ( requires pcap dev )',
-    nargs=1,
 )
 
 add_option('use-cpu-profiler',
@@ -488,15 +470,17 @@ add_option("cxx-std",
 
 def find_mongo_custom_variables():
     files = []
-    for path in sys.path:
+    paths = [path for path in sys.path if 'site_scons' in path]
+    for path in paths:
         probe = os.path.join(path, 'mongo_custom_variables.py')
         if os.path.isfile(probe):
             files.append(probe)
     return files
 
 add_option('variables-files',
-    default=find_mongo_custom_variables(),
-    help="Specify variables files to load",
+    default=[],
+    action="append",
+    help="Specify variables files to load.",
 )
 
 link_model_choices = ['auto', 'object', 'static', 'dynamic', 'dynamic-strict', 'dynamic-sdk']
@@ -647,7 +631,7 @@ def variable_arch_converter(val):
 def decide_platform_tools():
     if mongo_platform.is_running_os('windows'):
         # we only support MS toolchain on windows
-        return ['msvc', 'mslink', 'mslib', 'masm']
+        return ['msvc', 'mslink', 'mslib', 'masm', 'vcredist']
     elif mongo_platform.is_running_os('linux', 'solaris'):
         return ['gcc', 'g++', 'gnulink', 'ar', 'gas']
     elif mongo_platform.is_running_os('darwin'):
@@ -657,11 +641,15 @@ def decide_platform_tools():
 
 def variable_tools_converter(val):
     tool_list = shlex.split(val)
+    # This list is not sorted intentionally, the order of tool loading
+    # matters as some of the tools have dependencies on other tools.
     return tool_list + [
         "distsrc",
         "gziptool",
-        'idl_tool',
+        "idl_tool",
         "jsheader",
+        "mongo_test_execution",
+        "mongo_test_list",
         "mongo_benchmark",
         "mongo_integrationtest",
         "mongo_unittest",
@@ -674,9 +662,44 @@ def variable_distsrc_converter(val):
         return val + "/"
     return val
 
-variables_files = variable_shlex_converter(get_option('variables-files'))
-for file in variables_files:
-    print("Using variable customization file {}".format(file))
+# Apply the default variables files, and walk the provided
+# arguments. Interpret any falsy argument (like the empty string) as
+# resetting any prior state. This makes the argument
+# --variables-files= destructive of any prior variables files
+# arguments, including the default.
+variables_files_args = get_option('variables-files')
+variables_files = find_mongo_custom_variables()
+for variables_file in variables_files_args:
+    if variables_file:
+        variables_files.append(variables_file)
+    else:
+        variables_files = []
+for vf in variables_files:
+    if os.path.isfile(vf):
+        print("Using variable customization file {}".format(vf))
+    else:
+        print("IGNORING missing variable customization file {}".format(vf))
+
+# Attempt to prevent confusion between the different ways of
+# specifying file placement between hygienic and non-hygienic
+# modes. Re-interpret a value provided for the legacy '--prefix' flag
+# as setting `DESTDIR` instead. Note that we can't validate things
+# passed in via variables_files, so this is imperfect. However, it is
+# also temporary.
+if get_option('install-mode') == 'hygienic':
+    if has_option('prefix'):
+        print("Cannot use the '--prefix' option with '--install-mode=hygienic'. Use the DESTDIR and PREFIX Variables instead")
+        Exit(1)
+else:
+    if 'PREFIX' in ARGUMENTS:
+        print("Cannot use the 'PREFIX' Variable without '--install-mode=hygienic'")
+        Exit(1)
+    if 'DESTDIR' in ARGUMENTS:
+        print("Cannot use the 'DESTDIR' Variable without '--install-mode=hygienic', use the '--prefix' flag instead")
+        Exit(1)
+
+    if has_option('prefix'):
+        ARGUMENTS['DESTDIR'] = get_option('prefix')
 
 env_vars = Variables(
     files=variables_files,
@@ -698,18 +721,18 @@ env_vars.Add('ARFLAGS',
     converter=variable_shlex_converter)
 
 env_vars.Add('CCACHE',
-    help='Path to ccache used for the --ccache option. Defaults to first ccache in PATH.')
+    help='Tell SCons where the ccache binary is')
 
 env_vars.Add(
     'CACHE_SIZE',
-    help='Maximum size of the cache (in gigabytes)',
+    help='Maximum size of the SCons cache (in gigabytes)',
     default=32,
     converter=lambda x:int(x)
 )
 
 env_vars.Add(
     'CACHE_PRUNE_TARGET',
-    help='Maximum percent in-use in cache after pruning',
+    help='Maximum percent in-use in SCons cache after pruning',
     default=66,
     converter=lambda x:int(x)
 )
@@ -848,20 +871,21 @@ env_vars.Add('MSVC_USE_SCRIPT',
     help='Sets the script used to setup Visual Studio.')
 
 env_vars.Add('MSVC_VERSION',
-    help='Sets the version of Visual Studio to use (e.g.  12.0, 11.0, 10.0)')
+    help='Sets the version of Visual C++ to use (e.g. 14.1 for VS2017, 14.2 for VS2019)',
+    default="14.1")
 
 env_vars.Add('NINJA_SUFFIX',
     help="""A suffix to add to the end of generated build.ninja
 files. Useful for when compiling multiple build ninja files for
 different configurations, for instance:
 
-    scons --sanitize=asan --ninja NINJA_SUFFIX=asan ninja-install-all-meta
-    scons --sanitize=tsan --ninja NINJA_SUFFIX=tsan ninja-install-all-meta
+    scons --sanitize=asan --ninja NINJA_SUFFIX=asan build.ninja
+    scons --sanitize=tsan --ninja NINJA_SUFFIX=tsan build.ninja
 
 Will generate the files (respectively):
 
-    install-all-meta.build.ninja.asan
-    install-all-meta.build.ninja.tsan
+    build.ninja.asan
+    build.ninja.tsan
 """)
 
 env_vars.Add('__NINJA_NO',
@@ -1056,7 +1080,7 @@ envDict = dict(BUILD_ROOT=buildDir,
                MODULE_INJECTORS=dict(),
                ARCHIVE_ADDITION_DIR_MAP={},
                ARCHIVE_ADDITIONS=[],
-               PYTHON=utils.find_python(),
+               PYTHON="$( {} $)".format(sys.executable),
                SERVER_ARCHIVE='${SERVER_DIST_BASENAME}${DIST_ARCHIVE_SUFFIX}',
                UNITTEST_ALIAS='unittests',
                # TODO: Move unittests.txt to $BUILD_DIR, but that requires
@@ -1078,7 +1102,7 @@ env = Environment(variables=env_vars, **envDict)
 
 # Only print the spinner if stdout is a tty
 if sys.stdout.isatty():
-    Progress(['-\r', '\\\r', '|\r', '/\r'], interval=5)
+    Progress(['-\r', '\\\r', '|\r', '/\r'], interval=50)
 
 del envDict
 
@@ -1649,25 +1673,20 @@ if env['_LIBDEPS'] == '$_LIBDEPS_LIBS':
         env.Tool('thin_archive')
 
 if env.TargetOSIs('linux', 'freebsd', 'openbsd'):
-    env['LINK_LIBGROUP_START'] = '-Wl,--start-group'
-    env['LINK_LIBGROUP_END'] = '-Wl,--end-group'
     # NOTE: The leading and trailing spaces here are important. Do not remove them.
     env['LINK_WHOLE_ARCHIVE_LIB_START'] = '-Wl,--whole-archive '
     env['LINK_WHOLE_ARCHIVE_LIB_END'] = ' -Wl,--no-whole-archive'
 elif env.TargetOSIs('darwin'):
-    env['LINK_LIBGROUP_START'] = ''
-    env['LINK_LIBGROUP_END'] = ''
     # NOTE: The trailing space here is important. Do not remove it.
     env['LINK_WHOLE_ARCHIVE_LIB_START'] = '-Wl,-force_load '
     env['LINK_WHOLE_ARCHIVE_LIB_END'] = ''
 elif env.TargetOSIs('solaris'):
-    env['LINK_LIBGROUP_START'] = '-Wl,-z,rescan-start'
-    env['LINK_LIBGROUP_END'] = '-Wl,-z,rescan-end'
     # NOTE: The leading and trailing spaces here are important. Do not remove them.
     env['LINK_WHOLE_ARCHIVE_LIB_START'] = '-Wl,-z,allextract '
     env['LINK_WHOLE_ARCHIVE_LIB_END'] = ' -Wl,-z,defaultextract'
 elif env.TargetOSIs('windows'):
-    env['LINK_WHOLE_ARCHIVE_LIB_START'] = '/WHOLEARCHIVE:'
+    env['LINK_WHOLE_ARCHIVE_LIB_START'] = '/WHOLEARCHIVE'
+    env['LINK_WHOLE_ARCHIVE_SEP'] = ':'
     env['LINK_WHOLE_ARCHIVE_LIB_END'] = ''
 
 if has_option('audit'):
@@ -1914,6 +1933,18 @@ elif env.TargetOSIs('windows'):
 if env.ToolchainIs('msvc'):
     env['PDB'] = '${TARGET.base}.pdb'
 
+# Python uses APPDATA to determine the location of user installed
+# site-packages. If we do not pass this variable down to Python
+# subprocesses then anything installed with `pip install --user`
+# will be inaccessible leading to import errors.
+#
+# Use env['PLATFORM'] instead of TargetOSIs since we always want this
+# to run on Windows hosts but not always for Windows targets.
+if env['PLATFORM'] == 'win32':
+    appdata = os.getenv('APPDATA', None)
+    if appdata is not None:
+        env['ENV']['APPDATA'] = appdata
+
 if env.TargetOSIs('posix'):
 
     # On linux, C code compiled with gcc/clang -std=c11 causes
@@ -2003,15 +2034,6 @@ if env.TargetOSIs('posix'):
             env['ENV'][key] = os.environ[key]
         except KeyError:
             pass
-
-    # Python uses APPDATA to determine the location of user installed
-    # site-packages. If we do not pass this variable down to Python
-    # subprocesses then anything installed with `pip install --user`
-    # will be inaccessible leading to import errors.
-    if env.TargetOSIs('windows'):
-        appdata = os.getenv('APPDATA', None)
-        if appdata is not None:
-            env['ENV']['APPDATA'] = appdata
 
     if env.TargetOSIs('linux') and has_option( "gcov" ):
         env.Append( CCFLAGS=["-fprofile-arcs", "-ftest-coverage", "-fprofile-update=single"] )
@@ -2216,7 +2238,7 @@ def doConfigure(myenv):
 
     conf.Finish()
 
-    # We require macOS 10.10, iOS 10.2, or tvOS 10.2
+    # We require macOS 10.12 or newer
     if env.TargetOSIs('darwin'):
 
         # TODO: Better error messages, mention the various -mX-version-min-flags in the error, and
@@ -2227,12 +2249,8 @@ def doConfigure(myenv):
             #include <AvailabilityMacros.h>
             #include <TargetConditionals.h>
 
-            #if TARGET_OS_OSX && (MAC_OS_X_VERSION_MIN_REQUIRED < MAC_OS_X_VERSION_10_10)
+            #if TARGET_OS_OSX && (__MAC_OS_X_VERSION_MIN_REQUIRED < __MAC_10_12)
             #error 1
-            #elif TARGET_OS_IOS && (__IPHONE_OS_VERSION_MIN_REQUIRED < __IPHONE_10_2)
-            #error 2
-            #elif TARGET_OS_TV && (__TV_OS_VERSION_MIN_REQUIRED < __TVOS_10_1)
-            #error 3
             #endif
             """
 
@@ -2246,7 +2264,7 @@ def doConfigure(myenv):
         })
 
         if not conf.CheckDarwinMinima():
-            conf.env.ConfError("Required target minimum of macOS 10.10, iOS 10.2, or tvOS 10.1 not found")
+            conf.env.ConfError("Required target minimum of macOS 10.12 not found")
 
         conf.Finish()
 
@@ -2418,6 +2436,13 @@ def doConfigure(myenv):
         # This warning was added in Apple clang version 11 and flags many explicitly defaulted move
         # constructors and assignment operators for being implicitly deleted, which is not useful.
         AddToCXXFLAGSIfSupported(myenv, "-Wno-defaulted-function-deleted")
+
+        # SERVER-44856: Our windows builds complain about unused
+        # exception parameters, but GCC and clang don't seem to do
+        # that for us automatically. In the interest of making it more
+        # likely to catch these errors early, add the (currently clang
+        # only) flag that turns it on.
+        AddToCXXFLAGSIfSupported(myenv, "-Wunused-exception-parameter")
 
         # Check if we can set "-Wnon-virtual-dtor" when "-Werror" is set. The only time we can't set it is on
         # clang 3.4, where a class with virtual function(s) and a non-virtual destructor throws a warning when
@@ -2955,10 +2980,6 @@ def doConfigure(myenv):
         # cause the stack to become executable if the noexecstack flag was not in play, so that we
         # can find them and fix them. We do this here after we check for ld.gold because the
         # --warn-execstack is currently only offered with gold.
-        #
-        # TODO: Add -Wl,--fatal-warnings once WT-2629 is fixed. We probably can do that
-        # unconditionally above, and not need to do it as an AddToLINKFLAGSIfSupported step, since
-        # both gold and binutils ld both support it.
         AddToLINKFLAGSIfSupported(myenv, "-Wl,-z,noexecstack")
         AddToLINKFLAGSIfSupported(myenv, "-Wl,--warn-execstack")
 
@@ -3139,7 +3160,7 @@ def doConfigure(myenv):
 
     libdeps.setup_conftests(conf)
 
-    ### --ssl and --ssl-provider checks
+    ### --ssl checks
     def checkOpenSSL(conf):
         sslLibName = "ssl"
         cryptoLibName = "crypto"
@@ -3300,41 +3321,38 @@ def doConfigure(myenv):
         if conf.CheckOpenSSL_EC_KEY_new():
             conf.env.SetConfigHeaderDefine('MONGO_CONFIG_HAVE_SSL_EC_KEY_NEW')
 
-    ssl_provider = get_option("ssl-provider")
-    if ssl_provider == 'auto':
-        if conf.env.TargetOSIs('windows', 'darwin', 'macOS'):
-            ssl_provider = 'native'
-        else:
-            ssl_provider = 'openssl'
-
-    if ssl_provider == 'native':
-        if conf.env.TargetOSIs('windows'):
-            ssl_provider = 'windows'
-            conf.env.SetConfigHeaderDefine("MONGO_CONFIG_SSL_PROVIDER", "MONGO_CONFIG_SSL_PROVIDER_WINDOWS")
-            conf.env.Append( MONGO_CRYPTO=["windows"] )
-
-        elif conf.env.TargetOSIs('darwin', 'macOS'):
-            ssl_provider = 'apple'
-            conf.env.SetConfigHeaderDefine("MONGO_CONFIG_SSL_PROVIDER", "MONGO_CONFIG_SSL_PROVIDER_APPLE")
-            conf.env.Append( MONGO_CRYPTO=["apple"] )
-            conf.env.AppendUnique(FRAMEWORKS=[
-                'CoreFoundation',
-                'Security',
-            ])
-
     # We require ssl by default unless the user has specified --ssl=off
     require_ssl = get_option("ssl") != "off"
 
-    if ssl_provider == 'openssl':
-        if require_ssl:
-            checkOpenSSL(conf)
-            # Working OpenSSL available, use it.
-            conf.env.SetConfigHeaderDefine("MONGO_CONFIG_SSL_PROVIDER", "MONGO_CONFIG_SSL_PROVIDER_OPENSSL")
+    # The following platform checks setup both
+    # ssl_provider for TLS implementation
+    # and MONGO_CRYPTO for hashing support.
+    #
+    # MONGO_CRYPTO is always enabled regardless of --ssl=on/off
+    # However, ssl_provider will be rewritten to 'none' if --ssl=off
+    if conf.env.TargetOSIs('windows'):
+        # SChannel on Windows
+        ssl_provider = 'windows'
+        conf.env.SetConfigHeaderDefine("MONGO_CONFIG_SSL_PROVIDER", "MONGO_CONFIG_SSL_PROVIDER_WINDOWS")
+        conf.env.Append( MONGO_CRYPTO=["windows"] )
 
-            conf.env.Append( MONGO_CRYPTO=["openssl"] )
-        else:
-            # If we don't need an SSL build, we can get by with TomCrypt.
-            conf.env.Append( MONGO_CRYPTO=["tom"] )
+    elif conf.env.TargetOSIs('darwin', 'macOS'):
+        # SecureTransport on macOS
+        ssl_provider = 'apple'
+        conf.env.SetConfigHeaderDefine("MONGO_CONFIG_SSL_PROVIDER", "MONGO_CONFIG_SSL_PROVIDER_APPLE")
+        conf.env.Append( MONGO_CRYPTO=["apple"] )
+        conf.env.AppendUnique(FRAMEWORKS=['CoreFoundation', 'Security'])
+
+    elif require_ssl:
+        checkOpenSSL(conf)
+        # Working OpenSSL available, use it.
+        conf.env.SetConfigHeaderDefine("MONGO_CONFIG_SSL_PROVIDER", "MONGO_CONFIG_SSL_PROVIDER_OPENSSL")
+        conf.env.Append( MONGO_CRYPTO=["openssl"] )
+        ssl_provider = 'openssl'
+
+    else:
+        # If we don't need an SSL build, we can get by with TomCrypt.
+        conf.env.Append( MONGO_CRYPTO=["tom"] )
 
     if require_ssl:
         # Either crypto engine is native,
@@ -3343,26 +3361,6 @@ def doConfigure(myenv):
         print("Using SSL Provider: {0}".format(ssl_provider))
     else:
         ssl_provider = "none"
-
-    # The Windows build needs the openssl binaries if it targets openssl
-    if conf.env.TargetOSIs('windows') and ssl_provider == "openssl":
-        # Add the SSL binaries to the zip file distribution
-        def addOpenSslLibraryToDistArchive(file_name):
-            openssl_bin_path = os.path.normpath(env['WINDOWS_OPENSSL_BIN'].lower())
-            full_file_name = os.path.join(openssl_bin_path, file_name)
-            if os.path.exists(full_file_name):
-                env.Append(ARCHIVE_ADDITIONS=[full_file_name])
-                env.Append(ARCHIVE_ADDITION_DIR_MAP={
-                        openssl_bin_path: "bin"
-                        })
-                return True
-            else:
-                return False
-
-        files = ['ssleay32.dll', 'libeay32.dll']
-        for extra_file in files:
-            if not addOpenSslLibraryToDistArchive(extra_file):
-                print("WARNING: Cannot find SSL library '%s'" % extra_file)
 
     def checkHTTPLib(required=False):
         # WinHTTP available on Windows
@@ -3778,88 +3776,80 @@ def doConfigure(myenv):
 env = doConfigure( env )
 env["NINJA_SYNTAX"] = "#site_scons/third_party/ninja_syntax.py"
 
-# Now that we are done with configure checks, enable icecream, if available.
+# Now that we are done with configure checks, enable ccache and
+# icecream, if available. Per the rules declared in the icecream tool,
+# load the ccache tool first.
+env.Tool('ccache')
 env.Tool('icecream')
 
 if get_option('ninja') == 'true':
     ninja_builder = Tool("ninja")
-    if ninja_builder.exists(env):
-        ninja_builder.generate(env)
+    ninja_builder.generate(env)
 
-        # Explicitly add all generated sources to the DAG so NinjaBuilder can
-        # generate rules for them. SCons if the files don't exist will not wire up
-        # the dependencies in the DAG because it cannot scan them. The Ninja builder
-        # does not care about the actual edge here as all generated sources will be
-        # pushed to the "bottom" of it's DAG via the order_only dependency on
-        # _generated_sources (an internal phony target)
-        if get_option('install-mode') == 'hygienic':
-            env.Alias("install-common-base", env.Alias("generated-sources"))
-        else:
-            env.Alias("all", env.Alias("generated-sources"))
-            env.Alias("core", env.Alias("generated-sources"))
+    # Explicitly add all generated sources to the DAG so NinjaBuilder can
+    # generate rules for them. SCons if the files don't exist will not wire up
+    # the dependencies in the DAG because it cannot scan them. The Ninja builder
+    # does not care about the actual edge here as all generated sources will be
+    # pushed to the "bottom" of it's DAG via the order_only dependency on
+    # _generated_sources (an internal phony target)
+    if get_option('install-mode') == 'hygienic':
+        env.Alias("install-common-base", env.Alias("generated-sources"))
+    else:
+        env.Alias("all", env.Alias("generated-sources"))
+        env.Alias("core", env.Alias("generated-sources"))
 
-        if get_option("install-mode") == "hygienic":
-            ninja_build = env.Ninja(
-                target="install-all-meta.build.ninja",
-                source=env.Alias("install-all-meta"),
-            )
-        else:
-            ninja_build = env.Ninja(
-                target="all.build.ninja",
-                source=env.Alias("all"),
-            )
-
-        from glob import glob
-        sconscripts = [env.File(g) for g in glob("**/SConscript", recursive=True)]
-        sconscripts += [env.File("#SConstruct")]
-        env.Depends(ninja_build, sconscripts)
-
-
-        def skip(env, node):
-            """
-            Write an empty test text file.
-            
-            Instead of calling SCONS to generate a *test.txt that most
-            users aren't using (and the current generator skips) we
-            simply teach Ninja how to make an empty file on the given
-            platform so as not to break dependency trees.
-            """
-            cmd = "touch {}".format(str(node))
-            if env["PLATFORM"] == "win32":
-                cmd = "copy NUL {}".format(str(node))
-            return {
-                "outputs": [str(node)],
-                "rule": "CMD",
-                "variables": {
-                    "cmd": cmd,
-                }
-            }
-
-        env.NinjaRegisterFunctionHandler("unit_test_list_builder_action", skip)
-        env.NinjaRegisterFunctionHandler("integration_test_list_builder_action", skip)
-        env.NinjaRegisterFunctionHandler("benchmark_list_builder_action", skip)
-
-        # We can create empty files for FAKELIB in Ninja because it
-        # does not care about content signatures. We have to
-        # write_uuid_to_file for FAKELIB in SCons because SCons does.
-        env.NinjaRule(
-            rule="FAKELIB",
-            command="cmd /c copy NUL $out" if env["PLATFORM"] == "win32" else "touch $out",
+    if get_option("install-mode") == "hygienic":
+        ninja_build = env.Ninja(
+            target="build.ninja",
+            source=[
+                env.Alias("install-all-meta"),
+                env.Alias("test-execution-aliases"),
+            ],
+        )
+    else:
+        ninja_build = env.Ninja(
+            target="build.ninja",
+            source=[
+                env.Alias("all"),
+                env.Alias("test-execution-aliases"),
+            ],
         )
 
-        def fakelib_in_ninja(env, node):
-            """Generates empty .a files"""
-            return {
-                "outputs": [node.get_path()],
-                "rule": "FAKELIB",
-                "implicit": [str(s) for s in node.sources],
-            }
+    env.Alias("generate-ninja", ninja_build)
 
-        env.NinjaRegisterFunctionHandler("write_uuid_to_file", fakelib_in_ninja)
 
-        # Load ccache after icecream since order matters when we're both changing CCCOM
-        if get_option('ccache') == 'true':
-            env.Tool('ccache')
+    # idlc.py has the ability to print it's implicit dependencies
+    # while generating, Ninja can consume these prints using the
+    # deps=msvc method.
+    env.AppendUnique(IDLCFLAGS=[
+        "--write-dependencies-inline",
+    ])
+    env.NinjaRule(
+        rule="IDLC",
+        command="cmd /c $cmd" if env.TargetOSIs("windows") else "$cmd",
+        description="Generating $out",
+        deps="msvc",
+    )
+    env.NinjaRuleMapping("$IDLCCOM", "IDLC")
+    env.NinjaRuleMapping(env["IDLCCOM"], "IDLC")
+
+    # We can create empty files for FAKELIB in Ninja because it
+    # does not care about content signatures. We have to
+    # write_uuid_to_file for FAKELIB in SCons because SCons does.
+    env.NinjaRule(
+        rule="FAKELIB",
+        command="cmd /c copy NUL $out" if env["PLATFORM"] == "win32" else "touch $out",
+    )
+
+    def fakelib_in_ninja(env, node):
+        """Generates empty .a files"""
+        return {
+            "outputs": [node.get_path()],
+            "rule": "FAKELIB",
+            "implicit": [str(s) for s in node.sources],
+        }
+
+    env.NinjaRegisterFunctionHandler("write_uuid_to_file", fakelib_in_ninja)
 
 # TODO: Later, this should live somewhere more graceful.
 if get_option('install-mode') == 'hygienic':
@@ -4026,7 +4016,8 @@ if split_dwarf.exists(env):
 
 # Load the compilation_db tool. We want to do this after configure so we don't end up with
 # compilation database entries for the configure tests, which is weird.
-env.Tool("compilation_db")
+if get_option('ninja') == 'false':
+    env.Tool("compilation_db")
 
 # If we can, load the dagger tool for build dependency graph introspection.
 # Dagger is only supported on Linux and OSX (not Windows or Solaris).
@@ -4230,8 +4221,9 @@ def injectModule(env, module, **kwargs):
     return env
 env.AddMethod(injectModule, 'InjectModule')
 
-compileCommands = env.CompilationDatabase('compile_commands.json')
-compileDb = env.Alias("compiledb", compileCommands)
+if get_option('ninja') == 'false':
+    compileCommands = env.CompilationDatabase('compile_commands.json')
+    compileDb = env.Alias("compiledb", compileCommands)
 
 
 msvc_version = ""
@@ -4239,11 +4231,12 @@ if 'MSVC_VERSION' in env and env['MSVC_VERSION']:
     msvc_version = "--version " + env['MSVC_VERSION'] + " "
 
 # Microsoft Visual Studio Project generation for code browsing
-vcxprojFile = env.Command(
-    "mongodb.vcxproj",
-    compileCommands,
-    r"$PYTHON buildscripts\make_vcxproj.py " + msvc_version + "mongodb")
-vcxproj = env.Alias("vcxproj", vcxprojFile)
+if get_option("ninja") == "false":
+    vcxprojFile = env.Command(
+        "mongodb.vcxproj",
+        compileCommands,
+        r"$PYTHON buildscripts\make_vcxproj.py " + msvc_version + "mongodb")
+    vcxproj = env.Alias("vcxproj", vcxprojFile)
 
 distSrc = env.DistSrc("mongodb-src-${MONGO_VERSION}.tar")
 env.NoCache(distSrc)
@@ -4379,7 +4372,7 @@ env.SConscript(
 )
 
 
-allTargets = ['core', 'tools', 'unittests', 'integration_tests', 'benchmarks']
+allTargets = ['core', 'tools', 'unittests', 'integration_tests', 'libfuzzer_tests', 'benchmarks']
 
 if not has_option('noshell') and usemozjs:
     allTargets.extend(['dbtest'])

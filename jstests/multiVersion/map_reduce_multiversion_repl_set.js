@@ -5,8 +5,9 @@
 
 load("jstests/multiVersion/libs/multi_rs.js");  // Used by upgradeSet.
 
-const dbName = "test";
-const collName = jsTestName();
+const testName = "map_reduce_multiversion_repl_set";
+const dbName = "test_" + testName;
+const collName = testName;
 
 TestData.skipCheckDBHashes = true;  // Skip db hashes when restarting the replset.
 
@@ -101,11 +102,6 @@ runValidMrTests(sourceDB, sourceColl);
 rst.upgradeSet({binVersion: "latest"});
 sourceDB = rst.getPrimary().getDB(dbName);
 sourceColl = sourceDB[collName];
-
-// Now that we've upgraded the replica set to the latest binary version, switch on the query knob to
-// enable MR in agg.
-assert.commandWorked(rst.getPrimary().getDB(dbName).adminCommand(
-    {setParameter: 1, internalQueryUseAggMapReduce: true}));
 
 //
 // Binary version 4.4 and FCV 4.2.

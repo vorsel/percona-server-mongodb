@@ -103,8 +103,10 @@ public:
 
     virtual void endBackup(OperationContext* opCtx) override;
 
-    virtual StatusWith<std::vector<BackupBlock>> beginNonBlockingBackup(
-        OperationContext* opCtx) override;
+    virtual Status disableIncrementalBackup(OperationContext* opCtx) override;
+
+    virtual StatusWith<BackupInformation> beginNonBlockingBackup(
+        OperationContext* opCtx, const BackupOptions& options) override;
 
     virtual void endNonBlockingBackup(OperationContext* opCtx) override;
 
@@ -166,6 +168,8 @@ public:
     bool supportsPendingDrops() const final;
 
     void clearDropPendingState() final;
+
+    bool supportsTwoPhaseIndexBuild() const final;
 
     void triggerJournalFlush() const final;
 

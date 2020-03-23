@@ -132,14 +132,14 @@ Status IndexBuildsManager::startBuildingIndex(OperationContext* opCtx,
 }
 
 StatusWith<std::pair<long long, long long>> IndexBuildsManager::startBuildingIndexForRecovery(
-    OperationContext* opCtx, NamespaceString ns, const UUID& buildUUID) {
+    OperationContext* opCtx, NamespaceString ns, const UUID& buildUUID, RepairData repair) {
     auto builder = _getBuilder(buildUUID);
 
-    auto coll = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(ns);
+    auto coll = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, ns);
     auto rs = coll ? coll->getRecordStore() : nullptr;
 
-    // Iterate all records in the collection. Delete them if they aren't valid BSON. Index them
-    // if they are.
+    // Iterate all records in the collection. Validate the records and index them
+    // if they are valid.  Delete them (if in repair mode), or crash, if they are not valid.
     long long numRecords = 0;
     long long dataSize = 0;
 
@@ -162,6 +162,11 @@ StatusWith<std::pair<long long, long long>> IndexBuildsManager::startBuildingInd
                 // database even if decimal is disabled.
                 auto validStatus = validateBSON(data.data(), data.size(), BSONVersion::kLatest);
                 if (!validStatus.isOK()) {
+                    if (repair == RepairData::kNo) {
+                        severe() << "Invalid BSON detected at " << id << ": "
+                                 << redact(validStatus);
+                        fassertFailed(31396);
+                    }
                     warning() << "Invalid BSON detected at " << id << ": " << redact(validStatus)
                               << ". Deleting.";
                     rs->deleteRecord(opCtx, id);
@@ -272,9 +277,9 @@ bool IndexBuildsManager::abortIndexBuild(const UUID& buildUUID, const std::strin
     return true;
 }
 
-bool IndexBuildsManager::interruptIndexBuild(OperationContext* opCtx,
-                                             const UUID& buildUUID,
-                                             const std::string& reason) {
+bool IndexBuildsManager::abortIndexBuildWithoutCleanup(OperationContext* opCtx,
+                                                       const UUID& buildUUID,
+                                                       const std::string& reason) {
     stdx::unique_lock<Latch> lk(_mutex);
 
     auto builderIt = _builders.find(buildUUID);
@@ -282,7 +287,7 @@ bool IndexBuildsManager::interruptIndexBuild(OperationContext* opCtx,
         return false;
     }
 
-    log() << "Index build interrupted: " << buildUUID << ": " << reason;
+    log() << "Index build aborted without cleanup: " << buildUUID << ": " << reason;
     std::shared_ptr<MultiIndexBlock> builder = builderIt->second;
 
     lk.unlock();

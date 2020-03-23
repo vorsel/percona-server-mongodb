@@ -119,6 +119,7 @@ env.Library(
         ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/exec/document_value/document_value',
+        '$BUILD_DIR/mongo/db/query/query_knobs',
         '$BUILD_DIR/mongo/scripting/scripting_common',
         '$BUILD_DIR/mongo/util/summation',
         'expression',
@@ -214,6 +215,7 @@ env.Library(
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/catalog/database_holder',
         '$BUILD_DIR/mongo/db/concurrency/flow_control_ticketholder',
+        '$BUILD_DIR/mongo/db/index_builds_coordinator_interface',
         '$BUILD_DIR/mongo/db/session_catalog',
         '$BUILD_DIR/mongo/db/storage/backup_cursor_hooks',
         '$BUILD_DIR/mongo/db/transaction',
@@ -321,6 +323,7 @@ pipelineEnv.Library(
         'document_source_sort.cpp',
         'document_source_sort_by_count.cpp',
         'document_source_tee_consumer.cpp',
+        'document_source_union_with.cpp',
         'document_source_unwind.cpp',
         'pipeline.cpp',
         'semantic_analysis.cpp',
@@ -367,6 +370,7 @@ pipelineEnv.Library(
         'granularity_rounder',
     ],
     LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/background',
         '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
         '$BUILD_DIR/mongo/rpc/command_status',
     ]
@@ -444,6 +448,7 @@ env.CppUnitTest(
         'document_source_skip_test.cpp',
         'document_source_sort_by_count_test.cpp',
         'document_source_sort_test.cpp',
+        'document_source_union_with_test.cpp',
         'document_source_unwind_test.cpp',
         'expression_and_test.cpp',
         'expression_compare_test.cpp',
@@ -455,6 +460,7 @@ env.CppUnitTest(
         'expression_nary_test.cpp',
         'expression_object_test.cpp',
         'expression_or_test.cpp',
+        'expression_replace_test.cpp',
         'expression_test.cpp',
         'expression_trigonometric_test.cpp',
         'expression_trim_test.cpp',

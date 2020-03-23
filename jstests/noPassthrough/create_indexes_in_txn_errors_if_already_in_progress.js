@@ -12,7 +12,6 @@
 (function() {
 "use strict";
 
-load("jstests/libs/check_log.js");
 load("jstests/libs/parallel_shell_helpers.js");
 load('jstests/libs/test_background_ops.js');
 
@@ -58,6 +57,10 @@ const runFailedIndexBuildInTxn = function(dbName, collName, indexSpec, requestNu
     assert.commandFailedWithCode(session.abortTransaction_forTesting(),
                                  ErrorCodes.NoSuchTransaction);
 };
+
+// Insert document into collection to avoid optimization for index creation on an empty collection.
+// This allows us to pause index builds on the collection using a fail point.
+assert.commandWorked(testColl.insert({a: 1}));
 
 assert.commandWorked(
     testDB.adminCommand({configureFailPoint: 'hangAfterSettingUpIndexBuild', mode: 'alwaysOn'}));

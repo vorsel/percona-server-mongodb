@@ -215,8 +215,8 @@ Each node communicates with other nodes at regular intervals to:
 * Stay up to date with the primary (oplog fetching)
 * Update their sync source with their progress (`replSetUpdatePosition` commands)
 
-Each oplog entry is assigned an `OpTime` to describe when it occurred so other nodes can compare how
-up-to-date they are.
+Each oplog entry is assigned a unique `OpTime` to describe when it occurred so other nodes can
+compare how up-to-date they are.
 
 OpTimes include a timestamp and a term field. The term field indicates how many elections have
 occurred since the replica set started.
@@ -341,7 +341,7 @@ is simply: `(election timeout) * (priority rank + 1)`.
 
 ### Commit Point Propagation
 
-The replication majority *commit point* refers to an OpTime such that all oplog entries with an
+The replication majority **commit point** refers to an OpTime such that all oplog entries with an
 OpTime earlier or equal to it have been replicated to a majority of nodes in the replica set. It is
 influenced by the [`lastApplied`](#replication-timestamp-glossary) and the
 [`lastDurable`](#replication-timestamp-glossary) OpTimes.
@@ -414,27 +414,33 @@ error, such as in a `ReplSetConfig` mismatch.
 
 ## Read Concern
 
-MongoDB does not provide snapshot isolation. All reads in MongoDB are executed on snapshots of the
-data taken at some point in time; however if the storage engine yields while executing a read, the
-read may continue on a newer snapshot. Thus, reads are currently never guaranteed to return all data
-from one point in time. This means that some documents can be skipped if they are updated and any
-updates that occurred since the read began may or may not be seen.
+All reads in MongoDB are executed on snapshots of the data taken at some point in time. However, for
+all read concern levels other than 'snapshot', if the storage engine yields while executing a read,
+the read may continue on a newer snapshot. Thus, reads are currently not guaranteed to return all
+data from one point in time. This means that some documents can be skipped if they are updated and
+any updates that occurred since the read began may or may not be seen.
 
 [Read concern](https://docs.mongodb.com/manual/reference/read-concern/) is an option sent with any
-read command to specify at what consistency level the read should be satisfied. There are 3 read
+read command to specify at what consistency level the read should be satisfied. There are 5 read
 concern levels:
 
 * Local
 * Majority
 * Linearizable
+* Snapshot
+* Available
 
-**Local** just returns whatever the most up-to-date data is on the node. It does this by reading
-from the storage engine’s most recent snapshot(s).
+**Local** just returns whatever the most up-to-date data is on the node. On a primary, it does this
+by reading from the storage engine's most recent snapshot. On a secondary, it performs a timestamped
+read at the lastApplied, so that it does not see writes from the batch that is currently being
+applied. For information on how local read concern works within a multi-document transaction, see
+the [Read Concern Behavior Within Transactions](#read-concern-behavior-within-transactions) section.
 
-**Majority** uses the last committed snapshot(s) to do its read. The data read only reflects the
-oplog entries that have been replicated to a majority of nodes in the replica set. Any data seen in
-majority reads cannot roll back in the future. Thus majority reads prevent **dirty reads**, though
-they often are **stale reads**.
+**Majority** does a timestamped read at the stable timestamp (also called the last committed
+snapshot in the code, for legacy reasons). The data read only reflects the oplog entries that have
+been replicated to a majority of nodes in the replica set. Any data seen in majority reads cannot
+roll back in the future. Thus majority reads prevent **dirty reads**, though they often are
+**stale reads**.
 
 Read concern majority reads usually return as fast as local reads, but sometimes will block. Read
 concern majority reads do not wait for anything to be committed; they just use different snapshots
@@ -445,23 +451,8 @@ command, subsequent majority reads will block until that index build is finished
 nodes. Majority reads also block right after startup or rollback when we do not yet have a committed
 snapshot.
 
-MongoDB continuously directs the storage engine to take named snapshots. Reads with read concern
-level local are executed on “unnamed snapshots,” which are ephemeral and exist only long enough to
-satisfy the read transaction. As a node discovers that its writes have been replicated to
-secondaries, it updates its committed OpTime. The newest named snapshot older than the commit point
-becomes the new "committed snapshot" used for read majority reads. Any named snapshots older than
-the "committed snapshot" are then cleaned up (deleted). MongoDB tells WiredTiger to save up to 1000
-named snapshots at a time. If the commit point doesn't move, but writes continue to happen, we will
-keep taking more snapshots and may hit the limit. Afterwards, no further snapshots are created until
-the commit point moves and old snapshots are deleted. The commit level might not move if you are
-doing w:1 writes with an arbiter, for example. If we hit the limit, but continue to take writes, we
-may create a large gap across the oplog entries where there is no associated named snapshot. When
-the commit point begins to move forward again and we start deleting old snapshots again, the next
-snapshots will occur at the most recent OpTime and not be able to fill in the gap. In this case,
-once the commit point moves ahead into the gap, the committed snapshot will remain before the gap,
-and majority reads will read increasingly stale data until the commit point gets to the end of the
-gap. To reduce the chance of hitting the snapshot limit and this happening, we slow down the
-frequency with which we mark snapshots as “named snapshots” as we get closer to the limit.
+For information on how majority read concern works within a multi-document transaction, see the
+[Read Concern Behavior Within Transactions](#read-concern-behavior-within-transactions) section.
 
 **Linearizable** read concern actually does block for some time. Linearizability guarantees that if
 one thread does a write that is acknowledged and tells another thread about that write, then that
@@ -477,16 +468,114 @@ majority of nodes, linearizable reads satisfy all of the same guarantees of read
 and then some. Linearizable read concern reads are only done on the primary, and they only apply to
 single document reads, since linearizability is only defined as a property on single objects.
 
+Linearizable read concern is not allowed within a multi-document transaction.
+
+**Snapshot** read concern can only be run within a multi-document transaction. See the
+[Read Concern Behavior Within Transactions](#read-concern-behavior-within-transactions) section for
+more information.
+
 **afterOpTime** is another read concern option, only used internally, only for config servers as
 replica sets. **Read after optime** means that the read will block until the node has replicated
 writes after a certain OpTime. This means that if read concern local is specified it will wait until
 the local snapshot is beyond the specified OpTime. If read concern majority is specified it will
-wait until the committed snapshot is beyond the specified OpTime. In 3.6 this feature will be
-extended to support a sharded cluster and use a **Lamport Clock** to provide **causal consistency**.
+wait until the committed snapshot is beyond the specified OpTime.
+
+**afterClusterTime** is a read concern option used for supporting **causal consistency**.
+<!-- TODO: link to the Causal Consistency section of the Sharding Architecture Guide -->
+
+# enableMajorityReadConcern Flag
+
+`readConcern: majority` is enabled by default for WiredTiger in MongoDB. This can be problematic
+for systems that use arbiters because it is possible for writes to be accepted but not majority
+committed. Accepting writes without moving the majority commit point forward will increase WT cache
+pressure until the primary suffers severe performance issues, like stalling. Arbiters cause
+primaries to do this, for example, when secondaries are down for maintenance.
+
+`enableMajorityReadConcern=false` (`eMRC=false`) is the recommended configuration for replica sets
+with arbiters. When majority reads are disabled, the storage engine no longer maintains history as
+far back as the majority commit point. The replication system sets the
+[`stableTimestamp`](#replication-timestamp-glossary) to the newest `all_durable` timestamp, meaning
+that we can take stable checkpoints that are not necessarily majority committed.
+
+Some significant impacts of this flag in the replication system include changes to
+[`Cross Shard Transactions`](#cross-shard-Transactions-and-the-prepared-state), and
+[rollback](#rollback).
+
+For more information on how this impacts `Change Streams`, please refer to the Query Architecture
+Guide. <!-- TODO Link to Change Streams Section in Query Arch Guide -->
+
+## eMRC=false and Rollback
+
+Even though we added support for taking stable checkpoints when `eMRC=false`, we must still use the
+`rollbackViaRefetch` algorithm instead of the `Recover to A Timestamp` algorithm. As aforementioned,
+when `eMRC=false`, the replication system will set the `stableTimestamp` to the newest `all_durable`
+timestamp. This allows us to take stable checkpoints that are not necessarily majority committed.
+Consequently, the `stableTimestamp` can advance past the `majority commit point`, which will break
+the `Recover to A Timestamp` algorithm.
+
+### rollbackViaRefetch
+
+Nodes go into rollback if after they receive the first batch of writes from their sync source, they
+realize that the greater than or equal to predicate did not return the last op in their oplog. When
+rolling back, nodes are in the `ROLLBACK` state and reads are prohibited. When a node goes into
+rollback it drops all snapshots.
+
+The rolling-back node first finds the common point between its oplog and its sync source's oplog.
+It then goes through all of the operations in its oplog back to the common point and figures out
+how to undo them.
+
+Simply doing the "inverse" operation is sometimes impossible, such as a document remove where we do
+not log the entire document that is removed. Instead, the node simply refetches the problematic
+documents, or entire collections in the case of undoing a `drop`, from the sync source and replaces
+the local version with that version. Some operations also have special handling, and some just
+fail, such as `dropDatabase`, causing the entire node to shut down.
+
+The node first compiles a list of documents, collections, and indexes to fetch and drop. Before
+actually doing the undo steps, the node "fixes up" the operations by "cancelling out" operations
+that negate each other to reduce work. The node then drops and fetches all data it needs and
+replaces the local version with the remote versions.
+
+The node gets the last applied OpTime from the sync source and the Rollback ID to check if a
+rollback has happened during this rollback, in which case it fails rollback and shuts down. The
+last applied OpTime is set as the `minValid` for the node and the node goes into RECOVERING state.
+The node resumes fetching and applying operations like a normal secondary until it hits that
+`minValid`. Only at that point does the node go into SECONDARY state.
+
+This process is very similar to initial sync and startup after an unclean shutdown in that
+operations are applied on data that may already reflect those operations and operations in the
+future. This leads to all of the same idempotency concerns and index constraint relaxation.
+
+Though we primarily use the `Recover To A Timestamp` algorithm from MongoDB 4.0 and onwards, we
+must still keep the `rollbackViaRefetch` to support `eMRC=false` nodes.
+
+## eMRC=false and Single Replica Set Transactions
+
+[Single replica set transactions](#transactions) either do untimestamped reads or read from the
+[all_durable](#replication-timestamp-glossary) when using `readConcern: snapshot`, so they do not
+rely on storage engine support for reading from a majority committed snapshot. Therefore, single
+replica set transactions should work the same with `readConcern: majority` disabled.
+
+## eMRC=false and Cross Shard Transactions
+
+It is illegal to run a [cross-shard transaction](#cross-shard-Transactions-and-the-prepared-state)
+on shards that contain an arbiter or have a primary with `eMRC=false`. Shards that contain an
+arbiter could indefinitely accept writes but not commit them, which affects the liveness of
+cross-shard transactions. Consider a case where we try to commit a cross-shard transaction, but
+are unable to put the transaction into the prepare state without a majority of the set.
+
+Additionally, the `rollbackViaRefetch` algorithm does not support `prepare` oplog entries, so we
+do not allow cross-shard transactions to run on replica sets that have `eMRC=false` nodes. We
+automatically fail the `prepareTransaction` command in these cases, which will prevent a
+transaction from even being prepared on an invalid shard or replica set node. This is safe because
+it will cause the entire transaction to abort.
+
+In addition to explicitly failing the `prepareTransaction` command, we also crash when replaying
+the `prepare` oplog entry during [startup recovery](#startup-recovery) on `eMRC=false` nodes. This
+allows us to avoid issues regarding replaying `prepare` oplog entries after recovering from an
+unstable checkpoint. The only way to replay these entries and complete recovery is to restart the
+node with `eMRC=true`.
 
 # Transactions
-
-## Life of a Multi-Document Transaction
 
 **Multi-document transactions** were introduced in MongoDB to provide atomicity for reads and writes
 to multiple documents either in the same collection or across multiple collections. Atomicity in
@@ -494,13 +583,18 @@ transactions refers to an "all-or-nothing" principle. This means that when a tra
 it will not commit some of its changes while rolling back others. Likewise, when a transaction
 aborts, all of its operations abort and all corresponding data changes are aborted.
 
+## Life of a Multi-Document Transaction
+
 All transactions are associated with a server session and at any given time, only one open
 transaction can be associated with a single session. The state of a transaction is maintained
-through the `TransactionParticipant`, which is a decoration on the session. Any thread that attempts
-to modify the state of the transaction, which can include committing, aborting, or adding an
-operation to the transaction, must have the correct session checked out before doing so. Only one
-operation can check out a session at a time, so other operations that need to use the same session
-must wait for it to be checked back in.
+through the
+[`TransactionParticipant`](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/db/transaction_participant.h),
+which is a decoration on the session. Any thread that attempts to modify the state of the
+transaction, which can include committing, aborting, or adding an operation to the transaction, must
+have the correct session checked out before doing so. Only one operation can check out a session at
+a time, so other operations that need to use the same session must wait for it to be checked back in.
+
+### Starting a Transaction
 
 Transactions are started on the server by the first operation in the transaction, indicated by a
 `startTransaction: true` parameter. All operations in a transaction must include an `lsid`, which is
@@ -514,24 +608,33 @@ exists) on the session by updating our `txnNumber`. Next, we update our `txnStat
 legal state transitions. Finally, we reset the in memory state of the transaction as well as any
 corresponding transaction metrics from a previous transaction.
 
-When we start a transaction, we also open a `WriteUnitOfWork`, which begins a storage engine write
-unit of work on the `RecoveryUnit`. The `RecoveryUnit` is responsible for making sure data is
-persisted and all on-disk data must be modified through this interface. The WUOW for a transaction
-is updated every time an operation comes in so that we can read our own writes within a transaction.
-These changes are not visible to outside operations because we haven't committed the transaction (
-and therefore, the WUOW) yet.
+When a node starts a transaction, it will acquire the global lock in intent exclusive mode (and as a
+result, the [RSTL](#replication-state-transition-lock) in intent exclusive as well), which it will
+hold for the duration of the transaction. The only exception is when
+[preparing a transaction](#preparing-a-transaction-on-the-primary), which will release the RSTL and
+reacquire it when [committing](#committing-a-prepared-transaction) or
+[aborting](#aborting-a-prepared-transaction) the transaction. It also opens a `WriteUnitOfWork`,
+which begins a storage engine transaction on the `RecoveryUnit`. The `RecoveryUnit` is responsible
+for making sure data is persisted and all on-disk data must be modified through this interface. The
+storage transaction is updated every time an operation comes in so that we can read our own writes
+within a multi-document transaction. These changes are not visible to outside operations because the
+node hasn't committed the transaction (and therefore, the WUOW) yet.
 
-From here, we can continue this multi-document transaction by running more commands on the same
-session. These operations are then stored in memory. Once a write completes on the primary, we
-update the corresponding `sessionTxnRecord` in the transactions table (`config.transactions`) with
-information about the transaction. This includes things like the `lsid`, the `txnNumber`
-currently associated with the session, and the `txnState`.
+### Adding Operations to a Transaction
+
+A user can add additional operations to an existing multi-document transaction by running more
+commands on the same session. These operations are then stored in memory. Once a write completes on
+the primary, we update the corresponding `sessionTxnRecord` in the transactions table
+(`config.transactions`) with information about the transaction. This includes things like the
+`lsid`, the `txnNumber` currently associated with the session, and the `txnState`.
 
 This table was introduced for retryable writes and is used to keep track of retryable write and
 transaction progress on a session. When checking out a session, this table can be used to restore
-the transaction's state. See the Recovering Transactions section for information on how the
-transactions table is used during transaction recovery.
-<!-- TODO SERVER-43783: Link to recovery process for transactions -->
+the transaction's state. See the
+[Recovering Prepared Transactions](#recovering-prepared-transactions) section for information on how
+the transactions table is used during transaction recovery.
+
+### Committing a Single Replica Set Transaction
 
 If we decide to commit this transaction, we retrieve those operations, group them into an `applyOps`
 command and write down an `applyOps` oplog entry. Since an `applyOps` oplog entry can only be up to
@@ -548,6 +651,8 @@ storage engine.
 Finally, we update the transactions table, update our local `txnState` to `kCommitted`, log any
 transactions metrics, and clear our txnResources.
 
+### Aborting a Single Replica Set Transaction
+
 The process for aborting a multi-document transaction is simpler than committing since none of the
 operations are visible at this point. We abort the storage transaction, update the
 `sessionTxnRecord` in the transactions table, and write an abort oplog entry. Finally, we change
@@ -556,6 +661,355 @@ in memory state of the `TransactionParticipant`.
 
 Note that transactions can abort for reasons outside of the `abortTransaction` command. For example,
 we abort non-prepared transactions that encounter write conflicts or state transitions.
+
+## Cross-Shard Transactions and the Prepared State
+
+In 4.2, we added support for **cross-shard transactions**, or transactions that involve data from
+multiple shards in a cluster. We needed to add a **Two Phase Commit Protocol** to uphold the
+atomicity of a transaction that involves multiple shards. One important part of the Two Phase Commit
+Protocol is making sure that all shards participating in the transaction are in the
+**prepared state**, or guaranteed to be able to commit, before actually committing the transaction.
+This will allow us to avoid a situation where the transaction only commits on some of the shards and
+aborts on others. Once a node puts a transaction in the prepared state, it *must* be able to commit
+the transaction if we decide to commit the overall cross-shard transaction.
+
+Another key piece of the Two Phase Commit Protocol is the **`TransactionCoordinator`**, which is
+the first shard to receive an operation for a particular transaction. The `TransactionCoordinator`
+will coordinate between all participating shards to ultimately commit or abort the transaction.
+
+When the `TransactionCoordinator` is told to commit a transaction, it must first make sure that all
+participating shards successfully prepare the transaction before telling them to commit the
+transaction. As a result, the coordinator will issue the `prepareTransaction` command, an internal
+command, on each shard participating in the transaction.
+
+Each participating shard must majority commit the `prepareTransaction` command (thus making sure
+that the prepare operation cannot be rolled back) before the `TransactionCoordinator` will send out
+the `commitTransaction` command. This will help ensure that once a node prepares a transaction, it
+will remain in the prepared state until the transaction is committed or aborted by the
+`TransactionCoordinator`. If one of the shards fails to prepare the transaction, the
+`TransactionCoordinator` will tell all participating shards to abort the transaction via the
+`abortTransaction` command regardless of whether they have prepared it or not.
+
+The durability of the prepared state is managed by the replication system, while the Two Phase
+Commit Protocol is managed by the sharding system.
+
+## Lifetime of a Prepared Transaction
+
+Until a `prepareTransaction` command is run for a particular transaction, it follows the same path
+as a single replica set transaction. But once a transaction is in the prepared state, new operations
+cannot be added to it. The only way for a transaction to exit the prepared state is to either
+receive a `commitTransaction` or `abortTransaction` command. This means that prepared transactions
+must [survive state transitions and failovers](#state-transitions-and-failovers-with-transactions).
+Additionally, there are many situations that need to be prevented to preserve prepared transactions.
+For example, they cannot be killed or time out (nor can their sessions), manual updates to the
+transactions table are forbidden for transactions in the prepared state, and the prepare transaction
+oplog entry(s) cannot fall off the back of the oplog.
+
+### Preparing a Transaction on the Primary
+
+When a primary receives a `prepareTransaction` command, it will transition the associated
+transaction's `txnState` to `kPrepared`. Next it will reserve an **oplog slot** (which is a unique
+`OpTime`) for the `prepareTransaction` oplog entry. The `prepareTransaction` oplog entry will
+contain all the operations from the transaction, which means that if the transaction is larger than
+16MB (and thus requires multiple oplog entries), the node will reserve multiple oplog slots. The
+`OpTime` for the `prepareTransaction` oplog entry will be used for the
+[**`prepareTimestamp`**](#replication-timestamp-glossary).
+
+The node will then set the `prepareTimestamp` on the `RecoveryUnit` and mark the storage engine's
+transaction as prepared so that the storage engine can
+[block conflicting reads and writes](#prepare-conflicts) until the transaction is committed or
+aborted.
+
+Next, the node will create the `prepareTransaction` oplog entry and write it to the oplog. This will
+involve taking all the operations from the transaction and storing them as an `applyOps` oplog
+entry (or multiple `applyOps` entries for larger transactions). The node will also make a couple
+updates to the transactions table. It will update the starting `OpTime` of the transaction, which
+will either be the `OpTime` of the prepare oplog entry or, in the case of larger transactions, the
+`OpTime` of the first oplog entry of the transaction. It will also update that the state of the
+transaction is `kPrepared`. This information will be useful if the node ever needs to recover the
+prepared transaction in the event of failover.
+
+If any of the above steps fails when trying to prepare a transaction, then the node will abort the
+transaction. If that happens, the node will respond back to the `TransactionCoordinator` that the
+transaction failed to prepare. This will cause the `TransactionCoordinator` to tell all other
+participating shards to abort the transaction, thus preserving the atomicity of the transaction. If
+this happens, it is safe to retry the entire transaction.
+
+Finally, the node will record metrics, release the [RSTL](#replication-state-transition-lock) (while
+still holding the global lock) to allow prepared transactions to survive state transitions, and
+respond with the `prepareTimestamp` to the `TransactionCoordinator`.
+
+### Prepare Conflicts
+
+A **prepare conflict** is generated when an operation attempts to read a document that was updated
+as a part of an active prepared transaction. Since the transaction is still in the prepared state,
+it's not yet known whether it will commit or abort, so updates made by a prepared transaction can't
+be made visible outside the transaction until it completes.
+
+Based on the read concern, reads will do different things in this case. A read with read concern
+local, available or majority (without causal consistency) will not cause a prepare conflict to be
+generated by the storage engine, but instead will return the state of the data before the prepared
+update. Reads using snapshot, linearizable, or afterClusterTime read concerns, will block and wait
+until the transaction is committed or aborted to serve the read.
+
+If a write attempts to modify a document that was also modified by a prepared transaction, it will
+block and wait for the transaction to be committed or aborted before proceeding.
+
+### Committing a Prepared Transaction
+
+Committing a prepared transaction is very similar to
+[committing a single replica set transaction](#committing-a-single-replica-set-transaction). One of
+the main differences is that the commit oplog entry will not have any of the operations from the
+transaction in it, because those were already included in the prepare oplog entry(s).
+
+For a cross-shard transaction, the `TransactionCoordinator` will issue the `commitTransaction`
+command to all participating shards when each shard has majority committed the `prepareTransaction`
+command. The `commitTransaction` command must be run with a specified
+[`commitTimestamp`](#replication-timestamp-glossary) so that all participating shards can commit the
+transaction at the same timestamp. This will be the timestamp at which the effects of the
+transaction are visible.
+
+When a node receives the `commitTransaction` command and the transaction is in the prepared state,
+it will first re-acquire the [RSTL](#replication-state-transition-lock) to prevent any state
+transitions from happening while the commit is in progress. It will then reserve an oplog slot,
+commit the storage transaction at the `commitTimestamp`, write the `commitTransaction` oplog entry
+into the oplog, update the transactions table, transition the `txnState` to `kCommitted`, record
+metrics, and clean up the transaction resources.
+
+### Aborting a Prepared Transaction
+
+Aborting a prepared transaction is very similar to
+[aborting a non-prepared transaction](#aborting-a-single-replica-set-transaction). The only
+difference is that before aborting a prepared transaction, the node must re-acquire the
+[RSTL](#replication-state-transition-lock) to prevent any state transitions from happening while
+the abort is in progress. Non-prepared transactions don't have to do this because the node will
+still have the RSTL at this point.
+
+## State Transitions and Failovers with Transactions
+
+### State Transitions and Failovers with Single Replica Set Transactions
+
+The durability of a single replica set transaction is not guaranteed until the `commitTransaction`
+command is majority committed. This means that in-progress transactions are not recovered during
+failover or preserved during state transitions.
+
+Unprepared transactions that are in-progress will be aborted during stepdown. During a
+[stepdown](#step-down), transactions will still be holding the
+[RSTL](#replication-state-transition-lock), which will conflict with the stepdown. As a result,
+after enqueueing the RSTL during stepdown, the node will abort all unprepared transactions until it
+can acquire the RSTL.
+
+Transactions that are in-progress but not in the prepared state will be aborted during
+[step up](#step-up). Being in progress during step up means that the transaction requires multiple
+oplog entries and that the node has not received all the oplog entries it needs to prepare or commit
+the transaction. As a result, the node will abort all such transactions before it steps up.
+
+If a node goes through a shut down, it will not recover any unprepared transactions during
+[startup recovery](#startup-recovery).
+
+### Stepdown with a Prepared Transaction
+
+Unlike unprepared transactions, which get aborted during a stepdown, prepared transactions need to
+survive stepdown because shards are relying on the `prepareTransaction` command being (and
+remaining) majority committed. As a result, after preparing a transaction, the node will release the
+[RSTL](#replication-state-transition-lock) so that it does not end up conflicting with state
+transitions. When [stepdown](#step-down) is aborting transactions before acquiring the RSTL, it will
+only abort unprepared transactions. Once stepdown finishes, the node will yield locks from all
+prepared transactions since secondaries don't hold locks for their transactions.
+
+### Step Up with a Prepared Transaction
+
+If a secondary has a prepared transaction when it [steps up](#step-up), it will have to re-acquire
+all the locks for the prepared transaction (other than the RSTL), since the primary relies on
+holding these locks to prevent conflicting operations.
+
+### Recovering Prepared Transactions
+
+The prepare state *must* endure any state transition or failover, so they must be recovered and
+reconstructed in all situations. If the in-memory state of a prepared transaction is lost, it can be
+reconstructed using the information in the prepare oplog entry(s).
+
+[Startup recovery](#startup-recovery), [rollback](#rollback), and [initial sync](#initial-sync) all
+use the same algorithm to reconstruct prepared transactions. In all situations, the node will go
+through a period of applying oplog entries to get the data caught up with the rest of the replica
+set.
+
+As the node applies oplog entries, it will update the transaction table every time it encounters a
+`prepareTransaction` oplog entry to save that the state of the transaction is prepared. Instead of
+actually applying the oplog entry and preparing the transaction, the node will wait until oplog
+application has completed to reconstruct the transaction. If the node encounters a
+`commitTransaction` oplog entry, it will immediately commit the transaction. If the transaction it's
+about to commit was prepared, the node will find the `prepareTransaction` oplog entry(s) using the
+[`TransactionHistoryIterator`](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/db/transaction_history_iterator.h)
+to get the operations for the transaction, prepare it and then immediately commit it.
+
+When oplog application for recovery or initial sync completes, the node will iterate
+over all entries in the transactions table to see which transactions are still in the prepared
+state. At that point, the node will find the `prepareTransaction` oplog entry(s) associated with the
+transaction using the `TransactionHistoryIterator`. It will check out the session associated with
+the transaction, apply all the operations from the oplog entry(s) and prepare the transaction.
+
+## Read Concern Behavior Within Transactions
+
+The read concern for all operations within a transaction should be specified when starting the
+transaction. If no read concern was specified, the default read concern is local.
+
+Reads within a transaction behave differently from reads outside of a transaction because of
+**speculative** behavior. This means a transaction speculatively executes without ensuring that
+the data read won't be rolled back until it commits. No matter the read concern, when a node goes to
+commit a transaction, it waits for the data that it read to be majority committed *as long as the
+transaction was run with write concern majority*. Because of speculative behavior, this means that
+the transaction can only provide the guarantees of majority read concern, that data that it read
+won't roll back, if it is run with write concern majority.
+
+If the transaction did a write, then waiting for write concern is enough to ensure that all data
+read will have since become majority committed. However, if the transaction was read-only, the node
+will do a noop write and wait for that to be majority committed to provide the same guarantees.
+
+### Local and Majority Read Concerns
+
+There is currently no functional difference between a transaction with local and majority read
+concern. The node will do untimestamped reads in either case. When the transaction is started, it
+will choose the most recent snapshot to read from, so that it can read the freshest data.
+
+The node does untimestamped reads because reading at the
+[`all_durable`](#replication-timestamp-glossary) timestamp would mean that the node was reading
+potentially stale data. This would also allow for more write conflicts that abort the transaction,
+since there would be a larger window of time between when the read happens and when the transaction
+commits for an outside write to conflict.
+
+In theory, transactions with local read concern should not have to perform a noop write and wait for
+it to be majority committed when the transaction commits. However, we intend to make "majority" the
+default read concern level for transactions, in order to be consistent with the observation that any
+MongoDB command that can write has speculative majority behavior (e.g. findAndModify). Until we
+change transactions to have majority as their default read concern, it's important that local and
+majority behave the same.
+
+### Snapshot Read Concern
+
+Snapshot read concern will choose a snapshot from which the transaction will read. If it is
+specified with an `atClusterTime` argument, then that will be used as the transaction's read
+timestamp. If `atClusterTime` is not specified, then the read timestamp of the transaction will be
+the [`all_durable`](#replication-timestamp-glossary) timestamp when the transaction is started,
+which ensures a snapshot with no oplog holes.
+
+## Transaction Oplog Application
+
+Secondaries begin replicating transaction oplog entries once the primary has either prepared or
+committed the transaction. They use the `OplogApplier` to apply these entries, which then uses the
+writer thread pool to schedule operations to apply.
+<!-- TODO SERVER-43969: Link to oplog application section -->
+
+Before secondaries process and apply transaction oplog entries, they will track operations that
+require changes to `config.transactions`. This results in an update to the transactions table entry
+(`sessionTxnRecord`) that corresponds to the oplog entry operation. For example,
+`prepareTransaction`, `commitTransaction`, and `abortTransaction` will all update the `txnState`
+accordingly.
+
+### Unprepared Transactions Oplog Application
+
+Unprepared transactions are comprised of `applyOps` oplog entries. When they are smaller than 16MB,
+they will write a single `applyOps` oplog entry for the whole transaction upon commit. Since
+secondaries do not need to wait for any additional entries, they can apply the entry for a small
+unprepared transaction immediately.
+
+When transactions are larger than 16MB, they use the `prevOpTime` field, which is the opTime of the
+previous `applyOps` oplog entry, to link multiple `applyOps` oplog entries together. The
+`partialTxn: true` field is used here to indicate that the transaction is incomplete and cannot be
+applied immediately. Since the `partialTxn` field does not apply to all oplog entries, it is added
+as a subfield of the 'o' field. A secondary must wait until it receives the final `applyOps` oplog
+entry of a large unprepared transaction, which will have a non-empty `prevOpTime` field and no
+`partialTxn` field, before applying entries. This ensures we have all the entries associated with
+the transaction before applying them, allowing us to avoid failover scenarios where only part of a
+large transaction is replicated.
+
+When we see an `applyOps` oplog entry that is a part of an unprepared transaction, we will unpack
+the CRUD operations and apply them in parallel by using the writer thread pool. For larger
+transactions, once the secondary has received all the oplog entries, it will traverse the oplog
+chain to get all the operations from the transaction and do the same thing.
+
+Note that checking out the session is not necessary for unprepared transactions since they are
+just a series of CRUD operations for secondary oplog application. The atomicity of data on disk is
+guaranteed by recovery. The atomicity of visible data in memory is guaranteed by how we advance the
+[`lastApplied`](#replication-timestamp-glossary) on secondaries.
+
+### Prepared Transactions Oplog Application
+
+Prepared transactions also write down `applyOps` oplog entries that contain all the operations for
+the transaction, but do so when they are prepared. Prepared transactions smaller than 16MB only
+write one of these entries, while those larger than 16MB write multiple.
+
+We use a `prepare: true` field to indicate that an `applyOps` entry is for a prepared transaction.
+For large prepared transactions, this field will be present in the last `applyOps` entry of the
+oplog chain, indicating that the secondary must prepare the transaction. The timestamp of the
+prepare oplog entry is referred to as the [`prepareTimestamp`](#replication-timestamp-glossary).
+
+`prepareTransaction` oplog entries are applied in their own batches in a single WUOW. When
+applying prepared operations, which are unpacked from the prepared `applyOps` entry, the applier
+thread must first check out the appropriate session and **unstash** the transaction resources
+(`txnResources`). `txnResources` refers to the lock state and storage state of a transaction. When
+we "unstash" these resources, we transfer the management of them to the `OperationContext`. The
+applier thread will then add the prepare operations to the storage transaction and finally yield
+the locks used for transactions. This means that prepared transactions will only **stash** (which
+transfers the management of `txnResources` back to the session) the recovery unit. Stashing the
+locks would make secondary oplog application conflict with prepared transactions. These locks are
+restored the next time we **unstash** `txnResources`, which would be for `commitTransaction` or
+`abortTransaction`.
+
+Prepared transactions write down separate `commitTransaction` and `abortTransaction` oplog entries.
+`commitTransaction` oplog entries do not need to store the operations from the transaction since
+we have already recorded them through the prepare oplog entries. These entries are also applied
+in their own batches and follow the same procedure of checking out the appropriate session,
+unstashing transaction resources, and either committing or aborting the storage transaction.
+
+Note that secondaries can apply prepare oplog entries immediately but
+[recovering](#recovering-prepared-transactions) nodes must wait until they finish the process or
+see a commit oplog entry.
+
+## Transaction Errors
+
+### PreparedTransactionInProgress Errors
+
+Starting a new transaction on a session with an already existing in-progress transaction can cause
+the existing transaction to be **implicitly aborted**. Implicitly aborting a transaction happens if
+the transaction is aborted without an explicit `abortTransaction` command. However, prepared
+transactions cannot be implicitly aborted, since they can only complete after a `commitTransaction`
+or `abortTransaction` command from the `TransactionCoordinator`. As a result, any attempt to start a
+new transaction on a session that already has a prepared trasaction on it will fail with a
+`PreparedTransactionInProgress` error.
+
+Additionally, the only operations that can be run on a prepared transaction are
+`prepareTransaction`, `abortTransaction`, and `commitTransaction`. If any other command is run on
+the transaction, the command will fail with a `PreparedTransactionInProgress` error.
+
+Commands run as a part of a transaction that fail with this error code will always have the
+[`TransientTransactionError`](#transienttransactionerror-label) label attached to its response.
+
+### NoSuchTransaction Errors
+
+`NoSuchTransaction` errors are generated for commands that attempt to continue, prepare, commit, or
+abort a transaction that isn't in progress. Two common reasons why this error is generated are
+because the transaction has since started a new transaction or the transaction has already been
+aborted.
+
+All commands made in a transaction other than `commitTransaction` that fail with this error code
+will always have the [`TransientTransactionError`](#transienttransactionerror-label) label attached
+to its response. If the `commitTransaction` command failed with a `NoSuchTransaction` error without
+a write concern error, then it will have the `TransientTransactionError` label attached to its
+response. If it failed with a write concern error, then it wouldn't be safe to retry the entire
+transaction since it could have committed on one of the nodes.
+
+### TransactionTooOld Errors
+
+If an attempt is made to start a transaction that is older than the current active or the last
+committed transaction, then that operation will fail with `TransactionTooOld`.
+
+### TransientTransactionError Label
+
+A transaction could fail with one of the errors above or a different one. There are some errors that
+will cause a transaction to abort with no persistent side effects. In these cases, the server will
+attach the `TransientTransactionError` label to the response (which will still contain the orignal
+error code), so that the caller knows that they can safely retry the entire transaction.
 
 # Concurrency Control
 
@@ -587,8 +1041,9 @@ It is acquired in exclusive mode for the following replication state transitions
 `SECONDARY` (step down), `SECONDARY` to `PRIMARY` (step up), `SECONDARY` to `ROLLBACK` (rollback),
 `ROLLBACK` to `SECONDARY`, and `SECONDARY` to `RECOVERING`. Operations can hold it when they need to
 ensure that the node won't go through any of the above state transitions. Some examples of
-operations that do this are preparing a transaction, committing or aborting a prepared transaction,
-and checking/setting if the node can accept writes or serve reads.
+operations that do this are [preparing](#preparing-a-transaction-on-the-primary) a transaction,
+[committing](#committing-a-prepared-transaction) or [aborting](#aborting-a-prepared-transaction) a
+prepared transaction, and checking/setting if the node can accept writes or serve reads.
 
 ## Global Lock Acquisition Ordering
 
@@ -708,7 +1163,11 @@ from previous terms until the commit point is updated to reflect an oplog entry 
 The node writes a "new primary" noop oplog entry so that it can commit older writes as soon as
 possible. Once the commit point is updated to reflect the "new primary" oplog entry, older writes
 will automatically be part of the commit point by nature of happening before the term change.
-Finally, the node drops all temporary collections and logs “transition to primary complete”.
+Finally, the node drops all temporary collections, restores all locks for
+[prepared transactions](#step-up-with-a-prepared-transaction), aborts all
+[in progress transactions](#state-transitions-and-failovers-with-single-replica-set-transactions),
+and logs “transition to primary complete”. At this point, new writes will be accepted by the
+primary.
 
 ## Step Down
 
@@ -723,17 +1182,17 @@ a majority of the nodes
 * At least one of the up-to-date secondaries is also electable
 
 When a `replSetStepDown` command comes in, the node begins to check if it can step down. First, the
-node attempts to acquire the RSTL. In order to do so, it must kill all conflicting user/system
-operations and abort all unprepared transactions.
+node attempts to acquire the [RSTL](#replication-state-transition-lock). In order to do so, it must
+kill all conflicting user/system operations and abort all unprepared transactions.
 
 Now, the node loops trying to step down. If force is `false`, it repeatedly checks if a majority of
 nodes have reached the `lastApplied` optime, meaning that they are caught up. It must also check
 that at least one of those nodes is electable. If force is `true`, it does not wait for these
 conditions and steps down immediately after it reaches the `waitUntil` deadline.
 
-Upon a successful stepdown, it yields locks held by prepared transactions because we are now a
-secondary. Finally, we log stepdown metrics and update our member state to `SECONDARY`.
-<!-- TODO SERVER-43781: Link to process for reconstructing prepared transactions -->
+Upon a successful stepdown, it yields locks held by
+[prepared transactions](#stepdown-with-a-prepared-transaction) because we are now a secondary.
+Finally, we log stepdown metrics and update our member state to `SECONDARY`.
 
 ### Unconditional
 
@@ -751,7 +1210,7 @@ schedule a replica set config change.
 
 During unconditional stepdown, we do not check preconditions before attempting to step down. Similar
 to conditional stepdowns, we must kill any conflicting user/system operations before acquiring the
-RSTL and yield locks to prepared transactions following a successful stepdown.
+RSTL and yield locks of prepared transactions following a successful stepdown.
 
 ### Concurrent Stepdown Attempts
 
@@ -837,10 +1296,10 @@ truncate point) and applies all oplog entries through the end of the sync source
 [Startup Recovery](#startup-recovery) section for more information on truncating the oplog and
 applying oplog entries.
 
-The last thing we do before exiting the data modification section is reconstruct prepared
-transactions. We must also restore their in-memory state to what it was prior to the rollback in
-order to fulfill the durability guarantees of prepared transactions.
-<!-- TODO SERVER-43783: Link to process for reconstructing prepared transactions -->
+The last thing we do before exiting the data modification section is
+[reconstruct prepared transactions](#recovering-prepared-transactions). We must also restore their
+in-memory state to what it was prior to the rollback in order to fulfill the durability guarantees
+of prepared transactions.
 
 At this point, the last applied and durable OpTimes still point to the divergent branch of history,
 so we must update them to be at the top of the oplog, which should be the `common point`.
@@ -859,11 +1318,11 @@ initiated by the `ReplicationCoordinator` and done in the
 When a node begins initial sync, it goes into the `STARTUP2` state. `STARTUP` is reserved for the
 time before the node has loaded its local configuration of the replica set.
 
-At a high level, there are two phases to initial sync: the data clone phase and the oplog
-application phase. During the data clone phase, the node will copy all of another node's data. After
-that phase is completed, it will start the oplog application phase where it will apply all the oplog
-entries that were written since it started copying data. Finally, it will reconstruct any
-transactions in the prepared state.
+At a high level, there are two phases to initial sync: the [**data clone phase**](#data-clone-phase)
+and the [**oplog application phase**](#oplog-application-phase). During the data clone phase, the
+node will copy all of another node's data. After that phase is completed, it will start the oplog
+application phase where it will apply all the oplog entries that were written since it started
+copying data. Finally, it will reconstruct any transactions in the prepared state.
 
 Before the data clone phase begins, the node will do the following:
 
@@ -892,19 +1351,19 @@ Before the data clone phase begins, the node will do the following:
    to be applied later. Operations are buffered to a collection so that they are not limited by the
    amount of memory available.
 
-#### Data clone phase
+## Data clone phase
 
-The new node then begins to clone data from its sync source. The `InitialSyncer` constructs a
-[`DatabasesCloner`](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/db/repl/databases_cloner.h)
-that's used to clone all of the databases on the upstream node. The `DatabasesCloner` asks the sync
-source for a list of its databases and then for each one it creates a
-[`DatabaseCloner`](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/db/repl/database_cloner.h)
+The new node then begins to clone data from its sync source. The `InitialSyncer` constructs an
+[`AllDatabaseCloner`](https://github.com/mongodb/mongo/blob/r4.3.2/src/mongo/db/repl/all_database_cloner.h)
+that's used to clone all of the databases on the upstream node. The `AllDatabaseCloner` asks the
+sync source for a list of its databases and then for each one it creates and runs a
+[`DatabaseCloner`](https://github.com/mongodb/mongo/blob/r4.3.2/src/mongo/db/repl/database_cloner.h)
 to clone that database. Each `DatabaseCloner` asks the sync source for a list of its collections and
-for each one creates a
-[`CollectionCloner`](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/db/repl/collection_cloner.h)
+for each one creates and runs a
+[`CollectionCloner`](https://github.com/mongodb/mongo/blob/r4.3.2/src/mongo/db/repl/collection_cloner.h)
 to clone that collection. The `CollectionCloner` calls `listIndexes` on the sync source and creates
 a
-[`CollectionBulkLoader`](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/db/repl/collection_bulk_loader.h)
+[`CollectionBulkLoader`](https://github.com/mongodb/mongo/blob/r4.3.2/src/mongo/db/repl/collection_bulk_loader.h)
 to create all of the indexes in parallel with the data cloning. The `CollectionCloner` then uses an
 **exhaust cursor** to run a `find` request on the sync source for each collection, inserting the
 fetched documents each time, until it fetches all of the documents. Instead of explicitly needing to
@@ -912,7 +1371,26 @@ run a `getMore` on an open cursor to get the next batch, exhaust cursors make it
 `find` does not exhaust the cursor, the sync source will keep sending batches until there are none
 left.
 
-#### Oplog application phase
+The cloners are resilient to transient errors.  If a cloner encounters an error marked with the
+`RetriableError` label in
+[`error_codes.yml`](https://github.com/mongodb/mongo/blob/r4.3.2/src/mongo/base/error_codes.yml), it
+will retry whatever network operation it was attempting.  It will continue attempting to retry for a
+length of time set by the server parameter `initialSyncTransientErrorRetryPeriodSeconds`, after
+which it will consider the failure permanent.  A permanent failure means it will choose a new sync
+source and retry all of initial sync, up to a number of times set by the server parameter
+`numInitialSyncAttempts`.  One notable exception, where we do not retry the entire operation, is for
+the actual querying of the collection data.  For querying, we use a feature called **resume
+tokens**.  We set a flag on the query: `$_requestResumeToken`.  This causes each batch we receive
+from the sync source to contain an opaque token which indicates our current position in the
+collection.  After storing a batch of data, we store the most recent resume token in a member
+variable of the `CollectionCloner`.  Then, when retrying we provide this resume token in the query,
+allowing us to avoid having to re-fetch the parts of the collection we have already stored.
+
+The `initialSyncTransientErrorRetryPeriodSeconds` is also used to control retries for the oplog
+fetcher and all network operations in initial sync which take place after the data cloning has
+started.
+
+## Oplog application phase
 
 After the cloning phase of initial sync has finished, the oplog application phase begins. The new
 node first asks its sync source for its last applied OpTime and this is saved as the
@@ -930,11 +1408,11 @@ One notable exception is that the node will not apply `prepareTransaction` oplog
 to how we reconstruct prepared transactions in startup and rollback recovery, we will update the
 transactions table every time we see a `prepareTransaction` oplog entry. Because the nodes wrote
 all oplog entries starting at the `beginFetchingTimestamp` into the oplog, the node will have all
-the oplog entries it needs to reconstruct the state for all prepared transactions after the oplog
-application phase is done.
-<!-- TODO SERVER-43783: Link to process for reconstructing prepared transactions -->
+the oplog entries it needs to
+[reconstruct the state for all prepared transactions](#recovering-prepared-transactions) after the
+oplog application phase is done.
 
-#### Idempotency concerns
+## Idempotency concerns
 
 Some of the operations that are applied may already be reflected in the data that was cloned since
 we started buffering oplog entries before the collection cloning phase even started. Consider the
@@ -943,11 +1421,11 @@ following:
 1. Start buffering oplog entries
 2. Insert `{a: 1, b: 1}` to collection `foo`
 3. Insert `{a: 1, b: 2}` to collection `foo`
-5. Drop collection `foo`
-6. Recreate collection `foo`
-7. Create unique index on field `a` in collection `foo`
-8. Clone collection `foo`
-9. Start applying oplog entries and try to insert both `{a: 1, b: 1}` and `{a: 1, b: 2}`
+4. Drop collection `foo`
+5. Recreate collection `foo`
+6. Create unique index on field `a` in collection `foo`
+7. Clone collection `foo`
+8. Start applying oplog entries and try to insert both `{a: 1, b: 1}` and `{a: 1, b: 2}`
 
 As seen here, there can be operations on collections that have since been dropped or indexes could
 conflict with the data being added. As a result, many errors that occur here are ignored and assumed
@@ -955,7 +1433,7 @@ to resolve themselves, such as `DuplicateKey` errors (like in the example above)
 problematic operations such as `renameCollection` are received, where we cannot assume a drop will
 come and fix them, we abort and retry initial sync.
 
-#### Finishing initial sync
+## Finishing initial sync
 
 The oplog application phase concludes when the node applies an oplog entry at `stopTimestamp`. The
 node checks its sync source's Rollback ID to see if a rollback occurred and if so, restarts initial
@@ -970,23 +1448,23 @@ is the node's last applied OpTime. Finally, the `InitialSyncer` shuts down and t
 
 # Startup Recovery
 
-*Startup recovery* is a node's process for putting both the oplog and data into a consistent state
+**Startup recovery** is a node's process for putting both the oplog and data into a consistent state
 during startup (and happens while the node is in the `STARTUP` state). If a node has an empty or
 non-existent oplog, or already has the initial sync flag set when starting up, then it will skip
 startup recovery and go through [initial sync](#initial-sync) instead.
 
 If the node already has data, it will go through
 [startup recovery](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/db/repl/replication_recovery.cpp).
-It will first get the *recovery timestamp* from the storage engine, which is the timestamp through
+It will first get the **recovery timestamp** from the storage engine, which is the timestamp through
 which changes are reflected in the data at startup (and the timestamp used to set the
 `initialDataTimestamp`). The recovery timestamp will be a `stable_timestamp` so that the node
-recovers from a *stable checkpoint*, which is a durable view of the data at a particular timestamp.
+recovers from a **stable checkpoint**, which is a durable view of the data at a particular timestamp.
 It should be noted that due to journaling, the oplog and many collections in the local database are
 an exception and are up-to-date at startup rather than reflecting the recovery timestamp.
 
 If a node went through an unclean shutdown, then it might have been in the middle of writing a batch
 of oplog entries to its oplog. Since this is done in parallel, it could mean that there are gaps in
-the oplog from entries in the batch that weren't written yet, called *oplog holes*. During startup,
+the oplog from entries in the batch that weren't written yet, called **oplog holes**. During startup,
 a node wouldn't be able to tell which oplog entries were successfully written into the oplog. To fix
 this, after getting the recovery timestamp, the node will truncate its oplog to a point that it can
 guarantee didn't have any oplog holes using the `oplogTruncateAfterPoint` document. This document is
@@ -1006,8 +1484,8 @@ recovery timestamp through the top of the oplog. The one exception is that it wi
 `prepareTransaction` oplog entries. Similar to how a node reconstructs prepared transactions during
 initial sync and rollback, the node will update the transactions table every time it see a
 `prepareTransaction` oplog entry. Once the node has finished applying all the oplog entries through
-<!-- TODO SERVER-43783: Link to process for reconstructing prepared transactions -->
-the top of the oplog, it will reconstruct all transactions still in the prepare state.
+the top of the oplog, it will [reconstruct](#recovering-prepared-transactions) all transactions
+still in the prepare state.
 
 Finally, the node will finish loading the replica set configuration, set its `lastApplied` and
 `lastDurable` timestamps to the top of the oplog and start steady state replication.
@@ -1018,8 +1496,7 @@ In 3.6, the Two Phase Drop Algorithm was added in the replication layer for supp
 and database drops. It made it easy to support rollbacks for drop operations. In 4.2, the
 implementation for collection drops was moved to the storage engine. This section will cover the
 behavior for the implementation in the replication layer, which currently runs on nodes where
-<!-- TODO SERVER-43788: Link to the section describing enableMajorityReadConcern=false -->
-`enableMajorityReadConcern` is set to false.
+[`enableMajorityReadConcern=false`](#enableMajorityReadConcern-flag).
 
 ## Dropping Collections
 
@@ -1051,19 +1528,19 @@ In this section, when we refer to the word "transaction" without any other quali
 about a storage transaction. Transactions in the replication layer will be referred to as
 multi-document or prepared transactions.
 
-`all_durable`: All transactions with timestamps earlier than the `all_durable` timestamp are
+**`all_durable`**: All transactions with timestamps earlier than the `all_durable` timestamp are
 committed. This is the point at which the oplog has no gaps, which are created when we reserve
 timestamps before executing the associated write. Since this timestamp is used to maintain the oplog
 visibility point, it is important that all operations up to and including this timestamp are
 committed and durable on disk. This is so that we can replicate the oplog without any gaps.
 
-`commit oplog entry timestamp`: The timestamp of the ‘commitTransaction’ oplog entry for a prepared
-transaction, or the timestamp of the ‘applyOps’ oplog entry for a non-prepared transaction. In a
-cross-shard transaction each shard may have a different commit oplog entry timestamp. This is
+**`commit oplog entry timestamp`**: The timestamp of the ‘commitTransaction’ oplog entry for a
+prepared transaction, or the timestamp of the ‘applyOps’ oplog entry for a non-prepared transaction.
+In a cross-shard transaction each shard may have a different commit oplog entry timestamp. This is
 guaranteed to be greater than the `prepareTimestamp`.
 
-`commitTimestamp`: The timestamp at which we committed a multi-document transaction. This will be
-the `commitTimestamp` field in the `commitTransaction` oplog entry for a prepared transaction, or
+**`commitTimestamp`**: The timestamp at which we committed a multi-document transaction. This will
+be the `commitTimestamp` field in the `commitTransaction` oplog entry for a prepared transaction, or
 the timestamp of the ‘applyOps’ oplog entry for a non-prepared transaction. In a cross-shard
 transaction this timestamp is the same across all shards. The effects of the transaction are visible
 as of this timestamp. Note that `commitTimestamp` and the `commit oplog entry timestamp` are the
@@ -1071,18 +1548,18 @@ same for non-prepared transactions because we do not write down the oplog entry 
 transaction. For a prepared transaction, we have the following guarantee: `prepareTimestamp` <=
 `commitTimestamp` <= `commit oplog entry timestamp`
 
-`currentCommittedSnapshot`: An optime maintained in `ReplicationCoordinator` that is used to serve
-majority reads and is always guaranteed to be <= `lastCommittedOpTime`. When `eMRC=true`, this is
-currently set to the stable optime, which is guaranteed to be in a node’s oplog. Since it is reset
-every time we recalculate the stable optime, it will also be up to date.
+**`currentCommittedSnapshot`**: An optime maintained in `ReplicationCoordinator` that is used to
+serve majority reads and is always guaranteed to be <= `lastCommittedOpTime`. When `eMRC=true`, this
+is currently set to the stable optime, which is guaranteed to be in a node’s oplog. Since it is
+reset every time we recalculate the stable optime, it will also be up to date.
 
 When `eMRC=false`, this is set to the `lastCommittedOpTime`, so it may not be in the node’s oplog.
-The `stable_timestamp` is not allowed to advance past the `all_durable`. So, this value shouldn’t be
-ahead of `all_durable` unless `eMRC=false`.
+The `stable_timestamp` is not allowed to advance past the `all_durable`. So, this value shouldn’t
+be ahead of `all_durable` unless `eMRC=false`.
 
-`initialDataTimestamp`: A timestamp used to indicate the timestamp at which history “begins”. When
-a node comes out of initial sync, we inform the storage engine that the `initialDataTimestamp` is
-the node's `lastApplied`.
+**`initialDataTimestamp`**: A timestamp used to indicate the timestamp at which history “begins”.
+When a node comes out of initial sync, we inform the storage engine that the `initialDataTimestamp`
+is the node's `lastApplied`.
 
 By setting this value to 0, it informs the storage engine to take unstable checkpoints. Stable
 checkpoints can be viewed as timestamped reads that persist the data they read into a checkpoint.
@@ -1090,39 +1567,38 @@ Unstable checkpoints simply open a transaction and read all data that is current
 time the transaction is opened. They read a consistent snapshot of data, but the snapshot they read
 from is not associated with any particular timestamp.
 
-`lastApplied`: In-memory record of the latest applied oplog entry optime. It may lag behind the
+**`lastApplied`**: In-memory record of the latest applied oplog entry optime. It may lag behind the
 optime of the newest oplog entry that is visible in the storage engine because it is updated after
 a storage transaction commits.
 
-`lastCommittedOpTime`: A node’s local view of the latest majority committed optime. Every time we
-update this optime, we also recalculate the `stable_timestamp`. Note that the `lastCommittedOpTime`
-can advance beyond a node's `lastApplied` if it has not yet replicated the most recent majority
-committed oplog entry. For more information about how the `lastCommittedOpTime` is updated and
-propagated, please see [Commit Point Propagation](#commit-point-propagation).
+**`lastCommittedOpTime`**: A node’s local view of the latest majority committed optime. Every time
+we update this optime, we also recalculate the `stable_timestamp`. Note that the
+`lastCommittedOpTime` can advance beyond a node's `lastApplied` if it has not yet replicated the
+most recent majority committed oplog entry. For more information about how the `lastCommittedOpTime`
+is updated and propagated, please see [Commit Point Propagation](#commit-point-propagation).
 
-`lastDurable`: Optime of the latest oplog entry that has been flushed to the journal. It is
+**`lastDurable`**: Optime of the latest oplog entry that has been flushed to the journal. It is
 asynchronously updated by the storage engine as new writes become durable. Default journaling
 frequency is 100ms, so this could lag up to that amount behind lastApplied.
 
-`oldest_timestamp`: The earliest timestamp that the storage engine is guaranteed to have history
+**`oldest_timestamp`**: The earliest timestamp that the storage engine is guaranteed to have history
 for. New transactions can never start a timestamp earlier than this timestamp. Since we advance this
 as we advance the `stable_timestamp`, it will be less than or equal to the `stable_timestamp`.
 
-`prepareTimestamp`: The timestamp of the ‘prepare’ oplog entry for a prepared transaction. This is
-the earliest timestamp at which it is legal to commit the transaction. This timestamp is provided to
-the storage engine to block reads that are trying to read prepared data until the storage engines
+**`prepareTimestamp`**: The timestamp of the ‘prepare’ oplog entry for a prepared transaction. This
+is the earliest timestamp at which it is legal to commit the transaction. This timestamp is provided
+to the storage engine to block reads that are trying to read prepared data until the storage engines
 knows whether the prepared transaction has committed or aborted.
 
-`readConcernMajorityOpTime`: Exposed in replSetGetStatus as “readConcernMajorityOpTime” but is
+**`readConcernMajorityOpTime`**: Exposed in replSetGetStatus as “readConcernMajorityOpTime” but is
 populated internally from the `currentCommittedSnapshot` timestamp inside `ReplicationCoordinator`.
 
-`stable_timestamp`: The newest timestamp at which the storage engine is allowed to take a
+**`stable_timestamp`**: The newest timestamp at which the storage engine is allowed to take a
 checkpoint, which can be thought of as a consistent snapshot of the data. Replication informs the
 storage engine of where it is safe to take its next checkpoint. This timestamp is guaranteed to be
-majority committed so that RTT rollback can use it. In the case when `eMRC=false`, the stable
-<!-- TODO SERVER-43788: Link to eMRC=false section -->
-timestamp may not be majority committed, which is why we must use the Rollback via Refetch rollback
-algorithm.
+majority committed so that RTT rollback can use it. In the case when 
+[`eMRC=false`](#enableMajorityReadConcern-flag), the stable timestamp may not be majority committed,
+which is why we must use the Rollback via Refetch rollback algorithm.
 
 This timestamp is also required to increase monotonically except when `eMRC=false`, where in a
 special case during rollback it is possible for the `stableTimestamp` to move backwards.

@@ -454,6 +454,15 @@ public:
     virtual bool inActiveTxn() const = 0;
 
     /**
+     * Registers a callback to be called prior to a WriteUnitOfWork committing the storage
+     * transaction. This callback may throw a WriteConflictException which will abort the
+     * transaction.
+     */
+    virtual void registerPreCommitHook(std::function<void(OperationContext*)> callback);
+
+    virtual void runPreCommitHooks(OperationContext* opCtx);
+
+    /**
      * A Change is an action that is registerChange()'d while a WriteUnitOfWork exists. The
      * change is either rollback()'d or commit()'d when the WriteUnitOfWork goes out of scope.
      *
@@ -578,7 +587,10 @@ public:
         kAborting,
         kCommitting,
     };
-    State getState_forTest() const;
+
+    State getState() const {
+        return _state;
+    }
 
     std::string toString(State state) const {
         switch (state) {
@@ -604,13 +616,6 @@ public:
 
 protected:
     RecoveryUnit();
-
-    /**
-     * Returns the current state.
-     */
-    State _getState() const {
-        return _state;
-    }
 
     /**
      * Transitions to new state.
@@ -649,6 +654,8 @@ private:
     virtual void doAbandonSnapshot() = 0;
     virtual void doCommitUnitOfWork() = 0;
     virtual void doAbortUnitOfWork() = 0;
+
+    std::vector<std::function<void(OperationContext*)>> _preCommitHooks;
 
     typedef std::vector<std::unique_ptr<Change>> Changes;
     Changes _changes;

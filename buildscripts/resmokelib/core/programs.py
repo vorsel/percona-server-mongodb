@@ -138,6 +138,7 @@ def mongod_program(  # pylint: disable=too-many-branches
 
     shortcut_opts = {
         "enableMajorityReadConcern": config.MAJORITY_READ_CONCERN,
+        "logFormat": config.LOG_FORMAT,
         "nojournal": config.NO_JOURNAL,
         "serviceExecutor": config.SERVICE_EXECUTOR,
         "storageEngine": config.STORAGE_ENGINE,
@@ -213,6 +214,9 @@ def mongos_program(logger, executable=None, process_kwargs=None, **kwargs):
 
     _apply_set_parameters(args, suite_set_parameters)
 
+    if config.LOG_FORMAT is not None:
+        kwargs["logFormat"] = config.LOG_FORMAT
+
     # Apply the rest of the command line arguments.
     _apply_kwargs(args, kwargs)
 
@@ -243,6 +247,7 @@ def mongo_shell_program(  # pylint: disable=too-many-branches,too-many-locals,to
         test_name = None
     shortcut_opts = {
         "enableMajorityReadConcern": (config.MAJORITY_READ_CONCERN, True),
+        "logFormat": (config.LOG_FORMAT, ""),
         "mixedBinVersions": (config.MIXED_BIN_VERSIONS, ""),
         "noJournal": (config.NO_JOURNAL, False),
         "serviceExecutor": (config.SERVICE_EXECUTOR, ""),
@@ -330,6 +335,10 @@ def mongo_shell_program(  # pylint: disable=too-many-branches,too-many-locals,to
     eval_sb.append(
         "load('jstests/libs/override_methods/check_uuids_consistent_across_cluster.js');")
 
+    # Load a callback to check index consistency before shutting down a ShardingTest.
+    eval_sb.append(
+        "load('jstests/libs/override_methods/check_indexes_consistent_across_cluster.js');")
+
     # Load this file to retry operations that fail due to in-progress background operations.
     eval_sb.append(
         "load('jstests/libs/override_methods/implicitly_retry_on_background_op_in_progress.js');")
@@ -353,6 +362,9 @@ def mongo_shell_program(  # pylint: disable=too-many-branches,too-many-locals,to
 
         if "host" in kwargs:
             kwargs.pop("host")
+
+    if config.LOG_FORMAT is not None:
+        kwargs["logFormat"] = config.LOG_FORMAT
 
     # Apply the rest of the command line arguments.
     _apply_kwargs(args, kwargs)

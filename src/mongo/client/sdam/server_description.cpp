@@ -53,7 +53,9 @@ std::set<ServerType> kDataServerTypes{
 
 ServerDescription::ServerDescription(ClockSource* clockSource,
                                      const IsMasterOutcome& isMasterOutcome,
-                                     boost::optional<IsMasterRTT> lastRtt)
+                                     boost::optional<IsMasterRTT> lastRtt,
+                                     boost::optional<TopologyVersion> topologyVersion,
+                                     boost::optional<int> poolResetCounter)
     : ServerDescription(isMasterOutcome.getServer()) {
     if (isMasterOutcome.isSuccess()) {
         const auto response = *isMasterOutcome.getResponse();
@@ -65,11 +67,13 @@ ServerDescription::ServerDescription(ClockSource* clockSource,
         _lastUpdateTime = clockSource->now();
         _minWireVersion = response["minWireVersion"].numberInt();
         _maxWireVersion = response["maxWireVersion"].numberInt();
+        _topologyVersion = topologyVersion;
 
         saveLastWriteInfo(response.getObjectField("lastWrite"));
         saveHosts(response);
         saveTags(response.getObjectField("tags"));
         saveElectionId(response.getField("electionId"));
+        saveStreamable(response.getField("streamable"));
 
         auto lsTimeoutField = response.getField("logicalSessionTimeoutMinutes");
         if (lsTimeoutField.type() == BSONType::NumberInt) {
@@ -90,8 +94,16 @@ ServerDescription::ServerDescription(ClockSource* clockSource,
         if (primaryField.type() == BSONType::String) {
             _primary = response.getStringField("primary");
         }
+
+        if (poolResetCounter) {
+            _poolResetCounter = poolResetCounter.get();
+        }
     } else {
         _error = isMasterOutcome.getErrorMsg();
+        _topologyVersion = topologyVersion;
+        if (poolResetCounter) {
+            _poolResetCounter = poolResetCounter.get();
+        }
     }
 }
 
@@ -129,6 +141,15 @@ void ServerDescription::saveElectionId(BSONElement electionId) {
     if (electionId.type() == jstOID) {
         _electionId = electionId.OID();
     }
+}
+
+void ServerDescription::saveStreamable(BSONElement streamableField) {
+    if (_type == ServerType::kUnknown) {
+        _streamable = false;
+        return;
+    }
+
+    _streamable = streamableField && streamableField.Bool();
 }
 
 void ServerDescription::calculateRtt(const IsMasterRTT currentRtt,
@@ -172,13 +193,15 @@ void ServerDescription::parseTypeFromIsMaster(const BSONObj isMaster) {
         t = ServerType::kStandalone;
     } else if (kIsDbGrid == isMaster.getStringField("msg")) {
         t = ServerType::kMongos;
+    } else if (hasSetName && isMaster.getBoolField("hidden")) {
+        t = ServerType::kRSOther;
     } else if (hasSetName && isMaster.getBoolField("ismaster")) {
         t = ServerType::kRSPrimary;
     } else if (hasSetName && isMaster.getBoolField("secondary")) {
         t = ServerType::kRSSecondary;
     } else if (hasSetName && isMaster.getBoolField("arbiterOnly")) {
         t = ServerType::kRSArbiter;
-    } else if (hasSetName && isMaster.getBoolField("hidden")) {
+    } else if (hasSetName) {
         t = ServerType::kRSOther;
     } else if (isMaster.getBoolField("isreplicaset")) {
         t = ServerType::kRSGhost;
@@ -257,6 +280,18 @@ const boost::optional<int>& ServerDescription::getLogicalSessionTimeoutMinutes()
     return _logicalSessionTimeoutMinutes;
 }
 
+const boost::optional<TopologyVersion>& ServerDescription::getTopologyVersion() const {
+    return _topologyVersion;
+}
+
+int ServerDescription::getPoolResetCounter() {
+    return _poolResetCounter;
+}
+
+bool ServerDescription::isStreamable() const {
+    return _streamable;
+}
+
 bool ServerDescription::isEquivalent(const ServerDescription& other) const {
     auto otherValues = std::tie(other._type,
                                 other._minWireVersion,
@@ -270,7 +305,10 @@ bool ServerDescription::isEquivalent(const ServerDescription& other) const {
                                 other._setVersion,
                                 other._electionId,
                                 other._primary,
-                                other._logicalSessionTimeoutMinutes);
+                                other._logicalSessionTimeoutMinutes,
+                                other._topologyVersion,
+                                other._streamable,
+                                other._poolResetCounter);
     auto thisValues = std::tie(_type,
                                _minWireVersion,
                                _maxWireVersion,
@@ -283,7 +321,10 @@ bool ServerDescription::isEquivalent(const ServerDescription& other) const {
                                _setVersion,
                                _electionId,
                                _primary,
-                               _logicalSessionTimeoutMinutes);
+                               _logicalSessionTimeoutMinutes,
+                               _topologyVersion,
+                               _streamable,
+                               _poolResetCounter);
     return thisValues == otherValues;
 }
 
@@ -295,6 +336,11 @@ bool ServerDescription::isDataBearingServer() const {
 BSONObj ServerDescription::toBson() const {
     BSONObjBuilder bson;
     bson.append("address", _address);
+
+    if (_topologyVersion) {
+        bson.append("topologyVersion", _topologyVersion->toBSON());
+    }
+
     if (_rtt) {
         bson.append("roundTripTime", durationCount<Microseconds>(*_rtt));
     }
@@ -314,6 +360,10 @@ BSONObj ServerDescription::toBson() const {
 
     bson.append("minWireVersion", _minWireVersion);
     bson.append("maxWireVersion", _maxWireVersion);
+    bson.append("streamable", _streamable);
+    bson.append("poolResetCounter", _poolResetCounter);
+
+
     if (_me) {
         bson.append("me", *_me);
     }
@@ -335,6 +385,11 @@ BSONObj ServerDescription::toBson() const {
     if (_logicalSessionTimeoutMinutes) {
         bson.append("logicalSessionTimeoutMinutes", *_logicalSessionTimeoutMinutes);
     }
+
+    bson.append("hosts", _hosts);
+    bson.append("arbiters", _arbiters);
+    bson.append("passives", _passives);
+
     return bson.obj();
 }
 

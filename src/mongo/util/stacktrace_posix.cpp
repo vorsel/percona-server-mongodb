@@ -319,7 +319,7 @@ private:
     }
 
     bool done() const override {
-        return _end;
+        return (_i == kStackTraceFrameMax) || _end;
     }
 
     const StackTraceAddressMetadata& deref() const override {
@@ -327,6 +327,7 @@ private:
     }
 
     void advance() override {
+        ++_i;
         int r = unw_step(&_cursor);
         if (r <= 0) {
             if (r < 0) {
@@ -352,7 +353,7 @@ private:
         }
         _meta.reset(static_cast<uintptr_t>(pc));
         if (_flags & kSymbolic) {
-            // `unw_get_proc_name`, with its acccess to a cursor, and to libunwind's
+            // `unw_get_proc_name`, with its access to a cursor, and to libunwind's
             // dwarf reader, can generate better metadata than mergeDlInfo, so prefer it.
             unw_word_t offset;
             if (int r = unw_get_proc_name(&_cursor, _symbolBuf, sizeof(_symbolBuf), &offset);
@@ -373,6 +374,7 @@ private:
 
     bool _failed = false;
     bool _end = false;
+    size_t _i = 0;
 
     unw_context_t _context;
     unw_cursor_t _cursor;

@@ -24,7 +24,6 @@ MONGO_RUNNER_SUBDIR = "mongorunner"
 # We default to search for executables in the current working directory or in /data/multiversion
 # which are both part of the PATH.
 DEFAULT_DBTEST_EXECUTABLE = os.path.join(os.curdir, "dbtest")
-DEFAULT_MONGOEBENCH_EXECUTABLE = "mongoebench"
 DEFAULT_MONGO_EXECUTABLE = "mongo"
 DEFAULT_MONGOD_EXECUTABLE = "mongod"
 DEFAULT_MONGOS_EXECUTABLE = "mongos"
@@ -50,9 +49,6 @@ DEFAULTS = {
     "archive_limit_mb": 5000,
     "archive_limit_tests": 10,
     "base_port": 20000,
-    "benchrun_device": "Desktop",
-    "benchrun_embedded_root": "/data/local/tmp/benchrun_embedded",
-    "benchrun_report_root": "benchrun_embedded/results",
     "buildlogger_url": "https://logkeeper.mongodb.org",
     "continue_on_failure": False,
     "dbpath_prefix": None,
@@ -63,11 +59,12 @@ DEFAULTS = {
     "flow_control_tickets": None,
     "genny_executable": None,
     "include_with_any_tags": None,
+    "install_dir": None,
     "jobs": 1,
+    "log_format": None,
     "mongo_executable": None,
     "mongod_executable": None,
     "mongod_set_parameters": None,
-    "mongoebench_executable": None,
     "mongos_executable": None,
     "mongos_set_parameters": None,
     "no_journal": False,
@@ -95,6 +92,9 @@ DEFAULTS = {
     "tag_file": None,
     "transport_layer": None,
     "mixed_bin_versions": None,
+    "linear_chain": None,
+    "num_replset_nodes": None,
+    "num_shards": None,
 
     # Evergreen options.
     "build_id": None,
@@ -301,6 +301,9 @@ INCLUDE_WITH_ANY_TAGS = None
 # If set, then resmoke.py starts the specified number of Job instances to run tests.
 JOBS = None
 
+# Where to find the MONGO*_EXECUTABLE binaries
+INSTALL_DIR = None
+
 # The path to the mongo executable used by resmoke.py.
 MONGO_EXECUTABLE = None
 
@@ -310,8 +313,9 @@ MONGOD_EXECUTABLE = None
 # The --setParameter options passed to mongod.
 MONGOD_SET_PARAMETERS = None
 
-# The path to the mongoebench executable used by resmoke.py.
-MONGOEBENCH_EXECUTABLE = None
+# If set, the log format to use by all mongod's and mongo shells started by resmoke.py
+# Supported values are the same as what is supported in mongod/mongo shell: default, text, json
+LOG_FORMAT = None
 
 # The path to the mongos executable used by resmoke.py.
 MONGOS_EXECUTABLE = None
@@ -386,6 +390,15 @@ MAJORITY_READ_CONCERN = None
 # Specifies the binary versions of each node we should run for a replica set.
 MIXED_BIN_VERSIONS = None
 
+# Specifies the number of replica set members in a ReplicaSetFixture.
+NUM_REPLSET_NODES = None
+
+# Specifies the number of shards in a ShardedClusterFixture.
+NUM_SHARDS = None
+
+# If true, run ReplicaSetFixture with linear chaining.
+LINEAR_CHAIN = None
+
 # If set to "on", it enables flow control. If set to "off", it disables flow control. If left as
 # None, the server's default will determine whether flow control is enabled.
 FLOW_CONTROL = None
@@ -425,11 +438,6 @@ BENCHMARK_LIST_TESTS = None
 BENCHMARK_MIN_TIME = None
 BENCHMARK_REPETITIONS = None
 
-# Embedded Benchrun Test options.
-BENCHRUN_DEVICE = None
-BENCHRUN_EMBEDDED_ROOT = None
-BENCHRUN_REPORT_ROOT = None
-
 ##
 # Internally used configuration options that aren't exposed to the user
 ##
@@ -453,7 +461,7 @@ DEFAULT_LIBFUZZER_TEST_LIST = "build/libfuzzer_tests.txt"
 # therefore might not be available when creating a test membership map.
 EXTERNAL_SUITE_SELECTORS = (DEFAULT_BENCHMARK_TEST_LIST, DEFAULT_UNIT_TEST_LIST,
                             DEFAULT_INTEGRATION_TEST_LIST, DEFAULT_DBTEST_EXECUTABLE,
-                            DEFAULT_MONGOEBENCH_EXECUTABLE, DEFAULT_LIBFUZZER_TEST_LIST)
+                            DEFAULT_LIBFUZZER_TEST_LIST)
 
 # Where to look for logging and suite configuration files
 CONFIG_DIR = None

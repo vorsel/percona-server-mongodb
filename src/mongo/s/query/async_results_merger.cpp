@@ -64,7 +64,11 @@ BSONObj extractSortKey(BSONObj obj, bool compareWholeSortKey) {
     if (compareWholeSortKey) {
         return key.wrap();
     }
-    invariant(key.type() == BSONType::Object);
+    // TODO (SERVER-43361): We expect the sort key to be an array, but if the sort key originated
+    // from a 4.2 mongod, it will be a document, instead. Either way, 'isABSONObj()' will return
+    // true, and 'compareSortKeys()' will behave the same way. After branching for 4.5, we can
+    // tighten this invariant to specifically require a 'BSONArray' type.
+    invariant(key.isABSONObj());
     return key.Obj();
 }
 
@@ -75,8 +79,8 @@ BSONObj extractSortKey(BSONObj obj, bool compareWholeSortKey) {
 int compareSortKeys(BSONObj leftSortKey, BSONObj rightSortKey, BSONObj sortKeyPattern) {
     // This does not need to sort with a collator, since mongod has already mapped strings to their
     // ICU comparison keys as part of the $sortKey meta projection.
-    const bool considerFieldName = false;
-    return leftSortKey.woCompare(rightSortKey, sortKeyPattern, considerFieldName);
+    const BSONObj::ComparisonRulesSet rules = 0;  // 'considerFieldNames' flag is not set.
+    return leftSortKey.woCompare(rightSortKey, sortKeyPattern, rules);
 }
 
 }  // namespace
@@ -216,14 +220,16 @@ std::size_t AsyncResultsMerger::getNumRemotes() const {
 
 BSONObj AsyncResultsMerger::getHighWaterMark() {
     stdx::lock_guard<Latch> lk(_mutex);
+    // At this point, the high water mark may be the resume token of the last document we returned.
+    // If no further results are eligible for return, we advance to the minimum promised sort key.
     auto minPromisedSortKey = _getMinPromisedSortKey(lk);
     if (!minPromisedSortKey.isEmpty() && !_ready(lk)) {
-        // When 'minPromisedSortKey' contains the "high watermark" resume token, it's stored in
-        // sort-key format: {"": <high watermark>}. We copy the <high watermark> part of of the
-        // sort key, which looks like {_data: ..., _typeBits: ...}, and return that.
-        _highWaterMark = minPromisedSortKey.firstElement().Obj().getOwned();
+        _highWaterMark = minPromisedSortKey;
     }
-    return _highWaterMark;
+    // The high water mark is stored in sort-key format: {"": <high watermark>}. We only return
+    // the <high watermark> part of of the sort key, which looks like {_data: ..., _typeBits: ...}.
+    invariant(_highWaterMark.isEmpty() || _highWaterMark.firstElement().type() == BSONType::Object);
+    return _highWaterMark.isEmpty() ? BSONObj() : _highWaterMark.firstElement().Obj().getOwned();
 }
 
 BSONObj AsyncResultsMerger::_getMinPromisedSortKey(WithLock) {
@@ -677,7 +683,7 @@ bool AsyncResultsMerger::_addBatchToBuffer(WithLock lk,
                            str::stream() << "Missing field '" << AsyncResultsMerger::kSortKeyField
                                          << "' in document: " << obj);
                 return false;
-            } else if (!_params.getCompareWholeSortKey() && key.type() != BSONType::Object) {
+            } else if (!_params.getCompareWholeSortKey() && !key.isABSONObj()) {
                 remote.status =
                     Status(ErrorCodes::InternalError,
                            str::stream() << "Field '" << AsyncResultsMerger::kSortKeyField

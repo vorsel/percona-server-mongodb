@@ -50,6 +50,7 @@
 #include "mongo/db/query/explain_options.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/resource_yielder.h"
+#include "mongo/db/storage/backup_cursor_hooks.h"
 #include "mongo/db/storage/backup_cursor_state.h"
 #include "mongo/s/chunk_version.h"
 
@@ -125,13 +126,6 @@ public:
     virtual ~MongoProcessInterface(){};
 
     /**
-     * Sets the OperationContext of the DBDirectClient used by mongo process interface functions.
-     * This method must be called after updating the 'opCtx' member of the ExpressionContext
-     * associated with the document source.
-     */
-    virtual void setOperationContext(OperationContext* opCtx) = 0;
-
-    /**
      * Creates a new TransactionHistoryIterator object. Only applicable in processes which support
      * locally traversing the oplog.
      */
@@ -170,8 +164,18 @@ public:
                                             bool multi,
                                             boost::optional<OID> targetEpoch) = 0;
 
-    virtual CollectionIndexUsageMap getIndexStats(OperationContext* opCtx,
-                                                  const NamespaceString& ns) = 0;
+    /**
+     * Returns index usage statistics for each index on collection 'ns' along with additional
+     * information including the index specification and whether the index is currently being built.
+     *
+     * By passing true for 'addShardName', the caller can request that each document in the
+     * resulting vector includes a 'shard' field which denotes this node's shard name. It is illegal
+     * to set this option unless this node is a shardsvr.
+     */
+    virtual std::vector<Document> getIndexStats(OperationContext* opCtx,
+                                                const NamespaceString& ns,
+                                                StringData host,
+                                                bool addShardName) = 0;
 
     virtual std::list<BSONObj> getIndexSpecs(OperationContext* opCtx,
                                              const NamespaceString& ns,
@@ -238,9 +242,9 @@ public:
      * Runs createIndexes on the given database for the given index specs. If running on a shardsvr
      * this targets the primary shard of the database part of 'ns'.
      */
-    virtual void createIndexes(OperationContext* opCtx,
-                               const NamespaceString& ns,
-                               const std::vector<BSONObj>& indexSpecs) = 0;
+    virtual void createIndexesOnEmptyCollection(OperationContext* opCtx,
+                                                const NamespaceString& ns,
+                                                const std::vector<BSONObj>& indexSpecs) = 0;
 
     virtual void dropCollection(OperationContext* opCtx, const NamespaceString& collection) = 0;
 
@@ -314,6 +318,11 @@ public:
     virtual std::string getShardName(OperationContext* opCtx) const = 0;
 
     /**
+     * Returns the "host:port" string for this node.
+     */
+    virtual std::string getHostAndPort(OperationContext* opCtx) const = 0;
+
+    /**
      * Returns the fields of the document key (in order) for the collection corresponding to 'uuid',
      * including the shard key and _id. If _id is not in the shard key, it is added last. If the
      * collection is not sharded or no longer exists, returns only _id. Also returns a boolean that
@@ -362,9 +371,7 @@ public:
      * The following methods forward to the BackupCursorHooks decorating the ServiceContext.
      */
     virtual BackupCursorState openBackupCursor(OperationContext* opCtx,
-                                               bool incrementalBackup,
-                                               boost::optional<std::string> thisBackupName,
-                                               boost::optional<std::string> srcBackupName) = 0;
+                                               const StorageEngine::BackupOptions& options) = 0;
 
     virtual void closeBackupCursor(OperationContext* opCtx, const UUID& backupId) = 0;
 

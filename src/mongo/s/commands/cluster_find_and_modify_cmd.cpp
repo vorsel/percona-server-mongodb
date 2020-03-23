@@ -153,11 +153,12 @@ public:
         return true;
     }
 
-    ReadConcernSupportResult supportsReadConcern(const std::string& dbName,
-                                                 const BSONObj& cmdObj,
+    ReadConcernSupportResult supportsReadConcern(const BSONObj& cmdObj,
                                                  repl::ReadConcernLevel level) const final {
-        return {ReadConcernSupportResult::ReadConcern::kSupported,
-                ReadConcernSupportResult::DefaultReadConcern::kPermitted};
+        return {{level != repl::ReadConcernLevel::kLocalReadConcern &&
+                     level != repl::ReadConcernLevel::kSnapshotReadConcern,
+                 {ErrorCodes::InvalidOptions, "read concern not supported"}},
+                {{ErrorCodes::InvalidOptions, "default read concern not permitted"}}};
     }
 
     void addRequiredPrivileges(const std::string& dbname,
@@ -207,7 +208,7 @@ public:
                         chunkMgr->getVersion(shard->getId()),
                         boost::none,
                         nss,
-                        applyReadWriteConcern(opCtx, false, explainCmd),
+                        applyReadWriteConcern(opCtx, false, false, explainCmd),
                         &bob);
         } else {
             _runCommand(opCtx,
@@ -215,7 +216,7 @@ public:
                         ChunkVersion::UNSHARDED(),
                         routingInfo.db().databaseVersion(),
                         nss,
-                        applyReadWriteConcern(opCtx, false, explainCmd),
+                        applyReadWriteConcern(opCtx, false, false, explainCmd),
                         &bob);
         }
 
@@ -288,8 +289,7 @@ private:
         bool isRetryableWrite = opCtx->getTxnNumber() && !TransactionRouter::get(opCtx);
         const auto response = [&] {
             std::vector<AsyncRequestsSender::Request> requests;
-            BSONObj filteredCmdObj = appendAllowImplicitCreate(
-                CommandHelpers::filterCommandRequestForPassthrough(cmdObj), false);
+            BSONObj filteredCmdObj = CommandHelpers::filterCommandRequestForPassthrough(cmdObj);
             BSONObj cmdObjWithVersions(std::move(filteredCmdObj));
             if (dbVersion) {
                 cmdObjWithVersions = appendDbVersionIfPresent(cmdObjWithVersions, *dbVersion);

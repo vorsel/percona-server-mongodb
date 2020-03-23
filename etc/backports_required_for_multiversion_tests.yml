@@ -27,8 +27,30 @@ concurrency_replication_multiversion:
 concurrency_sharded_replication_multiversion:
 
 replica_sets_jscore_multiversion_passthrough:
+- ticket: SERVER-35921
+  test_file: jstests/core/min_max_key.js
+- ticket: SERVER-40805
+  test_file: jstests/core/profile_find.js
+- ticket: SERVER-44260
+  test_file: jstests/core/txns/new_transaction_waits_for_previous_txn_table_updates.js
 
 replica_sets_multiversion:
+- ticket: SERVER-42825
+  test_file: jstests/replsets/kill_reads_with_prepare_conflicts_during_step_down.js
+- ticket: SERVER-42825
+  test_file: jstests/replsets/kill_reads_with_prepare_conflicts_during_step_up.js
+- ticket: SERVER-42825
+  test_file: jstests/replsets/no_disconnect_on_stepdown.js
+- ticket: SERVER-42825
+  test_file: jstests/replsets/read_operations_during_rollback.js
+- ticket: SERVER-42825
+  test_file: jstests/replsets/read_operations_during_step_down.js
+- ticket: SERVER-42825
+  test_file: jstests/replsets/read_operations_during_step_up.js
+- ticket: SERVER-42825
+  test_file: jstests/replsets/step_down_on_secondary.js
+- ticket: SERVER-45010
+  test_file: jstests/replsets/rollback_dup_ids_clean_shutdown_during_rollback.js
 
 sharding_multiversion:
 - ticket: SERVER-38691
@@ -37,3 +59,5 @@ sharding_multiversion:
 sharding_jscore_multiversion_passthrough:
 
 sharded_collections_jscore_multiversion_passthrough:
+- ticket: SERVER-35921
+  test_file: jstests/core/min_max_key.js

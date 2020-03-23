@@ -44,7 +44,6 @@
 #include "mongo/db/fts/fts_spec.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index/wildcard_access_method.h"
-#include "mongo/db/index_legacy.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_cache.h"
 #include "mongo/db/query/planner_ixselect.h"
@@ -62,9 +61,9 @@ CoreIndexInfo indexInfoFromIndexCatalogEntry(const IndexCatalogEntry& ice) {
     auto accessMethod = ice.accessMethod();
     invariant(accessMethod);
 
-    projection_executor::ProjectionExecutor* projExec = nullptr;
+    const WildcardProjection* projExec = nullptr;
     if (desc->getIndexType() == IndexType::INDEX_WILDCARD)
-        projExec = static_cast<const WildcardAccessMethod*>(accessMethod)->getProjectionExecutor();
+        projExec = static_cast<const WildcardAccessMethod*>(accessMethod)->getWildcardProjection();
 
     return {desc->keyPattern(),
             desc->getIndexType(),
@@ -83,9 +82,6 @@ CollectionQueryInfo::CollectionQueryInfo()
       _indexUsageTracker(getGlobalServiceContext()->getPreciseClockSource()) {}
 
 const UpdateIndexData& CollectionQueryInfo::getIndexKeys(OperationContext* opCtx) const {
-    const Collection* coll = get.owner(this);
-    // This requires "some" lock, and MODE_IS is an expression for that, for now.
-    dassert(opCtx->lockState()->isCollectionLockedForMode(coll->ns(), MODE_IS));
     invariant(_keysComputed);
     return _indexedPaths;
 }
@@ -104,17 +100,18 @@ void CollectionQueryInfo::computeIndexKeys(OperationContext* opCtx) {
         if (descriptor->getAccessMethodName() == IndexNames::WILDCARD) {
             // Obtain the projection used by the $** index's key generator.
             const auto* pathProj =
-                static_cast<const WildcardAccessMethod*>(iam)->getProjectionExecutor();
+                static_cast<const WildcardAccessMethod*>(iam)->getWildcardProjection();
             // If the projection is an exclusion, then we must check the new document's keys on all
             // updates, since we do not exhaustively know the set of paths to be indexed.
-            if (pathProj->getType() ==
+            if (pathProj->exec()->getType() ==
                 TransformerInterface::TransformerType::kExclusionProjection) {
                 _indexedPaths.allPathsIndexed();
             } else {
                 // If a subtree was specified in the keyPattern, or if an inclusion projection is
                 // present, then we need only index the path(s) preserved by the projection.
-                for (const auto& path :
-                     projection_executor_utils::extractExhaustivePaths(pathProj)) {
+                const auto& exhaustivePaths = pathProj->exhaustivePaths();
+                invariant(exhaustivePaths);
+                for (const auto& path : *exhaustivePaths) {
                     _indexedPaths.addPath(path);
                 }
             }
@@ -173,7 +170,7 @@ void CollectionQueryInfo::notifyOfQuery(OperationContext* opCtx,
     for (auto it = indexesUsed.begin(); it != indexesUsed.end(); ++it) {
         // This index should still exist, since the PlanExecutor would have been killed if the
         // index was dropped (and we would not get here).
-        dassert(nullptr != coll->getIndexCatalog()->findIndexByName(opCtx, *it));
+        invariant(nullptr != coll->getIndexCatalog()->findIndexByName(opCtx, *it));
 
         _indexUsageTracker.recordIndexAccess(*it);
     }
@@ -214,8 +211,6 @@ void CollectionQueryInfo::updatePlanCacheIndexEntries(OperationContext* opCtx) {
 
 void CollectionQueryInfo::init(OperationContext* opCtx) {
     const Collection* coll = get.owner(this);
-    // Requires exclusive collection lock.
-    invariant(opCtx->lockState()->isCollectionLockedForMode(coll->ns(), MODE_X));
 
     const bool includeUnfinishedIndexes = false;
     std::unique_ptr<IndexCatalog::IndexIterator> ii =
@@ -229,21 +224,13 @@ void CollectionQueryInfo::init(OperationContext* opCtx) {
 }
 
 void CollectionQueryInfo::addedIndex(OperationContext* opCtx, const IndexDescriptor* desc) {
-    const Collection* coll = get.owner(this);
-    // Requires exclusive collection lock.
-    invariant(opCtx->lockState()->isCollectionLockedForMode(coll->ns(), MODE_X));
     invariant(desc);
 
     rebuildIndexData(opCtx);
-
     _indexUsageTracker.registerIndex(desc->indexName(), desc->keyPattern());
 }
 
 void CollectionQueryInfo::droppedIndex(OperationContext* opCtx, StringData indexName) {
-    const Collection* coll = get.owner(this);
-    // Requires exclusive collection lock.
-    invariant(opCtx->lockState()->isCollectionLockedForMode(coll->ns(), MODE_X));
-
     rebuildIndexData(opCtx);
     _indexUsageTracker.unregisterIndex(indexName);
 }

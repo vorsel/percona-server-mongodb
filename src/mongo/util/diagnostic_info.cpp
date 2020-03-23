@@ -42,6 +42,7 @@
 #include "mongo/db/client.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/util/clock_source.h"
+#include "mongo/util/hierarchical_acquisition.h"
 #include "mongo/util/interruptible.h"
 #include "mongo/util/log.h"
 
@@ -70,7 +71,7 @@ private:
         bool isContended = false;
         boost::optional<stdx::thread> thread{boost::none};
 
-        Mutex mutex = MONGO_MAKE_LATCH(kBlockedOpMutexName);
+        Mutex mutex = MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(3), kBlockedOpMutexName);
     };
     LatchState _latchState;
 
@@ -79,7 +80,8 @@ private:
         boost::optional<stdx::thread> thread{boost::none};
 
         stdx::condition_variable cv;
-        Mutex mutex = MONGO_MAKE_LATCH(kBlockedOpInterruptibleName);
+        Mutex mutex =
+            MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(0), kBlockedOpInterruptibleName);
         bool isDone = false;
     };
     InterruptibleState _interruptibleState;
@@ -172,26 +174,27 @@ struct DiagnosticInfoHandle {
 };
 const auto getDiagnosticInfoHandle = Client::declareDecoration<DiagnosticInfoHandle>();
 
-MONGO_INITIALIZER(LockListener)(InitializerContext* context) {
+MONGO_INITIALIZER_GENERAL(DiagnosticInfo, (/* NO PREREQS */), ("FinalizeLockListeners"))
+(InitializerContext* context) {
     class LockListener : public Mutex::LockListener {
-        void onContendedLock(const Mutex::Identity& id) override {
+        void onContendedLock(const Identity& id) override {
             if (auto client = Client::getCurrent()) {
                 auto& handle = getDiagnosticInfoHandle(client);
                 stdx::lock_guard<stdx::mutex> lk(handle.mutex);
-                handle.list.emplace_front(DiagnosticInfo::capture(id.name));
+                handle.list.emplace_front(DiagnosticInfo::capture(id.name()));
 
                 if (currentOpSpawnsThreadWaitingForLatch.shouldFail() &&
-                    (id.name == kBlockedOpMutexName)) {
+                    (id.name() == kBlockedOpMutexName)) {
                     gBlockedOp.setIsContended(true);
                 }
             }
         }
 
-        void onQuickLock(const Mutex::Identity&) override {
+        void onQuickLock(const Identity&) override {
             // Do nothing
         }
 
-        void onSlowLock(const Mutex::Identity& id) override {
+        void onSlowLock(const Identity& id) override {
             if (auto client = Client::getCurrent()) {
                 auto& handle = getDiagnosticInfoHandle(client);
                 stdx::lock_guard<stdx::mutex> lk(handle.mutex);
@@ -201,7 +204,7 @@ MONGO_INITIALIZER(LockListener)(InitializerContext* context) {
             }
         }
 
-        void onUnlock(const Mutex::Identity&) override {
+        void onUnlock(const Identity&) override {
             // Do nothing
         }
     };

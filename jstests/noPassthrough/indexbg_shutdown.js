@@ -4,18 +4,14 @@
  * shuts down cleanly, without an fassert.
  * Also confirms that killOp has no effect on the background index build on the secondary.
  *
- * TODO(SERVER-44467): Remove two_phase_index_builds_unsupported tag when startup recovery works
- * for two-phase index builds.
  * @tags: [
  *   requires_replication,
- *   two_phase_index_builds_unsupported,
  * ]
  */
 
 (function() {
 "use strict";
 
-load('jstests/libs/check_log.js');
 load('jstests/noPassthrough/libs/index_build.js');
 
 var dbname = 'bgIndexSec';
@@ -32,6 +28,7 @@ const replTest = new ReplSetTest({
                 priority: 0,
                 votes: 0,
             },
+            slowms: 30000,  // Don't log slow operations on secondary. See SERVER-44821.
         },
     ]
 });

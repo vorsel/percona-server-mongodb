@@ -95,12 +95,12 @@ struct InitialSyncerOptions {
 
     // InitialSyncer waits this long before retrying getApplierBatchCallback() if there are
     // currently no operations available to apply or if the 'rsSyncApplyStop' failpoint is active.
-    // This default value is based on the duration in OpQueueBatcher::run().
+    // This default value is based on the duration in OplogBatcher::run().
     Milliseconds getApplierBatchCallbackRetryWait{1000};
 
     // Replication settings
-    NamespaceString localOplogNS = NamespaceString("local.oplog.rs");
-    NamespaceString remoteOplogNS = NamespaceString("local.oplog.rs");
+    NamespaceString localOplogNS = NamespaceString::kRsOplogNamespace;
+    NamespaceString remoteOplogNS = NamespaceString::kRsOplogNamespace;
 
     GetMyLastOptimeFn getMyLastOptime;
     SetMyLastOptimeFn setMyLastOptime;
@@ -156,10 +156,35 @@ public:
         int durationMillis;
         Status status;
         HostAndPort syncSource;
+        int rollBackId;
+        int operationsRetried;
+        int totalTimeUnreachableMillis;
 
         std::string toString() const;
         BSONObj toBSON() const;
         void append(BSONObjBuilder* builder) const;
+    };
+
+    class OplogFetcherRestartDecisionInitialSyncer
+        : public AbstractOplogFetcher::OplogFetcherRestartDecision {
+
+    public:
+        OplogFetcherRestartDecisionInitialSyncer(InitialSyncSharedData* sharedData,
+                                                 std::size_t maxFetcherRestarts)
+            : _sharedData(sharedData), _defaultDecision(maxFetcherRestarts){};
+
+        bool shouldContinue(AbstractOplogFetcher* fetcher, Status status) final;
+
+        void fetchSuccessful(AbstractOplogFetcher* fetcher) final;
+
+    private:
+        InitialSyncSharedData* _sharedData;
+
+        // We delegate to the default strategy when it's a non-network error.
+        AbstractOplogFetcher::OplogFetcherRestartDecisionDefault _defaultDecision;
+
+        // The operation, if any, currently being retried because of a network error.
+        InitialSyncSharedData::RetryableOperation _retryingOperation;
     };
 
     struct Stats {
@@ -258,7 +283,18 @@ public:
      */
     Date_t getWallClockTime_forTest() const;
 
+    /**
+     * Sets the allowed outage duration in _sharedData.
+     * For testing only.
+     */
+    void setAllowedOutageDuration_forTest(Milliseconds allowedOutageDuration);
+
 private:
+    enum LastOplogEntryFetcherRetryStrategy {
+        kFetcherHandlesRetries,
+        kInitialSyncerHandlesRetries
+    };
+
     /**
      * Returns true if we are still processing initial sync tasks (_state is either Running or
      * Shutdown).
@@ -527,12 +563,17 @@ private:
     void _appendInitialSyncProgressMinimal_inlock(BSONObjBuilder* bob) const;
     BSONObj _getInitialSyncProgress_inlock() const;
 
-    StatusWith<MultiApplier::Operations> _getNextApplierBatch_inlock();
+    StatusWith<std::vector<OplogEntry>> _getNextApplierBatch_inlock();
 
     /**
      * Schedules a fetcher to get the last oplog entry from the sync source.
+     *
+     * If 'retryStrategy' is 'kFetcherHandlesRetries', the fetcher will retry up to the server
+     * parameter 'numInitialSyncOplogFindAttempts' times. Otherwise any failures must be handled by
+     * the caller.
      */
-    Status _scheduleLastOplogEntryFetcher_inlock(Fetcher::CallbackFn callback);
+    Status _scheduleLastOplogEntryFetcher_inlock(Fetcher::CallbackFn callback,
+                                                 LastOplogEntryFetcherRetryStrategy retryStrategy);
 
     /**
      * Checks the current oplog application progress (begin and end timestamps).
@@ -553,6 +594,19 @@ private:
      */
     void _scheduleRollbackCheckerCheckForRollback_inlock(
         const stdx::lock_guard<Latch>& lock, std::shared_ptr<OnCompletionGuard> onCompletionGuard);
+
+    /**
+     * Check if a status is one which means there's a retriable error and we should retry the
+     * current operation, and records whether an operation is currently being retried.  Note this
+     * can only handle one operation at a time (i.e. it should not be used in both parts of the
+     * "split" section of Initial Sync)
+     */
+    bool _shouldRetryError(WithLock lk, Status status);
+
+    /**
+     * Indicates we are no longer handling a retriable error.
+     */
+    void _clearRetriableError(WithLock lk);
 
     /**
      * Checks the given status (or embedded status inside the callback args) and current data
@@ -650,6 +704,9 @@ private:
     // Handle to currently scheduled _getNextApplierBatchCallback() task.
     executor::TaskExecutor::CallbackHandle _getNextApplierBatchHandle;  // (M)
 
+    // The operation, if any, currently being retried because of a network error.
+    InitialSyncSharedData::RetryableOperation _retryingOperation;  // (M)
+
     std::unique_ptr<InitialSyncState> _initialSyncState;   // (M)
     std::unique_ptr<OplogFetcher> _oplogFetcher;           // (S)
     std::unique_ptr<Fetcher> _beginFetchingOpTimeFetcher;  // (S)
@@ -679,6 +736,10 @@ private:
 
     // Data shared by cloners and fetcher.  Follow InitialSyncSharedData synchronization rules.
     std::unique_ptr<InitialSyncSharedData> _sharedData;  // (S)
+
+    // Amount of time an outage is allowed to continue before the initial sync attempt is marked
+    // as failed.
+    Milliseconds _allowedOutageDuration;  // (M)
 };
 
 }  // namespace repl

@@ -67,7 +67,6 @@
 #include "mongo/rpc/metadata/tracking_metadata.h"
 #include "mongo/rpc/op_msg.h"
 #include "mongo/rpc/op_msg_rpc_impls.h"
-#include "mongo/s/cannot_implicitly_create_collection_info.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/parallel.h"
 #include "mongo/s/client/shard_connection.h"
@@ -284,7 +283,7 @@ void execCommandClient(OperationContext* opCtx,
             },
             [&](const BSONObj& data) {
                 return CommandHelpers::shouldActivateFailCommandFailPoint(
-                           data, request.getCommandName(), opCtx->getClient(), invocation->ns()) &&
+                           data, invocation, opCtx->getClient()) &&
                     data.hasField("writeConcernError");
             });
     }
@@ -396,7 +395,10 @@ void runCommand(OperationContext* opCtx,
 
     boost::optional<RouterOperationContextSession> routerSession;
     try {
-        CommandHelpers::evaluateFailCommandFailPoint(opCtx, commandName, invocation->ns());
+        rpc::readRequestMetadata(opCtx, request.body, command->requiresAuth());
+
+        CommandHelpers::evaluateFailCommandFailPoint(opCtx, invocation.get());
+        bool startTransaction = false;
         if (osi.getAutocommit()) {
             routerSession.emplace(opCtx);
 
@@ -419,6 +421,7 @@ void runCommand(OperationContext* opCtx,
                 return TransactionRouter::TransactionActions::kContinue;
             })();
 
+            startTransaction = (transactionAction == TransactionRouter::TransactionActions::kStart);
             txnRouter.beginOrContinueTxn(opCtx, *txnNumber, transactionAction);
         }
 
@@ -435,12 +438,11 @@ void runCommand(OperationContext* opCtx,
         }
 
         if (supportsWriteConcern && wc.usedDefault &&
-            (!TransactionRouter::get(opCtx) ||
-             commandSupportsWriteConcernInTransaction(commandName))) {
+            (!TransactionRouter::get(opCtx) || isTransactionCommand(commandName))) {
             // This command supports WC, but wasn't given one - so apply the default, if there is
             // one.
             if (const auto wcDefault = ReadWriteConcernDefaults::get(opCtx->getServiceContext())
-                                           .getDefaultWriteConcern()) {
+                                           .getDefaultWriteConcern(opCtx)) {
                 wc = *wcDefault;
                 LOG(2) << "Applying default writeConcern on " << request.getCommandName() << " of "
                        << wcDefault->toBSON();
@@ -454,6 +456,76 @@ void runCommand(OperationContext* opCtx,
         if (supportsWriteConcern) {
             opCtx->setWriteConcern(wc);
         }
+
+        auto readConcernSupport = invocation->supportsReadConcern(readConcernArgs.getLevel());
+        if (readConcernSupport.defaultReadConcernPermit.isOK() &&
+            (startTransaction || !TransactionRouter::get(opCtx))) {
+            if (readConcernArgs.isEmpty()) {
+                const auto rcDefault = ReadWriteConcernDefaults::get(opCtx->getServiceContext())
+                                           .getDefaultReadConcern(opCtx);
+                if (rcDefault) {
+                    {
+                        // We must obtain the client lock to set ReadConcernArgs, because it's an
+                        // in-place reference to the object on the operation context, which may be
+                        // concurrently used elsewhere (eg. read by currentOp).
+                        stdx::lock_guard<Client> lk(*opCtx->getClient());
+                        readConcernArgs = std::move(*rcDefault);
+                    }
+                    LOG(2) << "Applying default readConcern on "
+                           << invocation->definition()->getName() << " of " << *rcDefault;
+                    // Update the readConcernSupport, since the default RC was applied.
+                    readConcernSupport =
+                        invocation->supportsReadConcern(readConcernArgs.getLevel());
+                }
+            }
+        }
+
+        // If we are starting a transaction, we only need to check whether the read concern is
+        // appropriate for running a transaction. There is no need to check whether the specific
+        // command supports the read concern, because all commands that are allowed to run in a
+        // transaction must support all applicable read concerns.
+        if (startTransaction) {
+            if (!isReadConcernLevelAllowedInTransaction(readConcernArgs.getLevel())) {
+                auto responseBuilder = replyBuilder->getBodyBuilder();
+                CommandHelpers::appendCommandStatusNoThrow(
+                    responseBuilder,
+                    {ErrorCodes::InvalidOptions,
+                     "The readConcern level must be either 'local' (default), 'majority' or "
+                     "'snapshot' in order to run in a transaction"});
+                return;
+            }
+            if (readConcernArgs.getArgsOpTime()) {
+                auto responseBuilder = replyBuilder->getBodyBuilder();
+                CommandHelpers::appendCommandStatusNoThrow(
+                    responseBuilder,
+                    {ErrorCodes::InvalidOptions,
+                     str::stream()
+                         << "The readConcern cannot specify '"
+                         << repl::ReadConcernArgs::kAfterOpTimeFieldName << "' in a transaction"});
+                return;
+            }
+        }
+
+        // Otherwise, if there is a read concern present - either user-specified or the default -
+        // then check whether the command supports it. If there is no explicit read concern level,
+        // then it is implicitly "local". There is no need to check whether this is supported,
+        // because all commands either support "local" or upconvert the absent readConcern to a
+        // stronger level that they do support; e.g. $changeStream upconverts to RC "majority".
+        if (!startTransaction && readConcernArgs.hasLevel()) {
+            if (!readConcernSupport.readConcernSupport.isOK()) {
+                auto responseBuilder = replyBuilder->getBodyBuilder();
+                CommandHelpers::appendCommandStatusNoThrow(
+                    responseBuilder,
+                    readConcernSupport.readConcernSupport.withContext(
+                        str::stream() << "Command " << invocation->definition()->getName()
+                                      << " does not support " << readConcernArgs.toString()));
+                return;
+            }
+        }
+
+        // Remember whether or not this operation is starting a transaction, in case something later
+        // in the execution needs to adjust its behavior based on this.
+        opCtx->setIsStartingMultiDocumentTransaction(startTransaction);
 
         for (int tries = 0;; ++tries) {
             // Try kMaxNumStaleVersionRetries times. On the last try, exceptions are rethrown.
@@ -481,20 +553,8 @@ void runCommand(OperationContext* opCtx,
                 const auto staleNs = [&] {
                     if (auto staleInfo = ex.extraInfo<StaleConfigInfo>()) {
                         return staleInfo->getNss();
-                    } else if (auto implicitCreateInfo =
-                                   ex.extraInfo<CannotImplicitlyCreateCollectionInfo>()) {
-                        // Requests that attempt to implicitly create a collection in a transaction
-                        // should always fail with OperationNotSupportedInTransaction - this
-                        // assertion is only meant to safeguard that assumption.
-                        uassert(50983,
-                                str::stream() << "Cannot handle exception in a transaction: "
-                                              << ex.toStatus(),
-                                !TransactionRouter::get(opCtx));
-
-                        return implicitCreateInfo->getNss();
-                    } else {
-                        throw;
                     }
+                    throw;
                 }();
 
                 // Send setShardVersion on this thread's versioned connections to shards (to support
@@ -509,7 +569,24 @@ void runCommand(OperationContext* opCtx,
                     ShardConnection::checkMyConnectionVersions(opCtx, staleNs.ns());
                 }
 
-                Grid::get(opCtx)->catalogCache()->invalidateShardedCollection(staleNs);
+                if (auto staleInfo = ex.extraInfo<StaleConfigInfo>()) {
+                    Grid::get(opCtx)
+                        ->catalogCache()
+                        ->invalidateShardOrEntireCollectionEntryForShardedCollection(
+                            opCtx,
+                            staleNs,
+                            staleInfo->getVersionWanted(),
+                            staleInfo->getVersionReceived(),
+                            staleInfo->getShardId());
+                } else {
+                    // If we don't have the stale config info and therefore don't know the shard's
+                    // id, we have to force all further targetting requests for the namespace to
+                    // block on a refresh.
+                    Grid::get(opCtx)->catalogCache()->onEpochChange(staleNs);
+                }
+
+                Grid::get(opCtx)->catalogCache()->setOperationShouldBlockBehindCatalogCacheRefresh(
+                    opCtx, true);
 
                 // Retry logic specific to transactions. Throws and aborts the transaction if the
                 // error cannot be retried on.
@@ -772,6 +849,8 @@ DbResponse Strategy::clientCommand(OperationContext* opCtx, const Message& m) {
             }
         }();
 
+        opCtx->setExhaust(OpMsg::isFlagSet(m, OpMsg::kExhaustSupported));
+
         // Execute.
         std::string db = request.getDatabase().toString();
         try {
@@ -804,10 +883,9 @@ DbResponse Strategy::clientCommand(OperationContext* opCtx, const Message& m) {
     DbResponse dbResponse;
     if (OpMsg::isFlagSet(m, OpMsg::kExhaustSupported)) {
         auto responseObj = reply->getBodyBuilder().asTempObj();
-        auto cursorObj = responseObj.getObjectField("cursor");
-        if (responseObj.getField("ok").trueValue() && !cursorObj.isEmpty()) {
-            dbResponse.exhaustNS = cursorObj.getField("ns").String();
-            dbResponse.exhaustCursorId = cursorObj.getField("id").numberLong();
+        if (responseObj.getField("ok").trueValue()) {
+            dbResponse.shouldRunAgainForExhaust = reply->shouldRunAgainForExhaust();
+            dbResponse.nextInvocation = reply->getNextInvocation();
         }
     }
     dbResponse.response = reply->done();
@@ -1005,12 +1083,8 @@ void Strategy::explainFind(OperationContext* opCtx,
             const auto staleNs = [&] {
                 if (auto staleInfo = ex.extraInfo<StaleConfigInfo>()) {
                     return staleInfo->getNss();
-                } else if (auto implicitCreateInfo =
-                               ex.extraInfo<CannotImplicitlyCreateCollectionInfo>()) {
-                    return implicitCreateInfo->getNss();
-                } else {
-                    throw;
                 }
+                throw;
             }();
 
             // Send setShardVersion on this thread's versioned connections to shards (to support
@@ -1025,7 +1099,21 @@ void Strategy::explainFind(OperationContext* opCtx,
                 ShardConnection::checkMyConnectionVersions(opCtx, staleNs.ns());
             }
 
-            Grid::get(opCtx)->catalogCache()->invalidateShardedCollection(staleNs);
+            if (auto staleInfo = ex.extraInfo<StaleConfigInfo>()) {
+                Grid::get(opCtx)
+                    ->catalogCache()
+                    ->invalidateShardOrEntireCollectionEntryForShardedCollection(
+                        opCtx,
+                        staleNs,
+                        staleInfo->getVersionWanted(),
+                        staleInfo->getVersionReceived(),
+                        staleInfo->getShardId());
+            } else {
+                // If we don't have the stale config info and therefore don't know the shard's id,
+                // we have to force all further targetting requests for the namespace to block on
+                // a refresh.
+                Grid::get(opCtx)->catalogCache()->onEpochChange(staleNs);
+            }
 
             if (canRetry) {
                 continue;

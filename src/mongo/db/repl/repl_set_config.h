@@ -56,6 +56,7 @@ public:
 
     static const std::string kConfigServerFieldName;
     static const std::string kVersionFieldName;
+    static const std::string kTermFieldName;
     static const std::string kMajorityWriteConcernModeName;
 
     // If this field is present, a repair operation potentially modified replicated data. This
@@ -78,12 +79,17 @@ public:
     /**
      * Initializes this ReplSetConfig from the contents of "cfg".
      * Sets _replicaSetId to "defaultReplicaSetId" if a replica set ID is not specified in "cfg".
+     * If forceTerm is not boost::none, sets _term to the given term. Otherwise, parses term from
+     * config BSON.
      */
-    Status initialize(const BSONObj& cfg, OID defaultReplicaSetId = OID());
+    Status initialize(const BSONObj& cfg,
+                      boost::optional<long long> forceTerm = boost::none,
+                      OID defaultReplicaSetId = OID());
 
     /**
      * Same as the generic initialize() above except will default "configsvr" setting to the value
      * of serverGlobalParams.configsvr.
+     * Sets _term to kInitialTerm.
      */
     Status initializeForInitiate(const BSONObj& cfg);
 
@@ -118,6 +124,16 @@ public:
      */
     long long getConfigVersion() const {
         return _version;
+    }
+
+    /**
+     * Gets the term of this configuration.
+     *
+     * The configuration term is the term of the primary that originally created this configuration.
+     * Configurations in a replica set are totally ordered by their term and configuration version.
+     */
+    long long getConfigTerm() const {
+        return _term;
     }
 
     /**
@@ -163,6 +179,19 @@ public:
     const std::vector<MemberConfig>& members() const {
         return _members;
     }
+
+    /**
+     * Returns all voting members in this ReplSetConfig.
+     */
+    std::vector<MemberConfig> votingMembers() const {
+        std::vector<MemberConfig> votingMembers;
+        for (const MemberConfig& m : _members) {
+            if (m.getNumVotes() > 0) {
+                votingMembers.push_back(m);
+            }
+        }
+        return votingMembers;
+    };
 
     /**
      * Access a MemberConfig element by index.
@@ -395,11 +424,17 @@ private:
     /**
      * Sets replica set ID to 'defaultReplicaSetId' if forInitiate is false and 'cfg' does not
      * contain an ID.
+     * Sets _term to kInitialTerm for initiate.
+     * Sets _term to forceTerm if it is not boost::none. Otherwise, parses term from 'cfg'.
      */
-    Status _initialize(const BSONObj& cfg, bool forInitiate, OID defaultReplicaSetId);
+    Status _initialize(const BSONObj& cfg,
+                       bool forInitiate,
+                       boost::optional<long long> forceTerm,
+                       OID defaultReplicaSetId);
 
     bool _isInitialized = false;
     long long _version = 1;
+    long long _term = OpTime::kUninitializedTerm;
     std::string _replSetName;
     std::vector<MemberConfig> _members;
     WriteConcernOptions _defaultWriteConcern;

@@ -3756,6 +3756,20 @@ var authCommandsLib = {
           ]
         },
         {
+            testname: "getDefaultRWConcern",
+            command: {getDefaultRWConcern: 1},
+            testcases: [
+                {
+                    runOnDb: adminDbName,
+                    roles: Object.merge(roles_monitoring, roles_clusterManager),
+                    privileges: [{resource: {cluster: true}, actions: ["getDefaultRWConcern"]}],
+                    expectFail: true,  // Will fail on standalone servers.
+                },
+                {runOnDb: firstDbName, roles: {}},
+                {runOnDb: secondDbName, roles: {}}
+            ]
+        },
+        {
           testname: "getDiagnosticData",
           command: {getDiagnosticData: 1},
           testcases: [
@@ -4585,31 +4599,6 @@ var authCommandsLib = {
           ]
         },
         {
-          testname: "planCacheRead",
-          command: {planCacheListQueryShapes: "x"},
-          skipSharded: true,
-          setup: function(db) {
-              db.x.save({});
-          },
-          teardown: function(db) {
-              db.x.drop();
-          },
-          testcases: [
-              {
-                runOnDb: firstDbName,
-                roles: roles_readDbAdmin,
-                privileges:
-                    [{resource: {db: firstDbName, collection: "x"}, actions: ["planCacheRead"]}],
-              },
-              {
-                runOnDb: secondDbName,
-                roles: roles_readDbAdminAny,
-                privileges:
-                    [{resource: {db: secondDbName, collection: "x"}, actions: ["planCacheRead"]}],
-              },
-          ]
-        },
-        {
           testname: "planCacheWrite",
           command: {planCacheClear: "x"},
           skipSharded: true,
@@ -5117,6 +5106,24 @@ var authCommandsLib = {
                 privileges: [{resource: {cluster: true}, actions: ["serverStatus"]}]
               }
           ]
+        },
+        {
+            testname: "setDefaultRWConcern",
+            command: {
+                setDefaultRWConcern: 1,
+                defaultReadConcern: {level: "local"},
+                defaultWriteConcern: {w: 1},
+            },
+            testcases: [
+                {
+                    runOnDb: adminDbName,
+                    roles: roles_clusterManager,
+                    privileges: [{resource: {cluster: true}, actions: ["setDefaultRWConcern"]}],
+                    expectFail: true,  // Will fail on standalone servers.
+                },
+                {runOnDb: firstDbName, roles: {}},
+                {runOnDb: secondDbName, roles: {}}
+            ]
         },
         {
           testname: "setFeatureCompatibilityVersion",
@@ -5664,6 +5671,22 @@ var authCommandsLib = {
               },
           ]
         },
+        {
+          testname: "balancerCollectionStatus",
+          command: {shardCollection: "test.x"},
+          skipUnlessSharded: true,
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: Object.extend({enableSharding: 1}, roles_clusterManager),
+                privileges:
+                    [{resource: {db: "test", collection: "x"}, actions: ["enableSharding"]}],
+                expectFail: true
+              },
+              {runOnDb: firstDbName, roles: {}},
+              {runOnDb: secondDbName, roles: {}}
+          ]
+		},
     ],
 
     /************* SHARED TEST LOGIC ****************/

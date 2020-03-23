@@ -2,19 +2,15 @@
  * Characterizes the actions (rebuilds or drops the index) taken upon unfinished indexes when
  * restarting mongod from (standalone -> standalone) and (replica set member -> standalone).
  *
- * TODO(SERVER-44468): Remove two_phase_index_builds_unsupported tag when standalone startup works
- * with two-phase builds
  * @tags: [
  *   requires_majority_read_concern,
  *   requires_persistence,
  *   requires_replication,
- *   two_phase_index_builds_unsupported,
  * ]
  */
 (function() {
 'use strict';
 
-load("jstests/libs/check_log.js");
 load('jstests/noPassthrough/libs/index_build.js');
 load("jstests/replsets/rslib.js");
 
@@ -99,7 +95,7 @@ function startIndexBuildOnSecondaryAndLeaveUnfinished(primaryDB, writeConcern, s
         checkLog.containsWithCount(
             secondaryDB,
             "Index build interrupted due to \'leaveIndexBuildUnfinishedForShutdown\' " +
-                "failpoint. Mimicing shutdown error code.",
+                "failpoint. Mimicking shutdown error code.",
             expectedFailPointMessageCount);
 
         // Wait until the secondary has a recovery timestamp beyond the index oplog entry. On
@@ -177,6 +173,14 @@ function standaloneToStandaloneTest() {
     let mongod = startStandalone();
     let collDB = mongod.getDB(dbName);
 
+    // TODO(SERVER-44468): Re-enable when standalone startup works with two-phase builds.
+    if (IndexBuildTest.supportsTwoPhaseIndexBuild(mongod)) {
+        jsTestLog(
+            '[standaloneToStandaloneTest] Two phase index builds not supported, skipping test.');
+        shutdownStandalone(mongod);
+        return;
+    }
+
     addTestDocuments(collDB);
 
     jsTest.log("Starting an index build on a standalone and leaving it unfinished.");
@@ -206,6 +210,14 @@ function secondaryToStandaloneTest() {
     let primary = replSet.getPrimary();
     let secondary = replSet.getSecondary();
 
+    // TODO(SERVER-44468): Re-enable when standalone startup works with two-phase builds.
+    if (IndexBuildTest.supportsTwoPhaseIndexBuild(primary)) {
+        jsTestLog(
+            '[secondaryToStandaloneTest] Two phase index builds not supported, skipping test.');
+        replSet.stopSet();
+        return;
+    }
+
     let primaryDB = primary.getDB(dbName);
     let secondaryDB = secondary.getDB(dbName);
 
@@ -216,7 +228,11 @@ function secondaryToStandaloneTest() {
 
     startIndexBuildOnSecondaryAndLeaveUnfinished(primaryDB, /*writeConcern=*/2, secondaryDB);
 
+    // Don't validate data because the index build state will be inconsistent between primary and
+    // secondary.
+    TestData.skipCheckDBHashes = true;
     replSet.stopSet(/*signal=*/null, /*forRestart=*/true);
+    TestData.skipCheckDBHashes = false;
 
     let mongod = restartStandalone(secondary);
 

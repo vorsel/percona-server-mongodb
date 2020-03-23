@@ -110,11 +110,12 @@ bool checkAuthorizationImplPreParse(OperationContext* opCtx,
 }
 
 // The command names that are allowed in a multi-document transaction.
+const StringMap<int> txnCmdWhitelistFCV44 = {
+    {"create", 1}, {"createIndexes", 1}, {"_configsvrCreateCollection", 1}};
 const StringMap<int> txnCmdWhitelist = {{"abortTransaction", 1},
                                         {"aggregate", 1},
                                         {"commitTransaction", 1},
                                         {"coordinateCommitTransaction", 1},
-                                        {"createIndexes", 1},
                                         {"delete", 1},
                                         {"distinct", 1},
                                         {"find", 1},
@@ -346,7 +347,8 @@ BSONObj CommandHelpers::appendPassthroughFields(const BSONObj& cmdObjWithPassthr
     return b.obj();
 }
 
-BSONObj CommandHelpers::appendMajorityWriteConcern(const BSONObj& cmdObj) {
+BSONObj CommandHelpers::appendMajorityWriteConcern(const BSONObj& cmdObj,
+                                                   WriteConcernOptions defaultWC) {
     WriteConcernOptions newWC = kMajorityWriteConcern;
 
     if (cmdObj.hasField(kWriteConcernField)) {
@@ -363,6 +365,13 @@ BSONObj CommandHelpers::appendMajorityWriteConcern(const BSONObj& cmdObj) {
             newWC = WriteConcernOptions(WriteConcernOptions::kMajority,
                                         WriteConcernOptions::SyncMode::UNSET,
                                         wc["wtimeout"].Number());
+        }
+    } else if (!defaultWC.usedDefault) {
+        auto minimumAcceptableWTimeout = newWC.wTimeout;
+        newWC = defaultWC;
+        newWC.wMode = "majority";
+        if (defaultWC.wTimeout < minimumAcceptableWTimeout) {
+            newWC.wTimeout = minimumAcceptableWTimeout;
         }
     }
 
@@ -443,9 +452,21 @@ void CommandHelpers::canUseTransactions(const NamespaceString& nss,
             "http://dochub.mongodb.org/core/transaction-count for a recommended alternative.",
             cmdName != "count"_sd);
 
+    auto inTxnWhitelist = txnCmdWhitelist.find(cmdName) != txnCmdWhitelist.cend();
+    auto inTxnWhitelistFCV44 = txnCmdWhitelistFCV44.find(cmdName) != txnCmdWhitelistFCV44.cend();
+    auto isFullyUpgradedTo44 =
+        (serverGlobalParams.featureCompatibility.getVersion() ==
+         ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44);
+
+    uassert(ErrorCodes::OperationNotSupportedInTransaction,
+            str::stream() << "Cannot run '" << cmdName
+                          << "' in a multi-document transaction unless the "
+                             "featureCompatibilityVersion is equal to 4.4.",
+            isFullyUpgradedTo44 || !inTxnWhitelistFCV44);
+
     uassert(ErrorCodes::OperationNotSupportedInTransaction,
             str::stream() << "Cannot run '" << cmdName << "' in a multi-document transaction.",
-            txnCmdWhitelist.find(cmdName) != txnCmdWhitelist.cend());
+            inTxnWhitelist || inTxnWhitelistFCV44);
 
     const auto dbName = nss.db();
 
@@ -479,10 +500,11 @@ const OperationContext::Decoration<boost::optional<BSONArray>> errorLabelsOverri
     OperationContext::declareDecoration<boost::optional<BSONArray>>();
 
 bool CommandHelpers::shouldActivateFailCommandFailPoint(const BSONObj& data,
-                                                        StringData cmdName,
-                                                        Client* client,
-                                                        const NamespaceString& nss) {
-    if (cmdName == "configureFailPoint"_sd)  // Banned even if in failCommands.
+                                                        const CommandInvocation* invocation,
+                                                        Client* client) {
+    const Command* cmd = invocation->definition();
+    const NamespaceString& nss = invocation->ns();
+    if (cmd->getName() == "configureFailPoint"_sd)  // Banned even if in failCommands.
         return false;
 
     if (data.hasField("threadName") &&
@@ -507,7 +529,7 @@ bool CommandHelpers::shouldActivateFailCommandFailPoint(const BSONObj& data,
     }
 
     for (auto&& failCommand : data.getObjectField("failCommands")) {
-        if (failCommand.type() == String && failCommand.valueStringData() == cmdName) {
+        if (failCommand.type() == String && cmd->hasAlias(failCommand.valueStringData())) {
             return true;
         }
     }
@@ -516,11 +538,11 @@ bool CommandHelpers::shouldActivateFailCommandFailPoint(const BSONObj& data,
 }
 
 void CommandHelpers::evaluateFailCommandFailPoint(OperationContext* opCtx,
-                                                  StringData commandName,
-                                                  const NamespaceString& nss) {
+                                                  const CommandInvocation* invocation) {
     bool closeConnection;
     bool hasErrorCode;
     long long errorCode;
+    const Command* cmd = invocation->definition();
     failCommand.executeIf(
         [&](const BSONObj& data) {
             if (data.hasField(kErrorLabelsFieldName) &&
@@ -534,13 +556,13 @@ void CommandHelpers::evaluateFailCommandFailPoint(OperationContext* opCtx,
 
             if (closeConnection) {
                 opCtx->getClient()->session()->end();
-                log() << "Failing command '" << commandName
+                log() << "Failing command '" << cmd->getName()
                       << "' via 'failCommand' failpoint. Action: closing connection.";
                 uasserted(50985, "Failing command due to 'failCommand' failpoint");
             }
 
             if (hasErrorCode) {
-                log() << "Failing command '" << commandName
+                log() << "Failing command '" << cmd->getName()
                       << "' via 'failCommand' failpoint. Action: returning error code " << errorCode
                       << ".";
                 uasserted(ErrorCodes::Error(errorCode),
@@ -553,7 +575,7 @@ void CommandHelpers::evaluateFailCommandFailPoint(OperationContext* opCtx,
                 closeConnection;
             hasErrorCode = data.hasField("errorCode") &&
                 bsonExtractIntegerField(data, "errorCode", &errorCode).isOK();
-            return shouldActivateFailCommandFailPoint(data, commandName, opCtx->getClient(), nss) &&
+            return shouldActivateFailCommandFailPoint(data, invocation, opCtx->getClient()) &&
                 (closeConnection || hasErrorCode);
         });
 }
@@ -614,9 +636,11 @@ void CommandInvocation::checkAuthorization(OperationContext* opCtx,
 //////////////////////////////////////////////////////////////
 // Command
 
-class BasicCommand::Invocation final : public CommandInvocation {
+class BasicCommandWithReplyBuilderInterface::Invocation final : public CommandInvocation {
 public:
-    Invocation(OperationContext*, const OpMsgRequest& request, BasicCommand* command)
+    Invocation(OperationContext*,
+               const OpMsgRequest& request,
+               BasicCommandWithReplyBuilderInterface* command)
         : CommandInvocation(command),
           _command(command),
           _request(&request),
@@ -625,10 +649,11 @@ public:
 private:
     void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* result) override {
         opCtx->lockState()->setDebugInfo(redact(_request->body));
-        BSONObjBuilder bob = result->getBodyBuilder();
-        bool ok = _command->run(opCtx, _dbName, _request->body, bob);
-        if (!ok)
+        bool ok = _command->runWithReplyBuilder(opCtx, _dbName, _request->body, result);
+        if (!ok) {
+            BSONObjBuilder bob = result->getBodyBuilder();
             CommandHelpers::appendSimpleCommandStatus(bob, ok);
+        }
     }
 
     void explain(OperationContext* opCtx,
@@ -646,7 +671,7 @@ private:
     }
 
     ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level) const override {
-        return _command->supportsReadConcern(_dbName, cmdObj(), level);
+        return _command->supportsReadConcern(cmdObj(), level);
     }
 
     bool allowsAfterClusterTime() const override {
@@ -666,7 +691,7 @@ private:
         return _request->body;
     }
 
-    BasicCommand* const _command;
+    BasicCommandWithReplyBuilderInterface* const _command;
     const OpMsgRequest* const _request;
     const std::string _dbName;
 };
@@ -688,35 +713,40 @@ void Command::snipForLogging(mutablebson::Document* cmdObj) const {
 }
 
 
-std::unique_ptr<CommandInvocation> BasicCommand::parse(OperationContext* opCtx,
-                                                       const OpMsgRequest& request) {
+std::unique_ptr<CommandInvocation> BasicCommandWithReplyBuilderInterface::parse(
+    OperationContext* opCtx, const OpMsgRequest& request) {
     CommandHelpers::uassertNoDocumentSequences(getName(), request);
     return std::make_unique<Invocation>(opCtx, request, this);
 }
 
-Command::Command(StringData name, StringData oldName)
+Command::Command(StringData name, std::vector<StringData> aliases)
     : _name(name.toString()),
+      _aliases(std::move(aliases)),
       _commandsExecutedMetric("commands." + _name + ".total", &_commandsExecuted),
       _commandsFailedMetric("commands." + _name + ".failed", &_commandsFailed) {
-    globalCommandRegistry()->registerCommand(this, name, oldName);
+    globalCommandRegistry()->registerCommand(this, _name, _aliases);
 }
 
-Status BasicCommand::explain(OperationContext* opCtx,
-                             const OpMsgRequest& request,
-                             ExplainOptions::Verbosity verbosity,
-                             rpc::ReplyBuilderInterface* result) const {
+bool Command::hasAlias(const StringData& alias) const {
+    return globalCommandRegistry()->findCommand(alias) == this;
+}
+
+Status BasicCommandWithReplyBuilderInterface::explain(OperationContext* opCtx,
+                                                      const OpMsgRequest& request,
+                                                      ExplainOptions::Verbosity verbosity,
+                                                      rpc::ReplyBuilderInterface* result) const {
     return {ErrorCodes::IllegalOperation, str::stream() << "Cannot explain cmd: " << getName()};
 }
 
-Status BasicCommand::checkAuthForOperation(OperationContext* opCtx,
-                                           const std::string& dbname,
-                                           const BSONObj& cmdObj) const {
+Status BasicCommandWithReplyBuilderInterface::checkAuthForOperation(OperationContext* opCtx,
+                                                                    const std::string& dbname,
+                                                                    const BSONObj& cmdObj) const {
     return checkAuthForCommand(opCtx->getClient(), dbname, cmdObj);
 }
 
-Status BasicCommand::checkAuthForCommand(Client* client,
-                                         const std::string& dbname,
-                                         const BSONObj& cmdObj) const {
+Status BasicCommandWithReplyBuilderInterface::checkAuthForCommand(Client* client,
+                                                                  const std::string& dbname,
+                                                                  const BSONObj& cmdObj) const {
     std::vector<Privilege> privileges;
     this->addRequiredPrivileges(dbname, cmdObj, &privileges);
     if (AuthorizationSession::get(client)->isAuthorizedForPrivileges(privileges))
@@ -748,8 +778,12 @@ bool ErrmsgCommandDeprecated::run(OperationContext* opCtx,
 //////////////////////////////////////////////////////////////
 // CommandRegistry
 
-void CommandRegistry::registerCommand(Command* command, StringData name, StringData oldName) {
-    for (StringData key : {name, oldName}) {
+void CommandRegistry::registerCommand(Command* command,
+                                      StringData name,
+                                      std::vector<StringData> aliases) {
+    aliases.push_back(name);
+
+    for (auto key : aliases) {
         if (key.empty()) {
             continue;
         }

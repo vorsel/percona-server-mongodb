@@ -38,6 +38,7 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index_build_entry_helpers.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/service_context.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point.h"
@@ -50,6 +51,7 @@ using namespace indexbuildentryhelpers;
 
 namespace {
 
+MONGO_FAIL_POINT_DEFINE(hangBeforeInitializingIndexBuild);
 MONGO_FAIL_POINT_DEFINE(hangAfterInitializingIndexBuild);
 
 /**
@@ -59,6 +61,9 @@ ThreadPool::Options makeDefaultThreadPoolOptions() {
     ThreadPool::Options options;
     options.poolName = "IndexBuildsCoordinatorMongod";
     options.minThreads = 0;
+    // We depend on thread pool sizes being equal between primaries and secondaries. If a secondary
+    // has fewer resources than a primary, index build oplog entries can replicate in an order that
+    // the secondary is unable to fulfill, leading to deadlocks. See SERVER-44250.
     options.maxThreads = 10;
 
     // Ensure all threads have a client.
@@ -89,40 +94,30 @@ void IndexBuildsCoordinatorMongod::shutdown() {
 
 StatusWith<SharedSemiFuture<ReplIndexBuildState::IndexCatalogStats>>
 IndexBuildsCoordinatorMongod::startIndexBuild(OperationContext* opCtx,
-                                              StringData dbName,
+                                              std::string dbName,
                                               CollectionUUID collectionUUID,
                                               const std::vector<BSONObj>& specs,
                                               const UUID& buildUUID,
                                               IndexBuildProtocol protocol,
                                               IndexBuildOptions indexBuildOptions) {
-    // This lock serializes setting up the index build and scheduling it on the thread pool between
-    // concurrent callers. It guarantees that if this thread replicates a "startIndexBuild" oplog
-    // entry in the setup, no other concurrent thread can schedule its work ahead of this one. The
-    // thread pool can become saturated with work such that the task gets queued and not immediately
-    // run. The serialization in this function guarantees that primaries and secondaries will
-    // execute these steps in the same order, which is important to avoid deadlocks due to thread
-    // pool resource contention.
-    // TODO(SERVER-44609): Remove this mutex and setup the index build on the scheduled index build
-    // thread.
-    stdx::unique_lock<Latch> lk(_startBuildMutex);
-
     if (indexBuildOptions.twoPhaseRecovery) {
         // Two phase index build recovery goes though a different set-up procedure because the
         // original index will be dropped first.
         invariant(protocol == IndexBuildProtocol::kTwoPhase);
-        auto status = _registerAndSetUpIndexBuildForTwoPhaseRecovery(
-            opCtx, dbName, collectionUUID, specs, buildUUID);
+        auto status =
+            _setUpIndexBuildForTwoPhaseRecovery(opCtx, dbName, collectionUUID, specs, buildUUID);
         if (!status.isOK()) {
             return status;
         }
     } else {
-        auto statusWithOptionalResult = _registerAndSetUpIndexBuild(opCtx,
-                                                                    dbName,
-                                                                    collectionUUID,
-                                                                    specs,
-                                                                    buildUUID,
-                                                                    protocol,
-                                                                    indexBuildOptions.commitQuorum);
+        auto statusWithOptionalResult =
+            _filterSpecsAndRegisterBuild(opCtx,
+                                         dbName,
+                                         collectionUUID,
+                                         specs,
+                                         buildUUID,
+                                         protocol,
+                                         indexBuildOptions.commitQuorum);
         if (!statusWithOptionalResult.isOK()) {
             return statusWithOptionalResult.getStatus();
         }
@@ -137,8 +132,6 @@ IndexBuildsCoordinatorMongod::startIndexBuild(OperationContext* opCtx,
         }
     }
 
-    auto replState = invariant(_getIndexBuild(buildUUID));
-
     invariant(!opCtx->lockState()->isRSTLExclusive(), buildUUID.toString());
 
     // Copy over all necessary OperationContext state.
@@ -146,6 +139,13 @@ IndexBuildsCoordinatorMongod::startIndexBuild(OperationContext* opCtx,
     // Task in thread pool should retain the caller's deadline.
     const auto deadline = opCtx->getDeadline();
     const auto timeoutError = opCtx->getTimeoutError();
+
+    const NamespaceStringOrUUID nssOrUuid{dbName, collectionUUID};
+    const auto nss = CollectionCatalog::get(opCtx).resolveNamespaceStringOrUUID(opCtx, nssOrUuid);
+
+    const auto& oss = OperationShardingState::get(opCtx);
+    const auto shardVersion = oss.getShardVersion(nss);
+    const auto dbVersion = oss.getDbVersion(dbName);
 
     // Task in thread pool should have similar CurOp representation to the caller so that it can be
     // identified as a createIndexes operation.
@@ -158,40 +158,46 @@ IndexBuildsCoordinatorMongod::startIndexBuild(OperationContext* opCtx,
         opDesc = curOp->opDescription().getOwned();
     }
 
+    // If this index build was started during secondary batch application, it will have a commit
+    // timestamp that must be copied over to timestamp the write to initialize the index build.
+    const auto startTimestamp = opCtx->recoveryUnit()->getCommitTimestamp();
+
+    // Use a promise-future pair to wait until the index build has been started. This future will
+    // only return when the index build thread has started and the initial catalog write has been
+    // written, or an error has been encountered otherwise.
+    auto [startPromise, startFuture] = makePromiseFuture<void>();
+
+    auto replState = invariant(_getIndexBuild(buildUUID));
     _threadPool.schedule([
         this,
         buildUUID,
-        indexBuildOptions,
+        collectionUUID,
+        dbName,
+        nss,
         deadline,
-        timeoutError,
+        indexBuildOptions,
         logicalOp,
         opDesc,
-        replState
-    ](auto status) noexcept {
-        // Clean up the index build if we failed to schedule it.
+        replState,
+        startPromise = std::move(startPromise),
+        startTimestamp,
+        timeoutError,
+        shardVersion,
+        dbVersion
+    ](auto status) mutable noexcept {
+        // Clean up if we failed to schedule the task.
         if (!status.isOK()) {
             stdx::unique_lock<Latch> lk(_mutex);
-
-            // Unregister the index build before setting the promises,
-            // so callers do not see the build again.
             _unregisterIndexBuild(lk, replState);
-
-            // Set the promise in case another thread already joined the index build.
-            replState->sharedPromise.setError(status);
-
+            startPromise.setError(status);
             return;
         }
 
-        hangAfterInitializingIndexBuild.pauseWhileSet();
-
         auto opCtx = Client::getCurrent()->makeOperationContext();
-
         opCtx->setDeadlineByDate(deadline, timeoutError);
 
-        // Index builds should never take the PBWM lock, even on a primary. This allows the index
-        // to continue running after the node steps down to a secondary.
-        ShouldNotConflictWithSecondaryBatchApplicationBlock shouldNotConflictBlock(
-            opCtx->lockState());
+        auto& oss = OperationShardingState::get(opCtx.get());
+        oss.initializeClientRoutingVersions(nss, shardVersion, dbVersion);
 
         {
             stdx::unique_lock<Client> lk(*opCtx->getClient());
@@ -200,11 +206,44 @@ IndexBuildsCoordinatorMongod::startIndexBuild(OperationContext* opCtx,
             curOp->setOpDescription_inlock(opDesc);
         }
 
-        // Sets up and runs the index build. Sets result and cleans up index build.
+        while (MONGO_unlikely(hangBeforeInitializingIndexBuild.shouldFail())) {
+            sleepmillis(100);
+        }
+
+        // Index builds should never take the PBWM lock, even on a primary. This allows the
+        // index build to continue running after the node steps down to a secondary.
+        ShouldNotConflictWithSecondaryBatchApplicationBlock shouldNotConflictBlock(
+            opCtx->lockState());
+
+        if (!indexBuildOptions.twoPhaseRecovery) {
+            status =
+                _setUpIndexBuild(opCtx.get(), dbName, collectionUUID, buildUUID, startTimestamp);
+            if (!status.isOK()) {
+                startPromise.setError(status);
+                return;
+            }
+        }
+
+        // Signal that the index build started successfully.
+        startPromise.setWith([] {});
+
+        while (MONGO_unlikely(hangAfterInitializingIndexBuild.shouldFail())) {
+            sleepmillis(100);
+        }
+
+        // Runs the remainder of the index build. Sets the promise result and cleans up the index
+        // build.
         _runIndexBuild(opCtx.get(), buildUUID, indexBuildOptions);
+
+        // Do not exit with an incomplete future.
+        invariant(replState->sharedPromise.getFuture().isReady());
     });
 
-
+    // Waits until the index build has either been started or failed to start.
+    auto status = startFuture.getNoThrow(opCtx);
+    if (!status.isOK()) {
+        return status;
+    }
     return replState->sharedPromise.getFuture();
 }
 

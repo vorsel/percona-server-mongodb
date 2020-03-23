@@ -254,7 +254,8 @@ TEST_F(IndexBoundsBuilderTest, TranslateLtNegativeInfinity) {
 
 TEST_F(IndexBoundsBuilderTest, TranslateLtDate) {
     auto testIndex = buildSimpleIndexEntry();
-    BSONObj obj = BSON("a" << LT << Date_t::fromMillisSinceEpoch(5000));
+    const auto date = Date_t::fromMillisSinceEpoch(5000);
+    BSONObj obj = BSON("a" << LT << date);
     auto expr = parseMatchExpression(obj);
     BSONElement elt = obj.firstElement();
     OrderedIntervalList oil;
@@ -262,9 +263,9 @@ TEST_F(IndexBoundsBuilderTest, TranslateLtDate) {
     IndexBoundsBuilder::translate(expr.get(), elt, testIndex, &oil, &tightness);
     ASSERT_EQUALS(oil.name, "a");
     ASSERT_EQUALS(oil.intervals.size(), 1U);
-    ASSERT_EQUALS(Interval::INTERVAL_EQUALS,
-                  oil.intervals[0].compare(
-                      Interval(fromjson("{'': true, '': new Date(5000)}"), false, false)));
+    ASSERT_EQUALS(
+        Interval::INTERVAL_EQUALS,
+        oil.intervals[0].compare(Interval(BSON("" << Date_t::min() << "" << date), true, false)));
     ASSERT_EQUALS(tightness, IndexBoundsBuilder::EXACT);
 }
 
@@ -489,6 +490,32 @@ TEST_F(IndexBoundsBuilderTest, TranslateGtMinKey) {
     ASSERT_FALSE(oil.intervals[0].startInclusive);
     ASSERT_TRUE(oil.intervals[0].endInclusive);
     ASSERT_EQUALS(tightness, IndexBoundsBuilder::EXACT);
+}
+
+TEST_F(IndexBoundsBuilderTest, DontCrashOnNegationOfArrayInequality) {
+    BSONObj keyPattern = BSON("a" << 1);
+    auto testIndex = IndexEntry(keyPattern,
+                                IndexNames::nameToType(IndexNames::findPluginName(keyPattern)),
+                                true,  // multikey
+                                {},
+                                {},
+                                false,  // sparse
+                                false,  // unique
+                                IndexEntry::Identifier{"test_foo"},
+                                nullptr,  // filterExpr
+                                BSONObj(),
+                                nullptr,
+                                nullptr);
+
+    BSONObj obj = fromjson("{a: {$not: {$lt: [\"here\", {}, false]}}}");
+    auto expr = MatchExpression::optimize(parseMatchExpression(obj));
+    BSONElement elt = obj.firstElement();
+    OrderedIntervalList oil;
+    IndexBoundsBuilder::BoundsTightness tightness;
+    // TODO: SERVER-45233 This should succeed rather than throwing code.
+    ASSERT_THROWS_CODE(IndexBoundsBuilder::translate(expr.get(), elt, testIndex, &oil, &tightness),
+                       DBException,
+                       ErrorCodes::InternalError);
 }
 
 // Nothing can be greater than MaxKey so the resulting index bounds would be a useless empty range.
@@ -1269,8 +1296,8 @@ TEST_F(IndexBoundsBuilderTest, TypeStringOrNumberHasCorrectBounds) {
         Interval::INTERVAL_EQUALS,
         oil.intervals[0].compare(Interval(fromjson("{'': NaN, '': Infinity}"), true, true)));
     ASSERT_EQUALS(Interval::INTERVAL_EQUALS,
-                  oil.intervals[1].compare(Interval(fromjson("{'': '', '': {}}"), true, true)));
-    ASSERT(tightness == IndexBoundsBuilder::INEXACT_FETCH);
+                  oil.intervals[1].compare(Interval(fromjson("{'': '', '': {}}"), true, false)));
+    ASSERT(tightness == IndexBoundsBuilder::INEXACT_COVERED);
 }
 
 TEST_F(IndexBoundsBuilderTest, RedundantTypeNumberHasCorrectBounds) {
@@ -1288,7 +1315,7 @@ TEST_F(IndexBoundsBuilderTest, RedundantTypeNumberHasCorrectBounds) {
     ASSERT_EQUALS(
         Interval::INTERVAL_EQUALS,
         oil.intervals[0].compare(Interval(fromjson("{'': NaN, '': Infinity}"), true, true)));
-    ASSERT(tightness == IndexBoundsBuilder::INEXACT_FETCH);
+    ASSERT(tightness == IndexBoundsBuilder::EXACT);
 }
 
 TEST_F(IndexBoundsBuilderTest, CanUseCoveredMatchingForEqualityPredicate) {

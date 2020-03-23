@@ -167,7 +167,7 @@ public:
             // here. No-op updates will not generate a new lastOp, so we still need the
             // guard to fire in that case. Operations on the local DB aren't replicated, so they
             // don't need to bump the lastOp.
-            replClientInfo().setLastOpToSystemLastOpTime(_opCtx);
+            replClientInfo().setLastOpToSystemLastOpTimeIgnoringInterrupt(_opCtx);
             LOG(5) << "Set last op to system time: " << replClientInfo().getLastOp().getTimestamp();
         }
     }
@@ -211,11 +211,12 @@ void makeCollection(OperationContext* opCtx, const NamespaceString& ns) {
 
     writeConflictRetry(opCtx, "implicit collection creation", ns.ns(), [&opCtx, &ns] {
         AutoGetOrCreateDb db(opCtx, ns.db(), MODE_IX);
-        Lock::CollectionLock collLock(opCtx, ns, MODE_X);
+        Lock::CollectionLock collLock(opCtx, ns, MODE_IX);
 
         assertCanWrite_inlock(
-            opCtx, ns, CollectionCatalog::get(opCtx).lookupCollectionByNamespace(ns));
+            opCtx, ns, CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, ns));
         if (!CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
+                opCtx,
                 ns)) {  // someone else may have beat us to it.
             uassertStatusOK(userAllowedCreateNS(ns.db(), ns.coll()));
             WriteUnitOfWork wuow(opCtx);

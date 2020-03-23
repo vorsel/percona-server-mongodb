@@ -100,26 +100,6 @@ using write_ops::Insert;
 
 namespace {
 /**
- * Return whether the given sort spec can be used in a find() sort.
- */
-bool canSortBePushedDown(const SortPattern& sortPattern) {
-    for (auto&& patternPart : sortPattern) {
-        if (!patternPart.expression) {
-            continue;
-        }
-
-        // Technically sorting by {$meta: "textScore"} can be done in find() but requires a
-        // corresponding projection, so for simplicity we don't support pushing it down.
-        const auto metaType = patternPart.expression->getMetaType();
-        if (metaType == DocumentMetadataFields::kTextScore ||
-            metaType == DocumentMetadataFields::kRandVal) {
-            return false;
-        }
-    }
-    return true;
-}
-
-/**
  * Returns a PlanExecutor which uses a random cursor to sample documents if successful. Returns {}
  * if the storage engine doesn't support random cursors, or if 'sampleSize' is a large enough
  * percentage of the collection.
@@ -362,7 +342,7 @@ PipelineD::buildInnerQueryExecutor(Collection* collection,
                 // Pipeline) and an exception is thrown, an invariant will trigger in the
                 // DocumentSourceCursor. This is a design flaw in DocumentSourceCursor.
 
-                auto deps = pipeline->getDependencies(DepsTracker::kNoMetadata);
+                auto deps = pipeline->getDependencies(DepsTracker::kAllMetadata);
                 const bool shouldProduceEmptyDocs = deps.hasNoRequirements();
                 auto attachExecutorCallback =
                     [shouldProduceEmptyDocs](
@@ -450,6 +430,11 @@ getSortAndGroupStagesFromPipeline(const Pipeline::SourceContainer& sources) {
 }
 
 boost::optional<long long> extractLimitForPushdown(Pipeline* pipeline) {
+    // If the disablePipelineOptimization failpoint is enabled, then do not attempt the limit
+    // pushdown optimization.
+    if (MONGO_unlikely(disablePipelineOptimization.shouldFail())) {
+        return boost::none;
+    }
     auto&& sources = pipeline->getSources();
     auto limit = DocumentSourceSort::extractLimitForPushdown(sources.begin(), &sources);
     if (limit) {
@@ -542,9 +527,9 @@ PipelineD::buildInnerQueryExecutorGeneric(Collection* collection,
     // layer, but that is handled elsewhere.
     const auto limit = extractLimitForPushdown(pipeline);
 
-    auto metadataAvailable = DocumentSourceMatch::isTextQuery(queryObj)
-        ? DepsTracker::kOnlyTextScore
-        : DepsTracker::kNoMetadata;
+    auto unavailableMetadata = DocumentSourceMatch::isTextQuery(queryObj)
+        ? DepsTracker::kDefaultUnavailableMetadata & ~DepsTracker::kOnlyTextScore
+        : DepsTracker::kDefaultUnavailableMetadata;
 
     // Create the PlanExecutor.
     bool shouldProduceEmptyDocs = false;
@@ -554,7 +539,7 @@ PipelineD::buildInnerQueryExecutorGeneric(Collection* collection,
                                                 pipeline,
                                                 sortStage,
                                                 std::move(rewrittenGroupStage),
-                                                metadataAvailable,
+                                                unavailableMetadata,
                                                 queryObj,
                                                 limit,
                                                 aggRequest,
@@ -604,18 +589,19 @@ PipelineD::buildInnerQueryExecutorGeoNear(Collection* collection,
     BSONObj fullQuery = geoNearStage->asNearQuery(nearFieldName);
 
     bool shouldProduceEmptyDocs = false;
-    auto exec = uassertStatusOK(prepareExecutor(expCtx,
-                                                collection,
-                                                nss,
-                                                pipeline,
-                                                nullptr, /* sortStage */
-                                                nullptr, /* rewrittenGroupStage */
-                                                DepsTracker::kAllGeoNearData,
-                                                std::move(fullQuery),
-                                                boost::none, /* limit */
-                                                aggRequest,
-                                                Pipeline::kGeoNearMatcherFeatures,
-                                                &shouldProduceEmptyDocs));
+    auto exec = uassertStatusOK(
+        prepareExecutor(expCtx,
+                        collection,
+                        nss,
+                        pipeline,
+                        nullptr, /* sortStage */
+                        nullptr, /* rewrittenGroupStage */
+                        DepsTracker::kDefaultUnavailableMetadata & ~DepsTracker::kAllGeoNearData,
+                        std::move(fullQuery),
+                        boost::none, /* limit */
+                        aggRequest,
+                        Pipeline::kGeoNearMatcherFeatures,
+                        &shouldProduceEmptyDocs));
 
     auto attachExecutorCallback = [shouldProduceEmptyDocs,
                                    distanceField = geoNearStage->getDistanceField(),
@@ -645,7 +631,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
     Pipeline* pipeline,
     const boost::intrusive_ptr<DocumentSourceSort>& sortStage,
     std::unique_ptr<GroupFromFirstDocumentTransformation> rewrittenGroupStage,
-    QueryMetadataBitSet metadataAvailable,
+    QueryMetadataBitSet unavailableMetadata,
     const BSONObj& queryObj,
     boost::optional<long long> limit,
     const AggregationRequest* aggRequest,
@@ -658,12 +644,6 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
     if (pipeline->peekFront() && pipeline->peekFront()->constraints().isChangeStreamStage()) {
         invariant(expCtx->tailableMode == TailableModeEnum::kTailableAndAwaitData);
         plannerOpts |= QueryPlannerParams::TRACK_LATEST_OPLOG_TS;
-
-        // SERVER-42713: If "use44SortKeys" isn't set, then this aggregation request is from an
-        // earlier version of mongos, and we must fall back to the old way of serializing change
-        // stream sort keys from 4.2 and earlier.
-        invariant(aggRequest);
-        expCtx->use42ChangeStreamSortKeys = !aggRequest->getUse44SortKeys();
     }
 
     // If there is a sort stage eligible for pushdown, serialize its SortPattern to a BSONObj. The
@@ -671,7 +651,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
     // inside the inner PlanExecutor. We also remove the $sort stage from the Pipeline, since it
     // will be handled instead by PlanStage execution.
     BSONObj sortObj;
-    if (sortStage && canSortBePushedDown(sortStage->getSortKeyPattern())) {
+    if (sortStage) {
         sortObj = sortStage->getSortKeyPattern()
                       .serialize(SortPattern::SortKeySerialization::kForPipelineSerialization)
                       .toBson();
@@ -687,7 +667,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
     // Perform dependency analysis. In order to minimize the dependency set, we only analyze the
     // stages that remain in the pipeline after pushdown. In particular, any dependencies for a
     // $match or $sort pushed down into the query layer will not be reflected here.
-    auto deps = pipeline->getDependencies(metadataAvailable);
+    auto deps = pipeline->getDependencies(unavailableMetadata);
     *hasNoRequirements = deps.hasNoRequirements();
 
     // If we're pushing down a sort, and a merge will be required later, then we need the query

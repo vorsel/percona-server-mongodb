@@ -35,166 +35,110 @@
 #include <boost/log/utility/formatting_ostream.hpp>
 
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/logv2/attribute_storage.h"
 #include "mongo/logv2/attributes.h"
 #include "mongo/logv2/constants.h"
 #include "mongo/logv2/log_component.h"
 #include "mongo/logv2/log_severity.h"
 #include "mongo/logv2/log_tag.h"
+#include "mongo/logv2/name_extractor.h"
+#include "mongo/logv2/named_arg_formatter.h"
+#include "mongo/util/str_escape.h"
 #include "mongo/util/time_support.h"
 
 #include <fmt/format.h>
 
 namespace mongo::logv2 {
 namespace {
-struct JsonValueExtractor {
+struct JSONValueExtractor {
+    JSONValueExtractor(fmt::memory_buffer& buffer) : _buffer(buffer) {}
+
     void operator()(StringData name, CustomAttributeValue const& val) {
-        if (val.toBSON) {
-            // This is a JSON subobject, select overload that does not surround value with quotes
-            operator()(name, val.toBSON().jsonString());
+        // Try to format as BSON first if available. Prefer BSONAppend if available as we might only
+        // want the value and not the whole element.
+        if (val.BSONAppend) {
+            BSONObjBuilder builder;
+            val.BSONAppend(builder, name);
+            // This is a JSON subobject, no quotes needed
+            storeUnquoted(name);
+            builder.done().getField(name).jsonStringBuffer(
+                JsonStringFormat::ExtendedRelaxedV2_0_0, false, 0, _buffer);
+        } else if (val.BSONSerialize) {
+            // This is a JSON subobject, no quotes needed
+            storeUnquoted(name);
+            BSONObjBuilder builder;
+            val.BSONSerialize(builder);
+            builder.done().jsonStringBuffer(
+                JsonStringFormat::ExtendedRelaxedV2_0_0, 0, false, _buffer);
+        } else if (val.toBSONArray) {
+            // This is a JSON subarray, no quotes needed
+            storeUnquoted(name);
+            val.toBSONArray().jsonStringBuffer(
+                JsonStringFormat::ExtendedRelaxedV2_0_0, 0, true, _buffer);
+        } else if (val.stringSerialize) {
+            fmt::memory_buffer intermediate;
+            val.stringSerialize(intermediate);
+            storeQuoted(name, StringData(intermediate.data(), intermediate.size()));
         } else {
-            // This is a string, select overload that surrounds value with quotes
-            operator()(name, StringData(val.toString()));
+            // This is a string, surround value with quotes
+            storeQuoted(name, val.toString());
         }
     }
 
     void operator()(StringData name, const BSONObj* val) {
-        // This is a JSON subobject, select overload that does not surround value with quotes
-        operator()(name, val->jsonString());
+        // This is a JSON subobject, no quotes needed
+        storeUnquoted(name);
+        val->jsonStringBuffer(JsonStringFormat::ExtendedRelaxedV2_0_0, 0, false, _buffer);
+    }
+
+    void operator()(StringData name, const BSONArray* val) {
+        // This is a JSON subobject, no quotes needed
+        storeUnquoted(name);
+        val->jsonStringBuffer(JsonStringFormat::ExtendedRelaxedV2_0_0, 0, true, _buffer);
     }
 
     void operator()(StringData name, StringData value) {
-        // The first {} is for the member separator, added by store()
-        store(R"({}"{}":"{}")", name, value);
+        storeQuoted(name, value);
     }
 
     template <typename T>
     void operator()(StringData name, const T& value) {
-        // The first {} is for the member separator, added by store()
-        store(R"({}"{}":{})", name, value);
+        storeUnquotedValue(name, value);
     }
 
-    template <typename T>
-    void store(const char* fmt_str, StringData name, const T& value) {
-        nameArgs.push_back(fmt::internal::make_arg<fmt::format_context>(name));
-        fmt::format_to(buffer, fmt_str, _separator, name, value);
+
+private:
+    void storeUnquoted(StringData name) {
+        fmt::format_to(_buffer, R"({}"{}":)", _separator, name);
         _separator = ","_sd;
     }
 
-    fmt::memory_buffer buffer;
-    boost::container::small_vector<fmt::basic_format_arg<fmt::format_context>,
-                                   constants::kNumStaticAttrs>
-        nameArgs;
+    template <typename T>
+    void storeUnquotedValue(StringData name, const T& value) {
+        fmt::format_to(_buffer, R"({}"{}":{})", _separator, name, value);
+        _separator = ","_sd;
+    }
 
-private:
+    template <typename T>
+    void storeQuoted(StringData name, const T& value) {
+        fmt::format_to(_buffer, R"({}"{}":")", _separator, name);
+        str::escapeForJSON(_buffer, value);
+        _buffer.push_back('"');
+        _separator = ","_sd;
+    }
+
+    fmt::memory_buffer& _buffer;
     StringData _separator = ""_sd;
-};
-
-class NamedArgFormatter : public fmt::arg_formatter<fmt::internal::buffer_range<char>> {
-public:
-    typedef fmt::arg_formatter<fmt::internal::buffer_range<char>> arg_formatter;
-
-    NamedArgFormatter(fmt::format_context& ctx,
-                      fmt::basic_parse_context<char>* parse_ctx = nullptr,
-                      fmt::format_specs* spec = nullptr)
-        : arg_formatter(ctx, parse_ctx, nullptr) {
-        // Pretend that we have no format_specs, but store so we can re-construct the format
-        // specifier
-        if (spec) {
-            spec_ = *spec;
-        }
-    }
-
-
-    using arg_formatter::operator();
-
-    auto operator()(fmt::string_view name) {
-        using namespace fmt;
-
-        write("{");
-        arg_formatter::operator()(name);
-        // If formatting spec was provided, reconstruct the string. Libfmt does not provide this
-        // unfortunately
-        if (spec_) {
-            char str[2] = {'\0', '\0'};
-            write(":");
-            if (spec_->fill() != ' ') {
-                str[0] = static_cast<char>(spec_->fill());
-                write(str);
-            }
-
-            switch (spec_->align()) {
-                case ALIGN_LEFT:
-                    write("<");
-                    break;
-                case ALIGN_RIGHT:
-                    write(">");
-                    break;
-                case ALIGN_CENTER:
-                    write("^");
-                    break;
-                case ALIGN_NUMERIC:
-                    write("=");
-                    break;
-                default:
-                    break;
-            };
-
-            if (spec_->has(PLUS_FLAG))
-                write("+");
-            else if (spec_->has(MINUS_FLAG))
-                write("-");
-            else if (spec_->has(SIGN_FLAG))
-                write(" ");
-            else if (spec_->has(HASH_FLAG))
-                write("#");
-
-            if (spec_->align() == ALIGN_NUMERIC && spec_->fill() == 0)
-                write("0");
-
-            if (spec_->width() > 0)
-                write(std::to_string(spec_->width()).c_str());
-
-            if (spec_->has_precision()) {
-                write(".");
-                write(std::to_string(spec_->precision).c_str());
-            }
-            str[0] = spec_->type;
-            write(str);
-        }
-        write("}");
-        return out();
-    }
-
-private:
-    boost::optional<fmt::format_specs> spec_;
 };
 }  // namespace
 
-void JsonFormatter::operator()(boost::log::record_view const& rec,
+void JSONFormatter::operator()(boost::log::record_view const& rec,
                                boost::log::formatting_ostream& strm) const {
     using namespace boost::log;
 
     // Build a JSON object for the user attributes.
     const auto& attrs = extract<TypeErasedAttributeStorage>(attributes::attributes(), rec).get();
-
-    JsonValueExtractor extractor;
-    attrs.apply(extractor);
-
-    std::string id;
-    auto stable_id = extract<StringData>(attributes::stableId(), rec).get();
-    if (!stable_id.empty()) {
-        id = fmt::format("\"id\":\"{}\",", stable_id);
-    }
-
-    std::string message;
-    fmt::memory_buffer buffer;
-    fmt::vformat_to<NamedArgFormatter, char>(
-        buffer,
-        extract<StringData>(attributes::message(), rec).get().toString(),
-        fmt::basic_format_args<fmt::format_context>(extractor.nameArgs.data(),
-                                                    extractor.nameArgs.size()));
-    message = fmt::to_string(buffer);
 
     StringData severity =
         extract<LogSeverity>(attributes::severity(), rec).get().toStringDataCompact();
@@ -203,38 +147,82 @@ void JsonFormatter::operator()(boost::log::record_view const& rec,
     std::string tag;
     LogTag tags = extract<LogTag>(attributes::tags(), rec).get();
     if (tags != LogTag::kNone) {
-        tag = fmt::format(",\"tags\":{}", tags.toJSONArray());
+        tag = fmt::format(
+            ",\"{}\":{}",
+            constants::kTagsFieldName,
+            tags.toBSONArray().jsonString(JsonStringFormat::ExtendedRelaxedV2_0_0, 0, true));
     }
 
-    strm << fmt::format(R"({{)"
-                        R"("t":"{}",)"        // timestamp
-                        R"("s":"{}"{: <{}})"  // severity with padding for the comma
-                        R"("c":"{}"{: <{}})"  // component with padding for the comma
-                        R"("ctx":"{}",)"      // context
-                        R"({})"               // optional stable id
-                        R"("msg":"{}")"       // message
-                        R"({})",              // optional attribute key
-                        dateToISOStringUTC(extract<Date_t>(attributes::timeStamp(), rec).get()),
-                        severity,
-                        ",",
-                        3 - severity.size(),
-                        component,
-                        ",",
-                        9 - component.size(),
-                        extract<StringData>(attributes::threadName(), rec).get(),
-                        id,
-                        message,
-                        attrs.empty() ? "" : ",\"attr\":{");
+    fmt::memory_buffer buffer;
+
+    // Put all fields up until the message value
+    fmt::format_to(buffer,
+                   R"({{)"
+                   R"("{}":{{"$date":"{}"}},)"  // timestamp
+                   R"("{}":"{}"{: <{}})"        // severity with padding for the comma
+                   R"("{}":"{}"{: <{}})"        // component with padding for the comma
+                   R"("{}":"{}",)"              // context
+                   R"("{}":{},)"                // id
+                   R"("{}":")",                 // message
+                                                // timestamp
+                   constants::kTimestampFieldName,
+                   dateToISOStringUTC(extract<Date_t>(attributes::timeStamp(), rec).get()),
+                   // severity, left align the comma and add padding to create fixed column width
+                   constants::kSeverityFieldName,
+                   severity,
+                   ",",
+                   3 - severity.size(),
+                   // component, left align the comma and add padding to create fixed column width
+                   constants::kComponentFieldName,
+                   component,
+                   ",",
+                   9 - component.size(),
+                   // context
+                   constants::kContextFieldName,
+                   extract<StringData>(attributes::threadName(), rec).get(),
+                   // id
+                   constants::kIdFieldName,
+                   extract<int32_t>(attributes::id(), rec).get(),
+                   // message
+                   constants::kMessageFieldName);
+
+    // Insert the attribute names back into the message string using a special formatter and format
+    // into buffer
+    detail::NameExtractor nameExtractor;
+    attrs.apply(nameExtractor);
+
+    fmt::vformat_to<detail::NamedArgFormatter, char>(
+        buffer,
+        extract<StringData>(attributes::message(), rec).get().toString(),
+        fmt::basic_format_args<fmt::format_context>(nameExtractor.nameArgs.data(),
+                                                    nameExtractor.nameArgs.size()));
+
+    if (attrs.empty()) {
+        // If no attributes we can just close the message string
+        buffer.push_back('"');
+    } else {
+        // otherwise, add attribute field name and opening brace
+        fmt::format_to(buffer, R"(","{}":{{)", constants::kAttributesFieldName);
+    }
 
     if (!attrs.empty()) {
-        strm << fmt::to_string(extractor.buffer);
+        // comma separated list of attributes (no opening/closing brace are added here)
+        JSONValueExtractor extractor(buffer);
+        attrs.apply(extractor);
     }
 
-    strm << fmt::format(R"({})"  // optional attribute closing
-                        R"({})"  // optional tags
-                        R"(}})",
-                        attrs.empty() ? "" : "}",
-                        tag);
+    // Add remaining fields
+    fmt::format_to(buffer,
+                   R"({})"  // optional attribute closing
+                   R"({})"  // optional tags
+                   R"(}})",
+                   // closing brace
+                   attrs.empty() ? "" : "}",
+                   // tags
+                   tag);
+
+    // Write final JSON object to output stream
+    strm.write(buffer.data(), buffer.size());
 }
 
 }  // namespace mongo::logv2

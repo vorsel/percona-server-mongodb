@@ -50,7 +50,7 @@ REPL_MIXED_VERSION_CONFIGS = ["new-old-new", "new-new-old", "old-new-new"]
 SHARDED_MIXED_VERSION_CONFIGS = ["new-old-old-new"]
 
 BURN_IN_TASK = "burn_in_tests_multiversion"
-BURN_IN_CONFIG_KEY = "use_in_multiversion_burn_in_tests"
+MULTIVERSION_CONFIG_KEY = "use_in_multiversion"
 PASSTHROUGH_TAG = "multiversion_passthrough"
 EXCLUDE_TAGS = f"{REQUIRES_FCV_TAG},multiversion_incompatible"
 
@@ -82,33 +82,11 @@ def is_suite_sharded(suite_dir, suite_name):
     return source_config["executor"]["fixture"]["class"] == "ShardedClusterFixture"
 
 
-def update_suite_config_for_multiversion_replset(suite_config):
-    """Update suite_config with arguments for multiversion tests using ReplicaSetFixture."""
-    suite_config["executor"]["fixture"]["num_nodes"] = 3
-    suite_config["executor"]["fixture"]["linear_chain"] = True
-
-
-def update_suite_config_for_multiversion_sharded(suite_config):
-    """Update suite_config with arguments for multiversion tests using ShardedClusterFixture."""
-
-    fixture_config = suite_config["executor"]["fixture"]
-    default_shards = "default_shards"
-    default_num_nodes = "default_nodes"
-    base_num_shards = (default_shards if "num_shards" not in fixture_config
-                       or not fixture_config["num_shards"] else fixture_config["num_shards"])
-    base_num_rs_nodes_per_shard = (default_num_nodes
-                                   if "num_rs_nodes_per_shard" not in fixture_config
-                                   or not fixture_config["num_rs_nodes_per_shard"] else
-                                   fixture_config["num_rs_nodes_per_shard"])
-
-    if base_num_shards is not default_shards or base_num_rs_nodes_per_shard is not default_num_nodes:
-        num_shard_num_nodes_pair = "{}-{}".format(base_num_shards, base_num_rs_nodes_per_shard)
-        assert num_shard_num_nodes_pair in {"default_shards-2", "2-default_nodes", "2-3"}, \
-               "The multiversion suite runs sharded clusters with 2 shards and 2 nodes per shard. "\
-               " acceptable, please add '{}' to this assert.".format(num_shard_num_nodes_pair)
-
-    suite_config["executor"]["fixture"]["num_shards"] = 2
-    suite_config["executor"]["fixture"]["num_rs_nodes_per_shard"] = 2
+def get_multiversion_resmoke_args(is_sharded):
+    """Return resmoke args used to configure a cluster for multiversion testing."""
+    args_for_sharded_cluster = "--numShards=2 --numReplSetNodes=2 "
+    args_for_replset = "--numReplSetNodes=3 --linearChain=on "
+    return args_for_sharded_cluster if is_sharded else args_for_replset
 
 
 def get_backports_required_last_stable_hash(task_path_suffix):
@@ -144,13 +122,31 @@ def get_last_stable_yaml(last_stable_commit_hash, suite_name):
     return backports_required_last_stable[suite_name]
 
 
-class MultiversionConfig(object):
-    """An object containing the configurations to generate and run the multiversion tests with."""
+def get_exclude_files(suite_name, task_path_suffix):
+    """Generate the list of files to exclude based on the BACKPORTS_REQUIRED_FILE."""
+    backports_required_latest = generate_resmoke.read_yaml(ETC_DIR, BACKPORTS_REQUIRED_FILE)
+    if suite_name not in backports_required_latest:
+        LOGGER.info(f"Generating exclude files not supported for '{suite_name}''.")
+        return set()
 
-    def __init__(self, update_yaml, version_configs):
-        """Create new MultiversionConfig object."""
-        self.update_yaml = update_yaml
-        self.version_configs = version_configs
+    latest_suite_yaml = backports_required_latest[suite_name]
+
+    if not latest_suite_yaml:
+        LOGGER.info(f"No tests need to be excluded from suite '{suite_name}'.")
+        return set()
+
+    # Get the state of the backports_required_for_multiversion_tests.yml file for the last-stable
+    # binary we are running tests against. We do this by using the commit hash from the last-stable
+    # mongo shell executable.
+    last_stable_commit_hash = get_backports_required_last_stable_hash(task_path_suffix)
+
+    # Get the yaml contents under the 'suite_name' key from the last-stable commit.
+    last_stable_suite_yaml = get_last_stable_yaml(last_stable_commit_hash, suite_name)
+    if last_stable_suite_yaml is None:
+        return set(elem["test_file"] for elem in latest_suite_yaml)
+    else:
+        return set(
+            elem["test_file"] for elem in latest_suite_yaml if elem not in last_stable_suite_yaml)
 
 
 class EvergreenConfigGenerator(object):
@@ -167,7 +163,7 @@ class EvergreenConfigGenerator(object):
         self.task = generate_resmoke.remove_gen_suffix(self.options.task)
 
     def _generate_sub_task(self, mixed_version_config, task, task_index, suite, num_suites,
-                           burn_in_test=None):
+                           is_sharded, burn_in_test=None):
         # pylint: disable=too-many-arguments
         """Generate a sub task to be run with the provided suite and  mixed version config."""
 
@@ -188,11 +184,15 @@ class EvergreenConfigGenerator(object):
         ]
         run_tests_vars = {
             "resmoke_args":
-                "{0} --suite={1} --mixedBinVersions={2} --excludeWithAnyTags={3} ".format(
-                    self.options.resmoke_args, suite, mixed_version_config, EXCLUDE_TAGS),
+                "{0} --suite={1} --mixedBinVersions={2} --excludeWithAnyTags={3} --originSuite={4} "
+                .format(self.options.resmoke_args, suite, mixed_version_config, EXCLUDE_TAGS,
+                        self.options.suite),
             "task":
                 gen_task_name,
         }
+        # Update the resmoke args to configure the cluster for multiversion testing.
+        run_tests_vars["resmoke_args"] += get_multiversion_resmoke_args(is_sharded)
+
         if burn_in_test is not None:
             run_tests_vars["resmoke_args"] += burn_in_test
 
@@ -213,42 +213,38 @@ class EvergreenConfigGenerator(object):
             .execution_task("{0}_gen".format(task_name))
         self.evg_config.variant(self.options.variant).tasks(task_specs).display_task(dt)
 
-    def _generate_burn_in_execution_tasks(self, config, suites, burn_in_test, burn_in_idx):
+    def _generate_burn_in_execution_tasks(self, version_configs, suites, burn_in_test, burn_in_idx,
+                                          is_sharded):
+        # pylint: disable=too-many-arguments
         burn_in_prefix = "burn_in_multiversion"
         task = "{0}:{1}".format(burn_in_prefix, self.task)
 
-        for version_config in config.version_configs:
+        for version_config in version_configs:
             # For burn in tasks, it doesn't matter which generated suite yml to use as all the
             # yaml configurations are the same.
             source_suite = os.path.join(CONFIG_DIR, suites[0].name + ".yml")
-            self._generate_sub_task(version_config, task, burn_in_idx, source_suite, 1,
+            self._generate_sub_task(version_config, task, burn_in_idx, source_suite, 1, is_sharded,
                                     burn_in_test)
         return self.evg_config
 
-    def _get_fuzzer_options(self, version_config, suite_file):
+    def _get_fuzzer_options(self, version_config, is_sharded):
         fuzzer_config = generate_resmoke.ConfigOptions(self.options.config)
         fuzzer_config.name = f"{self.options.suite}_multiversion"
         fuzzer_config.num_files = int(self.options.num_files)
         fuzzer_config.num_tasks = int(self.options.num_tasks)
+        add_resmoke_args = get_multiversion_resmoke_args(is_sharded)
         fuzzer_config.resmoke_args = f"{self.options.resmoke_args} "\
-            f"--mixedBinVersions={version_config} --excludeWithAnyTags={EXCLUDE_TAGS}"\
-            f" --suites={CONFIG_DIR}/{suite_file}"
+            f"--mixedBinVersions={version_config} {add_resmoke_args}"
         return fuzzer_config
 
-    def _generate_fuzzer_tasks(self, config):
-        suite_file = self.options.suite + ".yml"
-        # Update the jstestfuzz yml suite with the proper multiversion configurations.
-        source_config = generate_resmoke.read_yaml(TEST_SUITE_DIR, suite_file)
-        config.update_yaml(source_config)
-        updated_yml = generate_resmoke.generate_resmoke_suite_config(source_config, suite_file)
-        file_dict = {f"{self.options.suite}.yml": updated_yml}
+    def _generate_fuzzer_tasks(self, version_configs, is_sharded):
         dt = DisplayTaskDefinition(self.task)
 
-        for version_config in config.version_configs:
-            fuzzer_config = self._get_fuzzer_options(version_config, suite_file)
+        for version_config in version_configs:
+            fuzzer_config = generate_resmoke.ConfigOptions(self.options.config)
+            fuzzer_config = self._get_fuzzer_options(version_config, is_sharded)
             gen_fuzzer.generate_evg_tasks(fuzzer_config, self.evg_config,
                                           task_name_suffix=version_config, display_task=dt)
-        generate_resmoke.write_file_dict(CONFIG_DIR, file_dict)
         dt.execution_task(f"{fuzzer_config.name}_gen")
         self.evg_config.variant(self.options.variant).display_task(dt)
         return self.evg_config
@@ -263,15 +259,14 @@ class EvergreenConfigGenerator(object):
 
         :param burn_in_test: The test to be run as part of the burn in multiversion suite.
         """
-        if is_suite_sharded(TEST_SUITE_DIR, self.options.suite):
-            config = MultiversionConfig(update_suite_config_for_multiversion_sharded,
-                                        SHARDED_MIXED_VERSION_CONFIGS)
+        is_sharded = is_suite_sharded(TEST_SUITE_DIR, self.options.suite)
+        if is_sharded:
+            version_configs = SHARDED_MIXED_VERSION_CONFIGS
         else:
-            config = MultiversionConfig(update_suite_config_for_multiversion_replset,
-                                        REPL_MIXED_VERSION_CONFIGS)
+            version_configs = REPL_MIXED_VERSION_CONFIGS
 
         if self.options.is_jstestfuzz:
-            return self._generate_fuzzer_tasks(config)
+            return self._generate_fuzzer_tasks(version_configs, is_sharded)
 
         # Divide tests into suites based on run-time statistics for the last
         # LOOKBACK_DURATION_DAYS. Tests without enough run-time statistics will be placed
@@ -280,37 +275,32 @@ class EvergreenConfigGenerator(object):
         end_date = datetime.datetime.utcnow().replace(microsecond=0)
         start_date = end_date - datetime.timedelta(days=generate_resmoke.LOOKBACK_DURATION_DAYS)
         suites = gen_suites.calculate_suites(start_date, end_date)
-        # Update the base suite names to the multiversion task names.
-        for suite in suites:
-            suite.source_name = self.task
         # Render the given suites into yml files that can be used by resmoke.py.
-        config_file_dict = generate_resmoke.render_suite_files(
-            suites, self.options.suite, gen_suites.test_list, TEST_SUITE_DIR, config.update_yaml)
-        # Update the base misc suite name to the multiversion name.
-        base_misc_file = f"{self.options.suite}_misc.yml"
-        misc_suite_name = f"{self.task}_misc.yml"
-        misc_suite = os.path.join(CONFIG_DIR, misc_suite_name)
-        config_file_dict[misc_suite_name] = config_file_dict.pop(base_misc_file)
+        config_file_dict = generate_resmoke.render_suite_files(suites, self.options.suite,
+                                                               gen_suites.test_list, TEST_SUITE_DIR)
         generate_resmoke.write_file_dict(CONFIG_DIR, config_file_dict)
 
         if burn_in_test is not None:
             # Generate the subtasks to run burn_in_test against the appropriate mixed version
             # configurations. The display task is defined later as part of generating the burn
             # in tests.
-            self._generate_burn_in_execution_tasks(config, suites, burn_in_test, burn_in_idx)
+            self._generate_burn_in_execution_tasks(version_configs, suites, burn_in_test,
+                                                   burn_in_idx, is_sharded)
             return self.evg_config
 
-        for version_config in config.version_configs:
+        for version_config in version_configs:
             idx = 0
             for suite in suites:
                 # Generate the newly divided test suites
                 source_suite = os.path.join(CONFIG_DIR, suite.name + ".yml")
-                self._generate_sub_task(version_config, self.task, idx, source_suite, len(suites))
+                self._generate_sub_task(version_config, self.task, idx, source_suite, len(suites),
+                                        is_sharded)
                 idx += 1
 
             # Also generate the misc task.
             misc_suite_name = "{0}_misc".format(self.options.suite)
-            self._generate_sub_task(version_config, self.task, idx, misc_suite, 1)
+            misc_suite = os.path.join(CONFIG_DIR, misc_suite_name + ".yml")
+            self._generate_sub_task(version_config, self.task, idx, misc_suite, 1, is_sharded)
             idx += 1
         self.create_display_task(self.task, self.task_specs, self.task_names)
         return self.evg_config
@@ -367,6 +357,7 @@ def run_generate_tasks(expansion_file, evergreen_config=None):
 @click.option("--is-generated-suite", type=bool, required=True,
               help="Indicates whether the suite yaml to update is generated or static.")
 def generate_exclude_yaml(suite, task_path_suffix, is_generated_suite):
+    # pylint: disable=too-many-locals
     """
     Update the given multiversion suite configuration yaml to exclude tests.
 
@@ -378,30 +369,7 @@ def generate_exclude_yaml(suite, task_path_suffix, is_generated_suite):
 
     suite_name = generate_resmoke.remove_gen_suffix(suite)
 
-    # Get the backports_required_for_multiversion_tests.yml on the current version branch.
-    backports_required_latest = generate_resmoke.read_yaml(ETC_DIR, BACKPORTS_REQUIRED_FILE)
-    if suite_name not in backports_required_latest:
-        LOGGER.info(f"Generating exclude files not supported for '{suite_name}''.")
-        return
-
-    latest_suite_yaml = backports_required_latest[suite_name]
-
-    if not latest_suite_yaml:
-        LOGGER.info(f"No tests need to be excluded from suite '{suite_name}'.")
-        return
-
-    # Get the state of the backports_required_for_multiversion_tests.yml file for the last-stable
-    # binary we are running tests against. We do this by using the commit hash from the last-stable
-    # mongo shell executable.
-    last_stable_commit_hash = get_backports_required_last_stable_hash(task_path_suffix)
-
-    # Get the yaml contents under the 'suite_name' key from the last-stable commit.
-    last_stable_suite_yaml = get_last_stable_yaml(last_stable_commit_hash, suite_name)
-    if last_stable_suite_yaml is None:
-        files_to_exclude = set(elem["test_file"] for elem in latest_suite_yaml)
-    else:
-        files_to_exclude = set(
-            elem["test_file"] for elem in latest_suite_yaml if elem not in last_stable_suite_yaml)
+    files_to_exclude = get_exclude_files(suite_name, task_path_suffix)
 
     if not files_to_exclude:
         LOGGER.info(f"No tests need to be excluded from suite '{suite_name}'.")
@@ -425,7 +393,16 @@ def generate_exclude_yaml(suite, task_path_suffix, is_generated_suite):
         for file_name in os.listdir(CONFIG_DIR):
             suites_dir = CONFIG_DIR
             # Update the 'exclude_files' for each of the appropriate generated suites.
-            if suite_name in file_name and file_name.endswith('.yml'):
+            if file_name.endswith('misc.yml'):
+                # New tests will be run as part of misc.yml. We want to make sure to properly
+                # exclude these tests if they have been blacklisted.
+                suite_config = generate_resmoke.read_yaml(CONFIG_DIR, file_name)
+                exclude_files = suite_config["selector"]["exclude_files"]
+                add_to_excludes = [test for test in files_to_exclude if test not in exclude_files]
+                exclude_files += add_to_excludes
+                suite_yaml_dict[file_name] = generate_resmoke.generate_resmoke_suite_config(
+                    suite_config, file_name, excludes=list(exclude_files))
+            elif file_name.endswith('.yml'):
                 suite_config = generate_resmoke.read_yaml(CONFIG_DIR, file_name)
                 selected_files = suite_config["selector"]["roots"]
                 # Only exclude the files that we want to exclude in the first place and have been

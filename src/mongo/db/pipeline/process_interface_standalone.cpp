@@ -49,6 +49,7 @@
 #include "mongo/db/cursor_manager.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/pipeline/document_source_cursor.h"
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
 #include "mongo/db/pipeline/pipeline_d.h"
@@ -151,11 +152,7 @@ bool supportsUniqueKey(const boost::intrusive_ptr<ExpressionContext>& expCtx,
 
 }  // namespace
 
-MongoInterfaceStandalone::MongoInterfaceStandalone(OperationContext* opCtx) : _client(opCtx) {}
-
-void MongoInterfaceStandalone::setOperationContext(OperationContext* opCtx) {
-    _client.setOpCtx(opCtx);
-}
+MongoInterfaceStandalone::MongoInterfaceStandalone(OperationContext* opCtx) {}
 
 std::unique_ptr<TransactionHistoryIteratorBase>
 MongoInterfaceStandalone::createTransactionHistoryIterator(repl::OpTime time) const {
@@ -202,8 +199,9 @@ Update MongoInterfaceStandalone::buildUpdateOp(
                 entry.setU(std::move(u));
                 entry.setC(std::move(c));
                 entry.setUpsert(upsert != UpsertType::kNone);
-                entry.setUpsertSupplied(
-                    {{entry.getUpsert(), upsert == UpsertType::kInsertSuppliedDoc}});
+                // TODO SERVER-44884: after branching for 4.5, remove the 'useNewUpsert' flag.
+                entry.setUpsertSupplied({{entry.getUpsert() && expCtx->useNewUpsert,
+                                          upsert == UpsertType::kInsertSuppliedDoc}});
                 entry.setMulti(multi);
                 return entry;
             }());
@@ -261,17 +259,51 @@ StatusWith<MongoProcessInterface::UpdateResult> MongoInterfaceStandalone::update
     return updateResult;
 }
 
-CollectionIndexUsageMap MongoInterfaceStandalone::getIndexStats(OperationContext* opCtx,
-                                                                const NamespaceString& ns) {
+std::vector<Document> MongoInterfaceStandalone::getIndexStats(OperationContext* opCtx,
+                                                              const NamespaceString& ns,
+                                                              StringData host,
+                                                              bool addShardName) {
     AutoGetCollectionForReadCommand autoColl(opCtx, ns);
 
     Collection* collection = autoColl.getCollection();
+    std::vector<Document> indexStats;
     if (!collection) {
         LOG(2) << "Collection not found on index stats retrieval: " << ns.ns();
-        return CollectionIndexUsageMap();
+        return indexStats;
     }
 
-    return CollectionQueryInfo::get(collection).getIndexUsageStats();
+    auto indexStatsMap = CollectionQueryInfo::get(collection).getIndexUsageStats();
+    for (auto&& indexStatsMapIter : indexStatsMap) {
+        auto indexName = indexStatsMapIter.first;
+        auto stats = indexStatsMapIter.second;
+        MutableDocument doc;
+        doc["name"] = Value(indexName);
+        doc["key"] = Value(stats.indexKey);
+        doc["host"] = Value(host);
+        doc["accesses"]["ops"] = Value(stats.accesses.loadRelaxed());
+        doc["accesses"]["since"] = Value(stats.trackerStartTime);
+
+        if (addShardName)
+            doc["shard"] = Value(getShardName(opCtx));
+
+        // Retrieve the relevant index entry.
+        auto idxCatalog = collection->getIndexCatalog();
+        auto idx = idxCatalog->findIndexByName(opCtx,
+                                               indexName,
+                                               /* includeUnfinishedIndexes */ true);
+        uassert(ErrorCodes::IndexNotFound,
+                "Could not find entry in IndexCatalog for index " + indexName,
+                idx);
+        auto entry = idxCatalog->getEntry(idx);
+        doc["spec"] = Value(idx->infoObj());
+
+        if (!entry->isReady(opCtx)) {
+            doc["building"] = Value(true);
+        }
+
+        indexStats.push_back(doc.freeze());
+    }
+    return indexStats;
 }
 
 std::list<BSONObj> MongoInterfaceStandalone::getIndexSpecs(OperationContext* opCtx,
@@ -373,10 +405,37 @@ void MongoInterfaceStandalone::createCollection(OperationContext* opCtx,
     uassertStatusOK(mongo::createCollection(opCtx, dbName, cmdObj));
 }
 
-void MongoInterfaceStandalone::createIndexes(OperationContext* opCtx,
-                                             const NamespaceString& ns,
-                                             const std::vector<BSONObj>& indexSpecs) {
-    _client.createIndexes(ns.ns(), indexSpecs);
+void MongoInterfaceStandalone::createIndexesOnEmptyCollection(
+    OperationContext* opCtx, const NamespaceString& ns, const std::vector<BSONObj>& indexSpecs) {
+    AutoGetCollection autoColl(opCtx, ns, MODE_X);
+    writeConflictRetry(
+        opCtx, "MongoInterfaceStandalone::createIndexesOnEmptyCollection", ns.ns(), [&] {
+            auto collection = autoColl.getCollection();
+            invariant(collection,
+                      str::stream() << "Failed to create indexes for aggregation because "
+                                       "collection does not exist: "
+                                    << ns << ": " << BSON("indexes" << indexSpecs));
+
+            invariant(0U == collection->numRecords(opCtx),
+                      str::stream() << "Expected empty collection for index creation: " << ns
+                                    << ": numRecords: " << collection->numRecords(opCtx) << ": "
+                                    << BSON("indexes" << indexSpecs));
+
+            // Secondary index builds do not filter existing indexes so we have to do this on the
+            // primary.
+            auto removeIndexBuildsToo = false;
+            auto filteredIndexes = collection->getIndexCatalog()->removeExistingIndexes(
+                opCtx, indexSpecs, removeIndexBuildsToo);
+            if (filteredIndexes.empty()) {
+                return;
+            }
+
+            WriteUnitOfWork wuow(opCtx);
+            IndexBuildsCoordinator::get(opCtx)->createIndexesOnEmptyCollection(
+                opCtx, collection->uuid(), filteredIndexes, false  // fromMigrate
+            );
+            wuow.commit();
+        });
 }
 void MongoInterfaceStandalone::dropCollection(OperationContext* opCtx, const NamespaceString& ns) {
     BSONObjBuilder result;
@@ -476,14 +535,20 @@ boost::optional<Document> MongoInterfaceStandalone::lookupSingleDocument(
             nss,
             collectionUUID,
             _getCollectionDefaultCollator(expCtx->opCtx, nss.db(), collectionUUID));
-        pipeline = makePipeline({BSON("$match" << documentKey)}, foreignExpCtx);
+        // When looking up on a mongoD, we only ever want to read from the local collection. By
+        // default, makePipeline will attach a cursor source which may read from remote if the
+        // collection is sharded, so we manually attach a local-only cursor source here.
+        MakePipelineOptions opts;
+        opts.attachCursorSource = false;
+        pipeline = makePipeline({BSON("$match" << documentKey)}, foreignExpCtx, opts);
+        pipeline = attachCursorSourceToPipelineForLocalRead(foreignExpCtx, pipeline.release());
     } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
         return boost::none;
     }
 
     auto lookedUpDocument = pipeline->getNext();
     if (auto next = pipeline->getNext()) {
-        uasserted(ErrorCodes::TooManyMatchingDocuments,
+        uasserted(ErrorCodes::ChangeStreamFatalError,
                   str::stream() << "found more than one document with document key "
                                 << documentKey.toString() << " [" << lookedUpDocument->toString()
                                 << ", " << next->toString() << "]");
@@ -507,14 +572,10 @@ boost::optional<Document> MongoInterfaceStandalone::lookupSingleDocument(
 }
 
 BackupCursorState MongoInterfaceStandalone::openBackupCursor(
-    OperationContext* opCtx,
-    bool incrementalBackup,
-    boost::optional<std::string> thisBackupName,
-    boost::optional<std::string> srcBackupName) {
+    OperationContext* opCtx, const StorageEngine::BackupOptions& options) {
     auto backupCursorHooks = BackupCursorHooks::get(opCtx->getServiceContext());
     if (backupCursorHooks->enabled()) {
-        return backupCursorHooks->openBackupCursor(
-            opCtx, incrementalBackup, thisBackupName, srcBackupName);
+        return backupCursorHooks->openBackupCursor(opCtx, options);
     } else {
         uasserted(50956, "Backup cursors are an enterprise only feature.");
     }
@@ -575,7 +636,8 @@ bool MongoInterfaceStandalone::fieldsHaveSupportingUniqueIndex(
     Lock::CollectionLock collLock(opCtx, nss, MODE_IS);
     auto databaseHolder = DatabaseHolder::get(opCtx);
     auto db = databaseHolder->getDb(opCtx, nss.db());
-    auto collection = db ? CollectionCatalog::get(opCtx).lookupCollectionByNamespace(nss) : nullptr;
+    auto collection =
+        db ? CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss) : nullptr;
     if (!collection) {
         return fieldPaths == std::set<FieldPath>{"_id"};
     }

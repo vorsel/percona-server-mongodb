@@ -229,6 +229,7 @@ function testCommandAfterDropRecreateDatabase(testCase, st) {
 let testCases = {
     _hashBSONElement: {skip: "executes locally on mongos (not sent to any remote node)"},
     _isSelf: {skip: "executes locally on mongos (not sent to any remote node)"},
+    _killOperations: {skip: "executes locally on mongos (not sent to any remote node)"},
     _mergeAuthzCollections: {skip: "always targets the config server"},
     abortTransaction: {skip: "unversioned and uses special targetting rules"},
     addShard: {skip: "not on a user database"},
@@ -252,6 +253,7 @@ let testCases = {
     },
     authenticate: {skip: "does not forward command to primary shard"},
     availableQueryOptions: {skip: "executes locally on mongos (not sent to any remote node)"},
+    balancerCollectionStatus: {skip: "does not forward command to primary shard"},
     balancerStart: {skip: "not on a user database"},
     balancerStatus: {skip: "not on a user database"},
     balancerStop: {skip: "not on a user database"},
@@ -547,7 +549,40 @@ let testCases = {
     logApplicationMessage: {skip: "not on a user database", conditional: true},
     logRotate: {skip: "executes locally on mongos (not sent to any remote node)"},
     logout: {skip: "not on a user database"},
-    mapReduce: {skip: "TODO (SERVER-41953)"},
+    mapReduce: {
+        run: {
+            sendsDbVersion: true,
+            command: function(dbName, collName) {
+                return {
+                    mapReduce: collName,
+                    map: function mapFunc() {
+                        emit(this.x, 1);
+                    },
+                    reduce: function reduceFunc(key, values) {
+                        return Array.sum(values);
+                    },
+                    out: "inline"
+                };
+            }
+        },
+        explain: {
+            sendsDbVersion: true,
+            command: function(dbName, collName) {
+                return {
+                    explain: {
+                        mapReduce: collName,
+                        map: function mapFunc() {
+                            emit(this.x, 1);
+                        },
+                        reduce: function reduceFunc(key, values) {
+                            return Array.sum(values);
+                        },
+                        out: "inline"
+                    }
+                };
+            }
+        }
+    },
     mergeChunks: {skip: "does not forward command to primary shard"},
     moveChunk: {skip: "does not forward command to primary shard"},
     movePrimary: {skip: "reads primary shard from sharding catalog with readConcern: local"},
@@ -575,29 +610,6 @@ let testCases = {
             sendsDbVersion: true,
             command: function(dbName, collName) {
                 return {planCacheListFilters: collName};
-            }
-        }
-    },
-    planCacheListPlans: {
-        run: {
-            sendsDbVersion: true,
-            setUp: function(mongosConn, dbName, collName) {
-                // Expects the collection to exist, and doesn't implicitly create it.
-                assert.commandWorked(mongosConn.getDB(dbName).runCommand({create: collName}));
-            },
-            command: function(dbName, collName) {
-                return {planCacheListPlans: collName, query: {_id: "A"}};
-            },
-            cleanUp: function(mongosConn, dbName, collName) {
-                assert(mongosConn.getDB(dbName).getCollection(collName).drop());
-            }
-        }
-    },
-    planCacheListQueryShapes: {
-        run: {
-            sendsDbVersion: true,
-            command: function(dbName, collName) {
-                return {planCacheListQueryShapes: collName};
             }
         }
     },

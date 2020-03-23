@@ -35,4 +35,17 @@ namespace mongo::logv2::constants {
 // memory.
 constexpr size_t kNumStaticAttrs = 16;
 
+// Field names used in the JSON and BSON formatter
+constexpr StringData kTimestampFieldName = "t"_sd;
+constexpr StringData kSeverityFieldName = "s"_sd;
+constexpr StringData kComponentFieldName = "c"_sd;
+constexpr StringData kContextFieldName = "ctx"_sd;
+constexpr StringData kIdFieldName = "id"_sd;
+constexpr StringData kMessageFieldName = "msg"_sd;
+constexpr StringData kAttributesFieldName = "attr"_sd;
+constexpr StringData kTagsFieldName = "tags"_sd;
+
+// String to be used when logging empty boost::optional with the text formatter
+constexpr StringData kNullOptionalString = "(nothing)"_sd;
+
 }  // namespace mongo::logv2::constants

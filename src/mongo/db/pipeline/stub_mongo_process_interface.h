@@ -46,10 +46,6 @@ class StubMongoProcessInterface : public MongoProcessInterface {
 public:
     virtual ~StubMongoProcessInterface() = default;
 
-    void setOperationContext(OperationContext* opCtx) override {
-        MONGO_UNREACHABLE;
-    }
-
     std::unique_ptr<TransactionHistoryIteratorBase> createTransactionHistoryIterator(
         repl::OpTime time) const override {
         MONGO_UNREACHABLE;
@@ -77,8 +73,10 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    CollectionIndexUsageMap getIndexStats(OperationContext* opCtx,
-                                          const NamespaceString& ns) override {
+    std::vector<Document> getIndexStats(OperationContext* opCtx,
+                                        const NamespaceString& ns,
+                                        StringData host,
+                                        bool addShardName) override {
         MONGO_UNREACHABLE;
     }
 
@@ -133,9 +131,9 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    void createIndexes(OperationContext* opCtx,
-                       const NamespaceString& ns,
-                       const std::vector<BSONObj>& indexSpecs) override {
+    void createIndexesOnEmptyCollection(OperationContext* opCtx,
+                                        const NamespaceString& ns,
+                                        const std::vector<BSONObj>& indexSpecs) override {
         MONGO_UNREACHABLE;
     }
     void dropCollection(OperationContext* opCtx, const NamespaceString& ns) override {
@@ -178,6 +176,10 @@ public:
         MONGO_UNREACHABLE;
     }
 
+    std::string getHostAndPort(OperationContext* opCtx) const override {
+        MONGO_UNREACHABLE;
+    }
+
     std::pair<std::vector<FieldPath>, bool> collectDocumentKeyFieldsForHostedCollection(
         OperationContext*, const NamespaceString&, UUID) const override {
         MONGO_UNREACHABLE;
@@ -204,9 +206,7 @@ public:
     }
 
     BackupCursorState openBackupCursor(OperationContext* opCtx,
-                                       bool incrementalBackup,
-                                       boost::optional<std::string> thisBackupName,
-                                       boost::optional<std::string> srcBackupName) final {
+                                       const StorageEngine::BackupOptions& options) final {
         return BackupCursorState{UUID::gen(), boost::none, {}};
     }
 

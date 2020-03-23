@@ -24,8 +24,10 @@ assert.commandWorked(st.s.adminCommand({split: ns, middle: {x: 50}}));
 const collectionUuid = getUUIDFromConfigCollections(st.s, ns);
 
 let deletionTask = {
+    _id: UUID(),
     nss: ns,
     collectionUuid: collectionUuid,
+    donorShardId: "unused",
     pending: true,
     range: {min: {x: 70}, max: {x: 90}},
     whenToClean: "now"
@@ -37,14 +39,10 @@ let deletionsColl = st.shard1.getCollection(rangeDeletionNs);
 // Write range to deletion collection
 deletionsColl.insert(deletionTask);
 
-function commandFailsWithMsg(result, msg) {
-    assert(result.errmsg.includes(msg));
-}
-
-// Move chunk [50, inf) to shard1 and expect failure.
-commandFailsWithMsg(
-    st.s.adminCommand({moveChunk: ns, find: {x: 50}, to: st.shard1.shardName}),
-    "Migration aborted because range overlaps with a range that is scheduled for deletion: collection:");
+// Move chunk [50, inf) to shard1 and expect timeout failure.
+const result = assert.commandFailedWithCode(
+    st.s.adminCommand({moveChunk: ns, find: {x: 50}, to: st.shard1.shardName, maxTimeMS: 5000}),
+    ErrorCodes.MaxTimeMSExpired);
 
 st.stop();
 })();

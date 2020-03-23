@@ -1258,9 +1258,9 @@ TEST_F(QueryPlannerTest, NoFetchStageWhenSingleFieldSortIsCoveredByIndex) {
                  "sort: {b: 1}}"));
     assertNumSolutions(1U);
     assertSolutionExists(
-        "{proj: {spec: {a: 1, b:1, _id: 0}, node: {sort: {pattern: {b: 1}, limit: 0, node: "
-        "{sortKeyGen:{node: {ixscan: "
-        "{pattern: {a: 1, b: 1}}}}}}}}}");
+        "{sort: {pattern: {b: 1}, limit: 0, node: {sortKeyGen: {node:"
+        "{proj: {spec: {a: 1, b: 1, _id: 0}, node:"
+        "{ixscan: {pattern: {a: 1, b: 1}}}}}}}}}");
 }
 
 TEST_F(QueryPlannerTest, NoFetchStageWhenTwoFieldAscendingSortIsCoveredByIndex) {
@@ -1273,9 +1273,9 @@ TEST_F(QueryPlannerTest, NoFetchStageWhenTwoFieldAscendingSortIsCoveredByIndex) 
                  "sort: {b: 1, a: 1}}"));
     assertNumSolutions(1U);
     assertSolutionExists(
-        "{proj: {spec: {a: 1, b:1, _id: 0}, node: {sort: {pattern: {b: 1, a: 1}, limit: 0, node: "
-        "{sortKeyGen:{node: {ixscan: "
-        "{pattern: {a: 1, b: 1}}}}}}}}}");
+        "{sort: {pattern: {b: 1, a: 1}, limit: 0, node: {sortKeyGen: {node:"
+        "{proj: {spec: {a: 1, b: 1, _id: 0}, node:"
+        "{ixscan: {pattern: {a: 1, b: 1}}}}}}}}}");
 }
 
 TEST_F(QueryPlannerTest, NoFetchStageWhenTwoFieldMixedSortOrderSortIsCoveredByIndex) {
@@ -1288,9 +1288,8 @@ TEST_F(QueryPlannerTest, NoFetchStageWhenTwoFieldMixedSortOrderSortIsCoveredByIn
                  "sort: {b: 1, a: -1}}"));
     assertNumSolutions(1U);
     assertSolutionExists(
-        "{proj: {spec: {a: 1, b:1, _id: 0}, node: {sort: {pattern: {b: 1, a: -1}, limit: 0, node: "
-        "{sortKeyGen:{node: {ixscan: "
-        "{pattern: {a: 1, b: 1}}}}}}}}}");
+        "{sort: {pattern: {b: 1, a: -1}, limit: 0, node: {sortKeyGen: {node:"
+        "{proj: {spec: {a: 1, b: 1, _id: 0}, node: {ixscan: {pattern: {a: 1, b: 1}}}}}}}}}");
 }
 
 TEST_F(QueryPlannerTest, MustFetchWhenNotAllSortKeysAreCoveredByIndex) {
@@ -1410,6 +1409,20 @@ TEST_F(QueryPlannerTest, MustFetchWhenExpressionUsesROOT) {
     assertSolutionExists(
         "{proj: {spec: {_id: 0, x: '$$ROOT'}, node: "
         "{fetch: {node: {ixscan: {pattern: {a: 1, b: 1}}}}}}}");
+}
+
+TEST_F(QueryPlannerTest, PlansForWholeIndexScanWithSortAreGenerated) {
+    params.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
+    addIndex(BSON("a" << 1));
+    addIndex(BSON("a" << 1 << "b" << 1));
+
+    runQueryAsCommand(
+        fromjson("{find: 'testns', filter: {}, projection: {'b': 1, _id: 0}, sort: {'a': 1}}"));
+    assertNumSolutions(2U);
+    assertSolutionExists(
+        "{proj: {spec: {'b': 1, _id: 0}, node: {ixscan: {pattern: {a: 1, b: 1}}}}}");
+    assertSolutionExists(
+        "{proj: {spec: {'b': 1, _id: 0}, node: {fetch: {node: {ixscan: {pattern: {a: 1}}}}}}}");
 }
 
 }  // namespace

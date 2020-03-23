@@ -59,6 +59,13 @@ namespace repl {
 class OpTime;
 }
 
+struct CollectionOptionsAndIndexes {
+    UUID uuid;
+    std::vector<BSONObj> indexSpecs;
+    BSONObj idIndexSpec;
+    BSONObj options;
+};
+
 /**
  * Drives the receiving side of the MongoD migration process. One instance exists per shard.
  */
@@ -129,11 +136,19 @@ public:
     Status startCommit(const MigrationSessionId& sessionId);
 
     /**
-     * Creates the collection nss on the shard and clones the indexes and options from fromShardId.
+     * Gets the collection uuid, options and indexes from fromShardId.
      */
-    static void cloneCollectionIndexesAndOptions(OperationContext* opCtx,
-                                                 const NamespaceString& nss,
-                                                 const ShardId& fromShardId);
+    static CollectionOptionsAndIndexes getCollectionIndexesAndOptions(OperationContext* opCtx,
+                                                                      const NamespaceString& nss,
+                                                                      const ShardId& fromShardId);
+
+    /**
+     * Creates the collection on the shard and clones the indexes and options.
+     */
+    static void cloneCollectionIndexesAndOptions(
+        OperationContext* opCtx,
+        const NamespaceString& nss,
+        const CollectionOptionsAndIndexes& collectionOptionsAndIndexes);
 
 private:
     /**
@@ -160,8 +175,7 @@ private:
      * it schedules deletion of any documents in the range, so that process must be seen to be
      * complete before migrating any new documents in.
      */
-    CollectionShardingRuntime::CleanupNotification _notePending(OperationContext*,
-                                                                ChunkRange const&);
+    SharedSemiFuture<void> _notePending(OperationContext*, ChunkRange const&);
 
     /**
      * Stops tracking a chunk range between 'min' and 'max' that previously was having data
@@ -188,6 +202,9 @@ private:
 
     stdx::thread _migrateThreadHandle;
 
+    bool _useFCV44Protocol{false};
+
+    UUID _migrationId;
     NamespaceString _nss;
     ConnectionString _fromShardConnString;
     ShardId _fromShard;

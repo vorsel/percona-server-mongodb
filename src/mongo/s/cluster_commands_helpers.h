@@ -95,7 +95,10 @@ BSONObj appendAllowImplicitCreate(BSONObj cmdObj, bool allow);
  * Returns a copy of 'cmdObj' with the read/writeConcern from the OpCtx appended, unless the
  * cmdObj explicitly specifies read/writeConcern.
  */
-BSONObj applyReadWriteConcern(OperationContext* opCtx, bool appendWC, const BSONObj& cmdObj);
+BSONObj applyReadWriteConcern(OperationContext* opCtx,
+                              bool appendRC,
+                              bool appendWC,
+                              const BSONObj& cmdObj);
 
 /**
  * Convenience versions of applyReadWriteConcern() for calling from within
@@ -184,6 +187,20 @@ AsyncRequestsSender::Response executeCommandAgainstDatabasePrimary(
     Shard::RetryPolicy retryPolicy);
 
 /**
+ * Utility for dispatching commands against the shard with the MinKey chunk for the namespace and
+ * attaching the appropriate shard version.
+ *
+ * Does not retry on StaleConfigException.
+ */
+AsyncRequestsSender::Response executeCommandAgainstShardWithMinKeyChunk(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const CachedCollectionRoutingInfo& routingInfo,
+    const BSONObj& cmdObj,
+    const ReadPreferenceSetting& readPref,
+    Shard::RetryPolicy retryPolicy);
+
+/**
  * Attaches each shard's response or error status by the shard's connection string in a top-level
  * field called 'raw' in 'output'.
  *
@@ -244,6 +261,18 @@ std::set<ShardId> getTargetedShardsForQuery(OperationContext* opCtx,
                                             const BSONObj& collation);
 
 /**
+ * Determines the shard(s) to which the given query will be targeted, and builds a separate
+ * versioned copy of the command object for each such shard.
+ */
+std::vector<std::pair<ShardId, BSONObj>> getVersionedRequestsForTargetedShards(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const CachedCollectionRoutingInfo& routingInfo,
+    const BSONObj& cmdObj,
+    const BSONObj& query,
+    const BSONObj& collation);
+
+/**
  * If the command is running in a transaction, returns the proper routing table to use for targeting
  * shards. If there is no active transaction or the transaction is not running with snapshot level
  * read concern, the latest routing table is returned, otherwise a historical routing table is
@@ -253,13 +282,5 @@ std::set<ShardId> getTargetedShardsForQuery(OperationContext* opCtx,
  */
 StatusWith<CachedCollectionRoutingInfo> getCollectionRoutingInfoForTxnCmd(
     OperationContext* opCtx, const NamespaceString& nss);
-
-/**
- * Utility for dispatching a command on a namespace that is sent to all shards. If all shards return
- * CannotImplicitlyCreateCollection, will throw. If at least one shard succeeds, will ignore
- * CannotImplicitlyCreateCollection errors.
- */
-std::vector<AsyncRequestsSender::Response> dispatchCommandAssertCollectionExistsOnAtLeastOneShard(
-    OperationContext* opCtx, const NamespaceString& nss, const BSONObj& cmdObj);
 
 }  // namespace mongo

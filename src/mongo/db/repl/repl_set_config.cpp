@@ -44,6 +44,9 @@
 namespace mongo {
 namespace repl {
 
+// Allow the heartbeat interval to be forcibly overridden on this node.
+MONGO_FAIL_POINT_DEFINE(forceHeartbeatIntervalMS);
+
 const size_t ReplSetConfig::kMaxMembers;
 const size_t ReplSetConfig::kMaxVotingMembers;
 const Milliseconds ReplSetConfig::kInfiniteCatchUpTimeout(-1);
@@ -52,6 +55,7 @@ const Milliseconds ReplSetConfig::kCatchUpTakeoverDisabled(-1);
 
 const std::string ReplSetConfig::kConfigServerFieldName = "configsvr";
 const std::string ReplSetConfig::kVersionFieldName = "version";
+const std::string ReplSetConfig::kTermFieldName = "term";
 const std::string ReplSetConfig::kMajorityWriteConcernModeName = "$majority";
 const Milliseconds ReplSetConfig::kDefaultHeartbeatInterval(2000);
 const Seconds ReplSetConfig::kDefaultHeartbeatTimeoutPeriod(10);
@@ -73,6 +77,7 @@ const std::string kWriteConcernMajorityJournalDefaultFieldName =
 
 const std::string kLegalConfigTopFieldNames[] = {kIdFieldName,
                                                  ReplSetConfig::kVersionFieldName,
+                                                 ReplSetConfig::kTermFieldName,
                                                  kMembersFieldName,
                                                  kSettingsFieldName,
                                                  kProtocolVersionFieldName,
@@ -91,15 +96,20 @@ const std::string kCatchUpTakeoverDelayFieldName = "catchUpTakeoverDelayMillis";
 
 }  // namespace
 
-Status ReplSetConfig::initialize(const BSONObj& cfg, OID defaultReplicaSetId) {
-    return _initialize(cfg, false, defaultReplicaSetId);
+Status ReplSetConfig::initialize(const BSONObj& cfg,
+                                 boost::optional<long long> forceTerm,
+                                 OID defaultReplicaSetId) {
+    return _initialize(cfg, false, forceTerm, defaultReplicaSetId);
 }
 
 Status ReplSetConfig::initializeForInitiate(const BSONObj& cfg) {
-    return _initialize(cfg, true, OID());
+    return _initialize(cfg, true, OpTime::kInitialTerm, OID());
 }
 
-Status ReplSetConfig::_initialize(const BSONObj& cfg, bool forInitiate, OID defaultReplicaSetId) {
+Status ReplSetConfig::_initialize(const BSONObj& cfg,
+                                  bool forInitiate,
+                                  boost::optional<long long> forceTerm,
+                                  OID defaultReplicaSetId) {
     _isInitialized = false;
     _members.clear();
 
@@ -125,6 +135,21 @@ Status ReplSetConfig::_initialize(const BSONObj& cfg, bool forInitiate, OID defa
     status = bsonExtractIntegerField(cfg, kVersionFieldName, &_version);
     if (!status.isOK())
         return status;
+
+    //
+    // Set term
+    //
+    if (forceTerm != boost::none) {
+        // Set term to the value explicitly passed in.
+        _term = forceTerm.get();
+    } else {
+        // Parse term if an explicit term was not passed in. If we cannot find a term to parse,
+        // default to -1.
+        status = bsonExtractIntegerFieldWithDefault(
+            cfg, kTermFieldName, OpTime::kUninitializedTerm, &_term);
+        if (!status.isOK())
+            return status;
+    }
 
     //
     // Parse members
@@ -408,6 +433,11 @@ Status ReplSetConfig::validate() const {
         return Status(ErrorCodes::BadValue,
                       str::stream() << kVersionFieldName << " field value of " << _version
                                     << " is out of range");
+    }
+    if (_term < -1 || _term > std::numeric_limits<int>::max()) {
+        return Status(ErrorCodes::BadValue,
+                      str::stream()
+                          << kTermFieldName << " field value of " << _term << " is out of range");
     }
     if (_replSetName.empty()) {
         return Status(ErrorCodes::BadValue,
@@ -743,7 +773,12 @@ const MemberConfig* ReplSetConfig::findMemberByHostAndPort(const HostAndPort& ha
 }
 
 Milliseconds ReplSetConfig::getHeartbeatInterval() const {
-    return _heartbeatInterval;
+    auto heartbeatInterval = _heartbeatInterval;
+    forceHeartbeatIntervalMS.execute([&](const BSONObj& data) {
+        auto intervalMS = data["intervalMS"].numberInt();
+        heartbeatInterval = Milliseconds(intervalMS);
+    });
+    return heartbeatInterval;
 }
 
 bool ReplSetConfig::isLocalHostAllowed() const {
@@ -828,6 +863,9 @@ BSONObj ReplSetConfig::toBSON() const {
     BSONObjBuilder configBuilder;
     configBuilder.append(kIdFieldName, _replSetName);
     configBuilder.appendIntOrLL(kVersionFieldName, _version);
+    // TODO (SERVER-45408): Enable serialization of the config "term" field once we can handle it
+    // properly in upgrade/downgrade scenarios.
+    // configBuilder.appendIntOrLL(kTermFieldName, _term);
     if (_configServer) {
         // Only include "configsvr" field if true
         configBuilder.append(kConfigServerFieldName, _configServer);

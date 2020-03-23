@@ -52,6 +52,37 @@ class StatusWith;
  */
 class QueryRequest {
 public:
+    static const char kFilterField[];
+    static const char kProjectionField[];
+    static const char kSortField[];
+    static const char kHintField[];
+    static const char kCollationField[];
+    static const char kSkipField[];
+    static const char kLimitField[];
+    static const char kBatchSizeField[];
+    static const char kNToReturnField[];
+    static const char kSingleBatchField[];
+    static const char kMaxField[];
+    static const char kMinField[];
+    static const char kReturnKeyField[];
+    static const char kShowRecordIdField[];
+    static const char kTailableField[];
+    static const char kOplogReplayField[];
+    static const char kNoCursorTimeoutField[];
+    static const char kAwaitDataField[];
+    static const char kPartialResultsField[];
+    static const char kRuntimeConstantsField[];
+    static const char kTermField[];
+    static const char kOptionsField[];
+    static const char kReadOnceField[];
+    static const char kAllowSpeculativeMajorityReadField[];
+    static const char kInternalReadAtClusterTimeField[];
+    static const char kRequestResumeTokenField[];
+    static const char kResumeAfterField[];
+    static const char kUse44SortKeys[];
+
+    static const char kNaturalSortField[];
+
     static const char kFindCommandName[];
     static const char kShardVersionField[];
 
@@ -108,15 +139,6 @@ public:
      * Example: {a: {$meta: "textScore"}}
      */
     static bool isTextScoreMeta(BSONElement elt);
-
-    /**
-     * Helper function to validate a sort object.
-     * Returns true if each element satisfies one of:
-     * 1. a number with value 1
-     * 2. a number with value -1
-     * 3. isTextScoreMeta
-     */
-    static bool isValidSortOrder(const BSONObj& sortObj);
 
     // Read preference is attached to commands in "wrapped" form, e.g.
     //   { $query: { <cmd>: ... } , <kWrappedReadPrefField>: { ... } }
@@ -180,7 +202,12 @@ public:
     }
 
     const BSONObj& getReadConcern() const {
-        return _readConcern;
+        if (_readConcern) {
+            return *_readConcern;
+        } else {
+            static const auto empty = BSONObj();
+            return empty;
+        }
     }
 
     void setReadConcern(BSONObj readConcern) {
@@ -416,14 +443,21 @@ public:
         _requestResumeToken = requestResumeToken;
     }
 
-    const BSONObj& getResumeAfterResumeToken() const {
+    const BSONObj& getResumeAfter() const {
         return _resumeAfter;
     }
 
-    void setResumeAfterResumeToken(BSONObj resumeAfter) {
+    void setResumeAfter(BSONObj resumeAfter) {
         _resumeAfter = resumeAfter;
     }
 
+    bool use44SortKeys() const {
+        return _use44SortKeys;
+    }
+
+    void setUse44SortKeys(bool use44SortKeys) {
+        _use44SortKeys = use44SortKeys;
+    }
 
     /**
      * Return options as a bit vector.
@@ -495,7 +529,7 @@ private:
     // {$hint: <String>}, where <String> is the index name hinted.
     BSONObj _hint;
     // The read concern is parsed elsewhere.
-    BSONObj _readConcern;
+    boost::optional<BSONObj> _readConcern;
     // The collation is parsed elsewhere.
     BSONObj _collation;
 
@@ -562,6 +596,8 @@ private:
     // The Timestamp that RecoveryUnit::setTimestampReadSource() should be called with. The optional
     // should only ever be engaged when testing commands are enabled.
     boost::optional<Timestamp> _internalReadAtClusterTime;
+
+    bool _use44SortKeys = false;
 };
 
 }  // namespace mongo

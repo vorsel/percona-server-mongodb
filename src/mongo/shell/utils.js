@@ -275,6 +275,7 @@ jsTestOptions = function() {
             wiredTigerIndexConfigString: TestData.wiredTigerIndexConfigString,
             noJournal: TestData.noJournal,
             auth: TestData.auth,
+            logFormat: TestData.logFormat,
             // Note: keyFile is also used as a flag to indicate cluster auth is turned on, set it
             // to a truthy value if you'd like to do cluster auth, even if it's not keyFile auth.
             // Use clusterAuthMode to specify the actual auth mode you want to use.
@@ -314,6 +315,8 @@ jsTestOptions = function() {
             skipValidationNamespaces: TestData.skipValidationNamespaces || [],
             skipCheckingUUIDsConsistentAcrossCluster:
                 TestData.skipCheckingUUIDsConsistentAcrossCluster || false,
+            skipCheckingIndexesConsistentAcrossCluster:
+                TestData.skipCheckingIndexesConsistentAcrossCluster || false,
             skipCheckingCatalogCacheConsistencyWithShardingCatalog:
                 TestData.skipCheckingCatalogCacheConsistencyWithShardingCatalog || false,
             skipAwaitingReplicationOnShardsBeforeCheckingUUIDs:

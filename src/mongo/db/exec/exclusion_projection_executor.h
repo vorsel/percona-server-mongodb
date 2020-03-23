@@ -52,15 +52,24 @@ public:
 
     void reportDependencies(DepsTracker* deps) const final {
         // We have no dependencies on specific fields, since we only know the fields to be removed.
+        // We may have expression dependencies though, as $meta expression can be used with
+        // exclusion.
+        for (auto&& expressionPair : _expressions) {
+            expressionPair.second->addDependencies(deps);
+        }
+
+        for (auto&& childPair : _children) {
+            childPair.second->reportDependencies(deps);
+        }
     }
 
 protected:
-    std::unique_ptr<ProjectionNode> makeChild(std::string fieldName) const final {
+    std::unique_ptr<ProjectionNode> makeChild(const std::string& fieldName) const final {
         return std::make_unique<ExclusionNode>(
             _policies, FieldPath::getFullyQualifiedPath(_pathToNode, fieldName));
     }
-    Document initializeOutputDocument(const Document& inputDoc) const final {
-        return inputDoc;
+    MutableDocument initializeOutputDocument(const Document& inputDoc) const final {
+        return MutableDocument{inputDoc};
     }
     Value applyLeafProjectionToValue(const Value& value) const final {
         return Value();
@@ -79,7 +88,8 @@ protected:
 class ExclusionProjectionExecutor : public ProjectionExecutor {
 public:
     ExclusionProjectionExecutor(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                ProjectionPolicies policies)
+                                ProjectionPolicies policies,
+                                bool allowFastPath = false)
         : ProjectionExecutor(expCtx, policies), _root(new ExclusionNode(_policies)) {}
 
     TransformerType getType() const final {
@@ -107,6 +117,7 @@ public:
     }
 
     DepsTracker::State addDependencies(DepsTracker* deps) const final {
+        _root->reportDependencies(deps);
         if (_rootReplacementExpression) {
             _rootReplacementExpression->addDependencies(deps);
         }
@@ -123,6 +134,10 @@ public:
         std::set<std::string> modifiedPaths;
         _root->reportProjectedPaths(&modifiedPaths);
         return {DocumentSource::GetModPathsReturn::Type::kFiniteSet, std::move(modifiedPaths), {}};
+    }
+
+    boost::optional<std::set<FieldRef>> extractExhaustivePaths() const {
+        return boost::none;
     }
 
 private:

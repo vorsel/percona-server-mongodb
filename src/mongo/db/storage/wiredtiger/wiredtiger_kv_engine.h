@@ -56,6 +56,8 @@ class JournalListener;
 class WiredTigerRecordStore;
 class WiredTigerSessionCache;
 class WiredTigerSizeStorer;
+class WiredTigerEngineRuntimeConfigParameter;
+class WiredTigerMaxCacheOverflowSizeGBParameter;
 
 struct WiredTigerFileVersion {
     enum class StartupVersion { IS_34, IS_36, IS_40, IS_42, IS_44 };
@@ -164,7 +166,7 @@ public:
                                                                        const IndexDescriptor* desc,
                                                                        KVPrefix prefix) override;
 
-    Status dropIdent(OperationContext* opCtx, StringData ident) override;
+    Status dropIdent(OperationContext* opCtx, RecoveryUnit* ru, StringData ident) override;
 
     void keydbDropDatabase(const std::string& db) override;
 
@@ -180,8 +182,10 @@ public:
 
     void endBackup(OperationContext* opCtx) override;
 
-    StatusWith<std::vector<StorageEngine::BackupBlock>> beginNonBlockingBackup(
-        OperationContext* opCtx) override;
+    Status disableIncrementalBackup(OperationContext* opCtx) override;
+
+    StatusWith<StorageEngine::BackupInformation> beginNonBlockingBackup(
+        OperationContext* opCtx, const StorageEngine::BackupOptions& options) override;
 
     void endNonBlockingBackup(OperationContext* opCtx) override;
 
@@ -513,5 +517,8 @@ private:
     //
     // Access must be protected by the CheckpointLock.
     std::list<std::string> _checkpointedIndexes;
+
+    std::unique_ptr<WiredTigerEngineRuntimeConfigParameter> _runTimeConfigParam;
+    std::unique_ptr<WiredTigerMaxCacheOverflowSizeGBParameter> _maxCacheOverflowParam;
 };
 }  // namespace mongo

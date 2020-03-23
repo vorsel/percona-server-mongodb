@@ -1,24 +1,18 @@
 /**
  * Confirms that unique index builds on a primary are aborted when the node steps down during the
  * collection scan phase. This applies to both two phase and single phase index builds.
- * @tags: [requires_replication]
+ * TODO: Handle JSON logs. See SERVER-45140
+ * @tags: [requires_replication, requires_text_logs]
  */
 (function() {
 "use strict";
 
-load('jstests/libs/check_log.js');
 load('jstests/noPassthrough/libs/index_build.js');
 
 const rst = new ReplSetTest({
     nodes: [
         {},
-        {
-            // Disallow elections on secondary.
-            rsConfig: {
-                priority: 0,
-                votes: 0,
-            },
-        },
+        {},
     ]
 });
 const nodes = rst.startSet();

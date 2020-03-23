@@ -35,6 +35,7 @@
 #include <limits>
 
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/geo/geoconstants.h"
 #include "mongo/db/geo/s2.h"
 #include "mongo/db/index/expression_params.h"
@@ -126,6 +127,14 @@ const Interval kHashedUndefinedInterval = IndexBoundsBuilder::makePointInterval(
 const Interval kHashedNullInterval =
     IndexBoundsBuilder::makePointInterval(ExpressionMapping::hash(kNullElementObj.firstElement()));
 
+Interval makeUndefinedPointInterval(bool isHashed) {
+    return isHashed ? kHashedUndefinedInterval
+                    : IndexBoundsBuilder::makePointInterval(kUndefinedElementObj);
+}
+Interval makeNullPointInterval(bool isHashed) {
+    return isHashed ? kHashedNullInterval : IndexBoundsBuilder::makePointInterval(kNullElementObj);
+}
+
 void makeNullEqualityBounds(const IndexEntry& index,
                             bool isHashed,
                             OrderedIntervalList* oil,
@@ -135,11 +144,9 @@ void makeNullEqualityBounds(const IndexEntry& index,
     *tightnessOut = IndexBoundsBuilder::INEXACT_FETCH;
 
     // There are two values that could possibly be equal to null in an index: undefined and null.
-    oil->intervals.push_back(isHashed
-                                 ? kHashedUndefinedInterval
-                                 : IndexBoundsBuilder::makePointInterval(kUndefinedElementObj));
-    oil->intervals.push_back(isHashed ? kHashedNullInterval
-                                      : IndexBoundsBuilder::makePointInterval(kNullElementObj));
+    oil->intervals.push_back(makeUndefinedPointInterval(isHashed));
+    oil->intervals.push_back(makeNullPointInterval(isHashed));
+
     // Just to be sure, make sure the bounds are in the right order if the hash values are opposite.
     IndexBoundsBuilder::unionize(oil);
 }
@@ -379,6 +386,47 @@ void IndexBoundsBuilder::translate(const MatchExpression* expr,
     }
 }
 
+namespace {
+IndexBoundsBuilder::BoundsTightness computeTightnessForTypeSet(const MatcherTypeSet& typeSet,
+                                                               const IndexEntry& index) {
+    // The Array case will not be handled because a typeSet with Array should not reach this
+    // function
+    invariant(!typeSet.hasType(BSONType::Array));
+
+    // The String and Object types with collation require an inexact fetch.
+    if (index.collator != nullptr &&
+        (typeSet.hasType(BSONType::String) || typeSet.hasType(BSONType::Object))) {
+        return IndexBoundsBuilder::INEXACT_FETCH;
+    }
+
+    // Null and Undefined Types always require an inexact fetch.
+    if (typeSet.hasType(BSONType::jstNULL) || typeSet.hasType(BSONType::Undefined)) {
+        return IndexBoundsBuilder::INEXACT_FETCH;
+    }
+
+    const auto numberTypesIncluded = static_cast<int>(typeSet.hasType(BSONType::NumberInt)) +
+        static_cast<int>(typeSet.hasType(BSONType::NumberLong)) +
+        static_cast<int>(typeSet.hasType(BSONType::NumberDecimal)) +
+        static_cast<int>(typeSet.hasType(BSONType::NumberDouble));
+
+    // Checks that either all the number types are present or "number" is present in the type set.
+    const bool hasAllNumbers = (numberTypesIncluded == 4) || typeSet.allNumbers;
+    const bool hasAnyNumbers = numberTypesIncluded > 0;
+
+    if (hasAnyNumbers && !hasAllNumbers) {
+        return IndexBoundsBuilder::INEXACT_COVERED;
+    }
+
+    // This check is effectively typeSet.hasType(BSONType::String) XOR
+    // typeSet.hasType(BSONType::Symbol).
+    if ((typeSet.hasType(BSONType::String) != typeSet.hasType(BSONType::Symbol))) {
+        return IndexBoundsBuilder::INEXACT_COVERED;
+    }
+
+    return IndexBoundsBuilder::EXACT;
+}
+}  // namespace
+
 void IndexBoundsBuilder::_translatePredicate(const MatchExpression* expr,
                                              const BSONElement& elt,
                                              const IndexEntry& index,
@@ -394,10 +442,8 @@ void IndexBoundsBuilder::_translatePredicate(const MatchExpression* expr,
         isHashed = true;
     }
 
-    if (isHashed) {
-        invariant(MatchExpression::MATCH_IN == expr->matchType() ||
-                  ComparisonMatchExpressionBase::isEquality(expr->matchType()));
-    }
+    // We should never be asked to translate an unsupported predicate for a hashed index.
+    invariant(!isHashed || QueryPlannerIXSelect::nodeIsSupportedByHashedIndex(expr));
 
     if (MatchExpression::ELEM_MATCH_VALUE == expr->matchType()) {
         OrderedIntervalList acc;
@@ -433,13 +479,8 @@ void IndexBoundsBuilder::_translatePredicate(const MatchExpression* expr,
         if (MatchExpression::EXISTS == child->matchType()) {
             // We should never try to use a sparse index for $exists:false.
             invariant(!index.sparse);
-            BSONObjBuilder bob;
-            bob.appendNull("");
-            bob.appendNull("");
-            BSONObj dataObj = bob.obj();
-            oilOut->intervals.push_back(
-                makeRangeInterval(dataObj, BoundInclusion::kIncludeBothStartAndEndKeys));
-
+            // {$exists:false} is a point-interval on [null,null] that requires a fetch.
+            oilOut->intervals.push_back(makeNullPointInterval(isHashed));
             *tightnessOut = IndexBoundsBuilder::INEXACT_FETCH;
             return;
         }
@@ -454,8 +495,12 @@ void IndexBoundsBuilder::_translatePredicate(const MatchExpression* expr,
             *tightnessOut = IndexBoundsBuilder::EXACT;
         }
 
-        // If this invariant would fail, we would otherwise return incorrect query results.
-        invariant(*tightnessOut == IndexBoundsBuilder::EXACT);
+        // This disables indexed negation of array inequality.
+        // TODO: SERVER-45233 Perform correct behavior here once indexed array inequality without
+        // negation's semantics are correctly determined and implemented.
+        massert(ErrorCodes::InternalError,
+                "Indexed negation of array inequality not supported.",
+                *tightnessOut == IndexBoundsBuilder::EXACT);
 
         // If the index is multikey on this path, it doesn't matter what the tightness of the child
         // is, we must return INEXACT_FETCH. Consider a multikey index on 'a' with document
@@ -480,8 +525,10 @@ void IndexBoundsBuilder::_translatePredicate(const MatchExpression* expr,
         //
         // We can safely use an index in the following cases:
         // {a:{ $exists:true }} - normal index helps, but we must still fetch
+        // {a:{ $exists:true }} - hashed index helps, but we must still fetch
         // {a:{ $exists:true }} - sparse index is exact
         // {a:{ $exists:false }} - normal index requires a fetch
+        // {a:{ $exists:false }} - hashed index requires a fetch
         // {a:{ $exists:false }} - sparse indexes cannot be used at all.
         //
         // Noted in SERVER-12869, in case this ever changes some day.
@@ -702,15 +749,17 @@ void IndexBoundsBuilder::_translatePredicate(const MatchExpression* expr,
             BSONObjBuilder bob;
             bob.appendMinForType("", type);
             bob.appendMaxForType("", type);
-            oilOut->intervals.push_back(
-                makeRangeInterval(bob.obj(), BoundInclusion::kIncludeBothStartAndEndKeys));
+
+            // Types with variable width use the smallest value of the next type as their upper
+            // bound, so the upper bound needs to be excluded.
+            auto boundInclusionRule = BoundInclusion::kIncludeBothStartAndEndKeys;
+            if (isVariableWidthType(type)) {
+                boundInclusionRule = BoundInclusion::kIncludeStartKeyOnly;
+            }
+            oilOut->intervals.push_back(makeRangeInterval(bob.obj(), boundInclusionRule));
         }
 
-        // If we're only matching the "number" type, then the bounds are exact. Otherwise, the
-        // bounds may be inexact.
-        *tightnessOut = (tme->typeSet().isSingleType() && tme->typeSet().allNumbers)
-            ? IndexBoundsBuilder::EXACT
-            : IndexBoundsBuilder::INEXACT_FETCH;
+        *tightnessOut = computeTightnessForTypeSet(tme->typeSet(), index);
 
         // Sort the intervals, and merge redundant ones.
         unionize(oilOut);

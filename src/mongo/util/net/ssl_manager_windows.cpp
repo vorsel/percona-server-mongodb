@@ -1657,7 +1657,9 @@ StatusWith<std::vector<std::string>> getSubjectAlternativeNames(PCCERT_CONTEXT c
                 sa->sin6_family = AF_INET6;
                 memcpy(&(sa->sin6_addr), ipAddrStruct.pbData, ipAddrStruct.cbData);
             }
-            names.push_back(SockAddr(ss, sizeof(struct sockaddr_storage)).getAddr());
+            names.push_back(
+                SockAddr(reinterpret_cast<sockaddr*>(&ss), sizeof(struct sockaddr_storage))
+                    .getAddr());
         }
     }
     return names;
@@ -1862,6 +1864,8 @@ StatusWith<SSLPeerInfo> SSLManagerWindows::parseAndValidatePeerCertificate(
     boost::optional<std::string> sni,
     const std::string& remoteHost,
     const HostAndPort& hostForLogging) {
+    invariant(!sslGlobalParams.tlsCATrusts);
+
     PCCERT_CONTEXT cert;
 
     auto tlsVersionStatus = mapTLSVersion(ssl);

@@ -51,7 +51,7 @@ OplogApplier::OplogApplier(executor::TaskExecutor* executor,
                            Observer* observer,
                            const Options& options)
     : _executor(executor), _oplogBuffer(oplogBuffer), _observer(observer), _options(options) {
-    _opQueueBatcher = std::make_unique<OpQueueBatcher>(this, oplogBuffer);
+    _oplogBatcher = std::make_unique<OplogBatcher>(this, oplogBuffer);
 }
 
 OplogBuffer* OplogApplier::getBuffer() const {
@@ -96,8 +96,8 @@ void OplogApplier::waitForSpace(OperationContext* opCtx, std::size_t size) {
  * Pushes operations read from sync source into oplog buffer.
  */
 void OplogApplier::enqueue(OperationContext* opCtx,
-                           Operations::const_iterator begin,
-                           Operations::const_iterator end) {
+                           std::vector<OplogEntry>::const_iterator begin,
+                           std::vector<OplogEntry>::const_iterator end) {
     OplogBuffer::Batch batch;
     for (auto i = begin; i != end; ++i) {
         batch.push_back(i->getRaw());
@@ -115,7 +115,8 @@ void OplogApplier::enqueue(OperationContext* opCtx,
     _oplogBuffer->push(opCtx, begin, end);
 }
 
-StatusWith<OpTime> OplogApplier::applyOplogBatch(OperationContext* opCtx, Operations ops) {
+StatusWith<OpTime> OplogApplier::applyOplogBatch(OperationContext* opCtx,
+                                                 std::vector<OplogEntry> ops) {
     _observer->onBatchBegin(ops);
     auto lastApplied = _applyOplogBatch(opCtx, std::move(ops));
     _observer->onBatchEnd(lastApplied, {});
@@ -124,7 +125,7 @@ StatusWith<OpTime> OplogApplier::applyOplogBatch(OperationContext* opCtx, Operat
 
 StatusWith<std::vector<OplogEntry>> OplogApplier::getNextApplierBatch(
     OperationContext* opCtx, const BatchLimits& batchLimits) {
-    return _opQueueBatcher->getNextApplierBatch(opCtx, batchLimits);
+    return _oplogBatcher->getNextApplierBatch(opCtx, batchLimits);
 }
 
 const OplogApplier::Options& OplogApplier::getOptions() const {

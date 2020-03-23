@@ -63,15 +63,13 @@
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
-
-MONGO_FAIL_POINT_DEFINE(useRenameCollectionPathThroughConfigsvr);
-
 namespace {
 
+MONGO_FAIL_POINT_DEFINE(useRenameCollectionPathThroughConfigsvr);
 MONGO_FAIL_POINT_DEFINE(writeConflictInRenameCollCopyToTmp);
 
 boost::optional<NamespaceString> getNamespaceFromUUID(OperationContext* opCtx, const UUID& uuid) {
-    return CollectionCatalog::get(opCtx).lookupNSSByUUID(uuid);
+    return CollectionCatalog::get(opCtx).lookupNSSByUUID(opCtx, uuid);
 }
 
 bool isCollectionSharded(OperationContext* opCtx, const NamespaceString& nss) {
@@ -117,7 +115,7 @@ Status checkSourceAndTargetNamespaces(OperationContext* opCtx,
         return Status(ErrorCodes::NamespaceNotFound, "source namespace does not exist");
 
     Collection* const sourceColl =
-        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(source);
+        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, source);
     if (!sourceColl) {
         if (ViewCatalog::get(db)->lookup(opCtx, source.ns()))
             return Status(ErrorCodes::CommandNotSupportedOnView,
@@ -128,7 +126,8 @@ Status checkSourceAndTargetNamespaces(OperationContext* opCtx,
     BackgroundOperation::assertNoBgOpInProgForNs(source.ns());
     IndexBuildsCoordinator::get(opCtx)->assertNoIndexBuildInProgForCollection(sourceColl->uuid());
 
-    Collection* targetColl = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(target);
+    Collection* targetColl =
+        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, target);
 
     if (!targetColl) {
         if (ViewCatalog::get(db)->lookup(opCtx, target.ns()))
@@ -314,9 +313,9 @@ Status renameCollectionWithinDB(OperationContext* opCtx,
 
     auto db = DatabaseHolder::get(opCtx)->getDb(opCtx, source.db());
     Collection* const sourceColl =
-        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(source);
+        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, source);
     Collection* const targetColl =
-        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(target);
+        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, target);
 
     AutoStatsTracker statsTracker(opCtx,
                                   source,
@@ -356,7 +355,7 @@ Status renameCollectionWithinDBForApplyOps(OperationContext* opCtx,
 
     auto db = DatabaseHolder::get(opCtx)->getDb(opCtx, source.db());
     Collection* const sourceColl =
-        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(source);
+        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, source);
 
     AutoStatsTracker statsTracker(opCtx,
                                   source,
@@ -365,7 +364,8 @@ Status renameCollectionWithinDBForApplyOps(OperationContext* opCtx,
                                   db->getProfilingLevel());
 
     return writeConflictRetry(opCtx, "renameCollection", target.ns(), [&] {
-        Collection* targetColl = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(target);
+        Collection* targetColl =
+            CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, target);
         WriteUnitOfWork wuow(opCtx);
         if (targetColl) {
             if (sourceColl->uuid() == targetColl->uuid()) {
@@ -410,7 +410,7 @@ Status renameCollectionWithinDBForApplyOps(OperationContext* opCtx,
             if (collToDropBasedOnUUID && !collToDropBasedOnUUID->isDropPendingNamespace()) {
                 invariant(collToDropBasedOnUUID->db() == target.db());
                 targetColl = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
-                    *collToDropBasedOnUUID);
+                    opCtx, *collToDropBasedOnUUID);
             }
         }
 
@@ -482,7 +482,7 @@ Status renameBetweenDBs(OperationContext* opCtx,
                                                    sourceDB->getProfilingLevel());
 
     Collection* const sourceColl =
-        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(source);
+        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, source);
     if (!sourceColl) {
         if (sourceDB && ViewCatalog::get(sourceDB)->lookup(opCtx, source.ns()))
             return Status(ErrorCodes::CommandNotSupportedOnView,
@@ -508,8 +508,9 @@ Status renameBetweenDBs(OperationContext* opCtx,
     // Check if the target namespace exists and if dropTarget is true.
     // Return a non-OK status if target exists and dropTarget is not true or if the collection
     // is sharded.
-    Collection* targetColl =
-        targetDB ? CollectionCatalog::get(opCtx).lookupCollectionByNamespace(target) : nullptr;
+    Collection* targetColl = targetDB
+        ? CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, target)
+        : nullptr;
     if (targetColl) {
         if (sourceColl->uuid() == targetColl->uuid()) {
             invariant(source == target);
@@ -586,7 +587,8 @@ Status renameBetweenDBs(OperationContext* opCtx,
         }
     });
 
-    // Copy the index descriptions from the source collection.
+    // Copy the index descriptions from the source collection, adjusting the 'ns' field if
+    // necessary.
     std::vector<BSONObj> indexesToCopy;
     for (auto sourceIndIt = sourceColl->getIndexCatalog()->getIndexIterator(opCtx, true);
          sourceIndIt->more();) {
@@ -594,7 +596,28 @@ Status renameBetweenDBs(OperationContext* opCtx,
         if (descriptor->isIdIndex()) {
             continue;
         }
-        indexesToCopy.push_back(descriptor->infoObj());
+
+        const BSONObj currIndex = descriptor->infoObj();
+
+        // In FCV 4.4, there is no 'ns' field to modify.
+        if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+            serverGlobalParams.featureCompatibility.getVersion() ==
+                ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
+            indexesToCopy.push_back(currIndex);
+            continue;
+        }
+
+        // In FCV 4.2, we must rename the 'ns' field if it exists.
+        // Process the source index, adding fields in the same order as they were originally.
+        BSONObjBuilder newIndex;
+        for (auto&& elem : currIndex) {
+            if (elem.fieldNameStringData() == "ns") {
+                newIndex.append("ns", tmpName.ns());
+            } else {
+                newIndex.append(elem);
+            }
+        }
+        indexesToCopy.push_back(newIndex.obj());
     }
 
     // Create indexes using the index specs on the empty temporary collection that was just created.
@@ -716,7 +739,7 @@ void doLocalRenameIfOptionsAndIndexesHaveNotChanged(OperationContext* opCtx,
                                                     BSONObj originalCollectionOptions) {
     AutoGetDb dbLock(opCtx, targetNs.db(), MODE_X);
     auto collection = dbLock.getDb()
-        ? CollectionCatalog::get(opCtx).lookupCollectionByNamespace(targetNs)
+        ? CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, targetNs)
         : nullptr;
     BSONObj collectionOptions = {};
     if (collection) {
@@ -851,7 +874,7 @@ Status renameCollectionForApplyOps(OperationContext* opCtx,
     NamespaceString sourceNss(sourceNsElt.valueStringData());
     NamespaceString targetNss(targetNsElt.valueStringData());
     if (uuidToRename) {
-        auto nss = CollectionCatalog::get(opCtx).lookupNSSByUUID(uuidToRename.get());
+        auto nss = CollectionCatalog::get(opCtx).lookupNSSByUUID(opCtx, uuidToRename.get());
         if (nss)
             sourceNss = *nss;
     }

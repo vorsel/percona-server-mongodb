@@ -62,9 +62,7 @@ public:
     virtual void fsyncUnlock(OperationContext* opCtx);
 
     virtual BackupCursorState openBackupCursor(OperationContext* opCtx,
-                                               bool incrementalBackup,
-                                               boost::optional<std::string> thisBackupName,
-                                               boost::optional<std::string> srcBackupName);
+                                               const StorageEngine::BackupOptions& options);
 
     virtual void closeBackupCursor(OperationContext* opCtx, const UUID& backupId);
 

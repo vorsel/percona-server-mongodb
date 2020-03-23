@@ -41,7 +41,7 @@ namespace mongo::projection_executor {
  * level inclusions or additions, with any child InclusionNodes representing dotted or nested
  * inclusions or additions.
  */
-class InclusionNode final : public ProjectionNode {
+class InclusionNode : public ProjectionNode {
 public:
     InclusionNode(ProjectionPolicies policies, std::string pathToNode = "")
         : ProjectionNode(policies, std::move(pathToNode)) {}
@@ -55,10 +55,10 @@ public:
             deps->fields.insert(FieldPath::getFullyQualifiedPath(_pathToNode, includedField));
         }
 
-        if (!_pathToNode.empty() && !_expressions.empty()) {
-            // The shape of any computed fields in the output will change depending on if the field
-            // is an array or not, so in addition to any dependencies of the expression itself, we
-            // need to add this field to our dependencies.
+        if (!_pathToNode.empty() && _subtreeContainsComputedFields) {
+            // The shape of any computed fields in the output will change depending on if there are
+            // any arrays on the path to the expression.  In addition to any dependencies of the
+            // expression itself, we need to add this field to our dependencies.
             deps->fields.insert(_pathToNode);
         }
 
@@ -71,18 +71,27 @@ public:
         }
     }
 
+    boost::optional<size_t> maxFieldsToProject() const override {
+        return _children.size() + _projectedFields.size();
+    }
+
 protected:
     // For inclusions, we can apply an optimization here by simply appending to the output document
     // via MutableDocument::addField, rather than always checking for existing fields via setField.
     void outputProjectedField(StringData field, Value val, MutableDocument* outputDoc) const final {
         outputDoc->addField(field, val);
     }
-    std::unique_ptr<ProjectionNode> makeChild(std::string fieldName) const final {
+    std::unique_ptr<ProjectionNode> makeChild(const std::string& fieldName) const override {
         return std::make_unique<InclusionNode>(
             _policies, FieldPath::getFullyQualifiedPath(_pathToNode, fieldName));
     }
-    Document initializeOutputDocument(const Document& inputDoc) const final {
-        return {};
+    MutableDocument initializeOutputDocument(const Document& inputDoc) const final {
+        // Technically this value could be min(number of projected fields, size of input
+        // document). However, the size() function on Document() can take linear time, so we just
+        // allocate the number of projected fields.
+        const auto maxPossibleResultingFields =
+            _children.size() + _expressions.size() + _projectedFields.size();
+        return MutableDocument{maxPossibleResultingFields};
     }
     Value applyLeafProjectionToValue(const Value& value) const final {
         return value;
@@ -90,6 +99,33 @@ protected:
     Value transformSkippedValueForOutput(const Value& value) const final {
         return Value();
     }
+};
+
+/**
+ * A fast-path inclusion projection implementation which applies a BSON-to-BSON transformation
+ * rather than constructing an output document using the Document/Value API. For inclusion-only
+ * projections (which are projections without expressions, metadata, find-only expressions ($slice,
+ * $elemMatch, and positional), and not requiring an entire document) it can be much faster than the
+ * default InclusionNode implementation. On a document-by-document basis, if the fast-path
+ * projection cannot be applied to the input document, it will fall back to the default
+ * implementation.
+ */
+class FastPathEligibleInclusionNode final : public InclusionNode {
+public:
+    FastPathEligibleInclusionNode(ProjectionPolicies policies, std::string pathToNode = "")
+        : InclusionNode(policies, std::move(pathToNode)) {}
+
+    Document applyToDocument(const Document& inputDoc) const final;
+
+protected:
+    std::unique_ptr<ProjectionNode> makeChild(const std::string& fieldName) const final {
+        return std::make_unique<FastPathEligibleInclusionNode>(
+            _policies, FieldPath::getFullyQualifiedPath(_pathToNode, fieldName));
+    }
+
+private:
+    void _applyProjections(BSONObj bson, BSONObjBuilder* bob) const;
+    void _applyProjectionsToArray(BSONObj array, BSONArrayBuilder* bab) const;
 };
 
 /**
@@ -106,9 +142,13 @@ public:
         : ProjectionExecutor(expCtx, policies), _root(std::move(root)) {}
 
     InclusionProjectionExecutor(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                ProjectionPolicies policies)
-        : InclusionProjectionExecutor(expCtx, policies, std::make_unique<InclusionNode>(policies)) {
-    }
+                                ProjectionPolicies policies,
+                                bool allowFastPath = false)
+        : InclusionProjectionExecutor(
+              expCtx,
+              policies,
+              allowFastPath ? std::make_unique<FastPathEligibleInclusionNode>(policies)
+                            : std::make_unique<InclusionNode>(policies)) {}
 
     TransformerType getType() const final {
         return TransformerType::kInclusionProjection;
@@ -183,6 +223,21 @@ public:
      */
     Document applyProjection(const Document& inputDoc) const final {
         return _root->applyToDocument(inputDoc);
+    }
+
+    /**
+     * Returns the exhaustive set of all paths that will be preserved by this projection, or
+     * boost::none if the exhaustive set cannot be determined.
+     */
+    boost::optional<std::set<FieldRef>> extractExhaustivePaths() const override {
+        std::set<FieldRef> exhaustivePaths;
+        DepsTracker depsTracker;
+        addDependencies(&depsTracker);
+        for (auto&& field : depsTracker.fields) {
+            exhaustivePaths.insert(FieldRef{field});
+        }
+
+        return exhaustivePaths;
     }
 
 private:

@@ -262,7 +262,7 @@ void CurOp::reportCurrentOpForClient(OperationContext* opCtx,
     }
 
     // Fill out the rest of the BSONObj with opCtx specific details.
-    infoBuilder->appendBool("active", static_cast<bool>(clientOpCtx));
+    infoBuilder->appendBool("active", client->hasAnyActiveCurrentOp());
     infoBuilder->append("currentOpTime",
                         opCtx->getServiceContext()->getPreciseClockSource()->now().toString());
 
@@ -294,6 +294,11 @@ void CurOp::reportCurrentOpForClient(OperationContext* opCtx,
 
     if (clientOpCtx) {
         infoBuilder->append("opid", static_cast<int>(clientOpCtx->getOpID()));
+
+        if (auto opKey = clientOpCtx->getOperationKey()) {
+            opKey->appendToBuilder(infoBuilder, "operationKey");
+        }
+
         if (clientOpCtx->isKillPending()) {
             infoBuilder->append("killPending", true);
         }
@@ -442,6 +447,9 @@ bool CurOp::completeAndLogOperation(OperationContext* opCtx,
             // We can get here and our lock acquisition be timed out or interrupted, log a
             // message if that happens.
             try {
+                // Retrieving storage stats should not be blocked by oplog application.
+                ShouldNotConflictWithSecondaryBatchApplicationBlock shouldNotConflictBlock(
+                    opCtx->lockState());
                 Lock::GlobalLock lk(opCtx,
                                     MODE_IS,
                                     Date_t::now() + Milliseconds(500),
@@ -745,7 +753,11 @@ string OpDebug::report(OperationContext* opCtx, const SingleThreadedLockStats* l
     OPDEBUG_TOSTRING_HELP_BOOL(hasSortStage);
     OPDEBUG_TOSTRING_HELP_BOOL(usedDisk);
     OPDEBUG_TOSTRING_HELP_BOOL(fromMultiPlanner);
-    OPDEBUG_TOSTRING_HELP_BOOL(replanned);
+    if (replanReason) {
+        bool replanned = true;
+        OPDEBUG_TOSTRING_HELP_BOOL(replanned);
+        s << " replanReason:\"" << str::escape(redact(*replanReason)) << "\"";
+    }
     OPDEBUG_TOSTRING_HELP_OPTIONAL("nMatched", additiveMetrics.nMatched);
     OPDEBUG_TOSTRING_HELP_OPTIONAL("nModified", additiveMetrics.nModified);
     OPDEBUG_TOSTRING_HELP_OPTIONAL("ninserted", additiveMetrics.ninserted);
@@ -789,6 +801,17 @@ string OpDebug::report(OperationContext* opCtx, const SingleThreadedLockStats* l
     BSONObj flowControlObj = makeFlowControlObject(flowControlStats);
     if (flowControlObj.nFields() > 0) {
         s << " flowControl:" << flowControlObj.toString();
+    }
+
+    {
+        const auto& readConcern = repl::ReadConcernArgs::get(opCtx);
+        if (readConcern.isSpecified()) {
+            s << " readConcern:" << readConcern.toBSONInner();
+        }
+    }
+
+    if (writeConcern && !writeConcern->usedDefault) {
+        s << " writeConcern:" << writeConcern->toBSON();
     }
 
     if (storageStats) {
@@ -849,7 +872,11 @@ void OpDebug::append(OperationContext* opCtx,
     OPDEBUG_APPEND_BOOL(hasSortStage);
     OPDEBUG_APPEND_BOOL(usedDisk);
     OPDEBUG_APPEND_BOOL(fromMultiPlanner);
-    OPDEBUG_APPEND_BOOL(replanned);
+    if (replanReason) {
+        bool replanned = true;
+        OPDEBUG_APPEND_BOOL(replanned);
+        b.append("replanReason", *replanReason);
+    }
     OPDEBUG_APPEND_OPTIONAL("nMatched", additiveMetrics.nMatched);
     OPDEBUG_APPEND_OPTIONAL("nModified", additiveMetrics.nModified);
     OPDEBUG_APPEND_OPTIONAL("ninserted", additiveMetrics.ninserted);
@@ -883,6 +910,17 @@ void OpDebug::append(OperationContext* opCtx,
         BSONObj flowControlMetrics = makeFlowControlObject(flowControlStats);
         BSONObjBuilder flowControlBuilder(b.subobjStart("flowControl"));
         flowControlBuilder.appendElements(flowControlMetrics);
+    }
+
+    {
+        const auto& readConcern = repl::ReadConcernArgs::get(opCtx);
+        if (readConcern.isSpecified()) {
+            readConcern.appendInfo(&b);
+        }
+    }
+
+    if (writeConcern && !writeConcern->usedDefault) {
+        b.append("writeConcern", writeConcern->toBSON());
     }
 
     if (storageStats) {
@@ -921,7 +959,7 @@ void OpDebug::setPlanSummaryMetrics(const PlanSummaryStats& planSummaryStats) {
     hasSortStage = planSummaryStats.hasSortStage;
     usedDisk = planSummaryStats.usedDisk;
     fromMultiPlanner = planSummaryStats.fromMultiPlanner;
-    replanned = planSummaryStats.replanned;
+    replanReason = planSummaryStats.replanReason;
 }
 
 BSONObj OpDebug::makeFlowControlObject(FlowControlTicketholder::CurOp stats) const {

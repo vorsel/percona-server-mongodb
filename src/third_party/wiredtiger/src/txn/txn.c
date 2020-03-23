@@ -469,9 +469,7 @@ __wt_txn_config(WT_SESSION_IMPL *session, const char *cfg[])
 
     /* Retrieve the maximum operation time, defaulting to the database-wide configuration. */
     WT_RET(__wt_config_gets(session, cfg, "operation_timeout_ms", &cval));
-    session->operation_timeout_us = (uint64_t)(cval.val * WT_THOUSAND);
-    if (session->operation_timeout_us == 0)
-        session->operation_timeout_us = S2C(session)->operation_timeout_us;
+    txn->operation_timeout_us = (uint64_t)(cval.val * WT_THOUSAND);
 
     /*
      * The default sync setting is inherited from the connection, but can be overridden by an
@@ -621,7 +619,7 @@ __wt_txn_release(WT_SESSION_IMPL *session)
     txn->prepare_timestamp = WT_TS_NONE;
 
     /* Clear operation timer. */
-    session->operation_timeout_us = 0;
+    txn->operation_timeout_us = 0;
 }
 
 /*
@@ -841,8 +839,11 @@ __txn_commit_timestamps_assert(WT_SESSION_IMPL *session)
              */
             op_zero_ts = !F_ISSET(txn, WT_TXN_HAS_TS_COMMIT);
             upd_zero_ts = prev_op_timestamp == WT_TS_NONE;
-            if (op_zero_ts != upd_zero_ts)
-                WT_RET_MSG(session, EINVAL, "per-key timestamps used inconsistently");
+            if (op_zero_ts != upd_zero_ts) {
+                WT_RET(__wt_verbose_dump_update(session, upd));
+                WT_RET(__wt_verbose_dump_txn_one(session, &session->txn, EINVAL,
+                  "per-key timestamps used inconsistently, dumping relevant information"));
+            }
             /*
              * If we aren't using timestamps for this transaction then we are done checking. Don't
              * check the timestamp because the one in the transaction is not cleared.
@@ -891,6 +892,7 @@ __wt_txn_commit(WT_SESSION_IMPL *session, const char *cfg[])
     prepare = F_ISSET(txn, WT_TXN_PREPARE);
     readonly = txn->mod_count == 0;
 
+    /* Permit the commit if the transaction failed, but was read-only. */
     WT_ASSERT(session, F_ISSET(txn, WT_TXN_RUNNING));
     WT_ASSERT(session, !F_ISSET(txn, WT_TXN_ERROR) || txn->mod_count == 0);
 
@@ -1130,7 +1132,8 @@ __wt_txn_prepare(WT_SESSION_IMPL *session, const char *cfg[])
     txn_prepared_updates_count = 0;
 
     WT_ASSERT(session, F_ISSET(txn, WT_TXN_RUNNING));
-    WT_ASSERT(session, !F_ISSET(txn, WT_TXN_ERROR) || txn->mod_count == 0);
+    WT_ASSERT(session, !F_ISSET(txn, WT_TXN_ERROR));
+
     /*
      * A transaction should not have updated any of the logged tables, if debug mode logging is not
      * turned on.
@@ -1260,10 +1263,6 @@ __wt_txn_rollback(WT_SESSION_IMPL *session, const char *cfg[])
 
     /* Rollback and free updates. */
     for (i = 0, op = txn->mod; i < txn->mod_count; i++, op++) {
-        /* Assert it's not an update to the lookaside file. */
-        WT_ASSERT(
-          session, S2C(session)->cache->las_fileid == 0 || !F_ISSET(op->btree, WT_BTREE_LOOKASIDE));
-
         /* Metadata updates should never be rolled back. */
         WT_ASSERT(session, !WT_IS_METADATA(op->btree->dhandle));
         if (WT_IS_METADATA(op->btree->dhandle))
@@ -1589,87 +1588,41 @@ __wt_txn_global_shutdown(WT_SESSION_IMPL *session, const char *config, const cha
 }
 
 /*
- * __wt_txn_is_blocking_old --
- *     Return if this transaction is the oldest transaction in the system, called by eviction to
- *     determine if a worker thread should be released from eviction.
+ * __wt_txn_is_blocking --
+ *     Return an error if this transaction is likely blocking eviction because of a pinned
+ *     transaction ID, called by eviction to determine if a worker thread should be released from
+ *     eviction.
  */
 int
-__wt_txn_is_blocking_old(WT_SESSION_IMPL *session)
+__wt_txn_is_blocking(WT_SESSION_IMPL *session)
 {
-    WT_CONNECTION_IMPL *conn;
     WT_TXN *txn;
-    WT_TXN_GLOBAL *txn_global;
-    WT_TXN_STATE *state;
-    uint64_t id;
-    uint32_t i, session_cnt;
+    WT_TXN_STATE *txn_state;
+    uint64_t global_oldest;
 
-    conn = S2C(session);
     txn = &session->txn;
-    txn_global = &conn->txn_global;
+    txn_state = WT_SESSION_TXN_STATE(session);
+    global_oldest = S2C(session)->txn_global.oldest_id;
 
-    if (txn->id == WT_TXN_NONE || F_ISSET(txn, WT_TXN_PREPARE))
-        return (false);
-
-    WT_ORDERED_READ(session_cnt, conn->session_cnt);
+    /* We can't roll back prepared transactions. */
+    if (F_ISSET(txn, WT_TXN_PREPARE))
+        return (0);
 
     /*
-     * Check if the transaction is oldest one in the system. It's safe to ignore sessions allocating
-     * transaction IDs, since we already have an ID, they are guaranteed to be newer.
+     * MongoDB can't (yet) handle rolling back read only transactions. For this reason, don't check
+     * unless there's at least one update or we're configured to time out thread operations (a way
+     * to confirm our caller is prepared for rollback).
      */
-    for (i = 0, state = txn_global->states; i < session_cnt; i++, state++) {
-        if (state->is_allocating)
-            continue;
+    if (txn->mod_count == 0 && !__wt_op_timer_fired(session))
+        return (0);
 
-        WT_ORDERED_READ(id, state->id);
-        if (id != WT_TXN_NONE && WT_TXNID_LT(id, txn->id))
-            break;
-    }
-    return (i == session_cnt ?
-        __wt_txn_rollback_required(session, "oldest transaction ID rolled back for eviction") :
+    /*
+     * Check if either the transaction's ID or its pinned ID is equal to the oldest transaction ID.
+     */
+    return (txn_state->id == global_oldest || txn_state->pinned_id == global_oldest ?
+        __wt_txn_rollback_required(
+          session, "oldest pinned transaction ID rolled back for eviction") :
         0);
-}
-
-/*
- * __wt_txn_is_blocking_pin --
- *     Return if this transaction is likely blocking eviction because of a pinned transaction ID,
- *     called by eviction to determine if a worker thread should be released from eviction.
- */
-int
-__wt_txn_is_blocking_pin(WT_SESSION_IMPL *session)
-{
-    WT_CONNECTION_IMPL *conn;
-    WT_SESSION_IMPL *s;
-    WT_TXN *txn;
-    uint64_t snap_min;
-    uint32_t i, session_cnt;
-
-    conn = S2C(session);
-    txn = &session->txn;
-
-    /*
-     * Check if we hold the oldest pinned transaction ID in the system. This potentially means
-     * rolling back a read-only transaction, which MongoDB can't (yet) handle. For this reason,
-     * don't check unless we're configured to time out thread operations, a way to confirm our
-     * caller is prepared for rollback.
-     */
-    if (!F_ISSET(txn, WT_TXN_HAS_SNAPSHOT) || txn->snap_min == WT_TXN_NONE)
-        return (0);
-    if (!__wt_op_timer_fired(session))
-        return (0);
-
-    WT_ORDERED_READ(session_cnt, conn->session_cnt);
-
-    for (s = conn->sessions, i = 0; i < session_cnt; ++s, ++i) {
-        if (F_ISSET(s, WT_SESSION_INTERNAL) || !F_ISSET(&s->txn, WT_TXN_HAS_SNAPSHOT))
-            continue;
-
-        WT_ORDERED_READ(snap_min, s->txn.snap_min);
-        if (snap_min != WT_TXN_NONE && snap_min < txn->snap_min)
-            break;
-    }
-    return (i == session_cnt ? __wt_txn_rollback_required(
-                                 session, "oldest pinned transaction ID rolled back for eviction") :
-                               0);
 }
 
 /*
@@ -1677,8 +1630,10 @@ __wt_txn_is_blocking_pin(WT_SESSION_IMPL *session)
  *     Output diagnostic information about a transaction structure.
  */
 int
-__wt_verbose_dump_txn_one(WT_SESSION_IMPL *session, WT_TXN *txn)
+__wt_verbose_dump_txn_one(
+  WT_SESSION_IMPL *session, WT_TXN *txn, int error_code, const char *error_string)
 {
+    char buf[512];
     char ts_string[5][WT_TS_INT_STRING_SIZE];
     const char *iso_tag;
 
@@ -1694,17 +1649,23 @@ __wt_verbose_dump_txn_one(WT_SESSION_IMPL *session, WT_TXN *txn)
         iso_tag = "WT_ISO_SNAPSHOT";
         break;
     }
-    WT_RET(__wt_msg(session, "transaction id: %" PRIu64 ", mod count: %u"
-                             ", snap min: %" PRIu64 ", snap max: %" PRIu64 ", snapshot count: %u"
-                             ", commit_timestamp: %s"
-                             ", durable_timestamp: %s"
-                             ", first_commit_timestamp: %s"
-                             ", prepare_timestamp: %s"
-                             ", read_timestamp: %s"
-                             ", checkpoint LSN: [%" PRIu32 "][%" PRIu32 "]"
-                             ", full checkpoint: %s"
-                             ", rollback reason: %s"
-                             ", flags: 0x%08" PRIx32 ", isolation: %s",
+
+    /*
+     * Dump the information of the passed transaction into a buffer, to be logged with an optional
+     * error message.
+     */
+    WT_RET(__wt_snprintf(buf,
+      sizeof(buf), "transaction id: %" PRIu64 ", mod count: %u"
+                   ", snap min: %" PRIu64 ", snap max: %" PRIu64 ", snapshot count: %u"
+                   ", commit_timestamp: %s"
+                   ", durable_timestamp: %s"
+                   ", first_commit_timestamp: %s"
+                   ", prepare_timestamp: %s"
+                   ", read_timestamp: %s"
+                   ", checkpoint LSN: [%" PRIu32 "][%" PRIu32 "]"
+                   ", full checkpoint: %s"
+                   ", rollback reason: %s"
+                   ", flags: 0x%08" PRIx32 ", isolation: %s",
       txn->id, txn->mod_count, txn->snap_min, txn->snap_max, txn->snapshot_count,
       __wt_timestamp_to_string(txn->commit_timestamp, ts_string[0]),
       __wt_timestamp_to_string(txn->durable_timestamp, ts_string[1]),
@@ -1713,6 +1674,16 @@ __wt_verbose_dump_txn_one(WT_SESSION_IMPL *session, WT_TXN *txn)
       __wt_timestamp_to_string(txn->read_timestamp, ts_string[4]), txn->ckpt_lsn.l.file,
       txn->ckpt_lsn.l.offset, txn->full_ckpt ? "true" : "false",
       txn->rollback_reason == NULL ? "" : txn->rollback_reason, txn->flags, iso_tag));
+
+    /*
+     * Log a message and return an error if error code and an optional error string has been passed.
+     */
+    if (0 != error_code) {
+        WT_RET_MSG(session, error_code, "%s, %s", buf, error_string != NULL ? error_string : "");
+    } else {
+        WT_RET(__wt_msg(session, "%s", buf));
+    }
+
     return (0);
 }
 
@@ -1788,8 +1759,73 @@ __wt_verbose_dump_txn(WT_SESSION_IMPL *session)
         WT_RET(__wt_msg(session,
           "ID: %" PRIu64 ", pinned ID: %" PRIu64 ", metadata pinned ID: %" PRIu64 ", name: %s", id,
           s->pinned_id, s->metadata_pinned, sess->name == NULL ? "EMPTY" : sess->name));
-        WT_RET(__wt_verbose_dump_txn_one(session, &sess->txn));
+        WT_RET(__wt_verbose_dump_txn_one(session, &sess->txn, 0, NULL));
     }
 
+    return (0);
+}
+
+/*
+ * __wt_verbose_dump_update --
+ *     Output diagnostic information about an update structure.
+ */
+int
+__wt_verbose_dump_update(WT_SESSION_IMPL *session, WT_UPDATE *upd)
+{
+    char ts_string[2][WT_TS_INT_STRING_SIZE];
+    const char *prepare_state, *upd_type;
+
+    if (upd == NULL) {
+        WT_RET(__wt_msg(session, "NULL update"));
+        return (0);
+    }
+    WT_NOT_READ(upd_type, "WT_UPDATE_INVALID");
+    switch (upd->type) {
+    case WT_UPDATE_INVALID:
+        upd_type = "WT_UPDATE_INVALID";
+        break;
+    case WT_UPDATE_BIRTHMARK:
+        upd_type = "WT_UPDATE_BIRTHMARK";
+        break;
+    case WT_UPDATE_MODIFY:
+        upd_type = "WT_UPDATE_MODIFY";
+        break;
+    case WT_UPDATE_RESERVE:
+        upd_type = "WT_UPDATE_RESERVE";
+        break;
+    case WT_UPDATE_STANDARD:
+        upd_type = "WT_UPDATE_STANDARD";
+        break;
+    case WT_UPDATE_TOMBSTONE:
+        upd_type = "WT_UPDATE_TOMBSTONE";
+        break;
+    }
+
+    WT_NOT_READ(prepare_state, "WT_PREPARE_INVALID");
+    switch (upd->prepare_state) {
+    case WT_PREPARE_INIT:
+        prepare_state = "WT_PREPARE_INIT";
+        break;
+    case WT_PREPARE_INPROGRESS:
+        prepare_state = "WT_PREPARE_INPROGRESS";
+        break;
+    case WT_PREPARE_LOCKED:
+        prepare_state = "WT_PREPARE_LOCKED";
+        break;
+    case WT_PREPARE_RESOLVED:
+        prepare_state = "WT_PREPARE_RESOLVED";
+        break;
+    }
+
+    __wt_errx(session, "transaction id: %" PRIu64
+                       ", commit timestamp: %s"
+                       ", durable timestamp: %s"
+                       ", has next: %s"
+                       ", size: %" PRIu32
+                       ", type: %s"
+                       ", prepare state: %s",
+      upd->txnid, __wt_timestamp_to_string(upd->start_ts, ts_string[0]),
+      __wt_timestamp_to_string(upd->durable_ts, ts_string[1]), upd->next == NULL ? "no" : "yes",
+      upd->size, upd_type, prepare_state);
     return (0);
 }

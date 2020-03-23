@@ -102,6 +102,7 @@
 #include "mongo/db/periodic_runner_job_abort_expired_transactions.h"
 #include "mongo/db/periodic_runner_job_decrease_snapshot_cache_pressure.h"
 #include "mongo/db/query/internal_plans.h"
+#include "mongo/db/read_write_concern_defaults_cache_lookup_mongod.h"
 #include "mongo/db/repair_database_and_check_version.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/oplog.h"
@@ -138,6 +139,7 @@
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/storage/storage_engine_lock_file.h"
 #include "mongo/db/storage/storage_options.h"
+#include "mongo/db/storage/storage_parameters_gen.h"
 #include "mongo/db/system_index.h"
 #include "mongo/db/transaction_participant.h"
 #include "mongo/db/ttl.h"
@@ -166,6 +168,7 @@
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/fast_clock_source_factory.h"
+#include "mongo/util/latch_analyzer.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/net/ssl_manager.h"
@@ -231,7 +234,7 @@ void logStartup(OperationContext* opCtx) {
     AutoGetOrCreateDb autoDb(opCtx, startupLogCollectionName.db(), mongo::MODE_X);
     Database* db = autoDb.getDb();
     Collection* collection =
-        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(startupLogCollectionName);
+        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, startupLogCollectionName);
     WriteUnitOfWork wunit(opCtx);
     if (!collection) {
         BSONObj options = BSON("capped" << true << "size" << 10 * 1024 * 1024);
@@ -239,8 +242,8 @@ void logStartup(OperationContext* opCtx) {
         CollectionOptions collectionOptions = uassertStatusOK(
             CollectionOptions::parse(options, CollectionOptions::ParseKind::parseForCommand));
         uassertStatusOK(db->userCreateNS(opCtx, startupLogCollectionName, collectionOptions));
-        collection =
-            CollectionCatalog::get(opCtx).lookupCollectionByNamespace(startupLogCollectionName);
+        collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
+            opCtx, startupLogCollectionName);
     }
     invariant(collection);
 
@@ -522,9 +525,40 @@ ExitCode _initAndListen(int listenPort) {
         }
     }
 
+    try {
+        if (serverGlobalParams.clusterRole != ClusterRole::ShardServer &&
+            replSettings.usingReplSets()) {
+            ReadWriteConcernDefaults::get(startupOpCtx.get()->getServiceContext())
+                .refreshIfNecessary(startupOpCtx.get());
+        }
+    } catch (const DBException& ex) {
+        warning() << "Failed to load read and write concern defaults at startup"
+                  << causedBy(redact(ex.toStatus()));
+    }
+
     auto storageEngine = serviceContext->getStorageEngine();
     invariant(storageEngine);
     BackupCursorHooks::initialize(serviceContext, storageEngine);
+
+    // Perform replication recovery for queryable backup mode if needed.
+    if (storageGlobalParams.readOnly) {
+        uassert(ErrorCodes::BadValue,
+                str::stream() << "Cannot specify both queryableBackupMode and "
+                              << "recoverFromOplogAsStandalone at the same time",
+                !replSettings.shouldRecoverFromOplogAsStandalone());
+        uassert(
+            ErrorCodes::BadValue,
+            str::stream()
+                << "Cannot take an unstable checkpoint on shutdown while using queryableBackupMode",
+            !gTakeUnstableCheckpointOnShutdown);
+
+        auto replCoord = repl::ReplicationCoordinator::get(startupOpCtx.get());
+        invariant(replCoord);
+        uassert(ErrorCodes::BadValue,
+                str::stream() << "Cannot use queryableBackupMode in a replica set",
+                !replCoord->isReplEnabled());
+        replCoord->startup(startupOpCtx.get());
+    }
 
     if (!storageGlobalParams.readOnly) {
 
@@ -969,19 +1003,37 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
         repl::ReplicationStateTransitionLockGuard rstl(
             opCtx, MODE_X, repl::ReplicationStateTransitionLockGuard::EnqueueOnly());
 
-        // Kill all operations. After this point, the opCtx will have been marked as killed and will
-        // not be usable other than to kill all transactions directly below.
+        // Kill all operations. And, makes all newly created opCtx to be immediately interrupted.
+        // After this point, the opCtx will have been marked as killed and will not be usable other
+        // than to kill all transactions directly below.
         serviceContext->setKillAllOperations();
 
         // Destroy all stashed transaction resources, in order to release locks.
         killSessionsLocalShutdownAllTransactions(opCtx);
 
         rstl.waitForLockUntil(Date_t::max());
-    }
 
-    // Shuts down the thread pool and waits for index builds to finish.
-    // Depends on setKillAllOperations() above to interrupt the index build operations.
-    IndexBuildsCoordinator::get(serviceContext)->shutdown();
+        // Release the rstl before waiting for the index build threads to join as index build
+        // reacquires rstl in uninterruptible lock guard to finish their cleanup process.
+        rstl.release();
+
+        // Shuts down the thread pool and waits for index builds to finish.
+        // Depends on setKillAllOperations() above to interrupt the index build operations.
+        IndexBuildsCoordinator::get(serviceContext)->shutdown();
+
+        // No new readers can come in after the releasing the RSTL, as previously before releasing
+        // the RSTL, we made sure that all new operations will be immediately interrupted by setting
+        // ServiceContext::_globalKill to true. Reacquires RSTL in mode X.
+        rstl.reacquire();
+
+        // We are expected to have no active readers while performing
+        // markAsCleanShutdownIfPossible() step. We guarantee that there are no active readers at
+        // this point due to:
+        // 1) Acquiring RSTL in mode X as all readers (except single phase hybrid index builds on
+        //    secondaries) are expected to hold RSTL in mode IX.
+        // 2) By waiting for all index build to finish.
+        repl::ReplicationCoordinator::get(serviceContext)->markAsCleanShutdownIfPossible(opCtx);
+    }
 
     ReplicaSetMonitor::shutdown();
 
@@ -1049,6 +1101,8 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
     log(LogComponent::kControl) << "now exiting";
 
     audit::logShutdown(client);
+
+    LatchAnalyzer::get(serviceContext).dump();
 }
 
 int mongoDbMain(int argc, char* argv[], char** envp) {
@@ -1091,6 +1145,8 @@ int mongoDbMain(int argc, char* argv[], char** envp) {
     // Per SERVER-7434, startSignalProcessingThread must run after any forks (i.e.
     // initializeServerGlobalState) and before the creation of any other threads
     startSignalProcessingThread();
+
+    ReadWriteConcernDefaults::create(service, readWriteConcernDefaultsCacheLookupMongoD);
 
 #if defined(_WIN32)
     if (ntservice::shouldStartService()) {

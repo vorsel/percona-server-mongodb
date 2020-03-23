@@ -163,7 +163,7 @@ void EncryptionKeyDB::init_masterkey() {
             // generate new key
             char newkey[_key_len];
             generate_secure_key(newkey);
-            encoded_key = base64::encode(newkey, _key_len);
+            encoded_key = base64::encode(StringData{newkey, _key_len});
         } else {
             // read key from the Vault
             encoded_key = vaultReadKey();
@@ -177,7 +177,7 @@ void EncryptionKeyDB::init_masterkey() {
                 log() << "Master key is absent in the Vault. Generating and writing one.";
                 char newkey[_key_len];
                 generate_secure_key(newkey);
-                encoded_key = base64::encode(newkey, _key_len);
+                encoded_key = base64::encode(StringData{newkey, _key_len});
                 vaultWriteKey(encoded_key);
             }
         }
@@ -338,7 +338,7 @@ void EncryptionKeyDB::clone(EncryptionKeyDB *old) {
 }
 
 void EncryptionKeyDB::store_masterkey() {
-    vaultWriteKey(base64::encode((const char*)_masterkey, _key_len));
+    vaultWriteKey(base64::encode(StringData{(const char*)_masterkey, _key_len}));
 }
 
 int EncryptionKeyDB::get_key_by_id(const char *keyid, size_t len, unsigned char *key, void *pe) {
