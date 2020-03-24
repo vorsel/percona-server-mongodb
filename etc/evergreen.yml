@@ -607,6 +607,8 @@ functions:
 
         cat <<EOF > notary_env.sh
         export NOTARY_TOKEN=${signing_auth_token_42}
+        export BARQUE_USERNAME=${barque_user}
+        export BARQUE_PASSWORD=${barque_password}
         EOF
 
         echo "${signing_auth_token_42}" > signing_auth_token
@@ -2057,7 +2059,7 @@ functions:
       script: |
         set -o errexit
 
-        export KITCHEN_ARTIFACTS_URL="https://s3.amazonaws.com/mciuploads/${project}/${build_variant}/${revision}/artifacts/${build_id}.tgz"
+        export KITCHEN_ARTIFACTS_URL="https://s3.amazonaws.com/mciuploads/${project}/${build_variant}/${revision}/artifacts/${build_id}-packages.tgz"
         export KITCHEN_SECURITY_GROUP="${kitchen_security_group}"
         export KITCHEN_SSH_KEY_ID="${kitchen_ssh_key_id}"
         export KITCHEN_SUBNET="${kitchen_subnet}"
@@ -3441,6 +3443,24 @@ tasks:
           - "artifacts.json"
         exclude_files:
           - "*_test.pdb"
+    - command: archive.targz_pack
+      params:
+        target: "packages.tgz"
+        source_dir: "src"
+        include:
+          - "repo/**"
+          - "./**.msi"
+    - command: s3.put
+      params:
+        optional: true
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: packages.tgz
+        remote_file: ${project}/${build_variant}/${revision}/artifacts/${build_id}-packages.tgz
+        bucket: mciuploads
+        permissions: public-read
+        content_type: application/tar
+        display_name: Packages
     - func: "upload debugsymbols"
     - command: s3.put
       params:
@@ -6624,7 +6644,7 @@ tasks:
           CURATOR_RELEASE=${curator_release|"latest"}
           curl -L -O http://boxes.10gen.com/build/curator/curator-dist-rhel70-$CURATOR_RELEASE.tar.gz
           tar -zxvf curator-dist-rhel70-$CURATOR_RELEASE.tar.gz
-          ./curator repo --config ./etc/repo_config.yaml --distro ${packager_distro} --edition ${repo_edition} --version ${version} --arch ${packager_arch} --packages repo
+          ./curator repo submit --service ${barque_url} --config ./etc/repo_config.yaml --distro ${packager_distro} --edition ${repo_edition} --version ${version} --arch ${packager_arch} --packages https://s3.amazonaws.com/mciuploads/${project}/${build_variant}/${revision}/artifacts/${build_id}-packages.tgz
 
 - name: push
   tags: ["publish"]
@@ -10667,6 +10687,31 @@ buildvariants:
   - name: compile_all_run_unittests_TG
     distros:
     - ubuntu1604-build
+
+- name: enterprise-ubuntu-no-latch-1604-64-bit
+  display_name: "~ Enterprise Ubuntu 16.04 (without Diagnostic Latches)"
+  batchtime: 1440 # 1 day
+  modules:
+  - enterprise
+  expansions:
+    compile_flags: MONGO_DISTMOD=ubuntu1604 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars --use-diagnostic-latches=off
+  tasks:
+  - name: compile_all_run_unittests_TG
+    distros:
+    - ubuntu1804-build
+
+- name: enterprise-ubuntu-no-latch-1804-64-bit
+  display_name: "~ Enterprise Ubuntu 18.04 DEBUG (Unoptimized)"
+  batchtime: 1440 # 1 day
+  modules:
+  - enterprise
+  expansions:
+    compile_flags: MONGO_DISTMOD=ubuntu1804 -j$(grep -c ^processor /proc/cpuinfo) --dbg=on --opt=off --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
+    scons_cache_scope: shared
+  tasks:
+  - name: compile_all_run_unittests_TG
+    distros:
+    - ubuntu1804-build
 
 - name: enterprise-ubuntu-task-executor-pool-size-1604-64-bit
   display_name: "~ Enterprise Ubuntu 16.04 (with {taskExecutorPoolSize: 4})"

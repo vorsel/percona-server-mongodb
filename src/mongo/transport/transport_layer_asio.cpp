@@ -44,6 +44,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/transport/asio_utils.h"
 #include "mongo/transport/service_entry_point.h"
+#include "mongo/util/hierarchical_acquisition.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/net/sockaddr.h"
@@ -520,7 +521,7 @@ Future<SessionHandle> TransportLayerASIO::asyncConnect(HostAndPort peer,
         AtomicWord<bool> done{false};
         Promise<SessionHandle> promise;
 
-        Mutex mutex = MONGO_MAKE_LATCH("AsyncConnectState::mutex");
+        Mutex mutex = MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(0), "AsyncConnectState::mutex");
         GenericSocket socket;
         ASIOReactorTimer timeoutTimer;
         WrappedResolver resolver;
@@ -730,9 +731,7 @@ Status TransportLayerASIO::setup() {
             _listenerPort = endpointToHostAndPort(endpoint).port();
         }
 
-        sockaddr_storage sa;
-        memcpy(&sa, addr->data(), addr->size());
-        _acceptors.emplace_back(SockAddr(sa, addr->size()), std::move(acceptor));
+        _acceptors.emplace_back(SockAddr(addr->data(), addr->size()), std::move(acceptor));
     }
 
     if (_acceptors.empty() && _listenerOptions.isIngress()) {

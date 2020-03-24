@@ -47,6 +47,7 @@
 #include "mongo/util/clock_source.h"
 #include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/decorable.h"
+#include "mongo/util/hierarchical_acquisition.h"
 #include "mongo/util/periodic_runner.h"
 #include "mongo/util/tick_source.h"
 
@@ -530,7 +531,7 @@ private:
         std::unique_ptr<ClientObserver> _observer;
     };
 
-    Mutex _mutex = MONGO_MAKE_LATCH("ServiceContext::_mutex");
+    Mutex _mutex = MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(2), "ServiceContext::_mutex");
 
     /**
      * The periodic runner.
@@ -607,6 +608,15 @@ bool hasGlobalServiceContext();
  * Caller does not own pointer.
  */
 ServiceContext* getGlobalServiceContext();
+
+/**
+ * Returns the ServiceContext associated with the current Client.
+ *
+ * Returns a nullptr if there is not a current Client
+ *
+ * Caller does not own pointer.
+ */
+ServiceContext* getCurrentServiceContext();
 
 /**
  * Sets the global ServiceContext.  If 'serviceContext' is NULL, un-sets and deletes
