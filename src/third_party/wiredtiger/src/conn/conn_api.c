@@ -417,8 +417,7 @@ __wt_encryptor_config(WT_SESSION_IMPL *session, WT_CONFIG_ITEM *cval, WT_CONFIG_
         if (WT_STRING_MATCH(kenc->keyid, keyid->str, keyid->len)) {
             encryptor = kenc->encryptor;
             if (encryptor->sessioncreate != NULL) {
-                WT_ERR(encryptor->sessioncreate(encryptor, &session->iface,
-                       cfg_arg));
+                WT_ERR(encryptor->sessioncreate(encryptor, &session->iface, cfg_arg));
             }
             goto out;
         }
@@ -2505,6 +2504,12 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler, const char *c
 
     WT_ERR(__wt_config_gets(session, cfg, "session_scratch_max", &cval));
     conn->session_scratch_max = (size_t)cval.val;
+
+    WT_ERR(__wt_config_gets(session, cfg, "session_dhhash_size", &cval));
+    conn->session_dhhash_size = cval.val;
+
+    WT_ERR(__wt_config_gets(session, cfg, "session_cursor_cache_size", &cval));
+    conn->session_cursor_cache_size = cval.val;
 
     /*
      * If buffer alignment is not configured, use zero unless direct I/O is also configured, in
