@@ -343,9 +343,11 @@ install_deps() {
         yum -y install epel-release
         yum -y install rpmbuild rpm-build libpcap-devel gcc make cmake gcc-c++ openssl-devel
         yum -y install cyrus-sasl-devel snappy-devel zlib-devel bzip2-devel scons rpmlint
-        yum -y install rpm-build git python-pip python-devel libopcodes libcurl-devel rpmlint e2fsprogs-devel expat-devel lz4-devel
+        #yum -y install rpm-build git python-pip python-devel libopcodes libcurl-devel rpmlint e2fsprogs-devel expat-devel lz4-devel
+        yum -y install rpm-build git python python-devel libopcodes libcurl-devel rpmlint e2fsprogs-devel expat-devel lz4-devel
         yum -y install openldap-devel
-        pip install setuptools --upgrade
+        wget https://bootstrap.pypa.io/get-pip.py
+        python get-pip.py
       else
         yum -y install bzip2-devel libpcap-devel snappy-devel gcc gcc-c++ rpm-build rpmlint
         yum -y install cmake cyrus-sasl-devel make openssl-devel zlib-devel libcurl-devel git
@@ -542,6 +544,9 @@ build_rpm(){
       pip2.7 install --user -r buildscripts/requirements.txt
     else
       pip install --user -r buildscripts/requirements.txt
+      if [ $? -eq 1 ]; then
+        exit 1
+      fi
     fi
     #
     cd $WORKDIR
