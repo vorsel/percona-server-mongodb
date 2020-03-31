@@ -40,6 +40,7 @@
 #include <fstream>
 
 #include "mongo/bson/bson_validate.h"
+#include "mongo/bson/json.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/shell/shell_utils.h"
 #include "mongo/shell/shell_utils_launcher.h"
@@ -191,6 +192,15 @@ BSONObj cat(const BSONObj& args, void* data) {
         uassert(13301, "cat() : file too big to load as a variable", sz < 1024 * 1024 * 16);
     }
     return BSON("" << ss.str());
+}
+
+BSONObj parseJsonCanonical(const BSONObj& args, void* data) {
+    BSONElement e = singleArg(args);
+    uassert(51021,
+            "the first argument to parseJsonCanonical() must be a string containing "
+            "Json in canonical mode <http://dochub.mongodb.org/core/mongodbextendedjson>",
+            e.type() == mongo::String);
+    return BSON("" << fromjson(e.str()));
 }
 
 BSONObj md5sumFile(const BSONObj& args, void* data) {
@@ -447,6 +457,7 @@ void installShellUtilsExtended(Scope& scope) {
     scope.injectNative("pwd", pwd);
     scope.injectNative("cd", cd);
     scope.injectNative("cat", cat);
+    scope.injectNative("parseJsonCanonical", parseJsonCanonical);
     scope.injectNative("hostname", hostname);
     scope.injectNative("md5sumFile", md5sumFile);
     scope.injectNative("mkdir", mkdir);
