@@ -43,6 +43,7 @@ namespace {
 
 const std::string kCheckEmptyFieldName = "checkEmpty";
 const std::string kConfigVersionFieldName = "configVersion";
+const std::string kConfigTermFieldName = "configTerm";
 const std::string kHeartbeatVersionFieldName = "hbv";
 const std::string kSenderHostFieldName = "from";
 const std::string kSenderIdFieldName = "fromId";
@@ -51,6 +52,7 @@ const std::string kTermFieldName = "term";
 
 const std::string kLegalHeartbeatFieldNames[] = {kCheckEmptyFieldName,
                                                  kConfigVersionFieldName,
+                                                 kConfigTermFieldName,
                                                  kHeartbeatVersionFieldName,
                                                  kSenderHostFieldName,
                                                  kSenderIdFieldName,
@@ -70,6 +72,11 @@ Status ReplSetHeartbeatArgsV1::initialize(const BSONObj& argsObj) {
         return status;
 
     status = bsonExtractIntegerField(argsObj, kConfigVersionFieldName, &_configVersion);
+    if (!status.isOK())
+        return status;
+
+    status = bsonExtractIntegerFieldWithDefault(
+        argsObj, kConfigTermFieldName, OpTime::kUninitializedTerm, &_configTerm);
     if (!status.isOK())
         return status;
 
@@ -122,6 +129,10 @@ void ReplSetHeartbeatArgsV1::setConfigVersion(long long newVal) {
     _configVersion = newVal;
 }
 
+void ReplSetHeartbeatArgsV1::setConfigTerm(long long newVal) {
+    _configTerm = newVal;
+}
+
 void ReplSetHeartbeatArgsV1::setHeartbeatVersion(long long newVal) {
     _heartbeatVersion = newVal;
     _hasHeartbeatVersion = true;
@@ -161,6 +172,16 @@ void ReplSetHeartbeatArgsV1::addToBSON(BSONObjBuilder* builder) const {
         builder->append(kCheckEmptyFieldName, _checkEmpty);
     }
     builder->appendIntOrLL(kConfigVersionFieldName, _configVersion);
+    // The configTerm field is new in 4.4 and cannot be parsed by MongoDB 4.2. Therefore omit it if
+    // we have a 4.2-style replica set config with no "term". This permits us to downgrade by first
+    // removing the replica set config's term, then downgrading to 4.2.
+    // TODO (SERVER-46288): Don't check FCV.
+    if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+        serverGlobalParams.featureCompatibility.getVersion() ==
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44 &&
+        _configTerm != OpTime::kUninitializedTerm) {
+        builder->appendIntOrLL(kConfigTermFieldName, _configTerm);
+    }
     if (_hasHeartbeatVersion) {
         builder->appendIntOrLL(kHeartbeatVersionFieldName, _hasHeartbeatVersion);
     }

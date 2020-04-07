@@ -33,6 +33,8 @@
 
 #include "mongo/s/commands/strategy.h"
 
+#include <fmt/format.h>
+
 #include "mongo/base/data_cursor.h"
 #include "mongo/base/init.h"
 #include "mongo/base/status.h"
@@ -61,6 +63,7 @@
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/transaction_validation.h"
 #include "mongo/db/views/resolved_view.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/factory.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata/logical_time_metadata.h"
@@ -77,13 +80,17 @@
 #include "mongo/s/query/cluster_cursor_manager.h"
 #include "mongo/s/query/cluster_find.h"
 #include "mongo/s/session_catalog_router.h"
+#include "mongo/s/shard_invalidated_for_targeting_exception.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/s/transaction_router.h"
+#include "mongo/transport/ismaster_metrics.h"
+#include "mongo/transport/session.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
 #include "mongo/util/timer.h"
+
+using namespace fmt::literals;
 
 namespace mongo {
 namespace {
@@ -135,12 +142,18 @@ void appendRequiredFieldsToResponse(OperationContext* opCtx, BSONObjBuilder* res
         // Add operationTime.
         auto operationTime = OperationTimeTracker::get(opCtx)->getMaxOperationTime();
         if (operationTime != LogicalTime::kUninitialized) {
-            LOG(5) << "Appending operationTime: " << operationTime.asTimestamp();
+            LOGV2_DEBUG(22764,
+                        5,
+                        "Appending operationTime: {operationTime_asTimestamp}",
+                        "operationTime_asTimestamp"_attr = operationTime.asTimestamp());
             responseBuilder->append(kOperationTime, operationTime.asTimestamp());
         } else if (now != LogicalTime::kUninitialized) {
             // If we don't know the actual operation time, use the cluster time instead. This is
             // safe but not optimal because we can always return a later operation time than actual.
-            LOG(5) << "Appending clusterTime as operationTime " << now.asTimestamp();
+            LOGV2_DEBUG(22765,
+                        5,
+                        "Appending clusterTime as operationTime {now_asTimestamp}",
+                        "now_asTimestamp"_attr = now.asTimestamp());
             responseBuilder->append(kOperationTime, now.asTimestamp());
         }
 
@@ -159,6 +172,7 @@ void appendRequiredFieldsToResponse(OperationContext* opCtx, BSONObjBuilder* res
  * Invokes the given command and aborts the transaction on any non-retryable errors.
  */
 void invokeInTransactionRouter(OperationContext* opCtx,
+                               const OpMsgRequest& request,
                                CommandInvocation* invocation,
                                rpc::ReplyBuilderInterface* result) {
     auto txnRouter = TransactionRouter::get(opCtx);
@@ -168,10 +182,11 @@ void invokeInTransactionRouter(OperationContext* opCtx,
     txnRouter.setDefaultAtClusterTime(opCtx);
 
     try {
-        invocation->run(opCtx, result);
+        CommandHelpers::runCommandInvocation(opCtx, request, invocation, result);
     } catch (const DBException& e) {
         if (ErrorCodes::isSnapshotError(e.code()) ||
             ErrorCodes::isNeedRetargettingError(e.code()) ||
+            e.code() == ErrorCodes::ShardInvalidatedForTargeting ||
             e.code() == ErrorCodes::StaleDbVersion) {
             // Don't abort on possibly retryable errors.
             throw;
@@ -264,9 +279,9 @@ void execCommandClient(OperationContext* opCtx,
 
     auto txnRouter = TransactionRouter::get(opCtx);
     if (txnRouter) {
-        invokeInTransactionRouter(opCtx, invocation, result);
+        invokeInTransactionRouter(opCtx, request, invocation, result);
     } else {
-        invocation->run(opCtx, result);
+        CommandHelpers::runCommandInvocation(opCtx, request, invocation, result);
     }
 
     if (invocation->supportsWriteConcern()) {
@@ -349,7 +364,8 @@ void runCommand(OperationContext* opCtx,
         opCtx->setComment(commentField.wrap());
     }
 
-    auto invocation = command->parse(opCtx, request);
+    std::shared_ptr<CommandInvocation> invocation = command->parse(opCtx, request);
+    CommandInvocation::set(opCtx, invocation);
 
     // Set the logical optype, command object and namespace as soon as we identify the command. If
     // the command does not define a fully-qualified namespace, set CurOp to the generic command
@@ -437,15 +453,23 @@ void runCommand(OperationContext* opCtx,
             return;
         }
 
-        if (supportsWriteConcern && wc.usedDefault &&
+        bool clientSuppliedWriteConcern = !wc.usedDefault;
+        bool customDefaultWriteConcernWasApplied = false;
+
+        if (supportsWriteConcern && !clientSuppliedWriteConcern &&
             (!TransactionRouter::get(opCtx) || isTransactionCommand(commandName))) {
             // This command supports WC, but wasn't given one - so apply the default, if there is
             // one.
             if (const auto wcDefault = ReadWriteConcernDefaults::get(opCtx->getServiceContext())
                                            .getDefaultWriteConcern(opCtx)) {
                 wc = *wcDefault;
-                LOG(2) << "Applying default writeConcern on " << request.getCommandName() << " of "
-                       << wcDefault->toBSON();
+                customDefaultWriteConcernWasApplied = true;
+                LOGV2_DEBUG(
+                    22766,
+                    2,
+                    "Applying default writeConcern on {request_getCommandName} of {wcDefault}",
+                    "request_getCommandName"_attr = request.getCommandName(),
+                    "wcDefault"_attr = wcDefault->toBSON());
             }
         }
 
@@ -454,8 +478,41 @@ void runCommand(OperationContext* opCtx,
         }
 
         if (supportsWriteConcern) {
+            auto& provenance = wc.getProvenance();
+
+            // ClientSupplied is the only provenance that clients are allowed to pass to mongos.
+            if (provenance.hasSource() && !provenance.isClientSupplied()) {
+                auto responseBuilder = replyBuilder->getBodyBuilder();
+                CommandHelpers::appendCommandStatusNoThrow(
+                    responseBuilder,
+                    Status{ErrorCodes::InvalidOptions,
+                           "writeConcern provenance must be unset or \"{}\""_format(
+                               ReadWriteConcernProvenance::kClientSupplied)});
+                return;
+            }
+
+            // If the client didn't provide a provenance, then an appropriate value needs to be
+            // determined.
+            if (!provenance.hasSource()) {
+                if (clientSuppliedWriteConcern) {
+                    provenance.setSource(ReadWriteConcernProvenance::Source::clientSupplied);
+                } else if (customDefaultWriteConcernWasApplied) {
+                    provenance.setSource(ReadWriteConcernProvenance::Source::customDefault);
+                } else {
+                    provenance.setSource(ReadWriteConcernProvenance::Source::implicitDefault);
+                }
+            }
+
+            // Ensure that the WC being set on the opCtx has provenance.
+            invariant(wc.getProvenance().hasSource(),
+                      str::stream()
+                          << "unexpected unset provenance on writeConcern: " << wc.toBSON());
+
             opCtx->setWriteConcern(wc);
         }
+
+        bool clientSuppliedReadConcern = readConcernArgs.isSpecified();
+        bool customDefaultReadConcernWasApplied = false;
 
         auto readConcernSupport = invocation->supportsReadConcern(readConcernArgs.getLevel());
         if (readConcernSupport.defaultReadConcernPermit.isOK() &&
@@ -471,14 +528,53 @@ void runCommand(OperationContext* opCtx,
                         stdx::lock_guard<Client> lk(*opCtx->getClient());
                         readConcernArgs = std::move(*rcDefault);
                     }
-                    LOG(2) << "Applying default readConcern on "
-                           << invocation->definition()->getName() << " of " << *rcDefault;
+                    customDefaultReadConcernWasApplied = true;
+                    LOGV2_DEBUG(22767,
+                                2,
+                                "Applying default readConcern on {invocation_definition_getName} "
+                                "of {rcDefault}",
+                                "invocation_definition_getName"_attr =
+                                    invocation->definition()->getName(),
+                                "rcDefault"_attr = *rcDefault);
                     // Update the readConcernSupport, since the default RC was applied.
                     readConcernSupport =
                         invocation->supportsReadConcern(readConcernArgs.getLevel());
                 }
             }
         }
+
+        auto& provenance = readConcernArgs.getProvenance();
+
+        // ClientSupplied is the only provenance that clients are allowed to pass to mongos.
+        if (provenance.hasSource() && !provenance.isClientSupplied()) {
+            auto responseBuilder = replyBuilder->getBodyBuilder();
+            CommandHelpers::appendCommandStatusNoThrow(
+                responseBuilder,
+                Status{ErrorCodes::InvalidOptions,
+                       "readConcern provenance must be unset or \"{}\""_format(
+                           ReadWriteConcernProvenance::kClientSupplied)});
+            return;
+        }
+
+        // If the client didn't provide a provenance, then an appropriate value needs to be
+        // determined.
+        if (!provenance.hasSource()) {
+            // We must obtain the client lock to set the provenance of the opCtx's ReadConcernArgs
+            // as it may be concurrently read by CurrentOp.
+            stdx::lock_guard<Client> lk(*opCtx->getClient());
+            if (clientSuppliedReadConcern) {
+                provenance.setSource(ReadWriteConcernProvenance::Source::clientSupplied);
+            } else if (customDefaultReadConcernWasApplied) {
+                provenance.setSource(ReadWriteConcernProvenance::Source::customDefault);
+            } else {
+                provenance.setSource(ReadWriteConcernProvenance::Source::implicitDefault);
+            }
+        }
+
+        // Ensure that the RC on the opCtx has provenance.
+        invariant(readConcernArgs.getProvenance().hasSource(),
+                  str::stream() << "unexpected unset provenance on readConcern: "
+                                << readConcernArgs.toBSONInner());
 
         // If we are starting a transaction, we only need to check whether the read concern is
         // appropriate for running a transaction. There is no need to check whether the specific
@@ -549,6 +645,48 @@ void runCommand(OperationContext* opCtx,
                 }
 
                 return;
+            } catch (ShardInvalidatedForTargetingException& ex) {
+                auto catalogCache = Grid::get(opCtx)->catalogCache();
+                catalogCache->setOperationShouldBlockBehindCatalogCacheRefresh(opCtx, true);
+
+                // Retry logic specific to transactions. Throws and aborts the transaction if the
+                // error cannot be retried on.
+                if (auto txnRouter = TransactionRouter::get(opCtx)) {
+                    auto abortGuard = makeGuard(
+                        [&] { txnRouter.implicitlyAbortTransaction(opCtx, ex.toStatus()); });
+
+                    if (!canRetry) {
+                        addContextForTransactionAbortingError(txnRouter.txnIdToString(),
+                                                              txnRouter.getLatestStmtId(),
+                                                              ex,
+                                                              "exhausted retries");
+                        throw;
+                    }
+
+                    // TODO SERVER-39704 Allow mongos to retry on stale shard, stale db, snapshot,
+                    // or shard invalidated for targeting errors.
+                    if (!txnRouter.canContinueOnStaleShardOrDbError(commandName)) {
+                        (void)catalogCache->getCollectionRoutingInfoWithRefresh(
+                            opCtx, ex.extraInfo<ShardInvalidatedForTargetingInfo>()->getNss());
+                        addContextForTransactionAbortingError(
+                            txnRouter.txnIdToString(),
+                            txnRouter.getLatestStmtId(),
+                            ex,
+                            "an error from cluster data placement change");
+                        throw;
+                    }
+
+                    // The error is retryable, so update transaction state before retrying.
+                    txnRouter.onStaleShardOrDbError(opCtx, commandName, ex.toStatus());
+
+                    abortGuard.dismiss();
+                    continue;
+                }
+
+                if (canRetry) {
+                    continue;
+                }
+                throw;
             } catch (ExceptionForCat<ErrorCategory::NeedRetargettingError>& ex) {
                 const auto staleNs = [&] {
                     if (auto staleInfo = ex.extraInfo<StaleConfigInfo>()) {
@@ -569,24 +707,24 @@ void runCommand(OperationContext* opCtx,
                     ShardConnection::checkMyConnectionVersions(opCtx, staleNs.ns());
                 }
 
+                auto catalogCache = Grid::get(opCtx)->catalogCache();
+
                 if (auto staleInfo = ex.extraInfo<StaleConfigInfo>()) {
-                    Grid::get(opCtx)
-                        ->catalogCache()
-                        ->invalidateShardOrEntireCollectionEntryForShardedCollection(
-                            opCtx,
-                            staleNs,
-                            staleInfo->getVersionWanted(),
-                            staleInfo->getVersionReceived(),
-                            staleInfo->getShardId());
+                    catalogCache->invalidateShardOrEntireCollectionEntryForShardedCollection(
+                        opCtx,
+                        staleNs,
+                        staleInfo->getVersionWanted(),
+                        staleInfo->getVersionReceived(),
+                        staleInfo->getShardId());
                 } else {
                     // If we don't have the stale config info and therefore don't know the shard's
                     // id, we have to force all further targetting requests for the namespace to
                     // block on a refresh.
-                    Grid::get(opCtx)->catalogCache()->onEpochChange(staleNs);
+                    catalogCache->onEpochChange(staleNs);
                 }
 
-                Grid::get(opCtx)->catalogCache()->setOperationShouldBlockBehindCatalogCacheRefresh(
-                    opCtx, true);
+
+                catalogCache->setOperationShouldBlockBehindCatalogCacheRefresh(opCtx, true);
 
                 // Retry logic specific to transactions. Throws and aborts the transaction if the
                 // error cannot be retried on.
@@ -602,6 +740,8 @@ void runCommand(OperationContext* opCtx,
                         throw;
                     }
 
+                    // TODO SERVER-39704 Allow mongos to retry on stale shard, stale db, snapshot,
+                    // or shard invalidated for targeting errors.
                     if (!txnRouter.canContinueOnStaleShardOrDbError(commandName)) {
                         addContextForTransactionAbortingError(
                             txnRouter.txnIdToString(),
@@ -641,6 +781,8 @@ void runCommand(OperationContext* opCtx,
                         throw;
                     }
 
+                    // TODO SERVER-39704 Allow mongos to retry on stale shard, stale db, snapshot,
+                    // or shard invalidated for targeting errors.
                     if (!txnRouter.canContinueOnStaleShardOrDbError(commandName)) {
                         addContextForTransactionAbortingError(
                             txnRouter.txnIdToString(),
@@ -678,6 +820,8 @@ void runCommand(OperationContext* opCtx,
                         throw;
                     }
 
+                    // TODO SERVER-39704 Allow mongos to retry on stale shard, stale db, snapshot,
+                    // or shard invalidated for targeting errors.
                     if (!txnRouter.canContinueOnSnapshotError()) {
                         addContextForTransactionAbortingError(txnRouter.txnIdToString(),
                                                               txnRouter.getLatestStmtId(),
@@ -745,8 +889,13 @@ DbResponse Strategy::queryOp(OperationContext* opCtx, const NamespaceString& nss
     audit::logQueryAuthzCheck(client, nss, q.query, status.code());
     uassertStatusOK(status);
 
-    LOG(3) << "query: " << q.ns << " " << redact(q.query) << " ntoreturn: " << q.ntoreturn
-           << " options: " << q.queryOptions;
+    LOGV2_DEBUG(22768,
+                3,
+                "query: {q_ns} {q_query} ntoreturn: {q_ntoreturn} options: {q_queryOptions}",
+                "q_ns"_attr = q.ns,
+                "q_query"_attr = redact(q.query),
+                "q_ntoreturn"_attr = q.ntoreturn,
+                "q_queryOptions"_attr = q.queryOptions);
 
     if (q.queryOptions & QueryOption_Exhaust) {
         uasserted(18526,
@@ -844,22 +993,44 @@ DbResponse Strategy::clientCommand(OperationContext* opCtx, const Message& m) {
                 if (ErrorCodes::isConnectionFatalMessageParseError(ex.code()))
                     propagateException = true;
 
-                LOG(1) << "Exception thrown while parsing command " << causedBy(redact(ex));
+                LOGV2_DEBUG(22769,
+                            1,
+                            "Exception thrown while parsing command {causedBy_ex}",
+                            "causedBy_ex"_attr = causedBy(redact(ex)));
                 throw;
             }
         }();
 
         opCtx->setExhaust(OpMsg::isFlagSet(m, OpMsg::kExhaustSupported));
+        const auto session = opCtx->getClient()->session();
+        if (session) {
+            if (!opCtx->isExhaust() || request.getCommandName() != "isMaster"_sd) {
+                InExhaustIsMaster::get(session.get())->setInExhaustIsMaster(false);
+            }
+        }
 
         // Execute.
         std::string db = request.getDatabase().toString();
         try {
-            LOG(3) << "Command begin db: " << db << " msg id: " << m.header().getId();
+            LOGV2_DEBUG(22770,
+                        3,
+                        "Command begin db: {db} msg id: {m_header_getId}",
+                        "db"_attr = db,
+                        "m_header_getId"_attr = m.header().getId());
             runCommand(opCtx, request, m.operation(), reply.get(), &errorBuilder);
-            LOG(3) << "Command end db: " << db << " msg id: " << m.header().getId();
+            LOGV2_DEBUG(22771,
+                        3,
+                        "Command end db: {db} msg id: {m_header_getId}",
+                        "db"_attr = db,
+                        "m_header_getId"_attr = m.header().getId());
         } catch (const DBException& ex) {
-            LOG(1) << "Exception thrown while processing command on " << db
-                   << " msg id: " << m.header().getId() << causedBy(redact(ex));
+            LOGV2_DEBUG(22772,
+                        1,
+                        "Exception thrown while processing command on {db} msg id: "
+                        "{m_header_getId}{causedBy_ex}",
+                        "db"_attr = db,
+                        "m_header_getId"_attr = m.header().getId(),
+                        "causedBy_ex"_attr = causedBy(redact(ex)));
 
             // Record the exception in CurOp.
             CurOp::get(opCtx)->debug().errInfo = ex.toStatus();
@@ -996,7 +1167,10 @@ void Strategy::killCursors(OperationContext* opCtx, DbMessage* dbm) {
 
         boost::optional<NamespaceString> nss = manager->getNamespaceForCursorId(cursorId);
         if (!nss) {
-            LOG(3) << "Can't find cursor to kill.  Cursor id: " << cursorId << ".";
+            LOGV2_DEBUG(22773,
+                        3,
+                        "Can't find cursor to kill.  Cursor id: {cursorId}.",
+                        "cursorId"_attr = cursorId);
             continue;
         }
 
@@ -1007,19 +1181,30 @@ void Strategy::killCursors(OperationContext* opCtx, DbMessage* dbm) {
         auto authzStatus = manager->checkAuthForKillCursors(opCtx, *nss, cursorId, authChecker);
         audit::logKillCursorsAuthzCheck(client, *nss, cursorId, authzStatus.code());
         if (!authzStatus.isOK()) {
-            LOG(3) << "Not authorized to kill cursor.  Namespace: '" << *nss
-                   << "', cursor id: " << cursorId << ".";
+            LOGV2_DEBUG(
+                22774,
+                3,
+                "Not authorized to kill cursor.  Namespace: '{nss}', cursor id: {cursorId}.",
+                "nss"_attr = *nss,
+                "cursorId"_attr = cursorId);
             continue;
         }
 
         Status killCursorStatus = manager->killCursor(opCtx, *nss, cursorId);
         if (!killCursorStatus.isOK()) {
-            LOG(3) << "Can't find cursor to kill.  Namespace: '" << *nss
-                   << "', cursor id: " << cursorId << ".";
+            LOGV2_DEBUG(22775,
+                        3,
+                        "Can't find cursor to kill.  Namespace: '{nss}', cursor id: {cursorId}.",
+                        "nss"_attr = *nss,
+                        "cursorId"_attr = cursorId);
             continue;
         }
 
-        LOG(3) << "Killed cursor.  Namespace: '" << *nss << "', cursor id: " << cursorId << ".";
+        LOGV2_DEBUG(22776,
+                    3,
+                    "Killed cursor.  Namespace: '{nss}', cursor id: {cursorId}.",
+                    "nss"_attr = *nss,
+                    "cursorId"_attr = cursorId);
     }
 }
 
@@ -1079,6 +1264,14 @@ void Strategy::explainFind(OperationContext* opCtx,
                                                            qr.getCollation());
             millisElapsed = timer.millis();
             break;
+        } catch (ExceptionFor<ErrorCodes::ShardInvalidatedForTargeting>&) {
+            Grid::get(opCtx)->catalogCache()->setOperationShouldBlockBehindCatalogCacheRefresh(
+                opCtx, true);
+
+            if (canRetry) {
+                continue;
+            }
+            throw;
         } catch (const ExceptionForCat<ErrorCategory::NeedRetargettingError>& ex) {
             const auto staleNs = [&] {
                 if (auto staleInfo = ex.extraInfo<StaleConfigInfo>()) {

@@ -42,10 +42,10 @@ env.Library(
 
 env.Library(
     target=[
-        'sasl_iam_common',
+        'sasl_aws_common',
     ],
     source=[
-        env.Idlc('sasl_iam_protocol_common.idl')[0],
+        env.Idlc('sasl_aws_protocol_common.idl')[0],
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/base',
@@ -60,18 +60,18 @@ kmsEnv.InjectThirdParty(libraries=['kms-message'])
 
 kmsEnv.Library(
     target=[
-        'sasl_iam_client',
+        'sasl_aws_client',
     ],
     source=[
-        'sasl_iam_client_protocol.cpp',
-        env.Idlc('sasl_iam_client_protocol.idl')[0],
+        'sasl_aws_client_protocol.cpp',
+        env.Idlc('sasl_aws_client_protocol.idl')[0],
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/third_party/shim_kms_message',
         '$BUILD_DIR/mongo/idl/idl_parser',
         '$BUILD_DIR/mongo/db/server_options_core', # For object_check.h
-        'sasl_iam_common',
+        'sasl_aws_common',
     ],
 )
 
@@ -89,8 +89,8 @@ saslClientSource = [
 
 if get_option('ssl') == 'on':
     saslClientSource.extend([
-        'sasl_iam_client_conversation.cpp',
-        env.Idlc('sasl_iam_client_options.idl')[0],
+        'sasl_aws_client_conversation.cpp',
+        env.Idlc('sasl_aws_client_options.idl')[0],
     ])
 
 # Add in actual sasl dependencies if sasl is enabled, otherwise
@@ -112,7 +112,7 @@ saslClientEnv.Library(
     target='sasl_client',
     source=saslClientSource,
     LIBDEPS=[
-        "sasl_iam_client" if get_option('ssl') == 'on' else '',
+        "sasl_aws_client" if get_option('ssl') == 'on' else '',
         '$BUILD_DIR/mongo/base/secure_allocator',
         '$BUILD_DIR/mongo/bson/util/bson_extract',
         '$BUILD_DIR/mongo/executor/remote_command',
@@ -138,6 +138,9 @@ env.Library(
         '$BUILD_DIR/mongo/bson/util/bson_extract',
         '$BUILD_DIR/mongo/executor/remote_command',
         'sasl_client'
+    ],
+    LIBDEPS_PRIVATE=[
+        'connection_string',
     ],
 )
 
@@ -191,7 +194,10 @@ clientDriverEnv.Library(
         env.Idlc('global_conn_pool.idl')[0],
         'replica_set_change_notifier.cpp',
         'replica_set_monitor.cpp',
+        'scanning_replica_set_monitor.cpp',
+        'streamable_replica_set_monitor.cpp',
         'replica_set_monitor_manager.cpp',
+        env.Idlc('replica_set_monitor_params.idl')[0],
         'server_ping_monitor.cpp',
     ],
     LIBDEPS=[
@@ -301,19 +307,22 @@ env.CppUnitTest(
         'authenticate_test.cpp',
         'connection_string_test.cpp',
         'dbclient_cursor_test.cpp',
+        'disable_streamable_rsm_flag_test.cpp',
         'fetcher_test.cpp',
         'index_spec_test.cpp',
         'mongo_uri_test.cpp',
         'read_preference_test.cpp',
         'remote_command_retry_scheduler_test.cpp',
-        'replica_set_monitor_internal_test.cpp',
-        'replica_set_monitor_read_preference_test.cpp',
-        'replica_set_monitor_scan_test.cpp',
-        'replica_set_monitor_test_concurrent.cpp',
-        'replica_set_monitor_test_fixture.cpp',
+        'scanning_replica_set_monitor_internal_test.cpp',
+        'scanning_replica_set_monitor_read_preference_test.cpp',
+        'scanning_replica_set_monitor_scan_test.cpp',
+        'scanning_replica_set_monitor_test_concurrent.cpp',
+        'scanning_replica_set_monitor_test_fixture.cpp',
+        'server_ping_monitor_test.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/client/clientdriver_network',
+        '$BUILD_DIR/mongo/client/sdam/sdam',
+        '$BUILD_DIR/mongo/client/sdam/sdam_test',
         '$BUILD_DIR/mongo/db/auth/authmocks',
         '$BUILD_DIR/mongo/db/service_context_test_fixture',
         '$BUILD_DIR/mongo/db/write_concern_options',

@@ -43,6 +43,12 @@ namespace mongo {
 namespace executor {
 
 struct RemoteCommandRequestBase {
+    struct HedgeOptions {
+        size_t count;
+    };
+
+    enum FireAndForgetMode { kOn, kOff };
+
     // Indicates that there is no timeout for the request to complete
     static constexpr Milliseconds kNoTimeout{-1};
 
@@ -58,7 +64,9 @@ struct RemoteCommandRequestBase {
                              const BSONObj& theCmdObj,
                              const BSONObj& metadataObj,
                              OperationContext* opCtx,
-                             Milliseconds timeoutMillis);
+                             Milliseconds timeoutMillis,
+                             boost::optional<HedgeOptions> hedgeOptions,
+                             FireAndForgetMode fireAndForgetMode);
 
     // Internal id of this request. Not interpreted and used for tracing purposes only.
     RequestId id;
@@ -75,6 +83,12 @@ struct RemoteCommandRequestBase {
     // metadata is propagated. It is allowed to be null if used on NetworkInterfaces without
     // metadata attachment (i.e., replication).
     OperationContext* opCtx{nullptr};
+
+    boost::optional<HedgeOptions> hedgeOptions;
+
+    boost::optional<UUID> operationKey;
+
+    FireAndForgetMode fireAndForgetMode;
 
     Milliseconds timeout = kNoTimeout;
 
@@ -112,22 +126,51 @@ struct RemoteCommandRequestImpl : RemoteCommandRequestBase {
                              const BSONObj& theCmdObj,
                              const BSONObj& metadataObj,
                              OperationContext* opCtx,
-                             Milliseconds timeoutMillis);
+                             Milliseconds timeoutMillis = kNoTimeout,
+                             boost::optional<HedgeOptions> hedgeOptions = boost::none,
+                             FireAndForgetMode fireAndForgetMode = FireAndForgetMode::kOff);
 
     RemoteCommandRequestImpl(const Target& theTarget,
                              const std::string& theDbName,
                              const BSONObj& theCmdObj,
                              const BSONObj& metadataObj,
                              OperationContext* opCtx,
-                             Milliseconds timeoutMillis = kNoTimeout);
+                             Milliseconds timeoutMillis = kNoTimeout,
+                             boost::optional<HedgeOptions> hedgeOptions = boost::none,
+                             FireAndForgetMode fireAndForgetMode = FireAndForgetMode::kOff);
+
+    RemoteCommandRequestImpl(const Target& theTarget,
+                             const std::string& theDbName,
+                             const BSONObj& theCmdObj,
+                             const BSONObj& metadataObj,
+                             OperationContext* opCtx,
+                             boost::optional<HedgeOptions> hedgeOptions,
+                             FireAndForgetMode fireAndForgetMode = FireAndForgetMode::kOff)
+        : RemoteCommandRequestImpl(theTarget,
+                                   theDbName,
+                                   theCmdObj,
+                                   metadataObj,
+                                   opCtx,
+                                   kNoTimeout,
+                                   hedgeOptions,
+                                   fireAndForgetMode) {}
+
 
     RemoteCommandRequestImpl(const Target& theTarget,
                              const std::string& theDbName,
                              const BSONObj& theCmdObj,
                              OperationContext* opCtx,
-                             Milliseconds timeoutMillis = kNoTimeout)
-        : RemoteCommandRequestImpl(
-              theTarget, theDbName, theCmdObj, rpc::makeEmptyMetadata(), opCtx, timeoutMillis) {}
+                             Milliseconds timeoutMillis = kNoTimeout,
+                             boost::optional<HedgeOptions> hedgeOptions = boost::none,
+                             FireAndForgetMode fireAndForgetMode = FireAndForgetMode::kOff)
+        : RemoteCommandRequestImpl(theTarget,
+                                   theDbName,
+                                   theCmdObj,
+                                   rpc::makeEmptyMetadata(),
+                                   opCtx,
+                                   timeoutMillis,
+                                   hedgeOptions,
+                                   fireAndForgetMode) {}
 
     std::string toString() const;
 

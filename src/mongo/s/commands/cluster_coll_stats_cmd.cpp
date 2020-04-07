@@ -32,10 +32,10 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/commands.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -49,6 +49,10 @@ public:
     }
 
     bool adminOnly() const override {
+        return false;
+    }
+
+    bool maintenanceOk() const override {
         return false;
     }
 
@@ -173,7 +177,9 @@ public:
                         }
                     }
                 } else {
-                    log() << "mongos collstats doesn't know about: " << e.fieldName();
+                    LOGV2(22749,
+                          "mongos collstats doesn't know about: {e_fieldName}",
+                          "e_fieldName"_attr = e.fieldName());
                 }
             }
 

@@ -57,15 +57,38 @@ void doLog(int32_t id,
            const fmt::internal::named_arg<Args, char>&... args) {
     auto attributes = makeAttributeStorage(args...);
 
-    auto msg = static_cast<fmt::string_view>(message);
+    fmt::string_view msg{message};
     doLogImpl(id, severity, options, StringData(msg.data(), msg.size()), attributes);
+}
+
+template <typename S, size_t N, typename... Args>
+void doLog(int32_t id,
+           LogSeverity const& severity,
+           LogOptions const& options,
+           S const& fmtmsg,
+           const char (&msg)[N],
+           const fmt::internal::named_arg<Args, char>&... args) {
+    // TODO: When using JSON formatter, use 'msg' instead of 'fmtmsg' below.
+    doLog(id, severity, options, fmtmsg, args...);
+}
+
+template <typename S>
+void doLog(int32_t id,
+           LogSeverity const& severity,
+           LogOptions const& options,
+           S const& message,
+           const DynamicAttributes& dynamicAttrs) {
+    fmt::string_view msg{message};
+    doLogImpl(id, severity, options, StringData(msg.data(), msg.size()), dynamicAttrs);
 }
 
 }  // namespace detail
 }  // namespace logv2
 
+inline namespace literals {
 inline fmt::internal::udl_arg<char> operator"" _attr(const char* s, std::size_t) {
     return {s};
 }
+}  // namespace literals
 
 }  // namespace mongo

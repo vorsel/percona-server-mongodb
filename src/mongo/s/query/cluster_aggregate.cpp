@@ -45,8 +45,8 @@
 #include "mongo/db/pipeline/document_source_out.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
-#include "mongo/db/pipeline/mongos_process_interface.h"
 #include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/process_interface/mongos_process_interface.h"
 #include "mongo/db/pipeline/sharded_agg_helpers.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/cursor_response.h"
@@ -76,7 +76,6 @@
 #include "mongo/s/query/store_possible_cursor.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/s/transaction_router.h"
-#include "mongo/util/log.h"
 #include "mongo/util/net/socket_utils.h"
 
 namespace mongo {
@@ -117,12 +116,14 @@ boost::intrusive_ptr<ExpressionContext> makeExpressionContext(
 
     // Create the expression context, and set 'inMongos' to true. We explicitly do *not* set
     // mergeCtx->tempDir.
-    auto mergeCtx = new ExpressionContext(opCtx,
-                                          request,
-                                          std::move(collation),
-                                          std::make_shared<MongoSInterface>(),
-                                          std::move(resolvedNamespaces),
-                                          uuid);
+    auto mergeCtx =
+        new ExpressionContext(opCtx,
+                              request,
+                              std::move(collation),
+                              std::make_shared<MongosProcessInterface>(
+                                  Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor()),
+                              std::move(resolvedNamespaces),
+                              uuid);
 
     mergeCtx->inMongos = true;
     return mergeCtx;
@@ -255,7 +256,7 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
                 return {request.getCollation(), boost::none};
             }
 
-            return sharded_agg_helpers::getCollationAndUUID(
+            return cluster_aggregation_planner::getCollationAndUUID(
                 routingInfo, namespaces.executionNss, request.getCollation());
         }();
 
@@ -266,12 +267,12 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
             opCtx, request, collationObj, uuid, resolveInvolvedNamespaces(involvedNamespaces));
 
         // Parse and optimize the full pipeline.
-        auto pipeline = uassertStatusOK(Pipeline::parse(request.getPipeline(), expCtx));
+        auto pipeline = Pipeline::parse(request.getPipeline(), expCtx);
         pipeline->optimizePipeline();
         return pipeline;
     };
 
-    auto targeter = sharded_agg_helpers::AggregationTargeter::make(
+    auto targeter = cluster_aggregation_planner::AggregationTargeter::make(
         opCtx,
         namespaces.executionNss,
         pipelineBuilder,
@@ -284,8 +285,9 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
         // When the AggregationTargeter chooses a "passthrough" policy, it does not call the
         // 'pipelineBuilder' function, so we never get an expression context. Because this is a
         // passthrough, we only need a bare minimum expression context anyway.
-        invariant(targeter.policy == sharded_agg_helpers::AggregationTargeter::kPassthrough);
-        expCtx = make_intrusive<ExpressionContext>(opCtx, nullptr);
+        invariant(targeter.policy ==
+                  cluster_aggregation_planner::AggregationTargeter::kPassthrough);
+        expCtx = make_intrusive<ExpressionContext>(opCtx, nullptr, namespaces.executionNss);
     }
 
     if (request.getExplain()) {
@@ -294,10 +296,10 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
 
     auto status = [&]() {
         switch (targeter.policy) {
-            case sharded_agg_helpers::AggregationTargeter::TargetingPolicy::kPassthrough: {
+            case cluster_aggregation_planner::AggregationTargeter::TargetingPolicy::kPassthrough: {
                 // A pipeline with $changeStream should never be allowed to passthrough.
                 invariant(!hasChangeStream);
-                return sharded_agg_helpers::runPipelineOnPrimaryShard(
+                return cluster_aggregation_planner::runPipelineOnPrimaryShard(
                     expCtx,
                     namespaces,
                     targeter.routingInfo->db(),
@@ -307,7 +309,8 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
                     result);
             }
 
-            case sharded_agg_helpers::AggregationTargeter::TargetingPolicy::kMongosRequired: {
+            case cluster_aggregation_planner::AggregationTargeter::TargetingPolicy::
+                kMongosRequired: {
                 // If this is an explain write the explain output and return.
                 auto expCtx = targeter.pipeline->getContext();
                 if (expCtx->explain) {
@@ -318,16 +321,18 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
                     return Status::OK();
                 }
 
-                return sharded_agg_helpers::runPipelineOnMongoS(namespaces,
-                                                                request.getBatchSize(),
-                                                                std::move(targeter.pipeline),
-                                                                result,
-                                                                privileges);
+                return cluster_aggregation_planner::runPipelineOnMongoS(
+                    namespaces,
+                    request.getBatchSize(),
+                    std::move(targeter.pipeline),
+                    result,
+                    privileges);
             }
 
-            case sharded_agg_helpers::AggregationTargeter::TargetingPolicy::kAnyShard: {
-                return sharded_agg_helpers::dispatchPipelineAndMerge(
+            case cluster_aggregation_planner::AggregationTargeter::TargetingPolicy::kAnyShard: {
+                return cluster_aggregation_planner::dispatchPipelineAndMerge(
                     opCtx,
+                    expCtx->mongoProcessInterface->taskExecutor,
                     std::move(targeter),
                     request.serializeToCommandObj(),
                     request.getBatchSize(),
@@ -342,9 +347,11 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
         MONGO_UNREACHABLE;
     }();
 
-    if (status.isOK())
+    if (status.isOK()) {
         updateHostsTargetedMetrics(opCtx, namespaces.executionNss, routingInfo, involvedNamespaces);
-
+        // Report usage statistics for each stage in the pipeline.
+        liteParsedPipeline.tickGlobalStageCounters();
+    }
     return status;
 }
 

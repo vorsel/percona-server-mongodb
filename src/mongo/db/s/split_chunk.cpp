@@ -47,11 +47,11 @@
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/db/s/sharding_state.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/split_chunk_request_type.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -213,8 +213,10 @@ StatusWith<boost::optional<ChunkRange>> splitChunk(OperationContext* opCtx,
 
     Collection* const collection = autoColl.getCollection();
     if (!collection) {
-        warning() << "will not perform top-chunk checking since " << nss.toString()
-                  << " does not exist after splitting";
+        LOGV2_WARNING(
+            23778,
+            "will not perform top-chunk checking since {nss} does not exist after splitting",
+            "nss"_attr = nss.toString());
         return boost::optional<ChunkRange>(boost::none);
     }
 

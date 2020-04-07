@@ -38,7 +38,7 @@
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 namespace {
@@ -125,9 +125,12 @@ StatusWith<Shard::CommandResponse> Shard::runCommand(OperationContext* opCtx,
         auto swResponse = _runCommand(opCtx, readPref, dbName, maxTimeMSOverride, cmdObj);
         auto status = CommandResponse::getEffectiveStatus(swResponse);
         if (isRetriableError(status.code(), retryPolicy)) {
-            LOG(2) << "Command " << redact(cmdObj)
-                   << " failed with retriable error and will be retried"
-                   << causedBy(redact(status));
+            LOGV2_DEBUG(
+                22719,
+                2,
+                "Command {cmdObj} failed with retriable error and will be retried{causedBy_status}",
+                "cmdObj"_attr = redact(cmdObj),
+                "causedBy_status"_attr = causedBy(redact(status)));
             continue;
         }
 
@@ -162,9 +165,12 @@ StatusWith<Shard::CommandResponse> Shard::runCommandWithFixedRetryAttempts(
         auto swResponse = _runCommand(opCtx, readPref, dbName, maxTimeMSOverride, cmdObj);
         auto status = CommandResponse::getEffectiveStatus(swResponse);
         if (retry < kOnErrorNumRetries && isRetriableError(status.code(), retryPolicy)) {
-            LOG(2) << "Command " << redact(cmdObj)
-                   << " failed with retriable error and will be retried"
-                   << causedBy(redact(status));
+            LOGV2_DEBUG(
+                22720,
+                2,
+                "Command {cmdObj} failed with retriable error and will be retried{causedBy_status}",
+                "cmdObj"_attr = redact(cmdObj),
+                "causedBy_status"_attr = causedBy(redact(status)));
             continue;
         }
 
@@ -207,9 +213,12 @@ BatchedCommandResponse Shard::runBatchWriteCommand(OperationContext* opCtx,
         BatchedCommandResponse batchResponse;
         auto writeStatus = CommandResponse::processBatchWriteResponse(swResponse, &batchResponse);
         if (retry < kOnErrorNumRetries && isRetriableError(writeStatus.code(), retryPolicy)) {
-            LOG(2) << "Batch write command to " << getId()
-                   << " failed with retriable error and will be retried"
-                   << causedBy(redact(writeStatus));
+            LOGV2_DEBUG(22721,
+                        2,
+                        "Batch write command to {getId} failed with retriable error and will be "
+                        "retried{causedBy_writeStatus}",
+                        "getId"_attr = getId(),
+                        "causedBy_writeStatus"_attr = causedBy(redact(writeStatus)));
             continue;
         }
 

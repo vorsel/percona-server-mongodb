@@ -63,6 +63,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/executor/network_interface_mock.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/metadata/oplog_query_metadata.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/stdx/future.h"
@@ -70,9 +71,9 @@
 #include "mongo/unittest/barrier.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/ensure_fcv.h"
+#include "mongo/unittest/log_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/timer.h"
@@ -289,7 +290,7 @@ TEST_F(ReplCoordTest,
                                                                                 << "node2:12345"))),
                                                &result1);
     ASSERT_EQUALS(ErrorCodes::InvalidReplicaSetConfig, status);
-    ASSERT_STRING_CONTAINS(status.reason(), "is not electable under the new configuration version");
+    ASSERT_STRING_CONTAINS(status.reason(), "is not electable under the new configuration with");
     ASSERT_FALSE(getExternalState()->threadsStarted());
 }
 
@@ -1320,7 +1321,10 @@ protected:
         getNet()->runUntil(getNet()->now() + heartbeatInterval);
         NetworkInterfaceMock::NetworkOperationIterator noi = getNet()->getNextReadyRequest();
         RemoteCommandRequest request = noi->getRequest();
-        log() << request.target.toString() << " processing " << request.cmdObj;
+        LOGV2(21497,
+              "{request_target} processing {request_cmdObj}",
+              "request_target"_attr = request.target.toString(),
+              "request_cmdObj"_attr = request.cmdObj);
         ReplSetHeartbeatArgsV1 hbArgs;
         if (hbArgs.initialize(request.cmdObj).isOK()) {
             ReplSetHeartbeatResponse hbResp;
@@ -1336,7 +1340,9 @@ protected:
         }
         while (getNet()->hasReadyRequests()) {
             auto noi = getNet()->getNextReadyRequest();
-            log() << "Blackholing network request " << noi->getRequest().cmdObj;
+            LOGV2(21498,
+                  "Blackholing network request {noi_getRequest_cmdObj}",
+                  "noi_getRequest_cmdObj"_attr = noi->getRequest().cmdObj);
             getNet()->blackHole(noi);
         }
 
@@ -1969,7 +1975,10 @@ protected:
             ReplSetHeartbeatArgsV1 hbArgs;
             ASSERT_OK(hbArgs.initialize(request.cmdObj));
 
-            log() << request.target.toString() << " processing " << request.cmdObj;
+            LOGV2(21499,
+                  "{request_target} processing {request_cmdObj}",
+                  "request_target"_attr = request.target.toString(),
+                  "request_cmdObj"_attr = request.cmdObj);
 
             // Catch up 'numNodesCaughtUp' nodes out of 5.
             OpTime optimeResponse = (hbNum <= numNodesCaughtUp) ? optimePrimary : optimeLagged;
@@ -2365,7 +2374,10 @@ TEST_F(StepDownTest,
     getNet()->runUntil(getNet()->now() + Milliseconds(2000));
     NetworkInterfaceMock::NetworkOperationIterator noi = getNet()->getNextReadyRequest();
     RemoteCommandRequest request = noi->getRequest();
-    log() << "HB1: " << request.target.toString() << " processing " << request.cmdObj;
+    LOGV2(21500,
+          "HB1: {request_target} processing {request_cmdObj}",
+          "request_target"_attr = request.target.toString(),
+          "request_cmdObj"_attr = request.cmdObj);
     ReplSetHeartbeatArgsV1 hbArgs;
     if (hbArgs.initialize(request.cmdObj).isOK()) {
         ReplSetHeartbeatResponse hbResp;
@@ -2651,7 +2663,7 @@ TEST_F(ReplCoordTest, NodeIncludesOtherMembersProgressInUpdatePositionCommand) {
         long long memberId = entry[UpdatePositionArgs::kMemberIdFieldName].Number();
         memberIds.insert(memberId);
         if (memberId == 0) {
-            log() << 0;
+            LOGV2(21501, "{_0}", "_0"_attr = 0);
             ASSERT_OK(bsonExtractOpTimeField(
                 entry, UpdatePositionArgs::kAppliedOpTimeFieldName, &appliedOpTime));
             ASSERT_OK(bsonExtractOpTimeField(
@@ -2659,7 +2671,7 @@ TEST_F(ReplCoordTest, NodeIncludesOtherMembersProgressInUpdatePositionCommand) {
             ASSERT_EQUALS(optime1, appliedOpTime);
             ASSERT_EQUALS(optime1, durableOpTime);
         } else if (memberId == 1) {
-            log() << 1;
+            LOGV2(21502, "{_1}", "_1"_attr = 1);
             ASSERT_OK(bsonExtractOpTimeField(
                 entry, UpdatePositionArgs::kAppliedOpTimeFieldName, &appliedOpTime));
             ASSERT_OK(bsonExtractOpTimeField(
@@ -2667,7 +2679,7 @@ TEST_F(ReplCoordTest, NodeIncludesOtherMembersProgressInUpdatePositionCommand) {
             ASSERT_EQUALS(optime2, appliedOpTime);
             ASSERT_EQUALS(OpTime(), durableOpTime);
         } else if (memberId == 2) {
-            log() << 2;
+            LOGV2(21503, "{_2}", "_2"_attr = 2);
             ASSERT_OK(bsonExtractOpTimeField(
                 entry, UpdatePositionArgs::kAppliedOpTimeFieldName, &appliedOpTime));
             ASSERT_OK(bsonExtractOpTimeField(
@@ -2675,7 +2687,7 @@ TEST_F(ReplCoordTest, NodeIncludesOtherMembersProgressInUpdatePositionCommand) {
             ASSERT_EQUALS(optime3, appliedOpTime);
             ASSERT_EQUALS(optime3, durableOpTime);
         } else {
-            log() << 3;
+            LOGV2(21504, "{_3}", "_3"_attr = 3);
             ASSERT_EQUALS(3, memberId);
             ASSERT_OK(bsonExtractOpTimeField(
                 entry, UpdatePositionArgs::kAppliedOpTimeFieldName, &appliedOpTime));
@@ -3238,6 +3250,482 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnStepDown) {
     getIsMasterThread.join();
 }
 
+TEST_F(ReplCoordTest, AllIsMasterFieldsRespectHorizon) {
+    init();
+    const auto primaryHostName = "node1:12345";
+    const auto primaryHostNameHorizon = "horizon.com:15";
+    const auto passiveHostName = "node2:12345";
+    const auto passiveHostNameHorizon = "horizon.com:16";
+    const auto arbiterHostName = "node3:12345";
+    const auto arbiterHostNameHorizon = "horizon.com:17";
+    assertStartSuccess(
+        BSON("_id"
+             << "mySet"
+             << "version" << 1 << "members"
+             << BSON_ARRAY(BSON("host" << primaryHostName << "_id" << 1 << "horizons"
+                                       << BSON("horizon" << primaryHostNameHorizon))
+                           << BSON("host" << passiveHostName << "_id" << 2 << "horizons"
+                                          << BSON("horizon" << passiveHostNameHorizon) << "priority"
+                                          << 0)
+                           << BSON("host" << arbiterHostName << "_id" << 3 << "horizons"
+                                          << BSON("horizon" << arbiterHostNameHorizon)
+                                          << "arbiterOnly" << true))),
+        HostAndPort(primaryHostName));
+
+    // Become primary.
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+    replCoordSetMyLastAppliedOpTime(OpTimeWithTermOne(100, 1), Date_t() + Seconds(100));
+    replCoordSetMyLastDurableOpTime(OpTimeWithTermOne(100, 1), Date_t() + Seconds(100));
+    simulateSuccessfulV1Election();
+    ASSERT(getReplCoord()->getMemberState().primary());
+
+    auto opCtx = makeOperationContext();
+
+    // When no horizon is specified, the isMaster response uses the default horizon.
+    {
+        HostAndPort primaryHostAndPort(primaryHostName);
+        HostAndPort passiveHostAndPort(passiveHostName);
+        HostAndPort arbiterHostAndPort(arbiterHostName);
+
+        const auto response =
+            getReplCoord()->awaitIsMasterResponse(opCtx.get(), {}, boost::none, boost::none);
+        const auto hosts = response->getHosts();
+        ASSERT_EQUALS(hosts[0], primaryHostAndPort);
+        ASSERT_EQUALS(response->getPrimary(), primaryHostAndPort);
+        ASSERT_EQUALS(response->getMe(), primaryHostAndPort);
+        const auto passives = response->getPassives();
+        ASSERT_EQUALS(passives[0], passiveHostAndPort);
+        const auto arbiters = response->getArbiters();
+        ASSERT_EQUALS(arbiters[0], arbiterHostAndPort);
+    }
+
+    // The isMaster response respects the requested horizon.
+    {
+        HostAndPort primaryHostAndPort(primaryHostNameHorizon);
+        HostAndPort passiveHostAndPort(passiveHostNameHorizon);
+        HostAndPort arbiterHostAndPort(arbiterHostNameHorizon);
+
+        const std::string horizonSniName = "horizon.com";
+        const auto horizon = SplitHorizon::Parameters(horizonSniName);
+        const auto response =
+            getReplCoord()->awaitIsMasterResponse(opCtx.get(), horizon, boost::none, boost::none);
+        const auto hosts = response->getHosts();
+        ASSERT_EQUALS(hosts[0], primaryHostAndPort);
+        ASSERT_EQUALS(response->getPrimary(), primaryHostAndPort);
+        ASSERT_EQUALS(response->getMe(), primaryHostAndPort);
+        const auto passives = response->getPassives();
+        ASSERT_EQUALS(passives[0], passiveHostAndPort);
+        const auto arbiters = response->getArbiters();
+        ASSERT_EQUALS(arbiters[0], arbiterHostAndPort);
+    }
+}
+
+TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsErrorOnHorizonChange) {
+    init();
+    assertStartSuccess(BSON("_id"
+                            << "mySet"
+                            << "version" << 2 << "members"
+                            << BSON_ARRAY(BSON("host"
+                                               << "node1:12345"
+                                               << "_id" << 0)
+                                          << BSON("host"
+                                                  << "node2:12345"
+                                                  << "_id" << 1))),
+                       HostAndPort("node1", 12345));
+
+    // Become primary.
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+    replCoordSetMyLastAppliedOpTime(OpTimeWithTermOne(100, 1), Date_t() + Seconds(100));
+    replCoordSetMyLastDurableOpTime(OpTimeWithTermOne(100, 1), Date_t() + Seconds(100));
+    simulateSuccessfulV1Election();
+    ASSERT(getReplCoord()->getMemberState().primary());
+
+    auto maxAwaitTime = Milliseconds(5000);
+    auto deadline = getNet()->now() + maxAwaitTime;
+    auto opCtx = makeOperationContext();
+
+    auto waitForIsMasterFailPoint = globalFailPointRegistry().find("waitForIsMasterResponse");
+    auto timesEnteredFailPoint = waitForIsMasterFailPoint->setMode(FailPoint::alwaysOn, 0);
+
+    // awaitIsMasterResponse blocks and waits on a future when the request TopologyVersion equals
+    // the current TopologyVersion of the server.
+    stdx::thread getIsMasterThread([&] {
+        auto currentTopologyVersion = getTopoCoord().getTopologyVersion();
+
+        ASSERT_THROWS_CODE(getReplCoord()->awaitIsMasterResponse(
+                               opCtx.get(), {}, currentTopologyVersion, deadline),
+                           AssertionException,
+                           ErrorCodes::SplitHorizonChange);
+    });
+
+    // Ensure that the isMaster request is waiting before doing a reconfig.
+    waitForIsMasterFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
+    BSONObjBuilder garbage;
+    ReplSetReconfigArgs args;
+    // Use force to bypass the oplog commitment check, which we're not worried about testing here.
+    args.force = true;
+    // Do a reconfig that changes the SplitHorizon and also adds a third node. This should respond
+    // to all waiting isMaster requests with an error.
+    args.newConfigObj = BSON("_id"
+                             << "mySet"
+                             << "version" << 3 << "protocolVersion" << 1 << "members"
+                             << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                      << "node1:12345"
+                                                      << "priority" << 3 << "horizons"
+                                                      << BSON("testhorizon"
+                                                              << "test.monkey.example.com:24"))
+                                           << BSON("_id" << 1 << "host"
+                                                         << "node2:12345"
+                                                         << "horizons"
+                                                         << BSON("testhorizon"
+                                                                 << "test.giraffe.example.com:25"))
+                                           << BSON("_id"
+                                                   << 2 << "host"
+                                                   << "node3:12345"
+                                                   << "horizons"
+                                                   << BSON("testhorizon"
+                                                           << "test.elephant.example.com:26"))));
+    stdx::thread reconfigThread([&] {
+        Status status(ErrorCodes::InternalError, "Not Set");
+        status = getReplCoord()->processReplSetReconfig(opCtx.get(), args, &garbage);
+        ASSERT_OK(status);
+    });
+    replyToReceivedHeartbeatV1();
+    reconfigThread.join();
+    getIsMasterThread.join();
+}
+
+TEST_F(ReplCoordTest, AwaitIsMasterUsesDefaultHorizonWhenRequestedHorizonNotFound) {
+    init();
+    const auto nodeOneHostName = "node1:12345";
+    const auto nodeTwoHostName = "node2:12345";
+    const std::string nodeOneSniName = "node1.old.com";
+    const auto oldHorizonNodeOne = "node1.old.com:24";
+    const auto oldHorizonNodeTwo = "node2.old.com:25";
+    assertStartSuccess(
+        BSON("_id"
+             << "mySet"
+             << "version" << 1 << "members"
+             << BSON_ARRAY(BSON("host" << nodeOneHostName << "_id" << 1 << "horizons"
+                                       << BSON("oldhorizon" << oldHorizonNodeOne))
+                           << BSON("host" << nodeTwoHostName << "_id" << 2 << "horizons"
+                                          << BSON("oldhorizon" << oldHorizonNodeTwo)))),
+        HostAndPort(nodeOneHostName));
+
+    // Become primary.
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+    replCoordSetMyLastAppliedOpTime(OpTimeWithTermOne(100, 1), Date_t() + Seconds(100));
+    replCoordSetMyLastDurableOpTime(OpTimeWithTermOne(100, 1), Date_t() + Seconds(100));
+    simulateSuccessfulV1Election();
+    ASSERT(getReplCoord()->getMemberState().primary());
+
+    auto maxAwaitTime = Milliseconds(5000);
+    auto deadline = getNet()->now() + maxAwaitTime;
+    auto opCtx = makeOperationContext();
+
+    const auto oldHorizon = SplitHorizon::Parameters(nodeOneSniName);
+
+    stdx::thread getIsMasterOldHorizonThread([&] {
+        const auto expectedTopologyVersion = getTopoCoord().getTopologyVersion();
+        const auto response = getReplCoord()->awaitIsMasterResponse(
+            opCtx.get(), oldHorizon, expectedTopologyVersion, deadline);
+        auto topologyVersion = response->getTopologyVersion();
+        const auto hosts = response->getHosts();
+        HostAndPort expectedNodeOneHorizonView(oldHorizonNodeOne);
+        HostAndPort expectedNodeTwoHorizonView(oldHorizonNodeTwo);
+        ASSERT_EQUALS(hosts[0], expectedNodeOneHorizonView);
+        ASSERT_EQUALS(hosts[1], expectedNodeTwoHorizonView);
+        ASSERT_EQUALS(response->getPrimary(), expectedNodeOneHorizonView);
+        ASSERT_EQUALS(response->getMe(), expectedNodeOneHorizonView);
+    });
+
+    // Set the network clock to the timeout deadline of awaitIsMasterResponse.
+    getNet()->enterNetwork();
+    getNet()->advanceTime(deadline);
+    ASSERT_EQUALS(deadline, getNet()->now());
+    getIsMasterOldHorizonThread.join();
+    getNet()->exitNetwork();
+    replyToReceivedHeartbeatV1();
+
+    BSONObjBuilder garbage;
+    ReplSetReconfigArgs args;
+    args.force = true;
+    // Do a reconfig that removes the configured horizon.
+    args.newConfigObj = BSON("_id"
+                             << "mySet"
+                             << "version" << 2 << "protocolVersion" << 1 << "members"
+                             << BSON_ARRAY(BSON("host" << nodeOneHostName << "_id" << 1)
+                                           << BSON("host" << nodeTwoHostName << "_id" << 2)));
+    stdx::thread reconfigThread([&] {
+        Status status(ErrorCodes::InternalError, "Not Set");
+        status = getReplCoord()->processReplSetReconfig(opCtx.get(), args, &garbage);
+        ASSERT_OK(status);
+    });
+    replyToReceivedHeartbeatV1();
+    reconfigThread.join();
+
+    stdx::thread getIsMasterDefaultHorizonThread([&] {
+        const auto expectedTopologyVersion = getTopoCoord().getTopologyVersion();
+        // Sending an isMaster request with a removed horizon should return the default horizon.
+        const auto response = getReplCoord()->awaitIsMasterResponse(
+            opCtx.get(), oldHorizon, expectedTopologyVersion, deadline);
+        auto topologyVersion = response->getTopologyVersion();
+        const auto hosts = response->getHosts();
+        HostAndPort expectedNodeOneHorizonView(nodeOneHostName);
+        HostAndPort expectedNodeTwoHorizonView(nodeTwoHostName);
+        ASSERT_EQUALS(hosts[0], expectedNodeOneHorizonView);
+        ASSERT_EQUALS(hosts[1], expectedNodeTwoHorizonView);
+        ASSERT_EQUALS(response->getPrimary(), expectedNodeOneHorizonView);
+        ASSERT_EQUALS(response->getMe(), expectedNodeOneHorizonView);
+    });
+
+    deadline = getNet()->now() + maxAwaitTime;
+    // Set the network clock to the timeout deadline of awaitIsMasterResponse.
+    getNet()->enterNetwork();
+    getNet()->advanceTime(deadline);
+    ASSERT_EQUALS(deadline, getNet()->now());
+    getIsMasterDefaultHorizonThread.join();
+    getNet()->exitNetwork();
+}
+
+TEST_F(ReplCoordTest, AwaitIsMasterRespondsWithNewHorizon) {
+    init();
+    const auto nodeOneHostName = "node1:12345";
+    const auto nodeTwoHostName = "node2:12345";
+    assertStartSuccess(BSON("_id"
+                            << "mySet"
+                            << "version" << 1 << "members"
+                            << BSON_ARRAY(BSON("host" << nodeOneHostName << "_id" << 1)
+                                          << BSON("host" << nodeTwoHostName << "_id" << 2))),
+                       HostAndPort(nodeOneHostName));
+
+    // Become primary.
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+    replCoordSetMyLastAppliedOpTime(OpTimeWithTermOne(100, 1), Date_t() + Seconds(100));
+    replCoordSetMyLastDurableOpTime(OpTimeWithTermOne(100, 1), Date_t() + Seconds(100));
+    simulateSuccessfulV1Election();
+    ASSERT(getReplCoord()->getMemberState().primary());
+
+    auto maxAwaitTime = Milliseconds(5000);
+    auto deadline = getNet()->now() + maxAwaitTime;
+    auto opCtx = makeOperationContext();
+
+    // Define a new horizon to be configured later.
+    const std::string newHorizonSniName = "newhorizon.com";
+    const auto newHorizon = SplitHorizon::Parameters(newHorizonSniName);
+
+    stdx::thread getIsMasterThread([&] {
+        const auto expectedTopologyVersion = getTopoCoord().getTopologyVersion();
+        // The isMaster response should use the default horizon since no horizon has been
+        // configured.
+        const auto response = getReplCoord()->awaitIsMasterResponse(
+            opCtx.get(), newHorizon, expectedTopologyVersion, deadline);
+        const auto hosts = response->getHosts();
+        HostAndPort expectedNodeOneHorizonView(nodeOneHostName);
+        HostAndPort expectedNodeTwoHorizonView(nodeTwoHostName);
+        ASSERT_EQUALS(hosts[0], expectedNodeOneHorizonView);
+        ASSERT_EQUALS(hosts[1], expectedNodeTwoHorizonView);
+        ASSERT_EQUALS(response->getPrimary(), expectedNodeOneHorizonView);
+        ASSERT_EQUALS(response->getMe(), expectedNodeOneHorizonView);
+    });
+
+    // Set the network clock to the timeout deadline of awaitIsMasterResponse.
+    getNet()->enterNetwork();
+    getNet()->advanceTime(deadline);
+    ASSERT_EQUALS(deadline, getNet()->now());
+    getIsMasterThread.join();
+    getNet()->exitNetwork();
+    replyToReceivedHeartbeatV1();
+
+    BSONObjBuilder garbage;
+    ReplSetReconfigArgs args;
+    args.force = true;
+    // Do a reconfig that adds a new horizon.
+    const auto newHorizonNodeOne = "newhorizon.com:15";
+    const auto newHorizonNodeTwo = "newhorizon.com:16";
+    args.newConfigObj = BSON("_id"
+                             << "mySet"
+                             << "version" << 2 << "protocolVersion" << 1 << "members"
+                             << BSON_ARRAY(
+                                    BSON("host" << nodeOneHostName << "_id" << 1 << "horizons"
+                                                << BSON("newhorizon" << newHorizonNodeOne))
+                                    << BSON("host" << nodeTwoHostName << "_id" << 2 << "horizons"
+                                                   << BSON("newhorizon" << newHorizonNodeTwo))));
+    stdx::thread reconfigThread([&] {
+        Status status(ErrorCodes::InternalError, "Not Set");
+        status = getReplCoord()->processReplSetReconfig(opCtx.get(), args, &garbage);
+        ASSERT_OK(status);
+    });
+    replyToReceivedHeartbeatV1();
+    reconfigThread.join();
+
+    stdx::thread getIsMasterNewHorizonThread([&] {
+        const auto expectedTopologyVersion = getTopoCoord().getTopologyVersion();
+        // The isMaster response should now use the newly configured horizon.
+        const auto response = getReplCoord()->awaitIsMasterResponse(
+            opCtx.get(), newHorizon, expectedTopologyVersion, deadline);
+        const auto hosts = response->getHosts();
+        HostAndPort expectedNodeOneHorizonView(newHorizonNodeOne);
+        HostAndPort expectedNodeTwoHorizonView(newHorizonNodeTwo);
+        ASSERT_EQUALS(hosts[0], expectedNodeOneHorizonView);
+        ASSERT_EQUALS(hosts[1], expectedNodeTwoHorizonView);
+        ASSERT_EQUALS(response->getPrimary(), expectedNodeOneHorizonView);
+        ASSERT_EQUALS(response->getMe(), expectedNodeOneHorizonView);
+    });
+
+    deadline = getNet()->now() + maxAwaitTime;
+    // Set the network clock to the timeout deadline of awaitIsMasterResponse.
+    getNet()->enterNetwork();
+    getNet()->advanceTime(deadline);
+    ASSERT_EQUALS(deadline, getNet()->now());
+    getIsMasterNewHorizonThread.join();
+    getNet()->exitNetwork();
+}
+
+TEST_F(ReplCoordTest, AwaitIsMasterRespondsCorrectlyWhenNodeRemovedAndReadded) {
+    init();
+    const auto nodeOneHostName = "node1:12345";
+    const auto nodeTwoHostName = "node2:12345";
+    assertStartSuccess(BSON("_id"
+                            << "mySet"
+                            << "version" << 1 << "members"
+                            << BSON_ARRAY(BSON("host" << nodeOneHostName << "_id" << 1)
+                                          << BSON("host" << nodeTwoHostName << "_id" << 2))),
+                       HostAndPort(nodeOneHostName));
+
+    ReplicationCoordinatorImpl* replCoord = getReplCoord();
+    ASSERT_OK(replCoord->setFollowerMode(MemberState::RS_SECONDARY));
+
+    getReplCoord()->cancelAndRescheduleElectionTimeout();
+
+    const auto maxAwaitTime = Milliseconds(5000);
+    auto net = getNet();
+    auto deadline = net->now() + maxAwaitTime;
+    auto opCtx = makeOperationContext();
+
+    auto waitForIsMasterFailPoint = globalFailPointRegistry().find("waitForIsMasterResponse");
+    auto timesEnteredFailPoint = waitForIsMasterFailPoint->setMode(FailPoint::alwaysOn, 0);
+
+    stdx::thread getIsMasterWaitingForRemovedNodeThread([&] {
+        const auto expectedTopologyVersion = getTopoCoord().getTopologyVersion();
+        // The isMaster response should indicate that the node does not have a valid replica set
+        // config.
+        const auto response = getReplCoord()->awaitIsMasterResponse(
+            opCtx.get(), {}, expectedTopologyVersion, deadline);
+        ASSERT_FALSE(response->isMaster());
+        ASSERT_FALSE(response->isSecondary());
+        ASSERT_FALSE(response->isConfigSet());
+    });
+
+    // Ensure that awaitIsMasterResponse() is called before triggering a reconfig.
+    waitForIsMasterFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
+
+    enterNetwork();
+    ASSERT_TRUE(net->hasReadyRequests());
+    auto noi = net->getNextReadyRequest();
+    auto&& request = noi->getRequest();
+    ASSERT_EQUALS(HostAndPort(nodeTwoHostName), request.target);
+    ASSERT_EQUALS("replSetHeartbeat", request.cmdObj.firstElement().fieldNameStringData());
+
+    // Receive a config that excludes node1 and with node2 having a configured horizon.
+    ReplSetHeartbeatResponse hbResp;
+    ReplSetConfig removedFromConfig;
+    ASSERT_OK(removedFromConfig.initialize(
+        BSON("_id"
+             << "mySet"
+             << "protocolVersion" << 1 << "version" << 2 << "members"
+             << BSON_ARRAY(BSON("host" << nodeTwoHostName << "_id" << 2 << "horizons"
+                                       << BSON("horizon1"
+                                               << "testhorizon.com:100"))))));
+    hbResp.setConfig(removedFromConfig);
+    hbResp.setConfigVersion(2);
+    hbResp.setSetName("mySet");
+    hbResp.setState(MemberState::RS_SECONDARY);
+    hbResp.setAppliedOpTimeAndWallTime({OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100)});
+    hbResp.setDurableOpTimeAndWallTime({OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100)});
+    net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON()));
+    net->runReadyNetworkOperations();
+    exitNetwork();
+
+    // node1 no longer exists in the replica set config.
+    ASSERT_OK(getReplCoord()->waitForMemberState(MemberState::RS_REMOVED, Seconds(1)));
+    ASSERT_EQUALS(removedFromConfig.getConfigVersion(),
+                  getReplCoord()->getConfig().getConfigVersion());
+    getIsMasterWaitingForRemovedNodeThread.join();
+
+    const std::string testHorizonSniName = "testhorizon.com";
+    auto newHorizon = SplitHorizon::Parameters(testHorizonSniName);
+    stdx::thread getIsMasterThread([&] {
+        const auto expectedTopologyVersion = getTopoCoord().getTopologyVersion();
+        // Sending an isMaster request on a removed node should still indicate that the node does
+        // not have a valid replica set reconfig.
+        const auto response = getReplCoord()->awaitIsMasterResponse(
+            opCtx.get(), newHorizon, expectedTopologyVersion, deadline);
+        auto topologyVersion = response->getTopologyVersion();
+        ASSERT_FALSE(response->isMaster());
+        ASSERT_FALSE(response->isSecondary());
+        ASSERT_FALSE(response->isConfigSet());
+    });
+
+    deadline = net->now() + maxAwaitTime;
+    // Set the network clock to the timeout deadline of awaitIsMasterResponse.
+    net->enterNetwork();
+    net->advanceTime(deadline);
+    ASSERT_EQUALS(deadline, net->now());
+    getIsMasterThread.join();
+    ASSERT_FALSE(net->hasReadyRequests());
+    net->exitNetwork();
+
+    const std::string newHorizonSniName = "newhorizon.com";
+    newHorizon = SplitHorizon::Parameters(newHorizonSniName);
+    const auto newHorizonNodeOne = "newhorizon.com:100";
+    const auto newHorizonNodeTwo = "newhorizon.com:200";
+
+    // Add node1 back into the replica set and configure a new horizon.
+    BSONObjBuilder garbage;
+    ReplSetReconfigArgs args;
+    args.force = true;
+    args.newConfigObj = BSON("_id"
+                             << "mySet"
+                             << "protocolVersion" << 1 << "version" << 3 << "members"
+                             << BSON_ARRAY(
+                                    BSON("host" << nodeOneHostName << "_id" << 1 << "horizons"
+                                                << BSON("newhorizon"
+                                                        << "newhorizon.com:100"))
+                                    << BSON("host" << nodeTwoHostName << "_id" << 2 << "horizons"
+                                                   << BSON("newhorizon"
+                                                           << "newhorizon.com:200"))));
+    stdx::thread reconfigThread([&] {
+        Status status(ErrorCodes::InternalError, "Not Set");
+        status = getReplCoord()->processReplSetReconfig(opCtx.get(), args, &garbage);
+        ASSERT_OK(status);
+    });
+    replyToReceivedHeartbeatV1();
+    reconfigThread.join();
+    ASSERT_OK(getReplCoord()->waitForMemberState(MemberState::RS_SECONDARY, Seconds(1)));
+
+    stdx::thread getIsMasterThreadNewHorizon([&] {
+        const auto expectedTopologyVersion = getTopoCoord().getTopologyVersion();
+        // Sending an isMaster on the rejoined node should return the appropriate horizon view.
+        const auto response = getReplCoord()->awaitIsMasterResponse(
+            opCtx.get(), newHorizon, expectedTopologyVersion, deadline);
+        HostAndPort expectedNodeOneHorizonView(newHorizonNodeOne);
+        HostAndPort expectedNodeTwoHorizonView(newHorizonNodeTwo);
+        const auto hosts = response->getHosts();
+        ASSERT_EQUALS(hosts[0], expectedNodeOneHorizonView);
+        ASSERT_EQUALS(hosts[1], expectedNodeTwoHorizonView);
+        ASSERT_EQUALS(response->getMe(), expectedNodeOneHorizonView);
+    });
+
+    deadline = getNet()->now() + maxAwaitTime;
+    // Set the network clock to the timeout deadline of awaitIsMasterResponse.
+    getNet()->enterNetwork();
+    getNet()->advanceTime(deadline);
+    ASSERT_EQUALS(deadline, getNet()->now());
+    getIsMasterThreadNewHorizon.join();
+    getNet()->exitNetwork();
+}
+
 TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnElectionTimeout) {
     init();
     assertStartSuccess(BSON("_id"
@@ -3373,8 +3861,9 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnElectionWin) {
     waitForIsMasterFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
     auto electionTimeoutWhen = getReplCoord()->getElectionTimeout_forTest();
     ASSERT_NOT_EQUALS(Date_t(), electionTimeoutWhen);
-    unittest::log() << "Election timeout scheduled at " << electionTimeoutWhen
-                    << " (simulator time)";
+    LOGV2(21505,
+          "Election timeout scheduled at {electionTimeoutWhen} (simulator time)",
+          "electionTimeoutWhen"_attr = electionTimeoutWhen);
     simulateSuccessfulV1ElectionWithoutExitingDrainMode(electionTimeoutWhen, opCtx.get());
 
     waitForIsMasterFailPoint->waitForTimesEntered(timesEnteredFailPoint + 2);
@@ -3591,7 +4080,7 @@ TEST_F(ReplCoordTest, DoNotProcessSelfWhenUpdatePositionContainsInfoAboutSelf) {
                   getReplCoord()->awaitReplication(opCtx.get(), time2, writeConcern).status);
 }
 
-TEST_F(ReplCoordTest, DoNotProcessUpdatePositionWhenItsConfigVersionIsIncorrect) {
+TEST_F(ReplCoordTest, ProcessUpdatePositionWhenItsConfigVersionIsDifferent) {
     assertStartSuccess(BSON("_id"
                             << "mySet"
                             << "version" << 2 << "members"
@@ -3600,10 +4089,7 @@ TEST_F(ReplCoordTest, DoNotProcessUpdatePositionWhenItsConfigVersionIsIncorrect)
                                                << "_id" << 0)
                                           << BSON("host"
                                                   << "node2:12345"
-                                                  << "_id" << 1)
-                                          << BSON("host"
-                                                  << "node3:12345"
-                                                  << "_id" << 2))),
+                                                  << "_id" << 1))),
                        HostAndPort("node1", 12345));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
     replCoordSetMyLastAppliedOpTime(OpTimeWithTermOne(100, 1), Date_t() + Seconds(100));
@@ -3619,28 +4105,27 @@ TEST_F(ReplCoordTest, DoNotProcessUpdatePositionWhenItsConfigVersionIsIncorrect)
     writeConcern.wTimeout = WriteConcernOptions::kNoWaiting;
     writeConcern.wNumNodes = 1;
 
-    // receive updatePosition with incorrect config version
+    // receive updatePosition with a different config version, 3
+    replCoordSetMyLastAppliedOpTime(time2, Date_t() + Seconds(100));
+    replCoordSetMyLastDurableOpTime(time2, Date_t() + Seconds(100));
+    auto updatePositionConfigVersion = 3;
     UpdatePositionArgs args;
-    ASSERT_OK(args.initialize(
-        BSON(UpdatePositionArgs::kCommandFieldName
-             << 1 << UpdatePositionArgs::kUpdateArrayFieldName
-             << BSON_ARRAY(BSON(UpdatePositionArgs::kConfigVersionFieldName
-                                << 3 << UpdatePositionArgs::kMemberIdFieldName << 1
-                                << UpdatePositionArgs::kDurableOpTimeFieldName << time2.toBSON()
-                                << UpdatePositionArgs::kDurableWallTimeFieldName
-                                << Date_t() + Seconds(time2.getSecs())
-                                << UpdatePositionArgs::kAppliedOpTimeFieldName << time2.toBSON()
-                                << UpdatePositionArgs::kAppliedWallTimeFieldName
-                                << Date_t() + Seconds(time2.getSecs()))))));
+    ASSERT_OK(args.initialize(BSON(
+        UpdatePositionArgs::kCommandFieldName
+        << 1 << UpdatePositionArgs::kUpdateArrayFieldName
+        << BSON_ARRAY(BSON(UpdatePositionArgs::kConfigVersionFieldName
+                           << updatePositionConfigVersion << UpdatePositionArgs::kMemberIdFieldName
+                           << 1 << UpdatePositionArgs::kDurableOpTimeFieldName << time2.toBSON()
+                           << UpdatePositionArgs::kDurableWallTimeFieldName
+                           << Date_t() + Seconds(time2.getSecs())
+                           << UpdatePositionArgs::kAppliedOpTimeFieldName << time2.toBSON()
+                           << UpdatePositionArgs::kAppliedWallTimeFieldName
+                           << Date_t() + Seconds(time2.getSecs()))))));
 
     auto opCtx = makeOperationContext();
 
-
-    long long cfgver;
-    ASSERT_EQUALS(ErrorCodes::InvalidReplicaSetConfig,
-                  getReplCoord()->processReplSetUpdatePosition(args, &cfgver));
-    ASSERT_EQUALS(ErrorCodes::WriteConcernFailed,
-                  getReplCoord()->awaitReplication(opCtx.get(), time2, writeConcern).status);
+    ASSERT_OK(getReplCoord()->processReplSetUpdatePosition(args, nullptr));
+    ASSERT_OK(getReplCoord()->awaitReplication(opCtx.get(), time2, writeConcern).status);
 }
 
 TEST_F(ReplCoordTest, DoNotProcessUpdatePositionOfMembersWhoseIdsAreNotInTheConfig) {
@@ -3832,7 +4317,8 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnReplSetReconfig) {
     // Do a reconfig to add a third node to the replica set. A reconfig should cause the server to
     // respond to the waiting IsMasterResponse.
     Status status(ErrorCodes::InternalError, "Not Set");
-    stdx::thread reconfigThread([&] { doReplSetReconfig(getReplCoord(), &status); });
+    stdx::thread reconfigThread(
+        [&] { doReplSetReconfig(getReplCoord(), &status, true /* force */); });
     replyToReceivedHeartbeatV1();
     reconfigThread.join();
     ASSERT_OK(status);
@@ -3884,7 +4370,7 @@ TEST_F(ReplCoordTest, AwaitReplicationShouldResolveAsNormalDuringAReconfig) {
 
     // reconfig
     Status status(ErrorCodes::InternalError, "Not Set");
-    stdx::thread reconfigThread([&] { doReplSetReconfig(getReplCoord(), &status); });
+    stdx::thread reconfigThread([&] { doReplSetReconfig(getReplCoord(), &status, true); });
 
     replyToReceivedHeartbeatV1();
     reconfigThread.join();
@@ -4032,7 +4518,7 @@ TEST_F(
     // reconfig to fewer nodes
     Status status(ErrorCodes::InternalError, "Not Set");
     stdx::thread reconfigThread(
-        [&] { doReplSetReconfigToFewer(getReplCoord(), &status, false /* force */); });
+        [&] { doReplSetReconfigToFewer(getReplCoord(), &status, true /* force */); });
 
     replyToReceivedHeartbeatV1();
 
@@ -5022,7 +5508,7 @@ TEST_F(ReplCoordTest, WaitUntilOpTimeforReadRejectsUnsupportedMajorityReadConcer
     ASSERT_OK(status);
 }
 
-TEST_F(ReplCoordTest, IgnoreTheContentsOfMetadataWhenItsConfigVersionDoesNotMatchOurs) {
+TEST_F(ReplCoordTest, DoNotIgnoreTheContentsOfMetadataWhenItsConfigVersionDoesNotMatchOurs) {
     // Ensure that we do not process ReplSetMetadata when ConfigVersions do not match.
     assertStartSuccess(BSON("_id"
                             << "mySet"
@@ -5040,25 +5526,30 @@ TEST_F(ReplCoordTest, IgnoreTheContentsOfMetadataWhenItsConfigVersionDoesNotMatc
     ASSERT_EQUALS(OpTime(Timestamp(0, 0), 0), getReplCoord()->getLastCommittedOpTime());
 
     // lower configVersion
+    auto lowerConfigVersion = 1;
     StatusWith<rpc::ReplSetMetadata> metadata = rpc::ReplSetMetadata::readFromMetadata(BSON(
-        rpc::kReplSetMetadataFieldName << BSON(
-            "lastOpCommitted" << BSON("ts" << Timestamp(10, 0) << "t" << 2) << "lastCommittedWall"
-                              << Date_t() + Seconds(100) << "lastOpVisible"
-                              << BSON("ts" << Timestamp(10, 0) << "t" << 2) << "configVersion" << 1
-                              << "primaryIndex" << 2 << "term" << 2 << "syncSourceIndex" << 1)));
+        rpc::kReplSetMetadataFieldName
+        << BSON("lastOpCommitted" << BSON("ts" << Timestamp(10, 0) << "t" << 2)
+                                  << "lastCommittedWall" << Date_t() + Seconds(100)
+                                  << "lastOpVisible" << BSON("ts" << Timestamp(10, 0) << "t" << 2)
+                                  << "configVersion" << lowerConfigVersion << "primaryIndex" << 2
+                                  << "term" << 2 << "syncSourceIndex" << 1)));
     getReplCoord()->processReplSetMetadata(metadata.getValue());
-    ASSERT_EQUALS(0, getReplCoord()->getTerm());
+    // term should advance
+    ASSERT_EQUALS(2, getReplCoord()->getTerm());
 
     // higher configVersion
-    StatusWith<rpc::ReplSetMetadata> metadata2 = rpc::ReplSetMetadata::readFromMetadata(
-        BSON(rpc::kReplSetMetadataFieldName
-             << BSON("lastOpCommitted"
-                     << BSON("ts" << Timestamp(10, 0) << "t" << 2) << "lastCommittedWall"
-                     << Date_t() + Seconds(100) << "lastOpVisible"
-                     << BSON("ts" << Timestamp(10, 0) << "t" << 2) << "configVersion" << 100
-                     << "primaryIndex" << 2 << "term" << 2 << "syncSourceIndex" << 1)));
+    auto higherConfigVersion = 100;
+    StatusWith<rpc::ReplSetMetadata> metadata2 = rpc::ReplSetMetadata::readFromMetadata(BSON(
+        rpc::kReplSetMetadataFieldName
+        << BSON("lastOpCommitted" << BSON("ts" << Timestamp(10, 0) << "t" << 2)
+                                  << "lastCommittedWall" << Date_t() + Seconds(100)
+                                  << "lastOpVisible" << BSON("ts" << Timestamp(10, 0) << "t" << 2)
+                                  << "configVersion" << higherConfigVersion << "primaryIndex" << 2
+                                  << "term" << 2 << "syncSourceIndex" << 1)));
     getReplCoord()->processReplSetMetadata(metadata2.getValue());
-    ASSERT_EQUALS(0, getReplCoord()->getTerm());
+    // term should advance
+    ASSERT_EQUALS(2, getReplCoord()->getTerm());
 }
 
 TEST_F(ReplCoordTest, UpdateLastCommittedOpTimeWhenTheLastCommittedOpTimeIsNewer) {
@@ -5276,7 +5767,7 @@ TEST_F(ReplCoordTest, PrepareOplogQueryMetadata) {
         &metadataBob);
 
     BSONObj metadata = metadataBob.done();
-    log() << metadata;
+    LOGV2(21506, "{metadata}", "metadata"_attr = metadata);
 
     auto oqMetadata = rpc::OplogQueryMetadata::readFromMetadata(metadata);
     ASSERT_OK(oqMetadata.getStatus());
@@ -5382,12 +5873,16 @@ TEST_F(ReplCoordTest,
     const auto& request = noi->getRequest();
     ASSERT_EQUALS(HostAndPort("node2", 12345), request.target);
     ASSERT_EQUALS("replSetHeartbeat", request.cmdObj.firstElement().fieldNameStringData());
-    log() << "black holing " << noi->getRequest().cmdObj;
+    LOGV2(21507,
+          "black holing {noi_getRequest_cmdObj}",
+          "noi_getRequest_cmdObj"_attr = noi->getRequest().cmdObj);
     net->blackHole(noi);
 
     // Advance simulator clock to some time before the first scheduled election.
     auto electionTimeoutWhen = replCoord->getElectionTimeout_forTest();
-    log() << "Election initially scheduled at " << electionTimeoutWhen << " (simulator time)";
+    LOGV2(21508,
+          "Election initially scheduled at {electionTimeoutWhen} (simulator time)",
+          "electionTimeoutWhen"_attr = electionTimeoutWhen);
     ASSERT_GREATER_THAN(electionTimeoutWhen, net->now());
     auto until = net->now() + (electionTimeoutWhen - net->now()) / 2;
     net->runUntil(until);
@@ -5471,7 +5966,7 @@ TEST_F(ReplCoordTest,
     ASSERT_TRUE(net->hasReadyRequests());
     auto noi = net->getNextReadyRequest();
     auto&& request = noi->getRequest();
-    log() << "processing " << request.cmdObj;
+    LOGV2(21509, "processing {request_cmdObj}", "request_cmdObj"_attr = request.cmdObj);
     ASSERT_EQUALS(HostAndPort("node2", 12345), request.target);
     ASSERT_EQUALS("replSetHeartbeat", request.cmdObj.firstElement().fieldNameStringData());
 
@@ -5528,7 +6023,7 @@ TEST_F(ReplCoordTest,
     ASSERT_TRUE(net->hasReadyRequests());
     auto noi = net->getNextReadyRequest();
     auto&& request = noi->getRequest();
-    log() << "processing " << request.cmdObj;
+    LOGV2(21510, "processing {request_cmdObj}", "request_cmdObj"_attr = request.cmdObj);
     ASSERT_EQUALS(HostAndPort("node2", 12345), request.target);
 
     ASSERT_EQUALS("replSetHeartbeat", request.cmdObj.firstElement().fieldNameStringData());
@@ -5581,7 +6076,7 @@ TEST_F(ReplCoordTest,
     ASSERT_TRUE(net->hasReadyRequests());
     auto noi = net->getNextReadyRequest();
     auto&& request = noi->getRequest();
-    log() << "processing " << request.cmdObj;
+    LOGV2(21511, "processing {request_cmdObj}", "request_cmdObj"_attr = request.cmdObj);
     ASSERT_EQUALS(HostAndPort("node2", 12345), request.target);
 
     ASSERT_EQUALS("replSetHeartbeat", request.cmdObj.firstElement().fieldNameStringData());
@@ -5629,7 +6124,7 @@ TEST_F(ReplCoordTest,
     ASSERT_TRUE(net->hasReadyRequests());
     auto noi = net->getNextReadyRequest();
     auto&& request = noi->getRequest();
-    log() << "processing " << request.cmdObj;
+    LOGV2(21512, "processing {request_cmdObj}", "request_cmdObj"_attr = request.cmdObj);
     ASSERT_EQUALS(HostAndPort("node2", 12345), request.target);
 
     ASSERT_EQUALS("replSetHeartbeat", request.cmdObj.firstElement().fieldNameStringData());
@@ -5652,8 +6147,8 @@ TEST_F(ReplCoordTest,
 
 TEST_F(ReplCoordTest, CancelAndRescheduleElectionTimeoutLogging) {
     // Log all the election messages.
-    setMinimumLoggedSeverity(logger::LogComponent::kReplicationElection,
-                             logger::LogSeverity::Debug(5));
+    setMinimumLoggedSeverity(logv2::LogComponent::kReplicationElection,
+                             logv2::LogSeverity::Debug(5));
     startCapturingLogMessages();
     // heartbeatTimeoutSecs is made large so we can advance the clock without worrying about
     // additional heartbeats.
@@ -5691,12 +6186,16 @@ TEST_F(ReplCoordTest, CancelAndRescheduleElectionTimeoutLogging) {
     const auto& request = noi->getRequest();
     ASSERT_EQUALS(HostAndPort("node2", 12345), request.target);
     ASSERT_EQUALS("replSetHeartbeat", request.cmdObj.firstElement().fieldNameStringData());
-    log() << "black holing " << noi->getRequest().cmdObj;
+    LOGV2(21513,
+          "black holing {noi_getRequest_cmdObj}",
+          "noi_getRequest_cmdObj"_attr = noi->getRequest().cmdObj);
     net->blackHole(noi);
 
     // Advance simulator clock to some time after the first scheduled election.
     auto electionTimeoutWhen = replCoord->getElectionTimeout_forTest();
-    log() << "Election initially scheduled at " << electionTimeoutWhen << " (simulator time)";
+    LOGV2(21514,
+          "Election initially scheduled at {electionTimeoutWhen} (simulator time)",
+          "electionTimeoutWhen"_attr = electionTimeoutWhen);
     ASSERT_GREATER_THAN(electionTimeoutWhen, net->now());
     auto until = electionTimeoutWhen + Milliseconds(1);
     net->runUntil(until);
@@ -5708,8 +6207,8 @@ TEST_F(ReplCoordTest, CancelAndRescheduleElectionTimeoutLogging) {
     ASSERT_EQ(1, countTextFormatLogLinesContaining("Rescheduling election timeout callback"));
     ASSERT_EQ(1, countTextFormatLogLinesContaining("Canceling election timeout callback"));
 
-    setMinimumLoggedSeverity(logger::LogComponent::kReplicationElection,
-                             logger::LogSeverity::Debug(4));
+    setMinimumLoggedSeverity(logv2::LogComponent::kReplicationElection,
+                             logv2::LogSeverity::Debug(4));
     net->enterNetwork();
     until = electionTimeoutWhen + Milliseconds(500);
     net->runUntil(until);
@@ -6398,7 +6897,7 @@ TEST_F(ReplCoordTest, NodeStoresElectionVotes) {
                                                          << "mySet"
                                                          << "term" << 7LL << "candidateIndex" << 2LL
                                                          << "configVersion" << 2LL << "dryRun"
-                                                         << false << "lastCommittedOp"
+                                                         << false << "lastAppliedOpTime"
                                                          << time.asOpTime().toBSON())));
     ReplSetRequestVotesResponse response;
 
@@ -6441,7 +6940,7 @@ TEST_F(ReplCoordTest, NodeDoesNotStoreDryRunVotes) {
                                                          << "mySet"
                                                          << "term" << 7LL << "candidateIndex" << 2LL
                                                          << "configVersion" << 2LL << "dryRun"
-                                                         << true << "lastCommittedOp"
+                                                         << true << "lastAppliedOpTime"
                                                          << time.asOpTime().toBSON())));
     ReplSetRequestVotesResponse response;
 
@@ -6488,7 +6987,7 @@ TEST_F(ReplCoordTest, NodeFailsVoteRequestIfItFailsToStoreLastVote) {
                                    << "mySet"
                                    << "term" << initTerm + 1  // term of new candidate.
                                    << "candidateIndex" << 1LL << "configVersion" << 2LL << "dryRun"
-                                   << false << "lastCommittedOp" << time.asOpTime().toBSON())));
+                                   << false << "lastAppliedOpTime" << time.asOpTime().toBSON())));
     ReplSetRequestVotesResponse response;
 
     // Simulate a failure to write the 'last vote' document. The specific error code isn't
@@ -6539,7 +7038,7 @@ TEST_F(ReplCoordTest, NodeNodesNotGrantVoteIfInTerminalShutdown) {
                                    << "mySet"
                                    << "term" << initTerm + 1  // term of new candidate.
                                    << "candidateIndex" << 1LL << "configVersion" << 2LL << "dryRun"
-                                   << false << "lastCommittedOp" << time.asOpTime().toBSON())));
+                                   << false << "lastAppliedOpTime" << time.asOpTime().toBSON())));
     ReplSetRequestVotesResponse response;
 
     getReplCoord()->enterTerminalShutdown();

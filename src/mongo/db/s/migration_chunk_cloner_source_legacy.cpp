@@ -51,11 +51,11 @@
 #include "mongo/executor/remote_command_response.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/executor/task_executor_pool.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/elapsed_tracker.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
 #include "mongo/util/time_support.h"
@@ -181,7 +181,9 @@ void LogTransactionOperationsForShardingHandler::commit(boost::optional<Timestam
 
         auto idElement = documentKey["_id"];
         if (idElement.eoo()) {
-            warning() << "Received a document with no id, ignoring: " << redact(documentKey);
+            LOGV2_WARNING(21994,
+                          "Received a document with no id, ignoring: {documentKey}",
+                          "documentKey"_attr = redact(documentKey));
             continue;
         }
 
@@ -237,7 +239,9 @@ MigrationChunkClonerSourceLegacy::~MigrationChunkClonerSourceLegacy() {
 }
 
 Status MigrationChunkClonerSourceLegacy::startClone(OperationContext* opCtx,
-                                                    const UUID& migrationId) {
+                                                    const UUID& migrationId,
+                                                    const LogicalSessionId& lsid,
+                                                    TxnNumber txnNumber) {
     invariant(_state == kNew);
     invariant(!opCtx->lockState()->isLocked());
 
@@ -278,32 +282,90 @@ Status MigrationChunkClonerSourceLegacy::startClone(OperationContext* opCtx,
     // Tell the recipient shard to start cloning
     BSONObjBuilder cmdBuilder;
 
-    auto fcvVersion = serverGlobalParams.featureCompatibility.getVersion();
-    if (fcvVersion == ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
-        StartChunkCloneRequest::appendAsCommand(&cmdBuilder,
-                                                _args.getNss(),
-                                                migrationId,
-                                                _sessionId,
-                                                _donorConnStr,
-                                                _args.getFromShardId(),
-                                                _args.getToShardId(),
-                                                _args.getMinKey(),
-                                                _args.getMaxKey(),
-                                                _shardKeyPattern.toBSON(),
-                                                _args.getSecondaryThrottle());
-    } else {
-        // TODO (SERVER-44787): Remove this overload after 4.4 is released.
-        StartChunkCloneRequest::appendAsCommand(&cmdBuilder,
-                                                _args.getNss(),
-                                                _sessionId,
-                                                _donorConnStr,
-                                                _args.getFromShardId(),
-                                                _args.getToShardId(),
-                                                _args.getMinKey(),
-                                                _args.getMaxKey(),
-                                                _shardKeyPattern.toBSON(),
-                                                _args.getSecondaryThrottle());
+    StartChunkCloneRequest::appendAsCommand(&cmdBuilder,
+                                            _args.getNss(),
+                                            migrationId,
+                                            lsid,
+                                            txnNumber,
+                                            _sessionId,
+                                            _donorConnStr,
+                                            _args.getFromShardId(),
+                                            _args.getToShardId(),
+                                            _args.getMinKey(),
+                                            _args.getMaxKey(),
+                                            _shardKeyPattern.toBSON(),
+                                            _args.getSecondaryThrottle());
+
+    auto startChunkCloneResponseStatus = _callRecipient(cmdBuilder.obj());
+    if (!startChunkCloneResponseStatus.isOK()) {
+        return startChunkCloneResponseStatus.getStatus();
     }
+
+    // TODO (Kal): Setting the state to kCloning below means that if cancelClone was called we will
+    // send a cancellation command to the recipient. The reason to limit the cases when we send
+    // cancellation is for backwards compatibility with 3.2 nodes, which cannot differentiate
+    // between cancellations for different migration sessions. It is thus possible that a second
+    // migration from different donor, but the same recipient would certainly abort an already
+    // running migration.
+    stdx::lock_guard<Latch> sl(_mutex);
+    _state = kCloning;
+
+    return Status::OK();
+}
+
+// TODO (SERVER-44787): Remove this overload after 4.4 is released AND
+// disableResumableRangeDeleter has been removed from server parameters.
+Status MigrationChunkClonerSourceLegacy::startClone(OperationContext* opCtx) {
+    invariant(_state == kNew);
+    invariant(!opCtx->lockState()->isLocked());
+
+    auto const replCoord = repl::ReplicationCoordinator::get(opCtx);
+    if (replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet) {
+        _sessionCatalogSource = std::make_unique<SessionCatalogMigrationSource>(
+            opCtx,
+            _args.getNss(),
+            ChunkRange(_args.getMinKey(), _args.getMaxKey()),
+            _shardKeyPattern.getKeyPattern());
+
+        // Prime up the session migration source if there are oplog entries to migrate.
+        _sessionCatalogSource->fetchNextOplog(opCtx);
+    }
+
+    {
+        // Ignore prepare conflicts when we load ids of currently available documents. This is
+        // acceptable because we will track changes made by prepared transactions at transaction
+        // commit time.
+        auto originalPrepareConflictBehavior = opCtx->recoveryUnit()->getPrepareConflictBehavior();
+
+        ON_BLOCK_EXIT([&] {
+            opCtx->recoveryUnit()->setPrepareConflictBehavior(originalPrepareConflictBehavior);
+        });
+
+        opCtx->recoveryUnit()->setPrepareConflictBehavior(
+            PrepareConflictBehavior::kIgnoreConflicts);
+
+        auto storeCurrentLocsStatus = _storeCurrentLocs(opCtx);
+        if (storeCurrentLocsStatus == ErrorCodes::ChunkTooBig && _forceJumbo) {
+            stdx::lock_guard<Latch> sl(_mutex);
+            _jumboChunkCloneState.emplace();
+        } else if (!storeCurrentLocsStatus.isOK()) {
+            return storeCurrentLocsStatus;
+        }
+    }
+
+    // Tell the recipient shard to start cloning
+    BSONObjBuilder cmdBuilder;
+
+    StartChunkCloneRequest::appendAsCommand(&cmdBuilder,
+                                            _args.getNss(),
+                                            _sessionId,
+                                            _donorConnStr,
+                                            _args.getFromShardId(),
+                                            _args.getToShardId(),
+                                            _args.getMinKey(),
+                                            _args.getMaxKey(),
+                                            _shardKeyPattern.toBSON(),
+                                            _args.getSecondaryThrottle());
 
     auto startChunkCloneResponseStatus = _callRecipient(cmdBuilder.obj());
     if (!startChunkCloneResponseStatus.isOK()) {
@@ -389,7 +451,9 @@ void MigrationChunkClonerSourceLegacy::cancelClone(OperationContext* opCtx) {
                                                    kRecvChunkAbort, _args.getNss(), _sessionId))
                                     .getStatus();
             if (!status.isOK()) {
-                LOG(0) << "Failed to cancel migration " << causedBy(redact(status));
+                LOGV2(21991,
+                      "Failed to cancel migration {causedBy_status}",
+                      "causedBy_status"_attr = causedBy(redact(status)));
             }
         }
         // Intentional fall through
@@ -412,8 +476,10 @@ void MigrationChunkClonerSourceLegacy::onInsertOp(OperationContext* opCtx,
 
     BSONElement idElement = insertedDoc["_id"];
     if (idElement.eoo()) {
-        warning() << "logInsertOp got a document with no _id field, ignoring inserted document: "
-                  << redact(insertedDoc);
+        LOGV2_WARNING(21995,
+                      "logInsertOp got a document with no _id field, ignoring inserted document: "
+                      "{insertedDoc}",
+                      "insertedDoc"_attr = redact(insertedDoc));
         return;
     }
 
@@ -443,8 +509,10 @@ void MigrationChunkClonerSourceLegacy::onUpdateOp(OperationContext* opCtx,
 
     BSONElement idElement = postImageDoc["_id"];
     if (idElement.eoo()) {
-        warning() << "logUpdateOp got a document with no _id field, ignoring updatedDoc: "
-                  << redact(postImageDoc);
+        LOGV2_WARNING(
+            21996,
+            "logUpdateOp got a document with no _id field, ignoring updatedDoc: {postImageDoc}",
+            "postImageDoc"_attr = redact(postImageDoc));
         return;
     }
 
@@ -481,8 +549,10 @@ void MigrationChunkClonerSourceLegacy::onDeleteOp(OperationContext* opCtx,
 
     BSONElement idElement = deletedDocId["_id"];
     if (idElement.eoo()) {
-        warning() << "logDeleteOp got a document with no _id field, ignoring deleted doc: "
-                  << redact(deletedDocId);
+        LOGV2_WARNING(
+            21997,
+            "logDeleteOp got a document with no _id field, ignoring deleted doc: {deletedDocId}",
+            "deletedDocId"_attr = redact(deletedDocId));
         return;
     }
 
@@ -987,13 +1057,19 @@ Status MigrationChunkClonerSourceLegacy::_checkRecipientCloningStatus(OperationC
         const std::size_t cloneLocsRemaining = _cloneLocs.size();
 
         if (_forceJumbo && _jumboChunkCloneState) {
-            log() << "moveChunk data transfer progress: " << redact(res)
-                  << " mem used: " << _memoryUsed
-                  << " documents cloned so far: " << _jumboChunkCloneState->docsCloned;
+            LOGV2(21992,
+                  "moveChunk data transfer progress: {res} mem used: {memoryUsed} documents cloned "
+                  "so far: {jumboChunkCloneState_docsCloned}",
+                  "res"_attr = redact(res),
+                  "memoryUsed"_attr = _memoryUsed,
+                  "jumboChunkCloneState_docsCloned"_attr = _jumboChunkCloneState->docsCloned);
         } else {
-            log() << "moveChunk data transfer progress: " << redact(res)
-                  << " mem used: " << _memoryUsed
-                  << " documents remaining to clone: " << cloneLocsRemaining;
+            LOGV2(21993,
+                  "moveChunk data transfer progress: {res} mem used: {memoryUsed} documents "
+                  "remaining to clone: {cloneLocsRemaining}",
+                  "res"_attr = redact(res),
+                  "memoryUsed"_attr = _memoryUsed,
+                  "cloneLocsRemaining"_attr = cloneLocsRemaining);
         }
 
         if (res["state"].String() == "steady") {

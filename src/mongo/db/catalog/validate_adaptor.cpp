@@ -46,8 +46,8 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/storage/key_string.h"
 #include "mongo/db/storage/record_store.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/object_check.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -102,7 +102,8 @@ Status ValidateAdaptor::validateRecord(OperationContext* opCtx,
                      &documentKeySet,
                      &multikeyMetadataKeys,
                      &multikeyPaths,
-                     recordId);
+                     recordId,
+                     IndexAccessMethod::kNoopOnSuppressedErrorFn);
 
         if (!descriptor->isMultikey() &&
             iam->shouldMarkIndexAsMultikey(
@@ -277,7 +278,7 @@ void ValidateAdaptor::traverseRecordStore(OperationContext* opCtx,
                 ss << "Reason: Validated size of " << validatedSize
                    << " bytes does not equal the record size of " << dataSize << " bytes";
             }
-            log() << std::string(ss);
+            LOGV2(20404, "{std_string_ss}", "std_string_ss"_attr = std::string(ss));
 
             // Only log once
             if (results->valid) {
@@ -322,7 +323,7 @@ void ValidateAdaptor::validateIndexKeyCount(const IndexDescriptor* idx, Validate
 
     // Do not fail on finding too few index entries compared to collection entries when full:false.
     bool hasTooFewKeys = false;
-    bool noErrorOnTooFewKeys = !_validateState->isFullValidate();
+    bool noErrorOnTooFewKeys = !_validateState->isFullIndexValidation();
 
     if (idx->isIdIndex() && numTotalKeys != _numRecords) {
         hasTooFewKeys = (numTotalKeys < _numRecords);
@@ -366,7 +367,7 @@ void ValidateAdaptor::validateIndexKeyCount(const IndexDescriptor* idx, Validate
         }
     }
 
-    if (!_validateState->isFullValidate() && hasTooFewKeys) {
+    if (!_validateState->isFullIndexValidation() && hasTooFewKeys) {
         std::string warning = str::stream()
             << "index " << idx->indexName() << " has fewer keys than records."
             << " Please re-run the validate command with {full: true}";

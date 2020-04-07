@@ -33,6 +33,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/logv2/log.h"
 #include "mongo/util/log.h"
 
 #include "mongo/config.h"
@@ -55,18 +56,12 @@
 
 namespace mongo {
 
-#if defined(MONGO_CONFIG_LOGV1_DEFAULT)
-static bool _logV2Enabled = false;
-#else
-static bool _logV2Enabled = true;
-#endif
-
 bool logV2Enabled() {
-    return _logV2Enabled;
+    return true;
 }
 
-void logV2Set(bool setting) {
-    _logV2Enabled = setting;
+bool logV2IsJson(logv2::LogFormat format) {
+    return format == logv2::LogFormat::kJson || format == logv2::LogFormat::kDefault;
 }
 
 static logger::ExtraLogContextFn _appendExtraLogContext;
@@ -82,38 +77,27 @@ Status logger::registerExtraLogContextFn(logger::ExtraLogContextFn contextFn) {
     return Status::OK();
 }
 
-bool rotateLogs(bool renameFiles, bool useLogV2) {
-    if (useLogV2) {
-        log() << "Logv2 rotation initiated";
-        return logv2::LogManager::global().getGlobalDomainInternal().rotate().isOK();
-    }
+bool rotateLogs(bool renameFiles) {
+    // Rotate on both logv1 and logv2 so all files that need rotation gets rotated
+    LOGV2(23166, "Log rotation initiated");
+    std::string suffix = "." + terseCurrentTime(false);
+    Status resultv2 =
+        logv2::LogManager::global().getGlobalDomainInternal().rotate(renameFiles, suffix);
+    if (!resultv2.isOK())
+        LOGV2_WARNING(23168, "Log rotation failed: {resultv2}", "resultv2"_attr = resultv2);
+
     using logger::RotatableFileManager;
     RotatableFileManager* manager = logger::globalRotatableFileManager();
-    log() << "Log rotation initiated";
-    RotatableFileManager::FileNameStatusPairVector result(
-        manager->rotateAll(renameFiles, "." + terseCurrentTime(false)));
+    RotatableFileManager::FileNameStatusPairVector result(manager->rotateAll(renameFiles, suffix));
     for (RotatableFileManager::FileNameStatusPairVector::iterator it = result.begin();
          it != result.end();
          it++) {
-        warning() << "Rotating log file " << it->first << " failed: " << it->second.toString();
+        LOGV2_WARNING(23169,
+                      "Rotating log file {it_first} failed: {it_second}",
+                      "it_first"_attr = it->first,
+                      "it_second"_attr = it->second.toString());
     }
-    return result.empty();
-}
-
-void logContext(const char* errmsg) {
-    if (errmsg) {
-        log() << errmsg << std::endl;
-    }
-    // NOTE: We disable long-line truncation for the stack trace, because the JSON representation of
-    // the stack trace can sometimes exceed the long line limit.
-    printStackTrace(log().setIsTruncatable(false).stream());
-}
-
-void setPlainConsoleLogger() {
-    logger::globalLogManager()->getGlobalDomain()->clearAppenders();
-    logger::globalLogManager()->getGlobalDomain()->attachAppender(
-        std::make_unique<logger::ConsoleAppender<logger::MessageEventEphemeral>>(
-            std::make_unique<logger::MessageEventUnadornedEncoder>()));
+    return resultv2.isOK() && result.empty();
 }
 
 Tee* const startupWarningsLog = RamLog::get("startupWarnings");  // intentionally leaked

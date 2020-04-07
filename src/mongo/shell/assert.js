@@ -323,9 +323,15 @@ assert = (function() {
         }
 
         var start = new Date();
-        timeout = timeout || 5 * 60 * 1000;
+
+        if (TestData && TestData.inEvergreen) {
+            timeout = timeout || 10 * 60 * 1000;
+        } else {
+            timeout = timeout || 60 * 1000;
+        }
+
         interval = interval || 200;
-        var last;
+
         while (1) {
             if (typeof (func) == "string") {
                 if (eval(func))
@@ -340,10 +346,10 @@ assert = (function() {
                 msg = _buildAssertionMessage(msg, msgPrefix);
                 if (runHangAnalyzer) {
                     msg = msg +
-                        "The hang analyzer is automatically called in assert.soon functions. " +
-                        "If you are *expecting* assert.soon to possibly fail, call assert.soon " +
-                        "with {runHangAnalyzer: false} as the fifth argument " +
-                        "(you can fill unused arguments with `undefined`).";
+                        " The hang analyzer is automatically called in assert.soon functions." +
+                        " If you are *expecting* assert.soon to possibly fail, call assert.soon" +
+                        " with {runHangAnalyzer: false} as the fifth argument" +
+                        " (you can fill unused arguments with `undefined`).";
                     print(msg + " Running hang analyzer from assert.soon.");
                     MongoRunner.runHangAnalyzer();
                 }

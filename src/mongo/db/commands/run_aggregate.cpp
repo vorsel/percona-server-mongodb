@@ -52,10 +52,9 @@
 #include "mongo/db/pipeline/document_source_geo_near.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
-#include "mongo/db/pipeline/lite_parsed_pipeline.h"
-#include "mongo/db/pipeline/mongo_process_interface.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/pipeline/pipeline_d.h"
+#include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/query/cursor_response.h"
@@ -72,7 +71,7 @@
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/views/view.h"
 #include "mongo/db/views/view_catalog.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/string_map.h"
 
@@ -202,9 +201,13 @@ bool handleCursorCommand(OperationContext* opCtx,
             // We should always have a valid status member object at this point.
             auto status = WorkingSetCommon::getMemberObjectStatus(nextDoc);
             invariant(!status.isOK());
-            warning() << "Aggregate command executor error: " << PlanExecutor::statestr(state)
-                      << ", status: " << status
-                      << ", stats: " << redact(Explain::getWinningPlanStats(exec));
+            LOGV2_WARNING(23799,
+                          "Aggregate command executor error: {PlanExecutor_statestr_state}, "
+                          "status: {status}, stats: {Explain_getWinningPlanStats_exec}",
+                          "PlanExecutor_statestr_state"_attr = PlanExecutor::statestr(state),
+                          "status"_attr = status,
+                          "Explain_getWinningPlanStats_exec"_attr =
+                              redact(Explain::getWinningPlanStats(exec)));
 
             uassertStatusOK(status.withContext("PlanExecutor error during aggregation"));
         }
@@ -302,9 +305,8 @@ StatusWith<StringMap<ExpressionContext::ResolvedNamespace>> resolveInvolvedNames
             // If 'involvedNs' refers to a view namespace, then we resolve its definition.
             auto resolvedView = viewCatalog->resolveView(opCtx, involvedNs);
             if (!resolvedView.isOK()) {
-                return {ErrorCodes::FailedToParse,
-                        str::stream() << "Failed to resolve view '" << involvedNs.ns()
-                                      << "': " << resolvedView.getStatus().toString()};
+                return resolvedView.getStatus().withContext(
+                    str::stream() << "Failed to resolve view '" << involvedNs.ns());
             }
 
             resolvedNamespaces[involvedNs.coll()] = {resolvedView.getValue().getNamespace(),
@@ -312,8 +314,8 @@ StatusWith<StringMap<ExpressionContext::ResolvedNamespace>> resolveInvolvedNames
 
             // We parse the pipeline corresponding to the resolved view in case we must resolve
             // other view namespaces that are also involved.
-            LiteParsedPipeline resolvedViewLitePipeline(
-                {resolvedView.getValue().getNamespace(), resolvedView.getValue().getPipeline()});
+            LiteParsedPipeline resolvedViewLitePipeline(resolvedView.getValue().getNamespace(),
+                                                        resolvedView.getValue().getPipeline());
 
             const auto& resolvedViewInvolvedNamespaces =
                 resolvedViewLitePipeline.getInvolvedNamespaces();
@@ -443,7 +445,7 @@ std::vector<std::unique_ptr<Pipeline, PipelineDeleter>> createExchangePipelinesI
             // DocumentSourceExchange.
             boost::intrusive_ptr<DocumentSource> consumer = new DocumentSourceExchange(
                 expCtx, exchange, idx, expCtx->mongoProcessInterface->getResourceYielder());
-            pipelines.emplace_back(uassertStatusOK(Pipeline::create({consumer}, expCtx)));
+            pipelines.emplace_back(Pipeline::create({consumer}, expCtx));
         }
     } else {
         pipelines.emplace_back(std::move(pipeline));
@@ -465,8 +467,8 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> createOuterPipelineProxyExe
     // Transfer ownership of the Pipeline to the PipelineProxyStage.
     auto ws = std::make_unique<WorkingSet>();
     auto proxy = hasChangeStream
-        ? std::make_unique<ChangeStreamProxyStage>(opCtx, std::move(pipeline), ws.get())
-        : std::make_unique<PipelineProxyStage>(opCtx, std::move(pipeline), ws.get());
+        ? std::make_unique<ChangeStreamProxyStage>(expCtx.get(), std::move(pipeline), ws.get())
+        : std::make_unique<PipelineProxyStage>(expCtx.get(), std::move(pipeline), ws.get());
 
     // This PlanExecutor will simply forward requests to the Pipeline, so does not need
     // to yield or to be registered with any collection's CursorManager to receive
@@ -552,7 +554,7 @@ Status runAggregate(OperationContext* opCtx,
             statsTracker.emplace(opCtx,
                                  nss,
                                  Top::LockType::NotLocked,
-                                 AutoStatsTracker::LogMode::kUpdateTopAndCurop,
+                                 AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
                                  0);
             collatorToUse.emplace(
                 PipelineD::resolveCollator(opCtx, request.getCollation(), nullptr));
@@ -640,7 +642,7 @@ Status runAggregate(OperationContext* opCtx,
             // Use default value for the ExpressionContext's 'sortKeyFormat' member variable.
         }
 
-        auto pipeline = uassertStatusOK(Pipeline::parse(request.getPipeline(), expCtx));
+        auto pipeline = Pipeline::parse(request.getPipeline(), expCtx);
 
         // Check that the view's collation matches the collation of any views involved in the
         // pipeline.
@@ -767,6 +769,9 @@ Status runAggregate(OperationContext* opCtx,
         cursors.emplace_back(pin.getCursor());
         pins.emplace_back(std::move(pin));
     }
+
+    // Report usage statistics for each stage in the pipeline.
+    liteParsedPipeline.tickGlobalStageCounters();
 
     // If both explain and cursor are specified, explain wins.
     if (expCtx->explain) {

@@ -27,6 +27,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+
 #include "mongo/platform/basic.h"
 
 #include <string>
@@ -40,6 +42,7 @@
 #include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/pipeline/document_source_mock.h"
 #include "mongo/db/pipeline/pipeline.h"
+#include "mongo/logv2/log.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 
@@ -59,7 +62,7 @@ TEST_F(DocumentSourceMatchTest, RedactSafePortion) {
             auto match = DocumentSourceMatch::create(fromjson(input), expCtx);
             ASSERT_BSONOBJ_EQ(match->redactSafePortion(), fromjson(safePortion));
         } catch (...) {
-            unittest::log() << "Problem with redactSafePortion() of: " << input;
+            LOGV2(20899, "Problem with redactSafePortion() of: {input}", "input"_attr = input);
             throw;
         }
     };
@@ -523,9 +526,9 @@ TEST_F(DocumentSourceMatchTest, ShouldCorrectlyJoinWithSubsequentMatch) {
     ASSERT_TRUE(match->getNext().isEOF());
 }
 
-DEATH_TEST_F(DocumentSourceMatchTest,
-             ShouldFailToDescendExpressionOnPathThatIsNotACommonPrefix,
-             "Invariant failure expression::isPathPrefixOf") {
+DEATH_TEST_REGEX_F(DocumentSourceMatchTest,
+                   ShouldFailToDescendExpressionOnPathThatIsNotACommonPrefix,
+                   "Invariant failure.*expression::isPathPrefixOf") {
     const auto expCtx = getExpCtx();
     const auto matchSpec = BSON("a.b" << 1 << "b.c" << 1);
     const auto matchExpression =
@@ -533,9 +536,9 @@ DEATH_TEST_F(DocumentSourceMatchTest,
     DocumentSourceMatch::descendMatchOnPath(matchExpression.get(), "a", expCtx);
 }
 
-DEATH_TEST_F(DocumentSourceMatchTest,
-             ShouldFailToDescendExpressionOnPathThatContainsElemMatchWithObject,
-             "Invariant failure node->matchType()") {
+DEATH_TEST_REGEX_F(DocumentSourceMatchTest,
+                   ShouldFailToDescendExpressionOnPathThatContainsElemMatchWithObject,
+                   R"#(Invariant failure.*node->matchType\(\))#") {
     const auto expCtx = getExpCtx();
     const auto matchSpec = BSON("a" << BSON("$elemMatch" << BSON("a.b" << 1)));
     const auto matchExpression =

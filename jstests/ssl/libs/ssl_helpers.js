@@ -59,7 +59,14 @@ var replShouldFail = function(name, opt1, opt2) {
     ssl_options1 = opt1;
     ssl_options2 = opt2;
     ssl_name = name;
-    assert.throws(load, [replSetTestFile], "This setup should have failed");
+    // This will cause an assert.soon() in ReplSetTest to fail. This normally triggers the hang
+    // analyzer, but since we do not want to run it on expected timeouts, we temporarily disable it.
+    MongoRunner.runHangAnalyzer.disable();
+    try {
+        assert.throws(load, [replSetTestFile], "This setup should have failed");
+    } finally {
+        MongoRunner.runHangAnalyzer.enable();
+    }
     // Note: this leaves running mongod processes.
 };
 
@@ -103,7 +110,7 @@ function testShardedLookup(shardingTest) {
  * Takes in two mongod/mongos configuration options and runs a basic
  * sharding test to see if they can work together...
  */
-function mixedShardTest(options1, options2, shouldSucceed) {
+function mixedShardTest(options1, options2, shouldSucceed, disableResumableRangeDeleter) {
     let authSucceeded = false;
     try {
         // Start ShardingTest with enableBalancer because ShardingTest attempts to turn
@@ -116,12 +123,19 @@ function mixedShardTest(options1, options2, shouldSucceed) {
         //
         // Once SERVER-14017 is fixed the "enableBalancer" line can be removed.
         // TODO: SERVER-43899 Make sharding_with_x509.js and mixed_mode_sharded_transition.js start
-        // shards as replica sets.
+        // shards as replica sets and remove disableResumableRangeDeleter parameter.
+        let otherOptions = {enableBalancer: true};
+
+        if (disableResumableRangeDeleter) {
+            otherOptions.shardAsReplicaSet = false;
+            otherOptions.shardOptions = {setParameter: {"disableResumableRangeDeleter": true}};
+        }
+
         var st = new ShardingTest({
             mongos: [options1],
             config: [options1],
             shards: [options1, options2],
-            other: {enableBalancer: true, shardAsReplicaSet: false}
+            other: otherOptions
         });
 
         // Create admin user in case the options include auth
@@ -180,9 +194,25 @@ function mixedShardTest(options1, options2, shouldSucceed) {
                 node.getDB('admin').auth('admin', 'pwd');
             });
         }
+
         // This has to be done in order for failure
         // to not prevent future tests from running...
         if (st) {
+            if (st.s.fullOptions.clusterAuthMode === 'x509') {
+                // Index consistency check during shutdown needs a privileged user to auth as.
+                const x509User =
+                    'CN=client,OU=KernelUser,O=MongoDB,L=New York City,ST=New York,C=US';
+                st.s.getDB('$external')
+                    .createUser({user: x509User, roles: [{role: '__system', db: 'admin'}]});
+
+                // Check orphan hook needs a privileged user to auth as.
+                // Works only for stand alone shards.
+                st._connections.forEach((shardConn) => {
+                    shardConn.getDB('$external')
+                        .createUser({user: x509User, roles: [{role: '__system', db: 'admin'}]});
+                });
+            }
+
             st.stop();
         }
     }

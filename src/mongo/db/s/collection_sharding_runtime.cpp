@@ -39,12 +39,10 @@
 #include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/s/sharding_runtime_d_params_gen.h"
 #include "mongo/db/s/sharding_state.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/duration.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
-
-MONGO_FAIL_POINT_DEFINE(useFCV44CheckShardVersionProtocol);
 
 namespace {
 
@@ -124,10 +122,9 @@ CollectionShardingRuntime* CollectionShardingRuntime::get_UNSAFE(ServiceContext*
     return checked_cast<CollectionShardingRuntime*>(css);
 }
 
-ScopedCollectionMetadata CollectionShardingRuntime::getOrphansFilter(OperationContext* opCtx,
-                                                                     bool isCollection) {
+ScopedCollectionFilter CollectionShardingRuntime::getOwnershipFilter(OperationContext* opCtx) {
     const auto atClusterTime = repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime();
-    auto optMetadata = _getMetadataWithVersionCheckAt(opCtx, atClusterTime, isCollection);
+    auto optMetadata = _getMetadataWithVersionCheckAt(opCtx, atClusterTime);
 
     if (!optMetadata)
         return {kUnshardedCollection};
@@ -160,15 +157,13 @@ boost::optional<ChunkVersion> CollectionShardingRuntime::getCurrentShardVersionI
     MONGO_UNREACHABLE;
 }
 
-void CollectionShardingRuntime::checkShardVersionOrThrow(OperationContext* opCtx,
-                                                         bool isCollection) {
-    (void)_getMetadataWithVersionCheckAt(opCtx, boost::none, isCollection);
+void CollectionShardingRuntime::checkShardVersionOrThrow(OperationContext* opCtx) {
+    (void)_getMetadataWithVersionCheckAt(opCtx, boost::none);
 }
 
-Status CollectionShardingRuntime::checkShardVersionNoThrow(OperationContext* opCtx,
-                                                           bool isCollection) noexcept {
+Status CollectionShardingRuntime::checkShardVersionNoThrow(OperationContext* opCtx) noexcept {
     try {
-        checkShardVersionOrThrow(opCtx, isCollection);
+        checkShardVersionOrThrow(opCtx);
         return Status::OK();
     } catch (const DBException& ex) {
         return ex.toStatus();
@@ -207,14 +202,19 @@ void CollectionShardingRuntime::setFilteringMetadata(OperationContext* opCtx,
     stdx::lock_guard lk(_metadataManagerLock);
 
     if (!newMetadata.isSharded()) {
-        LOG(0) << "Marking collection " << _nss.ns() << " as " << newMetadata.toStringBasic();
+        LOGV2(21917,
+              "Marking collection {nss_ns} as {newMetadata_Basic}",
+              "nss_ns"_attr = _nss.ns(),
+              "newMetadata_Basic"_attr = newMetadata.toStringBasic());
         _metadataType = MetadataType::kUnsharded;
         _metadataManager.reset();
+        ++_numMetadataManagerChanges;
     } else if (!_metadataManager ||
                !newMetadata.uuidMatches(_metadataManager->getCollectionUuid())) {
         _metadataType = MetadataType::kSharded;
         _metadataManager = std::make_shared<MetadataManager>(
             opCtx->getServiceContext(), _nss, _rangeDeleterExecutor, newMetadata);
+        ++_numMetadataManagerChanges;
     } else {
         _metadataManager->setFilteringMetadata(std::move(newMetadata));
     }
@@ -269,13 +269,20 @@ Status CollectionShardingRuntime::waitForClean(OperationContext* opCtx,
 
             stillScheduled = self->_metadataManager->trackOrphanedDataCleanup(orphanRange);
             if (!stillScheduled) {
-                log() << "Finished deleting " << nss.ns() << " range "
-                      << redact(orphanRange.toString());
+                LOGV2_OPTIONS(21918,
+                              {logv2::LogComponent::kShardingMigration},
+                              "Finished waiting for deletion of {nss_ns} range {orphanRange}",
+                              "nss_ns"_attr = nss.ns(),
+                              "orphanRange"_attr = redact(orphanRange.toString()));
                 return Status::OK();
             }
         }
 
-        log() << "Waiting for deletion of " << nss.ns() << " range " << orphanRange;
+        LOGV2_OPTIONS(21919,
+                      {logv2::LogComponent::kShardingMigration},
+                      "Waiting for deletion of {nss_ns} range {orphanRange}",
+                      "nss_ns"_attr = nss.ns(),
+                      "orphanRange"_attr = orphanRange);
 
         Status result = stillScheduled->getNoThrow(opCtx);
 
@@ -313,9 +320,7 @@ boost::optional<ScopedCollectionMetadata> CollectionShardingRuntime::_getCurrent
 }
 
 boost::optional<ScopedCollectionMetadata> CollectionShardingRuntime::_getMetadataWithVersionCheckAt(
-    OperationContext* opCtx,
-    const boost::optional<mongo::LogicalTime>& atClusterTime,
-    bool isCollection) {
+    OperationContext* opCtx, const boost::optional<mongo::LogicalTime>& atClusterTime) {
     const auto optReceivedShardVersion = getOperationReceivedVersion(opCtx, _nss);
     if (!optReceivedShardVersion) {
         return boost::none;
@@ -335,19 +340,6 @@ boost::optional<ScopedCollectionMetadata> CollectionShardingRuntime::_getMetadat
         auto optionalWantedShardVersion = getCurrentShardVersionIfKnown();
         return optionalWantedShardVersion ? *optionalWantedShardVersion : ChunkVersion::UNSHARDED();
     }();
-
-    if (MONGO_unlikely(useFCV44CheckShardVersionProtocol.shouldFail())) {
-        LOG(0) << "Received shardVersion: " << receivedShardVersion << " for " << _nss.ns();
-        if (isCollection) {
-            auto shardVersionKnown = _metadataType != MetadataType::kUnknown;
-            LOG(0) << "Namespace " << _nss.ns() << " is collection, "
-                   << (shardVersionKnown ? "have shardVersion cached" : "don't know shardVersion");
-            uassert(StaleConfigInfo(_nss, receivedShardVersion, wantedShardVersion, shardId),
-                    "don't know shardVersion",
-                    shardVersionKnown);
-        }
-        LOG(0) << "Wanted shardVersion: " << wantedShardVersion << " for " << _nss.ns();
-    }
 
     auto criticalSectionSignal = [&] {
         return _critSec.getSignal(opCtx->lockState()->isWriteLocked()

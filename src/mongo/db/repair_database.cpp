@@ -32,6 +32,7 @@
 #include "mongo/platform/basic.h"
 
 #include <algorithm>
+#include <fmt/format.h>
 
 #include "mongo/db/repair_database.h"
 
@@ -42,131 +43,146 @@
 #include "mongo/db/background.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/catalog/collection_validation.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/catalog/multi_index_block.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/query_knobs_gen.h"
+#include "mongo/db/rebuild_indexes.h"
+#include "mongo/db/repl_set_member_in_standalone_mode.h"
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/storage_engine.h"
-#include "mongo/util/log.h"
+#include "mongo/db/storage/storage_repair_observer.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
-StatusWith<IndexNameObjs> getIndexNameObjs(OperationContext* opCtx,
-                                           RecordId catalogId,
-                                           std::function<bool(const std::string&)> filter) {
-    IndexNameObjs ret;
-    std::vector<std::string>& indexNames = ret.first;
-    std::vector<BSONObj>& indexSpecs = ret.second;
-    auto durableCatalog = DurableCatalog::get(opCtx);
-    {
-        // Fetch all indexes
-        durableCatalog->getAllIndexes(opCtx, catalogId, &indexNames);
-        auto newEnd =
-            std::remove_if(indexNames.begin(),
-                           indexNames.end(),
-                           [&filter](const std::string& indexName) { return !filter(indexName); });
-        indexNames.erase(newEnd, indexNames.end());
+using namespace fmt::literals;
 
-        indexSpecs.reserve(indexNames.size());
+Status rebuildIndexesForNamespace(OperationContext* opCtx,
+                                  const NamespaceString& nss,
+                                  StorageEngine* engine) {
+    opCtx->checkForInterrupt();
+    auto collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
+    auto swIndexNameObjs = getIndexNameObjs(opCtx, collection->getCatalogId());
+    if (!swIndexNameObjs.isOK())
+        return swIndexNameObjs.getStatus();
 
+    std::vector<BSONObj> indexSpecs = swIndexNameObjs.getValue().second;
+    Status status = rebuildIndexesOnCollection(opCtx, collection, indexSpecs, RepairData::kYes);
+    if (!status.isOK())
+        return status;
 
-        for (const auto& name : indexNames) {
-            BSONObj spec = durableCatalog->getIndexSpec(opCtx, catalogId, name);
-            using IndexVersion = IndexDescriptor::IndexVersion;
-            IndexVersion indexVersion = IndexVersion::kV1;
-            if (auto indexVersionElem = spec[IndexDescriptor::kIndexVersionFieldName]) {
-                auto indexVersionNum = indexVersionElem.numberInt();
-                invariant(indexVersionNum == static_cast<int>(IndexVersion::kV1) ||
-                          indexVersionNum == static_cast<int>(IndexVersion::kV2));
-                indexVersion = static_cast<IndexVersion>(indexVersionNum);
-            }
-            invariant(spec.isOwned());
-            indexSpecs.push_back(spec);
-
-            const BSONObj key = spec.getObjectField("key");
-            const Status keyStatus = index_key_validate::validateKeyPattern(key, indexVersion);
-            if (!keyStatus.isOK()) {
-                return Status(
-                    ErrorCodes::CannotCreateIndex,
-                    str::stream()
-                        << "Cannot rebuild index " << spec << ": " << keyStatus.reason()
-                        << " For more info see http://dochub.mongodb.org/core/index-validation");
-            }
-        }
-    }
-
-    return ret;
-}
-
-Status rebuildIndexesOnCollection(OperationContext* opCtx,
-                                  Collection* collection,
-                                  const std::vector<BSONObj>& indexSpecs,
-                                  RepairData repair) {
-    // Skip the rest if there are no indexes to rebuild.
-    if (indexSpecs.empty())
-        return Status::OK();
-
-    // Rebuild the indexes provided by 'indexSpecs'.
-    IndexBuildsCoordinator* indexBuildsCoord = IndexBuildsCoordinator::get(opCtx);
-    UUID buildUUID = UUID::gen();
-    auto swRebuild = indexBuildsCoord->rebuildIndexesForRecovery(
-        opCtx, collection->ns(), indexSpecs, buildUUID, repair);
-    if (!swRebuild.isOK()) {
-        return swRebuild.getStatus();
-    }
-
-    auto [numRecords, dataSize] = swRebuild.getValue();
-
-    auto rs = collection->getRecordStore();
-
-    // Update the record store stats after finishing and committing the index builds.
-    WriteUnitOfWork wuow(opCtx);
-    rs->updateStatsAfterRepair(opCtx, numRecords, dataSize);
-    wuow.commit();
-
+    engine->flushAllFiles(opCtx, /*callerHoldsReadLock*/ false);
     return Status::OK();
 }
 
 namespace {
+Status dropUnfinishedIndexes(OperationContext* opCtx, Collection* collection) {
+    std::vector<std::string> indexNames;
+    auto durableCatalog = DurableCatalog::get(opCtx);
+    durableCatalog->getAllIndexes(opCtx, collection->getCatalogId(), &indexNames);
+    for (const auto& indexName : indexNames) {
+        if (!durableCatalog->isIndexReady(opCtx, collection->getCatalogId(), indexName)) {
+            LOGV2(3871400,
+                  "Dropping unfinished index '{name}' after collection was modified by "
+                  "repair",
+                  "name"_attr = indexName);
+            WriteUnitOfWork wuow(opCtx);
+            auto status = durableCatalog->removeIndex(opCtx, collection->getCatalogId(), indexName);
+            if (!status.isOK()) {
+                return status;
+            }
+            wuow.commit();
+            StorageRepairObserver::get(opCtx->getServiceContext())
+                ->invalidatingModification(str::stream()
+                                           << "Dropped unfinished index '" << indexName << "' on "
+                                           << collection->ns());
+        }
+    }
+    return Status::OK();
+}
+
 Status repairCollections(OperationContext* opCtx,
                          StorageEngine* engine,
                          const std::string& dbName) {
-
     auto colls = CollectionCatalog::get(opCtx).getAllCollectionNamesFromDb(opCtx, dbName);
 
     for (const auto& nss : colls) {
         opCtx->checkForInterrupt();
 
-        log() << "Repairing collection " << nss;
+        LOGV2(21027, "Repairing collection {nss}", "nss"_attr = nss);
 
         auto collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
         Status status = engine->repairRecordStore(opCtx, collection->getCatalogId(), nss);
-        if (!status.isOK())
+
+        // Need to lookup from catalog again because the old collection object was invalidated by
+        // repairRecordStore.
+        collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
+
+        // If data was modified during repairRecordStore, we know to rebuild indexes without needing
+        // to run an expensive collection validation.
+        if (status.code() == ErrorCodes::DataModifiedByRepair) {
+            invariant(StorageRepairObserver::get(opCtx->getServiceContext())->isDataInvalidated(),
+                      "Collection '{}' ({})"_format(collection->ns().toString(),
+                                                    collection->uuid().toString()));
+
+            // If we are a replica set member in standalone mode and we have unfinished indexes,
+            // drop them before rebuilding any completed indexes. Since we have already made
+            // invalidating modifications to our data, it is safe to just drop the indexes entirely
+            // to avoid the risk of the index rebuild failing.
+            if (getReplSetMemberInStandaloneMode(opCtx->getServiceContext())) {
+                if (auto status = dropUnfinishedIndexes(opCtx, collection); !status.isOK()) {
+                    return status;
+                }
+            }
+
+            Status status = rebuildIndexesForNamespace(opCtx, nss, engine);
+            if (!status.isOK()) {
+                return status;
+            }
+            continue;
+        } else if (!status.isOK()) {
             return status;
-    }
+        }
 
-    for (const auto& nss : colls) {
-        opCtx->checkForInterrupt();
-        auto collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
-        auto swIndexNameObjs = getIndexNameObjs(opCtx, collection->getCatalogId());
-        if (!swIndexNameObjs.isOK())
-            return swIndexNameObjs.getStatus();
+        // Run collection validation to avoid unecessarily rebuilding indexes on valid collections
+        // with consistent indexes. Initialize the collection prior to validation.
+        collection->init(opCtx);
 
-        std::vector<BSONObj> indexSpecs = swIndexNameObjs.getValue().second;
-        Status status = rebuildIndexesOnCollection(opCtx, collection, indexSpecs, RepairData::kYes);
-        if (!status.isOK())
+        ValidateResults validateResults;
+        BSONObjBuilder output;
+
+        // Set options to exclude FullRecordStoreValidation because we have already validated the
+        // underlying record store in the call to repairRecordStore above.
+        auto options = CollectionValidation::ValidateOptions::kFullIndexValidation;
+
+        const bool background = false;
+        status = CollectionValidation::validate(
+            opCtx, nss, options, background, &validateResults, &output);
+        if (!status.isOK()) {
             return status;
+        }
 
-        engine->flushAllFiles(opCtx, true);
+        LOGV2(21028,
+              "Collection validation results: {output_done}",
+              "output_done"_attr = output.done());
+
+        if (!validateResults.valid) {
+            status = rebuildIndexesForNamespace(opCtx, nss, engine);
+            if (!status.isOK()) {
+                return status;
+            }
+        }
     }
     return Status::OK();
 }
@@ -179,7 +195,7 @@ Status repairDatabase(OperationContext* opCtx, StorageEngine* engine, const std:
     invariant(opCtx->lockState()->isW());
     invariant(dbName.find('.') == std::string::npos);
 
-    log() << "repairDatabase " << dbName;
+    LOGV2(21029, "repairDatabase {dbName}", "dbName"_attr = dbName);
 
     BackgroundOperation::assertNoBgOpInProgForDb(dbName);
 
@@ -189,17 +205,20 @@ Status repairDatabase(OperationContext* opCtx, StorageEngine* engine, const std:
     auto databaseHolder = DatabaseHolder::get(opCtx);
     databaseHolder->close(opCtx, dbName);
 
+    // Reopening db is necessary for repairCollections.
+    auto db = databaseHolder->openDb(opCtx, dbName);
+
     auto status = repairCollections(opCtx, engine, dbName);
     if (!status.isOK()) {
-        severe() << "Failed to repair database " << dbName << ": " << status.reason();
+        LOGV2_FATAL(21030,
+                    "Failed to repair database {dbName}: {status_reason}",
+                    "dbName"_attr = dbName,
+                    "status_reason"_attr = status.reason());
     }
 
     try {
         // Ensure that we don't trigger an exception when attempting to take locks.
         UninterruptibleLockGuard noInterrupt(opCtx->lockState());
-
-        // Open the db after everything finishes.
-        auto db = databaseHolder->openDb(opCtx, dbName);
 
         // Set the minimum snapshot for all Collections in this db. This ensures that readers
         // using majority readConcern level can only use the collections after their repaired
@@ -220,7 +239,8 @@ Status repairDatabase(OperationContext* opCtx, StorageEngine* engine, const std:
         // have a UUID.
         throw;
     } catch (...) {
-        severe() << "Unexpected exception encountered while reopening database after repair.";
+        LOGV2_FATAL(21031,
+                    "Unexpected exception encountered while reopening database after repair.");
         std::terminate();  // Logs additional info about the specific error.
     }
 

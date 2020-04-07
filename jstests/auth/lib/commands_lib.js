@@ -1070,6 +1070,14 @@ var authCommandsLib = {
                   bypassDocumentValidation: args.bypassDocumentValidation,
               };
           },
+          setup: function(db) {
+              assert.commandWorked(db.getSiblingDB(firstDbName).foo.insert({}));
+              assert.commandWorked(db.getSiblingDB(secondDbName).foo.insert({}));
+          },
+          teardown: function(db) {
+              db.getSiblingDB(firstDbName).dropDatabase();
+              db.getSiblingDB(secondDbName).dropDatabase();
+          },
           testcases: [
               {
                 runOnDb: firstDbName,
@@ -1107,39 +1115,64 @@ var authCommandsLib = {
           ]
         },
         {
-          testname: "aggregate_out_replace_collection",
+          testname: "aggregate_out_to_different_db",
           command: function(state, args) {
               return {
                   aggregate: "foo",
-                  pipeline: [{$out: "foo_out"}],
+                  pipeline: [{$out: {db: args.targetDB, coll: "foo_out"}}],
                   cursor: {},
                   bypassDocumentValidation: args.bypassDocumentValidation,
               };
           },
+          setup: function(db) {
+              assert.commandWorked(db.getSiblingDB(firstDbName).foo.insert({}));
+              assert.commandWorked(db.getSiblingDB(secondDbName).foo.insert({}));
+          },
+          teardown: function(db) {
+              db.getSiblingDB(firstDbName).dropDatabase();
+              db.getSiblingDB(secondDbName).dropDatabase();
+          },
           testcases: [
               {
                 runOnDb: firstDbName,
-                commandArgs: {bypassDocumentValidation: false},
+                commandArgs: {targetDB: firstDbName, bypassDocumentValidation: false},
                 roles: {readWrite: 1, readWriteAnyDatabase: 1, dbOwner: 1, root: 1, __system: 1},
                 privileges: [
                     {resource: {db: firstDbName, collection: "foo"}, actions: ["find"]},
-                    {resource: {db: firstDbName, collection: "foo_out"}, actions: ["insert"]},
-                    {resource: {db: firstDbName, collection: "foo_out"}, actions: ["remove"]}
+                    {
+                        resource: {db: firstDbName, collection: "foo_out"},
+                        actions: ["insert", "remove"]
+                    },
                 ]
               },
               {
                 runOnDb: secondDbName,
-                commandArgs: {bypassDocumentValidation: false},
+                commandArgs: {targetDB: secondDbName, bypassDocumentValidation: false},
                 roles: {readWriteAnyDatabase: 1, root: 1, __system: 1},
                 privileges: [
                     {resource: {db: secondDbName, collection: "foo"}, actions: ["find"]},
-                    {resource: {db: secondDbName, collection: "foo_out"}, actions: ["insert"]},
-                    {resource: {db: secondDbName, collection: "foo_out"}, actions: ["remove"]}
+                    {
+                        resource: {db: secondDbName, collection: "foo_out"},
+                        actions: ["insert", "remove"]
+                    },
                 ]
               },
               {
                 runOnDb: firstDbName,
-                commandArgs: {bypassDocumentValidation: true},
+                commandArgs: {targetDB: secondDbName, bypassDocumentValidation: false},
+                roles: {readWriteAnyDatabase: 1, root: 1, __system: 1},
+                privileges: [
+                    {resource: {db: firstDbName, collection: "foo"}, actions: ["find"]},
+                    {
+                        resource: {db: secondDbName, collection: "foo_out"},
+                        actions: ["insert", "remove"]
+                    },
+                ]
+              },
+              // Test for bypassDocumentValidation.
+              {
+                runOnDb: firstDbName,
+                commandArgs: {targetDB: firstDbName, bypassDocumentValidation: true},
                 // Note that the built-in role must have 'bypassDocumentValidation' for this test.
                 roles: {dbOwner: 1, root: 1, __system: 1},
                 privileges: [
@@ -1150,7 +1183,20 @@ var authCommandsLib = {
                     },
                 ]
               },
-              // TODO SERVER-36832: Test with a foreign database.
+              // Test for bypassDocumentValidation to a foreign database.
+              {
+                runOnDb: firstDbName,
+                commandArgs: {targetDB: secondDbName, bypassDocumentValidation: true},
+                // Note that the built-in role must have 'bypassDocumentValidation' for this test.
+                roles: {root: 1, __system: 1},
+                privileges: [
+                    {resource: {db: firstDbName, collection: "foo"}, actions: ["find"]},
+                    {
+                      resource: {db: secondDbName, collection: "foo_out"},
+                      actions: ["insert", "remove", "bypassDocumentValidation"]
+                    },
+                ]
+              },
           ]
         },
         {
@@ -1734,6 +1780,105 @@ var authCommandsLib = {
                 privileges:
                     [{resource: {db: secondDbName, collection: "foo"}, actions: ["collStats"]}]
               }
+          ]
+        },
+        {
+          testname: "aggregate_collStats_facet",
+          command: {
+              aggregate: "foo", 
+              pipeline: [
+                {$collStats: {latencyStats: {}}}, 
+                {$facet: {matched: [{$match: {a: 1}}]}}
+              ], 
+              cursor: {}
+          },
+          setup: function(db) {
+              db.createCollection("foo");
+          },
+          teardown: function(db) {
+              db.foo.drop();
+          },
+          testcases: [
+              {
+                runOnDb: firstDbName,
+                roles: {
+                    read: 1,
+                    readAnyDatabase: 1,
+                    readWrite: 1,
+                    readWriteAnyDatabase: 1,
+                    dbAdmin: 1,
+                    dbAdminAnyDatabase: 1,
+                    dbOwner: 1,
+                    clusterMonitor: 1,
+                    clusterAdmin: 1,
+                    backup: 1,
+                    root: 1,
+                    __system: 1
+                },
+                privileges:
+                    [{resource: {db: firstDbName, collection: "foo"}, actions: ["collStats"]}]
+              },
+          ]
+        },
+        {
+          testname: "aggregate_collStats_within_lookup",
+          command: {
+              aggregate: "foo", 
+              pipeline: [
+                {$lookup: {
+                    from: "lookupColl", 
+                    pipeline: [{
+                        $collStats: {latencyStats: {}}
+                    }], 
+                    as: "result"
+                }}, 
+              ], 
+              cursor: {}
+          },
+          setup: function(db) {
+              db.createCollection("foo");
+              db.createCollection("lookupColl");
+          },
+          teardown: function(db) {
+              db.foo.drop();
+              db.lookupColl.drop();
+          },
+          testcases: [
+              {
+                runOnDb: firstDbName,
+                roles: roles_read,
+                privileges: [
+                    {resource: {db: firstDbName, collection: "lookupColl"}, actions: ["collStats"]},
+                    {resource: {db: firstDbName, collection: "foo"}, actions: ["find"]}
+                ],
+              },
+          ]
+        },
+        {
+          testname: "aggregate_collStats_within_union",
+          command: {
+              aggregate: "foo", 
+              pipeline: [
+                {$unionWith: {coll: "unionColl", pipeline: [{$collStats: {latencyStats: {}}}]}}, 
+              ], 
+              cursor: {}
+          },
+          setup: function(db) {
+              db.createCollection("foo");
+              db.createCollection("unionColl");
+          },
+          teardown: function(db) {
+              db.foo.drop();
+              db.unionColl.drop();
+          },
+          testcases: [
+              {
+                runOnDb: firstDbName,
+                roles: roles_read,
+                privileges:
+                    [{resource: {db: firstDbName, collection: "unionColl"}, actions: ["collStats"]},
+                    {resource: {db: firstDbName, collection: "foo"}, actions: ["find"]}],
+              },
           ]
         },
         {
@@ -3491,15 +3636,8 @@ var authCommandsLib = {
           testcases: [
               {
                 runOnDb: "local",
-                roles: {
-                    "clusterAdmin": 1,
-                    "clusterMonitor": 1,
-                    "readLocal": 1,
-                    "readWriteLocal": 1,
-                    "backup": 1,
-                    "root": 1,
-                    "__system": 1
-                },
+                roles:
+                    {"clusterAdmin": 1, "clusterMonitor": 1, "backup": 1, "root": 1, "__system": 1},
                 privileges:
                     [{resource: {db: "local", collection: "replset.election"}, actions: ["find"]}]
               },
@@ -3512,15 +3650,8 @@ var authCommandsLib = {
           testcases: [
               {
                 runOnDb: "local",
-                roles: {
-                    "clusterAdmin": 1,
-                    "clusterMonitor": 1,
-                    "readLocal": 1,
-                    "readWriteLocal": 1,
-                    "backup": 1,
-                    "root": 1,
-                    "__system": 1
-                },
+                roles:
+                    {"clusterAdmin": 1, "clusterMonitor": 1, "backup": 1, "root": 1, "__system": 1},
                 privileges:
                     [{resource: {db: "local", collection: "replset.minvalid"}, actions: ["find"]}]
               },
@@ -4023,14 +4154,8 @@ var authCommandsLib = {
           skipSharded: true,
           testcases: [{
               runOnDb: "local",
-              roles: {
-                  "clusterAdmin": 1,
-                  "clusterManager": 1,
-                  "readWriteLocal": 1,
-                  "root": 1,
-                  "__system": 1,
-                  "restore": 1
-              },
+              roles:
+                  {"clusterAdmin": 1, "clusterManager": 1, "root": 1, "__system": 1, "restore": 1},
               privileges:
                   [{resource: {db: "local", collection: "replset.election"}, actions: ["insert"]}],
           }
@@ -4043,14 +4168,8 @@ var authCommandsLib = {
           skipSharded: true,
           testcases: [{
               runOnDb: "local",
-              roles: {
-                  "clusterAdmin": 1,
-                  "clusterManager": 1,
-                  "readWriteLocal": 1,
-                  "root": 1,
-                  "__system": 1,
-                  "restore": 1
-              },
+              roles:
+                  {"clusterAdmin": 1, "clusterManager": 1, "root": 1, "__system": 1, "restore": 1},
               privileges:
                   [{resource: {db: "local", collection: "replset.minvalid"}, actions: ["insert"]}],
           }
@@ -5581,12 +5700,12 @@ var authCommandsLib = {
           }
         },
         {
-          testname: "aggregate_$searchBeta",
+          testname: "aggregate_$search",
           command: {
               aggregate: "foo",
               cursor: {},
               pipeline: [{
-                  $searchBeta: {
+                  $search: {
                       // empty query
                   }
               }]
@@ -5610,13 +5729,13 @@ var authCommandsLib = {
               }
           ],
           setup: function(db) {
-              // Configure the $searchBeta stage to always return EOF so we can avoid the hassle
+              // Configure the $search stage to always return EOF so we can avoid the hassle
               // of giving mongod a host and port for mongot.
-              const cmd = {configureFailPoint: "searchBetaReturnEofImmediately", mode: "alwaysOn"};
+              const cmd = {configureFailPoint: "searchReturnEofImmediately", mode: "alwaysOn"};
               FixtureHelpers.runCommandOnEachPrimary({db: db.getSiblingDB("admin"), cmdObj: cmd});
           },
           teardown: function(db) {
-              const cmd = {configureFailPoint: "searchBetaReturnEofImmediately", mode: "off"};
+              const cmd = {configureFailPoint: "searchReturnEofImmediately", mode: "off"};
               FixtureHelpers.runCommandOnEachPrimary({db: db.getSiblingDB("admin"), cmdObj: cmd});
           }
         },
@@ -5686,7 +5805,102 @@ var authCommandsLib = {
               {runOnDb: firstDbName, roles: {}},
               {runOnDb: secondDbName, roles: {}}
           ]
-		},
+        },
+        {
+          testname: "aggregate_union_with_basic",
+          command: {
+              aggregate: "baseColl",
+              pipeline: [{$unionWith: "unionColl"}],
+              cursor: {}
+          },
+          setup: function(db) {
+              db.createCollection("baseColl");
+              db.createCollection("unionColl");
+          },
+          teardown: function(db) {
+              db.baseColl.drop();
+              db.unionColl.drop();
+          },
+          testcases: [
+              // Missing required privileges on base collection.
+              {
+                runOnDb: firstDbName,
+                roles: roles_read,
+                privileges: [
+                    {resource: {db: firstDbName, collection: "unionColl"}, actions: ["find"]}
+                ],
+                expectAuthzFailure: true,
+              },
+              // Missing required privileges on nested collection.
+              {
+                runOnDb: firstDbName,
+                roles: roles_read,
+                privileges: [
+                    {resource: {db: firstDbName, collection: "baseColl"}, actions: ["find"]},
+                ],
+                expectAuthzFailure: true,
+              },
+              // All required privileges.
+              {
+                runOnDb: firstDbName,
+                roles: roles_read,
+                privileges: [
+                    {resource: {db: firstDbName, collection: "baseColl"}, actions: ["find"]},
+                    {resource: {db: firstDbName, collection: "unionColl"}, actions: ["find"]},
+                ],
+              },
+          ]
+        },
+        {
+          testname: "aggregate_union_with_sub_pipeline",
+          command: {
+              aggregate: "baseColl",
+              pipeline: [{$unionWith: {coll: "unionColl", pipeline: [
+                {$lookup: {from: "lookupColl", localField: "_id", foreignField: "_id", as: "results"}}]
+              }}],
+              cursor: {}
+          },
+          setup: function(db) {
+              db.createCollection("baseColl");
+              db.createCollection("unionColl");
+              db.createCollection("lookupColl");
+          },
+          teardown: function(db) {
+              db.baseColl.drop();
+              db.unionColl.drop();
+              db.lookupColl.drop();
+          },
+          testcases: [
+              // Missing required privileges on nested collection.
+              {
+                runOnDb: firstDbName,
+                roles: roles_read,
+                privileges: [
+                    {resource: {db: firstDbName, collection: "baseColl"}, actions: ["find"]},
+                ],
+                expectAuthzFailure: true,
+              },
+              {
+                runOnDb: firstDbName,
+                roles: roles_read,
+                privileges: [
+                    {resource: {db: firstDbName, collection: "baseColl"}, actions: ["find"]},
+                    {resource: {db: firstDbName, collection: "unionColl"}, actions: ["find"]},
+                ],
+                expectAuthzFailure: true,
+              },
+              // All required privileges.
+              {
+                runOnDb: firstDbName,
+                roles: roles_read,
+                privileges: [
+                    {resource: {db: firstDbName, collection: "baseColl"}, actions: ["find"]},
+                    {resource: {db: firstDbName, collection: "unionColl"}, actions: ["find"]},
+                    {resource: {db: firstDbName, collection: "lookupColl"}, actions: ["find"]},
+                ],
+              },
+          ]
+        },
     ],
 
     /************* SHARED TEST LOGIC ****************/

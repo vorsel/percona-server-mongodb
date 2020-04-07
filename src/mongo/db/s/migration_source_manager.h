@@ -252,9 +252,9 @@ private:
     // collection doesn't have UUID.
     boost::optional<UUID> _collectionUuid;
 
-    // Whether to use the FCV 4.2 or FCV 4.4 protocol. After branching for v4.4, this should be
-    // removed and the FCV 4.4 protocol should always be used.
-    bool _useFCV44Protocol;
+    // Whether to use the resumable range deleter. This decision is based on whether the FCV 4.2 or
+    // FCV 4.4 protocol are in use and the disableResumableRangeDeleter option is off.
+    bool _enableResumableRangeDeleter;
 
     // Contains logic for ensuring the donor's and recipient's config.rangeDeletions entries are
     // correctly updated based on whether the migration committed or aborted.
@@ -270,6 +270,11 @@ private:
     BSONObj _recipientCloneCounts;
 
     boost::optional<CollectionCriticalSection> _critSec;
+
+    // Optional future that is populated if the migration succeeds and range deletion is scheduled
+    // on this node. The future is set when the range deletion completes. Used if the moveChunk was
+    // sent with waitForDelete.
+    boost::optional<SemiFuture<void>> _cleanupCompleteFuture;
 };
 
 }  // namespace mongo

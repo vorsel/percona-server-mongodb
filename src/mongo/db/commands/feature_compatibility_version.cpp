@@ -43,6 +43,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
@@ -51,11 +52,11 @@
 #include "mongo/db/wire_version.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/executor/egress_tag_closer_manager.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/grid.h"
 #include "mongo/transport/service_entry_point.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -157,8 +158,11 @@ void FeatureCompatibilityVersion::onInsertOrUpdate(OperationContext* opCtx, cons
         ? serverGlobalParams.featureCompatibility.getVersion() != newVersion
         : true;
     if (isDifferent) {
-        log() << "setting featureCompatibilityVersion to "
-              << FeatureCompatibilityVersionParser::toString(newVersion);
+        LOGV2(
+            20459,
+            "setting featureCompatibilityVersion to {FeatureCompatibilityVersionParser_newVersion}",
+            "FeatureCompatibilityVersionParser_newVersion"_attr =
+                FeatureCompatibilityVersionParser::toString(newVersion));
     }
 
     opCtx->recoveryUnit()->onCommit([opCtx, newVersion](boost::optional<Timestamp>) {
@@ -178,15 +182,29 @@ void FeatureCompatibilityVersion::onInsertOrUpdate(OperationContext* opCtx, cons
 
         if (newVersion != ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
             if (MONGO_unlikely(hangBeforeAbortingRunningTransactionsOnFCVDowngrade.shouldFail())) {
-                log() << "featureCompatibilityVersion - "
-                         "hangBeforeAbortingRunningTransactionsOnFCVDowngrade fail point enabled. "
-                         "Blocking until fail point is disabled.";
+                LOGV2(20460,
+                      "featureCompatibilityVersion - "
+                      "hangBeforeAbortingRunningTransactionsOnFCVDowngrade fail point enabled. "
+                      "Blocking until fail point is disabled.");
                 hangBeforeAbortingRunningTransactionsOnFCVDowngrade.pauseWhileSet();
             }
             // Abort all open transactions when downgrading the featureCompatibilityVersion.
             SessionKiller::Matcher matcherAllSessions(
                 KillAllSessionsByPatternSet{makeKillAllSessionsByPattern(opCtx)});
             killSessionsAbortUnpreparedTransactions(opCtx, matcherAllSessions);
+        }
+        const auto replCoordinator = repl::ReplicationCoordinator::get(opCtx);
+        const bool isReplSet =
+            replCoordinator->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
+        // We only want to increment the server TopologyVersion when the minWireVersion has changed.
+        // This can only happen in two scenarios:
+        // 1. Setting featureCompatibilityVersion from downgrading to fullyDowngraded.
+        // 2. Setting featureCompatibilityVersion from fullyDowngraded to upgrading.
+        const auto shouldIncrementTopologyVersion =
+            newVersion == ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo42 ||
+            newVersion == ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo44;
+        if (isReplSet && shouldIncrementTopologyVersion) {
+            replCoordinator->incrementTopologyVersion(opCtx);
         }
     });
 }

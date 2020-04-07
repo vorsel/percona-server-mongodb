@@ -259,11 +259,15 @@ jsTestName = function() {
     return "__unknown_name__";
 };
 
-var _jsTestOptions = {enableTestCommands: true};  // Test commands should be enabled by default
+var _jsTestOptions = {};
 
 jsTestOptions = function() {
     if (TestData) {
         return Object.merge(_jsTestOptions, {
+            // Test commands should be enabled by default if no enableTestCommands were present in
+            // TestData
+            enableTestCommands:
+                TestData.hasOwnProperty('enableTestCommands') ? TestData.enableTestCommands : true,
             serviceExecutor: TestData.serviceExecutor,
             setParameters: TestData.setParameters,
             setParametersMongos: TestData.setParametersMongos,
@@ -275,7 +279,6 @@ jsTestOptions = function() {
             wiredTigerIndexConfigString: TestData.wiredTigerIndexConfigString,
             noJournal: TestData.noJournal,
             auth: TestData.auth,
-            logFormat: TestData.logFormat,
             // Note: keyFile is also used as a flag to indicate cluster auth is turned on, set it
             // to a truthy value if you'd like to do cluster auth, even if it's not keyFile auth.
             // Use clusterAuthMode to specify the actual auth mode you want to use.
@@ -298,6 +301,7 @@ jsTestOptions = function() {
             // Note: does not support the array version
             mongosBinVersion: TestData.mongosBinVersion || "",
             shardMixedBinVersions: TestData.shardMixedBinVersions || false,
+            mixedBinVersions: TestData.mixedBinVersions || false,
             networkMessageCompressors: TestData.networkMessageCompressors,
             replSetFeatureCompatibilityVersion: TestData.replSetFeatureCompatibilityVersion,
             skipRetryOnNetworkError: TestData.skipRetryOnNetworkError,
@@ -349,13 +353,16 @@ jsTestOptions = function() {
             // Set a specific random seed to be used when useRandomBinVersionsWithinReplicaSet is
             // true.
             seed: TestData.seed || undefined,
+            // Override the logging options for mongod and mongos so they always log to a file
+            // in dbpath; additionally, prevent the dbpath from being cleared after a node
+            // is shut down.
+            alwaysUseLogFiles: TestData.alwaysUseLogFiles || false,
+            skipCheckOrphans: TestData.skipCheckOrphans || false,
+            isAsanBuild: TestData.isAsanBuild,
+            inEvergreen: TestData.inEvergreen || false,
         });
     }
     return _jsTestOptions;
-};
-
-setJsTestOption = function(name, value) {
-    _jsTestOptions[name] = value;
 };
 
 jsTestLog = function(msg) {
@@ -371,7 +378,6 @@ jsTest = {};
 
 jsTest.name = jsTestName;
 jsTest.options = jsTestOptions;
-jsTest.setOption = setJsTestOption;
 jsTest.log = jsTestLog;
 jsTest.readOnlyUserRoles = ["read"];
 jsTest.basicUserRoles = ["dbOwner"];
@@ -1749,9 +1755,9 @@ help = shellHelper.help = function(x) {
         print("\t" +
               "use <db_name>                set current database");
         print("\t" +
-              "db.foo.find()                list objects in collection foo");
+              "db.mycoll.find()             list objects in collection mycoll");
         print("\t" +
-              "db.foo.find( { a : 1 } )     list objects in foo where a == 1");
+              "db.mycoll.find( { a : 1 } )  list objects in mycoll where a == 1");
         print(
             "\t" +
             "it                           result of the last line evaluated; use to further iterate");

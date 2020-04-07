@@ -354,13 +354,13 @@ class OCSPResponseBuilder(object):
 
             issuer = self._certificate_issuer if self._certificate_issuer else responder_certificate
 
-            produced_at = datetime.now(timezone.utc)
+            produced_at = datetime.now(timezone.utc).replace(microsecond=0)
 
             if self._this_update is None:
                 self._this_update = produced_at
 
             if self._next_update is None:
-                self._next_update = self._this_update + timedelta(days=7)
+                self._next_update = (self._this_update + timedelta(days=7)).replace(microsecond=0)
 
             response = {
                     'cert_id': {
@@ -403,7 +403,7 @@ class OCSPResponseBuilder(object):
         signature_bytes = sign_func(responder_private_key, response_data.dump(), self._hash_algo)
 
         certs = None
-        if self._certificate_issuer:
+        if self._certificate_issuer and getattr(self._certificate_issuer.public_key, self._key_hash_algo) != responder_key_hash:
             certs = [responder_certificate]
 
         return ocsp.OCSPResponse({
@@ -414,6 +414,7 @@ class OCSPResponseBuilder(object):
                     'tbs_response_data': response_data,
                     'signature_algorithm': {'algorithm': signature_algorithm_id},
                     'signature': signature_bytes,
+                    'certs': certs,
                 }
             }
         })
@@ -450,7 +451,7 @@ FAULT_UNKNOWN = "unknown"
 class OCSPResponder:
 
     def __init__(self, issuer_cert: str, responder_cert: str, responder_key: str,
-                       fault: str = None, next_update_days: int = 7):
+                       fault: str, next_update_seconds: int):
         """
         Create a new OCSPResponder instance.
 
@@ -464,8 +465,8 @@ class OCSPResponder:
             depending on the status - a revocation datetime.
         :param cert_retrieve_func: A function that - given a certificate serial -
             will return the corresponding certificate as a string.
-        :param next_update_days: The ``nextUpdate`` value that will be written
-            into the response. Default: 7 days.
+        :param next_update_seconds: The ``nextUpdate`` value that will be written
+            into the response. Default: 9 hours.
 
         """
         # Certs and keys
@@ -474,7 +475,7 @@ class OCSPResponder:
         self._responder_key = asymmetric.load_private_key(responder_key)
 
         # Next update
-        self._next_update_days = next_update_days
+        self._next_update_seconds = next_update_seconds
 
         self._fault = fault
 
@@ -594,7 +595,8 @@ class OCSPResponder:
         builder.certificate_issuer = self._issuer_cert
 
         # Set next update date
-        builder.next_update = datetime.now(timezone.utc) + timedelta(days=self._next_update_days)
+        now = datetime.now(timezone.utc)
+        builder.next_update = (now + timedelta(seconds=self._next_update_seconds)).replace(microsecond=0)
 
         return builder.build(self._responder_key, self._responder_cert)
 

@@ -39,8 +39,8 @@
 #include "mongo/db/query/collation/collator_interface_mock.h"
 #include "mongo/db/query/projection_ast_util.h"
 #include "mongo/db/query/projection_parser.h"
+#include "mongo/logv2/log.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
 
 namespace mongo::projection_executor {
 namespace {
@@ -64,8 +64,11 @@ public:
             _allowFastPath = false;
             base->run();
         } catch (...) {
-            log() << "exception while testing with allowFastPath=" << _allowFastPath
-                  << " and allowFallBackToDefault=" << AllowFallBackToDefault;
+            LOGV2(20597,
+                  "exception while testing with allowFastPath={allowFastPath} and "
+                  "allowFallBackToDefault={AllowFallBackToDefault}",
+                  "allowFastPath"_attr = _allowFastPath,
+                  "AllowFallBackToDefault"_attr = AllowFallBackToDefault);
             throw;
         }
     }
@@ -228,8 +231,9 @@ TEST_F(ProjectionExecutorTestWithFallBackToDefault, CanProjectFindElemMatch) {
 }
 
 TEST_F(ProjectionExecutorTestWithFallBackToDefault, ElemMatchRespectsCollator) {
-    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
-    getExpCtx()->setCollator(&collator);
+    auto collator =
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString);
+    getExpCtx()->setCollator(std::move(collator));
 
     auto proj = parseWithFindFeaturesEnabled(fromjson("{a: {$elemMatch: {$gte: 'abc'}}}"));
     auto executor = createProjectionExecutor(proj);

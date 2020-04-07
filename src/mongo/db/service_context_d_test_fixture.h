@@ -52,6 +52,10 @@ protected:
     ServiceContextMongoDTest(std::string engine, RepairAction repair);
     virtual ~ServiceContextMongoDTest();
 
+    void setUp() override;
+
+    void tearDown() override;
+
 private:
     struct {
         std::string engine;

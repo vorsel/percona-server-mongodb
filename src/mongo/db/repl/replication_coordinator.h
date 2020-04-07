@@ -41,7 +41,6 @@
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/split_horizon.h"
 #include "mongo/db/repl/sync_source_selector.h"
-#include "mongo/db/repl/tla_plus_trace_repl_gen.h"
 #include "mongo/rpc/topology_version_gen.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
@@ -261,13 +260,15 @@ public:
      * The result of this function should be consistent with canAcceptWritesForDatabase()
      * for the database the namespace refers to, with additional checks on the collection.
      */
-    virtual bool canAcceptWritesFor(OperationContext* opCtx, const NamespaceString& ns) = 0;
+    virtual bool canAcceptWritesFor(OperationContext* opCtx,
+                                    const NamespaceStringOrUUID& nsOrUUID) = 0;
 
     /**
      * Version which does not check for the RSTL.  Do not use in new code. Without the RSTL held,
      * the return value may be inaccurate by the time the function returns.
      */
-    virtual bool canAcceptWritesFor_UNSAFE(OperationContext* opCtx, const NamespaceString& ns) = 0;
+    virtual bool canAcceptWritesFor_UNSAFE(OperationContext* opCtx,
+                                           const NamespaceStringOrUUID& nsOrUUID) = 0;
 
     /**
      * Checks if the current replica set configuration can satisfy the given write concern.
@@ -604,8 +605,11 @@ public:
 
     /**
      * Handles an incoming replSetGetConfig command. Adds BSON to 'result'.
+     *
+     * If commitmentStatus is true, adds a boolean 'commitmentStatus' field to 'result' indicating
+     * whether the current config is committed.
      */
-    virtual void processReplSetGetConfig(BSONObjBuilder* result) = 0;
+    virtual void processReplSetGetConfig(BSONObjBuilder* result, bool commitmentStatus = false) = 0;
 
     /**
      * Processes the ReplSetMetadata returned from a command run against another
@@ -676,7 +680,7 @@ public:
      */
     struct ReplSetReconfigArgs {
         BSONObj newConfigObj;
-        bool force;
+        bool force = false;
     };
 
     /**
@@ -686,6 +690,15 @@ public:
     virtual Status processReplSetReconfig(OperationContext* opCtx,
                                           const ReplSetReconfigArgs& args,
                                           BSONObjBuilder* resultObj) = 0;
+
+    /**
+     * Install the new config returned by the callback "getNewConfig".
+     */
+    using GetNewConfigFn = std::function<StatusWith<ReplSetConfig>(const ReplSetConfig& oldConfig,
+                                                                   long long currentTerm)>;
+    virtual Status doReplSetReconfig(OperationContext* opCtx,
+                                     GetNewConfigFn getNewConfig,
+                                     bool force) = 0;
 
     /*
      * Handles an incoming replSetInitiate command. If "configObj" is empty, generates a default
@@ -948,6 +961,12 @@ public:
         const size_t numOpsRunning) const = 0;
 
     /**
+     * Increment the server TopologyVersion and fulfill the promise of any currently waiting
+     * isMaster request.
+     */
+    virtual void incrementTopologyVersion(OperationContext* opCtx) = 0;
+
+    /**
      * Constructs and returns an IsMasterResponse. Will block until the given deadline waiting for a
      * significant topology change if the 'counter' field of 'clientTopologyVersion' is equal to the
      * current TopologyVersion 'counter' from the TopologyCoordinator. Returns immediately if
@@ -961,12 +980,13 @@ public:
         boost::optional<Date_t> deadline) const = 0;
 
     /**
-     * Trace a replication event for the RaftMongo.tla spec.
+     * The futurized version of `awaitIsMasterResponse()`:
+     * * The future is ready for all cases that `awaitIsMasterResponse()` returns immediately.
+     * * For cases that `awaitIsMasterResponse()` blocks, calling `get()` on the future is blocking.
      */
-    virtual void tlaPlusRaftMongoEvent(
-        OperationContext* opCtx,
-        RaftMongoSpecActionEnum action,
-        boost::optional<Timestamp> oplogReadTimestamp = boost::none) const {}
+    virtual SharedSemiFuture<std::shared_ptr<const IsMasterResponse>> getIsMasterResponseFuture(
+        const SplitHorizon::Parameters& horizonParams,
+        boost::optional<TopologyVersion> clientTopologyVersion) const = 0;
 
     /**
      * Returns the OpTime that consists of the timestamp of the latest oplog entry and the current
@@ -979,6 +999,13 @@ public:
      * 5. Getting latest oplog timestamp is not supported by the storage engine.
      */
     virtual OpTime getLatestWriteOpTime(OperationContext* opCtx) const = 0;
+
+    /**
+     * Returns the HostAndPort of the current primary, or an empty HostAndPort if there is no
+     * primary. Note that the primary can change at any time and thus the result may be immediately
+     * stale unless run from the primary with the RSTL held.
+     */
+    virtual HostAndPort getCurrentPrimaryHostAndPort() const = 0;
 
 protected:
     ReplicationCoordinator();

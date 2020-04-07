@@ -45,6 +45,8 @@ DEFAULT_GENNY_EXECUTABLE = os.path.normpath("genny/build/src/driver/genny")
 
 # Names below correspond to how they are specified via the command line or in the options YAML file.
 DEFAULTS = {
+    "always_use_log_files": False,
+    "is_asan_build": False,
     "archive_file": None,
     "archive_limit_mb": 5000,
     "archive_limit_tests": 10,
@@ -61,7 +63,6 @@ DEFAULTS = {
     "include_with_any_tags": None,
     "install_dir": None,
     "jobs": 1,
-    "log_format": None,
     "mongo_executable": None,
     "mongod_executable": None,
     "mongod_set_parameters": None,
@@ -219,6 +220,9 @@ SuiteOptions.ALL_INHERITED = SuiteOptions(  # type: ignore
 # Variables that are set by the user at the command line or with --options.
 ##
 
+# Log to files located in the db path and don't clean dbpaths after tests.
+ALWAYS_USE_LOG_FILES = False
+
 # The name of the archive JSON file used to associate S3 archives to an Evergreen task.
 ARCHIVE_FILE = None
 
@@ -227,6 +231,9 @@ ARCHIVE_LIMIT_MB = None
 
 # The limit number of tests to archive for an Evergreen task.
 ARCHIVE_LIMIT_TESTS = None
+
+# True if resmoke is running against and ASAN build.
+IS_ASAN_BUILD = None
 
 # The starting port number to use for mongod and mongos processes spawned by resmoke.py and the
 # mongo shell.
@@ -312,10 +319,6 @@ MONGOD_EXECUTABLE = None
 
 # The --setParameter options passed to mongod.
 MONGOD_SET_PARAMETERS = None
-
-# If set, the log format to use by all mongod's and mongo shells started by resmoke.py
-# Supported values are the same as what is supported in mongod/mongo shell: default, text, json
-LOG_FORMAT = None
 
 # The path to the mongos executable used by resmoke.py.
 MONGOS_EXECUTABLE = None

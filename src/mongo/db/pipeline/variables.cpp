@@ -40,11 +40,8 @@ namespace mongo {
 constexpr Variables::Id Variables::kRootId;
 constexpr Variables::Id Variables::kRemoveId;
 
-const StringMap<Variables::Id> Variables::kBuiltinVarNameToId = {{"ROOT", kRootId},
-                                                                 {"REMOVE", kRemoveId},
-                                                                 {"NOW", kNowId},
-                                                                 {"CLUSTER_TIME", kClusterTimeId},
-                                                                 {"JS_SCOPE", kJsScopeId}};
+const StringMap<Variables::Id> Variables::kBuiltinVarNameToId = {
+    {"ROOT", kRootId}, {"REMOVE", kRemoveId}, {"NOW", kNowId}, {"CLUSTER_TIME", kClusterTimeId}};
 
 void Variables::uassertValidNameForUserWrite(StringData varName) {
     // System variables users allowed to write to (currently just one)
@@ -153,6 +150,10 @@ Value Variables::getValue(Id id, const Document& root) const {
                           str::stream() << "Builtin variable '$$" << getBuiltinVariableName(id)
                                         << "' is not available");
                 MONGO_UNREACHABLE;
+            case Variables::kJsScopeId:
+                uasserted(4631100, "Use of undefined variable '$$JS_SCOPE'.");
+            case Variables::kIsMapReduceId:
+                uasserted(4631101, "Use of undefined variable '$$IS_MR'.");
             default:
                 MONGO_UNREACHABLE;
         }
@@ -186,6 +187,9 @@ RuntimeConstants Variables::getRuntimeConstants() const {
     if (auto it = _runtimeConstants.find(kJsScopeId); it != _runtimeConstants.end()) {
         constants.setJsScope(it->second.getDocument().toBson());
     }
+    if (auto it = _runtimeConstants.find(kIsMapReduceId); it != _runtimeConstants.end()) {
+        constants.setIsMapReduce(it->second.getBool());
+    }
 
     return constants;
 }
@@ -201,6 +205,9 @@ void Variables::setRuntimeConstants(const RuntimeConstants& constants) {
 
     if (constants.getJsScope()) {
         _runtimeConstants[kJsScopeId] = Value(constants.getJsScope().get());
+    }
+    if (constants.getIsMapReduce()) {
+        _runtimeConstants[kIsMapReduceId] = Value(constants.getIsMapReduce().get());
     }
 }
 

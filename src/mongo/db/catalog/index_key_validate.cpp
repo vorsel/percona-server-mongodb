@@ -50,8 +50,8 @@
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 #include "mongo/util/represent_as.h"
 #include "mongo/util/str.h"
 
@@ -243,8 +243,10 @@ BSONObj removeUnknownFields(const BSONObj& indexSpec) {
         if (allowedFieldNames.count(fieldName)) {
             builder.append(indexSpecElem);
         } else {
-            warning() << "Removing field '" << redact(fieldName)
-                      << "' from index spec: " << redact(indexSpec);
+            LOGV2_WARNING(23878,
+                          "Removing field '{fieldName}' from index spec: {indexSpec}",
+                          "fieldName"_attr = redact(fieldName),
+                          "indexSpec"_attr = redact(indexSpec));
         }
     }
     return builder.obj();
@@ -383,10 +385,12 @@ StatusWith<BSONObj> validateIndexSpec(
             // specified or may inherit the default collation from the collection. It's legal to
             // parse with the wrong collation, since the collation can be set on a MatchExpression
             // after the fact. Here, we don't bother checking the collation after the fact, since
-            // this invocation of the parser is just for validity checking.
+            // this invocation of the parser is just for validity checking. It's also legal to parse
+            // with an empty namespace string, because we are only doing validity checking and not
+            // resolving the expression against a given namespace.
             auto simpleCollator = nullptr;
             boost::intrusive_ptr<ExpressionContext> expCtx(
-                new ExpressionContext(opCtx, simpleCollator));
+                new ExpressionContext(opCtx, simpleCollator, NamespaceString()));
 
             // Special match expression features (e.g. $jsonSchema, $expr, ...) are not allowed in a
             // partialFilterExpression on index creation.

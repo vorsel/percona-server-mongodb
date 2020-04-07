@@ -53,7 +53,7 @@ class CollectionScan final : public RequiresCollectionStage {
 public:
     static const char* kStageType;
 
-    CollectionScan(OperationContext* opCtx,
+    CollectionScan(ExpressionContext* expCtx,
                    const Collection* collection,
                    const CollectionScanParams& params,
                    WorkingSet* workingSet,
@@ -73,7 +73,7 @@ public:
         return _latestOplogEntryTimestamp;
     }
 
-    BSONObj getResumeToken() const {
+    BSONObj getPostBatchResumeToken() const {
         return _params.requestResumeToken ? BSON("$recordId" << _lastSeenId.repr()) : BSONObj();
     }
 

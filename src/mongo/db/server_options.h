@@ -64,8 +64,6 @@ struct ServerGlobalParams {
 
     int listenBacklog = 0;  // --listenBacklog, real default is SOMAXCONN
 
-    bool indexBuildRetry = true;  // --noIndexBuildRetry
-
     AtomicWord<bool> quiet{false};  // --quiet
 
     ClusterRole clusterRole = ClusterRole::None;  // --configsvr/--shardsvr
@@ -102,7 +100,8 @@ struct ServerGlobalParams {
     bool relaxPermChecks = false;  // --relaxPermChecks
 
     std::string logpath;  // Path to log file, if logging to a file; otherwise, empty.
-    logv2::LogFormat logFormat = logv2::LogFormat::kDefault;  // Log format to output to
+    logv2::LogTimestampFormat logTimestampFormat = logv2::LogTimestampFormat::kISO8601Local;
+
     bool logAppend = false;         // True if logging to a file in append mode.
     bool logRenameOnRotate = true;  // True if logging should rename log files on rotate
     bool logWithSyslog = false;     // True if logging to syslog; must not be set if logpath is set.
@@ -243,9 +242,8 @@ struct ServerGlobalParams {
             return _version.store(version);
         }
 
-        bool isVersionUpgradingOrUpgraded() {
-            return (getVersion() == Version::kUpgradingTo44 ||
-                    getVersion() == Version::kFullyUpgradedTo44);
+        bool isVersion(Version version) {
+            return _version.load() == version;
         }
 
     private:

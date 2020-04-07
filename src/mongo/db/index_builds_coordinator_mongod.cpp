@@ -42,7 +42,6 @@
 #include "mongo/db/service_context.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -216,8 +215,7 @@ IndexBuildsCoordinatorMongod::startIndexBuild(OperationContext* opCtx,
             opCtx->lockState());
 
         if (!indexBuildOptions.twoPhaseRecovery) {
-            status =
-                _setUpIndexBuild(opCtx.get(), dbName, collectionUUID, buildUUID, startTimestamp);
+            status = _setUpIndexBuild(opCtx.get(), buildUUID, startTimestamp);
             if (!status.isOK()) {
                 startPromise.setError(status);
                 return;

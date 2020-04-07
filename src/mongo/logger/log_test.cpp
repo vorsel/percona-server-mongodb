@@ -61,16 +61,6 @@ namespace {
 typedef LogTest<MessageEventDetailsEncoder, logv2::TextFormatter> LogTestDetailsEncoder;
 typedef LogTest<MessageEventUnadornedEncoder, logv2::PlainFormatter> LogTestUnadornedEncoder;
 
-TEST_F(LogTestUnadornedEncoder, logContext) {
-    logContext("WHA!");
-    ASSERT_GREATER_THAN(_logLines.size(), 1U);
-    ASSERT_NOT_EQUALS(_logLines[0].find("WHA!"), std::string::npos);
-
-    // TODO(schwerin): Ensure that logContext rights a proper context to the log stream,
-    // including the address of the logContext() function.
-    // void const* logContextFn = reinterpret_cast<void const*>(logContext);
-}
-
 class CountAppender : public Appender<MessageEventEphemeral> {
 public:
     CountAppender() : _count(0) {}
@@ -215,10 +205,10 @@ TEST_F(LogTestUnadornedEncoder, LogComponentSettingsShouldLogDefaultLogComponent
     LogComponentSettings settings;
 
     // Initial log severity for LogComponent::kDefault is Log().
-    ASSERT_TRUE(shouldLog(LogSeverity::Info()));
-    ASSERT_TRUE(shouldLog(LogSeverity::Log()));
-    ASSERT_FALSE(shouldLog(LogSeverity::Debug(1)));
-    ASSERT_FALSE(shouldLog(LogSeverity::Debug(2)));
+    ASSERT_TRUE(shouldLogV1(LogSeverity::Info()));
+    ASSERT_TRUE(shouldLogV1(LogSeverity::Log()));
+    ASSERT_FALSE(shouldLogV1(LogSeverity::Debug(1)));
+    ASSERT_FALSE(shouldLogV1(LogSeverity::Debug(2)));
 
     // If any components are provided to shouldLog(), we should get the same outcome
     // because we have not configured any non-LogComponent::kDefault components.
@@ -229,10 +219,10 @@ TEST_F(LogTestUnadornedEncoder, LogComponentSettingsShouldLogDefaultLogComponent
     settings.setMinimumLoggedSeverity(LogComponent::kDefault, LogSeverity::Debug(1));
     setMinimumLoggedSeverity(LogComponent::kDefault, LogSeverity::Debug(1));
 
-    ASSERT_TRUE(shouldLog(LogSeverity::Info()));
-    ASSERT_TRUE(shouldLog(LogSeverity::Log()));
-    ASSERT_TRUE(shouldLog(LogSeverity::Debug(1)));
-    ASSERT_FALSE(shouldLog(LogSeverity::Debug(2)));
+    ASSERT_TRUE(shouldLogV1(LogSeverity::Info()));
+    ASSERT_TRUE(shouldLogV1(LogSeverity::Log()));
+    ASSERT_TRUE(shouldLogV1(LogSeverity::Debug(1)));
+    ASSERT_FALSE(shouldLogV1(LogSeverity::Debug(2)));
 
     // Revert back.
     setMinimumLoggedSeverity(LogComponent::kDefault, LogSeverity::Log());
@@ -267,8 +257,8 @@ TEST_F(LogTestUnadornedEncoder, LogComponentSettingsShouldLogSingleComponent) {
     setMinimumLoggedSeverity(LogComponent::kDefault, LogSeverity::Debug(1));
 
     // Components for log message: LogComponent::kDefault only.
-    ASSERT_TRUE(shouldLog(LogSeverity::Debug(1)));
-    ASSERT_FALSE(shouldLog(LogSeverity::Debug(2)));
+    ASSERT_TRUE(shouldLogV1(LogSeverity::Debug(1)));
+    ASSERT_FALSE(shouldLogV1(LogSeverity::Debug(2)));
 
     setMinimumLoggedSeverity(LogComponent::kDefault, LogSeverity::Log());
 }
@@ -304,8 +294,8 @@ TEST_F(LogTestUnadornedEncoder, LogComponentSettingsShouldLogMultipleComponentsC
 
 
     // Components for log message: LogComponent::kDefault only.
-    ASSERT_TRUE(shouldLog(LogSeverity::Debug(1)));
-    ASSERT_FALSE(shouldLog(LogSeverity::Debug(2)));
+    ASSERT_TRUE(shouldLogV1(LogSeverity::Debug(1)));
+    ASSERT_FALSE(shouldLogV1(LogSeverity::Debug(2)));
 
     setMinimumLoggedSeverity(LogComponent::kDefault, LogSeverity::Log());
 }

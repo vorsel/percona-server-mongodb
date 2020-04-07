@@ -52,6 +52,7 @@
 
 namespace mongo {
 
+class BSONObjBuilder;
 class BSONObjStlIterator;
 class ExtendedCanonicalV200Generator;
 class ExtendedRelaxedV200Generator;
@@ -249,6 +250,9 @@ public:
     /** @return a new full (and owned) copy of the object. */
     BSONObj copy() const;
 
+    /** @return a new full (and owned) redacted copy of the object. */
+    BSONObj redact() const;
+
     /** Readable representation of a BSON object in an extended JSON-style notation.
         This is an abbreviated representation which might be used for logging.
     */
@@ -266,25 +270,31 @@ public:
     */
     std::string jsonString(JsonStringFormat format = ExtendedCanonicalV2_0_0,
                            int pretty = 0,
-                           bool isArray = false) const;
+                           bool isArray = false,
+                           size_t writeLimit = 0,
+                           BSONObj* outTruncationResult = nullptr) const;
 
-    void jsonStringBuffer(JsonStringFormat format,
-                          int pretty,
-                          bool isArray,
-                          fmt::memory_buffer& buffer) const;
+    BSONObj jsonStringBuffer(JsonStringFormat format,
+                             int pretty,
+                             bool isArray,
+                             fmt::memory_buffer& buffer,
+                             size_t writeLimit = 0) const;
 
-    void jsonStringGenerator(ExtendedCanonicalV200Generator const& generator,
-                             int pretty,
-                             bool isArray,
-                             fmt::memory_buffer& buffer) const;
-    void jsonStringGenerator(ExtendedRelaxedV200Generator const& generator,
-                             int pretty,
-                             bool isArray,
-                             fmt::memory_buffer& buffer) const;
-    void jsonStringGenerator(LegacyStrictGenerator const& generator,
-                             int pretty,
-                             bool isArray,
-                             fmt::memory_buffer& buffer) const;
+    BSONObj jsonStringGenerator(ExtendedCanonicalV200Generator const& generator,
+                                int pretty,
+                                bool isArray,
+                                fmt::memory_buffer& buffer,
+                                size_t writeLimit = 0) const;
+    BSONObj jsonStringGenerator(ExtendedRelaxedV200Generator const& generator,
+                                int pretty,
+                                bool isArray,
+                                fmt::memory_buffer& buffer,
+                                size_t writeLimit = 0) const;
+    BSONObj jsonStringGenerator(LegacyStrictGenerator const& generator,
+                                int pretty,
+                                bool isArray,
+                                fmt::memory_buffer& buffer,
+                                size_t writeLimit = 0) const;
 
     /** note: addFields always adds _id even if not specified */
     int addFields(BSONObj& from, std::set<std::string>& fields); /* returns n added */
@@ -384,9 +394,11 @@ public:
      *    this.extractFieldsUnDotted({b : "blah"}) -> {"" : 5}
      *
      */
-    BSONObj extractFieldsUnDotted(const BSONObj& pattern) const;
+    BSONObj extractFieldsUndotted(const BSONObj& pattern) const;
+    void extractFieldsUndotted(BSONObjBuilder* b, const BSONObj& pattern) const;
 
     BSONObj filterFieldsUndotted(const BSONObj& filter, bool inFilter) const;
+    void filterFieldsUndotted(BSONObjBuilder* b, const BSONObj& filter, bool inFilter) const;
 
     BSONElement getFieldUsingIndexNames(StringData fieldName, const BSONObj& indexKey) const;
 
@@ -424,8 +436,6 @@ public:
     bool isEmpty() const {
         return objsize() <= kMinBSONLength;
     }
-
-    void dump() const;
 
     /** Alternative output format */
     std::string hexDump() const;
@@ -603,10 +613,11 @@ public:
 
 private:
     template <typename Generator>
-    void _jsonStringGenerator(const Generator& g,
-                              int pretty,
-                              bool isArray,
-                              fmt::memory_buffer& buffer) const;
+    BSONObj _jsonStringGenerator(const Generator& g,
+                                 int pretty,
+                                 bool isArray,
+                                 fmt::memory_buffer& buffer,
+                                 size_t writeLimit) const;
 
     void _assertInvalid(int maxSize) const;
 
@@ -616,6 +627,8 @@ private:
         if (!isValid<Traits>())
             _assertInvalid(Traits::MaxSize);
     }
+
+    void _validateUnownedSize(int size) const;
 
     const char* _objdata;
     ConstSharedBuffer _ownedBuffer;

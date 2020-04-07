@@ -320,6 +320,8 @@ TEST(ReplSetConfig, ParseFailsWithBadOrMissingTermField) {
                                      << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                               << "localhost:12345")))));
     ASSERT_EQUALS(config.getConfigTerm(), -1);
+    // Serializing the config to BSON should omit a term field with value -1.
+    ASSERT_FALSE(config.toBSON().hasField(ReplSetConfig::kTermFieldName));
     ASSERT_EQUALS(ErrorCodes::TypeMismatch,
                   config.initialize(BSON("_id"
                                          << "rs0"
@@ -351,6 +353,7 @@ TEST(ReplSetConfig, ParseFailsWithBadOrMissingTermField) {
                                      << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                               << "localhost:12345")))));
     ASSERT_OK(config.validate());
+    ASSERT_FALSE(config.toBSON().hasField(ReplSetConfig::kTermFieldName));
     ASSERT_OK(config.initialize(BSON("_id"
                                      << "rs0"
                                      << "version" << 1 << "term" << -2.0 << "protocolVersion" << 1
@@ -1714,6 +1717,34 @@ TEST(ReplSetConfig, ReplSetId) {
                            "\"replicaSetId\" had the wrong type. Expected objectId, found int");
 }
 
+TEST(ReplSetConfig, ConfigVersionAndTermComparison) {
+    // Test equality.
+    ASSERT_EQ(ConfigVersionAndTerm(1, 1), ConfigVersionAndTerm(1, 1));
+    ASSERT_EQ(ConfigVersionAndTerm(1, 2), ConfigVersionAndTerm(1, 2));
+    ASSERT_EQ(ConfigVersionAndTerm(2, 2), ConfigVersionAndTerm(2, 2));
+    ASSERT_EQ(ConfigVersionAndTerm(1, -1), ConfigVersionAndTerm(1, 1));
+    ASSERT_EQ(ConfigVersionAndTerm(1, 1), ConfigVersionAndTerm(1, -1));
+    ASSERT_EQ(ConfigVersionAndTerm(1, -1), ConfigVersionAndTerm(1, -1));
+    // Test greater/less than or equal to.
+    ASSERT_GT(ConfigVersionAndTerm(2, 1), ConfigVersionAndTerm(1, 1));
+    ASSERT_GTE(ConfigVersionAndTerm(2, 1), ConfigVersionAndTerm(1, 1));
+    ASSERT_GT(ConfigVersionAndTerm(1, 2), ConfigVersionAndTerm(1, 1));
+    ASSERT_GTE(ConfigVersionAndTerm(1, 2), ConfigVersionAndTerm(1, 1));
+    ASSERT_LT(ConfigVersionAndTerm(1, 1), ConfigVersionAndTerm(2, 1));
+    ASSERT_LTE(ConfigVersionAndTerm(1, 1), ConfigVersionAndTerm(2, 1));
+    ASSERT_LT(ConfigVersionAndTerm(1, 1), ConfigVersionAndTerm(1, 2));
+    ASSERT_LTE(ConfigVersionAndTerm(1, 1), ConfigVersionAndTerm(1, 2));
+    ASSERT_GT(ConfigVersionAndTerm(2, 1), ConfigVersionAndTerm(1, -1));
+    ASSERT_GT(ConfigVersionAndTerm(2, -1), ConfigVersionAndTerm(1, 1));
+    ASSERT_GT(ConfigVersionAndTerm(2, -1), ConfigVersionAndTerm(1, -1));
+}
+TEST(ReplSetConfig, ConfigVersionAndTermToString) {
+    ASSERT_EQ(ConfigVersionAndTerm(0, 1).toString(), "{version: 0, term: 1}");
+    ASSERT_EQ(ConfigVersionAndTerm(0, 2).toString(), "{version: 0, term: 2}");
+    ASSERT_EQ(ConfigVersionAndTerm(1, 1).toString(), "{version: 1, term: 1}");
+    ASSERT_EQ(ConfigVersionAndTerm(1, 2).toString(), "{version: 1, term: 2}");
+    ASSERT_EQ(ConfigVersionAndTerm(1, -1).toString(), "{version: 1, term: -1}");
+}
 }  // namespace
 }  // namespace repl
 }  // namespace mongo

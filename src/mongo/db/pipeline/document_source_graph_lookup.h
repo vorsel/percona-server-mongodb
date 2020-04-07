@@ -41,18 +41,24 @@ class DocumentSourceGraphLookUp final : public DocumentSource {
 public:
     static constexpr StringData kStageName = "$graphLookup"_sd;
 
-    class LiteParsed : public LiteParsedDocumentSourceForeignCollections {
+    class LiteParsed : public LiteParsedDocumentSourceForeignCollection {
     public:
-        LiteParsed(NamespaceString foreignNss, PrivilegeVector privileges)
-            : LiteParsedDocumentSourceForeignCollections(std::move(foreignNss),
-                                                         std::move(privileges)) {}
+        LiteParsed(std::string parseTimeName, NamespaceString foreignNss)
+            : LiteParsedDocumentSourceForeignCollection(std::move(parseTimeName),
+                                                        std::move(foreignNss)) {}
+
+        static std::unique_ptr<LiteParsed> parse(const NamespaceString& nss,
+                                                 const BSONElement& spec);
+
 
         bool allowShardedForeignCollection(NamespaceString nss) const override {
-            return (_foreignNssSet.find(nss) == _foreignNssSet.end());
+            return _foreignNss != nss;
+        }
+
+        PrivilegeVector requiredPrivileges(bool isMongos, bool bypassDocumentValidation) const {
+            return {Privilege(ResourcePattern::forExactNamespace(_foreignNss), ActionType::find)};
         }
     };
-    static std::unique_ptr<LiteParsed> liteParse(const AggregationRequest& request,
-                                                 const BSONElement& spec);
 
     const char* getSourceName() const final;
 
@@ -92,7 +98,8 @@ public:
                                      DiskUseRequirement::kNoDiskUse,
                                      FacetRequirement::kAllowed,
                                      TransactionRequirement::kAllowed,
-                                     LookupRequirement::kAllowed);
+                                     LookupRequirement::kAllowed,
+                                     UnionRequirement::kAllowed);
 
         constraints.canSwapWithMatch = true;
         return constraints;

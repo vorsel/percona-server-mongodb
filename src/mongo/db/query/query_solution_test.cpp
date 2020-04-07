@@ -46,7 +46,6 @@
 namespace {
 
 using namespace mongo;
-
 /**
  * Make a minimal IndexEntry from just a key pattern. A dummy name will be added.
  */
@@ -718,9 +717,8 @@ TEST(QuerySolutionTest, IndexScanNodeHasFieldExcludesSimpleBoundsStringFieldWhen
 auto createMatchExprAndProjection(const BSONObj& query, const BSONObj& projObj) {
     QueryTestServiceContext serviceCtx;
     auto opCtx = serviceCtx.makeOperationContext();
-    const CollatorInterface* collator = nullptr;
-    const boost::intrusive_ptr<ExpressionContext> expCtx(
-        new ExpressionContext(opCtx.get(), collator));
+    const boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContext(
+        opCtx.get(), std::unique_ptr<CollatorInterface>(nullptr), NamespaceString("test.dummy")));
     StatusWithMatchExpression queryMatchExpr =
         MatchExpressionParser::parse(query, std::move(expCtx));
     ASSERT(queryMatchExpr.isOK());
@@ -943,7 +941,6 @@ TEST(QuerySolutionTest, NonSimpleRangeAllEqualExcludesFieldWithMultikeyComponent
     }
 
     node.computeProperties();
-
     ASSERT_EQUALS(node.getSort().size(), 4U);
     ASSERT(node.getSort().count(BSON("a" << 1 << "b" << 1)));
     ASSERT(node.getSort().count(BSON("a" << 1)));
@@ -951,4 +948,26 @@ TEST(QuerySolutionTest, NonSimpleRangeAllEqualExcludesFieldWithMultikeyComponent
     ASSERT(node.getSort().count(BSON("e" << 1)));
 }
 
+TEST(QuerySolutionTest, SharedPrefixMultikeyNonMinMaxBoundsDoesNotProvideAnySorts) {
+    IndexScanNode node{buildSimpleIndexEntry(BSON("c.x" << 1 << "c.z" << 1))};
+
+    node.index.multikey = true;
+    node.index.multikeyPaths = MultikeyPaths{{1U}, {1U}};
+
+    {
+        OrderedIntervalList oil{};
+        oil.name = "c.x";
+        oil.intervals.push_back(IndexBoundsBuilder::makePointInterval(BSON("" << 1)));
+        node.bounds.fields.push_back(oil);
+    }
+    {
+        OrderedIntervalList oil{};
+        oil.name = "c.z";
+        oil.intervals.push_back(IndexBoundsBuilder::allValues());
+        node.bounds.fields.push_back(oil);
+    }
+
+    node.computeProperties();
+    ASSERT_EQUALS(node.getSort().size(), 0U);
+}
 }  // namespace

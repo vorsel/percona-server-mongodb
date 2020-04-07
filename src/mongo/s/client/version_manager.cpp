@@ -36,6 +36,7 @@
 #include "mongo/client/dbclient_cursor.h"
 #include "mongo/client/dbclient_rs.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/shard_registry.h"
@@ -45,7 +46,7 @@
 #include "mongo/s/stale_exception.h"
 #include "mongo/s/transaction_router.h"
 #include "mongo/util/hierarchical_acquisition.h"
-#include "mongo/util/log.h"
+#include "mongo/util/itoa.h"
 
 namespace mongo {
 
@@ -145,9 +146,15 @@ bool setShardVersion(OperationContext* opCtx,
         cmd = ssv.toBSON();
     }
 
-    LOG(1) << "    setShardVersion  " << shardId << " " << conn->getServerAddress() << "  " << ns
-           << "  " << cmd
-           << (manager ? string(str::stream() << " " << manager->getSequenceNumber()) : "");
+    LOGV2_DEBUG(20218,
+                1,
+                "setShardVersion  {shardId} {serverAddress}  {ns}  {cmd} {manager}",
+                "shardId"_attr = shardId,
+                "serverAddress"_attr = conn->getServerAddress(),
+                "ns"_attr = ns,
+                "cmd"_attr = cmd,
+                "manager"_attr =
+                    manager ? StringData{ItoA{manager->getSequenceNumber()}} : StringData{});
 
     return conn->runCommand("admin", cmd, result, 0);
 }
@@ -202,7 +209,7 @@ bool initShardVersionEmptyNS(OperationContext* opCtx, DBClientBase* conn_in) {
                             true,
                             result);
 
-        LOG(3) << "initial sharding result : " << result;
+        LOGV2_DEBUG(22741, 3, "initial sharding result : {result}", "result"_attr = result);
 
         connectionShardStatus.setSequence(conn, "", 0);
         return ok;
@@ -221,8 +228,9 @@ bool initShardVersionEmptyNS(OperationContext* opCtx, DBClientBase* conn_in) {
 
         static Occasionally sampler;
         if (sampler.tick()) {
-            warning() << "failed to initialize new replica set connection version, "
-                      << "will initialize on first use";
+            LOGV2_WARNING(22747,
+                          "failed to initialize new replica set connection version, will "
+                          "initialize on first use");
         }
 
         return false;
@@ -266,11 +274,10 @@ bool checkShardVersion(OperationContext* opCtx,
 
     auto const catalogCache = Grid::get(opCtx)->catalogCache();
 
-    if (authoritative) {
-        Grid::get(opCtx)->catalogCache()->onEpochChange(nss);
-    }
+    auto routingInfoStatus = authoritative
+        ? catalogCache->getCollectionRoutingInfoWithRefresh(opCtx, nss)
+        : catalogCache->getCollectionRoutingInfo(opCtx, nss);
 
-    auto routingInfoStatus = catalogCache->getCollectionRoutingInfo(opCtx, nss);
     if (!routingInfoStatus.isOK()) {
         return false;
     }
@@ -344,11 +351,19 @@ bool checkShardVersion(OperationContext* opCtx,
         version = manager->getVersion(shard->getId());
     }
 
-    LOG(1) << "setting shard version of " << version << " for " << ns << " on shard "
-           << shard->toString();
+    LOGV2_DEBUG(22742,
+                1,
+                "setting shard version of {version} for {ns} on shard {shard}",
+                "version"_attr = version,
+                "ns"_attr = ns,
+                "shard"_attr = shard->toString());
 
-    LOG(3) << "last version sent with chunk manager iteration " << sequenceNumber
-           << ", current chunk manager iteration is " << officialSequenceNumber;
+    LOGV2_DEBUG(22743,
+                3,
+                "last version sent with chunk manager iteration {sequenceNumber}, current chunk "
+                "manager iteration is {officialSequenceNumber}",
+                "sequenceNumber"_attr = sequenceNumber,
+                "officialSequenceNumber"_attr = officialSequenceNumber);
 
     BSONObj result;
     if (setShardVersion(opCtx,
@@ -359,7 +374,7 @@ bool checkShardVersion(OperationContext* opCtx,
                         manager.get(),
                         authoritative,
                         result)) {
-        LOG(1) << "      setShardVersion success: " << result;
+        LOGV2_DEBUG(22744, 1, "      setShardVersion success: {result}", "result"_attr = result);
         connectionShardStatus.setSequence(conn, ns, officialSequenceNumber);
         return true;
     }
@@ -368,7 +383,7 @@ bool checkShardVersion(OperationContext* opCtx,
     int errCode = result["code"].numberInt();
     uassert(errCode, result["errmsg"].String(), errCode != ErrorCodes::NoShardingEnabled);
 
-    LOG(1) << "       setShardVersion failed!\n" << result;
+    LOGV2_DEBUG(22745, 1, "       setShardVersion failed!\n{result}", "result"_attr = result);
 
     if (result["need_authoritative"].trueValue())
         massert(10428, "need_authoritative set but in authoritative mode already", !authoritative);
@@ -380,12 +395,15 @@ bool checkShardVersion(OperationContext* opCtx,
         return true;
     }
 
-    Grid::get(opCtx)->catalogCache()->onEpochChange(nss);
+    (void)catalogCache->getCollectionRoutingInfoWithRefresh(opCtx, nss);
 
     const int maxNumTries = 7;
     if (tryNumber < maxNumTries) {
-        LOG(tryNumber < (maxNumTries / 2) ? 1 : 0)
-            << "going to retry checkShardVersion shard: " << shard->toString() << " " << result;
+        LOGV2_DEBUG(20162,
+                    tryNumber < (maxNumTries / 2) ? 1 : 0,
+                    "going to retry checkShardVersion shard: {shard} {result}",
+                    "shard"_attr = shard->toString(),
+                    "result"_attr = result);
         sleepmillis(10 * tryNumber);
         // use the original connection and get a fresh versionable connection
         // since conn can be invalidated (or worse, freed) after the failure
@@ -395,7 +413,7 @@ bool checkShardVersion(OperationContext* opCtx,
 
     string errmsg = str::stream() << "setShardVersion failed shard: " << shard->toString() << " "
                                   << result;
-    log() << "     " << errmsg;
+    LOGV2(22746, "     {errmsg}", "errmsg"_attr = errmsg);
     massert(10429, errmsg, 0);
     return true;
 }

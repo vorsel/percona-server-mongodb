@@ -27,6 +27,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+
 #include <math.h>
 
 #include "mongo/platform/basic.h"
@@ -41,6 +43,7 @@
 #include "mongo/db/json.h"
 #include "mongo/db/pipeline/field_path.h"
 #include "mongo/dbtests/dbtests.h"
+#include "mongo/logv2/log.h"
 
 namespace DocumentTests {
 
@@ -77,20 +80,20 @@ void assertRoundTrips(const Document& document1) {
 
 TEST(DocumentConstruction, Default) {
     Document document;
-    ASSERT_EQUALS(0U, document.size());
+    ASSERT_EQUALS(0ULL, document.computeSize());
     assertRoundTrips(document);
 }
 
 TEST(DocumentConstruction, FromEmptyBson) {
     Document document = fromBson(BSONObj());
-    ASSERT_EQUALS(0U, document.size());
+    ASSERT_EQUALS(0ULL, document.computeSize());
     assertRoundTrips(document);
 }
 
 TEST(DocumentConstruction, FromNonEmptyBson) {
     Document document = fromBson(BSON("a" << 1 << "b"
                                           << "q"));
-    ASSERT_EQUALS(2U, document.size());
+    ASSERT_EQUALS(2ULL, document.computeSize());
     ASSERT_EQUALS("a", getNthField(document, 0).first.toString());
     ASSERT_EQUALS(1, getNthField(document, 0).second.getInt());
     ASSERT_EQUALS("b", getNthField(document, 1).first.toString());
@@ -99,7 +102,7 @@ TEST(DocumentConstruction, FromNonEmptyBson) {
 
 TEST(DocumentConstruction, FromInitializerList) {
     auto document = Document{{"a", 1}, {"b", "q"_sd}};
-    ASSERT_EQUALS(2U, document.size());
+    ASSERT_EQUALS(2ULL, document.computeSize());
     ASSERT_EQUALS("a", getNthField(document, 0).first.toString());
     ASSERT_EQUALS(1, getNthField(document, 0).second.getInt());
     ASSERT_EQUALS("b", getNthField(document, 1).first.toString());
@@ -108,7 +111,7 @@ TEST(DocumentConstruction, FromInitializerList) {
 
 TEST(DocumentConstruction, FromEmptyDocumentClone) {
     Document document;
-    ASSERT_EQUALS(0U, document.size());
+    ASSERT_EQUALS(0ULL, document.computeSize());
     // Prior to SERVER-26462, cloning an empty document would cause a segmentation fault.
     Document documentClone = document.clone();
     ASSERT_DOCUMENT_EQ(document, documentClone);
@@ -178,16 +181,16 @@ public:
     void run() {
         MutableDocument md;
         md.addField("foo", Value(1));
-        ASSERT_EQUALS(1U, md.peek().size());
+        ASSERT_EQUALS(1ULL, md.peek().computeSize());
         ASSERT_EQUALS(1, md.peek()["foo"].getInt());
         md.addField("bar", Value(99));
-        ASSERT_EQUALS(2U, md.peek().size());
+        ASSERT_EQUALS(2ULL, md.peek().computeSize());
         ASSERT_EQUALS(99, md.peek()["bar"].getInt());
         // No assertion is triggered by a duplicate field name.
         md.addField("a", Value(5));
 
         Document final = md.freeze();
-        ASSERT_EQUALS(3U, final.size());
+        ASSERT_EQUALS(3ULL, final.computeSize());
         assertRoundTrips(final);
     }
 };
@@ -223,21 +226,21 @@ public:
 
         // Set the first field.
         md.setField("a", Value("foo"_sd));
-        ASSERT_EQUALS(3U, md.peek().size());
+        ASSERT_EQUALS(3ULL, md.peek().computeSize());
         ASSERT_EQUALS("foo", md.peek()["a"].getString());
         ASSERT_EQUALS("foo", getNthField(md.peek(), 0).second.getString());
         assertRoundTrips(md.peek());
         // Set the second field.
         md["b"] = Value("bar"_sd);
-        ASSERT_EQUALS(3U, md.peek().size());
+        ASSERT_EQUALS(3ULL, md.peek().computeSize());
         ASSERT_EQUALS("bar", md.peek()["b"].getString());
         ASSERT_EQUALS("bar", getNthField(md.peek(), 1).second.getString());
         assertRoundTrips(md.peek());
 
         // Remove the second field.
         md.setField("b", Value());
-        log() << md.peek().toString();
-        ASSERT_EQUALS(2U, md.peek().size());
+        LOGV2(20585, "{md_peek}", "md_peek"_attr = md.peek().toString());
+        ASSERT_EQUALS(2ULL, md.peek().computeSize());
         ASSERT(md.peek()["b"].missing());
         ASSERT_EQUALS("a", getNthField(md.peek(), 0).first.toString());
         ASSERT_EQUALS("c", getNthField(md.peek(), 1).first.toString());
@@ -246,7 +249,7 @@ public:
 
         // Remove the first field.
         md["a"] = Value();
-        ASSERT_EQUALS(1U, md.peek().size());
+        ASSERT_EQUALS(1ULL, md.peek().computeSize());
         ASSERT(md.peek()["a"].missing());
         ASSERT_EQUALS("c", getNthField(md.peek(), 0).first.toString());
         ASSERT_EQUALS(99, md.peek()["c"].getInt());
@@ -255,7 +258,7 @@ public:
         // Remove the final field. Verify document is empty.
         md.remove("c");
         ASSERT(md.peek().empty());
-        ASSERT_EQUALS(0U, md.peek().size());
+        ASSERT_EQUALS(0ULL, md.peek().computeSize());
         ASSERT_DOCUMENT_EQ(md.peek(), Document());
         ASSERT(!FieldIterator(md.peek()).more());
         ASSERT(md.peek()["c"].missing());
@@ -1915,7 +1918,7 @@ private:
         assertComparison(expectedResult, fromBson(a), fromBson(b));
     }
     void assertComparison(int expectedResult, const Value& a, const Value& b) {
-        mongo::unittest::log() << "testing " << a.toString() << " and " << b.toString();
+        LOGV2(20586, "testing {a} and {b}", "a"_attr = a.toString(), "b"_attr = b.toString());
 
         // reflexivity
         ASSERT_EQUALS(0, cmp(a, a));

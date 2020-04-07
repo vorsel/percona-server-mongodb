@@ -28,6 +28,7 @@
  */
 
 #include "mongo/base/init.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/mutable/document.h"
 #include "mongo/bson/mutable/element.h"
 #include "mongo/db/catalog/database_holder.h"
@@ -40,6 +41,7 @@
 #include "mongo/db/json.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/ops/delete_request.h"
 #include "mongo/db/ops/parsed_delete.h"
 #include "mongo/db/ops/parsed_update.h"
@@ -328,6 +330,36 @@ private:
         Invocation(const WriteCommand* cmd, const OpMsgRequest& request)
             : InvocationBase(cmd, request), _batch(UpdateOp::parse(request)) {}
 
+        bool supportsReadMirroring() const override {
+            // This would translate to a find command with no filter!
+            // Based on the documentation for `update`, this vector should never be empty.
+            return !_batch.getUpdates().empty();
+        }
+
+        void appendMirrorableRequest(BSONObjBuilder* bob) const override {
+            auto extractQueryDetails = [](const write_ops::Update& query,
+                                          BSONObjBuilder* bob) -> void {
+                auto updates = query.getUpdates();
+                // `supportsReadMirroring()` is responsible for this validation.
+                invariant(!updates.empty());
+
+                // Current design ignores contents of `updates` array except for the first entry.
+                // Assuming identical collation for all elements in `updates`, future design could
+                // use the disjunction primitive (i.e, `$or`) to compile all queries into a single
+                // filter. Such a design also requires a sound way of combining hints.
+                bob->append("filter", updates.front().getQ());
+                if (!updates.front().getHint().isEmpty())
+                    bob->append("hint", updates.front().getHint());
+                if (updates.front().getCollation())
+                    bob->append("collation", *updates.front().getCollation());
+            };
+
+            bob->append("find", _batch.getNamespace().coll());
+            extractQueryDetails(_batch, bob);
+            bob->append("batchSize", 1);
+            bob->append("singleBatch", true);
+        }
+
     private:
         NamespaceString ns() const override {
             return _batch.getNamespace();
@@ -378,11 +410,8 @@ private:
             // info is more accurate.
             AutoGetCollection collection(opCtx, _batch.getNamespace(), MODE_IX);
 
-            auto exec = uassertStatusOK(getExecutorUpdate(opCtx,
-                                                          &CurOp::get(opCtx)->debug(),
-                                                          collection.getCollection(),
-                                                          &parsedUpdate,
-                                                          verbosity));
+            auto exec = uassertStatusOK(getExecutorUpdate(
+                &CurOp::get(opCtx)->debug(), collection.getCollection(), &parsedUpdate, verbosity));
             auto bodyBuilder = result->getBodyBuilder();
             Explain::explainStages(
                 exec.get(), collection.getCollection(), verbosity, BSONObj(), &bodyBuilder);
@@ -445,6 +474,7 @@ private:
             deleteRequest.setCollation(write_ops::collationOf(_batch.getDeletes()[0]));
             deleteRequest.setMulti(_batch.getDeletes()[0].getMulti());
             deleteRequest.setYieldPolicy(PlanExecutor::YIELD_AUTO);
+            deleteRequest.setHint(_batch.getDeletes()[0].getHint());
             deleteRequest.setExplain();
 
             ParsedDelete parsedDelete(opCtx, &deleteRequest);
@@ -455,11 +485,8 @@ private:
             AutoGetCollection collection(opCtx, _batch.getNamespace(), MODE_IX);
 
             // Explain the plan tree.
-            auto exec = uassertStatusOK(getExecutorDelete(opCtx,
-                                                          &CurOp::get(opCtx)->debug(),
-                                                          collection.getCollection(),
-                                                          &parsedDelete,
-                                                          verbosity));
+            auto exec = uassertStatusOK(getExecutorDelete(
+                &CurOp::get(opCtx)->debug(), collection.getCollection(), &parsedDelete, verbosity));
             auto bodyBuilder = result->getBodyBuilder();
             Explain::explainStages(
                 exec.get(), collection.getCollection(), verbosity, BSONObj(), &bodyBuilder);

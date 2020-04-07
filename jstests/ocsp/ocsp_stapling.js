@@ -14,7 +14,7 @@ if (!supportsStapling()) {
     return;
 }
 
-let mock_ocsp = new MockOCSPServer();
+let mock_ocsp = new MockOCSPServer("", 1000);
 mock_ocsp.start();
 
 const ocsp_options = {
@@ -39,7 +39,7 @@ assert.doesNotThrow(() => {
 });
 mock_ocsp.stop();
 
-mock_ocsp = new MockOCSPServer(FAULT_REVOKED);
+mock_ocsp = new MockOCSPServer(FAULT_REVOKED, 1000);
 mock_ocsp.start();
 assert.doesNotThrow(() => {
     new Mongo(conn.host);
@@ -63,13 +63,18 @@ assert.throws(() => {
 });
 mock_ocsp.stop();
 
-mock_ocsp = new MockOCSPServer();
+mock_ocsp = new MockOCSPServer("", 1000);
 mock_ocsp.start();
 
 assert.throws(() => {
     new Mongo(conn.host);
 });
 
-mock_ocsp.stop();
 MongoRunner.stopMongod(conn);
+
+// The mongoRunner spawns a new Mongo Object to validate the collections which races
+// with the shutdown logic of the mock_ocsp responder on some platforms. We need this
+// sleep to make sure that the threads don't interfere with each other.
+sleep(1000);
+mock_ocsp.stop();
 }());

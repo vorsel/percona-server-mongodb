@@ -46,6 +46,7 @@
 #include "mongo/base/string_data.h"
 #include "mongo/logger/log_domain.h"
 #include "mongo/logger/logger.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/compiler.h"
 #include "mongo/stdx/exception.h"
 #include "mongo/stdx/thread.h"
@@ -55,7 +56,6 @@
 #include "mongo/util/debugger.h"
 #include "mongo/util/exception_filter_win32.h"
 #include "mongo/util/exit_code.h"
-#include "mongo/util/log.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/signal_handlers.h"
 #include "mongo/util/stacktrace.h"
@@ -183,8 +183,8 @@ void writeMallocFreeStreamToLog() {
 // must hold MallocFreeOStreamGuard to call
 void printSignalAndBacktrace(int signalNum) {
     mallocFreeOStream << "Got signal: " << signalNum << " (" << strsignal(signalNum) << ").\n";
-    printStackTrace(mallocFreeOStream);
     writeMallocFreeStreamToLog();
+    printStackTrace();
 }
 
 // this will be called in certain c++ error cases, for example if there are two active
@@ -231,9 +231,8 @@ void myTerminate() {
     } else {
         mallocFreeOStream << "terminate() called. No exception is active";
     }
-
-    printStackTrace(mallocFreeOStream);
     writeMallocFreeStreamToLog();
+    printStackTrace();
     breakpoint();
     endProcessWithSignal(SIGABRT);
 }
@@ -252,17 +251,23 @@ void myInvalidParameterHandler(const wchar_t* expression,
                                const wchar_t* file,
                                unsigned int line,
                                uintptr_t pReserved) {
-    severe() << "Invalid parameter detected in function " << toUtf8String(function)
-             << " File: " << toUtf8String(file) << " Line: " << line;
-    severe() << "Expression: " << toUtf8String(expression);
-    severe() << "immediate exit due to invalid parameter";
+    LOGV2_FATAL(23815,
+                "Invalid parameter detected in function {toUtf8String_function} File: "
+                "{toUtf8String_file} Line: {line}",
+                "toUtf8String_function"_attr = toUtf8String(function),
+                "toUtf8String_file"_attr = toUtf8String(file),
+                "line"_attr = line);
+    LOGV2_FATAL(23816,
+                "Expression: {toUtf8String_expression}",
+                "toUtf8String_expression"_attr = toUtf8String(expression));
+    LOGV2_FATAL(23817, "immediate exit due to invalid parameter");
 
     abruptQuit(SIGABRT);
 }
 
 void myPureCallHandler() {
-    severe() << "Pure call handler invoked";
-    severe() << "immediate exit due to invalid pure call";
+    LOGV2_FATAL(23818, "Pure call handler invoked");
+    LOGV2_FATAL(23819, "immediate exit due to invalid pure call");
     abruptQuit(SIGABRT);
 }
 
@@ -331,10 +336,15 @@ void setupSynchronousSignalHandlers() {
         }
         if (sigaction(spec.signal, &sa, nullptr) != 0) {
             int savedErr = errno;
-            severe() << format(
-                FMT_STRING("Failed to install signal handler for signal {} with sigaction: {}"),
-                spec.signal,
-                strerror(savedErr));
+            LOGV2_FATAL(
+                23820,
+                "{format_FMT_STRING_Failed_to_install_signal_handler_for_signal_with_sigaction_"
+                "spec_signal_strerror_savedErr}",
+                "format_FMT_STRING_Failed_to_install_signal_handler_for_signal_with_sigaction_spec_signal_strerror_savedErr"_attr =
+                    format(FMT_STRING(
+                               "Failed to install signal handler for signal {} with sigaction: {}"),
+                           spec.signal,
+                           strerror(savedErr)));
             fassertFailed(31334);
         }
     }
@@ -347,8 +357,9 @@ void setupSynchronousSignalHandlers() {
 
 void reportOutOfMemoryErrorAndExit() {
     MallocFreeOStreamGuard lk{};
-    printStackTrace(mallocFreeOStream << "out of memory.\n");
+    mallocFreeOStream << "out of memory.\n";
     writeMallocFreeStreamToLog();
+    printStackTrace();
     quickExit(EXIT_ABRUPT);
 }
 
@@ -361,12 +372,10 @@ void clearSignalMask() {
 #endif
 }
 
-#ifdef __linux__
-
+#if defined(MONGO_STACKTRACE_HAS_SIGNAL)
 int stackTraceSignal() {
     return SIGUSR2;
 }
-
 #endif
 
 }  // namespace mongo

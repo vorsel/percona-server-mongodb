@@ -28,6 +28,7 @@
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -82,6 +83,7 @@
 #include "mongo/db/stats/top.h"
 #include "mongo/db/transaction_participant.h"
 #include "mongo/db/transaction_validation.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/factory.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/message.h"
@@ -92,8 +94,9 @@
 #include "mongo/rpc/metadata/tracking_metadata.h"
 #include "mongo/rpc/op_msg.h"
 #include "mongo/rpc/reply_builder_interface.h"
+#include "mongo/transport/ismaster_metrics.h"
+#include "mongo/transport/session.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -127,14 +130,26 @@ void generateLegacyQueryErrorResponse(const AssertionException& exception,
                                       Message* response) {
     curop->debug().errInfo = exception.toStatus();
 
-    log(LogComponent::kQuery) << "assertion " << exception.toString() << " ns:" << queryMessage.ns
-                              << " query:"
-                              << (queryMessage.query.valid(BSONVersion::kLatest)
-                                      ? redact(queryMessage.query)
-                                      : "query object is corrupt");
+    if (queryMessage.query.valid(BSONVersion::kLatest))
+        LOGV2_OPTIONS(51777,
+                      {logv2::LogComponent::kQuery},
+                      "assertion {exception} ns: {ns} query: {query}",
+                      "exception"_attr = exception,
+                      "ns"_attr = queryMessage.ns,
+                      "query"_attr = redact(queryMessage.query));
+    else
+        LOGV2_OPTIONS(51778,
+                      {logv2::LogComponent::kQuery},
+                      "assertion {exception} ns: {ns} query object is corrupt",
+                      "exception"_attr = exception,
+                      "ns"_attr = queryMessage.ns);
+
     if (queryMessage.ntoskip || queryMessage.ntoreturn) {
-        log(LogComponent::kQuery) << " ntoskip:" << queryMessage.ntoskip
-                                  << " ntoreturn:" << queryMessage.ntoreturn;
+        LOGV2_OPTIONS(21952,
+                      {logComponentV1toV2(LogComponent::kQuery)},
+                      " ntoskip:{queryMessage_ntoskip} ntoreturn:{queryMessage_ntoreturn}",
+                      "queryMessage_ntoskip"_attr = queryMessage.ntoskip,
+                      "queryMessage_ntoreturn"_attr = queryMessage.ntoreturn);
     }
 
     BSONObjBuilder err;
@@ -149,8 +164,11 @@ void generateLegacyQueryErrorResponse(const AssertionException& exception,
 
     const bool isStaleConfig = exception.code() == ErrorCodes::StaleConfig;
     if (isStaleConfig) {
-        log(LogComponent::kQuery) << "stale version detected during query over " << queryMessage.ns
-                                  << " : " << errObj;
+        LOGV2_OPTIONS(21953,
+                      {logComponentV1toV2(LogComponent::kQuery)},
+                      "stale version detected during query over {queryMessage_ns} : {errObj}",
+                      "queryMessage_ns"_attr = queryMessage.ns,
+                      "errObj"_attr = errObj);
     }
 
     BufBuilder bb;
@@ -240,6 +258,8 @@ StatusWith<repl::ReadConcernArgs> _extractReadConcern(OperationContext* opCtx,
         return readConcernParseStatus;
     }
 
+    bool clientSuppliedReadConcern = readConcernArgs.isSpecified();
+    bool customDefaultWasApplied = false;
     auto readConcernSupport = invocation->supportsReadConcern(readConcernArgs.getLevel());
     if (readConcernSupport.defaultReadConcernPermit.isOK() &&
         (startTransaction || !opCtx->inMultiDocumentTransaction()) &&
@@ -254,7 +274,8 @@ StatusWith<repl::ReadConcernArgs> _extractReadConcern(OperationContext* opCtx,
             // shard/config server.
             if (!readConcernArgs.isSpecified()) {
                 // TODO: Disabled until after SERVER-44539, to avoid log spam.
-                // log() << "Missing readConcern on " << invocation->definition()->getName();
+                // LOGV2(21954, "Missing readConcern on {invocation_definition_getName}",
+                // "invocation_definition_getName"_attr = invocation->definition()->getName());
             }
         } else {
             // A member in a regular replica set.  Since these servers receive client queries, in
@@ -265,14 +286,33 @@ StatusWith<repl::ReadConcernArgs> _extractReadConcern(OperationContext* opCtx,
                 const auto rcDefault = ReadWriteConcernDefaults::get(opCtx->getServiceContext())
                                            .getDefaultReadConcern(opCtx);
                 if (rcDefault) {
+                    customDefaultWasApplied = true;
                     readConcernArgs = std::move(*rcDefault);
-                    LOG(2) << "Applying default readConcern on "
-                           << invocation->definition()->getName() << " of " << *rcDefault;
+                    LOGV2_DEBUG(21955,
+                                2,
+                                "Applying default readConcern on {invocation_definition_getName} "
+                                "of {rcDefault}",
+                                "invocation_definition_getName"_attr =
+                                    invocation->definition()->getName(),
+                                "rcDefault"_attr = *rcDefault);
                     // Update the readConcernSupport, since the default RC was applied.
                     readConcernSupport =
                         invocation->supportsReadConcern(readConcernArgs.getLevel());
                 }
             }
+        }
+    }
+
+    // It's fine for clients to provide any provenance value to mongod. But if they haven't, then an
+    // appropriate provenance needs to be determined.
+    auto& provenance = readConcernArgs.getProvenance();
+    if (!provenance.hasSource()) {
+        if (clientSuppliedReadConcern) {
+            provenance.setSource(ReadWriteConcernProvenance::Source::clientSupplied);
+        } else if (customDefaultWasApplied) {
+            provenance.setSource(ReadWriteConcernProvenance::Source::customDefault);
+        } else {
+            provenance.setSource(ReadWriteConcernProvenance::Source::implicitDefault);
         }
     }
 
@@ -352,11 +392,6 @@ LogicalTime computeOperationTime(OperationContext* opCtx, LogicalTime startOpera
         replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
     invariant(isReplSet);
 
-    if (startOperationTime == LogicalTime::kUninitialized) {
-        LOG(5) << "startOperationTime is uninitialized";
-        return LogicalTime(replCoord->getMyLastAppliedOpTime().getTimestamp());
-    }
-
     auto operationTime = getClientOperationTime(opCtx);
     invariant(operationTime >= startOperationTime);
 
@@ -402,8 +437,11 @@ void appendClusterAndOperationTime(OperationContext* opCtx,
         dassert(signedTime.getTime() >= operationTime);
         rpc::LogicalTimeMetadata(signedTime).writeToMetadata(metadataBob);
 
-        LOG(5) << "Appending operationTime to cmd response for authorized client: "
-               << operationTime;
+        LOGV2_DEBUG(
+            21957,
+            5,
+            "Appending operationTime to cmd response for authorized client: {operationTime}",
+            "operationTime"_attr = operationTime);
         operationTime.appendAsOperationTime(commandBodyFieldsBob);
 
         return;
@@ -427,7 +465,10 @@ void appendClusterAndOperationTime(OperationContext* opCtx,
     dassert(signedTime.getTime() >= operationTime);
     rpc::LogicalTimeMetadata(signedTime).writeToMetadata(metadataBob);
 
-    LOG(5) << "Appending operationTime to cmd response: " << operationTime;
+    LOGV2_DEBUG(21958,
+                5,
+                "Appending operationTime to cmd response: {operationTime}",
+                "operationTime"_attr = operationTime);
     operationTime.appendAsOperationTime(commandBodyFieldsBob);
 }
 
@@ -442,20 +483,18 @@ void appendErrorLabelsAndTopologyVersion(OperationContext* opCtx,
         getErrorLabels(opCtx, sessionOptions, commandName, code, wcCode, isInternalClient);
     commandBodyFieldsBob->appendElements(errorLabels);
 
-    auto isStateChangeError = false;
+    auto isNotMasterError = false;
     if (code) {
-        isStateChangeError = ErrorCodes::isA<ErrorCategory::NotMasterError>(*code) ||
-            ErrorCodes::isA<ErrorCategory::ShutdownError>(*code);
+        isNotMasterError = ErrorCodes::isA<ErrorCategory::NotMasterError>(*code);
     }
 
-    if (!isStateChangeError && wcCode) {
-        isStateChangeError = ErrorCodes::isA<ErrorCategory::NotMasterError>(*wcCode) ||
-            ErrorCodes::isA<ErrorCategory::ShutdownError>(*wcCode);
+    if (!isNotMasterError && wcCode) {
+        isNotMasterError = ErrorCodes::isA<ErrorCategory::NotMasterError>(*wcCode);
     }
 
     const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
     if (replCoord->getReplicationMode() != repl::ReplicationCoordinator::modeReplSet ||
-        !isStateChangeError) {
+        !isNotMasterError) {
         return;
     }
     const auto topologyVersion = replCoord->getTopologyVersion();
@@ -474,15 +513,21 @@ void _abortUnpreparedOrStashPreparedTransaction(
             txnParticipant->abortTransaction(opCtx);
     } catch (...) {
         // It is illegal for this to throw so we catch and log this here for diagnosability.
-        severe() << "Caught exception during transaction " << opCtx->getTxnNumber()
-                 << (isPrepared ? " stash " : " abort ") << opCtx->getLogicalSessionId()->toBSON()
-                 << ": " << exceptionToStatus();
+        LOGV2_FATAL(21974,
+                    "Caught exception during transaction "
+                    "{opCtx_getTxnNumber}{isPrepared_stash_abort}{opCtx_getLogicalSessionId}: "
+                    "{exceptionToStatus}",
+                    "opCtx_getTxnNumber"_attr = opCtx->getTxnNumber(),
+                    "isPrepared_stash_abort"_attr = (isPrepared ? " stash " : " abort "),
+                    "opCtx_getLogicalSessionId"_attr = opCtx->getLogicalSessionId()->toBSON(),
+                    "exceptionToStatus"_attr = exceptionToStatus());
         std::terminate();
     }
 }
 }  // namespace
 
 void invokeWithSessionCheckedOut(OperationContext* opCtx,
+                                 const OpMsgRequest& request,
                                  CommandInvocation* invocation,
                                  const OperationSessionInfoFromClient& sessionOptions,
                                  rpc::ReplyBuilderInterface* replyBuilder) {
@@ -558,7 +603,7 @@ void invokeWithSessionCheckedOut(OperationContext* opCtx,
     });
 
     try {
-        invocation->run(opCtx, replyBuilder);
+        CommandHelpers::runCommandInvocation(opCtx, request, invocation, replyBuilder);
     } catch (const ExceptionFor<ErrorCodes::CommandOnShardedViewNotSupportedOnMongod>&) {
         // Exceptions are used to resolve views in a sharded cluster, so they should be handled
         // specially to avoid unnecessary aborts.
@@ -659,7 +704,8 @@ bool runCommandImpl(OperationContext* opCtx,
                  serverGlobalParams.clusterRole == ClusterRole::ConfigServer) &&
                 !request.body.hasField(WriteConcernOptions::kWriteConcernField)) {
                 // TODO: Disabled until after SERVER-44539, to avoid log spam.
-                // log() << "Missing writeConcern on " << command->getName();
+                // LOGV2(21959, "Missing writeConcern on {command_getName}", "command_getName"_attr
+                // = command->getName());
             }
             extractedWriteConcern.emplace(
                 uassertStatusOK(extractWriteConcern(opCtx, request.body)));
@@ -667,6 +713,12 @@ bool runCommandImpl(OperationContext* opCtx,
                 validateWriteConcernForTransaction(*extractedWriteConcern,
                                                    invocation->definition()->getName());
             }
+
+            // Ensure that the WC being set on the opCtx has provenance.
+            invariant(extractedWriteConcern->getProvenance().hasSource(),
+                      str::stream() << "unexpected unset provenance on writeConcern: "
+                                    << extractedWriteConcern->toBSON());
+
             opCtx->setWriteConcern(*extractedWriteConcern);
         }
 
@@ -697,21 +749,23 @@ bool runCommandImpl(OperationContext* opCtx,
         };
 
         try {
-            if (MONGO_unlikely(failWithErrorCodeInRunCommand.shouldFail())) {
-                auto scoped = failWithErrorCodeInRunCommand.scoped();
+            if (auto scoped = failWithErrorCodeInRunCommand.scoped();
+                MONGO_unlikely(scoped.isActive())) {
                 const auto errorCode = scoped.getData()["errorCode"].numberInt();
-                log() << "failWithErrorCodeInRunCommand enabled - failing command with error "
-                         "code: "
-                      << errorCode;
+                LOGV2(21960,
+                      "failWithErrorCodeInRunCommand enabled - failing command with error "
+                      "code: {errorCode}",
+                      "errorCode"_attr = errorCode);
                 BSONObjBuilder errorBuilder;
                 errorBuilder.append("ok", 0.0);
                 errorBuilder.append("code", errorCode);
                 errorBuilder.append("errmsg", "failWithErrorCodeInRunCommand enabled.");
                 replyBuilder->setCommandReply(errorBuilder.obj());
             } else if (shouldCheckOutSession) {
-                invokeWithSessionCheckedOut(opCtx, invocation, sessionOptions, replyBuilder);
+                invokeWithSessionCheckedOut(
+                    opCtx, request, invocation, sessionOptions, replyBuilder);
             } else {
-                invocation->run(opCtx, replyBuilder);
+                CommandHelpers::runCommandInvocation(opCtx, request, invocation, replyBuilder);
             }
         } catch (const DBException& ex) {
             // Do no-op write before returning NoSuchTransaction if command has writeConcern.
@@ -735,9 +789,9 @@ bool runCommandImpl(OperationContext* opCtx,
     } else {
         behaviors.uassertCommandDoesNotSpecifyWriteConcern(request.body);
         if (shouldCheckOutSession) {
-            invokeWithSessionCheckedOut(opCtx, invocation, sessionOptions, replyBuilder);
+            invokeWithSessionCheckedOut(opCtx, request, invocation, sessionOptions, replyBuilder);
         } else {
-            invocation->run(opCtx, replyBuilder);
+            CommandHelpers::runCommandInvocation(opCtx, request, invocation, replyBuilder);
         }
     }
 
@@ -811,7 +865,8 @@ void execCommandDatabase(OperationContext* opCtx,
     BSONObjBuilder extraFieldsBuilder;
     auto startOperationTime = getClientOperationTime(opCtx);
 
-    auto invocation = command->parse(opCtx, request);
+    std::shared_ptr<CommandInvocation> invocation = command->parse(opCtx, request);
+    CommandInvocation::set(opCtx, invocation);
 
     OperationSessionInfoFromClient sessionOptions;
 
@@ -942,7 +997,10 @@ void execCommandDatabase(OperationContext* opCtx,
         }
 
         if (command->adminOnly()) {
-            LOG(2) << "command: " << request.getCommandName();
+            LOGV2_DEBUG(21961,
+                        2,
+                        "command: {request_getCommandName}",
+                        "request_getCommandName"_attr = request.getCommandName());
         }
 
         if (command->maintenanceMode()) {
@@ -979,6 +1037,12 @@ void execCommandDatabase(OperationContext* opCtx,
         if (!skipReadConcern) {
             auto newReadConcernArgs = uassertStatusOK(
                 _extractReadConcern(opCtx, invocation.get(), request.body, startTransaction));
+
+            // Ensure that the RC being set on the opCtx has provenance.
+            invariant(newReadConcernArgs.getProvenance().hasSource(),
+                      str::stream() << "unexpected unset provenance on readConcern: "
+                                    << newReadConcernArgs.toBSONInner());
+
             {
                 // We must obtain the client lock to set the ReadConcernArgs on the operation
                 // context as it may be concurrently read by CurrentOp.
@@ -1036,10 +1100,13 @@ void execCommandDatabase(OperationContext* opCtx,
 
         command->incrementCommandsExecuted();
 
-        if (shouldLog(logger::LogComponent::kTracking, logger::LogSeverity::Debug(1)) &&
+        if (shouldLog(logv2::LogComponent::kTracking, logv2::LogSeverity::Debug(1)) &&
             rpc::TrackingMetadata::get(opCtx).getParentOperId()) {
-            MONGO_LOG_COMPONENT(1, logger::LogComponent::kTracking)
-                << rpc::TrackingMetadata::get(opCtx).toString();
+            LOGV2_DEBUG_OPTIONS(4615605,
+                                1,
+                                {logv2::LogComponent::kTracking},
+                                "{trackingMetadata}",
+                                "trackingMetadata"_attr = rpc::TrackingMetadata::get(opCtx));
             rpc::TrackingMetadata::get(opCtx).setIsLogged(true);
         }
 
@@ -1115,11 +1182,17 @@ void execCommandDatabase(OperationContext* opCtx,
         }
         appendClusterAndOperationTime(opCtx, &extraFieldsBuilder, &metadataBob, startOperationTime);
 
-        LOG(1) << "assertion while executing command '" << request.getCommandName() << "' "
-               << "on database '" << request.getDatabase() << "' "
-               << "with arguments '"
-               << redact(ServiceEntryPointCommon::getRedactedCopyForLogging(command, request.body))
-               << "': " << redact(e.toString());
+        LOGV2_DEBUG(
+            21962,
+            1,
+            "assertion while executing command '{request_getCommandName}' on database "
+            "'{request_getDatabase}' with arguments "
+            "'{ServiceEntryPointCommon_getRedactedCopyForLogging_command_request_body}': {e}",
+            "request_getCommandName"_attr = request.getCommandName(),
+            "request_getDatabase"_attr = request.getDatabase(),
+            "ServiceEntryPointCommon_getRedactedCopyForLogging_command_request_body"_attr =
+                redact(ServiceEntryPointCommon::getRedactedCopyForLogging(command, request.body)),
+            "e"_attr = redact(e.toString()));
 
         generateErrorResponse(opCtx, replyBuilder, e, metadataBob.obj(), extraFieldsBuilder.obj());
     }
@@ -1165,7 +1238,8 @@ DbResponse receivedCommands(OperationContext* opCtx,
             // Otherwise, reply with the parse error. This is useful for cases where parsing fails
             // due to user-supplied input, such as the document too deep error. Since we failed
             // during parsing, we can't log anything about the command.
-            LOG(1) << "assertion while parsing command: " << ex.toString();
+            LOGV2_DEBUG(
+                21963, 1, "assertion while parsing command: {ex}", "ex"_attr = ex.toString());
 
             generateErrorResponse(
                 opCtx, replyBuilder.get(), ex, metadataBob.obj(), extraFieldsBuilder.obj());
@@ -1185,12 +1259,18 @@ DbResponse receivedCommands(OperationContext* opCtx,
                 globalCommandRegistry()->incrementUnknownCommands();
                 std::string msg = str::stream()
                     << "no such command: '" << request.getCommandName() << "'";
-                LOG(2) << msg;
+                LOGV2_DEBUG(21964, 2, "{msg}", "msg"_attr = msg);
                 uasserted(ErrorCodes::CommandNotFound, str::stream() << msg);
             }
 
-            LOG(2) << "run command " << request.getDatabase() << ".$cmd" << ' '
-                   << redact(ServiceEntryPointCommon::getRedactedCopyForLogging(c, request.body));
+            LOGV2_DEBUG(
+                21965,
+                2,
+                "run command {request_getDatabase}.$cmd "
+                "{ServiceEntryPointCommon_getRedactedCopyForLogging_c_request_body}",
+                "request_getDatabase"_attr = request.getDatabase(),
+                "ServiceEntryPointCommon_getRedactedCopyForLogging_c_request_body"_attr =
+                    redact(ServiceEntryPointCommon::getRedactedCopyForLogging(c, request.body)));
 
             {
                 // Try to set this as early as possible, as soon as we have figured out the command.
@@ -1199,6 +1279,13 @@ DbResponse receivedCommands(OperationContext* opCtx,
             }
 
             opCtx->setExhaust(OpMsg::isFlagSet(message, OpMsg::kExhaustSupported));
+
+            const auto session = opCtx->getClient()->session();
+            if (session) {
+                if (!opCtx->isExhaust() || c->getName() != "isMaster"_sd) {
+                    InExhaustIsMaster::get(session.get())->setInExhaustIsMaster(false);
+                }
+            }
 
             execCommandDatabase(opCtx, c, request, replyBuilder.get(), behaviors);
         } catch (const DBException& ex) {
@@ -1209,8 +1296,13 @@ DbResponse receivedCommands(OperationContext* opCtx,
             appendClusterAndOperationTime(
                 opCtx, &extraFieldsBuilder, &metadataBob, LogicalTime::kUninitialized);
 
-            LOG(1) << "assertion while executing command '" << request.getCommandName() << "' "
-                   << "on database '" << request.getDatabase() << "': " << ex.toString();
+            LOGV2_DEBUG(21966,
+                        1,
+                        "assertion while executing command '{request_getCommandName}' on database "
+                        "'{request_getDatabase}': {ex}",
+                        "request_getCommandName"_attr = request.getCommandName(),
+                        "request_getDatabase"_attr = request.getDatabase(),
+                        "ex"_attr = ex.toString());
 
             generateErrorResponse(
                 opCtx, replyBuilder.get(), ex, metadataBob.obj(), extraFieldsBuilder.obj());
@@ -1286,7 +1378,10 @@ void receivedKillCursors(OperationContext* opCtx, const Message& m) {
     int n = dbmessage.pullInt();
 
     if (n > 2000) {
-        (n < 30000 ? warning() : error()) << "receivedKillCursors, n=" << n;
+        if (n < 30000)
+            LOGV2_WARNING(4615606, "receivedKillCursors, n={n}", "n"_attr = n);
+        else
+            LOGV2_ERROR(4615607, "receivedKillCursors, n={n}", "n"_attr = n);
         uassert(51250, "must kill fewer than 30000 cursors", n < 30000);
     }
 
@@ -1298,8 +1393,12 @@ void receivedKillCursors(OperationContext* opCtx, const Message& m) {
     const char* cursorArray = dbmessage.getArray(n);
     int found = runOpKillCursors(opCtx, static_cast<size_t>(n), cursorArray);
 
-    if (shouldLog(logger::LogSeverity::Debug(1)) || found != n) {
-        LOG(found == n ? 1 : 0) << "killcursors: found " << found << " of " << n;
+    if (shouldLog(logv2::LogSeverity::Debug(1)) || found != n) {
+        LOGV2_DEBUG(21967,
+                    logSeverityV1toV2(found == n ? 1 : 0).toInt(),
+                    "killcursors: found {found} of {n}",
+                    "found"_attr = found,
+                    "n"_attr = n);
     }
 }
 
@@ -1514,7 +1613,9 @@ DbResponse ServiceEntryPointCommon::handleRequest(OperationContext* opCtx,
                 slowMsOverride = 10;
                 receivedKillCursors(opCtx, m);
             } else if (op != dbInsert && op != dbUpdate && op != dbDelete) {
-                log() << "    operation isn't supported: " << static_cast<int>(op);
+                LOGV2(21968,
+                      "    operation isn't supported: {static_cast_int_op}",
+                      "static_cast_int_op"_attr = static_cast<int>(op));
                 currentOp.done();
                 forceLog = true;
             } else {
@@ -1540,8 +1641,11 @@ DbResponse ServiceEntryPointCommon::handleRequest(OperationContext* opCtx,
             }
         } catch (const AssertionException& ue) {
             LastError::get(c).setLastError(ue.code(), ue.reason());
-            LOG(3) << " Caught Assertion in " << networkOpToString(op) << ", continuing "
-                   << redact(ue);
+            LOGV2_DEBUG(21969,
+                        3,
+                        " Caught Assertion in {networkOpToString_op}, continuing {ue}",
+                        "networkOpToString_op"_attr = networkOpToString(op),
+                        "ue"_attr = redact(ue));
             debug.errInfo = ue.toStatus();
         }
         // A NotMaster error can be set either within receivedInsert/receivedUpdate/receivedDelete
@@ -1560,7 +1664,7 @@ DbResponse ServiceEntryPointCommon::handleRequest(OperationContext* opCtx,
     // Mark the op as complete, and log it if appropriate. Returns a boolean indicating whether
     // this op should be sampled for profiling.
     const bool shouldSample = currentOp.completeAndLogOperation(
-        opCtx, MONGO_LOG_DEFAULT_COMPONENT, dbresponse.response.size(), slowMsOverride, forceLog);
+        opCtx, MONGO_LOGV2_DEFAULT_COMPONENT, dbresponse.response.size(), slowMsOverride, forceLog);
 
     Top::get(opCtx->getServiceContext())
         .incrementGlobalLatencyStats(
@@ -1571,15 +1675,15 @@ DbResponse ServiceEntryPointCommon::handleRequest(OperationContext* opCtx,
     if (currentOp.shouldDBProfile(shouldSample)) {
         // Performance profiling is on
         if (opCtx->lockState()->isReadLocked()) {
-            LOG(1) << "note: not profiling because recursive read lock";
+            LOGV2_DEBUG(21970, 1, "note: not profiling because recursive read lock");
         } else if (c.isInDirectClient()) {
-            LOG(1) << "note: not profiling because we are in DBDirectClient";
+            LOGV2_DEBUG(21971, 1, "note: not profiling because we are in DBDirectClient");
         } else if (behaviors.lockedForWriting()) {
             // TODO SERVER-26825: Fix race condition where fsyncLock is acquired post
             // lockedForWriting() call but prior to profile collection lock acquisition.
-            LOG(1) << "note: not profiling because doing fsync+lock";
+            LOGV2_DEBUG(21972, 1, "note: not profiling because doing fsync+lock");
         } else if (storageGlobalParams.readOnly) {
-            LOG(1) << "note: not profiling because server is read-only";
+            LOGV2_DEBUG(21973, 1, "note: not profiling because server is read-only");
         } else {
             invariant(!opCtx->lockState()->inAWriteUnitOfWork());
             profile(opCtx, op);

@@ -34,8 +34,8 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 
 #include <iostream>
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
-#include "mongo/util/log.h"
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+#include "mongo/logv2/log.h"
 
 #include "audit_file.h"
 
@@ -46,8 +46,9 @@ namespace audit {
 int AuditFile::fsyncReturningError() const {
     if (::fsync(_fd)) {
         int _errno = errno;
-        log() << "In File::fsync(), ::fsync for '" << _name
-              << "' failed with " << errnoWithDescription() << std::endl;
+        LOGV2(29023, "In File::fsync(), ::fsync for '{name}' failed with {err_desc}",
+                "name"_attr = _name,
+                "err_desc"_attr = errnoWithDescription());
         return _errno;
     }
     return 0;
@@ -58,10 +59,12 @@ int AuditFile::writeReturningError(fileofs o, const char *data, unsigned len) {
     if (bytesWritten != static_cast<ssize_t>(len)) {
         _bad = true;
         int _errno = errno;
-        log() << "In File::write(), ::pwrite for '" << _name
-              << "' tried to write " << len
-              << " bytes but only wrote " << bytesWritten
-              << " bytes, failing with " << errnoWithDescription() << std::endl;
+        LOGV2(29024, "In File::write(), ::pwrite for '{name}' tried to write {len} bytes "
+                "but only wrote {written} bytes, failing with {err_desc}",
+                "name"_attr = _name,
+                "len"_attr = len,
+                "written"_attr = bytesWritten,
+                "err_desc"_attr = errnoWithDescription());
         return _errno;
     }
     return 0;

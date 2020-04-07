@@ -41,7 +41,6 @@
 #include "mongo/logv2/log_severity.h"
 #include "mongo/logv2/log_tag.h"
 #include "mongo/logv2/name_extractor.h"
-#include "mongo/logv2/named_arg_formatter.h"
 #include "mongo/util/time_support.h"
 
 #include <fmt/format.h>
@@ -98,6 +97,11 @@ struct BSONValueExtractor {
         _builder.append(name, static_cast<long long>(val));
     }
 
+    template <typename Period>
+    void operator()(StringData name, const Duration<Period>& value) {
+        _builder.append(name.toString() + value.mongoUnitSuffix(), value.count());
+    }
+
     template <typename T>
     void operator()(StringData name, const T& value) {
         _builder.append(name, value);
@@ -122,21 +126,11 @@ void BSONFormatter::operator()(boost::log::record_view const& rec,
                    extract<LogSeverity>(attributes::severity(), rec).get().toStringDataCompact());
     builder.append(constants::kComponentFieldName,
                    extract<LogComponent>(attributes::component(), rec).get().getNameForLog());
+    builder.append(constants::kIdFieldName, extract<int32_t>(attributes::id(), rec).get());
     builder.append(constants::kContextFieldName,
                    extract<StringData>(attributes::threadName(), rec).get());
-    builder.append(constants::kIdFieldName, extract<int32_t>(attributes::id(), rec).get());
-
-    detail::NameExtractor nameExtractor;
-    attrs.apply(nameExtractor);
-
-    // Insert the attribute names back into the message string using a special formatter
-    fmt::memory_buffer buffer;
-    fmt::vformat_to<detail::NamedArgFormatter, char>(
-        buffer,
-        extract<StringData>(attributes::message(), rec).get().toString(),
-        fmt::basic_format_args<fmt::format_context>(nameExtractor.nameArgs.data(),
-                                                    nameExtractor.nameArgs.size()));
-    builder.append(constants::kMessageFieldName, fmt::to_string(buffer));
+    builder.append(constants::kMessageFieldName,
+                   extract<StringData>(attributes::message(), rec).get());
 
     if (!attrs.empty()) {
         BSONValueExtractor extractor(builder);

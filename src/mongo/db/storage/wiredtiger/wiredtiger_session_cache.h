@@ -220,6 +220,27 @@ public:
     };
 
     /**
+     * Specifies what data will get flushed to disk in a WiredTigerSessionCache::waitUntilDurable()
+     * call.
+     */
+    enum class Fsync {
+        // Flushes only the journal (oplog) to disk.
+        // If journaling is disabled, checkpoints all of the data.
+        kJournal,
+        // Checkpoints data up to the stable timestamp.
+        // If journaling is disabled, checkpoints all of the data.
+        kCheckpointStableTimestamp,
+        // Checkpoints all of the data.
+        kCheckpointAll,
+    };
+
+    /**
+     * Controls whether or not WiredTigerSessionCache::waitUntilDurable() updates the
+     * JournalListener.
+     */
+    enum class UseJournalListener { kUpdate, kSkip };
+
+    /**
      * Indicates that WiredTiger should be configured to cache cursors.
      */
     static bool isEngineCachingCursors();
@@ -273,11 +294,27 @@ public:
     bool isEphemeral();
 
     /**
-     * Waits until all commits that happened before this call are durable, either by flushing
-     * the log or forcing a checkpoint if forceCheckpoint is true or the journal is disabled.
+     * Waits until all commits that happened before this call are made durable.
+     *
+     * Specifying Fsync::kJournal will flush only the (oplog) journal to disk. Callers are
+     * serialized by a mutex and will return early if it is discovered that another thread started
+     * and completed a flush while they slept.
+     *
+     * Specifying Fsync::kCheckpointStableTimestamp will take a checkpoint up to and including the
+     * stable timestamp.
+     *
+     * Specifying Fsync::kCheckpointAll, or if journaling is disabled with kJournal or
+     * kCheckpointStableTimestamp, causes a checkpoint to be taken of all of the data.
+     *
+     * Taking a checkpoint has the benefit of persisting unjournaled writes.
+     *
+     * 'useListener' controls whether or not the JournalListener is updated with the last durable
+     * value of the timestamp that it tracks. The JournalListener's token is fetched before writing
+     * out to disk and set afterwards to update the repl layer durable timestamp.
+     *
      * Uses a temporary session. Safe to call without any locks, even during shutdown.
      */
-    void waitUntilDurable(OperationContext* opCtx, bool forceCheckpoint, bool stableCheckpoint);
+    void waitUntilDurable(OperationContext* opCtx, Fsync syncType, UseJournalListener useListener);
 
     /**
      * Waits until a prepared unit of work has ended (either been commited or aborted). This
@@ -356,10 +393,16 @@ private:
     stdx::condition_variable _prepareCommittedOrAbortedCond;
     AtomicWord<std::uint64_t> _prepareCommitOrAbortCounter{0};
 
-    // Protects _journalListener.
+    // Protects getting and setting the _journalListener below.
     Mutex _journalListenerMutex = MONGO_MAKE_LATCH("WiredTigerSessionCache::_journalListenerMutex");
+
     // Notified when we commit to the journal.
-    JournalListener* _journalListener = &NoOpJournalListener::instance;
+    //
+    // This variable should be accessed under the _journalListenerMutex above and saved in a local
+    // variable before use. That way, we can avoid holding a mutex across calls on the object. It is
+    // only allowed to be set once, in order to ensure the memory to which a copy of the pointer
+    // points is always valid.
+    JournalListener* _journalListener = nullptr;
 
     WT_SESSION* _waitUntilDurableSession = nullptr;  // owned, and never explicitly closed
                                                      // (uses connection close to clean up)

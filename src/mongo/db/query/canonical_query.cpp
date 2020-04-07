@@ -42,7 +42,6 @@
 #include "mongo/db/query/indexability.h"
 #include "mongo/db/query/projection_parser.h"
 #include "mongo/db/query/query_planner_common.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -153,7 +152,8 @@ StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
     // Make MatchExpression.
     boost::intrusive_ptr<ExpressionContext> newExpCtx;
     if (!expCtx.get()) {
-        newExpCtx.reset(new ExpressionContext(opCtx, collator.get(), qr->getRuntimeConstants()));
+        newExpCtx = make_intrusive<ExpressionContext>(
+            opCtx, std::move(collator), qr->nss(), qr->getRuntimeConstants());
     } else {
         newExpCtx = expCtx;
         invariant(CollatorInterface::collatorsMatch(collator.get(), expCtx->getCollator()));
@@ -175,7 +175,6 @@ StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
                  std::move(qr),
                  parsingCanProduceNoopMatchNodes(extensionsCallback, allowedFeatures),
                  std::move(me),
-                 std::move(collator),
                  projectionPolicies);
 
     if (!initStatus.isOK()) {
@@ -200,11 +199,6 @@ StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
         return qrStatus;
     }
 
-    std::unique_ptr<CollatorInterface> collator;
-    if (baseQuery.getCollator()) {
-        collator = baseQuery.getCollator()->clone();
-    }
-
     // Make the CQ we'll hopefully return.
     std::unique_ptr<CanonicalQuery> cq(new CanonicalQuery());
     Status initStatus = cq->init(opCtx,
@@ -212,7 +206,6 @@ StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
                                  std::move(qr),
                                  baseQuery.canHaveNoopMatchNodes(),
                                  root->shallowClone(),
-                                 std::move(collator),
                                  ProjectionPolicies::findProjectionPolicies());
 
     if (!initStatus.isOK()) {
@@ -226,11 +219,9 @@ Status CanonicalQuery::init(OperationContext* opCtx,
                             std::unique_ptr<QueryRequest> qr,
                             bool canHaveNoopMatchNodes,
                             std::unique_ptr<MatchExpression> root,
-                            std::unique_ptr<CollatorInterface> collator,
                             const ProjectionPolicies& projectionPolicies) {
     _expCtx = expCtx;
     _qr = std::move(qr);
-    _collator = std::move(collator);
 
     _canHaveNoopMatchNodes = canHaveNoopMatchNodes;
 
@@ -270,6 +261,11 @@ Status CanonicalQuery::init(OperationContext* opCtx,
         return ex.toStatus();
     }
 
+    // If the 'returnKey' option is set, then the plan should produce index key metadata.
+    if (_qr->returnKey()) {
+        _metadataDeps.set(DocumentMetadataFields::kIndexKey);
+    }
+
     return Status::OK();
 }
 
@@ -284,25 +280,29 @@ void CanonicalQuery::initSortPattern(QueryMetadataBitSet unavailableMetadata) {
     // We have already validated that if there is a $natural sort and a hint, that the hint
     // also specifies $natural with the same direction. Therefore, it is safe to clear the $natural
     // sort and rewrite it as a $natural hint.
-    if (_qr->getSort()["$natural"]) {
+    if (_qr->getSort()[QueryRequest::kNaturalSortField]) {
         _qr->setHint(_qr->getSort());
         _qr->setSort(BSONObj{});
     }
 
     _sortPattern = SortPattern{_qr->getSort(), _expCtx};
     _metadataDeps |= _sortPattern->metadataDeps(unavailableMetadata);
+
+    // If the results of this query might have to be merged on a remote node, then that node might
+    // need the sort key metadata. Request that the plan generates this metadata.
+    if (_expCtx->needsMerge) {
+        _metadataDeps.set(DocumentMetadataFields::kSortKey);
+    }
 }
 
 void CanonicalQuery::setCollator(std::unique_ptr<CollatorInterface> collator) {
-    _collator = std::move(collator);
+    auto collatorRaw = collator.get();
+    // We must give the ExpressionContext the same collator.
+    _expCtx->setCollator(std::move(collator));
 
     // The collator associated with the match expression tree is now invalid, since we have reset
-    // the object owned by '_collator'. We must associate the match expression tree with the new
-    // value of '_collator'.
-    _root->setCollator(_collator.get());
-
-    // In a similar vein, we must give the ExpressionContext the same collator.
-    _expCtx->setCollator(_collator.get());
+    // the collator owned by the ExpressionContext.
+    _root->setCollator(collatorRaw);
 }
 
 // static

@@ -34,6 +34,7 @@
 #include <fmt/format.h>
 
 #include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/db/server_options.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/util/str.h"
 
@@ -58,18 +59,40 @@ RemoteCommandRequestBase::RemoteCommandRequestBase(RequestId requestId,
                                                    const BSONObj& theCmdObj,
                                                    const BSONObj& metadataObj,
                                                    OperationContext* opCtx,
-                                                   Milliseconds timeoutMillis)
-    : id(requestId), dbname(theDbName), metadata(metadataObj), opCtx(opCtx) {
+                                                   Milliseconds timeoutMillis,
+                                                   boost::optional<HedgeOptions> hedgeOptions,
+                                                   FireAndForgetMode fireAndForgetMode)
+    : id(requestId),
+      dbname(theDbName),
+      metadata(metadataObj),
+      opCtx(opCtx),
+      hedgeOptions(hedgeOptions),
+      fireAndForgetMode(fireAndForgetMode) {
     // If there is a comment associated with the current operation, append it to the command that we
     // are about to dispatch to the shards.
-    cmdObj = opCtx && opCtx->getComment() && !theCmdObj["comment"]
-        ? theCmdObj.addField(*opCtx->getComment())
-        : theCmdObj;
+    //
+    // TODO SERVER-45579: Remove this FCV check after branching for 4.5. This is needed only for
+    // compatibility with 4.2 during the 4.2 <=> 4.4 upgrade/downgrade process.
+    if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+        serverGlobalParams.featureCompatibility.getVersion() ==
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44 &&
+        opCtx && opCtx->getComment() && !theCmdObj["comment"]) {
+        cmdObj = theCmdObj.addField(*opCtx->getComment());
+    } else {
+        cmdObj = theCmdObj;
+    }
+
+    if (hedgeOptions) {
+        operationKey.emplace(UUID::gen());
+        cmdObj = cmdObj.addField(BSON("clientOperationKey" << operationKey.get()).firstElement());
+    }
+
     timeout = opCtx ? std::min<Milliseconds>(opCtx->getRemainingMaxTimeMillis(), timeoutMillis)
                     : timeoutMillis;
 }
 
-RemoteCommandRequestBase::RemoteCommandRequestBase() : id(requestIdCounter.addAndFetch(1)) {}
+RemoteCommandRequestBase::RemoteCommandRequestBase()
+    : id(requestIdCounter.addAndFetch(1)), operationKey(UUID::gen()) {}
 
 template <typename T>
 RemoteCommandRequestImpl<T>::RemoteCommandRequestImpl() = default;
@@ -81,8 +104,17 @@ RemoteCommandRequestImpl<T>::RemoteCommandRequestImpl(RequestId requestId,
                                                       const BSONObj& theCmdObj,
                                                       const BSONObj& metadataObj,
                                                       OperationContext* opCtx,
-                                                      Milliseconds timeoutMillis)
-    : RemoteCommandRequestBase(requestId, theDbName, theCmdObj, metadataObj, opCtx, timeoutMillis),
+                                                      Milliseconds timeoutMillis,
+                                                      boost::optional<HedgeOptions> hedgeOptions,
+                                                      FireAndForgetMode fireAndForgetMode)
+    : RemoteCommandRequestBase(requestId,
+                               theDbName,
+                               theCmdObj,
+                               metadataObj,
+                               opCtx,
+                               timeoutMillis,
+                               hedgeOptions,
+                               fireAndForgetMode),
       target(theTarget) {
     if constexpr (std::is_same_v<T, std::vector<HostAndPort>>) {
         invariant(!theTarget.empty());
@@ -95,14 +127,18 @@ RemoteCommandRequestImpl<T>::RemoteCommandRequestImpl(const T& theTarget,
                                                       const BSONObj& theCmdObj,
                                                       const BSONObj& metadataObj,
                                                       OperationContext* opCtx,
-                                                      Milliseconds timeoutMillis)
+                                                      Milliseconds timeoutMillis,
+                                                      boost::optional<HedgeOptions> hedgeOptions,
+                                                      FireAndForgetMode fireAndForgetMode)
     : RemoteCommandRequestImpl(requestIdCounter.addAndFetch(1),
                                theTarget,
                                theDbName,
                                theCmdObj,
                                metadataObj,
                                opCtx,
-                               timeoutMillis) {}
+                               timeoutMillis,
+                               hedgeOptions,
+                               fireAndForgetMode) {}
 
 template <typename T>
 std::string RemoteCommandRequestImpl<T>::toString() const {
@@ -117,6 +153,12 @@ std::string RemoteCommandRequestImpl<T>::toString() const {
 
     if (expirationDate != kNoExpirationDate) {
         out << " expDate:" << expirationDate.toString();
+    }
+
+    if (hedgeOptions) {
+        invariant(operationKey);
+        out << " hedgeOptions.count: " << hedgeOptions->count;
+        out << " operationKey: " << operationKey.get();
     }
 
     out << " cmd:" << cmdObj.toString();

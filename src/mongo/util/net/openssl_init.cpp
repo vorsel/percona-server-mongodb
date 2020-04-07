@@ -33,7 +33,7 @@
 
 #include "mongo/base/init.h"
 #include "mongo/config.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/net/ssl_options.h"
 
@@ -90,9 +90,9 @@ public:
 
     static void lockingCallback(int mode, int type, const char* file, int line) {
         if (mode & CRYPTO_LOCK) {
-            _mutex[type]->lock();
+            mutexes()[type]->lock();
         } else {
-            _mutex[type]->unlock();
+            mutexes()[type]->unlock();
         }
     }
 
@@ -100,8 +100,8 @@ public:
         CRYPTO_set_id_callback(&SSLThreadInfo::getID);
         CRYPTO_set_locking_callback(&SSLThreadInfo::lockingCallback);
 
-        while ((int)_mutex.size() < CRYPTO_num_locks()) {
-            _mutex.emplace_back(std::make_unique<stdx::recursive_mutex>());
+        while ((int)mutexes().size() < CRYPTO_num_locks()) {
+            mutexes().emplace_back(std::make_unique<stdx::recursive_mutex>());
         }
     }
 
@@ -111,7 +111,12 @@ private:
     // Note: see SERVER-8734 for why we are using a recursive mutex here.
     // Once the deadlock fix in OpenSSL is incorporated into most distros of
     // Linux, this can be changed back to a nonrecursive mutex.
-    static std::vector<std::unique_ptr<stdx::recursive_mutex>> _mutex;
+    static std::vector<std::unique_ptr<stdx::recursive_mutex>>& mutexes() {
+        // Keep the static as a pointer to avoid it ever to be destroyed. It is referenced in the
+        // CallErrRemoveState thread local above.
+        static auto m = new std::vector<std::unique_ptr<stdx::recursive_mutex>>();
+        return *m;
+    }
 
     class ThreadIDManager {
     public:
@@ -140,7 +145,6 @@ private:
     };
     static ThreadIDManager _idManager;
 };
-std::vector<std::unique_ptr<stdx::recursive_mutex>> SSLThreadInfo::_mutex;
 SSLThreadInfo::ThreadIDManager SSLThreadInfo::_idManager;
 
 void setupFIPS() {
@@ -148,13 +152,16 @@ void setupFIPS() {
 #if defined(MONGO_CONFIG_HAVE_FIPS_MODE_SET)
     int status = FIPS_mode_set(1);
     if (!status) {
-        severe() << "can't activate FIPS mode: "
-                 << SSLManagerInterface::getSSLErrorMessage(ERR_get_error());
+        LOGV2_FATAL(
+            23173,
+            "can't activate FIPS mode: {SSLManagerInterface_getSSLErrorMessage_ERR_get_error}",
+            "SSLManagerInterface_getSSLErrorMessage_ERR_get_error"_attr =
+                SSLManagerInterface::getSSLErrorMessage(ERR_get_error()));
         fassertFailedNoTrace(16703);
     }
-    log() << "FIPS 140-2 mode activated";
+    LOGV2(23172, "FIPS 140-2 mode activated");
 #else
-    severe() << "this version of mongodb was not compiled with FIPS support";
+    LOGV2_FATAL(23174, "this version of mongodb was not compiled with FIPS support");
     fassertFailedNoTrace(17089);
 #endif
 }

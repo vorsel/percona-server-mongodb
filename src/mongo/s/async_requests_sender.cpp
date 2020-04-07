@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -38,13 +38,14 @@
 
 #include "mongo/client/remote_command_targeter.h"
 #include "mongo/executor/remote_command_request.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/hedge_options_util.h"
 #include "mongo/transport/baton.h"
 #include "mongo/transport/transport_layer.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 using namespace fmt::literals;
@@ -181,8 +182,13 @@ SemiFuture<std::vector<HostAndPort>> AsyncRequestsSender::RemoteData::resolveSha
 
 auto AsyncRequestsSender::RemoteData::scheduleRemoteCommand(std::vector<HostAndPort>&& hostAndPorts)
     -> SemiFuture<RemoteCommandOnAnyCallbackArgs> {
-    executor::RemoteCommandRequestOnAny request(
-        std::move(hostAndPorts), _ars->_db, _cmdObj, _ars->_metadataObj, _ars->_opCtx);
+    auto hedgeOptions = extractHedgeOptions(_ars->_readPreference);
+    executor::RemoteCommandRequestOnAny request(std::move(hostAndPorts),
+                                                _ars->_db,
+                                                _cmdObj,
+                                                _ars->_metadataObj,
+                                                _ars->_opCtx,
+                                                hedgeOptions);
 
     // We have to make a promise future pair because the TaskExecutor doesn't currently support a
     // future returning variant of scheduleRemoteCommand
@@ -241,13 +247,13 @@ auto AsyncRequestsSender::RemoteData::handleResponse(RemoteCommandOnAnyCallbackA
         if (!_ars->_stopRetrying && shard->isRetriableError(status.code(), _ars->_retryPolicy) &&
             _retryCount < kMaxNumFailedHostRetryAttempts) {
 
-            LOG(1) << "Command to remote " << _shardId
-                   << (failedTargets.empty()
-                           ? " "
-                           : (failedTargets.size() > 1 ? " for hosts " : " at host "))
-                   << "{}"_format(fmt::join(failedTargets, ", "))
-                   << "failed with retriable error and will be retried "
-                   << causedBy(redact(status));
+            LOGV2_DEBUG(4615637,
+                        1,
+                        "Command to remote {shardId} for hosts {hosts} failed with retriable error "
+                        "and will be retried. Caused by {causedBy}",
+                        "shardId"_attr = _shardId,
+                        "hosts"_attr = failedTargets,
+                        "causedBy"_attr = redact(status));
 
             ++_retryCount;
             _shardHostAndPort.reset();

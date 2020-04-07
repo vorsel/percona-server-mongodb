@@ -34,11 +34,15 @@ def build_benchmark(env, target, source, **kwargs):
     libdeps.append("$BUILD_DIR/mongo/unittest/benchmark_main")
 
     kwargs["LIBDEPS"] = libdeps
-    kwargs["INSTALL_ALIAS"] = ["benchmarks"]
-
     benchmark_test_components = {"tests", "benchmarks"}
-    if "AIB_COMPONENT" in kwargs and not kwargs["AIB_COMPONENT"].endswith("-benchmark"):
+    primary_component = kwargs.get("AIB_COMPONENT", env.get("AIB_COMPONENT", ""))
+    if primary_component and not primary_component.endswith("-benchmark"):
         kwargs["AIB_COMPONENT"] += "-benchmark"
+    elif primary_component:
+        kwargs["AIB_COMPONENT"] = primary_component
+    else:
+        kwargs["AIB_COMPONENT"] = "benchmarks"
+        benchmark_test_components = {"tests"}
 
     if "AIB_COMPONENTS_EXTRA" in kwargs:
         benchmark_test_components = set(kwargs["AIB_COMPONENTS_EXTRA"]).union(

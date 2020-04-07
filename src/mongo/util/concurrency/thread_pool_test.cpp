@@ -43,7 +43,6 @@
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/concurrency/thread_pool_test_common.h"
 #include "mongo/util/concurrency/thread_pool_test_fixture.h"
-#include "mongo/util/log.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/timer.h"
 
@@ -187,15 +186,16 @@ TEST_F(ThreadPoolTest, MaxPoolSize20MinPoolSize15) {
         << "Failed to reap excess threads after " << durationCount<Milliseconds>(reapTime) << "ms";
 }
 
-DEATH_TEST(ThreadPoolTest, MaxThreadsTooFewDies, "but the maximum must be at least 1") {
+DEATH_TEST_REGEX(ThreadPoolTest, MaxThreadsTooFewDies, "but the maximum must be at least 1") {
     ThreadPool::Options options;
     options.maxThreads = 0;
     ThreadPool pool(options);
 }
 
-DEATH_TEST(ThreadPoolTest,
-           MinThreadsTooManyDies,
-           "6 which is more than the configured maximum of 5") {
+DEATH_TEST_REGEX(
+    ThreadPoolTest,
+    MinThreadsTooManyDies,
+    R"#(.*which is more than the configured maximum of.*minThreads":6,"options_maxThreads":5)#") {
     ThreadPool::Options options;
     options.maxThreads = 5;
     options.minThreads = 6;
@@ -211,9 +211,9 @@ TEST(ThreadPoolTest, LivePoolCleanedByDestructor) {
     // Destructor should reap leftover threads.
 }
 
-DEATH_TEST(ThreadPoolTest,
-           DestructionDuringJoinDies,
-           "Attempted to join pool DoubleJoinPool more than once") {
+DEATH_TEST_REGEX(ThreadPoolTest,
+                 DestructionDuringJoinDies,
+                 "Attempted to join pool .* more than once.*DoubleJoinPool") {
     // This test is a little complicated. We need to ensure that the ThreadPool destructor runs
     // while some thread is blocked running ThreadPool::join, to see that double-join is fatal in
     // the pool destructor. To do this, we first wait for minThreads threads to have started. Then,
@@ -277,6 +277,38 @@ TEST_F(ThreadPoolTest, ThreadPoolRunsOnCreateThreadFunctionBeforeConsumingTasks)
 
     ASSERT_TRUE(onCreateThreadCalled);
     ASSERT_EQUALS(options.threadNamePrefix + "0", taskThreadName);
+}
+
+TEST(ThreadPoolTest, JoinAllRetiredThreads) {
+    AtomicWord<unsigned long> retiredThreads(0);
+    ThreadPool::Options options;
+    options.minThreads = 4;
+    options.maxThreads = 8;
+    options.maxIdleThreadAge = Milliseconds(100);
+    options.onJoinRetiredThread = [&](const stdx::thread& t) { retiredThreads.addAndFetch(1); };
+    unittest::Barrier barrier(options.maxThreads + 1);
+
+    ThreadPool pool(options);
+    for (auto i = options.maxThreads; i > 0; i--) {
+        pool.schedule([&](auto status) {
+            ASSERT_OK(status);
+            barrier.countDownAndWait();
+        });
+    }
+    ASSERT_EQ(pool.getStats().numThreads, 0);
+    pool.startup();
+    barrier.countDownAndWait();
+
+    while (pool.getStats().numThreads > options.minThreads) {
+        sleepmillis(100);
+    }
+
+    pool.shutdown();
+    pool.join();
+
+    const auto expectedRetiredThreads = options.maxThreads - options.minThreads;
+    ASSERT_EQ(retiredThreads.load(), expectedRetiredThreads);
+    ASSERT_EQ(pool.getStats().numIdleThreads, 0);
 }
 
 }  // namespace

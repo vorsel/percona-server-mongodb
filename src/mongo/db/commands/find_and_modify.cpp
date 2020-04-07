@@ -70,7 +70,7 @@
 #include "mongo/db/stats/top.h"
 #include "mongo/db/transaction_participant.h"
 #include "mongo/db/write_concern.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -97,9 +97,13 @@ boost::optional<BSONObj> advanceExecutor(OperationContext* opCtx,
         // We should always have a valid status member object at this point.
         auto status = WorkingSetCommon::getMemberObjectStatus(value);
         invariant(!status.isOK());
-        warning() << "Plan executor error during findAndModify: " << PlanExecutor::statestr(state)
-                  << ", status: " << status
-                  << ", stats: " << redact(Explain::getWinningPlanStats(exec));
+        LOGV2_WARNING(23802,
+                      "Plan executor error during findAndModify: {PlanExecutor_statestr_state}, "
+                      "status: {status}, stats: {Explain_getWinningPlanStats_exec}",
+                      "PlanExecutor_statestr_state"_attr = PlanExecutor::statestr(state),
+                      "status"_attr = status,
+                      "Explain_getWinningPlanStats_exec"_attr =
+                          redact(Explain::getWinningPlanStats(exec)));
 
         uassertStatusOKWithContext(status, "Plan executor error during findAndModify");
         MONGO_UNREACHABLE;
@@ -142,6 +146,7 @@ void makeDeleteRequest(OperationContext* opCtx,
     requestOut->setRuntimeConstants(
         args.getRuntimeConstants().value_or(Variables::generateRuntimeConstants(opCtx)));
     requestOut->setSort(args.getSort());
+    requestOut->setHint(args.getHint());
     requestOut->setCollation(args.getCollation());
     requestOut->setMulti(false);
     requestOut->setReturnDeleted(true);  // Always return the old value.
@@ -170,7 +175,7 @@ void appendCommandResponse(const PlanExecutor* exec,
     }
 }
 
-void assertCanWrite(OperationContext* opCtx, const NamespaceString& nsString, bool isCollection) {
+void assertCanWrite(OperationContext* opCtx, const NamespaceString& nsString) {
     uassert(ErrorCodes::NotMaster,
             str::stream() << "Not primary while running findAndModify command on collection "
                           << nsString.ns(),
@@ -178,7 +183,7 @@ void assertCanWrite(OperationContext* opCtx, const NamespaceString& nsString, bo
 
     // Check for shard version match
     auto css = CollectionShardingState::get(opCtx, nsString);
-    css->checkShardVersionOrThrow(opCtx, isCollection);
+    css->checkShardVersionOrThrow(opCtx);
 }
 
 void recordStatsForTopCommand(OperationContext* opCtx) {
@@ -225,6 +230,10 @@ public:
         return true;
     }
 
+    bool supportsReadMirroring(const BSONObj&) const override {
+        return true;
+    }
+
     void addRequiredPrivileges(const std::string& dbname,
                                const BSONObj& cmdObj,
                                std::vector<Privilege>* out) const override {
@@ -264,11 +273,12 @@ public:
                     autoColl.getDb());
 
             auto css = CollectionShardingState::get(opCtx, nsString);
-            css->checkShardVersionOrThrow(opCtx, autoColl.getCollection());
+            css->checkShardVersionOrThrow(opCtx);
 
             Collection* const collection = autoColl.getCollection();
-            const auto exec = uassertStatusOK(
-                getExecutorDelete(opCtx, opDebug, collection, &parsedDelete, verbosity));
+
+            const auto exec =
+                uassertStatusOK(getExecutorDelete(opDebug, collection, &parsedDelete, verbosity));
 
             auto bodyBuilder = result->getBodyBuilder();
             Explain::explainStages(exec.get(), collection, verbosity, BSONObj(), &bodyBuilder);
@@ -289,11 +299,11 @@ public:
                     autoColl.getDb());
 
             auto css = CollectionShardingState::get(opCtx, nsString);
-            css->checkShardVersionOrThrow(opCtx, autoColl.getCollection());
+            css->checkShardVersionOrThrow(opCtx);
 
             Collection* const collection = autoColl.getCollection();
-            const auto exec = uassertStatusOK(
-                getExecutorUpdate(opCtx, opDebug, collection, &parsedUpdate, verbosity));
+            const auto exec =
+                uassertStatusOK(getExecutorUpdate(opDebug, collection, &parsedUpdate, verbosity));
 
             auto bodyBuilder = result->getBodyBuilder();
             Explain::explainStages(exec.get(), collection, verbosity, BSONObj(), &bodyBuilder);
@@ -376,13 +386,13 @@ public:
                     CurOp::get(opCtx)->enter_inlock(nsString.ns().c_str(), dbProfilingLevel);
                 }
 
-                assertCanWrite(opCtx, nsString, autoColl.getCollection());
+                assertCanWrite(opCtx, nsString);
 
                 Collection* const collection = autoColl.getCollection();
                 checkIfTransactionOnCappedColl(collection, inTransaction);
 
                 const auto exec = uassertStatusOK(getExecutorDelete(
-                    opCtx, opDebug, collection, &parsedDelete, boost::none /* verbosity */));
+                    opDebug, collection, &parsedDelete, boost::none /* verbosity */));
 
                 {
                     stdx::lock_guard<Client> lk(*opCtx->getClient());
@@ -442,13 +452,16 @@ public:
                     CurOp::get(opCtx)->enter_inlock(nsString.ns().c_str(), dbProfilingLevel);
                 }
 
-                assertCanWrite(opCtx, nsString, autoColl->getCollection());
+                assertCanWrite(opCtx, nsString);
 
                 Collection* collection = autoColl->getCollection();
 
                 // Create the collection if it does not exist when performing an upsert because the
                 // update stage does not create its own collection
                 if (!collection && args.isUpsert()) {
+                    // We do not allow acquisition of exclusive locks inside multi-document
+                    // transactions, so fail early if we are inside of such a transaction.
+                    // TODO(SERVER-45956) remove below assertion.
                     uassert(ErrorCodes::OperationNotSupportedInTransaction,
                             str::stream() << "Cannot create namespace " << nsString.ns()
                                           << " in multi-document transaction.",
@@ -459,10 +472,7 @@ public:
                     autoColl.reset();
                     autoDb.emplace(opCtx, dbName, MODE_X);
 
-                    assertCanWrite(
-                        opCtx,
-                        nsString,
-                        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nsString));
+                    assertCanWrite(opCtx, nsString);
 
                     collection =
                         CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nsString);
@@ -488,7 +498,7 @@ public:
                 checkIfTransactionOnCappedColl(collection, inTransaction);
 
                 const auto exec = uassertStatusOK(getExecutorUpdate(
-                    opCtx, opDebug, collection, &parsedUpdate, boost::none /* verbosity */));
+                    opDebug, collection, &parsedUpdate, boost::none /* verbosity */));
 
                 {
                     stdx::lock_guard<Client> lk(*opCtx->getClient());
@@ -521,6 +531,25 @@ public:
 
             return true;
         });
+    }
+
+    void appendMirrorableRequest(BSONObjBuilder* bob, const BSONObj& cmdObj) const override {
+        // Filter the keys that can be mirrored
+        static const auto kMirrorableKeys = [] {
+            BSONObjBuilder keyBob;
+            keyBob.append("sort", 1);
+            keyBob.append("collation", 1);
+            return keyBob.obj();
+        }();
+
+        bob->append("find", cmdObj.firstElement().String());
+        bob->append("filter", cmdObj["query"].Obj());
+
+        cmdObj.filterFieldsUndotted(bob, kMirrorableKeys, true);
+
+        // Prevent the find from returning multiple documents since we can
+        bob->append("batchSize", 1);
+        bob->append("singleBatch", true);
     }
 
 } cmdFindAndModify;

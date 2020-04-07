@@ -71,9 +71,9 @@
 #include "mongo/db/update/update_driver.h"
 
 #include "mongo/db/auth/user_document_parser.h"  // XXX-ANDY
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/object_check.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -98,6 +98,10 @@ MONGO_FAIL_POINT_DEFINE(hangAfterCollectionInserts);
 // This fail point throws a WriteConflictException after a successful call to insertRecords.
 MONGO_FAIL_POINT_DEFINE(failAfterBulkLoadDocInsert);
 
+// This fail point allows collections to be given malformed validator. A malformed validator
+// will not (and cannot) be enforced but it will be persisted.
+MONGO_FAIL_POINT_DEFINE(allowSettingMalformedCollectionValidators);
+
 /**
  * Checks the 'failCollectionInserts' fail point at the beginning of an insert operation to see if
  * the insert should fail. Returns Status::OK if The function should proceed with the insertion.
@@ -110,7 +114,7 @@ Status checkFailCollectionInsertsFailPoint(const NamespaceString& ns, const BSON
             const std::string msg = str::stream()
                 << "Failpoint (failCollectionInserts) has been enabled (" << data
                 << "), so rejecting insert (first doc): " << firstDoc;
-            log() << msg;
+            LOGV2(20287, "{msg}", "msg"_attr = msg);
             s = {ErrorCodes::FailPointEnabled, msg};
         },
         [&](const BSONObj& data) {
@@ -138,9 +142,11 @@ std::unique_ptr<CollatorInterface> parseCollation(OperationContext* opCtx,
     // integration, shut down the server. Errors other than IncompatibleCollationVersion should not
     // be possible, so these are an invariant rather than fassert.
     if (collator == ErrorCodes::IncompatibleCollationVersion) {
-        log() << "Collection " << nss
-              << " has a default collation which is incompatible with this version: "
-              << collationSpec;
+        LOGV2(20288,
+              "Collection {nss} has a default collation which is incompatible with this version: "
+              "{collationSpec}",
+              "nss"_attr = nss,
+              "collationSpec"_attr = collationSpec);
         fassertFailedNoTrace(40144);
     }
     invariant(collator.getStatus());
@@ -184,6 +190,56 @@ StatusWith<CollectionImpl::ValidationAction> _parseValidationAction(StringData n
     }
 
     MONGO_UNREACHABLE;
+}
+
+Status checkValidatorCanBeUsedOnNs(const BSONObj& validator,
+                                   const NamespaceString& nss,
+                                   const UUID& uuid) {
+    if (validator.isEmpty())
+        return Status::OK();
+
+    if (nss.isSystem() && !nss.isDropPendingNamespace()) {
+        return {ErrorCodes::InvalidOptions,
+                str::stream() << "Document validators not allowed on system collection " << nss
+                              << " with UUID " << uuid};
+    }
+
+    if (nss.isOnInternalDb()) {
+        return {ErrorCodes::InvalidOptions,
+                str::stream() << "Document validators are not allowed on collection " << nss.ns()
+                              << " with UUID " << uuid << " in the " << nss.db()
+                              << " internal database"};
+    }
+    return Status::OK();
+}
+
+Status validatePreImageRecording(OperationContext* opCtx, const NamespaceString& ns) {
+    if (ns.db() == NamespaceString::kAdminDb || ns.db() == NamespaceString::kLocalDb) {
+        return {ErrorCodes::InvalidOptions,
+                str::stream() << "recordPreImages collection option is not supported on the "
+                              << ns.db() << " database"};
+    }
+
+    if (!serverGlobalParams.featureCompatibility.isVersionInitialized() ||
+        serverGlobalParams.featureCompatibility.getVersion() !=
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
+        return {ErrorCodes::InvalidOptions,
+                "recordPreImages collection option is only supported when the feature "
+                "compatibility version is set to 4.4 or above"};
+    }
+
+    if (serverGlobalParams.clusterRole != ClusterRole::None) {
+        return {ErrorCodes::InvalidOptions,
+                "recordPreImages collection option is not supported on shards or config servers"};
+    }
+
+    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    if (!replCoord->isReplEnabled()) {
+        return {ErrorCodes::InvalidOptions,
+                "recordPreImages collection option depends on being in a replica set"};
+    }
+
+    return Status::OK();
 }
 
 }  // namespace
@@ -231,11 +287,30 @@ void CollectionImpl::init(OperationContext* opCtx) {
     auto collectionOptions =
         DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, getCatalogId());
     _collator = parseCollation(opCtx, _ns, collectionOptions.collation);
-    _validatorDoc = collectionOptions.validator.getOwned();
-    _validator = uassertStatusOK(
-        parseValidator(opCtx, _validatorDoc, MatchExpressionParser::kAllowAllSpecialFeatures));
+    auto validatorDoc = collectionOptions.validator.getOwned();
+
+    // Enforce that the validator can be used on this namespace.
+    uassertStatusOK(checkValidatorCanBeUsedOnNs(validatorDoc, ns(), _uuid));
+    // Store the result (OK / error) of parsing the validator, but do not enforce that the result is
+    // OK. This is intentional, as users may have validators on disk which were considered well
+    // formed in older versions but not in newer versions.
+    _validator =
+        parseValidator(opCtx, validatorDoc, MatchExpressionParser::kAllowAllSpecialFeatures);
+    if (!_validator.isOK()) {
+        // Log an error and startup warning if the collection validator is malformed.
+        LOGV2_WARNING_OPTIONS(20293,
+                              {logv2::LogTag::kStartupWarnings},
+                              "Collection {ns} has malformed validator: {validatorStatus}",
+                              "Collection has malformed validator",
+                              "ns"_attr = _ns,
+                              "validatorStatus"_attr = _validator.getStatus());
+    }
     _validationAction = uassertStatusOK(_parseValidationAction(collectionOptions.validationAction));
     _validationLevel = uassertStatusOK(_parseValidationLevel(collectionOptions.validationLevel));
+    if (collectionOptions.recordPreImages) {
+        uassertStatusOK(validatePreImageRecording(opCtx, _ns));
+        _recordPreImages = true;
+    }
 
     getIndexCatalog()->init(opCtx).transitional_ignore();
     _initialized = true;
@@ -243,6 +318,15 @@ void CollectionImpl::init(OperationContext* opCtx) {
 
 bool CollectionImpl::isInitialized() const {
     return _initialized;
+}
+
+bool CollectionImpl::isCommitted() const {
+    return _committed;
+}
+
+void CollectionImpl::setCommitted(bool val) {
+    invariant((!_committed && val) || (_committed && !val));
+    _committed = val;
 }
 
 bool CollectionImpl::requiresIdIndex() const {
@@ -282,7 +366,12 @@ bool CollectionImpl::findDoc(OperationContext* opCtx,
 }
 
 Status CollectionImpl::checkValidation(OperationContext* opCtx, const BSONObj& document) const {
-    if (!_validator)
+    if (!_validator.isOK()) {
+        return _validator.getStatus();
+    }
+
+    const auto* const validatorMatchExpr = _validator.filter.getValue().get();
+    if (!validatorMatchExpr)
         return Status::OK();
 
     if (_validationLevel == ValidationLevel::OFF)
@@ -291,41 +380,40 @@ Status CollectionImpl::checkValidation(OperationContext* opCtx, const BSONObj& d
     if (documentValidationDisabled(opCtx))
         return Status::OK();
 
-    if (_validator->matchesBSON(document))
+    if (validatorMatchExpr->matchesBSON(document))
         return Status::OK();
 
     if (_validationAction == ValidationAction::WARN) {
-        warning() << "Document would fail validation"
-                  << " collection: " << ns() << " doc: " << redact(document);
+        LOGV2_WARNING(20294,
+                      "Document would fail validation collection: {ns} doc: {document}",
+                      "ns"_attr = ns(),
+                      "document"_attr = redact(document));
         return Status::OK();
     }
 
     return {ErrorCodes::DocumentValidationFailure, "Document failed validation"};
 }
 
-StatusWithMatchExpression CollectionImpl::parseValidator(
+Collection::Validator CollectionImpl::parseValidator(
     OperationContext* opCtx,
     const BSONObj& validator,
     MatchExpressionParser::AllowedFeatureSet allowedFeatures,
     boost::optional<ServerGlobalParams::FeatureCompatibility::Version>
         maxFeatureCompatibilityVersion) const {
+    if (MONGO_unlikely(allowSettingMalformedCollectionValidators.shouldFail())) {
+        return {validator, nullptr, nullptr};
+    }
+
     if (validator.isEmpty())
-        return {nullptr};
+        return {validator, nullptr, nullptr};
 
-    if (ns().isSystem() && !ns().isDropPendingNamespace()) {
-        return {ErrorCodes::InvalidOptions,
-                str::stream() << "Document validators not allowed on system collection " << ns()
-                              << " with UUID " << _uuid};
+    Status canUseValidatorInThisContext = checkValidatorCanBeUsedOnNs(validator, ns(), _uuid);
+    if (!canUseValidatorInThisContext.isOK()) {
+        return {validator, nullptr, canUseValidatorInThisContext};
     }
 
-    if (ns().isOnInternalDb()) {
-        return {ErrorCodes::InvalidOptions,
-                str::stream() << "Document validators are not allowed on collection " << ns().ns()
-                              << " with UUID " << _uuid << " in the " << ns().db()
-                              << " internal database"};
-    }
-
-    boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContext(opCtx, _collator.get()));
+    auto expCtx = make_intrusive<ExpressionContext>(
+        opCtx, CollatorInterface::cloneCollator(_collator.get()), ns());
 
     // The MatchExpression and contained ExpressionContext created as part of the validator are
     // owned by the Collection and will outlive the OperationContext they were created under.
@@ -340,10 +428,16 @@ StatusWithMatchExpression CollectionImpl::parseValidator(
 
     auto statusWithMatcher =
         MatchExpressionParser::parse(validator, expCtx, ExtensionsCallbackNoop(), allowedFeatures);
-    if (!statusWithMatcher.isOK())
-        return statusWithMatcher.getStatus();
 
-    return statusWithMatcher;
+    if (!statusWithMatcher.isOK()) {
+        return {
+            validator,
+            boost::intrusive_ptr<ExpressionContext>(nullptr),
+            statusWithMatcher.getStatus().withContext("Parsing of collection validator failed")};
+    }
+
+    return Collection::Validator{
+        validator, std::move(expCtx), std::move(statusWithMatcher.getValue())};
 }
 
 Status CollectionImpl::insertDocumentsForOplog(OperationContext* opCtx,
@@ -352,7 +446,8 @@ Status CollectionImpl::insertDocumentsForOplog(OperationContext* opCtx,
     dassert(opCtx->lockState()->isWriteLocked());
 
     // Since this is only for the OpLog, we can assume these for simplicity.
-    invariant(!_validator);
+    invariant(_validator.isOK());
+    invariant(_validator.filter.getValue() == nullptr);
     invariant(!_indexCatalog->haveAnyIndexes());
 
     Status status = _recordStore->insertRecords(opCtx, records, timestamps);
@@ -415,8 +510,11 @@ Status CollectionImpl::insertDocuments(OperationContext* opCtx,
                 whenFirst += " when first _id is ";
                 whenFirst += firstIdElem.str();
             }
-            log() << "hangAfterCollectionInserts fail point enabled for " << _ns << whenFirst
-                  << ". Blocking until fail point is disabled.";
+            LOGV2(20289,
+                  "hangAfterCollectionInserts fail point enabled for {ns}{whenFirst}. Blocking "
+                  "until fail point is disabled.",
+                  "ns"_attr = _ns,
+                  "whenFirst"_attr = whenFirst);
             hangAfterCollectionInserts.pauseWhileSet(opCtx);
         },
         [&](const BSONObj& data) {
@@ -468,8 +566,10 @@ Status CollectionImpl::insertDocumentForBulkLoader(OperationContext* opCtx,
     status = onRecordInserted(loc.getValue());
 
     if (MONGO_unlikely(failAfterBulkLoadDocInsert.shouldFail())) {
-        log() << "Failpoint failAfterBulkLoadDocInsert enabled for " << _ns.ns()
-              << ". Throwing WriteConflictException.";
+        LOGV2(20290,
+              "Failpoint failAfterBulkLoadDocInsert enabled for {ns_ns}. Throwing "
+              "WriteConflictException.",
+              "ns_ns"_attr = _ns.ns());
         throw WriteConflictException();
     }
 
@@ -593,7 +693,7 @@ void CollectionImpl::deleteDocument(OperationContext* opCtx,
                                     bool noWarn,
                                     Collection::StoreDeletedDoc storeDeletedDoc) {
     if (isCapped()) {
-        log() << "failing remove on a capped ns " << _ns;
+        LOGV2(20291, "failing remove on a capped ns {ns}", "ns"_attr = _ns);
         uasserted(10089, "cannot remove from a capped collection");
         return;
     }
@@ -602,7 +702,8 @@ void CollectionImpl::deleteDocument(OperationContext* opCtx,
     getGlobalServiceContext()->getOpObserver()->aboutToDelete(opCtx, ns(), doc.value());
 
     boost::optional<BSONObj> deletedDoc;
-    if (storeDeletedDoc == Collection::StoreDeletedDoc::On) {
+    if ((storeDeletedDoc == Collection::StoreDeletedDoc::On && opCtx->getTxnNumber()) ||
+        getRecordPreImages()) {
         deletedDoc.emplace(doc.value().getOwned());
     }
 
@@ -675,7 +776,13 @@ RecordId CollectionImpl::updateDocument(OperationContext* opCtx,
                   str::stream() << "Cannot change the size of a document in a capped collection: "
                                 << oldSize << " != " << newDoc.objsize());
 
-    args->preImageDoc = oldDoc.value().getOwned();
+    // The preImageDoc may not be boost::none if this update was a retryable findAndModify or if
+    // the update may have changed the shard key. For non-in-place updates we always set the
+    // preImageDoc here to an owned copy of the pre-image.
+    if (!args->preImageDoc) {
+        args->preImageDoc = oldDoc.value().getOwned();
+    }
+    args->preImageRecordingEnabledForCollection = getRecordPreImages();
 
     uassertStatusOK(
         _recordStore->updateRecord(opCtx, oldLocation, newDoc.objdata(), newDoc.objsize()));
@@ -684,7 +791,7 @@ RecordId CollectionImpl::updateDocument(OperationContext* opCtx,
         int64_t keysInserted, keysDeleted;
 
         uassertStatusOK(_indexCatalog->updateRecord(
-            opCtx, args->preImageDoc.get(), newDoc, oldLocation, &keysInserted, &keysDeleted));
+            opCtx, *args->preImageDoc, newDoc, oldLocation, &keysInserted, &keysDeleted));
 
         if (opDebug) {
             opDebug->additiveMetrics.incrementKeysInserted(keysInserted);
@@ -702,7 +809,7 @@ RecordId CollectionImpl::updateDocument(OperationContext* opCtx,
 }
 
 bool CollectionImpl::updateWithDamagesSupported() const {
-    if (_validator)
+    if (!_validator.isOK() || _validator.filter.getValue() != nullptr)
         return false;
 
     return _recordStore->updateWithDamagesSupported();
@@ -719,12 +826,19 @@ StatusWith<RecordData> CollectionImpl::updateDocumentWithDamages(
     invariant(oldRec.snapshotId() == opCtx->recoveryUnit()->getSnapshotId());
     invariant(updateWithDamagesSupported());
 
+    // For in-place updates we need to grab an owned copy of the pre-image doc if pre-image
+    // recording is enabled and we haven't already set the pre-image due to this update being
+    // a retryable findAndModify or a possible update to the shard key.
+    if (!args->preImageDoc && getRecordPreImages()) {
+        args->preImageDoc = oldRec.value().toBson().getOwned();
+    }
+
     auto newRecStatus =
         _recordStore->updateWithDamages(opCtx, loc, oldRec.value(), damageSource, damages);
 
     if (newRecStatus.isOK()) {
         args->updatedDoc = newRecStatus.getValue().toBson();
-
+        args->preImageRecordingEnabledForCollection = getRecordPreImages();
         OplogUpdateEntryArgs entryArgs(*args, ns(), _uuid);
         getGlobalServiceContext()->getOpObserver()->onUpdate(opCtx, entryArgs);
     }
@@ -733,6 +847,18 @@ StatusWith<RecordData> CollectionImpl::updateDocumentWithDamages(
 
 bool CollectionImpl::isTemporary(OperationContext* opCtx) const {
     return DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, getCatalogId()).temp;
+}
+
+bool CollectionImpl::getRecordPreImages() const {
+    return _recordPreImages;
+}
+
+void CollectionImpl::setRecordPreImages(OperationContext* opCtx, bool val) {
+    if (val) {
+        uassertStatusOK(validatePreImageRecording(opCtx, _ns));
+    }
+    DurableCatalog::get(opCtx)->setRecordPreImages(opCtx, getCatalogId(), val);
+    _recordPreImages = val;
 }
 
 bool CollectionImpl::isCapped() const {
@@ -754,6 +880,31 @@ uint64_t CollectionImpl::numRecords(OperationContext* opCtx) const {
 
 uint64_t CollectionImpl::dataSize(OperationContext* opCtx) const {
     return _recordStore->dataSize(opCtx);
+}
+
+bool CollectionImpl::isEmpty(OperationContext* opCtx) const {
+    auto cursor = getCursor(opCtx, true /* forward */);
+
+    auto cursorEmptyCollRes = (!cursor->next()) ? true : false;
+    auto fastCount = numRecords(opCtx);
+    auto fastCountEmptyCollRes = (fastCount == 0) ? true : false;
+
+    if (cursorEmptyCollRes != fastCountEmptyCollRes) {
+        BSONObjBuilder bob;
+        bob.appendNumber("fastCount", static_cast<long long>(fastCount));
+        bob.append("cursor", str::stream() << (cursorEmptyCollRes ? "0" : ">=1"));
+
+        LOGV2_DEBUG(20292,
+                    2,
+                    "Detected erroneous fast count for collection {ns}({uuid}) "
+                    "[{getRecordStore_getIdent}]. Record count reported by: {bob_obj}",
+                    "ns"_attr = ns(),
+                    "uuid"_attr = uuid(),
+                    "getRecordStore_getIdent"_attr = getRecordStore()->getIdent(),
+                    "bob_obj"_attr = bob.obj());
+    }
+
+    return cursorEmptyCollRes;
 }
 
 uint64_t CollectionImpl::getIndexSize(OperationContext* opCtx,
@@ -838,22 +989,18 @@ Status CollectionImpl::setValidator(OperationContext* opCtx, BSONObj validatorDo
 
     // Note that, by the time we reach this, we should have already done a pre-parse that checks for
     // banned features, so we don't need to include that check again.
-    auto statusWithMatcher =
+    auto newValidator =
         parseValidator(opCtx, validatorDoc, MatchExpressionParser::kAllowAllSpecialFeatures);
-    if (!statusWithMatcher.isOK())
-        return statusWithMatcher.getStatus();
+    if (!newValidator.isOK())
+        return newValidator.getStatus();
 
     DurableCatalog::get(opCtx)->updateValidator(
         opCtx, getCatalogId(), validatorDoc, getValidationLevel(), getValidationAction());
 
-    opCtx->recoveryUnit()->onRollback([this,
-                                       oldValidator = std::move(_validator),
-                                       oldValidatorDoc = std::move(_validatorDoc)]() mutable {
+    opCtx->recoveryUnit()->onRollback([this, oldValidator = std::move(_validator)]() mutable {
         this->_validator = std::move(oldValidator);
-        this->_validatorDoc = std::move(oldValidatorDoc);
     });
-    _validator = std::move(statusWithMatcher.getValue());
-    _validatorDoc = std::move(validatorDoc);
+    _validator = std::move(newValidator);
     return Status::OK();
 }
 
@@ -890,8 +1037,11 @@ Status CollectionImpl::setValidationLevel(OperationContext* opCtx, StringData ne
     auto oldValidationLevel = _validationLevel;
     _validationLevel = levelSW.getValue();
 
-    DurableCatalog::get(opCtx)->updateValidator(
-        opCtx, getCatalogId(), _validatorDoc, getValidationLevel(), getValidationAction());
+    DurableCatalog::get(opCtx)->updateValidator(opCtx,
+                                                getCatalogId(),
+                                                _validator.validatorDoc,
+                                                getValidationLevel(),
+                                                getValidationAction());
     opCtx->recoveryUnit()->onRollback(
         [this, oldValidationLevel]() { this->_validationLevel = oldValidationLevel; });
 
@@ -910,8 +1060,11 @@ Status CollectionImpl::setValidationAction(OperationContext* opCtx, StringData n
     _validationAction = actionSW.getValue();
 
 
-    DurableCatalog::get(opCtx)->updateValidator(
-        opCtx, getCatalogId(), _validatorDoc, getValidationLevel(), getValidationAction());
+    DurableCatalog::get(opCtx)->updateValidator(opCtx,
+                                                getCatalogId(),
+                                                _validator.validatorDoc,
+                                                getValidationLevel(),
+                                                getValidationAction());
     opCtx->recoveryUnit()->onRollback(
         [this, oldValidationAction]() { this->_validationAction = oldValidationAction; });
 
@@ -926,25 +1079,22 @@ Status CollectionImpl::updateValidator(OperationContext* opCtx,
 
     opCtx->recoveryUnit()->onRollback([this,
                                        oldValidator = std::move(_validator),
-                                       oldValidatorDoc = std::move(_validatorDoc),
                                        oldValidationLevel = _validationLevel,
                                        oldValidationAction = _validationAction]() mutable {
         this->_validator = std::move(oldValidator);
-        this->_validatorDoc = std::move(oldValidatorDoc);
         this->_validationLevel = oldValidationLevel;
         this->_validationAction = oldValidationAction;
     });
 
     DurableCatalog::get(opCtx)->updateValidator(
         opCtx, getCatalogId(), newValidator, newLevel, newAction);
-    _validatorDoc = std::move(newValidator);
 
-    auto validatorSW =
-        parseValidator(opCtx, _validatorDoc, MatchExpressionParser::kAllowAllSpecialFeatures);
-    if (!validatorSW.isOK()) {
-        return validatorSW.getStatus();
+    auto validator =
+        parseValidator(opCtx, newValidator, MatchExpressionParser::kAllowAllSpecialFeatures);
+    if (!validator.isOK()) {
+        return validator.getStatus();
     }
-    _validator = std::move(validatorSW.getValue());
+    _validator = std::move(validator);
 
     auto levelSW = _parseValidationLevel(newLevel);
     if (!levelSW.isOK()) {

@@ -55,6 +55,7 @@
 #include "mongo/stdx/future.h"
 #include "mongo/unittest/barrier.h"
 #include "mongo/unittest/death_test.h"
+#include "mongo/unittest/log_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/clock_source_mock.h"
 #include "mongo/util/fail_point.h"
@@ -100,14 +101,16 @@ class OpObserverMock : public OpObserverNoop {
 public:
     void onTransactionPrepare(OperationContext* opCtx,
                               const std::vector<OplogSlot>& reservedSlots,
-                              std::vector<repl::ReplOperation>& statements) override;
+                              std::vector<repl::ReplOperation>* statements,
+                              size_t numberOfPreImagesToWrite) override;
 
     bool onTransactionPrepareThrowsException = false;
     bool transactionPrepared = false;
     std::function<void()> onTransactionPrepareFn = []() {};
 
     void onUnpreparedTransactionCommit(OperationContext* opCtx,
-                                       const std::vector<repl::ReplOperation>& statements) override;
+                                       std::vector<repl::ReplOperation>* statements,
+                                       size_t numberOfPreImagesToWrite) override;
     bool onUnpreparedTransactionCommitThrowsException = false;
     bool unpreparedTransactionCommitted = false;
     std::function<void(const std::vector<repl::ReplOperation>&)> onUnpreparedTransactionCommitFn =
@@ -142,9 +145,11 @@ public:
 
 void OpObserverMock::onTransactionPrepare(OperationContext* opCtx,
                                           const std::vector<OplogSlot>& reservedSlots,
-                                          std::vector<repl::ReplOperation>& statements) {
+                                          std::vector<repl::ReplOperation>* statements,
+                                          size_t numberOfPreImagesToWrite) {
     ASSERT_TRUE(opCtx->lockState()->inAWriteUnitOfWork());
-    OpObserverNoop::onTransactionPrepare(opCtx, reservedSlots, statements);
+    OpObserverNoop::onTransactionPrepare(
+        opCtx, reservedSlots, statements, numberOfPreImagesToWrite);
 
     uassert(ErrorCodes::OperationFailed,
             "onTransactionPrepare() failed",
@@ -153,18 +158,19 @@ void OpObserverMock::onTransactionPrepare(OperationContext* opCtx,
     onTransactionPrepareFn();
 }
 
-void OpObserverMock::onUnpreparedTransactionCommit(
-    OperationContext* opCtx, const std::vector<repl::ReplOperation>& statements) {
+void OpObserverMock::onUnpreparedTransactionCommit(OperationContext* opCtx,
+                                                   std::vector<repl::ReplOperation>* statements,
+                                                   size_t numberOfPreImagesToWrite) {
     ASSERT(opCtx->lockState()->inAWriteUnitOfWork());
 
-    OpObserverNoop::onUnpreparedTransactionCommit(opCtx, statements);
+    OpObserverNoop::onUnpreparedTransactionCommit(opCtx, statements, numberOfPreImagesToWrite);
 
     uassert(ErrorCodes::OperationFailed,
             "onUnpreparedTransactionCommit() failed",
             !onUnpreparedTransactionCommitThrowsException);
 
     unpreparedTransactionCommitted = true;
-    onUnpreparedTransactionCommitFn(statements);
+    onUnpreparedTransactionCommitFn(*statements);
 }
 
 void OpObserverMock::onPreparedTransactionCommit(
@@ -310,7 +316,7 @@ protected:
 
     const LogicalSessionId _sessionId{makeLogicalSessionIdForTest()};
     const TxnNumber _txnNumber{20};
-    const OptionalCollectionUUID _uuid = UUID::gen();
+    const UUID _uuid = UUID::gen();
 
     OpObserverMock* _opObserver = nullptr;
 };
@@ -1138,6 +1144,43 @@ TEST_F(TxnParticipantTest, CannotContinueTransactionIfNotPrimary) {
         txnParticipant.beginOrContinue(opCtx(), *opCtx()->getTxnNumber(), false, false),
         AssertionException,
         ErrorCodes::NotMaster);
+}
+
+TEST_F(TxnParticipantTest, OlderTransactionFailsOnSessionWithNewerTransaction) {
+    // Will start the transaction.
+    auto sessionCheckout = checkOutSession();
+    auto txnParticipant = TransactionParticipant::get(opCtx());
+    ASSERT_TRUE(txnParticipant.transactionIsOpen());
+    auto autocommit = false;
+    auto startTransaction = true;
+    const auto& sessionId = *opCtx()->getLogicalSessionId();
+
+    StringBuilder sb;
+    sb << "Cannot start transaction 19 on session " << sessionId
+       << " because a newer transaction with txnNumber 20 has already started on this session.";
+    ASSERT_THROWS_WHAT(txnParticipant.beginOrContinue(
+                           opCtx(), *opCtx()->getTxnNumber() - 1, autocommit, startTransaction),
+                       AssertionException,
+                       sb.str());
+    ASSERT(txnParticipant.getLastWriteOpTime().isNull());
+}
+
+
+TEST_F(TxnParticipantTest, OldRetryableWriteFailsOnSessionWithNewerTransaction) {
+    // Will start the transaction.
+    auto sessionCheckout = checkOutSession();
+    auto txnParticipant = TransactionParticipant::get(opCtx());
+    ASSERT_TRUE(txnParticipant.transactionIsOpen());
+    const auto& sessionId = *opCtx()->getLogicalSessionId();
+
+    StringBuilder sb;
+    sb << "Retryable write with txnNumber 19 is prohibited on session " << sessionId
+       << " because a newer transaction with txnNumber 20 has already started on this session.";
+    ASSERT_THROWS_WHAT(txnParticipant.beginOrContinue(
+                           opCtx(), *opCtx()->getTxnNumber() - 1, boost::none, boost::none),
+                       AssertionException,
+                       sb.str());
+    ASSERT(txnParticipant.getLastWriteOpTime().isNull());
 }
 
 TEST_F(TxnParticipantTest, CannotStartNewTransactionWhilePreparedTransactionInProgress) {
@@ -3280,7 +3323,19 @@ TEST_F(TransactionsMetricsTest, LogTransactionInfoAfterSlowCommit) {
     auto operation = repl::OplogEntry::makeInsertOperation(kNss, _uuid, BSON("TestValue" << 0));
     txnParticipant.addTransactionOperation(opCtx(), operation);
 
+    const auto originalSlowMS = serverGlobalParams.slowMS;
+    const auto originalSampleRate = serverGlobalParams.sampleRate;
+
     serverGlobalParams.slowMS = 10;
+    serverGlobalParams.sampleRate = 1;
+
+    ON_BLOCK_EXIT([originalSlowMS, originalSampleRate] {
+        // serverGlobalParams may have been modified prior to this test, so we set them back to
+        // their default values.
+        serverGlobalParams.slowMS = originalSlowMS;
+        serverGlobalParams.sampleRate = originalSampleRate;
+    });
+
     tickSource->advance(Microseconds(11 * 1000));
 
     startCapturingLogMessages();
@@ -3314,7 +3369,18 @@ TEST_F(TransactionsMetricsTest, LogPreparedTransactionInfoAfterSlowCommit) {
     const int metricValue = 1;
     setupAdditiveMetrics(metricValue, opCtx());
 
+    const auto originalSlowMS = serverGlobalParams.slowMS;
+    const auto originalSampleRate = serverGlobalParams.sampleRate;
+
     serverGlobalParams.slowMS = 10;
+    serverGlobalParams.sampleRate = 1;
+
+    // Reset the global parameters to their original values after this test exits.
+    ON_BLOCK_EXIT([originalSlowMS, originalSampleRate] {
+        serverGlobalParams.slowMS = originalSlowMS;
+        serverGlobalParams.sampleRate = originalSampleRate;
+    });
+
     tickSource->advance(Microseconds(11 * 1000));
 
     txnParticipant.unstashTransactionResources(opCtx(), "commitTransaction");
@@ -3353,7 +3419,18 @@ TEST_F(TransactionsMetricsTest, LogTransactionInfoAfterSlowAbort) {
 
     txnParticipant.unstashTransactionResources(opCtx(), "abortTransaction");
 
+    const auto originalSlowMS = serverGlobalParams.slowMS;
+    const auto originalSampleRate = serverGlobalParams.sampleRate;
+
     serverGlobalParams.slowMS = 10;
+    serverGlobalParams.sampleRate = 1;
+
+    // Reset the global parameters to their original values after this test exits.
+    ON_BLOCK_EXIT([originalSlowMS, originalSampleRate] {
+        serverGlobalParams.slowMS = originalSlowMS;
+        serverGlobalParams.sampleRate = originalSampleRate;
+    });
+
     tickSource->advance(Microseconds(11 * 1000));
 
     startCapturingLogMessages();
@@ -3397,8 +3474,20 @@ TEST_F(TransactionsMetricsTest, LogPreparedTransactionInfoAfterSlowAbort) {
     txnParticipant.unstashTransactionResources(opCtx(), "abortTransaction");
     txnParticipant.prepareTransaction(opCtx(), {});
 
+    const auto originalSlowMS = serverGlobalParams.slowMS;
+    const auto originalSampleRate = serverGlobalParams.sampleRate;
+
     serverGlobalParams.slowMS = 10;
+    serverGlobalParams.sampleRate = 1;
+
+    // Reset the global parameters to their original values after this test exits.
+    ON_BLOCK_EXIT([originalSlowMS, originalSampleRate] {
+        serverGlobalParams.slowMS = originalSlowMS;
+        serverGlobalParams.sampleRate = originalSampleRate;
+    });
+
     tickSource->advance(Microseconds(11 * 1000));
+
     auto prepareOpTime = txnParticipant.getPrepareOpTime();
 
     startCapturingLogMessages();
@@ -3441,7 +3530,19 @@ TEST_F(TransactionsMetricsTest, LogTransactionInfoAfterExceptionInPrepare) {
     setupAdditiveMetrics(metricValue, opCtx());
 
     txnParticipant.unstashTransactionResources(opCtx(), "prepareTransaction");
+
+    const auto originalSlowMS = serverGlobalParams.slowMS;
+    const auto originalSampleRate = serverGlobalParams.sampleRate;
+
     serverGlobalParams.slowMS = 10;
+    serverGlobalParams.sampleRate = 1;
+
+    // Reset the global parameters to their original values after this test exits.
+    ON_BLOCK_EXIT([originalSlowMS, originalSampleRate] {
+        serverGlobalParams.slowMS = originalSlowMS;
+        serverGlobalParams.sampleRate = originalSampleRate;
+    });
+
     tickSource->advance(Microseconds(11 * 1000));
 
     _opObserver->onTransactionPrepareThrowsException = true;
@@ -3496,7 +3597,18 @@ TEST_F(TransactionsMetricsTest, LogTransactionInfoAfterSlowStashedAbort) {
     ASSERT(txnResourceStashLocker);
     const auto lockerInfo = txnResourceStashLocker->getLockerInfo(boost::none);
 
+    const auto originalSlowMS = serverGlobalParams.slowMS;
+    const auto originalSampleRate = serverGlobalParams.sampleRate;
+
     serverGlobalParams.slowMS = 10;
+    serverGlobalParams.sampleRate = 1;
+
+    // Reset the global parameters to their original values after this test exits.
+    ON_BLOCK_EXIT([originalSlowMS, originalSampleRate] {
+        serverGlobalParams.slowMS = originalSlowMS;
+        serverGlobalParams.sampleRate = originalSampleRate;
+    });
+
     tickSource->advance(Microseconds(11 * 1000));
 
     startCapturingLogMessages();
@@ -3507,16 +3619,57 @@ TEST_F(TransactionsMetricsTest, LogTransactionInfoAfterSlowStashedAbort) {
     ASSERT_EQUALS(1, countTextFormatLogLinesContaining(expectedTransactionInfo));
 }
 
+TEST_F(TransactionsMetricsTest, LogTransactionInfoZeroSampleRate) {
+    auto tickSource = initMockTickSource();
+
+    auto sessionCheckout = checkOutSession();
+
+    const auto originalSlowMS = serverGlobalParams.slowMS;
+    const auto originalSampleRate = serverGlobalParams.sampleRate;
+
+    serverGlobalParams.slowMS = 10;
+    // Set the sample rate to 0 to never log this transaction.
+    serverGlobalParams.sampleRate = 0;
+
+    auto txnParticipant = TransactionParticipant::get(opCtx());
+    txnParticipant.unstashTransactionResources(opCtx(), "commitTransaction");
+
+    // Reset the global parameters to their original values after this test exits.
+    ON_BLOCK_EXIT([originalSlowMS, originalSampleRate] {
+        serverGlobalParams.slowMS = originalSlowMS;
+        serverGlobalParams.sampleRate = originalSampleRate;
+    });
+
+    tickSource->advance(Microseconds(11 * 1000));
+
+    startCapturingLogMessages();
+    txnParticipant.commitUnpreparedTransaction(opCtx());
+    stopCapturingLogMessages();
+
+    // Test that the transaction is not logged.
+    ASSERT_EQUALS(0, countTextFormatLogLinesContaining("transaction parameters"));
+}
+
 TEST_F(TransactionsMetricsTest, LogTransactionInfoVerbosityInfo) {
     auto sessionCheckout = checkOutSession();
 
     auto txnParticipant = TransactionParticipant::get(opCtx());
 
+    const auto originalSlowMS = serverGlobalParams.slowMS;
+    const auto originalSampleRate = serverGlobalParams.sampleRate;
+
     // Set a high slow operation threshold to avoid the transaction being logged as slow.
     serverGlobalParams.slowMS = 10000;
+    serverGlobalParams.sampleRate = 1;
+
+    // Reset the global parameters to their original values after this test exits.
+    ON_BLOCK_EXIT([originalSlowMS, originalSampleRate] {
+        serverGlobalParams.slowMS = originalSlowMS;
+        serverGlobalParams.sampleRate = originalSampleRate;
+    });
 
     // Set verbosity level of transaction components to info.
-    setMinimumLoggedSeverity(logger::LogComponent::kTransaction, logger::LogSeverity::Info());
+    setMinimumLoggedSeverity(logv2::LogComponent::kTransaction, logv2::LogSeverity::Info());
 
     txnParticipant.unstashTransactionResources(opCtx(), "commitTransaction");
 
@@ -3533,20 +3686,30 @@ TEST_F(TransactionsMetricsTest, LogTransactionInfoVerbosityDebug) {
 
     auto txnParticipant = TransactionParticipant::get(opCtx());
 
-    // Set a high slow operation threshold to avoid the transaction being logged as slow.
-    serverGlobalParams.slowMS = 10000;
-
     // Set verbosity level of transaction components to debug.
-    setMinimumLoggedSeverity(logger::LogComponent::kTransaction, logger::LogSeverity::Debug(1));
+    setMinimumLoggedSeverity(logv2::LogComponent::kTransaction, logv2::LogSeverity::Debug(1));
 
     txnParticipant.unstashTransactionResources(opCtx(), "commitTransaction");
+
+    const auto originalSlowMS = serverGlobalParams.slowMS;
+    const auto originalSampleRate = serverGlobalParams.sampleRate;
+
+    // Set a high slow operation threshold to avoid the transaction being logged as slow.
+    serverGlobalParams.slowMS = 10000;
+    serverGlobalParams.sampleRate = 1;
+
+    // Reset the global parameters to their original values after this test exits.
+    ON_BLOCK_EXIT([originalSlowMS, originalSampleRate] {
+        serverGlobalParams.slowMS = originalSlowMS;
+        serverGlobalParams.sampleRate = originalSampleRate;
+    });
 
     startCapturingLogMessages();
     txnParticipant.commitUnpreparedTransaction(opCtx());
     stopCapturingLogMessages();
 
     // Reset verbosity level of transaction components.
-    setMinimumLoggedSeverity(logger::LogComponent::kTransaction, logger::LogSeverity::Info());
+    setMinimumLoggedSeverity(logv2::LogComponent::kTransaction, logv2::LogSeverity::Info());
 
     // Test that the transaction is still logged.
     ASSERT_EQUALS(1, countTextFormatLogLinesContaining("transaction parameters"));

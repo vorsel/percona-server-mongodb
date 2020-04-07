@@ -54,6 +54,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/read_write_concern_defaults.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/factory.h"
 #include "mongo/rpc/metadata/client_metadata_ismaster.h"
 #include "mongo/rpc/op_msg_rpc_impls.h"
@@ -62,7 +63,6 @@
 #include "mongo/s/stale_exception.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/invariant.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -134,8 +134,15 @@ const StringMap<int> txnAdminCommands = {{"abortTransaction", 1},
                                          {"coordinateCommitTransaction", 1},
                                          {"prepareTransaction", 1}};
 
+auto getCommandInvocationHooksHandle =
+    ServiceContext::declareDecoration<std::shared_ptr<CommandInvocationHooks>>();
+
 }  // namespace
 
+void CommandInvocationHooks::set(ServiceContext* serviceContext,
+                                 std::shared_ptr<CommandInvocationHooks> hooks) {
+    getCommandInvocationHooksHandle(serviceContext) = std::move(hooks);
+}
 
 //////////////////////////////////////////////////////////////
 // CommandHelpers
@@ -162,6 +169,23 @@ BSONObj CommandHelpers::runCommandDirectly(OperationContext* opCtx, const OpMsgR
         appendCommandStatusNoThrow(body, ex.toStatus());
     }
     return replyBuilder.releaseBody();
+}
+
+void CommandHelpers::runCommandInvocation(OperationContext* opCtx,
+                                          const OpMsgRequest& request,
+                                          CommandInvocation* invocation,
+                                          rpc::ReplyBuilderInterface* response) {
+    auto hooks = getCommandInvocationHooksHandle(opCtx->getServiceContext());
+
+    if (hooks) {
+        hooks->onBeforeRun(opCtx, request, invocation);
+    }
+
+    invocation->run(opCtx, response);
+
+    if (hooks) {
+        hooks->onAfterRun(opCtx, request, invocation);
+    }
 }
 
 void CommandHelpers::auditLogAuthEvent(OperationContext* opCtx,
@@ -327,9 +351,12 @@ void CommandHelpers::appendCommandWCStatus(BSONObjBuilder& result,
     if (!awaitReplicationStatus.isOK() && !result.hasField("writeConcernError")) {
         WriteConcernErrorDetail wcError;
         wcError.setStatus(awaitReplicationStatus);
+        BSONObjBuilder errInfoBuilder;
         if (wcResult.wTimedOut) {
-            wcError.setErrInfo(BSON("wtimeout" << true));
+            errInfoBuilder.append("wtimeout", true);
         }
+        errInfoBuilder.append(kWriteConcernField, wcResult.wcUsed.toBSON());
+        wcError.setErrInfo(errInfoBuilder.obj());
         result.append("writeConcernError", wcError.toBSON());
     }
 }
@@ -455,8 +482,9 @@ void CommandHelpers::canUseTransactions(const NamespaceString& nss,
     auto inTxnWhitelist = txnCmdWhitelist.find(cmdName) != txnCmdWhitelist.cend();
     auto inTxnWhitelistFCV44 = txnCmdWhitelistFCV44.find(cmdName) != txnCmdWhitelistFCV44.cend();
     auto isFullyUpgradedTo44 =
-        (serverGlobalParams.featureCompatibility.getVersion() ==
-         ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44);
+        (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+         serverGlobalParams.featureCompatibility.getVersion() ==
+             ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44);
 
     uassert(ErrorCodes::OperationNotSupportedInTransaction,
             str::stream() << "Cannot run '" << cmdName
@@ -503,7 +531,19 @@ bool CommandHelpers::shouldActivateFailCommandFailPoint(const BSONObj& data,
                                                         const CommandInvocation* invocation,
                                                         Client* client) {
     const Command* cmd = invocation->definition();
-    const NamespaceString& nss = invocation->ns();
+    NamespaceString nss;
+    try {
+        nss = invocation->ns();
+    } catch (const ExceptionFor<ErrorCodes::InvalidNamespace>&) {
+        return false;
+    }
+    return shouldActivateFailCommandFailPoint(data, nss, cmd, client);
+}
+
+bool CommandHelpers::shouldActivateFailCommandFailPoint(const BSONObj& data,
+                                                        const NamespaceString& nss,
+                                                        const Command* cmd,
+                                                        Client* client) {
     if (cmd->getName() == "configureFailPoint"_sd)  // Banned even if in failCommands.
         return false;
 
@@ -540,8 +580,18 @@ bool CommandHelpers::shouldActivateFailCommandFailPoint(const BSONObj& data,
 void CommandHelpers::evaluateFailCommandFailPoint(OperationContext* opCtx,
                                                   const CommandInvocation* invocation) {
     bool closeConnection;
+    bool blockConnection;
     bool hasErrorCode;
-    long long errorCode;
+    /**
+     * Default value is used to suppress the uassert for `errorExtraInfo` if `errorCode` is not set.
+     */
+    long long errorCode = ErrorCodes::OK;
+    bool hasExtraInfo;
+    /**
+     * errorExtraInfo only holds a reference to the BSONElement of the parent object (data).
+     * The copy constructor of BSONObj handles cloning to keep references valid outside the scope.
+     */
+    BSONElement errorExtraInfo;
     const Command* cmd = invocation->definition();
     failCommand.executeIf(
         [&](const BSONObj& data) {
@@ -556,15 +606,50 @@ void CommandHelpers::evaluateFailCommandFailPoint(OperationContext* opCtx,
 
             if (closeConnection) {
                 opCtx->getClient()->session()->end();
-                log() << "Failing command '" << cmd->getName()
-                      << "' via 'failCommand' failpoint. Action: closing connection.";
+                LOGV2(20431,
+                      "Failing command '{cmd_getName}' via 'failCommand' failpoint. Action: "
+                      "closing connection.",
+                      "cmd_getName"_attr = cmd->getName());
                 uasserted(50985, "Failing command due to 'failCommand' failpoint");
             }
 
-            if (hasErrorCode) {
-                log() << "Failing command '" << cmd->getName()
-                      << "' via 'failCommand' failpoint. Action: returning error code " << errorCode
-                      << ".";
+            if (blockConnection) {
+                long long blockTimeMS = 0;
+                uassert(ErrorCodes::InvalidOptions,
+                        "must specify 'blockTimeMS' when 'blockConnection' is true",
+                        data.hasField("blockTimeMS") &&
+                            bsonExtractIntegerField(data, "blockTimeMS", &blockTimeMS).isOK());
+                uassert(ErrorCodes::InvalidOptions,
+                        "'blockTimeMS' must be non-negative",
+                        blockTimeMS >= 0);
+
+                LOGV2(20432,
+                      "Blocking command '{cmd_getName}' via 'failCommand' failpoint for "
+                      "{blockTimeMS} milliseconds",
+                      "cmd_getName"_attr = cmd->getName(),
+                      "blockTimeMS"_attr = blockTimeMS);
+                opCtx->sleepFor(Milliseconds{blockTimeMS});
+                LOGV2(20433,
+                      "Unblocking command '{cmd_getName}' via 'failCommand' failpoint",
+                      "cmd_getName"_attr = cmd->getName());
+            }
+
+            if (hasExtraInfo) {
+                LOGV2(20434,
+                      "Failing command '{cmd_getName}' via 'failCommand' failpoint. Action: "
+                      "returning error code {errorCode} and {errorExtraInfo}.",
+                      "cmd_getName"_attr = cmd->getName(),
+                      "errorCode"_attr = errorCode,
+                      "errorExtraInfo"_attr = errorExtraInfo);
+                uassertStatusOK(Status(ErrorCodes::Error(errorCode),
+                                       "Failing command due to 'failCommand' failpoint",
+                                       errorExtraInfo.Obj()));
+            } else if (hasErrorCode) {
+                LOGV2(20435,
+                      "Failing command '{cmd_getName}' via 'failCommand' failpoint. Action: "
+                      "returning error code {errorCode}.",
+                      "cmd_getName"_attr = cmd->getName(),
+                      "errorCode"_attr = errorCode);
                 uasserted(ErrorCodes::Error(errorCode),
                           "Failing command due to 'failCommand' failpoint");
             }
@@ -575,8 +660,14 @@ void CommandHelpers::evaluateFailCommandFailPoint(OperationContext* opCtx,
                 closeConnection;
             hasErrorCode = data.hasField("errorCode") &&
                 bsonExtractIntegerField(data, "errorCode", &errorCode).isOK();
+            hasExtraInfo = data.hasField("errorExtraInfo") &&
+                bsonExtractTypedField(data, "errorExtraInfo", BSONType::Object, &errorExtraInfo)
+                    .isOK();
+            blockConnection = data.hasField("blockConnection") &&
+                bsonExtractBooleanField(data, "blockConnection", &blockConnection).isOK() &&
+                blockConnection;
             return shouldActivateFailCommandFailPoint(data, invocation, opCtx->getClient()) &&
-                (closeConnection || hasErrorCode);
+                (closeConnection || blockConnection || hasErrorCode);
         });
 }
 
@@ -599,8 +690,25 @@ void CommandHelpers::handleMarkKillOnClientDisconnect(OperationContext* opCtx,
         });
 }
 
+namespace {
+// We store the CommandInvocation as a shared_ptr on the OperationContext in case we need to persist
+// the invocation past the lifetime of the op. If so, this shared_ptr can be copied off to another
+// thread. If not, there is only one shared_ptr and the invocation goes out of scope when the op
+// ends.
+auto invocationForOpCtx = OperationContext::declareDecoration<std::shared_ptr<CommandInvocation>>();
+}  // namespace
+
 //////////////////////////////////////////////////////////////
 // CommandInvocation
+
+void CommandInvocation::set(OperationContext* opCtx,
+                            std::shared_ptr<CommandInvocation> invocation) {
+    invocationForOpCtx(opCtx) = std::move(invocation);
+}
+
+std::shared_ptr<CommandInvocation> CommandInvocation::get(OperationContext* opCtx) {
+    return invocationForOpCtx(opCtx);
+}
 
 CommandInvocation::~CommandInvocation() = default;
 
@@ -626,7 +734,10 @@ void CommandInvocation::checkAuthorization(OperationContext* opCtx,
             }
         }
     } catch (const DBException& e) {
-        log(LogComponent::kAccessControl) << e.toStatus();
+        LOGV2_OPTIONS(20436,
+                      {logComponentV1toV2(LogComponent::kAccessControl)},
+                      "{e_toStatus}",
+                      "e_toStatus"_attr = e.toStatus());
         CommandHelpers::auditLogAuthEvent(opCtx, this, request, e.code());
         throw;
     }
@@ -643,13 +754,13 @@ public:
                BasicCommandWithReplyBuilderInterface* command)
         : CommandInvocation(command),
           _command(command),
-          _request(&request),
-          _dbName(_request->getDatabase().toString()) {}
+          _request(request),
+          _dbName(_request.getDatabase().toString()) {}
 
 private:
     void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* result) override {
-        opCtx->lockState()->setDebugInfo(redact(_request->body));
-        bool ok = _command->runWithReplyBuilder(opCtx, _dbName, _request->body, result);
+        opCtx->lockState()->setDebugInfo(redact(_request.body).toString());
+        bool ok = _command->runWithReplyBuilder(opCtx, _dbName, _request.body, result);
         if (!ok) {
             BSONObjBuilder bob = result->getBodyBuilder();
             CommandHelpers::appendSimpleCommandStatus(bob, ok);
@@ -659,7 +770,7 @@ private:
     void explain(OperationContext* opCtx,
                  ExplainOptions::Verbosity verbosity,
                  rpc::ReplyBuilderInterface* result) override {
-        uassertStatusOK(_command->explain(opCtx, *_request, verbosity, result));
+        uassertStatusOK(_command->explain(opCtx, _request, verbosity, result));
     }
 
     NamespaceString ns() const override {
@@ -674,6 +785,15 @@ private:
         return _command->supportsReadConcern(cmdObj(), level);
     }
 
+    bool supportsReadMirroring() const override {
+        return _command->supportsReadMirroring(cmdObj());
+    }
+
+    void appendMirrorableRequest(BSONObjBuilder* bob) const override {
+        invariant(cmdObj().isOwned());
+        _command->appendMirrorableRequest(bob, cmdObj());
+    }
+
     bool allowsAfterClusterTime() const override {
         return _command->allowsAfterClusterTime(cmdObj());
     }
@@ -684,15 +804,15 @@ private:
 
     void doCheckAuthorization(OperationContext* opCtx) const override {
         uassertStatusOK(_command->checkAuthForOperation(
-            opCtx, _request->getDatabase().toString(), _request->body));
+            opCtx, _request.getDatabase().toString(), _request.body));
     }
 
     const BSONObj& cmdObj() const {
-        return _request->body;
+        return _request.body;
     }
 
     BasicCommandWithReplyBuilderInterface* const _command;
-    const OpMsgRequest* const _request;
+    const OpMsgRequest _request;
     const std::string _dbName;
 };
 

@@ -51,6 +51,7 @@
 #include "mongo/client/dbclient_base.h"
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/db/hasher.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/platform/random.h"
 #include "mongo/scripting/engine.h"
@@ -59,7 +60,6 @@
 #include "mongo/shell/shell_utils_extended.h"
 #include "mongo/shell/shell_utils_launcher.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/text.h"
@@ -413,7 +413,7 @@ BSONObj replMonitorStats(const BSONObj& a, void* data) {
             a.nFields() == 1 && a.firstElement().type() == String);
 
     auto name = a.firstElement().valuestrsafe();
-    ReplicaSetMonitorPtr rsm = ReplicaSetMonitor::get(name);
+    auto rsm = ReplicaSetMonitor::get(name);
     if (!rsm) {
         return BSON(""
                     << "no ReplSetMonitor exists by that name");
@@ -582,20 +582,20 @@ void ConnectionRegistry::killOperationsOnAllConnections(bool withPrompt) const {
             if (auto elem = op["client"]) {
                 // mongod currentOp client
                 if (elem.type() != String) {
-                    warning() << "Ignoring operation " << op["opid"].toString(false)
+                    std::cout << "Ignoring operation " << op["opid"].toString(false)
                               << "; expected 'client' field in currentOp response to have type "
                                  "string, but found "
-                              << typeName(elem.type());
+                              << typeName(elem.type()) << std::endl;
                     continue;
                 }
                 client = elem.str();
             } else if (auto elem = op["client_s"]) {
                 // mongos currentOp client
                 if (elem.type() != String) {
-                    warning() << "Ignoring operation " << op["opid"].toString(false)
+                    std::cout << "Ignoring operation " << op["opid"].toString(false)
                               << "; expected 'client_s' field in currentOp response to have type "
                                  "string, but found "
-                              << typeName(elem.type());
+                              << typeName(elem.type()) << std::endl;
                     continue;
                 }
                 client = elem.str();

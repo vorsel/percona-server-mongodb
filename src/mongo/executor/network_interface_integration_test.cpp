@@ -46,11 +46,11 @@
 #include "mongo/rpc/factory.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/message.h"
+#include "mongo/rpc/topology_version_gen.h"
 #include "mongo/stdx/future.h"
 #include "mongo/unittest/integration_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -149,6 +149,9 @@ BSONObj objConcat(std::initializer_list<BSONObj> objs) {
 
 class NetworkInterfaceTest : public NetworkInterfaceIntegrationFixture {
 public:
+    constexpr static Milliseconds kNoTimeout = RemoteCommandRequest::kNoTimeout;
+    constexpr static Milliseconds kMaxWait = Milliseconds(Minutes(1));
+
     void assertNumOps(uint64_t canceled, uint64_t timedOut, uint64_t failed, uint64_t succeeded) {
         auto counters = net().getCounters();
         ASSERT_EQ(canceled, counters.canceled);
@@ -162,18 +165,29 @@ public:
         startNet(std::make_unique<WaitForIsMasterHook>(this));
     }
 
-    RemoteCommandRequest makeTestCommand(boost::optional<Milliseconds> timeout = boost::none,
-                                         BSONObj cmd = BSON("echo" << 1 << "foo"
-                                                                   << "bar"),
-                                         OperationContext* opCtx = nullptr) {
+    RemoteCommandRequest makeTestCommand(
+        Milliseconds timeout,
+        BSONObj cmd,
+        OperationContext* opCtx = nullptr,
+        boost::optional<RemoteCommandRequest::HedgeOptions> hedgeOptions = boost::none,
+        RemoteCommandRequest::FireAndForgetMode fireAndForgetMode =
+            RemoteCommandRequest::FireAndForgetMode::kOff) {
         auto cs = fixture();
         return RemoteCommandRequest(cs.getServers().front(),
                                     "admin",
                                     std::move(cmd),
                                     BSONObj(),
                                     opCtx,
-                                    timeout ? *timeout : RemoteCommandRequest::kNoTimeout);
+                                    timeout,
+                                    hedgeOptions,
+                                    fireAndForgetMode);
     }
+
+    BSONObj makeEchoCmdObj() {
+        return BSON("echo" << 1 << "foo"
+                           << "bar");
+    }
+
 
     struct IsMasterData {
         BSONObj request;
@@ -228,16 +242,14 @@ TEST_F(NetworkInterfaceTest, CancelMissingOperation) {
     assertNumOps(0u, 0u, 0u, 0u);
 }
 
-constexpr auto kMaxWait = Milliseconds(Minutes(1));
-
 TEST_F(NetworkInterfaceTest, CancelOperation) {
     auto cbh = makeCallbackHandle();
 
     auto deferred = [&] {
         // Kick off our operation
-        FailPointEnableBlock fpb("networkInterfaceDiscardCommandsAfterAcquireConn");
+        FailPointEnableBlock fpb("networkInterfaceHangCommandsAfterAcquireConn");
 
-        auto deferred = runCommand(cbh, makeTestCommand(kMaxWait));
+        auto deferred = runCommand(cbh, makeTestCommand(kMaxWait, makeEchoCmdObj()));
 
         waitForIsMaster();
 
@@ -256,6 +268,112 @@ TEST_F(NetworkInterfaceTest, CancelOperation) {
     assertNumOps(1u, 0u, 0u, 0u);
 }
 
+TEST_F(NetworkInterfaceTest, CancelRemotely) {
+    // Enable blockConnection for "echo".
+    assertCommandOK("admin",
+                    BSON("configureFailPoint"
+                         << "failCommand"
+                         << "mode"
+                         << "alwaysOn"
+                         << "data"
+                         << BSON("blockConnection" << true << "blockTimeMS" << 1000000000
+                                                   << "failCommands" << BSON_ARRAY("echo"))),
+                    kNoTimeout);
+
+    ON_BLOCK_EXIT([&] {
+        // Disable blockConnection.
+        assertCommandOK("admin",
+                        BSON("configureFailPoint"
+                             << "failCommand"
+                             << "mode"
+                             << "off"),
+                        kNoTimeout);
+    });
+
+    auto cbh = makeCallbackHandle();
+    auto deferred = [&] {
+        // Kick off an "echo" operation, which should block until cancelCommand causes
+        // the operation to be killed.
+        FailPointEnableBlock fpb("networkInterfaceAfterAcquireConn");
+
+        auto deferred = runCommand(cbh,
+                                   makeTestCommand(kNoTimeout,
+                                                   makeEchoCmdObj(),
+                                                   nullptr /* opCtx */,
+                                                   RemoteCommandRequest::HedgeOptions()));
+
+        fpb->waitForTimesEntered(fpb.initialTimesEntered() + 1);
+
+        // Run cancelCommand to kill the above operation.
+        net().cancelCommand(cbh);
+
+        return deferred;
+    }();
+
+    // Wait for the operation to complete, assert that it was canceled.
+    auto result = deferred.get();
+    ASSERT_EQ(ErrorCodes::CallbackCanceled, result.status);
+    ASSERT(result.elapsedMillis);
+
+    // We have one canceled operation (echo) and two succeeded operations (configureFailPoint
+    // and _killOperations).
+    assertNumOps(1u, 0u, 0u, 2u);
+}
+
+TEST_F(NetworkInterfaceTest, CancelRemotelyTimedOut) {
+    // Enable blockConnection for "echo" and "_killOperations".
+    assertCommandOK("admin",
+                    BSON("configureFailPoint"
+                         << "failCommand"
+                         << "mode"
+                         << "alwaysOn"
+                         << "data"
+                         << BSON("blockConnection" << true << "blockTimeMS" << 5000
+                                                   << "failCommands"
+                                                   << BSON_ARRAY("echo"
+                                                                 << "_killOperations"))),
+                    kNoTimeout);
+
+    ON_BLOCK_EXIT([&] {
+        // Disable blockConnection.
+        assertCommandOK("admin",
+                        BSON("configureFailPoint"
+                             << "failCommand"
+                             << "mode"
+                             << "off"),
+                        kNoTimeout);
+    });
+
+    auto cbh = makeCallbackHandle();
+    auto deferred = [&] {
+        // Kick off a blocking "echo" operation.
+        FailPointEnableBlock fpb("networkInterfaceAfterAcquireConn");
+
+        auto deferred = runCommand(cbh,
+                                   makeTestCommand(kNoTimeout,
+                                                   makeEchoCmdObj(),
+                                                   nullptr /* opCtx */,
+                                                   RemoteCommandRequest::HedgeOptions()));
+
+        fpb->waitForTimesEntered(fpb.initialTimesEntered() + 1);
+
+        // Run cancelCommand to kill the above operation. _killOperations is expected to block and
+        // time out, and the cancel timer is expected to cancel the operations.
+        net().cancelCommand(cbh);
+
+        return deferred;
+    }();
+
+    // Wait for op to complete, assert that it was canceled.
+    auto result = deferred.get();
+    ASSERT_EQ(ErrorCodes::NetworkInterfaceExceededTimeLimit, result.status);
+    ASSERT(result.elapsedMillis);
+
+    // We have two timedout operations (echo and _killOperations), and one succeeded operation
+    // (configureFailPoint).
+    assertNumOps(0u, 2u, 0u, 1u);
+}
+
 TEST_F(NetworkInterfaceTest, ImmediateCancel) {
     auto cbh = makeCallbackHandle();
 
@@ -263,7 +381,7 @@ TEST_F(NetworkInterfaceTest, ImmediateCancel) {
         // Kick off our operation
         FailPointEnableBlock fpb("networkInterfaceDiscardCommandsBeforeAcquireConn");
 
-        auto deferred = runCommand(cbh, makeTestCommand(kMaxWait));
+        auto deferred = runCommand(cbh, makeTestCommand(kMaxWait, makeEchoCmdObj()));
 
         fpb->waitForTimesEntered(fpb.initialTimesEntered() + 1);
 
@@ -284,7 +402,7 @@ TEST_F(NetworkInterfaceTest, ImmediateCancel) {
 TEST_F(NetworkInterfaceTest, LateCancel) {
     auto cbh = makeCallbackHandle();
 
-    auto deferred = runCommand(cbh, makeTestCommand(kMaxWait));
+    auto deferred = runCommand(cbh, makeTestCommand(kMaxWait, makeEchoCmdObj()));
 
     // Wait for op to complete, assert that it was canceled.
     auto result = deferred.get();
@@ -298,7 +416,7 @@ TEST_F(NetworkInterfaceTest, LateCancel) {
 TEST_F(NetworkInterfaceTest, AsyncOpTimeout) {
     // Kick off operation
     auto cb = makeCallbackHandle();
-    auto request = makeTestCommand(Milliseconds{1000});
+    auto request = makeTestCommand(Milliseconds{1000}, makeEchoCmdObj());
     request.cmdObj = BSON("sleep" << 1 << "lock"
                                   << "none"
                                   << "secs" << 1000000000);
@@ -393,19 +511,8 @@ TEST_F(NetworkInterfaceTest, AsyncOpTimeoutWithOpCtxDeadlineLater) {
 }
 
 TEST_F(NetworkInterfaceTest, StartCommand) {
-    auto commandRequest = BSON("echo" << 1 << "boop"
-                                      << "bop");
-
-    // This opmsg request expect the following reply, which is generated below
-    // { echo: { echo: 1, boop: "bop", $db: "admin" }, ok: 1.0 }
-    auto expectedCommandReply = [&] {
-        BSONObjBuilder echoed;
-        echoed.appendElements(commandRequest);
-        echoed << "$db"
-               << "admin";
-        return echoed.obj();
-    }();
-    auto request = makeTestCommand(boost::none, commandRequest);
+    auto request = makeTestCommand(
+        kNoTimeout, makeEchoCmdObj(), nullptr /* opCtx */, RemoteCommandRequest::HedgeOptions());
 
     auto deferred = runCommand(makeCallbackHandle(), std::move(request));
 
@@ -413,8 +520,93 @@ TEST_F(NetworkInterfaceTest, StartCommand) {
 
     ASSERT(res.elapsedMillis);
     uassertStatusOK(res.status);
-    ASSERT_BSONOBJ_EQ(res.data.getObjectField("echo"), expectedCommandReply);
-    ASSERT_EQ(res.data.getIntField("ok"), 1);
+
+    // This opmsg request expect the following reply, which is generated below
+    // { echo: { echo: 1, foo: "bar", clientOperationKey: uuid, $db: "admin" }, ok: 1.0 }
+    auto cmdObj = res.data.getObjectField("echo");
+    ASSERT_EQ(1, cmdObj.getIntField("echo"));
+    ASSERT_EQ("bar"_sd, cmdObj.getStringField("foo"));
+    ASSERT_EQ("admin"_sd, cmdObj.getStringField("$db"));
+    ASSERT_FALSE(cmdObj["clientOperationKey"].eoo());
+    ASSERT_EQ(1, res.data.getIntField("ok"));
+    assertNumOps(0u, 0u, 0u, 1u);
+}
+
+TEST_F(NetworkInterfaceTest, FireAndForget) {
+    assertCommandOK("admin",
+                    BSON("configureFailPoint"
+                         << "failCommand"
+                         << "mode"
+                         << "alwaysOn"
+                         << "data"
+                         << BSON("errorCode" << ErrorCodes::CommandFailed << "failCommands"
+                                             << BSON_ARRAY("echo"))));
+
+    ON_BLOCK_EXIT([&] {
+        assertCommandOK("admin",
+                        BSON("configureFailPoint"
+                             << "failCommand"
+                             << "mode"
+                             << "off"));
+    });
+
+    // Run fireAndForget commands and verify that we get status OK responses.
+    const int numFireAndForgetRequests = 3;
+    std::vector<Future<RemoteCommandResponse>> futures;
+
+    for (int i = 0; i < numFireAndForgetRequests; i++) {
+        auto cbh = makeCallbackHandle();
+        auto fireAndForgetRequest = makeTestCommand(kNoTimeout,
+                                                    makeEchoCmdObj(),
+                                                    nullptr /* opCtx */,
+                                                    boost::none /* hedgeOptions */,
+                                                    RemoteCommandRequest::FireAndForgetMode::kOn);
+        futures.push_back(runCommand(cbh, fireAndForgetRequest));
+    }
+
+    for (auto& future : futures) {
+        auto result = future.get();
+        ASSERT(result.elapsedMillis);
+        uassertStatusOK(result.status);
+        ASSERT_EQ(1, result.data.getIntField("ok"));
+    }
+
+    // Run a non-fireAndForget command and verify that we get a CommandFailed response.
+    auto nonFireAndForgetRequest = makeTestCommand(kNoTimeout, makeEchoCmdObj());
+    auto result = runCommandSync(nonFireAndForgetRequest);
+    ASSERT(result.elapsedMillis);
+    uassertStatusOK(result.status);
+    ASSERT_EQ(0, result.data.getIntField("ok"));
+    ASSERT_EQ(ErrorCodes::CommandFailed, result.data.getIntField("code"));
+    assertNumOps(0u, 0u, 0u, 5u);
+}
+
+TEST_F(NetworkInterfaceTest, StartCommandOnAny) {
+    auto commandRequest = makeEchoCmdObj();
+    auto request = [&] {
+        auto cs = fixture();
+        RemoteCommandRequestBase::HedgeOptions ho;
+        ho.count = 1;
+
+        return RemoteCommandRequestOnAny({cs.getServers()},
+                                         "admin",
+                                         std::move(commandRequest),
+                                         BSONObj(),
+                                         nullptr,
+                                         RemoteCommandRequest::kNoTimeout,
+                                         ho);
+    }();
+
+    auto deferred = runCommandOnAny(makeCallbackHandle(), std::move(request));
+    auto res = deferred.get();
+
+    auto cmdObj = res.data.getObjectField("echo");
+    uassertStatusOK(res.status);
+    ASSERT_EQ(1, cmdObj.getIntField("echo"));
+    ASSERT_EQ("bar"_sd, cmdObj.getStringField("foo"));
+    ASSERT_EQ("admin"_sd, cmdObj.getStringField("$db"));
+    ASSERT_FALSE(cmdObj["clientOperationKey"].eoo());
+    ASSERT_EQ(1, res.data.getIntField("ok"));
     assertNumOps(0u, 0u, 0u, 1u);
 }
 
@@ -453,7 +645,7 @@ TEST_F(NetworkInterfaceTest, SetAlarm) {
 TEST_F(NetworkInterfaceTest, IsMasterRequestContainsOutgoingWireVersionInternalClientInfo) {
     WireSpec::instance().isInternalClient = true;
 
-    auto deferred = runCommand(makeCallbackHandle(), makeTestCommand());
+    auto deferred = runCommand(makeCallbackHandle(), makeTestCommand(kNoTimeout, makeEchoCmdObj()));
     auto isMasterHandshake = waitForIsMaster();
 
     // Verify that the isMaster reply has the expected internalClient data.
@@ -475,7 +667,7 @@ TEST_F(NetworkInterfaceTest, IsMasterRequestContainsOutgoingWireVersionInternalC
 TEST_F(NetworkInterfaceTest, IsMasterRequestMissingInternalClientInfoWhenNotInternalClient) {
     WireSpec::instance().isInternalClient = false;
 
-    auto deferred = runCommand(makeCallbackHandle(), makeTestCommand());
+    auto deferred = runCommand(makeCallbackHandle(), makeTestCommand(kNoTimeout, makeEchoCmdObj()));
     auto isMasterHandshake = waitForIsMaster();
 
     // Verify that the isMaster reply has the expected internalClient data.
@@ -484,6 +676,139 @@ TEST_F(NetworkInterfaceTest, IsMasterRequestMissingInternalClientInfoWhenNotInte
     auto res = deferred.get();
     ASSERT(res.elapsedMillis);
     assertNumOps(0u, 0u, 0u, 1u);
+}
+
+class ExhaustRequestHandlerUtil {
+public:
+    struct responseOutcomeCount {
+        int _success = 0;
+        int _failed = 0;
+    };
+
+    std::function<void(const RemoteCommandResponse&)>&& getExhaustRequestCallbackFn() {
+        return std::move(_callbackFn);
+    }
+
+    ExhaustRequestHandlerUtil::responseOutcomeCount getCountersWhenReady() {
+        stdx::unique_lock<Latch> lk(_mutex);
+        _cv.wait(_mutex, [&] { return _replyUpdated; });
+        _replyUpdated = false;
+        return _responseOutcomeCount;
+    }
+
+private:
+    // set to true once '_responseOutcomeCount' has been updated. Used to indicate that a new
+    // response has been sent.
+    bool _replyUpdated = false;
+
+    // counter of how many successful and failed responses were received.
+    responseOutcomeCount _responseOutcomeCount;
+
+    Mutex _mutex = MONGO_MAKE_LATCH("ExhaustRequestHandlerUtil::_mutex");
+    stdx::condition_variable _cv;
+
+    // called when a server sends a new isMaster exhaust response. Updates _responseOutcomeCount
+    // and _replyUpdated.
+    std::function<void(const RemoteCommandResponse&)> _callbackFn =
+        [&](const executor::RemoteCommandResponse& response) {
+            {
+                stdx::unique_lock<Latch> lk(_mutex);
+                if (response.status.isOK()) {
+                    _responseOutcomeCount._success++;
+                } else {
+                    _responseOutcomeCount._failed++;
+                }
+                _replyUpdated = true;
+            }
+
+            _cv.notify_all();
+        };
+};
+
+TEST_F(NetworkInterfaceTest, StartExhaustCommandShouldReceiveMultipleResponses) {
+    auto isMasterCmd = BSON("isMaster" << 1 << "maxAwaitTimeMS" << 1000 << "topologyVersion"
+                                       << TopologyVersion(OID::max(), 0).toBSON());
+
+    auto request = makeTestCommand(kNoTimeout, isMasterCmd);
+    auto cbh = makeCallbackHandle();
+    ExhaustRequestHandlerUtil exhaustRequestHandler;
+
+    auto exhaustFuture = startExhaustCommand(
+        cbh, std::move(request), exhaustRequestHandler.getExhaustRequestCallbackFn());
+
+    {
+        // The server sends a response either when a topology change occurs or when it has not sent
+        // a response in 'maxAwaitTimeMS'. In this case we expect a response every 'maxAwaitTimeMS'
+        // = 1000 (set in the isMaster cmd above)
+        auto counters = exhaustRequestHandler.getCountersWhenReady();
+        ASSERT(!exhaustFuture.isReady());
+
+        // The first response should be successful
+        ASSERT_EQ(counters._success, 1);
+        ASSERT_EQ(counters._failed, 0);
+    }
+
+    {
+        auto counters = exhaustRequestHandler.getCountersWhenReady();
+        ASSERT(!exhaustFuture.isReady());
+
+        // The second response should also be successful
+        ASSERT_EQ(counters._success, 2);
+        ASSERT_EQ(counters._failed, 0);
+    }
+
+    net().cancelCommand(cbh);
+    auto error = exhaustFuture.getNoThrow();
+    ASSERT((error == ErrorCodes::CallbackCanceled) || (error == ErrorCodes::HostUnreachable));
+
+    auto counters = exhaustRequestHandler.getCountersWhenReady();
+
+    // The command was cancelled so the 'fail' counter should be incremented
+    ASSERT_EQ(counters._success, 2);
+    ASSERT_EQ(counters._failed, 1);
+}
+
+TEST_F(NetworkInterfaceTest, StartExhaustCommandShouldStopOnFailure) {
+    // Both assetCommandOK and makeTestCommand target the first host in the connection string, so we
+    // are guaranteed that the failpoint is set on the same host that we run the exhaust command on.
+    auto configureFailpointCmd = BSON("configureFailPoint"
+                                      << "failCommand"
+                                      << "mode"
+                                      << "alwaysOn"
+                                      << "data"
+                                      << BSON("errorCode" << ErrorCodes::CommandFailed
+                                                          << "failCommands"
+                                                          << BSON_ARRAY("isMaster")));
+    assertCommandOK("admin", configureFailpointCmd);
+
+    ON_BLOCK_EXIT([&] {
+        auto stopFpRequest = BSON("configureFailPoint"
+                                  << "failCommand"
+                                  << "mode"
+                                  << "off");
+        assertCommandOK("admin", stopFpRequest);
+    });
+
+    auto isMasterCmd = BSON("isMaster" << 1 << "maxAwaitTimeMS" << 1000 << "topologyVersion"
+                                       << TopologyVersion(OID::max(), 0).toBSON());
+
+    auto request = makeTestCommand(kNoTimeout, isMasterCmd);
+    auto cbh = makeCallbackHandle();
+    ExhaustRequestHandlerUtil exhaustRequestHandler;
+
+    auto exhaustFuture = startExhaustCommand(
+        cbh, std::move(request), exhaustRequestHandler.getExhaustRequestCallbackFn());
+
+    {
+        auto counters = exhaustRequestHandler.getCountersWhenReady();
+
+        auto error = exhaustFuture.getNoThrow();
+        ASSERT_EQ(error, ErrorCodes::CommandFailed);
+
+        // The response should be marked as failed
+        ASSERT_EQ(counters._success, 0);
+        ASSERT_EQ(counters._failed, 1);
+    }
 }
 
 }  // namespace

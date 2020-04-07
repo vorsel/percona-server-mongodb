@@ -170,12 +170,11 @@ public:
         std::abort();
     }
 
-    StatusWithMatchExpression parseValidator(
-        OperationContext* opCtx,
-        const BSONObj& validator,
-        MatchExpressionParser::AllowedFeatureSet allowedFeatures,
-        boost::optional<ServerGlobalParams::FeatureCompatibility::Version>
-            maxFeatureCompatibilityVersion) const {
+    Validator parseValidator(OperationContext* opCtx,
+                             const BSONObj& validator,
+                             MatchExpressionParser::AllowedFeatureSet allowedFeatures,
+                             boost::optional<ServerGlobalParams::FeatureCompatibility::Version>
+                                 maxFeatureCompatibilityVersion) const {
         std::abort();
     }
 
@@ -208,6 +207,14 @@ public:
         std::abort();
     }
 
+    bool getRecordPreImages() const {
+        std::abort();
+    }
+
+    void setRecordPreImages(OperationContext* opCtx, bool val) {
+        std::abort();
+    }
+
     bool isCapped() const {
         std::abort();
     }
@@ -225,6 +232,10 @@ public:
     }
 
     uint64_t dataSize(OperationContext* opCtx) const {
+        std::abort();
+    }
+
+    bool isEmpty(OperationContext* opCtx) const {
         std::abort();
     }
 

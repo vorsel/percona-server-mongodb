@@ -47,7 +47,6 @@
 #include "mongo/db/query/view_response_formatter.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/views/resolved_view.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -93,6 +92,10 @@ public:
     ReadConcernSupportResult supportsReadConcern(const BSONObj& cmdObj,
                                                  repl::ReadConcernLevel level) const override {
         return ReadConcernSupportResult::allSupportedAndDefaultPermitted();
+    }
+
+    bool supportsReadMirroring(const BSONObj&) const override {
+        return true;
     }
 
     ReadWriteType getReadWriteType() const override {
@@ -167,8 +170,11 @@ public:
         // version on initial entry into count.
         auto rangePreserver = CollectionShardingState::get(opCtx, nss)->getCurrentMetadata();
 
+        auto expCtx = makeExpressionContextForGetExecutor(
+            opCtx, request.getCollation().value_or(BSONObj()), nss);
+
         auto statusWithPlanExecutor =
-            getExecutorCount(opCtx, collection, request, true /*explain*/, nss);
+            getExecutorCount(expCtx, collection, request, true /*explain*/, nss);
         if (!statusWithPlanExecutor.isOK()) {
             return statusWithPlanExecutor.getStatus();
         }
@@ -225,7 +231,12 @@ public:
         auto rangePreserver = CollectionShardingState::get(opCtx, nss)->getCurrentMetadata();
 
         auto statusWithPlanExecutor =
-            getExecutorCount(opCtx, collection, request, false /*explain*/, nss);
+            getExecutorCount(makeExpressionContextForGetExecutor(
+                                 opCtx, request.getCollation().value_or(BSONObj()), nss),
+                             collection,
+                             request,
+                             false /*explain*/,
+                             nss);
         uassertStatusOK(statusWithPlanExecutor.getStatus());
 
         auto exec = std::move(statusWithPlanExecutor.getValue());
@@ -260,6 +271,24 @@ public:
 
         result.appendNumber("n", countStats->nCounted);
         return true;
+    }
+
+    void appendMirrorableRequest(BSONObjBuilder* bob, const BSONObj& cmdObj) const override {
+        static const auto kMirrorableKeys = [] {
+            BSONObjBuilder keyBob;
+
+            keyBob.append("count", 1);
+            keyBob.append("query", 1);
+            keyBob.append("skip", 1);
+            keyBob.append("limit", 1);
+            keyBob.append("hint", 1);
+            keyBob.append("collation", 1);
+
+            return keyBob.obj();
+        }();
+
+        // Filter the keys that can be mirrored
+        cmdObj.filterFieldsUndotted(bob, kMirrorableKeys, true);
     }
 
 } cmdCount;

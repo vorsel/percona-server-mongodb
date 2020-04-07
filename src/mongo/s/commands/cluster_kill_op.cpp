@@ -42,11 +42,11 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/kill_op_cmd_base.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/metadata.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -93,7 +93,7 @@ private:
                     (opSepPos != (opToKill.size() - 1)));  // can't be NN:
 
         auto shardIdent = opToKill.substr(0, opSepPos);
-        log() << "want to kill op: " << redact(opToKill);
+        LOGV2(22754, "want to kill op: {opToKill}", "opToKill"_attr = redact(opToKill));
 
         // Will throw if shard id is not found
         auto shardStatus = Grid::get(opCtx)->shardRegistry()->getShard(opCtx, shardIdent);

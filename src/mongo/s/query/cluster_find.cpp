@@ -51,6 +51,7 @@
 #include "mongo/db/query/getmore_request.h"
 #include "mongo/db/query/query_planner_common.h"
 #include "mongo/executor/task_executor_pool.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/overflow_arithmetic.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/num_hosts_targeted_metrics.h"
@@ -65,7 +66,6 @@
 #include "mongo/s/stale_exception.h"
 #include "mongo/s/transaction_router.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -83,34 +83,6 @@ static const BSONObj kGeoNearDistanceMetaProjection = BSON("$meta"
 static const int kPerDocumentOverheadBytesUpperBound = 10;
 
 const char kFindCmdName[] = "find";
-
-/**
- * Transforms the raw sort spec into one suitable for use as the ordering specification in
- * BSONObj::woCompare().
- *
- * In particular, eliminates text score meta-sort from 'sortSpec'.
- *
- * The input must be validated (each BSON element must be either a number or text score meta-sort
- * specification).
- */
-BSONObj transformSortSpec(const BSONObj& sortSpec) {
-    BSONObjBuilder comparatorBob;
-
-    for (BSONElement elt : sortSpec) {
-        if (elt.isNumber()) {
-            comparatorBob.append(elt);
-        } else if (QueryRequest::isTextScoreMeta(elt)) {
-            // Sort text score decreasing by default. Field name doesn't matter but we choose
-            // something that a user shouldn't ever have.
-            comparatorBob.append("$metaTextScore", -1);
-        } else {
-            // Sort spec should have been validated before here.
-            fassertFailed(28784);
-        }
-    }
-
-    return comparatorBob.obj();
-}
 
 /**
  * Given the QueryRequest 'qr' being executed by mongos, returns a copy of the query which is
@@ -161,7 +133,7 @@ StatusWith<std::unique_ptr<QueryRequest>> transformQueryForShards(
 
     // If there is a sort other than $natural, we send a sortKey meta-projection to the remote node.
     BSONObj newProjection = qr.getProj();
-    if (!qr.getSort().isEmpty() && !qr.getSort()["$natural"]) {
+    if (!qr.getSort().isEmpty() && !qr.getSort()[QueryRequest::kNaturalSortField]) {
         BSONObjBuilder projectionBuilder;
         projectionBuilder.appendElements(qr.getProj());
         projectionBuilder.append(AsyncResultsMerger::kSortKeyField, kSortKeyMetaProjection);
@@ -301,26 +273,35 @@ CursorId runQueryWithoutRetrying(OperationContext* opCtx,
     // $natural sort is actually a hint to use a collection scan, and shouldn't be treated like a
     // sort on mongos. Including a $natural anywhere in the sort spec results in the whole sort
     // being considered a hint to use a collection scan.
-    BSONObj sortComparatorBob;
-    if (!query.getQueryRequest().getSort().hasField("$natural")) {
-        sortComparatorBob = transformSortSpec(query.getQueryRequest().getSort());
+    BSONObj sortComparatorObj;
+    if (query.getSortPattern() &&
+        !query.getQueryRequest().getSort()[QueryRequest::kNaturalSortField]) {
+        // We have already validated the input sort object. Serialize the raw sort spec into one
+        // suitable for use as the ordering specification in BSONObj::woCompare(). In particular, we
+        // want to eliminate sorts using expressions (like $meta) and replace them with a
+        // placeholder. When mongos performs a merge-sort, any $meta expressions have already been
+        // performed on the shards. Mongos just needs to know the length of the sort pattern and
+        // whether each part of the sort pattern is ascending or descending.
+        sortComparatorObj = query.getSortPattern()
+                                ->serialize(SortPattern::SortKeySerialization::kForSortKeyMerging)
+                                .toBson();
     }
 
     bool appendGeoNearDistanceProjection = false;
     bool compareWholeSortKeyOnRouter = false;
-    if (query.getQueryRequest().getSort().isEmpty() &&
+    if (!query.getSortPattern() &&
         QueryPlannerCommon::hasNode(query.root(), MatchExpression::GEO_NEAR)) {
         // There is no specified sort, and there is a GEO_NEAR node. This means we should merge sort
         // by the geoNearDistance. Request the projection {$sortKey: <geoNearDistance>} from the
         // shards. Indicate to the AsyncResultsMerger that it should extract the sort key
         // {"$sortKey": <geoNearDistance>} and sort by the order {"$sortKey": 1}.
-        sortComparatorBob = AsyncResultsMerger::kWholeSortKeySortPattern;
+        sortComparatorObj = AsyncResultsMerger::kWholeSortKeySortPattern;
         compareWholeSortKeyOnRouter = true;
         appendGeoNearDistanceProjection = true;
     }
 
     // Tailable cursors can't have a sort, which should have already been validated.
-    invariant(sortComparatorBob.isEmpty() || !query.getQueryRequest().isTailable());
+    invariant(sortComparatorObj.isEmpty() || !query.getQueryRequest().isTailable());
 
     // Construct the requests that we will use to establish cursors on the targeted shards,
     // attaching the shardVersion and txnNumber, if necessary.
@@ -348,7 +329,7 @@ CursorId runQueryWithoutRetrying(OperationContext* opCtx,
         const auto qr = query.getQueryRequest();
         params.skipToApplyOnRouter = qr.getSkip();
         params.limit = qr.getLimit();
-        params.sortToApplyOnRouter = sortComparatorBob;
+        params.sortToApplyOnRouter = sortComparatorObj;
         params.compareWholeSortKeyOnRouter = compareWholeSortKeyOnRouter;
     }
 
@@ -538,8 +519,14 @@ CursorId ClusterFind::runQuery(OperationContext* opCtx,
                 throw;
             }
 
-            LOG(1) << "Received error status for query " << redact(query.toStringShort())
-                   << " on attempt " << retries << " of " << kMaxRetries << ": " << redact(ex);
+            LOGV2_DEBUG(22839,
+                        1,
+                        "Received error status for query {query_Short} on attempt {retries} of "
+                        "{kMaxRetries}: {ex}",
+                        "query_Short"_attr = redact(query.toStringShort()),
+                        "retries"_attr = retries,
+                        "kMaxRetries"_attr = kMaxRetries,
+                        "ex"_attr = redact(ex));
 
             Grid::get(opCtx)->catalogCache()->onStaleDatabaseVersion(ex->getDb(),
                                                                      ex->getVersionReceived());
@@ -564,6 +551,7 @@ CursorId ClusterFind::runQuery(OperationContext* opCtx,
                               << "Failed to run query after " << kMaxRetries << " retries");
                 throw;
             } else if (!ErrorCodes::isStaleShardVersionError(ex.code()) &&
+                       ex.code() != ErrorCodes::ShardInvalidatedForTargeting &&
                        ex.code() != ErrorCodes::ShardNotFound) {
                 // Errors other than stale metadata or from trying to reach a non existent shard are
                 // fatal to the operation. Network errors and replication retries happen at the
@@ -572,24 +560,35 @@ CursorId ClusterFind::runQuery(OperationContext* opCtx,
                 throw;
             }
 
-            LOG(1) << "Received error status for query " << redact(query.toStringShort())
-                   << " on attempt " << retries << " of " << kMaxRetries << ": " << redact(ex);
+            LOGV2_DEBUG(22840,
+                        1,
+                        "Received error status for query {query_Short} on attempt {retries} of "
+                        "{kMaxRetries}: {ex}",
+                        "query_Short"_attr = redact(query.toStringShort()),
+                        "retries"_attr = retries,
+                        "kMaxRetries"_attr = kMaxRetries,
+                        "ex"_attr = redact(ex));
 
-            if (auto staleInfo = ex.extraInfo<StaleConfigInfo>()) {
-                catalogCache->invalidateShardOrEntireCollectionEntryForShardedCollection(
-                    opCtx,
-                    query.nss(),
-                    staleInfo->getVersionWanted(),
-                    staleInfo->getVersionReceived(),
-                    staleInfo->getShardId());
-            } else {
-                catalogCache->onEpochChange(query.nss());
+            if (ex.code() != ErrorCodes::ShardInvalidatedForTargeting) {
+                if (auto staleInfo = ex.extraInfo<StaleConfigInfo>()) {
+                    catalogCache->invalidateShardOrEntireCollectionEntryForShardedCollection(
+                        opCtx,
+                        query.nss(),
+                        staleInfo->getVersionWanted(),
+                        staleInfo->getVersionReceived(),
+                        staleInfo->getShardId());
+                } else {
+                    catalogCache->onEpochChange(query.nss());
+                }
             }
 
             catalogCache->setOperationShouldBlockBehindCatalogCacheRefresh(opCtx, true);
 
             if (auto txnRouter = TransactionRouter::get(opCtx)) {
                 if (!txnRouter.canContinueOnStaleShardOrDbError(kFindCmdName)) {
+                    if (ex.code() == ErrorCodes::ShardInvalidatedForTargeting) {
+                        (void)catalogCache->getCollectionRoutingInfoWithRefresh(opCtx, query.nss());
+                    }
                     throw;
                 }
 
@@ -716,6 +715,22 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
             pinnedCursor.getValue()->getOriginatingCommand());
         CurOp::get(opCtx)->setGenericCursor_inlock(pinnedCursor.getValue().toGenericCursor());
     }
+
+    // If the 'failGetMoreAfterCursorCheckout' failpoint is enabled, throw an exception with the
+    // specified 'errorCode' value, or ErrorCodes::InternalError if 'errorCode' is omitted.
+    failGetMoreAfterCursorCheckout.executeIf(
+        [](const BSONObj& data) {
+            auto errorCode = (data["errorCode"] ? data["errorCode"].safeNumberLong()
+                                                : ErrorCodes::InternalError);
+            uasserted(errorCode, "Hit the 'failGetMoreAfterCursorCheckout' failpoint");
+        },
+        [&opCtx, &request](const BSONObj& data) {
+            auto dataForFailCommand =
+                data.addField(BSON("failCommands" << BSON_ARRAY("getMore")).firstElement());
+            auto* getMoreCommand = CommandHelpers::findCommand("getMore");
+            return CommandHelpers::shouldActivateFailCommandFailPoint(
+                dataForFailCommand, request.nss, getMoreCommand, opCtx->getClient());
+        });
 
     // If the 'waitAfterPinningCursorBeforeGetMoreBatch' fail point is enabled, set the 'msg'
     // field of this operation's CurOp to signal that we've hit this point.

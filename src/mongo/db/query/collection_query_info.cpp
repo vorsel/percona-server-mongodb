@@ -48,8 +48,8 @@
 #include "mongo/db/query/plan_cache.h"
 #include "mongo/db/query/planner_ixselect.h"
 #include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/clock_source.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -170,7 +170,8 @@ void CollectionQueryInfo::notifyOfQuery(OperationContext* opCtx,
     for (auto it = indexesUsed.begin(); it != indexesUsed.end(); ++it) {
         // This index should still exist, since the PlanExecutor would have been killed if the
         // index was dropped (and we would not get here).
-        invariant(nullptr != coll->getIndexCatalog()->findIndexByName(opCtx, *it));
+        invariant(nullptr != coll->getIndexCatalog()->findIndexByName(opCtx, *it),
+                  coll->uuid().toString());
 
         _indexUsageTracker.recordIndexAccess(*it);
     }
@@ -178,7 +179,10 @@ void CollectionQueryInfo::notifyOfQuery(OperationContext* opCtx,
 
 void CollectionQueryInfo::clearQueryCache() {
     const Collection* coll = get.owner(this);
-    LOG(1) << coll->ns() << ": clearing plan cache - collection info cache reset";
+    LOGV2_DEBUG(20907,
+                1,
+                "{coll_ns}: clearing plan cache - collection info cache reset",
+                "coll_ns"_attr = coll->ns());
     if (nullptr != _planCache.get()) {
         _planCache->clear();
     }

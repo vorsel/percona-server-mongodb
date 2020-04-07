@@ -31,10 +31,12 @@
 
 #include "mongo/platform/basic.h"
 
+#include <algorithm>
+
 #include "mongo/base/string_data.h"
 #include "mongo/db/repl/all_database_cloner.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 namespace mongo {
 namespace repl {
 
@@ -54,13 +56,18 @@ BaseCloner::ClonerStages AllDatabaseCloner::getStages() {
 Status AllDatabaseCloner::ensurePrimaryOrSecondary(
     const executor::RemoteCommandResponse& isMasterReply) {
     if (!isMasterReply.isOK()) {
-        log() << "Cannot reconnect because isMaster command failed.";
+        LOGV2(21054, "Cannot reconnect because isMaster command failed.");
         return isMasterReply.status;
     }
     if (isMasterReply.data["ismaster"].trueValue() || isMasterReply.data["secondary"].trueValue())
         return Status::OK();
-    // Nodes in a set always have a version; removed nodes never do.
-    if (!isMasterReply.data["setVersion"]) {
+
+    // There is a window during startup where a node has an invalid configuration and will have
+    // an isMaster response the same as a removed node.  So we must check to see if the node is
+    // removed by checking local configuration.
+    auto otherNodes =
+        ReplicationCoordinator::get(getGlobalServiceContext())->getOtherNodesInReplSet();
+    if (std::find(otherNodes.begin(), otherNodes.end(), getSource()) == otherNodes.end()) {
         Status status(ErrorCodes::NotMasterOrSecondary,
                       str::stream() << "Sync source " << getSource()
                                     << " has been removed from the replication configuration.");
@@ -69,9 +76,8 @@ Status AllDatabaseCloner::ensurePrimaryOrSecondary(
         getSharedData()->setInitialSyncStatusIfOK(lk, status);
         return status;
     }
-    auto source = isMasterReply.data.getStringField("me");
     return Status(ErrorCodes::NotMasterOrSecondary,
-                  str::stream() << "Cannot connect because sync source " << source
+                  str::stream() << "Cannot connect because sync source " << getSource()
                                 << " is neither primary nor secondary.");
 }
 
@@ -98,14 +104,19 @@ BaseCloner::AfterStageBehavior AllDatabaseCloner::listDatabasesStage() {
     auto databasesArray = getClient()->getDatabaseInfos(BSONObj(), true /* nameOnly */);
     for (const auto& dbBSON : databasesArray) {
         if (!dbBSON.hasField("name")) {
-            LOG(1) << "Excluding database due to the 'listDatabases' response not containing a "
-                      "'name' field for this entry: "
-                   << dbBSON;
+            LOGV2_DEBUG(21055,
+                        1,
+                        "Excluding database due to the 'listDatabases' response not containing a "
+                        "'name' field for this entry: {db}",
+                        "db"_attr = dbBSON);
             continue;
         }
         const auto& dbName = dbBSON["name"].str();
         if (dbName == "local") {
-            LOG(1) << "Excluding database from the 'listDatabases' response: " << dbBSON;
+            LOGV2_DEBUG(21056,
+                        1,
+                        "Excluding database from the 'listDatabases' response: {db}",
+                        "db"_attr = dbBSON);
             continue;
         } else {
             _databases.emplace_back(dbName);
@@ -140,15 +151,24 @@ void AllDatabaseCloner::postStage() {
         }
         auto dbStatus = _currentDatabaseCloner->run();
         if (dbStatus.isOK()) {
-            LOG(1) << "Database clone for '" << dbName << "' finished: " << dbStatus;
+            LOGV2_DEBUG(21057,
+                        1,
+                        "Database clone for '{dbName}' finished: {status}",
+                        "dbName"_attr = dbName,
+                        "status"_attr = dbStatus);
         } else {
-            warning() << "database '" << dbName << "' (" << (_stats.databasesCloned + 1) << " of "
-                      << _databases.size() << ") clone failed due to " << dbStatus.toString();
+            LOGV2_WARNING(21060,
+                          "database '{dbName}' ({number} of {total}) "
+                          "clone failed due to {status}",
+                          "dbName"_attr = dbName,
+                          "number"_attr = (_stats.databasesCloned + 1),
+                          "total"_attr = _databases.size(),
+                          "status"_attr = dbStatus.toString());
             setInitialSyncFailedStatus(dbStatus);
             return;
         }
         if (StringData(dbName).equalCaseInsensitive("admin")) {
-            LOG(1) << "Finished the 'admin' db, now validating it.";
+            LOGV2_DEBUG(21058, 1, "Finished the 'admin' db, now validating it.");
             // Do special checks for the admin database because of auth. collections.
             auto adminStatus = Status(ErrorCodes::NotYetInitialized, "");
             {
@@ -161,7 +181,10 @@ void AllDatabaseCloner::postStage() {
                 adminStatus = getStorageInterface()->isAdminDbValid(opCtx);
             }
             if (!adminStatus.isOK()) {
-                LOG(1) << "Validation failed on 'admin' db due to " << adminStatus;
+                LOGV2_DEBUG(21059,
+                            1,
+                            "Validation failed on 'admin' db due to {adminStatus}",
+                            "adminStatus"_attr = adminStatus);
                 setInitialSyncFailedStatus(adminStatus);
                 return;
             }

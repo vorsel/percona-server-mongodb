@@ -47,7 +47,7 @@
 #include "mongo/db/repl/optime.h"
 #include "mongo/util/background.h"
 
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 
@@ -210,7 +210,7 @@ protected:
             }
 
             if (_done) {
-                log() << "dbCheck terminated due to stepdown";
+                LOGV2(20451, "dbCheck terminated due to stepdown");
                 return;
             }
         }
@@ -489,6 +489,10 @@ public:
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
+    }
+
+    bool maintenanceOk() const override {
+        return false;
     }
 
     virtual bool adminOnly() const {

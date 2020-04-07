@@ -90,7 +90,7 @@ public:
     }
 
     const BSONObj getValidatorDoc() const final {
-        return _validatorDoc.getOwned();
+        return _validator.validatorDoc.getOwned();
     }
 
     bool requiresIdIndex() const final;
@@ -235,12 +235,11 @@ public:
     /**
      * Returns a non-ok Status if validator is not legal for this collection.
      */
-    StatusWithMatchExpression parseValidator(
-        OperationContext* opCtx,
-        const BSONObj& validator,
-        MatchExpressionParser::AllowedFeatureSet allowedFeatures,
-        boost::optional<ServerGlobalParams::FeatureCompatibility::Version>
-            maxFeatureCompatibilityVersion = boost::none) const final;
+    Validator parseValidator(OperationContext* opCtx,
+                             const BSONObj& validator,
+                             MatchExpressionParser::AllowedFeatureSet allowedFeatures,
+                             boost::optional<ServerGlobalParams::FeatureCompatibility::Version>
+                                 maxFeatureCompatibilityVersion = boost::none) const final;
 
     /**
      * Sets the validator for this collection.
@@ -266,6 +265,9 @@ public:
                            StringData newLevel,
                            StringData newAction) final;
 
+    bool getRecordPreImages() const final;
+    void setRecordPreImages(OperationContext* opCtx, bool val) final;
+
     bool isTemporary(OperationContext* opCtx) const final;
 
     //
@@ -287,6 +289,16 @@ public:
     uint64_t numRecords(OperationContext* opCtx) const final;
 
     uint64_t dataSize(OperationContext* opCtx) const final;
+
+    /**
+     * Currently fast counts are prone to false negative as it is not tolerant to unclean shutdowns.
+     * So, verify that the collection is really empty by opening the collection cursor and reading
+     * the first document.
+     * Expects to hold at least collection lock in mode IS.
+     * TODO SERVER-24266: After making fast counts tolerant to unclean shutdowns, we can make use of
+     * fast count to determine whether the collection is empty and remove cursor checking logic.
+     */
+    bool isEmpty(OperationContext* opCtx) const final;
 
     inline int averageObjectSize(OperationContext* opCtx) const {
         uint64_t n = numRecords(opCtx);
@@ -341,6 +353,8 @@ public:
 
     void init(OperationContext* opCtx) final;
     bool isInitialized() const final;
+    bool isCommitted() const final;
+    void setCommitted(bool val) final;
 
 private:
     /**
@@ -365,6 +379,7 @@ private:
     NamespaceString _ns;
     RecordId _catalogId;
     UUID _uuid;
+    bool _committed = true;
 
     // The RecordStore may be null during a repair operation.
     std::unique_ptr<RecordStore> _recordStore;  // owned
@@ -378,14 +393,13 @@ private:
     // If null, the default collation is simple binary compare.
     std::unique_ptr<CollatorInterface> _collator;
 
-    // Empty means no filter.
-    BSONObj _validatorDoc;
 
-    // Points into _validatorDoc. Null means no filter.
-    std::unique_ptr<MatchExpression> _validator;
+    Validator _validator;
 
     ValidationAction _validationAction;
     ValidationLevel _validationLevel;
+
+    bool _recordPreImages = false;
 
     // Notifier object for awaitData. Threads polling a capped collection for new data can wait
     // on this object until notified of the arrival of new data.

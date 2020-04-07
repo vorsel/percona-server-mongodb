@@ -82,7 +82,7 @@ public:
                                const UUID& collectionUuid,
                                ChunkRange orphanRange);
 
-    ScopedCollectionMetadata getOrphansFilter(OperationContext* opCtx, bool isCollection) override;
+    ScopedCollectionFilter getOwnershipFilter(OperationContext* opCtx) override;
 
     ScopedCollectionMetadata getCurrentMetadata() override;
 
@@ -90,9 +90,9 @@ public:
 
     boost::optional<ChunkVersion> getCurrentShardVersionIfKnown() override;
 
-    void checkShardVersionOrThrow(OperationContext* opCtx, bool isCollection) override;
+    void checkShardVersionOrThrow(OperationContext* opCtx) override;
 
-    Status checkShardVersionNoThrow(OperationContext* opCtx, bool isCollection) noexcept override;
+    Status checkShardVersionNoThrow(OperationContext* opCtx) noexcept override;
 
     void enterCriticalSectionCatchUpPhase(OperationContext* opCtx) override;
 
@@ -103,15 +103,7 @@ public:
     std::shared_ptr<Notification<void>> getCriticalSectionSignal(
         ShardingMigrationCriticalSection::Operation op) const override;
 
-    /**
-     * Updates the collection's filtering metadata based on changes received from the config server
-     * and also resolves the pending receives map in case some of these pending receives have
-     * committed on the config server or have been abandoned by the donor shard.
-     *
-     * This method must be called with an exclusive collection lock and it does not acquire any
-     * locks itself.
-     */
-    void setFilteringMetadata(OperationContext* opCtx, CollectionMetadata newMetadata);
+    void setFilteringMetadata(OperationContext* opCtx, CollectionMetadata newMetadata) override;
 
     /**
      * Marks the collection's filtering metadata as UNKNOWN, meaning that all attempts to check for
@@ -159,8 +151,12 @@ public:
     /**
      * BSON output of the pending metadata into a BSONArray
      */
-    void toBSONPending(BSONArrayBuilder& bb) const {
+    void toBSONPending(BSONArrayBuilder& bb) const override {
         _metadataManager->toBSONPending(bb);
+    }
+
+    std::uint64_t getNumMetadataManagerChanges_forTest() {
+        return _numMetadataManagerChanges;
     }
 
 private:
@@ -179,9 +175,7 @@ private:
      * operation context does not match the shard version on the active metadata object.
      */
     boost::optional<ScopedCollectionMetadata> _getMetadataWithVersionCheckAt(
-        OperationContext* opCtx,
-        const boost::optional<mongo::LogicalTime>& atClusterTime,
-        bool isCollection);
+        OperationContext* opCtx, const boost::optional<mongo::LogicalTime>& atClusterTime);
 
     // Namespace this state belongs to.
     const NamespaceString _nss;
@@ -212,6 +206,9 @@ private:
     // If the collection is unsharded, the metadata has not been set yet, or the metadata has been
     // specifically reset by calling clearFilteringMetadata(), this will be nullptr;
     std::shared_ptr<MetadataManager> _metadataManager;
+
+    // Used for testing to check the number of times a new MetadataManager has been installed.
+    std::uint64_t _numMetadataManagerChanges{0};
 };
 
 /**

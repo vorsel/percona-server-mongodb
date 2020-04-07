@@ -30,16 +30,22 @@
 
 #pragma once
 
+#include "mongo/config.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/cursor_id.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/write_concern_options.h"
+#include "mongo/logv2/attribute_storage.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/util/diagnostic_info.h"
 #include "mongo/util/progress_meter.h"
 #include "mongo/util/time_support.h"
+
+#ifndef MONGO_CONFIG_USE_RAW_LATCHES
+#include "mongo/util/diagnostic_info.h"
+#endif
 
 namespace mongo {
 
@@ -117,6 +123,8 @@ public:
          */
         std::string report() const;
 
+        void report(logv2::DynamicAttributes* pAttrs) const;
+
         boost::optional<long long> keysExamined;
         boost::optional<long long> docsExamined;
 
@@ -146,6 +154,10 @@ public:
 
     std::string report(OperationContext* opCtx, const SingleThreadedLockStats* lockStats) const;
 
+    void report(OperationContext* opCtx,
+                const SingleThreadedLockStats* lockStats,
+                logv2::DynamicAttributes* pAttrs) const;
+
     /**
      * Appends information about the current operation to "builder"
      *
@@ -168,9 +180,9 @@ public:
     BSONObj makeFlowControlObject(FlowControlTicketholder::CurOp flowControlStats) const;
 
     /**
-     * Make object from $searchBeta stats with non-populated values omitted.
+     * Make object from $search stats with non-populated values omitted.
      */
-    BSONObj makeSearchBetaObject() const;
+    BSONObj makeMongotDebugStatsObject() const;
 
     // -------------------
 
@@ -189,7 +201,7 @@ public:
     long long ntoskip{-1};
     bool exhaust{false};
 
-    // For searchBeta.
+    // For search using mongot.
     boost::optional<long long> mongotCursorId{boost::none};
     boost::optional<long long> msWaitingForMongot{boost::none};
 
@@ -245,6 +257,9 @@ public:
     // Records the WC that was waited on during the operation. (The WC in opCtx can't be used
     // because it's only set while the Command itself executes.)
     boost::optional<WriteConcernOptions> writeConcern;
+
+    // Whether this is an oplog getMore operation for replication oplog fetching.
+    bool isReplOplogFetching{false};
 };
 
 /**
@@ -321,7 +336,7 @@ public:
      * operation should also be profiled.
      */
     bool completeAndLogOperation(OperationContext* opCtx,
-                                 logger::LogComponent logComponent,
+                                 logv2::LogComponent logComponent,
                                  boost::optional<size_t> responseLength = boost::none,
                                  boost::optional<long long> slowMsOverride = boost::none,
                                  bool forceLog = false);

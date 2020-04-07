@@ -510,6 +510,7 @@ bitpos
 bitstring
 bitwise
 blk
+blkmod
 bm
 bnd
 bool
@@ -939,6 +940,7 @@ logf
 logmgr
 lognum
 logop
+logpath
 logread
 logrec
 logsize

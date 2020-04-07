@@ -44,13 +44,13 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/server_options.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/move_primary_gen.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -158,8 +158,13 @@ public:
         const auto toShard = [&]() {
             auto toShardStatus = shardRegistry->getShard(opCtx, to);
             if (!toShardStatus.isOK()) {
-                log() << "Could not move database '" << dbname << "' to shard '" << to
-                      << causedBy(toShardStatus.getStatus());
+                LOGV2(21921,
+                      "Could not move database '{dbname}' to shard "
+                      "'{to}{causedBy_toShardStatus_getStatus}",
+                      "dbname"_attr = dbname,
+                      "to"_attr = to,
+                      "causedBy_toShardStatus_getStatus"_attr =
+                          causedBy(toShardStatus.getStatus()));
                 uassertStatusOKWithContext(toShardStatus.getStatus(),
                                            str::stream() << "Could not move database '" << dbname
                                                          << "' to shard '" << to << "'");

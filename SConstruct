@@ -102,12 +102,12 @@ SetOption('random', 1)
 #
 
 add_option('ninja',
-    choices=['true', 'false'],
-    default='false',
+    choices=['stable', 'next', 'disabled'],
+    default='disabled',
     nargs='?',
-    const='true',
+    const='stable',
     type='choice',
-    help='Enable the build.ninja generator tool',
+    help='Enable the build.ninja generator tool stable or canary version',
 )
 
 add_option('prefix',
@@ -194,15 +194,6 @@ add_option('inmemory',
     const='on',
     default='off',
     help='Enable InMemory',
-    nargs='?',
-    type='choice',
-)
-
-add_option('mobile-se',
-    choices=['on', 'off'],
-    const='on',
-    default='off',
-    help='Enable Mobile Storage Engine',
     nargs='?',
     type='choice',
 )
@@ -348,6 +339,13 @@ add_option('use-sasl-client',
     nargs=0,
 )
 
+add_option('use-diagnostic-latches',
+    choices=['on', 'off'],
+    default='on',
+    help='Enable annotated Mutex types',
+    type='choice',
+)
+
 # Most of the "use-system-*" options follow a simple form.
 for pack in [
     ('abseil-cpp',),
@@ -360,7 +358,6 @@ for pack in [
     ('kms-message',),
     ('pcre',),
     ('snappy',),
-    ('sqlite',),
     ('stemmer',),
     ('tcmalloc',),
     ('libunwind',),
@@ -396,11 +393,6 @@ add_option('use-system-all',
     nargs=0,
 )
 
-add_option('use-cpu-profiler',
-    help='Link against the google-perftools profiler library',
-    nargs=0,
-)
-
 add_option('build-fast-and-loose',
     choices=['on', 'off', 'auto'],
     const='on',
@@ -432,12 +424,6 @@ add_option('osx-version-min',
 # https://docs.microsoft.com/en-us/cpp/porting/modifying-winver-and-win32-winnt?view=vs-2017
 # https://docs.microsoft.com/en-us/windows-server/get-started/windows-server-release-info
 win_version_min_choices = {
-    'win7'     : ('0601', '0000'),
-    'ws08r2'   : ('0601', '0000'),
-    'win8'     : ('0602', '0000'),
-    'ws2012'   : ('0602', '0000'),
-    'win81'    : ('0603', '0000'),
-    'ws2012r2' : ('0603', '0000'),
     'win10'    : ('0A00', '0000'),
     'ws2016'   : ('0A00', '1607'),
     'ws2019'   : ('0A00', '1809')
@@ -539,10 +525,10 @@ add_option('msvc-debugging-format',
 )
 
 add_option('use-libunwind',
-    choices=["on", "off"],
+    choices=["on", "off", "auto"],
     const="on",
-    default="off",
-    help="Enable libunwind for backtraces (experimental)",
+    default="auto",
+    help="Enable libunwind for backtraces",
     nargs="?",
     type='choice',
 )
@@ -798,7 +784,7 @@ env_vars.Add('ICERUN',
 
 env_vars.Add('ICECC_CREATE_ENV',
     help='Tell SCons where icecc-create-env tool is',
-    default='buildscripts/icecc_create_env')
+    default='icecc-create-env')
 
 env_vars.Add('ICECC_SCHEDULER',
     help='Tell ICECC where the sceduler daemon is running')
@@ -872,7 +858,26 @@ env_vars.Add('MSVC_USE_SCRIPT',
 
 env_vars.Add('MSVC_VERSION',
     help='Sets the version of Visual C++ to use (e.g. 14.1 for VS2017, 14.2 for VS2019)',
-    default="14.1")
+    default="14.2")
+
+env_vars.Add('NINJA_PREFIX',
+    default="build",
+    help="""A prefix to add to the beginning of generated ninja
+files. Useful for when compiling multiple build ninja files for
+different configurations, for instance:
+
+    scons --sanitize=asan --ninja NINJA_PREFIX=asan asan.ninja
+    scons --sanitize=tsan --ninja NINJA_PREFIX=tsan tsan.ninja
+
+Will generate the files (respectively):
+
+    asan.ninja
+    tsan.ninja
+
+Defaults to build, best used with the generate-ninja alias so you don't have to
+reiterate the prefix in the target name and variable.
+""")
+
 
 env_vars.Add('NINJA_SUFFIX',
     help="""A suffix to add to the end of generated build.ninja
@@ -896,6 +901,11 @@ env_vars.Add('__NINJA_NO',
 env_vars.Add('OBJCOPY',
     help='Sets the path to objcopy',
     default=WhereIs('objcopy'))
+
+
+env_vars.Add('PKGDIR',
+    help='Directory in which to build packages and archives',
+    default='$VARIANT_DIR/pkgs')
 
 env_vars.Add('PREFIX',
     help='Final installation location of files, will be made into a sub dir of $DESTDIR',
@@ -1052,17 +1062,6 @@ usemozjs = (jsEngine.startswith('mozjs'))
 if not serverJs and not usemozjs:
     print("Warning: --server-js=off is not needed with --js-engine=none")
 
-use_libunwind = get_option("use-libunwind") == "on"
-if use_libunwind:
-    use_system_libunwind = use_system_version_of_library("libunwind")
-    use_vendored_libunwind = not use_system_libunwind
-else:
-    if use_system_version_of_library("libunwind"):
-        print("Error: --use-system-libunwind requires --use-libunwind")
-        Exit(1)
-
-    use_system_libunwind = use_vendored_libunwind = False
-
 # We defer building the env until we have determined whether we want certain values. Some values
 # in the env actually have semantics for 'None' that differ from being absent, so it is better
 # to build it up via a dict, and then construct the Environment in one shot with kwargs.
@@ -1082,21 +1081,28 @@ envDict = dict(BUILD_ROOT=buildDir,
                ARCHIVE_ADDITIONS=[],
                PYTHON="$( {} $)".format(sys.executable),
                SERVER_ARCHIVE='${SERVER_DIST_BASENAME}${DIST_ARCHIVE_SUFFIX}',
-               UNITTEST_ALIAS='unittests',
+               UNITTEST_ALIAS='install-unittests',
                # TODO: Move unittests.txt to $BUILD_DIR, but that requires
                # changes to MCI.
                UNITTEST_LIST='$BUILD_ROOT/unittests.txt',
-               LIBFUZZER_TEST_ALIAS='libfuzzer_tests',
+               LIBFUZZER_TEST_ALIAS='install-fuzzertests',
                LIBFUZZER_TEST_LIST='$BUILD_ROOT/libfuzzer_tests.txt',
-               INTEGRATION_TEST_ALIAS='integration_tests',
+               INTEGRATION_TEST_ALIAS='install-integration-tests',
                INTEGRATION_TEST_LIST='$BUILD_ROOT/integration_tests.txt',
-               BENCHMARK_ALIAS='benchmarks',
+               BENCHMARK_ALIAS='install-benchmarks',
                BENCHMARK_LIST='$BUILD_ROOT/benchmarks.txt',
                CONFIGUREDIR='$BUILD_ROOT/scons/$VARIANT_DIR/sconf_temp',
                CONFIGURELOG='$BUILD_ROOT/scons/config.log',
                CONFIG_HEADER_DEFINES={},
                LIBDEPS_TAG_EXPANSIONS=[],
                )
+
+# TODO: Remove these when hygienic builds are default.
+if get_option('install-mode') != 'hygienic':
+    envDict["UNITTEST_ALIAS"] = "unittests"
+    envDict["INTEGRATION_TEST_ALIAS"] = "integration_tests"
+    envDict["LIBFUZZER_TEST_ALIAS"] = "libfuzzer_tests"
+    envDict["BENCHMARK_ALIAS"] = "benchmarks"
 
 env = Environment(variables=env_vars, **envDict)
 
@@ -1407,19 +1413,42 @@ link_model = get_option('link-model')
 if link_model == "auto":
     link_model = "static"
 
+# libunwind configuration.
+# In which the following globals are set and normalized to bool:
+#     - use_libunwind
+#     - use_system_libunwind
+#     - use_vendored_libunwind
+use_libunwind = get_option("use-libunwind")
+use_system_libunwind = use_system_version_of_library("libunwind")
+
+# Assume system libunwind works if it's installed and selected.
+# Vendored libunwind, however, works only on linux-x86_64.
+can_use_libunwind = (use_system_libunwind or
+    env.TargetOSIs('linux') and env['TARGET_ARCH'] == 'x86_64')
+
+if use_libunwind == "off":
+    use_libunwind = False
+    use_system_libunwind = False
+elif use_libunwind == "on":
+    use_libunwind = True
+    if not can_use_libunwind:
+        env.ConfError("libunwind not supported on target platform")
+        Exit(1)
+elif use_libunwind == "auto":
+    use_libunwind = can_use_libunwind
+
+use_vendored_libunwind = use_libunwind and not use_system_libunwind
+if use_system_libunwind and not use_libunwind:
+    print("Error: --use-system-libunwind requires --use-libunwind")
+    Exit(1)
+if use_libunwind == True:
+    env.SetConfigHeaderDefine("MONGO_CONFIG_USE_LIBUNWIND")
+
+
 # Windows can't currently support anything other than 'object' or 'static', until
 # we have both hygienic builds and have annotated functions for export.
 if env.TargetOSIs('windows') and link_model not in ['object', 'static', 'dynamic-sdk']:
     env.FatalError("Windows builds must use the 'object', 'dynamic-sdk', or 'static' link models")
-
-
-# The mongodbtoolchain currently doesn't produce working binaries if
-# you combine a dynamic build with a non-system allocator, but the
-# failure mode is non-obvious. For now, prevent people from wandering
-# inadvertantly into this trap. Remove this constraint when
-# https://jira.mongodb.org/browse/SERVER-27675 is resolved.
-if (link_model == 'dynamic') and ('mongodbtoolchain' in env['CXX']) and (env['MONGO_ALLOCATOR'] != 'system'):
-    env.FatalError('Cannot combine the MongoDB toolchain, a dynamic build, and a non-system allocator. Choose two.')
 
 # The 'object' mode for libdeps is enabled by setting _LIBDEPS to $_LIBDEPS_OBJS. The other two
 # modes operate in library mode, enabled by setting _LIBDEPS to $_LIBDEPS_LIBS.
@@ -1554,11 +1583,12 @@ if link_model.startswith("dynamic"):
 if optBuild:
     env.SetConfigHeaderDefine("MONGO_CONFIG_OPTIMIZED_BUILD")
 
+
 # Enable the fast decider if explicitly requested or if in 'auto' mode
 # and not in conflict with other options like the ninja option which
 # sets it's own decider
 if (
-        not get_option('ninja') == 'true' and
+        get_option('ninja') == 'disabled' and
         get_option('build-fast-and-loose') == 'on' or
         (
             get_option('build-fast-and-loose') == 'auto' and
@@ -1852,13 +1882,29 @@ elif env.TargetOSIs('windows'):
     elif get_option('msvc-debugging-format') == "pdb":
         env['CCPDBFLAGS'] = '/Zi /Fd${TARGET}.pdb'
 
+
+    # The SCons built-in pdbGenerator always adds /DEBUG, but we would like
+    # control over that flag so that users can override with /DEBUG:fastlink
+    # for better local builds. So we overwrite the builtin.
+    def pdbGenerator(env, target, source, for_signature):
+        try:
+            return ['/PDB:%s' % target[0].attributes.pdb]
+        except (AttributeError, IndexError):
+            return None
+    env['_PDB'] = pdbGenerator
+
     # /DEBUG will tell the linker to create a .pdb file
     # which WinDbg and Visual Studio will use to resolve
     # symbols if you want to debug a release-mode image.
     # Note that this means we can't do parallel links in the build.
     #
     # Please also note that this has nothing to do with _DEBUG or optimization.
-    env.Append( LINKFLAGS=["/DEBUG"] )
+
+    # If the user set a /DEBUG flag explicitly, don't add
+    # another. Otherwise use the standard /DEBUG flag, since we always
+    # want PDBs.
+    if not any(flag.startswith('/DEBUG') for flag in env['LINKFLAGS']):
+        env.Append(LINKFLAGS=["/DEBUG"])
 
     # /MD:  use the multithreaded, DLL version of the run-time library (MSVCRT.lib/MSVCR###.DLL)
     # /MDd: Defines _DEBUG, _MT, _DLL, and uses MSVCRTD.lib/MSVCRD###.DLL
@@ -2072,10 +2118,6 @@ if get_option('inmemory') == 'on':
     if not wiredtiger:
         env.FatalError("InMemory engine requires WiredTiger to build")
 
-mobile_se = False
-if get_option('mobile-se') == 'on':
-    mobile_se = True
-
 if env['TARGET_ARCH'] == 'i386':
     # If we are using GCC or clang to target 32 bit, set the ISA minimum to 'nocona',
     # and the tuning to 'generic'. The choice of 'nocona' is selected because it
@@ -2139,14 +2181,14 @@ def doConfigure(myenv):
     # bare compilers, and we should re-check at the very end that TryCompile and TryLink still
     # work with the flags we have selected.
     if myenv.ToolchainIs('msvc'):
-        compiler_minimum_string = "Microsoft Visual Studio 2017 15.9"
+        compiler_minimum_string = "Microsoft Visual Studio 2019 16.4"
         compiler_test_body = textwrap.dedent(
         """
         #if !defined(_MSC_VER)
         #error
         #endif
 
-        #if _MSC_VER < 1916
+        #if _MSC_VER < 1924
         #error %s or newer is required to build MongoDB
         #endif
 
@@ -2179,7 +2221,7 @@ def doConfigure(myenv):
         #endif
 
         #if defined(__apple_build_version__)
-        #if __apple_build_version__ < 10001044
+        #if __apple_build_version__ < 10010046
         #error %s or newer is required to build MongoDB
         #endif
         #elif (__clang_major__ < 7) || (__clang_major__ == 7 && __clang_minor__ < 0)
@@ -3426,11 +3468,6 @@ def doConfigure(myenv):
             myenv.ConfError("Cannot find wiredtiger headers")
         conf.FindSysLibDep("wiredtiger", ["wiredtiger"])
 
-    if use_system_version_of_library("sqlite"):
-        if not conf.CheckCXXHeader( "sqlite3.h" ):
-            myenv.ConfError("Cannot find sqlite headers")
-        conf.FindSysLibDep("sqlite", ["sqlite3"])
-
     conf.env.Append(
         CPPDEFINES=[
             ("BOOST_THREAD_VERSION", "5"),
@@ -3476,6 +3513,9 @@ def doConfigure(myenv):
 
     if posix_monotonic_clock:
         conf.env.SetConfigHeaderDefine("MONGO_CONFIG_HAVE_POSIX_MONOTONIC_CLOCK")
+
+    if get_option('use-diagnostic-latches') == 'off':
+        conf.env.SetConfigHeaderDefine("MONGO_CONFIG_USE_RAW_LATCHES")
 
     if (conf.CheckCXXHeader( "execinfo.h" ) and
         conf.CheckDeclaration('backtrace', includes='#include <execinfo.h>') and
@@ -3780,43 +3820,55 @@ env["NINJA_SYNTAX"] = "#site_scons/third_party/ninja_syntax.py"
 # icecream, if available. Per the rules declared in the icecream tool,
 # load the ccache tool first.
 env.Tool('ccache')
+
+if env.ToolchainIs("clang"):
+    env["ICECC_COMPILER_TYPE"] = "clang"
+elif env.ToolchainIs("gcc"):
+    env["ICECC_COMPILER_TYPE"] = "gcc"
+
 env.Tool('icecream')
 
-if get_option('ninja') == 'true':
-    ninja_builder = Tool("ninja")
-    ninja_builder.generate(env)
+if get_option('ninja') != 'disabled':
+    if get_option('ninja') == 'stable':
+        ninja_builder = Tool("ninja")
+        ninja_builder.generate(env)
 
-    # Explicitly add all generated sources to the DAG so NinjaBuilder can
-    # generate rules for them. SCons if the files don't exist will not wire up
-    # the dependencies in the DAG because it cannot scan them. The Ninja builder
-    # does not care about the actual edge here as all generated sources will be
-    # pushed to the "bottom" of it's DAG via the order_only dependency on
-    # _generated_sources (an internal phony target)
-    if get_option('install-mode') == 'hygienic':
-        env.Alias("install-common-base", env.Alias("generated-sources"))
+        # Explicitly add all generated sources to the DAG so NinjaBuilder can
+        # generate rules for them. SCons if the files don't exist will not wire up
+        # the dependencies in the DAG because it cannot scan them. The Ninja builder
+        # does not care about the actual edge here as all generated sources will be
+        # pushed to the "bottom" of it's DAG via the order_only dependency on
+        # _generated_sources (an internal phony target)
+        if get_option('install-mode') == 'hygienic':
+            env.Alias("install-common-base", env.Alias("generated-sources"))
+        else:
+            env.Alias("all", env.Alias("generated-sources"))
+            env.Alias("core", env.Alias("generated-sources"))
+
+        if env.get("NINJA_SUFFIX") and env["NINJA_SUFFIX"][0] != ".":
+            env["NINJA_SUFFIX"] = "." + env["NINJA_SUFFIX"]
+
+        if get_option("install-mode") == "hygienic":
+            ninja_build = env.Ninja(
+                target="${NINJA_PREFIX}.ninja$NINJA_SUFFIX",
+                source=[
+                    env.Alias("install-all-meta"),
+                    env.Alias("test-execution-aliases"),
+                ],
+            )
+        else:
+            ninja_build = env.Ninja(
+                target="${NINJA_PREFIX}.ninja$NINJA_SUFFIX",
+                source=[
+                    env.Alias("all"),
+                    env.Alias("test-execution-aliases"),
+                ],
+            )
+
+        env.Alias("generate-ninja", ninja_build)
     else:
-        env.Alias("all", env.Alias("generated-sources"))
-        env.Alias("core", env.Alias("generated-sources"))
-
-    if get_option("install-mode") == "hygienic":
-        ninja_build = env.Ninja(
-            target="build.ninja",
-            source=[
-                env.Alias("install-all-meta"),
-                env.Alias("test-execution-aliases"),
-            ],
-        )
-    else:
-        ninja_build = env.Ninja(
-            target="build.ninja",
-            source=[
-                env.Alias("all"),
-                env.Alias("test-execution-aliases"),
-            ],
-        )
-
-    env.Alias("generate-ninja", ninja_build)
-
+        ninja_builder = Tool("ninja_next")
+        ninja_builder.generate(env)
 
     # idlc.py has the ability to print it's implicit dependencies
     # while generating, Ninja can consume these prints using the
@@ -3829,16 +3881,23 @@ if get_option('ninja') == 'true':
         command="cmd /c $cmd" if env.TargetOSIs("windows") else "$cmd",
         description="Generating $out",
         deps="msvc",
+        pool="local_pool",
     )
-    env.NinjaRuleMapping("$IDLCCOM", "IDLC")
-    env.NinjaRuleMapping(env["IDLCCOM"], "IDLC")
+
+    def get_idlc_command(env, node, action, targets, sources, executor=None):
+        _, variables = env.NinjaGetShellCommand(node, action, targets, sources, executor=executor)
+        variables["msvc_deps_prefix"] = "import file:"
+        return "IDLC", variables
+
+    env.NinjaRuleMapping("$IDLCCOM", get_idlc_command)
+    env.NinjaRuleMapping(env["IDLCCOM"], get_idlc_command)
 
     # We can create empty files for FAKELIB in Ninja because it
     # does not care about content signatures. We have to
     # write_uuid_to_file for FAKELIB in SCons because SCons does.
     env.NinjaRule(
         rule="FAKELIB",
-        command="cmd /c copy NUL $out" if env["PLATFORM"] == "win32" else "touch $out",
+        command="cmd /c copy 1>NUL NUL $out" if env["PLATFORM"] == "win32" else "touch $out",
     )
 
     def fakelib_in_ninja(env, node):
@@ -3851,14 +3910,42 @@ if get_option('ninja') == 'true':
 
     env.NinjaRegisterFunctionHandler("write_uuid_to_file", fakelib_in_ninja)
 
+    def ninja_test_list_builder(env, node):
+        test_files = [test_file.path for test_file in env["MONGO_TEST_REGISTRY"][node.path]]
+        files = "\\n".join(test_files)
+        return {
+            "outputs": node.get_path(),
+            "rule": "TEST_LIST",
+            "implicit": test_files,
+            "variables": {
+                "files": files,
+            }
+        }
+
+    env.NinjaRule(
+        rule="TEST_LIST",
+        description="Compiling test list: $out",
+        command="{}echo '$files' > '$out'".format(
+            "cmd.exe /c " if env["PLATFORM"] == "win32" else "",
+        ),
+    )
+    env.NinjaRegisterFunctionHandler("test_list_builder_action", ninja_test_list_builder)
+
+
 # TODO: Later, this should live somewhere more graceful.
 if get_option('install-mode') == 'hygienic':
 
-    if get_option('separate-debug') == "on":
+    if get_option('separate-debug') == "on" or env.TargetOSIs("windows"):
         env.Tool('separate_debug')
 
-    env["AIB_TARBALL_SUFFIX"] = "tgz"
+    env["AUTO_ARCHIVE_TARBALL_SUFFIX"] = "tgz"
+
+    env["AIB_META_COMPONENT"] = "all"
+    env["AIB_BASE_COMPONENT"] = "common"
+    env["AIB_DEFAULT_COMPONENT"] = "mongodb"
+
     env.Tool('auto_install_binaries')
+    env.Tool('auto_archive')
 
     env.DeclareRoles(
         roles=[
@@ -3890,7 +3977,6 @@ if get_option('install-mode') == 'hygienic':
                     # runtime package.
                     "debug" if env.TargetOSIs('windows') else None,
                 ],
-                transitive=True,
                 silent=True,
             ),
         ],
@@ -3898,62 +3984,106 @@ if get_option('install-mode') == 'hygienic':
         meta_role="meta",
     )
 
+    def _aib_debugdir(source, target, env, for_signature):
+        for s in source:
+            origin = getattr(s.attributes, "debug_file_for", None)
+            oentry = env.Entry(origin)
+            osuf = oentry.get_suffix()
+            map_entry = env["AIB_SUFFIX_MAP"].get(osuf)
+            if map_entry:
+                return map_entry[0]
+
+        return "Unable to find debuginfo for {}".format(str(source))
+
+    env["PREFIX_DEBUGDIR"] = _aib_debugdir
+
     env.AddSuffixMapping({
         "$PROGSUFFIX": env.SuffixMap(
             directory="$PREFIX_BINDIR",
-            default_roles=[
-                "runtime",
-            ]
-        ),
-
-        "$LIBSUFFIX": env.SuffixMap(
-            directory="$PREFIX_LIBDIR",
-            default_roles=[
-                "dev",
-            ]
+            default_role="runtime",
         ),
 
         "$SHLIBSUFFIX": env.SuffixMap(
             directory="$PREFIX_BINDIR" \
             if mongo_platform.get_running_os_name() == "windows" \
             else "$PREFIX_LIBDIR",
-            default_roles=[
-                "runtime",
-            ]
+            default_role="runtime",
         ),
 
         ".debug": env.SuffixMap(
             directory="$PREFIX_DEBUGDIR",
-            default_roles=[
-                "debug",
-            ]
+            default_role="debug",
         ),
 
         ".dSYM": env.SuffixMap(
             directory="$PREFIX_DEBUGDIR",
-            default_roles=[
-                "debug"
-            ]
+            default_role="debug",
         ),
 
         ".pdb": env.SuffixMap(
             directory="$PREFIX_DEBUGDIR",
-            default_roles=[
-                "debug"
-            ]
+            default_role="debug",
         ),
     })
 
     env.AddPackageNameAlias(
         component="dist",
         role="runtime",
-        name="${SERVER_DIST_BASENAME}",
+        name="mongodb-dist",
     )
 
     env.AddPackageNameAlias(
         component="dist",
         role="debug",
-        name="${SERVER_DIST_BASENAME}-debugsymbols",
+        name="mongodb-dist-debugsymbols",
+    )
+
+    env.AddPackageNameAlias(
+        component="dist-test",
+        role="runtime",
+        name="mongodb-binaries",
+    )
+
+    env.AddPackageNameAlias(
+        component="dist-test",
+        role="debug",
+        name="mongo-debugsymbols",
+    )
+
+    env.AddPackageNameAlias(
+        component="dbtest",
+        role="runtime",
+        name="dbtest-binary",
+    )
+
+    env.AddPackageNameAlias(
+        component="dbtest",
+        role="debug",
+        name="dbtest-debugsymbols",
+    )
+
+    env.AddPackageNameAlias(
+        component="shell",
+        role="runtime",
+        name="mongodb-shell",
+    )
+
+    env.AddPackageNameAlias(
+        component="shell",
+        role="debug",
+        name="mongodb-shell-debugsymbols",
+    )
+
+    env.AddPackageNameAlias(
+        component="mongocryptd",
+        role="runtime",
+        name="mongodb-cryptd",
+    )
+
+    env.AddPackageNameAlias(
+        component="mongocryptd",
+        role="debug",
+        name="mongodb-cryptd-debugsymbols",
     )
 
     env.AddPackageNameAlias(
@@ -3962,7 +4092,7 @@ if get_option('install-mode') == 'hygienic':
         # TODO: we should be able to move this to where the mqlrun binary is
         # defined when AIB correctly uses environments instead of hooking into
         # the first environment used.
-        name="${MH_DIST_BASENAME}-binaries",
+        name="mh-binaries",
     )
 
     env.AddPackageNameAlias(
@@ -3971,7 +4101,7 @@ if get_option('install-mode') == 'hygienic':
         # TODO: we should be able to move this to where the mqlrun binary is
         # defined when AIB correctly uses environments instead of hooking into
         # the first environment used.
-        name="${MH_DIST_BASENAME}-debugsymbols",
+        name="mh-debugsymbols",
     )
 
     if env['PLATFORM'] == 'posix':
@@ -4016,7 +4146,7 @@ if split_dwarf.exists(env):
 
 # Load the compilation_db tool. We want to do this after configure so we don't end up with
 # compilation database entries for the configure tests, which is weird.
-if get_option('ninja') == 'false':
+if get_option('ninja') == 'disabled':
     env.Tool("compilation_db")
 
 # If we can, load the dagger tool for build dependency graph introspection.
@@ -4197,7 +4327,6 @@ Export([
     'has_option',
     'http_client',
     'inmemory',
-    'mobile_se',
     'module_sconscripts',
     'optBuild',
     'serverJs',
@@ -4221,7 +4350,7 @@ def injectModule(env, module, **kwargs):
     return env
 env.AddMethod(injectModule, 'InjectModule')
 
-if get_option('ninja') == 'false':
+if get_option('ninja') == 'disabled':
     compileCommands = env.CompilationDatabase('compile_commands.json')
     compileDb = env.Alias("compiledb", compileCommands)
 
@@ -4231,24 +4360,27 @@ if 'MSVC_VERSION' in env and env['MSVC_VERSION']:
     msvc_version = "--version " + env['MSVC_VERSION'] + " "
 
 # Microsoft Visual Studio Project generation for code browsing
-if get_option("ninja") == "false":
+if get_option("ninja") == "disabled":
     vcxprojFile = env.Command(
         "mongodb.vcxproj",
         compileCommands,
         r"$PYTHON buildscripts\make_vcxproj.py " + msvc_version + "mongodb")
     vcxproj = env.Alias("vcxproj", vcxprojFile)
 
-distSrc = env.DistSrc("mongodb-src-${MONGO_VERSION}.tar")
+# TODO: maybe make these work like the other archive- hygienic aliases
+# even though they aren't piped through AIB?
+distSrc = env.DistSrc("distsrc.tar", NINJA_SKIP=True)
 env.NoCache(distSrc)
 env.Alias("distsrc-tar", distSrc)
 
 distSrcGzip = env.GZip(
-    target="mongodb-src-${MONGO_VERSION}.tgz",
-    source=[distSrc])
+    target="distsrc.tgz",
+    source=[distSrc],
+    NINJA_SKIP=True)
 env.NoCache(distSrcGzip)
 env.Alias("distsrc-tgz", distSrcGzip)
 
-distSrcZip = env.DistSrc("mongodb-src-${MONGO_VERSION}.zip")
+distSrcZip = env.DistSrc("distsrc.zip", NINJA_SKIP=True)
 env.NoCache(distSrcZip)
 env.Alias("distsrc-zip", distSrcZip)
 
@@ -4271,10 +4403,11 @@ env.Alias("distsrc", "distsrc-tgz")
 #
 # psutil.cpu_count returns None when it can't determine the number. This always
 # fails on BSD's for example.
-if psutil.cpu_count() is not None and 'ICECC' not in env:
-    env.SetOption('num_jobs', psutil.cpu_count())
-elif psutil.cpu_count() and 'ICECC' in env:
-    env.SetOption('num_jobs', 8 * psutil.cpu_count())
+cpu_count = psutil.cpu_count()
+if cpu_count is not None and 'ICECC' in env and get_option("ninja") == "disabled":
+    env.SetOption('num_jobs', 8 * cpu_count)
+elif cpu_count is not None:
+    env.SetOption('num_jobs', cpu_count)
 
 
 # Do this as close to last as possible before reading SConscripts, so
@@ -4348,6 +4481,21 @@ if has_option("cache"):
         addNoCacheEmitter(env['BUILDERS']['SharedLibrary'])
         addNoCacheEmitter(env['BUILDERS']['LoadableModule'])
 
+
+resmoke_install_dir = env.subst("$PREFIX_BINDIR") if get_option("install-mode") == "hygienic" else env.Dir("#").abspath
+resmoke_install_dir = os.path.normpath(resmoke_install_dir).replace("\\", r"\\")
+
+# Much blood sweat and tears were shed getting to this point. Any version of
+# this that uses SCons builders and a scanner will either not regenerate when it
+# should, cause everything to rebuild, or conflict with ninja. Sometimes all
+# three. So we've decieded it's best to just write this file here every time
+# because it's the only solution that always works.
+with open("resmoke.ini", "w") as resmoke_config:
+    resmoke_config.write("""
+[resmoke]
+install_dir = {install_dir}
+""".format(install_dir=resmoke_install_dir))
+
 env.SConscript(
     dirs=[
         'src',
@@ -4396,22 +4544,10 @@ cachePrune = env.Command(
 )
 
 env.AlwaysBuild(cachePrune)
-env.Alias('cache-prune', cachePrune)
 
 if get_option('install-mode') == 'hygienic':
     env.FinalizeInstallDependencies()
-    # TODO: Remove once hygienic is driving all builds and we can make
-    # the evergreen.yml make this decision
-    if env.TargetOSIs("windows"):
-        env.Alias("archive-dist", "zip-dist")
-        env.Alias("archive-dist-debug", "zip-dist-debug")
-        env.Alias("archive-mh", "zip-mh")
-        env.Alias("archive-mh-debug", "zip-mh-debug")
-    else:
-        env.Alias("archive-dist", "tar-dist")
-        env.Alias("archive-dist-debug", "tar-dist-debug")
-        env.Alias("archive-mh", "tar-mh")
-        env.Alias("archive-mh-debug", "tar-mh-debug")
+
 
 # We don't want installing files to cause them to flow into the cache,
 # since presumably we can re-install them from the origin if needed.

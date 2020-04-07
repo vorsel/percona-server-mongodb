@@ -28,6 +28,7 @@
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
@@ -58,9 +59,11 @@
 #include "mongo/logger/rotatable_file_manager.h"
 #include "mongo/logger/rotatable_file_writer.h"
 #include "mongo/logger/syslog_appender.h"
+#include "mongo/logv2/log.h"
 #include "mongo/logv2/log_domain_global.h"
 #include "mongo/platform/process_id.h"
-#include "mongo/util/log.h"
+#include "mongo/util/exit_code.h"
+#include "mongo/util/log_global_settings.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/signal_handlers_synchronous.h"
@@ -220,10 +223,12 @@ MONGO_INITIALIZER_GENERAL(ServerLogRedirection,
     using logger::StatusWithRotatableFileWriter;
 
     // Hook up this global into our logging encoder
-    MessageEventDetailsEncoder::setMaxLogSizeKBSource(gMaxLogSizeKB);
     LogManager* manager = logger::globalLogManager();
     auto& lv2Manager = logv2::LogManager::global();
     logv2::LogDomainGlobal::ConfigurationOptions lv2Config;
+    MessageEventDetailsEncoder::setMaxLogSizeKBSource(gMaxLogAttributeSizeKB);
+    lv2Config.maxAttributeSizeKB = &gMaxLogAttributeSizeKB;
+    bool writeServerRestartedAfterLogConfig = false;
 
     if (serverGlobalParams.logWithSyslog) {
 #ifdef _WIN32
@@ -239,9 +244,9 @@ MONGO_INITIALIZER_GENERAL(ServerLogRedirection,
             javascriptAppender = std::make_unique<logger::LogV2Appender<MessageEventEphemeral>>(
                 &(lv2Manager.getGlobalDomain()), true);
 
-            lv2Config._consoleEnabled = false;
-            lv2Config._syslogEnabled = true;
-            lv2Config._syslogFacility = serverGlobalParams.syslogFacility;
+            lv2Config.consoleEnabled = false;
+            lv2Config.syslogEnabled = true;
+            lv2Config.syslogFacility = serverGlobalParams.syslogFacility;
         } else {
             using logger::SyslogAppender;
             StringBuilder sb;
@@ -286,8 +291,10 @@ MONGO_INITIALIZER_GENERAL(ServerLogRedirection,
                 boost::system::error_code ec;
                 boost::filesystem::rename(absoluteLogpath, renameTarget, ec);
                 if (!ec) {
-                    log() << "log file \"" << absoluteLogpath << "\" exists; moved to \""
-                          << renameTarget << "\".";
+                    LOGV2(20697,
+                          "log file \"{absoluteLogpath}\" exists; moved to \"{renameTarget}\".",
+                          "absoluteLogpath"_attr = absoluteLogpath,
+                          "renameTarget"_attr = renameTarget);
                 } else {
                     return Status(ErrorCodes::FileRenameFailed,
                                   str::stream()
@@ -309,22 +316,18 @@ MONGO_INITIALIZER_GENERAL(ServerLogRedirection,
             javascriptAppender = std::make_unique<logger::LogV2Appender<MessageEventEphemeral>>(
                 &(lv2Manager.getGlobalDomain()), true);
 
-            lv2Config._consoleEnabled = false;
-            lv2Config._fileEnabled = true;
-            lv2Config._filePath = absoluteLogpath;
-            lv2Config._fileRotationMode = serverGlobalParams.logRenameOnRotate
+            lv2Config.consoleEnabled = false;
+            lv2Config.fileEnabled = true;
+            lv2Config.filePath = absoluteLogpath;
+            lv2Config.fileRotationMode = serverGlobalParams.logRenameOnRotate
                 ? logv2::LogDomainGlobal::ConfigurationOptions::RotationMode::kRename
                 : logv2::LogDomainGlobal::ConfigurationOptions::RotationMode::kReopen;
-            lv2Config._fileOpenMode = serverGlobalParams.logAppend
+            lv2Config.fileOpenMode = serverGlobalParams.logAppend
                 ? logv2::LogDomainGlobal::ConfigurationOptions::OpenMode::kAppend
                 : logv2::LogDomainGlobal::ConfigurationOptions::OpenMode::kTruncate;
 
             if (serverGlobalParams.logAppend && exists) {
-                log() << "***** SERVER RESTARTED *****";
-                // FIXME rewrite for logv2
-                // Status status = logger::RotatableFileWriter::Use(writer.getValue()).status();
-                // if (!status.isOK())
-                //    return status;
+                writeServerRestartedAfterLogConfig = true;
             }
 
         } else {
@@ -338,7 +341,7 @@ MONGO_INITIALIZER_GENERAL(ServerLogRedirection,
             javascriptAppender = std::make_unique<RotatableFileAppender<MessageEventEphemeral>>(
                 std::make_unique<MessageEventDetailsEncoder>(), writer.getValue());
             if (serverGlobalParams.logAppend && exists) {
-                log() << "***** SERVER RESTARTED *****";
+                LOGV2(20699, "***** SERVER RESTARTED *****");
                 Status status = logger::RotatableFileWriter::Use(writer.getValue()).status();
                 if (!status.isOK())
                     return status;
@@ -372,8 +375,11 @@ MONGO_INITIALIZER_GENERAL(ServerLogRedirection,
 
 
     if (logV2Enabled()) {
-        lv2Config._format = serverGlobalParams.logFormat;
-        return lv2Manager.getGlobalDomainInternal().configure(lv2Config);
+        lv2Config.timestampFormat = serverGlobalParams.logTimestampFormat;
+        Status result = lv2Manager.getGlobalDomainInternal().configure(lv2Config);
+        if (result.isOK() && writeServerRestartedAfterLogConfig)
+            LOGV2(20698, "***** SERVER RESTARTED *****");
+        return result;
     }
 
     return Status::OK();

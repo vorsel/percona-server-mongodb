@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -60,6 +60,7 @@
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/client.h"
+#include "mongo/db/client_metadata_propagation_egress_hook.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/commands/feature_compatibility_version_gen.h"
@@ -95,12 +96,15 @@
 #include "mongo/db/logical_session_cache_factory_mongod.h"
 #include "mongo/db/logical_time_metadata_hook.h"
 #include "mongo/db/logical_time_validator.h"
+#include "mongo/db/mirror_maestro.h"
 #include "mongo/db/mongod_options.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/op_observer_impl.h"
 #include "mongo/db/op_observer_registry.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/periodic_runner_job_abort_expired_transactions.h"
 #include "mongo/db/periodic_runner_job_decrease_snapshot_cache_pressure.h"
+#include "mongo/db/pipeline/process_interface/replica_set_node_process_interface.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/read_write_concern_defaults_cache_lookup_mongod.h"
 #include "mongo/db/repair_database_and_check_version.h"
@@ -118,9 +122,12 @@
 #include "mongo/db/repl/topology_coordinator.h"
 #include "mongo/db/repl_set_member_in_standalone_mode.h"
 #include "mongo/db/s/balancer/balancer.h"
+#include "mongo/db/s/collection_sharding_state_factory_shard.h"
+#include "mongo/db/s/collection_sharding_state_factory_standalone.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/config_server_op_observer.h"
 #include "mongo/db/s/op_observer_sharding_impl.h"
+#include "mongo/db/s/periodic_sharded_index_consistency_checker.h"
 #include "mongo/db/s/shard_server_op_observer.h"
 #include "mongo/db/s/sharding_initialization_mongod.h"
 #include "mongo/db/s/sharding_state_recovery.h"
@@ -148,6 +155,7 @@
 #include "mongo/executor/network_interface_factory.h"
 #include "mongo/executor/network_interface_thread_pool.h"
 #include "mongo/executor/thread_pool_task_executor.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/process_id.h"
 #include "mongo/platform/random.h"
 #include "mongo/rpc/metadata/egress_metadata_hook_list.h"
@@ -169,7 +177,7 @@
 #include "mongo/util/fail_point.h"
 #include "mongo/util/fast_clock_source_factory.h"
 #include "mongo/util/latch_analyzer.h"
-#include "mongo/util/log.h"
+#include "mongo/util/net/ocsp/ocsp_manager.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/ntservice.h"
@@ -267,28 +275,27 @@ void initWireSpec() {
     spec.isInternalClient = true;
 }
 
+void initializeCommandHooks(ServiceContext* serviceContext) {
+    class MongodCommandInvocationHooks final : public CommandInvocationHooks {
+        void onBeforeRun(OperationContext*, const OpMsgRequest&, CommandInvocation*) {}
+
+        void onAfterRun(OperationContext* opCtx, const OpMsgRequest&, CommandInvocation*) {
+            MirrorMaestro::tryMirrorRequest(opCtx);
+        }
+    };
+
+    MirrorMaestro::init(serviceContext);
+    CommandInvocationHooks::set(serviceContext, std::make_shared<MongodCommandInvocationHooks>());
+}
+
 MONGO_FAIL_POINT_DEFINE(shutdownAtStartup);
 
-ExitCode _initAndListen(int listenPort) {
+ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
     Client::initThread("initandlisten");
 
     initWireSpec();
-    auto serviceContext = getGlobalServiceContext();
 
     serviceContext->setFastClockSource(FastClockSourceFactory::create(Milliseconds(10)));
-    auto opObserverRegistry = std::make_unique<OpObserverRegistry>();
-    opObserverRegistry->addObserver(std::make_unique<OpObserverShardingImpl>());
-    opObserverRegistry->addObserver(std::make_unique<AuthOpObserver>());
-
-    if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
-        opObserverRegistry->addObserver(std::make_unique<ShardServerOpObserver>());
-    } else if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-        opObserverRegistry->addObserver(std::make_unique<ConfigServerOpObserver>());
-    }
-    setupFreeMonitoringOpObserver(opObserverRegistry.get());
-
-
-    serviceContext->setOpObserver(std::move(opObserverRegistry));
 
     DBDirectClientFactory::get(serviceContext).registerImplementation([](OperationContext* opCtx) {
         return std::unique_ptr<DBClientBase>(new DBDirectClient(opCtx));
@@ -299,16 +306,19 @@ ExitCode _initAndListen(int listenPort) {
 
     {
         ProcessId pid = ProcessId::getCurrent();
-        LogstreamBuilder l = log(LogComponent::kControl);
-        l << "MongoDB starting : pid=" << pid << " port=" << serverGlobalParams.port
-          << " dbpath=" << storageGlobalParams.dbpath;
-
         const bool is32bit = sizeof(int*) == 4;
-        l << (is32bit ? " 32" : " 64") << "-bit host=" << getHostNameCached() << endl;
+        LOGV2(4615611,
+              "MongoDB starting",
+              "pid"_attr = pid.toNative(),
+              "port"_attr = serverGlobalParams.port,
+              "dbpath"_attr = boost::filesystem::path(storageGlobalParams.dbpath).generic_string(),
+              "architecture"_attr = (is32bit ? "32-bit" : "64-bit"),
+              "host"_attr = getHostNameCached());
     }
 
     if (kDebugBuild)
-        log(LogComponent::kControl) << "DEBUG build (which is slower)" << endl;
+        LOGV2_OPTIONS(
+            20533, {logComponentV1toV2(LogComponent::kControl)}, "DEBUG build (which is slower)");
 
 #if defined(_WIN32)
     VersionInfoInterface::instance().logTargetMinOS();
@@ -318,21 +328,24 @@ ExitCode _initAndListen(int listenPort) {
 
     serviceContext->setServiceEntryPoint(std::make_unique<ServiceEntryPointMongod>(serviceContext));
 
+    // Set up the periodic runner for background job execution. This is required to be running
+    // before both the storage engine or the transport layer are initialized.
+    auto runner = makePeriodicRunner(serviceContext);
+    serviceContext->setPeriodicRunner(std::move(runner));
+
+    OCSPManager::get()->startThreadPool();
+
     if (!storageGlobalParams.repair) {
         auto tl =
             transport::TransportLayerManager::createWithConfig(&serverGlobalParams, serviceContext);
         auto res = tl->setup();
         if (!res.isOK()) {
-            error() << "Failed to set up listener: " << res;
+            LOGV2_ERROR(20568, "Failed to set up listener: {res}", "res"_attr = res);
             return EXIT_NET_ERROR;
         }
         serviceContext->setTransportLayer(std::move(tl));
     }
 
-    // Set up the periodic runner for background job execution. This is required to be running
-    // before the storage engine is initialized.
-    auto runner = makePeriodicRunner(serviceContext);
-    serviceContext->setPeriodicRunner(std::move(runner));
     FlowControl::set(serviceContext,
                      std::make_unique<FlowControl>(
                          serviceContext, repl::ReplicationCoordinator::get(serviceContext)));
@@ -358,9 +371,11 @@ ExitCode _initAndListen(int listenPort) {
 
             // Warn if field name matches non-active registered storage engine.
             if (isRegisteredStorageEngine(serviceContext, e.fieldName())) {
-                warning() << "Detected configuration for non-active storage engine "
-                          << e.fieldName() << " when current storage engine is "
-                          << storageGlobalParams.engine;
+                LOGV2_WARNING(20566,
+                              "Detected configuration for non-active storage engine {e_fieldName} "
+                              "when current storage engine is {storageGlobalParams_engine}",
+                              "e_fieldName"_attr = e.fieldName(),
+                              "storageGlobalParams_engine"_attr = storageGlobalParams.engine);
             }
         }
     }
@@ -368,17 +383,20 @@ ExitCode _initAndListen(int listenPort) {
     // Disallow running a storage engine that doesn't support capped collections with --profile
     if (!serviceContext->getStorageEngine()->supportsCappedCollections() &&
         serverGlobalParams.defaultProfile != 0) {
-        log() << "Running " << storageGlobalParams.engine << " with profiling is not supported. "
-              << "Make sure you are not using --profile.";
+        LOGV2(20534,
+              "Running {storageGlobalParams_engine} with profiling is not supported. Make sure you "
+              "are not using --profile.",
+              "storageGlobalParams_engine"_attr = storageGlobalParams.engine);
         exitCleanly(EXIT_BADOPTIONS);
     }
 
     // Disallow running WiredTiger with --nojournal in a replica set
     if (storageGlobalParams.engine == "wiredTiger" && !storageGlobalParams.dur &&
         replSettings.usingReplSets()) {
-        log() << "Running wiredTiger without journaling in a replica set is not "
-              << "supported. Make sure you are not using --nojournal and that "
-              << "storage.journal.enabled is not set to 'false'.";
+        LOGV2(20535,
+              "Running wiredTiger without journaling in a replica set is not supported. Make sure "
+              "you are not using --nojournal and that storage.journal.enabled is not set to "
+              "'false'.");
         exitCleanly(EXIT_BADOPTIONS);
     }
 
@@ -421,7 +439,10 @@ ExitCode _initAndListen(int listenPort) {
     try {
         nonLocalDatabases = repairDatabasesAndCheckVersion(startupOpCtx.get());
     } catch (const ExceptionFor<ErrorCodes::MustDowngrade>& error) {
-        severe(LogComponent::kControl) << "** IMPORTANT: " << error.toStatus().reason();
+        LOGV2_FATAL_OPTIONS(20573,
+                            {logComponentV1toV2(LogComponent::kControl)},
+                            "** IMPORTANT: {error_toStatus_reason}",
+                            "error_toStatus_reason"_attr = error.toStatus().reason());
         exitCleanly(EXIT_NEED_DOWNGRADE);
     }
 
@@ -443,11 +464,11 @@ ExitCode _initAndListen(int listenPort) {
     }
 
     if (gFlowControlEnabled.load()) {
-        log() << "Flow Control is enabled on this deployment.";
+        LOGV2(20536, "Flow Control is enabled on this deployment.");
     }
 
     if (storageGlobalParams.upgrade) {
-        log() << "finished checking dbs";
+        LOGV2(20537, "finished checking dbs");
         exitCleanly(EXIT_CLEAN);
     }
 
@@ -463,7 +484,7 @@ ExitCode _initAndListen(int listenPort) {
     if (globalAuthzManager->shouldValidateAuthSchemaOnStartup()) {
         Status status = verifySystemIndexes(startupOpCtx.get());
         if (!status.isOK()) {
-            log() << redact(status);
+            LOGV2(20538, "{status}", "status"_attr = redact(status));
             if (status == ErrorCodes::AuthSchemaIncompatible) {
                 exitCleanly(EXIT_NEED_UPGRADE);
             } else if (status == ErrorCodes::NotMaster) {
@@ -479,37 +500,44 @@ ExitCode _initAndListen(int listenPort) {
         status =
             globalAuthzManager->getAuthorizationVersion(startupOpCtx.get(), &foundSchemaVersion);
         if (!status.isOK()) {
-            log() << "Auth schema version is incompatible: "
-                  << "User and role management commands require auth data to have "
-                  << "at least schema version " << AuthorizationManager::schemaVersion26Final
-                  << " but startup could not verify schema version: " << status;
-            log() << "To manually repair the 'authSchema' document in the admin.system.version "
-                     "collection, start up with --setParameter "
-                     "startupAuthSchemaValidation=false to disable validation.";
+            LOGV2(20539,
+                  "Auth schema version is incompatible: User and role management commands require "
+                  "auth data to have at least schema version "
+                  "{AuthorizationManager_schemaVersion26Final} but startup could not verify schema "
+                  "version: {status}",
+                  "AuthorizationManager_schemaVersion26Final"_attr =
+                      AuthorizationManager::schemaVersion26Final,
+                  "status"_attr = status);
+            LOGV2(20540,
+                  "To manually repair the 'authSchema' document in the admin.system.version "
+                  "collection, start up with --setParameter "
+                  "startupAuthSchemaValidation=false to disable validation.");
             exitCleanly(EXIT_NEED_UPGRADE);
         }
 
         if (foundSchemaVersion <= AuthorizationManager::schemaVersion26Final) {
-            log() << "This server is using MONGODB-CR, an authentication mechanism which "
-                  << "has been removed from MongoDB 4.0. In order to upgrade the auth schema, "
-                  << "first downgrade MongoDB binaries to version 3.6 and then run the "
-                  << "authSchemaUpgrade command. "
-                  << "See http://dochub.mongodb.org/core/3.0-upgrade-to-scram-sha-1";
+            LOGV2(20541,
+                  "This server is using MONGODB-CR, an authentication mechanism which has been "
+                  "removed from MongoDB 4.0. In order to upgrade the auth schema, first downgrade "
+                  "MongoDB binaries to version 3.6 and then run the authSchemaUpgrade command. See "
+                  "http://dochub.mongodb.org/core/3.0-upgrade-to-scram-sha-1");
             exitCleanly(EXIT_NEED_UPGRADE);
         }
     } else if (globalAuthzManager->isAuthEnabled()) {
-        error() << "Auth must be disabled when starting without auth schema validation";
+        LOGV2_ERROR(20569, "Auth must be disabled when starting without auth schema validation");
         exitCleanly(EXIT_BADOPTIONS);
     } else {
         // If authSchemaValidation is disabled and server is running without auth,
         // warn the user and continue startup without authSchema metadata checks.
-        log() << startupWarningsLog;
-        log() << "** WARNING: Startup auth schema validation checks are disabled for the "
-                 "database."
-              << startupWarningsLog;
-        log() << "**          This mode should only be used to manually repair corrupted auth "
-                 "data."
-              << startupWarningsLog;
+        LOGV2_OPTIONS(20542, {logv2::LogTag::kStartupWarnings}, "");
+        LOGV2_OPTIONS(20543,
+                      {logv2::LogTag::kStartupWarnings},
+                      "** WARNING: Startup auth schema validation checks are disabled for the "
+                      "database.");
+        LOGV2_OPTIONS(20544,
+                      {logv2::LogTag::kStartupWarnings},
+                      "**          This mode should only be used to manually repair corrupted auth "
+                      "data.");
     }
 
     WaitForMajorityService::get(serviceContext).setUp(serviceContext);
@@ -520,8 +548,9 @@ ExitCode _initAndListen(int listenPort) {
     if (shardingInitialized) {
         auto status = waitForShardRegistryReload(startupOpCtx.get());
         if (!status.isOK()) {
-            LOG(0) << "Failed to load the shard registry as part of startup"
-                   << causedBy(redact(status));
+            LOGV2(20545,
+                  "Failed to load the shard registry as part of startup{causedBy_status}",
+                  "causedBy_status"_attr = causedBy(redact(status)));
         }
     }
 
@@ -532,9 +561,12 @@ ExitCode _initAndListen(int listenPort) {
                 .refreshIfNecessary(startupOpCtx.get());
         }
     } catch (const DBException& ex) {
-        warning() << "Failed to load read and write concern defaults at startup"
-                  << causedBy(redact(ex.toStatus()));
+        LOGV2_WARNING(
+            20567,
+            "Failed to load read and write concern defaults at startup{causedBy_ex_toStatus}",
+            "causedBy_ex_toStatus"_attr = causedBy(redact(ex.toStatus())));
     }
+    readWriteConcernDefaultsMongodStartupChecks(startupOpCtx.get());
 
     auto storageEngine = serviceContext->getStorageEngine();
     invariant(storageEngine);
@@ -606,27 +638,40 @@ ExitCode _initAndListen(int listenPort) {
 
             LogicalTimeValidator::set(startupOpCtx->getServiceContext(),
                                       std::make_unique<LogicalTimeValidator>(keyManager));
+
+            ReplicaSetNodeProcessInterface::getReplicaSetNodeExecutor(serviceContext)->startup();
         }
 
         replCoord->startup(startupOpCtx.get());
         if (getReplSetMemberInStandaloneMode(serviceContext)) {
-            log() << startupWarningsLog;
-            log() << "** WARNING: mongod started without --replSet yet document(s) are present in "
-                  << NamespaceString::kSystemReplSetNamespace << "." << startupWarningsLog;
-            log() << "**          Database contents may appear inconsistent with the oplog and may "
-                     "appear to not contain"
-                  << startupWarningsLog;
-            log() << "**          writes that were visible when this node was running as part of a "
-                     "replica set."
-                  << startupWarningsLog;
-            log() << "**          Restart with --replSet unless you are doing maintenance and no "
-                     "other clients are connected."
-                  << startupWarningsLog;
-            log() << "**          The TTL collection monitor will not start because of this."
-                  << startupWarningsLog;
-            log() << "**         ";
-            log() << " For more info see http://dochub.mongodb.org/core/ttlcollections";
-            log() << startupWarningsLog;
+            LOGV2_OPTIONS(20546, {logv2::LogTag::kStartupWarnings}, "");
+            LOGV2_OPTIONS(20547,
+                          {logv2::LogTag::kStartupWarnings},
+                          "** WARNING: mongod started without --replSet yet document(s) are "
+                          "present in {NamespaceString_kSystemReplSetNamespace}.",
+                          "NamespaceString_kSystemReplSetNamespace"_attr =
+                              NamespaceString::kSystemReplSetNamespace);
+            LOGV2_OPTIONS(
+                20548,
+                {logv2::LogTag::kStartupWarnings},
+                "**          Database contents may appear inconsistent with the oplog and may "
+                "appear to not contain");
+            LOGV2_OPTIONS(
+                20549,
+                {logv2::LogTag::kStartupWarnings},
+                "**          writes that were visible when this node was running as part of a "
+                "replica set.");
+            LOGV2_OPTIONS(
+                20550,
+                {logv2::LogTag::kStartupWarnings},
+                "**          Restart with --replSet unless you are doing maintenance and no "
+                "other clients are connected.");
+            LOGV2_OPTIONS(20551,
+                          {logv2::LogTag::kStartupWarnings},
+                          "**          The TTL collection monitor will not start because of this.");
+            LOGV2(20552, "**         ");
+            LOGV2(20553, " For more info see http://dochub.mongodb.org/core/ttlcollections");
+            LOGV2_OPTIONS(20554, {logv2::LogTag::kStartupWarnings}, "");
         } else {
             startTTLBackgroundJob(serviceContext);
         }
@@ -670,26 +715,30 @@ ExitCode _initAndListen(int listenPort) {
 
     LogicalSessionCache::set(serviceContext, makeLogicalSessionCacheD(kind));
 
+    initializeCommandHooks(serviceContext);
+
     // MessageServer::run will return when exit code closes its socket and we don't need the
     // operation context anymore
     startupOpCtx.reset();
 
     auto start = serviceContext->getServiceExecutor()->start();
     if (!start.isOK()) {
-        error() << "Failed to start the service executor: " << start;
+        LOGV2_ERROR(20570, "Failed to start the service executor: {start}", "start"_attr = start);
         return EXIT_NET_ERROR;
     }
 
     start = serviceContext->getServiceEntryPoint()->start();
     if (!start.isOK()) {
-        error() << "Failed to start the service entry point: " << start;
+        LOGV2_ERROR(
+            20571, "Failed to start the service entry point: {start}", "start"_attr = start);
         return EXIT_NET_ERROR;
     }
 
     if (!storageGlobalParams.repair) {
         start = serviceContext->getTransportLayer()->start();
         if (!start.isOK()) {
-            error() << "Failed to start the listener: " << start.toString();
+            LOGV2_ERROR(
+                20572, "Failed to start the listener: {start}", "start"_attr = start.toString());
             return EXIT_NET_ERROR;
         }
     }
@@ -701,12 +750,12 @@ ExitCode _initAndListen(int listenPort) {
 #else
     if (ntservice::shouldStartService()) {
         ntservice::reportStatus(SERVICE_RUNNING);
-        log() << "Service running";
+        LOGV2(20555, "Service running");
     }
 #endif
 
     if (MONGO_unlikely(shutdownAtStartup.shouldFail())) {
-        log() << "starting clean exit via failpoint";
+        LOGV2(20556, "starting clean exit via failpoint");
         exitCleanly(EXIT_CLEAN);
     }
 
@@ -714,27 +763,29 @@ ExitCode _initAndListen(int listenPort) {
     return waitForShutdown();
 }
 
-ExitCode initAndListen(int listenPort) {
+ExitCode initAndListen(ServiceContext* service, int listenPort) {
     try {
-        return _initAndListen(listenPort);
+        return _initAndListen(service, listenPort);
     } catch (DBException& e) {
-        log() << "exception in initAndListen: " << e.toString() << ", terminating";
+        LOGV2(20557, "exception in initAndListen: {e}, terminating", "e"_attr = e.toString());
         return EXIT_UNCAUGHT;
     } catch (std::exception& e) {
-        log() << "exception in initAndListen std::exception: " << e.what() << ", terminating";
+        LOGV2(20558,
+              "exception in initAndListen std::exception: {e_what}, terminating",
+              "e_what"_attr = e.what());
         return EXIT_UNCAUGHT;
     } catch (int& n) {
-        log() << "exception in initAndListen int: " << n << ", terminating";
+        LOGV2(20559, "exception in initAndListen int: {n}, terminating", "n"_attr = n);
         return EXIT_UNCAUGHT;
     } catch (...) {
-        log() << "exception in initAndListen, terminating";
+        LOGV2(20560, "exception in initAndListen, terminating");
         return EXIT_UNCAUGHT;
     }
 }
 
 #if defined(_WIN32)
 ExitCode initService() {
-    return initAndListen(serverGlobalParams.port);
+    return initAndListen(getGlobalServiceContext(), serverGlobalParams.port);
 }
 #endif
 
@@ -832,10 +883,37 @@ void startupConfigActions(const std::vector<std::string>& args) {
 #endif
 }
 
+void setUpCollectionShardingState(ServiceContext* serviceContext) {
+    if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
+        CollectionShardingStateFactory::set(
+            serviceContext, std::make_unique<CollectionShardingStateFactoryShard>(serviceContext));
+    } else {
+        CollectionShardingStateFactory::set(
+            serviceContext,
+            std::make_unique<CollectionShardingStateFactoryStandalone>(serviceContext));
+    }
+}
+
 void setUpCatalog(ServiceContext* serviceContext) {
     DatabaseHolder::set(serviceContext, std::make_unique<DatabaseHolderImpl>());
     IndexAccessMethodFactory::set(serviceContext, std::make_unique<IndexAccessMethodFactoryImpl>());
     Collection::Factory::set(serviceContext, std::make_unique<CollectionImpl::FactoryImpl>());
+}
+
+auto makeReplicaSetNodeExecutor(ServiceContext* serviceContext) {
+    ThreadPool::Options tpOptions;
+    tpOptions.threadNamePrefix = "ReplNodeDbWorker-";
+    tpOptions.poolName = "ReplNodeDbWorkerThreadPool";
+    tpOptions.maxThreads = ThreadPool::Options::kUnlimited;
+    tpOptions.onCreateThread = [](const std::string& threadName) {
+        Client::initThread(threadName.c_str());
+    };
+    auto hookList = std::make_unique<rpc::EgressMetadataHookList>();
+    hookList->addHook(std::make_unique<rpc::LogicalTimeMetadataHook>(serviceContext));
+    hookList->addHook(std::make_unique<rpc::ClientMetadataPropagationEgressHook>());
+    return std::make_unique<executor::ThreadPoolTaskExecutor>(
+        std::make_unique<ThreadPool>(tpOptions),
+        executor::makeNetworkInterface("ReplNodeDbWorkerNetwork", nullptr, std::move(hookList)));
 }
 
 auto makeReplicationExecutor(ServiceContext* serviceContext) {
@@ -888,10 +966,34 @@ void setUpReplication(ServiceContext* serviceContext) {
         replicationProcess,
         storageInterface,
         SecureRandom().nextInt64());
+    // Only create a ReplicaSetNodeExecutor if sharding is disabled and replication is enabled.
+    // Note that sharding sets up its own executors for scheduling work to remote nodes.
+    if (serverGlobalParams.clusterRole == ClusterRole::None && replCoord->isReplEnabled())
+        ReplicaSetNodeProcessInterface::setReplicaSetNodeExecutor(
+            serviceContext, makeReplicaSetNodeExecutor(serviceContext));
+
     repl::ReplicationCoordinator::set(serviceContext, std::move(replCoord));
     repl::setOplogCollectionName(serviceContext);
 
     IndexBuildsCoordinator::set(serviceContext, std::make_unique<IndexBuildsCoordinatorMongod>());
+}
+
+void setUpObservers(ServiceContext* serviceContext) {
+    auto opObserverRegistry = std::make_unique<OpObserverRegistry>();
+    if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
+        opObserverRegistry->addObserver(std::make_unique<OpObserverShardingImpl>());
+        opObserverRegistry->addObserver(std::make_unique<ShardServerOpObserver>());
+    } else if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+        opObserverRegistry->addObserver(std::make_unique<OpObserverImpl>());
+        opObserverRegistry->addObserver(std::make_unique<ConfigServerOpObserver>());
+    } else {
+        opObserverRegistry->addObserver(std::make_unique<OpObserverImpl>());
+    }
+    opObserverRegistry->addObserver(std::make_unique<AuthOpObserver>());
+
+    setupFreeMonitoringOpObserver(opObserverRegistry.get());
+
+    serviceContext->setOpObserver(std::move(opObserverRegistry));
 }
 
 #ifdef MONGO_CONFIG_SSL
@@ -943,11 +1045,14 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
             } catch (const ExceptionFor<ErrorCodes::NotMaster>&) {
                 // ignore not master errors
             } catch (const DBException& e) {
-                log() << "Failed to stepDown in non-command initiated shutdown path "
-                      << e.toString();
+                LOGV2(20561,
+                      "Failed to stepDown in non-command initiated shutdown path {e}",
+                      "e"_attr = e.toString());
             }
         }
     }
+
+    MirrorMaestro::shutdown(serviceContext);
 
     WaitForMajorityService::get(serviceContext).shutDown();
 
@@ -962,9 +1067,16 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
         lsc->joinOnShutDown();
     }
 
+    // Terminate the index consistency check.
+    if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+        PeriodicShardedIndexConsistencyChecker::get(serviceContext).onShutDown();
+    }
+
     // Shutdown the TransportLayer so that new connections aren't accepted
     if (auto tl = serviceContext->getTransportLayer()) {
-        log(LogComponent::kNetwork) << "shutdown: going to close listening sockets...";
+        LOGV2_OPTIONS(20562,
+                      {logComponentV1toV2(LogComponent::kNetwork)},
+                      "shutdown: going to close listening sockets...");
         tl->shutdown();
     }
 
@@ -975,6 +1087,11 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
     // Periodic Runner is shut down (see SERVER-41751).
     if (auto flowControlTicketholder = FlowControlTicketholder::get(serviceContext)) {
         flowControlTicketholder->setInShutdown();
+    }
+
+    if (auto exec = ReplicaSetNodeProcessInterface::getReplicaSetNodeExecutor(serviceContext)) {
+        exec->shutdown();
+        exec->join();
     }
 
     if (auto storageEngine = serviceContext->getStorageEngine()) {
@@ -1059,8 +1176,9 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
     // Shutdown the Service Entry Point and its sessions and give it a grace period to complete.
     if (auto sep = serviceContext->getServiceEntryPoint()) {
         if (!sep->shutdown(Seconds(10))) {
-            log(LogComponent::kNetwork)
-                << "Service entry point failed to shutdown within timelimit.";
+            LOGV2_OPTIONS(20563,
+                          {logComponentV1toV2(LogComponent::kNetwork)},
+                          "Service entry point failed to shutdown within timelimit.");
         }
     }
 
@@ -1068,8 +1186,10 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
     if (auto svcExec = serviceContext->getServiceExecutor()) {
         Status status = svcExec->shutdown(Seconds(10));
         if (!status.isOK()) {
-            log(LogComponent::kNetwork)
-                << "Service executor failed to shutdown within timelimit: " << status.reason();
+            LOGV2_OPTIONS(20564,
+                          {logComponentV1toV2(LogComponent::kNetwork)},
+                          "Service executor failed to shutdown within timelimit: {status_reason}",
+                          "status_reason"_attr = status.reason());
         }
     }
 #endif
@@ -1098,11 +1218,13 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
     // the memory and makes leak sanitizer happy.
     ScriptEngine::dropScopeCache();
 
-    log(LogComponent::kControl) << "now exiting";
+    LOGV2_OPTIONS(20565, {logComponentV1toV2(LogComponent::kControl)}, "now exiting");
 
     audit::logShutdown(client);
 
+#ifndef MONGO_CONFIG_USE_RAW_LATCHES
     LatchAnalyzer::get(serviceContext).dump();
+#endif
 }
 
 int mongoDbMain(int argc, char* argv[], char** envp) {
@@ -1114,21 +1236,34 @@ int mongoDbMain(int argc, char* argv[], char** envp) {
 
     Status status = mongo::runGlobalInitializers(argc, argv, envp);
     if (!status.isOK()) {
-        severe(LogComponent::kControl) << "Failed global initialization: " << status;
+        LOGV2_FATAL_OPTIONS(20574,
+                            {logComponentV1toV2(LogComponent::kControl)},
+                            "Failed global initialization: {status}",
+                            "status"_attr = status);
         quickExit(EXIT_FAILURE);
     }
 
-    try {
-        setGlobalServiceContext(ServiceContext::make());
-    } catch (...) {
-        auto cause = exceptionToStatus();
-        severe(LogComponent::kControl) << "Failed to create service context: " << redact(cause);
-        quickExit(EXIT_FAILURE);
-    }
+    auto* service = [] {
+        try {
+            auto serviceContextHolder = ServiceContext::make();
+            auto* serviceContext = serviceContextHolder.get();
+            setGlobalServiceContext(std::move(serviceContextHolder));
 
-    auto service = getGlobalServiceContext();
+            return serviceContext;
+        } catch (...) {
+            auto cause = exceptionToStatus();
+            LOGV2_FATAL_OPTIONS(20575,
+                                {logComponentV1toV2(LogComponent::kControl)},
+                                "Failed to create service context: {cause}",
+                                "cause"_attr = redact(cause));
+            quickExit(EXIT_FAILURE);
+        }
+    }();
+
+    setUpCollectionShardingState(service);
     setUpCatalog(service);
     setUpReplication(service);
+    setUpObservers(service);
     service->setServiceEntryPoint(std::make_unique<ServiceEntryPointMongod>(service));
 
     ErrorExtraInfo::invariantHaveAllParsers();
@@ -1155,7 +1290,7 @@ int mongoDbMain(int argc, char* argv[], char** envp) {
     }
 #endif
 
-    ExitCode exitCode = initAndListen(serverGlobalParams.port);
+    ExitCode exitCode = initAndListen(service, serverGlobalParams.port);
     exitCleanly(exitCode);
     return 0;
 }

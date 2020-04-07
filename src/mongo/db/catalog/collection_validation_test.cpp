@@ -93,12 +93,16 @@ public:
  */
 void foregroundValidate(
     OperationContext* opCtx, bool valid, int numRecords, int numInvalidDocuments, int numErrors) {
-    std::vector<bool> levels = {false, true};
-    for (auto level : levels) {
+    std::vector<CollectionValidation::ValidateOptions> optionsList = {
+        CollectionValidation::ValidateOptions::kNoFullValidation,
+        CollectionValidation::ValidateOptions::kFullRecordStoreValidation,
+        CollectionValidation::ValidateOptions::kFullIndexValidation,
+        CollectionValidation::ValidateOptions::kFullValidation};
+    for (auto options : optionsList) {
         ValidateResults validateResults;
         BSONObjBuilder output;
         ASSERT_OK(CollectionValidation::validate(
-            opCtx, kNss, level, /*background*/ false, &validateResults, &output));
+            opCtx, kNss, options, /*background*/ false, &validateResults, &output));
         ASSERT_EQ(validateResults.valid, valid);
         ASSERT_EQ(validateResults.errors.size(), static_cast<long unsigned int>(numErrors));
 
@@ -124,16 +128,19 @@ void backgroundValidate(OperationContext* opCtx,
 
     // This function will force a checkpoint, so background validation can then read from that
     // checkpoint.
-    opCtx->recoveryUnit()->waitUntilUnjournaledWritesDurable(opCtx);
+    // Set 'stableCheckpoint' to false, so we checkpoint ALL data, not just up to WT's
+    // stable_timestamp.
+    opCtx->recoveryUnit()->waitUntilUnjournaledWritesDurable(opCtx, /*stableTimestamp*/ false);
 
     ValidateResults validateResults;
     BSONObjBuilder output;
-    ASSERT_OK(CollectionValidation::validate(opCtx,
-                                             kNss,
-                                             /*fullValidate*/ false,
-                                             /*background*/ true,
-                                             &validateResults,
-                                             &output));
+    ASSERT_OK(
+        CollectionValidation::validate(opCtx,
+                                       kNss,
+                                       CollectionValidation::ValidateOptions::kNoFullValidation,
+                                       /*background*/ true,
+                                       &validateResults,
+                                       &output));
     BSONObj obj = output.obj();
 
     ASSERT_EQ(validateResults.valid, valid);

@@ -32,13 +32,15 @@
 #include <boost/optional.hpp>
 
 #include "mongo/bson/oid.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
+#include "mongo/util/concurrency/thread_pool_interface.h"
+#include "mongo/util/functional.h"
+#include "mongo/util/future.h"
 #include "mongo/util/invalidating_lru_cache.h"
 
 namespace mongo {
-
-class OperationContext;
 
 /**
  * Serves as a container of the non-templatised parts of the ReadThroughCache class below.
@@ -47,14 +49,8 @@ class ReadThroughCacheBase {
     ReadThroughCacheBase(const ReadThroughCacheBase&) = delete;
     ReadThroughCacheBase& operator=(const ReadThroughCacheBase&) = delete;
 
-public:
-    /**
-     * Returns the cache generation identifier.
-     */
-    OID getCacheGeneration() const;
-
 protected:
-    ReadThroughCacheBase(Mutex& mutex);
+    ReadThroughCacheBase(Mutex& mutex, ServiceContext* service, ThreadPoolInterface& threadPool);
 
     virtual ~ReadThroughCacheBase();
 
@@ -179,9 +175,27 @@ protected:
     friend class ReadThroughCacheBase::CacheGuard;
 
     /**
+     * Creates a client and an operation context and executes the specified 'work' under that
+     * environment.
+     */
+    using WorkWithOpContext = unique_function<void(OperationContext*)>;
+    void _asyncWork(WorkWithOpContext work);
+
+    /**
      * Updates _fetchGeneration to a new OID
      */
     void _updateCacheGeneration(const CacheGuard&);
+
+    /**
+     * Service context under which this cache has been instantiated (used for access to service-wide
+     * functionality, such as client/operation context creation)
+     */
+    ServiceContext* const _serviceContext;
+
+    /**
+     * Thread pool, to be used for invoking the blocking loader work.
+     */
+    ThreadPoolInterface& _threadPool;
 
     /**
      * Protects _fetchGeneration and _isFetchPhaseBusy.  Manipulated via CacheGuard.
@@ -214,10 +228,80 @@ protected:
  */
 template <typename Key, typename Value>
 class ReadThroughCache : public ReadThroughCacheBase {
+    /**
+     * Data structure wrapping and expanding on the values stored in the cache.
+     */
+    struct StoredValue {
+        Value value;
+
+        // Contains the wallclock time of when the value was fetched from the backing storage. This
+        // value is not precise and should only be used for diagnostics purposes (i.e., it cannot be
+        // relied on to perform any recency comparisons for example).
+        Date_t updateWallClockTime;
+    };
+    using Cache = InvalidatingLRUCache<Key, StoredValue>;
+
 public:
-    using Cache = InvalidatingLRUCache<Key, Value>;
-    using ValueHandle = typename Cache::ValueHandle;
     using LookupFn = std::function<boost::optional<Value>(OperationContext*, const Key&)>;
+
+    /**
+     * Common type for values returned from the cache.
+     */
+    class ValueHandle {
+    public:
+        // The two constructors below are present in order to offset the fact that the cache doesn't
+        // support pinning items. Their only usage must be in the authorization mananager for the
+        // internal authentication user.
+        ValueHandle(Value&& value) : _valueHandle({std::move(value), Date_t::min()}) {}
+        ValueHandle() = default;
+
+        operator bool() const {
+            return bool(_valueHandle);
+        }
+
+        bool isValid() const {
+            return _valueHandle.isValid();
+        }
+
+        Value* get() {
+            return &_valueHandle->value;
+        }
+
+        const Value* get() const {
+            return &_valueHandle->value;
+        }
+
+        Value& operator*() {
+            return *get();
+        }
+
+        const Value& operator*() const {
+            return *get();
+        }
+
+        Value* operator->() {
+            return get();
+        }
+
+        const Value* operator->() const {
+            return get();
+        }
+
+        /**
+         * See the comments for `StoredValue::updateWallClockTime` above.
+         */
+        Date_t updateWallClockTime() const {
+            return _valueHandle->updateWallClockTime;
+        }
+
+    private:
+        friend class ReadThroughCache;
+
+        ValueHandle(typename Cache::ValueHandle&& valueHandle)
+            : _valueHandle(std::move(valueHandle)) {}
+
+        typename Cache::ValueHandle _valueHandle;
+    };
 
     /**
      * If 'key' is found in the cache, returns a ValidHandle, otherwise invokes the blocking
@@ -228,12 +312,13 @@ public:
      * NOTES:
      *  This is a potentially blocking method.
      *  The returned value may be invalid by the time the caller gets access to it.
+     *  TODO SERVER-44978: needs to call acquireAsync and then get.
      */
     ValueHandle acquire(OperationContext* opCtx, const Key& key) {
         while (true) {
             auto cachedValue = _cache.get(key);
             if (cachedValue)
-                return cachedValue;
+                return ValueHandle(std::move(cachedValue));
 
             // Otherwise make sure we have the locks we need and check whether and wait on another
             // thread is fetching into the cache
@@ -244,7 +329,7 @@ public:
             }
 
             if (cachedValue)
-                return cachedValue;
+                return ValueHandle(std::move(cachedValue));
 
             // If there's still no value in the cache, then we need to go and get it. Take the slow
             // path.
@@ -252,14 +337,15 @@ public:
 
             auto value = lookup(opCtx, key);
             if (!value)
-                return cachedValue;
+                return ValueHandle();
 
             // All this does is re-acquire the _cacheWriteMutex if we don't hold it already - a
             // caller may also call endFetchPhase() after this returns.
             guard.endFetchPhase();
 
             if (guard.isSameCacheGeneration())
-                return _cache.insertOrAssignAndGet(key, std::move(*value));
+                return ValueHandle(_cache.insertOrAssignAndGet(
+                    key, {std::move(*value), _serviceContext->getFastClockSource()->now()}));
 
             // If the cache generation changed while this thread was in fetch mode, the data
             // associated with the value may now be invalid, so we will throw out the fetched value
@@ -268,12 +354,20 @@ public:
     }
 
     /**
+     * This is an async version of acquire.
+     * TODO SERVER-44978: fix this method to make it actually async
+     */
+    SharedSemiFuture<ValueHandle> acquireAsync(const Key& key) {
+        return Future<ValueHandle>::makeReady(acquire(nullptr, key)).share();
+    }
+
+    /**
      * Invalidates the given 'key' and immediately replaces it with a new value.
      */
-    ValueHandle insertOrAssignAndGet(const Key& key, Value&& newValue) {
+    ValueHandle insertOrAssignAndGet(const Key& key, Value&& newValue, Date_t updateWallClockTime) {
         CacheGuard guard(this);
         _updateCacheGeneration(guard);
-        return _cache.insertOrAssignAndGet(key, std::move(newValue));
+        return _cache.insertOrAssignAndGet(key, {std::move(newValue), updateWallClockTime});
     }
 
     /**
@@ -290,12 +384,11 @@ public:
     void invalidateIf(const Pred& predicate) {
         CacheGuard guard(this);
         _updateCacheGeneration(guard);
-        _cache.invalidateIf(
-            [&](const Key& key, const Value* value) { return predicate(key, value); });
+        _cache.invalidateIf([&](const Key& key, const StoredValue*) { return predicate(key); });
     }
 
     void invalidateAll() {
-        invalidateIf([](const Key&, const Value*) { return true; });
+        invalidateIf([](const Key&) { return true; });
     }
 
     /**
@@ -307,14 +400,17 @@ public:
 
 protected:
     /**
-     * ReadThroughCache constructor, to be called by sub-classes.  Accepts the initial size of the
-     * cache, and a reference to a Mutex.  The Mutex is for the exclusive use of the
+     * ReadThroughCache constructor, to be called by sub-classes. The 'cacheSize' parameter
+     * represents the maximum size of the cache and 'mutex' is for the exclusive use of the
      * ReadThroughCache, the sub-class should never actually use it (apart from passing it to this
-     * constructor).  Having the Mutex stored by the sub-class allows latch diagnostics to be
+     * constructor). Having the Mutex stored by the sub-class allows latch diagnostics to be
      * correctly associated with the sub-class (not the generic ReadThroughCache class).
      */
-    ReadThroughCache(int cacheSize, Mutex& mutex)
-        : ReadThroughCacheBase(mutex), _cache(cacheSize) {}
+    ReadThroughCache(Mutex& mutex,
+                     ServiceContext* service,
+                     ThreadPoolInterface& threadPool,
+                     int cacheSize)
+        : ReadThroughCacheBase(mutex, service, threadPool), _cache(cacheSize) {}
 
 private:
     /**

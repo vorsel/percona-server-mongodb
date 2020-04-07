@@ -34,7 +34,7 @@
 #include "mongo/db/read_write_concern_defaults.h"
 
 #include "mongo/db/logical_clock.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 namespace {
@@ -42,40 +42,8 @@ namespace {
 static constexpr auto kReadConcernLevelsDisallowedAsDefault = {
     repl::ReadConcernLevel::kSnapshotReadConcern, repl::ReadConcernLevel::kLinearizableReadConcern};
 
-/**
- * Used to invalidate the cache on updates to the persisted defaults document.
- */
-class OnUpdateCommitHandler final : public RecoveryUnit::Change {
-public:
-    // rwcDefaults must outlive instantiations of this class.
-    OnUpdateCommitHandler(ServiceContext* service,
-                          ReadWriteConcernDefaults* rwcDefaults,
-                          const boost::optional<BSONObj>& newDefaultsDoc)
-        : _service(service), _rwcDefaults(rwcDefaults) {
-        // Note this will throw if the document can't be parsed. In the case of a delete, there will
-        // be no new defaults document and the RWConcern will be default constructed, which matches
-        // the behavior when lookup discovers a non-existent defaults document.
-        _rwc = newDefaultsDoc
-            ? RWConcernDefault::parse(IDLParserErrorContext("RWDefaultsWriteObserver"),
-                                      *newDefaultsDoc)
-            : RWConcernDefault();
-    }
-
-    void commit(boost::optional<Timestamp> timestamp) final {
-        _rwc.setLocalSetTime(_service->getFastClockSource()->now());
-        _rwcDefaults->setDefault(std::move(_rwc));
-    }
-
-    void rollback() final {}
-
-private:
-    ServiceContext* _service;
-    ReadWriteConcernDefaults* _rwcDefaults;
-    RWConcernDefault _rwc;
-};
-
 const auto getReadWriteConcernDefaults =
-    ServiceContext::declareDecoration<std::unique_ptr<ReadWriteConcernDefaults>>();
+    ServiceContext::declareDecoration<boost::optional<ReadWriteConcernDefaults>>();
 
 }  // namespace
 
@@ -105,12 +73,20 @@ void ReadWriteConcernDefaults::checkSuitabilityAsDefault(const ReadConcern& rc) 
             str::stream() << "'" << ReadConcern::kAtClusterTimeFieldName
                           << "' is not suitable for the default read concern",
             !rc.getArgsAtClusterTime());
+    uassert(ErrorCodes::BadValue,
+            str::stream() << "'" << ReadWriteConcernProvenance::kSourceFieldName
+                          << "' must be unset in default read concern",
+            !rc.getProvenance().hasSource());
 }
 
 void ReadWriteConcernDefaults::checkSuitabilityAsDefault(const WriteConcern& wc) {
     uassert(ErrorCodes::BadValue,
             "Unacknowledged write concern is not suitable for the default write concern",
             !(wc.wMode.empty() && wc.wNumNodes < 1));
+    uassert(ErrorCodes::BadValue,
+            str::stream() << "'" << ReadWriteConcernProvenance::kSourceFieldName
+                          << "' must be unset in default write concern",
+            !wc.getProvenance().hasSource());
 }
 
 RWConcernDefault ReadWriteConcernDefaults::generateNewConcerns(
@@ -133,10 +109,10 @@ RWConcernDefault ReadWriteConcernDefaults::generateNewConcerns(
         checkSuitabilityAsDefault(*wc);
         rwc.setDefaultWriteConcern(wc);
     }
-    auto epoch = LogicalClock::get(opCtx->getServiceContext())->getClusterTime().asTimestamp();
-    rwc.setEpoch(epoch);
-    auto now = opCtx->getServiceContext()->getFastClockSource()->now();
-    rwc.setSetTime(now);
+
+    auto* const serviceContext = opCtx->getServiceContext();
+    rwc.setUpdateOpTime(LogicalClock::get(serviceContext)->getClusterTime().asTimestamp());
+    rwc.setUpdateWallClockTime(serviceContext->getFastClockSource()->now());
 
     auto current = _getDefault(opCtx);
     if (!rc && current) {
@@ -157,16 +133,28 @@ void ReadWriteConcernDefaults::observeDirectWriteToConfigSettings(OperationConte
         return;
     }
 
-    opCtx->recoveryUnit()->registerChange(
-        std::make_unique<OnUpdateCommitHandler>(opCtx->getServiceContext(), this, newDoc));
+    // Note this will throw if the document can't be parsed. In the case of a delete, there will be
+    // no new defaults document and the RWConcern will be default constructed, which matches the
+    // behavior when lookup discovers a non-existent defaults document.
+    auto newDefaultsDoc = newDoc
+        ? RWConcernDefault::parse(IDLParserErrorContext("RWDefaultsWriteObserver"),
+                                  newDoc->getOwned())
+        : RWConcernDefault();
+
+    opCtx->recoveryUnit()->onCommit([this, opCtx, newDefaultsDoc = std::move(newDefaultsDoc)](
+                                        boost::optional<Timestamp> unusedCommitTime) mutable {
+        setDefault(opCtx, std::move(newDefaultsDoc));
+    });
 }
 
 void ReadWriteConcernDefaults::invalidate() {
     _defaults.invalidate(Type::kReadWriteConcernEntry);
 }
 
-void ReadWriteConcernDefaults::setDefault(RWConcernDefault&& rwc) {
-    _defaults.insertOrAssignAndGet(Type::kReadWriteConcernEntry, std::move(rwc));
+void ReadWriteConcernDefaults::setDefault(OperationContext* opCtx, RWConcernDefault&& rwc) {
+    _defaults.insertOrAssignAndGet(Type::kReadWriteConcernEntry,
+                                   std::move(rwc),
+                                   opCtx->getServiceContext()->getFastClockSource()->now());
 }
 
 void ReadWriteConcernDefaults::refreshIfNecessary(OperationContext* opCtx) {
@@ -176,16 +164,19 @@ void ReadWriteConcernDefaults::refreshIfNecessary(OperationContext* opCtx) {
     }
 
     auto currentDefaultsHandle = _defaults.acquire(opCtx, Type::kReadWriteConcernEntry);
-    if (!currentDefaultsHandle || !possibleNewDefaults->getEpoch() ||
-        (possibleNewDefaults->getEpoch() > currentDefaultsHandle->getEpoch())) {
+    if (!currentDefaultsHandle || !possibleNewDefaults->getUpdateOpTime() ||
+        (possibleNewDefaults->getUpdateOpTime() > currentDefaultsHandle->getUpdateOpTime())) {
         // Use the new defaults if they have a higher epoch, if there are no defaults in the cache,
         // or if the found defaults have no epoch, meaning there are no defaults in config.settings.
-        log() << "refreshed RWC defaults to " << possibleNewDefaults->toBSON();
-        setDefault(std::move(*possibleNewDefaults));
+        LOGV2(20997,
+              "refreshed RWC defaults to {newDefaults}",
+              "newDefaults"_attr = possibleNewDefaults->toBSON());
+        setDefault(opCtx, std::move(*possibleNewDefaults));
     }
 }
 
-boost::optional<RWConcernDefault> ReadWriteConcernDefaults::_getDefault(OperationContext* opCtx) {
+boost::optional<ReadWriteConcernDefaults::RWConcernDefaultAndTime>
+ReadWriteConcernDefaults::_getDefault(OperationContext* opCtx) {
     auto defaultsHandle = _defaults.acquire(opCtx, Type::kReadWriteConcernEntry);
     if (defaultsHandle) {
         // Since CWRWC is ok with continuing to use a value well after it has been invalidated
@@ -193,7 +184,7 @@ boost::optional<RWConcernDefault> ReadWriteConcernDefaults::_getDefault(Operatio
         // defaultsValue.isValid() here, and we don't need to return the Handle, since callers don't
         // need to check defaultsValue.isValid() later, either.  Just dereference it to get the
         // underlying contents.
-        return *defaultsHandle;
+        return RWConcernDefaultAndTime(*defaultsHandle, defaultsHandle.updateWallClockTime());
     }
     return boost::none;
 }
@@ -210,10 +201,6 @@ ReadWriteConcernDefaults::getDefaultWriteConcern(OperationContext* opCtx) {
     return current.getDefaultWriteConcern();
 }
 
-RWConcernDefault ReadWriteConcernDefaults::getDefault(OperationContext* opCtx) {
-    return _getDefault(opCtx).value_or(RWConcernDefault());
-}
-
 ReadWriteConcernDefaults& ReadWriteConcernDefaults::get(ServiceContext* service) {
     return *getReadWriteConcernDefaults(service);
 }
@@ -223,27 +210,38 @@ ReadWriteConcernDefaults& ReadWriteConcernDefaults::get(OperationContext* opCtx)
 }
 
 void ReadWriteConcernDefaults::create(ServiceContext* service, FetchDefaultsFn fetchDefaultsFn) {
-    getReadWriteConcernDefaults(service) =
-        std::make_unique<ReadWriteConcernDefaults>(fetchDefaultsFn);
+    getReadWriteConcernDefaults(service).emplace(service, fetchDefaultsFn);
 }
 
-ReadWriteConcernDefaults::ReadWriteConcernDefaults(FetchDefaultsFn fetchDefaultsFn)
-    : _defaults([fetchDefaultsFn = std::move(fetchDefaultsFn)](
-                    OperationContext* opCtx, const Type&) { return fetchDefaultsFn(opCtx); }) {}
+ReadWriteConcernDefaults::ReadWriteConcernDefaults(ServiceContext* service,
+                                                   FetchDefaultsFn fetchDefaultsFn)
+    : _threadPool([] {
+          ThreadPool::Options options;
+          options.poolName = "ReadWriteConcernDefaults";
+          options.minThreads = 0;
+          options.maxThreads = 1;
+
+          return options;
+      }()),
+      _defaults(service,
+                _threadPool,
+                [fetchDefaultsFn = std::move(fetchDefaultsFn)](
+                    OperationContext* opCtx, const Type&) { return fetchDefaultsFn(opCtx); }) {
+    _threadPool.startup();
+}
 
 ReadWriteConcernDefaults::~ReadWriteConcernDefaults() = default;
 
-ReadWriteConcernDefaults::Cache::Cache(LookupFn lookupFn)
-    : ReadThroughCache(1, _mutex), _lookupFn(lookupFn) {}
+ReadWriteConcernDefaults::Cache::Cache(ServiceContext* service,
+                                       ThreadPoolInterface& threadPool,
+                                       LookupFn lookupFn)
+    : ReadThroughCache(_mutex, service, threadPool, 1 /* cacheSize */),
+      _lookupFn(std::move(lookupFn)) {}
 
 boost::optional<RWConcernDefault> ReadWriteConcernDefaults::Cache::lookup(
     OperationContext* opCtx, const ReadWriteConcernDefaults::Type& key) {
     invariant(key == Type::kReadWriteConcernEntry);
-    auto newDefaults = _lookupFn(opCtx, key);
-    if (newDefaults) {
-        newDefaults->setLocalSetTime(opCtx->getServiceContext()->getFastClockSource()->now());
-    }
-    return newDefaults;
+    return _lookupFn(opCtx, key);
 }
 
 }  // namespace mongo

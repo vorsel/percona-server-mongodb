@@ -48,13 +48,13 @@
 #include "mongo/db/s/shard_identity_rollback_notifier.h"
 #include "mongo/db/s/type_shard_identity.h"
 #include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/catalog/type_config_version.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/transport/session.h"
 #include "mongo/transport/transport_layer_mock.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 #include "mongo/util/uuid.h"
 
 namespace {
@@ -113,10 +113,15 @@ protected:
                                         UUID uuid,
                                         NamespaceString nss,
                                         const SimpleBSONObjUnorderedSet& idSet) final {
-        log() << "Simulating writing a rollback file for namespace " << nss.ns() << " with uuid "
-              << uuid;
+        LOGV2(21647,
+              "Simulating writing a rollback file for namespace {nss_ns} with uuid {uuid}",
+              "nss_ns"_attr = nss.ns(),
+              "uuid"_attr = uuid);
         for (auto&& id : idSet) {
-            log() << "Looking up " << id.jsonString(JsonStringFormat::LegacyStrict);
+            LOGV2(21648,
+                  "Looking up {id_jsonString_JsonStringFormat_LegacyStrict}",
+                  "id_jsonString_JsonStringFormat_LegacyStrict"_attr =
+                      id.jsonString(JsonStringFormat::LegacyStrict));
             auto document = _findDocumentById(opCtx, uuid, nss, id.firstElement());
             if (document) {
                 _uuidToObjsMap[uuid].push_back(*document);
@@ -531,12 +536,12 @@ TEST_F(RollbackImplTest, RollbackKillsNecessaryOperations) {
     }
 
     // We assume that an interrupted opCtx would release its locks.
-    unittest::log() << "Both opCtx's marked for kill";
+    LOGV2(21649, "Both opCtx's marked for kill");
     ASSERT_EQ(ErrorCodes::InterruptedDueToReplStateChange, writeOpCtx->checkForInterruptNoAssert());
     globalWrite = boost::none;
     ASSERT_EQ(ErrorCodes::InterruptedDueToReplStateChange, readOpCtx->checkForInterruptNoAssert());
     globalRead = boost::none;
-    unittest::log() << "Both opCtx's were interrupted";
+    LOGV2(21650, "Both opCtx's were interrupted");
 
     rollbackThread.join();
     ASSERT_OK(status);
@@ -576,7 +581,7 @@ TEST_F(RollbackImplTest, RollbackPersistsDocumentAfterCommonPointToOplogTruncate
     auto coll = _initializeCollection(_opCtx.get(), UUID::gen(), nss);
 
     ASSERT_OK(_rollback->runRollback(_opCtx.get()));
-    ASSERT_EQUALS(_truncatePoint, Timestamp(3, 3));
+    ASSERT_EQUALS(_truncatePoint, Timestamp(2, 2));
 }
 
 TEST_F(RollbackImplTest, RollbackImplResetsOptimesFromOplogAfterRollback) {
@@ -658,9 +663,9 @@ TEST_F(RollbackImplTest, RollbackCallsRecoverToStableTimestamp) {
     ASSERT_EQUALS(stableTimestamp, _stableTimestamp);
 }
 
-DEATH_TEST_F(RollbackImplTest,
-             RollbackFassertsIfRecoverToStableTimestampFails,
-             "Fatal assertion 31049") {
+DEATH_TEST_REGEX_F(RollbackImplTest,
+                   RollbackFassertsIfRecoverToStableTimestampFails,
+                   "Fatal assertion.*31049") {
     auto op = makeOpAndRecordId(1);
     _remoteOplog->setOperations({op});
     ASSERT_OK(_insertOplogEntry(op.first));
@@ -839,7 +844,7 @@ TEST_F(RollbackImplTest,
     truncateAfterPoint =
         _replicationProcess->getConsistencyMarkers()->getOplogTruncateAfterPoint(_opCtx.get());
     ASSERT_EQUALS(Timestamp(), truncateAfterPoint);
-    ASSERT_EQUALS(_truncatePoint, Timestamp(2, 2));
+    ASSERT_EQUALS(_truncatePoint, Timestamp(1, 1));
     ASSERT_EQ(_storageInterface->getFinalCollectionCount(uuid), 1);
 }
 
@@ -863,13 +868,13 @@ TEST_F(RollbackImplTest, RollbackSucceedsAndTruncatesOplog) {
         _replicationProcess->getConsistencyMarkers()->getOplogTruncateAfterPoint(_opCtx.get());
     ASSERT_EQUALS(Timestamp(), truncateAfterPoint);
     _assertDocsInOplog(_opCtx.get(), {1});
-    ASSERT_EQUALS(_truncatePoint, Timestamp(2, 2));
+    ASSERT_EQUALS(_truncatePoint, Timestamp(1, 1));
 }
 
-DEATH_TEST_F(RollbackImplTest,
-             RollbackTriggersFatalAssertionOnFailingToTransitionFromRollbackToSecondary,
-             "Failed to transition into SECONDARY; expected to be in state ROLLBACK; found self in "
-             "ROLLBACK") {
+DEATH_TEST_REGEX_F(RollbackImplTest,
+                   RollbackTriggersFatalAssertionOnFailingToTransitionFromRollbackToSecondary,
+                   "Failed to transition into .*; expected to be in state .*; found self in "
+                   ".*.*SECONDARY.*ROLLBACK.*ROLLBACK") {
     _coordinator->failSettingFollowerMode(MemberState::RS_SECONDARY, ErrorCodes::IllegalOperation);
 
     auto op = makeOpAndRecordId(1);
@@ -879,7 +884,7 @@ DEATH_TEST_F(RollbackImplTest,
     _storageInterface->setStableTimestamp(nullptr, Timestamp(1, 1));
 
     auto status = _rollback->runRollback(_opCtx.get());
-    unittest::log() << "Mongod did not crash. Status: " << status;
+    LOGV2(21651, "Mongod did not crash. Status: {status}", "status"_attr = status);
     MONGO_UNREACHABLE;
 }
 
@@ -1234,7 +1239,7 @@ DEATH_TEST_F(RollbackImplTest,
     }
 
     auto status = _rollback->runRollback(_opCtx.get());
-    unittest::log() << "mongod did not crash when expected; status: " << status;
+    LOGV2(21652, "mongod did not crash when expected; status: {status}", "status"_attr = status);
 }
 
 DEATH_TEST_F(RollbackImplTest,
@@ -1248,7 +1253,7 @@ DEATH_TEST_F(RollbackImplTest,
     _storageInterface->setStableTimestamp(nullptr, Timestamp(1, 1));
 
     auto status = _rollback->runRollback(_opCtx.get());
-    unittest::log() << "mongod did not crash when expected; status: " << status;
+    LOGV2(21653, "mongod did not crash when expected; status: {status}", "status"_attr = status);
 }
 
 TEST_F(RollbackImplTest, RollbackSetsMultipleCollectionCounts) {
@@ -1753,7 +1758,9 @@ DEATH_TEST_F(RollbackImplObserverInfoTest,
         Timestamp(2, 2), boost::none, "admin.$cmd", BSON("applyOps" << subops.arr()), 2);
 
     auto status = _rollback->_namespacesForOp_forTest(OplogEntry(applyOpsCmdOp.first));
-    unittest::log() << "Mongod did not crash. Status: " << status.getStatus();
+    LOGV2(21654,
+          "Mongod did not crash. Status: {status_getStatus}",
+          "status_getStatus"_attr = status.getStatus());
     MONGO_UNREACHABLE;
 }
 
@@ -1855,7 +1862,7 @@ DEATH_TEST_F(RollbackImplObserverInfoTest,
     ASSERT_OK(_insertOplogEntry(unknownCmdOp.first));
 
     auto status = _rollback->runRollback(_opCtx.get());
-    unittest::log() << "Mongod did not crash. Status: " << status;
+    LOGV2(21655, "Mongod did not crash. Status: {status}", "status"_attr = status);
     MONGO_UNREACHABLE;
 }
 

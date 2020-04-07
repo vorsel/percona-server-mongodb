@@ -56,8 +56,8 @@
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/views/view_catalog.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -74,6 +74,7 @@ struct CollModRequest {
     BSONElement collValidator = {};
     std::string collValidationAction = {};
     std::string collValidationLevel = {};
+    bool recordPreImages = false;
 };
 
 StatusWith<CollModRequest> parseCollModRequest(OperationContext* opCtx,
@@ -222,6 +223,13 @@ StatusWith<CollModRequest> parseCollModRequest(OperationContext* opCtx,
                 return Status(ErrorCodes::InvalidOptions, "'viewOn' option must be a string");
             }
             cmr.viewOn = e.str();
+        } else if (fieldName == "recordPreImages") {
+            if (isView) {
+                return {ErrorCodes::InvalidOptions,
+                        str::stream() << "option not supported on a view: " << fieldName};
+            }
+
+            cmr.recordPreImages = e.trueValue();
         } else {
             if (isView) {
                 return Status(ErrorCodes::InvalidOptions,
@@ -376,7 +384,7 @@ Status _collModInternal(OperationContext* opCtx,
                     std::make_unique<CollModResultChange>(oldExpireSecs, newExpireSecs, result));
 
                 if (MONGO_unlikely(assertAfterIndexUpdate.shouldFail())) {
-                    log() << "collMod - assertAfterIndexUpdate fail point enabled.";
+                    LOGV2(20307, "collMod - assertAfterIndexUpdate fail point enabled.");
                     uasserted(50970, "trigger rollback after the index update");
                 }
             }
@@ -396,10 +404,14 @@ Status _collModInternal(OperationContext* opCtx,
         if (!cmrNew.collValidationLevel.empty())
             invariant(coll->setValidationLevel(opCtx, cmrNew.collValidationLevel));
 
+        if (cmrNew.recordPreImages != oldCollOptions.recordPreImages) {
+            coll->setRecordPreImages(opCtx, cmrNew.recordPreImages);
+        }
+
         // Only observe non-view collMods, as view operations are observed as operations on the
         // system.views collection.
-        getGlobalServiceContext()->getOpObserver()->onCollMod(
-            opCtx, nss, coll->uuid(), oplogEntryObj, oldCollOptions, ttlInfo);
+        auto* const opObserver = opCtx->getServiceContext()->getOpObserver();
+        opObserver->onCollMod(opCtx, nss, coll->uuid(), oplogEntryObj, oldCollOptions, ttlInfo);
 
         wunit.commit();
         return Status::OK();

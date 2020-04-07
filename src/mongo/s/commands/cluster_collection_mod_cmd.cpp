@@ -33,9 +33,9 @@
 
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -69,7 +69,11 @@ public:
                    std::string& errmsg,
                    BSONObjBuilder& output) override {
         const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
-        LOG(1) << "collMod: " << nss << " cmd:" << redact(cmdObj);
+        LOGV2_DEBUG(22748,
+                    1,
+                    "collMod: {nss} cmd:{cmdObj}",
+                    "nss"_attr = nss,
+                    "cmdObj"_attr = redact(cmdObj));
 
         auto routingInfo =
             uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));

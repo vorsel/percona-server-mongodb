@@ -26,6 +26,8 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+
 #include "mongo/client/sdam/sdam_test_base.h"
 #include "mongo/client/sdam/topology_description.h"
 
@@ -34,6 +36,7 @@
 #include "mongo/client/sdam/server_description.h"
 #include "mongo/client/sdam/server_description_builder.h"
 #include "mongo/db/wire_version.h"
+#include "mongo/logv2/log.h"
 #include "mongo/unittest/death_test.h"
 
 namespace mongo {
@@ -143,8 +146,9 @@ TEST_F(TopologyDescriptionTestFixture, ShouldOnlyAllowSingleAndRsNoPrimaryWithSe
                         topologyTypes.end());
 
     for (const auto topologyType : topologyTypes) {
-        unittest::log() << "Check TopologyType " << toString(topologyType)
-                        << " with setName value.";
+        LOGV2(20217,
+              "Check TopologyType {topologyType} with setName value.",
+              "topologyType"_attr = toString(topologyType));
         ASSERT_THROWS_CODE(
             SdamConfiguration(kOneServer, topologyType, mongo::Seconds(10), kSetName),
             DBException,
@@ -299,7 +303,8 @@ TEST_F(TopologyDescriptionTestFixture, ShouldUpdateTopologyVersionOnSuccess) {
     topologyDescription.installServerDescription(newDescription);
     ASSERT_EQUALS(topologyDescription.getServers().size(), 3);
     auto topologyVersion = topologyDescription.getServers()[1]->getTopologyVersion();
-    ASSERT(topologyVersion == TopologyVersion(processId, 1));
+    ASSERT(topologyVersion->getProcessId() == processId);
+    ASSERT(topologyVersion->getCounter() == 1);
 }
 
 TEST_F(TopologyDescriptionTestFixture, ShouldNotUpdateTopologyVersionOnError) {

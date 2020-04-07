@@ -71,8 +71,10 @@ public:
     bool canAcceptWritesForDatabase(OperationContext* opCtx, StringData dbName) override;
     bool canAcceptWritesForDatabase_UNSAFE(OperationContext* opCtx, StringData dbName) override;
 
-    bool canAcceptWritesFor(OperationContext* opCtx, const NamespaceString& ns) override;
-    bool canAcceptWritesFor_UNSAFE(OperationContext* opCtx, const NamespaceString& ns) override;
+    bool canAcceptWritesFor(OperationContext* opCtx,
+                            const NamespaceStringOrUUID& nsOrUUID) override;
+    bool canAcceptWritesFor_UNSAFE(OperationContext* opCtx,
+                                   const NamespaceStringOrUUID& nsOrUUID) override;
 
     Status checkCanServeReadsFor(OperationContext* opCtx,
                                  const NamespaceString& ns,
@@ -169,7 +171,7 @@ public:
 
     repl::ReplSetConfig getConfig() const override;
 
-    void processReplSetGetConfig(BSONObjBuilder*) override;
+    void processReplSetGetConfig(BSONObjBuilder*, bool commitmentStatus = false) override;
 
     void processReplSetMetadata(const rpc::ReplSetMetadata&) override;
 
@@ -187,6 +189,10 @@ public:
     Status processReplSetReconfig(OperationContext*,
                                   const ReplSetReconfigArgs&,
                                   BSONObjBuilder*) override;
+
+    Status doReplSetReconfig(OperationContext* opCtx,
+                             GetNewConfigFn getNewConfig,
+                             bool force) override;
 
     Status processReplSetInitiate(OperationContext*, const BSONObj&, BSONObjBuilder*) override;
 
@@ -265,13 +271,21 @@ public:
 
     TopologyVersion getTopologyVersion() const override;
 
+    void incrementTopologyVersion(OperationContext* opCtx) override;
+
     std::shared_ptr<const repl::IsMasterResponse> awaitIsMasterResponse(
         OperationContext* opCtx,
         const repl::SplitHorizon::Parameters& horizonParams,
         boost::optional<TopologyVersion> previous,
         boost::optional<Date_t> deadline) const override;
 
+    virtual SharedSemiFuture<std::shared_ptr<const repl::IsMasterResponse>>
+    getIsMasterResponseFuture(const repl::SplitHorizon::Parameters& horizonParams,
+                              boost::optional<TopologyVersion> clientTopologyVersion) const;
+
     repl::OpTime getLatestWriteOpTime(OperationContext* opCtx) const override;
+
+    HostAndPort getCurrentPrimaryHostAndPort() const override;
 
 private:
     // Back pointer to the ServiceContext that has started the instance.

@@ -65,6 +65,7 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/durable_catalog.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/parallel.h"
@@ -75,7 +76,6 @@
 #include "mongo/s/stale_exception.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/util/debug_util.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
 
@@ -467,7 +467,7 @@ Config::Config(const string& _dbname, const BSONObj& cmdObj) {
         // DEPRECATED
         if (auto mapParamsElem = cmdObj["mapparams"]) {
             if (mapParamsDeprecationSampler.tick()) {
-                warning() << "The mapparams option to MapReduce is deprecated.";
+                LOGV2_WARNING(20493, "The mapparams option to MapReduce is deprecated.");
             }
             if (mapParamsElem.type() == Array) {
                 mapParams = mapParamsElem.embeddedObjectUserCheck().getOwned();
@@ -548,7 +548,7 @@ void State::prepTempCollection() {
                 str::stream() << "createIndex failed for mr incLong ns " << _config.incLong.ns());
             wuow.commit();
 
-            CollectionShardingRuntime::get(_opCtx, _config.incLong)
+            CollectionShardingState::get(_opCtx, _config.incLong)
                 ->setFilteringMetadata(_opCtx, CollectionMetadata());
         });
     }
@@ -632,7 +632,7 @@ void State::prepTempCollection() {
 
         wuow.commit();
 
-        CollectionShardingRuntime::get(_opCtx, _config.tempNamespace)
+        CollectionShardingState::get(_opCtx, _config.tempNamespace)
             ->setFilteringMetadata(_opCtx, CollectionMetadata());
     });
 }
@@ -929,11 +929,12 @@ State::~State() {
                                 _config.tempNamespace,
                                 _useIncremental ? _config.incLong : NamespaceString());
         } catch (...) {
-            error() << "Unable to drop temporary collection created by mapReduce: "
-                    << _config.tempNamespace
-                    << ". This collection will be removed automatically "
-                       "the next time the server starts up. "
-                    << exceptionToStatus();
+            LOGV2_ERROR(20494,
+                        "Unable to drop temporary collection created by mapReduce: "
+                        "{config_tempNamespace}. This collection will be removed automatically "
+                        "the next time the server starts up. {exceptionToStatus}",
+                        "config_tempNamespace"_attr = _config.tempNamespace,
+                        "exceptionToStatus"_attr = exceptionToStatus());
         }
     }
     if (_scope && !_scope->isKillPending() && _scope->getError().empty()) {
@@ -944,7 +945,7 @@ State::~State() {
             _scope->invoke(cleanup, nullptr, nullptr, 0, true);
         } catch (const DBException&) {
             // not important because properties will be reset if scope is reused
-            LOG(1) << "MapReduce terminated during state destruction";
+            LOGV2_DEBUG(20483, 1, "MapReduce terminated during state destruction");
         }
     }
 }
@@ -1086,7 +1087,7 @@ void State::switchMode(bool jsMode) {
 }
 
 void State::bailFromJS() {
-    LOG(1) << "M/R: Switching from JS mode to mixed mode";
+    LOGV2_DEBUG(20484, 1, "M/R: Switching from JS mode to mixed mode");
 
     // reduce and reemit into c++
     switchMode(false);
@@ -1363,9 +1364,14 @@ void State::reduceAndSpillInMemoryStateIfNeeded() {
             // reduce now to lower mem usage
             Timer t;
             _scope->invoke(_reduceAll, nullptr, nullptr, 0, true);
-            LOG(3) << "  MR - did reduceAll: keys=" << keyCt << " dups=" << dupCt
-                   << " newKeys=" << _scope->getNumberInt("_keyCt") << " time=" << t.millis()
-                   << "ms";
+            LOGV2_DEBUG(20485,
+                        3,
+                        "  MR - did reduceAll: keys={keyCt} dups={dupCt} "
+                        "newKeys={scope_getNumberInt_keyCt} time={t_millis}ms",
+                        "keyCt"_attr = keyCt,
+                        "dupCt"_attr = dupCt,
+                        "scope_getNumberInt_keyCt"_attr = _scope->getNumberInt("_keyCt"),
+                        "t_millis"_attr = t.millis());
             return;
         }
     }
@@ -1378,13 +1384,19 @@ void State::reduceAndSpillInMemoryStateIfNeeded() {
         long oldSize = _size;
         Timer t;
         reduceInMemory();
-        LOG(3) << "  MR - did reduceInMemory: size=" << oldSize << " dups=" << _dupCount
-               << " newSize=" << _size << " time=" << t.millis() << "ms";
+        LOGV2_DEBUG(20486,
+                    3,
+                    "  MR - did reduceInMemory: size={oldSize} dups={dupCount} newSize={size} "
+                    "time={t_millis}ms",
+                    "oldSize"_attr = oldSize,
+                    "dupCount"_attr = _dupCount,
+                    "size"_attr = _size,
+                    "t_millis"_attr = t.millis());
 
         // if size is still high, or values are not reducing well, dump
         if (_onDisk && (_size > _config.maxInMemSize || _size > oldSize / 2)) {
             dumpToInc();
-            LOG(3) << "  MR - dumping to db";
+            LOGV2_DEBUG(20487, 3, "  MR - dumping to db");
         }
     }
 }
@@ -1411,14 +1423,13 @@ bool runMapReduce(OperationContext* opCtx,
 
     const Config config(dbname, cmd);
 
-    LOG(1) << "mr ns: " << config.nss;
+    LOGV2_DEBUG(20488, 1, "mr ns: {config_nss}", "config_nss"_attr = config.nss);
 
     uassert(16149, "cannot run map reduce without the js engine", getGlobalScriptEngine());
 
-    const auto metadata = [&] {
+    const auto collectionFilter = [&] {
         AutoGetCollectionForReadCommand autoColl(opCtx, config.nss);
-        return CollectionShardingState::get(opCtx, config.nss)
-            ->getOrphansFilter(opCtx, autoColl.getCollection());
+        return CollectionShardingState::get(opCtx, config.nss)->getOwnershipFilter(opCtx);
     }();
 
     bool shouldHaveData = false;
@@ -1513,9 +1524,9 @@ bool runMapReduce(OperationContext* opCtx,
 
                 // Check to see if this is a new object we don't own yet because of a chunk
                 // migration
-                if (metadata->isSharded()) {
-                    ShardKeyPattern kp(metadata->getKeyPattern());
-                    if (!metadata->keyBelongsToMe(kp.extractShardKeyFromDoc(o))) {
+                if (collectionFilter.isSharded()) {
+                    ShardKeyPattern kp(collectionFilter.getKeyPattern());
+                    if (!collectionFilter.keyBelongsToMe(kp.extractShardKeyFromDoc(o))) {
                         continue;
                     }
                 }
@@ -1638,19 +1649,19 @@ bool runMapReduce(OperationContext* opCtx,
             invariant(e.extraInfo<StaleConfigInfo>()->getShardId());
         }
 
-        log() << "mr detected stale config, should retry" << redact(e);
+        LOGV2(20489, "mr detected stale config, should retry{e}", "e"_attr = redact(e));
         throw;
     }
     // TODO:  The error handling code for queries is v. fragile,
     // *requires* rethrow AssertionExceptions - should probably fix.
     catch (AssertionException& e) {
-        log() << "mr failed, removing collection" << redact(e);
+        LOGV2(20490, "mr failed, removing collection{e}", "e"_attr = redact(e));
         throw;
     } catch (std::exception& e) {
-        log() << "mr failed, removing collection" << causedBy(e);
+        LOGV2(20491, "mr failed, removing collection{causedBy_e}", "causedBy_e"_attr = causedBy(e));
         throw;
     } catch (...) {
-        log() << "mr failed for unknown reason, removing collection";
+        LOGV2(20492, "mr failed for unknown reason, removing collection");
         throw;
     }
 

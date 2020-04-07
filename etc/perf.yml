@@ -77,24 +77,16 @@ functions:
       params:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
-        remote_file: ${project}/${version_id}/${revision}/mongod-${version_id}
+        remote_file: ${project}/${version_id}/${revision}/mongodb${compile-variant|}-${version_id}.tar.gz
         bucket: mciuploads
-        local_file: src/mongod
-    - command: s3.get
-      params:
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        remote_file: ${project}/${version_id}/${revision}/mongo-${version_id}
-        bucket: mciuploads
-        local_file: src/mongo
+        local_file: src/mongodb.tar.gz
     - command: shell.exec
       params:
         working_dir: src
         script: |
           set -e
           set -v
-          chmod +x mongod
-          chmod +x mongo
+          tar xvf mongodb.tar.gz
     - command: shell.exec
       params:
         background: true
@@ -103,7 +95,7 @@ functions:
           set -e
           set -o verbose
           mkdir -p ./dbdata
-          ${mongod_exec_wrapper} ./mongod --dbpath ./dbdata ${mongod_flags} --logpath "${workdir}/mongod.log"
+          ${mongod_exec_wrapper} ./bin/mongod --dbpath ./dbdata ${mongod_flags} --logpath "${workdir}/mongod.log"
     - command: shell.exec
       params:
         working_dir: src
@@ -119,7 +111,7 @@ functions:
           #       As a result, writeConcernMajorityJournalDefault can be set to false. If this becomes configurable later
           #       then the correct value should be passed to rs.initiate or getCmdLineOpts needs to interrogated (but
           #       only after db.createUser).
-          ./mongo --eval "if(db.isMaster().isreplicaset){\
+          ./bin/mongo --eval "if(db.isMaster().isreplicaset){\
                              rs.initiate({_id: 'test', version: 1, members: [ { _id: 0, host : 'localhost:27017' }], writeConcernMajorityJournalDefault:false});\
                              assert.soon(function(){return db.isMaster().ismaster}, 'no primary');\
                           }"
@@ -127,44 +119,14 @@ functions:
           # benchRun() authenticates against the admin db, with a user that must has admin access.
           # Note: This is possibly a legacy requirement from times when it would call serverStatus.
           # Btw, when mongod is started without --auth, these should be harmless no-ops
-          ./mongo --eval "db.createUser({user: 'admin', pwd: 'password', roles:\
+          ./bin/mongo --eval "db.createUser({user: 'admin', pwd: 'password', roles:\
                          [ { role: 'root', db: 'admin' } ] })"\
                            admin
 
           # print the replset config unless this is a standalone
-          ./mongo --eval "if( db.isMaster().hosts ) { printjson(rs.config()); }" --username admin --password password admin
+          ./bin/mongo --eval "if( db.isMaster().hosts ) { printjson(rs.config()); }" --username admin --password password admin
           echo "MONGOD STARTED."
   "analyze":
-    - command: shell.exec
-      params:
-        working_dir: src
-        script: |
-          cat > bootstrap.yml <<EOF
-          infrastructure_provisioning: ${cluster}
-          platform: ${platform}
-          mongodb_setup: ${setup}
-          storageEngine: ${storageEngine}
-          test_control: ${test}
-          production: true
-          EOF
-
-          cat > runtime.yml <<EOF
-          # evergreen default expansions
-          is_patch: ${is_patch}
-          task_id: ${task_id}
-          EOF
-
-          cp ./dsi/configurations/analysis/analysis.common.yml  analysis.yml
-    - command: shell.exec
-      params:
-        working_dir: src
-        silent: true
-        script: |
-          cat > runtime_secret.yml <<EOF
-          dsi_analysis_atlas_user: "${dsi_analysis_atlas_user}"
-          dsi_analysis_atlas_pw: "${dsi_analysis_atlas_pw}"
-          EOF
-          chmod 400 runtime_secret.yml
     - command: shell.exec
       params:
         working_dir: src
@@ -188,6 +150,34 @@ functions:
           source ./signal_processing_venv/bin/activate
           detect-changes --evergreen-api-config .evergreen.yml
     - command: shell.exec
+      params:
+        working_dir: src
+        script: |
+          set -o errexit
+          set -o verbose
+          cat > overrides.yml <<EOF
+          bootstrap:
+            production: true
+          test_control:
+            reports_dir_basename: ..
+          runtime:
+            # evergreen default expansions
+            is_patch: ${is_patch}
+            task_id: ${task_id}
+          EOF
+
+          cp ./dsi/configurations/analysis/analysis.microbenchmarks.yml  analysis.yml
+    - command: shell.exec
+      params:
+        working_dir: src
+        silent: true
+        script: |
+          cat > runtime_secret.yml <<EOF
+          dsi_analysis_atlas_user: "${dsi_analysis_atlas_user}"
+          dsi_analysis_atlas_pw: "${dsi_analysis_atlas_pw}"
+          EOF
+          chmod 400 runtime_secret.yml
+    - command: shell.exec
       type: test
       params:
         working_dir: src
@@ -196,15 +186,7 @@ functions:
           set -o verbose
           ./dsi/run-dsi setup
           source ./dsi/dsi_venv/bin/activate
-
-          # Any tasks that want the analysis scripts to analyze mongod.log files should pass in
-          # `reports_analysis: true` as a var to this function. The following line will select the
-          # appropriate flags if it's `true`.
-          reports_analysis_flags="--reports-analysis . --perf-file perf/perf.json"
-          cmd_flags=$([ "${reports_analysis}" = "true" ] && echo "$reports_analysis_flags" || echo "")
-          REFTAG="3.6.5-Baseline"
-          OVERRIDE="./dsi/analysis/${branch_name}/perf_override.json"
-          python ./dsi/analysis/perf_regression_check.py $cmd_flags --rev ${revision} --refTag $REFTAG --overrideFile $OVERRIDE --variant ${build_variant} --task ${task_name} --threshold 0.075 --threadThreshold 0.12
+          ./dsi/bin/analysis.py
 
   # Params:
   #   workload: the path relative to genny/src/workloads to run e.g.
@@ -255,9 +237,9 @@ functions:
           mkdir -p ../perf
           #  give mongod a few seconds to start up so that we can connect.
           sleep 5
-          ${perf_exec_wrapper} python benchrun.py --shell ../mongo -t ${threads} --trialCount 5 -f testcases/*.js --readCmd ${readCmd} --includeFilter ${includeFilter1}  --includeFilter ${includeFilter2} --excludeFilter ${excludeFilter} --out ../perf/perf.json --exclude-testbed --username admin --password password
+          ${perf_exec_wrapper} python benchrun.py --shell ../bin/mongo -t ${threads} --trialCount 5 -f testcases/*.js --readCmd ${readCmd} --includeFilter ${includeFilter1}  --includeFilter ${includeFilter2} --excludeFilter ${excludeFilter} --out ../perf/perf.json --exclude-testbed --username admin --password password
           echo "Oplog size at end of tests..."
-          ../mongo --username admin --password password --eval "db.getSiblingDB('local').oplog.rs.totalSize()/1024/1024" admin
+          ../bin/mongo --username admin --password password --eval "db.getSiblingDB('local').oplog.rs.totalSize()/1024/1024" admin
     - command: "json.send"
       params:
         name: "perf"
@@ -337,27 +319,20 @@ tasks:
           set -o verbose
 
           source "${workdir}/compile_venv/bin/activate"
-          python ./buildscripts/scons.py ${compile_flags|} ${scons_cache_args|} mongo mongod
+          python ./buildscripts/scons.py ${compile_flags|} ${scons_cache_args|} --install-mode=hygienic install-mongo{,d} DESTDIR=$(pwd)/mongodb
+          tar czf mongodb${compile-variant|}.tar.gz -C mongodb .
     - command: s3.put
       params:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
-        local_file: src/mongod
-        remote_file: ${project}/${version_id}/${revision}/mongod-${version_id}
+        local_file: src/mongodb${compile-variant|}.tar.gz
+        remote_file: ${project}/${version_id}/${revision}/mongodb${compile-variant|}-${version_id}.tar.gz
         bucket: mciuploads
         permissions: public-read
-        content_type: ${content_type|application/octet-stream}
-        display_name: mongod
-    - command: s3.put
-      params:
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        local_file: src/build/cached/mongo/mongo
-        remote_file: ${project}/${version_id}/${revision}/mongo-${version_id}
-        bucket: mciuploads
-        permissions: public-read
-        content_type: ${content_type|application/octet-stream}
-        display_name: mongo
+        content_type: ${content_type|application/x-gzip}
+        display_name: mongodb${compile-variant|}.tar.gz
+
+
 - name: query
   depends_on:
   - variant: linux-wt-standalone

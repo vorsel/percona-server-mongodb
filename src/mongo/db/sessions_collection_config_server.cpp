@@ -38,12 +38,12 @@
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/shard_collection_gen.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -98,8 +98,12 @@ void SessionsCollectionConfigServer::_generateIndexesIfNeeded(OperationContext* 
                     BSONObj() /* collation */);
                 return;
             } catch (const ExceptionForCat<ErrorCategory::StaleShardVersionError>& ex) {
-                log() << "Attempt " << tries << " to generate TTL index for " << nss
-                      << " received StaleShardVersion error" << causedBy(ex);
+                LOGV2(21980,
+                      "Attempt {tries} to generate TTL index for {nss} received StaleShardVersion "
+                      "error{causedBy_ex}",
+                      "tries"_attr = tries,
+                      "nss"_attr = nss,
+                      "causedBy_ex"_attr = causedBy(ex));
                 if (canRetry) {
                     continue;
                 }

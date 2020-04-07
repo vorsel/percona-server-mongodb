@@ -594,10 +594,11 @@ const Value Document::getNestedField(const FieldPath& path, vector<Position>* po
 }
 
 size_t Document::getApproximateSize() const {
+    size_t size = sizeof(Document);
     if (!_storage)
-        return 0;  // we've allocated no memory
+        return size;
 
-    size_t size = sizeof(DocumentStorage);
+    size += sizeof(DocumentStorage);
     size += storage().allocatedBytes();
 
     for (auto it = storage().iteratorCacheOnly(); !it.atEnd(); it.advance()) {
@@ -686,8 +687,8 @@ string Document::toString() const {
 }
 
 void Document::serializeForSorter(BufBuilder& buf) const {
-    const int numElems = size();
-    buf.appendNum(numElems);
+    const size_t numElems = computeSize();
+    buf.appendNum(static_cast<int>(numElems));
 
     for (DocumentStorageIterator it = storage().iterator(); !it.atEnd(); it.advance()) {
         buf.appendStr(it->nameSD(), /*NUL byte*/ true);

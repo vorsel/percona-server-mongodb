@@ -3,6 +3,7 @@ import os
 import os.path
 from . import interface
 from ... import core
+from ... import config
 from ... import utils
 from ...utils import globstar
 from ... import errors
@@ -24,6 +25,14 @@ class SDAMJsonTestCase(interface.ProcessTestCase):
         self.program_options = utils.default_if_none(program_options, {}).copy()
 
     def _find_executable(self):
+        if config.INSTALL_DIR is not None:
+            binary = os.path.join(config.INSTALL_DIR, "sdam_json_test")
+            if os.name == "nt":
+                binary += ".exe"
+
+            if os.path.isfile(binary):
+                return binary
+
         execs = globstar.glob(self.EXECUTABLE_BUILD_PATH + '.exe')
         if not execs:
             execs = globstar.glob(self.EXECUTABLE_BUILD_PATH)

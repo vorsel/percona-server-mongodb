@@ -46,11 +46,11 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/counters.h"
+#include "mongo/logv2/log.h"
 #include "mongo/transport/asio_utils.h"
 #include "mongo/transport/service_entry_point.h"
 #include "mongo/transport/transport_options_gen.h"
 #include "mongo/util/hierarchical_acquisition.h"
-#include "mongo/util/log.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/net/sockaddr.h"
 #include "mongo/util/net/ssl_manager.h"
@@ -112,7 +112,7 @@ public:
     void cancel(const BatonHandle& baton = nullptr) override {
         // If we have a baton try to cancel that.
         if (baton && baton->networking() && baton->networking()->cancelTimer(*this)) {
-            LOG(2) << "Canceled via baton, skipping asio cancel.";
+            LOGV2_DEBUG(23010, 2, "Canceled via baton, skipping asio cancel.");
             return;
         }
 
@@ -139,7 +139,7 @@ private:
             armTimer();
             return _timer->async_wait(UseFuture{}).tapError([timer = _timer](const Status& status) {
                 if (status != ErrorCodes::CallbackCanceled) {
-                    LOG(2) << "Timer received error: " << status;
+                    LOGV2_DEBUG(23011, 2, "Timer received error: {status}", "status"_attr = status);
                 }
             });
 
@@ -191,7 +191,7 @@ public:
         ThreadIdGuard threadIdGuard(this);
         _ioContext.restart();
         while (_ioContext.poll()) {
-            LOG(2) << "Draining remaining work in reactor.";
+            LOGV2_DEBUG(23012, 2, "Draining remaining work in reactor.");
         }
         _ioContext.stop();
     }
@@ -454,7 +454,13 @@ StatusWith<SessionHandle> TransportLayerASIO::connect(HostAndPort peer,
     GenericSocket sock(*_egressReactor);
     WrappedResolver resolver(*_egressReactor);
 
+    Date_t timeBefore = Date_t::now();
     auto swEndpoints = resolver.resolve(peer, _listenerOptions.enableIPv6);
+    Date_t timeAfter = Date_t::now();
+    if (timeAfter - timeBefore > kSlowOperationThreshold) {
+        networkCounter.incrementNumSlowDNSOperations();
+    }
+
     if (!swEndpoints.isOK()) {
         return swEndpoints.getStatus();
     }
@@ -484,7 +490,13 @@ StatusWith<SessionHandle> TransportLayerASIO::connect(HostAndPort peer,
         (sslMode == kGlobalSSLMode &&
          ((globalSSLMode == SSLParams::SSLMode_preferSSL) ||
           (globalSSLMode == SSLParams::SSLMode_requireSSL)))) {
+        Date_t timeBefore = Date_t::now();
         auto sslStatus = session->handshakeSSLForEgress(peer).getNoThrow();
+        Date_t timeAfter = Date_t::now();
+        if (timeAfter - timeBefore > kSlowOperationThreshold) {
+            networkCounter.incrementNumSlowSSLOperations();
+        }
+
         if (!sslStatus.isOK()) {
             return sslStatus;
         }
@@ -558,12 +570,14 @@ Future<SessionHandle> TransportLayerASIO::asyncConnect(HostAndPort peer,
     struct AsyncConnectState {
         AsyncConnectState(HostAndPort peer,
                           asio::io_context& context,
-                          Promise<SessionHandle> promise_)
+                          Promise<SessionHandle> promise_,
+                          const ReactorHandle& reactor)
             : promise(std::move(promise_)),
               socket(context),
               timeoutTimer(context),
               resolver(context),
-              peer(std::move(peer)) {}
+              peer(std::move(peer)),
+              reactor(reactor) {}
 
         AtomicWord<bool> done{false};
         Promise<SessionHandle> promise;
@@ -575,12 +589,13 @@ Future<SessionHandle> TransportLayerASIO::asyncConnect(HostAndPort peer,
         WrappedEndpoint resolvedEndpoint;
         const HostAndPort peer;
         TransportLayerASIO::ASIOSessionHandle session;
+        ReactorHandle reactor;
     };
 
     auto reactorImpl = checked_cast<ASIOReactor*>(reactor.get());
     auto pf = makePromiseFuture<SessionHandle>();
-    auto connector =
-        std::make_shared<AsyncConnectState>(std::move(peer), *reactorImpl, std::move(pf.promise));
+    auto connector = std::make_shared<AsyncConnectState>(
+        std::move(peer), *reactorImpl, std::move(pf.promise), reactor);
     Future<SessionHandle> mergedFuture = std::move(pf.future);
 
     if (connector->peer.host().empty()) {
@@ -616,9 +631,13 @@ Future<SessionHandle> TransportLayerASIO::asyncConnect(HostAndPort peer,
         .then([connector, timeBefore](WrappedResolver::EndpointVector results) {
             try {
                 Date_t timeAfter = Date_t::now();
-                if (timeAfter - timeBefore > Seconds(1)) {
-                    warning() << "DNS resolution while connecting to " << connector->peer
-                              << " took " << timeAfter - timeBefore;
+                if (timeAfter - timeBefore > kSlowOperationThreshold) {
+                    LOGV2_WARNING(23019,
+                                  "DNS resolution while connecting to {connector_peer} took "
+                                  "{timeAfter_timeBefore}",
+                                  "connector_peer"_attr = connector->peer,
+                                  "timeAfter_timeBefore"_attr = timeAfter - timeBefore);
+                    networkCounter.incrementNumSlowDNSOperations();
                 }
 
                 stdx::lock_guard<Latch> lk(connector->mutex);
@@ -655,9 +674,17 @@ Future<SessionHandle> TransportLayerASIO::asyncConnect(HostAndPort peer,
                 (sslMode == kGlobalSSLMode &&
                  ((globalSSLMode == SSLParams::SSLMode_preferSSL) ||
                   (globalSSLMode == SSLParams::SSLMode_requireSSL)))) {
+                Date_t timeBefore = Date_t::now();
                 return connector->session
-                    ->handshakeSSLForEgressWithLock(std::move(lk), connector->peer)
-                    .then([connector] { return Status::OK(); });
+                    ->handshakeSSLForEgressWithLock(
+                        std::move(lk), connector->peer, connector->reactor)
+                    .then([connector, timeBefore] {
+                        Date_t timeAfter = Date_t::now();
+                        if (timeAfter - timeBefore > kSlowOperationThreshold) {
+                            networkCounter.incrementNumSlowSSLOperations();
+                        }
+                        return Status::OK();
+                    });
             }
 #endif
             return Status::OK();
@@ -667,7 +694,7 @@ Future<SessionHandle> TransportLayerASIO::asyncConnect(HostAndPort peer,
         })
         .getAsync([connector](Status connectResult) {
             if (MONGO_unlikely(transportLayerASIOasyncConnectTimesOut.shouldFail())) {
-                log() << "asyncConnectTimesOut fail point is active. simulating timeout.";
+                LOGV2(23013, "asyncConnectTimesOut fail point is active. simulating timeout.");
                 return;
             }
 
@@ -805,7 +832,7 @@ Status TransportLayerASIO::setup() {
         if (tcpFastOpenIsConfigured) {
             return foStatus;
         } else {
-            log() << foStatus.reason();
+            LOGV2(23014, "{foStatus_reason}", "foStatus_reason"_attr = foStatus.reason());
         }
     }
 
@@ -821,14 +848,16 @@ Status TransportLayerASIO::setup() {
     std::set<WrappedEndpoint> endpoints;
     for (auto& ip : listenAddrs) {
         if (ip.empty()) {
-            warning() << "Skipping empty bind address";
+            LOGV2_WARNING(23020, "Skipping empty bind address");
             continue;
         }
 
         auto swAddrs =
             resolver.resolve(HostAndPort(ip, _listenerPort), _listenerOptions.enableIPv6);
         if (!swAddrs.isOK()) {
-            warning() << "Found no addresses for " << swAddrs.getStatus();
+            LOGV2_WARNING(23021,
+                          "Found no addresses for {swAddrs_getStatus}",
+                          "swAddrs_getStatus"_attr = swAddrs.getStatus());
             continue;
         }
         auto& addrs = swAddrs.getValue();
@@ -839,14 +868,17 @@ Status TransportLayerASIO::setup() {
 #ifndef _WIN32
         if (addr.family() == AF_UNIX) {
             if (::unlink(addr.toString().c_str()) == -1 && errno != ENOENT) {
-                error() << "Failed to unlink socket file " << addr.toString().c_str() << " "
-                        << errnoWithDescription(errno);
+                LOGV2_ERROR(
+                    23024,
+                    "Failed to unlink socket file {addr_c_str} {errnoWithDescription_errno}",
+                    "addr_c_str"_attr = addr.toString().c_str(),
+                    "errnoWithDescription_errno"_attr = errnoWithDescription(errno));
                 fassertFailedNoTrace(40486);
             }
         }
 #endif
         if (addr.family() == AF_INET6 && !_listenerOptions.enableIPv6) {
-            error() << "Specified ipv6 bind address, but ipv6 is disabled";
+            LOGV2_ERROR(23025, "Specified ipv6 bind address, but ipv6 is disabled");
             fassertFailedNoTrace(40488);
         }
 
@@ -881,8 +913,10 @@ Status TransportLayerASIO::setup() {
 #ifndef _WIN32
         if (addr.family() == AF_UNIX) {
             if (::chmod(addr.toString().c_str(), serverGlobalParams.unixSocketPermissions) == -1) {
-                error() << "Failed to chmod socket file " << addr.toString().c_str() << " "
-                        << errnoWithDescription(errno);
+                LOGV2_ERROR(23026,
+                            "Failed to chmod socket file {addr_c_str} {errnoWithDescription_errno}",
+                            "addr_c_str"_attr = addr.toString().c_str(),
+                            "errnoWithDescription_errno"_attr = errnoWithDescription(errno));
                 fassertFailedNoTrace(40487);
             }
         }
@@ -921,6 +955,13 @@ Status TransportLayerASIO::setup() {
         if (!status.isOK()) {
             return status;
         }
+
+        auto resp = getSSLManager()->stapleOCSPResponse(_ingressSSLContext->native_handle());
+        if (!resp.isOK()) {
+            return Status(ErrorCodes::InvalidSSLConfiguration,
+                          str::stream()
+                              << "Can not staple OCSP Response. Reason: " << resp.reason());
+        }
     }
 
     if (_listenerOptions.isEgress() && getSSLManager()) {
@@ -950,13 +991,17 @@ void TransportLayerASIO::_runListener() noexcept {
         asio::error_code ec;
         acceptor.second.listen(serverGlobalParams.listenBacklog, ec);
         if (ec) {
-            severe() << "Error listening for new connections on " << acceptor.first << ": "
-                     << ec.message();
+            LOGV2_FATAL(23027,
+                        "Error listening for new connections on {acceptor_first}: {ec_message}",
+                        "acceptor_first"_attr = acceptor.first,
+                        "ec_message"_attr = ec.message());
             fassertFailed(31339);
         }
 
         _acceptConnection(acceptor.second);
-        log() << "Listening on " << acceptor.first.getAddr();
+        LOGV2(23015,
+              "Listening on {acceptor_first_getAddr}",
+              "acceptor_first_getAddr"_attr = acceptor.first.getAddr());
     }
 
     const char* ssl = "";
@@ -965,7 +1010,10 @@ void TransportLayerASIO::_runListener() noexcept {
         ssl = " ssl";
     }
 #endif
-    log() << "waiting for connections on port " << _listenerPort << ssl;
+    LOGV2(23016,
+          "waiting for connections on port {listenerPort}{ssl}",
+          "listenerPort"_attr = _listenerPort,
+          "ssl"_attr = ssl);
 
     _listener.active = true;
     _listener.cv.notify_all();
@@ -987,10 +1035,13 @@ void TransportLayerASIO::_runListener() noexcept {
         auto& addr = acceptor.first;
         if (addr.getType() == AF_UNIX && !addr.isAnonymousUNIXSocket()) {
             auto path = addr.getAddr();
-            log() << "removing socket file: " << path;
+            LOGV2(23017, "removing socket file: {path}", "path"_attr = path);
             if (::unlink(path.c_str()) != 0) {
                 const auto ewd = errnoWithDescription();
-                warning() << "Unable to remove UNIX socket " << path << ": " << ewd;
+                LOGV2_WARNING(23022,
+                              "Unable to remove UNIX socket {path}: {ewd}",
+                              "path"_attr = path,
+                              "ewd"_attr = ewd);
             }
         }
     }
@@ -1063,8 +1114,12 @@ void TransportLayerASIO::_acceptConnection(GenericAcceptor& acceptor) {
         }
 
         if (ec) {
-            log() << "Error accepting new connection on "
-                  << endpointToHostAndPort(acceptor.local_endpoint()) << ": " << ec.message();
+            LOGV2(23018,
+                  "Error accepting new connection on "
+                  "{endpointToHostAndPort_acceptor_local_endpoint}: {ec_message}",
+                  "endpointToHostAndPort_acceptor_local_endpoint"_attr =
+                      endpointToHostAndPort(acceptor.local_endpoint()),
+                  "ec_message"_attr = ec.message());
             _acceptConnection(acceptor);
             return;
         }
@@ -1083,7 +1138,7 @@ void TransportLayerASIO::_acceptConnection(GenericAcceptor& acceptor) {
                 new ASIOSession(this, std::move(peerSocket), true));
             _sep->startSession(std::move(session));
         } catch (const DBException& e) {
-            warning() << "Error accepting new connection " << e;
+            LOGV2_WARNING(23023, "Error accepting new connection {e}", "e"_attr = e);
         }
 
         _acceptConnection(acceptor);

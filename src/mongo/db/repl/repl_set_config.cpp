@@ -47,7 +47,6 @@ namespace repl {
 // Allow the heartbeat interval to be forcibly overridden on this node.
 MONGO_FAIL_POINT_DEFINE(forceHeartbeatIntervalMS);
 
-const size_t ReplSetConfig::kMaxMembers;
 const size_t ReplSetConfig::kMaxVotingMembers;
 const Milliseconds ReplSetConfig::kInfiniteCatchUpTimeout(-1);
 const Milliseconds ReplSetConfig::kCatchUpDisabled(0);
@@ -56,7 +55,6 @@ const Milliseconds ReplSetConfig::kCatchUpTakeoverDisabled(-1);
 const std::string ReplSetConfig::kConfigServerFieldName = "configsvr";
 const std::string ReplSetConfig::kVersionFieldName = "version";
 const std::string ReplSetConfig::kTermFieldName = "term";
-const std::string ReplSetConfig::kMajorityWriteConcernModeName = "$majority";
 const Milliseconds ReplSetConfig::kDefaultHeartbeatInterval(2000);
 const Seconds ReplSetConfig::kDefaultHeartbeatTimeoutPeriod(10);
 const Milliseconds ReplSetConfig::kDefaultElectionTimeoutPeriod(10000);
@@ -810,7 +808,8 @@ void ReplSetConfig::_calculateMajorities() {
         std::count_if(begin(_members), end(_members), [](const auto& x) { return x.isArbiter(); });
     _totalVotingMembers = voters;
     _majorityVoteCount = voters / 2 + 1;
-    _writeMajority = std::min(_majorityVoteCount, voters - arbiters);
+    _writableVotingMembersCount = voters - arbiters;
+    _writeMajority = std::min(_majorityVoteCount, _writableVotingMembersCount);
 }
 
 void ReplSetConfig::_addInternalWriteConcernModes() {
@@ -840,6 +839,30 @@ void ReplSetConfig::_addInternalWriteConcernModes() {
         // other errors are unexpected
         fassert(28694, status);
     }
+
+    // $majorityConfig: the majority of all members including arbiters.
+    pattern = _tagConfig.makePattern();
+    status = _tagConfig.addTagCountConstraintToPattern(
+        &pattern, MemberConfig::kConfigAllTagName, _members.size() / 2 + 1);
+    if (status.isOK()) {
+        _customWriteConcernModes[kConfigMajorityWriteConcernModeName] = pattern;
+    } else if (status != ErrorCodes::NoSuchKey) {
+        // NoSuchKey means we have no $configAll-tagged nodes in this config;
+        // other errors are unexpected
+        fassert(31472, status);
+    }
+
+    // $configAll: all members including arbiters.
+    pattern = _tagConfig.makePattern();
+    status = _tagConfig.addTagCountConstraintToPattern(
+        &pattern, MemberConfig::kConfigAllTagName, _members.size());
+    if (status.isOK()) {
+        _customWriteConcernModes[kConfigAllWriteConcernName] = pattern;
+    } else if (status != ErrorCodes::NoSuchKey) {
+        // NoSuchKey means we have no $all-tagged nodes in this config;
+        // other errors are unexpected
+        fassert(31473, status);
+    }
 }
 
 void ReplSetConfig::_initializeConnectionString() {
@@ -863,9 +886,11 @@ BSONObj ReplSetConfig::toBSON() const {
     BSONObjBuilder configBuilder;
     configBuilder.append(kIdFieldName, _replSetName);
     configBuilder.appendIntOrLL(kVersionFieldName, _version);
-    // TODO (SERVER-45408): Enable serialization of the config "term" field once we can handle it
-    // properly in upgrade/downgrade scenarios.
-    // configBuilder.appendIntOrLL(kTermFieldName, _term);
+
+    if (_term != OpTime::kUninitializedTerm) {
+        configBuilder.appendIntOrLL(kTermFieldName, _term);
+    }
+
     if (_configServer) {
         // Only include "configsvr" field if true
         configBuilder.append(kConfigServerFieldName, _configServer);

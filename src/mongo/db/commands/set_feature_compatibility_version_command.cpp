@@ -43,6 +43,7 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/read_write_concern_defaults.h"
@@ -54,13 +55,13 @@
 #include "mongo/db/s/migration_util.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/server_options.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/database_version_helpers.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -160,8 +161,9 @@ public:
             auto waitForWCStatus = waitForWriteConcern(
                 opCtx,
                 repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp(),
-                WriteConcernOptions(
-                    WriteConcernOptions::kMajority, WriteConcernOptions::SyncMode::UNSET, timeout),
+                WriteConcernOptions(repl::ReplSetConfig::kMajorityWriteConcernModeName,
+                                    WriteConcernOptions::SyncMode::UNSET,
+                                    timeout),
                 &res);
             CommandHelpers::appendCommandWCStatus(result, waitForWCStatus, res);
         });
@@ -213,7 +215,7 @@ public:
             if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
                 const auto shardingState = ShardingState::get(opCtx);
                 if (shardingState->enabled()) {
-                    LOG(0) << "Upgrade: submitting orphaned ranges for cleanup";
+                    LOGV2(20500, "Upgrade: submitting orphaned ranges for cleanup");
                     migrationutil::submitOrphanRangesForCleanup(opCtx);
                 }
 
@@ -236,7 +238,7 @@ public:
                                      << requestedVersion)))));
 
                 if (MONGO_unlikely(pauseBeforeUpgradingConfigMetadata.shouldFail())) {
-                    log() << "Hit pauseBeforeUpgradingConfigMetadata";
+                    LOGV2(20501, "Hit pauseBeforeUpgradingConfigMetadata");
                     pauseBeforeUpgradingConfigMetadata.pauseWhileSet(opCtx);
                 }
                 ShardingCatalogManager::get(opCtx)->upgradeOrDowngradeChunksAndTags(
@@ -288,7 +290,59 @@ public:
                     }
                 }
             }
+
+            // Two phase index builds are only supported in 4.4. If the user tries to downgrade the
+            // cluster to FCV42, they must first wait for all index builds to run to completion, or
+            // abort the index builds (using the dropIndexes command).
+            if (auto indexBuildsCoord = IndexBuildsCoordinator::get(opCtx)) {
+                auto numIndexBuilds = indexBuildsCoord->getActiveIndexBuildCount(opCtx);
+                uassert(
+                    ErrorCodes::ConflictingOperationInProgress,
+                    str::stream()
+                        << "Cannot downgrade the cluster when there are index builds in progress: "
+                        << numIndexBuilds,
+                    numIndexBuilds == 0U);
+            }
+
             FeatureCompatibilityVersion::setTargetDowngrade(opCtx);
+
+            // Safe reconfig introduces a new "term" field in the config document. If the user tries
+            // to downgrade the replset to FCV42, the primary will initiate a reconfig without the
+            // term and wait for it to be replicated on all nodes.
+            auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+            const bool isReplSet =
+                replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
+            if (isReplSet &&
+                replCoord->getConfig().getConfigTerm() != repl::OpTime::kUninitializedTerm) {
+                // Force reconfig with term -1 to remove the 4.2 incompatible "term" field.
+                auto getNewConfig = [&](const repl::ReplSetConfig& oldConfig, long long term) {
+                    auto newConfig = oldConfig;
+                    newConfig.setConfigTerm(repl::OpTime::kUninitializedTerm);
+                    newConfig.setConfigVersion(newConfig.getConfigVersion() + 1);
+                    return newConfig;
+                };
+
+                // "force" reconfig in order to skip safety checks. This is safe since the content
+                // of config is the same.
+                LOGV2(4628800, "Downgrading replica set config.");
+                auto status = replCoord->doReplSetReconfig(opCtx, getNewConfig, true /* force */);
+                uassertStatusOKWithContext(status, "Failed to downgrade the replica set config");
+
+                LOGV2(4628801,
+                      "Waiting for the downgraded replica set config to propagate to all nodes");
+                // If a write concern is given, we'll use its wTimeout. It's kNoTimeout by default.
+                WriteConcernOptions writeConcern(repl::ReplSetConfig::kConfigAllWriteConcernName,
+                                                 WriteConcernOptions::SyncMode::NONE,
+                                                 opCtx->getWriteConcern().wTimeout);
+                writeConcern.checkCondition = WriteConcernOptions::CheckCondition::Config;
+                repl::OpTime fakeOpTime(Timestamp(1, 1), replCoord->getTerm());
+                uassertStatusOKWithContext(
+                    replCoord->awaitReplication(opCtx, fakeOpTime, writeConcern).status,
+                    "Failed to wait for the downgraded replica set config to propagate to all "
+                    "nodes");
+                LOGV2(4628802,
+                      "The downgraded replica set config has been propagated to all nodes");
+            }
 
             {
                 // Take the global lock in S mode to create a barrier for operations taking the
@@ -304,11 +358,8 @@ public:
             if (failDowngrading.shouldFail())
                 return false;
 
-            const bool isReplSet = repl::ReplicationCoordinator::get(opCtx)->getReplicationMode() ==
-                repl::ReplicationCoordinator::modeReplSet;
-
             if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
-                LOG(0) << "Downgrade: dropping config.rangeDeletions collection";
+                LOGV2(20502, "Downgrade: dropping config.rangeDeletions collection");
                 migrationutil::dropRangeDeletionsCollection(opCtx);
 
                 // The primary shard sharding a collection will write the initial chunks for a
@@ -334,7 +385,7 @@ public:
                                      << requestedVersion)))));
 
                 if (MONGO_unlikely(pauseBeforeDowngradingConfigMetadata.shouldFail())) {
-                    log() << "Hit pauseBeforeDowngradingConfigMetadata";
+                    LOGV2(20503, "Hit pauseBeforeDowngradingConfigMetadata");
                     pauseBeforeDowngradingConfigMetadata.pauseWhileSet(opCtx);
                 }
                 ShardingCatalogManager::get(opCtx)->upgradeOrDowngradeChunksAndTags(

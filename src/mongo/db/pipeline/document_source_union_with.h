@@ -32,7 +32,9 @@
 #include <boost/optional.hpp>
 
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/lite_parsed_document_source.h"
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
+#include "mongo/db/pipeline/stage_constraints.h"
 
 namespace mongo {
 
@@ -43,38 +45,19 @@ public:
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
-    class LiteParsed final : public LiteParsedDocumentSource {
+    class LiteParsed final : public LiteParsedDocumentSourceNestedPipelines {
     public:
-        static std::unique_ptr<LiteParsed> parse(const AggregationRequest& request,
+        static std::unique_ptr<LiteParsed> parse(const NamespaceString& nss,
                                                  const BSONElement& spec);
 
-        LiteParsed(NamespaceString withNss,
-                   stdx::unordered_set<NamespaceString> foreignNssSet,
-                   boost::optional<LiteParsedPipeline> liteParsedPipeline)
-            : _withNss{std::move(withNss)},
-              _foreignNssSet(std::move(foreignNssSet)),
-              _liteParsedPipeline(std::move(liteParsedPipeline)) {}
+        LiteParsed(std::string parseTimeName,
+                   NamespaceString foreignNss,
+                   boost::optional<LiteParsedPipeline> pipeline)
+            : LiteParsedDocumentSourceNestedPipelines(
+                  std::move(parseTimeName), std::move(foreignNss), std::move(pipeline)) {}
 
-        stdx::unordered_set<NamespaceString> getInvolvedNamespaces() const final {
-            return {_foreignNssSet};
-        }
-
-        PrivilegeVector requiredPrivileges(bool) const final {
-            return {};
-        }
-
-        bool allowShardedForeignCollection(NamespaceString) const final {
-            return true;
-        }
-
-        bool allowedToPassthroughFromMongos() const final {
-            return true;
-        }
-
-    private:
-        const NamespaceString _withNss;
-        const stdx::unordered_set<NamespaceString> _foreignNssSet;
-        const boost::optional<LiteParsedPipeline> _liteParsedPipeline;
+        PrivilegeVector requiredPrivileges(bool isMongos,
+                                           bool bypassDocumentValidation) const override final;
     };
 
     DocumentSourceUnionWith(const boost::intrusive_ptr<ExpressionContext>& expCtx,
@@ -89,16 +72,39 @@ public:
         std::vector<Value>& array,
         boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
 
-    GetModPathsReturn getModifiedPaths() const final;
+    GetModPathsReturn getModifiedPaths() const final {
+        // Since we might have a document arrive from the foreign pipeline with the same path as a
+        // document in the main pipeline. Without introspecting the sub-pipeline, we must report
+        // that all paths have been modified.
+        return {GetModPathsReturn::Type::kAllPaths, {}, {}};
+    }
 
     StageConstraints constraints(Pipeline::SplitState) const final {
-        return StageConstraints(StreamType::kStreaming,
-                                PositionRequirement::kNone,
-                                HostTypeRequirement::kNone,
-                                DiskUseRequirement::kNoDiskUse,
-                                FacetRequirement::kAllowed,
-                                TransactionRequirement::kNotAllowed,
-                                LookupRequirement::kNotAllowed);
+        StageConstraints unionConstraints(
+            StreamType::kStreaming,
+            PositionRequirement::kNone,
+            HostTypeRequirement::kAnyShard,
+            DiskUseRequirement::kNoDiskUse,
+            FacetRequirement::kAllowed,
+            TransactionRequirement::kNotAllowed,
+            // The check to disallow $unionWith on a sharded collection within $lookup happens
+            // outside of the constraints as long as the involved namespaces are reported correctly.
+            LookupRequirement::kAllowed,
+            UnionRequirement::kAllowed);
+
+        if (_pipeline) {
+            // The constraints of the sub-pipeline determine the constraints of the $unionWith
+            // stage. We want to forward the strictest requirements of the stages in the
+            // sub-pipeline.
+            unionConstraints = StageConstraints::getStrictestConstraints(_pipeline->getSources(),
+                                                                         unionConstraints);
+        }
+        // DocumentSourceUnionWith cannot directly swap with match but it contains custom logic in
+        // the doOptimizeAt() member function to allow itself to duplicate any match ahead in the
+        // current pipeline and place one copy inside its sub-pipeline and one copy behind in the
+        // current pipeline.
+        unionConstraints.canSwapWithMatch = false;
+        return unionConstraints;
     }
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
@@ -114,11 +120,38 @@ public:
 
     void reattachToOperationContext(OperationContext* opCtx) final;
 
+    bool usedDisk() final;
+
 protected:
     GetNextResult doGetNext() final;
+
+    Pipeline::SourceContainer::iterator doOptimizeAt(Pipeline::SourceContainer::iterator itr,
+                                                     Pipeline::SourceContainer* container) final;
+
+    boost::intrusive_ptr<DocumentSource> optimize() final {
+        _pipeline->optimizePipeline();
+        return this;
+    }
+
     void doDispose() final;
 
 private:
+    enum ExecutionProgress {
+        // We haven't yet iterated 'pSource' to completion.
+        kIteratingSource,
+
+        // We finished iterating 'pSource', but haven't started on the sub pipeline and need to do
+        // some setup first.
+        kStartingSubPipeline,
+
+        // We finished iterating 'pSource' and are now iterating '_pipeline', but haven't finished
+        // yet.
+        kIteratingSubPipeline,
+
+        // There are no more results.
+        kFinished
+    };
+
     /**
      * Should not be called; use serializeToArray instead.
      */
@@ -127,8 +160,9 @@ private:
     }
 
     std::unique_ptr<Pipeline, PipelineDeleter> _pipeline;
-    bool _sourceExhausted = false;
     bool _cursorAttached = false;
+    bool _usedDisk = false;
+    ExecutionProgress _executionState = ExecutionProgress::kIteratingSource;
 };
 
 }  // namespace mongo

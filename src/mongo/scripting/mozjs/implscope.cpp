@@ -33,6 +33,7 @@
 
 #include "mongo/scripting/mozjs/implscope.h"
 
+#include <iostream>
 #include <memory>
 
 #include <js/CharacterEncoding.h>
@@ -42,6 +43,7 @@
 #include "mongo/base/error_codes.h"
 #include "mongo/config.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/decimal128.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/platform/stack_locator.h"
@@ -50,7 +52,6 @@
 #include "mongo/scripting/mozjs/valuereader.h"
 #include "mongo/scripting/mozjs/valuewriter.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 #if !defined(__has_feature)
@@ -218,13 +219,18 @@ bool MozJSImplScope::_interruptCallback(JSContext* cx) {
 }
 
 void MozJSImplScope::_gcCallback(JSContext* rt, JSGCStatus status, void* data) {
-    if (!shouldLog(logger::LogSeverity::Debug(1))) {
+    if (!shouldLog(logv2::LogSeverity::Debug(1))) {
         // don't collect stats unless verbose
         return;
     }
 
-    log() << "MozJS GC " << (status == JSGC_BEGIN ? "prologue" : "epilogue") << " heap stats - "
-          << " total: " << mongo::sm::get_total_bytes() << " limit: " << mongo::sm::get_max_bytes();
+    LOGV2(22787,
+          "MozJS GC {status_JSGC_BEGIN_prologue_epilogue} heap stats -  total: "
+          "{mongo_sm_get_total_bytes} limit: {mongo_sm_get_max_bytes}",
+          "status_JSGC_BEGIN_prologue_epilogue"_attr =
+              (status == JSGC_BEGIN ? "prologue" : "epilogue"),
+          "mongo_sm_get_total_bytes"_attr = mongo::sm::get_total_bytes(),
+          "mongo_sm_get_max_bytes"_attr = mongo::sm::get_max_bytes());
 }
 
 #if __has_feature(address_sanitizer)
@@ -261,16 +267,21 @@ void MozJSImplScope::ASANHandles::removePointer(void* ptr) {}
 #endif
 
 
-MozJSImplScope::MozRuntime::MozRuntime(const MozJSScriptEngine* engine) {
+MozJSImplScope::MozRuntime::MozRuntime(const MozJSScriptEngine* engine,
+                                       boost::optional<int> jsHeapLimitMB) {
     /**
      * The maximum amount of memory to be given out per thread to mozilla. We
      * manage this by trapping all calls to malloc, free, etc. and keeping track of
-     * counts in some thread locals
+     * counts in some thread locals. If 'jsHeapLimitMB' is specified then we use this instead of the
+     * engine limit, given it does not exceed the engine limit.
      */
+    const auto engineJsHeapLimit = engine->getJSHeapLimitMB();
+    const auto jsHeapLimit =
+        jsHeapLimitMB ? std::min(*jsHeapLimitMB, engineJsHeapLimit) : engineJsHeapLimit;
 
-    const auto jsHeapLimit = engine->getJSHeapLimitMB();
     if (jsHeapLimit != 0 && jsHeapLimit < 10) {
-        warning() << "JavaScript may not be able to initialize with a heap limit less than 10MB.";
+        LOGV2_WARNING(22788,
+                      "JavaScript may not be able to initialize with a heap limit less than 10MB.");
     }
     size_t mallocMemoryLimit = 1024ul * 1024 * jsHeapLimit;
     mongo::sm::reset(mallocMemoryLimit);
@@ -360,9 +371,9 @@ MozJSImplScope::MozRuntime::MozRuntime(const MozJSScriptEngine* engine) {
     }
 }
 
-MozJSImplScope::MozJSImplScope(MozJSScriptEngine* engine)
+MozJSImplScope::MozJSImplScope(MozJSScriptEngine* engine, boost::optional<int> jsHeapLimitMB)
     : _engine(engine),
-      _mr(engine),
+      _mr(engine, jsHeapLimitMB),
       _context(_mr._context.get()),
       _globalProto(_context),
       _global(_globalProto.getProto()),
@@ -694,7 +705,7 @@ int MozJSImplScope::invoke(ScriptingFunction func,
             // must validate the handle because TerminateExecution may have
             // been thrown after the above checks
             if (out.isObject() && _nativeFunctionProto.instanceOf(out)) {
-                warning() << "storing native function as return value";
+                LOGV2_WARNING(22789, "storing native function as return value");
                 _lastRetIsNativeCode = true;
             } else {
                 _lastRetIsNativeCode = false;
@@ -912,7 +923,10 @@ bool MozJSImplScope::_checkErrorState(bool success, bool reportError, bool asser
     }
 
     if (reportError)
-        error() << redact(_error);
+        LOGV2_OPTIONS(4635900,
+                      logv2::LogOptions(logv2::LogTag::kPlainShell, logv2::LogTruncation::Disabled),
+                      "{message}",
+                      "message"_attr = redact(_error));
 
     // Clear the status state
     auto status = std::move(_status);

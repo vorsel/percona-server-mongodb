@@ -7,6 +7,7 @@
 //   requires_non_retryable_commands,
 //   requires_non_retryable_writes,
 //   uses_map_reduce_with_temp_collections,
+//   requires_emptycapped,
 // ]
 //
 // Tagged as 'requires_fcv_44', since this test cannot run against versions less then 4.4. This is
@@ -104,8 +105,6 @@ let viewsCommandTests = {
     _configsvrRemoveShardFromZone: {skip: isAnInternalCommand},
     _configsvrShardCollection: {skip: isAnInternalCommand},
     _configsvrUpdateZoneKeyRange: {skip: isAnInternalCommand},
-    _cpuProfilerStart: {skip: isAnInternalCommand},
-    _cpuProfilerStop: {skip: isAnInternalCommand},
     _flushDatabaseCacheUpdates: {skip: isUnrelated},
     _flushRoutingTableCacheUpdates: {skip: isUnrelated},
     _getNextSessionMods: {skip: isAnInternalCommand},
@@ -434,7 +433,6 @@ let viewsCommandTests = {
     refreshLogicalSessionCacheNow: {skip: isAnInternalCommand},
     reapLogicalSessionCacheNow: {skip: isAnInternalCommand},
     refreshSessions: {skip: isUnrelated},
-    restartCatalog: {skip: isAnInternalCommand},
     reIndex: {command: {reIndex: "view"}, expectFailure: true},
     removeShard: {skip: isUnrelated},
     removeShardFromZone: {skip: isUnrelated},

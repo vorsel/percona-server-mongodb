@@ -45,6 +45,9 @@ namespace logv2 {
 class LogComponent {
 public:
     enum Value {
+        // kAutomaticDetermination is placeholder for using component set by
+        // MONGO_LOGV2_DEFAULT_COMPONENT macro
+        kAutomaticDetermination = -1,
         kDefault = 0,
         kAccessControl,
         kCommand,
@@ -61,6 +64,7 @@ public:
         kReplicationRollback,
         kSharding,
         kShardingCatalogRefresh,
+        kShardingMigration,
         kStorage,
         kStorageRecovery,
         kJournal,
@@ -71,7 +75,6 @@ public:
         kTracking,
         kTransaction,
         kConnectionPool,
-        kTlaPlusTrace,
         kNumLogComponents
     };
 
@@ -116,6 +119,8 @@ public:
 private:
     Value _value;
 };
+
+std::ostream& operator<<(std::ostream& os, LogComponent component);
 
 }  // namespace logv2
 }  // namespace mongo

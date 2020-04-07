@@ -45,8 +45,8 @@
 #include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/ttl_collection_cache.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -104,13 +104,16 @@ Status IndexBuildBlock::init(OperationContext* opCtx, Collection* collection) {
     if (!status.isOK())
         return status;
 
-    const bool initFromDisk = false;
-    const bool isReadyIndex = false;
     _indexCatalogEntry =
-        _indexCatalog->createIndexEntry(opCtx, std::move(descriptor), initFromDisk, isReadyIndex);
+        _indexCatalog->createIndexEntry(opCtx, std::move(descriptor), CreateIndexEntryFlags::kNone);
 
+    // Only track skipped records with two-phase index builds, which is indicated by a present build
+    // UUID.
+    const auto trackSkipped = (_buildUUID) ? IndexBuildInterceptor::TrackSkippedRecords::kTrack
+                                           : IndexBuildInterceptor::TrackSkippedRecords::kNoTrack;
     if (_method == IndexBuildMethod::kHybrid) {
-        _indexBuildInterceptor = std::make_unique<IndexBuildInterceptor>(opCtx, _indexCatalogEntry);
+        _indexBuildInterceptor =
+            std::make_unique<IndexBuildInterceptor>(opCtx, _indexCatalogEntry, trackSkipped);
         _indexCatalogEntry->setIndexBuildInterceptor(_indexBuildInterceptor.get());
     }
 
@@ -157,10 +160,17 @@ void IndexBuildBlock::success(OperationContext* opCtx, Collection* collection) {
     // Being in a WUOW means all timestamping responsibility can be pushed up to the caller.
     invariant(opCtx->lockState()->inAWriteUnitOfWork());
 
-    invariant(
-        UncommittedCollections::get(opCtx).hasExclusiveAccessToCollection(opCtx, collection->ns()));
+    UncommittedCollections::get(opCtx).invariantHasExclusiveAccessToCollection(opCtx,
+                                                                               collection->ns());
 
     if (_indexBuildInterceptor) {
+        // Skipped records are only checked when we complete an index build as primary.
+        const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+        const auto skippedRecordsTracker = _indexBuildInterceptor->getSkippedRecordTracker();
+        if (skippedRecordsTracker && replCoord->canAcceptWritesFor(opCtx, collection->ns())) {
+            invariant(skippedRecordsTracker->areAllRecordsApplied(opCtx));
+        }
+
         // An index build should never be completed with writes remaining in the interceptor.
         invariant(_indexBuildInterceptor->areAllWritesApplied(opCtx));
 
@@ -168,7 +178,10 @@ void IndexBuildBlock::success(OperationContext* opCtx, Collection* collection) {
         invariant(_indexBuildInterceptor->areAllConstraintsChecked(opCtx));
     }
 
-    log() << "index build: done building index " << _indexName << " on ns " << _nss;
+    LOGV2(20345,
+          "index build: done building index {indexName} on ns {nss}",
+          "indexName"_attr = _indexName,
+          "nss"_attr = _nss);
 
     collection->indexBuildSuccess(opCtx, _indexCatalogEntry);
     auto svcCtx = opCtx->getClient()->getServiceContext();

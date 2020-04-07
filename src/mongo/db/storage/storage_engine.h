@@ -62,6 +62,13 @@ struct StorageGlobalParams;
 class StorageEngine : public percona::EngineExtension {
 public:
     /**
+     * This is the minimum valid timestamp; it can be used for reads that need to see all
+     * untimestamped data but no timestamped data. We cannot use 0 here because 0 means see all
+     * timestamped data.
+     */
+    static const uint64_t kMinimumTimestamp = 1;
+
+    /**
      * When the storage engine needs to know how much oplog to preserve for the sake of active
      * transactions, it executes a callback that returns either the oldest active transaction
      * timestamp, or boost::none if there is no active transaction, or an error if it fails.
@@ -290,9 +297,13 @@ public:
     virtual Status dropDatabase(OperationContext* opCtx, StringData db) = 0;
 
     /**
-     * @return number of files flushed
+     * Checkpoints the data to disk.
+     *
+     * 'callerHoldsReadLock' signals whether the caller holds a read lock. A write lock may be taken
+     * internally, but will be skipped for callers holding a read lock because a write lock would
+     * conflict. The JournalListener will not be updated in this case.
      */
-    virtual int flushAllFiles(OperationContext* opCtx, bool sync) = 0;
+    virtual void flushAllFiles(OperationContext* opCtx, bool callerHoldsReadLock) = 0;
 
     /**
      * Transitions the storage engine into backup mode.
@@ -358,8 +369,8 @@ public:
      * Recover as much data as possible from a potentially corrupt RecordStore.
      * This only recovers the record data, not indexes or anything else.
      *
-     * Generally, this method should not be called directly except by the repairDatabase()
-     * free function.
+     * The Collection object for on this namespace will be destructed and invalidated. A new
+     * Collection object will be created and it should be retrieved from the CollectionCatalog.
      */
     virtual Status repairRecordStore(OperationContext* opCtx,
                                      RecordId catalogId,
@@ -394,6 +405,8 @@ public:
     /**
      * Sets a new JournalListener, which is used by the storage engine to alert the rest of the
      * system about journaled write progress.
+     *
+     * This may only be set once.
      */
     virtual void setJournalListener(JournalListener* jl) = 0;
 
@@ -543,6 +556,21 @@ public:
      */
     virtual void triggerJournalFlush() const = 0;
 
+    /**
+     * Initiates if needed and waits for a complete round of journal flushing to execute.
+     *
+     * Can throw ShutdownInProgress if the storage engine is being closed.
+     */
+    virtual void waitForJournalFlush(OperationContext* opCtx) const = 0;
+
+    /**
+     * Ensures interruption of the JournalFlusher if it is or will be acquiring a lock.
+     *
+     * TODO: this function will be moved above the Storage Engine layer along with the
+     * JournalFlusher in SERVER-45847.
+     */
+    virtual void interruptJournalFlusherForReplStateChange() const = 0;
+
     struct IndexIdentifier {
         const RecordId catalogId;
         const NamespaceString nss;
@@ -578,6 +606,8 @@ public:
      * commit_timestamp and prepared transactions that have been given a durable_timestamp.
      * Previously, the deprecated all_committed timestamp would also include prepared transactions
      * that were prepared but not committed which could make the stable timestamp briefly jump back.
+     *
+     * Returns kMinimumTimestamp if there have been no new writes since the storage engine started.
      */
     virtual Timestamp getAllDurableTimestamp() const = 0;
 

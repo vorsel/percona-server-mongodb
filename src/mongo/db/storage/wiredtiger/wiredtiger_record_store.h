@@ -253,6 +253,7 @@ public:
     void reclaimOplog(OperationContext* opCtx) override;
 
     StatusWith<Timestamp> getLatestOplogTimestamp(OperationContext* opCtx) const override;
+    StatusWith<Timestamp> getEarliestOplogTimestamp(OperationContext* opCtx) override;
 
     /**
      * The `recoveryTimestamp` is when replication recovery would need to replay from for
@@ -548,8 +549,8 @@ private:
 extern FailPoint WTWriteConflictException;
 extern FailPoint WTWriteConflictExceptionForReads;
 
-// Prevents oplog writes from being considered durable on the primary. Once activated, new writes
-// will not be considered durable until deactivated. It is unspecified whether writes that commit
-// before activation will become visible while active.
+// Prevents oplog writes from becoming visible asynchronously. Once activated, new writes will not
+// be seen by regular readers until deactivated. It is unspecified whether writes that commit before
+// activation will become visible while active.
 extern FailPoint WTPausePrimaryOplogDurabilityLoop;
 }  // namespace mongo

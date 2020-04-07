@@ -37,9 +37,9 @@
 #include "mongo/db/s/transaction_coordinator_metrics_observer.h"
 #include "mongo/db/s/wait_for_majority_service.h"
 #include "mongo/db/server_options.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -63,7 +63,7 @@ ExecutorFuture<void> waitForMajorityWithHangFailpoint(ServiceContext* service,
 
     if (auto sfp = failpoint.scoped(); MONGO_unlikely(sfp.isActive())) {
         const BSONObj& data = sfp.getData();
-        LOG(0) << "Hit " << failPointName << " failpoint";
+        LOGV2(22445, "Hit {failPointName} failpoint", "failPointName"_attr = failPointName);
 
         // Run the hang failpoint asynchronously on a different thread to avoid self deadlocks.
         return ExecutorFuture<void>(executor).then(
@@ -200,9 +200,14 @@ TransactionCoordinator::TransactionCoordinator(OperationContext* operationContex
                     }
 
                     if (_decision->getDecision() == CommitDecision::kCommit) {
-                        LOG(3) << txn::txnIdToString(_lsid, _txnNumber)
-                               << " Advancing cluster time to the commit timestamp "
-                               << *_decision->getCommitTimestamp();
+                        LOGV2_DEBUG(22446,
+                                    3,
+                                    "{txn_txnIdToString_lsid_txnNumber} Advancing cluster time to "
+                                    "the commit timestamp {decision_getCommitTimestamp}",
+                                    "txn_txnIdToString_lsid_txnNumber"_attr =
+                                        txn::txnIdToString(_lsid, _txnNumber),
+                                    "decision_getCommitTimestamp"_attr =
+                                        *_decision->getCommitTimestamp());
 
                         uassertStatusOK(LogicalClock::get(_serviceContext)
                                             ->advanceClusterTime(
@@ -303,13 +308,13 @@ TransactionCoordinator::TransactionCoordinator(OperationContext* operationContex
 
             return txn::deleteCoordinatorDoc(*_scheduler, _lsid, _txnNumber);
         })
-        .onCompletion([this, deadlineFuture = std::move(deadlineFuture)](Status s) mutable {
+        .getAsync([this, deadlineFuture = std::move(deadlineFuture)](Status s) mutable {
             // Interrupt this coordinator's scheduler hierarchy and join the deadline task's future
             // in order to guarantee that there are no more threads running within the coordinator.
             _scheduler->shutdown(
                 {ErrorCodes::TransactionCoordinatorDeadlineTaskCanceled, "Coordinator completed"});
 
-            return std::move(deadlineFuture).onCompletion([this, s = std::move(s)](Status) {
+            return std::move(deadlineFuture).getAsync([this, s = std::move(s)](Status) {
                 // Notify all the listeners which are interested in the coordinator's lifecycle.
                 // After this call, the coordinator object could potentially get destroyed by its
                 // lifetime controller, so there shouldn't be any accesses to `this` after this
@@ -382,8 +387,11 @@ void TransactionCoordinator::_done(Status status) {
                         str::stream() << "Coordinator " << _lsid.getId() << ':' << _txnNumber
                                       << " stopped due to: " << status.reason());
 
-    LOG(3) << txn::txnIdToString(_lsid, _txnNumber) << " Two-phase commit completed with "
-           << redact(status);
+    LOGV2_DEBUG(22447,
+                3,
+                "{txn_txnIdToString_lsid_txnNumber} Two-phase commit completed with {status}",
+                "txn_txnIdToString_lsid_txnNumber"_attr = txn::txnIdToString(_lsid, _txnNumber),
+                "status"_attr = redact(status));
 
     stdx::unique_lock<Latch> ul(_mutex);
 
@@ -397,7 +405,7 @@ void TransactionCoordinator::_done(Status status) {
         _decisionDurable ? _decision : boost::none);
 
     if (status.isOK() &&
-        (shouldLog(logger::LogComponent::kTransaction, logger::LogSeverity::Debug(1)) ||
+        (shouldLog(logv2::LogComponent::kTransaction, logv2::LogSeverity::Debug(1)) ||
          _transactionCoordinatorMetricsObserver->getSingleTransactionCoordinatorStats()
                  .getTwoPhaseCommitDuration(tickSource, tickSource->getTicks()) >
              Milliseconds(serverGlobalParams.slowMS))) {
@@ -413,7 +421,83 @@ void TransactionCoordinator::_done(Status status) {
 
 void TransactionCoordinator::_logSlowTwoPhaseCommit(
     const txn::CoordinatorCommitDecision& decision) {
-    log() << _twoPhaseCommitInfoForLog(decision);
+    {
+        logv2::DynamicAttributes attrs;
+
+        BSONObjBuilder parametersBuilder;
+
+        BSONObjBuilder lsidBuilder(parametersBuilder.subobjStart("lsid"));
+        _lsid.serialize(&lsidBuilder);
+        lsidBuilder.doneFast();
+
+        parametersBuilder.append("txnNumber", _txnNumber);
+
+        attrs.add("parameters", parametersBuilder.obj());
+
+        std::string decisionTemp;
+        switch (decision.getDecision()) {
+            case txn::CommitDecision::kCommit:
+                attrs.add("terminationCause", "committed");
+                decisionTemp = decision.getCommitTimestamp()->toString();
+                attrs.add("commitTimestamp", decisionTemp);
+                break;
+            case txn::CommitDecision::kAbort:
+                attrs.add("terminationCause", "aborted");
+                attrs.add("terminationDetails", *decision.getAbortStatus());
+                break;
+            default:
+                MONGO_UNREACHABLE;
+        };
+
+        attrs.add("numParticipants", _participants->size());
+
+        auto tickSource = _serviceContext->getTickSource();
+        auto curTick = tickSource->getTicks();
+        const auto& singleTransactionCoordinatorStats =
+            _transactionCoordinatorMetricsObserver->getSingleTransactionCoordinatorStats();
+
+        BSONObjBuilder stepDurations;
+        stepDurations.append(
+            "writingParticipantListMicros",
+            durationCount<Microseconds>(
+                singleTransactionCoordinatorStats.getWritingParticipantListDuration(tickSource,
+                                                                                    curTick)));
+        stepDurations.append(
+            "waitingForVotesMicros",
+            durationCount<Microseconds>(
+                singleTransactionCoordinatorStats.getWaitingForVotesDuration(tickSource, curTick)));
+        stepDurations.append(
+            "writingDecisionMicros",
+            durationCount<Microseconds>(
+                singleTransactionCoordinatorStats.getWritingDecisionDuration(tickSource, curTick)));
+        stepDurations.append(
+            "waitingForDecisionAcksMicros",
+            durationCount<Microseconds>(
+                singleTransactionCoordinatorStats.getWaitingForDecisionAcksDuration(tickSource,
+                                                                                    curTick)));
+        stepDurations.append(
+            "deletingCoordinatorDocMicros",
+            durationCount<Microseconds>(
+                singleTransactionCoordinatorStats.getDeletingCoordinatorDocDuration(tickSource,
+                                                                                    curTick)));
+        attrs.add("stepDurations", stepDurations.obj());
+
+        // Total duration of the commit coordination. Logged at the end of the line for consistency
+        // with slow command logging. Note that this is reported in milliseconds while the step
+        // durations are reported in microseconds.
+        attrs.add(
+            "duration",
+            duration_cast<Milliseconds>(
+                singleTransactionCoordinatorStats.getTwoPhaseCommitDuration(tickSource, curTick)));
+
+        LOGV2(51804, "two-phase commit", attrs);
+    }
+    // TODO SERVER-46219: Log also with old log system to not break unit tests
+    {
+        LOGV2(22448,
+              "{twoPhaseCommitInfoForLog_decision}",
+              "twoPhaseCommitInfoForLog_decision"_attr = _twoPhaseCommitInfoForLog(decision));
+    }
 }
 
 std::string TransactionCoordinator::_twoPhaseCommitInfoForLog(

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kShardingMigration
 
 #include "mongo/platform/basic.h"
 
@@ -39,6 +39,7 @@
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/logical_clock.h"
+#include "mongo/db/logical_session_cache.h"
 #include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context.h"
@@ -50,11 +51,13 @@
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/db/s/shard_metadata_util.h"
 #include "mongo/db/s/sharding_logging.h"
+#include "mongo/db/s/sharding_runtime_d_params_gen.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/sharding_state_recovery.h"
 #include "mongo/db/s/sharding_statistics.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/executor/task_executor_pool.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_shard_collection.h"
 #include "mongo/s/catalog_cache_loader.h"
@@ -66,7 +69,6 @@
 #include "mongo/util/elapsed_tracker.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -116,6 +118,16 @@ void refreshRecipientRoutingTable(OperationContext* opCtx,
     executor->scheduleRemoteCommand(request, noOp).getStatus().ignore();
 }
 
+bool isFCVLatest() {
+    auto fcvVersion = serverGlobalParams.featureCompatibility.getVersion();
+
+    return fcvVersion == ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44;
+}
+
+BSONObj getMigrationIdBSON(migrationutil::MigrationCoordinator* coordinator) {
+    return coordinator ? coordinator->getMigrationId().toBSON() : BSONObj();
+}
+
 }  // namespace
 
 MONGO_FAIL_POINT_DEFINE(doNotRefreshRecipientAfterCommit);
@@ -143,20 +155,24 @@ MigrationSourceManager::MigrationSourceManager(OperationContext* opCtx,
     // chunk. This is guaranteed by the setFCV command serializing with donating and receiving
     // chunks via the ActiveMigrationsRegistry.
     auto fcvVersion = serverGlobalParams.featureCompatibility.getVersion();
+
     uassert(ErrorCodes::ConflictingOperationInProgress,
             "Can't donate chunk while FCV is upgrading/downgrading",
             fcvVersion != ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo44 &&
                 fcvVersion != ServerGlobalParams::FeatureCompatibility::Version::kDowngradingTo42);
-    _useFCV44Protocol =
-        fcvVersion == ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44;
+
+    _enableResumableRangeDeleter = isFCVLatest() && !disableResumableRangeDeleter.load();
 
     // Disallow moving a chunk to ourselves
     uassert(ErrorCodes::InvalidOptions,
             "Destination shard cannot be the same as source",
             _args.getFromShardId() != _args.getToShardId());
 
-    log() << "Starting chunk migration " << redact(_args.toString())
-          << " with expected collection version epoch " << _args.getVersionEpoch();
+    LOGV2(22016,
+          "Starting chunk migration {args} with expected collection version epoch "
+          "{args_getVersionEpoch}",
+          "args"_attr = redact(_args.toString()),
+          "args_getVersionEpoch"_attr = _args.getVersionEpoch());
 
     // Force refresh of the metadata to ensure we have the latest
     forceShardFilteringMetadataRefresh(_opCtx, getNss());
@@ -250,8 +266,6 @@ Status MigrationSourceManager::startClone() {
     auto replCoord = repl::ReplicationCoordinator::get(_opCtx);
     auto replEnabled = replCoord->isReplEnabled();
 
-    UUID migrationId = UUID::gen();
-
     {
         const auto metadata = _getCurrentMetadataAndCheckEpoch();
 
@@ -283,15 +297,16 @@ Status MigrationSourceManager::startClone() {
         auto lockedCsr = CollectionShardingRuntime::CSRLock::lockExclusive(_opCtx, csr);
         invariant(nullptr == std::exchange(msmForCsr(csr), this));
 
-        if (_useFCV44Protocol) {
+        if (_enableResumableRangeDeleter) {
             _coordinator = std::make_unique<migrationutil::MigrationCoordinator>(
-                migrationId,
+                _cloneDriver->getSessionId(),
                 _args.getFromShardId(),
                 _args.getToShardId(),
                 getNss(),
                 _collectionUuid.get(),
                 ChunkRange(_args.getMinKey(), _args.getMaxKey()),
-                _chunkVersion);
+                _chunkVersion,
+                _args.getWaitForDelete());
         }
 
         _state = kCloning;
@@ -306,13 +321,21 @@ Status MigrationSourceManager::startClone() {
             _opCtx, readConcernArgs, PrepareConflictBehavior::kEnforce);
     }
 
-    if (_useFCV44Protocol) {
-        _coordinator->startMigration(_opCtx, _args.getWaitForDelete());
-    }
+    if (_enableResumableRangeDeleter) {
+        _coordinator->startMigration(_opCtx);
 
-    Status startCloneStatus = _cloneDriver->startClone(_opCtx, migrationId);
-    if (!startCloneStatus.isOK()) {
-        return startCloneStatus;
+        Status startCloneStatus = _cloneDriver->startClone(_opCtx,
+                                                           _coordinator->getMigrationId(),
+                                                           _coordinator->getLsid(),
+                                                           _coordinator->getTxnNumber());
+        if (!startCloneStatus.isOK()) {
+            return startCloneStatus;
+        }
+    } else {
+        Status startCloneStatus = _cloneDriver->startClone(_opCtx);
+        if (!startCloneStatus.isOK()) {
+            return startCloneStatus;
+        }
     }
 
     scopedGuard.dismiss();
@@ -380,7 +403,9 @@ Status MigrationSourceManager::enterCriticalSection() {
                           << signalStatus.toString()};
     }
 
-    log() << "Migration successfully entered critical section";
+    LOGV2(22017,
+          "Migration successfully entered critical section",
+          "migrationId"_attr = getMigrationIdBSON(_coordinator.get()));
 
     scopedGuard.dismiss();
     return Status::OK();
@@ -426,9 +451,7 @@ Status MigrationSourceManager::commitChunkMetadataOnConfig() {
         ChunkType migratedChunkType;
         migratedChunkType.setMin(_args.getMinKey());
         migratedChunkType.setMax(_args.getMaxKey());
-        if (_useFCV44Protocol) {
-            migratedChunkType.setVersion(_chunkVersion);
-        }
+        migratedChunkType.setVersion(_chunkVersion);
 
         CommitChunkMigrationRequest::appendAsCommand(
             &builder,
@@ -467,68 +490,9 @@ Status MigrationSourceManager::commitChunkMetadataOnConfig() {
         Shard::CommandResponse::getEffectiveStatus(commitChunkMigrationResponse);
 
     if (!migrationCommitStatus.isOK()) {
-        if (_useFCV44Protocol) {
-            migrationutil::ensureChunkVersionIsGreaterThan(_opCtx, _args.getRange(), _chunkVersion);
-        } else {
-            // This is the FCV 4.2 and below protocol.
-
-            // Need to get the latest optime in case the refresh request goes to a secondary --
-            // otherwise the read won't wait for the write that _configsvrCommitChunkMigration may
-            // have done
-            log() << "Error occurred while committing the migration. Performing a majority write "
-                     "against the config server to obtain its latest optime"
-                  << causedBy(redact(migrationCommitStatus));
-
-            Status status = ShardingLogging::get(_opCtx)->logChangeChecked(
-                _opCtx,
-                "moveChunk.validating",
-                getNss().ns(),
-                BSON("min" << _args.getMinKey() << "max" << _args.getMaxKey() << "from"
-                           << _args.getFromShardId() << "to" << _args.getToShardId()),
-                ShardingCatalogClient::kMajorityWriteConcern);
-
-            if ((ErrorCodes::isInterruption(status.code()) ||
-                 ErrorCodes::isShutdownError(status.code()) ||
-                 status == ErrorCodes::CallbackCanceled) &&
-                globalInShutdownDeprecated()) {
-                // Since the server is already doing a clean shutdown, this call will just join the
-                // previous shutdown call
-                shutdown(waitForShutdown());
-            }
-
-            // If we failed to get the latest config optime because we stepped down as primary, then
-            // it is safe to fail without crashing because the new primary will fetch the latest
-            // optime when it recovers the sharding state recovery document, as long as we also
-            // clear the metadata for this collection, forcing subsequent callers to do a full
-            // refresh. Check if this node can accept writes for this collection as a proxy for it
-            // being primary.
-            if (!status.isOK()) {
-                UninterruptibleLockGuard noInterrupt(_opCtx->lockState());
-                AutoGetCollection autoColl(_opCtx, getNss(), MODE_IX);
-                if (!repl::ReplicationCoordinator::get(_opCtx)->canAcceptWritesFor(_opCtx,
-                                                                                   getNss())) {
-                    CollectionShardingRuntime::get(_opCtx, getNss())->clearFilteringMetadata();
-                    uassertStatusOK(status.withContext(
-                        str::stream()
-                        << "Unable to verify migration commit for chunk: "
-                        << redact(_args.toString())
-                        << " because the node's replication role changed. Metadata was cleared "
-                           "for: "
-                        << getNss().ns()
-                        << ", so it will get a full refresh when accessed again."));
-                }
-            }
-
-            fassert(40137,
-                    status.withContext(str::stream() << "Failed to commit migration for chunk "
-                                                     << _args.toString() << " due to "
-                                                     << redact(migrationCommitStatus)
-                                                     << ". Updating the optime with a write before "
-                                                        "refreshing the metadata also failed"));
-        }
+        migrationutil::ensureChunkVersionIsGreaterThan(_opCtx, _args.getRange(), _chunkVersion);
     }
 
-    // Incrementally refresh the metadata before leaving the critical section.
     migrationutil::refreshFilteringMetadataUntilSuccess(_opCtx, getNss());
 
     const auto refreshedMetadata = _getCurrentMetadataAndCheckEpoch();
@@ -542,7 +506,7 @@ Status MigrationSourceManager::commitChunkMetadataOnConfig() {
                     "have re-received the chunk"};
         }
 
-        if (_useFCV44Protocol) {
+        if (_enableResumableRangeDeleter) {
             _coordinator->setMigrationDecision(
                 migrationutil::MigrationCoordinator::Decision::kAborted);
         }
@@ -552,10 +516,13 @@ Status MigrationSourceManager::commitChunkMetadataOnConfig() {
     }
 
     // Migration succeeded
-    LOG(0) << "Migration succeeded and updated collection version to "
-           << refreshedMetadata->getCollVersion();
+    LOGV2(
+        22018,
+        "Migration succeeded and updated collection version to {refreshedMetadata_getCollVersion}",
+        "refreshedMetadata_getCollVersion"_attr = refreshedMetadata->getCollVersion(),
+        "migrationId"_attr = getMigrationIdBSON(_coordinator.get()));
 
-    if (_useFCV44Protocol) {
+    if (_enableResumableRangeDeleter) {
         _coordinator->setMigrationDecision(
             migrationutil::MigrationCoordinator::Decision::kCommitted);
     }
@@ -595,14 +562,16 @@ Status MigrationSourceManager::commitChunkMetadataOnConfig() {
         << "Moved chunks successfully but failed to clean up " << getNss().ns() << " range "
         << redact(range.toString()) << " due to: ";
 
-    if (_useFCV44Protocol) {
+    if (_enableResumableRangeDeleter) {
         if (_args.getWaitForDelete()) {
-            log() << "Waiting for cleanup of " << getNss().ns() << " range "
-                  << redact(range.toString());
+            LOGV2(22019,
+                  "Waiting for cleanup of {getNss_ns} range {range}",
+                  "getNss_ns"_attr = getNss().ns(),
+                  "range"_attr = redact(range.toString()),
+                  "migrationId"_attr = _coordinator->getMigrationId());
 
-            auto deleteStatus = CollectionShardingRuntime::waitForClean(
-                _opCtx, getNss(), _collectionUuid.get(), range);
-
+            invariant(_cleanupCompleteFuture);
+            auto deleteStatus = _cleanupCompleteFuture->getNoThrow(_opCtx);
             if (!deleteStatus.isOK()) {
                 return {ErrorCodes::OrphanedRangeCleanUpFailed,
                         orphanedRangeCleanUpErrMsg + redact(deleteStatus)};
@@ -619,8 +588,10 @@ Status MigrationSourceManager::commitChunkMetadataOnConfig() {
         }();
 
         if (_args.getWaitForDelete()) {
-            log() << "Waiting for cleanup of " << getNss().ns() << " range "
-                  << redact(range.toString());
+            LOGV2(22020,
+                  "Waiting for cleanup of {getNss_ns} range {range}",
+                  "getNss_ns"_attr = getNss().ns(),
+                  "range"_attr = redact(range.toString()));
 
             auto deleteStatus = cleanupCompleteFuture.getNoThrow(_opCtx);
 
@@ -636,8 +607,10 @@ Status MigrationSourceManager::commitChunkMetadataOnConfig() {
             return {ErrorCodes::OrphanedRangeCleanUpFailed,
                     orphanedRangeCleanUpErrMsg + redact(cleanupCompleteFuture.getNoThrow(_opCtx))};
         } else {
-            log() << "Leaving cleanup of " << getNss().ns() << " range " << redact(range.toString())
-                  << " to complete in background";
+            LOGV2(22021,
+                  "Leaving cleanup of {getNss_ns} range {range} to complete in background",
+                  "getNss_ns"_attr = getNss().ns(),
+                  "range"_attr = redact(range.toString()));
         }
     }
 
@@ -660,12 +633,19 @@ void MigrationSourceManager::cleanupOnError() {
     try {
         _cleanup();
     } catch (const DBException& ex) {
-        warning() << "Failed to clean up migration: " << redact(_args.toString())
-                  << "due to: " << redact(ex);
+        LOGV2_WARNING(22022,
+                      "Failed to clean up migration: {args}due to: {ex}",
+                      "args"_attr = redact(_args.toString()),
+                      "ex"_attr = redact(ex),
+                      "migrationId"_attr = getMigrationIdBSON(_coordinator.get()));
     }
 }
 
 void MigrationSourceManager::abortDueToConflictingIndexOperation() {
+    // Index operations sent in the 4.4 protocol are versioned and block behind both phases of the
+    // critical section, so there should never be an active critical section.
+    dassert(!_critSec);
+    stdx::lock_guard<Client> lk(*_opCtx->getClient());
     _opCtx->markKilled();
     _stats.countDonorMoveChunkAbortConflictingIndexOperation.addAndFetch(1);
 }
@@ -771,20 +751,20 @@ void MigrationSourceManager::_cleanup() {
         // possible that the persisted metadata is rolled back after step down, but the write which
         // cleared the 'inMigration' flag is not, a secondary node will report itself at an older
         // shard version.
-        CatalogCacheLoader::get(_opCtx).waitForCollectionFlush(_opCtx, getNss());
+        getCatalogCacheLoaderForFiltering(_opCtx).waitForCollectionFlush(_opCtx, getNss());
 
         // Clear the 'minOpTime recovery' document so that the next time a node from this shard
         // becomes a primary, it won't have to recover the config server optime.
         ShardingStateRecovery::endMetadataOp(_opCtx);
     }
 
-    if (_useFCV44Protocol) {
-        if (_state >= kCloning && _state < kCommittingOnConfig) {
+    if (_enableResumableRangeDeleter) {
+        if (_state >= kCloning) {
             invariant(_coordinator);
-            _coordinator->setMigrationDecision(
-                migrationutil::MigrationCoordinator::Decision::kAborted);
-        }
-        {
+            if (_state < kCommittingOnConfig) {
+                _coordinator->setMigrationDecision(
+                    migrationutil::MigrationCoordinator::Decision::kAborted);
+            }
             // This can be called on an exception path after the OperationContext has been
             // interrupted, so use a new OperationContext. Note, it's valid to call
             // getServiceContext on an interrupted OperationContext.
@@ -796,7 +776,7 @@ void MigrationSourceManager::_cleanup() {
             AlternativeClientRegion acr(newClient);
             auto newOpCtxPtr = cc().makeOperationContext();
             auto newOpCtx = newOpCtxPtr.get();
-            _coordinator->completeMigration(newOpCtx);
+            _cleanupCompleteFuture = _coordinator->completeMigration(newOpCtx);
         }
     }
 

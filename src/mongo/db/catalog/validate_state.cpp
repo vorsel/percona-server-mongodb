@@ -42,8 +42,8 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/views/view_catalog.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -54,8 +54,8 @@ namespace CollectionValidation {
 ValidateState::ValidateState(OperationContext* opCtx,
                              const NamespaceString& nss,
                              bool background,
-                             bool fullValidate)
-    : _nss(nss), _background(background), _fullValidate(fullValidate), _dataThrottle(opCtx) {
+                             ValidateOptions options)
+    : _nss(nss), _background(background), _options(options), _dataThrottle(opCtx) {
 
     // Subsequent re-locks will use the UUID when 'background' is true.
     if (_background) {
@@ -116,11 +116,6 @@ void ValidateState::_yieldLocks(OperationContext* opCtx) {
 void ValidateState::_yieldCursors(OperationContext* opCtx) {
     invariant(!_background);
 
-    // Mobile does not support saving and restoring cursors, so we skip yielding cursors for it.
-    if (storageGlobalParams.engine == "mobile") {
-        return;
-    }
-
     // Save all the cursors.
     for (const auto& indexCursor : _indexCursors) {
         indexCursor.second->save();
@@ -172,8 +167,11 @@ void ValidateState::initializeCursors(OperationContext* opCtx) {
     } catch (const ExceptionFor<ErrorCodes::CursorNotFound>& ex) {
         invariant(_background);
         // End the validation if we can't open a checkpoint cursor on the collection.
-        log() << "Skipping background validation on collection '" << _nss
-              << "' because the collection is not yet in a checkpoint: " << ex;
+        LOGV2(20405,
+              "Skipping background validation on collection '{nss}' because the collection is not "
+              "yet in a checkpoint: {ex}",
+              "nss"_attr = _nss,
+              "ex"_attr = ex);
         throw;
     }
 
@@ -183,8 +181,11 @@ void ValidateState::initializeCursors(OperationContext* opCtx) {
             opCtx, _collection->getCatalogId(), &readyDurableIndexes);
     } catch (const ExceptionFor<ErrorCodes::CursorNotFound>& ex) {
         invariant(_background);
-        log() << "Skipping background validation on collection '" << _nss
-              << "' because the data is not yet in a checkpoint: " << ex;
+        LOGV2(20406,
+              "Skipping background validation on collection '{nss}' because the data is not yet in "
+              "a checkpoint: {ex}",
+              "nss"_attr = _nss,
+              "ex"_attr = ex);
         throw;
     }
 
@@ -202,8 +203,11 @@ void ValidateState::initializeCursors(OperationContext* opCtx) {
             std::find(readyDurableIndexes.begin(), readyDurableIndexes.end(), desc->indexName()) !=
             readyDurableIndexes.end();
         if (_background && !isIndexDurable) {
-            log() << "Skipping validation on index '" << desc->indexName() << "' in collection '"
-                  << _nss << "' because the index is not yet in a checkpoint.";
+            LOGV2(20407,
+                  "Skipping validation on index '{desc_indexName}' in collection '{nss}' because "
+                  "the index is not yet in a checkpoint.",
+                  "desc_indexName"_attr = desc->indexName(),
+                  "nss"_attr = _nss);
             continue;
         }
 
@@ -216,8 +220,11 @@ void ValidateState::initializeCursors(OperationContext* opCtx) {
             opCtx->getServiceContext()->getStorageEngine()->getCatalog()->getIndexIdent(
                 opCtx, _collection->getCatalogId(), desc->indexName());
         if (entry->getIdent() != diskIndexIdent) {
-            log() << "Skipping validation on index '" << desc->indexName() << "' in collection '"
-                  << _nss << "' because the index was recreated and is not yet in a checkpoint.";
+            LOGV2(20408,
+                  "Skipping validation on index '{desc_indexName}' in collection '{nss}' because "
+                  "the index was recreated and is not yet in a checkpoint.",
+                  "desc_indexName"_attr = desc->indexName(),
+                  "nss"_attr = _nss);
             continue;
         }
 
@@ -229,8 +236,12 @@ void ValidateState::initializeCursors(OperationContext* opCtx) {
             invariant(_background);
             // This can only happen if the checkpoint has the MDB catalog entry for the index, but
             // not the corresponding index table.
-            log() << "Skipping validation on index '" << desc->indexName() << "' in collection '"
-                  << _nss << "' because the index data is not in a checkpoint: " << ex;
+            LOGV2(20409,
+                  "Skipping validation on index '{desc_indexName}' in collection '{nss}' because "
+                  "the index data is not in a checkpoint: {ex}",
+                  "desc_indexName"_attr = desc->indexName(),
+                  "nss"_attr = _nss,
+                  "ex"_attr = ex);
             continue;
         }
 
@@ -240,8 +251,11 @@ void ValidateState::initializeCursors(OperationContext* opCtx) {
             opCtx->getServiceContext()->getStorageEngine()->isInIndividuallyCheckpointedIndexesList(
                 diskIndexIdent)) {
             _indexCursors.erase(desc->indexName());
-            log() << "Skipping validation on index '" << desc->indexName() << "' in collection '"
-                  << _nss << "' because the index data is not yet consistent in the checkpoint.";
+            LOGV2(20410,
+                  "Skipping validation on index '{desc_indexName}' in collection '{nss}' because "
+                  "the index data is not yet consistent in the checkpoint.",
+                  "desc_indexName"_attr = desc->indexName(),
+                  "nss"_attr = _nss);
             continue;
         }
 
@@ -266,7 +280,7 @@ void ValidateState::_relockDatabaseAndCollection(OperationContext* opCtx) {
     _databaseLock.reset();
 
     if (MONGO_unlikely(hangDuringYieldingLocksForValidation.shouldFail())) {
-        log() << "Hanging on fail point 'hangDuringYieldingLocksForValidation'";
+        LOGV2(20411, "Hanging on fail point 'hangDuringYieldingLocksForValidation'");
         hangDuringYieldingLocksForValidation.pauseWhileSet();
     }
 

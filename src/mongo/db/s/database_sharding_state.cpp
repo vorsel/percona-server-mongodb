@@ -35,10 +35,10 @@
 
 #include "mongo/db/operation_context.h"
 #include "mongo/db/s/operation_sharding_state.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/database_version_helpers.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -120,8 +120,12 @@ void DatabaseShardingState::setDbVersion(OperationContext* opCtx,
                                          boost::optional<DatabaseVersion> newDbVersion,
                                          DSSLock&) {
     invariant(opCtx->lockState()->isDbLockedForMode(_dbName, MODE_X));
-    log() << "setting this node's cached database version for " << _dbName << " to "
-          << (newDbVersion ? newDbVersion->toBSON() : BSONObj());
+    LOGV2(21950,
+          "setting this node's cached database version for {dbName} to "
+          "{newDbVersion_newDbVersion_BSONObj}",
+          "dbName"_attr = _dbName,
+          "newDbVersion_newDbVersion_BSONObj"_attr =
+              (newDbVersion ? newDbVersion->toBSON() : BSONObj()));
     _dbVersion = newDbVersion;
 }
 

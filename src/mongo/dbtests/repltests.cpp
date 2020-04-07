@@ -48,8 +48,8 @@
 #include "mongo/db/s/op_observer_sharding_impl.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/logger/logger.h"
+#include "mongo/logv2/log.h"
 #include "mongo/transport/transport_layer_asio.h"
-#include "mongo/util/log.h"
 
 using namespace mongo::repl;
 
@@ -106,11 +106,6 @@ public:
         : _client(&_opCtx),
           _defaultReplSettings(
               ReplicationCoordinator::get(getGlobalServiceContext())->getSettings()) {
-        // Replication is not supported by mobile SE.
-        if (mongo::storageGlobalParams.engine == "mobile") {
-            return;
-        }
-
         transport::TransportLayerASIO::Options opts;
         opts.mode = transport::TransportLayerASIO::Options::kEgress;
         auto sc = getGlobalServiceContext();
@@ -155,10 +150,6 @@ public:
         deleteAll(cllNS());
     }
     ~Base() {
-        // Replication is not supported by mobile SE.
-        if (mongo::storageGlobalParams.engine == "mobile") {
-            return;
-        }
         try {
             deleteAll(ns());
             deleteAll(cllNS());
@@ -202,8 +193,10 @@ protected:
     }
     void check(const BSONObj& expected, const BSONObj& got) const {
         if (expected.woCompare(got)) {
-            ::mongo::log() << "expected: " << expected.toString() << ", got: " << got.toString()
-                           << endl;
+            LOGV2(22500,
+                  "expected: {expected}, got: {got}",
+                  "expected"_attr = expected.toString(),
+                  "got"_attr = got.toString());
         }
         ASSERT_BSONOBJ_EQ(expected, got);
     }
@@ -252,7 +245,7 @@ protected:
             OldClientContext ctx(&_opCtx, ns());
             for (vector<BSONObj>::iterator i = ops.begin(); i != ops.end(); ++i) {
                 if (0) {
-                    mongo::unittest::log() << "op: " << *i << endl;
+                    LOGV2(22501, "op: {i}", "i"_attr = *i);
                 }
                 repl::UnreplicatedWritesBlock uwb(&_opCtx);
                 auto entry = uassertStatusOK(OplogEntry::parse(*i));
@@ -336,10 +329,6 @@ protected:
 class LogBasic : public Base {
 public:
     void run() {
-        // Replication is not supported by mobile SE.
-        if (mongo::storageGlobalParams.engine == "mobile") {
-            return;
-        }
         ASSERT_EQUALS(0, opCount());
         _client.insert(ns(), fromjson("{\"a\":\"b\"}"));
         ASSERT_EQUALS(1, opCount());
@@ -352,10 +341,6 @@ class Base : public ReplTests::Base {
 public:
     virtual ~Base() {}
     void run() {
-        // Replication is not supported by mobile SE.
-        if (mongo::storageGlobalParams.engine == "mobile") {
-            return;
-        }
         reset();
         doIt();
         int nOps = opCount();
@@ -1308,11 +1293,6 @@ public:
 class DeleteOpIsIdBased : public Base {
 public:
     void run() {
-        // Replication is not supported by mobile SE.
-        if (mongo::storageGlobalParams.engine == "mobile") {
-            return;
-        }
-
         // These inserts don't write oplog entries.
         insert(BSON("_id" << 0 << "a" << 10));
         insert(BSON("_id" << 1 << "a" << 11));

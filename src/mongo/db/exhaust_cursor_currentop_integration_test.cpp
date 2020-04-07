@@ -27,11 +27,14 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/client/dbclient_connection.h"
 #include "mongo/client/dbclient_rs.h"
 #include "mongo/db/query/cursor_response.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/stdx/future.h"
 #include "mongo/unittest/integration_test.h"
@@ -114,9 +117,12 @@ bool confirmCurrentOpContents(DBClientBase* conn,
         sleepFor(intervalMS);
     }
     auto currentOp = BSON("currentOp" << BSON("idleCursors" << true));
-    unittest::log()
-        << "confirmCurrentOpContents fails with curOpMatch: " << curOpMatch << " currentOp: "
-        << conn->runCommand(OpMsgRequest::fromDBAndBody("admin", currentOp))->getCommandReply();
+    LOGV2(20606,
+          "confirmCurrentOpContents fails with curOpMatch: {curOpMatch} currentOp: "
+          "{conn_runCommand_OpMsgRequest_fromDBAndBody_admin_currentOp_getCommandReply}",
+          "curOpMatch"_attr = curOpMatch,
+          "conn_runCommand_OpMsgRequest_fromDBAndBody_admin_currentOp_getCommandReply"_attr =
+              conn->runCommand(OpMsgRequest::fromDBAndBody("admin", currentOp))->getCommandReply());
     return false;
 }
 
@@ -167,7 +173,9 @@ auto startExhaustQuery(
         sleepFor(Milliseconds(10));
     }
     ASSERT(queryCursor);
-    unittest::log() << "Started exhaust query with cursorId: " << queryCursor->getCursorId();
+    LOGV2(20607,
+          "Started exhaust query with cursorId: {queryCursor_getCursorId}",
+          "queryCursor_getCursorId"_attr = queryCursor->getCursorId());
     return queryThread;
 }
 
@@ -194,11 +202,6 @@ void runOneGetMore(DBClientBase* conn,
     // Re-enable the original failpoint to catch the next getMore, and release the current one.
     setWaitWithPinnedCursorDuringGetMoreBatchFailpoint(conn, true);
     setWaitBeforeUnpinningOrDeletingCursorAfterGetMoreBatchFailpoint(conn, false);
-
-    ASSERT(queryCursor->more());
-    // Assuming documents start with {a: 0}, the (nDocsReturned+1)-th document should have {a:
-    // nDocsReturned}. See initTestCollection().
-    ASSERT_BSONOBJ_EQ(queryCursor->nextSafe(), BSON("a" << nDocsReturned));
 }
 }  // namespace
 
@@ -291,7 +294,7 @@ void testClientDisconnect(bool disconnectAfterGetMoreBatch) {
 
     // Kill the client connection while the exhaust getMore is blocked on the failpoint.
     queryConnection->shutdownAndDisallowReconnect();
-    unittest::log() << "Killed exhaust connection.";
+    LOGV2(20608, "Killed exhaust connection.");
 
     if (disconnectAfterGetMoreBatch) {
         // Disable the failpoint to allow the exhaust getMore to continue sending out the response
@@ -363,6 +366,10 @@ TEST(CurrentOpExhaustCursorTest, ExhaustCursorUpdatesLastKnownCommittedOpTime) {
         &static_cast<DBClientReplicaSet*>(fixtureQueryConn.get())->masterConn();
     std::unique_ptr<DBClientCursor> queryCursor;
 
+    // Enable a failpoint to block getMore during execution to avoid races between getCursorId() and
+    // receiving new batches.
+    setWaitWithPinnedCursorDuringGetMoreBatchFailpoint(conn, true);
+
     // Initiate a tailable awaitData exhaust cursor with lastKnownCommittedOpTime being the
     // lastAppliedOpTime.
     auto queryThread = startExhaustQuery(queryConn,
@@ -370,13 +377,21 @@ TEST(CurrentOpExhaustCursorTest, ExhaustCursorUpdatesLastKnownCommittedOpTime) {
                                          QueryOption_CursorTailable | QueryOption_AwaitData,
                                          Milliseconds(1000),  // awaitData timeout
                                          lastAppliedOpTime);  // lastKnownCommittedOpTime
+
+    // Assert non-zero cursorId.
+    auto cursorId = queryCursor->getCursorId();
+    ASSERT_NE(cursorId, 0LL);
+
+    // Disable failpoint and allow exhaust queries to run.
+    setWaitWithPinnedCursorDuringGetMoreBatchFailpoint(conn, false);
+
     ON_BLOCK_EXIT([&conn, &queryThread] { queryThread.wait(); });
 
     // Test that the cursor's lastKnownCommittedOpTime is eventually advanced to the
     // lastAppliedOpTime.
-    auto curOpMatch = BSON("command.collection"
-                           << testNSS.coll() << "command.getMore" << queryCursor->getCursorId()
-                           << "cursor.lastKnownCommittedOpTime" << lastAppliedOpTime);
+    auto curOpMatch =
+        BSON("command.collection" << testNSS.coll() << "command.getMore" << cursorId
+                                  << "cursor.lastKnownCommittedOpTime" << lastAppliedOpTime);
     ASSERT(confirmCurrentOpContents(conn, curOpMatch));
 
     // Inserting more records to unblock awaitData and advance the commit point.
@@ -392,9 +407,9 @@ TEST(CurrentOpExhaustCursorTest, ExhaustCursorUpdatesLastKnownCommittedOpTime) {
 
     // Test that the cursor's lastKnownCommittedOpTime is eventually advanced to the
     // new lastAppliedOpTime.
-    curOpMatch = BSON("command.collection"
-                      << testNSS.coll() << "command.getMore" << queryCursor->getCursorId()
-                      << "cursor.lastKnownCommittedOpTime" << lastAppliedOpTime);
+    curOpMatch =
+        BSON("command.collection" << testNSS.coll() << "command.getMore" << cursorId
+                                  << "cursor.lastKnownCommittedOpTime" << lastAppliedOpTime);
     ASSERT(confirmCurrentOpContents(conn, curOpMatch));
 }
 }  // namespace mongo

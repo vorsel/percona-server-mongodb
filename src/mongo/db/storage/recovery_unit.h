@@ -206,8 +206,7 @@ public:
      * This must not be called by a system taking user writes until after a stable timestamp is
      * passed to the storage engine.
      */
-    virtual bool waitUntilUnjournaledWritesDurable(OperationContext* opCtx,
-                                                   bool stableCheckpoint = true) {
+    virtual bool waitUntilUnjournaledWritesDurable(OperationContext* opCtx, bool stableCheckpoint) {
         return waitUntilDurable(opCtx);
     }
 
@@ -588,10 +587,6 @@ public:
         kCommitting,
     };
 
-    State getState() const {
-        return _state;
-    }
-
     std::string toString(State state) const {
         switch (state) {
             case State::kInactive:
@@ -616,6 +611,13 @@ public:
 
 protected:
     RecoveryUnit();
+
+    /**
+     * Returns the current state.
+     */
+    State _getState() const {
+        return _state;
+    }
 
     /**
      * Transitions to new state.

@@ -63,10 +63,10 @@
 #include "mongo/db/stats/top.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/views/view_catalog.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
 
@@ -203,8 +203,10 @@ void generateBatch(int ntoreturn,
     switch (*state) {
         // Log an error message and then perform the cleanup.
         case PlanExecutor::FAILURE: {
-            error() << "getMore executor error, stats: "
-                    << redact(Explain::getWinningPlanStats(exec));
+            LOGV2_ERROR(20918,
+                        "getMore executor error, stats: {Explain_getWinningPlanStats_exec}",
+                        "Explain_getWinningPlanStats_exec"_attr =
+                            redact(Explain::getWinningPlanStats(exec)));
             // We should always have a valid status object by this point.
             auto status = WorkingSetCommon::getMemberObjectStatus(doc);
             invariant(!status.isOK());
@@ -244,7 +246,7 @@ Message getMore(OperationContext* opCtx,
                 bool* isCursorAuthorized) {
     invariant(ntoreturn >= 0);
 
-    LOG(5) << "Running getMore, cursorid: " << cursorid;
+    LOGV2_DEBUG(20909, 5, "Running getMore, cursorid: {cursorid}", "cursorid"_attr = cursorid);
 
     CurOp& curOp = *CurOp::get(opCtx);
     curOp.ensureStarted();
@@ -300,7 +302,7 @@ Message getMore(OperationContext* opCtx,
             statsTracker.emplace(opCtx,
                                  nss,
                                  Top::LockType::NotLocked,
-                                 AutoStatsTracker::LogMode::kUpdateTopAndCurop,
+                                 AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
                                  profilingLevel);
             auto view = autoDb.getDb() ? ViewCatalog::get(autoDb.getDb())->lookup(opCtx, nss.ns())
                                        : nullptr;
@@ -318,7 +320,7 @@ Message getMore(OperationContext* opCtx,
         statsTracker.emplace(opCtx,
                              nss,
                              Top::LockType::ReadLocked,
-                             AutoStatsTracker::LogMode::kUpdateTopAndCurop,
+                             AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
                              readLock->getDb() ? readLock->getDb()->getProfilingLevel()
                                                : doNotChangeProfilingLevel);
 
@@ -455,6 +457,22 @@ Message getMore(OperationContext* opCtx,
         curOp.setGenericCursor_inlock(cursorPin->toGenericCursor());
     }
 
+    // If the 'failGetMoreAfterCursorCheckout' failpoint is enabled, throw an exception with the
+    // specified 'errorCode' value, or ErrorCodes::InternalError if 'errorCode' is omitted.
+    failGetMoreAfterCursorCheckout.executeIf(
+        [](const BSONObj& data) {
+            auto errorCode = (data["errorCode"] ? data["errorCode"].safeNumberLong()
+                                                : ErrorCodes::InternalError);
+            uasserted(errorCode, "Hit the 'failGetMoreAfterCursorCheckout' failpoint");
+        },
+        [&opCtx, &nss](const BSONObj& data) {
+            auto dataForFailCommand =
+                data.addField(BSON("failCommands" << BSON_ARRAY("getMore")).firstElement());
+            auto* getMoreCommand = CommandHelpers::findCommand("getMore");
+            return CommandHelpers::shouldActivateFailCommandFailPoint(
+                dataForFailCommand, nss, getMoreCommand, opCtx->getClient());
+        });
+
     PlanExecutor::ExecState state;
 
     // We report keysExamined and docsExamined to OpDebug for a given getMore operation. To obtain
@@ -525,8 +543,11 @@ Message getMore(OperationContext* opCtx,
         cursorid = 0;
         curOp.debug().cursorExhausted = true;
 
-        LOG(5) << "getMore NOT saving client cursor, ended with state "
-               << PlanExecutor::statestr(state);
+        LOGV2_DEBUG(
+            20910,
+            5,
+            "getMore NOT saving client cursor, ended with state {PlanExecutor_statestr_state}",
+            "PlanExecutor_statestr_state"_attr = PlanExecutor::statestr(state));
     } else {
         cursorFreer.dismiss();
         // Continue caching the ClientCursor.
@@ -534,7 +555,10 @@ Message getMore(OperationContext* opCtx,
         cursorPin->incNBatches();
         exec->saveState();
         exec->detachFromOperationContext();
-        LOG(5) << "getMore saving client cursor ended with state " << PlanExecutor::statestr(state);
+        LOGV2_DEBUG(20911,
+                    5,
+                    "getMore saving client cursor ended with state {PlanExecutor_statestr_state}",
+                    "PlanExecutor_statestr_state"_attr = PlanExecutor::statestr(state));
 
         // Set 'exhaust' if the client requested exhaust and the cursor is not exhausted.
         *exhaust = opCtx->isExhaust();
@@ -567,7 +591,8 @@ Message getMore(OperationContext* opCtx,
     qr.setCursorId(cursorid);
     qr.setStartingFrom(startingResult);
     qr.setNReturned(numResults);
-    LOG(5) << "getMore returned " << numResults << " results\n";
+    LOGV2_DEBUG(
+        20912, 5, "getMore returned {numResults} results\n", "numResults"_attr = numResults);
     return Message(bb.release());
 }
 
@@ -595,7 +620,7 @@ bool runQuery(OperationContext* opCtx,
 
     // Parse the qm into a CanonicalQuery.
     const boost::intrusive_ptr<ExpressionContext> expCtx =
-        make_intrusive<ExpressionContext>(opCtx, nullptr /* collator */);
+        make_intrusive<ExpressionContext>(opCtx, nullptr /* collator */, nss);
     auto cq = uassertStatusOKWithContext(
         CanonicalQuery::canonicalize(opCtx,
                                      q,
@@ -605,8 +630,9 @@ bool runQuery(OperationContext* opCtx,
         "Can't canonicalize query");
     invariant(cq.get());
 
-    LOG(5) << "Running query:\n" << redact(cq->toString());
-    LOG(2) << "Running query: " << redact(cq->toStringShort());
+    LOGV2_DEBUG(20913, 5, "Running query:\n{cq}", "cq"_attr = redact(cq->toString()));
+    LOGV2_DEBUG(
+        20914, 2, "Running query: {cq_Short}", "cq_Short"_attr = redact(cq->toStringShort()));
 
     // Parse, canonicalize, plan, transcribe, and get a plan executor.
     AutoGetCollectionForReadCommand ctx(opCtx, nss, AutoGetCollection::ViewMode::kViewsForbidden);
@@ -704,17 +730,25 @@ bool runQuery(OperationContext* opCtx,
         ++numResults;
 
         if (FindCommon::enoughForFirstBatch(qr, numResults)) {
-            LOG(5) << "Enough for first batch, wantMore=" << qr.wantMore()
-                   << " ntoreturn=" << qr.getNToReturn().value_or(0)
-                   << " numResults=" << numResults;
+            LOGV2_DEBUG(20915,
+                        5,
+                        "Enough for first batch, wantMore={qr_wantMore} "
+                        "ntoreturn={qr_getNToReturn_value_or_0} numResults={numResults}",
+                        "qr_wantMore"_attr = qr.wantMore(),
+                        "qr_getNToReturn_value_or_0"_attr = qr.getNToReturn().value_or(0),
+                        "numResults"_attr = numResults);
             break;
         }
     }
 
     // Caller expects exceptions thrown in certain cases.
     if (PlanExecutor::FAILURE == state) {
-        error() << "Plan executor error during find: " << PlanExecutor::statestr(state)
-                << ", stats: " << redact(Explain::getWinningPlanStats(exec.get()));
+        LOGV2_ERROR(20919,
+                    "Plan executor error during find: {PlanExecutor_statestr_state}, stats: "
+                    "{Explain_getWinningPlanStats_exec_get}",
+                    "PlanExecutor_statestr_state"_attr = PlanExecutor::statestr(state),
+                    "Explain_getWinningPlanStats_exec_get"_attr =
+                        redact(Explain::getWinningPlanStats(exec.get())));
         uassertStatusOKWithContext(WorkingSetCommon::getMemberObjectStatus(doc),
                                    "Executor error during OP_QUERY find");
         MONGO_UNREACHABLE;
@@ -746,8 +780,11 @@ bool runQuery(OperationContext* opCtx,
             });
         ccId = pinnedCursor.getCursor()->cursorid();
 
-        LOG(5) << "caching executor with cursorid " << ccId << " after returning " << numResults
-               << " results";
+        LOGV2_DEBUG(20916,
+                    5,
+                    "caching executor with cursorid {ccId} after returning {numResults} results",
+                    "ccId"_attr = ccId,
+                    "numResults"_attr = numResults);
 
         // Set curOp.debug().exhaust if the client requested exhaust and the cursor is not
         // exhausted.
@@ -768,7 +805,10 @@ bool runQuery(OperationContext* opCtx,
 
         endQueryOp(opCtx, collection, *pinnedCursor.getCursor()->getExecutor(), numResults, ccId);
     } else {
-        LOG(5) << "Not caching executor but returning " << numResults << " results.";
+        LOGV2_DEBUG(20917,
+                    5,
+                    "Not caching executor but returning {numResults} results.",
+                    "numResults"_attr = numResults);
         endQueryOp(opCtx, collection, *exec, numResults, ccId);
     }
 

@@ -41,7 +41,6 @@
 #include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/s/grid.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -108,7 +107,7 @@ public:
 
         AutoGetCollection autoColl(
             opCtx, nss, MODE_IS, AutoGetCollection::ViewMode::kViewsPermitted);
-        auto* const css = CollectionShardingRuntime::get(opCtx, nss);
+        auto* const css = CollectionShardingState::get(opCtx, nss);
 
         const auto optMetadata = css->getCurrentMetadataIfKnown();
         if (!optMetadata) {

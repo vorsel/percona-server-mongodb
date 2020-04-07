@@ -29,7 +29,7 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
     it in the license file.
 ======= */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include <sys/stat.h>
 
@@ -40,10 +40,10 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 #include "mongo/db/encryption/encryption_vault.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/storage/wiredtiger/encryption_keydb.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/base64.h"
 #include "mongo/util/debug_util.h"
-#include "mongo/util/log.h"
 
 #include <third_party/wiredtiger/ext/encryptors/percona/encryption_keydb_c_api.h>
 
@@ -68,15 +68,15 @@ static void dump_key(unsigned char *key, const int _key_len, const char * msg) {
         ++key;
     }
     *p = 0;
-    log() << msg << ": " << buf;
+    LOGV2(29033, "{msg}: {buf}", "msg"_attr = msg, "buf"_attr = static_cast<const char*>(buf));
 }
 
 static void dump_table(WT_SESSION* _sess, const int _key_len, const char* msg) {
-    log() << msg;
+    LOGV2(29034, "{msg}", "msg"_attr = msg);
     WT_CURSOR *cursor;
     int res = _sess->open_cursor(_sess, "table:key", nullptr, nullptr, &cursor);
     if (res) {
-        log() << wiredtiger_strerror(res);
+        LOGV2(29035, "{e}", "e"_attr = wiredtiger_strerror(res));
         return;
     }
     while ((res = cursor->next(cursor)) == 0) {
@@ -174,7 +174,7 @@ void EncryptionKeyDB::init_masterkey() {
                 if (!_just_created) {
                     throw std::runtime_error("Cannot start. Master encryption key is absent in the Vault. Check configuration options.");
                 }
-                log() << "Master key is absent in the Vault. Generating and writing one.";
+                LOGV2(29036, "Master key is absent in the Vault. Generating and writing one.");
                 char newkey[_key_len];
                 generate_secure_key(newkey);
                 encoded_key = base64::encode(StringData{newkey, _key_len});
@@ -235,7 +235,7 @@ void EncryptionKeyDB::init() {
         // https://source.wiredtiger.com/3.0.0/tune_durability.html
         ss << "log=(enabled,file_max=5MB),transaction_sync=(enabled=true,method=fsync),";
         std::string config = ss.str();
-        log() << "Initializing KeyDB with wiredtiger_open config: " << config;
+        LOGV2(29037, "Initializing KeyDB with wiredtiger_open config: {cfg}", "cfg"_attr = config);
         int res = wiredtiger_open(_path.c_str(), nullptr, config.c_str(), &_conn);
         if (res) {
             throw std::runtime_error(std::string("error opening keys DB at '") + _path + "': " + wiredtiger_strerror(res));
@@ -289,10 +289,10 @@ void EncryptionKeyDB::init() {
             }
         }
     } catch (std::exception& e) {
-        error() << e.what();
+        LOGV2_ERROR(29038, "Exception in EncryptionKeyDB::init: {e}", "e"_attr = e.what());
         throw;
     }
-    log() << "Encryption keys DB is initialized successfully";
+    LOGV2(29039, "Encryption keys DB is initialized successfully");
 }
 
 void EncryptionKeyDB::clone(EncryptionKeyDB *old) {
@@ -332,7 +332,7 @@ void EncryptionKeyDB::clone(EncryptionKeyDB *old) {
         if (res != WT_NOTFOUND)
             throw std::runtime_error(std::string("clone: error reading key table: ") + wiredtiger_strerror(res));
     } catch (std::exception& e) {
-        error() << e.what();
+        LOGV2_ERROR(29049, "Exception in EncryptionKeyDB::clone: {e}", "e"_attr = e.what());
         throw;
     }
 }
@@ -342,7 +342,7 @@ void EncryptionKeyDB::store_masterkey() {
 }
 
 int EncryptionKeyDB::get_key_by_id(const char *keyid, size_t len, unsigned char *key, void *pe) {
-    LOG(4) << "get_key_by_id for keyid: '" << std::string(keyid, len) << "'";
+    LOGV2_DEBUG(29050, 4, "get_key_by_id for keyid: '{id}'", "id"_attr = std::string{keyid, len});
     // return key from keyfile if len == 0
     if (len == 0) {
         memcpy(key, _masterkey, _key_len);
@@ -357,7 +357,7 @@ int EncryptionKeyDB::get_key_by_id(const char *keyid, size_t len, unsigned char 
         stdx::lock_guard<Latch> lk(_lock_sess);
         res = _sess->open_cursor(_sess, "table:key", nullptr, nullptr, &cursor);
         if (res){
-            error() << "get_key_by_id: error opening cursor: " << wiredtiger_strerror(res);
+            LOGV2_ERROR(29040, "get_key_by_id: error opening cursor: {err}", "err"_attr = wiredtiger_strerror(res));
             return res;
         }
     }
@@ -372,7 +372,7 @@ int EncryptionKeyDB::get_key_by_id(const char *keyid, size_t len, unsigned char 
     stdx::lock_guard<Latch> lk(_lock_key);
     // read key from DB
     std::string c_str(keyid, len);
-    LOG(4) << "trying to load encryption key for keyid: " << c_str;
+    LOGV2_DEBUG(29041, 4, "trying to load encryption key for keyid: {id}", "id"_attr = c_str);
     cursor->set_key(cursor, c_str.c_str());
     res = cursor->search(cursor);
     if (res == 0) {
@@ -385,7 +385,8 @@ int EncryptionKeyDB::get_key_by_id(const char *keyid, size_t len, unsigned char 
         return 0;
     }
     if (res != WT_NOTFOUND) {
-        error() << "cursor->search error " << res << " : " <<wiredtiger_strerror(res);
+        LOGV2_ERROR(29042, "cursor->search error {code}: {desc}",
+                    "code"_attr = res, "desc"_attr = wiredtiger_strerror(res));
         return res;
     }
 
@@ -399,7 +400,8 @@ int EncryptionKeyDB::get_key_by_id(const char *keyid, size_t len, unsigned char 
     cursor->set_value(cursor, &v);
     res = cursor->insert(cursor);
     if (res) {
-        error() << "cursor->insert error " << res << " : " <<wiredtiger_strerror(res);
+        LOGV2_ERROR(29043, "cursor->insert error {code}: {desc}",
+                    "code"_attr = res, "desc"_attr = wiredtiger_strerror(res));
         return res;
     }
 
@@ -409,7 +411,7 @@ int EncryptionKeyDB::get_key_by_id(const char *keyid, size_t len, unsigned char 
 }
 
 int EncryptionKeyDB::delete_key_by_id(const std::string&  keyid) {
-    LOG(4) << "delete_key_by_id for keyid: '" << keyid << "'";
+    LOGV2_DEBUG(29044, 4, "delete_key_by_id for keyid: '{id}'", "id"_attr = keyid);
 
     int res;
     // open cursor
@@ -418,7 +420,7 @@ int EncryptionKeyDB::delete_key_by_id(const std::string&  keyid) {
         stdx::lock_guard<Latch> lk(_lock_sess);
         res = _sess->open_cursor(_sess, "table:key", nullptr, nullptr, &cursor);
         if (res){
-            error() << "delete_key_by_id: error opening cursor: " << wiredtiger_strerror(res);
+            LOGV2_ERROR(29045, "delete_key_by_id: error opening cursor: {desc}", "desc"_attr = wiredtiger_strerror(res));
             return res;
         }
     }
@@ -433,7 +435,8 @@ int EncryptionKeyDB::delete_key_by_id(const std::string&  keyid) {
     cursor->set_key(cursor, keyid.c_str());
     res = cursor->remove(cursor);
     if (res) {
-        error() << "cursor->remove error " << res << " : " << wiredtiger_strerror(res);
+        LOGV2_ERROR(29046, "cursor->remove error {code}: {desc}",
+                    "code"_attr = res, "desc"_attr = wiredtiger_strerror(res));
     }
 
     // prepare encryptor for reuse in case DB with the same name will be recreated
@@ -460,7 +463,8 @@ int EncryptionKeyDB::store_gcm_iv_reserved() {
         stdx::lock_guard<Latch> lk(_lock_sess);
         res = _sess->open_cursor(_sess, "table:parameters", nullptr, nullptr, &cursor);
         if (res){
-            error() << "store_gcm_iv_reserved: error opening cursor: " << wiredtiger_strerror(res);
+            LOGV2_ERROR(29047, "store_gcm_iv_reserved: error opening cursor: {desc}",
+                       "desc"_attr = wiredtiger_strerror(res));
             return res;
         }
     }
@@ -479,7 +483,8 @@ int EncryptionKeyDB::store_gcm_iv_reserved() {
     cursor->set_value(cursor, &v);
     res = cursor->insert(cursor);
     if (res) {
-        error() << "cursor->insert error " << res << " : " <<wiredtiger_strerror(res);
+        LOGV2_ERROR(29048, "cursor->insert error {code}: {desc}",
+                    "code"_attr = res, "desc"_attr = wiredtiger_strerror(res));
         return res;
     }
     return 0;

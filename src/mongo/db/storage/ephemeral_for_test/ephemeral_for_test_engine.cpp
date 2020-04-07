@@ -42,10 +42,12 @@
 namespace mongo {
 
 RecoveryUnit* EphemeralForTestEngine::newRecoveryUnit() {
-    return new EphemeralForTestRecoveryUnit([this]() {
+    return new EphemeralForTestRecoveryUnit([this](OperationContext* opCtx) {
         stdx::lock_guard<Latch> lk(_mutex);
-        JournalListener::Token token = _journalListener->getToken();
-        _journalListener->onDurable(token);
+        if (_journalListener) {
+            JournalListener::Token token = _journalListener->getToken(opCtx);
+            _journalListener->onDurable(token);
+        }
     });
 }
 

@@ -112,17 +112,6 @@ TEST_F(DocumentSourceFacetTest, ShouldRejectNonArrayFacets) {
                   AssertionException);
 }
 
-TEST_F(DocumentSourceFacetTest, ShouldRejectEmptyPipelines) {
-    auto ctx = getExpCtx();
-    auto spec = BSON("$facet" << BSON("a" << BSONArray()));
-    ASSERT_THROWS(DocumentSourceFacet::createFromBson(spec.firstElement(), ctx),
-                  AssertionException);
-
-    spec = BSON("$facet" << BSON("a" << BSON_ARRAY(BSON("$skip" << 4)) << "b" << BSONArray()));
-    ASSERT_THROWS(DocumentSourceFacet::createFromBson(spec.firstElement(), ctx),
-                  AssertionException);
-}
-
 TEST_F(DocumentSourceFacetTest, ShouldSucceedWhenNamespaceIsCollectionless) {
     auto ctx = getExpCtx();
     auto spec = fromjson("{$facet: {a: [{$match: {}}]}}");
@@ -241,7 +230,8 @@ public:
                 DiskUseRequirement::kNoDiskUse,
                 FacetRequirement::kAllowed,
                 TransactionRequirement::kAllowed,
-                LookupRequirement::kAllowed};
+                LookupRequirement::kAllowed,
+                UnionRequirement::kAllowed};
     }
 
     DocumentSource::GetNextResult doGetNext() final {
@@ -256,7 +246,7 @@ public:
 TEST_F(DocumentSourceFacetTest, PassthroughFacetDoesntRequireDiskAndIsOKInaTxn) {
     auto ctx = getExpCtx();
     auto passthrough = DocumentSourcePassthrough::create();
-    auto passthroughPipe = uassertStatusOK(Pipeline::createFacetPipeline({passthrough}, ctx));
+    auto passthroughPipe = Pipeline::create({passthrough}, ctx);
 
     std::vector<DocumentSourceFacet::FacetPipeline> facets;
     facets.emplace_back("passthrough", std::move(passthroughPipe));
@@ -282,6 +272,7 @@ public:
             FacetRequirement::kAllowed,
             TransactionRequirement::kNotAllowed,
             LookupRequirement::kNotAllowed,
+            UnionRequirement::kAllowed,
         };
     }
 
@@ -293,7 +284,7 @@ public:
 TEST_F(DocumentSourceFacetTest, FacetWithChildThatWritesDataAlsoReportsWritingData) {
     auto ctx = getExpCtx();
     auto writesDataStage = DocumentSourceWritesPersistentData::create();
-    auto pipeline = uassertStatusOK(Pipeline::createFacetPipeline({writesDataStage}, ctx));
+    auto pipeline = Pipeline::create({writesDataStage}, ctx);
 
     std::vector<DocumentSourceFacet::FacetPipeline> facets;
     facets.emplace_back("writes", std::move(pipeline));
@@ -314,9 +305,7 @@ TEST_F(DocumentSourceFacetTest, SingleFacetShouldReceiveAllDocuments) {
 
     auto dummy = DocumentSourcePassthrough::create();
 
-    auto statusWithPipeline = Pipeline::createFacetPipeline({dummy}, ctx);
-    ASSERT_OK(statusWithPipeline.getStatus());
-    auto pipeline = std::move(statusWithPipeline.getValue());
+    auto pipeline = Pipeline::create({dummy}, ctx);
 
     std::vector<DocumentSourceFacet::FacetPipeline> facets;
     facets.emplace_back("results", std::move(pipeline));
@@ -342,10 +331,10 @@ TEST_F(DocumentSourceFacetTest, MultipleFacetsShouldSeeTheSameDocuments) {
     auto mock = DocumentSourceMock::createForTest(inputs);
 
     auto firstDummy = DocumentSourcePassthrough::create();
-    auto firstPipeline = uassertStatusOK(Pipeline::createFacetPipeline({firstDummy}, ctx));
+    auto firstPipeline = Pipeline::create({firstDummy}, ctx);
 
     auto secondDummy = DocumentSourcePassthrough::create();
-    auto secondPipeline = uassertStatusOK(Pipeline::createFacetPipeline({secondDummy}, ctx));
+    auto secondPipeline = Pipeline::create({secondDummy}, ctx);
 
     std::vector<DocumentSourceFacet::FacetPipeline> facets;
     facets.emplace_back("first", std::move(firstPipeline));
@@ -362,9 +351,37 @@ TEST_F(DocumentSourceFacetTest, MultipleFacetsShouldSeeTheSameDocuments) {
         expectedOutputs.emplace_back(input.releaseDocument());
     }
     ASSERT(output.isAdvanced());
-    ASSERT_EQ(output.getDocument().size(), 2UL);
+    ASSERT_EQ(output.getDocument().computeSize(), 2ULL);
     ASSERT_VALUE_EQ(output.getDocument()["first"], Value(expectedOutputs));
     ASSERT_VALUE_EQ(output.getDocument()["second"], Value(expectedOutputs));
+
+    // Should be exhausted now.
+    ASSERT(facetStage->getNext().isEOF());
+    ASSERT(facetStage->getNext().isEOF());
+    ASSERT(facetStage->getNext().isEOF());
+}
+
+TEST_F(DocumentSourceFacetTest, ShouldAcceptEmptyPipelines) {
+    auto ctx = getExpCtx();
+    auto spec = BSON("$facet" << BSON("a" << BSONArray()));
+
+    deque<DocumentSource::GetNextResult> inputs = {
+        Document{{"_id", 0}}, Document{{"_id", 1}}, Document{{"_id", 2}}};
+    auto mock = DocumentSourceMock::createForTest(inputs);
+
+    auto facetStage = DocumentSourceFacet::createFromBson(spec.firstElement(), ctx);
+    facetStage->setSource(mock.get());
+
+    auto output = facetStage->getNext();
+
+    // The output fields are in no guaranteed order.
+    vector<Value> expectedOutputs;
+    for (auto&& input : inputs) {
+        expectedOutputs.emplace_back(input.releaseDocument());
+    }
+    ASSERT(output.isAdvanced());
+    ASSERT_EQ(output.getDocument().computeSize(), 1ULL);
+    ASSERT_VALUE_EQ(output.getDocument()["a"], Value(expectedOutputs));
 
     // Should be exhausted now.
     ASSERT(facetStage->getNext().isEOF());
@@ -381,10 +398,10 @@ TEST_F(DocumentSourceFacetTest,
     auto mock = DocumentSourceMock::createForTest(inputs);
 
     auto passthrough = DocumentSourcePassthrough::create();
-    auto passthroughPipe = uassertStatusOK(Pipeline::createFacetPipeline({passthrough}, ctx));
+    auto passthroughPipe = Pipeline::create({passthrough}, ctx);
 
     auto limit = DocumentSourceLimit::create(ctx, 1);
-    auto limitedPipe = uassertStatusOK(Pipeline::createFacetPipeline({limit}, ctx));
+    auto limitedPipe = Pipeline::create({limit}, ctx);
 
     std::vector<DocumentSourceFacet::FacetPipeline> facets;
     facets.emplace_back("all", std::move(passthroughPipe));
@@ -401,7 +418,7 @@ TEST_F(DocumentSourceFacetTest,
 
     // The output fields are in no guaranteed order.
     ASSERT(output.isAdvanced());
-    ASSERT_EQ(output.getDocument().size(), 2UL);
+    ASSERT_EQ(output.getDocument().computeSize(), 2ULL);
     ASSERT_VALUE_EQ(output.getDocument()["all"], Value(expectedPassthroughOutput));
     ASSERT_VALUE_EQ(output.getDocument()["first"],
                     Value(vector<Value>{Value(expectedPassthroughOutput.front())}));
@@ -420,7 +437,7 @@ TEST_F(DocumentSourceFacetTest, ShouldBeAbleToEvaluateMultipleStagesWithinOneSub
 
     auto firstDummy = DocumentSourcePassthrough::create();
     auto secondDummy = DocumentSourcePassthrough::create();
-    auto pipeline = uassertStatusOK(Pipeline::createFacetPipeline({firstDummy, secondDummy}, ctx));
+    auto pipeline = Pipeline::create({firstDummy, secondDummy}, ctx);
 
     std::vector<DocumentSourceFacet::FacetPipeline> facets;
     facets.emplace_back("subPipe", std::move(pipeline));
@@ -439,9 +456,9 @@ TEST_F(DocumentSourceFacetTest, ShouldPropagateDisposeThroughToSource) {
     auto mockSource = DocumentSourceMock::createForTest();
 
     auto firstDummy = DocumentSourcePassthrough::create();
-    auto firstPipe = uassertStatusOK(Pipeline::createFacetPipeline({firstDummy}, ctx));
+    auto firstPipe = Pipeline::create({firstDummy}, ctx);
     auto secondDummy = DocumentSourcePassthrough::create();
-    auto secondPipe = uassertStatusOK(Pipeline::createFacetPipeline({secondDummy}, ctx));
+    auto secondPipe = Pipeline::create({secondDummy}, ctx);
 
     std::vector<DocumentSourceFacet::FacetPipeline> facets;
     facets.emplace_back("firstPipe", std::move(firstPipe));
@@ -455,15 +472,15 @@ TEST_F(DocumentSourceFacetTest, ShouldPropagateDisposeThroughToSource) {
 }
 
 // TODO: DocumentSourceFacet will have to propagate pauses if we ever allow nested $facets.
-DEATH_TEST_F(DocumentSourceFacetTest,
-             ShouldFailIfGivenPausedInput,
-             "Invariant failure !input.isPaused()") {
+DEATH_TEST_REGEX_F(DocumentSourceFacetTest,
+                   ShouldFailIfGivenPausedInput,
+                   R"#(Invariant failure.*!input.isPaused\(\))#") {
     auto ctx = getExpCtx();
     auto mock =
         DocumentSourceMock::createForTest(DocumentSource::GetNextResult::makePauseExecution());
 
     auto firstDummy = DocumentSourcePassthrough::create();
-    auto pipeline = uassertStatusOK(Pipeline::createFacetPipeline({firstDummy}, ctx));
+    auto pipeline = Pipeline::create({firstDummy}, ctx);
 
     std::vector<DocumentSourceFacet::FacetPipeline> facets;
     facets.emplace_back("subPipe", std::move(pipeline));
@@ -487,10 +504,10 @@ TEST_F(DocumentSourceFacetTest, ShouldBeAbleToReParseSerializedStage) {
     //   skippedTwo: [{$skip: 2}]
     // }}
     auto firstSkip = DocumentSourceSkip::create(ctx, 1);
-    auto firstPipeline = uassertStatusOK(Pipeline::createFacetPipeline({firstSkip}, ctx));
+    auto firstPipeline = Pipeline::create({firstSkip}, ctx);
 
     auto secondSkip = DocumentSourceSkip::create(ctx, 2);
-    auto secondPipeline = uassertStatusOK(Pipeline::createFacetPipeline({secondSkip}, ctx));
+    auto secondPipeline = Pipeline::create({secondSkip}, ctx);
 
     std::vector<DocumentSourceFacet::FacetPipeline> facets;
     facets.emplace_back("skippedOne", std::move(firstPipeline));
@@ -504,12 +521,12 @@ TEST_F(DocumentSourceFacetTest, ShouldBeAbleToReParseSerializedStage) {
     ASSERT_EQ(serialization[0].getType(), BSONType::Object);
 
     // The fields are in no guaranteed order, so we can't make a simple Document comparison.
-    ASSERT_EQ(serialization[0].getDocument().size(), 1UL);
+    ASSERT_EQ(serialization[0].getDocument().computeSize(), 1ULL);
     ASSERT_EQ(serialization[0].getDocument()["$facet"].getType(), BSONType::Object);
 
     // Should have two fields: "skippedOne" and "skippedTwo".
     auto serializedStage = serialization[0].getDocument()["$facet"].getDocument();
-    ASSERT_EQ(serializedStage.size(), 2UL);
+    ASSERT_EQ(serializedStage.computeSize(), 2ULL);
     ASSERT_VALUE_EQ(serializedStage["skippedOne"],
                     Value(vector<Value>{Value(Document{{"$skip", 1}})}));
     ASSERT_VALUE_EQ(serializedStage["skippedTwo"],
@@ -530,7 +547,7 @@ TEST_F(DocumentSourceFacetTest, ShouldOptimizeInnerPipelines) {
     auto ctx = getExpCtx();
 
     auto dummy = DocumentSourcePassthrough::create();
-    auto pipeline = unittest::assertGet(Pipeline::createFacetPipeline({dummy}, ctx));
+    auto pipeline = Pipeline::create({dummy}, ctx);
 
     std::vector<DocumentSourceFacet::FacetPipeline> facets;
     facets.emplace_back("subPipe", std::move(pipeline));
@@ -548,10 +565,10 @@ TEST_F(DocumentSourceFacetTest, ShouldPropagateDetachingAndReattachingOfOpCtx) {
     ctx->mongoProcessInterface = std::make_unique<StubMongoProcessInterface>();
 
     auto firstDummy = DocumentSourcePassthrough::create();
-    auto firstPipeline = unittest::assertGet(Pipeline::createFacetPipeline({firstDummy}, ctx));
+    auto firstPipeline = Pipeline::create({firstDummy}, ctx);
 
     auto secondDummy = DocumentSourcePassthrough::create();
-    auto secondPipeline = unittest::assertGet(Pipeline::createFacetPipeline({secondDummy}, ctx));
+    auto secondPipeline = Pipeline::create({secondDummy}, ctx);
 
     std::vector<DocumentSourceFacet::FacetPipeline> facets;
     facets.emplace_back("one", std::move(firstPipeline));
@@ -605,7 +622,7 @@ TEST_F(DocumentSourceFacetTest, ShouldUnionDependenciesOfInnerPipelines) {
     auto ctx = getExpCtx();
 
     auto needsA = DocumentSourceNeedsA::create();
-    auto firstPipeline = unittest::assertGet(Pipeline::createFacetPipeline({needsA}, ctx));
+    auto firstPipeline = Pipeline::create({needsA}, ctx);
 
     auto firstPipelineDeps = firstPipeline->getDependencies(DepsTracker::kNoMetadata);
     ASSERT_FALSE(firstPipelineDeps.needWholeDocument);
@@ -613,7 +630,7 @@ TEST_F(DocumentSourceFacetTest, ShouldUnionDependenciesOfInnerPipelines) {
     ASSERT_EQ(firstPipelineDeps.fields.count("a"), 1UL);
 
     auto needsB = DocumentSourceNeedsB::create();
-    auto secondPipeline = unittest::assertGet(Pipeline::createFacetPipeline({needsB}, ctx));
+    auto secondPipeline = Pipeline::create({needsB}, ctx);
 
     auto secondPipelineDeps = secondPipeline->getDependencies(DepsTracker::kNoMetadata);
     ASSERT_FALSE(secondPipelineDeps.needWholeDocument);
@@ -652,11 +669,10 @@ TEST_F(DocumentSourceFacetTest, ShouldRequireWholeDocumentIfAnyPipelineRequiresW
     auto ctx = getExpCtx();
 
     auto needsA = DocumentSourceNeedsA::create();
-    auto firstPipeline = unittest::assertGet(Pipeline::createFacetPipeline({needsA}, ctx));
+    auto firstPipeline = Pipeline::create({needsA}, ctx);
 
     auto needsWholeDocument = DocumentSourceNeedsWholeDocument::create();
-    auto secondPipeline =
-        unittest::assertGet(Pipeline::createFacetPipeline({needsWholeDocument}, ctx));
+    auto secondPipeline = Pipeline::create({needsWholeDocument}, ctx);
 
     std::vector<DocumentSourceFacet::FacetPipeline> facets;
     facets.emplace_back("needsA", std::move(firstPipeline));
@@ -687,14 +703,13 @@ TEST_F(DocumentSourceFacetTest, ShouldRequireTextScoreIfAnyPipelineRequiresTextS
     auto ctx = getExpCtx();
 
     auto needsA = DocumentSourceNeedsA::create();
-    auto firstPipeline = unittest::assertGet(Pipeline::createFacetPipeline({needsA}, ctx));
+    auto firstPipeline = Pipeline::create({needsA}, ctx);
 
     auto needsWholeDocument = DocumentSourceNeedsWholeDocument::create();
-    auto secondPipeline =
-        unittest::assertGet(Pipeline::createFacetPipeline({needsWholeDocument}, ctx));
+    auto secondPipeline = Pipeline::create({needsWholeDocument}, ctx);
 
     auto needsTextScore = DocumentSourceNeedsOnlyTextScore::create();
-    auto thirdPipeline = unittest::assertGet(Pipeline::createFacetPipeline({needsTextScore}, ctx));
+    auto thirdPipeline = Pipeline::create({needsTextScore}, ctx);
 
     std::vector<DocumentSourceFacet::FacetPipeline> facets;
     facets.emplace_back("needsA", std::move(firstPipeline));
@@ -712,10 +727,10 @@ TEST_F(DocumentSourceFacetTest, ShouldThrowIfAnyPipelineRequiresTextScoreButItIs
     auto ctx = getExpCtx();
 
     auto needsA = DocumentSourceNeedsA::create();
-    auto firstPipeline = unittest::assertGet(Pipeline::createFacetPipeline({needsA}, ctx));
+    auto firstPipeline = Pipeline::create({needsA}, ctx);
 
     auto needsTextScore = DocumentSourceNeedsOnlyTextScore::create();
-    auto secondPipeline = unittest::assertGet(Pipeline::createFacetPipeline({needsTextScore}, ctx));
+    auto secondPipeline = Pipeline::create({needsTextScore}, ctx);
 
     std::vector<DocumentSourceFacet::FacetPipeline> facets;
     facets.emplace_back("needsA", std::move(firstPipeline));
@@ -738,7 +753,8 @@ public:
                 DiskUseRequirement::kNoDiskUse,
                 FacetRequirement::kAllowed,
                 TransactionRequirement::kAllowed,
-                LookupRequirement::kAllowed};
+                LookupRequirement::kAllowed,
+                UnionRequirement::kAllowed};
     }
 
     static boost::intrusive_ptr<DocumentSourceNeedsPrimaryShard> create() {
@@ -750,11 +766,10 @@ TEST_F(DocumentSourceFacetTest, ShouldRequirePrimaryShardIfAnyStageRequiresPrima
     auto ctx = getExpCtx();
 
     auto passthrough = DocumentSourcePassthrough::create();
-    auto firstPipeline = unittest::assertGet(Pipeline::createFacetPipeline({passthrough}, ctx));
+    auto firstPipeline = Pipeline::create({passthrough}, ctx);
 
     auto needsPrimaryShard = DocumentSourceNeedsPrimaryShard::create();
-    auto secondPipeline =
-        unittest::assertGet(Pipeline::createFacetPipeline({needsPrimaryShard}, ctx));
+    auto secondPipeline = Pipeline::create({needsPrimaryShard}, ctx);
 
     std::vector<DocumentSourceFacet::FacetPipeline> facets;
     facets.emplace_back("passthrough", std::move(firstPipeline));
@@ -773,12 +788,10 @@ TEST_F(DocumentSourceFacetTest, ShouldNotRequirePrimaryShardIfNoStagesRequiresPr
     auto ctx = getExpCtx();
 
     auto firstPassthrough = DocumentSourcePassthrough::create();
-    auto firstPipeline =
-        unittest::assertGet(Pipeline::createFacetPipeline({firstPassthrough}, ctx));
+    auto firstPipeline = Pipeline::create({firstPassthrough}, ctx);
 
     auto secondPassthrough = DocumentSourcePassthrough::create();
-    auto secondPipeline =
-        unittest::assertGet(Pipeline::createFacetPipeline({secondPassthrough}, ctx));
+    auto secondPipeline = Pipeline::create({secondPassthrough}, ctx);
 
     std::vector<DocumentSourceFacet::FacetPipeline> facets;
     facets.emplace_back("first", std::move(firstPipeline));
@@ -806,7 +819,8 @@ public:
                 DiskUseRequirement::kWritesTmpData,
                 FacetRequirement::kAllowed,
                 TransactionRequirement::kNotAllowed,
-                LookupRequirement::kAllowed};
+                LookupRequirement::kAllowed,
+                UnionRequirement::kAllowed};
     }
 
     static boost::intrusive_ptr<DocumentSourcePrimaryShardTmpDataNoTxn> create() {
@@ -826,7 +840,8 @@ public:
                 DiskUseRequirement::kNoDiskUse,
                 FacetRequirement::kAllowed,
                 TransactionRequirement::kAllowed,
-                LookupRequirement::kNotAllowed};
+                LookupRequirement::kNotAllowed,
+                UnionRequirement::kAllowed};
     }
 
     static boost::intrusive_ptr<DocumentSourceBannedInLookup> create() {
@@ -838,16 +853,13 @@ TEST_F(DocumentSourceFacetTest, ShouldSurfaceStrictestRequirementsOfEachConstrai
     auto ctx = getExpCtx();
 
     auto firstPassthrough = DocumentSourcePassthrough::create();
-    auto firstPipeline =
-        unittest::assertGet(Pipeline::createFacetPipeline({firstPassthrough}, ctx));
+    auto firstPipeline = Pipeline::create({firstPassthrough}, ctx);
 
     auto secondPassthrough = DocumentSourcePrimaryShardTmpDataNoTxn::create();
-    auto secondPipeline =
-        unittest::assertGet(Pipeline::createFacetPipeline({secondPassthrough}, ctx));
+    auto secondPipeline = Pipeline::create({secondPassthrough}, ctx);
 
     auto thirdPassthrough = DocumentSourceBannedInLookup::create();
-    auto thirdPipeline =
-        unittest::assertGet(Pipeline::createFacetPipeline({thirdPassthrough}, ctx));
+    auto thirdPipeline = Pipeline::create({thirdPassthrough}, ctx);
 
     std::vector<DocumentSourceFacet::FacetPipeline> facets;
     facets.emplace_back("first", std::move(firstPipeline));

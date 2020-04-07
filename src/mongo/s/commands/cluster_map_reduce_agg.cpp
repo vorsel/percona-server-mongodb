@@ -40,7 +40,7 @@
 #include "mongo/db/commands/map_reduce_agg.h"
 #include "mongo/db/commands/map_reduce_gen.h"
 #include "mongo/db/commands/mr_common.h"
-#include "mongo/db/pipeline/mongos_process_interface.h"
+#include "mongo/db/pipeline/process_interface/mongos_process_interface.h"
 #include "mongo/db/pipeline/sharded_agg_helpers.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/cursor_response.h"
@@ -50,6 +50,7 @@
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/commands/cluster_map_reduce_agg.h"
+#include "mongo/s/query/cluster_aggregation_planner.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
 
 namespace mongo {
@@ -61,7 +62,7 @@ auto makeExpressionContext(OperationContext* opCtx,
                            boost::optional<ExplainOptions::Verbosity> verbosity) {
     // Populate the collection UUID and the appropriate collation to use.
     auto nss = parsedMr.getNamespace();
-    auto [collationObj, uuid] = sharded_agg_helpers::getCollationAndUUID(
+    auto [collationObj, uuid] = cluster_aggregation_planner::getCollationAndUUID(
         routingInfo, nss, parsedMr.getCollation().get_value_or(BSONObj()));
 
     std::unique_ptr<CollatorInterface> resolvedCollator;
@@ -85,6 +86,7 @@ auto makeExpressionContext(OperationContext* opCtx,
     if (parsedMr.getScope()) {
         runtimeConstants.setJsScope(parsedMr.getScope()->getObj());
     }
+    runtimeConstants.setIsMapReduce(true);
     auto expCtx = make_intrusive<ExpressionContext>(
         opCtx,
         verbosity,
@@ -92,10 +94,12 @@ auto makeExpressionContext(OperationContext* opCtx,
         false,  // needsmerge
         true,   // allowDiskUse
         parsedMr.getBypassDocumentValidation().get_value_or(false),
+        true,  // isMapReduceCommand
         nss,
         runtimeConstants,
         std::move(resolvedCollator),
-        std::make_shared<MongoSInterface>(),
+        std::make_shared<MongosProcessInterface>(
+            Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor()),
         std::move(resolvedNamespaces),
         boost::none);  // uuid
     expCtx->inMongos = true;
@@ -113,6 +117,7 @@ Document serializeToCommand(BSONObj originalCmd, const MapReduce& parsedMr, Pipe
     translatedCmd[AggregationRequest::kFromMongosName] = Value(true);
     translatedCmd[AggregationRequest::kRuntimeConstants] =
         Value(pipeline->getContext()->getRuntimeConstants().toBSON());
+    translatedCmd[AggregationRequest::kIsMapReduceCommand] = Value(true);
 
     if (shouldBypassDocumentValidationForCommand(originalCmd)) {
         translatedCmd[bypassDocumentValidationCommandOption()] = Value(true);
@@ -169,38 +174,40 @@ bool runAggregationMapReduce(OperationContext* opCtx,
     // expected mapReduce output.
     BSONObjBuilder tempResults;
 
-    auto targeter = sharded_agg_helpers::AggregationTargeter::make(opCtx,
-                                                                   parsedMr.getNamespace(),
-                                                                   pipelineBuilder,
-                                                                   routingInfo,
-                                                                   involvedNamespaces,
-                                                                   false,  // hasChangeStream
-                                                                   true);  // allowedToPassthrough
+    auto targeter =
+        cluster_aggregation_planner::AggregationTargeter::make(opCtx,
+                                                               parsedMr.getNamespace(),
+                                                               pipelineBuilder,
+                                                               routingInfo,
+                                                               involvedNamespaces,
+                                                               false,  // hasChangeStream
+                                                               true);  // allowedToPassthrough
     try {
         switch (targeter.policy) {
-            case sharded_agg_helpers::AggregationTargeter::TargetingPolicy::kPassthrough: {
+            case cluster_aggregation_planner::AggregationTargeter::TargetingPolicy::kPassthrough: {
                 // For the passthrough case, the targeter will not build a pipeline since its not
                 // needed in the normal aggregation path. For this translation, though, we need to
                 // build the pipeline to serialize and send to the primary shard.
                 auto serialized = serializeToCommand(cmd, parsedMr, pipelineBuilder().get());
-                uassertStatusOK(
-                    sharded_agg_helpers::runPipelineOnPrimaryShard(expCtx,
-                                                                   namespaces,
-                                                                   targeter.routingInfo->db(),
-                                                                   verbosity,
-                                                                   std::move(serialized),
-                                                                   privileges,
-                                                                   &tempResults));
+                uassertStatusOK(cluster_aggregation_planner::runPipelineOnPrimaryShard(
+                    expCtx,
+                    namespaces,
+                    targeter.routingInfo->db(),
+                    verbosity,
+                    std::move(serialized),
+                    privileges,
+                    &tempResults));
                 break;
             }
 
-            case sharded_agg_helpers::AggregationTargeter::TargetingPolicy::kMongosRequired: {
+            case cluster_aggregation_planner::AggregationTargeter::TargetingPolicy::
+                kMongosRequired: {
                 // Pipelines generated from mapReduce should never be required to run on mongos.
                 uasserted(31291, "Internal error during mapReduce translation");
                 break;
             }
 
-            case sharded_agg_helpers::AggregationTargeter::TargetingPolicy::kAnyShard: {
+            case cluster_aggregation_planner::AggregationTargeter::TargetingPolicy::kAnyShard: {
                 if (verbosity) {
                     explain_common::generateServerInfo(&result);
                 }
@@ -208,8 +215,9 @@ bool runAggregationMapReduce(OperationContext* opCtx,
                 // When running explain, we don't explicitly pass the specified verbosity here
                 // because each stage of the constructed pipeline is aware of said verbosity through
                 // a pointer to the constructed ExpressionContext.
-                uassertStatusOK(sharded_agg_helpers::dispatchPipelineAndMerge(
+                uassertStatusOK(cluster_aggregation_planner::dispatchPipelineAndMerge(
                     opCtx,
+                    expCtx->mongoProcessInterface->taskExecutor,
                     std::move(targeter),
                     std::move(serialized),
                     std::numeric_limits<long long>::max(),

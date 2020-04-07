@@ -35,17 +35,19 @@
 
 #include <vector>
 
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
 #include "mongo/db/concurrency/flow_control_ticketholder.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/flow_control.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/compiler.h"
 #include "mongo/stdx/new.h"
 #include "mongo/util/background.h"
 #include "mongo/util/concurrency/ticketholder.h"
 #include "mongo/util/debug_util.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
 
@@ -191,19 +193,29 @@ bool LockerImpl::isRSTLLocked() const {
 }
 
 void LockerImpl::dump() const {
-    StringBuilder ss;
-    ss << "Locker id " << _id << " status: ";
+    struct Entry {
+        ResourceId key;
+        LockRequest::Status status;
+        LockMode mode;
 
-    _lock.lock();
-    LockRequestsMap::ConstIterator it = _requests.begin();
-    while (!it.finished()) {
-        ss << it.key().toString() << " " << lockRequestStatusName(it->status) << " in "
-           << modeName(it->mode) << "; ";
-        it.next();
+        BSONObj toBSON() const {
+            BSONObjBuilder b;
+            b.append("key", key.toString());
+            b.append("status", lockRequestStatusName(status));
+            b.append("mode", modeName(mode));
+            return b.obj();
+        }
+        std::string toString() const {
+            return tojson(toBSON());
+        }
+    };
+    std::vector<Entry> entries;
+    {
+        auto lg = stdx::lock_guard(_lock);
+        for (auto it = _requests.begin(); !it.finished(); it.next())
+            entries.push_back({it.key(), it->status, it->mode});
     }
-    _lock.unlock();
-
-    log() << ss.str();
+    LOGV2(20523, "Locker id {id} status: {requests}", "id"_attr = _id, "requests"_attr = entries);
 }
 
 
@@ -1062,7 +1074,7 @@ public:
     }
 
     void taskDoWork() {
-        LOG(2) << "cleaning up unused lock buckets of the global lock manager";
+        LOGV2_DEBUG(20524, 2, "cleaning up unused lock buckets of the global lock manager");
         getGlobalLockManager()->cleanupUnusedLocks();
     }
 } unusedLockCleaner;

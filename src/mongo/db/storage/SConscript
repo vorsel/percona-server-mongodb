@@ -10,22 +10,12 @@ env.SConscript(
         'ephemeral_for_test',
         'inmemory',
         'kv',
-        'mobile',
         'wiredtiger',
     ],
     exports=[
         'env'
     ],
 )
-
-env.Library(
-    target='journal_listener',
-    source=[
-        'journal_listener.cpp',
-        ],
-    LIBDEPS=[
-        ],
-    )
 
 env.Library(
     target='index_entry_comparison',
@@ -182,7 +172,6 @@ env.Library(
         'index_entry_comparison',
         'key_string',
     ],
-
 )
 
 env.Library(
@@ -203,25 +192,35 @@ env.Library(
         'record_store_test_truncate.cpp',
         'record_store_test_updaterecord.cpp',
         'record_store_test_updatewithdamages.cpp',
-        ],
+    ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/db/storage/storage_options',
         '$BUILD_DIR/mongo/unittest/unittest',
-        ],
-    )
+    ],
+)
 
 
 env.Library(
     target='recovery_unit_test_harness',
     source=[
         'recovery_unit_test_harness.cpp'
-        ],
+    ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/unittest/unittest',
-        ],
-    )
+    ],
+)
+
+env.Library(
+    target='storage_unittest_debug_util',
+    source=[
+        'storage_unittest_debug_util.cpp',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/db_raii',
+    ],
+)
 
 env.Library(
     target='storage_engine_lock_file',
@@ -438,7 +437,7 @@ env.Library(
     source=[
         'storage_engine_impl.cpp',
         'kv/temporary_kv_record_store.cpp', # TODO: SERVER-41892 Avoid source under kv sub-directory
-        env.Idlc('enable_two_phase_index_build.idl')[0],
+        env.Idlc('two_phase_index_build_knobs.idl')[0],
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',

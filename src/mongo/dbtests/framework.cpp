@@ -46,6 +46,7 @@
 #include "mongo/db/index/index_access_method_factory_impl.h"
 #include "mongo/db/index_builds_coordinator_mongod.h"
 #include "mongo/db/op_observer_registry.h"
+#include "mongo/db/s/collection_sharding_state_factory_shard.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_engine_init.h"
@@ -56,7 +57,6 @@
 #include "mongo/scripting/engine.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/exit.h"
-#include "mongo/util/log.h"
 #include "mongo/util/periodic_runner_factory.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/version.h"
@@ -86,6 +86,10 @@ int runDbTests(int argc, char** argv) {
     Client::initThread("testsuite");
 
     auto globalServiceContext = getGlobalServiceContext();
+    CollectionShardingStateFactory::set(
+        globalServiceContext,
+        std::make_unique<CollectionShardingStateFactoryShard>(globalServiceContext));
+
 
     // DBTests run as if in the database, so allow them to create direct clients.
     DBDirectClientFactory::get(globalServiceContext)
@@ -116,6 +120,7 @@ int runDbTests(int argc, char** argv) {
                                    frameworkGlobalParams.runsPerTest);
 
     // So everything shuts down cleanly
+    CollectionShardingStateFactory::clear(globalServiceContext);
     exitCleanly((ExitCode)ret);
     return ret;
 }

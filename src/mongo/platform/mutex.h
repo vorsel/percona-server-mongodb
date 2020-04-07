@@ -37,10 +37,12 @@
 
 #include "mongo/base/error_codes.h"
 #include "mongo/base/string_data.h"
+#include "mongo/config.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/source_location.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/concepts.h"
 #include "mongo/util/decorable.h"
 #include "mongo/util/duration.h"
 #include "mongo/util/hierarchical_acquisition.h"
@@ -48,9 +50,9 @@
 
 namespace mongo {
 
-class Mutex;
-
 namespace latch_detail {
+
+class Mutex;
 
 using Level = hierarchical_acquisition_detail::Level;
 
@@ -58,6 +60,9 @@ static constexpr auto kAnonymousName = "AnonymousLatch"_sd;
 
 /**
  * An Identity encapsulates the context around a latch
+ *
+ * Identities are intended to be constructed rarely and utilized via constant reference or pointer.
+ * Once an Identity is visible in a multithreaded context, it will be effectively constant.
  */
 class Identity {
 public:
@@ -125,6 +130,77 @@ private:
 };
 
 /**
+ * A set of actions to happen upon notable events on a Lockable-conceptualized type
+ *
+ * The event handlers on this type will be invoked extremely frequently and can substantially affect
+ * the efficiency and overall health of the process. As a general rule, avoid logging, disk io, and
+ * networking in any DiagnosticListener functions. System functions not related to those activities
+ * should be avoided as much as possible. For example, the overhead of taking an elementary stack
+ * trace voa backtrace_symbols_fd(3) proved too heavyweight to be used in a DiagnosticListener.
+ * Additionally, in parts of our system, Mutexes can outlive the invocation of main() and, indeed,
+ * certain process global variables. DiagnosticListeners usually need to be dynamically allocated
+ * and leaked.
+ *
+ * In short, HERE BE DRAGONS. DO NOT IMPLEMENT NON-DIAGNOSTIC FUNCTIONALITY USING THIS CLASS.
+ */
+class DiagnosticListener {
+    friend class Mutex;
+
+public:
+    using Identity = latch_detail::Identity;
+
+    virtual ~DiagnosticListener() = default;
+
+    /**
+     * Action to do when a lock cannot be immediately acquired
+     */
+    virtual void onContendedLock(const Identity& id) = 0;
+
+    /**
+     * Action to do when a lock was acquired without blocking
+     */
+    virtual void onQuickLock(const Identity& id) = 0;
+
+    /**
+     * Action to do when a lock was acquired after blocking
+     */
+    virtual void onSlowLock(const Identity& id) = 0;
+
+    /**
+     * Action to do when a lock is unlocked
+     */
+    virtual void onUnlock(const Identity& id) = 0;
+};
+
+
+inline auto& getDiagnosticListenerState() noexcept {
+    struct State {
+        AtomicWord<bool> isFinalized{false};
+        std::vector<latch_detail::DiagnosticListener*> listeners;
+    };
+    // Make state immortal
+    static const auto state = new State();  // Intentionally leaked!
+    return *state;
+}
+
+/**
+ * Creates a DiagnosticListener subclass and adds it to the triggers for certain actions.
+ *
+ * DiagnosticListeners can only be added and not removed. If you wish to deactivate a
+ * DiagnosticListeners subclass, please provide the switch on that subclass to noop its
+ * functions. It is only safe to add a DiagnosticListener during a MONGO_INITIALIZER.
+ */
+TEMPLATE(typename ListenerT)
+REQUIRES(std::is_base_of_v<DiagnosticListener, ListenerT>)
+void installDiagnosticListener() {
+    auto& state = getDiagnosticListenerState();
+
+    static auto* const listener = new ListenerT();  // Intentionally leaked!
+    state.listeners.push_back(listener);
+    invariant(!state.isFinalized.load());
+}
+
+/**
  * This class holds working data for a latchable resource
  *
  * All member data is either i) synchronized or ii) constant.
@@ -161,7 +237,7 @@ private:
 };
 
 /**
- * latch_details::Catalog holds a collection of Data objects for use with Mutexes
+ * latch_details::Catalog holds a set of Data objects for use with Mutexes
  *
  * All rules for LockFreeCollection apply:
  * - Synchronization is provided internally
@@ -176,7 +252,7 @@ public:
 };
 
 /**
- * Simple registration object that construct with an Identity and provides access to a Data
+ * Simple registration object that takes an Identity and provides access to a Data
  *
  * This object actually owns the Data object to make lifetime management simpler.
  */
@@ -216,8 +292,15 @@ auto getOrMakeLatchData(Tag&&, Identity identity, const SourceLocationHolder& so
 inline auto defaultData() {
     return getOrMakeLatchData([] {}, Identity(kAnonymousName), MONGO_SOURCE_LOCATION());
 }
-}  // namespace latch_detail
 
+/**
+ * Latch is an abstract base class that implements the Lockable concept
+ *
+ * This class is useful for designing function APIs that take stdx::unique_lock around an
+ * ambiguously defined resource. A stdx::unique_lock<Latch> can be constructed from a Mutex.
+ * A stdx::unique_lock<Latch> cannot be constructed from a stdx::unique_lock<Mutex>. Sometimes,
+ * standard types are not as powerful as we would like them to be.
+ */
 class Latch {
 public:
     virtual ~Latch() = default;
@@ -236,89 +319,47 @@ public:
  *
  * This class is intended to be used wherever a stdx::mutex would previously be used. It provides
  * a generic event-listener interface for instrumenting around lock()/unlock()/try_lock().
+ * Conceptually, this type is similar to most unique_lock and timed_mutex implementations.
+ *
+ * If you believe that you need synchronization with absolutely no additional nanosecond latency or
+ * need to exist at a very core level (e.g. code living in the base folder), please excuse yourself
+ * from the linter and use a stdx::mutex.
+ *
+ * If you believe that you need logical synchronization at a user-facing level, you may need
+ * a database Lock instead. Talk to Storage Execution.
  */
-class Mutex : public Latch {
+class Mutex final : public Latch {
 public:
-    class LockListener;
-
     void lock() override;
     void unlock() override;
     bool try_lock() override;
     StringData getName() const override;
 
-    Mutex() : Mutex(latch_detail::defaultData()) {}
-    explicit Mutex(std::shared_ptr<latch_detail::Data> data);
+    Mutex() : Mutex(defaultData()) {}
+    explicit Mutex(std::shared_ptr<Data> data);
 
     ~Mutex();
 
-    /**
-     * This function adds a LockListener subclass to the triggers for certain actions.
-     *
-     * LockListeners can only be added and not removed. If you wish to deactivate a LockListeners
-     * subclass, please provide the switch on that subclass to noop its functions. It is only safe
-     * to add a LockListener during a MONGO_INITIALIZER.
-     */
-    static void addLockListener(LockListener* listener);
-
-    /**
-     * This function finalizes the list of LockListener subclasses and prevents more from being
-     * added.
-     */
-    static void finalizeLockListeners();
-
 private:
-    static auto& _getListenerState() noexcept {
-        struct State {
-            AtomicWord<bool> isFinalized{false};
-            std::vector<LockListener*> listeners;
-        };
-
-        static State state;
-        return state;
-    }
-
     void _onContendedLock() noexcept;
     void _onQuickLock() noexcept;
     void _onSlowLock() noexcept;
     void _onUnlock() noexcept;
 
-    const std::shared_ptr<latch_detail::Data> _data;
+    const std::shared_ptr<Data> _data;
 
     stdx::mutex _mutex;  // NOLINT
     bool _isLocked = false;
 };
+}  // namespace latch_detail
 
-/**
- * A set of actions to happen upon notable events on a Lockable-conceptualized type
- */
-class Mutex::LockListener {
-    friend class Mutex;
-
-public:
-    using Identity = latch_detail::Identity;
-
-    virtual ~LockListener() = default;
-
-    /**
-     * Action to do when a lock cannot be immediately acquired
-     */
-    virtual void onContendedLock(const Identity& id) = 0;
-
-    /**
-     * Action to do when a lock was acquired without blocking
-     */
-    virtual void onQuickLock(const Identity& id) = 0;
-
-    /**
-     * Action to do when a lock was acquired after blocking
-     */
-    virtual void onSlowLock(const Identity& id) = 0;
-
-    /**
-     * Action to do when a lock is unlocked
-     */
-    virtual void onUnlock(const Identity& id) = 0;
-};
+#ifndef MONGO_CONFIG_USE_RAW_LATCHES
+using Latch = latch_detail::Latch;
+using Mutex = latch_detail::Mutex;
+#else
+using Latch = stdx::mutex;  // NOLINT
+using Mutex = stdx::mutex;  // NOLINT
+#endif
 
 }  // namespace mongo
 
@@ -332,4 +373,8 @@ public:
 /**
  * Construct a mongo::Mutex using the result of MONGO_GET_LATCH_DATA with all arguments forwarded
  */
+#ifndef MONGO_CONFIG_USE_RAW_LATCHES
 #define MONGO_MAKE_LATCH(...) ::mongo::Mutex(MONGO_GET_LATCH_DATA(__VA_ARGS__));
+#else
+#define MONGO_MAKE_LATCH(...) ::mongo::stdx::mutex();  // NOLINT
+#endif

@@ -55,15 +55,14 @@ void assertIntersectingChunkHasNotMoved(OperationContext* opCtx,
     if (!repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime())
         return;
 
-    const auto metadata = csr->getOrphansFilter(opCtx, true /* isCollection */);
-    if (!metadata->isSharded())
+    const auto collectionFilter = csr->getOwnershipFilter(opCtx);
+    if (!collectionFilter.isSharded())
         return;
 
-    auto chunkManager = metadata->getChunkManager();
-    auto shardKey = chunkManager->getShardKeyPattern().extractShardKeyFromDoc(doc);
+    auto shardKey = collectionFilter.extractShardKeyFromDoc(doc);
 
     // We can assume the simple collation because shard keys do not support non-simple collations.
-    auto chunk = chunkManager->findIntersectingChunkWithSimpleCollation(shardKey);
+    auto chunk = collectionFilter.findIntersectingChunkWithSimpleCollation(shardKey);
 
     // Throws if the chunk has moved since the timestamp of the running transaction's atClusterTime
     // read concern parameter.
@@ -107,7 +106,7 @@ void OpObserverShardingImpl::shardObserveInsertOp(OperationContext* opCtx,
         return;
     }
 
-    csr->checkShardVersionOrThrow(opCtx, true /* isCollection */);
+    csr->checkShardVersionOrThrow(opCtx);
 
     if (inMultiDocumentTransaction) {
         assertIntersectingChunkHasNotMoved(opCtx, csr, insertedDoc);
@@ -129,7 +128,7 @@ void OpObserverShardingImpl::shardObserveUpdateOp(OperationContext* opCtx,
                                                   const repl::OpTime& prePostImageOpTime,
                                                   const bool inMultiDocumentTransaction) {
     auto* const csr = CollectionShardingRuntime::get(opCtx, nss);
-    csr->checkShardVersionOrThrow(opCtx, true /* isCollection */);
+    csr->checkShardVersionOrThrow(opCtx);
 
     if (inMultiDocumentTransaction) {
         assertIntersectingChunkHasNotMoved(opCtx, csr, postImageDoc);
@@ -150,7 +149,7 @@ void OpObserverShardingImpl::shardObserveDeleteOp(OperationContext* opCtx,
                                                   const repl::OpTime& preImageOpTime,
                                                   const bool inMultiDocumentTransaction) {
     auto* const csr = CollectionShardingRuntime::get(opCtx, nss);
-    csr->checkShardVersionOrThrow(opCtx, true /* isCollection */);
+    csr->checkShardVersionOrThrow(opCtx);
 
     if (inMultiDocumentTransaction) {
         assertIntersectingChunkHasNotMoved(opCtx, csr, documentKey);

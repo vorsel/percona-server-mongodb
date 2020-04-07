@@ -42,7 +42,6 @@
 #include "mongo/db/server_options.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -51,6 +50,7 @@ namespace {
 
 const std::string kConfigFieldName = "config";
 const std::string kConfigVersionFieldName = "v";
+const std::string kConfigTermFieldName = "configTerm";
 const std::string kElectionTimeFieldName = "electionTime";
 const std::string kMemberStateFieldName = "state";
 const std::string kOkFieldName = "ok";
@@ -80,6 +80,9 @@ void ReplSetHeartbeatResponse::addToBSON(BSONObjBuilder* builder) const {
     }
     if (_configVersion != -1) {
         *builder << kConfigVersionFieldName << _configVersion;
+    }
+    if (_configTerm != OpTime::kUninitializedTerm) {
+        *builder << kConfigTermFieldName << _configTerm;
     }
     if (!_setName.empty()) {
         *builder << kReplSetFieldName << _setName;
@@ -217,6 +220,12 @@ Status ReplSetHeartbeatResponse::initialize(const BSONObj& doc, long long term) 
                                     << typeName(configVersionElement.type()));
     }
     _configVersion = configVersionElement.numberInt();
+
+    // Allow a missing term field for backward compatibility.
+    const BSONElement configTermElement = doc[kConfigTermFieldName];
+    if (!configTermElement.eoo() && configVersionElement.type() == NumberInt) {
+        _configTerm = configTermElement.numberInt();
+    }
 
     const BSONElement syncingToElement = doc[kSyncSourceFieldName];
     if (syncingToElement.eoo()) {

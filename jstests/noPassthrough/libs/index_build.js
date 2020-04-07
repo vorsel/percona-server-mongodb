@@ -1,15 +1,28 @@
 // Helper functions for testing index builds.
 
-class IndexBuildTest {
+var IndexBuildTest = class {
     /**
      * Starts an index build in a separate mongo shell process with given options.
+     * Ensures the index build worked or failed with one of the expected failures.
      */
-    static startIndexBuild(conn, ns, keyPattern, options) {
+    static startIndexBuild(conn, ns, keyPattern, options, expectedFailures) {
         options = options || {};
-        return startParallelShell('const coll = db.getMongo().getCollection("' + ns + '");' +
-                                      'assert.commandWorked(coll.createIndex(' +
-                                      tojson(keyPattern) + ', ' + tojson(options) + '));',
-                                  conn.port);
+        expectedFailures = expectedFailures || [];
+
+        if (Array.isArray(keyPattern)) {
+            return startParallelShell(
+                'const coll = db.getMongo().getCollection("' + ns + '");' +
+                    'assert.commandWorkedOrFailedWithCode(coll.createIndexes(' +
+                    JSON.stringify(keyPattern) + ', ' + tojson(options) + '), ' +
+                    JSON.stringify(expectedFailures) + ');',
+                conn.port);
+        } else {
+            return startParallelShell('const coll = db.getMongo().getCollection("' + ns + '");' +
+                                          'assert.commandWorkedOrFailedWithCode(coll.createIndex(' +
+                                          tojson(keyPattern) + ', ' + tojson(options) + '), ' +
+                                          JSON.stringify(expectedFailures) + ');',
+                                      conn.port);
+        }
     }
 
     /**
@@ -123,7 +136,7 @@ class IndexBuildTest {
         notReadyIndexes = notReadyIndexes || [];
         options = options || {};
 
-        let res = coll.runCommand("listIndexes", options);
+        let res = assert.commandWorked(coll.runCommand("listIndexes", options));
         assert.eq(numIndexes,
                   res.cursor.firstBatch.length,
                   'unexpected number of indexes in collection: ' + tojson(res));
@@ -195,4 +208,14 @@ class IndexBuildTest {
         const storageEngineSection = serverStatus.storageEngine;
         return storageEngineSection.supportsTwoPhaseIndexBuild;
     }
-}
+
+    /**
+     * Returns true if majority commit quorum is supported by two phase index builds.
+     */
+    static supportsIndexBuildMajorityCommitQuorum(conn) {
+        return assert
+            .commandWorked(
+                conn.adminCommand({getParameter: 1, enableIndexBuildMajorityCommitQuorum: 1}))
+            .enableIndexBuildMajorityCommitQuorum;
+    }
+};

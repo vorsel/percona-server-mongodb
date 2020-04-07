@@ -35,8 +35,9 @@
 #include "mongo/db/query/projection_ast_path_tracking_visitor.h"
 #include "mongo/db/query/projection_ast_walker.h"
 #include "mongo/db/query/query_planner_common.h"
+#include "mongo/logger/redaction.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
+
 
 namespace mongo {
 
@@ -69,8 +70,9 @@ void QueryPlannerCommon::reverseScans(QuerySolutionNode* node) {
         MergeSortNode* msn = static_cast<MergeSortNode*>(node);
         msn->sort = reverseSortObj(msn->sort);
     } else {
-        invariant(STAGE_SORT != type);
-        // This shouldn't be here...
+        // Reversing scans is done in order to determine whether or not we need to add an explicit
+        // SORT stage. There shouldn't already be one present in the plan.
+        invariant(!isSortStageType(type));
     }
 
     for (size_t i = 0; i < node->children.size(); ++i) {

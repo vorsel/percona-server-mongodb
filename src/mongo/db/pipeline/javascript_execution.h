@@ -33,6 +33,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/scripting/engine.h"
 
 namespace mongo {
@@ -48,36 +49,34 @@ class JsExecution {
 public:
     /**
      * Create or get a pointer to a JsExecution instance, capable of invoking Javascript functions
-     * and reading the return value. This will load all stored procedures from database unless
-     * 'disableLoadStored' is set on the global ScriptEngine.
+     * and reading the return value. If `loadStoredProcedures` is true, this will load all stored
+     * procedures from database unless 'disableLoadStored' is set on the global ScriptEngine. The
+     * JsExecution* returned is owned by 'opCtx'.
      */
-    static JsExecution* get(OperationContext* opCtx, const BSONObj& scope, StringData database);
-
+    static JsExecution* get(OperationContext* opCtx,
+                            const BSONObj& scope,
+                            StringData database,
+                            bool loadStoredProcedures,
+                            boost::optional<int> jsHeapLimitMB);
     /**
      * Construct with a thread-local scope and initialize with the given scope variables.
      */
-    explicit JsExecution(const BSONObj& scopeVars)
-        : _scope(getGlobalScriptEngine()->newScopeForCurrentThread()) {
+    explicit JsExecution(const BSONObj& scopeVars, boost::optional<int> jsHeapLimitMB = boost::none)
+        : _scope(getGlobalScriptEngine()->newScopeForCurrentThread(jsHeapLimitMB)) {
         _scopeVars = scopeVars.getOwned();
         _scope->init(&_scopeVars);
-        _scope->registerOperation(Client::getCurrent()->getOperationContext());
-    }
-
-    ~JsExecution() {
-        _scope->unregisterOperation();
+        _fnCallTimeoutMillis = internalQueryJavaScriptFnTimeoutMillis.load();
     }
 
     /**
      * Registers and invokes the javascript function given by 'func' with the arguments 'params' and
      * input object 'thisObj'.
      *
-     * This method assumes that the desired function to execute does return a value.
+     * This method assumes that the desired function to execute does not return a value.
      */
     void callFunctionWithoutReturn(ScriptingFunction func,
                                    const BSONObj& params,
-                                   const BSONObj& thisObj) {
-        _scope->invoke(func, &params, &thisObj, 0, true);
-    }
+                                   const BSONObj& thisObj);
 
     /**
      * Registers and invokes the javascript function given by 'func' with the arguments 'params' and
@@ -85,12 +84,7 @@ public:
      *
      * Returns the value returned by the function.
      */
-    Value callFunction(ScriptingFunction func, const BSONObj& params, const BSONObj& thisObj) {
-        _scope->invoke(func, &params, &thisObj, 0, false);
-        BSONObjBuilder returnValue;
-        _scope->append(returnValue, "", "__returnValue");
-        return Value(returnValue.done().firstElement());
-    }
+    Value callFunction(ScriptingFunction func, const BSONObj& params, const BSONObj& thisObj);
 
     /**
      * Injects the given function 'emitFn' as a native JS function named 'emit', callable from
@@ -111,5 +105,12 @@ private:
     BSONObj _scopeVars;
     std::unique_ptr<Scope> _scope;
     bool _emitCreated = false;
+    bool _storedProceduresLoaded = false;
+    int _fnCallTimeoutMillis;
+
+    Value doCallFunction(ScriptingFunction func,
+                         const BSONObj& params,
+                         const BSONObj& thisObj,
+                         bool noReturnVal);
 };
 }  // namespace mongo

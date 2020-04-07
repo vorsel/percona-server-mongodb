@@ -145,7 +145,9 @@ public:
             std::error_code ec;
             getSocket().shutdown(GenericSocket::shutdown_both, ec);
             if ((ec) && (ec != asio::error::not_connected)) {
-                error() << "Error shutting down socket: " << ec.message();
+                LOGV2_ERROR(23841,
+                            "Error shutting down socket: {ec_message}",
+                            "ec_message"_attr = ec.message());
             }
         }
     }
@@ -183,7 +185,10 @@ public:
     }
 
     void cancelAsyncOperations(const BatonHandle& baton = nullptr) override {
-        LOG(3) << "Cancelling outstanding I/O operations on connection to " << _remote;
+        LOGV2_DEBUG(4615608,
+                    3,
+                    "Cancelling outstanding I/O operations on connection to {remote}",
+                    "remote"_attr = _remote);
         if (baton && baton->networking()) {
             baton->networking()->cancelSession(*this);
         } else {
@@ -205,8 +210,9 @@ public:
         auto swPollEvents = pollASIOSocket(getSocket(), POLLIN, Milliseconds{0});
         if (!swPollEvents.isOK()) {
             if (swPollEvents != ErrorCodes::NetworkTimeout) {
-                warning() << "Failed to poll socket for connectivity check: "
-                          << swPollEvents.getStatus();
+                LOGV2_WARNING(4615609,
+                              "Failed to poll socket for connectivity check: {reason}",
+                              "reason"_attr = swPollEvents.getStatus());
                 return false;
             }
             return true;
@@ -219,8 +225,9 @@ public:
             if (size == sizeof(testByte)) {
                 return true;
             } else if (size == -1) {
-                auto errDesc = errnoWithDescription(errno);
-                warning() << "Failed to check socket connectivity: " << errDesc;
+                LOGV2_WARNING(4615610,
+                              "Failed to check socket connectivity: {errDesc}",
+                              "errDesc"_attr = errnoWithDescription(errno));
             }
             // If size == 0 then we got disconnected and we should return false.
         }
@@ -236,7 +243,8 @@ protected:
     // The unique_lock here is held by TransportLayerASIO to synchronize with the asyncConnect
     // timeout callback. It will be unlocked before the SSL actually handshake begins.
     Future<void> handshakeSSLForEgressWithLock(stdx::unique_lock<Latch> lk,
-                                               const HostAndPort& target) {
+                                               const HostAndPort& target,
+                                               const ReactorHandle& reactor) {
         if (!_tl->_egressSSLContext) {
             return Future<void>::makeReady(Status(ErrorCodes::SSLHandshakeFailed,
                                                   "SSL requested but SSL support is disabled"));
@@ -255,12 +263,18 @@ protected:
                 return _sslSocket->async_handshake(asio::ssl::stream_base::client, UseFuture{});
             }
         };
-        return doHandshake().then([this, target] {
+        return doHandshake().then([this, target, reactor] {
             _ranHandshake = true;
 
-            SSLPeerInfo::forSession(shared_from_this()) =
-                uassertStatusOK(getSSLManager()->parseAndValidatePeerCertificate(
-                    _sslSocket->native_handle(), _sslSocket->get_sni(), target.host(), target));
+            return getSSLManager()
+                ->parseAndValidatePeerCertificate(_sslSocket->native_handle(),
+                                                  _sslSocket->get_sni(),
+                                                  target.host(),
+                                                  target,
+                                                  reactor)
+                .then([this](SSLPeerInfo info) {
+                    SSLPeerInfo::forSession(shared_from_this()) = info;
+                });
         });
     }
 
@@ -268,7 +282,7 @@ protected:
     // pass it to the WithLock version of handshakeSSLForEgress
     Future<void> handshakeSSLForEgress(const HostAndPort& target) {
         auto mutex = MONGO_MAKE_LATCH();
-        return handshakeSSLForEgressWithLock(stdx::unique_lock<Latch>(mutex), target);
+        return handshakeSSLForEgressWithLock(stdx::unique_lock<Latch>(mutex), target, nullptr);
     }
 #endif
 
@@ -377,7 +391,11 @@ private:
                     sb << "recv(): message msgLen " << msgLen << " is invalid. "
                        << "Min " << kHeaderSize << " Max: " << MaxMessageSizeBytes;
                     const auto str = sb.str();
-                    LOG(0) << str;
+                    LOGV2(4615638,
+                          "recv(): message msgLen {msgLen} is invalid. Min: {min} Max: {max}",
+                          "msgLen"_attr = msgLen,
+                          "min"_attr = kHeaderSize,
+                          "max"_attr = MaxMessageSizeBytes);
 
                     return Future<Message>::makeReady(Status(ErrorCodes::ProtocolError, str));
                 }
@@ -634,13 +652,20 @@ private:
                 }
             };
             return doHandshake().then([this](size_t size) {
-                auto& sslPeerInfo = SSLPeerInfo::forSession(shared_from_this());
-
-                if (sslPeerInfo.subjectName.empty()) {
-                    sslPeerInfo = uassertStatusOK(getSSLManager()->parseAndValidatePeerCertificate(
-                        _sslSocket->native_handle(), _sslSocket->get_sni(), "", _remote));
+                if (SSLPeerInfo::forSession(shared_from_this()).subjectName.empty()) {
+                    return getSSLManager()
+                        ->parseAndValidatePeerCertificate(_sslSocket->native_handle(),
+                                                          _sslSocket->get_sni(),
+                                                          "",
+                                                          _remote,
+                                                          nullptr)
+                        .then([this](SSLPeerInfo info) -> bool {
+                            SSLPeerInfo::forSession(shared_from_this()) = info;
+                            return true;
+                        });
                 }
-                return true;
+
+                return Future<bool>::makeReady(true);
             });
         } else if (_tl->_sslMode() == SSLParams::SSLMode_requireSSL) {
             uasserted(ErrorCodes::SSLHandshakeFailed,
@@ -648,8 +673,11 @@ private:
         } else {
             if (!sslGlobalParams.disableNonSSLConnectionLogging &&
                 _tl->_sslMode() == SSLParams::SSLMode_preferSSL) {
-                LOG(0) << "SSL mode is set to 'preferred' and connection " << id() << " to "
-                       << remote() << " is not using SSL.";
+                LOGV2(23838,
+                      "SSL mode is set to 'preferred' and connection {id} to {remote} is not using "
+                      "SSL.",
+                      "id"_attr = id(),
+                      "remote"_attr = remote());
             }
             return Future<bool>::makeReady(false);
         }

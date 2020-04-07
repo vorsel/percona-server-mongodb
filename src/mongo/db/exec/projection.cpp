@@ -42,7 +42,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/record_id.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -117,12 +117,12 @@ auto rehydrateIndexKey(const BSONObj& keyPattern, const BSONObj& dehydratedKey) 
 }
 }  // namespace
 
-ProjectionStage::ProjectionStage(boost::intrusive_ptr<ExpressionContext> expCtx,
+ProjectionStage::ProjectionStage(ExpressionContext* expCtx,
                                  const BSONObj& projObj,
                                  WorkingSet* ws,
                                  std::unique_ptr<PlanStage> child,
                                  const char* stageType)
-    : PlanStage{expCtx->opCtx, std::move(child), stageType},
+    : PlanStage{expCtx, std::move(child), stageType},
       _projObj{expCtx->explain ? boost::make_optional(projObj.getOwned()) : boost::none},
       _ws{*ws} {}
 
@@ -141,7 +141,9 @@ PlanStage::StageState ProjectionStage::doWork(WorkingSetID* out) {
         // Punt to our specific projection impl.
         Status projStatus = transform(member);
         if (!projStatus.isOK()) {
-            warning() << "Couldn't execute projection, status = " << redact(projStatus);
+            LOGV2_WARNING(23827,
+                          "Couldn't execute projection, status = {projStatus}",
+                          "projStatus"_attr = redact(projStatus));
             *out = WorkingSetCommon::allocateStatusMember(&_ws, projStatus);
             return PlanStage::FAILURE;
         }
@@ -176,7 +178,7 @@ ProjectionStageDefault::ProjectionStageDefault(boost::intrusive_ptr<ExpressionCo
                                                const projection_ast::Projection* projection,
                                                WorkingSet* ws,
                                                std::unique_ptr<PlanStage> child)
-    : ProjectionStage{expCtx, projObj, ws, std::move(child), "PROJECTION_DEFAULT"},
+    : ProjectionStage{expCtx.get(), projObj, ws, std::move(child), "PROJECTION_DEFAULT"},
       _requestedMetadata{projection->metadataDeps()},
       _projectType{projection->type()},
       _executor{projection_executor::buildProjectionExecutor(
@@ -228,7 +230,7 @@ Status ProjectionStageDefault::transform(WorkingSetMember* member) const {
     return Status::OK();
 }
 
-ProjectionStageCovered::ProjectionStageCovered(boost::intrusive_ptr<ExpressionContext> expCtx,
+ProjectionStageCovered::ProjectionStageCovered(ExpressionContext* expCtx,
                                                const BSONObj& projObj,
                                                const projection_ast::Projection* projection,
                                                WorkingSet* ws,
@@ -285,7 +287,7 @@ Status ProjectionStageCovered::transform(WorkingSetMember* member) const {
     return Status::OK();
 }
 
-ProjectionStageSimple::ProjectionStageSimple(boost::intrusive_ptr<ExpressionContext> expCtx,
+ProjectionStageSimple::ProjectionStageSimple(ExpressionContext* expCtx,
                                              const BSONObj& projObj,
                                              const projection_ast::Projection* projection,
                                              WorkingSet* ws,

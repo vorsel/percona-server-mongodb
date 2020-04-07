@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2019 MongoDB, Inc.
+ * Public Domain 2014-2020 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -50,6 +50,12 @@ static void config_map_isolation(const char *, u_int *);
 static void config_pct(void);
 static void config_reset(void);
 static void config_transaction(void);
+
+/*
+ * We currently disable random LSM testing, that is, it can be specified explicitly but we won't
+ * randomly choose LSM as a data_source configuration.
+ */
+#define DISABLE_RANDOM_LSM_TESTING 1
 
 /*
  * config_setup --
@@ -106,14 +112,15 @@ config_setup(void)
             config_single("data_source=file", false);
             break;
         case 2: /* 20% */
-                /*
-                 * LSM requires a row-store and backing disk.
-                 *
-                 * Configuring truncation or timestamps results in LSM cache problems, don't
-                 * configure LSM if those set.
-                 *
-                 * XXX Remove the timestamp test when WT-4162 resolved.
-                 */
+#if !defined(DISABLE_RANDOM_LSM_TESTING)
+            /*
+             * LSM requires a row-store and backing disk.
+             *
+             * Configuring truncation or timestamps results in LSM cache problems, don't configure
+             * LSM if those set.
+             *
+             * XXX Remove the timestamp test when WT-4162 resolved.
+             */
             if (g.type != ROW || g.c_in_memory)
                 break;
             if (config_is_perm("transaction_timestamps") && g.c_txn_timestamps)
@@ -121,6 +128,7 @@ config_setup(void)
             if (config_is_perm("truncate") && g.c_truncate)
                 break;
             config_single("data_source=lsm", false);
+#endif
             break;
         case 3:
         case 4:
@@ -826,17 +834,35 @@ void
 config_file(const char *name)
 {
     FILE *fp;
-    char buf[256], *p;
+    char buf[256], *p, *t;
 
     if ((fp = fopen(name, "r")) == NULL)
         testutil_die(errno, "fopen: %s", name);
+
+    /*
+     * Skip leading Evergreen timestamps by skipping up to a closing brace and following whitespace.
+     * This is a little fragile: we're in trouble if Evergreen changes its timestamp format or if
+     * this program includes closing braces in its commands.
+     */
     while (fgets(buf, sizeof(buf), fp) != NULL) {
-        for (p = buf; *p != '\0' && *p != '\n'; ++p)
-            ;
-        *p = '\0';
-        if (buf[0] == '\0' || buf[0] == '#')
+        for (p = t = buf; *p != '\0'; ++p) {
+            if (*p == '\n') { /* Configuration end. */
+                *p = '\0';
+                break;
+            }
+            if (*p == '#') { /* Comment, skip the line */
+                t = p;
+                break;
+            }
+            if (t == buf && *p == ']') { /* Closing brace, configuration starts after it. */
+                while (isblank(*++p))
+                    ;
+                t = p--;
+            }
+        }
+        if (*t == '\0' || *t == '#')
             continue;
-        config_single(buf, true);
+        config_single(t, true);
     }
     fclose_and_clear(&fp);
 }

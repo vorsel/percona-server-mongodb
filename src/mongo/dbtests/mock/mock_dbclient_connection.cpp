@@ -43,22 +43,12 @@ using std::string;
 using std::vector;
 
 namespace mongo {
-MockDBClientConnection::MockDBClientConnection()
-    : _remoteServer(nullptr),
-      _isFailed(false),
-      _sockCreationTime(mongo::curTimeMicros64()),
-      _autoReconnect(false) {
-    _setServerRPCProtocols(rpc::supports::kAll);
-    _callIter = _mockCallResponses.begin();
-    _recvIter = _mockRecvResponses.begin();
-}
-
 MockDBClientConnection::MockDBClientConnection(MockRemoteDBServer* remoteServer, bool autoReconnect)
-    : _remoteServerInstanceID(remoteServer->getInstanceID()),
+    : DBClientConnection(autoReconnect),
+      _remoteServerInstanceID(remoteServer->getInstanceID()),
       _remoteServer(remoteServer),
-      _isFailed(false),
-      _sockCreationTime(mongo::curTimeMicros64()),
-      _autoReconnect(autoReconnect) {
+      _sockCreationTime(mongo::curTimeMicros64()) {
+    _setServerRPCProtocols(rpc::supports::kAll);
     _callIter = _mockCallResponses.begin();
     _recvIter = _mockRecvResponses.begin();
 }
@@ -75,6 +65,7 @@ bool MockDBClientConnection::connect(const char* hostName,
         return true;
     }
 
+    _failed.store(true);
     errmsg.assign("cannot connect to " + _remoteServer->getServerAddress());
     return false;
 }
@@ -101,7 +92,7 @@ std::pair<rpc::UniqueReply, DBClientBase*> MockDBClientConnection::runCommandWit
         }
         return {std::move(reply), this};
     } catch (const mongo::DBException&) {
-        _isFailed = true;
+        _failed.store(true);
         throw;
     }
 }  // namespace mongo
@@ -172,7 +163,7 @@ std::unique_ptr<mongo::DBClientCursor> MockDBClientConnection::query(
             this, BSONArray(resultsInCursor), provideResumeToken, batchSize));
         return cursor;
     } catch (const mongo::DBException&) {
-        _isFailed = true;
+        _failed.store(true);
         throw;
     }
 
@@ -182,10 +173,6 @@ std::unique_ptr<mongo::DBClientCursor> MockDBClientConnection::query(
 
 mongo::ConnectionString::ConnectionType MockDBClientConnection::type() const {
     return mongo::ConnectionString::CUSTOM;
-}
-
-bool MockDBClientConnection::isFailed() const {
-    return _isFailed;
 }
 
 string MockDBClientConnection::getServerAddress() const {
@@ -227,7 +214,7 @@ void MockDBClientConnection::remove(const string& ns, Query query, int flags) {
 }
 
 void MockDBClientConnection::killCursor(const NamespaceString& ns, long long cursorID) {
-    invariant(false);  // unimplemented
+    // It is not worth the bother of killing the cursor in the mock.
 }
 
 bool MockDBClientConnection::call(mongo::Message& toSend,
@@ -253,13 +240,26 @@ bool MockDBClientConnection::call(mongo::Message& toSend,
             return true;
         }
     }
+
+    auto killSessionOnDisconnect = makeGuard([this] { shutdown(); });
+
     stdx::unique_lock lk(_netMutex);
+    checkConnection();
+    if (!isStillConnected() || !_remoteServer->isRunning()) {
+        uasserted(ErrorCodes::SocketException, "Broken pipe in call");
+    }
 
     _lastSentMessage = toSend;
     _mockCallResponsesCV.wait(lk, [&] {
         _blockedOnNetwork = (_callIter == _mockCallResponses.end());
-        return !_blockedOnNetwork;
+        return !_blockedOnNetwork || !isStillConnected() || !_remoteServer->isRunning();
     });
+
+    uassert(ErrorCodes::HostUnreachable,
+            "Socket was shut down while in call",
+            isStillConnected() && _remoteServer->isRunning());
+
+    killSessionOnDisconnect.dismiss();
 
     const auto& swResponse = *_callIter;
     _callIter++;
@@ -268,17 +268,42 @@ bool MockDBClientConnection::call(mongo::Message& toSend,
 }
 
 Status MockDBClientConnection::recv(mongo::Message& m, int lastRequestId) {
+    auto killSessionOnDisconnect = makeGuard([this] { shutdown(); });
+
     stdx::unique_lock lk(_netMutex);
+    if (!isStillConnected() || !_remoteServer->isRunning()) {
+        return Status(ErrorCodes::SocketException, "Broken pipe in recv");
+    }
 
     _mockRecvResponsesCV.wait(lk, [&] {
         _blockedOnNetwork = (_recvIter == _mockRecvResponses.end());
-        return !_blockedOnNetwork;
+        return !_blockedOnNetwork || !isStillConnected() || !_remoteServer->isRunning();
     });
+
+    if (!isStillConnected() || !_remoteServer->isRunning()) {
+        return Status(ErrorCodes::HostUnreachable, "Socket was shut down while in recv");
+    }
+
+    killSessionOnDisconnect.dismiss();
 
     const auto& swResponse = *_recvIter;
     _recvIter++;
     m = uassertStatusOK(swResponse);
     return Status::OK();
+}
+
+void MockDBClientConnection::shutdown() {
+    stdx::lock_guard lk(_netMutex);
+    DBClientConnection::shutdown();
+    _mockCallResponsesCV.notify_all();
+    _mockRecvResponsesCV.notify_all();
+}
+
+void MockDBClientConnection::shutdownAndDisallowReconnect() {
+    stdx::lock_guard lk(_netMutex);
+    DBClientConnection::shutdownAndDisallowReconnect();
+    _mockCallResponsesCV.notify_all();
+    _mockRecvResponsesCV.notify_all();
 }
 
 void MockDBClientConnection::setCallResponses(Responses responses) {
@@ -310,14 +335,14 @@ bool MockDBClientConnection::lazySupported() const {
     return false;
 }
 
-double MockDBClientConnection::getSoTimeout() const {
-    return 0;
-}
-
 void MockDBClientConnection::checkConnection() {
-    if (_isFailed && _autoReconnect && _remoteServer->isRunning()) {
+    if (_failed.load()) {
+        uassert(ErrorCodes::SocketException, toString(), autoReconnect);
+        uassert(ErrorCodes::HostUnreachable,
+                "cannot connect to " + _remoteServer->getServerAddress(),
+                _remoteServer->isRunning());
         _remoteServerInstanceID = _remoteServer->getInstanceID();
-        _isFailed = false;
+        _failed.store(false);
     }
 }
 }  // namespace mongo

@@ -34,7 +34,7 @@
 #include "mongo/db/collection_index_builds_tracker.h"
 
 #include "mongo/db/catalog/index_builds_manager.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 
@@ -67,9 +67,7 @@ void CollectionIndexBuildsTracker::removeIndexBuild(
         _buildStateByIndexName.erase(indexName);
     }
 
-    if (_buildStateByBuildUUID.empty()) {
-        _noIndexBuildsRemainCondVar.notify_all();
-    }
+    _indexBuildFinishedCondVar.notify_all();
 }
 
 std::shared_ptr<ReplIndexBuildState> CollectionIndexBuildsTracker::getIndexBuildState(
@@ -85,6 +83,14 @@ bool CollectionIndexBuildsTracker::hasIndexBuildState(WithLock, StringData index
         return false;
     }
     return true;
+}
+
+std::vector<UUID> CollectionIndexBuildsTracker::getIndexBuildUUIDs(WithLock) const {
+    std::vector<UUID> buildUUIDs;
+    for (const auto& state : _buildStateByBuildUUID) {
+        buildUUIDs.push_back(state.first);
+    }
+    return buildUUIDs;
 }
 
 void CollectionIndexBuildsTracker::runOperationOnAllBuilds(
@@ -105,16 +111,32 @@ int CollectionIndexBuildsTracker::getNumberOfIndexBuilds(WithLock) const {
 }
 
 void CollectionIndexBuildsTracker::waitUntilNoIndexBuildsRemain(stdx::unique_lock<Latch>& lk) {
-    _noIndexBuildsRemainCondVar.wait(lk, [&] {
+    _indexBuildFinishedCondVar.wait(lk, [&] {
         if (_buildStateByBuildUUID.empty()) {
             return true;
         }
 
-        log() << "Waiting until the following index builds are finished:";
+        LOGV2(20425, "Waiting until the following index builds are finished:");
         for (const auto& indexBuild : _buildStateByBuildUUID) {
-            log() << "    Index build with UUID: " << indexBuild.first;
+            LOGV2(20426,
+                  "    Index build with UUID: {indexBuild_first}",
+                  "indexBuild_first"_attr = indexBuild.first);
         }
 
+        return false;
+    });
+}
+
+void CollectionIndexBuildsTracker::waitUntilIndexBuildFinished(stdx::unique_lock<Latch>& lk,
+                                                               const UUID& buildUUID) {
+    LOGV2(23867,
+          "Waiting until index build with UUID {buildUUID} is finished",
+          "buildUUID"_attr = buildUUID);
+
+    _indexBuildFinishedCondVar.wait(lk, [&] {
+        if (_buildStateByBuildUUID.find(buildUUID) == _buildStateByBuildUUID.end()) {
+            return true;
+        }
         return false;
     });
 }

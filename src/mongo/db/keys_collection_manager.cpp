@@ -41,9 +41,9 @@
 #include "mongo/db/logical_time.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 #include "mongo/util/time_support.h"
 
@@ -158,7 +158,7 @@ void KeysCollectionManager::stopMonitoring() {
     _refresher.stop();
 }
 
-void KeysCollectionManager::enableKeyGenerator(OperationContext* opCtx, bool doEnable) {
+void KeysCollectionManager::enableKeyGenerator(OperationContext* opCtx, bool doEnable) try {
     if (doEnable) {
         _refresher.switchFunc(opCtx, [this](OperationContext* opCtx) {
             KeyGenerator keyGenerator(_purpose, _client.get(), _keyValidForInterval);
@@ -181,6 +181,9 @@ void KeysCollectionManager::enableKeyGenerator(OperationContext* opCtx, bool doE
         _refresher.switchFunc(
             opCtx, [this](OperationContext* opCtx) { return _keysCache.refresh(opCtx); });
     }
+} catch (const ExceptionForCat<ErrorCategory::ShutdownError>& ex) {
+    LOGV2(518091, "{ex}, doEnable = {doEnable}", "ex"_attr = ex, "doEnable"_attr = doEnable);
+    return;
 }
 
 bool KeysCollectionManager::hasSeenKeys() {
@@ -293,7 +296,7 @@ void KeysCollectionManager::PeriodicRunner::_doPeriodicRefresh(ServiceContext* s
                     return _inShutdown || _refreshRequest;
                 });
         } catch (const DBException& e) {
-            LOG(1) << "Unable to wait for refresh request due to: " << e;
+            LOGV2_DEBUG(20705, 1, "Unable to wait for refresh request due to: {e}", "e"_attr = e);
 
             if (ErrorCodes::isShutdownError(e)) {
                 return;

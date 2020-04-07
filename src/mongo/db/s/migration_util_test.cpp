@@ -30,12 +30,16 @@
 #include "mongo/client/remote_command_targeter_factory_mock.h"
 #include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/catalog_raii.h"
+#include "mongo/db/s/catalog_cache_loader_mock.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/migration_util.h"
 #include "mongo/db/s/persistent_task_store.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
+#include "mongo/db/s/shard_server_catalog_cache_loader.h"
+#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/wait_for_majority_service.h"
+#include "mongo/s/catalog/sharding_catalog_client_mock.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/database_version_helpers.h"
 #include "mongo/s/shard_server_test_fixture.h"
@@ -57,7 +61,7 @@ protected:
 
         WaitForMajorityService::get(getServiceContext()).setUp(getServiceContext());
 
-        CatalogCacheLoader::get(operationContext()).initializeReplicaSetRole(true);
+        getCatalogCacheLoaderForFiltering(operationContext()).initializeReplicaSetRole(true);
 
         setupNShards(2);
     }
@@ -270,8 +274,9 @@ void addRangeToReceivingChunks(OperationContext* opCtx,
     std::ignore = CollectionShardingRuntime::get(opCtx, nss)->beginReceive(range);
 }
 
+template <typename ShardKey>
 RangeDeletionTask createDeletionTask(
-    NamespaceString nss, const UUID& uuid, int min, int max, bool pending = true) {
+    const NamespaceString& nss, const UUID& uuid, ShardKey min, ShardKey max, bool pending = true) {
     auto task = RangeDeletionTask(UUID::gen(),
                                   nss,
                                   uuid,
@@ -300,7 +305,7 @@ RangeDeletionTask createDeletionTask(
 //                                         |---------O [40 50)
 //           1    1    2    2    3    3    4    4    5
 // 0----5----0----5----0----5----0----5----0----5----0
-TEST_F(MigrationUtilsTest, TestOverlappingRangeQuery) {
+TEST_F(MigrationUtilsTest, TestOverlappingRangeQueryWithIntegerShardKey) {
     auto opCtx = operationContext();
     const auto uuid = UUID::gen();
 
@@ -357,6 +362,155 @@ TEST_F(MigrationUtilsTest, TestOverlappingRangeQuery) {
     ASSERT_FALSE(migrationutil::checkForConflictingDeletions(opCtx, range9, uuid));
 }
 
+TEST_F(MigrationUtilsTest, TestOverlappingRangeQueryWithCompoundShardKeyWhereFirstValueIsConstant) {
+    auto opCtx = operationContext();
+    const auto uuid = UUID::gen();
+
+    PersistentTaskStore<RangeDeletionTask> store(opCtx, NamespaceString::kRangeDeletionNamespace);
+
+    auto deletionTasks = {
+        createDeletionTask(
+            NamespaceString{"one"}, uuid, BSON("a" << 0 << "b" << 0), BSON("a" << 0 << "b" << 10)),
+        createDeletionTask(
+            NamespaceString{"two"}, uuid, BSON("a" << 0 << "b" << 10), BSON("a" << 0 << "b" << 20)),
+        createDeletionTask(
+            NamespaceString{"one"}, uuid, BSON("a" << 0 << "b" << 40), BSON("a" << 0 << "b" << 50)),
+    };
+
+    for (auto&& task : deletionTasks) {
+        store.add(opCtx, task);
+    }
+
+    ASSERT_EQ(store.count(opCtx), 3);
+
+    // 1. Non-overlapping range
+    auto range1 = ChunkRange{BSON("_id" << BSON("a" << 0 << "b" << 25)),
+                             BSON("_id" << BSON("a" << 0 << "b" << 35))};
+    auto results = store.count(opCtx, migrationutil::overlappingRangeQuery(range1, uuid));
+    ASSERT_EQ(results, 0);
+    ASSERT_FALSE(migrationutil::checkForConflictingDeletions(opCtx, range1, uuid));
+
+    // 2, 3. Find overlapping ranges, either direction.
+    auto range2 = ChunkRange{BSON("_id" << BSON("a" << 0 << "b" << 5)),
+                             BSON("_id" << BSON("a" << 0 << "b" << 15))};
+    results = store.count(opCtx, migrationutil::overlappingRangeQuery(range2, uuid));
+    ASSERT_EQ(results, 2);
+    ASSERT(migrationutil::checkForConflictingDeletions(opCtx, range2, uuid));
+
+    // 4. Identical range
+    auto range4 = ChunkRange{BSON("_id" << BSON("a" << 0 << "b" << 10)),
+                             BSON("_id" << BSON("a" << 0 << "b" << 20))};
+    results = store.count(opCtx, migrationutil::overlappingRangeQuery(range4, uuid));
+    ASSERT_EQ(results, 1);
+    ASSERT(migrationutil::checkForConflictingDeletions(opCtx, range4, uuid));
+
+    // 5, 6. Find overlapping edge, either direction.
+    auto range5 = ChunkRange{BSON("_id" << BSON("a" << 0 << "b" << 0)),
+                             BSON("_id" << BSON("a" << 0 << "b" << 5))};
+    results = store.count(opCtx, migrationutil::overlappingRangeQuery(range5, uuid));
+    ASSERT_EQ(results, 1);
+    ASSERT(migrationutil::checkForConflictingDeletions(opCtx, range5, uuid));
+    auto range6 = ChunkRange{BSON("_id" << BSON("a" << 0 << "b" << 5)),
+                             BSON("_id" << BSON("a" << 0 << "b" << 10))};
+    results = store.count(opCtx, migrationutil::overlappingRangeQuery(range6, uuid));
+    ASSERT_EQ(results, 1);
+    ASSERT(migrationutil::checkForConflictingDeletions(opCtx, range6, uuid));
+
+    // 7. Find fully enclosed range
+    auto range7 = ChunkRange{BSON("_id" << BSON("a" << 0 << "b" << 12)),
+                             BSON("_id" << BSON("a" << 0 << "b" << 18))};
+    results = store.count(opCtx, migrationutil::overlappingRangeQuery(range7, uuid));
+    ASSERT_EQ(results, 1);
+    ASSERT(migrationutil::checkForConflictingDeletions(opCtx, range7, uuid));
+
+    // 8, 9. Open max doesn't overlap closed min, either direction.
+    auto range8 = ChunkRange{BSON("_id" << BSON("a" << 0 << "b" << 30)),
+                             BSON("_id" << BSON("a" << 0 << "b" << 40))};
+    results = store.count(opCtx, migrationutil::overlappingRangeQuery(range8, uuid));
+    ASSERT_EQ(results, 0);
+    ASSERT_FALSE(migrationutil::checkForConflictingDeletions(opCtx, range8, uuid));
+    auto range9 = ChunkRange{BSON("_id" << BSON("a" << 0 << "b" << 20)),
+                             BSON("_id" << BSON("a" << 0 << "b" << 30))};
+    results = store.count(opCtx, migrationutil::overlappingRangeQuery(range9, uuid));
+    ASSERT_EQ(results, 0);
+    ASSERT_FALSE(migrationutil::checkForConflictingDeletions(opCtx, range9, uuid));
+}
+
+TEST_F(MigrationUtilsTest,
+       TestOverlappingRangeQueryWithCompoundShardKeyWhereSecondValueIsConstant) {
+    auto opCtx = operationContext();
+    const auto uuid = UUID::gen();
+
+    PersistentTaskStore<RangeDeletionTask> store(opCtx, NamespaceString::kRangeDeletionNamespace);
+
+    auto deletionTasks = {
+        createDeletionTask(
+            NamespaceString{"one"}, uuid, BSON("a" << 0 << "b" << 0), BSON("a" << 10 << "b" << 0)),
+        createDeletionTask(
+            NamespaceString{"two"}, uuid, BSON("a" << 10 << "b" << 0), BSON("a" << 20 << "b" << 0)),
+        createDeletionTask(
+            NamespaceString{"one"}, uuid, BSON("a" << 40 << "b" << 0), BSON("a" << 50 << "b" << 0)),
+    };
+
+    for (auto&& task : deletionTasks) {
+        store.add(opCtx, task);
+    }
+
+    ASSERT_EQ(store.count(opCtx), 3);
+
+    // 1. Non-overlapping range
+    auto range1 = ChunkRange{BSON("_id" << BSON("a" << 25 << "b" << 0)),
+                             BSON("_id" << BSON("a" << 35 << "b" << 0))};
+    auto results = store.count(opCtx, migrationutil::overlappingRangeQuery(range1, uuid));
+    ASSERT_EQ(results, 0);
+    ASSERT_FALSE(migrationutil::checkForConflictingDeletions(opCtx, range1, uuid));
+
+    // 2, 3. Find overlapping ranges, either direction.
+    auto range2 = ChunkRange{BSON("_id" << BSON("a" << 5 << "b" << 0)),
+                             BSON("_id" << BSON("a" << 15 << "b" << 0))};
+    results = store.count(opCtx, migrationutil::overlappingRangeQuery(range2, uuid));
+    ASSERT_EQ(results, 2);
+    ASSERT(migrationutil::checkForConflictingDeletions(opCtx, range2, uuid));
+
+    // 4. Identical range
+    auto range4 = ChunkRange{BSON("_id" << BSON("a" << 10 << "b" << 0)),
+                             BSON("_id" << BSON("a" << 20 << "b" << 0))};
+    results = store.count(opCtx, migrationutil::overlappingRangeQuery(range4, uuid));
+    ASSERT_EQ(results, 1);
+    ASSERT(migrationutil::checkForConflictingDeletions(opCtx, range4, uuid));
+
+    // 5, 6. Find overlapping edge, either direction.
+    auto range5 = ChunkRange{BSON("_id" << BSON("a" << 0 << "b" << 0)),
+                             BSON("_id" << BSON("a" << 5 << "b" << 0))};
+    results = store.count(opCtx, migrationutil::overlappingRangeQuery(range5, uuid));
+    ASSERT_EQ(results, 1);
+    ASSERT(migrationutil::checkForConflictingDeletions(opCtx, range5, uuid));
+    auto range6 = ChunkRange{BSON("_id" << BSON("a" << 5 << "b" << 0)),
+                             BSON("_id" << BSON("a" << 10 << "b" << 0))};
+    results = store.count(opCtx, migrationutil::overlappingRangeQuery(range6, uuid));
+    ASSERT_EQ(results, 1);
+    ASSERT(migrationutil::checkForConflictingDeletions(opCtx, range6, uuid));
+
+    // 7. Find fully enclosed range
+    auto range7 = ChunkRange{BSON("_id" << BSON("a" << 12 << "b" << 0)),
+                             BSON("_id" << BSON("a" << 18 << "b" << 0))};
+    results = store.count(opCtx, migrationutil::overlappingRangeQuery(range7, uuid));
+    ASSERT_EQ(results, 1);
+    ASSERT(migrationutil::checkForConflictingDeletions(opCtx, range7, uuid));
+
+    // 8, 9. Open max doesn't overlap closed min, either direction.
+    auto range8 = ChunkRange{BSON("_id" << BSON("a" << 30 << "b" << 0)),
+                             BSON("_id" << BSON("a" << 40 << "b" << 0))};
+    results = store.count(opCtx, migrationutil::overlappingRangeQuery(range8, uuid));
+    ASSERT_EQ(results, 0);
+    ASSERT_FALSE(migrationutil::checkForConflictingDeletions(opCtx, range8, uuid));
+    auto range9 = ChunkRange{BSON("_id" << BSON("a" << 20 << "b" << 0)),
+                             BSON("_id" << BSON("a" << 30 << "b" << 0))};
+    results = store.count(opCtx, migrationutil::overlappingRangeQuery(range9, uuid));
+    ASSERT_EQ(results, 0);
+    ASSERT_FALSE(migrationutil::checkForConflictingDeletions(opCtx, range9, uuid));
+}
+
 TEST_F(MigrationUtilsTest, TestInvalidUUID) {
     auto opCtx = operationContext();
     const auto uuid = UUID::gen();
@@ -376,22 +530,240 @@ TEST_F(MigrationUtilsTest, TestInvalidUUID) {
     ASSERT_FALSE(migrationutil::checkForConflictingDeletions(opCtx, range, wrongUuid));
 }
 
-using SubmitRangeDeletionTaskTest = MigrationUtilsTest;
+// Fixture that uses a mocked CatalogCacheLoader and CatalogClient to allow metadata refreshes
+// without using the mock network.
+class SubmitRangeDeletionTaskTest : public ShardServerTestFixture {
+public:
+    const HostAndPort kConfigHostAndPort{"dummy", 123};
+    const NamespaceString kNss{"test.foo"};
+    const ShardKeyPattern kShardKeyPattern = ShardKeyPattern(BSON("_id" << 1));
+    const UUID kDefaultUUID = UUID::gen();
+    const OID kEpoch = OID::gen();
+    const DatabaseType kDefaultDatabaseType =
+        DatabaseType(kNss.db().toString(), ShardId("0"), true, DatabaseVersion(kDefaultUUID, 1));
+    const std::vector<ShardType> kShardList = {ShardType("0", "Host0:12345"),
+                                               ShardType("1", "Host1:12345")};
+
+    void setUp() override {
+        // Don't call ShardServerTestFixture::setUp so we can install a mock catalog cache loader.
+        ShardingMongodTestFixture::setUp();
+
+        replicationCoordinator()->alwaysAllowWrites(true);
+        serverGlobalParams.clusterRole = ClusterRole::ShardServer;
+
+        _clusterId = OID::gen();
+        ShardingState::get(getServiceContext())->setInitialized(_myShardName, _clusterId);
+
+        std::unique_ptr<CatalogCacheLoaderMock> mockLoader =
+            std::make_unique<CatalogCacheLoaderMock>();
+        _mockCatalogCacheLoader = mockLoader.get();
+        CatalogCacheLoader::set(getServiceContext(), std::move(mockLoader));
+
+        uassertStatusOK(
+            initializeGlobalShardingStateForMongodForTest(ConnectionString(kConfigHostAndPort)));
+
+        configTargeterMock()->setFindHostReturnValue(kConfigHostAndPort);
+
+        WaitForMajorityService::get(getServiceContext()).setUp(getServiceContext());
+
+        // Set up 2 default shards.
+        for (const auto& shard : kShardList) {
+            std::unique_ptr<RemoteCommandTargeterMock> targeter(
+                std::make_unique<RemoteCommandTargeterMock>());
+            HostAndPort host(shard.getHost());
+            targeter->setConnectionStringReturnValue(ConnectionString(host));
+            targeter->setFindHostReturnValue(host);
+            targeterFactory()->addTargeterToReturn(ConnectionString(host), std::move(targeter));
+        }
+    }
+
+    void tearDown() override {
+        WaitForMajorityService::get(getServiceContext()).shutDown();
+        CatalogCacheLoader::clearForTests(getServiceContext());
+        ShardingMongodTestFixture::tearDown();
+        CollectionShardingStateFactory::clear(getServiceContext());
+    }
+
+    // Mock for the ShardingCatalogClient used to satisfy loading all shards for the ShardRegistry
+    // and loading all collections when a database is loaded for the first time by the CatalogCache.
+    class StaticCatalogClient final : public ShardingCatalogClientMock {
+    public:
+        StaticCatalogClient(std::vector<ShardType> shards)
+            : ShardingCatalogClientMock(nullptr), _shards(std::move(shards)) {}
+
+        StatusWith<repl::OpTimeWith<std::vector<ShardType>>> getAllShards(
+            OperationContext* opCtx, repl::ReadConcernLevel readConcern) override {
+            return repl::OpTimeWith<std::vector<ShardType>>(_shards);
+        }
+
+        StatusWith<std::vector<CollectionType>> getCollections(
+            OperationContext* opCtx,
+            const std::string* dbName,
+            repl::OpTime* optime,
+            repl::ReadConcernLevel readConcernLevel) override {
+            return _colls;
+        }
+
+        void setCollections(std::vector<CollectionType> colls) {
+            _colls = std::move(colls);
+        }
+
+    private:
+        const std::vector<ShardType> _shards;
+        std::vector<CollectionType> _colls;
+    };
+
+    UUID createCollectionAndGetUUID(const NamespaceString& nss) {
+        DBDirectClient client(operationContext());
+        client.createCollection(nss.ns());
+
+        AutoGetCollection autoColl(operationContext(), kNss, MODE_IX);
+        return autoColl.getCollection()->uuid();
+    }
+
+    std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient(
+        std::unique_ptr<DistLockManager> distLockManager) override {
+        auto mockCatalogClient = std::make_unique<StaticCatalogClient>(kShardList);
+        // Stash a pointer to the mock so its return values can be set.
+        _mockCatalogClient = mockCatalogClient.get();
+        return mockCatalogClient;
+    }
+
+    CollectionType makeCollectionType(UUID uuid, OID epoch) {
+        CollectionType coll;
+        coll.setNs(kNss);
+        coll.setEpoch(epoch);
+        coll.setKeyPattern(kShardKeyPattern.getKeyPattern());
+        coll.setUnique(true);
+        coll.setUUID(uuid);
+        return coll;
+    }
+
+    std::vector<ChunkType> makeChangedChunks(ChunkVersion startingVersion) {
+        ChunkType chunk1(kNss,
+                         {kShardKeyPattern.getKeyPattern().globalMin(), BSON("_id" << -100)},
+                         startingVersion,
+                         {"0"});
+        chunk1.setName(OID::gen());
+        startingVersion.incMinor();
+
+        ChunkType chunk2(kNss, {BSON("_id" << -100), BSON("_id" << 0)}, startingVersion, {"1"});
+        chunk2.setName(OID::gen());
+        startingVersion.incMinor();
+
+        ChunkType chunk3(kNss, {BSON("_id" << 0), BSON("_id" << 100)}, startingVersion, {"0"});
+        chunk3.setName(OID::gen());
+        startingVersion.incMinor();
+
+        ChunkType chunk4(kNss,
+                         {BSON("_id" << 100), kShardKeyPattern.getKeyPattern().globalMax()},
+                         startingVersion,
+                         {"1"});
+        chunk4.setName(OID::gen());
+        startingVersion.incMinor();
+
+        return std::vector<ChunkType>{chunk1, chunk2, chunk3, chunk4};
+    }
+
+    CatalogCacheLoaderMock* _mockCatalogCacheLoader;
+    StaticCatalogClient* _mockCatalogClient;
+};
+
+TEST_F(SubmitRangeDeletionTaskTest,
+       FailsAndDeletesTaskIfFilteringMetadataIsUnknownEvenAfterRefresh) {
+    auto opCtx = operationContext();
+
+    auto deletionTask = createDeletionTask(kNss, kDefaultUUID, 0, 10);
+
+    PersistentTaskStore<RangeDeletionTask> store(opCtx, NamespaceString::kRangeDeletionNamespace);
+    store.add(opCtx, deletionTask);
+    ASSERT_EQ(store.count(opCtx), 1);
+
+    // Make the refresh triggered by submitting the task return an empty result when loading the
+    // database.
+    _mockCatalogCacheLoader->setDatabaseRefreshReturnValue(
+        Status(ErrorCodes::NamespaceNotFound, "dummy errmsg"));
+
+    auto cleanupCompleteFuture = migrationutil::submitRangeDeletionTask(opCtx, deletionTask);
+
+    // The task should not have been submitted, and the task's entry should have been removed from
+    // the persistent store.
+    ASSERT_THROWS_CODE(cleanupCompleteFuture.get(opCtx),
+                       AssertionException,
+                       ErrorCodes::RangeDeletionAbandonedBecauseCollectionWithUUIDDoesNotExist);
+    ASSERT_EQ(store.count(opCtx), 0);
+}
+
+TEST_F(SubmitRangeDeletionTaskTest, FailsAndDeletesTaskIfNamespaceIsUnshardedEvenAfterRefresh) {
+    auto opCtx = operationContext();
+
+    auto deletionTask = createDeletionTask(kNss, kDefaultUUID, 0, 10);
+
+    PersistentTaskStore<RangeDeletionTask> store(opCtx, NamespaceString::kRangeDeletionNamespace);
+    store.add(opCtx, deletionTask);
+    ASSERT_EQ(store.count(opCtx), 1);
+
+    // Make the refresh triggered by submitting the task return an empty result when loading the
+    // collection so it is considered unsharded.
+    _mockCatalogCacheLoader->setDatabaseRefreshReturnValue(kDefaultDatabaseType);
+    _mockCatalogCacheLoader->setCollectionRefreshReturnValue(
+        Status(ErrorCodes::NamespaceNotFound, "dummy errmsg"));
+
+    auto cleanupCompleteFuture = migrationutil::submitRangeDeletionTask(opCtx, deletionTask);
+
+    // The task should not have been submitted, and the task's entry should have been removed from
+    // the persistent store.
+    ASSERT_THROWS_CODE(cleanupCompleteFuture.get(opCtx),
+                       AssertionException,
+                       ErrorCodes::RangeDeletionAbandonedBecauseCollectionWithUUIDDoesNotExist);
+    ASSERT_EQ(store.count(opCtx), 0);
+}
+
+TEST_F(SubmitRangeDeletionTaskTest,
+       FailsAndDeletesTaskIfNamespaceIsUnshardedBeforeAndAfterRefresh) {
+    auto opCtx = operationContext();
+
+    auto deletionTask = createDeletionTask(kNss, kDefaultUUID, 0, 10);
+
+    PersistentTaskStore<RangeDeletionTask> store(opCtx, NamespaceString::kRangeDeletionNamespace);
+    store.add(opCtx, deletionTask);
+    ASSERT_EQ(store.count(opCtx), 1);
+
+    // Mock an empty result for the task's collection and force a refresh so the node believes the
+    // collection is unsharded.
+    _mockCatalogCacheLoader->setDatabaseRefreshReturnValue(kDefaultDatabaseType);
+    _mockCatalogCacheLoader->setCollectionRefreshReturnValue(
+        Status(ErrorCodes::NamespaceNotFound, "dummy errmsg"));
+    forceShardFilteringMetadataRefresh(opCtx, kNss, true);
+
+    auto cleanupCompleteFuture = migrationutil::submitRangeDeletionTask(opCtx, deletionTask);
+
+    // The task should not have been submitted, and the task's entry should have been removed from
+    // the persistent store.
+    ASSERT_THROWS_CODE(cleanupCompleteFuture.get(opCtx),
+                       AssertionException,
+                       ErrorCodes::RangeDeletionAbandonedBecauseCollectionWithUUIDDoesNotExist);
+    ASSERT_EQ(store.count(opCtx), 0);
+}
 
 TEST_F(SubmitRangeDeletionTaskTest, SucceedsIfFilteringMetadataUUIDMatchesTaskUUID) {
     auto opCtx = operationContext();
 
-    const auto uuid = UUID::gen();
-    auto deletionTask = createDeletionTask(kNss, uuid, 0, 10);
+    auto collectionUUID = createCollectionAndGetUUID(kNss);
+    auto deletionTask = createDeletionTask(kNss, collectionUUID, 0, 10);
 
     // Force a metadata refresh with the task's UUID before the task is submitted.
-    auto result =
-        stdx::async(stdx::launch::async, [this, uuid] { respondToMetadataRefreshRequests(uuid); });
+    auto coll = makeCollectionType(collectionUUID, kEpoch);
+    _mockCatalogCacheLoader->setDatabaseRefreshReturnValue(kDefaultDatabaseType);
+    _mockCatalogCacheLoader->setCollectionRefreshReturnValue(coll);
+    _mockCatalogCacheLoader->setChunkRefreshReturnValue(
+        makeChangedChunks(ChunkVersion(1, 0, kEpoch)));
+    _mockCatalogClient->setCollections({coll});
     forceShardFilteringMetadataRefresh(opCtx, kNss, true);
 
     // The task should have been submitted successfully.
-    auto submitTaskFuture = migrationutil::submitRangeDeletionTask(opCtx, deletionTask);
-    ASSERT(submitTaskFuture.get(opCtx));
+    auto cleanupCompleteFuture = migrationutil::submitRangeDeletionTask(opCtx, deletionTask);
+    cleanupCompleteFuture.get(opCtx);
 }
 
 TEST_F(
@@ -399,16 +771,46 @@ TEST_F(
     SucceedsIfFilteringMetadataInitiallyUnknownButFilteringMetadataUUIDMatchesTaskUUIDAfterRefresh) {
     auto opCtx = operationContext();
 
-    const auto uuid = UUID::gen();
-    auto deletionTask = createDeletionTask(kNss, uuid, 0, 10);
+    auto collectionUUID = createCollectionAndGetUUID(kNss);
+    auto deletionTask = createDeletionTask(kNss, collectionUUID, 0, 10);
 
     // Make the refresh triggered by submitting the task return a UUID that matches the task's UUID.
-    auto result =
-        stdx::async(stdx::launch::async, [this, uuid] { respondToMetadataRefreshRequests(uuid); });
+    auto coll = makeCollectionType(collectionUUID, kEpoch);
+    _mockCatalogCacheLoader->setDatabaseRefreshReturnValue(kDefaultDatabaseType);
+    _mockCatalogCacheLoader->setCollectionRefreshReturnValue(coll);
+    _mockCatalogCacheLoader->setChunkRefreshReturnValue(
+        makeChangedChunks(ChunkVersion(1, 0, kEpoch)));
+    _mockCatalogClient->setCollections({coll});
 
     // The task should have been submitted successfully.
-    auto submitTaskFuture = migrationutil::submitRangeDeletionTask(opCtx, deletionTask);
-    ASSERT(submitTaskFuture.get(opCtx));
+    auto cleanupCompleteFuture = migrationutil::submitRangeDeletionTask(opCtx, deletionTask);
+    cleanupCompleteFuture.get(opCtx);
+}
+
+TEST_F(SubmitRangeDeletionTaskTest,
+       SucceedsIfTaskNamespaceInitiallyUnshardedButUUIDMatchesAfterRefresh) {
+    auto opCtx = operationContext();
+
+    // Force a metadata refresh with no collection entry so the node believes the namespace is
+    // unsharded when the task is submitted.
+    _mockCatalogCacheLoader->setDatabaseRefreshReturnValue(kDefaultDatabaseType);
+    _mockCatalogCacheLoader->setCollectionRefreshReturnValue(
+        Status(ErrorCodes::NamespaceNotFound, "dummy errmsg"));
+    forceShardFilteringMetadataRefresh(opCtx, kNss, true);
+
+    auto collectionUUID = createCollectionAndGetUUID(kNss);
+    auto deletionTask = createDeletionTask(kNss, collectionUUID, 0, 10);
+
+    // Make the refresh triggered by submitting the task return a UUID that matches the task's UUID.
+    auto matchingColl = makeCollectionType(collectionUUID, kEpoch);
+    _mockCatalogCacheLoader->setCollectionRefreshReturnValue(matchingColl);
+    _mockCatalogCacheLoader->setChunkRefreshReturnValue(
+        makeChangedChunks(ChunkVersion(10, 0, kEpoch)));
+    _mockCatalogClient->setCollections({matchingColl});
+
+    // The task should have been submitted successfully.
+    auto cleanupCompleteFuture = migrationutil::submitRangeDeletionTask(opCtx, deletionTask);
+    cleanupCompleteFuture.get(opCtx);
 }
 
 TEST_F(SubmitRangeDeletionTaskTest,
@@ -417,41 +819,56 @@ TEST_F(SubmitRangeDeletionTaskTest,
 
     // Force a metadata refresh with an arbitrary UUID so that the node's filtering metadata is
     // stale when the task is submitted.
-    auto result1 = stdx::async(stdx::launch::async, [this] { respondToMetadataRefreshRequests(); });
+    const auto staleUUID = UUID::gen();
+    const auto staleEpoch = OID::gen();
+    auto staleColl = makeCollectionType(staleUUID, staleEpoch);
+    _mockCatalogCacheLoader->setDatabaseRefreshReturnValue(kDefaultDatabaseType);
+    _mockCatalogCacheLoader->setCollectionRefreshReturnValue(staleColl);
+    _mockCatalogCacheLoader->setChunkRefreshReturnValue(
+        makeChangedChunks(ChunkVersion(1, 0, staleEpoch)));
+    _mockCatalogClient->setCollections({staleColl});
     forceShardFilteringMetadataRefresh(opCtx, kNss, true);
 
-    const auto uuid = UUID::gen();
-    auto deletionTask = createDeletionTask(kNss, uuid, 0, 10);
+    auto collectionUUID = createCollectionAndGetUUID(kNss);
+    auto deletionTask = createDeletionTask(kNss, collectionUUID, 0, 10);
 
     // Make the refresh triggered by submitting the task return a UUID that matches the task's UUID.
-    auto result2 = stdx::async(stdx::launch::async, [this, uuid] {
-        respondToMetadataRefreshRequests(uuid, true /* incrementalRefresh */);
-    });
+    auto matchingColl = makeCollectionType(collectionUUID, kEpoch);
+    _mockCatalogCacheLoader->setCollectionRefreshReturnValue(matchingColl);
+    _mockCatalogCacheLoader->setChunkRefreshReturnValue(
+        makeChangedChunks(ChunkVersion(10, 0, kEpoch)));
+    _mockCatalogClient->setCollections({matchingColl});
 
     // The task should have been submitted successfully.
-    auto submitTaskFuture = migrationutil::submitRangeDeletionTask(opCtx, deletionTask);
-    ASSERT(submitTaskFuture.get(opCtx));
+    auto cleanupCompleteFuture = migrationutil::submitRangeDeletionTask(opCtx, deletionTask);
+    cleanupCompleteFuture.get(opCtx);
 }
 
 TEST_F(SubmitRangeDeletionTaskTest,
        FailsAndDeletesTaskIfFilteringMetadataUUIDDifferentFromTaskUUIDEvenAfterRefresh) {
     auto opCtx = operationContext();
 
-    const auto uuid = UUID::gen();
-    auto deletionTask = createDeletionTask(kNss, uuid, 0, 10);
+    auto deletionTask = createDeletionTask(kNss, kDefaultUUID, 0, 10);
 
     PersistentTaskStore<RangeDeletionTask> store(opCtx, NamespaceString::kRangeDeletionNamespace);
     store.add(opCtx, deletionTask);
     ASSERT_EQ(store.count(opCtx), 1);
 
     // Make the refresh triggered by submitting the task return an arbitrary UUID.
-    auto result2 =
-        stdx::async(stdx::launch::async, [this, uuid] { respondToMetadataRefreshRequests(); });
+    const auto otherEpoch = OID::gen();
+    auto otherColl = makeCollectionType(UUID::gen(), otherEpoch);
+    _mockCatalogCacheLoader->setDatabaseRefreshReturnValue(kDefaultDatabaseType);
+    _mockCatalogCacheLoader->setCollectionRefreshReturnValue(otherColl);
+    _mockCatalogCacheLoader->setChunkRefreshReturnValue(
+        makeChangedChunks(ChunkVersion(1, 0, otherEpoch)));
+    _mockCatalogClient->setCollections({otherColl});
 
     // The task should not have been submitted, and the task's entry should have been removed from
     // the persistent store.
-    auto submitTaskFuture = migrationutil::submitRangeDeletionTask(opCtx, deletionTask);
-    ASSERT_FALSE(submitTaskFuture.get(opCtx));
+    auto cleanupCompleteFuture = migrationutil::submitRangeDeletionTask(opCtx, deletionTask);
+    ASSERT_THROWS_CODE(cleanupCompleteFuture.get(opCtx),
+                       AssertionException,
+                       ErrorCodes::RangeDeletionAbandonedBecauseCollectionWithUUIDDoesNotExist);
     ASSERT_EQ(store.count(opCtx), 0);
 }
 

@@ -40,7 +40,7 @@
 #include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/pipeline/document_path_support.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 using namespace fmt::literals;
@@ -283,17 +283,35 @@ DocumentSourceMergeSpec parseMergeSpecAndResolveTargetNamespace(const BSONElemen
 
     return mergeSpec;
 }
+
+/**
+ * Converts an array of field names into a set of FieldPath. Throws if 'fields' contains
+ * duplicate elements.
+ */
+boost::optional<std::set<FieldPath>> convertToFieldPaths(
+    const boost::optional<std::vector<std::string>>& fields) {
+
+    if (!fields)
+        return boost::none;
+
+    std::set<FieldPath> fieldPaths;
+
+    for (const auto& field : *fields) {
+        const auto res = fieldPaths.insert(FieldPath(field));
+        uassert(31465, str::stream() << "Found a duplicate field '" << field << "'", res.second);
+    }
+    return fieldPaths;
+}
 }  // namespace
 
 std::unique_ptr<DocumentSourceMerge::LiteParsed> DocumentSourceMerge::LiteParsed::parse(
-    const AggregationRequest& request, const BSONElement& spec) {
+    const NamespaceString& nss, const BSONElement& spec) {
     uassert(ErrorCodes::TypeMismatch,
             "{} requires a string or object argument, but found {}"_format(kStageName,
                                                                            typeName(spec.type())),
             spec.type() == BSONType::String || spec.type() == BSONType::Object);
 
-    auto mergeSpec =
-        parseMergeSpecAndResolveTargetNamespace(spec, request.getNamespaceString().db());
+    auto mergeSpec = parseMergeSpecAndResolveTargetNamespace(spec, nss.db());
     auto targetNss = mergeSpec.getTargetNss();
 
     uassert(ErrorCodes::InvalidNamespace,
@@ -310,16 +328,28 @@ std::unique_ptr<DocumentSourceMerge::LiteParsed> DocumentSourceMerge::LiteParsed
                                       MergeWhenMatchedMode_serializer(whenMatched),
                                       MergeWhenNotMatchedMode_serializer(whenNotMatched)),
             isSupportedMergeMode(whenMatched, whenNotMatched));
+    boost::optional<LiteParsedPipeline> liteParsedPipeline;
+    if (whenMatched == MergeWhenMatchedModeEnum::kPipeline) {
+        auto pipeline = mergeSpec.getWhenMatched()->pipeline;
+        invariant(pipeline);
+        liteParsedPipeline = LiteParsedPipeline(nss, *pipeline);
+    }
+    return std::make_unique<DocumentSourceMerge::LiteParsed>(spec.fieldName(),
+                                                             std::move(targetNss),
+                                                             whenMatched,
+                                                             whenNotMatched,
+                                                             std::move(liteParsedPipeline));
+}
 
-    auto actions = ActionSet{getDescriptors().at({whenMatched, whenNotMatched}).actions};
-    if (request.shouldBypassDocumentValidation()) {
+PrivilegeVector DocumentSourceMerge::LiteParsed::requiredPrivileges(
+    bool isMongos, bool bypassDocumentValidation) const {
+    invariant(_foreignNss);
+    auto actions = ActionSet{getDescriptors().at({_whenMatched, _whenNotMatched}).actions};
+    if (bypassDocumentValidation) {
         actions.addAction(ActionType::bypassDocumentValidation);
     }
 
-    PrivilegeVector privileges{{ResourcePattern::forExactNamespace(targetNss), actions}};
-
-    return std::make_unique<DocumentSourceMerge::LiteParsed>(std::move(targetNss),
-                                                             std::move(privileges));
+    return {{ResourcePattern::forExactNamespace(*_foreignNss), actions}};
 }
 
 DocumentSourceMerge::DocumentSourceMerge(NamespaceString outputNs,
@@ -422,9 +452,10 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceMerge::createFromBson(
         mergeSpec.getWhenMatched() ? mergeSpec.getWhenMatched()->mode : kDefaultWhenMatched;
     auto whenNotMatched = mergeSpec.getWhenNotMatched().value_or(kDefaultWhenNotMatched);
     auto pipeline = mergeSpec.getWhenMatched() ? mergeSpec.getWhenMatched()->pipeline : boost::none;
+    auto fieldPaths = convertToFieldPaths(mergeSpec.getOn());
     auto [mergeOnFields, targetCollectionVersion] =
         expCtx->mongoProcessInterface->ensureFieldsUniqueOrResolveDocumentKey(
-            expCtx, mergeSpec.getOn(), mergeSpec.getTargetCollectionVersion(), targetNss);
+            expCtx, std::move(fieldPaths), mergeSpec.getTargetCollectionVersion(), targetNss);
 
     return DocumentSourceMerge::create(std::move(targetNss),
                                        expCtx,
@@ -485,8 +516,9 @@ void DocumentSourceMerge::waitWhileFailPointEnabled() {
         pExpCtx->opCtx,
         "hangWhileBuildingDocumentSourceMergeBatch",
         []() {
-            log() << "Hanging aggregation due to 'hangWhileBuildingDocumentSourceMergeBatch' "
-                  << "failpoint";
+            LOGV2(
+                20900,
+                "Hanging aggregation due to 'hangWhileBuildingDocumentSourceMergeBatch' failpoint");
         });
 }
 

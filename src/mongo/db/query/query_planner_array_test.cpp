@@ -2384,9 +2384,9 @@ TEST_F(QueryPlannerTest, CantExplodeMultikeyIxscanForSort) {
 
     assertNumSolutions(1U);
     assertSolutionExists(
-        "{sort: {pattern: {b: 1}, limit: 0, node: {sortKeyGen: {node: "
+        "{sort: {pattern: {b: 1}, limit: 0, type: 'simple', node:"
         "{fetch: {filter: null, node: {ixscan: {pattern: {a: 1, b: 1}, filter: null, bounds: {a: "
-        "[[1,1,true,true], [2,2,true,true]], b: [['MinKey','MaxKey',true,true]]}}}}}}}}}");
+        "[[1,1,true,true], [2,2,true,true]], b: [['MinKey','MaxKey',true,true]]}}}}}}}");
 }
 
 TEST_F(QueryPlannerTest, CantExplodeMultikeyIxscanForSortWithPathLevelMultikeyMetadata) {
@@ -2398,9 +2398,9 @@ TEST_F(QueryPlannerTest, CantExplodeMultikeyIxscanForSortWithPathLevelMultikeyMe
 
     assertNumSolutions(1U);
     assertSolutionExists(
-        "{sort: {pattern: {'b.c': 1}, limit: 0, node: {sortKeyGen: {node: "
+        "{sort: {pattern: {'b.c': 1}, limit: 0, type: 'simple', node: "
         "{fetch: {filter: null, node: {ixscan: {pattern: {a: 1, 'b.c': 1}, filter: null, bounds: "
-        "{a: [[1,1,true,true], [2,2,true,true]], 'b.c': [['MinKey','MaxKey',true,true]]}}}}}}}}}");
+        "{a: [[1,1,true,true], [2,2,true,true]], 'b.c': [['MinKey','MaxKey',true,true]]}}}}}}}");
 }
 
 TEST_F(QueryPlannerTest, CanExplodeMultikeyIndexScanForSortWhenSortFieldsAreNotMultikey) {
@@ -2417,6 +2417,71 @@ TEST_F(QueryPlannerTest, CanExplodeMultikeyIndexScanForSortWhenSortFieldsAreNotM
         "bounds: {a: [[1,1,true,true]], 'b.c': [['MinKey','MaxKey',true,true]]}}},"
         "{ixscan: {pattern: {a: 1, 'b.c': 1}, filter: null,"
         "bounds: {a: [[2,2,true,true]], 'b.c': [['MinKey','MaxKey',true,true]]}}}]}}}}");
+}
+
+TEST_F(QueryPlannerTest, MultikeyIndexScanWithMinKeyMaxKeyBoundsCanProvideSort) {
+    params.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
+    MultikeyPaths multikeyPaths{{0U}};
+    addIndex(BSON("a" << 1), multikeyPaths);
+    runQueryAsCommand(fromjson("{sort: {a: 1}}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{fetch: {node: {ixscan: {pattern: {a: 1}, bounds: {a: "
+        "[['MinKey','MaxKey',true,true]]}}}}}");
+}
+
+TEST_F(QueryPlannerTest, MultikeyIndexScanWithBoundsOnIndexWithoutSharedPrefixCanProvideSort) {
+    params.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
+    MultikeyPaths multikeyPaths{{0U}, {0U}};
+    addIndex(BSON("a" << 1 << "b" << 1), multikeyPaths);
+    runQueryAsCommand(fromjson("{filter: {b : {$gte: 3}}, sort: {a: 1}}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{fetch: {filter: {b: {$gte: 3}}, node: {ixscan: {pattern: {a: 1, b: 1}, bounds: {a: "
+        "[['MinKey','MaxKey',true,true]], b: [['MinKey','MaxKey',true,true]]}}}}}");
+}
+
+TEST_F(QueryPlannerTest,
+       MultikeyIndexScanWithBoundsOnIndexWithoutSharedPrefixCanProvideSortDifferentIndex) {
+    params.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
+    MultikeyPaths multikeyPaths{{0U}, {0U}};
+    addIndex(BSON("a" << 1 << "b" << 1), multikeyPaths);
+    runQueryAsCommand(fromjson("{filter: {a : {$eq: 3}}, sort: {b: 1}}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{fetch: {node: {ixscan: {pattern: {a: 1, b: 1}, bounds: {a: "
+        "[[3,3,true,true]], b: [['MinKey','MaxKey',true,true]]}}}}}");
+}
+
+TEST_F(QueryPlannerTest,
+       MultikeyIndexScanWithFilterAndSortOnFieldsThatSharePrefixCannotProvideSort) {
+    params.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
+    MultikeyPaths multikeyPaths{{0U}, {0U}};
+    addIndex(BSON("a" << 1 << "a.b" << 1), multikeyPaths);
+    runQueryAsCommand(fromjson("{filter: {a : {$gte: 3}}, sort: {'a.b': 1}}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{sort: {pattern: {'a.b': 1}, limit: 0, type: 'simple', node: "
+        "{fetch: {filter: null, node: {ixscan: {pattern: {a: 1, 'a.b': 1}, filter: null, bounds: "
+        "{a: [[3, Infinity, true,true]], 'a.b': [['MinKey','MaxKey',true,true]]}}}}}}}");
+}
+
+TEST_F(QueryPlannerTest,
+       MultikeyIndexScanWithFilterAndSortOnFieldsThatSharePrefixCannotProvideSortDifferentIndex) {
+    params.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
+    MultikeyPaths multikeyPaths{{0U, 1U}, {0U}};
+    addIndex(BSON("a.b" << 1 << "a" << 1), multikeyPaths);
+    runQueryAsCommand(fromjson("{filter: {'a.b' : {$gte: 3}}, sort: {a: 1}}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{sort: {pattern: {a: 1}, limit: 0, type: 'simple', node: "
+        "{fetch: {filter: null, node: {ixscan: {pattern: {'a.b': 1, a: 1}, filter: null, bounds: "
+        "{'a.b': [[3, Infinity, true,true]], a: [['MinKey','MaxKey',true,true]]}}}}}}}");
 }
 
 TEST_F(QueryPlannerTest, ElemMatchValueNENull) {
@@ -2631,53 +2696,47 @@ TEST_F(QueryPlannerTest, MustFetchBeforeDottedMultiKeyPathSort) {
 
     assertNumSolutions(3U);
     assertSolutionExists(
-        "{sort: {pattern: {'a.x': 1}, limit: 0, node: {sortKeyGen: {node: {cscan: {dir: 1}}}}}}");
+        "{sort: {pattern: {'a.x': 1}, limit: 0, type: 'simple', node: {cscan: {dir: 1}}}}");
     assertSolutionExists(
         "{sort: {"
         "  pattern: {'a.x': 1},"
         "  limit: 0,"
+        "  type: 'simple',"
         "  node: {"
-        "    sortKeyGen: {"
-        "      node: {"
-        "        fetch: {"
-        "          filter: {'a.x': 4},"
-        "          node: {"
-        "            ixscan: {"
-        "              filter: null, "
-        "              pattern: {'a.x': 1},"
-        "              bounds: {"
-        "                'a.x': [['MinKey', 'MaxKey', true, true]]"
-        "              },"
-        "              dir: 1"
-        "            }"
-        "          }"
-        "        }"
-        "      }"
-        "    }"
+        "   fetch: {"
+        "     filter: {'a.x': 4},"
+        "     node: {"
+        "       ixscan: {"
+        "         filter: null, "
+        "         pattern: {'a.x': 1},"
+        "         bounds: {"
+        "           'a.x': [['MinKey', 'MaxKey', true, true]]"
+        "         },"
+        "         dir: 1"
+        "       }"
+        "     }"
+        "   }"
         "  }"
         "}}");
     assertSolutionExists(
         "{sort: {"
         "  pattern: {'a.x': 1},"
         "  limit: 0,"
+        "  type: 'simple',"
         "  node: {"
-        "    sortKeyGen: {"
-        "      node: {"
-        "        fetch: {"
-        "          filter: null,"
-        "          node: {"
-        "            ixscan: {"
-        "              filter: null, "
-        "              pattern: {'a.x': 1},"
-        "              bounds: {"
-        "                'a.x': [[4, 4, true, true]]"
-        "              },"
-        "              dir: 1"
-        "            }"
-        "          }"
-        "        }"
-        "      }"
-        "    }"
+        "   fetch: {"
+        "     filter: null,"
+        "     node: {"
+        "       ixscan: {"
+        "         filter: null, "
+        "         pattern: {'a.x': 1},"
+        "         bounds: {"
+        "           'a.x': [[4, 4, true, true]]"
+        "         },"
+        "         dir: 1"
+        "       }"
+        "     }"
+        "   }"
         "  }"
         "}}");
 
@@ -2686,29 +2745,26 @@ TEST_F(QueryPlannerTest, MustFetchBeforeDottedMultiKeyPathSort) {
 
     assertNumSolutions(2U);
     assertSolutionExists(
-        "{sort: {pattern: {'a.x': 1}, limit: 0, node: {sortKeyGen: {node: {cscan: {dir: 1}}}}}}");
+        "{sort: {pattern: {'a.x': 1}, limit: 0, type: 'simple', node: {cscan: {dir: 1}}}}");
     assertSolutionExists(
         "{sort: {"
         "  pattern: {'a.x': 1},"
         "  limit: 0,"
+        "  type: 'simple',"
         "  node: {"
-        "    sortKeyGen: {"
-        "      node: {"
-        "        fetch: {"
-        "          filter: null,"
-        "          node: {"
-        "            ixscan: {"
-        "              filter: null, "
-        "              pattern: {'a.x': 1},"
-        "              bounds: {"
-        "                'a.x': [['MinKey', 'MaxKey', true, true]]"
-        "              },"
-        "              dir: 1"
-        "            }"
-        "          }"
-        "        }"
-        "      }"
-        "    }"
+        "   fetch: {"
+        "     filter: null,"
+        "     node: {"
+        "       ixscan: {"
+        "         filter: null, "
+        "         pattern: {'a.x': 1},"
+        "         bounds: {"
+        "           'a.x': [['MinKey', 'MaxKey', true, true]]"
+        "         },"
+        "         dir: 1"
+        "       }"
+        "     }"
+        "   }"
         "  }"
         "}}");
 }

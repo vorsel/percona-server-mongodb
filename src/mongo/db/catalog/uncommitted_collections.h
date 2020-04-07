@@ -51,6 +51,11 @@ public:
         bool empty() {
             return _collections.empty() && _nssIndex.empty();
         }
+        void erase(UUID uuid, NamespaceString nss) {
+            _collections.erase(uuid);
+            _nssIndex.erase(nss);
+        }
+
         std::map<UUID, std::unique_ptr<Collection>> _collections;
         std::map<NamespaceString, UUID> _nssIndex;
     };
@@ -86,13 +91,33 @@ public:
     /**
      * Registers any uncommitted collections with the CollectionCatalog. If registering a collection
      * name conflicts with an existing entry, this method will throw a `WriteConflictException`.
+     * This method also clears the entries for the collection identified by `uuid` from
+     * UncommittedCollections.
      */
     static void commit(OperationContext* opCtx,
                        UUID uuid,
                        Timestamp createTs,
                        UncommittedCollectionsMap* map);
 
-    bool hasExclusiveAccessToCollection(OperationContext* opCtx, const NamespaceString& nss) const;
+    /**
+     * Deregisters the collection with uuid `uuid` from the CollectionCatalog, and re-adds the
+     * entries for the collection identified by `uuid` to UncommittedCollections. This function
+     * assumes `commit` has previously been called for `uuid`.
+     */
+    static void rollback(ServiceContext* svcCtx,
+                         CollectionUUID uuid,
+                         UncommittedCollectionsMap* map);
+
+
+    /**
+     * Erases the UUID/NamespaceString entries corresponding to `uuid` and `nss` from `map`.
+     */
+    static void erase(UUID uuid, NamespaceString nss, UncommittedCollectionsMap* map);
+
+    bool isUncommittedCollection(OperationContext* opCtx, const NamespaceString& nss) const;
+    void invariantHasExclusiveAccessToCollection(OperationContext* opCtx,
+                                                 const NamespaceString& nss) const;
+    bool isEmpty();
 
     static void clear(UncommittedCollectionsMap* map) {
         map->_collections.clear();

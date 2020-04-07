@@ -36,16 +36,19 @@
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/database_sharding_state.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/sharding_statistics.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/storage/storage_options.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -63,8 +66,11 @@ void onShardVersionMismatch(OperationContext* opCtx,
 
     invariant(ShardingState::get(opCtx)->canAcceptShardedCommands());
 
-    LOG(2) << "Metadata refresh requested for " << nss.ns() << " at shard version "
-           << shardVersionReceived;
+    LOGV2_DEBUG(22061,
+                2,
+                "Metadata refresh requested for {nss_ns} at shard version {shardVersionReceived}",
+                "nss_ns"_attr = nss.ns(),
+                "shardVersionReceived"_attr = shardVersionReceived);
 
     ShardingStatistics::get(opCtx).countStaleConfigErrors.addAndFetch(1);
 
@@ -124,7 +130,62 @@ void onDbVersionMismatch(OperationContext* opCtx,
     forceDatabaseRefresh(opCtx, dbName);
 }
 
+const auto catalogCacheForFilteringDecoration =
+    ServiceContext::declareDecoration<std::unique_ptr<CatalogCache>>();
+
+const auto catalogCacheLoaderForFilteringDecoration =
+    ServiceContext::declareDecoration<std::unique_ptr<CatalogCacheLoader>>();
+
+CatalogCache& getCatalogCacheForFiltering(ServiceContext* serviceContext) {
+    if (hasAdditionalCatalogCacheForFiltering()) {
+        auto& catalogCacheForFiltering = catalogCacheForFilteringDecoration(serviceContext);
+        invariant(catalogCacheForFiltering);
+        return *catalogCacheForFiltering;
+    }
+    return *Grid::get(serviceContext)->catalogCache();
+}
+
+CatalogCache& getCatalogCacheForFiltering(OperationContext* opCtx) {
+    return getCatalogCacheForFiltering(opCtx->getServiceContext());
+}
+
 }  // namespace
+
+
+bool hasAdditionalCatalogCacheForFiltering() {
+    invariant(serverGlobalParams.clusterRole == ClusterRole::ShardServer);
+    return getTestCommandsEnabled() && !storageGlobalParams.readOnly;
+}
+
+void setCatalogCacheForFiltering(ServiceContext* serviceContext,
+                                 std::unique_ptr<CatalogCache> catalogCache) {
+    invariant(hasAdditionalCatalogCacheForFiltering());
+    auto& catalogCacheForFiltering = catalogCacheForFilteringDecoration(serviceContext);
+    invariant(!catalogCacheForFiltering);
+    catalogCacheForFiltering = std::move(catalogCache);
+}
+
+void setCatalogCacheLoaderForFiltering(ServiceContext* serviceContext,
+                                       std::unique_ptr<CatalogCacheLoader> loader) {
+    invariant(hasAdditionalCatalogCacheForFiltering());
+    auto& catalogCacheLoader = catalogCacheLoaderForFilteringDecoration(serviceContext);
+    invariant(!catalogCacheLoader);
+    catalogCacheLoader = std::move(loader);
+}
+
+CatalogCacheLoader& getCatalogCacheLoaderForFiltering(ServiceContext* serviceContext) {
+    if (hasAdditionalCatalogCacheForFiltering()) {
+        auto& catalogCacheLoader = catalogCacheLoaderForFilteringDecoration(serviceContext);
+        invariant(catalogCacheLoader);
+        return *catalogCacheLoader;
+    }
+    return CatalogCacheLoader::get(serviceContext);
+}
+
+CatalogCacheLoader& getCatalogCacheLoaderForFiltering(OperationContext* opCtx) {
+    return getCatalogCacheLoaderForFiltering(opCtx->getServiceContext());
+}
+
 
 Status onShardVersionMismatchNoExcept(OperationContext* opCtx,
                                       const NamespaceString& nss,
@@ -134,7 +195,10 @@ Status onShardVersionMismatchNoExcept(OperationContext* opCtx,
         onShardVersionMismatch(opCtx, nss, shardVersionReceived, forceRefreshFromThisThread);
         return Status::OK();
     } catch (const DBException& ex) {
-        log() << "Failed to refresh metadata for collection " << nss << causedBy(redact(ex));
+        LOGV2(22062,
+              "Failed to refresh metadata for collection {nss}{causedBy_ex}",
+              "nss"_attr = nss,
+              "causedBy_ex"_attr = causedBy(redact(ex)));
         return ex.toStatus();
     }
 }
@@ -148,8 +212,15 @@ ChunkVersion forceShardFilteringMetadataRefresh(OperationContext* opCtx,
     auto* const shardingState = ShardingState::get(opCtx);
     invariant(shardingState->canAcceptShardedCommands());
 
+    if (hasAdditionalCatalogCacheForFiltering()) {
+        Grid::get(opCtx)
+            ->catalogCache()
+            ->getCollectionRoutingInfoWithRefresh(opCtx, nss, forceRefreshFromThisThread)
+            .getStatus()
+            .ignore();
+    }
     auto routingInfo =
-        uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfoWithRefresh(
+        uassertStatusOK(getCatalogCacheForFiltering(opCtx).getCollectionRoutingInfoWithRefresh(
             opCtx, nss, forceRefreshFromThisThread));
     auto cm = routingInfo.cm();
 
@@ -179,8 +250,13 @@ ChunkVersion forceShardFilteringMetadataRefresh(OperationContext* opCtx,
             if (metadata->isSharded() &&
                 metadata->getCollVersion().epoch() == cm->getVersion().epoch() &&
                 metadata->getCollVersion() >= cm->getVersion()) {
-                LOG(1) << "Skipping refresh of metadata for " << nss << " "
-                       << metadata->getCollVersion() << " with an older " << cm->getVersion();
+                LOGV2_DEBUG(22063,
+                            1,
+                            "Skipping refresh of metadata for {nss} {metadata_getCollVersion} with "
+                            "an older {cm_getVersion}",
+                            "nss"_attr = nss,
+                            "metadata_getCollVersion"_attr = metadata->getCollVersion(),
+                            "cm_getVersion"_attr = cm->getVersion());
                 return metadata->getShardVersion();
             }
         }
@@ -202,8 +278,13 @@ ChunkVersion forceShardFilteringMetadataRefresh(OperationContext* opCtx,
             if (metadata->isSharded() &&
                 metadata->getCollVersion().epoch() == cm->getVersion().epoch() &&
                 metadata->getCollVersion() >= cm->getVersion()) {
-                LOG(1) << "Skipping refresh of metadata for " << nss << " "
-                       << metadata->getCollVersion() << " with an older " << cm->getVersion();
+                LOGV2_DEBUG(22064,
+                            1,
+                            "Skipping refresh of metadata for {nss} {metadata_getCollVersion} with "
+                            "an older {cm_getVersion}",
+                            "nss"_attr = nss,
+                            "metadata_getCollVersion"_attr = metadata->getCollVersion(),
+                            "cm_getVersion"_attr = cm->getVersion());
                 return metadata->getShardVersion();
             }
         }
@@ -225,8 +306,10 @@ Status onDbVersionMismatchNoExcept(
         onDbVersionMismatch(opCtx, dbName, clientDbVersion, serverDbVersion);
         return Status::OK();
     } catch (const DBException& ex) {
-        log() << "Failed to refresh databaseVersion for database " << dbName
-              << causedBy(redact(ex));
+        LOGV2(22065,
+              "Failed to refresh databaseVersion for database {dbName}{causedBy_ex}",
+              "dbName"_attr = dbName,
+              "causedBy_ex"_attr = causedBy(redact(ex)));
         return ex.toStatus();
     }
 }
@@ -240,8 +323,16 @@ void forceDatabaseRefresh(OperationContext* opCtx, const StringData dbName) {
 
     DatabaseVersion refreshedDbVersion;
     try {
+        if (hasAdditionalCatalogCacheForFiltering()) {
+            Grid::get(opCtx)
+                ->catalogCache()
+                ->getDatabaseWithRefresh(opCtx, dbName)
+                .getStatus()
+                .ignore();
+        }
         refreshedDbVersion =
-            uassertStatusOK(Grid::get(opCtx)->catalogCache()->getDatabaseWithRefresh(opCtx, dbName))
+            uassertStatusOK(
+                getCatalogCacheForFiltering(opCtx).getDatabaseWithRefresh(opCtx, dbName))
                 .databaseVersion();
     } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
         // db has been dropped, set the db version to boost::none
@@ -266,10 +357,14 @@ void forceDatabaseRefresh(OperationContext* opCtx, const StringData dbName) {
         const auto cachedDbVersion = dss->getDbVersion(opCtx, dssLock);
         if (cachedDbVersion && cachedDbVersion->getUuid() == refreshedDbVersion.getUuid() &&
             cachedDbVersion->getLastMod() >= refreshedDbVersion.getLastMod()) {
-            LOG(2) << "Skipping setting cached databaseVersion for " << dbName
-                   << " to refreshed version " << refreshedDbVersion.toBSON()
-                   << " because current cached databaseVersion is already "
-                   << cachedDbVersion->toBSON();
+            LOGV2_DEBUG(22066,
+                        2,
+                        "Skipping setting cached databaseVersion for {dbName} to refreshed version "
+                        "{refreshedDbVersion} because current cached databaseVersion is already "
+                        "{cachedDbVersion}",
+                        "dbName"_attr = dbName,
+                        "refreshedDbVersion"_attr = refreshedDbVersion.toBSON(),
+                        "cachedDbVersion"_attr = cachedDbVersion->toBSON());
             return;
         }
     }

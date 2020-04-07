@@ -43,10 +43,10 @@
 #include "mongo/base/status_with.h"
 #include "mongo/crypto/sha1_block.h"
 #include "mongo/crypto/sha256_block.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/random.h"
 #include "mongo/util/base64.h"
 #include "mongo/util/concurrency/mutex.h"
-#include "mongo/util/log.h"
 #include "mongo/util/net/cidr.h"
 #include "mongo/util/net/private/ssl_expiration.h"
 #include "mongo/util/net/socket_exception.h"
@@ -527,8 +527,9 @@ StatusWith<std::vector<std::string>> extractSubjectAlternateNames(::CFDictionary
         if (swCIDRValue.isOK()) {
             swNameStr = swCIDRValue.getValue().toString();
             if (san == kDNS) {
-                warning() << "You have an IP Address in the DNS Name field on your "
-                             "certificate. This formulation is deprecated.";
+                LOGV2_WARNING(23208,
+                              "You have an IP Address in the DNS Name field on your "
+                              "certificate. This formulation is deprecated.");
             }
         }
         ret.push_back(swNameStr.getValue());
@@ -1196,11 +1197,13 @@ public:
                                                           const std::string& remoteHost,
                                                           const HostAndPort& hostForLogging) final;
 
-    StatusWith<SSLPeerInfo> parseAndValidatePeerCertificate(
-        ::SSLContextRef conn,
-        boost::optional<std::string> sniName,
-        const std::string& remoteHost,
-        const HostAndPort& hostForLogging) final;
+    Future<SSLPeerInfo> parseAndValidatePeerCertificate(::SSLContextRef conn,
+                                                        boost::optional<std::string> sniName,
+                                                        const std::string& remoteHost,
+                                                        const HostAndPort& hostForLogging,
+                                                        const ExecutorPtr& reactor) final;
+
+    Status stapleOCSPResponse(asio::ssl::apple::Context* context) final;
 
     const SSLConfiguration& getSSLConfiguration() const final {
         return _sslConfiguration;
@@ -1394,7 +1397,8 @@ SSLPeerInfo SSLManagerApple::parseAndValidatePeerCertificateDeprecated(
     auto ssl = checked_cast<const SSLConnectionApple*>(conn)->get();
 
     auto swPeerSubjectName =
-        parseAndValidatePeerCertificate(ssl, boost::none, remoteHost, hostForLogging);
+        parseAndValidatePeerCertificate(ssl, boost::none, remoteHost, hostForLogging, nullptr)
+            .getNoThrow();
     // We can't use uassertStatusOK here because we need to throw a NetworkException.
     if (!swPeerSubjectName.isOK()) {
         throwSocketError(SocketErrorKind::CONNECT_ERROR, swPeerSubjectName.getStatus().reason());
@@ -1419,18 +1423,22 @@ StatusWith<TLSVersion> mapTLSVersion(SSLContextRef ssl) {
     }
 }
 
+Status SSLManagerApple::stapleOCSPResponse(asio::ssl::apple::Context* context) {
+    return Status::OK();
+}
 
-StatusWith<SSLPeerInfo> SSLManagerApple::parseAndValidatePeerCertificate(
+Future<SSLPeerInfo> SSLManagerApple::parseAndValidatePeerCertificate(
     ::SSLContextRef ssl,
     boost::optional<std::string> sniName,
     const std::string& remoteHost,
-    const HostAndPort& hostForLogging) {
+    const HostAndPort& hostForLogging,
+    const ExecutorPtr& reactor) {
     invariant(!sslGlobalParams.tlsCATrusts);
 
     // Record TLS version stats
     auto tlsVersionStatus = mapTLSVersion(ssl);
     if (!tlsVersionStatus.isOK()) {
-        return tlsVersionStatus.getStatus();
+        return Future<SSLPeerInfo>::makeReady(tlsVersionStatus.getStatus());
     }
 
     recordTLSVersion(tlsVersionStatus.getValue(), hostForLogging);
@@ -1443,17 +1451,17 @@ StatusWith<SSLPeerInfo> SSLManagerApple::parseAndValidatePeerCertificate(
      * so that the validation path runs anyway.
      */
     if (!_sslConfiguration.hasCA && isSSLServer) {
-        return SSLPeerInfo(sniName);
+        return Future<SSLPeerInfo>::makeReady(SSLPeerInfo(sniName));
     }
 
-    const auto badCert = [&](StringData msg, bool warn = false) -> StatusWith<SSLPeerInfo> {
+    const auto badCert = [&](StringData msg, bool warn = false) -> Future<SSLPeerInfo> {
         constexpr StringData prefix = "SSL peer certificate validation failed: "_sd;
         if (warn) {
-            warning() << prefix << msg;
-            return SSLPeerInfo(sniName);
+            LOGV2_WARNING(23209, "{prefix}{msg}", "prefix"_attr = prefix, "msg"_attr = msg);
+            return Future<SSLPeerInfo>::makeReady(SSLPeerInfo(sniName));
         } else {
             std::string m = str::stream() << prefix << msg << "; connection rejected";
-            error() << m;
+            LOGV2_ERROR(23212, "{m}", "m"_attr = m);
             return Status(ErrorCodes::SSLHandshakeFailed, m);
         }
     };
@@ -1502,6 +1510,19 @@ StatusWith<SSLPeerInfo> SSLManagerApple::parseAndValidatePeerCertificate(
         ipv6 = true;
     }
 
+    if (tlsOCSPEnabled && !remoteHost.empty()) {
+        CFArrayRef policies = nullptr;
+        ::SecTrustCopyPolicies(cftrust.get(), &policies);
+        CFUniquePtr<::CFArrayRef> cfpolicies(policies);
+
+        CFUniquePtr<::CFMutableArrayRef> policiesMutable(
+            ::CFArrayCreateMutableCopy(NULL, 0, policies));
+        CFUniquePtr<::SecPolicyRef> cfRevPolicy(
+            ::SecPolicyCreateRevocation(kSecRevocationOCSPMethod));
+        ::CFArrayAppendValue(policiesMutable.get(), cfRevPolicy.get());
+        ::SecTrustSetPolicies(cftrust.get(), policiesMutable.get());
+    }
+
     auto result = ::kSecTrustResultInvalid;
     uassertOSStatusOK(::SecTrustEvaluate(cftrust.get(), &result), ErrorCodes::SSLHandshakeFailed);
 
@@ -1541,7 +1562,10 @@ StatusWith<SSLPeerInfo> SSLManagerApple::parseAndValidatePeerCertificate(
         return swPeerSubjectName.getStatus();
     }
     const auto peerSubjectName = std::move(swPeerSubjectName.getValue());
-    LOG(2) << "Accepted TLS connection from peer: " << peerSubjectName;
+    LOGV2_DEBUG(23207,
+                2,
+                "Accepted TLS connection from peer: {peerSubjectName}",
+                "peerSubjectName"_attr = peerSubjectName);
 
     // Server side.
     if (remoteHost.empty()) {
@@ -1564,7 +1588,7 @@ StatusWith<SSLPeerInfo> SSLManagerApple::parseAndValidatePeerCertificate(
 
         // If client and server certificate are the same, log a warning.
         if (_sslConfiguration.serverSubjectName() == peerSubjectName) {
-            warning() << "Client connecting with server's own TLS certificate";
+            LOGV2_WARNING(23210, "Client connecting with server's own TLS certificate");
         }
 
         // If this is an SSL server context (on a mongod/mongos)
@@ -1573,7 +1597,8 @@ StatusWith<SSLPeerInfo> SSLManagerApple::parseAndValidatePeerCertificate(
         if (!swPeerCertificateRoles.isOK()) {
             return swPeerCertificateRoles.getStatus();
         }
-        return SSLPeerInfo(peerSubjectName, sniName, std::move(swPeerCertificateRoles.getValue()));
+        return Future<SSLPeerInfo>::makeReady(
+            SSLPeerInfo(peerSubjectName, sniName, std::move(swPeerCertificateRoles.getValue())));
     }
 
     // If this is an SSL client context (on a MongoDB server or client)
@@ -1635,14 +1660,14 @@ StatusWith<SSLPeerInfo> SSLManagerApple::parseAndValidatePeerCertificate(
     if (!sanMatch && !cnMatch) {
         const auto msg = certErr.str();
         if (_allowInvalidCertificates || _allowInvalidHostnames || isUnixDomainSocket(remoteHost)) {
-            warning() << msg;
+            LOGV2_WARNING(23211, "{msg}", "msg"_attr = msg);
         } else {
-            error() << msg;
+            LOGV2_ERROR(23213, "{msg}", "msg"_attr = msg);
             return Status(ErrorCodes::SSLHandshakeFailed, msg);
         }
     }
 
-    return SSLPeerInfo(peerSubjectName);
+    return Future<SSLPeerInfo>::makeReady(SSLPeerInfo(peerSubjectName));
 }
 
 int SSLManagerApple::SSL_read(SSLConnectionInterface* conn, void* buf, int num) {

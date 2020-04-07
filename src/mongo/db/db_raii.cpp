@@ -39,7 +39,7 @@
 #include "mongo/db/db_raii_gen.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/collection_sharding_state.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 namespace {
@@ -60,8 +60,12 @@ AutoStatsTracker::AutoStatsTracker(OperationContext* opCtx,
                                    LogMode logMode,
                                    boost::optional<int> dbProfilingLevel,
                                    Date_t deadline)
-    : _opCtx(opCtx), _lockType(lockType), _nss(nss) {
-    if (!dbProfilingLevel && logMode == LogMode::kUpdateTopAndCurop) {
+    : _opCtx(opCtx), _lockType(lockType), _nss(nss), _logMode(logMode) {
+    if (_logMode == LogMode::kUpdateTop) {
+        return;
+    }
+
+    if (!dbProfilingLevel) {
         // No profiling level was determined, attempt to read the profiling level from the Database
         // object. Since we are only reading the in-memory profiling level out of the database
         // object (which is configured on a per-node basis and not replicated or persisted), we
@@ -74,12 +78,14 @@ AutoStatsTracker::AutoStatsTracker(OperationContext* opCtx,
     }
 
     stdx::lock_guard<Client> clientLock(*_opCtx->getClient());
-    if (logMode == LogMode::kUpdateTopAndCurop) {
-        CurOp::get(_opCtx)->enter_inlock(_nss.ns().c_str(), dbProfilingLevel);
-    }
+    CurOp::get(_opCtx)->enter_inlock(_nss.ns().c_str(), dbProfilingLevel);
 }
 
 AutoStatsTracker::~AutoStatsTracker() {
+    if (_logMode == LogMode::kUpdateCurOp) {
+        return;
+    }
+
     auto curOp = CurOp::get(_opCtx);
     Top::get(_opCtx->getServiceContext())
         .record(_opCtx,
@@ -185,9 +191,13 @@ AutoGetCollectionForRead::AutoGetCollectionForRead(OperationContext* opCtx,
         // waiting for the lastAppliedTimestamp to move forward. Instead we force the reader take
         // the PBWM lock and retry.
         if (lastAppliedTimestamp) {
-            LOG(0) << "tried reading at last-applied time: " << *lastAppliedTimestamp
-                   << " on ns: " << nss.ns() << ", but future catalog changes are pending at time "
-                   << *minSnapshot << ". Trying again without reading at last-applied time.";
+            LOGV2(20576,
+                  "tried reading at last-applied time: {lastAppliedTimestamp} on ns: {nss_ns}, but "
+                  "future catalog changes are pending at time {minSnapshot}. Trying again without "
+                  "reading at last-applied time.",
+                  "lastAppliedTimestamp"_attr = *lastAppliedTimestamp,
+                  "nss_ns"_attr = nss.ns(),
+                  "minSnapshot"_attr = *minSnapshot);
             // Destructing the block sets _shouldConflictWithSecondaryBatchApplication back to the
             // previous value. If the previous value is false (because there is another
             // shouldNotConflictWithSecondaryBatchApplicationBlock outside of this function), this
@@ -259,7 +269,7 @@ bool AutoGetCollectionForRead::_shouldReadAtLastAppliedTimestamp(
     // This may occur when multiple collection locks are held concurrently, which is often the case
     // when DBDirectClient is used.
     if (opCtx->lockState()->isLockHeldForMode(resourceIdParallelBatchWriterMode, MODE_IS)) {
-        LOG(1) << "not reading at last-applied because the PBWM lock is held";
+        LOGV2_DEBUG(20577, 1, "not reading at last-applied because the PBWM lock is held");
         return false;
     }
 
@@ -340,7 +350,7 @@ AutoGetCollectionForReadCommand::AutoGetCollectionForReadCommand(
     // use an empty plan.
     invariant(!_autoCollForRead.getView() || !_autoCollForRead.getCollection());
     auto css = CollectionShardingState::get(opCtx, _autoCollForRead.getNss());
-    css->checkShardVersionOrThrow(opCtx, _autoCollForRead.getCollection());
+    css->checkShardVersionOrThrow(opCtx);
 }
 
 OldClientContext::OldClientContext(OperationContext* opCtx, const std::string& ns, bool doVersion)
@@ -361,10 +371,7 @@ OldClientContext::OldClientContext(OperationContext* opCtx, const std::string& n
                 break;
             default:
                 CollectionShardingState::get(_opCtx, NamespaceString(ns))
-                    ->checkShardVersionOrThrow(
-                        _opCtx,
-                        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
-                            opCtx, NamespaceString(ns)));
+                    ->checkShardVersionOrThrow(_opCtx);
                 break;
         }
     }

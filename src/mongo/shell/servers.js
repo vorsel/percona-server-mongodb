@@ -103,6 +103,10 @@ function pathJoin(...parts) {
     return parts.join(separator);
 }
 
+// Internal state to determine if the hang analyzer should be enabled or not.
+// Accessible via global setter/getter defined below.
+let _hangAnalyzerEnabled = true;
+
 /**
  * Run `./buildscripts/hang_analyzer.py`.
  *
@@ -118,6 +122,22 @@ function runHangAnalyzer(pids) {
         print("Skipping runHangAnalyzer: no TestData (not running from resmoke)");
         return;
     }
+
+    if (!TestData.inEvergreen) {
+        print('Skipping runHangAnalyzer: not running in Evergreen');
+        return;
+    }
+
+    if (!_hangAnalyzerEnabled) {
+        print('Skipping runHangAnalyzer: manually disabled');
+        return;
+    }
+
+    if (TestData.isAsanBuild) {
+        print('Skipping runHangAnalyzer: ASAN build');
+        return;
+    }
+
     if (typeof pids === 'undefined') {
         pids = getPids();
     }
@@ -130,10 +150,18 @@ function runHangAnalyzer(pids) {
     pids = pids.map(p => p + 0).join(',');
     print(`Running hang_analyzer.py for pids [${pids}]`);
     const scriptPath = pathJoin('.', 'buildscripts', 'hang_analyzer.py');
-    runProgram('python', scriptPath, '-c', '-d', pids);
+    return runProgram('python', scriptPath, '-c', '-d', pids);
 }
 
 MongoRunner.runHangAnalyzer = runHangAnalyzer;
+
+MongoRunner.runHangAnalyzer.enable = function() {
+    _hangAnalyzerEnabled = true;
+};
+
+MongoRunner.runHangAnalyzer.disable = function() {
+    _hangAnalyzerEnabled = false;
+};
 })();
 
 /**
@@ -624,8 +652,21 @@ var _removeSetParameterIfBeforeVersion = function(opts, parameterName, requiredV
  *     oplogSize
  *   }
  */
-MongoRunner.mongodOptions = function(opts) {
+MongoRunner.mongodOptions = function(opts = {}) {
     opts = MongoRunner.mongoOptions(opts);
+
+    if (jsTestOptions().alwaysUseLogFiles) {
+        if (opts.cleanData || opts.startClean || opts.noCleanData === false ||
+            opts.useLogFiles === false) {
+            throw new Error("Always using log files, but received conflicting option.");
+        }
+
+        opts.cleanData = false;
+        opts.startClean = false;
+        opts.noCleanData = true;
+        opts.useLogFiles = true;
+        opts.logappend = "";
+    }
 
     opts.dbpath = MongoRunner.toRealDir(opts.dbpath || "$dataDir/mongod-$port", opts.pathOpts);
 
@@ -707,6 +748,15 @@ MongoRunner.mongosOptions = function(opts) {
     // Normalize configdb option to be host string if currently a host
     if (opts.configdb && opts.configdb.getDB) {
         opts.configdb = opts.configdb.host;
+    }
+
+    if (jsTestOptions().alwaysUseLogFiles) {
+        if (opts.useLogFiles === false) {
+            throw new Error("Always using log files, but received conflicting option.");
+        }
+
+        opts.useLogFiles = true;
+        opts.logappend = "";
     }
 
     opts.pathOpts = Object.merge(opts.pathOpts, {configdb: opts.configdb.replace(/:|\/|,/g, "-")});
@@ -1034,6 +1084,11 @@ function appendSetParameterArgs(argArray) {
     // programName includes the version, e.g., mongod-3.2.
     // baseProgramName is the program name without any version information, e.g., mongod.
     let programName = argArray[0];
+    const separator = _isWindows() ? '\\' : '/';
+    if (programName.indexOf(separator) !== -1) {
+        let pathElements = programName.split(separator);
+        programName = pathElements[pathElements.length - 1];
+    }
 
     let [baseProgramName, programVersion] = programName.split("-");
     let programMajorMinorVersion = 0;
@@ -1072,15 +1127,6 @@ function appendSetParameterArgs(argArray) {
 
             // Disable background cache refreshing to avoid races in tests
             argArray.push(...['--setParameter', "disableLogicalSessionCacheRefresh=true"]);
-        }
-
-        // New options in 4.3.x
-        if (!programMajorMinorVersion || programMajorMinorVersion >= 403) {
-            if (jsTest.options().logFormat) {
-                if (!argArrayContains("--logFormat")) {
-                    argArray.push(...["--logFormat", jsTest.options().logFormat]);
-                }
-            }
         }
 
         // Since options may not be backward compatible, mongos options are not
@@ -1141,9 +1187,7 @@ function appendSetParameterArgs(argArray) {
                 }
             }
 
-            // Since options may not be backward compatible, mongod options are not
-            // set on older versions, e.g., mongod-3.0.
-            if (programName.endsWith('mongod')) {
+            if (!programMajorMinorVersion || programMajorMinorVersion >= 306) {
                 if (jsTest.options().storageEngine === "wiredTiger" ||
                     !jsTest.options().storageEngine) {
                     if (jsTest.options().enableMajorityReadConcern !== undefined &&
@@ -1151,6 +1195,14 @@ function appendSetParameterArgs(argArray) {
                         argArray.push(...['--enableMajorityReadConcern',
                                           jsTest.options().enableMajorityReadConcern.toString()]);
                     }
+                }
+            }
+
+            // Since options may not be backward compatible, mongod options are not
+            // set on older versions, e.g., mongod-3.0.
+            if (programName.endsWith('mongod')) {
+                if (jsTest.options().storageEngine === "wiredTiger" ||
+                    !jsTest.options().storageEngine) {
                     if (jsTest.options().storageEngineCacheSizeGB &&
                         !argArrayContains('--wiredTigerCacheSizeGB')) {
                         argArray.push(...['--wiredTigerCacheSizeGB',
@@ -1372,10 +1424,18 @@ startMongoProgramNoConnect = function() {
 };
 
 myPort = function() {
-    var m = db.getMongo();
-    if (m.host.match(/:/))
-        return m.host.match(/:(.*)/)[1];
-    else
-        return 27017;
+    const hosts = db.getMongo().host.split(',');
+
+    const ip6Numeric = hosts[0].match(/^\[[0-9A-Fa-f:]+\]:(\d+)$/);
+    if (ip6Numeric) {
+        return ip6Numeric[1];
+    }
+
+    const hasPort = hosts[0].match(/:(\d+)/);
+    if (hasPort) {
+        return hasPort[1];
+    }
+
+    return 27017;
 };
 }());

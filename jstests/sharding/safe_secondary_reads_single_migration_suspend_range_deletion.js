@@ -347,7 +347,6 @@ let testCases = {
     replSetUpdatePosition: {skip: "does not return user data"},
     replSetResizeOplog: {skip: "does not return user data"},
     resetError: {skip: "does not return user data"},
-    restartCatalog: {skip: "internal-only command"},
     resync: {skip: "primary only"},
     revokePrivilegesFromRole: {skip: "primary only"},
     revokeRolesFromRole: {skip: "primary only"},
@@ -536,7 +535,7 @@ for (let command of commands) {
                 "command.$readPreference": {"mode": "secondary"},
                 "$or": [
                     {"command.readConcern": {"$exists": false}},
-                    {"command.readConcern": {}},
+                    {"command.readConcern": {"provenance": "implicitDefault"}},
                 ],
                 "errCode": {"$ne": ErrorCodes.StaleConfig},
             },

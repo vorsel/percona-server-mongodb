@@ -58,8 +58,8 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/views/view_catalog.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -111,8 +111,10 @@ Status checkSourceAndTargetNamespaces(OperationContext* opCtx,
                 "Cannot rename collections between a replicated and an unreplicated database"};
 
     auto db = DatabaseHolder::get(opCtx)->getDb(opCtx, source.db());
-    if (!db)
-        return Status(ErrorCodes::NamespaceNotFound, "source namespace does not exist");
+    if (!db || db->isDropPending(opCtx))
+        return Status(ErrorCodes::NamespaceNotFound,
+                      str::stream()
+                          << "Database " << source.db() << " does not exist or is drop pending");
 
     Collection* const sourceColl =
         CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, source);
@@ -120,7 +122,8 @@ Status checkSourceAndTargetNamespaces(OperationContext* opCtx,
         if (ViewCatalog::get(db)->lookup(opCtx, source.ns()))
             return Status(ErrorCodes::CommandNotSupportedOnView,
                           str::stream() << "cannot rename view: " << source);
-        return Status(ErrorCodes::NamespaceNotFound, "source namespace does not exist");
+        return Status(ErrorCodes::NamespaceNotFound,
+                      str::stream() << "Source collection " << source.ns() << " does not exist");
     }
 
     BackgroundOperation::assertNoBgOpInProgForNs(source.ns());
@@ -172,9 +175,15 @@ Status renameTargetCollectionToTmp(OperationContext* opCtx,
 
         wunit.commit();
 
-        log() << "Successfully renamed the target " << targetNs << " (" << targetUUID << ") to "
-              << tmpName << " so that the source " << sourceNs << " (" << sourceUUID
-              << ") could be renamed to " << targetNs;
+        LOGV2(20397,
+              "Successfully renamed the target {targetNs} ({targetUUID}) to {tmpName} so that the "
+              "source {sourceNs} ({sourceUUID}) could be renamed to {targetNs2}",
+              "targetNs"_attr = targetNs,
+              "targetUUID"_attr = targetUUID,
+              "tmpName"_attr = tmpName,
+              "sourceNs"_attr = sourceNs,
+              "sourceUUID"_attr = sourceUUID,
+              "targetNs2"_attr = targetNs);
 
         return Status::OK();
     });
@@ -245,9 +254,13 @@ Status renameCollectionAndDropTarget(OperationContext* opCtx,
             // 'renameOpTime' must be null because a valid 'renameOpTimeFromApplyOps' implies
             // replicated writes are not enabled.
             if (!renameOpTime.isNull()) {
-                severe() << "renameCollection: " << source << " to " << target
-                         << " (with dropTarget=true) - unexpected renameCollection oplog entry"
-                         << " written to the oplog with optime " << renameOpTime;
+                LOGV2_FATAL(
+                    20403,
+                    "renameCollection: {source} to {target} (with dropTarget=true) - unexpected "
+                    "renameCollection oplog entry written to the oplog with optime {renameOpTime}",
+                    "source"_attr = source,
+                    "target"_attr = target,
+                    "renameOpTime"_attr = renameOpTime);
                 fassertFailed(40616);
             }
             renameOpTime = renameOpTimeFromApplyOps;
@@ -320,7 +333,7 @@ Status renameCollectionWithinDB(OperationContext* opCtx,
     AutoStatsTracker statsTracker(opCtx,
                                   source,
                                   Top::LockType::NotLocked,
-                                  AutoStatsTracker::LogMode::kUpdateTopAndCurop,
+                                  AutoStatsTracker::LogMode::kUpdateCurOp,
                                   db->getProfilingLevel());
 
     if (!targetColl) {
@@ -360,7 +373,7 @@ Status renameCollectionWithinDBForApplyOps(OperationContext* opCtx,
     AutoStatsTracker statsTracker(opCtx,
                                   source,
                                   Top::LockType::NotLocked,
-                                  AutoStatsTracker::LogMode::kUpdateTopAndCurop,
+                                  AutoStatsTracker::LogMode::kUpdateCurOp,
                                   db->getProfilingLevel());
 
     return writeConflictRetry(opCtx, "renameCollection", target.ns(), [&] {
@@ -391,7 +404,7 @@ Status renameCollectionWithinDBForApplyOps(OperationContext* opCtx,
                 return Status::OK();
             }
 
-            if (!uuidToDrop || (uuidToDrop && uuidToDrop != targetColl->uuid())) {
+            if (!uuidToDrop || uuidToDrop != targetColl->uuid()) {
                 // We need to rename the targetColl to a temporary name.
                 auto status = renameTargetCollectionToTmp(
                     opCtx, source, sourceColl->uuid(), db, target, targetColl->uuid());
@@ -478,7 +491,7 @@ Status renameBetweenDBs(OperationContext* opCtx,
                                                    opCtx,
                                                    source,
                                                    Top::LockType::NotLocked,
-                                                   AutoStatsTracker::LogMode::kUpdateTopAndCurop,
+                                                   AutoStatsTracker::LogMode::kUpdateCurOp,
                                                    sourceDB->getProfilingLevel());
 
     Collection* const sourceColl =
@@ -547,8 +560,11 @@ Status renameBetweenDBs(OperationContext* opCtx,
     }
     const auto& tmpName = tmpNameResult.getValue();
 
-    log() << "Attempting to create temporary collection: " << tmpName
-          << " with the contents of collection: " << source;
+    LOGV2(20398,
+          "Attempting to create temporary collection: {tmpName} with the contents of collection: "
+          "{source}",
+          "tmpName"_attr = tmpName,
+          "source"_attr = source);
 
     Collection* tmpColl = nullptr;
     {
@@ -567,23 +583,26 @@ Status renameBetweenDBs(OperationContext* opCtx,
 
     // Dismissed on success
     auto tmpCollectionDropper = makeGuard([&] {
-        BSONObjBuilder unusedResult;
         Status status = Status::OK();
         try {
-            status =
-                dropCollection(opCtx,
-                               tmpName,
-                               unusedResult,
-                               {},
-                               DropCollectionSystemCollectionMode::kAllowSystemCollectionDrops);
+            status = dropCollectionForApplyOps(
+                opCtx,
+                tmpName,
+                {},
+                DropCollectionSystemCollectionMode::kAllowSystemCollectionDrops);
         } catch (...) {
             status = exceptionToStatus();
         }
         if (!status.isOK()) {
             // Ignoring failure case when dropping the temporary collection during cleanup because
             // the rename operation has already failed for another reason.
-            log() << "Unable to drop temporary collection " << tmpName << " while renaming from "
-                  << source << " to " << target << ": " << status;
+            LOGV2(20399,
+                  "Unable to drop temporary collection {tmpName} while renaming from {source} to "
+                  "{target}: {status}",
+                  "tmpName"_attr = tmpName,
+                  "source"_attr = source,
+                  "target"_attr = target,
+                  "status"_attr = status);
         }
     });
 
@@ -719,13 +738,8 @@ Status renameBetweenDBs(OperationContext* opCtx,
         return status;
 
     tmpCollectionDropper.dismiss();
-
-    BSONObjBuilder unusedResult;
-    return dropCollection(opCtx,
-                          source,
-                          unusedResult,
-                          {},
-                          DropCollectionSystemCollectionMode::kAllowSystemCollectionDrops);
+    return dropCollectionForApplyOps(
+        opCtx, source, {}, DropCollectionSystemCollectionMode::kAllowSystemCollectionDrops);
 }
 
 }  // namespace
@@ -840,7 +854,11 @@ Status renameCollection(OperationContext* opCtx,
 
     const std::string dropTargetMsg =
         options.dropTarget ? " and drop " + target.toString() + "." : ".";
-    log() << "renameCollectionForCommand: rename " << source << " to " << target << dropTargetMsg;
+    LOGV2(20400,
+          "renameCollectionForCommand: rename {source} to {target}{dropTargetMsg}",
+          "source"_attr = source,
+          "target"_attr = target,
+          "dropTargetMsg"_attr = dropTargetMsg);
 
     if (source.db() == target.db())
         return renameCollectionWithinDB(opCtx, source, target, options);
@@ -918,12 +936,11 @@ Status renameCollectionForApplyOps(OperationContext* opCtx,
 
         // Downgrade renameCollection to dropCollection.
         if (dropTargetNss) {
-            BSONObjBuilder unusedResult;
-            return dropCollection(opCtx,
-                                  *dropTargetNss,
-                                  unusedResult,
-                                  renameOpTime,
-                                  DropCollectionSystemCollectionMode::kAllowSystemCollectionDrops);
+            return dropCollectionForApplyOps(
+                opCtx,
+                *dropTargetNss,
+                renameOpTime,
+                DropCollectionSystemCollectionMode::kAllowSystemCollectionDrops);
         }
 
         return Status(ErrorCodes::NamespaceNotFound,
@@ -936,8 +953,13 @@ Status renameCollectionForApplyOps(OperationContext* opCtx,
     const std::string dropTargetMsg =
         uuidToDrop ? " and drop " + uuidToDrop->toString() + "." : ".";
     const std::string uuidString = uuidToRename ? uuidToRename->toString() : "UUID unknown";
-    log() << "renameCollectionForApplyOps: rename " << sourceNss << " (" << uuidString << ") to "
-          << targetNss << dropTargetMsg;
+    LOGV2(20401,
+          "renameCollectionForApplyOps: rename {sourceNss} ({uuidString}) to "
+          "{targetNss}{dropTargetMsg}",
+          "sourceNss"_attr = sourceNss,
+          "uuidString"_attr = uuidString,
+          "targetNss"_attr = targetNss,
+          "dropTargetMsg"_attr = dropTargetMsg);
 
     if (sourceNss.db() == targetNss.db()) {
         return renameCollectionWithinDBForApplyOps(
@@ -958,8 +980,11 @@ Status renameCollectionForRollback(OperationContext* opCtx,
                                "have the same database. source: "
                             << *source << ". target: " << target);
 
-    log() << "renameCollectionForRollback: rename " << *source << " (" << uuid << ") to " << target
-          << ".";
+    LOGV2(20402,
+          "renameCollectionForRollback: rename {source} ({uuid}) to {target}.",
+          "source"_attr = *source,
+          "uuid"_attr = uuid,
+          "target"_attr = target);
 
     return renameCollectionWithinDB(opCtx, *source, target, {});
 }

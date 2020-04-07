@@ -39,33 +39,35 @@ namespace mongo::sdam {
  */
 class TopologyListener {
 public:
+    virtual ~TopologyListener() {}
+
     /**
      * Called when a TopologyDescriptionChangedEvent is published - The TopologyDescription changed
      * and the new TopologyDescription does not match the old.
      */
-    void onTopologyDescriptionChangedEvent(UUID topologyId,
-                                           TopologyDescriptionPtr previousDescription,
-                                           TopologyDescriptionPtr newDescription){};
+    virtual void onTopologyDescriptionChangedEvent(UUID topologyId,
+                                                   TopologyDescriptionPtr previousDescription,
+                                                   TopologyDescriptionPtr newDescription){};
 
     /**
      * Called when a ServerHeartBeatSucceededEvent is published - A heartbeat sent to the server at
      * hostAndPort succeeded. durationMS is the execution time of the event, including the time it
      * took to send the message and recieve the reply from the server.
      */
-    void onServerHeartbeatSucceededEvent(mongo::Milliseconds durationMs,
-                                         ServerAddress hostAndPort){};
+    virtual void onServerHeartbeatSucceededEvent(IsMasterRTT durationMs,
+                                                 const ServerAddress& hostAndPort){};
 
     /*
      * Called when a ServerPingFailedEvent is published - A monitoring ping to the server at
      * hostAndPort was not successful.
      */
-    void onServerPingFailedEvent(const ServerAddress hostAndPort, const Status& status){};
+    virtual void onServerPingFailedEvent(const ServerAddress& hostAndPort, const Status& status){};
 
     /**
      * Called when a ServerPingSucceededEvent is published - A monitoring ping to the server at
      * hostAndPort was successful. durationMS is the measured RTT (Round Trip Time).
      */
-    void onServerPingSucceededEvent(mongo::Milliseconds durationMS, ServerAddress hostAndPort){};
+    virtual void onServerPingSucceededEvent(IsMasterRTT durationMS,
+                                            const ServerAddress& hostAndPort){};
 };
-
 }  // namespace mongo::sdam

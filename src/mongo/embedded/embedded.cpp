@@ -66,10 +66,10 @@
 #include "mongo/embedded/replication_coordinator_embedded.h"
 #include "mongo/embedded/service_entry_point_embedded.h"
 #include "mongo/logger/log_component.h"
+#include "mongo/logv2/log.h"
 #include "mongo/scripting/dbdirectclient_factory.h"
 #include "mongo/util/background.h"
 #include "mongo/util/exit.h"
-#include "mongo/util/log.h"
 #include "mongo/util/periodic_runner_factory.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/time_support.h"
@@ -182,7 +182,7 @@ void shutdown(ServiceContext* srvContext) {
     }
     setGlobalServiceContext(nullptr);
 
-    log(LogComponent::kControl) << "now exiting";
+    LOGV2_OPTIONS(22551, {logComponentV1toV2(LogComponent::kControl)}, "now exiting");
 }
 
 
@@ -217,16 +217,20 @@ ServiceContext* initialize(const char* yaml_config) {
 
     {
         ProcessId pid = ProcessId::getCurrent();
-        LogstreamBuilder l = log(LogComponent::kControl);
-        l << "MongoDB starting : pid=" << pid << " port=" << serverGlobalParams.port
-          << " dbpath=" << storageGlobalParams.dbpath;
-
         const bool is32bit = sizeof(int*) == 4;
-        l << (is32bit ? " 32" : " 64") << "-bit" << endl;
+        LOGV2_OPTIONS(4615667,
+                      {logv2::LogComponent::kControl},
+                      "MongoDB starting",
+                      "pid"_attr = pid.toNative(),
+                      "port"_attr = serverGlobalParams.port,
+                      "dbpath"_attr =
+                          boost::filesystem::path(storageGlobalParams.dbpath).generic_string(),
+                      "architecture"_attr = (is32bit ? "32-bit" : "64-bit"));
     }
 
     if (kDebugBuild)
-        log(LogComponent::kControl) << "DEBUG build (which is slower)" << endl;
+        LOGV2_OPTIONS(
+            22552, {logComponentV1toV2(LogComponent::kControl)}, "DEBUG build (which is slower)");
 
     // The periodic runner is required by the storage engine to be running beforehand.
     auto periodicRunner = std::make_unique<PeriodicRunnerEmbedded>(
@@ -249,9 +253,11 @@ ServiceContext* initialize(const char* yaml_config) {
 
             // Warn if field name matches non-active registered storage engine.
             if (isRegisteredStorageEngine(serviceContext, e.fieldName())) {
-                warning() << "Detected configuration for non-active storage engine "
-                          << e.fieldName() << " when current storage engine is "
-                          << storageGlobalParams.engine;
+                LOGV2_WARNING(22554,
+                              "Detected configuration for non-active storage engine {e_fieldName} "
+                              "when current storage engine is {storageGlobalParams_engine}",
+                              "e_fieldName"_attr = e.fieldName(),
+                              "storageGlobalParams_engine"_attr = storageGlobalParams.engine);
             }
         }
     }
@@ -286,7 +292,10 @@ ServiceContext* initialize(const char* yaml_config) {
     try {
         repairDatabasesAndCheckVersion(startupOpCtx.get());
     } catch (const ExceptionFor<ErrorCodes::MustDowngrade>& error) {
-        severe(LogComponent::kControl) << "** IMPORTANT: " << error.toStatus().reason();
+        LOGV2_FATAL_OPTIONS(22555,
+                            {logComponentV1toV2(LogComponent::kControl)},
+                            "** IMPORTANT: {error_toStatus_reason}",
+                            "error_toStatus_reason"_attr = error.toStatus().reason());
         quickExit(EXIT_NEED_DOWNGRADE);
     }
 
@@ -300,7 +309,7 @@ ServiceContext* initialize(const char* yaml_config) {
     }
 
     if (storageGlobalParams.upgrade) {
-        log() << "finished checking dbs";
+        LOGV2(22553, "finished checking dbs");
         exitCleanly(EXIT_CLEAN);
     }
 

@@ -39,8 +39,8 @@
 #include "mongo/db/s/transaction_coordinator_service.h"
 #include "mongo/db/session_catalog_mongod.h"
 #include "mongo/db/transaction_participant.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -99,10 +99,17 @@ public:
                     "prepareTransaction must be run within a transaction",
                     txnParticipant);
 
-            LOG(3)
-                << "Participant shard received prepareTransaction for transaction with txnNumber "
-                << opCtx->getTxnNumber() << " on session "
-                << opCtx->getLogicalSessionId()->toBSON();
+            LOGV2_DEBUG(22483,
+                        3,
+                        "Participant shard received prepareTransaction for transaction with "
+                        "txnNumber {opCtx_getTxnNumber} on session {opCtx_getLogicalSessionId}",
+                        "opCtx_getTxnNumber"_attr = opCtx->getTxnNumber(),
+                        "opCtx_getLogicalSessionId"_attr = opCtx->getLogicalSessionId()->toBSON());
+
+            // TODO(SERVER-46105) remove
+            uassert(ErrorCodes::OperationNotSupportedInTransaction,
+                    "Cannot create new collections inside distributed transactions",
+                    UncommittedCollections::get(opCtx).isEmpty());
 
             uassert(ErrorCodes::NoSuchTransaction,
                     "Transaction isn't in progress",
@@ -117,16 +124,15 @@ public:
                 // lastApplied OpTime. If we've gotten to this point, then we are guaranteed that
                 // the transaction was prepared at this prepareOpTime on this branch of history and
                 // that waiting on this lastApplied OpTime waits on the prepareOpTime as well.
-                replClient.setLastOpToSystemLastOpTime(opCtx);
-
-                // TODO SERVER-39364: Due to a bug in setlastOpToSystemLastOpTime, the prepareOpTime
-                // may still be greater than the lastApplied. In that case we make sure that we wait
-                // on the prepareOpTime which is guaranteed to be in the current term. SERVER-39364
-                // can remove this extra setLastOp() call and just rely on the call to
-                // setLastOpToSystemLastOpTime() above.
-                if (prepareOpTime > replClient.getLastOp()) {
-                    replClient.setLastOp(opCtx, prepareOpTime);
-                }
+                // Because lastAppliedOpTime is updated asynchronously with the WUOW that prepares
+                // the transaction, there is a chance that the lastAppliedOpTime is behind the
+                // prepareOpTime. And we also need to be careful not to set lastOp backwards. Thus,
+                // we set the client lastOp to max of prepareOpTime, lastAppliedOpTime, and the
+                // current lastOp.
+                const auto lastAppliedOpTime =
+                    repl::ReplicationCoordinator::get(opCtx)->getMyLastAppliedOpTime();
+                replClient.setLastOp(
+                    opCtx, std::max({prepareOpTime, lastAppliedOpTime, replClient.getLastOp()}));
 
                 invariant(
                     opCtx->recoveryUnit()->getPrepareTimestamp() == prepareOpTime.getTimestamp(),
@@ -200,10 +206,14 @@ std::set<ShardId> validateParticipants(OperationContext* opCtx,
     }
     ss << ']';
 
-    LOG(3) << "Coordinator shard received request to coordinate commit with "
-              "participant list "
-           << ss.str() << " for " << opCtx->getLogicalSessionId()->getId() << ':'
-           << opCtx->getTxnNumber();
+    LOGV2_DEBUG(
+        22484,
+        3,
+        "Coordinator shard received request to coordinate commit with "
+        "participant list {ss_str} for {opCtx_getLogicalSessionId_getId}:{opCtx_getTxnNumber}",
+        "ss_str"_attr = ss.str(),
+        "opCtx_getLogicalSessionId_getId"_attr = opCtx->getLogicalSessionId()->getId(),
+        "opCtx_getTxnNumber"_attr = opCtx->getTxnNumber());
 
     return participantsSet;
 }
@@ -235,7 +245,7 @@ public:
                                         validateParticipants(opCtx, cmd.getParticipants()));
 
             if (MONGO_unlikely(hangAfterStartingCoordinateCommit.shouldFail())) {
-                LOG(0) << "Hit hangAfterStartingCoordinateCommit failpoint";
+                LOGV2(22485, "Hit hangAfterStartingCoordinateCommit failpoint");
                 hangAfterStartingCoordinateCommit.pauseWhileSet(opCtx);
             }
 
@@ -275,8 +285,13 @@ public:
 
             // No coordinator was found in memory. Recover the decision from the local participant.
 
-            LOG(3) << "Going to recover decision from local participant for "
-                   << opCtx->getLogicalSessionId()->getId() << ':' << opCtx->getTxnNumber();
+            LOGV2_DEBUG(22486,
+                        3,
+                        "Going to recover decision from local participant for "
+                        "{opCtx_getLogicalSessionId_getId}:{opCtx_getTxnNumber}",
+                        "opCtx_getLogicalSessionId_getId"_attr =
+                            opCtx->getLogicalSessionId()->getId(),
+                        "opCtx_getTxnNumber"_attr = opCtx->getTxnNumber());
 
             boost::optional<SharedSemiFuture<void>> participantExitPrepareFuture;
             {

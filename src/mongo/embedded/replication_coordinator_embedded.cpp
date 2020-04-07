@@ -79,12 +79,12 @@ bool ReplicationCoordinatorEmbedded::canAcceptWritesForDatabase_UNSAFE(Operation
 }
 
 bool ReplicationCoordinatorEmbedded::canAcceptWritesFor(OperationContext* opCtx,
-                                                        const NamespaceString& ns) {
+                                                        const NamespaceStringOrUUID& nsOrUUID) {
     return true;
 }
 
-bool ReplicationCoordinatorEmbedded::canAcceptWritesFor_UNSAFE(OperationContext* opCtx,
-                                                               const NamespaceString& ns) {
+bool ReplicationCoordinatorEmbedded::canAcceptWritesFor_UNSAFE(
+    OperationContext* opCtx, const NamespaceStringOrUUID& nsOrUUID) {
     return true;
 }
 
@@ -154,7 +154,7 @@ void ReplicationCoordinatorEmbedded::appendConnectionStats(
 }
 
 MemberState ReplicationCoordinatorEmbedded::getMemberState() const {
-    UASSERT_NOT_IMPLEMENTED;
+    return MemberState::RS_PRIMARY;
 }
 
 std::vector<repl::MemberData> ReplicationCoordinatorEmbedded::getMemberData() const {
@@ -314,7 +314,8 @@ ReplSetConfig ReplicationCoordinatorEmbedded::getConfig() const {
     UASSERT_NOT_IMPLEMENTED;
 }
 
-void ReplicationCoordinatorEmbedded::processReplSetGetConfig(BSONObjBuilder*) {
+void ReplicationCoordinatorEmbedded::processReplSetGetConfig(BSONObjBuilder*,
+                                                             bool commitmentStatus) {
     UASSERT_NOT_IMPLEMENTED;
 }
 
@@ -343,6 +344,12 @@ Status ReplicationCoordinatorEmbedded::processReplSetFreeze(int, BSONObjBuilder*
 Status ReplicationCoordinatorEmbedded::processReplSetReconfig(OperationContext*,
                                                               const ReplSetReconfigArgs&,
                                                               BSONObjBuilder*) {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
+Status ReplicationCoordinatorEmbedded::doReplSetReconfig(OperationContext* opCtx,
+                                                         GetNewConfigFn getNewConfig,
+                                                         bool force) {
     UASSERT_NOT_IMPLEMENTED;
 }
 
@@ -494,6 +501,10 @@ TopologyVersion ReplicationCoordinatorEmbedded::getTopologyVersion() const {
     UASSERT_NOT_IMPLEMENTED;
 }
 
+void ReplicationCoordinatorEmbedded::incrementTopologyVersion(OperationContext* opCtx) {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
 std::shared_ptr<const repl::IsMasterResponse> ReplicationCoordinatorEmbedded::awaitIsMasterResponse(
     OperationContext* opCtx,
     const repl::SplitHorizon::Parameters& horizonParams,
@@ -502,8 +513,19 @@ std::shared_ptr<const repl::IsMasterResponse> ReplicationCoordinatorEmbedded::aw
     UASSERT_NOT_IMPLEMENTED;
 };
 
+SharedSemiFuture<std::shared_ptr<const IsMasterResponse>>
+ReplicationCoordinatorEmbedded::getIsMasterResponseFuture(
+    const SplitHorizon::Parameters& horizonParams,
+    boost::optional<TopologyVersion> clientTopologyVersion) const {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
 OpTime ReplicationCoordinatorEmbedded::getLatestWriteOpTime(OperationContext* opCtx) const {
     return getMyLastAppliedOpTime();
+}
+
+HostAndPort ReplicationCoordinatorEmbedded::getCurrentPrimaryHostAndPort() const {
+    UASSERT_NOT_IMPLEMENTED;
 }
 
 }  // namespace embedded

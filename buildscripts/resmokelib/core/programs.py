@@ -7,6 +7,7 @@ import json
 import os
 import os.path
 import stat
+import sys
 
 from . import jasper_process
 from . import process
@@ -21,13 +22,15 @@ from .. import utils
 
 # The default verbosity setting for any tests that are not started with an Evergreen task id. This
 # will apply to any tests run locally.
-DEFAULT_MONGOD_LOG_COMPONENT_VERBOSITY = {"replication": {"rollback": 2}, "transaction": 4}
+DEFAULT_MONGOD_LOG_COMPONENT_VERBOSITY = {
+    "replication": {"rollback": 2}, "sharding": {"migration": 2}, "transaction": 4
+}
 
 # The default verbosity setting for any tests running in Evergreen i.e. started with an Evergreen
 # task id.
 DEFAULT_EVERGREEN_MONGOD_LOG_COMPONENT_VERBOSITY = {
     "replication": {"election": 4, "heartbeats": 2, "initialSync": 2, "rollback": 2},
-    "storage": {"recovery": 2}, "transaction": 4
+    "sharding": {"migration": 2}, "storage": {"recovery": 2}, "transaction": 4
 }
 
 # The default verbosity setting for any tests that are not started with an Evergreen task id. This
@@ -44,10 +47,20 @@ def make_process(*args, **kwargs):
     process_cls = process.Process
     if config.SPAWN_USING == "jasper":
         process_cls = jasper_process.Process
+
     # Add the current working directory and /data/multiversion to the PATH.
     env_vars = kwargs.get("env_vars", {}).copy()
-    path = [env_vars.get("PATH", os.environ.get("PATH", ""))]
-    path = [os.getcwd(), config.DEFAULT_MULTIVERSION_DIR] + path
+    path = [
+        os.getcwd(),
+        config.DEFAULT_MULTIVERSION_DIR,
+    ]
+
+    # If installDir is provided, add it early to the path
+    if config.INSTALL_DIR is not None:
+        path.append(config.INSTALL_DIR)
+
+    path.append(env_vars.get("PATH", os.environ.get("PATH", "")))
+
     env_vars["PATH"] = os.pathsep.join(path)
     kwargs["env_vars"] = env_vars
     return process_cls(*args, **kwargs)
@@ -138,7 +151,6 @@ def mongod_program(  # pylint: disable=too-many-branches
 
     shortcut_opts = {
         "enableMajorityReadConcern": config.MAJORITY_READ_CONCERN,
-        "logFormat": config.LOG_FORMAT,
         "nojournal": config.NO_JOURNAL,
         "serviceExecutor": config.SERVICE_EXECUTOR,
         "storageEngine": config.STORAGE_ENGINE,
@@ -156,7 +168,7 @@ def mongod_program(  # pylint: disable=too-many-branches
         shortcut_opts["wiredTigerCacheSizeGB"] = config.STORAGE_ENGINE_CACHE_SIZE
 
     # These options are just flags, so they should not take a value.
-    opts_without_vals = ("nojournal", )
+    opts_without_vals = ("nojournal", "logappend")
 
     # Have the --nojournal command line argument to resmoke.py unset the journal option.
     if shortcut_opts["nojournal"] and "journal" in kwargs:
@@ -214,9 +226,6 @@ def mongos_program(logger, executable=None, process_kwargs=None, **kwargs):
 
     _apply_set_parameters(args, suite_set_parameters)
 
-    if config.LOG_FORMAT is not None:
-        kwargs["logFormat"] = config.LOG_FORMAT
-
     # Apply the rest of the command line arguments.
     _apply_kwargs(args, kwargs)
 
@@ -247,7 +256,6 @@ def mongo_shell_program(  # pylint: disable=too-many-branches,too-many-locals,to
         test_name = None
     shortcut_opts = {
         "enableMajorityReadConcern": (config.MAJORITY_READ_CONCERN, True),
-        "logFormat": (config.LOG_FORMAT, ""),
         "mixedBinVersions": (config.MIXED_BIN_VERSIONS, ""),
         "noJournal": (config.NO_JOURNAL, False),
         "serviceExecutor": (config.SERVICE_EXECUTOR, ""),
@@ -270,6 +278,9 @@ def mongo_shell_program(  # pylint: disable=too-many-branches,too-many-locals,to
             test_data[opt_name] = opt_default
 
     global_vars["TestData"] = test_data
+
+    if config.EVERGREEN_TASK_ID is not None:
+        test_data["inEvergreen"] = True
 
     # Initialize setParameters for mongod and mongos, to be passed to the shell via TestData. Since
     # they are dictionaries, they will be converted to JavaScript objects when passed to the shell
@@ -305,6 +316,8 @@ def mongo_shell_program(  # pylint: disable=too-many-branches,too-many-locals,to
     test_data["setParameters"] = mongod_set_parameters
     test_data["setParametersMongos"] = mongos_set_parameters
 
+    test_data["isAsanBuild"] = config.IS_ASAN_BUILD
+
     # There's a periodic background thread that checks for and aborts expired transactions.
     # "transactionLifetimeLimitSeconds" specifies for how long a transaction can run before expiring
     # and being aborted by the background thread. It defaults to 60 seconds, which is too short to
@@ -339,6 +352,9 @@ def mongo_shell_program(  # pylint: disable=too-many-branches,too-many-locals,to
     eval_sb.append(
         "load('jstests/libs/override_methods/check_indexes_consistent_across_cluster.js');")
 
+    # Load a callback to check that all orphans are deleted before shutting down a ShardingTest.
+    eval_sb.append("load('jstests/libs/override_methods/check_orphans_are_deleted.js');")
+
     # Load this file to retry operations that fail due to in-progress background operations.
     eval_sb.append(
         "load('jstests/libs/override_methods/implicitly_retry_on_background_op_in_progress.js');")
@@ -362,9 +378,6 @@ def mongo_shell_program(  # pylint: disable=too-many-branches,too-many-locals,to
 
         if "host" in kwargs:
             kwargs.pop("host")
-
-    if config.LOG_FORMAT is not None:
-        kwargs["logFormat"] = config.LOG_FORMAT
 
     # Apply the rest of the command line arguments.
     _apply_kwargs(args, kwargs)

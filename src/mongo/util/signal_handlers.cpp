@@ -43,6 +43,7 @@
 #include "mongo/db/log_process_details.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/process_id.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/assert_util.h"
@@ -78,24 +79,26 @@ namespace {
 #ifdef _WIN32
 void consoleTerminate(const char* controlCodeName) {
     setThreadName("consoleTerminate");
-    log() << "got " << controlCodeName << ", will terminate after current cmd ends";
+    LOGV2(23371,
+          "got {controlCodeName}, will terminate after current cmd ends",
+          "controlCodeName"_attr = controlCodeName);
     exitCleanly(EXIT_KILL);
 }
 
 BOOL WINAPI CtrlHandler(DWORD fdwCtrlType) {
     switch (fdwCtrlType) {
         case CTRL_C_EVENT:
-            log() << "Ctrl-C signal";
+            LOGV2(23372, "Ctrl-C signal");
             consoleTerminate("CTRL_C_EVENT");
             return TRUE;
 
         case CTRL_CLOSE_EVENT:
-            log() << "CTRL_CLOSE_EVENT signal";
+            LOGV2(23373, "CTRL_CLOSE_EVENT signal");
             consoleTerminate("CTRL_CLOSE_EVENT");
             return TRUE;
 
         case CTRL_BREAK_EVENT:
-            log() << "CTRL_BREAK_EVENT signal";
+            LOGV2(23374, "CTRL_BREAK_EVENT signal");
             consoleTerminate("CTRL_BREAK_EVENT");
             return TRUE;
 
@@ -104,7 +107,7 @@ BOOL WINAPI CtrlHandler(DWORD fdwCtrlType) {
             return FALSE;
 
         case CTRL_SHUTDOWN_EVENT:
-            log() << "CTRL_SHUTDOWN_EVENT signal";
+            LOGV2(23375, "CTRL_SHUTDOWN_EVENT signal");
             consoleTerminate("CTRL_SHUTDOWN_EVENT");
             return TRUE;
 
@@ -118,7 +121,9 @@ void eventProcessingThread() {
 
     HANDLE event = CreateEventA(nullptr, TRUE, FALSE, eventName.c_str());
     if (event == nullptr) {
-        warning() << "eventProcessingThread CreateEvent failed: " << errnoWithDescription();
+        LOGV2_WARNING(23382,
+                      "eventProcessingThread CreateEvent failed: {errnoWithDescription}",
+                      "errnoWithDescription"_attr = errnoWithDescription());
         return;
     }
 
@@ -127,19 +132,24 @@ void eventProcessingThread() {
     int returnCode = WaitForSingleObject(event, INFINITE);
     if (returnCode != WAIT_OBJECT_0) {
         if (returnCode == WAIT_FAILED) {
-            warning() << "eventProcessingThread WaitForSingleObject failed: "
-                      << errnoWithDescription();
+            LOGV2_WARNING(
+                23383,
+                "eventProcessingThread WaitForSingleObject failed: {errnoWithDescription}",
+                "errnoWithDescription"_attr = errnoWithDescription());
             return;
         } else {
-            warning() << "eventProcessingThread WaitForSingleObject failed: "
-                      << errnoWithDescription(returnCode);
+            LOGV2_WARNING(23384,
+                          "eventProcessingThread WaitForSingleObject failed: "
+                          "{errnoWithDescription_returnCode}",
+                          "errnoWithDescription_returnCode"_attr =
+                              errnoWithDescription(returnCode));
             return;
         }
     }
 
     setThreadName("eventTerminate");
 
-    log() << "shutdown event signaled, will terminate after current cmd ends";
+    LOGV2(23376, "shutdown event signaled, will terminate after current cmd ends");
     exitCleanly(EXIT_CLEAN);
 }
 
@@ -169,7 +179,9 @@ bool waitForSignal(const sigset_t& sigset, SignalWaitResult* result) {
         if (result->sig == -1) {
             if (errsv == EINTR)
                 continue;
-            severe() << "sigwaitinfo failed with error:" << strerror(errsv);
+            LOGV2_FATAL(23385,
+                        "sigwaitinfo failed with error:{strerror_errsv}",
+                        "strerror_errsv"_attr = strerror(errsv));
             return false;
         }
         return true;
@@ -189,19 +201,25 @@ struct LogRotationState {
 
 void handleOneSignal(const SignalWaitResult& waited, LogRotationState* rotation) {
     int sig = waited.sig;
-    log() << "got signal " << sig << " (" << strsignal(sig) << ")";
-#ifdef __linux__
+    LOGV2(23377,
+          "got signal {sig} ({strsignal_sig})",
+          "sig"_attr = sig,
+          "strsignal_sig"_attr = strsignal(sig));
+#if defined(__linux__)
     const siginfo_t& si = waited.si;
     switch (si.si_code) {
         case SI_USER:
         case SI_QUEUE:
-            log() << "kill from pid:" << si.si_pid << " uid:" << si.si_uid;
+            LOGV2(23378,
+                  "kill from pid:{si_si_pid} uid:{si_si_uid}",
+                  "si_si_pid"_attr = si.si_pid,
+                  "si_si_uid"_attr = si.si_uid);
             break;
         case SI_TKILL:
-            log() << "tgkill";
+            LOGV2(23379, "tgkill");
             break;
         case SI_KERNEL:
-            log() << "kernel";
+            LOGV2(23380, "kernel");
             break;
     }
 #endif  // __linux__
@@ -215,23 +233,26 @@ void handleOneSignal(const SignalWaitResult& waited, LogRotationState* rotation)
                 return;
             rotation->previous = now;
         }
-        fassert(16782, rotateLogs(serverGlobalParams.logRenameOnRotate, logV2Enabled()));
+        fassert(16782, rotateLogs(serverGlobalParams.logRenameOnRotate));
         if (rotation->logFileStatus == LogFileStatus::kNeedToRotateLogFile) {
             logProcessDetailsForLogRotate(getGlobalServiceContext());
         }
         return;
     }
-#if defined(MONGO_STACKTRACE_CAN_DUMP_ALL_THREADS)
+
+#if defined(MONGO_STACKTRACE_HAS_SIGNAL)
     if (sig == stackTraceSignal()) {
-        auto logObj = log();
-        auto& stream = logObj.setIsTruncatable(false).stream();
-        OstreamStackTraceSink sink{stream};
-        printAllThreadStacks(sink);
+        // If there's a stackTraceSignal at all, catch it here so we don't die from it.
+        // Can dump all threads if we can, else silently ignore it.
+#if defined(MONGO_STACKTRACE_CAN_DUMP_ALL_THREADS)
+        printAllThreadStacks();
+#endif
         return;
     }
 #endif
+
     // interrupt/terminate signal
-    log() << "will terminate after current cmd ends";
+    LOGV2(23381, "will terminate after current cmd ends");
     exitCleanly(EXIT_CLEAN);
 }
 
@@ -240,7 +261,7 @@ void handleOneSignal(const SignalWaitResult& waited, LogRotationState* rotation)
  * to ensure the db and log mutexes aren't held.
  */
 void signalProcessingThread(LogFileStatus rotate) {
-    setThreadName("signalProcessingThread");
+    setThreadName("SignalHandler");
 
     LogRotationState logRotationState{rotate, logRotationState.kNever};
 
@@ -250,15 +271,17 @@ void signalProcessingThread(LogFileStatus rotate) {
     for (int sig : kSignalProcessingThreadExclusives)
         sigaddset(&waitSignals, sig);
 
-#if defined(MONGO_STACKTRACE_CAN_DUMP_ALL_THREADS)
-    // On this thread, block the stackTraceSignal and rely on sigwaitinfo to deliver it.
+#if defined(MONGO_STACKTRACE_HAS_SIGNAL)
+    // On this thread, block the stackTraceSignal and rely on a signal wait to deliver it.
     sigaddset(&waitSignals, stackTraceSignal());
 #endif
 
     errno = 0;
     if (int r = pthread_sigmask(SIG_SETMASK, &waitSignals, nullptr); r != 0) {
         int errsv = errno;
-        severe() << "pthread_sigmask failed with error:" << strerror(errsv);
+        LOGV2_FATAL(23386,
+                    "pthread_sigmask failed with error:{strerror_errsv}",
+                    "strerror_errsv"_attr = strerror(errsv));
         fassertFailed(31377);
     }
 
@@ -299,6 +322,13 @@ void startSignalProcessingThread(LogFileStatus rotate) {
     sigemptyset(&sigset);
     for (int sig : kSignalProcessingThreadExclusives)
         sigaddset(&sigset, sig);
+
+#if defined(MONGO_STACKTRACE_HAS_SIGNAL) && !defined(MONGO_STACKTRACE_CAN_DUMP_ALL_THREADS)
+    // On a Unixlike build without the stacktrace behavior, we still want to handle SIGUSR2 to
+    // print a message, but it must only go to the signalProcessingThread, not on other threads.
+    // It's as if stackTraceSignal (e.g. SIGUSR2) is a member of kSignalProcessingThreadExclusives.
+    sigaddset(&sigset, stackTraceSignal());
+#endif
 
     // Mask signals in the current (only) thread. All new threads will inherit this mask.
     invariant(pthread_sigmask(SIG_SETMASK, &sigset, nullptr) == 0);

@@ -26,18 +26,62 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+
 #include "mongo/platform/basic.h"
 
+#include <iterator>
+
+#include "mongo/db/commands/test_commands_enabled.h"
+#include "mongo/db/pipeline/document_source_match.h"
+#include "mongo/db/pipeline/document_source_single_document_transformation.h"
 #include "mongo/db/pipeline/document_source_union_with.h"
+#include "mongo/db/pipeline/document_source_union_with_gen.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 
-REGISTER_TEST_DOCUMENT_SOURCE(unionWith,
-                              DocumentSourceUnionWith::LiteParsed::parse,
-                              DocumentSourceUnionWith::createFromBson);
+REGISTER_DOCUMENT_SOURCE_WITH_MIN_VERSION(
+    unionWith,
+    DocumentSourceUnionWith::LiteParsed::parse,
+    DocumentSourceUnionWith::createFromBson,
+    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44);
+
+namespace {
+std::unique_ptr<Pipeline, PipelineDeleter> buildPipelineFromViewDefinition(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    ExpressionContext::ResolvedNamespace resolvedNs,
+    std::vector<BSONObj> currentPipeline) {
+
+    auto validatorCallback = [](const Pipeline& pipeline) {
+        const auto& sources = pipeline.getSources();
+        std::for_each(sources.begin(), sources.end(), [](auto& src) {
+            uassert(31441,
+                    str::stream() << src->getSourceName()
+                                  << " is not allowed within a $unionWith's sub-pipeline",
+                    src->constraints().isAllowedInUnionPipeline());
+        });
+    };
+
+    // Copy the ExpressionContext of the base aggregation, using the inner namespace instead.
+    auto unionExpCtx = expCtx->copyForSubPipeline(resolvedNs.ns);
+
+    if (resolvedNs.pipeline.empty()) {
+        return Pipeline::parse(std::move(currentPipeline), unionExpCtx, validatorCallback);
+    }
+    auto resolvedPipeline = std::move(resolvedNs.pipeline);
+    resolvedPipeline.reserve(currentPipeline.size() + resolvedPipeline.size());
+    resolvedPipeline.insert(resolvedPipeline.end(),
+                            std::make_move_iterator(currentPipeline.begin()),
+                            std::make_move_iterator(currentPipeline.end()));
+
+    return Pipeline::parse(std::move(resolvedPipeline), unionExpCtx, validatorCallback);
+}
+
+}  // namespace
 
 std::unique_ptr<DocumentSourceUnionWith::LiteParsed> DocumentSourceUnionWith::LiteParsed::parse(
-    const AggregationRequest& request, const BSONElement& spec) {
+    const NamespaceString& nss, const BSONElement& spec) {
     uassert(ErrorCodes::FailedToParse,
             str::stream()
                 << "the $unionWith stage specification must be an object or string, but found "
@@ -45,29 +89,47 @@ std::unique_ptr<DocumentSourceUnionWith::LiteParsed> DocumentSourceUnionWith::Li
             spec.type() == BSONType::Object || spec.type() == BSONType::String);
 
     NamespaceString unionNss;
-    stdx::unordered_set<NamespaceString> foreignNssSet;
     boost::optional<LiteParsedPipeline> liteParsedPipeline;
     if (spec.type() == BSONType::String) {
-        unionNss = NamespaceString(request.getNamespaceString().db(), spec.valueStringData());
+        unionNss = NamespaceString(nss.db(), spec.valueStringData());
     } else {
-        unionNss =
-            NamespaceString(request.getNamespaceString().db(), spec["coll"].valueStringData());
+        auto unionWithSpec =
+            UnionWithSpec::parse(IDLParserErrorContext(kStageName), spec.embeddedObject());
+        unionNss = NamespaceString(nss.db(), unionWithSpec.getColl());
 
         // Recursively lite parse the nested pipeline, if one exists.
-        if (auto pipelineElem = spec["pipeline"]) {
-            auto pipeline =
-                uassertStatusOK(AggregationRequest::parsePipelineFromBSON(pipelineElem));
-            AggregationRequest foreignAggReq(unionNss, std::move(pipeline));
-            liteParsedPipeline = LiteParsedPipeline(foreignAggReq);
-
-            foreignNssSet.merge(liteParsedPipeline->getInvolvedNamespaces());
+        if (unionWithSpec.getPipeline()) {
+            liteParsedPipeline = LiteParsedPipeline(unionNss, *unionWithSpec.getPipeline());
         }
     }
 
-    foreignNssSet.insert(unionNss);
-
     return std::make_unique<DocumentSourceUnionWith::LiteParsed>(
-        std::move(unionNss), std::move(foreignNssSet), std::move(liteParsedPipeline));
+        spec.fieldName(), std::move(unionNss), std::move(liteParsedPipeline));
+}
+
+PrivilegeVector DocumentSourceUnionWith::LiteParsed::requiredPrivileges(
+    bool isMongos, bool bypassDocumentValidation) const {
+    PrivilegeVector requiredPrivileges;
+    invariant(_pipelines.size() <= 1);
+    invariant(_foreignNss);
+
+    // If no pipeline is specified, then assume that we're reading directly from the collection.
+    // Otherwise check whether the pipeline starts with an "initial source" indicating that we don't
+    // require the "find" privilege.
+    if (_pipelines.empty() || !_pipelines[0].startsWithInitialSource()) {
+        Privilege::addPrivilegeToPrivilegeVector(
+            &requiredPrivileges,
+            Privilege(ResourcePattern::forExactNamespace(*_foreignNss), ActionType::find));
+    }
+
+    // Add the sub-pipeline privileges, if one was specified.
+    if (!_pipelines.empty()) {
+        const LiteParsedPipeline& pipeline = _pipelines[0];
+        Privilege::addPrivilegesToPrivilegeVector(
+            &requiredPrivileges,
+            std::move(pipeline.requiredPrivileges(isMongos, bypassDocumentValidation)));
+    }
+    return requiredPrivileges;
 }
 
 boost::intrusive_ptr<DocumentSource> DocumentSourceUnionWith::createFromBson(
@@ -83,71 +145,83 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceUnionWith::createFromBson(
     if (elem.type() == BSONType::String) {
         unionNss = NamespaceString(expCtx->ns.db().toString(), elem.valueStringData());
     } else {
-        bool sawColl = false;
-        bool sawPipeline = false;
-        for (auto&& arg : elem.embeddedObject()) {
-            auto fieldName = arg.fieldNameStringData();
-            if (fieldName == "coll") {
-                if (sawColl)
-                    uasserted(ErrorCodes::FailedToParse,
-                              str::stream() << "Redundant 'coll' argument given to $unionWith");
-                unionNss = NamespaceString(expCtx->ns.db().toString(), arg.valueStringData());
-                sawColl = true;
-            } else if (fieldName == "pipeline") {
-                if (sawPipeline)
-                    uasserted(ErrorCodes::FailedToParse,
-                              str::stream() << "Redundant 'pipeline' argument given to $unionWith");
-                pipeline = uassertStatusOK(AggregationRequest::parsePipelineFromBSON(arg));
-                sawPipeline = true;
-            } else
-                uasserted(ErrorCodes::FailedToParse,
-                          str::stream()
-                              << "Unknown argument given to $unionWith stage: " << fieldName);
-        }
-        if (!sawColl)
-            uasserted(ErrorCodes::FailedToParse,
-                      str::stream() << "No 'coll' argument given to $unionWith");
+        auto unionWithSpec =
+            UnionWithSpec::parse(IDLParserErrorContext(kStageName), elem.embeddedObject());
+        unionNss = NamespaceString(expCtx->ns.db().toString(), unionWithSpec.getColl());
+        pipeline = unionWithSpec.getPipeline().value_or(std::vector<BSONObj>{});
     }
     return make_intrusive<DocumentSourceUnionWith>(
         expCtx,
-        uassertStatusOK(
-            Pipeline::parse(std::move(pipeline), expCtx->copyWith(std::move(unionNss)))));
+        buildPipelineFromViewDefinition(
+            expCtx, expCtx->getResolvedNamespace(std::move(unionNss)), std::move(pipeline)));
 }
 
 DocumentSource::GetNextResult DocumentSourceUnionWith::doGetNext() {
-    if (!_sourceExhausted) {
+    if (!_pipeline) {
+        // We must have already been disposed, so we're finished.
+        return GetNextResult::makeEOF();
+    }
+
+    if (_executionState == ExecutionProgress::kIteratingSource) {
         auto nextInput = pSource->getNext();
         if (!nextInput.isEOF()) {
             return nextInput;
         }
-        _sourceExhausted = true;
+        _executionState = ExecutionProgress::kStartingSubPipeline;
         // All documents from the base collection have been returned, switch to iterating the sub-
         // pipeline by falling through below.
     }
 
-    if (!_cursorAttached) {
-        auto ctx = _pipeline->getContext();
-        _pipeline =
-            pExpCtx->mongoProcessInterface->attachCursorSourceToPipeline(ctx, _pipeline.release());
-        _cursorAttached = true;
+    if (_executionState == ExecutionProgress::kStartingSubPipeline) {
+        LOGV2_DEBUG(23869,
+                    3,
+                    "$unionWith attaching cursor to pipeline {pipeline}",
+                    "pipeline"_attr = Value(_pipeline->serialize()));
+        auto expCtxCopy = _pipeline->getContext();
+        _pipeline = pExpCtx->mongoProcessInterface->attachCursorSourceToPipeline(
+            expCtxCopy, _pipeline.release());
+        _executionState = ExecutionProgress::kIteratingSubPipeline;
     }
 
-    if (auto res = _pipeline->getNext())
+    auto res = _pipeline->getNext();
+    if (res)
         return std::move(*res);
 
+    _executionState = ExecutionProgress::kFinished;
     return GetNextResult::makeEOF();
 }
 
-DocumentSource::GetModPathsReturn DocumentSourceUnionWith::getModifiedPaths() const {
-    // Since we might have a document arrive from the foreign pipeline with the same path as a
-    // document in the main pipeline. Without introspecting the sub-pipeline, we must report that
-    // all paths have been modified.
-    return {GetModPathsReturn::Type::kAllPaths, {}, {}};
+Pipeline::SourceContainer::iterator DocumentSourceUnionWith::doOptimizeAt(
+    Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
+    auto duplicateAcrossUnion = [&](auto&& nextStage) {
+        _pipeline->addFinalSource(nextStage->clone());
+        auto newStageItr = container->insert(itr, std::move(nextStage));
+        container->erase(std::next(itr));
+        return newStageItr == container->begin() ? newStageItr : std::prev(newStageItr);
+    };
+    if (std::next(itr) != container->end()) {
+        if (auto nextMatch = dynamic_cast<DocumentSourceMatch*>((*std::next(itr)).get()))
+            return duplicateAcrossUnion(nextMatch);
+        else if (auto nextProject = dynamic_cast<DocumentSourceSingleDocumentTransformation*>(
+                     (*std::next(itr)).get()))
+            return duplicateAcrossUnion(nextProject);
+    }
+    return std::next(itr);
+};
+
+bool DocumentSourceUnionWith::usedDisk() {
+    if (_pipeline) {
+        _usedDisk = _usedDisk || _pipeline->usedDisk();
+    }
+    return _usedDisk;
 }
 
 void DocumentSourceUnionWith::doDispose() {
-    _pipeline->dispose(pExpCtx->opCtx);
-    _pipeline.reset();
+    if (_pipeline) {
+        _usedDisk = _usedDisk || _pipeline->usedDisk();
+        _pipeline->dispose(pExpCtx->opCtx);
+        _pipeline.reset();
+    }
 }
 
 void DocumentSourceUnionWith::serializeToArray(
@@ -161,21 +235,28 @@ void DocumentSourceUnionWith::serializeToArray(
 }
 
 DepsTracker::State DocumentSourceUnionWith::getDependencies(DepsTracker* deps) const {
-    return DepsTracker::State::SEE_NEXT;
+    // Since the $unionWith stage is a simple passthrough, we *could* report SEE_NEXT here in an
+    // attempt to get a covered plan for the base collection. The ideal solution would involve
+    // pushing down any dependencies to the inner pipeline as well.
+    return DepsTracker::State::NOT_SUPPORTED;
 }
 
 void DocumentSourceUnionWith::detachFromOperationContext() {
     // We have a pipeline we're going to be executing across multiple calls to getNext(), so we
     // use Pipeline::detachFromOperationContext() to take care of updating the Pipeline's
     // ExpressionContext.
-    _pipeline->detachFromOperationContext();
+    if (_pipeline) {
+        _pipeline->detachFromOperationContext();
+    }
 }
 
 void DocumentSourceUnionWith::reattachToOperationContext(OperationContext* opCtx) {
     // We have a pipeline we're going to be executing across multiple calls to getNext(), so we
     // use Pipeline::reattachToOperationContext() to take care of updating the Pipeline's
     // ExpressionContext.
-    _pipeline->reattachToOperationContext(opCtx);
+    if (_pipeline) {
+        _pipeline->reattachToOperationContext(opCtx);
+    }
 }
 
 void DocumentSourceUnionWith::addInvolvedCollections(

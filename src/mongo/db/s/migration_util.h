@@ -83,11 +83,13 @@ bool checkForConflictingDeletions(OperationContext* opCtx,
  *
  * Note that if the current filtering metadata's UUID does not match the task's UUID, the filtering
  * metadata will be refreshed once. If the UUID's still don't match, the task will be deleted from
- * disk. If the UUID's do match, the task will be submitted for processing.
+ * disk. If the UUID's do match, the range will be submitted for deletion.
  *
- * The returned future will contain whether the task was submitted for processing.
+ * If the range is submitted for deletion, the returned future is set when the range deletion
+ * completes. If the range is not submitted for deletion, the returned future is set with an error
+ * explaining why.
  */
-ExecutorFuture<bool> submitRangeDeletionTask(OperationContext* oppCtx,
+ExecutorFuture<void> submitRangeDeletionTask(OperationContext* oppCtx,
                                              const RangeDeletionTask& deletionTask);
 
 /**
@@ -144,19 +146,21 @@ void deleteRangeDeletionTaskLocally(
     const WriteConcernOptions& writeConcern = WriteConcerns::kMajorityWriteConcern);
 
 /**
- * Deletes all range deletion task documents with the specified collection UUID from
- * config.rangeDeletions and waits for majority write concern.
- */
-void deleteRangeDeletionTasksForCollectionLocally(OperationContext* opCtx,
-                                                  const UUID& collectionUuid);
-
-/**
  * Deletes the range deletion task document with the specified id from config.rangeDeletions on the
  * specified shard and waits for majority write concern.
  */
 void deleteRangeDeletionTaskOnRecipient(OperationContext* opCtx,
                                         const ShardId& recipientId,
                                         const UUID& migrationId);
+
+/**
+ * Advances the optime for the current transaction by performing a write operation as a retryable
+ * write. This is to prevent a write of the deletion task once the decision has been recorded.
+ */
+void advanceTransactionOnRecipient(OperationContext* opCtx,
+                                   const ShardId& recipientId,
+                                   const LogicalSessionId& lsid,
+                                   TxnNumber txnNumber);
 
 /**
  * Removes the 'pending' flag from the range deletion task document with the specified id from

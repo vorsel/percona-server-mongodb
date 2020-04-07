@@ -30,23 +30,30 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
-
-#include "mongo/util/string_map.h"
+#include "mongo/db/pipeline/lite_parsed_pipeline.h"
+#include "mongo/db/stats/counters.h"
 
 namespace mongo {
 
 using Parser = LiteParsedDocumentSource::Parser;
 
 namespace {
+
+// Empty vector used by LiteParsedDocumentSources which do not have a sub pipeline.
+inline static std::vector<LiteParsedPipeline> kNoSubPipeline = {};
+
 StringMap<Parser> parserMap;
+
 }  // namespace
 
 void LiteParsedDocumentSource::registerParser(const std::string& name, Parser parser) {
     parserMap[name] = parser;
+    // Initialize a counter for this document source to track how many times it is used.
+    aggStageCounters.stageCounterMap[name] = std::make_unique<AggStageCounters::StageCounter>(name);
 }
 
 std::unique_ptr<LiteParsedDocumentSource> LiteParsedDocumentSource::parse(
-    const AggregationRequest& request, const BSONObj& spec) {
+    const NamespaceString& nss, const BSONObj& spec) {
     uassert(40323,
             "A pipeline stage specification object must contain exactly one field.",
             spec.nFields() == 1);
@@ -59,6 +66,56 @@ std::unique_ptr<LiteParsedDocumentSource> LiteParsedDocumentSource::parse(
             str::stream() << "Unrecognized pipeline stage name: '" << stageName << "'",
             it != parserMap.end());
 
-    return it->second(request, specElem);
+    return it->second(nss, specElem);
 }
+
+const std::vector<LiteParsedPipeline>& LiteParsedDocumentSource::getSubPipelines() const {
+    return kNoSubPipeline;
+}
+
+LiteParsedDocumentSourceNestedPipelines::LiteParsedDocumentSourceNestedPipelines(
+    std::string parseTimeName,
+    boost::optional<NamespaceString> foreignNss,
+    std::vector<LiteParsedPipeline> pipelines)
+    : LiteParsedDocumentSource(std::move(parseTimeName)),
+      _foreignNss(std::move(foreignNss)),
+      _pipelines(std::move(pipelines)) {}
+
+LiteParsedDocumentSourceNestedPipelines::LiteParsedDocumentSourceNestedPipelines(
+    std::string parseTimeName,
+    boost::optional<NamespaceString> foreignNss,
+    boost::optional<LiteParsedPipeline> pipeline)
+    : LiteParsedDocumentSourceNestedPipelines(
+          std::move(parseTimeName), std::move(foreignNss), std::vector<LiteParsedPipeline>{}) {
+    if (pipeline)
+        _pipelines.emplace_back(std::move(pipeline.get()));
+}
+
+stdx::unordered_set<NamespaceString>
+LiteParsedDocumentSourceNestedPipelines::getInvolvedNamespaces() const {
+    stdx::unordered_set<NamespaceString> involvedNamespaces;
+    if (_foreignNss)
+        involvedNamespaces.insert(*_foreignNss);
+
+    for (auto&& pipeline : _pipelines) {
+        auto involvedInSubPipe = pipeline.getInvolvedNamespaces();
+        involvedNamespaces.insert(involvedInSubPipe.begin(), involvedInSubPipe.end());
+    }
+    return involvedNamespaces;
+}
+
+bool LiteParsedDocumentSourceNestedPipelines::allowedToPassthroughFromMongos() const {
+    // If any of the sub-pipelines doesn't allow pass through, then return false.
+    return std::all_of(_pipelines.cbegin(), _pipelines.cend(), [](const auto& subPipeline) {
+        return subPipeline.allowedToPassthroughFromMongos();
+    });
+}
+
+bool LiteParsedDocumentSourceNestedPipelines::allowShardedForeignCollection(
+    NamespaceString nss) const {
+    return std::all_of(_pipelines.begin(), _pipelines.end(), [&nss](auto&& pipeline) {
+        return pipeline.allowShardedForeignCollection(nss);
+    });
+}
+
 }  // namespace mongo

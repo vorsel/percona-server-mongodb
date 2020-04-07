@@ -27,6 +27,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/storage/kv/kv_engine_test_harness.h"
@@ -45,6 +47,8 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
 #include "mongo/logger/logger.h"
+#include "mongo/logv2/log.h"
+#include "mongo/unittest/log_test.h"
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/clock_source_mock.h"
@@ -253,9 +257,9 @@ TEST_F(WiredTigerKVEngineTest, TestOplogTruncation) {
     wiredTigerGlobalOptions.checkpointDelaySecs = 1;
 
     // To diagnose any intermittent failures, maximize logging from WiredTigerKVEngine and friends.
-    const auto kStorage = logger::LogComponent::kStorage;
+    const auto kStorage = logv2::LogComponent::kStorage;
     auto originalVerbosity = getMinimumLogSeverity(kStorage);
-    setMinimumLoggedSeverity(kStorage, logger::LogSeverity::Debug(3));
+    setMinimumLoggedSeverity(kStorage, logv2::LogSeverity::Debug(3));
     ON_BLOCK_EXIT([&]() { setMinimumLoggedSeverity(kStorage, originalVerbosity); });
 
     // Simulate the callback that queries config.transactions for the oldest active transaction.
@@ -294,8 +298,12 @@ TEST_F(WiredTigerKVEngineTest, TestOplogTruncation) {
             sleepmillis(100);
         }
 
-        unittest::log() << "Expected the pinned oplog to advance. Expected value: " << newPinned
-                        << " Published value: " << _engine->getOplogNeededForCrashRecovery();
+        LOGV2(22367,
+              "Expected the pinned oplog to advance. Expected value: {newPinned} Published value: "
+              "{engine_getOplogNeededForCrashRecovery}",
+              "newPinned"_attr = newPinned,
+              "engine_getOplogNeededForCrashRecovery"_attr =
+                  _engine->getOplogNeededForCrashRecovery());
         FAIL("");
     };
 

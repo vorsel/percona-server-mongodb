@@ -78,6 +78,7 @@ auto makeExpressionContext(OperationContext* opCtx,
     if (parsedMr.getScope()) {
         runtimeConstants.setJsScope(parsedMr.getScope()->getObj());
     }
+    runtimeConstants.setIsMapReduce(true);
 
     // Manually build an ExpressionContext with the desired options for the translated
     // aggregation. The one option worth noting here is allowDiskUse, which is required to allow
@@ -89,6 +90,7 @@ auto makeExpressionContext(OperationContext* opCtx,
         false,  // needsmerge
         true,   // allowDiskUse
         parsedMr.getBypassDocumentValidation().get_value_or(false),
+        true,  // isMapReduceCommand
         parsedMr.getNamespace(),
         runtimeConstants,
         std::move(resolvedCollator),

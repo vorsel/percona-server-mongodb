@@ -34,21 +34,21 @@
 #include "mongo/db/storage/ephemeral_for_test/ephemeral_for_test_recovery_unit.h"
 
 #include "mongo/db/storage/sorted_data_interface.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 
 EphemeralForTestRecoveryUnit::~EphemeralForTestRecoveryUnit() {
-    invariant(!_inUnitOfWork(), toString(getState()));
+    invariant(!_inUnitOfWork(), toString(_getState()));
 }
 
 void EphemeralForTestRecoveryUnit::beginUnitOfWork(OperationContext* opCtx) {
-    invariant(!_inUnitOfWork(), toString(getState()));
+    invariant(!_inUnitOfWork(), toString(_getState()));
     _setState(State::kInactiveInUnitOfWork);
 }
 
 void EphemeralForTestRecoveryUnit::doCommitUnitOfWork() {
-    invariant(_inUnitOfWork(), toString(getState()));
+    invariant(_inUnitOfWork(), toString(_getState()));
     _setState(State::kCommitting);
 
     try {
@@ -64,21 +64,24 @@ void EphemeralForTestRecoveryUnit::doCommitUnitOfWork() {
     // SERVER-22575: Remove this once we add a generic mechanism to periodically wait
     // for durability.
     if (_waitUntilDurableCallback) {
-        _waitUntilDurableCallback();
+        _waitUntilDurableCallback(nullptr);
     }
 
     _setState(State::kInactive);
 }
 
 void EphemeralForTestRecoveryUnit::doAbortUnitOfWork() {
-    invariant(_inUnitOfWork(), toString(getState()));
+    invariant(_inUnitOfWork(), toString(_getState()));
     _setState(State::kAborting);
 
     try {
         for (Changes::reverse_iterator it = _changes.rbegin(), end = _changes.rend(); it != end;
              ++it) {
             auto change = *it;
-            LOG(2) << "CUSTOM ROLLBACK " << demangleName(typeid(*change));
+            LOGV2_DEBUG(22217,
+                        2,
+                        "CUSTOM ROLLBACK {demangleName_typeid_change}",
+                        "demangleName_typeid_change"_attr = demangleName(typeid(*change)));
             change->rollback();
         }
         _changes.clear();
@@ -91,7 +94,7 @@ void EphemeralForTestRecoveryUnit::doAbortUnitOfWork() {
 
 bool EphemeralForTestRecoveryUnit::waitUntilDurable(OperationContext* opCtx) {
     if (_waitUntilDurableCallback) {
-        _waitUntilDurableCallback();
+        _waitUntilDurableCallback(opCtx);
     }
     return true;
 }
@@ -101,7 +104,7 @@ bool EphemeralForTestRecoveryUnit::inActiveTxn() const {
 }
 
 void EphemeralForTestRecoveryUnit::doAbandonSnapshot() {
-    invariant(!_inUnitOfWork(), toString(getState()));
+    invariant(!_inUnitOfWork(), toString(_getState()));
 }
 
 Status EphemeralForTestRecoveryUnit::obtainMajorityCommittedSnapshot() {

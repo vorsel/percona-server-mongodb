@@ -43,12 +43,12 @@
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/db/storage/recovery_unit_noop.h"
+#include "mongo/logv2/log.h"
 #include "mongo/stdx/future.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/concurrency/ticketholder.h"
 #include "mongo/util/debug_util.h"
-#include "mongo/util/log.h"
 #include "mongo/util/progress_meter.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/time_support.h"
@@ -240,7 +240,7 @@ TEST_F(DConcurrencyTestFixture, ResourceMutex) {
         state.finish(3);
 
         // Step 4: Try to regain the shared lock // transfers control to t1
-        lk.lock(MODE_IS);
+        lk.lock(nullptr, MODE_IS);
 
         // Step 6: CHeck we actually got back the shared lock
         ASSERT(lk.isLocked());
@@ -471,6 +471,24 @@ TEST_F(DConcurrencyTestFixture, RSTLmodeX_Timeout) {
     ASSERT_EQ(
         clients[1].second.get()->lockState()->getLockMode(resourceIdReplicationStateTransitionLock),
         MODE_NONE);
+}
+
+TEST_F(DConcurrencyTestFixture, PBWMmodeX_Timeout) {
+    auto clients = makeKClientsWithLockers(2);
+    Lock::ParallelBatchWriterMode pbwm(clients[0].second.get()->lockState());
+    ASSERT_EQ(clients[0].second.get()->lockState()->getLockMode(resourceIdParallelBatchWriterMode),
+              MODE_X);
+
+    ASSERT_THROWS_CODE(Lock::GlobalLock(clients[1].second.get(),
+                                        MODE_X,
+                                        Date_t::now() + Milliseconds(1),
+                                        Lock::InterruptBehavior::kThrow),
+                       AssertionException,
+                       ErrorCodes::LockTimeout);
+    ASSERT_EQ(clients[0].second.get()->lockState()->getLockMode(resourceIdParallelBatchWriterMode),
+              MODE_X);
+    ASSERT_EQ(clients[1].second.get()->lockState()->getLockMode(resourceIdParallelBatchWriterMode),
+              MODE_NONE);
 }
 
 TEST_F(DConcurrencyTestFixture, GlobalLockXSetsGlobalWriteLockedOnOperationContext) {
@@ -2056,9 +2074,13 @@ TEST_F(DConcurrencyTestFixture, CompatibleFirstStress) {
     for (auto& thread : threads)
         thread.join();
     for (int threadId = 0; threadId < numThreads; threadId++) {
-        log() << "thread " << threadId << " stats: " << acquisitionCount[threadId]
-              << " acquisitions, " << timeoutCount[threadId] << " timeouts, "
-              << busyWaitCount[threadId] / 1'000'000 << "M busy waits";
+        LOGV2(20515,
+              "thread {threadId} stats: {acquisitionCount_threadId} acquisitions, "
+              "{timeoutCount_threadId} timeouts, {busyWaitCount_threadId_1_000_000}M busy waits",
+              "threadId"_attr = threadId,
+              "acquisitionCount_threadId"_attr = acquisitionCount[threadId],
+              "timeoutCount_threadId"_attr = timeoutCount[threadId],
+              "busyWaitCount_threadId_1_000_000"_attr = busyWaitCount[threadId] / 1'000'000);
     }
 }
 
@@ -2323,7 +2345,7 @@ TEST_F(DConcurrencyTestFixture, PBWMRespectsMaxTimeMS) {
     auto opCtx2 = clientOpCtxPairs[1].second.get();
 
     Lock::ResourceLock pbwm1(opCtx1->lockState(), resourceIdParallelBatchWriterMode);
-    pbwm1.lock(MODE_X);
+    pbwm1.lock(nullptr, MODE_X);
 
     opCtx2->setDeadlineAfterNowBy(Seconds{1}, ErrorCodes::ExceededTimeLimit);
 

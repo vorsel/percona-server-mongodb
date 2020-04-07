@@ -40,9 +40,11 @@
 #include "mongo/db/curop.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/logical_clock.h"
+#include "mongo/db/pipeline/lite_parsed_pipeline.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/storage/duplicate_key_error_info.h"
 #include "mongo/executor/task_executor_pool.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/client/num_hosts_targeted_metrics.h"
 #include "mongo/s/client/shard_registry.h"
@@ -59,7 +61,6 @@
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/s/write_ops/chunk_manager_targeter.h"
 #include "mongo/s/write_ops/cluster_write.h"
-#include "mongo/util/log.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
@@ -206,7 +207,7 @@ bool handleWouldChangeOwningShardError(OperationContext* opCtx,
     boost::optional<BSONObj> upsertedId;
     if (isRetryableWrite) {
         if (MONGO_unlikely(hangAfterThrowWouldChangeOwningShardRetryableWrite.shouldFail())) {
-            log() << "Hit hangAfterThrowWouldChangeOwningShardRetryableWrite failpoint";
+            LOGV2(22759, "Hit hangAfterThrowWouldChangeOwningShardRetryableWrite failpoint");
             hangAfterThrowWouldChangeOwningShardRetryableWrite.pauseWhileSet(opCtx);
         }
         RouterOperationContextSession routerSession(opCtx);
@@ -506,6 +507,15 @@ private:
                 debug.additiveMetrics.nMatched =
                     response.getN() - (debug.upsert ? response.sizeUpsertDetails() : 0);
                 debug.additiveMetrics.nModified = response.getNModified();
+                for (auto&& update : _batchedRequest.getUpdateRequest().getUpdates()) {
+                    // If this was a pipeline style update, record which stages were being used.
+                    auto updateMod = update.getU();
+                    if (updateMod.type() == write_ops::UpdateModification::Type::kPipeline) {
+                        auto pipeline = LiteParsedPipeline(_batchedRequest.getNS(),
+                                                           updateMod.getUpdatePipeline());
+                        pipeline.tickGlobalStageCounters();
+                    }
+                }
                 break;
             case BatchedCommandRequest::BatchType_Delete:
                 for (size_t i = 0; i < numAttempts; ++i) {

@@ -41,9 +41,9 @@
 #include "mongo/db/server_options_helpers.h"
 #include "mongo/db/service_context.h"
 #include "mongo/logger/logger.h"
+#include "mongo/logv2/log.h"
 #include "mongo/transport/transport_layer_asio.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
 #include "mongo/util/options_parser/environment.h"
 #include "mongo/util/options_parser/option_section.h"
 #include "mongo/util/options_parser/options_parser.h"
@@ -133,7 +133,9 @@ MONGO_STARTUP_OPTIONS_STORE(IntegrationTestOptions)(InitializerContext*) {
     }
 
     fixtureConnectionString = std::move(swConnectionString.getValue());
-    log() << "Using test fixture with connection string = " << connectionString;
+    LOGV2(23050,
+          "Using test fixture with connection string = {connectionString}",
+          "connectionString"_attr = connectionString);
 
 
     return Status::OK();

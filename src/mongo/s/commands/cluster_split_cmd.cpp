@@ -39,19 +39,19 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/field_parser.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/shard_util.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
 
 /**
  * Asks the mongod holding this chunk to find a key that approximately divides the specified chunk
- * in two. Throws on error or if the chunk is empty.
+ * in two. Throws on error or if the chunk is indivisible.
  */
 BSONObj selectMedianKey(OperationContext* opCtx,
                         const ShardId& shardId,
@@ -81,7 +81,7 @@ BSONObj selectMedianKey(OperationContext* opCtx,
     }
 
     uasserted(ErrorCodes::CannotSplit,
-              "Unable to find median in chunk, possibly because chunk is empty.");
+              "Unable to find median in chunk because chunk is indivisible.");
 }
 
 class SplitCollectionCmd : public ErrmsgCommandDeprecated {
@@ -193,8 +193,8 @@ public:
 
         if (!find.isEmpty()) {
             // find
-            BSONObj shardKey =
-                uassertStatusOK(cm->getShardKeyPattern().extractShardKeyFromQuery(opCtx, find));
+            BSONObj shardKey = uassertStatusOK(
+                cm->getShardKeyPattern().extractShardKeyFromQuery(opCtx, nss, find));
             if (shardKey.isEmpty()) {
                 errmsg = str::stream() << "no shard key found in chunk query " << find;
                 return false;
@@ -254,10 +254,14 @@ public:
                               cm->getShardKeyPattern(),
                               ChunkRange(chunk->getMin(), chunk->getMax()));
 
-        log() << "Splitting chunk "
-              << redact(ChunkRange(chunk->getMin(), chunk->getMax()).toString())
-              << " in collection " << nss.ns() << " on shard " << chunk->getShardId() << " at key "
-              << redact(splitPoint);
+        LOGV2(22758,
+              "Splitting chunk {ChunkRange_chunk_getMin_chunk_getMax} in collection {nss_ns} on "
+              "shard {chunk_getShardId} at key {splitPoint}",
+              "ChunkRange_chunk_getMin_chunk_getMax"_attr =
+                  redact(ChunkRange(chunk->getMin(), chunk->getMax()).toString()),
+              "nss_ns"_attr = nss.ns(),
+              "chunk_getShardId"_attr = chunk->getShardId(),
+              "splitPoint"_attr = redact(splitPoint));
 
         uassertStatusOK(
             shardutil::splitChunkAtMultiplePoints(opCtx,

@@ -39,7 +39,7 @@
 #include "mongo/db/exec/projection_executor_utils.h"
 #include "mongo/db/index/wildcard_key_generator.h"
 #include "mongo/db/query/index_bounds.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 namespace wildcard_planning {
@@ -245,9 +245,14 @@ bool validateNumericPathComponents(const MultikeyPaths& multikeyPaths,
     // all paths with and without array indices. Because this is O(2^n), we decline to answer
     // queries that traverse more than 8 levels of array indices.
     if (arrayIndices.size() > kWildcardMaxArrayIndexTraversalDepth) {
-        LOG(2) << "Declining to answer query on field '" << queryPath.dottedField()
-               << "' with $** index, as it traverses through more than "
-               << kWildcardMaxArrayIndexTraversalDepth << " nested array indices.";
+        LOGV2_DEBUG(20955,
+                    2,
+                    "Declining to answer query on field '{queryPath_dottedField}' with $** index, "
+                    "as it traverses through more than {kWildcardMaxArrayIndexTraversalDepth} "
+                    "nested array indices.",
+                    "queryPath_dottedField"_attr = queryPath.dottedField(),
+                    "kWildcardMaxArrayIndexTraversalDepth"_attr =
+                        kWildcardMaxArrayIndexTraversalDepth);
         return false;
     }
 
@@ -362,8 +367,9 @@ void expandWildcardIndexEntry(const IndexEntry& wildcardIndex,
     const auto projectedFields =
         projection_executor_utils::applyProjectionToFields(wildcardProjection->exec(), fields);
 
-    std::set<FieldRef> includedPaths =
-        wildcardProjection->exhaustivePaths().value_or(std::set<FieldRef>{});
+    const static auto kEmptySet = std::set<FieldRef>{};
+    const auto& includedPaths =
+        wildcardProjection->exhaustivePaths() ? *wildcardProjection->exhaustivePaths() : kEmptySet;
     out->reserve(out->size() + projectedFields.size());
     for (auto&& fieldName : projectedFields) {
         // Convert string 'fieldName' into a FieldRef, to better facilitate the subsequent checks.

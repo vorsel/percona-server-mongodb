@@ -31,7 +31,7 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
     it in the license file.
 ======= */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAccessControl
 
 #include "mongo/db/auth/external/external_sasl_authentication_session.h"
 
@@ -43,7 +43,7 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 #include "mongo/client/sasl_client_authenticate.h"
 #include "mongo/db/auth/sasl_command_constants.h"
 #include "mongo/db/auth/sasl_mechanism_registry.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/str.h"
 #include "mongo/util/net/socket_utils.h"
 
@@ -140,7 +140,7 @@ StringData SaslExternalLDAPServerMechanism::getPrincipalName() const {
 MONGO_INITIALIZER(SaslExternalLDAPServerMechanism)(InitializerContext*) {
     int result = sasl_server_init(NULL, saslDefaultServiceName.rawData());
     if (result != SASL_OK) {
-        log() << "Failed Initializing SASL " << std::endl;
+        LOGV2(29030, "Failed Initializing SASL ");
         return getInitializationError(result);
     }
     return Status::OK();

@@ -16,23 +16,22 @@
  *   sharded and non-sharded clusters.
  * - shardedTargetsConfigServer: [OPTIONAL] When sharded, the operation is sent to the config
  *   server, rather than to the shard.
- * - useLogs: { undefined | "normal" | "shardedReordersCommentAfterRWC" } Normally, profiling is
- *   used to check behavior.  Set this to "normal" to use logs instead, or to
- *   "shardedReordersCommentAfterRWC" if the fields in the log line are reordered by sharding to put
- *   'comment' after 'readConcern' and 'writeConcern'.
+ * - useLogs: Normally, profiling is used to check behavior.  Set this to true to use slow op log
+ *   lines instead.
  *
  * @tags: [
  *   does_not_support_stepdowns,
  *   requires_fcv_44,
  *   requires_majority_read_concern,
  *   requires_profiling,
- *   requires_text_logs,
+ *   uses_transactions,
  * ]
  */
 (function() {
 "use strict";
 
 load('jstests/libs/profiler.js');
+load("jstests/libs/logv2_helpers.js");
 
 let db = "test";
 let coll = "foo";
@@ -66,7 +65,7 @@ let validateTestCase = function(test) {
         assert(typeof (test.shardedTargetsConfigServer) === "boolean");
     }
     if ("useLogs" in test) {
-        assert(test.useLogs === "normal" || test.useLogs === "shardedReordersCommentAfterRWC");
+        assert(typeof (test.useLogs) === "boolean");
     }
 };
 
@@ -138,7 +137,7 @@ let testCases = {
         db: "admin",
         checkReadConcern: false,
         checkWriteConcern: true,
-        useLogs: "shardedReordersCommentAfterRWC",
+        useLogs: true,
     },
     addShard: {skip: "does not accept read or write concern"},
     addShardToZone: {skip: "does not accept read or write concern"},
@@ -156,7 +155,7 @@ let testCases = {
         checkWriteConcern: true,
         target: "replset",
         db: "admin",
-        useLogs: "normal",
+        useLogs: true,
     },
     applyOps: {skip: "internal command"},
     authenticate: {skip: "does not accept read or write concern"},
@@ -211,7 +210,7 @@ let testCases = {
         db: "admin",
         checkReadConcern: false,
         checkWriteConcern: true,
-        useLogs: "shardedReordersCommentAfterRWC",
+        useLogs: true,
     },
     compact: {skip: "does not accept read or write concern"},
     configureFailPoint: {skip: "does not accept read or write concern"},
@@ -254,14 +253,14 @@ let testCases = {
         checkReadConcern: false,
         checkWriteConcern: true,
         shardedTargetsConfigServer: true,
-        useLogs: "normal",
+        useLogs: true,
     },
     createUser: {
         command: {createUser: "foo", pwd: "bar", roles: []},
         checkReadConcern: false,
         checkWriteConcern: true,
         shardedTargetsConfigServer: true,
-        useLogs: "normal",
+        useLogs: true,
     },
     currentOp: {skip: "does not accept read or write concern"},
     dataSize: {skip: "does not accept read or write concern"},
@@ -269,13 +268,15 @@ let testCases = {
     dbHash: {skip: "does not accept read or write concern"},
     dbStats: {skip: "does not accept read or write concern"},
     delete: {
-        skip: "TODO SERVER-23266: enable once overall batch command is profiled",
         setUp: function(conn) {
             assert.commandWorked(conn.getCollection(nss).insert({x: 1}));
         },
         command: {delete: coll, deletes: [{q: {x: 1}, limit: 1}]},
         checkReadConcern: false,
         checkWriteConcern: true,
+        // TODO SERVER-23266: If the overall batch command if profiled, then it would be better to
+        // use profiling.  In the meantime, use logs.
+        useLogs: true,
     },
     distinct: {
         setUp: function(conn) {
@@ -303,7 +304,7 @@ let testCases = {
         checkReadConcern: false,
         checkWriteConcern: true,
         shardedTargetsConfigServer: true,
-        useLogs: "normal",
+        useLogs: true,
     },
     dropAllUsersFromDatabase: {
         setUp: function(conn) {
@@ -314,7 +315,7 @@ let testCases = {
         checkReadConcern: false,
         checkWriteConcern: true,
         shardedTargetsConfigServer: true,
-        useLogs: "normal",
+        useLogs: true,
     },
     dropConnections: {skip: "does not accept read or write concern"},
     dropDatabase: {skip: "not profiled or logged"},
@@ -337,7 +338,7 @@ let testCases = {
         checkReadConcern: false,
         checkWriteConcern: true,
         shardedTargetsConfigServer: true,
-        useLogs: "normal",
+        useLogs: true,
     },
     dropUser: {
         setUp: function(conn) {
@@ -348,7 +349,7 @@ let testCases = {
         checkReadConcern: false,
         checkWriteConcern: true,
         shardedTargetsConfigServer: true,
-        useLogs: "normal",
+        useLogs: true,
     },
     echo: {skip: "does not accept read or write concern"},
     emptycapped: {skip: "test command"},
@@ -411,7 +412,7 @@ let testCases = {
         checkReadConcern: false,
         checkWriteConcern: true,
         shardedTargetsConfigServer: true,
-        useLogs: "normal",
+        useLogs: true,
     },
     grantRolesToRole: {
         setUp: function(conn) {
@@ -424,7 +425,7 @@ let testCases = {
         checkReadConcern: false,
         checkWriteConcern: true,
         shardedTargetsConfigServer: true,
-        useLogs: "normal",
+        useLogs: true,
     },
     grantRolesToUser: {
         setUp: function(conn) {
@@ -437,7 +438,7 @@ let testCases = {
         checkReadConcern: false,
         checkWriteConcern: true,
         shardedTargetsConfigServer: true,
-        useLogs: "normal",
+        useLogs: true,
     },
     handshake: {skip: "does not accept read or write concern"},
     hostInfo: {skip: "does not accept read or write concern"},
@@ -521,7 +522,6 @@ let testCases = {
     replSetTest: {skip: "does not accept read or write concern"},
     replSetUpdatePosition: {skip: "does not accept read or write concern"},
     resetError: {skip: "does not accept read or write concern"},
-    restartCatalog: {skip: "internal command"},
     resync: {skip: "does not accept read or write concern"},
     revokePrivilegesFromRole: {
         setUp: function(conn) {
@@ -538,7 +538,7 @@ let testCases = {
         checkReadConcern: false,
         checkWriteConcern: true,
         shardedTargetsConfigServer: true,
-        useLogs: "normal",
+        useLogs: true,
     },
     revokeRolesFromRole: {
         setUp: function(conn) {
@@ -551,7 +551,7 @@ let testCases = {
         checkReadConcern: false,
         checkWriteConcern: true,
         shardedTargetsConfigServer: true,
-        useLogs: "normal",
+        useLogs: true,
     },
     revokeRolesFromUser: {
         setUp: function(conn) {
@@ -564,7 +564,7 @@ let testCases = {
         checkReadConcern: false,
         checkWriteConcern: true,
         shardedTargetsConfigServer: true,
-        useLogs: "normal",
+        useLogs: true,
     },
     rolesInfo: {skip: "does not accept read or write concern"},
     saslContinue: {skip: "does not accept read or write concern"},
@@ -592,13 +592,15 @@ let testCases = {
     top: {skip: "does not accept read or write concern"},
     unsetSharding: {skip: "internal command"},
     update: {
-        skip: "TODO SERVER-23266: enable once overall batch command is profiled",
         setUp: function(conn) {
             assert.commandWorked(conn.getCollection(nss).insert({x: 1}));
         },
         command: {update: coll, updates: [{q: {x: 1}, u: {x: 2}}]},
         checkReadConcern: false,
         checkWriteConcern: true,
+        // TODO SERVER-23266: If the overall batch command if profiled, then it would be better to
+        // use profiling.  In the meantime, use logs.
+        useLogs: true,
     },
     updateRole: {
         setUp: function(conn) {
@@ -609,7 +611,7 @@ let testCases = {
         checkReadConcern: false,
         checkWriteConcern: true,
         shardedTargetsConfigServer: true,
-        useLogs: "normal",
+        useLogs: true,
     },
     updateUser: {
         setUp: function(conn) {
@@ -620,7 +622,7 @@ let testCases = {
         checkReadConcern: false,
         checkWriteConcern: true,
         shardedTargetsConfigServer: true,
-        useLogs: "normal",
+        useLogs: true,
     },
     updateZoneKeyRange: {skip: "does not accept read or write concern"},
     usersInfo: {skip: "does not accept read or write concern"},
@@ -655,30 +657,95 @@ let setDefaultRWConcernActualTestCase = {
     checkReadConcern: false,
     checkWriteConcern: true,
     shardedTargetsConfigServer: true,
-    useLogs: "normal",
+    useLogs: true,
 };
 
-function createLogLineRegularExpressionForTestCase(test, cmdName, targetId, sharded) {
-    let pattern = `command: ${cmdName} `;
-    let commentComesLast = sharded && test.useLogs == "shardedReordersCommentAfterRWC";
-    if (!commentComesLast) {
-        pattern += `.* comment: "${targetId}"`;
+// Example log line (broken over several lines), indicating the sections matched by the regex
+// generated by this function:
+// 2020-01-28T16:46:57.373+1100 I  COMMAND  [conn18] command test.foo appName: "MongoDB Shell"
+//      command: aggregate { aggregate: "foo", ..., comment: "5e2fcad149034875e22c9fbc", ... }
+//     ^^^^^^^^^^^^^^^^^^^                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+//      planSummary: COLLSCAN keysExamined:0 docsExamined:1 ... readConcern:{ level: "majority" }
+//                                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+//      writeConcern:{ w: "majority", wtimeout: 1234567 } storage:{} protocol:op_msg 275ms
+//     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+function createLogLineRegularExpressionForTestCase(test, cmdName, targetId, explicitRWC) {
+    let expectedProvenance = explicitRWC ? "clientSupplied" : "customDefault";
+    if (isJsonLogNoConn()) {
+        let pattern = `"command":{"${cmdName}"`;
+        pattern += `.*"comment":"${targetId}"`;
+        if (test.checkReadConcern) {
+            pattern += `.*"readConcern":{"level":"majority","provenance":"${expectedProvenance}"}`;
+        }
+        if (test.checkWriteConcern) {
+            pattern += `.*"writeConcern":{"w":"majority","wtimeout":1234567,"provenance":"${
+                expectedProvenance}"}`;
+        }
+        return new RegExp(pattern);
     }
-    // These need to match both the fields in the command (in the case of sharding), and the CurOp
-    // reporting (otherwise).
+
+    let pattern = `command: ${cmdName} `;
+    pattern += `.* comment: "${targetId}"`;
     if (test.checkReadConcern) {
-        pattern += '.* readConcern: *{ level: "majority" }';
+        pattern += `.* readConcern:{ level: "majority", provenance: "${expectedProvenance}" }`;
     }
     if (test.checkWriteConcern) {
-        pattern += '.* writeConcern: *{ w: "majority", wtimeout: 1234567(\\.0)? }';
-    }
-    if (commentComesLast) {
-        pattern += `.* comment: "${targetId}"`;
+        pattern += `.* writeConcern:{ w: "majority", wtimeout: 1234567, provenance: "${
+            expectedProvenance}" }`;
     }
     return new RegExp(pattern);
 }
 
-function runScenario(desc, conn, regularCheckConn, configSvrCheckConn, explicitRWC) {
+// Example profile document, indicating the fields matched by the filter generated by this function:
+// {
+//     "op" : "insert",
+//     "ns" : "test.foo",
+//     "command" : {
+//         "aggregate" : "foo",
+//         "pipeline" : [ ... ],
+//         ...
+// >>>     "comment" : "5e2fd42654a611422be06518",
+//         "lsid" : { ... },
+//         ...
+//     },
+//     "keysExamined" : 0,
+//     "docsExamined" : 1,
+//     ...
+//     "readConcern" : {
+// >>>     "level" : "majority"
+//     },
+//     "writeConcern" : {
+// >>>     "w" : "majority",
+// >>>     "wtimeout" : 1234567
+//     },
+//     "storage" : { },
+//     "responseLength" : 222,
+//     "protocol" : "op_msg",
+//     "millis" : 194,
+//     "planSummary" : "COLLSCAN",
+//      ...
+// }
+function createProfileFilterForTestCase(test, targetId, explicitRWC) {
+    let expectedProvenance = explicitRWC ? "clientSupplied" : "customDefault";
+    let commandProfile = {"command.comment": targetId};
+    if (test.checkReadConcern) {
+        commandProfile = Object.extend(
+            {"readConcern.level": "majority", "readConcern.provenance": expectedProvenance},
+            commandProfile);
+    }
+    if (test.checkWriteConcern) {
+        commandProfile = Object.extend({
+            "writeConcern.w": "majority",
+            "writeConcern.wtimeout": 1234567,
+            "writeConcern.provenance": expectedProvenance
+        },
+                                       commandProfile);
+    }
+    return commandProfile;
+}
+
+function runScenario(
+    desc, conn, regularCheckConn, configSvrCheckConn, {explicitRWC, explicitProvenance = false}) {
     let runCommandTest = function(cmdName, test) {
         assert(test !== undefined,
                "coverage failure: must define a RWC defaults application test for " + cmdName);
@@ -740,11 +807,18 @@ function runScenario(desc, conn, regularCheckConn, configSvrCheckConn, explicitR
         }
         if (explicitRWC) {
             if (test.checkReadConcern) {
-                actualCmd = Object.extend(actualCmd, {readConcern: {level: 'majority'}});
+                let explicitRC = {level: 'majority'};
+                if (explicitProvenance) {
+                    explicitRC = Object.extend(explicitRC, {provenance: "clientSupplied"});
+                }
+                actualCmd = Object.extend(actualCmd, {readConcern: explicitRC});
             }
             if (test.checkWriteConcern) {
-                actualCmd =
-                    Object.extend(actualCmd, {writeConcern: {w: "majority", wtimeout: 1234567}});
+                let explicitWC = {w: "majority", wtimeout: 1234567};
+                if (explicitProvenance) {
+                    explicitWC = Object.extend(explicitWC, {provenance: "clientSupplied"});
+                }
+                actualCmd = Object.extend(actualCmd, {writeConcern: explicitWC});
             }
         }
         if (!sharded) {
@@ -757,22 +831,16 @@ function runScenario(desc, conn, regularCheckConn, configSvrCheckConn, explicitR
 
         // Check that the command applied the correct RWC.
         if (test.useLogs) {
-            let re = createLogLineRegularExpressionForTestCase(test, cmdName, targetId, sharded);
+            let re =
+                createLogLineRegularExpressionForTestCase(test, cmdName, targetId, explicitRWC);
             assert(checkLog.checkContainsOnce(checkConn, re),
                    "unable to find pattern " + re + " in logs on " + checkConn + " for test " +
                        thisTestDesc);
         } else {
-            let commandProfile = {"command.comment": targetId};
-            if (test.checkReadConcern) {
-                commandProfile = Object.extend({"readConcern.level": "majority"}, commandProfile);
-            }
-            if (test.checkWriteConcern) {
-                commandProfile =
-                    Object.extend({"writeConcern.w": "majority", "writeConcern.wtimeout": 1234567},
-                                  commandProfile);
-            }
-            profilerHasSingleMatchingEntryOrThrow(
-                {profileDB: checkConn.getDB(db), filter: commandProfile});
+            profilerHasSingleMatchingEntryOrThrow({
+                profileDB: checkConn.getDB(db),
+                filter: createProfileFilterForTestCase(test, targetId, explicitRWC)
+            });
         }
 
         // Clean up the collection by dropping the DB. This also drops all associated indexes and
@@ -800,11 +868,16 @@ function runScenario(desc, conn, regularCheckConn, configSvrCheckConn, explicitR
 function runTests(conn, regularCheckConn, configSvrCheckConn) {
     // The target RWC is always {level: "majority"} and {w: "majority", wtimeout: 1234567}
 
-    runScenario("Scenario: RWC defaults never set, explicit RWC present",
+    runScenario("Scenario: RWC defaults never set, explicit RWC present, absent provenance",
                 conn,
                 regularCheckConn,
                 configSvrCheckConn,
-                true);
+                {explicitRWC: true, explicitProvenance: false});
+    runScenario("Scenario: RWC defaults never set, explicit RWC present, explicit provenance",
+                conn,
+                regularCheckConn,
+                configSvrCheckConn,
+                {explicitRWC: true, explicitProvenance: true});
 
     assert.commandWorked(conn.adminCommand({
         setDefaultRWConcern: 1,
@@ -815,26 +888,36 @@ function runTests(conn, regularCheckConn, configSvrCheckConn) {
                 conn,
                 regularCheckConn,
                 configSvrCheckConn,
-                false);
+                {explicitRWC: false});
 
     assert.commandWorked(conn.adminCommand({
         setDefaultRWConcern: 1,
         defaultReadConcern: {level: "local"},
         defaultWriteConcern: {w: 1, wtimeout: 7654321}
     }));
-    runScenario("Scenario: RWC defaults set, explicit RWC present",
+    runScenario("Scenario: RWC defaults set, explicit RWC present, absent provenance",
                 conn,
                 regularCheckConn,
                 configSvrCheckConn,
-                true);
+                {explicitRWC: true, explicitProvenance: false});
+    runScenario("Scenario: RWC defaults set, explicit RWC present, explicit provenance",
+                conn,
+                regularCheckConn,
+                configSvrCheckConn,
+                {explicitRWC: true, explicitProvenance: true});
 
     assert.commandWorked(conn.adminCommand(
         {setDefaultRWConcern: 1, defaultReadConcern: {}, defaultWriteConcern: {}}));
-    runScenario("Scenario: RWC defaults unset, explicit RWC present",
+    runScenario("Scenario: RWC defaults unset, explicit RWC present, absent provenance",
                 conn,
                 regularCheckConn,
                 configSvrCheckConn,
-                true);
+                {explicitRWC: true, explicitProvenance: false});
+    runScenario("Scenario: RWC defaults unset, explicit RWC present, explicit provenance",
+                conn,
+                regularCheckConn,
+                configSvrCheckConn,
+                {explicitRWC: true, explicitProvenance: true});
 }
 
 // TODO SERVER-45052: Move the main code into jstests/lib, and then call it from jstests/replsets

@@ -45,8 +45,8 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/collection_bulk_loader_impl.h"
 #include "mongo/db/repl/repl_server_parameters_gen.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/destructor_guard.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
 
@@ -212,7 +212,7 @@ Status CollectionBulkLoaderImpl::insertDocuments(const std::vector<BSONObj>::con
 Status CollectionBulkLoaderImpl::commit() {
     return _runTaskReleaseResourcesOnFailure([&] {
         _stats.startBuildingIndexes = Date_t::now();
-        LOG(2) << "Creating indexes for ns: " << _nss.ns();
+        LOGV2_DEBUG(21130, 2, "Creating indexes for ns: {ns}", "ns"_attr = _nss.ns());
         UnreplicatedWritesBlock uwb(_opCtx.get());
 
         // Commit before deleting dups, so the dups will be removed from secondary indexes when
@@ -226,13 +226,6 @@ Status CollectionBulkLoaderImpl::commit() {
             // This should always return Status::OK() as secondary index builds ignore duplicate key
             // constraints causing them to not be recorded.
             invariant(_secondaryIndexesBlock->checkConstraints(_opCtx.get()));
-
-            // Need to upgrade the collection lock to MODE_X to commit the index build.
-            if (!_opCtx->lockState()->isCollectionLockedForMode(_nss, MODE_X)) {
-                _autoColl = std::make_unique<AutoGetCollection>(_opCtx.get(), _nss, MODE_X);
-                _collection = _autoColl->getCollection();
-                invariant(_collection);
-            }
 
             status = writeConflictRetry(
                 _opCtx.get(), "CollectionBulkLoaderImpl::commit", _nss.ns(), [this] {
@@ -295,13 +288,6 @@ Status CollectionBulkLoaderImpl::commit() {
                 return status;
             }
 
-            // Need to upgrade the collection lock to MODE_X to commit the index build.
-            if (!_opCtx->lockState()->isCollectionLockedForMode(_nss, MODE_X)) {
-                _autoColl = std::make_unique<AutoGetCollection>(_opCtx.get(), _nss, MODE_X);
-                _collection = _autoColl->getCollection();
-                invariant(_collection);
-            }
-
             // Commit the _id index, there won't be any documents with duplicate _ids as they were
             // deleted prior to this.
             status = writeConflictRetry(
@@ -323,7 +309,11 @@ Status CollectionBulkLoaderImpl::commit() {
         }
 
         _stats.endBuildingIndexes = Date_t::now();
-        LOG(2) << "Done creating indexes for ns: " << _nss.ns() << ", stats: " << _stats.toString();
+        LOGV2_DEBUG(21131,
+                    2,
+                    "Done creating indexes for ns: {ns}, stats: {stats}",
+                    "ns"_attr = _nss.ns(),
+                    "stats"_attr = _stats.toString());
 
         _releaseResources();
         return Status::OK();
@@ -332,15 +322,6 @@ Status CollectionBulkLoaderImpl::commit() {
 
 void CollectionBulkLoaderImpl::_releaseResources() {
     invariant(&cc() == _opCtx->getClient());
-
-    // Need to upgrade the collection lock to MODE_X to clean up the index build.
-    if (!_opCtx->lockState()->isCollectionLockedForMode(_nss, MODE_X) &&
-        (_secondaryIndexesBlock || _idIndexBlock)) {
-        _autoColl = std::make_unique<AutoGetCollection>(_opCtx.get(), _nss, MODE_X);
-        _collection = _autoColl->getCollection();
-        invariant(_collection);
-    }
-
     if (_secondaryIndexesBlock) {
         _secondaryIndexesBlock->cleanUpAfterBuild(
             _opCtx.get(), _collection, MultiIndexBlock::kNoopOnCleanUpFn);

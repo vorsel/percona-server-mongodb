@@ -262,7 +262,8 @@ public:
      * subclass, please provide the switch on that subclass to noop its functions. It is only safe
      * to add a WaitListener during a MONGO_INITIALIZER.
      */
-    static void addWaitListener(WaitListener* listnener);
+    template <typename WaitListenerT>
+    static void installWaitListener();
 
     /**
      * Returns a statically allocated instance that cannot be interrupted.  Useful as a default
@@ -323,7 +324,7 @@ public:
      * Get the name for a Latch
      */
     TEMPLATE(typename LatchT)
-    REQUIRES(std::is_base_of_v<Latch, LatchT>)  //
+    REQUIRES(std::is_base_of_v<latch_detail::Latch, LatchT>)  //
     static StringData getLatchName(const stdx::unique_lock<LatchT>& lk) {
         return lk.mutex()->getName();
     }
@@ -348,15 +349,50 @@ public:
     bool waitForConditionOrInterruptUntil(stdx::condition_variable& cv,
                                           LockT& m,
                                           Date_t finalDeadline,
-                                          PredicateT pred) {
+                                          PredicateT pred,
+                                          AtomicWord<Microseconds::rep>* waitTimer = nullptr) {
         WaitContext waitContext(this);
         auto latchName = getLatchName(m);
+
+        /**
+         * Apparatus to measure the approximate time spent in this function (waiting time).
+         * The waiting duration is incrementally added to the atomic word upon:
+         * * Waking from a condition wait (i.e., return from
+         *   waitForConditionOrInterruptNoAssertUntil).
+         * * Returning from the function.
+         */
+        boost::optional<Microseconds::rep> timeOfLastReport;
+        auto advanceWaitTimer = [&]() {
+            invariant(timeOfLastReport);
+            auto now = mongo::curTimeMicros64();
+            auto inc = now - timeOfLastReport.get();
+            waitTimer->fetchAndAdd(inc);
+            timeOfLastReport = now;
+        };
+        ON_BLOCK_EXIT([&]() {
+            if (!waitTimer)
+                return;
+
+            // Never called `waitUntil()`, so waitTime == 0
+            if (!timeOfLastReport)
+                return;
+
+            advanceWaitTimer();
+        });
 
         auto waitUntil = [&](Date_t deadline, WakeSpeed speed) -> boost::optional<WakeReason> {
             // If the result of waitForConditionOrInterruptNoAssertUntil() is non-spurious, return
             // a WakeReason. Otherwise, return boost::none
 
+            if (!timeOfLastReport)
+                timeOfLastReport = mongo::curTimeMicros64();
+
             auto swResult = waitForConditionOrInterruptNoAssertUntil(cv, m, deadline);
+
+            if (MONGO_unlikely(waitTimer)) {
+                advanceWaitTimer();
+            }
+
             if (!swResult.isOK()) {
                 _onWake(latchName, WakeReason::kInterrupt, speed);
                 uassertStatusOK(std::move(swResult));
@@ -423,8 +459,11 @@ public:
      * deadline expiration.
      */
     template <typename LockT, typename PredicateT>
-    void waitForConditionOrInterrupt(stdx::condition_variable& cv, LockT& m, PredicateT pred) {
-        waitForConditionOrInterruptUntil(cv, m, Date_t::max(), std::move(pred));
+    void waitForConditionOrInterrupt(stdx::condition_variable& cv,
+                                     LockT& m,
+                                     PredicateT pred,
+                                     AtomicWord<Microseconds::rep>* waitTimer = nullptr) {
+        waitForConditionOrInterruptUntil(cv, m, Date_t::max(), std::move(pred), waitTimer);
     }
 
     /**
@@ -435,9 +474,10 @@ public:
     bool waitForConditionOrInterruptFor(stdx::condition_variable& cv,
                                         LockT& m,
                                         Milliseconds ms,
-                                        PredicateT pred) {
+                                        PredicateT pred,
+                                        AtomicWord<Microseconds::rep>* waitTimer = nullptr) {
         return waitForConditionOrInterruptUntil(
-            cv, m, getExpirationDateForWaitForValue(ms), std::move(pred));
+            cv, m, getExpirationDateForWaitForValue(ms), std::move(pred), waitTimer);
     }
 
     /**
@@ -504,9 +544,11 @@ public:
     virtual void onWake(const StringData& name, WakeReason reason, WakeSpeed speed) = 0;
 };
 
-inline void Interruptible::addWaitListener(WaitListener* listener) {
+template <typename WaitListenerT>
+inline void Interruptible::installWaitListener() {
     auto& state = _getListenerState();
 
+    static auto* listener = new WaitListenerT();  // Intentionally leaked!
     state.list.push_back(listener);
 }
 

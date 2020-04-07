@@ -45,6 +45,7 @@
 #include "mongo/util/net/sock.h"
 #include "mongo/util/net/ssl/apple.hpp"
 #include "mongo/util/net/ssl_types.h"
+#include "mongo/util/out_of_line_executor.h"
 #include "mongo/util/time_support.h"
 
 // SChannel implementation
@@ -55,6 +56,7 @@
 #endif  // #ifdef MONGO_CONFIG_SSL
 
 namespace mongo {
+
 /*
  * @return the SSL version std::string prefixed with prefix and suffixed with suffix
  */
@@ -119,7 +121,7 @@ class SSLConfiguration {
 public:
     bool isClusterMember(StringData subjectName) const;
     bool isClusterMember(SSLX509Name subjectName) const;
-    BSONObj getServerStatusBSON() const;
+    void getServerStatusBSON(BSONObjBuilder*) const;
     Status setServerSubjectName(SSLX509Name name);
 
     const SSLX509Name& serverSubjectName() const {
@@ -258,12 +260,21 @@ public:
      * the `subjectName` will contain  the certificate's subject name, and any roles acquired by
      * X509 authorization will be returned in `roles`.
      * Further, the SNI Name will be captured into the `sni` value, when available.
+     * The reactor is there to continue the execution of the chained statements to the Future
+     * returned by OCSP validation. Can be a nullptr, but will make this function synchronous and
+     * single threaded.
      */
-    virtual StatusWith<SSLPeerInfo> parseAndValidatePeerCertificate(
-        SSLConnectionType ssl,
-        boost::optional<std::string> sni,
-        const std::string& remoteHost,
-        const HostAndPort& hostForLogging) = 0;
+    virtual Future<SSLPeerInfo> parseAndValidatePeerCertificate(SSLConnectionType ssl,
+                                                                boost::optional<std::string> sni,
+                                                                const std::string& remoteHost,
+                                                                const HostAndPort& hostForLogging,
+                                                                const ExecutorPtr& reactor) = 0;
+
+    /**
+     * No-op function for SChannel and SecureTransport. Attaches stapled OCSP response to the
+     * SSL_CTX obect.
+     */
+    virtual Status stapleOCSPResponse(SSLContextType context) = 0;
 };
 
 // Access SSL functions through this instance.
@@ -281,6 +292,14 @@ bool hostNameMatchForX509Certificates(std::string nameToMatch, std::string certH
  * Parse a binary blob of DER encoded ASN.1 into a set of RoleNames.
  */
 StatusWith<stdx::unordered_set<RoleName>> parsePeerRoles(ConstDataRange cdrExtension);
+
+using DERInteger = std::vector<uint8_t>;
+
+/**
+ * Parse a binary blob of DER encoded ASN.1 into a list of features (integers).
+ * ASN.1 Integers can be very large, so they are stored in a vector of bytes.
+ */
+StatusWith<std::vector<DERInteger>> parseTLSFeature(ConstDataRange cdrExtension);
 
 /**
  * Strip the trailing '.' in FQDN.

@@ -446,7 +446,8 @@ function appendReadAndWriteConcern(conn, dbName, cmdName, cmdObj) {
             let writeConcern = cmdObj.writeConcern;
             if (typeof writeConcern !== "object" || writeConcern === null ||
                 (writeConcern.hasOwnProperty("w") &&
-                 bsonWoCompare({_: writeConcern.w}, {_: kDefaultWriteConcernW}) !== 0)) {
+                 bsonWoCompare({_: writeConcern.w}, {_: kDefaultWriteConcernW}) !== 0 &&
+                 bsonWoCompare({_: writeConcern.w}, {_: 1}) !== 0)) {
                 throw new Error("Cowardly refusing to override write concern of command: " +
                                 tojson(cmdObj));
             }
@@ -681,6 +682,8 @@ function retryWithTxnOverride(res, conn, dbName, cmdName, cmdObj, lsid, logError
         assert.gt(ops.length, 0);
         abortTransaction(conn, lsid, txnOptions.txnNumber);
 
+        // TODO(SERVER-45956) the below retry logic is necessary because findAndModify with upsert=
+        // true is not presently permitted inside multi-document transactions.
         // If the command inserted data and is not supported in a transaction, we assume it
         // failed because the collection did not exist. We will create the collection and retry
         // the entire transaction. We should not receive this error in this override for any

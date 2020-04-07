@@ -37,7 +37,7 @@
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/document_source_graph_lookup.h"
 #include "mongo/db/pipeline/document_source_mock.h"
-#include "mongo/db/pipeline/stub_mongo_process_interface.h"
+#include "mongo/db/pipeline/process_interface/stub_mongo_process_interface.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
@@ -62,25 +62,10 @@ public:
     MockMongoInterface(std::deque<DocumentSource::GetNextResult> results)
         : _results(std::move(results)) {}
 
-    std::unique_ptr<Pipeline, PipelineDeleter> makePipeline(
-        const std::vector<BSONObj>& rawPipeline,
-        const boost::intrusive_ptr<ExpressionContext>& expCtx,
-        const MakePipelineOptions opts) final {
-        auto pipeline = uassertStatusOK(Pipeline::parse(rawPipeline, expCtx));
-
-        if (opts.optimize) {
-            pipeline->optimizePipeline();
-        }
-
-        if (opts.attachCursorSource) {
-            pipeline = attachCursorSourceToPipeline(expCtx, pipeline.release());
-        }
-
-        return pipeline;
-    }
-
     std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx, Pipeline* ownedPipeline) final {
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        Pipeline* ownedPipeline,
+        bool allowTargetingShards) final {
         std::unique_ptr<Pipeline, PipelineDeleter> pipeline(ownedPipeline,
                                                             PipelineDeleter(expCtx->opCtx));
         pipeline->addInitialSource(DocumentSourceMock::createForTest(_results));
@@ -222,7 +207,7 @@ TEST_F(DocumentSourceGraphLookUpTest,
     auto next = graphLookupStage->getNext();
     ASSERT_TRUE(next.isAdvanced());
 
-    ASSERT_EQ(2U, next.getDocument().size());
+    ASSERT_EQ(2ULL, next.getDocument().computeSize());
     ASSERT_VALUE_EQ(Value(0), next.getDocument().getField("_id"));
 
     auto resultsValue = next.getDocument().getField("results");
@@ -540,7 +525,7 @@ TEST_F(DocumentSourceGraphLookUpTest, ShouldExpandArraysAtEndOfConnectFromField)
     auto next = graphLookupStage->getNext();
     ASSERT_TRUE(next.isAdvanced());
 
-    ASSERT_EQ(3U, next.getDocument().size());
+    ASSERT_EQ(3ULL, next.getDocument().computeSize());
     ASSERT_VALUE_EQ(Value(0), next.getDocument().getField("_id"));
 
     auto resultsValue = next.getDocument().getField("results");
@@ -613,7 +598,7 @@ TEST_F(DocumentSourceGraphLookUpTest, ShouldNotExpandArraysWithinArraysAtEndOfCo
     auto next = graphLookupStage->getNext();
     ASSERT_TRUE(next.isAdvanced());
 
-    ASSERT_EQ(3U, next.getDocument().size());
+    ASSERT_EQ(3ULL, next.getDocument().computeSize());
     ASSERT_VALUE_EQ(Value(0), next.getDocument().getField("_id"));
 
     auto resultsValue = next.getDocument().getField("results");

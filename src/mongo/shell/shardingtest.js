@@ -386,9 +386,18 @@ var ShardingTest = function(params) {
         }
     };
 
-    this.stop = function(opts) {
+    this.stop = function(opts = {}) {
         this.checkUUIDsConsistentAcrossCluster();
         this.checkIndexesConsistentAcrossCluster();
+        this.checkOrphansAreDeleted();
+
+        if (jsTestOptions().alwaysUseLogFiles) {
+            if (opts.noCleanData === false) {
+                throw new Error("Always using log files, but received conflicting option.");
+            }
+
+            opts.noCleanData = true;
+        }
 
         this.stopAllMongos(opts);
 
@@ -412,7 +421,7 @@ var ShardingTest = function(params) {
             }
         }
 
-        if (!opts || !opts.noCleanData) {
+        if (!opts.noCleanData) {
             print("ShardingTest stop deleting all dbpaths");
             for (var i = 0; i < _alldbpaths.length; i++) {
                 resetDbpath(MongoRunner.dataPath + _alldbpaths[i]);
@@ -1719,15 +1728,16 @@ var ShardingTest = function(params) {
         // TODO SERVER-45108: Enable support for x509 auth for _flushRoutingTableCacheUpdates.
         if (!otherParams.manualAddShard && !x509AuthRequired) {
             for (let i = 0; i < numShards; i++) {
+                const keyFileLocal =
+                    (otherParams.shards && otherParams.shards[i] && otherParams.shards[i].keyFile)
+                    ? otherParams.shards[i].keyFile
+                    : this.keyFile;
+
                 if (otherParams.rs || otherParams["rs" + i] || startShardsAsRS) {
                     const rs = this._rs[i].test;
-                    flushRT(rs.getPrimary(), rs.nodes, this.keyFile);
+                    flushRT(rs.getPrimary(), rs.nodes, keyFileLocal);
                 } else {
                     // If specified, use the keyFile for the standalone shard.
-                    const keyFileLocal = (otherParams.shards && otherParams.shards[i] &&
-                                          otherParams.shards[i].keyFile)
-                        ? otherParams.shards[i].keyFile
-                        : this.keyFile;
                     flushRT(this["shard" + i], this["shard" + i], keyFileLocal);
                 }
             }
@@ -1741,3 +1751,7 @@ ShardingTest.prototype.checkUUIDsConsistentAcrossCluster = function() {};
 
 // Stub for a hook to check that indexes are consistent across shards.
 ShardingTest.prototype.checkIndexesConsistentAcrossCluster = function() {};
+
+ShardingTest.prototype.checkOrphansAreDeleted = function() {
+    print("Unhooked function");
+};

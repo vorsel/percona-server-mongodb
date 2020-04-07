@@ -38,10 +38,10 @@
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/shard_key_util.h"
 #include "mongo/db/server_options.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/catalog/dist_lock_manager.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/refine_collection_shard_key_gen.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -148,7 +148,9 @@ public:
                                                                  collType.getUnique(),
                                                                  false);  // createIndexIfPossible
 
-            LOG(0) << "CMD: refineCollectionShardKey: " << request().toBSON({});
+            LOGV2(21922,
+                  "CMD: refineCollectionShardKey: {request}",
+                  "request"_attr = request().toBSON({}));
 
             audit::logRefineCollectionShardKey(opCtx->getClient(), nss.ns(), proposedKey);
 

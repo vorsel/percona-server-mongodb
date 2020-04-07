@@ -50,7 +50,7 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
  * See this link for explanation of the MONGO_LOG macro:
  * http://www.mongodb.org/about/contributors/reference/server-logging-rules/
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/base/init.h"
 #include "mongo/bson/bson_field.h"
@@ -64,10 +64,11 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 #include "mongo/db/matcher/matcher.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/logger/auditlog.h"
+#include "mongo/logger/logger.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/exit_code.h"
-#include "mongo/util/log.h"
 #include "mongo/util/net/sock.h"
 #include "mongo/util/string_map.h"
 #include "mongo/util/time_support.h"
@@ -85,7 +86,7 @@ namespace audit {
 #ifdef _COVERAGE
         // Need to make sure coverage data is properly flushed before exit.
         // It appears that ::_exit() does not do this.
-        log() << "calling regular ::exit() so coverage data may flush..." << std::endl;
+        LOGV2(29013, "calling regular ::exit() so coverage data may flush...");
         ::exit( rc );
 #else
         ::_exit( rc );
@@ -104,7 +105,7 @@ namespace audit {
     class WritableAuditLog : public logger::AuditLog {
     public:
         WritableAuditLog(const BSONObj &filter)
-            : _matcher(filter.getOwned(), new ExpressionContext(nullptr, nullptr)) {
+            : _matcher(filter.getOwned(), new ExpressionContext(nullptr, nullptr, NamespaceString())) {
         }
         virtual ~WritableAuditLog() {}
 
@@ -180,23 +181,36 @@ namespace audit {
                 if (writeRet == 0) {
                     break;
                 } else if (!ioErrorShouldRetry(writeRet)) {
-                    error() << "Audit system cannot write event " << redact(obj) << " to log file " << _fileName << std::endl;
-                    error() << "Write failed with fatal error " << errnoWithDescription(writeRet) << std::endl;
-                    error() << "As audit cannot make progress, the server will now shut down." << std::endl;
+                    LOGV2_ERROR(29017,
+                        "Audit system cannot write event {event} to log file {file}. "
+                        "Write failed with fatal error {err_desc}. "
+                        "As audit cannot make progress, the server will now shut down.",
+                        "event"_attr = redact(obj),
+                        "file"_attr = _fileName,
+                        "err_desc"_attr = errnoWithDescription(writeRet));
                     realexit(EXIT_AUDIT_ERROR);
                 }
-                warning() << "Audit system cannot write event " << redact(obj) << " to log file " << _fileName << std::endl;
-                warning() << "Write failed with retryable error " << errnoWithDescription(writeRet) << std::endl;
-                warning() << "Audit system will retry this write another " << retries - 1 << " times." << std::endl;
+                LOGV2_WARNING(29018,
+                    "Audit system cannot write event {event} to log file {file}. "
+                    "Write failed with retryable error {err_desc}. "
+                    "Audit system will retry this write another {retries} times.",
+                    "event"_attr = redact(obj),
+                    "file"_attr = _fileName,
+                    "err_desc"_attr = errnoWithDescription(writeRet),
+                    "retries"_attr = retries - 1);
                 if (retries <= 7 && retries > 0) {
                     sleepmillis(1 << ((7 - retries) * 2));
                 }
             }
 
             if (writeRet != 0) {
-                error() << "Audit system cannot write event " << redact(obj) << " to log file " << _fileName << std::endl;
-                error() << "Write failed with fatal error " << errnoWithDescription(writeRet) << std::endl;
-                error() << "As audit cannot make progress, the server will now shut down." << std::endl;
+                LOGV2_ERROR(29019,
+                    "Audit system cannot write event {event} to log file {file}. "
+                    "Write failed with fatal error {err_desc}. "
+                    "As audit cannot make progress, the server will now shut down.",
+                    "event"_attr = redact(obj),
+                    "file"_attr = _fileName,
+                    "err_desc"_attr = errnoWithDescription(writeRet));
                 realexit(EXIT_AUDIT_ERROR);
             }
 
@@ -206,23 +220,36 @@ namespace audit {
                 if (fsyncRet == 0) {
                     break;
                 } else if (!ioErrorShouldRetry(fsyncRet)) {
-                    error() << "Audit system cannot fsync event " << redact(obj) << " to log file " << _fileName << std::endl;
-                    error() << "Fsync failed with fatal error " << errnoWithDescription(fsyncRet) << std::endl;
-                    error() << "As audit cannot make progress, the server will now shut down." << std::endl;
+                    LOGV2_ERROR(29020,
+                        "Audit system cannot fsync event {event} to log file {file}. "
+                        "Fsync failed with fatal error {err_desc}. "
+                        "As audit cannot make progress, the server will now shut down.",
+                        "event"_attr = redact(obj),
+                        "file"_attr = _fileName,
+                        "err_desc"_attr = errnoWithDescription(fsyncRet));
                     realexit(EXIT_AUDIT_ERROR);
                 }
-                warning() << "Audit system cannot fsync event " << redact(obj) << " to log file " << _fileName << std::endl;
-                warning() << "Fsync failed with retryable error " << errnoWithDescription(fsyncRet) << std::endl;
-                warning() << "Audit system will retry this fsync another " << retries - 1 << " times." << std::endl;
+                LOGV2_WARNING(29021,
+                    "Audit system cannot fsync event {event} to log file {file}. "
+                    "Fsync failed with retryable error {err_desc}. "
+                    "Audit system will retry this fsync another {retries} times.",
+                    "event"_attr = redact(obj),
+                    "file"_attr = _fileName,
+                    "err_desc"_attr = errnoWithDescription(fsyncRet),
+                    "retries"_attr = retries - 1);
                 if (retries <= 7 && retries > 0) {
                     sleepmillis(1 << ((7 - retries) * 2));
                 }
             }
 
             if (fsyncRet != 0) {
-                error() << "Audit system cannot fsync event " << redact(obj) << " to log file " << _fileName << std::endl;
-                error() << "Fsync failed with fatal error " << errnoWithDescription(fsyncRet) << std::endl;
-                error() << "As audit cannot make progress, the server will now shut down." << std::endl;
+                LOGV2_ERROR(29022,
+                    "Audit system cannot fsync event {event} to log file {file}. "
+                    "Fsync failed with fatal error {err_desc}. "
+                    "As audit cannot make progress, the server will now shut down.",
+                    "event"_attr = redact(obj),
+                    "file"_attr = _fileName,
+                    "err_desc"_attr = errnoWithDescription(fsyncRet));
                 realexit(EXIT_AUDIT_ERROR);
             }
         }
@@ -240,9 +267,10 @@ namespace audit {
             std::string s = ss.str();
             int r = std::rename(_fileName.c_str(), s.c_str());
             if (r != 0) {
-                error() << "Could not rotate audit log, but continuing normally "
-                        << "(error desc: " << errnoWithDescription() << ")"
-                        << std::endl;
+                LOGV2_ERROR(29016,
+                            "Could not rotate audit log, but continuing normally "
+                            "(error desc: {err_desc})",
+                            "err_desc"_attr = errnoWithDescription());
             }
 
             // Open a new file, with the same name as the original.
@@ -375,13 +403,13 @@ namespace audit {
             // Write audit events into the void for debug builds, so we get
             // coverage on the code that generates audit log objects.
             if (kDebugBuild) {
-                log() << "Initializing dev null audit..." << std::endl;
+                LOGV2(29014, "Initializing dev null audit...");
                 _setGlobalAuditLog(new VoidAuditLog(fromjson(auditOptions.filter)));
             }
             return Status::OK();
         }
 
-        log() << "Initializing audit..." << std::endl;
+        LOGV2(29015, "Initializing audit...");
         const BSONObj filter = fromjson(auditOptions.filter);
         if (auditOptions.destination == "console")
             _setGlobalAuditLog(new ConsoleAuditLog(filter));

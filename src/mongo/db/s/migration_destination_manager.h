@@ -109,7 +109,7 @@ public:
     Status start(OperationContext* opCtx,
                  const NamespaceString& nss,
                  ScopedReceiveChunk scopedReceiveChunk,
-                 StartChunkCloneRequest cloneRequest,
+                 const StartChunkCloneRequest& cloneRequest,
                  const OID& epoch,
                  const WriteConcernOptions& writeConcern);
 
@@ -202,9 +202,13 @@ private:
 
     stdx::thread _migrateThreadHandle;
 
-    bool _useFCV44Protocol{false};
+    // Whether to use the resumable range deleter. This decision is based on whether the FCV 4.2 or
+    // FCV 4.4 protocol are in use and the disableResumableRangeDeleter option is off.
+    bool _enableResumableRangeDeleter{true};
 
     UUID _migrationId;
+    LogicalSessionId _lsid;
+    TxnNumber _txnNumber;
     NamespaceString _nss;
     ConnectionString _fromShardConnString;
     ShardId _fromShard;

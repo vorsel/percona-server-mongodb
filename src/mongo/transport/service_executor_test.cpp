@@ -34,11 +34,11 @@
 #include "boost/optional.hpp"
 
 #include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
 #include "mongo/transport/service_executor_adaptive.h"
 #include "mongo/transport/service_executor_synchronous.h"
 #include "mongo/transport/service_executor_task_names.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 #include <asio.hpp>
@@ -102,7 +102,9 @@ public:
         try {
             _ioContext.run_for(time.toSystemDuration());
         } catch (...) {
-            severe() << "Uncaught exception in reactor: " << exceptionToStatus();
+            LOGV2_FATAL(22985,
+                        "Uncaught exception in reactor: {exceptionToStatus}",
+                        "exceptionToStatus"_attr = exceptionToStatus());
             fassertFailed(50476);
         }
     }
@@ -114,7 +116,7 @@ public:
     void drain() override final {
         _ioContext.restart();
         while (_ioContext.poll()) {
-            LOG(1) << "Draining remaining work in reactor.";
+            LOGV2_DEBUG(22984, 1, "Draining remaining work in reactor.");
         }
         _ioContext.stop();
     }

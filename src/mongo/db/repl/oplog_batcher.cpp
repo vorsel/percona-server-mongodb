@@ -31,10 +31,11 @@
 
 #include "mongo/db/repl/oplog_batcher.h"
 
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands/txn_cmds_gen.h"
 #include "mongo/db/repl/oplog_applier.h"
 #include "mongo/db/repl/repl_server_parameters_gen.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 namespace repl {
@@ -172,7 +173,7 @@ StatusWith<std::vector<OplogEntry>> OplogBatcher::getNextApplierBatch(
             std::string message = str::stream()
                 << "expected oplog version " << OplogEntry::kOplogVersion << " but found version "
                 << entry.getVersion() << " in oplog entry: " << redact(entry.toBSON());
-            severe() << message;
+            LOGV2_FATAL(21240, "{message}", "message"_attr = message);
             return {ErrorCodes::BadValue, message};
         }
 
@@ -318,7 +319,9 @@ void OplogBatcher::_run(StorageInterface* storageInterface) {
             // Check the oplog buffer after the applier state to ensure the producer is stopped.
             if (isDraining && _oplogBuffer->isEmpty()) {
                 ops.setTermWhenExhausted(termWhenBufferIsEmpty);
-                log() << "Oplog buffer has been drained in term " << termWhenBufferIsEmpty;
+                LOGV2(21239,
+                      "Oplog buffer has been drained in term {term}",
+                      "term"_attr = termWhenBufferIsEmpty);
             } else {
                 // Don't emit empty batches.
                 continue;
@@ -341,6 +344,14 @@ std::size_t getBatchLimitOplogEntries() {
 }
 
 std::size_t getBatchLimitOplogBytes(OperationContext* opCtx, StorageInterface* storageInterface) {
+    // We can't change the timestamp source within a write unit of work.
+    invariant(!opCtx->lockState()->inAWriteUnitOfWork());
+    // We're only reading oplog metadata, so the timestamp is not important.  If we read with the
+    // default (which is kLastApplied on secondaries), we may end up with a reader that is at
+    // kLastApplied.  If we then roll back, then when we reconstruct prepared transactions during
+    // rollback recovery we will be preparing transactions before the read timestamp, which triggers
+    // an assertion in WiredTiger.
+    ReadSourceScope readSourceScope(opCtx, RecoveryUnit::ReadSource::kNoTimestamp);
     auto oplogMaxSizeResult =
         storageInterface->getOplogMaxSize(opCtx, NamespaceString::kRsOplogNamespace);
     auto oplogMaxSize = fassert(40301, oplogMaxSizeResult);

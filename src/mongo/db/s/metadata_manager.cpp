@@ -42,10 +42,10 @@
 #include "mongo/db/range_arithmetic.h"
 #include "mongo/db/s/range_deletion_util.h"
 #include "mongo/db/s/sharding_runtime_d_params_gen.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -167,14 +167,21 @@ void MetadataManager::setFilteringMetadata(CollectionMetadata remoteMetadata) {
     // We already have the same or newer version
     if (activeMetadata.getCollVersion().epoch() == remoteMetadata.getCollVersion().epoch() &&
         activeMetadata.getCollVersion() >= remoteMetadata.getCollVersion()) {
-        LOG(1) << "Ignoring update of active metadata " << activeMetadata.toStringBasic()
-               << " with an older " << remoteMetadata.toStringBasic();
+        LOGV2_DEBUG(21984,
+                    1,
+                    "Ignoring update of active metadata {activeMetadata_Basic} with an older "
+                    "{remoteMetadata_Basic}",
+                    "activeMetadata_Basic"_attr = activeMetadata.toStringBasic(),
+                    "remoteMetadata_Basic"_attr = remoteMetadata.toStringBasic());
         return;
     }
 
-    LOG(0) << "Updating metadata for collection " << _nss.ns() << " from "
-           << activeMetadata.toStringBasic() << " to " << remoteMetadata.toStringBasic()
-           << " due to version change";
+    LOGV2(21985,
+          "Updating metadata for collection {nss_ns} from {activeMetadata_Basic} to "
+          "{remoteMetadata_Basic} due to version change",
+          "nss_ns"_attr = _nss.ns(),
+          "activeMetadata_Basic"_attr = activeMetadata.toStringBasic(),
+          "remoteMetadata_Basic"_attr = remoteMetadata.toStringBasic());
 
     // Resolve any receiving chunks, which might have completed by now
     for (auto it = _receivingChunks.begin(); it != _receivingChunks.end();) {
@@ -187,8 +194,12 @@ void MetadataManager::setFilteringMetadata(CollectionMetadata remoteMetadata) {
 
         // The remote metadata contains a chunk we were earlier in the process of receiving, so we
         // deem it successfully received
-        LOG(2) << "Verified chunk " << redact(receivingRange.toString()) << " for collection "
-               << _nss.ns() << " has been migrated to this shard earlier";
+        LOGV2_DEBUG(21986,
+                    2,
+                    "Verified chunk {receivingRange} for collection {nss_ns} has been migrated to "
+                    "this shard earlier",
+                    "receivingRange"_attr = redact(receivingRange.toString()),
+                    "nss_ns"_attr = _nss.ns());
 
         _receivingChunks.erase(it);
         it = _receivingChunks.begin();
@@ -279,8 +290,12 @@ SharedSemiFuture<void> MetadataManager::beginReceive(ChunkRange const& range) {
 
     _receivingChunks.emplace(range.getMin().getOwned(), range.getMax().getOwned());
 
-    log() << "Scheduling deletion of any documents in " << _nss.ns() << " range "
-          << redact(range.toString()) << " before migrating in a chunk covering the range";
+    LOGV2_OPTIONS(21987,
+                  {logv2::LogComponent::kShardingMigration},
+                  "Scheduling deletion of any documents in {nss_ns} range {range} before migrating "
+                  "in a chunk covering the range",
+                  "nss_ns"_attr = _nss.ns(),
+                  "range"_attr = redact(range.toString()));
 
     return _submitRangeForDeletion(
         lg, SemiFuture<void>::makeReady(), range, Seconds(orphanCleanupDelaySecs.load()));
@@ -292,8 +307,12 @@ void MetadataManager::forgetReceive(ChunkRange const& range) {
 
     // This is potentially a partially received chunk, which needs to be cleaned up. We know none
     // of these documents are in use, so they can go straight to the deletion queue.
-    log() << "Abandoning in-migration of " << _nss.ns() << " range " << range
-          << "; scheduling deletion of any documents already copied";
+    LOGV2_OPTIONS(21988,
+                  {logv2::LogComponent::kShardingMigration},
+                  "Abandoning in-migration of {nss_ns} range {range}; scheduling deletion of any "
+                  "documents already copied",
+                  "nss_ns"_attr = _nss.ns(),
+                  "range"_attr = range);
 
     invariant(!_overlapsInUseChunk(lg, range));
 
@@ -327,8 +346,12 @@ SharedSemiFuture<void> MetadataManager::cleanUpRange(ChunkRange const& range,
         shouldDelayBeforeDeletion ? Seconds(orphanCleanupDelaySecs.load()) : Seconds(0);
 
     if (overlapMetadata) {
-        log() << "Deletion of " << _nss.ns() << " range " << redact(range.toString())
-              << " will be scheduled after all possibly dependent queries finish";
+        LOGV2_OPTIONS(21989,
+                      {logv2::LogComponent::kShardingMigration},
+                      "Deletion of {nss_ns} range {range} will be scheduled after all possibly "
+                      "dependent queries finish",
+                      "nss_ns"_attr = _nss.ns(),
+                      "range"_attr = redact(range.toString()));
         ++overlapMetadata->numContingentRangeDeletionTasks;
         // Schedule the range for deletion once the overlapping metadata object is destroyed
         // (meaning no more queries can be using the range) and obtain a future which will be
@@ -339,7 +362,11 @@ SharedSemiFuture<void> MetadataManager::cleanUpRange(ChunkRange const& range,
                                        delayForActiveQueriesOnSecondariesToComplete);
     } else {
         // No running queries can depend on this range, so queue it for deletion immediately.
-        log() << "Scheduling deletion of " << _nss.ns() << " range " << redact(range.toString());
+        LOGV2_OPTIONS(21990,
+                      {logv2::LogComponent::kShardingMigration},
+                      "Scheduling deletion of {nss_ns} range {range}",
+                      "nss_ns"_attr = _nss.ns(),
+                      "range"_attr = redact(range.toString()));
 
         return _submitRangeForDeletion(
             lg, SemiFuture<void>::makeReady(), range, delayForActiveQueriesOnSecondariesToComplete);
@@ -432,7 +459,7 @@ SharedSemiFuture<void> MetadataManager::_submitRangeForDeletion(
     // from the _rangesScheduledForDeletion.  std::list iterators are never invalidated, which
     // allows us to save the iterator pointing to the newly added element for use later when
     // deleting it.
-    cleanupComplete.thenRunOn(_executor).onCompletion(
+    cleanupComplete.thenRunOn(_executor).getAsync(
         [self = shared_from_this(), it = _rangesScheduledForDeletion.begin()](Status s) {
             stdx::lock_guard<Latch> lg(self->_managerLock);
             self->_rangesScheduledForDeletion.erase(it);

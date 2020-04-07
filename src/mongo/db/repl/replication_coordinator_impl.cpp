@@ -28,8 +28,10 @@
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
-#define LOG_FOR_ELECTION(level) \
-    MONGO_LOG_COMPONENT(level, ::mongo::logger::LogComponent::kReplicationElection)
+
+#define LOGV2_FOR_ELECTION(ID, DLEVEL, MESSAGE, ...) \
+    LOGV2_DEBUG_OPTIONS(                             \
+        ID, DLEVEL, {logv2::LogComponent::kReplicationElection}, MESSAGE, ##__VA_ARGS__)
 
 #include "mongo/platform/basic.h"
 
@@ -44,6 +46,7 @@
 #include "mongo/bson/timestamp.h"
 #include "mongo/client/fetcher.h"
 #include "mongo/db/audit.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/commit_quorum_options.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
@@ -78,7 +81,6 @@
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/rslog.h"
 #include "mongo/db/repl/storage_interface.h"
-#include "mongo/db/repl/tla_plus_trace_repl_gen.h"
 #include "mongo/db/repl/topology_coordinator.h"
 #include "mongo/db/repl/transaction_oplog_application.h"
 #include "mongo/db/repl/update_position_args.h"
@@ -89,17 +91,17 @@
 #include "mongo/db/write_concern_options.h"
 #include "mongo/executor/connection_pool_stats.h"
 #include "mongo/executor/network_interface.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/rpc/metadata/oplog_query_metadata.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
+#include "mongo/transport/ismaster_metrics.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/stacktrace.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/timer.h"
-#include "mongo/util/tla_plus_trace.h"
 
 namespace mongo {
 namespace repl {
@@ -110,7 +112,13 @@ MONGO_FAIL_POINT_DEFINE(stepdownHangBeforeRSTLEnqueue);
 // Fail setMaintenanceMode with ErrorCodes::NotSecondary to simulate a concurrent election.
 MONGO_FAIL_POINT_DEFINE(setMaintenanceModeFailsWithNotSecondary);
 MONGO_FAIL_POINT_DEFINE(forceSyncSourceRetryWaitForInitialSync);
+// Signals that an isMaster request has started waiting.
 MONGO_FAIL_POINT_DEFINE(waitForIsMasterResponse);
+// Will cause an isMaster request to hang as it starts waiting.
+MONGO_FAIL_POINT_DEFINE(hangWhileWaitingForIsMasterResponse);
+MONGO_FAIL_POINT_DEFINE(skipDurableTimestampUpdates);
+// Will cause a reconfig to hang after completing the config quorum check.
+MONGO_FAIL_POINT_DEFINE(omitConfigQuorumCheck);
 
 // Number of times we tried to go live as a secondary.
 Counter64 attemptsToBecomeSecondary;
@@ -176,26 +184,6 @@ void lockAndCall(stdx::unique_lock<Latch>* lk, const std::function<void()>& fn) 
         lk->lock();
     }
     fn();
-}
-
-/**
- * Implements the force-reconfig behavior of incrementing config version by a large random
- * number.
- */
-BSONObj incrementConfigVersionByRandom(BSONObj config) {
-    BSONObjBuilder builder;
-    SecureRandom generator;
-    for (BSONObjIterator iter(config); iter.more(); iter.next()) {
-        BSONElement elem = *iter;
-        if (elem.fieldNameStringData() == ReplSetConfig::kVersionFieldName && elem.isNumber()) {
-            const int random = generator.nextInt32(100'000);
-            builder.appendIntOrLL(ReplSetConfig::kVersionFieldName,
-                                  elem.numberLong() + 10'000 + random);
-        } else {
-            builder.append(elem);
-        }
-    }
-    return builder.obj();
 }
 
 template <typename T>
@@ -334,7 +322,13 @@ ReplicationCoordinatorImpl::ReplicationCoordinatorImpl(
         return;
     }
 
-    _externalState->setupNoopWriter(Seconds(periodicNoopIntervalSecs));
+    // If this is a config server, then we set the periodic no-op interval to 1 second. This is to
+    // ensure that the config server will not unduly hold up change streams running on the cluster.
+    if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+        periodicNoopIntervalSecs.store(1);
+    }
+
+    _externalState->setupNoopWriter(Seconds(periodicNoopIntervalSecs.load()));
 }
 
 ReplicationCoordinatorImpl::~ReplicationCoordinatorImpl() = default;
@@ -445,12 +439,14 @@ bool ReplicationCoordinatorImpl::_startLoadLocalConfig(OperationContext* opCtx) 
 
     StatusWith<LastVote> lastVote = _externalState->loadLocalLastVoteDocument(opCtx);
     if (!lastVote.isOK()) {
-        severe() << "Error loading local voted for document at startup; " << lastVote.getStatus();
+        LOGV2_FATAL(21429,
+                    "Error loading local voted for document at startup; {status}",
+                    "status"_attr = lastVote.getStatus());
         fassertFailedNoTrace(40367);
     }
     if (lastVote.getValue().getTerm() == OpTime::kInitialTerm) {
         // This log line is checked in unit tests.
-        log() << "Did not find local initialized voted for document at startup.";
+        LOGV2(21311, "Did not find local initialized voted for document at startup.");
     }
     {
         stdx::lock_guard<Latch> lk(_mutex);
@@ -461,38 +457,45 @@ bool ReplicationCoordinatorImpl::_startLoadLocalConfig(OperationContext* opCtx) 
     auto status = _replicationProcess->refreshRollbackID(opCtx);
     if (!status.isOK()) {
         if (status == ErrorCodes::NamespaceNotFound) {
-            log() << "Did not find local Rollback ID document at startup. Creating one.";
+            LOGV2(21312, "Did not find local Rollback ID document at startup. Creating one.");
             auto initializingStatus = _replicationProcess->initializeRollbackID(opCtx);
             fassert(40424, initializingStatus);
         } else {
-            severe() << "Error loading local Rollback ID document at startup; " << status;
+            LOGV2_FATAL(21430,
+                        "Error loading local Rollback ID document at startup; {status}",
+                        "status"_attr = status);
             fassertFailedNoTrace(40428);
         }
     }
 
     StatusWith<BSONObj> cfg = _externalState->loadLocalConfigDocument(opCtx);
     if (!cfg.isOK()) {
-        log() << "Did not find local replica set configuration document at startup;  "
-              << cfg.getStatus();
+        LOGV2(21313,
+              "Did not find local replica set configuration document at startup;  {status}",
+              "status"_attr = cfg.getStatus());
         return true;
     }
     ReplSetConfig localConfig;
     status = localConfig.initialize(cfg.getValue());
     if (!status.isOK()) {
         if (status.code() == ErrorCodes::RepairedReplicaSetNode) {
-            severe()
-                << "This instance has been repaired and may contain modified replicated data that "
-                   "would not match other replica set members. To see your repaired data, start "
-                   "mongod without the --replSet option. When you are finished recovering your "
-                   "data and would like to perform a complete re-sync, please refer to the "
-                   "documentation here: "
-                   "https://docs.mongodb.com/manual/tutorial/resync-replica-set-member/";
+            LOGV2_FATAL(
+                21431,
+                "This instance has been repaired and may contain modified replicated data that "
+                "would not match other replica set members. To see your repaired data, start "
+                "mongod without the --replSet option. When you are finished recovering your "
+                "data and would like to perform a complete re-sync, please refer to the "
+                "documentation here: "
+                "https://docs.mongodb.com/manual/tutorial/resync-replica-set-member/");
             fassertFailedNoTrace(50923);
         }
-        error() << "Locally stored replica set configuration does not parse; See "
-                   "http://www.mongodb.org/dochub/core/recover-replica-set-from-invalid-config "
-                   "for information on how to recover from this. Got \""
-                << status << "\" while parsing " << cfg.getValue();
+        LOGV2_ERROR(21414,
+                    "Locally stored replica set configuration does not parse; See "
+                    "http://www.mongodb.org/dochub/core/recover-replica-set-from-invalid-config "
+                    "for information on how to recover from this. Got \"{status}\" while parsing "
+                    "{config}",
+                    "status"_attr = status,
+                    "config"_attr = cfg.getValue());
         fassertFailedNoTrace(28545);
     }
 
@@ -537,7 +540,10 @@ void ReplicationCoordinatorImpl::_finishLoadLocalConfig(
     const StatusWith<OpTimeAndWallTime>& lastOpTimeAndWallTimeStatus,
     const StatusWith<LastVote>& lastVoteStatus) {
     if (!cbData.status.isOK()) {
-        LOG(1) << "Loading local replica set configuration failed due to " << cbData.status;
+        LOGV2_DEBUG(21314,
+                    1,
+                    "Loading local replica set configuration failed due to {status}",
+                    "status"_attr = cbData.status);
         return;
     }
 
@@ -546,37 +552,51 @@ void ReplicationCoordinatorImpl::_finishLoadLocalConfig(
     if (!myIndex.isOK()) {
         if (myIndex.getStatus() == ErrorCodes::NodeNotFound ||
             myIndex.getStatus() == ErrorCodes::InvalidReplicaSetConfig) {
-            warning() << "Locally stored replica set configuration does not have a valid entry "
-                         "for the current node; waiting for reconfig or remote heartbeat; Got \""
-                      << myIndex.getStatus() << "\" while validating " << localConfig.toBSON();
+            LOGV2_WARNING(21405,
+                          "Locally stored replica set configuration does not have a valid entry "
+                          "for the current node; waiting for reconfig or remote heartbeat; Got "
+                          "\"{status}\" while validating {localConfig}",
+                          "status"_attr = myIndex.getStatus(),
+                          "localConfig"_attr = localConfig.toBSON());
             myIndex = StatusWith<int>(-1);
         } else {
-            error() << "Locally stored replica set configuration is invalid; See "
-                       "http://www.mongodb.org/dochub/core/recover-replica-set-from-invalid-config"
-                       " for information on how to recover from this. Got \""
-                    << myIndex.getStatus() << "\" while validating " << localConfig.toBSON();
+            LOGV2_ERROR(21415,
+                        "Locally stored replica set configuration is invalid; See "
+                        "http://www.mongodb.org/dochub/core/recover-replica-set-from-invalid-config"
+                        " for information on how to recover from this. Got \"{status}\" "
+                        "while validating {localConfig}",
+                        "status"_attr = myIndex.getStatus(),
+                        "localConfig"_attr = localConfig.toBSON());
             fassertFailedNoTrace(28544);
         }
     }
 
     if (localConfig.getReplSetName() != _settings.ourSetName()) {
-        warning() << "Local replica set configuration document reports set name of "
-                  << localConfig.getReplSetName() << ", but command line reports "
-                  << _settings.ourSetName() << "; waiting for reconfig or remote heartbeat";
+        LOGV2_WARNING(21406,
+                      "Local replica set configuration document reports set name of "
+                      "{localConfigSetName}, but command line reports "
+                      "{settingsSetName}; waiting for reconfig or remote heartbeat",
+                      "localConfigSetName"_attr = localConfig.getReplSetName(),
+                      "settingsSetName"_attr = _settings.ourSetName());
         myIndex = StatusWith<int>(-1);
     }
 
     if (serverGlobalParams.enableMajorityReadConcern && localConfig.getNumMembers() == 3 &&
         localConfig.getNumDataBearingMembers() == 2) {
-        log() << startupWarningsLog;
-        log() << "** WARNING: This replica set has a Primary-Secondary-Arbiter architecture, but "
-                 "readConcern:majority is enabled "
-              << startupWarningsLog;
-        log() << "**          for this node. This is not a recommended configuration. Please see "
-              << startupWarningsLog;
-        log() << "**          https://dochub.mongodb.org/core/psa-disable-rc-majority"
-              << startupWarningsLog;
-        log() << startupWarningsLog;
+        LOGV2_OPTIONS(21315, {logv2::LogTag::kStartupWarnings}, "");
+        LOGV2_OPTIONS(
+            21316,
+            {logv2::LogTag::kStartupWarnings},
+            "** WARNING: This replica set has a Primary-Secondary-Arbiter architecture, but "
+            "readConcern:majority is enabled ");
+        LOGV2_OPTIONS(
+            21317,
+            {logv2::LogTag::kStartupWarnings},
+            "**          for this node. This is not a recommended configuration. Please see ");
+        LOGV2_OPTIONS(21318,
+                      {logv2::LogTag::kStartupWarnings},
+                      "**          https://dochub.mongodb.org/core/psa-disable-rc-majority");
+        LOGV2_OPTIONS(21319, {logv2::LogTag::kStartupWarnings}, "");
     }
 
     // Do not check optime, if this node is an arbiter.
@@ -585,9 +605,11 @@ void ReplicationCoordinatorImpl::_finishLoadLocalConfig(
     OpTimeAndWallTime lastOpTimeAndWallTime = OpTimeAndWallTime();
     if (!isArbiter) {
         if (!lastOpTimeAndWallTimeStatus.isOK()) {
-            warning() << "Failed to load timestamp and/or wall clock time of most recently applied "
-                         "operation: "
-                      << lastOpTimeAndWallTimeStatus.getStatus();
+            LOGV2_WARNING(
+                21407,
+                "Failed to load timestamp and/or wall clock time of most recently applied "
+                "operation: {status}",
+                "status"_attr = lastOpTimeAndWallTimeStatus.getStatus());
         } else {
             lastOpTimeAndWallTime = lastOpTimeAndWallTimeStatus.getValue();
         }
@@ -648,7 +670,7 @@ void ReplicationCoordinatorImpl::_finishLoadLocalConfig(
         // Step down is impossible, so we don't need to wait for the returned event.
         _updateTerm_inlock(term);
     }
-    LOG(1) << "Current term is now " << term;
+    LOGV2_DEBUG(21320, 1, "Current term is now {term}", "term"_attr = term);
     _performPostMemberStateUpdateAction(action);
 
     if (!isArbiter) {
@@ -664,17 +686,21 @@ void ReplicationCoordinatorImpl::_stopDataReplication(OperationContext* opCtx) {
         _initialSyncer.swap(initialSyncerCopy);
     }
     if (initialSyncerCopy) {
-        LOG(1)
-            << "ReplicationCoordinatorImpl::_stopDataReplication calling InitialSyncer::shutdown.";
+        LOGV2_DEBUG(
+            21321,
+            1,
+            "ReplicationCoordinatorImpl::_stopDataReplication calling InitialSyncer::shutdown.");
         const auto status = initialSyncerCopy->shutdown();
         if (!status.isOK()) {
-            warning() << "InitialSyncer shutdown failed: " << status;
+            LOGV2_WARNING(21408, "InitialSyncer shutdown failed: {status}", "status"_attr = status);
         }
         initialSyncerCopy.reset();
         // Do not return here, fall through.
     }
-    LOG(1) << "ReplicationCoordinatorImpl::_stopDataReplication calling "
-              "ReplCoordExtState::stopDataReplication.";
+    LOGV2_DEBUG(21322,
+                1,
+                "ReplicationCoordinatorImpl::_stopDataReplication calling "
+                "ReplCoordExtState::stopDataReplication.");
     _externalState->stopDataReplication(opCtx);
 }
 
@@ -696,7 +722,7 @@ void ReplicationCoordinatorImpl::_startDataReplication(OperationContext* opCtx,
 
     // Do initial sync.
     if (!_externalState->getTaskExecutor()) {
-        log() << "not running initial sync during test.";
+        LOGV2(21323, "not running initial sync during test.");
         return;
     }
 
@@ -704,16 +730,20 @@ void ReplicationCoordinatorImpl::_startDataReplication(OperationContext* opCtx,
         {
             stdx::lock_guard<Latch> lock(_mutex);
             if (opTimeStatus == ErrorCodes::CallbackCanceled) {
-                log() << "Initial Sync has been cancelled: " << opTimeStatus.getStatus();
+                LOGV2(21324,
+                      "Initial Sync has been cancelled: {status}",
+                      "status"_attr = opTimeStatus.getStatus());
                 return;
             } else if (!opTimeStatus.isOK()) {
                 if (_inShutdown) {
-                    log() << "Initial Sync failed during shutdown due to "
-                          << opTimeStatus.getStatus();
+                    LOGV2(21325,
+                          "Initial Sync failed during shutdown due to {status}",
+                          "status"_attr = opTimeStatus.getStatus());
                     return;
                 } else {
-                    error() << "Initial sync failed, shutting down now. Restart the server "
-                               "to attempt a new initial sync.";
+                    LOGV2_ERROR(21416,
+                                "Initial sync failed, shutting down now. Restart the server "
+                                "to attempt a new initial sync.");
                     fassertFailedWithStatusNoTrace(40088, opTimeStatus.getStatus());
                 }
             }
@@ -745,7 +775,7 @@ void ReplicationCoordinatorImpl::_startDataReplication(OperationContext* opCtx,
             // Must take the lock to set _initialSyncer, but not call it.
             stdx::lock_guard<Latch> lock(_mutex);
             if (_inShutdown) {
-                log() << "Initial Sync not starting because replication is shutting down.";
+                LOGV2(21326, "Initial Sync not starting because replication is shutting down.");
                 return;
             }
             initialSyncerCopy = std::make_shared<InitialSyncer>(
@@ -763,7 +793,7 @@ void ReplicationCoordinatorImpl::_startDataReplication(OperationContext* opCtx,
         uassertStatusOK(initialSyncerCopy->startup(opCtx, numInitialSyncAttempts.load()));
     } catch (const DBException& e) {
         auto status = e.toStatus();
-        log() << "Initial Sync failed to start: " << status;
+        LOGV2(21327, "Initial Sync failed to start: {status}", "status"_attr = status);
         if (ErrorCodes::CallbackCanceled == status || ErrorCodes::isShutdownError(status.code())) {
             return;
         }
@@ -855,7 +885,7 @@ void ReplicationCoordinatorImpl::shutdown(OperationContext* opCtx) {
         return;
     }
 
-    log() << "shutting down replication subsystems";
+    LOGV2(21328, "shutting down replication subsystems");
 
     // Used to shut down outside of the lock.
     std::shared_ptr<InitialSyncer> initialSyncerCopy;
@@ -864,9 +894,10 @@ void ReplicationCoordinatorImpl::shutdown(OperationContext* opCtx) {
         fassert(28533, !_inShutdown);
         _inShutdown = true;
         if (_rsConfigState == kConfigPreStart) {
-            warning() << "ReplicationCoordinatorImpl::shutdown() called before "
-                         "startup() finished.  Shutting down without cleaning up the "
-                         "replication system";
+            LOGV2_WARNING(21409,
+                          "ReplicationCoordinatorImpl::shutdown() called before "
+                          "startup() finished.  Shutting down without cleaning up the "
+                          "replication system");
             return;
         }
         if (_rsConfigState == kConfigStartingUp) {
@@ -887,10 +918,11 @@ void ReplicationCoordinatorImpl::shutdown(OperationContext* opCtx) {
 
     // joining the replication executor is blocking so it must be run outside of the mutex
     if (initialSyncerCopy) {
-        LOG(1) << "ReplicationCoordinatorImpl::shutdown calling InitialSyncer::shutdown.";
+        LOGV2_DEBUG(
+            21329, 1, "ReplicationCoordinatorImpl::shutdown calling InitialSyncer::shutdown.");
         const auto status = initialSyncerCopy->shutdown();
         if (!status.isOK()) {
-            warning() << "InitialSyncer shutdown failed: " << status;
+            LOGV2_WARNING(21410, "InitialSyncer shutdown failed: {status}", "status"_attr = status);
         }
         initialSyncerCopy->join();
         initialSyncerCopy.reset();
@@ -1039,7 +1071,6 @@ void ReplicationCoordinatorImpl::signalDrainComplete(OperationContext* opCtx,
     if (_applierState != ApplierState::Draining) {
         return;
     }
-    _tlaPlusRaftMongoEvent(lk, opCtx, RaftMongoSpecActionEnum::kBecomePrimaryByMagic);
     lk.unlock();
 
     _externalState->onDrainComplete(opCtx);
@@ -1071,7 +1102,7 @@ void ReplicationCoordinatorImpl::signalDrainComplete(OperationContext* opCtx,
 
         auto status = _topCoord->completeTransitionToPrimary(firstOpTime);
         if (status.code() == ErrorCodes::PrimarySteppedDown) {
-            log() << "Transition to primary failed" << causedBy(status);
+            LOGV2(21330, "Transition to primary failed{status}", "status"_attr = causedBy(status));
             return;
         }
         invariant(status);
@@ -1085,7 +1116,9 @@ void ReplicationCoordinatorImpl::signalDrainComplete(OperationContext* opCtx,
     // Update _canAcceptNonLocalWrites
     _updateMemberStateFromTopologyCoordinator(lk, opCtx);
 
-    log() << "transition to primary complete; database writes are now permitted" << rsLog;
+    LOGV2_OPTIONS(21331,
+                  {logv2::LogTag::kRS},
+                  "transition to primary complete; database writes are now permitted");
     _drainFinishedCond.notify_all();
     _externalState->startNoopWriter(_getMyLastAppliedOpTime_inlock());
 }
@@ -1148,6 +1181,11 @@ void ReplicationCoordinatorImpl::setMyLastAppliedOpTimeAndWallTimeForward(
 void ReplicationCoordinatorImpl::setMyLastDurableOpTimeAndWallTimeForward(
     const OpTimeAndWallTime& opTimeAndWallTime) {
     stdx::unique_lock<Latch> lock(_mutex);
+
+    if (MONGO_unlikely(skipDurableTimestampUpdates.shouldFail())) {
+        return;
+    }
+
     if (opTimeAndWallTime.opTime > _getMyLastDurableOpTime_inlock()) {
         _setMyLastDurableOpTimeAndWallTime(lock, opTimeAndWallTime, false);
         _reportUpstream_inlock(std::move(lock));
@@ -1181,7 +1219,7 @@ void ReplicationCoordinatorImpl::resetMyLastOpTimes() {
 }
 
 void ReplicationCoordinatorImpl::_resetMyLastOpTimes(WithLock lk) {
-    LOG(1) << "resetting durable/applied optimes.";
+    LOGV2_DEBUG(21332, 1, "resetting durable/applied optimes.");
     // Reset to uninitialized OpTime
     bool isRollbackAllowed = true;
     _setMyLastAppliedOpTimeAndWallTime(
@@ -1414,8 +1452,13 @@ Status ReplicationCoordinatorImpl::_waitUntilOpTime(OperationContext* opCtx,
             // We just need to wait for the opTime to catch up to what we need (not majority RC).
             auto future = _opTimeWaiterList.add_inlock(targetOpTime);
 
-            LOG(3) << "waitUntilOpTime: OpID " << opCtx->getOpID() << " is waiting for OpTime "
-                   << targetOpTime << " until " << deadline.value_or(opCtx->getDeadline());
+            LOGV2_DEBUG(21333,
+                        3,
+                        "waitUntilOpTime: OpID {OpID} is waiting for OpTime "
+                        "{targetOpTime} until {deadline}",
+                        "OpID"_attr = opCtx->getOpID(),
+                        "targetOpTime"_attr = targetOpTime,
+                        "deadline"_attr = deadline.value_or(opCtx->getDeadline()));
 
             lock.unlock();
             auto waitStatus = futureGetNoThrowWithDeadline(
@@ -1458,12 +1501,18 @@ Status ReplicationCoordinatorImpl::_waitUntilMajorityOpTime(mongo::OperationCont
 
     stdx::unique_lock lock(_mutex);
 
-    LOG(1) << "waitUntilOpTime: waiting for optime:" << targetOpTime
-           << " to be in a snapshot -- current snapshot: "
-           << _getCurrentCommittedSnapshotOpTime_inlock();
+    LOGV2_DEBUG(21334,
+                1,
+                "waitUntilOpTime: waiting for optime:{targetOpTime} to be in a snapshot -- current "
+                "snapshot: {currentCommittedSnapshotOpTime}",
+                "targetOpTime"_attr = targetOpTime,
+                "currentCommittedSnapshotOpTime"_attr =
+                    _getCurrentCommittedSnapshotOpTime_inlock());
 
-    LOG(3) << "waitUntilOpTime: waiting for a new snapshot until "
-           << deadline.value_or(opCtx->getDeadline());
+    LOGV2_DEBUG(21335,
+                3,
+                "waitUntilOpTime: waiting for a new snapshot until {deadline}",
+                "deadline"_attr = deadline.value_or(opCtx->getDeadline()));
 
     try {
         auto ok = opCtx->waitForConditionOrInterruptUntil(
@@ -1487,7 +1536,10 @@ Status ReplicationCoordinatorImpl::_waitUntilMajorityOpTime(mongo::OperationCont
         // _currentCommittedSnapshot, _getCurrentCommittedSnapshotOpTime_inlock() also returns
         // default OpTime{}. Hence this branch only runs if _currentCommittedSnapshot actually
         // exists.
-        LOG(3) << "Got notified of new snapshot: " << _currentCommittedSnapshot->toString();
+        LOGV2_DEBUG(21336,
+                    3,
+                    "Got notified of new snapshot: {currentCommittedSnapshot}",
+                    "currentCommittedSnapshot"_attr = _currentCommittedSnapshot->toString());
     }
     return Status::OK();
 }
@@ -1624,12 +1676,10 @@ bool ReplicationCoordinatorImpl::_doneWaitingForReplication_inlock(
     invariant(writeConcern.syncMode != WriteConcernOptions::SyncMode::UNSET);
 
     const bool useDurableOpTime = writeConcern.syncMode == WriteConcernOptions::SyncMode::JOURNAL;
-
     if (writeConcern.wMode.empty()) {
         return _topCoord->haveNumNodesReachedOpTime(
             opTime, writeConcern.wNumNodes, useDurableOpTime);
     }
-
     StringData patternName;
     if (writeConcern.wMode == WriteConcernOptions::kMajority) {
         if (_externalState->snapshotsEnabled() && !gTestingSnapshotBehaviorInIsolation) {
@@ -1641,8 +1691,13 @@ bool ReplicationCoordinatorImpl::_doneWaitingForReplication_inlock(
             // Wait for the "current" snapshot to advance to/past the opTime.
             const auto haveSnapshot = _currentCommittedSnapshot->opTime >= opTime;
             if (!haveSnapshot) {
-                LOG(1) << "Required snapshot optime: " << opTime << " is not yet part of the "
-                       << "current 'committed' snapshot: " << _currentCommittedSnapshot->opTime;
+                LOGV2_DEBUG(21337,
+                            1,
+                            "Required snapshot optime: {opTime} is not yet part of the current "
+                            "'committed' snapshot: {currentCommittedSnapshotOpTime}",
+                            "opTime"_attr = opTime,
+                            "currentCommittedSnapshotOpTime"_attr =
+                                _currentCommittedSnapshot->opTime);
                 return false;
             }
 
@@ -1653,14 +1708,16 @@ bool ReplicationCoordinatorImpl::_doneWaitingForReplication_inlock(
         // removed from storage.
         if (auto dropOpTime = _externalState->getEarliestDropPendingOpTime()) {
             if (*dropOpTime <= opTime) {
-                LOG(1) << "Unable to satisfy the requested majority write concern at "
-                          "'committed' optime "
-                       << opTime
-                       << ". There are still drop pending collections (earliest drop optime: "
-                       << *dropOpTime
-                       << ") that have to be removed from storage before we can "
-                          "satisfy the write concern "
-                       << writeConcern.toBSON();
+                LOGV2_DEBUG(21338,
+                            1,
+                            "Unable to satisfy the requested majority write concern at "
+                            "'committed' optime {opTime}. There are still drop pending collections "
+                            "(earliest drop optime: {dropOpTime}) that have to be removed from "
+                            "storage before we can "
+                            "satisfy the write concern {writeConcern}",
+                            "opTime"_attr = opTime,
+                            "dropOpTime"_attr = *dropOpTime,
+                            "writeConcern"_attr = writeConcern.toBSON());
                 return false;
             }
         }
@@ -1671,9 +1728,14 @@ bool ReplicationCoordinatorImpl::_doneWaitingForReplication_inlock(
     } else {
         patternName = writeConcern.wMode;
     }
-
     auto tagPattern = uassertStatusOK(_rsConfig.findCustomWriteMode(patternName));
-    return _topCoord->haveTaggedNodesReachedOpTime(opTime, tagPattern, useDurableOpTime);
+    if (writeConcern.checkCondition == WriteConcernOptions::CheckCondition::OpTime) {
+        return _topCoord->haveTaggedNodesReachedOpTime(opTime, tagPattern, useDurableOpTime);
+    } else {
+        invariant(writeConcern.checkCondition == WriteConcernOptions::CheckCondition::Config);
+        auto pred = _topCoord->makeConfigPredicate();
+        return _topCoord->haveTaggedNodesSatisfiedCondition(pred, tagPattern);
+    }
 }
 
 ReplicationCoordinator::StatusAndDuration ReplicationCoordinatorImpl::awaitReplication(
@@ -1720,9 +1782,13 @@ ReplicationCoordinator::StatusAndDuration ReplicationCoordinatorImpl::awaitRepli
 
     if (getTestCommandsEnabled() && !status.isOK()) {
         stdx::lock_guard lock(_mutex);
-        log() << "Replication failed for write concern: " << writeConcern.toBSON()
-              << ", waiting for optime: " << opTime << ", opID: " << opCtx->getOpID()
-              << ", progress: " << _getReplicationProgress(lock);
+        LOGV2(21339,
+              "Replication failed for write concern: {writeConcern}, waiting for optime: {opTime}, "
+              "opID: {opID}, progress: {progress}",
+              "writeConcern"_attr = writeConcern.toBSON(),
+              "opTime"_attr = opTime,
+              "opID"_attr = opCtx->getOpID(),
+              "progress"_attr = _getReplicationProgress(lock));
     }
     return {std::move(status), duration_cast<Milliseconds>(timer.elapsed())};
 }
@@ -1753,12 +1819,10 @@ SharedSemiFuture<void> ReplicationCoordinatorImpl::_startWaitingForReplication(
         // no replication check needed (validated above)
         return Future<void>::makeReady();
     }
-
     if (opTime.isNull()) {
         // If waiting for the empty optime, always say it's been replicated.
         return Future<void>::makeReady();
     }
-
     if (_inShutdown) {
         return Future<void>::makeReady(
             Status{ErrorCodes::ShutdownInProgress, "Replication is being shut down"});
@@ -1865,7 +1929,7 @@ void ReplicationCoordinatorImpl::updateAndLogStateTransitionMetrics(
     bob.appendNumber("userOpsKilled", userOpsKilled.get());
     bob.appendNumber("userOpsRunning", userOpsRunning.get());
 
-    log() << "State transition ops metrics: " << bob.obj();
+    LOGV2(21340, "State transition ops metrics: {metrics}", "metrics"_attr = bob.obj());
 }
 
 std::shared_ptr<IsMasterResponse> ReplicationCoordinatorImpl::_makeIsMasterResponse(
@@ -1894,12 +1958,11 @@ std::shared_ptr<IsMasterResponse> ReplicationCoordinatorImpl::_makeIsMasterRespo
     return response;
 }
 
-std::shared_ptr<const IsMasterResponse> ReplicationCoordinatorImpl::awaitIsMasterResponse(
-    OperationContext* opCtx,
+SharedSemiFuture<ReplicationCoordinatorImpl::SharedIsMasterResponse>
+ReplicationCoordinatorImpl::_getIsMasterResponseFuture(
+    WithLock lk,
     const SplitHorizon::Parameters& horizonParams,
-    boost::optional<TopologyVersion> clientTopologyVersion,
-    boost::optional<Date_t> deadline) const {
-    stdx::unique_lock lk(_mutex);
+    boost::optional<TopologyVersion> clientTopologyVersion) const {
 
     const MemberState myState = _topCoord->getMemberState();
     if (!_rsConfig.isInitialized() || myState.removed()) {
@@ -1909,7 +1972,8 @@ std::shared_ptr<const IsMasterResponse> ReplicationCoordinatorImpl::awaitIsMaste
         auto response = std::make_shared<IsMasterResponse>();
         response->setTopologyVersion(_topCoord->getTopologyVersion());
         response->markAsNoConfig();
-        return response;
+        return SharedSemiFuture<SharedIsMasterResponse>(
+            SharedIsMasterResponse(std::move(response)));
     }
 
     const auto& self = _rsConfig.getMemberAt(_selfIndex);
@@ -1918,11 +1982,9 @@ std::shared_ptr<const IsMasterResponse> ReplicationCoordinatorImpl::awaitIsMaste
     const StringData horizonString = self.determineHorizon(horizonParams);
     if (!clientTopologyVersion) {
         // The client is not using awaitable isMaster so we respond immediately.
-        return _makeIsMasterResponse(horizonString, lk);
+        return SharedSemiFuture<SharedIsMasterResponse>(
+            SharedIsMasterResponse(_makeIsMasterResponse(horizonString, lk)));
     }
-
-    // If clientTopologyVersion is not none, deadline must also be not none.
-    invariant(deadline);
 
     // Each awaitable isMaster will wait on their specific horizon. We always expect horizonString
     // to exist in _horizonToPromiseMap.
@@ -1935,7 +1997,8 @@ std::shared_ptr<const IsMasterResponse> ReplicationCoordinatorImpl::awaitIsMaste
     if (clientTopologyVersion->getProcessId() != topologyVersion.getProcessId()) {
         // Getting a different process id indicates that the server has restarted so we return
         // immediately with the updated process id.
-        return _makeIsMasterResponse(horizonString, lk);
+        return SharedSemiFuture<SharedIsMasterResponse>(
+            SharedIsMasterResponse(_makeIsMasterResponse(horizonString, lk)));
     }
 
     auto prevCounter = clientTopologyVersion->getCounter();
@@ -1949,20 +2012,61 @@ std::shared_ptr<const IsMasterResponse> ReplicationCoordinatorImpl::awaitIsMaste
     if (prevCounter < topologyVersionCounter) {
         // The received isMaster command contains a stale topology version so we respond
         // immediately with a more current topology version.
-        return _makeIsMasterResponse(horizonString, lk);
+        return SharedSemiFuture<SharedIsMasterResponse>(
+            SharedIsMasterResponse(_makeIsMasterResponse(horizonString, lk)));
     }
 
+    return future;
+}
+
+SharedSemiFuture<ReplicationCoordinatorImpl::SharedIsMasterResponse>
+ReplicationCoordinatorImpl::getIsMasterResponseFuture(
+    const SplitHorizon::Parameters& horizonParams,
+    boost::optional<TopologyVersion> clientTopologyVersion) const {
+    stdx::lock_guard lk(_mutex);
+    return _getIsMasterResponseFuture(lk, horizonParams, clientTopologyVersion);
+}
+
+std::shared_ptr<const IsMasterResponse> ReplicationCoordinatorImpl::awaitIsMasterResponse(
+    OperationContext* opCtx,
+    const SplitHorizon::Parameters& horizonParams,
+    boost::optional<TopologyVersion> clientTopologyVersion,
+    boost::optional<Date_t> deadline) const {
+    stdx::unique_lock lk(_mutex);
+
+    auto future = _getIsMasterResponseFuture(lk, horizonParams, clientTopologyVersion);
+    if (future.isReady()) {
+        return future.get();
+    }
+
+    // If clientTopologyVersion is not none, deadline must also be not none.
+    invariant(deadline);
+    const auto myState = _topCoord->getMemberState();
+    invariant(_rsConfig.isInitialized() && !myState.removed());
+    const auto& self = _rsConfig.getMemberAt(_selfIndex);
+    const StringData horizonString = self.determineHorizon(horizonParams);
+    const TopologyVersion topologyVersion = _topCoord->getTopologyVersion();
     lk.unlock();
+
+    IsMasterMetrics::get(opCtx)->incrementNumAwaitingTopologyChanges();
 
     if (MONGO_unlikely(waitForIsMasterResponse.shouldFail())) {
         // Used in tests that wait for this failpoint to be entered before triggering a topology
         // change.
-        log() << "waitForIsMasterResponse failpoint enabled.";
+        LOGV2(31464, "waitForIsMasterResponse failpoint enabled.");
+    }
+    if (MONGO_unlikely(hangWhileWaitingForIsMasterResponse.shouldFail())) {
+        LOGV2(21341, "Hanging due to hangWhileWaitingForIsMasterResponse failpoint.");
+        hangWhileWaitingForIsMasterResponse.pauseWhileSet(opCtx);
     }
 
     // Wait for a topology change with timeout set to deadline.
-    LOG(1) << "Waiting for an isMaster response from a topology change or until deadline: "
-           << deadline.get() << ". Current TopologyVersion counter is " << topologyVersionCounter;
+    LOGV2_DEBUG(21342,
+                1,
+                "Waiting for an isMaster response from a topology change or until deadline: "
+                "{deadline}. Current TopologyVersion counter is {topologyVersionCounter}",
+                "deadline"_attr = deadline.get(),
+                "topologyVersionCounter"_attr = topologyVersion.getCounter());
     auto statusWithIsMaster =
         futureGetNoThrowWithDeadline(opCtx, future, deadline.get(), opCtx->getTimeoutError());
     auto status = statusWithIsMaster.getStatus();
@@ -1971,12 +2075,13 @@ std::shared_ptr<const IsMasterResponse> ReplicationCoordinatorImpl::awaitIsMaste
         // Return an IsMasterResponse with the current topology version on timeout when waiting for
         // a topology change.
         stdx::lock_guard lk(_mutex);
+        IsMasterMetrics::get(opCtx)->decrementNumAwaitingTopologyChanges();
         return _makeIsMasterResponse(horizonString, lk);
     }
 
-    uassertStatusOK(status);
     // A topology change has happened so we return an IsMasterResponse with the updated
     // topology version.
+    uassertStatusOK(status);
     return statusWithIsMaster.getValue();
 }
 
@@ -1992,6 +2097,12 @@ OpTime ReplicationCoordinatorImpl::getLatestWriteOpTime(OperationContext* opCtx)
     auto latestOplogTimestamp =
         uassertStatusOK(oplog->getRecordStore()->getLatestOplogTimestamp(opCtx));
     return OpTime(latestOplogTimestamp, getTerm());
+}
+
+HostAndPort ReplicationCoordinatorImpl::getCurrentPrimaryHostAndPort() const {
+    stdx::lock_guard<Latch> lock(_mutex);
+    auto primary = _topCoord->getCurrentPrimaryMember();
+    return primary ? primary->getHostAndPort() : HostAndPort();
 }
 
 void ReplicationCoordinatorImpl::_killConflictingOpsOnStepUpAndStepDown(
@@ -2053,7 +2164,7 @@ void ReplicationCoordinatorImpl::AutoGetRstlForStepUpStepDown::_killOpThreadFn()
 
     invariant(!cc().isFromUserConnection());
 
-    log() << "Starting to kill user operations";
+    LOGV2(21343, "Starting to kill user operations");
     auto uniqueOpCtx = cc().makeOperationContext();
     OperationContext* opCtx = uniqueOpCtx.get();
 
@@ -2081,7 +2192,7 @@ void ReplicationCoordinatorImpl::AutoGetRstlForStepUpStepDown::_killOpThreadFn()
             stdx::unique_lock<Latch> lock(_mutex);
             if (_stopKillingOps.wait_for(
                     lock, Milliseconds(10).toSystemDuration(), [this] { return _killSignaled; })) {
-                log() << "Stopped killing user operations";
+                LOGV2(21344, "Stopped killing user operations");
                 _replCord->updateAndLogStateTransitionMetrics(
                     _stateTransition, getUserOpsKilled(), getUserOpsRunning());
                 _killSignaled = false;
@@ -2192,9 +2303,10 @@ void ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
         lk.unlock();
 
         if (MONGO_unlikely(stepdownHangBeforePerformingPostMemberStateUpdateActions.shouldFail())) {
-            log() << "stepping down from primary - "
-                     "stepdownHangBeforePerformingPostMemberStateUpdateActions fail point enabled. "
-                     "Blocking until fail point is disabled.";
+            LOGV2(21345,
+                  "stepping down from primary - "
+                  "stepdownHangBeforePerformingPostMemberStateUpdateActions fail point enabled. "
+                  "Blocking until fail point is disabled.");
             while (MONGO_unlikely(
                 stepdownHangBeforePerformingPostMemberStateUpdateActions.shouldFail())) {
                 mongo::sleepsecs(1);
@@ -2215,7 +2327,6 @@ void ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
     });
 
     auto waitTimeout = std::min(waitTime, stepdownTime);
-    auto lastAppliedOpTime = _getMyLastAppliedOpTime_inlock();
 
     // Set up a waiter which will be signaled when we process a heartbeat or updatePosition
     // and have a majority of nodes at our optime.
@@ -2258,6 +2369,15 @@ void ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
             arsd.rstlReacquire();
             lk.lock();
         });
+
+        auto lastAppliedOpTime = _getMyLastAppliedOpTime_inlock();
+        auto currentTerm = _topCoord->getTerm();
+        // If termAtStart != currentTerm, tryToStartStepDown would have thrown.
+        invariant(termAtStart == currentTerm);
+        // As we should not wait for secondaries to catch up if this node has not yet written in
+        // this term, invariant that the lastAppliedOpTime we will wait for has the same term as the
+        // current term. Also see TopologyCoordinator::isSafeToStepDown.
+        invariant(lastAppliedOpTime.getTerm() == currentTerm);
 
         auto future = _replicationWaiterList.add_inlock(lastAppliedOpTime, waiterWriteConcern);
 
@@ -2308,31 +2428,41 @@ void ReplicationCoordinatorImpl::_performElectionHandoff() {
     auto candidateIndex = _topCoord->chooseElectionHandoffCandidate();
 
     if (candidateIndex < 0) {
-        log() << "Could not find node to hand off election to.";
+        LOGV2(21346, "Could not find node to hand off election to.");
         return;
     }
 
     auto target = _rsConfig.getMemberAt(candidateIndex).getHostAndPort();
     executor::RemoteCommandRequest request(
         target, "admin", BSON("replSetStepUp" << 1 << "skipDryRun" << true), nullptr);
-    log() << "Handing off election to " << target;
+    LOGV2(21347, "Handing off election to {target}", "target"_attr = target);
 
     auto callbackHandleSW = _replExecutor->scheduleRemoteCommand(
         request, [target](const executor::TaskExecutor::RemoteCommandCallbackArgs& callbackData) {
             auto status = callbackData.response.status;
 
             if (status.isOK()) {
-                LOG(1) << "replSetStepUp request to " << target << " succeeded with response -- "
-                       << callbackData.response.data;
+                LOGV2_DEBUG(21348,
+                            1,
+                            "replSetStepUp request to {target} succeeded with response -- "
+                            "{response}",
+                            "target"_attr = target,
+                            "response"_attr = callbackData.response.data);
             } else {
-                log() << "replSetStepUp request to " << target << " failed due to " << status;
+                LOGV2(21349,
+                      "replSetStepUp request to {target} failed due to {status}",
+                      "target"_attr = target,
+                      "status"_attr = status);
             }
         });
 
     auto callbackHandleStatus = callbackHandleSW.getStatus();
     if (!callbackHandleStatus.isOK()) {
-        error() << "Failed to schedule ReplSetStepUp request to " << target
-                << " for election handoff: " << callbackHandleStatus;
+        LOGV2_ERROR(21417,
+                    "Failed to schedule ReplSetStepUp request to {target} for election handoff: "
+                    "{status}",
+                    "target"_attr = target,
+                    "status"_attr = callbackHandleStatus);
     }
 }
 
@@ -2386,18 +2516,29 @@ bool ReplicationCoordinatorImpl::canAcceptNonLocalWrites() const {
 }
 
 bool ReplicationCoordinatorImpl::canAcceptWritesFor(OperationContext* opCtx,
-                                                    const NamespaceString& ns) {
-    invariant(opCtx->lockState()->isRSTLLocked(), ns.ns());
-    return canAcceptWritesFor_UNSAFE(opCtx, ns);
+                                                    const NamespaceStringOrUUID& nsOrUUID) {
+    invariant(opCtx->lockState()->isRSTLLocked(), nsOrUUID.toString());
+    return canAcceptWritesFor_UNSAFE(opCtx, nsOrUUID);
 }
 
 bool ReplicationCoordinatorImpl::canAcceptWritesFor_UNSAFE(OperationContext* opCtx,
-                                                           const NamespaceString& ns) {
-    StringData dbName = ns.db();
-    bool canWriteToDB = canAcceptWritesForDatabase_UNSAFE(opCtx, dbName);
+                                                           const NamespaceStringOrUUID& nsOrUUID) {
+    bool canWriteToDB = canAcceptWritesForDatabase_UNSAFE(opCtx, nsOrUUID.db());
 
-    if (!canWriteToDB && !ns.isSystemDotProfile()) {
-        return false;
+    if (!canWriteToDB) {
+        if (auto ns = nsOrUUID.nss()) {
+            if (!ns->isSystemDotProfile()) {
+                return false;
+            }
+        } else {
+            auto uuid = nsOrUUID.uuid();
+            invariant(uuid, nsOrUUID.toString());
+            if (auto ns = CollectionCatalog::get(opCtx).lookupNSSByUUID(opCtx, *uuid)) {
+                if (!ns->isSystemDotProfile()) {
+                    return false;
+                }
+            }
+        }
     }
 
     // Even if we think we can write to the database we need to make sure we're not trying
@@ -2409,8 +2550,16 @@ bool ReplicationCoordinatorImpl::canAcceptWritesFor_UNSAFE(OperationContext* opC
         return true;
     }
 
-    if (!ns.isOplog()) {
-        return true;
+    if (auto ns = nsOrUUID.nss()) {
+        if (!ns->isOplog()) {
+            return true;
+        }
+    } else if (auto oplogCollection = LocalOplogInfo::get(opCtx)->getCollection()) {
+        auto uuid = nsOrUUID.uuid();
+        invariant(uuid, nsOrUUID.toString());
+        if (oplogCollection->uuid() != *uuid) {
+            return true;
+        }
     }
 
     stdx::lock_guard<Latch> lock(_mutex);
@@ -2580,9 +2729,30 @@ ReplSetConfig ReplicationCoordinatorImpl::getConfig() const {
     return _rsConfig;
 }
 
-void ReplicationCoordinatorImpl::processReplSetGetConfig(BSONObjBuilder* result) {
+void ReplicationCoordinatorImpl::processReplSetGetConfig(BSONObjBuilder* result,
+                                                         bool commitmentStatus) {
     stdx::lock_guard<Latch> lock(_mutex);
     result->append("config", _rsConfig.toBSON());
+
+    if (commitmentStatus) {
+        WriteConcernOptions configWriteConcern(ReplSetConfig::kConfigMajorityWriteConcernModeName,
+                                               WriteConcernOptions::SyncMode::NONE,
+                                               WriteConcernOptions::kNoTimeout);
+        configWriteConcern.checkCondition = WriteConcernOptions::CheckCondition::Config;
+
+        auto configOplogCommitmentOpTime = _topCoord->getConfigOplogCommitmentOpTime();
+        auto oplogWriteConcern = _populateUnsetWriteConcernOptionsSyncMode(
+            lock,
+            WriteConcernOptions(_rsConfig.getWriteMajority(),
+                                WriteConcernOptions::SyncMode::NONE,
+                                WriteConcernOptions::kNoTimeout));
+
+        // OpTime isn't used when checking for config replication.
+        OpTime ignored;
+        auto committed = _doneWaitingForReplication_inlock(ignored, configWriteConcern) &&
+            _doneWaitingForReplication_inlock(configOplogCommitmentOpTime, oplogWriteConcern);
+        result->append("commitmentStatus", committed);
+    }
 }
 
 void ReplicationCoordinatorImpl::processReplSetMetadata(const rpc::ReplSetMetadata& replMetadata) {
@@ -2605,8 +2775,12 @@ void ReplicationCoordinatorImpl::cancelAndRescheduleElectionTimeout() {
 
 EventHandle ReplicationCoordinatorImpl::_processReplSetMetadata_inlock(
     const rpc::ReplSetMetadata& replMetadata) {
-    if (replMetadata.getConfigVersion() != _rsConfig.getConfigVersion()) {
-        return EventHandle();
+    // If we're in FCV 4.4, allow metadata updates between config versions.
+    if (!serverGlobalParams.featureCompatibility.isVersion(
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44)) {
+        if (replMetadata.getConfigVersion() != _rsConfig.getConfigVersion()) {
+            return EventHandle();
+        }
     }
     return _updateTerm_inlock(replMetadata.getTerm());
 }
@@ -2634,18 +2808,24 @@ Status ReplicationCoordinatorImpl::setMaintenanceMode(bool activate) {
 
     int curMaintenanceCalls = _topCoord->getMaintenanceCount();
     if (activate) {
-        log() << "going into maintenance mode with " << curMaintenanceCalls
-              << " other maintenance mode tasks in progress" << rsLog;
+        LOGV2_OPTIONS(21350,
+                      {logv2::LogTag::kRS},
+                      "going into maintenance mode with {curMaintenanceCalls} other maintenance "
+                      "mode tasks in progress",
+                      "curMaintenanceCalls"_attr = curMaintenanceCalls);
         _topCoord->adjustMaintenanceCountBy(1);
     } else if (curMaintenanceCalls > 0) {
         invariant(_topCoord->getRole() == TopologyCoordinator::Role::kFollower);
 
         _topCoord->adjustMaintenanceCountBy(-1);
 
-        log() << "leaving maintenance mode (" << curMaintenanceCalls - 1
-              << " other maintenance mode tasks ongoing)" << rsLog;
+        LOGV2_OPTIONS(21351,
+                      {logv2::LogTag::kRS},
+                      "leaving maintenance mode ({curMaintenanceCalls} other maintenance mode "
+                      "tasks ongoing)",
+                      "curMaintenanceCalls"_attr = curMaintenanceCalls - 1);
     } else {
-        warning() << "Attempted to leave maintenance mode but it is not currently active";
+        LOGV2_WARNING(21411, "Attempted to leave maintenance mode but it is not currently active");
         return Status(ErrorCodes::OperationFailed, "already out of maintenance mode");
     }
 
@@ -2698,9 +2878,55 @@ Status ReplicationCoordinatorImpl::processReplSetFreeze(int secs, BSONObjBuilder
 Status ReplicationCoordinatorImpl::processReplSetReconfig(OperationContext* opCtx,
                                                           const ReplSetReconfigArgs& args,
                                                           BSONObjBuilder* resultObj) {
-    log() << "replSetReconfig admin command received from client; new config: "
-          << args.newConfigObj;
+    LOGV2(21352,
+          "replSetReconfig admin command received from client; new config: {newConfig}",
+          "newConfig"_attr = args.newConfigObj);
 
+    auto getNewConfig = [&](const ReplSetConfig& oldConfig,
+                            long long currentTerm) -> StatusWith<ReplSetConfig> {
+        ReplSetConfig newConfig;
+
+        // Only explicitly set configTerm for reconfig to this node's term if we're in FCV 4.4.
+        // Otherwise, use -1.
+        auto isUpgraded = serverGlobalParams.featureCompatibility.isVersion(
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44);
+        auto term = (!args.force && isUpgraded) ? currentTerm : OpTime::kUninitializedTerm;
+
+        // When initializing a new config through the replSetReconfig command, ignore the term
+        // field passed in through its args. Instead, use this node's term.
+        Status status = newConfig.initialize(args.newConfigObj, term, oldConfig.getReplicaSetId());
+        if (!status.isOK()) {
+            LOGV2_ERROR(21418,
+                        "replSetReconfig got {status} while parsing {newConfigObj}",
+                        "status"_attr = status,
+                        "newConfigObj"_attr = args.newConfigObj);
+            return Status(ErrorCodes::InvalidReplicaSetConfig, status.reason());
+        }
+        if (newConfig.getReplSetName() != _settings.ourSetName()) {
+            str::stream errmsg;
+            errmsg << "Attempting to reconfigure a replica set with name "
+                   << newConfig.getReplSetName() << ", but command line reports "
+                   << _settings.ourSetName() << "; rejecting";
+            LOGV2_ERROR(
+                21419, "{std_string_errmsg}", "std_string_errmsg"_attr = std::string(errmsg));
+            return Status(ErrorCodes::InvalidReplicaSetConfig, errmsg);
+        }
+
+        // Increase the config version for force reconfig.
+        if (args.force) {
+            auto version = std::max(oldConfig.getConfigVersion(), newConfig.getConfigVersion());
+            version += 10'000 + SecureRandom().nextInt32(100'000);
+            newConfig.setConfigVersion(version);
+        }
+        return newConfig;
+    };
+
+    return doReplSetReconfig(opCtx, getNewConfig, args.force);
+}
+
+Status ReplicationCoordinatorImpl::doReplSetReconfig(OperationContext* opCtx,
+                                                     GetNewConfigFn getNewConfig,
+                                                     bool force) {
     stdx::unique_lock<Latch> lk(_mutex);
 
     while (_rsConfigState == kConfigPreStart || _rsConfigState == kConfigStartingUp) {
@@ -2723,18 +2949,68 @@ Status ReplicationCoordinatorImpl::processReplSetReconfig(OperationContext* opCt
                           "Cannot run replSetReconfig because the node is currently updating "
                           "its configuration");
         default:
-            severe() << "Unexpected _rsConfigState " << int(_rsConfigState);
+            LOGV2_FATAL(21432,
+                        "Unexpected _rsConfigState {_rsConfigState}",
+                        "_rsConfigState"_attr = int(_rsConfigState));
             fassertFailed(18914);
     }
 
     invariant(_rsConfig.isInitialized());
 
-    if (!args.force && !_getMemberState_inlock().primary()) {
+    if (!force && !_getMemberState_inlock().primary()) {
         return Status(ErrorCodes::NotMaster,
                       str::stream()
                           << "replSetReconfig should only be run on PRIMARY, but my state is "
                           << _getMemberState_inlock().toString()
                           << "; use the \"force\" argument to override");
+    }
+    auto topCoordTerm = _topCoord->getTerm();
+
+    WriteConcernOptions configWriteConcern(ReplSetConfig::kConfigMajorityWriteConcernModeName,
+                                           WriteConcernOptions::SyncMode::NONE,
+                                           WriteConcernOptions::kNoTimeout);
+    configWriteConcern.checkCondition = WriteConcernOptions::CheckCondition::Config;
+    // Construct a fake OpTime that can be accepted but isn't used.
+    OpTime fakeOpTime(Timestamp(1, 1), topCoordTerm);
+
+    if (serverGlobalParams.featureCompatibility.isVersion(
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) &&
+        !force) {
+        if (!_doneWaitingForReplication_inlock(fakeOpTime, configWriteConcern)) {
+            return Status(ErrorCodes::ConfigurationInProgress,
+                          str::stream()
+                              << "Cannot run replSetReconfig because the current config: "
+                              << _rsConfig.getConfigVersionAndTerm().toString() << " is not "
+                              << "majority committed.");
+        }
+
+        // Make sure that the latest committed optime from the previous config is committed in the
+        // current config. If this is the initial reconfig, then we don't need to check this
+        // condition, since there were no prior configs. Also, for force reconfigs we bypass this
+        // safety check condition. In any FCV < 4.4 we also bypass it to preserve client facing
+        // behavior in mixed version sets.
+        auto isInitialReconfig = (_rsConfig.getConfigVersion() == 1);
+        // If our config was installed via a "force" reconfig, we bypass the oplog commitment check.
+        auto leavingForceConfig = (_rsConfig.getConfigTerm() == OpTime::kUninitializedTerm);
+        auto configOplogCommitmentOpTime = _topCoord->getConfigOplogCommitmentOpTime();
+        auto wcOpts = _populateUnsetWriteConcernOptionsSyncMode(
+            lk,
+            WriteConcernOptions(_rsConfig.getWriteMajority(),
+                                WriteConcernOptions::SyncMode::NONE,
+                                WriteConcernOptions::kNoWaiting));
+
+        if (!leavingForceConfig && !isInitialReconfig &&
+            !_doneWaitingForReplication_inlock(configOplogCommitmentOpTime, wcOpts)) {
+            LOGV2(51816,
+                  "Oplog config commitment condition failed to be satisfied. The last committed "
+                  "optime in the previous config ({configOplogCommitmentOpTime}) is not committed "
+                  "in current config",
+                  "configOplogCommitmentOpTime"_attr = configOplogCommitmentOpTime);
+            return Status(ErrorCodes::ConfigurationInProgress,
+                          str::stream() << "Last committed optime from previous config ("
+                                        << configOplogCommitmentOpTime.toString()
+                                        << ") is not committed in the current config.");
+        }
     }
 
     _setConfigState_inlock(kConfigReconfiguring);
@@ -2742,62 +3018,96 @@ Status ReplicationCoordinatorImpl::processReplSetReconfig(OperationContext* opCt
         makeGuard([&] { lockAndCall(&lk, [=] { _setConfigState_inlock(kConfigSteady); }); });
 
     ReplSetConfig oldConfig = _rsConfig;
-    auto topCoordTerm = _topCoord->getTerm();
     lk.unlock();
 
-    ReplSetConfig newConfig;
-    BSONObj newConfigObj = args.newConfigObj;
-    if (args.force) {
-        newConfigObj = incrementConfigVersionByRandom(newConfigObj);
-    }
+    // Call the callback to get the new config given the old one.
+    auto newConfigStatus = getNewConfig(oldConfig, topCoordTerm);
+    Status status = newConfigStatus.getStatus();
+    if (!status.isOK())
+        return status;
+    ReplSetConfig newConfig = newConfigStatus.getValue();
 
     BSONObj oldConfigObj = oldConfig.toBSON();
+    BSONObj newConfigObj = newConfig.toBSON();
     audit::logReplSetReconfig(opCtx->getClient(), &oldConfigObj, &newConfigObj);
 
-    // When initializing a new config through the replSetReconfig command, ignore the term
-    // field passed in through its args. Instead, use this node's term.
-    Status status = newConfig.initialize(newConfigObj, topCoordTerm, oldConfig.getReplicaSetId());
-    if (!status.isOK()) {
-        error() << "replSetReconfig got " << status << " while parsing " << newConfigObj;
-        return Status(ErrorCodes::InvalidReplicaSetConfig, status.reason());
-    }
-    if (newConfig.getReplSetName() != _settings.ourSetName()) {
-        str::stream errmsg;
-        errmsg << "Attempting to reconfigure a replica set with name " << newConfig.getReplSetName()
-               << ", but command line reports " << _settings.ourSetName() << "; rejecting";
-        error() << std::string(errmsg);
-        return Status(ErrorCodes::InvalidReplicaSetConfig, errmsg);
-    }
-
     StatusWith<int> myIndex = validateConfigForReconfig(
-        _externalState.get(), oldConfig, newConfig, opCtx->getServiceContext(), args.force);
+        _externalState.get(), oldConfig, newConfig, opCtx->getServiceContext(), force);
     if (!myIndex.isOK()) {
-        error() << "replSetReconfig got " << myIndex.getStatus() << " while validating "
-                << newConfigObj;
+        LOGV2_ERROR(21420,
+                    "replSetReconfig got {status} while validating {newConfigObj}",
+                    "status"_attr = myIndex.getStatus(),
+                    "newConfigObj"_attr = newConfigObj);
         return Status(ErrorCodes::NewReplicaSetConfigurationIncompatible,
                       myIndex.getStatus().reason());
     }
 
-    log() << "replSetReconfig config object with " << newConfig.getNumMembers()
-          << " members parses ok";
+    LOGV2(21353,
+          "replSetReconfig config object with {numMembers} members parses ok",
+          "numMembers"_attr = newConfig.getNumMembers());
 
-    if (!args.force) {
+    if (!force && !MONGO_unlikely(omitConfigQuorumCheck.shouldFail())) {
         status = checkQuorumForReconfig(
             _replExecutor.get(), newConfig, myIndex.getValue(), _topCoord->getTerm());
         if (!status.isOK()) {
-            error() << "replSetReconfig failed; " << status;
+            LOGV2_ERROR(21421, "replSetReconfig failed; {status}", "status"_attr = status);
             return status;
         }
     }
 
+    LOGV2(51814, "Persisting new config to disk.");
     status = _externalState->storeLocalConfigDocument(opCtx, newConfig.toBSON());
     if (!status.isOK()) {
-        error() << "replSetReconfig failed to store config document; " << status;
+        LOGV2_ERROR(21422,
+                    "replSetReconfig failed to store config document; {status}",
+                    "status"_attr = status);
         return status;
     }
 
     configStateGuard.dismiss();
-    _finishReplSetReconfig(opCtx, newConfig, args.force, myIndex.getValue());
+    _finishReplSetReconfig(opCtx, newConfig, force, myIndex.getValue());
+
+    if (!force &&
+        serverGlobalParams.featureCompatibility.isVersion(
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44)) {
+        // Wait for the config document to be replicated to a majority of nodes in the new
+        // config.
+        StatusAndDuration configAwaitStatus =
+            awaitReplication(opCtx, fakeOpTime, configWriteConcern);
+        uassertStatusOK(configAwaitStatus.status);
+
+        // Now that the new config has been persisted and installed in memory, wait for the latest
+        // committed optime in the previous config to be committed in the newly installed config.
+        // For force reconfigs we don't need to check this safety condition, and in any FCV < 4.4 we
+        // also bypass this to preserve client facing behavior in mixed version sets. Note that even
+        // if we have just left a force config via a non-force reconfig, we still want to wait for
+        // this oplog commitment check, since a subsequent safe reconfig will check it as a
+        // precondition.
+        auto configOplogCommitmentOpTime = _topCoord->getConfigOplogCommitmentOpTime();
+        auto oplogWriteConcern = WriteConcernOptions(newConfig.getWriteMajority(),
+                                                     WriteConcernOptions::SyncMode::NONE,
+                                                     WriteConcernOptions::kNoTimeout);
+        LOGV2(51815,
+              "Waiting for the last committed optime in the previous config "
+              "({configOplogCommitmentOpTime}) to be committed in the current config.",
+              "configOplogCommitmentOpTime"_attr = configOplogCommitmentOpTime);
+        StatusAndDuration oplogAwaitStatus =
+            awaitReplication(opCtx, configOplogCommitmentOpTime, oplogWriteConcern);
+        if (!oplogAwaitStatus.status.isOK()) {
+            uasserted(oplogAwaitStatus.status.code(),
+                      str::stream() << "Last committed optime in the previous config ("
+                                    << configOplogCommitmentOpTime.toString()
+                                    << ") did not become committed in the current config.");
+        }
+
+        LOGV2(4508701,
+              "Committed new replica set config",
+              "newConfigVersion"_attr = newConfig.getConfigVersion(),
+              "newConfigTerm"_attr = newConfig.getConfigTerm(),
+              "configWaitDuration"_attr = configAwaitStatus.duration,
+              "oplogWaitDuration"_attr = oplogAwaitStatus.duration,
+              "configOplogCommitmentOpTime"_attr = configOplogCommitmentOpTime);
+    }
     return Status::OK();
 }
 
@@ -2816,8 +3126,11 @@ void ReplicationCoordinatorImpl::_finishReplSetReconfig(OperationContext* opCtx,
     // we have already set our ReplicationCoordinatorImpl::_rsConfigState state to
     // "kConfigReconfiguring" which prevents new elections from happening.
     if (electionFinishedEvent) {
-        LOG(2) << "Waiting for election to complete before finishing reconfig to version "
-               << newConfig.getConfigVersion();
+        LOGV2_DEBUG(21354,
+                    2,
+                    "Waiting for election to complete before finishing reconfig to config with "
+                    "{configVersionAndTerm}",
+                    "configVersionAndTerm"_attr = newConfig.getConfigVersionAndTerm());
         // Wait for the election to complete and the node's Role to be set to follower.
         _replExecutor->waitForEvent(electionFinishedEvent);
     }
@@ -2835,7 +3148,7 @@ void ReplicationCoordinatorImpl::_finishReplSetReconfig(OperationContext* opCtx,
         lk.lock();
         if (_topCoord->isSteppingDownUnconditionally()) {
             invariant(opCtx->lockState()->isRSTLExclusive());
-            log() << "stepping down from primary, because we received a new config";
+            LOGV2(21355, "stepping down from primary, because we received a new config");
             // We need to release the mutex before yielding locks for prepared transactions, which
             // might check out sessions, to avoid deadlocks with checked-out sessions accessing
             // this mutex.
@@ -2883,7 +3196,7 @@ void ReplicationCoordinatorImpl::_finishReplSetReconfig(OperationContext* opCtx,
 Status ReplicationCoordinatorImpl::processReplSetInitiate(OperationContext* opCtx,
                                                           const BSONObj& configObj,
                                                           BSONObjBuilder* resultObj) {
-    log() << "replSetInitiate admin command received from client";
+    LOGV2(21356, "replSetInitiate admin command received from client");
 
     const auto replEnabled = _settings.usingReplSets();
     stdx::unique_lock<Latch> lk(_mutex);
@@ -2903,32 +3216,46 @@ Status ReplicationCoordinatorImpl::processReplSetInitiate(OperationContext* opCt
 
     auto configStateGuard =
         makeGuard([&] { lockAndCall(&lk, [=] { _setConfigState_inlock(kConfigUninitialized); }); });
+
+    // When writing our first oplog entry below, disable advancement of the stable timestamp so that
+    // we don't set it before setting our initial data timestamp. We will set it after we set our
+    // initialDataTimestamp. This will ensure we trigger an initial stable checkpoint properly.
+    if (!serverGlobalParams.enableMajorityReadConcern) {
+        _shouldSetStableTimestamp = false;
+    }
+
     lk.unlock();
 
     ReplSetConfig newConfig;
     Status status = newConfig.initializeForInitiate(configObj);
     if (!status.isOK()) {
-        error() << "replSet initiate got " << status << " while parsing " << configObj;
+        LOGV2_ERROR(21423,
+                    "replSet initiate got {status} while parsing {configObj}",
+                    "status"_attr = status,
+                    "configObj"_attr = configObj);
         return Status(ErrorCodes::InvalidReplicaSetConfig, status.reason());
     }
     if (newConfig.getReplSetName() != _settings.ourSetName()) {
         str::stream errmsg;
         errmsg << "Attempting to initiate a replica set with name " << newConfig.getReplSetName()
                << ", but command line reports " << _settings.ourSetName() << "; rejecting";
-        error() << std::string(errmsg);
+        LOGV2_ERROR(21424, "{errmsg}", "errmsg"_attr = std::string(errmsg));
         return Status(ErrorCodes::InvalidReplicaSetConfig, errmsg);
     }
 
     StatusWith<int> myIndex =
         validateConfigForInitiate(_externalState.get(), newConfig, opCtx->getServiceContext());
     if (!myIndex.isOK()) {
-        error() << "replSet initiate got " << myIndex.getStatus() << " while validating "
-                << configObj;
+        LOGV2_ERROR(21425,
+                    "replSet initiate got {status} while validating {configObj}",
+                    "status"_attr = myIndex.getStatus(),
+                    "configObj"_attr = configObj);
         return Status(ErrorCodes::InvalidReplicaSetConfig, myIndex.getStatus().reason());
     }
 
-    log() << "replSetInitiate config object with " << newConfig.getNumMembers()
-          << " members parses ok";
+    LOGV2(21357,
+          "replSetInitiate config object with {numMembers} members parses ok",
+          "numMembers"_attr = newConfig.getNumMembers());
 
     // In pv1, the TopologyCoordinator has not set the term yet. It will be set to kInitialTerm if
     // the initiate succeeds so we pass that here.
@@ -2936,14 +3263,15 @@ Status ReplicationCoordinatorImpl::processReplSetInitiate(OperationContext* opCt
         _replExecutor.get(), newConfig, myIndex.getValue(), OpTime::kInitialTerm);
 
     if (!status.isOK()) {
-        error() << "replSetInitiate failed; " << status;
+        LOGV2_ERROR(21426, "replSetInitiate failed; {status}", "status"_attr = status);
         return status;
     }
 
     status = _externalState->initializeReplSetStorage(opCtx, newConfig.toBSON());
     if (!status.isOK()) {
-        error() << "replSetInitiate failed to store config document or create the oplog; "
-                << status;
+        LOGV2_ERROR(21427,
+                    "replSetInitiate failed to store config document or create the oplog; {status}",
+                    "status"_attr = status);
         return status;
     }
 
@@ -2959,6 +3287,14 @@ Status ReplicationCoordinatorImpl::processReplSetInitiate(OperationContext* opCt
     // to data on disk. We do this after writing the "initiating set" oplog entry.
     _storage->setInitialDataTimestamp(getServiceContext(),
                                       lastAppliedOpTimeAndWallTime.opTime.getTimestamp());
+
+    // Set our stable timestamp for storage and re-enable stable timestamp advancement after we have
+    // set our initial data timestamp.
+    if (!serverGlobalParams.enableMajorityReadConcern) {
+        stdx::unique_lock<Latch> lk(_mutex);
+        _shouldSetStableTimestamp = true;
+        _setStableTimestampForStorage(lk);
+    }
 
     _finishReplSetInitiate(opCtx, newConfig, myIndex.getValue());
 
@@ -2990,6 +3326,19 @@ void ReplicationCoordinatorImpl::_setConfigState_inlock(ConfigState newState) {
     }
 }
 
+bool ReplicationCoordinatorImpl::_haveHorizonsChanged(const ReplSetConfig& oldConfig,
+                                                      const ReplSetConfig& newConfig,
+                                                      int oldIndex,
+                                                      int newIndex) {
+    if (oldIndex < 0 || newIndex < 0) {
+        // It's possible for index to be -1 if we are performing a reconfig via heartbeat.
+        return false;
+    }
+    const auto oldHorizonMappings = oldConfig.getMemberAt(oldIndex).getHorizonMappings();
+    const auto newHorizonMappings = newConfig.getMemberAt(newIndex).getHorizonMappings();
+    return oldHorizonMappings != newHorizonMappings;
+}
+
 void ReplicationCoordinatorImpl::_fulfillTopologyChangePromise(OperationContext* opCtx,
                                                                WithLock lock) {
     _topCoord->incrementTopologyVersion();
@@ -3001,6 +3350,11 @@ void ReplicationCoordinatorImpl::_fulfillTopologyChangePromise(OperationContext*
         iter->second->emplaceValue(response);
         iter->second = std::make_shared<SharedPromise<std::shared_ptr<const IsMasterResponse>>>();
     }
+}
+
+void ReplicationCoordinatorImpl::incrementTopologyVersion(OperationContext* opCtx) {
+    stdx::lock_guard lk(_mutex);
+    _fulfillTopologyChangePromise(opCtx, lk);
 }
 
 ReplicationCoordinatorImpl::PostMemberStateUpdateAction
@@ -3020,6 +3374,8 @@ ReplicationCoordinatorImpl::_updateMemberStateFromTopologyCoordinator(WithLock l
     ON_BLOCK_EXIT([&] {
         if (_rsConfig.isInitialized()) {
             _fulfillTopologyChangePromise(opCtx, lk);
+            // Use the global ServiceContext here in case the current opCtx is null.
+            IsMasterMetrics::get(getGlobalServiceContext())->resetNumAwaitingTopologyChanges();
         }
     });
 
@@ -3134,7 +3490,11 @@ ReplicationCoordinatorImpl::_updateMemberStateFromTopologyCoordinator(WithLock l
         _cancelPriorityTakeover_inlock();
     }
 
-    log() << "transition to " << newState << " from " << _memberState << rsLog;
+    LOGV2_OPTIONS(21358,
+                  {logv2::LogTag::kRS},
+                  "transition to {newState} from {memberState}",
+                  "newState"_attr = newState,
+                  "memberState"_attr = _memberState);
     // Initializes the featureCompatibilityVersion to the latest value, because arbiters do not
     // receive the replicated version. This is to avoid bugs like SERVER-32639.
     if (newState.arbiter()) {
@@ -3176,7 +3536,9 @@ void ReplicationCoordinatorImpl::_performPostMemberStateUpdateAction(
             _startElectSelfV1(StartElectionReasonEnum::kElectionTimeout);
             break;
         default:
-            severe() << "Unknown post member state update action " << static_cast<int>(action);
+            LOGV2_FATAL(21433,
+                        "Unknown post member state update action {action}",
+                        "action"_attr = static_cast<int>(action));
             fassertFailed(26010);
     }
 }
@@ -3206,7 +3568,7 @@ void ReplicationCoordinatorImpl::_onFollowerModeStateChange() {
 }
 
 void ReplicationCoordinatorImpl::CatchupState::start_inlock() {
-    log() << "Entering primary catch-up mode.";
+    LOGV2(21359, "Entering primary catch-up mode.");
 
     // Reset the number of catchup operations performed before starting catchup.
     _numCatchUpOps = 0;
@@ -3221,7 +3583,7 @@ void ReplicationCoordinatorImpl::CatchupState::start_inlock() {
 
     // When catchUpTimeoutMillis is 0, we skip doing catchup entirely.
     if (catchupTimeout == ReplSetConfig::kCatchUpDisabled) {
-        log() << "Skipping primary catchup since the catchup timeout is 0.";
+        LOGV2(21360, "Skipping primary catchup since the catchup timeout is 0.");
         abort_inlock(PrimaryCatchUpConclusionReason::kSkipped);
         return;
     }
@@ -3236,7 +3598,7 @@ void ReplicationCoordinatorImpl::CatchupState::start_inlock() {
         if (cbData.myHandle.isCanceled()) {
             return;
         }
-        log() << "Catchup timed out after becoming primary.";
+        LOGV2(21361, "Catchup timed out after becoming primary.");
         abort_inlock(PrimaryCatchUpConclusionReason::kTimedOut);
     };
 
@@ -3249,7 +3611,7 @@ void ReplicationCoordinatorImpl::CatchupState::start_inlock() {
     auto timeoutDate = _repl->_replExecutor->now() + catchupTimeout;
     auto status = _repl->_replExecutor->scheduleWorkAt(timeoutDate, std::move(timeoutCB));
     if (!status.isOK()) {
-        log() << "Failed to schedule catchup timeout work.";
+        LOGV2(21362, "Failed to schedule catchup timeout work.");
         abort_inlock(PrimaryCatchUpConclusionReason::kFailedWithError);
         return;
     }
@@ -3262,7 +3624,7 @@ void ReplicationCoordinatorImpl::CatchupState::abort_inlock(PrimaryCatchUpConclu
     ReplicationMetrics::get(getGlobalServiceContext())
         .incrementNumCatchUpsConcludedForReason(reason);
 
-    log() << "Exited primary catch-up mode.";
+    LOGV2(21363, "Exited primary catch-up mode.");
     // Clean up its own members.
     if (_timeoutCbh) {
         _repl->_replExecutor->cancel(_timeoutCbh);
@@ -3288,8 +3650,11 @@ void ReplicationCoordinatorImpl::CatchupState::signalHeartbeatUpdate_inlock() {
     // We've caught up.
     const auto myLastApplied = _repl->_getMyLastAppliedOpTime_inlock();
     if (*targetOpTime <= myLastApplied) {
-        log() << "Caught up to the latest optime known via heartbeats after becoming primary. "
-              << "Target optime: " << *targetOpTime << ". My Last Applied: " << myLastApplied;
+        LOGV2(21364,
+              "Caught up to the latest optime known via heartbeats after becoming primary. Target "
+              "optime: {targetOpTime}. My Last Applied: {myLastApplied}",
+              "targetOpTime"_attr = *targetOpTime,
+              "myLastApplied"_attr = myLastApplied);
         // Report the number of ops applied during catchup in replSetGetStatus once the primary is
         // caught up.
         ReplicationMetrics::get(getGlobalServiceContext()).setNumCatchUpOps(_numCatchUpOps);
@@ -3305,12 +3670,16 @@ void ReplicationCoordinatorImpl::CatchupState::signalHeartbeatUpdate_inlock() {
 
     ReplicationMetrics::get(getGlobalServiceContext()).setTargetCatchupOpTime(_targetOpTime);
 
-    log() << "Heartbeats updated catchup target optime to " << _targetOpTime;
-    log() << "Latest known optime per replica set member:";
+    LOGV2(21365,
+          "Heartbeats updated catchup target optime to {targetOpTime}",
+          "targetOpTime"_attr = _targetOpTime);
+    LOGV2(21366, "Latest known optime per replica set member:");
     auto opTimesPerMember = _repl->_topCoord->latestKnownOpTimeSinceHeartbeatRestartPerMember();
     for (auto&& pair : opTimesPerMember) {
-        log() << "Member ID: " << pair.first
-              << ", latest known optime: " << (pair.second ? (*pair.second).toString() : "unknown");
+        LOGV2(21367,
+              "Member ID: {memberId}, latest known optime: {latestKnownOpTime}",
+              "memberId"_attr = pair.first,
+              "latestKnownOpTime"_attr = (pair.second ? (*pair.second).toString() : "unknown"));
     }
 
     if (_waiter) {
@@ -3327,8 +3696,11 @@ void ReplicationCoordinatorImpl::CatchupState::signalHeartbeatUpdate_inlock() {
         // Double check the target time since stepdown may signal us too.
         const auto myLastApplied = _repl->_getMyLastAppliedOpTime_inlock();
         if (_targetOpTime <= myLastApplied) {
-            log() << "Caught up to the latest known optime successfully after becoming primary. "
-                  << "Target optime: " << _targetOpTime << ". My Last Applied: " << myLastApplied;
+            LOGV2(21368,
+                  "Caught up to the latest known optime successfully after becoming primary. "
+                  "Target optime: {targetOpTime}. My Last Applied: {myLastApplied}",
+                  "targetOpTime"_attr = _targetOpTime,
+                  "myLastApplied"_attr = myLastApplied);
             // Report the number of ops applied during catchup in replSetGetStatus once the primary
             // is caught up.
             ReplicationMetrics::get(getGlobalServiceContext()).setNumCatchUpOps(_numCatchUpOps);
@@ -3399,21 +3771,32 @@ ReplicationCoordinatorImpl::_setCurrentRSConfig(WithLock lk,
     if (storageEngine && !storageEngine->isDurable() &&
         (newConfig.getWriteConcernMajorityShouldJournal() &&
          (!oldConfig.isInitialized() || !oldConfig.getWriteConcernMajorityShouldJournal()))) {
-        log() << startupWarningsLog;
-        log() << "** WARNING: This replica set node is running without journaling enabled but the "
-              << startupWarningsLog;
-        log() << "**          writeConcernMajorityJournalDefault option to the replica set config "
-              << startupWarningsLog;
-        log() << "**          is set to true. The writeConcernMajorityJournalDefault "
-              << startupWarningsLog;
-        log() << "**          option to the replica set config must be set to false "
-              << startupWarningsLog;
-        log() << "**          or w:majority write concerns will never complete."
-              << startupWarningsLog;
-        log() << "**          In addition, this node's memory consumption may increase until all"
-              << startupWarningsLog;
-        log() << "**          available free RAM is exhausted." << startupWarningsLog;
-        log() << startupWarningsLog;
+        LOGV2_OPTIONS(21369, {logv2::LogTag::kStartupWarnings}, "");
+        LOGV2_OPTIONS(
+            21370,
+            {logv2::LogTag::kStartupWarnings},
+            "** WARNING: This replica set node is running without journaling enabled but the ");
+        LOGV2_OPTIONS(
+            21371,
+            {logv2::LogTag::kStartupWarnings},
+            "**          writeConcernMajorityJournalDefault option to the replica set config ");
+        LOGV2_OPTIONS(21372,
+                      {logv2::LogTag::kStartupWarnings},
+                      "**          is set to true. The writeConcernMajorityJournalDefault ");
+        LOGV2_OPTIONS(21373,
+                      {logv2::LogTag::kStartupWarnings},
+                      "**          option to the replica set config must be set to false ");
+        LOGV2_OPTIONS(21374,
+                      {logv2::LogTag::kStartupWarnings},
+                      "**          or w:majority write concerns will never complete.");
+        LOGV2_OPTIONS(
+            21375,
+            {logv2::LogTag::kStartupWarnings},
+            "**          In addition, this node's memory consumption may increase until all");
+        LOGV2_OPTIONS(21376,
+                      {logv2::LogTag::kStartupWarnings},
+                      "**          available free RAM is exhausted.");
+        LOGV2_OPTIONS(21377, {logv2::LogTag::kStartupWarnings}, "");
     }
 
     // Warn if using the in-memory (ephemeral) storage engine with
@@ -3421,30 +3804,77 @@ ReplicationCoordinatorImpl::_setCurrentRSConfig(WithLock lk,
     if (storageEngine && storageEngine->isEphemeral() &&
         (newConfig.getWriteConcernMajorityShouldJournal() &&
          (!oldConfig.isInitialized() || !oldConfig.getWriteConcernMajorityShouldJournal()))) {
-        log() << startupWarningsLog;
-        log() << "** WARNING: This replica set node is using in-memory (ephemeral) storage with the"
-              << startupWarningsLog;
-        log() << "**          writeConcernMajorityJournalDefault option to the replica set config "
-              << startupWarningsLog;
-        log() << "**          set to true. The writeConcernMajorityJournalDefault option to the "
-              << startupWarningsLog;
-        log() << "**          replica set config must be set to false " << startupWarningsLog;
-        log() << "**          or w:majority write concerns will never complete."
-              << startupWarningsLog;
-        log() << "**          In addition, this node's memory consumption may increase until all"
-              << startupWarningsLog;
-        log() << "**          available free RAM is exhausted." << startupWarningsLog;
-        log() << startupWarningsLog;
+        LOGV2_OPTIONS(21378, {logv2::LogTag::kStartupWarnings}, "");
+        LOGV2_OPTIONS(
+            21379,
+            {logv2::LogTag::kStartupWarnings},
+            "** WARNING: This replica set node is using in-memory (ephemeral) storage with the");
+        LOGV2_OPTIONS(
+            21380,
+            {logv2::LogTag::kStartupWarnings},
+            "**          writeConcernMajorityJournalDefault option to the replica set config ");
+        LOGV2_OPTIONS(
+            21381,
+            {logv2::LogTag::kStartupWarnings},
+            "**          set to true. The writeConcernMajorityJournalDefault option to the ");
+        LOGV2_OPTIONS(21382,
+                      {logv2::LogTag::kStartupWarnings},
+                      "**          replica set config must be set to false ");
+        LOGV2_OPTIONS(21383,
+                      {logv2::LogTag::kStartupWarnings},
+                      "**          or w:majority write concerns will never complete.");
+        LOGV2_OPTIONS(
+            21384,
+            {logv2::LogTag::kStartupWarnings},
+            "**          In addition, this node's memory consumption may increase until all");
+        LOGV2_OPTIONS(21385,
+                      {logv2::LogTag::kStartupWarnings},
+                      "**          available free RAM is exhausted.");
+        LOGV2_OPTIONS(21386, {logv2::LogTag::kStartupWarnings}, "");
     }
 
+    // Since the ReplSetConfig always has a WriteConcernOptions, the only way to know if it has been
+    // customized is if it's different to the implicit defaults of { w: 1, wtimeout: 0 }.
+    if (const auto& wc = newConfig.getDefaultWriteConcern();
+        !(wc.wNumNodes == 1 && wc.wTimeout == 0)) {
+        LOGV2_OPTIONS(21387, {logv2::LogTag::kStartupWarnings}, "");
+        LOGV2_OPTIONS(21388,
+                      {logv2::LogTag::kStartupWarnings},
+                      "** WARNING: Replica set config contains customized getLastErrorDefaults,");
+        LOGV2_OPTIONS(21389,
+                      {logv2::LogTag::kStartupWarnings},
+                      "**          which are deprecated. Use setDefaultRWConcern instead to set a");
+        LOGV2_OPTIONS(21390,
+                      {logv2::LogTag::kStartupWarnings},
+                      "**          cluster-wide default writeConcern.");
+        LOGV2_OPTIONS(21391, {logv2::LogTag::kStartupWarnings}, "");
+    }
 
-    log() << "New replica set config in use: " << _rsConfig.toBSON() << rsLog;
+    const bool horizonsChanged = _haveHorizonsChanged(oldConfig, newConfig, _selfIndex, myIndex);
+
+    LOGV2_OPTIONS(21392,
+                  {logv2::LogTag::kRS},
+                  "New replica set config in use: {rsConfig}",
+                  "rsConfig"_attr = _rsConfig.toBSON());
     _selfIndex = myIndex;
     if (_selfIndex >= 0) {
-        log() << "This node is " << _rsConfig.getMemberAt(_selfIndex).getHostAndPort()
-              << " in the config";
+        LOGV2(21393,
+              "This node is {hostAndPort} in the config",
+              "hostAndPort"_attr = _rsConfig.getMemberAt(_selfIndex).getHostAndPort());
     } else {
-        log() << "This node is not a member of the config";
+        LOGV2(21394, "This node is not a member of the config");
+    }
+
+    if (horizonsChanged) {
+        for (auto iter = _horizonToPromiseMap.begin(); iter != _horizonToPromiseMap.end(); iter++) {
+            iter->second->setError({ErrorCodes::SplitHorizonChange,
+                                    "Received a reconfig that changed the horizon parameters."});
+            IsMasterMetrics::get(opCtx)->resetNumAwaitingTopologyChanges();
+        }
+        if (_selfIndex >= 0) {
+            // Only create a new horizon promise mapping if the node exists in the new config.
+            _createHorizonTopologyChangePromiseMapping(lk);
+        }
     }
 
     // Wake up writeConcern waiters that are no longer satisfiable due to the rsConfig change.
@@ -3472,10 +3902,12 @@ ReplicationCoordinatorImpl::_setCurrentRSConfig(WithLock lk,
         if (_horizonToPromiseMap.empty()) {
             // We should only create a new horizon-to-promise mapping for nodes that are members of
             // the config.
-            // TODO (SERVER-45039): Create a new horizon to promise mapping after each reconfig
-            // that changes the horizon.
             _createHorizonTopologyChangePromiseMapping(lk);
         }
+    } else {
+        // Clear the horizon promise mappings of removed nodes so they can be recreated if the node
+        // later rejoins the set.
+        _horizonToPromiseMap.clear();
     }
 
     _updateLastCommittedOpTimeAndWallTime(lk);
@@ -3666,9 +4098,10 @@ void ReplicationCoordinatorImpl::resetLastOpTimesFromOplog(OperationContext* opC
     auto lastOpTimeAndWallTimeStatus = _externalState->loadLastOpTimeAndWallTime(opCtx);
     OpTimeAndWallTime lastOpTimeAndWallTime = {OpTime(), Date_t()};
     if (!lastOpTimeAndWallTimeStatus.getStatus().isOK()) {
-        warning() << "Failed to load timestamp and/or wall clock time of most recently applied "
-                     "operation; "
-                  << lastOpTimeAndWallTimeStatus.getStatus();
+        LOGV2_WARNING(21412,
+                      "Failed to load timestamp and/or wall clock time of most recently applied "
+                      "operation; {status}",
+                      "status"_attr = lastOpTimeAndWallTimeStatus.getStatus());
     } else {
         lastOpTimeAndWallTime = lastOpTimeAndWallTimeStatus.getValue();
     }
@@ -3697,12 +4130,6 @@ bool ReplicationCoordinatorImpl::shouldChangeSyncSource(
 void ReplicationCoordinatorImpl::_updateLastCommittedOpTimeAndWallTime(WithLock lk) {
     if (_topCoord->updateLastCommittedOpTimeAndWallTime()) {
         _setStableTimestampForStorage(lk);
-        if (MONGO_unlikely(logForTLAPlusSpecs.shouldFail())) {
-            EnsureOperationContext ensureOpCtx;
-            _tlaPlusRaftMongoEvent(lk,
-                                   ensureOpCtx.getOperationContext(),
-                                   RaftMongoSpecActionEnum::kAdvanceCommitPoint);
-        }
     }
 }
 
@@ -3834,13 +4261,20 @@ boost::optional<OpTimeAndWallTime> ReplicationCoordinatorImpl::_recalculateStabl
 MONGO_FAIL_POINT_DEFINE(disableSnapshotting);
 
 void ReplicationCoordinatorImpl::_setStableTimestampForStorage(WithLock lk) {
+    if (!_shouldSetStableTimestamp) {
+        LOGV2_DEBUG(21395, 2, "Not setting stable timestamp for storage.");
+        return;
+    }
     // Get the current stable optime.
     auto stableOpTime = _recalculateStableOpTime(lk);
 
     // If there is a valid stable optime, set it for the storage engine, and then remove any
     // old, unneeded stable optime candidates.
     if (stableOpTime) {
-        LOG(2) << "Setting replication's stable optime to " << stableOpTime.value();
+        LOGV2_DEBUG(21396,
+                    2,
+                    "Setting replication's stable optime to {stableOpTime}",
+                    "stableOpTime"_attr = stableOpTime.value());
 
         if (!gTestingSnapshotBehaviorInIsolation) {
             // Update committed snapshot and wake up any threads waiting on read concern or
@@ -3894,15 +4328,17 @@ void ReplicationCoordinatorImpl::finishRecoveryIfEligible(OperationContext* opCt
     // We can only transition to SECONDARY from RECOVERING state.
     MemberState state(getMemberState());
     if (!state.recovering()) {
-        LOG(2) << "We cannot transition to SECONDARY state since we are not currently in "
-                  "RECOVERING state. Current state: "
-               << state.toString();
+        LOGV2_DEBUG(21397,
+                    2,
+                    "We cannot transition to SECONDARY state since we are not currently in "
+                    "RECOVERING state. Current state: {state}",
+                    "state"_attr = state.toString());
         return;
     }
 
     // Maintenance mode will force us to remain in RECOVERING state, no matter what.
     if (getMaintenanceMode()) {
-        LOG(1) << "We cannot transition to SECONDARY state while in maintenance mode.";
+        LOGV2_DEBUG(21398, 1, "We cannot transition to SECONDARY state while in maintenance mode.");
         return;
     }
 
@@ -3912,17 +4348,26 @@ void ReplicationCoordinatorImpl::finishRecoveryIfEligible(OperationContext* opCt
     auto lastApplied = getMyLastAppliedOpTime();
     auto minValid = _replicationProcess->getConsistencyMarkers()->getMinValid(opCtx);
     if (lastApplied < minValid) {
-        LOG(2) << "We cannot transition to SECONDARY state because our 'lastApplied' optime"
-                  " is less than the 'minValid' optime. minValid optime: "
-               << minValid << ", lastApplied optime: " << lastApplied;
+        LOGV2_DEBUG(21399,
+                    2,
+                    "We cannot transition to SECONDARY state because our 'lastApplied' optime"
+                    " is less than the 'minValid' optime. minValid optime: {minValid}, lastApplied "
+                    "optime: {lastApplied}",
+                    "minValid"_attr = minValid,
+                    "lastApplied"_attr = lastApplied);
         return;
     }
 
     // Execute the transition to SECONDARY.
     auto status = setFollowerMode(MemberState::RS_SECONDARY);
     if (!status.isOK()) {
-        warning() << "Failed to transition into " << MemberState(MemberState::RS_SECONDARY)
-                  << ". Current state: " << getMemberState() << causedBy(status);
+        LOGV2_WARNING(21413,
+                      "Failed to transition into {MemberState_MemberState_RS_SECONDARY}. Current "
+                      "state: {state}{status}",
+                      "MemberState_MemberState_RS_SECONDARY"_attr =
+                          MemberState(MemberState::RS_SECONDARY),
+                      "state"_attr = getMemberState(),
+                      "status"_attr = causedBy(status));
     }
 }
 
@@ -3944,15 +4389,6 @@ void ReplicationCoordinatorImpl::_advanceCommitPoint(
         }
 
         _setStableTimestampForStorage(lk);
-        if (MONGO_unlikely(logForTLAPlusSpecs.shouldFail())) {
-            EnsureOperationContext ensureOpCtx;
-            auto action = fromSyncSource
-                ? RaftMongoSpecActionEnum::kLearnCommitPointFromSyncSourceNeverBeyondLastApplied
-                : RaftMongoSpecActionEnum::kLearnCommitPointWithTermCheck;
-
-            _tlaPlusRaftMongoEvent(lk, ensureOpCtx.getOperationContext(), action);
-        }
-
         // Even if we have no new snapshot, we need to notify waiters that the commit point moved.
         _externalState->notifyOplogMetadataWaiters(committedOpTimeAndWallTime.opTime);
     }
@@ -3998,7 +4434,9 @@ Status ReplicationCoordinatorImpl::processReplSetRequestVotes(
         if (votedForCandidate) {
             Status status = _externalState->storeLocalLastVoteDocument(opCtx, lastVote);
             if (!status.isOK()) {
-                error() << "replSetRequestVotes failed to store LastVote document; " << status;
+                LOGV2_ERROR(21428,
+                            "replSetRequestVotes failed to store LastVote document; {status}",
+                            "status"_attr = status);
                 return status;
             }
         }
@@ -4101,13 +4539,25 @@ Status ReplicationCoordinatorImpl::processHeartbeatV1(const ReplSetHeartbeatArgs
         // a configuration that contains us.  Chances are excellent that it will, since that
         // is the only reason for a remote node to send this node a heartbeat request.
         if (!senderHost.empty() && _seedList.insert(senderHost).second) {
+            LOGV2(21400,
+                  "Scheduling heartbeat to fetch a new config from: {senderHost} since we are not "
+                  "a member of our current config.",
+                  "senderHost"_attr = senderHost);
             _scheduleHeartbeatToTarget_inlock(senderHost, -1, now);
         }
-    } else if (result.isOK() && response->getConfigVersion() < args.getConfigVersion()) {
+    } else if (result.isOK() &&
+               response->getConfigVersionAndTerm() < args.getConfigVersionAndTerm()) {
         // Schedule a heartbeat to the sender to fetch the new config.
+        // Only send this if the sender's config is newer.
         // We cannot cancel the enqueued heartbeat, but either this one or the enqueued heartbeat
         // will trigger reconfig, which cancels and reschedules all heartbeats.
         if (args.hasSender()) {
+            LOGV2(21401,
+                  "Scheduling heartbeat to fetch a newer config with term {configTerm} and "
+                  "version {configVersion} from member: {senderHost}",
+                  "configTerm"_attr = args.getConfigTerm(),
+                  "configVersion"_attr = args.getConfigVersion(),
+                  "senderHost"_attr = senderHost);
             int senderIndex = _rsConfig.findMemberIndexByHostAndPort(senderHost);
             _scheduleHeartbeatToTarget_inlock(senderHost, senderIndex, now);
         }
@@ -4185,12 +4635,16 @@ EventHandle ReplicationCoordinatorImpl::_updateTerm_inlock(
             _pendingTermUpdateDuringStepDown = term;
         }
         if (_topCoord->prepareForUnconditionalStepDown()) {
-            log() << "stepping down from primary, because a new term has begun: " << term;
+            LOGV2(21402,
+                  "stepping down from primary, because a new term has begun: {term}",
+                  "term"_attr = term);
             ReplicationMetrics::get(getServiceContext()).incrementNumStepDownsCausedByHigherTerm();
             return _stepDownStart();
         } else {
-            LOG(2) << "Updated term but not triggering stepdown because we are already in the "
-                      "process of stepping down";
+            LOGV2_DEBUG(21403,
+                        2,
+                        "Updated term but not triggering stepdown because we are already in the "
+                        "process of stepping down");
         }
     }
     return EventHandle();
@@ -4248,7 +4702,7 @@ bool ReplicationCoordinatorImpl::_updateCommittedSnapshot(
     // If we are in ROLLBACK state, do not set any new _currentCommittedSnapshot, as it will be
     // cleared at the end of rollback anyway.
     if (_memberState.rollback()) {
-        log() << "Not updating committed snapshot because we are in rollback";
+        LOGV2(21404, "Not updating committed snapshot because we are in rollback");
         return false;
     }
     invariant(!newCommittedSnapshot.opTime.isNull());

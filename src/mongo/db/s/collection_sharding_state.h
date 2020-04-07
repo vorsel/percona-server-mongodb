@@ -87,27 +87,27 @@ public:
     static void report(OperationContext* opCtx, BSONObjBuilder* builder);
 
     /**
-     * Returns the orphan chunk filtering metadata that the current operation should be using for
+     * Returns the chunk filtering object that the current operation should be using for
      * the collection.
      *
-     * If the operation context contains an 'atClusterTime', the returned filtering metadata will be
+     * If the operation context contains an 'atClusterTime', the returned filtering object will be
      * tied to a specific point in time. Otherwise, it will reference the latest time available. If
      * the operation is not associated with a shard version (refer to
      * OperationShardingState::isOperationVersioned for more info on that), returns an UNSHARDED
      * metadata object.
      *
-     * The intended users of this method are callers which need to perform orphan filtering. Use
+     * The intended users of this method are callers which need to perform filtering. Use
      * 'getCurrentMetadata' for other cases, like obtaining information about sharding-related
      * properties of the collection are necessary that won't change under collection IX/IS lock
      * (e.g., isSharded or the shard key).
      *
      * The returned object is safe to access even after the collection lock has been dropped.
      */
-    virtual ScopedCollectionMetadata getOrphansFilter(OperationContext* opCtx,
-                                                      bool isCollection) = 0;
+
+    virtual ScopedCollectionFilter getOwnershipFilter(OperationContext* opCtx) = 0;
 
     /**
-     * See the comments for 'getOrphansFilter' above for more information on this method.
+     * See the comments for 'getOwnershipFilter' above for more information on this method.
      */
     virtual ScopedCollectionMetadata getCurrentMetadata() = 0;
 
@@ -127,13 +127,12 @@ public:
      * version of the collection and if not, throws StaleConfigException populated with the received
      * and wanted versions.
      */
-    virtual void checkShardVersionOrThrow(OperationContext* opCtx, bool isCollection) = 0;
+    virtual void checkShardVersionOrThrow(OperationContext* opCtx) = 0;
 
     /**
      * Similar to checkShardVersionOrThrow but returns a status instead of throwing.
      */
-    virtual Status checkShardVersionNoThrow(OperationContext* opCtx,
-                                            bool isCollection) noexcept = 0;
+    virtual Status checkShardVersionNoThrow(OperationContext* opCtx) noexcept = 0;
 
     /**
      * Methods to control the collection's critical section. Methods listed below must be called
@@ -160,6 +159,22 @@ public:
      */
     virtual std::shared_ptr<Notification<void>> getCriticalSectionSignal(
         ShardingMigrationCriticalSection::Operation op) const = 0;
+
+    /**
+     * BSON output of the pending metadata into a BSONArray
+     * used for reporting/diagnostic purposes only
+     */
+    virtual void toBSONPending(BSONArrayBuilder& bb) const = 0;
+
+    /**
+     * Updates the collection's filtering metadata based on changes received from the config server
+     * and also resolves the pending receives map in case some of these pending receives have
+     * committed on the config server or have been abandoned by the donor shard.
+     *
+     * This method must be called with an exclusive collection lock and it does not acquire any
+     * locks itself.
+     */
+    virtual void setFilteringMetadata(OperationContext* opCtx, CollectionMetadata newMetadata) = 0;
 };
 
 /**

@@ -19,6 +19,90 @@ const getThreadName = function() {
 
 let threadName = getThreadName();
 
+// Test idempotent configureFailPoint.
+assert.commandWorked(adminDB.runCommand({
+    configureFailPoint: "failCommand",
+    mode: "alwaysOn",
+    data: {
+        errorCode: ErrorCodes.NotMaster,
+        failCommands: ["ping"],
+        threadName: threadName,
+    }
+}));
+assert.commandFailedWithCode(testDB.runCommand({ping: 1}), ErrorCodes.NotMaster);
+// Configure failCommand again and verify that it still works correctly.
+assert.commandWorked(adminDB.runCommand({
+    configureFailPoint: "failCommand",
+    mode: "alwaysOn",
+    data: {
+        errorCode: ErrorCodes.NotMaster,
+        failCommands: ["ping"],
+        threadName: threadName,
+    }
+}));
+assert.commandFailedWithCode(testDB.runCommand({ping: 1}), ErrorCodes.NotMaster);
+assert.commandWorked(adminDB.runCommand({configureFailPoint: "failCommand", mode: "off"}));
+
+// Test switching command sets.
+assert.commandWorked(adminDB.runCommand({
+    configureFailPoint: "failCommand",
+    mode: "alwaysOn",
+    data: {
+        errorCode: ErrorCodes.NotMaster,
+        failCommands: ["ping"],
+        threadName: threadName,
+    }
+}));
+assert.commandFailedWithCode(testDB.runCommand({ping: 1}), ErrorCodes.NotMaster);
+assert.commandWorked(adminDB.runCommand({
+    configureFailPoint: "failCommand",
+    mode: "alwaysOn",
+    data: {
+        errorCode: ErrorCodes.NotMaster,
+        failCommands: ["isMaster"],
+        threadName: threadName,
+    }
+}));
+assert.commandWorked(testDB.runCommand({ping: 1}));
+assert.commandWorked(adminDB.runCommand({configureFailPoint: "failCommand", mode: "off"}));
+
+// Test failpoint with extraErrorInfo
+assert.commandWorked(adminDB.runCommand({
+    configureFailPoint: "failCommand",
+    mode: "alwaysOn",
+    data: {
+        errorCode: ErrorCodes.CannotImplicitlyCreateCollection,
+        failCommands: ["create"],
+        threadName: threadName,
+        errorExtraInfo: {
+            "ns": "namespace",
+        }
+    }
+}));
+
+{
+    let result = testDB.runCommand({create: "collection"});
+    assert(result.ok == 0);
+    assert(result.code == ErrorCodes.CannotImplicitlyCreateCollection);
+    assert(result.ns == "namespace");
+}
+assert.commandWorked(adminDB.runCommand({configureFailPoint: "failCommand", mode: "off"}));
+
+// Test failpoint with extraErrorInfo and no error code
+assert.commandWorked(adminDB.runCommand({
+    configureFailPoint: "failCommand",
+    mode: "alwaysOn",
+    data: {
+        failCommands: ["ping"],
+        threadName: threadName,
+        errorExtraInfo: {
+            "desc": "some description",
+        }
+    }
+}));
+assert.commandWorked(testDB.runCommand({ping: 1}));
+assert.commandWorked(adminDB.runCommand({configureFailPoint: "failCommand", mode: "off"}));
+
 // Test failpoint for command aliases
 assert.commandWorked(adminDB.runCommand({
     configureFailPoint: "failCommand",

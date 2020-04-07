@@ -36,8 +36,11 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/client/connpool.h"
 #include "mongo/client/dbclient_connection.h"
+#include "mongo/db/auth/sasl_command_constants.h"
+#include "mongo/db/auth/sasl_commands.h"
 #include "mongo/db/auth/sasl_mechanism_registry.h"
 #include "mongo/db/client.h"
+#include "mongo/db/commands/authentication_commands.h"
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
@@ -57,16 +60,21 @@
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/executor/network_interface.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/metadata/client_metadata.h"
 #include "mongo/rpc/metadata/client_metadata_ismaster.h"
+#include "mongo/transport/ismaster_metrics.h"
 #include "mongo/util/decimal_counter.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 #include "mongo/util/map_util.h"
 
 namespace mongo {
 
+// Hangs in the beginning of each isMaster command when set.
 MONGO_FAIL_POINT_DEFINE(waitInIsMaster);
+// Awaitable isMaster requests with the proper topologyVersions will sleep for maxAwaitTimeMS on
+// standalones. This failpoint will hang right before doing this sleep when set.
+MONGO_FAIL_POINT_DEFINE(hangWaitingForIsMasterResponseOnStandalone);
 
 using std::list;
 using std::string;
@@ -118,6 +126,15 @@ TopologyVersion appendReplicationInfo(OperationContext* opCtx,
         // The topologyVersion never changes on a running standalone process, so just sleep for
         // maxAwaitTimeMS.
         invariant(maxAwaitTimeMS);
+
+        IsMasterMetrics::get(opCtx)->incrementNumAwaitingTopologyChanges();
+        ON_BLOCK_EXIT([&] { IsMasterMetrics::get(opCtx)->decrementNumAwaitingTopologyChanges(); });
+        if (MONGO_unlikely(hangWaitingForIsMasterResponseOnStandalone.shouldFail())) {
+            // Used in tests that wait for this failpoint to be entered to guarantee that the
+            // request is waiting and metrics have been updated.
+            LOGV2(31462, "Hanging due to hangWaitingForIsMasterResponseOnStandalone failpoint.");
+            hangWaitingForIsMasterResponseOnStandalone.pauseWhileSet(opCtx);
+        }
         opCtx->sleepFor(Milliseconds(*maxAwaitTimeMS));
     }
 
@@ -246,11 +263,21 @@ public:
         // TODO(siyuan) Output term of OpTime
         result.append("latestOptime", replCoord->getMyLastAppliedOpTime().getTimestamp());
 
-        BSONObj o;
-        uassert(17347,
+        AutoGetCollection oplog(opCtx, NamespaceString::kRsOplogNamespace, MODE_IS);
+        auto earliestOplogTimestampFetch =
+            oplog.getCollection()->getRecordStore()->getEarliestOplogTimestamp(opCtx);
+        Timestamp earliestOplogTimestamp;
+        if (earliestOplogTimestampFetch.isOK()) {
+            earliestOplogTimestamp = earliestOplogTimestampFetch.getValue();
+        } else {
+            BSONObj o;
+            uassert(
+                17347,
                 "Problem reading earliest entry from oplog",
                 Helpers::getSingleton(opCtx, NamespaceString::kRsOplogNamespace.ns().c_str(), o));
-        result.append("earliestOptime", o["ts"].timestamp());
+            earliestOplogTimestamp = o["ts"].timestamp();
+        }
+        result.append("earliestOptime", earliestOplogTimestamp);
         return result.obj();
     }
 } oplogInfoServerStatus;
@@ -425,7 +452,7 @@ public:
 
             uassert(31373, "maxAwaitTimeMS must be a non-negative integer", *maxAwaitTimeMS >= 0);
 
-            LOG(3) << "Using maxAwaitTimeMS for awaitable isMaster protocol.";
+            LOGV2_DEBUG(23904, 3, "Using maxAwaitTimeMS for awaitable isMaster protocol.");
         } else {
             uassert(31368,
                     (topologyVersionElement
@@ -479,12 +506,15 @@ public:
         saslMechanismRegistry.advertiseMechanismNamesForUser(opCtx, cmdObj, &result);
 
         if (opCtx->isExhaust()) {
-            LOG(3) << "Using exhaust for isMaster protocol";
+            LOGV2_DEBUG(23905, 3, "Using exhaust for isMaster protocol");
 
             uassert(51756,
                     "An isMaster request with exhaust must specify 'maxAwaitTimeMS'",
                     maxAwaitTimeMSField);
             invariant(clientTopologyVersion);
+
+            InExhaustIsMaster::get(opCtx->getClient()->session().get())
+                ->setInExhaustIsMaster(true /* inExhaustIsMaster */);
 
             if (clientTopologyVersion->getProcessId() == currentTopologyVersion.getProcessId() &&
                 clientTopologyVersion->getCounter() == currentTopologyVersion.getCounter()) {
@@ -503,6 +533,30 @@ public:
                     }
                 }
                 replyBuilder->setNextInvocation(nextInvocationBuilder.obj());
+            }
+        }
+
+        if (auto sae = cmdObj[auth::kSpeculativeAuthenticate]; !sae.eoo()) {
+            uassert(ErrorCodes::BadValue,
+                    str::stream() << "isMaster." << auth::kSpeculativeAuthenticate
+                                  << " must be an Object",
+                    sae.type() == Object);
+            auto specAuth = sae.Obj();
+
+            uassert(ErrorCodes::BadValue,
+                    str::stream() << "isMaster." << auth::kSpeculativeAuthenticate
+                                  << " must be a non-empty Object",
+                    !specAuth.isEmpty());
+            auto specCmd = specAuth.firstElementFieldNameStringData();
+
+            if (specCmd == saslStartCommandName) {
+                doSpeculativeSaslStart(opCtx, specAuth, &result);
+            } else if (specCmd == auth::kAuthenticateCommand) {
+                doSpeculativeAuthenticate(opCtx, specAuth, &result);
+            } else {
+                uasserted(51769,
+                          str::stream() << "isMaster." << auth::kSpeculativeAuthenticate
+                                        << " unknown command: " << specCmd);
             }
         }
 

@@ -89,5 +89,11 @@
 // Set to which provider defines USDT
 @mongo_config_usdt_provider@
 
+// Defined if using libunwind.
+@mongo_config_use_libunwind@
+
+// Defined if raw latches are enabled
+@mongo_config_use_raw_latches@
+
 // Defined if WiredTiger storage engine is enabled
 @mongo_config_wiredtiger_enabled@

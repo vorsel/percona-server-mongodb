@@ -178,14 +178,14 @@ bool ReplicationCoordinatorMock::canAcceptWritesForDatabase_UNSAFE(OperationCont
 }
 
 bool ReplicationCoordinatorMock::canAcceptWritesFor(OperationContext* opCtx,
-                                                    const NamespaceString& ns) {
+                                                    const NamespaceStringOrUUID& nsOrUUID) {
     // TODO
-    return canAcceptWritesForDatabase(opCtx, ns.db());
+    return canAcceptWritesForDatabase(opCtx, nsOrUUID.db());
 }
 
 bool ReplicationCoordinatorMock::canAcceptWritesFor_UNSAFE(OperationContext* opCtx,
-                                                           const NamespaceString& ns) {
-    return canAcceptWritesFor(opCtx, ns);
+                                                           const NamespaceStringOrUUID& nsOrUUID) {
+    return canAcceptWritesFor(opCtx, nsOrUUID);
 }
 
 Status ReplicationCoordinatorMock::checkCanServeReadsFor(OperationContext* opCtx,
@@ -332,7 +332,8 @@ void ReplicationCoordinatorMock::setGetConfigReturnValue(ReplSetConfig returnVal
     _getConfigReturnValue = std::move(returnValue);
 }
 
-void ReplicationCoordinatorMock::processReplSetGetConfig(BSONObjBuilder* result) {
+void ReplicationCoordinatorMock::processReplSetGetConfig(BSONObjBuilder* result,
+                                                         bool commitmentStatus) {
     // TODO
 }
 
@@ -376,6 +377,12 @@ Status ReplicationCoordinatorMock::processReplSetFreeze(int secs, BSONObjBuilder
 Status ReplicationCoordinatorMock::processReplSetReconfig(OperationContext* opCtx,
                                                           const ReplSetReconfigArgs& args,
                                                           BSONObjBuilder* resultObj) {
+    return Status::OK();
+}
+
+Status ReplicationCoordinatorMock::doReplSetReconfig(OperationContext* opCtx,
+                                                     GetNewConfigFn getNewConfig,
+                                                     bool force) {
     return Status::OK();
 }
 
@@ -559,6 +566,20 @@ TopologyVersion ReplicationCoordinatorMock::getTopologyVersion() const {
     return TopologyVersion(repl::instanceId, 0);
 }
 
+void ReplicationCoordinatorMock::incrementTopologyVersion(OperationContext* opCtx) {
+    return;
+}
+
+SharedSemiFuture<std::shared_ptr<const IsMasterResponse>>
+ReplicationCoordinatorMock::getIsMasterResponseFuture(
+    const SplitHorizon::Parameters& horizonParams,
+    boost::optional<TopologyVersion> clientTopologyVersion) const {
+    auto response =
+        awaitIsMasterResponse(nullptr, horizonParams, clientTopologyVersion, Date_t::now());
+    return SharedSemiFuture<std::shared_ptr<const IsMasterResponse>>(
+        std::shared_ptr<const IsMasterResponse>(response));
+}
+
 std::shared_ptr<const IsMasterResponse> ReplicationCoordinatorMock::awaitIsMasterResponse(
     OperationContext* opCtx,
     const SplitHorizon::Parameters& horizonParams,
@@ -576,6 +597,10 @@ std::shared_ptr<const IsMasterResponse> ReplicationCoordinatorMock::awaitIsMaste
 
 OpTime ReplicationCoordinatorMock::getLatestWriteOpTime(OperationContext* opCtx) const {
     return getMyLastAppliedOpTime();
+}
+
+HostAndPort ReplicationCoordinatorMock::getCurrentPrimaryHostAndPort() const {
+    return HostAndPort();
 }
 
 }  // namespace repl

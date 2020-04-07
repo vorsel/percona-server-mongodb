@@ -39,20 +39,17 @@
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/rename_collection.h"
+#include "mongo/db/commands/rename_collection_gen.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/commands/cluster_explain.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/query/store_possible_cursor.h"
-#include "mongo/s/request_types/rename_collection_gen.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
-
-MONGO_FAIL_POINT_DEFINE(useRenameCollectionPathThroughConfigsvr);
 
 namespace {
 
@@ -232,46 +229,14 @@ public:
              const std::string& dbName,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
-        const NamespaceString fromNss(parseNs(dbName, cmdObj));
-        const NamespaceString toNss([&cmdObj] {
-            const auto fullnsToElt = cmdObj["to"];
-            uassert(ErrorCodes::InvalidNamespace,
-                    "'to' must be of type String",
-                    fullnsToElt.type() == BSONType::String);
-            return fullnsToElt.valueStringData();
-        }());
+        auto renameRequest =
+            RenameCollectionCommand::parse(IDLParserErrorContext("renameCollection"), cmdObj);
+        auto fromNss = renameRequest.getCommandParameter();
+        auto toNss = renameRequest.getTo();
+
         uassert(ErrorCodes::InvalidNamespace,
                 str::stream() << "Invalid target namespace: " << toNss.ns(),
                 toNss.isValid());
-
-        if (MONGO_unlikely(useRenameCollectionPathThroughConfigsvr.shouldFail())) {
-            bool dropTarget = cmdObj["dropTarget"].trueValue();
-            bool stayTemp = cmdObj["stayTemp"].trueValue();
-
-            const auto fromRoutingInfo = uassertStatusOK(
-                Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, fromNss));
-            const auto toRoutingInfo = uassertStatusOK(
-                Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, toNss));
-
-            ConfigsvrRenameCollection configsvrRenameCollectionRequest;
-            configsvrRenameCollectionRequest.setRenameCollection(fromNss);
-            configsvrRenameCollectionRequest.setTo(toNss);
-            configsvrRenameCollectionRequest.setDropTarget(dropTarget);
-            configsvrRenameCollectionRequest.setStayTemp(stayTemp);
-            configsvrRenameCollectionRequest.setDbName(dbName);
-
-            auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
-            auto cmdResponse = uassertStatusOK(configShard->runCommandWithFixedRetryAttempts(
-                opCtx,
-                ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-                "admin",
-                configsvrRenameCollectionRequest.toBSON(applyReadWriteConcern(
-                    opCtx, this, CommandHelpers::filterCommandRequestForPassthrough(cmdObj))),
-                Shard::RetryPolicy::kIdempotent));
-
-            uassertStatusOK(cmdResponse.commandStatus);
-            return true;
-        }
 
         const auto fromRoutingInfo = uassertStatusOK(
             Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, fromNss));
@@ -395,6 +360,10 @@ public:
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
+    }
+
+    bool maintenanceOk() const override {
+        return false;
     }
 
     bool adminOnly() const override {
@@ -547,6 +516,10 @@ public:
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
+    }
+
+    bool maintenanceOk() const override {
+        return false;
     }
 
     bool adminOnly() const override {

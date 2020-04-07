@@ -18,12 +18,13 @@ from SCons.Script import Action
 
 def register_unit_test(env, test):
     """
-    Kept around for compatibility. 
-
-    Some SConscripts called RegisterUnitTest directly.
+    Kept around for compatibility with non-hygienic builds. The only callers of
+    this should be the intel_readtest_wrapper SConscript. All original callers
+    have been updated to use UNITTEST_HAS_CUSTOM_MAINLINE.
     """
     env.RegisterTest("$UNITTEST_LIST", test)
-    env.Alias("$UNITTEST_ALIAS", test)
+    if not env.get("AUTO_INSTALL_ENABLED", False):
+        env.Alias("$UNITTEST_ALIAS", test)
 
 
 def exists(env):
@@ -31,13 +32,20 @@ def exists(env):
 
 
 def build_cpp_unit_test(env, target, source, **kwargs):
-    libdeps = kwargs.get("LIBDEPS", [])
-    libdeps.append("$BUILD_DIR/mongo/unittest/unittest_main")
+    if not kwargs.get("UNITTEST_HAS_CUSTOM_MAINLINE", False):
+        libdeps = kwargs.get("LIBDEPS", [])
+        libdeps.append("$BUILD_DIR/mongo/unittest/unittest_main")
+        kwargs["LIBDEPS"] = libdeps
 
-    kwargs["LIBDEPS"] = libdeps
     unit_test_components = {"tests", "unittests"}
-    if "AIB_COMPONENT" in kwargs and not kwargs["AIB_COMPONENT"].endswith("-test"):
-        kwargs["AIB_COMPONENT"] += "-test"
+    primary_component = kwargs.get("AIB_COMPONENT", env.get("AIB_COMPONENT", ""))
+    if primary_component and not primary_component.endswith("-test"):
+        kwargs["AIB_COMPONENT"] = primary_component + "-test"
+    elif primary_component:
+        kwargs["AIB_COMPONENT"] = primary_component
+    else:
+        kwargs["AIB_COMPONENT"] = "unittests"
+        unit_test_components = {"tests"}
 
     if "AIB_COMPONENTS_EXTRA" in kwargs:
         kwargs["AIB_COMPONENTS_EXTRA"] = set(kwargs["AIB_COMPONENTS_EXTRA"]).union(

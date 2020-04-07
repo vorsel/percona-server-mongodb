@@ -37,11 +37,13 @@
 #include "mongo/db/commands/shutdown.h"
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/log_process_details.h"
+#include "mongo/logv2/log.h"
 #include "mongo/logv2/ramlog.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
+#include "mongo/util/log_global_settings.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/ntservice.h"
 #include "mongo/util/processinfo.h"
@@ -121,7 +123,7 @@ public:
         bSys.append("cpuAddrSize", static_cast<int>(p.getAddrSize()));
         bSys.append("memSizeMB", static_cast<long long>(p.getSystemMemSizeMB()));
         bSys.append("memLimitMB", static_cast<long long>(p.getMemSizeMB()));
-        bSys.append("numCores", static_cast<int>(p.getNumCores()));
+        bSys.append("numCores", static_cast<int>(p.getNumAvailableCores()));
         bSys.append("cpuArch", p.getArch());
         bSys.append("numaEnabled", p.hasNumaEnabled());
         bOs.append("type", p.getOsType());
@@ -196,7 +198,7 @@ public:
                      const std::string& ns,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
-        bool didRotate = rotateLogs(serverGlobalParams.logRenameOnRotate, logV2Enabled());
+        bool didRotate = rotateLogs(serverGlobalParams.logRenameOnRotate);
         if (didRotate)
             logProcessDetailsForLogRotate(opCtx->getServiceContext());
         return didRotate;
@@ -354,7 +356,7 @@ void CmdShutdown::shutdownHelper(const BSONObj& cmdObj) {
         ::abort();
     });
 
-    log() << "terminating, shutdown command received " << cmdObj;
+    LOGV2(20475, "terminating, shutdown command received {cmdObj}", "cmdObj"_attr = cmdObj);
 
 #if defined(_WIN32)
     // Signal the ServiceMain thread to shutdown.

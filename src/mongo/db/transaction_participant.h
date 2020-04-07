@@ -52,6 +52,7 @@
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/transaction_metrics_observer.h"
 #include "mongo/idl/mutable_observer_registry.h"
+#include "mongo/logv2/attribute_storage.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/with_lock.h"
@@ -615,6 +616,7 @@ public:
             stdx::lock_guard<Client> lk(*opCtx->getClient());
             o(lk).prepareOpTime = prepareOpTime;
             o(lk).txnState.transitionTo(TransactionState::kPrepared);
+            opCtx->lockState()->unlockRSTLforPrepare();
         }
 
         void transitionToAbortedWithoutPrepareforTest(OperationContext* opCtx) {
@@ -697,6 +699,12 @@ public:
                                            const SingleThreadedLockStats* lockStats,
                                            TerminationCause terminationCause,
                                            repl::ReadConcernArgs readConcernArgs) const;
+
+        void _transactionInfoForLog(OperationContext* opCtx,
+                                    const SingleThreadedLockStats* lockStats,
+                                    TerminationCause terminationCause,
+                                    repl::ReadConcernArgs readConcernArgs,
+                                    logv2::DynamicAttributes* pAttrs) const;
 
         // Bumps up the transaction number of this transaction and perform the necessary cleanup.
         void _setNewTxnNumber(OperationContext* opCtx, const TxnNumber& txnNumber);
@@ -898,6 +906,9 @@ private:
 
         // Total size in bytes of all operations within the _transactionOperations vector.
         size_t transactionOperationBytes{0};
+
+        // Number of operations that have pre-images to be written to noop oplog entries.
+        size_t numberOfPreImagesToWrite{0};
 
         // The autocommit setting of this transaction. Should always be false for multi-statement
         // transaction. Currently only needed for diagnostics reporting.

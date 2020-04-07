@@ -31,7 +31,6 @@
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
 #include "mongo/client/sdam/server_description.h"
 #include "mongo/db/wire_version.h"
-#include "mongo/util/log.h"
 
 namespace mongo::sdam {
 ////////////////////////
@@ -181,7 +180,7 @@ void TopologyDescription::checkWireCompatibilityVersions() {
 
 const std::string TopologyDescription::minimumRequiredMongoVersionString(int version) {
     switch (version) {
-        case PLACEHOLDER_FOR_44:
+        case RESUMABLE_INITIAL_SYNC:
             return "4.4";
         case SHARDED_TRANSACTIONS:
             return "4.2";

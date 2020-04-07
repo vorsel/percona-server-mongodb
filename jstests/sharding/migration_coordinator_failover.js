@@ -96,6 +96,12 @@ function runMoveChunkMakeDonorStepDownAfterFailpoint(
         });
     }
 
+    // Wait for mongos to see a new primary of rs0 before running the count command, because mongos
+    // will only wait 20 seconds to see a new primary from within the count command, and it may take
+    // longer for a new primary to be elected if both replica set nodes run for election at the same
+    // time (and therefore both lose the first election).
+    awaitRSClientHosts(st.s, st.rs0.getPrimary(), {ok: true, ismaster: true});
+
     // The data should still be present on the shard that owns the chunk.
     assert.eq(numDocs, st.s.getDB(dbName).getCollection(collName).count());
 
@@ -122,6 +128,15 @@ runMoveChunkMakeDonorStepDownAfterFailpoint("hangBeforeSendingCommitDecision",
                                             false /* shouldMakeMigrationFailToCommitOnConfig */);
 runMoveChunkMakeDonorStepDownAfterFailpoint("hangBeforeForgettingMigrationAfterCommitDecision",
                                             false /* shouldMakeMigrationFailToCommitOnConfig */);
+runMoveChunkMakeDonorStepDownAfterFailpoint(
+    "hangInPersistMigrateCommitDecisionThenSimulateErrorUninterruptible",
+    false /* shouldMakeMigrationFailToCommitOnConfig */);
+runMoveChunkMakeDonorStepDownAfterFailpoint(
+    "hangInDeleteRangeDeletionOnRecipientThenSimulateErrorUninterruptible",
+    false /* shouldMakeMigrationFailToCommitOnConfig */);
+runMoveChunkMakeDonorStepDownAfterFailpoint(
+    "hangInReadyRangeDeletionLocallyThenSimulateErrorUninterruptible",
+    false /* shouldMakeMigrationFailToCommitOnConfig */);
 
 //
 // Decision is abort
@@ -138,6 +153,31 @@ runMoveChunkMakeDonorStepDownAfterFailpoint("moveChunkHangAtStep4",
 runMoveChunkMakeDonorStepDownAfterFailpoint("moveChunkHangAtStep5",
                                             false /* shouldMakeMigrationFailToCommitOnConfig */,
                                             ErrorCodes.OperationFailed);
+
+runMoveChunkMakeDonorStepDownAfterFailpoint(
+    "hangInEnsureChunkVersionIsGreaterThanThenSimulateErrorUninterruptible",
+    true /* shouldMakeMigrationFailToCommitOnConfig */,
+    ErrorCodes.OperationFailed);
+
+runMoveChunkMakeDonorStepDownAfterFailpoint(
+    "hangInRefreshFilteringMetadataUntilSuccessThenSimulateErrorUninterruptible",
+    true /* shouldMakeMigrationFailToCommitOnConfig */,
+    ErrorCodes.OperationFailed);
+
+runMoveChunkMakeDonorStepDownAfterFailpoint(
+    "hangInPersistMigrateAbortDecisionThenSimulateErrorUninterruptible",
+    true /* shouldMakeMigrationFailToCommitOnConfig */,
+    ErrorCodes.StaleEpoch);
+
+runMoveChunkMakeDonorStepDownAfterFailpoint(
+    "hangInDeleteRangeDeletionLocallyThenSimulateErrorUninterruptible",
+    true /* shouldMakeMigrationFailToCommitOnConfig */,
+    ErrorCodes.StaleEpoch);
+
+runMoveChunkMakeDonorStepDownAfterFailpoint(
+    "hangInReadyRangeDeletionOnRecipientThenSimulateErrorUninterruptible",
+    true /* shouldMakeMigrationFailToCommitOnConfig */,
+    ErrorCodes.StaleEpoch);
 
 runMoveChunkMakeDonorStepDownAfterFailpoint("hangBeforeMakingAbortDecisionDurable",
                                             true /* shouldMakeMigrationFailToCommitOnConfig */,

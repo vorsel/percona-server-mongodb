@@ -40,8 +40,8 @@
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/repl/oplog_applier_impl.h"
 #include "mongo/db/repl/oplog_entry.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace repl {
@@ -139,9 +139,9 @@ StatusWith<InsertGroup::ConstIterator> InsertGroup::groupAndApplyInserts(ConstIt
 
         // It's not an error during initial sync to encounter DuplicateKey errors.
         if (Mode::kInitialSync == _mode && ErrorCodes::DuplicateKey == status) {
-            LOG(2) << status;
+            LOGV2_DEBUG(21203, 2, "{status}", "status"_attr = status);
         } else {
-            error() << status;
+            LOGV2_ERROR(21204, "{status}", "status"_attr = status);
         }
 
         // Avoid quadratic run time from failed insert by not retrying until we

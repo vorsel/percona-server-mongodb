@@ -67,8 +67,17 @@ public:
         _preImageDocumentKey = std::move(value);
     }
 
+    const BSONObj& getPreImage() const {
+        return _fullPreImage;
+    }
+
+    void setPreImage(BSONObj value) {
+        _fullPreImage = std::move(value);
+    }
+
 private:
     BSONObj _preImageDocumentKey;
+    BSONObj _fullPreImage;
 };
 
 /**
@@ -81,19 +90,23 @@ public:
 
     // Helpers to generate ReplOperation.
     static ReplOperation makeInsertOperation(const NamespaceString& nss,
-                                             boost::optional<UUID> uuid,
+                                             UUID uuid,
                                              const BSONObj& docToInsert);
     static ReplOperation makeUpdateOperation(const NamespaceString nss,
-                                             boost::optional<UUID> uuid,
+                                             UUID uuid,
                                              const BSONObj& update,
                                              const BSONObj& criteria);
     static ReplOperation makeDeleteOperation(const NamespaceString& nss,
-                                             boost::optional<UUID> uuid,
+                                             UUID uuid,
                                              const BSONObj& docToDelete);
 
     static ReplOperation makeCreateCommand(const NamespaceString nss,
                                            const mongo::CollectionOptions& options,
                                            const BSONObj& idIndex);
+
+    static ReplOperation makeCreateIndexesCommand(const NamespaceString nss,
+                                                  CollectionUUID uuid,
+                                                  const BSONObj& indexDoc);
 
     static BSONObj makeCreateCollCmdObj(const NamespaceString& collectionName,
                                         const mongo::CollectionOptions& options,
@@ -133,6 +146,14 @@ public:
 
     void setUpsert(boost::optional<bool> value) & {
         getDurableReplOperation().setUpsert(std::move(value));
+    }
+
+    void setPreImageOpTime(boost::optional<OpTime> value) {
+        getDurableReplOperation().setPreImageOpTime(std::move(value));
+    }
+
+    const boost::optional<OpTime>& getPreImageOpTime() const {
+        return getDurableReplOperation().getPreImageOpTime();
     }
 
     void setTimestamp(Timestamp value) & {
@@ -223,6 +244,7 @@ public:
     // Make helper functions accessible.
     using MutableOplogEntry::getOpTime;
     using MutableOplogEntry::makeCreateCommand;
+    using MutableOplogEntry::makeCreateIndexesCommand;
     using MutableOplogEntry::makeDeleteOperation;
     using MutableOplogEntry::makeInsertOperation;
     using MutableOplogEntry::makeUpdateOperation;

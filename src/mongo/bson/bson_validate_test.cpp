@@ -34,9 +34,9 @@
 #include "mongo/base/data_view.h"
 #include "mongo/bson/bson_validate.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/random.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
 
 namespace {
 
@@ -94,9 +94,12 @@ TEST(BSONValidate, RandomData) {
         delete[] x;
     }
 
-    log() << "RandomData: didn't crash valid/total: " << numValid << "/" << numToRun
-          << " (want few valid ones)"
-          << " jsonSize: " << jsonSize << endl;
+    LOGV2(20104,
+          "RandomData: didn't crash valid/total: {numValid}/{numToRun} (want few valid ones) "
+          "jsonSize: {jsonSize}",
+          "numValid"_attr = numValid,
+          "numToRun"_attr = numToRun,
+          "jsonSize"_attr = jsonSize);
 }
 
 TEST(BSONValidate, MuckingData1) {
@@ -140,14 +143,17 @@ TEST(BSONValidate, MuckingData1) {
         }
     }
 
-    log() << "MuckingData1: didn't crash valid/total: " << numValid << "/" << numToRun
-          << " (want few valid ones) "
-          << " jsonSize: " << jsonSize << endl;
+    LOGV2(20105,
+          "MuckingData1: didn't crash valid/total: {numValid}/{numToRun} (want few valid ones)  "
+          "jsonSize: {jsonSize}",
+          "numValid"_attr = numValid,
+          "numToRun"_attr = numToRun,
+          "jsonSize"_attr = jsonSize);
 }
 
 TEST(BSONValidate, Fuzz) {
     int64_t seed = time(nullptr);
-    log() << "BSONValidate Fuzz random seed: " << seed << endl;
+    LOGV2(20106, "BSONValidate Fuzz random seed: {seed}", "seed"_attr = seed);
     PseudoRandom randomSource(seed);
 
     BSONObj original =

@@ -44,9 +44,9 @@ const std::string kCommandName = "replSetRequestVotes";
 const std::string kConfigVersionFieldName = "configVersion";
 const std::string kConfigTermFieldName = "configTerm";
 const std::string kDryRunFieldName = "dryRun";
-// The underlying field name is inaccurate, but changing it requires a fair amount of cross
-// compatibility work for no real benefit.
+// TODO: Remove references to the "lastCommittedOp" field name (SERVER-46090).
 const std::string kLastDurableOpTimeFieldName = "lastCommittedOp";
+const std::string kLastAppliedOpTimeFieldName = "lastAppliedOpTime";
 const std::string kOkFieldName = "ok";
 const std::string kReasonFieldName = "reason";
 const std::string kSetNameFieldName = "setName";
@@ -54,7 +54,8 @@ const std::string kTermFieldName = "term";
 const std::string kVoteGrantedFieldName = "voteGranted";
 const std::string kOperationTime = "operationTime";
 
-const std::string kLegalArgsFieldNames[] = {
+// TODO: `kLegalArgsFieldNamesFCV42` should be removed after upgrading to 4.6 (SERVER-46090).
+const std::string kLegalArgsFieldNamesFCV42[] = {
     kCandidateIndexFieldName,
     kCommandName,
     kConfigVersionFieldName,
@@ -66,14 +67,42 @@ const std::string kLegalArgsFieldNames[] = {
     kOperationTime,
 };
 
+const std::string kLegalArgsFieldNames[] = {
+    kCandidateIndexFieldName,
+    kCommandName,
+    kConfigVersionFieldName,
+    kConfigTermFieldName,
+    kDryRunFieldName,
+    kLastAppliedOpTimeFieldName,
+    kSetNameFieldName,
+    kTermFieldName,
+    kOperationTime,
+};
+
 }  // namespace
 
 
 Status ReplSetRequestVotesArgs::initialize(const BSONObj& argsObj) {
     Status status =
         bsonCheckOnlyHasFieldsForCommand("ReplSetRequestVotes", argsObj, kLegalArgsFieldNames);
-    if (!status.isOK())
-        return status;
+    // TODO: Remove this logic once we branch to 4.6 and can always assume
+    // _usingLastAppliedOptimeFieldName to be true (SERVER-46090).
+    // Since nodes in the replica set may have different values for FCV, we check that the legal
+    // field names of either FCV 4.2 or 4.4 are present in the args obj.
+    if (!status.isOK()) {
+        status = bsonCheckOnlyHasFieldsForCommand(
+            "ReplSetRequestVotes", argsObj, kLegalArgsFieldNamesFCV42);
+        if (!status.isOK())
+            return status;
+
+        // If we successfully parsed with the FCV 4.2 field names, use 'lastCommittedOp' as the
+        // correct field name.
+        _usingLastAppliedOpTimeFieldName = false;
+    } else {
+        // If we successfully parsed with the FCV 4.4 field names, use 'lastAppliedOpTime' as the
+        // correct field name.
+        _usingLastAppliedOpTimeFieldName = true;
+    }
 
     status = bsonExtractIntegerField(argsObj, kTermFieldName, &_term);
     if (!status.isOK())
@@ -83,14 +112,14 @@ Status ReplSetRequestVotesArgs::initialize(const BSONObj& argsObj) {
     if (!status.isOK())
         return status;
 
-    status = bsonExtractIntegerField(argsObj, kConfigVersionFieldName, &_cfgver);
+    status = bsonExtractIntegerField(argsObj, kConfigVersionFieldName, &_cfgVer);
     if (!status.isOK())
         return status;
 
     // In order to be compatible with FCV 4.2, default the config term to -1 if we are unable
     // parse a configTerm field from the args.
     status = bsonExtractIntegerFieldWithDefault(
-        argsObj, kConfigTermFieldName, OpTime::kUninitializedTerm, &_cfgterm);
+        argsObj, kConfigTermFieldName, OpTime::kUninitializedTerm, &_cfgTerm);
     if (!status.isOK())
         return status;
 
@@ -102,9 +131,16 @@ Status ReplSetRequestVotesArgs::initialize(const BSONObj& argsObj) {
     if (!status.isOK())
         return status;
 
-    status = bsonExtractOpTimeField(argsObj, kLastDurableOpTimeFieldName, &_lastDurableOpTime);
-    if (!status.isOK())
+    // If we successfully parsed with the FCV 4.4 field names, use 'lastAppliedOpTime' to extract
+    // the data. Else, use 'lastCommittedOp' as the field name.
+    if (_usingLastAppliedOpTimeFieldName) {
+        status = bsonExtractOpTimeField(argsObj, kLastAppliedOpTimeFieldName, &_lastAppliedOpTime);
+    } else {
+        status = bsonExtractOpTimeField(argsObj, kLastDurableOpTimeFieldName, &_lastAppliedOpTime);
+    }
+    if (!status.isOK()) {
         return status;
+    }
 
     return Status::OK();
 }
@@ -122,15 +158,19 @@ long long ReplSetRequestVotesArgs::getCandidateIndex() const {
 }
 
 long long ReplSetRequestVotesArgs::getConfigVersion() const {
-    return _cfgver;
+    return _cfgVer;
 }
 
 long long ReplSetRequestVotesArgs::getConfigTerm() const {
-    return _cfgterm;
+    return _cfgTerm;
 }
 
-OpTime ReplSetRequestVotesArgs::getLastDurableOpTime() const {
-    return _lastDurableOpTime;
+ConfigVersionAndTerm ReplSetRequestVotesArgs::getConfigVersionAndTerm() const {
+    return ConfigVersionAndTerm(_cfgVer, _cfgTerm);
+}
+
+OpTime ReplSetRequestVotesArgs::getLastAppliedOpTime() const {
+    return _lastAppliedOpTime;
 }
 
 bool ReplSetRequestVotesArgs::isADryRun() const {
@@ -143,9 +183,13 @@ void ReplSetRequestVotesArgs::addToBSON(BSONObjBuilder* builder) const {
     builder->append(kDryRunFieldName, _dryRun);
     builder->append(kTermFieldName, _term);
     builder->appendIntOrLL(kCandidateIndexFieldName, _candidateIndex);
-    builder->appendIntOrLL(kConfigVersionFieldName, _cfgver);
-    builder->appendIntOrLL(kConfigTermFieldName, _cfgterm);
-    _lastDurableOpTime.append(builder, kLastDurableOpTimeFieldName);
+    builder->appendIntOrLL(kConfigVersionFieldName, _cfgVer);
+    builder->appendIntOrLL(kConfigTermFieldName, _cfgTerm);
+    if (_usingLastAppliedOpTimeFieldName) {
+        _lastAppliedOpTime.append(builder, kLastAppliedOpTimeFieldName);
+    } else {
+        _lastAppliedOpTime.append(builder, kLastDurableOpTimeFieldName);
+    }
 }
 
 std::string ReplSetRequestVotesArgs::toString() const {

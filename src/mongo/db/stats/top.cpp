@@ -35,7 +35,6 @@
 
 #include "mongo/db/jsobj.h"
 #include "mongo/db/service_context.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -84,12 +83,6 @@ void Top::record(OperationContext* opCtx,
 
     auto hashedNs = UsageMap::hasher().hashed_key(ns);
     stdx::lock_guard<SimpleMutex> lk(_lock);
-
-    if ((command || logicalOp == LogicalOp::opQuery) &&
-        _collDropNs.find(ns.toString()) != _collDropNs.end()) {
-        _collDropNs.erase(ns.toString());
-        return;
-    }
 
     CollectionData& coll = _usage[hashedNs];
     _record(opCtx, coll, logicalOp, lockType, micros, readWriteType);
@@ -140,15 +133,9 @@ void Top::_record(OperationContext* opCtx,
     }
 }
 
-void Top::collectionDropped(const NamespaceString& nss, bool databaseDropped) {
+void Top::collectionDropped(const NamespaceString& nss) {
     stdx::lock_guard<SimpleMutex> lk(_lock);
     _usage.erase(nss.ns());
-
-    if (!databaseDropped) {
-        // If a collection drop occurred, there will be a subsequent call to record for this
-        // collection namespace which must be ignored. This does not apply to a database drop.
-        _collDropNs.insert(nss.toString());
-    }
 }
 
 void Top::cloneMap(Top::UsageMap& out) const {

@@ -76,9 +76,9 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/oplog_cap_maintainer_thread.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/background.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -190,7 +190,10 @@ StorageInterfaceImpl::createCollectionForBulkLoading(
     const BSONObj idIndexSpec,
     const std::vector<BSONObj>& secondaryIndexSpecs) {
 
-    LOG(2) << "StorageInterfaceImpl::createCollectionForBulkLoading called for ns: " << nss.ns();
+    LOGV2_DEBUG(21753,
+                2,
+                "StorageInterfaceImpl::createCollectionForBulkLoading called for ns: {ns}",
+                "ns"_attr = nss.ns());
 
     class StashClient {
     public:
@@ -217,29 +220,28 @@ StorageInterfaceImpl::createCollectionForBulkLoading(
 
     documentValidationDisabled(opCtx.get()) = true;
 
+    std::unique_ptr<AutoGetCollection> autoColl;
     // Retry if WCE.
     Status status = writeConflictRetry(opCtx.get(), "beginCollectionClone", nss.ns(), [&] {
         UnreplicatedWritesBlock uwb(opCtx.get());
 
         // Get locks and create the collection.
-        AutoGetOrCreateDb autoDb(opCtx.get(), nss.db(), MODE_IX);
-        AutoGetCollection autoColl(
-            opCtx.get(), nss, fixLockModeForSystemDotViewsChanges(nss, MODE_X));
+        AutoGetOrCreateDb db(opCtx.get(), nss.db(), MODE_IX);
+        AutoGetCollection coll(opCtx.get(), nss, fixLockModeForSystemDotViewsChanges(nss, MODE_X));
 
-        if (autoColl.getCollection()) {
+        if (coll.getCollection()) {
             return Status(ErrorCodes::NamespaceExists,
                           str::stream() << "Collection " << nss.ns() << " already exists.");
         }
         {
             // Create the collection.
             WriteUnitOfWork wunit(opCtx.get());
-            fassert(40332, autoDb.getDb()->createCollection(opCtx.get(), nss, options, false));
+            fassert(40332, db.getDb()->createCollection(opCtx.get(), nss, options, false));
             wunit.commit();
         }
 
-        Collection* coll =
-            CollectionCatalog::get(opCtx.get()).lookupCollectionByNamespace(opCtx.get(), nss);
-        invariant(coll);
+        autoColl = std::make_unique<AutoGetCollection>(
+            opCtx.get(), nss, fixLockModeForSystemDotViewsChanges(nss, MODE_IX));
 
         // Build empty capped indexes.  Capped indexes cannot be built by the MultiIndexBlock
         // because the cap might delete documents off the back while we are inserting them into
@@ -248,14 +250,16 @@ StorageInterfaceImpl::createCollectionForBulkLoading(
             WriteUnitOfWork wunit(opCtx.get());
             if (!idIndexSpec.isEmpty()) {
                 auto status =
-                    coll->getIndexCatalog()->createIndexOnEmptyCollection(opCtx.get(), idIndexSpec);
+                    autoColl->getCollection()->getIndexCatalog()->createIndexOnEmptyCollection(
+                        opCtx.get(), idIndexSpec);
                 if (!status.getStatus().isOK()) {
                     return status.getStatus();
                 }
             }
             for (auto&& spec : secondaryIndexSpecs) {
                 auto status =
-                    coll->getIndexCatalog()->createIndexOnEmptyCollection(opCtx.get(), spec);
+                    autoColl->getCollection()->getIndexCatalog()->createIndexOnEmptyCollection(
+                        opCtx.get(), spec);
                 if (!status.getStatus().isOK()) {
                     return status.getStatus();
                 }
@@ -269,10 +273,6 @@ StorageInterfaceImpl::createCollectionForBulkLoading(
     if (!status.isOK()) {
         return status;
     }
-
-    std::unique_ptr<AutoGetCollection> autoColl = std::make_unique<AutoGetCollection>(
-        opCtx.get(), nss, fixLockModeForSystemDotViewsChanges(nss, MODE_IX));
-    invariant(autoColl->getCollection());
 
     // Move locks into loader, so it now controls their lifetime.
     auto loader =
@@ -387,7 +387,7 @@ Status StorageInterfaceImpl::dropReplicatedDatabases(OperationContext* opCtx) {
     std::vector<std::string> dbNames =
         opCtx->getServiceContext()->getStorageEngine()->listDatabases();
     invariant(!dbNames.empty());
-    log() << "dropReplicatedDatabases - dropping " << dbNames.size() << " databases";
+    LOGV2(21754, "dropReplicatedDatabases - dropping {num} databases", "num"_attr = dbNames.size());
 
     ReplicationCoordinator::get(opCtx)->dropAllSnapshots();
 
@@ -404,14 +404,15 @@ Status StorageInterfaceImpl::dropReplicatedDatabases(OperationContext* opCtx) {
             } else {
                 // This is needed since dropDatabase can't be rolled back.
                 // This is safe be replaced by "invariant(db);dropDatabase(opCtx, db);" once fixed.
-                log() << "dropReplicatedDatabases - database disappeared after retrieving list of "
-                         "database names but before drop: "
-                      << dbName;
+                LOGV2(21755,
+                      "dropReplicatedDatabases - database disappeared after retrieving list of "
+                      "database names but before drop: {dbName}",
+                      "dbName"_attr = dbName);
             }
         });
     }
     invariant(hasLocalDatabase, "local database missing");
-    log() << "dropReplicatedDatabases - dropped " << dbNames.size() << " databases";
+    LOGV2(21756, "dropReplicatedDatabases - dropped {num} databases", "num"_attr = dbNames.size());
 
     return Status::OK();
 }
@@ -874,7 +875,7 @@ Status _updateWithQuery(OperationContext* opCtx,
         }
 
         auto planExecutorResult = mongo::getExecutorUpdate(
-            opCtx, nullptr, collection, &parsedUpdate, boost::none /* verbosity */);
+            nullptr, collection, &parsedUpdate, boost::none /* verbosity */);
         if (!planExecutorResult.isOK()) {
             return planExecutorResult.getStatus();
         }
@@ -1003,7 +1004,7 @@ Status StorageInterfaceImpl::deleteByFilter(OperationContext* opCtx,
         auto collection = collectionResult.getValue();
 
         auto planExecutorResult = mongo::getExecutorDelete(
-            opCtx, nullptr, collection, &parsedDelete, boost::none /* verbosity */);
+            nullptr, collection, &parsedDelete, boost::none /* verbosity */);
         if (!planExecutorResult.isOK()) {
             return planExecutorResult.getStatus();
         }
@@ -1011,6 +1012,47 @@ Status StorageInterfaceImpl::deleteByFilter(OperationContext* opCtx,
 
         return planExecutor->executePlan();
     });
+}
+
+boost::optional<BSONObj> StorageInterfaceImpl::findOplogEntryLessThanOrEqualToTimestamp(
+    OperationContext* opCtx, Collection* oplog, const Timestamp& timestamp) {
+    invariant(oplog);
+    invariant(opCtx->lockState()->isLocked());
+
+    std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec =
+        InternalPlanner::collectionScan(opCtx,
+                                        NamespaceString::kRsOplogNamespace.ns(),
+                                        oplog,
+                                        PlanExecutor::NO_YIELD,
+                                        InternalPlanner::BACKWARD);
+
+    // A record id in the oplog collection is equivalent to the document's timestamp field.
+    RecordId desiredRecordId = RecordId(timestamp.asULL());
+
+    // Iterate the collection in reverse until the desiredRecordId, or one less than, is found.
+    BSONObj bson;
+    RecordId recordId;
+    PlanExecutor::ExecState state;
+    while (PlanExecutor::ADVANCED == (state = exec->getNext(&bson, &recordId))) {
+        if (recordId <= desiredRecordId) {
+            invariant(!bson.isEmpty(),
+                      "An empty oplog entry was returned while searching for an oplog entry <= " +
+                          timestamp.toString());
+            return bson.getOwned();
+        }
+    }
+
+    return boost::none;
+}
+
+Timestamp StorageInterfaceImpl::getLatestOplogTimestamp(OperationContext* opCtx) {
+    AutoGetCollectionForReadCommand autoColl(opCtx, NamespaceString::kRsOplogNamespace);
+    auto statusWithTimestamp =
+        autoColl.getCollection()->getRecordStore()->getLatestOplogTimestamp(opCtx);
+    invariant(statusWithTimestamp.isOK(),
+              str::stream() << "Expected oplog entries to exist: "
+                            << statusWithTimestamp.getStatus());
+    return statusWithTimestamp.getValue();
 }
 
 StatusWith<StorageInterface::CollectionSize> StorageInterfaceImpl::getCollectionSize(

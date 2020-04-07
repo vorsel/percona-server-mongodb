@@ -46,6 +46,7 @@
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/getmore_request.h"
 #include "mongo/db/query/query_request.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/factory.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata.h"
@@ -55,7 +56,6 @@
 #include "mongo/util/debug_util.h"
 #include "mongo/util/destructor_guard.h"
 #include "mongo/util/exit.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -203,13 +203,13 @@ bool DBClientCursor::init() {
         _client->call(toSend, reply, true, &_originalHost);
     } catch (const DBException&) {
         // log msg temp?
-        log() << "DBClientCursor::init call() failed" << endl;
+        LOGV2(20127, "DBClientCursor::init call() failed");
         // We always want to throw on network exceptions.
         throw;
     }
     if (reply.empty()) {
         // log msg temp?
-        log() << "DBClientCursor::init message from call() was empty" << endl;
+        LOGV2(20128, "DBClientCursor::init message from call() was empty");
         return false;
     }
     dataReceived(reply);
@@ -235,9 +235,11 @@ bool DBClientCursor::initLazyFinish(bool& retry) {
     // If we get a bad response, return false
     if (!recvStatus.isOK() || reply.empty()) {
         if (!recvStatus.isOK())
-            log() << "DBClientCursor::init lazy say() failed: " << redact(recvStatus) << endl;
+            LOGV2(20129,
+                  "DBClientCursor::init lazy say() failed: {recvStatus}",
+                  "recvStatus"_attr = redact(recvStatus));
         if (reply.empty())
-            log() << "DBClientCursor::init message from say() was empty" << endl;
+            LOGV2(20130, "DBClientCursor::init message from say() was empty");
 
         _client->checkResponse({}, true, &retry, &_lazyHost);
 
@@ -357,13 +359,11 @@ void DBClientCursor::dataReceived(const Message& reply, bool& retry, string& hos
         // cursor id no longer valid at the server.
         invariant(qr.getCursorId() == 0);
 
-        if (!(opts & QueryOption_CursorTailable)) {
-            uasserted(ErrorCodes::CursorNotFound,
-                      str::stream() << "cursor id " << cursorId << " didn't exist on server.");
-        }
-
-        // 0 indicates no longer valid (dead)
+        // 0 indicates no longer valid (dead).
         cursorId = 0;
+
+        uasserted(ErrorCodes::CursorNotFound,
+                  str::stream() << "cursor id " << cursorId << " didn't exist on server.");
     }
 
     if (cursorId == 0 || !(opts & QueryOption_CursorTailable)) {

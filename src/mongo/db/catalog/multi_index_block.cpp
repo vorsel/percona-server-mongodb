@@ -54,9 +54,9 @@
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/write_unit_of_work.h"
 #include "mongo/logger/redaction.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 #include "mongo/util/progress_meter.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/scopeguard.h"
@@ -65,6 +65,7 @@
 namespace mongo {
 
 MONGO_FAIL_POINT_DEFINE(hangAfterSettingUpIndexBuild);
+MONGO_FAIL_POINT_DEFINE(hangAfterSettingUpIndexBuildUnlocked);
 MONGO_FAIL_POINT_DEFINE(hangAfterStartingIndexBuild);
 MONGO_FAIL_POINT_DEFINE(hangAfterStartingIndexBuildUnlocked);
 MONGO_FAIL_POINT_DEFINE(hangBeforeIndexBuildOf);
@@ -117,8 +118,7 @@ void MultiIndexBlock::cleanUpAfterBuild(OperationContext* opCtx,
     }
 
     auto nss = collection->ns();
-    invariant(UncommittedCollections::get(opCtx).hasExclusiveAccessToCollection(opCtx, nss),
-              nss.toString());
+    UncommittedCollections::get(opCtx).invariantHasExclusiveAccessToCollection(opCtx, nss);
 
     while (true) {
         try {
@@ -142,7 +142,7 @@ void MultiIndexBlock::cleanUpAfterBuild(OperationContext* opCtx,
                 // Simply get a timestamp to write with here; we can't write to the oplog.
                 repl::UnreplicatedWritesBlock uwb(opCtx);
                 if (!IndexTimestampHelper::setGhostCommitTimestampForCatalogWrite(opCtx, nss)) {
-                    log() << "Did not timestamp index abort write.";
+                    LOGV2(20382, "Did not timestamp index abort write.");
                 }
             }
 
@@ -156,23 +156,22 @@ void MultiIndexBlock::cleanUpAfterBuild(OperationContext* opCtx,
         } catch (const DBException& e) {
             if (e.toStatus() == ErrorCodes::ExceededMemoryLimit)
                 continue;
-            error() << "Caught exception while cleaning up partially built indexes: " << redact(e);
+            LOGV2_ERROR(20393,
+                        "Caught exception while cleaning up partially built indexes: {e}",
+                        "e"_attr = redact(e));
         } catch (const std::exception& e) {
-            error() << "Caught exception while cleaning up partially built indexes: " << e.what();
+            LOGV2_ERROR(20394,
+                        "Caught exception while cleaning up partially built indexes: {e_what}",
+                        "e_what"_attr = e.what());
         } catch (...) {
-            error() << "Caught unknown exception while cleaning up partially built indexes.";
+            LOGV2_ERROR(20395,
+                        "Caught unknown exception while cleaning up partially built indexes.");
         }
         fassertFailed(18644);
     }
 }
 
 bool MultiIndexBlock::areHybridIndexBuildsEnabled() {
-    // The mobile storage engine does not suport dupsAllowed mode on bulk builders, which means that
-    // it does not support hybrid builds. See SERVER-38550
-    if (storageGlobalParams.engine == "mobile") {
-        return false;
-    }
-
     return enableHybridIndexBuilds.load();
 }
 
@@ -245,9 +244,10 @@ StatusWith<std::vector<BSONObj>> MultiIndexBlock::init(OperationContext* opCtx,
             BSONObj info = indexSpecs[i];
             if (enableHybrid) {
                 if (info["background"].isBoolean() && !info["background"].Bool()) {
-                    log()
-                        << "ignoring obselete { background: false } index build option because all "
-                           "indexes are built in the background with the hybrid method";
+                    LOGV2(
+                        20383,
+                        "ignoring obselete {{ background: false }} index build option because all "
+                        "indexes are built in the background with the hybrid method");
                 }
                 continue;
             }
@@ -326,13 +326,26 @@ StatusWith<std::vector<BSONObj>> MultiIndexBlock::init(OperationContext* opCtx,
             if (_ignoreUnique) {
                 index.options.getKeysMode = IndexAccessMethod::GetKeysMode::kRelaxConstraints;
             }
+
+            // Two-phase index builds (with a build UUID) always relax constraints and check for
+            // violations at commit-time.
+            if (_buildUUID) {
+                index.options.getKeysMode = IndexAccessMethod::GetKeysMode::kRelaxConstraints;
+            }
+
             index.options.fromIndexBuilder = true;
 
-            log() << "index build: starting on " << ns << " properties: " << descriptor->toString()
-                  << " using method: " << _method;
+            LOGV2(20384,
+                  "index build: starting on {ns} properties: {descriptor} using method: {method}",
+                  "ns"_attr = ns,
+                  "descriptor"_attr = descriptor->toString(),
+                  "method"_attr = _method);
             if (index.bulk)
-                log() << "build may temporarily use up to "
-                      << eachIndexBuildMaxMemoryUsageBytes / 1024 / 1024 << " megabytes of RAM";
+                LOGV2(20385,
+                      "build may temporarily use up to "
+                      "{eachIndexBuildMaxMemoryUsageBytes_1024_1024} megabytes of RAM",
+                      "eachIndexBuildMaxMemoryUsageBytes_1024_1024"_attr =
+                          eachIndexBuildMaxMemoryUsageBytes / 1024 / 1024);
 
             index.filterExpression = index.block->getEntry()->getFilterExpression();
 
@@ -374,7 +387,8 @@ void failPointHangDuringBuild(FailPoint* fp, StringData where, const BSONObj& do
     fp->executeIf(
         [&](const BSONObj& data) {
             int i = doc.getIntField("i");
-            log() << "Hanging " << where << " index build of i=" << i;
+            LOGV2(
+                20386, "Hanging {where} index build of i={i}", "where"_attr = where, "i"_attr = i);
             fp->pauseWhileSet();
         },
         [&](const BSONObj& data) {
@@ -412,13 +426,30 @@ Status MultiIndexBlock::insertAllDocumentsInCollection(OperationContext* opCtx,
 
     if (MONGO_unlikely(hangAfterSettingUpIndexBuild.shouldFail())) {
         // Hang the build after the BackgroundOperation and curOP info is set up.
-        log() << "Hanging index build due to failpoint 'hangAfterSettingUpIndexBuild'";
+        LOGV2(20387, "Hanging index build due to failpoint 'hangAfterSettingUpIndexBuild'");
         hangAfterSettingUpIndexBuild.pauseWhileSet();
     }
 
+    if (MONGO_unlikely(hangAfterSettingUpIndexBuildUnlocked.shouldFail())) {
+        uassert(4585200, "failpoint may not be set on foreground indexes", isBackgroundBuilding());
+
+        // Unlock before hanging so replication recognizes we've completed.
+        Locker::LockSnapshot lockInfo;
+        invariant(opCtx->lockState()->saveLockStateAndUnlock(&lockInfo));
+
+        LOGV2(4585201,
+              "Hanging index build with no locks due to "
+              "'hangAfterSettingUpIndexBuildUnlocked' failpoint");
+        hangAfterSettingUpIndexBuildUnlocked.pauseWhileSet();
+
+        opCtx->lockState()->restoreLockState(opCtx, lockInfo);
+        opCtx->recoveryUnit()->abandonSnapshot();
+    }
+
+
     if (MONGO_unlikely(hangAndThenFailIndexBuild.shouldFail())) {
         // Hang the build after the BackgroundOperation and curOP info is set up.
-        log() << "Hanging index build due to failpoint 'hangAndThenFailIndexBuild'";
+        LOGV2(20388, "Hanging index build due to failpoint 'hangAndThenFailIndexBuild'");
         hangAndThenFailIndexBuild.pauseWhileSet();
         return {ErrorCodes::InternalError,
                 "Failed index build because of failpoint 'hangAndThenFailIndexBuild'"};
@@ -525,8 +556,9 @@ Status MultiIndexBlock::insertAllDocumentsInCollection(OperationContext* opCtx,
     }
 
     if (MONGO_unlikely(leaveIndexBuildUnfinishedForShutdown.shouldFail())) {
-        log() << "Index build interrupted due to 'leaveIndexBuildUnfinishedForShutdown' failpoint. "
-                 "Mimicking shutdown error code.";
+        LOGV2(20389,
+              "Index build interrupted due to 'leaveIndexBuildUnfinishedForShutdown' failpoint. "
+              "Mimicking shutdown error code.");
         return Status(
             ErrorCodes::InterruptedAtShutdown,
             "background index build interrupted due to failpoint. returning a shutdown error.");
@@ -537,8 +569,9 @@ Status MultiIndexBlock::insertAllDocumentsInCollection(OperationContext* opCtx,
         Locker::LockSnapshot lockInfo;
         invariant(opCtx->lockState()->saveLockStateAndUnlock(&lockInfo));
 
-        log() << "Hanging index build with no locks due to "
-                 "'hangAfterStartingIndexBuildUnlocked' failpoint";
+        LOGV2(20390,
+              "Hanging index build with no locks due to "
+              "'hangAfterStartingIndexBuildUnlocked' failpoint");
         hangAfterStartingIndexBuildUnlocked.pauseWhileSet();
 
         if (isBackgroundBuilding()) {
@@ -553,8 +586,10 @@ Status MultiIndexBlock::insertAllDocumentsInCollection(OperationContext* opCtx,
 
     progress->finished();
 
-    log() << "index build: collection scan done. scanned " << n << " total records in "
-          << t.seconds() << " seconds";
+    LOGV2(20391,
+          "index build: collection scan done. scanned {n} total records in {t_seconds} seconds",
+          "n"_attr = n,
+          "t_seconds"_attr = t.seconds());
 
     Status ret = dumpInsertsFromBulk(opCtx);
     if (!ret.isOK())
@@ -621,8 +656,11 @@ Status MultiIndexBlock::dumpInsertsFromBulk(OperationContext* opCtx,
                                         : _indexes[i].options.dupsAllowed;
 
         IndexCatalogEntry* entry = _indexes[i].block->getEntry();
-        LOG(1) << "index build: inserting from external sorter into index: "
-               << entry->descriptor()->indexName();
+        LOGV2_DEBUG(
+            20392,
+            1,
+            "index build: inserting from external sorter into index: {entry_descriptor_indexName}",
+            "entry_descriptor_indexName"_attr = entry->descriptor()->indexName());
 
         // SERVER-41918 This call to commitBulk() results in file I/O that may result in an
         // exception.
@@ -685,6 +723,20 @@ Status MultiIndexBlock::drainBackgroundWrites(
 
         auto status = interceptor->drainWritesIntoIndex(
             opCtx, _indexes[i].options, readSource, drainYieldPolicy);
+        if (!status.isOK()) {
+            return status;
+        }
+    }
+    return Status::OK();
+}
+
+Status MultiIndexBlock::retrySkippedRecords(OperationContext* opCtx, Collection* collection) {
+    for (auto&& index : _indexes) {
+        auto interceptor = index.block->getEntry()->indexBuildInterceptor();
+        if (!interceptor)
+            continue;
+
+        auto status = interceptor->retrySkippedRecords(opCtx, collection);
         if (!status.isOK()) {
             return status;
         }
@@ -894,34 +946,22 @@ void MultiIndexBlock::_setStateToAbortedIfNotCommitted(StringData reason) {
     _abortReason = reason.toString();
 }
 
-std::ostream& operator<<(std::ostream& os, const MultiIndexBlock::State& state) {
+StringData toString(MultiIndexBlock::State state) {
     switch (state) {
         case MultiIndexBlock::State::kUninitialized:
-            return os << "Uninitialized";
+            return "Uninitialized"_sd;
         case MultiIndexBlock::State::kRunning:
-            return os << "Running";
+            return "Running"_sd;
         case MultiIndexBlock::State::kCommitted:
-            return os << "Committed";
+            return "Committed"_sd;
         case MultiIndexBlock::State::kAborted:
-            return os << "Aborted";
+            return "Aborted"_sd;
     }
     MONGO_UNREACHABLE;
 }
 
-logger::LogstreamBuilder& operator<<(logger::LogstreamBuilder& out,
-                                     const IndexBuildMethod& method) {
-    switch (method) {
-        case IndexBuildMethod::kHybrid:
-            out.stream() << "Hybrid";
-            break;
-        case IndexBuildMethod::kBackground:
-            out.stream() << "Background";
-            break;
-        case IndexBuildMethod::kForeground:
-            out.stream() << "Foreground";
-            break;
-    }
-    return out;
+std::ostream& operator<<(std::ostream& os, const MultiIndexBlock::State& state) {
+    return os << toString(state);
 }
 
 }  // namespace mongo

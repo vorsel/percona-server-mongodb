@@ -51,11 +51,9 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context_test_fixture.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
 #include "mongo/util/password_digest.h"
 
 namespace mongo {
-
 namespace {
 
 class SaslConversation : public ServiceContextTest {
@@ -94,10 +92,10 @@ SaslConversation::SaslConversation(std::string mech)
     : opCtx(makeOperationContext()),
       authManagerExternalState(new AuthzManagerExternalStateMock),
       authManager(new AuthorizationManagerImpl(
-          std::unique_ptr<AuthzManagerExternalState>(authManagerExternalState),
-          AuthorizationManagerImpl::InstallMockForTestingOrAuthImpl{})),
+          getServiceContext(),
+          std::unique_ptr<AuthzManagerExternalState>(authManagerExternalState))),
       authSession(authManager->makeAuthorizationSession()),
-      registry(opCtx->getServiceContext(), {"SCRAM-SHA-1", "SCRAM-SHA-256", "PLAIN"}),
+      registry(getServiceContext(), {"SCRAM-SHA-1", "SCRAM-SHA-256", "PLAIN"}),
       mechanism(mech) {
 
     AuthorizationManager::set(getServiceContext(),

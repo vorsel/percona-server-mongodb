@@ -46,7 +46,6 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 #include "mongo/util/net/http_client.h"
 
 namespace mongo {
@@ -131,17 +130,21 @@ private:
     }
 
     static void _lockShare(CURL*, curl_lock_data, curl_lock_access, void* ctx) {
-        reinterpret_cast<Mutex*>(ctx)->lock();
+        reinterpret_cast<stdx::recursive_mutex*>(ctx)->lock();
     }
 
     static void _unlockShare(CURL*, curl_lock_data, void* ctx) {
-        reinterpret_cast<Mutex*>(ctx)->unlock();
+        reinterpret_cast<stdx::recursive_mutex*>(ctx)->unlock();
     }
 
 private:
     bool _initialized = false;
     CURLSH* _share = nullptr;
-    Mutex _shareMutex = MONGO_MAKE_LATCH("CurlLibraryManager::_shareMutex");
+
+    // A recursive mutex here is needed because CURL needs to lock this multiple times depending
+    // on the "internal CURL type" of the object that CURL is sending. Using a normal mutex
+    // causes the CURL system to deadlock.
+    stdx::recursive_mutex _shareMutex{};
 } curlLibraryManager;
 
 /**

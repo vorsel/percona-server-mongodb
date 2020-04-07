@@ -1,10 +1,11 @@
 # -*- mode: python -*-
 
+import SCons
+
 import libdeps
 import json
 
 Import("env use_system_version_of_library usemozjs get_option")
-Import("mobile_se")
 Import("use_libunwind")
 Import("use_system_libunwind")
 Import("use_vendored_libunwind")
@@ -22,7 +23,6 @@ gperftoolsSuffix = '-2.7'
 timelibSuffix = '-2018.01'
 tomcryptSuffix = '-1.18.2'
 benchmarkSuffix = '-1.4.1'
-sqliteSuffix = '-amalgamation-3260000'
 libarchiveSuffix = '-3.4.0'
 
 thirdPartyEnvironmentModifications = {
@@ -128,11 +128,6 @@ if not use_system_version_of_library('zstd'):
         'CPPPATH' : ['#/src/third_party/zstandard' + zstdSuffix + '/zstd/lib'],
     }
 
-if not use_system_version_of_library('sqlite'):
-    thirdPartyEnvironmentModifications['sqlite'] = {
-        'CPPPATH' : ['#/src/third_party/sqlite' + sqliteSuffix + '/sqlite'],
-    }
-
 if not use_system_version_of_library('google-benchmark'):
     thirdPartyEnvironmentModifications['benchmark'] = {
         'CPPPATH' : ['#/src/third_party/benchmark' + benchmarkSuffix + '/benchmark/include'],
@@ -199,12 +194,10 @@ if not use_system_version_of_library('kms-message'):
 
 if use_system_libunwind:
     thirdPartyEnvironmentModifications['unwind'] = {
-        'CPPDEFINES' : ['MONGO_USE_LIBUNWIND', 'UNW_LOCAL_ONLY'],
         'SYSLIBDEPS' : [env['LIBDEPS_UNWIND_SYSLIBDEP'], 'lzma'],
     }
 elif use_vendored_libunwind:
     thirdPartyEnvironmentModifications['unwind'] = {
-        'CPPDEFINES' : ['MONGO_USE_LIBUNWIND', 'UNW_LOCAL_ONLY'],
         'LIBDEPS' : ['$BUILD_DIR/third_party/shim_unwind'],
         'SYSLIBDEPS' : ['lzma'],
     }
@@ -223,6 +216,42 @@ def injectThirdParty(thisEnv, libraries=[], parts=[]):
                 thisEnv.PrependUnique({part : mods[part]})
 
 env.AddMethod(injectThirdParty, 'InjectThirdParty')
+
+# In a dynamic build, force everything to depend on shim_allocator, so
+# that it topsorts to the end of the list.  We are totally relying on
+# the fact that we are altering the env from src/SConscript
+if get_option('link-model').startswith("dynamic"):
+
+    for builder_name in ('Program', 'SharedLibrary', 'LoadableModule', 'StaticLibrary'):
+        builder = env['BUILDERS'][builder_name]
+        base_emitter = builder.emitter
+
+        def add_shim_allocator_hack(target, source, env):
+
+            # If we allowed conftests to become dependent, any TryLink
+            # that happened after we made the below modifications would
+            # cause the configure steps to try to compile tcmalloc and any
+            # of its dependencies. Oops!
+            if any('conftest' in str(t) for t in target):
+                return target, source
+
+            # It is possible that 'env' isn't a unique
+            # OverrideEnvironment, since if you didn't pass any kw args
+            # into your builder call, you just reuse the env you were
+            # called with. That could mean that we see the same
+            # envirnoment here multiple times. But that is really OK,
+            # since the operation we are performing would be performed on
+            # all of them anyway. The flag serves as a way to disable the
+            # auto-injection for the handful of libraries where we must do
+            # so to avoid forming a cycle.
+            if not env.get('DISABLE_ALLOCATOR_SHIM_INJECTION', False):
+                lds = env.get('LIBDEPS', [])
+                lds.append('$BUILD_DIR/third_party/shim_allocator')
+                env['LIBDEPS'] = lds
+
+            return target, source
+
+        builder.emitter = SCons.Builder.ListEmitter([add_shim_allocator_hack, base_emitter])
 
 env = env.Clone()
 
@@ -265,7 +294,12 @@ if use_libunwind:
         target="shim_unwind",
         source=[
             'shim_unwind.cpp',
-        ])
+        ],
+        # We don't want the shim_allocator hack to apply to this library, since
+        # otherwise we would create a loop, since tcmalloc might use us. That should
+        # be OK, unless libunwind had static initializers that invoked malloc.
+        DISABLE_ALLOCATOR_SHIM_INJECTION=True,
+    )
 
 if use_system_version_of_library("fmt"):
     fmtEnv = env.Clone(
@@ -509,7 +543,9 @@ gperftoolsEnv.Library(
     target="shim_allocator",
     source=[
         "shim_allocator.cpp",
-    ])
+    ],
+    DISABLE_ALLOCATOR_SHIM_INJECTION=True,
+)
 
 
 if use_system_version_of_library("stemmer"):
@@ -587,26 +623,6 @@ if wiredtiger:
         source=[
             'shim_wiredtiger.cpp'
         ])
-
-if use_system_version_of_library("sqlite"):
-    sqliteEnv = env.Clone(
-        SYSLIBDEPS=[
-            env['LIBDEPS_SQLITE_SYSLIBDEP']
-        ])
-else:
-    sqliteEnv = env.Clone()
-    sqliteEnv.InjectThirdParty(libraries=['sqlite'])
-    sqliteEnv.SConscript('sqlite' + sqliteSuffix + '/SConscript', exports={ 'env' : sqliteEnv })
-    sqliteEnv = sqliteEnv.Clone(
-        LIBDEPS_INTERFACE=[
-            'sqlite' + sqliteSuffix + '/sqlite3',
-        ])
-
-sqliteEnv.Library(
-    target='shim_sqlite',
-    source=[
-        'shim_sqlite.cpp',
-    ])
 
 if use_system_version_of_library("asio"):
     # Normally, we would request LIBDEPS_ASIO_SYSLIBDEP here, but on most systems, the system asio

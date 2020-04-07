@@ -40,11 +40,11 @@
 
 #include "mongo/base/init.h"
 #include "mongo/db/client.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/util/clock_source.h"
 #include "mongo/util/hierarchical_acquisition.h"
 #include "mongo/util/interruptible.h"
-#include "mongo/util/log.h"
 
 using namespace fmt::literals;
 
@@ -100,29 +100,29 @@ void BlockedOp::start(ServiceContext* serviceContext) {
     _latchState.thread = stdx::thread([this, serviceContext]() mutable {
         ThreadClient tc("DiagnosticCaptureTestLatch", serviceContext);
 
-        log() << "Entered currentOpSpawnsThreadWaitingForLatch thread";
+        LOGV2(23123, "Entered currentOpSpawnsThreadWaitingForLatch thread");
 
         stdx::lock_guard testLock(_latchState.mutex);
 
-        log() << "Joining currentOpSpawnsThreadWaitingForLatch thread";
+        LOGV2(23124, "Joining currentOpSpawnsThreadWaitingForLatch thread");
     });
 
     _interruptibleState.thread = stdx::thread([this, serviceContext]() mutable {
         ThreadClient tc("DiagnosticCaptureTestInterruptible", serviceContext);
         auto opCtx = tc->makeOperationContext();
 
-        log() << "Entered currentOpSpawnsThreadWaitingForLatch thread for interruptibles";
+        LOGV2(23125, "Entered currentOpSpawnsThreadWaitingForLatch thread for interruptibles");
         stdx::unique_lock lk(_interruptibleState.mutex);
         opCtx->waitForConditionOrInterrupt(
             _interruptibleState.cv, lk, [&] { return _interruptibleState.isDone; });
         _interruptibleState.isDone = false;
 
-        log() << "Joining currentOpSpawnsThreadWaitingForLatch thread for interruptibles";
+        LOGV2(23126, "Joining currentOpSpawnsThreadWaitingForLatch thread for interruptibles");
     });
 
 
     _cv.wait(lk, [this] { return _latchState.isContended && _interruptibleState.isWaiting; });
-    log() << "Started threads for currentOpSpawnsThreadWaitingForLatch";
+    LOGV2(23127, "Started threads for currentOpSpawnsThreadWaitingForLatch");
 }
 
 // This function unlocks testMutex and joins if there are no more callers of BlockedOp::start()
@@ -155,14 +155,18 @@ void BlockedOp::join() {
 }
 
 void BlockedOp::setIsContended(bool value) {
-    log() << "Setting isContended to " << (value ? "true" : "false");
+    LOGV2(23128,
+          "Setting isContended to {value_true_false}",
+          "value_true_false"_attr = (value ? "true" : "false"));
     stdx::lock_guard lk(_m);
     _latchState.isContended = value;
     _cv.notify_one();
 }
 
 void BlockedOp::setIsWaiting(bool value) {
-    log() << "Setting isWaiting to " << (value ? "true" : "false");
+    LOGV2(23129,
+          "Setting isWaiting to {value_true_false}",
+          "value_true_false"_attr = (value ? "true" : "false"));
     stdx::lock_guard lk(_m);
     _interruptibleState.isWaiting = value;
     _cv.notify_one();
@@ -174,9 +178,9 @@ struct DiagnosticInfoHandle {
 };
 const auto getDiagnosticInfoHandle = Client::declareDecoration<DiagnosticInfoHandle>();
 
-MONGO_INITIALIZER_GENERAL(DiagnosticInfo, (/* NO PREREQS */), ("FinalizeLockListeners"))
+MONGO_INITIALIZER_GENERAL(DiagnosticInfo, (/* NO PREREQS */), ("FinalizeDiagnosticListeners"))
 (InitializerContext* context) {
-    class LockListener : public Mutex::LockListener {
+    class DiagnosticListener : public latch_detail::DiagnosticListener {
         void onContendedLock(const Identity& id) override {
             if (auto client = Client::getCurrent()) {
                 auto& handle = getDiagnosticInfoHandle(client);
@@ -209,9 +213,7 @@ MONGO_INITIALIZER_GENERAL(DiagnosticInfo, (/* NO PREREQS */), ("FinalizeLockList
         }
     };
 
-    // Intentionally leaked, people use Latches in detached threads
-    static auto& listener = *new LockListener;
-    Mutex::addLockListener(&listener);
+    latch_detail::installDiagnosticListener<DiagnosticListener>();
 
     return Status::OK();
 }
@@ -255,9 +257,7 @@ MONGO_INITIALIZER(InterruptibleWaitListener)(InitializerContext* context) {
         }
     };
 
-    // Intentionally leaked, people can use in detached threads
-    static auto& listener = *new WaitListener();
-    Interruptible::addWaitListener(&listener);
+    Interruptible::installWaitListener<WaitListener>();
 
     return Status::OK();
 }

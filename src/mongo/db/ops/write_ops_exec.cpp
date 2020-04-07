@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kWrite
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kWrite
 
 #include "mongo/platform/basic.h"
 
@@ -59,6 +59,7 @@
 #include "mongo/db/ops/write_ops_exec.h"
 #include "mongo/db/ops/write_ops_gen.h"
 #include "mongo/db/ops/write_ops_retryability.h"
+#include "mongo/db/pipeline/lite_parsed_pipeline.h"
 #include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_summary_stats.h"
@@ -74,11 +75,11 @@
 #include "mongo/db/storage/duplicate_key_error_info.h"
 #include "mongo/db/transaction_participant.h"
 #include "mongo/db/write_concern.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/cannot_implicitly_create_collection_info.h"
 #include "mongo/s/would_change_owning_shard_exception.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 #include "mongo/util/log_and_backoff.h"
 #include "mongo/util/scopeguard.h"
 
@@ -128,14 +129,19 @@ void finishCurOp(OperationContext* opCtx, CurOp* curOp) {
                     curOp->getReadWriteType());
 
         if (!curOp->debug().errInfo.isOK()) {
-            LOG(3) << "Caught Assertion in " << redact(logicalOpToString(curOp->getLogicalOp()))
-                   << ": " << curOp->debug().errInfo.toString();
+            LOGV2_DEBUG(
+                20886,
+                3,
+                "Caught Assertion in {logicalOpToString_curOp_getLogicalOp}: {curOp_debug_errInfo}",
+                "logicalOpToString_curOp_getLogicalOp"_attr =
+                    redact(logicalOpToString(curOp->getLogicalOp())),
+                "curOp_debug_errInfo"_attr = curOp->debug().errInfo.toString());
         }
 
         // Mark the op as complete, and log it if appropriate. Returns a boolean indicating whether
         // this op should be sampled for profiling.
         const bool shouldSample =
-            curOp->completeAndLogOperation(opCtx, MONGO_LOG_DEFAULT_COMPONENT);
+            curOp->completeAndLogOperation(opCtx, MONGO_LOGV2_DEFAULT_COMPONENT);
 
         if (curOp->shouldDBProfile(shouldSample)) {
             // Stash the current transaction so that writes to the profile collection are not
@@ -147,7 +153,7 @@ void finishCurOp(OperationContext* opCtx, CurOp* curOp) {
         // We need to ignore all errors here. We don't want a successful op to fail because of a
         // failure to record stats. We also don't want to replace the error reported for an op that
         // is failing.
-        log() << "Ignoring error from finishCurOp: " << redact(ex);
+        LOGV2(20887, "Ignoring error from finishCurOp: {ex}", "ex"_attr = redact(ex));
     }
 }
 
@@ -168,7 +174,11 @@ public:
             // guard to fire in that case. Operations on the local DB aren't replicated, so they
             // don't need to bump the lastOp.
             replClientInfo().setLastOpToSystemLastOpTimeIgnoringInterrupt(_opCtx);
-            LOG(5) << "Set last op to system time: " << replClientInfo().getLastOp().getTimestamp();
+            LOGV2_DEBUG(20888,
+                        5,
+                        "Set last op to system time: {replClientInfo_getLastOp_getTimestamp}",
+                        "replClientInfo_getLastOp_getTimestamp"_attr =
+                            replClientInfo().getLastOp().getTimestamp());
         }
     }
 
@@ -194,27 +204,33 @@ private:
     repl::OpTime _opTimeAtLastOpStart;
 };
 
-void assertCanWrite_inlock(OperationContext* opCtx, const NamespaceString& ns, bool isCollection) {
+void assertCanWrite_inlock(OperationContext* opCtx, const NamespaceString& ns) {
     uassert(ErrorCodes::PrimarySteppedDown,
             str::stream() << "Not primary while writing to " << ns.ns(),
             repl::ReplicationCoordinator::get(opCtx->getServiceContext())
                 ->canAcceptWritesFor(opCtx, ns));
-    CollectionShardingState::get(opCtx, ns)->checkShardVersionOrThrow(opCtx, isCollection);
+    CollectionShardingState::get(opCtx, ns)->checkShardVersionOrThrow(opCtx);
 }
 
 void makeCollection(OperationContext* opCtx, const NamespaceString& ns) {
+    auto isFullyUpgradedTo44 =
+        (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+         serverGlobalParams.featureCompatibility.getVersion() ==
+             ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44);
+
     auto inTransaction = opCtx->inMultiDocumentTransaction();
+
     uassert(ErrorCodes::OperationNotSupportedInTransaction,
-            str::stream() << "Cannot create namespace " << ns.ns()
-                          << " in multi-document transaction.",
-            !inTransaction);
+            str::stream()
+                << "Cannot create namespace " << ns.ns()
+                << " in multi-document transaction unless featureCompatibilityVersion is 4.4.",
+            isFullyUpgradedTo44 || !inTransaction);
 
     writeConflictRetry(opCtx, "implicit collection creation", ns.ns(), [&opCtx, &ns] {
         AutoGetOrCreateDb db(opCtx, ns.db(), MODE_IX);
         Lock::CollectionLock collLock(opCtx, ns, MODE_IX);
 
-        assertCanWrite_inlock(
-            opCtx, ns, CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, ns));
+        assertCanWrite_inlock(opCtx, ns);
         if (!CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
                 opCtx,
                 ns)) {  // someone else may have beat us to it.
@@ -375,10 +391,11 @@ bool insertBatchAndHandleErrors(OperationContext* opCtx,
         opCtx,
         "hangDuringBatchInsert",
         [&wholeOp]() {
-            log() << "batch insert - hangDuringBatchInsert fail point enabled for namespace "
-                  << wholeOp.getNamespace()
-                  << ". Blocking "
-                     "until fail point is disabled.";
+            LOGV2(20889,
+                  "batch insert - hangDuringBatchInsert fail point enabled for namespace "
+                  "{wholeOp_getNamespace}. Blocking "
+                  "until fail point is disabled.",
+                  "wholeOp_getNamespace"_attr = wholeOp.getNamespace());
         },
         true,  // Check for interrupt periodically.
         wholeOp.getNamespace());
@@ -402,7 +419,7 @@ bool insertBatchAndHandleErrors(OperationContext* opCtx,
         }
 
         curOp.raiseDbProfileLevel(collection->getDb()->getProfilingLevel());
-        assertCanWrite_inlock(opCtx, wholeOp.getNamespace(), collection->getCollection());
+        assertCanWrite_inlock(opCtx, wholeOp.getNamespace());
 
         CurOpFailpointHelpers::waitWhileFailPointEnabled(
             &hangWithLockDuringBatchInsert, opCtx, "hangWithLockDuringBatchInsert");
@@ -609,9 +626,11 @@ static SingleWriteResult performSingleUpdateOp(OperationContext* opCtx,
         opCtx,
         "hangDuringBatchUpdate",
         [&ns]() {
-            log() << "batch update - hangDuringBatchUpdate fail point enabled for nss " << ns
-                  << ". Blocking until "
-                     "fail point is disabled.";
+            LOGV2(20890,
+                  "batch update - hangDuringBatchUpdate fail point enabled for nss {ns}. Blocking "
+                  "until "
+                  "fail point is disabled.",
+                  "ns"_attr = ns);
         },
         false /*checkForInterrupt*/,
         ns);
@@ -647,13 +666,10 @@ static SingleWriteResult performSingleUpdateOp(OperationContext* opCtx,
         curOp.raiseDbProfileLevel(collection->getDb()->getProfilingLevel());
     }
 
-    assertCanWrite_inlock(opCtx, ns, collection->getCollection());
+    assertCanWrite_inlock(opCtx, ns);
 
-    auto exec = uassertStatusOK(getExecutorUpdate(opCtx,
-                                                  &curOp.debug(),
-                                                  collection->getCollection(),
-                                                  &parsedUpdate,
-                                                  boost::none /* verbosity */));
+    auto exec = uassertStatusOK(getExecutorUpdate(
+        &curOp.debug(), collection->getCollection(), &parsedUpdate, boost::none /* verbosity */));
 
     {
         stdx::lock_guard<Client> lk(*opCtx->getClient());
@@ -751,8 +767,9 @@ static SingleWriteResult performSingleUpdateOpWithDupKeyRetry(OperationContext* 
                 throw;
             }
 
-            logAndBackoff(::mongo::logger::LogComponent::kWrite,
-                          logger::LogSeverity::Debug(1),
+            logAndBackoff(4640402,
+                          ::mongo::logv2::LogComponent::kWrite,
+                          logv2::LogSeverity::Debug(1),
                           numAttempts,
                           str::stream()
                               << "Caught DuplicateKey exception during upsert for namespace "
@@ -821,6 +838,14 @@ WriteResult performUpdates(OperationContext* opCtx, const write_ops::Update& who
             if (!canContinue)
                 break;
         }
+
+        // If this was a pipeline style update, record which stages were being used.
+        auto updateMod = singleOp.getU();
+        if (updateMod.type() == write_ops::UpdateModification::Type::kPipeline) {
+            auto pipeline =
+                LiteParsedPipeline(wholeOp.getNamespace(), updateMod.getUpdatePipeline());
+            pipeline.tickGlobalStageCounters();
+        }
     }
 
     return out;
@@ -853,6 +878,7 @@ static SingleWriteResult performSingleDeleteOp(OperationContext* opCtx,
     request.setYieldPolicy(opCtx->inMultiDocumentTransaction() ? PlanExecutor::INTERRUPT_ONLY
                                                                : PlanExecutor::YIELD_AUTO);
     request.setStmtId(stmtId);
+    request.setHint(op.getHint());
 
     ParsedDelete parsedDelete(opCtx, &request);
     uassertStatusOK(parsedDelete.parseRequest());
@@ -862,8 +888,9 @@ static SingleWriteResult performSingleDeleteOp(OperationContext* opCtx,
         opCtx,
         "hangDuringBatchRemove",
         []() {
-            log() << "batch remove - hangDuringBatchRemove fail point enabled. Blocking "
-                     "until fail point is disabled.";
+            LOGV2(20891,
+                  "batch remove - hangDuringBatchRemove fail point enabled. Blocking "
+                  "until fail point is disabled.");
         },
         true  // Check for interrupt periodically.
     );
@@ -877,16 +904,13 @@ static SingleWriteResult performSingleDeleteOp(OperationContext* opCtx,
         curOp.raiseDbProfileLevel(collection.getDb()->getProfilingLevel());
     }
 
-    assertCanWrite_inlock(opCtx, ns, collection.getCollection());
+    assertCanWrite_inlock(opCtx, ns);
 
     CurOpFailpointHelpers::waitWhileFailPointEnabled(
         &hangWithLockDuringBatchRemove, opCtx, "hangWithLockDuringBatchRemove");
 
-    auto exec = uassertStatusOK(getExecutorDelete(opCtx,
-                                                  &curOp.debug(),
-                                                  collection.getCollection(),
-                                                  &parsedDelete,
-                                                  boost::none /* verbosity */));
+    auto exec = uassertStatusOK(getExecutorDelete(
+        &curOp.debug(), collection.getCollection(), &parsedDelete, boost::none /* verbosity */));
 
     {
         stdx::lock_guard<Client> lk(*opCtx->getClient());

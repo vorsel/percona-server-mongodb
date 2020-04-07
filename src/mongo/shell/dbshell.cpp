@@ -49,7 +49,7 @@
 #include "mongo/base/status.h"
 #include "mongo/client/authenticate.h"
 #include "mongo/client/mongo_uri.h"
-#include "mongo/client/sasl_iam_client_options.h"
+#include "mongo/client/sasl_aws_client_options.h"
 #include "mongo/config.h"
 #include "mongo/db/auth/sasl_command_constants.h"
 #include "mongo/db/client.h"
@@ -77,7 +77,8 @@
 #include "mongo/transport/transport_layer_asio.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/file.h"
-#include "mongo/util/log.h"
+#include "mongo/util/log_global_settings.h"
+#include "mongo/util/net/ocsp/ocsp_manager.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/password.h"
 #include "mongo/util/quick_exit.h"
@@ -194,9 +195,8 @@ public:
 /**
  * Formatter to provide specialized formatting for logs from javascript engine
  */
-class ShellFormatter final : private logv2::TextFormatter, private logv2::JSONFormatter {
+class ShellFormatter final : private logv2::PlainFormatter, private logv2::JSONFormatter {
 public:
-    ShellFormatter(bool isJson) : _isJson(isJson) {}
     void operator()(boost::log::record_view const& rec, boost::log::formatting_ostream& strm) {
         using namespace logv2;
         using boost::log::extract;
@@ -204,16 +204,9 @@ public:
         if (extract<LogTag>(attributes::tags(), rec).get().has(LogTag::kPlainShell)) {
             PlainFormatter::operator()(rec, strm);
         } else {
-            if (_isJson) {
-                JSONFormatter::operator()(rec, strm);
-            } else {
-                TextFormatter::operator()(rec, strm);
-            }
+            JSONFormatter::operator()(rec, strm);
         }
     }
-
-private:
-    bool _isJson;
 };
 
 }  // namespace
@@ -278,7 +271,7 @@ void completionHook(const char* text, linenoiseCompletions* lc) {
 void shellHistoryInit() {
     Status res = linenoiseHistoryLoad(shell_utils::getHistoryFilePath().string().c_str());
     if (!res.isOK()) {
-        error() << "Error loading history file: " << res;
+        std::cout << "Error loading history file: " << res << std::endl;
     }
     linenoiseSetCompletionCallback(completionHook);
 }
@@ -286,7 +279,7 @@ void shellHistoryInit() {
 void shellHistoryDone() {
     Status res = linenoiseHistorySave(shell_utils::getHistoryFilePath().string().c_str());
     if (!res.isOK()) {
-        error() << "Error saving history file: " << res;
+        std::cout << "Error saving history file: " << res << std::endl;
     }
     linenoiseHistoryFree();
 }
@@ -708,7 +701,7 @@ namespace {
 bool mechanismRequiresPassword(const MongoURI& uri) {
     if (const auto authMechanisms = uri.getOption("authMechanism")) {
         constexpr std::array<StringData, 3> passwordlessMechanisms{
-            auth::kMechanismGSSAPI, auth::kMechanismMongoX509, auth::kMechanismMongoIAM};
+            auth::kMechanismGSSAPI, auth::kMechanismMongoX509, auth::kMechanismMongoAWS};
         const std::string& authMechanism = authMechanisms.get();
         for (const auto& mechanism : passwordlessMechanisms) {
             if (mechanism.toString() == authMechanism) {
@@ -756,6 +749,9 @@ int _main(int argc, char* argv[], char** envp) {
     setGlobalServiceContext(ServiceContext::make());
     // TODO This should use a TransportLayerManager or TransportLayerFactory
     auto serviceContext = getGlobalServiceContext();
+
+    OCSPManager::get()->startThreadPool();
+
     transport::TransportLayerASIO::Options opts;
     opts.enableIPv6 = shellGlobalParams.enableIPv6;
     opts.mode = transport::TransportLayerASIO::Options::kEgress;
@@ -792,8 +788,7 @@ int _main(int argc, char* argv[], char** envp) {
         auto consoleSink = boost::make_shared<boost::log::sinks::synchronous_sink<ShellBackend>>();
         consoleSink->set_filter(logv2::ComponentSettingsFilter(lv2Manager.getGlobalDomain(),
                                                                lv2Manager.getGlobalSettings()));
-        consoleSink->set_formatter(
-            ShellFormatter(shellGlobalParams.logFormat == logv2::LogFormat::kJson));
+        consoleSink->set_formatter(ShellFormatter());
 
         consoleSink->locked_backend()->add_stream(
             boost::shared_ptr<std::ostream>(&logv2::Console::out(), boost::null_deleter()));
@@ -807,7 +802,6 @@ int _main(int argc, char* argv[], char** envp) {
 
         boost::log::core::get()->add_sink(std::move(consoleSink));
     }
-
 
     // Get the URL passed to the shell
     std::string& cmdlineURI = shellGlobalParams.url;
@@ -824,10 +818,10 @@ int _main(int argc, char* argv[], char** envp) {
     parsedURI.setOptionIfNecessary("gssapiServiceName"s, shellGlobalParams.gssapiServiceName);
     parsedURI.setOptionIfNecessary("gssapiHostName"s, shellGlobalParams.gssapiHostName);
 #ifdef MONGO_CONFIG_SSL
-    if (!iam::saslIamClientGlobalParams.awsSessionToken.empty()) {
+    if (!awsIam::saslAwsClientGlobalParams.awsSessionToken.empty()) {
         parsedURI.setOptionIfNecessary("authmechanismproperties"s,
                                        std::string("AWS_SESSION_TOKEN:") +
-                                           iam::saslIamClientGlobalParams.awsSessionToken);
+                                           awsIam::saslAwsClientGlobalParams.awsSessionToken);
     }
 #endif
 
@@ -919,7 +913,7 @@ int _main(int argc, char* argv[], char** envp) {
     if (!shellGlobalParams.script.empty()) {
         mongo::shell_utils::MongoProgramScope s;
         if (!scope->exec(shellGlobalParams.script, "(shell eval)", false, true, false)) {
-            error() << "exiting with code " << static_cast<int>(kEvalError);
+            std::cout << "exiting with code " << static_cast<int>(kEvalError) << std::endl;
             return kEvalError;
         }
         scope->exec("shellPrintHelper( __lastres__ );", "(shell2 eval)", true, true, false);
@@ -932,8 +926,8 @@ int _main(int argc, char* argv[], char** envp) {
             std::cout << "loading file: " << shellGlobalParams.files[i] << std::endl;
 
         if (!scope->execFile(shellGlobalParams.files[i], false, true)) {
-            severe() << "failed to load: " << shellGlobalParams.files[i];
-            error() << "exiting with code " << static_cast<int>(kInputFileError);
+            std::cout << "failed to load: " << shellGlobalParams.files[i] << std::endl;
+            std::cout << "exiting with code " << static_cast<int>(kInputFileError) << std::endl;
             return kInputFileError;
         }
 
@@ -947,9 +941,10 @@ int _main(int argc, char* argv[], char** envp) {
             std::cout << std::endl;
 
             if (mongo::shell_utils::KillMongoProgramInstances() != EXIT_SUCCESS) {
-                severe() << "one more more child processes exited with an error during "
-                         << shellGlobalParams.files[i];
-                error() << "exiting with code " << static_cast<int>(kProcessTerminationError);
+                std::cout << "one more more child processes exited with an error during "
+                          << shellGlobalParams.files[i] << std::endl;
+                std::cout << "exiting with code " << static_cast<int>(kProcessTerminationError)
+                          << std::endl;
                 return kProcessTerminationError;
             }
 
@@ -962,10 +957,12 @@ int _main(int argc, char* argv[], char** envp) {
             failIfUnterminatedProcesses = shellMainScope->getBoolean("__returnValue");
 
             if (failIfUnterminatedProcesses) {
-                severe() << "exiting with a failure due to unterminated processes, "
-                            "a call to MongoRunner.stopMongod(), ReplSetTest#stopSet(), or "
-                            "ShardingTest#stop() may be missing from the test";
-                error() << "exiting with code " << static_cast<int>(kUnterminatedProcess);
+                std::cout << "exiting with a failure due to unterminated processes, "
+                             "a call to MongoRunner.stopMongod(), ReplSetTest#stopSet(), or "
+                             "ShardingTest#stop() may be missing from the test"
+                          << std::endl;
+                std::cout << "exiting with code " << static_cast<int>(kUnterminatedProcess)
+                          << std::endl;
                 return kUnterminatedProcess;
             }
         }
@@ -993,9 +990,12 @@ int _main(int argc, char* argv[], char** envp) {
             if (!rcLocation.empty() && ::mongo::shell_utils::fileExists(rcLocation)) {
                 hasMongoRC = true;
                 if (!scope->execFile(rcLocation, false, true)) {
-                    severe() << "The \".mongorc.js\" file located in your home folder could not be "
-                                "executed";
-                    error() << "exiting with code " << static_cast<int>(kMongorcError);
+                    std::cout
+                        << "The \".mongorc.js\" file located in your home folder could not be "
+                           "executed"
+                        << std::endl;
+                    std::cout << "exiting with code " << static_cast<int>(kMongorcError)
+                              << std::endl;
                     return kMongorcError;
                 }
             }
@@ -1183,8 +1183,8 @@ int wmain(int argc, wchar_t* argvW[], wchar_t* envpW[]) {
         WindowsCommandLine wcl(argc, argvW, envpW);
         returnCode = _main(argc, wcl.argv(), wcl.envp());
     } catch (mongo::DBException& e) {
-        severe() << "exception: " << e.what();
-        error() << "exiting with code " << static_cast<int>(kDBException);
+        std::cout << "exception: " << e.what() << std::endl;
+        std::cout << "exiting with code " << static_cast<int>(kDBException) << std::endl;
         returnCode = kDBException;
     }
     quickExit(returnCode);
@@ -1195,8 +1195,8 @@ int main(int argc, char* argv[], char** envp) {
     try {
         returnCode = _main(argc, argv, envp);
     } catch (mongo::DBException& e) {
-        severe() << "exception: " << e.what();
-        error() << "exiting with code " << static_cast<int>(kDBException);
+        std::cout << "exception: " << e.what() << std::endl;
+        std::cout << "exiting with code " << static_cast<int>(kDBException) << std::endl;
         returnCode = kDBException;
     }
     quickExit(returnCode);

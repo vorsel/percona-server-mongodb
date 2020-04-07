@@ -27,6 +27,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+
 #include "mongo/platform/basic.h"
 
 #include <cstdint>
@@ -71,6 +73,7 @@
 #include "mongo/db/repl/replication_recovery_mock.h"
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/repl/timestamp_block.h"
+#include "mongo/db/s/collection_sharding_state_factory_shard.h"
 #include "mongo/db/s/op_observer_sharding_impl.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/session.h"
@@ -80,6 +83,7 @@
 #include "mongo/db/transaction_participant.h"
 #include "mongo/db/transaction_participant_gen.h"
 #include "mongo/dbtests/dbtests.h"
+#include "mongo/logv2/log.h"
 #include "mongo/stdx/future.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/stacktrace.h"
@@ -1524,9 +1528,9 @@ public:
         auto beforeTxnTs = beforeTxnTime.asTimestamp();
         auto commitEntryTs = beforeTxnTime.addTicks(1).asTimestamp();
 
-        unittest::log() << "Present TS: " << presentTs;
-        unittest::log() << "Before transaction TS: " << beforeTxnTs;
-        unittest::log() << "Commit entry TS: " << commitEntryTs;
+        LOGV2(22502, "Present TS: {presentTs}", "presentTs"_attr = presentTs);
+        LOGV2(22503, "Before transaction TS: {beforeTxnTs}", "beforeTxnTs"_attr = beforeTxnTs);
+        LOGV2(22504, "Commit entry TS: {commitEntryTs}", "commitEntryTs"_attr = commitEntryTs);
 
         const auto sessionId = makeLogicalSessionIdForTest();
         _opCtx->setLogicalSessionId(sessionId);
@@ -1799,11 +1803,11 @@ public:
 
         const Timestamp dropTime = _clock->reserveTicks(1).asTimestamp();
         if (SimulatePrimary) {
-            ASSERT_OK(dropDatabase(_opCtx, nss.db().toString()));
+            ASSERT_OK(dropDatabaseForApplyOps(_opCtx, nss.db().toString()));
         } else {
             repl::UnreplicatedWritesBlock uwb(_opCtx);
             TimestampBlock ts(_opCtx, dropTime);
-            ASSERT_OK(dropDatabase(_opCtx, nss.db().toString()));
+            ASSERT_OK(dropDatabaseForApplyOps(_opCtx, nss.db().toString()));
         }
 
         // Assert that the idents do not exist.
@@ -2590,6 +2594,162 @@ Status SecondaryReadsDuringBatchApplicationAreAllowedApplier::applyOplogBatchPer
     return Status::OK();
 }
 
+class IndexBuildsResolveErrorsDuringStateChangeToPrimary : public StorageTimestampTest {
+public:
+    void run() {
+
+        NamespaceString nss("unittests.timestampIndexBuilds");
+        reset(nss);
+
+        AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_X);
+        auto collection = autoColl.getCollection();
+
+        // Indexing of parallel arrays is not allowed, so these are deemed "bad".
+        const auto badDoc1 =
+            BSON("_id" << 0 << "a" << BSON_ARRAY(0 << 1) << "b" << BSON_ARRAY(0 << 1));
+        const auto badDoc2 =
+            BSON("_id" << 1 << "a" << BSON_ARRAY(2 << 3) << "b" << BSON_ARRAY(2 << 3));
+        const auto badDoc3 =
+            BSON("_id" << 2 << "a" << BSON_ARRAY(4 << 5) << "b" << BSON_ARRAY(4 << 5));
+
+        // NOTE: This test does not test any timestamp reads.
+        const LogicalTime insert1 = _clock->reserveTicks(1);
+        {
+            LOGV2(22505, "inserting {badDoc1}", "badDoc1"_attr = badDoc1);
+            WriteUnitOfWork wuow(_opCtx);
+            insertDocument(autoColl.getCollection(),
+                           InsertStatement(badDoc1, insert1.asTimestamp(), presentTerm));
+            wuow.commit();
+        }
+
+        const LogicalTime insert2 = _clock->reserveTicks(1);
+        {
+            LOGV2(22506, "inserting {badDoc2}", "badDoc2"_attr = badDoc2);
+            WriteUnitOfWork wuow(_opCtx);
+            insertDocument(autoColl.getCollection(),
+                           InsertStatement(badDoc2, insert2.asTimestamp(), presentTerm));
+            wuow.commit();
+        }
+
+        const IndexCatalogEntry* buildingIndex = nullptr;
+        MultiIndexBlock indexer;
+        ON_BLOCK_EXIT([&] {
+            indexer.cleanUpAfterBuild(_opCtx, collection, MultiIndexBlock::kNoopOnCleanUpFn);
+        });
+
+        // Provide a build UUID, indicating that this is a two-phase index build.
+        const auto buildUUID = UUID::gen();
+        indexer.setTwoPhaseBuildUUID(buildUUID);
+
+        const LogicalTime indexInit = _clock->reserveTicks(3);
+
+        // First, simulate being a secondary. Indexing errors are ignored.
+        {
+            ASSERT_OK(_coordinatorMock->setFollowerMode({repl::MemberState::MS::RS_SECONDARY}));
+            _coordinatorMock->alwaysAllowWrites(false);
+            repl::UnreplicatedWritesBlock unreplicatedWrites(_opCtx);
+
+            {
+                TimestampBlock tsBlock(_opCtx, indexInit.asTimestamp());
+
+                auto swSpecs =
+                    indexer.init(_opCtx,
+                                 collection,
+                                 {BSON("v" << 2 << "name"
+                                           << "a_1_b_1"
+                                           << "ns" << collection->ns().ns() << "key"
+                                           << BSON("a" << 1 << "b" << 1))},
+                                 MultiIndexBlock::makeTimestampedIndexOnInitFn(_opCtx, collection));
+                ASSERT_OK(swSpecs.getStatus());
+            }
+
+            auto indexCatalog = collection->getIndexCatalog();
+            buildingIndex = indexCatalog->getEntry(
+                indexCatalog->findIndexByName(_opCtx, "a_1_b_1", /* includeUnfinished */ true));
+            ASSERT(buildingIndex);
+
+            ASSERT_OK(indexer.insertAllDocumentsInCollection(_opCtx, collection));
+
+            ASSERT_TRUE(buildingIndex->indexBuildInterceptor()->areAllWritesApplied(_opCtx));
+
+            // There should be one skipped record from the collection scan.
+            ASSERT_FALSE(buildingIndex->indexBuildInterceptor()
+                             ->getSkippedRecordTracker()
+                             ->areAllRecordsApplied(_opCtx));
+        }
+
+        // As a primary, stop ignoring indexing errors.
+        ASSERT_OK(_coordinatorMock->setFollowerMode({repl::MemberState::MS::RS_PRIMARY}));
+
+        {
+            // This write will not succeed because the node is a primary and the document is not
+            // indexable.
+            LOGV2(22507, "attempting to insert {badDoc3}", "badDoc3"_attr = badDoc3);
+            WriteUnitOfWork wuow(_opCtx);
+            ASSERT_THROWS_CODE(
+                collection->insertDocument(
+                    _opCtx,
+                    InsertStatement(badDoc3, indexInit.addTicks(1).asTimestamp(), presentTerm),
+                    /* opDebug */ nullptr,
+                    /* noWarn */ false),
+                DBException,
+                ErrorCodes::CannotIndexParallelArrays);
+            wuow.commit();
+        }
+
+        // There should skipped records from failed collection scans and writes.
+        ASSERT_FALSE(
+            buildingIndex->indexBuildInterceptor()->getSkippedRecordTracker()->areAllRecordsApplied(
+                _opCtx));
+        // This fails because the bad record is still invalid.
+        auto status = indexer.retrySkippedRecords(_opCtx, collection);
+        ASSERT_EQ(status.code(), ErrorCodes::CannotIndexParallelArrays);
+
+        ASSERT_FALSE(
+            buildingIndex->indexBuildInterceptor()->getSkippedRecordTracker()->areAllRecordsApplied(
+                _opCtx));
+        ASSERT_TRUE(buildingIndex->indexBuildInterceptor()->areAllWritesApplied(_opCtx));
+
+        // Update one documents to be valid, and delete the other. These modifications are written
+        // to the side writes table and must be drained.
+        Helpers::upsert(_opCtx, collection->ns().ns(), BSON("_id" << 0 << "a" << 1 << "b" << 1));
+        {
+            RecordId badRecord =
+                Helpers::findOne(_opCtx, collection, BSON("_id" << 1), false /* requireIndex */);
+            WriteUnitOfWork wuow(_opCtx);
+            collection->deleteDocument(_opCtx, kUninitializedStmtId, badRecord, nullptr);
+            wuow.commit();
+        }
+
+        ASSERT_FALSE(buildingIndex->indexBuildInterceptor()->areAllWritesApplied(_opCtx));
+        ASSERT_OK(indexer.drainBackgroundWrites(_opCtx,
+                                                RecoveryUnit::ReadSource::kUnset,
+                                                IndexBuildInterceptor::DrainYieldPolicy::kNoYield));
+
+
+        // This succeeds because the bad documents are now either valid or removed.
+        ASSERT_OK(indexer.retrySkippedRecords(_opCtx, collection));
+        ASSERT_TRUE(
+            buildingIndex->indexBuildInterceptor()->getSkippedRecordTracker()->areAllRecordsApplied(
+                _opCtx));
+        ASSERT_TRUE(buildingIndex->indexBuildInterceptor()->areAllWritesApplied(_opCtx));
+        ASSERT_OK(indexer.checkConstraints(_opCtx));
+
+        {
+            WriteUnitOfWork wuow(_opCtx);
+            ASSERT_OK(indexer.commit(
+                _opCtx,
+                collection,
+                [&](const BSONObj& indexSpec) {
+                    _opCtx->getServiceContext()->getOpObserver()->onCreateIndex(
+                        _opCtx, collection->ns(), collection->uuid(), indexSpec, false);
+                },
+                MultiIndexBlock::kNoopOnCommitFn));
+            wuow.commit();
+        }
+    }
+};
+
 class SecondaryReadsDuringBatchApplicationAreAllowed : public StorageTimestampTest {
 public:
     void run() {
@@ -2944,9 +3104,9 @@ public:
     }
 
     void logTimestamps() const {
-        unittest::log() << "Present TS: " << presentTs;
-        unittest::log() << "Before transaction TS: " << beforeTxnTs;
-        unittest::log() << "Commit entry TS: " << commitEntryTs;
+        LOGV2(22508, "Present TS: {presentTs}", "presentTs"_attr = presentTs);
+        LOGV2(22509, "Before transaction TS: {beforeTxnTs}", "beforeTxnTs"_attr = beforeTxnTs);
+        LOGV2(22510, "Commit entry TS: {commitEntryTs}", "commitEntryTs"_attr = commitEntryTs);
     }
 
     BSONObj getSessionTxnInfoAtTimestamp(const Timestamp& ts, bool expected) {
@@ -3143,7 +3303,7 @@ public:
     void run() {
         auto txnParticipant = TransactionParticipant::get(_opCtx);
         ASSERT(txnParticipant);
-        unittest::log() << "PrepareTS: " << prepareEntryTs;
+        LOGV2(22511, "PrepareTS: {prepareEntryTs}", "prepareEntryTs"_attr = prepareEntryTs);
         logTimestamps();
 
         const auto prepareFilter = BSON("ts" << prepareEntryTs);
@@ -3337,8 +3497,8 @@ public:
     void run() {
         auto txnParticipant = TransactionParticipant::get(_opCtx);
         ASSERT(txnParticipant);
-        unittest::log() << "PrepareTS: " << prepareEntryTs;
-        unittest::log() << "AbortTS: " << abortEntryTs;
+        LOGV2(22512, "PrepareTS: {prepareEntryTs}", "prepareEntryTs"_attr = prepareEntryTs);
+        LOGV2(22513, "AbortTS: {abortEntryTs}", "abortEntryTs"_attr = abortEntryTs);
 
         const auto prepareFilter = BSON("ts" << prepareEntryTs);
         const auto abortFilter = BSON("ts" << abortEntryTs);
@@ -3441,7 +3601,7 @@ public:
         const auto currentTime = _clock->getClusterTime();
         const auto prepareTs = currentTime.addTicks(1).asTimestamp();
         commitEntryTs = currentTime.addTicks(2).asTimestamp();
-        unittest::log() << "Prepare TS: " << prepareTs;
+        LOGV2(22514, "Prepare TS: {prepareTs}", "prepareTs"_attr = prepareTs);
         logTimestamps();
 
         {
@@ -3542,7 +3702,7 @@ public:
         const auto currentTime = _clock->getClusterTime();
         const auto prepareTs = currentTime.addTicks(1).asTimestamp();
         const auto abortEntryTs = currentTime.addTicks(2).asTimestamp();
-        unittest::log() << "Prepare TS: " << prepareTs;
+        LOGV2(22515, "Prepare TS: {prepareTs}", "prepareTs"_attr = prepareTs);
         logTimestamps();
 
         {
@@ -3637,8 +3797,10 @@ public:
         auto storageEngine = cc().getServiceContext()->getStorageEngine();
         if (!storageEngine->supportsReadConcernSnapshot() ||
             !mongo::serverGlobalParams.enableMajorityReadConcern) {
-            unittest::log() << "Skipping this test suite because storage engine "
-                            << storageGlobalParams.engine << " does not support timestamp writes.";
+            LOGV2(22516,
+                  "Skipping this test suite because storage engine {storageGlobalParams_engine} "
+                  "does not support timestamp writes.",
+                  "storageGlobalParams_engine"_attr = storageGlobalParams.engine);
             return true;
         }
         return false;
@@ -3696,6 +3858,7 @@ public:
         addIf<AbortPreparedMultiOplogEntryTransaction>();
         addIf<PreparedMultiDocumentTransaction>();
         addIf<AbortedPreparedMultiDocumentTransaction>();
+        addIf<IndexBuildsResolveErrorsDuringStateChangeToPrimary>();
     }
 };
 

@@ -29,7 +29,7 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
     it in the license file.
 ======= */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include <boost/filesystem/path.hpp>
 
@@ -40,7 +40,7 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 #include "mongo/db/encryption/encryption_options.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_data_protector.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_encryption_hooks.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 #include <third_party/wiredtiger/ext/encryptors/percona/encryption_keydb_c_api.h>
 
@@ -83,7 +83,7 @@ namespace {
 
     // callback for ERR_print_errors_cb
     static int err_print_cb(const char *str, size_t len, void *param) {
-        error() << str;
+        LOGV2_ERROR(29029, "{str}", "str"_attr = str);
         return 1;
     }
 

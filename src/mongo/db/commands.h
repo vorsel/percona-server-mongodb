@@ -67,6 +67,36 @@ namespace mutablebson {
 class Document;
 }  // namespace mutablebson
 
+/**
+ * A simple set of type-erased hooks for pre and post command actions.
+ *
+ * These hooks will only run on external requests that form CommandInvocations (a.k.a. OP_MSG
+ * requests). They are not applied for runCommandDirectly() or raw CommandInvocation::run() calls.
+ */
+class CommandInvocationHooks {
+public:
+    /**
+     * Set the current hooks
+     */
+    static void set(ServiceContext* serviceContext, std::shared_ptr<CommandInvocationHooks> hooks);
+
+    virtual ~CommandInvocationHooks() = default;
+
+    /**
+     * A behavior to perform before CommandInvocation::run()
+     */
+    virtual void onBeforeRun(OperationContext* opCtx,
+                             const OpMsgRequest& request,
+                             CommandInvocation* invocation) = 0;
+
+    /**
+     * A behavior to perform after CommandInvocation::run()
+     */
+    virtual void onAfterRun(OperationContext* opCtx,
+                            const OpMsgRequest& request,
+                            CommandInvocation* invocation) = 0;
+};
+
 // Various helpers unrelated to any single command or to the command registry.
 // Would be a namespace, but want to keep it closed rather than open.
 // Some of these may move to the BasicCommand shim if they are only for legacy implementations.
@@ -194,6 +224,16 @@ struct CommandHelpers {
     static BSONObj runCommandDirectly(OperationContext* opCtx, const OpMsgRequest& request);
 
     /**
+     * Runs a previously parsed CommandInvocation and propagates the result to the
+     * ReplyBuilderInterface. This function is agnostic to the derived type of the CommandInvocation
+     * but may mirror, forward, or do other supplementary actions with the request.
+     */
+    static void runCommandInvocation(OperationContext* opCtx,
+                                     const OpMsgRequest& request,
+                                     CommandInvocation* invocation,
+                                     rpc::ReplyBuilderInterface* response);
+
+    /**
      * If '!invocation', we're logging about a Command pre-parse. It has to punt on the logged
      * namespace, giving only the request's $db. Since the Command hasn't parsed the request body,
      * we can't know the collection part of that namespace, so we leave it blank in the audit log.
@@ -229,6 +269,14 @@ struct CommandHelpers {
      */
     static bool shouldActivateFailCommandFailPoint(const BSONObj& data,
                                                    const CommandInvocation* invocation,
+                                                   Client* client);
+
+    /**
+     * Checks if the command passed in is in the list of failCommands defined in the fail point.
+     */
+    static bool shouldActivateFailCommandFailPoint(const BSONObj& data,
+                                                   const NamespaceString& nss,
+                                                   const Command* cmd,
                                                    Client* client);
 
     /**
@@ -466,6 +514,9 @@ public:
 
     virtual ~CommandInvocation();
 
+    static void set(OperationContext* opCtx, std::shared_ptr<CommandInvocation> invocation);
+    static std::shared_ptr<CommandInvocation> get(OperationContext* opCtx);
+
     /**
      * Runs the command, filling in result. Any exception thrown from here will cause result
      * to be reset and filled in with the error. Non-const to permit modifying the request
@@ -504,6 +555,20 @@ public:
                                                             "default read concern not permitted"};
         return {{level != repl::ReadConcernLevel::kLocalReadConcern, kReadConcernNotSupported},
                 {kDefaultReadConcernNotPermitted}};
+    }
+
+    /**
+     * Return if this invocation can be mirrored to secondaries
+     */
+    virtual bool supportsReadMirroring() const {
+        return false;
+    }
+
+    /**
+     * Return a BSONObj that can be safely mirrored to secondaries for cache warming
+     */
+    virtual void appendMirrorableRequest(BSONObjBuilder*) const {
+        MONGO_UNREACHABLE;
     }
 
     /**
@@ -656,6 +721,20 @@ public:
                                                             "default read concern not permitted"};
         return {{level != repl::ReadConcernLevel::kLocalReadConcern, kReadConcernNotSupported},
                 {kDefaultReadConcernNotPermitted}};
+    }
+
+    /**
+     * Return if the cmdObj can be mirrored to secondaries in some form
+     */
+    virtual bool supportsReadMirroring(const BSONObj& cmdObj) const {
+        return false;
+    }
+
+    /**
+     * Return a modified form of cmdObj that can be safely mirrored to secondaries for cache warming
+     */
+    virtual void appendMirrorableRequest(BSONObjBuilder*, const BSONObj&) const {
+        MONGO_UNREACHABLE;
     }
 
     virtual bool allowsAfterClusterTime(const BSONObj& cmdObj) const {

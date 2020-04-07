@@ -49,14 +49,14 @@
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
 #include "mongo/db/pipeline/pipeline.h"
-#include "mongo/db/pipeline/stub_mongo_process_interface.h"
+#include "mongo/db/pipeline/process_interface/stub_mongo_process_interface.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/views/resolved_view.h"
 #include "mongo/db/views/view.h"
 #include "mongo/db/views/view_graph.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -94,7 +94,10 @@ Status ViewCatalog::reload(OperationContext* opCtx, ViewCatalogLookupBehavior lo
 Status ViewCatalog::_reload(WithLock,
                             OperationContext* opCtx,
                             ViewCatalogLookupBehavior lookupBehavior) {
-    LOG(1) << "reloading view catalog for database " << _durable->getName();
+    LOGV2_DEBUG(22546,
+                1,
+                "reloading view catalog for database {durable_getName}",
+                "durable_getName"_attr = _durable->getName());
 
     _viewMap.clear();
     _valid = false;
@@ -137,8 +140,10 @@ Status ViewCatalog::_reload(WithLock,
         }
     } catch (const DBException& ex) {
         auto status = ex.toStatus();
-        LOG(0) << "could not load view catalog for database " << _durable->getName() << ": "
-               << status;
+        LOGV2(22547,
+              "could not load view catalog for database {durable_getName}: {status}",
+              "durable_getName"_attr = _durable->getName(),
+              "status"_attr = status);
         return status;
     }
 
@@ -299,8 +304,7 @@ Status ViewCatalog::_upsertIntoGraph(WithLock lk,
 
 StatusWith<stdx::unordered_set<NamespaceString>> ViewCatalog::_validatePipeline(
     WithLock lk, OperationContext* opCtx, const ViewDefinition& viewDef) const {
-    AggregationRequest request(viewDef.viewOn(), viewDef.pipeline());
-    const LiteParsedPipeline liteParsedPipeline(request);
+    const LiteParsedPipeline liteParsedPipeline(viewDef.viewOn(), viewDef.pipeline());
     const auto involvedNamespaces = liteParsedPipeline.getInvolvedNamespaces();
 
     // Verify that this is a legitimate pipeline specification by making sure it parses
@@ -313,7 +317,7 @@ StatusWith<stdx::unordered_set<NamespaceString>> ViewCatalog::_validatePipeline(
     }
     boost::intrusive_ptr<ExpressionContext> expCtx =
         new ExpressionContext(opCtx,
-                              request,
+                              AggregationRequest(viewDef.viewOn(), viewDef.pipeline()),
                               CollatorInterface::cloneCollator(viewDef.defaultCollator()),
                               // We can use a stub MongoProcessInterface because we are only parsing
                               // the Pipeline for validation here. We won't do anything with the
@@ -337,29 +341,38 @@ StatusWith<stdx::unordered_set<NamespaceString>> ViewCatalog::_validatePipeline(
     // to apply some additional checks.
     expCtx->isParsingViewDefinition = true;
 
-    auto pipelineStatus = Pipeline::parse(viewDef.pipeline(), std::move(expCtx));
-    if (!pipelineStatus.isOK()) {
-        return pipelineStatus.getStatus();
-    }
+    try {
+        auto pipeline =
+            Pipeline::parse(viewDef.pipeline(), std::move(expCtx), [&](const Pipeline& pipeline) {
+                // Validate that the view pipeline does not contain any ineligible stages.
+                const auto& sources = pipeline.getSources();
+                const auto firstPersistentStage =
+                    std::find_if(sources.begin(), sources.end(), [](const auto& source) {
+                        return source->constraints().writesPersistentData();
+                    });
 
-    // Validate that the view pipeline does not contain any ineligible stages.
-    const auto& sources = pipelineStatus.getValue()->getSources();
-    if (!sources.empty()) {
-        const auto firstPersistentStage =
-            std::find_if(sources.begin(), sources.end(), [](const auto& source) {
-                return source->constraints().writesPersistentData();
+                uassert(ErrorCodes::OptionNotSupportedOnView,
+                        str::stream()
+                            << "The aggregation stage "
+                            << firstPersistentStage->get()->getSourceName() << " in location "
+                            << std::distance(sources.begin(), firstPersistentStage)
+                            << " of the pipeline cannot be used in the view definition of "
+                            << viewDef.name().ns() << " because it writes to disk",
+                        firstPersistentStage == sources.end());
+
+                uassert(ErrorCodes::OptionNotSupportedOnView,
+                        "$changeStream cannot be used in a view definition",
+                        sources.empty() || !sources.front()->constraints().isChangeStreamStage());
+
+                std::for_each(sources.begin(), sources.end(), [](auto& stage) {
+                    uassert(ErrorCodes::InvalidNamespace,
+                            str::stream() << "'" << stage->getSourceName()
+                                          << "' cannot be used in a view definition",
+                            !stage->constraints().isIndependentOfAnyCollection);
+                });
             });
-        if (sources.front()->constraints().isChangeStreamStage()) {
-            return {ErrorCodes::OptionNotSupportedOnView,
-                    "$changeStream cannot be used in a view definition"};
-        } else if (firstPersistentStage != sources.end()) {
-            mongo::StringBuilder errorMessage;
-            errorMessage << "The aggregation stage " << firstPersistentStage->get()->getSourceName()
-                         << " in location " << std::distance(sources.begin(), firstPersistentStage)
-                         << " of the pipeline cannot be used in the view definition of "
-                         << viewDef.name().ns() << " because it writes to disk";
-            return {ErrorCodes::OptionNotSupportedOnView, errorMessage.str()};
-        }
+    } catch (const DBException& ex) {
+        return ex.toStatus();
     }
 
     return std::move(involvedNamespaces);
@@ -507,7 +520,6 @@ std::shared_ptr<ViewDefinition> ViewCatalog::_lookup(WithLock lk,
                                                      OperationContext* opCtx,
                                                      StringData ns,
                                                      ViewCatalogLookupBehavior lookupBehavior) {
-
     ViewMap::const_iterator it = _viewMap.find(ns);
     if (it != _viewMap.end()) {
         return it->second;

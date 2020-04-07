@@ -42,7 +42,7 @@
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_planner_test_lib.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/transitional_tools_do_not_use/vector_spooling.h"
 
 namespace mongo {
@@ -53,6 +53,8 @@ const NamespaceString QueryPlannerTest::nss("test.collection");
 
 void QueryPlannerTest::setUp() {
     opCtx = serviceContext.makeOperationContext();
+    expCtx = make_intrusive<ExpressionContext>(
+        opCtx.get(), std::unique_ptr<CollatorInterface>(nullptr), nss);
     internalQueryPlannerEnableHashIntersection.store(true);
     params.options = QueryPlannerParams::INCLUDE_COLLSCAN;
     addIndex(BSON("_id" << 1));
@@ -62,6 +64,7 @@ void QueryPlannerTest::clearState() {
     plannerStatus = Status::OK();
     solns.clear();
     cq.reset();
+    expCtx.reset();
     relaxBoundsCheck = false;
 }
 
@@ -327,7 +330,6 @@ void QueryPlannerTest::runQueryFull(const BSONObj& query,
     qr->setHint(hint);
     qr->setMin(minObj);
     qr->setMax(maxObj);
-    const boost::intrusive_ptr<ExpressionContext> expCtx;
     auto statusWithCQ =
         CanonicalQuery::canonicalize(opCtx.get(),
                                      std::move(qr),
@@ -408,7 +410,6 @@ void QueryPlannerTest::runInvalidQueryFull(const BSONObj& query,
     qr->setHint(hint);
     qr->setMin(minObj);
     qr->setMax(maxObj);
-    const boost::intrusive_ptr<ExpressionContext> expCtx;
     auto statusWithCQ =
         CanonicalQuery::canonicalize(opCtx.get(),
                                      std::move(qr),
@@ -432,7 +433,6 @@ void QueryPlannerTest::runQueryAsCommand(const BSONObj& cmdObj) {
     std::unique_ptr<QueryRequest> qr(
         assertGet(QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain)));
 
-    const boost::intrusive_ptr<ExpressionContext> expCtx;
     auto statusWithCQ =
         CanonicalQuery::canonicalize(opCtx.get(),
                                      std::move(qr),
@@ -456,7 +456,6 @@ void QueryPlannerTest::runInvalidQueryAsCommand(const BSONObj& cmdObj) {
     std::unique_ptr<QueryRequest> qr(
         assertGet(QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain)));
 
-    const boost::intrusive_ptr<ExpressionContext> expCtx;
     auto statusWithCQ =
         CanonicalQuery::canonicalize(opCtx.get(),
                                      std::move(qr),
@@ -478,7 +477,7 @@ size_t QueryPlannerTest::getNumSolutions() const {
 void QueryPlannerTest::dumpSolutions() const {
     str::stream ost;
     dumpSolutions(ost);
-    log() << std::string(ost);
+    LOGV2(20985, "{std_string_ost}", "std_string_ost"_attr = std::string(ost));
 }
 
 void QueryPlannerTest::dumpSolutions(str::stream& ost) const {
@@ -550,10 +549,13 @@ void QueryPlannerTest::assertHasOnlyCollscan() const {
 }
 
 std::unique_ptr<MatchExpression> QueryPlannerTest::parseMatchExpression(
-    const BSONObj& obj, const CollatorInterface* collator) {
-    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    expCtx->setCollator(collator);
-    StatusWithMatchExpression status = MatchExpressionParser::parse(obj, std::move(expCtx));
+    const BSONObj& obj, const boost::intrusive_ptr<ExpressionContext>& optionalExpCtx) {
+    auto expCtx = optionalExpCtx;
+    if (!expCtx.get()) {
+        expCtx = make_intrusive<ExpressionContextForTest>();
+    }
+
+    StatusWithMatchExpression status = MatchExpressionParser::parse(obj, expCtx);
     if (!status.isOK()) {
         FAIL(str::stream() << "failed to parse query: " << obj.toString()
                            << ". Reason: " << status.getStatus().toString());

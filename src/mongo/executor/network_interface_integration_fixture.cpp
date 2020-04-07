@@ -38,11 +38,11 @@
 #include "mongo/executor/network_interface_integration_fixture.h"
 #include "mongo/executor/remote_command_response.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/stdx/future.h"
 #include "mongo/unittest/integration_test.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace executor {
@@ -112,14 +112,56 @@ Future<RemoteCommandResponse> NetworkInterfaceIntegrationFixture::runCommand(
     });
 }
 
+Future<RemoteCommandOnAnyResponse> NetworkInterfaceIntegrationFixture::runCommandOnAny(
+    const TaskExecutor::CallbackHandle& cbHandle, RemoteCommandRequestOnAny request) {
+    RemoteCommandRequestOnAny rcroa{request};
+
+    return net().startCommand(cbHandle, rcroa).then([](TaskExecutor::ResponseOnAnyStatus roa) {
+        return roa;
+    });
+}
+
+Future<void> NetworkInterfaceIntegrationFixture::startExhaustCommand(
+    const TaskExecutor::CallbackHandle& cbHandle,
+    RemoteCommandRequest request,
+    std::function<void(const RemoteCommandResponse&)> exhaustUtilCB,
+    const BatonHandle& baton) {
+    RemoteCommandRequestOnAny rcroa{request};
+    auto pf = makePromiseFuture<void>();
+
+    auto status = net().startExhaustCommand(
+        cbHandle,
+        rcroa,
+        [p = std::move(pf.promise), exhaustUtilCB = std::move(exhaustUtilCB)](
+            const TaskExecutor::ResponseOnAnyStatus& rs, bool isMoreToComeSet) mutable {
+            exhaustUtilCB(rs);
+
+            if (!rs.status.isOK()) {
+                invariant(!isMoreToComeSet);
+                p.setError(rs.status);
+                return;
+            }
+
+            if (!isMoreToComeSet) {
+                p.emplaceValue();
+            }
+        },
+        baton);
+
+    if (!status.isOK()) {
+        return status;
+    }
+    return std::move(pf.future);
+}
+
 RemoteCommandResponse NetworkInterfaceIntegrationFixture::runCommandSync(
     RemoteCommandRequest& request) {
     auto deferred = runCommand(makeCallbackHandle(), request);
     auto& res = deferred.get();
     if (res.isOK()) {
-        log() << "got command result: " << res.toString();
+        LOGV2(22586, "got command result: {res}", "res"_attr = res.toString());
     } else {
-        log() << "command failed: " << res.status;
+        LOGV2(22587, "command failed: {res_status}", "res_status"_attr = res.status);
     }
     return res;
 }

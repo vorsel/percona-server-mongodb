@@ -35,7 +35,7 @@
 
 #include <iostream>
 
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -47,7 +47,9 @@ namespace {
  * Accepts an errno code, prints its error message, and exits.
  */
 void failWithErrno(int err) {
-    severe() << "error in Ticketholder: " << errnoWithDescription(err);
+    LOGV2_FATAL(23121,
+                "error in Ticketholder: {errnoWithDescription_err}",
+                "errnoWithDescription_err"_attr = errnoWithDescription(err));
     fassertFailed(28604);
 }
 
@@ -218,7 +220,7 @@ Status TicketHolder::resize(int newSize) {
            << "more than newSize(" << newSize << ")";
 
         std::string errmsg = ss.str();
-        log() << errmsg;
+        LOGV2(23120, "{errmsg}", "errmsg"_attr = errmsg);
         return Status(ErrorCodes::BadValue, errmsg);
     }
 

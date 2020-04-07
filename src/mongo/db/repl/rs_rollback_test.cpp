@@ -63,9 +63,9 @@
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/net/hostandport.h"
 
+namespace mongo {
 namespace {
 
-using namespace mongo;
 using namespace mongo::repl;
 using namespace mongo::repl::rollback_internal;
 
@@ -220,9 +220,9 @@ int _createIndexOnEmptyCollection(OperationContext* opCtx,
 
 TEST_F(RSRollbackTest, InconsistentMinValid) {
     _replicationProcess->getConsistencyMarkers()->setAppliedThrough(
-        _opCtx.get(), OpTime(Timestamp(Seconds(0), 0), 0));
+        _opCtx.get(), OpTime(Timestamp(Seconds(1), 0), 0));
     _replicationProcess->getConsistencyMarkers()->setMinValid(_opCtx.get(),
-                                                              OpTime(Timestamp(Seconds(1), 0), 0));
+                                                              OpTime(Timestamp(Seconds(2), 0), 0));
     auto status = syncRollback(_opCtx.get(),
                                OplogInterfaceMock(),
                                RollbackSourceMock(std::make_unique<OplogInterfaceMock>()),
@@ -1061,7 +1061,7 @@ TEST_F(RSRollbackTest, RollbackCommitIndexBuild) {
 
     // Kill the index build we just restarted so the fixture can shut down.
     IndexBuildsCoordinator::get(_opCtx.get())
-        ->abortIndexBuildByBuildUUID(_opCtx.get(), buildUUID, "");
+        ->abortIndexBuildByBuildUUID(_opCtx.get(), buildUUID, Timestamp(), "");
 }
 
 TEST_F(RSRollbackTest, RollbackAbortIndexBuild) {
@@ -1105,7 +1105,7 @@ TEST_F(RSRollbackTest, RollbackAbortIndexBuild) {
 
     // Kill the index build we just restarted so the fixture can shut down.
     IndexBuildsCoordinator::get(_opCtx.get())
-        ->abortIndexBuildByBuildUUID(_opCtx.get(), buildUUID, "");
+        ->abortIndexBuildByBuildUUID(_opCtx.get(), buildUUID, Timestamp(), "");
 }
 
 TEST_F(RSRollbackTest, AbortedIndexBuildsAreRestarted) {
@@ -1154,7 +1154,7 @@ TEST_F(RSRollbackTest, AbortedIndexBuildsAreRestarted) {
 
     // Kill the index build we just restarted so the fixture can shut down.
     IndexBuildsCoordinator::get(_opCtx.get())
-        ->abortIndexBuildByBuildUUID(_opCtx.get(), buildUUID, "");
+        ->abortIndexBuildByBuildUUID(_opCtx.get(), buildUUID, Timestamp(), "");
 }
 
 TEST_F(RSRollbackTest, AbortedIndexBuildsAreNotRestartedWhenStartIsRolledBack) {
@@ -2772,10 +2772,10 @@ TEST_F(RSRollbackTest, RollbackReturnsImmediatelyOnFailureToTransitionToRollback
     ASSERT_EQUALS(MemberState(MemberState::RS_SECONDARY), _coordinator->getMemberState());
 }
 
-DEATH_TEST_F(
+DEATH_TEST_REGEX_F(
     RSRollbackTest,
     RollbackUnrecoverableRollbackErrorTriggersFatalAssertion,
-    "Unable to complete rollback. A full resync may be needed: "
+    "Unable to complete rollback. A full resync may be needed:.*"
     "UnrecoverableRollbackError: need to rollback, but unable to determine common point "
     "between local and remote oplog: InvalidSyncSource: remote oplog empty or unreadable") {
     // rollback() should abort on getting UnrecoverableRollbackError from syncRollback(). An empty
@@ -2837,11 +2837,11 @@ DEATH_TEST_F(RSRollbackTest,
         _opCtx.get(), localOplog, rollbackSource, {}, {}, _coordinator, _replicationProcess.get());
 }
 
-DEATH_TEST_F(
+DEATH_TEST_REGEX_F(
     RSRollbackTest,
     RollbackTriggersFatalAssertionOnFailingToTransitionToRecoveringAfterSyncRollbackReturns,
-    "Failed to transition into RECOVERING; expected to be in state ROLLBACK; found self in "
-    "ROLLBACK") {
+    "Failed to transition into.*; expected to be in state.*; found self "
+    "in.*RECOVERING.*ROLLBACK.*ROLLBACK") {
     auto commonOperation = makeNoopOplogEntryAndRecordId(Seconds(1));
     OplogInterfaceMock localOplog({commonOperation});
     RollbackSourceMock rollbackSource(
@@ -2918,25 +2918,25 @@ TEST_F(RSRollbackTest, RollbackInvalidatesDefaultRWConcernCache) {
     // Put initial defaults in the cache.
     {
         RWConcernDefault origDefaults;
-        origDefaults.setEpoch(Timestamp(10, 20));
-        origDefaults.setSetTime(Date_t::fromMillisSinceEpoch(1234));
+        origDefaults.setUpdateOpTime(Timestamp(10, 20));
+        origDefaults.setUpdateWallClockTime(Date_t::fromMillisSinceEpoch(1234));
         _lookupMock.setLookupCallReturnValue(std::move(origDefaults));
     }
     auto origCachedDefaults = rwcDefaults.getDefault(_opCtx.get());
-    ASSERT_EQ(Timestamp(10, 20), *origCachedDefaults.getEpoch());
-    ASSERT_EQ(Date_t::fromMillisSinceEpoch(1234), *origCachedDefaults.getSetTime());
+    ASSERT_EQ(Timestamp(10, 20), *origCachedDefaults.getUpdateOpTime());
+    ASSERT_EQ(Date_t::fromMillisSinceEpoch(1234), *origCachedDefaults.getUpdateWallClockTime());
 
     // Change the mock's defaults, but don't invalidate the cache yet. The cache should still return
     // the original defaults.
     {
         RWConcernDefault newDefaults;
-        newDefaults.setEpoch(Timestamp(50, 20));
-        newDefaults.setSetTime(Date_t::fromMillisSinceEpoch(5678));
+        newDefaults.setUpdateOpTime(Timestamp(50, 20));
+        newDefaults.setUpdateWallClockTime(Date_t::fromMillisSinceEpoch(5678));
         _lookupMock.setLookupCallReturnValue(std::move(newDefaults));
 
         auto cachedDefaults = rwcDefaults.getDefault(_opCtx.get());
-        ASSERT_EQ(Timestamp(10, 20), *cachedDefaults.getEpoch());
-        ASSERT_EQ(Date_t::fromMillisSinceEpoch(1234), *cachedDefaults.getSetTime());
+        ASSERT_EQ(Timestamp(10, 20), *cachedDefaults.getUpdateOpTime());
+        ASSERT_EQ(Date_t::fromMillisSinceEpoch(1234), *cachedDefaults.getUpdateWallClockTime());
     }
 
     // Rollback via refetch should invalidate the cache and getting the defaults should now return
@@ -2949,8 +2949,9 @@ TEST_F(RSRollbackTest, RollbackInvalidatesDefaultRWConcernCache) {
     _testRollbackDelete(_opCtx.get(), _coordinator, _replicationProcess.get(), coll->uuid(), doc);
 
     auto newCachedDefaults = rwcDefaults.getDefault(_opCtx.get());
-    ASSERT_EQ(Timestamp(50, 20), *newCachedDefaults.getEpoch());
-    ASSERT_EQ(Date_t::fromMillisSinceEpoch(5678), *newCachedDefaults.getSetTime());
+    ASSERT_EQ(Timestamp(50, 20), *newCachedDefaults.getUpdateOpTime());
+    ASSERT_EQ(Date_t::fromMillisSinceEpoch(5678), *newCachedDefaults.getUpdateWallClockTime());
 }
 
 }  // namespace
+}  // namespace mongo

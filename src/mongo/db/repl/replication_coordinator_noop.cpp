@@ -80,12 +80,12 @@ bool ReplicationCoordinatorNoOp::canAcceptWritesForDatabase_UNSAFE(OperationCont
 }
 
 bool ReplicationCoordinatorNoOp::canAcceptWritesFor_UNSAFE(OperationContext* opCtx,
-                                                           const NamespaceString& ns) {
+                                                           const NamespaceStringOrUUID& nsOrUUID) {
     MONGO_UNREACHABLE;
 }
 
 bool ReplicationCoordinatorNoOp::canAcceptWritesFor(OperationContext* opCtx,
-                                                    const NamespaceString& ns) {
+                                                    const NamespaceStringOrUUID& nsOrUUID) {
     MONGO_UNREACHABLE;
 }
 
@@ -289,7 +289,8 @@ ReplSetConfig ReplicationCoordinatorNoOp::getConfig() const {
     MONGO_UNREACHABLE;
 }
 
-void ReplicationCoordinatorNoOp::processReplSetGetConfig(BSONObjBuilder*) {
+void ReplicationCoordinatorNoOp::processReplSetGetConfig(BSONObjBuilder* result,
+                                                         bool commitmentStatus) {
     MONGO_UNREACHABLE;
 }
 
@@ -318,6 +319,12 @@ Status ReplicationCoordinatorNoOp::processReplSetFreeze(int, BSONObjBuilder*) {
 Status ReplicationCoordinatorNoOp::processReplSetReconfig(OperationContext*,
                                                           const ReplSetReconfigArgs&,
                                                           BSONObjBuilder*) {
+    MONGO_UNREACHABLE;
+}
+
+Status ReplicationCoordinatorNoOp::doReplSetReconfig(OperationContext* opCtx,
+                                                     GetNewConfigFn getNewConfig,
+                                                     bool force) {
     MONGO_UNREACHABLE;
 }
 
@@ -468,6 +475,10 @@ TopologyVersion ReplicationCoordinatorNoOp::getTopologyVersion() const {
     MONGO_UNREACHABLE;
 }
 
+void ReplicationCoordinatorNoOp::incrementTopologyVersion(OperationContext* opCtx) {
+    MONGO_UNREACHABLE;
+}
+
 std::shared_ptr<const IsMasterResponse> ReplicationCoordinatorNoOp::awaitIsMasterResponse(
     OperationContext* opCtx,
     const SplitHorizon::Parameters& horizonParams,
@@ -476,8 +487,20 @@ std::shared_ptr<const IsMasterResponse> ReplicationCoordinatorNoOp::awaitIsMaste
     MONGO_UNREACHABLE;
 }
 
+
+SharedSemiFuture<std::shared_ptr<const IsMasterResponse>>
+ReplicationCoordinatorNoOp::getIsMasterResponseFuture(
+    const SplitHorizon::Parameters& horizonParams,
+    boost::optional<TopologyVersion> clientTopologyVersion) const {
+    MONGO_UNREACHABLE;
+}
+
 OpTime ReplicationCoordinatorNoOp::getLatestWriteOpTime(OperationContext* opCtx) const {
     return getMyLastAppliedOpTime();
+}
+
+HostAndPort ReplicationCoordinatorNoOp::getCurrentPrimaryHostAndPort() const {
+    MONGO_UNREACHABLE;
 }
 
 }  // namespace repl

@@ -190,13 +190,20 @@ public:
 
     void setTags(transport::Session::TagMask tag);
 
+
+    /**
+     * Disconnects the client and interrupts operations if they are currently blocked waiting for
+     * the network. If autoreconnect is on, a connection will be re-established after reconnecting.
+     */
+    virtual void shutdown();
+
     /**
      * Causes an error to be reported the next time the connection is used. Will interrupt
      * operations if they are currently blocked waiting for the network.
      *
      * This is the only method that is allowed to be called from other threads.
      */
-    void shutdownAndDisallowReconnect();
+    virtual void shutdownAndDisallowReconnect();
 
     void setWireVersions(int minWireVersion, int maxWireVersion) {
         _minWireVersion = minWireVersion;
@@ -286,6 +293,10 @@ public:
 
     Status authenticateInternalUser() override;
 
+    bool authenticatedDuringConnect() const override {
+        return _authenticatedDuringConnect;
+    }
+
 protected:
     int _minWireVersion{0};
     int _maxWireVersion{0};
@@ -342,6 +353,8 @@ private:
     MessageCompressorManager _compressorManager;
 
     MongoURI _uri;
+
+    bool _authenticatedDuringConnect = false;
 };
 
 BSONElement getErrField(const BSONObj& result);

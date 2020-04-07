@@ -2,6 +2,7 @@
  * Test that CollectionCloner completes without error when a collection is dropped during cloning,
  * specifically when that sync source is in 4.2.
  */
+load("jstests/libs/logv2_helpers.js");
 
 (function() {
 "use strict";
@@ -77,7 +78,7 @@ function setupTest({failPoint, extraFailPointData, secondaryStartupParams}) {
     replTest.waitForState(secondary, ReplSetTest.State.STARTUP_2);
 }
 
-function finishTest({failPoint, expectedLog, waitForDrop, createNew}) {
+function finishTest({failPoint, expectedLog, expectedLogId, waitForDrop, createNew}) {
     // Get the uuid for use in checking the log line.
     let uuid = getUUIDFromListCollections(primaryDB, collName);
 
@@ -98,9 +99,23 @@ function finishTest({failPoint, expectedLog, waitForDrop, createNew}) {
     jsTestLog("Allowing secondary to continue.");
     assert.commandWorked(secondary.adminCommand({configureFailPoint: failPoint, mode: 'off'}));
 
-    if (expectedLog) {
-        jsTestLog(eval(expectedLog));
-        checkLog.contains(secondary, eval(expectedLog));
+    if (isJsonLog(primaryColl.getMongo())) {
+        if (expectedLogId) {
+            let attrValues = {
+                "ns": nss,
+                "uuid": function(attr) {
+                    return UUID(attr.uuid.$uuid).toString() === uuid.toString();
+                }
+            };
+
+            checkLog.containsJson(secondary, expectedLogId, attrValues);
+        }
+    } else {
+        if (expectedLog) {
+            expectedLog = eval(expectedLog);
+            jsTestLog(expectedLog);
+            checkLog.contains(secondary, expectedLog);
+        }
     }
 
     jsTestLog("Waiting for initial sync to complete.");
@@ -143,6 +158,7 @@ runDropTest({
     failPoint: "initialSyncHangCollectionClonerAfterHandlingBatchResponse",
     secondaryStartupParams: {collectionClonerBatchSize: 1},
     waitForDrop: true,
+    expectedLogId: 21132,
     expectedLog:
         "`CollectionCloner ns: '${nss}' uuid: ${uuid} stopped because collection was dropped on source.`"
 });
@@ -153,6 +169,7 @@ runDropTest({
     failPoint: "initialSyncHangCollectionClonerAfterHandlingBatchResponse",
     secondaryStartupParams: {collectionClonerBatchSize: 1},
     waitForDrop: true,
+    expectedLogId: 21132,
     expectedLog:
         "`CollectionCloner ns: '${nss}' uuid: ${uuid} stopped because collection was dropped on source.`",
     createNew: true

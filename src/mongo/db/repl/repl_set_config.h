@@ -48,6 +48,66 @@ class BSONObj;
 namespace repl {
 
 /**
+ * A structure that stores a ReplSetConfig (version, term) pair.
+ *
+ * This can be used to compare two ReplSetConfig objects to determine which is logically newer.
+ */
+class ConfigVersionAndTerm {
+public:
+    ConfigVersionAndTerm() : _version(0), _term(OpTime::kUninitializedTerm) {}
+    ConfigVersionAndTerm(int version, long long term) : _version(version), _term(term) {}
+
+    inline bool operator==(const ConfigVersionAndTerm& rhs) const {
+        // If term of either item is uninitialized (-1), then we ignore terms entirely and only
+        // compare versions.
+        if (_term == OpTime::kUninitializedTerm || rhs._term == OpTime::kUninitializedTerm) {
+            return _version == rhs._version;
+        }
+        // Compare term first, then the versions.
+        return std::tie(_term, _version) == std::tie(rhs._term, rhs._version);
+    }
+
+    inline bool operator<(const ConfigVersionAndTerm& rhs) const {
+        // If term of either item is uninitialized (-1), then we ignore terms entirely and only
+        // compare versions. This allows force reconfigs, which set the config term to -1, to
+        // override other configs by using a high config version.
+        if (_term == OpTime::kUninitializedTerm || rhs._term == OpTime::kUninitializedTerm) {
+            return _version < rhs._version;
+        }
+        // Compare term first, then the versions.
+        return std::tie(_term, _version) < std::tie(rhs._term, rhs._version);
+    }
+
+    inline bool operator!=(const ConfigVersionAndTerm& rhs) const {
+        return !(*this == rhs);
+    }
+
+    inline bool operator<=(const ConfigVersionAndTerm& rhs) const {
+        return *this < rhs || *this == rhs;
+    }
+
+    inline bool operator>(const ConfigVersionAndTerm& rhs) const {
+        return !(*this <= rhs);
+    }
+
+    inline bool operator>=(const ConfigVersionAndTerm& rhs) const {
+        return !(*this < rhs);
+    }
+
+    std::string toString() const {
+        return str::stream() << "{version: " << _version << ", term: " << _term << "}";
+    };
+
+    friend std::ostream& operator<<(std::ostream& out, const ConfigVersionAndTerm& cvt) {
+        return out << cvt.toString();
+    }
+
+private:
+    long long _version;
+    long long _term;
+};
+
+/**
  * Representation of the configuration information about a particular replica set.
  */
 class ReplSetConfig {
@@ -57,13 +117,19 @@ public:
     static const std::string kConfigServerFieldName;
     static const std::string kVersionFieldName;
     static const std::string kTermFieldName;
-    static const std::string kMajorityWriteConcernModeName;
+    static constexpr char kMajorityWriteConcernModeName[] = "$majority";
+    static constexpr char kConfigMajorityWriteConcernModeName[] = "$configMajority";
+    static constexpr char kConfigAllWriteConcernName[] = "$configAll";
 
     // If this field is present, a repair operation potentially modified replicated data. This
     // should never be included in a valid configuration document.
     static const std::string kRepairedFieldName;
 
-    static const size_t kMaxMembers = 50;
+    /**
+     * Inline `kMaxMembers` to allow others (e.g, `WriteConcernOptions`) use
+     * the constant without linking to `repl_set_config.cpp`.
+     */
+    inline static const size_t kMaxMembers = 50;
     static const size_t kMaxVotingMembers = 7;
     static const Milliseconds kInfiniteCatchUpTimeout;
     static const Milliseconds kCatchUpDisabled;
@@ -117,7 +183,7 @@ public:
     Status checkIfWriteConcernCanBeSatisfied(const WriteConcernOptions& writeConcern) const;
 
     /**
-     * Gets the version of this configuration.
+     * Gets and sets the version of this configuration.
      *
      * The version number sequences configurations of the replica set, so that
      * nodes may distinguish between "older" and "newer" configurations.
@@ -126,14 +192,29 @@ public:
         return _version;
     }
 
+    void setConfigVersion(long long version) {
+        _version = version;
+    }
+
     /**
-     * Gets the term of this configuration.
+     * Gets and sets the term of this configuration.
      *
      * The configuration term is the term of the primary that originally created this configuration.
      * Configurations in a replica set are totally ordered by their term and configuration version.
      */
     long long getConfigTerm() const {
         return _term;
+    }
+
+    void setConfigTerm(long long term) {
+        _term = term;
+    }
+
+    /**
+     * Gets the (version, term) pair of this configuration.
+     */
+    ConfigVersionAndTerm getConfigVersionAndTerm() const {
+        return ConfigVersionAndTerm(_version, _term);
     }
 
     /**
@@ -343,6 +424,13 @@ public:
     std::vector<std::string> getWriteConcernNames() const;
 
     /**
+     *  Returns the number of voting data-bearing members.
+     */
+    int getWritableVotingMembersCount() {
+        return _writableVotingMembersCount;
+    }
+
+    /**
      * Returns the number of voting data-bearing members that must acknowledge a write
      * in order to satisfy a write concern of {w: "majority"}.
      */
@@ -446,6 +534,7 @@ private:
     bool _chainingAllowed = kDefaultChainingAllowed;
     bool _writeConcernMajorityJournalDefault = false;
     int _majorityVoteCount = 0;
+    int _writableVotingMembersCount = 0;
     int _writeMajority = 0;
     int _totalVotingMembers = 0;
     ReplSetTagConfig _tagConfig;

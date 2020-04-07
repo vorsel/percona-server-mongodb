@@ -18,6 +18,8 @@
 
 // Restarts cause issues with authentication for awaiting replication.
 TestData.skipAwaitingReplicationOnShardsBeforeCheckingUUIDs = true;
+// Restarts shard nodes with no keyFile.
+TestData.skipCheckOrphans = true;
 
 (function() {
 "use strict";
@@ -785,7 +787,7 @@ let currentOp =
     shardAdminDB.aggregate([{$currentOp: {allUsers: false}}, {$match: sessionFilter()}]).toArray();
 let transactionDocument = currentOp[0].transaction;
 assert.eq(transactionDocument.parameters.autocommit, false);
-assert.eq(transactionDocument.parameters.readConcern, {level: "snapshot"});
+assert.eq(transactionDocument.parameters.readConcern.level, "snapshot");
 assert.gte(transactionDocument.readTimestamp, operationTime);
 // We round timeOpenMicros up to the nearest multiple of 1000 to avoid occasional assertion
 // failures caused by timeOpenMicros having microsecond precision while

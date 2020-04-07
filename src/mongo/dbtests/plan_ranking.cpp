@@ -126,7 +126,7 @@ public:
         ASSERT_GREATER_THAN_OR_EQUALS(solutions.size(), 1U);
 
         // Fill out the MPR.
-        _mps.reset(new MultiPlanStage(&_opCtx, collection, cq));
+        _mps.reset(new MultiPlanStage(_expCtx.get(), collection, cq));
         unique_ptr<WorkingSet> ws(new WorkingSet());
         // Put each solution from the planner into the MPR.
         for (size_t i = 0; i < solutions.size(); ++i) {
@@ -166,6 +166,9 @@ protected:
 
     const ServiceContext::UniqueOperationContext _txnPtr = cc().makeOperationContext();
     OperationContext& _opCtx = *_txnPtr;
+
+    boost::intrusive_ptr<ExpressionContext> _expCtx =
+        make_intrusive<ExpressionContext>(&_opCtx, nullptr, nss);
 
 private:
     // Holds the value of global "internalQueryForceIntersectionPlans" setParameter flag.
@@ -557,9 +560,9 @@ public:
 
         // The best must not be a collscan.
         ASSERT(QueryPlannerTestLib::solutionMatches(
-            "{sort: {pattern: {c: 1}, limit: 0, node: {sortKeyGen: {node:"
+            "{sort: {pattern: {c: 1}, limit: 0, type:'simple', node:"
             "{fetch: {filter: null, node: "
-            "{ixscan: {filter: null, pattern: {_id: 1}}}}}}}}}",
+            "{ixscan: {filter: null, pattern: {_id: 1}}}}}}}",
             soln->root.get()));
     }
 };

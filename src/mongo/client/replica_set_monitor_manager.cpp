@@ -38,16 +38,18 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/client/connection_string.h"
 #include "mongo/client/mongo_uri.h"
-#include "mongo/client/replica_set_monitor.h"
+#include "mongo/client/replica_set_monitor_params_gen.h"
+#include "mongo/client/scanning_replica_set_monitor.h"
+#include "mongo/client/streamable_replica_set_monitor.h"
 #include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface_factory.h"
 #include "mongo/executor/network_interface_thread_pool.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/executor/thread_pool_task_executor.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/rpc/metadata/egress_metadata_hook_list.h"
-#include "mongo/util/log.h"
 #include "mongo/util/map_util.h"
 
 namespace mongo {
@@ -63,10 +65,17 @@ using executor::TaskExecutor;
 using executor::TaskExecutorPool;
 using executor::ThreadPoolTaskExecutor;
 
-ReplicaSetMonitorManager::ReplicaSetMonitorManager() {}
+namespace {
+const auto getGlobalRSMMonitorManager =
+    ServiceContext::declareDecoration<ReplicaSetMonitorManager>();
+}  // namespace
 
 ReplicaSetMonitorManager::~ReplicaSetMonitorManager() {
     shutdown();
+}
+
+ReplicaSetMonitorManager* ReplicaSetMonitorManager::get() {
+    return &getGlobalRSMMonitorManager(getGlobalServiceContext());
 }
 
 shared_ptr<ReplicaSetMonitor> ReplicaSetMonitorManager::getMonitor(StringData setName) {
@@ -121,12 +130,16 @@ shared_ptr<ReplicaSetMonitor> ReplicaSetMonitorManager::getOrCreateMonitor(const
         return monitor;
     }
 
-    log() << "Starting new replica set monitor for " << uri.toString();
+    LOGV2(20186, "Starting new replica set monitor for {uri}", "uri"_attr = uri.toString());
 
-    auto newMonitor = std::make_shared<ReplicaSetMonitor>(uri);
-    _monitors[setName] = newMonitor;
-    newMonitor->init();
-    return newMonitor;
+    if (disableStreamableReplicaSetMonitor.load()) {
+        auto newMonitor = std::make_shared<ScanningReplicaSetMonitor>(uri);
+        _monitors[setName] = newMonitor;
+        newMonitor->init();
+        return newMonitor;
+    } else {
+        uasserted(31451, "StreamableReplicaSetMonitor is not yet implemented");
+    }
 }
 
 vector<string> ReplicaSetMonitorManager::getAllSetNames() {
@@ -149,16 +162,12 @@ void ReplicaSetMonitorManager::removeMonitor(StringData setName) {
             monitor->drop();
         }
         _monitors.erase(it);
-        log() << "Removed ReplicaSetMonitor for replica set " << setName;
+        LOGV2(
+            20187, "Removed ReplicaSetMonitor for replica set {setName}", "setName"_attr = setName);
     }
 }
 
 void ReplicaSetMonitorManager::shutdown() {
-    // Sadly, this function can run very late in the post-main shutdown because there is still
-    // a globalRSMonitorManager. We have to be very carefully how we log because this can actually
-    // shutdown later than the logging subsystem. This will be less of an issue once SERVER-42437 is
-    // done.
-
     decltype(_monitors) monitors;
     decltype(_taskExecutor) taskExecutor;
     {
@@ -172,12 +181,12 @@ void ReplicaSetMonitorManager::shutdown() {
     }
 
     if (taskExecutor) {
-        LOG(1) << "Shutting down task executor used for monitoring replica sets";
+        LOGV2_DEBUG(20188, 1, "Shutting down task executor used for monitoring replica sets");
         taskExecutor->shutdown();
     }
 
     if (monitors.size()) {
-        log() << "Dropping all ongoing scans against replica sets";
+        LOGV2(20189, "Dropping all ongoing scans against replica sets");
     }
     for (auto& [name, monitor] : monitors) {
         auto anchor = monitor.lock();

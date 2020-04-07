@@ -51,6 +51,7 @@ class IndexAccessMethod;
 class IndexDescriptor;
 class MatchExpression;
 class OperationContext;
+class ExpressionContext;
 
 class IndexCatalogEntryImpl : public IndexCatalogEntry {
     IndexCatalogEntryImpl(const IndexCatalogEntryImpl&) = delete;
@@ -60,7 +61,8 @@ public:
     IndexCatalogEntryImpl(OperationContext* opCtx,
                           const std::string& ident,
                           std::unique_ptr<IndexDescriptor> descriptor,  // ownership passes to me
-                          CollectionQueryInfo* queryInfo);              // not owned, optional
+                          CollectionQueryInfo* queryInfo,               // not owned, optional
+                          bool isFrozen);
 
     ~IndexCatalogEntryImpl() final;
 
@@ -164,6 +166,8 @@ public:
     // if this ready is ready for queries
     bool isReady(OperationContext* opCtx) const final;
 
+    bool isFrozen() const final;
+
     KVPrefix getPrefix() const final {
         return _prefix;
     }
@@ -183,7 +187,12 @@ public:
     void setMinimumVisibleSnapshot(Timestamp newMinimumVisibleSnapshot) final;
 
 private:
-    class SetMultikeyChange;
+    /**
+     * Sets this index to be multikey when we are running inside a multi-document transaction.
+     * Used by setMultikey() only.
+     */
+    Status _setMultikeyInMultiDocumentTransaction(OperationContext* opCtx,
+                                                  const MultikeyPaths& multikeyPaths);
 
     bool _catalogIsReady(OperationContext* opCtx) const;
     bool _catalogIsPresent(OperationContext* opCtx) const;
@@ -194,6 +203,11 @@ private:
      * See CollectionCatalogEntry::isIndexMultikey() for more details.
      */
     bool _catalogIsMultikey(OperationContext* opCtx, MultikeyPaths* multikeyPaths) const;
+
+    /**
+     * Sets on-disk multikey flag for this index.
+     */
+    void _catalogSetMultikey(OperationContext* opCtx, const MultikeyPaths& multikeyPaths);
 
     KVPrefix _catalogGetPrefix(OperationContext* opCtx) const;
 
@@ -211,11 +225,14 @@ private:
 
     std::unique_ptr<CollatorInterface> _collator;
     std::unique_ptr<MatchExpression> _filterExpression;
+    // Special ExpressionContext used to evaluate the partial filter expression.
+    boost::intrusive_ptr<ExpressionContext> _expCtxForFilter;
 
     // cached stuff
 
-    Ordering _ordering;           // TODO: this might be b-tree specific
-    bool _isReady;                // cache of NamespaceDetails info
+    Ordering _ordering;  // TODO: this might be b-tree specific
+    bool _isReady;       // cache of NamespaceDetails info
+    bool _isFrozen;
     AtomicWord<bool> _isDropped;  // Whether the index drop is committed.
 
     // Set to true if this index supports path-level multikey tracking.

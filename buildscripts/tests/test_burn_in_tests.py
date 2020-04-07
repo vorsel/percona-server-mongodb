@@ -29,8 +29,8 @@ _parser.set_options()
 
 def create_tests_by_task_mock(n_tasks, n_tests):
     return {
-        f"task_{i}": {
-            "resmoke_args": f"--suites=suite_{i}",
+        f"task_{i}_gen": {
+            "display_task_name": f"task_{i}", "resmoke_args": f"--suites=suite_{i}",
             "tests": [f"jstests/tests_{j}" for j in range(n_tests)]
         }
         for i in range(n_tasks)
@@ -78,6 +78,7 @@ def mock_git_diff(change_list):
 def mock_changed_git_files(add_files):
     repo = MagicMock()
     repo.index.diff.return_value = mock_git_diff([mock_a_file(f) for f in add_files])
+    repo.working_dir = "."
     return repo
 
 
@@ -120,9 +121,9 @@ class TestAcceptance(unittest.TestCase):
     @patch(ns("_write_json_file"))
     def test_tests_generated_if_a_file_changed(self, write_json_mock):
         """
-        Given a git repository with no changes,
+        Given a git repository with changes,
         When burn_in_tests is run,
-        Then no tests are discovered to run.
+        Then tests are discovered to run.
         """
         # Note: this test is using actual tests and suites. So changes to those suites could
         # introduce failures and require this test to be updated.
@@ -130,7 +131,7 @@ class TestAcceptance(unittest.TestCase):
         # 'auth_audit' test suites. It needs to be in at least one of those for the test to pass.
         _config.NAMED_SUITES = None
         variant = "enterprise-rhel-62-64-bit"
-        repo = mock_changed_git_files(["jstests/auth/auth1.js"])
+        repos = [mock_changed_git_files(["jstests/auth/auth1.js"])]
         repeat_config = under_test.RepeatConfig()
         gen_config = under_test.GenerateConfig(
             variant,
@@ -139,7 +140,7 @@ class TestAcceptance(unittest.TestCase):
         )  # yapf: disable
         evg_config = get_evergreen_config("etc/evergreen.yml")
 
-        under_test.burn_in(repeat_config, gen_config, "", "testfile.json", False, evg_config, repo,
+        under_test.burn_in(repeat_config, gen_config, "", "testfile.json", False, evg_config, repos,
                            None)
 
         write_json_mock.assert_called_once()
@@ -512,17 +513,21 @@ TESTS_BY_TASK = {
 
 
 class TestCreateGenerateTasksConfig(unittest.TestCase):
+    @unittest.skipIf(sys.platform.startswith("win"), "not supported on windows")
     def test_no_tasks_given(self):
         evg_config = Configuration()
         gen_config = MagicMock(run_build_variant="variant")
         repeat_config = MagicMock()
 
-        evg_config = under_test.create_generate_tasks_config(evg_config, {}, gen_config,
-                                                             repeat_config, None)
+        evg_project_config = get_evergreen_config("etc/evergreen.yml")
+
+        evg_config = under_test.create_generate_tasks_config(
+            evg_config, {}, gen_config, repeat_config, None, evg_project_config)
 
         evg_config_dict = evg_config.to_map()
         self.assertNotIn("tasks", evg_config_dict)
 
+    @unittest.skipIf(sys.platform.startswith("win"), "not supported on windows")
     def test_one_task_one_test(self):
         n_tasks = 1
         n_tests = 1
@@ -533,8 +538,10 @@ class TestCreateGenerateTasksConfig(unittest.TestCase):
         repeat_config.generate_resmoke_options.return_value = resmoke_options
         tests_by_task = create_tests_by_task_mock(n_tasks, n_tests)
 
-        evg_config = under_test.create_generate_tasks_config(evg_config, tests_by_task, gen_config,
-                                                             repeat_config, None)
+        evg_project_config = get_evergreen_config("etc/evergreen.yml")
+
+        evg_config = under_test.create_generate_tasks_config(
+            evg_config, tests_by_task, gen_config, repeat_config, None, evg_project_config)
 
         evg_config_dict = evg_config.to_map()
         tasks = evg_config_dict["tasks"]
@@ -544,6 +551,7 @@ class TestCreateGenerateTasksConfig(unittest.TestCase):
         self.assertIn("--suites=suite_0", cmd[1]["vars"]["resmoke_args"])
         self.assertIn("tests_0", cmd[1]["vars"]["resmoke_args"])
 
+    @unittest.skipIf(sys.platform.startswith("win"), "not supported on windows")
     def test_n_task_m_test(self):
         n_tasks = 3
         n_tests = 5
@@ -552,12 +560,15 @@ class TestCreateGenerateTasksConfig(unittest.TestCase):
         repeat_config = MagicMock()
         tests_by_task = create_tests_by_task_mock(n_tasks, n_tests)
 
-        evg_config = under_test.create_generate_tasks_config(evg_config, tests_by_task, gen_config,
-                                                             repeat_config, None)
+        evg_project_config = get_evergreen_config("etc/evergreen.yml")
+
+        evg_config = under_test.create_generate_tasks_config(
+            evg_config, tests_by_task, gen_config, repeat_config, None, evg_project_config)
 
         evg_config_dict = evg_config.to_map()
         self.assertEqual(n_tasks * n_tests, len(evg_config_dict["tasks"]))
 
+    @unittest.skipIf(sys.platform.startswith("win"), "not supported on windows")
     def test_multiversion_path_is_used(self):
         n_tasks = 1
         n_tests = 1
@@ -565,12 +576,14 @@ class TestCreateGenerateTasksConfig(unittest.TestCase):
         gen_config = MagicMock(run_build_variant="variant", distro=None)
         repeat_config = MagicMock()
         tests_by_task = create_tests_by_task_mock(n_tasks, n_tests)
-        first_task = "task_0"
+        first_task = "task_0_gen"
         multiversion_path = "multiversion_path"
         tests_by_task[first_task]["use_multiversion"] = multiversion_path
 
-        evg_config = under_test.create_generate_tasks_config(evg_config, tests_by_task, gen_config,
-                                                             repeat_config, None)
+        evg_project_config = get_evergreen_config("etc/evergreen.yml")
+
+        evg_config = under_test.create_generate_tasks_config(
+            evg_config, tests_by_task, gen_config, repeat_config, None, evg_project_config)
 
         evg_config_dict = evg_config.to_map()
         tasks = evg_config_dict["tasks"]
@@ -678,6 +691,7 @@ class TestCreateMultiversionGenerateTasksConfig(unittest.TestCase):
 
 
 class TestCreateGenerateTasksFile(unittest.TestCase):
+    @unittest.skipIf(sys.platform.startswith("win"), "not supported on windows")
     @patch("buildscripts.burn_in_tests.create_generate_tasks_config")
     def test_gen_tasks_configuration_is_returned(self, gen_tasks_config_mock):
         evg_api = MagicMock()
@@ -693,12 +707,14 @@ class TestCreateGenerateTasksFile(unittest.TestCase):
         }
 
         gen_tasks_config_mock.return_value = evg_config
+        evg_project_config = get_evergreen_config("etc/evergreen.yml")
 
         config = under_test.create_generate_tasks_file(tests_by_task, gen_config, repeat_config,
-                                                       evg_api)
+                                                       evg_api, evg_project_config)
 
         self.assertEqual(config, evg_config.to_map.return_value)
 
+    @unittest.skipIf(sys.platform.startswith("win"), "not supported on windows")
     @patch(ns("create_generate_tasks_config"))
     def test_gen_tasks_multiversion_configuration_is_returned(self, gen_tasks_config_mock):  # pylint: disable=invalid-name
         evg_api = MagicMock()
@@ -726,11 +742,13 @@ class TestCreateGenerateTasksFile(unittest.TestCase):
         }  # yapf: disable
 
         gen_tasks_config_mock.return_value = evg_config
+        evg_project_config = get_evergreen_config("etc/evergreen.yml")
 
         config = under_test.create_generate_tasks_file(tests_by_task, gen_config, repeat_config,
-                                                       evg_api)
+                                                       evg_api, evg_project_config)
         self.assertEqual(config, evg_config.to_map.return_value)
 
+    @unittest.skipIf(sys.platform.startswith("win"), "not supported on windows")
     @patch("buildscripts.burn_in_tests.sys.exit")
     @patch("buildscripts.burn_in_tests.create_generate_tasks_config")
     def test_cap_on_task_generate(self, gen_tasks_config_mock, exit_mock):
@@ -747,10 +765,12 @@ class TestCreateGenerateTasksFile(unittest.TestCase):
         }
 
         gen_tasks_config_mock.return_value = evg_config
+        evg_project_config = get_evergreen_config("etc/evergreen.yml")
 
         exit_mock.side_effect = ValueError("exiting")
         with self.assertRaises(ValueError):
-            under_test.create_generate_tasks_file(tests_by_task, gen_config, repeat_config, evg_api)
+            under_test.create_generate_tasks_file(tests_by_task, gen_config, repeat_config, evg_api,
+                                                  evg_project_config)
 
         exit_mock.assert_called_once()
 
@@ -1095,7 +1115,7 @@ class TestFindChangedTests(unittest.TestCase):
         changed_files_mock.return_value = set(file_list)
         is_file_mock.return_value = True
 
-        found_tests = under_test.find_changed_tests(repo_mock)
+        found_tests = under_test.find_changed_tests([repo_mock])
 
         self.assertIn(file_list[0], found_tests)
         self.assertIn(file_list[2], found_tests)
@@ -1113,7 +1133,7 @@ class TestFindChangedTests(unittest.TestCase):
         changed_files_mock.return_value = set(file_list)
         is_file_mock.return_value = False
 
-        found_tests = under_test.find_changed_tests(repo_mock)
+        found_tests = under_test.find_changed_tests([repo_mock])
 
         self.assertEqual(0, len(found_tests))
 
@@ -1129,7 +1149,7 @@ class TestFindChangedTests(unittest.TestCase):
         changed_files_mock.return_value = set(file_list)
         is_file_mock.return_value = True
 
-        found_tests = under_test.find_changed_tests(repo_mock)
+        found_tests = under_test.find_changed_tests([repo_mock])
 
         self.assertIn(file_list[0], found_tests)
         self.assertIn(file_list[2], found_tests)

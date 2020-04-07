@@ -61,7 +61,7 @@ env.SConscript(
 # it, and do not declare other libraries in this file.
 baseEnv = env.Clone()
 
-if use_libunwind:
+if use_libunwind == True:
     baseEnv.InjectThirdParty('unwind')
 
 stacktrace_impl_cpp = [ File('util/stacktrace_${TARGET_OS_FAMILY}.cpp') ]
@@ -117,6 +117,7 @@ baseEnv.Library(
         'logv2/attributes.cpp',
         'logv2/bson_formatter.cpp',
         'logv2/console.cpp',
+        'logv2/file_rotate_sink.cpp',
         'logv2/json_formatter.cpp',
         'logv2/log_component.cpp',
         'logv2/log_component_settings.cpp',
@@ -128,6 +129,7 @@ baseEnv.Library(
         'logv2/log_severity.cpp',
         'logv2/log_tag.cpp',
         'logv2/plain_formatter.cpp',
+        'logv2/shared_access_fstream.cpp',
         'logv2/ramlog.cpp',
         'logv2/text_formatter.cpp',
         'platform/decimal128.cpp',
@@ -312,6 +314,8 @@ config_header_substs = (
     ('@mongo_config_ssl_provider@', 'MONGO_CONFIG_SSL_PROVIDER'),
     ('@mongo_config_usdt_enabled@', 'MONGO_CONFIG_USDT_ENABLED'),
     ('@mongo_config_usdt_provider@', 'MONGO_CONFIG_USDT_PROVIDER'),
+    ('@mongo_config_use_libunwind@', 'MONGO_CONFIG_USE_LIBUNWIND'),
+    ('@mongo_config_use_raw_latches@', 'MONGO_CONFIG_USE_RAW_LATCHES'),
     ('@mongo_config_wiredtiger_enabled@', 'MONGO_CONFIG_WIREDTIGER_ENABLED'),
 )
 
@@ -377,6 +381,7 @@ mongod = env.Program(
         'db/catalog/document_validation',
         'db/catalog/health_log',
         'db/catalog/index_key_validate',
+        'db/client_metadata_propagation_egress_hook',
         'db/cloner',
         'db/collection_index_usage_tracker',
         'db/commands/mongod',
@@ -406,12 +411,13 @@ mongod = env.Program(
         'db/logical_session_cache_factory_mongod',
         'db/logical_time_metadata_hook',
         'db/matcher/expressions_mongod_only',
+        'db/mirror_maestro',
         'db/mongod_options',
         'db/ops/write_ops_parsers',
         'db/periodic_runner_job_abort_expired_transactions',
         'db/periodic_runner_job_decrease_snapshot_cache_pressure',
         'db/pipeline/aggregation',
-        'db/pipeline/process_interface_factory_mongod',
+        'db/pipeline/process_interface/mongod_process_interface_factory',
         'db/query_exec',
         'db/read_concern_d_impl',
         'db/read_write_concern_defaults',
@@ -473,7 +479,7 @@ mongod = env.Program(
         'util/clock_sources',
         'util/elapsed_tracker',
         'util/fail_point',
-        'util/latch_analyzer',
+        'util/latch_analyzer' if get_option('use-diagnostic-latches') == 'on' else [],
         'util/net/network',
         'util/ntservice',
         'util/options_parser/options_parser_init',
@@ -489,7 +495,9 @@ mongod = env.Program(
         "core",
         "default",
         "dist",
+        "dist-test",
         "servers",
+        "integration-tests",
     ],
 )
 
@@ -552,6 +560,7 @@ mongos = env.Program(
         'db/commands/server_status_core',
         'db/commands/server_status_servers',
         'db/curop',
+        'db/dbdirectclient',
         'db/ftdc/ftdc_mongos',
         'db/initialize_server_security_state',
         'db/logical_session_cache',
@@ -580,7 +589,7 @@ mongos = env.Program(
         'transport/transport_layer_manager',
         'util/clock_sources',
         'util/fail_point',
-        'util/latch_analyzer',
+        'util/latch_analyzer' if get_option('use-diagnostic-latches') == 'on' else [],
         'util/net/ssl_options_server' if get_option('ssl') == 'on' else '',
         'util/ntservice',
         'util/version_impl',
@@ -593,7 +602,9 @@ mongos = env.Program(
     AIB_COMPONENTS_EXTRA=[
         "core",
         "dist",
-        "servers"
+        "dist-test",
+        "servers",
+        "integration-tests",
     ]
 )
 
@@ -689,7 +700,9 @@ if not has_option('noshell') and usemozjs:
         AIB_COMPONENTS_EXTRA=[
             "core",
             "dist",
+            "dist-test",
             "shell",
+            "integration-tests",
         ],
     )
 
@@ -790,7 +803,6 @@ if hygienic:
             distsrc.File('MPL-2'),
         ],
         AIB_COMPONENT='common',
-        AIB_COMPONENTS_EXTRA=['dist'],
         AIB_ROLE='base',
     )
 else:
@@ -817,7 +829,7 @@ if hygienic:
         target='$DESTDIR',
         source=env.get('MODULE_BANNERS', []),
         AIB_COMPONENT='common',
-        AIB_COMPONENTS_EXTRA=['dist'],
+        AIB_COMPONENTS_EXTRA=['dist', 'dist-test'],
         AIB_ROLE='base',
     )
 
@@ -869,8 +881,7 @@ else:
         source=[
             compass_installer,
         ],
-        AIB_COMPONENT='tools',
-        AIB_COMPONENTS_EXTRA=['dist'],
+        AIB_COMPONENT='dist',
         AIB_ROLE='runtime',
     )
 

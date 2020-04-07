@@ -51,8 +51,8 @@
 #include "mongo/db/auth/user_management_commands_parser.h"
 #include "mongo/db/global_settings.h"
 #include "mongo/db/mongod_options.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -284,8 +284,10 @@ Status initializeUserFromPrivilegeDocument(User* user, const BSONObj& privDoc) {
     return Status::OK();
 }
 
-std::unique_ptr<AuthorizationManager> authorizationManagerCreateImpl() {
-    return std::make_unique<AuthorizationManagerImpl>();
+std::unique_ptr<AuthorizationManager> authorizationManagerCreateImpl(
+    ServiceContext* serviceContext) {
+    return std::make_unique<AuthorizationManagerImpl>(serviceContext,
+                                                      AuthzManagerExternalState::create());
 }
 
 auto authorizationManagerCreateRegistration =
@@ -309,17 +311,27 @@ Status AuthorizationManagerPinnedUsersServerParameter::setFromString(const std::
     return authorizationManagerPinnedUsers.setFromString(str);
 }
 
-AuthorizationManagerImpl::AuthorizationManagerImpl()
-    : AuthorizationManagerImpl(AuthzManagerExternalState::create(),
-                               InstallMockForTestingOrAuthImpl{}) {}
-
 AuthorizationManagerImpl::AuthorizationManagerImpl(
-    std::unique_ptr<AuthzManagerExternalState> externalState, InstallMockForTestingOrAuthImpl)
+    ServiceContext* service, std::unique_ptr<AuthzManagerExternalState> externalState)
     : _externalState(std::move(externalState)),
-      _authSchemaVersionCache(_externalState.get()),
-      _userCache(&_authSchemaVersionCache, _externalState.get(), authorizationManagerCacheSize) {}
+      _threadPool([] {
+          ThreadPool::Options options;
+          options.poolName = "AuthorizationManager";
+          options.minThreads = 0;
+          options.maxThreads = ThreadPool::Options::kUnlimited;
 
-AuthorizationManagerImpl::~AuthorizationManagerImpl() {}
+          return options;
+      }()),
+      _authSchemaVersionCache(service, _threadPool, _externalState.get()),
+      _userCache(service,
+                 _threadPool,
+                 authorizationManagerCacheSize,
+                 &_authSchemaVersionCache,
+                 _externalState.get()) {
+    _threadPool.startup();
+}
+
+AuthorizationManagerImpl::~AuthorizationManagerImpl() = default;
 
 std::unique_ptr<AuthorizationSession> AuthorizationManagerImpl::makeAuthorizationSession() {
     return std::make_unique<AuthorizationSessionImpl>(
@@ -344,7 +356,8 @@ Status AuthorizationManagerImpl::getAuthorizationVersion(OperationContext* opCtx
 }
 
 OID AuthorizationManagerImpl::getCacheGeneration() {
-    return _userCache.getCacheGeneration();
+    stdx::lock_guard lg(_cacheGenerationMutex);
+    return _cacheGeneration;
 }
 
 void AuthorizationManagerImpl::setAuthEnabled(bool enabled) {
@@ -413,7 +426,7 @@ StatusWith<UserHandle> AuthorizationManagerImpl::acquireUser(OperationContext* o
     auto cachedUser = _userCache.acquire(opCtx, userName);
     invariant(cachedUser);
 
-    LOG(1) << "Returning user " << userName << " from cache";
+    LOGV2_DEBUG(20226, 1, "Returning user {userName} from cache", "userName"_attr = userName);
     return cachedUser;
 } catch (const DBException& ex) {
     return ex.toStatus();
@@ -442,7 +455,7 @@ void AuthorizationManagerImpl::updatePinnedUsersList(std::vector<UserName> names
     bool noUsersToPin = _usersToPin->empty();
     _pinnedUsersCond.notify_one();
     if (noUsersToPin) {
-        LOG(1) << "There were no users to pin, not starting tracker thread";
+        LOGV2_DEBUG(20227, 1, "There were no users to pin, not starting tracker thread");
         return;
     }
 
@@ -452,11 +465,16 @@ void AuthorizationManagerImpl::updatePinnedUsersList(std::vector<UserName> names
     });
 }
 
+void AuthorizationManagerImpl::_updateCacheGeneration() {
+    stdx::lock_guard lg(_cacheGenerationMutex);
+    _cacheGeneration = OID::gen();
+}
+
 void AuthorizationManagerImpl::_pinnedUsersThreadRoutine() noexcept try {
     Client::initThread("PinnedUsersTracker");
     std::list<UserHandle> pinnedUsers;
     std::vector<UserName> usersToPin;
-    LOG(1) << "Starting pinned users tracking thread";
+    LOGV2_DEBUG(20228, 1, "Starting pinned users tracking thread");
     while (true) {
         auto opCtx = cc().makeOperationContext();
 
@@ -485,13 +503,22 @@ void AuthorizationManagerImpl::_pinnedUsersThreadRoutine() noexcept try {
 
             if (!user.isValid() || !shouldPin) {
                 if (!shouldPin) {
-                    LOG(2) << "Unpinning user " << user->getName();
+                    LOGV2_DEBUG(20229,
+                                2,
+                                "Unpinning user {user_getName}",
+                                "user_getName"_attr = user->getName());
                 } else {
-                    LOG(2) << "Pinned user no longer valid, will re-pin " << user->getName();
+                    LOGV2_DEBUG(20230,
+                                2,
+                                "Pinned user no longer valid, will re-pin {user_getName}",
+                                "user_getName"_attr = user->getName());
                 }
                 it = pinnedUsers.erase(it);
             } else {
-                LOG(3) << "Pinned user is still valid and pinned " << user->getName();
+                LOGV2_DEBUG(20231,
+                            3,
+                            "Pinned user is still valid and pinned {user_getName}",
+                            "user_getName"_attr = user->getName());
                 ++it;
             }
         }
@@ -506,42 +533,47 @@ void AuthorizationManagerImpl::_pinnedUsersThreadRoutine() noexcept try {
             auto swUser = acquireUser(opCtx.get(), userName);
 
             if (swUser.isOK()) {
-                LOG(2) << "Pinned user " << userName;
+                LOGV2_DEBUG(20232, 2, "Pinned user {userName}", "userName"_attr = userName);
                 pinnedUsers.emplace_back(std::move(swUser.getValue()));
             } else {
                 const auto& status = swUser.getStatus();
                 // If the user is not found, then it might just not exist yet. Skip this user for
                 // now.
                 if (status != ErrorCodes::UserNotFound) {
-                    warning() << "Unable to fetch pinned user " << userName.toString() << ": "
-                              << status;
+                    LOGV2_WARNING(20239,
+                                  "Unable to fetch pinned user {userName}: {status}",
+                                  "userName"_attr = userName.toString(),
+                                  "status"_attr = status);
                 } else {
-                    LOG(2) << "Pinned user not found: " << userName;
+                    LOGV2_DEBUG(
+                        20233, 2, "Pinned user not found: {userName}", "userName"_attr = userName);
                 }
             }
         }
     }
 } catch (const ExceptionFor<ErrorCodes::InterruptedAtShutdown>&) {
-    LOG(1) << "Ending pinned users tracking thread";
+    LOGV2_DEBUG(20234, 1, "Ending pinned users tracking thread");
     return;
 }
 
 void AuthorizationManagerImpl::invalidateUserByName(OperationContext* opCtx,
                                                     const UserName& userName) {
-    LOG(2) << "Invalidating user " << userName;
+    LOGV2_DEBUG(20235, 2, "Invalidating user {userName}", "userName"_attr = userName);
+    _updateCacheGeneration();
     _authSchemaVersionCache.invalidateAll();
     _userCache.invalidate(userName);
 }
 
 void AuthorizationManagerImpl::invalidateUsersFromDB(OperationContext* opCtx, StringData dbname) {
-    LOG(2) << "Invalidating all users from database " << dbname;
+    LOGV2_DEBUG(20236, 2, "Invalidating all users from database {dbname}", "dbname"_attr = dbname);
+    _updateCacheGeneration();
     _authSchemaVersionCache.invalidateAll();
-    _userCache.invalidateIf(
-        [&](const UserName& user, const User*) { return user.getDB() == dbname; });
+    _userCache.invalidateIf([&](const UserName& user) { return user.getDB() == dbname; });
 }
 
 void AuthorizationManagerImpl::invalidateUserCache(OperationContext* opCtx) {
-    LOG(2) << "Invalidating user cache";
+    LOGV2_DEBUG(20237, 2, "Invalidating user cache");
+    _updateCacheGeneration();
     _authSchemaVersionCache.invalidateAll();
     _userCache.invalidateAll();
 }
@@ -580,8 +612,11 @@ std::vector<AuthorizationManager::CachedUserInfo> AuthorizationManagerImpl::getU
 }
 
 AuthorizationManagerImpl::AuthSchemaVersionCache::AuthSchemaVersionCache(
+    ServiceContext* service,
+    ThreadPoolInterface& threadPool,
     AuthzManagerExternalState* externalState)
-    : ReadThroughCache(1, _mutex), _externalState(externalState) {}
+    : ReadThroughCache(_mutex, service, threadPool, 1 /* cacheSize */),
+      _externalState(externalState) {}
 
 boost::optional<int> AuthorizationManagerImpl::AuthSchemaVersionCache::lookup(
     OperationContext* opCtx, const int& unusedKey) {
@@ -594,16 +629,18 @@ boost::optional<int> AuthorizationManagerImpl::AuthSchemaVersionCache::lookup(
 }
 
 AuthorizationManagerImpl::UserCacheImpl::UserCacheImpl(
+    ServiceContext* service,
+    ThreadPoolInterface& threadPool,
+    int cacheSize,
     AuthSchemaVersionCache* authSchemaVersionCache,
-    AuthzManagerExternalState* externalState,
-    int cacheSize)
-    : UserCache(cacheSize, _mutex),
+    AuthzManagerExternalState* externalState)
+    : UserCache(_mutex, service, threadPool, cacheSize),
       _authSchemaVersionCache(authSchemaVersionCache),
       _externalState(externalState) {}
 
 boost::optional<User> AuthorizationManagerImpl::UserCacheImpl::lookup(OperationContext* opCtx,
                                                                       const UserName& userName) {
-    LOG(1) << "Getting user " << userName << " from disk";
+    LOGV2_DEBUG(20238, 1, "Getting user {userName} from disk", "userName"_attr = userName);
 
     // Number of times to retry a user document that fetches due to transient AuthSchemaIncompatible
     // errors. These errors should only ever occur during and shortly after schema upgrades.

@@ -39,7 +39,6 @@
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_global_options.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -108,12 +107,18 @@ TEST_F(ValidateStateTest, NonExistentCollectionShouldThrowNamespaceNotFoundError
     auto opCtx = operationContext();
 
     ASSERT_THROWS_CODE(CollectionValidation::ValidateState(
-                           opCtx, kNss, /*background*/ false, /*fullValidate*/ false),
+                           opCtx,
+                           kNss,
+                           /*background*/ false,
+                           CollectionValidation::ValidateOptions::kNoFullValidation),
                        AssertionException,
                        ErrorCodes::NamespaceNotFound);
 
     ASSERT_THROWS_CODE(CollectionValidation::ValidateState(
-                           opCtx, kNss, /*background*/ true, /*fullValidate*/ false),
+                           opCtx,
+                           kNss,
+                           /*background*/ true,
+                           CollectionValidation::ValidateOptions::kNoFullValidation),
                        AssertionException,
                        ErrorCodes::NamespaceNotFound);
 }
@@ -125,14 +130,14 @@ TEST_F(ValidateStateTest, UncheckpointedCollectionShouldThrowCursorNotFoundError
     // Disable periodic checkpoint'ing thread so we can control when checkpoints occur.
     FailPointEnableBlock failPoint("pauseCheckpointThread");
 
-    // Make sure there is a checkpoint.
-    opCtx->recoveryUnit()->waitUntilUnjournaledWritesDurable(opCtx);  // provokes a checkpoint.
+    // Checkpoint of all of the data.
+    opCtx->recoveryUnit()->waitUntilUnjournaledWritesDurable(opCtx, /*stableCheckpoint*/ false);
 
     // Create the collection, which will not be in the checkpoint, and check that a CursorNotFound
     // error is thrown when attempting to open cursors.
     createCollectionAndPopulateIt(opCtx, kNss);
     CollectionValidation::ValidateState validateState(
-        opCtx, kNss, /*background*/ true, /*fullValidate*/ false);
+        opCtx, kNss, /*background*/ true, CollectionValidation::ValidateOptions::kNoFullValidation);
     ASSERT_THROWS_CODE(
         validateState.initializeCursors(opCtx), AssertionException, ErrorCodes::CursorNotFound);
 }
@@ -154,7 +159,10 @@ TEST_F(ValidateStateTest, OpenCursorsOnAllIndexes) {
     {
         // Open the cursors.
         CollectionValidation::ValidateState validateState(
-            opCtx, kNss, /*background*/ false, /*fullValidate*/ false);
+            opCtx,
+            kNss,
+            /*background*/ false,
+            CollectionValidation::ValidateOptions::kNoFullValidation);
         validateState.initializeCursors(opCtx);
 
         // Make sure all of the indexes were found and cursors opened against them. Including the
@@ -162,14 +170,17 @@ TEST_F(ValidateStateTest, OpenCursorsOnAllIndexes) {
         ASSERT_EQ(validateState.getIndexes().size(), 5);
     }
 
-    // Force a checkpoint: it should not make any difference for foreground validation that does not
-    // use checkpoint cursors.
+    // Checkpoint of all of the data: it should not make any difference for foreground validation
+    // that does not use checkpoint cursors.
     // Note: no locks can be held for a waitUntilDurable*() call.
-    opCtx->recoveryUnit()->waitUntilUnjournaledWritesDurable(opCtx);  // provokes a checkpoint.
+    opCtx->recoveryUnit()->waitUntilUnjournaledWritesDurable(opCtx, /*stableCheckpoint*/ false);
 
     // Check that foreground validation behaves just the same with checkpoint'ed data.
     CollectionValidation::ValidateState validateState(
-        opCtx, kNss, /*background*/ false, /*fullValidate*/ false);
+        opCtx,
+        kNss,
+        /*background*/ false,
+        CollectionValidation::ValidateOptions::kNoFullValidation);
     validateState.initializeCursors(opCtx);
     ASSERT_EQ(validateState.getIndexes().size(), 5);
 }
@@ -185,7 +196,7 @@ TEST_F(ValidateStateTest, OpenCursorsOnCheckpointedIndexes) {
     // Create two indexes and checkpoint them.
     createIndex(opCtx, kNss, BSON("a" << 1));
     createIndex(opCtx, kNss, BSON("b" << 1));
-    opCtx->recoveryUnit()->waitUntilUnjournaledWritesDurable(opCtx);  // provokes a checkpoint.
+    opCtx->recoveryUnit()->waitUntilUnjournaledWritesDurable(opCtx, /*stableCheckpoint*/ false);
 
     // Create two more indexes that are not checkpoint'ed.
     createIndex(opCtx, kNss, BSON("c" << 1));
@@ -193,7 +204,7 @@ TEST_F(ValidateStateTest, OpenCursorsOnCheckpointedIndexes) {
 
     // Open the cursors.
     CollectionValidation::ValidateState validateState(
-        opCtx, kNss, /*background*/ true, /*fullValidate*/ false);
+        opCtx, kNss, /*background*/ true, CollectionValidation::ValidateOptions::kNoFullValidation);
     validateState.initializeCursors(opCtx);
 
     // Make sure the uncheckpoint'ed indexes are not found.
@@ -216,7 +227,7 @@ TEST_F(ValidateStateTest, OpenCursorsOnConsistentlyCheckpointedIndexes) {
     createIndex(opCtx, kNss, BSON("d" << 1));
 
     // Checkpoint the indexes.
-    opCtx->recoveryUnit()->waitUntilUnjournaledWritesDurable(opCtx);  // provokes a checkpoint.
+    opCtx->recoveryUnit()->waitUntilUnjournaledWritesDurable(opCtx, /*stableCheckpoint*/ false);
 
     {
         // Artificially set two indexes as inconsistent with the checkpoint.
@@ -238,7 +249,7 @@ TEST_F(ValidateStateTest, OpenCursorsOnConsistentlyCheckpointedIndexes) {
     // The two inconsistent indexes should not be found.
     // (Note the _id index was create with collection creation, so we have 3 indexes.)
     CollectionValidation::ValidateState validateState(
-        opCtx, kNss, /*background*/ true, /*fullValidate*/ false);
+        opCtx, kNss, /*background*/ true, CollectionValidation::ValidateOptions::kNoFullValidation);
     validateState.initializeCursors(opCtx);
     ASSERT_EQ(validateState.getIndexes().size(), 3);
 }
@@ -259,7 +270,7 @@ TEST_F(ValidateStateTest, CursorsAreNotOpenedAgainstCheckpointedIndexesThatWereL
     createIndex(opCtx, kNss, BSON("d" << 1));
 
     // Checkpoint the indexes.
-    opCtx->recoveryUnit()->waitUntilUnjournaledWritesDurable(opCtx);  // provokes a checkpoint.
+    opCtx->recoveryUnit()->waitUntilUnjournaledWritesDurable(opCtx, /*stableCheckpoint*/ false);
 
     // Drop two indexes without checkpoint'ing the drops.
     dropIndex(opCtx, kNss, "a_1");
@@ -269,17 +280,20 @@ TEST_F(ValidateStateTest, CursorsAreNotOpenedAgainstCheckpointedIndexesThatWereL
     // (Note the _id index was create with collection creation, so we have 3 indexes.)
     {
         CollectionValidation::ValidateState validateState(
-            opCtx, kNss, /*background*/ true, /*fullValidate*/ false);
+            opCtx,
+            kNss,
+            /*background*/ true,
+            CollectionValidation::ValidateOptions::kNoFullValidation);
         validateState.initializeCursors(opCtx);
         ASSERT_EQ(validateState.getIndexes().size(), 3);
     }
 
     // Checkpoint the index drops and recheck that the indexes are not found.
     // Note: no locks can be held for a waitUntilDurable*() call.
-    opCtx->recoveryUnit()->waitUntilUnjournaledWritesDurable(opCtx);  // provokes a checkpoint.
+    opCtx->recoveryUnit()->waitUntilUnjournaledWritesDurable(opCtx, /*stableCheckpoint*/ false);
 
     CollectionValidation::ValidateState validateState(
-        opCtx, kNss, /*background*/ true, /*fullValidate*/ false);
+        opCtx, kNss, /*background*/ true, CollectionValidation::ValidateOptions::kNoFullValidation);
     validateState.initializeCursors(opCtx);
     ASSERT_EQ(validateState.getIndexes().size(), 3);
 }

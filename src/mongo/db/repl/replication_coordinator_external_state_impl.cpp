@@ -81,6 +81,8 @@
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/migration_util.h"
 #include "mongo/db/s/periodic_balancer_config_refresher.h"
+#include "mongo/db/s/periodic_sharded_index_consistency_checker.h"
+#include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/db/s/sharding_initialization_mongod.h"
 #include "mongo/db/s/sharding_state_recovery.h"
 #include "mongo/db/s/transaction_coordinator_service.h"
@@ -93,6 +95,7 @@
 #include "mongo/executor/network_interface.h"
 #include "mongo/executor/network_interface_factory.h"
 #include "mongo/executor/thread_pool_task_executor.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/metadata/egress_metadata_hook_list.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog_cache_loader.h"
@@ -105,12 +108,10 @@
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
 #include "mongo/util/time_support.h"
-#include "mongo/util/tla_plus_trace.h"
 
 namespace mongo {
 namespace repl {
@@ -238,13 +239,13 @@ void ReplicationCoordinatorExternalStateImpl::startSteadyStateReplication(
     _bgSync =
         std::make_unique<BackgroundSync>(replCoord, this, _replicationProcess, _oplogApplier.get());
 
-    log() << "Starting replication fetcher thread";
+    LOGV2(21299, "Starting replication fetcher thread");
     _bgSync->startup(opCtx);
 
-    log() << "Starting replication applier thread";
+    LOGV2(21300, "Starting replication applier thread");
     _oplogApplierShutdownFuture = _oplogApplier->startup();
 
-    log() << "Starting replication reporter thread";
+    LOGV2(21301, "Starting replication reporter thread");
     invariant(!_syncSourceFeedbackThread);
     // Get the pointer while holding the lock so that _stopDataReplication_inlock() won't
     // leave the unique pointer empty if the _syncSourceFeedbackThread's function starts
@@ -275,18 +276,18 @@ void ReplicationCoordinatorExternalStateImpl::_stopDataReplication_inlock(
     // _syncSourceFeedbackThread should be joined before _bgSync's shutdown because it has
     // a pointer of _bgSync.
     if (oldSSF) {
-        log() << "Stopping replication reporter thread";
+        LOGV2(21302, "Stopping replication reporter thread");
         _syncSourceFeedback.shutdown();
         oldSSF->join();
     }
 
     if (oldBgSync) {
-        log() << "Stopping replication fetcher thread";
+        LOGV2(21303, "Stopping replication fetcher thread");
         oldBgSync->shutdown(opCtx);
     }
 
     if (oldApplier) {
-        log() << "Stopping replication applier thread";
+        LOGV2(21304, "Stopping replication applier thread");
         oldApplier->shutdown();
     }
 
@@ -321,11 +322,12 @@ void ReplicationCoordinatorExternalStateImpl::startThreads(const ReplSettings& s
         return;
     }
     if (_inShutdown) {
-        log() << "Not starting replication storage threads because replication is shutting down.";
+        LOGV2(21305,
+              "Not starting replication storage threads because replication is shutting down.");
         return;
     }
 
-    log() << "Starting replication storage threads";
+    LOGV2(21306, "Starting replication storage threads");
     _service->getStorageEngine()->setJournalListener(this);
 
     _oplogApplierTaskExecutor =
@@ -383,7 +385,7 @@ void ReplicationCoordinatorExternalStateImpl::shutdown(OperationContext* opCtx) 
 
     _stopDataReplication_inlock(opCtx, lk);
 
-    log() << "Stopping replication storage threads";
+    LOGV2(21307, "Stopping replication storage threads");
     _taskExecutor->shutdown();
     _oplogApplierTaskExecutor->shutdown();
 
@@ -396,7 +398,7 @@ void ReplicationCoordinatorExternalStateImpl::shutdown(OperationContext* opCtx) 
     // itself can block on the ReplicationCoordinator mutex. It is safe to access _noopWriter
     // outside of _threadMutex because _noopWriter is protected by its own mutex.
     invariant(_noopWriter);
-    LOG(1) << "Stopping noop writer";
+    LOGV2_DEBUG(21308, 1, "Stopping noop writer");
     _noopWriter->stopWritingPeriodicNoops();
 
     // We must wait for _taskExecutor outside of _threadMutex, since _taskExecutor is used to run
@@ -404,6 +406,17 @@ void ReplicationCoordinatorExternalStateImpl::shutdown(OperationContext* opCtx) 
     // _taskExecutor outside of _threadMutex because once _startedThreads is set to true, the
     // _taskExecutor pointer never changes.
     _taskExecutor->join();
+
+    // Clear the truncate point if we are still primary, so nothing gets truncated unnecessarily on
+    // startup. There are no oplog holes on clean primary shutdown. Stepdown is similarly safe and
+    // clears the truncate point. The other replication states do need truncation if the truncate
+    // point is set: e.g. interruption mid batch application can leave oplog holes.
+    if (!storageGlobalParams.readOnly &&
+        _replicationProcess->getConsistencyMarkers()
+            ->isOplogTruncateAfterPointBeingUsedForPrimary()) {
+        _replicationProcess->getConsistencyMarkers()->setOplogTruncateAfterPoint(opCtx,
+                                                                                 Timestamp());
+    }
 }
 
 executor::TaskExecutor* ReplicationCoordinatorExternalStateImpl::getTaskExecutor() const {
@@ -450,6 +463,10 @@ void ReplicationCoordinatorExternalStateImpl::onDrainComplete(OperationContext* 
     invariant(!opCtx->lockState()->isLocked());
     invariant(!opCtx->shouldParticipateInFlowControl());
 
+    if (_oplogBuffer) {
+        _oplogBuffer->exitDrainMode();
+    }
+
     // If this is a config server node becoming a primary, ensure the balancer is ready to start.
     if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
         // We must ensure the balancer has stopped because it may still be in the process of
@@ -464,13 +481,30 @@ OpTime ReplicationCoordinatorExternalStateImpl::onTransitionToPrimary(OperationC
 
     MongoDSessionCatalog::onStepUp(opCtx);
 
+    invariant(
+        _replicationProcess->getConsistencyMarkers()->getOplogTruncateAfterPoint(opCtx).isNull());
+
+    // A primary periodically updates the oplogTruncateAfterPoint to allow replication to proceed
+    // without danger of unidentifiable oplog holes on unclean shutdown due to parallel writes.
+    //
+    // Initialize the oplogTruncateAfterPoint so that user writes are safe on unclean shutdown
+    // between completion of transition to primary and the first async oplogTruncateAfterPoint
+    // update.
+    _replicationProcess->getConsistencyMarkers()->setOplogTruncateAfterPointToTopOfOplog(opCtx);
+
+    // Tell the system to start updating the oplogTruncateAfterPoint asynchronously and to use the
+    // truncate point, rather than last applied, to update the repl durable timestamp.
+    //
+    // The truncate point must be used while primary for repl's durable timestamp because otherwise
+    // we could truncate last applied writes on startup recovery after an unclean shutdown that were
+    // previously majority confirmed to the user.
+    _replicationProcess->getConsistencyMarkers()->startUsingOplogTruncateAfterPointForPrimary();
+
     // Clear the appliedThrough marker so on startup we'll use the top of the oplog. This must be
     // done before we add anything to our oplog.
     // We record this update at the 'lastAppliedOpTime'. If there are any outstanding
     // checkpoints being taken, they should only reflect this write if they see all writes up
     // to our 'lastAppliedOpTime'.
-    invariant(
-        _replicationProcess->getConsistencyMarkers()->getOplogTruncateAfterPoint(opCtx).isNull());
     auto lastAppliedOpTime = repl::ReplicationCoordinator::get(opCtx)->getMyLastAppliedOpTime();
     _replicationProcess->getConsistencyMarkers()->clearAppliedThrough(
         opCtx, lastAppliedOpTime.getTimestamp());
@@ -548,6 +582,9 @@ Status ReplicationCoordinatorExternalStateImpl::storeLocalConfigDocument(Operati
             Lock::DBLock dbWriteLock(opCtx, configDatabaseName, MODE_X);
             Helpers::putSingleton(opCtx, configCollectionName, config);
         });
+
+        // Wait for durability of the new config document.
+        opCtx->recoveryUnit()->waitUntilDurable(opCtx);
 
         return Status::OK();
     } catch (const DBException& ex) {
@@ -709,10 +746,11 @@ void ReplicationCoordinatorExternalStateImpl::closeConnections() {
 void ReplicationCoordinatorExternalStateImpl::shardingOnStepDownHook() {
     if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
         Balancer::get(_service)->interruptBalancer();
+        PeriodicShardedIndexConsistencyChecker::get(_service).onStepDown();
         TransactionCoordinatorService::get(_service)->onStepDown();
     } else if (ShardingState::get(_service)->enabled()) {
         ChunkSplitter::get(_service).onStepDown();
-        CatalogCacheLoader::get(_service).onStepDown();
+        getCatalogCacheLoaderForFiltering(_service).onStepDown();
         PeriodicBalancerConfigRefresher::get(_service).onStepDown();
         TransactionCoordinatorService::get(_service)->onStepDown();
     }
@@ -739,13 +777,29 @@ void ReplicationCoordinatorExternalStateImpl::clearOplogVisibilityStateForStepDo
     ON_BLOCK_EXIT([&] { opCtx->setShouldParticipateInFlowControl(originalFlowControlSetting); });
     opCtx->setShouldParticipateInFlowControl(false);
 
-    // We can clear the oplogTruncateAfterPoint because we know there are no concurrent user writes
-    // during stepdown and therefore presently no oplog holes.
+    // Tell the system to stop updating the oplogTruncateAfterPoint asynchronously and to go back to
+    // using last applied to update repl's durable timestamp instead of the truncate point.
+    _replicationProcess->getConsistencyMarkers()->stopUsingOplogTruncateAfterPointForPrimary();
+
+    // Interrupt the current JournalFlusher thread round, so it recognizes that it is no longer
+    // primary. Otherwise the asynchronously running thread could race with setting the truncate
+    // point to null below. This would leave the truncate point potentially stale in a non-PRIMARY
+    // state, where last applied would be used to update repl's durable timestamp and confirm
+    // majority writes. Startup recovery could truncate majority confirmed writes back to the stale
+    // truncate after point.
     //
-    // This value is updated periodically while in PRIMARY mode to protect against oplog holes on
-    // unclean shutdown. The value must then be cleared on stepdown because stepup expects the value
-    // to be unset. Batch application, in mode SECONDARY, also uses the value to protect against
-    // unclean shutdown, and will handle both setting AND unsetting the value.
+    // This makes sure the JournalFlusher is not stuck waiting for a lock that stepdown might hold
+    // before doing an update write to the truncate point.
+    _service->getStorageEngine()->interruptJournalFlusherForReplStateChange();
+
+    // Wait for another round of journal flushing. This will ensure that we wait for the current
+    // round to completely finish and have no chance of racing with unsetting the truncate point
+    // below. It is possible that the JournalFlusher will not check for the interrupt signaled
+    // above, if writing is imminent, so we must make sure that the code completes fully.
+    _service->getStorageEngine()->waitForJournalFlush(opCtx);
+
+    // We can clear the oplogTruncateAfterPoint because we know there are no user writes during
+    // stepdown and therefore presently no oplog holes.
     _replicationProcess->getConsistencyMarkers()->setOplogTruncateAfterPoint(opCtx, Timestamp());
 }
 
@@ -796,6 +850,7 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook
             validator->enableKeyGenerator(opCtx, true);
         }
 
+        PeriodicShardedIndexConsistencyChecker::get(_service).onStepUp(_service);
         TransactionCoordinatorService::get(_service)->onStepUp(opCtx);
     } else if (ShardingState::get(opCtx)->enabled()) {
         Status status = ShardingStateRecovery::recover(opCtx);
@@ -814,7 +869,7 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook
         ShardingInitializationMongoD::get(opCtx)->updateShardIdentityConfigString(opCtx,
                                                                                   configsvrConnStr);
 
-        CatalogCacheLoader::get(_service).onStepUp();
+        getCatalogCacheLoaderForFiltering(_service).onStepUp();
         ChunkSplitter::get(_service).onStepUp();
         PeriodicBalancerConfigRefresher::get(_service).onStepUp(_service);
         TransactionCoordinatorService::get(_service)->onStepUp(opCtx);
@@ -844,10 +899,16 @@ void ReplicationCoordinatorExternalStateImpl::stopProducer() {
     if (_bgSync) {
         _bgSync->stop(false);
     }
+    if (_oplogBuffer) {
+        _oplogBuffer->enterDrainMode();
+    }
 }
 
 void ReplicationCoordinatorExternalStateImpl::startProducerIfStopped() {
     stdx::lock_guard<Latch> lk(_threadMutex);
+    if (_oplogBuffer) {
+        _oplogBuffer->exitDrainMode();
+    }
     if (_bgSync) {
         _bgSync->startProducerIfStopped();
     }
@@ -875,7 +936,7 @@ void ReplicationCoordinatorExternalStateImpl::_dropAllTempCollections(OperationC
         // replica set members.
         if (*it == "local")
             continue;
-        LOG(2) << "Removing temporary collections from " << *it;
+        LOGV2_DEBUG(21309, 2, "Removing temporary collections from {db}", "db"_attr = *it);
         AutoGetDb autoDb(opCtx, *it, MODE_IX);
         invariant(autoDb.getDb(), str::stream() << "Unable to get reference to database " << *it);
         autoDb.getDb()->clearTmpCollections(opCtx);
@@ -920,10 +981,11 @@ void ReplicationCoordinatorExternalStateImpl::notifyOplogMetadataWaiters(
                 _taskExecutor.get(),
                 [committedOpTime, reaper](const executor::TaskExecutor::CallbackArgs& args) {
                     if (MONGO_unlikely(dropPendingCollectionReaperHang.shouldFail())) {
-                        log() << "fail point dropPendingCollectionReaperHang enabled. "
-                                 "Blocking until fail point is disabled. "
-                                 "committedOpTime: "
-                              << committedOpTime;
+                        LOGV2(21310,
+                              "fail point dropPendingCollectionReaperHang enabled. "
+                              "Blocking until fail point is disabled. "
+                              "committedOpTime: {committedOpTime}",
+                              "committedOpTime"_attr = committedOpTime);
                         dropPendingCollectionReaperHang.pauseWhileSet();
                     }
                     auto opCtx = cc().makeOperationContext();
@@ -970,7 +1032,17 @@ std::size_t ReplicationCoordinatorExternalStateImpl::getOplogFetcherInitialSyncM
     return oplogFetcherInitialSyncMaxFetcherRestarts.load();
 }
 
-JournalListener::Token ReplicationCoordinatorExternalStateImpl::getToken() {
+JournalListener::Token ReplicationCoordinatorExternalStateImpl::getToken(OperationContext* opCtx) {
+    // If in state PRIMARY, the oplogTruncateAfterPoint must be used for the Durable timestamp in
+    // order to avoid majority confirming any writes that could later be truncated.
+    auto truncatePoint = repl::ReplicationProcess::get(opCtx)
+                             ->getConsistencyMarkers()
+                             ->refreshOplogTruncateAfterPointIfPrimary(opCtx);
+    if (truncatePoint) {
+        return truncatePoint.get();
+    }
+
+    // All other repl states use the last applied.
     return repl::ReplicationCoordinator::get(_service)->getMyLastAppliedOpTimeAndWallTime();
 }
 

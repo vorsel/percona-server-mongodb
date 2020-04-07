@@ -427,6 +427,25 @@ public:
                                       const ReplSetTagPattern& tagPattern,
                                       bool durablyWritten);
 
+    using MemberPredicate = std::function<bool(const MemberData&)>;
+
+    /**
+     * Return the predicate that tests if a member has reached the target OpTime.
+     */
+    MemberPredicate makeOpTimePredicate(const OpTime& opTime, bool durablyWritten);
+
+    /**
+     * Return the predicate that tests if a member has replicated the given config.
+     */
+    MemberPredicate makeConfigPredicate();
+
+    /**
+     * Returns whether or not at least one node matching the tagPattern has satisfied the given
+     * condition.
+     */
+    bool haveTaggedNodesSatisfiedCondition(MemberPredicate pred,
+                                           const ReplSetTagPattern& tagPattern);
+
     /**
      * Returns a vector of members that have applied the operation with OpTime 'op'.
      * "durablyWritten" indicates whether the operation has to be durably applied.
@@ -517,6 +536,12 @@ public:
      * Returns the latest optime committed in the previous config.
      */
     OpTime getLastCommittedInPrevConfig();
+
+    /**
+     * Returns an optime that must become majority committed in the current config before it is safe
+     * for a primary to move to a new config.
+     */
+    OpTime getConfigOplogCommitmentOpTime();
 
     /**
      * Sets lastVote to be for ourself in this term.
@@ -718,6 +743,11 @@ public:
     bool checkIfCommitQuorumCanBeSatisfied(const CommitQuorumOptions& commitQuorum,
                                            const std::vector<MemberConfig>& members) const;
 
+    /**
+     * Returns nullptr if there is no primary, or the MemberConfig* for the current primary.
+     */
+    const MemberConfig* getCurrentPrimaryMember() const;
+
     ////////////////////////////////////////////////////////////
     //
     // Test support methods
@@ -736,6 +766,12 @@ public:
     // set the current primary.
     void setCurrentPrimary_forTest(int primaryIndex,
                                    const Timestamp& electionTime = Timestamp(0, 0));
+
+    /**
+     * Change config (version, term) of each member in the initial test config so that
+     * it will be majority replicated without having to mock heartbeats.
+     */
+    void populateAllMembersConfigVersionAndTerm_forTest();
 
     // Returns _electionTime.  Only used in unittests.
     Timestamp getElectionTime() const;
@@ -850,9 +886,6 @@ private:
      * nullptr if memberId is not found in the configuration.
      */
     MemberData* _findMemberDataByMemberId(const int memberId);
-
-    // Returns NULL if there is no primary, or the MemberConfig* for the current primary
-    const MemberConfig* _currentPrimaryMember() const;
 
     /**
      * Performs updating "_currentPrimaryIndex" for processHeartbeatResponse(), and determines if an

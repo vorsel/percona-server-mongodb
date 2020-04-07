@@ -170,6 +170,7 @@ selector:
 
   # Uses getMore in the same state function as a command not supported in a transaction.
   - jstests/concurrency/fsm_workloads/list_indexes.js
+  - jstests/concurrency/fsm_workloads/agg_union_with_chunk_migrations.js
 
   # Uses non-retryable commands in the same state function as a command not supported in a
   # transaction.
@@ -184,6 +185,7 @@ selector:
   - jstests/concurrency/fsm_workloads/random_moveChunk_refine_collection_shard_key.js
   - jstests/concurrency/fsm_workloads/random_moveChunk_refine_collection_shard_key_broadcast_delete_transaction.js
   - jstests/concurrency/fsm_workloads/random_moveChunk_refine_collection_shard_key_broadcast_update_transaction.js
+  - jstests/concurrency/fsm_workloads/random_moveChunk_index_operations.js
 
   # JS engine interruptions on mongos return ErrorCodes::Interrupted, which isn't
   # considered a retryable or transient transaction error.
@@ -235,6 +237,7 @@ executor:
     wait_for_mongos_retarget: true
   - class: CheckReplDBHash
   - class: ValidateCollections
+  - class: CheckOrphansDeleted
   - class: CleanupConcurrencyWorkloads
   fixture:
     class: ShardedClusterFixture

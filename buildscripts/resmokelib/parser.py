@@ -47,6 +47,11 @@ def _make_parser():  # pylint: disable=too-many-statements
                       help="Directory to search for MongoDB binaries")
 
     parser.add_option(
+        "--alwaysUseLogFiles", dest="always_use_log_files", action="store_true",
+        help=("Logs server output to a file located in the db path and prevents the"
+              " cleaning of dbpaths after testing. Note that conflicting options"
+              " passed in from test files may cause an error."))
+    parser.add_option(
         "--archiveFile", dest="archive_file", metavar="ARCHIVE_FILE",
         help=("Sets the archive file name for the Evergreen task running the tests."
               " The archive file is JSON format containing a list of tests that were"
@@ -137,9 +142,6 @@ def _make_parser():  # pylint: disable=too-many-statements
         help=("Passes one or more --setParameter options to all mongod processes"
               " started by resmoke.py. The argument is specified as bracketed YAML -"
               " i.e. JSON with support for single quoted and unquoted keys."))
-
-    parser.add_option("--logFormat", dest="log_format",
-                      help="The log format used by mongo executables.")
 
     parser.add_option("--mongos", dest="mongos_executable", metavar="PATH",
                       help="The path to the mongos executable for resmoke.py to use.")
@@ -569,6 +571,15 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements,too-many
 
     config = _config.DEFAULTS.copy()
 
+    # Use RSK_ prefixed environment variables to indicate resmoke-specific values.
+    # The list of configuration is detailed in config.py
+    resmoke_env_prefix = 'RSK_'
+    for key in os.environ.keys():
+        if key.startswith(resmoke_env_prefix):
+            # Windows env vars are case-insensitive, we use lowercase to be consistent
+            # with existing resmoke options.
+            config[key[len(resmoke_env_prefix):].lower()] = os.environ[key]
+
     # Override `config` with values from command line arguments.
     cmdline_vars = vars(values)
     for cmdline_key in cmdline_vars:
@@ -585,9 +596,11 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements,too-many
             user_config = dict(config_parser["resmoke"])
             config.update(user_config)
 
+    _config.ALWAYS_USE_LOG_FILES = config.pop("always_use_log_files")
     _config.ARCHIVE_FILE = config.pop("archive_file")
     _config.ARCHIVE_LIMIT_MB = config.pop("archive_limit_mb")
     _config.ARCHIVE_LIMIT_TESTS = config.pop("archive_limit_tests")
+    _config.IS_ASAN_BUILD = config.pop("is_asan_build")
     _config.BASE_PORT = int(config.pop("base_port"))
     _config.BUILDLOGGER_URL = config.pop("buildlogger_url")
     _config.DBPATH_PREFIX = _expand_user(config.pop("dbpath_prefix"))
@@ -603,7 +616,6 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements,too-many
     _config.GENNY_EXECUTABLE = _expand_user(config.pop("genny_executable"))
     _config.JOBS = config.pop("jobs")
     _config.LINEAR_CHAIN = config.pop("linear_chain") == "on"
-    _config.LOG_FORMAT = config.pop("log_format")
     _config.MAJORITY_READ_CONCERN = config.pop("majority_read_concern") == "on"
     _config.MIXED_BIN_VERSIONS = config.pop("mixed_bin_versions")
     if _config.MIXED_BIN_VERSIONS is not None:
@@ -611,9 +623,10 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements,too-many
 
     _config.INSTALL_DIR = config.pop("install_dir")
     if _config.INSTALL_DIR is not None:
-        # Inject INSTALL_DIR into the $PATH so RunProgram in the shell
-        # helpers can find the installed binaries.
-        os.environ['PATH'] = "{}:{}".format(_expand_user(_config.INSTALL_DIR), os.environ['PATH'])
+        # Normalize the path so that on Windows dist-test/bin
+        # translates to .\dist-test\bin then absolutify it since the
+        # Windows PATH variable requires absolute paths.
+        _config.INSTALL_DIR = os.path.abspath(_expand_user(os.path.normpath(_config.INSTALL_DIR)))
 
         for binary in ["mongo", "mongod", "mongos", "dbtest"]:
             keyname = binary + "_executable"

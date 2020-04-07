@@ -39,6 +39,7 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/timestamp.h"
+#include "mongo/client/fetcher.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/callback_completion_guard.h"
 #include "mongo/db/repl/data_replicator_external_state.h"
@@ -152,6 +153,23 @@ public:
      */
     using CreateClientFn = std::function<std::unique_ptr<DBClientConnection>()>;
 
+    /**
+     * Type of function to create an OplogFetcher.
+     */
+    using CreateOplogFetcherFn = std::function<std::unique_ptr<OplogFetcher>(
+        executor::TaskExecutor* executor,
+        OpTime lastFetched,
+        HostAndPort source,
+        ReplSetConfig config,
+        std::unique_ptr<OplogFetcher::OplogFetcherRestartDecision> oplogFetcherRestartDecision,
+        int requiredRBID,
+        bool requireFresherSyncSource,
+        DataReplicatorExternalState* dataReplicatorExternalState,
+        OplogFetcher::EnqueueDocumentsFn enqueueDocumentsFn,
+        OplogFetcher::OnShutdownCallbackFn onShutdownCallbackFn,
+        const int batchSize,
+        OplogFetcher::StartingPoint startingPoint)>;
+
     struct InitialSyncAttemptInfo {
         int durationMillis;
         Status status;
@@ -166,22 +184,22 @@ public:
     };
 
     class OplogFetcherRestartDecisionInitialSyncer
-        : public AbstractOplogFetcher::OplogFetcherRestartDecision {
+        : public OplogFetcher::OplogFetcherRestartDecision {
 
     public:
         OplogFetcherRestartDecisionInitialSyncer(InitialSyncSharedData* sharedData,
                                                  std::size_t maxFetcherRestarts)
             : _sharedData(sharedData), _defaultDecision(maxFetcherRestarts){};
 
-        bool shouldContinue(AbstractOplogFetcher* fetcher, Status status) final;
+        bool shouldContinue(OplogFetcher* fetcher, Status status) final;
 
-        void fetchSuccessful(AbstractOplogFetcher* fetcher) final;
+        void fetchSuccessful(OplogFetcher* fetcher) final;
 
     private:
         InitialSyncSharedData* _sharedData;
 
         // We delegate to the default strategy when it's a non-network error.
-        AbstractOplogFetcher::OplogFetcherRestartDecisionDefault _defaultDecision;
+        OplogFetcher::OplogFetcherRestartDecisionDefault _defaultDecision;
 
         // The operation, if any, currently being retried because of a network error.
         InitialSyncSharedData::RetryableOperation _retryingOperation;
@@ -246,6 +264,24 @@ public:
      * For testing only
      */
     void setCreateClientFn_forTest(const CreateClientFn& createClientFn);
+
+    /**
+     *
+     * Overrides how the initial syncer creates the OplogFetcher.
+     *
+     * For testing only.
+     */
+    void setCreateOplogFetcherFn_forTest(const CreateOplogFetcherFn& createOplogFetcherFn);
+
+    /**
+     *
+     * Get a raw pointer to the OplogFetcher. Block up to 10s until the underlying OplogFetcher has
+     * started. It is the caller's responsibility to not reuse this pointer beyond the lifetime of
+     * the underlying OplogFetcher.
+     *
+     * For testing only.
+     */
+    OplogFetcher* getOplogFetcher_forTest() const;
 
     /**
      *
@@ -556,8 +592,8 @@ private:
      * Returns a status even though it always returns OK, to conform the interface OplogFetcher
      * expects for the EnqueueDocumentsFn.
      */
-    Status _enqueueDocuments(Fetcher::Documents::const_iterator begin,
-                             Fetcher::Documents::const_iterator end,
+    Status _enqueueDocuments(OplogFetcher::Documents::const_iterator begin,
+                             OplogFetcher::Documents::const_iterator end,
                              const OplogFetcher::DocumentsInfo& info);
 
     void _appendInitialSyncProgressMinimal_inlock(BSONObjBuilder* bob) const;
@@ -729,6 +765,9 @@ private:
 
     // Used to create the DBClientConnection for the cloners
     CreateClientFn _createClientFn;
+
+    // Used to create the OplogFetcher for the InitialSyncer.
+    CreateOplogFetcherFn _createOplogFetcherFn;
 
     // Contains stats on the current initial sync request (includes all attempts).
     // To access these stats in a user-readable format, use getInitialSyncProgress().

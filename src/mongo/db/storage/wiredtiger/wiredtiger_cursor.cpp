@@ -35,7 +35,7 @@
 
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 
@@ -81,7 +81,7 @@ WiredTigerCursor::WiredTigerCursor(const std::string& uri,
         // A WiredTiger table will not be available in the latest checkpoint if the checkpoint
         // thread hasn't ran after the initial WiredTiger table was created.
         if (!_isCheckpoint) {
-            error() << ex;
+            LOGV2_ERROR(23719, "{ex}", "ex"_attr = ex);
             fassertFailedNoTrace(50883);
         }
         throw;

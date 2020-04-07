@@ -43,7 +43,6 @@
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/clear_jumbo_flag_gen.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -94,8 +93,9 @@ public:
             boost::optional<Chunk> chunk;
 
             if (request().getFind()) {
-                BSONObj shardKey = uassertStatusOK(
-                    cm->getShardKeyPattern().extractShardKeyFromQuery(opCtx, *request().getFind()));
+                BSONObj shardKey =
+                    uassertStatusOK(cm->getShardKeyPattern().extractShardKeyFromQuery(
+                        opCtx, ns(), *request().getFind()));
                 uassert(51260,
                         str::stream()
                             << "no shard key found in chunk query " << *request().getFind(),

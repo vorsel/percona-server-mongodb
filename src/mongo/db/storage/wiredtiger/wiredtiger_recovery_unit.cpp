@@ -40,8 +40,8 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_prepare_conflict.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/hex.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -52,7 +52,7 @@ namespace {
 // because the recovery unit may not ever actually be in a prepared state.
 MONGO_FAIL_POINT_DEFINE(WTAlwaysNotifyPrepareConflictWaiters);
 
-logger::LogSeverity kSlowTransactionSeverity = logger::LogSeverity::Debug(1);
+logv2::LogSeverity kSlowTransactionSeverity = logv2::LogSeverity::Debug(1);
 
 }  // namespace
 
@@ -162,7 +162,7 @@ WiredTigerRecoveryUnit::WiredTigerRecoveryUnit(WiredTigerSessionCache* sc,
     : _sessionCache(sc), _oplogManager(oplogManager) {}
 
 WiredTigerRecoveryUnit::~WiredTigerRecoveryUnit() {
-    invariant(!_inUnitOfWork(), toString(getState()));
+    invariant(!_inUnitOfWork(), toString(_getState()));
     _abort();
 }
 
@@ -206,22 +206,25 @@ void WiredTigerRecoveryUnit::_abort() {
 }
 
 void WiredTigerRecoveryUnit::beginUnitOfWork(OperationContext* opCtx) {
-    invariant(!_inUnitOfWork(), toString(getState()));
+    invariant(!_inUnitOfWork(), toString(_getState()));
     invariant(!_isCommittingOrAborting(),
               str::stream() << "cannot begin unit of work while commit or rollback handlers are "
                                "running: "
-                            << toString(getState()));
+                            << toString(_getState()));
     _setState(_isActive() ? State::kActive : State::kInactiveInUnitOfWork);
 }
 
 void WiredTigerRecoveryUnit::prepareUnitOfWork() {
-    invariant(_inUnitOfWork(), toString(getState()));
+    invariant(_inUnitOfWork(), toString(_getState()));
     invariant(!_prepareTimestamp.isNull());
 
     auto session = getSession();
     WT_SESSION* s = session->getSession();
 
-    LOG(1) << "preparing transaction at time: " << _prepareTimestamp;
+    LOGV2_DEBUG(22410,
+                1,
+                "preparing transaction at time: {prepareTimestamp}",
+                "prepareTimestamp"_attr = _prepareTimestamp);
 
     const std::string conf = "prepare_timestamp=" + integerToHex(_prepareTimestamp.asULL());
     // Prepare the transaction.
@@ -229,12 +232,12 @@ void WiredTigerRecoveryUnit::prepareUnitOfWork() {
 }
 
 void WiredTigerRecoveryUnit::doCommitUnitOfWork() {
-    invariant(_inUnitOfWork(), toString(getState()));
+    invariant(_inUnitOfWork(), toString(_getState()));
     _commit();
 }
 
 void WiredTigerRecoveryUnit::doAbortUnitOfWork() {
-    invariant(_inUnitOfWork(), toString(getState()));
+    invariant(_inUnitOfWork(), toString(_getState()));
     _abort();
 }
 
@@ -245,23 +248,34 @@ void WiredTigerRecoveryUnit::_ensureSession() {
 }
 
 bool WiredTigerRecoveryUnit::waitUntilDurable(OperationContext* opCtx) {
-    invariant(!_inUnitOfWork(), toString(getState()));
+    invariant(!_inUnitOfWork(), toString(_getState()));
     invariant(!opCtx->lockState()->isLocked() || storageGlobalParams.repair);
-    const bool forceCheckpoint = false;
-    const bool stableCheckpoint = false;
-    _sessionCache->waitUntilDurable(opCtx, forceCheckpoint, stableCheckpoint);
+
+    // Flushes the journal log to disk. Checkpoints all data if journaling is disabled.
+    _sessionCache->waitUntilDurable(opCtx,
+                                    WiredTigerSessionCache::Fsync::kJournal,
+                                    WiredTigerSessionCache::UseJournalListener::kUpdate);
+
     return true;
 }
 
 bool WiredTigerRecoveryUnit::waitUntilUnjournaledWritesDurable(OperationContext* opCtx,
                                                                bool stableCheckpoint) {
-    invariant(!_inUnitOfWork(), toString(getState()));
+    invariant(!_inUnitOfWork(), toString(_getState()));
     invariant(!opCtx->lockState()->isLocked() || storageGlobalParams.repair);
-    const bool forceCheckpoint = true;
-    // Calling `waitUntilDurable` with `forceCheckpoint` set to false only performs a log
-    // (journal) flush, and thus has no effect on unjournaled writes. Setting `forceCheckpoint` to
-    // true will lock in stable writes to unjournaled tables.
-    _sessionCache->waitUntilDurable(opCtx, forceCheckpoint, stableCheckpoint);
+
+    // Take a checkpoint, rather than only flush the (oplog) journal, in order to lock in stable
+    // writes to unjournaled tables.
+    //
+    // If 'stableCheckpoint' is set, then we will only checkpoint data up to and including the
+    // stable_timestamp set on WT at the time of the checkpoint. Otherwise, we will checkpoint all
+    // of the data.
+    WiredTigerSessionCache::Fsync fsyncType = stableCheckpoint
+        ? WiredTigerSessionCache::Fsync::kCheckpointStableTimestamp
+        : WiredTigerSessionCache::Fsync::kCheckpointAll;
+    _sessionCache->waitUntilDurable(
+        opCtx, fsyncType, WiredTigerSessionCache::UseJournalListener::kUpdate);
+
     return true;
 }
 
@@ -269,7 +283,9 @@ void WiredTigerRecoveryUnit::assertInActiveTxn() const {
     if (_isActive()) {
         return;
     }
-    severe() << "Recovery unit is not active. Current state: " << toString(getState());
+    LOGV2_FATAL(22417,
+                "Recovery unit is not active. Current state: {getState}",
+                "getState"_attr = toString(_getState()));
     fassertFailed(28575);
 }
 
@@ -301,7 +317,7 @@ WiredTigerSession* WiredTigerRecoveryUnit::getSessionNoTxn() {
 }
 
 void WiredTigerRecoveryUnit::doAbandonSnapshot() {
-    invariant(!_inUnitOfWork(), toString(getState()));
+    invariant(!_inUnitOfWork(), toString(_getState()));
     if (_isActive()) {
         // Can't be in a WriteUnitOfWork, so safe to rollback
         _txnClose(false);
@@ -315,16 +331,19 @@ void WiredTigerRecoveryUnit::preallocateSnapshot() {
 }
 
 void WiredTigerRecoveryUnit::_txnClose(bool commit) {
-    invariant(_isActive(), toString(getState()));
+    invariant(_isActive(), toString(_getState()));
     WT_SESSION* s = _session->getSession();
     if (_timer) {
         const int transactionTime = _timer->millis();
         // `serverGlobalParams.slowMs` can be set to values <= 0. In those cases, give logging a
         // break.
         if (transactionTime >= std::max(1, serverGlobalParams.slowMS)) {
-            LOG(kSlowTransactionSeverity)
-                << "Slow WT transaction. Lifetime of SnapshotId " << getSnapshotId().toNumber()
-                << " was " << transactionTime << "ms";
+            LOGV2_DEBUG(22411,
+                        kSlowTransactionSeverity.toInt(),
+                        "Slow WT transaction. Lifetime of SnapshotId {getSnapshotId_toNumber} was "
+                        "{transactionTime}ms",
+                        "getSnapshotId_toNumber"_attr = getSnapshotId().toNumber(),
+                        "transactionTime"_attr = transactionTime);
         }
     }
 
@@ -349,19 +368,28 @@ void WiredTigerRecoveryUnit::_txnClose(bool commit) {
         }
 
         wtRet = s->commit_transaction(s, conf.str().c_str());
-        LOG(3) << "WT commit_transaction for snapshot id " << getSnapshotId().toNumber();
+        LOGV2_DEBUG(22412,
+                    3,
+                    "WT commit_transaction for snapshot id {getSnapshotId_toNumber}",
+                    "getSnapshotId_toNumber"_attr = getSnapshotId().toNumber());
     } else {
         wtRet = s->rollback_transaction(s, nullptr);
         invariant(!wtRet);
-        LOG(3) << "WT rollback_transaction for snapshot id " << getSnapshotId().toNumber();
+        LOGV2_DEBUG(22413,
+                    3,
+                    "WT rollback_transaction for snapshot id {getSnapshotId_toNumber}",
+                    "getSnapshotId_toNumber"_attr = getSnapshotId().toNumber());
     }
 
     if (_isTimestamped) {
         if (!_orderedCommit) {
             // We only need to update oplog visibility where commits can be out-of-order with
-            // respect to their assigned optime and such commits might otherwise be visible.
+            // respect to their assigned optime. This will ensure the oplog read timestamp gets
+            // updated when oplog 'holes' are filled: the last commit filling the last hole will
+            // prompt the oplog read timestamp to be forwarded.
+            //
             // This should happen only on primary nodes.
-            _oplogManager->triggerJournalFlush();
+            _oplogManager->triggerOplogVisibilityUpdate();
         }
         _isTimestamped = false;
     }
@@ -456,10 +484,10 @@ boost::optional<Timestamp> WiredTigerRecoveryUnit::getPointInTimeReadTimestamp()
 }
 
 void WiredTigerRecoveryUnit::_txnOpen() {
-    invariant(!_isActive(), toString(getState()));
+    invariant(!_isActive(), toString(_getState()));
     invariant(!_isCommittingOrAborting(),
               str::stream() << "commit or rollback handler reopened transaction: "
-                            << toString(getState()));
+                            << toString(_getState()));
     _ensureSession();
 
     // Only start a timer for transaction's lifetime if we're going to log it.
@@ -529,7 +557,10 @@ void WiredTigerRecoveryUnit::_txnOpen() {
         }
     }
 
-    LOG(3) << "WT begin_transaction for snapshot id " << getSnapshotId().toNumber();
+    LOGV2_DEBUG(22414,
+                3,
+                "WT begin_transaction for snapshot id {getSnapshotId_toNumber}",
+                "getSnapshotId_toNumber"_attr = getSnapshotId().toNumber());
 }
 
 Timestamp WiredTigerRecoveryUnit::_beginTransactionAtAllDurableTimestamp(WT_SESSION* session) {
@@ -605,9 +636,12 @@ Timestamp WiredTigerRecoveryUnit::_getTransactionReadTimestamp(WT_SESSION* sessi
 
 Status WiredTigerRecoveryUnit::setTimestamp(Timestamp timestamp) {
     _ensureSession();
-    LOG(3) << "WT set timestamp of future write operations to " << timestamp;
+    LOGV2_DEBUG(22415,
+                3,
+                "WT set timestamp of future write operations to {timestamp}",
+                "timestamp"_attr = timestamp);
     WT_SESSION* session = _session->getSession();
-    invariant(_inUnitOfWork(), toString(getState()));
+    invariant(_inUnitOfWork(), toString(_getState()));
     invariant(_prepareTimestamp.isNull());
     invariant(_commitTimestamp.isNull(),
               str::stream() << "Commit timestamp set to " << _commitTimestamp.toString()
@@ -635,7 +669,7 @@ void WiredTigerRecoveryUnit::setCommitTimestamp(Timestamp timestamp) {
     // setPrepareTimestamp() is called. Prepared transactions ensure the correct timestamping
     // semantics and the set-once commitTimestamp behavior is exactly what prepared transactions
     // want.
-    invariant(!_inUnitOfWork() || !_prepareTimestamp.isNull(), toString(getState()));
+    invariant(!_inUnitOfWork() || !_prepareTimestamp.isNull(), toString(_getState()));
     invariant(_commitTimestamp.isNull(),
               str::stream() << "Commit timestamp set to " << _commitTimestamp.toString()
                             << " and trying to set it to " << timestamp.toString());
@@ -665,7 +699,7 @@ Timestamp WiredTigerRecoveryUnit::getDurableTimestamp() const {
 }
 
 void WiredTigerRecoveryUnit::clearCommitTimestamp() {
-    invariant(!_inUnitOfWork(), toString(getState()));
+    invariant(!_inUnitOfWork(), toString(_getState()));
     invariant(!_commitTimestamp.isNull());
     invariant(!_lastTimestampSet,
               str::stream() << "Last timestamp set is " << _lastTimestampSet->toString()
@@ -676,7 +710,7 @@ void WiredTigerRecoveryUnit::clearCommitTimestamp() {
 }
 
 void WiredTigerRecoveryUnit::setPrepareTimestamp(Timestamp timestamp) {
-    invariant(_inUnitOfWork(), toString(getState()));
+    invariant(_inUnitOfWork(), toString(_getState()));
     invariant(_prepareTimestamp.isNull(),
               str::stream() << "Trying to set prepare timestamp to " << timestamp.toString()
                             << ". It's already set to " << _prepareTimestamp.toString());
@@ -691,7 +725,7 @@ void WiredTigerRecoveryUnit::setPrepareTimestamp(Timestamp timestamp) {
 }
 
 Timestamp WiredTigerRecoveryUnit::getPrepareTimestamp() const {
-    invariant(_inUnitOfWork(), toString(getState()));
+    invariant(_inUnitOfWork(), toString(_getState()));
     invariant(!_prepareTimestamp.isNull());
     invariant(_commitTimestamp.isNull(),
               str::stream() << "Commit timestamp is " << _commitTimestamp.toString()
@@ -710,7 +744,7 @@ void WiredTigerRecoveryUnit::setPrepareConflictBehavior(PrepareConflictBehavior 
     // ignoring prepare conflicts, since that behavior is applied when the transaction is opened.
     invariant(
         !_isActive(),
-        str::stream() << "Current state: " << toString(getState())
+        str::stream() << "Current state: " << toString(_getState())
                       << ". Invalid internal state while setting prepare conflict behavior to: "
                       << static_cast<int>(behavior));
 
@@ -725,18 +759,22 @@ void WiredTigerRecoveryUnit::setRoundUpPreparedTimestamps(bool value) {
     // This cannot be called after WiredTigerRecoveryUnit::_txnOpen.
     invariant(!_isActive(),
               str::stream() << "Can't change round up prepared timestamps flag "
-                            << "when current state is " << toString(getState()));
+                            << "when current state is " << toString(_getState()));
     _roundUpPreparedTimestamps =
         (value) ? RoundUpPreparedTimestamps::kRound : RoundUpPreparedTimestamps::kNoRound;
 }
 
 void WiredTigerRecoveryUnit::setTimestampReadSource(ReadSource readSource,
                                                     boost::optional<Timestamp> provided) {
-    LOG(3) << "setting timestamp read source: " << static_cast<int>(readSource)
-           << ", provided timestamp: " << ((provided) ? provided->toString() : "none");
+    LOGV2_DEBUG(22416,
+                3,
+                "setting timestamp read source: {static_cast_int_readSource}, provided timestamp: "
+                "{provided_provided_none}",
+                "static_cast_int_readSource"_attr = static_cast<int>(readSource),
+                "provided_provided_none"_attr = ((provided) ? provided->toString() : "none"));
 
     invariant(!_isActive() || _timestampReadSource == readSource,
-              str::stream() << "Current state: " << toString(getState())
+              str::stream() << "Current state: " << toString(_getState())
                             << ". Invalid internal state while setting timestamp read source: "
                             << static_cast<int>(readSource) << ", provided timestamp: "
                             << (provided ? provided->toString() : "none"));
@@ -775,7 +813,7 @@ std::shared_ptr<StorageStats> WiredTigerRecoveryUnit::getOperationStatistics() c
 
 void WiredTigerRecoveryUnit::setCatalogConflictingTimestamp(Timestamp timestamp) {
     // This cannot be called after a storage snapshot is allocated.
-    invariant(!_isActive(), toString(getState()));
+    invariant(!_isActive(), toString(_getState()));
     invariant(_timestampReadSource == ReadSource::kNoTimestamp,
               str::stream() << "Illegal to set catalog conflicting timestamp for a read source "
                             << static_cast<int>(_timestampReadSource));

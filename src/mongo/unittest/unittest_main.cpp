@@ -34,6 +34,9 @@
 #include "mongo/base/initializer.h"
 #include "mongo/base/status.h"
 #include "mongo/logger/logger.h"
+#include "mongo/logv2/log_domain_global.h"
+#include "mongo/logv2/log_manager.h"
+#include "mongo/unittest/log_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/unittest/unittest_options_gen.h"
 #include "mongo/util/log_global_settings.h"
@@ -92,7 +95,7 @@ int main(int argc, char** argv, char** envp) {
         std::cerr << options.helpString();
         return EXIT_FAILURE;
     }
-    mongo::setMinimumLoggedSeverity(::mongo::logger::LogSeverity::Debug(verbose.length()));
+    mongo::setMinimumLoggedSeverity(::mongo::logv2::LogSeverity::Debug(verbose.length()));
 
     if (list) {
         auto suiteNames = ::mongo::unittest::getAllSuiteNames();

@@ -45,6 +45,7 @@
 #include "mongo/db/pipeline/document_source_internal_split_pipeline.h"
 #include "mongo/db/pipeline/document_source_lookup.h"
 #include "mongo/db/pipeline/document_source_lookup_change_post_image.h"
+#include "mongo/db/pipeline/document_source_lookup_change_pre_image.h"
 #include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/pipeline/document_source_mock.h"
 #include "mongo/db/pipeline/document_source_out.h"
@@ -54,13 +55,13 @@
 #include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/pipeline/field_path.h"
 #include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/process_interface/stub_mongo_process_interface.h"
 #include "mongo/db/pipeline/semantic_analysis.h"
-#include "mongo/db/pipeline/stub_mongo_process_interface.h"
+#include "mongo/db/pipeline/sharded_agg_helpers.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
 #include "mongo/db/query/query_test_service_context.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/dbtests/dbtests.h"
-#include "mongo/s/query/cluster_aggregation_planner.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/temp_dir.h"
 
@@ -111,9 +112,11 @@ void assertPipelineOptimizesAndSerializesTo(std::string inputPipeJson,
     // For $graphLookup and $lookup, we have to populate the resolvedNamespaces so that the
     // operations will be able to have a resolved view definition.
     NamespaceString lookupCollNs("a", "lookupColl");
+    NamespaceString unionCollNs("b", "unionColl");
     ctx->setResolvedNamespace(lookupCollNs, {lookupCollNs, std::vector<BSONObj>{}});
+    ctx->setResolvedNamespace(unionCollNs, {unionCollNs, std::vector<BSONObj>{}});
 
-    auto outputPipe = uassertStatusOK(Pipeline::parse(request.getPipeline(), ctx));
+    auto outputPipe = Pipeline::parse(request.getPipeline(), ctx);
     outputPipe->optimizePipeline();
 
     ASSERT_VALUE_EQ(Value(outputPipe->writeExplainOps(ExplainOptions::Verbosity::kQueryPlanner)),
@@ -1676,7 +1679,7 @@ TEST(PipelineOptimizationTest, ChangeStreamLookupSwapsWithIndependentMatch) {
     auto matchPredicate = BSON("extra"
                                << "predicate");
     stages.push_back(DocumentSourceMatch::create(matchPredicate, expCtx));
-    auto pipeline = uassertStatusOK(Pipeline::create(stages, expCtx));
+    auto pipeline = Pipeline::create(stages, expCtx);
     pipeline->optimizePipeline();
 
     // Make sure the $match stage has swapped before the change look up.
@@ -1701,7 +1704,59 @@ TEST(PipelineOptimizationTest, ChangeStreamLookupDoesNotSwapWithMatchOnPostImage
 
     stages.push_back(DocumentSourceMatch::create(
         BSON(DocumentSourceLookupChangePostImage::kFullDocumentFieldName << BSONNULL), expCtx));
-    auto pipeline = uassertStatusOK(Pipeline::create(stages, expCtx));
+    auto pipeline = Pipeline::create(stages, expCtx);
+    pipeline->optimizePipeline();
+
+    // Make sure the $match stage stays at the end.
+    ASSERT(dynamic_cast<DocumentSourceMatch*>(pipeline->getSources().back().get()));
+}
+
+TEST(PipelineOptimizationTest, FullDocumentBeforeChangeLookupSwapsWithIndependentMatch) {
+    QueryTestServiceContext testServiceContext;
+    auto opCtx = testServiceContext.makeOperationContext();
+
+    intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest(kTestNss));
+    expCtx->opCtx = opCtx.get();
+    expCtx->uuid = UUID::gen();
+    setMockReplicationCoordinatorOnOpCtx(expCtx->opCtx);
+
+    auto spec = BSON("$changeStream" << BSON("fullDocumentBeforeChange"
+                                             << "required"));
+    auto stages = DocumentSourceChangeStream::createFromBson(spec.firstElement(), expCtx);
+    ASSERT_EQ(stages.size(), 5UL);
+    // Make sure the pre-image lookup is at the end.
+    ASSERT(dynamic_cast<DocumentSourceLookupChangePreImage*>(stages.back().get()));
+
+    auto matchPredicate = BSON("extra"
+                               << "predicate");
+    stages.push_back(DocumentSourceMatch::create(matchPredicate, expCtx));
+    auto pipeline = Pipeline::create(stages, expCtx);
+    pipeline->optimizePipeline();
+
+    // Make sure the $match stage has swapped before the change look up.
+    ASSERT(dynamic_cast<DocumentSourceLookupChangePreImage*>(pipeline->getSources().back().get()));
+}
+
+TEST(PipelineOptimizationTest, FullDocumentBeforeChangeDoesNotSwapWithMatchOnPreImage) {
+    QueryTestServiceContext testServiceContext;
+    auto opCtx = testServiceContext.makeOperationContext();
+
+    intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest(kTestNss));
+    expCtx->opCtx = opCtx.get();
+    expCtx->uuid = UUID::gen();
+    setMockReplicationCoordinatorOnOpCtx(expCtx->opCtx);
+
+    auto spec = BSON("$changeStream" << BSON("fullDocumentBeforeChange"
+                                             << "required"));
+    auto stages = DocumentSourceChangeStream::createFromBson(spec.firstElement(), expCtx);
+    ASSERT_EQ(stages.size(), 5UL);
+    // Make sure the pre-image lookup is at the end.
+    ASSERT(dynamic_cast<DocumentSourceLookupChangePreImage*>(stages.back().get()));
+
+    stages.push_back(DocumentSourceMatch::create(
+        BSON(DocumentSourceLookupChangePreImage::kFullDocumentBeforeChangeFieldName << BSONNULL),
+        expCtx));
+    auto pipeline = Pipeline::create(stages, expCtx);
     pipeline->optimizePipeline();
 
     // Make sure the $match stage stays at the end.
@@ -1853,6 +1908,157 @@ TEST(PipelineOptimizationTest, SortSkipProjSkipLimSkipLimBecomesTopKSortSkipProj
     assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 }
 
+TEST(PipelineOptimizationTest, MatchGetsPushedIntoBothChildrenOfUnion) {
+    assertPipelineOptimizesTo(
+        "["
+        " {$unionWith: 'unionColl'},"
+        " {$match: {x: {$eq: 2}}}"
+        "]",
+        "[{$match: {x: {$eq: 2}}},"
+        " {$unionWith: {"
+        "   coll: 'unionColl',"
+        "   pipeline: [{$match: {x: {$eq: 2}}}]"
+        " }}]");
+
+    // Test that the $match can get pulled forward through other stages.
+    assertPipelineOptimizesAndSerializesTo(
+        "["
+        " {$unionWith: 'unionColl'},"
+        " {$lookup: {from: 'lookupColl', as: 'y', localField: 'z', foreignField: 'z'}},"
+        " {$sort: {score: 1}},"
+        " {$match: {x: {$eq: 2}}}"
+        "]",
+        "["
+        " {$match: {x: {$eq: 2}}},"
+        " {$unionWith: {"
+        "   coll: 'unionColl',"
+        "   pipeline: [{$match: {x: {$eq: 2}}}]"
+        " }},"
+        " {$lookup: {from: 'lookupColl', as: 'y', localField: 'z', foreignField: 'z'}},"
+        " {$sort: {sortKey: {score: 1}}}"
+        "]",
+        "["
+        " {$match: {x: {$eq: 2}}},"
+        " {$unionWith: {"
+        "   coll: 'unionColl',"
+        "   pipeline: [{$match: {x: {$eq: 2}}}]"
+        " }},"
+        " {$lookup: {from: 'lookupColl', as: 'y', localField: 'z', foreignField: 'z'}},"
+        " {$sort: {score: 1}}"
+        "]");
+
+    // Test that the $match can get pulled forward from after the $unionWith to inside, then to the
+    // beginning of a $unionWith subpipeline.
+    // TODO: SERVER-45535 the explained inner pipeline should have the 'sortKey' form for $sort.
+    assertPipelineOptimizesAndSerializesTo(
+        "["
+        " {$unionWith: {"
+        "    coll: 'unionColl',"
+        "    pipeline: ["
+        "      {$project: {y: false}},"
+        "      {$sort: {score: 1}}"
+        "    ]"
+        " }},"
+        " {$match: {x: {$eq: 2}}}"
+        "]",
+        "["
+        " {$match: {x: {$eq: 2}}},"
+        " {$unionWith: {"
+        "    coll: 'unionColl',"
+        "    pipeline: ["
+        "      {$match: {x: {$eq: 2}}},"
+        "      {$project: {y: false}},"
+        "      {$sort: {score: 1}}"
+        "    ]"
+        " }}"
+        "]",
+        "["
+        " {$match: {x: {$eq: 2}}},"
+        " {$unionWith: {"
+        "    coll: 'unionColl',"
+        "    pipeline: ["
+        "      {$match: {x: {$eq: 2}}},"
+        "      {$project: {y: false}},"
+        "      {$sort: {score: 1}}"
+        "    ]"
+        " }}"
+        "]");
+}
+
+TEST(PipelineOptimizationTest, ProjectGetsPushedIntoBothChildrenOfUnion) {
+    assertPipelineOptimizesTo(
+        "["
+        " {$unionWith: 'unionColl'},"
+        " {$project: {x: false}}"
+        "]",
+        "[{$project: {x: false}},"
+        " {$unionWith: {"
+        "   coll: 'unionColl',"
+        "   pipeline: [{$project: {x: false}}]"
+        " }}]");
+
+    // Test an inclusion projection.
+    assertPipelineOptimizesTo(
+        "["
+        " {$unionWith: 'unionColl'},"
+        " {$project: {x: true}}"
+        "]",
+        "[{$project: {_id: true, x: true}},"
+        " {$unionWith: {"
+        "   coll: 'unionColl',"
+        "   pipeline: [{$project: {_id: true, x: true}}]"
+        " }}]");
+
+    // Test a $set.
+    assertPipelineOptimizesTo(
+        "["
+        " {$unionWith: 'unionColl'},"
+        " {$set: {x: 'new value'}}"
+        "]",
+        "[{$set: {x: {$const: 'new value'}}},"
+        " {$unionWith: {"
+        "   coll: 'unionColl',"
+        "   pipeline: [{$set: {x: {$const: 'new value'}}}]"
+        " }}]");
+}
+
+TEST(PipelineOptimizationTest, UnionWithViewsSampleUseCase) {
+    // Test that if someone uses $unionWith to query one logical collection from four physical
+    // collections then the query and projection can get pushed down to next to each collection
+    // access.
+    assertPipelineOptimizesTo(
+        "["
+        " {$unionWith: 'unionColl'},"
+        " {$unionWith: 'unionColl'},"
+        " {$unionWith: 'unionColl'},"
+        " {$match: {business: {$eq: 'good'}}},"
+        " {$project: {_id: true, x: true}}"
+        "]",
+        "[{$match: {business: {$eq: 'good'}}},"
+        " {$project: {_id: true, x: true}},"
+        " {$unionWith: {"
+        "   coll: 'unionColl',"
+        "   pipeline: ["
+        "     {$match: {business: {$eq: 'good'}}},"
+        "     {$project: {_id: true, x: true}}"
+        "   ]"
+        " }},"
+        " {$unionWith: {"
+        "   coll: 'unionColl',"
+        "   pipeline: ["
+        "     {$match: {business: {$eq: 'good'}}},"
+        "     {$project: {_id: true, x: true}}"
+        "   ]"
+        " }},"
+        " {$unionWith: {"
+        "   coll: 'unionColl',"
+        "   pipeline: ["
+        "     {$match: {business: {$eq: 'good'}}},"
+        "     {$project: {_id: true, x: true}}"
+        "   ]"
+        " }}"
+        "]");
+}
 }  // namespace Local
 
 namespace Sharded {
@@ -1889,10 +2095,10 @@ public:
         ctx->setResolvedNamespace(lookupCollNs, {lookupCollNs, std::vector<BSONObj>{}});
 
         // Test that we can both split the pipeline and reassemble it into its original form.
-        mergePipe = uassertStatusOK(Pipeline::parse(request.getPipeline(), ctx));
+        mergePipe = Pipeline::parse(request.getPipeline(), ctx);
         mergePipe->optimizePipeline();
 
-        auto splitPipeline = cluster_aggregation_planner::splitPipeline(std::move(mergePipe));
+        auto splitPipeline = sharded_agg_helpers::splitPipeline(std::move(mergePipe));
 
         ASSERT_VALUE_EQ(Value(splitPipeline.shardsPipeline->writeExplainOps(
                             ExplainOptions::Verbosity::kQueryPlanner)),
@@ -1991,7 +2197,7 @@ namespace propagateDocLimitToShards {
  * stage in the merge pipeline creates an upper bound on how many documents are necessary from any
  * of the shards, we can add a $limit to the shard pipeline to prevent it from sending more
  * documents than necessary. See the comment for propagateDocLimitToShard in
- * cluster_aggregation_planner.cpp and the explanation in SERVER-36881.
+ * sharded_agg_helpers.cpp and the explanation in SERVER-36881.
  */
 class MatchWithSkipAndLimit : public Base {
     string inputPipeJson() {
@@ -2367,7 +2573,7 @@ class Out : public ShardMergerBase {
         return "[]";
     }
     string mergePipeJson() {
-        return "[{$out: 'outColl'}]";
+        return "[{$out: {db: 'a', coll: 'outColl'}}]";
     }
 };
 
@@ -2465,7 +2671,8 @@ public:
                 DiskUseRequirement::kNoDiskUse,
                 FacetRequirement::kNotAllowed,
                 TransactionRequirement::kAllowed,
-                LookupRequirement::kNotAllowed};
+                LookupRequirement::kNotAllowed,
+                UnionRequirement::kAllowed};
     }
 
     static boost::intrusive_ptr<DocumentSourceMustRunOnMongoS> create() {
@@ -2483,7 +2690,7 @@ TEST_F(PipelineMustRunOnMongoSTest, UnsplittablePipelineMustRunOnMongoS) {
     auto match = DocumentSourceMatch::create(fromjson("{x: 5}"), expCtx);
     auto runOnMongoS = DocumentSourceMustRunOnMongoS::create();
 
-    auto pipeline = uassertStatusOK(Pipeline::create({match, runOnMongoS}, expCtx));
+    auto pipeline = Pipeline::create({match, runOnMongoS}, expCtx);
     ASSERT_TRUE(pipeline->requiredToRunOnMongos());
 
     pipeline->optimizePipeline();
@@ -2500,7 +2707,7 @@ TEST_F(PipelineMustRunOnMongoSTest, UnsplittableMongoSPipelineAssertsIfDisallowe
     auto runOnMongoS = DocumentSourceMustRunOnMongoS::create();
     auto sort = DocumentSourceSort::create(expCtx, fromjson("{x: 1}"));
 
-    auto pipeline = uassertStatusOK(Pipeline::create({match, runOnMongoS, sort}, expCtx));
+    auto pipeline = Pipeline::create({match, runOnMongoS, sort}, expCtx);
     pipeline->optimizePipeline();
 
     // The entire pipeline must run on mongoS, but $sort cannot do so when 'allowDiskUse' is true.
@@ -2518,13 +2725,13 @@ DEATH_TEST_F(PipelineMustRunOnMongoSTest,
     auto split = DocumentSourceInternalSplitPipeline::create(expCtx, HostTypeRequirement::kNone);
     auto runOnMongoS = DocumentSourceMustRunOnMongoS::create();
 
-    auto pipeline = uassertStatusOK(Pipeline::create({match, split, runOnMongoS}, expCtx));
+    auto pipeline = Pipeline::create({match, split, runOnMongoS}, expCtx);
 
     // We don't need to run the entire pipeline on mongoS because we can split at
     // $_internalSplitPipeline.
     ASSERT_FALSE(pipeline->requiredToRunOnMongos());
 
-    auto splitPipeline = cluster_aggregation_planner::splitPipeline(std::move(pipeline));
+    auto splitPipeline = sharded_agg_helpers::splitPipeline(std::move(pipeline));
     ASSERT(splitPipeline.shardsPipeline);
     ASSERT(splitPipeline.mergePipeline);
 
@@ -2559,13 +2766,13 @@ TEST_F(PipelineMustRunOnMongoSTest, SplitMongoSMergePipelineAssertsIfShardStageP
     auto outSpec = fromjson("{$out: 'outcoll'}");
     auto out = DocumentSourceOut::createFromBson(outSpec["$out"], expCtx);
 
-    auto pipeline = uassertStatusOK(Pipeline::create({match, split, runOnMongoS, out}, expCtx));
+    auto pipeline = Pipeline::create({match, split, runOnMongoS, out}, expCtx);
 
     // We don't need to run the entire pipeline on mongoS because we can split at
     // $_internalSplitPipeline.
     ASSERT_FALSE(pipeline->requiredToRunOnMongos());
 
-    auto splitPipeline = cluster_aggregation_planner::splitPipeline(std::move(pipeline));
+    auto splitPipeline = sharded_agg_helpers::splitPipeline(std::move(pipeline));
 
     // The merge pipeline must run on mongoS, but $out needs to run on  the primary shard.
     ASSERT_THROWS_CODE(splitPipeline.mergePipeline->requiredToRunOnMongos(),
@@ -2582,7 +2789,7 @@ TEST_F(PipelineMustRunOnMongoSTest, SplittablePipelineAssertsIfMongoSStageOnShar
     auto split =
         DocumentSourceInternalSplitPipeline::create(expCtx, HostTypeRequirement::kAnyShard);
 
-    auto pipeline = uassertStatusOK(Pipeline::create({match, runOnMongoS, split}, expCtx));
+    auto pipeline = Pipeline::create({match, runOnMongoS, split}, expCtx);
     pipeline->optimizePipeline();
 
     // The 'runOnMongoS' stage comes before any splitpoint, so this entire pipeline must run on
@@ -2601,7 +2808,7 @@ TEST_F(PipelineMustRunOnMongoSTest, SplittablePipelineRunsUnsplitOnMongoSIfSplit
     auto runOnMongoS = DocumentSourceMustRunOnMongoS::create();
     auto split = DocumentSourceInternalSplitPipeline::create(expCtx, HostTypeRequirement::kNone);
 
-    auto pipeline = uassertStatusOK(Pipeline::create({match, runOnMongoS, split}, expCtx));
+    auto pipeline = Pipeline::create({match, runOnMongoS, split}, expCtx);
     pipeline->optimizePipeline();
 
     // The 'runOnMongoS' stage is before the splitpoint, so this entire pipeline must run on mongoS.
@@ -2620,7 +2827,7 @@ TEST(PipelineInitialSource, GeoNearInitialQuery) {
         fromjson("{$geoNear: {distanceField: 'd', near: [0, 0], query: {a: 1}}}")};
     intrusive_ptr<ExpressionContextForTest> ctx = new ExpressionContextForTest(
         &_opCtx, AggregationRequest(NamespaceString("a.collection"), rawPipeline));
-    auto pipe = uassertStatusOK(Pipeline::parse(rawPipeline, ctx));
+    auto pipe = Pipeline::parse(rawPipeline, ctx);
     ASSERT_BSONOBJ_EQ(pipe->getInitialQuery(), BSON("a" << 1));
 }
 
@@ -2630,7 +2837,7 @@ TEST(PipelineInitialSource, MatchInitialQuery) {
     intrusive_ptr<ExpressionContextForTest> ctx = new ExpressionContextForTest(
         &_opCtx, AggregationRequest(NamespaceString("a.collection"), rawPipeline));
 
-    auto pipe = uassertStatusOK(Pipeline::parse(rawPipeline, ctx));
+    auto pipe = Pipeline::parse(rawPipeline, ctx);
     ASSERT_BSONOBJ_EQ(pipe->getInitialQuery(), BSON("a" << 4));
 }
 
@@ -2650,7 +2857,8 @@ public:
                                      DiskUseRequirement::kNoDiskUse,
                                      FacetRequirement::kNotAllowed,
                                      TransactionRequirement::kAllowed,
-                                     LookupRequirement::kAllowed);
+                                     LookupRequirement::kAllowed,
+                                     UnionRequirement::kAllowed);
         constraints.isIndependentOfAnyCollection = true;
         constraints.requiresInputDocSource = false;
         return constraints;
@@ -2667,7 +2875,8 @@ TEST_F(PipelineValidateTest, AggregateOneNSNotValidForEmptyPipeline) {
 
     ctx->ns = NamespaceString::makeCollectionlessAggregateNSS("a");
 
-    ASSERT_NOT_OK(Pipeline::parse(rawPipeline, ctx).getStatus());
+    ASSERT_THROWS_CODE(
+        Pipeline::parse(rawPipeline, ctx), AssertionException, ErrorCodes::InvalidNamespace);
 }
 
 TEST_F(PipelineValidateTest, AggregateOneNSNotValidIfInitialStageRequiresCollection) {
@@ -2676,7 +2885,8 @@ TEST_F(PipelineValidateTest, AggregateOneNSNotValidIfInitialStageRequiresCollect
 
     ctx->ns = NamespaceString::makeCollectionlessAggregateNSS("a");
 
-    ASSERT_NOT_OK(Pipeline::parse(rawPipeline, ctx).getStatus());
+    ASSERT_THROWS_CODE(
+        Pipeline::parse(rawPipeline, ctx), AssertionException, ErrorCodes::InvalidNamespace);
 }
 
 TEST_F(PipelineValidateTest, AggregateOneNSValidIfInitialStageIsCollectionless) {
@@ -2685,7 +2895,7 @@ TEST_F(PipelineValidateTest, AggregateOneNSValidIfInitialStageIsCollectionless) 
 
     ctx->ns = NamespaceString::makeCollectionlessAggregateNSS("a");
 
-    ASSERT_OK(Pipeline::create({collectionlessSource}, ctx).getStatus());
+    Pipeline::create({collectionlessSource}, ctx);
 }
 
 TEST_F(PipelineValidateTest, CollectionNSNotValidIfInitialStageIsCollectionless) {
@@ -2694,16 +2904,20 @@ TEST_F(PipelineValidateTest, CollectionNSNotValidIfInitialStageIsCollectionless)
 
     ctx->ns = kTestNss;
 
-    ASSERT_NOT_OK(Pipeline::create({collectionlessSource}, ctx).getStatus());
+    ASSERT_THROWS_CODE(Pipeline::parse({fromjson("{$listLocalSessions: {}}")},
+                                       ctx),  // Pipeline::create({collectionlessSource}, ctx),
+                       AssertionException,
+                       ErrorCodes::InvalidNamespace);
 }
 
 TEST_F(PipelineValidateTest, AggregateOneNSValidForFacetPipelineRegardlessOfInitialStage) {
-    const std::vector<BSONObj> rawPipeline = {fromjson("{$match: {}}")};
+    const std::vector<BSONObj> rawPipeline = {fromjson("{$facet: {subPipe: [{$match: {}}]}}")};
     auto ctx = getExpCtx();
 
     ctx->ns = NamespaceString::makeCollectionlessAggregateNSS("unittests");
 
-    ASSERT_OK(Pipeline::parseFacetPipeline(rawPipeline, ctx).getStatus());
+    ASSERT_THROWS_CODE(
+        Pipeline::parse(rawPipeline, ctx), AssertionException, ErrorCodes::InvalidNamespace);
 }
 
 TEST_F(PipelineValidateTest, ChangeStreamIsValidAsFirstStage) {
@@ -2711,7 +2925,7 @@ TEST_F(PipelineValidateTest, ChangeStreamIsValidAsFirstStage) {
     auto ctx = getExpCtx();
     setMockReplicationCoordinatorOnOpCtx(ctx->opCtx);
     ctx->ns = NamespaceString("a.collection");
-    ASSERT_OK(Pipeline::parse(rawPipeline, ctx).getStatus());
+    Pipeline::parse(rawPipeline, ctx);
 }
 
 TEST_F(PipelineValidateTest, ChangeStreamIsNotValidIfNotFirstStage) {
@@ -2720,19 +2934,17 @@ TEST_F(PipelineValidateTest, ChangeStreamIsNotValidIfNotFirstStage) {
     auto ctx = getExpCtx();
     setMockReplicationCoordinatorOnOpCtx(ctx->opCtx);
     ctx->ns = NamespaceString("a.collection");
-    auto parseStatus = Pipeline::parse(rawPipeline, ctx).getStatus();
-    ASSERT_EQ(parseStatus, ErrorCodes::duplicateCodeForTest(40602));
+    ASSERT_THROWS_CODE(Pipeline::parse(rawPipeline, ctx), AssertionException, 40602);
 }
 
 TEST_F(PipelineValidateTest, ChangeStreamIsNotValidIfNotFirstStageInFacet) {
-    const std::vector<BSONObj> rawPipeline = {fromjson("{$match: {custom: 'filter'}}"),
-                                              fromjson("{$changeStream: {}}")};
+    const std::vector<BSONObj> rawPipeline = {
+        fromjson("{$facet: {subPipe: [{$match: {}}, {$changeStream: {}}]}}")};
+
     auto ctx = getExpCtx();
     setMockReplicationCoordinatorOnOpCtx(ctx->opCtx);
     ctx->ns = NamespaceString("a.collection");
-    auto parseStatus = Pipeline::parseFacetPipeline(rawPipeline, ctx).getStatus();
-    ASSERT_EQ(parseStatus, ErrorCodes::duplicateCodeForTest(40600));
-    ASSERT(std::string::npos != parseStatus.reason().find("$changeStream"));
+    ASSERT_THROWS_CODE(Pipeline::parse(rawPipeline, ctx), AssertionException, 40600);
 }
 
 class DocumentSourceDisallowedInTransactions : public DocumentSourceMock {
@@ -2746,7 +2958,8 @@ public:
                                 DiskUseRequirement::kNoDiskUse,
                                 FacetRequirement::kAllowed,
                                 TransactionRequirement::kNotAllowed,
-                                LookupRequirement::kAllowed};
+                                LookupRequirement::kAllowed,
+                                UnionRequirement::kAllowed};
     }
 
     static boost::intrusive_ptr<DocumentSourceDisallowedInTransactions> create() {
@@ -2755,8 +2968,6 @@ public:
 };
 
 TEST_F(PipelineValidateTest, TopLevelPipelineValidatedForStagesIllegalInTransactions) {
-    BSONObj readConcernSnapshot = BSON("readConcern" << BSON("level"
-                                                             << "snapshot"));
     auto ctx = getExpCtx();
     ctx->inMultiDocumentTransaction = true;
 
@@ -2764,24 +2975,20 @@ TEST_F(PipelineValidateTest, TopLevelPipelineValidatedForStagesIllegalInTransact
     // creation fails with the expected error code.
     auto matchStage = DocumentSourceMatch::create(BSON("_id" << 3), ctx);
     auto illegalStage = DocumentSourceDisallowedInTransactions::create();
-    auto pipeline = Pipeline::create({matchStage, illegalStage}, ctx);
-    ASSERT_NOT_OK(pipeline.getStatus());
-    ASSERT_EQ(pipeline.getStatus(), ErrorCodes::OperationNotSupportedInTransaction);
+    ASSERT_THROWS_CODE(Pipeline::create({matchStage, illegalStage}, ctx),
+                       AssertionException,
+                       ErrorCodes::OperationNotSupportedInTransaction);
 }
 
 TEST_F(PipelineValidateTest, FacetPipelineValidatedForStagesIllegalInTransactions) {
-    BSONObj readConcernSnapshot = BSON("readConcern" << BSON("level"
-                                                             << "snapshot"));
     auto ctx = getExpCtx();
     ctx->inMultiDocumentTransaction = true;
 
-    // Make a pipeline with a legal $match, and then an illegal mock stage, and verify that pipeline
-    // creation fails with the expected error code.
-    auto matchStage = DocumentSourceMatch::create(BSON("_id" << 3), ctx);
-    auto illegalStage = DocumentSourceDisallowedInTransactions::create();
-    auto pipeline = Pipeline::createFacetPipeline({matchStage, illegalStage}, ctx);
-    ASSERT_NOT_OK(pipeline.getStatus());
-    ASSERT_EQ(pipeline.getStatus(), ErrorCodes::OperationNotSupportedInTransaction);
+    const std::vector<BSONObj> rawPipeline = {
+        fromjson("{$facet: {subPipe: [{$match: {}}, {$out: 'outColl'}]}}")};
+    ASSERT_THROWS_CODE(Pipeline::parse(rawPipeline, ctx),
+                       AssertionException,
+                       ErrorCodes::OperationNotSupportedInTransaction);
 }
 
 }  // namespace pipeline_validate
@@ -2791,7 +2998,7 @@ namespace Dependencies {
 using PipelineDependenciesTest = AggregationContextFixture;
 
 TEST_F(PipelineDependenciesTest, EmptyPipelineShouldRequireWholeDocument) {
-    auto pipeline = unittest::assertGet(Pipeline::create({}, getExpCtx()));
+    auto pipeline = Pipeline::create({}, getExpCtx());
 
     auto depsTracker = pipeline->getDependencies(DepsTracker::kAllMetadata);
     ASSERT_TRUE(depsTracker.needWholeDocument);
@@ -2820,7 +3027,8 @@ public:
                 DiskUseRequirement::kNoDiskUse,
                 FacetRequirement::kAllowed,
                 TransactionRequirement::kAllowed,
-                LookupRequirement::kAllowed};
+                LookupRequirement::kAllowed,
+                UnionRequirement::kAllowed};
     }
 };
 
@@ -2886,7 +3094,7 @@ TEST_F(PipelineDependenciesTest, ShouldRequireWholeDocumentIfAnyStageDoesNotSupp
     auto ctx = getExpCtx();
     auto needsASeeNext = DocumentSourceNeedsASeeNext::create();
     auto notSupported = DocumentSourceDependenciesNotSupported::create();
-    auto pipeline = unittest::assertGet(Pipeline::create({needsASeeNext, notSupported}, ctx));
+    auto pipeline = Pipeline::create({needsASeeNext, notSupported}, ctx);
 
     auto depsTracker = pipeline->getDependencies(DepsTracker::kAllMetadata);
     ASSERT_TRUE(depsTracker.needWholeDocument);
@@ -2894,7 +3102,7 @@ TEST_F(PipelineDependenciesTest, ShouldRequireWholeDocumentIfAnyStageDoesNotSupp
     ASSERT_FALSE(depsTracker.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 
     // Now in the other order.
-    pipeline = unittest::assertGet(Pipeline::create({notSupported, needsASeeNext}, ctx));
+    pipeline = Pipeline::create({notSupported, needsASeeNext}, ctx);
 
     depsTracker = pipeline->getDependencies(DepsTracker::kAllMetadata);
     ASSERT_TRUE(depsTracker.needWholeDocument);
@@ -2903,7 +3111,7 @@ TEST_F(PipelineDependenciesTest, ShouldRequireWholeDocumentIfAnyStageDoesNotSupp
 TEST_F(PipelineDependenciesTest, ShouldRequireWholeDocumentIfNoStageReturnsExhaustiveFields) {
     auto ctx = getExpCtx();
     auto needsASeeNext = DocumentSourceNeedsASeeNext::create();
-    auto pipeline = unittest::assertGet(Pipeline::create({needsASeeNext}, ctx));
+    auto pipeline = Pipeline::create({needsASeeNext}, ctx);
 
     auto depsTracker = pipeline->getDependencies(DepsTracker::kNoMetadata);
     ASSERT_TRUE(depsTracker.needWholeDocument);
@@ -2913,7 +3121,7 @@ TEST_F(PipelineDependenciesTest, ShouldNotRequireWholeDocumentIfAnyStageReturnsE
     auto ctx = getExpCtx();
     auto needsASeeNext = DocumentSourceNeedsASeeNext::create();
     auto needsOnlyB = DocumentSourceNeedsOnlyB::create();
-    auto pipeline = unittest::assertGet(Pipeline::create({needsASeeNext, needsOnlyB}, ctx));
+    auto pipeline = Pipeline::create({needsASeeNext, needsOnlyB}, ctx);
 
     auto depsTracker = pipeline->getDependencies(DepsTracker::kNoMetadata);
     ASSERT_FALSE(depsTracker.needWholeDocument);
@@ -2926,7 +3134,7 @@ TEST_F(PipelineDependenciesTest, ShouldNotAddAnyRequiredFieldsAfterFirstStageWit
     auto ctx = getExpCtx();
     auto needsOnlyB = DocumentSourceNeedsOnlyB::create();
     auto needsASeeNext = DocumentSourceNeedsASeeNext::create();
-    auto pipeline = unittest::assertGet(Pipeline::create({needsOnlyB, needsASeeNext}, ctx));
+    auto pipeline = Pipeline::create({needsOnlyB, needsASeeNext}, ctx);
 
     auto depsTracker = pipeline->getDependencies(DepsTracker::kAllMetadata);
     ASSERT_FALSE(depsTracker.needWholeDocument);
@@ -2940,7 +3148,7 @@ TEST_F(PipelineDependenciesTest, ShouldNotAddAnyRequiredFieldsAfterFirstStageWit
 
 TEST_F(PipelineDependenciesTest, ShouldNotRequireTextScoreIfThereIsNoScoreAvailable) {
     auto ctx = getExpCtx();
-    auto pipeline = unittest::assertGet(Pipeline::create({}, ctx));
+    auto pipeline = Pipeline::create({}, ctx);
 
     auto depsTracker = pipeline->getDependencies(DepsTracker::kAllMetadata);
     ASSERT_FALSE(depsTracker.getNeedsMetadata(DocumentMetadataFields::kTextScore));
@@ -2949,21 +3157,21 @@ TEST_F(PipelineDependenciesTest, ShouldNotRequireTextScoreIfThereIsNoScoreAvaila
 TEST_F(PipelineDependenciesTest, ShouldThrowIfTextScoreIsNeededButNotPresent) {
     auto ctx = getExpCtx();
     auto needsText = DocumentSourceNeedsOnlyTextScore::create();
-    auto pipeline = unittest::assertGet(Pipeline::create({needsText}, ctx));
+    auto pipeline = Pipeline::create({needsText}, ctx);
 
     ASSERT_THROWS(pipeline->getDependencies(DepsTracker::kAllMetadata), AssertionException);
 }
 
 TEST_F(PipelineDependenciesTest, ShouldRequireTextScoreIfAvailableAndNoStageReturnsExhaustiveMeta) {
     auto ctx = getExpCtx();
-    auto pipeline = unittest::assertGet(Pipeline::create({}, ctx));
+    auto pipeline = Pipeline::create({}, ctx);
 
     auto depsTracker =
         pipeline->getDependencies(DepsTracker::kAllMetadata & ~DepsTracker::kOnlyTextScore);
     ASSERT_TRUE(depsTracker.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 
     auto needsASeeNext = DocumentSourceNeedsASeeNext::create();
-    pipeline = unittest::assertGet(Pipeline::create({needsASeeNext}, ctx));
+    pipeline = Pipeline::create({needsASeeNext}, ctx);
     depsTracker =
         pipeline->getDependencies(DepsTracker::kAllMetadata & ~DepsTracker::kOnlyTextScore);
     ASSERT_TRUE(depsTracker.getNeedsMetadata(DocumentMetadataFields::kTextScore));
@@ -2973,7 +3181,7 @@ TEST_F(PipelineDependenciesTest, ShouldNotRequireTextScoreIfAvailableButDefinite
     auto ctx = getExpCtx();
     auto stripsTextScore = DocumentSourceStripsTextScore::create();
     auto needsText = DocumentSourceNeedsOnlyTextScore::create();
-    auto pipeline = unittest::assertGet(Pipeline::create({stripsTextScore, needsText}, ctx));
+    auto pipeline = Pipeline::create({stripsTextScore, needsText}, ctx);
 
     auto depsTracker =
         pipeline->getDependencies(DepsTracker::kAllMetadata & ~DepsTracker::kOnlyTextScore);
@@ -2988,8 +3196,7 @@ TEST_F(PipelineDependenciesTest, ShouldNotRequireTextScoreIfAvailableButDefinite
 namespace {
 TEST(PipelineRenameTracking, ReportsIdentityMapWhenEmpty) {
     boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
-    auto pipeline =
-        unittest::assertGet(Pipeline::create({DocumentSourceMock::createForTest()}, expCtx));
+    auto pipeline = Pipeline::create({DocumentSourceMock::createForTest()}, expCtx);
     {
         // Tracking renames backwards.
         auto renames = semantic_analysis::renamedPaths(
@@ -3033,8 +3240,8 @@ TEST(PipelineRenameTracking, ReportsIdentityWhenNoStageModifiesAnything) {
     boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
     {
         // Tracking renames backwards.
-        auto pipeline = unittest::assertGet(Pipeline::create(
-            {DocumentSourceMock::createForTest(), NoModifications::create()}, expCtx));
+        auto pipeline = Pipeline::create(
+            {DocumentSourceMock::createForTest(), NoModifications::create()}, expCtx);
         auto renames = semantic_analysis::renamedPaths(
             pipeline->getSources().crbegin(), pipeline->getSources().crend(), {"a", "b", "c.d"});
         ASSERT(static_cast<bool>(renames));
@@ -3046,8 +3253,8 @@ TEST(PipelineRenameTracking, ReportsIdentityWhenNoStageModifiesAnything) {
     }
     {
         // Tracking renames forwards.
-        auto pipeline = unittest::assertGet(Pipeline::create(
-            {DocumentSourceMock::createForTest(), NoModifications::create()}, expCtx));
+        auto pipeline = Pipeline::create(
+            {DocumentSourceMock::createForTest(), NoModifications::create()}, expCtx);
         auto renames = semantic_analysis::renamedPaths(
             pipeline->getSources().cbegin(), pipeline->getSources().cend(), {"a", "b", "c.d"});
         ASSERT(static_cast<bool>(renames));
@@ -3059,11 +3266,11 @@ TEST(PipelineRenameTracking, ReportsIdentityWhenNoStageModifiesAnything) {
     }
     {
         // Tracking renames backwards.
-        auto pipeline = unittest::assertGet(Pipeline::create({DocumentSourceMock::createForTest(),
-                                                              NoModifications::create(),
-                                                              NoModifications::create(),
-                                                              NoModifications::create()},
-                                                             expCtx));
+        auto pipeline = Pipeline::create({DocumentSourceMock::createForTest(),
+                                          NoModifications::create(),
+                                          NoModifications::create(),
+                                          NoModifications::create()},
+                                         expCtx);
         auto renames = semantic_analysis::renamedPaths(
             pipeline->getSources().crbegin(), pipeline->getSources().crend(), {"a", "b", "c.d"});
         auto nameMap = *renames;
@@ -3074,11 +3281,11 @@ TEST(PipelineRenameTracking, ReportsIdentityWhenNoStageModifiesAnything) {
     }
     {
         // Tracking renames forwards.
-        auto pipeline = unittest::assertGet(Pipeline::create({DocumentSourceMock::createForTest(),
-                                                              NoModifications::create(),
-                                                              NoModifications::create(),
-                                                              NoModifications::create()},
-                                                             expCtx));
+        auto pipeline = Pipeline::create({DocumentSourceMock::createForTest(),
+                                          NoModifications::create(),
+                                          NoModifications::create(),
+                                          NoModifications::create()},
+                                         expCtx);
         auto renames = semantic_analysis::renamedPaths(
             pipeline->getSources().cbegin(), pipeline->getSources().cend(), {"a", "b", "c.d"});
         auto nameMap = *renames;
@@ -3106,11 +3313,11 @@ public:
 
 TEST(PipelineRenameTracking, DoesNotReportRenamesIfAStageDoesNotSupportTrackingThem) {
     boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
-    auto pipeline = unittest::assertGet(Pipeline::create({DocumentSourceMock::createForTest(),
-                                                          NoModifications::create(),
-                                                          NotSupported::create(),
-                                                          NoModifications::create()},
-                                                         expCtx));
+    auto pipeline = Pipeline::create({DocumentSourceMock::createForTest(),
+                                      NoModifications::create(),
+                                      NotSupported::create(),
+                                      NoModifications::create()},
+                                     expCtx);
     // Backwards case.
     ASSERT_FALSE(static_cast<bool>(semantic_analysis::renamedPaths(
         pipeline->getSources().crbegin(), pipeline->getSources().crend(), {"a"})));
@@ -3140,8 +3347,8 @@ public:
 
 TEST(PipelineRenameTracking, ReportsNewNamesWhenSingleStageRenames) {
     boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
-    auto pipeline = unittest::assertGet(
-        Pipeline::create({DocumentSourceMock::createForTest(), RenamesAToB::create()}, expCtx));
+    auto pipeline =
+        Pipeline::create({DocumentSourceMock::createForTest(), RenamesAToB::create()}, expCtx);
     {
         // Tracking backwards.
         auto renames = semantic_analysis::renamedPaths(
@@ -3206,8 +3413,8 @@ TEST(PipelineRenameTracking, ReportsNewNamesWhenSingleStageRenames) {
 
 TEST(PipelineRenameTracking, ReportsIdentityMapWhenGivenEmptyIteratorRange) {
     boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
-    auto pipeline = unittest::assertGet(
-        Pipeline::create({DocumentSourceMock::createForTest(), RenamesAToB::create()}, expCtx));
+    auto pipeline =
+        Pipeline::create({DocumentSourceMock::createForTest(), RenamesAToB::create()}, expCtx);
     {
         // Tracking backwards.
         auto renames = semantic_analysis::renamedPaths(
@@ -3264,9 +3471,9 @@ TEST(PipelineRenameTracking, ReportsNewNameAcrossMultipleRenames) {
     boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
     {
         // Tracking backwards.
-        auto pipeline = unittest::assertGet(Pipeline::create(
+        auto pipeline = Pipeline::create(
             {DocumentSourceMock::createForTest(), RenamesAToB::create(), RenamesBToC::create()},
-            expCtx));
+            expCtx);
         auto stages = pipeline->getSources();
         auto renames = semantic_analysis::renamedPaths(stages.crbegin(), stages.crend(), {"c"});
         ASSERT(static_cast<bool>(renames));
@@ -3276,9 +3483,9 @@ TEST(PipelineRenameTracking, ReportsNewNameAcrossMultipleRenames) {
     }
     {
         // Tracking forwards.
-        auto pipeline = unittest::assertGet(Pipeline::create(
+        auto pipeline = Pipeline::create(
             {DocumentSourceMock::createForTest(), RenamesAToB::create(), RenamesBToC::create()},
-            expCtx));
+            expCtx);
         auto stages = pipeline->getSources();
         auto renames = semantic_analysis::renamedPaths(stages.cbegin(), stages.cend(), {"a"});
         ASSERT(static_cast<bool>(renames));
@@ -3303,9 +3510,9 @@ TEST(PipelineRenameTracking, CanHandleBackAndForthRename) {
     boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
     {
         // Tracking backwards.
-        auto pipeline = unittest::assertGet(Pipeline::create(
+        auto pipeline = Pipeline::create(
             {DocumentSourceMock::createForTest(), RenamesAToB::create(), RenamesBToA::create()},
-            expCtx));
+            expCtx);
         auto stages = pipeline->getSources();
         auto renames = semantic_analysis::renamedPaths(stages.crbegin(), stages.crend(), {"a"});
         ASSERT(static_cast<bool>(renames));
@@ -3315,9 +3522,9 @@ TEST(PipelineRenameTracking, CanHandleBackAndForthRename) {
     }
     {
         // Tracking forwards.
-        auto pipeline = unittest::assertGet(Pipeline::create(
+        auto pipeline = Pipeline::create(
             {DocumentSourceMock::createForTest(), RenamesAToB::create(), RenamesBToA::create()},
-            expCtx));
+            expCtx);
         auto stages = pipeline->getSources();
         auto renames = semantic_analysis::renamedPaths(stages.cbegin(), stages.cend(), {"a"});
         ASSERT(static_cast<bool>(renames));
@@ -3329,12 +3536,12 @@ TEST(PipelineRenameTracking, CanHandleBackAndForthRename) {
 
 TEST(InvolvedNamespacesTest, NoInvolvedNamespacesForMatchSortProject) {
     boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
-    auto pipeline = unittest::assertGet(Pipeline::create(
+    auto pipeline = Pipeline::create(
         {DocumentSourceMock::createForTest(),
          DocumentSourceMatch::create(BSON("x" << 1), expCtx),
          DocumentSourceSort::create(expCtx, BSON("y" << -1)),
          DocumentSourceProject::create(BSON("x" << 1 << "y" << 1), expCtx, "$project"_sd)},
-        expCtx));
+        expCtx);
     auto involvedNssSet = pipeline->getInvolvedCollections();
     ASSERT(involvedNssSet.empty());
 }
@@ -3346,10 +3553,10 @@ TEST(InvolvedNamespacesTest, IncludesLookupNamespace) {
     expCtx->setResolvedNamespace(lookupNss, {resolvedNss, vector<BSONObj>{}});
     auto lookupSpec =
         fromjson("{$lookup: {from: 'foo', as: 'x', localField: 'foo_id', foreignField: '_id'}}");
-    auto pipeline = unittest::assertGet(
+    auto pipeline =
         Pipeline::create({DocumentSourceMock::createForTest(),
                           DocumentSourceLookUp::createFromBson(lookupSpec.firstElement(), expCtx)},
-                         expCtx));
+                         expCtx);
 
     auto involvedNssSet = pipeline->getInvolvedCollections();
     ASSERT_EQ(involvedNssSet.size(), 1UL);
@@ -3369,10 +3576,10 @@ TEST(InvolvedNamespacesTest, IncludesGraphLookupNamespace) {
         "  connectToField: 'y',"
         "  startWith: '$start'"
         "}}");
-    auto pipeline = unittest::assertGet(Pipeline::create(
+    auto pipeline = Pipeline::create(
         {DocumentSourceMock::createForTest(),
          DocumentSourceGraphLookUp::createFromBson(graphLookupSpec.firstElement(), expCtx)},
-        expCtx));
+        expCtx);
 
     auto involvedNssSet = pipeline->getInvolvedCollections();
     ASSERT_EQ(involvedNssSet.size(), 1UL);
@@ -3393,10 +3600,10 @@ TEST(InvolvedNamespacesTest, IncludesLookupSubpipelineNamespaces) {
         "  as: 'x', "
         "  pipeline: [{$lookup: {from: 'foo_inner', as: 'y', pipeline: []}}]"
         "}}");
-    auto pipeline = unittest::assertGet(
+    auto pipeline =
         Pipeline::create({DocumentSourceMock::createForTest(),
                           DocumentSourceLookUp::createFromBson(lookupSpec.firstElement(), expCtx)},
-                         expCtx));
+                         expCtx);
 
     auto involvedNssSet = pipeline->getInvolvedCollections();
     ASSERT_EQ(involvedNssSet.size(), 2UL);
@@ -3424,10 +3631,10 @@ TEST(InvolvedNamespacesTest, IncludesGraphLookupSubPipeline) {
         "  connectToField: 'y',"
         "  startWith: '$start'"
         "}}");
-    auto pipeline = unittest::assertGet(Pipeline::create(
+    auto pipeline = Pipeline::create(
         {DocumentSourceMock::createForTest(),
          DocumentSourceGraphLookUp::createFromBson(graphLookupSpec.firstElement(), expCtx)},
-        expCtx));
+        expCtx);
 
     auto involvedNssSet = pipeline->getInvolvedCollections();
     ASSERT_EQ(involvedNssSet.size(), 2UL);
@@ -3467,10 +3674,10 @@ TEST(InvolvedNamespacesTest, IncludesAllCollectionsWhenResolvingViews) {
         "    }}"
         "  ]"
         "}}");
-    auto pipeline = unittest::assertGet(
+    auto pipeline =
         Pipeline::create({DocumentSourceMock::createForTest(),
                           DocumentSourceFacet::createFromBson(facetSpec.firstElement(), expCtx)},
-                         expCtx));
+                         expCtx);
 
     auto involvedNssSet = pipeline->getInvolvedCollections();
     ASSERT_EQ(involvedNssSet.size(), 3UL);

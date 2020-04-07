@@ -57,7 +57,7 @@
 #include "mongo/db/query/view_response_formatter.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/views/resolved_view.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 namespace {
@@ -76,6 +76,10 @@ public:
         return AllowedOnSecondary::kOptIn;
     }
 
+    bool maintenanceOk() const override {
+        return false;
+    }
+
     bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
@@ -87,6 +91,10 @@ public:
     ReadConcernSupportResult supportsReadConcern(const BSONObj& cmdObj,
                                                  repl::ReadConcernLevel level) const override {
         return ReadConcernSupportResult::allSupportedAndDefaultPermitted();
+    }
+
+    bool supportsReadMirroring(const BSONObj&) const override {
+        return true;
     }
 
     ReadWriteType getReadWriteType() const override {
@@ -161,7 +169,7 @@ public:
         Collection* const collection = ctx->getCollection();
 
         auto executor = uassertStatusOK(
-            getExecutorDistinct(opCtx, collection, QueryPlannerParams::DEFAULT, &parsedDistinct));
+            getExecutorDistinct(collection, QueryPlannerParams::DEFAULT, &parsedDistinct));
 
         auto bodyBuilder = result->getBodyBuilder();
         Explain::explainStages(executor.get(), collection, verbosity, BSONObj(), &bodyBuilder);
@@ -217,7 +225,7 @@ public:
         Collection* const collection = ctx->getCollection();
 
         auto executor =
-            getExecutorDistinct(opCtx, collection, QueryPlannerParams::DEFAULT, &parsedDistinct);
+            getExecutorDistinct(collection, QueryPlannerParams::DEFAULT, &parsedDistinct);
         uassertStatusOK(executor.getStatus());
 
         {
@@ -267,10 +275,14 @@ public:
             // We should always have a valid status member object at this point.
             auto status = WorkingSetCommon::getMemberObjectStatus(obj);
             invariant(!status.isOK());
-            warning() << "Plan executor error during distinct command: "
-                      << redact(PlanExecutor::statestr(state)) << ", status: " << status
-                      << ", stats: "
-                      << redact(Explain::getWinningPlanStats(executor.getValue().get()));
+            LOGV2_WARNING(
+                23797,
+                "Plan executor error during distinct command: {PlanExecutor_statestr_state}, "
+                "status: {status}, stats: {Explain_getWinningPlanStats_executor_getValue_get}",
+                "PlanExecutor_statestr_state"_attr = redact(PlanExecutor::statestr(state)),
+                "status"_attr = status,
+                "Explain_getWinningPlanStats_executor_getValue_get"_attr =
+                    redact(Explain::getWinningPlanStats(executor.getValue().get())));
 
             uassertStatusOK(status.withContext("Executor error during distinct command"));
         }
@@ -301,6 +313,21 @@ public:
         uassert(31299, "distinct too big, 16mb cap", result.len() < kMaxResponseSize);
         return true;
     }
+
+    void appendMirrorableRequest(BSONObjBuilder* bob, const BSONObj& cmdObj) const override {
+        static const auto kMirrorableKeys = [] {
+            BSONObjBuilder keyBob;
+            keyBob.append("distinct", 1);
+            keyBob.append("key", 1);
+            keyBob.append("query", 1);
+            keyBob.append("collation", 1);
+            return keyBob.obj();
+        }();
+
+        // Filter the keys that can be mirrored
+        cmdObj.filterFieldsUndotted(bob, kMirrorableKeys, true);
+    }
+
 
 } distinctCmd;
 

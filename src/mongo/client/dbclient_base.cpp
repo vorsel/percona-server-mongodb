@@ -56,6 +56,7 @@
 #include "mongo/db/wire_version.h"
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/executor/remote_command_response.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/rpc/factory.h"
 #include "mongo/rpc/get_status_from_command_result.h"
@@ -66,7 +67,6 @@
 #include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/debug_util.h"
-#include "mongo/util/log.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/password_digest.h"
@@ -469,7 +469,7 @@ Status DBClientBase::authenticateInternalUser() {
     ScopedMetadataWriterRemover remover{this};
     if (!auth::isInternalAuthSet()) {
         if (!serverGlobalParams.quiet.load()) {
-            log() << "ERROR: No authentication parameters set for internal user";
+            LOGV2(20116, "ERROR: No authentication parameters set for internal user");
         }
         return {ErrorCodes::AuthenticationFailed,
                 "No authentication parameters set for internal user"};
@@ -491,8 +491,10 @@ Status DBClientBase::authenticateInternalUser() {
     }
 
     if (serverGlobalParams.quiet.load()) {
-        log() << "can't authenticate to " << toString()
-              << " as internal user, error: " << status.reason();
+        LOGV2(20117,
+              "can't authenticate to {} as internal user, error: {status_reason}",
+              ""_attr = toString(),
+              "status_reason"_attr = status.reason());
     }
 
     return status;
@@ -831,9 +833,12 @@ void DBClientBase::killCursor(const NamespaceString& ns, long long cursorId) {
         OpMsgRequest::fromDBAndBody(ns.db(), KillCursorsRequest(ns, {cursorId}).toBSON()));
 }
 
-list<BSONObj> DBClientBase::getIndexSpecs(const NamespaceStringOrUUID& nsOrUuid, int options) {
-    list<BSONObj> specs;
+namespace {
 
+/**
+ * Constructs command object for listIndexes.
+ */
+BSONObj makeListIndexesCommand(const NamespaceStringOrUUID& nsOrUuid, bool includeBuildUUIDs) {
     BSONObjBuilder bob;
     if (nsOrUuid.nss()) {
         bob.append("listIndexes", (*nsOrUuid.nss()).coll());
@@ -843,10 +848,37 @@ list<BSONObj> DBClientBase::getIndexSpecs(const NamespaceStringOrUUID& nsOrUuid,
         uuid.appendToBuilder(&bob, "listIndexes");
         bob.append("cursor", BSONObj());
     }
+    if (includeBuildUUIDs) {
+        bob.appendBool("includeBuildUUIDs", true);
+    }
+    return bob.obj();
+}
 
-    BSONObj cmd = bob.obj();
+}  // namespace
+
+list<BSONObj> DBClientBase::getIndexSpecs(const NamespaceStringOrUUID& nsOrUuid, int options) {
+    return _getIndexSpecs(nsOrUuid, makeListIndexesCommand(nsOrUuid, false), options);
+}
+
+std::list<BSONObj> DBClientBase::getReadyIndexSpecs(const NamespaceStringOrUUID& nsOrUuid,
+                                                    int options) {
+    auto specsWithBuildUUIDs =
+        _getIndexSpecs(nsOrUuid, makeListIndexesCommand(nsOrUuid, true), options);
+    list<BSONObj> specs;
+    for (const auto& spec : specsWithBuildUUIDs) {
+        if (spec["buildUUID"]) {
+            continue;
+        }
+        specs.push_back(spec);
+    }
+    return specs;
+}
+
+std::list<BSONObj> DBClientBase::_getIndexSpecs(const NamespaceStringOrUUID& nsOrUuid,
+                                                const BSONObj& cmd,
+                                                int options) {
+    list<BSONObj> specs;
     auto dbName = (nsOrUuid.uuid() ? nsOrUuid.dbname() : (*nsOrUuid.nss()).db().toString());
-
     BSONObj res;
     if (runCommand(dbName, cmd, res, options)) {
         BSONObj cursorObj = res["cursor"].Obj();
@@ -892,7 +924,10 @@ void DBClientBase::dropIndex(const string& ns, const string& indexName) {
     if (!runCommand(nsToDatabase(ns),
                     BSON("dropIndexes" << nsToCollectionSubstring(ns) << "index" << indexName),
                     info)) {
-        LOG(_logLevel) << "dropIndex failed: " << info << endl;
+        LOGV2_DEBUG(20118,
+                    logSeverityV1toV2(_logLevel).toInt(),
+                    "dropIndex failed: {info}",
+                    "info"_attr = info);
         uassert(10007, "dropIndex failed", 0);
     }
 }

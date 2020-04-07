@@ -35,7 +35,6 @@
 #include "mongo/db/catalog/uncommitted_collections.h"
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -64,10 +63,16 @@ void UncommittedCollections::addToTxn(OperationContext* opCtx,
 
     auto collListUnowned = getUncommittedCollections(opCtx).getResources();
 
+    opCtx->recoveryUnit()->onRollback([collListUnowned, uuid, nss]() {
+        UncommittedCollections::erase(uuid, nss, collListUnowned.lock().get());
+    });
+
+
     opCtx->recoveryUnit()->registerPreCommitHook(
         [collListUnowned, uuid, createTime](OperationContext* opCtx) {
             UncommittedCollections::commit(opCtx, uuid, createTime, collListUnowned.lock().get());
         });
+
     opCtx->recoveryUnit()->onCommit(
         [collListUnowned, collPtr, createTime](boost::optional<Timestamp> commitTs) {
             // Verify that the collection was given a minVisibleTimestamp equal to the transactions
@@ -75,8 +80,6 @@ void UncommittedCollections::addToTxn(OperationContext* opCtx,
             invariant(collPtr->getMinimumVisibleSnapshot() == createTime);
             UncommittedCollections::clear(collListUnowned.lock().get());
         });
-    opCtx->recoveryUnit()->onRollback(
-        [collListUnowned]() { UncommittedCollections::clear(collListUnowned.lock().get()); });
 }
 
 Collection* UncommittedCollections::getForTxn(OperationContext* opCtx,
@@ -108,6 +111,19 @@ Collection* UncommittedCollections::getForTxn(OperationContext* opCtx, const UUI
     return it->second.get();
 }
 
+void UncommittedCollections::erase(UUID uuid, NamespaceString nss, UncommittedCollectionsMap* map) {
+    map->erase(uuid, nss);
+}
+
+void UncommittedCollections::rollback(ServiceContext* svcCtx,
+                                      CollectionUUID uuid,
+                                      UncommittedCollectionsMap* map) {
+    auto collPtr = CollectionCatalog::get(svcCtx).deregisterCollection(uuid);
+    auto nss = collPtr.get()->ns();
+    map->_collections[uuid] = std::move(collPtr);
+    map->_nssIndex.insert({nss, uuid});
+}
+
 void UncommittedCollections::commit(OperationContext* opCtx,
                                     UUID uuid,
                                     Timestamp createTs,
@@ -125,14 +141,19 @@ void UncommittedCollections::commit(OperationContext* opCtx,
     CollectionCatalog::get(opCtx).registerCollection(uuid, &(it->second));
     map->_collections.erase(it);
     map->_nssIndex.erase(nss);
+    auto svcCtx = opCtx->getServiceContext();
+    auto collListUnowned = getUncommittedCollections(opCtx).getResources();
+
+    opCtx->recoveryUnit()->onRollback([svcCtx, collListUnowned, uuid]() {
+        UncommittedCollections::rollback(svcCtx, uuid, collListUnowned.lock().get());
+    });
+    opCtx->recoveryUnit()->onCommit([svcCtx, uuid](boost::optional<Timestamp> commitTs) {
+        CollectionCatalog::get(svcCtx).makeCollectionVisible(uuid);
+    });
 }
 
-bool UncommittedCollections::hasExclusiveAccessToCollection(OperationContext* opCtx,
-                                                            const NamespaceString& nss) const {
-    if (opCtx->lockState()->isCollectionLockedForMode(nss, MODE_X)) {
-        return true;
-    }
-
+bool UncommittedCollections::isUncommittedCollection(OperationContext* opCtx,
+                                                     const NamespaceString& nss) const {
     if (_resourcesPtr->_nssIndex.count(nss) == 1) {
         // If the collection is found in the local catalog, the appropriate locks must have already
         // been taken.
@@ -141,6 +162,17 @@ bool UncommittedCollections::hasExclusiveAccessToCollection(OperationContext* op
     }
 
     return false;
+}
+
+void UncommittedCollections::invariantHasExclusiveAccessToCollection(
+    OperationContext* opCtx, const NamespaceString& nss) const {
+    invariant(opCtx->lockState()->isCollectionLockedForMode(nss, MODE_X) ||
+                  isUncommittedCollection(opCtx, nss),
+              nss.toString());
+}
+
+bool UncommittedCollections::isEmpty() {
+    return _resourcesPtr->empty();
 }
 
 }  // namespace mongo

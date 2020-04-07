@@ -72,8 +72,9 @@ public:
     bool canAcceptWritesForDatabase(OperationContext* opCtx, StringData dbName) final;
     bool canAcceptWritesForDatabase_UNSAFE(OperationContext* opCtx, StringData dbName) final;
 
-    bool canAcceptWritesFor(OperationContext* opCtx, const NamespaceString& ns) final;
-    bool canAcceptWritesFor_UNSAFE(OperationContext* opCtx, const NamespaceString& ns) final;
+    bool canAcceptWritesFor(OperationContext* opCtx, const NamespaceStringOrUUID& nsOrUUID) final;
+    bool canAcceptWritesFor_UNSAFE(OperationContext* opCtx,
+                                   const NamespaceStringOrUUID& nsOrUUID) final;
 
     Status checkCanServeReadsFor(OperationContext* opCtx,
                                  const NamespaceString& ns,
@@ -163,7 +164,7 @@ public:
 
     ReplSetConfig getConfig() const final;
 
-    void processReplSetGetConfig(BSONObjBuilder*) final;
+    void processReplSetGetConfig(BSONObjBuilder*, bool commitmentStatus = false) final;
 
     void processReplSetMetadata(const rpc::ReplSetMetadata&) final;
 
@@ -181,6 +182,10 @@ public:
     Status processReplSetReconfig(OperationContext*,
                                   const ReplSetReconfigArgs&,
                                   BSONObjBuilder*) final;
+
+    Status doReplSetReconfig(OperationContext* opCtx,
+                             GetNewConfigFn getNewConfig,
+                             bool force) final;
 
     Status processReplSetInitiate(OperationContext*, const BSONObj&, BSONObjBuilder*) final;
 
@@ -251,6 +256,8 @@ public:
 
     void finishRecoveryIfEligible(OperationContext* opCtx) final;
 
+    void incrementTopologyVersion(OperationContext* opCtx) final;
+
     void updateAndLogStateTransitionMetrics(
         const ReplicationCoordinator::OpsKillingStateTransitionEnum stateTransition,
         const size_t numOpsKilled,
@@ -264,7 +271,13 @@ public:
         boost::optional<TopologyVersion> clientTopologyVersion,
         boost::optional<Date_t> deadline) const final;
 
+    SharedSemiFuture<std::shared_ptr<const IsMasterResponse>> getIsMasterResponseFuture(
+        const SplitHorizon::Parameters& horizonParams,
+        boost::optional<TopologyVersion> clientTopologyVersion) const final;
+
     OpTime getLatestWriteOpTime(OperationContext* opCtx) const override;
+
+    HostAndPort getCurrentPrimaryHostAndPort() const override;
 
 private:
     ServiceContext* const _service;

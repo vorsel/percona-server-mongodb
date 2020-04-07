@@ -43,7 +43,7 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/aggregation_request.h"
 #include "mongo/db/pipeline/javascript_execution.h"
-#include "mongo/db/pipeline/mongo_process_interface.h"
+#include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
 #include "mongo/db/pipeline/runtime_constants_gen.h"
 #include "mongo/db/pipeline/variables.h"
 #include "mongo/db/query/collation/collator_interface.h"
@@ -59,6 +59,7 @@ namespace mongo {
 
 class ExpressionContext : public RefCountable {
 public:
+    static constexpr size_t kMaxSubPipelineViewDepth = 20;
     struct ResolvedNamespace {
         ResolvedNamespace() = default;
         ResolvedNamespace(NamespaceString ns, std::vector<BSONObj> pipeline);
@@ -94,8 +95,7 @@ public:
 
         boost::intrusive_ptr<ExpressionContext> _expCtx;
 
-        std::unique_ptr<CollatorInterface> _originalCollatorOwned;
-        const CollatorInterface* _originalCollatorUnowned{nullptr};
+        std::unique_ptr<CollatorInterface> _originalCollator;
     };
 
     /**
@@ -120,6 +120,7 @@ public:
                       bool needsMerge,
                       bool allowDiskUse,
                       bool bypassDocumentValidation,
+                      bool isMapReduceCommand,
                       const NamespaceString& ns,
                       const boost::optional<RuntimeConstants>& runtimeConstants,
                       std::unique_ptr<CollatorInterface> collator,
@@ -134,7 +135,8 @@ public:
      * If 'collator' is null, the simple collator will be used.
      */
     ExpressionContext(OperationContext* opCtx,
-                      const CollatorInterface* collator,
+                      std::unique_ptr<CollatorInterface> collator,
+                      const NamespaceString& ns,
                       const boost::optional<RuntimeConstants>& runtimeConstants = boost::none);
 
     /**
@@ -165,7 +167,11 @@ public:
     }
 
     const CollatorInterface* getCollator() const {
-        return _unownedCollator;
+        return _collator.get();
+    }
+
+    bool shouldCollectExecStats() const {
+        return static_cast<bool>(explain);
     }
 
     /**
@@ -178,10 +184,22 @@ public:
      * the ExpressionContext.
      */
     BSONObj getCollatorBSON() const {
-        return _unownedCollator ? _unownedCollator->getSpec().toBSON() : CollationSpec::kSimpleSpec;
+        return _collator ? _collator->getSpec().toBSON() : CollationSpec::kSimpleSpec;
     }
 
-    void setCollator(const CollatorInterface* collator);
+    /**
+     * Sets '_collator' and resets 'documentComparator' and 'valueComparator'.
+     *
+     * Use with caution - '_collator' is used in the context of a Pipeline, and it is illegal
+     * to change the collation once a Pipeline has been parsed with this ExpressionContext.
+     */
+    void setCollator(std::unique_ptr<CollatorInterface> collator) {
+        _collator = std::move(collator);
+
+        // Document/Value comparisons must be aware of the collation.
+        _documentComparator = DocumentComparator(_collator.get());
+        _valueComparator = ValueComparator(_collator.get());
+    }
 
     const DocumentComparator& getDocumentComparator() const {
         return _documentComparator;
@@ -206,6 +224,16 @@ public:
         NamespaceString ns,
         boost::optional<UUID> uuid = boost::none,
         boost::optional<std::unique_ptr<CollatorInterface>> updatedCollator = boost::none) const;
+
+    boost::intrusive_ptr<ExpressionContext> copyForSubPipeline(NamespaceString nss) const {
+        uassert(ErrorCodes::MaxSubPipelineDepthExceeded,
+                str::stream() << "Maximum number of nested sub-pipelines exceeded. Limit is "
+                              << ExpressionContext::kMaxSubPipelineViewDepth,
+                subPipelineDepth < kMaxSubPipelineViewDepth);
+        auto newCopy = copyWith(std::move(nss));
+        newCopy->subPipelineDepth += 1;
+        return newCopy;
+    }
 
     /**
      * Returns the ResolvedNamespace corresponding to 'nss'. It is an error to call this method on a
@@ -236,16 +264,34 @@ public:
     /**
      * Retrieves the Javascript Scope for the current thread or creates a new one if it has not been
      * created yet. Initializes the Scope with the 'jsScope' variables from the runtimeConstants.
+     * Loads the Scope with the functions stored in system.js if the expression isn't executed on
+     * mongos and is called from a MapReduce command or `forceLoadOfStoredProcedures` is true.
      *
      * Returns a JsExec and a boolean indicating whether the Scope was created as part of this call.
      */
-    auto getJsExecWithScope() const {
+    auto getJsExecWithScope(bool forceLoadOfStoredProcedures = false) const {
         uassert(31264,
                 "Cannot run server-side javascript without the javascript engine enabled",
                 getGlobalScriptEngine());
         RuntimeConstants runtimeConstants = getRuntimeConstants();
+        const boost::optional<bool> isMapReduceCommand = runtimeConstants.getIsMapReduce();
+        if (inMongos) {
+            invariant(!forceLoadOfStoredProcedures);
+            invariant(!isMapReduceCommand);
+        }
+
+        // Stored procedures are only loaded for the $where expression and MapReduce command.
+        const bool loadStoredProcedures = forceLoadOfStoredProcedures || isMapReduceCommand;
+
+        if (hasWhereClause && !loadStoredProcedures) {
+            uasserted(4649200,
+                      "A single operation cannot use both JavaScript aggregation expressions and "
+                      "$where.");
+        }
+
         const boost::optional<mongo::BSONObj>& scope = runtimeConstants.getJsScope();
-        return JsExecution::get(opCtx, scope.get_value_or(BSONObj()), ns.db());
+        return JsExecution::get(
+            opCtx, scope.get_value_or(BSONObj()), ns.db(), loadStoredProcedures, jsHeapLimitMB);
     }
 
     // The explain verbosity requested by the user, or boost::none if no explain was requested.
@@ -257,6 +303,7 @@ public:
     bool allowDiskUse = false;
     bool bypassDocumentValidation = false;
     bool inMultiDocumentTransaction = false;
+    bool hasWhereClause = false;
 
     NamespaceString ns;
 
@@ -266,6 +313,15 @@ public:
     std::string tempDir;  // Defaults to empty to prevent external sorting in mongos.
 
     OperationContext* opCtx;
+
+    // When set restricts the global JavaScript heap size limit for any Scope returned by
+    // getJsExecWithScope(). This limit is ignored if larger than the global limit dictated by the
+    // 'jsHeapLimitMB' server parameter.
+    boost::optional<int> jsHeapLimitMB;
+
+    // When set this timeout limits the allowed execution time for a JavaScript function invocation
+    // under any Scope returned by getJsExecWithScope().
+    int jsFnTimeoutMillis;
 
     // An interface for accessing information or performing operations that have different
     // implementations on mongod and mongos, or that only make sense on one of the two.
@@ -310,27 +366,10 @@ public:
 protected:
     static const int kInterruptCheckPeriod = 128;
 
-    /**
-     * Sets '_ownedCollator' and resets '_unownedCollator', 'documentComparator' and
-     * 'valueComparator'.
-     *
-     * Use with caution - '_ownedCollator' is used in the context of a Pipeline, and it is illegal
-     * to change the collation once a Pipeline has been parsed with this ExpressionContext.
-     */
-    void setCollator(std::unique_ptr<CollatorInterface> collator) {
-        _ownedCollator = std::move(collator);
-        setCollator(_ownedCollator.get());
-    }
-
     friend class CollatorStash;
 
-    // Collator used for comparisons. This is owned in the context of a Pipeline.
-    // TODO SERVER-31294: Move ownership of an aggregation's collator elsewhere.
-    std::unique_ptr<CollatorInterface> _ownedCollator;
-
-    // Collator used for comparisons. If '_ownedCollator' is non-null, then this must point to the
-    // same collator object.
-    const CollatorInterface* _unownedCollator = nullptr;
+    // Collator used for comparisons.
+    std::unique_ptr<CollatorInterface> _collator;
 
     // Used for all comparisons of Document/Value during execution of the aggregation operation.
     // Must not be changed after parsing a Pipeline with this ExpressionContext.

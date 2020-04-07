@@ -186,9 +186,10 @@ selector:
   ##
 
   # Uses getMore in the same state function as a command not supported in a transaction.
-  - jstests/concurrency/fsm_workloads/list_indexes.js
+  - jstests/concurrency/fsm_workloads/agg_union_with_chunk_migrations.js
   - jstests/concurrency/fsm_workloads/create_capped_collection.js
   - jstests/concurrency/fsm_workloads/create_capped_collection_maxdocs.js
+  - jstests/concurrency/fsm_workloads/list_indexes.js
 
   # Uses non-retryable commands in the same state function as a command not supported in a
   # transaction.
@@ -202,6 +203,7 @@ selector:
   - jstests/concurrency/fsm_workloads/random_moveChunk_refine_collection_shard_key.js
   - jstests/concurrency/fsm_workloads/random_moveChunk_refine_collection_shard_key_broadcast_delete_transaction.js
   - jstests/concurrency/fsm_workloads/random_moveChunk_refine_collection_shard_key_broadcast_update_transaction.js
+  - jstests/concurrency/fsm_workloads/random_moveChunk_index_operations.js
 
   # JS engine interruptions on mongos return ErrorCodes::Interrupted, which isn't
   # considered a retryable or transient transaction error.
@@ -217,6 +219,10 @@ selector:
   # These start a transaction in one state function and use it in other state functions. This suite
   # would instead execute each state function as its own transaction.
   - state_functions_share_transaction
+  # Tests which expect commands to fail and catch the error can cause transactions to abort and
+  # retry indefinitely.
+  - catches_command_failures
+
   # Note that "requires_non_retryable_writes" does not need to be blacklisted because some writes
   # that are not individually retryable can be retried if they are part of a transaction.
 
@@ -253,6 +259,7 @@ executor:
     wait_for_mongos_retarget: true
   - class: CheckReplDBHash
   - class: ValidateCollections
+  - class: CheckOrphansDeleted
   - class: CleanupConcurrencyWorkloads
   fixture:
     class: ShardedClusterFixture

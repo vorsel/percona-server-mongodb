@@ -31,6 +31,7 @@
 
 #include "mongo/db/pipeline/document_source_merge_gen.h"
 #include "mongo/db/pipeline/document_source_writer.h"
+#include "mongo/db/pipeline/lite_parsed_pipeline.h"
 
 namespace mongo {
 
@@ -68,15 +69,22 @@ public:
      * collection is unsharded. This ensures that the unique index verification happens once on
      * mongos and can be bypassed on the shards.
      */
-    class LiteParsed final : public LiteParsedDocumentSourceForeignCollections {
+    class LiteParsed final : public LiteParsedDocumentSourceNestedPipelines {
     public:
-        using LiteParsedDocumentSourceForeignCollections::
-            LiteParsedDocumentSourceForeignCollections;
+        LiteParsed(std::string parseTimeName,
+                   NamespaceString foreignNss,
+                   MergeWhenMatchedModeEnum whenMatched,
+                   MergeWhenNotMatchedModeEnum whenNotMatched,
+                   boost::optional<LiteParsedPipeline> onMatchedPipeline)
+            : LiteParsedDocumentSourceNestedPipelines(
+                  std::move(parseTimeName), std::move(foreignNss), std::move(onMatchedPipeline)),
+              _whenMatched(whenMatched),
+              _whenNotMatched(whenNotMatched) {}
 
-        static std::unique_ptr<LiteParsed> parse(const AggregationRequest& request,
+        static std::unique_ptr<LiteParsed> parse(const NamespaceString& nss,
                                                  const BSONElement& spec);
 
-        bool allowedToPassthroughFromMongos() const final {
+        bool allowedToPassthroughFromMongos() const {
             return false;
         }
 
@@ -87,6 +95,13 @@ public:
                   "{} cannot be used with a 'linearizable' read concern level"_format(kStageName)}},
                 Status::OK()};
         }
+
+        PrivilegeVector requiredPrivileges(bool isMongos,
+                                           bool bypassDocumentValidation) const final;
+
+    private:
+        MergeWhenMatchedModeEnum _whenMatched;
+        MergeWhenNotMatchedModeEnum _whenNotMatched;
     };
 
     virtual ~DocumentSourceMerge() = default;
@@ -112,7 +127,8 @@ public:
                 DiskUseRequirement::kWritesPersistentData,
                 FacetRequirement::kNotAllowed,
                 TransactionRequirement::kNotAllowed,
-                LookupRequirement::kNotAllowed};
+                LookupRequirement::kNotAllowed,
+                UnionRequirement::kNotAllowed};
     }
 
     boost::optional<DistributedPlanLogic> distributedPlanLogic() final override {

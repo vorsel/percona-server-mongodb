@@ -93,6 +93,7 @@ struct CollectionUpdateArgs {
     bool fromMigrate = false;
 
     StoreDocOption storeDocOption = StoreDocOption::None;
+    bool preImageRecordingEnabledForCollection = false;
 };
 
 /**
@@ -181,6 +182,53 @@ public:
                                                  RecordId catalogId,
                                                  CollectionUUID uuid,
                                                  std::unique_ptr<RecordStore> rs) const = 0;
+    };
+
+    /**
+     * A Collection::Validator represents a filter that is applied to all documents that are
+     * inserted. Enforcement of Validators being well formed is done lazily, so the 'Validator'
+     * class may represent a validator which is not well formed.
+     */
+    struct Validator {
+
+        /**
+         * Returns whether the validator's filter is well formed.
+         */
+        bool isOK() const {
+            return filter.isOK();
+        }
+
+        /**
+         * Returns OK or the error encounter when parsing the validator.
+         */
+        Status getStatus() const {
+            return filter.getStatus();
+        }
+
+        /**
+         * Empty means no validator. This must outlive 'filter'.
+         */
+        BSONObj validatorDoc;
+
+        /**
+         * A special ExpressionContext used to evaluate the filter match expression. This should
+         * outlive 'filter'.
+         */
+        boost::intrusive_ptr<ExpressionContext> expCtxForFilter;
+
+        /**
+         * The collection validator MatchExpression. This is stored as a StatusWith, as we lazily
+         * enforce that collection validators are well formed.
+         *
+         * -A non-OK Status indicates that the validator is not well formed, and any attempts to
+         * enforce the validator should error.
+         *
+         * -A value of Status::OK/nullptr indicates that there is no validator.
+         *
+         * -Anything else indicates a well formed validator. The MatchExpression will maintain
+         * pointers into _validatorDoc.
+         */
+        StatusWithMatchExpression filter = {nullptr};
     };
 
     /**
@@ -353,7 +401,7 @@ public:
     /**
      * Returns a non-ok Status if validator is not legal for this collection.
      */
-    virtual StatusWithMatchExpression parseValidator(
+    virtual Validator parseValidator(
         OperationContext* opCtx,
         const BSONObj& validator,
         MatchExpressionParser::AllowedFeatureSet allowedFeatures,
@@ -382,6 +430,9 @@ public:
                                    BSONObj newValidator,
                                    StringData newLevel,
                                    StringData newAction) = 0;
+
+    virtual bool getRecordPreImages() const = 0;
+    virtual void setRecordPreImages(OperationContext* opCtx, bool val) = 0;
 
     /**
      * Returns true if this is a temporary collection.
@@ -414,6 +465,12 @@ public:
     virtual uint64_t numRecords(OperationContext* const opCtx) const = 0;
 
     virtual uint64_t dataSize(OperationContext* const opCtx) const = 0;
+
+
+    /**
+     * Returns true if the collection does not contain any records.
+     */
+    virtual bool isEmpty(OperationContext* const opCtx) const = 0;
 
     virtual int averageObjectSize(OperationContext* const opCtx) const = 0;
 
@@ -466,6 +523,16 @@ public:
     virtual void establishOplogCollectionForLogging(OperationContext* opCtx) = 0;
 
     virtual void init(OperationContext* opCtx) {}
+
+    virtual bool isCommitted() const {
+        return true;
+    }
+
+    /**
+     * Update the visibility of this collection in the Collection Catalog. Updates to this value
+     * are not idempotent, as successive updates with the same `val` should not occur.
+     */
+    virtual void setCommitted(bool val) {}
 
     virtual bool isInitialized() const {
         return false;

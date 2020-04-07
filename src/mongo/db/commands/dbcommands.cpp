@@ -87,9 +87,9 @@
 #include "mongo/db/stats/storage_stats.h"
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/write_concern.h"
+#include "mongo/logv2/log.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 #include "mongo/util/md5.hpp"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/version.h"
@@ -255,7 +255,6 @@ public:
             dropCollection(opCtx,
                            nsToDrop,
                            result,
-                           {},
                            DropCollectionSystemCollectionMode::kDisallowSystemCollectionDrops));
         return true;
     }
@@ -320,7 +319,8 @@ public:
         if (cmd.getAutoIndexId()) {
             const char* deprecationWarning =
                 "the autoIndexId option is deprecated and will be removed in a future release";
-            warning() << deprecationWarning;
+            LOGV2_WARNING(
+                23800, "{deprecationWarning}", "deprecationWarning"_attr = deprecationWarning);
             result.append("note", deprecationWarning);
         }
 
@@ -536,7 +536,7 @@ public:
         }
 
         if (PlanExecutor::FAILURE == state) {
-            warning() << "Internal error while reading " << ns;
+            LOGV2_WARNING(23801, "Internal error while reading {ns}", "ns"_attr = ns);
             uassertStatusOK(WorkingSetCommon::getMemberObjectStatus(obj).withContext(
                 "Executor error while reading during dataSize command"));
         }
@@ -561,6 +561,9 @@ public:
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
+    }
+    bool maintenanceOk() const override {
+        return false;
     }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
@@ -643,6 +646,9 @@ public:
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
+    }
+    bool maintenanceOk() const override {
+        return false;
     }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;

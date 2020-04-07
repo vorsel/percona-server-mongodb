@@ -26,9 +26,9 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
 
 #include "mongo/client/sdam/server_description.h"
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
 
 #include <algorithm>
 #include <boost/algorithm/string.hpp>
@@ -38,8 +38,8 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/oid.h"
 #include "mongo/client/sdam/sdam_datatypes.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/duration.h"
-#include "mongo/util/log.h"
 
 
 namespace mongo::sdam {
@@ -206,7 +206,9 @@ void ServerDescription::parseTypeFromIsMaster(const BSONObj isMaster) {
     } else if (isMaster.getBoolField("isreplicaset")) {
         t = ServerType::kRSGhost;
     } else {
-        error() << "unknown server type from successful ismaster reply: " << isMaster.toString();
+        LOGV2_ERROR(23931,
+                    "unknown server type from successful ismaster reply: {isMaster}",
+                    "isMaster"_attr = isMaster.toString());
         t = ServerType::kUnknown;
     }
     _type = t;
@@ -293,6 +295,15 @@ bool ServerDescription::isStreamable() const {
 }
 
 bool ServerDescription::isEquivalent(const ServerDescription& other) const {
+    if (_topologyVersion && other._topologyVersion &&
+        ((_topologyVersion->getProcessId() != other._topologyVersion->getProcessId()) ||
+         (_topologyVersion->getCounter() != other._topologyVersion->getCounter()))) {
+        return false;
+    } else if ((!_topologyVersion && other._topologyVersion) ||
+               (_topologyVersion && !other._topologyVersion)) {
+        return false;
+    }
+
     auto otherValues = std::tie(other._type,
                                 other._minWireVersion,
                                 other._maxWireVersion,
@@ -306,7 +317,6 @@ bool ServerDescription::isEquivalent(const ServerDescription& other) const {
                                 other._electionId,
                                 other._primary,
                                 other._logicalSessionTimeoutMinutes,
-                                other._topologyVersion,
                                 other._streamable,
                                 other._poolResetCounter);
     auto thisValues = std::tie(_type,
@@ -322,7 +332,6 @@ bool ServerDescription::isEquivalent(const ServerDescription& other) const {
                                _electionId,
                                _primary,
                                _logicalSessionTimeoutMinutes,
-                               _topologyVersion,
                                _streamable,
                                _poolResetCounter);
     return thisValues == otherValues;

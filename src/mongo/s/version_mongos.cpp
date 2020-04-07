@@ -35,9 +35,11 @@
 
 #include "mongo/db/log_process_details.h"
 #include "mongo/db/server_options.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_domain_global.h"
+#include "mongo/logv2/log_manager.h"
 #include "mongo/platform/process_id.h"
 #include "mongo/util/debug_util.h"
-#include "mongo/util/log.h"
 #include "mongo/util/version.h"
 
 namespace mongo {
@@ -46,11 +48,14 @@ void printShardingVersionInfo(bool isForVersionReportingOnly) {
     auto&& vii = VersionInfoInterface::instance();
 
     if (isForVersionReportingOnly) {
-        setPlainConsoleLogger();
-        log() << mongosVersion(vii);
+        auto& globalDomain = logv2::LogManager::global().getGlobalDomainInternal();
+        logv2::LogDomainGlobal::ConfigurationOptions config = globalDomain.config();
+        config.format = logv2::LogFormat::kPlain;
+        invariant(globalDomain.configure(config).isOK());
+        LOGV2(22900, "{mongosVersion_vii}", "mongosVersion_vii"_attr = mongosVersion(vii));
         vii.logBuildInfo();
     } else {
-        log() << mongosVersion(vii);
+        LOGV2(22901, "{mongosVersion_vii}", "mongosVersion_vii"_attr = mongosVersion(vii));
         logProcessDetails();
     }
 }

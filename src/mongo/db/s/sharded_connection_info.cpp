@@ -34,7 +34,7 @@
 #include "mongo/db/s/sharded_connection_info.h"
 
 #include "mongo/db/client.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 namespace {
@@ -51,7 +51,7 @@ ShardedConnectionInfo* ShardedConnectionInfo::get(Client* client, bool create) {
     auto& current = clientSCI(client);
 
     if (!current && create) {
-        LOG(1) << "entering shard mode for connection";
+        LOGV2_DEBUG(22060, 1, "entering shard mode for connection");
         current.emplace();
     }
 

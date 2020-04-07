@@ -323,7 +323,8 @@ error_codes:
     # Internal only code used by WaitForMajorityService.
     - {code: 289,name: WaitForMajorityServiceEarlierOpTimeAvailable}
 
-    - {code: 290,name: TransactionExceededLifetimeLimitSeconds,categories: [ExceededTimeLimitError]}
+    - {code: 290,name: TransactionExceededLifetimeLimitSeconds,
+                 categories: [Interruption,ExceededTimeLimitError]}
     - {code: 291,name: NoQueryExecutionPlans}
     - {code: 292,name: QueryExceededMemoryLimitNoDiskUseAllowed}
     - {code: 293,name: InvalidSeedList}
@@ -335,6 +336,12 @@ error_codes:
     - {code: 299,name: OCSPCertificateStatusRevoked}
     - {code: 300,name: RangeDeletionAbandonedBecauseCollectionWithUUIDDoesNotExist}
     - {code: 301,name: DataCorruptionDetected}
+    - {code: 302,name: OCSPCertificateStatusUnknown}
+    - {code: 303,name: SplitHorizonChange}
+    # This code should only be used upon finding that a shard has been marked stale in the sharding
+    # catalog cache, and as such does not belong in the StaleShardVersionError or
+    # NeedRetargettingError categories.
+    - {code: 304,name: ShardInvalidatedForTargeting,extra: ShardInvalidatedForTargetingInfo}
 
     # Error codes 4000-8999 are reserved.
 

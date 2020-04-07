@@ -43,7 +43,7 @@
 #include "mongo/db/repl/replication_coordinator_external_state.h"
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/storage_interface.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 namespace repl {
@@ -101,16 +101,22 @@ bool DataReplicatorExternalStateImpl::shouldStopFetching(
         // If OplogQueryMetadata was provided, its values were used to determine if we should
         // change sync sources.
         if (oqMetadata) {
-            log() << "Canceling oplog query due to OplogQueryMetadata. We have to choose a new "
-                     "sync source. Current source: "
-                  << source << ", OpTime " << oqMetadata->getLastOpApplied()
-                  << ", its sync source index:" << oqMetadata->getSyncSourceIndex();
+            LOGV2(21150,
+                  "Canceling oplog query due to OplogQueryMetadata. We have to choose a new "
+                  "sync source. Current source: {source}, OpTime {lastAppliedOpTime}, "
+                  "its sync source index:{syncSourceIndex}",
+                  "source"_attr = source,
+                  "lastAppliedOpTime"_attr = oqMetadata->getLastOpApplied(),
+                  "syncSourceIndex"_attr = oqMetadata->getSyncSourceIndex());
 
         } else {
-            log() << "Canceling oplog query due to ReplSetMetadata. We have to choose a new sync "
-                     "source. Current source: "
-                  << source << ", OpTime " << replMetadata.getLastOpVisible()
-                  << ", its sync source index:" << replMetadata.getSyncSourceIndex();
+            LOGV2(21151,
+                  "Canceling oplog query due to ReplSetMetadata. We have to choose a new sync "
+                  "source. Current source: {source}, OpTime {lastVisibleOpTime}, its "
+                  "sync source index:{syncSourceIndex}",
+                  "source"_attr = source,
+                  "lastVisibleOpTime"_attr = replMetadata.getLastOpVisible(),
+                  "syncSourceIndex"_attr = replMetadata.getSyncSourceIndex());
         }
         return true;
     }

@@ -47,15 +47,16 @@
 #include "mongo/db/query/projection_parser.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_solution.h"
+#include "mongo/logv2/log.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 
 namespace {
 
 using namespace mongo;
 
 using std::string;
+
 
 bool filterMatches(const BSONObj& testFilter,
                    const BSONObj& testCollation,
@@ -75,9 +76,8 @@ bool filterMatches(const BSONObj& testFilter,
     }
 
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    expCtx->setCollator(testCollator.get());
-    StatusWithMatchExpression statusWithMatcher =
-        MatchExpressionParser::parse(testFilter, std::move(expCtx));
+    expCtx->setCollator(std::move(testCollator));
+    StatusWithMatchExpression statusWithMatcher = MatchExpressionParser::parse(testFilter, expCtx);
     if (!statusWithMatcher.isOK()) {
         return false;
     }
@@ -137,7 +137,9 @@ bool bsonObjFieldsAreInSet(BSONObj obj, const std::set<std::string>& allowedFiel
     while (i.more()) {
         BSONElement child = i.next();
         if (!allowedFields.count(child.fieldName())) {
-            error() << "Did not expect to find " << child.fieldName();
+            LOGV2_ERROR(23932,
+                        "Did not expect to find {child_fieldName}",
+                        "child_fieldName"_attr = child.fieldName());
             return false;
         }
     }
@@ -577,9 +579,7 @@ bool QueryPlannerTestLib::solutionMatches(const BSONObj& testSoln,
         }
 
         return childrenMatch(andSortedObj, asn, relaxBoundsCheck);
-    } else if (STAGE_PROJECTION_DEFAULT == trueSoln->getType() ||
-               STAGE_PROJECTION_COVERED == trueSoln->getType() ||
-               STAGE_PROJECTION_SIMPLE == trueSoln->getType()) {
+    } else if (isProjectionStageType(trueSoln->getType())) {
         const ProjectionNode* pn = static_cast<const ProjectionNode*>(trueSoln);
 
         BSONElement el = testSoln["proj"];
@@ -621,21 +621,22 @@ bool QueryPlannerTestLib::solutionMatches(const BSONObj& testSoln,
 
         // Create an empty/dummy expression context without access to the operation context and
         // collator. This should be sufficient to parse a projection.
-        auto expCtx = make_intrusive<ExpressionContext>(nullptr, nullptr);
+        auto expCtx =
+            make_intrusive<ExpressionContext>(nullptr, nullptr, NamespaceString("test.dummy"));
         auto projection =
             projection_ast::parse(expCtx, spec.Obj(), ProjectionPolicies::findProjectionPolicies());
         auto specProjObj = projection_ast::astToDebugBSON(projection.root());
         auto solnProjObj = projection_ast::astToDebugBSON(pn->proj.root());
         return SimpleBSONObjComparator::kInstance.evaluate(specProjObj == solnProjObj) &&
             solutionMatches(child.Obj(), pn->children[0], relaxBoundsCheck);
-    } else if (STAGE_SORT == trueSoln->getType()) {
+    } else if (isSortStageType(trueSoln->getType())) {
         const SortNode* sn = static_cast<const SortNode*>(trueSoln);
         BSONElement el = testSoln["sort"];
         if (el.eoo() || !el.isABSONObj()) {
             return false;
         }
         BSONObj sortObj = el.Obj();
-        invariant(bsonObjFieldsAreInSet(sortObj, {"pattern", "limit", "node"}));
+        invariant(bsonObjFieldsAreInSet(sortObj, {"pattern", "limit", "type", "node"}));
 
         BSONElement patternEl = sortObj["pattern"];
         if (patternEl.eoo() || !patternEl.isABSONObj()) {
@@ -645,6 +646,31 @@ bool QueryPlannerTestLib::solutionMatches(const BSONObj& testSoln,
         if (!limitEl.isNumber()) {
             return false;
         }
+
+        BSONElement sortType = sortObj["type"];
+        if (sortType) {
+            if (sortType.type() != BSONType::String) {
+                return false;
+            }
+
+            auto sortTypeString = sortType.valueStringData();
+            switch (sn->getType()) {
+                case StageType::STAGE_SORT_DEFAULT: {
+                    if (sortTypeString != "default") {
+                        return false;
+                    }
+                    break;
+                }
+                case StageType::STAGE_SORT_SIMPLE: {
+                    if (sortTypeString != "simple") {
+                        return false;
+                    }
+                    break;
+                }
+                default: { MONGO_UNREACHABLE; }
+            }
+        }
+
         BSONElement child = sortObj["node"];
         if (child.eoo() || !child.isABSONObj()) {
             return false;

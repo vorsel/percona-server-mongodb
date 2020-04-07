@@ -10,7 +10,7 @@ if (determineSSLProvider() != "openssl") {
     return;
 }
 
-let mock_ocsp = new MockOCSPServer();
+let mock_ocsp = new MockOCSPServer("", 1);
 mock_ocsp.start();
 
 const ocsp_options = {
@@ -29,16 +29,23 @@ assert.doesNotThrow(() => {
     conn = MongoRunner.runMongod(ocsp_options);
 });
 
+sleep(10000);
+
 mock_ocsp.stop();
 
 // Test Scenario when Mock OCSP Server replies stating
 // that the OCSP status of the client cert is revoked.
-mock_ocsp = new MockOCSPServer(FAULT_REVOKED);
+mock_ocsp = new MockOCSPServer(FAULT_REVOKED, 1);
 mock_ocsp.start();
 assert.throws(() => {
     new Mongo(conn.host);
 });
 
-mock_ocsp.stop();
 MongoRunner.stopMongod(conn);
+
+// The mongoRunner spawns a new Mongo Object to validate the collections which races
+// with the shutdown logic of the mock_ocsp responder on some platforms. We need this
+// sleep to make sure that the threads don't interfere with each other.
+sleep(1000);
+mock_ocsp.stop();
 }());

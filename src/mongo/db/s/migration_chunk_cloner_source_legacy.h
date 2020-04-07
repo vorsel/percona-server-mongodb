@@ -90,7 +90,13 @@ public:
                                      HostAndPort recipientHost);
     ~MigrationChunkClonerSourceLegacy();
 
-    Status startClone(OperationContext* opCtx, const UUID& migrationId) override;
+    Status startClone(OperationContext* opCtx,
+                      const UUID& migrationId,
+                      const LogicalSessionId& lsid,
+                      TxnNumber txnNumber) override;
+
+    // TODO (SERVER-44787): Remove this function after 4.4 is released.
+    Status startClone(OperationContext* opCtx) override;
 
     Status awaitUntilCriticalSectionIsAppropriate(OperationContext* opCtx,
                                                   Milliseconds maxTimeToWait) override;
@@ -116,15 +122,11 @@ public:
                     const repl::OpTime& opTime,
                     const repl::OpTime& preImageOpTime) override;
 
-    // Legacy cloner specific functionality
-
-    /**
-     * Returns the migration session id associated with this cloner, so stale sessions can be
-     * disambiguated.
-     */
-    const MigrationSessionId& getSessionId() const {
+    const MigrationSessionId& getSessionId() const override {
         return _sessionId;
     }
+
+    // Legacy cloner specific functionality
 
     /**
      * Returns the rollback ID recorded at the beginning of session migration. If the underlying

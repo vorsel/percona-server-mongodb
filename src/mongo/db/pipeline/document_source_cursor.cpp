@@ -40,8 +40,8 @@
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/storage/storage_options.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -56,8 +56,57 @@ const char* DocumentSourceCursor::getSourceName() const {
     return kStageName.rawData();
 }
 
+bool DocumentSourceCursor::Batch::isEmpty() const {
+    switch (_type) {
+        case CursorType::kRegular:
+            return _batchOfDocs.empty();
+        case CursorType::kEmptyDocuments:
+            return !_count;
+    }
+    MONGO_UNREACHABLE;
+}
+
+void DocumentSourceCursor::Batch::enqueue(Document&& doc) {
+    switch (_type) {
+        case CursorType::kRegular: {
+            _batchOfDocs.push_back(doc.getOwned());
+            _memUsageBytes += _batchOfDocs.back().getApproximateSize();
+            break;
+        }
+        case CursorType::kEmptyDocuments: {
+            ++_count;
+            break;
+        }
+    }
+}
+
+Document DocumentSourceCursor::Batch::dequeue() {
+    invariant(!isEmpty());
+    switch (_type) {
+        case CursorType::kRegular: {
+            Document out = std::move(_batchOfDocs.front());
+            _batchOfDocs.pop_front();
+            if (_batchOfDocs.empty()) {
+                _memUsageBytes = 0;
+            }
+            return out;
+        }
+        case CursorType::kEmptyDocuments: {
+            --_count;
+            return Document{};
+        }
+    }
+    MONGO_UNREACHABLE;
+}
+
+void DocumentSourceCursor::Batch::clear() {
+    _batchOfDocs.clear();
+    _count = 0;
+    _memUsageBytes = 0;
+}
+
 DocumentSource::GetNextResult DocumentSourceCursor::doGetNext() {
-    if (_currentBatch.empty()) {
+    if (_currentBatch.isEmpty()) {
         loadBatch();
     }
 
@@ -65,12 +114,10 @@ DocumentSource::GetNextResult DocumentSourceCursor::doGetNext() {
     if (_trackOplogTS && _exec)
         _updateOplogTimestamp();
 
-    if (_currentBatch.empty())
+    if (_currentBatch.isEmpty())
         return GetNextResult::makeEOF();
 
-    Document out = std::move(_currentBatch.front());
-    _currentBatch.pop_front();
-    return std::move(out);
+    return _currentBatch.dequeue();
 }
 
 void DocumentSourceCursor::loadBatch() {
@@ -80,7 +127,8 @@ void DocumentSourceCursor::loadBatch() {
     }
 
     while (MONGO_unlikely(hangBeforeDocumentSourceCursorLoadBatch.shouldFail())) {
-        log() << "Hanging aggregation due to 'hangBeforeDocumentSourceCursorLoadBatch' failpoint";
+        LOGV2(20895,
+              "Hanging aggregation due to 'hangBeforeDocumentSourceCursorLoadBatch' failpoint");
         sleepmillis(10);
     }
 
@@ -93,23 +141,17 @@ void DocumentSourceCursor::loadBatch() {
 
         _exec->restoreState();
 
-        int memUsageBytes = 0;
         {
             ON_BLOCK_EXIT([this] { recordPlanSummaryStats(); });
 
             while ((state = _exec->getNext(&resultObj, nullptr)) == PlanExecutor::ADVANCED) {
-                if (_shouldProduceEmptyDocs) {
-                    _currentBatch.push_back(Document());
-                } else {
-                    _currentBatch.push_back(transformDoc(resultObj.getOwned()));
-                }
-
-                memUsageBytes += _currentBatch.back().getApproximateSize();
+                _currentBatch.enqueue(transformDoc(std::move(resultObj)));
 
                 // As long as we're waiting for inserts, we shouldn't do any batching at this level
                 // we need the whole pipeline to see each document to see if we should stop waiting.
                 if (awaitDataState(pExpCtx->opCtx).shouldWaitForInserts ||
-                    memUsageBytes > internalDocumentSourceCursorBatchSizeBytes.load()) {
+                    static_cast<long long>(_currentBatch.memUsageBytes()) >
+                        internalDocumentSourceCursorBatchSizeBytes.load()) {
                     // End this batch and prepare PlanExecutor for yielding.
                     _exec->saveState();
                     return;
@@ -148,8 +190,8 @@ void DocumentSourceCursor::loadBatch() {
 
 void DocumentSourceCursor::_updateOplogTimestamp() {
     // If we are about to return a result, set our oplog timestamp to the optime of that result.
-    if (!_currentBatch.empty()) {
-        const auto& ts = _currentBatch.front().getField(repl::OpTime::kTimestampFieldName);
+    if (!_currentBatch.isEmpty()) {
+        const auto& ts = _currentBatch.peekFront().getField(repl::OpTime::kTimestampFieldName);
         invariant(ts.getType() == BSONType::bsonTimestamp);
         _latestOplogTimestamp = ts.getTimestamp();
         return;
@@ -253,8 +295,15 @@ DocumentSourceCursor::DocumentSourceCursor(
     Collection* collection,
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
     const intrusive_ptr<ExpressionContext>& pCtx,
+    CursorType cursorType,
     bool trackOplogTimestamp)
-    : DocumentSource(kStageName, pCtx), _exec(std::move(exec)), _trackOplogTS(trackOplogTimestamp) {
+    : DocumentSource(kStageName, pCtx),
+      _currentBatch(cursorType),
+      _exec(std::move(exec)),
+      _trackOplogTS(trackOplogTimestamp) {
+    // It is illegal for both 'kEmptyDocuments' and 'trackOplogTimestamp' to be set.
+    invariant(!(cursorType == CursorType::kEmptyDocuments && trackOplogTimestamp));
+
     // Later code in the DocumentSourceCursor lifecycle expects that '_exec' is in a saved state.
     _exec->saveState();
 
@@ -276,9 +325,10 @@ intrusive_ptr<DocumentSourceCursor> DocumentSourceCursor::create(
     Collection* collection,
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
     const intrusive_ptr<ExpressionContext>& pExpCtx,
+    CursorType cursorType,
     bool trackOplogTimestamp) {
-    intrusive_ptr<DocumentSourceCursor> source(
-        new DocumentSourceCursor(collection, std::move(exec), pExpCtx, trackOplogTimestamp));
+    intrusive_ptr<DocumentSourceCursor> source(new DocumentSourceCursor(
+        collection, std::move(exec), pExpCtx, cursorType, trackOplogTimestamp));
     return source;
 }
 }  // namespace mongo

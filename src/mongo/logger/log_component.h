@@ -61,6 +61,7 @@ public:
         kReplicationRollback,
         kSharding,
         kShardingCatalogRefresh,
+        kShardingMigration,
         kStorage,
         kStorageRecovery,
         kJournal,
@@ -71,7 +72,6 @@ public:
         kTracking,
         kTransaction,
         kConnectionPool,
-        kTlaPlusTrace,
         kNumLogComponents,
     };
 

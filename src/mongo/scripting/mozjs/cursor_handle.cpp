@@ -32,11 +32,11 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/client/dbclient_base.h"
+#include "mongo/logv2/log.h"
 #include "mongo/scripting/mozjs/cursor_handle.h"
 #include "mongo/scripting/mozjs/implscope.h"
 #include "mongo/scripting/mozjs/scripting_util_gen.h"
 #include "mongo/scripting/mozjs/wrapconstrainedmethod.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace mozjs {
@@ -77,7 +77,10 @@ void CursorHandleInfo::finalize(js::FreeOp* fop, JSObject* obj) {
                 auto status = exceptionToStatus();
 
                 try {
-                    LOG(0) << "Failed to kill cursor " << cursorId << " due to " << status;
+                    LOGV2(22782,
+                          "Failed to kill cursor {cursorId} due to {status}",
+                          "cursorId"_attr = cursorId,
+                          "status"_attr = status);
                 } catch (...) {
                     // This is here in case logging fails.
                 }

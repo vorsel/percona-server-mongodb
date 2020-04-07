@@ -104,59 +104,18 @@ vector<pair<string, vector<BSONObj>>> extractRawPipelines(const BSONElement& ele
     return rawFacetPipelines;
 }
 
-StageConstraints::LookupRequirement computeLookupRequirement(
-    const std::vector<DocumentSourceFacet::FacetPipeline>& facets) {
-    for (auto&& facet : facets) {
-        const auto& sources = facet.pipeline->getSources();
-        for (auto&& src : sources) {
-            if (!src->constraints().isAllowedInLookupPipeline()) {
-                return StageConstraints::LookupRequirement::kNotAllowed;
-            }
-        }
-    }
-    return StageConstraints::LookupRequirement::kAllowed;
-}
-
 }  // namespace
 
 std::unique_ptr<DocumentSourceFacet::LiteParsed> DocumentSourceFacet::LiteParsed::parse(
-    const AggregationRequest& request, const BSONElement& spec) {
+    const NamespaceString& nss, const BSONElement& spec) {
     std::vector<LiteParsedPipeline> liteParsedPipelines;
 
     for (auto&& rawPipeline : extractRawPipelines(spec)) {
-        liteParsedPipelines.emplace_back(
-            AggregationRequest(request.getNamespaceString(), rawPipeline.second));
+        liteParsedPipelines.emplace_back(LiteParsedPipeline(nss, rawPipeline.second));
     }
 
-    PrivilegeVector requiredPrivileges;
-    for (auto&& pipeline : liteParsedPipelines) {
-
-        // A correct isMongos flag is only required for DocumentSourceCurrentOp which is disallowed
-        // in $facet pipelines.
-        const bool unusedIsMongosFlag = false;
-        Privilege::addPrivilegesToPrivilegeVector(&requiredPrivileges,
-                                                  pipeline.requiredPrivileges(unusedIsMongosFlag));
-    }
-
-    return std::make_unique<DocumentSourceFacet::LiteParsed>(std::move(liteParsedPipelines),
-                                                             std::move(requiredPrivileges));
-}
-
-stdx::unordered_set<NamespaceString> DocumentSourceFacet::LiteParsed::getInvolvedNamespaces()
-    const {
-    stdx::unordered_set<NamespaceString> involvedNamespaces;
-    for (auto&& liteParsedPipeline : _liteParsedPipelines) {
-        auto involvedInSubPipe = liteParsedPipeline.getInvolvedNamespaces();
-        involvedNamespaces.insert(involvedInSubPipe.begin(), involvedInSubPipe.end());
-    }
-    return involvedNamespaces;
-}
-
-bool DocumentSourceFacet::LiteParsed::allowShardedForeignCollection(NamespaceString nss) const {
-    return std::all_of(
-        _liteParsedPipelines.begin(), _liteParsedPipelines.end(), [&nss](auto&& pipeline) {
-            return pipeline.allowShardedForeignCollection(nss);
-        });
+    return std::make_unique<DocumentSourceFacet::LiteParsed>(spec.fieldName(),
+                                                             std::move(liteParsedPipelines));
 }
 
 REGISTER_DOCUMENT_SOURCE(facet,
@@ -268,21 +227,21 @@ StageConstraints DocumentSourceFacet::constraints(Pipeline::SplitState) const {
         }
     }
 
-    // Resolve the disk use and transaction requirement of this $facet by iterating through the
-    // children in its facets.
-    auto diskAndTxnReq = StageConstraints::kDefaultDiskUseAndTransactionRequirement;
+    // Resolve the disk use, lookup, and transaction requirement of this $facet by iterating through
+    // the children in its facets.
+    StageConstraints constraints(StreamType::kBlocking,
+                                 PositionRequirement::kNone,
+                                 host,
+                                 StageConstraints::DiskUseRequirement::kNoDiskUse,
+                                 FacetRequirement::kNotAllowed,
+                                 StageConstraints::TransactionRequirement::kAllowed,
+                                 StageConstraints::LookupRequirement::kAllowed,
+                                 StageConstraints::UnionRequirement::kAllowed);
     for (const auto& facet : _facets) {
-        diskAndTxnReq = StageConstraints::resolveDiskUseAndTransactionRequirement(
-            facet.pipeline->getSources(), diskAndTxnReq);
+        constraints =
+            StageConstraints::getStrictestConstraints(facet.pipeline->getSources(), constraints);
     }
-
-    return {StreamType::kBlocking,
-            PositionRequirement::kNone,
-            host,
-            std::get<StageConstraints::DiskUseRequirement>(diskAndTxnReq),
-            FacetRequirement::kNotAllowed,
-            std::get<StageConstraints::TransactionRequirement>(diskAndTxnReq),
-            computeLookupRequirement(_facets)};
+    return constraints;
 }
 
 bool DocumentSourceFacet::usedDisk() {
@@ -332,7 +291,20 @@ intrusive_ptr<DocumentSource> DocumentSourceFacet::createFromBson(
     for (auto&& rawFacet : extractRawPipelines(elem)) {
         const auto facetName = rawFacet.first;
 
-        auto pipeline = uassertStatusOK(Pipeline::parseFacetPipeline(rawFacet.second, expCtx));
+        auto pipeline = Pipeline::parse(rawFacet.second, expCtx, [](const Pipeline& pipeline) {
+            auto sources = pipeline.getSources();
+            std::for_each(sources.begin(), sources.end(), [](auto& stage) {
+                auto stageConstraints = stage->constraints();
+                uassert(40600,
+                        str::stream() << stage->getSourceName()
+                                      << " is not allowed to be used within a $facet stage",
+                        stageConstraints.isAllowedInsideFacetStage());
+                // We expect a stage within a $facet stage to have these properties.
+                invariant(stageConstraints.requiredPosition ==
+                          StageConstraints::PositionRequirement::kNone);
+                invariant(!stageConstraints.isIndependentOfAnyCollection);
+            });
+        });
 
         // Validate that none of the facet pipelines have any conflicting HostTypeRequirements. This
         // verifies both that all stages within each pipeline are consistent, and that the pipelines

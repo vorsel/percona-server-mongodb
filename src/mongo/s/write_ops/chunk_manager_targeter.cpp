@@ -38,12 +38,12 @@
 #include "mongo/db/matcher/extensions_callback_noop.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/collation/collation_index_key.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/database_version_helpers.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/shard_key_pattern.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -115,6 +115,7 @@ StatusWith<UpdateType> getUpdateExprType(const write_ops::UpdateOpEntry& updateD
  */
 StatusWith<BSONObj> getUpdateExprForTargeting(OperationContext* opCtx,
                                               const ShardKeyPattern& shardKeyPattern,
+                                              const NamespaceString& nss,
                                               const UpdateType updateType,
                                               const write_ops::UpdateOpEntry& updateDoc) {
     // We should never see an invalid update type here.
@@ -144,7 +145,8 @@ StatusWith<BSONObj> getUpdateExprForTargeting(OperationContext* opCtx,
     // We are missing _id, so attempt to extract it from an exact match in the update's query spec.
     // This will guarantee that we can target a single shard, but it is not necessarily fatal if no
     // exact _id can be found.
-    const auto idFromQuery = kVirtualIdShardKey.extractShardKeyFromQuery(opCtx, updateDoc.getQ());
+    const auto idFromQuery =
+        kVirtualIdShardKey.extractShardKeyFromQuery(opCtx, nss, updateDoc.getQ());
     if (!idFromQuery.isOK()) {
         return idFromQuery;
     } else if (auto idElt = idFromQuery.getValue()[kIdFieldName]) {
@@ -269,9 +271,11 @@ CompareResult compareAllShardVersions(const CachedCollectionRoutingInfo& routing
             // Throws b/c shard constructor throws
             cachedShardVersion = getShardVersion(routingInfo, shardId);
         } catch (const DBException& ex) {
-            warning() << "could not lookup shard " << shardId
-                      << " in local cache, shard metadata may have changed"
-                      << " or be unavailable" << causedBy(ex);
+            LOGV2_WARNING(22915,
+                          "could not lookup shard {shardId} in local cache, shard metadata may "
+                          "have changed or be unavailable{causedBy_ex}",
+                          "shardId"_attr = shardId,
+                          "causedBy_ex"_attr = causedBy(ex));
 
             return CompareResult_Unknown;
         }
@@ -447,8 +451,8 @@ StatusWith<std::vector<ShardEndpoint>> ChunkManagerTargeter::targetUpdate(
     const auto& shardKeyPattern = _routingInfo->cm()->getShardKeyPattern();
     const auto collation = write_ops::collationOf(updateDoc);
 
-    const auto updateExpr =
-        getUpdateExprForTargeting(opCtx, shardKeyPattern, updateType.getValue(), updateDoc);
+    const auto updateExpr = getUpdateExprForTargeting(
+        opCtx, shardKeyPattern, getNS(), updateType.getValue(), updateDoc);
     const bool isUpsert = updateDoc.getUpsert();
     const auto query = updateDoc.getQ();
     if (!updateExpr.isOK()) {
@@ -477,7 +481,7 @@ StatusWith<std::vector<ShardEndpoint>> ChunkManagerTargeter::targetUpdate(
     // to target based on the replacement doc, it could result in an insertion even if a document
     // matching the query exists on another shard.
     if (isUpsert) {
-        return targetByShardKey(shardKeyPattern.extractShardKeyFromQuery(opCtx, query),
+        return targetByShardKey(shardKeyPattern.extractShardKeyFromQuery(opCtx, getNS(), query),
                                 "Failed to target upsert by query");
     }
 
@@ -531,8 +535,8 @@ StatusWith<std::vector<ShardEndpoint>> ChunkManagerTargeter::targetDelete(
 
         // Get the shard key
         StatusWith<BSONObj> status =
-            _routingInfo->cm()->getShardKeyPattern().extractShardKeyFromQuery(opCtx,
-                                                                              deleteDoc.getQ());
+            _routingInfo->cm()->getShardKeyPattern().extractShardKeyFromQuery(
+                opCtx, getNS(), deleteDoc.getQ());
 
         // Bad query
         if (!status.isOK())
@@ -625,30 +629,6 @@ StatusWith<ShardEndpoint> ChunkManagerTargeter::_targetShardKey(const BSONObj& s
         return ex.toStatus();
     }
     MONGO_UNREACHABLE;
-}
-
-StatusWith<std::vector<ShardEndpoint>> ChunkManagerTargeter::targetCollection() const {
-    if (!_routingInfo->db().primary() && !_routingInfo->cm()) {
-        return {ErrorCodes::NamespaceNotFound,
-                str::stream() << "could not target full range of " << getNS().ns()
-                              << "; metadata not found"};
-    }
-
-    if (!_routingInfo->cm()) {
-        return std::vector<ShardEndpoint>{{_routingInfo->db().primaryId(),
-                                           ChunkVersion::UNSHARDED(),
-                                           _routingInfo->db().databaseVersion()}};
-    }
-
-    std::set<ShardId> shardIds;
-    _routingInfo->cm()->getAllShardIds(&shardIds);
-
-    std::vector<ShardEndpoint> endpoints;
-    for (auto&& shardId : shardIds) {
-        endpoints.emplace_back(std::move(shardId), _routingInfo->cm()->getVersion(shardId));
-    }
-
-    return endpoints;
 }
 
 StatusWith<std::vector<ShardEndpoint>> ChunkManagerTargeter::targetAllShards(
@@ -751,10 +731,14 @@ Status ChunkManagerTargeter::refreshIfNeeded(OperationContext* opCtx, bool* wasC
 
     *wasChanged = false;
 
-    LOG(4) << "ChunkManagerTargeter checking if refresh is needed, needsTargetingRefresh("
-           << _needsTargetingRefresh << ") remoteShardVersions empty ("
-           << _remoteShardVersions.empty() << ")"
-           << ") remoteDbVersion empty (" << !_remoteDbVersion << ")";
+    LOGV2_DEBUG(22912,
+                4,
+                "ChunkManagerTargeter checking if refresh is needed, "
+                "needsTargetingRefresh({needsTargetingRefresh}) remoteShardVersions empty "
+                "({remoteShardVersions_empty})) remoteDbVersion empty ({remoteDbVersion})",
+                "needsTargetingRefresh"_attr = _needsTargetingRefresh,
+                "remoteShardVersions_empty"_attr = _remoteShardVersions.empty(),
+                "remoteDbVersion"_attr = !_remoteDbVersion);
 
     //
     // Did we have any stale config or targeting errors at all?
@@ -808,7 +792,10 @@ Status ChunkManagerTargeter::refreshIfNeeded(OperationContext* opCtx, bool* wasC
 
         CompareResult result = compareAllShardVersions(*_routingInfo, _remoteShardVersions);
 
-        LOG(4) << "ChunkManagerTargeter shard versions comparison result: " << (int)result;
+        LOGV2_DEBUG(22913,
+                    4,
+                    "ChunkManagerTargeter shard versions comparison result: {int_result}",
+                    "int_result"_attr = (int)result);
 
         // Reset the versions
         _remoteShardVersions.clear();
@@ -827,7 +814,10 @@ Status ChunkManagerTargeter::refreshIfNeeded(OperationContext* opCtx, bool* wasC
 
         CompareResult result = compareDbVersions(*_routingInfo, *_remoteDbVersion);
 
-        LOG(4) << "ChunkManagerTargeter database versions comparison result: " << (int)result;
+        LOGV2_DEBUG(22914,
+                    4,
+                    "ChunkManagerTargeter database versions comparison result: {int_result}",
+                    "int_result"_attr = (int)result);
 
         // Reset the version
         _remoteDbVersion = boost::none;
@@ -844,6 +834,30 @@ Status ChunkManagerTargeter::refreshIfNeeded(OperationContext* opCtx, bool* wasC
     }
 
     MONGO_UNREACHABLE;
+}
+
+bool ChunkManagerTargeter::endpointIsConfigServer() const {
+    uassert(ErrorCodes::NamespaceNotFound,
+            str::stream() << "could not verify full range of " << getNS().ns()
+                          << "; metadata not found",
+            _routingInfo->db().primary() || _routingInfo->cm());
+
+    if (!_routingInfo->cm()) {
+        return _routingInfo->db().primaryId() == ShardRegistry::kConfigServerShardId;
+    }
+
+    std::set<ShardId> shardIds;
+    _routingInfo->cm()->getAllShardIds(&shardIds);
+
+    if (std::any_of(shardIds.begin(), shardIds.end(), [](const auto& shardId) {
+            return shardId == ShardRegistry::kConfigServerShardId;
+        })) {
+        // There should be no namespaces that target both config servers and shards.
+        invariant(shardIds.size() == 1);
+        return true;
+    }
+
+    return false;
 }
 
 int ChunkManagerTargeter::getNShardsOwningChunks() const {

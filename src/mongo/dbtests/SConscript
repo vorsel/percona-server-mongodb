@@ -162,6 +162,7 @@ if not has_option('noshell') and usemozjs:
             "$BUILD_DIR/mongo/db/storage/ephemeral_for_test/storage_ephemeral_for_test",
             "$BUILD_DIR/mongo/db/storage/inmemory/storage_inmemory" if inmemory else [],
             "$BUILD_DIR/mongo/db/storage/storage_engine_impl",
+            "$BUILD_DIR/mongo/db/storage/storage_unittest_debug_util",
             "$BUILD_DIR/mongo/db/storage/wiredtiger/storage_wiredtiger" if wiredtiger else [],
             "$BUILD_DIR/mongo/db/transaction",
             "$BUILD_DIR/mongo/shell_core",
@@ -174,11 +175,12 @@ if not has_option('noshell') and usemozjs:
             "mocklib",
             "testframework",
         ],
-        AIB_COMPONENT="dbtests",
+        AIB_COMPONENT="dbtest",
         AIB_COMPONENTS_EXTRA=[
             "tests",
         ],
     )
+
     hygienic = get_option('install-mode') == 'hygienic'
     if not hygienic:
         install_dbtest = env.Install('#/', dbtest)

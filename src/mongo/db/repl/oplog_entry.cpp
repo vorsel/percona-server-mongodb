@@ -35,7 +35,7 @@
 
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/util/log.h"
+#include "mongo/logger/redaction.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -155,7 +155,7 @@ const int MutableOplogEntry::kOplogVersion = 2;
 
 // Static
 ReplOperation MutableOplogEntry::makeInsertOperation(const NamespaceString& nss,
-                                                     boost::optional<UUID> uuid,
+                                                     UUID uuid,
                                                      const BSONObj& docToInsert) {
     ReplOperation op;
     op.setOpType(OpTypeEnum::kInsert);
@@ -191,7 +191,7 @@ BSONObj MutableOplogEntry::makeCreateCollCmdObj(const NamespaceString& collectio
 }
 
 ReplOperation MutableOplogEntry::makeUpdateOperation(const NamespaceString nss,
-                                                     boost::optional<UUID> uuid,
+                                                     UUID uuid,
                                                      const BSONObj& update,
                                                      const BSONObj& criteria) {
     ReplOperation op;
@@ -215,8 +215,25 @@ ReplOperation MutableOplogEntry::makeCreateCommand(const NamespaceString nss,
     return op;
 }
 
+ReplOperation MutableOplogEntry::makeCreateIndexesCommand(const NamespaceString nss,
+                                                          CollectionUUID uuid,
+                                                          const BSONObj& indexDoc) {
+    ReplOperation op;
+    op.setOpType(OpTypeEnum::kCommand);
+    op.setNss(nss.getCommandNS());
+    op.setUuid(uuid);
+
+    BSONObjBuilder builder;
+    builder.append("createIndexes", nss.coll());
+    builder.appendElements(indexDoc);
+
+    op.setObject(builder.obj());
+
+    return op;
+}
+
 ReplOperation MutableOplogEntry::makeDeleteOperation(const NamespaceString& nss,
-                                                     boost::optional<UUID> uuid,
+                                                     UUID uuid,
                                                      const BSONObj& docToDelete) {
     ReplOperation op;
     op.setOpType(OpTypeEnum::kDelete);

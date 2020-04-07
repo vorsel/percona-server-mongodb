@@ -83,6 +83,7 @@ LogComponent LogComponent::parent() const {
             DECLARE_LOG_COMPONENT_PARENT(kReplicationInitialSync, kReplication);
             DECLARE_LOG_COMPONENT_PARENT(kReplicationRollback, kReplication);
             DECLARE_LOG_COMPONENT_PARENT(kShardingCatalogRefresh, kSharding);
+            DECLARE_LOG_COMPONENT_PARENT(kShardingMigration, kSharding);
             DECLARE_LOG_COMPONENT_PARENT(kStorageRecovery, kStorage);
         case kNumLogComponents:
             return kNumLogComponents;
@@ -126,6 +127,8 @@ StringData LogComponent::toStringData() const {
             return "sharding"_sd;
         case kShardingCatalogRefresh:
             return "shardingCatalogRefresh"_sd;
+        case kShardingMigration:
+            return "migration"_sd;
         case kStorage:
             return "storage"_sd;
         case kStorageRecovery:
@@ -146,10 +149,11 @@ StringData LogComponent::toStringData() const {
             return "transaction"_sd;
         case kConnectionPool:
             return "connectionPool"_sd;
-        case kTlaPlusTrace:
-            return "tlaPlusTrace"_sd;
         case kNumLogComponents:
             return "total"_sd;
+        case kAutomaticDetermination:
+            // We should not reach this
+            break;
             // No default. Compiler should complain if there's a log component that's not handled.
     }
     MONGO_UNREACHABLE;
@@ -216,6 +220,8 @@ StringData LogComponent::getNameForLog() const {
             return "SHARDING"_sd;
         case kShardingCatalogRefresh:
             return "SH_REFR"_sd;
+        case kShardingMigration:
+            return "MIGRATION"_sd;
         case kStorage:
             return "STORAGE"_sd;
         case kStorageRecovery:
@@ -236,13 +242,18 @@ StringData LogComponent::getNameForLog() const {
             return "TXN"_sd;
         case kConnectionPool:
             return "CONNPOOL"_sd;
-        case kTlaPlusTrace:
-            return "TLA_PLUS"_sd;
         case kNumLogComponents:
             return "TOTAL"_sd;
+        case kAutomaticDetermination:
+            // We should not reach this
+            break;
             // No default. Compiler should complain if there's a log component that's not handled.
     }
     MONGO_UNREACHABLE;
+}
+
+std::ostream& operator<<(std::ostream& os, LogComponent component) {
+    return os << component.getNameForLog();
 }
 
 }  // namespace logv2

@@ -172,9 +172,9 @@ public:
     const Value getNestedField(const FieldPath& path,
                                std::vector<Position>* positions = nullptr) const;
 
-    /// Number of fields in this document. O(n)
-    size_t size() const {
-        return storage().size();
+    // Number of fields in this document. Exp. runtime O(n).
+    size_t computeSize() const {
+        return storage().computeSize();
     }
 
     /// True if this document has no fields.
@@ -188,12 +188,15 @@ public:
     /// Convenience type for dealing with fields. Used by FieldIterator.
     typedef std::pair<StringData, Value> FieldPair;
 
-    /** Get the approximate storage size of the document and sub-values in bytes.
-     *  Note: Some memory may be shared with other Documents or between fields within
-     *        a single Document so this can overestimate usage.
+    /**
+     * Get the approximate size of the Document, plus its underlying storage and sub-values. Returns
+     * size in bytes.
      *
-     *  Note: the value returned by this function includes the size of the metadata associated with
-     *  the document.
+     * Note: Some memory may be shared with other Documents or between fields within a single
+     * Document so this can overestimate usage.
+     *
+     * Note: the value returned by this function includes the size of the metadata associated with
+     * the document.
      */
     size_t getApproximateSize() const;
 
