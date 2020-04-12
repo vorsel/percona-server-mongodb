@@ -90,6 +90,8 @@ __wt_connection_hash_arrays_init(WT_CONNECTION_IMPL *conn)
 
     session = conn->default_session;
 
+    WT_RET(__wt_calloc_def(session, conn->big_hash_array_size, &conn->dh_bucket_count));
+
     WT_RET(__wt_calloc_def(session, conn->big_hash_array_size, &conn->dhhash));
     for (i = 0; i < conn->big_hash_array_size; i++)
         TAILQ_INIT(&conn->dhhash[i]); /* Data handle hash lists */
@@ -161,6 +163,9 @@ __wt_connection_destroy(WT_CONNECTION_IMPL *conn)
     __wt_free(session, conn->dhhash);
     __wt_free(session, conn->fhhash);
     __wt_free(session, conn->blockhash);
+
+    /* Free conn->dh_bucket_count */
+    __wt_free(session, conn->dh_bucket_count);
 
     __wt_free(NULL, conn);
 }
