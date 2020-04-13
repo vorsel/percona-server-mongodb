@@ -51,7 +51,7 @@ Requires: %{name}-mongos = %{version}-%{release}
 Requires: %{name}-server = %{version}-%{release}
 Requires: %{name}-shell = %{version}-%{release}
 Requires: %{name}-tools = %{version}-%{release}
-Requires: numactl, openldap
+Requires: numactl, openldap, cyrus-sasl-gssapi
 
 Conflicts: Percona-Server-MongoDB < 4.4.0
 Conflicts: Percona-Server-MongoDB-32 Percona-Server-MongoDB-34 Percona-Server-MongoDB-36 mongodb-org
