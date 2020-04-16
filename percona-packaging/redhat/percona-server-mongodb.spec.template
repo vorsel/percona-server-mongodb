@@ -40,7 +40,7 @@ BuildRoot:      /var/tmp/%{name}-%{version}-%{release}
 %define         src_dir @@SRC_DIR@@
 
 BuildRequires: gcc, make, cmake, gcc-c++, openssl-devel, cyrus-sasl-devel
-BuildRequires: snappy-devel, zlib-devel, bzip2-devel, libpcap-devel, openldap-devel
+BuildRequires: snappy-devel, zlib-devel, bzip2-devel, libpcap-devel, openldap-devel, xz-devel
 BuildRequires: /usr/bin/scons
 
 # %if 0%{?rhel} >= 6
