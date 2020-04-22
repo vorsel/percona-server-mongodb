@@ -1,5 +1,6 @@
 #
-%define         mongo_home /var/lib/mongo
+%define         MONGO_HOME /var/lib/mongo
+%define         MONGO_USER mongod
 #
 Name:           percona-server-mongodb
 Version:        @@VERSION@@
@@ -53,8 +54,8 @@ Requires: %{name}-shell = %{version}-%{release}
 Requires: %{name}-tools = %{version}-%{release}
 Requires: numactl, openldap
 
-Conflicts: Percona-Server-MongoDB < 4.0.0
-Conflicts: Percona-Server-MongoDB-32 Percona-Server-MongoDB-34 Percona-Server-MongoDB-36 mongodb-org
+Obsoletes: Percona-Server-MongoDB < 4.0.0
+Obsoletes: Percona-Server-MongoDB-32 Percona-Server-MongoDB-34 Percona-Server-MongoDB-36 mongodb-org
 
 %description
 This package contains high-performance MongoDB replacement from Percona - Percona Server for MongoDB.
@@ -75,35 +76,44 @@ Percona Server for MongoDB features:
 
 This metapackage will install the mongo shell, import/export tools, other client utilities, server software, default configuration, and init.d scripts.
 
+
 %package mongos
 Group:          Applications/Databases
 Summary:        Percona Server for MongoDB sharded cluster query router
+Obsoletes: Percona-Server-MongoDB-32-mongos Percona-Server-MongoDB-34-mongos Percona-Server-MongoDB-36-mongos mongodb-org-mongos
+
 %description mongos
 This package contains mongos - the Percona Server for MongoDB sharded cluster query router
-Conflicts: Percona-Server-MongoDB-mongos Percona-Server-MongoDB-32-mongos Percona-Server-MongoDB-34-mongos Percona-Server-MongoDB-36-mongos mongodb-org-mongos
+
 
 %package server
 Group:          Applications/Databases
 Summary:        Percona Server for MongoDB database server
 Requires: policycoreutils
 Requires: %{name}-shell = %{version}-%{release}
+Obsoletes: Percona-Server-MongoDB-32-server Percona-Server-MongoDB-34-server Percona-Server-MongoDB-36-server mongodb-org-server
+
 %description server
 This package contains the Percona Server for MongoDB server software, default configuration files and init.d scripts
-Conflicts: Percona-Server-MongoDB-server Percona-Server-MongoDB-32-server Percona-Server-MongoDB-34-server Percona-Server-MongoDB-36-server mongodb-org-server
+
 
 %package shell
 Group:          Applications/Databases
 Summary:        Percona Server for MongoDB shell client
+Obsoletes: Percona-Server-MongoDB-32-shell Percona-Server-MongoDB-34-shell Percona-Server-MongoDB-36-shell mongodb-org-shell
+
 %description shell
 This package contains the Percona Server for MongoDB shell
-Conflicts: Percona-Server-MongoDB-shell Percona-Server-MongoDB-32-shell Percona-Server-MongoDB-34-shell Percona-Server-MongoDB-36-shell mongodb-org-shell
+
 
 %package tools
 Group:          Applications/Databases
 Summary:        The tools package for Percona Server for MongoDB
+Obsoletes: Percona-Server-MongoDB-32-tools Percona-Server-MongoDB-34-tools Percona-Server-MongoDB-36-tools mongodb-org-tools
+
 %description tools
 This package contains various tools from MongoDB project, recompiled for Percona Server for MongoDB
-Conflicts: Percona-Server-MongoDB-tools Percona-Server-MongoDB-32-tools Percona-Server-MongoDB-34-tools Percona-Server-MongoDB-36-tools mongodb-org-tools
+
 
 %prep
 
@@ -185,7 +195,7 @@ install -m 755 -d %{buildroot}/%{_mandir}/man1
 
 install -m 750 -d %{buildroot}/var/log/mongo
 touch %{buildroot}/var/log/mongo/mongod.log
-install -m 750 -d %{buildroot}/%{mongo_home}
+install -m 750 -d %{buildroot}/%{MONGO_HOME}
 install -m 755 -d %{buildroot}/%{_sysconfdir}/sysconfig
 #
 install -m 644 %{SOURCE1} %{buildroot}/%{_sysconfdir}/mongod.conf
@@ -233,11 +243,11 @@ install -m 644 $RPM_BUILD_DIR/%{src_dir}/manpages/* %{buildroot}/%{_mandir}/man1
 /etc/rc.d/init.d/mongod
 %endif
 /etc/selinux/targeted/modules/active/modules/mongod.pp
-%attr(0750,mongod,mongod) %dir %{mongo_home}
-%attr(0750,mongod,mongod) %dir /var/log/mongo
+%attr(0750,%{MONGO_USER},%{MONGO_USER}) %dir %{MONGO_HOME}
+%attr(0750,%{MONGO_USER},%{MONGO_USER}) %dir /var/log/mongo
 %config(noreplace) %{_sysconfdir}/mongod.conf
 %config(noreplace) %{_sysconfdir}/sysconfig/mongod
-%attr(0640,mongod,mongod) %ghost /var/log/mongo/mongod.log
+%attr(0640,%{MONGO_USER},%{MONGO_USER}) %ghost /var/log/mongo/mongod.log
 %doc LICENSE-Community.txt README THIRD-PARTY-NOTICES
 
 %files shell
@@ -267,9 +277,9 @@ install -m 644 $RPM_BUILD_DIR/%{src_dir}/manpages/* %{buildroot}/%{_mandir}/man1
 
 %pre server
 if [ $1 == 1 ]; then
-  if ! getent passwd mongod > /dev/null 2>&1; then
-    /usr/sbin/groupadd -r mongod
-    /usr/sbin/useradd -M -r -g mongod -d %{mongo_home} -s /bin/false -c mongod mongod > /dev/null 2>&1
+  if ! getent passwd %{MONGO_USER} > /dev/null 2>&1; then
+    /usr/sbin/groupadd -r %{MONGO_USER}
+    /usr/sbin/useradd -M -r -g %{MONGO_USER} -d %{MONGO_HOME} -s /bin/false -c %{MONGO_USER} %{MONGO_USER} > /dev/null 2>&1
   fi
 fi
 
@@ -365,6 +375,8 @@ fi
 %endif
     fi
 fi
+%{__id} -u %{MONGO_USER} > /tmp/mongod_user_id
+%{__id} -g %{MONGO_USER} > /tmp/mongod_group_id
 
 %preun server
 %if 0%{?rhel} >= 7
@@ -380,10 +392,28 @@ fi
 %systemd_postun mongod.service
 %endif
 if [ $1 == 0 ]; then
-  if /usr/bin/id -g mongod > /dev/null 2>&1; then
-    /usr/sbin/userdel mongod > /dev/null 2>&1
-    /usr/sbin/groupdel mongod > /dev/null 2>&1 || true
+  if /usr/bin/id -g %{MONGO_USER} > /dev/null 2>&1; then
+    /usr/sbin/userdel %{MONGO_USER} > /dev/null 2>&1
+    /usr/sbin/groupdel %{MONGO_USER} > /dev/null 2>&1 || true
   fi
+fi
+
+%posttrans server
+if [ -f '/tmp/mongod_user_id' ] && [ -f '/tmp/mongod_group_id' ]; then
+    USER_ID=$(cat /tmp/mongod_user_id)
+    GROUP_ID=$(cat /tmp/mongod_group_id)
+    rm /tmp/mongod_user_id /tmp/mongod_group_id
+fi
+
+USER_EXISTS=$(/usr/bin/getent passwd %{MONGO_USER})
+if [ -z "${USER_EXISTS}" ]; then
+    GROUP_EXISTS=$(/usr/bin/getent passwd %{MONGO_USER})
+    if [ -z "${GROUP_EXISTS}" ] && [ -n "${GROUP_ID}" ]; then
+        /usr/sbin/groupadd -g "${GROUP_ID}" %{MONGO_USER}
+    fi
+    if [ -n "${USER_ID}" ]; then
+        /usr/sbin/useradd -M -r -u "${USER_ID}" -g %{MONGO_USER} -d %{MONGO_HOME} -s /bin/false -c %{MONGO_USER} %{MONGO_USER} > /dev/null 2>&1 
+    fi
 fi
 
 #
