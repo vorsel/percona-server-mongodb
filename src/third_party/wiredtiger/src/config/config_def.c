@@ -892,6 +892,10 @@ static const WT_CONFIG_CHECK confchk_wiredtiger_open[] = {
 	    confchk_wiredtiger_open_operation_tracking_subconfigs, 2 },
 	{ "readonly", "boolean", NULL, NULL, NULL, 0 },
 	{ "salvage", "boolean", NULL, NULL, NULL, 0 },
+	{ "session_cursor_cache_size", "int",
+	    NULL, "min=512",
+	    NULL, 0 },
+	{ "session_dhhash_size", "int", NULL, "min=512", NULL, 0 },
 	{ "session_max", "int", NULL, "min=1", NULL, 0 },
 	{ "session_scratch_max", "int", NULL, NULL, NULL, 0 },
 	{ "session_table_cache", "boolean", NULL, NULL, NULL, 0 },
@@ -1001,6 +1005,10 @@ static const WT_CONFIG_CHECK confchk_wiredtiger_open_all[] = {
 	    confchk_wiredtiger_open_operation_tracking_subconfigs, 2 },
 	{ "readonly", "boolean", NULL, NULL, NULL, 0 },
 	{ "salvage", "boolean", NULL, NULL, NULL, 0 },
+	{ "session_cursor_cache_size", "int",
+	    NULL, "min=512",
+	    NULL, 0 },
+	{ "session_dhhash_size", "int", NULL, "min=512", NULL, 0 },
 	{ "session_max", "int", NULL, "min=1", NULL, 0 },
 	{ "session_scratch_max", "int", NULL, NULL, NULL, 0 },
 	{ "session_table_cache", "boolean", NULL, NULL, NULL, 0 },
@@ -1107,6 +1115,10 @@ static const WT_CONFIG_CHECK confchk_wiredtiger_open_basecfg[] = {
 	    confchk_wiredtiger_open_operation_tracking_subconfigs, 2 },
 	{ "readonly", "boolean", NULL, NULL, NULL, 0 },
 	{ "salvage", "boolean", NULL, NULL, NULL, 0 },
+	{ "session_cursor_cache_size", "int",
+	    NULL, "min=512",
+	    NULL, 0 },
+	{ "session_dhhash_size", "int", NULL, "min=512", NULL, 0 },
 	{ "session_max", "int", NULL, "min=1", NULL, 0 },
 	{ "session_scratch_max", "int", NULL, NULL, NULL, 0 },
 	{ "session_table_cache", "boolean", NULL, NULL, NULL, 0 },
@@ -1211,6 +1223,10 @@ static const WT_CONFIG_CHECK confchk_wiredtiger_open_usercfg[] = {
 	    confchk_wiredtiger_open_operation_tracking_subconfigs, 2 },
 	{ "readonly", "boolean", NULL, NULL, NULL, 0 },
 	{ "salvage", "boolean", NULL, NULL, NULL, 0 },
+	{ "session_cursor_cache_size", "int",
+	    NULL, "min=512",
+	    NULL, 0 },
+	{ "session_dhhash_size", "int", NULL, "min=512", NULL, 0 },
 	{ "session_max", "int", NULL, "min=1", NULL, 0 },
 	{ "session_scratch_max", "int", NULL, NULL, NULL, 0 },
 	{ "session_table_cache", "boolean", NULL, NULL, NULL, 0 },
@@ -1561,15 +1577,16 @@ static const WT_CONFIG_ENTRY config_entries[] = {
 	  "path=\".\",prealloc=true,recover=on,zero_fill=false),"
 	  "lsm_manager=(merge=true,worker_thread_max=4),lsm_merge=true,"
 	  "mmap=true,multiprocess=false,operation_tracking=(enabled=false,"
-	  "path=\".\"),readonly=false,salvage=false,session_max=100,"
-	  "session_scratch_max=2MB,session_table_cache=true,"
-	  "shared_cache=(chunk=10MB,name=,quota=0,reserve=0,size=500MB),"
+	  "path=\".\"),readonly=false,salvage=false,"
+	  "session_cursor_cache_size=512,session_dhhash_size=512,"
+	  "session_max=100,session_scratch_max=2MB,session_table_cache=true"
+	  ",shared_cache=(chunk=10MB,name=,quota=0,reserve=0,size=500MB),"
 	  "statistics=none,statistics_log=(json=false,on_close=false,"
 	  "path=\".\",sources=,timestamp=\"%b %d %H:%M:%S\",wait=0),"
 	  "timing_stress_for_test=,transaction_sync=(enabled=false,"
 	  "method=fsync),use_environment=true,use_environment_priv=false,"
 	  "verbose=,write_through=",
-	  confchk_wiredtiger_open, 48
+	  confchk_wiredtiger_open, 50
 	},
 	{ "wiredtiger_open_all",
 	  "async=(enabled=false,ops_max=1024,threads=2),buffer_alignment=-1"
@@ -1589,15 +1606,16 @@ static const WT_CONFIG_ENTRY config_entries[] = {
 	  "path=\".\",prealloc=true,recover=on,zero_fill=false),"
 	  "lsm_manager=(merge=true,worker_thread_max=4),lsm_merge=true,"
 	  "mmap=true,multiprocess=false,operation_tracking=(enabled=false,"
-	  "path=\".\"),readonly=false,salvage=false,session_max=100,"
-	  "session_scratch_max=2MB,session_table_cache=true,"
-	  "shared_cache=(chunk=10MB,name=,quota=0,reserve=0,size=500MB),"
+	  "path=\".\"),readonly=false,salvage=false,"
+	  "session_cursor_cache_size=512,session_dhhash_size=512,"
+	  "session_max=100,session_scratch_max=2MB,session_table_cache=true"
+	  ",shared_cache=(chunk=10MB,name=,quota=0,reserve=0,size=500MB),"
 	  "statistics=none,statistics_log=(json=false,on_close=false,"
 	  "path=\".\",sources=,timestamp=\"%b %d %H:%M:%S\",wait=0),"
 	  "timing_stress_for_test=,transaction_sync=(enabled=false,"
 	  "method=fsync),use_environment=true,use_environment_priv=false,"
 	  "verbose=,version=(major=0,minor=0),write_through=",
-	  confchk_wiredtiger_open_all, 49
+	  confchk_wiredtiger_open_all, 51
 	},
 	{ "wiredtiger_open_basecfg",
 	  "async=(enabled=false,ops_max=1024,threads=2),buffer_alignment=-1"
@@ -1615,14 +1633,15 @@ static const WT_CONFIG_ENTRY config_entries[] = {
 	  "path=\".\",prealloc=true,recover=on,zero_fill=false),"
 	  "lsm_manager=(merge=true,worker_thread_max=4),lsm_merge=true,"
 	  "mmap=true,multiprocess=false,operation_tracking=(enabled=false,"
-	  "path=\".\"),readonly=false,salvage=false,session_max=100,"
-	  "session_scratch_max=2MB,session_table_cache=true,"
-	  "shared_cache=(chunk=10MB,name=,quota=0,reserve=0,size=500MB),"
+	  "path=\".\"),readonly=false,salvage=false,"
+	  "session_cursor_cache_size=512,session_dhhash_size=512,"
+	  "session_max=100,session_scratch_max=2MB,session_table_cache=true"
+	  ",shared_cache=(chunk=10MB,name=,quota=0,reserve=0,size=500MB),"
 	  "statistics=none,statistics_log=(json=false,on_close=false,"
 	  "path=\".\",sources=,timestamp=\"%b %d %H:%M:%S\",wait=0),"
 	  "timing_stress_for_test=,transaction_sync=(enabled=false,"
 	  "method=fsync),verbose=,version=(major=0,minor=0),write_through=",
-	  confchk_wiredtiger_open_basecfg, 43
+	  confchk_wiredtiger_open_basecfg, 45
 	},
 	{ "wiredtiger_open_usercfg",
 	  "async=(enabled=false,ops_max=1024,threads=2),buffer_alignment=-1"
@@ -1640,14 +1659,15 @@ static const WT_CONFIG_ENTRY config_entries[] = {
 	  "path=\".\",prealloc=true,recover=on,zero_fill=false),"
 	  "lsm_manager=(merge=true,worker_thread_max=4),lsm_merge=true,"
 	  "mmap=true,multiprocess=false,operation_tracking=(enabled=false,"
-	  "path=\".\"),readonly=false,salvage=false,session_max=100,"
-	  "session_scratch_max=2MB,session_table_cache=true,"
-	  "shared_cache=(chunk=10MB,name=,quota=0,reserve=0,size=500MB),"
+	  "path=\".\"),readonly=false,salvage=false,"
+	  "session_cursor_cache_size=512,session_dhhash_size=512,"
+	  "session_max=100,session_scratch_max=2MB,session_table_cache=true"
+	  ",shared_cache=(chunk=10MB,name=,quota=0,reserve=0,size=500MB),"
 	  "statistics=none,statistics_log=(json=false,on_close=false,"
 	  "path=\".\",sources=,timestamp=\"%b %d %H:%M:%S\",wait=0),"
 	  "timing_stress_for_test=,transaction_sync=(enabled=false,"
 	  "method=fsync),verbose=,write_through=",
-	  confchk_wiredtiger_open_usercfg, 42
+	  confchk_wiredtiger_open_usercfg, 44
 	},
 	{ NULL, NULL, NULL, 0 }
 };
