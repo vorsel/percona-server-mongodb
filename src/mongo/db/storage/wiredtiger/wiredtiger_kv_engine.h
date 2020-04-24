@@ -59,7 +59,10 @@ class WiredTigerEngineRuntimeConfigParameter;
 class WiredTigerMaxCacheOverflowSizeGBParameter;
 
 struct WiredTigerFileVersion {
-    enum class StartupVersion { IS_34, IS_36, IS_40, IS_42 };
+    // "4.2 classic" is for data files never touched by a 4.4 binary. "4.2 upgraded" is the state of
+    // data files after being touched by a 4.4 binary. Only 4.2.6+ will work on "4.2 upgraded" data
+    // files.
+    enum class StartupVersion { IS_34, IS_36, IS_40, IS_42_CLASSIC, IS_42_UPGRADED };
 
     StartupVersion _startupVersion;
     bool shouldDowngrade(bool readOnly, bool repairMode, bool hasRecoveryTimestamp);
@@ -505,5 +508,9 @@ private:
 
     std::unique_ptr<WiredTigerEngineRuntimeConfigParameter> _runTimeConfigParam;
     std::unique_ptr<WiredTigerMaxCacheOverflowSizeGBParameter> _maxCacheOverflowParam;
+
+    mutable Mutex _highestDurableTimestampMutex =
+        MONGO_MAKE_LATCH("WiredTigerKVEngine::_highestDurableTimestampMutex");
+    mutable unsigned long long _highestSeenDurableTimestamp = 0ULL;
 };
 }  // namespace mongo

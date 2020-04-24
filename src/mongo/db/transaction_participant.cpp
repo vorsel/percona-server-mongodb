@@ -61,6 +61,7 @@
 #include "mongo/db/server_recovery.h"
 #include "mongo/db/server_transactions_metrics.h"
 #include "mongo/db/stats/fill_locker_info.h"
+#include "mongo/db/storage/flow_control.h"
 #include "mongo/db/transaction_history_iterator.h"
 #include "mongo/db/transaction_participant_gen.h"
 #include "mongo/util/fail_point_service.h"
@@ -119,6 +120,10 @@ ActiveTransactionHistory fetchActiveTransactionHistory(OperationContext* opCtx,
 
     result.lastTxnRecord = [&]() -> boost::optional<SessionTxnRecord> {
         DBDirectClient client(opCtx);
+        // Even though the request only performs a read, the OpCtx's "in multi document transaction"
+        // field has been set, bumping the global lock acquisition to an IX. That upconvert would
+        // require a flow control ticket to be obtained.
+        FlowControl::Bypass flowControlBypass(opCtx);
         auto result =
             client.findOne(NamespaceString::kSessionTransactionsTableNamespace.ns(),
                            {BSON(SessionTxnRecord::kSessionIdFieldName << lsid.toBSON())});
@@ -499,11 +504,25 @@ void TransactionParticipant::Participant::beginOrContinue(OperationContext* opCt
                     getTestCommandsEnabled());
     }
 
-    uassert(ErrorCodes::TransactionTooOld,
-            str::stream() << "Cannot start transaction " << txnNumber << " on session "
-                          << _sessionId() << " because a newer transaction " << o().activeTxnNumber
-                          << " has already started.",
-            txnNumber >= o().activeTxnNumber);
+    if (txnNumber < o().activeTxnNumber) {
+        const std::string currOperation =
+            o().txnState.isInRetryableWriteMode() ? "retryable write" : "transaction";
+        if (!autocommit) {
+            uasserted(ErrorCodes::TransactionTooOld,
+                      str::stream()
+                          << "Retryable write with txnNumber " << txnNumber
+                          << " is prohibited on session " << _sessionId() << " because a newer "
+                          << currOperation << " with txnNumber " << o().activeTxnNumber
+                          << " has already started on this session.");
+        } else {
+            uasserted(ErrorCodes::TransactionTooOld,
+                      str::stream() << "Cannot start transaction " << txnNumber << " on session "
+                                    << _sessionId() << " because a newer " << currOperation
+                                    << " with txnNumber " << o().activeTxnNumber
+                                    << " has already started on this session.");
+        }
+    }
+
 
     // Requests without an autocommit field are interpreted as retryable writes. They cannot specify
     // startTransaction, which is verified earlier when parsing the request.

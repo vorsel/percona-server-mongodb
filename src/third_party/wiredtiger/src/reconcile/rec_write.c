@@ -1653,8 +1653,7 @@ __rec_split_write_header(WT_SESSION_IMPL *session, WT_RECONCILE *r, WT_REC_CHUNK
         F_SET(dsk, WT_PAGE_LAS_UPDATE);
 
     dsk->unused = 0;
-
-    dsk->version = __wt_process.page_version_ts ? WT_PAGE_VERSION_TS : WT_PAGE_VERSION_ORIG;
+    dsk->version = WT_PAGE_VERSION_ORIG;
 
     /* Clear the memory owned by the block manager. */
     memset(WT_BLOCK_HEADER_REF(dsk), 0, btree->block_header);
@@ -2511,8 +2510,8 @@ __wt_rec_cell_build_ovfl(WT_SESSION_IMPL *session, WT_RECONCILE *r, WT_REC_KV *k
     WT_ERR(__wt_buf_set(session, &kv->buf, addr, size));
 
     /* Build the cell and return. */
-    kv->cell_len = __wt_cell_pack_ovfl(
-      session, &kv->cell, type, start_ts, start_txn, stop_ts, stop_txn, rle, kv->buf.size);
+    kv->cell_len = __wt_cell_pack_ovfl(session, &kv->cell, type, WT_TS_NONE, start_ts, start_txn,
+      WT_TS_NONE, stop_ts, stop_txn, rle, kv->buf.size);
     kv->len = kv->cell_len + kv->buf.size;
 
 err:

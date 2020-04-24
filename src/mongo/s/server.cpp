@@ -308,6 +308,10 @@ void cleanupTask(ServiceContext* serviceContext) {
             shardRegistry->shutdown();
         }
 
+        if (Grid::get(serviceContext)->isShardingInitialized()) {
+            CatalogCacheLoader::get(serviceContext).shutDown();
+        }
+
 #if __has_feature(address_sanitizer)
         // When running under address sanitizer, we get false positive leaks due to disorder around
         // the lifecycle of a connection and request. When we are running under ASAN, we try a lot
@@ -372,12 +376,30 @@ Status initializeSharding(OperationContext* opCtx) {
     CatalogCacheLoader::set(opCtx->getServiceContext(),
                             stdx::make_unique<ConfigServerCatalogCacheLoader>());
 
+    auto catalogCache = stdx::make_unique<CatalogCache>(CatalogCacheLoader::get(opCtx));
+
+    // List of hooks which will be called by the ShardRegistry when it discovers a shard has been
+    // removed.
+    std::vector<ShardRegistry::ShardRemovalHook> shardRemovalHooks = {
+        // Invalidate appropriate entries in the catalog cache when a shard is removed. It's safe to
+        // capture the catalog cache pointer since the Grid (and therefore CatalogCache and
+        // ShardRegistry) are never destroyed.
+        [catCache = catalogCache.get()](const ShardId& removedShard) {
+            catCache->invalidateEntriesThatReferenceShard(removedShard);
+        }};
+
+    if (mongosGlobalParams.configdbs.type() == ConnectionString::INVALID) {
+        return {ErrorCodes::BadValue, "Unrecognized connection string."};
+    }
+
+    auto shardRegistry = stdx::make_unique<ShardRegistry>(
+        std::move(shardFactory), mongosGlobalParams.configdbs, std::move(shardRemovalHooks));
+
     Status status = initializeGlobalShardingState(
         opCtx,
-        mongosGlobalParams.configdbs,
         generateDistLockProcessId(opCtx),
-        std::move(shardFactory),
-        stdx::make_unique<CatalogCache>(CatalogCacheLoader::get(opCtx)),
+        std::move(catalogCache),
+        std::move(shardRegistry),
         [opCtx]() {
             auto hookList = stdx::make_unique<rpc::EgressMetadataHookList>();
             hookList->addHook(
