@@ -217,7 +217,7 @@ __wt_conn_dhandle_alloc(
 	 * Prepend the handle to the connection list, assuming we're likely to
 	 * need new files again soon, until they are cached by all sessions.
 	 */
-	bucket = dhandle->name_hash % WT_BIG_HASH_ARRAY_SIZE;
+	bucket = dhandle->name_hash % S2C(session)->big_hash_array_size;
 	WT_CONN_DHANDLE_INSERT(S2C(session), dhandle, bucket);
 
 	session->dhandle = dhandle;
@@ -244,7 +244,7 @@ __wt_conn_dhandle_find(
 	/* We must be holding the handle list lock at a higher level. */
 	WT_ASSERT(session, F_ISSET(session, WT_SESSION_LOCKED_HANDLE_LIST));
 
-	bucket = __wt_hash_city64(uri, strlen(uri)) % WT_BIG_HASH_ARRAY_SIZE;
+	bucket = __wt_hash_city64(uri, strlen(uri)) % conn->big_hash_array_size;
 	if (checkpoint == NULL) {
 		TAILQ_FOREACH(dhandle, &conn->dhhash[bucket], hashq) {
 			if (F_ISSET(dhandle, WT_DHANDLE_DEAD))
@@ -593,7 +593,7 @@ __wt_conn_btree_apply(WT_SESSION_IMPL *session, const char *uri,
 	 */
 	if (uri != NULL) {
 		bucket =
-		    __wt_hash_city64(uri, strlen(uri)) % WT_BIG_HASH_ARRAY_SIZE;
+		    __wt_hash_city64(uri, strlen(uri)) % conn->big_hash_array_size;
 
 		for (dhandle = NULL;;) {
 			WT_WITH_HANDLE_LIST_READ_LOCK(session,
@@ -705,7 +705,7 @@ __wt_conn_dhandle_close_all(
 	WT_ERR(__conn_dhandle_close_one(
 	    session, uri, NULL, removed, mark_dead));
 
-	bucket = __wt_hash_city64(uri, strlen(uri)) % WT_BIG_HASH_ARRAY_SIZE;
+	bucket = __wt_hash_city64(uri, strlen(uri)) % conn->big_hash_array_size;
 	TAILQ_FOREACH(dhandle, &conn->dhhash[bucket], hashq) {
 		if (strcmp(dhandle->name, uri) != 0 ||
 		    dhandle->checkpoint == NULL ||
@@ -734,7 +734,7 @@ __conn_dhandle_remove(WT_SESSION_IMPL *session, bool final)
 
 	conn = S2C(session);
 	dhandle = session->dhandle;
-	bucket = dhandle->name_hash % WT_BIG_HASH_ARRAY_SIZE;
+	bucket = dhandle->name_hash % conn->big_hash_array_size;
 
 	WT_ASSERT(session,
 	    F_ISSET(session, WT_SESSION_LOCKED_HANDLE_LIST_WRITE));
