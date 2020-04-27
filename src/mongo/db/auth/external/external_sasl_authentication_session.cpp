@@ -44,6 +44,7 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 #include "mongo/client/sasl_client_authenticate.h"
 #include "mongo/db/auth/sasl_command_constants.h"
 #include "mongo/db/auth/sasl_mechanism_registry.h"
+#include "mongo/db/auth/sasl_options.h"
 #include "mongo/db/ldap/ldap_manager.h"
 #include "mongo/db/ldap/ldap_manager_impl.h"
 #include "mongo/db/ldap_options.h"
@@ -76,8 +77,8 @@ StatusWith<std::tuple<bool, std::string>> SaslExternalLDAPServerMechanism::getSt
 }
 
 Status SaslExternalLDAPServerMechanism::initializeConnection() {
-    int result = sasl_server_new(saslDefaultServiceName.rawData(),
-                                 prettyHostName().c_str(), // Fully Qualified Domain Name (FQDN), nullptr => gethostname()
+    int result = sasl_server_new(saslGlobalParams.serviceName.c_str(),
+                                 saslGlobalParams.hostName.c_str(), // Fully Qualified Domain Name (FQDN), nullptr => gethostname()
                                  nullptr, // User Realm string, nullptr forces default value: FQDN.
                                  nullptr, // Local IP address
                                  nullptr, // Remote IP address
@@ -215,7 +216,7 @@ MONGO_INITIALIZER(SaslExternalLDAPServerMechanism)(InitializerContext*) {
         {SASL_CB_LOG, SaslCallbackFn(saslServerLog), nullptr /* context */},
         {SASL_CB_LIST_END}
     };
-    int result = sasl_server_init(saslServerGlobalCallbacks, saslDefaultServiceName.rawData());
+    int result = sasl_server_init(saslServerGlobalCallbacks, saslGlobalParams.serviceName.c_str());
     if (result != SASL_OK) {
         LOGV2_ERROR(29030, "SASL server initialization failed");
         return getInitializationError(result);
