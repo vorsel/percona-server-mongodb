@@ -4,6 +4,24 @@ command_type: system
 pre:
 
 post:
+    # Do cluster teardown first to ensure runtime is below Evergreen's post timeout. Other post tasks
+    # will not have been run if the timeout is exceeded.
+    - command: shell.exec
+      params:
+        working_dir: work
+        script: |
+          source ./dsienv.sh
+          if [ -e /data/infrastructure_provisioning/terraform/provisioned.${cluster} ]; then
+            mark_idle.sh
+          fi
+    - command: shell.exec
+      params:
+        working_dir: work
+        script: |
+          set -e
+          set -v
+          source ./dsienv.sh
+          ../src/dsi/dsi/run-dsi infrastructure_teardown.py
     - command: shell.exec
       params:
         working_dir: work
@@ -37,15 +55,6 @@ post:
       params:
          name: "perf"
          file: "work/perf.json"
-    - command: shell.exec
-      params:
-        working_dir: work
-        script: |
-          source ./dsienv.sh
-          if [ -e /data/infrastructure_provisioning/terraform/provisioned.${cluster} ]; then
-            mark_idle.sh
-          fi
-
     - command: shell.exec
       params:
         working_dir: src
@@ -189,6 +198,10 @@ functions:
           test_control: ${test}
           production: true
           overrides:
+            infrastructure_provisioning:
+              tfvars:
+                # This is currently only used by initialsync-logkeeper. It is empty and not used for other tests.
+                mongod_seeded_ebs_snapshot_id: ${snapshotId}
             workload_setup:
               local_repos:
                 workloads: ../src/workloads/workloads
@@ -287,6 +300,16 @@ functions:
 
   "analyze":
     - command: shell.exec
+      type: test
+      params:
+        working_dir: work
+        script: |
+          set -o verbose
+          source ./dsienv.sh
+          ../src/dsi/dsi/run-dsi analysis.py
+          # detect outliers needs to run, so defer the post_run_check exit status to later
+          echo $? > post_run_check.status
+    - command: shell.exec
       params:
         working_dir: work
         script: |
@@ -299,25 +322,13 @@ functions:
           evergreen_api_key=${evergreen_api_key}
           evergreen_api_user=${evergreen_api_user}
           source ../src/buildscripts/signal_processing_setup.sh
-          detect-changes --evergreen-api-config .evergreen.yml
-    - command: shell.exec
-      type : test
-      params:
-        working_dir: work
-        script: |
-          set -o errexit
-          set -o verbose
-          TAG="3.4.14-Baseline"
-          OVERRIDEFILE="../src/dsi/dsi/analysis/${branch_name}/system_perf_override.json"
-          python -u ../src/dsi/dsi/analysis/post_run_check.py ${script_flags} --reports-analysis reports --perf-file perf.json --rev ${revision} --refTag $TAG --overrideFile $OVERRIDEFILE --project_id sys-perf --variant ${build_variant} --task ${task_name}
-          # detect outliers needs to run, so defer the post_run_check exit status to later
-          echo $? > post_run_check.status
+          detect-changes --config .signal-processing.yml
     - command: shell.exec
       params:
         working_dir: work
         script: |
           source ../src/buildscripts/signal_processing_setup.sh
-          detect-outliers --evergreen-api-config .evergreen.yml
+          detect-outliers --config .signal-processing.yml
 
 #######################################
 #               Tasks                 #
@@ -526,6 +537,17 @@ tasks:
     - func: "prepare environment"
       vars:
         test: "initialsync"
+    - func: "deploy cluster"
+    - func: "run test"
+    - func: "analyze"
+
+- name: initialsync-logkeeper
+  priority: 5
+  exec_timeout_secs: 216000 # 2.5 days
+  commands:
+    - func: "prepare environment"
+      vars:
+        test: "initialsync-logkeeper"
     - func: "deploy cluster"
     - func: "run test"
     - func: "analyze"
@@ -745,6 +767,29 @@ buildvariants:
         variant: compile-rhel70
   tasks:
     - name: initialsync
+
+
+- name: linux-replSet-initialsync-logkeeper
+  display_name: Linux ReplSet Initial Sync LogKeeper
+  batchtime: 10080 # 7 days
+  modules: *modules
+  expansions:
+    setup: initialsync-logkeeper
+    cluster: initialsync-logkeeper
+    # EBS logkeeper snapshot with FCV set to 4.0
+    snapshotId: snap-044cc4cf3f616ef5d
+    platform: linux
+    # TODO(TIG-1506): enabled authentication on initialsync variants
+    authentication: disabled
+    storageEngine: wiredTiger
+    project_dir: *project_dir
+  run_on:
+      - "rhel70-perf-initialsync-logkeeper"
+  depends_on:
+      - name: compile
+        variant: compile-rhel70
+  tasks:
+    - name: initialsync-logkeeper
 
 #######################################
 #         MMAP Buildvariants         #
