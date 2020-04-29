@@ -37,6 +37,9 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 #include <cstdint>
 #include <string>
 
+#include <ldap.h>
+#include <sasl/sasl.h>
+
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
@@ -92,6 +95,28 @@ namespace mongo {
                 return result == SASL_OK || result == SASL_CONTINUE;
             }
         } _results;
+    };
+
+    class OpenLDAPAuthenticationSession : public SaslAuthenticationSession {
+        MONGO_DISALLOW_COPYING(OpenLDAPAuthenticationSession);
+    public:
+        explicit OpenLDAPAuthenticationSession(AuthorizationSession* authzSession);
+        virtual ~OpenLDAPAuthenticationSession();
+
+    private:
+        LDAP* _ld{nullptr};
+        mutable char* _principal{nullptr};
+        std::string _mechanism;
+
+        virtual Status start(StringData authenticationDatabase,
+                             StringData mechanism,
+                             StringData serviceName,
+                             StringData serviceHostname,
+                             int64_t conversationId,
+                             bool autoAuthorize) override final;
+        virtual Status step(StringData inputData, std::string* outputData) override final;
+        virtual std::string getPrincipalId() const override final;
+        virtual const char* getMechanism() const override final;
     };
 
 }  // namespace mongo
