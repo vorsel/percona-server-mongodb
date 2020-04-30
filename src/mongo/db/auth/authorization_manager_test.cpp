@@ -226,7 +226,13 @@ public:
 };
 
 TEST_F(AuthorizationManagerTest, testAcquireV2User) {
-    OperationContextNoop opCtx;
+    ServiceContextNoop serviceContext;
+    transport::TransportLayerMock transportLayer{};
+    transport::SessionHandle session = transportLayer.createSession();
+    setX509PeerInfo(session, {});
+    ServiceContext::UniqueClient client = serviceContext.makeClient("testClient", session);
+    ServiceContext::UniqueOperationContext opCtxPtr = client->makeOperationContext();
+    auto& opCtx = *opCtxPtr;
 
     ASSERT_OK(externalState->insertPrivilegeDocument(&opCtx,
                                                      BSON("_id"
@@ -420,7 +426,13 @@ public:
 
 // Tests SERVER-21535, unrecognized actions should be ignored rather than causing errors.
 TEST_F(AuthorizationManagerTest, testAcquireV2UserWithUnrecognizedActions) {
-    OperationContextNoop opCtx;
+    ServiceContextNoop serviceContext;
+    transport::TransportLayerMock transportLayer{};
+    transport::SessionHandle session = transportLayer.createSession();
+    setX509PeerInfo(session, {});
+    ServiceContext::UniqueClient client = serviceContext.makeClient("testClient", session);
+    ServiceContext::UniqueOperationContext opCtxPtr = client->makeOperationContext();
+    auto& opCtx = *opCtxPtr;
 
     ASSERT_OK(
         externalState->insertPrivilegeDocument(&opCtx,
