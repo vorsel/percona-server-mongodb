@@ -4,7 +4,7 @@ import subprocess
 import os
 import datetime
 
-import buildscripts.resmokelib.testing.fixtures.interface as fixture_interface
+from buildscripts.resmokelib.testing.fixtures import interface as fixture_interface
 from . import interface
 from ... import core
 from ... import utils
