@@ -36,6 +36,8 @@
 #include <string>
 #include <vector>
 
+#include <boost/thread/synchronized_value.hpp>
+
 #include "mongo/base/static_assert.h"
 #include "mongo/base/status.h"
 #include "mongo/db/jsobj.h"
@@ -280,7 +282,7 @@ struct IsOneOf<T, U0, Us...>
  * they have std::atomic or equivalent types.
  */
 template <typename T>
-struct IsSafeRuntimeType : IsOneOf<T, bool, int, long long, double> {};
+struct IsSafeRuntimeType : IsOneOf<T, bool, int, long long, double, std::string> {};
 
 /**
  * Get the type of storage to use for a given tuple of <type, ServerParameterType>.
@@ -293,12 +295,14 @@ template <typename T, ServerParameterType paramType>
 struct StorageTraits {
     /**
      * For kStartupOnly parameters, we can use the type T as storage directly.
+     * Otherwise if T is std::string, use boost::synchronized_value<std::string>
      * Otherwise if T is double, use AtomicDouble. Otherwise use AtomicWord<T>.
      */
     using value_type = std::conditional_t<
         paramType == ServerParameterType::kStartupOnly,
         T,
-        std::conditional_t<std::is_same<T, double>::value, AtomicDouble, AtomicWord<T>>>;
+        std::conditional_t<std::is_same<T, std::string>::value, boost::synchronized_value<std::string>,
+        std::conditional_t<std::is_same<T, double>::value, AtomicDouble, AtomicWord<T>>>>;
 
     static T get(value_type* v) {
         return _get(v);
@@ -309,6 +313,9 @@ struct StorageTraits {
     }
 
 private:
+    static T _get(boost::synchronized_value<std::string>* v) {
+        return v->get();
+    }
     static T _get(AtomicDouble* v) {
         return v->load();
     }
@@ -321,6 +328,9 @@ private:
         return *v;
     }
 
+    static void _set(boost::synchronized_value<std::string>* v, const T& newValue) {
+        *v = newValue;
+    }
     static void _set(AtomicDouble* v, const T& newValue) {
         v->store(newValue);
     }
@@ -369,6 +379,15 @@ public:
                                   [this] { return storage_traits::get(_value); },
                                   paramType),
           _value(value) {}
+
+    /**
+     * Same constructor plus validator function.
+     */
+    ExportedServerParameter(ServerParameterSet* sps, const std::string& name, storage_type* value,
+                            validator_function validator)
+        : ExportedServerParameter(sps, name, value) {
+        _validator = std::move(validator);
+    }
 
     // Don't let the template method hide our inherited method
     using BoundServerParameter<T>::set;

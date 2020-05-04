@@ -33,7 +33,8 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
 
-#include <sasl/sasl.h>
+#include <fmt/format.h>
+#include <ldap.h>
 
 #include "mongo/db/auth/native_sasl_authentication_session.h"
 
@@ -49,8 +50,11 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/auth/sasl_options.h"
 #include "mongo/db/auth/external/external_sasl_authentication_session.h"
+#include "mongo/db/auth/sasl_options.h"
+#include "mongo/db/ldap/ldap_manager.h"
+#include "mongo/db/ldap/ldap_manager_impl.h"
+#include "mongo/db/ldap_options.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
@@ -59,6 +63,7 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 namespace mongo {
 
     using boost::scoped_ptr;
+    using namespace fmt::literals;
 
 namespace {
 
@@ -69,7 +74,10 @@ namespace {
         StringData db,
         StringData mechanism) {
         if (mechanism == "PLAIN" && db == saslDefaultDBName)
-            return new ExternalSaslAuthenticationSession(authzSession);
+            if (!ldapGlobalParams.ldapServers->empty())
+                return new OpenLDAPAuthenticationSession(authzSession);
+            else
+                return new ExternalSaslAuthenticationSession(authzSession);
         else
             return createSaslBase(authzSession, db, mechanism);
     }
@@ -235,5 +243,95 @@ namespace {
     int ExternalSaslAuthenticationSession::getUserName(const char ** username) const {
         return sasl_getprop(_saslConnection, SASL_USERNAME, (const void**)username);
     }
+
+
+
+OpenLDAPAuthenticationSession::OpenLDAPAuthenticationSession(
+    AuthorizationSession* authzSession) :
+    SaslAuthenticationSession(authzSession) {}
+
+OpenLDAPAuthenticationSession::~OpenLDAPAuthenticationSession() {
+    if (_ld) {
+        ldap_unbind_ext(_ld, nullptr, nullptr);
+        _ld = nullptr;
+    }
+}
+
+
+Status OpenLDAPAuthenticationSession::start(StringData authenticationDatabase,
+                                              StringData mechanism,
+                                              StringData serviceName,
+                                              StringData serviceHostname,
+                                              int64_t conversationId,
+                                              bool autoAuthorize) {
+    if (_conversationId != 0) {
+        return Status(ErrorCodes::AlreadyInitialized,
+                      "Cannot call start() twice on same OpenLDAPAuthenticationSession.");
+    }
+
+    _authenticationDatabase = authenticationDatabase.toString();
+    _mechanism = mechanism.toString();
+    _serviceName = serviceName.toString();
+    _serviceHostname = serviceHostname.toString();
+    _conversationId = conversationId;
+    _autoAuthorize = autoAuthorize;
+
+    return Status::OK();
+}
+
+Status OpenLDAPAuthenticationSession::step(StringData inputData, std::string* outputData) {
+    if (_saslStep++ == 0) {
+        const char* userid = inputData.rawData();
+        const char* dn = userid + std::strlen(userid) + 1; // authentication id
+        const char* pw = dn + std::strlen(dn) + 1; // password
+
+        // transform user to DN
+        std::string mappedUser;
+        {
+            auto ldapManager = LDAPManager::get(_opCtx->getServiceContext());
+            auto mapRes = ldapManager->mapUserToDN(dn, mappedUser);
+            if (!mapRes.isOK())
+                return mapRes;
+            dn = mappedUser.c_str();
+        }
+
+        const char* ldapprot = "ldaps";
+        if (ldapGlobalParams.ldapTransportSecurity == "none")
+            ldapprot = "ldap";
+        auto uri = "{}://{}/"_format(ldapprot, ldapGlobalParams.ldapServers.get());
+        int res = ldap_initialize(&_ld, uri.c_str());
+        if (res != LDAP_SUCCESS) {
+            return Status(ErrorCodes::LDAPLibraryError,
+                          "Cannot initialize LDAP structure for {}; LDAP error: {}"_format(
+                              uri, ldap_err2string(res)));
+        }
+        const int ldap_version = LDAP_VERSION3;
+        res = ldap_set_option(_ld, LDAP_OPT_PROTOCOL_VERSION, &ldap_version);
+        if (res != LDAP_OPT_SUCCESS) {
+            return Status(ErrorCodes::LDAPLibraryError,
+                          "Cannot set LDAP version option; LDAP error: {}"_format(
+                              ldap_err2string(res)));
+        }
+
+        Status status = LDAPbind(_ld, dn, pw);
+        if (!status.isOK())
+            return status;
+        _principal = userid;
+        _done = true;
+        return Status::OK();
+    }
+    // This authentication session supports single step
+    return Status(ErrorCodes::InternalError,
+                  "An invalid second step was called against the OpenLDAP authentication session");
+
+}
+
+std::string OpenLDAPAuthenticationSession::getPrincipalId() const {
+    return _principal;
+}
+
+const char* OpenLDAPAuthenticationSession::getMechanism() const {
+    return _mechanism.c_str();
+}
 
 }  // namespace mongo

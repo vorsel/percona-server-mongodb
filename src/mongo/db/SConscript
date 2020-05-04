@@ -31,6 +31,7 @@ env.SConscript(
         'ftdc',
         'geo',
         'index',
+        'ldap',
         'matcher',
         'ops',
         'pipeline',
@@ -390,8 +391,22 @@ env.Clone().InjectModule("enterprise").Library(
         # networking library has separate options
         '$BUILD_DIR/mongo/util/net/network',
         '$BUILD_DIR/mongo/util/options_parser/options_parser',
+        'ldap_options',
         'server_options_core',
         'server_parameters',
+    ],
+)
+
+env.Library(
+    target='ldap_options',
+    source=[
+        'ldap_options.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/server_parameters',
+        '$BUILD_DIR/mongo/util/net/network',
+        '$BUILD_DIR/mongo/util/options_parser/options_parser',
     ],
 )
 
@@ -431,6 +446,7 @@ env.Library(
     source=[
         "mongod_options.cpp",
         "ratelimit_parameter.cpp",
+        "mongod_ldap_parameters.cpp",
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/storage/mmap_v1/mmap_v1_options',
