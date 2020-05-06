@@ -37,7 +37,7 @@
 namespace mongo {
 namespace {
 
-class UnshardedCollection : public ScopedCollectionMetadata::Impl {
+class UnshardedCollection : public ScopedCollectionDescription::Impl {
 public:
     UnshardedCollection() = default;
 
@@ -57,11 +57,11 @@ public:
         return {kUnshardedCollection};
     }
 
-    ScopedCollectionMetadata getCurrentMetadata() override {
+    ScopedCollectionDescription getCollectionDescription() override {
         return {kUnshardedCollection};
     }
 
-    boost::optional<ScopedCollectionMetadata> getCurrentMetadataIfKnown() override {
+    boost::optional<ScopedCollectionDescription> getCurrentMetadataIfKnown() override {
         return boost::none;
     }
     boost::optional<ChunkVersion> getCurrentShardVersionIfKnown() override {
@@ -83,6 +83,7 @@ public:
     }
 
     void toBSONPending(BSONArrayBuilder&) const override {}
+    void appendInfoForServerStatus(BSONArrayBuilder* builder) {}
 
     void setFilteringMetadata(OperationContext*, CollectionMetadata) override {}
 };

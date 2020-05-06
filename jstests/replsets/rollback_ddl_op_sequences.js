@@ -10,6 +10,8 @@
  * 5. A receives many new operations, which B will replicate after rollback.
  * 6. B rejoins the set and goes through the rollback process.
  * 7. The contents of A and B are compare to ensure the rollback results in consistent nodes.
+ *
+ * @tags: [multiversion_incompatible]
  */
 load("jstests/replsets/rslib.js");
 
@@ -33,7 +35,14 @@ var checkFinalResults = function(db) {
 };
 
 var name = "rollback_ddl_op_sequences";
-var replTest = new ReplSetTest({name: name, nodes: 3, useBridge: true});
+// This test create indexes with majority of nodes not avialable for replication. So, disabling
+// index build commit quorum.
+var replTest = new ReplSetTest({
+    name: name,
+    nodes: 3,
+    useBridge: true,
+    nodeOptions: {setParameter: "enableIndexBuildCommitQuorum=false"}
+});
 var nodes = replTest.nodeList();
 
 var conns = replTest.startSet();

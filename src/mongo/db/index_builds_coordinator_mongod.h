@@ -55,6 +55,7 @@ public:
      * Sets up the thread pool.
      */
     IndexBuildsCoordinatorMongod();
+    IndexBuildsCoordinatorMongod(ThreadPool::Options options);
 
     /**
      * Shuts down the thread pool, signals interrupt to all index builds, then waits for all of the
@@ -78,7 +79,9 @@ public:
         IndexBuildProtocol protocol,
         IndexBuildOptions indexBuildOptions) override;
 
-    Status voteCommitIndexBuild(const UUID& buildUUID, const HostAndPort& hostAndPort) override;
+    Status voteCommitIndexBuild(OperationContext* opCtx,
+                                const UUID& buildUUID,
+                                const HostAndPort& hostAndPort) override;
 
     Status setCommitQuorum(OperationContext* opCtx,
                            const NamespaceString& nss,
@@ -122,6 +125,32 @@ private:
      * TODO: not yet implemented.
      */
     void _refreshReplStateFromPersisted(OperationContext* opCtx, const UUID& buildUUID);
+
+    /**
+     * Process voteCommitIndexBuild command's response.
+     */
+    bool _checkVoteCommitIndexCmdSucceeded(const BSONObj& response);
+
+    /**
+     * Signals index builder to commit.
+     */
+    void _sendCommitQuorumSatisfiedSignal(WithLock lk,
+                                          OperationContext* opCtx,
+                                          std::shared_ptr<ReplIndexBuildState> replState);
+
+    void _signalIfCommitQuorumIsSatisfied(OperationContext* opCtx,
+                                          std::shared_ptr<ReplIndexBuildState> replState) override;
+
+
+    bool _signalIfCommitQuorumNotEnabled(OperationContext* opCtx,
+                                         std::shared_ptr<ReplIndexBuildState> replState,
+                                         bool onStepUp = false) override;
+
+    void _signalPrimaryForCommitReadiness(OperationContext* opCtx,
+                                          std::shared_ptr<ReplIndexBuildState> replState) override;
+
+    Timestamp _waitForNextIndexBuildAction(OperationContext* opCtx,
+                                           std::shared_ptr<ReplIndexBuildState> replState) override;
 
     // Thread pool on which index builds are run.
     ThreadPool _threadPool;

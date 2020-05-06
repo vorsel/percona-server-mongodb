@@ -152,6 +152,19 @@ void addMergeCursorsSource(Pipeline* mergePipeline,
                            bool hasChangeStream);
 
 /**
+ * Targets the shards with an aggregation command built from `ownedPipeline` and explain set to
+ * true. Returns a BSONObj of the form {"pipeline": {<pipelineExplainOutput>}}.
+ */
+BSONObj targetShardsForExplain(Pipeline* ownedPipeline);
+
+/**
+ * Appends the explain output of `dispatchResults` to `result`.
+ */
+Status appendExplainResults(DispatchShardPipelineResults&& dispatchResults,
+                            const boost::intrusive_ptr<ExpressionContext>& mergeCtx,
+                            BSONObjBuilder* result);
+
+/**
  * Returns the proper routing table to use for targeting shards: either a historical routing table
  * based on the global read timestamp if there is an active transaction with snapshot level read
  * concern or the latest routing table otherwise.
@@ -177,10 +190,8 @@ Shard::RetryPolicy getDesiredRetryPolicy(OperationContext* opCtx);
  * merging half executing in this process after attaching a $mergeCursors. Will retry on network
  * errors and also on StaleConfig errors to avoid restarting the entire operation.
  */
-std::unique_ptr<Pipeline, PipelineDeleter> attachCursorToPipeline(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    Pipeline* ownedPipeline,
-    bool allowTargetingShards);
+std::unique_ptr<Pipeline, PipelineDeleter> attachCursorToPipeline(Pipeline* ownedPipeline,
+                                                                  bool allowTargetingShards);
 
 /**
  * Adds a log message with the given message. Simple helper to avoid defining the log component in a
@@ -248,7 +259,6 @@ auto shardVersionRetry(OperationContext* opCtx,
             if (!logAndTestMaxRetries(e)) {
                 throw;
             }
-            continue;
         }
     }
 }

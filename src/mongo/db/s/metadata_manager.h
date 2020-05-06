@@ -66,10 +66,11 @@ public:
      *
      * Holding a reference on a particular instance of the metadata means that orphan cleanup is not
      * allowed to run and delete chunks which are covered by that metadata. When the returned
-     * ScopedCollectionMetadata goes out of scope, the reference counter on the metadata will be
+     * ScopedCollectionDescription goes out of scope, the reference counter on the metadata will be
      * decremented and if it reaches to zero, orphan cleanup may proceed.
      */
-    ScopedCollectionMetadata getActiveMetadata(const boost::optional<LogicalTime>& atClusterTime);
+    ScopedCollectionDescription getActiveMetadata(
+        const boost::optional<LogicalTime>& atClusterTime);
 
     /**
      * Returns the shard version of the active metadata object.
@@ -109,6 +110,11 @@ public:
      * Appends information on all the chunk ranges in rangesToClean to builder.
      */
     void append(BSONObjBuilder* builder) const;
+
+    /**
+     * Appends summarized information for server status.
+     */
+    void appendForServerStatus(BSONArrayBuilder* builder) const;
 
     /**
      * Schedules any documents in `range` for immediate cleanup iff no running queries can depend

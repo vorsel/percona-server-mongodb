@@ -87,6 +87,11 @@ public:
     static void report(OperationContext* opCtx, BSONObjBuilder* builder);
 
     /**
+     * Attaches info for server status.
+     */
+    static void appendInfoForServerStatus(OperationContext* opCtx, BSONObjBuilder* builder);
+
+    /**
      * Returns the chunk filtering object that the current operation should be using for
      * the collection.
      *
@@ -109,17 +114,17 @@ public:
     /**
      * See the comments for 'getOwnershipFilter' above for more information on this method.
      */
-    virtual ScopedCollectionMetadata getCurrentMetadata() = 0;
+    virtual ScopedCollectionDescription getCollectionDescription() = 0;
 
     /**
-     * Returns boost::none if the filtering metadata for the collection is not known yet. Otherwise
+     * Returns boost::none if the description for the collection is not known yet. Otherwise
      * returns the most recently refreshed from the config server metadata or shard version.
      *
      * These methods do not check for the shard version that the operation requires and should only
      * be used for cases such as checking whether a particular config server update has taken
      * effect.
      */
-    virtual boost::optional<ScopedCollectionMetadata> getCurrentMetadataIfKnown() = 0;
+    virtual boost::optional<ScopedCollectionDescription> getCurrentMetadataIfKnown() = 0;
     virtual boost::optional<ChunkVersion> getCurrentShardVersionIfKnown() = 0;
 
     /**
@@ -175,6 +180,11 @@ public:
      * locks itself.
      */
     virtual void setFilteringMetadata(OperationContext* opCtx, CollectionMetadata newMetadata) = 0;
+
+    /**
+     * Append info to display in server status.
+     */
+    virtual void appendInfoForServerStatus(BSONArrayBuilder* builder) = 0;
 };
 
 /**

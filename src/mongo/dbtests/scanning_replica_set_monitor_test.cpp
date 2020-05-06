@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2018-present MongoDB, Inc.
+ *    Copyright (C) 2020-present MongoDB, Inc.
  *
  *    This program is free software: you can redistribute it and/or modify
  *    it under the terms of the Server Side Public License, version 1,
@@ -36,6 +36,7 @@
 #include "mongo/client/connpool.h"
 #include "mongo/client/dbclient_rs.h"
 #include "mongo/client/replica_set_monitor.h"
+#include "mongo/client/replica_set_monitor_protocol_test_util.h"
 #include "mongo/client/scanning_replica_set_monitor_internal.h"
 #include "mongo/dbtests/mock/mock_conn_registry.h"
 #include "mongo/dbtests/mock/mock_replica_set.h"
@@ -62,49 +63,43 @@ MONGO_INITIALIZER(DisableReplicaSetMonitorRefreshRetries)(InitializerContext*) {
  * Warning: Tests running this fixture cannot be run in parallel with other tests
  * that uses ConnectionString::setConnectionHook
  */
-class ReplicaSetMonitorTest : public mongo::unittest::Test {
+class ScanningReplicaSetMonitorDBTest : public unittest::Test {
 protected:
     void setUp() {
-        _replSet.reset(new MockReplicaSet("test", 3));
-        _originalConnectionHook = ConnectionString::getConnectionHook();
-        ConnectionString::setConnectionHook(mongo::MockConnRegistry::get()->getConnStrHook());
+        // Restrict the test to use ReplicaSetMonitorProtocol::kScanning only.
+        ReplicaSetMonitorProtocolTestUtil::setRSMProtocol(ReplicaSetMonitorProtocol::kScanning);
     }
 
     void tearDown() {
-        ConnectionString::setConnectionHook(_originalConnectionHook);
         ReplicaSetMonitor::cleanup();
-        _replSet.reset();
-        mongo::ScopedDbConnection::clearPool();
+        ReplicaSetMonitorProtocolTestUtil::resetRSMProtocol();
     }
-
-    MockReplicaSet* getReplSet() {
-        return _replSet.get();
-    }
-
-private:
-    ConnectionString::ConnectionHook* _originalConnectionHook;
-    std::unique_ptr<MockReplicaSet> _replSet;
 };
 
-TEST_F(ReplicaSetMonitorTest, SeedWithPriOnlySecDown) {
+TEST_F(ScanningReplicaSetMonitorDBTest, SeedWithPriOnlySecDown) {
     // Test to make sure that the monitor doesn't crash when
     // ConnectionString::connect returns NULL
-    MockReplicaSet* replSet = getReplSet();
-    replSet->kill(replSet->getSecondaries());
+    MockReplicaSet replSet("test", 3);
+    ConnectionString::ConnectionHook* originalConnHook = ConnectionString::getConnectionHook();
+    ConnectionString::setConnectionHook(mongo::MockConnRegistry::get()->getConnStrHook());
+    replSet.kill(replSet.getSecondaries());
 
     // Create a monitor with primary as the only seed list and the two secondaries
     // down so a NULL connection object will be stored for these secondaries in
     // the _nodes vector.
-    const string replSetName(replSet->getSetName());
+    const string replSetName(replSet.getSetName());
     set<HostAndPort> seedList;
-    seedList.insert(HostAndPort(replSet->getPrimary()));
+    seedList.insert(HostAndPort(replSet.getPrimary()));
     auto monitor = ReplicaSetMonitor::createIfNeeded(replSetName, seedList);
 
-    replSet->kill(replSet->getPrimary());
+    replSet.kill(replSet.getPrimary());
 
     // Trigger connection.
     monitor->runScanForMockReplicaSet();
     monitor.reset();
+    ReplicaSetMonitor::cleanup();
+    ConnectionString::setConnectionHook(originalConnHook);
+    mongo::ScopedDbConnection::clearPool();
 }
 
 namespace {
@@ -144,7 +139,7 @@ repl::ReplSetConfig _getConfigWithMemberRemoved(const repl::ReplSetConfig& oldCo
 // This test goes through configurations with different positions for the primary node
 // in the host list returned from the isMaster command. The test here is to make sure
 // that the ReplicaSetMonitor will not crash under these situations.
-TEST(ReplicaSetMonitorTest, PrimaryRemovedFromSetStress) {
+TEST_F(ScanningReplicaSetMonitorDBTest, PrimaryRemovedFromSetStress) {
     const size_t NODE_COUNT = 5;
     MockReplicaSet replSet("test", NODE_COUNT);
     ConnectionString::ConnectionHook* originalConnHook = ConnectionString::getConnectionHook();

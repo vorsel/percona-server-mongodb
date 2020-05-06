@@ -194,10 +194,11 @@ clientDriverEnv.Library(
         env.Idlc('global_conn_pool.idl')[0],
         'replica_set_change_notifier.cpp',
         'replica_set_monitor.cpp',
+        'replica_set_monitor_manager.cpp',
         'scanning_replica_set_monitor.cpp',
         'streamable_replica_set_monitor.cpp',
-        'replica_set_monitor_manager.cpp',
-        env.Idlc('replica_set_monitor_params.idl')[0],
+        'streamable_replica_set_monitor_query_processor.cpp',
+        'server_is_master_monitor.cpp',
         'server_ping_monitor.cpp',
     ],
     LIBDEPS=[
@@ -210,6 +211,8 @@ clientDriverEnv.Library(
         '$BUILD_DIR/mongo/util/background_job',
         '$BUILD_DIR/mongo/util/md5',
         '$BUILD_DIR/mongo/util/net/network',
+        'replica_set_monitor_server_parameters',
+		'$BUILD_DIR/mongo/client/sdam/sdam',
         'clientdriver_minimal',
         'read_preference',
     ],
@@ -217,6 +220,17 @@ clientDriverEnv.Library(
         '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
         '$BUILD_DIR/mongo/transport/message_compressor',
         '$BUILD_DIR/mongo/util/net/ssl_manager',
+    ]
+)
+
+env.Library(
+    target='replica_set_monitor_server_parameters',
+    source=[
+        'replica_set_monitor_server_parameters.cpp',
+        env.Idlc('replica_set_monitor_server_parameters.idl')[0],
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/idl/server_parameter',
     ]
 )
 
@@ -307,12 +321,12 @@ env.CppUnitTest(
         'authenticate_test.cpp',
         'connection_string_test.cpp',
         'dbclient_cursor_test.cpp',
-        'disable_streamable_rsm_flag_test.cpp',
         'fetcher_test.cpp',
         'index_spec_test.cpp',
         'mongo_uri_test.cpp',
         'read_preference_test.cpp',
         'remote_command_retry_scheduler_test.cpp',
+        'replica_set_monitor_server_parameters_test.cpp', 
         'scanning_replica_set_monitor_internal_test.cpp',
         'scanning_replica_set_monitor_read_preference_test.cpp',
         'scanning_replica_set_monitor_scan_test.cpp',
@@ -342,6 +356,17 @@ env.CppUnitTest(
         'fetcher',
         'read_preference',
         'remote_command_retry_scheduler',
+        'replica_set_monitor_protocol_test_util',
+    ],
+)
+
+env.Library(
+    target='replica_set_monitor_protocol_test_util',
+    source=[
+        'replica_set_monitor_protocol_test_util.cpp',
+    ],
+    LIBDEPS=[
+        'clientdriver_network',
     ],
 )
 
@@ -350,11 +375,12 @@ env.CppUnitTest(
 env.CppUnitTest(
     target='client_rs_test',
     source=[
-        'dbclient_rs_test.cpp'
+        'dbclient_rs_test.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/dbtests/mocklib',
         'clientdriver_network',
+        'replica_set_monitor_protocol_test_util',
     ],
 )
 

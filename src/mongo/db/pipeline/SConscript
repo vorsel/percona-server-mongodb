@@ -64,7 +64,7 @@ env.Library(
     LIBDEPS=[
         'aggregation_request',
         '$BUILD_DIR/mongo/db/query/collation/collator_factory_interface',
-	'$BUILD_DIR/mongo/db/query/query_knobs',
+	    '$BUILD_DIR/mongo/db/query/query_knobs',
         '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/scripting/scripting',
         '$BUILD_DIR/mongo/util/intrusive_counter',
@@ -282,6 +282,7 @@ pipelineEnv.Library(
         '$BUILD_DIR/mongo/db/sessions_collection',
         '$BUILD_DIR/mongo/db/storage/encryption_hooks',
         '$BUILD_DIR/mongo/db/storage/storage_options',
+        '$BUILD_DIR/mongo/db/views/resolved_view',
         '$BUILD_DIR/mongo/s/is_mongos',
         '$BUILD_DIR/third_party/shim_snappy',
         'accumulator',

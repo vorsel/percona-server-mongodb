@@ -138,10 +138,6 @@ private:
     // A cache of whether there are any users set up for the cluster.
     AtomicWord<bool> _privilegeDocsExist{false};
 
-    // Thread pool on which to perform the blocking activities that load the user credentials from
-    // storage
-    ThreadPool _threadPool;
-
     // Serves as a source for the return value of getCacheGeneration(). Refer to this method for
     // more details.
     Mutex _cacheGenerationMutex =
@@ -184,7 +180,7 @@ private:
         // Even though the dist cache permits for lookup to return boost::none for non-existent
         // values, the contract of the authorization manager is that it should throw an exception if
         // the value can not be loaded, so if it returns, the value will always be set.
-        boost::optional<User> lookup(OperationContext* opCtx, const UserName& userName) override;
+        boost::optional<User> lookup(OperationContext* opCtx, const UserRequest& user) override;
 
     private:
         Mutex _mutex = MONGO_MAKE_LATCH("AuthorizationManagerImpl::UserDistCacheImpl::_mutex");
@@ -193,6 +189,10 @@ private:
 
         AuthzManagerExternalState* const _externalState;
     } _userCache;
+
+    // Thread pool on which to perform the blocking activities that load the user credentials from
+    // storage
+    ThreadPool _threadPool;
 
     Mutex _pinnedUsersMutex = MONGO_MAKE_LATCH("AuthorizationManagerImpl::_pinnedUsersMutex");
     stdx::condition_variable _pinnedUsersCond;

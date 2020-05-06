@@ -322,6 +322,7 @@ env.Library(
         'rename_collection_idl',
         'test_commands_enabled',
         'write_commands_common',
+        "$BUILD_DIR/mongo/db/storage/two_phase_index_build_knobs_idl",
     ],
 )
 
@@ -561,23 +562,28 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/db/auth/authmocks',
         '$BUILD_DIR/mongo/db/query/query_test_service_context',
         'map_reduce_agg',
-    ]
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/storage/two_phase_index_build_knobs_idl',
+    ],
 )
 
-env.CppUnitTest(
-    target="command_mirroring_test",
-    source=[
-        'command_mirroring_test.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/auth/authorization_manager_global',
-        '$BUILD_DIR/mongo/db/auth/authmocks',
-        '$BUILD_DIR/mongo/db/commands/standalone',
-        '$BUILD_DIR/mongo/db/service_context',
-        '$BUILD_DIR/mongo/unittest/unittest',
-    ],
-)
+# TODO SERVER-46533 Reenable this test when update can participate in read mirroring again
+if False:
+    env.CppUnitTest(
+        target="command_mirroring_test",
+        source=[
+            'command_mirroring_test.cpp',
+        ],
+        LIBDEPS=[
+            '$BUILD_DIR/mongo/base',
+            '$BUILD_DIR/mongo/db/auth/authorization_manager_global',
+            '$BUILD_DIR/mongo/db/auth/authmocks',
+            '$BUILD_DIR/mongo/db/commands/standalone',
+            '$BUILD_DIR/mongo/db/service_context',
+            '$BUILD_DIR/mongo/unittest/unittest',
+        ],
+    )
 
 env.CppUnitTest(
     target="db_commands_test",

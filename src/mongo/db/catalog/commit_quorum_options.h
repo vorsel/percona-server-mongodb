@@ -50,6 +50,8 @@ public:
     static const StringData kCommitQuorumField;  // = "commitQuorum"
     static const char kMajority[];               // = "majority"
 
+    static const int kUninitializedNumNodes = -1;
+    static const int kDisabled = 0;
     static const BSONObj Majority;  // = {"commitQuorum": "majority"}
 
     CommitQuorumOptions() {
@@ -70,21 +72,25 @@ public:
     static CommitQuorumOptions deserializerForIDL(const BSONElement& commitQuorumElement);
 
     void reset() {
-        numNodes = 0;
+        numNodes = kUninitializedNumNodes;
         mode = "";
+    }
+
+    inline bool operator==(const CommitQuorumOptions& rhs) const {
+        return (numNodes == rhs.numNodes && mode == rhs.mode) ? true : false;
     }
 
     // Returns the BSON representation of this object.
     BSONObj toBSON() const;
 
     // Appends the BSON representation of this object.
-    void append(StringData fieldName, BSONObjBuilder* builder) const;
+    void appendToBuilder(StringData fieldName, BSONObjBuilder* builder) const;
 
     // The 'commitQuorum' parameter to define the required quorum for the index builds to commit.
     // The 'mode' represents the string format and takes precedence over the number format
     // 'numNodes'.
-    int numNodes;
-    std::string mode;
+    int numNodes = kUninitializedNumNodes;
+    std::string mode = "";
 };
 
 }  // namespace mongo

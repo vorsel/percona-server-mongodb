@@ -84,9 +84,9 @@ public:
 
     ScopedCollectionFilter getOwnershipFilter(OperationContext* opCtx) override;
 
-    ScopedCollectionMetadata getCurrentMetadata() override;
+    ScopedCollectionDescription getCollectionDescription() override;
 
-    boost::optional<ScopedCollectionMetadata> getCurrentMetadataIfKnown() override;
+    boost::optional<ScopedCollectionDescription> getCurrentMetadataIfKnown() override;
 
     boost::optional<ChunkVersion> getCurrentShardVersionIfKnown() override;
 
@@ -104,6 +104,8 @@ public:
         ShardingMigrationCriticalSection::Operation op) const override;
 
     void setFilteringMetadata(OperationContext* opCtx, CollectionMetadata newMetadata) override;
+
+    void appendInfoForServerStatus(BSONArrayBuilder* builder) override;
 
     /**
      * Marks the collection's filtering metadata as UNKNOWN, meaning that all attempts to check for
@@ -166,7 +168,7 @@ private:
      * Returns the latest version of collection metadata with filtering configured for
      * atClusterTime if specified.
      */
-    boost::optional<ScopedCollectionMetadata> _getCurrentMetadataIfKnown(
+    boost::optional<ScopedCollectionDescription> _getCurrentMetadataIfKnown(
         const boost::optional<LogicalTime>& atClusterTime);
 
     /**
@@ -174,7 +176,7 @@ private:
      * atClusterTime if specified. Throws StaleConfigInfo if the shard version attached to the
      * operation context does not match the shard version on the active metadata object.
      */
-    boost::optional<ScopedCollectionMetadata> _getMetadataWithVersionCheckAt(
+    boost::optional<ScopedCollectionDescription> _getMetadataWithVersionCheckAt(
         OperationContext* opCtx, const boost::optional<mongo::LogicalTime>& atClusterTime);
 
     // Namespace this state belongs to.

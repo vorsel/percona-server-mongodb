@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2018-present MongoDB, Inc.
+ *    Copyright (C) 2020-present MongoDB, Inc.
  *
  *    This program is free software: you can redistribute it and/or modify
  *    it under the terms of the Server Side Public License, version 1,
@@ -32,6 +32,21 @@
 #include "mongo/client/scanning_replica_set_monitor_test_fixture.h"
 
 namespace mongo {
+
+/**
+ * Setup every test to use replicaSetMonitorProtocol::kScanning.
+ */
+void ScanningReplicaSetMonitorTest::setUp() {
+    setGlobalServiceContext(ServiceContext::make());
+    ReplicaSetMonitorProtocolTestUtil::setRSMProtocol(ReplicaSetMonitorProtocol::kScanning);
+    ReplicaSetMonitor::cleanup();
+}
+
+void ScanningReplicaSetMonitorTest::tearDown() {
+    ReplicaSetMonitor::cleanup();
+    ReplicaSetMonitorProtocolTestUtil::resetRSMProtocol();
+}
+
 const std::vector<HostAndPort> ScanningReplicaSetMonitorTest::basicSeeds = {
     HostAndPort("a"), HostAndPort("b"), HostAndPort("c")};
 const std::set<HostAndPort> ScanningReplicaSetMonitorTest::basicSeedsSet = {std::begin(basicSeeds),

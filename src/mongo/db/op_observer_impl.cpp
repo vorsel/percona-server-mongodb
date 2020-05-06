@@ -235,8 +235,8 @@ OpTimeBundle replLogDelete(OperationContext* opCtx,
 BSONObj OpObserverImpl::getDocumentKey(OperationContext* opCtx,
                                        NamespaceString const& nss,
                                        BSONObj const& doc) {
-    auto metadata = CollectionShardingState::get(opCtx, nss)->getCurrentMetadata();
-    return metadata->extractDocumentKey(doc).getOwned();
+    auto collDesc = CollectionShardingState::get(opCtx, nss)->getCollectionDescription();
+    return collDesc.extractDocumentKey(doc).getOwned();
 }
 
 void OpObserverImpl::onCreateIndex(OperationContext* opCtx,
@@ -273,11 +273,14 @@ void OpObserverImpl::onStartIndexBuild(OperationContext* opCtx,
                                        CollectionUUID collUUID,
                                        const UUID& indexBuildUUID,
                                        const std::vector<BSONObj>& indexes,
+                                       const CommitQuorumOptions& commitQuorum,
                                        bool fromMigrate) {
     BSONObjBuilder oplogEntryBuilder;
     oplogEntryBuilder.append("startIndexBuild", nss.coll());
 
     indexBuildUUID.appendToBuilder(&oplogEntryBuilder, "indexBuildUUID");
+
+    commitQuorum.appendToBuilder(CommitQuorumOptions::kCommitQuorumField, &oplogEntryBuilder);
 
     BSONArrayBuilder indexesArr(oplogEntryBuilder.subarrayStart("indexes"));
     for (auto indexDoc : indexes) {

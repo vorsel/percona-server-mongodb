@@ -272,8 +272,8 @@ BSONObj CommonMongodProcessInterface::getCollectionOptions(OperationContext* opC
 }
 
 std::unique_ptr<Pipeline, PipelineDeleter>
-CommonMongodProcessInterface::attachCursorSourceToPipelineForLocalRead(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx, Pipeline* ownedPipeline) {
+CommonMongodProcessInterface::attachCursorSourceToPipelineForLocalRead(Pipeline* ownedPipeline) {
+    auto expCtx = ownedPipeline->getContext();
     std::unique_ptr<Pipeline, PipelineDeleter> pipeline(ownedPipeline,
                                                         PipelineDeleter(expCtx->opCtx));
 
@@ -628,9 +628,6 @@ BSONObj CommonMongodProcessInterface::_convertRenameToInternalRename(
     newCmd.append("from", renameCommandObj["renameCollection"].String());
     newCmd.append("to", renameCommandObj["to"].String());
     newCmd.append("collectionOptions", originalCollectionOptions);
-    if (!opCtx->getWriteConcern().usedDefault) {
-        newCmd.append(WriteConcernOptions::kWriteConcernField, opCtx->getWriteConcern().toBSON());
-    }
     BSONArrayBuilder indexArrayBuilder(newCmd.subarrayStart("indexes"));
     for (auto&& index : originalIndexes) {
         indexArrayBuilder.append(index);

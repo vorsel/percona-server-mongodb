@@ -49,6 +49,7 @@
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
 #include "mongo/db/pipeline/semantic_analysis.h"
 #include "mongo/logv2/log.h"
+#include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/query/cluster_query_knobs_gen.h"
@@ -581,6 +582,9 @@ void abandonCacheIfSentToShards(Pipeline* shardsPipeline) {
     }
 }
 
+
+}  // namespace
+
 /**
  * For a sharded collection, establishes remote cursors on each shard that may have results, and
  * creates a DocumentSourceMergeCursors stage to merge the remote cursors. Returns a pipeline
@@ -596,24 +600,16 @@ std::unique_ptr<Pipeline, PipelineDeleter> targetShardsAndAddMergeCursors(
               !dynamic_cast<DocumentSourceMergeCursors*>(pipeline->getSources().front().get()));
 
     // Generate the command object for the targeted shards.
-    std::vector<BSONObj> rawStages = [&pipeline]() {
-        auto serialization = pipeline->serialize();
-        std::vector<BSONObj> stages;
-        stages.reserve(serialization.size());
+    AggregationRequest aggRequest(expCtx->ns, pipeline->serializeToBson());
 
-        for (const auto& stageObj : serialization) {
-            invariant(stageObj.getType() == BSONType::Object);
-            stages.push_back(stageObj.getDocument().toBson());
-        }
-
-        return stages;
-    }();
-
-    AggregationRequest aggRequest(expCtx->ns, rawStages);
-
-    // The default value for 'allowDiskUse' in the AggregationRequest may not match what was set
-    // on the originating command, so copy it from the ExpressionContext.
+    // The default value for 'allowDiskUse' and 'maxTimeMS' in the AggregationRequest may not match
+    // what was set on the originating command, so copy it from the ExpressionContext.
     aggRequest.setAllowDiskUse(expCtx->allowDiskUse);
+
+    if (auto maxTimeMS = expCtx->opCtx->getRemainingMaxTimeMillis();
+        maxTimeMS < Microseconds::max()) {
+        aggRequest.setMaxTimeMS(durationCount<Milliseconds>(maxTimeMS));
+    }
 
     LiteParsedPipeline liteParsedPipeline(aggRequest);
     auto hasChangeStream = liteParsedPipeline.hasChangeStream();
@@ -646,8 +642,6 @@ std::unique_ptr<Pipeline, PipelineDeleter> targetShardsAndAddMergeCursors(
 
     return mergePipeline;
 }
-
-}  // namespace
 
 boost::optional<ShardedExchangePolicy> checkIfEligibleForExchange(OperationContext* opCtx,
                                                                   const Pipeline* mergePipeline) {
@@ -1001,6 +995,112 @@ void addMergeCursorsSource(Pipeline* mergePipeline,
     mergePipeline->addInitialSource(std::move(mergeCursorsStage));
 }
 
+Status appendExplainResults(DispatchShardPipelineResults&& dispatchResults,
+                            const boost::intrusive_ptr<ExpressionContext>& mergeCtx,
+                            BSONObjBuilder* result) {
+    if (dispatchResults.splitPipeline) {
+        auto* mergePipeline = dispatchResults.splitPipeline->mergePipeline.get();
+        const char* mergeType = [&]() {
+            if (mergePipeline->canRunOnMongos()) {
+                if (mergeCtx->inMongos) {
+                    return "mongos";
+                }
+                return "local";
+            } else if (dispatchResults.exchangeSpec) {
+                return "exchange";
+            } else if (mergePipeline->needsPrimaryShardMerger()) {
+                return "primaryShard";
+            } else {
+                return "anyShard";
+            }
+        }();
+
+        *result << "mergeType" << mergeType;
+
+        MutableDocument pipelinesDoc;
+        // We specify "queryPlanner" verbosity when building the output for "shardsPart" because
+        // execution stats are reported by each shard individually.
+        pipelinesDoc.addField("shardsPart",
+                              Value(dispatchResults.splitPipeline->shardsPipeline->writeExplainOps(
+                                  ExplainOptions::Verbosity::kQueryPlanner)));
+        if (dispatchResults.exchangeSpec) {
+            BSONObjBuilder bob;
+            dispatchResults.exchangeSpec->exchangeSpec.serialize(&bob);
+            bob.append("consumerShards", dispatchResults.exchangeSpec->consumerShards);
+            pipelinesDoc.addField("exchange", Value(bob.obj()));
+        }
+        // We specify "queryPlanner" verbosity because execution stats are not currently
+        // supported when building the output for "mergerPart".
+        pipelinesDoc.addField(
+            "mergerPart",
+            Value(mergePipeline->writeExplainOps(ExplainOptions::Verbosity::kQueryPlanner)));
+
+        *result << "splitPipeline" << pipelinesDoc.freeze();
+    } else {
+        *result << "splitPipeline" << BSONNULL;
+    }
+
+    BSONObjBuilder shardExplains(result->subobjStart("shards"));
+    for (const auto& shardResult : dispatchResults.remoteExplainOutput) {
+        invariant(shardResult.shardHostAndPort);
+
+        uassertStatusOK(shardResult.swResponse.getStatus());
+        uassertStatusOK(getStatusFromCommandResult(shardResult.swResponse.getValue().data));
+
+        auto shardId = shardResult.shardId.toString();
+        const auto& data = shardResult.swResponse.getValue().data;
+        BSONObjBuilder explain(shardExplains.subobjStart(shardId));
+        explain << "host" << shardResult.shardHostAndPort->toString();
+        if (auto stagesElement = data["stages"]) {
+            explain << "stages" << stagesElement;
+        } else {
+            auto queryPlannerElement = data["queryPlanner"];
+            uassert(51157,
+                    str::stream() << "Malformed explain response received from shard " << shardId
+                                  << ": " << data.toString(),
+                    queryPlannerElement);
+            explain << "queryPlanner" << queryPlannerElement;
+            if (auto executionStatsElement = data["executionStats"]) {
+                explain << "executionStats" << executionStatsElement;
+            }
+        }
+    }
+    return Status::OK();
+}
+
+BSONObj targetShardsForExplain(Pipeline* ownedPipeline) {
+    auto expCtx = ownedPipeline->getContext();
+    std::unique_ptr<Pipeline, PipelineDeleter> pipeline(ownedPipeline,
+                                                        PipelineDeleter(expCtx->opCtx));
+    invariant(pipeline->getSources().empty() ||
+              !dynamic_cast<DocumentSourceMergeCursors*>(pipeline->getSources().front().get()));
+    invariant(expCtx->explain);
+    // Generate the command object for the targeted shards.
+    auto rawStages = [&pipeline]() {
+        auto serialization = pipeline->serialize();
+        std::vector<BSONObj> stages;
+        stages.reserve(serialization.size());
+
+        for (const auto& stageObj : serialization) {
+            invariant(stageObj.getType() == BSONType::Object);
+            stages.push_back(stageObj.getDocument().toBson());
+        }
+
+        return stages;
+    }();
+
+    AggregationRequest aggRequest(expCtx->ns, rawStages);
+    LiteParsedPipeline liteParsedPipeline(aggRequest);
+    auto hasChangeStream = liteParsedPipeline.hasChangeStream();
+    auto shardDispatchResults = dispatchShardPipeline(
+        aggRequest.serializeToCommandObj(), hasChangeStream, std::move(pipeline));
+    BSONObjBuilder explainBuilder;
+    auto appendStatus =
+        appendExplainResults(std::move(shardDispatchResults), expCtx, &explainBuilder);
+    uassertStatusOK(appendStatus);
+    return BSON("pipeline" << explainBuilder.done());
+}
+
 StatusWith<CachedCollectionRoutingInfo> getExecutionNsRoutingInfo(OperationContext* opCtx,
                                                                   const NamespaceString& execNss) {
     // First, verify that there are shards present in the cluster. If not, then we return the
@@ -1036,10 +1136,9 @@ bool mustRunOnAllShards(const NamespaceString& nss, bool hasChangeStream) {
     return nss.isCollectionlessAggregateNS() || hasChangeStream;
 }
 
-std::unique_ptr<Pipeline, PipelineDeleter> attachCursorToPipeline(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    Pipeline* ownedPipeline,
-    bool allowTargetingShards) {
+std::unique_ptr<Pipeline, PipelineDeleter> attachCursorToPipeline(Pipeline* ownedPipeline,
+                                                                  bool allowTargetingShards) {
+    auto expCtx = ownedPipeline->getContext();
     std::unique_ptr<Pipeline, PipelineDeleter> pipeline(ownedPipeline,
                                                         PipelineDeleter(expCtx->opCtx));
     invariant(pipeline->getSources().empty() ||
@@ -1053,7 +1152,7 @@ std::unique_ptr<Pipeline, PipelineDeleter> attachCursorToPipeline(
                 // If the db is local, this may be a change stream examining the oplog. We know the
                 // oplog (and any other local collections) will not be sharded.
                 return expCtx->mongoProcessInterface->attachCursorSourceToPipelineForLocalRead(
-                    expCtx, pipeline.release());
+                    pipeline.release());
             }
             return targetShardsAndAddMergeCursors(expCtx, pipelineToTarget.release());
         });

@@ -69,6 +69,8 @@ constexpr auto kTopologyVersionObserverName = "TopologyVersionObserver";
  */
 class TopologyVersionObserver final {
 public:
+    static constexpr auto kDelayMS = Milliseconds(10);
+
     TopologyVersionObserver() = default;
 
     ~TopologyVersionObserver() {
@@ -98,8 +100,7 @@ private:
         kShutdown,
     };
 
-    std::shared_ptr<const IsMasterResponse> _getIsMasterResponse(boost::optional<TopologyVersion>,
-                                                                 bool*) noexcept;
+    void _cacheIsMasterResponse(OperationContext*, boost::optional<TopologyVersion>) noexcept;
 
     void _workerThreadBody() noexcept;
 
@@ -131,9 +132,11 @@ private:
      */
     AtomicWord<State> _state;
 
-    // Holds a reference to the observer client to allow `shutdown()` to stop the observer thread.
-    // This variable is only consistent when _state == State::kRunning and _mutex is acquired.
-    Client* _observerClient;
+    // Holds a reference to the worker opCtx to allow `shutdown()` to stop the observer thread.
+    // This variable should only be set after the `_workerThreadBody()` checks _shouldShutdown.
+    // This means that we only ever have to interrupt the _workerOpCtx at most once because both its
+    // construction and its destruction synchronize with the cv in shutdown().
+    OperationContext* _workerOpCtx = nullptr;
 
     boost::optional<stdx::thread> _thread;
 

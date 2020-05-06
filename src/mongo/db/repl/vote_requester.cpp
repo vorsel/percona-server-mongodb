@@ -90,6 +90,9 @@ std::vector<RemoteCommandRequest> VoteRequester::Algorithm::getRequests() const 
     requestVotesCmdBuilder.append("candidateIndex", _candidateIndex);
     requestVotesCmdBuilder.append("configVersion", _rsConfig.getConfigVersion());
 
+    if (_rsConfig.getConfigTerm() != -1) {
+        requestVotesCmdBuilder.append("configTerm", _rsConfig.getConfigTerm());
+    }
     // TODO: Remove this check when we upgrade to 4.6 and can remove references to "lastCommittedOp"
     // (SERVER-46090).
     // Only append the config term field to the VoteRequester and use "lastAppliedOpTime" as the
@@ -97,7 +100,6 @@ std::vector<RemoteCommandRequest> VoteRequester::Algorithm::getRequests() const 
     if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
         serverGlobalParams.featureCompatibility.getVersion() ==
             ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
-        requestVotesCmdBuilder.append("configTerm", _rsConfig.getConfigTerm());
         _lastAppliedOpTime.append(&requestVotesCmdBuilder, "lastAppliedOpTime");
     } else {
         // If we are not in FCV 4.4, use "lastCommittedOp" as the field name instead.
@@ -133,11 +135,8 @@ void VoteRequester::Algorithm::processResponse(const RemoteCommandRequest& reque
     logAttrs.add("term", _term);
     logAttrs.add("dryRun", _dryRun);
 
-    auto logLine = log();
-    logLine << "VoteRequester(term " << _term << (_dryRun ? " dry run" : "") << ") ";
     _responsesProcessed++;
     if (!response.isOK()) {  // failed response
-        logLine << "failed to receive response from " << request.target << ": " << response.status;
         logAttrs.add("failReason", "failed to receive response"_sd);
         logAttrs.add("error", response.status);
         logAttrs.add("from", request.target);
@@ -155,8 +154,6 @@ void VoteRequester::Algorithm::processResponse(const RemoteCommandRequest& reque
         status = voteResponse.initialize(response.data);
     }
     if (!status.isOK()) {
-        logLine << "received an invalid response from " << request.target << ": " << status;
-        logLine << "; response message: " << response.data;
         logAttrs.add("failReason", "received an invalid response"_sd);
         logAttrs.add("error", status);
         logAttrs.add("from", request.target);
@@ -165,7 +162,6 @@ void VoteRequester::Algorithm::processResponse(const RemoteCommandRequest& reque
     }
 
     if (voteResponse.getVoteGranted()) {
-        logLine << "received a yes vote from " << request.target;
         logAttrs.add("vote", "yes"_sd);
         logAttrs.add("from", request.target);
         if (_primaryHost == request.target) {
@@ -173,8 +169,6 @@ void VoteRequester::Algorithm::processResponse(const RemoteCommandRequest& reque
         }
         _votes++;
     } else {
-        logLine << "received a no vote from " << request.target << " with reason \""
-                << voteResponse.getReason() << '"';
         logAttrs.add("vote", "no"_sd);
         logAttrs.add("from", request.target);
         logAttrs.add("reason", voteResponse.getReason());
@@ -183,7 +177,7 @@ void VoteRequester::Algorithm::processResponse(const RemoteCommandRequest& reque
     if (voteResponse.getTerm() > _term) {
         _staleTerm = true;
     }
-    logLine << "; response message: " << response.data;
+
     logAttrs.add("message", response.data);
 }
 
