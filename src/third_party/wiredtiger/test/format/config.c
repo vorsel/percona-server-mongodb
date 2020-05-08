@@ -29,6 +29,7 @@
 #include "format.h"
 #include "config.h"
 
+static void config_backup(void);
 static void config_cache(void);
 static void config_checkpoint(void);
 static void config_checksum(void);
@@ -41,6 +42,7 @@ static void config_in_memory(void);
 static void config_in_memory_reset(void);
 static int config_is_perm(const char *);
 static void config_lsm_reset(void);
+static void config_map_backup_incr(const char *, u_int *);
 static void config_map_checkpoint(const char *, u_int *);
 static void config_map_checksum(const char *, u_int *);
 static void config_map_compression(const char *, u_int *);
@@ -137,13 +139,10 @@ config_setup(void)
         }
     }
 
-    /*
-     * If data_source and file_type were both "permanent", we may still have a mismatch.
-     */
-    if (DATASOURCE("lsm") && g.type != ROW) {
-        fprintf(stderr, "%s: lsm data_source is only compatible with row file_type\n", progname);
-        exit(EXIT_FAILURE);
-    }
+    /* If data_source and file_type were both "permanent", we may still have a mismatch. */
+    if (DATASOURCE("lsm") && g.type != ROW)
+        testutil_die(
+          EINVAL, "%s: lsm data_source is only compatible with row file_type\n", progname);
 
     /*
      * Build the top-level object name: we're overloading data_source in our configuration, LSM
@@ -179,6 +178,7 @@ config_setup(void)
     config_transaction();
 
     /* Simple selection. */
+    config_backup();
     config_checkpoint();
     config_checksum();
     config_compression("compression");
@@ -239,6 +239,41 @@ config_setup(void)
     g.key_cnt = 0;
 }
 
+/*
+ * config_backup --
+ *     Backup configuration.
+ */
+static void
+config_backup(void)
+{
+    const char *cstr;
+
+    /*
+     * Choose a type of incremental backup.
+     */
+    if (!config_is_perm("backup_incremental")) {
+        cstr = "backup_incremental=off";
+        switch (mmrand(NULL, 1, 10)) {
+        case 1: /* 30% full backup only */
+        case 2:
+        case 3:
+            break;
+        case 4: /* 40% block based incremental */
+        case 5:
+        case 6:
+        case 7:
+            cstr = "backup_incremental=block";
+            break;
+        case 8:
+        case 9:
+        case 10: /* 30% log based incremental */
+            cstr = "backup_incremental=log";
+            break;
+        }
+
+        config_single(cstr, false);
+    }
+}
 /*
  * config_cache --
  *     Cache configuration.
@@ -500,7 +535,7 @@ config_encryption(void)
 static bool
 config_fix(void)
 {
-    /* Fixed-length column stores don't support the lookaside table, so no modify operations. */
+    /* Fixed-length column stores don't support the history store table, so no modify operations. */
     if (config_is_perm("modify_pct"))
         return (false);
     return (true);
@@ -783,12 +818,24 @@ config_error(void)
 
     /* Display configuration names. */
     fprintf(stderr, "\n");
+    fprintf(stderr, "=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=\n");
+    fprintf(stderr, "Configuration values:\n");
+    fprintf(stderr, "%10s: %s\n", "off", "boolean off");
+    fprintf(stderr, "%10s: %s\n", "on", "boolean on");
+    fprintf(stderr, "%10s: %s\n", "0", "boolean off");
+    fprintf(stderr, "%10s: %s\n", "1", "boolean on");
+    fprintf(stderr, "%10s: %s\n", "NNN", "unsigned number");
+    fprintf(stderr, "%10s: %s\n", "NNN-NNN", "number range, each number equally likely");
+    fprintf(stderr, "%10s: %s\n", "NNN:NNN", "number range, lower numbers more likely");
+    fprintf(stderr, "%10s: %s\n", "string", "configuration value");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=\n");
     fprintf(stderr, "Configuration names:\n");
     for (cp = c; cp->name != NULL; ++cp)
-        if (strlen(cp->name) > 17)
-            fprintf(stderr, "%s\n%17s: %s\n", cp->name, " ", cp->desc);
+        if (strlen(cp->name) > 25)
+            fprintf(stderr, "%s: %s\n", cp->name, cp->desc);
         else
-            fprintf(stderr, "%17s: %s\n", cp->name, cp->desc);
+            fprintf(stderr, "%25s: %s\n", cp->name, cp->desc);
 }
 
 /*
@@ -895,6 +942,9 @@ config_reset(void)
 {
     CONFIG *cp;
 
+    if (!config_is_perm("isolation"))
+        g.c_isolation_flag = 0;
+
     /* Clear temporary allocated configuration data. */
     for (cp = c; cp->name != NULL; ++cp) {
         F_CLR(cp, C_TEMP);
@@ -920,15 +970,31 @@ config_find(const char *s, size_t len, bool fatal)
         if (strncmp(s, cp->name, len) == 0 && cp->name[len] == '\0')
             return (cp);
 
-    /*
-     * Optionally ignore unknown keywords, it makes it easier to run old CONFIG files.
-     */
-    if (fatal) {
-        fprintf(stderr, "%s: %s: unknown required configuration keyword\n", progname, s);
-        exit(EXIT_FAILURE);
-    }
+    /* Optionally ignore unknown keywords, it makes it easier to run old CONFIG files. */
+    if (fatal)
+        testutil_die(EINVAL, "%s: %s: unknown required configuration keyword\n", progname, s);
+
     fprintf(stderr, "%s: %s: WARNING, ignoring unknown configuration keyword\n", progname, s);
     return (NULL);
+}
+
+/*
+ * config_value --
+ *     String to long helper function.
+ */
+static uint32_t
+config_value(const char *config, const char *p, int match)
+{
+    long v;
+    char *endptr;
+
+    errno = 0;
+    v = strtol(p, &endptr, 10);
+    if ((errno == ERANGE && (v == LONG_MAX || v == LONG_MIN)) || (errno != 0 && v == 0) ||
+      *endptr != match || v < 0 || v > UINT32_MAX)
+        testutil_die(
+          EINVAL, "%s: %s: illegal numeric value or value out of range", progname, config);
+    return ((uint32_t)v);
 }
 
 /*
@@ -938,22 +1004,20 @@ config_find(const char *s, size_t len, bool fatal)
 void
 config_single(const char *s, bool perm)
 {
+    enum { RANGE_FIXED, RANGE_NONE, RANGE_WEIGHTED } range;
     CONFIG *cp;
-    long vlong;
-    uint32_t v;
-    char *p;
-    const char *ep;
+    uint32_t steps, v1, v2;
+    u_int i;
+    const char *equalp, *vp1, *vp2;
 
-    if ((ep = strchr(s, '=')) == NULL) {
-        fprintf(stderr, "%s: %s: illegal configuration value\n", progname, s);
-        exit(EXIT_FAILURE);
-    }
+    if ((equalp = strchr(s, '=')) == NULL)
+        testutil_die(EINVAL, "%s: %s: illegal configuration value\n", progname, s);
 
-    if ((cp = config_find(s, (size_t)(ep - s), false)) == NULL)
+    if ((cp = config_find(s, (size_t)(equalp - s), false)) == NULL)
         return;
 
     F_SET(cp, perm ? C_PERM : C_TEMP);
-    ++ep;
+    ++equalp;
 
     if (F_ISSET(cp, C_STRING)) {
         /*
@@ -964,65 +1028,103 @@ config_single(const char *s, bool perm)
             *cp->vstr = NULL;
         }
 
-        if (strncmp(s, "checkpoints", strlen("checkpoints")) == 0) {
-            config_map_checkpoint(ep, &g.c_checkpoint_flag);
-            *cp->vstr = dstrdup(ep);
+        if (strncmp(s, "backup_incremental", strlen("backup_incremental")) == 0) {
+            config_map_backup_incr(equalp, &g.c_backup_incr_flag);
+            *cp->vstr = dstrdup(equalp);
+        } else if (strncmp(s, "checkpoints", strlen("checkpoints")) == 0) {
+            config_map_checkpoint(equalp, &g.c_checkpoint_flag);
+            *cp->vstr = dstrdup(equalp);
         } else if (strncmp(s, "checksum", strlen("checksum")) == 0) {
-            config_map_checksum(ep, &g.c_checksum_flag);
-            *cp->vstr = dstrdup(ep);
+            config_map_checksum(equalp, &g.c_checksum_flag);
+            *cp->vstr = dstrdup(equalp);
         } else if (strncmp(s, "compression", strlen("compression")) == 0) {
-            config_map_compression(ep, &g.c_compression_flag);
-            *cp->vstr = dstrdup(ep);
+            config_map_compression(equalp, &g.c_compression_flag);
+            *cp->vstr = dstrdup(equalp);
         } else if (strncmp(s, "data_source", strlen("data_source")) == 0 &&
-          strncmp("file", ep, strlen("file")) != 0 && strncmp("lsm", ep, strlen("lsm")) != 0 &&
-          strncmp("table", ep, strlen("table")) != 0) {
-            fprintf(stderr, "Invalid data source option: %s\n", ep);
-            exit(EXIT_FAILURE);
+          strncmp("file", equalp, strlen("file")) != 0 &&
+          strncmp("lsm", equalp, strlen("lsm")) != 0 &&
+          strncmp("table", equalp, strlen("table")) != 0) {
+            testutil_die(EINVAL, "Invalid data source option: %s\n", equalp);
         } else if (strncmp(s, "encryption", strlen("encryption")) == 0) {
-            config_map_encryption(ep, &g.c_encryption_flag);
-            *cp->vstr = dstrdup(ep);
+            config_map_encryption(equalp, &g.c_encryption_flag);
+            *cp->vstr = dstrdup(equalp);
         } else if (strncmp(s, "file_type", strlen("file_type")) == 0) {
-            config_map_file_type(ep, &g.type);
+            config_map_file_type(equalp, &g.type);
             *cp->vstr = dstrdup(config_file_type(g.type));
         } else if (strncmp(s, "isolation", strlen("isolation")) == 0) {
-            config_map_isolation(ep, &g.c_isolation_flag);
-            *cp->vstr = dstrdup(ep);
+            config_map_isolation(equalp, &g.c_isolation_flag);
+            *cp->vstr = dstrdup(equalp);
         } else if (strncmp(s, "logging_compression", strlen("logging_compression")) == 0) {
-            config_map_compression(ep, &g.c_logging_compression_flag);
-            *cp->vstr = dstrdup(ep);
+            config_map_compression(equalp, &g.c_logging_compression_flag);
+            *cp->vstr = dstrdup(equalp);
         } else
-            *cp->vstr = dstrdup(ep);
+            *cp->vstr = dstrdup(equalp);
 
         return;
     }
 
-    vlong = -1;
     if (F_ISSET(cp, C_BOOL)) {
-        if (strncmp(ep, "off", strlen("off")) == 0)
-            vlong = 0;
-        else if (strncmp(ep, "on", strlen("on")) == 0)
-            vlong = 1;
-    }
-    if (vlong == -1) {
-        vlong = strtol(ep, &p, 10);
-        if (*p != '\0') {
-            fprintf(stderr, "%s: %s: illegal numeric value\n", progname, s);
-            exit(EXIT_FAILURE);
+        if (strncmp(equalp, "off", strlen("off")) == 0)
+            v1 = 0;
+        else if (strncmp(equalp, "on", strlen("on")) == 0)
+            v1 = 1;
+        else {
+            v1 = config_value(s, equalp, '\0');
+            if (v1 != 0 && v1 != 1)
+                testutil_die(EINVAL, "%s: %s: value of boolean not 0 or 1", progname, s);
         }
-    }
-    v = (uint32_t)vlong;
-    if (F_ISSET(cp, C_BOOL)) {
-        if (v != 0 && v != 1) {
-            fprintf(stderr, "%s: %s: value of boolean not 0 or 1\n", progname, s);
-            exit(EXIT_FAILURE);
-        }
-    } else if (v < cp->min || v > cp->maxset) {
-        fprintf(stderr, "%s: %s: value outside min/max values of %" PRIu32 "-%" PRIu32 "\n",
-          progname, s, cp->min, cp->maxset);
-        exit(EXIT_FAILURE);
+
+        *cp->v = v1;
+        return;
     }
 
-    *cp->v = v;
+    /*
+     * Three possible syntax elements: a number, two numbers separated by a dash, two numbers
+     * separated by an colon. The first is a fixed value, the second is a range where all values are
+     * equally possible, the third is a weighted range where lower values are more likely.
+     */
+    vp1 = equalp;
+    range = RANGE_NONE;
+    if ((vp2 = strchr(vp1, '-')) != NULL) {
+        ++vp2;
+        range = RANGE_FIXED;
+    } else if ((vp2 = strchr(vp1, ':')) != NULL) {
+        ++vp2;
+        range = RANGE_WEIGHTED;
+    }
+
+    v1 = config_value(s, vp1, range == RANGE_NONE ? '\0' : (range == RANGE_FIXED ? '-' : ':'));
+    if (v1 < cp->min || v1 > cp->maxset)
+        testutil_die(EINVAL, "%s: %s: value outside min/max values of %" PRIu32 "-%" PRIu32 "\n",
+          progname, s, cp->min, cp->maxset);
+
+    if (range != RANGE_NONE) {
+        v2 = config_value(s, vp2, '\0');
+        if (v2 < cp->min || v2 > cp->maxset)
+            testutil_die(EINVAL,
+              "%s: %s: value outside min/max values of %" PRIu32 "-%" PRIu32 "\n", progname, s,
+              cp->min, cp->maxset);
+        if (v1 > v2)
+            testutil_die(EINVAL, "%s: %s: illegal numeric range\n", progname, s);
+
+        if (range == RANGE_FIXED)
+            v1 = mmrand(NULL, (u_int)v1, (u_int)v2);
+        else {
+            /*
+             * Roll dice, 50% chance of proceeding to the next larger value, and 5 steps to the
+             * maximum value.
+             */
+            steps = ((v2 - v1) + 4) / 5;
+            if (steps == 0)
+                steps = 1;
+            for (i = 0; i < 5; ++i, v1 += steps)
+                if (mmrand(NULL, 0, 1) == 0)
+                    break;
+            v1 = WT_MIN(v1, v2);
+        }
+    }
+
+    *cp->v = v1;
 }
 
 /*
@@ -1040,6 +1142,23 @@ config_map_file_type(const char *s, u_int *vp)
         *vp = ROW;
     else
         testutil_die(EINVAL, "illegal file type configuration: %s", s);
+}
+
+/*
+ * config_map_backup_incr --
+ *     Map a incremental backup configuration to a flag.
+ */
+static void
+config_map_backup_incr(const char *s, u_int *vp)
+{
+    if (strcmp(s, "block") == 0)
+        *vp = INCREMENTAL_BLOCK;
+    else if (strcmp(s, "log") == 0)
+        *vp = INCREMENTAL_LOG;
+    else if (strcmp(s, "off") == 0)
+        *vp = INCREMENTAL_OFF;
+    else
+        testutil_die(EINVAL, "illegal incremental backup configuration: %s", s);
 }
 
 /*

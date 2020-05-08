@@ -153,6 +153,10 @@ public:
     virtual Status checkIfCommitQuorumCanBeSatisfied(
         const CommitQuorumOptions& commitQuorum) const override;
 
+    virtual bool isCommitQuorumSatisfied(
+        const CommitQuorumOptions& commitQuorum,
+        const std::vector<mongo::HostAndPort>& members) const override;
+
     virtual Status checkCanServeReadsFor(OperationContext* opCtx,
                                          const NamespaceString& ns,
                                          bool slaveOk);
@@ -195,8 +199,7 @@ public:
 
     virtual Status setFollowerMode(const MemberState& newState) override;
 
-    virtual Status setFollowerModeStrict(OperationContext* opCtx,
-                                         const MemberState& newState) override;
+    virtual Status setFollowerModeRollback(OperationContext* opCtx) override;
 
     virtual ApplierState getApplierState() override;
 
@@ -245,6 +248,8 @@ public:
     virtual Status doReplSetReconfig(OperationContext* opCtx,
                                      GetNewConfigFn getNewConfig,
                                      bool force) override;
+
+    virtual Status awaitConfigCommitment(OperationContext* opCtx) override;
 
     virtual Status processReplSetInitiate(OperationContext* opCtx,
                                           const BSONObj& configObj,
@@ -346,7 +351,7 @@ public:
 
     virtual TopologyVersion getTopologyVersion() const override;
 
-    virtual void incrementTopologyVersion(OperationContext* opCtx) override;
+    virtual void incrementTopologyVersion() override;
 
     using SharedIsMasterResponse = std::shared_ptr<const IsMasterResponse>;
 
@@ -839,6 +844,21 @@ private:
     bool _doneWaitingForReplication_inlock(const OpTime& opTime,
                                            const WriteConcernOptions& writeConcern);
 
+    /**
+     *  Returns whether or not "members" list contains at least 'numNodes'.
+     */
+    bool _haveNumNodesSatisfiedCommitQuorum(WithLock lk,
+                                            int numNodes,
+                                            const std::vector<mongo::HostAndPort>& members) const;
+
+    /**
+     * Returns whether or not "members" list matches the tagPattern.
+     */
+    bool _haveTaggedNodesSatisfiedCommitQuorum(
+        WithLock lk,
+        const ReplSetTagPattern& tagPattern,
+        const std::vector<mongo::HostAndPort>& members) const;
+
     Status _checkIfWriteConcernCanBeSatisfied_inlock(const WriteConcernOptions& writeConcern) const;
 
     Status _checkIfCommitQuorumCanBeSatisfied(WithLock,
@@ -1009,7 +1029,12 @@ private:
      * Fulfills the promises that are waited on by awaitable isMaster requests. This increments the
      * server TopologyVersion.
      */
-    void _fulfillTopologyChangePromise(OperationContext* opCtx, WithLock);
+    void _fulfillTopologyChangePromise(WithLock);
+
+    /**
+     * Update _canAcceptNonLocalWrites based on _topCoord->canAcceptWrites().
+     */
+    void _updateWriteAbilityFromTopologyCoordinator(WithLock lk, OperationContext* opCtx);
 
     /**
      * Updates the cached value, _memberState, to match _topCoord's reported
@@ -1018,12 +1043,8 @@ private:
      * Returns an enum indicating what action to take after releasing _mutex, if any.
      * Call performPostMemberStateUpdateAction on the return value after releasing
      * _mutex.
-     *
-     * Note: opCtx may be null as currently not all paths thread an OperationContext all the way
-     * down, but it must be non-null for any calls that change _canAcceptNonLocalWrites.
      */
-    PostMemberStateUpdateAction _updateMemberStateFromTopologyCoordinator(WithLock lk,
-                                                                          OperationContext* opCtx);
+    PostMemberStateUpdateAction _updateMemberStateFromTopologyCoordinator(WithLock lk);
 
     /**
      * Performs a post member-state update action.  Do not call while holding _mutex.
@@ -1396,6 +1417,7 @@ private:
 
     /**
      * Runs the command using DBDirectClient and returns the response received for that command.
+     * Callers of this function should not hold any locks.
      */
     BSONObj _runCmdOnSelfOnAlternativeClient(OperationContext* opCtx,
                                              const std::string& dbName,

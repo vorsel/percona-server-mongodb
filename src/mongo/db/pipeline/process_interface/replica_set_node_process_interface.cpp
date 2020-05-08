@@ -163,11 +163,16 @@ StatusWith<BSONObj> ReplicaSetNodeProcessInterface::_executeCommandOnPrimary(
     OperationContext* opCtx, const NamespaceString& ns, const BSONObj& cmdObj) const {
     BSONObjBuilder cmd(cmdObj);
     _attachGenericCommandArgs(opCtx, &cmd);
+
+    // Verify that the ReplicationCoordinator believes that a primary exists before issuing a
+    // command to it.
+    auto hostAndPort = repl::ReplicationCoordinator::get(opCtx)->getCurrentPrimaryHostAndPort();
+    if (hostAndPort.empty()) {
+        return StatusWith<BSONObj>{ErrorCodes::PrimarySteppedDown, "No primary exists currently"};
+    }
+
     executor::RemoteCommandRequest request(
-        repl::ReplicationCoordinator::get(opCtx)->getCurrentPrimaryHostAndPort(),
-        ns.db().toString(),
-        cmd.obj(),
-        opCtx);
+        std::move(hostAndPort), ns.db().toString(), cmd.obj(), opCtx);
     auto [promise, future] = makePromiseFuture<executor::TaskExecutor::RemoteCommandCallbackArgs>();
     auto promisePtr = std::make_shared<Promise<executor::TaskExecutor::RemoteCommandCallbackArgs>>(
         std::move(promise));
@@ -210,10 +215,13 @@ StatusWith<BSONObj> ReplicaSetNodeProcessInterface::_executeCommandOnPrimary(
 
 void ReplicaSetNodeProcessInterface::_attachGenericCommandArgs(OperationContext* opCtx,
                                                                BSONObjBuilder* cmd) const {
-    auto writeConcern = opCtx->getWriteConcern();
-    if (!writeConcern.usedDefault) {
-        cmd->append(WriteConcernOptions::kWriteConcernField, writeConcern.toBSON());
+    cmd->append(WriteConcernOptions::kWriteConcernField, opCtx->getWriteConcern().toBSON());
+
+    auto maxTimeMS = opCtx->getRemainingMaxTimeMillis();
+    if (maxTimeMS != Milliseconds::max()) {
+        cmd->append(QueryRequest::cmdOptionMaxTimeMS, durationCount<Milliseconds>(maxTimeMS));
     }
+
     logical_session_id_helpers::serializeLsidAndTxnNumber(opCtx, cmd);
 }
 

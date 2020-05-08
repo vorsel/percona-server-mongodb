@@ -68,6 +68,7 @@ REQUIRED_CONFIG_KEYS = {
 DEFAULT_CONFIG_VALUES = {
     "generated_config_dir": "generated_resmoke_config",
     "max_tests_per_suite": 100,
+    "max_sub_suites": 10,
     "resmoke_args": "",
     "resmoke_repeat_suites": 1,
     "run_multiple_jobs": "true",
@@ -621,7 +622,8 @@ class EvergreenConfigGenerator(object):
                 LOGGER.debug("Setting exec_timeout", exec_timeout=exec_timeout,
                              suite_runtime=expected_suite_runtime, factor=repeat_factor)
 
-            if timeout > MAX_EXPECTED_TIMEOUT or exec_timeout > MAX_EXPECTED_TIMEOUT:
+            if self.options.is_patch and \
+                    (timeout > MAX_EXPECTED_TIMEOUT or exec_timeout > MAX_EXPECTED_TIMEOUT):
                 frameinfo = getframeinfo(currentframe())
                 LOGGER.error(
                     "This task looks like it is expected to run far longer than normal. This is "

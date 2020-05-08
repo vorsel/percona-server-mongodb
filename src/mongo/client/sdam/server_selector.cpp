@@ -30,12 +30,15 @@
 
 #include <algorithm>
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 #include "mongo/client/sdam/topology_description.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/random.h"
-#include "mongo/util/log.h"
+#include "mongo/util/fail_point.h"
 
 namespace mongo::sdam {
+MONGO_FAIL_POINT_DEFINE(sdamServerSelectorIgnoreLatencyWindow);
+
 ServerSelector::~ServerSelector() {}
 
 SdamServerSelector::SdamServerSelector(const ServerSelectionConfiguration& config)
@@ -68,7 +71,7 @@ void SdamServerSelector::_getCandidateServers(std::vector<ServerDescriptionPtr>*
             if (maxOpTime && maxOpTime < criteria.minOpTime) {
                 // ignore minOpTime
                 const_cast<ReadPreferenceSetting&>(criteria) = ReadPreferenceSetting(criteria.pref);
-                log() << "ignoring minOpTime for " << criteria.toString();
+                LOGV2(46712001, "Ignoring minOpTime", "readPreference"_attr = criteria);
             }
         }
     }
@@ -154,6 +157,10 @@ boost::optional<std::vector<ServerDescriptionPtr>> SdamServerSelector::selectSer
     _getCandidateServers(&results, topologyDescription, criteria);
 
     if (results.size()) {
+        if (MONGO_unlikely(sdamServerSelectorIgnoreLatencyWindow.shouldFail())) {
+            return results;
+        }
+
         ServerDescriptionPtr minServer =
             *std::min_element(results.begin(), results.end(), LatencyWindow::rttCompareFn);
 
@@ -211,9 +218,11 @@ void SdamServerSelector::filterTags(std::vector<ServerDescriptionPtr>* servers,
                     return false;
                 }
             } else {
-                log() << "invalid tags specified for server selection; tags should be specified as "
-                         "a bson Obj: "
-                      << it->toString();
+                LOGV2_WARNING(
+                    46712002,
+                    "Invalid tags specified for server selection; tags should be specified as "
+                    "bson Objects",
+                    "tag"_attr = *it);
             }
             ++it;
         }

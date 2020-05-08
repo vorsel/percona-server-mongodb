@@ -2985,8 +2985,8 @@ void TopologyCoordinator::processReplSetRequestVotes(const ReplSetRequestVotesAr
     if (MONGO_unlikely(voteNoInElection.shouldFail())) {
         LOGV2(21835, "failpoint voteNoInElection enabled");
         response->setVoteGranted(false);
-        response->setReason(str::stream() << "forced to vote no during dry run election due to "
-                                             "failpoint voteNoInElection set");
+        response->setReason(
+            "forced to vote no during dry run election due to failpoint voteNoInElection set");
         return;
     }
 
@@ -2994,54 +2994,48 @@ void TopologyCoordinator::processReplSetRequestVotes(const ReplSetRequestVotesAr
         LOGV2(21836, "failpoint voteYesInDryRunButNoInRealElection enabled");
         if (args.isADryRun()) {
             response->setVoteGranted(true);
-            response->setReason(str::stream() << "forced to vote yes in dry run due to failpoint "
-                                                 "voteYesInDryRunButNoInRealElection set");
+            response->setReason(
+                "forced to vote yes in dry run due to failpoint "
+                "voteYesInDryRunButNoInRealElection set");
         } else {
             response->setVoteGranted(false);
-            response->setReason(str::stream()
-                                << "forced to vote no in real election due to failpoint "
-                                   "voteYesInDryRunButNoInRealElection set");
+            response->setReason(
+                "forced to vote no in real election due to failpoint "
+                "voteYesInDryRunButNoInRealElection set");
         }
         return;
     }
 
-    if (args.getTerm() < _term) {
+    if (args.getConfigVersionAndTerm() != _rsConfig.getConfigVersionAndTerm()) {
         response->setVoteGranted(false);
-        response->setReason(str::stream() << "candidate's term ({}) is lower than mine ({})"_format(
-                                args.getTerm(), _term));
-    } else if (args.getConfigVersionAndTerm() < _rsConfig.getConfigVersionAndTerm()) {
-        response->setVoteGranted(false);
-        response->setReason(str::stream()
-                            << "candidate's config with {} is older "
-                               "than mine with {}"_format(args.getConfigVersionAndTerm(),
-                                                          _rsConfig.getConfigVersionAndTerm()));
-    } else if (args.getSetName() != _rsConfig.getReplSetName()) {
-        response->setVoteGranted(false);
-        response->setReason(str::stream()
-                            << "candidate's set name ({}) differs from mine ({})"_format(
-                                   args.getSetName(), _rsConfig.getReplSetName()));
-    } else if (args.getLastAppliedOpTime() < getMyLastAppliedOpTime()) {
-        response->setVoteGranted(false);
-        response->setReason(str::stream()
-                            << "candidate's data is staler than mine. candidate's last applied "
-                               "OpTime: {}, my last applied OpTime: {}"_format(
-                                   args.getLastAppliedOpTime().toString(),
-                                   getMyLastAppliedOpTime().toString()));
-    } else if (!args.isADryRun() && _lastVote.getTerm() == args.getTerm()) {
+        response->setReason("candidate's config with {} differs from mine with {}"_format(
+            args.getConfigVersionAndTerm(), _rsConfig.getConfigVersionAndTerm()));
+    } else if (args.getTerm() < _term) {
         response->setVoteGranted(false);
         response->setReason(
-            str::stream() << "already voted for another candidate ({}) this "
-                             "term ({})"_format(_rsConfig.getMemberAt(_lastVote.getCandidateIndex())
-                                                    .getHostAndPort(),
-                                                _lastVote.getTerm()));
+            "candidate's term ({}) is lower than mine ({})"_format(args.getTerm(), _term));
+    } else if (args.getSetName() != _rsConfig.getReplSetName()) {
+        response->setVoteGranted(false);
+        response->setReason("candidate's set name ({}) differs from mine ({})"_format(
+            args.getSetName(), _rsConfig.getReplSetName()));
+    } else if (args.getLastAppliedOpTime() < getMyLastAppliedOpTime()) {
+        response->setVoteGranted(false);
+        response->setReason(
+            "candidate's data is staler than mine. candidate's last applied OpTime: {}, "
+            "my last applied OpTime: {}"_format(args.getLastAppliedOpTime().toString(),
+                                                getMyLastAppliedOpTime().toString()));
+    } else if (!args.isADryRun() && _lastVote.getTerm() == args.getTerm()) {
+        response->setVoteGranted(false);
+        response->setReason("already voted for another candidate ({}) this term ({})"_format(
+            _rsConfig.getMemberAt(_lastVote.getCandidateIndex()).getHostAndPort(),
+            _lastVote.getTerm()));
     } else {
         int betterPrimary = _findHealthyPrimaryOfEqualOrGreaterPriority(args.getCandidateIndex());
         if (_selfConfig().isArbiter() && betterPrimary >= 0) {
             response->setVoteGranted(false);
-            response
-                ->setReason(str::stream()
-                            << "can see a healthy primary ({}) of equal or greater priority"_format(
-                                   _rsConfig.getMemberAt(betterPrimary).getHostAndPort()));
+            response->setReason(
+                "can see a healthy primary ({}) of equal or greater priority"_format(
+                    _rsConfig.getMemberAt(betterPrimary).getHostAndPort()));
         } else {
             if (!args.isADryRun()) {
                 _lastVote.setTerm(args.getTerm());
@@ -3186,8 +3180,9 @@ TopologyCoordinator::latestKnownOpTimeSinceHeartbeatRestartPerMember() const {
 }
 
 bool TopologyCoordinator::checkIfCommitQuorumCanBeSatisfied(
-    const CommitQuorumOptions& commitQuorum, const std::vector<MemberConfig>& members) const {
-    if (!commitQuorum.mode.empty() && commitQuorum.mode != CommitQuorumOptions::kMajority) {
+    const CommitQuorumOptions& commitQuorum) const {
+    if (!commitQuorum.mode.empty() && commitQuorum.mode != CommitQuorumOptions::kMajority &&
+        commitQuorum.mode != CommitQuorumOptions::kAll) {
         StatusWith<ReplSetTagPattern> tagPatternStatus =
             _rsConfig.findCustomWriteMode(commitQuorum.mode);
         if (!tagPatternStatus.isOK()) {
@@ -3195,7 +3190,7 @@ bool TopologyCoordinator::checkIfCommitQuorumCanBeSatisfied(
         }
 
         ReplSetTagMatch matcher(tagPatternStatus.getValue());
-        for (auto&& member : members) {
+        for (auto&& member : _rsConfig.members()) {
             for (MemberConfig::TagIterator it = member.tagsBegin(); it != member.tagsEnd(); ++it) {
                 if (matcher.update(*it)) {
                     return true;
@@ -3206,25 +3201,26 @@ bool TopologyCoordinator::checkIfCommitQuorumCanBeSatisfied(
         // Even if all the nodes in the set had a given write it still would not satisfy this
         // commit quorum.
         return false;
-    } else {
-        int nodesRemaining = 0;
-        if (!commitQuorum.mode.empty()) {
-            invariant(commitQuorum.mode == CommitQuorumOptions::kMajority);
-            nodesRemaining = _rsConfig.getWriteMajority();
-        } else {
-            nodesRemaining = commitQuorum.numNodes;
-        }
+    }
 
-        for (auto&& member : members) {
-            if (!member.isArbiter()) {  // Only count data-bearing nodes
-                --nodesRemaining;
-                if (nodesRemaining <= 0) {
-                    return true;
-                }
+    int nodesRemaining = commitQuorum.numNodes;
+    if (!commitQuorum.mode.empty()) {
+        if (commitQuorum.mode == CommitQuorumOptions::kMajority) {
+            nodesRemaining = _rsConfig.getWriteMajority();
+        } else if (commitQuorum.mode == CommitQuorumOptions::kAll) {
+            nodesRemaining = _rsConfig.getWritableVotingMembersCount();
+        }
+    }
+
+    for (auto&& member : _rsConfig.members()) {
+        if (!member.isArbiter()) {  // Only count data-bearing nodes
+            --nodesRemaining;
+            if (nodesRemaining <= 0) {
+                return true;
             }
         }
-        return false;
     }
+    return false;
 }
 
 }  // namespace repl

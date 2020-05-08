@@ -995,14 +995,15 @@ void ReplicationCoordinatorImpl::clearSyncSourceBlacklist() {
     _topCoord->clearSyncSourceBlacklist();
 }
 
-Status ReplicationCoordinatorImpl::setFollowerModeStrict(OperationContext* opCtx,
-                                                         const MemberState& newState) {
+Status ReplicationCoordinatorImpl::setFollowerModeRollback(OperationContext* opCtx) {
     invariant(opCtx);
     invariant(opCtx->lockState()->isRSTLExclusive());
-    return _setFollowerMode(opCtx, newState);
+    return _setFollowerMode(opCtx, MemberState::RS_ROLLBACK);
 }
 
 Status ReplicationCoordinatorImpl::setFollowerMode(const MemberState& newState) {
+    // Switching to rollback should call setFollowerModeRollback instead.
+    invariant(newState != MemberState::RS_ROLLBACK);
     return _setFollowerMode(nullptr, newState);
 }
 
@@ -1031,7 +1032,13 @@ Status ReplicationCoordinatorImpl::_setFollowerMode(OperationContext* opCtx,
 
     _topCoord->setFollowerMode(newState.s);
 
-    const PostMemberStateUpdateAction action = _updateMemberStateFromTopologyCoordinator(lk, opCtx);
+    if (_memberState.secondary() && newState == MemberState::RS_ROLLBACK) {
+        // If we are switching out of SECONDARY and to ROLLBACK, we must make sure that we hold the
+        // RSTL in mode X to prevent readers that have the RSTL in intent mode from reading.
+        _readWriteAbility->setCanServeNonLocalReads(opCtx, 0U);
+    }
+
+    const PostMemberStateUpdateAction action = _updateMemberStateFromTopologyCoordinator(lk);
     lk.unlock();
     _performPostMemberStateUpdateAction(action);
 
@@ -1156,8 +1163,9 @@ void ReplicationCoordinatorImpl::signalDrainComplete(OperationContext* opCtx,
     _updateLastCommittedOpTimeAndWallTime(lk);
     _wakeReadyWaiters(lk);
 
-    // Update _canAcceptNonLocalWrites
-    _updateMemberStateFromTopologyCoordinator(lk, opCtx);
+    // Update _canAcceptNonLocalWrites.
+    _updateWriteAbilityFromTopologyCoordinator(lk, opCtx);
+    _updateMemberStateFromTopologyCoordinator(lk);
 
     LOGV2_OPTIONS(21331,
                   {logv2::LogTag::kRS},
@@ -1713,6 +1721,66 @@ Status ReplicationCoordinatorImpl::_setLastOptime(WithLock lk,
     return Status::OK();
 }
 
+bool ReplicationCoordinatorImpl::isCommitQuorumSatisfied(
+    const CommitQuorumOptions& commitQuorum, const std::vector<mongo::HostAndPort>& members) const {
+    stdx::lock_guard<Latch> lock(_mutex);
+
+    if (commitQuorum.mode.empty()) {
+        return _haveNumNodesSatisfiedCommitQuorum(lock, commitQuorum.numNodes, members);
+    }
+
+    StringData patternName;
+    if (commitQuorum.mode == CommitQuorumOptions::kMajority) {
+        patternName = ReplSetConfig::kMajorityWriteConcernModeName;
+    } else if (commitQuorum.mode == CommitQuorumOptions::kAll) {
+        patternName = ReplSetConfig::kAllWriteConcernModeName;
+    } else {
+        patternName = commitQuorum.mode;
+    }
+
+    auto tagPattern = uassertStatusOK(_rsConfig.findCustomWriteMode(patternName));
+    return _haveTaggedNodesSatisfiedCommitQuorum(lock, tagPattern, members);
+}
+
+bool ReplicationCoordinatorImpl::_haveNumNodesSatisfiedCommitQuorum(
+    WithLock lk, int numNodes, const std::vector<mongo::HostAndPort>& members) const {
+    for (auto&& member : members) {
+        auto memberConfig = _rsConfig.findMemberByHostAndPort(member);
+        // We do not count arbiters and members that aren't part of replica set config,
+        // towards the commit quorum.
+        if (!memberConfig || memberConfig->isArbiter())
+            continue;
+
+        --numNodes;
+
+        if (numNodes <= 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ReplicationCoordinatorImpl::_haveTaggedNodesSatisfiedCommitQuorum(
+    WithLock lk,
+    const ReplSetTagPattern& tagPattern,
+    const std::vector<mongo::HostAndPort>& members) const {
+    ReplSetTagMatch matcher(tagPattern);
+
+    for (auto&& member : members) {
+        auto memberConfig = _rsConfig.findMemberByHostAndPort(member);
+        // We do not count arbiters and members that aren't part of replica set config,
+        // towards the commit quorum.
+        if (!memberConfig || memberConfig->isArbiter())
+            continue;
+        for (auto&& it = memberConfig->tagsBegin(); it != memberConfig->tagsEnd(); ++it) {
+            if (matcher.update(*it)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 bool ReplicationCoordinatorImpl::_doneWaitingForReplication_inlock(
     const OpTime& opTime, const WriteConcernOptions& writeConcern) {
     // The syncMode cannot be unset.
@@ -1827,10 +1895,11 @@ ReplicationCoordinator::StatusAndDuration ReplicationCoordinatorImpl::awaitRepli
         stdx::lock_guard lock(_mutex);
         LOGV2(21339,
               "Replication failed for write concern: {writeConcern}, waiting for optime: {opTime}, "
-              "opID: {opID}, progress: {progress}",
+              "opID: {opID}, all_durable: {all_durable}, progress: {progress}",
               "writeConcern"_attr = writeConcern.toBSON(),
               "opTime"_attr = opTime,
               "opID"_attr = opCtx->getOpID(),
+              "all_durable"_attr = _storage->getAllDurableTimestamp(_service),
               "progress"_attr = _getReplicationProgress(lock));
     }
     return {std::move(status), duration_cast<Milliseconds>(timer.elapsed())};
@@ -2180,31 +2249,31 @@ BSONObj ReplicationCoordinatorImpl::runCmdOnPrimaryAndAwaitResponse(
     const BSONObj& cmdObj,
     OnRemoteCmdScheduledFn onRemoteCmdScheduled,
     OnRemoteCmdCompleteFn onRemoteCmdComplete) {
-    // Sanity check
-    invariant(!opCtx->lockState()->isRSTLLocked());
+    // About to make network and DBDirectClient (recursive) calls, so we should not hold any locks.
+    invariant(!opCtx->lockState()->isLocked());
 
-    repl::ReplicationStateTransitionLockGuard rstl(opCtx, MODE_IX);
+    const auto myHostAndPort = getMyHostAndPort();
+    const auto primaryHostAndPort = getCurrentPrimaryHostAndPort();
 
-    if (getMemberState().primary()) {
-        if (canAcceptWritesForDatabase(opCtx, dbName)) {
-            // Run command using DBDirectClient to avoid tcp connection.
-            return _runCmdOnSelfOnAlternativeClient(opCtx, dbName, cmdObj);
-        }
-        // Node is primary but it's not in a state to accept non-local writes because it might be in
-        // the catchup or draining phase. So, try releasing and reacquiring RSTL lock so that we
-        // give chance for the node to finish executing signalDrainComplete() and become master.
-        uassertStatusOK(
-            Status{ErrorCodes::NotMaster, "Node is in primary state but can't accept writes."});
+    if (myHostAndPort.empty()) {
+        // Possibly because either rsconfig is uninitialized or the node got removed from config.
+        uassertStatusOK(Status{ErrorCodes::NodeNotFound, "Address unknown."});
+    }
+
+    if (primaryHostAndPort.empty()) {
+        uassertStatusOK(Status{ErrorCodes::NoConfigMaster, "Primary is unknown/down."});
+    }
+
+    auto iAmPrimary = (myHostAndPort == primaryHostAndPort) ? true : false;
+
+    if (iAmPrimary) {
+        // Run command using DBDirectClient to avoid tcp connection.
+        return _runCmdOnSelfOnAlternativeClient(opCtx, dbName, cmdObj);
     }
 
     // Node is not primary, so we will run the remote command via AsyncDBClient. To use
     // AsyncDBClient, we will be using repl task executor.
-    const auto primary = getCurrentPrimaryHostAndPort();
-    if (primary.empty()) {
-        uassertStatusOK(Status{ErrorCodes::CommandFailed, "Primary is unknown/down."});
-    }
-
-    executor::RemoteCommandRequest request(primary, dbName, cmdObj, nullptr);
+    executor::RemoteCommandRequest request(primaryHostAndPort, dbName, cmdObj, nullptr);
     executor::RemoteCommandResponse cbkResponse(
         Status{ErrorCodes::InternalError, "Uninitialized value"});
 
@@ -2218,11 +2287,6 @@ BSONObj ReplicationCoordinatorImpl::runCmdOnPrimaryAndAwaitResponse(
     CallbackHandle cbkHandle = scheduleResult.getValue();
 
     onRemoteCmdScheduled(cbkHandle);
-    // Before, we wait for the remote command response, it's important we release the rstl lock to
-    // ensure that the state transition can happen during the wait period. Else, it can lead to
-    // deadlock. Consider a case, where the remote command waits for majority write concern. But, we
-    // are not able to transition our state to secondary (steady state replication).
-    rstl.release();
 
     // Wait for the response in an interruptible mode.
     _replExecutor->wait(cbkHandle, opCtx);
@@ -2417,16 +2481,18 @@ void ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
     // of a stepdown attempt.  This will prevent us from accepting writes so that if our stepdown
     // attempt fails later we can release the RSTL and go to sleep to allow secondaries to
     // catch up without allowing new writes in.
-    auto action = _updateMemberStateFromTopologyCoordinator(lk, opCtx);
+    _updateWriteAbilityFromTopologyCoordinator(lk, opCtx);
+    auto action = _updateMemberStateFromTopologyCoordinator(lk);
     invariant(action == PostMemberStateUpdateAction::kActionNone);
     invariant(!_readWriteAbility->canAcceptNonLocalWrites(lk));
 
-    // Make sure that we leave _canAcceptNonLocalWrites in the proper state.
     auto updateMemberState = [&] {
         invariant(lk.owns_lock());
         invariant(opCtx->lockState()->isRSTLExclusive());
 
-        auto action = _updateMemberStateFromTopologyCoordinator(lk, opCtx);
+        // Make sure that we leave _canAcceptNonLocalWrites in the proper state.
+        _updateWriteAbilityFromTopologyCoordinator(lk, opCtx);
+        auto action = _updateMemberStateFromTopologyCoordinator(lk);
         lk.unlock();
 
         if (MONGO_unlikely(stepdownHangBeforePerformingPostMemberStateUpdateActions.shouldFail())) {
@@ -2973,8 +3039,7 @@ Status ReplicationCoordinatorImpl::setMaintenanceMode(bool activate) {
         return Status(ErrorCodes::OperationFailed, "already out of maintenance mode");
     }
 
-    const PostMemberStateUpdateAction action =
-        _updateMemberStateFromTopologyCoordinator(lk, nullptr);
+    const PostMemberStateUpdateAction action = _updateMemberStateFromTopologyCoordinator(lk);
     lk.unlock();
     _performPostMemberStateUpdateAction(action);
     return Status::OK();
@@ -3185,6 +3250,7 @@ Status ReplicationCoordinatorImpl::doReplSetReconfig(OperationContext* opCtx,
           "numMembers"_attr = newConfig.getNumMembers());
 
     if (!force && !MONGO_unlikely(omitConfigQuorumCheck.shouldFail())) {
+        LOGV2(4509600, "Executing quorum check for reconfig");
         status = checkQuorumForReconfig(
             _replExecutor.get(), newConfig, myIndex.getValue(), _topCoord->getTerm());
         if (!status.isOK()) {
@@ -3205,49 +3271,6 @@ Status ReplicationCoordinatorImpl::doReplSetReconfig(OperationContext* opCtx,
     configStateGuard.dismiss();
     _finishReplSetReconfig(opCtx, newConfig, force, myIndex.getValue());
 
-    if (!force &&
-        serverGlobalParams.featureCompatibility.isVersion(
-            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) &&
-        enableSafeReplicaSetReconfig) {
-        // Wait for the config document to be replicated to a majority of nodes in the new
-        // config.
-        StatusAndDuration configAwaitStatus =
-            awaitReplication(opCtx, fakeOpTime, configWriteConcern);
-        uassertStatusOK(configAwaitStatus.status);
-
-        // Now that the new config has been persisted and installed in memory, wait for the latest
-        // committed optime in the previous config to be committed in the newly installed config.
-        // For force reconfigs we don't need to check this safety condition, and in any FCV < 4.4 we
-        // also bypass this to preserve client facing behavior in mixed version sets. Note that even
-        // if we have just left a force config via a non-force reconfig, we still want to wait for
-        // this oplog commitment check, since a subsequent safe reconfig will check it as a
-        // precondition.
-        lk.lock();
-        auto configOplogCommitmentOpTime = _topCoord->getConfigOplogCommitmentOpTime();
-        auto oplogWriteConcern = _getOplogCommitmentWriteConcern(lk);
-        lk.unlock();
-
-        LOGV2(51815,
-              "Waiting for the last committed optime in the previous config "
-              "({configOplogCommitmentOpTime}) to be committed in the current config.",
-              "configOplogCommitmentOpTime"_attr = configOplogCommitmentOpTime);
-        StatusAndDuration oplogAwaitStatus =
-            awaitReplication(opCtx, configOplogCommitmentOpTime, oplogWriteConcern);
-        if (!oplogAwaitStatus.status.isOK()) {
-            uasserted(oplogAwaitStatus.status.code(),
-                      str::stream() << "Last committed optime in the previous config ("
-                                    << configOplogCommitmentOpTime.toString()
-                                    << ") did not become committed in the current config.");
-        }
-
-        LOGV2(4508701,
-              "Committed new replica set config",
-              "newConfigVersion"_attr = newConfig.getConfigVersion(),
-              "newConfigTerm"_attr = newConfig.getConfigTerm(),
-              "configWaitDuration"_attr = configAwaitStatus.duration,
-              "oplogWaitDuration"_attr = oplogAwaitStatus.duration,
-              "configOplogCommitmentOpTime"_attr = configOplogCommitmentOpTime);
-    }
     return Status::OK();
 }
 
@@ -3300,6 +3323,9 @@ void ReplicationCoordinatorImpl::_finishReplSetReconfig(OperationContext* opCtx,
 
             // Clear the node's election candidate metrics since it is no longer primary.
             ReplicationMetrics::get(opCtx).clearElectionCandidateMetrics();
+
+            // Update _canAcceptNonLocalWrites.
+            _updateWriteAbilityFromTopologyCoordinator(lk, opCtx);
         } else {
             // Release the rstl lock as the node might have stepped down due to
             // other unconditional step down code paths like learning new term via heartbeat &
@@ -3340,6 +3366,52 @@ void ReplicationCoordinatorImpl::_finishReplSetReconfig(OperationContext* opCtx,
     // Inform the index builds coordinator of the replica set reconfig.
     IndexBuildsCoordinator::get(opCtx)->onReplicaSetReconfig();
 }
+
+Status ReplicationCoordinatorImpl::awaitConfigCommitment(OperationContext* opCtx) {
+    stdx::unique_lock<Latch> lk(_mutex);
+    auto configOplogCommitmentOpTime = _topCoord->getConfigOplogCommitmentOpTime();
+    auto oplogWriteConcern = _getOplogCommitmentWriteConcern(lk);
+    OpTime fakeOpTime(Timestamp(1, 1), _topCoord->getTerm());
+    auto currConfig = _rsConfig;
+    lk.unlock();
+
+    // Wait for the config document to be replicated to a majority of nodes in the current config.
+    LOGV2(4508702, "Waiting for the current config to propagate to a majority of nodes.");
+    StatusAndDuration configAwaitStatus =
+        awaitReplication(opCtx, fakeOpTime, _getConfigReplicationWriteConcern());
+    if (!configAwaitStatus.status.isOK()) {
+        std::stringstream ss;
+        ss << "Current config with " << currConfig.getConfigVersionAndTerm().toString()
+           << " did not propagate to a majority of nodes.";
+        return configAwaitStatus.status.withContext(ss.str());
+    }
+
+    // Wait for the latest committed optime in the previous config to be committed in the current
+    // config.
+    LOGV2(51815,
+          "Waiting for the last committed optime in the previous config "
+          "({configOplogCommitmentOpTime}) to be committed in the current config.",
+          "configOplogCommitmentOpTime"_attr = configOplogCommitmentOpTime);
+    StatusAndDuration oplogAwaitStatus =
+        awaitReplication(opCtx, configOplogCommitmentOpTime, oplogWriteConcern);
+    if (!oplogAwaitStatus.status.isOK()) {
+        std::stringstream ss;
+        ss << "Last committed optime in the previous config ("
+           << configOplogCommitmentOpTime.toString()
+           << ") did not become committed in the current config.";
+        return oplogAwaitStatus.status.withContext(ss.str());
+    }
+
+    LOGV2(4508701,
+          "Committed current replica set config",
+          "configVersion"_attr = currConfig.getConfigVersion(),
+          "configTerm"_attr = currConfig.getConfigTerm(),
+          "configWaitDuration"_attr = configAwaitStatus.duration,
+          "oplogWaitDuration"_attr = oplogAwaitStatus.duration,
+          "configOplogCommitmentOpTime"_attr = configOplogCommitmentOpTime);
+    return Status::OK();
+}
+
 
 Status ReplicationCoordinatorImpl::processReplSetInitiate(OperationContext* opCtx,
                                                           const BSONObj& configObj,
@@ -3487,8 +3559,7 @@ bool ReplicationCoordinatorImpl::_haveHorizonsChanged(const ReplSetConfig& oldCo
     return oldHorizonMappings != newHorizonMappings;
 }
 
-void ReplicationCoordinatorImpl::_fulfillTopologyChangePromise(OperationContext* opCtx,
-                                                               WithLock lock) {
+void ReplicationCoordinatorImpl::_fulfillTopologyChangePromise(WithLock lock) {
     _topCoord->incrementTopologyVersion();
     _cachedTopologyVersionCounter.store(_topCoord->getTopologyVersion().getCounter());
     // Create an isMaster response for each horizon the server is knowledgeable about.
@@ -3500,29 +3571,25 @@ void ReplicationCoordinatorImpl::_fulfillTopologyChangePromise(OperationContext*
     }
 }
 
-void ReplicationCoordinatorImpl::incrementTopologyVersion(OperationContext* opCtx) {
+void ReplicationCoordinatorImpl::incrementTopologyVersion() {
     stdx::lock_guard lk(_mutex);
-    _fulfillTopologyChangePromise(opCtx, lk);
+    _fulfillTopologyChangePromise(lk);
+}
+
+void ReplicationCoordinatorImpl::_updateWriteAbilityFromTopologyCoordinator(
+    WithLock lk, OperationContext* opCtx) {
+    bool canAcceptWrites = _topCoord->canAcceptWrites();
+    _readWriteAbility->setCanAcceptNonLocalWrites(lk, opCtx, canAcceptWrites);
 }
 
 ReplicationCoordinatorImpl::PostMemberStateUpdateAction
-ReplicationCoordinatorImpl::_updateMemberStateFromTopologyCoordinator(WithLock lk,
-                                                                      OperationContext* opCtx) {
-    {
-        // We have to do this check even if our current and target state are the same as we might
-        // have just failed a stepdown attempt and thus are staying in PRIMARY state but restoring
-        // our ability to accept writes.
-        bool canAcceptWrites = _topCoord->canAcceptWrites();
-        _readWriteAbility->setCanAcceptNonLocalWrites(lk, opCtx, canAcceptWrites);
-    }
-
+ReplicationCoordinatorImpl::_updateMemberStateFromTopologyCoordinator(WithLock lk) {
     // We want to respond to any waiting isMasters even if our current and target state are the
     // same as it is possible writes have been disabled during a stepDown but the primary has yet
     // to transition to SECONDARY state.
     ON_BLOCK_EXIT([&] {
         if (_rsConfig.isInitialized()) {
-            _fulfillTopologyChangePromise(opCtx, lk);
-            // Use the global ServiceContext here in case the current opCtx is null.
+            _fulfillTopologyChangePromise(lk);
             IsMasterMetrics::get(getGlobalServiceContext())->resetNumAwaitingTopologyChanges();
         }
     });
@@ -3548,7 +3615,7 @@ ReplicationCoordinatorImpl::_updateMemberStateFromTopologyCoordinator(WithLock l
         _opTimeWaiterList.setErrorAll_inlock(
             {ErrorCodes::PrimarySteppedDown, "Primary stepped down while waiting for replication"});
 
-        // _canAcceptNonLocalWrites should already be set above.
+        // _canAcceptNonLocalWrites should already be set.
         invariant(!_readWriteAbility->canAcceptNonLocalWrites(lk));
 
         serverGlobalParams.validateFeaturesAsMaster.store(false);
@@ -3576,12 +3643,9 @@ ReplicationCoordinatorImpl::_updateMemberStateFromTopologyCoordinator(WithLock l
         _externalState->startProducerIfStopped();
     }
 
-    if (_memberState.secondary() && newState.rollback()) {
-        // If we are switching out of SECONDARY and to ROLLBACK, we must make sure that we hold the
-        // RSTL in mode X to prevent readers that have the RSTL in intent mode from reading.
-        _readWriteAbility->setCanServeNonLocalReads(opCtx, 0U);
-    } else if (_memberState.secondary() && !newState.primary()) {
-        // Switching out of SECONDARY, but not to PRIMARY or ROLLBACK.
+    if (_memberState.secondary() && !newState.primary() && !newState.rollback()) {
+        // Switching out of SECONDARY, but not to PRIMARY or ROLLBACK. Note that ROLLBACK case is
+        // handled separately and requires RSTL lock held, see setFollowerModeRollback.
         _readWriteAbility->setCanServeNonLocalReads_UNSAFE(0U);
     } else if (!_memberState.primary() && newState.secondary()) {
         // Switching into SECONDARY, but not from PRIMARY.
@@ -3676,7 +3740,7 @@ void ReplicationCoordinatorImpl::_performPostMemberStateUpdateAction(
             // This code must be safe to run on node rollback and node removal!
             _externalState->shardingOnStepDownHook();
             _externalState->stopNoopWriter();
-            _externalState->clearOplogVisibilityStateForStepDown();
+            _externalState->stopAsyncUpdatesOfAndClearOplogTruncateAfterPoint();
             break;
         case kActionStartSingleNodeElection:
             // In protocol version 1, single node replset will run an election instead of
@@ -3696,8 +3760,7 @@ void ReplicationCoordinatorImpl::_postWonElectionUpdateMemberState(WithLock lk) 
     _electionId = OID::fromTerm(_topCoord->getTerm());
     auto ts = LogicalClock::get(getServiceContext())->reserveTicks(1).asTimestamp();
     _topCoord->processWinElection(_electionId, ts);
-    const PostMemberStateUpdateAction nextAction =
-        _updateMemberStateFromTopologyCoordinator(lk, nullptr);
+    const PostMemberStateUpdateAction nextAction = _updateMemberStateFromTopologyCoordinator(lk);
 
     invariant(nextAction == kActionFollowerModeStateChange,
               str::stream() << "nextAction == " << static_cast<int>(nextAction));
@@ -4041,7 +4104,7 @@ ReplicationCoordinatorImpl::_setCurrentRSConfig(WithLock lk,
     _cancelPriorityTakeover_inlock();
     _cancelAndRescheduleElectionTimeout_inlock();
 
-    const PostMemberStateUpdateAction action = _updateMemberStateFromTopologyCoordinator(lk, opCtx);
+    const PostMemberStateUpdateAction action = _updateMemberStateFromTopologyCoordinator(lk);
     if (_selfIndex >= 0) {
         // Don't send heartbeats if we're not in the config, if we get re-added one of the
         // nodes in the set will contact us.
@@ -4161,12 +4224,9 @@ Status ReplicationCoordinatorImpl::_checkIfCommitQuorumCanBeSatisfied(
 
     invariant(getReplicationMode() == modeReplSet);
 
-    std::vector<MemberConfig> memberConfig(_rsConfig.membersBegin(), _rsConfig.membersEnd());
-
     // We need to ensure that the 'commitQuorum' can be satisfied by all the members of this
     // replica set.
-    bool commitQuorumCanBeSatisfied =
-        _topCoord->checkIfCommitQuorumCanBeSatisfied(commitQuorum, memberConfig);
+    bool commitQuorumCanBeSatisfied = _topCoord->checkIfCommitQuorumCanBeSatisfied(commitQuorum);
     if (!commitQuorumCanBeSatisfied) {
         return Status(ErrorCodes::UnsatisfiableCommitQuorum,
                       str::stream() << "Commit quorum cannot be satisfied with the current replica "
@@ -5002,15 +5062,13 @@ bool ReplicationCoordinatorImpl::setContainsArbiter() const {
 
 void ReplicationCoordinatorImpl::ReadWriteAbility::setCanAcceptNonLocalWrites(
     WithLock lk, OperationContext* opCtx, bool canAcceptWrites) {
+    // We must be holding the RSTL in mode X to change _canAcceptNonLocalWrites.
+    invariant(opCtx);
+    invariant(opCtx->lockState()->isRSTLExclusive());
     if (canAcceptWrites == canAcceptNonLocalWrites(lk)) {
         return;
     }
-
-    // We must be holding the RSTL in mode X to change _canAcceptNonLocalWrites.
-    invariant(opCtx);
-    if (opCtx->lockState()->isRSTLExclusive()) {
-        _canAcceptNonLocalWrites.store(canAcceptWrites);
-    }
+    _canAcceptNonLocalWrites.store(canAcceptWrites);
 }
 
 bool ReplicationCoordinatorImpl::ReadWriteAbility::canAcceptNonLocalWrites(WithLock) const {

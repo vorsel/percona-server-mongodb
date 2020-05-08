@@ -55,10 +55,15 @@ class ValidateState {
     ValidateState& operator=(const ValidateState&) = delete;
 
 public:
+    /**
+     * 'turnOnExtraLoggingForTest' turns on extra logging for test debugging. This parameter is for
+     * unit testing only.
+     */
     ValidateState(OperationContext* opCtx,
                   const NamespaceString& nss,
                   bool background,
-                  ValidateOptions options);
+                  ValidateOptions options,
+                  bool turnOnExtraLoggingForTest = false);
 
     const NamespaceString& nss() const {
         return _nss;
@@ -132,6 +137,15 @@ public:
      */
     void initializeCursors(OperationContext* opCtx);
 
+    /**
+     * Indicates whether extra logging should occur during validation.
+     *
+     * This is for unit testing only. Intended to improve diagnosibility.
+     */
+    bool extraLoggingForTest() {
+        return _extraLoggingForTest;
+    }
+
 private:
     ValidateState() = delete;
 
@@ -172,6 +186,7 @@ private:
     ValidateOptions _options;
     OptionalCollectionUUID _uuid;
 
+    boost::optional<Lock::GlobalLock> _globalLock;
     boost::optional<AutoGetDb> _databaseLock;
     boost::optional<Lock::CollectionLock> _collectionLock;
 
@@ -195,6 +210,9 @@ private:
 
     // Used to detect when the catalog is re-opened while yielding locks.
     uint64_t _catalogGeneration;
+
+    // Can be set by unit tests to obtain better insight into what validate sees/does.
+    bool _extraLoggingForTest;
 };
 
 }  // namespace CollectionValidation

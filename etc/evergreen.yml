@@ -97,7 +97,7 @@ variables:
 
 - &jstestfuzz_config_vars
   num_files: 15
-  num_tasks: 10
+  num_tasks: 1
   resmoke_args: --help # resmoke_args needs to be overridden to specify one of the jstestfuzz suites
   resmoke_jobs_max: 1
   should_shuffle: false
@@ -442,6 +442,8 @@ variables:
   - enterprise-ubuntu1804-arm64
   - enterprise-ubuntu1804-ppc64le
   - enterprise-ubuntu1804-s390x
+  - enterprise-windows
+  - windows
 
 
 #######################################
@@ -647,7 +649,7 @@ functions:
   "get buildnumber": &get_buildnumber
     command: keyval.inc
     params:
-      key: "${build_variant}_master"
+      key: "${build_variant}_v4.4"
       destination: "builder_num"
 
   "run diskstats": &run_diskstats
@@ -779,6 +781,8 @@ functions:
 
         cat <<EOF > notary_env.sh
         export NOTARY_TOKEN=${signing_auth_token_44}
+        export BARQUE_USERNAME=${barque_user}
+        export BARQUE_PASSWORD=${barque_password}
         EOF
 
         echo "${signing_auth_token_44}" > signing_auth_token
@@ -1796,7 +1800,7 @@ functions:
             extra_flags="--lint-scope=changed"
           fi
 
-          ${compile_env|} python3 ./buildscripts/scons.py ${compile_flags|} $extra_flags --stack-size=1024 GITDIFFFLAGS="${revision}" ${targets}
+          ${compile_env|} python3 ./buildscripts/scons.py ${compile_flags|} $extra_flags --stack-size=1024 GITDIFFFLAGS="${revision}" REVISION="${revision|}" ENTERPRISE_REV="${enterprise_rev|}" ${targets}
 
   "scons compile":
     command: shell.exec
@@ -4673,8 +4677,8 @@ tasks:
   - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
-      num_files: 10
-      num_tasks: 15
+      num_files: 20
+      num_tasks: 1
       npm_command: initsync-fuzzer
       suite: initial_sync_multiversion_fuzzer
       resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
@@ -4688,8 +4692,8 @@ tasks:
   - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
-      num_files: 10
-      num_tasks: 5
+      num_files: 20
+      num_tasks: 1
       npm_command: initsync-fuzzer
       suite: initial_sync_fuzzer
       resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
@@ -4703,8 +4707,8 @@ tasks:
   - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
-      num_files: 5
-      num_tasks: 10
+      num_files: 10
+      num_tasks: 1
       suite: generational_fuzzer
       resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       npm_command: agg-fuzzer
@@ -4719,8 +4723,8 @@ tasks:
   - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
-      num_files: 5
-      num_tasks: 10
+      num_files: 15
+      num_tasks: 1
       suite: generational_fuzzer
       resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       npm_command: agg-expr-fuzzer
@@ -4735,8 +4739,8 @@ tasks:
   - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
-      num_files: 5
-      num_tasks: 10
+      num_files: 10
+      num_tasks: 1
       jstestfuzz_vars: --diffTestingMode optimization
       suite: generational_fuzzer
       resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
@@ -4751,8 +4755,8 @@ tasks:
   - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
-      num_files: 5
-      num_tasks: 10
+      num_files: 10
+      num_tasks: 1
       jstestfuzz_vars: --diffTestingMode optimization
       suite: generational_fuzzer
       resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
@@ -4767,8 +4771,8 @@ tasks:
   - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
-      num_files: 5
-      num_tasks: 10
+      num_files: 10
+      num_tasks: 1
       jstestfuzz_vars: --diffTestingMode wildcard
       npm_command: agg-fuzzer
       suite: generational_fuzzer
@@ -4783,8 +4787,8 @@ tasks:
   - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
-      num_files: 5
-      num_tasks: 10
+      num_files: 10
+      num_tasks: 1
       jstestfuzz_vars: --diffTestingMode standalone
       npm_command: query-fuzzer
       suite: generational_fuzzer
@@ -4799,8 +4803,8 @@ tasks:
   - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
-      num_files: 5
-      num_tasks: 10
+      num_files: 10
+      num_tasks: 1
       jstestfuzz_vars: --diffTestingMode sharded
       npm_command: query-fuzzer
       suite: generational_fuzzer
@@ -4815,8 +4819,8 @@ tasks:
   - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
-      num_files: 5
-      num_tasks: 10
+      num_files: 10
+      num_tasks: 1
       npm_command: update-fuzzer
       suite: generational_fuzzer
       resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
@@ -4831,8 +4835,8 @@ tasks:
   - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
-      num_files: 5
-      num_tasks: 10
+      num_files: 10
+      num_tasks: 1
       npm_command: update-fuzzer
       suite: generational_fuzzer_replication
       resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
@@ -4847,8 +4851,8 @@ tasks:
   - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
-      num_files: 3
-      num_tasks: 5
+      num_files: 5
+      num_tasks: 1
       npm_command: rollback-fuzzer
       suite: rollback_multiversion_fuzzer
       # Rollback suites create indexes with majority of nodes not available for replication. So, disabling
@@ -4865,8 +4869,8 @@ tasks:
   - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
-      num_files: 3
-      num_tasks: 5
+      num_files: 8
+      num_tasks: 1
       npm_command: rollback-fuzzer
       suite: rollback_fuzzer
       # Rollback suites create indexes with majority of nodes not available for replication. So, disabling
@@ -4882,8 +4886,8 @@ tasks:
   - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
-      num_files: 1
-      num_tasks: 4
+      num_files: 2
+      num_tasks: 1
       jstestfuzz_vars: --numLinesPerFile 300 --maxLinesBetweenEvents 50
       npm_command: rollback-fuzzer
       suite: rollback_fuzzer_clean_shutdowns
@@ -4900,8 +4904,8 @@ tasks:
   - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
-      num_files: 1
-      num_tasks: 4
+      num_files: 2
+      num_tasks: 1
       jstestfuzz_vars: --numLinesPerFile 300 --maxLinesBetweenEvents 50
       npm_command: rollback-fuzzer
       suite: rollback_fuzzer_unclean_shutdowns
@@ -4933,7 +4937,7 @@ tasks:
     vars:
       <<: *jstestfuzz_config_vars
       num_files: ${jstestfuzz_concurrent_num_files|10}
-      num_tasks: 15
+      num_tasks: 1
       jstestfuzz_vars: --jsTestsDir ../jstests
       suite: jstestfuzz
       resmoke_args: --storageEngine=wiredTiger --numClientsPerFixture=10
@@ -4948,7 +4952,7 @@ tasks:
     vars:
       <<: *jstestfuzz_config_vars
       num_files: ${jstestfuzz_concurrent_num_files|10}
-      num_tasks: 15
+      num_tasks: 1
       jstestfuzz_vars: --jsTestsDir ../jstests
       suite: jstestfuzz_replication
       resmoke_args: --storageEngine=wiredTiger --numClientsPerFixture=10
@@ -4963,7 +4967,7 @@ tasks:
     vars:
       <<: *jstestfuzz_config_vars
       num_files: ${jstestfuzz_concurrent_num_files|10}
-      num_tasks: 15
+      num_tasks: 1
       jstestfuzz_vars: --jsTestsDir ../jstests
       suite: jstestfuzz_replication_session
       resmoke_args: --storageEngine=wiredTiger --numClientsPerFixture=10
@@ -4978,7 +4982,7 @@ tasks:
     vars:
       <<: *jstestfuzz_config_vars
       num_files: ${jstestfuzz_concurrent_num_files|10}
-      num_tasks: 15
+      num_tasks: 1
       jstestfuzz_vars: --jsTestsDir ../jstests
       suite: jstestfuzz_sharded
       resmoke_args: --storageEngine=wiredTiger --numClientsPerFixture=10
@@ -4993,7 +4997,7 @@ tasks:
     vars:
       <<: *jstestfuzz_config_vars
       num_files: ${jstestfuzz_concurrent_num_files|10}
-      num_tasks: 15
+      num_tasks: 1
       jstestfuzz_vars: --jsTestsDir ../jstests
       suite: jstestfuzz_sharded_causal_consistency
       resmoke_args: --storageEngine=wiredTiger --numClientsPerFixture=10
@@ -5002,13 +5006,13 @@ tasks:
 ## jstestfuzz concurrent sharded cluster continuous stepdown ##
 - <<: *jstestfuzz_template
   name: jstestfuzz_concurrent_sharded_continuous_stepdown_gen
-  tags: ["jstestfuzz"]
+  tags: ["jstestfuzz", "stepdowns"]
   commands:
   - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
       num_files: ${jstestfuzz_concurrent_num_files|10}
-      num_tasks: 2
+      num_tasks: 1
       jstestfuzz_vars: --jsTestsDir ../jstests
       suite: jstestfuzz_sharded_continuous_stepdown
       resmoke_args: --storageEngine=wiredTiger --numClientsPerFixture=10
@@ -5023,7 +5027,7 @@ tasks:
     vars:
       <<: *jstestfuzz_config_vars
       num_files: ${jstestfuzz_concurrent_num_files|10}
-      num_tasks: 15
+      num_tasks: 1
       jstestfuzz_vars: --jsTestsDir ../jstests
       suite: jstestfuzz_sharded_session
       resmoke_args: --storageEngine=wiredTiger --numClientsPerFixture=10
@@ -5063,8 +5067,8 @@ tasks:
   - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
-      num_files: 5
-      num_tasks: 30
+      num_files: 2
+      num_tasks: 1
       jstestfuzz_vars: --jsTestsDir ../jstests
       suite: jstestfuzz_interrupt_replication
       resmoke_args: "--flowControlTicketOverride=1 --storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
@@ -5073,13 +5077,13 @@ tasks:
 ## jstestfuzz sharded cluster continuous stepdown with flow control engaged ##
 - <<: *jstestfuzz_template
   name: jstestfuzz_sharded_continuous_stepdown_flow_control_gen
-  tags: ["jstestfuzz", "flow_control"]
+  tags: ["jstestfuzz", "flow_control", "stepdowns"]
   commands:
   - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
-      num_files: 5
-      num_tasks: 10
+      num_files: 2
+      num_tasks: 1
       jstestfuzz_vars: --jsTestsDir ../jstests
       suite: jstestfuzz_sharded_continuous_stepdown
       resmoke_args: >-
@@ -5091,13 +5095,13 @@ tasks:
 ## jstestfuzz concurrent sharded cluster continuous stepdown with flow control engaged ##
 - <<: *jstestfuzz_template
   name: jstestfuzz_concurrent_sharded_continuous_stepdown_flow_control_gen
-  tags: ["jstestfuzz", "flow_control"]
+  tags: ["jstestfuzz", "flow_control", "stepdowns"]
   commands:
   - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
-      num_files: ${jstestfuzz_concurrent_num_files|10}
-      num_tasks: 2
+      num_files: 2
+      num_tasks: 1
       jstestfuzz_vars: --jsTestsDir ../jstests
       suite: jstestfuzz_sharded_continuous_stepdown
       resmoke_args: >-
@@ -5109,13 +5113,13 @@ tasks:
 # jstestfuzz replication continuous stepdown with flow control engaged #
 - <<: *jstestfuzz_template
   name: jstestfuzz_replication_continuous_stepdown_flow_control_gen
-  tags: ["jstestfuzz", "repl", "flow_control"]
+  tags: ["jstestfuzz", "repl", "flow_control", "stepdowns"]
   commands:
   - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
-      num_files: 5
-      num_tasks: 30
+      num_files: 2
+      num_tasks: 1
       jstestfuzz_vars: --jsTestsDir ../jstests
       suite: jstestfuzz_replication_continuous_stepdown
       resmoke_args: >-
@@ -5127,13 +5131,13 @@ tasks:
 ## jstestfuzz concurrent replication continuous stepdown with flow control engaged ##
 - <<: *jstestfuzz_template
   name: jstestfuzz_concurrent_replication_continuous_stepdown_flow_control_gen
-  tags: ["jstestfuzz", "common", "repl", "flow_control"]
+  tags: ["jstestfuzz", "common", "repl", "flow_control", "stepdowns"]
   commands:
   - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
-      num_files: ${jstestfuzz_concurrent_num_files|10}
-      num_tasks: 15
+      num_files: 2
+      num_tasks: 1
       jstestfuzz_vars: --jsTestsDir ../jstests
       suite: jstestfuzz_replication_continuous_stepdown
       resmoke_args: >-
@@ -5178,8 +5182,8 @@ tasks:
   - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
-      num_files: 8
-      num_tasks: 10
+      num_files: 15
+      num_tasks: 1
       jstestfuzz_vars: --jsTestsDir ../jstests
       suite: jstestfuzz_replication_initsync
       resmoke_args: "--storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
@@ -5242,13 +5246,13 @@ tasks:
 ## jstestfuzz sharded cluster continuous stepdown ##
 - <<: *jstestfuzz_template
   name: jstestfuzz_sharded_continuous_stepdown_gen
-  tags: ["jstestfuzz"]
+  tags: ["jstestfuzz", "stepdowns"]
   commands:
   - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
-      num_files: 5
-      num_tasks: 10
+      num_files: 10
+      num_tasks: 1
       jstestfuzz_vars: --jsTestsDir ../jstests
       suite: jstestfuzz_sharded_continuous_stepdown
       resmoke_args: "--storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
@@ -5395,6 +5399,18 @@ tasks:
   - func: "run tests"
     vars:
       resmoke_args: --suites=aggregation_read_concern_majority_passthrough --storageEngine=wiredTiger
+
+- <<: *task_template
+  name: aggregation_secondary_reads
+  tags: ["aggregation", "secondary_reads"]
+  depends_on:
+  - name: aggregation
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=aggregation_secondary_reads --storageEngine=wiredTiger
+      resmoke_jobs_max: 1
 
 - <<: *task_template
   name: aggregation_sharded_collections_passthrough
@@ -7716,7 +7732,7 @@ tasks:
           CURATOR_RELEASE=${curator_release|"latest"}
           curl -L -O http://boxes.10gen.com/build/curator/curator-dist-rhel70-$CURATOR_RELEASE.tar.gz
           tar -zxvf curator-dist-rhel70-$CURATOR_RELEASE.tar.gz
-          ./curator repo --config ./etc/repo_config.yaml --distro ${packager_distro} --edition ${repo_edition} --version ${version} --arch ${packager_arch} --packages repo
+          ./curator repo submit --service ${barque_url} --config ./etc/repo_config.yaml --distro ${packager_distro} --edition ${repo_edition} --version ${version} --arch ${packager_arch} --packages https://s3.amazonaws.com/mciuploads/${project}/${build_variant}/${revision}/artifacts/${build_id}-packages.tgz
 
 - name: push
   tags: ["publish"]
@@ -8497,7 +8513,7 @@ modules:
 - name: enterprise
   repo: git@github.com:10gen/mongo-enterprise-modules.git
   prefix: src/mongo/db/modules
-  branch: master
+  branch: v4.4
 
 - name: wtdevelop
   repo: git@github.com:wiredtiger/wiredtiger.git
@@ -8560,6 +8576,7 @@ buildvariants:
     scons_cache_scope: shared
     test_flags: --excludeWithAnyTags=requires_http_client
     target_resmoke_time: 15
+    max_sub_suites: 100
   tasks:
   - name: compile_all_run_unittests_TG
   - name: .aggregation !.encrypt
@@ -8823,22 +8840,16 @@ buildvariants:
     multiversion_edition: enterprise
   tasks:
   - name: compile_all_run_unittests_TG
-  - name: .aggfuzzer .common
   - name: aggregation
   - name: .auth !.audit !.multiversion !.jscore
-  - name: causally_consistent_jscore_txns_passthrough
   - name: .misc_js
-  - name: .concurrency .common
-  - name: concurrency_replication_causal_consistency
   - name: fle
   - name: .jscore .common !.auth
   - name: .jstestfuzz .common
-  - name: .logical_session_cache .one_sec
   - name: replica_sets
   - name: .replica_sets .common
   - name: .sharding .txns
   - name: sharding_gen
-  - name: sharding_jscore_passthrough
   - name: .ssl
   - name: .stitch
   - name: .publish
@@ -8949,26 +8960,15 @@ buildvariants:
     distros:
     - ubuntu1804-power8-build
   - name: aggregation
-  - name: aggregation_wildcard_fuzzer_gen
   - name: .auth !.audit !.multiversion !.jscore
-  - name: causally_consistent_jscore_txns_passthrough
   - name: .misc_js
-  - name: .concurrency .common
-  - name: concurrency_replication_causal_consistency
-    #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-    #- name: concurrency_sharded_replication_local_read_write_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
-    #- name: concurrency_sharded_replication_multi_stmt_txn # Removed until SERVER-38499 is resolved.
-    #- name: concurrency_sharded_replication_multi_stmt_txn_with_balancer # Removed until SERVER-38499 is resolved.
   - name: fle
   - name: .jscore .common !.auth
-  - name: .jstestfuzz .common
-  - name: .logical_session_cache .one_sec
   - name: .ocsp
   - name: replica_sets
   - name: .replica_sets .common
   - name: .sharding .txns
   - name: sharding_gen
-  - name: sharding_jscore_passthrough
   - name: .ssl
   - name: .stitch
   - name: .publish
@@ -9000,7 +9000,6 @@ buildvariants:
     - ubuntu1804-zseries-build
   - name: jsCore
   - name: replica_sets_jscore_passthrough
-  - name: ssl_gen
   - name: .publish
     distros:
     - ubuntu1804-test
@@ -9034,22 +9033,15 @@ buildvariants:
     distros:
     - ubuntu1804-zseries-build
   - name: aggregation
-  - name: aggregation_read_concern_majority_passthrough
-  - name: aggregation_sharded_collections_passthrough
   - name: audit
   - name: .auth !.multiversion !.jscore
-  - name: causally_consistent_jscore_txns_passthrough
   - name: .misc_js
-  - name: .concurrency .common
-  - name: concurrency_replication_causal_consistency
   - name: .encrypt
   - name: .integration !.audit
     distros:
     - ubuntu1804-zseries-build
   - name: .jscore .common !.auth
   - name: jsCore_op_query
-  - name: .jstestfuzz .common
-  - name: .logical_session_cache .one_sec
   - name: .read_write_concern
   - name: replica_sets
   - name: .replica_sets .common
@@ -9321,11 +9313,9 @@ buildvariants:
   - name: .causally_consistent !.sharding
   - name: .change_streams !.secondary_reads
   - name: .misc_js !.non_win_dbg
-    # Some concurrency workloads require a lot of memory, so we use machines
-    # with more RAM for these suites.
-  - name: .concurrency !.ubsan !.no_txns !.kill_terminate
+  - name: .concurrency .debug_only
     distros:
-      - windows-64-vs2019-large
+    - windows-64-vs2019-large
   - name: disk_wiredtiger
   - name: free_monitoring
   - name: initial_sync_fuzzer_gen
@@ -9335,7 +9325,6 @@ buildvariants:
   - name: .jscore .common !.auth !.sharding
   - name: jsCore_txns_large_txns_format
   - name: jsonSchema
-  - name: .logical_session_cache .one_sec
   - name: multi_shard_multi_stmt_txn_jscore_passthrough_gen
   - name: multi_stmt_txn_jscore_passthrough_with_migration_gen
   - name: .read_write_concern !.large
@@ -9381,6 +9370,7 @@ buildvariants:
     multiversion_edition: enterprise
     jstestfuzz_num_generated_files: 35
     target_resmoke_time: 20
+    max_sub_suites: 100
     large_distro_name: windows-64-vs2019-large
     push_path: windows
     push_bucket: downloads.10gen.com
@@ -9423,6 +9413,7 @@ buildvariants:
     multiversion_edition: enterprise
     jstestfuzz_num_generated_files: 35
     target_resmoke_time: 20
+    max_sub_suites: 100
     large_distro_name: windows-64-vs2019-large
     push_path: windows
     push_bucket: downloads.10gen.com
@@ -9432,7 +9423,6 @@ buildvariants:
     - name: compile_all_run_unittests_TG
       distros:
         - windows-64-vs2019-large
-    - name: .aggfuzzer
     - name: audit
     - name: auth_audit_gen
     - name: buildscripts_test
@@ -9555,8 +9545,7 @@ buildvariants:
     - windows-64-vs2019-large
   - name: initial_sync_fuzzer_gen
   - name: .jscore .common !.decimal !.compat !.sharding
-  - name: .jstestfuzz .common
-  - name: .logical_session_cache .one_sec
+  - name: .jstestfuzz .common !.flow_control  # Flow control jstestfuzz take longer.
   - name: .read_write_concern .linearize
   - name: replica_sets_auth_gen
   - name: replica_sets_jscore_passthrough
@@ -9594,13 +9583,18 @@ buildvariants:
   - name: compile_all_run_unittests_TG
     distros:
     - windows-64-vs2019-large
-  - name: .aggfuzzer .common
+  - name: .aggfuzzer
   - name: .aggregation !.auth !.encrypt !.unwind
   - name: auth_gen
   - name: .auth .gle
   - name: causally_consistent_jscore_txns_passthrough
   - name: .misc_js
-  - name: .concurrency .common !.txn
+    # Some concurrency workloads require a lot of memory, so we use machines
+    # with more RAM for these suites.
+  - name: .concurrency !.ubsan !.no_txns !.kill_terminate !.common !.debug_only
+    distros:
+      - windows-64-vs2019-large
+  - name: .concurrency .common
   - name: concurrency_replication_causal_consistency
     distros:
     - windows-64-vs2019-large
@@ -9608,8 +9602,7 @@ buildvariants:
   - name: free_monitoring
   - name: .jscore .common !.auth
   - name: jsonSchema
-  - name: .jstestfuzz !.initsync
-  - name: .logical_session_cache .one_sec
+  - name: .jstestfuzz !.initsync !.flow_control !.stepdowns
   - name: multiversion_gen
   - name: multiversion_auth_gen
   - name: .powercycle
@@ -9846,6 +9839,7 @@ buildvariants:
     jstestfuzz_num_generated_files: 40
     jstestfuzz_concurrent_num_files: 10
     target_resmoke_time: 10
+    max_sub_suites: 100
     large_distro_name: rhel62-large
     burn_in_tag_buildvariants: enterprise-rhel-62-64-bit-majority-read-concern-off enterprise-rhel-62-64-bit-inmem linux-64-duroff enterprise-rhel-62-64-bit-multiversion
   tasks:
@@ -10219,15 +10213,16 @@ buildvariants:
   - name: .sharding .jscore !.wo_snapshot !.multi_stmt
   - name: .sharding .common !.multiversion
 
-- name: enterprise-rhel-62-64-bit-two-phase-index-build-majority-commit-quorum-on
-  display_name: "Enterprise RHEL 6.2 (2 phase index build majority commit quorum on)"
+- name: enterprise-rhel-62-64-bit-two-phase-index-build-commit-quorum-off
+  display_name: "Enterprise RHEL 6.2 (2 phase index build commit quorum off)"
   modules:
   - enterprise
   run_on:
   - rhel62-small
-  expansions: &enterprise-rhel-62-64-bit-two-phase-index-build-majority-commit-quorum-on
+  batchtime: 10080 # 7 days
+  expansions: &enterprise-rhel-62-64-bit-two-phase-index-build-commit-quorum-off
     test_flags: >-
-        --mongodSetParameters="{enableIndexBuildCommitQuorum: true}"
+        --mongodSetParameters="{enableIndexBuildCommitQuorum: false}"
     compile_flags: >-
       -j$(grep -c ^processor /proc/cpuinfo)
       --ssl
@@ -10737,24 +10732,17 @@ buildvariants:
   - name: .aggregation .common
   - name: audit
   - name: .auth !.multiversion !.jscore
-  - name: causally_consistent_jscore_txns_passthrough
   - name: .misc_js
-  - name: .concurrency .common
-  - name: concurrency_replication_causal_consistency
   - name: .encrypt
   - name: .integration !.audit
     distros:
     - rhel71-power8-build
   - name: .jscore .common !.auth
   - name: jsCore_op_query
-  - name: .aggfuzzer .common
-  - name: .jstestfuzz .common
-  - name: .logical_session_cache .one_sec
   - name: .read_write_concern
   - name: replica_sets
   - name: .replica_sets .common
   - name: sasl
-  - name: secondary_reads_passthrough_gen
   - name: .sharding .jscore !.wo_snapshot !.multi_stmt
   - name: .sharding .common !.multiversion
   - name: snmp
@@ -10795,23 +10783,17 @@ buildvariants:
   - name: .aggregation .common
   - name: audit
   - name: .auth !.multiversion !.jscore
-  - name: causally_consistent_jscore_txns_passthrough
   - name: .misc_js
-  - name: .concurrency .common
-  - name: concurrency_replication_causal_consistency
   - name: .encrypt
   - name: .integration !.audit
     distros:
     - rhel72-zseries-build
   - name: .jscore .common !.auth
   - name: jsCore_op_query
-  - name: .jstestfuzz .common
-  - name: .logical_session_cache .one_sec
   - name: .read_write_concern
   - name: replica_sets
   - name: .replica_sets .common
   - name: sasl
-  - name: secondary_reads_passthrough_gen
   - name: .sharding .jscore !.wo_snapshot !.multi_stmt
   - name: .sharding .common !.multiversion
   - name: snmp
@@ -10846,21 +10828,14 @@ buildvariants:
   - name: .aggregation .common
   - name: audit
   - name: .auth !.multiversion
-  - name: causally_consistent_jscore_txns_passthrough
   - name: .misc_js
-  - name: .concurrency .common
-  - name: concurrency_replication_causal_consistency
   - name: .encrypt
   - name: .integration !.audit !.sharded
     distros:
     - rhel67-zseries-build
   - name: .jscore .common
   - name: jsCore_minimum_batch_size
-  - name: jsCore_op_query
-  - name: .logical_session_cache .one_sec
-  - name: .read_write_concern
-  - name: replica_sets
-  - name: .replica_sets .common
+  - name: replica_sets_jscore_passthrough
   - name: sasl
   - name: .sharding .jscore !.wo_snapshot !.multi_stmt
   - name: .sharding .common !.multiversion
@@ -11110,18 +11085,13 @@ buildvariants:
   - name: .aggregation .common
   - name: audit
   - name: .auth !.multiversion !.jscore
-  - name: causally_consistent_jscore_txns_passthrough
   - name: .misc_js
-  - name: .concurrency .common
-  - name: concurrency_replication_causal_consistency
   - name: .encrypt
   - name: .integration !.audit
     distros:
     - suse12-zseries-build
   - name: .jscore .common !.auth
   - name: jsCore_op_query
-  - name: .jstestfuzz .common
-  - name: .logical_session_cache .one_sec
   - name: .read_write_concern
   - name: replica_sets
   - name: .replica_sets .common
@@ -11659,21 +11629,15 @@ buildvariants:
   - name: audit
   - name: .auth !.multiversion
   - name: .misc_js
-  - name: .concurrency .common !.repl
-  - name: concurrency_replication
-  - name: concurrency_replication_causal_consistency
   - name: .integration !.audit
     distros:
     - rhel71-power8-build
   - name: .jscore .common !.decimal
   - name: jsCore_op_query
-  - name: causally_consistent_jscore_txns_passthrough
-  - name: .logical_session_cache .one_sec
   - name: .read_write_concern
   - name: replica_sets
   - name: .replica_sets .common
   - name: sasl
-  - name: secondary_reads_passthrough_gen
   - name: .sharding .jscore !.wo_snapshot !.multi_stmt
   - name: .sharding .common !.multiversion !.csrs
   - name: snmp
@@ -11699,20 +11663,12 @@ buildvariants:
   - name: .aggregation .common
   - name: .auth !.multiversion
   - name: audit
-  - name: causally_consistent_jscore_txns_passthrough
   - name: .misc_js
-  - name: .concurrency .common
-    distros:
-    - rhel72-zseries-build
-  - name: concurrency_replication_causal_consistency
-    distros:
-    - rhel72-zseries-build
   - name: .integration !.audit
     distros:
     - rhel72-zseries-build
   - name: .jscore .common !.decimal
   - name: jsCore_op_query
-  - name: .logical_session_cache .one_sec
   - name: .read_write_concern
   - name: replica_sets
   - name: .replica_sets .common
@@ -11814,7 +11770,6 @@ buildvariants:
     resmoke_jobs_factor: 0.3  # Avoid starting too many mongod's under ASAN build.
     is_asan_build: true
     scons_cache_scope: shared
-    target_resmoke_time: 15
     test_flags: --excludeWithAnyTags=requires_fast_memory
   tasks:
   - name: compile_all_run_unittests_TG
@@ -11904,6 +11859,7 @@ buildvariants:
     resmoke_jobs_factor: 0.3  # Avoid starting too many mongod's under {A,UB}SAN build.
     is_asan_build: true
     scons_cache_scope: shared
+    max_sub_suites: 100
   tasks:
   - name: compile_all_run_unittests_TG
   - name: server_discovery_and_monitoring_json_test_TG

@@ -30,6 +30,7 @@
 #pragma once
 
 #include <algorithm>
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
@@ -290,11 +291,12 @@ public:
     void onStepUp(OperationContext* opCtx);
 
     /**
-     * Invoked when the node enters the rollback state.
-     * Unblocks index builds that have been waiting to commit/abort during the secondary state.
-     * Returns an IndexBuilds of aborted index builds.
+     * Called during rollback to stop all active index builds. The state of these builds is distinct
+     * from "aborted" because no abortIndexBuild is replicated and the current node will restart
+     * these builds at the completion of rollback. Returns an IndexBuilds of stopped index builds.
+     * Single-phase index builds are not stopped.
      */
-    IndexBuilds onRollback(OperationContext* opCtx);
+    IndexBuilds stopIndexBuildsForRollback(OperationContext* opCtx);
 
     /**
      * Handles the 'VoteCommitIndexBuild' command request.
@@ -334,6 +336,7 @@ public:
     /**
      * Returns true if an index build is in progress on the specified collection.
      */
+    bool inProgForCollection(const UUID& collectionUUID, IndexBuildProtocol protocol) const;
     bool inProgForCollection(const UUID& collectionUUID) const;
 
     /**
@@ -365,6 +368,9 @@ public:
     /**
      * Waits for all index builds on a specified collection to finish.
      */
+    void awaitNoIndexBuildInProgressForCollection(OperationContext* opCtx,
+                                                  const UUID& collectionUUID,
+                                                  IndexBuildProtocol protocol);
     void awaitNoIndexBuildInProgressForCollection(const UUID& collectionUUID) const;
 
     /**
@@ -440,6 +446,17 @@ public:
      */
     static int getNumIndexesTotal(OperationContext* opCtx, Collection* collection);
 
+
+    /**
+     * Sets the index build action 'signal' for the index build pointed by 'replState'. Also, it
+     * cancels if there is any active remote 'voteCommitIndexBuild' command request callback handle
+     * for this index build.
+     */
+    virtual void setSignalAndCancelVoteRequestCbkIfActive(
+        WithLock ReplIndexBuildStateLk,
+        OperationContext* opCtx,
+        std::shared_ptr<ReplIndexBuildState> replState,
+        IndexBuildAction signal) = 0;
 
 private:
     /**
@@ -682,6 +699,14 @@ protected:
     std::vector<std::shared_ptr<ReplIndexBuildState>> _getIndexBuilds() const;
 
     /**
+     * Returns a list of index builds matching the criteria 'indexBuildFilter'.
+     * Requires caller to lock '_mutex'.
+     */
+    using IndexBuildFilterFn = std::function<bool(const ReplIndexBuildState& replState)>;
+    std::vector<std::shared_ptr<ReplIndexBuildState>> _filterIndexBuilds_inlock(
+        WithLock lk, IndexBuildFilterFn indexBuildFilter) const;
+
+    /**
      * Helper for 'abortCollectionIndexBuilds' and 'abortCollectionIndexBuildsNoWait'. Returns the
      * UUIDs of the aborted index builders
      */
@@ -722,6 +747,9 @@ protected:
 
     // Build UUID to index build information map.
     stdx::unordered_map<UUID, std::shared_ptr<ReplIndexBuildState>, UUID::Hash> _allIndexBuilds;
+
+    // Waiters are notified whenever one of the three maps above has something added or removed.
+    stdx::condition_variable _indexBuildsCondVar;
 
     // Handles actually building the indexes.
     IndexBuildsManager _indexBuildsManager;

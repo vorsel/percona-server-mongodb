@@ -150,9 +150,8 @@ bool WiredTigerFileVersion::shouldDowngrade(bool readOnly,
     if (!serverGlobalParams.featureCompatibility.isVersionInitialized()) {
         // If the FCV document hasn't been read, trust the WT compatibility. MongoD will
         // downgrade to the same compatibility it discovered on startup.
-        return _startupVersion == StartupVersion::IS_42 ||
-            _startupVersion == StartupVersion::IS_40 || _startupVersion == StartupVersion::IS_36 ||
-            _startupVersion == StartupVersion::IS_34;
+        return _startupVersion == StartupVersion::IS_44_FCV_42 ||
+            _startupVersion == StartupVersion::IS_42;
     }
 
     if (serverGlobalParams.featureCompatibility.getVersion() !=
@@ -181,22 +180,18 @@ bool WiredTigerFileVersion::shouldDowngrade(bool readOnly,
 
 std::string WiredTigerFileVersion::getDowngradeString() {
     if (!serverGlobalParams.featureCompatibility.isVersionInitialized()) {
-        invariant(_startupVersion != StartupVersion::IS_44);
+        invariant(_startupVersion != StartupVersion::IS_44_FCV_44);
 
         switch (_startupVersion) {
-            case StartupVersion::IS_34:
-                return "compatibility=(release=2.9)";
-            case StartupVersion::IS_36:
-                return "compatibility=(release=3.0)";
-            case StartupVersion::IS_40:
-                return "compatibility=(release=3.1)";
+            case StartupVersion::IS_44_FCV_42:
+                return "compatibility=(release=3.3)";
             case StartupVersion::IS_42:
-                return "compatibility=(release=3.2)";
+                return "compatibility=(release=3.3)";
             default:
                 MONGO_UNREACHABLE;
         }
     }
-    return "compatibility=(release=3.2)";
+    return "compatibility=(release=3.3)";
 }
 
 using std::set;
@@ -267,6 +262,11 @@ public:
 
         // Initialize the thread's opCtx.
         _uniqueCtx.emplace(tc->makeOperationContext());
+
+        // Updates to a non-replicated collection, oplogTruncateAfterPoint, are made by this thread.
+        // Non-replicated writes will not contribute to replication lag and can be safely excluded
+        // from Flow Control.
+        _uniqueCtx->get()->setShouldParticipateInFlowControl(false);
         while (true) {
 
             pauseJournalFlusherThread.pauseWhileSet(_uniqueCtx->get());
@@ -283,6 +283,7 @@ public:
                     stdx::lock_guard<Latch> lk(_opCtxMutex);
                     _uniqueCtx.reset();
                     _uniqueCtx.emplace(tc->makeOperationContext());
+                    _uniqueCtx->get()->setShouldParticipateInFlowControl(false);
                 });
 
                 _sessionCache->waitUntilDurable(
@@ -1183,30 +1184,29 @@ void WiredTigerKVEngine::appendGlobalStats(BSONObjBuilder& b) {
 }
 
 void WiredTigerKVEngine::_openWiredTiger(const std::string& path, const std::string& wtOpenConfig) {
-    std::string configStr = wtOpenConfig + ",compatibility=(require_min=\"3.1.0\")";
-
+    // MongoDB 4.4 will always run in compatibility version 10.0.
+    std::string configStr = wtOpenConfig + ",compatibility=(require_min=\"10.0.0\")";
     auto wtEventHandler = _eventHandler.getWtEventHandler();
 
     int ret = wiredtiger_open(path.c_str(), wtEventHandler, configStr.c_str(), &_conn);
     if (!ret) {
+        _fileVersion = {WiredTigerFileVersion::StartupVersion::IS_44_FCV_44};
+        return;
+    }
+
+    // MongoDB 4.4 doing clean shutdown in FCV 4.2 will use compatibility version 3.3.
+    configStr = wtOpenConfig + ",compatibility=(require_min=\"3.3.0\")";
+    ret = wiredtiger_open(path.c_str(), wtEventHandler, configStr.c_str(), &_conn);
+    if (!ret) {
+        _fileVersion = {WiredTigerFileVersion::StartupVersion::IS_44_FCV_42};
+        return;
+    }
+
+    // MongoDB 4.2 uses compatibility version 3.2.
+    configStr = wtOpenConfig + ",compatibility=(require_min=\"3.2.0\")";
+    ret = wiredtiger_open(path.c_str(), wtEventHandler, configStr.c_str(), &_conn);
+    if (!ret) {
         _fileVersion = {WiredTigerFileVersion::StartupVersion::IS_42};
-        return;
-    }
-
-    // Arbiters do not replicate the FCV document. Due to arbiter FCV semantics on 4.0, shutting
-    // down a 4.0 arbiter may either downgrade the data files to WT compatibility 2.9 or 3.0. Thus,
-    // 4.2 binaries must allow starting up on 2.9 and 3.0 files.
-    configStr = wtOpenConfig + ",compatibility=(require_min=\"3.0.0\")";
-    ret = wiredtiger_open(path.c_str(), wtEventHandler, configStr.c_str(), &_conn);
-    if (!ret) {
-        _fileVersion = {WiredTigerFileVersion::StartupVersion::IS_36};
-        return;
-    }
-
-    configStr = wtOpenConfig + ",compatibility=(require_min=\"2.9.0\")";
-    ret = wiredtiger_open(path.c_str(), wtEventHandler, configStr.c_str(), &_conn);
-    if (!ret) {
-        _fileVersion = {WiredTigerFileVersion::StartupVersion::IS_34};
         return;
     }
 
@@ -2597,6 +2597,8 @@ void WiredTigerKVEngine::setStableTimestamp(Timestamp stableTimestamp, bool forc
         stableTSConfigString =
             "force=true,oldest_timestamp={0:x},commit_timestamp={0:x},stable_timestamp={0:x}"_format(
                 ts);
+        stdx::lock_guard<Latch> lk(_highestDurableTimestampMutex);
+        _highestSeenDurableTimestamp = ts;
     } else {
         stableTSConfigString = "stable_timestamp={:x}"_format(ts);
     }
@@ -2653,6 +2655,8 @@ void WiredTigerKVEngine::setOldestTimestamp(Timestamp newOldestTimestamp, bool f
                 newOldestTimestamp.asULL());
         invariantWTOK(_conn->set_timestamp(_conn, oldestTSConfigString.c_str()));
         _oldestTimestamp.store(newOldestTimestamp.asULL());
+        stdx::lock_guard<Latch> lk(_highestDurableTimestampMutex);
+        _highestSeenDurableTimestamp = newOldestTimestamp.asULL();
         LOGV2_DEBUG(22342,
                     2,
                     "oldest_timestamp and commit_timestamp force set to {newOldestTimestamp}",
@@ -2790,7 +2794,15 @@ StatusWith<Timestamp> WiredTigerKVEngine::recoverToStableTimestamp(OperationCont
 }
 
 Timestamp WiredTigerKVEngine::getAllDurableTimestamp() const {
-    return Timestamp(_oplogManager->fetchAllDurableValue(_conn));
+    auto ret = _oplogManager->fetchAllDurableValue(_conn);
+
+    stdx::lock_guard<Latch> lk(_highestDurableTimestampMutex);
+    if (ret < _highestSeenDurableTimestamp) {
+        ret = _highestSeenDurableTimestamp;
+    } else {
+        _highestSeenDurableTimestamp = ret;
+    }
+    return Timestamp(ret);
 }
 
 Timestamp WiredTigerKVEngine::getOldestOpenReadTimestamp() const {

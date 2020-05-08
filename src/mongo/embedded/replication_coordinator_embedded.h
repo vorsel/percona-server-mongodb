@@ -116,6 +116,9 @@ public:
     Status checkIfCommitQuorumCanBeSatisfied(
         const CommitQuorumOptions& commitQuorum) const override;
 
+    bool isCommitQuorumSatisfied(const CommitQuorumOptions& commitQuorum,
+                                 const std::vector<mongo::HostAndPort>& members) const override;
+
     void setMyLastAppliedOpTimeAndWallTime(
         const repl::OpTimeAndWallTime& opTimeAndWallTime) override;
     void setMyLastDurableOpTimeAndWallTime(
@@ -151,7 +154,7 @@ public:
 
     Status setFollowerMode(const repl::MemberState&) override;
 
-    Status setFollowerModeStrict(OperationContext* opCtx, const repl::MemberState&) override;
+    Status setFollowerModeRollback(OperationContext* opCtx) override;
 
     ApplierState getApplierState() override;
 
@@ -193,6 +196,8 @@ public:
     Status doReplSetReconfig(OperationContext* opCtx,
                              GetNewConfigFn getNewConfig,
                              bool force) override;
+
+    Status awaitConfigCommitment(OperationContext* opCtx) override;
 
     Status processReplSetInitiate(OperationContext*, const BSONObj&, BSONObjBuilder*) override;
 
@@ -270,7 +275,7 @@ public:
 
     TopologyVersion getTopologyVersion() const override;
 
-    void incrementTopologyVersion(OperationContext* opCtx) override;
+    void incrementTopologyVersion() override;
 
     std::shared_ptr<const repl::IsMasterResponse> awaitIsMasterResponse(
         OperationContext* opCtx,

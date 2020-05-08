@@ -4,6 +4,24 @@ command_type: system
 pre:
 
 post:
+    # Do cluster teardown first to ensure runtime is below Evergreen's post timeout. Other post tasks
+    # will not have been run if the timeout is exceeded.
+    - command: shell.exec
+      params:
+        working_dir: work
+        script: |
+          source ./dsienv.sh
+          if [ -e /data/infrastructure_provisioning/terraform/provisioned.${cluster} ]; then
+            mark_idle.sh
+          fi
+    - command: shell.exec
+      params:
+        working_dir: work
+        script: |
+          set -e
+          set -v
+          source ./dsienv.sh
+          ../src/dsi/dsi/run-dsi infrastructure_teardown.py
     - command: shell.exec
       params:
         working_dir: work
@@ -37,15 +55,6 @@ post:
       params:
          name: "perf"
          file: "work/perf.json"
-    - command: shell.exec
-      params:
-        working_dir: work
-        script: |
-          source ./dsienv.sh
-          if [ -e /data/infrastructure_provisioning/terraform/provisioned.${cluster} ]; then
-            mark_idle.sh
-          fi
-
     - func: "upload pip requirements"
     - command: shell.exec
       params:
@@ -218,6 +227,8 @@ functions:
             tfvars:
               # This is currently only used by initialsync-logkeeper. It is empty and not used for other tests.
               mongod_seeded_ebs_snapshot_id: ${snapshotId}
+              # Initially used by sb_large_scale to override expire-on-delta to allow longer runtime on otherwise standard variants
+              ${additional_tfvars|}
           workload_setup:
             local_repos:
               workloads: ../src/workloads/workloads
@@ -856,6 +867,28 @@ tasks:
         files:
           - src/genny/genny/build/patch_tasks.json
 
+- name: sb_large_scale
+  priority: 5
+  exec_timeout_secs: 43200 # 12 hours
+  commands:
+    - func: "prepare environment"
+      vars:
+        test: "sb_large_scale"
+        additional_tfvars: "tags: {expire-on-delta: 12}"
+    - func: "deploy cluster"
+    - func: "run test"
+    - func: "analyze"
+
+- name: sb_timeseries
+  priority: 5
+  commands:
+    - func: "prepare environment"
+      vars:
+        test: "sb_timeseries"
+    - func: "deploy cluster"
+    - func: "run test"
+    - func: "analyze"
+
 #######################################
 #               Modules               #
 #######################################
@@ -890,7 +923,7 @@ modules:
 - name: enterprise
   repo: git@github.com:10gen/mongo-enterprise-modules.git
   prefix: src/mongo/db/modules
-  branch: master
+  branch: v4.4
 
 - name: mongo-tools
   repo: git@github.com:mongodb/mongo-tools.git
@@ -1012,6 +1045,8 @@ buildvariants:
     - name: genny_patch_tasks
     - name: genny_auto_tasks
     - name: industry_benchmarks_wmajority
+    - name: sb_large_scale
+    - name: sb_timeseries
 
 - name: linux-standalone
   display_name: Linux Standalone
@@ -1341,6 +1376,8 @@ buildvariants:
     - name: linkbench
     - name: genny_patch_tasks
     - name: genny_auto_tasks
+    - name: sb_large_scale
+    - name: sb_timeseries
 
 - name: linux-3-node-replSet-noflowcontrol
   display_name: Linux 3-Node ReplSet (Flow Control off)
@@ -1504,7 +1541,7 @@ buildvariants:
 #######################################
 - name: wtdevelop-1-node-replSet
   display_name: WT Develop 1-Node ReplSet
-  batchtime: 1440 # 24 hours
+  batchtime: 10080 # 7 days
   modules: *modules
   expansions:
     setup: single-replica
@@ -1525,7 +1562,7 @@ buildvariants:
 
 - name: wtdevelop-standalone
   display_name: WT Develop Standalone
-  batchtime: 1440 # 24 hours
+  batchtime: 10080 # 7 days
   modules: *modules
   expansions:
     setup: standalone

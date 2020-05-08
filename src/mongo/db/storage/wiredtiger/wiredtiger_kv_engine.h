@@ -60,7 +60,10 @@ class WiredTigerEngineRuntimeConfigParameter;
 class WiredTigerMaxCacheOverflowSizeGBParameter;
 
 struct WiredTigerFileVersion {
-    enum class StartupVersion { IS_34, IS_36, IS_40, IS_42, IS_44 };
+    // MongoDB 4.4+ will not open on datafiles left behind by 4.2.5 and earlier. MongoDB 4.4
+    // shutting down in FCV 4.2 will leave data files that 4.2.6+ will understand
+    // (IS_44_FCV_42). MongoDB 4.2.x always writes out IS_42.
+    enum class StartupVersion { IS_42, IS_44_FCV_42, IS_44_FCV_44 };
 
     StartupVersion _startupVersion;
     bool shouldDowngrade(bool readOnly, bool repairMode, bool hasRecoveryTimestamp);
@@ -524,5 +527,9 @@ private:
 
     std::unique_ptr<WiredTigerEngineRuntimeConfigParameter> _runTimeConfigParam;
     std::unique_ptr<WiredTigerMaxCacheOverflowSizeGBParameter> _maxCacheOverflowParam;
+
+    mutable Mutex _highestDurableTimestampMutex =
+        MONGO_MAKE_LATCH("WiredTigerKVEngine::_highestDurableTimestampMutex");
+    mutable unsigned long long _highestSeenDurableTimestamp = StorageEngine::kMinimumTimestamp;
 };
 }  // namespace mongo

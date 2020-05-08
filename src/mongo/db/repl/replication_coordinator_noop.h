@@ -113,6 +113,9 @@ public:
 
     Status checkIfCommitQuorumCanBeSatisfied(const CommitQuorumOptions& commitQuorum) const final;
 
+    bool isCommitQuorumSatisfied(const CommitQuorumOptions& commitQuorum,
+                                 const std::vector<mongo::HostAndPort>& members) const final;
+
     void setMyLastAppliedOpTimeAndWallTime(const OpTimeAndWallTime& opTimeAndWallTime) final;
     void setMyLastDurableOpTimeAndWallTime(const OpTimeAndWallTime& opTimeAndWallTime) final;
     void setMyLastAppliedOpTimeAndWallTimeForward(const OpTimeAndWallTime& opTimeAndWallTime,
@@ -144,7 +147,7 @@ public:
 
     Status setFollowerMode(const MemberState&) final;
 
-    Status setFollowerModeStrict(OperationContext* opCtx, const MemberState&) final;
+    Status setFollowerModeRollback(OperationContext* opCtx) final;
 
     ApplierState getApplierState() final;
 
@@ -186,6 +189,8 @@ public:
     Status doReplSetReconfig(OperationContext* opCtx,
                              GetNewConfigFn getNewConfig,
                              bool force) final;
+
+    Status awaitConfigCommitment(OperationContext* opCtx) final;
 
     Status processReplSetInitiate(OperationContext*, const BSONObj&, BSONObjBuilder*) final;
 
@@ -255,7 +260,7 @@ public:
 
     void finishRecoveryIfEligible(OperationContext* opCtx) final;
 
-    void incrementTopologyVersion(OperationContext* opCtx) final;
+    void incrementTopologyVersion() final;
 
     void updateAndLogStateTransitionMetrics(
         const ReplicationCoordinator::OpsKillingStateTransitionEnum stateTransition,

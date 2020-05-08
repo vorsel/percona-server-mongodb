@@ -590,12 +590,20 @@ void DatabaseImpl::_checkCanCreateCollection(OperationContext* opCtx,
                           << " - database is in the process of being dropped.",
             !_dropPending.load());
 
-    uassert(ErrorCodes::IncompatibleServerVersion,
-            str::stream() << "Cannot create collection with a long name " << nss
-                          << " - upgrade to feature compatibility version "
-                          << FeatureCompatibilityVersionParser::kVersion44
-                          << " to be able to do so.",
-            nss.checkLengthForFCV());
+    uassert(17381,
+            str::stream() << "Fully qualified namespace is too long. Namespace: " << nss.ns()
+                          << " Max: " << NamespaceString::MaxNsCollectionLen,
+            !nss.isNormalCollection() || nss.size() <= NamespaceString::MaxNsCollectionLen);
+    const auto& fcv = serverGlobalParams.featureCompatibility;
+    if (!fcv.isVersionInitialized() ||
+        fcv.getVersion() < ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
+        uassert(ErrorCodes::IncompatibleServerVersion,
+                str::stream() << "Fully qualified namespace is too long for FCV 4.2. Upgrade to "
+                                 "FCV 4.4 to create this namespace. Namespace: "
+                              << nss.ns()
+                              << " FCV 4.2 Limit: " << NamespaceString::MaxNSCollectionLenFCV42,
+                nss.size() <= NamespaceString::MaxNSCollectionLenFCV42);
+    }
 }
 
 Status DatabaseImpl::createView(OperationContext* opCtx,
@@ -664,13 +672,9 @@ Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
     // reserve oplog slots here if it is run outside of a multi-document transaction. Multi-
     // document transactions reserve the appropriate oplog slots at commit time.
     OplogSlot createOplogSlot;
-    Timestamp createTime;
     if (canAcceptWrites && supportsDocLocking() && !coordinator->isOplogDisabledFor(opCtx, nss) &&
         !opCtx->inMultiDocumentTransaction()) {
         createOplogSlot = repl::getNextOpTime(opCtx);
-        createTime = createOplogSlot.getTimestamp();
-    } else {
-        createTime = opCtx->recoveryUnit()->getCommitTimestamp();
     }
 
     if (MONGO_unlikely(hangAndFailAfterCreateCollectionReservesOpTime.shouldFail())) {
@@ -704,7 +708,7 @@ Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
     auto collection = ownedCollection.get();
     ownedCollection->init(opCtx);
     ownedCollection->setCommitted(false);
-    UncommittedCollections::addToTxn(opCtx, std::move(ownedCollection), createTime);
+    UncommittedCollections::addToTxn(opCtx, std::move(ownedCollection));
     openCreateCollectionWindowFp.executeIf([&](const BSONObj& data) { sleepsecs(3); },
                                            [&](const BSONObj& data) {
                                                const auto collElem = data["collectionNS"];

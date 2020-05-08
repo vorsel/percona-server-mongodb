@@ -308,16 +308,15 @@ StatusWith<BSONObj> validateIndexSpec(
             }
 
             // Allow compound hashed index only if FCV is 4.4.
-            const auto isFeatureDisabled =
+            const auto isFCV44 =
                 (featureCompatibility.isVersionInitialized() &&
-                 featureCompatibility.getVersion() <
+                 featureCompatibility.getVersion() ==
                      ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44);
-            if (isFeatureDisabled && (indexSpecElem.embeddedObject().nFields() > 1) &&
+            if (!isFCV44 && (indexSpecElem.embeddedObject().nFields() > 1) &&
                 (IndexNames::findPluginName(indexSpecElem.embeddedObject()) ==
                  IndexNames::HASHED)) {
                 return {ErrorCodes::Error(16763),
-                        "Compound hashed indexes can only be created with FCV 4.4 and with test "
-                        "commands enabled "};
+                        "Compound hashed indexes can only be created with FCV 4.4"};
             }
 
             hasKeyPatternField = true;

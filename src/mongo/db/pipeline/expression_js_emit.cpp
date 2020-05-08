@@ -36,7 +36,10 @@
 
 namespace mongo {
 
-REGISTER_EXPRESSION(_internalJsEmit, ExpressionInternalJsEmit::parse);
+REGISTER_EXPRESSION_WITH_MIN_VERSION(
+    _internalJsEmit,
+    ExpressionInternalJsEmit::parse,
+    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44);
 namespace {
 
 /**
@@ -71,6 +74,10 @@ boost::intrusive_ptr<Expression> ExpressionInternalJsEmit::parse(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     BSONElement expr,
     const VariablesParseState& vps) {
+
+    uassert(4660801,
+            str::stream() << kExpressionName << " cannot be used inside a validator.",
+            !expCtx->isParsingCollectionValidator);
 
     uassert(31221,
             str::stream() << kExpressionName

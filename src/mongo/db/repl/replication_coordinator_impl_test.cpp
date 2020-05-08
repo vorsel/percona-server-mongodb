@@ -39,6 +39,7 @@
 #include <vector>
 
 #include "mongo/bson/util/bson_extract.h"
+#include "mongo/db/catalog/commit_quorum_options.h"
 #include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/concurrency/replication_state_transition_lock_guard.h"
 #include "mongo/db/operation_context_noop.h"
@@ -358,7 +359,7 @@ TEST_F(ReplCoordTest, NodeReturnsNodeNotFoundWhenQuorumCheckFailsWhileInitiating
     ReplSetHeartbeatArgsV1 hbArgs;
     hbArgs.setSetName("mySet");
     hbArgs.setConfigVersion(1);
-    hbArgs.setConfigTerm(0);
+    hbArgs.setConfigTerm(OpTime::kUninitializedTerm);
     hbArgs.setCheckEmpty();
     hbArgs.setSenderHost(HostAndPort("node1", 12345));
     hbArgs.setSenderId(0);
@@ -392,7 +393,7 @@ TEST_F(ReplCoordTest, InitiateSucceedsWhenQuorumCheckPasses) {
     ReplSetHeartbeatArgsV1 hbArgs;
     hbArgs.setSetName("mySet");
     hbArgs.setConfigVersion(1);
-    hbArgs.setConfigTerm(0);
+    hbArgs.setConfigTerm(OpTime::kUninitializedTerm);
     hbArgs.setCheckEmpty();
     hbArgs.setSenderHost(HostAndPort("node1", 12345));
     hbArgs.setSenderId(0);
@@ -2750,7 +2751,7 @@ TEST_F(ReplCoordTest,
     ReplicationStateTransitionLockGuard transitionGuard(opCtx.get(), MODE_X);
 
     // If we go into rollback while in maintenance mode, our state changes to RS_ROLLBACK.
-    ASSERT_OK(getReplCoord()->setFollowerModeStrict(opCtx.get(), MemberState::RS_ROLLBACK));
+    ASSERT_OK(getReplCoord()->setFollowerModeRollback(opCtx.get()));
     ASSERT_TRUE(getReplCoord()->getMemberState().rollback());
 
     // When we go back to SECONDARY, we still observe RECOVERING because of maintenance mode.
@@ -2810,7 +2811,7 @@ TEST_F(ReplCoordTest, SettingAndUnsettingMaintenanceModeShouldNotAffectRollbackS
 
     // From rollback, entering and exiting maintenance mode doesn't change perceived
     // state.
-    ASSERT_OK(getReplCoord()->setFollowerModeStrict(opCtx.get(), MemberState::RS_ROLLBACK));
+    ASSERT_OK(getReplCoord()->setFollowerModeRollback(opCtx.get()));
     ASSERT_TRUE(getReplCoord()->getMemberState().rollback());
     ASSERT_OK(getReplCoord()->setMaintenanceMode(true));
     ASSERT_TRUE(getReplCoord()->getMemberState().rollback());
@@ -2822,7 +2823,7 @@ TEST_F(ReplCoordTest, SettingAndUnsettingMaintenanceModeShouldNotAffectRollbackS
     ASSERT_TRUE(getReplCoord()->getMemberState().secondary());
     ASSERT_OK(getReplCoord()->setMaintenanceMode(true));
     ASSERT_TRUE(getReplCoord()->getMemberState().recovering());
-    ASSERT_OK(getReplCoord()->setFollowerModeStrict(opCtx.get(), MemberState::RS_ROLLBACK));
+    ASSERT_OK(getReplCoord()->setFollowerModeRollback(opCtx.get()));
     ASSERT_TRUE(getReplCoord()->getMemberState().rollback());
     ASSERT_OK(getReplCoord()->setMaintenanceMode(false));
     ASSERT_TRUE(getReplCoord()->getMemberState().rollback());
@@ -2927,7 +2928,7 @@ TEST_F(ReplCoordTest, DoNotAllowSettingMaintenanceModeWhileConductingAnElection)
     // We do not need to respond to any pending network operations because setFollowerMode() will
     // cancel the vote requester.
     ASSERT_EQUALS(ErrorCodes::ElectionInProgress,
-                  getReplCoord()->setFollowerModeStrict(opCtx.get(), MemberState::RS_ROLLBACK));
+                  getReplCoord()->setFollowerModeRollback(opCtx.get()));
 }
 
 TEST_F(ReplCoordTest,
@@ -5220,7 +5221,7 @@ TEST_F(StableOpTimeTest,
     // We must take the RSTL in mode X before transitioning to RS_ROLLBACK.
     const auto opCtx = makeOperationContext();
     ReplicationStateTransitionLockGuard transitionGuard(opCtx.get(), MODE_X);
-    ASSERT_OK(getReplCoord()->setFollowerModeStrict(opCtx.get(), MemberState::RS_ROLLBACK));
+    ASSERT_OK(getReplCoord()->setFollowerModeRollback(opCtx.get()));
 
     // It is possible that rollback-via-refetch forces the stable timestamp backwards to the common
     // point at the end of rollback.
@@ -5285,7 +5286,7 @@ TEST_F(StableOpTimeTest, ClearOpTimeCandidatesPastCommonPointAfterRollback) {
     ReplicationStateTransitionLockGuard transitionGuard(opCtx.get(), MODE_X);
 
     // Transition to ROLLBACK. The set of stable optime candidates should not have changed.
-    ASSERT_OK(repl->setFollowerModeStrict(opCtx.get(), MemberState::RS_ROLLBACK));
+    ASSERT_OK(repl->setFollowerModeRollback(opCtx.get()));
     opTimeCandidates = repl->getStableOpTimeCandidates_forTest();
     ASSERT_OPTIME_SET_EQ(expectedOpTimeCandidates, opTimeCandidates);
 
@@ -6023,7 +6024,7 @@ TEST_F(ReplCoordTest, DoNotScheduleElectionWhenCancelAndRescheduleElectionTimeou
     // We must take the RSTL in mode X before transitioning to RS_ROLLBACK.
     const auto opCtx = makeOperationContext();
     ReplicationStateTransitionLockGuard transitionGuard(opCtx.get(), MODE_X);
-    ASSERT_OK(replCoord->setFollowerModeStrict(opCtx.get(), MemberState::RS_ROLLBACK));
+    ASSERT_OK(replCoord->setFollowerModeRollback(opCtx.get()));
 
     getReplCoord()->cancelAndRescheduleElectionTimeout();
 
@@ -7160,6 +7161,246 @@ TEST_F(ReplCoordTest, NodeNodesNotGrantVoteIfInTerminalShutdown) {
     ASSERT_NOT_OK(r);
     ASSERT_EQUALS("In the process of shutting down", r.reason());
     ASSERT_EQUALS(ErrorCodes::ShutdownInProgress, r.code());
+}
+
+TEST_F(ReplCoordTest, CheckIfCommitQuorumHasReached) {
+    // Set up a 5-node replica set config.
+    assertStartSuccess(BSON("_id"
+                            << "mySet"
+                            << "version" << 2 << "members"
+                            << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                     << "node0:100"
+                                                     << "tags"
+                                                     << BSON("dc"
+                                                             << "NA"
+                                                             << "rack"
+                                                             << "rackNA1"))
+                                          << BSON("_id" << 1 << "host"
+                                                        << "node1:101"
+                                                        << "tags"
+                                                        << BSON("dc"
+                                                                << "NA"
+                                                                << "rack"
+                                                                << "rackNA2"))
+                                          << BSON("_id" << 2 << "host"
+                                                        << "node2:102"
+                                                        << "tags"
+                                                        << BSON("dc"
+                                                                << "NA"
+                                                                << "rack"
+                                                                << "rackNA3"))
+                                          << BSON("_id" << 3 << "host"
+                                                        << "node3:103"
+                                                        << "tags"
+                                                        << BSON("dc"
+                                                                << "EU"
+                                                                << "rack"
+                                                                << "rackEU1"))
+                                          << BSON("_id" << 4 << "host"
+                                                        << "node4:104"
+                                                        << "votes" << 0 << "priority" << 0 << "tags"
+                                                        << BSON("dc"
+                                                                << "EU"
+                                                                << "rack"
+                                                                << "rackEU2"))
+                                          << BSON("_id" << 5 << "host"
+                                                        << "node5:105"
+                                                        << "arbiterOnly" << true))
+                            << "settings"
+                            << BSON("getLastErrorModes" << BSON(
+                                        "valid" << BSON("dc" << 2 << "rack" << 2)
+                                                << "invalidNotEnoughValues" << BSON("dc" << 3)
+                                                << "invalidNotEnoughNodes" << BSON("rack" << 6)))),
+                       HostAndPort("node0", 100));
+
+    auto replCoord = getReplCoord();
+    {
+        // Quorum contains a node which is not part of the replica set config.
+        std::vector<HostAndPort> commitReadyMembers{HostAndPort("node100", 100)};
+
+        CommitQuorumOptions singleNodeCQ;
+        singleNodeCQ.numNodes = 1;
+        ASSERT_FALSE(replCoord->isCommitQuorumSatisfied(singleNodeCQ, commitReadyMembers));
+
+        CommitQuorumOptions vaildModeCQ;
+        vaildModeCQ.mode = "valid";
+        ASSERT_FALSE(replCoord->isCommitQuorumSatisfied(vaildModeCQ, commitReadyMembers));
+
+        CommitQuorumOptions majorityModeCQ;
+        majorityModeCQ.mode = "majority";
+        ASSERT_FALSE(replCoord->isCommitQuorumSatisfied(majorityModeCQ, commitReadyMembers));
+
+        CommitQuorumOptions allModeCQ;
+        allModeCQ.mode = "all";
+        ASSERT_FALSE(replCoord->isCommitQuorumSatisfied(allModeCQ, commitReadyMembers));
+
+        CommitQuorumOptions allNodesCQ;
+        allNodesCQ.numNodes = 5;
+        ASSERT_FALSE(replCoord->isCommitQuorumSatisfied(allNodesCQ, commitReadyMembers));
+    }
+
+    {
+        // Quorum contains two nodes from same data center.
+        std::vector<HostAndPort> commitReadyMembers{HostAndPort("node0", 100),
+                                                    HostAndPort("node1", 101)};
+
+        CommitQuorumOptions singleNodeCQ;
+        singleNodeCQ.numNodes = 1;
+        ASSERT_TRUE(replCoord->isCommitQuorumSatisfied(singleNodeCQ, commitReadyMembers));
+
+        CommitQuorumOptions vaildModeCQ;
+        vaildModeCQ.mode = "valid";
+        ASSERT_FALSE(replCoord->isCommitQuorumSatisfied(vaildModeCQ, commitReadyMembers));
+
+        CommitQuorumOptions majorityModeCQ;
+        majorityModeCQ.mode = "majority";
+        ASSERT_FALSE(replCoord->isCommitQuorumSatisfied(majorityModeCQ, commitReadyMembers));
+
+        CommitQuorumOptions allModeCQ;
+        allModeCQ.mode = "all";
+        ASSERT_FALSE(replCoord->isCommitQuorumSatisfied(allModeCQ, commitReadyMembers));
+
+        CommitQuorumOptions allNodesCQ;
+        allNodesCQ.numNodes = 5;
+        ASSERT_FALSE(replCoord->isCommitQuorumSatisfied(allNodesCQ, commitReadyMembers));
+    }
+
+    {
+        // Quorum contains two nodes from different data center.
+        std::vector<HostAndPort> commitReadyMembers{HostAndPort("node1", 101),
+                                                    HostAndPort("node3", 103)};
+
+        CommitQuorumOptions singleNodeCQ;
+        singleNodeCQ.numNodes = 1;
+        ASSERT_TRUE(replCoord->isCommitQuorumSatisfied(singleNodeCQ, commitReadyMembers));
+
+        CommitQuorumOptions vaildModeCQ;
+        vaildModeCQ.mode = "valid";
+        ASSERT_TRUE(replCoord->isCommitQuorumSatisfied(vaildModeCQ, commitReadyMembers));
+
+        CommitQuorumOptions majorityModeCQ;
+        majorityModeCQ.mode = "majority";
+        ASSERT_FALSE(replCoord->isCommitQuorumSatisfied(majorityModeCQ, commitReadyMembers));
+
+        CommitQuorumOptions allModeCQ;
+        allModeCQ.mode = "all";
+        ASSERT_FALSE(replCoord->isCommitQuorumSatisfied(allModeCQ, commitReadyMembers));
+
+        CommitQuorumOptions allNodesCQ;
+        allNodesCQ.numNodes = 5;
+        ASSERT_FALSE(replCoord->isCommitQuorumSatisfied(allNodesCQ, commitReadyMembers));
+    }
+
+    {
+        // Quorum contains majority of voting data bearing nodes.
+        std::vector<HostAndPort> commitReadyMembers{
+            HostAndPort("node1", 101), HostAndPort("node2", 102), HostAndPort("node3", 103)};
+
+        CommitQuorumOptions singleNodeCQ;
+        singleNodeCQ.numNodes = 1;
+        ASSERT_TRUE(replCoord->isCommitQuorumSatisfied(singleNodeCQ, commitReadyMembers));
+
+        CommitQuorumOptions vaildModeCQ;
+        vaildModeCQ.mode = "valid";
+        ASSERT_TRUE(replCoord->isCommitQuorumSatisfied(vaildModeCQ, commitReadyMembers));
+
+        CommitQuorumOptions majorityModeCQ;
+        majorityModeCQ.mode = "majority";
+        ASSERT_TRUE(replCoord->isCommitQuorumSatisfied(majorityModeCQ, commitReadyMembers));
+
+        CommitQuorumOptions allModeCQ;
+        allModeCQ.mode = "all";
+        ASSERT_FALSE(replCoord->isCommitQuorumSatisfied(allModeCQ, commitReadyMembers));
+
+        CommitQuorumOptions allNodesCQ;
+        allNodesCQ.numNodes = 5;
+        ASSERT_FALSE(replCoord->isCommitQuorumSatisfied(allNodesCQ, commitReadyMembers));
+    }
+
+    {
+        // Quorum contains all voting data bearing nodes.
+        std::vector<HostAndPort> commitReadyMembers{HostAndPort("node0", 100),
+                                                    HostAndPort("node1", 101),
+                                                    HostAndPort("node2", 102),
+                                                    HostAndPort("node3", 103)};
+
+        CommitQuorumOptions singleNodeCQ;
+        singleNodeCQ.numNodes = 1;
+        ASSERT_TRUE(replCoord->isCommitQuorumSatisfied(singleNodeCQ, commitReadyMembers));
+
+        CommitQuorumOptions vaildModeCQ;
+        vaildModeCQ.mode = "valid";
+        ASSERT_TRUE(replCoord->isCommitQuorumSatisfied(vaildModeCQ, commitReadyMembers));
+
+        CommitQuorumOptions majorityModeCQ;
+        majorityModeCQ.mode = "majority";
+        ASSERT_TRUE(replCoord->isCommitQuorumSatisfied(majorityModeCQ, commitReadyMembers));
+
+        CommitQuorumOptions allModeCQ;
+        allModeCQ.mode = "all";
+        ASSERT_TRUE(replCoord->isCommitQuorumSatisfied(allModeCQ, commitReadyMembers));
+
+        CommitQuorumOptions allNodesCQ;
+        allNodesCQ.numNodes = 5;
+        ASSERT_FALSE(replCoord->isCommitQuorumSatisfied(allNodesCQ, commitReadyMembers));
+    }
+
+    {
+        // Quorum contains all data bearing nodes.
+        std::vector<HostAndPort> commitReadyMembers{HostAndPort("node0", 100),
+                                                    HostAndPort("node1", 101),
+                                                    HostAndPort("node2", 102),
+                                                    HostAndPort("node3", 103),
+                                                    HostAndPort("node4", 104)};
+
+        CommitQuorumOptions singleNodeCQ;
+        singleNodeCQ.numNodes = 1;
+        ASSERT_TRUE(replCoord->isCommitQuorumSatisfied(singleNodeCQ, commitReadyMembers));
+
+        CommitQuorumOptions vaildModeCQ;
+        vaildModeCQ.mode = "valid";
+        ASSERT_TRUE(replCoord->isCommitQuorumSatisfied(vaildModeCQ, commitReadyMembers));
+
+        CommitQuorumOptions majorityModeCQ;
+        majorityModeCQ.mode = "majority";
+        ASSERT_TRUE(replCoord->isCommitQuorumSatisfied(majorityModeCQ, commitReadyMembers));
+
+        CommitQuorumOptions allModeCQ;
+        allModeCQ.mode = "all";
+        ASSERT_TRUE(replCoord->isCommitQuorumSatisfied(allModeCQ, commitReadyMembers));
+
+        CommitQuorumOptions allNodesCQ;
+        allNodesCQ.numNodes = 5;
+        ASSERT_TRUE(replCoord->isCommitQuorumSatisfied(allNodesCQ, commitReadyMembers));
+    }
+
+    {
+        // Quorum contains arbiter.
+        std::vector<HostAndPort> commitReadyMembers{HostAndPort("node1", 101),
+                                                    HostAndPort("node2", 102),
+                                                    HostAndPort("node3", 103),
+                                                    HostAndPort("node5", 105)};
+
+        CommitQuorumOptions singleNodeCQ;
+        singleNodeCQ.numNodes = 1;
+        ASSERT_TRUE(replCoord->isCommitQuorumSatisfied(singleNodeCQ, commitReadyMembers));
+
+        CommitQuorumOptions vaildModeCQ;
+        vaildModeCQ.mode = "valid";
+        ASSERT_TRUE(replCoord->isCommitQuorumSatisfied(vaildModeCQ, commitReadyMembers));
+
+        CommitQuorumOptions majorityModeCQ;
+        majorityModeCQ.mode = "majority";
+        ASSERT_TRUE(replCoord->isCommitQuorumSatisfied(majorityModeCQ, commitReadyMembers));
+
+        CommitQuorumOptions allModeCQ;
+        allModeCQ.mode = "all";
+        ASSERT_FALSE(replCoord->isCommitQuorumSatisfied(allModeCQ, commitReadyMembers));
+
+        CommitQuorumOptions numNodesCQ;
+        numNodesCQ.numNodes = 4;
+        ASSERT_FALSE(replCoord->isCommitQuorumSatisfied(numNodesCQ, commitReadyMembers));
+    }
 }
 
 // TODO(schwerin): Unit test election id updating

@@ -181,8 +181,7 @@ Status ReplicationCoordinatorEmbedded::setFollowerMode(const MemberState&) {
     UASSERT_NOT_IMPLEMENTED;
 }
 
-Status ReplicationCoordinatorEmbedded::setFollowerModeStrict(OperationContext* opCtx,
-                                                             const MemberState&) {
+Status ReplicationCoordinatorEmbedded::setFollowerModeRollback(OperationContext* opCtx) {
     UASSERT_NOT_IMPLEMENTED;
 }
 
@@ -353,6 +352,10 @@ Status ReplicationCoordinatorEmbedded::doReplSetReconfig(OperationContext* opCtx
     UASSERT_NOT_IMPLEMENTED;
 }
 
+Status ReplicationCoordinatorEmbedded::awaitConfigCommitment(OperationContext* opCtx) {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
 Status ReplicationCoordinatorEmbedded::processReplSetInitiate(OperationContext*,
                                                               const BSONObj&,
                                                               BSONObjBuilder*) {
@@ -387,6 +390,11 @@ Status ReplicationCoordinatorEmbedded::checkIfWriteConcernCanBeSatisfied(
 
 Status ReplicationCoordinatorEmbedded::checkIfCommitQuorumCanBeSatisfied(
     const CommitQuorumOptions& commitQuorum) const {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
+bool ReplicationCoordinatorEmbedded::isCommitQuorumSatisfied(
+    const CommitQuorumOptions& commitQuorum, const std::vector<mongo::HostAndPort>& members) const {
     UASSERT_NOT_IMPLEMENTED;
 }
 
@@ -501,7 +509,7 @@ TopologyVersion ReplicationCoordinatorEmbedded::getTopologyVersion() const {
     UASSERT_NOT_IMPLEMENTED;
 }
 
-void ReplicationCoordinatorEmbedded::incrementTopologyVersion(OperationContext* opCtx) {
+void ReplicationCoordinatorEmbedded::incrementTopologyVersion() {
     UASSERT_NOT_IMPLEMENTED;
 }
 

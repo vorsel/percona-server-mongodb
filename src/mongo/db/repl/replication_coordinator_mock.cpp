@@ -296,9 +296,8 @@ Status ReplicationCoordinatorMock::setFollowerMode(const MemberState& newState) 
     return Status::OK();
 }
 
-Status ReplicationCoordinatorMock::setFollowerModeStrict(OperationContext* opCtx,
-                                                         const MemberState& newState) {
-    return setFollowerMode(newState);
+Status ReplicationCoordinatorMock::setFollowerModeRollback(OperationContext* opCtx) {
+    return setFollowerMode(MemberState::RS_ROLLBACK);
 }
 
 ReplicationCoordinator::ApplierState ReplicationCoordinatorMock::getApplierState() {
@@ -386,6 +385,10 @@ Status ReplicationCoordinatorMock::doReplSetReconfig(OperationContext* opCtx,
     return Status::OK();
 }
 
+Status ReplicationCoordinatorMock::awaitConfigCommitment(OperationContext* opCtx) {
+    return Status::OK();
+}
+
 Status ReplicationCoordinatorMock::processReplSetInitiate(OperationContext* opCtx,
                                                           const BSONObj& configObj,
                                                           BSONObjBuilder* resultObj) {
@@ -420,6 +423,11 @@ Status ReplicationCoordinatorMock::checkIfWriteConcernCanBeSatisfied(
 Status ReplicationCoordinatorMock::checkIfCommitQuorumCanBeSatisfied(
     const CommitQuorumOptions& commitQuorum) const {
     return Status::OK();
+}
+
+bool ReplicationCoordinatorMock::isCommitQuorumSatisfied(
+    const CommitQuorumOptions& commitQuorum, const std::vector<mongo::HostAndPort>& members) const {
+    return true;
 }
 
 WriteConcernOptions ReplicationCoordinatorMock::getGetLastErrorDefault() {
@@ -566,7 +574,7 @@ TopologyVersion ReplicationCoordinatorMock::getTopologyVersion() const {
     return TopologyVersion(repl::instanceId, 0);
 }
 
-void ReplicationCoordinatorMock::incrementTopologyVersion(OperationContext* opCtx) {
+void ReplicationCoordinatorMock::incrementTopologyVersion() {
     return;
 }
 

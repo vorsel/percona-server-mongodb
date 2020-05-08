@@ -89,6 +89,7 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/session_catalog_mongod.h"
+#include "mongo/db/storage/flow_control.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/system_index.h"
 #include "mongo/executor/network_connection_hook.h"
@@ -407,15 +408,15 @@ void ReplicationCoordinatorExternalStateImpl::shutdown(OperationContext* opCtx) 
     // _taskExecutor pointer never changes.
     _taskExecutor->join();
 
-    // Clear the truncate point if we are still primary, so nothing gets truncated unnecessarily on
-    // startup. There are no oplog holes on clean primary shutdown. Stepdown is similarly safe and
-    // clears the truncate point. The other replication states do need truncation if the truncate
-    // point is set: e.g. interruption mid batch application can leave oplog holes.
+    // The oplog truncate after point must be cleared, if we are still primary for shutdown, so
+    // nothing gets truncated unnecessarily on startup. There are no oplog holes on clean primary
+    // shutdown. Stepdown is similarly safe from holes and halts updates to and clears the truncate
+    // point. The other replication states do need truncation if the truncate point is set: e.g.
+    // interruption mid batch application can leave oplog holes.
     if (!storageGlobalParams.readOnly &&
         _replicationProcess->getConsistencyMarkers()
             ->isOplogTruncateAfterPointBeingUsedForPrimary()) {
-        _replicationProcess->getConsistencyMarkers()->setOplogTruncateAfterPoint(opCtx,
-                                                                                 Timestamp());
+        stopAsyncUpdatesOfAndClearOplogTruncateAfterPoint();
     }
 }
 
@@ -767,15 +768,13 @@ void ReplicationCoordinatorExternalStateImpl::shardingOnStepDownHook() {
     }
 }
 
-void ReplicationCoordinatorExternalStateImpl::clearOplogVisibilityStateForStepDown() {
+void ReplicationCoordinatorExternalStateImpl::stopAsyncUpdatesOfAndClearOplogTruncateAfterPoint() {
     auto opCtx = cc().getOperationContext();
     // Temporarily turn off flow control ticketing. Getting a ticket can stall on a ticket being
     // available, which may have to wait for the ticket refresher to run, which in turn blocks on
     // the repl _mutex to check whether we are primary or not: this is a deadlock because stepdown
     // already holds the repl _mutex!
-    auto originalFlowControlSetting = opCtx->shouldParticipateInFlowControl();
-    ON_BLOCK_EXIT([&] { opCtx->setShouldParticipateInFlowControl(originalFlowControlSetting); });
-    opCtx->setShouldParticipateInFlowControl(false);
+    FlowControl::Bypass flowControlBypass(opCtx);
 
     // Tell the system to stop updating the oplogTruncateAfterPoint asynchronously and to go back to
     // using last applied to update repl's durable timestamp instead of the truncate point.
@@ -878,7 +877,7 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook
         // ShardingStateRecovery::recover above, because they may trigger filtering metadata
         // refreshes which should use the recovered configOpTime.
         migrationutil::resubmitRangeDeletionsOnStepUp(_service);
-        migrationutil::resumeMigrationCoordinationsOnStepUp(_service);
+        migrationutil::resumeMigrationCoordinationsOnStepUp(opCtx);
 
     } else {  // unsharded
         if (auto validator = LogicalTimeValidator::get(_service)) {

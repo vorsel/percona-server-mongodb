@@ -38,6 +38,7 @@
 
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/document_validation.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/index/index_descriptor.h"
@@ -828,7 +829,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx) {
           "fromShard"_attr = _fromShard,
           "epoch"_attr = _epoch.toString(),
           "sessionId"_attr = *_sessionId,
-          "migrationId"_attr = _enableResumableRangeDeleter ? _migrationId.toBSON() : BSONObj());
+          "migrationId"_attr = _enableResumableRangeDeleter ? _migrationId->toBSON() : BSONObj());
 
     MoveTimingHelper timing(
         outerOpCtx, "to", _nss.ns(), _min, _max, 6 /* steps */, &_errmsg, _toShard, _fromShard);
@@ -839,7 +840,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx) {
         LOGV2_ERROR(22013,
                     "Migration abort requested before it started",
                     "migrationId"_attr =
-                        _enableResumableRangeDeleter ? _migrationId.toBSON() : BSONObj());
+                        _enableResumableRangeDeleter ? _migrationId->toBSON() : BSONObj());
         return;
     }
 
@@ -865,7 +866,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx) {
                       "nss_ns"_attr = _nss.ns(),
                       "range"_attr = redact(range.toString()),
                       "migrationId"_attr =
-                          _enableResumableRangeDeleter ? _migrationId.toBSON() : BSONObj());
+                          _enableResumableRangeDeleter ? _migrationId->toBSON() : BSONObj());
 
                 auto status = CollectionShardingRuntime::waitForClean(
                     outerOpCtx, _nss, donorCollectionOptionsAndIndexes.uuid, range);
@@ -878,7 +879,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx) {
                 outerOpCtx->sleepFor(Milliseconds(1000));
             }
 
-            RangeDeletionTask recipientDeletionTask(_migrationId,
+            RangeDeletionTask recipientDeletionTask(*_migrationId,
                                                     _nss,
                                                     donorCollectionOptionsAndIndexes.uuid,
                                                     _fromShard,
@@ -1008,7 +1009,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx) {
                                       "secondaryThrottle on, but doc insert timed out; "
                                       "continuing",
                                       "migrationId"_attr = _enableResumableRangeDeleter
-                                          ? _migrationId.toBSON()
+                                          ? _migrationId->toBSON()
                                           : BSONObj());
                     } else {
                         uassertStatusOK(replStatus.status);
@@ -1086,7 +1087,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx) {
                     LOGV2(22002,
                           "Migration aborted while waiting for replication at catch up stage",
                           "migrationId"_attr =
-                              _enableResumableRangeDeleter ? _migrationId.toBSON() : BSONObj());
+                              _enableResumableRangeDeleter ? _migrationId->toBSON() : BSONObj());
                     return;
                 }
 
@@ -1097,7 +1098,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx) {
                     LOGV2(22003,
                           "secondaries having hard time keeping up with migrate",
                           "migrationId"_attr =
-                              _enableResumableRangeDeleter ? _migrationId.toBSON() : BSONObj());
+                              _enableResumableRangeDeleter ? _migrationId->toBSON() : BSONObj());
                 }
 
                 sleepmillis(20);
@@ -1120,7 +1121,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx) {
         LOGV2(22004,
               "Waiting for replication to catch up before entering critical section",
               "migrationId"_attr =
-                  _enableResumableRangeDeleter ? _migrationId.toBSON() : BSONObj());
+                  _enableResumableRangeDeleter ? _migrationId->toBSON() : BSONObj());
 
         auto awaitReplicationResult = repl::ReplicationCoordinator::get(opCtx)->awaitReplication(
             opCtx, lastOpApplied, _writeConcern);
@@ -1130,7 +1131,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx) {
         LOGV2(22005,
               "Chunk data replicated successfully.",
               "migrationId"_attr =
-                  _enableResumableRangeDeleter ? _migrationId.toBSON() : BSONObj());
+                  _enableResumableRangeDeleter ? _migrationId->toBSON() : BSONObj());
     }
 
     {
@@ -1170,7 +1171,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx) {
                 LOGV2(22006,
                       "Migration aborted while transferring mods",
                       "migrationId"_attr =
-                          _enableResumableRangeDeleter ? _migrationId.toBSON() : BSONObj());
+                          _enableResumableRangeDeleter ? _migrationId->toBSON() : BSONObj());
                 return;
             }
 
@@ -1248,13 +1249,15 @@ bool MigrationDestinationManager::_applyMigrateOp(OperationContext* opCtx,
                 uassertStatusOK(rs->goingToDelete(fullObj));
             }
 
-            deleteObjects(opCtx,
-                          autoColl.getCollection(),
-                          _nss,
-                          id,
-                          true /* justOne */,
-                          false /* god */,
-                          true /* fromMigrate */);
+            writeConflictRetry(opCtx, "transferModsDeletes", _nss.ns(), [&] {
+                deleteObjects(opCtx,
+                              autoColl.getCollection(),
+                              _nss,
+                              id,
+                              true /* justOne */,
+                              false /* god */,
+                              true /* fromMigrate */);
+            });
 
             *lastOpApplied = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
             didAnything = true;
@@ -1296,15 +1299,18 @@ bool MigrationDestinationManager::_applyMigrateOp(OperationContext* opCtx,
                 LOGV2_WARNING(22012,
                               "{errMsg}",
                               "errMsg"_attr = errMsg,
-                              "migrationId"_attr =
-                                  _enableResumableRangeDeleter ? _migrationId.toBSON() : BSONObj());
+                              "migrationId"_attr = _enableResumableRangeDeleter
+                                  ? _migrationId->toBSON()
+                                  : BSONObj());
 
                 // Exception will abort migration cleanly
                 uasserted(16977, errMsg);
             }
 
             // We are in write lock here, so sure we aren't killing
-            Helpers::upsert(opCtx, _nss.ns(), updatedDoc, true);
+            writeConflictRetry(opCtx, "transferModsUpdates", _nss.ns(), [&] {
+                Helpers::upsert(opCtx, _nss.ns(), updatedDoc, true);
+            });
 
             *lastOpApplied = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
             didAnything = true;
@@ -1328,7 +1334,7 @@ bool MigrationDestinationManager::_flushPendingWrites(OperationContext* opCtx,
                   "max"_attr = redact(_max),
                   "op"_attr = op,
                   "migrationId"_attr =
-                      _enableResumableRangeDeleter ? _migrationId.toBSON() : BSONObj());
+                      _enableResumableRangeDeleter ? _migrationId->toBSON() : BSONObj());
         }
         return false;
     }
@@ -1338,7 +1344,7 @@ bool MigrationDestinationManager::_flushPendingWrites(OperationContext* opCtx,
           "nss_ns"_attr = _nss.ns(),
           "min"_attr = redact(_min),
           "max"_attr = redact(_max),
-          "migrationId"_attr = _enableResumableRangeDeleter ? _migrationId.toBSON() : BSONObj());
+          "migrationId"_attr = _enableResumableRangeDeleter ? _migrationId->toBSON() : BSONObj());
 
     return true;
 }

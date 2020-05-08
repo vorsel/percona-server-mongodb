@@ -68,6 +68,10 @@ boost::intrusive_ptr<Expression> ExpressionFunction::parse(
     BSONElement expr,
     const VariablesParseState& vps) {
 
+    uassert(4660800,
+            str::stream() << kExpressionName << " cannot be used inside a validator.",
+            !expCtx->isParsingCollectionValidator);
+
     uassert(31260,
             str::stream() << kExpressionName
                           << " requires an object as an argument, found: " << expr.type(),
@@ -111,6 +115,8 @@ Value ExpressionFunction::evaluate(const Document& root, Variables* variables) c
     auto jsExec = getExpressionContext()->getJsExecWithScope(_assignFirstArgToThis);
     auto scope = jsExec->getScope();
 
+    // createFunction is memoized in MozJSImplScope, so it's ok to call this for each
+    // eval call.
     ScriptingFunction func = jsExec->getScope()->createFunction(_funcSource.c_str());
     uassert(31265, "The body function did not evaluate", func);
 

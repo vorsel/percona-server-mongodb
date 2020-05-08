@@ -174,8 +174,7 @@ Status ReplicationCoordinatorNoOp::setFollowerMode(const MemberState&) {
     MONGO_UNREACHABLE;
 }
 
-Status ReplicationCoordinatorNoOp::setFollowerModeStrict(OperationContext* opCtx,
-                                                         const MemberState&) {
+Status ReplicationCoordinatorNoOp::setFollowerModeRollback(OperationContext* opCtx) {
     MONGO_UNREACHABLE;
 }
 
@@ -328,6 +327,10 @@ Status ReplicationCoordinatorNoOp::doReplSetReconfig(OperationContext* opCtx,
     MONGO_UNREACHABLE;
 }
 
+Status ReplicationCoordinatorNoOp::awaitConfigCommitment(OperationContext* opCtx) {
+    MONGO_UNREACHABLE;
+}
+
 Status ReplicationCoordinatorNoOp::processReplSetInitiate(OperationContext*,
                                                           const BSONObj&,
                                                           BSONObjBuilder*) {
@@ -362,6 +365,11 @@ Status ReplicationCoordinatorNoOp::checkIfWriteConcernCanBeSatisfied(
 
 Status ReplicationCoordinatorNoOp::checkIfCommitQuorumCanBeSatisfied(
     const CommitQuorumOptions& commitQuorum) const {
+    MONGO_UNREACHABLE;
+}
+
+bool ReplicationCoordinatorNoOp::isCommitQuorumSatisfied(
+    const CommitQuorumOptions& commitQuorum, const std::vector<mongo::HostAndPort>& members) const {
     MONGO_UNREACHABLE;
 }
 
@@ -475,7 +483,7 @@ TopologyVersion ReplicationCoordinatorNoOp::getTopologyVersion() const {
     MONGO_UNREACHABLE;
 }
 
-void ReplicationCoordinatorNoOp::incrementTopologyVersion(OperationContext* opCtx) {
+void ReplicationCoordinatorNoOp::incrementTopologyVersion() {
     MONGO_UNREACHABLE;
 }
 
