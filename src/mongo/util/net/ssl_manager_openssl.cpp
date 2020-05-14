@@ -97,6 +97,22 @@ using UniqueX509StoreCtx =
 
 using UniqueX509 = std::unique_ptr<X509, OpenSSLDeleter<decltype(X509_free), ::X509_free>>;
 
+// This deleter should be used when you have a stack of X509 objects that you own and that
+// needs to be deleted.
+struct X509StackDeleter {
+    void operator()(STACK_OF(X509) * chain) {
+        if (chain) {
+            sk_X509_pop_free(chain, X509_free);
+        }
+    }
+};
+
+// If we have an X509 Stack that is owned by an internal SSL Object, we need to use this
+// deleter.
+struct X509StackDeleterNoOp {
+    void operator()(STACK_OF(X509) * chain) {}
+};
+
 // Modulus for Diffie-Hellman parameter 'ffdhe3072' defined in RFC 7919
 constexpr std::array<std::uint8_t, 384> ffdhe3072_p = {
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xAD, 0xF8, 0x54, 0x58, 0xA2, 0xBB, 0x4A, 0x9A,
@@ -287,15 +303,7 @@ X509* X509_OBJECT_get0_X509(const X509_OBJECT* a) {
     return a->data.x509;
 }
 
-// On OpenSSL < 1.1.0, this chain isn't attached to
-// the SSL session, so we need it to dispose of itself.
-struct VerifiedChainDeleter {
-    void operator()(STACK_OF(X509) * chain) {
-        if (chain) {
-            sk_X509_pop_free(chain, X509_free);
-        }
-    }
-};
+using UniqueVerifiedChainPolyfill = std::unique_ptr<STACK_OF(X509), X509StackDeleter>;
 
 STACK_OF(X509) * SSL_get0_verified_chain(SSL* s) {
     auto* store = SSL_CTX_get_cert_store(SSL_get_SSL_CTX(s));
@@ -348,13 +356,10 @@ static int const NID_tlsfeature = OBJ_create(tlsFeatureOID.identifier.c_str(),
                                              tlsFeatureOID.longDescription.c_str());
 
 #else
-// No-op deleter for OpenSSL >= 1.1.0
-struct VerifiedChainDeleter {
-    void operator()(STACK_OF(X509) * chain) {}
-};
+using UniqueVerifiedChainPolyfill = std::unique_ptr<STACK_OF(X509), X509StackDeleterNoOp>;
+
 #endif
 
-using UniqueVerifiedChainPolyfill = std::unique_ptr<STACK_OF(X509), VerifiedChainDeleter>;
 UniqueVerifiedChainPolyfill SSLgetVerifiedChain(SSL* s) {
     return UniqueVerifiedChainPolyfill(SSL_get0_verified_chain(s));
 }
@@ -1365,8 +1370,9 @@ int SSLManagerOpenSSL::password_cb(char* buf, int num, int rwflag, void* userdat
     auto swPassword = pwFetcher->fetchPassword();
     if (!swPassword.isOK()) {
         LOGV2_ERROR(23239,
-                    "Unable to fetch password: {swPassword_getStatus}",
-                    "swPassword_getStatus"_attr = swPassword.getStatus());
+                    "Unable to fetch password: {status}",
+                    "Unable to fetch password",
+                    "status"_attr = swPassword.getStatus());
         return -1;
     }
     StringData password = std::move(swPassword.getValue());
@@ -1539,8 +1545,9 @@ int ocspClientCallback(SSL* ssl, void* arg) {
         if (swStapleOK.getStatus() == ErrorCodes::OCSPCertificateStatusRevoked) {
             LOGV2_DEBUG(23225,
                         1,
-                        "Stapled Certificate validation failed: {swStapleOK_getStatus_reason}",
-                        "swStapleOK_getStatus_reason"_attr = swStapleOK.getStatus().reason());
+                        "Stapled Certificate validation failed: {error}",
+                        "Stapled Certificate validation failed",
+                        "error"_attr = swStapleOK.getStatus());
             return OCSP_CLIENT_RESPONSE_NOT_ACCEPTABLE;
         }
 
@@ -1672,6 +1679,8 @@ Future<void> SSLManagerOpenSSL::ocspClientVerification(SSL* ssl, const ExecutorP
     return convert(std::move(semifuture)).onCompletion(validate).then(refetchIfInvalidAndReturn);
 }
 
+using StoreCtxVerifiedChain = std::unique_ptr<STACK_OF(X509), X509StackDeleter>;
+
 #if OPENSSL_VERSION_NUMBER >= 0x10002000L
 Status SSLManagerOpenSSL::stapleOCSPResponse(SSL_CTX* context) {
     if (MONGO_unlikely(disableStapling.shouldFail()) || !tlsOCSPEnabled) {
@@ -1691,14 +1700,26 @@ Status SSLManagerOpenSSL::stapleOCSPResponse(SSL_CTX* context) {
     }
 
     auto fetchAndStaple = [context, cert]() -> Future<Milliseconds> {
-        STACK_OF(X509) * intermediateCertsPtr;
-
-        if (SSL_CTX_get0_chain_certs(context, &intermediateCertsPtr) == 0) {
-            return getSSLFailure("Could not get chain for SSL Context.");
+        // Generate a new verified X509StoreContext to get our own certificate chain
+        UniqueX509StoreCtx storeCtx(X509_STORE_CTX_new());
+        if (!storeCtx) {
+            return getSSLFailure("Could not create X509 store.");
         }
 
-        UniqueVerifiedChainPolyfill intermediateCerts(intermediateCertsPtr);
+        if (X509_STORE_CTX_init(storeCtx.get(), SSL_CTX_get_cert_store(context), NULL, NULL) == 0) {
+            return getSSLFailure("Could not initialize the X509 Store Context.");
+        }
 
+        X509_STORE_CTX_set_cert(storeCtx.get(), cert);
+
+        if (X509_verify_cert(storeCtx.get()) <= 0) {
+            return getSSLFailure("Could not verify X509 certificate store for OCSP Stapling.");
+        }
+
+        // Extract the chain from the verified X509StoreCtx
+        StoreCtxVerifiedChain intermediateCerts(X509_STORE_CTX_get1_chain(storeCtx.get()));
+
+        // Continue with OCSP Stapling logic
         auto swOCSPContext = extractOcspUris(context, cert, intermediateCerts.get());
         if (!swOCSPContext.isOK()) {
             LOGV2_WARNING(23232, "Could not staple OCSP response to outgoing certificate.");
@@ -1932,10 +1953,10 @@ Status SSLManagerOpenSSL::initSSLContext(SSL_CTX* context,
             UniqueDHParams dhparams = makeDefaultDHParameters();
 
             if (!dhparams || SSL_CTX_set_tmp_dh(context, dhparams.get()) != 1) {
-                LOGV2_ERROR(
-                    23240,
-                    "Failed to set default DH parameters: {getSSLErrorMessage_ERR_get_error}",
-                    "getSSLErrorMessage_ERR_get_error"_attr = getSSLErrorMessage(ERR_get_error()));
+                LOGV2_ERROR(23240,
+                            "Failed to set default DH parameters: {error}",
+                            "Failed to set default DH parameters",
+                            "error"_attr = getSSLErrorMessage(ERR_get_error()));
             }
         }
     }
@@ -1964,18 +1985,19 @@ bool SSLManagerOpenSSL::_parseAndValidateCertificate(const std::string& keyFile,
     BIO* inBIO = BIO_new(BIO_s_file());
     if (inBIO == nullptr) {
         LOGV2_ERROR(23243,
-                    "failed to allocate BIO object: {getSSLErrorMessage_ERR_get_error}",
-                    "getSSLErrorMessage_ERR_get_error"_attr = getSSLErrorMessage(ERR_get_error()));
+                    "failed to allocate BIO object: {error}",
+                    "Failed to allocate BIO object",
+                    "error"_attr = getSSLErrorMessage(ERR_get_error()));
         return false;
     }
 
     ON_BLOCK_EXIT([&] { BIO_free(inBIO); });
     if (BIO_read_filename(inBIO, keyFile.c_str()) <= 0) {
         LOGV2_ERROR(23244,
-                    "cannot read key file when setting subject name: {keyFile} "
-                    "{getSSLErrorMessage_ERR_get_error}",
+                    "cannot read key file when setting subject name: {keyFile} {error}",
+                    "Cannot read key file when setting subject name",
                     "keyFile"_attr = keyFile,
-                    "getSSLErrorMessage_ERR_get_error"_attr = getSSLErrorMessage(ERR_get_error()));
+                    "error"_attr = getSSLErrorMessage(ERR_get_error()));
         return false;
     }
 
@@ -1983,10 +2005,10 @@ bool SSLManagerOpenSSL::_parseAndValidateCertificate(const std::string& keyFile,
         inBIO, nullptr, &SSLManagerOpenSSL::password_cb, static_cast<void*>(&keyPassword));
     if (x509 == nullptr) {
         LOGV2_ERROR(23245,
-                    "cannot retrieve certificate from keyfile: {keyFile} "
-                    "{getSSLErrorMessage_ERR_get_error}",
+                    "cannot retrieve certificate from keyfile: {keyFile} {error}",
+                    "Cannot retrieve certificate from keyfile",
                     "keyFile"_attr = keyFile,
-                    "getSSLErrorMessage_ERR_get_error"_attr = getSSLErrorMessage(ERR_get_error()));
+                    "error"_attr = getSSLErrorMessage(ERR_get_error()));
         return false;
     }
     ON_BLOCK_EXIT([&] { X509_free(x509); });
@@ -2006,8 +2028,7 @@ bool SSLManagerOpenSSL::_parseAndValidateCertificate(const std::string& keyFile,
         }
 
         if ((notBeforeMillis > Date_t::now()) || (Date_t::now() > notAfterMillis)) {
-            LOGV2_FATAL(23875, "The provided SSL certificate is expired or not yet valid.");
-            fassertFailedNoTrace(28652);
+            LOGV2_FATAL_NOTRACE(28652, "The provided SSL certificate is expired or not yet valid.");
         }
 
         *serverCertificateExpirationDate = notAfterMillis;
@@ -2021,26 +2042,29 @@ bool SSLManagerOpenSSL::_setupPEM(SSL_CTX* context,
                                   PasswordFetcher* password) {
     if (SSL_CTX_use_certificate_chain_file(context, keyFile.c_str()) != 1) {
         LOGV2_ERROR(23248,
-                    "cannot read certificate file: {keyFile} {getSSLErrorMessage_ERR_get_error}",
+                    "cannot read certificate file: {keyFile} {error}",
+                    "Cannot read certificate file",
                     "keyFile"_attr = keyFile,
-                    "getSSLErrorMessage_ERR_get_error"_attr = getSSLErrorMessage(ERR_get_error()));
+                    "error"_attr = getSSLErrorMessage(ERR_get_error()));
         return false;
     }
 
     BIO* inBio = BIO_new(BIO_s_file());
     if (!inBio) {
         LOGV2_ERROR(23249,
-                    "failed to allocate BIO object: {getSSLErrorMessage_ERR_get_error}",
-                    "getSSLErrorMessage_ERR_get_error"_attr = getSSLErrorMessage(ERR_get_error()));
+                    "failed to allocate BIO object: {error}",
+                    "Failed to allocate BIO object",
+                    "error"_attr = getSSLErrorMessage(ERR_get_error()));
         return false;
     }
     const auto bioGuard = makeGuard([&inBio]() { BIO_free(inBio); });
 
     if (BIO_read_filename(inBio, keyFile.c_str()) <= 0) {
         LOGV2_ERROR(23250,
-                    "cannot read PEM key file: {keyFile} {getSSLErrorMessage_ERR_get_error}",
+                    "cannot read PEM key file: {keyFile} {error}",
+                    "Cannot read PEM key file",
                     "keyFile"_attr = keyFile,
-                    "getSSLErrorMessage_ERR_get_error"_attr = getSSLErrorMessage(ERR_get_error()));
+                    "error"_attr = getSSLErrorMessage(ERR_get_error()));
         return false;
     }
 
@@ -2050,26 +2074,29 @@ bool SSLManagerOpenSSL::_setupPEM(SSL_CTX* context,
     EVP_PKEY* privateKey = PEM_read_bio_PrivateKey(inBio, nullptr, password_cb, userdata);
     if (!privateKey) {
         LOGV2_ERROR(23251,
-                    "cannot read PEM key file: {keyFile} {getSSLErrorMessage_ERR_get_error}",
+                    "cannot read PEM key file: {keyFile} {error}",
+                    "Cannot read PEM key file",
                     "keyFile"_attr = keyFile,
-                    "getSSLErrorMessage_ERR_get_error"_attr = getSSLErrorMessage(ERR_get_error()));
+                    "error"_attr = getSSLErrorMessage(ERR_get_error()));
         return false;
     }
     const auto privateKeyGuard = makeGuard([&privateKey]() { EVP_PKEY_free(privateKey); });
 
     if (SSL_CTX_use_PrivateKey(context, privateKey) != 1) {
         LOGV2_ERROR(23252,
-                    "cannot use PEM key file: {keyFile} {getSSLErrorMessage_ERR_get_error}",
+                    "cannot use PEM key file: {keyFile} {error}",
+                    "Cannot use PEM key file",
                     "keyFile"_attr = keyFile,
-                    "getSSLErrorMessage_ERR_get_error"_attr = getSSLErrorMessage(ERR_get_error()));
+                    "error"_attr = getSSLErrorMessage(ERR_get_error()));
         return false;
     }
 
     // Verify that the certificate and the key go together.
     if (SSL_CTX_check_private_key(context) != 1) {
         LOGV2_ERROR(23253,
-                    "SSL certificate validation: {getSSLErrorMessage_ERR_get_error}",
-                    "getSSLErrorMessage_ERR_get_error"_attr = getSSLErrorMessage(ERR_get_error()));
+                    "SSL certificate validation failed: {error}",
+                    "SSL certificate validation failed",
+                    "error"_attr = getSSLErrorMessage(ERR_get_error()));
         return false;
     }
 
@@ -2136,15 +2163,22 @@ bool SSLManagerOpenSSL::_setupCRL(SSL_CTX* context, const std::string& crlFile) 
     int status = X509_load_crl_file(lookup, crlFile.c_str(), X509_FILETYPE_PEM);
     if (status == 0) {
         LOGV2_ERROR(23254,
-                    "cannot read CRL file: {crlFile} {getSSLErrorMessage_ERR_get_error}",
+                    "cannot read CRL file: {crlFile} {error}",
+                    "Cannot read CRL file",
                     "crlFile"_attr = crlFile,
-                    "getSSLErrorMessage_ERR_get_error"_attr = getSSLErrorMessage(ERR_get_error()));
+                    "error"_attr = getSSLErrorMessage(ERR_get_error()));
         return false;
     }
-    LOGV2(23227,
-          "ssl imported {status} revoked certificate{status_1_s} from the revocation list.",
-          "status"_attr = status,
-          "status_1_s"_attr = ((status == 1) ? "" : "s"));
+
+    if (status == 1) {
+        LOGV2(4652601, "ssl imported 1 revoked certificate from the revocation list.");
+    } else {
+        LOGV2(4652602,
+              "ssl imported {numberCerts} revoked certificates from the revocation list",
+              "SSL imported revoked certificates from the revocation list",
+              "numberCerts"_attr = status);
+    }
+
     return true;
 }
 
@@ -2363,13 +2397,17 @@ Future<SSLPeerInfo> SSLManagerOpenSSL::parseAndValidatePeerCertificate(
         if (_weakValidation) {
             // do not give warning if certificate warnings are  suppressed
             if (!_suppressNoCertificateWarning) {
-                LOGV2_WARNING(23234, "no SSL certificate provided by peer");
+                LOGV2_WARNING(23234,
+                              "no SSL certificate provided by peer",
+                              "No SSL certificate provided by peer");
             }
             return SSLPeerInfo(sni);
         } else {
-            auto msg = "no SSL certificate provided by peer; connection rejected";
-            LOGV2_ERROR(23255, "{msg}", "msg"_attr = msg);
-            return Status(ErrorCodes::SSLHandshakeFailed, msg);
+            LOGV2_ERROR(23255,
+                        "no SSL certificate provided by peer; connection rejected",
+                        "No SSL certificate provided by peer; connection rejected");
+            return Status(ErrorCodes::SSLHandshakeFailed,
+                          "no SSL certificate provided by peer; connection rejected");
         }
     }
     ON_BLOCK_EXIT([&] { X509_free(peerCert); });
@@ -2378,17 +2416,19 @@ Future<SSLPeerInfo> SSLManagerOpenSSL::parseAndValidatePeerCertificate(
 
     if (result != X509_V_OK) {
         if (_allowInvalidCertificates) {
-            LOGV2_WARNING(
-                23235,
-                "SSL peer certificate validation failed: {X509_verify_cert_error_string_result}",
-                "X509_verify_cert_error_string_result"_attr =
-                    X509_verify_cert_error_string(result));
+            LOGV2_WARNING(23235,
+                          "SSL peer certificate validation failed: {reason}",
+                          "SSL peer certificate validation failed",
+                          "reason"_attr = X509_verify_cert_error_string(result));
             return SSLPeerInfo(sni);
         } else {
             str::stream msg;
             msg << "SSL peer certificate validation failed: "
                 << X509_verify_cert_error_string(result);
-            LOGV2_ERROR(23256, "{msg_ss_str}", "msg_ss_str"_attr = msg.ss.str());
+            LOGV2_ERROR(23256,
+                        "{error}",
+                        "SSL peer certificate validation failed",
+                        "error"_attr = msg.ss.str());
             return Status(ErrorCodes::SSLHandshakeFailed, msg);
         }
     }
@@ -2407,6 +2447,7 @@ Future<SSLPeerInfo> SSLManagerOpenSSL::parseAndValidatePeerCertificate(
     LOGV2_DEBUG(23229,
                 2,
                 "Accepted TLS connection from peer: {peerSubject}",
+                "Accepted TLS connection from peer",
                 "peerSubject"_attr = peerSubject);
 
     StatusWith<stdx::unordered_set<RoleName>> swPeerCertificateRoles = _parsePeerRoles(peerCert);
@@ -2543,10 +2584,21 @@ Future<SSLPeerInfo> SSLManagerOpenSSL::parseAndValidatePeerCertificate(
         msgBuilder << "The server certificate does not match the host name. Hostname: "
                    << remoteHost << " does not match " << certificateNames.str();
         std::string msg = msgBuilder.str();
+
         if (_allowInvalidCertificates || _allowInvalidHostnames || isUnixDomainSocket(remoteHost)) {
-            LOGV2_WARNING(23238, "{msg}", "msg"_attr = msg);
+            LOGV2_WARNING(23238,
+                          "The server certificate does not match the host name. Hostname: "
+                          "{remoteHost} does not match {certificateNames}",
+                          "The server certificate does not match the remote host name",
+                          "remoteHost"_attr = remoteHost,
+                          "certificateNames"_attr = certificateNames.str());
         } else {
-            LOGV2_ERROR(23257, "{msg}", "msg"_attr = msg);
+            LOGV2_ERROR(23257,
+                        "The server certificate does not match the host name. Hostname: "
+                        "{remoteHost} does not match {certificateNames}",
+                        "The server certificate does not match the remote host name",
+                        "remoteHost"_attr = remoteHost,
+                        "certificateNames"_attr = certificateNames.str());
             return Future<SSLPeerInfo>::makeReady(Status(ErrorCodes::SSLHandshakeFailed, msg));
         }
     }
@@ -2640,8 +2692,10 @@ void SSLManagerOpenSSL::_handleSSLError(SSLConnectionOpenSSL* conn, int ret) {
             // manner.
             errToThrow = (code == SSL_ERROR_WANT_READ) ? SocketErrorKind::RECV_ERROR
                                                        : SocketErrorKind::SEND_ERROR;
-            LOGV2_ERROR(
-                23258, "SSL: {code}, possibly timed out during connect", "code"_attr = code);
+            LOGV2_ERROR(23258,
+                        "SSL: {error}, possibly timed out during connect",
+                        "SSL: possibly timed out during connect",
+                        "error"_attr = code);
             break;
 
         case SSL_ERROR_ZERO_RETURN:
@@ -2653,21 +2707,19 @@ void SSLManagerOpenSSL::_handleSSLError(SSLConnectionOpenSSL* conn, int ret) {
             // If ERR_get_error returned 0, the error queue is empty
             // check the return value of the actual SSL operation
             if (err != 0) {
-                LOGV2_ERROR(23260,
-                            "SSL: {getSSLErrorMessage_err}",
-                            "getSSLErrorMessage_err"_attr = getSSLErrorMessage(err));
+                LOGV2_ERROR(
+                    23260, "SSL: {error}", "SSL error", "error"_attr = getSSLErrorMessage(err));
             } else if (ret == 0) {
                 LOGV2_ERROR(23261, "Unexpected EOF encountered during SSL communication");
             } else {
                 LOGV2_ERROR(23262,
-                            "The SSL BIO reported an I/O error {errnoWithDescription}",
-                            "errnoWithDescription"_attr = errnoWithDescription());
+                            "The SSL BIO reported an I/O error {error}",
+                            "The SSL BIO reported an I/O error",
+                            "error"_attr = errnoWithDescription());
             }
             break;
         case SSL_ERROR_SSL: {
-            LOGV2_ERROR(23263,
-                        "SSL: {getSSLErrorMessage_err}",
-                        "getSSLErrorMessage_err"_attr = getSSLErrorMessage(err));
+            LOGV2_ERROR(23263, "SSL: {error}", "SSL error", "error"_attr = getSSLErrorMessage(err));
             break;
         }
 

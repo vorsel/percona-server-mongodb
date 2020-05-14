@@ -1046,9 +1046,10 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
         // the normal path without the journal.
         if (boost::filesystem::exists(journalPath)) {
             string config = ss.str();
-            LOGV2(22313, "Detected WT journal files.  Running recovery from last checkpoint.");
-            LOGV2(
-                22314, "journal to nojournal transition config: {config}", "config"_attr = config);
+            LOGV2(22313,
+                  "Detected WT journal files. Running recovery from last checkpoint. journal to "
+                  "nojournal transition config",
+                  "config"_attr = config);
             int ret = wiredtiger_open(
                 path.c_str(), _eventHandler.getWtEventHandler(), config.c_str(), &_conn);
             if (ret == EINVAL) {
@@ -1074,7 +1075,7 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
     }
 
     string config = ss.str();
-    LOGV2(22315, "wiredtiger_open config: {config}", "config"_attr = config);
+    LOGV2(22315, "wiredtiger_open config", "config"_attr = config);
     _openWiredTiger(path, config);
     _eventHandler.setStartupSuccessful();
     _wtOpenConfig = config;
@@ -1088,7 +1089,7 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
         _recoveryTimestamp = Timestamp(tmp);
         LOGV2_FOR_RECOVERY(23987,
                            0,
-                           "WiredTiger recoveryTimestamp. Ts: {recoveryTimestamp}",
+                           "WiredTiger recoveryTimestamp",
                            "recoveryTimestamp"_attr = _recoveryTimestamp);
     }
 
@@ -1194,6 +1195,21 @@ void WiredTigerKVEngine::_openWiredTiger(const std::string& path, const std::str
         return;
     }
 
+    if (_eventHandler.isWtIncompatible()) {
+        // WT 4.4+ will refuse to startup on datafiles left behind by 4.0 and earlier. This behavior
+        // is enforced outside of `require_min`. This condition is detected via a specific error
+        // message from WiredTiger.
+        if (_inRepairMode) {
+            // In case this process was started with `--repair`, remove the "repair incomplete"
+            // file.
+            StorageRepairObserver::get(getGlobalServiceContext())->onRepairDone(nullptr);
+        }
+        LOGV2_FATAL(46712005,
+                    "This version of MongoDB is too recent to start up on the existing data files. "
+                    "Try MongoDB 4.2 or earlier.");
+        fassertFailedNoTrace(46712006);
+    }
+
     // MongoDB 4.4 doing clean shutdown in FCV 4.2 will use compatibility version 3.3.
     configStr = wtOpenConfig + ",compatibility=(require_min=\"3.3.0\")";
     ret = wiredtiger_open(path.c_str(), wtEventHandler, configStr.c_str(), &_conn);
@@ -1210,29 +1226,25 @@ void WiredTigerKVEngine::_openWiredTiger(const std::string& path, const std::str
         return;
     }
 
-    LOGV2_WARNING(22347, "Failed to start up WiredTiger under any compatibility version.");
+    LOGV2_WARNING(22347,
+                  "Failed to start up WiredTiger under any compatibility version. This may be due "
+                  "to an unsupported upgrade or downgrade.");
     if (ret == EINVAL) {
         fassertFailedNoTrace(28561);
     }
 
     if (ret == WT_TRY_SALVAGE) {
         LOGV2_WARNING(22348, "WiredTiger metadata corruption detected");
-
         if (!_inRepairMode) {
-            LOGV2_FATAL(22362, "{kWTRepairMsg}", "kWTRepairMsg"_attr = kWTRepairMsg);
-            fassertFailedNoTrace(50944);
+            LOGV2_FATAL_NOTRACE(50944, kWTRepairMsg);
         }
     }
 
-    LOGV2_FATAL(22363,
-                "Reason: {wtRCToStatus_ret_reason}",
-                "wtRCToStatus_ret_reason"_attr = wtRCToStatus(ret).reason());
     if (!_inRepairMode) {
-        fassertFailedNoTrace(28595);
+        LOGV2_FATAL_NOTRACE(28595, "Terminating.", "Reason"_attr = wtRCToStatus(ret).reason());
     }
 
     // Always attempt to salvage metadata regardless of error code when in repair mode.
-
     LOGV2_WARNING(22349, "Attempting to salvage WiredTiger metadata");
     configStr = wtOpenConfig + ",salvage=true";
     ret = wiredtiger_open(path.c_str(), wtEventHandler, configStr.c_str(), &_conn);
@@ -1242,11 +1254,9 @@ void WiredTigerKVEngine::_openWiredTiger(const std::string& path, const std::str
         return;
     }
 
-    LOGV2_FATAL(22364,
-                "{Failed_to_salvage_WiredTiger_metadata_wtRCToStatus_ret_reason}",
-                "Failed_to_salvage_WiredTiger_metadata_wtRCToStatus_ret_reason"_attr =
-                    "Failed to salvage WiredTiger metadata: " + wtRCToStatus(ret).reason());
-    fassertFailedNoTrace(50947);
+    LOGV2_FATAL_NOTRACE(50947,
+                        "Failed to salvage WiredTiger metadata.",
+                        "Details"_attr = wtRCToStatus(ret).reason());
 }
 
 void WiredTigerKVEngine::cleanShutdown() {
@@ -2734,8 +2744,7 @@ bool WiredTigerKVEngine::_canRecoverToStableTimestamp() const {
 
 StatusWith<Timestamp> WiredTigerKVEngine::recoverToStableTimestamp(OperationContext* opCtx) {
     if (!supportsRecoverToStableTimestamp()) {
-        LOGV2_FATAL(22365, "WiredTiger is configured to not support recover to a stable timestamp");
-        fassertFailed(50665);
+        LOGV2_FATAL(50665, "WiredTiger is configured to not support recover to a stable timestamp");
     }
 
     if (!_canRecoverToStableTimestamp()) {
@@ -2822,9 +2831,8 @@ Timestamp WiredTigerKVEngine::getOldestOpenReadTimestamp() const {
 
 boost::optional<Timestamp> WiredTigerKVEngine::getRecoveryTimestamp() const {
     if (!supportsRecoveryTimestamp()) {
-        LOGV2_FATAL(22366,
+        LOGV2_FATAL(50745,
                     "WiredTiger is configured to not support providing a recovery timestamp");
-        fassertFailed(50745);
     }
 
     if (_recoveryTimestamp.isNull()) {

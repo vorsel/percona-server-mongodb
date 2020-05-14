@@ -712,7 +712,7 @@ public:
      *  (1) The current config has propagated to a majority of nodes.
      *  (2) Any operations committed in the previous config are committed in the current config.
      */
-    virtual Status awaitConfigCommitment(OperationContext* opCtx) = 0;
+    virtual Status awaitConfigCommitment(OperationContext* opCtx, bool waitForOplogCommitment) = 0;
 
     /*
      * Handles an incoming replSetInitiate command. If "configObj" is empty, generates a default
@@ -748,13 +748,6 @@ public:
      * "durablyWritten" indicates whether the operation has to be durably applied.
      */
     virtual std::vector<HostAndPort> getHostsWrittenTo(const OpTime& op, bool durablyWritten) = 0;
-
-    /**
-     * Returns a vector of the members other than ourself in the replica set, as specified in
-     * the replica set config.  Invalid to call if we are not in replica set mode.  Returns
-     * an empty vector if we do not have a valid config.
-     */
-    virtual std::vector<HostAndPort> getOtherNodesInReplSet() const = 0;
 
     /**
      * Returns a BSONObj containing a representation of the current default write concern.

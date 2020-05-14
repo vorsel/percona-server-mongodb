@@ -385,7 +385,8 @@ Status ReplicationCoordinatorMock::doReplSetReconfig(OperationContext* opCtx,
     return Status::OK();
 }
 
-Status ReplicationCoordinatorMock::awaitConfigCommitment(OperationContext* opCtx) {
+Status ReplicationCoordinatorMock::awaitConfigCommitment(OperationContext* opCtx,
+                                                         bool waitForOplogCommitment) {
     return Status::OK();
 }
 
@@ -408,10 +409,6 @@ bool ReplicationCoordinatorMock::buildsIndexes() {
 
 std::vector<HostAndPort> ReplicationCoordinatorMock::getHostsWrittenTo(const OpTime& op,
                                                                        bool durablyWritten) {
-    return std::vector<HostAndPort>();
-}
-
-std::vector<HostAndPort> ReplicationCoordinatorMock::getOtherNodesInReplSet() const {
     return std::vector<HostAndPort>();
 }
 
@@ -454,10 +451,9 @@ bool ReplicationCoordinatorMock::lastOpTimesWereReset() const {
     return _resetLastOpTimesCalled;
 }
 
-bool ReplicationCoordinatorMock::shouldChangeSyncSource(
-    const HostAndPort& currentSource,
-    const rpc::ReplSetMetadata& replMetadata,
-    boost::optional<rpc::OplogQueryMetadata> oqMetadata) {
+bool ReplicationCoordinatorMock::shouldChangeSyncSource(const HostAndPort& currentSource,
+                                                        const rpc::ReplSetMetadata& replMetadata,
+                                                        const rpc::OplogQueryMetadata& oqMetadata) {
     MONGO_UNREACHABLE;
 }
 

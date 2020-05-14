@@ -352,7 +352,8 @@ Status ReplicationCoordinatorEmbedded::doReplSetReconfig(OperationContext* opCtx
     UASSERT_NOT_IMPLEMENTED;
 }
 
-Status ReplicationCoordinatorEmbedded::awaitConfigCommitment(OperationContext* opCtx) {
+Status ReplicationCoordinatorEmbedded::awaitConfigCommitment(OperationContext* opCtx,
+                                                             bool waitForOplogCommitment) {
     UASSERT_NOT_IMPLEMENTED;
 }
 
@@ -376,10 +377,6 @@ Status ReplicationCoordinatorEmbedded::processReplSetUpdatePosition(const Update
 }
 
 std::vector<HostAndPort> ReplicationCoordinatorEmbedded::getHostsWrittenTo(const OpTime&, bool) {
-    UASSERT_NOT_IMPLEMENTED;
-}
-
-std::vector<HostAndPort> ReplicationCoordinatorEmbedded::getOtherNodesInReplSet() const {
     UASSERT_NOT_IMPLEMENTED;
 }
 
@@ -414,8 +411,9 @@ void ReplicationCoordinatorEmbedded::resetLastOpTimesFromOplog(OperationContext*
     UASSERT_NOT_IMPLEMENTED;
 }
 
-bool ReplicationCoordinatorEmbedded::shouldChangeSyncSource(
-    const HostAndPort&, const rpc::ReplSetMetadata&, boost::optional<rpc::OplogQueryMetadata>) {
+bool ReplicationCoordinatorEmbedded::shouldChangeSyncSource(const HostAndPort&,
+                                                            const rpc::ReplSetMetadata&,
+                                                            const rpc::OplogQueryMetadata&) {
     UASSERT_NOT_IMPLEMENTED;
 }
 

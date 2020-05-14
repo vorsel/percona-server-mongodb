@@ -79,12 +79,11 @@ void initializeStorageEngine(ServiceContext* service, const StorageEngineInitFla
         if (storageGlobalParams.repair) {
             repairObserver->onRepairStarted();
         } else if (repairObserver->isIncomplete()) {
-            LOGV2_FATAL(
-                22272,
+            LOGV2_FATAL_NOTRACE(
+                50922,
                 "An incomplete repair has been detected! This is likely because a repair "
                 "operation unexpectedly failed before completing. MongoDB will not start up "
                 "again without --repair.");
-            fassertFailedNoTrace(50922);
         }
     }
 
@@ -106,13 +105,10 @@ void initializeStorageEngine(ServiceContext* service, const StorageEngineInitFla
             }
         } else {
             // Otherwise set the active storage engine as the contents of the metadata file.
-            LOGV2(
-                22270,
-                "Detected data files in {dbpath} created by the '{existingStorageEngine}' storage "
-                "engine, so setting the active storage engine to '{existingStorageEngine2}'.",
-                "dbpath"_attr = dbpath,
-                "existingStorageEngine"_attr = *existingStorageEngine,
-                "existingStorageEngine2"_attr = *existingStorageEngine);
+            LOGV2(22270,
+                  "Storage engine to use detected by data files",
+                  "dbpath"_attr = boost::filesystem::path(dbpath).generic_string(),
+                  "storageEngine"_attr = *existingStorageEngine);
             storageGlobalParams.engine = *existingStorageEngine;
         }
     }
@@ -216,14 +212,13 @@ void createLockFile(ServiceContext* service) {
 
     if (wasUnclean) {
         if (storageGlobalParams.readOnly) {
-            LOGV2_FATAL(22273,
-                        "Attempted to open dbpath in readOnly mode, but the server was "
-                        "previously not shut down cleanly.");
-            fassertFailedNoTrace(34416);
+            LOGV2_FATAL_NOTRACE(34416,
+                                "Attempted to open dbpath in readOnly mode, but the server was "
+                                "previously not shut down cleanly.");
         }
         LOGV2_WARNING(22271,
-                      "Detected unclean shutdown - {lockFile_getFilespec} is not empty.",
-                      "lockFile_getFilespec"_attr = lockFile->getFilespec());
+                      "Detected unclean shutdown - Lock file is not empty.",
+                      "lockFile"_attr = lockFile->getFilespec());
         startingAfterUncleanShutdown(service) = true;
     }
 }

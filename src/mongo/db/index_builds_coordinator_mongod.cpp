@@ -58,8 +58,9 @@ using namespace indexbuildentryhelpers;
 namespace {
 
 MONGO_FAIL_POINT_DEFINE(hangBeforeInitializingIndexBuild);
-MONGO_FAIL_POINT_DEFINE(hangBeforeSendingCommitQuorumVote);
 MONGO_FAIL_POINT_DEFINE(hangAfterInitializingIndexBuild);
+
+const StringData kMaxNumActiveUserIndexBuildsServerParameterName = "maxNumActiveUserIndexBuilds"_sd;
 
 /**
  * Constructs the options for the loader thread pool.
@@ -68,10 +69,13 @@ ThreadPool::Options makeDefaultThreadPoolOptions() {
     ThreadPool::Options options;
     options.poolName = "IndexBuildsCoordinatorMongod";
     options.minThreads = 0;
-    // We depend on thread pool sizes being equal between primaries and secondaries. If a secondary
-    // has fewer resources than a primary, index build oplog entries can replicate in an order that
-    // the secondary is unable to fulfill, leading to deadlocks. See SERVER-44250.
-    options.maxThreads = 3;
+    // Both the primary and secondary nodes will have an unlimited thread pool size. This is done to
+    // allow secondary nodes to startup as many index builders as necessary in order to prevent
+    // scheduling deadlocks during initial sync or oplog application. When commands are run from
+    // user connections that need to create indexes, those commands will hang until there are less
+    // than 'maxNumActiveUserIndexBuilds' running index build threads, or until the operation is
+    // interrupted.
+    options.maxThreads = ThreadPool::Options::kUnlimited;
 
     // Ensure all threads have a client.
     options.onCreateThread = [](const std::string& threadName) {
@@ -86,10 +90,18 @@ ThreadPool::Options makeDefaultThreadPoolOptions() {
 IndexBuildsCoordinatorMongod::IndexBuildsCoordinatorMongod()
     : _threadPool(makeDefaultThreadPoolOptions()) {
     _threadPool.startup();
-}
-IndexBuildsCoordinatorMongod::IndexBuildsCoordinatorMongod(ThreadPool::Options options)
-    : _threadPool(std::move(options)) {
-    _threadPool.startup();
+
+    // Change the 'setOnUpdate' function for the server parameter to signal the condition variable
+    // when the value changes.
+    ServerParameter* serverParam =
+        ServerParameterSet::getGlobal()->get(kMaxNumActiveUserIndexBuildsServerParameterName);
+    static_cast<
+        IDLServerParameterWithStorage<ServerParameterType::kStartupAndRuntime, AtomicWord<int>>*>(
+        serverParam)
+        ->setOnUpdate([this](const int) -> Status {
+            _indexBuildFinished.notify_all();
+            return Status::OK();
+        });
 }
 
 void IndexBuildsCoordinatorMongod::shutdown() {
@@ -111,6 +123,55 @@ IndexBuildsCoordinatorMongod::startIndexBuild(OperationContext* opCtx,
                                               const UUID& buildUUID,
                                               IndexBuildProtocol protocol,
                                               IndexBuildOptions indexBuildOptions) {
+    const NamespaceStringOrUUID nssOrUuid{dbName, collectionUUID};
+
+    {
+        // Only operations originating from user connections need to wait while there are more than
+        // 'maxNumActiveUserIndexBuilds' index builds currently running.
+        if (opCtx->getClient()->isFromUserConnection()) {
+            // Need to follow the locking order here by getting the global lock first followed by
+            // the mutex. The global lock acquires the RSTL lock which we use to assert that we're
+            // the primary node when running user operations.
+            ShouldNotConflictWithSecondaryBatchApplicationBlock shouldNotConflictBlock(
+                opCtx->lockState());
+            Lock::GlobalLock globalLk(opCtx, MODE_IX);
+
+            stdx::unique_lock<Latch> lk(_mutex);
+
+            auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+            uassert(ErrorCodes::NotMaster,
+                    "Not primary while waiting to start an index build",
+                    replCoord->canAcceptWritesFor(opCtx, nssOrUuid));
+            opCtx->waitForConditionOrInterrupt(_indexBuildFinished, lk, [&] {
+                const int maxActiveBuilds = maxNumActiveUserIndexBuilds.load();
+                if (_numActiveIndexBuilds < maxActiveBuilds) {
+                    _numActiveIndexBuilds++;
+                    return true;
+                }
+
+                LOGV2(4715500,
+                      "Too many index builds running simultaneously, waiting until the number of "
+                      "active index builds is below the threshold",
+                      "numActiveIndexBuilds"_attr = _numActiveIndexBuilds,
+                      "maxNumActiveUserIndexBuilds"_attr = maxActiveBuilds,
+                      "indexSpecs"_attr = specs,
+                      "buildUUID"_attr = buildUUID,
+                      "collectionUUID"_attr = collectionUUID);
+                return false;
+            });
+        } else {
+            // System index builds have no limit and never wait, but do consume a slot.
+            stdx::unique_lock<Latch> lk(_mutex);
+            _numActiveIndexBuilds++;
+        }
+    }
+
+    auto onScopeExitGuard = makeGuard([&] {
+        stdx::unique_lock<Latch> lk(_mutex);
+        _numActiveIndexBuilds--;
+        _indexBuildFinished.notify_one();
+    });
+
     if (indexBuildOptions.twoPhaseRecovery) {
         // Two phase index build recovery goes though a different set-up procedure because the
         // original index will be dropped first.
@@ -151,7 +212,6 @@ IndexBuildsCoordinatorMongod::startIndexBuild(OperationContext* opCtx,
     const auto deadline = opCtx->getDeadline();
     const auto timeoutError = opCtx->getTimeoutError();
 
-    const NamespaceStringOrUUID nssOrUuid{dbName, collectionUUID};
     const auto nss = CollectionCatalog::get(opCtx).resolveNamespaceStringOrUUID(opCtx, nssOrUuid);
 
     const auto& oss = OperationShardingState::get(opCtx);
@@ -180,10 +240,13 @@ IndexBuildsCoordinatorMongod::startIndexBuild(OperationContext* opCtx,
 
 
     auto replState = invariant(_getIndexBuild(buildUUID));
+
+    // The thread pool task will be responsible for signalling the condition variable when the index
+    // build thread is done running.
+    onScopeExitGuard.dismiss();
     _threadPool.schedule([
         this,
         buildUUID,
-        collectionUUID,
         dbName,
         nss,
         deadline,
@@ -197,6 +260,12 @@ IndexBuildsCoordinatorMongod::startIndexBuild(OperationContext* opCtx,
         shardVersion,
         dbVersion
     ](auto status) mutable noexcept {
+        auto onScopeExitGuard = makeGuard([&] {
+            stdx::unique_lock<Latch> lk(_mutex);
+            _numActiveIndexBuilds--;
+            _indexBuildFinished.notify_one();
+        });
+
         // Clean up if we failed to schedule the task.
         if (!status.isOK()) {
             stdx::unique_lock<Latch> lk(_mutex);
@@ -220,49 +289,6 @@ IndexBuildsCoordinatorMongod::startIndexBuild(OperationContext* opCtx,
 
         while (MONGO_unlikely(hangBeforeInitializingIndexBuild.shouldFail())) {
             sleepmillis(100);
-        }
-
-        auto replCoord = repl::ReplicationCoordinator::get(opCtx.get());
-        auto replState = invariant(_getIndexBuild(buildUUID));
-        if (replCoord->isReplEnabled() && !replCoord->getMemberState().primary() &&
-            replState->alreadyHasIndexesBuilt) {
-            LOGV2(3942301,
-                  "Node already has the requested index(es) finished, will vote for committing the "
-                  "index build",
-                  "collectionUUID"_attr = replState->collectionUUID,
-                  "buildUUID"_attr = replState->buildUUID,
-                  "indexNames"_attr = replState->indexNames,
-                  "indexSpecs"_attr = replState->indexSpecs);
-
-            // Signal that the index build started successfully.
-            startPromise.setWith([] {});
-
-            try {
-                _signalPrimaryForCommitReadiness(opCtx.get(), replState);
-                _waitForNextIndexBuildAction(opCtx.get(), replState);
-            } catch (const ExceptionForCat<ErrorCategory::Interruption>& ex) {
-                // This is a blocking call that can take an extended amount of time to finish. We
-                // need to anticipate possible shutdowns or interruptions here.
-                status = ex.toStatus();
-
-                LOGV2(4709502,
-                      "Vote interrupted for committing the index build",
-                      "collectionUUID"_attr = replState->collectionUUID,
-                      "buildUUID"_attr = replState->buildUUID,
-                      "indexNames"_attr = replState->indexNames,
-                      "indexSpecs"_attr = replState->indexSpecs,
-                      "status"_attr = status);
-            }
-
-            // No additional cleanup is necessary other than unregistering the index build as it's
-            // already built.
-            {
-                stdx::unique_lock<Latch> lk(_mutex);
-                _unregisterIndexBuild(lk, replState);
-            }
-
-            replState->sharedPromise.emplaceValue((replState->stats));
-            return;
         }
 
         // Index builds should never take the PBWM lock, even on a primary. This allows the
@@ -549,11 +575,6 @@ void IndexBuildsCoordinatorMongod::_signalPrimaryForCommitReadiness(
 
         BSONObj voteCmdResponse;
         try {
-            if (MONGO_unlikely(hangBeforeSendingCommitQuorumVote.shouldFail())) {
-                LOGV2(4709501, "Hanging on 'hangBeforeSendingCommitQuorumVote' fail point.");
-                hangBeforeSendingCommitQuorumVote.pauseWhileSet(opCtx);
-            }
-
             voteCmdResponse = replCoord->runCmdOnPrimaryAndAwaitResponse(
                 opCtx, "admin", voteCmdRequest, onRemoteCmdScheduled, onRemoteCmdComplete);
         } catch (DBException& ex) {

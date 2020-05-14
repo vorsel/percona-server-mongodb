@@ -76,8 +76,31 @@ const char* strsignal(int signalNum) {
     }
 }
 
+int sehExceptionFilter(unsigned int code, struct _EXCEPTION_POINTERS* excPointers) {
+    exceptionFilter(excPointers);
+
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+// Follow SEH conventions by defining a status code per their conventions
+// Bit 31-30: 11 = ERROR
+// Bit 29:     1 = Client bit, i.e. a user-defined code
+#define STATUS_EXIT_ABRUPT 0xE0000001
+
+// Historically we relied on raising SEH exception and letting the unhandled exception handler then
+// handle it to that we can dump the process. This works in all but one case.
+// The C++ terminate handler runs the terminate handler in a SEH __try/__catch. Therefore, any SEH
+// exceptions we raise become handled. Now, we setup our own SEH handler to quick catch the SEH
+// exception and take the dump bypassing the unhandled exception handler.
+//
 void endProcessWithSignal(int signalNum) {
-    RaiseException(EXIT_ABRUPT, EXCEPTION_NONCONTINUABLE, 0, nullptr);
+
+    __try {
+        RaiseException(STATUS_EXIT_ABRUPT, EXCEPTION_NONCONTINUABLE, 0, nullptr);
+    } __except (sehExceptionFilter(GetExceptionCode(), GetExceptionInformation())) {
+        // The exception filter exits the process
+        quickExit(EXIT_ABRUPT);
+    }
 }
 
 #else
@@ -251,23 +274,21 @@ void myInvalidParameterHandler(const wchar_t* expression,
                                const wchar_t* file,
                                unsigned int line,
                                uintptr_t pReserved) {
-    LOGV2_FATAL(23815,
-                "Invalid parameter detected in function {toUtf8String_function} File: "
-                "{toUtf8String_file} Line: {line}",
-                "toUtf8String_function"_attr = toUtf8String(function),
-                "toUtf8String_file"_attr = toUtf8String(file),
-                "line"_attr = line);
-    LOGV2_FATAL(23816,
-                "Expression: {toUtf8String_expression}",
-                "toUtf8String_expression"_attr = toUtf8String(expression));
-    LOGV2_FATAL(23817, "immediate exit due to invalid parameter");
+    LOGV2_FATAL_CONTINUE(
+        23815,
+        "Invalid parameter detected in function {function} File: "
+        "{file} Line: {line} Expression: {expression}. Immediate exit due to invalid parameter",
+        "function"_attr = toUtf8String(function),
+        "file"_attr = toUtf8String(file),
+        "line"_attr = line,
+        "expression"_attr = toUtf8String(expression));
 
     abruptQuit(SIGABRT);
 }
 
 void myPureCallHandler() {
-    LOGV2_FATAL(23818, "Pure call handler invoked");
-    LOGV2_FATAL(23819, "immediate exit due to invalid pure call");
+    LOGV2_FATAL_CONTINUE(23818,
+                         "Pure call handler invoked. Immediate exit due to invalid pure call");
     abruptQuit(SIGABRT);
 }
 
@@ -337,7 +358,7 @@ void setupSynchronousSignalHandlers() {
         if (sigaction(spec.signal, &sa, nullptr) != 0) {
             int savedErr = errno;
             LOGV2_FATAL(
-                23820,
+                31334,
                 "{format_FMT_STRING_Failed_to_install_signal_handler_for_signal_with_sigaction_"
                 "spec_signal_strerror_savedErr}",
                 "format_FMT_STRING_Failed_to_install_signal_handler_for_signal_with_sigaction_spec_signal_strerror_savedErr"_attr =
@@ -345,7 +366,6 @@ void setupSynchronousSignalHandlers() {
                                "Failed to install signal handler for signal {} with sigaction: {}"),
                            spec.signal,
                            strerror(savedErr)));
-            fassertFailed(31334);
         }
     }
     setupSIGTRAPforDebugger();

@@ -1,11 +1,9 @@
 'use strict';
 
 /**
- * Perform CRUD operations, some of which may implicitly create collections. Also perform index
- * creations which may implicitly create collections. Performs these in parallel with collection-
- * dropping operations.
+ * Perform CRUD operations, some of which may implicitly create collections, in parallel with
+ * collection-dropping operations.
  */
-
 var $config = (function() {
     const data = {numIds: 10};
 
@@ -62,6 +60,51 @@ var $config = (function() {
                         // TODO(SERVER-46651) upsert with concurrent dropCollection can result in
                         // writeErrors if queries yield.
                         assertAlways.writeError(res, "unexpected error: " + tojsononeline(e));
+                    }
+                }
+            }
+        },
+
+        findAndModifyDocs: function findAndModifyDocs(db, collName) {
+            for (let i = 0; i < 5; ++i) {
+                let indexToUpdate = Math.floor(Math.random() * this.numIds);
+                let res;
+                try {
+                    res = db.runCommand({
+                        findAndModify: collName,
+                        query: {_id: indexToUpdate},
+                        update: {$inc: {num: 1}},
+                        upsert: true
+                    });
+                    assertWhenOwnColl.commandWorked(res);
+                } catch (e) {
+                    // We propagate TransientTransactionErrors to allow the state function to
+                    // automatically be retried when TestData.runInsideTransaction=true
+                    if (e.hasOwnProperty('errorLabels') &&
+                        e.errorLabels.includes('TransientTransactionError')) {
+                        throw e;
+                    } else if (e.code === ErrorCodes.ConflictingOperationInProgress) {
+                        // dropCollection in sharding can disrupt routing cache refreshes.
+                        if (TestData.runInsideTransaction) {
+                            e["errorLabels"] = ["TransientTransactionError"];
+                            throw e;
+                        }
+                    } else if (e.code === ErrorCodes.OperationNotSupportedInTransaction) {
+                        // TODO (SERVER-45956): Remove this case once fineAndModify with upsert=true
+                        // is allowed in transactions.
+                        throw e;
+                    } else {
+                        assertAlways.contains(
+                            e.code,
+                            [
+                                // dropIndex can cause queries to throw if these queries yield.
+                                ErrorCodes.QueryPlanKilled,
+                                // findAndModify may not automatically handle a DuplicateKey error.
+                                // TODO (SERVER-47212): Remove this error code once findAndModify
+                                // retries on DuplicateKey errors automatically.
+                                ErrorCodes.DuplicateKey
+                            ],
+                            'unexpected error code: ' + e.code + ': ' + e.message);
                     }
                 }
             }
@@ -124,28 +167,6 @@ var $config = (function() {
             }
         },
 
-        createIndex: function createIndex(db, collName) {
-            db[collName].createIndex({value: 1});
-        },
-
-        createIdIndex: function createIdIndex(db, collName) {
-            try {
-                assertWhenOwnColl.commandWorked(db[collName].createIndex({_id: 1}));
-            } catch (e) {
-                if (e.code == ErrorCodes.ConflictingOperationInProgress) {
-                    // createIndex concurrently with dropCollection can throw.
-                    if (TestData.runInsideTransaction) {
-                        e["errorLabels"] = ["TransientTransactionError"];
-                        throw e;
-                    }
-                }
-            }
-        },
-
-        dropIndex: function dropIndex(db, collName) {
-            db[collName].dropIndex({value: 1});
-        },
-
         dropCollection: function dropCollection(db, collName) {
             db[collName].drop();
         }
@@ -155,91 +176,57 @@ var $config = (function() {
         init: {
             insertDocs: 0.10,
             updateDocs: 0.10,
+            findAndModifyDocs: 0.10,
             readDocs: 0.10,
             deleteDocs: 0.10,
-            createIndex: 0.10,
-            createIdIndex: 0.10,
-            dropIndex: 0.10,
             dropCollection: 0.10,
         },
         insertDocs: {
             insertDocs: 0.10,
             updateDocs: 0.10,
+            findAndModifyDocs: 0.10,
             readDocs: 0.10,
             deleteDocs: 0.10,
-            createIndex: 0.10,
-            createIdIndex: 0.10,
-            dropIndex: 0.10,
             dropCollection: 0.30,
         },
         updateDocs: {
             insertDocs: 0.10,
             updateDocs: 0.10,
+            findAndModifyDocs: 0.10,
             readDocs: 0.10,
             deleteDocs: 0.10,
-            createIndex: 0.10,
-            createIdIndex: 0.10,
-            dropIndex: 0.10,
+            dropCollection: 0.30,
+        },
+        findAndModifyDocs: {
+            insertDocs: 0.10,
+            updateDocs: 0.10,
+            findAndModifyDocs: 0.10,
+            readDocs: 0.10,
+            deleteDocs: 0.10,
             dropCollection: 0.30,
         },
         readDocs: {
             insertDocs: 0.10,
             updateDocs: 0.10,
+            findAndModifyDocs: 0.10,
             readDocs: 0.10,
             deleteDocs: 0.10,
-            createIndex: 0.10,
-            createIdIndex: 0.10,
-            dropIndex: 0.10,
             dropCollection: 0.30,
         },
         deleteDocs: {
             insertDocs: 0.10,
             updateDocs: 0.10,
+            findAndModifyDocs: 0.10,
             readDocs: 0.10,
             deleteDocs: 0.10,
-            createIndex: 0.10,
-            createIdIndex: 0.10,
-            dropIndex: 0.10,
-            dropCollection: 0.30,
-        },
-        createIndex: {
-            insertDocs: 0.10,
-            updateDocs: 0.10,
-            readDocs: 0.10,
-            deleteDocs: 0.10,
-            createIndex: 0.10,
-            createIdIndex: 0.10,
-            dropIndex: 0.10,
-            dropCollection: 0.30,
-        },
-        createIdIndex: {
-            insertDocs: 0.10,
-            updateDocs: 0.10,
-            readDocs: 0.10,
-            deleteDocs: 0.10,
-            createIndex: 0.10,
-            createIdIndex: 0.10,
-            dropIndex: 0.10,
-            dropCollection: 0.30,
-        },
-        dropIndex: {
-            insertDocs: 0.10,
-            updateDocs: 0.10,
-            readDocs: 0.10,
-            deleteDocs: 0.10,
-            createIndex: 0.10,
-            createIdIndex: 0.10,
-            dropIndex: 0.10,
             dropCollection: 0.30,
         },
         dropCollection: {
             insertDocs: 0.10,
             updateDocs: 0.10,
+            findAndModifyDocs: 0.10,
             readDocs: 0.10,
             deleteDocs: 0.10,
-            createIndex: 0.10,
-            createIdIndex: 0.10,
-            dropIndex: 0.10,
             dropCollection: 0.10,
         }
     };

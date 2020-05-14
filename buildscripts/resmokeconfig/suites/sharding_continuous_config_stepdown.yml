@@ -6,6 +6,7 @@ selector:
   exclude_files:
   # Auth tests require authentication on the stepdown thread's connection
   - jstests/sharding/auth*.js
+  - jstests/sharding/cleanup_orphaned_auth.js
   - jstests/sharding/localhostAuthBypass.js
   - jstests/sharding/kill_sessions.js
   - jstests/sharding/mongos_rs_auth_shard_failure_tolerance.js
@@ -49,6 +50,7 @@ selector:
   - jstests/sharding/prefix_shard_key.js
   - jstests/sharding/presplit.js
   - jstests/sharding/query_config.js
+  - jstests/sharding/range_deleter_interacts_correctly_with_refine_shard_key.js
   - jstests/sharding/remove1.js
   - jstests/sharding/rename_across_mongos.js
   - jstests/sharding/shard1.js
@@ -137,6 +139,9 @@ selector:
   # ShardingTest is never used, so continuous step down thread never starts
   - jstests/sharding/config_rs_change.js
   - jstests/sharding/empty_cluster_init.js
+  # Temporarily blacklisted until more robust
+  - jstests/sharding/cleanup_orphaned_cmd_during_movechunk_hashed.js
+  - jstests/sharding/cleanup_orphaned_cmd_during_movechunk.js
   # Expects same secondaries for entire test
   - jstests/sharding/commands_that_write_accept_wc_configRS.js
   - jstests/sharding/commands_that_write_accept_wc_shards.js

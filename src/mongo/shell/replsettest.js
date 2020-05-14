@@ -1204,6 +1204,55 @@ var ReplSetTest = function(opts) {
             });
         }
 
+        // Wait for 2 keys to appear before adding the other nodes. This is to prevent replica
+        // set configurations from interfering with the primary to generate the keys. One example
+        // of problematic configuration are delayed secondaries, which impedes the primary from
+        // generating the second key due to timeout waiting for write concern.
+        let shouldWaitForKeys = true;
+        if (self.waitForKeys != undefined) {
+            shouldWaitForKeys = self.waitForKeys;
+            print("Set shouldWaitForKeys from RS options: " + shouldWaitForKeys);
+        } else {
+            Object.keys(self.nodeOptions).forEach(function(key, index) {
+                let val = self.nodeOptions[key];
+                if (typeof (val) === "object" &&
+                    (val.hasOwnProperty("shardsvr") ||
+                     val.hasOwnProperty("binVersion") &&
+                         // Should not wait for keys if version is less than 3.6
+                         MongoRunner.compareBinVersions(val.binVersion, "3.6") == -1)) {
+                    shouldWaitForKeys = false;
+                    print("Set shouldWaitForKeys from node options: " + shouldWaitForKeys);
+                }
+            });
+            if (self.startOptions != undefined) {
+                let val = self.startOptions;
+                if (typeof (val) === "object" &&
+                    (val.hasOwnProperty("shardsvr") ||
+                     val.hasOwnProperty("binVersion") &&
+                         // Should not wait for keys if version is less than 3.6
+                         MongoRunner.compareBinVersions(val.binVersion, "3.6") == -1)) {
+                    shouldWaitForKeys = false;
+                    print("Set shouldWaitForKeys from start options: " + shouldWaitForKeys);
+                }
+            }
+        }
+        /**
+         * Blocks until the primary node generates cluster time sign keys.
+         */
+        if (shouldWaitForKeys) {
+            var timeout = self.kDefaultTimeoutMS;
+            asCluster(this.nodes, function(timeout) {
+                print("Waiting for keys to sign $clusterTime to be generated");
+                assert.soonNoExcept(function(timeout) {
+                    var keyCnt = self.getPrimary(timeout)
+                                     .getCollection('admin.system.keys')
+                                     .find({purpose: 'HMAC'})
+                                     .itcount();
+                    return keyCnt >= 2;
+                }, "Awaiting keys", timeout);
+            });
+        }
+
         // Allow nodes to find sync sources more quickly. We also turn down the heartbeat interval
         // to speed up the initiation process. We use a failpoint so that we can easily turn this
         // behavior on/off without doing a reconfig. This is only an optimization so it's OK if we
@@ -1270,51 +1319,6 @@ var ReplSetTest = function(opts) {
             print("Running awaitHighestPriorityNodeIsPrimary() during ReplSetTest initialization " +
                   "failed with Unauthorized error, proceeding even though we aren't guaranteed " +
                   "that the highest priority node is primary");
-        }
-
-        let shouldWaitForKeys = true;
-        if (self.waitForKeys != undefined) {
-            shouldWaitForKeys = self.waitForKeys;
-            print("Set shouldWaitForKeys from RS options: " + shouldWaitForKeys);
-        } else {
-            Object.keys(self.nodeOptions).forEach(function(key, index) {
-                let val = self.nodeOptions[key];
-                if (typeof (val) === "object" &&
-                    (val.hasOwnProperty("shardsvr") ||
-                     val.hasOwnProperty("binVersion") &&
-                         // Should not wait for keys if version is less than 3.6
-                         MongoRunner.compareBinVersions(val.binVersion, "3.6") == -1)) {
-                    shouldWaitForKeys = false;
-                    print("Set shouldWaitForKeys from node options: " + shouldWaitForKeys);
-                }
-            });
-            if (self.startOptions != undefined) {
-                let val = self.startOptions;
-                if (typeof (val) === "object" &&
-                    (val.hasOwnProperty("shardsvr") ||
-                     val.hasOwnProperty("binVersion") &&
-                         // Should not wait for keys if version is less than 3.6
-                         MongoRunner.compareBinVersions(val.binVersion, "3.6") == -1)) {
-                    shouldWaitForKeys = false;
-                    print("Set shouldWaitForKeys from start options: " + shouldWaitForKeys);
-                }
-            }
-        }
-        /**
-         * Blocks until the primary node generates cluster time sign keys.
-         */
-        if (shouldWaitForKeys) {
-            var timeout = self.kDefaultTimeoutMS;
-            asCluster(this.nodes, function(timeout) {
-                print("Waiting for keys to sign $clusterTime to be generated");
-                assert.soonNoExcept(function(timeout) {
-                    var keyCnt = self.getPrimary(timeout)
-                                     .getCollection('admin.system.keys')
-                                     .find({purpose: 'HMAC'})
-                                     .itcount();
-                    return keyCnt >= 2;
-                }, "Awaiting keys", timeout);
-            });
         }
 
         // Set 'featureCompatibilityVersion' for the entire replica set, if specified.
@@ -1672,17 +1676,6 @@ var ReplSetTest = function(opts) {
               "established on " + id);
     };
 
-    function _runInCommandReadMode(conn, fn) {
-        let origReadMode = conn.readMode();
-        conn.forceReadMode("commands");
-        try {
-            var res = fn();
-        } finally {
-            conn.forceReadMode(origReadMode);
-        }
-        return res;
-    }
-
     // Wait until the optime of the specified type reaches the primary's last applied optime. Blocks
     // on all secondary nodes or just 'slaves', if specified. The timeout will reset if any of the
     // secondaries makes progress.
@@ -1747,13 +1740,13 @@ var ReplSetTest = function(opts) {
             var slaveName = slave.host;
 
             var slaveConfigVersion =
-                _runInCommandReadMode(slave,
-                                      () => slave.getDB("local")['system.replset']
-                                                .find()
-                                                .readConcern("local")
-                                                .limit(1)
-                                                .next()
-                                                .version);
+                slave._runWithForcedReadMode("commands",
+                                             () => slave.getDB("local")['system.replset']
+                                                       .find()
+                                                       .readConcern("local")
+                                                       .limit(1)
+                                                       .next()
+                                                       .version);
 
             if (masterConfigVersion != slaveConfigVersion) {
                 print("ReplSetTest awaitReplication: secondary #" + secondaryCount + ", " +
@@ -1763,13 +1756,13 @@ var ReplSetTest = function(opts) {
                 if (slaveConfigVersion > masterConfigVersion) {
                     master = self.getPrimary();
                     masterConfigVersion =
-                        _runInCommandReadMode(master,
-                                              () => master.getDB("local")['system.replset']
-                                                        .find()
-                                                        .readConcern("local")
-                                                        .limit(1)
-                                                        .next()
-                                                        .version);
+                        master._runWithForcedReadMode("commands",
+                                                      () => master.getDB("local")['system.replset']
+                                                                .find()
+                                                                .readConcern("local")
+                                                                .limit(1)
+                                                                .next()
+                                                                .version);
                     masterName = master.host;
 
                     print("ReplSetTest awaitReplication: optime for primary, " + masterName +
@@ -2459,7 +2452,8 @@ var ReplSetTest = function(opts) {
                 }
 
                 try {
-                    return _runInCommandReadMode(this.mongo, () => operation(this.cursor));
+                    return this.mongo._runWithForcedReadMode("commands",
+                                                             () => operation(this.cursor));
                 } catch (err) {
                     print("Error: " + name + " threw '" + err.message + "' on " + this.mongo.host);
                     // Occasionally, the capped collection will get truncated while we are iterating
@@ -2495,20 +2489,21 @@ var ReplSetTest = function(opts) {
                 // changed "cursorTimeoutMillis" to a short time period.
                 this._cursorExhausted = false;
                 // Although this line sets the read concern, it does not need to be called via
-                // _runInCommandReadMode() because it only creates the client-side cursor.  It's not
-                // until next()/hasNext() are called that the find command gets sent to the server.
+                // _runWithForcedReadMode() because it only creates the client-side cursor.  It's
+                // not until next()/hasNext() are called that the find command gets sent to the
+                // server.
                 this.cursor =
                     coll.find(query).sort({$natural: -1}).noCursorTimeout().readConcern("local");
             };
 
             this.getFirstDoc = function() {
-                return _runInCommandReadMode(this.mongo,
-                                             () => this.getOplogColl()
-                                                       .find()
-                                                       .sort({$natural: 1})
-                                                       .readConcern("local")
-                                                       .limit(-1)
-                                                       .next());
+                return this.mongo._runWithForcedReadMode("commands",
+                                                         () => this.getOplogColl()
+                                                                   .find()
+                                                                   .sort({$natural: 1})
+                                                                   .readConcern("local")
+                                                                   .limit(-1)
+                                                                   .next());
             };
 
             this.getOplogColl = function() {

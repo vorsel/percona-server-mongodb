@@ -424,6 +424,15 @@ int mdb_handle_error_with_startup_suppression(WT_EVENT_HANDLER* handler,
             if (sd.find("Version incompatibility detected:") != std::string::npos) {
                 return 0;
             }
+
+            // WT shipped with MongoDB 4.4 can read data left behind by 4.0, but cannot write 4.0
+            // compatible data. Instead of forcing an upgrade on the user, it refuses to start up
+            // with this error string.
+            if (sd.find("WiredTiger version incompatible with current binary") !=
+                std::string::npos) {
+                wtHandler->setWtIncompatible();
+                return 0;
+            }
         }
         LOGV2_ERROR(22435,
                     "WiredTiger error ({errorCode}) {message} Raw: {message2}",
@@ -465,7 +474,7 @@ int mdb_handle_error(WT_EVENT_HANDLER* handler,
 
 int mdb_handle_message(WT_EVENT_HANDLER* handler, WT_SESSION* session, const char* message) {
     try {
-        LOGV2(22430, "WiredTiger message {message}", "message"_attr = redact(message));
+        LOGV2(22430, "WiredTiger message", "message"_attr = redact(message));
     } catch (...) {
         std::terminate();
     }
@@ -478,7 +487,7 @@ int mdb_handle_progress(WT_EVENT_HANDLER* handler,
                         uint64_t progress) {
     try {
         LOGV2(22431,
-              "WiredTiger progress {operation} {progress}",
+              "WiredTiger progress",
               "operation"_attr = redact(operation),
               "progress"_attr = progress);
     } catch (...) {
@@ -626,7 +635,7 @@ Status WiredTigerUtil::setTableLogging(WT_SESSION* session, const std::string& u
                 "on"_attr = on);
     int ret = session->alter(session, uri.c_str(), setting.c_str());
     if (ret) {
-        LOGV2_FATAL(22437,
+        LOGV2_FATAL(50756,
                     "Failed to update log setting. Uri: {uri} Enable? {on} Ret: {ret} MD: "
                     "{existingMetadata} Msg: {session_strerror_session_ret}",
                     "uri"_attr = uri,
@@ -634,7 +643,6 @@ Status WiredTigerUtil::setTableLogging(WT_SESSION* session, const std::string& u
                     "ret"_attr = ret,
                     "existingMetadata"_attr = redact(existingMetadata),
                     "session_strerror_session_ret"_attr = session->strerror(session, ret));
-        fassertFailed(50756);
     }
 
     return Status::OK();

@@ -249,7 +249,8 @@ public:
                                      GetNewConfigFn getNewConfig,
                                      bool force) override;
 
-    virtual Status awaitConfigCommitment(OperationContext* opCtx) override;
+    virtual Status awaitConfigCommitment(OperationContext* opCtx,
+                                         bool waitForOplogCommitment) override;
 
     virtual Status processReplSetInitiate(OperationContext* opCtx,
                                           const BSONObj& configObj,
@@ -262,8 +263,6 @@ public:
 
     virtual std::vector<HostAndPort> getHostsWrittenTo(const OpTime& op,
                                                        bool durablyWritten) override;
-
-    virtual std::vector<HostAndPort> getOtherNodesInReplSet() const override;
 
     virtual WriteConcernOptions getGetLastErrorDefault() override;
 
@@ -278,10 +277,9 @@ public:
     virtual void resetLastOpTimesFromOplog(OperationContext* opCtx,
                                            DataConsistency consistency) override;
 
-    virtual bool shouldChangeSyncSource(
-        const HostAndPort& currentSource,
-        const rpc::ReplSetMetadata& replMetadata,
-        boost::optional<rpc::OplogQueryMetadata> oqMetadata) override;
+    virtual bool shouldChangeSyncSource(const HostAndPort& currentSource,
+                                        const rpc::ReplSetMetadata& replMetadata,
+                                        const rpc::OplogQueryMetadata& oqMetadata) override;
 
     virtual OpTime getLastCommittedOpTime() const override;
     virtual OpTimeAndWallTime getLastCommittedOpTimeAndWallTime() const override;

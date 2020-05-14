@@ -37,6 +37,7 @@
 
 #include <boost/container/small_vector.hpp>
 #include <functional>
+#include <string_view>
 
 namespace mongo {
 namespace logv2 {
@@ -205,11 +206,15 @@ inline double mapValue(float value) {
 inline double mapValue(double value) {
     return value;
 }
+
 inline StringData mapValue(StringData value) {
     return value;
 }
 inline StringData mapValue(std::string const& value) {
     return value;
+}
+inline StringData mapValue(std::string_view value) {
+    return StringData(value.data(), value.size());
 }
 inline StringData mapValue(char* value) {
     return value;
@@ -217,6 +222,7 @@ inline StringData mapValue(char* value) {
 inline StringData mapValue(const char* value) {
     return value;
 }
+
 inline const BSONObj mapValue(BSONObj const& value) {
     return value;
 }
@@ -347,7 +353,8 @@ public:
         for (auto it = _begin; it != _end; ++it) {
             const auto& item = *it;
             auto append = [&builder](auto&& val) {
-                if constexpr (std::is_same_v<decltype(val), CustomAttributeValue&&>) {
+                using V = decltype(val);
+                if constexpr (std::is_same_v<V, CustomAttributeValue&&>) {
                     if (val.BSONAppend) {
                         BSONObjBuilder objBuilder;
                         val.BSONAppend(objBuilder, ""_sd);
@@ -365,8 +372,10 @@ public:
                     } else {
                         builder.append(val.toString());
                     }
-                } else if constexpr (IsDuration<std::decay_t<decltype(val)>>::value) {
+                } else if constexpr (IsDuration<std::decay_t<V>>::value) {
                     builder.append(val.toBSON());
+                } else if constexpr (std::is_same_v<std::decay_t<V>, unsigned int>) {
+                    builder.append(static_cast<long long>(val));
                 } else {
                     builder.append(val);
                 }
@@ -447,7 +456,8 @@ public:
         for (auto it = _begin; it != _end; ++it) {
             const auto& item = *it;
             auto append = [builder](StringData key, auto&& val) {
-                if constexpr (std::is_same_v<decltype(val), CustomAttributeValue&&>) {
+                using V = decltype(val);
+                if constexpr (std::is_same_v<V, CustomAttributeValue&&>) {
                     if (val.BSONAppend) {
                         val.BSONAppend(*builder, key);
                     } else if (val.BSONSerialize) {
@@ -463,8 +473,10 @@ public:
                     } else {
                         builder->append(key, val.toString());
                     }
-                } else if constexpr (IsDuration<std::decay_t<decltype(val)>>::value) {
+                } else if constexpr (IsDuration<std::decay_t<V>>::value) {
                     builder->append(key, val.toBSON());
+                } else if constexpr (std::is_same_v<std::decay_t<V>, unsigned int>) {
+                    builder->append(key, static_cast<long long>(val));
                 } else {
                     builder->append(key, val);
                 }

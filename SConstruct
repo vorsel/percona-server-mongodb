@@ -3485,6 +3485,7 @@ def doConfigure(myenv):
             "BOOST_ENABLE_ASSERT_DEBUG_HANDLER",
             "BOOST_LOG_NO_SHORTHAND_NAMES",
             "BOOST_LOG_USE_NATIVE_SYSLOG",
+            "BOOST_LOG_WITHOUT_THREAD_ATTR",
             "ABSL_FORCE_ALIGNED_ACCESS",
         ]
     )
@@ -4168,13 +4169,6 @@ incremental_link = Tool('incremental_link')
 if incremental_link.exists(env):
     incremental_link(env)
 
-def checkErrorCodes():
-    import buildscripts.errorcodes as x
-    if x.check_error_codes() == False:
-        env.FatalError("next id to use: {0}", x.get_next_code())
-
-checkErrorCodes()
-
 # Resource Files are Windows specific
 def env_windows_resource_file(env, path):
     if env.TargetOSIs('windows'):
@@ -4255,11 +4249,16 @@ lint_py = env.Command(
     action="$PYTHON ${SOURCES[0]} lint",
 )
 
-env.Alias( "lint" , [ lint_py, eslint, clang_format, pylinters ] )
-env.Alias( "lint-fast" , [ eslint, clang_format, pylinters ] )
+lint_errorcodes = env.Command(
+    target="#lint-errorcodes",
+    source=["buildscripts/errorcodes.py"],
+    action="$PYTHON ${SOURCES[0]} --quiet",
+)
+
+env.Alias( "lint" , [ lint_py, eslint, clang_format, pylinters, lint_errorcodes ] )
+env.Alias( "lint-fast" , [ eslint, clang_format, pylinters, lint_errorcodes ] )
 env.AlwaysBuild( "lint" )
 env.AlwaysBuild( "lint-fast" )
-
 
 #  ----  INSTALL -------
 

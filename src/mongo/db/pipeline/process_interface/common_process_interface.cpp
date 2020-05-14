@@ -40,7 +40,10 @@
 #include "mongo/db/client.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/operation_time_tracker.h"
 #include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/mutex.h"
@@ -146,6 +149,25 @@ std::vector<FieldPath> CommonProcessInterface::collectDocumentKeyFieldsActingAsR
     return {"_id"};
 }
 
+void CommonProcessInterface::updateClientOperationTime(OperationContext* opCtx) const {
+    // In order to support causal consistency in a replica set or a sharded cluster when reading
+    // with secondary read preference, the secondary must propagate the primary's operation time
+    // to the client so that when the client attempts to read, the secondary will block until it
+    // has replicated the primary's writes. As such, the 'operationTime' returned from the
+    // primary is explicitly set on the given opCtx's client.
+    //
+    // Note that the operationTime is attached even when a command fails because writes may succeed
+    // while the command fails (such as in a $merge where 'whenMatched' is set to fail). This
+    // guarantees that the operation time returned to the client reflects the most recent
+    // successful write executed by this client.
+    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    if (replCoord) {
+        auto operationTime = OperationTimeTracker::get(opCtx)->getMaxOperationTime();
+        repl::OpTime opTime(operationTime.asTimestamp(), replCoord->getTerm());
+        repl::ReplClientInfo::forClient(opCtx->getClient()).setLastProxyWriteOpTimeForward(opTime);
+    }
+}
+
 bool CommonProcessInterface::keyPatternNamesExactPaths(const BSONObj& keyPattern,
                                                        const std::set<FieldPath>& uniqueKeyPaths) {
     size_t nFieldsMatched = 0;
@@ -172,6 +194,11 @@ boost::optional<ChunkVersion> CommonProcessInterface::refreshAndGetCollectionVer
         return chunkManager->getVersion();
     }
     return boost::none;
+}
+
+bool CommonProcessInterface::supportsReadPreferenceForWriteOp(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    return true;
 }
 
 std::vector<FieldPath> CommonProcessInterface::_shardKeyToDocumentKeyFields(

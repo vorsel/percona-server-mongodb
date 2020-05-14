@@ -53,7 +53,6 @@
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/write_unit_of_work.h"
-#include "mongo/logger/redaction.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point.h"
@@ -202,7 +201,7 @@ StatusWith<std::vector<BSONObj>> MultiIndexBlock::init(OperationContext* opCtx,
                                                        Collection* collection,
                                                        const std::vector<BSONObj>& indexSpecs,
                                                        OnInitFn onInit) {
-    invariant(opCtx->lockState()->isCollectionLockedForMode(collection->ns(), MODE_IX),
+    invariant(opCtx->lockState()->isCollectionLockedForMode(collection->ns(), MODE_X),
               str::stream() << "Collection " << collection->ns() << " with UUID "
                             << collection->uuid() << " is holding the incorrect lock");
     if (State::kAborted == _getState()) {
@@ -752,8 +751,6 @@ Status MultiIndexBlock::retrySkippedRecords(OperationContext* opCtx, Collection*
 }
 
 Status MultiIndexBlock::checkConstraints(OperationContext* opCtx) {
-    _constraintsChecked = true;
-
     if (State::kAborted == _getState()) {
         return {ErrorCodes::IndexBuildAborted,
                 str::stream() << "Index build aborted: " << _abortReason
@@ -820,9 +817,6 @@ Status MultiIndexBlock::commit(OperationContext* opCtx,
                           << ". Cannot commit index builder: " << collection->ns()
                           << (_collectionUUID ? (" (" + _collectionUUID->toString() + ")") : "")};
     }
-
-    // Ensure that duplicate key constraints were checked at least once.
-    invariant(_constraintsChecked);
 
     // Do not interfere with writing multikey information when committing index builds.
     auto restartTracker = makeGuard(

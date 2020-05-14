@@ -137,7 +137,7 @@ Status AbstractIndexAccessMethod::insert(OperationContext* opCtx,
 
     getKeys(obj,
             options.getKeysMode,
-            GetKeysContext::kReadOrAddKeys,
+            GetKeysContext::kAddingKeys,
             &keys,
             &multikeyMetadataKeys,
             &multikeyPaths,
@@ -257,7 +257,7 @@ RecordId AbstractIndexAccessMethod::findSingle(OperationContext* opCtx,
             MultikeyPaths* multikeyPaths = nullptr;
             getKeys(requestedKey,
                     GetKeysMode::kEnforceConstraints,
-                    GetKeysContext::kReadOrAddKeys,
+                    GetKeysContext::kAddingKeys,
                     &keys,
                     multikeyMetadataKeys,
                     multikeyPaths,
@@ -384,7 +384,7 @@ void AbstractIndexAccessMethod::prepareUpdate(OperationContext* opCtx,
     if (!indexFilter || indexFilter->matchesBSON(to)) {
         getKeys(to,
                 options.getKeysMode,
-                GetKeysContext::kReadOrAddKeys,
+                GetKeysContext::kAddingKeys,
                 &ticket->newKeys,
                 &ticket->newMultikeyMetadataKeys,
                 &ticket->newMultikeyPaths,
@@ -523,7 +523,7 @@ Status AbstractIndexAccessMethod::BulkBuilderImpl::insert(OperationContext* opCt
         _indexCatalogEntry->accessMethod()->getKeys(
             obj,
             options.getKeysMode,
-            GetKeysContext::kReadOrAddKeys,
+            GetKeysContext::kAddingKeys,
             &keys,
             &_multikeyMetadataKeys,
             &multikeyPaths,
@@ -633,12 +633,12 @@ Status AbstractIndexAccessMethod::commitBulk(OperationContext* opCtx,
         if (kDebugBuild || _descriptor->unique()) {
             cmpData = data.first.compareWithoutRecordId(previousKey);
             if (cmpData < 0) {
-                LOGV2_FATAL(20687,
-                            "expected the next key{data_first} to be greater than or equal to the "
-                            "previous key{previousKey}",
-                            "data_first"_attr = data.first.toString(),
-                            "previousKey"_attr = previousKey.toString());
-                fassertFailedNoTrace(31171);
+                LOGV2_FATAL_NOTRACE(
+                    31171,
+                    "expected the next key{data_first} to be greater than or equal to the "
+                    "previous key{previousKey}",
+                    "data_first"_attr = data.first.toString(),
+                    "previousKey"_attr = previousKey.toString());
             }
         }
 

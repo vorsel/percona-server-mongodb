@@ -131,6 +131,14 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
             self.initial_sync_node.setup()
             self.initial_sync_node.await_ready()
 
+        if self.mixed_bin_versions:
+            for i in range(self.num_nodes):
+                if self.nodes[i].mongod_executable != self.mixed_bin_versions[i]:
+                    msg = (f"Executable of node{i}: {self.nodes[i].mongod_executable} does not "
+                           f"match the executable assigned by mixedBinVersions: "
+                           f"{self.mixed_bin_versions[i]}.")
+                    raise errors.ServerFailure(msg)
+
         # We need only to wait to connect to the first node of the replica set because we first
         # initiate it as a single node replica set.
         self.nodes[0].await_ready()
@@ -284,7 +292,6 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
         self._await_primary()
         self._await_secondaries()
         self._await_stable_recovery_timestamp()
-        self._setup_sessions_collection()
         self._setup_cwrwc_defaults()
 
     def _await_primary(self):
@@ -385,11 +392,6 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
                         node.port, last_stable_recovery_timestamp)
                     break
                 time.sleep(0.1)  # Wait a little bit before trying again.
-
-    def _setup_sessions_collection(self):
-        """Set up the sessions collection so that it will not attempt to set up during a test."""
-        primary = self.nodes[0]
-        primary.mongo_client().admin.command({"refreshLogicalSessionCacheNow": 1})
 
     def _setup_cwrwc_defaults(self):
         """Set up the cluster-wide read/write concern defaults."""

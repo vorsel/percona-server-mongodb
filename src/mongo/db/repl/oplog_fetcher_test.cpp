@@ -306,8 +306,8 @@ protected:
     /**
      * Tests checkSyncSource result handling.
      */
-    void testSyncSourceChecking(boost::optional<const rpc::ReplSetMetadata&> replMetadata,
-                                boost::optional<const rpc::OplogQueryMetadata&> oqMetadata);
+    void testSyncSourceChecking(const rpc::ReplSetMetadata& replMetadata,
+                                const rpc::OplogQueryMetadata& oqMetadata);
 
     void validateLastBatch(bool skipFirstDoc, OplogFetcher::Documents docs, OpTime lastFetched);
 
@@ -333,8 +333,8 @@ const Date_t OplogFetcherTest::staleWallTime = Date_t() + Seconds(staleOpTime.ge
 const rpc::OplogQueryMetadata OplogFetcherTest::staleOqMetadata = rpc::OplogQueryMetadata(
     {staleOpTime, staleWallTime}, staleOpTime, rbid, primaryIndex, syncSourceIndex);
 
-const rpc::ReplSetMetadata OplogFetcherTest::replSetMetadata =
-    rpc::ReplSetMetadata(1, OpTimeAndWallTime(), OpTime(), 1, OID(), primaryIndex, syncSourceIndex);
+const rpc::ReplSetMetadata OplogFetcherTest::replSetMetadata = rpc::ReplSetMetadata(
+    1, OpTimeAndWallTime(), OpTime(), 1, 0, OID(), primaryIndex, syncSourceIndex, false);
 
 void OplogFetcherTest::setUp() {
     executor::ThreadPoolExecutorTest::setUp();
@@ -453,9 +453,8 @@ std::unique_ptr<ShutdownState> OplogFetcherTest::processSingleBatch(const Messag
     return shutdownState;
 }
 
-void OplogFetcherTest::testSyncSourceChecking(
-    boost::optional<const rpc::ReplSetMetadata&> replMetadata,
-    boost::optional<const rpc::OplogQueryMetadata&> oqMetadata) {
+void OplogFetcherTest::testSyncSourceChecking(const rpc::ReplSetMetadata& replMetadata,
+                                              const rpc::OplogQueryMetadata& oqMetadata) {
     auto firstEntry = makeNoopOplogEntry(lastFetched);
     auto secondEntry = makeNoopOplogEntry({{Seconds(456), 0}, lastFetched.getTerm()});
     auto thirdEntry = makeNoopOplogEntry({{Seconds(789), 0}, lastFetched.getTerm()});
@@ -769,7 +768,7 @@ TEST_F(
 
     CursorId cursorId = 22LL;
     auto firstEntry = makeNoopOplogEntry(lastFetched);
-    auto metadataObj = makeOplogBatchMetadata(boost::none, oqMetadata);
+    auto metadataObj = makeOplogBatchMetadata(replSetMetadata, oqMetadata);
 
     auto conn = oplogFetcher->getDBClientConnection_forTest();
 
@@ -824,14 +823,20 @@ TEST_F(OplogFetcherTest, InvalidOplogQueryMetadataInResponseStopsTheOplogFetcher
                   processSingleBatch(makeFirstBatch(cursorId, {entry}, metadataObj))->getStatus());
 }
 
-DEATH_TEST_REGEX_F(OplogFetcherTest,
-                   ValidMetadataInResponseWithoutOplogMetadataInvariants,
-                   "Invariant failure.*oqMetadata") {
+TEST_F(OplogFetcherTest, ValidMetadataInResponseWithoutOplogMetadataStopsTheOplogFetcher) {
     CursorId cursorId = 22LL;
     auto entry = makeNoopOplogEntry(lastFetched);
     auto metadataObj = makeOplogBatchMetadata(replSetMetadata, boost::none);
+    ASSERT_EQUALS(ErrorCodes::NoSuchKey,
+                  processSingleBatch(makeFirstBatch(cursorId, {entry}, metadataObj))->getStatus());
+}
 
-    processSingleBatch(makeFirstBatch(cursorId, {entry}, metadataObj));
+TEST_F(OplogFetcherTest, ResponseWithoutReplicaSetMetadataStopsTheOplogFetcher) {
+    CursorId cursorId = 22LL;
+    auto entry = makeNoopOplogEntry(lastFetched);
+    auto metadataObj = makeOplogBatchMetadata(boost::none, oqMetadata);
+    ASSERT_EQUALS(ErrorCodes::NoSuchKey,
+                  processSingleBatch(makeFirstBatch(cursorId, {entry}, metadataObj))->getStatus());
 }
 
 TEST_F(OplogFetcherTest, ValidMetadataWithInResponseShouldBeForwardedToProcessMetadataFn) {
@@ -936,17 +941,6 @@ TEST_F(OplogFetcherTest,
     ASSERT(dataReplicatorExternalState->metadataWasProcessed);
 }
 
-TEST_F(OplogFetcherTest,
-       MetadataWithoutOplogQueryMetadataIsNotProcessedOnBatchThatTriggersRollback) {
-    CursorId cursorId = 22LL;
-    auto metadataObj = makeOplogBatchMetadata(replSetMetadata, boost::none);
-    auto entry = makeNoopOplogEntry(Seconds(456));
-
-    ASSERT_EQUALS(ErrorCodes::OplogStartMissing,
-                  processSingleBatch(makeFirstBatch(cursorId, {entry}, metadataObj))->getStatus());
-    ASSERT_FALSE(dataReplicatorExternalState->metadataWasProcessed);
-}
-
 TEST_F(OplogFetcherTest, MetadataIsNotProcessedOnBatchThatTriggersRollback) {
     CursorId cursorId = 22LL;
     auto metadataObj = makeOplogBatchMetadata(replSetMetadata, oqMetadata);
@@ -955,14 +949,6 @@ TEST_F(OplogFetcherTest, MetadataIsNotProcessedOnBatchThatTriggersRollback) {
     ASSERT_EQUALS(
         ErrorCodes::OplogStartMissing,
         processSingleBatch(makeFirstBatch(cursorId, {entry}, {metadataObj}))->getStatus());
-    ASSERT_FALSE(dataReplicatorExternalState->metadataWasProcessed);
-}
-
-TEST_F(OplogFetcherTest, EmptyMetadataIsNotProcessed) {
-    CursorId cursorId = 0LL;
-    auto entry = makeNoopOplogEntry(lastFetched);
-
-    ASSERT_OK(processSingleBatch(makeFirstBatch(cursorId, {entry}, {}))->getStatus());
     ASSERT_FALSE(dataReplicatorExternalState->metadataWasProcessed);
 }
 
@@ -1019,7 +1005,7 @@ TEST_F(OplogFetcherTest, DontRecreateNewCursorAfterFailedBatchNoRetries) {
     CursorId cursorId = 22LL;
     auto firstEntry = makeNoopOplogEntry(lastFetched);
     auto secondEntry = makeNoopOplogEntry({{Seconds(456), 0}, lastFetched.getTerm()});
-    auto metadataObj = makeOplogBatchMetadata(boost::none, oqMetadata);
+    auto metadataObj = makeOplogBatchMetadata(replSetMetadata, oqMetadata);
     auto firstBatch = {firstEntry, secondEntry};
 
     // Update lastFetched before it is updated by getting the next batch.
@@ -1057,7 +1043,7 @@ TEST_F(OplogFetcherTest, FailCreateNewCursorAfterFailedBatchRetriesShutsDownOplo
     CursorId cursorId = 22LL;
     auto firstEntry = makeNoopOplogEntry(lastFetched);
     auto secondEntry = makeNoopOplogEntry({{Seconds(456), 0}, lastFetched.getTerm()});
-    auto metadataObj = makeOplogBatchMetadata(boost::none, oqMetadata);
+    auto metadataObj = makeOplogBatchMetadata(replSetMetadata, oqMetadata);
     auto firstBatch = {firstEntry, secondEntry};
 
     // Update lastFetched before it is updated by getting the next batch.
@@ -1127,7 +1113,7 @@ TEST_F(OplogFetcherTest, SuccessfullyRecreateCursorAfterFailedBatch) {
     CursorId cursorId = 22LL;
     auto firstEntry = makeNoopOplogEntry(lastFetched);
     auto secondEntry = makeNoopOplogEntry({{Seconds(124), 0}, lastFetched.getTerm()});
-    auto metadataObj = makeOplogBatchMetadata(boost::none, oqMetadata);
+    auto metadataObj = makeOplogBatchMetadata(replSetMetadata, oqMetadata);
     auto firstBatch = {firstEntry, secondEntry};
 
     // Update lastFetched before it is updated by getting the next batch.
@@ -1271,7 +1257,7 @@ TEST_F(OplogFetcherTest, SuccessfulBatchResetsNumRestarts) {
     CursorId cursorId = 22LL;
     auto firstEntry = makeNoopOplogEntry(lastFetched);
     auto secondEntry = makeNoopOplogEntry({{Seconds(456), 0}, lastFetched.getTerm()});
-    auto metadataObj = makeOplogBatchMetadata(boost::none, oqMetadata);
+    auto metadataObj = makeOplogBatchMetadata(replSetMetadata, oqMetadata);
     auto firstBatch = {firstEntry, secondEntry};
 
     // Update lastFetched before it is updated by getting the next batch.
@@ -1344,7 +1330,7 @@ TEST_F(OplogFetcherTest, OplogFetcherWorksWithoutExhaust) {
     CursorId cursorId = 22LL;
     auto firstEntry = makeNoopOplogEntry(lastFetched);
     auto secondEntry = makeNoopOplogEntry({{Seconds(456), 0}, lastFetched.getTerm()});
-    auto metadataObj = makeOplogBatchMetadata(boost::none, oqMetadata);
+    auto metadataObj = makeOplogBatchMetadata(replSetMetadata, oqMetadata);
     auto firstBatch = {firstEntry, secondEntry};
 
     // Update lastFetched before it is updated by getting the next batch.
@@ -1423,7 +1409,7 @@ TEST_F(OplogFetcherTest, CursorIsDeadShutsDownOplogFetcherWithSuccessfulStatus) 
     CursorId cursorId = 0LL;
     auto firstEntry = makeNoopOplogEntry(lastFetched);
     auto secondEntry = makeNoopOplogEntry({{Seconds(124), 0}, lastFetched.getTerm()});
-    auto metadataObj = makeOplogBatchMetadata(boost::none, oqMetadata);
+    auto metadataObj = makeOplogBatchMetadata(replSetMetadata, oqMetadata);
     auto firstBatch = {firstEntry, secondEntry};
 
     // Creating the cursor will succeed, but the oplog fetcher will shut down after receiving this
@@ -1448,13 +1434,14 @@ TEST_F(OplogFetcherTest, CursorIsDeadShutsDownOplogFetcherWithSuccessfulStatus) 
 
 TEST_F(OplogFetcherTest, EmptyFirstBatchStopsOplogFetcherWithOplogStartMissingError) {
     CursorId cursorId = 22LL;
+    auto metadataObj = makeOplogBatchMetadata(replSetMetadata, oqMetadata);
     ASSERT_EQUALS(ErrorCodes::OplogStartMissing,
-                  processSingleBatch(makeFirstBatch(cursorId, {}, {}))->getStatus());
+                  processSingleBatch(makeFirstBatch(cursorId, {}, {metadataObj}))->getStatus());
 }
 
 TEST_F(OplogFetcherTest, MissingOpTimeInFirstDocumentCausesOplogFetcherToStopWithInvalidBSONError) {
     CursorId cursorId = 22LL;
-    auto metadataObj = makeOplogBatchMetadata(boost::none, oqMetadata);
+    auto metadataObj = makeOplogBatchMetadata(replSetMetadata, oqMetadata);
     ASSERT_EQUALS(
         ErrorCodes::InvalidBSON,
         processSingleBatch(makeFirstBatch(cursorId, {BSONObj()}, metadataObj))->getStatus());
@@ -1465,7 +1452,7 @@ TEST_F(
     LastOpTimeFetchedDoesNotMatchFirstDocumentCausesOplogFetcherToStopWithOplogStartMissingError) {
     CursorId cursorId = 22LL;
     auto entry = makeNoopOplogEntry({{Seconds(456), 0}, lastFetched.getTerm()});
-    auto metadataObj = makeOplogBatchMetadata(boost::none, oqMetadata);
+    auto metadataObj = makeOplogBatchMetadata(replSetMetadata, oqMetadata);
     ASSERT_EQUALS(ErrorCodes::OplogStartMissing,
                   processSingleBatch(makeFirstBatch(cursorId, {entry}, metadataObj))->getStatus());
 }
@@ -1474,7 +1461,7 @@ TEST_F(OplogFetcherTest,
        MissingOpTimeInSecondDocumentOfFirstBatchCausesOplogFetcherToStopWithNoSuchKey) {
     CursorId cursorId = 22LL;
     auto firstEntry = makeNoopOplogEntry(lastFetched);
-    auto metadataObj = makeOplogBatchMetadata(boost::none, oqMetadata);
+    auto metadataObj = makeOplogBatchMetadata(replSetMetadata, oqMetadata);
     ASSERT_EQUALS(
         ErrorCodes::NoSuchKey,
         processSingleBatch(makeFirstBatch(cursorId,
@@ -1487,7 +1474,7 @@ TEST_F(OplogFetcherTest,
 
 TEST_F(OplogFetcherTest, TimestampsNotAdvancingInBatchCausesOplogFetcherStopWithOplogOutOfOrder) {
     CursorId cursorId = 22LL;
-    auto metadataObj = makeOplogBatchMetadata(boost::none, oqMetadata);
+    auto metadataObj = makeOplogBatchMetadata(replSetMetadata, oqMetadata);
     ASSERT_EQUALS(ErrorCodes::OplogOutOfOrder,
                   processSingleBatch(makeFirstBatch(cursorId,
                                                     {makeNoopOplogEntry(lastFetched),
@@ -1503,7 +1490,7 @@ TEST_F(OplogFetcherTest, OplogFetcherShouldExcludeFirstDocumentInFirstBatchWhenE
     auto firstEntry = makeNoopOplogEntry(lastFetched);
     auto secondEntry = makeNoopOplogEntry({{Seconds(456), 0}, lastFetched.getTerm()});
     auto thirdEntry = makeNoopOplogEntry({{Seconds(789), 0}, lastFetched.getTerm()});
-    auto metadataObj = makeOplogBatchMetadata(boost::none, oqMetadata);
+    auto metadataObj = makeOplogBatchMetadata(replSetMetadata, oqMetadata);
 
     auto shutdownState = processSingleBatch(
         makeFirstBatch(cursorId, {firstEntry, secondEntry, thirdEntry}, metadataObj),
@@ -1564,7 +1551,7 @@ TEST_F(OplogFetcherTest,
     CursorId cursorId = 22LL;
     auto firstEntry = makeNoopOplogEntry({{Seconds(123), 0}, lastFetched.getTerm()});
     auto secondEntry = makeNoopOplogEntry({{Seconds(456), 0}, lastFetched.getTerm()});
-    auto metadataObj = makeOplogBatchMetadata(boost::none, oqMetadata);
+    auto metadataObj = makeOplogBatchMetadata(replSetMetadata, oqMetadata);
 
     // Update lastFetched before it is updated by getting the next batch.
     lastFetched = oplogFetcher->getLastOpTimeFetched_forTest();
@@ -1639,7 +1626,7 @@ TEST_F(OplogFetcherTest,
     auto firstEntry = makeNoopOplogEntry({{Seconds(123), 0}, lastFetched.getTerm()});
     auto secondEntry = makeNoopOplogEntry({{Seconds(456), 0}, lastFetched.getTerm()});
     auto thirdEntry = makeNoopOplogEntry({{Seconds(789), 0}, lastFetched.getTerm()});
-    auto metadataObj = makeOplogBatchMetadata(boost::none, oqMetadata);
+    auto metadataObj = makeOplogBatchMetadata(replSetMetadata, oqMetadata);
 
     // Update lastFetched before it is updated by getting the next batch.
     lastFetched = oplogFetcher->getLastOpTimeFetched_forTest();
@@ -1682,7 +1669,7 @@ TEST_F(OplogFetcherTest, OplogFetcherShouldReportErrorsThrownFromEnqueueDocument
     CursorId cursorId = 22LL;
     auto firstEntry = makeNoopOplogEntry(lastFetched);
     auto secondEntry = makeNoopOplogEntry({{Seconds(456), 0}, lastFetched.getTerm()});
-    auto metadataObj = makeOplogBatchMetadata(boost::none, oqMetadata);
+    auto metadataObj = makeOplogBatchMetadata(replSetMetadata, oqMetadata);
 
     enqueueDocumentsFn = [](OplogFetcher::Documents::const_iterator,
                             OplogFetcher::Documents::const_iterator,
@@ -1693,16 +1680,6 @@ TEST_F(OplogFetcherTest, OplogFetcherShouldReportErrorsThrownFromEnqueueDocument
     auto shutdownState =
         processSingleBatch(makeFirstBatch(cursorId, {firstEntry, secondEntry}, metadataObj));
     ASSERT_EQ(Status(ErrorCodes::InternalError, "my custom error"), shutdownState->getStatus());
-}
-
-TEST_F(OplogFetcherTest, FailedSyncSourceCheckWithoutMetadataStopsTheOplogFetcher) {
-    testSyncSourceChecking(boost::none, boost::none);
-
-    // Sync source optime and "hasSyncSource" are not available if the response does not
-    // contain metadata.
-    ASSERT_EQUALS(source, dataReplicatorExternalState->lastSyncSourceChecked);
-    ASSERT_EQUALS(OpTime(), dataReplicatorExternalState->syncSourceLastOpTime);
-    ASSERT_FALSE(dataReplicatorExternalState->syncSourceHasSyncSource);
 }
 
 TEST_F(OplogFetcherTest, FailedSyncSourceCheckWithBothMetadatasStopsTheOplogFetcher) {
@@ -1979,7 +1956,7 @@ TEST_F(OplogFetcherTest, OplogFetcherResetsNumRestartsOnSuccessfulConnection) {
 
     CursorId cursorId = 0LL;
     auto firstEntry = makeNoopOplogEntry(lastFetched);
-    auto metadataObj = makeOplogBatchMetadata(boost::none, oqMetadata);
+    auto metadataObj = makeOplogBatchMetadata(replSetMetadata, oqMetadata);
 
     // Allow the cursor re-initialization to succeed. But the OplogFetcher will shut down with an OK
     // status after receiving this batch because the cursor id is 0.
@@ -2004,7 +1981,7 @@ TEST_F(OplogFetcherTest, OplogFetcherCanAutoReconnect) {
 
     auto firstEntry = makeNoopOplogEntry(lastFetched);
     auto secondEntry = makeNoopOplogEntry({{Seconds(124), 0}, lastFetched.getTerm()});
-    auto metadataObj = makeOplogBatchMetadata(boost::none, oqMetadata);
+    auto metadataObj = makeOplogBatchMetadata(replSetMetadata, oqMetadata);
 
     // Simulate closing the cursor and the OplogFetcher should exit with an OK status.
     processSingleRequestResponse(conn, makeFirstBatch(0LL, {firstEntry}, metadataObj));
@@ -2054,7 +2031,7 @@ TEST_F(OplogFetcherTest, DisconnectsOnErrorsDuringExhaustStream) {
     CursorId cursorId = 22LL;
     auto firstEntry = makeNoopOplogEntry(lastFetched);
     auto secondEntry = makeNoopOplogEntry({{Seconds(124), 0}, lastFetched.getTerm()});
-    auto metadataObj = makeOplogBatchMetadata(boost::none, oqMetadata);
+    auto metadataObj = makeOplogBatchMetadata(replSetMetadata, oqMetadata);
 
     auto conn = oplogFetcher->getDBClientConnection_forTest();
     // First batch for the initial find command.
@@ -2100,7 +2077,7 @@ TEST_F(OplogFetcherTest, GetMoreEmptyBatch) {
 
     CursorId cursorId = 22LL;
     auto firstEntry = makeNoopOplogEntry(lastFetched);
-    auto metadataObj = makeOplogBatchMetadata(boost::none, oqMetadata);
+    auto metadataObj = makeOplogBatchMetadata(replSetMetadata, oqMetadata);
 
     auto conn = oplogFetcher->getDBClientConnection_forTest();
 
@@ -2132,6 +2109,7 @@ TEST_F(OplogFetcherTest, HandleLogicalTimeMetaDataAndAdvanceClusterTime) {
         rpc::LogicalTimeMetadata(SignedLogicalTime(logicalTime, TimeProofService::TimeProof(), 0));
 
     BSONObjBuilder bob;
+    ASSERT_OK(replSetMetadata.writeToMetadata(&bob));
     ASSERT_OK(oqMetadata.writeToMetadata(&bob));
     logicalTimeMetadata.writeToMetadata(&bob);
     auto metadataObj = bob.obj();

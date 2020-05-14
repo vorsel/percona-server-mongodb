@@ -1051,12 +1051,10 @@ void IndexBuildsCoordinator::restartIndexBuildsForRecovery(OperationContext* opC
         invariant(nss);
 
         LOGV2(20660,
-              "Restarting index build for collection: {nss}, collection UUID: {build_collUUID}, "
-              "index build UUID: {buildUUID}",
-              "nss"_attr = *nss,
-              "build_collUUID"_attr = build.collUUID,
+              "Restarting index build",
+              "collection"_attr = nss,
+              "collectionUUID"_attr = build.collUUID,
               "buildUUID"_attr = buildUUID);
-
         IndexBuildsCoordinator::IndexBuildOptions indexBuildOptions;
         // Start the index build as if in secondary oplog application.
         indexBuildOptions.replSetAndNotPrimaryAtStart = true;
@@ -1332,6 +1330,7 @@ void IndexBuildsCoordinator::updateCurOpOpDescription(OperationContext* opCtx,
     auto opDescObj = builder.obj();
     curOp->setLogicalOp_inlock(LogicalOp::opCommand);
     curOp->setOpDescription_inlock(opDescObj);
+    curOp->setNS_inlock(nss.ns());
     curOp->ensureStarted();
 }
 
@@ -1481,44 +1480,6 @@ IndexBuildsCoordinator::_filterSpecsAndRegisterBuild(
         indexCatalogStats.numIndexesBefore = numIndexes;
         indexCatalogStats.numIndexesAfter = numIndexes;
         return SharedSemiFuture(indexCatalogStats);
-    }
-
-    // If all the requested index(es) have already been built on this secondary node due to rolling
-    // index builds, we'll be able to vote for committing the index build once an index builder
-    // thread gets created.
-    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
-    if (replCoord->isReplEnabled() && !replCoord->getMemberState().primary()) {
-        const IndexCatalog* indexCatalog = collection->getIndexCatalog();
-        const bool includeUnfinishedIndexes = true;
-
-        bool indexesAlreadyBuilt =
-            std::all_of(filteredSpecs.begin(), filteredSpecs.end(), [&](const BSONObj& spec) {
-                std::string name = spec.getStringField(IndexDescriptor::kIndexNameFieldName);
-                return indexCatalog->findIndexByName(opCtx, name, includeUnfinishedIndexes);
-            });
-
-        if (indexesAlreadyBuilt) {
-            // Register the index build on the secondary. This is needed when the secondary
-            // processes the 'commitIndexBuild' oplog entry otherwise it will be forced to rebuild
-            // the existing index(es).
-            auto replIndexBuildState = std::make_shared<ReplIndexBuildState>(buildUUID,
-                                                                             collectionUUID,
-                                                                             dbName.toString(),
-                                                                             filteredSpecs,
-                                                                             protocol,
-                                                                             commitQuorum);
-
-            replIndexBuildState->stats.numIndexesBefore = getNumIndexesTotal(opCtx, collection);
-            replIndexBuildState->stats.numIndexesAfter = getNumIndexesTotal(opCtx, collection);
-            replIndexBuildState->alreadyHasIndexesBuilt = true;
-
-            status = _registerIndexBuild(lk, replIndexBuildState);
-            if (!status.isOK()) {
-                return status;
-            }
-
-            return boost::none;
-        }
     }
 
     // Bypass the thread pool if we are building indexes on an empty collection.
@@ -2155,9 +2116,11 @@ void IndexBuildsCoordinator::_insertKeysFromSideTablesAndCommit(
         RecoveryUnit::ReadSource::kUnset,
         IndexBuildInterceptor::DrainYieldPolicy::kNoYield));
 
-    // Retry indexing records that may have been skipped while relaxing constraints (i.e. as
-    // secondary), but only if we are primary and committing the index build and during two-phase
-    // builds. Single-phase index builds are not resilient to state transitions.
+    // Retry indexing records that failed key generation while relaxing constraints (i.e. while
+    // a secondary node), but only if we are primary and committing the index build and during
+    // two-phase builds. Single-phase index builds are not resilient to state transitions and do not
+    // track skipped records. Secondaries rely on the primary's decision to commit as assurance that
+    // it has checked all key generation errors on its behalf.
     auto replCoord = repl::ReplicationCoordinator::get(opCtx);
     if (IndexBuildProtocol::kTwoPhase == replState->protocol &&
         replCoord->canAcceptWritesFor(opCtx, collection->ns())) {
@@ -2165,9 +2128,17 @@ void IndexBuildsCoordinator::_insertKeysFromSideTablesAndCommit(
             _indexBuildsManager.retrySkippedRecords(opCtx, replState->buildUUID, collection));
     }
 
-    // Index constraint checking phase.
-    uassertStatusOK(
-        _indexBuildsManager.checkIndexConstraintViolations(opCtx, replState->buildUUID));
+    // Duplicate key constraint checking phase. Duplicate key errors are tracked for single-phase
+    // builds on primaries and two-phase builds in all replication states. Single-phase builds on
+    // secondaries don't track duplicates so this call is a no-op. This can be called for two-phase
+    // builds in all replication states except during initial sync when this node is not guaranteed
+    // to be consistent.
+    bool twoPhaseAndNotInitialSyncing = IndexBuildProtocol::kTwoPhase == replState->protocol &&
+        !replCoord->getMemberState().startup2();
+    if (IndexBuildProtocol::kSinglePhase == replState->protocol || twoPhaseAndNotInitialSyncing) {
+        uassertStatusOK(
+            _indexBuildsManager.checkIndexConstraintViolations(opCtx, replState->buildUUID));
+    }
 
     // If two phase index builds is enabled, index build will be coordinated using
     // startIndexBuild and commitIndexBuild oplog entries.

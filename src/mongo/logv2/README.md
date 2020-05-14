@@ -2,6 +2,95 @@
 
 The new log system adds capability to produce structured logs in the [Relaxed Extended JSON 2.0.0](https://github.com/mongodb/specifications/blob/master/source/extended-json.rst) format. The new API requires names to be given to variables, forming field names for the variables in structured JSON logs. Named variables are called attributes in the log system. Human readable log messages are built with a [libfmt](https://fmt.dev/6.1.1/index.html) inspired API, where attributes are inserted using replacement fields instead of being streamed together using the streaming operator `<<`.
 
+# Style guide
+
+## In general
+
+Log lines are composed primarily of a message (`msg`) and attributes (`attr.*` fields).
+
+## Philosophy
+
+As you write log messages, keep the following in mind: A big thing that makes (J|B)SON unique as a data format is the ability to provide rich field names.
+
+What makes logv2 machine readable is that we write an intact Extended BSON format.
+
+But, what makes these lines human readable is that the `msg` provides a simple, clear context for interpreting well-formed field names and values in the `attr` subdocument.
+
+## Specific Guidance
+
+For maximum readability, a log message additionally has the least amount of repetition possible, and shares attribute names with other related log lines.
+
+### Message (the msg field)
+
+The `msg` field predicates a reader's interpretation of the log line. It should be crafted with care and attention.
+
+* Concisely describe what the log line is reporting, providing enough context necessary for interpreting attribute field names and values
+* Avoid unnecessary punctuation and do not conclude with punctuation
+* For new log messages, do __not__ use a format string/substitution for new log messages
+* For updating existing log messages, provide both a format string/substitution, __and__ a substitution-free message string
+
+### Attributes (fields in the attr subdocument)
+
+The `attr` subdocument includes important metrics/statistics about the logged event for the purposes of debugging or performance analysis. These variables should be named very well, as though intended for a very human-readable portion of the codebase (like config variable declaration, abstract class definitions, etc.)
+
+For `attr` fields, do the following:
+
+#### Use camelCased words understandable in the context of the message (msg)
+
+The bar for understanding should be:
+
+* Someone with reasonable understanding of mongod behavior should understand immediately what is being logged
+* Someone with reasonable troubleshooting skill should be able to extract doc- or code-searchable phrases to learn about what is being logged
+
+#### Precisely describe values and units
+
+Exception: Do not add a unit suffix when logging a Duration type. The system automatically adds this unit.
+
+#### When providing an execution time attribute, ensure it is named "durationMillis"
+
+To describe the execution time of an operation using our preferred method: Specify an `attr` name of “duration” and provide a value using the Milliseconds Duration type. The log system will automatically append "Millis" to the attribute name.
+
+Alternatively, specify an `attr` name of “durationMillis” and provide the number of milliseconds as an integer type.
+
+__Importantly__: downstream analysis tools will rely on this convention, as a replacement for the "[0-9]+ms$" format of prior logs.
+
+#### Use certain specific terms whenever possible
+
+When logging the below information, do so with these specific terms:
+
+* __namespace__ - instead of "ns"
+* __db__ - instead of "database"
+* __error__ - when an error occurs, instead of "status". Use this for objects of type Status and DBException
+* __reason__ - to provide rationale for an event/action when "error" isn't appropriate
+
+### Examples
+
+For new log lines:
+
+ ```
+LOGV2(1041, "Transition to PRIMARY complete");
+
+{ ... , "id": 1041, "msg": "Transition to PRIMARY complete", "attr": {} }
+```
+
+```
+LOGV2(1042, "Slow query", "duration"_attr = getDurationMillis());
+
+{ ..., "id": 1042, "msg": "Slow query", "attr": { "durationMillis": 1000 } }
+
+```
+
+For updating existing log lines:
+
+```
+LOGV2(1040, 
+      "Replica set state transition from {oldState} to {newState} on this node", 
+      "Replica set state transition on this node", 
+      "oldState"_attr = getOldState(), "newState"_attr = getNewState());
+
+{ ..., "id": 1040, "msg": "Replica set state transition on this node", "attr": { "oldState": "SECONARY", "newState": "PRIMARY" } }
+```
+
 # Basic Usage
 
 The log system is made available with the following header:
@@ -69,6 +158,8 @@ LOGV2_OPTIONS(1003, {LogComponent::kCommand}, "Log event to specified component"
 * `LOGV2_WARNING`
 * `LOGV2_ERROR`
 * `LOGV2_FATAL`
+* `LOGV2_FATAL_NOTRACE`
+* `LOGV2_FATAL_CONTINUE`
 
 There is also variations that take `LogOptions` if needed:
 
@@ -76,7 +167,9 @@ There is also variations that take `LogOptions` if needed:
 * `LOGV2_ERROR_OPTIONS`
 * `LOGV2_FATAL_OPTIONS`
 
-Fatal level log statements perform `fassert` after logging, using the provided ID as assert id. 
+Fatal level log statements using `LOGV2_FATAL` perform `fassert` after logging, using the provided ID as assert id. `LOGV2_FATAL_NOTRACE` perform `fassertNoTrace` and `LOGV2_FATAL_CONTINUE` does not `fassert` allowing for continued execution. `LOGV2_FATAL_CONTINUE` is meant to be used when a fatal error has occured but a different way of halting execution is desired such as `std::terminate` or `fassertFailedWithStatus`.
+
+`LOGV2_FATAL_OPTIONS` performs `fassert` by default like `LOGV2_FATAL` but this can be changed by setting the `FatalMode` on the `LogOptions`.
 
 Debug-level logging is slightly different where an additional parameter (as integer) required to indicate the desired debug level:
 
@@ -281,13 +374,24 @@ Text | JSON/BSON
 
 ## Combining uassert with log statement
 
-Code that emits a high severity log statement may also need to emit a `uassert` after the log. There is the `UserAssertAfterLog` helper that allows you to re-use the log statement to do the formatting required for the `uassert`. The reason string will be a plain text formatted log (replacement fields filled in format-string).
+Code that emits a high severity log statement may also need to emit a `uassert` after the log. There is the `UserAssertAfterLog` logging option that allows you to re-use the log statement to do the formatting required for the `uassert`. The assertion id can be either the logging ID by passing `UserAssertAfterLog` with no arguments or the assertion id can set by constructing `UserAssertAfterLog` with an `ErrorCodes::Error`. 
+
+The assertion reason string will be a plain text formatted log (replacement fields filled in format-string). If replacement fields are not provided in the message string, attribute values will be missing from the assertion message.
+
 
 ##### Examples
 ```
+LOGV2_ERROR_OPTIONS(1050000, {UserAssertAfterLog()}, "Assertion after log");
+```
+Would emit a `uassert` after performing the log that is equivalent to:
+```
+uasserted(1050000, "Assertion after log");
+```
+Using a named error code:
+```
 LOGV2_ERROR_OPTIONS(1050, {UserAssertAfterLog(ErrorCodes::DataCorruptionDetected)}, "Data corruption detected for {recordId}, "recordId"_attr=RecordId(123456));
 ```
-Would emit an `uassert` after performing the log that is equivalent to:
+Would emit a `uassert` after performing the log that is equivalent to:
 ```
 uasserted(ErrorCodes::DataCorruptionDetected, "Data corruption detected for RecordId(123456)");
 ```
@@ -356,43 +460,20 @@ unsigned long | int64 (0x12)
 long long | int64 (0x12)
 unsigned long long | int64 (0x12)
 
-# Style guide
+# FAQ
 
-### Message and Format string
+### Why are we doing this?
 
-* Prefer pithy noun phrases or short sentence describing what is being logged
-* Prefer a message without replacement fields for new log messages.
-* When updating existing messages, try to include both a replacement-free message and format string with replacement fields. That will help the transition to good JSON logs.
-* Avoid ending with punctuation (.)
+Structured logging brings __significant__ potential for log analysis to the codebase that isn't present with earlier logging facilities. This is an improvement that facilitates many future improvements.
 
-### Attribute names
+Not only that, logv2 removes most parsing/post-processing concerns for automated downstream consumption of logs.
 
-* Should be small number of camelCased words being understandable as description with just the message string as context for someone with reasonable understanding of mongod behavior
-* Do not add unit suffix when logging duration type (it will be added by log system)
-* Prefer naming attribute "duration" and use Milliseconds of unit when logging real-time durations as part of performance warnings.
-* Prefer adding unit suffix if available when logging integral or floating point attributes
+### Why are we doing this so fast?
 
-##### Examples
+Maintaining multiple output formats for even a single version would present serious overhead for both support and engineering. This dual support would last for years given the adoption curve, and effectively creates __four__ formats (old, new, new-old, and newer).
 
-```
-LOGV2(1040, 
-      "Replica set state transition from {oldState} to {newState} on this node", 
-      "Replica set state transition on this node", 
-      "oldState"_attr = getOldState(), "newState"_attr = getNewState());
+By making a full cutover in a single release, we are in a much better position.
 
-{ ..., "id": 1040, "msg": "Replica set state transition on this node", "attr": { "oldState": "SECONARY", "newState": "PRIMARY" } }
-```
- 
- ```
-LOGV2(1041, "Transition to PRIMARY complete");
+### Why shouldn't we use formatting strings and substitution for new log lines?
 
-{ ... , "id": 1041, "msg": "Transition to PRIMARY complete", "attr": {} }
-```
-
-```
-LOGV2(1042, "Slow query", "duration"_attr = getDurationMillis());
-
-{ ..., "id": 1042, "msg": "Slow query", "attr": { "durationMillis": 1000 } }
-
-```
-
+Human readability suffers significantly when `attr` field names are included both in the `attr` subdocument and within `msg` string. This is a powerful feature that we don't want to exclude entirely, but it makes sense to lean on it only when absolutely necessary.

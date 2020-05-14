@@ -10,6 +10,7 @@ env.Library(
         env.Idlc('repl_server_parameters.idl')[0]
     ],
     LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/client/read_preference',
         '$BUILD_DIR/mongo/idl/server_parameter',
     ]
 )
@@ -623,10 +624,17 @@ env.Library(
     ],
 )
 
+env.Library('member_data',
+            [
+                'member_data.cpp',
+            ],
+            LIBDEPS=[
+                'replica_set_messages',
+            ])
+
 env.Library('topology_coordinator',
             [
                 'heartbeat_response_action.cpp',
-                'member_data.cpp',
                 'topology_coordinator.cpp',
                 env.Idlc('topology_coordinator.idl')[0],
             ],
@@ -635,6 +643,7 @@ env.Library('topology_coordinator',
                 '$BUILD_DIR/mongo/rpc/metadata',
                 '$BUILD_DIR/mongo/util/fail_point',
                 'isself',
+                'member_data',
                 'replica_set_messages',
                 'repl_settings',
                 'rslog',
@@ -896,6 +905,7 @@ env.Library(
     LIBDEPS=[
         'oplog_entry',
         'optime',
+        'read_concern_args',
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/client/fetcher',
         '$BUILD_DIR/mongo/db/namespace_string',
@@ -930,6 +940,8 @@ env.Library(
     LIBDEPS = [
         'task_runner',
         'initial_sync_shared_data',
+        'member_data',
+        'replication_consistency_markers_impl',
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/client/clientdriver_network',
         '$BUILD_DIR/mongo/util/concurrency/thread_pool',

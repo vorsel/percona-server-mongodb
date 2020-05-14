@@ -254,7 +254,8 @@ private:
 StatusWith<repl::ReadConcernArgs> _extractReadConcern(OperationContext* opCtx,
                                                       const CommandInvocation* invocation,
                                                       const BSONObj& cmdObj,
-                                                      bool startTransaction) {
+                                                      bool startTransaction,
+                                                      bool isInternalClient) {
     repl::ReadConcernArgs readConcernArgs;
 
     auto readConcernParseStatus = readConcernArgs.initialize(cmdObj);
@@ -269,24 +270,35 @@ StatusWith<repl::ReadConcernArgs> _extractReadConcern(OperationContext* opCtx,
         (startTransaction || !opCtx->inMultiDocumentTransaction()) &&
         repl::ReplicationCoordinator::get(opCtx)->isReplEnabled() &&
         !opCtx->getClient()->isInDirectClient()) {
-        if (serverGlobalParams.clusterRole == ClusterRole::ShardServer ||
-            serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-            // ReadConcern should always be explicitly specified by operations received on shard and
-            // config servers, even if it is empty (ie. readConcern: {}).  In this context
-            // (shard/config servers) an empty RC indicates the operation should use the implicit
-            // server defaults.  So, warn if the operation has not specified readConcern and is on a
-            // shard/config server.
-            if (!readConcernArgs.isSpecified()) {
-                // TODO: Disabled until after SERVER-44539, to avoid log spam.
-                // LOGV2(21954, "Missing readConcern on {invocation_definition_getName}",
-                // "invocation_definition_getName"_attr = invocation->definition()->getName());
+
+        if (serverGlobalParams.featureCompatibility.isVersion(
+                ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44)) {
+            if (isInternalClient) {
+                // ReadConcern should always be explicitly specified by operations received from
+                // internal clients (ie. from a mongos or mongod), even if it is empty (ie.
+                // readConcern: {}, meaning to use the implicit server defaults).
+                uassert(
+                    4569200,
+                    "received command without explicit readConcern on an internalClient connection {}"_format(
+                        redact(cmdObj.toString())),
+                    readConcernArgs.isSpecified());
+            } else if (serverGlobalParams.clusterRole == ClusterRole::ShardServer ||
+                       serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+                if (!readConcernArgs.isSpecified()) {
+                    // TODO: Disabled until after SERVER-44539, to avoid log spam.
+                    // LOGV2(21954, "Missing readConcern on {invocation_definition_getName}",
+                    // "invocation_definition_getName"_attr = invocation->definition()->getName());
+                }
             }
-        } else {
+        }
+
+        if (serverGlobalParams.clusterRole != ClusterRole::ShardServer &&
+            serverGlobalParams.clusterRole != ClusterRole::ConfigServer) {
             // A member in a regular replica set.  Since these servers receive client queries, in
             // this context empty RC (ie. readConcern: {}) means the same as if absent/unspecified,
             // which is to apply the CWRWC defaults if present.  This means we just test isEmpty(),
             // since this covers both isSpecified() && !isSpecified()
-            if (readConcernArgs.isEmpty()) {
+            if (!isInternalClient && readConcernArgs.isEmpty()) {
                 const auto rcDefault = ReadWriteConcernDefaults::get(opCtx->getServiceContext())
                                            .getDefaultReadConcern(opCtx);
                 if (rcDefault) {
@@ -320,10 +332,8 @@ StatusWith<repl::ReadConcernArgs> _extractReadConcern(OperationContext* opCtx,
         }
     }
 
-    // If we are starting a transaction, we only need to check whether the read concern is
-    // appropriate for running a transaction. There is no need to check whether the specific
-    // command supports the read concern, because all commands that are allowed to run in a
-    // transaction must support all applicable read concerns.
+    // If we are starting a transaction, we need to check whether the read concern is
+    // appropriate for running a transaction.
     if (startTransaction) {
         if (!isReadConcernLevelAllowedInTransaction(readConcernArgs.getLevel())) {
             return {ErrorCodes::InvalidOptions,
@@ -344,7 +354,10 @@ StatusWith<repl::ReadConcernArgs> _extractReadConcern(OperationContext* opCtx,
     // it is implicitly "local". There is no need to check whether this is supported, because all
     // commands either support "local" or upconvert the absent readConcern to a stronger level that
     // they do support; for instance, $changeStream upconverts to RC level "majority".
-    if (!startTransaction && readConcernArgs.hasLevel()) {
+    //
+    // Individual transaction statements are checked later on, after we've unstashed the
+    // transaction resources.
+    if (!opCtx->inMultiDocumentTransaction() && readConcernArgs.hasLevel()) {
         if (!readConcernSupport.readConcernSupport.isOK()) {
             return readConcernSupport.readConcernSupport.withContext(
                 str::stream() << "Command " << invocation->definition()->getName()
@@ -379,7 +392,7 @@ LogicalTime getClientOperationTime(OperationContext* opCtx) {
     }
 
     return LogicalTime(
-        repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp().getTimestamp());
+        repl::ReplClientInfo::forClient(opCtx->getClient()).getMaxKnownOpTime().getTimestamp());
 }
 
 /**
@@ -517,14 +530,15 @@ void _abortUnpreparedOrStashPreparedTransaction(
             txnParticipant->abortTransaction(opCtx);
     } catch (...) {
         // It is illegal for this to throw so we catch and log this here for diagnosability.
-        LOGV2_FATAL(21974,
-                    "Caught exception during transaction "
-                    "{opCtx_getTxnNumber}{isPrepared_stash_abort}{opCtx_getLogicalSessionId}: "
-                    "{exceptionToStatus}",
-                    "opCtx_getTxnNumber"_attr = opCtx->getTxnNumber(),
-                    "isPrepared_stash_abort"_attr = (isPrepared ? " stash " : " abort "),
-                    "opCtx_getLogicalSessionId"_attr = opCtx->getLogicalSessionId()->toBSON(),
-                    "exceptionToStatus"_attr = exceptionToStatus());
+        LOGV2_FATAL_CONTINUE(
+            21974,
+            "Caught exception during transaction "
+            "{opCtx_getTxnNumber}{isPrepared_stash_abort}{opCtx_getLogicalSessionId}: "
+            "{exceptionToStatus}",
+            "opCtx_getTxnNumber"_attr = opCtx->getTxnNumber(),
+            "isPrepared_stash_abort"_attr = (isPrepared ? " stash " : " abort "),
+            "opCtx_getLogicalSessionId"_attr = opCtx->getLogicalSessionId()->toBSON(),
+            "exceptionToStatus"_attr = exceptionToStatus());
         std::terminate();
     }
 }
@@ -606,6 +620,28 @@ void invokeWithSessionCheckedOut(OperationContext* opCtx,
         _abortUnpreparedOrStashPreparedTransaction(opCtx, &txnParticipant);
     });
 
+    if (!opCtx->getClient()->isInDirectClient()) {
+        const auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
+
+        // For replica sets, we do not receive the readConcernArgs of our parent transaction
+        // statements until we unstash the transaction resources. The below check is necessary to
+        // ensure commands, including those occurring after the first statement in their respective
+        // transactions, are checked for readConcern support. Presently, only `create` and
+        // `createIndexes` do not support readConcern inside transactions.
+        // TODO(SERVER-46971): Consider how to extend this check to other commands.
+        auto cmdName = invocation->definition()->getName();
+        auto readConcernSupport = invocation->supportsReadConcern(readConcernArgs.getLevel());
+        if (readConcernArgs.hasLevel() &&
+            (cmdName == "create"_sd || cmdName == "createIndexes"_sd)) {
+            if (!readConcernSupport.readConcernSupport.isOK()) {
+                uassertStatusOK(readConcernSupport.readConcernSupport.withContext(
+                    str::stream() << "Command " << cmdName
+                                  << " does not support this transaction's "
+                                  << readConcernArgs.toString()));
+            }
+        }
+    }
+
     try {
         CommandHelpers::runCommandInvocation(opCtx, request, invocation, replyBuilder);
     } catch (const ExceptionFor<ErrorCodes::CommandOnShardedViewNotSupportedOnMongod>&) {
@@ -674,6 +710,9 @@ bool runCommandImpl(OperationContext* opCtx,
 #endif
     replyBuilder->reserveBytes(bytesToReserve);
 
+    const auto isInternalClient = opCtx->getClient()->session() &&
+        (opCtx->getClient()->session()->getTags() & transport::Session::kInternalClient);
+
     const bool shouldCheckOutSession =
         sessionOptions.getTxnNumber() && !shouldCommandSkipSessionCheckout(command->getName());
 
@@ -703,16 +742,30 @@ bool runCommandImpl(OperationContext* opCtx,
             // a shard/config server.
             if (!opCtx->getClient()->isInDirectClient() &&
                 (!opCtx->inMultiDocumentTransaction() ||
-                 isTransactionCommand(command->getName())) &&
-                (serverGlobalParams.clusterRole == ClusterRole::ShardServer ||
-                 serverGlobalParams.clusterRole == ClusterRole::ConfigServer) &&
-                !request.body.hasField(WriteConcernOptions::kWriteConcernField)) {
-                // TODO: Disabled until after SERVER-44539, to avoid log spam.
-                // LOGV2(21959, "Missing writeConcern on {command_getName}", "command_getName"_attr
-                // = command->getName());
+                 isTransactionCommand(command->getName()))) {
+                if (serverGlobalParams.featureCompatibility.isVersion(
+                        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44)) {
+                    if (isInternalClient) {
+                        // WriteConcern should always be explicitly specified by operations received
+                        // from internal clients (ie. from a mongos or mongod), even if it is empty
+                        // (ie. writeConcern: {}, which is equivalent to { w: 1, wtimeout: 0 }).
+                        uassert(
+                            4569201,
+                            "received command without explicit writeConcern on an internalClient connection {}"_format(
+                                redact(request.body.toString())),
+                            request.body.hasField(WriteConcernOptions::kWriteConcernField));
+                    } else if (serverGlobalParams.clusterRole == ClusterRole::ShardServer ||
+                               serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+                        if (!request.body.hasField(WriteConcernOptions::kWriteConcernField)) {
+                            // TODO: Disabled until after SERVER-44539, to avoid log spam.
+                            // LOGV2(21959, "Missing writeConcern on {command_getName}",
+                            // "command_getName"_attr = command->getName());
+                        }
+                    }
+                }
             }
             extractedWriteConcern.emplace(
-                uassertStatusOK(extractWriteConcern(opCtx, request.body)));
+                uassertStatusOK(extractWriteConcern(opCtx, request.body, isInternalClient)));
             if (sessionOptions.getAutocommit()) {
                 validateWriteConcernForTransaction(*extractedWriteConcern,
                                                    invocation->definition()->getName());
@@ -846,8 +899,6 @@ bool runCommandImpl(OperationContext* opCtx,
         if (response.hasField("writeConcernError")) {
             wcCode = ErrorCodes::Error(response["writeConcernError"]["code"].numberInt());
         }
-        auto isInternalClient = opCtx->getClient()->session() &&
-            (opCtx->getClient()->session()->getTags() & transport::Session::kInternalClient);
         appendErrorLabelsAndTopologyVersion(
             opCtx, &body, sessionOptions, command->getName(), code, wcCode, isInternalClient);
     }
@@ -878,6 +929,9 @@ void execCommandDatabase(OperationContext* opCtx,
     CommandInvocation::set(opCtx, invocation);
 
     OperationSessionInfoFromClient sessionOptions;
+
+    const auto isInternalClient = opCtx->getClient()->session() &&
+        (opCtx->getClient()->session()->getTags() & transport::Session::kInternalClient);
 
     try {
         {
@@ -1044,8 +1098,8 @@ void execCommandDatabase(OperationContext* opCtx,
             opCtx->getClient()->isInDirectClient() && opCtx->inMultiDocumentTransaction();
         bool startTransaction = static_cast<bool>(sessionOptions.getStartTransaction());
         if (!skipReadConcern) {
-            auto newReadConcernArgs = uassertStatusOK(
-                _extractReadConcern(opCtx, invocation.get(), request.body, startTransaction));
+            auto newReadConcernArgs = uassertStatusOK(_extractReadConcern(
+                opCtx, invocation.get(), request.body, startTransaction, isInternalClient));
 
             // Ensure that the RC being set on the opCtx has provenance.
             invariant(newReadConcernArgs.getProvenance().hasSource(),
@@ -1163,8 +1217,6 @@ void execCommandDatabase(OperationContext* opCtx,
         if (response.hasField("writeConcernError")) {
             wcCode = ErrorCodes::Error(response["writeConcernError"]["code"].numberInt());
         }
-        auto isInternalClient = opCtx->getClient()->session() &&
-            (opCtx->getClient()->session()->getTags() & transport::Session::kInternalClient);
         appendErrorLabelsAndTopologyVersion(opCtx,
                                             &extraFieldsBuilder,
                                             sessionOptions,
@@ -1181,7 +1233,7 @@ void execCommandDatabase(OperationContext* opCtx,
         auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
         if (readConcernArgs.isEmpty()) {
             auto readConcernArgsStatus =
-                _extractReadConcern(opCtx, invocation.get(), request.body, false);
+                _extractReadConcern(opCtx, invocation.get(), request.body, false, isInternalClient);
             if (readConcernArgsStatus.isOK()) {
                 // We must obtain the client lock to set the ReadConcernArgs on the operation
                 // context as it may be concurrently read by CurrentOp.
@@ -1229,6 +1281,7 @@ DbResponse receivedCommands(OperationContext* opCtx,
                             const ServiceEntryPointCommon::Hooks& behaviors) {
     auto replyBuilder = rpc::makeReplyBuilder(rpc::protocolForMessage(message));
     OpMsgRequest request;
+    Command* c = nullptr;
     [&] {
         try {  // Parse.
             request = rpc::opMsgRequestFromAnyProtocol(message);
@@ -1259,7 +1312,6 @@ DbResponse receivedCommands(OperationContext* opCtx,
         try {  // Execute.
             curOpCommandSetup(opCtx, request);
 
-            Command* c = nullptr;
             // In the absence of a Command object, no redaction is possible. Therefore
             // to avoid displaying potentially sensitive information in the logs,
             // we restrict the log message to the name of the unrecognized command.
@@ -1321,7 +1373,8 @@ DbResponse receivedCommands(OperationContext* opCtx,
     if (OpMsg::isFlagSet(message, OpMsg::kMoreToCome)) {
         // Close the connection to get client to go through server selection again.
         if (LastError::get(opCtx->getClient()).hadNotMasterError()) {
-            notMasterUnackWrites.increment();
+            if (c && c->getReadWriteType() == Command::ReadWriteType::kWrite)
+                notMasterUnackWrites.increment();
             uasserted(ErrorCodes::NotMaster,
                       str::stream()
                           << "Not-master error while processing '" << request.getCommandName()

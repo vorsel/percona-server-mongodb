@@ -33,6 +33,11 @@
 
 #include "mongo/db/log_process_details.h"
 
+#include <ostream>
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/server_options.h"
@@ -44,40 +49,44 @@
 
 namespace mongo {
 
+namespace {
+
 bool is32bit() {
     return (sizeof(int*) == 4);
 }
 
-void logProcessDetails() {
+}  // namespace
+
+void logProcessDetails(std::ostream* os) {
     auto&& vii = VersionInfoInterface::instance();
-    LOGV2(20719, "{mongodVersion_vii}", "mongodVersion_vii"_attr = mongodVersion(vii));
-    vii.logBuildInfo();
-
-    ProcessInfo p;
-    LOGV2(51765,
-          "operating system: {name}, version: {version}",
-          "name"_attr = p.getOsName(),
-          "version"_attr = p.getOsVersion());
-
     if (ProcessInfo::getMemSizeMB() < ProcessInfo::getSystemMemSizeMB()) {
-        LOGV2(20720,
-              "{ProcessInfo_getMemSizeMB} MB of memory available to the process out of "
-              "{ProcessInfo_getSystemMemSizeMB} MB total system memory",
-              "ProcessInfo_getMemSizeMB"_attr = ProcessInfo::getMemSizeMB(),
-              "ProcessInfo_getSystemMemSizeMB"_attr = ProcessInfo::getSystemMemSizeMB());
+        LOGV2_WARNING(20720,
+                      "Available memory is less than system memory",
+                      "availableMemSizeMB"_attr = ProcessInfo::getMemSizeMB(),
+                      "systemMemSizeMB"_attr = ProcessInfo::getSystemMemSizeMB());
     }
-
-    printCommandLineOpts();
+    auto osInfo = BSONObjBuilder()
+                      .append("name", ProcessInfo::getOsName())
+                      .append("version", ProcessInfo::getOsVersion())
+                      .obj();
+    vii.logBuildInfo(os);
+    if (os) {
+        *os << format(FMT_STRING("Operating System: {}"),
+                      tojson(osInfo, ExtendedRelaxedV2_0_0, true))
+            << std::endl;
+    } else {
+        LOGV2(51765, "Operating System", "os"_attr = osInfo);
+    }
+    printCommandLineOpts(os);
 }
 
 void logProcessDetailsForLogRotate(ServiceContext* serviceContext) {
     LOGV2(20721,
-          "pid={ProcessId_getCurrent} port={serverGlobalParams_port}{is32bit_32_64}-bit "
-          "host={getHostNameCached}",
-          "ProcessId_getCurrent"_attr = ProcessId::getCurrent(),
-          "serverGlobalParams_port"_attr = serverGlobalParams.port,
-          "is32bit_32_64"_attr = (is32bit() ? " 32" : " 64"),
-          "getHostNameCached"_attr = getHostNameCached());
+          "Process Details",
+          "pid"_attr = ProcessId::getCurrent(),
+          "port"_attr = serverGlobalParams.port,
+          "architecture"_attr = (is32bit() ? "32-bit" : "64-bit"),
+          "host"_attr = getHostNameCached());
 
     auto replCoord = repl::ReplicationCoordinator::get(serviceContext);
     if (replCoord != nullptr &&
@@ -85,16 +94,16 @@ void logProcessDetailsForLogRotate(ServiceContext* serviceContext) {
         auto rsConfig = replCoord->getConfig();
 
         if (rsConfig.isInitialized()) {
-            LOGV2(20722, "Replica Set Config: {rsConfig}", "rsConfig"_attr = rsConfig.toBSON());
-            LOGV2(20723,
-                  "Replica Set Member State: {replCoord_getMemberState}",
-                  "replCoord_getMemberState"_attr = (replCoord->getMemberState()).toString());
+            LOGV2(20722,
+                  "Replica Set Config",
+                  "config"_attr = rsConfig,
+                  "memberState"_attr = replCoord->getMemberState());
         } else {
             LOGV2(20724, "Node currently has no Replica Set Config.");
         }
     }
 
-    logProcessDetails();
+    logProcessDetails(nullptr);
 }
 
 }  // namespace mongo

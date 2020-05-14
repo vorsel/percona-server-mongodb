@@ -124,15 +124,6 @@ var doTest = function(signal) {
 
     t.save({a: 1000});
     t.ensureIndex({a: 1});
-
-    var result = db.runCommand({getLastError: 1, w: 3, wtimeout: 30000});
-    printjson(result);
-    var lastOp = result.lastOp;
-    const oplogEntries = replTest.dumpOplog(master);
-    const lastOplogOp = oplogEntries[0];
-    assert.eq(lastOplogOp['ts'], lastOp['ts']);
-    assert.eq(lastOplogOp['t'], lastOp['t']);
-
     replTest.waitForAllIndexBuildsToFinish('foo', 'foo');
 
     ts.forEach(function(z) {

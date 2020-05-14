@@ -327,7 +327,8 @@ Status ReplicationCoordinatorNoOp::doReplSetReconfig(OperationContext* opCtx,
     MONGO_UNREACHABLE;
 }
 
-Status ReplicationCoordinatorNoOp::awaitConfigCommitment(OperationContext* opCtx) {
+Status ReplicationCoordinatorNoOp::awaitConfigCommitment(OperationContext* opCtx,
+                                                         bool waitForOplogCommitment) {
     MONGO_UNREACHABLE;
 }
 
@@ -351,10 +352,6 @@ Status ReplicationCoordinatorNoOp::processReplSetUpdatePosition(const UpdatePosi
 }
 
 std::vector<HostAndPort> ReplicationCoordinatorNoOp::getHostsWrittenTo(const OpTime&, bool) {
-    MONGO_UNREACHABLE;
-}
-
-std::vector<HostAndPort> ReplicationCoordinatorNoOp::getOtherNodesInReplSet() const {
     MONGO_UNREACHABLE;
 }
 
@@ -391,7 +388,7 @@ void ReplicationCoordinatorNoOp::resetLastOpTimesFromOplog(OperationContext*, Da
 
 bool ReplicationCoordinatorNoOp::shouldChangeSyncSource(const HostAndPort&,
                                                         const rpc::ReplSetMetadata&,
-                                                        boost::optional<rpc::OplogQueryMetadata>) {
+                                                        const rpc::OplogQueryMetadata&) {
     MONGO_UNREACHABLE;
 }
 

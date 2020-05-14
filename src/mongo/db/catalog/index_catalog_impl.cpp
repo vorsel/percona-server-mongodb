@@ -101,12 +101,22 @@ Status IndexCatalogImpl::init(OperationContext* opCtx) {
     vector<string> indexNames;
     auto durableCatalog = DurableCatalog::get(opCtx);
     durableCatalog->getAllIndexes(opCtx, _collection->getCatalogId(), &indexNames);
+    const bool replSetMemberInStandaloneMode =
+        getReplSetMemberInStandaloneMode(opCtx->getServiceContext());
 
     for (size_t i = 0; i < indexNames.size(); i++) {
         const string& indexName = indexNames[i];
         BSONObj spec =
             durableCatalog->getIndexSpec(opCtx, _collection->getCatalogId(), indexName).getOwned();
         BSONObj keyPattern = spec.getObjectField("key");
+
+        if (spec.hasField(IndexDescriptor::kGeoHaystackBucketSize)) {
+            LOGV2_OPTIONS(4670602,
+                          {logv2::LogTag::kStartupWarnings},
+                          "Found an existing geoHaystack index in the catalog. Support for "
+                          "geoHaystack indexes has been deprecated. Instead create a 2d index. See "
+                          "https://dochub.mongodb.org/core/4.4-deprecate-geoHaystack");
+        }
         auto descriptor =
             std::make_unique<IndexDescriptor>(_collection, _getAccessMethodName(keyPattern), spec);
         if (spec.hasField(IndexDescriptor::kExpireAfterSecondsFieldName)) {
@@ -114,28 +124,34 @@ Status IndexCatalogImpl::init(OperationContext* opCtx) {
                 .registerTTLInfo(std::make_pair(_collection->uuid(), indexName));
         }
 
-        // We intentionally do not drop or rebuild unfinished two-phase index builds before
-        // initializing the IndexCatalog when starting a replica set member in standalone mode. This
-        // is because the index build cannot complete until it receives a replicated commit or
-        // abort oplog entry.
-        if (!durableCatalog->isIndexReady(opCtx, _collection->getCatalogId(), indexName)) {
-            invariant(getReplSetMemberInStandaloneMode(opCtx->getServiceContext()));
+        bool ready = durableCatalog->isIndexReady(opCtx, _collection->getCatalogId(), indexName);
+        if (!ready) {
             auto buildUUID =
                 durableCatalog->getIndexBuildUUID(opCtx, _collection->getCatalogId(), indexName);
-            invariant(buildUUID);
-
-            // Indicate that this index is "frozen". It is not ready but is not currently in
-            // progress either. These indexes may be dropped.
-            auto flags = CreateIndexEntryFlags::kInitFromDisk | CreateIndexEntryFlags::kFrozen;
+            invariant(buildUUID,
+                      str::stream()
+                          << "collection: " << _collection->ns() << "index:" << indexName);
+            // We intentionally do not drop or rebuild unfinished two-phase index builds before
+            // initializing the IndexCatalog when starting a replica set member in standalone mode.
+            // This is because the index build cannot complete until it receives a replicated commit
+            // or abort oplog entry.
+            if (replSetMemberInStandaloneMode) {
+                // Indicate that this index is "frozen". It is not ready but is not currently in
+                // progress either. These indexes may be dropped.
+                auto flags = CreateIndexEntryFlags::kInitFromDisk | CreateIndexEntryFlags::kFrozen;
+                IndexCatalogEntry* entry = createIndexEntry(opCtx, std::move(descriptor), flags);
+                fassert(31433, !entry->isReady(opCtx));
+            } else {
+                // Initializing with unfinished indexes may occur during rollback or startup.
+                auto flags = CreateIndexEntryFlags::kInitFromDisk;
+                IndexCatalogEntry* entry = createIndexEntry(opCtx, std::move(descriptor), flags);
+                fassert(4505500, !entry->isReady(opCtx));
+            }
+        } else {
+            auto flags = CreateIndexEntryFlags::kInitFromDisk | CreateIndexEntryFlags::kIsReady;
             IndexCatalogEntry* entry = createIndexEntry(opCtx, std::move(descriptor), flags);
-            fassert(31433, !entry->isReady(opCtx));
-            continue;
+            fassert(17340, entry->isReady(opCtx));
         }
-
-        auto flags = CreateIndexEntryFlags::kInitFromDisk | CreateIndexEntryFlags::kIsReady;
-        IndexCatalogEntry* entry = createIndexEntry(opCtx, std::move(descriptor), flags);
-
-        fassert(17340, entry->isReady(opCtx));
     }
 
     CollectionQueryInfo::get(_collection).init(opCtx);
@@ -303,6 +319,9 @@ void IndexCatalogImpl::_logInternalState(OperationContext* opCtx,
     }
 }
 
+namespace {
+std::string lastHaystackIndexLogged = "";
+}
 StatusWith<BSONObj> IndexCatalogImpl::prepareSpecForCreate(OperationContext* opCtx,
                                                            const BSONObj& original) const {
     auto swValidatedAndFixed = _validateAndFixIndexSpec(opCtx, original);
@@ -311,15 +330,29 @@ StatusWith<BSONObj> IndexCatalogImpl::prepareSpecForCreate(OperationContext* opC
             str::stream() << "Error in specification " << original.toString());
     }
 
+    auto validatedSpec = swValidatedAndFixed.getValue();
+    auto indexName = validatedSpec.getField("name").String();
+    // This gets hit twice per index, so we keep track of what we last logged to avoid logging the
+    // same line for the same index twice.
+    if (validatedSpec.hasField(IndexDescriptor::kGeoHaystackBucketSize) &&
+        lastHaystackIndexLogged.compare(indexName) != 0) {
+        LOGV2_OPTIONS(4670601,
+                      {logv2::LogTag::kStartupWarnings},
+                      "Support for "
+                      "geoHaystack indexes has been deprecated. Instead create a 2d index. See "
+                      "https://dochub.mongodb.org/core/4.4-deprecate-geoHaystack");
+        lastHaystackIndexLogged = indexName;
+    }
+
     // Check whether this is a non-_id index and there are any settings disallowing this server
     // from building non-_id indexes.
-    Status status = _isNonIDIndexAndNotAllowedToBuild(opCtx, swValidatedAndFixed.getValue());
+    Status status = _isNonIDIndexAndNotAllowedToBuild(opCtx, validatedSpec);
     if (!status.isOK()) {
         return status;
     }
 
     // First check against only the ready indexes for conflicts.
-    status = _doesSpecConflictWithExisting(opCtx, swValidatedAndFixed.getValue(), false);
+    status = _doesSpecConflictWithExisting(opCtx, validatedSpec, false);
     if (!status.isOK()) {
         return status;
     }
@@ -329,7 +362,7 @@ StatusWith<BSONObj> IndexCatalogImpl::prepareSpecForCreate(OperationContext* opC
     // The index catalog cannot currently iterate over only in-progress indexes. So by previously
     // checking against only ready indexes without error, we know that any errors encountered
     // checking against all indexes occurred due to an in-progress index.
-    status = _doesSpecConflictWithExisting(opCtx, swValidatedAndFixed.getValue(), true);
+    status = _doesSpecConflictWithExisting(opCtx, validatedSpec, true);
     if (!status.isOK()) {
         if (ErrorCodes::IndexAlreadyExists == status.code()) {
             // Callers need to be able to distinguish conflicts against ready indexes versus
@@ -339,7 +372,7 @@ StatusWith<BSONObj> IndexCatalogImpl::prepareSpecForCreate(OperationContext* opC
         return status;
     }
 
-    return swValidatedAndFixed.getValue();
+    return validatedSpec;
 }
 
 std::vector<BSONObj> IndexCatalogImpl::removeExistingIndexesNoChecks(
@@ -387,13 +420,12 @@ IndexCatalogEntry* IndexCatalogImpl::createIndexEntry(OperationContext* opCtx,
                                                       CreateIndexEntryFlags flags) {
     Status status = _isSpecOk(opCtx, descriptor->infoObj());
     if (!status.isOK()) {
-        LOGV2_FATAL(20378,
-                    "Found an invalid index {descriptor_infoObj} on the {collection_ns} "
-                    "collection: {status}",
-                    "descriptor_infoObj"_attr = descriptor->infoObj(),
-                    "collection_ns"_attr = _collection->ns(),
-                    "status"_attr = redact(status));
-        fassertFailedNoTrace(28782);
+        LOGV2_FATAL_NOTRACE(28782,
+                            "Found an invalid index {descriptor_infoObj} on the {collection_ns} "
+                            "collection: {status}",
+                            "descriptor_infoObj"_attr = descriptor->infoObj(),
+                            "collection_ns"_attr = _collection->ns(),
+                            "status"_attr = redact(status));
     }
 
     auto engine = opCtx->getServiceContext()->getStorageEngine();
@@ -1386,7 +1418,7 @@ Status IndexCatalogImpl::_indexFilteredRecords(OperationContext* opCtx,
 
         index->accessMethod()->getKeys(*bsonRecord.docPtr,
                                        options.getKeysMode,
-                                       IndexAccessMethod::GetKeysContext::kReadOrAddKeys,
+                                       IndexAccessMethod::GetKeysContext::kAddingKeys,
                                        &keys,
                                        &multikeyMetadataKeys,
                                        &multikeyPaths,

@@ -372,7 +372,6 @@ variables:
   - enterprise-ubuntu1804-ppc64le
   - enterprise-ubuntu1804-s390x
   - enterprise-windows
-  - enterprise-windows-async
   - enterprise-windows-compile-all
   - enterprise-windows-debug-unoptimized
   - enterprise-windows-inmem
@@ -383,7 +382,6 @@ variables:
   - ubuntu1804-debug-ubsan
   - ubuntu1804-debug-aubsan-lite
   - ubuntu1804-debug-aubsan-lite_fuzzer
-  - ubuntu1804-debug-aubsan-async
 
 
 # List of all variants that make mh artifacts.
@@ -436,7 +434,6 @@ variables:
   - ubuntu-dynamic-1604-clang
   - ubuntu1804
   - ubuntu1804-arm64
-  - ubuntu1804-debug-aubsan-async
   - ubuntu1804-s390x
   - enterprise-ubuntu1804-64
   - enterprise-ubuntu1804-arm64
@@ -1285,12 +1282,12 @@ functions:
       file: src/perf.json
 
   "do setup":
+  - *set_task_expansion_macros
   - *fetch_artifacts
   - *update_bypass_expansions
   - *fetch_binaries
   - *fetch_debugsymbols_archive
   - *extract_binaries
-  - *set_task_expansion_macros
   - *set_up_virtualenv
   - *upload_pip_requirements
   - *check_binary_version
@@ -4461,6 +4458,17 @@ tasks:
         ${activate_virtualenv}
         find buildscripts etc jstests -name '*.y*ml' -exec yamllint -c etc/yamllint_config.yml {} +
 
+- name: lint_errorcodes
+  commands:
+    - command: manifest.load
+    - func: "git get project"
+    - func: "set task expansion macros"
+    - func: "set up virtualenv"
+    - func: "upload pip requirements"
+    - func: "scons lint"
+      vars:
+        targets: lint-errorcodes
+
 - name: burn_in_tests_gen
   commands:
   - command: manifest.load
@@ -5271,6 +5279,16 @@ tasks:
       resmoke_args: "--storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: jstestfuzz_sharded_session
 
+## Tests that the multiversion test generation logic is not broken.
+- name: multiversion_sanity_check_gen
+  commands:
+  - func: "generate multiversion tasks"
+    vars:
+      suite: replica_sets_jscore_passthrough
+      resmoke_args: --storageEngine=wiredTiger --includeWithAnyTags=multiversion_sanity_check
+      task_path_suffix: /data/multiversion
+      fallback_num_sub_suites: 1
+
 - name: replica_sets_jscore_multiversion_passthrough_gen
   tags: ["multiversion_passthrough"]
   commands:
@@ -5402,7 +5420,7 @@ tasks:
 
 - <<: *task_template
   name: aggregation_secondary_reads
-  tags: ["aggregation", "secondary_reads"]
+  tags: ["aggregation", "secondary_reads", "large"]
   depends_on:
   - name: aggregation
   commands:
@@ -6099,6 +6117,15 @@ tasks:
       suite: sharded_causally_consistent_jscore_txns_passthrough
       resmoke_args: --storageEngine=wiredTiger --excludeWithAnyTags=uses_snapshot_read_concern
       fallback_num_sub_suites: 1
+
+- <<: *task_template
+  name: causally_consistent_hedged_reads_jscore_passthrough
+  tags: ["causally_consistent"]
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=causally_consistent_hedged_reads_jscore_passthrough --storageEngine=wiredTiger
 
 - <<: *task_template
   name: sharded_collections_causally_consistent_jscore_txns_passthrough
@@ -8696,6 +8723,8 @@ buildvariants:
     distros:
     - ubuntu1604-packer
   - name: .publish
+    distros:
+    - ubuntu1804-small
 
 - name: enterprise-ubuntu1804-64
   display_name: Enterprise Ubuntu 18.04
@@ -8751,6 +8780,8 @@ buildvariants:
     distros:
     - ubuntu1604-packer
   - name: .publish
+    distros:
+    - ubuntu1804-small
 
 - name: ubuntu1604
   display_name: Ubuntu 16.04
@@ -8814,6 +8845,8 @@ buildvariants:
     distros:
     - ubuntu1604-packer
   - name: .publish
+    distros:
+    - ubuntu1604-small
 
 - name: enterprise-ubuntu1604-arm64
   display_name: Enterprise Ubuntu 16.04 arm64
@@ -9106,6 +9139,8 @@ buildvariants:
     distros:
     - ubuntu1604-packer
   - name: .publish
+    distros:
+    - amazon1-2018-small
 
 - name: amazon
   display_name: Amazon Linux
@@ -9157,6 +9192,8 @@ buildvariants:
     distros:
     - ubuntu1604-packer
   - name: .publish
+    distros:
+    - amazon1-2018-small
 
 - name: enterprise-amazon2
   display_name: "Enterprise Amazon Linux 2"
@@ -9213,6 +9250,8 @@ buildvariants:
     distros:
     - ubuntu1604-packer
   - name: .publish
+    distros:
+    - amazon2-small
 
 - name: amazon2
   display_name: Amazon Linux 2
@@ -9268,6 +9307,8 @@ buildvariants:
     distros:
     - ubuntu1604-packer
   - name: .publish
+    distros:
+    - amazon2-small
 
 - name: tig-daily-cron
   modules:
@@ -9305,7 +9346,10 @@ buildvariants:
   - name: compile_all_run_unittests_TG
     distros:
     - windows-64-vs2019-large
-  - name: .aggregation !.auth !.encrypt
+  - name: .aggregation !.auth !.encrypt !.large
+  - name: .aggregation .large
+    distros:
+    - windows-64-vs2019-large
   - name: aggregation_expression_multiversion_fuzzer_gen
   - name: aggregation_expression_optimization_fuzzer_gen
   - name: auth_gen
@@ -9477,38 +9521,6 @@ buildvariants:
     <<: *enterprise-windows-nopush-expansions-template
     use_wt_develop: true
 
-- name: enterprise-windows-async
-  display_name: "~ Enterprise Windows async"
-  modules:
-  - enterprise
-  run_on:
-  - windows-64-vs2019-small
-  stepback: true
-  batchtime: 10080 # 7 days
-  expansions:
-    additional_targets: archive-mongocryptd archive-mongocryptd-debug
-    msi_target: msi
-    exe: ".exe"
-    content_type: application/zip
-    compile_flags: --ssl MONGO_DISTMOD=windows CPPPATH="c:/sasl/include c:/snmp/include" LIBPATH="c:/sasl/lib c:/snmp/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --win-version-min=win10
-    # We invoke SCons using --jobs = (# of CPUs / 4) to avoid causing out of memory errors due to
-    # spawning a large number of linker processes.
-    num_scons_link_jobs_available: $(( $(grep -c ^processor /proc/cpuinfo) / 4 ))
-    python: '/cygdrive/c/python/python37/python.exe'
-    ext: zip
-    scons_cache_scope: shared
-    test_flags: |- # Use the ServiceExecutorAdaptive with a reasonable number of starting threads
-        --serviceExecutor=adaptive \
-        --mongodSetParameters="adaptiveServiceExecutorReservedThreads: 8" \
-        --mongosSetParameters="adaptiveServiceExecutorReservedThreads: 8"
-  tasks:
-  - name: compile_TG
-    distros:
-    - windows-64-vs2019-large
-  - name: jsCore
-  - name: replica_sets
-  - name: sharding_gen
-
 - name: enterprise-windows-inmem
   display_name: Enterprise Windows (inMemory)
   modules:
@@ -9584,7 +9596,10 @@ buildvariants:
     distros:
     - windows-64-vs2019-large
   - name: .aggfuzzer
-  - name: .aggregation !.auth !.encrypt !.unwind
+  - name: .aggregation !.auth !.encrypt !.unwind !.large
+  - name: .aggregation .large
+    distros:
+    - windows-64-vs2019-large
   - name: auth_gen
   - name: .auth .gle
   - name: causally_consistent_jscore_txns_passthrough
@@ -9852,6 +9867,7 @@ buildvariants:
   - name: lint_cpplint
   - name: lint_fuzzer_sanity_patch
   - name: lint_yaml
+  - name: lint_errorcodes
   - name: burn_in_tests_gen
   - name: burn_in_tests_multiversion_gen
   - name: .aggfuzzer
@@ -9882,11 +9898,13 @@ buildvariants:
   - name: jsonSchema
   - name: .jstestfuzz !.flow_control  # Flow control jstestfuzz take longer.
   - name: libunwind_tests
+  - name: multiversion_sanity_check_gen
   - name: mqlrun
   - name: .multi_shard
   - name: multi_stmt_txn_jscore_passthrough_with_migration_gen
   - name: multiversion_gen
   - name: .query_fuzzer
+  - name: .random_multiversion_replica_sets
   - name: .read_write_concern .large
     distros:
     - rhel62-large
@@ -9916,6 +9934,8 @@ buildvariants:
     distros:
     - ubuntu1604-packer
   - name: .publish
+    distros:
+        - rhel62-small
   - name: server_discovery_and_monitoring_json_test_TG
 
 - name: enterprise-rhel-62-64-bit-large-txns-format
@@ -10287,7 +10307,6 @@ buildvariants:
     - name: jsCore_txns_large_txns_format
     - name: jsCore_minimum_batch_size
     - name: jsCore_op_query
-    - name: .jstestfuzz_multiversion_gen
     - name: libunwind_tests
     - name: .logical_session_cache .one_sec
     - name: .multi_shard .common
@@ -10370,7 +10389,7 @@ buildvariants:
     - ubuntu1604-packer
   - name: .publish
     distros:
-    - rhel70
+    - rhel70-small
 
 - &enterprise-rhel-80-64-bit-template
   name: enterprise-rhel-80-64-bit
@@ -10427,6 +10446,8 @@ buildvariants:
     distros:
     - ubuntu1604-packer
   - name: .publish
+    distros:
+    - rhel80-small
 
 # This variant is to intentionally test uncommon features nightly
 - <<: *enterprise-rhel-70-64-bit-template
@@ -10585,6 +10606,8 @@ buildvariants:
     distros:
     - ubuntu1604-packer
   - name: .publish
+    distros:
+    - rhel62-small
 
 - name: rhel70
   display_name: RHEL 7.0
@@ -10635,7 +10658,7 @@ buildvariants:
     - ubuntu1604-packer
   - name: .publish
     distros:
-    - rhel70
+    - rhel70-small
 
 - name: rhel80
   display_name: RHEL 8.0
@@ -10685,6 +10708,8 @@ buildvariants:
     distros:
     - ubuntu1604-packer
   - name: .publish
+    distros:
+    - rhel80-small
 
 # This variant compiles on RHEL 7.0 and runs tests on RHEL 7.6
 - name: rhel76_compile_rhel70
@@ -10749,7 +10774,7 @@ buildvariants:
   - name: .stitch
   - name: .publish
     distros:
-    - rhel70
+    - rhel70-small
 
 - name: enterprise-rhel-72-s390x
   display_name: Enterprise RHEL 7.2 s390x
@@ -10800,7 +10825,7 @@ buildvariants:
   - name: .stitch
   - name: .publish
     distros:
-    - rhel70
+    - rhel70-small
 
 - name: enterprise-rhel-67-s390x
   display_name: Enterprise RHEL 6.7 s390x
@@ -10844,7 +10869,7 @@ buildvariants:
   - name: secondary_reads_passthrough_gen
   - name: .publish
     distros:
-    - rhel62-large
+    - rhel62-small
 
 - name: rhel-72-s390x
   display_name: RHEL 7.2 s390x
@@ -10870,7 +10895,7 @@ buildvariants:
   - name: ssl_gen
   - name: .publish
     distros:
-    - rhel70
+    - rhel70-small
 
 - name: rhel-67-s390x
   display_name: RHEL 6.7 s390x
@@ -10896,7 +10921,7 @@ buildvariants:
   - name: ssl_gen
   - name: .publish
     distros:
-    - rhel62-large
+    - rhel62-small
 
 ###########################################
 #          Ubuntu buildvariants           #
@@ -10950,6 +10975,8 @@ buildvariants:
     distros:
     - ubuntu1604-packer
   - name: .publish
+    distros:
+    - ubuntu1604-small
 
 
 - name: enterprise-ubuntu-dynamic-1604-clang
@@ -11054,6 +11081,8 @@ buildvariants:
     distros:
     - ubuntu1604-packer
   - name: .publish
+    distros:
+    - suse12-small
 
 - name: enterprise-suse12-s390x
   display_name: Enterprise SLES 12 s390x
@@ -11181,6 +11210,8 @@ buildvariants:
   - name: .ssl
   - name: .stitch
   - name: .publish
+    distros:
+    - suse12-small
 
 - name: enterprise-suse15-64
   display_name: Enterprise SLES 15
@@ -11219,6 +11250,8 @@ buildvariants:
   - name: snmp
   - name: .stitch
   - name: .publish
+    distros:
+    - suse15-small
 
 - name: suse15
   display_name: SUSE 15
@@ -11264,6 +11297,8 @@ buildvariants:
   - name: .ssl
   - name: .stitch
   - name: .publish
+    distros:
+    - suse15-small
 
 ###########################################
 #          Debian buildvariants           #
@@ -11315,6 +11350,8 @@ buildvariants:
     distros:
     - ubuntu1604-packer
   - name: .publish
+    distros:
+    - debian92-small
 
 - name: debian92
   display_name: Debian 9.2
@@ -11367,6 +11404,8 @@ buildvariants:
     distros:
     - ubuntu1604-packer
   - name: .publish
+    distros:
+    - debian92-small
 
 - name: enterprise-debian10-64
   display_name: Enterprise Debian 10
@@ -11414,6 +11453,8 @@ buildvariants:
     distros:
     - ubuntu1604-packer
   - name: .publish
+    distros:
+    - debian10-small
 
 - name: debian10
   display_name: Debian 10
@@ -11466,6 +11507,8 @@ buildvariants:
     distros:
     - ubuntu1604-packer
   - name: .publish
+    distros:
+    - debian10-small
 
 ################################
 # storage engine buildvariants #
@@ -11727,7 +11770,6 @@ buildvariants:
   - name: jsCore_op_query
   - name: jsCore_txns_large_txns_format
   - name: jsonSchema
-  - name: .jstestfuzz_multiversion_gen
   - name: .logical_session_cache
   - name: .multi_shard .common
   - name: multiversion_gen
@@ -11776,6 +11818,7 @@ buildvariants:
   - name: .aggfuzzer .common
   - name: free_monitoring
   - name: .jstestfuzz !.initsync
+  - name: .jstestfuzz_multiversion_gen
 
 - name: ubuntu1804-debug-ubsan
   display_name: ~ UBSAN Enterprise Ubuntu 18.04 DEBUG
@@ -11816,7 +11859,6 @@ buildvariants:
   - name: jsCore_op_query
   - name: jsCore_txns_large_txns_format
   - name: jsonSchema
-  - name: .jstestfuzz_multiversion_gen
   - name: .logical_session_cache .one_sec
   - name: .multi_shard .common
   - name: multiversion_gen
@@ -11887,55 +11929,6 @@ buildvariants:
   - *libfuzzertests
   tasks:
    - name: libfuzzertests_TG
-
-- name: ubuntu1804-debug-aubsan-async
-  display_name: "~ {A,UB}SAN Enterprise Ubuntu 18.04 async"
-  modules:
-  - enterprise
-  run_on:
-  - ubuntu1804-build
-  stepback: true
-  expansions:
-    # We need llvm-symbolizer in the PATH for ASAN for clang-3.7 or later.
-    variant_path_suffix: /opt/mongodbtoolchain/v3/bin
-    lang_environment: LANG=C
-    san_options: UBSAN_OPTIONS="print_stacktrace=1" LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=1
-    compile_flags: --variables-files=etc/scons/mongodbtoolchain_v3_clang.vars --dbg=on --opt=on --allocator=system --sanitize=undefined,address --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
-    multiversion_platform: ubuntu1804
-    multiversion_edition: enterprise
-    resmoke_jobs_factor: 0.3  # Avoid starting too many mongod's under {A,UB}SAN build.
-    is_asan_build: true
-    test_flags: |- # Use the ServiceExecutorAdaptive with a reasonable number of starting threads
-        --serviceExecutor=adaptive \
-        --mongodSetParameters="adaptiveServiceExecutorReservedThreads: 8" \
-        --mongosSetParameters="adaptiveServiceExecutorReservedThreads: 8"
-    scons_cache_scope: shared
-  tasks:
-  - name: compile_all_run_unittests_TG
-  - name: .aggregation !.no_async
-  - name: .auth
-  - name: audit
-  - name: .causally_consistent !.wo_snapshot
-  - name: .misc_js
-  - name: .concurrency .common !.kill_terminate
-  - name: concurrency_replication_causal_consistency
-  - name: disk_wiredtiger
-  - name: .encrypt
-  - name: .integration !.audit
-  - name: .jscore .common
-  - name: jsCore_minimum_batch_size
-  - name: jsCore_op_query
-  - name: jsCore_txns_large_txns_format
-  - name: .logical_session_cache .one_sec
-  - name: multiversion_gen
-  - name: .read_write_concern
-  - name: .replica_sets .san
-  - name: .read_only
-  - name: sasl
-  - name: secondary_reads_passthrough_gen
-  - name: .sharding .jscore !.wo_snapshot !.multi_stmt
-  - name: .sharding .common !.csrs
-  - name: snmp
 
 - name: enterprise-ubuntu-dynamic-1604-64-bit
   display_name: "* Shared Library Enterprise Ubuntu 16.04"

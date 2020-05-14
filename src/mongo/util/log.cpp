@@ -77,29 +77,6 @@ Status logger::registerExtraLogContextFn(logger::ExtraLogContextFn contextFn) {
     return Status::OK();
 }
 
-bool rotateLogs(bool renameFiles) {
-    // Rotate on both logv1 and logv2 so all files that need rotation gets rotated
-    LOGV2(23166, "Log rotation initiated");
-    std::string suffix = "." + terseCurrentTime(false);
-    Status resultv2 =
-        logv2::LogManager::global().getGlobalDomainInternal().rotate(renameFiles, suffix);
-    if (!resultv2.isOK())
-        LOGV2_WARNING(23168, "Log rotation failed: {resultv2}", "resultv2"_attr = resultv2);
-
-    using logger::RotatableFileManager;
-    RotatableFileManager* manager = logger::globalRotatableFileManager();
-    RotatableFileManager::FileNameStatusPairVector result(manager->rotateAll(renameFiles, suffix));
-    for (RotatableFileManager::FileNameStatusPairVector::iterator it = result.begin();
-         it != result.end();
-         it++) {
-        LOGV2_WARNING(23169,
-                      "Rotating log file {it_first} failed: {it_second}",
-                      "it_first"_attr = it->first,
-                      "it_second"_attr = it->second.toString());
-    }
-    return resultv2.isOK() && result.empty();
-}
-
 Tee* const startupWarningsLog = RamLog::get("startupWarnings");  // intentionally leaked
 
 }  // namespace mongo

@@ -57,6 +57,13 @@ public:
         return false;
     }
 
+    bool supportsReadPreferenceForWriteOp(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx) override {
+        return true;
+    }
+
+    void updateClientOperationTime(OperationContext* opCtx) const override {}
+
     Status insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                   const NamespaceString& ns,
                   std::vector<BSONObj>&& objs,

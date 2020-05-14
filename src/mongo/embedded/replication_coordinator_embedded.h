@@ -197,15 +197,13 @@ public:
                              GetNewConfigFn getNewConfig,
                              bool force) override;
 
-    Status awaitConfigCommitment(OperationContext* opCtx) override;
+    Status awaitConfigCommitment(OperationContext* opCtx, bool waitForOplogCommitment) override;
 
     Status processReplSetInitiate(OperationContext*, const BSONObj&, BSONObjBuilder*) override;
 
     Status processReplSetUpdatePosition(const repl::UpdatePositionArgs&, long long*) override;
 
     std::vector<HostAndPort> getHostsWrittenTo(const repl::OpTime&, bool) override;
-
-    std::vector<HostAndPort> getOtherNodesInReplSet() const override;
 
     Status checkReplEnabledForCommand(BSONObjBuilder*) override;
 
@@ -217,7 +215,7 @@ public:
 
     bool shouldChangeSyncSource(const HostAndPort&,
                                 const rpc::ReplSetMetadata&,
-                                boost::optional<rpc::OplogQueryMetadata>) override;
+                                const rpc::OplogQueryMetadata&) override;
 
     repl::OpTime getLastCommittedOpTime() const override;
 

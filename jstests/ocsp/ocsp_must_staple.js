@@ -20,7 +20,7 @@ mock_ocsp.start();
 let ocsp_options = {
     sslMode: "requireSSL",
     sslPEMKeyFile: OCSP_SERVER_MUSTSTAPLE_CERT,
-    sslCAFile: OCSP_CA_CERT,
+    sslCAFile: OCSP_CA_PEM,
     sslAllowInvalidHostnames: "",
     setParameter: {
         "ocspEnabled": "true",
@@ -45,23 +45,7 @@ assert.doesNotThrow(() => {
 });
 jsTestLog(
     "Testing that a client can connect to a server using a MustStaple certificate and tlsAllowInvalidCertificates enabled.");
-assert.soon(() => {
-    return runMongoProgram("mongo",
-                           "--host",
-                           conn.host,
-                           "--port",
-                           conn.port,
-                           "--tls",
-                           "--tlsAllowInvalidCertificates",
-                           "--tlsCAFile",
-                           OCSP_CA_CERT,
-                           "--tlsCertificateKeyFile",
-                           OCSP_CLIENT_CERT,
-                           "--setShellParameter",
-                           "ocspEnabled=true",
-                           "--eval",
-                           ";") === 0;
-});
+waitForServer(conn);
 
 // assert that trying to connect to a server using a MustStaple certificate without a stapled OCSP
 // response will fail

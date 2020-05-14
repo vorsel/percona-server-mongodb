@@ -119,9 +119,10 @@ BaseCloner::AfterStageBehavior CollectionCloner::CollectionClonerStage::run() {
         return ClonerStage<CollectionCloner>::run();
     } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
         LOGV2(21132,
-              "CollectionCloner ns: '{ns}' uuid: "
+              "CollectionCloner ns: '{namespace}' uuid: "
               "UUID(\"{uuid}\") stopped because collection was dropped on source.",
-              "ns"_attr = getCloner()->getSourceNss(),
+              "CollectionCloner stopped because collection was dropped on source",
+              "namespace"_attr = getCloner()->getSourceNss(),
               "uuid"_attr = getCloner()->getSourceUuid());
         getCloner()->waitForDatabaseWorkToComplete();
         return kSkipRemainingStages;
@@ -132,7 +133,12 @@ BaseCloner::AfterStageBehavior CollectionCloner::CollectionClonerStage::run() {
 }
 
 BaseCloner::AfterStageBehavior CollectionCloner::countStage() {
-    auto count = getClient()->count(_sourceDbAndUuid, {} /* Query */, QueryOption_SlaveOk);
+    auto count = getClient()->count(_sourceDbAndUuid,
+                                    {} /* Query */,
+                                    QueryOption_SlaveOk,
+                                    0 /* limit */,
+                                    0 /* skip */,
+                                    ReadConcernArgs::kImplicitDefault);
 
     // The count command may return a negative value after an unclean shutdown,
     // so we set it to zero here to avoid aborting the collection clone.
@@ -140,7 +146,7 @@ BaseCloner::AfterStageBehavior CollectionCloner::countStage() {
     if (count < 0) {
         LOGV2_WARNING(21142,
                       "Count command returned negative value. Updating to 0 to allow progress "
-                      "meter to function properly. ");
+                      "meter to function properly");
         count = 0;
     }
 
@@ -158,8 +164,9 @@ BaseCloner::AfterStageBehavior CollectionCloner::listIndexesStage() {
         : getClient()->getIndexSpecs(_sourceDbAndUuid, QueryOption_SlaveOk);
     if (indexSpecs.empty()) {
         LOGV2_WARNING(21143,
-                      "No indexes found for collection {collection} while cloning from {source}",
-                      "collection"_attr = _sourceNss.ns(),
+                      "No indexes found for collection {namespace} while cloning from {source}",
+                      "No indexes found for collection while cloning",
+                      "namespace"_attr = _sourceNss.ns(),
                       "source"_attr = getSource());
     }
     for (auto&& spec : indexSpecs) {
@@ -177,8 +184,9 @@ BaseCloner::AfterStageBehavior CollectionCloner::listIndexesStage() {
     if (!_idIndexSpec.isEmpty() && _collectionOptions.autoIndexId == CollectionOptions::NO) {
         LOGV2_WARNING(21144,
                       "Found the _id_ index spec but the collection specified autoIndexId of false "
-                      "on ns:{ns}",
-                      "ns"_attr = this->_sourceNss);
+                      "on ns:{namespace}",
+                      "Found the _id index spec but the collection specified autoIndexId of false",
+                      "namespace"_attr = this->_sourceNss);
     }
     return kContinueNormally;
 }
@@ -233,7 +241,8 @@ void CollectionCloner::runQuery() {
                            nullptr /* fieldsToReturn */,
                            QueryOption_NoCursorTimeout | QueryOption_SlaveOk |
                                (collectionClonerUsesExhaust ? QueryOption_Exhaust : 0),
-                           _collectionClonerBatchSize);
+                           _collectionClonerBatchSize,
+                           ReadConcernArgs::kImplicitDefault);
     } catch (...) {
         auto status = exceptionToStatus();
 
@@ -257,8 +266,9 @@ void CollectionCloner::runQuery() {
             // (unless we find out the collection was dropped via getting a NamespaceNotFound).
             if (_queryStage.isCursorError(status)) {
                 LOGV2(21135,
-                      "Lost cursor during non-resumable query: {status}",
-                      "status"_attr = status);
+                      "Lost cursor during non-resumable query: {error}",
+                      "Lost cursor during non-resumable query",
+                      "error"_attr = status);
                 _lostNonResumableCursor = true;
                 throw;
             }
@@ -276,11 +286,12 @@ void CollectionCloner::handleNextBatch(DBClientCursorBatchIterator& iter) {
     {
         stdx::lock_guard<InitialSyncSharedData> lk(*getSharedData());
         if (!getSharedData()->getInitialSyncStatus(lk).isOK()) {
-            std::string message = str::stream()
-                << "Collection cloning cancelled due to initial sync failure: "
-                << getSharedData()->getInitialSyncStatus(lk).toString();
-            LOGV2(21136, "{message}", "message"_attr = message);
-            uasserted(ErrorCodes::CallbackCanceled, message);
+            static constexpr char message[] =
+                "Collection cloning cancelled due to initial sync failure";
+            LOGV2(21136, message, "error"_attr = getSharedData()->getInitialSyncStatus(lk));
+            uasserted(ErrorCodes::CallbackCanceled,
+                      str::stream()
+                          << message << ": " << getSharedData()->getInitialSyncStatus(lk));
         }
     }
 
@@ -330,6 +341,8 @@ void CollectionCloner::handleNextBatch(DBClientCursorBatchIterator& iter) {
                 LOGV2(21137,
                       "initialSyncHangCollectionClonerAfterHandlingBatchResponse fail point "
                       "enabled for {namespace}. Blocking until fail point is disabled.",
+                      "initialSyncHangCollectionClonerAfterHandlingBatchResponse fail point "
+                      "enabled. Blocking until fail point is disabled",
                       "namespace"_attr = _sourceNss.toString());
                 mongo::sleepsecs(1);
             }
@@ -349,8 +362,9 @@ void CollectionCloner::insertDocumentsCallback(const executor::TaskExecutor::Cal
         std::vector<BSONObj> docs;
         if (_documentsToInsert.size() == 0) {
             LOGV2_WARNING(21145,
-                          "insertDocumentsCallback, but no documents to insert for ns:{ns}",
-                          "ns"_attr = _sourceNss);
+                          "insertDocumentsCallback, but no documents to insert for ns:{namespace}",
+                          "insertDocumentsCallback, but no documents to insert",
+                          "namespace"_attr = _sourceNss);
             return;
         }
         _documentsToInsert.swap(docs);
@@ -368,7 +382,7 @@ void CollectionCloner::insertDocumentsCallback(const executor::TaskExecutor::Cal
         [&](const BSONObj&) {
             LOGV2(21138,
                   "initial sync - initialSyncHangDuringCollectionClone fail point "
-                  "enabled. Blocking until fail point is disabled.");
+                  "enabled. Blocking until fail point is disabled");
             while (MONGO_unlikely(initialSyncHangDuringCollectionClone.shouldFail()) &&
                    !mustExit()) {
                 mongo::sleepsecs(1);
@@ -418,7 +432,10 @@ void CollectionCloner::forgetOldQueryCursor() {
 // Throws.
 void CollectionCloner::abortNonResumableClone(const Status& status) {
     invariant(!_resumeSupported);
-    LOGV2(21141, "Error during non-resumable clone: {status}", "status"_attr = status);
+    LOGV2(21141,
+          "Error during non-resumable clone: {error}",
+          "Error during non-resumable clone",
+          "error"_attr = status);
     std::string message = str::stream()
         << "Collection clone failed and is not resumable. nss: " << _sourceNss;
     uasserted(ErrorCodes::InitialSyncFailure, message);

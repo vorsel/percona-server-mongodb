@@ -41,10 +41,13 @@
 #endif
 #endif
 
+#include <fmt/format.h>
 #include <pcrecpp.h>
-
 #include <sstream>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/json.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
@@ -94,7 +97,7 @@ public:
         return "unknown";
     }
 
-    std::vector<BuildInfoTuple> buildInfo() const final {
+    std::vector<BuildInfoField> buildInfo() const final {
         return {};
     }
 };
@@ -118,8 +121,7 @@ const VersionInfoInterface& VersionInfoInterface::instance(NotEnabledAction acti
         return fallbackVersionInfo;
     }
 
-    LOGV2_FATAL(23405, "Terminating because valid version info has not been configured");
-    fassertFailed(40278);
+    LOGV2_FATAL(40278, "Terminating because valid version info has not been configured");
 }
 
 bool VersionInfoInterface::isSameMajorVersion(const char* otherVersion) const noexcept {
@@ -140,51 +142,53 @@ std::string VersionInfoInterface::makeVersionString(StringData binaryName) const
 }
 
 void VersionInfoInterface::appendBuildInfo(BSONObjBuilder* result) const {
+    BSONObjBuilder& o = *result;
+    o.append("version", version());
     // The 'psmdbVersion' key is used to distinguish between MongoDB and PSMDB.
-    *result << "version" << version() << "psmdbVersion" << version() << "gitVersion" << gitVersion()
+    o.append("psmdbVersion", version());
+    o.append("gitVersion", gitVersion());
 #if defined(_WIN32)
-            << "targetMinOS" << targetMinOS()
+    o.append("targetMinOS", targetMinOS());
 #endif
-            << "modules" << modules() << "allocator" << allocator() << "javascriptEngine"
-            << jsEngine() << "sysInfo"
-            << "deprecated";
+    o.append("modules", modules());
+    o.append("allocator", allocator());
+    o.append("javascriptEngine", jsEngine());
+    o.append("sysInfo", "deprecated");
 
-    BSONArrayBuilder versionArray(result->subarrayStart("versionArray"));
-    versionArray << majorVersion() << minorVersion() << patchVersion() << extraVersion();
-    versionArray.done();
+    BSONArrayBuilder(o.subarrayStart("versionArray"))
+        .append(majorVersion())
+        .append(minorVersion())
+        .append(patchVersion())
+        .append(extraVersion());
 
-    BSONObjBuilder opensslInfo(result->subobjStart("openssl"));
+    BSONObjBuilder(o.subobjStart("openssl"))
 #ifdef MONGO_CONFIG_SSL
 #if MONGO_CONFIG_SSL_PROVIDER == MONGO_CONFIG_SSL_PROVIDER_OPENSSL
-    opensslInfo << "running" << openSSLVersion() << "compiled" << OPENSSL_VERSION_TEXT;
+        .append("running", openSSLVersion())
+        .append("compiled", OPENSSL_VERSION_TEXT)
 #elif MONGO_CONFIG_SSL_PROVIDER == MONGO_CONFIG_SSL_PROVIDER_WINDOWS
-    opensslInfo << "running"
-                << "Windows SChannel";
+        .append("running", "Windows SChannel")
 #elif MONGO_CONFIG_SSL_PROVIDER == MONGO_CONFIG_SSL_PROVIDER_APPLE
-    opensslInfo << "running"
-                << "Apple Secure Transport";
+        .append("running", "Apple Secure Transport")
 #else
 #error "Unknown SSL Provider"
 #endif  // MONGO_CONFIG_SSL_PROVIDER
 #else
-    opensslInfo << "running"
-                << "disabled"
-                << "compiled"
-                << "disabled";
+        .append("running", "disabled")
+        .append("compiled", "disabled")
 #endif
-    opensslInfo.done();
+        ;
 
-    BSONObjBuilder buildvarsInfo(result->subobjStart("buildEnvironment"));
-    for (auto&& envDataEntry : buildInfo()) {
-        if (std::get<2>(envDataEntry)) {
-            buildvarsInfo << std::get<0>(envDataEntry) << std::get<1>(envDataEntry);
-        }
+    {
+        auto env = BSONObjBuilder(o.subobjStart("buildEnvironment"));
+        for (auto&& e : buildInfo())
+            if (e.inBuildInfo)
+                env.append(e.key, e.value);
     }
-    buildvarsInfo.done();
 
-    *result << "bits" << (int)sizeof(void*) * 8;
-    result->appendBool("debug", kDebugBuild);
-    result->appendNumber("maxBsonObjectSize", BSONObjMaxUserSize);
+    o.append("bits", (int)sizeof(void*) * CHAR_BIT);
+    o.appendBool("debug", kDebugBuild);
+    o.appendNumber("maxBsonObjectSize", BSONObjMaxUserSize);
 }
 
 std::string VersionInfoInterface::openSSLVersion(StringData prefix, StringData suffix) const {
@@ -196,43 +200,30 @@ std::string VersionInfoInterface::openSSLVersion(StringData prefix, StringData s
 }
 
 void VersionInfoInterface::logTargetMinOS() const {
-    LOGV2(23398, "targetMinOS: {targetMinOS}", "targetMinOS"_attr = targetMinOS());
+    LOGV2(23398, "Target operating system minimum version", "targetMinOS"_attr = targetMinOS());
 }
 
-void VersionInfoInterface::logBuildInfo() const {
-    LOGV2(23399, "git version: {gitVersion}", "gitVersion"_attr = gitVersion());
-
+void VersionInfoInterface::logBuildInfo(std::ostream* os) const {
+    BSONObjBuilder bob;
+    bob.append("version", version());
+    bob.append("gitVersion", gitVersion());
 #if defined(MONGO_CONFIG_SSL) && MONGO_CONFIG_SSL_PROVIDER == MONGO_CONFIG_SSL_PROVIDER_OPENSSL
-    LOGV2(23400,
-          "{openSSLVersion_OpenSSL_version}",
-          "openSSLVersion_OpenSSL_version"_attr = openSSLVersion("OpenSSL version: "));
+    bob.append("openSSLVersion", openSSLVersion());
 #endif
-
-    LOGV2(23401, "allocator: {allocator}", "allocator"_attr = allocator());
-
-    std::stringstream ss;
-    ss << "modules: ";
-    auto modules_list = modules();
-    if (modules_list.size() == 0) {
-        ss << "none";
-    } else {
-        for (const auto& m : modules_list) {
-            ss << m << " ";
-        }
+    bob.append("modules", modules());
+    bob.append("allocator", allocator());
+    {
+        auto envObj = BSONObjBuilder(bob.subobjStart("environment"));
+        for (auto&& bi : buildInfo())
+            if (bi.inVersion && !bi.value.empty())
+                envObj.append(bi.key, bi.value);
     }
-    LOGV2(23402, "{ss_str}", "ss_str"_attr = ss.str());
-
-    LOGV2(23403, "build environment:");
-    for (auto&& envDataEntry : buildInfo()) {
-        if (std::get<3>(envDataEntry)) {
-            auto val = std::get<1>(envDataEntry);
-            if (val.size() == 0)
-                continue;
-            LOGV2(23404,
-                  "    {std_get_0_envDataEntry}: {std_get_1_envDataEntry}",
-                  "std_get_0_envDataEntry"_attr = std::get<0>(envDataEntry),
-                  "std_get_1_envDataEntry"_attr = std::get<1>(envDataEntry));
-        }
+    BSONObj obj = bob.done();
+    if (os) {
+        // If printing to ostream, print a json object with a single "buildInfo" element.
+        *os << "Build Info:" << tojson(obj, ExtendedRelaxedV2_0_0, true) << std::endl;
+    } else {
+        LOGV2(23403, "Build Info", "buildInfo"_attr = obj);
     }
 }
 

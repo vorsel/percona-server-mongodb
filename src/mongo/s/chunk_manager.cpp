@@ -195,8 +195,12 @@ void ChunkManager::getShardIdsForQuery(OperationContext* opCtx,
     for (BoundList::const_iterator it = ranges.begin(); it != ranges.end(); ++it) {
         getShardIdsForRange(it->first /*min*/, it->second /*max*/, shardIds);
 
-        // once we know we need to visit all shards no need to keep looping
-        if (shardIds->size() == _rt->_shardVersions.size()) {
+        // Once we know we need to visit all shards no need to keep looping.
+        // However, this optimization does not apply when we are reading from a snapshot
+        // because _shardVersions contains shards with chunks and is built based on the last
+        // refresh. Therefore, it is possible for _shardVersions to have fewer entries if a shard
+        // no longer owns chunks when it used to at _clusterTime.
+        if (!_clusterTime && shardIds->size() == _rt->_shardVersions.size()) {
             break;
         }
     }
@@ -217,8 +221,11 @@ void ChunkManager::getShardIdsForRange(const BSONObj& min,
         shardIds->insert(it->second->getShardIdAt(_clusterTime));
 
         // No need to iterate through the rest of the ranges, because we already know we need to use
-        // all shards.
-        if (shardIds->size() == _rt->_shardVersions.size()) {
+        // all shards. However, this optimization does not apply when we are reading from a snapshot
+        // because _shardVersions contains shards with chunks and is built based on the last
+        // refresh. Therefore, it is possible for _shardVersions to have fewer entries if a shard
+        // no longer owns chunks when it used to at _clusterTime.
+        if (!_clusterTime && shardIds->size() == _rt->_shardVersions.size()) {
             break;
         }
     }
@@ -249,6 +256,11 @@ ChunkManager::ConstRangeOfChunks ChunkManager::getNextChunkOnShard(const BSONObj
     return {ConstChunkIterator(), ConstChunkIterator()};
 }
 
+ShardId ChunkManager::getMinKeyShardIdWithSimpleCollation() const {
+    auto minKey = getShardKeyPattern().getKeyPattern().globalMin();
+    return findIntersectingChunkWithSimpleCollation(minKey).getShardId();
+}
+
 void RoutingTableHistory::getAllShardIds(std::set<ShardId>* all) const {
     std::transform(_shardVersions.begin(),
                    _shardVersions.end(),
@@ -264,9 +276,20 @@ std::pair<ChunkInfoMap::const_iterator, ChunkInfoMap::const_iterator>
 RoutingTableHistory::overlappingRanges(const BSONObj& min,
                                        const BSONObj& max,
                                        bool isMaxInclusive) const {
+    if (kDebugBuild) {
+        auto keyPattern = _shardKeyPattern.getKeyPattern();
+        bool minHasFullShardKey =
+            _extractKeyString(keyPattern.extendRangeBound(min, false /* makeUpperInclusive */)) ==
+            _extractKeyString(min);
+        bool maxHasFullShardKey =
+            _extractKeyString(keyPattern.extendRangeBound(max, false /* makeUpperInclusive */)) ==
+            _extractKeyString(max);
+        invariant(minHasFullShardKey);
+        invariant(maxHasFullShardKey);
+    }
 
     const auto itMin = _chunkMap.upper_bound(_extractKeyString(min));
-    const auto itMax = [this, &max, isMaxInclusive]() {
+    const auto itMax = [&]() {
         auto it = isMaxInclusive ? _chunkMap.upper_bound(_extractKeyString(max))
                                  : _chunkMap.lower_bound(_extractKeyString(max));
         return it == _chunkMap.end() ? it : ++it;

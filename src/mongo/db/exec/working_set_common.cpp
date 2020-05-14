@@ -41,7 +41,6 @@
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/service_context.h"
-#include "mongo/logger/redaction.h"
 #include "mongo/logv2/log.h"
 
 namespace mongo {
@@ -138,7 +137,7 @@ bool WorkingSetCommon::fetch(OperationContext* opCtx,
             auto* iam = workingSet->retrieveIndexAccessMethod(memberKey.indexId);
             iam->getKeys(member->doc.value().toBson(),
                          IndexAccessMethod::GetKeysMode::kEnforceConstraints,
-                         IndexAccessMethod::GetKeysContext::kReadOrAddKeys,
+                         IndexAccessMethod::GetKeysContext::kValidatingKeys,
                          &keys,
                          multikeyMetadataKeys,
                          multikeyPaths,

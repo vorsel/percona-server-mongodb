@@ -249,13 +249,12 @@ int EncryptionKeyDB::_openWiredTiger(const std::string& path, const std::string&
     }
 
     LOGV2_WARNING(29054,
-        "EncryptionKeyDB: Failed to start up WiredTiger under any compatibility version.");
+        "EncryptionKeyDB: Failed to start up WiredTiger under any compatibility version. "
+        "This may be due to an unsupported upgrade or downgrade.");
     if (ret == WT_TRY_SALVAGE)
         LOGV2_WARNING(29055, "EncryptionKeyDB: WiredTiger metadata corruption detected");
 
-    LOGV2_FATAL(29056,
-                "Reason: {wtRCToStatus_ret_reason}",
-                "wtRCToStatus_ret_reason"_attr = wtRCToStatus(ret).reason());
+    LOGV2_FATAL_NOTRACE(29056, "Terminating.", "Reason"_attr = wtRCToStatus(ret).reason());
 
     return ret;
 }

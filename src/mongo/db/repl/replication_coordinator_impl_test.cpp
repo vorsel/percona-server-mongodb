@@ -194,7 +194,9 @@ TEST_F(ReplCoordTest, NodeEntersRemovedStateWhenStartingUpWithALocalConfigWhichL
                                                         << "node2:54321"))),
                        HostAndPort("node3", 12345));
     stopCapturingLogMessages();
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("NodeNotFound"));
+    ASSERT_EQUALS(1,
+                  countTextFormatLogLinesContaining("Locally stored replica set configuration does "
+                                                    "not have a valid entry for the current node"));
     ASSERT_EQUALS(MemberState::RS_REMOVED, getReplCoord()->getMemberState().s);
 }
 
@@ -209,7 +211,9 @@ TEST_F(ReplCoordTest,
                                                      << "node1:12345"))),
                        HostAndPort("node1", 12345));
     stopCapturingLogMessages();
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("reports set name of notMySet,"));
+    ASSERT_EQUALS(1,
+                  countTextFormatLogLinesContaining("Local replica set configuration document set "
+                                                    "name differs from command line set name"));
     ASSERT_EQUALS(MemberState::RS_REMOVED, getReplCoord()->getMemberState().s);
 }
 
@@ -3009,34 +3013,6 @@ TEST_F(ReplCoordTest,
     }
 }
 
-TEST_F(ReplCoordTest, NodeReturnsNoNodesWhenGetOtherNodesInReplSetIsRunBeforeHavingAConfig) {
-    start();
-    ASSERT_EQUALS(0U, getReplCoord()->getOtherNodesInReplSet().size());
-}
-
-TEST_F(ReplCoordTest, NodeReturnsListOfNodesOtherThanItselfInResponseToGetOtherNodesInReplSet) {
-    assertStartSuccess(BSON("_id"
-                            << "mySet"
-                            << "version" << 2 << "members"
-                            << BSON_ARRAY(BSON("_id" << 0 << "host"
-                                                     << "h1")
-                                          << BSON("_id" << 1 << "host"
-                                                        << "h2")
-                                          << BSON("_id" << 2 << "host"
-                                                        << "h3"
-                                                        << "priority" << 0 << "hidden" << true))),
-                       HostAndPort("h1"));
-
-    std::vector<HostAndPort> otherNodes = getReplCoord()->getOtherNodesInReplSet();
-    ASSERT_EQUALS(2U, otherNodes.size());
-    if (otherNodes[0] == HostAndPort("h2")) {
-        ASSERT_EQUALS(HostAndPort("h3"), otherNodes[1]);
-    } else {
-        ASSERT_EQUALS(HostAndPort("h3"), otherNodes[0]);
-        ASSERT_EQUALS(HostAndPort("h2"), otherNodes[1]);
-    }
-}
-
 TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsCurrentTopologyVersionOnTimeOut) {
     init();
     assertStartSuccess(BSON("_id"
@@ -5641,12 +5617,12 @@ TEST_F(ReplCoordTest, DoNotIgnoreTheContentsOfMetadataWhenItsConfigVersionDoesNo
     // lower configVersion
     auto lowerConfigVersion = 1;
     StatusWith<rpc::ReplSetMetadata> metadata = rpc::ReplSetMetadata::readFromMetadata(BSON(
-        rpc::kReplSetMetadataFieldName
-        << BSON("lastOpCommitted" << BSON("ts" << Timestamp(10, 0) << "t" << 2)
-                                  << "lastCommittedWall" << Date_t() + Seconds(100)
-                                  << "lastOpVisible" << BSON("ts" << Timestamp(10, 0) << "t" << 2)
-                                  << "configVersion" << lowerConfigVersion << "primaryIndex" << 2
-                                  << "term" << 2 << "syncSourceIndex" << 1)));
+        rpc::kReplSetMetadataFieldName << BSON(
+            "lastOpCommitted" << BSON("ts" << Timestamp(10, 0) << "t" << 2) << "lastCommittedWall"
+                              << Date_t() + Seconds(100) << "lastOpVisible"
+                              << BSON("ts" << Timestamp(10, 0) << "t" << 2) << "configVersion"
+                              << lowerConfigVersion << "configTerm" << 2 << "primaryIndex" << 2
+                              << "term" << 2 << "syncSourceIndex" << 1 << "isPrimary" << true)));
     getReplCoord()->processReplSetMetadata(metadata.getValue());
     // term should advance
     ASSERT_EQUALS(2, getReplCoord()->getTerm());
@@ -5654,12 +5630,12 @@ TEST_F(ReplCoordTest, DoNotIgnoreTheContentsOfMetadataWhenItsConfigVersionDoesNo
     // higher configVersion
     auto higherConfigVersion = 100;
     StatusWith<rpc::ReplSetMetadata> metadata2 = rpc::ReplSetMetadata::readFromMetadata(BSON(
-        rpc::kReplSetMetadataFieldName
-        << BSON("lastOpCommitted" << BSON("ts" << Timestamp(10, 0) << "t" << 2)
-                                  << "lastCommittedWall" << Date_t() + Seconds(100)
-                                  << "lastOpVisible" << BSON("ts" << Timestamp(10, 0) << "t" << 2)
-                                  << "configVersion" << higherConfigVersion << "primaryIndex" << 2
-                                  << "term" << 2 << "syncSourceIndex" << 1)));
+        rpc::kReplSetMetadataFieldName << BSON(
+            "lastOpCommitted" << BSON("ts" << Timestamp(10, 0) << "t" << 2) << "lastCommittedWall"
+                              << Date_t() + Seconds(100) << "lastOpVisible"
+                              << BSON("ts" << Timestamp(10, 0) << "t" << 2) << "configVersion"
+                              << higherConfigVersion << "configTerm" << 2 << "primaryIndex" << 2
+                              << "term" << 2 << "syncSourceIndex" << 1 << "isPrimary" << true)));
     getReplCoord()->processReplSetMetadata(metadata2.getValue());
     // term should advance
     ASSERT_EQUALS(2, getReplCoord()->getTerm());
@@ -5733,7 +5709,8 @@ TEST_F(ReplCoordTest, UpdateTermWhenTheTermFromMetadataIsNewerButNeverUpdateCurr
             "lastOpCommitted" << BSON("ts" << Timestamp(10, 0) << "t" << 3) << "lastCommittedWall"
                               << Date_t() + Seconds(100) << "lastOpVisible"
                               << BSON("ts" << Timestamp(10, 0) << "t" << 3) << "configVersion" << 2
-                              << "primaryIndex" << 2 << "term" << 3 << "syncSourceIndex" << 1)));
+                              << "configTerm" << 2 << "primaryIndex" << 2 << "term" << 3
+                              << "syncSourceIndex" << 1 << "isPrimary" << true)));
     getReplCoord()->processReplSetMetadata(metadata.getValue());
     ASSERT_EQUALS(3, getReplCoord()->getTerm());
     ASSERT_EQUALS(-1, getTopoCoord().getCurrentPrimaryIndex());
@@ -5745,7 +5722,8 @@ TEST_F(ReplCoordTest, UpdateTermWhenTheTermFromMetadataIsNewerButNeverUpdateCurr
             "lastOpCommitted" << BSON("ts" << Timestamp(11, 0) << "t" << 3) << "lastCommittedWall"
                               << Date_t() + Seconds(100) << "lastOpVisible"
                               << BSON("ts" << Timestamp(11, 0) << "t" << 3) << "configVersion" << 2
-                              << "primaryIndex" << 1 << "term" << 2 << "syncSourceIndex" << 1)));
+                              << "configTerm" << 2 << "primaryIndex" << 1 << "term" << 2
+                              << "syncSourceIndex" << 1 << "isPrimary" << true)));
     getReplCoord()->processReplSetMetadata(metadata2.getValue());
     ASSERT_EQUALS(3, getReplCoord()->getTerm());
     ASSERT_EQUALS(-1, getTopoCoord().getCurrentPrimaryIndex());
@@ -5757,7 +5735,8 @@ TEST_F(ReplCoordTest, UpdateTermWhenTheTermFromMetadataIsNewerButNeverUpdateCurr
             "lastOpCommitted" << BSON("ts" << Timestamp(11, 0) << "t" << 3) << "lastCommittedWall"
                               << Date_t() + Seconds(100) << "lastOpVisible"
                               << BSON("ts" << Timestamp(11, 0) << "t" << 3) << "configVersion" << 2
-                              << "primaryIndex" << 1 << "term" << 3 << "syncSourceIndex" << 1)));
+                              << "configTerm" << 2 << "primaryIndex" << 1 << "term" << 3
+                              << "syncSourceIndex" << 1 << "isPrimary" << true)));
     getReplCoord()->processReplSetMetadata(metadata3.getValue());
     ASSERT_EQUALS(3, getReplCoord()->getTerm());
     ASSERT_EQUALS(-1, getTopoCoord().getCurrentPrimaryIndex());
@@ -5792,8 +5771,9 @@ TEST_F(ReplCoordTest,
         << BSON("lastOpCommitted" << BSON("ts" << Timestamp(10, 0) << "t" << 3)
                                   << "lastCommittedWall" << Date_t() + Seconds(100)
                                   << "lastOpVisible" << BSON("ts" << Timestamp(10, 0) << "t" << 3)
-                                  << "configVersion" << config.getConfigVersion() << "primaryIndex"
-                                  << 1 << "term" << 3 << "syncSourceIndex" << 1)));
+                                  << "configVersion" << config.getConfigVersion() << "configTerm"
+                                  << config.getConfigTerm() << "primaryIndex" << 1 << "term" << 3
+                                  << "syncSourceIndex" << 1 << "isPrimary" << true)));
     BSONObjBuilder responseBuilder;
     ASSERT_OK(metadata.getValue().writeToMetadata(&responseBuilder));
 
@@ -5848,7 +5828,7 @@ TEST_F(ReplCoordTest, AdvanceCommitPointFromSyncSourceCanSetCommitPointToLastApp
 TEST_F(ReplCoordTest, PrepareOplogQueryMetadata) {
     assertStartSuccess(BSON("_id"
                             << "mySet"
-                            << "version" << 2 << "members"
+                            << "version" << 2 << "term" << 0 << "members"
                             << BSON_ARRAY(BSON("host"
                                                << "node1:12345"
                                                << "_id" << 0)
@@ -5897,9 +5877,11 @@ TEST_F(ReplCoordTest, PrepareOplogQueryMetadata) {
     ASSERT_EQ(replMetadata.getValue().getLastOpCommitted().wallTime, wallTime1);
     ASSERT_EQ(replMetadata.getValue().getLastOpVisible(), OpTime());
     ASSERT_EQ(replMetadata.getValue().getConfigVersion(), 2);
+    ASSERT_EQ(replMetadata.getValue().getConfigTerm(), 0);
     ASSERT_EQ(replMetadata.getValue().getTerm(), 0);
     ASSERT_EQ(replMetadata.getValue().getSyncSourceIndex(), -1);
     ASSERT_EQ(replMetadata.getValue().getPrimaryIndex(), -1);
+    ASSERT_EQ(replMetadata.getValue().getIsPrimary(), false);
 }
 
 TEST_F(ReplCoordTest, TermAndLastCommittedOpTimeUpdatedFromHeartbeatWhenArbiter) {
@@ -5930,8 +5912,9 @@ TEST_F(ReplCoordTest, TermAndLastCommittedOpTimeUpdatedFromHeartbeatWhenArbiter)
         << BSON("lastOpCommitted" << BSON("ts" << Timestamp(10, 1) << "t" << 3)
                                   << "lastCommittedWall" << Date_t() + Seconds(100)
                                   << "lastOpVisible" << BSON("ts" << Timestamp(10, 1) << "t" << 3)
-                                  << "configVersion" << config.getConfigVersion() << "primaryIndex"
-                                  << 1 << "term" << 3 << "syncSourceIndex" << 1)));
+                                  << "configVersion" << config.getConfigVersion() << "configTerm"
+                                  << config.getConfigTerm() << "primaryIndex" << 1 << "term" << 3
+                                  << "syncSourceIndex" << 1 << "isPrimary" << true)));
     BSONObjBuilder responseBuilder;
     ASSERT_OK(metadata.getValue().writeToMetadata(&responseBuilder));
 
@@ -6644,8 +6627,15 @@ TEST_F(ReplCoordTest, UpdatePositionCmdHasMetadata) {
 
     // Set last committed optime via metadata. Pass dummy Date_t to avoid advanceCommitPoint
     // invariant.
-    rpc::ReplSetMetadata syncSourceMetadata(
-        optime.getTerm(), {optime, Date_t() + Seconds(optime.getSecs())}, optime, 1, OID(), -1, 1);
+    rpc::ReplSetMetadata syncSourceMetadata(optime.getTerm(),
+                                            {optime, Date_t() + Seconds(optime.getSecs())},
+                                            optime,
+                                            1,
+                                            0,
+                                            OID(),
+                                            -1,
+                                            1,
+                                            false);
     getReplCoord()->processReplSetMetadata(syncSourceMetadata);
     // Pass dummy Date_t to avoid advanceCommitPoint invariant.
     getReplCoord()->advanceCommitPoint({optime, Date_t() + Seconds(optime.getSecs())}, true);
@@ -7230,9 +7220,9 @@ TEST_F(ReplCoordTest, CheckIfCommitQuorumHasReached) {
         majorityModeCQ.mode = "majority";
         ASSERT_FALSE(replCoord->isCommitQuorumSatisfied(majorityModeCQ, commitReadyMembers));
 
-        CommitQuorumOptions allModeCQ;
-        allModeCQ.mode = "all";
-        ASSERT_FALSE(replCoord->isCommitQuorumSatisfied(allModeCQ, commitReadyMembers));
+        CommitQuorumOptions votingMembersModeCQ;
+        votingMembersModeCQ.mode = "votingMembers";
+        ASSERT_FALSE(replCoord->isCommitQuorumSatisfied(votingMembersModeCQ, commitReadyMembers));
 
         CommitQuorumOptions allNodesCQ;
         allNodesCQ.numNodes = 5;
@@ -7256,9 +7246,9 @@ TEST_F(ReplCoordTest, CheckIfCommitQuorumHasReached) {
         majorityModeCQ.mode = "majority";
         ASSERT_FALSE(replCoord->isCommitQuorumSatisfied(majorityModeCQ, commitReadyMembers));
 
-        CommitQuorumOptions allModeCQ;
-        allModeCQ.mode = "all";
-        ASSERT_FALSE(replCoord->isCommitQuorumSatisfied(allModeCQ, commitReadyMembers));
+        CommitQuorumOptions votingMembersModeCQ;
+        votingMembersModeCQ.mode = "votingMembers";
+        ASSERT_FALSE(replCoord->isCommitQuorumSatisfied(votingMembersModeCQ, commitReadyMembers));
 
         CommitQuorumOptions allNodesCQ;
         allNodesCQ.numNodes = 5;
@@ -7282,9 +7272,9 @@ TEST_F(ReplCoordTest, CheckIfCommitQuorumHasReached) {
         majorityModeCQ.mode = "majority";
         ASSERT_FALSE(replCoord->isCommitQuorumSatisfied(majorityModeCQ, commitReadyMembers));
 
-        CommitQuorumOptions allModeCQ;
-        allModeCQ.mode = "all";
-        ASSERT_FALSE(replCoord->isCommitQuorumSatisfied(allModeCQ, commitReadyMembers));
+        CommitQuorumOptions votingMembersModeCQ;
+        votingMembersModeCQ.mode = "votingMembers";
+        ASSERT_FALSE(replCoord->isCommitQuorumSatisfied(votingMembersModeCQ, commitReadyMembers));
 
         CommitQuorumOptions allNodesCQ;
         allNodesCQ.numNodes = 5;
@@ -7308,9 +7298,9 @@ TEST_F(ReplCoordTest, CheckIfCommitQuorumHasReached) {
         majorityModeCQ.mode = "majority";
         ASSERT_TRUE(replCoord->isCommitQuorumSatisfied(majorityModeCQ, commitReadyMembers));
 
-        CommitQuorumOptions allModeCQ;
-        allModeCQ.mode = "all";
-        ASSERT_FALSE(replCoord->isCommitQuorumSatisfied(allModeCQ, commitReadyMembers));
+        CommitQuorumOptions votingMembersModeCQ;
+        votingMembersModeCQ.mode = "votingMembers";
+        ASSERT_FALSE(replCoord->isCommitQuorumSatisfied(votingMembersModeCQ, commitReadyMembers));
 
         CommitQuorumOptions allNodesCQ;
         allNodesCQ.numNodes = 5;
@@ -7336,9 +7326,9 @@ TEST_F(ReplCoordTest, CheckIfCommitQuorumHasReached) {
         majorityModeCQ.mode = "majority";
         ASSERT_TRUE(replCoord->isCommitQuorumSatisfied(majorityModeCQ, commitReadyMembers));
 
-        CommitQuorumOptions allModeCQ;
-        allModeCQ.mode = "all";
-        ASSERT_TRUE(replCoord->isCommitQuorumSatisfied(allModeCQ, commitReadyMembers));
+        CommitQuorumOptions votingMembersModeCQ;
+        votingMembersModeCQ.mode = "votingMembers";
+        ASSERT_TRUE(replCoord->isCommitQuorumSatisfied(votingMembersModeCQ, commitReadyMembers));
 
         CommitQuorumOptions allNodesCQ;
         allNodesCQ.numNodes = 5;
@@ -7365,9 +7355,9 @@ TEST_F(ReplCoordTest, CheckIfCommitQuorumHasReached) {
         majorityModeCQ.mode = "majority";
         ASSERT_TRUE(replCoord->isCommitQuorumSatisfied(majorityModeCQ, commitReadyMembers));
 
-        CommitQuorumOptions allModeCQ;
-        allModeCQ.mode = "all";
-        ASSERT_TRUE(replCoord->isCommitQuorumSatisfied(allModeCQ, commitReadyMembers));
+        CommitQuorumOptions votingMembersModeCQ;
+        votingMembersModeCQ.mode = "votingMembers";
+        ASSERT_TRUE(replCoord->isCommitQuorumSatisfied(votingMembersModeCQ, commitReadyMembers));
 
         CommitQuorumOptions allNodesCQ;
         allNodesCQ.numNodes = 5;
@@ -7393,9 +7383,9 @@ TEST_F(ReplCoordTest, CheckIfCommitQuorumHasReached) {
         majorityModeCQ.mode = "majority";
         ASSERT_TRUE(replCoord->isCommitQuorumSatisfied(majorityModeCQ, commitReadyMembers));
 
-        CommitQuorumOptions allModeCQ;
-        allModeCQ.mode = "all";
-        ASSERT_FALSE(replCoord->isCommitQuorumSatisfied(allModeCQ, commitReadyMembers));
+        CommitQuorumOptions votingMembersModeCQ;
+        votingMembersModeCQ.mode = "votingMembers";
+        ASSERT_FALSE(replCoord->isCommitQuorumSatisfied(votingMembersModeCQ, commitReadyMembers));
 
         CommitQuorumOptions numNodesCQ;
         numNodesCQ.numNodes = 4;

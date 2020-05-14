@@ -282,7 +282,7 @@ TEST_F(OpObserverTest, CollModWithCollectionOptionsAndTTLInfo) {
 
     // Write to the oplog.
     {
-        AutoGetDb autoDb(opCtx.get(), nss.db(), MODE_X);
+        AutoGetCollection autoColl(opCtx.get(), nss, MODE_X);
         WriteUnitOfWork wunit(opCtx.get());
         opObserver.onCollMod(opCtx.get(), nss, uuid, collModCmd, oldCollOpts, ttlInfo);
         wunit.commit();
@@ -331,7 +331,7 @@ TEST_F(OpObserverTest, CollModWithOnlyCollectionOptions) {
 
     // Write to the oplog.
     {
-        AutoGetDb autoDb(opCtx.get(), nss.db(), MODE_X);
+        AutoGetCollection autoColl(opCtx.get(), nss, MODE_X);
         WriteUnitOfWork wunit(opCtx.get());
         opObserver.onCollMod(opCtx.get(), nss, uuid, collModCmd, oldCollOpts, boost::none);
         wunit.commit();
@@ -559,7 +559,7 @@ DEATH_TEST_F(OpObserverTest, EachOnDeleteRequiresAboutToDelete, "invariant") {
 
 DEATH_TEST_REGEX_F(OpObserverTest,
                    NodeCrashesIfShardIdentityDocumentRolledBack,
-                   "Fatal Assertion.*50712") {
+                   "Fatal assertion.*50712") {
     OpObserverImpl opObserver;
     auto opCtx = cc().makeOperationContext();
 

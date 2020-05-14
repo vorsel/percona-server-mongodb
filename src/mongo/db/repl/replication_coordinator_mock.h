@@ -216,7 +216,7 @@ public:
                                      GetNewConfigFn getNewConfig,
                                      bool force);
 
-    Status awaitConfigCommitment(OperationContext* opCtx);
+    Status awaitConfigCommitment(OperationContext* opCtx, bool waitForOplogCommitment);
 
     virtual Status processReplSetInitiate(OperationContext* opCtx,
                                           const BSONObj& configObj,
@@ -228,8 +228,6 @@ public:
     virtual bool buildsIndexes();
 
     virtual std::vector<HostAndPort> getHostsWrittenTo(const OpTime& op, bool durablyWritten);
-
-    virtual std::vector<HostAndPort> getOtherNodesInReplSet() const;
 
     virtual WriteConcernOptions getGetLastErrorDefault();
 
@@ -245,7 +243,7 @@ public:
 
     virtual bool shouldChangeSyncSource(const HostAndPort& currentSource,
                                         const rpc::ReplSetMetadata& replMetadata,
-                                        boost::optional<rpc::OplogQueryMetadata> oqMetadata);
+                                        const rpc::OplogQueryMetadata& oqMetadata);
 
     virtual OpTime getLastCommittedOpTime() const;
 

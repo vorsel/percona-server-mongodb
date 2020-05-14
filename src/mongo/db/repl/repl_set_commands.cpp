@@ -36,6 +36,7 @@
 #include "mongo/platform/basic.h"
 
 #include <boost/algorithm/string.hpp>
+#include <fmt/format.h>
 
 #include "mongo/db/repl/repl_set_command.h"
 
@@ -78,6 +79,7 @@ namespace repl {
 
 using std::string;
 using std::stringstream;
+using namespace fmt::literals;
 
 static const std::string kReplSetReconfigNss = "local.replset.reconfig";
 
@@ -106,7 +108,10 @@ public:
                      const string&,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
-        LOGV2(21573, "replSetTest command received: {cmdObj}", "cmdObj"_attr = cmdObj.toString());
+        LOGV2(21573,
+              "replSetTest command received: {cmdObj}",
+              "replSetTest command received",
+              "cmdObj"_attr = cmdObj.toString());
 
         auto replCoord = ReplicationCoordinator::get(getGlobalServiceContext());
 
@@ -125,6 +130,7 @@ public:
             Milliseconds timeout(timeoutMillis);
             LOGV2(21574,
                   "replSetTest: waiting {timeout} for member state to become {expectedState}",
+                  "replSetTest: waiting for member state to become expected state",
                   "timeout"_attr = timeout,
                   "expectedState"_attr = expectedState);
 
@@ -139,6 +145,7 @@ public:
             Milliseconds timeout(timeoutMillis);
             LOGV2(21575,
                   "replSetTest: waiting {timeout} for applier buffer to finish draining",
+                  "replSetTest: waiting for applier buffer to finish draining",
                   "timeout"_attr = timeout);
 
             status = replCoord->waitForDrainFinish(timeout);
@@ -285,7 +292,11 @@ void parseReplSetSeedList(ReplicationCoordinatorExternalState* externalState,
         seedSet.insert(m);
         // uassert(13101, "can't use localhost in replset host list", !m.isLocalHost());
         if (externalState->isSelf(m, getGlobalServiceContext())) {
-            LOGV2_DEBUG(21576, 1, "ignoring seed {m} (=self)", "m"_attr = m.toString());
+            LOGV2_DEBUG(21576,
+                        1,
+                        "ignoring seed {seed} (=self)",
+                        "Ignoring seed (=self)",
+                        "seed"_attr = m.toString());
         } else {
             seeds->push_back(m);
         }
@@ -325,7 +336,9 @@ public:
                 "no configuration specified. "
                 "Using a default configuration for the set";
             result.append("info2", noConfigMessage);
-            LOGV2(21577, "initiate : {noConfigMessage}", "noConfigMessage"_attr = noConfigMessage);
+            LOGV2(
+                21577,
+                "Initiate: no configuration specified. Using a default configuration for the set");
 
             ReplicationCoordinatorExternalStateImpl externalState(
                 opCtx->getServiceContext(),
@@ -357,8 +370,9 @@ public:
             b.appendArray("members", members.obj());
             configObj = b.obj();
             LOGV2(21578,
-                  "created this configuration for initiation : {configObj}",
-                  "configObj"_attr = configObj.toString());
+                  "created this configuration for initiation : {config}",
+                  "Created configuration for initiation",
+                  "config"_attr = configObj.toString());
         }
 
         if (configObj.getField("version").eoo()) {
@@ -405,6 +419,29 @@ public:
         ReplicationCoordinator::ReplSetReconfigArgs parsedArgs;
         parsedArgs.newConfigObj = cmdObj["replSetReconfig"].Obj();
         parsedArgs.force = cmdObj.hasField("force") && cmdObj["force"].trueValue();
+
+        // For safe reconfig, wait for the current config to be committed before running a new one.
+        // We will check again after acquiring the repl mutex in processReplSetReconfig(), in case
+        // of concurrent reconfigs.
+        if (!parsedArgs.force && enableSafeReplicaSetReconfig) {
+            // Check primary before waiting.
+            auto memberState = replCoord->getMemberState();
+            uassert(ErrorCodes::NotMaster,
+                    "replSetReconfig should only be run on PRIMARY, but my state is {};"_format(
+                        memberState.toString()),
+                    memberState.primary());
+
+            // Skip the waiting if the current config is from a force reconfig.
+            auto oplogWait = replCoord->getConfig().getConfigTerm() != OpTime::kUninitializedTerm;
+            auto status = replCoord->awaitConfigCommitment(opCtx, oplogWait);
+            status.addContext("New config is rejected");
+            if (status == ErrorCodes::MaxTimeMSExpired) {
+                // Convert the error code to be more specific.
+                uasserted(ErrorCodes::CurrentConfigNotCommittedYet, status.reason());
+            }
+            uassertStatusOK(status);
+        }
+
         auto status = replCoord->processReplSetReconfig(opCtx, parsedArgs, &result);
 
         if (status.isOK() && !parsedArgs.force) {
@@ -434,7 +471,10 @@ public:
             serverGlobalParams.featureCompatibility.isVersion(
                 ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) &&
             enableSafeReplicaSetReconfig) {
-            uassertStatusOK(replCoord->awaitConfigCommitment(opCtx));
+            auto status =
+                replCoord->awaitConfigCommitment(opCtx, false /* waitForOplogCommitment */);
+            uassertStatusOK(
+                status.withContext("Reconfig finished but failed to propagate to a majority"));
         }
 
         return true;
@@ -711,12 +751,12 @@ public:
         rsDelayHeartbeatResponse.execute(
             [&](const BSONObj& data) { sleepsecs(data["delay"].numberInt()); });
 
-        LOGV2_FOR_HEARTBEATS(
-            24095,
-            2,
-            "Received heartbeat request from {cmdObj_getStringField_from}, {cmdObj}",
-            "cmdObj_getStringField_from"_attr = cmdObj.getStringField("from"),
-            "cmdObj"_attr = cmdObj);
+        LOGV2_FOR_HEARTBEATS(24095,
+                             2,
+                             "Received heartbeat request from {from}, {cmdObj}",
+                             "Received heartbeat request",
+                             "from"_attr = cmdObj.getStringField("from"),
+                             "cmdObj"_attr = cmdObj);
 
         Status status = Status(ErrorCodes::InternalError, "status not set in heartbeat code");
         /* we don't call ReplSetCommand::check() here because heartbeat
@@ -729,23 +769,23 @@ public:
         ReplSetHeartbeatArgsV1 args;
         uassertStatusOK(args.initialize(cmdObj));
 
-        LOGV2_FOR_HEARTBEATS(
-            24096,
-            2,
-            "Processing heartbeat request from {cmdObj_getStringField_from}, {cmdObj}",
-            "cmdObj_getStringField_from"_attr = cmdObj.getStringField("from"),
-            "cmdObj"_attr = cmdObj);
+        LOGV2_FOR_HEARTBEATS(24096,
+                             2,
+                             "Processing heartbeat request from {from}, {cmdObj}",
+                             "Processing heartbeat request",
+                             "from"_attr = cmdObj.getStringField("from"),
+                             "cmdObj"_attr = cmdObj);
         ReplSetHeartbeatResponse response;
         status = ReplicationCoordinator::get(opCtx)->processHeartbeatV1(args, &response);
         if (status.isOK())
             response.addToBSON(&result);
 
-        LOGV2_FOR_HEARTBEATS(
-            24097,
-            2,
-            "Generated heartbeat response to  {cmdObj_getStringField_from}, {response}",
-            "cmdObj_getStringField_from"_attr = cmdObj.getStringField("from"),
-            "response"_attr = response);
+        LOGV2_FOR_HEARTBEATS(24097,
+                             2,
+                             "Generated heartbeat response to {from}, {response}",
+                             "Generated heartbeat response",
+                             "from"_attr = cmdObj.getStringField("from"),
+                             "response"_attr = response);
         uassertStatusOK(status);
         return true;
     }
@@ -768,7 +808,10 @@ public:
         status = ReplicationCoordinator::get(opCtx)->stepUpIfEligible(skipDryRun);
 
         if (!status.isOK()) {
-            LOGV2(21582, "replSetStepUp request failed{status}", "status"_attr = causedBy(status));
+            LOGV2(21582,
+                  "replSetStepUp request failed {error}",
+                  "replSetStepUp request failed",
+                  "error"_attr = causedBy(status));
         }
 
         uassertStatusOK(status);
@@ -804,8 +847,9 @@ public:
                 kFailedWithReplSetAbortPrimaryCatchUpCmd);
         if (!status.isOK()) {
             LOGV2(21584,
-                  "replSetAbortPrimaryCatchUp request failed{status}",
-                  "status"_attr = causedBy(status));
+                  "replSetAbortPrimaryCatchUp request failed {error}",
+                  "replSetAbortPrimaryCatchUp request failed",
+                  "error"_attr = causedBy(status));
         }
         uassertStatusOK(status);
         return true;

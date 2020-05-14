@@ -128,7 +128,7 @@ public:
      *
      * Does not need to be called inside of a WriteUnitOfWork (but can be due to nesting).
      *
-     * Requires holding an intent lock on the collection.
+     * Requires holding an exclusive lock on the collection.
      */
     using OnInitFn = std::function<Status(std::vector<BSONObj>& specs)>;
     StatusWith<std::vector<BSONObj>> init(OperationContext* opCtx,
@@ -370,9 +370,6 @@ private:
     // Set to true when no work remains to be done, the object can safely destruct without leaving
     // incorrect state set anywhere.
     bool _buildIsCleanedUp = true;
-
-    // Duplicate key constraints should be checked at least once in the MultiIndexBlock.
-    bool _constraintsChecked = false;
 
     // A unique identifier associating this index build with a two-phase index build within a
     // replica set.
