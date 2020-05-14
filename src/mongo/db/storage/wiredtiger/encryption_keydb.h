@@ -88,6 +88,7 @@ private:
 
     EncryptionKeyDB(const bool just_created, const std::string& path, const bool rotation);
 
+    int _openWiredTiger(const std::string& path, const std::string& wtOpenConfig);
 
     void close_handles();
     int store_gcm_iv_reserved();
