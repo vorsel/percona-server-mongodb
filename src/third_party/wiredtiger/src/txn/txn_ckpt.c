@@ -838,8 +838,12 @@ __txn_checkpoint(WT_SESSION_IMPL *session, const char *cfg[])
      * Hold the schema lock while starting the transaction and gathering handles so the set we get
      * is complete and correct.
      */
+    time_start_hs = __wt_clock(session);
     WT_WITH_SCHEMA_LOCK(session, ret = __checkpoint_prepare(session, &tracking, cfg));
     WT_ERR(ret);
+    time_stop_hs = __wt_clock(session);
+    WT_STAT_CONN_INCRV(
+      session, txn_checkpoint_prepare_time, (int64_t)WT_CLOCKDIFF_US(time_stop_hs, time_start_hs));
 
     /*
      * Save the checkpoint timestamp in a temporary variable, when we release our snapshot it'll be
@@ -861,7 +865,11 @@ __txn_checkpoint(WT_SESSION_IMPL *session, const char *cfg[])
         WT_ERR(__wt_txn_checkpoint_log(session, full, WT_TXN_LOG_CKPT_START, NULL));
 
     __checkpoint_timing_stress(session);
+    time_start_hs = __wt_clock(session);
     WT_ERR(__checkpoint_apply_to_dhandles(session, cfg, __checkpoint_tree_helper));
+    time_stop_hs = __wt_clock(session);
+    WT_STAT_CONN_INCRV(
+      session, txn_checkpoint_tree_helper_time, (int64_t)WT_CLOCKDIFF_US(time_stop_hs, time_start_hs));
 
     /*
      * Get a history store dhandle. If the history store file is opened for a special operation this
