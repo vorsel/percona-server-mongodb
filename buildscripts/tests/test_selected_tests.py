@@ -1,15 +1,16 @@
 """Unit tests for the selected_tests script."""
-import os
+import json
 import sys
 import unittest
+from typing import Dict, Any
 
 from mock import MagicMock, patch
-from shrub.config import Configuration
+from shrub.v2 import BuildVariant, ShrubProject
 
 # pylint: disable=wrong-import-position
 import buildscripts.ciconfig.evergreen as _evergreen
 from buildscripts.evergreen_generate_resmoke_tasks import Suite
-from buildscripts.tests.test_burn_in_tests import get_evergreen_config
+from buildscripts.tests.test_burn_in_tests import get_evergreen_config, mock_changed_git_files
 from buildscripts import selected_tests as under_test
 
 # pylint: disable=missing-docstring,invalid-name,unused-argument,protected-access
@@ -40,6 +41,16 @@ def tests_by_task_stub():
     }
 
 
+def empty_build_variant(variant_name: str) -> Dict[str, Any]:
+    return {
+        "buildvariants": [{
+            "name": variant_name,
+            "tasks": [],
+        }],
+        "tasks": [],
+    }
+
+
 class TestAcceptance(unittest.TestCase):
     """A suite of Acceptance tests for selected_tests."""
 
@@ -63,14 +74,16 @@ class TestAcceptance(unittest.TestCase):
             "task_name": "selected_tests_gen", "build_variant": "selected-tests",
             "build_id": "my_build_id", "project": "mongodb-mongo-master"
         }
-        changed_files = ["src/file1.cpp"]
+        repos = [mock_changed_git_files([])]
         origin_build_variants = ["enterprise-rhel-62-64-bit"]
 
         config_dict = under_test.run(evg_api_mock, evg_config, selected_tests_service_mock,
-                                     selected_tests_variant_expansions, changed_files,
+                                     selected_tests_variant_expansions, repos,
                                      origin_build_variants)
 
-        self.assertEqual(config_dict["selected_tests_config.json"], "{}")
+        self.assertEqual(
+            json.loads(config_dict["selected_tests_config.json"]),
+            empty_build_variant(origin_build_variants[0]))
 
     @unittest.skipIf(sys.platform.startswith("win"), "not supported on windows")
     def test_when_test_mappings_are_found_for_changed_files(self):
@@ -87,11 +100,11 @@ class TestAcceptance(unittest.TestCase):
             "task_name": "selected_tests_gen", "build_variant": "selected-tests",
             "build_id": "my_build_id", "project": "mongodb-mongo-master"
         }
-        changed_files = ["src/file1.cpp"]
+        repos = [mock_changed_git_files(["src/file1.cpp"])]
         origin_build_variants = ["enterprise-rhel-62-64-bit"]
 
         config_dict = under_test.run(evg_api_mock, evg_config, selected_tests_service_mock,
-                                     selected_tests_variant_expansions, changed_files,
+                                     selected_tests_variant_expansions, repos,
                                      origin_build_variants)
 
         self.assertIn("selected_tests_config.json", config_dict)
@@ -121,11 +134,11 @@ class TestAcceptance(unittest.TestCase):
             "task_name": "selected_tests_gen", "build_variant": "selected-tests",
             "build_id": "my_build_id", "project": "mongodb-mongo-master"
         }
-        changed_files = ["src/file1.cpp"]
+        repos = [mock_changed_git_files(["src/file1.cpp"])]
         origin_build_variants = ["enterprise-rhel-62-64-bit"]
 
         config_dict = under_test.run(evg_api_mock, evg_config, selected_tests_service_mock,
-                                     selected_tests_variant_expansions, changed_files,
+                                     selected_tests_variant_expansions, repos,
                                      origin_build_variants)
 
         self.assertIn("selected_tests_config.json", config_dict)
@@ -210,17 +223,6 @@ class TestSelectedTestsConfigOptions(unittest.TestCase):
             {"selected_tests_to_run": {"my_test.js"}}, {}, {}, {})
 
         self.assertFalse(config_options.create_misc_suite)
-
-    @patch(ns("read_config"))
-    def test_generate_display_task(self, read_config_mock):
-        config_options = under_test.SelectedTestsConfigOptions(
-            {"task_name": "my_task", "build_variant": "my_variant"}, {}, {}, {})
-
-        display_task = config_options.generate_display_task(["task_1", "task_2"])
-
-        self.assertEqual("my_task_my_variant", display_task._name)
-        self.assertIn("task_1", display_task.to_map()["execution_tasks"])
-        self.assertIn("task_2", display_task.to_map()["execution_tasks"])
 
 
 class TestFindSelectedTestFiles(unittest.TestCase):
@@ -431,27 +433,6 @@ class TestGetEvgTaskConfig(unittest.TestCase):
 class TestUpdateConfigDictWithTask(unittest.TestCase):
     @patch(ns("SelectedTestsConfigOptions"))
     @patch(ns("GenerateSubSuites"))
-    def test_suites_and_tasks_are_generated(self, generate_subsuites_mock,
-                                            selected_tests_config_options_mock):
-        suites_config_mock = {"my_suite_0.yml": "suite file contents"}
-        generate_subsuites_mock.return_value.generate_suites_config.return_value = suites_config_mock
-
-        def generate_task_config(shrub_config, suites):
-            shrub_config.task("my_fake_task")
-
-        generate_subsuites_mock.return_value.generate_task_config.side_effect = generate_task_config
-
-        shrub_config = Configuration()
-        config_dict_of_suites_and_tasks = {}
-        under_test._update_config_with_task(
-            evg_api=MagicMock(), shrub_config=shrub_config, config_options=MagicMock(),
-            config_dict_of_suites_and_tasks=config_dict_of_suites_and_tasks)
-
-        self.assertEqual(config_dict_of_suites_and_tasks, suites_config_mock)
-        self.assertIn("my_fake_task", shrub_config.to_json())
-
-    @patch(ns("SelectedTestsConfigOptions"))
-    @patch(ns("GenerateSubSuites"))
     def test_no_suites_or_tasks_are_generated(self, generate_subsuites_mock,
                                               selected_tests_config_options_mock):
         generate_subsuites_mock.return_value.generate_suites_config.return_value = {}
@@ -461,14 +442,15 @@ class TestUpdateConfigDictWithTask(unittest.TestCase):
 
         generate_subsuites_mock.return_value.generate_task_config.side_effect = generate_task_config
 
-        shrub_config = Configuration()
+        build_variant = BuildVariant("variant")
         config_dict_of_suites_and_tasks = {}
         under_test._update_config_with_task(
-            evg_api=MagicMock(), shrub_config=shrub_config, config_options=MagicMock(),
+            MagicMock(), build_variant, config_options=MagicMock(),
             config_dict_of_suites_and_tasks=config_dict_of_suites_and_tasks)
 
+        shrub_project = ShrubProject.empty().add_build_variant(build_variant)
         self.assertEqual(config_dict_of_suites_and_tasks, {})
-        self.assertEqual(shrub_config.to_json(), "{}")
+        self.assertEqual(shrub_project.as_dict(), empty_build_variant("variant"))
 
 
 class TestGetTaskConfigsForTestMappings(unittest.TestCase):
@@ -565,3 +547,16 @@ class TestGetTaskConfigs(unittest.TestCase):
                                                     changed_files)
 
         self.assertEqual(task_configs["task_config_key"], "task_config_value_2")
+
+
+class RemoveRepoPathPrefix(unittest.TestCase):
+    def test_file_is_in_enterprise_modules(self):
+        filepath = under_test._remove_repo_path_prefix(
+            "src/mongo/db/modules/enterprise/src/file1.cpp")
+
+        self.assertEqual(filepath, "src/file1.cpp")
+
+    def test_file_is_not_in_enterprise_modules(self):
+        filepath = under_test._remove_repo_path_prefix("other_directory/src/file1.cpp")
+
+        self.assertEqual(filepath, "other_directory/src/file1.cpp")
