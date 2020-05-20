@@ -14,10 +14,12 @@
 typedef struct {
     WT_FILE_SYSTEM iface;
 
-    TAILQ_HEAD(__wt_fhhash_inmem, __wt_file_handle_inmem) fhhash[WT_HASH_ARRAY_SIZE];
     TAILQ_HEAD(__wt_fh_inmem_qh, __wt_file_handle_inmem) fhqh;
 
     WT_SPINLOCK lock;
+
+    uint32_t fhhash_size;
+    TAILQ_HEAD(__wt_fhhash_inmem, __wt_file_handle_inmem) fhhash[];
 } WT_FILE_SYSTEM_INMEM;
 
 static int __im_file_size(WT_FILE_HANDLE *, WT_SESSION *, wt_off_t *);
@@ -36,7 +38,7 @@ __im_handle_search(WT_FILE_SYSTEM *file_system, const char *name)
     im_fs = (WT_FILE_SYSTEM_INMEM *)file_system;
 
     hash = __wt_hash_city64(name, strlen(name));
-    bucket = hash % WT_HASH_ARRAY_SIZE;
+    bucket = hash % im_fs->fhhash_size;
     TAILQ_FOREACH (im_fh, &im_fs->fhhash[bucket], hashq)
         if (strcmp(im_fh->iface.name, name) == 0)
             break;
@@ -64,7 +66,7 @@ __im_handle_remove(
             return (__wt_set_return(session, EBUSY));
     }
 
-    bucket = im_fh->name_hash % WT_HASH_ARRAY_SIZE;
+    bucket = im_fh->name_hash % im_fs->fhhash_size;
     WT_FILE_HANDLE_REMOVE(im_fs, im_fh, bucket);
 
     /* Clean up private information. */
@@ -236,10 +238,10 @@ __im_fs_rename(WT_FILE_SYSTEM *file_system, WT_SESSION *wt_session, const char *
         __wt_free(session, im_fh->iface.name);
         im_fh->iface.name = copy;
 
-        bucket = im_fh->name_hash % WT_HASH_ARRAY_SIZE;
+        bucket = im_fh->name_hash % im_fs->fhhash_size;
         WT_FILE_HANDLE_REMOVE(im_fs, im_fh, bucket);
         im_fh->name_hash = __wt_hash_city64(to, strlen(to));
-        bucket = im_fh->name_hash % WT_HASH_ARRAY_SIZE;
+        bucket = im_fh->name_hash % im_fs->fhhash_size;
         WT_FILE_HANDLE_INSERT(im_fs, im_fh, bucket);
     }
 
@@ -476,7 +478,7 @@ __im_file_open(WT_FILE_SYSTEM *file_system, WT_SESSION *wt_session, const char *
     im_fh->ref = 1;
 
     hash = __wt_hash_city64(name, strlen(name));
-    bucket = hash % WT_HASH_ARRAY_SIZE;
+    bucket = hash % im_fs->fhhash_size;
     im_fh->name_hash = hash;
     WT_FILE_HANDLE_INSERT(im_fs, im_fh, bucket);
 
@@ -535,13 +537,18 @@ __wt_os_inmemory(WT_SESSION_IMPL *session)
     WT_DECL_RET;
     WT_FILE_SYSTEM *file_system;
     WT_FILE_SYSTEM_INMEM *im_fs;
+    uint32_t fhhash_size;
     u_int i;
+    u_int sz;
 
-    WT_RET(__wt_calloc_one(session, &im_fs));
+    fhhash_size = S2C(session)->big_hash_array_size;
+    sz = sizeof(WT_FILE_SYSTEM_INMEM) + fhhash_size * sizeof(im_fs->fhhash[0]);
+    WT_RET(__wt_calloc(session, 1, sz, &im_fs));
 
     /* Initialize private information. */
     TAILQ_INIT(&im_fs->fhqh);
-    for (i = 0; i < WT_HASH_ARRAY_SIZE; i++)
+    im_fs->fhhash_size = fhhash_size;
+    for (i = 0; i < fhhash_size; i++)
         TAILQ_INIT(&im_fs->fhhash[i]);
 
     WT_ERR(__wt_spin_init(session, &im_fs->lock, "in-memory I/O"));
