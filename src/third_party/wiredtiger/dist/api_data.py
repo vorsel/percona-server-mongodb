@@ -906,6 +906,9 @@ wiredtiger_open_common =\
         We recommend making a backup copy of all files with the
         WiredTiger prefix prior to passing this flag.''',
         type='boolean'),
+    Config('big_hash_array_size', '512', r'''
+        size of several connection-level arrays which are considered big''',
+        min='512', max='1048576'),
     Config('session_max', '100', r'''
         maximum expected number of sessions (including server
         threads)''',
@@ -913,6 +916,12 @@ wiredtiger_open_common =\
     Config('session_scratch_max', '2MB', r'''
         maximum memory to cache in each session''',
         type='int', undoc=True),
+    Config('session_dhhash_size', '512', r'''
+        size of hash array that holds cached session dhandles''',
+        min='512'),
+    Config('session_cursor_cache_size', '512', r'''
+        size of hash array that holds cached session cursors''',
+        min='512'),
     Config('session_table_cache', 'true', r'''
         Maintain a per-session cache of tables''',
         type='boolean', undoc=True), # Obsolete after WT-3476
