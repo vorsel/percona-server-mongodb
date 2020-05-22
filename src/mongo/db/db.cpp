@@ -62,6 +62,7 @@
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/commands/feature_compatibility_version_gen.h"
+#include "mongo/db/commands/shutdown.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/flow_control_ticketholder.h"
 #include "mongo/db/concurrency/lock_state.h"
@@ -123,6 +124,7 @@
 #include "mongo/db/s/shard_server_op_observer.h"
 #include "mongo/db/s/sharding_initialization_mongod.h"
 #include "mongo/db/s/sharding_state_recovery.h"
+#include "mongo/db/s/transaction_coordinator_service.h"
 #include "mongo/db/s/wait_for_majority_service.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
@@ -639,11 +641,19 @@ ExitCode _initAndListen(int listenPort) {
     // Only do this on storage engines supporting snapshot reads, which hold resources we wish to
     // release periodically in order to avoid storage cache pressure build up.
     if (storageEngine->supportsReadConcernSnapshot()) {
-        PeriodicThreadToAbortExpiredTransactions::get(serviceContext)->start();
-        // The inMemory engine is not yet used for replica or sharded transactions in production so
-        // it does not currently maintain snapshot history. It is live in testing, however.
-        if (!storageEngine->isEphemeral() || getTestCommandsEnabled()) {
-            PeriodicThreadToDecreaseSnapshotHistoryIfNotNeeded::get(serviceContext)->start();
+        try {
+            PeriodicThreadToAbortExpiredTransactions::get(serviceContext)->start();
+            // The inMemory engine is not yet used for replica or sharded transactions in production
+            // so it does not currently maintain snapshot history. It is live in testing, however.
+            if (!storageEngine->isEphemeral() || getTestCommandsEnabled()) {
+                PeriodicThreadToDecreaseSnapshotHistoryIfNotNeeded::get(serviceContext)->start();
+            }
+        } catch (ExceptionFor<ErrorCodes::PeriodicJobIsStopped>&) {
+            log() << "Not starting periodic jobs as shutdown is in progress";
+            // Shutdown has already started before initialization is complete. Wait for the
+            // shutdown task to complete and return.
+            MONGO_IDLE_THREAD_BLOCK;
+            return waitForShutdown();
         }
     }
 
@@ -919,22 +929,12 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
             opCtx = uniqueOpCtx.get();
         }
 
-        // If this is a single node replica set, then we don't have to wait
-        // for any secondaries. Ignore stepdown.
-        if (repl::ReplicationCoordinator::get(serviceContext)->getConfig().getNumMembers() != 1) {
-            try {
-                // For faster tests, we allow a short wait time with setParameter.
-                auto waitTime = repl::waitForStepDownOnNonCommandShutdown.load()
-                    ? Milliseconds(Seconds(10))
-                    : Milliseconds(100);
-                replCoord->stepDown(opCtx, false /* force */, waitTime, Seconds(120));
-            } catch (const ExceptionFor<ErrorCodes::NotMaster>&) {
-                // ignore not master errors
-            } catch (const DBException& e) {
-                log() << "Failed to stepDown in non-command initiated shutdown path "
-                      << e.toString();
-            }
-        }
+        // For faster tests, we allow a short wait time with setParameter.
+        auto waitTime = repl::waitForStepDownOnNonCommandShutdown.load() ? Milliseconds(Seconds(10))
+                                                                         : Milliseconds(100);
+        const auto forceShutdown = true;
+        // stepDown should never return an error during force shutdown.
+        invariant(stepDownForShutdown(opCtx, waitTime, forceShutdown).isOK());
     }
 
     WaitForMajorityService::get(serviceContext).shutDown();

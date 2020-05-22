@@ -195,129 +195,140 @@ void execCommandClient(OperationContext* opCtx,
                        CommandInvocation* invocation,
                        const OpMsgRequest& request,
                        rpc::ReplyBuilderInterface* result) {
-    const Command* c = invocation->definition();
-    ON_BLOCK_EXIT([opCtx, &result] {
-        auto body = result->getBodyBuilder();
-        appendRequiredFieldsToResponse(opCtx, &body);
-    });
+    [&] {
+        const Command* c = invocation->definition();
 
-    const auto dbname = request.getDatabase();
-    uassert(ErrorCodes::IllegalOperation,
-            "Can't use 'local' database through mongos",
-            dbname != NamespaceString::kLocalDb);
-    uassert(ErrorCodes::InvalidNamespace,
+        const auto dbname = request.getDatabase();
+        uassert(ErrorCodes::IllegalOperation,
+                "Can't use 'local' database through mongos",
+                dbname != NamespaceString::kLocalDb);
+        uassert(
+            ErrorCodes::InvalidNamespace,
             str::stream() << "Invalid database name: '" << dbname << "'",
             NamespaceString::validDBName(dbname, NamespaceString::DollarInDbNameBehavior::Allow));
 
-    StringMap<int> topLevelFields;
-    for (auto&& element : request.body) {
-        StringData fieldName = element.fieldNameStringData();
-        if (fieldName == "help" && element.type() == Bool && element.Bool()) {
-            std::stringstream help;
-            help << "help for: " << c->getName() << " " << c->help();
+        StringMap<int> topLevelFields;
+        for (auto&& element : request.body) {
+            StringData fieldName = element.fieldNameStringData();
+            if (fieldName == "help" && element.type() == Bool && element.Bool()) {
+                std::stringstream help;
+                help << "help for: " << c->getName() << " " << c->help();
+                auto body = result->getBodyBuilder();
+                body.append("help", help.str());
+                CommandHelpers::appendSimpleCommandStatus(body, true, "");
+                return;
+            }
+
+            uassert(ErrorCodes::FailedToParse,
+                    str::stream() << "Parsed command object contains duplicate top level key: "
+                                  << fieldName,
+                    topLevelFields[fieldName]++ == 0);
+        }
+
+        try {
+            invocation->checkAuthorization(opCtx, request);
+        } catch (const DBException& e) {
             auto body = result->getBodyBuilder();
-            body.append("help", help.str());
-            CommandHelpers::appendSimpleCommandStatus(body, true, "");
+            CommandHelpers::appendCommandStatusNoThrow(body, e.toStatus());
             return;
         }
 
-        uassert(ErrorCodes::FailedToParse,
-                str::stream() << "Parsed command object contains duplicate top level key: "
-                              << fieldName,
-                topLevelFields[fieldName]++ == 0);
-    }
+        c->incrementCommandsExecuted();
 
-    try {
-        invocation->checkAuthorization(opCtx, request);
-    } catch (const DBException& e) {
-        auto body = result->getBodyBuilder();
-        CommandHelpers::appendCommandStatusNoThrow(body, e.toStatus());
-        return;
-    }
+        auto shouldAffectCommandCounter = c->shouldAffectCommandCounter();
 
-    c->incrementCommandsExecuted();
+        if (shouldAffectCommandCounter) {
+            globalOpCounters.gotCommand();
+        }
 
-    if (c->shouldAffectCommandCounter()) {
-        globalOpCounters.gotCommand();
-    }
+        ON_BLOCK_EXIT([opCtx, shouldAffectCommandCounter] {
+            if (shouldAffectCommandCounter) {
+                Grid::get(opCtx)->catalogCache()->checkAndRecordOperationBlockedByRefresh(
+                    opCtx, mongo::LogicalOp::opCommand);
+            }
+        });
 
-    auto wcResult = uassertStatusOK(WriteConcernOptions::extractWCFromCommand(request.body));
+        auto wcResult = uassertStatusOK(WriteConcernOptions::extractWCFromCommand(request.body));
 
-    bool supportsWriteConcern = invocation->supportsWriteConcern();
-    if (!supportsWriteConcern && !wcResult.usedDefault) {
-        // This command doesn't do writes so it should not be passed a writeConcern.
-        // If we did not use the default writeConcern, one was provided when it shouldn't have
-        // been by the user.
-        auto body = result->getBodyBuilder();
-        CommandHelpers::appendCommandStatusNoThrow(
-            body, Status(ErrorCodes::InvalidOptions, "Command does not support writeConcern"));
-        return;
-    }
+        bool supportsWriteConcern = invocation->supportsWriteConcern();
+        if (!supportsWriteConcern && !wcResult.usedDefault) {
+            // This command doesn't do writes so it should not be passed a writeConcern.
+            // If we did not use the default writeConcern, one was provided when it shouldn't have
+            // been by the user.
+            auto body = result->getBodyBuilder();
+            CommandHelpers::appendCommandStatusNoThrow(
+                body, Status(ErrorCodes::InvalidOptions, "Command does not support writeConcern"));
+            return;
+        }
 
-    if (TransactionRouter::get(opCtx)) {
-        validateWriteConcernForTransaction(wcResult, c->getName());
-    }
+        if (TransactionRouter::get(opCtx)) {
+            validateWriteConcernForTransaction(wcResult, c->getName());
+        }
 
-    auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
-    if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern) {
-        uassert(ErrorCodes::InvalidOptions,
-                "read concern snapshot is only supported in a multi-statement transaction",
-                TransactionRouter::get(opCtx));
-    }
+        auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
+        if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern) {
+            uassert(ErrorCodes::InvalidOptions,
+                    "read concern snapshot is only supported in a multi-statement transaction",
+                    TransactionRouter::get(opCtx));
+        }
 
-    // attach tracking
-    rpc::TrackingMetadata trackingMetadata;
-    trackingMetadata.initWithOperName(c->getName());
-    rpc::TrackingMetadata::get(opCtx) = trackingMetadata;
+        // attach tracking
+        rpc::TrackingMetadata trackingMetadata;
+        trackingMetadata.initWithOperName(c->getName());
+        rpc::TrackingMetadata::get(opCtx) = trackingMetadata;
 
-    auto metadataStatus = processCommandMetadata(opCtx, request.body);
-    if (!metadataStatus.isOK()) {
-        auto body = result->getBodyBuilder();
-        CommandHelpers::appendCommandStatusNoThrow(body, metadataStatus);
-        return;
-    }
+        auto metadataStatus = processCommandMetadata(opCtx, request.body);
+        if (!metadataStatus.isOK()) {
+            auto body = result->getBodyBuilder();
+            CommandHelpers::appendCommandStatusNoThrow(body, metadataStatus);
+            return;
+        }
 
-    auto txnRouter = TransactionRouter::get(opCtx);
-    if (!supportsWriteConcern) {
-        if (txnRouter) {
-            invokeInTransactionRouter(opCtx, invocation, result);
+        auto txnRouter = TransactionRouter::get(opCtx);
+        if (!supportsWriteConcern) {
+            if (txnRouter) {
+                invokeInTransactionRouter(opCtx, invocation, result);
+            } else {
+                invocation->run(opCtx, result);
+            }
         } else {
-            invocation->run(opCtx, result);
-        }
-    } else {
-        // Change the write concern while running the command.
-        const auto oldWC = opCtx->getWriteConcern();
-        ON_BLOCK_EXIT([&] { opCtx->setWriteConcern(oldWC); });
-        opCtx->setWriteConcern(wcResult);
+            // Change the write concern while running the command.
+            const auto oldWC = opCtx->getWriteConcern();
+            ON_BLOCK_EXIT([&] { opCtx->setWriteConcern(oldWC); });
+            opCtx->setWriteConcern(wcResult);
 
-        if (txnRouter) {
-            invokeInTransactionRouter(opCtx, invocation, result);
-        } else {
-            invocation->run(opCtx, result);
+            if (txnRouter) {
+                invokeInTransactionRouter(opCtx, invocation, result);
+            } else {
+                invocation->run(opCtx, result);
+            }
+
+            auto body = result->getBodyBuilder();
+
+            MONGO_FAIL_POINT_BLOCK_IF(failCommand, data, [&](const BSONObj& data) {
+                return CommandHelpers::shouldActivateFailCommandFailPoint(
+                           data, request.getCommandName(), opCtx->getClient(), invocation->ns()) &&
+                    data.hasField("writeConcernError");
+            }) {
+                body.append(data.getData()["writeConcernError"]);
+            }
         }
 
         auto body = result->getBodyBuilder();
 
-        MONGO_FAIL_POINT_BLOCK_IF(failCommand, data, [&](const BSONObj& data) {
-            return CommandHelpers::shouldActivateFailCommandFailPoint(
-                       data, request.getCommandName(), opCtx->getClient(), invocation->ns()) &&
-                data.hasField("writeConcernError");
-        }) {
-            body.append(data.getData()["writeConcernError"]);
+        bool ok = CommandHelpers::extractOrAppendOk(body);
+        if (!ok) {
+            c->incrementCommandsFailed();
+
+            if (auto txnRouter = TransactionRouter::get(opCtx)) {
+                txnRouter.implicitlyAbortTransaction(opCtx,
+                                                     getStatusFromCommandResult(body.asTempObj()));
+            }
         }
-    }
+    }();
 
     auto body = result->getBodyBuilder();
-
-    bool ok = CommandHelpers::extractOrAppendOk(body);
-    if (!ok) {
-        c->incrementCommandsFailed();
-
-        if (auto txnRouter = TransactionRouter::get(opCtx)) {
-            txnRouter.implicitlyAbortTransaction(opCtx,
-                                                 getStatusFromCommandResult(body.asTempObj()));
-        }
-    }
+    appendRequiredFieldsToResponse(opCtx, &body);
 }
 
 MONGO_FAIL_POINT_DEFINE(doNotRefreshShardsOnRetargettingError);
@@ -335,11 +346,11 @@ void runCommand(OperationContext* opCtx,
     auto const command = CommandHelpers::findCommand(commandName);
     if (!command) {
         auto builder = replyBuilder->getBodyBuilder();
-        ON_BLOCK_EXIT([opCtx, &builder] { appendRequiredFieldsToResponse(opCtx, &builder); });
         CommandHelpers::appendCommandStatusNoThrow(
             builder,
             {ErrorCodes::CommandNotFound, str::stream() << "no such cmd: " << commandName});
         globalCommandRegistry()->incrementUnknownCommands();
+        appendRequiredFieldsToResponse(opCtx, &builder);
         return;
     }
 
@@ -620,6 +631,11 @@ void runCommand(OperationContext* opCtx,
 
 DbResponse Strategy::queryOp(OperationContext* opCtx, const NamespaceString& nss, DbMessage* dbm) {
     globalOpCounters.gotQuery();
+
+    ON_BLOCK_EXIT([opCtx] {
+        Grid::get(opCtx)->catalogCache()->checkAndRecordOperationBlockedByRefresh(
+            opCtx, mongo::LogicalOp::opQuery);
+    });
 
     const QueryMessage q(*dbm);
 

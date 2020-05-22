@@ -1,4 +1,4 @@
-# Copyright (C) 2018-present MongoDB, Inc.
+# Copyright (C) 2020-present MongoDB, Inc.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the Server Side Public License, version 1,
@@ -26,30 +26,31 @@
 # it in the license file.
 #
 
-# setIndexCommitQuorum IDL File.
-
 global:
-    cpp_namespace: "mongo"
-    cpp_includes:
-        - "mongo/db/write_concern_options.h"
+   cpp_namespace: "mongo"
 
 imports:
-    - "mongo/db/catalog/commit_quorum.idl"
     - "mongo/idl/basic_types.idl"
 
-commands:
-    setIndexCommitQuorum:
-        cpp_name: SetIndexCommitQuorum
-        description: "Resets the commitQuorum for an index build."
-        strict: false
-        namespace: concatenate_with_db
-        fields:
-            indexNames:
-                type: array<string>
-                description: "an array of all index names matching a single prior createIndexes
-                              request."
-            commitQuorum:
-                type: CommitQuorum
-                description: "commitQuorum can be set to the same values as writeConcern.w and
-                              indicates how many and/or which replica set members are needed for the
-                              primary to commit the index build."
+enums:
+  ReadPreference:
+      description: Enumeration representing Read Preference Modes
+      type: string
+      values:
+          # Read from primary only. All operations produce an error (throw an exception where
+          # applicable) if primary is unavailable. Cannot be combined with tags.
+          PrimaryOnly: "primary"
+          #
+          # Read from primary if available, otherwise a secondary. Tags will only be applied in the
+          # event that the primary is unavailable and a secondary is read from. In this event only
+          # secondaries matching the tags provided would be read from.
+          PrimaryPreferred: "primaryPreferred"
+          #
+          # Read from secondary if available, otherwise error.
+          SecondaryOnly: "secondary"
+          #
+          # Read from a secondary if available, otherwise read from the primary.
+          SecondaryPreferred: "secondaryPreferred"
+          #
+          # Read from any member.
+          Nearest: "nearest"

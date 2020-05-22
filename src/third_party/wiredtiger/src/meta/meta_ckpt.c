@@ -462,9 +462,10 @@ __wt_meta_ckptlist_get(
     WT_CKPT *ckpt, *ckptbase;
     WT_CONFIG ckptconf;
     WT_CONFIG_ITEM k, v;
+    WT_CONNECTION_IMPL *conn;
     WT_DECL_RET;
     size_t allocated, slot;
-    int64_t maxorder;
+    uint64_t most_recent;
     char *config;
 
     *ckptbasep = NULL;
@@ -472,6 +473,7 @@ __wt_meta_ckptlist_get(
     ckptbase = NULL;
     allocated = slot = 0;
     config = NULL;
+    conn = S2C(session);
 
     /* Retrieve the metadata information for the file. */
     WT_RET(__wt_metadata_search(session, fname, &config));
@@ -509,12 +511,20 @@ __wt_meta_ckptlist_get(
         WT_ERR(__wt_realloc_def(session, &allocated, slot + 2, &ckptbase));
 
         /* The caller may be adding a value, initialize it. */
-        maxorder = 0;
-        WT_CKPT_FOREACH (ckptbase, ckpt)
-            if (ckpt->order > maxorder)
-                maxorder = ckpt->order;
-        ckpt->order = maxorder + 1;
+        ckpt = &ckptbase[slot];
+        ckpt->order = (slot == 0) ? 1 : ckptbase[slot - 1].order + 1;
         __wt_seconds(session, &ckpt->sec);
+        /*
+         * Update time value for most recent checkpoint, not letting it move backwards. It is
+         * possible to race here, so use atomic CAS. This code relies on the fact that anyone we
+         * race with will only increase (never decrease) the most recent checkpoint time value.
+         */
+        for (;;) {
+            WT_ORDERED_READ(most_recent, conn->ckpt_most_recent);
+            if (ckpt->sec <= most_recent ||
+              __wt_atomic_cas64(&conn->ckpt_most_recent, most_recent, ckpt->sec))
+                break;
+        }
         /*
          * Load most recent checkpoint backup blocks to this checkpoint.
          */
@@ -527,7 +537,7 @@ __wt_meta_ckptlist_get(
          * the checkpoint's modified blocks from the block manager.
          */
         F_SET(ckpt, WT_CKPT_ADD);
-        if (F_ISSET(S2C(session), WT_CONN_INCR_BACKUP)) {
+        if (F_ISSET(conn, WT_CONN_INCR_BACKUP)) {
             F_SET(ckpt, WT_CKPT_BLOCK_MODS);
             WT_ERR(__ckpt_valid_blk_mods(session, ckpt));
         }
@@ -763,7 +773,7 @@ __ckpt_blkmod_to_meta(WT_SESSION_IMPL *session, WT_ITEM *buf, WT_CKPT *ckpt)
         if (!F_ISSET(blk, WT_BLOCK_MODS_VALID))
             continue;
         WT_RET(__wt_raw_to_hex(session, blk->bitstring.data, blk->bitstring.size, &bitstring));
-        WT_RET(__wt_buf_catfmt(session, buf, "%s%s=(id=%" PRIu32 ",granularity=%" PRIu64
+        WT_RET(__wt_buf_catfmt(session, buf, "%s\"%s\"=(id=%" PRIu32 ",granularity=%" PRIu64
                                              ",nbits=%" PRIu64 ",offset=%" PRIu64 ",blocks=%.*s)",
           i == 0 ? "" : ",", blk->id_str, i, blk->granularity, blk->nbits, blk->offset,
           (int)bitstring.size, (char *)bitstring.data));

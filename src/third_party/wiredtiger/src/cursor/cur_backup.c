@@ -311,7 +311,7 @@ __backup_add_id(WT_SESSION_IMPL *session, WT_CONFIG_ITEM *cval)
     for (i = 0; i < WT_BLKINCR_MAX; ++i) {
         blk = &conn->incr_backups[i];
         __wt_verbose(session, WT_VERB_BACKUP, "blk[%u] flags 0x%" PRIx64, i, blk->flags);
-        /* If it isn't use, we can use it. */
+        /* If it isn't already in use, we can use it. */
         if (!F_ISSET(blk, WT_BLKINCR_INUSE))
             break;
     }
@@ -368,6 +368,7 @@ __backup_find_id(WT_SESSION_IMPL *session, WT_CONFIG_ITEM *cval, WT_BLKINCR **in
     u_int i;
 
     conn = S2C(session);
+    WT_RET(__wt_name_check(session, cval->str, cval->len, false));
     for (i = 0; i < WT_BLKINCR_MAX; ++i) {
         blk = &conn->incr_backups[i];
         /* If it isn't valid, skip it. */
@@ -416,6 +417,10 @@ err:
 /*
  * __backup_config --
  *     Backup configuration.
+ *
+ * NOTE: this function handles all of the backup configuration except for the incremental use of
+ *     force_stop. That is handled at the beginning of __backup_start because we want to deal with
+ *     that setting without any of the other cursor setup.
  */
 static int
 __backup_config(WT_SESSION_IMPL *session, WT_CURSOR_BACKUP *cb, const char *cfg[],
@@ -439,19 +444,6 @@ __backup_config(WT_SESSION_IMPL *session, WT_CURSOR_BACKUP *cb, const char *cfg[
      * Per-file offset incremental hot backup configurations take a starting checkpoint and optional
      * maximum transfer size, and the subsequent duplicate cursors take a file object.
      */
-    WT_RET_NOTFOUND_OK(__wt_config_gets(session, cfg, "incremental.force_stop", &cval));
-    if (cval.val) {
-        /*
-         * If we're force stopping incremental backup, set the flag. The resources involved in
-         * incremental backup will be released on cursor close and that is the only expected usage
-         * for this cursor.
-         */
-        if (is_dup)
-            WT_RET_MSG(session, EINVAL,
-              "Incremental force stop can only be specified on a primary backup cursor");
-        F_SET(cb, WT_CURBACKUP_FORCE_STOP);
-        return (0);
-    }
     WT_RET_NOTFOUND_OK(__wt_config_gets(session, cfg, "incremental.enabled", &cval));
     if (cval.val) {
         if (!F_ISSET(conn, WT_CONN_INCR_BACKUP)) {
@@ -504,8 +496,10 @@ __backup_config(WT_SESSION_IMPL *session, WT_CURSOR_BACKUP *cb, const char *cfg[
             WT_ERR_MSG(session, EINVAL,
               "Incremental identifier can only be specified on a primary backup cursor");
         ret = __backup_find_id(session, &cval, NULL);
-        if (ret != WT_NOTFOUND)
+        if (ret == 0)
             WT_ERR_MSG(session, EINVAL, "Incremental identifier already exists");
+        if (ret != WT_NOTFOUND)
+            WT_ERR(ret);
 
         WT_ERR(__backup_add_id(session, &cval));
         incremental_config = true;
@@ -620,7 +614,7 @@ __backup_start(
      * Single thread hot backups: we're holding the schema lock, so we know we'll serialize with
      * other attempts to start a hot backup.
      */
-    if (conn->hot_backup && !is_dup)
+    if (conn->hot_backup_start != 0 && !is_dup)
         WT_RET_MSG(session, EINVAL, "there is already a backup cursor open");
 
     if (F_ISSET(session, WT_SESSION_BACKUP_DUP) && is_dup)
@@ -637,6 +631,9 @@ __backup_start(
          * incremental backup will be released on cursor close and that is the only expected usage
          * for this cursor.
          */
+        if (is_dup)
+            WT_RET_MSG(session, EINVAL,
+              "Incremental force stop can only be specified on a primary backup cursor");
         F_SET(cb, WT_CURBACKUP_FORCE_STOP);
         return (0);
     }
@@ -778,7 +775,7 @@ __backup_stop(WT_SESSION_IMPL *session, WT_CURSOR_BACKUP *cb)
     WT_TRET(__wt_backup_file_remove(session));
 
     /* Checkpoint deletion and next hot backup can proceed. */
-    WT_WITH_HOTBACKUP_WRITE_LOCK(session, conn->hot_backup = false);
+    WT_WITH_HOTBACKUP_WRITE_LOCK(session, conn->hot_backup_start = 0);
     F_CLR(session, WT_SESSION_BACKUP_CURSOR);
 
     return (ret);
