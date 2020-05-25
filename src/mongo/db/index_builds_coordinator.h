@@ -169,7 +169,9 @@ public:
      * Apply a 'startIndexBuild' oplog entry. Returns when the index build thread has started and
      * performed the initial ready:false write. Throws if there were any errors building the index.
      */
-    void applyStartIndexBuild(OperationContext* opCtx, const IndexBuildOplogEntry& entry);
+    void applyStartIndexBuild(OperationContext* opCtx,
+                              bool isInitialSync,
+                              const IndexBuildOplogEntry& entry);
 
     /**
      * Apply a 'commitIndexBuild' oplog entry. If no index build is found, starts an index build
@@ -609,6 +611,8 @@ protected:
      */
     void _insertKeysFromSideTablesWithoutBlockingWrites(
         OperationContext* opCtx, std::shared_ptr<ReplIndexBuildState> replState);
+    void _insertKeysFromSideTablesBlockingWrites(OperationContext* opCtx,
+                                                 std::shared_ptr<ReplIndexBuildState> replState);
 
     /**
      * Reads the commit ready members list for index build UUID in 'replState' from
@@ -635,6 +639,12 @@ protected:
      * index build.
      */
     virtual void _signalPrimaryForCommitReadiness(
+        OperationContext* opCtx, std::shared_ptr<ReplIndexBuildState> replState) = 0;
+
+    /**
+     * Drains the side-writes table periodically while waiting for the IndexBuildAction to be ready.
+     */
+    virtual IndexBuildAction _drainSideWritesUntilNextActionIsAvailable(
         OperationContext* opCtx, std::shared_ptr<ReplIndexBuildState> replState) = 0;
 
     /**

@@ -253,7 +253,6 @@ variables:
   - func: "get buildnumber"
   - func: "set up credentials"
   - func: "fetch and build OpenSSL"
-  - func: "use WiredTiger develop" # noop if ${use_wt_develop} is not "true"
   - func: "set up win mount script"
   - func: "generate compile expansions"
   teardown_group:
@@ -377,7 +376,6 @@ variables:
   - enterprise-windows-inmem
   - enterprise-windows-nopush-template
   - enterprise-windows-required
-  - enterprise-windows-wtdevelop
   - ubuntu1804-debug-asan
   - ubuntu1804-debug-ubsan
   - ubuntu1804-debug-aubsan-lite
@@ -499,7 +497,6 @@ functions:
       directory: ${git_project_directory|src}
       revisions: # for each module include revision as <module_name> : ${<module_name>_rev}
         enterprise: ${enterprise_rev}
-        wtdevelop: ${wtdevelop_rev}
 
   "fetch artifacts": &fetch_artifacts
     command: s3.get
@@ -887,21 +884,6 @@ functions:
             if [ "${build_openssl|}" = "true" ]; then
                 bash buildscripts/fetch_and_build_openssl.sh "${python|python3}" "${openssl_make_flags|}" "${openssl_config_flags|}"
             fi
-
-  "use WiredTiger develop":
-    command: shell.exec
-    params:
-      working_dir: src
-      script: |
-        set -o errexit
-        set -o verbose
-        if [ "${use_wt_develop|}" = "true" ]; then
-        cd src/third_party
-        for wtdir in dist examples ext lang src test tools ; do
-          rm -rf wiredtiger/$wtdir
-          mv wtdevelop/$wtdir wiredtiger/
-        done
-        fi
 
   "shared scons cache pruning":
     command: shell.exec
@@ -4348,7 +4330,6 @@ tasks:
     - func: "upload pip requirements"
     - func: "get buildnumber"
     - func: "set up credentials"
-    - func: "use WiredTiger develop" # noop if ${use_wt_develop} is not "true"
     - func: "set up win mount script"
     - func: "generate compile expansions"
     # Then we load the generated version data into the agent so we can use it in task definitions
@@ -5440,6 +5421,17 @@ tasks:
   - func: "run tests"
     vars:
       resmoke_args: --suites=aggregation_sharded_collections_passthrough --storageEngine=wiredTiger
+
+- <<: *task_template
+  name: aggregation_sharded_collections_causally_consistent_passthrough
+  tags: ["aggregation", "secondary_reads"]
+  depends_on:
+  - name: aggregation
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=aggregation_sharded_collections_causally_consistent_passthrough --storageEngine=wiredTiger
 
 - <<: *task_template
   name: audit
@@ -8542,11 +8534,6 @@ modules:
   prefix: src/mongo/db/modules
   branch: v4.4
 
-- name: wtdevelop
-  repo: git@github.com:wiredtiger/wiredtiger.git
-  prefix: src/third_party
-  branch: develop
-
 #######################################
 #            Buildvariants            #
 #######################################
@@ -8631,17 +8618,6 @@ buildvariants:
   - name: sharding_gen
   - name: .stitch
   - name: server_discovery_and_monitoring_json_test_TG
-
-- <<: *linux-64-debug-template
-  name: linux-64-debug-wtdevelop
-  display_name: "~ Linux DEBUG WiredTiger develop"
-  modules:
-  - wtdevelop
-  expansions:
-    use_wt_develop: true
-    resmoke_jobs_factor: 0.5  # Avoid starting too many mongod's
-    compile_flags: --dbg=on --opt=on -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars --enable-free-mon=off --enable-http-client=off
-    test_flags: --excludeWithAnyTags=requires_http_client
 
 - name: linux-64-duroff
   display_name: Linux (No Journal)
@@ -9511,16 +9487,6 @@ buildvariants:
     - windows-64-vs2019-large
   - name: .benchmarks
 
-- <<: *enterprise-windows-nopush-template
-  name: enterprise-windows-wtdevelop
-  display_name: "~ Enterprise Windows WiredTiger develop"
-  modules:
-  - enterprise
-  - wtdevelop
-  expansions:
-    <<: *enterprise-windows-nopush-expansions-template
-    use_wt_develop: true
-
 - name: enterprise-windows-inmem
   display_name: Enterprise Windows (inMemory)
   modules:
@@ -10208,41 +10174,6 @@ buildvariants:
     additional_targets: archive-mongocryptd archive-mongocryptd-debug
     test_flags: >-
       --mongodSetParameters="{enableTwoPhaseIndexBuild: false}"
-    compile_flags: >-
-      -j$(grep -c ^processor /proc/cpuinfo)
-      --ssl
-      --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
-      MONGO_DISTMOD=rhel62
-    multiversion_platform: rhel62
-    multiversion_edition: enterprise
-    repo_edition: enterprise
-    scons_cache_scope: shared
-    large_distro_name: rhel62-large
-  tasks:
-  - name: compile_TG
-    distros:
-    - rhel62-large
-  - name: .concurrency !.large !.ubsan !.no_txns !.debug_only
-  - name: .jscore .common
-  - name: noPassthrough_gen
-  - name: noPassthroughWithMongod_gen
-  - name: .replica_sets !.encrypt !.auth
-    distros:
-    - rhel62-large
-  - name: .rollbackfuzzer
-  - name: .sharding .jscore !.wo_snapshot !.multi_stmt
-  - name: .sharding .common !.multiversion
-
-- name: enterprise-rhel-62-64-bit-two-phase-index-build-commit-quorum-off
-  display_name: "Enterprise RHEL 6.2 (2 phase index build commit quorum off)"
-  modules:
-  - enterprise
-  run_on:
-  - rhel62-small
-  batchtime: 10080 # 7 days
-  expansions: &enterprise-rhel-62-64-bit-two-phase-index-build-commit-quorum-off
-    test_flags: >-
-        --mongodSetParameters="{enableIndexBuildCommitQuorum: false}"
     compile_flags: >-
       -j$(grep -c ^processor /proc/cpuinfo)
       --ssl
