@@ -66,7 +66,7 @@ replSet.waitForAllIndexBuildsToFinish(testDB.getName(), collName);
 let awaitShell;
 try {
     assert.commandWorked(testDB.adminCommand(
-        {configureFailPoint: "hangAfterIndexBuildSecondDrain", mode: "alwaysOn"}));
+        {configureFailPoint: "hangAfterIndexBuildFirstDrain", mode: "alwaysOn"}));
 
     // Starts parallel shell to run the command that will hang.
     awaitShell = startParallelShell(function() {
@@ -88,9 +88,11 @@ try {
         indexNames: ['a_1'],
         commitQuorum: "someTag"
     }));
-
-    assert.commandWorked(testDB.runCommand(
+    // setIndexCommitQuorum should fail as it is illegal to disable commit quorum for in-progress
+    // index builds with commit quorum enabled.
+    assert.commandFailed(testDB.runCommand(
         {setIndexCommitQuorum: 'twoPhaseIndexBuild', indexNames: ['a_1'], commitQuorum: 0}));
+
     assert.commandWorked(testDB.runCommand(
         {setIndexCommitQuorum: 'twoPhaseIndexBuild', indexNames: ['a_1'], commitQuorum: 2}));
     assert.commandWorked(testDB.runCommand({
@@ -100,7 +102,7 @@ try {
     }));
 } finally {
     assert.commandWorked(
-        testDB.adminCommand({configureFailPoint: "hangAfterIndexBuildSecondDrain", mode: "off"}));
+        testDB.adminCommand({configureFailPoint: "hangAfterIndexBuildFirstDrain", mode: "off"}));
 }
 
 // Wait for the parallel shell to complete.

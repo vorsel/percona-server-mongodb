@@ -50,13 +50,13 @@ const newPrimaryColl = secondaryColl;
 assert.commandWorked(primary.adminCommand({replSetStepDown: 60, force: true}));
 const exitCode = createIdx({checkExitSuccess: false});
 assert.neq(0, exitCode, 'expected shell to exit abnormally due to index build being terminated');
-checkLog.contains(primary, 'Index build interrupted: ');
+checkLog.containsJson(primary, 20441);
 
 // Unblock the index build on the old primary during the collection scanning phase.
 // This index build will not complete because it has to wait for a commitIndexBuild oplog
 // entry.
 IndexBuildTest.resumeIndexBuilds(primary);
-checkLog.contains(primary, 'Index build waiting for next action before completing final phase: ');
+checkLog.containsJson(primary, 3856203);
 
 // Step up the new primary.
 rst.stepUp(newPrimary);

@@ -64,12 +64,16 @@ public:
     const CollectionUUID _othertestFooUUID = UUID::gen();
     const NamespaceString _othertestFooNss = NamespaceString("othertest.foo");
     const IndexBuildsCoordinator::IndexBuildOptions _indexBuildOptions = {
-        CommitQuorumOptions("majority")};
+        CommitQuorumOptions(CommitQuorumOptions::kDisabled)};
     std::unique_ptr<IndexBuildsCoordinator> _indexBuildsCoord;
 };
 
 void IndexBuildsCoordinatorMongodTest::setUp() {
     CatalogTestFixture::setUp();
+    // Create config.system.indexBuilds collection to store commit quorum value during index
+    // building.
+    createCollection(NamespaceString::kIndexBuildEntryNamespace, UUID::gen());
+
     createCollection(_testFooNss, _testFooUUID);
     createCollection(_testBarNss, _testBarUUID);
     createCollection(_othertestFooNss, _othertestFooUUID);
@@ -85,8 +89,7 @@ void IndexBuildsCoordinatorMongodTest::setUp() {
 }
 
 void IndexBuildsCoordinatorMongodTest::tearDown() {
-    _indexBuildsCoord->verifyNoIndexBuilds_forTestOnly();
-    _indexBuildsCoord->shutdown();
+    _indexBuildsCoord->shutdown(operationContext());
     _indexBuildsCoord.reset();
     // All databases are dropped during tear down.
     CatalogTestFixture::tearDown();
@@ -309,6 +312,63 @@ TEST_F(IndexBuildsCoordinatorMongodTest, SetCommitQuorumWithBadArguments) {
 
     _indexBuildsCoord->sleepIndexBuilds_forTestOnly(false);
     unittest::assertGet(testFoo1Future.getNoThrow());
+}
+
+TEST_F(IndexBuildsCoordinatorMongodTest, SetCommitQuorumFailsToTurnCommitQuorumFromOffToOn) {
+    _indexBuildsCoord->sleepIndexBuilds_forTestOnly(true);
+
+    // Start an index build on _testFooNss with commit quorum disabled.
+    auto testFoo1Future =
+        assertGet(_indexBuildsCoord->startIndexBuild(operationContext(),
+                                                     _testFooNss.db().toString(),
+                                                     _testFooUUID,
+                                                     makeSpecs(_testFooNss, {"a"}),
+                                                     UUID::gen(),
+                                                     IndexBuildProtocol::kTwoPhase,
+                                                     _indexBuildOptions));
+
+    // Update the commit quorum value such that it enables commit quorum for the index
+    // build 'a_1'.
+    auto status = _indexBuildsCoord->setCommitQuorum(
+        operationContext(), _testFooNss, {"a_1"}, CommitQuorumOptions(1));
+    ASSERT_EQUALS(ErrorCodes::BadValue, status);
+
+    _indexBuildsCoord->sleepIndexBuilds_forTestOnly(false);
+    assertGet(testFoo1Future.getNoThrow());
+}
+
+TEST_F(IndexBuildsCoordinatorMongodTest, SetCommitQuorumFailsToTurnCommitQuorumFromOnToOff) {
+    _indexBuildsCoord->sleepIndexBuilds_forTestOnly(true);
+
+    const IndexBuildsCoordinator::IndexBuildOptions indexBuildOptionsWithCQOn = {
+        CommitQuorumOptions(1)};
+    const auto buildUUID = UUID::gen();
+
+    // Start an index build on _testFooNss with commit quorum enabled.
+    auto testFoo1Future =
+        assertGet(_indexBuildsCoord->startIndexBuild(operationContext(),
+                                                     _testFooNss.db().toString(),
+                                                     _testFooUUID,
+                                                     makeSpecs(_testFooNss, {"a"}),
+                                                     buildUUID,
+                                                     IndexBuildProtocol::kTwoPhase,
+                                                     indexBuildOptionsWithCQOn));
+
+    // Update the commit quorum value such that it disables commit quorum for the index
+    // build 'a_1'.
+    auto status =
+        _indexBuildsCoord->setCommitQuorum(operationContext(),
+                                           _testFooNss,
+                                           {"a_1"},
+                                           CommitQuorumOptions(CommitQuorumOptions::kDisabled));
+    ASSERT_EQUALS(ErrorCodes::BadValue, status);
+
+    _indexBuildsCoord->sleepIndexBuilds_forTestOnly(false);
+
+    ASSERT_OK(_indexBuildsCoord->voteCommitIndexBuild(
+        operationContext(), buildUUID, HostAndPort("test1", 1234)));
+
+    assertGet(testFoo1Future.getNoThrow());
 }
 
 }  // namespace

@@ -51,6 +51,7 @@
 #include "mongo/db/catalog/commit_quorum_options.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/replication_state_transition_lock_guard.h"
@@ -2330,10 +2331,21 @@ BSONObj ReplicationCoordinatorImpl::runCmdOnPrimaryAndAwaitResponse(
     uassertStatusOK(scheduleResult.getStatus());
     CallbackHandle cbkHandle = scheduleResult.getValue();
 
-    onRemoteCmdScheduled(cbkHandle);
+    try {
+        onRemoteCmdScheduled(cbkHandle);
 
-    // Wait for the response in an interruptible mode.
-    _replExecutor->wait(cbkHandle, opCtx);
+        // Wait for the response in an interruptible mode.
+        _replExecutor->wait(cbkHandle, opCtx);
+    } catch (const DBException&) {
+        // If waiting for the response is interrupted, then we still have a callback out and
+        // registered with the TaskExecutor to run when the response finally does come back. Since
+        // the callback references local state, cbkResponse, it would be invalid for the callback to
+        // run after leaving the this function. Therefore, we cancel the callback and wait
+        // uninterruptably for the callback to be run.
+        _replExecutor->cancel(cbkHandle);
+        _replExecutor->wait(cbkHandle);
+        throw;
+    }
 
     onRemoteCmdComplete(cbkHandle);
     uassertStatusOK(cbkResponse.status);
@@ -3568,6 +3580,17 @@ Status ReplicationCoordinatorImpl::processReplSetInitiate(OperationContext* opCt
         return status;
     }
 
+    // Shard server nodes start up in the last stable FCV by default. In this case we must ensure
+    // that the config does not have a 'term' field in case their binary is downgraded.
+    bool omitConfigTerm = serverGlobalParams.clusterRole == ClusterRole::ShardServer &&
+        FeatureCompatibilityVersion::isCleanStartUp();
+    if (omitConfigTerm) {
+        newConfig.setConfigTerm(OpTime::kUninitializedTerm);
+        LOGV2(4711900,
+              "Set config term as uninitialized on shard server node",
+              "newConfig"_attr = newConfig.toBSON());
+    }
+
     status = _externalState->initializeReplSetStorage(opCtx, newConfig.toBSON());
     if (!status.isOK()) {
         LOGV2_ERROR(21427,
@@ -3651,6 +3674,8 @@ void ReplicationCoordinatorImpl::_fulfillTopologyChangePromise(WithLock lock) {
         iter->second->emplaceValue(response);
         iter->second = std::make_shared<SharedPromise<std::shared_ptr<const IsMasterResponse>>>();
     }
+
+    IsMasterMetrics::get(getGlobalServiceContext())->resetNumAwaitingTopologyChanges();
 }
 
 void ReplicationCoordinatorImpl::incrementTopologyVersion() {
@@ -3672,7 +3697,6 @@ ReplicationCoordinatorImpl::_updateMemberStateFromTopologyCoordinator(WithLock l
     ON_BLOCK_EXIT([&] {
         if (_rsConfig.isInitialized()) {
             _fulfillTopologyChangePromise(lk);
-            IsMasterMetrics::get(getGlobalServiceContext())->resetNumAwaitingTopologyChanges();
         }
     });
 
@@ -4750,24 +4774,26 @@ Status ReplicationCoordinatorImpl::processReplSetRequestVotes(
 
         _topCoord->processReplSetRequestVotes(args, response);
 
-        const bool votedForCandidate = response->getVoteGranted();
-        const long long electionTerm = args.getTerm();
-        const Date_t lastVoteDate = _replExecutor->now();
-        const int electionCandidateMemberId =
-            _rsConfig.getMemberAt(candidateIndex).getId().getData();
-        const std::string voteReason = response->getReason();
-        const OpTime lastAppliedOpTime = _topCoord->getMyLastAppliedOpTime();
-        const OpTime maxAppliedOpTime = _topCoord->latestKnownOpTime();
-        const double priorityAtElection = _rsConfig.getMemberAt(_selfIndex).getPriority();
-        ReplicationMetrics::get(getServiceContext())
-            .setElectionParticipantMetrics(votedForCandidate,
-                                           electionTerm,
-                                           lastVoteDate,
-                                           electionCandidateMemberId,
-                                           voteReason,
-                                           lastAppliedOpTime,
-                                           maxAppliedOpTime,
-                                           priorityAtElection);
+        if (!args.isADryRun()) {
+            const bool votedForCandidate = response->getVoteGranted();
+            const long long electionTerm = args.getTerm();
+            const Date_t lastVoteDate = _replExecutor->now();
+            const int electionCandidateMemberId =
+                _rsConfig.getMemberAt(candidateIndex).getId().getData();
+            const std::string voteReason = response->getReason();
+            const OpTime lastAppliedOpTime = _topCoord->getMyLastAppliedOpTime();
+            const OpTime maxAppliedOpTime = _topCoord->latestKnownOpTime();
+            const double priorityAtElection = _rsConfig.getMemberAt(_selfIndex).getPriority();
+            ReplicationMetrics::get(getServiceContext())
+                .setElectionParticipantMetrics(votedForCandidate,
+                                               electionTerm,
+                                               lastVoteDate,
+                                               electionCandidateMemberId,
+                                               voteReason,
+                                               lastAppliedOpTime,
+                                               maxAppliedOpTime,
+                                               priorityAtElection);
+        }
     }
 
     // It's safe to store lastVote outside of _mutex. The topology coordinator grants only one

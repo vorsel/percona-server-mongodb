@@ -1081,7 +1081,6 @@ Status applyOperation_inlock(OperationContext* opCtx,
                     str::stream() << "Failed to apply insert due to missing collection: "
                                   << redact(opOrGroupedInserts.toBSON()),
                     collection);
-
             if (opOrGroupedInserts.isGroupedInserts()) {
                 // Grouped inserts.
 
@@ -1101,8 +1100,11 @@ Status applyOperation_inlock(OperationContext* opCtx,
 
                 WriteUnitOfWork wuow(opCtx);
                 OpDebug* const nullOpDebug = nullptr;
-                Status status = collection->insertDocuments(
-                    opCtx, insertObjs.begin(), insertObjs.end(), nullOpDebug, true);
+                Status status = collection->insertDocuments(opCtx,
+                                                            insertObjs.begin(),
+                                                            insertObjs.end(),
+                                                            nullOpDebug,
+                                                            false /* fromMigrate */);
                 if (!status.isOK()) {
                     return status;
                 }
@@ -1176,8 +1178,10 @@ Status applyOperation_inlock(OperationContext* opCtx,
                     }
 
                     OpDebug* const nullOpDebug = nullptr;
-                    Status status = collection->insertDocument(
-                        opCtx, InsertStatement(o, timestamp, term), nullOpDebug, true);
+                    Status status = collection->insertDocument(opCtx,
+                                                               InsertStatement(o, timestamp, term),
+                                                               nullOpDebug,
+                                                               false /* fromMigrate */);
 
                     if (status.isOK()) {
                         wuow.commit();
@@ -1504,7 +1508,7 @@ Status applyCommand_inlock(OperationContext* opCtx,
                 Lock::TempRelease release(opCtx->lockState());
 
                 BackgroundOperation::awaitNoBgOpInProgForDb(nss.db());
-                IndexBuildsCoordinator::get(opCtx)->awaitNoBgOpInProgForDb(nss.db());
+                IndexBuildsCoordinator::get(opCtx)->awaitNoBgOpInProgForDb(opCtx, nss.db());
                 opCtx->recoveryUnit()->abandonSnapshot();
                 opCtx->checkForInterrupt();
 
@@ -1538,7 +1542,7 @@ Status applyCommand_inlock(OperationContext* opCtx,
                 }
                 BackgroundOperation::awaitNoBgOpInProgForNs(ns);
                 IndexBuildsCoordinator::get(opCtx)->awaitNoIndexBuildInProgressForCollection(
-                    swUUID.get());
+                    opCtx, swUUID.get());
 
                 opCtx->recoveryUnit()->abandonSnapshot();
                 opCtx->checkForInterrupt();

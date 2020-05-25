@@ -71,6 +71,11 @@ public:
                                          const CollectionOptions& options);
 
     /**
+     * Inserts a single document into the collection namespace 'nss'.
+     */
+    void _insertDocument(OperationContext* opCtx, const NamespaceString& nss, const BSONObj& doc);
+
+    /**
      * Inserts a document into the oplog.
      */
     Status _insertOplogEntry(const BSONObj& doc);
@@ -270,8 +275,6 @@ public:
                                                       UUID uuid,
                                                       const BSONObj& filter) const override;
 
-    void copyCollectionFromRemote(OperationContext* opCtx,
-                                  const NamespaceString& nss) const override;
     StatusWith<BSONObj> getCollectionInfoByUUID(const std::string& db,
                                                 const UUID& uuid) const override;
     StatusWith<BSONObj> getCollectionInfo(const NamespaceString& nss) const override;

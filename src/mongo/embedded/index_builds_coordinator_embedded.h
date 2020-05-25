@@ -54,7 +54,7 @@ public:
     /**
      * Does nothing.
      */
-    void shutdown() override;
+    void shutdown(OperationContext* opCtx) override;
 
     StatusWith<SharedSemiFuture<ReplIndexBuildState::IndexCatalogStats>> startIndexBuild(
         OperationContext* opCtx,
@@ -86,8 +86,7 @@ private:
                                           std::shared_ptr<ReplIndexBuildState> replState) override;
 
     bool _signalIfCommitQuorumNotEnabled(OperationContext* opCtx,
-                                         std::shared_ptr<ReplIndexBuildState> replState,
-                                         bool onStepUp) override;
+                                         std::shared_ptr<ReplIndexBuildState> replState) override;
 
     void _signalPrimaryForCommitReadiness(OperationContext* opCtx,
                                           std::shared_ptr<ReplIndexBuildState> replState) override;
@@ -97,8 +96,9 @@ private:
         return {};
     };
 
-    Timestamp _waitForNextIndexBuildAction(OperationContext* opCtx,
-                                           std::shared_ptr<ReplIndexBuildState> replState) override;
+    void _waitForNextIndexBuildActionAndCommit(OperationContext* opCtx,
+                                               std::shared_ptr<ReplIndexBuildState> replState,
+                                               const IndexBuildOptions& indexBuildOptions) override;
 };
 
 }  // namespace mongo

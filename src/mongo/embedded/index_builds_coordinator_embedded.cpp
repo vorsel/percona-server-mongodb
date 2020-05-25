@@ -40,7 +40,7 @@
 
 namespace mongo {
 
-void IndexBuildsCoordinatorEmbedded::shutdown() {}
+void IndexBuildsCoordinatorEmbedded::shutdown(OperationContext* opCtx) {}
 
 StatusWith<SharedSemiFuture<ReplIndexBuildState::IndexCatalogStats>>
 IndexBuildsCoordinatorEmbedded::startIndexBuild(OperationContext* opCtx,
@@ -52,8 +52,8 @@ IndexBuildsCoordinatorEmbedded::startIndexBuild(OperationContext* opCtx,
                                                 IndexBuildOptions indexBuildOptions) {
     invariant(!opCtx->lockState()->isLocked());
 
-    auto statusWithOptionalResult = _filterSpecsAndRegisterBuild(
-        opCtx, dbName, collectionUUID, specs, buildUUID, protocol, indexBuildOptions.commitQuorum);
+    auto statusWithOptionalResult =
+        _filterSpecsAndRegisterBuild(opCtx, dbName, collectionUUID, specs, buildUUID, protocol);
     if (!statusWithOptionalResult.isOK()) {
         return statusWithOptionalResult.getStatus();
     }
@@ -67,7 +67,7 @@ IndexBuildsCoordinatorEmbedded::startIndexBuild(OperationContext* opCtx,
         return statusWithOptionalResult.getValue().get();
     }
 
-    auto status = _setUpIndexBuild(opCtx, buildUUID, Timestamp());
+    auto status = _setUpIndexBuild(opCtx, buildUUID, Timestamp(), indexBuildOptions.commitQuorum);
     if (!status.isOK()) {
         return status;
     }
@@ -81,10 +81,10 @@ IndexBuildsCoordinatorEmbedded::startIndexBuild(OperationContext* opCtx,
 void IndexBuildsCoordinatorEmbedded::_signalPrimaryForCommitReadiness(
     OperationContext* opCtx, std::shared_ptr<ReplIndexBuildState> replState) {}
 
-Timestamp IndexBuildsCoordinatorEmbedded::_waitForNextIndexBuildAction(
-    OperationContext* opCtx, std::shared_ptr<ReplIndexBuildState> replState) {
-    return Timestamp();
-}
+void IndexBuildsCoordinatorEmbedded::_waitForNextIndexBuildActionAndCommit(
+    OperationContext* opCtx,
+    std::shared_ptr<ReplIndexBuildState> replState,
+    const IndexBuildOptions& indexBuildOptions) {}
 
 void IndexBuildsCoordinatorEmbedded::setSignalAndCancelVoteRequestCbkIfActive(
     WithLock ReplIndexBuildStateLk,
@@ -111,7 +111,7 @@ void IndexBuildsCoordinatorEmbedded::_signalIfCommitQuorumIsSatisfied(
 }
 
 bool IndexBuildsCoordinatorEmbedded::_signalIfCommitQuorumNotEnabled(
-    OperationContext* opCtx, std::shared_ptr<ReplIndexBuildState> replState, bool onStepUp) {
+    OperationContext* opCtx, std::shared_ptr<ReplIndexBuildState> replState) {
     MONGO_UNREACHABLE;
 }
 

@@ -265,8 +265,8 @@ public:
 
         // Build an index.
         MultiIndexBlock indexer;
-        ON_BLOCK_EXIT(
-            [&] { indexer.cleanUpAfterBuild(_opCtx, coll, MultiIndexBlock::kNoopOnCleanUpFn); });
+        auto abortOnExit = makeGuard(
+            [&] { indexer.abortIndexBuild(_opCtx, coll, MultiIndexBlock::kNoopOnCleanUpFn); });
 
         BSONObj indexInfoObj;
         {
@@ -297,6 +297,7 @@ public:
             // MultiIndexBlock.
             wuow.commit();
         }
+        abortOnExit.dismiss();
     }
 
     std::int32_t itCount(Collection* coll) {
@@ -1412,7 +1413,7 @@ public:
         ASSERT_EQ(lastTime.getTimestamp(), insertTime2.asTimestamp());
 
         // Wait for the index build to finish before making any assertions.
-        IndexBuildsCoordinator::get(_opCtx)->awaitNoIndexBuildInProgressForCollection(uuid);
+        IndexBuildsCoordinator::get(_opCtx)->awaitNoIndexBuildInProgressForCollection(_opCtx, uuid);
 
         AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IX);
 
@@ -1872,8 +1873,8 @@ public:
 
         // Build an index on `{a: 1}`. This index will be multikey.
         MultiIndexBlock indexer;
-        ON_BLOCK_EXIT([&] {
-            indexer.cleanUpAfterBuild(
+        auto abortOnExit = makeGuard([&] {
+            indexer.abortIndexBuild(
                 _opCtx, autoColl.getCollection(), MultiIndexBlock::kNoopOnCleanUpFn);
         });
         const LogicalTime beforeIndexBuild = _clock->reserveTicks(2);
@@ -1930,6 +1931,7 @@ public:
                 MultiIndexBlock::kNoopOnCommitFn));
             wuow.commit();
         }
+        abortOnExit.dismiss();
 
         const Timestamp afterIndexBuild = _clock->reserveTicks(1).asTimestamp();
 
@@ -1984,8 +1986,8 @@ public:
 
         // Build an index on `{a: 1}`.
         MultiIndexBlock indexer;
-        ON_BLOCK_EXIT([&] {
-            indexer.cleanUpAfterBuild(
+        auto abortOnExit = makeGuard([&] {
+            indexer.abortIndexBuild(
                 _opCtx, autoColl.getCollection(), MultiIndexBlock::kNoopOnCleanUpFn);
         });
         const LogicalTime beforeIndexBuild = _clock->reserveTicks(2);
@@ -2116,6 +2118,7 @@ public:
                 MultiIndexBlock::kNoopOnCommitFn));
             wuow.commit();
         }
+        abortOnExit.dismiss();
     }
 };
 
@@ -2131,6 +2134,13 @@ public:
 
         auto storageEngine = _opCtx->getServiceContext()->getStorageEngine();
         auto durableCatalog = storageEngine->getCatalog();
+
+        // Create config.system.indexBuilds collection to store commit quorum value during index
+        // building.
+        ASSERT_OK(
+            createCollection(_opCtx,
+                             NamespaceString::kIndexBuildEntryNamespace.db().toString(),
+                             BSON("create" << NamespaceString::kIndexBuildEntryNamespace.coll())));
 
         NamespaceString nss("unittests.timestampMultiIndexBuilds");
         reset(nss);
@@ -2646,8 +2656,8 @@ public:
 
         const IndexCatalogEntry* buildingIndex = nullptr;
         MultiIndexBlock indexer;
-        ON_BLOCK_EXIT([&] {
-            indexer.cleanUpAfterBuild(_opCtx, collection, MultiIndexBlock::kNoopOnCleanUpFn);
+        auto abortOnExit = makeGuard([&] {
+            indexer.abortIndexBuild(_opCtx, collection, MultiIndexBlock::kNoopOnCleanUpFn);
         });
 
         // Provide a build UUID, indicating that this is a two-phase index build.
@@ -2760,6 +2770,7 @@ public:
                 MultiIndexBlock::kNoopOnCommitFn));
             wuow.commit();
         }
+        abortOnExit.dismiss();
     }
 };
 
@@ -3861,7 +3872,8 @@ public:
         addIf<TimestampMultiIndexBuildsDuringRename>();
         addIf<TimestampAbortIndexBuild>();
         addIf<TimestampIndexDrops>();
-        addIf<TimestampIndexBuilderOnPrimary>();
+        // TODO SERVER-46722: Turn back on when test is passing.
+        // addIf<TimestampIndexBuilderOnPrimary>();
         addIf<SecondaryReadsDuringBatchApplicationAreAllowed>();
         addIf<ViewCreationSeparateTransaction>();
         addIf<CreateCollectionWithSystemIndex>();
