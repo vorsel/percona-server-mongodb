@@ -93,6 +93,70 @@ TEST_F(ReplCoordTest, NodeReturnsNotMasterWhenReconfigReceivedWhileSecondary) {
     ASSERT_TRUE(result.obj().isEmpty());
 }
 
+TEST_F(ReplCoordTest, NodeReturnsNotMasterWhenRunningSafeReconfigWhileInDrainMode) {
+    init();
+
+    assertStartSuccess(BSON("_id"
+                            << "mySet"
+                            << "version" << 1 << "members"
+                            << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                     << "test1:1234")
+                                          << BSON("_id" << 1 << "host"
+                                                        << "test2:1234"))
+                            << "protocolVersion" << 1),
+                       HostAndPort("test1", 1234));
+    replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    replCoordSetMyLastDurableOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+    ASSERT_TRUE(getReplCoord()->getMemberState().secondary());
+
+    const auto opCtx = makeOperationContext();
+    simulateSuccessfulV1ElectionWithoutExitingDrainMode(
+        getReplCoord()->getElectionTimeout_forTest(), opCtx.get());
+
+    ASSERT_EQUALS(1, getReplCoord()->getTerm());
+    ASSERT_TRUE(getReplCoord()->getMemberState().primary());
+
+    BSONObjBuilder result;
+    ReplSetReconfigArgs args;
+    args.force = false;
+    auto status = getReplCoord()->processReplSetReconfig(opCtx.get(), args, &result);
+    ASSERT_EQUALS(ErrorCodes::NotMaster, status);
+    ASSERT_STRING_CONTAINS(status.reason(), "Safe reconfig is only allowed on a writable PRIMARY.");
+    ASSERT_TRUE(result.obj().isEmpty());
+}
+
+TEST_F(ReplCoordTest, NodeReturnsNotMasterWhenReconfigCmdReceivedWhileInDrainMode) {
+    init();
+
+    assertStartSuccess(BSON("_id"
+                            << "mySet"
+                            << "version" << 1 << "members"
+                            << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                     << "test1:1234")
+                                          << BSON("_id" << 1 << "host"
+                                                        << "test2:1234"))
+                            << "protocolVersion" << 1),
+                       HostAndPort("test1", 1234));
+    replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    replCoordSetMyLastDurableOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+    ASSERT_TRUE(getReplCoord()->getMemberState().secondary());
+
+    const auto opCtx = makeOperationContext();
+    simulateSuccessfulV1ElectionWithoutExitingDrainMode(
+        getReplCoord()->getElectionTimeout_forTest(), opCtx.get());
+
+    ASSERT_EQUALS(1, getReplCoord()->getTerm());
+    ASSERT_TRUE(getReplCoord()->getMemberState().primary());
+
+    // Reconfig command first waits for config commitment and will get an error.
+    auto status = getReplCoord()->awaitConfigCommitment(opCtx.get(), true);
+    ASSERT_EQUALS(ErrorCodes::PrimarySteppedDown, status);
+    ASSERT_STRING_CONTAINS(status.reason(), "should only be run on a writable PRIMARY");
+}
+
+
 TEST_F(ReplCoordTest, NodeReturnsInvalidReplicaSetConfigWhenReconfigReceivedWithInvalidConfig) {
     // start up, become primary, receive uninitializable config
     assertStartSuccess(BSON("_id"
@@ -1193,6 +1257,66 @@ TEST_F(ReplCoordReconfigTest,
 
     reconfigThread.join();
     ASSERT_OK(status);
+}
+
+TEST_F(ReplCoordReconfigTest, StepdownShouldInterruptConfigWrite) {
+    // Start out in a non-initial config version.
+    init();
+    auto configVersion = 2;
+    assertStartSuccess(
+        configWithMembers(configVersion, 0, BSON_ARRAY(member(1, "n1:1") << member(2, "n2:1"))),
+        HostAndPort("n1", 1));
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+
+    // Simulate application of one oplog entry.
+    replCoordSetMyLastAppliedAndDurableOpTime(OpTime(Timestamp(1, 1), 0));
+
+    // Get elected primary.
+    simulateSuccessfulV1Election();
+    ASSERT_EQ(getReplCoord()->getMemberState(), MemberState::RS_PRIMARY);
+    ASSERT_EQ(getReplCoord()->getTerm(), 1);
+
+    // Advance your optime.
+    auto commitPoint = OpTime(Timestamp(2, 1), 1);
+    replCoordSetMyLastAppliedAndDurableOpTime(commitPoint);
+    replicateOpTo(2, commitPoint);
+
+    // Respond to heartbeats before reconfig.
+    respondToAllHeartbeats();
+
+    // Do a reconfig that should fail due to stepdown.
+    configVersion = 3;
+    ReplSetReconfigArgs args;
+    args.newConfigObj = configWithMembers(
+        configVersion, 1, BSON_ARRAY(member(1, "n1:1") << member(2, "n2:1") << member(3, "n3:1")));
+
+    BSONObjBuilder result;
+    Status status(ErrorCodes::InternalError, "Not Set");
+    const auto opCtx = makeOperationContext();
+    stdx::thread reconfigThread;
+    reconfigThread = stdx::thread(
+        [&] { status = getReplCoord()->processReplSetReconfig(opCtx.get(), args, &result); });
+
+    getNet()->enterNetwork();
+    // Wait for the next heartbeat of quorum check and blackhole it.
+    // The reconfig is hung during the quorum check.
+    auto request = getNet()->getNextReadyRequest();
+    getNet()->blackHole(request);
+    getNet()->exitNetwork();
+
+    // Step down due to a higher term.
+    TopologyCoordinator::UpdateTermResult termUpdated;
+    auto updateTermEvh = getReplCoord()->updateTerm_forTest(2, &termUpdated);
+    ASSERT(termUpdated == TopologyCoordinator::UpdateTermResult::kTriggerStepDown);
+    ASSERT(updateTermEvh.isValid());
+    getReplExec()->waitForEvent(updateTermEvh);
+
+    // Respond to quorum check to resume the reconfig.
+    respondToAllHeartbeats();
+
+    reconfigThread.join();
+    ASSERT_EQ(status.code(), ErrorCodes::NotMaster);
+    ASSERT_EQ(status.reason(), "Stepped down when persisting new config");
 }
 
 }  // anonymous namespace

@@ -167,6 +167,8 @@ StatusWith<std::vector<BSONObj>> parseAndValidateIndexSpecs(
                     // entry with a '*' as an index name means "drop all indexes in this
                     // collection".  We disallow creation of such indexes to avoid this conflict.
                     return {ErrorCodes::BadValue, "The index name '*' is not valid."};
+                } else if (ns.isSystem() && !indexSpec[IndexDescriptor::kHiddenFieldName].eoo()) {
+                    return {ErrorCodes::BadValue, "Can't hide index on system collection"};
                 }
 
                 indexSpecs.push_back(std::move(indexSpec));
@@ -303,7 +305,7 @@ boost::optional<CommitQuorumOptions> parseAndGetCommitQuorum(OperationContext* o
     if (IndexBuildProtocol::kTwoPhase == protocol) {
         // Setting CommitQuorum to 0 will make the index build to opt out of voting proces.
         return (replCoord->isReplEnabled() && commitQuorumEnabled)
-            ? CommitQuorumOptions(CommitQuorumOptions::kMajority)
+            ? CommitQuorumOptions(CommitQuorumOptions::kVotingMembers)
             : CommitQuorumOptions(CommitQuorumOptions::kDisabled);
     }
 

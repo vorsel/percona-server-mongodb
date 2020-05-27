@@ -624,6 +624,7 @@ public:
             LOGV2(22310,
                   "Triggering the first stable checkpoint. Initial Data: {initialData} PrevStable: "
                   "{prevStable} CurrStable: {currStable}",
+                  "Triggering the first stable checkpoint",
                   "initialData"_attr = initialData,
                   "prevStable"_attr = prevStable,
                   "currStable"_attr = currStable);
@@ -1398,7 +1399,7 @@ Status WiredTigerKVEngine::_salvageIfNeeded(const char* uri) {
 
     int rc = (session->verify)(session, uri, nullptr);
     if (rc == 0) {
-        LOGV2(22327, "Verify succeeded on uri {uri}. Not salvaging.", "uri"_attr = uri);
+        LOGV2(22327, "Verify succeeded. Not salvaging.", "uri"_attr = uri);
         return Status::OK();
     }
 
@@ -1407,7 +1408,7 @@ Status WiredTigerKVEngine::_salvageIfNeeded(const char* uri) {
         // lie and return OK to avoid breaking tests. This block should go away when that ticket
         // is resolved.
         LOGV2_ERROR(22356,
-                    "Verify on {uri} failed with EBUSY. This means the collection was being "
+                    "Verify failed with EBUSY. This means the collection was being "
                     "accessed. No repair is necessary unless other "
                     "errors are reported.",
                     "uri"_attr = uri);
@@ -1415,25 +1416,24 @@ Status WiredTigerKVEngine::_salvageIfNeeded(const char* uri) {
     }
 
     if (rc == ENOENT) {
-        LOGV2_WARNING(
-            22350,
-            "Data file is missing for {uri}. Attempting to drop and re-create the collection.",
-            "uri"_attr = uri);
+        LOGV2_WARNING(22350,
+                      "Data file is missing. Attempting to drop and re-create the collection.",
+                      "uri"_attr = uri);
 
         return _rebuildIdent(session, uri);
     }
 
-    LOGV2(22328, "Verify failed on uri {uri}. Running a salvage operation.", "uri"_attr = uri);
+    LOGV2(22328, "Verify failed. Running a salvage operation.", "uri"_attr = uri);
     auto status = wtRCToStatus(session->salvage(session, uri, nullptr), "Salvage failed:");
     if (status.isOK()) {
         return {ErrorCodes::DataModifiedByRepair, str::stream() << "Salvaged data for " << uri};
     }
 
     LOGV2_WARNING(22351,
-                  "Salvage failed for uri {uri}: {status_reason}. The file will be moved out of "
+                  "Salvage failed. The file will be moved out of "
                   "the way and a new ident will be created.",
                   "uri"_attr = uri,
-                  "status_reason"_attr = status.reason());
+                  "error"_attr = status);
 
     //  If the data is unsalvageable, we should completely rebuild the ident.
     return _rebuildIdent(session, uri);
@@ -1483,7 +1483,7 @@ Status WiredTigerKVEngine::_rebuildIdent(WT_SESSION* session, const char* uri) {
                     "swMetadata_getValue"_attr = swMetadata.getValue());
         return wtRCToStatus(rc);
     }
-    LOGV2(22329, "Successfully re-created {uri}.", "uri"_attr = uri);
+    LOGV2(22329, "Successfully re-created table", "uri"_attr = uri);
     return {ErrorCodes::DataModifiedByRepair,
             str::stream() << "Re-created empty data file for " << uri};
 }

@@ -74,6 +74,7 @@ const testDB = st.s.getDB(dbName);
 
 const kBlockCmdTimeMS = 5 * 60 * 1000;
 const kWaitKillOpTimeoutMS = 5 * 1000;
+const numDocs = 10;
 
 assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
 st.ensurePrimaryShard(dbName, st.shard0.shardName);
@@ -113,6 +114,7 @@ try {
         kWaitKillOpTimeoutMS);
 } finally {
     clearCommandDelay(sortedNodes[0]);
+    clearCommandDelay(sortedNodes[1]);
 }
 
 jsTest.log(
@@ -142,7 +144,47 @@ try {
         "Timed out waiting for the operation run by the additional request to be killed",
         kWaitKillOpTimeoutMS);
 } finally {
+    clearCommandDelay(sortedNodes[0]);
     clearCommandDelay(sortedNodes[1]);
+    assert.commandWorked(st.s.adminCommand({setParameter: 1, maxTimeMSForHedgedReads: 100}));
+}
+
+// Need causally consistent reads to verify the document count
+let session = testDB.getMongo().startSession({causalConsistency: true});
+const sessionDB = session.getDatabase(dbName);
+const sessionColl = sessionDB.getCollection(collName);
+
+let bulk = sessionColl.initializeUnorderedBulkOp();
+for (let i = 0; i < numDocs; i++) {
+    bulk.insert({x: i});
+}
+assert.commandWorked(bulk.execute());
+
+jsTest.log("Verify that the getMore on hedge request do not inherit maxTimeMS");
+try {
+    // force to open hedge read cursor on sortedNodes[1]
+    setCommandDelay(sortedNodes[0], "find", 500, ns);
+
+    // $where with sleep is used because blocking command via failCommand does not affect the opCtx
+    // deadlines as it blocks and unblocks the command before it starts execution.
+    const comment = "test_getmore_on_additional_request_" + ObjectId();
+    let findRes = assert.commandWorked(sessionDB.runCommand({
+        find: collName,
+        filter: {$where: "sleep(2000); return true;", x: {$gte: 0}},
+        $readPreference: {mode: "nearest"},
+        batchSize: 0,
+        comment: comment
+    }));
+
+    const cursorId = findRes.cursor.id;
+    assert.neq(0, cursorId);
+
+    // confirm that getMore does not time out.
+    let getMoreRes =
+        assert.commandWorked(sessionDB.runCommand({getMore: cursorId, collection: collName}));
+    assert.eq(getMoreRes.cursor.nextBatch.length, numDocs);
+} finally {
+    clearCommandDelay(sortedNodes[0]);
 }
 
 st.stop();
