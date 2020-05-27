@@ -43,7 +43,6 @@
 #include "mongo/scripting/engine.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log_global_settings.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/ntservice.h"
 #include "mongo/util/processinfo.h"
@@ -236,10 +235,7 @@ public:
                    const BSONObj& cmdObj,
                    std::string& errmsg,
                    BSONObjBuilder& result) override {
-        if (logV2Enabled()) {
-            return errmsgRunImpl<logv2::RamLog>(opCtx, dbname, cmdObj, errmsg, result);
-        }
-        return errmsgRunImpl<RamLog>(opCtx, dbname, cmdObj, errmsg, result);
+        return errmsgRunImpl<logv2::RamLog>(opCtx, dbname, cmdObj, errmsg, result);
     }
 
     template <typename RamLogType>
@@ -325,11 +321,8 @@ public:
             invariant(ramlog);
             ramlog->clear();
         };
-        if (logV2Enabled()) {
-            clearRamlog(logv2::RamLog::getIfExists(logName));
-        } else {
-            clearRamlog(RamLog::getIfExists(logName));
-        }
+        clearRamlog(logv2::RamLog::getIfExists(logName));
+
         return true;
     }
 };

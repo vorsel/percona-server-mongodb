@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -67,7 +67,7 @@ IndexBuildsCoordinatorEmbedded::startIndexBuild(OperationContext* opCtx,
         return statusWithOptionalResult.getValue().get();
     }
 
-    auto status = _setUpIndexBuild(opCtx, buildUUID, Timestamp(), indexBuildOptions.commitQuorum);
+    auto status = _setUpIndexBuild(opCtx, buildUUID, Timestamp(), indexBuildOptions);
     if (!status.isOK()) {
         return status;
     }

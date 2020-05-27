@@ -29,7 +29,7 @@
 
 // CHECK_LOG_REDACTION
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -55,7 +55,6 @@
 #include "mongo/rpc/metadata/client_metadata_ismaster.h"
 #include "mongo/rpc/metadata/impersonated_user_metadata.h"
 #include "mongo/util/hex.h"
-#include "mongo/util/log.h"
 #include "mongo/util/log_with_sampling.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/str.h"
@@ -657,6 +656,14 @@ void CurOp::reportState(OperationContext* opCtx, BSONObjBuilder* builder, bool t
     }
 
     builder->append("numYields", _numYields);
+
+    if (_debug.dataThroughputLastSecond) {
+        builder->append("dataThroughputLastSecond", *_debug.dataThroughputLastSecond);
+    }
+
+    if (_debug.dataThroughputAverage) {
+        builder->append("dataThroughputAverage", *_debug.dataThroughputAverage);
+    }
 }
 
 bool CurOp::_shouldDBProfileWithRateLimit() {

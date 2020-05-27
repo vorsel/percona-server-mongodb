@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -43,6 +43,7 @@
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/s/cluster_last_error_info.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/options_parser/startup_option_init.h"
 #include "mongo/util/tick_source_mock.h"
 
 namespace mongo {
@@ -302,6 +303,11 @@ void ClusterCommandTestFixture::appendTxnResponseMetadata(BSONObjBuilder& bob) {
     // Set readOnly to false to avoid opting in to the read-only optimization.
     TxnResponseMetadata txnResponseMetadata(false);
     txnResponseMetadata.serialize(&bob);
+}
+
+// Satisfies dependency from StoreSASLOPtions.
+MONGO_STARTUP_OPTIONS_STORE(CoreOptions)(InitializerContext*) {
+    return Status::OK();
 }
 
 }  // namespace mongo

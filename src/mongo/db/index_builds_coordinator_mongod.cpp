@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
@@ -174,7 +173,7 @@ IndexBuildsCoordinatorMongod::startIndexBuild(OperationContext* opCtx,
         _indexBuildFinished.notify_one();
     });
 
-    if (indexBuildOptions.twoPhaseRecovery) {
+    if (indexBuildOptions.applicationMode == ApplicationMode::kStartupRepair) {
         // Two phase index build recovery goes though a different set-up procedure because the
         // original index will be dropped first.
         invariant(protocol == IndexBuildProtocol::kTwoPhase);
@@ -283,9 +282,8 @@ IndexBuildsCoordinatorMongod::startIndexBuild(OperationContext* opCtx,
         ShouldNotConflictWithSecondaryBatchApplicationBlock shouldNotConflictBlock(
             opCtx->lockState());
 
-        if (!indexBuildOptions.twoPhaseRecovery) {
-            status = _setUpIndexBuild(
-                opCtx.get(), buildUUID, startTimestamp, indexBuildOptions.commitQuorum);
+        if (indexBuildOptions.applicationMode != ApplicationMode::kStartupRepair) {
+            status = _setUpIndexBuild(opCtx.get(), buildUUID, startTimestamp, indexBuildOptions);
             if (!status.isOK()) {
                 startPromise.setError(status);
                 return;
@@ -679,6 +677,7 @@ void IndexBuildsCoordinatorMongod::_waitForNextIndexBuildActionAndCommit(
                 break;
             case IndexBuildAction::kOplogAbort:
             case IndexBuildAction::kRollbackAbort:
+            case IndexBuildAction::kInitialSyncAbort:
             case IndexBuildAction::kPrimaryAbort:
                 // The calling thread should have interrupted us before signaling an abort action.
                 LOGV2_FATAL(4698901, "Index build abort should have interrupted this operation");
@@ -736,6 +735,12 @@ Status IndexBuildsCoordinatorMongod::setCommitQuorum(OperationContext* opCtx,
                           << nss << "' without providing any indexes.");
     }
 
+    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    if (!replCoord->isReplEnabled()) {
+        return Status(ErrorCodes::BadValue,
+                      str::stream() << "Standalones can't specify commitQuorum");
+    }
+
     AutoGetCollectionForRead autoColl(opCtx, nss);
     Collection* collection = autoColl.getCollection();
     if (!collection) {
@@ -773,8 +778,13 @@ Status IndexBuildsCoordinatorMongod::setCommitQuorum(OperationContext* opCtx,
         replState = collIndexBuilds.front();
     }
 
+    if (!(IndexBuildProtocol::kTwoPhase == replState->protocol && enableIndexBuildCommitQuorum)) {
+        return Status(ErrorCodes::BadValue,
+                      str::stream() << "commitQuorum is supported only for two phase index builds "
+                                       "with commit quorum support enabled, and requires FCV 4.4");
+    }
+
     // See if the new commit quorum is satisfiable.
-    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
     Status status = replCoord->checkIfCommitQuorumCanBeSatisfied(newCommitQuorum);
     if (!status.isOK()) {
         return status;

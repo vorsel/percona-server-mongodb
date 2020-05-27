@@ -167,6 +167,7 @@ def get_outputs(node):
             outputs = [node]
 
     outputs = [get_path(o) for o in outputs]
+
     return outputs
 
 
@@ -354,7 +355,7 @@ class NinjaState:
         self.generated_suffixes = env.get("NINJA_GENERATED_SOURCE_SUFFIXES", [])
 
         # List of generated builds that will be written at a later stage
-        self.builds = list()
+        self.builds = dict()
 
         # List of targets for which we have generated a build. This
         # allows us to take multiple Alias nodes as sources and to not
@@ -515,7 +516,10 @@ class NinjaState:
         if build is None:
             return False
 
-        self.builds.append(build)
+        node_string = str(node)
+        if node_string in self.builds:
+            raise Exception("Node {} added to ninja build state more than once".format(node_string))
+        self.builds[node_string] = build
         self.built.update(build["outputs"])
         return True
 
@@ -560,10 +564,10 @@ class NinjaState:
         for rule, kwargs in self.rules.items():
             ninja.rule(rule, **kwargs)
 
-        generated_source_files = {
+        generated_source_files = sorted({
             output
             # First find builds which have header files in their outputs.
-            for build in self.builds
+            for build in self.builds.values()
             if self.has_generated_sources(build["outputs"])
             for output in build["outputs"]
             # Collect only the header files from the builds with them
@@ -572,25 +576,24 @@ class NinjaState:
             # here we need to filter so we only have the headers and
             # not the other outputs.
             if self.is_generated_source(output)
-        }
+        })
 
         if generated_source_files:
             ninja.build(
                 outputs="_generated_sources",
                 rule="phony",
-                implicit=list(generated_source_files),
+                implicit=generated_source_files
             )
 
         template_builders = []
 
-        for build in self.builds:
+        for build in [self.builds[key] for key in sorted(self.builds.keys())]:
             if build["rule"] == "TEMPLATE":
                 template_builders.append(build)
                 continue
 
-            implicit = build.get("implicit", [])
-            implicit.append(ninja_file)
-            build["implicit"] = implicit
+            if "implicit" in build:
+                build["implicit"].sort()
 
             # Don't make generated sources depend on each other. We
             # have to check that none of the outputs are generated
@@ -601,7 +604,7 @@ class NinjaState:
                 generated_source_files
                 and not build["rule"] == "INSTALL"
                 and set(build["outputs"]).isdisjoint(generated_source_files)
-                and set(implicit).isdisjoint(generated_source_files)
+                and set(build.get("implicit", [])).isdisjoint(generated_source_files)
             ):
 
                 # Make all non-generated source targets depend on
@@ -613,6 +616,8 @@ class NinjaState:
                 order_only = build.get("order_only", [])
                 order_only.append("_generated_sources")
                 build["order_only"] = order_only
+            if "order_only" in build:
+                build["order_only"].sort()
 
             # When using a depfile Ninja can only have a single output
             # but SCons will usually have emitted an output for every
@@ -636,6 +641,7 @@ class NinjaState:
             # use for the "real" builder and multiple phony targets that
             # match the file names of the remaining outputs. This way any
             # build can depend on any output from any build.
+            build["outputs"].sort()
             if rule is not None and (rule.get("deps") or rule.get("rspfile")):
                 first_output, remaining_outputs = (
                     build["outputs"][0],
@@ -648,6 +654,9 @@ class NinjaState:
                     )
 
                 build["outputs"] = first_output
+
+            if "inputs" in build:
+                build["inputs"].sort()
 
             ninja.build(**build)
 
@@ -686,13 +695,13 @@ class NinjaState:
         # jstests/SConscript and being specific to the MongoDB
         # repository layout.
         ninja.build(
-            ninja_file,
+            self.env.File(ninja_file).path,
             rule="REGENERATE",
             implicit=[
-                self.env.File("#SConstruct").get_abspath(),
-                os.path.abspath(__file__),
+                self.env.File("#SConstruct").path,
+                __file__,
             ]
-            + glob("src/**/SConscript", recursive=True),
+            + sorted(glob("src/**/SConscript", recursive=True)),
         )
 
         # If we ever change the name/s of the rules that include
@@ -702,6 +711,7 @@ class NinjaState:
             "compile_commands.json",
             rule="CMD",
             pool="console",
+            implicit=[ninja_file],
             variables={
                 "cmd": "ninja -f {} -t compdb CC CXX > compile_commands.json".format(
                     ninja_file

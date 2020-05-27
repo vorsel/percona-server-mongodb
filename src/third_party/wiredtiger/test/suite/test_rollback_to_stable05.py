@@ -28,7 +28,7 @@
 
 import time
 from helper import copy_wiredtiger_home
-import unittest, wiredtiger, wttest
+import wiredtiger, wttest
 from wtdataset import SimpleDataSet
 from wiredtiger import stat
 from wtscenario import make_scenarios
@@ -150,7 +150,7 @@ class test_rollback_to_stable05(test_rollback_to_stable_base):
         else:
             self.assertEqual(pages_visited, 0)
             self.assertEqual(upd_aborted, 0)
-            self.assertEqual(hs_removed, nrows * 3 * 2)
+            self.assertEqual(hs_removed, 0)
 
 if __name__ == '__main__':
     wttest.run()

@@ -49,8 +49,8 @@
 
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
-#include "mongo/logger/logstream_builder.h"
 #include "mongo/logger/message_log_domain.h"
+#include "mongo/logv2/log_detail.h"
 #include "mongo/unittest/bson_test_util.h"
 #include "mongo/unittest/unittest_helpers.h"
 #include "mongo/util/assert_util.h"
@@ -347,15 +347,6 @@ namespace mongo::unittest {
 
 class Result;
 
-void setupTestLogger();
-
-/**
- * Gets a LogstreamBuilder for logging to the unittest log domain, which may have
- * different target from the global log domain.
- */
-logger::LogstreamBuilderDeprecated log();
-logger::LogstreamBuilderDeprecated warning();
-
 /**
  * Representation of a collection of tests.
  *
@@ -489,9 +480,7 @@ struct OldStyleSuiteInitializer {
     }
 
     void init(OldStyleSuiteSpecification& suiteSpec) const {
-        log() << "\t about to setupTests" << std::endl;
         suiteSpec.setupTests();
-        log() << "\t done setupTests" << std::endl;
         auto& suite = Suite::getSuite(suiteSpec.name());
         for (auto&& t : suiteSpec.tests()) {
             suite.add(t.name, "", t.fn);
@@ -585,7 +574,7 @@ protected:
      * the last call to startCapturingLogMessages() in this test.
      */
     const std::vector<std::string>& getCapturedTextFormatLogMessages() const;
-    const std::vector<BSONObj> getCapturedBSONFormatLogMessages() const;
+    std::vector<BSONObj> getCapturedBSONFormatLogMessages() const;
 
     /**
      * Returns the number of collected log lines containing "needle".

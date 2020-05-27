@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -41,6 +41,7 @@
 #include "mongo/db/repl/replication_coordinator_impl.h"
 #include "mongo/db/repl/replication_coordinator_test_fixture.h"
 #include "mongo/executor/network_interface_mock.h"
+#include "mongo/logv2/log.h"
 #include "mongo/unittest/log_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/fail_point.h"
@@ -716,7 +717,8 @@ TEST_F(ReplCoordTest, NodeDoesNotAcceptHeartbeatReconfigWhileInTheMidstOfReconfi
     hbResp.addToBSON(&respObj2);
     net->scheduleResponse(noi, net->now(), makeResponseStatus(respObj2.obj()));
 
-    setMinimumLoggedSeverity(logv2::LogSeverity::Debug(1));
+    auto severityGuard = unittest::MinimumLoggedSeverityGuard{logv2::LogComponent::kDefault,
+                                                              logv2::LogSeverity::Debug(1)};
     startCapturingLogMessages();
     // execute hb reconfig, which should fail with a log message; confirmed at end of test
     net->runReadyNetworkOperations();
@@ -729,7 +731,6 @@ TEST_F(ReplCoordTest, NodeDoesNotAcceptHeartbeatReconfigWhileInTheMidstOfReconfi
                                           "the midst of a configuration process"));
     shutdown(opCtx.get());
     reconfigThread.join();
-    setMinimumLoggedSeverity(logv2::LogSeverity::Log());
 }
 
 TEST_F(ReplCoordTest, NodeAcceptsConfigFromAReconfigWithForceTrueWhileNotPrimary) {
@@ -773,9 +774,10 @@ TEST_F(ReplCoordTest, NodeAcceptsConfigFromAReconfigWithForceTrueWhileNotPrimary
 
 class ReplCoordReconfigTest : public ReplCoordTest {
 public:
-    void setUp() {
-        setMinimumLoggedSeverity(logv2::LogSeverity::Debug(3));
-    }
+    int counter = 0;
+    std::vector<HostAndPort> initialSyncNodes;
+    unittest::MinimumLoggedSeverityGuard severityGuard{logv2::LogComponent::kDefault,
+                                                       logv2::LogSeverity::Debug(3)};
 
     BSONObj member(int id, std::string host) {
         return BSON("_id" << id << "host" << host);
@@ -838,7 +840,9 @@ public:
         stdx::thread reconfigThread = stdx::thread(
             [&] { status = getReplCoord()->processReplSetReconfig(opCtx, args, &result); });
         // Satisfy quorum check with heartbeats.
-        unittest::log() << "Responding to quorum check with " << quorumHeartbeats << " heartbeats.";
+        LOGV2(24257,
+              "Responding to quorum check with heartbeats.",
+              "heartbeats"_attr = quorumHeartbeats);
         respondToNHeartbeats(quorumHeartbeats);
         reconfigThread.join();
 
@@ -853,6 +857,69 @@ public:
         ASSERT_OK(getReplCoord()->setLastDurableOptime_forTest(configVersion, nodeId, op));
     }
 };
+
+TEST_F(ReplCoordReconfigTest, MustFindSelfAndBeElectableInNewConfig) {
+    // Start up as a secondary and then get elected.
+    init();
+
+    // We only check for ourselves if the config contents actually change.
+    auto oldConfigObj = BSON("_id"
+                             << "mySet"
+                             << "version" << 1 << "protocolVersion" << 1 << "members"
+                             << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                      << "h1:1")
+                                           << BSON("_id" << 2 << "host"
+                                                         << "h2:1")
+                                           << BSON("_id" << 3 << "host"
+                                                         << "h3:1"))
+                             << "settings" << BSON("heartbeatIntervalMillis" << 1000));
+    auto newConfigObj = BSON("_id"
+                             << "mySet"
+                             << "version" << 2 << "protocolVersion" << 1 << "members"
+                             << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                      << "h1:1")
+                                           << BSON("_id" << 2 << "host"
+                                                         << "h2:1")
+                                           << BSON("_id" << 3 << "host"
+                                                         << "h3:1"
+                                                         << "priority" << 0))
+                             << "settings" << BSON("heartbeatIntervalMillis" << 2000));
+
+    assertStartSuccess(oldConfigObj, HostAndPort("h1", 1));
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+    replCoordSetMyLastAppliedAndDurableOpTime(OpTime(Timestamp(1, 1), 0));
+    simulateSuccessfulV1Election();
+    ASSERT_EQ(getReplCoord()->getMemberState(), MemberState::RS_PRIMARY);
+
+    BSONObjBuilder result;
+    const auto opCtx = makeOperationContext();
+    ReplSetReconfigArgs args;
+    args.newConfigObj = newConfigObj;
+
+    // We must be present in the new config. Must hold for both safe and force reconfig.
+    getExternalState()->clearSelfHosts();
+    getExternalState()->addSelf(HostAndPort("nonself:1"));
+
+    args.force = false;
+    Status status = getReplCoord()->processReplSetReconfig(opCtx.get(), args, &result);
+    ASSERT_EQUALS(status.code(), ErrorCodes::NodeNotFound);
+
+    args.force = true;
+    status = getReplCoord()->processReplSetReconfig(opCtx.get(), args, &result);
+    ASSERT_EQUALS(status.code(), ErrorCodes::NodeNotFound);
+
+    // We must be electable in the new config. Only required for safe reconfig.
+    getExternalState()->clearSelfHosts();
+    getExternalState()->addSelf(HostAndPort("h3:1"));  // h3 has priority 0 (unelectable).
+
+    args.force = false;
+    status = getReplCoord()->processReplSetReconfig(opCtx.get(), args, &result);
+    ASSERT_EQUALS(status.code(), ErrorCodes::NodeNotElectable);
+
+    args.force = true;
+    status = getReplCoord()->processReplSetReconfig(opCtx.get(), args, &result);
+    ASSERT_OK(status.code());
+}
 
 TEST_F(ReplCoordReconfigTest,
        InitialReconfigAlwaysSucceedsOnlyRegardlessOfLastCommittedOpInPrevConfig) {

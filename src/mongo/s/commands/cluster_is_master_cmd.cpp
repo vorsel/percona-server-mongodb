@@ -26,7 +26,7 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -37,6 +37,7 @@
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/write_ops.h"
+#include "mongo/db/repl/speculative_auth.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/metadata/client_metadata.h"
@@ -203,6 +204,7 @@ public:
 
         BSONObjBuilder topologyVersionBuilder(result.subobjStart("topologyVersion"));
         mongosTopologyVersion.serialize(&topologyVersionBuilder);
+        topologyVersionBuilder.done();
 
         if (opCtx->isExhaust()) {
             LOGV2_DEBUG(23872, 3, "Using exhaust for isMaster protocol");
@@ -234,6 +236,8 @@ public:
                 replyBuilder->setNextInvocation(nextInvocationBuilder.obj());
             }
         }
+
+        handleIsMasterSpeculativeAuth(opCtx, cmdObj, &result);
 
         return true;
     }

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -52,7 +52,6 @@
 #include "mongo/unittest/log_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log_global_settings.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/scopeguard.h"
@@ -7175,16 +7174,9 @@ TEST_F(HeartbeatResponseTestTwoRetriesV1, HeartbeatThreeNonconsecutiveFailures) 
 
 class HeartbeatResponseHighVerbosityTestV1 : public HeartbeatResponseTestV1 {
 public:
-    virtual void setUp() {
-        HeartbeatResponseTestV1::setUp();
-        // set verbosity as high as the highest verbosity log message we'd like to check for
-        setMinimumLoggedSeverity(logv2::LogSeverity::Debug(3));
-    }
-
-    virtual void tearDown() {
-        HeartbeatResponseTestV1::tearDown();
-        setMinimumLoggedSeverity(logv2::LogSeverity::Log());
-    }
+    // set verbosity as high as the highest verbosity log message we'd like to check for
+    unittest::MinimumLoggedSeverityGuard severityGuard{logv2::LogComponent::kDefault,
+                                                       logv2::LogSeverity::Debug(3)};
 };
 
 // TODO(dannenberg) figure out why this test is useful

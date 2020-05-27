@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -514,7 +514,9 @@ Status Cloner::copyDb(OperationContext* opCtx,
         Lock::TempRelease tempRelease(opCtx->lockState());
         for (auto&& params : createCollectionParams) {
             const NamespaceString nss(dBName, params.collectionName);
-            auto indexSpecs = conn->getIndexSpecs(nss);
+            const bool includeBuildUUIDs = false;
+            const int options = 0;
+            auto indexSpecs = conn->getIndexSpecs(nss, includeBuildUUIDs, options);
 
             collectionIndexSpecs[params.collectionName] = indexSpecs;
 

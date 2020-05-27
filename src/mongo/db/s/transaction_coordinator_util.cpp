@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kTransaction
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTransaction
 
 #include "mongo/platform/basic.h"
 
@@ -719,7 +719,10 @@ Future<PrepareResponse> sendPrepareToShard(ServiceContext* service,
                         "Prepare stopped retrying due to retrying being cancelled",
                         "sessionId"_attr = lsid.getId(),
                         "txnNumber"_attr = txnNumber);
-            return PrepareResponse{shardId, boost::none, boost::none, status};
+            return PrepareResponse{shardId,
+                                   boost::none,
+                                   boost::none,
+                                   Status(ErrorCodes::NoSuchTransaction, status.reason())};
         });
 }
 

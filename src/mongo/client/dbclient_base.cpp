@@ -31,7 +31,7 @@
  * Connect to a Mongo database as a database, from C++.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
@@ -932,8 +932,10 @@ BSONObj makeListIndexesCommand(const NamespaceStringOrUUID& nsOrUuid, bool inclu
 
 }  // namespace
 
-list<BSONObj> DBClientBase::getIndexSpecs(const NamespaceStringOrUUID& nsOrUuid, int options) {
-    return _getIndexSpecs(nsOrUuid, makeListIndexesCommand(nsOrUuid, false), options);
+std::list<BSONObj> DBClientBase::getIndexSpecs(const NamespaceStringOrUUID& nsOrUuid,
+                                               bool includeBuildUUIDs,
+                                               int options) {
+    return _getIndexSpecs(nsOrUuid, makeListIndexesCommand(nsOrUuid, includeBuildUUIDs), options);
 }
 
 std::list<BSONObj> DBClientBase::getReadyIndexSpecs(const NamespaceStringOrUUID& nsOrUuid,
@@ -1008,10 +1010,7 @@ void DBClientBase::dropIndex(const string& ns,
     }
     BSONObj info;
     if (!runCommand(nsToDatabase(ns), cmdBuilder.obj(), info)) {
-        LOGV2_DEBUG(20118,
-                    logSeverityV1toV2(_logLevel).toInt(),
-                    "dropIndex failed: {info}",
-                    "info"_attr = info);
+        LOGV2_DEBUG(20118, _logLevel.toInt(), "dropIndex failed: {info}", "info"_attr = info);
         uassert(10007, "dropIndex failed", 0);
     }
 }

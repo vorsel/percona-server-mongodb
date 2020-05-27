@@ -44,7 +44,7 @@
 #include "mongo/client/streamable_replica_set_monitor_error_handler.h"
 #include "mongo/executor/egress_tag_closer.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/logger/log_component.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/duration.h"
 #include "mongo/util/net/hostandport.h"
@@ -166,16 +166,14 @@ private:
                                            sdam::TopologyDescriptionPtr previousDescription,
                                            sdam::TopologyDescriptionPtr newDescription) override;
 
-    void onServerHeartbeatSucceededEvent(sdam::IsMasterRTT durationMs,
-                                         const sdam::ServerAddress& hostAndPort,
+    void onServerHeartbeatSucceededEvent(const sdam::ServerAddress& hostAndPort,
                                          const BSONObj reply) override;
 
     void onServerHandshakeFailedEvent(const sdam::ServerAddress& address,
                                       const Status& status,
                                       const BSONObj reply) override;
 
-    void onServerHeartbeatFailureEvent(IsMasterRTT durationMs,
-                                       Status errorStatus,
+    void onServerHeartbeatFailureEvent(Status errorStatus,
                                        const ServerAddress& hostAndPort,
                                        const BSONObj reply) override;
 

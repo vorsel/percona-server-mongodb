@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -101,6 +101,10 @@ bool ReplicationCoordinatorExternalStateMock::isSelf(const HostAndPort& host,
 
 void ReplicationCoordinatorExternalStateMock::addSelf(const HostAndPort& host) {
     _selfHosts.push_back(host);
+}
+
+void ReplicationCoordinatorExternalStateMock::clearSelfHosts() {
+    _selfHosts.clear();
 }
 
 HostAndPort ReplicationCoordinatorExternalStateMock::getClientHostAndPort(

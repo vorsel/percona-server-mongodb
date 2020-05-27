@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kASIO
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kASIO
 
 #include "mongo/platform/basic.h"
 
@@ -133,16 +133,16 @@ Future<void> NetworkInterfaceIntegrationFixture::startExhaustCommand(
         cbHandle,
         rcroa,
         [p = std::move(pf.promise), exhaustUtilCB = std::move(exhaustUtilCB)](
-            const TaskExecutor::ResponseOnAnyStatus& rs, bool isMoreToComeSet) mutable {
+            const TaskExecutor::ResponseOnAnyStatus& rs) mutable {
             exhaustUtilCB(rs);
 
             if (!rs.status.isOK()) {
-                invariant(!isMoreToComeSet);
+                invariant(!rs.moreToCome);
                 p.setError(rs.status);
                 return;
             }
 
-            if (!isMoreToComeSet) {
+            if (!rs.moreToCome) {
                 p.emplaceValue();
             }
         },

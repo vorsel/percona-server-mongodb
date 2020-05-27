@@ -8,8 +8,7 @@ all_TESTS=
 noinst_PROGRAMS=
 
 # The import test is only a shell script
-# Temporarily disabled
-# all_TESTS += import/smoke.sh
+all_TESTS += import/smoke.sh
 
 test_incr_backup_SOURCES = incr_backup/main.c
 noinst_PROGRAMS += test_incr_backup
@@ -53,7 +52,8 @@ all_TESTS += test_wt2403_lsm_workload
 
 test_wt2246_col_append_SOURCES = wt2246_col_append/main.c
 noinst_PROGRAMS += test_wt2246_col_append
-all_TESTS += test_wt2246_col_append
+# Temporarily disabled (WT-5790)
+# all_TESTS += test_wt2246_col_append
 
 test_wt2323_join_visibility_SOURCES = wt2323_join_visibility/main.c
 noinst_PROGRAMS += test_wt2323_join_visibility

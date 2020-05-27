@@ -26,7 +26,7 @@
 # ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 # OTHER DEALINGS IN THE SOFTWARE.
 
-import unittest, wiredtiger, wttest, time
+import wiredtiger, wttest, time
 from wiredtiger import stat
 from wtscenario import make_scenarios
 
@@ -45,7 +45,7 @@ class test_hs08(wttest.WiredTigerTestCase):
         stat_cursor.close()
         return val
 
-    def test_modify_insert_to_las(self):
+    def test_modify_insert_to_hs(self):
         uri = "table:test_hs08"
         create_params = 'value_format=S,key_format=i'
         value1 = 'a' * 1000

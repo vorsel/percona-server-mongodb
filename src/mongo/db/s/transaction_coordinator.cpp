@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kTransaction
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTransaction
 
 #include "mongo/platform/basic.h"
 
@@ -278,12 +278,7 @@ TransactionCoordinator::TransactionCoordinator(OperationContext* operationContex
                                            *_decision->getCommitTimestamp());
                 }
                 case CommitDecision::kAbort: {
-                    const auto& abortStatus = *_decision->getAbortStatus();
-
-                    if (abortStatus == ErrorCodes::ReadConcernMajorityNotEnabled)
-                        _decisionPromise.setError(abortStatus);
-                    else
-                        _decisionPromise.emplaceValue(CommitDecision::kAbort);
+                    _decisionPromise.setError(*_decision->getAbortStatus());
 
                     return txn::sendAbort(
                         _serviceContext, *_scheduler, _lsid, _txnNumber, *_participants);
@@ -364,7 +359,7 @@ void TransactionCoordinator::cancelIfCommitNotYetStarted() {
     if (!_reserveKickOffCommitPromise())
         return;
 
-    _kickOffCommitPromise.setError({ErrorCodes::NoSuchTransaction,
+    _kickOffCommitPromise.setError({ErrorCodes::TransactionCoordinatorCanceled,
                                     "Transaction exceeded deadline or newer transaction started"});
 }
 

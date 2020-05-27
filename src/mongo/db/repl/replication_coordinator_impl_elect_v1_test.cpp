@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -60,6 +60,14 @@ using executor::NetworkInterfaceMock;
 using executor::RemoteCommandRequest;
 using executor::RemoteCommandResponse;
 using ApplierState = ReplicationCoordinator::ApplierState;
+
+TEST(LastVote, LastVoteAcceptsUnknownField) {
+    auto lastVoteBSON =
+        BSON("candidateIndex" << 1 << "term" << 2 << "_id" << 3 << "unknownField" << 1);
+    auto lastVoteSW = LastVote::readFromLastVote(lastVoteBSON);
+    ASSERT_OK(lastVoteSW.getStatus());
+    ASSERT_BSONOBJ_EQ(lastVoteSW.getValue().toBSON(), BSON("term" << 2 << "candidateIndex" << 1));
+}
 
 TEST_F(ReplCoordTest, RandomizedElectionOffsetWithinProperBounds) {
     BSONObj configObj = BSON("_id"
@@ -581,7 +589,8 @@ TEST_F(ReplCoordTest, NodeWillNotStandForElectionDuringHeartbeatReconfig) {
     ASSERT_EQUALS(ErrorCodes::ConfigurationInProgress,
                   getReplCoord()->processReplSetReconfig(&opCtx, args, &result));
 
-    setMinimumLoggedSeverity(logv2::LogSeverity::Debug(2));
+    auto severityGuard = unittest::MinimumLoggedSeverityGuard{logv2::LogComponent::kDefault,
+                                                              logv2::LogSeverity::Debug(2)};
     startCapturingLogMessages();
 
     // receive sufficient heartbeats to allow the node to see a majority.
@@ -1191,7 +1200,8 @@ TEST_F(TakeoverTest, PrefersPriorityToCatchupTakeoverIfNodeHasHighestPriority) {
                                                          << "node3:12345"))
                              << "protocolVersion" << 1);
 
-    setMinimumLoggedSeverity(logv2::LogSeverity::Debug(2));
+    auto severityGuard = unittest::MinimumLoggedSeverityGuard{logv2::LogComponent::kDefault,
+                                                              logv2::LogSeverity::Debug(2)};
     startCapturingLogMessages();
 
     assertStartSuccess(configObj, HostAndPort("node1", 12345));

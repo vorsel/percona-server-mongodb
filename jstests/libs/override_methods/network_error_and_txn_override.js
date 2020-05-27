@@ -209,14 +209,16 @@ function isRetryableShardCollectionResponse(res) {
 // Returns true if the given response could have come from moveChunk being interrupted by a
 // failover.
 function isRetryableMoveChunkResponse(res) {
-    return res.code === ErrorCodes.OperationFailed &&
-        (RetryableWritesUtil.errmsgContainsRetryableCodeName(res.errmsg) ||
-         // The transaction number is bumped by the migration coordinator when its commit or abort
-         // decision is being made durable.
-         res.errmsg.includes("TransactionTooOld") ||
-         // The range deletion task may have been interrupted. This error can occur even when
-         // _waitForDelete=false.
-         res.errmsg.includes("operation was interrupted"));
+    return (res.code === ErrorCodes.OperationFailed &&
+            (RetryableWritesUtil.errmsgContainsRetryableCodeName(res.errmsg) ||
+             // The transaction number is bumped by the migration coordinator when its commit or
+             // abort decision is being made durable.
+             res.errmsg.includes("TransactionTooOld") ||
+             // The range deletion task may have been interrupted. This error can occur even when
+             // _waitForDelete=false.
+             res.errmsg.includes("operation was interrupted"))) ||
+        // This error may occur when the node is shutting down.
+        res.code === ErrorCodes.CallbackCanceled;
 }
 
 function hasError(res) {
@@ -1075,9 +1077,6 @@ function runCommandOverride(conn, dbName, cmdName, cmdObj, clientFunction, makeF
 }
 
 if (configuredForNetworkRetry()) {
-    OverrideHelpers.prependOverrideInParallelShell(
-        "jstests/libs/override_methods/network_error_and_txn_override.js");
-
     const connectOriginal = connect;
 
     connect = function(url, user, pass) {
@@ -1106,13 +1105,18 @@ if (configuredForNetworkRetry()) {
         throw new Error(
             "logout() isn't resilient to network errors. Please add requires_non_retryable_commands to your test");
     };
+
+    startParallelShell = function() {
+        throw new Error("Cowardly refusing to run test with network retries enabled when it uses " +
+                        "startParallelShell()");
+    };
 }
 
 if (configuredForTxnOverride()) {
     startParallelShell = function() {
         throw new Error(
-            "Cowardly refusing to run test with transaction override enabled when it uses" +
-            "startParalleShell()");
+            "Cowardly refusing to run test with transaction override enabled when it uses " +
+            "startParallelShell()");
     };
 }
 

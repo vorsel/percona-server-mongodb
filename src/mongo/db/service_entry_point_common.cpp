@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
@@ -37,6 +36,7 @@
 #include "mongo/base/checked_cast.h"
 #include "mongo/bson/mutable/document.h"
 #include "mongo/bson/util/bson_extract.h"
+#include "mongo/client/server_is_master_monitor.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/impersonation_session.h"
@@ -96,6 +96,7 @@
 #include "mongo/rpc/reply_builder_interface.h"
 #include "mongo/transport/ismaster_metrics.h"
 #include "mongo/transport/session.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/scopeguard.h"
 
@@ -126,7 +127,6 @@ ServerStatusMetricField<Counter64> displayNotMasterUnackWrites(
     "repl.network.notMasterUnacknowledgedWrites", &notMasterUnackWrites);
 
 namespace {
-using logger::LogComponent;
 
 void generateLegacyQueryErrorResponse(const AssertionException& exception,
                                       const QueryMessage& queryMessage,
@@ -152,7 +152,7 @@ void generateLegacyQueryErrorResponse(const AssertionException& exception,
 
     if (queryMessage.ntoskip || queryMessage.ntoreturn) {
         LOGV2_OPTIONS(21952,
-                      {logComponentV1toV2(LogComponent::kQuery)},
+                      {logv2::LogComponent::kQuery},
                       "Query's nToSkip = {nToSkip} and nToReturn = {nToReturn}",
                       "Assertion for query with nToSkip and/or nToReturn",
                       "nToSkip"_attr = queryMessage.ntoskip,
@@ -172,7 +172,7 @@ void generateLegacyQueryErrorResponse(const AssertionException& exception,
     const bool isStaleConfig = exception.code() == ErrorCodes::StaleConfig;
     if (isStaleConfig) {
         LOGV2_OPTIONS(21953,
-                      {logComponentV1toV2(LogComponent::kQuery)},
+                      {logv2::LogComponent::kQuery},
                       "Stale version detected during query over {namespace}: {error}",
                       "Detected stale version while querying namespace",
                       "namespace"_attr = queryMessage.ns,
@@ -1280,6 +1280,12 @@ void execCommandDatabase(OperationContext* opCtx,
                     "error"_attr = redact(e.toString()));
 
         generateErrorResponse(opCtx, replyBuilder, e, metadataBob.obj(), extraFieldsBuilder.obj());
+
+        if (ErrorCodes::isA<ErrorCategory::CloseConnectionError>(e.code())) {
+            // Rethrow the exception to the top to signal that the client connection should be
+            // closed.
+            throw;
+        }
     }
 }
 
@@ -1398,6 +1404,12 @@ DbResponse receivedCommands(OperationContext* opCtx,
 
             generateErrorResponse(
                 opCtx, replyBuilder.get(), ex, metadataBob.obj(), extraFieldsBuilder.obj());
+
+            if (ErrorCodes::isA<ErrorCategory::CloseConnectionError>(ex.code())) {
+                // Rethrow the exception to the top to signal that the client connection should be
+                // closed.
+                throw;
+            }
         }
     }();
 
@@ -1500,7 +1512,7 @@ void receivedKillCursors(OperationContext* opCtx, const Message& m) {
 
     if (shouldLog(logv2::LogSeverity::Debug(1)) || found != n) {
         LOGV2_DEBUG(21967,
-                    logSeverityV1toV2(found == n ? 1 : 0).toInt(),
+                    found == n ? 1 : 0,
                     "killCursors: found {found} of {numCursors}",
                     "killCursors found fewer cursors to kill than requested",
                     "found"_attr = found,
@@ -1704,6 +1716,12 @@ DbResponse ServiceEntryPointCommon::handleRequest(OperationContext* opCtx,
     DbResponse dbresponse;
     if (op == dbMsg || (op == dbQuery && isCommand)) {
         dbresponse = receivedCommands(opCtx, m, behaviors);
+        // IsMaster should take kMaxAwaitTimeMs at most, log if it takes twice that.
+        if (auto command = currentOp.getCommand();
+            command && (command->getName() == "ismaster" || command->getName() == "isMaster")) {
+            slowMsOverride =
+                2 * durationCount<Milliseconds>(SingleServerIsMasterMonitor::kMaxAwaitTimeMs);
+        }
     } else if (op == dbQuery) {
         invariant(!isCommand);
         opCtx->markKillOnClientDisconnect();
