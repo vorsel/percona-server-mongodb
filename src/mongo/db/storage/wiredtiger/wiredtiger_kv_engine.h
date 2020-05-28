@@ -172,6 +172,10 @@ public:
 
     void keydbDropDatabase(const std::string& db) override;
 
+    void alterIdentMetadata(OperationContext* opCtx,
+                            StringData ident,
+                            const IndexDescriptor* desc) override;
+
     Status okToRename(OperationContext* opCtx,
                       StringData fromNS,
                       StringData toNS,

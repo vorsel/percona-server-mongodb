@@ -129,7 +129,7 @@ CleanupResult cleanupOrphanedData(OperationContext* opCtx,
                     {logv2::UserAssertAfterLog(ErrorCodes::OrphanedRangeCleanUpFailed)},
                     "Could not cleanup orphaned data because start key does not match shard key "
                     "pattern",
-                    "startKey"_attr = startingFromKeyConst,
+                    "startKey"_attr = redact(startingFromKeyConst),
                     "shardKeyPattern"_attr = keyPattern);
             }
         }
@@ -170,6 +170,8 @@ CleanupResult cleanupOrphanedData(OperationContext* opCtx,
         {
             AutoGetCollection autoColl(opCtx, ns, MODE_IX);
             auto* const css = CollectionShardingRuntime::get(opCtx, ns);
+            // Keep the collection metadata from changing for the rest of this scope.
+            auto csrLock = CollectionShardingRuntime::CSRLock::lockShared(opCtx, css);
             const auto collDesc = css->getCollectionDescription();
             if (!collDesc.isSharded()) {
                 LOGV2(21911,
@@ -189,7 +191,7 @@ CleanupResult cleanupOrphanedData(OperationContext* opCtx,
                         "shard key pattern {shardKeyPattern}",
                         "Could not cleanup orphaned data because start key does not match shard "
                         "key pattern",
-                        "startKey"_attr = startingFromKey,
+                        "startKey"_attr = redact(startingFromKey),
                         "shardKeyPattern"_attr = keyPattern);
                 }
             } else {

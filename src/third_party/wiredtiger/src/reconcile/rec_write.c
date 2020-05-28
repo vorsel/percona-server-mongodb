@@ -210,6 +210,14 @@ __reconcile(WT_SESSION_IMPL *session, WT_REF *ref, WT_SALVAGE_COOKIE *salvage, u
         WT_STAT_CONN_INCR(session, cache_write_restore);
         WT_STAT_DATA_INCR(session, cache_write_restore);
     }
+    if (!WT_IS_HS(btree)) {
+        if (r->rec_page_cell_with_txn_id)
+            WT_STAT_CONN_INCR(session, rec_pages_with_txn);
+        if (r->rec_page_cell_with_ts)
+            WT_STAT_CONN_INCR(session, rec_pages_with_ts);
+        if (r->rec_page_cell_with_prepared_txn)
+            WT_STAT_CONN_INCR(session, rec_pages_with_prepare);
+    }
     if (r->multi_next > btree->rec_multiblock_max)
         btree->rec_multiblock_max = r->multi_next;
 
@@ -487,6 +495,13 @@ __rec_init(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags, WT_SALVAGE_COO
     WT_ORDERED_READ(r->last_running, txn_global->last_running);
 
     /*
+     * Cache the pinned timestamp and oldest id, these are used to when we clear obsolete timestamps
+     * and ids from time windows later in reconciliation.
+     */
+    __wt_txn_pinned_timestamp(session, &r->rec_start_pinned_ts);
+    r->rec_start_oldest_id = __wt_txn_oldest_id(session);
+
+    /*
      * The checkpoint transaction doesn't pin the oldest txn id, therefore the global last_running
      * can move beyond the checkpoint transaction id. When reconciling the metadata, we have to take
      * checkpoints into account.
@@ -496,7 +511,6 @@ __rec_init(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags, WT_SALVAGE_COO
         if (ckpt_txn != WT_TXN_NONE && WT_TXNID_LT(ckpt_txn, r->last_running))
             r->last_running = ckpt_txn;
     }
-
     /* When operating on the history store table, we should never try history store eviction. */
     WT_ASSERT(session, !F_ISSET(btree, WT_BTREE_HS) || !LF_ISSET(WT_REC_HS));
 
@@ -519,7 +533,7 @@ __rec_init(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags, WT_SALVAGE_COO
 
     /* Track the page's min/maximum transaction */
     r->max_txn = WT_TXN_NONE;
-    r->max_ondisk_ts = r->max_ts = WT_TS_NONE;
+    r->max_ts = WT_TS_NONE;
     r->min_skipped_ts = WT_TS_MAX;
 
     /* Track if updates were used and/or uncommitted. */
@@ -595,6 +609,11 @@ __rec_init(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags, WT_SALVAGE_COO
     r->update_modify_cbt.ref = ref;
     r->update_modify_cbt.iface.value_format = btree->value_format;
     r->update_modify_cbt.upd_value = &r->update_modify_cbt._upd_value;
+
+    /* Clear stats related data. */
+    r->rec_page_cell_with_ts = false;
+    r->rec_page_cell_with_txn_id = false;
+    r->rec_page_cell_with_prepared_txn = false;
 
 /*
  * If we allocated the reconciliation structure and there was an error, clean up. If our caller
@@ -2304,7 +2323,7 @@ __wt_rec_cell_build_ovfl(WT_SESSION_IMPL *session, WT_RECONCILE *r, WT_REC_KV *k
     WT_ERR(__wt_buf_set(session, &kv->buf, addr, size));
 
     /* Build the cell and return. */
-    kv->cell_len = __wt_cell_pack_ovfl(session, &kv->cell, type, tw, rle, kv->buf.size);
+    kv->cell_len = __wt_cell_pack_ovfl(session, r, &kv->cell, type, tw, rle, kv->buf.size);
     kv->len = kv->cell_len + kv->buf.size;
 
 err:

@@ -580,7 +580,11 @@ __wt_txn_upd_visible_all(WT_SESSION_IMPL *session, WT_UPDATE *upd)
     if (upd->prepare_state == WT_PREPARE_LOCKED || upd->prepare_state == WT_PREPARE_INPROGRESS)
         return (false);
 
-    return (__wt_txn_visible_all(session, upd->txnid, upd->start_ts));
+    /*
+     * This function is used to determine when an update is obsolete: that should take into account
+     * the durable timestamp which is greater than or equal to the start timestamp.
+     */
+    return (__wt_txn_visible_all(session, upd->txnid, upd->durable_ts));
 }
 
 /*
@@ -594,7 +598,51 @@ __wt_txn_upd_value_visible_all(WT_SESSION_IMPL *session, WT_UPDATE_VALUE *upd_va
       upd_value->prepare_state == WT_PREPARE_INPROGRESS)
         return (false);
 
-    return (__wt_txn_visible_all(session, upd_value->txnid, upd_value->start_ts));
+    return (__wt_txn_visible_all(session, upd_value->txnid, upd_value->durable_ts));
+}
+
+/*
+ * __wt_txn_tw_stop_visible --
+ *     Is the given stop time window visible?
+ */
+static inline bool
+__wt_txn_tw_stop_visible(WT_SESSION_IMPL *session, WT_TIME_WINDOW *tw)
+{
+    return (__wt_time_window_has_stop(tw) && !tw->prepare &&
+      __wt_txn_visible(session, tw->stop_txn, tw->stop_ts));
+}
+
+/*
+ * __wt_txn_tw_start_visible --
+ *     Is the given start time window visible?
+ */
+static inline bool
+__wt_txn_tw_start_visible(WT_SESSION_IMPL *session, WT_TIME_WINDOW *tw)
+{
+    return ((__wt_time_window_has_stop(tw) || !tw->prepare) &&
+      __wt_txn_visible(session, tw->start_txn, tw->start_ts));
+}
+
+/*
+ * __wt_txn_tw_start_visible_all --
+ *     Is the given start time window visible to all (possible) readers?
+ */
+static inline bool
+__wt_txn_tw_start_visible_all(WT_SESSION_IMPL *session, WT_TIME_WINDOW *tw)
+{
+    return ((__wt_time_window_has_stop(tw) || !tw->prepare) &&
+      __wt_txn_visible_all(session, tw->start_txn, tw->durable_start_ts));
+}
+
+/*
+ * __wt_txn_tw_stop_visible_all --
+ *     Is the given stop time window visible to all (possible) readers?
+ */
+static inline bool
+__wt_txn_tw_stop_visible_all(WT_SESSION_IMPL *session, WT_TIME_WINDOW *tw)
+{
+    return (__wt_time_window_has_stop(tw) && !tw->prepare &&
+      __wt_txn_visible_all(session, tw->stop_txn, tw->durable_stop_ts));
 }
 
 /*
@@ -837,7 +885,7 @@ __wt_txn_read_upd_list(WT_SESSION_IMPL *session, WT_CURSOR_BTREE *cbt, WT_UPDATE
  */
 static inline int
 __wt_txn_read(WT_SESSION_IMPL *session, WT_CURSOR_BTREE *cbt, WT_ITEM *key, uint64_t recno,
-  WT_UPDATE *upd, WT_CELL_UNPACK *vpack)
+  WT_UPDATE *upd, WT_CELL_UNPACK_KV *vpack)
 {
     WT_TIME_WINDOW tw;
 
@@ -869,28 +917,21 @@ __wt_txn_read(WT_SESSION_IMPL *session, WT_CURSOR_BTREE *cbt, WT_ITEM *key, uint
      * tombstone and should return "not found", except for history store scan during rollback to
      * stable and when we are told to ignore non-globally visible tombstones.
      */
-    if (tw.stop_txn != WT_TXN_MAX && tw.stop_ts != WT_TS_MAX && !tw.prepare &&
-      __wt_txn_visible(session, tw.stop_txn, tw.stop_ts) &&
+    if (__wt_txn_tw_stop_visible(session, &tw) &&
       ((!F_ISSET(&cbt->iface, WT_CURSTD_IGNORE_TOMBSTONE) &&
          (!WT_IS_HS(S2BT(session)) || !F_ISSET(session, WT_SESSION_ROLLBACK_TO_STABLE))) ||
-          __wt_txn_visible_all(session, tw.stop_txn, tw.stop_ts))) {
+          __wt_txn_tw_stop_visible_all(session, &tw))) {
         cbt->upd_value->buf.data = NULL;
         cbt->upd_value->buf.size = 0;
-        cbt->upd_value->start_ts = tw.stop_ts;
+        cbt->upd_value->durable_ts = tw.durable_stop_ts;
         cbt->upd_value->txnid = tw.stop_txn;
         cbt->upd_value->type = WT_UPDATE_TOMBSTONE;
         cbt->upd_value->prepare_state = WT_PREPARE_INIT;
         return (0);
     }
 
-    /*
-     * If the start time pair is visible and it is not a prepared value then we need to return the
-     * ondisk value.
-     */
-    if ((!tw.prepare || (tw.stop_txn != WT_TXN_MAX && tw.stop_ts != WT_TS_MAX)) &&
-      (__wt_txn_visible(session, tw.start_txn, tw.start_ts) ||
-          F_ISSET(session, WT_SESSION_RESOLVING_MODIFY))) {
-
+    /* If the start time pair is visible then we need to return the ondisk value. */
+    if (__wt_txn_tw_start_visible(session, &tw) || F_ISSET(session, WT_SESSION_RESOLVING_MODIFY)) {
         /* If we are resolving a modify then the btree must be the history store. */
         WT_ASSERT(
           session, (F_ISSET(session, WT_SESSION_RESOLVING_MODIFY) && WT_IS_HS(S2BT(session))) ||
@@ -900,7 +941,7 @@ __wt_txn_read(WT_SESSION_IMPL *session, WT_CURSOR_BTREE *cbt, WT_ITEM *key, uint
             cbt->upd_value->buf.data = NULL;
             cbt->upd_value->buf.size = 0;
         }
-        cbt->upd_value->start_ts = tw.start_ts;
+        cbt->upd_value->durable_ts = tw.durable_start_ts;
         cbt->upd_value->txnid = tw.start_txn;
         cbt->upd_value->type = WT_UPDATE_STANDARD;
         cbt->upd_value->prepare_state = WT_PREPARE_INIT;
@@ -1152,7 +1193,7 @@ __wt_txn_update_check(WT_SESSION_IMPL *session, WT_CURSOR_BTREE *cbt, WT_UPDATE 
      * aborted updates. Otherwise, we would have either already detected a conflict if we saw an
      * uncommitted update or determined that it would be safe to write if we saw a committed update.
      */
-    if (!rollback && upd == NULL && cbt != NULL && cbt->btree->type != BTREE_COL_FIX &&
+    if (!rollback && upd == NULL && cbt != NULL && CUR2BT(cbt)->type != BTREE_COL_FIX &&
       cbt->ins == NULL) {
         __wt_read_cell_time_window(cbt, cbt->ref, &tw);
         if (tw.stop_txn != WT_TXN_MAX && tw.stop_ts != WT_TS_MAX)
@@ -1276,7 +1317,7 @@ __wt_upd_value_assign(WT_UPDATE_VALUE *upd_value, WT_UPDATE *upd)
         upd_value->buf.data = upd->data;
         upd_value->buf.size = upd->size;
     }
-    upd_value->start_ts = upd->start_ts;
+    upd_value->durable_ts = upd->durable_ts;
     upd_value->txnid = upd->txnid;
     upd_value->type = upd->type;
     upd_value->prepare_state = upd->prepare_state;
@@ -1295,7 +1336,7 @@ __wt_upd_value_clear(WT_UPDATE_VALUE *upd_value)
      */
     upd_value->buf.data = NULL;
     upd_value->buf.size = 0;
-    upd_value->start_ts = WT_TS_NONE;
+    upd_value->durable_ts = WT_TS_NONE;
     upd_value->txnid = WT_TXN_NONE;
     upd_value->type = WT_UPDATE_INVALID;
     upd_value->prepare_state = WT_PREPARE_INIT;
