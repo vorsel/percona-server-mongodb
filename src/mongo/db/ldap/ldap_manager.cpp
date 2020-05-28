@@ -29,7 +29,7 @@ Copyright (C) 2019-present Percona and/or its affiliates. All rights reserved.
     it in the license file.
 ======= */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAccessControl
 
 #include "mongo/db/ldap/ldap_manager.h"
 
