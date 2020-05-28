@@ -64,8 +64,6 @@
 
 namespace mongo {
 
-using namespace indexbuildentryhelpers;
-
 MONGO_FAIL_POINT_DEFINE(hangAfterIndexBuildFirstDrain);
 MONGO_FAIL_POINT_DEFINE(hangAfterIndexBuildSecondDrain);
 MONGO_FAIL_POINT_DEFINE(hangAfterIndexBuildDumpsInsertsFromBulk);
@@ -167,26 +165,26 @@ bool shouldSkipIndexBuildStateTransitionCheck(OperationContext* opCtx,
  */
 void onCommitIndexBuild(OperationContext* opCtx,
                         const NamespaceString& nss,
-                        ReplIndexBuildState& replState) {
-    const auto& buildUUID = replState.buildUUID;
+                        std::shared_ptr<ReplIndexBuildState> replState) {
+    const auto& buildUUID = replState->buildUUID;
 
-    auto skipCheck = shouldSkipIndexBuildStateTransitionCheck(opCtx, replState.protocol);
-    {
-        stdx::unique_lock<Latch> lk(replState.mutex);
-        replState.indexBuildState.setState(IndexBuildState::kCommitted, skipCheck);
-    }
-    if (IndexBuildProtocol::kSinglePhase == replState.protocol) {
+    auto skipCheck = shouldSkipIndexBuildStateTransitionCheck(opCtx, replState->protocol);
+    opCtx->recoveryUnit()->onCommit([replState, skipCheck](boost::optional<Timestamp> commitTime) {
+        stdx::unique_lock<Latch> lk(replState->mutex);
+        replState->indexBuildState.setState(IndexBuildState::kCommitted, skipCheck);
+    });
+    if (IndexBuildProtocol::kSinglePhase == replState->protocol) {
         return;
     }
 
-    invariant(IndexBuildProtocol::kTwoPhase == replState.protocol,
+    invariant(IndexBuildProtocol::kTwoPhase == replState->protocol,
               str::stream() << "onCommitIndexBuild: " << buildUUID);
     invariant(opCtx->lockState()->isWriteLocked(),
               str::stream() << "onCommitIndexBuild: " << buildUUID);
 
     auto opObserver = opCtx->getServiceContext()->getOpObserver();
-    const auto& collUUID = replState.collectionUUID;
-    const auto& indexSpecs = replState.indexSpecs;
+    const auto& collUUID = replState->collectionUUID;
+    const auto& indexSpecs = replState->indexSpecs;
     auto fromMigrate = false;
 
     // Since two phase index builds are allowed to survive replication state transitions, we should
@@ -1169,7 +1167,7 @@ void IndexBuildsCoordinator::onStepUp(OperationContext* opCtx) {
 
     // This would create an empty table even for FCV 4.2 to handle case where a primary node started
     // with FCV 4.2, and then upgraded FCV 4.4.
-    ensureIndexBuildEntriesNamespaceExists(opCtx);
+    indexbuildentryhelpers::ensureIndexBuildEntriesNamespaceExists(opCtx);
 
     auto indexBuilds = _getIndexBuilds();
     auto onIndexBuild = [this, opCtx](std::shared_ptr<ReplIndexBuildState> replState) {
@@ -1179,7 +1177,11 @@ void IndexBuildsCoordinator::onStepUp(OperationContext* opCtx) {
 
         if (!_signalIfCommitQuorumNotEnabled(opCtx, replState)) {
             // This reads from system.indexBuilds collection to see if commit quorum got satisfied.
-            _signalIfCommitQuorumIsSatisfied(opCtx, replState);
+            try {
+                _signalIfCommitQuorumIsSatisfied(opCtx, replState);
+            } catch (DBException& ex) {
+                fassert(31440, ex.toStatus());
+            }
         }
     };
     forEachIndexBuild(indexBuilds, "IndexBuildsCoordinator::onStepUp - "_sd, onIndexBuild);
@@ -1683,7 +1685,7 @@ IndexBuildsCoordinator::PostSetupAction IndexBuildsCoordinator::_setUpIndexBuild
                                             replState->collectionUUID,
                                             indexBuildOptions.commitQuorum.get(),
                                             replState->indexNames);
-            uassertStatusOK(addIndexBuildEntry(opCtx, indexBuildEntry));
+            uassertStatusOK(indexbuildentryhelpers::addIndexBuildEntry(opCtx, indexBuildEntry));
 
             opCtx->getServiceContext()->getOpObserver()->onStartIndexBuild(
                 opCtx,
@@ -2259,7 +2261,7 @@ IndexBuildsCoordinator::CommitResult IndexBuildsCoordinator::_insertKeysFromSide
 
     // If two phase index builds is enabled, index build will be coordinated using
     // startIndexBuild and commitIndexBuild oplog entries.
-    auto onCommitFn = [&] { onCommitIndexBuild(opCtx, collection->ns(), *replState); };
+    auto onCommitFn = [&] { onCommitIndexBuild(opCtx, collection->ns(), replState); };
 
     auto onCreateEachFn = [&](const BSONObj& spec) {
         if (IndexBuildProtocol::kTwoPhase == replState->protocol) {

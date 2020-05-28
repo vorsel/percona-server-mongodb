@@ -421,33 +421,6 @@ private:
         std::make_unique<SharedPromise<void>>();
 };
 
-namespace {
-
-/**
- * RAII class that holds an exclusive lock on the checkpoint resource mutex.
- *
- * Instances are created via getCheckpointLock(), which passes in the checkpoint resource mutex.
- */
-class CheckpointLockImpl : public StorageEngine::CheckpointLock {
-    CheckpointLockImpl(const CheckpointLockImpl&) = delete;
-    CheckpointLockImpl& operator=(const CheckpointLockImpl&) = delete;
-    CheckpointLockImpl(CheckpointLockImpl&& other) = delete;
-
-public:
-    CheckpointLockImpl() = delete;
-    CheckpointLockImpl(OperationContext* opCtx, Lock::ResourceMutex mutex)
-        : _lk(opCtx->lockState(), mutex) {
-        invariant(_lk.isLocked());
-    }
-
-    ~CheckpointLockImpl() = default;
-
-private:
-    Lock::ExclusiveLock _lk;
-};
-
-}  // namespace
-
 std::string toString(const StorageEngine::OldestActiveTransactionTimestampResult& r) {
     if (r.isOK()) {
         if (r.getValue()) {
@@ -534,8 +507,6 @@ public:
                 if (initialDataTimestamp.asULL() <= 1) {
                     UniqueWiredTigerSession session = _sessionCache->getSession();
                     WT_SESSION* s = session->getSession();
-                    auto checkpointLock = _wiredTigerKVEngine->getCheckpointLock(opCtx.get());
-                    _wiredTigerKVEngine->clearIndividuallyCheckpointedIndexesList();
                     invariantWTOK(s->checkpoint(s, "use_timestamp=false"));
                 } else if (stableTimestamp < initialDataTimestamp) {
                     LOGV2_FOR_RECOVERY(
@@ -559,11 +530,7 @@ public:
 
                     UniqueWiredTigerSession session = _sessionCache->getSession();
                     WT_SESSION* s = session->getSession();
-                    {
-                        auto checkpointLock = _wiredTigerKVEngine->getCheckpointLock(opCtx.get());
-                        _wiredTigerKVEngine->clearIndividuallyCheckpointedIndexesList();
-                        invariantWTOK(s->checkpoint(s, "use_timestamp=true"));
-                    }
+                    invariantWTOK(s->checkpoint(s, "use_timestamp=true"));
 
                     if (oplogNeededForRollback.isOK()) {
                         // Now that the checkpoint is durable, publish the oplog needed to recover
@@ -864,7 +831,7 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
                                        ClockSource* cs,
                                        const std::string& extraOpenOptions,
                                        size_t cacheSizeMB,
-                                       size_t maxCacheOverflowFileSizeMB,
+                                       size_t maxHistoryFileSizeMB,
                                        bool durable,
                                        bool ephemeral,
                                        bool repair,
@@ -1004,7 +971,6 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
     std::stringstream ss;
     ss << "create,";
     ss << "cache_size=" << cacheSizeMB << "M,";
-    ss << "cache_overflow=(file_max=" << maxCacheOverflowFileSizeMB << "M),";
     ss << "session_max=33000,";
     ss << "eviction=(threads_min=4,threads_max=4),";
     ss << "config_base=false,";
@@ -1157,16 +1123,12 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
     _runTimeConfigParam.reset(new WiredTigerEngineRuntimeConfigParameter(
         "wiredTigerEngineRuntimeConfig", ServerParameterType::kRuntimeOnly));
     _runTimeConfigParam->_data.second = this;
-    _maxCacheOverflowParam.reset(new WiredTigerMaxCacheOverflowSizeGBParameter(
-        "wiredTigerMaxCacheOverflowSizeGB", ServerParameterType::kRuntimeOnly));
-    _maxCacheOverflowParam->_data = {maxCacheOverflowFileSizeMB / 1024, this};
 }
 
 WiredTigerKVEngine::~WiredTigerKVEngine() {
     // Remove server parameters that we added in the constructor, to enable unit tests to reload the
     // storage engine again in this same process.
     ServerParameterSet::getGlobal()->remove("wiredTigerEngineRuntimeConfig");
-    ServerParameterSet::getGlobal()->remove("wiredTigerMaxCacheOverflowSizeGB");
 
     cleanShutdown();
 
@@ -2956,20 +2918,6 @@ Timestamp WiredTigerKVEngine::getPinnedOplog() const {
 
     // If getOplogNeededForRollback fails, don't truncate any oplog right now.
     return Timestamp::min();
-}
-
-std::unique_ptr<StorageEngine::CheckpointLock> WiredTigerKVEngine::getCheckpointLock(
-    OperationContext* opCtx) {
-    return std::make_unique<CheckpointLockImpl>(opCtx, _checkpointMutex);
-}
-
-bool WiredTigerKVEngine::isInIndividuallyCheckpointedIndexesList(const std::string& ident) const {
-    for (auto it = _checkpointedIndexes.begin(); it != _checkpointedIndexes.end(); ++it) {
-        if (*it == ident) {
-            return true;
-        }
-    }
-    return false;
 }
 
 bool WiredTigerKVEngine::supportsReadConcernSnapshot() const {

@@ -342,22 +342,6 @@ public:
         return _catalog.get();
     }
 
-    std::unique_ptr<CheckpointLock> getCheckpointLock(OperationContext* opCtx) override {
-        return _engine->getCheckpointLock(opCtx);
-    }
-
-    void addIndividuallyCheckpointedIndexToList(const std::string& ident) override {
-        return _engine->addIndividuallyCheckpointedIndexToList(ident);
-    }
-
-    void clearIndividuallyCheckpointedIndexesList() override {
-        return _engine->clearIndividuallyCheckpointedIndexesList();
-    }
-
-    bool isInIndividuallyCheckpointedIndexesList(const std::string& ident) const override {
-        return _engine->isInIndividuallyCheckpointedIndexesList(ident);
-    }
-
     StatusWith<ReconcileResult> reconcileCatalogAndIdents(OperationContext* opCtx) override;
 
     std::string getFilesystemPathForDb(const std::string& dbName) const override;

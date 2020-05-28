@@ -57,7 +57,6 @@ class WiredTigerRecordStore;
 class WiredTigerSessionCache;
 class WiredTigerSizeStorer;
 class WiredTigerEngineRuntimeConfigParameter;
-class WiredTigerMaxCacheOverflowSizeGBParameter;
 
 struct WiredTigerFileVersion {
     // MongoDB 4.4+ will not open on datafiles left behind by 4.0 and earlier. MongoDB 4.4
@@ -79,7 +78,7 @@ public:
                        ClockSource* cs,
                        const std::string& extraOpenOptions,
                        size_t cacheSizeMB,
-                       size_t maxCacheOverflowFileSizeMB,
+                       size_t maxHistoryFileSizeMB,
                        bool durable,
                        bool ephemeral,
                        bool repair,
@@ -371,22 +370,6 @@ public:
         return _clockSource;
     }
 
-    /**
-     * Returns a CheckpointLockImpl RAII instance holding the _checkpointMutex.
-     */
-    std::unique_ptr<StorageEngine::CheckpointLock> getCheckpointLock(
-        OperationContext* opCtx) override;
-
-    void addIndividuallyCheckpointedIndexToList(const std::string& ident) override {
-        _checkpointedIndexes.push_back(ident);
-    }
-
-    void clearIndividuallyCheckpointedIndexesList() override {
-        _checkpointedIndexes.clear();
-    }
-
-    bool isInIndividuallyCheckpointedIndexesList(const std::string& ident) const override;
-
 private:
     class WiredTigerSessionSweeper;
     class WiredTigerJournalFlusher;
@@ -514,19 +497,7 @@ private:
     // timestamp. Provided by replication layer because WT does not persist timestamps.
     AtomicWord<std::uint64_t> _initialDataTimestamp;
 
-    // Required for taking a checkpoint; and can be used to ensure multiple checkpoint cursors
-    // target the same checkpoint.
-    Lock::ResourceMutex _checkpointMutex = Lock::ResourceMutex("checkpointCursorMutex");
-
-    // A list of indexes that were individually checkpoint'ed and are not consistent with the rest
-    // of the checkpoint's PIT view of the storage data. This list is reset when a storage-wide WT
-    // checkpoint is taken that makes the PIT view consistent again.
-    //
-    // Access must be protected by the CheckpointLock.
-    std::list<std::string> _checkpointedIndexes;
-
     std::unique_ptr<WiredTigerEngineRuntimeConfigParameter> _runTimeConfigParam;
-    std::unique_ptr<WiredTigerMaxCacheOverflowSizeGBParameter> _maxCacheOverflowParam;
 
     mutable Mutex _highestDurableTimestampMutex =
         MONGO_MAKE_LATCH("WiredTigerKVEngine::_highestDurableTimestampMutex");

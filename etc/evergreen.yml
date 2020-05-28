@@ -5087,7 +5087,7 @@ tasks:
 
 ## jstestfuzz replica set ##
 - <<: *jstestfuzz_template
-  name: jstestfuzz_replication_multiversion_gen
+  name: jstestfuzz_replication_fcv42_multiversion_gen
   tags: ["jstestfuzz_multiversion_gen"]
   commands:
   - func: "generate multiversion tasks"
@@ -5095,10 +5095,11 @@ tasks:
       <<: *jstestfuzz_config_vars
       jstestfuzz_vars: --jsTestsDir ../jstests
       resmoke_args: "--storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
-      suite: jstestfuzz_replication
+      suite: jstestfuzz_replication_fcv42
       is_jstestfuzz: true
       use_multiversion: /data/multiversion
       npm_command: jstestfuzz
+      fallback_num_sub_suites: 4
 
 ## jstestfuzz initial sync replica set ##
 - <<: *jstestfuzz_template
@@ -5155,6 +5156,7 @@ tasks:
       is_jstestfuzz: true
       use_multiversion: /data/multiversion
       npm_command: jstestfuzz
+      fallback_num_sub_suites: 4
 
 ## jstestfuzz sharded cluster causal consistency ##
 - <<: *jstestfuzz_template
@@ -8881,7 +8883,7 @@ buildvariants:
     push_name: linux
     push_arch: aarch64-enterprise-ubuntu1804
     compile_flags: --ssl MONGO_DISTMOD=ubuntu1804 -j$(grep -c ^processor /proc/cpuinfo) CCFLAGS="-march=armv8-a+crc -mtune=generic" --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
-    resmoke_jobs_max: 8 # Avoid starting too many mongod's on ARM test servers
+    resmoke_jobs_max: 4 # Avoid starting too many mongod's on ARM test servers
     has_packages: true
     packager_script: packager_enterprise.py
     packager_arch: arm64
@@ -12088,6 +12090,35 @@ buildvariants:
     test_flags: >-
       --mongosSetParameters="{replicaSetMonitorProtocol: scanning}"
       --mongodSetParameters="{replicaSetMonitorProtocol: scanning}"
+      --excludeWithAnyTags=requires_streamable_rsm
+
+  tasks:
+  - name: compile_all_run_unittests_TG
+    distros:
+    - ubuntu1604-build
+  - name: .aggregation !.no_async
+  - name: .sharding .auth
+  - name: .sharding .causally_consistent !.wo_snapshot
+  - name: .concurrency .common !.kill_terminate
+  - name: .integration !.audit
+  - name: .jscore .common
+  - name: .logical_session_cache .one_sec
+  - name: .sharding .jscore !.wo_snapshot !.multi_stmt
+  - name: .sharding .common !.csrs
+
+- name: enterprise-ubuntu-sdam-replica-set-monitor-1604-64-bit
+  display_name: "~ Enterprise Ubuntu 16.04 (with SdamReplicaSetMonitor)"
+  batchtime: 1440 # 1 day
+  run_on:
+    - ubuntu1604-test
+  modules:
+  - enterprise
+  expansions:
+    scons_cache_scope: shared
+    compile_flags: MONGO_DISTMOD=ubuntu1604 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
+    test_flags: >-
+      --mongosSetParameters="{replicaSetMonitorProtocol: sdam}"
+      --mongodSetParameters="{replicaSetMonitorProtocol: sdam}"
       --excludeWithAnyTags=requires_streamable_rsm
 
   tasks:

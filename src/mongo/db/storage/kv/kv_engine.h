@@ -254,30 +254,6 @@ public:
     }
 
     /**
-     * See StorageEngine::getCheckpointLock for details.
-     */
-    virtual std::unique_ptr<StorageEngine::CheckpointLock> getCheckpointLock(
-        OperationContext* opCtx) {
-        uasserted(ErrorCodes::CommandNotSupported,
-                  "The current storage engine does not support checkpoints");
-    }
-
-    virtual void addIndividuallyCheckpointedIndexToList(const std::string& ident) {
-        uasserted(ErrorCodes::CommandNotSupported,
-                  "The current storage engine does not support checkpoints");
-    }
-
-    virtual void clearIndividuallyCheckpointedIndexesList() {
-        uasserted(ErrorCodes::CommandNotSupported,
-                  "The current storage engine does not support checkpoints");
-    }
-
-    virtual bool isInIndividuallyCheckpointedIndexesList(const std::string& ident) const {
-        uasserted(ErrorCodes::CommandNotSupported,
-                  "The current storage engine does not support checkpoints");
-    }
-
-    /**
      * Returns whether the KVEngine supports checkpoints.
      */
     virtual bool supportsCheckpoints() const {

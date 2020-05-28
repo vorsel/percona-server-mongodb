@@ -55,8 +55,6 @@
 
 namespace mongo {
 
-using namespace indexbuildentryhelpers;
-
 namespace {
 
 MONGO_FAIL_POINT_DEFINE(hangBeforeInitializingIndexBuild);
@@ -335,8 +333,11 @@ Status IndexBuildsCoordinatorMongod::voteCommitIndexBuild(OperationContext* opCt
     {
         // Secondary nodes will always try to vote regardless of the commit quorum value. If the
         // commit quorum is disabled, do not record their entry into the commit ready nodes.
+        // If we fail to retrieve the persisted commit quorum, the index build might be in the
+        // middle of tearing down.
         Lock::SharedLock commitQuorumLk(opCtx->lockState(), replState->commitQuorumLock.get());
-        auto commitQuorum = invariant(getCommitQuorum(opCtx, buildUUID));
+        auto commitQuorum =
+            uassertStatusOK(indexbuildentryhelpers::getCommitQuorum(opCtx, buildUUID));
         if (commitQuorum.numNodes == CommitQuorumOptions::kDisabled) {
             return Status::OK();
         }
@@ -357,7 +358,7 @@ Status IndexBuildsCoordinatorMongod::voteCommitIndexBuild(OperationContext* opCt
     {
         // Upserts doesn't need to acquire pbwm lock.
         ShouldNotConflictWithSecondaryBatchApplicationBlock noPBWMBlock(opCtx->lockState());
-        upsertStatus = persistCommitReadyMemberInfo(opCtx, indexbuildEntry);
+        upsertStatus = indexbuildentryhelpers::persistCommitReadyMemberInfo(opCtx, indexbuildEntry);
     }
 
     if (upsertStatus.isOK()) {
@@ -410,8 +411,9 @@ void IndexBuildsCoordinatorMongod::_signalIfCommitQuorumIsSatisfied(
     Lock::SharedLock commitQuorumLk(opCtx->lockState(), replState->commitQuorumLock.get());
 
     // Read the index builds entry from config.system.indexBuilds collection.
-    auto swIndexBuildEntry = getIndexBuildEntry(opCtx, replState->buildUUID);
-    auto indexBuildEntry = invariantStatusOK(swIndexBuildEntry);
+    auto swIndexBuildEntry =
+        indexbuildentryhelpers::getIndexBuildEntry(opCtx, replState->buildUUID);
+    auto indexBuildEntry = uassertStatusOK(swIndexBuildEntry);
 
     auto voteMemberList = indexBuildEntry.getCommitReadyMembers();
     // This can occur when no vote got received and stepup tries to check if commit quorum is
@@ -471,7 +473,7 @@ bool IndexBuildsCoordinatorMongod::_signalIfCommitQuorumNotEnabled(
     Lock::SharedLock commitQuorumLk(opCtx->lockState(), replState->commitQuorumLock.get());
 
     // Read the commit quorum value from config.system.indexBuilds collection.
-    auto swCommitQuorum = getCommitQuorum(opCtx, replState->buildUUID);
+    auto swCommitQuorum = indexbuildentryhelpers::getCommitQuorum(opCtx, replState->buildUUID);
     auto commitQuorum = invariantStatusOK(swCommitQuorum);
 
     // Check if the commit quorum is disabled for the index build.
@@ -791,7 +793,8 @@ Status IndexBuildsCoordinatorMongod::setCommitQuorum(OperationContext* opCtx,
     }
 
     // Read the index builds entry from config.system.indexBuilds collection.
-    auto swOnDiskCommitQuorum = getCommitQuorum(opCtx, replState->buildUUID);
+    auto swOnDiskCommitQuorum =
+        indexbuildentryhelpers::getCommitQuorum(opCtx, replState->buildUUID);
     // Index build has not yet started.
     if (swOnDiskCommitQuorum == ErrorCodes::NoMatchingDocument) {
         return Status(ErrorCodes::IndexNotFound,
@@ -827,7 +830,7 @@ Status IndexBuildsCoordinatorMongod::setCommitQuorum(OperationContext* opCtx,
 
     IndexBuildEntry indexbuildEntry(
         replState->buildUUID, replState->collectionUUID, newCommitQuorum, replState->indexNames);
-    status = persistIndexCommitQuorum(opCtx, indexbuildEntry);
+    status = indexbuildentryhelpers::persistIndexCommitQuorum(opCtx, indexbuildEntry);
 
     {
         // Check to see the index build hasn't received commit index build signal while updating
