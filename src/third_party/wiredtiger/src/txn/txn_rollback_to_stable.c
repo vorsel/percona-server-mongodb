@@ -312,7 +312,7 @@ __rollback_row_ondisk_fixup_key(WT_SESSION_IMPL *session, WT_PAGE *page, WT_ROW 
              * Set the flag to indicate that this update has been restored from history store for
              * the rollback to stable operation.
              */
-            F_SET(upd, WT_UPDATE_RESTORED_FOR_ROLLBACK);
+            F_SET(upd, WT_UPDATE_RESTORED_FROM_HS);
         } else {
             WT_ERR(__wt_upd_alloc_tombstone(session, &upd, NULL));
             WT_STAT_CONN_INCR(session, txn_rts_keys_removed);
@@ -754,7 +754,7 @@ __rollback_abort_newer_updates(
                 WT_RET(__wt_page_in(session, ref, 0));
                 if (ref->page->type == WT_PAGE_ROW_LEAF)
                     __rollback_verify_ondisk_page(session, ref->page, rollback_timestamp);
-                WT_TRET(__wt_page_release(session, ref, 0));
+                WT_TRET_BUSY_OK(__wt_page_release_evict(session, ref, 0));
             }
 #endif
             return (0);
@@ -795,7 +795,7 @@ __rollback_abort_newer_updates(
 
 err:
     if (local_read)
-        WT_TRET(__wt_page_release(session, ref, 0));
+        WT_TRET_BUSY_OK(__wt_page_release_evict(session, ref, 0));
     return (ret);
 }
 

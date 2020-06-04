@@ -2995,11 +2995,10 @@ bool WiredTigerKVEngine::supportsOplogStones() const {
 }
 
 void WiredTigerKVEngine::startOplogManager(OperationContext* opCtx,
-                                           const std::string& uri,
                                            WiredTigerRecordStore* oplogRecordStore) {
     stdx::lock_guard<Latch> lock(_oplogManagerMutex);
     if (_oplogManagerCount == 0)
-        _oplogManager->start(opCtx, uri, oplogRecordStore);
+        _oplogManager->startVisibilityThread(opCtx, oplogRecordStore);
     _oplogManagerCount++;
 }
 
@@ -3008,7 +3007,7 @@ void WiredTigerKVEngine::haltOplogManager() {
     invariant(_oplogManagerCount > 0);
     _oplogManagerCount--;
     if (_oplogManagerCount == 0) {
-        _oplogManager->halt();
+        _oplogManager->haltVisibilityThread();
     }
 }
 

@@ -914,7 +914,7 @@ void WiredTigerRecordStore::postConstructorInit(OperationContext* opCtx) {
 
     if (_isOplog) {
         invariant(_kvEngine);
-        _kvEngine->startOplogManager(opCtx, _uri, this);
+        _kvEngine->startOplogManager(opCtx, this);
     }
 }
 
@@ -1022,6 +1022,9 @@ bool WiredTigerRecordStore::findRecord(OperationContext* opCtx,
 void WiredTigerRecordStore::deleteRecord(OperationContext* opCtx, const RecordId& id) {
     dassert(opCtx->lockState()->isWriteLocked());
     invariant(opCtx->lockState()->inAWriteUnitOfWork() || opCtx->lockState()->isNoop());
+    // SERVER-48453: Initialize the next record id counter before deleting. This ensures we won't
+    // reuse record ids, which can be problematic for the _mdb_catalog.
+    _initNextIdIfNeeded(opCtx);
 
     // Deletes should never occur on a capped collection because truncation uses
     // WT_SESSION::truncate().
@@ -1519,7 +1522,7 @@ bool WiredTigerRecordStore::haveCappedWaiters() {
 
 void WiredTigerRecordStore::notifyCappedWaitersIfNeeded() {
     stdx::lock_guard<Latch> cappedCallbackLock(_cappedCallbackMutex);
-    // This wakes up cursors blocking in await_data.
+    // This wakes up cursors blocking for awaitData.
     if (_cappedCallback) {
         _cappedCallback->notifyCappedWaitersIfNeeded();
     }
@@ -1730,6 +1733,11 @@ void WiredTigerRecordStore::validate(OperationContext* opCtx,
     dassert(opCtx->lockState()->isReadLocked());
 
     if (_isEphemeral) {
+        return;
+    }
+
+    if (_isOplog) {
+        results->warnings.push_back("Skipping verification of the WiredTiger table for the oplog.");
         return;
     }
 
