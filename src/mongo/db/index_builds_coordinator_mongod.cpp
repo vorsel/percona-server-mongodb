@@ -304,7 +304,7 @@ IndexBuildsCoordinatorMongod::startIndexBuild(OperationContext* opCtx,
             CurOp::get(opCtx.get())
                 ->completeAndLogOperation(opCtx.get(), MONGO_LOGV2_DEFAULT_COMPONENT);
         } catch (const DBException& e) {
-            LOGV2(4656002, "unable to log operation", "reason"_attr = e);
+            LOGV2(4656002, "unable to log operation", "error"_attr = e);
         }
     });
 
@@ -394,11 +394,12 @@ void IndexBuildsCoordinatorMongod::_sendCommitQuorumSatisfiedSignal(
         auto action = replState->waitForNextAction->getFuture().get(opCtx);
 
         LOGV2(3856200,
-              "Not signaling \"{signalAction}\" as it was previously signaled with "
-              "\"{signalActionSet}\" for index build: {buildUUID}",
-              "signalAction"_attr =
+              "Not signaling \"{skippedAction}\" as it was previously signaled with "
+              "\"{previousAction}\" for index build: {buildUUID}",
+              "Skipping signaling as it was previously signaled for index build",
+              "skippedAction"_attr =
                   _indexBuildActionToString(IndexBuildAction::kCommitQuorumSatisfied),
-              "signalActionSet"_attr = _indexBuildActionToString(action),
+              "previousAction"_attr = _indexBuildActionToString(action),
               "buildUUID"_attr = replState->buildUUID);
     }
 }
@@ -427,8 +428,7 @@ void IndexBuildsCoordinatorMongod::_signalIfCommitQuorumIsSatisfied(
     if (!commitQuorumSatisfied)
         return;
 
-    LOGV2(
-        3856201, "Index build commit quorum satisfied:", "indexBuildEntry"_attr = indexBuildEntry);
+    LOGV2(3856201, "Index build commit quorum satisfied", "indexBuildEntry"_attr = indexBuildEntry);
     _sendCommitQuorumSatisfiedSignal(opCtx, replState);
 }
 
@@ -473,8 +473,10 @@ bool IndexBuildsCoordinatorMongod::_signalIfCommitQuorumNotEnabled(
     Lock::SharedLock commitQuorumLk(opCtx->lockState(), replState->commitQuorumLock.get());
 
     // Read the commit quorum value from config.system.indexBuilds collection.
-    auto swCommitQuorum = indexbuildentryhelpers::getCommitQuorum(opCtx, replState->buildUUID);
-    auto commitQuorum = invariantStatusOK(swCommitQuorum);
+    auto commitQuorum = uassertStatusOKWithContext(
+        indexbuildentryhelpers::getCommitQuorum(opCtx, replState->buildUUID),
+        str::stream() << "failed to get commit quorum before committing index build: "
+                      << replState->buildUUID);
 
     // Check if the commit quorum is disabled for the index build.
     if (commitQuorum.numNodes != CommitQuorumOptions::kDisabled) {
@@ -540,7 +542,8 @@ void IndexBuildsCoordinatorMongod::_signalPrimaryForCommitReadiness(
     // or abort. This way, we can make sure majority of nodes will never stop voting and wait for
     // commit or abort signal until they have received commit or abort signal.
     while (needToVote()) {
-        // check for any interrupts before starting the voting process.
+        // Check for any interrupts, including shutdown-related ones, before starting the voting
+        // process.
         opCtx->checkForInterrupt();
 
         // Don't hammer the network.
@@ -569,11 +572,7 @@ void IndexBuildsCoordinatorMongod::_signalPrimaryForCommitReadiness(
             voteCmdResponse = replCoord->runCmdOnPrimaryAndAwaitResponse(
                 opCtx, "admin", voteCmdRequest, onRemoteCmdScheduled, onRemoteCmdComplete);
         } catch (DBException& ex) {
-            if (ex.isA<ErrorCategory::ShutdownError>()) {
-                throw;
-            }
-
-            // All other errors including CallbackCanceled and network errors should be retried.
+            // All errors, including CallbackCanceled and network errors, should be retried.
             // If ErrorCodes::CallbackCanceled is due to shutdown, then checkForInterrupt() at the
             // beginning of this loop will catch it and throw an error to the caller. Or, if we
             // received the CallbackCanceled error because the index build was signaled with abort

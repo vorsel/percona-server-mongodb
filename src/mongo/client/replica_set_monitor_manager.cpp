@@ -89,12 +89,11 @@ Status ReplicaSetMonitorManagerNetworkConnectionHook::validateHost(
             if (publisher) {
                 try {
                     if (isMasterReply.status.isOK()) {
-                        publisher->onServerHandshakeCompleteEvent(isMasterReply.elapsedMillis.get(),
-                                                                  remoteHost.toString(),
-                                                                  isMasterReply.data);
+                        publisher->onServerHandshakeCompleteEvent(
+                            isMasterReply.elapsedMillis.get(), remoteHost, isMasterReply.data);
                     } else {
                         publisher->onServerHandshakeFailedEvent(
-                            remoteHost.toString(), isMasterReply.status, isMasterReply.data);
+                            remoteHost, isMasterReply.status, isMasterReply.data);
                     }
                 } catch (const DBException& exception) {
                     LOGV2_ERROR(4712101,
@@ -237,6 +236,7 @@ void ReplicaSetMonitorManager::removeMonitor(StringData setName) {
         _monitors.erase(it);
         LOGV2(20187,
               "Removed ReplicaSetMonitor for replica set {replicaSet}",
+              "Removed ReplicaSetMonitor for replica set",
               "replicaSet"_attr = setName);
     }
 }

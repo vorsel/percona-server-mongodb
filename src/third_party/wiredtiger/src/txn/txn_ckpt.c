@@ -605,8 +605,8 @@ __checkpoint_prepare(WT_SESSION_IMPL *session, bool *trackingp, const char *cfg[
      * We rely on having the global transaction data locked so the oldest timestamp can't move past
      * the stable timestamp.
      */
-    WT_ASSERT(session, !F_ISSET(txn, WT_TXN_HAS_TS_COMMIT | WT_TXN_HAS_TS_READ |
-                           WT_TXN_SHARED_TS_DURABLE | WT_TXN_SHARED_TS_READ));
+    WT_ASSERT(session,
+      !F_ISSET(txn, WT_TXN_HAS_TS_COMMIT | WT_TXN_SHARED_TS_DURABLE | WT_TXN_SHARED_TS_READ));
 
     if (use_timestamp) {
         /*
@@ -623,7 +623,7 @@ __checkpoint_prepare(WT_SESSION_IMPL *session, bool *trackingp, const char *cfg[
     } else {
         if (!F_ISSET(conn, WT_CONN_RECOVERING))
             txn_global->meta_ckpt_timestamp = WT_TS_NONE;
-        txn->read_timestamp = txn_shared->pinned_read_timestamp = WT_TS_NONE;
+        txn_shared->read_timestamp = WT_TS_NONE;
     }
 
     __wt_writeunlock(session, &txn_global->rwlock);
@@ -773,8 +773,9 @@ __txn_checkpoint(WT_SESSION_IMPL *session, const char *cfg[])
 
     logging = FLD_ISSET(conn->log_flags, WT_CONN_LOG_ENABLED);
 
-    /* Reset the maximum page size seen by eviction. */
-    conn->cache->evict_max_page_size = 0;
+    /* Reset the statistics tracked per checkpoint. */
+    cache->evict_max_page_size = 0;
+    conn->rec_maximum_seconds = 0;
 
     /* Initialize the verbose tracking timer */
     __wt_epoch(session, &conn->ckpt_timer_start);
@@ -866,8 +867,8 @@ __txn_checkpoint(WT_SESSION_IMPL *session, const char *cfg[])
     time_start_hs = __wt_clock(session);
     WT_ERR(__checkpoint_apply_to_dhandles(session, cfg, __checkpoint_tree_helper));
     time_stop_hs = __wt_clock(session);
-    WT_STAT_CONN_INCRV(
-      session, txn_checkpoint_tree_helper_time, (int64_t)WT_CLOCKDIFF_US(time_stop_hs, time_start_hs));
+    WT_STAT_CONN_INCRV(session, txn_checkpoint_tree_helper_time,
+      (int64_t)WT_CLOCKDIFF_US(time_stop_hs, time_start_hs));
 
     /*
      * Get a history store dhandle. If the history store file is opened for a special operation this
@@ -1523,7 +1524,7 @@ __wt_checkpoint_tree_reconcile_update(WT_SESSION_IMPL *session, WT_TIME_AGGREGAT
     WT_CKPT_FOREACH (ckptbase, ckpt)
         if (F_ISSET(ckpt, WT_CKPT_ADD)) {
             ckpt->write_gen = btree->write_gen;
-            __wt_time_aggregate_copy(&ckpt->ta, ta);
+            WT_TIME_AGGREGATE_COPY(&ckpt->ta, ta);
         }
 }
 
@@ -1550,7 +1551,7 @@ __checkpoint_tree(WT_SESSION_IMPL *session, bool is_checkpoint, const char *cfg[
     conn = S2C(session);
     dhandle = session->dhandle;
     fake_ckpt = resolve_bm = false;
-    __wt_time_aggregate_init(&ta);
+    WT_TIME_AGGREGATE_INIT(&ta);
 
     /*
      * Set the checkpoint LSN to the maximum LSN so that if logging is disabled, recovery will never
@@ -1710,20 +1711,20 @@ __checkpoint_tree_helper(WT_SESSION_IMPL *session, const char *cfg[])
     txn = session->txn;
 
     /* Are we using a read timestamp for this checkpoint transaction? */
-    with_timestamp = F_ISSET(txn, WT_TXN_HAS_TS_READ);
+    with_timestamp = F_ISSET(txn, WT_TXN_SHARED_TS_READ);
 
     /*
      * For tables with immediate durability (indicated by having logging enabled), ignore any read
      * timestamp configured for the checkpoint.
      */
     if (__wt_btree_immediately_durable(session))
-        F_CLR(txn, WT_TXN_HAS_TS_READ);
+        F_CLR(txn, WT_TXN_SHARED_TS_READ);
 
     ret = __checkpoint_tree(session, true, cfg);
 
     /* Restore the use of the timestamp for other tables. */
     if (with_timestamp)
-        F_SET(txn, WT_TXN_HAS_TS_READ);
+        F_SET(txn, WT_TXN_SHARED_TS_READ);
 
     /*
      * Whatever happened, we aren't visiting this tree again in this checkpoint. Don't keep updates

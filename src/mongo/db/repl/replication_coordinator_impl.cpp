@@ -1356,17 +1356,20 @@ void ReplicationCoordinatorImpl::_setMyLastAppliedOpTimeAndWallTime(
     // No need to wake up replication waiters because there should not be any replication waiters
     // waiting on our own lastApplied.
 
+    // Update the storage engine's lastApplied snapshot before updating the stable timestamp on the
+    // storage engine. New transactions reading from the lastApplied snapshot should start before
+    // the oldest timestamp is advanced to avoid races. Additionally, update this snapshot before
+    // signaling optime waiters. This avoids a race that would allow optime waiters to open
+    // transactions on stale lastApplied values because they do not hold or reacquire the
+    // replication coordinator mutex when signaled.
+    _externalState->updateLastAppliedSnapshot(opTime);
+
     // Signal anyone waiting on optime changes.
     _opTimeWaiterList.setValueIf_inlock(
         [opTime](const OpTime& waitOpTime, const SharedWaiterHandle& waiter) {
             return waitOpTime <= opTime;
         },
         opTime);
-
-    // Update the local snapshot before updating the stable timestamp on the storage engine. New
-    // transactions reading from the local snapshot should start before the oldest timestamp is
-    // advanced to avoid races.
-    _externalState->updateLocalSnapshot(opTime);
 
     // Notify the oplog waiters after updating the local snapshot.
     signalOplogWaiters();
@@ -2301,28 +2304,6 @@ void ReplicationCoordinatorImpl::cancelCbkHandle(CallbackHandle activeHandle) {
     _replExecutor->cancel(activeHandle);
 }
 
-BSONObj ReplicationCoordinatorImpl::_runCmdOnSelfOnAlternativeClient(OperationContext* opCtx,
-                                                                     const std::string& dbName,
-                                                                     const BSONObj& cmdObj) {
-
-    auto client = opCtx->getServiceContext()->makeClient("DBDirectClientCmd");
-    // We want the command's opCtx that gets executed via DBDirectClient to be interruptible
-    // so that we don't block state transitions. Callers of this function might run opCtx
-    // in an uninterruptible mode. To be on safer side, run the command in AlternativeClientRegion,
-    // to make sure that the command's opCtx is interruptible.
-    AlternativeClientRegion acr(client);
-    auto uniqueNewOpCtx = cc().makeOperationContext();
-    {
-        stdx::lock_guard<Client> lk(cc());
-        cc().setSystemOperationKillable(lk);
-    }
-
-    DBDirectClient dbClient(uniqueNewOpCtx.get());
-    const auto commandResponse = dbClient.runCommand(OpMsgRequest::fromDBAndBody(dbName, cmdObj));
-
-    return commandResponse->getCommandReply();
-}
-
 BSONObj ReplicationCoordinatorImpl::runCmdOnPrimaryAndAwaitResponse(
     OperationContext* opCtx,
     const std::string& dbName,
@@ -2332,27 +2313,14 @@ BSONObj ReplicationCoordinatorImpl::runCmdOnPrimaryAndAwaitResponse(
     // About to make network and DBDirectClient (recursive) calls, so we should not hold any locks.
     invariant(!opCtx->lockState()->isLocked());
 
-    const auto myHostAndPort = getMyHostAndPort();
     const auto primaryHostAndPort = getCurrentPrimaryHostAndPort();
-
-    if (myHostAndPort.empty()) {
-        // Possibly because either rsconfig is uninitialized or the node got removed from config.
-        uassertStatusOK(Status{ErrorCodes::NodeNotFound, "Address unknown."});
-    }
-
     if (primaryHostAndPort.empty()) {
         uassertStatusOK(Status{ErrorCodes::NoConfigMaster, "Primary is unknown/down."});
     }
 
-    auto iAmPrimary = (myHostAndPort == primaryHostAndPort) ? true : false;
-
-    if (iAmPrimary) {
-        // Run command using DBDirectClient to avoid tcp connection.
-        return _runCmdOnSelfOnAlternativeClient(opCtx, dbName, cmdObj);
-    }
-
-    // Node is not primary, so we will run the remote command via AsyncDBClient. To use
-    // AsyncDBClient, we will be using repl task executor.
+    // Run the command via AsyncDBClient which performs a network call. This is also the desired
+    // behaviour when running this command locally as to avoid using the DBDirectClient which would
+    // provide additional management when trying to cancel the request with differing clients.
     executor::RemoteCommandRequest request(primaryHostAndPort, dbName, cmdObj, nullptr);
     executor::RemoteCommandResponse cbkResponse(
         Status{ErrorCodes::InternalError, "Uninitialized value"});
@@ -3277,6 +3245,14 @@ Status ReplicationCoordinatorImpl::doReplSetReconfig(OperationContext* opCtx,
                 << _getMemberState_inlock().toString());
     }
     auto topCoordTerm = _topCoord->getTerm();
+
+    if (!force) {
+        // For safety of reconfig, since we must commit a config in our own term before executing a
+        // reconfig, so we should never have a config in an older term. If the current config was
+        // installed via a force reconfig, we aren't concerned about this safety guarantee.
+        invariant(_rsConfig.getConfigTerm() == OpTime::kUninitializedTerm ||
+                  _rsConfig.getConfigTerm() == topCoordTerm);
+    }
 
     auto configWriteConcern = _getConfigReplicationWriteConcern();
     // Construct a fake OpTime that can be accepted but isn't used.
@@ -5018,18 +4994,27 @@ Status ReplicationCoordinatorImpl::processHeartbeatV1(const ReplSetHeartbeatArgs
         }
     } else if (result.isOK() &&
                response->getConfigVersionAndTerm() < args.getConfigVersionAndTerm()) {
+        logv2::DynamicAttributes attr;
+        attr.add("configTerm", args.getConfigTerm());
+        attr.add("configVersion", args.getConfigVersion());
+        attr.add("senderHost", senderHost);
+
+        // If we are currently in drain mode, we won't allow installing newer configs, so we don't
+        // schedule a heartbeat to fetch one. We do allow force reconfigs to proceed even if we are
+        // in drain mode.
+        if (_memberState.primary() && !_readWriteAbility->canAcceptNonLocalWrites(lk) &&
+            args.getConfigTerm() != OpTime::kUninitializedTerm) {
+            LOGV2(4794901,
+                  "Not scheduling a heartbeat to fetch a newer config since we are in PRIMARY "
+                  "state but cannot accept writes yet.",
+                  attr);
+        }
         // Schedule a heartbeat to the sender to fetch the new config.
         // Only send this if the sender's config is newer.
         // We cannot cancel the enqueued heartbeat, but either this one or the enqueued heartbeat
         // will trigger reconfig, which cancels and reschedules all heartbeats.
-        if (args.hasSender()) {
-            LOGV2(21401,
-                  "Scheduling heartbeat to fetch a newer config with term {configTerm} and "
-                  "version {configVersion} from member: {senderHost}",
-                  "Scheduling heartbeat to fetch a newer config",
-                  "configTerm"_attr = args.getConfigTerm(),
-                  "configVersion"_attr = args.getConfigVersion(),
-                  "senderHost"_attr = senderHost);
+        else if (args.hasSender()) {
+            LOGV2(21401, "Scheduling heartbeat to fetch a newer config", attr);
             int senderIndex = _rsConfig.findMemberIndexByHostAndPort(senderHost);
             _scheduleHeartbeatToTarget_inlock(senderHost, senderIndex, now);
         }

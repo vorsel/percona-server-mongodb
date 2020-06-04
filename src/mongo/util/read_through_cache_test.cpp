@@ -37,6 +37,7 @@
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/read_through_cache.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 namespace {
@@ -51,16 +52,10 @@ struct CachedValue {
 class Cache : public ReadThroughCache<std::string, CachedValue> {
 public:
     Cache(ServiceContext* service, ThreadPoolInterface& threadPool, size_t size, LookupFn lookupFn)
-        : ReadThroughCache(_mutex, service, threadPool, size), _lookupFn(std::move(lookupFn)) {}
+        : ReadThroughCache(_mutex, service, threadPool, std::move(lookupFn), size) {}
 
 private:
-    boost::optional<CachedValue> lookup(OperationContext* opCtx, const std::string& key) override {
-        return _lookupFn(opCtx, key);
-    }
-
     Mutex _mutex = MONGO_MAKE_LATCH("ReadThroughCacheTest::Cache");
-
-    LookupFn _lookupFn;
 };
 
 /**
@@ -112,24 +107,6 @@ TEST_F(ReadThroughCacheTest, FetchInvalidateAndRefetch) {
         ASSERT_EQ(i, countLookups);
 
         cache.invalidate("TestKey");
-    }
-}
-
-TEST_F(ReadThroughCacheTest, CacheSizeZero) {
-    int countLookups = 0;
-    CacheWithThreadPool cache(
-        getServiceContext(), 0, [&](OperationContext*, const std::string& key) {
-            ASSERT_EQ("TestKey", key);
-            countLookups++;
-
-            return CachedValue{100 * countLookups};
-        });
-
-    for (int i = 1; i <= 3; i++) {
-        auto value = cache.acquire(_opCtx, "TestKey");
-        ASSERT(value);
-        ASSERT_EQ(100 * i, value->counter);
-        ASSERT_EQ(i, countLookups);
     }
 }
 
@@ -190,6 +167,13 @@ TEST_F(ReadThroughCacheTestAsync, AcquireObservesOperationContextDeadline) {
         return CachedValue(5);
     });
 
+    // Join threads before destroying cache. This ensure the internal asynchronous processing tasks
+    // are completed before the cache resources are released.
+    ON_BLOCK_EXIT([&] {
+        threadPool.shutdown();
+        threadPool.join();
+    });
+
     {
         ThreadClient tc(getServiceContext());
         const ServiceContext::UniqueOperationContext opCtxHolder{tc->makeOperationContext()};
@@ -241,6 +225,13 @@ TEST_F(ReadThroughCacheTestAsync, InvalidateReissuesLookup) {
         return CachedValue(idx);
     });
 
+    // Join threads before destroying cache. This ensure the internal asynchronous processing tasks
+    // are completed before the cache resources are released.
+    ON_BLOCK_EXIT([&] {
+        threadPool.shutdown();
+        threadPool.join();
+    });
+
     // Kick off the first lookup, which will block
     auto future = cache.acquireAsync("TestKey");
     ASSERT(!future.isReady());
@@ -287,23 +278,30 @@ TEST_F(ReadThroughCacheTestAsync, AcquireWithAShutdownThreadPool) {
     ASSERT_THROWS_CODE(future.get(), DBException, ErrorCodes::ShutdownInProgress);
 }
 
-TEST_F(ReadThroughCacheTestAsync, InvalidateCalledBeforeLookupTaskExecutes) {
-    struct MockThreadPool : public ThreadPoolInterface {
-        void startup() override {}
-        void shutdown() override {}
-        void join() override {}
-        void schedule(Task task) override {
-            ASSERT(!mostRecentTask);
-            mostRecentTask = std::move(task);
-        }
-        void runMostRecentTask() {
-            ASSERT(mostRecentTask);
-            auto f = std::move(mostRecentTask);
-            f(Status::OK());
-        }
+class MockThreadPool : public ThreadPoolInterface {
+public:
+    ~MockThreadPool() {
+        ASSERT(!_mostRecentTask);
+    }
+    void startup() override {}
+    void shutdown() override {}
+    void join() override {}
+    void schedule(Task task) override {
+        ASSERT(!_mostRecentTask);
+        _mostRecentTask = std::move(task);
+    }
+    void runMostRecentTask() {
+        ASSERT(_mostRecentTask);
+        auto f = std::move(_mostRecentTask);
+        f(Status::OK());
+    }
 
-        Task mostRecentTask;
-    } threadPool;
+private:
+    Task _mostRecentTask;
+};
+
+TEST_F(ReadThroughCacheTestAsync, InvalidateCalledBeforeLookupTaskExecutes) {
+    MockThreadPool threadPool;
 
     Cache cache(getServiceContext(), threadPool, 1, [&](OperationContext*, const std::string&) {
         return CachedValue(123);
@@ -319,6 +317,26 @@ TEST_F(ReadThroughCacheTestAsync, InvalidateCalledBeforeLookupTaskExecutes) {
     threadPool.runMostRecentTask();
 
     ASSERT_EQ(123, future.get()->counter);
+}
+
+TEST_F(ReadThroughCacheTestAsync, CacheSizeZero) {
+    MockThreadPool threadPool;
+    int countLookups = 0;
+    Cache cache(getServiceContext(), threadPool, 0, [&](OperationContext*, const std::string& key) {
+        ASSERT_EQ("TestKey", key);
+        countLookups++;
+
+        return CachedValue{100 * countLookups};
+    });
+
+    for (int i = 1; i <= 3; i++) {
+        auto future = cache.acquireAsync("TestKey");
+        threadPool.runMostRecentTask();
+        auto value = future.get();
+        ASSERT(value);
+        ASSERT_EQ(100 * i, value->counter);
+        ASSERT_EQ(i, countLookups);
+    }
 }
 
 }  // namespace

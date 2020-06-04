@@ -130,7 +130,7 @@ protected:
      * Sets up a SingleServerIsMasterMonitor that starts sending isMasters to the server.
      */
     std::shared_ptr<SingleServerIsMasterMonitor> initSingleServerIsMasterMonitor(
-        const sdam::ServerAddress& hostAndPort, MockReplicaSet* replSet) {
+        const HostAndPort& hostAndPort, MockReplicaSet* replSet) {
         auto ssIsMasterMonitor = std::make_shared<SingleServerIsMasterMonitor>(replSet->getURI(),
                                                                                hostAndPort,
                                                                                boost::none,
@@ -163,7 +163,7 @@ protected:
      * assertHostCheck is true, asserts that the isMaster was sent to the server at hostAndPort.
      */
     void processIsMasterRequest(MockReplicaSet* replSet,
-                                boost::optional<sdam::ServerAddress> hostAndPort = boost::none) {
+                                boost::optional<HostAndPort> hostAndPort = boost::none) {
         ASSERT(hasReadyRequests());
         InNetworkGuard guard(_net);
         _net->runReadyNetworkOperations();
@@ -173,11 +173,11 @@ protected:
         executor::TaskExecutorTest::assertRemoteCommandNameEquals("isMaster", request);
         auto requestHost = request.target.toString();
         if (hostAndPort) {
-            ASSERT_EQ(request.target.toString(), hostAndPort);
+            ASSERT_EQ(request.target, hostAndPort);
         }
 
         LOGV2(457991,
-              "got mock network operation",
+              "Got mock network operation",
               "elapsed"_attr = elapsed(),
               "request"_attr = request.toString());
 
@@ -198,10 +198,10 @@ protected:
         LOGV2_DEBUG(457992,
                     1,
                     "Advancing time",
-                    "from_time_elapsed"_attr = elapsed(),
-                    "to_time_elapsed"_attr = (elapsed() + d));
+                    "elpasedStart"_attr = elapsed(),
+                    "elapsedEnd"_attr = (elapsed() + d));
         _net->advanceTime(_net->now() + d);
-        LOGV2_DEBUG(457993, 1, "Advanced time", "time_elapsed"_attr = elapsed());
+        LOGV2_DEBUG(457993, 1, "Advanced time", "timeElapsed"_attr = elapsed());
     }
 
     /**
@@ -209,7 +209,7 @@ protected:
      * heartbeatFrequency.
      */
     void checkSingleIsMaster(Milliseconds heartbeatFrequency,
-                             const sdam::ServerAddress& hostAndPort,
+                             const HostAndPort& hostAndPort,
                              MockReplicaSet* replSet) {
         auto deadline = elapsed() + heartbeatFrequency;
         processIsMasterRequest(replSet, hostAndPort);
@@ -221,7 +221,7 @@ protected:
         checkNoActivityBefore(deadline, hostAndPort);
     }
 
-    void validateIsMasterResponse(const sdam::ServerAddress& hostAndPort, Milliseconds deadline) {
+    void validateIsMasterResponse(const HostAndPort& hostAndPort, Milliseconds deadline) {
         ASSERT_TRUE(_topologyListener->hasIsMasterResponse(hostAndPort));
         ASSERT_LT(elapsed(), deadline);
         auto isMasterResponse = _topologyListener->getIsMasterResponse(hostAndPort);
@@ -236,22 +236,8 @@ protected:
      * isMaster responses are received between elapsed() and deadline when hostAndPort is specified.
      */
     void checkNoActivityBefore(Milliseconds deadline,
-                               boost::optional<sdam::ServerAddress> hostAndPort = boost::none) {
+                               boost::optional<HostAndPort> hostAndPort = boost::none) {
         while (elapsed() < deadline) {
-            if (hasReadyRequests()) {
-                {
-                    InNetworkGuard guard(_net);
-                    _net->runReadyNetworkOperations();
-                    auto noi = _net->getNextReadyRequest();
-                    auto request = noi->getRequest();
-                    LOGV2_DEBUG(4579931,
-                                0,
-                                "mynameisrae about to fail because was activity",
-                                "request"_attr = request.toString(),
-                                "elapsed"_attr = elapsed());
-                }
-                ASSERT_FALSE(true);
-            }
             ASSERT_FALSE(hasReadyRequests());
             if (hostAndPort) {
                 ASSERT_FALSE(_topologyListener->hasIsMasterResponse(hostAndPort.get()));
@@ -296,7 +282,7 @@ private:
 TEST_F(ServerIsMasterMonitorTestFixture, heartbeatFrequencyCheck) {
     auto replSet = std::make_unique<MockReplicaSet>(
         "test", 1, /* hasPrimary = */ false, /* dollarPrefixHosts = */ false);
-    auto hostAndPort = HostAndPort(replSet->getSecondaries()[0]).toString();
+    auto hostAndPort = HostAndPort(replSet->getSecondaries()[0]);
 
     auto ssIsMasterMonitor = initSingleServerIsMasterMonitor(hostAndPort, replSet.get());
     ssIsMasterMonitor->disableExpeditedChecking();
@@ -327,10 +313,10 @@ TEST_F(ServerIsMasterMonitorTestFixture, singleServerIsMasterMonitorReportsFailu
         "test", 1, /* hasPrimary = */ false, /* dollarPrefixHosts = */ false);
 
     // Kill the server before starting up the SingleServerIsMasterMonitor.
-    auto hostAndPort = HostAndPort(replSet->getSecondaries()[0]).toString();
+    auto hostAndPort = HostAndPort(replSet->getSecondaries()[0]);
     {
         NetworkInterfaceMock::InNetworkGuard ing(getNet());
-        replSet->kill(hostAndPort);
+        replSet->kill(hostAndPort.toString());
     }
 
     auto ssIsMasterMonitor = initSingleServerIsMasterMonitor(hostAndPort, replSet.get());
@@ -354,8 +340,8 @@ TEST_F(ServerIsMasterMonitorTestFixture, serverIsMasterMonitorOnTopologyDescript
         "test", 2, /* hasPrimary = */ false, /* dollarPrefixHosts = */ false);
 
     auto hostAndPortList = replSet->getHosts();
-    auto host0 = hostAndPortList[0].toString();
-    std::vector<sdam::ServerAddress> host0Vec{host0};
+    auto host0 = hostAndPortList[0];
+    std::vector<HostAndPort> host0Vec{host0};
 
     // Start up the ServerIsMasterMonitor to monitor host0 only.
     auto sdamConfig0 = sdam::SdamConfiguration(host0Vec);
@@ -369,8 +355,8 @@ TEST_F(ServerIsMasterMonitorTestFixture, serverIsMasterMonitorOnTopologyDescript
     ASSERT_FALSE(hasReadyRequests());
 
     // Start monitoring host1.
-    auto host1 = hostAndPortList[1].toString();
-    std::vector<sdam::ServerAddress> allHostsVec{host0, host1};
+    auto host1 = hostAndPortList[1];
+    std::vector<HostAndPort> allHostsVec{host0, host1};
     auto sdamConfigAllHosts = sdam::SdamConfiguration(allHostsVec);
     auto topologyDescriptionAllHosts =
         std::make_shared<sdam::TopologyDescription>(sdamConfigAllHosts);
@@ -393,9 +379,9 @@ TEST_F(ServerIsMasterMonitorTestFixture,
         "test", 2, /* hasPrimary = */ false, /* dollarPrefixHosts = */ false);
 
     auto hostAndPortList = replSet->getHosts();
-    auto host0 = hostAndPortList[0].toString();
-    auto host1 = hostAndPortList[1].toString();
-    std::vector<sdam::ServerAddress> allHostsVec{host0, host1};
+    auto host0 = hostAndPortList[0];
+    auto host1 = hostAndPortList[1];
+    std::vector<HostAndPort> allHostsVec{host0, host1};
 
     // Start up the ServerIsMasterMonitor to monitor both hosts.
     auto sdamConfigAllHosts = sdam::SdamConfiguration(allHostsVec);
@@ -424,7 +410,7 @@ TEST_F(ServerIsMasterMonitorTestFixture,
     validateIsMasterResponse(host1, deadline);
 
     // Remove host1 from the TopologyDescription to stop monitoring it.
-    std::vector<sdam::ServerAddress> host0Vec{host0};
+    std::vector<HostAndPort> host0Vec{host0};
     auto sdamConfig0 = sdam::SdamConfiguration(host0Vec);
     auto topologyDescription0 = std::make_shared<sdam::TopologyDescription>(sdamConfig0);
     isMasterMonitor->onTopologyDescriptionChangedEvent(topologyDescriptionAllHosts,
@@ -444,7 +430,7 @@ TEST_F(ServerIsMasterMonitorTestFixture, serverIsMasterMonitorShutdownStopsIsMas
     auto replSet = std::make_unique<MockReplicaSet>(
         "test", 1, /* hasPrimary = */ false, /* dollarPrefixHosts = */ false);
 
-    std::vector<sdam::ServerAddress> hostVec{replSet->getHosts()[0].toString()};
+    std::vector<HostAndPort> hostVec{replSet->getHosts()[0]};
     auto sdamConfig = sdam::SdamConfiguration(hostVec);
     auto topologyDescription = std::make_shared<sdam::TopologyDescription>(sdamConfig);
     auto uri = replSet->getURI();
@@ -488,7 +474,7 @@ TEST_F(ServerIsMasterMonitorTestFixture,
     auto replSet = std::make_unique<MockReplicaSet>(
         "test", 1, /* hasPrimary = */ false, /* dollarPrefixHosts = */ false);
 
-    std::vector<sdam::ServerAddress> hostVec{replSet->getHosts()[0].toString()};
+    std::vector<HostAndPort> hostVec{replSet->getHosts()[0]};
 
     // Start up the ServerIsMasterMonitor to monitor host0 only.
     auto sdamConfig0 = sdam::SdamConfiguration(hostVec);
@@ -532,7 +518,7 @@ TEST_F(ServerIsMasterMonitorTestFixture, serverIsMasterMonitorRequestImmediateCh
     auto replSet = std::make_unique<MockReplicaSet>(
         "test", 1, /* hasPrimary = */ false, /* dollarPrefixHosts = */ false);
 
-    std::vector<sdam::ServerAddress> hostVec{replSet->getHosts()[0].toString()};
+    std::vector<HostAndPort> hostVec{replSet->getHosts()[0]};
 
     // Start up the ServerIsMasterMonitor to monitor host0 only.
     auto sdamConfig0 = sdam::SdamConfiguration(hostVec);

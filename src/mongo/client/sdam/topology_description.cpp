@@ -28,10 +28,8 @@
  */
 #include "mongo/client/sdam/topology_description.h"
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 #include "mongo/client/sdam/server_description.h"
 #include "mongo/db/wire_version.h"
-#include "mongo/logv2/log.h"
 #include "mongo/util/fail_point.h"
 
 namespace mongo::sdam {
@@ -90,7 +88,7 @@ void TopologyDescription::setType(TopologyType type) {
     _type = type;
 }
 
-bool TopologyDescription::containsServerAddress(const ServerAddress& address) const {
+bool TopologyDescription::containsServerAddress(const HostAndPort& address) const {
     return findServerByAddress(address) != boost::none;
 }
 
@@ -102,7 +100,7 @@ std::vector<ServerDescriptionPtr> TopologyDescription::findServers(
 }
 
 const boost::optional<ServerDescriptionPtr> TopologyDescription::findServerByAddress(
-    ServerAddress address) const {
+    HostAndPort address) const {
     auto results = findServers([address](const ServerDescriptionPtr& serverDescription) {
         return serverDescription->getAddress() == address;
     });
@@ -111,11 +109,6 @@ const boost::optional<ServerDescriptionPtr> TopologyDescription::findServerByAdd
 
 boost::optional<ServerDescriptionPtr> TopologyDescription::installServerDescription(
     const ServerDescriptionPtr& newServerDescription) {
-    LOGV2_DEBUG(4333202,
-                2,
-                "install server description {description}",
-                "description"_attr = newServerDescription->toString());
-
     boost::optional<ServerDescriptionPtr> previousDescription;
     if (getType() == TopologyType::kSingle) {
         // For Single, there is always one ServerDescription in TopologyDescription.servers;
@@ -146,10 +139,10 @@ boost::optional<ServerDescriptionPtr> TopologyDescription::installServerDescript
     return previousDescription;
 }
 
-void TopologyDescription::removeServerDescription(const ServerAddress& serverAddress) {
+void TopologyDescription::removeServerDescription(const HostAndPort& HostAndPort) {
     auto it = std::find_if(
-        _servers.begin(), _servers.end(), [serverAddress](const ServerDescriptionPtr& description) {
-            return description->getAddress() == serverAddress;
+        _servers.begin(), _servers.end(), [HostAndPort](const ServerDescriptionPtr& description) {
+            return description->getAddress() == HostAndPort;
         });
     if (it != _servers.end()) {
         _servers.erase(it);
@@ -245,7 +238,7 @@ BSONObj TopologyDescription::toBSON() {
 
     BSONObjBuilder bsonServers;
     for (auto server : this->getServers()) {
-        bsonServers << server->getAddress() << server->toBson();
+        bsonServers << server->getAddress().toString() << server->toBson();
     }
     bson.append("servers", bsonServers.obj());
 

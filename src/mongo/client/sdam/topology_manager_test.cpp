@@ -26,8 +26,6 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
-
 #include "mongo/client/sdam/topology_manager.h"
 
 #include <boost/optional/optional_io.hpp>
@@ -37,8 +35,7 @@
 #include "mongo/util/system_clock_source.h"
 
 namespace mongo {
-template std::ostream& operator<<(std::ostream& os,
-                                  const std::vector<mongo::sdam::ServerAddress>& s);
+template std::ostream& operator<<(std::ostream& os, const std::vector<HostAndPort>& s);
 
 namespace sdam {
 using mongo::operator<<;
@@ -49,7 +46,7 @@ protected:
 
     static inline const auto kSetName = std::string("mySetName");
 
-    static inline const std::vector<ServerAddress> kOneServer{"foo:1234"};
+    static inline const std::vector<HostAndPort> kOneServer{HostAndPort("foo:1234")};
 
     static BSONObjBuilder okBuilder() {
         return std::move(BSONObjBuilder().append("ok", 1));

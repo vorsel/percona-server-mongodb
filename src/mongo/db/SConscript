@@ -633,6 +633,7 @@ env.Library(
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/idl/server_parameter',
         'catalog/database_holder',
+        'storage/snapshot_helper',
     ],
 )
 
@@ -986,6 +987,9 @@ env.Library(
     LIBDEPS=[
         "db_raii",
     ],
+    LIBDEPS_PRIVATE=[
+       "concurrency/write_conflict_exception",
+    ],
 )
 
 env.Library(
@@ -1191,6 +1195,7 @@ env.Library(
         's/sharding_api_d',
         'stats/serveronly_stats',
         'storage/oplog_hack',
+        'storage/snapshot_helper',
         'storage/storage_options',
         'storage/remove_saver',
         'update/update_driver',

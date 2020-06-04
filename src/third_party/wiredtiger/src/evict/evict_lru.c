@@ -1548,6 +1548,11 @@ err:
     if (dhandle_locked)
         __wt_readunlock(session, &conn->dhandle_lock);
 
+    if (incr) {
+        WT_ASSERT(session, dhandle->session_inuse > 0);
+        (void)__wt_atomic_subi32(&dhandle->session_inuse, 1);
+    }
+
     /*
      * If we didn't find any entries on a walk when we weren't interrupted, let our caller know.
      */
@@ -1906,14 +1911,8 @@ __evict_walk_tree(WT_SESSION_IMPL *session, WT_EVICT_QUEUE *queue, u_int max_ent
             continue;
         }
 
-        /*
-         * Pages that are empty or from dead trees are fast-tracked.
-         *
-         * Also evict the history store table pages without further filtering: the cache is under
-         * pressure by definition and we want to free space.
-         */
-        if (__wt_page_is_empty(page) || F_ISSET(session->dhandle, WT_DHANDLE_DEAD) ||
-          WT_IS_HS(btree))
+        /* Pages that are empty or from dead trees are fast-tracked. */
+        if (__wt_page_is_empty(page) || F_ISSET(session->dhandle, WT_DHANDLE_DEAD))
             goto fast;
 
         /*

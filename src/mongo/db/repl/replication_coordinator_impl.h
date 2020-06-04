@@ -439,6 +439,10 @@ public:
     void cleanupStableOpTimeCandidates_forTest(std::set<OpTimeAndWallTime>* candidates,
                                                OpTimeAndWallTime stableOpTime);
     std::set<OpTimeAndWallTime> getStableOpTimeCandidates_forTest();
+    void handleHeartbeatResponse_forTest(BSONObj response,
+                                         int targetIndex,
+                                         Milliseconds ping = Milliseconds(100));
+
 
     /**
      * Non-blocking version of updateTerm.
@@ -1154,7 +1158,7 @@ private:
     /**
      * Schedules a replica set config change.
      */
-    void _scheduleHeartbeatReconfig_inlock(const ReplSetConfig& newConfig);
+    void _scheduleHeartbeatReconfig(WithLock lk, const ReplSetConfig& newConfig);
 
     /**
      * Method to write a configuration transmitted via heartbeat message to stable storage.
@@ -1425,14 +1429,6 @@ private:
      * Returns a pseudorandom number no less than 0 and less than limit (which must be positive).
      */
     int64_t _nextRandomInt64_inlock(int64_t limit);
-
-    /**
-     * Runs the command using DBDirectClient and returns the response received for that command.
-     * Callers of this function should not hold any locks.
-     */
-    BSONObj _runCmdOnSelfOnAlternativeClient(OperationContext* opCtx,
-                                             const std::string& dbName,
-                                             const BSONObj& cmdObj);
 
     //
     // All member variables are labeled with one of the following codes indicating the

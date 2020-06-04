@@ -140,6 +140,30 @@ void ReplicationCoordinatorImpl::_scheduleHeartbeatToTarget_inlock(const HostAnd
         }));
 }
 
+void ReplicationCoordinatorImpl::handleHeartbeatResponse_forTest(BSONObj response,
+                                                                 int targetIndex,
+                                                                 Milliseconds ping) {
+    CallbackHandle handle;
+    RemoteCommandRequest request;
+    request.target = _rsConfig.getMemberAt(targetIndex).getHostAndPort();
+    executor::TaskExecutor::ResponseStatus status(response, ping);
+    executor::TaskExecutor::RemoteCommandCallbackArgs cbData(
+        _replExecutor.get(), handle, request, status);
+
+    {
+        stdx::unique_lock<Latch> lk(_mutex);
+
+        // Simulate preparing a heartbeat request so that the target's ping stats are initialized.
+        _topCoord->prepareHeartbeatRequestV1(
+            _replExecutor->now(), _rsConfig.getReplSetName(), request.target);
+
+        // Pretend we sent a request so that _untrackHeartbeatHandle_inlock succeeds.
+        _trackHeartbeatHandle_inlock(handle);
+    }
+
+    _handleHeartbeatResponse(cbData, targetIndex);
+}
+
 void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
     const executor::TaskExecutor::RemoteCommandCallbackArgs& cbData, int targetIndex) {
     stdx::unique_lock<Latch> lk(_mutex);
@@ -298,7 +322,7 @@ stdx::unique_lock<Latch> ReplicationCoordinatorImpl::_handleHeartbeatResponseAct
             break;
         case HeartbeatResponseAction::Reconfig:
             invariant(responseStatus.isOK());
-            _scheduleHeartbeatReconfig_inlock(responseStatus.getValue().getConfig());
+            _scheduleHeartbeatReconfig(lock, responseStatus.getValue().getConfig());
             break;
         case HeartbeatResponseAction::StepDownSelf:
             invariant(action.getPrimaryConfigIndex() == _selfIndex);
@@ -472,7 +496,8 @@ bool ReplicationCoordinatorImpl::_shouldStepDownOnReconfig(WithLock,
         !(myIndex.isOK() && newConfig.getMemberAt(myIndex.getValue()).isElectable());
 }
 
-void ReplicationCoordinatorImpl::_scheduleHeartbeatReconfig_inlock(const ReplSetConfig& newConfig) {
+void ReplicationCoordinatorImpl::_scheduleHeartbeatReconfig(WithLock lk,
+                                                            const ReplSetConfig& newConfig) {
     if (_inShutdown) {
         return;
     }
@@ -508,26 +533,28 @@ void ReplicationCoordinatorImpl::_scheduleHeartbeatReconfig_inlock(const ReplSet
                         "Aborting reconfiguration request",
                         "_rsConfigState"_attr = int(_rsConfigState));
     }
+
+    // Allow force reconfigs to proceed even if we are not a writable primary yet.
+    if (_memberState.primary() && !_readWriteAbility->canAcceptNonLocalWrites(lk) &&
+        newConfig.getConfigTerm() != OpTime::kUninitializedTerm) {
+        LOGV2_FOR_HEARTBEATS(
+            4794900,
+            1,
+            "Not scheduling a heartbeat reconfig since we are in PRIMARY state but "
+            "cannot accept writes yet.");
+        return;
+    }
+
+    // Prevent heartbeat reconfigs from running concurrently with an election.
+    if (_topCoord->getRole() == TopologyCoordinator::Role::kCandidate) {
+        LOGV2_FOR_HEARTBEATS(
+            482570, 1, "Not scheduling a heartbeat reconfig when running for election");
+        return;
+    }
+
     _setConfigState_inlock(kConfigHBReconfiguring);
     invariant(!_rsConfig.isInitialized() ||
               _rsConfig.getConfigVersionAndTerm() < newConfig.getConfigVersionAndTerm());
-    if (auto electionFinishedEvent = _cancelElectionIfNeeded_inlock()) {
-        LOGV2_FOR_HEARTBEATS(
-            4615624,
-            2,
-            "Rescheduling heartbeat reconfig to config with {newConfigVersionAndTerm} to "
-            "be processed after election is cancelled.",
-            "Rescheduling heartbeat reconfig to be processed after election is cancelled",
-            "newConfigVersionAndTerm"_attr = newConfig.getConfigVersionAndTerm());
-
-        _replExecutor
-            ->onEvent(electionFinishedEvent,
-                      [=](const executor::TaskExecutor::CallbackArgs& cbData) {
-                          _heartbeatReconfigStore(cbData, newConfig);
-                      })
-            .status_with_transitional_ignore();
-        return;
-    }
     _replExecutor
         ->scheduleWork([=](const executor::TaskExecutor::CallbackArgs& cbData) {
             _heartbeatReconfigStore(cbData, newConfig);
