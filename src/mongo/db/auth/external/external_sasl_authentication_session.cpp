@@ -51,6 +51,7 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/external/external_sasl_authentication_session.h"
+#include "mongo/db/auth/external/gssapi_server_mechanism.h"
 #include "mongo/db/auth/sasl_options.h"
 #include "mongo/db/ldap/ldap_manager.h"
 #include "mongo/db/ldap/ldap_manager_impl.h"
@@ -73,13 +74,17 @@ namespace {
         AuthorizationSession* authzSession,
         StringData db,
         StringData mechanism) {
-        if (mechanism == "PLAIN" && db == saslDefaultDBName)
-            if (!ldapGlobalParams.ldapServers->empty())
-                return new OpenLDAPAuthenticationSession(authzSession);
-            else
-                return new ExternalSaslAuthenticationSession(authzSession);
-        else
-            return createSaslBase(authzSession, db, mechanism);
+        if (db == saslDefaultDBName) {
+            if (mechanism == "PLAIN") {
+                if (!ldapGlobalParams.ldapServers->empty())
+                    return new OpenLDAPAuthenticationSession(authzSession);
+                else
+                    return new ExternalSaslAuthenticationSession(authzSession);
+            } else if (mechanism == "GSSAPI") {
+                return new GSSAPIServerSession(authzSession);
+            }
+        }
+        return createSaslBase(authzSession, db, mechanism);
     }
 
     int saslServerLog(void* context, int priority, const char* message) throw() {
