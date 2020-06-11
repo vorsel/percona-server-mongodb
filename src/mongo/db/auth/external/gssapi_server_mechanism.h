@@ -31,7 +31,7 @@ Copyright (C) 2020-present Percona and/or its affiliates. All rights reserved.
 
 #pragma once
 
-
+#include "mongo/db/auth/external/cyrus_sasl_server_session.h"
 #include "mongo/db/auth/sasl_mechanism_policies.h"
 #include "mongo/db/auth/sasl_mechanism_registry.h"
 
@@ -40,13 +40,17 @@ namespace mongo {
 class GSSAPIServerMechanism : public MakeServerMechanism<GSSAPIPolicy> {
 public:
     explicit GSSAPIServerMechanism(std::string authenticationDatabase)
-        : MakeServerMechanism<GSSAPIPolicy>(std::move(authenticationDatabase)) {}
+        : MakeServerMechanism<GSSAPIPolicy>(std::move(authenticationDatabase)),
+          _sess(mechanismName()) {}
 
     virtual ~GSSAPIServerMechanism();
 
 private:
+    CyrusSASLServerSession _sess;
+
     virtual StatusWith<std::tuple<bool, std::string>> stepImpl(OperationContext* opCtx,
                                                                StringData input) override final;
+    virtual StringData getPrincipalName() const override final;
 };
 
 class GSSAPIServerFactory : public MakeServerFactory<GSSAPIServerMechanism> {
