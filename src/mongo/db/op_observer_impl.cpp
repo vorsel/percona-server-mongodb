@@ -52,6 +52,8 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/session_catalog.h"
 #include "mongo/db/views/durable_view_catalog.h"
+#include "mongo/s/client/shard_registry.h"
+#include "mongo/s/grid.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point_service.h"
@@ -981,6 +983,14 @@ void OpObserverImpl::onReplicationRollback(OperationContext* opCtx,
     // Check if the shard identity document rolled back.
     if (rbInfo.shardIdentityRolledBack) {
         fassertFailedNoTrace(50712);
+    }
+
+    // Force the config server to update its shard registry on next access. Otherwise it may have
+    // the stale data that has been just rolled back.
+    if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+        if (auto shardRegistry = Grid::get(opCtx)->shardRegistry()) {
+            shardRegistry->clearEntries();
+        }
     }
 }
 
