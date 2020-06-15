@@ -8,7 +8,7 @@
 
 #include "wt_internal.h"
 
-static void __checkpoint_timing_stress(WT_SESSION_IMPL *);
+static void __checkpoint_timing_stress(WT_SESSION_IMPL *, bool);
 static int __checkpoint_lock_dirty_tree(WT_SESSION_IMPL *, bool, bool, bool, const char *[]);
 static int __checkpoint_mark_skip(WT_SESSION_IMPL *, WT_CKPT *, bool);
 static int __checkpoint_presync(WT_SESSION_IMPL *, const char *[]);
@@ -863,12 +863,15 @@ __txn_checkpoint(WT_SESSION_IMPL *session, const char *cfg[])
     if (full && logging)
         WT_ERR(__wt_txn_checkpoint_log(session, full, WT_TXN_LOG_CKPT_START, NULL));
 
-    __checkpoint_timing_stress(session);
+    __checkpoint_timing_stress(session, false);
     time_start_hs = __wt_clock(session);
     WT_ERR(__checkpoint_apply_to_dhandles(session, cfg, __checkpoint_tree_helper));
     time_stop_hs = __wt_clock(session);
     WT_STAT_CONN_INCRV(session, txn_checkpoint_tree_helper_time,
       (int64_t)WT_CLOCKDIFF_US(time_stop_hs, time_start_hs));
+
+    /* Wait prior to checkpointing the history store to simulate checkpoint slowness. */
+    __checkpoint_timing_stress(session, true);
 
     /*
      * Get a history store dhandle. If the history store file is opened for a special operation this
@@ -1870,7 +1873,7 @@ __wt_checkpoint_close(WT_SESSION_IMPL *session, bool final)
  *     for a checkpoint to complete.
  */
 static void
-__checkpoint_timing_stress(WT_SESSION_IMPL *session)
+__checkpoint_timing_stress(WT_SESSION_IMPL *session, bool history_store_stress)
 {
     WT_CONNECTION_IMPL *conn;
 
@@ -1881,6 +1884,9 @@ __checkpoint_timing_stress(WT_SESSION_IMPL *session)
      * the session used is either of the two sessions set aside for internal checkpoints.
      */
     if (conn->ckpt_session != session && conn->meta_ckpt_session != session &&
-      FLD_ISSET(conn->timing_stress_flags, WT_TIMING_STRESS_CHECKPOINT_SLOW))
+      ((FLD_ISSET(conn->timing_stress_flags, WT_TIMING_STRESS_CHECKPOINT_SLOW) &&
+         !history_store_stress) ||
+          (FLD_ISSET(conn->timing_stress_flags, WT_TIMING_STRESS_HS_CHECKPOINT_DELAY) &&
+            history_store_stress)))
         __wt_sleep(10, 0);
 }

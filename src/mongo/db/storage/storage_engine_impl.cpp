@@ -532,7 +532,8 @@ StatusWith<StorageEngine::ReconcileResult> StorageEngineImpl::reconcileCatalogAn
             // will return the index to be rebuilt.
             if (indexMetaData.isBackgroundSecondaryBuild && (!foundIdent || !indexMetaData.ready)) {
                 LOGV2(22255,
-                      "Expected background index build did not complete, rebuilding",
+                      "Expected background index build did not complete, rebuilding in foreground "
+                      "- see SERVER-43097",
                       "namespace"_attr = coll,
                       "index"_attr = indexName);
                 ret.indexesToRebuild.push_back({entry.catalogId, coll, indexName});
@@ -1069,7 +1070,7 @@ void StorageEngineImpl::TimestampMonitor::startup() {
                 // killed, it's fine to give up on future notifications.
                 LOGV2(22263,
                       "Timestamp monitor is stopping. {reason}",
-                      "Timestamp monitor is stopping"
+                      "Timestamp monitor is stopping",
                       "error"_attr = ex.reason());
                 return;
             }

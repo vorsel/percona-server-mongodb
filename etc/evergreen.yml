@@ -1408,7 +1408,6 @@ functions:
         set +o errexit
         PATH="$path_value"                                \
             AWS_PROFILE=${aws_profile_remote}             \
-            RSK_is_asan_build=${is_asan_build|""}         \
             ${gcov_environment}                           \
             ${lang_environment}                           \
             ${san_options}                                \
@@ -1602,6 +1601,7 @@ functions:
       params:
         target: generate_tasks_config.tgz
         source_dir: src/generated_resmoke_config
+        optional: true
         include:
           - "*"
 
@@ -2053,14 +2053,6 @@ functions:
           ${activate_virtualenv}
           $python buildscripts/evergreen_gen_multiversion_tests.py run --expansion-file expansions.yml
 
-    - command: shell.exec
-      params:
-        working_dir: src
-        script: |
-          set -o errexit
-          set -o verbose
-
-          ${activate_virtualenv}
           $python buildscripts/evergreen_gen_multiversion_tests.py generate-exclude-files --suite=${task_name} --task-path-suffix=${task_path_suffix} --is-generated-suite=true
 
     - command: archive.targz_pack
@@ -2080,9 +2072,13 @@ functions:
         permissions: public-read
         content_type: ${content_type|application/gzip}
         display_name: Generated Task Config - Execution ${execution}
+        optional: true
 
     - command: generate.tasks
       params:
+        # Optional b/c reruns of this task will produce no JSON files to avoid
+        # generate.tasks failing
+        optional: true
         files:
           - src/generated_resmoke_config/*.json
 
@@ -3409,7 +3405,7 @@ functions:
             binary_file=$(echo $core_file | sed "s/.*\///;s/dump_//;s/\..*\.core//;s/\..*\.mdmp//")
             # Locate the binary file. Since the base file name might be truncated, the find
             # may return more than 1 file.
-            binary_file_locations=$(/usr/bin/find -H . -name "$binary_file*${exe}" 2> /dev/null)
+            binary_file_locations=$(/usr/bin/find -H . -executable -name "$binary_file*${exe}" 2> /dev/null)
           fi
           if [ -z "$binary_file_locations" ]; then
             echo "Cannot locate the unittest binary file ($binary_file) that generated the core file $core_file"
@@ -3510,7 +3506,7 @@ functions:
 
         hang_analyzer_option="-o file -o stdout -p ${hang_analyzer_processes|dbtest,java,mongo,mongod,mongos,python,_test}"
 
-        if [ ${is_asan_build|false} = false ]; then
+        if [ ${hang_analyzer_dump_core|true} = true ]; then
           hang_analyzer_option="-c $hang_analyzer_option"
         fi
 
@@ -11997,7 +11993,7 @@ buildvariants:
     multiversion_platform: ubuntu1804
     multiversion_edition: enterprise
     resmoke_jobs_factor: 0.3  # Avoid starting too many mongod's under ASAN build.
-    is_asan_build: true
+    hang_analyzer_dump_core: false
     scons_cache_scope: shared
     test_flags: --excludeWithAnyTags=requires_fast_memory
   tasks:
@@ -12064,7 +12060,7 @@ buildvariants:
     multiversion_platform: ubuntu1804
     multiversion_edition: enterprise
     resmoke_jobs_factor: 0.3  # Avoid starting too many mongod's under ASAN build.
-    is_asan_build: true
+    hang_analyzer_dump_core: false
     scons_cache_scope: shared
     test_flags: --excludeWithAnyTags=requires_fast_memory
   tasks:
@@ -12154,7 +12150,7 @@ buildvariants:
     san_options: UBSAN_OPTIONS="print_stacktrace=1" LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=1
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_v3_clang.vars --dbg=on --opt=on --allocator=system --sanitize=undefined,address --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
     resmoke_jobs_factor: 0.3  # Avoid starting too many mongod's under {A,UB}SAN build.
-    is_asan_build: true
+    hang_analyzer_dump_core: false
     scons_cache_scope: shared
     max_sub_suites: 100
   tasks:
@@ -12179,7 +12175,7 @@ buildvariants:
     san_options: UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1" LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=1
     compile_flags: LINKFLAGS=-nostdlib++ LIBS=stdc++ --variables-files=etc/scons/mongodbtoolchain_v3_clang.vars --dbg=on --opt=on --allocator=system --sanitize=undefined,address,fuzzer --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
     resmoke_jobs_factor: 0.3  # Avoid starting too many mongod's under {A,UB}SAN build.
-    is_asan_build: true
+    hang_analyzer_dump_core: false
     scons_cache_scope: shared
   display_tasks:
   - *libfuzzertests

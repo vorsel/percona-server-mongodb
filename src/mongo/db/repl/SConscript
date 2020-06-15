@@ -152,12 +152,6 @@ env.Library(
     ],
 )
 
-env.Library('rslog',
-            'rslog.cpp',
-            LIBDEPS=[
-                '$BUILD_DIR/mongo/base',
-            ])
-
 env.Library(
     target='abstract_async_component',
     source=[
@@ -399,7 +393,6 @@ env.Library(
         'replication_process',
         'roll_back_local_operations',
         'rollback_impl',
-        'rslog',
         '$BUILD_DIR/mongo/db/catalog/catalog_helpers',
         '$BUILD_DIR/mongo/db/catalog/database_holder',
         '$BUILD_DIR/mongo/db/s/sharding_runtime_d',
@@ -661,7 +654,6 @@ env.Library('topology_coordinator',
                 'member_data',
                 'replica_set_messages',
                 'repl_settings',
-                'rslog',
                 'repl_coordinator_interface',
             ],
             LIBDEPS_PRIVATE=[
@@ -702,7 +694,6 @@ env.Library(
         'replica_set_messages',
         'replication_process',
         'reporter',
-        'rslog',
         'scatter_gather',
         'topology_coordinator',
     ],
@@ -1089,6 +1080,7 @@ env.Library(
     LIBDEPS_PRIVATE=[
         'repl_server_parameters',
         '$BUILD_DIR/mongo/db/commands/feature_compatibility_parsers',
+        '$BUILD_DIR/mongo/db/index_builds_coordinator_interface',
     ]
 )
 
@@ -1269,6 +1261,7 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/db/commands/mongod_fcv',
         '$BUILD_DIR/mongo/db/commands/txn_cmd_request',
         '$BUILD_DIR/mongo/db/dbdirectclient',
+        '$BUILD_DIR/mongo/db/index_builds_coordinator_mongod',
         '$BUILD_DIR/mongo/db/index/index_access_methods',
         '$BUILD_DIR/mongo/db/logical_session_id_helpers',
         '$BUILD_DIR/mongo/db/logical_time',
