@@ -327,7 +327,7 @@ install_deps() {
         yum -y install scons make rpm-build rpmbuild percona-devtoolset-gcc percona-devtoolset-binutils 
         yum -y install percona-devtoolset-gcc-c++ percona-devtoolset-libstdc++-devel percona-devtoolset-valgrind-devel
         yum -y install python27 python27-devel rpmlint libcurl-devel e2fsprogs-devel expat-devel lz4-devel git cmake3
-        yum -y install openldap-devel
+        yum -y install openldap-devel krb5-devel
         wget https://bootstrap.pypa.io/get-pip.py
         python2.7 get-pip.py
         rm -rf /usr/bin/python2
@@ -345,7 +345,7 @@ install_deps() {
         yum -y install cyrus-sasl-devel snappy-devel zlib-devel bzip2-devel scons rpmlint
         #yum -y install rpm-build git python-pip python-devel libopcodes libcurl-devel rpmlint e2fsprogs-devel expat-devel lz4-devel
         yum -y install rpm-build git python python-devel libopcodes libcurl-devel rpmlint e2fsprogs-devel expat-devel lz4-devel
-        yum -y install openldap-devel
+        yum -y install openldap-devel krb5-devel
         wget https://bootstrap.pypa.io/get-pip.py
         python get-pip.py
       else
@@ -353,7 +353,7 @@ install_deps() {
         yum -y install cmake cyrus-sasl-devel make openssl-devel zlib-devel libcurl-devel git
         yum -y install python2-scons python2-pip python36-devel
         yum -y install redhat-rpm-config python2-devel e2fsprogs-devel expat-devel lz4-devel
-        yum -y install openldap-devel
+        yum -y install openldap-devel krb5-devel
       fi
       if [ "x${RHEL}" == "x8" ]; then
         /usr/bin/pip3.6 install --user typing pyyaml regex Cheetah3
@@ -380,7 +380,7 @@ EOL
       else
           INSTALL_LIST="${INSTALL_LIST} python python-dev "
       fi
-      INSTALL_LIST="${INSTALL_LIST} libssl-dev libcurl4-openssl-dev libldap2-dev"
+      INSTALL_LIST="${INSTALL_LIST} libssl-dev libcurl4-openssl-dev libldap2-dev libkrb5-dev"
       until apt-get -y install dirmngr; do
         sleep 1
         echo "waiting"
@@ -403,7 +403,7 @@ EOL
       fi
     fi
     if [ x"${DEBIAN}" = "xstretch" ]; then
-      LIBCURL_DEPS="libidn2-0-dev libkrb5-dev libldap2-dev libnghttp2-dev libnss3-dev libpsl-dev librtmp-dev libssh2-1-dev libssl1.0-dev"
+      LIBCURL_DEPS="libidn2-0-dev libldap2-dev libnghttp2-dev libnss3-dev libpsl-dev librtmp-dev libssh2-1-dev libssl1.0-dev"
       until DEBIAN_FRONTEND=noninteractive apt-get -y install ${LIBCURL_DEPS}; do
         sleep 1
         echo "waiting"
@@ -898,3 +898,4 @@ build_srpm
 build_source_deb
 build_rpm
 build_deb
+
