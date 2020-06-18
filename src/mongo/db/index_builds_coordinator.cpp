@@ -763,7 +763,7 @@ void IndexBuildsCoordinator::applyCommitIndexBuild(OperationContext* opCtx,
 
     auto fut = replState->sharedPromise.getFuture();
     LOGV2(20654,
-          "Index build joined after commit",
+          "Index build: joined after commit",
           "buildUUID"_attr = buildUUID,
           "result"_attr = fut.waitNoThrow(opCtx));
 
@@ -943,16 +943,18 @@ IndexBuildsCoordinator::TryAbortResult IndexBuildsCoordinator::_tryAbort(
             IndexBuildState::kAborted, skipCheck, abortTimestamp, reason);
 
         // Interrupt the builder thread so that it can no longer acquire locks or make progress.
+        // It is possible that the index build thread may have completed its operation and removed
+        // itself from the ServiceContext. This may happen in the case of an explicit db.killOp()
+        // operation or during shutdown.
+        // During normal operation, the abort logic, initiated through external means such as
+        // dropIndexes or internally through an indexing error, should have set the state in
+        // ReplIndexBuildState so that this code would not be reachable as it is no longer necessary
+        // to interrupt the builder thread here.
         auto serviceContext = opCtx->getServiceContext();
-        auto target = serviceContext->getLockedClient(replState->opId);
-        if (!target) {
-            LOGV2_FATAL(4656001,
-                        "Index builder thread did not appear to be running while aborting",
-                        "buildUUID"_attr = replState->buildUUID,
-                        "opId"_attr = replState->opId);
+        if (auto target = serviceContext->getLockedClient(replState->opId)) {
+            auto targetOpCtx = target->getOperationContext();
+            serviceContext->killOperation(target, targetOpCtx, ErrorCodes::IndexBuildAborted);
         }
-        serviceContext->killOperation(
-            target, target->getOperationContext(), ErrorCodes::IndexBuildAborted);
 
         // Set the signal. Because we have already interrupted the index build, it will not observe
         // this signal. We do this so that other observers do not also try to abort the index build.
@@ -1600,7 +1602,10 @@ void IndexBuildsCoordinator::_unregisterIndexBuild(
 
     invariant(_allIndexBuilds.erase(replIndexBuildState->buildUUID));
 
-    LOGV2(4656004, "Unregistering index build", "buildUUID"_attr = replIndexBuildState->buildUUID);
+    LOGV2_DEBUG(4656004,
+                1,
+                "Index build: Unregistering",
+                "buildUUID"_attr = replIndexBuildState->buildUUID);
     _indexBuildsManager.unregisterIndexBuild(replIndexBuildState->buildUUID);
     _indexBuildsCondVar.notify_all();
 }
@@ -2108,6 +2113,10 @@ void IndexBuildsCoordinator::_buildIndex(OperationContext* opCtx,
     _waitForNextIndexBuildActionAndCommit(opCtx, replState, indexBuildOptions);
 }
 
+/*
+ * First phase is doing a collection scan and inserting keys into sorter.
+ * Second phase is extracting the sorted keys and writing them into the new index table.
+ */
 void IndexBuildsCoordinator::_scanCollectionAndInsertKeysIntoSorter(
     OperationContext* opCtx, std::shared_ptr<ReplIndexBuildState> replState) {
     // Collection scan and insert into index.
@@ -2146,8 +2155,8 @@ void IndexBuildsCoordinator::_scanCollectionAndInsertKeysIntoSorter(
     }
 }
 
-/**
- * Second phase is extracting the sorted keys and writing them into the new index table.
+/*
+ * Third phase is catching up on all the writes that occurred during the first two phases.
  */
 void IndexBuildsCoordinator::_insertKeysFromSideTablesWithoutBlockingWrites(
     OperationContext* opCtx, std::shared_ptr<ReplIndexBuildState> replState) {
@@ -2197,7 +2206,7 @@ void IndexBuildsCoordinator::_insertKeysFromSideTablesBlockingWrites(
 }
 
 /**
- * Third phase is catching up on all the writes that occurred during the first two phases.
+ * Continue the third phase of catching up on all remaining writes that occurred and then commit.
  * Accepts a commit timestamp for the index (null if not available).
  */
 IndexBuildsCoordinator::CommitResult IndexBuildsCoordinator::_insertKeysFromSideTablesAndCommit(
@@ -2263,8 +2272,8 @@ IndexBuildsCoordinator::CommitResult IndexBuildsCoordinator::_insertKeysFromSide
                             << replState->buildUUID
                             << ", collection UUID: " << replState->collectionUUID);
 
-    // Perform the third and final drain after releasing a shared lock and reacquiring an
-    // exclusive lock on the database.
+    // Perform the third and final drain after releasing a shared lock and reacquiring an exclusive
+    // lock on the collection.
     uassertStatusOK(_indexBuildsManager.drainBackgroundWrites(
         opCtx,
         replState->buildUUID,
@@ -2386,7 +2395,7 @@ IndexBuildsCoordinator::CommitResult IndexBuildsCoordinator::_insertKeysFromSide
     removeIndexBuildEntryAfterCommitOrAbort(opCtx, dbAndUUID, *replState);
     replState->stats.numIndexesAfter = getNumIndexesTotal(opCtx, collection);
     LOGV2(20663,
-          "Index build completed successfully",
+          "Index build: completed successfully",
           "buildUUID"_attr = replState->buildUUID,
           "namespace"_attr = collection->ns(),
           "uuid"_attr = replState->collectionUUID,
