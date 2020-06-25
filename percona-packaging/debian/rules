@@ -21,14 +21,14 @@ override_dh_auto_clean:
 	dh_auto_clean
 	rm -fr $(PSMSRC)/bin
 	#rm -fr $(INSTALLDIR)
-	buildscripts/scons.py CC=$(CC) CXX=$(CXX) -C $(PSMSRC) -c --disable-warnings-as-errors --audit --release --ssl --opt -j$(NJOBS) --use-sasl-client CPPPATH=$(INSTALLDIR)/include \
+	buildscripts/scons.py CC=$(CC) CXX=$(CXX) -C $(PSMSRC) -c --install-mode=legacy --disable-warnings-as-errors --audit --release --ssl --opt -j$(NJOBS) --use-sasl-client CPPPATH=$(INSTALLDIR)/include \
 	LIBPATH=$(INSTALLDIR)/lib LINKFLAGS="$(LINKFLAGS)" --wiredtiger --inmemory --hotbackup $(PSM_TARGETS) || exit $?
 	rm -fr build
 	find $(PSMSRC) -name '*.pyc' -delete
 
 # Finally PSfMDB
 percona-server-mongodb:
-	buildscripts/scons.py CC=${CC} CXX=${CXX} --disable-warnings-as-errors --audit --release --ssl --opt=on -j$(NJOBS) \
+	buildscripts/scons.py CC=${CC} CXX=${CXX} --install-mode=legacy --disable-warnings-as-errors --audit --release --ssl --opt=on -j$(NJOBS) \
 	--use-sasl-client --wiredtiger --inmemory --hotbackup \
 	CPPPATH=${INSTALLDIR}/include LIBPATH=${INSTALLDIR}/lib LINKFLAGS="${LINKFLAGS}" ${PSM_TARGETS} || exit $?
 
