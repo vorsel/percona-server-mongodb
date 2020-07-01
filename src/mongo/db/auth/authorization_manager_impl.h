@@ -121,6 +121,11 @@ public:
     std::vector<CachedUserInfo> getUserCacheInfo() const override;
 
 private:
+    /**
+     * ldap user cache invalidator class
+     */
+    class LDAPUserCacheInvalidator;
+
     void _updateCacheGeneration();
 
     void _pinnedUsersThreadRoutine() noexcept;
@@ -198,6 +203,12 @@ private:
     stdx::condition_variable _pinnedUsersCond;
     std::once_flag _pinnedThreadTrackerStarted;
     boost::optional<std::vector<UserName>> _usersToPin;
+
+    /**
+     * LDAP user cache invalidator instance
+     * Not null only if LDAP authorization configured
+     */
+    std::unique_ptr<LDAPUserCacheInvalidator> _ldapUserCacheInvalidator;
 };
 
 extern int authorizationManagerCacheSize;
