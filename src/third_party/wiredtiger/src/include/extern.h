@@ -462,6 +462,8 @@ extern int __wt_conn_statistics_config(WT_SESSION_IMPL *session, const char *cfg
   WT_GCC_FUNC_DECL_ATTRIBUTE((warn_unused_result));
 extern int __wt_connection_close(WT_CONNECTION_IMPL *conn)
   WT_GCC_FUNC_DECL_ATTRIBUTE((warn_unused_result));
+extern int __wt_connection_hash_arrays_init(WT_CONNECTION_IMPL *conn)
+  WT_GCC_FUNC_DECL_ATTRIBUTE((warn_unused_result));
 extern int __wt_connection_init(WT_CONNECTION_IMPL *conn)
   WT_GCC_FUNC_DECL_ATTRIBUTE((warn_unused_result));
 extern int __wt_connection_open(WT_CONNECTION_IMPL *conn, const char *cfg[])
