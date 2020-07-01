@@ -1022,6 +1022,7 @@ static const char *const __stats_connection_desc[] = {
   "reconciliation: records written including a stop transaction ID",
   "reconciliation: split bytes currently awaiting free",
   "reconciliation: split objects currently awaiting free", "session: open session count",
+  "session: session cursor cache size", "session: session dhandle hash size",
   "session: session query timestamp calls", "session: table alter failed calls",
   "session: table alter successful calls", "session: table alter unchanged and skipped",
   "session: table compact failed calls", "session: table compact successful calls",
@@ -1506,6 +1507,8 @@ __wt_stat_connection_clear_single(WT_CONNECTION_STATS *stats)
     /* not clearing rec_split_stashed_bytes */
     /* not clearing rec_split_stashed_objects */
     /* not clearing session_open */
+    /* not clearing session_cursor_cache_size */
+    /* not clearing session_dhhash_size */
     stats->session_query_ts = 0;
     /* not clearing session_table_alter_fail */
     /* not clearing session_table_alter_success */
@@ -2017,6 +2020,8 @@ __wt_stat_connection_aggregate(WT_CONNECTION_STATS **from, WT_CONNECTION_STATS *
     to->rec_split_stashed_bytes += WT_STAT_READ(from, rec_split_stashed_bytes);
     to->rec_split_stashed_objects += WT_STAT_READ(from, rec_split_stashed_objects);
     to->session_open += WT_STAT_READ(from, session_open);
+    to->session_cursor_cache_size += WT_STAT_READ(from, session_cursor_cache_size);
+    to->session_dhhash_size += WT_STAT_READ(from, session_dhhash_size);
     to->session_query_ts += WT_STAT_READ(from, session_query_ts);
     to->session_table_alter_fail += WT_STAT_READ(from, session_table_alter_fail);
     to->session_table_alter_success += WT_STAT_READ(from, session_table_alter_success);
