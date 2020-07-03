@@ -843,6 +843,9 @@ static const char *const __stats_connection_desc[] = {
   "cache: history store score", "cache: history store table insert calls",
   "cache: history store table insert calls that returned restart",
   "cache: history store table max on-disk size", "cache: history store table on-disk size",
+  "cache: history store table out-of-order resolved updates that lose their durable timestamp",
+  "cache: history store table out-of-order updates that were fixed up by moving existing records",
+  "cache: history store table out-of-order updates that were fixed up during insertion",
   "cache: history store table reads", "cache: history store table reads missed",
   "cache: history store table reads requiring squashed modifies",
   "cache: history store table remove calls due to key truncation",
@@ -884,6 +887,7 @@ static const char *const __stats_connection_desc[] = {
   "capacity: time waiting during eviction (usecs)", "capacity: time waiting during logging (usecs)",
   "capacity: time waiting during read (usecs)", "connection: auto adjusting condition resets",
   "connection: auto adjusting condition wait calls",
+  "connection: auto adjusting condition wait raced to update timeout and skipped updating",
   "connection: detected system time went backwards", "connection: files currently open",
   "connection: memory allocations", "connection: memory frees", "connection: memory re-allocations",
   "connection: pthread mutex condition wait calls",
@@ -901,6 +905,9 @@ static const char *const __stats_connection_desc[] = {
   "cursor: cursor next calls that skip greater than or equal to 100 entries",
   "cursor: cursor next calls that skip less than 100 entries", "cursor: cursor operation restarted",
   "cursor: cursor prev calls",
+  "cursor: cursor prev calls that skip due to a globally visible history store tombstone",
+  "cursor: cursor prev calls that skip due to a globally visible history store tombstone in "
+  "rollback to stable",
   "cursor: cursor prev calls that skip greater than or equal to 100 entries",
   "cursor: cursor prev calls that skip less than 100 entries", "cursor: cursor remove calls",
   "cursor: cursor remove key bytes removed", "cursor: cursor reserve calls",
@@ -1255,6 +1262,9 @@ __wt_stat_connection_clear_single(WT_CONNECTION_STATS *stats)
     stats->cache_hs_insert_restart = 0;
     /* not clearing cache_hs_ondisk_max */
     /* not clearing cache_hs_ondisk */
+    stats->cache_hs_order_lose_durable_timestamp = 0;
+    stats->cache_hs_order_fixup_move = 0;
+    stats->cache_hs_order_fixup_insert = 0;
     stats->cache_hs_read = 0;
     stats->cache_hs_read_miss = 0;
     stats->cache_hs_read_squash = 0;
@@ -1317,6 +1327,7 @@ __wt_stat_connection_clear_single(WT_CONNECTION_STATS *stats)
     stats->capacity_time_read = 0;
     stats->cond_auto_wait_reset = 0;
     stats->cond_auto_wait = 0;
+    stats->cond_auto_wait_skipped = 0;
     stats->time_travel = 0;
     /* not clearing file_open */
     stats->memory_allocation = 0;
@@ -1345,6 +1356,8 @@ __wt_stat_connection_clear_single(WT_CONNECTION_STATS *stats)
     stats->cursor_next_skip_lt_100 = 0;
     stats->cursor_restart = 0;
     stats->cursor_prev = 0;
+    stats->cursor_prev_hs_tombstone = 0;
+    stats->cursor_prev_hs_tombstone_rts = 0;
     stats->cursor_prev_skip_ge_100 = 0;
     stats->cursor_prev_skip_lt_100 = 0;
     stats->cursor_remove = 0;
@@ -1750,6 +1763,10 @@ __wt_stat_connection_aggregate(WT_CONNECTION_STATS **from, WT_CONNECTION_STATS *
     to->cache_hs_insert_restart += WT_STAT_READ(from, cache_hs_insert_restart);
     to->cache_hs_ondisk_max += WT_STAT_READ(from, cache_hs_ondisk_max);
     to->cache_hs_ondisk += WT_STAT_READ(from, cache_hs_ondisk);
+    to->cache_hs_order_lose_durable_timestamp +=
+      WT_STAT_READ(from, cache_hs_order_lose_durable_timestamp);
+    to->cache_hs_order_fixup_move += WT_STAT_READ(from, cache_hs_order_fixup_move);
+    to->cache_hs_order_fixup_insert += WT_STAT_READ(from, cache_hs_order_fixup_insert);
     to->cache_hs_read += WT_STAT_READ(from, cache_hs_read);
     to->cache_hs_read_miss += WT_STAT_READ(from, cache_hs_read_miss);
     to->cache_hs_read_squash += WT_STAT_READ(from, cache_hs_read_squash);
@@ -1822,6 +1839,7 @@ __wt_stat_connection_aggregate(WT_CONNECTION_STATS **from, WT_CONNECTION_STATS *
     to->capacity_time_read += WT_STAT_READ(from, capacity_time_read);
     to->cond_auto_wait_reset += WT_STAT_READ(from, cond_auto_wait_reset);
     to->cond_auto_wait += WT_STAT_READ(from, cond_auto_wait);
+    to->cond_auto_wait_skipped += WT_STAT_READ(from, cond_auto_wait_skipped);
     to->time_travel += WT_STAT_READ(from, time_travel);
     to->file_open += WT_STAT_READ(from, file_open);
     to->memory_allocation += WT_STAT_READ(from, memory_allocation);
@@ -1850,6 +1868,8 @@ __wt_stat_connection_aggregate(WT_CONNECTION_STATS **from, WT_CONNECTION_STATS *
     to->cursor_next_skip_lt_100 += WT_STAT_READ(from, cursor_next_skip_lt_100);
     to->cursor_restart += WT_STAT_READ(from, cursor_restart);
     to->cursor_prev += WT_STAT_READ(from, cursor_prev);
+    to->cursor_prev_hs_tombstone += WT_STAT_READ(from, cursor_prev_hs_tombstone);
+    to->cursor_prev_hs_tombstone_rts += WT_STAT_READ(from, cursor_prev_hs_tombstone_rts);
     to->cursor_prev_skip_ge_100 += WT_STAT_READ(from, cursor_prev_skip_ge_100);
     to->cursor_prev_skip_lt_100 += WT_STAT_READ(from, cursor_prev_skip_lt_100);
     to->cursor_remove += WT_STAT_READ(from, cursor_remove);

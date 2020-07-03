@@ -405,6 +405,9 @@ struct __wt_connection_stats {
     int64_t cache_hs_insert_restart;
     int64_t cache_hs_ondisk_max;
     int64_t cache_hs_ondisk;
+    int64_t cache_hs_order_lose_durable_timestamp;
+    int64_t cache_hs_order_fixup_move;
+    int64_t cache_hs_order_fixup_insert;
     int64_t cache_hs_read;
     int64_t cache_hs_read_miss;
     int64_t cache_hs_read_squash;
@@ -467,6 +470,7 @@ struct __wt_connection_stats {
     int64_t capacity_time_read;
     int64_t cond_auto_wait_reset;
     int64_t cond_auto_wait;
+    int64_t cond_auto_wait_skipped;
     int64_t time_travel;
     int64_t file_open;
     int64_t memory_allocation;
@@ -495,6 +499,8 @@ struct __wt_connection_stats {
     int64_t cursor_next_skip_lt_100;
     int64_t cursor_restart;
     int64_t cursor_prev;
+    int64_t cursor_prev_hs_tombstone;
+    int64_t cursor_prev_hs_tombstone_rts;
     int64_t cursor_prev_skip_ge_100;
     int64_t cursor_prev_skip_lt_100;
     int64_t cursor_remove;

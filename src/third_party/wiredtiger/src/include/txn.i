@@ -504,8 +504,8 @@ __wt_txn_pinned_timestamp(WT_SESSION_IMPL *session, wt_timestamp_t *pinned_tsp)
      * If there is no active checkpoint or this handle is up to date with the active checkpoint then
      * it's safe to ignore the checkpoint ID in the visibility check.
      */
-    include_checkpoint_txn = btree == NULL ||
-      (!WT_IS_HS(btree) && btree->checkpoint_gen != __wt_gen(session, WT_GEN_CHECKPOINT));
+    include_checkpoint_txn =
+      btree == NULL || (btree->checkpoint_gen != __wt_gen(session, WT_GEN_CHECKPOINT));
     if (!include_checkpoint_txn)
         return;
 
@@ -664,19 +664,16 @@ __txn_visible_id(WT_SESSION_IMPL *session, uint64_t id)
     if (id == WT_TXN_ABORTED)
         return (false);
 
+    /* Transactions see their own changes. */
+    if (id == txn->id)
+        return (true);
+
     /* Read-uncommitted transactions see all other changes. */
     if (txn->isolation == WT_ISO_READ_UNCOMMITTED)
         return (true);
 
-    /*
-     * If we don't have a transactional snapshot, only make stable updates visible.
-     */
-    if (!F_ISSET(txn, WT_TXN_HAS_SNAPSHOT))
-        return (__txn_visible_all_id(session, id));
-
-    /* Transactions see their own changes. */
-    if (id == txn->id)
-        return (true);
+    /* Otherwise, we should be called with a snapshot. */
+    WT_ASSERT(session, F_ISSET(txn, WT_TXN_HAS_SNAPSHOT) || session->dhandle->checkpoint != NULL);
 
     /*
      * WT_ISO_SNAPSHOT, WT_ISO_READ_COMMITTED: the ID is visible if it is not the result of a
