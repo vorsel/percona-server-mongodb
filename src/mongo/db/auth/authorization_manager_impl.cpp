@@ -350,6 +350,7 @@ public:
     }
 
     virtual void run() override {
+        ThreadClient tc(name(), getGlobalServiceContext());
         LOGV2_DEBUG(29057, 1, "starting thread", "name"_attr = name());
         stdx::unique_lock<Latch> lock(_mutex);
 
@@ -401,10 +402,6 @@ AuthorizationManagerImpl::AuthorizationManagerImpl(
           return options;
       }()) {
     _threadPool.startup();
-    if (!ldapGlobalParams.ldapServers->empty()) {
-        _ldapUserCacheInvalidator = std::make_unique<LDAPUserCacheInvalidator>(this);
-        _ldapUserCacheInvalidator->go();
-    }
 }
 
 AuthorizationManagerImpl::~AuthorizationManagerImpl() {
@@ -681,6 +678,10 @@ Status AuthorizationManagerImpl::initialize(OperationContext* opCtx) {
 
     authorizationManagerPinnedUsers.setAuthzManager(this);
     invalidateUserCache(opCtx);
+    if (!ldapGlobalParams.ldapServers->empty()) {
+        _ldapUserCacheInvalidator = std::make_unique<LDAPUserCacheInvalidator>(this);
+        _ldapUserCacheInvalidator->go();
+    }
     return Status::OK();
 }
 
