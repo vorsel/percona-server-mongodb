@@ -1045,9 +1045,10 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
         // the normal path without the journal.
         if (boost::filesystem::exists(journalPath)) {
             string config = ss.str();
-            LOGV2(22313, "Detected WT journal files.  Running recovery from last checkpoint.");
-            LOGV2(
-                22314, "journal to nojournal transition config: {config}", "config"_attr = config);
+            LOGV2(22313,
+                  "Detected WT journal files. Running recovery from last checkpoint. journal to "
+                  "nojournal transition config",
+                  "config"_attr = config);
             int ret = wiredtiger_open(
                 path.c_str(), _eventHandler.getWtEventHandler(), config.c_str(), &_conn);
             if (ret == EINVAL) {
@@ -1073,7 +1074,7 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
     }
 
     string config = ss.str();
-    LOGV2(22315, "wiredtiger_open config: {config}", "config"_attr = config);
+    LOGV2(22315, "wiredtiger_open config", "config"_attr = config);
     _openWiredTiger(path, config);
     _eventHandler.setStartupSuccessful();
     _wtOpenConfig = config;
@@ -1087,7 +1088,7 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
         _recoveryTimestamp = Timestamp(tmp);
         LOGV2_FOR_RECOVERY(23987,
                            0,
-                           "WiredTiger recoveryTimestamp. Ts: {recoveryTimestamp}",
+                           "WiredTiger recoveryTimestamp",
                            "recoveryTimestamp"_attr = _recoveryTimestamp);
     }
 

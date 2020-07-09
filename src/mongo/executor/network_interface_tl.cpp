@@ -36,6 +36,7 @@
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/server_options.h"
 #include "mongo/executor/connection_pool_tl.h"
+#include "mongo/executor/hedging_metrics.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/transport/transport_layer_manager.h"
@@ -548,7 +549,11 @@ std::shared_ptr<NetworkInterfaceTL::RequestState>
 NetworkInterfaceTL::RequestManager::getNextRequest() {
     stdx::lock_guard<Latch> lk(mutex);
     if (sentIdx.load() < requests.size()) {
-        return requests[sentIdx.fetchAndAdd(1)].lock();
+        auto req = requests[sentIdx.fetchAndAdd(1)].lock();
+        if (sentIdx.load() > 1) {
+            req->isHedge = true;
+        }
+        return req;
     } else {
         return nullptr;
     }
@@ -614,7 +619,10 @@ void NetworkInterfaceTL::RequestManager::trySend(
     auto req = getNextRequest();
     if (req) {
         RemoteCommandRequest remoteReq({cmdStatePtr->requestOnAny, idx});
-        if (sentIdx.load() > 1) {  // this is a hedged read
+        if (remoteReq.hedgeOptions) {
+            req->hasHedgeOptions = true;
+        }
+        if (req->isHedge) {  // this is a hedged read
             invariant(remoteReq.hedgeOptions);
             auto maxTimeMS = remoteReq.hedgeOptions->maxTimeMSForHedgedReads;
             if (remoteReq.timeout == remoteReq.kNoTimeout ||
@@ -635,6 +643,14 @@ void NetworkInterfaceTL::RequestManager::trySend(
                     "maxTimeMS"_attr = maxTimeMS,
                     "request_id"_attr = cmdStatePtr->requestOnAny.id,
                     "idx"_attr = idx);
+            }
+        }
+        if (cmdStatePtr->interface->_svcCtx && remoteReq.hedgeOptions) {
+            auto hm = HedgingMetrics::get(cmdStatePtr->interface->_svcCtx);
+            invariant(hm);
+            hm->incrementNumTotalOperations();
+            if (req->isHedge) {
+                hm->incrementNumTotalHedgedOperations();
             }
         }
         req->send(std::move(swConn), remoteReq);
@@ -674,6 +690,8 @@ void NetworkInterfaceTL::RequestState::resolve(Future<RemoteCommandResponse> fut
     auto& reactor = interface()->_reactor;
     auto& baton = cmdState->baton;
 
+    isSent = true;
+
     // Convert the RemoteCommandResponse to a RemoteCommandOnAnyResponse and wrap any error
     auto anyFuture =
         std::move(future)
@@ -694,8 +712,23 @@ void NetworkInterfaceTL::RequestState::resolve(Future<RemoteCommandResponse> fut
             .onCompletion([ this, anchor = shared_from_this() ](auto swr) noexcept {
                 auto response = uassertStatusOK(swr);
                 auto status = swr.getValue().status;
-                if (cmdState->finishLine.arriveStrongly()) {
-                    cmdState->fulfillFinalPromise(std::move(response));
+                auto commandStatus = getStatusFromCommandResult(response.data);
+                // ignore MaxTimeMS expiration errors for  hedged reads
+                if (hasHedgeOptions && isHedge && commandStatus == ErrorCodes::MaxTimeMSExpired) {
+                    LOGV2_DEBUG(4660700,
+                                2,
+                                "Hedged request {request_id} returned status {status}",
+                                "request_id"_attr = request.get().id,
+                                "status"_attr = commandStatus);
+                } else {
+                    if (cmdState->finishLine.arriveStrongly()) {
+                        if (hasHedgeOptions && isHedge) {
+                            auto hm = HedgingMetrics::get(cmdState->interface->_svcCtx);
+                            invariant(hm);
+                            hm->incrementNumAdvantageouslyHedgedOperations();
+                        }
+                        cmdState->fulfillFinalPromise(std::move(response));
+                    }
                 }
 
                 return status;
@@ -710,12 +743,26 @@ void NetworkInterfaceTL::RequestState::resolve(Future<RemoteCommandResponse> fut
             [ this, anchor = shared_from_this() ](auto swr) noexcept {
                 auto response = uassertStatusOK(swr);
                 auto status = response.status;
+                auto commandStatus = getStatusFromCommandResult(response.data);
                 ON_BLOCK_EXIT([&] { returnConnection(status); });
                 if (!cmdState->finishLine.arriveStrongly()) {
                     return;
                 }
-
-                cmdState->fulfillFinalPromise(std::move(response));
+                // ignore MaxTimeMS expiration errors for  hedged reads
+                if (hasHedgeOptions && isHedge && commandStatus == ErrorCodes::MaxTimeMSExpired) {
+                    LOGV2_DEBUG(4660701,
+                                2,
+                                "Hedged request {request_id} returned status {status}",
+                                "request_id"_attr = request.get().id,
+                                "status"_attr = commandStatus);
+                } else {
+                    if (hasHedgeOptions && isHedge) {
+                        auto hm = HedgingMetrics::get(cmdState->interface->_svcCtx);
+                        invariant(hm);
+                        hm->incrementNumAdvantageouslyHedgedOperations();
+                    }
+                    cmdState->fulfillFinalPromise(std::move(response));
+                }
             });
     }
 }

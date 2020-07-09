@@ -132,7 +132,12 @@ BaseCloner::AfterStageBehavior CollectionCloner::CollectionClonerStage::run() {
 }
 
 BaseCloner::AfterStageBehavior CollectionCloner::countStage() {
-    auto count = getClient()->count(_sourceDbAndUuid, {} /* Query */, QueryOption_SlaveOk);
+    auto count = getClient()->count(_sourceDbAndUuid,
+                                    {} /* Query */,
+                                    QueryOption_SlaveOk,
+                                    0 /* limit */,
+                                    0 /* skip */,
+                                    ReadConcernArgs::kImplicitDefault);
 
     // The count command may return a negative value after an unclean shutdown,
     // so we set it to zero here to avoid aborting the collection clone.
@@ -192,8 +197,6 @@ BaseCloner::AfterStageBehavior CollectionCloner::createCollectionStage() {
 }
 
 BaseCloner::AfterStageBehavior CollectionCloner::queryStage() {
-    // Attempt to clean up cursor from the last retry (if applicable).
-    killOldQueryCursor();
     runQuery();
     waitForDatabaseWorkToComplete();
     // We want to free the _collLoader regardless of whether the commit succeeds.
@@ -233,7 +236,8 @@ void CollectionCloner::runQuery() {
                            nullptr /* fieldsToReturn */,
                            QueryOption_NoCursorTimeout | QueryOption_SlaveOk |
                                (collectionClonerUsesExhaust ? QueryOption_Exhaust : 0),
-                           _collectionClonerBatchSize);
+                           _collectionClonerBatchSize,
+                           ReadConcernArgs::kImplicitDefault);
     } catch (...) {
         auto status = exceptionToStatus();
 
@@ -387,32 +391,6 @@ bool CollectionCloner::isMyFailPoint(const BSONObj& data) const {
 
 void CollectionCloner::waitForDatabaseWorkToComplete() {
     _dbWorkTaskRunner.join();
-}
-
-void CollectionCloner::killOldQueryCursor() {
-    // No cursor stored. Do nothing.
-    if (_remoteCursorId == -1) {
-        return;
-    }
-
-    BSONObj infoObj;
-    auto nss = _sourceNss;
-    auto id = _remoteCursorId;
-
-    auto cmdObj = BSON("killCursors" << nss.coll() << "cursors" << BSON_ARRAY(id));
-    LOGV2_DEBUG(21139, 1, "Attempting to kill old remote cursor with id: {id}", "id"_attr = id);
-    try {
-        getClient()->runCommand(nss.db().toString(), cmdObj, infoObj);
-    } catch (...) {
-        LOGV2(21140, "Error while trying to kill remote cursor after transient query error");
-    }
-
-    // Clear the stored cursorId on success.
-    _remoteCursorId = -1;
-}
-
-void CollectionCloner::forgetOldQueryCursor() {
-    _remoteCursorId = -1;
 }
 
 // Throws.

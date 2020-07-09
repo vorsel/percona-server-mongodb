@@ -27,54 +27,19 @@
  *    it in the license file.
  */
 
-#include "mongo/s/client/hedging_metrics.h"
+#pragma once
 
-namespace mongo {
-
-namespace {
-const auto HedgingMetricsDecoration = ServiceContext::declareDecoration<HedgingMetrics>();
-}  // namespace
-
-HedgingMetrics* HedgingMetrics::get(ServiceContext* service) {
-    return &HedgingMetricsDecoration(service);
-}
-
-HedgingMetrics* HedgingMetrics::get(OperationContext* opCtx) {
-    return get(opCtx->getServiceContext());
-}
-
-long long HedgingMetrics::getNumTotalOperations() const {
-    return _numTotalOperations.load();
-}
-
-void HedgingMetrics::incrementNumTotalOperations() {
-    _numTotalOperations.fetchAndAdd(1);
-}
-
-long long HedgingMetrics::getNumTotalHedgedOperations() const {
-    return _numTotalHedgedOperations.load();
-}
-
-void HedgingMetrics::incrementNumTotalHedgedOperations() {
-    _numTotalHedgedOperations.fetchAndAdd(1);
-}
-
-long long HedgingMetrics::getNumAdvantageouslyHedgedOperations() const {
-    return _numAdvantageouslyHedgedOperations.load();
-}
-
-void HedgingMetrics::incrementNumAdvantageouslyHedgedOperations() {
-    _numAdvantageouslyHedgedOperations.fetchAndAdd(1);
-}
-
-BSONObj HedgingMetrics::toBSON() const {
-    BSONObjBuilder builder;
-
-    builder.append("numTotalOperations", _numTotalOperations.load());
-    builder.append("numTotalHedgedOperations", _numTotalHedgedOperations.load());
-    builder.append("numAdvantageouslyHedgedOperations", _numAdvantageouslyHedgedOperations.load());
-
-    return builder.obj();
-}
-
-}  // namespace mongo
+namespace mongo::logv2 {
+/**
+ * Rotates the log files.  Returns true if all logs rotate successfully.
+ *
+ * renameFiles - true means we rename files, false means we expect the file to be renamed
+ *               externally
+ *
+ * logrotate on *nix systems expects us not to rename the file, it is expected that the program
+ * simply open the file again with the same name.
+ * We expect logrotate to rename the existing file before we rotate, and so the next open
+ * we do should result in a file create.
+ */
+bool rotateLogs(bool renameFiles);
+}  // namespace mongo::logv2
