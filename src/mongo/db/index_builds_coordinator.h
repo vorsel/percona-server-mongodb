@@ -30,6 +30,7 @@
 #pragma once
 
 #include <algorithm>
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
@@ -334,6 +335,7 @@ public:
     /**
      * Returns true if an index build is in progress on the specified collection.
      */
+    bool inProgForCollection(const UUID& collectionUUID, IndexBuildProtocol protocol) const;
     bool inProgForCollection(const UUID& collectionUUID) const;
 
     /**
@@ -365,6 +367,9 @@ public:
     /**
      * Waits for all index builds on a specified collection to finish.
      */
+    void awaitNoIndexBuildInProgressForCollection(OperationContext* opCtx,
+                                                  const UUID& collectionUUID,
+                                                  IndexBuildProtocol protocol);
     void awaitNoIndexBuildInProgressForCollection(const UUID& collectionUUID) const;
 
     /**
@@ -682,6 +687,14 @@ protected:
     std::vector<std::shared_ptr<ReplIndexBuildState>> _getIndexBuilds() const;
 
     /**
+     * Returns a list of index builds matching the criteria 'indexBuildFilter'.
+     * Requires caller to lock '_mutex'.
+     */
+    using IndexBuildFilterFn = std::function<bool(const ReplIndexBuildState& replState)>;
+    std::vector<std::shared_ptr<ReplIndexBuildState>> _filterIndexBuilds_inlock(
+        WithLock lk, IndexBuildFilterFn indexBuildFilter) const;
+
+    /**
      * Helper for 'abortCollectionIndexBuilds' and 'abortCollectionIndexBuildsNoWait'. Returns the
      * UUIDs of the aborted index builders
      */
@@ -722,6 +735,9 @@ protected:
 
     // Build UUID to index build information map.
     stdx::unordered_map<UUID, std::shared_ptr<ReplIndexBuildState>, UUID::Hash> _allIndexBuilds;
+
+    // Waiters are notified whenever one of the three maps above has something added or removed.
+    stdx::condition_variable _indexBuildsCondVar;
 
     // Handles actually building the indexes.
     IndexBuildsManager _indexBuildsManager;

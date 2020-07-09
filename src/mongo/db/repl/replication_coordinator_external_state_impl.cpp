@@ -89,6 +89,7 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/session_catalog_mongod.h"
+#include "mongo/db/storage/flow_control.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/system_index.h"
 #include "mongo/executor/network_connection_hook.h"
@@ -510,9 +511,7 @@ OpTime ReplicationCoordinatorExternalStateImpl::onTransitionToPrimary(OperationC
         opCtx, lastAppliedOpTime.getTimestamp());
 
     writeConflictRetry(opCtx, "logging transition to primary to oplog", "local.oplog.rs", [&] {
-        // Writes to the oplog only require a Global intent lock.
-        Lock::GlobalLock globalLock(opCtx, MODE_IX);
-
+        AutoGetOplog oplogWrite(opCtx, OplogAccessMode::kWrite);
         WriteUnitOfWork wuow(opCtx);
         opCtx->getClient()->getServiceContext()->getOpObserver()->onOpMessage(
             opCtx,
@@ -773,9 +772,7 @@ void ReplicationCoordinatorExternalStateImpl::clearOplogVisibilityStateForStepDo
     // available, which may have to wait for the ticket refresher to run, which in turn blocks on
     // the repl _mutex to check whether we are primary or not: this is a deadlock because stepdown
     // already holds the repl _mutex!
-    auto originalFlowControlSetting = opCtx->shouldParticipateInFlowControl();
-    ON_BLOCK_EXIT([&] { opCtx->setShouldParticipateInFlowControl(originalFlowControlSetting); });
-    opCtx->setShouldParticipateInFlowControl(false);
+    FlowControl::Bypass flowControlBypass(opCtx);
 
     // Tell the system to stop updating the oplogTruncateAfterPoint asynchronously and to go back to
     // using last applied to update repl's durable timestamp instead of the truncate point.
@@ -878,7 +875,7 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook
         // ShardingStateRecovery::recover above, because they may trigger filtering metadata
         // refreshes which should use the recovered configOpTime.
         migrationutil::resubmitRangeDeletionsOnStepUp(_service);
-        migrationutil::resumeMigrationCoordinationsOnStepUp(_service);
+        migrationutil::resumeMigrationCoordinationsOnStepUp(opCtx);
 
     } else {  // unsharded
         if (auto validator = LogicalTimeValidator::get(_service)) {

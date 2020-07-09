@@ -31,7 +31,7 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/logger/redaction.h"
+#include "mongo/logv2/redaction.h"
 
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonobj.h"

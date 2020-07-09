@@ -157,7 +157,8 @@ bool WiredTigerFileVersion::shouldDowngrade(bool readOnly,
 
     if (serverGlobalParams.featureCompatibility.getVersion() !=
         ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo42) {
-        // Only consider downgrading when FCV is set to 4.2
+        // Only consider downgrading when FCV is set to kFullyDowngraded.
+        // (This FCV gate must remain across binary version releases.)
         return false;
     }
 
@@ -267,6 +268,11 @@ public:
 
         // Initialize the thread's opCtx.
         _uniqueCtx.emplace(tc->makeOperationContext());
+
+        // Updates to a non-replicated collection, oplogTruncateAfterPoint, are made by this thread.
+        // Non-replicated writes will not contribute to replication lag and can be safely excluded
+        // from Flow Control.
+        _uniqueCtx->get()->setShouldParticipateInFlowControl(false);
         while (true) {
 
             pauseJournalFlusherThread.pauseWhileSet(_uniqueCtx->get());
@@ -283,6 +289,7 @@ public:
                     stdx::lock_guard<Latch> lk(_opCtxMutex);
                     _uniqueCtx.reset();
                     _uniqueCtx.emplace(tc->makeOperationContext());
+                    _uniqueCtx->get()->setShouldParticipateInFlowControl(false);
                 });
 
                 _sessionCache->waitUntilDurable(
@@ -1191,23 +1198,6 @@ void WiredTigerKVEngine::_openWiredTiger(const std::string& path, const std::str
     int ret = wiredtiger_open(path.c_str(), wtEventHandler, configStr.c_str(), &_conn);
     if (!ret) {
         _fileVersion = {WiredTigerFileVersion::StartupVersion::IS_42};
-        return;
-    }
-
-    // Arbiters do not replicate the FCV document. Due to arbiter FCV semantics on 4.0, shutting
-    // down a 4.0 arbiter may either downgrade the data files to WT compatibility 2.9 or 3.0. Thus,
-    // 4.2 binaries must allow starting up on 2.9 and 3.0 files.
-    configStr = wtOpenConfig + ",compatibility=(require_min=\"3.0.0\")";
-    ret = wiredtiger_open(path.c_str(), wtEventHandler, configStr.c_str(), &_conn);
-    if (!ret) {
-        _fileVersion = {WiredTigerFileVersion::StartupVersion::IS_36};
-        return;
-    }
-
-    configStr = wtOpenConfig + ",compatibility=(require_min=\"2.9.0\")";
-    ret = wiredtiger_open(path.c_str(), wtEventHandler, configStr.c_str(), &_conn);
-    if (!ret) {
-        _fileVersion = {WiredTigerFileVersion::StartupVersion::IS_34};
         return;
     }
 

@@ -1713,6 +1713,66 @@ Status ReplicationCoordinatorImpl::_setLastOptime(WithLock lk,
     return Status::OK();
 }
 
+bool ReplicationCoordinatorImpl::isCommitQuorumSatisfied(
+    const CommitQuorumOptions& commitQuorum, const std::vector<mongo::HostAndPort>& members) const {
+    stdx::lock_guard<Latch> lock(_mutex);
+
+    if (commitQuorum.mode.empty()) {
+        return _haveNumNodesSatisfiedCommitQuorum(lock, commitQuorum.numNodes, members);
+    }
+
+    StringData patternName;
+    if (commitQuorum.mode == CommitQuorumOptions::kMajority) {
+        patternName = ReplSetConfig::kMajorityWriteConcernModeName;
+    } else if (commitQuorum.mode == CommitQuorumOptions::kAll) {
+        patternName = ReplSetConfig::kAllWriteConcernModeName;
+    } else {
+        patternName = commitQuorum.mode;
+    }
+
+    auto tagPattern = uassertStatusOK(_rsConfig.findCustomWriteMode(patternName));
+    return _haveTaggedNodesSatisfiedCommitQuorum(lock, tagPattern, members);
+}
+
+bool ReplicationCoordinatorImpl::_haveNumNodesSatisfiedCommitQuorum(
+    WithLock lk, int numNodes, const std::vector<mongo::HostAndPort>& members) const {
+    for (auto&& member : members) {
+        auto memberConfig = _rsConfig.findMemberByHostAndPort(member);
+        // We do not count arbiters and members that aren't part of replica set config,
+        // towards the commit quorum.
+        if (!memberConfig || memberConfig->isArbiter())
+            continue;
+
+        --numNodes;
+
+        if (numNodes <= 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ReplicationCoordinatorImpl::_haveTaggedNodesSatisfiedCommitQuorum(
+    WithLock lk,
+    const ReplSetTagPattern& tagPattern,
+    const std::vector<mongo::HostAndPort>& members) const {
+    ReplSetTagMatch matcher(tagPattern);
+
+    for (auto&& member : members) {
+        auto memberConfig = _rsConfig.findMemberByHostAndPort(member);
+        // We do not count arbiters and members that aren't part of replica set config,
+        // towards the commit quorum.
+        if (!memberConfig || memberConfig->isArbiter())
+            continue;
+        for (auto&& it = memberConfig->tagsBegin(); it != memberConfig->tagsEnd(); ++it) {
+            if (matcher.update(*it)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 bool ReplicationCoordinatorImpl::_doneWaitingForReplication_inlock(
     const OpTime& opTime, const WriteConcernOptions& writeConcern) {
     // The syncMode cannot be unset.
@@ -2180,31 +2240,31 @@ BSONObj ReplicationCoordinatorImpl::runCmdOnPrimaryAndAwaitResponse(
     const BSONObj& cmdObj,
     OnRemoteCmdScheduledFn onRemoteCmdScheduled,
     OnRemoteCmdCompleteFn onRemoteCmdComplete) {
-    // Sanity check
-    invariant(!opCtx->lockState()->isRSTLLocked());
+    // About to make network and DBDirectClient (recursive) calls, so we should not hold any locks.
+    invariant(!opCtx->lockState()->isLocked());
 
-    repl::ReplicationStateTransitionLockGuard rstl(opCtx, MODE_IX);
+    const auto myHostAndPort = getMyHostAndPort();
+    const auto primaryHostAndPort = getCurrentPrimaryHostAndPort();
 
-    if (getMemberState().primary()) {
-        if (canAcceptWritesForDatabase(opCtx, dbName)) {
-            // Run command using DBDirectClient to avoid tcp connection.
-            return _runCmdOnSelfOnAlternativeClient(opCtx, dbName, cmdObj);
-        }
-        // Node is primary but it's not in a state to accept non-local writes because it might be in
-        // the catchup or draining phase. So, try releasing and reacquiring RSTL lock so that we
-        // give chance for the node to finish executing signalDrainComplete() and become master.
-        uassertStatusOK(
-            Status{ErrorCodes::NotMaster, "Node is in primary state but can't accept writes."});
+    if (myHostAndPort.empty()) {
+        // Possibly because either rsconfig is uninitialized or the node got removed from config.
+        uassertStatusOK(Status{ErrorCodes::NodeNotFound, "Address unknown."});
+    }
+
+    if (primaryHostAndPort.empty()) {
+        uassertStatusOK(Status{ErrorCodes::NoConfigMaster, "Primary is unknown/down."});
+    }
+
+    auto iAmPrimary = (myHostAndPort == primaryHostAndPort) ? true : false;
+
+    if (iAmPrimary) {
+        // Run command using DBDirectClient to avoid tcp connection.
+        return _runCmdOnSelfOnAlternativeClient(opCtx, dbName, cmdObj);
     }
 
     // Node is not primary, so we will run the remote command via AsyncDBClient. To use
     // AsyncDBClient, we will be using repl task executor.
-    const auto primary = getCurrentPrimaryHostAndPort();
-    if (primary.empty()) {
-        uassertStatusOK(Status{ErrorCodes::CommandFailed, "Primary is unknown/down."});
-    }
-
-    executor::RemoteCommandRequest request(primary, dbName, cmdObj, nullptr);
+    executor::RemoteCommandRequest request(primaryHostAndPort, dbName, cmdObj, nullptr);
     executor::RemoteCommandResponse cbkResponse(
         Status{ErrorCodes::InternalError, "Uninitialized value"});
 
@@ -2218,11 +2278,6 @@ BSONObj ReplicationCoordinatorImpl::runCmdOnPrimaryAndAwaitResponse(
     CallbackHandle cbkHandle = scheduleResult.getValue();
 
     onRemoteCmdScheduled(cbkHandle);
-    // Before, we wait for the remote command response, it's important we release the rstl lock to
-    // ensure that the state transition can happen during the wait period. Else, it can lead to
-    // deadlock. Consider a case, where the remote command waits for majority write concern. But, we
-    // are not able to transition our state to secondary (steady state replication).
-    rstl.release();
 
     // Wait for the response in an interruptible mode.
     _replExecutor->wait(cbkHandle, opCtx);
@@ -2993,10 +3048,9 @@ Status ReplicationCoordinatorImpl::processReplSetSyncFrom(OperationContext* opCt
     }
 
     // If we are in the middle of an initial sync, do a resync.
-    if (result.isOK() && initialSyncerCopy && initialSyncerCopy->isActive()) {
-        return resyncData(opCtx, false);
+    if (result.isOK() && initialSyncerCopy) {
+        initialSyncerCopy->cancelCurrentAttempt();
     }
-
     return result;
 }
 
@@ -3063,14 +3117,33 @@ Status ReplicationCoordinatorImpl::processReplSetReconfig(OperationContext* opCt
         if (enableAutomaticReconfig) {
             bool addedNewlyAddedField = false;
 
-            // Set the `newlyAdded` field to true for all new voting nodes.
+            // Set the 'newlyAdded' field to true for all new voting nodes.
             for (int i = 0; i < newConfig.getNumMembers(); i++) {
                 const auto newMem = newConfig.getMemberAt(i);
-                const int newMemId = newMem.getId().getData();
-                const bool newMemberIdNotInOldConfig =
-                    (oldConfig.findMemberByID(newMemId) == nullptr);
 
-                if (newMemberIdNotInOldConfig && newMem.isVoter()) {
+                // If this is a safe reconfig, the 'newlyAdded' flag should never already be set for
+                // this member. If it is set, throw an error.
+                if (!args.force && newMem.isNewlyAdded()) {
+                    str::stream errmsg;
+                    errmsg << "Cannot provide " << MemberConfig::kNewlyAddedFieldName
+                           << " field to member config during safe reconfig.";
+                    LOGV2_ERROR(
+                        4634900,
+                        "Initializing 'newlyAdded' field to member has failed with bad status.",
+                        "errmsg"_attr = std::string(errmsg));
+                    return Status(ErrorCodes::InvalidReplicaSetConfig, errmsg);
+                }
+
+                const int newMemId = newMem.getId().getData();
+                const auto oldMem = oldConfig.findMemberByID(newMemId);
+
+                const bool isNewVotingMember = (oldMem == nullptr && newMem.isVoter());
+                const bool isCurrentlyNewlyAdded = (oldMem != nullptr && oldMem->isNewlyAdded());
+
+                // Append the 'newlyAdded' field if the node:
+                // 1) Is a new, voting node
+                // 2) Already has a 'newlyAdded' field in the old config
+                if (isNewVotingMember || isCurrentlyNewlyAdded) {
                     newConfig.setNewlyAddedFieldForMemberAtIndex(i, true);
                     addedNewlyAddedField = true;
                 }
@@ -3078,10 +3151,12 @@ Status ReplicationCoordinatorImpl::processReplSetReconfig(OperationContext* opCt
 
             if (addedNewlyAddedField) {
                 LOGV2(4634400,
-                      "Rewrote the config to add `newlyAdded` field. Nodes with the `newlyAdded` "
-                      "field will be considered to have `votes:0`. Upon transition to SECONDARY, "
-                      "this field will be automatically removed.",
-                      "newConfigObj"_attr = newConfig.toBSON());
+                      "Appended the 'newlyAdded' field to a node in the new config. Nodes with the "
+                      "'newlyAdded' field will be considered to have 'votes:0'. Upon transition to "
+                      "SECONDARY, this field will be automatically removed.",
+                      "newConfigObj"_attr = newConfig.toBSON(),
+                      "userProvidedConfig"_attr = args.newConfigObj,
+                      "oldConfig"_attr = oldConfig.toBSON());
             }
         }
 
@@ -4189,12 +4264,9 @@ Status ReplicationCoordinatorImpl::_checkIfCommitQuorumCanBeSatisfied(
 
     invariant(getReplicationMode() == modeReplSet);
 
-    std::vector<MemberConfig> memberConfig(_rsConfig.membersBegin(), _rsConfig.membersEnd());
-
     // We need to ensure that the 'commitQuorum' can be satisfied by all the members of this
     // replica set.
-    bool commitQuorumCanBeSatisfied =
-        _topCoord->checkIfCommitQuorumCanBeSatisfied(commitQuorum, memberConfig);
+    bool commitQuorumCanBeSatisfied = _topCoord->checkIfCommitQuorumCanBeSatisfied(commitQuorum);
     if (!commitQuorumCanBeSatisfied) {
         return Status(ErrorCodes::UnsatisfiableCommitQuorum,
                       str::stream() << "Commit quorum cannot be satisfied with the current replica "

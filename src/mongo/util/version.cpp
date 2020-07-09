@@ -45,14 +45,20 @@
 #include <boost/iterator/transform_iterator.hpp>
 #include <pcrecpp.h>
 
+#include <fmt/format.h>
 #include <sstream>
 
+#include "mongo/base/string_data.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
 namespace {
+
+std::string formatVersionString(StringData versioned, const VersionInfoInterface& provider) {
+    return format(FMT_STRING("{} version v{}"), versioned, provider.version());
+}
 
 class FallbackVersionInfo : public VersionInfoInterface {
 public:
@@ -96,7 +102,7 @@ public:
         return "unknown";
     }
 
-    std::vector<BuildInfoTuple> buildInfo() const final {
+    std::vector<BuildInfoField> buildInfo() const final {
         return {};
     }
 };
@@ -124,21 +130,8 @@ const VersionInfoInterface& VersionInfoInterface::instance(NotEnabledAction acti
     fassertFailed(40278);
 }
 
-bool VersionInfoInterface::isSameMajorVersion(const char* otherVersion) const noexcept {
-    int major = -1, minor = -1;
-    pcrecpp::RE ver_regex("^(\\d+)\\.(\\d+)\\.");
-    ver_regex.PartialMatch(otherVersion, &major, &minor);
-
-    if (major == -1 || minor == -1)
-        return false;
-
-    return (major == majorVersion() && minor == minorVersion());
-}
-
 std::string VersionInfoInterface::makeVersionString(StringData binaryName) const {
-    std::stringstream ss;
-    ss << binaryName << " v" << version();
-    return ss.str();
+    return format(FMT_STRING("{} v{}"), binaryName, version());
 }
 
 void VersionInfoInterface::appendBuildInfo(BSONObjBuilder* result) const {
@@ -176,13 +169,12 @@ void VersionInfoInterface::appendBuildInfo(BSONObjBuilder* result) const {
 #endif
     opensslInfo.done();
 
-    BSONObjBuilder buildvarsInfo(result->subobjStart("buildEnvironment"));
-    for (auto&& envDataEntry : buildInfo()) {
-        if (std::get<2>(envDataEntry)) {
-            buildvarsInfo << std::get<0>(envDataEntry) << std::get<1>(envDataEntry);
-        }
+    {
+        BSONObjBuilder env(result->subobjStart("buildEnvironment"));
+        for (auto&& e : buildInfo())
+            if (e.inBuildInfo)
+                env.append(e.key, e.value);
     }
-    buildvarsInfo.done();
 
     *result << "bits" << (int)sizeof(void*) * 8;
     result->appendBool("debug", kDebugBuild);
@@ -219,20 +211,12 @@ void VersionInfoInterface::logBuildInfo() const {
 
     auto build = buildInfo();
 
-    auto envFilter = [](const BuildInfoTuple& bi) -> bool {
-        if (std::get<3>(bi))
-            return std::get<1>(bi).size() != 0;
-        return false;
-    };
+    auto envFilter = [](auto&& bi) { return bi.inBuildInfo && !bi.value.empty(); };
 
     auto filtered_begin = boost::make_filter_iterator(envFilter, build.begin(), build.end());
     auto filtered_end = boost::make_filter_iterator(envFilter, build.end(), build.end());
 
-    auto envFormatter = [](const BuildInfoTuple& bi) {
-        BSONObjBuilder builder;
-        builder.append(std::get<0>(bi), std::get<1>(bi));
-        return builder.obj();
-    };
+    auto envFormatter = [](auto&& bi) { return BSONObjBuilder{}.append(bi.key, bi.value).obj(); };
 
     auto begin = boost::make_transform_iterator(filtered_begin, envFormatter);
     auto end = boost::make_transform_iterator(filtered_end, envFormatter);
@@ -243,21 +227,15 @@ void VersionInfoInterface::logBuildInfo() const {
 }
 
 std::string mongoShellVersion(const VersionInfoInterface& provider) {
-    std::stringstream ss;
-    ss << "Percona Server for MongoDB shell version v" << provider.version();
-    return ss.str();
+    return formatVersionString("Percona Server for MongoDB shell", provider);
 }
 
 std::string mongosVersion(const VersionInfoInterface& provider) {
-    std::stringstream ss;
-    ss << "mongos version v" << provider.version();
-    return ss.str();
+    return formatVersionString("mongos", provider);
 }
 
 std::string mongodVersion(const VersionInfoInterface& provider) {
-    std::stringstream ss;
-    ss << "db version v" << provider.version();
-    return ss.str();
+    return formatVersionString("db", provider);
 }
 
 }  // namespace mongo

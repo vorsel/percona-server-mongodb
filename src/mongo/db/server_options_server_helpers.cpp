@@ -50,6 +50,7 @@
 #include "mongo/logger/logger.h"
 #include "mongo/logger/message_event_utf8_encoder.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_util.h"
 #include "mongo/transport/message_compressor_registry.h"
 #include "mongo/util/cmdline_utils/censor_cmdline.h"
 #include "mongo/util/fail_point.h"
@@ -411,7 +412,7 @@ Status storeServerOptions(const moe::Environment& params) {
 #endif  // _WIN32
 
     if (params.count("security.redactClientLogData")) {
-        logger::globalLogDomain()->setShouldRedactLogs(params["security.redactClientLogData"].as<bool>());
+        logv2::setShouldRedactLogs(params["security.redactClientLogData"].as<bool>());
     }
 
     if (serverGlobalParams.doFork && serverGlobalParams.logpath.empty() &&

@@ -306,20 +306,6 @@ StatusWith<BSONObj> validateIndexSpec(
                                 << "Values in the index key pattern cannot be empty strings"};
                 }
             }
-
-            // Allow compound hashed index only if FCV is 4.4.
-            const auto isFeatureDisabled =
-                (featureCompatibility.isVersionInitialized() &&
-                 featureCompatibility.getVersion() <
-                     ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44);
-            if (isFeatureDisabled && (indexSpecElem.embeddedObject().nFields() > 1) &&
-                (IndexNames::findPluginName(indexSpecElem.embeddedObject()) ==
-                 IndexNames::HASHED)) {
-                return {ErrorCodes::Error(16763),
-                        "Compound hashed indexes can only be created with FCV 4.4 and with test "
-                        "commands enabled "};
-            }
-
             hasKeyPatternField = true;
         } else if (IndexDescriptor::kIndexNameFieldName == indexSpecElemFieldName) {
             if (indexSpecElem.type() != BSONType::String) {

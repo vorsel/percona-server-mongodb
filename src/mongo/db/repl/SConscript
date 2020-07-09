@@ -41,6 +41,7 @@ env.Library(
         'dbcheck',
         'local_oplog_info',
         'repl_coordinator_interface',
+        'repl_server_parameters',
         'repl_settings',
         'timestamp_block',
         '$BUILD_DIR/mongo/base',
@@ -230,10 +231,10 @@ env.Library(
         '$BUILD_DIR/mongo/db/query_exec',
     ],
     LIBDEPS_PRIVATE=[
+        'repl_server_parameters',
         '$BUILD_DIR/mongo/db/catalog/database_holder',
         '$BUILD_DIR/mongo/db/storage/oplog_cap_maintainer_thread',
         '$BUILD_DIR/mongo/db/logical_clock',
-        'repl_server_parameters',
     ],
 )
 
@@ -275,6 +276,7 @@ env.Library(
     LIBDEPS_PRIVATE=[
         'oplog',
         'oplog_application',
+        'oplog_interface_local',
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/storage/storage_options',
     ],
@@ -563,6 +565,7 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/commands/mongod_fsync',
+        'repl_server_parameters',
         'replication_auth',
     ],
 )

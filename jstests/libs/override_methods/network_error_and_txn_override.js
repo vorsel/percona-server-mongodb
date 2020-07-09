@@ -64,6 +64,11 @@ function configuredForTxnOverride() {
     return TestData.networkErrorAndTxnOverrideConfig.wrapCRUDinTransactions;
 }
 
+function configuredForBackgroundReconfigs() {
+    assert(TestData.networkErrorAndTxnOverrideConfig, TestData);
+    return TestData.networkErrorAndTxnOverrideConfig.backgroundReconfigs;
+}
+
 // Commands assumed to not be blindly retryable.
 const kNonRetryableCommands = new Set([
     // Commands that take write concern and do not support txnNumbers.
@@ -107,7 +112,6 @@ const kNonRetryableCommands = new Set([
     "grantRolesToRole",
     "grantRolesToUser",
     "mapreduce.shardedfinish",
-    "moveChunk",
     "renameCollection",
     "revokePrivilegesFromRole",
     "revokeRolesFromRole",
@@ -126,7 +130,17 @@ const kAcceptableNonRetryableCommands = new Set([
     "drop",
     "dropDatabase",  // Already ignores NamespaceNotFound errors, so not handled below.
     "dropIndexes",
+    "moveChunk",
 ]);
+
+// The following read operations defined in the CRUD specification are retryable.
+// Note that estimatedDocumentCount() and countDocuments() use the count command.
+const kRetryableReadCommands = new Set(["find", "aggregate", "distinct", "count"]);
+
+// Returns true if the command name is that of a retryable read command.
+function isRetryableReadCmdName(cmdName) {
+    return kRetryableReadCommands.has(cmdName);
+}
 
 // Returns if the given failed response is a safe response to ignore when retrying the
 // given command type.
@@ -186,6 +200,20 @@ function canRetryNetworkErrorForCommand(cmdName, cmdObj) {
     return true;
 }
 
+// Returns if the given command should retry a read error when reconfigs are present.
+function canRetryReadErrorDuringBackgroundReconfig(cmdName) {
+    if (!configuredForBackgroundReconfigs()) {
+        return false;
+    }
+    return isRetryableReadCmdName(cmdName);
+}
+
+// When running the reconfig command on a node, it will drop its snapshot. Read commands issued
+// to this node before it updates its snapshot will fail with ReadConcernMajorityNotAvailableYet.
+function isRetryableReadCode(code) {
+    return code === ErrorCodes.ReadConcernMajorityNotAvailableYet;
+}
+
 // Several commands that use the plan executor swallow the actual error code from a failed plan
 // into their error message and instead return OperationFailed.
 //
@@ -204,6 +232,19 @@ function isRetryableShardCollectionResponse(res) {
         // _cloneCollectionsOptionsFromPrimaryShard, which may fail with the following code if
         // interupted by a failover.
         res.code === ErrorCodes.CallbackCanceled;
+}
+
+// Returns true if the given response could have come from moveChunk being interrupted by a
+// failover.
+function isRetryableMoveChunkResponse(res) {
+    return res.code === ErrorCodes.OperationFailed &&
+        (RetryableWritesUtil.errmsgContainsRetryableCodeName(res.errmsg) ||
+         // The transaction number is bumped by the migration coordinator when its commit or abort
+         // decision is being made durable.
+         res.errmsg.includes("TransactionTooOld") ||
+         // The range deletion task may have been interrupted. This error can occur even when
+         // _waitForDelete=false.
+         res.errmsg.includes("operation was interrupted"));
 }
 
 function hasError(res) {
@@ -833,6 +874,12 @@ function shouldRetryWithNetworkErrorOverride(
             return kContinue;
         }
 
+        // Check for the retryable error codes from an interrupted moveChunk.
+        if (cmdName === "moveChunk" && isRetryableMoveChunkResponse(res)) {
+            logError("Retrying interrupted moveChunk");
+            return kContinue;
+        }
+
         // In a sharded cluster, drop may bury the original error code in the error message if
         // interrupted.
         if (cmdName === "drop" && RetryableWritesUtil.errmsgContainsRetryableCodeName(res.errmsg)) {
@@ -862,6 +909,19 @@ function shouldRetryWithNetworkErrorOverride(
         }
     }
 
+    return res;
+}
+
+function shouldRetryForBackgroundReconfigOverride(res, cmdName, logError) {
+    assert(configuredForBackgroundReconfigs());
+    // Background reconfigs can interfere with read commands if they are using readConcern: majority
+    // and readPreference: primary. If we're running a read command and it fails with
+    // ReadConcernMajorityNotAvailableYet, retry because it should eventually succeed.
+    if (isRetryableReadCmdName(cmdName) && isRetryableReadCode(res.code)) {
+        logError("Retrying read command after 100ms because of background reconfigs");
+        sleep(100);
+        return kContinue;
+    }
     return res;
 }
 
@@ -950,6 +1010,7 @@ function runCommandOverrideBody(conn, dbName, cmdName, cmdObj, lsid, clientFunct
     }
 
     const canRetryNetworkError = canRetryNetworkErrorForCommand(cmdName, cmdObj);
+    const canRetryReadError = canRetryReadErrorDuringBackgroundReconfig(cmdName);
     let numNetworkErrorRetries = canRetryNetworkError ? kMaxNumRetries : 0;
     do {
         try {
@@ -977,6 +1038,16 @@ function runCommandOverrideBody(conn, dbName, cmdName, cmdObj, lsid, clientFunct
                     continue;
                 } else {
                     res = networkRetryRes;
+                }
+            }
+
+            if (canRetryReadError) {
+                const readRetryRes =
+                    shouldRetryForBackgroundReconfigOverride(res, cmdName, logError);
+                if (readRetryRes === kContinue) {
+                    continue;
+                } else {
+                    res = readRetryRes;
                 }
             }
 

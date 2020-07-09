@@ -244,9 +244,9 @@ TEST_F(LogTestV2, Basic) {
     t4.serialize(buffer);
     ASSERT_EQUALS(lines.back(), fmt::to_string(buffer));
 
-    // Text formatter selects format string
+    // Message string is selected when using API that also take a format string
     LOGV2(20084, "fmtstr {name}", "msgstr", "name"_attr = 1);
-    ASSERT_EQUALS(lines.back(), "fmtstr 1");
+    ASSERT_EQUALS(lines.back(), "msgstr");
 
     // Test that logging exceptions does not propagate out to user code in release builds
     if (!kDebugBuild) {
@@ -429,6 +429,14 @@ TEST_F(LogTestV2, Types) {
     validateJSON(str_data.toString());
     ASSERT_EQUALS(lastBSONElement().String(), str_data);
 
+    {
+        std::string_view s = "a std::string_view";
+        LOGV2(4329200, "std::string_view {name}", "name"_attr = s);
+        ASSERT_EQUALS(text.back(), "std::string_view a std::string_view");
+        validateJSON(std::string{s});
+        ASSERT_EQUALS(lastBSONElement().String(), s);
+    }
+
     // BSONObj
     BSONObjBuilder builder;
     builder.append("int32"_sd, 1);
@@ -478,13 +486,22 @@ TEST_F(LogTestV2, Types) {
            bsonObj.getField("int32"_sd).Int());
 
     // Date_t
-    Date_t date = Date_t::now();
-    LOGV2(20023, "Date_t {name}", "name"_attr = date);
-    ASSERT_EQUALS(text.back(), std::string("Date_t ") + date.toString());
-    ASSERT_EQUALS(
-        mongo::fromjson(json.back()).getField(kAttributesFieldName).Obj().getField("name").Date(),
-        date);
-    ASSERT_EQUALS(lastBSONElement().Date(), date);
+    bool prevIsLocalTimezone = dateFormatIsLocalTimezone();
+    for (auto localTimezone : {true, false}) {
+        setDateFormatIsLocalTimezone(localTimezone);
+        Date_t date = Date_t::now();
+        LOGV2(20023, "Date_t {name}", "name"_attr = date);
+        ASSERT_EQUALS(text.back(), std::string("Date_t ") + date.toString());
+        ASSERT_EQUALS(mongo::fromjson(json.back())
+                          .getField(kAttributesFieldName)
+                          .Obj()
+                          .getField("name")
+                          .Date(),
+                      date);
+        ASSERT_EQUALS(lastBSONElement().Date(), date);
+    }
+
+    setDateFormatIsLocalTimezone(prevIsLocalTimezone);
 
     // Decimal128
     LOGV2(20024, "Decimal128 {name}", "name"_attr = Decimal128::kPi);

@@ -46,7 +46,6 @@
 #include "mongo/db/s/sharding_config_optime_gossip.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_entry_point_common.h"
-#include "mongo/logger/redaction.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata/config_server_metadata.h"
@@ -190,6 +189,12 @@ public:
     void handleException(const DBException& e, OperationContext* opCtx) const override {
         // If we got a stale config, wait in case the operation is stuck in a critical section
         if (auto sce = e.extraInfo<StaleConfigInfo>()) {
+            // A config server acting as a router may return a StaleConfig exception, but a config
+            // server won't contain data for a sharded collection, so skip handling the exception.
+            if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+                return;
+            }
+
             if (sce->getCriticalSectionSignal()) {
                 // Set migration critical section on operation sharding state: operation will wait
                 // for the migration to finish before returning.

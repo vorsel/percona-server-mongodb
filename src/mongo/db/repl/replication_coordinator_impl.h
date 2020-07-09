@@ -153,6 +153,10 @@ public:
     virtual Status checkIfCommitQuorumCanBeSatisfied(
         const CommitQuorumOptions& commitQuorum) const override;
 
+    virtual bool isCommitQuorumSatisfied(
+        const CommitQuorumOptions& commitQuorum,
+        const std::vector<mongo::HostAndPort>& members) const override;
+
     virtual Status checkCanServeReadsFor(OperationContext* opCtx,
                                          const NamespaceString& ns,
                                          bool slaveOk);
@@ -839,6 +843,21 @@ private:
     bool _doneWaitingForReplication_inlock(const OpTime& opTime,
                                            const WriteConcernOptions& writeConcern);
 
+    /**
+     *  Returns whether or not "members" list contains at least 'numNodes'.
+     */
+    bool _haveNumNodesSatisfiedCommitQuorum(WithLock lk,
+                                            int numNodes,
+                                            const std::vector<mongo::HostAndPort>& members) const;
+
+    /**
+     * Returns whether or not "members" list matches the tagPattern.
+     */
+    bool _haveTaggedNodesSatisfiedCommitQuorum(
+        WithLock lk,
+        const ReplSetTagPattern& tagPattern,
+        const std::vector<mongo::HostAndPort>& members) const;
+
     Status _checkIfWriteConcernCanBeSatisfied_inlock(const WriteConcernOptions& writeConcern) const;
 
     Status _checkIfCommitQuorumCanBeSatisfied(WithLock,
@@ -1396,6 +1415,7 @@ private:
 
     /**
      * Runs the command using DBDirectClient and returns the response received for that command.
+     * Callers of this function should not hold any locks.
      */
     BSONObj _runCmdOnSelfOnAlternativeClient(OperationContext* opCtx,
                                              const std::string& dbName,

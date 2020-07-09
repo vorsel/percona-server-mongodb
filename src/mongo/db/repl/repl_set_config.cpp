@@ -190,8 +190,8 @@ Status ReplSetConfig::_initialize(const BSONObj& cfg,
     // Parse protocol version
     //
     status = bsonExtractIntegerField(cfg, kProtocolVersionFieldName, &_protocolVersion);
-    // If 'protocolVersion' field is missing for initiate, then _protocolVersion defaults to 1.
-    if (!(status.isOK() || (status == ErrorCodes::NoSuchKey && forInitiate))) {
+    // If 'protocolVersion' field is missing, then _protocolVersion defaults to 1.
+    if (!status.isOK() && status != ErrorCodes::NoSuchKey) {
         return status;
     }
 
@@ -826,6 +826,19 @@ void ReplSetConfig::_addInternalWriteConcernModes() {
         // NoSuchKey means we have no $voter-tagged nodes in this config;
         // other errors are unexpected.
         fassert(28693, status);
+    }
+
+    // $all: all voting data-bearing nodes.
+    pattern = _tagConfig.makePattern();
+    status = _tagConfig.addTagCountConstraintToPattern(
+        &pattern, MemberConfig::kInternalVoterTagName, _writableVotingMembersCount);
+
+    if (status.isOK()) {
+        _customWriteConcernModes[kAllWriteConcernModeName] = pattern;
+    } else if (status != ErrorCodes::NoSuchKey) {
+        // NoSuchKey means we have no $voter-tagged nodes in this config;
+        // other errors are unexpected.
+        fassert(46712003, status);
     }
 
     // $stepDownCheck: one electable node plus ourselves

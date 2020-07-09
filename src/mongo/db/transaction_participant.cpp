@@ -61,6 +61,7 @@
 #include "mongo/db/server_recovery.h"
 #include "mongo/db/server_transactions_metrics.h"
 #include "mongo/db/stats/fill_locker_info.h"
+#include "mongo/db/storage/flow_control.h"
 #include "mongo/db/transaction_history_iterator.h"
 #include "mongo/db/transaction_participant_gen.h"
 #include "mongo/logv2/log.h"
@@ -85,6 +86,8 @@ MONGO_FAIL_POINT_DEFINE(hangBeforeReleasingTransactionOplogHole);
 MONGO_FAIL_POINT_DEFINE(skipCommitTxnCheckPrepareMajorityCommitted);
 
 MONGO_FAIL_POINT_DEFINE(restoreLocksFail);
+
+MONGO_FAIL_POINT_DEFINE(failTransactionNoopWrite);
 
 const auto getTransactionParticipant = Session::declareDecoration<TransactionParticipant>();
 
@@ -125,6 +128,10 @@ ActiveTransactionHistory fetchActiveTransactionHistory(OperationContext* opCtx,
 
     result.lastTxnRecord = [&]() -> boost::optional<SessionTxnRecord> {
         DBDirectClient client(opCtx);
+        // Even though the request only performs a read, the OpCtx's "in multi document transaction"
+        // field has been set, bumping the global lock acquisition to an IX. That upconvert would
+        // require a flow control ticket to be obtained.
+        FlowControl::Bypass flowControlBypass(opCtx);
         auto result =
             client.findOne(NamespaceString::kSessionTransactionsTableNamespace.ns(),
                            {BSON(SessionTxnRecord::kSessionIdFieldName << lsid.toBSON())});
@@ -310,10 +317,15 @@ void TransactionParticipant::performNoopWrite(OperationContext* opCtx, StringDat
     // been satisfied.
     invariant(!opCtx->lockState()->hasMaxLockTimeout());
 
-    {
-        Lock::DBLock dbLock(opCtx, "local", MODE_IX);
-        Lock::CollectionLock collectionLock(opCtx, NamespaceString::kRsOplogNamespace, MODE_IX);
+    // Simulate an operation timeout and fail the noop write if the fail point is enabled. This is
+    // to test that NoSuchTransaction error is not considered transient if the noop write cannot
+    // occur.
+    if (MONGO_unlikely(failTransactionNoopWrite.shouldFail())) {
+        uasserted(ErrorCodes::MaxTimeMSExpired, "failTransactionNoopWrite fail point enabled");
+    }
 
+    {
+        AutoGetOplog oplogWrite(opCtx, OplogAccessMode::kWrite);
         uassert(ErrorCodes::NotMaster,
                 "Not primary when performing noop write for {}"_format(msg),
                 replCoord->canAcceptWritesForDatabase(opCtx, "admin"));

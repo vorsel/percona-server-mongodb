@@ -4214,7 +4214,7 @@ if get_option('lint-scope') == 'changed':
             "buildscripts/eslint.py",
             patch_file,
         ],
-        action="$PYTHON ${SOURCES[0]} lint-patch ${SOURCES[1]}"
+        action="$PYTHON ${SOURCES[0]} lint-git-diff ${SOURCES[1]}"
     )
 
 else:
@@ -4533,7 +4533,7 @@ if get_option("install-mode") != "hygienic":
 if should_dagger:
     dependencyDb = env.Alias("dagger", env.Dagger('library_dependency_graph.json'))
     # Require everything to be built before trying to extract build dependency information
-    env.Requires(dependencyDb, allTargets)
+    env.Requires(dependencyDb, 'all')
 
 # Declare the cache prune target
 cachePrune = env.Command(

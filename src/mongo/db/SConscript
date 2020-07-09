@@ -554,6 +554,7 @@ env.Library(
     target="commands",
     source=[
         'commands.cpp',
+        env.Idlc('commands_in_multi_doc_txn_params.idl')[0],
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
@@ -641,6 +642,7 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         'catalog/database_holder',
+        'repl/local_oplog_info',
         's/sharding_api_d',
     ]
 )
@@ -1374,6 +1376,7 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/s/sharding_router_api',
+        '$BUILD_DIR/mongo/db/pipeline/sharded_agg_helpers',
     ]
 )
 

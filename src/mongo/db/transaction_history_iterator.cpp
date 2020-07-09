@@ -39,7 +39,7 @@
 #include "mongo/db/repl/local_oplog_info.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/transaction_history_iterator.h"
-#include "mongo/logger/redaction.h"
+#include "mongo/logv2/redaction.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -76,8 +76,7 @@ BSONObj findOneOplogEntry(OperationContext* opCtx,
                             << causedBy(statusWithCQ.getStatus()));
     std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
-    ShouldNotConflictWithSecondaryBatchApplicationBlock noPBWMBlock(opCtx->lockState());
-    Lock::GlobalLock globalLock(opCtx, MODE_IS);
+    AutoGetOplog oplogRead(opCtx, OplogAccessMode::kRead);
     const auto localDb = DatabaseHolder::get(opCtx)->getDb(opCtx, "local");
     invariant(localDb);
     AutoStatsTracker statsTracker(opCtx,
@@ -86,10 +85,9 @@ BSONObj findOneOplogEntry(OperationContext* opCtx,
                                   AutoStatsTracker::LogMode::kUpdateTop,
                                   localDb->getProfilingLevel(),
                                   Date_t::max());
-    auto oplog = repl::LocalOplogInfo::get(opCtx)->getCollection();
-    invariant(oplog);
 
-    auto exec = uassertStatusOK(getExecutorFind(opCtx, oplog, std::move(cq), permitYield));
+    auto exec = uassertStatusOK(
+        getExecutorFind(opCtx, oplogRead.getCollection(), std::move(cq), permitYield));
 
     auto getNextResult = exec->getNext(&oplogBSON, nullptr);
     uassert(ErrorCodes::IncompleteTransactionHistory,

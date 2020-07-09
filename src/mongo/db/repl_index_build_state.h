@@ -84,6 +84,10 @@ enum class IndexBuildAction {
      */
     kPrimaryAbort,
     /**
+     * Commit signal set by an index build for a single-phase build.
+     */
+    kSinglePhaseCommit,
+    /**
      * Commit signal set by "voteCommitIndexBuild" cmd and step up.
      */
     kCommitQuorumSatisfied
@@ -138,6 +142,8 @@ public:
                   bool skipCheck,
                   boost::optional<Timestamp> timestamp = boost::none,
                   boost::optional<std::string> abortReason = boost::none) {
+        // TODO SERVER-46560: Should remove the hard-coded value skipCheck 'true'.
+        skipCheck = true;
         if (!skipCheck) {
             invariant(checkIfValidTransition(state),
                       str::stream() << "current state :" << toString(_state)
@@ -228,9 +234,7 @@ struct ReplIndexBuildState {
           indexSpecs(specs),
           protocol(protocol),
           commitQuorum(commitQuorum) {
-        if (IndexBuildProtocol::kTwoPhase == protocol) {
-            waitForNextAction = std::make_unique<SharedPromise<IndexBuildAction>>();
-        }
+        waitForNextAction = std::make_unique<SharedPromise<IndexBuildAction>>();
     }
 
     // Uniquely identifies this index build across replica set members.

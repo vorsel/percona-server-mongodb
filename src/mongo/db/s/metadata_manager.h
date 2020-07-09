@@ -140,7 +140,9 @@ public:
      *
      * Returns a future that will be fulfilled when the range deletion completes or fails.
      */
-    SharedSemiFuture<void> cleanUpRange(ChunkRange const& range, bool shouldDelayBeforeDeletion);
+    SharedSemiFuture<void> cleanUpRange(ChunkRange const& range,
+                                        boost::optional<UUID> migrationId,
+                                        bool shouldDelayBeforeDeletion);
 
     /**
      * Returns the number of ranges scheduled to be cleaned, exclusive of such ranges that might
@@ -241,6 +243,7 @@ private:
         const WithLock&,
         SemiFuture<void> waitForActiveQueriesToComplete,
         const ChunkRange& range,
+        boost::optional<UUID> migrationId,
         Seconds delayForActiveQueriesOnSecondariesToComplete);
 
     // ServiceContext from which to obtain instances of global support objects
@@ -258,7 +261,7 @@ private:
     // Mutex to protect the state below
     mutable Mutex _managerLock = MONGO_MAKE_LATCH("MetadataManager::_managerLock");
 
-    // Contains a list of collection metadata for the same collection epoch, ordered in
+    // Contains a list of collection metadata for the same collection uuid, ordered in
     // chronological order based on the refreshes that occurred. The entry at _metadata.back() is
     // the most recent metadata and is what is returned to new queries. The rest are previously
     // active collection metadata instances still in use by active server operations or cursors.

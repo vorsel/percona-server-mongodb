@@ -45,6 +45,7 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
         self.default_write_concern = default_write_concern
         self.mixed_bin_versions = utils.default_if_none(mixed_bin_versions,
                                                         config.MIXED_BIN_VERSIONS)
+        self.mixed_bin_versions_config = self.mixed_bin_versions
 
         # Use the values given from the command line if they exist for linear_chain and num_nodes.
         linear_chain_option = utils.default_if_none(config.LINEAR_CHAIN, linear_chain)
@@ -115,6 +116,12 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
                 self.nodes.append(node)
 
         for i in range(self.num_nodes):
+            # TODO(SERVER-46864): Remove version check on "oplogApplicationEnforcesSteadyStateConstraints"
+            steady_state_constraint_param = "oplogApplicationEnforcesSteadyStateConstraints"
+            if (steady_state_constraint_param not in self.nodes[i].mongod_options["set_parameters"]
+                    and (self.mixed_bin_versions_config is None
+                         or self.mixed_bin_versions_config[i] == "new")):
+                self.nodes[i].mongod_options["set_parameters"][steady_state_constraint_param] = True
             if self.linear_chain and i > 0:
                 self.nodes[i].mongod_options["set_parameters"][
                     "failpoint.forceSyncSourceCandidate"] = {
@@ -130,6 +137,14 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
                                                           self.replset_name)
             self.initial_sync_node.setup()
             self.initial_sync_node.await_ready()
+
+        if self.mixed_bin_versions:
+            for i in range(self.num_nodes):
+                if self.nodes[i].mongod_executable != self.mixed_bin_versions[i]:
+                    msg = (f"Executable of node{i}: {self.nodes[i].mongod_executable} does not "
+                           f"match the executable assigned by mixedBinVersions: "
+                           f"{self.mixed_bin_versions[i]}.")
+                    raise errors.ServerFailure(msg)
 
         # We need only to wait to connect to the first node of the replica set because we first
         # initiate it as a single node replica set.

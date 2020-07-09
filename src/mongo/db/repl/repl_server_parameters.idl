@@ -305,10 +305,19 @@ server_parameters:
     # TODO: Remove in SERVER-46541.
     enableAutomaticReconfig:
         description: >-
-            Enables the `newlyAdded` field in member configs to be set, as part of automatic
+            Enables the 'newlyAdded' field in member configs to be set, as part of automatic
             reconfig.
         set_at: startup
         test_only: true
         cpp_vartype: bool
         cpp_varname: enableAutomaticReconfig
+        default: false
+
+    oplogApplicationEnforcesSteadyStateConstraints:
+        description: >-
+            Whether or not secondary oplog application enforces (by fassert) consistency
+            constraints that apply if an oplog entry is to be applied exactly once and in order.
+        set_at: startup
+        cpp_vartype: bool
+        cpp_varname: oplogApplicationEnforcesSteadyStateConstraints
         default: false

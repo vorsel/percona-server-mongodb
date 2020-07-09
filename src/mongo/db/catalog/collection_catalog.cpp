@@ -268,6 +268,12 @@ void CollectionCatalog::makeCollectionVisible(CollectionUUID uuid) {
     coll->setCommitted(true);
 }
 
+bool CollectionCatalog::isCollectionAwaitingVisibility(CollectionUUID uuid) const {
+    stdx::lock_guard<Latch> lock(_catalogLock);
+    auto coll = _lookupCollectionByUUID(lock, uuid);
+    return coll && !coll->isCommitted();
+}
+
 Collection* CollectionCatalog::_lookupCollectionByUUID(WithLock, CollectionUUID uuid) const {
     auto foundIt = _catalog.find(uuid);
     return foundIt == _catalog.end() ? nullptr : foundIt->second.get();
@@ -405,7 +411,13 @@ std::vector<std::string> CollectionCatalog::getAllDbNames() const {
         auto dbName = iter->first.first;
         if (iter->second->isCommitted()) {
             ret.push_back(dbName);
+        } else {
+            // If the first collection found for `dbName` is not yet committed, increment the
+            // iterator to find the next visible collection (possibly under a different `dbName`).
+            iter++;
+            continue;
         }
+        // Move on to the next database after `dbName`.
         iter = _orderedCollections.upper_bound(std::make_pair(dbName, maxUuid));
     }
     return ret;

@@ -38,6 +38,8 @@
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/storage/storage_debug_util.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
@@ -110,10 +112,10 @@ void IndexConsistency::addIndexEntryErrors(ValidateResultsMap* indexNsResultsMap
                                            ValidateResults* results) {
     invariant(!_firstPhase);
 
-    // We'll report up to 1MB for extra index entry errors and missing index entry errors.
-    const int kErrorSizeMB = 1 * 1024 * 1024;
-    int numMissingIndexEntriesSizeMB = 0;
-    int numExtraIndexEntriesSizeMB = 0;
+    // We'll report up to 1MB for extra index entry errors and missing index entry errors combined.
+    const int kErrorSizeBytes = 500 * 1024;
+    long numMissingIndexEntriesSizeBytes = 0;
+    long numExtraIndexEntriesSizeBytes = 0;
 
     int numMissingIndexEntryErrors = _missingIndexEntries.size();
     int numExtraIndexEntryErrors = 0;
@@ -127,13 +129,8 @@ void IndexConsistency::addIndexEntryErrors(ValidateResultsMap* indexNsResultsMap
     for (const auto& missingIndexEntry : _missingIndexEntries) {
         const BSONObj& entry = missingIndexEntry.second;
 
-        // Only count the indexKey and idKey fields towards the total size.
-        numMissingIndexEntriesSizeMB += entry["indexKey"].size();
-        if (entry.hasField("idKey")) {
-            numMissingIndexEntriesSizeMB += entry["idKey"].size();
-        }
-
-        if (numMissingIndexEntriesSizeMB <= kErrorSizeMB) {
+        numMissingIndexEntriesSizeBytes += entry.objsize();
+        if (numMissingIndexEntriesSizeBytes <= kErrorSizeBytes) {
             results->missingIndexEntries.push_back(entry);
         } else if (!missingIndexEntrySizeLimitWarning) {
             StringBuilder ss;
@@ -159,9 +156,8 @@ void IndexConsistency::addIndexEntryErrors(ValidateResultsMap* indexNsResultsMap
     for (const auto& extraIndexEntry : _extraIndexEntries) {
         const SimpleBSONObjSet& entries = extraIndexEntry.second;
         for (const auto& entry : entries) {
-            // Only count the indexKey field towards the total size.
-            numExtraIndexEntriesSizeMB += entry["indexKey"].size();
-            if (numExtraIndexEntriesSizeMB <= kErrorSizeMB) {
+            numExtraIndexEntriesSizeBytes += entry.objsize();
+            if (numExtraIndexEntriesSizeBytes <= kErrorSizeBytes) {
                 results->extraIndexEntries.push_back(entry);
             } else if (!extraIndexEntrySizeLimitWarning) {
                 StringBuilder ss;
@@ -212,6 +208,15 @@ void IndexConsistency::addDocKey(OperationContext* opCtx,
         // keys encountered.
         _indexKeyCount[hash]++;
         indexInfo->numRecords++;
+
+        if (MONGO_unlikely(_validateState->extraLoggingForTest())) {
+            LOGV2(46666002, "[validate](record) {hash_num}", "hash_num"_attr = hash);
+            const BSONObj& keyPatternBson = indexInfo->keyPattern;
+            auto keyStringBson = KeyString::toBsonSafe(
+                ks.getBuffer(), ks.getSize(), indexInfo->ord, ks.getTypeBits());
+            StorageDebugUtil::printKeyString(
+                recordId, ks, keyPatternBson, keyStringBson, "[validate](record)");
+        }
     } else if (_indexKeyCount[hash]) {
         // Found a document key for a hash bucket that had mismatches.
 
@@ -246,6 +251,15 @@ void IndexConsistency::addIndexKey(const KeyString::Value& ks,
         // keys encountered.
         _indexKeyCount[hash]--;
         indexInfo->numKeys++;
+
+        if (MONGO_unlikely(_validateState->extraLoggingForTest())) {
+            LOGV2(46666003, "[validate](index) {hash_num}", "hash_num"_attr = hash);
+            const BSONObj& keyPatternBson = indexInfo->keyPattern;
+            auto keyStringBson = KeyString::toBsonSafe(
+                ks.getBuffer(), ks.getSize(), indexInfo->ord, ks.getTypeBits());
+            StorageDebugUtil::printKeyString(
+                recordId, ks, keyPatternBson, keyStringBson, "[validate](index)");
+        }
     } else if (_indexKeyCount[hash]) {
         // Found an index key for a bucket that has inconsistencies.
         // If there is a corresponding document key for the index entry key, we remove the key from
