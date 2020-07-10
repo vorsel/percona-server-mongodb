@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -573,16 +573,22 @@ StatusWith<BSONObj> ReplicationCoordinatorExternalStateImpl::loadLocalConfigDocu
 }
 
 Status ReplicationCoordinatorExternalStateImpl::storeLocalConfigDocument(OperationContext* opCtx,
-                                                                         const BSONObj& config) {
+                                                                         const BSONObj& config,
+                                                                         bool writeOplog) {
     try {
         writeConflictRetry(opCtx, "save replica set config", configCollectionName, [&] {
+            WriteUnitOfWork wuow(opCtx);
             Lock::DBLock dbWriteLock(opCtx, configDatabaseName, MODE_X);
             Helpers::putSingleton(opCtx, configCollectionName, config);
+
+            if (writeOplog) {
+                auto msgObj = BSON("msg"
+                                   << "Reconfig set"
+                                   << "version" << config["version"]);
+                _service->getOpObserver()->onOpMessage(opCtx, msgObj);
+            }
+            wuow.commit();
         });
-
-        // Wait for durability of the new config document.
-        opCtx->recoveryUnit()->waitUntilDurable(opCtx);
-
         return Status::OK();
     } catch (const DBException& ex) {
         return ex.toStatus();

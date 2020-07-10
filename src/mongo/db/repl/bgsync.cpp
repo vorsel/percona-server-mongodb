@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -111,7 +111,8 @@ public:
         BackgroundSync* bgsync);
     bool shouldStopFetching(const HostAndPort& source,
                             const rpc::ReplSetMetadata& replMetadata,
-                            const rpc::OplogQueryMetadata& oqMetadata) override;
+                            const rpc::OplogQueryMetadata& oqMetadata,
+                            const OpTime& lastOpTimeFetched) override;
 
 private:
     BackgroundSync* _bgsync;
@@ -127,12 +128,14 @@ DataReplicatorExternalStateBackgroundSync::DataReplicatorExternalStateBackground
 bool DataReplicatorExternalStateBackgroundSync::shouldStopFetching(
     const HostAndPort& source,
     const rpc::ReplSetMetadata& replMetadata,
-    const rpc::OplogQueryMetadata& oqMetadata) {
+    const rpc::OplogQueryMetadata& oqMetadata,
+    const OpTime& lastOpTimeFetched) {
     if (_bgsync->shouldStopFetching()) {
         return true;
     }
 
-    return DataReplicatorExternalStateImpl::shouldStopFetching(source, replMetadata, oqMetadata);
+    return DataReplicatorExternalStateImpl::shouldStopFetching(
+        source, replMetadata, oqMetadata, lastOpTimeFetched);
 }
 
 size_t getSize(const BSONObj& o) {
@@ -530,7 +533,7 @@ void BackgroundSync::_produce() {
 
     const auto logLevel = getTestCommandsEnabled() ? 0 : 1;
     LOGV2_DEBUG(21092,
-                logSeverityV1toV2(logLevel).toInt(),
+                logLevel,
                 "scheduling fetcher to read remote oplog on {syncSource} starting at "
                 "{lastOpTimeFetched}",
                 "Scheduling fetcher to read remote oplog",

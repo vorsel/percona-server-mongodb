@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kIndex
 
 #include "mongo/db/index/skipped_record_tracker.h"
 
@@ -55,10 +55,14 @@ void SkippedRecordTracker::record(OperationContext* opCtx, const RecordId& recor
         _skippedRecordsTable =
             opCtx->getServiceContext()->getStorageEngine()->makeTemporaryRecordStore(opCtx);
     }
+    // A WriteUnitOfWork may not already be active if the originating operation was part of an
+    // insert into the external sorter.
+    WriteUnitOfWork wuow(opCtx);
     uassertStatusOK(
         _skippedRecordsTable->rs()
             ->insertRecord(opCtx, toInsert.objdata(), toInsert.objsize(), Timestamp::min())
             .getStatus());
+    wuow.commit();
 }
 
 bool SkippedRecordTracker::areAllRecordsApplied(OperationContext* opCtx) const {
@@ -150,7 +154,7 @@ Status SkippedRecordTracker::retrySkippedRecords(OperationContext* opCtx,
 
     int logLevel = (resolved > 0) ? 0 : 1;
     LOGV2_DEBUG(23883,
-                logSeverityV1toV2(logLevel).toInt(),
+                logLevel,
                 "index build: reapplied {resolved} skipped records for index: "
                 "{indexCatalogEntry_descriptor_indexName}",
                 "resolved"_attr = resolved,

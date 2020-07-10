@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -40,7 +40,7 @@
 
 namespace mongo {
 
-void IndexBuildsCoordinatorEmbedded::shutdown() {}
+void IndexBuildsCoordinatorEmbedded::shutdown(OperationContext* opCtx) {}
 
 StatusWith<SharedSemiFuture<ReplIndexBuildState::IndexCatalogStats>>
 IndexBuildsCoordinatorEmbedded::startIndexBuild(OperationContext* opCtx,
@@ -52,22 +52,20 @@ IndexBuildsCoordinatorEmbedded::startIndexBuild(OperationContext* opCtx,
                                                 IndexBuildOptions indexBuildOptions) {
     invariant(!opCtx->lockState()->isLocked());
 
-    auto statusWithOptionalResult = _filterSpecsAndRegisterBuild(
-        opCtx, dbName, collectionUUID, specs, buildUUID, protocol, indexBuildOptions.commitQuorum);
+    auto statusWithOptionalResult =
+        _filterSpecsAndRegisterBuild(opCtx, dbName, collectionUUID, specs, buildUUID, protocol);
     if (!statusWithOptionalResult.isOK()) {
         return statusWithOptionalResult.getStatus();
     }
 
     if (statusWithOptionalResult.getValue()) {
-        // TODO (SERVER-37644): when joining is implemented, the returned Future will no longer
-        // always be set.
         invariant(statusWithOptionalResult.getValue()->isReady());
         // The requested index (specs) are already built or are being built. Return success early
         // (this is v4.0 behavior compatible).
         return statusWithOptionalResult.getValue().get();
     }
 
-    auto status = _setUpIndexBuild(opCtx, buildUUID, Timestamp());
+    auto status = _setUpIndexBuild(opCtx, buildUUID, Timestamp(), indexBuildOptions);
     if (!status.isOK()) {
         return status;
     }
@@ -81,10 +79,10 @@ IndexBuildsCoordinatorEmbedded::startIndexBuild(OperationContext* opCtx,
 void IndexBuildsCoordinatorEmbedded::_signalPrimaryForCommitReadiness(
     OperationContext* opCtx, std::shared_ptr<ReplIndexBuildState> replState) {}
 
-Timestamp IndexBuildsCoordinatorEmbedded::_waitForNextIndexBuildAction(
-    OperationContext* opCtx, std::shared_ptr<ReplIndexBuildState> replState) {
-    return Timestamp();
-}
+void IndexBuildsCoordinatorEmbedded::_waitForNextIndexBuildActionAndCommit(
+    OperationContext* opCtx,
+    std::shared_ptr<ReplIndexBuildState> replState,
+    const IndexBuildOptions& indexBuildOptions) {}
 
 void IndexBuildsCoordinatorEmbedded::setSignalAndCancelVoteRequestCbkIfActive(
     WithLock ReplIndexBuildStateLk,
@@ -111,7 +109,7 @@ void IndexBuildsCoordinatorEmbedded::_signalIfCommitQuorumIsSatisfied(
 }
 
 bool IndexBuildsCoordinatorEmbedded::_signalIfCommitQuorumNotEnabled(
-    OperationContext* opCtx, std::shared_ptr<ReplIndexBuildState> replState, bool onStepUp) {
+    OperationContext* opCtx, std::shared_ptr<ReplIndexBuildState> replState) {
     MONGO_UNREACHABLE;
 }
 

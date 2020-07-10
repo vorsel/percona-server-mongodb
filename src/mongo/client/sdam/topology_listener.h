@@ -52,8 +52,7 @@ public:
                                                    TopologyDescriptionPtr previousDescription,
                                                    TopologyDescriptionPtr newDescription){};
 
-    virtual void onServerHeartbeatFailureEvent(IsMasterRTT durationMs,
-                                               Status errorStatus,
+    virtual void onServerHeartbeatFailureEvent(Status errorStatus,
                                                const ServerAddress& hostAndPort,
                                                const BSONObj reply){};
     /**
@@ -64,13 +63,16 @@ public:
                                                 const sdam::ServerAddress& address,
                                                 const BSONObj reply = BSONObj()){};
 
+    virtual void onServerHandshakeFailedEvent(const sdam::ServerAddress& address,
+                                              const Status& status,
+                                              const BSONObj reply){};
+
     /**
      * Called when a ServerHeartBeatSucceededEvent is published - A heartbeat sent to the server at
      * hostAndPort succeeded. durationMS is the execution time of the event, including the time it
      * took to send the message and recieve the reply from the server.
      */
-    virtual void onServerHeartbeatSucceededEvent(IsMasterRTT durationMs,
-                                                 const ServerAddress& hostAndPort,
+    virtual void onServerHeartbeatSucceededEvent(const ServerAddress& hostAndPort,
                                                  const BSONObj reply){};
 
     /*
@@ -108,11 +110,14 @@ public:
     virtual void onServerHandshakeCompleteEvent(IsMasterRTT durationMs,
                                                 const sdam::ServerAddress& address,
                                                 const BSONObj reply = BSONObj()) override;
-    void onServerHeartbeatSucceededEvent(IsMasterRTT durationMs,
-                                         const ServerAddress& hostAndPort,
+
+    void onServerHandshakeFailedEvent(const sdam::ServerAddress& address,
+                                      const Status& status,
+                                      const BSONObj reply);
+
+    void onServerHeartbeatSucceededEvent(const ServerAddress& hostAndPort,
                                          const BSONObj reply) override;
-    void onServerHeartbeatFailureEvent(IsMasterRTT durationMs,
-                                       Status errorStatus,
+    void onServerHeartbeatFailureEvent(Status errorStatus,
                                        const ServerAddress& hostAndPort,
                                        const BSONObj reply) override;
     void onServerPingFailedEvent(const ServerAddress& hostAndPort, const Status& status) override;
@@ -126,8 +131,10 @@ private:
         PING_SUCCESS,
         PING_FAILURE,
         TOPOLOGY_DESCRIPTION_CHANGED,
-        HANDSHAKE_COMPLETE
+        HANDSHAKE_COMPLETE,
+        HANDSHAKE_FAILURE
     };
+
     struct Event {
         EventType type;
         ServerAddress hostAndPort;

@@ -694,6 +694,7 @@ _SELECTOR_REGISTRY = {
     "cpp_unit_test": (_CppTestSelectorConfig, _CppTestSelector),
     "benchmark_test": (_CppTestSelectorConfig, _CppTestSelector),
     "sdam_json_test": (_FileBasedSelectorConfig, _Selector),
+    "server_selection_json_test": (_FileBasedSelectorConfig, _Selector),
     "db_test": (_DbTestSelectorConfig, _DbTestSelector),
     "fsm_workload_test": (_JSTestSelectorConfig, _JSTestSelector),
     "parallel_fsm_workload_test": (_MultiJSTestSelectorConfig, _MultiJSTestSelector),
@@ -707,6 +708,7 @@ _SELECTOR_REGISTRY = {
     "genny_test": (_FileBasedSelectorConfig, _Selector),
     "gennylib_test": (_GennylibTestCaseSelectorConfig, _GennylibTestCaseSelector),
     "cpp_libfuzzer_test": (_CppTestSelectorConfig, _CppTestSelector),
+    "tla_plus_test": (_FileBasedSelectorConfig, _Selector),
 }
 
 

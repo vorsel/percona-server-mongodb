@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -50,6 +50,8 @@ ReplicationCoordinatorEmbedded::~ReplicationCoordinatorEmbedded() = default;
 void ReplicationCoordinatorEmbedded::startup(OperationContext* opCtx) {}
 
 void ReplicationCoordinatorEmbedded::enterTerminalShutdown() {}
+
+void ReplicationCoordinatorEmbedded::enterQuiesceMode() {}
 
 void ReplicationCoordinatorEmbedded::shutdown(OperationContext* opCtx) {}
 
@@ -348,7 +350,8 @@ Status ReplicationCoordinatorEmbedded::doReplSetReconfig(OperationContext* opCtx
     UASSERT_NOT_IMPLEMENTED;
 }
 
-Status ReplicationCoordinatorEmbedded::awaitConfigCommitment(OperationContext* opCtx) {
+Status ReplicationCoordinatorEmbedded::awaitConfigCommitment(OperationContext* opCtx,
+                                                             bool waitForOplogCommitment) {
     UASSERT_NOT_IMPLEMENTED;
 }
 
@@ -408,7 +411,8 @@ void ReplicationCoordinatorEmbedded::resetLastOpTimesFromOplog(OperationContext*
 
 bool ReplicationCoordinatorEmbedded::shouldChangeSyncSource(const HostAndPort&,
                                                             const rpc::ReplSetMetadata&,
-                                                            const rpc::OplogQueryMetadata&) {
+                                                            const rpc::OplogQueryMetadata&,
+                                                            const OpTime&) {
     UASSERT_NOT_IMPLEMENTED;
 }
 
@@ -510,14 +514,14 @@ std::shared_ptr<const repl::IsMasterResponse> ReplicationCoordinatorEmbedded::aw
     OperationContext* opCtx,
     const repl::SplitHorizon::Parameters& horizonParams,
     boost::optional<TopologyVersion> previous,
-    boost::optional<Date_t> deadline) const {
+    boost::optional<Date_t> deadline) {
     UASSERT_NOT_IMPLEMENTED;
 };
 
 SharedSemiFuture<std::shared_ptr<const IsMasterResponse>>
 ReplicationCoordinatorEmbedded::getIsMasterResponseFuture(
     const SplitHorizon::Parameters& horizonParams,
-    boost::optional<TopologyVersion> clientTopologyVersion) const {
+    boost::optional<TopologyVersion> clientTopologyVersion) {
     UASSERT_NOT_IMPLEMENTED;
 }
 
@@ -540,6 +544,10 @@ BSONObj ReplicationCoordinatorEmbedded::runCmdOnPrimaryAndAwaitResponse(
     const BSONObj& cmdObj,
     OnRemoteCmdScheduledFn onRemoteCmdScheduled,
     OnRemoteCmdCompleteFn onRemoteCmdComplete) {
+    MONGO_UNREACHABLE;
+}
+
+void ReplicationCoordinatorEmbedded::restartHeartbeats_forTest() {
     MONGO_UNREACHABLE;
 }
 

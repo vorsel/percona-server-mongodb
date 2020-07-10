@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -62,8 +62,9 @@ namespace {
 void uassertStatusOKWithWarning(const Status& status) {
     if (!status.isOK()) {
         LOGV2_WARNING(23777,
-                      "Chunk move failed{causedBy_status}",
-                      "causedBy_status"_attr = causedBy(redact(status)));
+                      "Chunk move failed with {error}",
+                      "Error while doing moveChunk",
+                      "error"_attr = redact(status));
         uassertStatusOK(status);
     }
 }

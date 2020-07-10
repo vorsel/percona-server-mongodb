@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -260,6 +260,10 @@ void fillOutPlannerParams(OperationContext* opCtx,
         collection->getIndexCatalog()->getIndexIterator(opCtx, false);
     while (ii->more()) {
         const IndexCatalogEntry* ice = ii->next();
+
+        // Skip the addition of hidden indexes to prevent use in query planning.
+        if (ice->descriptor()->hidden())
+            continue;
         plannerParams->indices.push_back(
             indexEntryFromIndexCatalogEntry(opCtx, *ice, canonicalQuery));
     }
@@ -283,8 +287,8 @@ void fillOutPlannerParams(OperationContext* opCtx,
 
     // If the caller wants a shard filter, make sure we're actually sharded.
     if (plannerParams->options & QueryPlannerParams::INCLUDE_SHARD_FILTER) {
-        auto collDesc =
-            CollectionShardingState::get(opCtx, canonicalQuery->nss())->getCollectionDescription();
+        auto collDesc = CollectionShardingState::get(opCtx, canonicalQuery->nss())
+                            ->getCollectionDescription_DEPRECATED();
         if (collDesc.isSharded()) {
             plannerParams->shardKey = collDesc.getKeyPattern();
         } else {
@@ -780,7 +784,7 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDelete(
                     "nss_ns"_attr = nss.ns(),
                     "request_getQuery"_attr = redact(request->getQuery()));
         return PlanExecutor::make(
-            opCtx, std::move(ws), std::make_unique<EOFStage>(expCtx.get()), nullptr, policy, nss);
+            expCtx, std::move(ws), std::make_unique<EOFStage>(expCtx.get()), nullptr, policy, nss);
     }
 
     if (!parsedDelete->hasParsedQuery()) {
@@ -822,7 +826,7 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDelete(
                                                   collection,
                                                   idHackStage.release());
                 return PlanExecutor::make(
-                    opCtx, std::move(ws), std::move(root), collection, policy);
+                    expCtx, std::move(ws), std::move(root), collection, policy);
             }
         }
 
@@ -946,7 +950,7 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorUpdate(
                     "nss_ns"_attr = nss.ns(),
                     "request_getQuery"_attr = redact(request->getQuery()));
         return PlanExecutor::make(
-            opCtx, std::move(ws), std::make_unique<EOFStage>(expCtx.get()), nullptr, policy, nss);
+            expCtx, std::move(ws), std::make_unique<EOFStage>(expCtx.get()), nullptr, policy, nss);
     }
 
     // Pass index information to the update driver, so that it can determine for us whether the
@@ -1228,7 +1232,8 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorCount(
         // this case we put a CountStage on top of an EOFStage.
         unique_ptr<PlanStage> root = std::make_unique<CountStage>(
             expCtx.get(), collection, limit, skip, ws.get(), new EOFStage(expCtx.get()));
-        return PlanExecutor::make(opCtx, std::move(ws), std::move(root), nullptr, yieldPolicy, nss);
+        return PlanExecutor::make(
+            expCtx, std::move(ws), std::move(root), nullptr, yieldPolicy, nss);
     }
 
     // If the query is empty, then we can determine the count by just asking the collection
@@ -1243,7 +1248,8 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorCount(
     if (useRecordStoreCount) {
         unique_ptr<PlanStage> root =
             std::make_unique<RecordStoreFastCountStage>(expCtx.get(), collection, skip, limit);
-        return PlanExecutor::make(opCtx, std::move(ws), std::move(root), nullptr, yieldPolicy, nss);
+        return PlanExecutor::make(
+            expCtx, std::move(ws), std::move(root), nullptr, yieldPolicy, nss);
     }
 
     size_t plannerOptions = QueryPlannerParams::IS_COUNT;
@@ -1467,6 +1473,10 @@ QueryPlannerParams fillOutPlannerParamsForDistinct(OperationContext* opCtx,
     while (ii->more()) {
         const IndexCatalogEntry* ice = ii->next();
         const IndexDescriptor* desc = ice->descriptor();
+
+        // Skip the addition of hidden indexes to prevent use in query planning.
+        if (desc->hidden())
+            continue;
         if (desc->keyPattern().hasField(parsedDistinct.getKey())) {
             if (!mayUnwindArrays &&
                 isAnyComponentOfPathMultikey(desc->keyPattern(),

@@ -81,6 +81,10 @@ void ReplicationCoordinatorMock::enterTerminalShutdown() {
     // TODO
 }
 
+void ReplicationCoordinatorMock::enterQuiesceMode() {
+    // TODO
+}
+
 void ReplicationCoordinatorMock::shutdown(OperationContext*) {
     // TODO
 }
@@ -381,7 +385,8 @@ Status ReplicationCoordinatorMock::doReplSetReconfig(OperationContext* opCtx,
     return Status::OK();
 }
 
-Status ReplicationCoordinatorMock::awaitConfigCommitment(OperationContext* opCtx) {
+Status ReplicationCoordinatorMock::awaitConfigCommitment(OperationContext* opCtx,
+                                                         bool waitForOplogCommitment) {
     return Status::OK();
 }
 
@@ -448,7 +453,8 @@ bool ReplicationCoordinatorMock::lastOpTimesWereReset() const {
 
 bool ReplicationCoordinatorMock::shouldChangeSyncSource(const HostAndPort& currentSource,
                                                         const rpc::ReplSetMetadata& replMetadata,
-                                                        const rpc::OplogQueryMetadata& oqMetadata) {
+                                                        const rpc::OplogQueryMetadata& oqMetadata,
+                                                        const OpTime& lastOpTimeFetched) {
     MONGO_UNREACHABLE;
 }
 
@@ -572,7 +578,7 @@ void ReplicationCoordinatorMock::incrementTopologyVersion() {
 SharedSemiFuture<std::shared_ptr<const IsMasterResponse>>
 ReplicationCoordinatorMock::getIsMasterResponseFuture(
     const SplitHorizon::Parameters& horizonParams,
-    boost::optional<TopologyVersion> clientTopologyVersion) const {
+    boost::optional<TopologyVersion> clientTopologyVersion) {
     auto response =
         awaitIsMasterResponse(nullptr, horizonParams, clientTopologyVersion, Date_t::now());
     return SharedSemiFuture<std::shared_ptr<const IsMasterResponse>>(
@@ -583,7 +589,7 @@ std::shared_ptr<const IsMasterResponse> ReplicationCoordinatorMock::awaitIsMaste
     OperationContext* opCtx,
     const SplitHorizon::Parameters& horizonParams,
     boost::optional<TopologyVersion> clientTopologyVersion,
-    boost::optional<Date_t> deadline) const {
+    boost::optional<Date_t> deadline) {
     auto response = std::make_shared<IsMasterResponse>();
     response->setReplSetVersion(_getConfigReturnValue.getConfigVersion());
     response->setIsMaster(true);
@@ -615,5 +621,9 @@ BSONObj ReplicationCoordinatorMock::runCmdOnPrimaryAndAwaitResponse(
     OnRemoteCmdCompleteFn onRemoteCmdComplete) {
     return BSON("ok" << 1);
 }
+void ReplicationCoordinatorMock::restartHeartbeats_forTest() {
+    return;
+}
+
 }  // namespace repl
 }  // namespace mongo

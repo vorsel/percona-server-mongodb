@@ -46,14 +46,14 @@ WildcardAccessMethod::WildcardAccessMethod(IndexCatalogEntry* wildcardState,
               getSortedDataInterface()->getKeyStringVersion(),
               getSortedDataInterface()->getOrdering()) {}
 
-bool WildcardAccessMethod::shouldMarkIndexAsMultikey(
-    size_t numberOfKeys,
-    const std::vector<KeyString::Value>& multikeyMetadataKeys,
-    const MultikeyPaths& multikeyPaths) const {
+bool WildcardAccessMethod::shouldMarkIndexAsMultikey(size_t numberOfKeys,
+                                                     const KeyStringSet& multikeyMetadataKeys,
+                                                     const MultikeyPaths& multikeyPaths) const {
     return !multikeyMetadataKeys.empty();
 }
 
-void WildcardAccessMethod::doGetKeys(const BSONObj& obj,
+void WildcardAccessMethod::doGetKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                                     const BSONObj& obj,
                                      GetKeysContext context,
                                      KeyStringSet* keys,
                                      KeyStringSet* multikeyMetadataKeys,

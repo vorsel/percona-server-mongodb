@@ -127,6 +127,14 @@ public:
     virtual void enterTerminalShutdown() = 0;
 
     /**
+     * We enter quiesce mode during the shutdown process if we are in secondary mode. While in
+     * quiesce mode, we allow reads to continue and accept new reads, but we fail isMaster requests
+     * with ShutdownInProgress. This function causes us to increment the topologyVersion and start
+     * failing isMaster requests with ShutdownInProgress.
+     */
+    virtual void enterQuiesceMode() = 0;
+
+    /**
      * Does whatever cleanup is required to stop replication, including instructing the other
      * components of the replication system to shut down and stop any threads they are using,
      * blocking until all replication-related shutdown tasks are complete.
@@ -707,7 +715,7 @@ public:
      *  (1) The current config has propagated to a majority of nodes.
      *  (2) Any operations committed in the previous config are committed in the current config.
      */
-    virtual Status awaitConfigCommitment(OperationContext* opCtx) = 0;
+    virtual Status awaitConfigCommitment(OperationContext* opCtx, bool waitForOplogCommitment) = 0;
 
     /*
      * Handles an incoming replSetInitiate command. If "configObj" is empty, generates a default
@@ -979,7 +987,7 @@ public:
         OperationContext* opCtx,
         const SplitHorizon::Parameters& horizonParams,
         boost::optional<TopologyVersion> clientTopologyVersion,
-        boost::optional<Date_t> deadline) const = 0;
+        boost::optional<Date_t> deadline) = 0;
 
     /**
      * The futurized version of `awaitIsMasterResponse()`:
@@ -988,7 +996,7 @@ public:
      */
     virtual SharedSemiFuture<std::shared_ptr<const IsMasterResponse>> getIsMasterResponseFuture(
         const SplitHorizon::Parameters& horizonParams,
-        boost::optional<TopologyVersion> clientTopologyVersion) const = 0;
+        boost::optional<TopologyVersion> clientTopologyVersion) = 0;
 
     /**
      * Returns the OpTime that consists of the timestamp of the latest oplog entry and the current
@@ -1030,6 +1038,11 @@ public:
                                                     const BSONObj& cmdObj,
                                                     OnRemoteCmdScheduledFn onRemoteCmdScheduled,
                                                     OnRemoteCmdCompleteFn onRemoteCmdComplete) = 0;
+
+    /**
+     * A testing only function that cancels and reschedules replication heartbeats immediately.
+     */
+    virtual void restartHeartbeats_forTest() = 0;
 
 protected:
     ReplicationCoordinator();

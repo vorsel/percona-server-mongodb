@@ -34,7 +34,6 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/commands/shutdown.h"
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/log_process_details.h"
 #include "mongo/logv2/log.h"
@@ -43,7 +42,6 @@
 #include "mongo/scripting/engine.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log_global_settings.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/ntservice.h"
 #include "mongo/util/processinfo.h"
@@ -139,9 +137,6 @@ public:
 
 } hostInfoCmd;
 
-MONGO_FAIL_POINT_DEFINE(crashOnShutdown);
-int* volatile illegalAddress;  // NOLINT - used for fail point only
-
 class CmdGetCmdLineOpts : public BasicCommand {
 public:
     CmdGetCmdLineOpts() : BasicCommand("getCmdLineOpts") {}
@@ -236,10 +231,7 @@ public:
                    const BSONObj& cmdObj,
                    std::string& errmsg,
                    BSONObjBuilder& result) override {
-        if (logV2Enabled()) {
-            return errmsgRunImpl<logv2::RamLog>(opCtx, dbname, cmdObj, errmsg, result);
-        }
-        return errmsgRunImpl<RamLog>(opCtx, dbname, cmdObj, errmsg, result);
+        return errmsgRunImpl<logv2::RamLog>(opCtx, dbname, cmdObj, errmsg, result);
     }
 
     template <typename RamLogType>
@@ -325,11 +317,8 @@ public:
             invariant(ramlog);
             ramlog->clear();
         };
-        if (logV2Enabled()) {
-            clearRamlog(logv2::RamLog::getIfExists(logName));
-        } else {
-            clearRamlog(RamLog::getIfExists(logName));
-        }
+        clearRamlog(logv2::RamLog::getIfExists(logName));
+
         return true;
     }
 };
@@ -337,42 +326,5 @@ public:
 MONGO_REGISTER_TEST_COMMAND(ClearLogCmd);
 
 }  // namespace
-
-void CmdShutdown::addRequiredPrivileges(const std::string& dbname,
-                                        const BSONObj& cmdObj,
-                                        std::vector<Privilege>* out) const {
-    ActionSet actions;
-    actions.addAction(ActionType::shutdown);
-    out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
-}
-
-void CmdShutdown::shutdownHelper(const BSONObj& cmdObj) {
-    ShutdownTaskArgs shutdownArgs;
-    shutdownArgs.isUserInitiated = true;
-
-    crashOnShutdown.execute([&](const BSONObj& data) {
-        if (data["how"].str() == "fault") {
-            ++*illegalAddress;
-        }
-        ::abort();
-    });
-
-    LOGV2(20475, "terminating, shutdown command received {cmdObj}", "cmdObj"_attr = cmdObj);
-
-#if defined(_WIN32)
-    // Signal the ServiceMain thread to shutdown.
-    if (ntservice::shouldStartService()) {
-        shutdownNoTerminate(shutdownArgs);
-
-        // Client expects us to abruptly close the socket as part of exiting
-        // so this function is not allowed to return.
-        // The ServiceMain thread will quit for us so just sleep until it does.
-        while (true)
-            sleepsecs(60);  // Loop forever
-        return;
-    }
-#endif
-    shutdown(EXIT_CLEAN, shutdownArgs);  // this never returns
-}
 
 }  // namespace mongo

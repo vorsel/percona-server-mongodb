@@ -45,7 +45,7 @@ namespace executor {
 extern FailPoint networkInterfaceSendRequestsToTargetHostsInAlphabeticalOrder;
 extern FailPoint networkInterfaceDiscardCommandsBeforeAcquireConn;
 extern FailPoint networkInterfaceHangCommandsAfterAcquireConn;
-extern FailPoint networkInterfaceAfterAcquireConn;
+extern FailPoint networkInterfaceCommandsFailedWithErrorCode;
 
 /**
  * Interface to networking for use by TaskExecutor implementations.
@@ -58,8 +58,10 @@ public:
     using Response = RemoteCommandResponse;
     using RemoteCommandCompletionFn =
         unique_function<void(const TaskExecutor::ResponseOnAnyStatus&)>;
-    using RemoteCommandOnReplyFn =
-        unique_function<void(const TaskExecutor::ResponseOnAnyStatus&, bool isMoreToComeSet)>;
+    using RemoteCommandOnReplyFn = unique_function<void(const TaskExecutor::ResponseOnAnyStatus&)>;
+
+    // Indicates that there is no expiration time by when a request needs to complete
+    static constexpr Date_t kNoExpirationDate{Date_t::max()};
 
     virtual ~NetworkInterface();
 

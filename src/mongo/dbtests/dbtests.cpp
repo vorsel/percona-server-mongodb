@@ -108,8 +108,8 @@ Status createIndexFromSpec(OperationContext* opCtx, StringData ns, const BSONObj
         wunit.commit();
     }
     MultiIndexBlock indexer;
-    ON_BLOCK_EXIT(
-        [&] { indexer.cleanUpAfterBuild(opCtx, coll, MultiIndexBlock::kNoopOnCleanUpFn); });
+    auto abortOnExit =
+        makeGuard([&] { indexer.abortIndexBuild(opCtx, coll, MultiIndexBlock::kNoopOnCleanUpFn); });
     Status status = indexer
                         .init(opCtx,
                               coll,
@@ -131,6 +131,10 @@ Status createIndexFromSpec(OperationContext* opCtx, StringData ns, const BSONObj
     if (!status.isOK()) {
         return status;
     }
+    status = indexer.retrySkippedRecords(opCtx, coll);
+    if (!status.isOK()) {
+        return status;
+    }
     status = indexer.checkConstraints(opCtx);
     if (!status.isOK()) {
         return status;
@@ -140,6 +144,7 @@ Status createIndexFromSpec(OperationContext* opCtx, StringData ns, const BSONObj
         opCtx, coll, MultiIndexBlock::kNoopOnCreateEachFn, MultiIndexBlock::kNoopOnCommitFn));
     ASSERT_OK(opCtx->recoveryUnit()->setTimestamp(Timestamp(1, 1)));
     wunit.commit();
+    abortOnExit.dismiss();
     return Status::OK();
 }
 
@@ -173,7 +178,7 @@ int dbtestsMain(int argc, char** argv, char** envp) {
 
     mongo::runGlobalInitializersOrDie(argc, argv, envp);
     serverGlobalParams.featureCompatibility.setVersion(
-        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44);
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo46);
     repl::ReplSettings replSettings;
     replSettings.setOplogSizeBytes(10 * 1024 * 1024);
     setGlobalServiceContext(ServiceContext::make());

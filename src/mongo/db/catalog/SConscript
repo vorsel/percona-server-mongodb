@@ -356,6 +356,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/db/storage/key_string',
         '$BUILD_DIR/mongo/db/storage/durable_catalog_impl',
+        '$BUILD_DIR/mongo/db/storage/execution_context',
         '$BUILD_DIR/mongo/db/storage/storage_engine_impl',
         '$BUILD_DIR/mongo/db/system_index',
         '$BUILD_DIR/mongo/db/views/views_mongod',
@@ -388,6 +389,7 @@ env.Library(
         'catalog_impl',
     ],
     LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/multi_key_path_tracker',
         'throttle_cursor',
         'validate_state',
     ]
@@ -470,6 +472,7 @@ env.CppUnitTest(
         'index_build_entry_test.cpp',
         'index_builds_manager_test.cpp',
         'index_key_validate_test.cpp',
+        'index_signature_test.cpp',
         'index_spec_validate_test.cpp',
         'multi_index_block_test.cpp',
         'rename_collection_test.cpp',

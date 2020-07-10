@@ -31,7 +31,7 @@
  * This file contains tests for mongo/db/query/query_planner.cpp
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/db/query/query_planner_test_lib.h"
 
@@ -82,9 +82,9 @@ bool filterMatches(const BSONObj& testFilter,
         return false;
     }
     const std::unique_ptr<MatchExpression> root = std::move(statusWithMatcher.getValue());
-    CanonicalQuery::sortTree(root.get());
+    MatchExpression::sortTree(root.get());
     std::unique_ptr<MatchExpression> trueFilter(trueFilterNode->filter->shallowClone());
-    CanonicalQuery::sortTree(trueFilter.get());
+    MatchExpression::sortTree(trueFilter.get());
     return trueFilter->equivalent(root.get());
 }
 

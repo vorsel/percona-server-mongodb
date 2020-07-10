@@ -69,7 +69,7 @@ public:
      * ScopedCollectionDescription goes out of scope, the reference counter on the metadata will be
      * decremented and if it reaches to zero, orphan cleanup may proceed.
      */
-    ScopedCollectionDescription getActiveMetadata(
+    std::shared_ptr<ScopedCollectionDescription::Impl> getActiveMetadata(
         const boost::optional<LogicalTime>& atClusterTime);
 
     /**
@@ -114,14 +114,14 @@ public:
     }
 
     /**
+     * Clears the items in the _receivingChunks list.
+     */
+    void clearReceivingChunks();
+
+    /**
      * Appends information on all the chunk ranges in rangesToClean to builder.
      */
     void append(BSONObjBuilder* builder) const;
-
-    /**
-     * Appends summarized information for server status.
-     */
-    void appendForServerStatus(BSONArrayBuilder* builder) const;
 
     /**
      * Schedules any documents in `range` for immediate cleanup iff no running queries can depend
@@ -164,6 +164,12 @@ public:
      * useful for unit tests.
      */
     size_t numberOfRangesToCleanStillInUse() const;
+
+    /**
+     * Returns the number of ranges scheduled for deletion, regardless of whether they may still be
+     * in use by running queries.
+     */
+    size_t numberOfRangesScheduledForDeletion() const;
 
     /**
      * Reports whether any range still scheduled for deletion overlaps the argument range. If so,

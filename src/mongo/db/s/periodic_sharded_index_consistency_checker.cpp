@@ -27,13 +27,14 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/s/periodic_sharded_index_consistency_checker.h"
 
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/curop.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/sharded_agg_helpers.h"
 #include "mongo/db/s/sharding_runtime_d_params_gen.h"
@@ -117,6 +118,9 @@ void PeriodicShardedIndexConsistencyChecker::_launchShardedIndexConsistencyCheck
 
             auto uniqueOpCtx = client->makeOperationContext();
             auto opCtx = uniqueOpCtx.get();
+            auto curOp = CurOp::get(opCtx);
+            curOp->ensureStarted();
+            ON_BLOCK_EXIT([&] { curOp->done(); });
 
             try {
                 long long numShardedCollsWithInconsistentIndexes = 0;
@@ -164,11 +168,14 @@ void PeriodicShardedIndexConsistencyChecker::_launchShardedIndexConsistencyCheck
                         });
                 }
 
-                LOGV2(22051,
-                      "Found {numShardedCollsWithInconsistentIndexes} sharded collection(s) with "
-                      "inconsistent indexes",
-                      "numShardedCollsWithInconsistentIndexes"_attr =
-                          numShardedCollsWithInconsistentIndexes);
+                if (numShardedCollsWithInconsistentIndexes) {
+                    LOGV2_WARNING(22051,
+                                  "Found {numShardedCollectionsWithInconsistentIndexes} sharded "
+                                  "collection(s) with inconsistent indexes",
+                                  "Found sharded collections with inconsistent indexes",
+                                  "numShardedCollectionsWithInconsistentIndexes"_attr =
+                                      numShardedCollsWithInconsistentIndexes);
+                }
 
                 // Update the count if this node is still primary. This is necessary because a
                 // stepdown may complete while this job is running and the count should always be
@@ -180,8 +187,9 @@ void PeriodicShardedIndexConsistencyChecker::_launchShardedIndexConsistencyCheck
                 }
             } catch (DBException& ex) {
                 LOGV2(22052,
-                      "Failed to check sharded index consistency {causedBy_ex_toStatus}",
-                      "causedBy_ex_toStatus"_attr = causedBy(ex.toStatus()));
+                      "Checking sharded index consistency failed with {error}",
+                      "Error while checking sharded index consistency",
+                      "error"_attr = ex.toStatus());
             }
         },
         Milliseconds(shardedIndexConsistencyCheckIntervalMS));

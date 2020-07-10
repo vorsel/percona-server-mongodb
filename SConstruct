@@ -26,6 +26,7 @@ import mongo
 import mongo.platform as mongo_platform
 import mongo.toolchain as mongo_toolchain
 import mongo.generators as mongo_generators
+import mongo.install_actions as install_actions
 
 EnsurePythonVersion(3, 6)
 EnsureSConsVersion(3, 1, 1)
@@ -134,6 +135,14 @@ add_option('install-mode',
     choices=['legacy', 'hygienic'],
     default='legacy',
     help='select type of installation',
+    nargs=1,
+    type='choice',
+)
+
+add_option('install-action',
+    choices=([*install_actions.available_actions] + ['default']),
+    default='default',
+    help='select mechanism to use to install files (advanced option to reduce disk IO and utilization)',
     nargs=1,
     type='choice',
 )
@@ -754,6 +763,10 @@ env_vars.Add('DESTDIR',
     help='Where hygienic builds will install files',
     default='$BUILD_ROOT/install')
 
+env_vars.Add('DSYMUTIL',
+    help='Path to the dsymutil utility',
+)
+
 env_vars.Add('GITDIFFFLAGS',
     help='Sets flags for git diff',
     default='')
@@ -913,7 +926,7 @@ env_vars.Add('OBJCOPY',
 
 env_vars.Add('PKGDIR',
     help='Directory in which to build packages and archives',
-    default='$VARIANT_DIR/pkgs')
+    default='$BUILD_DIR/pkgs')
 
 env_vars.Add('PREFIX',
     help='Final installation location of files, will be made into a sub dir of $DESTDIR',
@@ -945,6 +958,10 @@ env_vars.Add('SHELL',
 env_vars.Add('SHLINKFLAGS',
     help='Sets flags for the linker when building shared libraries',
     converter=variable_shlex_converter)
+
+env_vars.Add('STRIP',
+    help='Path to the strip utility (non-darwin platforms probably use OBJCOPY for this)',
+)
 
 env_vars.Add('TARGET_ARCH',
     help='Sets the architecture to build for',
@@ -1171,6 +1188,10 @@ if has_option('variables-help'):
 unknown_vars = env_vars.UnknownVariables()
 if unknown_vars:
     env.FatalError("Unknown variables specified: {0}", ", ".join(list(unknown_vars.keys())))
+
+if get_option('install-action') != 'default' and get_option('ninja') != "disabled":
+    env.FatalError("Cannot use non-default install actions when generating Ninja.")
+install_actions.setup(env, get_option('install-action'))
 
 def set_config_header_define(env, varname, varval = 1):
     env['CONFIG_HEADER_DEFINES'][varname] = varval
@@ -2583,11 +2604,9 @@ def doConfigure(myenv):
         To specify a target minimum for Darwin platforms, please explicitly add the appropriate options
         to CCFLAGS and LINKFLAGS on the command line:
 
-        macOS: scons CCFLAGS="-mmacosx-version-min=10.11" LINKFLAGS="-mmacosx-version-min=10.11" ..
-        iOS  : scons CCFLAGS="-miphoneos-version-min=10.3" LINKFLAGS="-miphoneos-version-min=10.3" ...
-        tvOS : scons CCFLAGS="-mtvos-version-min=10.3" LINKFLAGS="-tvos-version-min=10.3" ...
+        macOS: scons CCFLAGS="-mmacosx-version-min=10.13" LINKFLAGS="-mmacosx-version-min=10.13" ..
 
-        Note that MongoDB requires macOS 10.10, iOS 10.2, or tvOS 10.2 or later.
+        Note that MongoDB requires macOS 10.13 or later.
         """
         myenv.ConfError(textwrap.dedent(message))
 
@@ -2655,6 +2674,7 @@ def doConfigure(myenv):
 
     conf.Finish()
 
+    # C11 memset_s - a secure memset
     def CheckMemset_s(context):
         test_body = """
         #define __STDC_WANT_LIB_EXT1__ 1
@@ -2678,6 +2698,10 @@ def doConfigure(myenv):
 
     if conf.CheckFunc('strnlen'):
         conf.env.SetConfigHeaderDefine("MONGO_CONFIG_HAVE_STRNLEN")
+
+    # Gblic 2.25+, OpenBSD 5.5+ and FreeBSD 11.0+ offer explicit_bzero, a secure way to zero memory
+    if conf.CheckFunc('explicit_bzero'):
+        conf.env.SetConfigHeaderDefine("MONGO_CONFIG_HAVE_EXPLICIT_BZERO")
 
     conf.Finish()
 
@@ -2999,12 +3023,23 @@ def doConfigure(myenv):
         # because it is much faster. Don't use it if the user has already configured another linker
         # selection manually.
         if not any(flag.startswith('-fuse-ld=') for flag in env['LINKFLAGS']):
-            if AddToLINKFLAGSIfSupported(myenv, '-fuse-ld=lld') or AddToLINKFLAGSIfSupported(myenv, '-fuse-ld=gold'):
-                if link_model.startswith("dynamic"):
-                    AddToLINKFLAGSIfSupported(myenv, '-Wl,--gdb-index')
 
-            # Our build is already parallel.
-            AddToLINKFLAGSIfSupported(myenv, '-Wl,--no-threads')
+            # lld has problems with separate debug info on some platforms. See:
+            # - https://bugzilla.mozilla.org/show_bug.cgi?id=1485556
+            # - https://bugzilla.mozilla.org/show_bug.cgi?id=1485556
+            if get_option('separate-debug') == 'off':
+                if not AddToLINKFLAGSIfSupported(myenv, '-fuse-ld=lld'):
+                    AddToLINKFLAGSIfSupported(myenv, '-fuse-ld=gold')
+            else:
+                AddToLINKFLAGSIfSupported(myenv, '-fuse-ld=gold')
+
+        # Usually, --gdb-index is too expensive in big static binaries, but for dynamic
+        # builds it works well.
+        if link_model.startswith("dynamic"):
+            AddToLINKFLAGSIfSupported(myenv, '-Wl,--gdb-index')
+
+        # Our build is already parallel.
+        AddToLINKFLAGSIfSupported(myenv, '-Wl,--no-threads')
 
         # Explicitly enable GNU build id's if the linker supports it.
         AddToLINKFLAGSIfSupported(myenv, '-Wl,--build-id')
@@ -3947,7 +3982,10 @@ if get_option('ninja') != 'disabled':
 if get_option('install-mode') == 'hygienic':
 
     if get_option('separate-debug') == "on" or env.TargetOSIs("windows"):
-        env.Tool('separate_debug')
+        separate_debug = Tool('separate_debug')
+        if not separate_debug.exists(env):
+            env.FatalError('Cannot honor --separate-debug because the separate_debug.py Tool reported as nonexistent')
+        separate_debug(env)
 
     env["AUTO_ARCHIVE_TARBALL_SUFFIX"] = "tgz"
 

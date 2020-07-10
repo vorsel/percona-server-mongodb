@@ -144,9 +144,8 @@ TEST_F(OpObserverTest, StartIndexBuildExpectedOplogEntry) {
     {
         AutoGetDb autoDb(opCtx.get(), nss.db(), MODE_X);
         WriteUnitOfWork wunit(opCtx.get());
-        CommitQuorumOptions commitQuorum(1);
         opObserver.onStartIndexBuild(
-            opCtx.get(), nss, uuid, indexBuildUUID, specs, commitQuorum, false /*fromMigrate*/);
+            opCtx.get(), nss, uuid, indexBuildUUID, specs, false /*fromMigrate*/);
         wunit.commit();
     }
 
@@ -154,7 +153,6 @@ TEST_F(OpObserverTest, StartIndexBuildExpectedOplogEntry) {
     BSONObjBuilder startIndexBuildBuilder;
     startIndexBuildBuilder.append("startIndexBuild", nss.coll());
     indexBuildUUID.appendToBuilder(&startIndexBuildBuilder, "indexBuildUUID");
-    startIndexBuildBuilder.append("commitQuorum", 1);
     BSONArrayBuilder indexesArr(startIndexBuildBuilder.subarrayStart("indexes"));
     indexesArr.append(specX);
     indexesArr.append(specA);
@@ -275,16 +273,16 @@ TEST_F(OpObserverTest, CollModWithCollectionOptionsAndTTLInfo) {
     oldCollOpts.validationLevel = "strict";
     oldCollOpts.validationAction = "error";
 
-    TTLCollModInfo ttlInfo;
-    ttlInfo.expireAfterSeconds = Seconds(10);
-    ttlInfo.oldExpireAfterSeconds = Seconds(5);
-    ttlInfo.indexName = "name_of_index";
+    IndexCollModInfo indexInfo;
+    indexInfo.expireAfterSeconds = Seconds(10);
+    indexInfo.oldExpireAfterSeconds = Seconds(5);
+    indexInfo.indexName = "name_of_index";
 
     // Write to the oplog.
     {
-        AutoGetDb autoDb(opCtx.get(), nss.db(), MODE_X);
+        AutoGetCollection autoColl(opCtx.get(), nss, MODE_X);
         WriteUnitOfWork wunit(opCtx.get());
-        opObserver.onCollMod(opCtx.get(), nss, uuid, collModCmd, oldCollOpts, ttlInfo);
+        opObserver.onCollMod(opCtx.get(), nss, uuid, collModCmd, oldCollOpts, indexInfo);
         wunit.commit();
     }
 
@@ -292,14 +290,14 @@ TEST_F(OpObserverTest, CollModWithCollectionOptionsAndTTLInfo) {
 
     // Ensure that collMod fields were properly added to the oplog entry.
     auto o = oplogEntry.getObjectField("o");
-    auto oExpected =
-        BSON("collMod" << nss.coll() << "validationLevel"
-                       << "off"
-                       << "validationAction"
-                       << "warn"
-                       << "index"
-                       << BSON("name" << ttlInfo.indexName << "expireAfterSeconds"
-                                      << durationCount<Seconds>(ttlInfo.expireAfterSeconds)));
+    auto oExpected = BSON(
+        "collMod" << nss.coll() << "validationLevel"
+                  << "off"
+                  << "validationAction"
+                  << "warn"
+                  << "index"
+                  << BSON("name" << indexInfo.indexName << "expireAfterSeconds"
+                                 << durationCount<Seconds>(indexInfo.expireAfterSeconds.get())));
     ASSERT_BSONOBJ_EQ(oExpected, o);
 
     // Ensure that the old collection metadata was saved.
@@ -308,7 +306,8 @@ TEST_F(OpObserverTest, CollModWithCollectionOptionsAndTTLInfo) {
         BSON("collectionOptions_old"
              << BSON("validationLevel" << oldCollOpts.validationLevel << "validationAction"
                                        << oldCollOpts.validationAction)
-             << "expireAfterSeconds_old" << durationCount<Seconds>(ttlInfo.oldExpireAfterSeconds));
+             << "expireAfterSeconds_old"
+             << durationCount<Seconds>(indexInfo.oldExpireAfterSeconds.get()));
 
     ASSERT_BSONOBJ_EQ(o2Expected, o2);
 }
@@ -331,7 +330,7 @@ TEST_F(OpObserverTest, CollModWithOnlyCollectionOptions) {
 
     // Write to the oplog.
     {
-        AutoGetDb autoDb(opCtx.get(), nss.db(), MODE_X);
+        AutoGetCollection autoColl(opCtx.get(), nss, MODE_X);
         WriteUnitOfWork wunit(opCtx.get());
         opObserver.onCollMod(opCtx.get(), nss, uuid, collModCmd, oldCollOpts, boost::none);
         wunit.commit();

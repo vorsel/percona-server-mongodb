@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kTransaction
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTransaction
 
 #include "mongo/platform/basic.h"
@@ -415,8 +414,6 @@ BSONObj TransactionRouter::Participant::attachTxnFieldsIfNeeded(
             hasTxnNum = true;
         }
     }
-
-    // TODO: SERVER-37045 assert when attaching startTransaction to killCursors command.
 
     // The first command sent to a participant must start a transaction, unless it is a transaction
     // command, which don't support the options that start transactions, i.e. startTransaction and

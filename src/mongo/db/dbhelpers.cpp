@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -242,7 +242,8 @@ void Helpers::upsert(OperationContext* opCtx,
     OldClientContext context(opCtx, ns);
 
     const NamespaceString requestNs(ns);
-    UpdateRequest request(requestNs);
+    auto request = UpdateRequest();
+    request.setNamespaceString(requestNs);
 
     request.setQuery(filter);
     request.setUpdateModification(updateMod);
@@ -257,7 +258,8 @@ void Helpers::putSingleton(OperationContext* opCtx, const char* ns, BSONObj obj)
     OldClientContext context(opCtx, ns);
 
     const NamespaceString requestNs(ns);
-    UpdateRequest request(requestNs);
+    auto request = UpdateRequest();
+    request.setNamespaceString(requestNs);
 
     request.setUpdateModification(obj);
     request.setUpsert();

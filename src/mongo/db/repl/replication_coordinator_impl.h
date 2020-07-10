@@ -106,6 +106,8 @@ public:
 
     virtual void enterTerminalShutdown() override;
 
+    virtual void enterQuiesceMode() override;
+
     virtual void shutdown(OperationContext* opCtx) override;
 
     void markAsCleanShutdownIfPossible(OperationContext* opCtx) override;
@@ -247,7 +249,8 @@ public:
                                      GetNewConfigFn getNewConfig,
                                      bool force) override;
 
-    virtual Status awaitConfigCommitment(OperationContext* opCtx) override;
+    virtual Status awaitConfigCommitment(OperationContext* opCtx,
+                                         bool waitForOplogCommitment) override;
 
     virtual Status processReplSetInitiate(OperationContext* opCtx,
                                           const BSONObj& configObj,
@@ -276,7 +279,8 @@ public:
 
     virtual bool shouldChangeSyncSource(const HostAndPort& currentSource,
                                         const rpc::ReplSetMetadata& replMetadata,
-                                        const rpc::OplogQueryMetadata& oqMetadata) override;
+                                        const rpc::OplogQueryMetadata& oqMetadata,
+                                        const OpTime& lastOpTimeFetched) override;
 
     virtual OpTime getLastCommittedOpTime() const override;
     virtual OpTimeAndWallTime getLastCommittedOpTimeAndWallTime() const override;
@@ -352,13 +356,13 @@ public:
 
     virtual SharedSemiFuture<SharedIsMasterResponse> getIsMasterResponseFuture(
         const SplitHorizon::Parameters& horizonParams,
-        boost::optional<TopologyVersion> clientTopologyVersion) const override;
+        boost::optional<TopologyVersion> clientTopologyVersion) override;
 
     virtual std::shared_ptr<const IsMasterResponse> awaitIsMasterResponse(
         OperationContext* opCtx,
         const SplitHorizon::Parameters& horizonParams,
         boost::optional<TopologyVersion> clientTopologyVersion,
-        boost::optional<Date_t> deadline) const override;
+        boost::optional<Date_t> deadline) override;
 
     virtual OpTime getLatestWriteOpTime(OperationContext* opCtx) const override;
 
@@ -371,6 +375,8 @@ public:
                                             const BSONObj& cmdObj,
                                             OnRemoteCmdScheduledFn onRemoteCmdScheduled,
                                             OnRemoteCmdCompleteFn onRemoteCmdComplete) override;
+
+    virtual void restartHeartbeats_forTest() override;
 
     // ================== Test support API ===================
 
@@ -1016,10 +1022,12 @@ private:
     /**
      * Returns true if the horizon mappings between the oldConfig and newConfig are different.
      */
-    bool _haveHorizonsChanged(const ReplSetConfig& oldConfig,
-                              const ReplSetConfig& newConfig,
-                              int oldIndex,
-                              int newIndex);
+    void _errorOnPromisesIfHorizonChanged(WithLock lk,
+                                          OperationContext* opCtx,
+                                          const ReplSetConfig& oldConfig,
+                                          const ReplSetConfig& newConfig,
+                                          int oldIndex,
+                                          int newIndex);
 
     /**
      * Fulfills the promises that are waited on by awaitable isMaster requests. This increments the
@@ -1166,17 +1174,28 @@ private:
                                   StatusWith<int> myIndex);
 
     /**
-     * Fills an IsMasterResponse with the appropriate replication related fields.
+     * Fills an IsMasterResponse with the appropriate replication related fields. horizonString
+     * should be passed in if hasValidConfig is true.
      */
-    std::shared_ptr<IsMasterResponse> _makeIsMasterResponse(const StringData horizonString,
-                                                            WithLock) const;
+    std::shared_ptr<IsMasterResponse> _makeIsMasterResponse(
+        boost::optional<StringData> horizonString, WithLock, const bool hasValidConfig) const;
+
     /**
-     * Creates a semi-future for isMasterResponse.
+     * Creates a semi-future for isMasterResponse. horizonString should be passed in if and only if
+     * the server is a valid member of the config.
      */
     virtual SharedSemiFuture<SharedIsMasterResponse> _getIsMasterResponseFuture(
         WithLock,
         const SplitHorizon::Parameters& horizonParams,
-        boost::optional<TopologyVersion> clientTopologyVersion) const;
+        boost::optional<StringData> horizonString,
+        boost::optional<TopologyVersion> clientTopologyVersion);
+
+    /**
+     * Returns the horizon string by parsing horizonParams if the node is a valid member of the
+     * replica set. Otherwise, return boost::none.
+     */
+    boost::optional<StringData> _getHorizonString(
+        WithLock, const SplitHorizon::Parameters& horizonParams) const;
 
     /**
      * Utility method that schedules or performs actions specified by a HeartbeatResponseAction
@@ -1419,6 +1438,14 @@ private:
                                              const std::string& dbName,
                                              const BSONObj& cmdObj);
 
+    /**
+     * This is called by a primary when they become aware that a node has completed initial sync.
+     * That primary initiates a reconfig to remove the 'newlyAdded' for that node, if it was set.
+     */
+    void _reconfigToRemoveNewlyAddedField(const executor::TaskExecutor::CallbackArgs& cbData,
+                                          MemberId memberId,
+                                          ConfigVersionAndTerm versionAndTerm);
+
     //
     // All member variables are labeled with one of the following codes indicating the
     // synchronization rules for accessing them.
@@ -1470,8 +1497,15 @@ private:
     // Waiters in this list are checked and notified on self's lastApplied opTime updates.
     WaiterList _opTimeWaiterList;  // (M)
 
-    // Maps a horizon name to the promise waited on by exhaust isMaster requests.
-    StringMap<std::shared_ptr<SharedPromiseOfIsMasterResponse>> _horizonToPromiseMap;  // (M)
+    // Maps a horizon name to the promise waited on by awaitable isMaster requests when the node
+    // has an initialized replica set config and is an active member of the replica set.
+    StringMap<std::shared_ptr<SharedPromiseOfIsMasterResponse>>
+        _horizonToTopologyChangePromiseMap;  // (M)
+
+    // Maps a requested SNI to the promise waited on by awaitable isMaster requests when the node
+    // has an unitialized replica set config or is removed. An empty SNI will map to a promise on
+    // the default horizon.
+    StringMap<std::shared_ptr<SharedPromiseOfIsMasterResponse>> _sniToValidConfigPromiseMap;  // (M)
 
     // Set to true when we are in the process of shutting down replication.
     bool _inShutdown;  // (M)
@@ -1605,6 +1639,9 @@ private:
 
     // If we're in terminal shutdown.  If true, we'll refuse to vote in elections.
     bool _inTerminalShutdown = false;  // (M)
+
+    // If we're in quiesce mode.  If true, we'll respond to isMaster requests with ok:0.
+    bool _inQuiesceMode = false;  // (M)
 
     // The cached value of the 'counter' field in the server's TopologyVersion.
     AtomicWord<int64_t> _cachedTopologyVersionCounter;  // (S)

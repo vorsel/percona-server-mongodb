@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -118,9 +118,10 @@ void _finishDropDatabase(OperationContext* opCtx,
 
     LOGV2(20335,
           "dropDatabase {dbName} - dropped {numCollections} collection(s)",
-          "dbName"_attr = dbName,
-          "numCollections"_attr = numCollections);
-    LOGV2(20336, "dropDatabase {dbName} - finished", "dbName"_attr = dbName);
+          "dropDatabase",
+          "db"_attr = dbName,
+          "numCollectionsDropped"_attr = numCollections);
+    LOGV2(20336, "dropDatabase {dbName} - finished", "dropDatabase - finished", "db"_attr = dbName);
 }
 
 Status _dropDatabase(OperationContext* opCtx, const std::string& dbName, bool abortIndexBuilds) {
@@ -164,7 +165,10 @@ Status _dropDatabase(OperationContext* opCtx, const std::string& dbName, bool ab
                               << "The database is currently being dropped. Database: " << dbName);
         }
 
-        LOGV2(20337, "dropDatabase {dbName} - starting", "dbName"_attr = dbName);
+        LOGV2(20337,
+              "dropDatabase {dbName} - starting",
+              "dropDatabase - starting",
+              "db"_attr = dbName);
         db->setDropPending(opCtx, true);
 
         // If Database::dropCollectionEventIfSystem() fails, we should reset the drop-pending state
@@ -176,10 +180,6 @@ Status _dropDatabase(OperationContext* opCtx, const std::string& dbName, bool ab
             // We need to keep aborting all the active index builders for this database until there
             // are none left when we retrieve the exclusive database lock again.
             while (indexBuildsCoord->inProgForDb(dbName)) {
-                // Sends the abort signal to all the active index builders for this database.
-                indexBuildsCoord->abortDatabaseIndexBuildsNoWait(
-                    opCtx, dbName, "dropDatabase command");
-
                 // Create a scope guard to reset the drop-pending state on the database to false if
                 // there is a replica state change that kills this operation while the locks were
                 // yielded.
@@ -192,12 +192,12 @@ Status _dropDatabase(OperationContext* opCtx, const std::string& dbName, bool ab
                     dropPendingGuard.dismiss();
                 });
 
-                // Now that the abort signals were sent out to the active index builders for this
-                // database, we need to release the lock temporarily to allow those index builders
-                // to process the abort signal. Holding a lock here will cause the index builders to
-                // block indefinitely.
+                // Drop locks. The drop helper will acquire locks on our behalf.
                 autoDB = boost::none;
-                indexBuildsCoord->awaitNoBgOpInProgForDb(dbName);
+
+                // Sends the abort signal to all the active index builders for this database. Waits
+                // for aborted index builds to complete.
+                indexBuildsCoord->abortDatabaseIndexBuilds(opCtx, dbName, "dropDatabase command");
 
                 if (MONGO_unlikely(dropDatabaseHangAfterWaitingForIndexBuilds.shouldFail())) {
                     LOGV2(4612300,
@@ -235,15 +235,17 @@ Status _dropDatabase(OperationContext* opCtx, const std::string& dbName, bool ab
 
             LOGV2(20338,
                   "dropDatabase {dbName} - dropping collection: {nss}",
-                  "dbName"_attr = dbName,
-                  "nss"_attr = nss);
+                  "dropDatabase - dropping collection",
+                  "db"_attr = dbName,
+                  "namespace"_attr = nss);
 
             if (nss.isDropPendingNamespace() && replCoord->isReplEnabled() &&
                 opCtx->writesAreReplicated()) {
                 LOGV2(20339,
                       "dropDatabase {dbName} - found drop-pending collection: {nss}",
-                      "dbName"_attr = dbName,
-                      "nss"_attr = nss);
+                      "dropDatabase - found drop-pending collection",
+                      "db"_attr = dbName,
+                      "namespace"_attr = nss);
                 latestDropPendingOpTime = std::max(
                     latestDropPendingOpTime, uassertStatusOK(nss.getDropPendingNamespaceOpTime()));
                 continue;
@@ -345,7 +347,8 @@ Status _dropDatabase(OperationContext* opCtx, const std::string& dbName, bool ab
               "dropDatabase {dbName} waiting for {awaitOpTime} to be replicated at "
               "{dropDatabaseWriteConcern}. Dropping {numCollectionsToDrop} collection(s), with "
               "last collection drop at {latestDropPendingOpTime}",
-              "dbName"_attr = dbName,
+              "dropDatabase waiting for replication and dropping collections",
+              "db"_attr = dbName,
               "awaitOpTime"_attr = awaitOpTime,
               "dropDatabaseWriteConcern"_attr = dropDatabaseWriteConcern.toBSON(),
               "numCollectionsToDrop"_attr = numCollectionsToDrop,
@@ -358,9 +361,10 @@ Status _dropDatabase(OperationContext* opCtx, const std::string& dbName, bool ab
             LOGV2(20341,
                   "dropDatabase {dbName} waiting for {awaitOpTime} to be replicated at "
                   "{userWriteConcern}",
-                  "dbName"_attr = dbName,
+                  "dropDatabase waiting for replication",
+                  "db"_attr = dbName,
                   "awaitOpTime"_attr = awaitOpTime,
-                  "userWriteConcern"_attr = userWriteConcern.toBSON());
+                  "writeConcern"_attr = userWriteConcern.toBSON());
             result = replCoord->awaitReplication(opCtx, awaitOpTime, userWriteConcern);
         }
 
@@ -375,10 +379,11 @@ Status _dropDatabase(OperationContext* opCtx, const std::string& dbName, bool ab
         LOGV2(20342,
               "dropDatabase {dbName} - successfully dropped {numCollectionsToDrop} collection(s) "
               "(most recent drop optime: {awaitOpTime}) after {result_duration}. dropping database",
-              "dbName"_attr = dbName,
-              "numCollectionsToDrop"_attr = numCollectionsToDrop,
-              "awaitOpTime"_attr = awaitOpTime,
-              "result_duration"_attr = result.duration);
+              "dropDatabase - successfully dropped collections",
+              "db"_attr = dbName,
+              "numCollectionsDropped"_attr = numCollectionsToDrop,
+              "mostRecentDropOpTime"_attr = awaitOpTime,
+              "duration"_attr = result.duration);
     }
 
     if (MONGO_unlikely(dropDatabaseHangAfterAllCollectionsDrop.shouldFail())) {

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kIndex
 
 #include "mongo/platform/basic.h"
 
@@ -81,8 +81,7 @@ Status IndexBuildBlock::init(OperationContext* opCtx, Collection* collection) {
 
     _indexName = descriptor->indexName();
 
-    bool isBackgroundIndex =
-        _method == IndexBuildMethod::kHybrid || _method == IndexBuildMethod::kBackground;
+    bool isBackgroundIndex = _method == IndexBuildMethod::kHybrid;
     bool isBackgroundSecondaryBuild = false;
     if (auto replCoord = repl::ReplicationCoordinator::get(opCtx)) {
         isBackgroundSecondaryBuild =
@@ -102,13 +101,8 @@ Status IndexBuildBlock::init(OperationContext* opCtx, Collection* collection) {
     _indexCatalogEntry =
         _indexCatalog->createIndexEntry(opCtx, std::move(descriptor), CreateIndexEntryFlags::kNone);
 
-    // Only track skipped records with two-phase index builds, which is indicated by a present build
-    // UUID.
-    const auto trackSkipped = (_buildUUID) ? IndexBuildInterceptor::TrackSkippedRecords::kTrack
-                                           : IndexBuildInterceptor::TrackSkippedRecords::kNoTrack;
     if (_method == IndexBuildMethod::kHybrid) {
-        _indexBuildInterceptor =
-            std::make_unique<IndexBuildInterceptor>(opCtx, _indexCatalogEntry, trackSkipped);
+        _indexBuildInterceptor = std::make_unique<IndexBuildInterceptor>(opCtx, _indexCatalogEntry);
         _indexCatalogEntry->setIndexBuildInterceptor(_indexBuildInterceptor.get());
     }
 
@@ -172,8 +166,9 @@ void IndexBuildBlock::success(OperationContext* opCtx, Collection* collection) {
 
     LOGV2(20345,
           "index build: done building index {indexName} on ns {nss}",
-          "indexName"_attr = _indexName,
-          "nss"_attr = _nss);
+          "index build: done building",
+          "namespace"_attr = _nss,
+          "index"_attr = _indexName);
 
     collection->indexBuildSuccess(opCtx, _indexCatalogEntry);
     auto svcCtx = opCtx->getClient()->getServiceContext();

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
@@ -356,6 +356,18 @@ void ScanningReplicaSetMonitor::failedHost(const HostAndPort& host, const Status
         _state->checkInvariants();
 }
 
+void ScanningReplicaSetMonitor::failedHostPreHandshake(const HostAndPort& host,
+                                                       const Status& status,
+                                                       BSONObj bson) {
+    failedHost(host, status);
+}
+
+void ScanningReplicaSetMonitor::failedHostPostHandshake(const HostAndPort& host,
+                                                        const Status& status,
+                                                        BSONObj bson) {
+    failedHost(host, status);
+}
+
 bool ScanningReplicaSetMonitor::isPrimary(const HostAndPort& host) const {
     stdx::lock_guard<Latch> lk(_state->mutex);
     Node* node = _state->findNode(host);
@@ -554,9 +566,14 @@ void Refresher::scheduleIsMaster(const HostAndPort& host) {
         return;
     }
 
-    auto request = executor::RemoteCommandRequest(
-        host, "admin", BSON("isMaster" << 1), nullptr, kCheckTimeout);
+    BSONObjBuilder bob;
+    bob.append("isMaster", 1);
+    if (WireSpec::instance().isInternalClient) {
+        WireSpec::appendInternalClientWireVersion(WireSpec::instance().outgoing, &bob);
+    }
+    auto request = executor::RemoteCommandRequest(host, "admin", bob.obj(), nullptr, kCheckTimeout);
     request.sslMode = _set->setUri.getSSLMode();
+
     auto status =
         _set->executor
             ->scheduleRemoteCommand(

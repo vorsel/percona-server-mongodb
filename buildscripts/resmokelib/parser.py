@@ -51,13 +51,6 @@ def _make_parser():  # pylint: disable=too-many-statements
         help=("Logs server output to a file located in the db path and prevents the"
               " cleaning of dbpaths after testing. Note that conflicting options"
               " passed in from test files may cause an error."))
-    parser.add_option(
-        "--archiveFile", dest="archive_file", metavar="ARCHIVE_FILE",
-        help=("Sets the archive file name for the Evergreen task running the tests."
-              " The archive file is JSON format containing a list of tests that were"
-              " successfully archived to S3. If unspecified, no data files from tests"
-              " will be archived in S3. Tests can be designated for archival in the"
-              " task suite configuration file."))
 
     parser.add_option(
         "--archiveLimitMb", type="int", dest="archive_limit_mb", metavar="ARCHIVE_LIMIT_MB",
@@ -112,6 +105,10 @@ def _make_parser():  # pylint: disable=too-many-statements
         help=("Comma separated list of tags. For the jstest portion of the suite(s),"
               " only tests which have at least one of the specified tags will be"
               " run."))
+
+    # Used for testing resmoke. Do not set this.
+    parser.add_option("--internalParam", action="append", dest="internal_params",
+                      help=optparse.SUPPRESS_HELP)
 
     parser.add_option("-n", action="store_const", const="tests", dest="dry_run",
                       help="Outputs the tests that would be run.")
@@ -444,7 +441,6 @@ def to_local_args(args=None):  # pylint: disable=too-many-branches,too-many-loca
     other_local_args = []
 
     options_to_ignore = {
-        "--archiveFile",
         "--archiveLimitMb",
         "--archiveLimitTests",
         "--buildloggerUrl",
@@ -597,9 +593,6 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements,too-many
             config.update(user_config)
 
     _config.ALWAYS_USE_LOG_FILES = config.pop("always_use_log_files")
-    _config.ARCHIVE_FILE = config.pop("archive_file")
-    _config.ARCHIVE_LIMIT_MB = config.pop("archive_limit_mb")
-    _config.ARCHIVE_LIMIT_TESTS = config.pop("archive_limit_tests")
     _config.IS_ASAN_BUILD = config.pop("is_asan_build")
     _config.BASE_PORT = int(config.pop("base_port"))
     _config.BUILDLOGGER_URL = config.pop("buildlogger_url")
@@ -663,6 +656,9 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements,too-many
     _config.TAG_FILE = config.pop("tag_file")
     _config.TRANSPORT_LAYER = config.pop("transport_layer")
 
+    # Internal testing options.
+    _config.INTERNAL_PARAMS = config.pop("internal_params")
+
     # Evergreen options.
     _config.EVERGREEN_BUILD_ID = config.pop("build_id")
     _config.EVERGREEN_DISTRO_ID = config.pop("distro_id")
@@ -675,6 +671,12 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements,too-many
     _config.EVERGREEN_TASK_NAME = config.pop("task_name")
     _config.EVERGREEN_VARIANT_NAME = config.pop("variant_name")
     _config.EVERGREEN_VERSION_ID = config.pop("version_id")
+
+    # Archival options. Archival is enabled only when running on evergreen.
+    if not _config.EVERGREEN_TASK_ID:
+        _config.ARCHIVE_FILE = None
+    _config.ARCHIVE_LIMIT_MB = config.pop("archive_limit_mb")
+    _config.ARCHIVE_LIMIT_TESTS = config.pop("archive_limit_tests")
 
     # Wiredtiger options.
     _config.WT_COLL_CONFIG = config.pop("wt_coll_config")

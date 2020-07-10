@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
@@ -95,11 +95,11 @@ void logProcessDetailsForLogRotate(ServiceContext* serviceContext) {
 
         if (rsConfig.isInitialized()) {
             LOGV2(20722,
-                  "Replica Set Config",
+                  "Node is a member of a replica set",
                   "config"_attr = rsConfig,
                   "memberState"_attr = replCoord->getMemberState());
         } else {
-            LOGV2(20724, "Node currently has no Replica Set Config.");
+            LOGV2(20724, "Node currently has no replica set config");
         }
     }
 

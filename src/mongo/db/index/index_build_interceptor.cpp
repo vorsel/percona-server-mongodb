@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kIndex
 
 #include "mongo/platform/basic.h"
 
@@ -67,17 +67,12 @@ bool IndexBuildInterceptor::typeCanFastpathMultikeyUpdates(IndexType indexType) 
     return (indexType == INDEX_BTREE);
 }
 
-IndexBuildInterceptor::IndexBuildInterceptor(OperationContext* opCtx,
-                                             IndexCatalogEntry* entry,
-                                             TrackSkippedRecords trackSkippedRecords)
+IndexBuildInterceptor::IndexBuildInterceptor(OperationContext* opCtx, IndexCatalogEntry* entry)
     : _indexCatalogEntry(entry),
       _sideWritesTable(
           opCtx->getServiceContext()->getStorageEngine()->makeTemporaryRecordStore(opCtx)),
+      _skippedRecordTracker(entry),
       _sideWritesCounter(std::make_shared<AtomicWord<long long>>()) {
-
-    if (TrackSkippedRecords::kTrack == trackSkippedRecords) {
-        _skippedRecordTracker = std::make_unique<SkippedRecordTracker>(_indexCatalogEntry);
-    }
 
     if (entry->descriptor()->unique()) {
         _duplicateKeyTracker = std::make_unique<DuplicateKeyTracker>(opCtx, entry);
@@ -98,9 +93,7 @@ void IndexBuildInterceptor::deleteTemporaryTables(OperationContext* opCtx) {
     if (_duplicateKeyTracker) {
         _duplicateKeyTracker->deleteTemporaryTable(opCtx);
     }
-    if (_skippedRecordTracker) {
-        _skippedRecordTracker->deleteTemporaryTable(opCtx);
-    }
+    _skippedRecordTracker.deleteTemporaryTable(opCtx);
 }
 
 Status IndexBuildInterceptor::recordDuplicateKeys(OperationContext* opCtx,
@@ -254,7 +247,7 @@ Status IndexBuildInterceptor::drainWritesIntoIndex(OperationContext* opCtx,
 
     int logLevel = (_numApplied - appliedAtStart > 0) ? 0 : 1;
     LOGV2_DEBUG(20689,
-                logSeverityV1toV2(logLevel).toInt(),
+                logLevel,
                 "index build: drained side writes",
                 "numApplied"_attr = (_numApplied - appliedAtStart),
                 "totalInserted"_attr = totalInserted,
@@ -383,7 +376,7 @@ boost::optional<MultikeyPaths> IndexBuildInterceptor::getMultikeyPaths() const {
 }
 
 Status IndexBuildInterceptor::sideWrite(OperationContext* opCtx,
-                                        const std::vector<KeyString::Value>& keys,
+                                        const KeyStringSet& keys,
                                         const KeyStringSet& multikeyMetadataKeys,
                                         const MultikeyPaths& multikeyPaths,
                                         RecordId loc,
@@ -487,10 +480,7 @@ Status IndexBuildInterceptor::sideWrite(OperationContext* opCtx,
 
 Status IndexBuildInterceptor::retrySkippedRecords(OperationContext* opCtx,
                                                   const Collection* collection) {
-    if (!_skippedRecordTracker) {
-        return Status::OK();
-    }
-    return _skippedRecordTracker->retrySkippedRecords(opCtx, collection);
+    return _skippedRecordTracker.retrySkippedRecords(opCtx, collection);
 }
 
 

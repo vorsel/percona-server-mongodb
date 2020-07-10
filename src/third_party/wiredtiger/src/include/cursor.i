@@ -25,8 +25,14 @@ static inline int
 __cursor_copy_release(WT_CURSOR *cursor)
 {
     if (F_ISSET(S2C((WT_SESSION_IMPL *)cursor->session), WT_CONN_DEBUG_CURSOR_COPY)) {
-        WT_RET(__wt_cursor_copy_release_item(cursor, &cursor->key));
-        WT_RET(__wt_cursor_copy_release_item(cursor, &cursor->value));
+        if (F_ISSET(cursor, WT_CURSTD_DEBUG_COPY_KEY)) {
+            WT_RET(__wt_cursor_copy_release_item(cursor, &cursor->key));
+            F_CLR(cursor, WT_CURSTD_DEBUG_COPY_KEY);
+        }
+        if (F_ISSET(cursor, WT_CURSTD_DEBUG_COPY_VALUE)) {
+            WT_RET(__wt_cursor_copy_release_item(cursor, &cursor->value));
+            F_CLR(cursor, WT_CURSTD_DEBUG_COPY_VALUE);
+        }
     }
     return (0);
 }
@@ -213,9 +219,8 @@ __cursor_reset(WT_CURSOR_BTREE *cbt)
     cbt->page_deleted_count = 0;
 
     /*
-     * Release any page references we're holding. This can trigger eviction
-     * (e.g., forced eviction of big pages), so it's important to do after
-     * releasing our snapshot above.
+     * Release any page references we're holding. This can trigger eviction (e.g., forced eviction
+     * of big pages), so it's important to do after releasing our snapshot above.
      *
      * Clear the reference regardless, so we don't try the release twice.
      */
@@ -313,6 +318,38 @@ __wt_cursor_dhandle_decr_use(WT_SESSION_IMPL *session)
 }
 
 /*
+ * __wt_cursor_disable_bulk --
+ *     Disable bulk loads into a tree.
+ */
+static inline void
+__wt_cursor_disable_bulk(WT_SESSION_IMPL *session)
+{
+    WT_BTREE *btree;
+
+    btree = S2BT(session);
+
+    /*
+     * Once a tree (other than the LSM primary) is no longer empty, eviction should pay attention to
+     * it, and it's no longer possible to bulk-load into it.
+     */
+    if (!btree->original)
+        return;
+    if (btree->lsm_primary) {
+        btree->original = 0; /* Make the next test faster. */
+        return;
+    }
+
+    /*
+     * We use a compare-and-swap here to avoid races among the first inserts into a tree. Eviction
+     * is disabled when an empty tree is opened, and it must only be enabled once.
+     */
+    if (__wt_atomic_cas8(&btree->original, 1, 0)) {
+        btree->evict_disabled_open = false;
+        __wt_evict_file_exclusive_off(session);
+    }
+}
+
+/*
  * __cursor_kv_return --
  *     Return a page referenced key/value pair to the application.
  */
@@ -368,29 +405,27 @@ __cursor_func_init(WT_CURSOR_BTREE *cbt, bool reenter)
 }
 
 /*
- * __cursor_row_slot_return --
- *     Return a row-store leaf page slot's K/V pair.
+ * __cursor_row_slot_key_return --
+ *     Return a row-store leaf page slot's key.
  */
 static inline int
-__cursor_row_slot_return(WT_CURSOR_BTREE *cbt, WT_ROW *rip, WT_UPDATE *upd)
+__cursor_row_slot_key_return(
+  WT_CURSOR_BTREE *cbt, WT_ROW *rip, WT_CELL_UNPACK *kpack, bool *kpack_used)
 {
     WT_BTREE *btree;
     WT_CELL *cell;
-    WT_CELL_UNPACK *kpack, _kpack, *vpack, _vpack;
-    WT_ITEM *kb, *vb;
+    WT_ITEM *kb;
     WT_PAGE *page;
     WT_SESSION_IMPL *session;
     void *copy;
+
+    *kpack_used = false;
 
     session = (WT_SESSION_IMPL *)cbt->iface.session;
     btree = S2BT(session);
     page = cbt->ref->page;
 
-    kpack = NULL;
-    vpack = &_vpack;
-
     kb = &cbt->iface.key;
-    vb = &cbt->iface.value;
 
     /*
      * The row-store key can change underfoot; explicitly take a copy.
@@ -405,7 +440,7 @@ __cursor_row_slot_return(WT_CURSOR_BTREE *cbt, WT_ROW *rip, WT_UPDATE *upd)
      * First, check for an immediately available key.
      */
     if (__wt_row_leaf_key_info(page, copy, NULL, &cell, &kb->data, &kb->size))
-        goto value;
+        return (0);
 
     /* Huffman encoded keys are a slow path in all cases. */
     if (btree->huffman_key != NULL)
@@ -419,9 +454,9 @@ __cursor_row_slot_return(WT_CURSOR_BTREE *cbt, WT_ROW *rip, WT_UPDATE *upd)
      * do it in lots of other places), but disabling shared builds (--disable-shared) results in the
      * compiler complaining about uninitialized field use.
      */
-    kpack = &_kpack;
     memset(kpack, 0, sizeof(*kpack));
     __wt_cell_unpack(session, page, cell, kpack);
+    *kpack_used = true;
     if (kpack->type == WT_CELL_KEY && cbt->rip_saved != NULL && cbt->rip_saved == rip - 1) {
         WT_ASSERT(session, cbt->row_key->size >= kpack->prefix);
 
@@ -447,21 +482,5 @@ slow:
     kb->data = cbt->row_key->data;
     kb->size = cbt->row_key->size;
     cbt->rip_saved = rip;
-
-value:
-    /*
-     * If the item was ever modified, use the WT_UPDATE data.  Note the
-     * caller passes us the update: it has already resolved which one
-     * (if any) is visible.
-     */
-    if (upd != NULL)
-        return (__wt_value_return(cbt, upd));
-
-    /* Else, simple values have their location encoded in the WT_ROW. */
-    if (__wt_row_leaf_value(page, rip, vb))
-        return (0);
-
-    /* Else, take the value from the original page cell. */
-    __wt_row_leaf_value_cell(session, page, rip, kpack, vpack);
-    return (__wt_page_cell_data_ref(session, cbt->ref->page, vpack, vb));
+    return (0);
 }

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -49,6 +49,8 @@
 
 namespace mongo {
 namespace {
+
+MONGO_FAIL_POINT_DEFINE(disableShardingUptimeReporterPeriodicThread);
 
 const Seconds kUptimeReportInterval(10);
 
@@ -110,6 +112,11 @@ void ShardingUptimeReporter::startPeriodicThread() {
         const Timer upTimeTimer;
 
         while (!globalInShutdownDeprecated()) {
+            if (MONGO_unlikely(disableShardingUptimeReporterPeriodicThread.shouldFail())) {
+                LOGV2(426322,
+                      "The sharding uptime reporter periodic thread is disabled for testing");
+                return;
+            }
             {
                 auto opCtx = cc().makeOperationContext();
                 reportStatus(opCtx.get(), instanceId, hostName, upTimeTimer);

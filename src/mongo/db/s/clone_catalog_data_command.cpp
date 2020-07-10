@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/authorization_session.h"
@@ -120,12 +120,6 @@ public:
         const auto shardedColls = catalogClient->getAllShardedCollectionsForDb(
             opCtx, dbname, repl::ReadConcernLevel::kMajorityReadConcern);
 
-        CloneOptions opts;
-        opts.fromDB = dbname;
-        for (const auto& shardedColl : shardedColls) {
-            opts.shardedColls.insert(shardedColl.ns());
-        }
-
         DisableDocumentValidation disableValidation(opCtx);
 
         // Clone the non-ignored collections.
@@ -133,7 +127,7 @@ public:
         Lock::DBLock dbXLock(opCtx, dbname, MODE_X);
 
         Cloner cloner;
-        uassertStatusOK(cloner.copyDb(opCtx, dbname, from.toString(), opts, &clonedColls));
+        uassertStatusOK(cloner.copyDb(opCtx, dbname, from.toString(), shardedColls, &clonedColls));
         {
             BSONArrayBuilder cloneBarr = result.subarrayStart("clonedColls");
             cloneBarr.append(clonedColls);

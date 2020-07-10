@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kIndex
 
 #include "mongo/platform/basic.h"
 
@@ -80,7 +80,9 @@ IndexCatalogEntryImpl::IndexCatalogEntryImpl(OperationContext* const opCtx,
 
     {
         stdx::lock_guard<Latch> lk(_indexMultikeyPathsMutex);
-        _isMultikey.store(_catalogIsMultikey(opCtx, &_indexMultikeyPaths));
+        const bool isMultikey = _catalogIsMultikey(opCtx, &_indexMultikeyPaths);
+        _isMultikeyForRead.store(isMultikey);
+        _isMultikeyForWrite.store(isMultikey);
         _indexTracksPathLevelMultikeyInfo = !_indexMultikeyPaths.empty();
     }
 
@@ -103,13 +105,11 @@ IndexCatalogEntryImpl::IndexCatalogEntryImpl(OperationContext* const opCtx,
 
         // Parsing the partial filter expression is not expected to fail here since the
         // expression would have been successfully parsed upstream during index creation.
-        StatusWithMatchExpression statusWithMatcher =
-            MatchExpressionParser::parse(filter,
-                                         _expCtxForFilter,
-                                         ExtensionsCallbackNoop(),
-                                         MatchExpressionParser::kBanAllSpecialFeatures);
-        invariant(statusWithMatcher.getStatus());
-        _filterExpression = std::move(statusWithMatcher.getValue());
+        _filterExpression =
+            MatchExpressionParser::parseAndNormalize(filter,
+                                                     _expCtxForFilter,
+                                                     ExtensionsCallbackNoop(),
+                                                     MatchExpressionParser::kBanAllSpecialFeatures);
         LOGV2_DEBUG(20350,
                     2,
                     "have filter expression for {ns} {descriptor_indexName} {filter}",
@@ -158,7 +158,7 @@ bool IndexCatalogEntryImpl::isFrozen() const {
 }
 
 bool IndexCatalogEntryImpl::isMultikey() const {
-    return _isMultikey.load();
+    return _isMultikeyForRead.load();
 }
 
 MultikeyPaths IndexCatalogEntryImpl::getMultikeyPaths(OperationContext* opCtx) const {
@@ -180,7 +180,7 @@ void IndexCatalogEntryImpl::setIsReady(bool newIsReady) {
 
 void IndexCatalogEntryImpl::setMultikey(OperationContext* opCtx,
                                         const MultikeyPaths& multikeyPaths) {
-    if (!_indexTracksPathLevelMultikeyInfo && isMultikey()) {
+    if (!_indexTracksPathLevelMultikeyInfo && _isMultikeyForWrite.load()) {
         // If the index is already set as multikey and we don't have any path-level information to
         // update, then there's nothing more for us to do.
         return;
@@ -288,9 +288,8 @@ Status IndexCatalogEntryImpl::_setMultikeyInMultiDocumentTransaction(
         auto status = opCtx->recoveryUnit()->setTimestamp(writeTs);
         if (status.code() == ErrorCodes::BadValue) {
             LOGV2(20352,
-                  "Temporarily could not timestamp the multikey catalog write, retrying. "
-                  "{status_reason}",
-                  "status_reason"_attr = status.reason());
+                  "Temporarily could not timestamp the multikey catalog write, retrying.",
+                  "reason"_attr = status.reason());
             throw WriteConflictException();
         }
         fassert(31164, status);
@@ -336,30 +335,35 @@ void IndexCatalogEntryImpl::_catalogSetMultikey(OperationContext* opCtx,
                                                        _descriptor->indexName(),
                                                        multikeyPaths);
 
-    // The commit handler for a transaction that sets the multikey flag. When the recovery unit
-    // commits, update the multikey paths if needed and clear the plan cache if the index metadata
-    // has changed.
-    opCtx->recoveryUnit()->onCommit(
-        [this, multikeyPaths, indexMetadataHasChanged](boost::optional<Timestamp>) {
-            _isMultikey.store(true);
-
-            if (_indexTracksPathLevelMultikeyInfo) {
-                stdx::lock_guard<Latch> lk(_indexMultikeyPathsMutex);
-                for (size_t i = 0; i < multikeyPaths.size(); ++i) {
-                    _indexMultikeyPaths[i].insert(multikeyPaths[i].begin(), multikeyPaths[i].end());
-                }
-            }
-
-            if (indexMetadataHasChanged && _queryInfo) {
-                LOGV2_DEBUG(
-                    20351,
+    // In the absense of using the storage engine to read from the catalog, we must set multikey
+    // prior to the storage engine transaction committing.
+    //
+    // Moreover, there must not be an `onRollback` handler to reset this back to false. Given a long
+    // enough pause in processing `onRollback` handlers, a later writer that successfully flipped
+    // multikey can be undone. Alternatively, one could use a counter instead of a boolean to avoid
+    // that problem.
+    _isMultikeyForRead.store(true);
+    if (_indexTracksPathLevelMultikeyInfo) {
+        stdx::lock_guard<Latch> lk(_indexMultikeyPathsMutex);
+        for (size_t i = 0; i < multikeyPaths.size(); ++i) {
+            _indexMultikeyPaths[i].insert(multikeyPaths[i].begin(), multikeyPaths[i].end());
+        }
+    }
+    if (indexMetadataHasChanged && _queryInfo) {
+        LOGV2_DEBUG(47187005,
                     1,
-                    "{ns}: clearing plan cache - index {descriptor_keyPattern} set to multi key.",
-                    "ns"_attr = ns(),
-                    "descriptor_keyPattern"_attr = _descriptor->keyPattern());
-                _queryInfo->clearQueryCache();
-            }
-        });
+                    "Index set to multi key, clearing query plan cache",
+                    "namespace"_attr = ns(),
+                    "keyPattern"_attr = _descriptor->keyPattern());
+        _queryInfo->clearQueryCache();
+    }
+
+    opCtx->recoveryUnit()->onCommit([this](boost::optional<Timestamp>) {
+        // Writers must attempt to flip multikey until it's confirmed a storage engine
+        // transaction successfully commits. Only after this point may a writer optimize out
+        // flipping multikey.
+        _isMultikeyForWrite.store(true);
+    });
 }
 
 KVPrefix IndexCatalogEntryImpl::_catalogGetPrefix(OperationContext* opCtx) const {

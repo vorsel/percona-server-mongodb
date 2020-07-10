@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -48,10 +48,6 @@
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
-
-const std::string kWTRepairMsg =
-    "Please read the documentation for starting MongoDB with --repair here: "
-    "http://dochub.mongodb.org/core/repair";
 
 WiredTigerSession::WiredTigerSession(WT_CONNECTION* conn, uint64_t epoch, uint64_t cursorEpoch)
     : _epoch(epoch),

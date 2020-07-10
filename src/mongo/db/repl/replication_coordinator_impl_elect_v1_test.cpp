@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -43,6 +43,7 @@
 #include "mongo/db/repl/replication_coordinator_test_fixture.h"
 #include "mongo/db/repl/replication_metrics.h"
 #include "mongo/db/repl/topology_coordinator.h"
+#include "mongo/db/repl/vote_requester.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/logv2/log.h"
 #include "mongo/unittest/log_test.h"
@@ -59,6 +60,14 @@ using executor::NetworkInterfaceMock;
 using executor::RemoteCommandRequest;
 using executor::RemoteCommandResponse;
 using ApplierState = ReplicationCoordinator::ApplierState;
+
+TEST(LastVote, LastVoteAcceptsUnknownField) {
+    auto lastVoteBSON =
+        BSON("candidateIndex" << 1 << "term" << 2 << "_id" << 3 << "unknownField" << 1);
+    auto lastVoteSW = LastVote::readFromLastVote(lastVoteBSON);
+    ASSERT_OK(lastVoteSW.getStatus());
+    ASSERT_BSONOBJ_EQ(lastVoteSW.getValue().toBSON(), BSON("term" << 2 << "candidateIndex" << 1));
+}
 
 TEST_F(ReplCoordTest, RandomizedElectionOffsetWithinProperBounds) {
     BSONObj configObj = BSON("_id"
@@ -474,6 +483,52 @@ TEST_F(ReplCoordTest, ElectionFailsWhenDryRunResponseContainsANewerTerm) {
                       "Not running for primary, we have been superseded already"));
 }
 
+TEST_F(ReplCoordTest, ElectionParticipantMetricsAreCollected) {
+    BSONObj configObj = BSON("_id"
+                             << "mySet"
+                             << "version" << 1 << "members"
+                             << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                      << "node1:12345")
+                                           << BSON("_id" << 2 << "host"
+                                                         << "node2:12345"))
+                             << "protocolVersion" << 1);
+    assertStartSuccess(configObj, HostAndPort("node1", 12345));
+    OperationContextNoop opCtx;
+    OpTime lastOplogEntry = OpTime(Timestamp(999, 0), 1);
+
+    auto metricsAfterVoteRequestWithDryRun = [&](bool dryRun) {
+        repl::VoteRequester::Algorithm requester(getReplCoord()->getConfig(),
+                                                 1 /* candidateIndex */,
+                                                 1 /* term */,
+                                                 dryRun,
+                                                 lastOplogEntry,
+                                                 -1 /* primaryIndex */
+        );
+
+        auto voteRequest = requester.getRequests()[0];
+        ReplSetRequestVotesArgs requestVotesArgs;
+        ASSERT_OK(requestVotesArgs.initialize(voteRequest.cmdObj));
+        ReplSetRequestVotesResponse requestVotesResponse;
+        ASSERT_OK(getReplCoord()->processReplSetRequestVotes(
+            &opCtx, requestVotesArgs, &requestVotesResponse));
+
+        auto electionParticipantMetrics =
+            ReplicationMetrics::get(getServiceContext()).getElectionParticipantMetricsBSON();
+
+        LOGV2(4745900,
+              "Got election participant metrics",
+              "metrics"_attr = electionParticipantMetrics,
+              "dryRun"_attr = dryRun);
+        return electionParticipantMetrics;
+    };
+
+    auto metrics = metricsAfterVoteRequestWithDryRun(true);
+    ASSERT_TRUE(metrics.isEmpty());
+
+    metrics = metricsAfterVoteRequestWithDryRun(false);
+    ASSERT_TRUE(metrics["votedForCandidate"].Bool());
+}
+
 TEST_F(ReplCoordTest, NodeWillNotStandForElectionDuringHeartbeatReconfig) {
     // start up, receive reconfig via heartbeat while at the same time, become candidate.
     // candidate state should be cleared.
@@ -534,7 +589,8 @@ TEST_F(ReplCoordTest, NodeWillNotStandForElectionDuringHeartbeatReconfig) {
     ASSERT_EQUALS(ErrorCodes::ConfigurationInProgress,
                   getReplCoord()->processReplSetReconfig(&opCtx, args, &result));
 
-    setMinimumLoggedSeverity(logv2::LogSeverity::Debug(2));
+    auto severityGuard = unittest::MinimumLoggedSeverityGuard{logv2::LogComponent::kDefault,
+                                                              logv2::LogSeverity::Debug(2)};
     startCapturingLogMessages();
 
     // receive sufficient heartbeats to allow the node to see a majority.
@@ -1144,7 +1200,8 @@ TEST_F(TakeoverTest, PrefersPriorityToCatchupTakeoverIfNodeHasHighestPriority) {
                                                          << "node3:12345"))
                              << "protocolVersion" << 1);
 
-    setMinimumLoggedSeverity(logv2::LogSeverity::Debug(2));
+    auto severityGuard = unittest::MinimumLoggedSeverityGuard{logv2::LogComponent::kDefault,
+                                                              logv2::LogSeverity::Debug(2)};
     startCapturingLogMessages();
 
     assertStartSuccess(configObj, HostAndPort("node1", 12345));

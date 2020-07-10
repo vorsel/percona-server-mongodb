@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -41,7 +41,6 @@
 #include "mongo/db/s/database_sharding_state.h"
 #include "mongo/db/s/migration_source_manager.h"
 #include "mongo/db/s/migration_util.h"
-#include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/range_deletion_task_gen.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/db/s/shard_identity_rollback_notifier.h"
@@ -221,7 +220,7 @@ void abortOngoingMigrationIfNeeded(OperationContext* opCtx, const NamespaceStrin
     auto csrLock = CollectionShardingRuntime::CSRLock::lockShared(opCtx, csr);
     auto msm = MigrationSourceManager::get(csr, csrLock);
     if (msm) {
-        msm->abortDueToConflictingIndexOperation();
+        msm->abortDueToConflictingIndexOperation(opCtx);
     }
 }
 
@@ -237,8 +236,10 @@ void ShardServerOpObserver::onInserts(OperationContext* opCtx,
                                       std::vector<InsertStatement>::const_iterator begin,
                                       std::vector<InsertStatement>::const_iterator end,
                                       bool fromMigrate) {
-    auto* const css = CollectionShardingState::get(opCtx, nss);
-    const auto collDesc = css->getCollectionDescription();
+    // TODO (SERVER-47701): As part of enabling transition from a replica-set to sharded cluster,
+    // without requiring application downtime, these checks need to be revisited. Ideally this code
+    // should not be reached upon direct writes to a shard.
+    const auto metadata = CollectionShardingRuntime::get(opCtx, nss)->getCurrentMetadataIfKnown();
 
     for (auto it = begin; it != end; ++it) {
         const auto& insertedDoc = it->doc;
@@ -270,10 +271,10 @@ void ShardServerOpObserver::onInserts(OperationContext* opCtx,
             }
         }
 
-        if (collDesc.isSharded()) {
+        if (metadata && metadata->isSharded()) {
             incrementChunkOnInsertOrUpdate(opCtx,
                                            nss,
-                                           *collDesc->getChunkManager(),
+                                           *metadata->getChunkManager(),
                                            insertedDoc,
                                            insertedDoc.objsize(),
                                            fromMigrate);
@@ -282,9 +283,6 @@ void ShardServerOpObserver::onInserts(OperationContext* opCtx,
 }
 
 void ShardServerOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateEntryArgs& args) {
-    auto* const css = CollectionShardingState::get(opCtx, args.nss);
-    const auto collDesc = css->getCollectionDescription();
-
     if (args.nss == NamespaceString::kShardConfigCollectionsNamespace) {
         // Notification of routing table changes are only needed on secondaries
         if (isStandaloneOrPrimary(opCtx)) {
@@ -395,10 +393,15 @@ void ShardServerOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateE
         }
     }
 
-    if (collDesc.isSharded()) {
+    // TODO (SERVER-47701): As part of enabling transition from a replica-set to sharded cluster,
+    // without requiring application downtime, these checks need to be revisited. Ideally this code
+    // should not be reached upon direct writes to a shard.
+    auto* const csr = CollectionShardingRuntime::get(opCtx, args.nss);
+    const auto metadata = csr->getCurrentMetadataIfKnown();
+    if (metadata && metadata->isSharded()) {
         incrementChunkOnInsertOrUpdate(opCtx,
                                        args.nss,
-                                       *collDesc->getChunkManager(),
+                                       *metadata->getChunkManager(),
                                        args.updateArgs.updatedDoc,
                                        args.updateArgs.updatedDoc.objsize(),
                                        args.updateArgs.fromMigrate);
@@ -422,6 +425,7 @@ void ShardServerOpObserver::onDelete(OperationContext* opCtx,
     if (nss == NamespaceString::kShardConfigCollectionsNamespace) {
         onConfigDeleteInvalidateCachedCollectionMetadataAndNotify(opCtx, documentKey);
     }
+
     if (nss == NamespaceString::kShardConfigDatabasesNamespace) {
         if (isStandaloneOrPrimary(opCtx)) {
             return;
@@ -484,7 +488,6 @@ void ShardServerOpObserver::onStartIndexBuild(OperationContext* opCtx,
                                               CollectionUUID collUUID,
                                               const UUID& indexBuildUUID,
                                               const std::vector<BSONObj>& indexes,
-                                              const CommitQuorumOptions& commitQuorum,
                                               bool fromMigrate) {
     abortOngoingMigrationIfNeeded(opCtx, nss);
 };
@@ -507,7 +510,7 @@ void ShardServerOpObserver::onCollMod(OperationContext* opCtx,
                                       OptionalCollectionUUID uuid,
                                       const BSONObj& collModCmd,
                                       const CollectionOptions& oldCollOptions,
-                                      boost::optional<TTLCollModInfo> ttlInfo) {
+                                      boost::optional<IndexCollModInfo> indexInfo) {
     abortOngoingMigrationIfNeeded(opCtx, nss);
 };
 

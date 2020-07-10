@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
@@ -375,14 +374,13 @@ void sendSSVToAllShards(OperationContext* opCtx, const NamespaceString& nss) {
     for (const auto& shardEntry : allShards) {
         const auto& shard = uassertStatusOK(shardRegistry->getShard(opCtx, shardEntry.getName()));
 
-        SetShardVersionRequest ssv = SetShardVersionRequest::makeForVersioningNoPersist(
-            shardRegistry->getConfigServerConnectionString(),
-            shardEntry.getName(),
-            fassert(28781, ConnectionString::parse(shardEntry.getHost())),
-            nss,
-            ChunkVersion::DROPPED(),
-            true /* isAuthoritative */,
-            true /* forceRefresh */);
+        SetShardVersionRequest ssv(shardRegistry->getConfigServerConnectionString(),
+                                   shardEntry.getName(),
+                                   fassert(28781, ConnectionString::parse(shardEntry.getHost())),
+                                   nss,
+                                   ChunkVersion::DROPPED(),
+                                   true /* isAuthoritative */,
+                                   true /* forceRefresh */);
 
         auto ssvResult = shard->runCommandWithFixedRetryAttempts(
             opCtx,

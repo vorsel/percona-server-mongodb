@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -179,6 +179,27 @@ Microseconds OperationContext::getRemainingMaxTimeMicros() const {
         return Microseconds::max();
     }
     return _maxTime - getElapsedTime();
+}
+
+void OperationContext::restoreMaxTimeMS() {
+    if (!_storedMaxTime) {
+        return;
+    }
+
+    auto maxTime = *_storedMaxTime;
+    _storedMaxTime = boost::none;
+
+    if (maxTime <= Microseconds::zero()) {
+        maxTime = Microseconds::max();
+    }
+
+    if (maxTime == Microseconds::max()) {
+        _deadline = Date_t::max();
+    } else {
+        auto clock = getServiceContext()->getFastClockSource();
+        _deadline = clock->now() + clock->getPrecision() + maxTime - _elapsedTime.elapsed();
+    }
+    _maxTime = maxTime;
 }
 
 namespace {

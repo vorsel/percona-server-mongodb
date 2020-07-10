@@ -33,6 +33,8 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/metadata_manager.h"
+#include "mongo/db/s/sharding_migration_critical_section.h"
+#include "mongo/db/s/sharding_state_lock.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/stdx/variant.h"
 #include "mongo/util/decorable.h"
@@ -86,27 +88,33 @@ public:
                                               OrphanCleanupPolicy orphanCleanupPolicy) override;
 
     ScopedCollectionDescription getCollectionDescription() override;
-
-    boost::optional<ScopedCollectionDescription> getCurrentMetadataIfKnown() override;
-
-    boost::optional<ChunkVersion> getCurrentShardVersionIfKnown() override;
+    ScopedCollectionDescription getCollectionDescription_DEPRECATED() override;
 
     void checkShardVersionOrThrow(OperationContext* opCtx) override;
 
-    Status checkShardVersionNoThrow(OperationContext* opCtx) noexcept override;
+    void appendShardVersion(BSONObjBuilder* builder) override;
 
-    void enterCriticalSectionCatchUpPhase(OperationContext* opCtx) override;
+    size_t numberOfRangesScheduledForDeletion() const override;
 
-    void enterCriticalSectionCommitPhase(OperationContext* opCtx) override;
+    /**
+     * Returns boost::none if the description for the collection is not known yet. Otherwise
+     * returns the most recently refreshed from the config server metadata.
+     *
+     * This method do not check for the shard version that the operation requires and should only
+     * be used for cases such as checking whether a particular config server update has taken
+     * effect.
+     */
+    boost::optional<CollectionMetadata> getCurrentMetadataIfKnown();
 
-    void exitCriticalSection(OperationContext* opCtx) override;
-
-    std::shared_ptr<Notification<void>> getCriticalSectionSignal(
-        ShardingMigrationCriticalSection::Operation op) const override;
-
-    void setFilteringMetadata(OperationContext* opCtx, CollectionMetadata newMetadata) override;
-
-    void appendInfoForServerStatus(BSONArrayBuilder* builder) override;
+    /**
+     * Updates the collection's filtering metadata based on changes received from the config server
+     * and also resolves the pending receives map in case some of these pending receives have
+     * committed on the config server or have been abandoned by the donor shard.
+     *
+     * This method must be called with an exclusive collection lock and it does not acquire any
+     * locks itself.
+     */
+    void setFilteringMetadata(OperationContext* opCtx, CollectionMetadata newMetadata);
 
     /**
      * Marks the collection's filtering metadata as UNKNOWN, meaning that all attempts to check for
@@ -154,11 +162,42 @@ public:
     boost::optional<ChunkRange> getNextOrphanRange(BSONObj const& startingFrom);
 
     /**
-     * BSON output of the pending metadata into a BSONArray
+     * Methods to control the collection's critical section. Methods listed below must be called
+     * with both the collection lock and CSRLock held in exclusive mode.
+     *
+     * In these methods, the CSRLock ensures concurrent access to the critical section.
      */
-    void toBSONPending(BSONArrayBuilder& bb) const override {
-        _metadataManager->toBSONPending(bb);
-    }
+    void enterCriticalSectionCatchUpPhase(OperationContext* opCtx);
+    void enterCriticalSectionCommitPhase(OperationContext* opCtx);
+
+    /**
+     * Method to control the collection's critical secion. Method listed below must be called with
+     * the collection lock in IX mode and the CSRLock in exclusive mode.
+     *
+     * In this method, the CSRLock ensures concurrent access to the critical section.
+     */
+    void exitCriticalSection(OperationContext* opCtx);
+
+    /**
+     * If the collection is currently in a critical section, returns the critical section signal to
+     * be waited on. Otherwise, returns nullptr.
+     *
+     * In this method, the CSRLock ensures concurrent access to the critical section.
+     */
+    std::shared_ptr<Notification<void>> getCriticalSectionSignal(
+        OperationContext* opCtx, ShardingMigrationCriticalSection::Operation op);
+
+    /**
+     * Appends information about any chunks for which incoming migration has been requested, but the
+     * shard hasn't yet synchronised with the config server on whether that migration actually
+     * committed.
+     */
+    void appendPendingReceiveChunks(BSONArrayBuilder* builder);
+
+    /**
+     * Clears the list of chunks that are being received as a part of an incoming migration.
+     */
+    void clearReceivingChunks();
 
     std::uint64_t getNumMetadataManagerChanges_forTest() {
         return _numMetadataManagerChanges;
@@ -171,7 +210,7 @@ private:
      * Returns the latest version of collection metadata with filtering configured for
      * atClusterTime if specified.
      */
-    boost::optional<ScopedCollectionDescription> _getCurrentMetadataIfKnown(
+    std::shared_ptr<ScopedCollectionDescription::Impl> _getCurrentMetadataIfKnown(
         const boost::optional<LogicalTime>& atClusterTime);
 
     /**
@@ -179,7 +218,7 @@ private:
      * atClusterTime if specified. Throws StaleConfigInfo if the shard version attached to the
      * operation context does not match the shard version on the active metadata object.
      */
-    boost::optional<ScopedCollectionDescription> _getMetadataWithVersionCheckAt(
+    std::shared_ptr<ScopedCollectionDescription::Impl> _getMetadataWithVersionCheckAt(
         OperationContext* opCtx, const boost::optional<mongo::LogicalTime>& atClusterTime);
 
     // Namespace this state belongs to.
@@ -194,6 +233,7 @@ private:
     Lock::ResourceMutex _stateChangeMutex;
 
     // Tracks the migration critical section state for this collection.
+    // Must hold CSRLock while accessing.
     ShardingMigrationCriticalSection _critSec;
 
     mutable Mutex _metadataManagerLock =
@@ -214,6 +254,9 @@ private:
 
     // Used for testing to check the number of times a new MetadataManager has been installed.
     std::uint64_t _numMetadataManagerChanges{0};
+
+    // Used to get the shardId if no metadata is known when calling getCollectionDescription
+    ServiceContext* _serviceContext;
 };
 
 /**

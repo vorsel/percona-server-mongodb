@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #define LOGV2_FOR_HEARTBEATS(ID, DLEVEL, MESSAGE, ...) \
     LOGV2_DEBUG_OPTIONS(                               \
@@ -54,7 +54,6 @@
 #include "mongo/db/op_observer.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
 #include "mongo/db/repl/replication_coordinator.h"
@@ -157,6 +156,9 @@ public:
             if (ts) {
                 result.append("lastStableRecoveryTimestamp", ts.get());
             }
+            return true;
+        } else if (cmdObj.hasElement("restartHeartbeats")) {
+            replCoord->restartHeartbeats_forTest();
             return true;
         }
 
@@ -417,31 +419,35 @@ public:
         ReplicationCoordinator::ReplSetReconfigArgs parsedArgs;
         parsedArgs.newConfigObj = cmdObj["replSetReconfig"].Obj();
         parsedArgs.force = cmdObj.hasField("force") && cmdObj["force"].trueValue();
-        auto status = replCoord->processReplSetReconfig(opCtx, parsedArgs, &result);
 
-        if (status.isOK() && !parsedArgs.force) {
-            const auto service = opCtx->getServiceContext();
-            Lock::GlobalLock globalLock(opCtx, MODE_IX);
-            writeConflictRetry(opCtx, "replSetReconfig", kReplSetReconfigNss, [&] {
-                WriteUnitOfWork wuow(opCtx);
-                // Users must not be allowed to provide their own contents for the o2 field.
-                // o2 field of no-ops is supposed to be used internally.
-
-                service->getOpObserver()->onOpMessage(opCtx,
-                                                      BSON("msg"
-                                                           << "Reconfig set"
-                                                           << "version"
-                                                           << parsedArgs.newConfigObj["version"]));
-                wuow.commit();
-            });
+        // For safe reconfig, wait for the current config to be committed before running a new one.
+        // We will check again after acquiring the repl mutex in processReplSetReconfig(), in case
+        // of concurrent reconfigs.
+        if (!parsedArgs.force) {
+            // Skip the waiting if the current config is from a force reconfig.
+            auto oplogWait = replCoord->getConfig().getConfigTerm() != OpTime::kUninitializedTerm;
+            auto status = replCoord->awaitConfigCommitment(opCtx, oplogWait);
+            status.addContext("New config is rejected");
+            if (status == ErrorCodes::MaxTimeMSExpired) {
+                // Convert the error code to be more specific.
+                uasserted(ErrorCodes::CurrentConfigNotCommittedYet, status.reason());
+            } else if (status == ErrorCodes::PrimarySteppedDown) {
+                // Return NotMaster since the command has no side effect yet.
+                status = {ErrorCodes::NotMaster, status.reason()};
+            }
+            uassertStatusOK(status);
         }
 
+        auto status = replCoord->processReplSetReconfig(opCtx, parsedArgs, &result);
         uassertStatusOK(status);
 
         // Now that the new config has been persisted and installed in memory, wait for the new
-        // config to become committed. For force reconfigs we don't need to do this waiting.
-        if (!parsedArgs.force && enableSafeReplicaSetReconfig) {
-            uassertStatusOK(replCoord->awaitConfigCommitment(opCtx));
+        // config to become replicated. For force reconfigs we don't need to do this waiting.
+        if (!parsedArgs.force) {
+            auto status =
+                replCoord->awaitConfigCommitment(opCtx, false /* waitForOplogCommitment */);
+            uassertStatusOK(
+                status.withContext("Reconfig finished but failed to propagate to a majority"));
         }
 
         return true;

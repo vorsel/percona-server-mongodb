@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -76,7 +76,6 @@
 #include "mongo/rpc/metadata/egress_metadata_hook_list.h"
 #include "mongo/s/balancer_configuration.h"
 #include "mongo/s/catalog_cache.h"
-#include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/shard_factory.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/client/shard_remote.h"
@@ -126,7 +125,7 @@
 
 namespace mongo {
 
-using logger::LogComponent;
+using logv2::LogComponent;
 
 #if !defined(__has_feature)
 #define __has_feature(x) 0
@@ -271,9 +270,8 @@ void cleanupTask(ServiceContext* serviceContext) {
 
         // Shutdown the TransportLayer so that new connections aren't accepted
         if (auto tl = serviceContext->getTransportLayer()) {
-            LOGV2_OPTIONS(22843,
-                          {logComponentV1toV2(LogComponent::kNetwork)},
-                          "shutdown: going to close all sockets...");
+            LOGV2_OPTIONS(
+                22843, {LogComponent::kNetwork}, "shutdown: going to close all sockets...");
 
             tl->shutdown();
         }
@@ -332,14 +330,11 @@ void cleanupTask(ServiceContext* serviceContext) {
         // the lifecycle of a connection and request. When we are running under ASAN, we try a lot
         // harder to dry up the server from active connections before going on to really shut down.
 
-        // Shut down the global dbclient pool so callers stop waiting for connections.
-        shardConnectionPool.shutdown();
-
         // Shutdown the Service Entry Point and its sessions and give it a grace period to complete.
         if (auto sep = serviceContext->getServiceEntryPoint()) {
             if (!sep->shutdown(Seconds(10))) {
                 LOGV2_OPTIONS(22844,
-                              {logComponentV1toV2(LogComponent::kNetwork)},
+                              {LogComponent::kNetwork},
                               "Service entry point did not shutdown within the time limit");
             }
         }
@@ -349,7 +344,7 @@ void cleanupTask(ServiceContext* serviceContext) {
             Status status = svcExec->shutdown(Seconds(5));
             if (!status.isOK()) {
                 LOGV2_OPTIONS(22845,
-                              {logComponentV1toV2(LogComponent::kNetwork)},
+                              {LogComponent::kNetwork},
                               "Service executor did not shutdown within the time limit",
                               "error"_attr = status);
             }
@@ -579,13 +574,10 @@ ExitCode runMongosServer(ServiceContext* serviceContext) {
     unshardedHookList->addHook(std::make_unique<rpc::ClientMetadataPropagationEgressHook>());
     unshardedHookList->addHook(
         std::make_unique<rpc::ShardingEgressMetadataHookForMongos>(serviceContext));
-    // TODO SERVER-33053: readReplyMetadata is not called on hooks added through
-    // ShardingConnectionHook with _shardedConnections=false, so this hook will not run for
-    // connections using globalConnPool.
     unshardedHookList->addHook(std::make_unique<rpc::CommittedOpTimeMetadataHook>(serviceContext));
 
     // Add sharding hooks to both connection pools - ShardingConnectionHook includes auth hooks
-    globalConnPool.addHook(new ShardingConnectionHook(false, std::move(unshardedHookList)));
+    globalConnPool.addHook(new ShardingConnectionHook(std::move(unshardedHookList)));
 
     auto shardedHookList = std::make_unique<rpc::EgressMetadataHookList>();
     shardedHookList->addHook(std::make_unique<rpc::LogicalTimeMetadataHook>(serviceContext));
@@ -593,8 +585,6 @@ ExitCode runMongosServer(ServiceContext* serviceContext) {
     shardedHookList->addHook(
         std::make_unique<rpc::ShardingEgressMetadataHookForMongos>(serviceContext));
     shardedHookList->addHook(std::make_unique<rpc::CommittedOpTimeMetadataHook>(serviceContext));
-
-    shardConnectionPool.addHook(new ShardingConnectionHook(true, std::move(shardedHookList)));
 
     // Hook up a Listener for changes from the ReplicaSetMonitor
     // This will last for the scope of this function. i.e. until shutdown finishes
@@ -767,7 +757,7 @@ ExitCode main(ServiceContext* serviceContext) {
 
         if (configAddr.isLocalHost() != shardingContext->allowLocalHost()) {
             LOGV2_OPTIONS(22852,
-                          {logComponentV1toV2(LogComponent::kDefault)},
+                          {LogComponent::kDefault},
                           "cannot mix localhost and ip addresses in configdbs");
             return EXIT_BADOPTIONS;
         }
@@ -800,7 +790,7 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(SetFeatureCompatibilityVersionLatest,
                                      ("EndStartupOptionStorage"))
 (InitializerContext* context) {
     serverGlobalParams.featureCompatibility.setVersion(
-        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44);
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo46);
     return Status::OK();
 }
 

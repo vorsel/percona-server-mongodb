@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -332,6 +332,7 @@ void ServiceContext::setKillAllOperations() {
 
     // Ensure that all newly created operation contexts will immediately be in the interrupted state
     _globalKill.store(true);
+    auto opsKilled = 0;
 
     // Interrupt all active operations
     for (auto&& client : _clients) {
@@ -339,8 +340,12 @@ void ServiceContext::setKillAllOperations() {
         auto opCtxToKill = client->getOperationContext();
         if (opCtxToKill) {
             killOperation(lk, opCtxToKill, ErrorCodes::InterruptedAtShutdown);
+            opsKilled++;
         }
     }
+
+    // Shared by mongos and mongod shutdown code paths
+    LOGV2(4695300, "Interrupted all currently running operations", "opsKilled"_attr = opsKilled);
 
     // Notify any listeners who need to reach to the server shutting down
     for (const auto listener : _killOpListeners) {
@@ -411,6 +416,15 @@ ServiceContext::ConstructorActionRegisterer::ConstructorActionRegisterer(
     std::string name,
     std::vector<std::string> prereqs,
     ConstructorAction constructor,
+    DestructorAction destructor)
+    : ConstructorActionRegisterer(
+          std::move(name), prereqs, {}, std::move(constructor), std::move(destructor)) {}
+
+ServiceContext::ConstructorActionRegisterer::ConstructorActionRegisterer(
+    std::string name,
+    std::vector<std::string> prereqs,
+    std::vector<std::string> dependents,
+    ConstructorAction constructor,
     DestructorAction destructor) {
     if (!destructor)
         destructor = [](ServiceContext*) {};
@@ -426,7 +440,8 @@ ServiceContext::ConstructorActionRegisterer::ConstructorActionRegisterer(
                             registeredConstructorActions().erase(_iter);
                             return Status::OK();
                         },
-                        std::move(prereqs));
+                        std::move(prereqs),
+                        std::move(dependents));
 }
 
 ServiceContext::UniqueServiceContext ServiceContext::make() {

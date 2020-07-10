@@ -43,7 +43,7 @@
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/write_concern_options.h"
-#include "mongo/logger/log_severity.h"
+#include "mongo/logv2/log_severity.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/rpc/message.h"
 #include "mongo/rpc/metadata.h"
@@ -109,7 +109,7 @@ class DBClientBase : public DBClientQueryInterface {
 
 public:
     DBClientBase()
-        : _logLevel(logger::LogSeverity::Log()),
+        : _logLevel(logv2::LogSeverity::Log()),
           _connectionId(ConnectionIdSequence.fetchAndAdd(1)),
           _cachedAvailableOptions((enum QueryOptions)0),
           _haveCachedAvailableOptions(false) {}
@@ -531,15 +531,20 @@ public:
     /**
      * Lists indexes on the collection 'nsOrUuid'.
      * Includes in-progress indexes.
+     *
+     * If 'includeBuildUUIDs' is true, in-progress index specs will have the following format:
+     * {
+     *     spec: <BSONObj>
+     *     buildUUID: <UUID>
+     * }
+     * and ready index specs will only list the spec.
+     *
+     * If 'includeBuildUUIDs' is false, only the index spec will be returned without a way to
+     * distinguish between ready and in-progress index specs.
      */
     virtual std::list<BSONObj> getIndexSpecs(const NamespaceStringOrUUID& nsOrUuid,
-                                             int options = 0);
-
-    /**
-     * Lists completed indexes on the collection 'nsOrUuid'.
-     */
-    virtual std::list<BSONObj> getReadyIndexSpecs(const NamespaceStringOrUUID& nsOrUuid,
-                                                  int options = 0);
+                                             bool includeBuildUUIDs,
+                                             int options);
 
     virtual void dropIndex(const std::string& ns,
                            BSONObj keys,
@@ -777,7 +782,7 @@ protected:
     void _setServerRPCProtocols(rpc::ProtocolSet serverProtocols);
 
     /** controls how chatty the client is about network errors & such.  See log.h */
-    const logger::LogSeverity _logLevel;
+    const logv2::LogSeverity _logLevel;
 
     static AtomicWord<long long> ConnectionIdSequence;
     long long _connectionId;  // unique connection id for this connection

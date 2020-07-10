@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -113,8 +113,11 @@ public:
                 BSONArrayBuilder chunksArrBuilder;
                 bool exceedsSizeLimit = false;
 
+                LOGV2(22753,
+                      "Routing info requested by getShardVersion: {routingInfo}",
+                      "Routing info requested by getShardVersion",
+                      "routingInfo"_attr = redact(cm->toString()));
                 for (const auto& chunk : cm->chunks()) {
-                    LOGV2(22753, "{chunk}", "chunk"_attr = redact(chunk.toString()));
                     if (!exceedsSizeLimit) {
                         BSONArrayBuilder chunkBB(chunksArrBuilder.subarrayStart());
                         chunkBB.append(chunk.getMin());

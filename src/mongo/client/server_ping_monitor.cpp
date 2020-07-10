@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
@@ -38,9 +38,12 @@
 #include "mongo/executor/network_interface_thread_pool.h"
 #include "mongo/executor/thread_pool_task_executor.h"
 #include "mongo/logv2/log.h"
+#include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata/egress_metadata_hook_list.h"
 
 namespace mongo {
+
+MONGO_FAIL_POINT_DEFINE(serverPingMonitorFailWithHostUnreachable);
 
 using executor::NetworkInterface;
 using executor::NetworkInterfaceThreadPool;
@@ -146,7 +149,15 @@ void SingleServerPingMonitor::_doServerPing() {
                     return;
                 }
 
-                if (!result.response.isOK()) {
+                if (MONGO_unlikely(serverPingMonitorFailWithHostUnreachable.shouldFail(
+                        [&](const BSONObj& data) {
+                            return anchor->_hostAndPort == data.getStringField("hostAndPort");
+                        }))) {
+                    const std::string reason = str::stream()
+                        << "Failing the ping command to " << (anchor->_hostAndPort);
+                    anchor->_rttListener->onServerPingFailedEvent(
+                        anchor->_hostAndPort, {ErrorCodes::HostUnreachable, reason});
+                } else if (!result.response.isOK()) {
                     anchor->_rttListener->onServerPingFailedEvent(anchor->_hostAndPort,
                                                                   result.response.status);
                 } else {
@@ -215,10 +226,9 @@ void ServerPingMonitor::onServerHandshakeCompleteEvent(sdam::IsMasterRTT duratio
                                                        const sdam::ServerAddress& address,
                                                        const BSONObj reply) {
     stdx::lock_guard lk(_mutex);
-    uassert(ErrorCodes::ShutdownInProgress,
-            str::stream() << "ServerPingMonitor is unable to start monitoring '" << address
-                          << "' due to shutdown",
-            !_isShutdown);
+    if (_isShutdown) {
+        return;
+    }
 
     if (_serverPingMonitorMap.find(address) != _serverPingMonitorMap.end()) {
         LOGV2_DEBUG(466811,

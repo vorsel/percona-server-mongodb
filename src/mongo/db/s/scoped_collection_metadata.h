@@ -34,9 +34,10 @@
 namespace mongo {
 
 /**
- * Acts like a shared pointer and exposes sharding filtering metadata to be used by server
- * operations. It is allowed to be referenced outside of collection lock, but all implementations
- * must be able to outlive the object from which they were obtained.
+ * Contains the parts of the sharding state for a particular collection, which do not change due to
+ * chunk move, split and merge. The implementation is allowed to be tighly coupled with the
+ * CollectionShardingState from which it was derived and because of this it must not be accessed
+ * outside of a collection lock.
  */
 class ScopedCollectionDescription {
 public:
@@ -52,28 +53,8 @@ public:
 
     ScopedCollectionDescription(std::shared_ptr<Impl> impl) : _impl(std::move(impl)) {}
 
-    const auto& get() const {
-        return _impl->get();
-    }
-
-    const auto* operator-> () const {
-        return &get();
-    }
-
-    const auto& operator*() const {
-        return get();
-    }
-
     bool isSharded() const {
         return _impl->get().isSharded();
-    }
-
-    ChunkVersion getShardVersion() const {
-        return _impl->get().getShardVersion();
-    }
-
-    ChunkVersion getCollVersion() const {
-        return _impl->get().getCollVersion();
     }
 
     bool isValidKey(const BSONObj& key) const {
@@ -104,29 +85,24 @@ public:
         return _impl->get().uuidMatches(uuid);
     }
 
-    const BSONObj extractShardKeyFromDoc(const BSONObj& doc) const {
-        return _impl->get().getChunkManager()->getShardKeyPattern().extractShardKeyFromDoc(doc);
-    }
-
-
 protected:
     std::shared_ptr<Impl> _impl;
 };
 
+/**
+ * Contains the parts of the sharding state for a particular collection, which can change due to
+ * chunk move, split and merge and represents a snapshot in time of these parts, specifically the
+ * chunk ownership. The implementation is allowed to be tightly coupled with the
+ * CollectionShardingState from which it was derived, but it must be allowed to be accessed outside
+ * of collection lock.
+ */
 class ScopedCollectionFilter : public ScopedCollectionDescription {
 public:
     ScopedCollectionFilter(std::shared_ptr<Impl> impl)
         : ScopedCollectionDescription(std::move(impl)) {}
 
-    ScopedCollectionFilter(ScopedCollectionDescription&& scopedMetadata)
-        : ScopedCollectionDescription(std::move(scopedMetadata)) {}
-
     bool keyBelongsToMe(const BSONObj& key) const {
         return _impl->get().keyBelongsToMe(key);
-    }
-
-    Chunk findIntersectingChunkWithSimpleCollation(const BSONObj& shardKey) const {
-        return _impl->get().getChunkManager()->findIntersectingChunkWithSimpleCollation(shardKey);
     }
 };
 

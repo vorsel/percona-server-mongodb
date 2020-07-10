@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -55,6 +55,27 @@ namespace {
 using executor::NetworkInterfaceMock;
 using executor::RemoteCommandRequest;
 using executor::RemoteCommandResponse;
+
+TEST(ReplSetHeartbeatArgs, AcceptsUnknownField) {
+    ReplSetHeartbeatArgsV1 hbArgs;
+    hbArgs.setConfigTerm(1);
+    hbArgs.setConfigVersion(1);
+    hbArgs.setHeartbeatVersion(1);
+    hbArgs.setTerm(1);
+    hbArgs.setSenderHost(HostAndPort("host:1"));
+    hbArgs.setSetName("replSet");
+    BSONObjBuilder bob;
+    hbArgs.addToBSON(&bob);
+    bob.append("unknownField", 1);  // append an unknown field.
+    BSONObj cmdObj = bob.obj();
+    ASSERT_OK(hbArgs.initialize(cmdObj));
+
+    // The serialized object should be the same as the original except for the unknown field.
+    BSONObjBuilder bob2;
+    hbArgs.addToBSON(&bob2);
+    bob2.append("unknownField", 1);
+    ASSERT_BSONOBJ_EQ(bob2.obj(), cmdObj);
+}
 
 class ReplCoordHBV1Test : public ReplCoordTest {
 protected:
@@ -89,7 +110,8 @@ ReplSetHeartbeatResponse ReplCoordHBV1Test::receiveHeartbeatFrom(const ReplSetCo
 
 TEST_F(ReplCoordHBV1Test,
        NodeJoinsExistingReplSetWhenReceivingAConfigContainingTheNodeViaHeartbeat) {
-    setMinimumLoggedSeverity(logv2::LogSeverity::Debug(3));
+    auto severityGuard = unittest::MinimumLoggedSeverityGuard{logv2::LogComponent::kDefault,
+                                                              logv2::LogSeverity::Debug(3)};
     ReplSetConfig rsConfig = assertMakeRSConfig(BSON("_id"
                                                      << "mySet"
                                                      << "version" << 3 << "members"
@@ -159,7 +181,6 @@ TEST_F(ReplCoordHBV1Test,
 class ReplCoordHBV1ReconfigTest : public ReplCoordHBV1Test {
 public:
     void setUp() {
-        setMinimumLoggedSeverity(logv2::LogSeverity::Debug(3));
         BSONObj configBson = BSON("_id"
                                   << "mySet"
                                   << "version" << initConfigVersion << "term" << initConfigTerm
@@ -191,6 +212,9 @@ public:
     ReplSetConfig makeRSConfigWithVersionAndTerm(long long version, long long term) {
         return assertMakeRSConfig(makeConfigObj(version, term));
     }
+
+    unittest::MinimumLoggedSeverityGuard severityGuard{logv2::LogComponent::kDefault,
+                                                       logv2::LogSeverity::Debug(3)};
 
     int initConfigVersion = 2;
     int initConfigTerm = 2;
@@ -500,7 +524,8 @@ TEST_F(ReplCoordHBV1Test, AwaitIsMasterReturnsResponseOnReconfigViaHeartbeat) {
         ASSERT_EQUALS("node3", hosts[2].host());
     });
 
-    setMinimumLoggedSeverity(logv2::LogSeverity::Debug(3));
+    auto severityGuard = unittest::MinimumLoggedSeverityGuard{logv2::LogComponent::kDefault,
+                                                              logv2::LogSeverity::Debug(3)};
     ReplSetConfig rsConfig =
         assertMakeRSConfig(BSON("_id"
                                 << "mySet"
@@ -551,7 +576,8 @@ TEST_F(ReplCoordHBV1Test, AwaitIsMasterReturnsResponseOnReconfigViaHeartbeat) {
 
 TEST_F(ReplCoordHBV1Test,
        ArbiterJoinsExistingReplSetWhenReceivingAConfigContainingTheArbiterViaHeartbeat) {
-    setMinimumLoggedSeverity(logv2::LogSeverity::Debug(3));
+    auto severityGuard = unittest::MinimumLoggedSeverityGuard{logv2::LogComponent::kDefault,
+                                                              logv2::LogSeverity::Debug(3)};
     ReplSetConfig rsConfig =
         assertMakeRSConfig(BSON("_id"
                                 << "mySet"
@@ -624,7 +650,8 @@ TEST_F(ReplCoordHBV1Test,
        NodeDoesNotJoinExistingReplSetWhenReceivingAConfigNotContainingTheNodeViaHeartbeat) {
     // Tests that a node in RS_STARTUP will not transition to RS_REMOVED if it receives a
     // configuration that does not contain it.
-    setMinimumLoggedSeverity(logv2::LogSeverity::Debug(3));
+    auto severityGuard = unittest::MinimumLoggedSeverityGuard{logv2::LogComponent::kDefault,
+                                                              logv2::LogSeverity::Debug(3)};
     ReplSetConfig rsConfig = assertMakeRSConfig(BSON("_id"
                                                      << "mySet"
                                                      << "version" << 3 << "members"
@@ -706,7 +733,8 @@ TEST_F(ReplCoordHBV1Test,
 TEST_F(ReplCoordHBV1Test,
        NodeChangesToRecoveringStateWhenAllNodesRespondToHeartbeatsWithUnauthorized) {
     // Tests that a node that only has auth error heartbeats is recovering
-    setMinimumLoggedSeverity(logv2::LogSeverity::Debug(3));
+    auto severityGuard = unittest::MinimumLoggedSeverityGuard{logv2::LogComponent::kDefault,
+                                                              logv2::LogSeverity::Debug(3)};
     assertStartSuccess(BSON("_id"
                             << "mySet"
                             << "version" << 1 << "members"
@@ -786,7 +814,6 @@ TEST_F(ReplCoordHBV1Test, IgnoreTheContentsOfMetadataWhenItsReplicaSetIdDoesNotM
                                       rsConfig.getConfigVersion(),
                                       0,
                                       unexpectedId,
-                                      1,
                                       -1,
                                       true);
         uassertStatusOK(metadata.writeToMetadata(&responseBuilder));
@@ -873,7 +900,6 @@ TEST_F(ReplCoordHBV1Test,
         config.getConfigVersion(),
         0,
         {},     // replset id
-        1,      // currentPrimaryIndex,
         1,      // currentSyncSourceIndex
         true);  // isPrimary
 
@@ -950,7 +976,6 @@ TEST_F(ReplCoordHBV1Test, LastCommittedOpTimeOnlyUpdatesFromHeartbeatIfNotInStar
         config.getConfigVersion(),
         0,
         {},     // replset id
-        1,      // currentPrimaryIndex,
         1,      // currentSyncSourceIndex
         true);  // isPrimary
 
@@ -1050,6 +1075,9 @@ protected:
     OpTime _commitPoint = OpTime(Timestamp(100, 1), 0);
     Date_t _wallTime = Date_t() + Seconds(100);
     std::unique_ptr<ThreadPool> _threadPool;
+
+    unittest::MinimumLoggedSeverityGuard replLogSeverityGuard{logv2::LogComponent::kReplication,
+                                                              logv2::LogSeverity::Debug(2)};
 };
 
 void HBStepdownAndReconfigTest::setUp() {
@@ -1083,12 +1111,9 @@ void HBStepdownAndReconfigTest::setUp() {
         ASSERT_OK(replCoord->setLastAppliedOptime_forTest(2, i, _commitPoint, _wallTime));
         ASSERT_OK(replCoord->setLastDurableOptime_forTest(2, i, _commitPoint, _wallTime));
     }
-
-    setMinimumLoggedSeverity(logv2::LogComponent::kReplication, logv2::LogSeverity::Debug(2));
 }
 
 void HBStepdownAndReconfigTest::tearDown() {
-    clearMinimumLoggedSeverity(logv2::LogComponent::kReplication);
     _threadPool.reset();
     ReplCoordHBV1Test::tearDown();
 }

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -72,8 +72,6 @@
 #include "mongo/rpc/op_msg.h"
 #include "mongo/rpc/op_msg_rpc_impls.h"
 #include "mongo/s/catalog_cache.h"
-#include "mongo/s/client/parallel.h"
-#include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/commands/cluster_explain.h"
@@ -623,9 +621,18 @@ void runCommand(OperationContext* opCtx,
 
         command->incrementCommandsExecuted();
 
-        if (command->shouldAffectCommandCounter()) {
+        auto shouldAffectCommandCounter = command->shouldAffectCommandCounter();
+
+        if (shouldAffectCommandCounter) {
             globalOpCounters.gotCommand();
         }
+
+        ON_BLOCK_EXIT([opCtx, shouldAffectCommandCounter] {
+            if (shouldAffectCommandCounter) {
+                Grid::get(opCtx)->catalogCache()->checkAndRecordOperationBlockedByRefresh(
+                    opCtx, mongo::LogicalOp::opCommand);
+            }
+        });
 
 
         for (int tries = 0;; ++tries) {
@@ -699,18 +706,6 @@ void runCommand(OperationContext* opCtx,
                     }
                     throw;
                 }();
-
-                // Send setShardVersion on this thread's versioned connections to shards (to support
-                // commands that use the legacy (ShardConnection) versioning protocol).
-                //
-                // Versioned connections are a legacy concept, which is never used from code running
-                // under a transaction (see the invariant inside ShardConnection). Because of this,
-                // the retargeting error could not have come from a ShardConnection, so we don't
-                // need to reset the connection's in-memory state.
-                if (!MONGO_unlikely(doNotRefreshShardsOnRetargettingError.shouldFail()) &&
-                    !TransactionRouter::get(opCtx)) {
-                    ShardConnection::checkMyConnectionVersions(opCtx, staleNs.ns());
-                }
 
                 auto catalogCache = Grid::get(opCtx)->catalogCache();
                 if (auto staleInfo = ex.extraInfo<StaleConfigInfo>()) {
@@ -871,6 +866,11 @@ void runCommand(OperationContext* opCtx,
 
 DbResponse Strategy::queryOp(OperationContext* opCtx, const NamespaceString& nss, DbMessage* dbm) {
     globalOpCounters.gotQuery();
+
+    ON_BLOCK_EXIT([opCtx] {
+        Grid::get(opCtx)->catalogCache()->checkAndRecordOperationBlockedByRefresh(
+            opCtx, mongo::LogicalOp::opQuery);
+    });
 
     const QueryMessage q(*dbm);
 
@@ -1073,35 +1073,6 @@ DbResponse Strategy::clientCommand(OperationContext* opCtx, const Message& m) {
     return dbResponse;
 }
 
-void Strategy::commandOp(OperationContext* opCtx,
-                         const std::string& db,
-                         const BSONObj& command,
-                         const std::string& versionedNS,
-                         const BSONObj& targetingQuery,
-                         const BSONObj& targetingCollation,
-                         std::vector<CommandResult>* results) {
-    QuerySpec qSpec(db + ".$cmd", command, BSONObj(), 0, 1, 0);
-
-    ParallelSortClusteredCursor cursor(
-        qSpec, CommandInfo(versionedNS, targetingQuery, targetingCollation));
-
-    // Initialize the cursor
-    cursor.init(opCtx);
-
-    std::set<ShardId> shardIds;
-    cursor.getQueryShardIds(shardIds);
-
-    for (const ShardId& shardId : shardIds) {
-        CommandResult result;
-        result.shardTargetId = shardId;
-
-        result.target =
-            fassert(34417, ConnectionString::parse(cursor.getShardCursor(shardId)->originalHost()));
-        result.result = cursor.getShardCursor(shardId)->peekFirst().getOwned();
-        results->push_back(result);
-    }
-}
-
 DbResponse Strategy::getMore(OperationContext* opCtx, const NamespaceString& nss, DbMessage* dbm) {
     const int ntoreturn = dbm->pullInt();
     uassert(
@@ -1294,18 +1265,6 @@ void Strategy::explainFind(OperationContext* opCtx,
                 throw;
             }();
 
-            // Send setShardVersion on this thread's versioned connections to shards (to support
-            // commands that use the legacy (ShardConnection) versioning protocol).
-            //
-            // Versioned connections are a legacy concept, which is never used from code running
-            // under a transaction (see the invariant inside ShardConnection). Because of this, the
-            // retargeting error could not have come from a ShardConnection, so we don't need to
-            // reset the connection's in-memory state.
-            if (!MONGO_unlikely(doNotRefreshShardsOnRetargettingError.shouldFail()) &&
-                !TransactionRouter::get(opCtx)) {
-                ShardConnection::checkMyConnectionVersions(opCtx, staleNs.ns());
-            }
-
             if (auto staleInfo = ex.extraInfo<StaleConfigInfo>()) {
                 Grid::get(opCtx)
                     ->catalogCache()
@@ -1346,11 +1305,7 @@ void Strategy::explainFind(OperationContext* opCtx,
     const char* mongosStageName =
         ClusterExplain::getStageNameForReadOp(shardResponses.size(), findCommand);
 
-    uassertStatusOK(
-        ClusterExplain::buildExplainResult(opCtx,
-                                           ClusterExplain::downconvert(opCtx, shardResponses),
-                                           mongosStageName,
-                                           millisElapsed,
-                                           out));
+    uassertStatusOK(ClusterExplain::buildExplainResult(
+        opCtx, shardResponses, mongosStageName, millisElapsed, out));
 }
 }  // namespace mongo

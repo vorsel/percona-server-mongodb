@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #define LOGV2_FOR_CATALOG_REFRESH(ID, DLEVEL, MESSAGE, ...) \
     LOGV2_DEBUG_OPTIONS(                                    \
@@ -47,6 +47,7 @@
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/database_version_helpers.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/is_mongos.h"
 #include "mongo/s/mongos_server_parameters_gen.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/util/concurrency/with_lock.h"
@@ -55,6 +56,9 @@
 
 namespace mongo {
 const OperationContext::Decoration<bool> operationShouldBlockBehindCatalogCacheRefresh =
+    OperationContext::declareDecoration<bool>();
+
+const OperationContext::Decoration<bool> operationBlockedBehindCatalogCacheRefresh =
     OperationContext::declareDecoration<bool>();
 
 namespace {
@@ -258,6 +262,9 @@ CatalogCache::RefreshResult CatalogCache::_getCollectionRoutingInfoAt(
         if (collEntry->needsRefresh &&
             (!gEnableFinerGrainedCatalogCacheRefresh || collEntry->epochHasChanged ||
              operationShouldBlockBehindCatalogCacheRefresh(opCtx))) {
+
+            operationBlockedBehindCatalogCacheRefresh(opCtx) = true;
+
             auto refreshNotification = collEntry->refreshCompletionNotification;
             if (!refreshNotification) {
                 refreshNotification = (collEntry->refreshCompletionNotification =
@@ -408,9 +415,9 @@ void CatalogCache::invalidateShardOrEntireCollectionEntryForShardedCollection(
     const NamespaceString& nss,
     boost::optional<ChunkVersion> wantedVersion,
     const ChunkVersion& receivedVersion,
-    boost::optional<ShardId> shardId) {
-    if (shardId && shardVersionsHaveMatchingEpoch(wantedVersion, receivedVersion)) {
-        _createOrGetCollectionEntryAndMarkShardStale(nss, *shardId);
+    ShardId shardId) {
+    if (shardVersionsHaveMatchingEpoch(wantedVersion, receivedVersion)) {
+        _createOrGetCollectionEntryAndMarkShardStale(nss, shardId);
     } else {
         _createOrGetCollectionEntryAndMarkEpochStale(nss);
     }
@@ -574,6 +581,37 @@ void CatalogCache::report(BSONObjBuilder* builder) const {
     _stats.report(&cacheStatsBuilder);
 }
 
+void CatalogCache::checkAndRecordOperationBlockedByRefresh(OperationContext* opCtx,
+                                                           mongo::LogicalOp opType) {
+    if (!isMongos() || !operationBlockedBehindCatalogCacheRefresh(opCtx)) {
+        return;
+    }
+
+    auto& opsBlockedByRefresh = _stats.operationsBlockedByRefresh;
+
+    opsBlockedByRefresh.countAllOperations.fetchAndAddRelaxed(1);
+
+    switch (opType) {
+        case LogicalOp::opInsert:
+            opsBlockedByRefresh.countInserts.fetchAndAddRelaxed(1);
+            break;
+        case LogicalOp::opQuery:
+            opsBlockedByRefresh.countQueries.fetchAndAddRelaxed(1);
+            break;
+        case LogicalOp::opUpdate:
+            opsBlockedByRefresh.countUpdates.fetchAndAddRelaxed(1);
+            break;
+        case LogicalOp::opDelete:
+            opsBlockedByRefresh.countDeletes.fetchAndAddRelaxed(1);
+            break;
+        case LogicalOp::opCommand:
+            opsBlockedByRefresh.countCommands.fetchAndAddRelaxed(1);
+            break;
+        default:
+            MONGO_UNREACHABLE;
+    }
+}
+
 void CatalogCache::_scheduleDatabaseRefresh(WithLock lk,
                                             const std::string& dbName,
                                             std::shared_ptr<DatabaseInfoEntry> dbEntry) {
@@ -601,7 +639,7 @@ void CatalogCache::_scheduleDatabaseRefresh(WithLock lk,
             : 1;
         LOGV2_FOR_CATALOG_REFRESH(
             24101,
-            logSeverityV1toV2(logLevel).toInt(),
+            logLevel,
             "Refreshed cached database entry for {db} to version {newDbVersion} from version "
             "{oldDbVersion}. Took {duration}",
             "Refreshed cached database entry",
@@ -712,7 +750,7 @@ void CatalogCache::_scheduleCollectionRefresh(WithLock lk,
                 : 1;
             LOGV2_FOR_CATALOG_REFRESH(
                 24104,
-                logSeverityV1toV2(logLevel).toInt(),
+                logLevel,
                 "Refreshed cached collection {namespace} to version {newVersion} from version "
                 "{oldVersion}. Took {duration}",
                 "Refreshed cached collection",
@@ -786,7 +824,13 @@ void CatalogCache::_scheduleCollectionRefresh(WithLock lk,
             }
             itDb->second.erase(nss.ns());
             return;
+        } else if (existingRoutingInfo &&
+                   existingRoutingInfo->getSequenceNumber() ==
+                       newRoutingInfo->getSequenceNumber()) {
+            // If the routingInfo hasn't changed, we need to manually reset stale shards.
+            newRoutingInfo->setAllShardsRefreshed();
         }
+
         collEntry->routingInfo = std::move(newRoutingInfo);
     };
 
@@ -879,6 +923,26 @@ void CatalogCache::Stats::report(BSONObjBuilder* builder) const {
     builder->append("countFullRefreshesStarted", countFullRefreshesStarted.load());
 
     builder->append("countFailedRefreshes", countFailedRefreshes.load());
+
+    if (isMongos()) {
+        BSONObjBuilder operationsBlockedByRefreshBuilder(
+            builder->subobjStart("operationsBlockedByRefresh"));
+
+        operationsBlockedByRefreshBuilder.append(
+            "countAllOperations", operationsBlockedByRefresh.countAllOperations.load());
+        operationsBlockedByRefreshBuilder.append("countInserts",
+                                                 operationsBlockedByRefresh.countInserts.load());
+        operationsBlockedByRefreshBuilder.append("countQueries",
+                                                 operationsBlockedByRefresh.countQueries.load());
+        operationsBlockedByRefreshBuilder.append("countUpdates",
+                                                 operationsBlockedByRefresh.countUpdates.load());
+        operationsBlockedByRefreshBuilder.append("countDeletes",
+                                                 operationsBlockedByRefresh.countDeletes.load());
+        operationsBlockedByRefreshBuilder.append("countCommands",
+                                                 operationsBlockedByRefresh.countCommands.load());
+
+        operationsBlockedByRefreshBuilder.done();
+    }
 }
 
 CachedDatabaseInfo::CachedDatabaseInfo(DatabaseType dbt, std::shared_ptr<Shard> primaryShard)

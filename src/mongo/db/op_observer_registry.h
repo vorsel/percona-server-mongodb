@@ -73,12 +73,10 @@ public:
                                    CollectionUUID collUUID,
                                    const UUID& indexBuildUUID,
                                    const std::vector<BSONObj>& indexes,
-                                   const CommitQuorumOptions& commitQuorum,
                                    bool fromMigrate) override {
         ReservedTimes times{opCtx};
         for (auto& o : _observers) {
-            o->onStartIndexBuild(
-                opCtx, nss, collUUID, indexBuildUUID, indexes, commitQuorum, fromMigrate);
+            o->onStartIndexBuild(opCtx, nss, collUUID, indexBuildUUID, indexes, fromMigrate);
         }
     }
 
@@ -177,10 +175,10 @@ public:
                    OptionalCollectionUUID uuid,
                    const BSONObj& collModCmd,
                    const CollectionOptions& oldCollOptions,
-                   boost::optional<TTLCollModInfo> ttlInfo) override {
+                   boost::optional<IndexCollModInfo> indexInfo) override {
         ReservedTimes times{opCtx};
         for (auto& o : _observers)
-            o->onCollMod(opCtx, nss, uuid, collModCmd, oldCollOptions, ttlInfo);
+            o->onCollMod(opCtx, nss, uuid, collModCmd, oldCollOptions, indexInfo);
     }
 
     void onDropDatabase(OperationContext* const opCtx, const std::string& dbName) override {

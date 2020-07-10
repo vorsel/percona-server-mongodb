@@ -36,6 +36,7 @@
 #include "mongo/db/op_observer_util.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/s/collection_sharding_state.h"
 
 namespace mongo {
 
@@ -72,7 +73,8 @@ void AuthOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateEntryArg
 BSONObj AuthOpObserver::getDocumentKey(OperationContext* opCtx,
                                        NamespaceString const& nss,
                                        BSONObj const& doc) {
-    const auto collDesc = CollectionShardingState::get(opCtx, nss)->getCollectionDescription();
+    const auto collDesc =
+        CollectionShardingState::get(opCtx, nss)->getCollectionDescription_DEPRECATED();
     return collDesc.extractDocumentKey(doc).getOwned();
 }
 
@@ -114,11 +116,11 @@ void AuthOpObserver::onCollMod(OperationContext* opCtx,
                                OptionalCollectionUUID uuid,
                                const BSONObj& collModCmd,
                                const CollectionOptions& oldCollOptions,
-                               boost::optional<TTLCollModInfo> ttlInfo) {
+                               boost::optional<IndexCollModInfo> indexInfo) {
     const auto cmdNss = nss.getCommandNS();
 
     // Create the 'o' field object.
-    const auto cmdObj = makeCollModCmdObj(collModCmd, oldCollOptions, ttlInfo);
+    const auto cmdObj = makeCollModCmdObj(collModCmd, oldCollOptions, indexInfo);
 
     AuthorizationManager::get(opCtx->getServiceContext())
         ->logOp(opCtx, "c", cmdNss, cmdObj, nullptr);

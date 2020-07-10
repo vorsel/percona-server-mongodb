@@ -37,6 +37,7 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/catalog/commit_quorum_options.h"
+#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/executor/task_executor.h"
@@ -80,6 +81,10 @@ enum class IndexBuildAction {
      */
     kRollbackAbort,
     /**
+     * Abort signal set on initial sync.
+     */
+    kInitialSyncAbort,
+    /**
      * Abort signal set by createIndexes cmd or by drop databases/collections/indexes cmds
      */
     kPrimaryAbort,
@@ -97,32 +102,41 @@ enum class IndexBuildAction {
  * Represents the index build state.
  * Valid State transition for primary:
  * ===================================
- * kNone ---> kAborted.
- * kNone ---> kPrepareAbort ---> kAborted.
+ * kSetup -> kInProgress
+ * kInProgress -> kAborted    // An index build failed due to an indexing error or was aborted
+ *                               externally.
+ * kInProgress -> kCommitted  // An index build was committed
+
  *
  * Valid State transition for secondaries:
  * =======================================
- * kNone ---> kPrepareCommit ---> kCommitted.
- * kNone ---> kPrepareAbort ---> kAborted.
+ * kSetup -> kInProgress
+ * kInProgress -> kAborted    // An index build received an abort oplog entry
+ * kInProgress -> kPrepareCommit -> kCommitted // An index build received a commit oplog entry
  */
 class IndexBuildState {
 public:
     enum StateFlag {
-        kNone = 1 << 0,
+        kSetup = 1 << 0,
         /**
-         * Below state indicates that indexBuildscoordinator thread was externally asked either to
-         * commit or abort. Oplog applier, rollback, createIndexes command and drop
-         * databases/collections/indexes cmds can change this state to kPrepareCommit or
-         * kPrepareAbort.
+         * Once an index build is in-progress it is eligible for being aborted by an external
+         * thread. The kSetup state prevents other threads from observing an inconsistent state of
+         * a build until it transitions to kInProgress.
          */
-        kPrepareCommit = 1 << 1,
-        kPrepareAbort = 1 << 2,
+        kInProgress = 1 << 1,
         /**
-         * Below state indicates that index build was successfully able to commit or abort. And,
-         * it's yet to generate the commitIndexBuild or abortIndexBuild oplog entry respectively.
+         * Below state indicates that IndexBuildsCoordinator thread was externally asked to commit.
+         * For kPrepareCommit, this can come from an oplog entry.
+         */
+        kPrepareCommit = 1 << 2,
+        /**
+         * Below state indicates that index build was successfully able to commit or abort. For
+         * kCommitted, the state is set immediately before it commits the index build. For
+         * kAborted, this state is set after the build is cleaned up and the abort oplog entry is
+         * replicated.
          */
         kCommitted = 1 << 3,
-        kAborted = 1 << 4
+        kAborted = 1 << 4,
     };
 
     using StateSet = int;
@@ -131,8 +145,9 @@ public:
     }
 
     bool checkIfValidTransition(StateFlag newState) {
-        if (_state == kNone || (_state == kPrepareCommit && newState == kCommitted) ||
-            (_state == kPrepareAbort && newState == kAborted)) {
+        if ((_state == kSetup && newState == kInProgress) ||
+            (_state == kInProgress && newState != kSetup) ||
+            (_state == kPrepareCommit && newState == kCommitted)) {
             return true;
         }
         return false;
@@ -142,8 +157,6 @@ public:
                   bool skipCheck,
                   boost::optional<Timestamp> timestamp = boost::none,
                   boost::optional<std::string> abortReason = boost::none) {
-        // TODO SERVER-46560: Should remove the hard-coded value skipCheck 'true'.
-        skipCheck = true;
         if (!skipCheck) {
             invariant(checkIfValidTransition(state),
                       str::stream() << "current state :" << toString(_state)
@@ -153,7 +166,7 @@ public:
         if (timestamp)
             _timestamp = timestamp;
         if (abortReason) {
-            invariant(_state == kPrepareAbort);
+            invariant(_state == kAborted);
             _abortReason = abortReason;
         }
     }
@@ -166,12 +179,12 @@ public:
         return _state == kCommitted;
     }
 
-    bool isAbortPrepared() const {
-        return _state == kPrepareAbort;
-    }
-
     bool isAborted() const {
         return _state == kAborted;
+    }
+
+    bool isSettingUp() const {
+        return _state == kSetup;
     }
 
     boost::optional<Timestamp> getTimestamp() const {
@@ -188,14 +201,14 @@ public:
 
     static std::string toString(StateFlag state) {
         switch (state) {
-            case kNone:
-                return "in-progress";
+            case kSetup:
+                return "Setting up";
+            case kInProgress:
+                return "In progress";
             case kPrepareCommit:
                 return "Prepare commit";
             case kCommitted:
                 return "Committed";
-            case kPrepareAbort:
-                return "Prepare abort";
             case kAborted:
                 return "Aborted";
         }
@@ -204,7 +217,7 @@ public:
 
 private:
     // Represents the index build state.
-    StateFlag _state = kNone;
+    StateFlag _state = kSetup;
     // Timestamp will be populated only if the node is secondary.
     // It represents the commit or abort timestamp communicated via
     // commitIndexBuild and abortIndexBuild oplog entry.
@@ -225,16 +238,16 @@ struct ReplIndexBuildState {
                         const UUID& collUUID,
                         const std::string& dbName,
                         const std::vector<BSONObj>& specs,
-                        IndexBuildProtocol protocol,
-                        boost::optional<CommitQuorumOptions> commitQuorum)
+                        IndexBuildProtocol protocol)
         : buildUUID(indexBuildUUID),
           collectionUUID(collUUID),
           dbName(dbName),
           indexNames(extractIndexNames(specs)),
           indexSpecs(specs),
-          protocol(protocol),
-          commitQuorum(commitQuorum) {
+          protocol(protocol) {
         waitForNextAction = std::make_unique<SharedPromise<IndexBuildAction>>();
+        if (protocol == IndexBuildProtocol::kTwoPhase)
+            commitQuorumLock.emplace(indexBuildUUID.toString());
     }
 
     // Uniquely identifies this index build across replica set members.
@@ -262,13 +275,23 @@ struct ReplIndexBuildState {
     // Protects the state below.
     mutable Mutex mutex = MONGO_MAKE_LATCH("ReplIndexBuildState::mutex");
 
-    // Secondaries do not set this information, so it is only set on primaries or on
-    // transition to primary.
-    boost::optional<CommitQuorumOptions> commitQuorum;
+    // The OperationId of the index build. This allows external callers to interrupt the index build
+    // thread.
+    OperationId opId;
 
-    // Tracks the members of the replica set that have finished building the index(es) and are ready
-    // to commit the index(es).
-    std::vector<HostAndPort> commitReadyMembers;
+    /*
+     * Readers who read the commit quorum value from "config.system.indexBuilds" collection
+     * to decide if the commit quorum got satisfied for an index build, should take this lock in
+     * shared mode.
+     *
+     * Writers (setCommitQuorum) who update the commit quorum value of an existing index build
+     * entry in "config.system.indexBuilds" collection should take this lock in exclusive mode.
+     *
+     * Resource mutex will be initialized only for 2 phase index protocol.
+     * Mutex lock order:
+     * commitQuorumLock -> mutex.
+     */
+    boost::optional<Lock::ResourceMutex> commitQuorumLock;
 
     using IndexCatalogStats = struct {
         int numIndexesBefore = 0;

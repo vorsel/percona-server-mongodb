@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kIndex
 
 #include "mongo/platform/basic.h"
 
@@ -37,6 +37,7 @@
 #include "mongo/db/curop.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/keypattern.h"
+#include "mongo/db/storage/execution_context.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
 
@@ -116,15 +117,18 @@ Status DuplicateKeyTracker::checkConstraints(OperationContext* opCtx) const {
             CurOp::get(opCtx)->setProgress_inlock(curopMessage, _duplicateCounter.load(), 1));
     }
 
-
+    auto& executionCtx = StorageExecutionContext::get(opCtx);
     int resolved = 0;
     while (record) {
         resolved++;
         BSONObj conflict = record->data.toBson();
         BSONObj keyObj = conflict[kKeyField].Obj();
 
-        KeyString::Builder keyString(index->getKeyStringVersion(), keyObj, index->getOrdering());
-        auto status = index->dupKeyCheck(opCtx, keyString.getValueCopy());
+        KeyString::PooledBuilder keyString(executionCtx.pooledBufferBuilder(),
+                                           index->getKeyStringVersion(),
+                                           keyObj,
+                                           index->getOrdering());
+        auto status = index->dupKeyCheck(opCtx, keyString.release());
         if (!status.isOK())
             return status;
 
@@ -144,7 +148,7 @@ Status DuplicateKeyTracker::checkConstraints(OperationContext* opCtx) const {
 
     int logLevel = (resolved > 0) ? 0 : 1;
     LOGV2_DEBUG(20677,
-                logSeverityV1toV2(logLevel).toInt(),
+                logLevel,
                 "index build: resolved duplicate key conflicts for unique index",
                 "numResolved"_attr = resolved,
                 "indexName"_attr = _indexCatalogEntry->descriptor()->indexName());

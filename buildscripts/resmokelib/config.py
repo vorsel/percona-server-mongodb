@@ -47,7 +47,6 @@ DEFAULT_GENNY_EXECUTABLE = os.path.normpath("genny/build/src/driver/genny")
 DEFAULTS = {
     "always_use_log_files": False,
     "is_asan_build": False,
-    "archive_file": None,
     "archive_limit_mb": 5000,
     "archive_limit_tests": 10,
     "base_port": 20000,
@@ -96,6 +95,9 @@ DEFAULTS = {
     "linear_chain": None,
     "num_replset_nodes": None,
     "num_shards": None,
+
+    # Internal testing options.
+    "internal_params": [],
 
     # Evergreen options.
     "build_id": None,
@@ -223,9 +225,6 @@ SuiteOptions.ALL_INHERITED = SuiteOptions(  # type: ignore
 # Log to files located in the db path and don't clean dbpaths after tests.
 ALWAYS_USE_LOG_FILES = False
 
-# The name of the archive JSON file used to associate S3 archives to an Evergreen task.
-ARCHIVE_FILE = None
-
 # The limit size of all archive files for an Evergreen task.
 ARCHIVE_LIMIT_MB = None
 
@@ -304,6 +303,10 @@ GENNY_EXECUTABLE = None
 # If set, then only jstests that have at least one of the specified tags will be run during the
 # jstest portion of the suite(s).
 INCLUDE_WITH_ANY_TAGS = None
+
+# Params that can be set to change internal resmoke behavior. Used to test resmoke and should
+# not be set by the user.
+INTERNAL_PARAMS = []
 
 # If set, then resmoke.py starts the specified number of Job instances to run tests.
 JOBS = None
@@ -444,6 +447,9 @@ BENCHMARK_REPETITIONS = None
 ##
 # Internally used configuration options that aren't exposed to the user
 ##
+
+# The name of the archive JSON file used to associate S3 archives to an Evergreen task.
+ARCHIVE_FILE = "archive.json"
 
 # S3 Bucket to upload archive files.
 ARCHIVE_BUCKET = "mongodatafiles"

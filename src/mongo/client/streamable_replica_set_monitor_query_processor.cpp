@@ -26,7 +26,7 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 #include "mongo/client/streamable_replica_set_monitor_query_processor.h"
 
 #include <memory>
@@ -57,8 +57,8 @@ void StreamableReplicaSetMonitor::StreamableReplicaSetMonitorQueryProcessor::
         if (!replicaSetMonitor) {
             LOGV2_DEBUG(4333215,
                         kLogLevel,
-                        "could not find rsm instance {setName} for query processing.",
-                        "setName"_attr = *setName);
+                        "could not find rsm instance {replicaSet} for query processing.",
+                        "replicaSet"_attr = *setName);
             return;
         }
         replicaSetMonitor->_processOutstanding(newDescription);

@@ -51,6 +51,8 @@ public:
 
     void enterTerminalShutdown() final;
 
+    void enterQuiesceMode() final;
+
     void shutdown(OperationContext* opCtx) final;
 
     void markAsCleanShutdownIfPossible(OperationContext* opCtx) final;
@@ -188,7 +190,7 @@ public:
                              GetNewConfigFn getNewConfig,
                              bool force) final;
 
-    Status awaitConfigCommitment(OperationContext* opCtx) final;
+    Status awaitConfigCommitment(OperationContext* opCtx, bool waitForOplogCommitment) final;
 
     Status processReplSetInitiate(OperationContext*, const BSONObj&, BSONObjBuilder*) final;
 
@@ -206,7 +208,8 @@ public:
 
     bool shouldChangeSyncSource(const HostAndPort&,
                                 const rpc::ReplSetMetadata&,
-                                const rpc::OplogQueryMetadata&) final;
+                                const rpc::OplogQueryMetadata&,
+                                const OpTime&) final;
 
     OpTime getLastCommittedOpTime() const final;
 
@@ -269,11 +272,11 @@ public:
         OperationContext* opCtx,
         const SplitHorizon::Parameters& horizonParams,
         boost::optional<TopologyVersion> clientTopologyVersion,
-        boost::optional<Date_t> deadline) const final;
+        boost::optional<Date_t> deadline) final;
 
     SharedSemiFuture<std::shared_ptr<const IsMasterResponse>> getIsMasterResponseFuture(
         const SplitHorizon::Parameters& horizonParams,
-        boost::optional<TopologyVersion> clientTopologyVersion) const final;
+        boost::optional<TopologyVersion> clientTopologyVersion) final;
 
     OpTime getLatestWriteOpTime(OperationContext* opCtx) const override;
 
@@ -286,6 +289,8 @@ public:
                                             const BSONObj& cmdObj,
                                             OnRemoteCmdScheduledFn onRemoteCmdScheduled,
                                             OnRemoteCmdCompleteFn onRemoteCmdComplete) override;
+
+    virtual void restartHeartbeats_forTest() final;
 
 private:
     ServiceContext* const _service;

@@ -55,13 +55,12 @@ public:
      * Sets up the thread pool.
      */
     IndexBuildsCoordinatorMongod();
-    IndexBuildsCoordinatorMongod(ThreadPool::Options options);
 
     /**
      * Shuts down the thread pool, signals interrupt to all index builds, then waits for all of the
      * threads to finish.
      */
-    void shutdown() override;
+    void shutdown(OperationContext* opCtx) override;
 
     /**
      * Sets up the in-memory and persisted state of the index build, then passes the build off to an
@@ -139,8 +138,7 @@ private:
     /**
      * Signals index builder to commit.
      */
-    void _sendCommitQuorumSatisfiedSignal(WithLock ReplIndexBuildStateLk,
-                                          OperationContext* opCtx,
+    void _sendCommitQuorumSatisfiedSignal(OperationContext* opCtx,
                                           std::shared_ptr<ReplIndexBuildState> replState);
 
 
@@ -149,17 +147,26 @@ private:
 
 
     bool _signalIfCommitQuorumNotEnabled(OperationContext* opCtx,
-                                         std::shared_ptr<ReplIndexBuildState> replState,
-                                         bool onStepUp = false) override;
+                                         std::shared_ptr<ReplIndexBuildState> replState) override;
 
     void _signalPrimaryForCommitReadiness(OperationContext* opCtx,
                                           std::shared_ptr<ReplIndexBuildState> replState) override;
 
-    Timestamp _waitForNextIndexBuildAction(OperationContext* opCtx,
-                                           std::shared_ptr<ReplIndexBuildState> replState) override;
+    IndexBuildAction _drainSideWritesUntilNextActionIsAvailable(
+        OperationContext* opCtx, std::shared_ptr<ReplIndexBuildState> replState) override;
+
+    void _waitForNextIndexBuildActionAndCommit(OperationContext* opCtx,
+                                               std::shared_ptr<ReplIndexBuildState> replState,
+                                               const IndexBuildOptions& indexBuildOptions) override;
 
     // Thread pool on which index builds are run.
     ThreadPool _threadPool;
+
+    // Protected by _mutex.
+    int _numActiveIndexBuilds = 0;
+
+    // Condition signalled to indicate that an index build thread finished executing.
+    stdx::condition_variable _indexBuildFinished;
 };
 
 }  // namespace mongo

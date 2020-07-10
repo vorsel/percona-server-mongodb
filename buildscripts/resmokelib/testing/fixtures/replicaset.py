@@ -116,11 +116,8 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
                 self.nodes.append(node)
 
         for i in range(self.num_nodes):
-            # TODO(SERVER-46864): Remove version check on "oplogApplicationEnforcesSteadyStateConstraints"
             steady_state_constraint_param = "oplogApplicationEnforcesSteadyStateConstraints"
-            if (steady_state_constraint_param not in self.nodes[i].mongod_options["set_parameters"]
-                    and (self.mixed_bin_versions_config is None
-                         or self.mixed_bin_versions_config[i] == "new")):
+            if steady_state_constraint_param not in self.nodes[i].mongod_options["set_parameters"]:
                 self.nodes[i].mongod_options["set_parameters"][steady_state_constraint_param] = True
             if self.linear_chain and i > 0:
                 self.nodes[i].mongod_options["set_parameters"][
@@ -506,6 +503,16 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
         """Return a list of secondaries from the replica set."""
         primary = self.get_primary()
         return [node for node in self.nodes if node.port != primary.port]
+
+    def get_voting_members(self):
+        """Return the number of voting nodes in the replica set."""
+        primary = self.get_primary()
+        client = primary.mongo_client()
+
+        members = client.admin.command({"replSetGetConfig": 1})['config']['members']
+        voting_members = [member['host'] for member in members if member['votes'] == 1]
+
+        return voting_members
 
     def get_initial_sync_node(self):
         """Return initial sync node from the replica set."""

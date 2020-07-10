@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/db/query/plan_enumerator.h"
 
@@ -166,7 +166,7 @@ void getPossibleFirstAssignments(const IndexEntry& thisIndex,
  * will be assigned to the index.
  */
 bool canAssignPredToIndex(const RelevantTag* rt,
-                          const std::set<size_t>& multikeyComponents,
+                          const MultikeyComponents& multikeyComponents,
                           StringMap<MatchExpression*>* used) {
     invariant(used);
     const FieldRef path(rt->path);

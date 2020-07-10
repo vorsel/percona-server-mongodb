@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kASIO
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kASIO
 
 #include "mongo/platform/basic.h"
 
@@ -308,9 +308,10 @@ void TLConnection::setup(Milliseconds timeout, SetupCallback cb) {
             } else {
                 LOGV2_DEBUG(22584,
                             2,
-                            "Failed to connect to {peer} - {status}",
-                            "peer"_attr = _peer,
-                            "status"_attr = redact(status));
+                            "Failed to connect to {hostAndPort} - {error}",
+                            "Failed to connect",
+                            "hostAndPort"_attr = _peer,
+                            "error"_attr = redact(status));
                 handler->promise.setError(status);
             }
         });

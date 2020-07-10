@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -60,6 +60,7 @@
 #include "mongo/db/transaction_participant.h"
 #include "mongo/db/transaction_participant_gen.h"
 #include "mongo/db/views/durable_view_catalog.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/scripting/engine.h"
@@ -235,7 +236,7 @@ OpTimeBundle replLogDelete(OperationContext* opCtx,
 BSONObj OpObserverImpl::getDocumentKey(OperationContext* opCtx,
                                        NamespaceString const& nss,
                                        BSONObj const& doc) {
-    auto collDesc = CollectionShardingState::get(opCtx, nss)->getCollectionDescription();
+    auto collDesc = CollectionShardingState::get(opCtx, nss)->getCollectionDescription_DEPRECATED();
     return collDesc.extractDocumentKey(doc).getOwned();
 }
 
@@ -271,14 +272,11 @@ void OpObserverImpl::onStartIndexBuild(OperationContext* opCtx,
                                        CollectionUUID collUUID,
                                        const UUID& indexBuildUUID,
                                        const std::vector<BSONObj>& indexes,
-                                       const CommitQuorumOptions& commitQuorum,
                                        bool fromMigrate) {
     BSONObjBuilder oplogEntryBuilder;
     oplogEntryBuilder.append("startIndexBuild", nss.coll());
 
     indexBuildUUID.appendToBuilder(&oplogEntryBuilder, "indexBuildUUID");
-
-    commitQuorum.appendToBuilder(CommitQuorumOptions::kCommitQuorumField, &oplogEntryBuilder);
 
     BSONArrayBuilder indexesArr(oplogEntryBuilder.subarrayStart("indexes"));
     for (auto indexDoc : indexes) {
@@ -658,7 +656,7 @@ void OpObserverImpl::onCollMod(OperationContext* opCtx,
                                OptionalCollectionUUID uuid,
                                const BSONObj& collModCmd,
                                const CollectionOptions& oldCollOptions,
-                               boost::optional<TTLCollModInfo> ttlInfo) {
+                               boost::optional<IndexCollModInfo> indexInfo) {
 
     if (!nss.isSystemDotProfile()) {
         // do not replicate system.profile modifications
@@ -666,23 +664,30 @@ void OpObserverImpl::onCollMod(OperationContext* opCtx,
         // Create the 'o2' field object. We save the old collection metadata and TTL expiration.
         BSONObjBuilder o2Builder;
         o2Builder.append("collectionOptions_old", oldCollOptions.toBSON());
-        if (ttlInfo) {
-            auto oldExpireAfterSeconds = durationCount<Seconds>(ttlInfo->oldExpireAfterSeconds);
-            o2Builder.append("expireAfterSeconds_old", oldExpireAfterSeconds);
+        if (indexInfo) {
+            if (indexInfo->oldExpireAfterSeconds) {
+                auto oldExpireAfterSeconds =
+                    durationCount<Seconds>(indexInfo->oldExpireAfterSeconds.get());
+                o2Builder.append("expireAfterSeconds_old", oldExpireAfterSeconds);
+            }
+            if (indexInfo->oldHidden) {
+                auto oldHidden = indexInfo->oldHidden.get();
+                o2Builder.append("hidden_old", oldHidden);
+            }
         }
 
         MutableOplogEntry oplogEntry;
         oplogEntry.setOpType(repl::OpTypeEnum::kCommand);
         oplogEntry.setNss(nss.getCommandNS());
         oplogEntry.setUuid(uuid);
-        oplogEntry.setObject(makeCollModCmdObj(collModCmd, oldCollOptions, ttlInfo));
+        oplogEntry.setObject(makeCollModCmdObj(collModCmd, oldCollOptions, indexInfo));
         oplogEntry.setObject2(o2Builder.done());
         logOperation(opCtx, &oplogEntry);
     }
 
     // Make sure the UUID values in the Collection metadata, the Collection object, and the UUID
     // catalog are all present and equal.
-    invariant(opCtx->lockState()->isDbLockedForMode(nss.db(), MODE_X));
+    invariant(opCtx->lockState()->isCollectionLockedForMode(nss, MODE_X));
     auto databaseHolder = DatabaseHolder::get(opCtx);
     auto db = databaseHolder->getDb(opCtx, nss.db());
     // Some unit tests call the op observer on an unregistered Database.
@@ -1264,6 +1269,9 @@ void OpObserverImpl::onReplicationRollback(OperationContext* opCtx,
     // Force the default read/write concern cache to reload on next access in case the defaults
     // document was rolled back.
     ReadWriteConcernDefaults::get(opCtx).invalidate();
+
+    // Make sure the in-memory FCV matches the on-disk FCV.
+    FeatureCompatibilityVersion::onReplicationRollback(opCtx);
 }
 
 }  // namespace mongo

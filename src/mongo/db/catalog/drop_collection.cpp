@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -159,21 +159,21 @@ Status _abortIndexBuildsAndDropCollection(OperationContext* opCtx,
     const int numIndexes = coll->getIndexCatalog()->numIndexesTotal(opCtx);
 
     while (true) {
-        // Send the abort signal to any active index builds on the collection.
-        indexBuildsCoord->abortCollectionIndexBuildsNoWait(
-            opCtx,
-            collectionUUID,
-            str::stream() << "Collection " << coll->ns() << "(" << collectionUUID
-                          << ") is being dropped");
+        // Save a copy of the namespace before yielding our locks.
+        const NamespaceString collectionNs = coll->ns();
 
-        // Now that the abort signals were sent out to the active index builders for this
-        // collection, we need to release the lock temporarily to allow those index builders to
-        // process the abort signal. Holding a lock here will cause the index builders to block
-        // indefinitely.
+        // Release locks before aborting index builds. The helper will acquire locks on our behalf.
         collLock = boost::none;
         autoDb = boost::none;
 
-        indexBuildsCoord->awaitNoIndexBuildInProgressForCollection(collectionUUID);
+        // Send the abort signal to any active index builds on the collection. This waits until all
+        // aborted index builds complete.
+        indexBuildsCoord->abortCollectionIndexBuilds(opCtx,
+                                                     collectionNs,
+                                                     collectionUUID,
+                                                     str::stream()
+                                                         << "Collection " << collectionNs << "("
+                                                         << collectionUUID << ") is being dropped");
 
         // Take an exclusive lock to finish the collection drop.
         autoDb.emplace(opCtx, startingNss.db(), MODE_IX);
@@ -194,24 +194,6 @@ Status _abortIndexBuildsAndDropCollection(OperationContext* opCtx,
         const bool abortAgain = indexBuildsCoord->inProgForCollection(collectionUUID);
         if (!abortAgain) {
             break;
-        }
-
-        // We only need to hold an intent lock to send an abort signal to the active index
-        // builders on this collection.
-        collLock = boost::none;
-        autoDb = boost::none;
-
-        autoDb.emplace(opCtx, startingNss.db(), MODE_IX);
-        collLock.emplace(opCtx, dbAndUUID, MODE_IX);
-
-        // Abandon the snapshot as the index catalog will compare the in-memory state to the
-        // disk state, which may have changed when we released the collection lock temporarily.
-        opCtx->recoveryUnit()->abandonSnapshot();
-
-        coll = CollectionCatalog::get(opCtx).lookupCollectionByUUID(opCtx, collectionUUID);
-        status = _checkNssAndReplState(opCtx, coll);
-        if (!status.isOK()) {
-            return status;
         }
     }
 
@@ -294,7 +276,8 @@ Status dropCollection(OperationContext* opCtx,
                       BSONObjBuilder& result,
                       DropCollectionSystemCollectionMode systemCollectionMode) {
     if (!serverGlobalParams.quiet.load()) {
-        LOGV2(518070, "CMD: drop {collectionName}", "collectionName"_attr = collectionName);
+        LOGV2(
+            518070, "CMD: drop {collectionName}", "CMD: drop", "collection"_attr = collectionName);
     }
 
     if (MONGO_unlikely(hangDropCollectionBeforeLockAcquisition.shouldFail())) {
@@ -342,7 +325,7 @@ Status dropCollectionForApplyOps(OperationContext* opCtx,
                                  const repl::OpTime& dropOpTime,
                                  DropCollectionSystemCollectionMode systemCollectionMode) {
     if (!serverGlobalParams.quiet.load()) {
-        LOGV2(20332, "CMD: drop {collectionName}", "collectionName"_attr = collectionName);
+        LOGV2(20332, "CMD: drop {collectionName}", "CMD: drop", "collection"_attr = collectionName);
     }
 
     if (MONGO_unlikely(hangDropCollectionBeforeLockAcquisition.shouldFail())) {

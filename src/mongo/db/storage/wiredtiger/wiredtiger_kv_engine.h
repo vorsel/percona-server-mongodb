@@ -60,7 +60,10 @@ class WiredTigerEngineRuntimeConfigParameter;
 class WiredTigerMaxCacheOverflowSizeGBParameter;
 
 struct WiredTigerFileVersion {
-    enum class StartupVersion { IS_34, IS_36, IS_40, IS_42, IS_44 };
+    // MongoDB 4.4+ will not open on datafiles left behind by 4.2.5 and earlier. MongoDB 4.4
+    // shutting down in FCV 4.2 will leave data files that 4.2.6+ will understand
+    // (IS_44_FCV_42). MongoDB 4.2.x always writes out IS_42.
+    enum class StartupVersion { IS_42, IS_44_FCV_42, IS_44_FCV_44 };
 
     StartupVersion _startupVersion;
     bool shouldDowngrade(bool readOnly, bool repairMode, bool hasRecoveryTimestamp);
@@ -288,17 +291,14 @@ public:
     }
 
     /*
-     * An oplog manager is always accessible, but this method will start the background thread to
+     * The oplog manager is always accessible, but this method will start the background thread to
      * control oplog entry visibility for reads.
      *
-     * On mongod, the background thread will be started when the first oplog record store is
-     * created, and stopped when the last oplog record store is destroyed, at shutdown time. For
-     * unit tests, the background thread may be started and stopped multiple times as tests create
-     * and destroy oplog record stores.
+     * On mongod, the background thread will be started when the oplog record store is created, and
+     * stopped when the oplog record store is destroyed. For unit tests, the background thread may
+     * be started and stopped multiple times as tests create and destroy the oplog record store.
      */
-    void startOplogManager(OperationContext* opCtx,
-                           const std::string& uri,
-                           WiredTigerRecordStore* oplogRecordStore);
+    void startOplogManager(OperationContext* opCtx, WiredTigerRecordStore* oplogRecordStore);
     void haltOplogManager();
 
     /*

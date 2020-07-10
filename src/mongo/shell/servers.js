@@ -204,7 +204,7 @@ MongoRunner.binVersionSubs = [
     new MongoRunner.VersionSub(extractMajorVersionFromVersionString(shellVersion()),
                                shellVersion()),
     // To-be-updated when we branch for the next release.
-    new MongoRunner.VersionSub("last-stable", "4.3")
+    new MongoRunner.VersionSub("last-stable", "4.4")
 ];
 
 MongoRunner.getBinVersionFor = function(version) {
@@ -1181,6 +1181,13 @@ function appendSetParameterArgs(argArray) {
                     argArray.push(...['--setParameter',
                                       'oplogApplicationEnforcesSteadyStateConstraints=true']);
                 }
+
+                if ((jsTest.options().setParameters === undefined ||
+                     jsTest.options().setParameters['minNumChunksForSessionsCollection'] ===
+                         undefined) &&
+                    !argArrayContainsSetParameterValue('minNumChunksForSessionsCollection=')) {
+                    argArray.push(...['--setParameter', "minNumChunksForSessionsCollection=1"]);
+                }
             }
 
             // New mongod-specific options in 4.0.x
@@ -1391,8 +1398,13 @@ runMongoProgram = function() {
     args = appendSetParameterArgs(args);
     var progName = args[0];
 
-    // The bsondump tool doesn't support these auth related command line flags.
-    if (jsTestOptions().auth && progName != 'mongod') {
+    const separator = _isWindows() ? '\\' : '/';
+    progName = progName.split(separator).pop();
+    const [baseProgramName, programVersion] = progName.split("-");
+
+    // Non-shell binaries (which are in fact instantiated via `runMongoProgram`) may not support
+    // these command line flags.
+    if (jsTestOptions().auth && baseProgramName != 'mongod') {
         args = args.slice(1);
         args.unshift(progName,
                      '-u',

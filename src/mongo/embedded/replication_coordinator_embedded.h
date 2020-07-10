@@ -49,6 +49,8 @@ public:
 
     void enterTerminalShutdown() override;
 
+    void enterQuiesceMode() override;
+
     void shutdown(OperationContext* opCtx) override;
 
     void markAsCleanShutdownIfPossible(OperationContext* opCtx) override;
@@ -195,7 +197,7 @@ public:
                              GetNewConfigFn getNewConfig,
                              bool force) override;
 
-    Status awaitConfigCommitment(OperationContext* opCtx) override;
+    Status awaitConfigCommitment(OperationContext* opCtx, bool waitForOplogCommitment) override;
 
     Status processReplSetInitiate(OperationContext*, const BSONObj&, BSONObjBuilder*) override;
 
@@ -213,7 +215,8 @@ public:
 
     bool shouldChangeSyncSource(const HostAndPort&,
                                 const rpc::ReplSetMetadata&,
-                                const rpc::OplogQueryMetadata&) override;
+                                const rpc::OplogQueryMetadata&,
+                                const repl::OpTime&) override;
 
     repl::OpTime getLastCommittedOpTime() const override;
 
@@ -277,11 +280,11 @@ public:
         OperationContext* opCtx,
         const repl::SplitHorizon::Parameters& horizonParams,
         boost::optional<TopologyVersion> previous,
-        boost::optional<Date_t> deadline) const override;
+        boost::optional<Date_t> deadline) override;
 
     virtual SharedSemiFuture<std::shared_ptr<const repl::IsMasterResponse>>
     getIsMasterResponseFuture(const repl::SplitHorizon::Parameters& horizonParams,
-                              boost::optional<TopologyVersion> clientTopologyVersion) const;
+                              boost::optional<TopologyVersion> clientTopologyVersion);
 
     repl::OpTime getLatestWriteOpTime(OperationContext* opCtx) const override;
 
@@ -294,6 +297,8 @@ public:
                                             const BSONObj& cmdObj,
                                             OnRemoteCmdScheduledFn onRemoteCmdScheduled,
                                             OnRemoteCmdCompleteFn onRemoteCmdComplete) final;
+
+    virtual void restartHeartbeats_forTest() override;
 
 private:
     // Back pointer to the ServiceContext that has started the instance.

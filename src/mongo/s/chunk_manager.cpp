@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -52,12 +52,19 @@ namespace {
 // Used to generate sequence numbers to assign to each newly created RoutingTableHistory
 AtomicWord<unsigned> nextCMSequenceNumber(0);
 
-void checkAllElementsAreOfType(BSONType type, const BSONObj& o) {
-    for (auto&& element : o) {
-        uassert(ErrorCodes::ConflictingOperationInProgress,
-                str::stream() << "Not all elements of " << o << " are of type " << typeName(type),
-                element.type() == type);
+bool allElementsAreOfType(BSONType type, const BSONObj& obj) {
+    for (auto&& elem : obj) {
+        if (elem.type() != type) {
+            return false;
+        }
     }
+    return true;
+}
+
+void checkAllElementsAreOfType(BSONType type, const BSONObj& o) {
+    uassert(ErrorCodes::ConflictingOperationInProgress,
+            str::stream() << "Not all elements of " << o << " are of type " << typeName(type),
+            allElementsAreOfType(type, o));
 }
 
 std::string extractKeyStringInternal(const BSONObj& shardKeyValue, Ordering ordering) {
@@ -216,6 +223,16 @@ void ChunkManager::getShardIdsForQuery(OperationContext* opCtx,
 void ChunkManager::getShardIdsForRange(const BSONObj& min,
                                        const BSONObj& max,
                                        std::set<ShardId>* shardIds) const {
+    // If our range is [MinKey, MaxKey], we can simply return all shard ids right away. However,
+    // this optimization does not apply when we are reading from a snapshot because _shardVersions
+    // contains shards with chunks and is built based on the last refresh. Therefore, it is
+    // possible for _shardVersions to have fewer entries if a shard no longer owns chunks when it
+    // used to at _clusterTime.
+    if (!_clusterTime && allElementsAreOfType(MinKey, min) && allElementsAreOfType(MaxKey, max)) {
+        getAllShardIds(shardIds);
+        return;
+    }
+
     const auto bounds = _rt->overlappingRanges(min, max, true);
     for (auto it = bounds.first; it != bounds.second; ++it) {
         shardIds->insert(it->second->getShardIdAt(_clusterTime));
@@ -431,7 +448,8 @@ bool RoutingTableHistory::compatibleWith(const RoutingTableHistory& other,
     return other.getVersion(shardName) == getVersion(shardName);
 }
 
-ChunkVersion RoutingTableHistory::getVersion(const ShardId& shardName) const {
+ChunkVersion RoutingTableHistory::_getVersion(const ShardId& shardName,
+                                              bool throwOnStaleShard) const {
     auto it = _shardVersions.find(shardName);
     if (it == _shardVersions.end()) {
         // Shards without explicitly tracked shard versions (meaning they have no chunks) always
@@ -439,13 +457,21 @@ ChunkVersion RoutingTableHistory::getVersion(const ShardId& shardName) const {
         return ChunkVersion(0, 0, _collectionVersion.epoch());
     }
 
-    if (gEnableFinerGrainedCatalogCacheRefresh) {
+    if (throwOnStaleShard && gEnableFinerGrainedCatalogCacheRefresh) {
         uassert(ShardInvalidatedForTargetingInfo(_nss),
                 "shard has been marked stale",
                 !it->second.isStale.load());
     }
 
     return it->second.shardVersion;
+}
+
+ChunkVersion RoutingTableHistory::getVersion(const ShardId& shardName) const {
+    return _getVersion(shardName, true);
+}
+
+ChunkVersion RoutingTableHistory::getVersionForLogging(const ShardId& shardName) const {
+    return _getVersion(shardName, false);
 }
 
 std::string RoutingTableHistory::toString() const {
@@ -636,7 +662,6 @@ std::shared_ptr<RoutingTableHistory> RoutingTableHistory::makeUpdated(
     // sequence number to detect batch writes not making progress because of chunks moving across
     // shards too frequently.
     if (collectionVersion == startingCollectionVersion) {
-        setAllShardsRefreshed();
         return shared_from_this();
     }
 

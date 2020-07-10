@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
@@ -44,8 +44,6 @@
 #include <typeinfo>
 
 #include "mongo/base/string_data.h"
-#include "mongo/logger/log_domain.h"
-#include "mongo/logger/logger.h"
 #include "mongo/logv2/log.h"
 #include "mongo/platform/compiler.h"
 #include "mongo/stdx/exception.h"
@@ -193,13 +191,11 @@ thread_local int MallocFreeOStreamGuard::terminateDepth = 0;
 
 // must hold MallocFreeOStreamGuard to call
 void writeMallocFreeStreamToLog() {
-    logger::globalLogDomain()
-        ->append(logger::MessageEventEphemeral(Date_t::now(),
-                                               logger::LogSeverity::Severe(),
-                                               getThreadName(),
-                                               mallocFreeOStream.str())
-                     .setIsTruncatable(false))
-        .transitional_ignore();
+    LOGV2_FATAL_OPTIONS(
+        4757800,
+        logv2::LogOptions(logv2::FatalMode::kContinue, logv2::LogTruncation::Disabled),
+        "{message}",
+        "message"_attr = mallocFreeOStream.str());
     mallocFreeOStream.rewind();
 }
 

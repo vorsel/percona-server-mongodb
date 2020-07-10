@@ -27,13 +27,11 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/s/metadata_manager.h"
-
-#include <memory>
 
 #include "mongo/base/string_data.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
@@ -161,7 +159,7 @@ MetadataManager::MetadataManager(ServiceContext* serviceContext,
     _metadata.emplace_back(std::make_shared<CollectionMetadataTracker>(std::move(initialMetadata)));
 }
 
-ScopedCollectionDescription MetadataManager::getActiveMetadata(
+std::shared_ptr<ScopedCollectionDescription::Impl> MetadataManager::getActiveMetadata(
     const boost::optional<LogicalTime>& atClusterTime) {
     stdx::lock_guard<Latch> lg(_managerLock);
 
@@ -171,8 +169,8 @@ ScopedCollectionDescription MetadataManager::getActiveMetadata(
     // We don't keep routing history for unsharded collections, so if the collection is unsharded
     // just return the active metadata
     if (!atClusterTime || !activeMetadata->isSharded()) {
-        return ScopedCollectionDescription(std::make_shared<RangePreserver>(
-            lg, shared_from_this(), std::move(activeMetadataTracker)));
+        return std::make_shared<RangePreserver>(
+            lg, shared_from_this(), std::move(activeMetadataTracker));
     }
 
     auto chunkManager = activeMetadata->getChunkManager();
@@ -191,8 +189,8 @@ ScopedCollectionDescription MetadataManager::getActiveMetadata(
         CollectionMetadata _metadata;
     };
 
-    return ScopedCollectionDescription(std::make_shared<MetadataAtTimestamp>(
-        CollectionMetadata(chunkManagerAtClusterTime, activeMetadata->shardId())));
+    return std::make_shared<MetadataAtTimestamp>(
+        CollectionMetadata(chunkManagerAtClusterTime, activeMetadata->shardId()));
 }
 
 size_t MetadataManager::numberOfMetadataSnapshots() const {
@@ -342,19 +340,6 @@ void MetadataManager::append(BSONObjBuilder* builder) const {
     amrArr.done();
 }
 
-void MetadataManager::appendForServerStatus(BSONArrayBuilder* builder) const {
-    auto numRangeDeletes = ([this] {
-        stdx::lock_guard<Latch> lg(_managerLock);
-        return _rangesScheduledForDeletion.size();
-    })();
-
-    if (numRangeDeletes > 0) {
-        BSONObjBuilder statBuilder;
-        statBuilder.appendNumber(_nss.ns(), numRangeDeletes);
-        builder->append(statBuilder.obj());
-    }
-}
-
 SharedSemiFuture<void> MetadataManager::beginReceive(ChunkRange const& range) {
     stdx::lock_guard<Latch> lg(_managerLock);
     invariant(!_metadata.empty());
@@ -481,6 +466,11 @@ size_t MetadataManager::numberOfRangesToClean() const {
     return _rangesScheduledForDeletion.size() - rangesToCleanInUse;
 }
 
+size_t MetadataManager::numberOfRangesScheduledForDeletion() const {
+    stdx::lock_guard<Latch> lg(_managerLock);
+    return _rangesScheduledForDeletion.size();
+}
+
 boost::optional<SharedSemiFuture<void>> MetadataManager::trackOrphanedDataCleanup(
     ChunkRange const& range) const {
     stdx::lock_guard<Latch> lg(_managerLock);
@@ -559,5 +549,10 @@ SharedSemiFuture<void> MetadataManager::_submitRangeForDeletion(
             self->_rangesScheduledForDeletion.erase(it);
         });
     return cleanupComplete;
+}
+
+void MetadataManager::clearReceivingChunks() {
+    stdx::lock_guard<Latch> lg(_managerLock);
+    _receivingChunks.clear();
 }
 }  // namespace mongo

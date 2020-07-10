@@ -32,8 +32,6 @@
 #include "mongo/db/logical_time.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/s/scoped_collection_metadata.h"
-#include "mongo/db/s/sharding_migration_critical_section.h"
-#include "mongo/db/s/sharding_state_lock.h"
 
 namespace mongo {
 
@@ -76,12 +74,6 @@ public:
     static CollectionShardingState* get(OperationContext* opCtx, const NamespaceString& nss);
 
     /**
-     * It is the caller's responsibility to ensure that the collection locks for this namespace are
-     * held when this is called. The returned pointer should never be stored.
-     */
-    static CollectionShardingState* get_UNSAFE(ServiceContext* svcCtx, const NamespaceString& nss);
-
-    /**
      * Reports all collections which have filtering information associated.
      */
     static void report(OperationContext* opCtx, BSONObjBuilder* builder);
@@ -92,44 +84,44 @@ public:
     static void appendInfoForServerStatus(OperationContext* opCtx, BSONObjBuilder* builder);
 
     /**
-     * Returns the chunk filtering object that the current operation should be using for
-     * the collection.
+     * If the shard currently doesn't know whether the collection is sharded or not, it will throw
+     * StaleShardVersion.
      *
-     * If the operation context contains an 'atClusterTime', the returned filtering object will be
-     * tied to a specific point in time. Otherwise, it will reference the latest time available. If
-     * the operation is not associated with a shard version (refer to
-     * OperationShardingState::isOperationVersioned for more info on that), returns an UNSHARDED
-     * metadata object.
-     * If 'kDisallowOrphanCleanup' is passed as 'OrphanCleanupPolicy', the range deleter won't
-     * delete any orphan chunk associated with this ScopedCollectionFilter until the object is
-     * destroyed. The intended users of this method are callers which need to perform filtering. Use
-     * 'getCurrentMetadata' for other cases, like obtaining information about sharding-related
-     * properties of the collection are necessary that won't change under collection IX/IS lock
-     * (e.g., isSharded or the shard key).
-     *
-     * The returned object is safe to access even after the collection lock has been dropped.
-     */
-
-    enum class OrphanCleanupPolicy { kDisallowOrphanCleanup, kAllowOrphanCleanup };
-
-    virtual ScopedCollectionFilter getOwnershipFilter(OperationContext* opCtx,
-                                                      OrphanCleanupPolicy orphanCleanupPolicy) = 0;
-
-    /**
-     * See the comments for 'getOwnershipFilter' above for more information on this method.
+     * The returned object *is not safe* to access after the collection lock has been dropped.
      */
     virtual ScopedCollectionDescription getCollectionDescription() = 0;
 
+    // TODO (SERVER-32198): This method must not be used in any new code because it does not provide
+    // the necessary guarantees that getCollectionDescription above does. Specifically, it silently
+    // treats UNKNOWN metadata as UNSHARDED, which can lead to data loss.
+    virtual ScopedCollectionDescription getCollectionDescription_DEPRECATED() = 0;
+
     /**
-     * Returns boost::none if the description for the collection is not known yet. Otherwise
-     * returns the most recently refreshed from the config server metadata or shard version.
+     * This method must be called with an OperationShardingState, which specifies an expected shard
+     * version for the collection and it will invariant otherwise.
      *
-     * These methods do not check for the shard version that the operation requires and should only
-     * be used for cases such as checking whether a particular config server update has taken
-     * effect.
+     * If the shard currently doesn't know whether the collection is sharded or not, or if the
+     * expected shard version doesn't match with the one in the OperationShardingState, it will
+     * throw StaleShardVersion.
+     *
+     * If the operation context contains an 'atClusterTime', the returned filtering object will be
+     * tied to a specific point in time. Otherwise, it will reference the latest cluster time
+     * available.
+     *
+     * If 'kDisallowOrphanCleanup' is passed as 'OrphanCleanupPolicy', the range deleter won't
+     * delete any orphan chunk associated with this ScopedCollectionFilter until the object is
+     * destroyed. The intended users of this mode are read operations, which need to yield the
+     * collection lock, but still perform filtering.
+     *
+     * Use 'getCollectionDescription' for other cases, like obtaining information about
+     * sharding-related properties of the collection are necessary that won't change under
+     * collection IX/IS lock (e.g., isSharded or the shard key).
+     *
+     * The returned object *is safe* to access even after the collection lock has been dropped.
      */
-    virtual boost::optional<ScopedCollectionDescription> getCurrentMetadataIfKnown() = 0;
-    virtual boost::optional<ChunkVersion> getCurrentShardVersionIfKnown() = 0;
+    enum class OrphanCleanupPolicy { kDisallowOrphanCleanup, kAllowOrphanCleanup };
+    virtual ScopedCollectionFilter getOwnershipFilter(OperationContext* opCtx,
+                                                      OrphanCleanupPolicy orphanCleanupPolicy) = 0;
 
     /**
      * Checks whether the shard version in the operation context is compatible with the shard
@@ -139,56 +131,21 @@ public:
     virtual void checkShardVersionOrThrow(OperationContext* opCtx) = 0;
 
     /**
-     * Similar to checkShardVersionOrThrow but returns a status instead of throwing.
+     * Appends information about the shard version of the collection.
      */
-    virtual Status checkShardVersionNoThrow(OperationContext* opCtx) noexcept = 0;
+    virtual void appendShardVersion(BSONObjBuilder* builder) = 0;
 
     /**
-     * Methods to control the collection's critical section. Methods listed below must be called
-     * with both the collection lock and CSRLock held in exclusive mode.
-     *
-     * In these methods, the CSRLock ensures concurrent access to the
-     * critical section.
+     * Returns the number of ranges scheduled for deletion on the collection.
      */
-    virtual void enterCriticalSectionCatchUpPhase(OperationContext* opCtx) = 0;
-    virtual void enterCriticalSectionCommitPhase(OperationContext* opCtx) = 0;
+    virtual size_t numberOfRangesScheduledForDeletion() const = 0;
 
+protected:
     /**
-     * Method to control the collection's critical secion. Method listed below must be called with
-     * the collection lock in IX mode and the CSRLock in exclusive mode.
-     *
-     * In this method, the CSRLock ensures concurrent access to the
-     * critical section.
+     * It is the caller's responsibility to ensure that the collection locks for this namespace are
+     * held when this is called. The returned pointer should never be stored.
      */
-    virtual void exitCriticalSection(OperationContext* opCtx) = 0;
-
-    /**
-     * If the collection is currently in a critical section, returns the critical section signal to
-     * be waited on. Otherwise, returns nullptr.
-     */
-    virtual std::shared_ptr<Notification<void>> getCriticalSectionSignal(
-        ShardingMigrationCriticalSection::Operation op) const = 0;
-
-    /**
-     * BSON output of the pending metadata into a BSONArray
-     * used for reporting/diagnostic purposes only
-     */
-    virtual void toBSONPending(BSONArrayBuilder& bb) const = 0;
-
-    /**
-     * Updates the collection's filtering metadata based on changes received from the config server
-     * and also resolves the pending receives map in case some of these pending receives have
-     * committed on the config server or have been abandoned by the donor shard.
-     *
-     * This method must be called with an exclusive collection lock and it does not acquire any
-     * locks itself.
-     */
-    virtual void setFilteringMetadata(OperationContext* opCtx, CollectionMetadata newMetadata) = 0;
-
-    /**
-     * Append info to display in server status.
-     */
-    virtual void appendInfoForServerStatus(BSONArrayBuilder* builder) = 0;
+    static CollectionShardingState* get_UNSAFE(ServiceContext* svcCtx, const NamespaceString& nss);
 };
 
 /**

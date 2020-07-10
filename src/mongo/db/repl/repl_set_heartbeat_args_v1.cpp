@@ -49,25 +49,11 @@ const std::string kSenderHostFieldName = "from";
 const std::string kSenderIdFieldName = "fromId";
 const std::string kSetNameFieldName = "replSetHeartbeat";
 const std::string kTermFieldName = "term";
-
-const std::string kLegalHeartbeatFieldNames[] = {kCheckEmptyFieldName,
-                                                 kConfigVersionFieldName,
-                                                 kConfigTermFieldName,
-                                                 kHeartbeatVersionFieldName,
-                                                 kSenderHostFieldName,
-                                                 kSenderIdFieldName,
-                                                 kSetNameFieldName,
-                                                 kTermFieldName};
-
 }  // namespace
 
 Status ReplSetHeartbeatArgsV1::initialize(const BSONObj& argsObj) {
-    Status status = bsonCheckOnlyHasFieldsForCommand(
-        "ReplSetHeartbeatArgs", argsObj, kLegalHeartbeatFieldNames);
-    if (!status.isOK())
-        return status;
-
-    status = bsonExtractBooleanFieldWithDefault(argsObj, kCheckEmptyFieldName, false, &_checkEmpty);
+    Status status =
+        bsonExtractBooleanFieldWithDefault(argsObj, kCheckEmptyFieldName, false, &_checkEmpty);
     if (!status.isOK())
         return status;
 
@@ -172,12 +158,7 @@ void ReplSetHeartbeatArgsV1::addToBSON(BSONObjBuilder* builder) const {
         builder->append(kCheckEmptyFieldName, _checkEmpty);
     }
     builder->appendIntOrLL(kConfigVersionFieldName, _configVersion);
-    // The configTerm field is new in 4.4 and cannot be parsed by MongoDB 4.2. Therefore omit it if
-    // we have a 4.2-style replica set config with no "term". This permits us to downgrade by first
-    // removing the replica set config's term, then downgrading to 4.2.
-    if (_configTerm != OpTime::kUninitializedTerm) {
-        builder->appendIntOrLL(kConfigTermFieldName, _configTerm);
-    }
+    builder->appendIntOrLL(kConfigTermFieldName, _configTerm);
     if (_hasHeartbeatVersion) {
         builder->appendIntOrLL(kHeartbeatVersionFieldName, _hasHeartbeatVersion);
     }

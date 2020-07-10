@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -106,6 +106,7 @@ std::unique_ptr<SortedDataInterface> EphemeralForTestEngine::getSortedDataInterf
                                         desc->parentNS(),
                                         desc->indexName(),
                                         desc->keyPattern(),
+                                        desc->collation(),
                                         &_dataMap[ident]);
 }
 

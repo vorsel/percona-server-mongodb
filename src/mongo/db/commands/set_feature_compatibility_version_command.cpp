@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -70,7 +70,9 @@ namespace {
 MONGO_FAIL_POINT_DEFINE(featureCompatibilityDowngrade);
 MONGO_FAIL_POINT_DEFINE(featureCompatibilityUpgrade);
 MONGO_FAIL_POINT_DEFINE(failUpgrading);
+MONGO_FAIL_POINT_DEFINE(hangWhileUpgrading);
 MONGO_FAIL_POINT_DEFINE(failDowngrading);
+MONGO_FAIL_POINT_DEFINE(hangWhileDowngrading);
 
 /**
  * Deletes the persisted default read/write concern document.
@@ -91,7 +93,7 @@ void deletePersistedDefaultRWConcernDocument(OperationContext* opCtx) {
 }
 
 /**
- * Sets the minimum allowed version for the cluster. If it is 4.2, then the node should not use 4.4
+ * Sets the minimum allowed version for the cluster. If it is 4.4, then the node should not use 4.6
  * features.
  *
  * Format:
@@ -119,11 +121,11 @@ public:
     std::string help() const override {
         using FCVP = FeatureCompatibilityVersionParser;
         std::stringstream h;
-        h << "Set the API version exposed by this node. If set to '" << FCVP::kVersion42
-          << "', then " << FCVP::kVersion44 << " features are disabled. If set to '"
-          << FCVP::kVersion44 << "', then " << FCVP::kVersion44
+        h << "Set the API version exposed by this node. If set to '" << FCVP::kVersion44
+          << "', then " << FCVP::kVersion46 << " features are disabled. If set to '"
+          << FCVP::kVersion46 << "', then " << FCVP::kVersion46
           << " features are enabled, and all nodes in the cluster must be binary version "
-          << FCVP::kVersion44 << ". See "
+          << FCVP::kVersion46 << ". See "
           << feature_compatibility_version_documentation::kCompatibilityLink << ".";
         return h.str();
     }
@@ -181,16 +183,16 @@ public:
         ServerGlobalParams::FeatureCompatibility::Version actualVersion =
             serverGlobalParams.featureCompatibility.getVersion();
 
-        if (requestedVersion == FeatureCompatibilityVersionParser::kVersion44) {
+        if (requestedVersion == FeatureCompatibilityVersionParser::kVersion46) {
             uassert(ErrorCodes::IllegalOperation,
-                    "cannot initiate featureCompatibilityVersion upgrade to 4.4 while a previous "
-                    "featureCompatibilityVersion downgrade to 4.2 has not completed. Finish "
-                    "downgrade to 4.2, then upgrade to 4.4.",
+                    "cannot initiate featureCompatibilityVersion upgrade to 4.6 while a previous "
+                    "featureCompatibilityVersion downgrade to 4.4 has not completed. Finish "
+                    "downgrade to 4.4, then upgrade to 4.6.",
                     actualVersion !=
-                        ServerGlobalParams::FeatureCompatibility::Version::kDowngradingTo42);
+                        ServerGlobalParams::FeatureCompatibility::Version::kDowngradingTo44);
 
             if (actualVersion ==
-                ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
+                ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo46) {
                 // Set the client's last opTime to the system last opTime so no-ops wait for
                 // writeConcern.
                 repl::ReplClientInfo::forClient(opCtx->getClient())
@@ -204,7 +206,7 @@ public:
                 // Take the global lock in S mode to create a barrier for operations taking the
                 // global IX or X locks. This ensures that either
                 //   - The global IX/X locked operation will start after the FCV change, see the
-                //     upgrading to 4.4 FCV and act accordingly.
+                //     upgrading to 4.6 FCV and act accordingly.
                 //   - The global IX/X locked operation began prior to the FCV change, is acting on
                 //     that assumption and will finish before upgrade procedures begin right after
                 //     this.
@@ -234,16 +236,17 @@ public:
                                      << requestedVersion)))));
             }
 
+            hangWhileUpgrading.pauseWhileSet(opCtx);
             FeatureCompatibilityVersion::unsetTargetUpgradeOrDowngrade(opCtx, requestedVersion);
-        } else if (requestedVersion == FeatureCompatibilityVersionParser::kVersion42) {
+        } else if (requestedVersion == FeatureCompatibilityVersionParser::kVersion44) {
             uassert(ErrorCodes::IllegalOperation,
-                    "cannot initiate setting featureCompatibilityVersion to 4.2 while a previous "
-                    "featureCompatibilityVersion upgrade to 4.4 has not completed.",
+                    "cannot initiate setting featureCompatibilityVersion to 4.4 while a previous "
+                    "featureCompatibilityVersion upgrade to 4.6 has not completed.",
                     actualVersion !=
-                        ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo44);
+                        ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo46);
 
             if (actualVersion ==
-                ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo42) {
+                ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo44) {
                 // Set the client's last opTime to the system last opTime so no-ops wait for
                 // writeConcern.
                 repl::ReplClientInfo::forClient(opCtx->getClient())
@@ -253,55 +256,20 @@ public:
 
             FeatureCompatibilityVersion::setTargetDowngrade(opCtx);
 
-            // Safe reconfig introduces a new "term" field in the config document. If the user tries
-            // to downgrade the replset to FCV42, the primary will initiate a reconfig without the
-            // term and wait for it to be replicated on all nodes.
-            auto replCoord = repl::ReplicationCoordinator::get(opCtx);
-            const bool isReplSet =
-                replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
-            if (isReplSet &&
-                replCoord->getConfig().getConfigTerm() != repl::OpTime::kUninitializedTerm) {
-                // Force reconfig with term -1 to remove the 4.2 incompatible "term" field.
-                auto getNewConfig = [&](const repl::ReplSetConfig& oldConfig, long long term) {
-                    auto newConfig = oldConfig;
-                    newConfig.setConfigTerm(repl::OpTime::kUninitializedTerm);
-                    newConfig.setConfigVersion(newConfig.getConfigVersion() + 1);
-                    return newConfig;
-                };
-
-                // "force" reconfig in order to skip safety checks. This is safe since the content
-                // of config is the same.
-                LOGV2(4628800, "Downgrading replica set config.");
-                auto status = replCoord->doReplSetReconfig(opCtx, getNewConfig, true /* force */);
-                uassertStatusOKWithContext(status, "Failed to downgrade the replica set config");
-
-                LOGV2(4628801,
-                      "Waiting for the downgraded replica set config to propagate to all nodes");
-                // If a write concern is given, we'll use its wTimeout. It's kNoTimeout by default.
-                WriteConcernOptions writeConcern(repl::ReplSetConfig::kConfigAllWriteConcernName,
-                                                 WriteConcernOptions::SyncMode::NONE,
-                                                 opCtx->getWriteConcern().wTimeout);
-                writeConcern.checkCondition = WriteConcernOptions::CheckCondition::Config;
-                repl::OpTime fakeOpTime(Timestamp(1, 1), replCoord->getTerm());
-                uassertStatusOKWithContext(
-                    replCoord->awaitReplication(opCtx, fakeOpTime, writeConcern).status,
-                    "Failed to wait for the downgraded replica set config to propagate to all "
-                    "nodes");
-                LOGV2(4628802,
-                      "The downgraded replica set config has been propagated to all nodes");
-            }
-
             {
                 // Take the global lock in S mode to create a barrier for operations taking the
                 // global IX or X locks. This ensures that either
                 //   - The global IX/X locked operation will start after the FCV change, see the
-                //     downgrading to 4.2 FCV and act accordingly.
+                //     downgrading to 4.4 FCV and act accordingly.
                 //   - The global IX/X locked operation began prior to the FCV change, is acting on
                 //     that assumption and will finish before downgrade procedures begin right after
                 //     this.
                 Lock::GlobalLock lk(opCtx, MODE_S);
             }
 
+            auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+            const bool isReplSet =
+                replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
             if (failDowngrading.shouldFail())
                 return false;
 
@@ -326,6 +294,7 @@ public:
                                      << requestedVersion)))));
             }
 
+            hangWhileDowngrading.pauseWhileSet(opCtx);
             FeatureCompatibilityVersion::unsetTargetUpgradeOrDowngrade(opCtx, requestedVersion);
         }
 

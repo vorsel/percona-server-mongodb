@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -329,11 +329,11 @@ StatusWith<stdx::unordered_set<NamespaceString>> ViewCatalog::_validatePipeline(
     // Save this to a variable to avoid reading the atomic variable multiple times.
     auto currentFCV = serverGlobalParams.featureCompatibility.getVersion();
 
-    // If the feature compatibility version is not 4.4, and we are validating features as master,
-    // ban the use of new agg features introduced in 4.4 to prevent them from being persisted in the
+    // If the feature compatibility version is not 4.6, and we are validating features as master,
+    // ban the use of new agg features introduced in 4.6 to prevent them from being persisted in the
     // catalog.
     if (serverGlobalParams.validateFeaturesAsMaster.load() &&
-        currentFCV != ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
+        currentFCV != ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo46) {
         expCtx->maxFeatureCompatibilityVersion = currentFCV;
     }
 
@@ -438,7 +438,9 @@ Status ViewCatalog::modifyView(OperationContext* opCtx,
                                const NamespaceString& viewName,
                                const NamespaceString& viewOn,
                                const BSONArray& pipeline) {
-    invariant(opCtx->lockState()->isDbLockedForMode(viewName.db(), MODE_X));
+    invariant(opCtx->lockState()->isCollectionLockedForMode(viewName, MODE_X));
+    invariant(opCtx->lockState()->isCollectionLockedForMode(
+        NamespaceString(viewName.db(), NamespaceString::kSystemDotViewsCollectionName), MODE_X));
 
     stdx::lock_guard<Latch> lk(_mutex);
 

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplicationRollback
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplicationRollback
 
 #include "mongo/platform/basic.h"
 
@@ -374,7 +374,7 @@ void RollbackImpl::_stopAndWaitForIndexBuilds(OperationContext* opCtx) {
                     (numInProg > numInProgInCoordinator ? numInProg : numInProgInCoordinator),
                 "db"_attr = db);
             BackgroundOperation::awaitNoBgOpInProgForDb(db);
-            IndexBuildsCoordinator::get(opCtx)->awaitNoBgOpInProgForDb(db);
+            IndexBuildsCoordinator::get(opCtx)->awaitNoBgOpInProgForDb(opCtx, db);
         }
     }
 

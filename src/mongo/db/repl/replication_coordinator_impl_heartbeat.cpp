@@ -41,12 +41,14 @@
 #include <functional>
 
 #include "mongo/base/status.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/kill_sessions_local.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/heartbeat_response_action.h"
+#include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/repl/repl_set_config_checks.h"
 #include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
@@ -275,6 +277,43 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
 
         // Wake up replication waiters on optime changes or updated configs.
         _wakeReadyWaiters(lk);
+    }
+
+    if (enableAutomaticReconfig) {
+        // When receiving a heartbeat response indicating that the remote is in a state past
+        // STARTUP_2, the primary will initiate a reconfig to remove the 'newlyAdded' field for that
+        // node (if present). This field is normally set when we add new members with votes:1 to the
+        // set.
+        if (_getMemberState_inlock().primary() && hbStatusResponse.isOK() &&
+            hbStatusResponse.getValue().hasState()) {
+            auto remoteState = hbStatusResponse.getValue().getState();
+            if (remoteState == MemberState::RS_SECONDARY ||
+                remoteState == MemberState::RS_RECOVERING ||
+                remoteState == MemberState::RS_ROLLBACK) {
+                const auto mem = _rsConfig.getMemberAt(targetIndex);
+                const auto memId = mem.getId();
+                if (mem.isNewlyAdded()) {
+                    auto status = _replExecutor->scheduleWork(
+                        [=](const executor::TaskExecutor::CallbackArgs& cbData) {
+                            _reconfigToRemoveNewlyAddedField(
+                                cbData, memId, _rsConfig.getConfigVersionAndTerm());
+                        });
+
+                    if (!status.isOK()) {
+                        LOGV2_DEBUG(4634500,
+                                    1,
+                                    "Failed to schedule work for removing 'newlyAdded' field.",
+                                    "memberId"_attr = memId.getData(),
+                                    "error"_attr = status.getStatus());
+                    } else {
+                        LOGV2_DEBUG(4634501,
+                                    1,
+                                    "Scheduled automatic reconfig to remove 'newlyAdded' field.",
+                                    "memberId"_attr = memId.getData());
+                    }
+                }
+            }
+        }
     }
 
     // Abort catchup if we have caught up to the latest known optime after heartbeat refreshing.
@@ -602,7 +641,12 @@ void ReplicationCoordinatorImpl::_heartbeatReconfigStore(
                              "newConfigVersionAndTerm"_attr = newConfig.getConfigVersionAndTerm());
 
         auto opCtx = cc().makeOperationContext();
-        auto status = _externalState->storeLocalConfigDocument(opCtx.get(), newConfig.toBSON());
+        // Don't write the no-op for config learned via heartbeats.
+        auto status = _externalState->storeLocalConfigDocument(
+            opCtx.get(), newConfig.toBSON(), false /* writeOplog */);
+        // Wait for durability of the new config document.
+        opCtx->recoveryUnit()->waitUntilDurable(opCtx.get());
+
         bool isFirstConfig;
         {
             stdx::lock_guard<Latch> lk(_mutex);
@@ -825,6 +869,13 @@ void ReplicationCoordinatorImpl::_cancelHeartbeats_inlock() {
     }
 }
 
+void ReplicationCoordinatorImpl::restartHeartbeats_forTest() {
+    stdx::unique_lock<Latch> lk(_mutex);
+    invariant(getTestCommandsEnabled());
+    LOGV2_FOR_HEARTBEATS(4406800, 0, "Restarting heartbeats");
+    _restartHeartbeats_inlock();
+};
+
 void ReplicationCoordinatorImpl::_restartHeartbeats_inlock() {
     _cancelHeartbeats_inlock();
     _startHeartbeats_inlock();
@@ -962,7 +1013,7 @@ void ReplicationCoordinatorImpl::_cancelAndRescheduleElectionTimeout_inlock() {
     }
     if (wasActive) {
         LOGV2_FOR_ELECTION(4615649,
-                           logSeverityV1toV2(cancelAndRescheduleLogLevel).toInt(),
+                           cancelAndRescheduleLogLevel,
                            "Canceling election timeout callback at {when}",
                            "Canceling election timeout callback",
                            "when"_attr = _handleElectionTimeoutWhen);
@@ -980,7 +1031,7 @@ void ReplicationCoordinatorImpl::_cancelAndRescheduleElectionTimeout_inlock() {
     if (wasActive) {
         // The log level here is 4 once per second, otherwise 5.
         LOGV2_FOR_ELECTION(4615650,
-                           logSeverityV1toV2(cancelAndRescheduleLogLevel).toInt(),
+                           cancelAndRescheduleLogLevel,
                            "Rescheduling election timeout callback at {when}",
                            "Rescheduling election timeout callback",
                            "when"_attr = when);

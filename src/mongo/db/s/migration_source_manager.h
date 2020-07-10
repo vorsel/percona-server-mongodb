@@ -168,7 +168,7 @@ public:
      * Aborts the migration after observing a concurrent index operation by marking its operation
      * context as killed.
      */
-    void abortDueToConflictingIndexOperation();
+    void abortDueToConflictingIndexOperation(OperationContext* opCtx);
 
     /**
      * Returns the cloner which is being used for this migration. This value is available only if
@@ -201,14 +201,14 @@ private:
         kDone
     };
 
-    ScopedCollectionDescription _getCurrentMetadataAndCheckEpoch();
+    CollectionMetadata _getCurrentMetadataAndCheckEpoch();
 
     /**
      * If this donation moves the first chunk to the recipient (i.e., the recipient didn't have any
      * chunks), this function writes a no-op message to the oplog, so that change stream will notice
      * that and close the cursor in order to notify mongos to target the new shard as well.
      */
-    void _notifyChangeStreamsOnRecipientFirstChunk(const ScopedCollectionDescription& metadata);
+    void _notifyChangeStreamsOnRecipientFirstChunk(const CollectionMetadata& metadata);
 
     /**
      * Called when any of the states fails. May only be called once and will put the migration

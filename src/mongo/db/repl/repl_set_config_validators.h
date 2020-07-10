@@ -27,7 +27,13 @@
  *    it in the license file.
  */
 
+#pragma once
+
 #include "mongo/base/status.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
+#include "mongo/db/write_concern_options.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace repl {
@@ -40,6 +46,38 @@ inline Status validateTrue(bool boolVal) {
         return {ErrorCodes::InvalidReplicaSetConfig, "Value must be true if specified"};
     }
     return Status::OK();
+}
+
+inline Status validateDefaultWriteConcernHasMember(const WriteConcernOptions& defaultWriteConcern) {
+    if (defaultWriteConcern.wMode.empty() && defaultWriteConcern.wNumNodes == 0) {
+        return Status(ErrorCodes::BadValue,
+                      "Default write concern mode must wait for at least 1 member");
+    }
+    return Status::OK();
+}
+
+Status validateReplicaSetIdNotNull(OID replicaSetId);
+
+/**
+ * For serialization and deserialization of certain values in the IDL.
+ */
+inline void smallExactInt64Append(std::int64_t value, StringData fieldName, BSONObjBuilder* bob) {
+    bob->appendIntOrLL(fieldName, value);
+}
+
+inline std::int64_t parseSmallExactInt64(const BSONElement& element) {
+    uassert(ErrorCodes::TypeMismatch,
+            str::stream() << "Expected a number, got value of type " << typeName(element.type())
+                          << " for field " << element.fieldName(),
+            element.isNumber());
+    std::int64_t result = element.safeNumberLong();
+    uassert(4708900,
+            str::stream() << "Expected field \"" << element.fieldName()
+                          << "\" to have a value "
+                             "exactly representable as a 64-bit integer, but found "
+                          << element,
+            result == element.numberDouble());
+    return result;
 }
 
 }  // namespace repl

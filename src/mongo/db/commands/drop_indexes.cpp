@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -54,6 +54,7 @@
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/views/view_catalog.h"
 #include "mongo/logv2/log.h"
+#include "mongo/util/exit_code.h"
 #include "mongo/util/quick_exit.h"
 
 namespace mongo {
@@ -100,13 +101,16 @@ public:
 class CmdReIndex : public ErrmsgCommandDeprecated {
 public:
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
-        return AllowedOnSecondary::kAlways;  // can reindex on a secondary
+        // Even though reIndex is a standalone-only command, this will return that the command is
+        // allowed on secondaries so that it will fail with a more useful error message to the user
+        // rather than with a NotMaster error.
+        return AllowedOnSecondary::kAlways;
     }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
     std::string help() const override {
-        return "re-index a collection";
+        return "re-index a collection (can only be run on a standalone mongod)";
     }
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
@@ -127,6 +131,15 @@ public:
             CommandHelpers::parseNsCollectionRequired(dbname, jsobj);
 
         LOGV2(20457, "CMD: reIndex {toReIndexNss}", "toReIndexNss"_attr = toReIndexNss);
+
+        if (repl::ReplicationCoordinator::get(opCtx)->getReplicationMode() !=
+            repl::ReplicationCoordinator::modeNone) {
+            uasserted(
+                ErrorCodes::IllegalOperation,
+                str::stream()
+                    << "reIndex is only allowed on a standalone mongod instance. Cannot reIndex '"
+                    << toReIndexNss << "' while replication is active");
+        }
 
         AutoGetCollection autoColl(opCtx, toReIndexNss, MODE_X);
         Collection* collection = autoColl.getCollection();
@@ -201,22 +214,20 @@ public:
         StatusWith<std::vector<BSONObj>> swIndexesToRebuild(ErrorCodes::UnknownError,
                                                             "Uninitialized");
 
-        // The 'indexer' can throw, so ensure build cleanup occurs.
-        ON_BLOCK_EXIT([&] {
-            indexer->cleanUpAfterBuild(opCtx, collection, MultiIndexBlock::kNoopOnCleanUpFn);
+        writeConflictRetry(opCtx, "dropAllIndexes", toReIndexNss.ns(), [&] {
+            WriteUnitOfWork wunit(opCtx);
+            collection->getIndexCatalog()->dropAllIndexes(opCtx, true);
+
+            swIndexesToRebuild =
+                indexer->init(opCtx, collection, all, MultiIndexBlock::kNoopOnInitFn);
+            uassertStatusOK(swIndexesToRebuild.getStatus());
+            wunit.commit();
         });
 
-        {
-            writeConflictRetry(opCtx, "dropAllIndexes", toReIndexNss.ns(), [&] {
-                WriteUnitOfWork wunit(opCtx);
-                collection->getIndexCatalog()->dropAllIndexes(opCtx, true);
-
-                swIndexesToRebuild =
-                    indexer->init(opCtx, collection, all, MultiIndexBlock::kNoopOnInitFn);
-                uassertStatusOK(swIndexesToRebuild.getStatus());
-                wunit.commit();
-            });
-        }
+        // The 'indexer' can throw, so ensure build cleanup occurs.
+        auto abortOnExit = makeGuard([&] {
+            indexer->abortIndexBuild(opCtx, collection, MultiIndexBlock::kNoopOnCleanUpFn);
+        });
 
         if (MONGO_unlikely(reIndexCrashAfterDrop.shouldFail())) {
             LOGV2(20458, "exiting because 'reIndexCrashAfterDrop' fail point was set");
@@ -229,16 +240,15 @@ public:
 
         uassertStatusOK(indexer->checkConstraints(opCtx));
 
-        {
-            writeConflictRetry(opCtx, "commitReIndex", toReIndexNss.ns(), [&] {
-                WriteUnitOfWork wunit(opCtx);
-                uassertStatusOK(indexer->commit(opCtx,
-                                                collection,
-                                                MultiIndexBlock::kNoopOnCreateEachFn,
-                                                MultiIndexBlock::kNoopOnCommitFn));
-                wunit.commit();
-            });
-        }
+        writeConflictRetry(opCtx, "commitReIndex", toReIndexNss.ns(), [&] {
+            WriteUnitOfWork wunit(opCtx);
+            uassertStatusOK(indexer->commit(opCtx,
+                                            collection,
+                                            MultiIndexBlock::kNoopOnCreateEachFn,
+                                            MultiIndexBlock::kNoopOnCommitFn));
+            wunit.commit();
+        });
+        abortOnExit.dismiss();
 
         // Do not allow majority reads from this collection until all original indexes are visible.
         // This was also done when dropAllIndexes() committed, but we need to ensure that no one

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -59,7 +59,6 @@
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/metadata/egress_metadata_hook_list.h"
 #include "mongo/s/catalog_cache.h"
-#include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/shard_factory.h"
 #include "mongo/s/client/shard_local.h"
 #include "mongo/s/client/shard_remote.h"
@@ -386,7 +385,8 @@ void ShardingInitializationMongoD::updateShardIdentityConfigString(
     BSONObj updateObj(
         ShardIdentityType::createConfigServerUpdateObject(newConnectionString.toString()));
 
-    UpdateRequest updateReq(NamespaceString::kServerConfigurationNamespace);
+    auto updateReq = UpdateRequest();
+    updateReq.setNamespaceString(NamespaceString::kServerConfigurationNamespace);
     updateReq.setQuery(BSON("_id" << ShardIdentityType::IdName));
     updateReq.setUpdateModification(updateObj);
 
@@ -501,8 +501,7 @@ void initializeGlobalShardingStateForMongoD(OperationContext* opCtx,
         validator->stopKeyManager();
     }
 
-    globalConnPool.addHook(new ShardingConnectionHook(false, makeEgressHooksList(service)));
-    shardConnectionPool.addHook(new ShardingConnectionHook(true, makeEgressHooksList(service)));
+    globalConnPool.addHook(new ShardingConnectionHook(makeEgressHooksList(service)));
 
     auto catalogCache = std::make_unique<CatalogCache>(CatalogCacheLoader::get(opCtx));
 

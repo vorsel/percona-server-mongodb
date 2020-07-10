@@ -40,6 +40,10 @@
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d_test_fixture.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/log_severity.h"
+#include "mongo/unittest/log_test.h"
+#include "mongo/unittest/unittest.h"
 
 namespace mongo {
 namespace repl {
@@ -69,6 +73,11 @@ public:
     static Collection* _createCollection(OperationContext* opCtx,
                                          const std::string& nss,
                                          const CollectionOptions& options);
+
+    /**
+     * Inserts a single document into the collection namespace 'nss'.
+     */
+    void _insertDocument(OperationContext* opCtx, const NamespaceString& nss, const BSONObj& doc);
 
     /**
      * Inserts a document into the oplog.
@@ -128,6 +137,10 @@ protected:
     DropPendingCollectionReaper* _dropPendingCollectionReaper = nullptr;
 
     ReadWriteConcernDefaultsLookupMock _lookupMock;
+
+    // Increase rollback log component verbosity for unit tests.
+    unittest::MinimumLoggedSeverityGuard severityGuard{logv2::LogComponent::kReplicationRollback,
+                                                       logv2::LogSeverity::Debug(2)};
 };
 
 class RollbackTest::StorageInterfaceRollback : public StorageInterfaceImpl {
@@ -270,8 +283,6 @@ public:
                                                       UUID uuid,
                                                       const BSONObj& filter) const override;
 
-    void copyCollectionFromRemote(OperationContext* opCtx,
-                                  const NamespaceString& nss) const override;
     StatusWith<BSONObj> getCollectionInfoByUUID(const std::string& db,
                                                 const UUID& uuid) const override;
     StatusWith<BSONObj> getCollectionInfo(const NamespaceString& nss) const override;

@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
@@ -37,6 +36,7 @@
 #include "mongo/base/checked_cast.h"
 #include "mongo/bson/mutable/document.h"
 #include "mongo/bson/util/bson_extract.h"
+#include "mongo/client/server_is_master_monitor.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/impersonation_session.h"
@@ -72,7 +72,6 @@
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/run_op_kill_cursors.h"
 #include "mongo/db/s/operation_sharding_state.h"
-#include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/transaction_coordinator_factory.h"
 #include "mongo/db/service_entry_point_common.h"
@@ -96,6 +95,7 @@
 #include "mongo/rpc/reply_builder_interface.h"
 #include "mongo/transport/ismaster_metrics.h"
 #include "mongo/transport/session.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/scopeguard.h"
 
@@ -126,7 +126,6 @@ ServerStatusMetricField<Counter64> displayNotMasterUnackWrites(
     "repl.network.notMasterUnacknowledgedWrites", &notMasterUnackWrites);
 
 namespace {
-using logger::LogComponent;
 
 void generateLegacyQueryErrorResponse(const AssertionException& exception,
                                       const QueryMessage& queryMessage,
@@ -152,7 +151,7 @@ void generateLegacyQueryErrorResponse(const AssertionException& exception,
 
     if (queryMessage.ntoskip || queryMessage.ntoreturn) {
         LOGV2_OPTIONS(21952,
-                      {logComponentV1toV2(LogComponent::kQuery)},
+                      {logv2::LogComponent::kQuery},
                       "Query's nToSkip = {nToSkip} and nToReturn = {nToReturn}",
                       "Assertion for query with nToSkip and/or nToReturn",
                       "nToSkip"_attr = queryMessage.ntoskip,
@@ -172,7 +171,7 @@ void generateLegacyQueryErrorResponse(const AssertionException& exception,
     const bool isStaleConfig = exception.code() == ErrorCodes::StaleConfig;
     if (isStaleConfig) {
         LOGV2_OPTIONS(21953,
-                      {logComponentV1toV2(LogComponent::kQuery)},
+                      {logv2::LogComponent::kQuery},
                       "Stale version detected during query over {namespace}: {error}",
                       "Detected stale version while querying namespace",
                       "namespace"_attr = queryMessage.ns,
@@ -254,6 +253,7 @@ private:
 /**
  * Given the specified command, returns an effective read concern which should be used or an error
  * if the read concern is not valid for the command.
+ * Note that the validation performed is not necessarily exhaustive.
  */
 StatusWith<repl::ReadConcernArgs> _extractReadConcern(OperationContext* opCtx,
                                                       const CommandInvocation* invocation,
@@ -275,34 +275,28 @@ StatusWith<repl::ReadConcernArgs> _extractReadConcern(OperationContext* opCtx,
         repl::ReplicationCoordinator::get(opCtx)->isReplEnabled() &&
         !opCtx->getClient()->isInDirectClient()) {
 
-        if (serverGlobalParams.featureCompatibility.isVersion(
-                ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44)) {
-            if (isInternalClient) {
-                // ReadConcern should always be explicitly specified by operations received from
-                // internal clients (ie. from a mongos or mongod), even if it is empty (ie.
-                // readConcern: {}, meaning to use the implicit server defaults).
-                uassert(
-                    4569200,
-                    "received command without explicit readConcern on an internalClient connection {}"_format(
-                        redact(cmdObj.toString())),
-                    readConcernArgs.isSpecified());
-            } else if (serverGlobalParams.clusterRole == ClusterRole::ShardServer ||
-                       serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-                if (!readConcernArgs.isSpecified()) {
-                    // TODO: Disabled until after SERVER-44539, to avoid log spam.
-                    // LOGV2(21954, "Missing readConcern on {command}", "Missing readConcern "
-                    // "for command", "command"_attr = invocation->definition()->getName());
-                }
+        if (isInternalClient) {
+            // ReadConcern should always be explicitly specified by operations received from
+            // internal clients (ie. from a mongos or mongod), even if it is empty (ie.
+            // readConcern: {}, meaning to use the implicit server defaults).
+            uassert(
+                4569200,
+                "received command without explicit readConcern on an internalClient connection {}"_format(
+                    redact(cmdObj.toString())),
+                readConcernArgs.isSpecified());
+        } else if (serverGlobalParams.clusterRole == ClusterRole::ShardServer ||
+                   serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+            if (!readConcernArgs.isSpecified()) {
+                // TODO: Disabled until after SERVER-44539, to avoid log spam.
+                // LOGV2(21954, "Missing readConcern on {command}", "Missing readConcern "
+                // "for command", "command"_attr = invocation->definition()->getName());
             }
-        }
-
-        if (serverGlobalParams.clusterRole != ClusterRole::ShardServer &&
-            serverGlobalParams.clusterRole != ClusterRole::ConfigServer) {
+        } else {
             // A member in a regular replica set.  Since these servers receive client queries, in
             // this context empty RC (ie. readConcern: {}) means the same as if absent/unspecified,
             // which is to apply the CWRWC defaults if present.  This means we just test isEmpty(),
             // since this covers both isSpecified() && !isSpecified()
-            if (!isInternalClient && readConcernArgs.isEmpty()) {
+            if (readConcernArgs.isEmpty()) {
                 const auto rcDefault = ReadWriteConcernDefaults::get(opCtx->getServiceContext())
                                            .getDefaultReadConcern(opCtx);
                 if (rcDefault) {
@@ -396,7 +390,7 @@ LogicalTime getClientOperationTime(OperationContext* opCtx) {
     }
 
     return LogicalTime(
-        repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp().getTimestamp());
+        repl::ReplClientInfo::forClient(opCtx->getClient()).getMaxKnownOpTime().getTimestamp());
 }
 
 /**
@@ -596,11 +590,6 @@ void invokeWithSessionCheckedOut(OperationContext* opCtx,
             if (sessionOptions.getCoordinator() == boost::optional<bool>(true)) {
                 createTransactionCoordinator(opCtx, *sessionOptions.getTxnNumber());
             }
-        } else if (txnParticipant.transactionIsOpen()) {
-            const auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
-            uassert(ErrorCodes::InvalidOptions,
-                    "Only the first command in a transaction may specify a readConcern",
-                    readConcernArgs.isEmpty());
         }
 
         // Release the transaction lock resources and abort storage transaction for unprepared
@@ -746,24 +735,21 @@ bool runCommandImpl(OperationContext* opCtx,
             if (!opCtx->getClient()->isInDirectClient() &&
                 (!opCtx->inMultiDocumentTransaction() ||
                  isTransactionCommand(command->getName()))) {
-                if (serverGlobalParams.featureCompatibility.isVersion(
-                        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44)) {
-                    if (isInternalClient) {
-                        // WriteConcern should always be explicitly specified by operations received
-                        // from internal clients (ie. from a mongos or mongod), even if it is empty
-                        // (ie. writeConcern: {}, which is equivalent to { w: 1, wtimeout: 0 }).
-                        uassert(
-                            4569201,
-                            "received command without explicit writeConcern on an internalClient connection {}"_format(
-                                redact(request.body.toString())),
-                            request.body.hasField(WriteConcernOptions::kWriteConcernField));
-                    } else if (serverGlobalParams.clusterRole == ClusterRole::ShardServer ||
-                               serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-                        if (!request.body.hasField(WriteConcernOptions::kWriteConcernField)) {
-                            // TODO: Disabled until after SERVER-44539, to avoid log spam.
-                            // LOGV2(21959, "Missing writeConcern on {command}", "Missing "
-                            // "writeConcern on command", "command"_attr = command->getName());
-                        }
+                if (isInternalClient) {
+                    // WriteConcern should always be explicitly specified by operations received
+                    // from internal clients (ie. from a mongos or mongod), even if it is empty
+                    // (ie. writeConcern: {}, which is equivalent to { w: 1, wtimeout: 0 }).
+                    uassert(
+                        4569201,
+                        "received command without explicit writeConcern on an internalClient connection {}"_format(
+                            redact(request.body.toString())),
+                        request.body.hasField(WriteConcernOptions::kWriteConcernField));
+                } else if (serverGlobalParams.clusterRole == ClusterRole::ShardServer ||
+                           serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+                    if (!request.body.hasField(WriteConcernOptions::kWriteConcernField)) {
+                        // TODO: Disabled until after SERVER-44539, to avoid log spam.
+                        // LOGV2(21959, "Missing writeConcern on {command}", "Missing "
+                        // "writeConcern on command", "command"_attr = command->getName());
                     }
                 }
             }
@@ -985,6 +971,7 @@ void execCommandDatabase(OperationContext* opCtx,
         std::unique_ptr<MaintenanceModeSetter> mmSetter;
 
         BSONElement cmdOptionMaxTimeMSField;
+        BSONElement maxTimeMSOpOnlyField;
         BSONElement allowImplicitCollectionCreationField;
         BSONElement helpField;
 
@@ -993,6 +980,11 @@ void execCommandDatabase(OperationContext* opCtx,
             StringData fieldName = element.fieldNameStringData();
             if (fieldName == QueryRequest::cmdOptionMaxTimeMS) {
                 cmdOptionMaxTimeMSField = element;
+            } else if (fieldName == QueryRequest::kMaxTimeMSOpOnlyField) {
+                uassert(ErrorCodes::InvalidOptions,
+                        "Can not specify maxTimeMSOpOnly for non internal clients",
+                        isInternalClient);
+                maxTimeMSOpOnlyField = element;
             } else if (fieldName == "allowImplicitCollectionCreation") {
                 allowImplicitCollectionCreationField = element;
             } else if (fieldName == CommandHelpers::kHelpFieldName) {
@@ -1012,9 +1004,9 @@ void execCommandDatabase(OperationContext* opCtx,
 
         if (CommandHelpers::isHelpRequest(helpField)) {
             CurOp::get(opCtx)->ensureStarted();
-            // We disable last-error for help requests due to SERVER-11492, because config servers
-            // use help requests to determine which commands are database writes, and so must be
-            // forwarded to all config servers.
+            // We disable last-error for help requests due to SERVER-11492, because config
+            // servers use help requests to determine which commands are database writes, and so
+            // must be forwarded to all config servers.
             LastError::get(opCtx->getClient()).disable();
             Command::generateHelpResponse(opCtx, replyBuilder, *command);
             return;
@@ -1080,20 +1072,28 @@ void execCommandDatabase(OperationContext* opCtx,
             opCounters->gotCommand();
         }
 
-        // Parse the 'maxTimeMS' command option, and use it to set a deadline for the operation on
-        // the OperationContext. The 'maxTimeMS' option unfortunately has a different meaning for a
-        // getMore command, where it is used to communicate the maximum time to wait for new inserts
-        // on tailable cursors, not as a deadline for the operation.
+        // Parse the 'maxTimeMS' command option, and use it to set a deadline for the operation
+        // on the OperationContext. The 'maxTimeMS' option unfortunately has a different meaning
+        // for a getMore command, where it is used to communicate the maximum time to wait for
+        // new inserts on tailable cursors, not as a deadline for the operation.
         // TODO SERVER-34277 Remove the special handling for maxTimeMS for getMores. This will
-        // require introducing a new 'max await time' parameter for getMore, and eventually banning
-        // maxTimeMS altogether on a getMore command.
-        const int maxTimeMS =
-            uassertStatusOK(QueryRequest::parseMaxTimeMS(cmdOptionMaxTimeMSField));
-        if (maxTimeMS > 0 && command->getLogicalOp() != LogicalOp::opGetMore) {
+        // require introducing a new 'max await time' parameter for getMore, and eventually
+        // banning maxTimeMS altogether on a getMore command.
+        int maxTimeMS = uassertStatusOK(QueryRequest::parseMaxTimeMS(cmdOptionMaxTimeMSField));
+        int maxTimeMSOpOnly = uassertStatusOK(QueryRequest::parseMaxTimeMS(maxTimeMSOpOnlyField));
+
+        if ((maxTimeMS > 0 || maxTimeMSOpOnly > 0) &&
+            command->getLogicalOp() != LogicalOp::opGetMore) {
             uassert(40119,
                     "Illegal attempt to set operation deadline within DBDirectClient",
                     !opCtx->getClient()->isInDirectClient());
-            opCtx->setDeadlineAfterNowBy(Milliseconds{maxTimeMS}, ErrorCodes::MaxTimeMSExpired);
+            if (maxTimeMSOpOnly > 0 && (maxTimeMS == 0 || maxTimeMSOpOnly < maxTimeMS)) {
+                opCtx->storeMaxTimeMS(Milliseconds{maxTimeMS});
+                opCtx->setDeadlineAfterNowBy(Milliseconds{maxTimeMSOpOnly},
+                                             ErrorCodes::MaxTimeMSExpired);
+            } else if (maxTimeMS > 0) {
+                opCtx->setDeadlineAfterNowBy(Milliseconds{maxTimeMS}, ErrorCodes::MaxTimeMSExpired);
+            }
         }
 
         auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
@@ -1111,6 +1111,11 @@ void execCommandDatabase(OperationContext* opCtx,
                       str::stream() << "unexpected unset provenance on readConcern: "
                                     << newReadConcernArgs.toBSONInner());
 
+            uassert(ErrorCodes::InvalidOptions,
+                    "Only the first command in a transaction may specify a readConcern",
+                    startTransaction || !opCtx->inMultiDocumentTransaction() ||
+                        newReadConcernArgs.isEmpty());
+
             {
                 // We must obtain the client lock to set the ReadConcernArgs on the operation
                 // context as it may be concurrently read by CurrentOp.
@@ -1119,18 +1124,13 @@ void execCommandDatabase(OperationContext* opCtx,
             }
         }
 
-        uassert(ErrorCodes::InvalidOptions,
-                "read concern level snapshot is only valid in a transaction",
-                opCtx->inMultiDocumentTransaction() ||
-                    readConcernArgs.getLevel() != repl::ReadConcernLevel::kSnapshotReadConcern);
-
         if (startTransaction) {
             opCtx->lockState()->setSharedLocksShouldTwoPhaseLock(true);
             opCtx->lockState()->setShouldConflictWithSecondaryBatchApplication(false);
         }
 
-        // Remember whether or not this operation is starting a transaction, in case something later
-        // in the execution needs to adjust its behavior based on this.
+        // Remember whether or not this operation is starting a transaction, in case something
+        // later in the execution needs to adjust its behavior based on this.
         opCtx->setIsStartingMultiDocumentTransaction(startTransaction);
 
         auto& oss = OperationShardingState::get(opCtx);
@@ -1155,9 +1155,10 @@ void execCommandDatabase(OperationContext* opCtx,
         // This may trigger the maxTimeAlwaysTimeOut failpoint.
         auto status = opCtx->checkForInterruptNoAssert();
 
-        // We still proceed if the primary stepped down, but accept other kinds of interruptions.
-        // We defer to individual commands to allow themselves to be interruptible by stepdowns,
-        // since commands like 'voteRequest' should conversely continue executing.
+        // We still proceed if the primary stepped down, but accept other kinds of
+        // interruptions. We defer to individual commands to allow themselves to be
+        // interruptible by stepdowns, since commands like 'voteRequest' should conversely
+        // continue executing.
         if (status != ErrorCodes::PrimarySteppedDown &&
             status != ErrorCodes::InterruptedDueToReplStateChange) {
             uassertStatusOK(status);
@@ -1207,10 +1208,10 @@ void execCommandDatabase(OperationContext* opCtx,
             auto engine = opCtx->getServiceContext()->getStorageEngine();
             invariant(engine && engine->supportsReadConcernSnapshot());
 
-            // SnapshotTooOld errors indicate that PIT ops are failing to find an available snapshot
-            // at their specified atClusterTime. Therefore, we'll try to increase the snapshot
-            // history window that the storage engine maintains in order to increase the likelihood
-            // of successful future PIT atClusterTime requests.
+            // SnapshotTooOld errors indicate that PIT ops are failing to find an available
+            // snapshot at their specified atClusterTime. Therefore, we'll try to increase the
+            // snapshot history window that the storage engine maintains in order to increase
+            // the likelihood of successful future PIT atClusterTime requests.
             SnapshotWindowUtil::incrementSnapshotTooOldErrorCount();
             SnapshotWindowUtil::increaseTargetSnapshotWindowSize(opCtx);
         } else {
@@ -1238,8 +1239,11 @@ void execCommandDatabase(OperationContext* opCtx,
         // parse it here, so if it is valid it can be used to compute the proper operationTime.
         auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
         if (readConcernArgs.isEmpty()) {
-            auto readConcernArgsStatus =
-                _extractReadConcern(opCtx, invocation.get(), request.body, false, isInternalClient);
+            auto readConcernArgsStatus = _extractReadConcern(opCtx,
+                                                             invocation.get(),
+                                                             request.body,
+                                                             false /*startTransaction*/,
+                                                             isInternalClient);
             if (readConcernArgsStatus.isOK()) {
                 // We must obtain the client lock to set the ReadConcernArgs on the operation
                 // context as it may be concurrently read by CurrentOp.
@@ -1261,6 +1265,12 @@ void execCommandDatabase(OperationContext* opCtx,
                     "error"_attr = redact(e.toString()));
 
         generateErrorResponse(opCtx, replyBuilder, e, metadataBob.obj(), extraFieldsBuilder.obj());
+
+        if (ErrorCodes::isA<ErrorCategory::CloseConnectionError>(e.code())) {
+            // Rethrow the exception to the top to signal that the client connection should be
+            // closed.
+            throw;
+        }
     }
 }
 
@@ -1286,6 +1296,7 @@ DbResponse receivedCommands(OperationContext* opCtx,
                             const ServiceEntryPointCommon::Hooks& behaviors) {
     auto replyBuilder = rpc::makeReplyBuilder(rpc::protocolForMessage(message));
     OpMsgRequest request;
+    Command* c = nullptr;
     [&] {
         try {  // Parse.
             request = rpc::opMsgRequestFromAnyProtocol(message);
@@ -1319,7 +1330,6 @@ DbResponse receivedCommands(OperationContext* opCtx,
         try {  // Execute.
             curOpCommandSetup(opCtx, request);
 
-            Command* c = nullptr;
             // In the absence of a Command object, no redaction is possible. Therefore
             // to avoid displaying potentially sensitive information in the logs,
             // we restrict the log message to the name of the unrecognized command.
@@ -1345,7 +1355,8 @@ DbResponse receivedCommands(OperationContext* opCtx,
                             ServiceEntryPointCommon::getRedactedCopyForLogging(c, request.body)));
 
             {
-                // Try to set this as early as possible, as soon as we have figured out the command.
+                // Try to set this as early as possible, as soon as we have figured out the
+                // command.
                 stdx::lock_guard<Client> lk(*opCtx->getClient());
                 CurOp::get(opCtx)->setLogicalOp_inlock(c->getLogicalOp());
             }
@@ -1378,13 +1389,20 @@ DbResponse receivedCommands(OperationContext* opCtx,
 
             generateErrorResponse(
                 opCtx, replyBuilder.get(), ex, metadataBob.obj(), extraFieldsBuilder.obj());
+
+            if (ErrorCodes::isA<ErrorCategory::CloseConnectionError>(ex.code())) {
+                // Rethrow the exception to the top to signal that the client connection should be
+                // closed.
+                throw;
+            }
         }
     }();
 
     if (OpMsg::isFlagSet(message, OpMsg::kMoreToCome)) {
         // Close the connection to get client to go through server selection again.
         if (LastError::get(opCtx->getClient()).hadNotMasterError()) {
-            notMasterUnackWrites.increment();
+            if (c && c->getReadWriteType() == Command::ReadWriteType::kWrite)
+                notMasterUnackWrites.increment();
             uasserted(ErrorCodes::NotMaster,
                       str::stream()
                           << "Not-master error while processing '" << request.getCommandName()
@@ -1479,7 +1497,7 @@ void receivedKillCursors(OperationContext* opCtx, const Message& m) {
 
     if (shouldLog(logv2::LogSeverity::Debug(1)) || found != n) {
         LOGV2_DEBUG(21967,
-                    logSeverityV1toV2(found == n ? 1 : 0).toInt(),
+                    found == n ? 1 : 0,
                     "killCursors: found {found} of {numCursors}",
                     "killCursors found fewer cursors to kill than requested",
                     "found"_attr = found,
@@ -1583,12 +1601,12 @@ DbResponse receivedGetMore(OperationContext* opCtx,
             // Make sure that killCursorGlobal does not throw an exception if it is interrupted.
             UninterruptibleLockGuard noInterrupt(opCtx->lockState());
 
-            // If an error was thrown prior to auth checks, then the cursor should remain alive in
-            // order to prevent an unauthorized user from resulting in the death of a cursor. In
-            // other error cases, the cursor is dead and should be cleaned up.
+            // If an error was thrown prior to auth checks, then the cursor should remain alive
+            // in order to prevent an unauthorized user from resulting in the death of a cursor.
+            // In other error cases, the cursor is dead and should be cleaned up.
             //
-            // If killing the cursor fails, ignore the error and don't try again. The cursor should
-            // be reaped by the client cursor timeout thread.
+            // If killing the cursor fails, ignore the error and don't try again. The cursor
+            // should be reaped by the client cursor timeout thread.
             CursorManager::get(opCtx)
                 ->killCursor(opCtx, cursorid, false /* shouldAudit */)
                 .ignore();
@@ -1683,6 +1701,12 @@ DbResponse ServiceEntryPointCommon::handleRequest(OperationContext* opCtx,
     DbResponse dbresponse;
     if (op == dbMsg || (op == dbQuery && isCommand)) {
         dbresponse = receivedCommands(opCtx, m, behaviors);
+        // IsMaster should take kMaxAwaitTimeMs at most, log if it takes twice that.
+        if (auto command = currentOp.getCommand();
+            command && (command->getName() == "ismaster" || command->getName() == "isMaster")) {
+            slowMsOverride =
+                2 * durationCount<Milliseconds>(SingleServerIsMasterMonitor::kMaxAwaitTimeMs);
+        }
     } else if (op == dbQuery) {
         invariant(!isCommand);
         opCtx->markKillOnClientDisconnect();
@@ -1705,14 +1729,6 @@ DbResponse ServiceEntryPointCommon::handleRequest(OperationContext* opCtx,
                 currentOp.done();
                 forceLog = true;
             } else {
-                if (!opCtx->getClient()->isInDirectClient()) {
-                    uassert(18663,
-                            str::stream() << "legacy writeOps not longer supported for "
-                                          << "versioned connections, ns: " << nsString.ns()
-                                          << ", op: " << networkOpToString(op),
-                            !ShardedConnectionInfo::get(&c, false));
-                }
-
                 if (!nsString.isValid()) {
                     uassert(16257, str::stream() << "Invalid ns [" << ns << "]", false);
                 } else if (op == dbInsert) {

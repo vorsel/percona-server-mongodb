@@ -67,11 +67,6 @@ struct IndexKeyEntry {
 
     IndexKeyEntry(BSONObj key, RecordId loc) : key(std::move(key)), loc(std::move(loc)) {}
 
-    // TODO SERVER-45138: toString() can be removed when we log to JSON only
-    std::string toString() const {
-        return str::stream() << key << ' ' << loc;
-    }
-
     void serialize(BSONObjBuilder* builder) const {
         builder->append("key"_sd, key);
         loc.serialize(builder);
@@ -263,7 +258,8 @@ private:
 Status buildDupKeyErrorStatus(const BSONObj& key,
                               const NamespaceString& collectionNamespace,
                               const std::string& indexName,
-                              const BSONObj& keyPattern);
+                              const BSONObj& keyPattern,
+                              const BSONObj& indexCollation);
 
 /**
  * Returns the formatted error status about the duplicate KeyString.
@@ -272,6 +268,7 @@ Status buildDupKeyErrorStatus(const KeyString::Value& keyString,
                               const NamespaceString& collectionNamespace,
                               const std::string& indexName,
                               const BSONObj& keyPattern,
+                              const BSONObj& indexCollation,
                               const Ordering& ordering);
 
 }  // namespace mongo

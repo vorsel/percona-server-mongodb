@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -82,7 +82,7 @@ public:
                 const int debugLevel =
                     serverGlobalParams.clusterRole == ClusterRole::ConfigServer ? 0 : 2;
                 LOGV2_DEBUG(21975,
-                            logSeverityV1toV2(debugLevel).toInt(),
+                            debugLevel,
                             "Command on database {db} timed out waiting for read concern to be "
                             "satisfied. Command: {command}. Info: {error}",
                             "Command timed out waiting for read concern to be satisfied",
@@ -198,12 +198,6 @@ public:
                 oss.setMigrationCriticalSectionSignal(sce->getCriticalSectionSignal());
             }
 
-            if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-                serverGlobalParams.featureCompatibility.getVersion() ==
-                    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
-                invariant(sce->getShardId());
-            }
-
             if (!opCtx->getClient()->isInDirectClient()) {
                 // We already have the StaleConfig exception, so just swallow any errors due to
                 // refresh
@@ -242,7 +236,7 @@ public:
         if (isReplSet) {
             // Attach our own last opTime.
             repl::OpTime lastOpTimeFromClient =
-                repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
+                repl::ReplClientInfo::forClient(opCtx->getClient()).getMaxKnownOpTime();
             replCoord->prepareReplMetadata(request.body, lastOpTimeFromClient, metadataBob);
             // For commands from mongos, append some info to help getLastError(w) work.
             // TODO: refactor out of here as part of SERVER-18236

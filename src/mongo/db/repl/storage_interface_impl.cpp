@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -936,7 +936,8 @@ Status StorageInterfaceImpl::upsertById(OperationContext* opCtx,
 
         // We can create an UpdateRequest now that the collection's namespace has been resolved, in
         // the event it was specified as a UUID.
-        UpdateRequest request(collection->ns());
+        auto request = UpdateRequest();
+        request.setNamespaceString(collection->ns());
         request.setQuery(query);
         request.setUpdateModification(update);
         request.setUpsert(true);
@@ -977,7 +978,8 @@ Status StorageInterfaceImpl::upsertById(OperationContext* opCtx,
 Status StorageInterfaceImpl::putSingleton(OperationContext* opCtx,
                                           const NamespaceString& nss,
                                           const TimestampedBSONObj& update) {
-    UpdateRequest request(nss);
+    auto request = UpdateRequest();
+    request.setNamespaceString(nss);
     request.setQuery({});
     request.setUpdateModification(update.obj);
     request.setUpsert(true);
@@ -988,7 +990,8 @@ Status StorageInterfaceImpl::updateSingleton(OperationContext* opCtx,
                                              const NamespaceString& nss,
                                              const BSONObj& query,
                                              const TimestampedBSONObj& update) {
-    UpdateRequest request(nss);
+    auto request = UpdateRequest();
+    request.setNamespaceString(nss);
     request.setQuery(query);
     request.setUpdateModification(update.obj);
     invariant(!request.isUpsert());
@@ -1045,11 +1048,19 @@ boost::optional<BSONObj> StorageInterfaceImpl::findOplogEntryLessThanOrEqualToTi
     invariant(oplog);
     invariant(opCtx->lockState()->isLocked());
 
+    // Using a YieldPolicy WRITE_CONFLICT_RETRY_ONLY that will allow query to retry on
+    // WriteConflictExceptions without releasing locks that are important to callers.
+    //
+    // This read can run concurrently with the validate cmd's WT verify operation due to the special
+    // locking rules for internal operations accessing the oplog collection. Validate holds a MODE_X
+    // collection lock for WT verify, but an internal read only needs a MODE_IS global lock. Trying
+    // to open a cursor on a collection that has a verify operation running produces an EBUSY error
+    // that we then convert to a WCE.
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec =
         InternalPlanner::collectionScan(opCtx,
                                         NamespaceString::kRsOplogNamespace.ns(),
                                         oplog,
-                                        PlanExecutor::NO_YIELD,
+                                        PlanExecutor::WRITE_CONFLICT_RETRY_ONLY,
                                         InternalPlanner::BACKWARD);
 
     // A record id in the oplog collection is equivalent to the document's timestamp field.

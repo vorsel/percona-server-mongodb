@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -123,7 +123,6 @@ TEST_F(ShardingCatalogClientTest, GetCollectionExisting) {
                                      100,
                                      0,
                                      OID(),
-                                     30,
                                      -1,
                                      true);
             BSONObjBuilder builder;
@@ -198,7 +197,6 @@ TEST_F(ShardingCatalogClientTest, GetDatabaseExisting) {
                                  100,
                                  0,
                                  OID(),
-                                 30,
                                  -1,
                                  true);
         BSONObjBuilder builder;
@@ -427,7 +425,6 @@ TEST_F(ShardingCatalogClientTest, GetChunksForNSWithSortAndLimit) {
                                      100,
                                      0,
                                      OID(),
-                                     30,
                                      -1,
                                      true);
             BSONObjBuilder builder;
@@ -830,7 +827,6 @@ TEST_F(ShardingCatalogClientTest, GetCollectionsValidResultsNoDb) {
                                  100,
                                  0,
                                  OID(),
-                                 30,
                                  -1,
                                  true);
         BSONObjBuilder builder;

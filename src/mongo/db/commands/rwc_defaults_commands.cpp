@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -112,12 +112,6 @@ public:
 
         auto typedRun(OperationContext* opCtx) {
             assertNotStandaloneOrShardServer(opCtx, SetDefaultRWConcern::kCommandName);
-
-            uassert(ErrorCodes::CommandNotSupported,
-                    str::stream() << "'" << SetDefaultRWConcern::kCommandName
-                                  << "' is only supported in feature compatibility version 4.4",
-                    serverGlobalParams.featureCompatibility.getVersion() ==
-                        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44);
 
             auto& rwcDefaults = ReadWriteConcernDefaults::get(opCtx->getServiceContext());
             auto newDefaults = rwcDefaults.generateNewConcerns(

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -66,7 +66,6 @@
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard.h"
-#include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_identity_loader.h"
 #include "mongo/s/database_version_helpers.h"
@@ -339,14 +338,14 @@ StatusWith<ShardType> ShardingCatalogManager::_validateHostAsShard(
                                                 << connectionString.toString() << " as a shard");
     }
     if (serverGlobalParams.featureCompatibility.getVersion() >
-        ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo42) {
-        // If the cluster's FCV is 4.4, or upgrading to / downgrading from, the node being added
-        // must be a v4.4 binary.
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo44) {
+        // If the cluster's FCV is 4.6, or upgrading to / downgrading from, the node being added
+        // must be a v4.6 binary.
         invariant(maxWireVersion == WireVersion::LATEST_WIRE_VERSION);
     } else {
-        // If the cluster's FCV is 4.2, the node being added must be a v4.2 or v4.4 binary.
+        // If the cluster's FCV is 4.4, the node being added must be a v4.4 or v4.6 binary.
         invariant(serverGlobalParams.featureCompatibility.getVersion() ==
-                  ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo42);
+                  ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo44);
         invariant(maxWireVersion >= WireVersion::LATEST_WIRE_VERSION - 1);
     }
 
@@ -651,16 +650,16 @@ StatusWith<std::string> ShardingCatalogManager::addShard(
 
         BSONObj setFCVCmd;
         switch (serverGlobalParams.featureCompatibility.getVersion()) {
-            case ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44:
-            case ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo44:
+            case ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo46:
+            case ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo46:
                 setFCVCmd = BSON(FeatureCompatibilityVersionCommandParser::kCommandName
-                                 << FeatureCompatibilityVersionParser::kVersion44
+                                 << FeatureCompatibilityVersionParser::kVersion46
                                  << WriteConcernOptions::kWriteConcernField
                                  << opCtx->getWriteConcern().toBSON());
                 break;
             default:
                 setFCVCmd = BSON(FeatureCompatibilityVersionCommandParser::kCommandName
-                                 << FeatureCompatibilityVersionParser::kVersion42
+                                 << FeatureCompatibilityVersionParser::kVersion44
                                  << WriteConcernOptions::kWriteConcernField
                                  << opCtx->getWriteConcern().toBSON());
                 break;
@@ -857,7 +856,6 @@ RemoveShardProgress ShardingCatalogManager::removeShard(OperationContext* opCtx,
     // The shard which was just removed must be reflected in the shard registry, before the replica
     // set monitor is removed, otherwise the shard would be referencing a dropped RSM
     Grid::get(opCtx)->shardRegistry()->reload(opCtx);
-    shardConnectionPool.removeHost(name);
     ReplicaSetMonitor::remove(name);
 
     // Record finish in changelog

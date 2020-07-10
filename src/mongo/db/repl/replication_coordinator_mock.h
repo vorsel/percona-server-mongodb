@@ -70,6 +70,8 @@ public:
 
     virtual void enterTerminalShutdown();
 
+    virtual void enterQuiesceMode();
+
     virtual void shutdown(OperationContext* opCtx);
 
     void markAsCleanShutdownIfPossible(OperationContext* opCtx) override;
@@ -214,7 +216,7 @@ public:
                                      GetNewConfigFn getNewConfig,
                                      bool force);
 
-    Status awaitConfigCommitment(OperationContext* opCtx);
+    Status awaitConfigCommitment(OperationContext* opCtx, bool waitForOplogCommitment);
 
     virtual Status processReplSetInitiate(OperationContext* opCtx,
                                           const BSONObj& configObj,
@@ -241,7 +243,8 @@ public:
 
     virtual bool shouldChangeSyncSource(const HostAndPort& currentSource,
                                         const rpc::ReplSetMetadata& replMetadata,
-                                        const rpc::OplogQueryMetadata& oqMetadata);
+                                        const rpc::OplogQueryMetadata& oqMetadata,
+                                        const OpTime& lastOpTimeFetched);
 
     virtual OpTime getLastCommittedOpTime() const;
 
@@ -334,11 +337,11 @@ public:
         OperationContext* opCtx,
         const SplitHorizon::Parameters& horizonParams,
         boost::optional<TopologyVersion> clientTopologyVersion,
-        boost::optional<Date_t> deadline) const override;
+        boost::optional<Date_t> deadline) override;
 
     virtual SharedSemiFuture<std::shared_ptr<const IsMasterResponse>> getIsMasterResponseFuture(
         const SplitHorizon::Parameters& horizonParams,
-        boost::optional<TopologyVersion> clientTopologyVersion) const override;
+        boost::optional<TopologyVersion> clientTopologyVersion) override;
 
     virtual OpTime getLatestWriteOpTime(OperationContext* opCtx) const override;
 
@@ -350,6 +353,7 @@ public:
                                             const BSONObj& cmdObj,
                                             OnRemoteCmdScheduledFn onRemoteCmdScheduled,
                                             OnRemoteCmdCompleteFn onRemoteCmdComplete) override;
+    virtual void restartHeartbeats_forTest() override;
 
 private:
     ServiceContext* const _service;

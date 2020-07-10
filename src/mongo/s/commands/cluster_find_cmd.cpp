@@ -176,11 +176,7 @@ public:
 
                 auto bodyBuilder = result->getBodyBuilder();
                 uassertStatusOK(ClusterExplain::buildExplainResult(
-                    opCtx,
-                    ClusterExplain::downconvert(opCtx, shardResponses),
-                    mongosStageName,
-                    millisElapsed,
-                    &bodyBuilder));
+                    opCtx, shardResponses, mongosStageName, millisElapsed, &bodyBuilder));
 
             } catch (const ExceptionFor<ErrorCodes::CommandOnShardedViewNotSupportedOnMongod>& ex) {
                 auto bodyBuilder = result->getBodyBuilder();
@@ -206,6 +202,11 @@ public:
             CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
             // We count find command as a query op.
             globalOpCounters.gotQuery();
+
+            ON_BLOCK_EXIT([opCtx] {
+                Grid::get(opCtx)->catalogCache()->checkAndRecordOperationBlockedByRefresh(
+                    opCtx, mongo::LogicalOp::opQuery);
+            });
 
             const bool isExplain = false;
             auto qr = parseCmdObjectToQueryRequest(opCtx, ns(), _request.body, isExplain);

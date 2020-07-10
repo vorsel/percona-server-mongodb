@@ -52,18 +52,23 @@ const auto getIsMigrating = OperationContext::declareDecoration<bool>();
 void assertIntersectingChunkHasNotMoved(OperationContext* opCtx,
                                         CollectionShardingRuntime* csr,
                                         const BSONObj& doc) {
-    if (!repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime())
+    const auto atClusterTime = repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime();
+    if (!atClusterTime)
         return;
 
-    const auto collectionFilter = csr->getOwnershipFilter(
-        opCtx, CollectionShardingState::OrphanCleanupPolicy::kAllowOrphanCleanup);
-    if (!collectionFilter.isSharded())
+    // TODO (SERVER-47701): As part of enabling transition from a replica-set to sharded cluster,
+    // without requiring application downtime, these checks need to be revisited. Ideally this code
+    // should not be reached upon direct writes to a shard.
+    auto metadata = csr->getCurrentMetadataIfKnown();
+    if (!metadata || !metadata->isSharded())
         return;
 
-    auto shardKey = collectionFilter.extractShardKeyFromDoc(doc);
+    auto shardKey = metadata->getShardKeyPattern().extractShardKeyFromDoc(doc);
 
     // We can assume the simple collation because shard keys do not support non-simple collations.
-    auto chunk = collectionFilter.findIntersectingChunkWithSimpleCollation(shardKey);
+    ChunkManager chunkManagerAtClusterTime(metadata->getChunkManager()->getRoutingHistory(),
+                                           atClusterTime->asTimestamp());
+    auto chunk = chunkManagerAtClusterTime.findIntersectingChunkWithSimpleCollation(shardKey);
 
     // Throws if the chunk has moved since the timestamp of the running transaction's atClusterTime
     // read concern parameter.
@@ -99,14 +104,10 @@ void OpObserverShardingImpl::shardObserveInsertOp(OperationContext* opCtx,
                                                   const repl::OpTime& opTime,
                                                   const bool fromMigrate,
                                                   const bool inMultiDocumentTransaction) {
-    auto* const csr = (nss == NamespaceString::kSessionTransactionsTableNamespace || fromMigrate)
-        ? nullptr
-        : CollectionShardingRuntime::get(opCtx, nss);
-
-    if (!csr) {
+    if (nss == NamespaceString::kSessionTransactionsTableNamespace || fromMigrate)
         return;
-    }
 
+    auto* const csr = CollectionShardingRuntime::get(opCtx, nss);
     csr->checkShardVersionOrThrow(opCtx);
 
     if (inMultiDocumentTransaction) {

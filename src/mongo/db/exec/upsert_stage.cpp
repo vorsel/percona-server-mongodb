@@ -46,31 +46,6 @@ namespace {
 const char idFieldName[] = "_id";
 const FieldRef idFieldRef(idFieldName);
 
-/**
- * Populates the given FieldRefSets with the shard key paths (if applicable) and all paths which
- * are not modifiable, respectively. The contents of these two sets may or may not be identical.
- */
-void getShardKeyAndImmutablePaths(OperationContext* opCtx,
-                                  const ScopedCollectionDescription& collDesc,
-                                  bool isInternalRequest,
-                                  FieldRefSet* shardKeyPaths,
-                                  FieldRefSet* immutablePaths) {
-    // If the collection is sharded, add all fields from the shard key to the 'shardKeyPaths' set.
-    if (collDesc.isSharded()) {
-        shardKeyPaths->fillFrom(collDesc.getKeyPatternFields());
-    }
-    // If this is an internal request, no fields are immutable and we leave 'immutablePaths' empty.
-    if (!isInternalRequest) {
-        // An unversioned request cannot update the shard key, so all shardKey paths are immutable.
-        if (!OperationShardingState::isOperationVersioned(opCtx)) {
-            for (auto&& shardKeyPath : *shardKeyPaths) {
-                immutablePaths->insert(shardKeyPath);
-            }
-        }
-        // The _id field is always immutable to user requests, even if the shard key is mutable.
-        immutablePaths->keepShortest(&idFieldRef);
-    }
-}
 }  // namespace
 
 UpsertStage::UpsertStage(ExpressionContext* expCtx,
@@ -112,12 +87,8 @@ PlanStage::StageState UpsertStage::doWork(WorkingSetID* out) {
     _params.driver->setLogOp(false);
     _specificStats.inserted = true;
 
-    // Determine whether this is a user-initiated or internal request.
-    const bool isInternalRequest =
-        !opCtx()->writesAreReplicated() || _params.request->isFromMigration();
-
     // Generate the new document to be inserted.
-    _specificStats.objInserted = _produceNewDocumentForInsert(isInternalRequest);
+    _specificStats.objInserted = _produceNewDocumentForInsert();
 
     // If this is an explain, skip performing the actual insert.
     if (!_params.request->isExplain()) {
@@ -148,13 +119,14 @@ void UpsertStage::_performInsert(BSONObj newDocument) {
     // throw so that MongoS can target the insert to the correct shard.
     if (_shouldCheckForShardKeyUpdate) {
         auto* const css = CollectionShardingState::get(opCtx(), collection()->ns());
-        const auto& collDesc = css->getCollectionDescription();
+        const auto collFilter = css->getOwnershipFilter(
+            opCtx(), CollectionShardingState::OrphanCleanupPolicy::kAllowOrphanCleanup);
 
-        if (collDesc.isSharded()) {
-            const ShardKeyPattern shardKeyPattern(collDesc.getKeyPattern());
+        if (collFilter.isSharded()) {
+            const ShardKeyPattern shardKeyPattern(collFilter.getKeyPattern());
             auto newShardKey = shardKeyPattern.extractShardKeyFromDoc(newDocument);
 
-            if (!collDesc->keyBelongsToMe(newShardKey)) {
+            if (!collFilter.keyBelongsToMe(newShardKey)) {
                 // An attempt to upsert a document with a shard key value that belongs on another
                 // shard must either be a retryable write or inside a transaction.
                 uassert(ErrorCodes::IllegalOperation,
@@ -189,17 +161,36 @@ void UpsertStage::_performInsert(BSONObj newDocument) {
     });
 }
 
-BSONObj UpsertStage::_produceNewDocumentForInsert(bool isInternalRequest) {
+BSONObj UpsertStage::_produceNewDocumentForInsert() {
     // Obtain the collection description. This will be needed to compute the shardKey paths.
     // The collection description must remain in scope since it owns the pointers used by
     // 'shardKeyPaths' and 'immutablePaths'.
-    auto* css = CollectionShardingState::get(opCtx(), _params.request->getNamespaceString());
-    auto collDesc = css->getCollectionDescription();
-
-    // Compute the set of shard key paths and the set of immutable paths. Either may be empty.
+    boost::optional<ScopedCollectionDescription> optCollDesc;
     FieldRefSet shardKeyPaths, immutablePaths;
-    getShardKeyAndImmutablePaths(
-        opCtx(), collDesc, isInternalRequest, &shardKeyPaths, &immutablePaths);
+
+    // Determine whether this is a user-initiated or internal request.
+    const bool isInternalRequest =
+        !opCtx()->writesAreReplicated() || _params.request->isFromMigration();
+
+    if (!isInternalRequest) {
+        optCollDesc.emplace(
+            CollectionShardingState::get(opCtx(), _params.request->getNamespaceString())
+                ->getCollectionDescription());
+
+        // If the collection is sharded, add all fields from the shard key to the 'shardKeyPaths'
+        // set.
+        if (optCollDesc->isSharded()) {
+            shardKeyPaths.fillFrom(optCollDesc->getKeyPatternFields());
+        }
+        // An unversioned request cannot update the shard key, so all shardKey paths are immutable.
+        if (!OperationShardingState::isOperationVersioned(opCtx())) {
+            for (auto&& shardKeyPath : shardKeyPaths) {
+                immutablePaths.insert(shardKeyPath);
+            }
+        }
+        // The _id field is always immutable to user requests, even if the shard key is mutable.
+        immutablePaths.keepShortest(&idFieldRef);
+    }
 
     // Reset the document into which we will be writing.
     _doc.reset();

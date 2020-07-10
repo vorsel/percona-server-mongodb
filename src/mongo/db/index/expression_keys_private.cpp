@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kIndex
 
 #include "mongo/db/index/expression_keys_private.h"
 
@@ -555,7 +555,7 @@ void ExpressionKeysPrivate::getS2Keys(const BSONObj& obj,
         // the value of the field, or they're transformed if the field is geo.
         BSONElementSet fieldElements;
         const bool expandArrayOnTrailingField = false;
-        std::set<size_t>* arrayComponents = multikeyPaths ? &(*multikeyPaths)[posInIdx] : nullptr;
+        MultikeyComponents* arrayComponents = multikeyPaths ? &(*multikeyPaths)[posInIdx] : nullptr;
         dps::extractAllElementsAlongPath(
             obj, keyElem.fieldName(), fieldElements, expandArrayOnTrailingField, arrayComponents);
 

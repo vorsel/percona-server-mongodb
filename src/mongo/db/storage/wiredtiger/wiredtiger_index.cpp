@@ -245,6 +245,7 @@ WiredTigerIndex::WiredTigerIndex(OperationContext* ctx,
       _collectionNamespace(desc->parentNS()),
       _indexName(desc->indexName()),
       _keyPattern(desc->keyPattern()),
+      _collation(desc->collation()),
       _prefix(prefix),
       _isIdIndex(desc->isIdIndex()) {}
 
@@ -290,8 +291,8 @@ void WiredTigerIndex::fullValidate(OperationContext* opCtx,
                    "in use by other operations.";
 
             LOGV2_WARNING(51781,
-                          "Could not complete validation of {uri}. This is a transient issue as "
-                          "the collection was actively in use by other operations.",
+                          "Could not complete validation. This is a transient issue as "
+                          "the collection was actively in use by other operations",
                           "uri"_attr = _uri);
             fullResults->warnings.push_back(msg);
         } else if (err) {
@@ -300,7 +301,7 @@ void WiredTigerIndex::fullValidate(OperationContext* opCtx,
                 << "This indicates structural damage. "
                 << "Not examining individual index entries.";
             LOGV2_ERROR(51782,
-                        "verify() returned {error}. This indicates structural damage. Not "
+                        "verify() returned an error. This indicates structural damage. Not "
                         "examining individual index entries.",
                         "error"_attr = wiredtiger_strerror(err));
             fullResults->errors.push_back(msg);
@@ -380,7 +381,7 @@ Status WiredTigerIndex::dupKeyCheck(OperationContext* opCtx, const KeyString::Va
 
     if (isDup(opCtx, c, key))
         return buildDupKeyErrorStatus(
-            key, _collectionNamespace, _indexName, _keyPattern, _ordering);
+            key, _collectionNamespace, _indexName, _keyPattern, _collation, _ordering);
     return Status::OK();
 }
 
@@ -524,13 +525,7 @@ KeyString::Version WiredTigerIndex::_handleVersionInfo(OperationContext* ctx,
             : Status(ErrorCodes::UnsupportedFormat,
                      str::stream()
                          << "Index: {name: " << desc->indexName() << ", ns: " << desc->parentNS()
-                         << "} has incompatible format version: " << _dataFormatVersion
-                         << ". In MongoDB 4.2 onwards, WT secondary unique indexes use "
-                            "either format version 11 or 12. See "
-                            "https://dochub.mongodb.org/core/upgrade-4.2-procedures for "
-                            "detailed instructions on upgrading the index format. If this node is "
-                            "already upgraded to FCV 4.2, try restarting with a 4.2.4 binary to "
-                            "correct the unique index format version.");
+                         << "} has incompatible format version: " << _dataFormatVersion);
         fassertNoTrace(31179, versionStatus);
     }
 
@@ -699,8 +694,11 @@ private:
             if (cmp == 0) {
                 // Duplicate found!
                 auto newKey = KeyString::toBson(newKeyString, _idx->_ordering);
-                return buildDupKeyErrorStatus(
-                    newKey, _idx->collectionNamespace(), _idx->indexName(), _idx->keyPattern());
+                return buildDupKeyErrorStatus(newKey,
+                                              _idx->collectionNamespace(),
+                                              _idx->indexName(),
+                                              _idx->keyPattern(),
+                                              _idx->_collation);
             } else {
                 /*
                  * _previousKeyString.isEmpty() is only true on the first call to addKey().
@@ -744,8 +742,11 @@ private:
             // Dup found!
             if (!_dupsAllowed) {
                 auto newKey = KeyString::toBson(newKeyString, _idx->_ordering);
-                return buildDupKeyErrorStatus(
-                    newKey, _idx->collectionNamespace(), _idx->indexName(), _idx->keyPattern());
+                return buildDupKeyErrorStatus(newKey,
+                                              _idx->collectionNamespace(),
+                                              _idx->indexName(),
+                                              _idx->keyPattern(),
+                                              _idx->_collation);
             }
 
             // If we get here, we are in the weird mode where dups are allowed on a unique
@@ -1077,6 +1078,9 @@ protected:
 
     // Seeks to query. Returns true on exact match.
     bool seekWTCursor(const KeyString::Value& query) {
+        // Ensure an active transaction is open.
+        WiredTigerRecoveryUnit::get(_opCtx)->getSession();
+
         WT_CURSOR* c = _cursor->get();
 
         int cmp = -1;
@@ -1172,6 +1176,10 @@ protected:
         if (_eof) {
             return false;
         }
+
+        // Ensure an active transaction is open.
+        WiredTigerRecoveryUnit::get(_opCtx)->getSession();
+
         if (!_lastMoveSkippedKey) {
             advanceWTCursor();
         }
@@ -1519,7 +1527,8 @@ Status WiredTigerIndexUnique::_insertTimestampUnsafe(OperationContext* opCtx,
 
     if (!dupsAllowed) {
         auto key = KeyString::toBson(keyString, _ordering);
-        return buildDupKeyErrorStatus(key, _collectionNamespace, _indexName, _keyPattern);
+        return buildDupKeyErrorStatus(
+            key, _collectionNamespace, _indexName, _keyPattern, _collation);
     }
 
     if (!insertedId) {
@@ -1565,7 +1574,8 @@ Status WiredTigerIndexUnique::_insertTimestampSafe(OperationContext* opCtx,
         if (ret == WT_DUPLICATE_KEY) {
             auto key = KeyString::toBson(
                 keyString.getBuffer(), sizeWithoutRecordId, _ordering, keyString.getTypeBits());
-            return buildDupKeyErrorStatus(key, _collectionNamespace, _indexName, _keyPattern);
+            return buildDupKeyErrorStatus(
+                key, _collectionNamespace, _indexName, _keyPattern, _collation);
         }
         invariantWTOK(ret);
 
@@ -1580,7 +1590,8 @@ Status WiredTigerIndexUnique::_insertTimestampSafe(OperationContext* opCtx,
         if (_keyExists(opCtx, c, keyString.getBuffer(), sizeWithoutRecordId)) {
             auto key = KeyString::toBson(
                 keyString.getBuffer(), sizeWithoutRecordId, _ordering, keyString.getTypeBits());
-            return buildDupKeyErrorStatus(key, _collectionNamespace, _indexName, _keyPattern);
+            return buildDupKeyErrorStatus(
+                key, _collectionNamespace, _indexName, _keyPattern, _collation);
         }
     }
 

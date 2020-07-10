@@ -34,7 +34,6 @@
 #include <algorithm>
 #include <iterator>
 
-#include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator_external_state.h"
 #include "mongo/db/service_context.h"
@@ -353,12 +352,11 @@ StatusWith<int> validateConfigForInitiate(ReplicationCoordinatorExternalState* e
                                              << newConfig.getConfigVersion());
     }
 
-    if (newConfig.getConfigTerm() != OpTime::kUninitializedTerm) {
-        return StatusWith<int>(ErrorCodes::NewReplicaSetConfigurationIncompatible,
-                               str::stream()
-                                   << "Configuration used to initiate a replica set must have term "
-                                   << OpTime::kUninitializedTerm << ", but found "
-                                   << newConfig.getConfigTerm());
+    if (newConfig.getConfigTerm() != OpTime::kInitialTerm) {
+        return StatusWith<int>(
+            ErrorCodes::NewReplicaSetConfigurationIncompatible,
+            str::stream() << "Configuration used to initiate a replica set must have term "
+                          << OpTime::kInitialTerm << ", but found " << newConfig.getConfigTerm());
     }
     return findSelfInConfigIfElectable(externalState, newConfig, ctx);
 }
@@ -386,7 +384,7 @@ StatusWith<int> validateConfigForReconfig(ReplicationCoordinatorExternalState* e
 
     // For non-force reconfigs, verify that the reconfig only adds or removes a single node. This
     // ensures that all quorums of the new config overlap with all quorums of the old config.
-    if (!force && enableSafeReplicaSetReconfig) {
+    if (!force) {
         status = validateSingleNodeChange(oldConfig, newConfig);
         if (!status.isOK()) {
             return StatusWith<int>(status);

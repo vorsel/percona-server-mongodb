@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -43,15 +43,20 @@
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index/wildcard_access_method.h"
 #include "mongo/db/matcher/expression.h"
+#include "mongo/db/multi_key_path_tracker.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/storage/execution_context.h"
 #include "mongo/db/storage/key_string.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/object_check.h"
+#include "mongo/util/fail_point.h"
 
 namespace mongo {
 
 namespace {
+
+MONGO_FAIL_POINT_DEFINE(crashOnMultikeyValidateFailure);
 
 const long long kInterruptIntervalNumRecords = 4096;
 const long long kInterruptIntervalNumBytes = 50 * 1024 * 1024;  // 50MB.
@@ -70,10 +75,7 @@ Status ValidateAdaptor::validateRecord(OperationContext* opCtx,
     }
 
     if (MONGO_unlikely(_validateState->extraLoggingForTest())) {
-        LOGV2(46666001,
-              "[validate](record) {record_id}, Value: {record_data}",
-              "record_id"_attr = recordId,
-              "record_data"_attr = recordBson);
+        LOGV2(46666001, "[validate]", "recordId"_attr = recordId, "recordData"_attr = recordBson);
     }
 
     const Status status = validateBSON(
@@ -89,6 +91,8 @@ Status ValidateAdaptor::validateRecord(OperationContext* opCtx,
         return status;
     }
 
+    auto& executionCtx = StorageExecutionContext::get(opCtx);
+
     for (const auto& index : _validateState->getIndexes()) {
         const IndexDescriptor* descriptor = index->descriptor();
         const IndexAccessMethod* iam = index->accessMethod();
@@ -100,33 +104,50 @@ Status ValidateAdaptor::validateRecord(OperationContext* opCtx,
             }
         }
 
-        KeyStringSet documentKeySet;
-        KeyStringSet multikeyMetadataKeys;
-        MultikeyPaths multikeyPaths;
-        iam->getKeys(recordBson,
+        auto documentKeySet = executionCtx.keys();
+        auto multikeyMetadataKeys = executionCtx.multikeyMetadataKeys();
+        auto documentMultikeyPaths = executionCtx.multikeyPaths();
+
+        iam->getKeys(executionCtx.pooledBufferBuilder(),
+                     recordBson,
                      IndexAccessMethod::GetKeysMode::kEnforceConstraints,
                      IndexAccessMethod::GetKeysContext::kAddingKeys,
-                     &documentKeySet,
-                     &multikeyMetadataKeys,
-                     &multikeyPaths,
+                     documentKeySet.get(),
+                     multikeyMetadataKeys.get(),
+                     documentMultikeyPaths.get(),
                      recordId,
                      IndexAccessMethod::kNoopOnSuppressedErrorFn);
 
         if (!descriptor->isMultikey() &&
             iam->shouldMarkIndexAsMultikey(
-                documentKeySet.size(),
-                {multikeyMetadataKeys.begin(), multikeyMetadataKeys.end()},
-                multikeyPaths)) {
+                documentKeySet->size(),
+                {multikeyMetadataKeys->begin(), multikeyMetadataKeys->end()},
+                *documentMultikeyPaths)) {
             std::string msg = str::stream()
                 << "Index " << descriptor->indexName() << " is not multi-key but has more than one"
                 << " key in document " << recordId;
             ValidateResults& curRecordResults = (*_indexNsResultsMap)[descriptor->indexName()];
             curRecordResults.errors.push_back(msg);
             curRecordResults.valid = false;
+            if (crashOnMultikeyValidateFailure.shouldFail()) {
+                invariant(false, msg);
+            }
+        }
+
+        if (descriptor->isMultikey()) {
+            const MultikeyPaths& indexPaths = descriptor->getMultikeyPaths(opCtx);
+            if (!MultikeyPathTracker::covers(indexPaths, *documentMultikeyPaths.get())) {
+                std::string msg = str::stream()
+                    << "Index " << descriptor->indexName()
+                    << " multi-key paths do not cover a document. RecordId: " << recordId;
+                ValidateResults& curRecordResults = (*_indexNsResultsMap)[descriptor->indexName()];
+                curRecordResults.errors.push_back(msg);
+                curRecordResults.valid = false;
+            }
         }
 
         IndexInfo& indexInfo = _indexConsistency->getIndexInfo(descriptor->indexName());
-        for (const auto& keyString : multikeyMetadataKeys) {
+        for (const auto& keyString : *multikeyMetadataKeys) {
             try {
                 _indexConsistency->addMultikeyMetadataPath(keyString, &indexInfo);
             } catch (...) {
@@ -134,7 +155,7 @@ Status ValidateAdaptor::validateRecord(OperationContext* opCtx,
             }
         }
 
-        for (const auto& keyString : documentKeySet) {
+        for (const auto& keyString : *documentKeySet) {
             try {
                 _totalIndexKeys++;
                 _indexConsistency->addDocKey(opCtx, keyString, &indexInfo, recordId);
@@ -216,8 +237,13 @@ void ValidateAdaptor::traverseIndex(OperationContext* opCtx,
 
     const KeyString::Version version =
         index->accessMethod()->getSortedDataInterface()->getKeyStringVersion();
-    KeyString::Builder firstKeyString(
-        version, BSONObj(), indexInfo.ord, KeyString::Discriminator::kExclusiveBefore);
+
+    auto& executionCtx = StorageExecutionContext::get(opCtx);
+    KeyString::PooledBuilder firstKeyString(executionCtx.pooledBufferBuilder(),
+                                            version,
+                                            BSONObj(),
+                                            indexInfo.ord,
+                                            KeyString::Discriminator::kExclusiveBefore);
 
     KeyString::Value prevIndexKeyStringValue;
 
@@ -226,7 +252,7 @@ void ValidateAdaptor::traverseIndex(OperationContext* opCtx,
     invariant(indexCursorIt != _validateState->getIndexCursors().end());
 
     const std::unique_ptr<SortedDataInterfaceThrottleCursor>& indexCursor = indexCursorIt->second;
-    for (auto indexEntry = indexCursor->seekForKeyString(opCtx, firstKeyString.getValueCopy());
+    for (auto indexEntry = indexCursor->seekForKeyString(opCtx, firstKeyString.release());
          indexEntry;
          indexEntry = indexCursor->nextKeyString(opCtx)) {
 
@@ -318,7 +344,6 @@ void ValidateAdaptor::traverseRecordStore(OperationContext* opCtx,
         // padding, but we still require that they return the unpadded record data.
         if (!status.isOK() || validatedSize != static_cast<size_t>(dataSize)) {
             str::stream ss;
-            ss << "Document with RecordId " << record->id << " is corrupted. ";
             if (!status.isOK() && validatedSize != static_cast<size_t>(dataSize)) {
                 ss << "Reasons: (1) " << status << "; (2) Validated size of " << validatedSize
                    << " bytes does not equal the record size of " << dataSize << " bytes";
@@ -328,7 +353,10 @@ void ValidateAdaptor::traverseRecordStore(OperationContext* opCtx,
                 ss << "Reason: Validated size of " << validatedSize
                    << " bytes does not equal the record size of " << dataSize << " bytes";
             }
-            LOGV2(20404, "{std_string_ss}", "std_string_ss"_attr = std::string(ss));
+            LOGV2(20404,
+                  "Document corruption details",
+                  "recordId"_attr = record->id,
+                  "reasons"_attr = std::string(ss));
 
             // Only log once
             if (results->valid) {

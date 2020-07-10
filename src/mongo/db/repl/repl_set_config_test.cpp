@@ -912,13 +912,84 @@ TEST(ReplSetConfig, SetNewlyAddedFieldForMemberConfig) {
                                      << "rs0"
                                      << "version" << 1 << "protocolVersion" << 1 << "members"
                                      << BSON_ARRAY(BSON("_id" << 1 << "host"
-                                                              << "localhost:12345")))));
+                                                              << "n1:1")
+                                                   << BSON("_id" << 2 << "host"
+                                                                 << "n2:1")))));
 
     // The member should have its 'newlyAdded' field set to false by default.
     ASSERT_FALSE(config.findMemberByID(1)->isNewlyAdded());
+    ASSERT_EQ(2, config.getTotalVotingMembers());
+    ASSERT_EQ(2, config.getMajorityVoteCount());
+    ASSERT_EQ(2, config.getWriteMajority());
+    ASSERT_EQ(2, config.getWritableVotingMembersCount());
 
-    config.setNewlyAddedFieldForMemberAtIndex(0, true);
+    {
+        auto modeSW = config.findCustomWriteMode("$majority");
+        ASSERT(modeSW.isOK());
+        auto modeIt = modeSW.getValue().constraintsBegin();
+        ASSERT_EQ(modeIt->getMinCount(), 2);
+    }
+
+    config.addNewlyAddedFieldForMember(MemberId(1));
+
     ASSERT_TRUE(config.findMemberByID(1)->isNewlyAdded());
+    ASSERT_EQ(1, config.getTotalVotingMembers());
+    ASSERT_EQ(1, config.getMajorityVoteCount());
+    ASSERT_EQ(1, config.getWriteMajority());
+    ASSERT_EQ(1, config.getWritableVotingMembersCount());
+
+    {
+        auto modeSW = config.findCustomWriteMode("$majority");
+        ASSERT(modeSW.isOK());
+        auto modeIt = modeSW.getValue().constraintsBegin();
+        ASSERT_EQ(modeIt->getMinCount(), 1);
+    }
+}
+
+TEST(ReplSetConfig, RemoveNewlyAddedFieldForMemberConfig) {
+    // Set the flag to add the 'newlyAdded' field to MemberConfigs.
+    enableAutomaticReconfig = true;
+    // Set the flag back to false after this test exits.
+    ON_BLOCK_EXIT([] { enableAutomaticReconfig = false; });
+
+    ReplSetConfig config;
+    ASSERT_OK(config.initialize(BSON("_id"
+                                     << "rs0"
+                                     << "version" << 1 << "protocolVersion" << 1 << "members"
+                                     << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                              << "n1:1"
+                                                              << "newlyAdded" << true)
+                                                   << BSON("_id" << 2 << "host"
+                                                                 << "n2:1")))));
+
+
+    ASSERT_TRUE(config.findMemberByID(1)->isNewlyAdded());
+    ASSERT_EQ(1, config.getTotalVotingMembers());
+    ASSERT_EQ(1, config.getMajorityVoteCount());
+    ASSERT_EQ(1, config.getWriteMajority());
+    ASSERT_EQ(1, config.getWritableVotingMembersCount());
+
+    {
+        auto modeSW = config.findCustomWriteMode("$majority");
+        ASSERT(modeSW.isOK());
+        auto modeIt = modeSW.getValue().constraintsBegin();
+        ASSERT_EQ(modeIt->getMinCount(), 1);
+    }
+
+    config.removeNewlyAddedFieldForMember(MemberId(1));
+
+    ASSERT_FALSE(config.findMemberByID(1)->isNewlyAdded());
+    ASSERT_EQ(2, config.getTotalVotingMembers());
+    ASSERT_EQ(2, config.getMajorityVoteCount());
+    ASSERT_EQ(2, config.getWriteMajority());
+    ASSERT_EQ(2, config.getWritableVotingMembersCount());
+
+    {
+        auto modeSW = config.findCustomWriteMode("$majority");
+        ASSERT(modeSW.isOK());
+        auto modeIt = modeSW.getValue().constraintsBegin();
+        ASSERT_EQ(modeIt->getMinCount(), 2);
+    }
 }
 
 TEST(ReplSetConfig, ParsingNewlyAddedSetsFieldToTrueCorrectly) {
@@ -954,19 +1025,6 @@ TEST(ReplSetConfig, ParseFailsWithNewlyAddedSetToFalse) {
                                                                     << "newlyAdded" << false))));
 
     ASSERT_EQUALS(ErrorCodes::InvalidReplicaSetConfig, status);
-}
-
-TEST(ReplSetConfig, CannotSetNewlyAddedFieldToFalseForMemberConfig) {
-    ReplSetConfig config;
-    ASSERT_OK(config.initialize(BSON("_id"
-                                     << "rs0"
-                                     << "version" << 1 << "protocolVersion" << 1 << "members"
-                                     << BSON_ARRAY(BSON("_id" << 1 << "host"
-                                                              << "localhost:12345")))));
-    // Cannot set 'newlyAdded' field to false.
-    ASSERT_THROWS_CODE(config.setNewlyAddedFieldForMemberAtIndex(0, false),
-                       AssertionException,
-                       ErrorCodes::InvalidReplicaSetConfig);
 }
 
 TEST(ReplSetConfig, NodeWithNewlyAddedFieldHasVotesZero) {
@@ -1053,13 +1111,32 @@ TEST(ReplSetConfig, HeartbeatIntervalField) {
     ASSERT_OK(config.validate());
     ASSERT_EQUALS(Seconds(5), config.getHeartbeatInterval());
 
+    ASSERT_NOT_OK(
+        config.initialize(BSON("_id"
+                               << "rs0"
+                               << "version" << 1 << "protocolVersion" << 1 << "members"
+                               << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                        << "localhost:12345"))
+                               << "settings" << BSON("heartbeatIntervalMillis" << -5000))));
+}
+
+// This test covers the "exact" behavior of all the smallExactInt fields.
+TEST(ReplSetConfig, DecimalHeartbeatIntervalField) {
+    ReplSetConfig config;
     ASSERT_OK(config.initialize(BSON("_id"
                                      << "rs0"
                                      << "version" << 1 << "protocolVersion" << 1 << "members"
                                      << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                               << "localhost:12345"))
-                                     << "settings" << BSON("heartbeatIntervalMillis" << -5000))));
-    ASSERT_EQUALS(ErrorCodes::BadValue, config.validate());
+                                     << "settings" << BSON("heartbeatIntervalMillis" << 5000.0))));
+
+    ASSERT_NOT_OK(
+        config.initialize(BSON("_id"
+                               << "rs0"
+                               << "version" << 1 << "protocolVersion" << 1 << "members"
+                               << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                        << "localhost:12345"))
+                               << "settings" << BSON("heartbeatIntervalMillis" << 5000.1))));
 }
 
 TEST(ReplSetConfig, ElectionTimeoutField) {
@@ -1079,8 +1156,7 @@ TEST(ReplSetConfig, ElectionTimeoutField) {
                                          << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                                   << "localhost:12345"))
                                          << "settings" << BSON("electionTimeoutMillis" << -20)));
-    ASSERT_EQUALS(ErrorCodes::BadValue, status);
-    ASSERT_STRING_CONTAINS(status.reason(), "election timeout must be greater than 0");
+    ASSERT_NOT_OK(status);
 }
 
 TEST(ReplSetConfig, HeartbeatTimeoutField) {
@@ -1100,8 +1176,7 @@ TEST(ReplSetConfig, HeartbeatTimeoutField) {
                                          << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                                   << "localhost:12345"))
                                          << "settings" << BSON("heartbeatTimeoutSecs" << -20)));
-    ASSERT_EQUALS(ErrorCodes::BadValue, status);
-    ASSERT_STRING_CONTAINS(status.reason(), "heartbeat timeout must be greater than 0");
+    ASSERT_NOT_OK(status);
 }
 
 TEST(ReplSetConfig, GleDefaultField) {
@@ -1127,14 +1202,14 @@ TEST(ReplSetConfig, GleDefaultField) {
                                                                             << "frim")))));
     ASSERT_EQUALS(ErrorCodes::BadValue, config.validate());
 
-    ASSERT_OK(
+    // Test that default write concern must have at least one member.
+    ASSERT_NOT_OK(
         config.initialize(BSON("_id"
                                << "rs0"
                                << "version" << 1 << "protocolVersion" << 1 << "members"
                                << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                         << "localhost:12345"))
                                << "settings" << BSON("getLastErrorDefaults" << BSON("w" << 0)))));
-    ASSERT_EQUALS(ErrorCodes::BadValue, config.validate());
 
     ASSERT_OK(
         config.initialize(BSON("_id"
@@ -1294,7 +1369,7 @@ TEST(ReplSetConfig, toBSONRoundTripAbilityLarge) {
         << "protocolVersion" << 1 << "settings"
 
         << BSON("heartbeatIntervalMillis" << 5000 << "heartbeatTimeoutSecs" << 20
-                                          << "electionTimeoutMillis" << 4 << "chainingAllowd"
+                                          << "electionTimeoutMillis" << 4 << "chainingAllowed"
                                           << true << "getLastErrorDefaults"
                                           << BSON("w"
                                                   << "majority")
@@ -1580,10 +1655,7 @@ TEST(ReplSetConfig, GetCatchUpTakeoverDelay) {
                                << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                         << "localhost:12345"))
                                << "settings" << BSON("catchUpTakeoverDelayMillis" << -5000)));
-    ASSERT_EQUALS(ErrorCodes::BadValue, status);
-    ASSERT_STRING_CONTAINS(
-        status.reason(),
-        "catch-up takeover delay must be -1 (no catch-up takeover) or greater than or equal to 0");
+    ASSERT_NOT_OK(status);
 }
 
 TEST(ReplSetConfig, GetCatchUpTakeoverDelayDefault) {
@@ -1819,8 +1891,6 @@ TEST(ReplSetConfig, ReplSetId) {
                                                                   << "priority" << 1))
                                          << "settings" << BSON("replicaSetId" << 12345)));
     ASSERT_EQUALS(ErrorCodes::TypeMismatch, status);
-    ASSERT_STRING_CONTAINS(status.reason(),
-                           "\"replicaSetId\" had the wrong type. Expected objectId, found int");
 }
 
 TEST(ReplSetConfig, ConfigVersionAndTermComparison) {

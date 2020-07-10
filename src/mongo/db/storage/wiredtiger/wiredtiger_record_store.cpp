@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #define LOGV2_FOR_RECOVERY(ID, DLEVEL, MESSAGE, ...) \
     LOGV2_DEBUG_OPTIONS(ID, DLEVEL, {logv2::LogComponent::kStorageRecovery}, MESSAGE, ##__VA_ARGS__)
@@ -909,7 +909,7 @@ void WiredTigerRecordStore::postConstructorInit(OperationContext* opCtx) {
 
     if (_isOplog) {
         invariant(_kvEngine);
-        _kvEngine->startOplogManager(opCtx, _uri, this);
+        _kvEngine->startOplogManager(opCtx, this);
     }
 }
 
@@ -1016,6 +1016,7 @@ bool WiredTigerRecordStore::findRecord(OperationContext* opCtx,
 
 void WiredTigerRecordStore::deleteRecord(OperationContext* opCtx, const RecordId& id) {
     dassert(opCtx->lockState()->isWriteLocked());
+    invariant(opCtx->lockState()->inAWriteUnitOfWork() || opCtx->lockState()->isNoop());
 
     // Deletes should never occur on a capped collection because truncation uses
     // WT_SESSION::truncate().
@@ -1424,6 +1425,7 @@ Status WiredTigerRecordStore::_insertRecords(OperationContext* opCtx,
                                              const Timestamp* timestamps,
                                              size_t nRecords) {
     dassert(opCtx->lockState()->isWriteLocked());
+    invariant(opCtx->lockState()->inAWriteUnitOfWork() || opCtx->lockState()->isNoop());
 
     // We are kind of cheating on capped collections since we write all of them at once ....
     // Simplest way out would be to just block vector writes for everything except oplog ?
@@ -1511,7 +1513,7 @@ bool WiredTigerRecordStore::haveCappedWaiters() {
 
 void WiredTigerRecordStore::notifyCappedWaitersIfNeeded() {
     stdx::lock_guard<Latch> cappedCallbackLock(_cappedCallbackMutex);
-    // This wakes up cursors blocking in await_data.
+    // This wakes up cursors blocking for awaitData.
     if (_cappedCallback) {
         _cappedCallback->notifyCappedWaitersIfNeeded();
     }
@@ -1569,6 +1571,7 @@ Status WiredTigerRecordStore::updateRecord(OperationContext* opCtx,
                                            const char* data,
                                            int len) {
     dassert(opCtx->lockState()->isWriteLocked());
+    invariant(opCtx->lockState()->inAWriteUnitOfWork() || opCtx->lockState()->isNoop());
 
     WiredTigerCursor curwrap(_uri, _tableId, true, opCtx);
     curwrap.assertInActiveTxn();
@@ -2084,6 +2087,11 @@ boost::optional<Record> WiredTigerRecordStoreCursorBase::next() {
     if (_eof)
         return {};
 
+    // Ensure an active transaction is open. While WiredTiger supports using cursors on a session
+    // without an active transaction (i.e. an implicit transaction), that would bypass configuration
+    // options we pass when we explicitly start transactions in the RecoveryUnit.
+    WiredTigerRecoveryUnit::get(_opCtx)->getSession();
+
     WT_CURSOR* c = _cursor->get();
 
     RecordId id;
@@ -2142,6 +2150,11 @@ boost::optional<Record> WiredTigerRecordStoreCursorBase::seekExact(const RecordI
         _eof = true;
         return {};
     }
+
+    // Ensure an active transaction is open. While WiredTiger supports using cursors on a session
+    // without an active transaction (i.e. an implicit transaction), that would bypass configuration
+    // options we pass when we explicitly start transactions in the RecoveryUnit.
+    WiredTigerRecoveryUnit::get(_opCtx)->getSession();
 
     _skipNextAdvance = false;
     WT_CURSOR* c = _cursor->get();

@@ -335,8 +335,8 @@ const Date_t OplogFetcherTest::staleWallTime = Date_t() + Seconds(staleOpTime.ge
 const rpc::OplogQueryMetadata OplogFetcherTest::staleOqMetadata = rpc::OplogQueryMetadata(
     {staleOpTime, staleWallTime}, staleOpTime, rbid, primaryIndex, syncSourceIndex);
 
-const rpc::ReplSetMetadata OplogFetcherTest::replSetMetadata = rpc::ReplSetMetadata(
-    1, OpTimeAndWallTime(), OpTime(), 1, 0, OID(), primaryIndex, syncSourceIndex, false);
+const rpc::ReplSetMetadata OplogFetcherTest::replSetMetadata =
+    rpc::ReplSetMetadata(1, OpTimeAndWallTime(), OpTime(), 1, 0, OID(), syncSourceIndex, false);
 
 void OplogFetcherTest::setUp() {
     executor::ThreadPoolExecutorTest::setUp();
@@ -466,7 +466,10 @@ void OplogFetcherTest::testSyncSourceChecking(const rpc::ReplSetMetadata& replMe
     dataReplicatorExternalState->shouldStopFetchingResult = true;
 
     auto shutdownState =
-        processSingleBatch(makeFirstBatch(0, {firstEntry, secondEntry, thirdEntry}, metadataObj));
+        processSingleBatch(makeFirstBatch(0, {firstEntry, secondEntry, thirdEntry}, metadataObj),
+                           false /* shouldShutdown */,
+                           true /* requireFresherSyncSource */,
+                           true /* lastFetchedShouldAdvance */);
 
     ASSERT_EQUALS(ErrorCodes::InvalidSyncSource, shutdownState->getStatus());
 }
@@ -848,10 +851,10 @@ TEST_F(OplogFetcherTest, ValidMetadataWithInResponseShouldBeForwardedToProcessMe
 
     ASSERT_OK(processSingleBatch(makeFirstBatch(cursorId, {entry}, metadataObj))->getStatus());
     ASSERT_TRUE(dataReplicatorExternalState->metadataWasProcessed);
-    ASSERT_EQUALS(replSetMetadata.getPrimaryIndex(),
-                  dataReplicatorExternalState->replMetadataProcessed.getPrimaryIndex());
-    ASSERT_EQUALS(oqMetadata.getPrimaryIndex(),
-                  dataReplicatorExternalState->oqMetadataProcessed.getPrimaryIndex());
+    ASSERT_EQUALS(replSetMetadata.getIsPrimary(),
+                  dataReplicatorExternalState->replMetadataProcessed.getIsPrimary());
+    ASSERT_EQUALS(oqMetadata.hasPrimaryIndex(),
+                  dataReplicatorExternalState->oqMetadataProcessed.hasPrimaryIndex());
 }
 
 TEST_F(OplogFetcherTest, MetadataAndBatchAreNotProcessedWhenSyncSourceRollsBack) {
@@ -1419,9 +1422,8 @@ TEST_F(OplogFetcherTest, CursorIsDeadShutsDownOplogFetcherWithSuccessfulStatus) 
     auto m = processSingleRequestResponse(oplogFetcher->getDBClientConnection_forTest(),
                                           makeFirstBatch(cursorId, firstBatch, metadataObj));
 
-    validateFindCommand(m,
-                        oplogFetcher->getLastOpTimeFetched_forTest(),
-                        durationCount<Milliseconds>(oplogFetcher->getInitialFindMaxTime_forTest()));
+    validateFindCommand(
+        m, lastFetched, durationCount<Milliseconds>(oplogFetcher->getInitialFindMaxTime_forTest()));
 
     // Check that the oplog fetcher has shut down to make sure it has processed the next batch
     // before verifying the batch's contents.
@@ -1687,7 +1689,7 @@ TEST_F(OplogFetcherTest, OplogFetcherShouldReportErrorsThrownFromEnqueueDocument
 TEST_F(OplogFetcherTest, FailedSyncSourceCheckWithBothMetadatasStopsTheOplogFetcher) {
     testSyncSourceChecking(replSetMetadata, oqMetadata);
 
-    // Sync source optime and "hasSyncSource" can be set if the respone contains metadata.
+    // Sync source optime and "hasSyncSource" can be set if the response contains metadata.
     ASSERT_EQUALS(source, dataReplicatorExternalState->lastSyncSourceChecked);
     ASSERT_EQUALS(oqMetadata.getLastOpApplied(), dataReplicatorExternalState->syncSourceLastOpTime);
     ASSERT_TRUE(dataReplicatorExternalState->syncSourceHasSyncSource);

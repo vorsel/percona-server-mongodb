@@ -35,6 +35,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/executor/connection_pool.h"
 #include "mongo/executor/network_interface.h"
+#include "mongo/logv2/log_severity.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/rpc/metadata/metadata_hook.h"
 #include "mongo/stdx/thread.h"
@@ -56,6 +57,7 @@ public:
                        ServiceContext* ctx,
                        std::unique_ptr<NetworkConnectionHook> onConnectHook,
                        std::unique_ptr<rpc::EgressMetadataHook> metadataHook);
+    ~NetworkInterfaceTL();
 
     constexpr static Milliseconds kCancelCommandTimeout{1000};
 
@@ -150,7 +152,7 @@ private:
 
         RemoteCommandRequestOnAny requestOnAny;
         TaskExecutor::CallbackHandle cbHandle;
-        Date_t deadline = RemoteCommandRequest::kNoExpirationDate;
+        Date_t deadline = kNoExpirationDate;
 
         ClockSource::StopWatch stopwatch;
 
@@ -203,10 +205,11 @@ private:
 
         void fulfillFinalPromise(StatusWith<RemoteCommandOnAnyResponse> response) override;
 
+        void continueExhaustRequest(std::shared_ptr<RequestState> requestState,
+                                    StatusWith<RemoteCommandResponse> swResponse);
+
         Promise<void> promise;
-        RemoteCommandResponse prevResponse;
-        Mutex _onReplyMutex =
-            MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(0), "NetworkInterfaceTL::_onReplyMutex");
+        Promise<RemoteCommandResponse> finalResponsePromise;
         RemoteCommandOnReplyFn onReplyFn;
     };
 
@@ -336,7 +339,7 @@ private:
 
     void _run();
 
-    void _killOperation(std::shared_ptr<RequestState> requestStateToKill);
+    Status _killOperation(std::shared_ptr<RequestState> requestStateToKill);
 
     std::string _instanceName;
     ServiceContext* _svcCtx = nullptr;

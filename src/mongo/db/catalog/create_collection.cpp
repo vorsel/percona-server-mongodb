@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -41,6 +41,7 @@
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context.h"
@@ -209,6 +210,10 @@ Status createCollection(OperationContext* opCtx,
                 !opCtx->inMultiDocumentTransaction());
         return _createView(opCtx, nss, collectionOptions, idIndex);
     } else {
+        uassert(ErrorCodes::OperationNotSupportedInTransaction,
+                str::stream() << "Cannot create system collection " << nss.toString()
+                              << " within a transaction.",
+                !opCtx->inMultiDocumentTransaction() || !nss.isSystem());
         return _createCollection(opCtx, nss, collectionOptions, idIndex);
     }
 }
@@ -269,9 +274,11 @@ Status createCollectionForApplyOps(OperationContext* opCtx,
                     LOGV2(20308,
                           "CMD: create {newCollName} - existing collection with conflicting UUID "
                           "{uuid} is in a drop-pending state: {currentName}",
-                          "newCollName"_attr = newCollName,
-                          "uuid"_attr = uuid,
-                          "currentName"_attr = *currentName);
+                          "CMD: create -- existing collection with conflicting UUID "
+                          "is in a drop-pending state",
+                          "newCollection"_attr = newCollName,
+                          "conflictingUuid"_attr = uuid,
+                          "existingCollection"_attr = *currentName);
                     return Result(Status(ErrorCodes::NamespaceExists,
                                          str::stream()
                                              << "existing collection " << currentName->toString()
@@ -316,9 +323,11 @@ Status createCollectionForApplyOps(OperationContext* opCtx,
                     LOGV2(20309,
                           "CMD: create {newCollName} - renaming existing collection with "
                           "conflicting UUID {uuid} to temporary collection {tmpName}",
-                          "newCollName"_attr = newCollName,
-                          "uuid"_attr = uuid,
-                          "tmpName"_attr = tmpName);
+                          "CMD: create -- renaming existing collection with "
+                          "conflicting UUID to temporary collection",
+                          "newCollection"_attr = newCollName,
+                          "conflictingUuid"_attr = uuid,
+                          "tempName"_attr = tmpName);
                     Status status = db->renameCollection(opCtx, newCollName, tmpName, stayTemp);
                     if (!status.isOK())
                         return Result(status);
@@ -329,6 +338,14 @@ Status createCollectionForApplyOps(OperationContext* opCtx,
                                                    /*dropTargetUUID*/ {},
                                                    /*numRecords*/ 0U,
                                                    stayTemp);
+
+                    // Abort any remaining index builds on the temporary collection.
+                    IndexBuildsCoordinator::get(opCtx)->abortCollectionIndexBuilds(
+                        opCtx,
+                        tmpName,
+                        futureColl->uuid(),
+                        "Aborting index builds on temporary collection");
+
                     // The existing collection has been successfully moved out of the way.
                     needsRenaming = false;
                 }

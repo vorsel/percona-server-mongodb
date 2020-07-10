@@ -118,7 +118,7 @@ public:
     static const std::string kVersionFieldName;
     static const std::string kTermFieldName;
     static constexpr char kMajorityWriteConcernModeName[] = "$majority";
-    static constexpr char kAllWriteConcernModeName[] = "$all";
+    static constexpr char kVotingMembersWriteConcernModeName[] = "$votingMembers";
     static constexpr char kConfigMajorityWriteConcernModeName[] = "$configMajority";
     static constexpr char kConfigAllWriteConcernName[] = "$configAll";
 
@@ -308,7 +308,7 @@ public:
      * Gets the default write concern for the replica set described by this configuration.
      */
     const WriteConcernOptions& getDefaultWriteConcern() const {
-        return _defaultWriteConcern;
+        return _settings.getDefaultWriteConcern();
     }
 
     /**
@@ -323,7 +323,7 @@ public:
      * run for election.
      */
     Milliseconds getElectionTimeoutPeriod() const {
-        return _electionTimeoutPeriod;
+        return Milliseconds(_settings.getElectionTimeoutMillis());
     }
 
     /**
@@ -331,7 +331,7 @@ public:
      * nodes in the replica set.
      */
     Seconds getHeartbeatTimeoutPeriod() const {
-        return _heartbeatTimeoutPeriod;
+        return Seconds(_settings.getHeartbeatTimeoutSecs());
     }
 
     /**
@@ -340,14 +340,14 @@ public:
      * Seconds object.
      */
     Milliseconds getHeartbeatTimeoutPeriodMillis() const {
-        return _heartbeatTimeoutPeriod;
+        return duration_cast<Milliseconds>(getHeartbeatTimeoutPeriod());
     }
 
     /**
      * Gets the timeout to wait for a primary to catch up its oplog.
      */
     Milliseconds getCatchUpTimeoutPeriod() const {
-        return _catchUpTimeoutPeriod;
+        return Milliseconds(_settings.getCatchUpTimeoutMillis());
     }
 
     /**
@@ -368,7 +368,7 @@ public:
      * Returns true if automatic (not explicitly set) chaining is allowed.
      */
     bool isChainingAllowed() const {
-        return _chainingAllowed;
+        return _settings.getChainingAllowed();
     }
 
     /**
@@ -414,9 +414,14 @@ public:
     }
 
     /**
-     * Returns the config as a BSONObj.
+     * Returns the config as a BSONObj. Default behavior (no omission of 'newlyAdded' fields).
      */
     BSONObj toBSON() const;
+
+    /**
+     * Returns the config as a BSONObj. Omits 'newlyAdded' fields.
+     */
+    BSONObj toBSONWithoutNewlyAdded() const;
 
     /**
      * Returns a vector of strings which are the names of the WriteConcernModes.
@@ -455,14 +460,14 @@ public:
      * have the same replica set name (_id field) but meant for different replica set instances.
      */
     bool hasReplicaSetId() const {
-        return _replicaSetId.isSet();
+        return _settings.getReplicaSetId() != boost::none;
     }
 
     /**
      * Returns replica set ID.
      */
     OID getReplicaSetId() const {
-        return _replicaSetId;
+        return _settings.getReplicaSetId() ? *_settings.getReplicaSetId() : OID();
     }
 
     /**
@@ -476,7 +481,7 @@ public:
      * sees that it is more caught up than the current primary.
      */
     Milliseconds getCatchUpTakeoverDelay() const {
-        return _catchUpTakeoverDelay;
+        return Milliseconds(_settings.getCatchUpTakeoverDelayMillis());
     }
 
     /**
@@ -490,9 +495,14 @@ public:
     bool containsArbiter() const;
 
     /**
-     * Sets the 'newlyAdded' field of the MemberConfig at memberIndex to the value passed in.
+     * Adds 'newlyAdded=true' to the MemberConfig of the specified member.
      */
-    void setNewlyAddedFieldForMemberAtIndex(int memberIndex, bool newlyAdded);
+    void addNewlyAddedFieldForMember(MemberId memberId);
+
+    /**
+     * Removes the 'newlyAdded' field from the MemberConfig of the specified member.
+     */
+    void removeNewlyAddedFieldForMember(MemberId memberId);
 
 private:
     /**
@@ -516,6 +526,16 @@ private:
     void _initializeConnectionString();
 
     /**
+     * Returns a pointer to a mutable MemberConfig.
+     */
+    MemberConfig* _findMemberByID(MemberId id);
+
+    /**
+     * Returns the config as a BSONObj. Omits 'newlyAdded' fields on request.
+     */
+    BSONObj _toBSON(bool omitNewlyAddedField) const;
+
+    /**
      * Sets replica set ID to 'defaultReplicaSetId' if forInitiate is false and 'cfg' does not
      * contain an ID.
      * Sets _term to kInitialTerm for initiate.
@@ -531,23 +551,16 @@ private:
     long long _term = OpTime::kUninitializedTerm;
     std::string _replSetName;
     std::vector<MemberConfig> _members;
-    WriteConcernOptions _defaultWriteConcern;
-    Milliseconds _electionTimeoutPeriod = kDefaultElectionTimeoutPeriod;
-    Milliseconds _heartbeatInterval = kDefaultHeartbeatInterval;
-    Seconds _heartbeatTimeoutPeriod = kDefaultHeartbeatTimeoutPeriod;
-    Milliseconds _catchUpTimeoutPeriod = kDefaultCatchUpTimeoutPeriod;
-    Milliseconds _catchUpTakeoverDelay = kDefaultCatchUpTakeoverDelay;
-    bool _chainingAllowed = kDefaultChainingAllowed;
     bool _writeConcernMajorityJournalDefault = false;
     int _majorityVoteCount = 0;
     int _writableVotingMembersCount = 0;
     int _writeMajority = 0;
     int _totalVotingMembers = 0;
     ReplSetTagConfig _tagConfig;
+    ReplSetConfigSettings _settings;
     StringMap<ReplSetTagPattern> _customWriteConcernModes;
     long long _protocolVersion = 1;
     bool _configServer = false;
-    OID _replicaSetId;
     ConnectionString _connectionString;
 };
 

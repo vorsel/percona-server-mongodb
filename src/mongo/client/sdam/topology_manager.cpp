@@ -26,7 +26,7 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/client/sdam/topology_manager.h"
 
@@ -147,9 +147,9 @@ void TopologyManager::onServerRTTUpdated(ServerAddress hostAndPort, IsMasterRTT 
     }
     // otherwise, the server was removed from the topology. Nothing to do.
     LOGV2(4333201,
-          "Not updating RTT. Server {server} does not exist in {setName}",
-          "server"_attr = hostAndPort,
-          "setName"_attr = getTopologyDescription()->getSetName());
+          "Not updating RTT. Server {server} does not exist in {replicaSet}",
+          "host"_attr = hostAndPort,
+          "replicaSet"_attr = getTopologyDescription()->getSetName());
 }
 
 void TopologyManager::_publishTopologyDescriptionChanged(

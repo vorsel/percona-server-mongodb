@@ -81,6 +81,7 @@
 namespace mongo {
 namespace embedded {
 namespace {
+
 void initWireSpec() {
     WireSpec& spec = WireSpec::instance();
 
@@ -95,7 +96,6 @@ void initWireSpec() {
 
     spec.isInternalClient = true;
 }
-
 
 // Noop, to fulfill dependencies for other initializers.
 MONGO_INITIALIZER_GENERAL(ForkServer, ("EndStartupOptionHandling"), ("default"))
@@ -170,7 +170,7 @@ void shutdown(ServiceContext* srvContext) {
             LogicalSessionCache::set(serviceContext, nullptr);
 
             repl::ReplicationCoordinator::get(serviceContext)->shutdown(shutdownOpCtx.get());
-            IndexBuildsCoordinator::get(serviceContext)->shutdown();
+            IndexBuildsCoordinator::get(serviceContext)->shutdown(shutdownOpCtx.get());
 
             // Global storage engine may not be started in all cases before we exit
             if (serviceContext->getStorageEngine()) {
@@ -337,5 +337,6 @@ ServiceContext* initialize(const char* yaml_config) {
 
     return serviceContext;
 }
+
 }  // namespace embedded
 }  // namespace mongo

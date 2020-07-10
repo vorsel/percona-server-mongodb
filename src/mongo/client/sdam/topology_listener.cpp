@@ -77,14 +77,27 @@ void TopologyEventsPublisher::onServerHandshakeCompleteEvent(IsMasterRTT duratio
     _scheduleNextDelivery();
 }
 
-void TopologyEventsPublisher::onServerHeartbeatSucceededEvent(IsMasterRTT durationMs,
-                                                              const ServerAddress& hostAndPort,
+void TopologyEventsPublisher::onServerHandshakeFailedEvent(const sdam::ServerAddress& address,
+                                                           const Status& status,
+                                                           const BSONObj reply) {
+    {
+        stdx::lock_guard<Mutex> lock(_eventQueueMutex);
+        EventPtr event = std::make_unique<Event>();
+        event->type = EventType::HANDSHAKE_FAILURE;
+        event->hostAndPort = address;
+        event->reply = reply;
+        event->status = status;
+        _eventQueue.push_back(std::move(event));
+    }
+    _scheduleNextDelivery();
+}
+
+void TopologyEventsPublisher::onServerHeartbeatSucceededEvent(const ServerAddress& hostAndPort,
                                                               const BSONObj reply) {
     {
         stdx::lock_guard lock(_eventQueueMutex);
         EventPtr event = std::make_unique<Event>();
         event->type = EventType::HEARTBEAT_SUCCESS;
-        event->duration = duration_cast<IsMasterRTT>(durationMs);
         event->hostAndPort = hostAndPort;
         event->reply = reply;
         _eventQueue.push_back(std::move(event));
@@ -92,15 +105,13 @@ void TopologyEventsPublisher::onServerHeartbeatSucceededEvent(IsMasterRTT durati
     _scheduleNextDelivery();
 }
 
-void TopologyEventsPublisher::onServerHeartbeatFailureEvent(IsMasterRTT durationMs,
-                                                            Status errorStatus,
+void TopologyEventsPublisher::onServerHeartbeatFailureEvent(Status errorStatus,
                                                             const ServerAddress& hostAndPort,
                                                             const BSONObj reply) {
     {
         stdx::lock_guard lock(_eventQueueMutex);
         EventPtr event = std::make_unique<Event>();
         event->type = EventType::HEARTBEAT_FAILURE;
-        event->duration = duration_cast<IsMasterRTT>(durationMs);
         event->hostAndPort = hostAndPort;
         event->reply = reply;
         event->status = errorStatus;
@@ -174,14 +185,10 @@ void TopologyEventsPublisher::_nextDelivery() {
 void TopologyEventsPublisher::_sendEvent(TopologyListenerPtr listener, const Event& event) {
     switch (event.type) {
         case EventType::HEARTBEAT_SUCCESS:
-            listener->onServerHeartbeatSucceededEvent(
-                duration_cast<IsMasterRTT>(event.duration), event.hostAndPort, event.reply);
+            listener->onServerHeartbeatSucceededEvent(event.hostAndPort, event.reply);
             break;
         case EventType::HEARTBEAT_FAILURE:
-            listener->onServerHeartbeatFailureEvent(duration_cast<IsMasterRTT>(event.duration),
-                                                    event.status,
-                                                    event.hostAndPort,
-                                                    event.reply);
+            listener->onServerHeartbeatFailureEvent(event.status, event.hostAndPort, event.reply);
             break;
         case EventType::TOPOLOGY_DESCRIPTION_CHANGED:
             // TODO SERVER-46497: fix uuid or just remove
@@ -200,6 +207,9 @@ void TopologyEventsPublisher::_sendEvent(TopologyListenerPtr listener, const Eve
             break;
         case EventType::PING_FAILURE:
             listener->onServerPingFailedEvent(event.hostAndPort, event.status);
+            break;
+        case EventType::HANDSHAKE_FAILURE:
+            listener->onServerHandshakeFailedEvent(event.hostAndPort, event.status, event.reply);
             break;
         default:
             MONGO_UNREACHABLE;

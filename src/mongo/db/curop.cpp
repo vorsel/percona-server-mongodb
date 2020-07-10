@@ -29,7 +29,7 @@
 
 // CHECK_LOG_REDACTION
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -55,7 +55,6 @@
 #include "mongo/rpc/metadata/client_metadata_ismaster.h"
 #include "mongo/rpc/metadata/impersonated_user_metadata.h"
 #include "mongo/util/hex.h"
-#include "mongo/util/log.h"
 #include "mongo/util/log_with_sampling.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/str.h"
@@ -857,6 +856,10 @@ string OpDebug::report(OperationContext* opCtx, const SingleThreadedLockStats* l
         s << " protocol:" << getProtoString(networkOp);
     }
 
+    if (remoteOpWaitTime) {
+        s << " remoteOpWaitMillis:" << durationCount<Milliseconds>(*remoteOpWaitTime);
+    }
+
     s << " " << (executionTimeMicros / 1000) << "ms";
 
     return s.str();
@@ -1022,6 +1025,10 @@ void OpDebug::report(OperationContext* opCtx,
         pAttrs->add("protocol", getProtoString(networkOp));
     }
 
+    if (remoteOpWaitTime) {
+        pAttrs->add("remoteOpWaitMillis", durationCount<Milliseconds>(*remoteOpWaitTime));
+    }
+
     pAttrs->add("durationMillis", (executionTimeMicros / 1000));
 }
 
@@ -1139,6 +1146,11 @@ void OpDebug::append(OperationContext* opCtx,
     if (iscommand) {
         b.append("protocol", getProtoString(networkOp));
     }
+
+    if (remoteOpWaitTime) {
+        b.append("remoteOpWaitMillis", durationCount<Milliseconds>(*remoteOpWaitTime));
+    }
+
     b.appendIntOrLL("millis", executionTimeMicros / 1000);
     b.append("rateLimit",
              executionTimeMicros >= serverGlobalParams.slowMS * 1000LL ? 1 : serverGlobalParams.rateLimit);

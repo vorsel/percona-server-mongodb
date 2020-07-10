@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
@@ -52,7 +51,6 @@
 #include "mongo/db/server_options.h"
 #include "mongo/logger/console_appender.h"
 #include "mongo/logger/logger.h"
-#include "mongo/logger/logv2_appender.h"
 #include "mongo/logger/message_event.h"
 #include "mongo/logger/message_event_utf8_encoder.h"
 #include "mongo/logger/ramlog.h"
@@ -64,7 +62,6 @@
 #include "mongo/logv2/log_domain_global.h"
 #include "mongo/platform/process_id.h"
 #include "mongo/util/exit_code.h"
-#include "mongo/util/log_global_settings.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/str.h"
@@ -111,7 +108,7 @@ void signalForkSuccess() {
     if (close(*f) == -1) {
         int savedErr = errno;
         LOGV2_WARNING(4656301,
-                      "closing write pipe failed",
+                      "Closing write pipe failed",
                       "errno"_attr = savedErr,
                       "errnoDesc"_attr = errnoWithDescription(savedErr));
     }
@@ -270,6 +267,8 @@ static bool forkServer() {
         croak("closing read side of pipe failed");
     serverGlobalParams.forkReadyFd = readyPipe[1];
 
+    std::cout << format(FMT_STRING("forked process: {}"), getpid()) << std::endl;
+
     auto stdioDetach = [](FILE* fp, const char* mode, StringData name) {
         if (!freopen("/dev/null", mode, fp)) {
             int saved = errno;
@@ -309,7 +308,6 @@ MONGO_INITIALIZER_GENERAL(ServerLogRedirection,
     using logger::StatusWithRotatableFileWriter;
 
     // Hook up this global into our logging encoder
-    LogManager* manager = logger::globalLogManager();
     auto& lv2Manager = logv2::LogManager::global();
     logv2::LogDomainGlobal::ConfigurationOptions lv2Config;
     MessageEventDetailsEncoder::setMaxLogSizeKBSource(gMaxLogAttributeSizeKB);
@@ -321,33 +319,9 @@ MONGO_INITIALIZER_GENERAL(ServerLogRedirection,
         return Status(ErrorCodes::InternalError,
                       "Syslog requested in Windows build; command line processor logic error");
 #else
-        std::unique_ptr<logger::Appender<MessageEventEphemeral>> appender;
-        std::unique_ptr<logger::Appender<MessageEventEphemeral>> javascriptAppender;
-
-        if (logV2Enabled()) {
-            appender = std::make_unique<logger::LogV2Appender<MessageEventEphemeral>>(
-                &(lv2Manager.getGlobalDomain()), true);
-            javascriptAppender = std::make_unique<logger::LogV2Appender<MessageEventEphemeral>>(
-                &(lv2Manager.getGlobalDomain()), true);
-
-            lv2Config.consoleEnabled = false;
-            lv2Config.syslogEnabled = true;
-            lv2Config.syslogFacility = serverGlobalParams.syslogFacility;
-        } else {
-            using logger::SyslogAppender;
-            StringBuilder sb;
-            sb << serverGlobalParams.binaryName << "." << serverGlobalParams.port;
-            openlog(
-                strdup(sb.str().c_str()), LOG_PID | LOG_CONS, serverGlobalParams.syslogFacility);
-            appender = std::make_unique<SyslogAppender<MessageEventEphemeral>>(
-                std::make_unique<MessageEventDetailsEncoder>());
-            javascriptAppender = std::make_unique<SyslogAppender<MessageEventEphemeral>>(
-                std::make_unique<MessageEventDetailsEncoder>());
-        }
-        manager->getGlobalDomain()->clearAppenders();
-        manager->getGlobalDomain()->attachAppender(std::move(appender));
-        manager->getNamedDomain("plainShellOutput")->attachAppender(std::move(javascriptAppender));
-
+        lv2Config.consoleEnabled = false;
+        lv2Config.syslogEnabled = true;
+        lv2Config.syslogFacility = serverGlobalParams.syslogFacility;
 #endif  // defined(_WIN32)
     } else if (!serverGlobalParams.logpath.empty()) {
         fassert(16448, !serverGlobalParams.logWithSyslog);
@@ -378,9 +352,10 @@ MONGO_INITIALIZER_GENERAL(ServerLogRedirection,
                 boost::filesystem::rename(absoluteLogpath, renameTarget, ec);
                 if (!ec) {
                     LOGV2(20697,
-                          "log file \"{absoluteLogpath}\" exists; moved to \"{renameTarget}\".",
-                          "absoluteLogpath"_attr = absoluteLogpath,
-                          "renameTarget"_attr = renameTarget);
+                          "Moving existing log file \"{oldLogPath}\" to \"{newLogPath}\"",
+                          "Renamed existing log file",
+                          "oldLogPath"_attr = absoluteLogpath,
+                          "newLogPath"_attr = renameTarget);
                 } else {
                     return Status(ErrorCodes::FileRenameFailed,
                                   str::stream()
@@ -392,81 +367,27 @@ MONGO_INITIALIZER_GENERAL(ServerLogRedirection,
             }
         }
 
-        std::unique_ptr<logger::Appender<MessageEventEphemeral>> appender;
-        std::unique_ptr<logger::Appender<MessageEventEphemeral>> javascriptAppender;
+        lv2Config.consoleEnabled = false;
+        lv2Config.fileEnabled = true;
+        lv2Config.filePath = absoluteLogpath;
+        lv2Config.fileRotationMode = serverGlobalParams.logRenameOnRotate
+            ? logv2::LogDomainGlobal::ConfigurationOptions::RotationMode::kRename
+            : logv2::LogDomainGlobal::ConfigurationOptions::RotationMode::kReopen;
+        lv2Config.fileOpenMode = serverGlobalParams.logAppend
+            ? logv2::LogDomainGlobal::ConfigurationOptions::OpenMode::kAppend
+            : logv2::LogDomainGlobal::ConfigurationOptions::OpenMode::kTruncate;
 
-        if (logV2Enabled()) {
-
-            appender = std::make_unique<logger::LogV2Appender<MessageEventEphemeral>>(
-                &(lv2Manager.getGlobalDomain()), true);
-            javascriptAppender = std::make_unique<logger::LogV2Appender<MessageEventEphemeral>>(
-                &(lv2Manager.getGlobalDomain()), true);
-
-            lv2Config.consoleEnabled = false;
-            lv2Config.fileEnabled = true;
-            lv2Config.filePath = absoluteLogpath;
-            lv2Config.fileRotationMode = serverGlobalParams.logRenameOnRotate
-                ? logv2::LogDomainGlobal::ConfigurationOptions::RotationMode::kRename
-                : logv2::LogDomainGlobal::ConfigurationOptions::RotationMode::kReopen;
-            lv2Config.fileOpenMode = serverGlobalParams.logAppend
-                ? logv2::LogDomainGlobal::ConfigurationOptions::OpenMode::kAppend
-                : logv2::LogDomainGlobal::ConfigurationOptions::OpenMode::kTruncate;
-
-            if (serverGlobalParams.logAppend && exists) {
-                writeServerRestartedAfterLogConfig = true;
-            }
-
-        } else {
-            StatusWithRotatableFileWriter writer = logger::globalRotatableFileManager()->openFile(
-                absoluteLogpath, serverGlobalParams.logAppend);
-            if (!writer.isOK()) {
-                return writer.getStatus();
-            }
-            appender = std::make_unique<RotatableFileAppender<MessageEventEphemeral>>(
-                std::make_unique<MessageEventDetailsEncoder>(), writer.getValue());
-            javascriptAppender = std::make_unique<RotatableFileAppender<MessageEventEphemeral>>(
-                std::make_unique<MessageEventDetailsEncoder>(), writer.getValue());
-            if (serverGlobalParams.logAppend && exists) {
-                LOGV2(20699, "***** SERVER RESTARTED *****");
-                Status status = logger::RotatableFileWriter::Use(writer.getValue()).status();
-                if (!status.isOK())
-                    return status;
-            }
-        }
-
-        manager->getGlobalDomain()->clearAppenders();
-        manager->getGlobalDomain()->attachAppender(std::move(appender));
-        manager->getNamedDomain("plainShellOutput")->attachAppender(std::move(javascriptAppender));
-
-    } else {
-        if (logV2Enabled()) {
-            manager->getGlobalDomain()->clearAppenders();
-            manager->getGlobalDomain()->attachAppender(
-                std::make_unique<logger::LogV2Appender<MessageEventEphemeral>>(
-                    &(lv2Manager.getGlobalDomain()), true));
-            manager->getNamedDomain("plainShellOutput")
-                ->attachAppender(std::make_unique<logger::LogV2Appender<MessageEventEphemeral>>(
-                    &(lv2Manager.getGlobalDomain()), true));
-        } else {
-            logger::globalLogManager()
-                ->getNamedDomain("plainShellOutput")
-                ->attachAppender(std::make_unique<logger::ConsoleAppender<MessageEventEphemeral>>(
-                    std::make_unique<MessageEventDetailsEncoder>()));
+        if (serverGlobalParams.logAppend && exists) {
+            writeServerRestartedAfterLogConfig = true;
         }
     }
-    if (!logV2Enabled()) {
-        logger::globalLogDomain()->attachAppender(
-            std::make_unique<RamLogAppender>(RamLog::get("global")));
-    }
 
-
-    if (logV2Enabled()) {
-        lv2Config.timestampFormat = serverGlobalParams.logTimestampFormat;
-        Status result = lv2Manager.getGlobalDomainInternal().configure(lv2Config);
-        if (result.isOK() && writeServerRestartedAfterLogConfig)
-            LOGV2(20698, "***** SERVER RESTARTED *****");
-        return result;
-    }
+    lv2Config.timestampFormat = serverGlobalParams.logTimestampFormat;
+    Status result = lv2Manager.getGlobalDomainInternal().configure(lv2Config);
+    if (result.isOK() && writeServerRestartedAfterLogConfig)
+        LOGV2_WARNING_OPTIONS(
+            20698, {logv2::LogTag::kStartupWarnings}, "***** SERVER RESTARTED *****");
+    return result;
 
     return Status::OK();
 }

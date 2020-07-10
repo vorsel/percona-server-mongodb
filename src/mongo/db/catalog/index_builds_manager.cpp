@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -37,6 +37,7 @@
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/index_timestamp_helper.h"
+#include "mongo/db/catalog/uncommitted_collections.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/storage/write_unit_of_work.h"
@@ -51,7 +52,7 @@ namespace {
 /**
  * Returns basic info on index builders.
  */
-std::string toSummary(const std::map<UUID, std::shared_ptr<MultiIndexBlock>>& builders) {
+std::string toSummary(const std::map<UUID, std::unique_ptr<MultiIndexBlock>>& builders) {
     str::stream ss;
     ss << "Number of builders: " << builders.size() << ": [";
     bool first = true;
@@ -97,7 +98,7 @@ Status IndexBuildsManager::setUpIndexBuild(OperationContext* opCtx,
     // secondaries. Secondaries can complete index builds in the middle of batches, which creates
     // the potential for finding duplicate key violations where there otherwise would be none at
     // consistent states.
-    // Two-phase builds will defer any unique key violations until commit-time.
+    // Index builds will otherwise defer any unique key constraint checks until commit-time.
     if (options.indexConstraints == IndexConstraints::kRelax &&
         options.protocol == IndexBuildProtocol::kSinglePhase) {
         builder->ignoreUniqueConstraint();
@@ -115,10 +116,11 @@ Status IndexBuildsManager::setUpIndexBuild(OperationContext* opCtx,
     LOGV2(
         20346,
         "Index build initialized: {buildUUID}: {nss} ({collection_uuid} ): indexes: {indexes_size}",
-        "buildUUID"_attr = buildUUID,
-        "nss"_attr = nss,
-        "collection_uuid"_attr = collection->uuid(),
-        "indexes_size"_attr = indexes.size());
+        "Index build initialized",
+        "indexBuildUUID"_attr = buildUUID,
+        "namespace"_attr = nss,
+        "collectionUuid"_attr = collection->uuid(),
+        "numIndexes"_attr = indexes.size());
 
     return Status::OK();
 }
@@ -165,13 +167,15 @@ StatusWith<std::pair<long long, long long>> IndexBuildsManager::startBuildingInd
                     if (repair == RepairData::kNo) {
                         LOGV2_FATAL(31396,
                                     "Invalid BSON detected at {id}: {validStatus}",
+                                    "Invalid BSON detected",
                                     "id"_attr = id,
-                                    "validStatus"_attr = redact(validStatus));
+                                    "error"_attr = redact(validStatus));
                     }
                     LOGV2_WARNING(20348,
                                   "Invalid BSON detected at {id}: {validStatus}. Deleting.",
+                                  "Invalid BSON detected; deleting.",
                                   "id"_attr = id,
-                                  "validStatus"_attr = redact(validStatus));
+                                  "error"_attr = redact(validStatus));
                     rs->deleteRecord(opCtx, id);
                 } else {
                     numRecords++;
@@ -253,26 +257,25 @@ Status IndexBuildsManager::commitIndexBuild(OperationContext* opCtx,
                 return status;
             }
             wunit.commit();
-
-            // Required call to clean up even though commit cleaned everything up.
-            builder->cleanUpAfterBuild(opCtx, collection, MultiIndexBlock::kNoopOnCleanUpFn);
-            _unregisterIndexBuild(buildUUID);
             return Status::OK();
         });
 }
 
-bool IndexBuildsManager::abortIndexBuild(const UUID& buildUUID, const std::string& reason) {
-    stdx::unique_lock<Latch> lk(_mutex);
-
-    auto builderIt = _builders.find(buildUUID);
-    if (builderIt == _builders.end()) {
+bool IndexBuildsManager::abortIndexBuild(OperationContext* opCtx,
+                                         Collection* collection,
+                                         const UUID& buildUUID,
+                                         OnCleanUpFn onCleanUpFn) {
+    auto builder = _getBuilder(buildUUID);
+    if (!builder.isOK()) {
         return false;
     }
 
-    std::shared_ptr<MultiIndexBlock> builder = builderIt->second;
+    // Since abortIndexBuild is special in that it can be called by threads other than the index
+    // builder, ensure the caller has an exclusive lock.
+    auto nss = collection->ns();
+    UncommittedCollections::get(opCtx).invariantHasExclusiveAccessToCollection(opCtx, nss);
 
-    lk.unlock();
-    builder->abort(reason);
+    builder.getValue()->abortIndexBuild(opCtx, collection, onCleanUpFn);
     return true;
 }
 
@@ -287,27 +290,12 @@ bool IndexBuildsManager::abortIndexBuildWithoutCleanup(OperationContext* opCtx,
 
     LOGV2(20347,
           "Index build aborted without cleanup: {buildUUID}: {reason}",
+          "Index build aborted without cleanup",
           "buildUUID"_attr = buildUUID,
           "reason"_attr = reason);
 
     builder.getValue()->abortWithoutCleanup(opCtx);
-    builder.getValue()->cleanUpAfterBuild(opCtx, collection, MultiIndexBlock::kNoopOnCleanUpFn);
-    _unregisterIndexBuild(buildUUID);
-
     return true;
-}
-
-void IndexBuildsManager::tearDownIndexBuild(OperationContext* opCtx,
-                                            Collection* collection,
-                                            const UUID& buildUUID,
-                                            OnCleanUpFn onCleanUpFn) {
-    auto builder = _getBuilder(buildUUID);
-    if (!builder.isOK()) {
-        return;
-    }
-
-    builder.getValue()->cleanUpAfterBuild(opCtx, collection, onCleanUpFn);
-    _unregisterIndexBuild(buildUUID);
 }
 
 bool IndexBuildsManager::isBackgroundBuilding(const UUID& buildUUID) {
@@ -322,11 +310,11 @@ void IndexBuildsManager::verifyNoIndexBuilds_forTestOnly() {
 void IndexBuildsManager::_registerIndexBuild(UUID buildUUID) {
     stdx::unique_lock<Latch> lk(_mutex);
 
-    std::shared_ptr<MultiIndexBlock> mib = std::make_shared<MultiIndexBlock>();
-    invariant(_builders.insert(std::make_pair(buildUUID, mib)).second);
+    auto mib = std::make_unique<MultiIndexBlock>();
+    invariant(_builders.insert(std::make_pair(buildUUID, std::move(mib))).second);
 }
 
-void IndexBuildsManager::_unregisterIndexBuild(const UUID& buildUUID) {
+void IndexBuildsManager::unregisterIndexBuild(const UUID& buildUUID) {
     stdx::unique_lock<Latch> lk(_mutex);
 
     auto builderIt = _builders.find(buildUUID);
@@ -336,14 +324,13 @@ void IndexBuildsManager::_unregisterIndexBuild(const UUID& buildUUID) {
     _builders.erase(builderIt);
 }
 
-StatusWith<std::shared_ptr<MultiIndexBlock>> IndexBuildsManager::_getBuilder(
-    const UUID& buildUUID) {
+StatusWith<MultiIndexBlock*> IndexBuildsManager::_getBuilder(const UUID& buildUUID) {
     stdx::unique_lock<Latch> lk(_mutex);
     auto builderIt = _builders.find(buildUUID);
     if (builderIt == _builders.end()) {
         return {ErrorCodes::NoSuchKey, str::stream() << "No index build with UUID: " << buildUUID};
     }
-    return builderIt->second;
+    return builderIt->second.get();
 }
 
 }  // namespace mongo

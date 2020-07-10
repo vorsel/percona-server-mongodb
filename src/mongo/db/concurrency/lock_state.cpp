@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -215,7 +215,11 @@ void LockerImpl::dump() const {
         for (auto it = _requests.begin(); !it.finished(); it.next())
             entries.push_back({it.key(), it->status, it->mode});
     }
-    LOGV2(20523, "Locker id {id} status: {requests}", "id"_attr = _id, "requests"_attr = entries);
+    LOGV2(20523,
+          "Locker id {id} status: {requests}",
+          "Locker status",
+          "id"_attr = _id,
+          "requests"_attr = entries);
 }
 
 

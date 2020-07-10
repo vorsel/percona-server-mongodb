@@ -30,7 +30,7 @@
 
 #pragma once
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "asio/detail/config.hpp"
 
@@ -131,9 +131,6 @@ engine::engine(context::native_handle_type context, const std::string& remoteHos
         }
         _protoMin = context->protoMin;
         _protoMax = context->protoMax;
-        if (context->allowInvalidHostnames) {
-            _remoteHostName.clear();
-        }
     } else {
         apple::Context def;
         _protoMin = def.protoMin;

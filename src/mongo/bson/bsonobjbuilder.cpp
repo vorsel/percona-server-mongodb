@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/db/jsobj.h"
 
@@ -235,9 +235,7 @@ BSONObjBuilder::~BSONObjBuilder() {
     }
 }
 
-template class BasicBufBuilder<SharedBufferAllocator>;
-template class BasicBufBuilder<StackAllocator<StackSizeDefault>>;
-template class StringBuilderImpl<SharedBufferAllocator>;
-template class StringBuilderImpl<StackAllocator<StackSizeDefault>>;
+template class StringBuilderImpl<BufBuilder>;
+template class StringBuilderImpl<StackBufBuilderBase<StackSizeDefault>>;
 
 }  // namespace mongo

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -62,8 +62,6 @@ protected:
         ThreadPoolExecutorTest::setUp();
         launchExecutorThread();
         _startTime = getNet()->now();
-
-        { setMinimumLoggedSeverity(logv2::LogComponent::kNetwork, logv2::LogSeverity::Debug(2)); }
         setGlobalServiceContext(std::move(serviceContext));
     }
 
@@ -154,6 +152,9 @@ protected:
     }
 
 private:
+    unittest::MinimumLoggedSeverityGuard _networkSeverityGuard{logv2::LogComponent::kNetwork,
+                                                               logv2::LogSeverity::Debug(2)};
+
     std::map<HostAndPort, int> _numChecks;
     Date_t _startTime;
 

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -257,10 +257,11 @@ Status waitForShardRegistryReload(OperationContext* opCtx) {
             continue;
         } catch (const DBException& ex) {
             Status status = ex.toStatus();
-            LOGV2_WARNING(23834,
-                          "Error initializing sharding state, sleeping for 2 seconds and trying "
-                          "again{causedBy_status}",
-                          "causedBy_status"_attr = causedBy(status));
+            LOGV2_WARNING(
+                23834,
+                "Error {error} initializing sharding state, sleeping for 2 seconds and retrying",
+                "Error initializing sharding state, sleeping for 2 seconds and retrying",
+                "error"_attr = status);
             sleepFor(kRetryInterval);
             continue;
         }

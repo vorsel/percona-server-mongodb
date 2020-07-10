@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -449,7 +449,6 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckFailedDueToSetIdMismatch) {
                                           rsConfig.getConfigVersion(),
                                           rsConfig.getConfigTerm(),
                                           unexpectedId,
-                                          rpc::ReplSetMetadata::kNoPrimary,
                                           -1,
                                           false);
             BSONObjBuilder bob;

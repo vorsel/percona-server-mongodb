@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kASIO
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kASIO
 
 #include "mongo/platform/basic.h"
 
@@ -133,16 +133,16 @@ Future<void> NetworkInterfaceIntegrationFixture::startExhaustCommand(
         cbHandle,
         rcroa,
         [p = std::move(pf.promise), exhaustUtilCB = std::move(exhaustUtilCB)](
-            const TaskExecutor::ResponseOnAnyStatus& rs, bool isMoreToComeSet) mutable {
+            const TaskExecutor::ResponseOnAnyStatus& rs) mutable {
             exhaustUtilCB(rs);
 
             if (!rs.status.isOK()) {
-                invariant(!isMoreToComeSet);
+                invariant(!rs.moreToCome);
                 p.setError(rs.status);
                 return;
             }
 
-            if (!isMoreToComeSet) {
+            if (!rs.moreToCome) {
                 p.emplaceValue();
             }
         },
@@ -159,9 +159,12 @@ RemoteCommandResponse NetworkInterfaceIntegrationFixture::runCommandSync(
     auto deferred = runCommand(makeCallbackHandle(), request);
     auto& res = deferred.get();
     if (res.isOK()) {
-        LOGV2(22586, "got command result: {res}", "res"_attr = res.toString());
+        LOGV2(22586,
+              "Got command result: {response}",
+              "Got command result",
+              "response"_attr = res.toString());
     } else {
-        LOGV2(22587, "command failed: {res_status}", "res_status"_attr = res.status);
+        LOGV2(22587, "Command failed: {error}", "Command failed", "error"_attr = res.status);
     }
     return res;
 }

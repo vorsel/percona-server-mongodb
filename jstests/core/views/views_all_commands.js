@@ -322,20 +322,9 @@ let viewsCommandTests = {
     getParameter: {skip: isUnrelated},
     getShardMap: {skip: isUnrelated},
     getShardVersion: {
-        command: function(conn) {
-            // getShardVersion was updated to be allowed on views in v4.4, but in v4.2 would return
-            // CommandNotSupportedOnView. Ignore a CommandNotSupportedOnView error code so that the
-            // test passes in the mixed-version replica sets passthrough. The v4.2 behavior is
-            // tested in the v4.2 branch.
-            try {
-                assert.commandWorked(conn.adminCommand({getShardVersion: "test.view"}));
-            } catch (e) {
-                if (e.code == ErrorCodes.CommandNotSupportedOnView) {
-                    return;
-                }
-                throw e;
-            }
-        },
+        command: {getShardVersion: "test.view"},
+        expectFailure: true,
+        expectedErrorCode: ErrorCodes.NoShardingEnabled,
         isAdminCommand: true,
         skipSharded: true,  // mongos is tested in views/views_sharded.js
     },
@@ -431,7 +420,11 @@ let viewsCommandTests = {
     refreshLogicalSessionCacheNow: {skip: isAnInternalCommand},
     reapLogicalSessionCacheNow: {skip: isAnInternalCommand},
     refreshSessions: {skip: isUnrelated},
-    reIndex: {command: {reIndex: "view"}, expectFailure: true},
+    reIndex: {
+        command: {reIndex: "view"},
+        expectFailure: true,
+        expectedErrorCode: [ErrorCodes.IllegalOperation, ErrorCodes.CommandNotSupportedOnView],
+    },
     removeShard: {skip: isUnrelated},
     removeShardFromZone: {skip: isUnrelated},
     renameCollection: [
@@ -527,7 +520,7 @@ let viewsCommandTests = {
         },
         skipSharded: true,
         expectFailure: true,
-        expectedErrorCode: 193,
+        expectedErrorCode: ErrorCodes.NoShardingEnabled,
         isAdminCommand: true,
     },
     splitVector: {

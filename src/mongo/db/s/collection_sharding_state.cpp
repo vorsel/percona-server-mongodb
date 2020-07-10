@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -39,7 +39,6 @@
 #include "mongo/util/string_map.h"
 
 namespace mongo {
-
 namespace {
 
 class CollectionShardingStateMap {
@@ -73,18 +72,13 @@ public:
         return *it->second;
     }
 
-    void report(OperationContext* opCtx, BSONObjBuilder* builder) {
+    void report(BSONObjBuilder* builder) {
         BSONObjBuilder versionB(builder->subobjStart("versions"));
 
         {
             stdx::lock_guard<Latch> lg(_mutex);
-
-            for (auto& coll : _collections) {
-                const auto optMetadata = coll.second->getCurrentMetadataIfKnown();
-                if (optMetadata) {
-                    const auto& metadata = *optMetadata;
-                    versionB.appendTimestamp(coll.first, metadata->getShardVersion().toLong());
-                }
+            for (const auto& coll : _collections) {
+                coll.second->appendShardVersion(builder);
             }
         }
 
@@ -92,16 +86,18 @@ public:
     }
 
     void appendInfoForServerStatus(BSONObjBuilder* builder) {
-        BSONArrayBuilder rangeDeleterArrayBuilder(builder->subarrayStart("rangeDeleterTasks"));
-
-        {
+        auto totalNumberOfRangesScheduledForDeletion = ([this] {
             stdx::lock_guard lg(_mutex);
-            for (auto& coll : _collections) {
-                coll.second->appendInfoForServerStatus(&rangeDeleterArrayBuilder);
-            }
-        }
+            return std::accumulate(_collections.begin(),
+                                   _collections.end(),
+                                   0LL,
+                                   [](long long total, const auto& coll) {
+                                       return total +
+                                           coll.second->numberOfRangesScheduledForDeletion();
+                                   });
+        })();
 
-        rangeDeleterArrayBuilder.done();
+        builder->appendNumber("rangeDeleterTasks", totalNumberOfRangesScheduledForDeletion);
     }
 
 private:
@@ -136,7 +132,7 @@ CollectionShardingState* CollectionShardingState::get_UNSAFE(ServiceContext* svc
 
 void CollectionShardingState::report(OperationContext* opCtx, BSONObjBuilder* builder) {
     auto& collectionsMap = CollectionShardingStateMap::get(opCtx->getServiceContext());
-    collectionsMap->report(opCtx, builder);
+    collectionsMap->report(builder);
 }
 
 void CollectionShardingState::appendInfoForServerStatus(OperationContext* opCtx,

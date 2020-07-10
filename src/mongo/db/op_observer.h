@@ -37,7 +37,6 @@
 #include "mongo/db/catalog/commit_quorum_options.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/rollback.h"
-#include "mongo/db/s/collection_sharding_state.h"
 
 namespace mongo {
 
@@ -61,9 +60,11 @@ struct OplogUpdateEntryArgs {
         : updateArgs(std::move(updateArgs)), nss(std::move(nss)), uuid(std::move(uuid)) {}
 };
 
-struct TTLCollModInfo {
-    Seconds expireAfterSeconds;
-    Seconds oldExpireAfterSeconds;
+struct IndexCollModInfo {
+    boost::optional<Seconds> expireAfterSeconds;
+    boost::optional<Seconds> oldExpireAfterSeconds;
+    boost::optional<bool> hidden;
+    boost::optional<bool> oldHidden;
     std::string indexName;
 };
 
@@ -100,7 +101,6 @@ public:
                                    CollectionUUID collUUID,
                                    const UUID& indexBuildUUID,
                                    const std::vector<BSONObj>& indexes,
-                                   const CommitQuorumOptions& commitQuorum,
                                    bool fromMigrate) = 0;
 
     virtual void onStartIndexBuildSinglePhase(OperationContext* opCtx,
@@ -210,7 +210,7 @@ public:
                            OptionalCollectionUUID uuid,
                            const BSONObj& collModCmd,
                            const CollectionOptions& oldCollOptions,
-                           boost::optional<TTLCollModInfo> ttlInfo) = 0;
+                           boost::optional<IndexCollModInfo> indexInfo) = 0;
     virtual void onDropDatabase(OperationContext* opCtx, const std::string& dbName) = 0;
 
     /**

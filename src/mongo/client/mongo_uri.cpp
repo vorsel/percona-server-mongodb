@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
@@ -89,7 +89,7 @@ mongo::StatusWith<std::string> mongo::uriDecode(StringData toDecode) {
     for (size_t i = 0; i < toDecode.size(); ++i) {
         const char c = toDecode[i];
         if (c == '%') {
-            if (i + 2 > toDecode.size()) {
+            if (i + 2 >= toDecode.size()) {
                 return Status(ErrorCodes::FailedToParse,
                               "Encountered partial escape sequence at end of string");
             }

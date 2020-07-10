@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #define LOGV2_FOR_ELECTION(ID, DLEVEL, MESSAGE, ...) \
     LOGV2_DEBUG_OPTIONS(                             \
@@ -1267,28 +1267,6 @@ StatusWith<bool> TopologyCoordinator::setLastOptime(const UpdatePositionArgs::Up
                 "configVersion"_attr = args.cfgver,
                 "appliedOpTime"_attr = args.appliedOpTime,
                 "durableOpTime"_attr = args.durableOpTime);
-
-    // If we're in FCV 4.4, allow replSetUpdatePosition commands between config versions.
-    if (!serverGlobalParams.featureCompatibility.isVersion(
-            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44)) {
-        if (args.cfgver != _rsConfig.getConfigVersion()) {
-            static constexpr char errmsg[] =
-                "Received replSetUpdatePosition for node whose config version doesn't match our "
-                "config version";
-            LOGV2_DEBUG(21813,
-                        1,
-                        errmsg,
-                        "memberId"_attr = memberId,
-                        "memberConfigVersion"_attr = args.cfgver,
-                        "ourConfigVersion"_attr = _rsConfig.getConfigVersion());
-            *configVersion = _rsConfig.getConfigVersion();
-            return Status(ErrorCodes::InvalidReplicaSetConfig,
-                          str::stream()
-                              << errmsg << ", memberId: " << memberId
-                              << ", member config version: " << args.cfgver
-                              << ", our config version: " << _rsConfig.getConfigVersion());
-        }
-    }
 
     // While we can accept replSetUpdatePosition commands across config versions, we still do not
     // allow receiving them from a node that is not in our config.
@@ -2885,6 +2863,7 @@ long long TopologyCoordinator::getTerm() const {
 bool TopologyCoordinator::shouldChangeSyncSource(const HostAndPort& currentSource,
                                                  const rpc::ReplSetMetadata& replMetadata,
                                                  const rpc::OplogQueryMetadata& oqMetadata,
+                                                 const OpTime& lastOpTimeFetched,
                                                  Date_t now) const {
     // Methodology:
     // If there exists a viable sync source member other than currentSource, whose oplog has
@@ -2908,24 +2887,6 @@ bool TopologyCoordinator::shouldChangeSyncSource(const HostAndPort& currentSourc
         return true;
     }
 
-    // If we're in FCV 4.4, allow data replication between config versions. Otherwise, change
-    // our sync source.
-    if (!serverGlobalParams.featureCompatibility.isVersion(
-            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44)) {
-        if (replMetadata.getConfigVersion() != _rsConfig.getConfigVersion()) {
-            LOGV2(
-                21830,
-                "Choosing new sync source because the config version supplied by {currentSource}, "
-                "{syncSourceConfigVersion}, does not match ours, {configVersion}",
-                "Choosing new sync source because the config version supplied by the current sync "
-                "source does not match ours",
-                "currentSource"_attr = currentSource,
-                "syncSourceConfigVersion"_attr = replMetadata.getConfigVersion(),
-                "configVersion"_attr = _rsConfig.getConfigVersion());
-            return true;
-        }
-    }
-
     // While we can allow data replication across config versions, we still do not allow syncing
     // from a node that is not in our config.
     const int currentSourceIndex = _rsConfig.findMemberIndexByHostAndPort(currentSource);
@@ -2946,30 +2907,18 @@ bool TopologyCoordinator::shouldChangeSyncSource(const HostAndPort& currentSourc
     fassert(4612000, !currentSourceOpTime.isNull());
 
     int syncSourceIndex = oqMetadata.getSyncSourceIndex();
-    // A 4.2 sync source's primaryIndex is unreliable, because we don't know what config version the
-    // index is valid for. Prefer the new 4.4 field isPrimary.
-    // TODO(SERVER-47125): Require isPrimary and stop using primaryIndex.
-    bool sourceIsPrimary =
-        replMetadata.getIsPrimary().value_or(oqMetadata.getPrimaryIndex() == currentSourceIndex);
 
     // Change sync source if they are not ahead of us, and don't have a sync source,
     // unless they are primary.
-    const OpTime myLastOpTime = getMyLastAppliedOpTime();
-    if (syncSourceIndex == -1 && currentSourceOpTime <= myLastOpTime && !sourceIsPrimary) {
-        logv2::DynamicAttributes attrs;
-        attrs.add("syncSource", currentSource);
-        attrs.add("lastFetchedOpTime", myLastOpTime);
-        attrs.add("syncSourceLatestOplogOpTime", currentSourceOpTime);
-        if (replMetadata.getIsPrimary().is_initialized()) {
-            attrs.add("isPrimary", replMetadata.getIsPrimary().value());
-        } else {
-            attrs.add("isPrimary", "unset");
-        }
-
+    if (syncSourceIndex == -1 && currentSourceOpTime <= lastOpTimeFetched &&
+        !replMetadata.getIsPrimary()) {
         LOGV2(21832,
               "Choosing new sync source. Our current sync source is not primary and does "
               "not have a sync source, so we require that it is ahead of us",
-              attrs);
+              "syncSource"_attr = currentSource,
+              "lastFetchedOpTime"_attr = lastOpTimeFetched,
+              "syncSourceLatestOplogOpTime"_attr = currentSourceOpTime,
+              "isPrimary"_attr = replMetadata.getIsPrimary());
         return true;
     }
 
@@ -3026,7 +2975,6 @@ rpc::ReplSetMetadata TopologyCoordinator::prepareReplSetMetadata(
                                 _rsConfig.getConfigVersion(),
                                 _rsConfig.getConfigTerm(),
                                 _rsConfig.getReplicaSetId(),
-                                _currentPrimaryIndex,
                                 _rsConfig.findMemberIndexByHostAndPort(getSyncSourceAddress()),
                                 _role == Role::kLeader /* isPrimary */);
 }
@@ -3242,7 +3190,7 @@ TopologyCoordinator::latestKnownOpTimeSinceHeartbeatRestartPerMember() const {
 bool TopologyCoordinator::checkIfCommitQuorumCanBeSatisfied(
     const CommitQuorumOptions& commitQuorum) const {
     if (!commitQuorum.mode.empty() && commitQuorum.mode != CommitQuorumOptions::kMajority &&
-        commitQuorum.mode != CommitQuorumOptions::kAll) {
+        commitQuorum.mode != CommitQuorumOptions::kVotingMembers) {
         StatusWith<ReplSetTagPattern> tagPatternStatus =
             _rsConfig.findCustomWriteMode(commitQuorum.mode);
         if (!tagPatternStatus.isOK()) {
@@ -3267,7 +3215,7 @@ bool TopologyCoordinator::checkIfCommitQuorumCanBeSatisfied(
     if (!commitQuorum.mode.empty()) {
         if (commitQuorum.mode == CommitQuorumOptions::kMajority) {
             nodesRemaining = _rsConfig.getWriteMajority();
-        } else if (commitQuorum.mode == CommitQuorumOptions::kAll) {
+        } else if (commitQuorum.mode == CommitQuorumOptions::kVotingMembers) {
             nodesRemaining = _rsConfig.getWritableVotingMembersCount();
         }
     }

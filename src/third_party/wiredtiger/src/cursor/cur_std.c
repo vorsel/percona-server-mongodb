@@ -240,6 +240,10 @@ __wt_cursor_copy_release_item(WT_CURSOR *cursor, WT_ITEM *item) WT_GCC_FUNC_ATTR
 
     session = (WT_SESSION_IMPL *)cursor->session;
 
+    /* Bail out if the item has been cleared. */
+    if (item->data == NULL)
+        return (0);
+
     /*
      * Whether or not we own the memory for the item, make a copy of the data and use that instead.
      * That allows us to overwrite and free memory owned by the item, potentially uncovering
@@ -483,6 +487,7 @@ err:
         if (buf->mem == NULL && !F_ISSET(S2C(session), WT_CONN_DEBUG_CURSOR_COPY)) {
             buf->mem = tmp.mem;
             buf->memsize = tmp.memsize;
+            F_SET(cursor, WT_CURSTD_DEBUG_COPY_KEY);
         } else
             __wt_free(session, tmp.mem);
     }
@@ -622,6 +627,7 @@ err:
         if (buf->mem == NULL && !F_ISSET(S2C(session), WT_CONN_DEBUG_CURSOR_COPY)) {
             buf->mem = tmp.mem;
             buf->memsize = tmp.memsize;
+            F_SET(cursor, WT_CURSTD_DEBUG_COPY_VALUE);
         } else
             __wt_free(session, tmp.mem);
     }
@@ -943,11 +949,11 @@ __cursor_modify(WT_CURSOR *cursor, WT_MODIFY *entries, int nentries)
      * read-uncommitted transaction, or outside of an explicit transaction. Disallow here as well,
      * for consistency.
      */
-    if (session->txn.isolation != WT_ISO_SNAPSHOT)
+    if (session->txn->isolation != WT_ISO_SNAPSHOT)
         WT_ERR_MSG(session, ENOTSUP,
           "not supported in read-committed or read-uncommitted "
           "transactions");
-    if (F_ISSET(&session->txn, WT_TXN_AUTOCOMMIT))
+    if (F_ISSET(session->txn, WT_TXN_AUTOCOMMIT))
         WT_ERR_MSG(session, ENOTSUP, "not supported in implicit transactions");
 
     WT_ERR(__cursor_checkkey(cursor));
@@ -989,7 +995,7 @@ __wt_cursor_reconfigure(WT_CURSOR *cursor, const char *config)
             else
                 F_CLR(cursor, WT_CURSTD_APPEND);
         } else
-            WT_ERR_NOTFOUND_OK(ret);
+            WT_ERR_NOTFOUND_OK(ret, false);
     }
 
     /*
@@ -1001,7 +1007,7 @@ __wt_cursor_reconfigure(WT_CURSOR *cursor, const char *config)
         else
             F_CLR(cursor, WT_CURSTD_OVERWRITE);
     } else
-        WT_ERR_NOTFOUND_OK(ret);
+        WT_ERR_NOTFOUND_OK(ret, false);
 
 err:
     API_END_RET(session, ret);

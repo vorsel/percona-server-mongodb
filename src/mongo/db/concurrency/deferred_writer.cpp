@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kWrite
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kWrite
 
 #include "mongo/db/concurrency/deferred_writer.h"
 #include "mongo/db/catalog/create_collection.h"
@@ -49,8 +49,9 @@ void DeferredWriter::_logFailure(const Status& status) {
     if (TimePoint::clock::now() - _lastLogged > kLogInterval) {
         LOGV2(20516,
               "Unable to write to collection {nss}: {status}",
-              "nss"_attr = _nss.toString(),
-              "status"_attr = status.toString());
+              "Unable to write to collection",
+              "namespace"_attr = _nss.toString(),
+              "error"_attr = status);
         _lastLogged = stdx::chrono::system_clock::now();
     }
 }

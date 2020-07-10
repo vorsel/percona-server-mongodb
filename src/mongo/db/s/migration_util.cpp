@@ -269,9 +269,6 @@ ExecutorFuture<void> submitRangeDeletionTask(OperationContext* opCtx,
                       "namespace"_attr = deletionTask.getNss(),
                       "migrationId"_attr = deletionTask.getId());
 
-                // TODO (SERVER-46075): Add an asynchronous version of
-                // forceShardFilteringMetadataRefresh to avoid blocking on the network in the
-                // thread pool.
                 autoColl.reset();
                 refreshFilteringMetadataUntilSuccess(opCtx, deletionTask.getNss());
             }
@@ -279,12 +276,15 @@ ExecutorFuture<void> submitRangeDeletionTask(OperationContext* opCtx,
             autoColl.emplace(opCtx, deletionTask.getNss(), MODE_IS);
             uassert(
                 ErrorCodes::RangeDeletionAbandonedBecauseCollectionWithUUIDDoesNotExist,
-                str::stream() << "Even after forced refresh, filtering metadata for namespace in "
-                                 "deletion task "
-                              << (css->getCollectionDescription().isSharded()
-                                      ? " has UUID that does not match UUID of the deletion task"
-                                      : " is unsharded"),
-                css->getCollectionDescription().isSharded() &&
+                str::stream()
+                    << "Even after forced refresh, filtering metadata for namespace in "
+                       "deletion task "
+                    << (css->getCurrentMetadataIfKnown()
+                            ? (css->getCollectionDescription().isSharded()
+                                   ? " has UUID that does not match UUID of the deletion task"
+                                   : " is unsharded")
+                            : " is not known"),
+                css->getCurrentMetadataIfKnown() && css->getCollectionDescription().isSharded() &&
                     css->getCollectionDescription().uuidMatches(deletionTask.getCollectionUuid()));
 
             LOGV2(22026,
@@ -369,22 +369,30 @@ template <typename Callable>
 void forEachOrphanRange(OperationContext* opCtx, const NamespaceString& nss, Callable&& handler) {
     AutoGetCollection autoColl(opCtx, nss, MODE_IX);
 
-    const auto css = CollectionShardingRuntime::get(opCtx, nss);
-    const auto collDesc = css->getCollectionDescription();
+    const auto csr = CollectionShardingRuntime::get(opCtx, nss);
+    const auto metadata = csr->getCurrentMetadataIfKnown();
     const auto emptyChunkMap =
         RangeMap{SimpleBSONObjComparator::kInstance.makeBSONObjIndexedMap<BSONObj>()};
 
-    if (!collDesc.isSharded()) {
+    if (!metadata) {
+        LOGV2(474680,
+              "Upgrade: Skipping orphaned range enumeration because the collection's sharding "
+              "state is not known",
+              "namespace"_attr = nss);
+        return;
+    }
+
+    if (!metadata->isSharded()) {
         LOGV2(22029,
               "Upgrade: Skipping orphaned range enumeration because the collection is not sharded",
               "namespace"_attr = nss);
         return;
     }
 
-    auto startingKey = collDesc.getMinKey();
+    auto startingKey = metadata->getMinKey();
 
     while (true) {
-        auto range = collDesc->getNextOrphanRange(emptyChunkMap, startingKey);
+        auto range = metadata->getNextOrphanRange(emptyChunkMap, startingKey);
         if (!range) {
             LOGV2_DEBUG(22030,
                         2,
@@ -408,6 +416,15 @@ void submitOrphanRanges(OperationContext* opCtx, const NamespaceString& nss, con
 
         if (version == ChunkVersion::UNSHARDED())
             return;
+
+        // We clear the list of receiving chunks to ensure that that a RangeDeletionTask submitted
+        // by this setFCV command cannot be blocked behind a chunk received as a part of a
+        // migration that completed on the recipient (this node) but failed to commit.
+        {
+            AutoGetCollection autoColl(opCtx, nss, MODE_IS);
+            auto csr = CollectionShardingRuntime::get(opCtx, nss);
+            csr->clearReceivingChunks();
+        }
 
         LOGV2_DEBUG(22031,
                     2,
@@ -837,9 +854,9 @@ void resumeMigrationCoordinationsOnStepUp(OperationContext* opCtx) {
                         return css->getCurrentMetadataIfKnown();
                     }();
 
-                    if (!refreshedMetadata || !(*refreshedMetadata)->isSharded() ||
-                        !(*refreshedMetadata)->uuidMatches(doc.getCollectionUuid())) {
-                        if (!refreshedMetadata || !(*refreshedMetadata)->isSharded()) {
+                    if (!refreshedMetadata || !refreshedMetadata->isSharded() ||
+                        !refreshedMetadata->uuidMatches(doc.getCollectionUuid())) {
+                        if (!refreshedMetadata || !refreshedMetadata->isSharded()) {
                             LOGV2(
                                 22040,
                                 "Even after forced refresh, filtering metadata for this namespace "
@@ -857,13 +874,10 @@ void resumeMigrationCoordinationsOnStepUp(OperationContext* opCtx) {
                                 "node",
                                 "migrationCoordinatorDocument"_attr = redact(doc.toBSON()),
                                 "refreshedMetadataUUID"_attr =
-                                    (*refreshedMetadata)->getChunkManager()->getUUID(),
+                                    refreshedMetadata->getChunkManager()->getUUID(),
                                 "coordinatorDocumentUUID"_attr = doc.getCollectionUuid());
                         }
 
-                        // TODO (SERVER-45707): Test that range deletion tasks are eventually
-                        // deleted even if the collection is dropped before migration coordination
-                        // is resumed.
                         deleteRangeDeletionTaskOnRecipient(
                             opCtx, doc.getRecipientShardId(), doc.getId());
                         deleteRangeDeletionTaskLocally(opCtx, doc.getId());
@@ -871,7 +885,7 @@ void resumeMigrationCoordinationsOnStepUp(OperationContext* opCtx) {
                         return true;
                     }
 
-                    if ((*refreshedMetadata)->keyBelongsToMe(doc.getRange().getMin())) {
+                    if (refreshedMetadata->keyBelongsToMe(doc.getRange().getMin())) {
                         coordinator.setMigrationDecision(MigrationCoordinator::Decision::kAborted);
                     } else {
                         coordinator.setMigrationDecision(

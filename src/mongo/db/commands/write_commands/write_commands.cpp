@@ -47,6 +47,7 @@
 #include "mongo/db/ops/parsed_update.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/ops/write_ops_exec.h"
+#include "mongo/db/pipeline/lite_parsed_pipeline.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/repl/repl_client_info.h"
@@ -92,15 +93,18 @@ void serializeReply(OperationContext* opCtx,
     if (shouldSkipOutput(opCtx))
         return;
 
-    if (continueOnError && !result.results.empty()) {
+    if (continueOnError) {
+        invariant(!result.results.empty());
         const auto& lastResult = result.results.back();
-        if (lastResult == ErrorCodes::StaleConfig || lastResult == ErrorCodes::StaleDbVersion) {
-            // For ordered:false commands we need to duplicate these error results for all ops
-            // after we stopped. See handleError() in write_ops_exec.cpp for more info.
-            auto err = result.results.back();
-            while (result.results.size() < opsInBatch) {
-                result.results.emplace_back(err);
-            }
+
+        if (lastResult == ErrorCodes::StaleDbVersion ||
+            ErrorCodes::isStaleShardVersionError(lastResult.getStatus())) {
+            // For ordered:false commands we need to duplicate these error results for all ops after
+            // we stopped. See handleError() in write_ops_exec.cpp for more info.
+            //
+            // Omit the reason from the duplicate unordered responses so it doesn't consume BSON
+            // object space
+            result.results.resize(opsInBatch, lastResult.getStatus().withReason(""));
         }
     }
 
@@ -389,6 +393,17 @@ private:
                            _batch.getUpdates().size(),
                            std::move(reply),
                            &result);
+
+            // If this was a pipeline style update, record which stages were being used.
+            for (auto&& update : _batch.getUpdates()) {
+                auto& updateMod = update.getU();
+                if (updateMod.type() == write_ops::UpdateModification::Type::kPipeline) {
+                    AggregationRequest request(_batch.getNamespace(),
+                                               updateMod.getUpdatePipeline());
+                    LiteParsedPipeline pipeline(request);
+                    pipeline.tickGlobalStageCounters();
+                }
+            }
         }
 
         void explain(OperationContext* opCtx,
@@ -398,19 +413,11 @@ private:
                     "explained write batches must be of size 1",
                     _batch.getUpdates().size() == 1);
 
-            UpdateRequest updateRequest(_batch.getNamespace());
-            updateRequest.setQuery(_batch.getUpdates()[0].getQ());
-            updateRequest.setUpdateModification(_batch.getUpdates()[0].getU());
-            updateRequest.setUpdateConstants(_batch.getUpdates()[0].getC());
+            UpdateRequest updateRequest(_batch.getUpdates()[0]);
+            updateRequest.setNamespaceString(_batch.getNamespace());
             updateRequest.setRuntimeConstants(
                 _batch.getRuntimeConstants().value_or(Variables::generateRuntimeConstants(opCtx)));
-            updateRequest.setCollation(write_ops::collationOf(_batch.getUpdates()[0]));
-            updateRequest.setArrayFilters(write_ops::arrayFiltersOf(_batch.getUpdates()[0]));
-            updateRequest.setMulti(_batch.getUpdates()[0].getMulti());
-            updateRequest.setUpsert(_batch.getUpdates()[0].getUpsert());
-            updateRequest.setUpsertSuppliedDocument(_batch.getUpdates()[0].getUpsertSupplied());
             updateRequest.setYieldPolicy(PlanExecutor::YIELD_AUTO);
-            updateRequest.setHint(_batch.getUpdates()[0].getHint());
             updateRequest.setExplain();
 
             const ExtensionsCallbackReal extensionsCallback(opCtx,

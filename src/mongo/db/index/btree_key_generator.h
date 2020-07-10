@@ -75,7 +75,8 @@ public:
      * this parameter must be set to 'false'. In this case a generic algorithm will be used, which
      * can handle both multikey and non-multikey indexes.
      */
-    void getKeys(const BSONObj& obj,
+    void getKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                 const BSONObj& obj,
                  bool skipMultikey,
                  KeyStringSet* keys,
                  MultikeyPaths* multikeyPaths,
@@ -146,11 +147,13 @@ private:
 
     /**
      * This recursive method does the heavy-lifting for getKeys().
+     * It will modify 'fieldNames' and 'fixed'.
      */
-    void _getKeysWithArray(std::vector<const char*> fieldNames,
-                           std::vector<BSONElement> fixed,
+    void _getKeysWithArray(std::vector<const char*>* fieldNames,
+                           std::vector<BSONElement>* fixed,
+                           SharedBufferFragmentBuilder& pooledBufferBuilder,
                            const BSONObj& obj,
-                           KeyStringSet* keys,
+                           KeyStringSet::sequence_type* keys,
                            unsigned numNotFound,
                            const std::vector<PositionalPathInfo>& positionalInfo,
                            MultikeyPaths* multikeyPaths,
@@ -160,7 +163,8 @@ private:
      * An optimized version of the key generation algorithm to be used when it is known that 'obj'
      * doesn't contain an array value in any of the fields in the key pattern.
      */
-    void _getKeysWithoutArray(const BSONObj& obj,
+    void _getKeysWithoutArray(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                              const BSONObj& obj,
                               boost::optional<RecordId> id,
                               KeyStringSet* keys) const;
 
@@ -205,12 +209,17 @@ private:
     /**
      * Sets extracted elements in 'fixed' for field paths that we have traversed to the end.
      *
+     * fieldNamesTemp and fixedTemp are temporary vectors that will be modified by this method
+     *
      * Then calls _getKeysWithArray() recursively.
      */
-    void _getKeysArrEltFixed(std::vector<const char*>* fieldNames,
-                             std::vector<BSONElement>* fixed,
+    void _getKeysArrEltFixed(const std::vector<const char*>& fieldNames,
+                             const std::vector<BSONElement>& fixed,
+                             std::vector<const char*>* fieldNamesTemp,
+                             std::vector<BSONElement>* fixedTemp,
+                             SharedBufferFragmentBuilder& pooledBufferBuilder,
                              const BSONElement& arrEntry,
-                             KeyStringSet* keys,
+                             KeyStringSet::sequence_type* keys,
                              unsigned numNotFound,
                              const BSONElement& arrObjElt,
                              const std::set<size_t>& arrIdxs,

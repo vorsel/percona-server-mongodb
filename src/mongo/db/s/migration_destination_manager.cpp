@@ -51,6 +51,7 @@
 #include "mongo/db/ops/write_ops_exec.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/migration_util.h"
 #include "mongo/db/s/move_timing_helper.h"
@@ -344,24 +345,20 @@ Status MigrationDestinationManager::start(OperationContext* opCtx,
     invariant(!_sessionId);
     invariant(!_scopedReceiveChunk);
 
-    auto fcvVersion = serverGlobalParams.featureCompatibility.getVersion();
-    if (fcvVersion == ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo44 ||
-        fcvVersion == ServerGlobalParams::FeatureCompatibility::Version::kDowngradingTo42)
-        return Status(ErrorCodes::ConflictingOperationInProgress,
-                      "Can't receive chunk while FCV is upgrading/downgrading");
-
     _enableResumableRangeDeleter = !disableResumableRangeDeleter.load();
+
+    uassert(ErrorCodes::IllegalOperation,
+            "Resumable range deleter must be enabled or disabled on both the source and "
+            "destination shards",
+            !cloneRequest.resumableRangeDeleterDisabled() == _enableResumableRangeDeleter);
 
     _state = READY;
     _stateChangedCV.notify_all();
     _errmsg = "";
 
-    if (_enableResumableRangeDeleter) {
-        uassert(ErrorCodes::ConflictingOperationInProgress,
-                "Missing migrationId while Resumable Range Deleter is enabled",
-                cloneRequest.hasMigrationId());
+    _migrationId = cloneRequest.getMigrationId();
 
-        _migrationId = cloneRequest.getMigrationId();
+    if (_enableResumableRangeDeleter) {
         _lsid = cloneRequest.getLsid();
         _txnNumber = cloneRequest.getTxnNumber();
     }
@@ -639,7 +636,7 @@ void MigrationDestinationManager::cloneCollectionIndexesAndOptions(
         // Only attempt to drop a collection's indexes if we have valid metadata and the
         // collection is sharded.
         if (optMetadata) {
-            const auto& metadata = optMetadata->get();
+            const auto& metadata = *optMetadata;
             if (metadata.isSharded()) {
                 auto chunks = metadata.getChunks();
                 if (chunks.empty()) {
@@ -654,7 +651,9 @@ void MigrationDestinationManager::cloneCollectionIndexesAndOptions(
         // Determine which indexes exist on the local collection that don't exist on the donor's
         // collection.
         DBDirectClient client(opCtx);
-        auto indexes = client.getIndexSpecs(nss);
+        const bool includeBuildUUIDs = false;
+        const int options = 0;
+        auto indexes = client.getIndexSpecs(nss, includeBuildUUIDs, options);
         for (auto&& recipientIndex : indexes) {
             bool dropIndex = true;
             for (auto&& donorIndex : collectionOptionsAndIndexes.indexSpecs) {
@@ -833,7 +832,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx) {
           "fromShard"_attr = _fromShard,
           "epoch"_attr = _epoch,
           "sessionId"_attr = *_sessionId,
-          "migrationId"_attr = _enableResumableRangeDeleter ? _migrationId->toBSON() : BSONObj());
+          "migrationId"_attr = *_migrationId);
 
     MoveTimingHelper timing(
         outerOpCtx, "to", _nss.ns(), _min, _max, 6 /* steps */, &_errmsg, _toShard, _fromShard);
@@ -843,8 +842,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx) {
     if (initialState == ABORT) {
         LOGV2_ERROR(22013,
                     "Migration abort requested before the migration started",
-                    "migrationId"_attr =
-                        _enableResumableRangeDeleter ? _migrationId->toBSON() : BSONObj());
+                    "migrationId"_attr = *_migrationId);
         return;
     }
 
@@ -871,8 +869,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx) {
                       "scheduled for deletion",
                       "namespace"_attr = _nss.ns(),
                       "range"_attr = redact(range.toString()),
-                      "migrationId"_attr =
-                          _enableResumableRangeDeleter ? _migrationId->toBSON() : BSONObj());
+                      "migrationId"_attr = *_migrationId);
 
                 auto status = CollectionShardingRuntime::waitForClean(
                     outerOpCtx, _nss, donorCollectionOptionsAndIndexes.uuid, range);
@@ -1094,8 +1091,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx) {
                 if (getState() == ABORT) {
                     LOGV2(22002,
                           "Migration aborted while waiting for replication at catch up stage",
-                          "migrationId"_attr =
-                              _enableResumableRangeDeleter ? _migrationId->toBSON() : BSONObj());
+                          "migrationId"_attr = *_migrationId);
                     return;
                 }
 
@@ -1105,8 +1101,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx) {
                 if (i > 100) {
                     LOGV2(22003,
                           "secondaries having hard time keeping up with migrate",
-                          "migrationId"_attr =
-                              _enableResumableRangeDeleter ? _migrationId->toBSON() : BSONObj());
+                          "migrationId"_attr = *_migrationId);
                 }
 
                 sleepmillis(20);
@@ -1128,18 +1123,14 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx) {
 
         LOGV2(22004,
               "Waiting for replication to catch up before entering critical section",
-              "migrationId"_attr =
-                  _enableResumableRangeDeleter ? _migrationId->toBSON() : BSONObj());
+              "migrationId"_attr = *_migrationId);
 
         auto awaitReplicationResult = repl::ReplicationCoordinator::get(opCtx)->awaitReplication(
             opCtx, lastOpApplied, _writeConcern);
         uassertStatusOKWithContext(awaitReplicationResult.status,
                                    awaitReplicationResult.status.codeString());
 
-        LOGV2(22005,
-              "Chunk data replicated successfully.",
-              "migrationId"_attr =
-                  _enableResumableRangeDeleter ? _migrationId->toBSON() : BSONObj());
+        LOGV2(22005, "Chunk data replicated successfully.", "migrationId"_attr = *_migrationId);
     }
 
     {
@@ -1178,8 +1169,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx) {
             if (getState() == ABORT) {
                 LOGV2(22006,
                       "Migration aborted while transferring mods",
-                      "migrationId"_attr =
-                          _enableResumableRangeDeleter ? _migrationId->toBSON() : BSONObj());
+                      "migrationId"_attr = *_migrationId);
                 return;
             }
 
@@ -1301,11 +1291,12 @@ bool MigrationDestinationManager::_applyMigrateOp(OperationContext* opCtx,
                                     autoColl.getDb(),
                                     updatedDoc,
                                     &localDoc)) {
-                const auto migrationId =
-                    _enableResumableRangeDeleter ? _migrationId->toBSON() : BSONObj();
+                const auto migrationId = *_migrationId;
 
-                LOGV2_WARNING(
-                    22012,
+                // Exception will abort migration cleanly
+                LOGV2_ERROR_OPTIONS(
+                    16977,
+                    {logv2::UserAssertAfterLog()},
                     "Cannot migrate chunk because the local document {localDoc} has the same _id "
                     "as the reloaded remote document {remoteDoc}",
                     "Cannot migrate chunk because the local document has the same _id as the "
@@ -1313,13 +1304,6 @@ bool MigrationDestinationManager::_applyMigrateOp(OperationContext* opCtx,
                     "localDoc"_attr = redact(localDoc),
                     "remoteDoc"_attr = redact(updatedDoc),
                     "migrationId"_attr = migrationId);
-
-                // Exception will abort migration cleanly
-                uasserted(16977,
-                          str::stream() << "Cannot migrate chunk because the local document "
-                                        << redact(localDoc)
-                                        << " has the same _id as the reloaded remote document "
-                                        << redact(updatedDoc) << "; migrationId: " << migrationId);
             }
 
             // We are in write lock here, so sure we aren't killing
@@ -1350,8 +1334,7 @@ bool MigrationDestinationManager::_flushPendingWrites(OperationContext* opCtx,
                   "chunkMin"_attr = redact(_min),
                   "chunkMax"_attr = redact(_max),
                   "lastOpApplied"_attr = op,
-                  "migrationId"_attr =
-                      _enableResumableRangeDeleter ? _migrationId->toBSON() : BSONObj());
+                  "migrationId"_attr = *_migrationId);
         }
         return false;
     }
@@ -1362,7 +1345,7 @@ bool MigrationDestinationManager::_flushPendingWrites(OperationContext* opCtx,
           "namespace"_attr = _nss.ns(),
           "chunkMin"_attr = redact(_min),
           "chunkMax"_attr = redact(_max),
-          "migrationId"_attr = _enableResumableRangeDeleter ? _migrationId->toBSON() : BSONObj());
+          "migrationId"_attr = *_migrationId);
 
     return true;
 }
@@ -1377,8 +1360,8 @@ SharedSemiFuture<void> MigrationDestinationManager::_notePending(OperationContex
     // This can currently happen because drops and shard key refine operations aren't guaranteed to
     // be synchronized with in-migrations. The idea for checking this here is that in the future we
     // shouldn't have this problem.
-    if (!optMetadata || !(*optMetadata)->isSharded() ||
-        (*optMetadata)->getCollVersion().epoch() != _epoch) {
+    if (!optMetadata || !optMetadata->isSharded() ||
+        optMetadata->getCollVersion().epoch() != _epoch) {
         return Status{ErrorCodes::StaleShardVersion,
                       str::stream()
                           << "Not marking chunk " << redact(range.toString())
@@ -1411,8 +1394,8 @@ void MigrationDestinationManager::_forgetPending(OperationContext* opCtx, ChunkR
     // _collUuid will always be set if _notePending was called, so if it is not set, there is no
     // need to do anything. If it is set, we use it to ensure that the collection UUID has not
     // changed since the beginning of migration.
-    if (!optMetadata || !(*optMetadata)->isSharded() ||
-        (_collUuid && !(*optMetadata)->uuidMatches(*_collUuid))) {
+    if (!optMetadata || !optMetadata->isSharded() ||
+        (_collUuid && !optMetadata->uuidMatches(*_collUuid))) {
         LOGV2(22009,
               "No need to forget pending chunk {range} because the UUID for {namespace} changed",
               "No need to forget pending chunk for the requested range, because the UUID for the "

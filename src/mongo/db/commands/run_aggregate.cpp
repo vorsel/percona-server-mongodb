@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -267,12 +267,16 @@ StatusWith<StringMap<ExpressionContext::ResolvedNamespace>> resolveInvolvedNames
         return {StringMap<ExpressionContext::ResolvedNamespace>()};
     }
 
-    // We intentionally do not drop and reacquire our DB lock after resolving the view definition in
-    // order to prevent the definition for any view namespaces we've already resolved from changing.
-    // This is necessary to prevent a cycle from being formed among the view definitions cached in
-    // 'resolvedNamespaces' because we won't re-resolve a view namespace we've already encountered.
-    AutoGetDb autoDb(opCtx, request.getNamespaceString().db(), MODE_IS);
-    Database* const db = autoDb.getDb();
+    // We intentionally do not drop and reacquire our system.views collection lock after resolving
+    // the view definition in order to prevent the definition for any view namespaces we've already
+    // resolved from changing. This is necessary to prevent a cycle from being formed among the view
+    // definitions cached in 'resolvedNamespaces' because we won't re-resolve a view namespace we've
+    // already encountered.
+    AutoGetCollection autoColl(opCtx,
+                               NamespaceString(request.getNamespaceString().db(),
+                                               NamespaceString::kSystemDotViewsCollectionName),
+                               MODE_IS);
+    Database* const db = autoColl.getDb();
     ViewCatalog* viewCatalog = db ? ViewCatalog::get(db) : nullptr;
 
     std::deque<NamespaceString> involvedNamespacesQueue(pipelineInvolvedNamespaces.begin(),
@@ -371,7 +375,8 @@ boost::intrusive_ptr<ExpressionContext> makeExpressionContext(
                               std::move(collator),
                               MongoProcessInterface::create(opCtx),
                               uassertStatusOK(resolveInvolvedNamespaces(opCtx, request)),
-                              uuid);
+                              uuid,
+                              CurOp::get(opCtx)->dbProfileLevel() > 0);
     expCtx->tempDir = storageGlobalParams.dbpath + "/_tmp";
     expCtx->inMultiDocumentTransaction = opCtx->inMultiDocumentTransaction();
 

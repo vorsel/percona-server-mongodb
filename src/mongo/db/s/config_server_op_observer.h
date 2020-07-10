@@ -56,7 +56,6 @@ public:
                            CollectionUUID collUUID,
                            const UUID& indexBuildUUID,
                            const std::vector<BSONObj>& indexes,
-                           const CommitQuorumOptions& commitQuorum,
                            bool fromMigrate) override {}
 
     void onStartIndexBuildSinglePhase(OperationContext* opCtx,
@@ -115,7 +114,7 @@ public:
                    OptionalCollectionUUID uuid,
                    const BSONObj& collModCmd,
                    const CollectionOptions& oldCollOptions,
-                   boost::optional<TTLCollModInfo> ttlInfo) override {}
+                   boost::optional<IndexCollModInfo> indexInfo) override {}
 
     void onDropDatabase(OperationContext* opCtx, const std::string& dbName) override {}
 

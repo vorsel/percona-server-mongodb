@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -157,7 +157,8 @@ Status modifyRecoveryDocument(OperationContext* opCtx,
                     "Changing sharding recovery document",
                     "update"_attr = redact(updateObj));
 
-        UpdateRequest updateReq(NamespaceString::kServerConfigurationNamespace);
+        auto updateReq = UpdateRequest();
+        updateReq.setNamespaceString(NamespaceString::kServerConfigurationNamespace);
         updateReq.setQuery(RecoveryDocument::getQuery());
         updateReq.setUpdateModification(updateObj);
         updateReq.setUpsert();

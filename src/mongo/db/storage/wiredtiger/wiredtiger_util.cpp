@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -422,6 +422,15 @@ int mdb_handle_error_with_startup_suppression(WT_EVENT_HANDLER* handler,
             // the state of the data files before FCV can be read. Suppress the error messages
             // regarding expected version compatibility requirements.
             if (sd.find("Version incompatibility detected:") != std::string::npos) {
+                return 0;
+            }
+
+            // WT shipped with MongoDB 4.4 can read data left behind by 4.0, but cannot write 4.0
+            // compatible data. Instead of forcing an upgrade on the user, it refuses to start up
+            // with this error string.
+            if (sd.find("WiredTiger version incompatible with current binary") !=
+                std::string::npos) {
+                wtHandler->setWtIncompatible();
                 return 0;
             }
         }

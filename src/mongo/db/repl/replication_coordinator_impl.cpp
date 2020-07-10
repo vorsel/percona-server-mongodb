@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #define LOGV2_FOR_ELECTION(ID, DLEVEL, MESSAGE, ...) \
     LOGV2_DEBUG_OPTIONS(                             \
@@ -38,6 +38,7 @@
 #include "mongo/db/repl/replication_coordinator_impl.h"
 
 #include <algorithm>
+#include <fmt/format.h>
 #include <functional>
 #include <limits>
 
@@ -124,6 +125,7 @@ MONGO_FAIL_POINT_DEFINE(skipDurableTimestampUpdates);
 MONGO_FAIL_POINT_DEFINE(omitConfigQuorumCheck);
 // Will cause signal drain complete to hang after reconfig
 MONGO_FAIL_POINT_DEFINE(hangAfterReconfigOnDrainComplete);
+MONGO_FAIL_POINT_DEFINE(doNotRemoveNewlyAddedOnHeartbeats);
 
 // Number of times we tried to go live as a secondary.
 Counter64 attemptsToBecomeSecondary;
@@ -144,6 +146,15 @@ ServerStatusMetricField<Counter64> displayUserOpsKilled("repl.stateTransition.us
 Counter64 userOpsRunning;
 ServerStatusMetricField<Counter64> displayUserOpsRunning(
     "repl.stateTransition.userOperationsRunning", &userOpsRunning);
+
+// Tracks the number of times we have successfully performed automatic reconfigs to remove
+// 'newlyAdded' fields.
+Counter64 numAutoReconfigsForRemovalOfNewlyAddedFields;
+ServerStatusMetricField<Counter64> displayNumAutoReconfigs(
+    "repl.reconfig.numAutoReconfigsForRemovalOfNewlyAddedFields",
+    &numAutoReconfigsForRemovalOfNewlyAddedFields);
+
+using namespace fmt::literals;
 
 using CallbackArgs = executor::TaskExecutor::CallbackArgs;
 using CallbackFn = executor::TaskExecutor::CallbackFn;
@@ -535,9 +546,9 @@ void ReplicationCoordinatorImpl::_createHorizonTopologyChangePromiseMapping(With
     auto horizonMappings = _rsConfig.getMemberAt(_selfIndex).getHorizonMappings();
     // Create a new horizon to promise mapping since it is possible for the horizons
     // to change after a replica set reconfig.
-    _horizonToPromiseMap.clear();
+    _horizonToTopologyChangePromiseMap.clear();
     for (auto const& [horizon, hostAndPort] : horizonMappings) {
-        _horizonToPromiseMap.emplace(
+        _horizonToTopologyChangePromiseMap.emplace(
             horizon, std::make_shared<SharedPromise<std::shared_ptr<const IsMasterResponse>>>());
     }
 }
@@ -904,6 +915,14 @@ void ReplicationCoordinatorImpl::enterTerminalShutdown() {
     _inTerminalShutdown = true;
 }
 
+void ReplicationCoordinatorImpl::enterQuiesceMode() {
+    stdx::lock_guard lk(_mutex);
+    _inQuiesceMode = true;
+
+    // Increment the topology version and respond to all waiting isMaster requests with an error.
+    _fulfillTopologyChangePromise(lk);
+}
+
 void ReplicationCoordinatorImpl::shutdown(OperationContext* opCtx) {
     // Shutdown must:
     // * prevent new threads from blocking in awaitReplication
@@ -1135,13 +1154,19 @@ void ReplicationCoordinatorImpl::signalDrainComplete(OperationContext* opCtx,
     {
         // If the config doesn't have a term, don't change it.
         auto needBumpConfigTerm = _rsConfig.getConfigTerm() != OpTime::kUninitializedTerm;
+        auto currConfigVersionAndTerm = _rsConfig.getConfigVersionAndTerm();
         lk.unlock();
 
         if (needBumpConfigTerm) {
             // We re-write the term but keep version the same. This conceptually a no-op
             // in the config consensus group, analogous to writing a new oplog entry
             // in Raft log state machine on step up.
-            auto getNewConfig = [&](const ReplSetConfig& oldConfig, long long primaryTerm) {
+            auto getNewConfig = [&](const ReplSetConfig& oldConfig,
+                                    long long primaryTerm) -> StatusWith<ReplSetConfig> {
+                if (oldConfig.getConfigVersionAndTerm() != currConfigVersionAndTerm) {
+                    return {ErrorCodes::ConfigurationInProgress,
+                            "reconfig on step up was preempted by another reconfig"};
+                }
                 auto config = oldConfig;
                 config.setConfigTerm(primaryTerm);
                 return config;
@@ -1652,9 +1677,13 @@ Status ReplicationCoordinatorImpl::_waitUntilClusterTimeForRead(OperationContext
     // ensures the recency guarantee for the afterClusterTime read. At the end of the command, we
     // will wait for the lastApplied optime to become majority committed, which then satisfies the
     // durability guarantee.
-    const bool isMajorityCommittedRead =
-        readConcern.getLevel() == ReadConcernLevel::kMajorityReadConcern &&
-        !readConcern.isSpeculativeMajority() && !opCtx->inMultiDocumentTransaction();
+    //
+    // Majority and snapshot reads outside of transactions should non-speculatively wait for the
+    // majority committed snapshot.
+    const bool isMajorityCommittedRead = !readConcern.isSpeculativeMajority() &&
+        !opCtx->inMultiDocumentTransaction() &&
+        (readConcern.getLevel() == ReadConcernLevel::kMajorityReadConcern ||
+         readConcern.getLevel() == ReadConcernLevel::kSnapshotReadConcern);
 
     if (isMajorityCommittedRead) {
         return _waitUntilMajorityOpTime(opCtx, targetOpTime, deadline);
@@ -1766,8 +1795,8 @@ bool ReplicationCoordinatorImpl::isCommitQuorumSatisfied(
     StringData patternName;
     if (commitQuorum.mode == CommitQuorumOptions::kMajority) {
         patternName = ReplSetConfig::kMajorityWriteConcernModeName;
-    } else if (commitQuorum.mode == CommitQuorumOptions::kAll) {
-        patternName = ReplSetConfig::kAllWriteConcernModeName;
+    } else if (commitQuorum.mode == CommitQuorumOptions::kVotingMembers) {
+        patternName = ReplSetConfig::kVotingMembersWriteConcernModeName;
     } else {
         patternName = commitQuorum.mode;
     }
@@ -2088,12 +2117,22 @@ void ReplicationCoordinatorImpl::updateAndLogStateTransitionMetrics(
 }
 
 std::shared_ptr<IsMasterResponse> ReplicationCoordinatorImpl::_makeIsMasterResponse(
-    const StringData horizonString, WithLock lock) const {
+    boost::optional<StringData> horizonString, WithLock lock, const bool hasValidConfig) const {
+    if (!hasValidConfig) {
+        auto response = std::make_shared<IsMasterResponse>();
+        response->setTopologyVersion(_topCoord->getTopologyVersion());
+        response->markAsNoConfig();
+        return response;
+    }
+
+    // horizonString must be passed in if we are a valid member of the config.
+    invariant(horizonString);
     auto response = std::make_shared<IsMasterResponse>();
     invariant(getSettings().usingReplSets());
-    _topCoord->fillIsMasterForReplSet(response, horizonString);
+    _topCoord->fillIsMasterForReplSet(response, *horizonString);
 
     OpTime lastOpTime = _getMyLastAppliedOpTime_inlock();
+
     response->setLastWrite(lastOpTime, lastOpTime.getTimestamp().getSecs());
     if (_currentCommittedSnapshot) {
         response->setLastMajorityWrite(_currentCommittedSnapshot->opTime,
@@ -2117,43 +2156,27 @@ SharedSemiFuture<ReplicationCoordinatorImpl::SharedIsMasterResponse>
 ReplicationCoordinatorImpl::_getIsMasterResponseFuture(
     WithLock lk,
     const SplitHorizon::Parameters& horizonParams,
-    boost::optional<TopologyVersion> clientTopologyVersion) const {
+    boost::optional<StringData> horizonString,
+    boost::optional<TopologyVersion> clientTopologyVersion) {
 
-    const MemberState myState = _topCoord->getMemberState();
-    if (!_rsConfig.isInitialized() || myState.removed()) {
-        // It is possible the SplitHorizon mappings have not been initialized yet for a member
-        // config. We also clear the horizon mappings for nodes that are no longer part of the
-        // config.
-        auto response = std::make_shared<IsMasterResponse>();
-        response->setTopologyVersion(_topCoord->getTopologyVersion());
-        response->markAsNoConfig();
-        return SharedSemiFuture<SharedIsMasterResponse>(
-            SharedIsMasterResponse(std::move(response)));
-    }
+    uassert(ErrorCodes::ShutdownInProgress,
+            "The server is in quiesce mode and will shut down",
+            !_inQuiesceMode);
 
-    const auto& self = _rsConfig.getMemberAt(_selfIndex);
-    // determineHorizon falls back to kDefaultHorizon if the server does not know of the given
-    // horizon.
-    const StringData horizonString = self.determineHorizon(horizonParams);
+    const bool hasValidConfig = horizonString != boost::none;
+
     if (!clientTopologyVersion) {
         // The client is not using awaitable isMaster so we respond immediately.
         return SharedSemiFuture<SharedIsMasterResponse>(
-            SharedIsMasterResponse(_makeIsMasterResponse(horizonString, lk)));
+            SharedIsMasterResponse(_makeIsMasterResponse(horizonString, lk, hasValidConfig)));
     }
-
-    // Each awaitable isMaster will wait on their specific horizon. We always expect horizonString
-    // to exist in _horizonToPromiseMap.
-    auto horizonIter = _horizonToPromiseMap.find(horizonString);
-    invariant(horizonIter != end(_horizonToPromiseMap));
-    SharedSemiFuture<std::shared_ptr<const IsMasterResponse>> future =
-        horizonIter->second->getFuture();
 
     const TopologyVersion topologyVersion = _topCoord->getTopologyVersion();
     if (clientTopologyVersion->getProcessId() != topologyVersion.getProcessId()) {
         // Getting a different process id indicates that the server has restarted so we return
         // immediately with the updated process id.
         return SharedSemiFuture<SharedIsMasterResponse>(
-            SharedIsMasterResponse(_makeIsMasterResponse(horizonString, lk)));
+            SharedIsMasterResponse(_makeIsMasterResponse(horizonString, lk, hasValidConfig)));
     }
 
     auto prevCounter = clientTopologyVersion->getCounter();
@@ -2168,38 +2191,64 @@ ReplicationCoordinatorImpl::_getIsMasterResponseFuture(
         // The received isMaster command contains a stale topology version so we respond
         // immediately with a more current topology version.
         return SharedSemiFuture<SharedIsMasterResponse>(
-            SharedIsMasterResponse(_makeIsMasterResponse(horizonString, lk)));
+            SharedIsMasterResponse(_makeIsMasterResponse(horizonString, lk, hasValidConfig)));
     }
 
-    return future;
+    if (!hasValidConfig) {
+        // An empty SNI will correspond to kDefaultHorizon.
+        const auto sni = horizonParams.sniName ? *horizonParams.sniName : "";
+        auto sniIter =
+            _sniToValidConfigPromiseMap
+                .emplace(sni,
+                         std::make_shared<SharedPromise<std::shared_ptr<const IsMasterResponse>>>())
+                .first;
+        return sniIter->second->getFuture();
+    }
+    // Each awaitable isMaster will wait on their specific horizon. We always expect horizonString
+    // to exist in _horizonToTopologyChangePromiseMap.
+    auto horizonIter = _horizonToTopologyChangePromiseMap.find(*horizonString);
+    invariant(horizonIter != end(_horizonToTopologyChangePromiseMap));
+    return horizonIter->second->getFuture();
 }
 
 SharedSemiFuture<ReplicationCoordinatorImpl::SharedIsMasterResponse>
 ReplicationCoordinatorImpl::getIsMasterResponseFuture(
     const SplitHorizon::Parameters& horizonParams,
-    boost::optional<TopologyVersion> clientTopologyVersion) const {
+    boost::optional<TopologyVersion> clientTopologyVersion) {
     stdx::lock_guard lk(_mutex);
-    return _getIsMasterResponseFuture(lk, horizonParams, clientTopologyVersion);
+    const auto horizonString = _getHorizonString(lk, horizonParams);
+    return _getIsMasterResponseFuture(lk, horizonParams, horizonString, clientTopologyVersion);
+}
+
+boost::optional<StringData> ReplicationCoordinatorImpl::_getHorizonString(
+    WithLock, const SplitHorizon::Parameters& horizonParams) const {
+    const auto myState = _topCoord->getMemberState();
+    const bool hasValidConfig = _rsConfig.isInitialized() && !myState.removed();
+    boost::optional<StringData> horizonString;
+    if (hasValidConfig) {
+        const auto& self = _rsConfig.getMemberAt(_selfIndex);
+        horizonString = self.determineHorizon(horizonParams);
+    }
+    // A horizonString that is boost::none indicates that we do not have a valid config.
+    return horizonString;
 }
 
 std::shared_ptr<const IsMasterResponse> ReplicationCoordinatorImpl::awaitIsMasterResponse(
     OperationContext* opCtx,
     const SplitHorizon::Parameters& horizonParams,
     boost::optional<TopologyVersion> clientTopologyVersion,
-    boost::optional<Date_t> deadline) const {
+    boost::optional<Date_t> deadline) {
     stdx::unique_lock lk(_mutex);
 
-    auto future = _getIsMasterResponseFuture(lk, horizonParams, clientTopologyVersion);
+    const auto horizonString = _getHorizonString(lk, horizonParams);
+    auto future =
+        _getIsMasterResponseFuture(lk, horizonParams, horizonString, clientTopologyVersion);
     if (future.isReady()) {
         return future.get();
     }
 
     // If clientTopologyVersion is not none, deadline must also be not none.
     invariant(deadline);
-    const auto myState = _topCoord->getMemberState();
-    invariant(_rsConfig.isInitialized() && !myState.removed());
-    const auto& self = _rsConfig.getMemberAt(_selfIndex);
-    const StringData horizonString = self.determineHorizon(horizonParams);
     const TopologyVersion topologyVersion = _topCoord->getTopologyVersion();
     lk.unlock();
 
@@ -2232,7 +2281,10 @@ std::shared_ptr<const IsMasterResponse> ReplicationCoordinatorImpl::awaitIsMaste
         // a topology change.
         stdx::lock_guard lk(_mutex);
         IsMasterMetrics::get(opCtx)->decrementNumAwaitingTopologyChanges();
-        return _makeIsMasterResponse(horizonString, lk);
+        // A topology change has not occured within the deadline so horizonString is still a good
+        // indicator of whether we have a valid config.
+        const bool hasValidConfig = horizonString != boost::none;
+        return _makeIsMasterResponse(horizonString, lk, hasValidConfig);
     }
 
     // A topology change has happened so we return an IsMasterResponse with the updated
@@ -2330,10 +2382,21 @@ BSONObj ReplicationCoordinatorImpl::runCmdOnPrimaryAndAwaitResponse(
     uassertStatusOK(scheduleResult.getStatus());
     CallbackHandle cbkHandle = scheduleResult.getValue();
 
-    onRemoteCmdScheduled(cbkHandle);
+    try {
+        onRemoteCmdScheduled(cbkHandle);
 
-    // Wait for the response in an interruptible mode.
-    _replExecutor->wait(cbkHandle, opCtx);
+        // Wait for the response in an interruptible mode.
+        _replExecutor->wait(cbkHandle, opCtx);
+    } catch (const DBException&) {
+        // If waiting for the response is interrupted, then we still have a callback out and
+        // registered with the TaskExecutor to run when the response finally does come back. Since
+        // the callback references local state, cbkResponse, it would be invalid for the callback to
+        // run after leaving the this function. Therefore, we cancel the callback and wait
+        // uninterruptably for the callback to be run.
+        _replExecutor->cancel(cbkHandle);
+        _replExecutor->wait(cbkHandle);
+        throw;
+    }
 
     onRemoteCmdComplete(cbkHandle);
     uassertStatusOK(cbkResponse.status);
@@ -2975,7 +3038,7 @@ WriteConcernOptions ReplicationCoordinatorImpl::_getConfigReplicationWriteConcer
 void ReplicationCoordinatorImpl::processReplSetGetConfig(BSONObjBuilder* result,
                                                          bool commitmentStatus) {
     stdx::lock_guard<Latch> lock(_mutex);
-    result->append("config", _rsConfig.toBSON());
+    result->append("config", _rsConfig.toBSONWithoutNewlyAdded());
 
     if (commitmentStatus) {
         uassert(ErrorCodes::NotMaster,
@@ -3013,11 +3076,6 @@ void ReplicationCoordinatorImpl::cancelAndRescheduleElectionTimeout() {
 
 EventHandle ReplicationCoordinatorImpl::_processReplSetMetadata_inlock(
     const rpc::ReplSetMetadata& replMetadata) {
-    if (!enableSafeReplicaSetReconfig) {
-        if (replMetadata.getConfigVersion() != _rsConfig.getConfigVersion()) {
-            return EventHandle();
-        }
-    }
     return _updateTerm_inlock(replMetadata.getTerm());
 }
 
@@ -3124,10 +3182,9 @@ Status ReplicationCoordinatorImpl::processReplSetReconfig(OperationContext* opCt
                             long long currentTerm) -> StatusWith<ReplSetConfig> {
         ReplSetConfig newConfig;
 
-        // Only explicitly set configTerm for reconfig to this node's term if safe reconfig is
-        // enabled. Otherwise, use -1.
-        auto term = (!args.force && enableSafeReplicaSetReconfig) ? currentTerm
-                                                                  : OpTime::kUninitializedTerm;
+        // Only explicitly set configTerm to this node's term for non-force reconfigs.
+        // Otherwise, use -1.
+        auto term = (!args.force) ? currentTerm : OpTime::kUninitializedTerm;
 
         // When initializing a new config through the replSetReconfig command, ignore the term
         // field passed in through its args. Instead, use this node's term.
@@ -3187,9 +3244,8 @@ Status ReplicationCoordinatorImpl::processReplSetReconfig(OperationContext* opCt
                     if (newMem.isArbiter()) {
                         continue;
                     }
-
-                    const int newMemId = newMem.getId().getData();
-                    const auto oldMem = oldConfig.findMemberByID(newMemId);
+                    const auto newMemId = newMem.getId();
+                    const auto oldMem = oldConfig.findMemberByID(newMemId.getData());
 
                     const bool isNewVotingMember = (oldMem == nullptr && newMem.isVoter());
                     const bool isCurrentlyNewlyAdded =
@@ -3199,7 +3255,7 @@ Status ReplicationCoordinatorImpl::processReplSetReconfig(OperationContext* opCt
                     // 1) Is a new, voting node
                     // 2) Already has a 'newlyAdded' field in the old config
                     if (isNewVotingMember || isCurrentlyNewlyAdded) {
-                        newConfig.setNewlyAddedFieldForMemberAtIndex(i, true);
+                        newConfig.addNewlyAddedFieldForMember(newMemId);
                         addedNewlyAddedField = true;
                     }
                 }
@@ -3254,12 +3310,12 @@ Status ReplicationCoordinatorImpl::doReplSetReconfig(OperationContext* opCtx,
 
     invariant(_rsConfig.isInitialized());
 
-    if (!force && !_getMemberState_inlock().primary()) {
-        return Status(ErrorCodes::NotMaster,
-                      str::stream()
-                          << "replSetReconfig should only be run on PRIMARY, but my state is "
-                          << _getMemberState_inlock().toString()
-                          << "; use the \"force\" argument to override");
+    if (!force && !_readWriteAbility->canAcceptNonLocalWrites(lk)) {
+        return Status(
+            ErrorCodes::NotMaster,
+            str::stream()
+                << "Safe reconfig is only allowed on a writable PRIMARY. Current state is "
+                << _getMemberState_inlock().toString());
     }
     auto topCoordTerm = _topCoord->getTerm();
 
@@ -3267,9 +3323,9 @@ Status ReplicationCoordinatorImpl::doReplSetReconfig(OperationContext* opCtx,
     // Construct a fake OpTime that can be accepted but isn't used.
     OpTime fakeOpTime(Timestamp(1, 1), topCoordTerm);
 
-    if (!force && enableSafeReplicaSetReconfig) {
+    if (!force) {
         if (!_doneWaitingForReplication_inlock(fakeOpTime, configWriteConcern)) {
-            return Status(ErrorCodes::ConfigurationInProgress,
+            return Status(ErrorCodes::CurrentConfigNotCommittedYet,
                           str::stream()
                               << "Cannot run replSetReconfig because the current config: "
                               << _rsConfig.getConfigVersionAndTerm().toString() << " is not "
@@ -3279,8 +3335,7 @@ Status ReplicationCoordinatorImpl::doReplSetReconfig(OperationContext* opCtx,
         // Make sure that the latest committed optime from the previous config is committed in the
         // current config. If this is the initial reconfig, then we don't need to check this
         // condition, since there were no prior configs. Also, for force reconfigs we bypass this
-        // safety check condition. In any FCV < 4.4 we also bypass it to preserve client facing
-        // behavior in mixed version sets.
+        // safety check condition.
         auto isInitialReconfig = (_rsConfig.getConfigVersion() == 1);
         // If our config was installed via a "force" reconfig, we bypass the oplog commitment check.
         auto leavingForceConfig = (_rsConfig.getConfigTerm() == OpTime::kUninitializedTerm);
@@ -3296,7 +3351,7 @@ Status ReplicationCoordinatorImpl::doReplSetReconfig(OperationContext* opCtx,
                   "Oplog config commitment condition failed to be satisfied. The last committed "
                   "optime in the previous config is not committed in current config",
                   "configOplogCommitmentOpTime"_attr = configOplogCommitmentOpTime);
-            return Status(ErrorCodes::ConfigurationInProgress,
+            return Status(ErrorCodes::CurrentConfigNotCommittedYet,
                           str::stream() << "Last committed optime from previous config ("
                                         << configOplogCommitmentOpTime.toString()
                                         << ") is not committed in the current config.");
@@ -3352,14 +3407,26 @@ Status ReplicationCoordinatorImpl::doReplSetReconfig(OperationContext* opCtx,
     }
 
     LOGV2(51814, "Persisting new config to disk");
-    status = _externalState->storeLocalConfigDocument(opCtx, newConfig.toBSON());
-    if (!status.isOK()) {
-        LOGV2_ERROR(21422,
-                    "replSetReconfig failed to store config document; {error}",
-                    "replSetReconfig failed to store config document",
-                    "error"_attr = status);
-        return status;
+    {
+        Lock::GlobalLock globalLock(opCtx, LockMode::MODE_IX);
+        if (!force && !_readWriteAbility->canAcceptNonLocalWrites(opCtx)) {
+            return {ErrorCodes::NotMaster, "Stepped down when persisting new config"};
+        }
+
+        // Don't write no-op for internal and external force reconfig.
+        // For non-force reconfig, we are guaranteed the node is a writable primary.
+        status = _externalState->storeLocalConfigDocument(
+            opCtx, newConfig.toBSON(), !force /* writeOplog */);
+        if (!status.isOK()) {
+            LOGV2_ERROR(21422,
+                        "replSetReconfig failed to store config document; {error}",
+                        "replSetReconfig failed to store config document",
+                        "error"_attr = status);
+            return status;
+        }
     }
+    // Wait for durability of the new config document.
+    opCtx->recoveryUnit()->waitUntilDurable(opCtx);
 
     configStateGuard.dismiss();
     _finishReplSetReconfig(opCtx, newConfig, force, myIndex.getValue());
@@ -3442,15 +3509,19 @@ void ReplicationCoordinatorImpl::_finishReplSetReconfig(OperationContext* opCtx,
     // acquire the mutex to advance the commit point.
     _topCoord->updateLastCommittedInPrevConfig();
 
-    // On a reconfig we drop all snapshots so we don't mistakenly read from the wrong one.
-    // For example, if we change the meaning of the "committed" snapshot from applied -> durable.
-    //
-    // If the new config has the same content but different version and term, skip it, since
-    // the quorum condition is still the same.
+    // Safe reconfig guarantees that all committed entries are safe, so we can keep our commit
+    // point. One exception is when we change the meaning of the "committed" snapshot from applied
+    // -> durable. We have to drop all snapshots so we don't mistakenly read from the wrong one.
+    auto defaultDurableChanged = oldConfig.getWriteConcernMajorityShouldJournal() !=
+        newConfig.getWriteConcernMajorityShouldJournal();
+    // If the new config has the same content but different version and term, like on stepup, we
+    // don't need to drop snapshots either, since the quorum condition is still the same.
     auto newConfigCopy = newConfig;
     newConfigCopy.setConfigTerm(oldConfig.getConfigTerm());
     newConfigCopy.setConfigVersion(oldConfig.getConfigVersion());
-    if (SimpleBSONObjComparator::kInstance.evaluate(oldConfig.toBSON() != newConfigCopy.toBSON())) {
+    auto contentChanged =
+        SimpleBSONObjComparator::kInstance.evaluate(oldConfig.toBSON() != newConfigCopy.toBSON());
+    if (defaultDurableChanged || (isForceReconfig && contentChanged)) {
         _dropAllSnapshots_inlock();
     }
 
@@ -3461,8 +3532,16 @@ void ReplicationCoordinatorImpl::_finishReplSetReconfig(OperationContext* opCtx,
     IndexBuildsCoordinator::get(opCtx)->onReplicaSetReconfig();
 }
 
-Status ReplicationCoordinatorImpl::awaitConfigCommitment(OperationContext* opCtx) {
+Status ReplicationCoordinatorImpl::awaitConfigCommitment(OperationContext* opCtx,
+                                                         bool waitForOplogCommitment) {
     stdx::unique_lock<Latch> lk(_mutex);
+    // Check writable primary before waiting.
+    if (!_readWriteAbility->canAcceptNonLocalWrites(lk)) {
+        return {
+            ErrorCodes::PrimarySteppedDown,
+            "replSetReconfig should only be run on a writable PRIMARY. Current state {};"_format(
+                _memberState.toString())};
+    }
     auto configOplogCommitmentOpTime = _topCoord->getConfigOplogCommitmentOpTime();
     auto oplogWriteConcern = _getOplogCommitmentWriteConcern(lk);
     OpTime fakeOpTime(Timestamp(1, 1), _topCoord->getTerm());
@@ -3473,39 +3552,123 @@ Status ReplicationCoordinatorImpl::awaitConfigCommitment(OperationContext* opCtx
     LOGV2(4508702, "Waiting for the current config to propagate to a majority of nodes.");
     StatusAndDuration configAwaitStatus =
         awaitReplication(opCtx, fakeOpTime, _getConfigReplicationWriteConcern());
+
+    logv2::DynamicAttributes attr;
+    attr.add("configVersion", currConfig.getConfigVersion());
+    attr.add("configTerm", currConfig.getConfigTerm());
+    attr.add("configWaitDuration", configAwaitStatus.duration);
     if (!configAwaitStatus.status.isOK()) {
+        LOGV2_WARNING(4714200, "Current config hasn't propagated to a majority of nodes", attr);
         std::stringstream ss;
         ss << "Current config with " << currConfig.getConfigVersionAndTerm().toString()
-           << " did not propagate to a majority of nodes.";
+           << " has not yet propagated to a majority of nodes";
         return configAwaitStatus.status.withContext(ss.str());
     }
 
-    // Wait for the latest committed optime in the previous config to be committed in the current
-    // config.
+    if (!waitForOplogCommitment) {
+        LOGV2(4689401, "Propagated current replica set config to a majority of nodes", attr);
+        return Status::OK();
+    }
+
+    // Wait for the latest committed optime in the previous config to be committed in the
+    // current config.
     LOGV2(51815,
           "Waiting for the last committed optime in the previous config "
-          "({configOplogCommitmentOpTime}) to be committed in the current config.",
+          "to be committed in the current config.",
           "configOplogCommitmentOpTime"_attr = configOplogCommitmentOpTime);
     StatusAndDuration oplogAwaitStatus =
         awaitReplication(opCtx, configOplogCommitmentOpTime, oplogWriteConcern);
+    attr.add("oplogWaitDuration", oplogAwaitStatus.duration);
+    attr.add("configOplogCommitmentOpTime", configOplogCommitmentOpTime);
     if (!oplogAwaitStatus.status.isOK()) {
+        LOGV2_WARNING(4714201,
+                      "Last committed optime in previous config isn't committed in current config",
+                      attr);
         std::stringstream ss;
         ss << "Last committed optime in the previous config ("
            << configOplogCommitmentOpTime.toString()
-           << ") did not become committed in the current config.";
+           << ") has not yet become committed in the current config with "
+           << currConfig.getConfigVersionAndTerm().toString();
         return oplogAwaitStatus.status.withContext(ss.str());
     }
-
-    LOGV2(4508701,
-          "Committed current replica set config",
-          "configVersion"_attr = currConfig.getConfigVersion(),
-          "configTerm"_attr = currConfig.getConfigTerm(),
-          "configWaitDuration"_attr = configAwaitStatus.duration,
-          "oplogWaitDuration"_attr = oplogAwaitStatus.duration,
-          "configOplogCommitmentOpTime"_attr = configOplogCommitmentOpTime);
+    LOGV2(4508701, "The current replica set config is committed", attr);
     return Status::OK();
 }
 
+
+void ReplicationCoordinatorImpl::_reconfigToRemoveNewlyAddedField(
+    const executor::TaskExecutor::CallbackArgs& cbData,
+    MemberId memberId,
+    ConfigVersionAndTerm versionAndTerm) {
+    if (cbData.status == ErrorCodes::CallbackCanceled) {
+        LOGV2_DEBUG(4634502,
+                    2,
+                    "Failed to remove 'newlyAdded' config field",
+                    "memberId"_attr = memberId.getData(),
+                    "error"_attr = cbData.status);
+        // We will retry on the next heartbeat.
+        return;
+    }
+
+    if (MONGO_unlikely(doNotRemoveNewlyAddedOnHeartbeats.shouldFail())) {
+        LOGV2(
+            4709200,
+            "Not removing 'newlyAdded' field due to 'doNotremoveNewlyAddedOnHeartbeats' failpoint",
+            "memberId"_attr = memberId.getData());
+        return;
+    }
+
+    LOGV2(4634505,
+          "Beginning automatic reconfig to remove 'newlyAdded' config field",
+          "memberId"_attr = memberId.getData());
+
+    auto getNewConfig = [&](const repl::ReplSetConfig& oldConfig,
+                            long long term) -> StatusWith<ReplSetConfig> {
+        // Even though memberIds should properly identify nodes across config changes, to be safe we
+        // only want to do an automatic reconfig where the base config is the one that specified
+        // this memberId.
+        if (oldConfig.getConfigVersionAndTerm() != versionAndTerm) {
+            return Status(ErrorCodes::StaleConfig,
+                          str::stream()
+                              << "Current config is no longer consistent with heartbeat "
+                                 "data. Current config version: "
+                              << oldConfig.getConfigVersionAndTerm().toString()
+                              << ", heartbeat data config version: " << versionAndTerm.toString());
+        }
+
+        auto newConfig = oldConfig;
+        newConfig.setConfigVersion(newConfig.getConfigVersion() + 1);
+
+        const auto hasNewlyAddedField =
+            oldConfig.findMemberByID(memberId.getData())->isNewlyAdded();
+        if (!hasNewlyAddedField) {
+            return Status(ErrorCodes::NoSuchKey, "Old config no longer has 'newlyAdded' field");
+        }
+
+        newConfig.removeNewlyAddedFieldForMember(memberId);
+        return newConfig;
+    };
+
+    auto opCtx = cc().makeOperationContext();
+    auto status = doReplSetReconfig(opCtx.get(), getNewConfig, false /* force */);
+
+    if (!status.isOK()) {
+        LOGV2_DEBUG(4634503,
+                    2,
+                    "Failed to remove 'newlyAdded' config field",
+                    "memberId"_attr = memberId.getData(),
+                    "error"_attr = status);
+        // It is safe to do nothing here as we will retry this on the next heartbeat, or we may
+        // instead find out the reconfig already took place and is no longer necessary.
+        return;
+    }
+
+    numAutoReconfigsForRemovalOfNewlyAddedFields.increment(1);
+
+    // We intentionally do not wait for config commitment. If the config does not get committed, we
+    // will try again on the next heartbeat.
+    LOGV2(4634504, "Removed 'newlyAdded' config field", "memberId"_attr = memberId.getData());
+}
 
 Status ReplicationCoordinatorImpl::processReplSetInitiate(OperationContext* opCtx,
                                                           const BSONObj& configObj,
@@ -3621,7 +3784,6 @@ Status ReplicationCoordinatorImpl::processReplSetInitiate(OperationContext* opCt
         _shouldSetStableTimestamp = true;
         _setStableTimestampForStorage(lk);
     }
-
     _finishReplSetInitiate(opCtx, newConfig, myIndex.getValue());
 
     // A configuration passed to replSetInitiate() with the current node as an arbiter
@@ -3652,28 +3814,93 @@ void ReplicationCoordinatorImpl::_setConfigState_inlock(ConfigState newState) {
     }
 }
 
-bool ReplicationCoordinatorImpl::_haveHorizonsChanged(const ReplSetConfig& oldConfig,
-                                                      const ReplSetConfig& newConfig,
-                                                      int oldIndex,
-                                                      int newIndex) {
-    if (oldIndex < 0 || newIndex < 0) {
-        // It's possible for index to be -1 if we are performing a reconfig via heartbeat.
-        return false;
+void ReplicationCoordinatorImpl::_errorOnPromisesIfHorizonChanged(WithLock lk,
+                                                                  OperationContext* opCtx,
+                                                                  const ReplSetConfig& oldConfig,
+                                                                  const ReplSetConfig& newConfig,
+                                                                  int oldIndex,
+                                                                  int newIndex) {
+    if (newIndex < 0) {
+        // When a node is removed, always return an isMaster response indicating the server has no
+        // config set.
+        return;
     }
-    const auto oldHorizonMappings = oldConfig.getMemberAt(oldIndex).getHorizonMappings();
-    const auto newHorizonMappings = newConfig.getMemberAt(newIndex).getHorizonMappings();
-    return oldHorizonMappings != newHorizonMappings;
+
+    // We were previously removed but are now rejoining the replica set.
+    if (_memberState.removed()) {
+        // Reply with an error to isMaster requests received while the node had an invalid config.
+        invariant(_horizonToTopologyChangePromiseMap.empty());
+
+        for (const auto& [sni, promise] : _sniToValidConfigPromiseMap) {
+            promise->setError({ErrorCodes::SplitHorizonChange,
+                               "Received a reconfig that changed the horizon mappings."});
+        }
+        _sniToValidConfigPromiseMap.clear();
+        IsMasterMetrics::get(opCtx)->resetNumAwaitingTopologyChanges();
+    }
+
+    if (oldIndex >= 0 && newIndex >= 0) {
+        invariant(_sniToValidConfigPromiseMap.empty());
+
+        const auto oldHorizonMappings = oldConfig.getMemberAt(oldIndex).getHorizonMappings();
+        const auto newHorizonMappings = newConfig.getMemberAt(newIndex).getHorizonMappings();
+        if (oldHorizonMappings != newHorizonMappings) {
+            for (const auto& [horizon, promise] : _horizonToTopologyChangePromiseMap) {
+                promise->setError({ErrorCodes::SplitHorizonChange,
+                                   "Received a reconfig that changed the horizon mappings."});
+            }
+            _createHorizonTopologyChangePromiseMapping(lk);
+            IsMasterMetrics::get(opCtx)->resetNumAwaitingTopologyChanges();
+        }
+    }
 }
 
 void ReplicationCoordinatorImpl::_fulfillTopologyChangePromise(WithLock lock) {
     _topCoord->incrementTopologyVersion();
     _cachedTopologyVersionCounter.store(_topCoord->getTopologyVersion().getCounter());
+    const auto myState = _topCoord->getMemberState();
+    const bool hasValidConfig = _rsConfig.isInitialized() && !myState.removed();
     // Create an isMaster response for each horizon the server is knowledgeable about.
-    for (auto iter = _horizonToPromiseMap.begin(); iter != _horizonToPromiseMap.end(); iter++) {
-        auto response = _makeIsMasterResponse(iter->first, lock);
-        // Fulfill the promise and replace with a new one for future waiters.
-        iter->second->emplaceValue(response);
-        iter->second = std::make_shared<SharedPromise<std::shared_ptr<const IsMasterResponse>>>();
+    for (auto iter = _horizonToTopologyChangePromiseMap.begin();
+         iter != _horizonToTopologyChangePromiseMap.end();
+         iter++) {
+        if (_inQuiesceMode) {
+            iter->second->setError({ErrorCodes::ShutdownInProgress,
+                                    "The server is in quiesce mode and will shut down"});
+        } else {
+            StringData horizonString = iter->first;
+            auto response = _makeIsMasterResponse(horizonString, lock, hasValidConfig);
+            // Fulfill the promise and replace with a new one for future waiters.
+            iter->second->emplaceValue(response);
+            iter->second =
+                std::make_shared<SharedPromise<std::shared_ptr<const IsMasterResponse>>>();
+        }
+    }
+    if (_selfIndex >= 0 && !_sniToValidConfigPromiseMap.empty()) {
+        // We are joining the replica set for the first time. Send back an error to isMaster
+        // requests that are waiting on a horizon that does not exist in the new config. Otherwise,
+        // reply with an updated isMaster response.
+        const auto& reverseHostMappings =
+            _rsConfig.getMemberAt(_selfIndex).getHorizonReverseHostMappings();
+        for (const auto& [sni, promise] : _sniToValidConfigPromiseMap) {
+            const auto iter = reverseHostMappings.find(sni);
+            if (!sni.empty() && iter == end(reverseHostMappings)) {
+                promise->setError({ErrorCodes::SplitHorizonChange,
+                                   "The original request horizon parameter does not exist in the "
+                                   "current replica set config"});
+            } else {
+                const auto horizon = sni.empty() ? SplitHorizon::kDefaultHorizon : iter->second;
+                const auto response = _makeIsMasterResponse(horizon, lock, hasValidConfig);
+                promise->emplaceValue(response);
+            }
+        }
+        _sniToValidConfigPromiseMap.clear();
+    }
+    IsMasterMetrics::get(getGlobalServiceContext())->resetNumAwaitingTopologyChanges();
+
+    if (_inQuiesceMode) {
+        // No more isMaster requests will wait for a topology change, so clear _horizonToPromiseMap.
+        _horizonToTopologyChangePromiseMap.clear();
     }
 }
 
@@ -3696,7 +3923,6 @@ ReplicationCoordinatorImpl::_updateMemberStateFromTopologyCoordinator(WithLock l
     ON_BLOCK_EXIT([&] {
         if (_rsConfig.isInitialized()) {
             _fulfillTopologyChangePromise(lk);
-            IsMasterMetrics::get(getGlobalServiceContext())->resetNumAwaitingTopologyChanges();
         }
     });
 
@@ -4162,7 +4388,8 @@ ReplicationCoordinatorImpl::_setCurrentRSConfig(WithLock lk,
         LOGV2_OPTIONS(21391, {logv2::LogTag::kStartupWarnings}, "");
     }
 
-    const bool horizonsChanged = _haveHorizonsChanged(oldConfig, newConfig, _selfIndex, myIndex);
+    // If the SplitHorizon has changed, reply to all waiting isMasters with an error.
+    _errorOnPromisesIfHorizonChanged(lk, opCtx, oldConfig, newConfig, _selfIndex, myIndex);
 
     LOGV2_OPTIONS(21392,
                   {logv2::LogTag::kRS},
@@ -4177,18 +4404,6 @@ ReplicationCoordinatorImpl::_setCurrentRSConfig(WithLock lk,
               "hostAndPort"_attr = _rsConfig.getMemberAt(_selfIndex).getHostAndPort());
     } else {
         LOGV2(21394, "This node is not a member of the config");
-    }
-
-    if (horizonsChanged) {
-        for (auto iter = _horizonToPromiseMap.begin(); iter != _horizonToPromiseMap.end(); iter++) {
-            iter->second->setError({ErrorCodes::SplitHorizonChange,
-                                    "Received a reconfig that changed the horizon parameters."});
-            IsMasterMetrics::get(opCtx)->resetNumAwaitingTopologyChanges();
-        }
-        if (_selfIndex >= 0) {
-            // Only create a new horizon promise mapping if the node exists in the new config.
-            _createHorizonTopologyChangePromiseMapping(lk);
-        }
     }
 
     // Wake up writeConcern waiters that are no longer satisfiable due to the rsConfig change.
@@ -4213,15 +4428,15 @@ ReplicationCoordinatorImpl::_setCurrentRSConfig(WithLock lk,
         // nodes in the set will contact us.
         _startHeartbeats_inlock();
 
-        if (_horizonToPromiseMap.empty()) {
+        if (_horizonToTopologyChangePromiseMap.empty()) {
             // We should only create a new horizon-to-promise mapping for nodes that are members of
             // the config.
             _createHorizonTopologyChangePromiseMapping(lk);
         }
     } else {
-        // Clear the horizon promise mappings of removed nodes so they can be recreated if the node
-        // later rejoins the set.
-        _horizonToPromiseMap.clear();
+        // Clear the horizon promise mappings of removed nodes so they can be recreated if the
+        // node later rejoins the set.
+        _horizonToTopologyChangePromiseMap.clear();
 
         // If we're still REMOVED, clear the seedList.
         _seedList.clear();
@@ -4448,10 +4663,11 @@ void ReplicationCoordinatorImpl::resetLastOpTimesFromOplog(OperationContext* opC
 
 bool ReplicationCoordinatorImpl::shouldChangeSyncSource(const HostAndPort& currentSource,
                                                         const rpc::ReplSetMetadata& replMetadata,
-                                                        const rpc::OplogQueryMetadata& oqMetadata) {
+                                                        const rpc::OplogQueryMetadata& oqMetadata,
+                                                        const OpTime& lastOpTimeFetched) {
     stdx::lock_guard<Latch> lock(_mutex);
     return _topCoord->shouldChangeSyncSource(
-        currentSource, replMetadata, oqMetadata, _replExecutor->now());
+        currentSource, replMetadata, oqMetadata, lastOpTimeFetched, _replExecutor->now());
 }
 
 void ReplicationCoordinatorImpl::_updateLastCommittedOpTimeAndWallTime(WithLock lk) {
@@ -4762,26 +4978,33 @@ Status ReplicationCoordinatorImpl::processReplSetRequestVotes(
                                         << _rsConfig.getNumMembers() - 1 << " inclusive");
         }
 
+        if (_selfIndex == -1) {
+            return Status(ErrorCodes::InvalidReplicaSetConfig,
+                          "Invalid replica set config, or this node is not a member");
+        }
+
         _topCoord->processReplSetRequestVotes(args, response);
 
-        const bool votedForCandidate = response->getVoteGranted();
-        const long long electionTerm = args.getTerm();
-        const Date_t lastVoteDate = _replExecutor->now();
-        const int electionCandidateMemberId =
-            _rsConfig.getMemberAt(candidateIndex).getId().getData();
-        const std::string voteReason = response->getReason();
-        const OpTime lastAppliedOpTime = _topCoord->getMyLastAppliedOpTime();
-        const OpTime maxAppliedOpTime = _topCoord->latestKnownOpTime();
-        const double priorityAtElection = _rsConfig.getMemberAt(_selfIndex).getPriority();
-        ReplicationMetrics::get(getServiceContext())
-            .setElectionParticipantMetrics(votedForCandidate,
-                                           electionTerm,
-                                           lastVoteDate,
-                                           electionCandidateMemberId,
-                                           voteReason,
-                                           lastAppliedOpTime,
-                                           maxAppliedOpTime,
-                                           priorityAtElection);
+        if (!args.isADryRun()) {
+            const bool votedForCandidate = response->getVoteGranted();
+            const long long electionTerm = args.getTerm();
+            const Date_t lastVoteDate = _replExecutor->now();
+            const int electionCandidateMemberId =
+                _rsConfig.getMemberAt(candidateIndex).getId().getData();
+            const std::string voteReason = response->getReason();
+            const OpTime lastAppliedOpTime = _topCoord->getMyLastAppliedOpTime();
+            const OpTime maxAppliedOpTime = _topCoord->latestKnownOpTime();
+            const double priorityAtElection = _rsConfig.getMemberAt(_selfIndex).getPriority();
+            ReplicationMetrics::get(getServiceContext())
+                .setElectionParticipantMetrics(votedForCandidate,
+                                               electionTerm,
+                                               lastVoteDate,
+                                               electionCandidateMemberId,
+                                               voteReason,
+                                               lastAppliedOpTime,
+                                               maxAppliedOpTime,
+                                               priorityAtElection);
+        }
     }
 
     // It's safe to store lastVote outside of _mutex. The topology coordinator grants only one

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -160,25 +160,6 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PlanExecutor::make(
                                   std::move(qs),
                                   nullptr,
                                   expCtx,
-                                  collection,
-                                  nss,
-                                  yieldPolicy);
-}
-
-StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PlanExecutor::make(
-    OperationContext* opCtx,
-    std::unique_ptr<WorkingSet> ws,
-    std::unique_ptr<PlanStage> rt,
-    const Collection* collection,
-    YieldPolicy yieldPolicy,
-    NamespaceString nss,
-    std::unique_ptr<QuerySolution> qs) {
-    return PlanExecutorImpl::make(opCtx,
-                                  std::move(ws),
-                                  std::move(rt),
-                                  std::move(qs),
-                                  nullptr,
-                                  nullptr,
                                   collection,
                                   nss,
                                   yieldPolicy);

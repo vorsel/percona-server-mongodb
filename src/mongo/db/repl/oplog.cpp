@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
@@ -152,15 +151,26 @@ bool shouldBuildInForeground(OperationContext* opCtx,
         return true;
     }
 
-    // Without hybrid builds enabled, indexes should build with the behavior of their specs.
-    bool hybrid = MultiIndexBlock::areHybridIndexBuildsEnabled();
-    if (!hybrid) {
-        return !index["background"].trueValue();
-    }
-
     return false;
 }
 
+void abortIndexBuilds(OperationContext* opCtx,
+                      const OplogEntry::CommandType& commandType,
+                      const NamespaceString& nss,
+                      const std::string& reason) {
+    auto indexBuildsCoordinator = IndexBuildsCoordinator::get(opCtx);
+    if (commandType == OplogEntry::CommandType::kDropDatabase) {
+        indexBuildsCoordinator->abortDatabaseIndexBuilds(opCtx, nss.db(), reason);
+    } else if (commandType == OplogEntry::CommandType::kDrop ||
+               commandType == OplogEntry::CommandType::kDropIndexes ||
+               commandType == OplogEntry::CommandType::kRenameCollection) {
+        const boost::optional<UUID> collUUID =
+            CollectionCatalog::get(opCtx).lookupUUIDByNSS(opCtx, nss);
+        invariant(collUUID);
+
+        indexBuildsCoordinator->abortCollectionIndexBuilds(opCtx, nss, *collUUID, reason);
+    }
+}
 
 }  // namespace
 
@@ -756,7 +766,13 @@ const StringMap<ApplyOpMetadata> kOpsMap = {
                   "Error parsing 'startIndexBuild' oplog entry");
           }
 
-          IndexBuildsCoordinator::get(opCtx)->applyStartIndexBuild(opCtx, swOplogEntry.getValue());
+          IndexBuildsCoordinator::ApplicationMode applicationMode =
+              IndexBuildsCoordinator::ApplicationMode::kNormal;
+          if (mode == OplogApplication::Mode::kInitialSync) {
+              applicationMode = IndexBuildsCoordinator::ApplicationMode::kInitialSync;
+          }
+          IndexBuildsCoordinator::get(opCtx)->applyStartIndexBuild(
+              opCtx, applicationMode, swOplogEntry.getValue());
           return Status::OK();
       },
       {ErrorCodes::IndexAlreadyExists,
@@ -774,15 +790,8 @@ const StringMap<ApplyOpMetadata> kOpsMap = {
               return swOplogEntry.getStatus().withContext(
                   "Error parsing 'commitIndexBuild' oplog entry");
           }
-          try {
-              IndexBuildsCoordinator::get(opCtx)->applyCommitIndexBuild(opCtx,
-                                                                        swOplogEntry.getValue());
-          } catch (ExceptionFor<ErrorCodes::IndexAlreadyExists>&) {
-              // TODO(SERVER-46656): We sometimes do two-phase builds of empty collections on
-              // the primary, but treat them as one-phase on the secondary.  This will result
-              // in an IndexAlreadyExists when we commit.  When SERVER-46656 is fixed we should
-              // no longer catch and ignore this error.
-          }
+          auto* indexBuildsCoordinator = IndexBuildsCoordinator::get(opCtx);
+          indexBuildsCoordinator->applyCommitIndexBuild(opCtx, swOplogEntry.getValue());
           return Status::OK();
       },
       {ErrorCodes::IndexAlreadyExists,
@@ -1213,7 +1222,8 @@ Status applyOperation_inlock(OperationContext* opCtx,
                     BSONObjBuilder b;
                     b.append(o.getField("_id"));
 
-                    UpdateRequest request(requestNss);
+                    auto request = UpdateRequest();
+                    request.setNamespaceString(requestNss);
                     request.setQuery(b.done());
                     request.setUpdateModification(o);
                     request.setUpsert();
@@ -1265,7 +1275,8 @@ Status applyOperation_inlock(OperationContext* opCtx,
 
             const bool upsertOplogEntry = op.getUpsert().value_or(false);
             const bool upsert = alwaysUpsert || upsertOplogEntry;
-            UpdateRequest request(requestNss);
+            auto request = UpdateRequest();
+            request.setNamespaceString(requestNss);
             request.setQuery(updateCriteria);
             request.setUpdateModification(o);
             request.setUpsert(upsert);
@@ -1552,10 +1563,22 @@ Status applyCommand_inlock(OperationContext* opCtx,
                 throw WriteConflictException();
             }
             case ErrorCodes::BackgroundOperationInProgressForDatabase: {
+                if (mode == OplogApplication::Mode::kInitialSync) {
+                    abortIndexBuilds(opCtx,
+                                     entry.getCommandType(),
+                                     nss,
+                                     "Aborting index builds during initial sync");
+                    LOGV2_DEBUG(4665900,
+                                1,
+                                "Conflicting DDL operation encountered during initial sync; "
+                                "aborting index build and retrying",
+                                "db"_attr = nss.db());
+                }
+
                 Lock::TempRelease release(opCtx->lockState());
 
                 BackgroundOperation::awaitNoBgOpInProgForDb(nss.db());
-                IndexBuildsCoordinator::get(opCtx)->awaitNoBgOpInProgForDb(nss.db());
+                IndexBuildsCoordinator::get(opCtx)->awaitNoBgOpInProgForDb(opCtx, nss.db());
                 opCtx->recoveryUnit()->abandonSnapshot();
                 opCtx->checkForInterrupt();
 
@@ -1570,14 +1593,25 @@ Status applyCommand_inlock(OperationContext* opCtx,
                 break;
             }
             case ErrorCodes::BackgroundOperationInProgressForNamespace: {
-                Lock::TempRelease release(opCtx->lockState());
-
                 Command* cmd = CommandHelpers::findCommand(o.firstElement().fieldName());
                 invariant(cmd);
 
-                // TODO: This parse could be expensive and not worth it.
-                auto ns =
-                    cmd->parse(opCtx, OpMsgRequest::fromDBAndBody(nss.db(), o))->ns().toString();
+                auto ns = cmd->parse(opCtx, OpMsgRequest::fromDBAndBody(nss.db(), o))->ns();
+
+                if (mode == OplogApplication::Mode::kInitialSync) {
+                    abortIndexBuilds(opCtx,
+                                     entry.getCommandType(),
+                                     ns,
+                                     "Aborting index builds during initial sync");
+                    LOGV2_DEBUG(4665901,
+                                1,
+                                "Conflicting DDL operation encountered during initial sync; "
+                                "aborting index build and retrying",
+                                "namespace"_attr = ns);
+                }
+
+                Lock::TempRelease release(opCtx->lockState());
+
                 auto swUUID = entry.getUuid();
                 if (!swUUID) {
                     LOGV2_ERROR(21261,
@@ -1589,7 +1623,7 @@ Status applyCommand_inlock(OperationContext* opCtx,
                 }
                 BackgroundOperation::awaitNoBgOpInProgForNs(ns);
                 IndexBuildsCoordinator::get(opCtx)->awaitNoIndexBuildInProgressForCollection(
-                    swUUID.get());
+                    opCtx, swUUID.get());
 
                 opCtx->recoveryUnit()->abandonSnapshot();
                 opCtx->checkForInterrupt();

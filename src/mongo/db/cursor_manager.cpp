@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -366,6 +366,11 @@ ClientCursorPin CursorManager::registerCursor(OperationContext* opCtx,
         stdx::lock_guard<Latch> lk(_opKeyMutex);
         _opKeyMap.emplace(*opKey, cursorId);
     }
+
+    // Restores the maxTimeMS provided in the cursor generating command in the case it used
+    // maxTimeMSOpOnly. This way the pinned cursor will have the leftover time consistent with the
+    // maxTimeMS.
+    opCtx->restoreMaxTimeMS();
 
     return ClientCursorPin(opCtx, unownedCursor, this);
 }

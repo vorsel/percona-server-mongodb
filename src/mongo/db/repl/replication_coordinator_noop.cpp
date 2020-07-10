@@ -41,6 +41,8 @@ void ReplicationCoordinatorNoOp::startup(OperationContext* opCtx) {}
 
 void ReplicationCoordinatorNoOp::enterTerminalShutdown() {}
 
+void ReplicationCoordinatorNoOp::enterQuiesceMode() {}
+
 void ReplicationCoordinatorNoOp::shutdown(OperationContext* opCtx) {}
 
 void ReplicationCoordinatorNoOp::markAsCleanShutdownIfPossible(OperationContext* opCtx) {}
@@ -323,7 +325,8 @@ Status ReplicationCoordinatorNoOp::doReplSetReconfig(OperationContext* opCtx,
     MONGO_UNREACHABLE;
 }
 
-Status ReplicationCoordinatorNoOp::awaitConfigCommitment(OperationContext* opCtx) {
+Status ReplicationCoordinatorNoOp::awaitConfigCommitment(OperationContext* opCtx,
+                                                         bool waitForOplogCommitment) {
     MONGO_UNREACHABLE;
 }
 
@@ -383,7 +386,8 @@ void ReplicationCoordinatorNoOp::resetLastOpTimesFromOplog(OperationContext*, Da
 
 bool ReplicationCoordinatorNoOp::shouldChangeSyncSource(const HostAndPort&,
                                                         const rpc::ReplSetMetadata&,
-                                                        const rpc::OplogQueryMetadata&) {
+                                                        const rpc::OplogQueryMetadata&,
+                                                        const OpTime&) {
     MONGO_UNREACHABLE;
 }
 
@@ -483,7 +487,7 @@ std::shared_ptr<const IsMasterResponse> ReplicationCoordinatorNoOp::awaitIsMaste
     OperationContext* opCtx,
     const SplitHorizon::Parameters& horizonParams,
     boost::optional<TopologyVersion> clientTopologyVersion,
-    boost::optional<Date_t> deadline) const {
+    boost::optional<Date_t> deadline) {
     MONGO_UNREACHABLE;
 }
 
@@ -491,7 +495,7 @@ std::shared_ptr<const IsMasterResponse> ReplicationCoordinatorNoOp::awaitIsMaste
 SharedSemiFuture<std::shared_ptr<const IsMasterResponse>>
 ReplicationCoordinatorNoOp::getIsMasterResponseFuture(
     const SplitHorizon::Parameters& horizonParams,
-    boost::optional<TopologyVersion> clientTopologyVersion) const {
+    boost::optional<TopologyVersion> clientTopologyVersion) {
     MONGO_UNREACHABLE;
 }
 
@@ -514,6 +518,10 @@ BSONObj ReplicationCoordinatorNoOp::runCmdOnPrimaryAndAwaitResponse(
     const BSONObj& cmdObj,
     OnRemoteCmdScheduledFn onRemoteCmdScheduled,
     OnRemoteCmdCompleteFn onRemoteCmdComplete) {
+    MONGO_UNREACHABLE;
+}
+
+void ReplicationCoordinatorNoOp::restartHeartbeats_forTest() {
     MONGO_UNREACHABLE;
 }
 

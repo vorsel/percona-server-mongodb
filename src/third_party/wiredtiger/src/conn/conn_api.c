@@ -882,7 +882,7 @@ __conn_load_extension_int(
     WT_ERR(__wt_dlsym(session, dlh, terminate_name, false, &dlh->terminate));
 
     WT_CLEAR(cval);
-    WT_ERR_NOTFOUND_OK(__wt_config_gets(session, cfg, "config", &cval));
+    WT_ERR_NOTFOUND_OK(__wt_config_gets(session, cfg, "config", &cval), false);
     WT_ERR(__wt_strndup(session, cval.str, cval.len, &ext_config));
     ext_cfg[0] = ext_config;
     ext_cfg[1] = NULL;
@@ -953,7 +953,7 @@ __conn_load_extensions(WT_SESSION_IMPL *session, const char *cfg[], bool early_l
         sub_cfg[1] = sval.len > 0 ? exconfig->data : NULL;
         WT_ERR(__conn_load_extension_int(session, expath->data, sub_cfg, early_load));
     }
-    WT_ERR_NOTFOUND_OK(ret);
+    WT_ERR_NOTFOUND_OK(ret, false);
 
 err:
     __wt_scr_free(session, &expath);
@@ -1039,13 +1039,10 @@ err:
      * never referenced that file.
      */
     for (s = conn->sessions, i = 0; i < conn->session_cnt; ++s, ++i)
-        if (s->active && !F_ISSET(s, WT_SESSION_INTERNAL) && F_ISSET(&s->txn, WT_TXN_RUNNING)) {
+        if (s->active && !F_ISSET(s, WT_SESSION_INTERNAL) && F_ISSET(s->txn, WT_TXN_RUNNING)) {
             wt_session = &s->iface;
             WT_TRET(wt_session->rollback_transaction(wt_session, NULL));
         }
-
-    /* Release all named snapshots. */
-    __wt_txn_named_snapshot_destroy(session);
 
     /* Close open, external sessions. */
     for (s = conn->sessions, i = 0; i < conn->session_cnt; ++s, ++i)
@@ -1064,12 +1061,6 @@ err:
     WT_TRET(__wt_txn_activity_drain(session));
 
     /*
-     * Disable lookaside eviction: it doesn't help us shut down and can lead to pages being marked
-     * dirty, causing spurious assertions to fire.
-     */
-    F_SET(conn, WT_CONN_EVICTION_NO_LOOKASIDE);
-
-    /*
      * Clear any pending async operations and shut down the async worker threads and system before
      * closing LSM.
      */
@@ -1082,11 +1073,9 @@ err:
      * After the async and LSM threads have exited, we won't open more files for the application.
      * However, the sweep server is still running and it can close file handles at the same time the
      * final checkpoint is reviewing open data handles (forcing checkpoint to reopen handles). Shut
-     * down the sweep server and then flag the system should not open anything new.
+     * down the sweep server.
      */
     WT_TRET(__wt_sweep_destroy(session));
-    F_SET(conn, WT_CONN_CLOSING_NO_MORE_OPENS);
-    WT_FULL_BARRIER();
 
     /*
      * Shut down the checkpoint and capacity server threads: we don't want to throttle writes and
@@ -1252,7 +1241,8 @@ __conn_rollback_to_stable(WT_CONNECTION *wt_conn, const char *config)
     conn = (WT_CONNECTION_IMPL *)wt_conn;
 
     CONNECTION_API_CALL(conn, session, rollback_to_stable, config, cfg);
-    WT_TRET(__wt_txn_rollback_to_stable(session, cfg));
+    WT_STAT_CONN_INCR(session, txn_rts);
+    WT_TRET(__wt_rollback_to_stable(session, cfg, false));
 err:
     API_END_RET(session, ret);
 }
@@ -1312,8 +1302,9 @@ __conn_config_check_version(WT_SESSION_IMPL *session, const char *config)
     if (vmajor.val > WIREDTIGER_VERSION_MAJOR ||
       (vmajor.val == WIREDTIGER_VERSION_MAJOR && vminor.val > WIREDTIGER_VERSION_MINOR))
         WT_RET_MSG(session, ENOTSUP,
-          "WiredTiger configuration is from an incompatible release "
-          "of the WiredTiger engine");
+          "WiredTiger configuration is from an incompatible release of the WiredTiger engine, "
+          "configuration major, minor of (%" PRId64 ", %" PRId64 "), with build (%d, %d)",
+          vmajor.val, vminor.val, WIREDTIGER_VERSION_MAJOR, WIREDTIGER_VERSION_MINOR);
 
     return (0);
 }
@@ -1847,17 +1838,18 @@ __wt_verbose_config(WT_SESSION_IMPL *session, const char *cfg[])
 {
     static const WT_NAME_FLAG verbtypes[] = {{"api", WT_VERB_API}, {"backup", WT_VERB_BACKUP},
       {"block", WT_VERB_BLOCK}, {"checkpoint", WT_VERB_CHECKPOINT},
+      {"checkpoint_gc", WT_VERB_CHECKPOINT_GC},
       {"checkpoint_progress", WT_VERB_CHECKPOINT_PROGRESS}, {"compact", WT_VERB_COMPACT},
       {"compact_progress", WT_VERB_COMPACT_PROGRESS}, {"error_returns", WT_VERB_ERROR_RETURNS},
       {"evict", WT_VERB_EVICT}, {"evict_stuck", WT_VERB_EVICT_STUCK},
       {"evictserver", WT_VERB_EVICTSERVER}, {"fileops", WT_VERB_FILEOPS},
-      {"handleops", WT_VERB_HANDLEOPS}, {"log", WT_VERB_LOG}, {"lookaside", WT_VERB_LOOKASIDE},
-      {"lookaside_activity", WT_VERB_LOOKASIDE_ACTIVITY}, {"lsm", WT_VERB_LSM},
+      {"handleops", WT_VERB_HANDLEOPS}, {"log", WT_VERB_LOG}, {"hs", WT_VERB_HS},
+      {"history_store_activity", WT_VERB_HS_ACTIVITY}, {"lsm", WT_VERB_LSM},
       {"lsm_manager", WT_VERB_LSM_MANAGER}, {"metadata", WT_VERB_METADATA},
       {"mutex", WT_VERB_MUTEX}, {"overflow", WT_VERB_OVERFLOW}, {"read", WT_VERB_READ},
       {"rebalance", WT_VERB_REBALANCE}, {"reconcile", WT_VERB_RECONCILE},
       {"recovery", WT_VERB_RECOVERY}, {"recovery_progress", WT_VERB_RECOVERY_PROGRESS},
-      {"salvage", WT_VERB_SALVAGE}, {"shared_cache", WT_VERB_SHARED_CACHE},
+      {"rts", WT_VERB_RTS}, {"salvage", WT_VERB_SALVAGE}, {"shared_cache", WT_VERB_SHARED_CACHE},
       {"split", WT_VERB_SPLIT}, {"temporary", WT_VERB_TEMPORARY},
       {"thread_group", WT_VERB_THREAD_GROUP}, {"timestamp", WT_VERB_TIMESTAMP},
       {"transaction", WT_VERB_TRANSACTION}, {"verify", WT_VERB_VERIFY},
@@ -1932,7 +1924,7 @@ __wt_verbose_dump_sessions(WT_SESSION_IMPL *session, bool show_cursors)
                   "read-committed" :
                   (s->isolation == WT_ISO_READ_UNCOMMITTED ? "read-uncommitted" : "snapshot")));
             WT_ERR(__wt_msg(session, "  Transaction:"));
-            WT_ERR(__wt_verbose_dump_txn_one(session, &s->txn, 0, NULL));
+            WT_ERR(__wt_verbose_dump_txn_one(session, s, 0, NULL));
         } else {
             WT_ERR(__wt_msg(session, "  Number of positioned cursors: %u", s->ncursors));
             TAILQ_FOREACH (cursor, &s->cursors, q) {
@@ -1987,7 +1979,7 @@ __wt_timing_stress_config(WT_SESSION_IMPL *session, const char *cfg[])
     static const WT_NAME_FLAG stress_types[] = {
       {"aggressive_sweep", WT_TIMING_STRESS_AGGRESSIVE_SWEEP},
       {"checkpoint_slow", WT_TIMING_STRESS_CHECKPOINT_SLOW},
-      {"lookaside_sweep_race", WT_TIMING_STRESS_LOOKASIDE_SWEEP},
+      {"history_store_sweep_race", WT_TIMING_STRESS_HS_SWEEP},
       {"split_1", WT_TIMING_STRESS_SPLIT_1}, {"split_2", WT_TIMING_STRESS_SPLIT_2},
       {"split_3", WT_TIMING_STRESS_SPLIT_3}, {"split_4", WT_TIMING_STRESS_SPLIT_4},
       {"split_5", WT_TIMING_STRESS_SPLIT_5}, {"split_6", WT_TIMING_STRESS_SPLIT_6},
@@ -2110,7 +2102,7 @@ __conn_write_base_config(WT_SESSION_IMPL *session, const char *cfg[])
         }
         WT_ERR(__wt_fprintf(session, fs, "%.*s=%.*s\n", (int)k.len, k.str, (int)v.len, v.str));
     }
-    WT_ERR_NOTFOUND_OK(ret);
+    WT_ERR_NOTFOUND_OK(ret, false);
 
     /* Flush the stream and rename the file into place. */
     ret = __wt_sync_and_rename(session, &fs, WT_BASECONFIG_SET, WT_BASECONFIG);
@@ -2402,8 +2394,16 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler, const char *c
 
     /*
      * Set compatibility versions early so that any subsystem sees it. Call after we own the
-     * database so that we can know if the database is new or not.
+     * database so that we can know if the database is new or not. Compatibility testing needs to
+     * know if salvage has been set, so parse that early.
      */
+    WT_ERR(__wt_config_gets(session, cfg, "salvage", &cval));
+    if (cval.val) {
+        if (F_ISSET(conn, WT_CONN_READONLY))
+            WT_ERR_MSG(session, EINVAL, "Readonly configuration incompatible with salvage");
+        F_SET(conn, WT_CONN_SALVAGE);
+    }
+
     WT_ERR(__wt_conn_compat_config(session, cfg, false));
 
     /*
@@ -2497,7 +2497,6 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler, const char *c
     }
     WT_ERR(__wt_verbose_config(session, cfg));
     WT_ERR(__wt_timing_stress_config(session, cfg));
-    __wt_btree_page_version_config(session);
 
     /* Set up operation tracking if configured. */
     WT_ERR(__wt_conn_optrack_setup(session, cfg, false));
@@ -2519,7 +2518,7 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler, const char *c
             if (sval.val)
                 FLD_SET(conn->direct_io, ft->flag);
         } else
-            WT_ERR_NOTFOUND_OK(ret);
+            WT_ERR_NOTFOUND_OK(ret, false);
     }
 
     WT_ERR(__wt_config_gets(session, cfg, "write_through", &cval));
@@ -2529,7 +2528,7 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler, const char *c
             if (sval.val)
                 FLD_SET(conn->write_through, ft->flag);
         } else
-            WT_ERR_NOTFOUND_OK(ret);
+            WT_ERR_NOTFOUND_OK(ret, false);
     }
 
     WT_ERR(__wt_config_gets(session, cfg, "buffer_alignment", &cval));
@@ -2580,21 +2579,17 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler, const char *c
                 break;
             }
         } else
-            WT_ERR_NOTFOUND_OK(ret);
+            WT_ERR_NOTFOUND_OK(ret, false);
     }
 
     WT_ERR(__wt_config_gets(session, cfg, "mmap", &cval));
     conn->mmap = cval.val != 0;
 
+    WT_ERR(__wt_config_gets(session, cfg, "mmap_all", &cval));
+    conn->mmap_all = cval.val != 0;
+
     WT_ERR(__wt_config_gets(session, cfg, "operation_timeout_ms", &cval));
     conn->operation_timeout_us = (uint64_t)(cval.val * WT_THOUSAND);
-
-    WT_ERR(__wt_config_gets(session, cfg, "salvage", &cval));
-    if (cval.val) {
-        if (F_ISSET(conn, WT_CONN_READONLY))
-            WT_ERR_MSG(session, EINVAL, "Readonly configuration incompatible with salvage");
-        F_SET(conn, WT_CONN_SALVAGE);
-    }
 
     WT_ERR(__wt_conn_statistics_config(session, cfg));
     WT_ERR(__wt_lsm_manager_config(session, cfg));
@@ -2654,13 +2649,12 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler, const char *c
     WT_ERR(__conn_write_base_config(session, cfg));
 
     /*
-     * Check on the turtle and metadata files, creating them if necessary
-     * (which avoids application threads racing to create the metadata file
-     * later).  Once the metadata file exists, get a reference to it in
-     * the connection's session.
+     * Check on the turtle and metadata files, creating them if necessary (which avoids application
+     * threads racing to create the metadata file later). Once the metadata file exists, get a
+     * reference to it in the connection's session.
      *
-     * THE TURTLE FILE MUST BE THE LAST FILE CREATED WHEN INITIALIZING THE
-     * DATABASE HOME, IT'S WHAT WE USE TO DECIDE IF WE'RE CREATING OR NOT.
+     * THE TURTLE FILE MUST BE THE LAST FILE CREATED WHEN INITIALIZING THE DATABASE HOME, IT'S WHAT
+     * WE USE TO DECIDE IF WE'RE CREATING OR NOT.
      */
     WT_ERR(__wt_turtle_init(session));
 
@@ -2672,8 +2666,8 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler, const char *c
     if (F_ISSET(conn, WT_CONN_SALVAGE))
         WT_ERR(__wt_metadata_salvage(session));
 
-    /* Set the connection's base write generation. */
-    WT_ERR(__wt_metadata_set_base_write_gen(session));
+    /* Initialize the connection's base write generation. */
+    WT_ERR(__wt_metadata_init_base_write_gen(session));
 
     WT_ERR(__wt_metadata_cursor(session, NULL));
 

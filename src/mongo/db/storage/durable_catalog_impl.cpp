@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/db/storage/durable_catalog_impl.h"
 
@@ -920,6 +920,19 @@ void DurableCatalogImpl::updateTTLSetting(OperationContext* opCtx,
     putMetaData(opCtx, catalogId, md);
 }
 
+void DurableCatalogImpl::updateHiddenSetting(OperationContext* opCtx,
+                                             RecordId catalogId,
+                                             StringData idxName,
+                                             bool hidden) {
+
+    BSONCollectionCatalogEntry::MetaData md = getMetaData(opCtx, catalogId);
+    int offset = md.findIndexOffset(idxName);
+    invariant(offset >= 0);
+    md.indexes[offset].updateHiddenSetting(hidden);
+    putMetaData(opCtx, catalogId, md);
+}
+
+
 bool DurableCatalogImpl::isEqualToMetadataUUID(OperationContext* opCtx,
                                                RecordId catalogId,
                                                OptionalCollectionUUID uuid) {
@@ -1097,7 +1110,7 @@ bool DurableCatalogImpl::setIndexIsMultikey(OperationContext* opCtx,
         // Store new path components that cause this index to be multikey in catalog's index
         // metadata.
         for (size_t i = 0; i < multikeyPaths.size(); ++i) {
-            std::set<size_t>& indexMultikeyComponents = md.indexes[offset].multikeyPaths[i];
+            MultikeyComponents& indexMultikeyComponents = md.indexes[offset].multikeyPaths[i];
             for (const auto multikeyComponent : multikeyPaths[i]) {
                 auto result = indexMultikeyComponents.insert(multikeyComponent);
                 newPathIsMultikey = newPathIsMultikey || result.second;

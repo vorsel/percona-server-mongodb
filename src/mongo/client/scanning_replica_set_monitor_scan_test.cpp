@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
@@ -1550,7 +1550,7 @@ public:
     }
 
 protected:
-    decltype(_notifier)::ListenerHandle _listener = _notifier.makeListener<Listener>();
+    std::shared_ptr<decltype(_notifier)::Listener> _listener = _notifier.makeListener<Listener>();
 
     std::shared_ptr<SetState> _state = makeState(basicUri);
 };

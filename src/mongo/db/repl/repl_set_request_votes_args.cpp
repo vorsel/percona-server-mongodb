@@ -51,27 +51,11 @@ const std::string kSetNameFieldName = "setName";
 const std::string kTermFieldName = "term";
 const std::string kVoteGrantedFieldName = "voteGranted";
 const std::string kOperationTime = "operationTime";
-
-const std::string kLegalArgsFieldNames[] = {
-    kCandidateIndexFieldName,
-    kCommandName,
-    kConfigVersionFieldName,
-    kConfigTermFieldName,
-    kDryRunFieldName,
-    kLastAppliedOpTimeFieldName,
-    kSetNameFieldName,
-    kTermFieldName,
-    kOperationTime,
-};
-
 }  // namespace
 
 
 Status ReplSetRequestVotesArgs::initialize(const BSONObj& argsObj) {
-    Status status =
-        bsonCheckOnlyHasFieldsForCommand("ReplSetRequestVotes", argsObj, kLegalArgsFieldNames);
-
-    status = bsonExtractIntegerField(argsObj, kTermFieldName, &_term);
+    Status status = bsonExtractIntegerField(argsObj, kTermFieldName, &_term);
     if (!status.isOK())
         return status;
 
@@ -83,8 +67,6 @@ Status ReplSetRequestVotesArgs::initialize(const BSONObj& argsObj) {
     if (!status.isOK())
         return status;
 
-    // In order to be compatible with FCV 4.2, default the config term to -1 if we are unable
-    // parse a configTerm field from the args.
     status = bsonExtractIntegerFieldWithDefault(
         argsObj, kConfigTermFieldName, OpTime::kUninitializedTerm, &_cfgTerm);
     if (!status.isOK())

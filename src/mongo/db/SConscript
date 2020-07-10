@@ -534,6 +534,17 @@ env.Clone().InjectModule("enterprise").Library(
 )
 
 env.Library(
+    target='client_out_of_line_executor',
+    source=[
+        'client_out_of_line_executor.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/service_context',
+    ],
+)
+
+env.Library(
     target='mirror_maestro',
     source=[
         'mirror_maestro.cpp',
@@ -544,6 +555,7 @@ env.Library(
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/executor/task_executor_interface',
         "$BUILD_DIR/mongo/rpc/protocol",
+        'client_out_of_line_executor',
         'service_context',
         "$BUILD_DIR/mongo/util/net/network",
     ],
@@ -557,6 +569,16 @@ env.Library(
         'repl/replica_set_messages',
         'repl/repl_coordinator_interface',
         'repl/topology_version_observer',
+    ],
+)
+
+env.CppUnitTest(
+    target='client_out_of_line_executor_test',
+    source=[
+        'client_out_of_line_executor_test.cpp',
+    ],
+    LIBDEPS=[
+        'client_out_of_line_executor',
     ],
 )
 
@@ -888,8 +910,6 @@ env.Library(
 env.Library(
     target="index_builds_coordinator_interface",
     source=[
-        "collection_index_builds_tracker.cpp",
-        "database_index_builds_tracker.cpp",
         "index_builds_coordinator.cpp",
     ],
     LIBDEPS=[
@@ -926,16 +946,12 @@ env.Library(
         "dbhelpers",
         "db_raii",
         "namespace_string",
-        "query_exec",
         "service_context",
         "$BUILD_DIR/mongo/base",
         "$BUILD_DIR/mongo/db/catalog/commit_quorum_options",
         "$BUILD_DIR/mongo/db/catalog/index_build_entry_idl",
-        "$BUILD_DIR/mongo/db/matcher/expressions_mongod_only",
         "$BUILD_DIR/mongo/db/storage/write_unit_of_work",
-        "$BUILD_DIR/mongo/db/query/query_request",
-        "$BUILD_DIR/mongo/db/query/query_planner",
-        "$BUILD_DIR/mongo/util/net/network",
+        "repl/local_oplog_info",
     ],
 )
 

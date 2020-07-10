@@ -42,16 +42,18 @@ namespace mongo {
 
 const StringData CommitQuorumOptions::kCommitQuorumField = "commitQuorum"_sd;
 const char CommitQuorumOptions::kMajority[] = "majority";
-const char CommitQuorumOptions::kAll[] = "all";
+const char CommitQuorumOptions::kVotingMembers[] = "votingMembers";
 
 const BSONObj CommitQuorumOptions::Majority(BSON(kCommitQuorumField
                                                  << CommitQuorumOptions::kMajority));
-const BSONObj CommitQuorumOptions::all(BSON(kCommitQuorumField << CommitQuorumOptions::kAll));
+const BSONObj CommitQuorumOptions::VotingMembers(BSON(kCommitQuorumField
+                                                      << CommitQuorumOptions::kVotingMembers));
 
 CommitQuorumOptions::CommitQuorumOptions(int numNodesOpts) {
     reset();
     numNodes = numNodesOpts;
-    invariant(numNodes >= 0);
+    invariant(numNodes >= 0 &&
+              numNodes <= static_cast<decltype(numNodes)>(repl::ReplSetConfig::kMaxMembers));
 }
 
 CommitQuorumOptions::CommitQuorumOptions(const std::string& modeOpts) {
@@ -76,6 +78,10 @@ Status CommitQuorumOptions::parse(const BSONElement& commitQuorumElement) {
         numNodes = static_cast<decltype(numNodes)>(cNumNodes);
     } else if (commitQuorumElement.type() == String) {
         mode = commitQuorumElement.valuestrsafe();
+        if (mode.empty()) {
+            return Status(ErrorCodes::FailedToParse,
+                          str::stream() << "commitQuorum can't be an empty string");
+        }
     } else {
         return Status(ErrorCodes::FailedToParse, "commitQuorum has to be a number or a string");
     }

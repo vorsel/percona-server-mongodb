@@ -56,7 +56,6 @@ public:
                            CollectionUUID collUUID,
                            const UUID& indexBuildUUID,
                            const std::vector<BSONObj>& indexes,
-                           const CommitQuorumOptions& commitQuorum,
                            bool fromMigrate) final {}
 
     void onStartIndexBuildSinglePhase(OperationContext* opCtx, const NamespaceString& nss) final {}
@@ -114,7 +113,7 @@ public:
                    OptionalCollectionUUID uuid,
                    const BSONObj& collModCmd,
                    const CollectionOptions& oldCollOptions,
-                   boost::optional<TTLCollModInfo> ttlInfo) final;
+                   boost::optional<IndexCollModInfo> indexInfo) final;
 
     void onDropDatabase(OperationContext* opCtx, const std::string& dbName) final;
 

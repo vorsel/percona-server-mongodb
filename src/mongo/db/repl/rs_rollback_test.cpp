@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -101,7 +101,7 @@ OplogInterfaceMock::Operation makeStartIndexBuildOplogEntry(Collection* collecti
                                                             BSONObj spec,
                                                             int time) {
     auto entry = BSON("startIndexBuild" << collection->ns().coll() << "indexBuildUUID" << buildUUID
-                                        << "indexes" << BSON_ARRAY(spec) << "commitQuorum" << 1);
+                                        << "indexes" << BSON_ARRAY(spec));
 
     return std::make_pair(BSON("ts" << Timestamp(Seconds(time), 0) << "op"
                                     << "c"
@@ -1022,9 +1022,15 @@ TEST_F(RSRollbackTest, RollbackCommitIndexBuild) {
     int numIndexes = _createIndexOnEmptyCollection(_opCtx.get(), coll, nss, indexSpec);
     ASSERT_EQUALS(2, numIndexes);
 
+    auto buildUUID = UUID::gen();
+    // Store the commit quorum value for the index build in config.system.indexBuilds collection.
+    _insertDocument(_opCtx.get(),
+                    NamespaceString::kIndexBuildEntryNamespace,
+                    BSON("_id" << buildUUID << "collectionUUID" << options.uuid.get()
+                               << "indexNames" << BSON_ARRAY(idxName("0")) << "commitQuorum" << 0));
+
     auto commonOp = makeOpAndRecordId(1);
 
-    auto buildUUID = UUID::gen();
     auto commitIndexBuild = makeCommitIndexBuildOplogEntry(coll, buildUUID, indexSpec, 2);
 
     // Roll back a commit oplog entry, which will drop and restart the index build.
@@ -1046,8 +1052,10 @@ TEST_F(RSRollbackTest, RollbackCommitIndexBuild) {
     ASSERT_EQUALS(1, numIndexesInProgress(_opCtx.get(), nss, coll));
 
     // Kill the index build we just restarted so the fixture can shut down.
-    IndexBuildsCoordinator::get(_opCtx.get())
-        ->abortIndexBuildByBuildUUID(_opCtx.get(), buildUUID, IndexBuildAction::kRollbackAbort);
+    ASSERT_OK(_coordinator->setFollowerMode(MemberState::RS_ROLLBACK));
+    ASSERT(IndexBuildsCoordinator::get(_opCtx.get())
+               ->abortIndexBuildByBuildUUID(
+                   _opCtx.get(), buildUUID, IndexBuildAction::kRollbackAbort, ""));
 }
 
 TEST_F(RSRollbackTest, RollbackAbortIndexBuild) {
@@ -1066,9 +1074,15 @@ TEST_F(RSRollbackTest, RollbackAbortIndexBuild) {
     int numIndexes = _createIndexOnEmptyCollection(_opCtx.get(), coll, nss, indexSpec);
     ASSERT_EQUALS(2, numIndexes);
 
+    auto buildUUID = UUID::gen();
+    // Store the commit quorum value for the index build in config.system.indexBuilds collection.
+    _insertDocument(_opCtx.get(),
+                    NamespaceString::kIndexBuildEntryNamespace,
+                    BSON("_id" << buildUUID << "collectionUUID" << options.uuid.get()
+                               << "indexNames" << BSON_ARRAY(idxName("0")) << "commitQuorum" << 0));
+
     auto commonOp = makeOpAndRecordId(1);
 
-    auto buildUUID = UUID::gen();
     auto abortIndexBuild = makeAbortIndexBuildOplogEntry(coll, buildUUID, indexSpec, 2);
 
     // Roll back an abort oplog entry, which will drop and restart the index build.
@@ -1090,8 +1104,10 @@ TEST_F(RSRollbackTest, RollbackAbortIndexBuild) {
     ASSERT_EQUALS(1, numIndexesInProgress(_opCtx.get(), nss, coll));
 
     // Kill the index build we just restarted so the fixture can shut down.
-    IndexBuildsCoordinator::get(_opCtx.get())
-        ->abortIndexBuildByBuildUUID(_opCtx.get(), buildUUID, IndexBuildAction::kRollbackAbort);
+    ASSERT_OK(_coordinator->setFollowerMode(MemberState::RS_ROLLBACK));
+    ASSERT(IndexBuildsCoordinator::get(_opCtx.get())
+               ->abortIndexBuildByBuildUUID(
+                   _opCtx.get(), buildUUID, IndexBuildAction::kRollbackAbort, ""));
 }
 
 TEST_F(RSRollbackTest, AbortedIndexBuildsAreRestarted) {
@@ -1110,6 +1126,13 @@ TEST_F(RSRollbackTest, AbortedIndexBuildsAreRestarted) {
     int numIndexes = _createIndexOnEmptyCollection(_opCtx.get(), coll, nss, indexSpec);
     ASSERT_EQUALS(2, numIndexes);
 
+    auto buildUUID = UUID::gen();
+    // Store the commit quorum value for the index build in config.system.indexBuilds collection.
+    _insertDocument(_opCtx.get(),
+                    NamespaceString::kIndexBuildEntryNamespace,
+                    BSON("_id" << buildUUID << "collectionUUID" << options.uuid.get()
+                               << "indexNames" << BSON_ARRAY(idxName("0")) << "commitQuorum" << 0));
+
     auto commonOp = makeOpAndRecordId(1);
 
     // Don't roll-back anything.
@@ -1119,7 +1142,6 @@ TEST_F(RSRollbackTest, AbortedIndexBuildsAreRestarted) {
     // Even though the index has already completed, simulate that we aborted the index build before
     // rollback. We expect the index to be dropped and rebuilt.
     IndexBuildDetails build(coll->uuid());
-    auto buildUUID = UUID::gen();
     build.indexSpecs.push_back(indexSpec);
 
     IndexBuilds abortedBuilds{{buildUUID, build}};
@@ -1139,8 +1161,10 @@ TEST_F(RSRollbackTest, AbortedIndexBuildsAreRestarted) {
     ASSERT_EQUALS(1, numIndexesInProgress(_opCtx.get(), nss, coll));
 
     // Kill the index build we just restarted so the fixture can shut down.
-    IndexBuildsCoordinator::get(_opCtx.get())
-        ->abortIndexBuildByBuildUUID(_opCtx.get(), buildUUID, IndexBuildAction::kRollbackAbort);
+    ASSERT_OK(_coordinator->setFollowerMode(MemberState::RS_ROLLBACK));
+    ASSERT(IndexBuildsCoordinator::get(_opCtx.get())
+               ->abortIndexBuildByBuildUUID(
+                   _opCtx.get(), buildUUID, IndexBuildAction::kRollbackAbort, ""));
 }
 
 TEST_F(RSRollbackTest, AbortedIndexBuildsAreNotRestartedWhenStartIsRolledBack) {
@@ -1213,62 +1237,6 @@ TEST_F(RSRollbackTest, RollbackUnknownCommand) {
                      _replicationProcess.get());
     ASSERT_EQUALS(ErrorCodes::UnrecoverableRollbackError, status.code());
     ASSERT_STRING_CONTAINS(status.reason(), "unable to determine common point");
-}
-
-TEST_F(RSRollbackTest, RollbackDropCollectionCommand) {
-    createOplog(_opCtx.get());
-
-    OpTime dropTime = OpTime(Timestamp(2, 0), 5);
-    auto dpns = NamespaceString("test.t").makeDropPendingNamespace(dropTime);
-    CollectionOptions options;
-    options.uuid = UUID::gen();
-    auto coll = _createCollection(_opCtx.get(), dpns, options);
-    _dropPendingCollectionReaper->addDropPendingNamespace(_opCtx.get(), dropTime, dpns);
-
-    auto commonOperation = makeOpAndRecordId(1);
-    auto dropCollectionOperation =
-        std::make_pair(BSON("ts" << dropTime.getTimestamp() << "t" << dropTime.getTerm() << "op"
-                                 << "c"
-                                 << "ui" << coll->uuid() << "ns"
-                                 << "test.t"
-                                 << "wall" << Date_t() << "o"
-                                 << BSON("drop"
-                                         << "t")),
-                       RecordId(2));
-    class RollbackSourceLocal : public RollbackSourceMock {
-    public:
-        RollbackSourceLocal(std::unique_ptr<OplogInterface> oplog)
-            : RollbackSourceMock(std::move(oplog)), called(false) {}
-        void copyCollectionFromRemote(OperationContext* opCtx,
-                                      const NamespaceString& nss) const override {
-            called = true;
-        }
-        mutable bool called;
-    };
-    RollbackSourceLocal rollbackSource(std::unique_ptr<OplogInterface>(new OplogInterfaceMock({
-        commonOperation,
-    })));
-
-    {
-        AutoGetCollectionForReadCommand autoCollDropPending(_opCtx.get(), dpns);
-        ASSERT_TRUE(autoCollDropPending.getCollection());
-        AutoGetCollectionForReadCommand autoColl(_opCtx.get(), NamespaceString("test.t"));
-        ASSERT_FALSE(autoColl.getCollection());
-    }
-    ASSERT_OK(syncRollback(_opCtx.get(),
-                           OplogInterfaceMock({dropCollectionOperation, commonOperation}),
-                           rollbackSource,
-                           {},
-                           {},
-                           _coordinator,
-                           _replicationProcess.get()));
-    ASSERT_FALSE(rollbackSource.called);
-    {
-        AutoGetCollectionForReadCommand autoCollDropPending(_opCtx.get(), dpns);
-        ASSERT_FALSE(autoCollDropPending.getCollection());
-        AutoGetCollectionForReadCommand autoColl(_opCtx.get(), NamespaceString("test.t"));
-        ASSERT_TRUE(autoColl.getCollection());
-    }
 }
 
 TEST_F(RSRollbackTest, RollbackRenameCollectionInSameDatabaseCommand) {

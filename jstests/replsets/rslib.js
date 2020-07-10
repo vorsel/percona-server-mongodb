@@ -20,6 +20,9 @@ var clearFailPoint;
 var isConfigCommitted;
 var waitForConfigReplication;
 var assertSameConfigContent;
+var isMemberNewlyAdded;
+var waitForNewlyAddedRemovalForNodeToBeCommitted;
+var assertVoteCount;
 
 (function() {
 "use strict";
@@ -711,5 +714,60 @@ assertSameConfigContent = function(configA, configB) {
     configA.term = termA;
     configB.version = versionB;
     configB.term = termB;
+};
+
+isMemberNewlyAdded = function(node, memberIndex, force = false) {
+    // The in-memory config will not include the 'newlyAdded' field, so we must consult the on-disk
+    // version. However, the in-memory config is updated after the config is persisted to disk, so
+    // we must confirm that the in-memory config agrees with the on-disk config, before returning
+    // true or false.
+    const configInMemory = assert.commandWorked(node.adminCommand({replSetGetConfig: 1})).config;
+
+    const versionSetInMemory = configInMemory.hasOwnProperty("version");
+    const termSetInMemory = configInMemory.hasOwnProperty("term");
+
+    // Since the term is not set in a force reconfig, we skip the check for the term if
+    // 'force=true'.
+    if (!versionSetInMemory || (!termSetInMemory && !force)) {
+        throw new Error("isMemberNewlyAdded: in-memory config has no version or term: " +
+                        tojsononeline(configInMemory));
+    }
+
+    const configOnDisk = node.getDB("local").system.replset.findOne();
+    const termSetOnDisk = configOnDisk.hasOwnProperty("term");
+
+    const isVersionSetCorrectly = (configOnDisk.version === configInMemory.version);
+    const isTermSetCorrectly =
+        ((!termSetInMemory && !termSetOnDisk) || (configOnDisk.term === configInMemory.term));
+
+    if (!isVersionSetCorrectly || !isTermSetCorrectly) {
+        throw new error(
+            "isMemberNewlyAdded: in-memory config version/term does not match on-disk config." +
+            " in-memory: " + tojsononeline(configInMemory) +
+            ", on-disk: " + tojsononeline(configOnDisk));
+    }
+
+    const memberConfigOnDisk = configOnDisk.members[memberIndex];
+    if (memberConfigOnDisk.hasOwnProperty("newlyAdded")) {
+        assert(memberConfigOnDisk["newlyAdded"] === true, () => tojson(configOnDisk));
+        return true;
+    }
+    return false;
+};
+
+waitForNewlyAddedRemovalForNodeToBeCommitted = function(node, memberIndex, force = false) {
+    jsTestLog("Waiting for member " + memberIndex + " to no longer be 'newlyAdded'");
+    assert.soonNoExcept(function() {
+        return !isMemberNewlyAdded(node, memberIndex, force) && isConfigCommitted(node);
+    }, () => tojson(node.getDB("local").system.replset.findOne()));
+};
+
+assertVoteCount = function(
+    node, {votingMembersCount, majorityVoteCount, writableVotingMembersCount, writeMajorityCount}) {
+    const status = assert.commandWorked(node.adminCommand({replSetGetStatus: 1}));
+    assert.eq(status["votingMembersCount"], votingMembersCount, tojson(status));
+    assert.eq(status["majorityVoteCount"], majorityVoteCount, tojson(status));
+    assert.eq(status["writableVotingMembersCount"], writableVotingMembersCount, tojson(status));
+    assert.eq(status["writeMajorityCount"], writeMajorityCount, tojson(status));
 };
 }());

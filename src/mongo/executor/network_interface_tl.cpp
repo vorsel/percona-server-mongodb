@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kASIO
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kASIO
 
 #include "mongo/platform/basic.h"
 
@@ -47,7 +47,7 @@ namespace mongo {
 namespace executor {
 
 namespace {
-static inline const std::string kMaxTimeMSOptionName = "maxTimeMS";
+static inline const std::string kMaxTimeMSOpOnlyField = "maxTimeMSOpOnly";
 }  // unnamed namespace
 
 /**
@@ -134,6 +134,17 @@ NetworkInterfaceTL::NetworkInterfaceTL(std::string instanceName,
     }
 }
 
+NetworkInterfaceTL::~NetworkInterfaceTL() {
+    if (!inShutdown()) {
+        shutdown();
+    }
+
+    // Because we quick exit on shutdown, these invariants are usually checked only in ASAN builds
+    // and integration/unit tests.
+    invariant(_inProgress.empty());
+    invariant(_inProgressAlarms.empty());
+}
+
 std::string NetworkInterfaceTL::getDiagnosticString() {
     return "DEPRECATED: getDiagnosticString is deprecated in NetworkInterfaceTL";
 }
@@ -189,6 +200,25 @@ void NetworkInterfaceTL::shutdown() {
         return;
 
     LOGV2_DEBUG(22594, 2, "Shutting down network interface.");
+
+    // Cancel any remaining commands. Any attempt to register new commands will throw.
+    auto inProgress = [&] {
+        stdx::lock_guard lk(_inProgressMutex);
+        return std::exchange(_inProgress, {});
+    }();
+
+    for (auto& [_, weakCmdState] : inProgress) {
+        auto cmdState = weakCmdState.lock();
+        if (!cmdState) {
+            continue;
+        }
+
+        if (!cmdState->finishLine.arriveStrongly()) {
+            continue;
+        }
+
+        cmdState->fulfillFinalPromise(kNetworkInterfaceShutdownInProgress);
+    }
 
     // Stop the reactor/thread first so that nothing runs on a partially dtor'd pool.
     _reactor->stop();
@@ -271,6 +301,11 @@ auto NetworkInterfaceTL::CommandState::make(NetworkInterfaceTL* interface,
 
     {
         stdx::lock_guard lk(interface->_inProgressMutex);
+        if (interface->inShutdown()) {
+            // If we're in shutdown, we can't add a new command.
+            uassertStatusOK(kNetworkInterfaceShutdownInProgress);
+        }
+
         interface->_inProgress.insert({cbHandle, state});
     }
 
@@ -286,7 +321,7 @@ AsyncDBClient* NetworkInterfaceTL::RequestState::getClient(const ConnectionHandl
 }
 
 void NetworkInterfaceTL::CommandStateBase::setTimer() {
-    if (deadline == RemoteCommandRequest::kNoExpirationDate) {
+    if (deadline == kNoExpirationDate) {
         return;
     }
 
@@ -315,7 +350,12 @@ void NetworkInterfaceTL::CommandStateBase::setTimer() {
                                                   << ", deadline was " << deadline.toString()
                                                   << ", op was " << redact(requestOnAny.toString());
 
-        LOGV2_DEBUG(22595, 2, "", "message"_attr = message);
+        LOGV2_DEBUG(22595,
+                    2,
+                    "Request timed out",
+                    "requestId"_attr = requestOnAny.id,
+                    "deadline"_attr = deadline,
+                    "request"_attr = requestOnAny);
         fulfillFinalPromise(Status(ErrorCodes::NetworkInterfaceExceededTimeLimit, message));
     });
 }
@@ -364,6 +404,22 @@ void NetworkInterfaceTL::CommandStateBase::tryFinish(Status status) noexcept {
         // Kill operations for requests that we didn't use to fulfill the promise.
         requestManager->killOperationsForPendingRequests();
     }
+
+    networkInterfaceCommandsFailedWithErrorCode.shouldFail([&](const BSONObj& data) {
+        const auto errorCode = data.getIntField("errorCode");
+        if (errorCode != status.code()) {
+            return false;
+        }
+
+        const std::string requestCmdName = requestOnAny.cmdObj.firstElement().fieldName();
+        for (auto&& cmdName : data.getObjectField("cmdNames")) {
+            if (cmdName.type() == String && cmdName.valueStringData() == requestCmdName) {
+                return true;
+            }
+        }
+
+        return false;
+    });
 }
 
 void NetworkInterfaceTL::RequestState::cancel() noexcept {
@@ -381,15 +437,13 @@ NetworkInterfaceTL::RequestState::~RequestState() {
 Status NetworkInterfaceTL::startCommand(const TaskExecutor::CallbackHandle& cbHandle,
                                         RemoteCommandRequestOnAny& request,
                                         RemoteCommandCompletionFn&& onFinish,
-                                        const BatonHandle& baton) {
+                                        const BatonHandle& baton) try {
     if (inShutdown()) {
         return kNetworkInterfaceShutdownInProgress;
     }
 
-    LOGV2_DEBUG(22596,
-                logSeverityV1toV2(kDiagnosticLogLevel).toInt(),
-                "startCommand",
-                "request"_attr = redact(request.toString()));
+    LOGV2_DEBUG(
+        22596, kDiagnosticLogLevel, "startCommand", "request"_attr = redact(request.toString()));
 
     if (_metadataHook) {
         BSONObjBuilder newMetadata(std::move(request.metadata));
@@ -471,6 +525,7 @@ Status NetworkInterfaceTL::startCommand(const TaskExecutor::CallbackHandle& cbHa
                     2,
                     "Request finished with response",
                     "requestId"_attr = cmdState->requestOnAny.id,
+                    "isOK"_attr = rs.isOK(),
                     "response"_attr =
                         redact(rs.isOK() ? rs.data.toString() : rs.status.toString()));
         onFinish(std::move(rs));
@@ -501,6 +556,8 @@ Status NetworkInterfaceTL::startCommand(const TaskExecutor::CallbackHandle& cbHa
     }
 
     return Status::OK();
+} catch (const DBException& ex) {
+    return ex.toStatus();
 }
 
 void NetworkInterfaceTL::testEgress(const HostAndPort& hostAndPort,
@@ -637,14 +694,20 @@ void NetworkInterfaceTL::RequestManager::killOperationsForPendingRequests() {
         // If the request was sent, send a remote command request to the target host
         // to kill the operation started by the request.
         bool hasAcquiredConn = getConnStatus(requestState->reqId) == ConnStatus::OK;
-        if (hasAcquiredConn && requestState->request) {
-            LOGV2_DEBUG(4664801,
-                        2,
-                        "Sending remote _killOperations request to cancel command",
-                        "operationKey"_attr = cmdState.lock()->operationKey,
-                        "target"_attr = requestState->request->target,
-                        "request_id"_attr = requestState->request->id);
-            requestState->interface()->_killOperation(requestState);
+        if (!hasAcquiredConn || !requestState->request) {
+            continue;
+        }
+
+        LOGV2_DEBUG(4664801,
+                    2,
+                    "Sending remote _killOperations request to cancel command",
+                    "operationKey"_attr = cmdState.lock()->operationKey,
+                    "target"_attr = requestState->request->target,
+                    "requestId"_attr = requestState->request->id);
+
+        auto status = requestState->interface()->_killOperation(requestState);
+        if (!status.isOK()) {
+            LOGV2_DEBUG(4664810, 2, "Failed to send remote _killOperations", "error"_attr = status);
         }
     }
 }
@@ -700,26 +763,19 @@ void NetworkInterfaceTL::RequestManager::trySend(
 
     if (requestState->isHedge) {
         invariant(cmdStatePtr->requestOnAny.hedgeOptions);
-
-        // Attach a maxTimeMS to the request.
         auto maxTimeMS = request.hedgeOptions->maxTimeMSForHedgedReads;
-        if (request.timeout == request.kNoTimeout || request.timeout > Milliseconds(maxTimeMS)) {
-            BSONObjBuilder updatedCmdBuilder;
-            for (const auto& elem : request.cmdObj) {
-                if (elem.fieldNameStringData() != kMaxTimeMSOptionName) {
-                    updatedCmdBuilder.append(elem);
-                }
-            }
-            updatedCmdBuilder.append(kMaxTimeMSOptionName, maxTimeMS);
-            request.cmdObj = updatedCmdBuilder.obj();
 
-            LOGV2_DEBUG(4647200,
-                        2,
-                        "Set maxTimeMS for request",
-                        "maxTimeMS"_attr = maxTimeMS,
-                        "request_id"_attr = cmdStatePtr->requestOnAny.id,
-                        "target"_attr = cmdStatePtr->requestOnAny.target[idx]);
-        }
+        BSONObjBuilder updatedCmdBuilder;
+        updatedCmdBuilder.appendElements(request.cmdObj);
+        updatedCmdBuilder.append(kMaxTimeMSOpOnlyField, maxTimeMS);
+        request.cmdObj = updatedCmdBuilder.obj();
+
+        LOGV2_DEBUG(4647200,
+                    2,
+                    "Set maxTimeMS for request",
+                    "maxTime"_attr = Milliseconds(maxTimeMS),
+                    "requestId"_attr = cmdStatePtr->requestOnAny.id,
+                    "target"_attr = cmdStatePtr->requestOnAny.target[idx]);
 
         if (cmdStatePtr->interface->_svcCtx) {
             auto hm = HedgingMetrics::get(cmdStatePtr->interface->_svcCtx);
@@ -748,12 +804,11 @@ void NetworkInterfaceTL::RequestState::send(StatusWith<ConnectionPool::Connectio
 
     networkInterfaceHangCommandsAfterAcquireConn.pauseWhileSet();
 
-    if (networkInterfaceAfterAcquireConn.shouldFail()) {
-        LOGV2(4630601,
-              "Request acquired a connection",
-              "requestId"_attr = request->id,
-              "target"_attr = request->target);
-    }
+    LOGV2_DEBUG(4630601,
+                2,
+                "Request acquired a connection",
+                "requestId"_attr = request->id,
+                "target"_attr = request->target);
 
     if (auto counters = interface()->_counters) {
         counters->recordSent();
@@ -776,23 +831,19 @@ void NetworkInterfaceTL::RequestState::resolve(Future<RemoteCommandResponse> fut
             .onError([this, anchor = shared_from_this()](Status error) {
                 // The RCRq failed, wrap the error into a RCRsp with the host and duration
                 return RemoteCommandOnAnyResponse(host, std::move(error), stopwatch.elapsed());
+            })
+            .tapAll([ this, anchor = shared_from_this() ](const auto& swr) noexcept {
+                invariant(swr.isOK());
+                returnConnection(swr.getValue().status);
             });
 
     std::move(anyFuture)                                    //
         .thenRunOn(makeGuaranteedExecutor(baton, reactor))  // Switch to the baton/reactor.
         .getAsync([ this, anchor = shared_from_this() ](auto swr) noexcept {
-            auto response = uassertStatusOK(swr);
-            auto status = response.status;
-
-            returnConnection(status);
-
+            auto response = uassertStatusOK(std::move(swr));
             auto commandStatus = getStatusFromCommandResult(response.data);
-
-            if (!cmdState->finishLine.arriveStrongly()) {
-                return;
-            }
-
-            // Ignore maxTimeMS expiration errors for hedged reads
+            // Ignore maxTimeMS expiration errors for hedged reads without triggering the finish
+            // line.
             if (isHedge && commandStatus == ErrorCodes::MaxTimeMSExpired) {
                 LOGV2_DEBUG(4660701,
                             2,
@@ -800,15 +851,27 @@ void NetworkInterfaceTL::RequestState::resolve(Future<RemoteCommandResponse> fut
                             "requestId"_attr = request->id,
                             "target"_attr = request->target,
                             "status"_attr = commandStatus);
-            } else {
-                if (isHedge) {
-                    auto hm = HedgingMetrics::get(cmdState->interface->_svcCtx);
-                    invariant(hm);
-                    hm->incrementNumAdvantageouslyHedgedOperations();
-                }
-                fulfilledPromise = true;
-                cmdState->fulfillFinalPromise(std::move(response));
+                return;
             }
+
+            if (!cmdState->finishLine.arriveStrongly()) {
+                LOGV2_DEBUG(4754301,
+                            2,
+                            "Skipping the response because it was already received from other node",
+                            "requestId"_attr = request->id,
+                            "target"_attr = request->target,
+                            "status"_attr = commandStatus);
+
+                return;
+            }
+
+            if (isHedge) {
+                auto hm = HedgingMetrics::get(cmdState->interface->_svcCtx);
+                invariant(hm);
+                hm->incrementNumAdvantageouslyHedgedOperations();
+            }
+            fulfilledPromise = true;
+            cmdState->fulfillFinalPromise(std::move(response));
         });
 }
 
@@ -830,15 +893,20 @@ auto NetworkInterfaceTL::ExhaustCommandState::make(NetworkInterfaceTL* interface
     state->promise = std::move(promise);
     std::move(future)
         .onError([state](Status error) {
-            stdx::lock_guard lk(state->_onReplyMutex);
             state->onReplyFn(RemoteCommandOnAnyResponse(
-                                 boost::none, std::move(error), state->stopwatch.elapsed()),
-                             false);
+                boost::none, std::move(error), state->stopwatch.elapsed()));
         })
-        .getAsync([state](Status status) { state->tryFinish(status); });
+        .getAsync([state](Status status) {
+            state->tryFinish(
+                Status{ErrorCodes::ExhaustCommandFinished, "Exhaust command finished"});
+        });
 
     {
         stdx::lock_guard lk(interface->_inProgressMutex);
+        if (interface->inShutdown()) {
+            // If we're in shutdown, we can't add a new command.
+            uassertStatusOK(kNetworkInterfaceShutdownInProgress);
+        }
         interface->_inProgress.insert({cbHandle, state});
     }
 
@@ -849,38 +917,17 @@ Future<RemoteCommandResponse> NetworkInterfaceTL::ExhaustCommandState::sendReque
     auto requestState = requestManager->getRequest(reqId);
     invariant(requestState);
 
-    auto clientCallback = [this, requestState](const RemoteCommandResponse& response,
-                                               bool isMoreToComeSet) {
-        // Stash this response on the command state to be used to fulfill the promise.
-        prevResponse = response;
-        auto onAnyResponse = RemoteCommandOnAnyResponse(requestState->host, response);
-        doMetadataHook(onAnyResponse);
+    setTimer();
+    requestState->getClient(requestState->conn)
+        ->beginExhaustCommandRequest(*requestState->request, baton)
+        .thenRunOn(requestState->interface()->_reactor)
+        .getAsync([this, requestState](StatusWith<RemoteCommandResponse> swResponse) mutable {
+            continueExhaustRequest(std::move(requestState), swResponse);
+        });
 
-        // If the command failed, we will call 'onReply' as a part of the future chain paired with
-        // the promise. This is to be sure that all error paths will run 'onReply' only once upon
-        // future completion.
-        if (!getStatusFromCommandResult(response.data).isOK()) {
-            // The moreToCome bit should *not* be set if the command failed
-            invariant(!isMoreToComeSet);
-            return;
-        }
-
-        // Reset the stopwatch to measure the correct duration for the folowing reply
-        stopwatch.restart();
-        setTimer();
-
-        stdx::lock_guard lk(_onReplyMutex);
-        onReplyFn(onAnyResponse, isMoreToComeSet);
-    };
-
-    return makeReadyFutureWith(
-               [this, requestState, clientCallback = std::move(clientCallback)]() mutable {
-                   setTimer();
-                   return RequestState::getClient(requestState->conn)
-                       ->runExhaustCommandRequest(
-                           *requestState->request, std::move(clientCallback), baton);
-               })
-        .then([this, requestState] { return prevResponse; });
+    auto [promise, future] = makePromiseFuture<RemoteCommandResponse>();
+    finalResponsePromise = std::move(promise);
+    return std::move(future).then([this](const auto& finalResponse) { return finalResponse; });
 }
 
 void NetworkInterfaceTL::ExhaustCommandState::fulfillFinalPromise(
@@ -897,18 +944,62 @@ void NetworkInterfaceTL::ExhaustCommandState::fulfillFinalPromise(
     promise.emplaceValue();
 }
 
+void NetworkInterfaceTL::ExhaustCommandState::continueExhaustRequest(
+    std::shared_ptr<RequestState> requestState, StatusWith<RemoteCommandResponse> swResponse) {
+    RemoteCommandResponse response;
+    if (!swResponse.isOK()) {
+        response = RemoteCommandResponse(std::move(swResponse.getStatus()));
+    } else {
+        response = std::move(swResponse.getValue());
+    }
+
+    if (requestState->interface()->inShutdown() ||
+        ErrorCodes::isCancelationError(response.status)) {
+        finalResponsePromise.emplaceValue(response);
+        return;
+    }
+
+    auto onAnyResponse = RemoteCommandOnAnyResponse(requestState->host, response);
+    doMetadataHook(onAnyResponse);
+
+    // If the command failed, we will call 'onReply' as a part of the future chain paired with
+    // the promise. This is to be sure that all error paths will run 'onReply' only once upon
+    // future completion.
+    if (!response.status.isOK() || !getStatusFromCommandResult(response.data).isOK()) {
+        // The moreToCome bit should *not* be set if the command failed
+        invariant(!response.moreToCome);
+
+        finalResponsePromise.emplaceValue(response);
+        return;
+    }
+
+    onReplyFn(onAnyResponse);
+
+    // Reset the stopwatch to measure the correct duration for the folowing reply
+    stopwatch.restart();
+    if (deadline != kNoExpirationDate) {
+        deadline = stopwatch.start() + requestOnAny.timeout;
+    }
+    setTimer();
+
+    requestState->getClient(requestState->conn)
+        ->awaitExhaustCommand(baton)
+        .thenRunOn(requestState->interface()->_reactor)
+        .getAsync([this, requestState](StatusWith<RemoteCommandResponse> swResponse) mutable {
+            continueExhaustRequest(std::move(requestState), swResponse);
+        });
+}
+
 Status NetworkInterfaceTL::startExhaustCommand(const TaskExecutor::CallbackHandle& cbHandle,
                                                RemoteCommandRequestOnAny& request,
                                                RemoteCommandOnReplyFn&& onReply,
-                                               const BatonHandle& baton) {
+                                               const BatonHandle& baton) try {
     if (inShutdown()) {
         return {ErrorCodes::ShutdownInProgress, "NetworkInterface shutdown in progress"};
     }
 
-    LOGV2_DEBUG(23909,
-                logSeverityV1toV2(kDiagnosticLogLevel).toInt(),
-                "startCommand",
-                "request"_attr = redact(request.toString()));
+    LOGV2_DEBUG(
+        23909, kDiagnosticLogLevel, "startCommand", "request"_attr = redact(request.toString()));
 
     if (_metadataHook) {
         BSONObjBuilder newMetadata(std::move(request.metadata));
@@ -947,6 +1038,8 @@ Status NetworkInterfaceTL::startExhaustCommand(const TaskExecutor::CallbackHandl
     }
 
     return Status::OK();
+} catch (const DBException& ex) {
+    return ex.toStatus();
 }
 
 void NetworkInterfaceTL::cancelCommand(const TaskExecutor::CallbackHandle& cbHandle,
@@ -979,7 +1072,7 @@ void NetworkInterfaceTL::cancelCommand(const TaskExecutor::CallbackHandle& cbHan
                        << redact(cmdStateToCancel->requestOnAny.toString())});
 }
 
-void NetworkInterfaceTL::_killOperation(std::shared_ptr<RequestState> requestStateToKill) {
+Status NetworkInterfaceTL::_killOperation(std::shared_ptr<RequestState> requestStateToKill) try {
     auto [target, sslMode] = [&] {
         invariant(requestStateToKill->request);
         auto request = requestStateToKill->request.get();
@@ -1020,7 +1113,7 @@ void NetworkInterfaceTL::_killOperation(std::shared_ptr<RequestState> requestSta
     auto connFuture = _pool->get(target, sslMode, killOpRequest.kNoTimeout);
     if (connFuture.isReady()) {
         killOpRequestState->trySend(std::move(connFuture).getNoThrow(), 0);
-        return;
+        return Status::OK();
     }
 
     std::move(connFuture)
@@ -1028,6 +1121,9 @@ void NetworkInterfaceTL::_killOperation(std::shared_ptr<RequestState> requestSta
         .getAsync([this, killOpRequestState, killOpRequest](auto swConn) {
             killOpRequestState->trySend(std::move(swConn), 0);
         });
+    return Status::OK();
+} catch (const DBException& ex) {
+    return ex.toStatus();
 }
 
 Status NetworkInterfaceTL::schedule(unique_function<void(Status)> action) {

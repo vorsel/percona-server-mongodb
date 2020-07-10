@@ -52,21 +52,21 @@ public:
     static Lock::ResourceMutex fcvLock;
 
     /**
-     * Records intent to perform a 4.2 -> 4.4 upgrade by updating the on-disk feature
-     * compatibility version document to have 'version'=4.2, 'targetVersion'=4.4.
+     * Records intent to perform a 4.4 -> 4.6 upgrade by updating the on-disk feature
+     * compatibility version document to have 'version'=4.4, 'targetVersion'=4.6.
      * Should be called before schemas are modified.
      */
     static void setTargetUpgrade(OperationContext* opCtx);
 
     /**
-     * Records intent to perform a 4.4 -> 4.2 downgrade by updating the on-disk feature
-     * compatibility version document to have 'version'=4.2, 'targetVersion'=4.2.
+     * Records intent to perform a 4.6 -> 4.4 downgrade by updating the on-disk feature
+     * compatibility version document to have 'version'=4.4, 'targetVersion'=4.4.
      * Should be called before schemas are modified.
      */
     static void setTargetDowngrade(OperationContext* opCtx);
 
     /**
-     * Records the completion of a 4.2 <-> 4.4 upgrade or downgrade by updating the on-disk feature
+     * Records the completion of a 4.4 <-> 4.6 upgrade or downgrade by updating the on-disk feature
      * compatibility version document to have 'version'=version and unsetting the 'targetVersion'
      * field. Should be called after schemas are modified.
      */
@@ -99,6 +99,11 @@ public:
      */
     static void updateMinWireVersion();
 
+    /**
+     * Ensures the in-memory and on-disk FCV states are consistent after a rollback.
+     */
+    static void onReplicationRollback(OperationContext* opCtx);
+
 private:
     /**
      * Validate version. Uasserts if invalid.
@@ -110,6 +115,13 @@ private:
      */
     typedef std::function<void(BSONObjBuilder)> UpdateBuilder;
     static void _runUpdateCommand(OperationContext* opCtx, UpdateBuilder callback);
+
+    /**
+     * Set the FCV to newVersion, making sure to close any outgoing connections with incompatible
+     * servers and closing open transactions if necessary. Increments the server TopologyVersion.
+     */
+    static void _setVersion(OperationContext* opCtx,
+                            ServerGlobalParams::FeatureCompatibility::Version newVersion);
 };
 
 /**

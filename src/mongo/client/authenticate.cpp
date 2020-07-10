@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAccessControl
 
 #include "mongo/platform/basic.h"
 
@@ -151,8 +151,8 @@ Future<void> authenticateClient(const BSONObj& params,
         if (serverGlobalParams.transitionToAuth && !ErrorCodes::isNetworkError(status)) {
             // If auth failed in transitionToAuth, just pretend it succeeded.
             LOGV2(20108,
-                  "Failed to authenticate in transitionToAuth, falling back to no "
-                  "authentication.");
+                  "Failed to authenticate in transitionToAuth, "
+                  "falling back to no authentication");
 
             return Status::OK();
         }

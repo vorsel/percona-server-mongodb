@@ -44,10 +44,10 @@ static const OpTime opTime(Timestamp(1234, 100), 5);
 static const OpTime opTime2(Timestamp(7777, 100), 6);
 static const Date_t committedWallTime = Date_t() + Seconds(opTime.getSecs());
 static const ReplSetMetadata metadata(
-    3, {opTime, committedWallTime}, opTime2, 6, 0, OID("abcdefabcdefabcdefabcdef"), 12, -1, false);
+    3, {opTime, committedWallTime}, opTime2, 6, 0, OID("abcdefabcdefabcdefabcdef"), -1, false);
 
 TEST(ReplResponseMetadataTest, ReplicaSetIdNotSet) {
-    ASSERT_FALSE(ReplSetMetadata(3, OpTimeAndWallTime(), OpTime(), 6, 0, OID(), 12, -1, false)
+    ASSERT_FALSE(ReplSetMetadata(3, OpTimeAndWallTime(), OpTime(), 6, 0, OID(), -1, false)
                      .hasReplicaSetId());
 }
 
@@ -67,13 +67,18 @@ TEST(ReplResponseMetadataTest, Roundtrip) {
                             << "lastCommittedWall" << committedWallTime << "lastOpVisible"
                             << BSON("ts" << opTime2.getTimestamp() << "t" << opTime2.getTerm())
                             << "configVersion" << 6 << "configTerm" << 0 << "replicaSetId"
-                            << metadata.getReplicaSetId() << "primaryIndex" << 12
-                            << "syncSourceIndex" << -1 << "isPrimary" << false)));
+                            << metadata.getReplicaSetId() << "syncSourceIndex" << -1 << "isPrimary"
+                            << false)));
 
     BSONObj serializedObj = builder.obj();
     ASSERT_BSONOBJ_EQ(expectedObj, serializedObj);
 
-    auto cloneStatus = ReplSetMetadata::readFromMetadata(serializedObj);
+    // Verify that we allow unknown fields.
+    BSONObjBuilder bob;
+    bob.appendElements(serializedObj);
+    bob.append("unknownField", 1);
+
+    auto cloneStatus = ReplSetMetadata::readFromMetadata(bob.obj());
     ASSERT_OK(cloneStatus.getStatus());
 
     const auto& clonedMetadata = cloneStatus.getValue();
@@ -106,27 +111,6 @@ TEST(ReplResponseMetadataTest, MetadataCanBeConstructedWhenMissingOplogQueryMeta
     ASSERT_EQ(metadata.getReplicaSetId(), metadata.getReplicaSetId());
     ASSERT_EQ(metadata.getTerm(), 3);
 }
-
-TEST(ReplResponseMetadataTest, MetadataCanBeConstructedFrom42) {
-    // TODO(SERVER-47125): delete this test in 4.6 when we can rely on the isPrimary and configTerm
-    // fields.
-    BSONObj obj(
-        BSON(kReplSetMetadataFieldName
-             << BSON("term" << 3 << "lastOpCommitted"
-                            << BSON("ts" << opTime.getTimestamp() << "t" << opTime.getTerm())
-                            << "lastCommittedWall" << committedWallTime << "lastOpVisible"
-                            << BSON("ts" << opTime2.getTimestamp() << "t" << opTime2.getTerm())
-                            << "configVersion" << 6 << "replicaSetId" << metadata.getReplicaSetId()
-                            << "primaryIndex" << 12 << "syncSourceIndex" << -1)));
-
-    auto status = ReplSetMetadata::readFromMetadata(obj);
-    ASSERT_OK(status.getStatus());
-
-    const auto& metadata = status.getValue();
-    ASSERT_FALSE(metadata.getIsPrimary().is_initialized());
-    ASSERT_EQUALS(metadata.getConfigTerm(), -1);
-}
-
 }  // unnamed namespace
 }  // namespace rpc
 }  // namespace mongo

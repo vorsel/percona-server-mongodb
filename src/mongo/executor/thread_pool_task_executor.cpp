@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT mongo::logger::LogComponent::kExecutor
+#define MONGO_LOGV2_DEFAULT_COMPONENT mongo::logv2::LogComponent::kExecutor
 
 #include "mongo/platform/basic.h"
 
@@ -101,6 +101,9 @@ public:
     AtomicWord<bool> isFinished{false};
     boost::optional<stdx::condition_variable> finishedCondition;
     BatonHandle baton;
+    AtomicWord<bool> exhaustErased{
+        false};  // Used only in the exhaust path. Used to indicate that a cbState associated with
+                 // an exhaust request has been removed from the '_networkInProgressQueue'.
 };
 
 class ThreadPoolTaskExecutor::EventState : public TaskExecutor::EventState {
@@ -418,11 +421,7 @@ StatusWith<TaskExecutor::CallbackHandle> ThreadPoolTaskExecutor::scheduleRemoteC
     const BatonHandle& baton) {
 
     RemoteCommandRequestOnAny scheduledRequest = request;
-    if (request.timeout == RemoteCommandRequest::kNoTimeout) {
-        scheduledRequest.expirationDate = RemoteCommandRequest::kNoExpirationDate;
-    } else {
-        scheduledRequest.expirationDate = _net->now() + scheduledRequest.timeout;
-    }
+    scheduledRequest.dateScheduled = _net->now();
 
     // In case the request fails to even get a connection from the pool,
     // we wrap the callback in a method that prepares its input parameters.
@@ -439,8 +438,9 @@ StatusWith<TaskExecutor::CallbackHandle> ThreadPoolTaskExecutor::scheduleRemoteC
     const auto cbState = _networkInProgressQueue.back();
     LOGV2_DEBUG(22607,
                 3,
-                "Scheduling remote command request: {scheduledRequest}",
-                "scheduledRequest"_attr = redact(scheduledRequest.toString()));
+                "Scheduling remote command request: {request}",
+                "Scheduling remote command request",
+                "request"_attr = redact(scheduledRequest.toString()));
     lk.unlock();
 
     auto commandStatus = _net->startCommand(
@@ -455,12 +455,12 @@ StatusWith<TaskExecutor::CallbackHandle> ThreadPoolTaskExecutor::scheduleRemoteC
             if (_inShutdown_inlock()) {
                 return;
             }
-            LOGV2_DEBUG(
-                22608,
-                3,
-                "Received remote response: {response_isOK_response_response_status_toString}",
-                "response_isOK_response_response_status_toString"_attr =
-                    redact(response.isOK() ? response.toString() : response.status.toString()));
+            LOGV2_DEBUG(22608,
+                        3,
+                        "Received remote response: {response}",
+                        "Received remote response",
+                        "response"_attr = redact(response.isOK() ? response.toString()
+                                                                 : response.status.toString()));
             swap(cbState->callback, newCb);
             scheduleIntoPool_inlock(&_networkInProgressQueue, cbState->iter, std::move(lk));
         },
@@ -662,11 +662,7 @@ StatusWith<TaskExecutor::CallbackHandle> ThreadPoolTaskExecutor::scheduleExhaust
     const RemoteCommandOnAnyCallbackFn& cb,
     const BatonHandle& baton) {
     RemoteCommandRequestOnAny scheduledRequest = request;
-    if (request.timeout == RemoteCommandRequest::kNoTimeout) {
-        scheduledRequest.expirationDate = RemoteCommandRequest::kNoExpirationDate;
-    } else {
-        scheduledRequest.expirationDate = _net->now() + scheduledRequest.timeout;
-    }
+    scheduledRequest.dateScheduled = _net->now();
 
     // In case the request fails to even get a connection from the pool,
     // we wrap the callback in a method that prepares its input parameters.
@@ -684,25 +680,54 @@ StatusWith<TaskExecutor::CallbackHandle> ThreadPoolTaskExecutor::scheduleExhaust
     lk.unlock();
     LOGV2_DEBUG(4495133,
                 3,
-                "Scheduling exhaust remote command request: {scheduledRequest}",
-                "scheduledRequest"_attr = redact(scheduledRequest.toString()));
+                "Scheduling exhaust remote command request: {request}",
+                "Scheduling exhaust remote command request",
+                "request"_attr = redact(scheduledRequest.toString()));
 
     auto commandStatus = _net->startExhaustCommand(
         swCbHandle.getValue(),
         scheduledRequest,
-        [this, scheduledRequest, cbState, cb, baton](const ResponseOnAnyStatus& response,
-                                                     bool isMoreToComeSet) {
+        [this, scheduledRequest, cbState, cb, baton](const ResponseOnAnyStatus& response) {
             using std::swap;
 
-            LOGV2_DEBUG(
-                4495134,
-                3,
-                "Received remote response: {response_isOK_response_response_status_toString}",
-                "response_isOK_response_response_status_toString"_attr =
-                    redact(response.isOK() ? response.toString() : response.status.toString()));
+            LOGV2_DEBUG(4495134,
+                        3,
+                        "Received remote response: {response}",
+                        "Received remote response",
+                        "response"_attr = redact(response.isOK() ? response.toString()
+                                                                 : response.status.toString()));
+
+            // The cbState remains in the '_networkInProgressQueue' for the entirety of the
+            // request's lifetime and is added to and removed from the '_poolInProgressQueue' each
+            // time a response is received and its callback run respectively. It must be erased from
+            // the '_networkInProgressQueue' when either the request is cancelled or a response is
+            // received that has moreToCome == false to avoid shutting down with a task still in the
+            // '_networkInProgressQueue'. It is also possible that we receive both of these
+            // responses around the same time, so the 'exhaustErased' bool protects against
+            // attempting to erase the same cbState twice.
 
             stdx::unique_lock<Latch> lk(_mutex);
-            if (_inShutdown_inlock()) {
+            if (_inShutdown_inlock() || cbState->exhaustErased.load()) {
+                if (cbState->exhaustIter) {
+                    _poolInProgressQueue.erase(cbState->exhaustIter.get());
+                    cbState->exhaustIter = boost::none;
+                }
+                return;
+            }
+
+            if (cbState->canceled.load()) {
+                // Release any resources the callback function is holding
+                TaskExecutor::CallbackFn callback = [](const CallbackArgs&) {};
+                std::swap(cbState->callback, callback);
+
+                _networkInProgressQueue.erase(cbState->iter);
+                cbState->exhaustErased.store(1);
+
+                if (cbState->exhaustIter) {
+                    _poolInProgressQueue.erase(cbState->exhaustIter.get());
+                    cbState->exhaustIter = boost::none;
+                }
+
                 return;
             }
 
@@ -714,8 +739,15 @@ StatusWith<TaskExecutor::CallbackHandle> ThreadPoolTaskExecutor::scheduleExhaust
 
             // If this is the last response, invoke the non-exhaust path. This will mark cbState as
             // finished and remove the task from _networkInProgressQueue
-            if (!isMoreToComeSet) {
-                scheduleIntoPool_inlock(&_networkInProgressQueue, cbState->iter, std::move(lk));
+            if (!response.moreToCome) {
+                _networkInProgressQueue.erase(cbState->iter);
+                cbState->exhaustErased.store(1);
+
+                WorkQueue result;
+                result.emplace_front(cbState);
+                result.front()->iter = result.begin();
+
+                scheduleIntoPool_inlock(&result, std::move(lk));
                 return;
             }
 
@@ -778,21 +810,28 @@ void ThreadPoolTaskExecutor::runCallbackExhaust(std::shared_ptr<CallbackState> c
                       cbState->canceled.load()
                           ? Status({ErrorCodes::CallbackCanceled, "Callback canceled"})
                           : Status::OK());
-    invariant(!cbState->isFinished.load());
-    {
-        // After running callback function, clear 'cbStateArg->callback' to release any resources
-        // that might be held by this function object.
-        // Swap 'cbStateArg->callback' with temporary copy before running callback for exception
-        // safety.
-        TaskExecutor::CallbackFn callback;
+
+    if (!cbState->isFinished.load()) {
+        TaskExecutor::CallbackFn callback = [](const CallbackArgs&) {};
         std::swap(cbState->callback, callback);
         callback(std::move(args));
+
+        // Leave the empty callback function if the request has been marked canceled or finished
+        // while running the callback to avoid leaking resources.
+        if (!cbState->canceled.load() && !cbState->isFinished.load()) {
+            std::swap(callback, cbState->callback);
+        }
     }
 
-    // Do not mark cbState as finished. It will be marked as finished on the last reply.
+    // Do not mark cbState as finished. It will be marked as finished on the last reply which is
+    // handled in 'runCallback'.
     stdx::lock_guard<Latch> lk(_mutex);
-    invariant(cbState->exhaustIter);
-    _poolInProgressQueue.erase(cbState->exhaustIter.get());
+
+    if (cbState->exhaustIter) {
+        _poolInProgressQueue.erase(cbState->exhaustIter.get());
+        cbState->exhaustIter = boost::none;
+    }
+
     if (_inShutdown_inlock() && _poolInProgressQueue.empty()) {
         _stateChange.notify_all();
     }

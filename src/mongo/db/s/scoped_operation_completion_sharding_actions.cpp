@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -76,12 +76,6 @@ ScopedOperationCompletionShardingActions::~ScopedOperationCompletionShardingActi
             // the migration to finish before returning.
             auto& oss = OperationShardingState::get(_opCtx);
             oss.setMigrationCriticalSectionSignal(staleInfo->getCriticalSectionSignal());
-        }
-
-        if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-            serverGlobalParams.featureCompatibility.getVersion() ==
-                ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
-            invariant(staleInfo->getShardId());
         }
 
         auto handleMismatchStatus = onShardVersionMismatchNoExcept(

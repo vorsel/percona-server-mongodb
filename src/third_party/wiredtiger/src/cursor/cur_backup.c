@@ -334,8 +334,7 @@ __backup_add_id(WT_SESSION_IMPL *session, WT_CONFIG_ITEM *cval)
      */
     ret = __wt_meta_checkpoint_last_name(session, WT_METAFILE_URI, &ckpt);
     __wt_free(session, ckpt);
-    if (ret != 0 && ret != WT_NOTFOUND)
-        WT_ERR(ret);
+    WT_ERR_NOTFOUND_OK(ret, true);
     if (ret == WT_NOTFOUND) {
         /*
          * If we don't find any checkpoint, backup files need to be full copy.
@@ -351,8 +350,7 @@ __backup_add_id(WT_SESSION_IMPL *session, WT_CONFIG_ITEM *cval)
     return (0);
 
 err:
-    if (blk != NULL)
-        __wt_free(session, blk->id_str);
+    __wt_free(session, blk->id_str);
     return (ret);
 }
 
@@ -417,6 +415,10 @@ err:
 /*
  * __backup_config --
  *     Backup configuration.
+ *
+ * NOTE: this function handles all of the backup configuration except for the incremental use of
+ *     force_stop. That is handled at the beginning of __backup_start because we want to deal with
+ *     that setting without any of the other cursor setup.
  */
 static int
 __backup_config(WT_SESSION_IMPL *session, WT_CURSOR_BACKUP *cb, const char *cfg[],
@@ -440,19 +442,6 @@ __backup_config(WT_SESSION_IMPL *session, WT_CURSOR_BACKUP *cb, const char *cfg[
      * Per-file offset incremental hot backup configurations take a starting checkpoint and optional
      * maximum transfer size, and the subsequent duplicate cursors take a file object.
      */
-    WT_RET_NOTFOUND_OK(__wt_config_gets(session, cfg, "incremental.force_stop", &cval));
-    if (cval.val) {
-        /*
-         * If we're force stopping incremental backup, set the flag. The resources involved in
-         * incremental backup will be released on cursor close and that is the only expected usage
-         * for this cursor.
-         */
-        if (is_dup)
-            WT_RET_MSG(session, EINVAL,
-              "Incremental force stop can only be specified on a primary backup cursor");
-        F_SET(cb, WT_CURBACKUP_FORCE_STOP);
-        return (0);
-    }
     WT_RET_NOTFOUND_OK(__wt_config_gets(session, cfg, "incremental.enabled", &cval));
     if (cval.val) {
         if (!F_ISSET(conn, WT_CONN_INCR_BACKUP)) {
@@ -504,11 +493,9 @@ __backup_config(WT_SESSION_IMPL *session, WT_CURSOR_BACKUP *cb, const char *cfg[
         if (is_dup)
             WT_ERR_MSG(session, EINVAL,
               "Incremental identifier can only be specified on a primary backup cursor");
-        ret = __backup_find_id(session, &cval, NULL);
+        WT_ERR_NOTFOUND_OK(__backup_find_id(session, &cval, NULL), true);
         if (ret == 0)
             WT_ERR_MSG(session, EINVAL, "Incremental identifier already exists");
-        if (ret != WT_NOTFOUND)
-            WT_ERR(ret);
 
         WT_ERR(__backup_add_id(session, &cval));
         incremental_config = true;
@@ -556,7 +543,7 @@ __backup_config(WT_SESSION_IMPL *session, WT_CURSOR_BACKUP *cb, const char *cfg[
             WT_ERR(ret);
         }
     }
-    WT_ERR_NOTFOUND_OK(ret);
+    WT_ERR_NOTFOUND_OK(ret, false);
 
     /*
      * Compatibility checking.
@@ -640,6 +627,9 @@ __backup_start(
          * incremental backup will be released on cursor close and that is the only expected usage
          * for this cursor.
          */
+        if (is_dup)
+            WT_RET_MSG(session, EINVAL,
+              "Incremental force stop can only be specified on a primary backup cursor");
         F_SET(cb, WT_CURBACKUP_FORCE_STOP);
         return (0);
     }
@@ -688,20 +678,15 @@ __backup_start(
     }
     if (!target_list) {
         /*
-         * It's important to first gather the log files to be copied
-         * (which internally starts a new log file), followed by
-         * choosing a checkpoint to reference in the WiredTiger.backup
-         * file.
+         * It's important to first gather the log files to be copied (which internally starts a new
+         * log file), followed by choosing a checkpoint to reference in the WiredTiger.backup file.
          *
-         * Applications may have logic that takes a checkpoint, followed
-         * by performing a write that should only appear in the new
-         * checkpoint. This ordering prevents choosing the prior
-         * checkpoint, but including the write in the log files
-         * returned.
+         * Applications may have logic that takes a checkpoint, followed by performing a write that
+         * should only appear in the new checkpoint. This ordering prevents choosing the prior
+         * checkpoint, but including the write in the log files returned.
          *
-         * It is also possible, and considered legal, to choose the new
-         * checkpoint, but not include the log file that contains the
-         * log entry for taking the new checkpoint.
+         * It is also possible, and considered legal, to choose the new checkpoint, but not include
+         * the log file that contains the log entry for taking the new checkpoint.
          */
         WT_ERR(__backup_log_append(session, cb, true));
         WT_ERR(__backup_all(session));
@@ -823,10 +808,6 @@ __backup_list_uri_append(WT_SESSION_IMPL *session, const char *name, bool *skip)
       !WT_PREFIX_MATCH(name, "index:") && !WT_PREFIX_MATCH(name, "lsm:") &&
       !WT_PREFIX_MATCH(name, WT_SYSTEM_PREFIX) && !WT_PREFIX_MATCH(name, "table:"))
         WT_RET_MSG(session, ENOTSUP, "hot backup is not supported for objects of type %s", name);
-
-    /* Ignore the lookaside table or system info. */
-    if (strcmp(name, WT_LAS_URI) == 0)
-        return (0);
 
     /* Add the metadata entry to the backup file. */
     WT_RET(__wt_metadata_search(session, name, &value));

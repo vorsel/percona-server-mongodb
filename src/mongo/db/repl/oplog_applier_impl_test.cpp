@@ -56,6 +56,7 @@
 #include "mongo/db/repl/idempotency_test_fixture.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplog_applier.h"
+#include "mongo/db/repl/oplog_entry_test_helpers.h"
 #include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_process.h"
@@ -1486,7 +1487,11 @@ void testWorkerMultikeyPaths(OperationContext* opCtx,
 }
 
 TEST_F(OplogApplierImplTest, OplogApplicationThreadFuncAddsWorkerMultikeyPathInfoOnInsert) {
-    NamespaceString nss("local." + _agent.getSuiteName() + "_" + _agent.getTestName());
+    // Set the state as secondary as we are going to apply createIndexes oplog entry.
+    ASSERT_OK(
+        ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_SECONDARY));
+
+    NamespaceString nss("test." + _agent.getSuiteName() + "_" + _agent.getTestName());
 
     {
         auto op = makeCreateCollectionOplogEntry(
@@ -1507,7 +1512,11 @@ TEST_F(OplogApplierImplTest, OplogApplicationThreadFuncAddsWorkerMultikeyPathInf
 }
 
 TEST_F(OplogApplierImplTest, OplogApplicationThreadFuncAddsMultipleWorkerMultikeyPathInfo) {
-    NamespaceString nss("local." + _agent.getSuiteName() + "_" + _agent.getTestName());
+    // Set the state as secondary as we are going to apply createIndexes oplog entry.
+    ASSERT_OK(
+        ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_SECONDARY));
+
+    NamespaceString nss("test." + _agent.getSuiteName() + "_" + _agent.getTestName());
 
     {
         auto op = makeCreateCollectionOplogEntry(
@@ -3123,6 +3132,26 @@ TEST_F(IdempotencyTest, ConvertToCappedNamespaceNotFound) {
     // Ensure that autoColl.getCollection() and autoColl.getDb() are both null.
     ASSERT_FALSE(autoColl.getCollection());
     ASSERT_FALSE(autoColl.getDb());
+}
+
+TEST_F(IdempotencyTest, IgnoreMultipleTextIndexErrorFromSystemConnection) {
+    ASSERT_OK(
+        ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING));
+    ASSERT_OK(runOpInitialSync(createCollection(kUuid)));
+    ASSERT_OK(runOpInitialSync(insert(fromjson("{_id: 1, a: '1', b: '2'}"))));
+    // Building multiple non-compound indexes on different field results in an IndexOptionsConflict
+    // error code, which is already explicitly ignored during oplog application. In order to test
+    // ignoring the correct multiple text index error, we use compound indexes.
+    auto addA = buildIndex(fromjson("{a: 'text', b: 1}"), BSONObj(), kUuid);
+    ASSERT_OK(runOpInitialSync(addA));
+    // Building a second text index should succeed as only users are limited to one
+    // text index per collection. Trying to build indexA a second time should fail, but the error
+    // will be ignored.
+    auto indexB = buildIndex(fromjson("{b: 'text', c: 1}"), BSONObj(), kUuid);
+    auto dropB = dropIndex("b_index", kUuid);
+    auto ops = {indexB, dropB, addA};
+    testOpsAreIdempotent(ops);
+    ASSERT_OK(runOpsInitialSync(ops));
 }
 
 typedef SetSteadyStateConstraints<IdempotencyTest, false>

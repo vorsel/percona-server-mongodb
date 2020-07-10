@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/base/shim.h"
 #include "mongo/base/status.h"
@@ -300,6 +300,18 @@ Status waitForReadConcernImpl(OperationContext* opCtx,
         }
     }
 
+    if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern) {
+        if (replCoord->getReplicationMode() != repl::ReplicationCoordinator::modeReplSet) {
+            return {ErrorCodes::NotAReplicaSet,
+                    "node needs to be a replica set member to use readConcern: snapshot"};
+        }
+        if (!opCtx->inMultiDocumentTransaction() && !serverGlobalParams.enableMajorityReadConcern) {
+            return {ErrorCodes::ReadConcernMajorityNotEnabled,
+                    "read concern level snapshot is not supported when "
+                    "enableMajorityReadConcern=false"};
+        }
+    }
+
     auto afterClusterTime = readConcernArgs.getArgsAfterClusterTime();
     auto atClusterTime = readConcernArgs.getArgsAtClusterTime();
 
@@ -336,8 +348,9 @@ Status waitForReadConcernImpl(OperationContext* opCtx,
             if (!status.isOK()) {
                 LOGV2(20990,
                       "Failed noop write at clusterTime: {targetClusterTime} due to {status}",
-                      "targetClusterTime"_attr = targetClusterTime->toString(),
-                      "status"_attr = status.toString());
+                      "Failed noop write",
+                      "targetClusterTime"_attr = targetClusterTime,
+                      "error"_attr = status);
             }
         }
 
@@ -346,13 +359,6 @@ Status waitForReadConcernImpl(OperationContext* opCtx,
             if (!status.isOK()) {
                 return status;
             }
-        }
-    }
-
-    if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern) {
-        if (replCoord->getReplicationMode() != repl::ReplicationCoordinator::modeReplSet) {
-            return {ErrorCodes::NotAReplicaSet,
-                    "node needs to be a replica set member to use readConcern: snapshot"};
         }
     }
 
@@ -383,7 +389,7 @@ Status waitForReadConcernImpl(OperationContext* opCtx,
 
         LOGV2_DEBUG(
             20991,
-            logSeverityV1toV2(debugLevel).toInt(),
+            debugLevel,
             "Waiting for 'committed' snapshot to be available for reading: {readConcernArgs}",
             "readConcernArgs"_attr = readConcernArgs);
 
@@ -392,8 +398,7 @@ Status waitForReadConcernImpl(OperationContext* opCtx,
 
         // Wait until a snapshot is available.
         while (status == ErrorCodes::ReadConcernMajorityNotAvailableYet) {
-            LOGV2_DEBUG(
-                20992, logSeverityV1toV2(debugLevel).toInt(), "Snapshot not available yet.");
+            LOGV2_DEBUG(20992, debugLevel, "Snapshot not available yet.");
             replCoord->waitUntilSnapshotCommitted(opCtx, Timestamp());
             status = opCtx->recoveryUnit()->obtainMajorityCommittedSnapshot();
         }
@@ -403,7 +408,7 @@ Status waitForReadConcernImpl(OperationContext* opCtx,
         }
 
         LOGV2_DEBUG(20993,
-                    logSeverityV1toV2(debugLevel).toInt(),
+                    debugLevel,
                     "Using 'committed' snapshot: {CurOp_get_opCtx_opDescription} with readTs: "
                     "{opCtx_recoveryUnit_getPointInTimeReadTimestamp}",
                     "CurOp_get_opCtx_opDescription"_attr = CurOp::get(opCtx)->opDescription(),

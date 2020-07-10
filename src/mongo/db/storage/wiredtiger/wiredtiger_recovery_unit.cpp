@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -53,6 +53,8 @@ namespace {
 MONGO_FAIL_POINT_DEFINE(WTAlwaysNotifyPrepareConflictWaiters);
 
 logv2::LogSeverity kSlowTransactionSeverity = logv2::LogSeverity::Debug(1);
+
+MONGO_FAIL_POINT_DEFINE(doUntimestampedWritesForIdempotencyTests);
 
 }  // namespace
 
@@ -354,7 +356,9 @@ void WiredTigerRecoveryUnit::_txnClose(bool commit) {
             // read timestamp.
             invariant(_readAtTimestamp.isNull() || _commitTimestamp >= _readAtTimestamp);
 
-            conf << "commit_timestamp=" << integerToHex(_commitTimestamp.asULL()) << ",";
+            if (MONGO_likely(!doUntimestampedWritesForIdempotencyTests.shouldFail())) {
+                conf << "commit_timestamp=" << integerToHex(_commitTimestamp.asULL()) << ",";
+            }
             _isTimestamped = true;
         }
 
@@ -654,6 +658,11 @@ Status WiredTigerRecoveryUnit::setTimestamp(Timestamp timestamp) {
 
     // Starts the WT transaction associated with this session.
     getSession();
+
+    if (MONGO_unlikely(doUntimestampedWritesForIdempotencyTests.shouldFail())) {
+        _isTimestamped = true;
+        return Status::OK();
+    }
 
     const std::string conf = "commit_timestamp=" + integerToHex(timestamp.asULL());
     auto rc = session->timestamp_transaction(session, conf.c_str());
