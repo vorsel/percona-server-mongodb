@@ -39,13 +39,16 @@
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/field_parser.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/range_arithmetic.h"
 #include "mongo/db/s/chunk_move_write_concern_options.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
+#include "mongo/db/s/migration_util.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
+#include "mongo/db/s/sharding_runtime_d_params_gen.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_context.h"
 #include "mongo/logv2/log.h"
@@ -57,8 +60,12 @@ namespace {
 enum class CleanupResult { kDone, kContinue, kError };
 
 /**
+ * In FCV 4.2 or if the resumable range deleter is disabled:
  * Cleans up one range of orphaned data starting from a range that overlaps or starts at
  * 'startingFromKey'.  If empty, startingFromKey is the minimum key of the sharded range.
+ *
+ * If the resumable range deleter is enabled:
+ * Waits for all possibly orphaned ranges on 'nss' to be cleaned up.
  *
  * @return CleanupResult::kContinue and 'stoppedAtKey' if orphaned range was found and cleaned
  * @return CleanupResult::kDone if no orphaned ranges remain
@@ -71,79 +78,177 @@ CleanupResult cleanupOrphanedData(OperationContext* opCtx,
                                   const BSONObj& startingFromKeyConst,
                                   BSONObj* stoppedAtKey,
                                   std::string* errMsg) {
-    BSONObj startingFromKey = startingFromKeyConst;
-    boost::optional<ChunkRange> targetRange;
-    SharedSemiFuture<void> cleanupCompleteFuture;
+    FixedFCVRegion fixedFCVRegion(opCtx);
 
-    {
-        AutoGetCollection autoColl(opCtx, ns, MODE_IX);
-        auto* const css = CollectionShardingRuntime::get(opCtx, ns);
-        const auto collDesc = css->getCollectionDescription();
-        if (!collDesc.isSharded()) {
-            LOGV2(21911,
-                  "skipping orphaned data cleanup for {ns_ns}, collection is not sharded",
-                  "ns_ns"_attr = ns.ns());
-            return CleanupResult::kDone;
+    auto fcvVersion = serverGlobalParams.featureCompatibility.getVersion();
+    uassert(ErrorCodes::ConflictingOperationInProgress,
+            "Cannot run cleanupOrphaned while the FCV is upgrading or downgrading",
+            fcvVersion == ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo42 ||
+                fcvVersion ==
+                    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44);
+
+    // Note that 'disableResumableRangeDeleter' is a startup-only parameter, so it cannot change
+    // while this process is running.
+    if (fcvVersion == ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44 &&
+        !disableResumableRangeDeleter.load()) {
+        boost::optional<ChunkRange> range;
+        boost::optional<UUID> collectionUuid;
+        {
+            AutoGetCollection autoColl(opCtx, ns, MODE_IX);
+            if (!autoColl.getCollection()) {
+                LOGV2(4416000,
+                      "cleanupOrphaned skipping waiting for orphaned data cleanup because "
+                      "{namespace} does not exist",
+                      "cleanupOrphaned skipping waiting for orphaned data cleanup because "
+                      "collection does not exist",
+                      "namespace"_attr = ns.ns());
+                return CleanupResult::kDone;
+            }
+            collectionUuid.emplace(autoColl.getCollection()->uuid());
+
+            auto* const css = CollectionShardingRuntime::get(opCtx, ns);
+            const auto collDesc = css->getCollectionDescription();
+            if (!collDesc.isSharded()) {
+                LOGV2(4416001,
+                      "cleanupOrphaned skipping waiting for orphaned data cleanup because "
+                      "{namespace} is not sharded",
+                      "cleanupOrphaned skipping waiting for orphaned data cleanup because "
+                      "collection is not sharded",
+                      "namespace"_attr = ns.ns());
+                return CleanupResult::kDone;
+            }
+            range.emplace(collDesc.getMinKey(), collDesc.getMaxKey());
+
+            // Though the 'startingFromKey' parameter is not used as the min key of the range to
+            // wait for, we still validate that 'startingFromKey' in the same way as the original
+            // cleanupOrphaned logic did if 'startingFromKey' is present.
+            BSONObj keyPattern = collDesc.getKeyPattern();
+            if (!startingFromKeyConst.isEmpty() && !collDesc.isValidKey(startingFromKeyConst)) {
+                LOGV2_ERROR_OPTIONS(
+                    4416002,
+                    {logv2::UserAssertAfterLog(ErrorCodes::OrphanedRangeCleanUpFailed)},
+                    "Could not cleanup orphaned data because start key does not match shard key "
+                    "pattern",
+                    "startKey"_attr = startingFromKeyConst,
+                    "shardKeyPattern"_attr = keyPattern);
+            }
         }
 
-        BSONObj keyPattern = collDesc.getKeyPattern();
-        if (!startingFromKey.isEmpty()) {
-            if (!collDesc.isValidKey(startingFromKey)) {
-                *errMsg = str::stream()
-                    << "could not cleanup orphaned data, start key " << startingFromKey
-                    << " does not match shard key pattern " << keyPattern;
+        // We actually want to wait until there are no range deletion tasks for this namespace/UUID,
+        // but we don't have a good way to wait for that event, so instead we wait for there to be
+        // no tasks being processed in memory for this namespace/UUID.
+        // However, it's possible this node has recently stepped up, and the stepup recovery task to
+        // resubmit range deletion tasks for processing has not yet completed. In that case,
+        // waitForClean will return though there are still tasks in config.rangeDeletions, so we
+        // sleep for a short time and then try waitForClean again.
+        while (auto numRemainingDeletionTasks =
+                   migrationutil::checkForConflictingDeletions(opCtx, *range, *collectionUuid)) {
+            LOGV2(4416003,
+                  "cleanupOrphaned going to wait for range deletion tasks to complete",
+                  "namespace"_attr = ns.ns(),
+                  "collectionUUID"_attr = *collectionUuid,
+                  "numRemainingDeletionTasks"_attr = numRemainingDeletionTasks);
 
-                LOGV2(21912, "{errMsg}", "errMsg"_attr = *errMsg);
+            auto status =
+                CollectionShardingRuntime::waitForClean(opCtx, ns, *collectionUuid, *range);
+
+            if (!status.isOK()) {
+                *errMsg = status.reason();
                 return CleanupResult::kError;
             }
-        } else {
-            startingFromKey = collDesc.getMinKey();
+
+            opCtx->sleepFor(Milliseconds(1000));
         }
 
-        targetRange = css->getNextOrphanRange(startingFromKey);
-        if (!targetRange) {
-            LOGV2_DEBUG(21913,
-                        1,
-                        "cleanupOrphaned requested for {ns} starting from {startingFromKey}, no "
-                        "orphan ranges remain",
-                        "ns"_attr = ns.toString(),
-                        "startingFromKey"_attr = redact(startingFromKey));
+        return CleanupResult::kDone;
+    } else {
 
-            return CleanupResult::kDone;
+        BSONObj startingFromKey = startingFromKeyConst;
+        boost::optional<ChunkRange> targetRange;
+        SharedSemiFuture<void> cleanupCompleteFuture;
+
+        {
+            AutoGetCollection autoColl(opCtx, ns, MODE_IX);
+            auto* const css = CollectionShardingRuntime::get(opCtx, ns);
+            const auto collDesc = css->getCollectionDescription();
+            if (!collDesc.isSharded()) {
+                LOGV2(21911,
+                      "cleanupOrphaned skipping orphaned data cleanup because collection is not "
+                      "sharded",
+                      "namespace"_attr = ns.ns());
+                return CleanupResult::kDone;
+            }
+
+            BSONObj keyPattern = collDesc.getKeyPattern();
+            if (!startingFromKey.isEmpty()) {
+                if (!collDesc.isValidKey(startingFromKey)) {
+                    LOGV2_ERROR_OPTIONS(
+                        21912,
+                        {logv2::UserAssertAfterLog(ErrorCodes::OrphanedRangeCleanUpFailed)},
+                        "Could not cleanup orphaned data, start key {startKey} does not match "
+                        "shard key pattern {shardKeyPattern}",
+                        "Could not cleanup orphaned data because start key does not match shard "
+                        "key pattern",
+                        "startKey"_attr = startingFromKey,
+                        "shardKeyPattern"_attr = keyPattern);
+                }
+            } else {
+                startingFromKey = collDesc.getMinKey();
+            }
+
+            targetRange = css->getNextOrphanRange(startingFromKey);
+            if (!targetRange) {
+                LOGV2_DEBUG(21913,
+                            1,
+                            "cleanupOrphaned returning because no orphan ranges remain",
+                            "namespace"_attr = ns.toString(),
+                            "startingFromKey"_attr = redact(startingFromKey));
+
+                return CleanupResult::kDone;
+            }
+
+            *stoppedAtKey = targetRange->getMax();
+
+            cleanupCompleteFuture =
+                css->cleanUpRange(*targetRange, boost::none, CollectionShardingRuntime::kNow);
         }
 
-        *stoppedAtKey = targetRange->getMax();
+        // Sleep waiting for our own deletion. We don't actually care about any others, so there is
+        // no need to call css::waitForClean() here.
 
-        cleanupCompleteFuture =
-            css->cleanUpRange(*targetRange, boost::none, CollectionShardingRuntime::kNow);
+        LOGV2_DEBUG(21914,
+                    1,
+                    "cleanupOrphaned requested for {namespace} starting from {startingFromKey}, "
+                    "removing next orphan range {targetRange}; waiting...",
+                    "cleanupOrphaned requested",
+                    "namespace"_attr = ns.toString(),
+                    "startingFromKey"_attr = redact(startingFromKey),
+                    "targetRange"_attr = redact(targetRange->toString()));
+
+        Status result = cleanupCompleteFuture.getNoThrow(opCtx);
+
+        LOGV2_DEBUG(21915,
+                    1,
+                    "Finished waiting for last {namespace} orphan range cleanup",
+                    "Finished waiting for last orphan range cleanup in collection",
+                    "namespace"_attr = ns.toString());
+
+        if (!result.isOK()) {
+            LOGV2_ERROR_OPTIONS(21916,
+                                {logv2::UserAssertAfterLog(result.code())},
+                                "Error waiting for last {namespace} orphan range cleanup: {error}",
+                                "Error waiting for last orphan range cleanup in collection",
+                                "namespace"_attr = ns.ns(),
+                                "error"_attr = redact(result.reason()));
+        }
+
+        return CleanupResult::kContinue;
     }
-
-    // Sleep waiting for our own deletion. We don't actually care about any others, so there is no
-    // need to call css::waitForClean() here.
-
-    LOGV2_DEBUG(21914,
-                1,
-                "cleanupOrphaned requested for {ns} starting from {startingFromKey}, removing next "
-                "orphan range {targetRange}; waiting...",
-                "ns"_attr = ns.toString(),
-                "startingFromKey"_attr = redact(startingFromKey),
-                "targetRange"_attr = redact(targetRange->toString()));
-
-    Status result = cleanupCompleteFuture.getNoThrow(opCtx);
-
-    LOGV2_DEBUG(
-        21915, 1, "Finished waiting for last {ns} orphan range cleanup", "ns"_attr = ns.toString());
-
-    if (!result.isOK()) {
-        LOGV2(21916, "{result_reason}", "result_reason"_attr = redact(result.reason()));
-        *errMsg = result.reason();
-        return CleanupResult::kError;
-    }
-
-    return CleanupResult::kContinue;
 }
 
 /**
+ * In FCV 4.2 or if 'disableResumableRangeDeleter=true':
+ *
  * Cleanup orphaned data command.  Called on a particular namespace, and if the collection
  * is sharded will clean up a single orphaned data range which overlaps or starts after a
  * passed-in 'startingFromKey'.  Returns true and a 'stoppedAtKey' (which will start a
@@ -170,6 +275,20 @@ CleanupResult cleanupOrphanedData(OperationContext* opCtx,
  *      // defaults to { w: "majority", wtimeout: 60000 }. Applies to individual writes.
  *      writeConcern: { <writeConcern options> }
  * }
+ *
+ * In FCV 4.4 if 'disableResumableRangeDeleter=false':
+ *
+ * Called on a particular namespace, and if the collection is sharded will wait for the number of
+ * range deletion tasks on the collection on this shard to reach zero. Returns true on completion,
+ * but never returns 'stoppedAtKey', since it always returns once there are no more orphaned ranges.
+ *
+ * If the collection is not sharded, returns true and no 'stoppedAtKey'.
+ * On failure, returns false and an error message.
+ *
+ * As in FCV 4.2, since the sharding state may change after this call returns, there is no guarantee
+ * that orphans won't re-appear as a result of migrations that commit after this call returns.
+ *
+ * Safe to call with the balancer on.
  */
 class CleanupOrphanedCommand : public ErrmsgCommandDeprecated {
 public:

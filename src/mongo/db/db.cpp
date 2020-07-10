@@ -121,7 +121,7 @@
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/repl/topology_coordinator.h"
 #include "mongo/db/repl_set_member_in_standalone_mode.h"
-#include "mongo/db/s/balancer/balancer.h"
+#include "mongo/db/replica_set_aware_service.h"
 #include "mongo/db/s/collection_sharding_state_factory_shard.h"
 #include "mongo/db/s/collection_sharding_state_factory_standalone.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
@@ -140,6 +140,7 @@
 #include "mongo/db/startup_warnings_mongod.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/storage/backup_cursor_hooks.h"
+#include "mongo/db/storage/control/storage_control.h"
 #include "mongo/db/storage/encryption_hooks.h"
 #include "mongo/db/storage/flow_control.h"
 #include "mongo/db/storage/flow_control_parameters_gen.h"
@@ -309,10 +310,11 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
         ProcessId pid = ProcessId::getCurrent();
         const bool is32bit = sizeof(int*) == 4;
         LOGV2(4615611,
+              "MongoDB starting : pid={pid} port={port} dbpath={dbPath} {architecture} host={host}",
               "MongoDB starting",
               "pid"_attr = pid.toNative(),
               "port"_attr = serverGlobalParams.port,
-              "dbpath"_attr = boost::filesystem::path(storageGlobalParams.dbpath).generic_string(),
+              "dbPath"_attr = boost::filesystem::path(storageGlobalParams.dbpath).generic_string(),
               "architecture"_attr = (is32bit ? "32-bit" : "64-bit"),
               "host"_attr = getHostNameCached());
     }
@@ -325,7 +327,7 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
     VersionInfoInterface::instance().logTargetMinOS();
 #endif
 
-    logProcessDetails();
+    logProcessDetails(nullptr);
 
     serviceContext->setServiceEntryPoint(std::make_unique<ServiceEntryPointMongod>(serviceContext));
 
@@ -341,7 +343,10 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
             transport::TransportLayerManager::createWithConfig(&serverGlobalParams, serviceContext);
         auto res = tl->setup();
         if (!res.isOK()) {
-            LOGV2_ERROR(20568, "Failed to set up listener: {res}", "res"_attr = res);
+            LOGV2_ERROR(20568,
+                        "Error setting up listener: {error}",
+                        "Error setting up listener",
+                        "error"_attr = res);
             return EXIT_NET_ERROR;
         }
         serviceContext->setTransportLayer(std::move(tl));
@@ -352,6 +357,7 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
                          serviceContext, repl::ReplicationCoordinator::get(serviceContext)));
 
     initializeStorageEngine(serviceContext, StorageEngineInitFlags::kNone);
+    StorageControl::startStorageControls(serviceContext);
 
 #ifdef MONGO_CONFIG_WIREDTIGER_ENABLED
     if (EncryptionHooks::get(serviceContext)->restartRequired()) {
@@ -373,10 +379,11 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
             // Warn if field name matches non-active registered storage engine.
             if (isRegisteredStorageEngine(serviceContext, e.fieldName())) {
                 LOGV2_WARNING(20566,
-                              "Detected configuration for non-active storage engine {e_fieldName} "
-                              "when current storage engine is {storageGlobalParams_engine}",
-                              "e_fieldName"_attr = e.fieldName(),
-                              "storageGlobalParams_engine"_attr = storageGlobalParams.engine);
+                              "Detected configuration for non-active storage engine {fieldName} "
+                              "when current storage engine is {storageEngine}",
+                              "Detected configuration for non-active storage engine",
+                              "fieldName"_attr = e.fieldName(),
+                              "storageEngine"_attr = storageGlobalParams.engine);
             }
         }
     }
@@ -384,20 +391,22 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
     // Disallow running a storage engine that doesn't support capped collections with --profile
     if (!serviceContext->getStorageEngine()->supportsCappedCollections() &&
         serverGlobalParams.defaultProfile != 0) {
-        LOGV2(20534,
-              "Running {storageGlobalParams_engine} with profiling is not supported. Make sure you "
-              "are not using --profile.",
-              "storageGlobalParams_engine"_attr = storageGlobalParams.engine);
+        LOGV2_ERROR(20534,
+                    "Running {storageEngine} with profiling is not supported. Make sure you "
+                    "are not using --profile",
+                    "Running the selected storage engine with profiling is not supported",
+                    "storageEngine"_attr = storageGlobalParams.engine);
         exitCleanly(EXIT_BADOPTIONS);
     }
 
     // Disallow running WiredTiger with --nojournal in a replica set
     if (storageGlobalParams.engine == "wiredTiger" && !storageGlobalParams.dur &&
         replSettings.usingReplSets()) {
-        LOGV2(20535,
-              "Running wiredTiger without journaling in a replica set is not supported. Make sure "
-              "you are not using --nojournal and that storage.journal.enabled is not set to "
-              "'false'.");
+        LOGV2_ERROR(
+            20535,
+            "Running wiredTiger without journaling in a replica set is not supported. Make sure "
+            "you are not using --nojournal and that storage.journal.enabled is not set to "
+            "'false'");
         exitCleanly(EXIT_BADOPTIONS);
     }
 
@@ -440,10 +449,12 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
     try {
         nonLocalDatabases = repairDatabasesAndCheckVersion(startupOpCtx.get());
     } catch (const ExceptionFor<ErrorCodes::MustDowngrade>& error) {
-        LOGV2_FATAL_OPTIONS(20573,
-                            {logComponentV1toV2(LogComponent::kControl)},
-                            "** IMPORTANT: {error_toStatus_reason}",
-                            "error_toStatus_reason"_attr = error.toStatus().reason());
+        LOGV2_FATAL_OPTIONS(
+            20573,
+            logv2::LogOptions(logv2::LogComponent::kControl, logv2::FatalMode::kContinue),
+            "** IMPORTANT: {error}",
+            "Wrong mongod version",
+            "error"_attr = error.toStatus().reason());
         exitCleanly(EXIT_NEED_DOWNGRADE);
     }
 
@@ -465,11 +476,11 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
     }
 
     if (gFlowControlEnabled.load()) {
-        LOGV2(20536, "Flow Control is enabled on this deployment.");
+        LOGV2(20536, "Flow Control is enabled on this deployment");
     }
 
     if (storageGlobalParams.upgrade) {
-        LOGV2(20537, "finished checking dbs");
+        LOGV2(20537, "Finished checking dbs");
         exitCleanly(EXIT_CLEAN);
     }
 
@@ -485,7 +496,10 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
     if (globalAuthzManager->shouldValidateAuthSchemaOnStartup()) {
         Status status = verifySystemIndexes(startupOpCtx.get());
         if (!status.isOK()) {
-            LOGV2(20538, "{status}", "status"_attr = redact(status));
+            LOGV2_WARNING(20538,
+                          "Unable to verify system indexes: {error}",
+                          "Unable to verify system indexes",
+                          "error"_attr = redact(status));
             if (status == ErrorCodes::AuthSchemaIncompatible) {
                 exitCleanly(EXIT_NEED_UPGRADE);
             } else if (status == ErrorCodes::NotMaster) {
@@ -501,27 +515,28 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
         status =
             globalAuthzManager->getAuthorizationVersion(startupOpCtx.get(), &foundSchemaVersion);
         if (!status.isOK()) {
-            LOGV2(20539,
-                  "Auth schema version is incompatible: User and role management commands require "
-                  "auth data to have at least schema version "
-                  "{AuthorizationManager_schemaVersion26Final} but startup could not verify schema "
-                  "version: {status}",
-                  "AuthorizationManager_schemaVersion26Final"_attr =
-                      AuthorizationManager::schemaVersion26Final,
-                  "status"_attr = status);
+            LOGV2_ERROR(
+                20539,
+                "Auth schema version is incompatible: User and role management commands require "
+                "auth data to have at least schema version {minSchemaVersion} but startup could "
+                "not verify schema version: {error}",
+                "Failed to verify auth schema version",
+                "minSchemaVersion"_attr = AuthorizationManager::schemaVersion26Final,
+                "error"_attr = status);
             LOGV2(20540,
                   "To manually repair the 'authSchema' document in the admin.system.version "
                   "collection, start up with --setParameter "
-                  "startupAuthSchemaValidation=false to disable validation.");
+                  "startupAuthSchemaValidation=false to disable validation");
             exitCleanly(EXIT_NEED_UPGRADE);
         }
 
         if (foundSchemaVersion <= AuthorizationManager::schemaVersion26Final) {
-            LOGV2(20541,
-                  "This server is using MONGODB-CR, an authentication mechanism which has been "
-                  "removed from MongoDB 4.0. In order to upgrade the auth schema, first downgrade "
-                  "MongoDB binaries to version 3.6 and then run the authSchemaUpgrade command. See "
-                  "http://dochub.mongodb.org/core/3.0-upgrade-to-scram-sha-1");
+            LOGV2_ERROR(
+                20541,
+                "This server is using MONGODB-CR, an authentication mechanism which has been "
+                "removed from MongoDB 4.0. In order to upgrade the auth schema, first downgrade "
+                "MongoDB binaries to version 3.6 and then run the authSchemaUpgrade command. See "
+                "http://dochub.mongodb.org/core/3.0-upgrade-to-scram-sha-1");
             exitCleanly(EXIT_NEED_UPGRADE);
         }
     } else if (globalAuthzManager->isAuthEnabled()) {
@@ -530,15 +545,14 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
     } else {
         // If authSchemaValidation is disabled and server is running without auth,
         // warn the user and continue startup without authSchema metadata checks.
-        LOGV2_OPTIONS(20542, {logv2::LogTag::kStartupWarnings}, "");
-        LOGV2_OPTIONS(20543,
-                      {logv2::LogTag::kStartupWarnings},
-                      "** WARNING: Startup auth schema validation checks are disabled for the "
-                      "database.");
-        LOGV2_OPTIONS(20544,
-                      {logv2::LogTag::kStartupWarnings},
-                      "**          This mode should only be used to manually repair corrupted auth "
-                      "data.");
+        LOGV2_WARNING_OPTIONS(
+            20543,
+            {logv2::LogTag::kStartupWarnings},
+            "** WARNING: Startup auth schema validation checks are disabled for the database");
+        LOGV2_WARNING_OPTIONS(
+            20544,
+            {logv2::LogTag::kStartupWarnings},
+            "**          This mode should only be used to manually repair corrupted auth data");
     }
 
     WaitForMajorityService::get(serviceContext).setUp(serviceContext);
@@ -550,8 +564,9 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
         auto status = waitForShardRegistryReload(startupOpCtx.get());
         if (!status.isOK()) {
             LOGV2(20545,
-                  "Failed to load the shard registry as part of startup{causedBy_status}",
-                  "causedBy_status"_attr = causedBy(redact(status)));
+                  "Error loading shard registry at startup {error}",
+                  "Error loading shard registry at startup",
+                  "error"_attr = redact(status));
         }
     }
 
@@ -562,10 +577,9 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
                 .refreshIfNecessary(startupOpCtx.get());
         }
     } catch (const DBException& ex) {
-        LOGV2_WARNING(
-            20567,
-            "Failed to load read and write concern defaults at startup{causedBy_ex_toStatus}",
-            "causedBy_ex_toStatus"_attr = causedBy(redact(ex.toStatus())));
+        LOGV2_WARNING(20567,
+                      "Error loading read and write concern defaults at startup",
+                      "error"_attr = redact(ex));
     }
     readWriteConcernDefaultsMongodStartupChecks(startupOpCtx.get());
 
@@ -622,8 +636,6 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
                                                    ConnectionString::forLocal(),
                                                    kDistLockProcessIdForConfigServer);
 
-            Balancer::create(startupOpCtx->getServiceContext());
-
             ShardingCatalogManager::create(
                 startupOpCtx->getServiceContext(),
                 makeShardingTaskExecutor(executor::makeNetworkInterface("AddShard-TaskExecutor")));
@@ -645,34 +657,31 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
 
         replCoord->startup(startupOpCtx.get());
         if (getReplSetMemberInStandaloneMode(serviceContext)) {
-            LOGV2_OPTIONS(20546, {logv2::LogTag::kStartupWarnings}, "");
-            LOGV2_OPTIONS(20547,
-                          {logv2::LogTag::kStartupWarnings},
-                          "** WARNING: mongod started without --replSet yet document(s) are "
-                          "present in {NamespaceString_kSystemReplSetNamespace}.",
-                          "NamespaceString_kSystemReplSetNamespace"_attr =
-                              NamespaceString::kSystemReplSetNamespace);
-            LOGV2_OPTIONS(
-                20548,
+            LOGV2_WARNING_OPTIONS(
+                20547,
                 {logv2::LogTag::kStartupWarnings},
-                "**          Database contents may appear inconsistent with the oplog and may "
-                "appear to not contain");
-            LOGV2_OPTIONS(
-                20549,
+                "** WARNING: mongod started without --replSet yet document(s) are present in "
+                "{namespace}",
+                "Document(s) exist in replSet namespace, but started without --replSet",
+                "namespace"_attr = NamespaceString::kSystemReplSetNamespace);
+            LOGV2_WARNING_OPTIONS(20548,
+                                  {logv2::LogTag::kStartupWarnings},
+                                  "**          Database contents may appear inconsistent with the "
+                                  "oplog and may appear to not contain");
+            LOGV2_WARNING_OPTIONS(20549,
+                                  {logv2::LogTag::kStartupWarnings},
+                                  "**           writes that were visible when this node was "
+                                  "running as part of a replica set");
+            LOGV2_WARNING_OPTIONS(20550,
+                                  {logv2::LogTag::kStartupWarnings},
+                                  "**          Restart with --replSet unless you are doing "
+                                  "maintenance and no other clients are connected");
+            LOGV2_WARNING_OPTIONS(
+                20551,
                 {logv2::LogTag::kStartupWarnings},
-                "**          writes that were visible when this node was running as part of a "
-                "replica set.");
-            LOGV2_OPTIONS(
-                20550,
-                {logv2::LogTag::kStartupWarnings},
-                "**          Restart with --replSet unless you are doing maintenance and no "
-                "other clients are connected.");
-            LOGV2_OPTIONS(20551,
-                          {logv2::LogTag::kStartupWarnings},
-                          "**          The TTL collection monitor will not start because of this.");
-            LOGV2(20552, "**         ");
-            LOGV2(20553, " For more info see http://dochub.mongodb.org/core/ttlcollections");
-            LOGV2_OPTIONS(20554, {logv2::LogTag::kStartupWarnings}, "");
+                "**          The TTL collection monitor will not start because of this");
+            LOGV2(20553,
+                  "**          For more info see http://dochub.mongodb.org/core/ttlcollections");
         } else {
             startTTLBackgroundJob(serviceContext);
         }
@@ -724,22 +733,29 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
 
     auto start = serviceContext->getServiceExecutor()->start();
     if (!start.isOK()) {
-        LOGV2_ERROR(20570, "Failed to start the service executor: {start}", "start"_attr = start);
+        LOGV2_ERROR(20570,
+                    "Error starting service executor: {error}",
+                    "Error starting service executor",
+                    "error"_attr = start);
         return EXIT_NET_ERROR;
     }
 
     start = serviceContext->getServiceEntryPoint()->start();
     if (!start.isOK()) {
-        LOGV2_ERROR(
-            20571, "Failed to start the service entry point: {start}", "start"_attr = start);
+        LOGV2_ERROR(20571,
+                    "Error starting service entry point: {error}",
+                    "Error starting service entry point",
+                    "error"_attr = start);
         return EXIT_NET_ERROR;
     }
 
     if (!storageGlobalParams.repair) {
         start = serviceContext->getTransportLayer()->start();
         if (!start.isOK()) {
-            LOGV2_ERROR(
-                20572, "Failed to start the listener: {start}", "start"_attr = start.toString());
+            LOGV2_ERROR(20572,
+                        "Error starting listener: {error}",
+                        "Error starting listener",
+                        "error"_attr = start);
             return EXIT_NET_ERROR;
         }
     }
@@ -756,7 +772,7 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
 #endif
 
     if (MONGO_unlikely(shutdownAtStartup.shouldFail())) {
-        LOGV2(20556, "starting clean exit via failpoint");
+        LOGV2(20556, "Starting clean exit via failpoint");
         exitCleanly(EXIT_CLEAN);
     }
 
@@ -768,18 +784,25 @@ ExitCode initAndListen(ServiceContext* service, int listenPort) {
     try {
         return _initAndListen(service, listenPort);
     } catch (DBException& e) {
-        LOGV2(20557, "exception in initAndListen: {e}, terminating", "e"_attr = e.toString());
+        LOGV2_ERROR(20557,
+                    "Exception in initAndListen: {error}, terminating",
+                    "DBException in initAndListen, terminating",
+                    "error"_attr = e.toString());
         return EXIT_UNCAUGHT;
     } catch (std::exception& e) {
-        LOGV2(20558,
-              "exception in initAndListen std::exception: {e_what}, terminating",
-              "e_what"_attr = e.what());
+        LOGV2_ERROR(20558,
+                    "Exception in initAndListen std::exception: {error}, terminating",
+                    "std::exception in initAndListen, terminating",
+                    "error"_attr = e.what());
         return EXIT_UNCAUGHT;
     } catch (int& n) {
-        LOGV2(20559, "exception in initAndListen int: {n}, terminating", "n"_attr = n);
+        LOGV2_ERROR(20559,
+                    "Exception in initAndListen int: {reason}, terminating",
+                    "Exception in initAndListen, terminating",
+                    "reason"_attr = n);
         return EXIT_UNCAUGHT;
     } catch (...) {
-        LOGV2(20560, "exception in initAndListen, terminating");
+        LOGV2_ERROR(20560, "Exception in initAndListen, terminating");
         return EXIT_UNCAUGHT;
     }
 }
@@ -1046,9 +1069,10 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
             } catch (const ExceptionFor<ErrorCodes::NotMaster>&) {
                 // ignore not master errors
             } catch (const DBException& e) {
-                LOGV2(20561,
-                      "Failed to stepDown in non-command initiated shutdown path {e}",
-                      "e"_attr = e.toString());
+                LOGV2_WARNING(20561,
+                              "Error stepping down in non-command initiated shutdown path: {error}",
+                              "Error stepping down in non-command initiated shutdown path",
+                              "error"_attr = e);
             }
 
             // Even if the replCoordinator failed to step down, ensure we still shut down the
@@ -1060,12 +1084,6 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
     MirrorMaestro::shutdown(serviceContext);
 
     WaitForMajorityService::get(serviceContext).shutDown();
-
-    // Terminate the balancer thread so it doesn't leak memory.
-    if (auto balancer = Balancer::get(serviceContext)) {
-        balancer->interruptBalancer();
-        balancer->waitForBalancerToStop();
-    }
 
     // Join the logical session cache before the transport layer.
     if (auto lsc = LogicalSessionCache::get(serviceContext)) {
@@ -1081,7 +1099,7 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
     if (auto tl = serviceContext->getTransportLayer()) {
         LOGV2_OPTIONS(20562,
                       {logComponentV1toV2(LogComponent::kNetwork)},
-                      "shutdown: going to close listening sockets...");
+                      "Shutdown: going to close listening sockets");
         tl->shutdown();
     }
 
@@ -1183,7 +1201,7 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
         if (!sep->shutdown(Seconds(10))) {
             LOGV2_OPTIONS(20563,
                           {logComponentV1toV2(LogComponent::kNetwork)},
-                          "Service entry point failed to shutdown within timelimit.");
+                          "Service entry point did not shutdown within the time limit");
         }
     }
 
@@ -1193,8 +1211,8 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
         if (!status.isOK()) {
             LOGV2_OPTIONS(20564,
                           {logComponentV1toV2(LogComponent::kNetwork)},
-                          "Service executor failed to shutdown within timelimit: {status_reason}",
-                          "status_reason"_attr = status.reason());
+                          "Service executor did not shutdown within the time limit",
+                          "error"_attr = status);
         }
     }
 #endif
@@ -1223,7 +1241,7 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
     // the memory and makes leak sanitizer happy.
     ScriptEngine::dropScopeCache();
 
-    LOGV2_OPTIONS(20565, {logComponentV1toV2(LogComponent::kControl)}, "now exiting");
+    LOGV2_OPTIONS(20565, {logComponentV1toV2(LogComponent::kControl)}, "Now exiting");
 
     audit::logShutdown(client);
 
@@ -1243,10 +1261,12 @@ int mongoDbMain(int argc, char* argv[], char** envp) {
 
     Status status = mongo::runGlobalInitializers(argc, argv, envp);
     if (!status.isOK()) {
-        LOGV2_FATAL_OPTIONS(20574,
-                            {logComponentV1toV2(LogComponent::kControl)},
-                            "Failed global initialization: {status}",
-                            "status"_attr = status);
+        LOGV2_FATAL_OPTIONS(
+            20574,
+            logv2::LogOptions(logv2::LogComponent::kControl, logv2::FatalMode::kContinue),
+            "Error during global initialization: {error}",
+            "Error during global initialization",
+            "error"_attr = status);
         quickExit(EXIT_FAILURE);
     }
 
@@ -1259,10 +1279,12 @@ int mongoDbMain(int argc, char* argv[], char** envp) {
             return serviceContext;
         } catch (...) {
             auto cause = exceptionToStatus();
-            LOGV2_FATAL_OPTIONS(20575,
-                                {logComponentV1toV2(LogComponent::kControl)},
-                                "Failed to create service context: {cause}",
-                                "cause"_attr = redact(cause));
+            LOGV2_FATAL_OPTIONS(
+                20575,
+                logv2::LogOptions(logv2::LogComponent::kControl, logv2::FatalMode::kContinue),
+                "Error creating service context: {error}",
+                "Error creating service context",
+                "error"_attr = redact(cause));
             quickExit(EXIT_FAILURE);
         }
     }();

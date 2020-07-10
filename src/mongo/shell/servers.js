@@ -204,7 +204,7 @@ MongoRunner.binVersionSubs = [
     new MongoRunner.VersionSub(extractMajorVersionFromVersionString(shellVersion()),
                                shellVersion()),
     // To-be-updated when we branch for the next release.
-    new MongoRunner.VersionSub("last-stable", "4.2")
+    new MongoRunner.VersionSub("last-stable", "4.3")
 ];
 
 MongoRunner.getBinVersionFor = function(version) {
@@ -1171,7 +1171,12 @@ function appendSetParameterArgs(argArray) {
 
             // New mongod-specific option in 4.3.x.
             if (!programMajorMinorVersion || programMajorMinorVersion >= 430) {
-                if (!argArrayContainsSetParameterValue(
+                // Allow the parameter to be overridden if set explicitly via TestData.
+                if ((jsTest.options().setParameters === undefined ||
+                     jsTest.options()
+                             .setParameters['oplogApplicationEnforcesSteadyStateConstraints'] ===
+                         undefined) &&
+                    !argArrayContainsSetParameterValue(
                         'oplogApplicationEnforcesSteadyStateConstraints=')) {
                     argArray.push(...['--setParameter',
                                       'oplogApplicationEnforcesSteadyStateConstraints=true']);

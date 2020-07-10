@@ -2,7 +2,7 @@
  * Test that the validate command properly limits the index entry inconsistencies reported when
  * there is corruption on an index with a long name.
  *
- * @tags: [requires_wiredtiger]
+ * @tags: [requires_wiredtiger, requires_persistence]
  */
 (function() {
 "use strict";
@@ -29,16 +29,10 @@ function insertDocsAndBuildIndex() {
     coll.createIndex({a: 1}, {name: indexName});
 }
 
-function truncateAndRestartMongod(uri) {
-    MongoRunner.stopMongod(conn, null, {skipValidation: true});
-    runWiredTigerTool("-h", conn.dbpath, "truncate", uri);
-    conn = startMongodOnExistingPath(dbpath, {});
-    coll = conn.getDB("test").getCollection("corrupt");
-}
-
 insertDocsAndBuildIndex();
 let uri = getUriForIndex(coll, indexName);
-truncateAndRestartMongod(uri);
+conn = truncateUriAndRestartMongod(uri, conn);
+coll = conn.getDB("test").getCollection("corrupt");
 
 const missingIndexEntries = "Detected " + kNumDocs + " missing index entries.";
 const missingSizeLimitations =
@@ -53,7 +47,8 @@ assert.contains(missingSizeLimitations, res.errors);
 coll.drop();
 insertDocsAndBuildIndex();
 uri = getUriForColl(coll);
-truncateAndRestartMongod(uri);
+conn = truncateUriAndRestartMongod(uri, conn);
+coll = conn.getDB("test").getCollection("corrupt");
 
 const extraIndexEntries = "Detected " + 2 * kNumDocs + " extra index entries.";
 const extraSizeLimitations =

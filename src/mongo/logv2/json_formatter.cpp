@@ -36,16 +36,10 @@
 
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/logv2/attribute_storage.h"
 #include "mongo/logv2/attributes.h"
 #include "mongo/logv2/constants.h"
-#include "mongo/logv2/log_component.h"
-#include "mongo/logv2/log_severity.h"
-#include "mongo/logv2/log_tag.h"
-#include "mongo/logv2/log_truncation.h"
 #include "mongo/logv2/name_extractor.h"
 #include "mongo/util/str_escape.h"
-#include "mongo/util/time_support.h"
 
 #include <fmt/compile.h>
 #include <fmt/format.h>
@@ -226,25 +220,23 @@ private:
 };
 }  // namespace
 
-void JSONFormatter::operator()(boost::log::record_view const& rec,
-                               boost::log::formatting_ostream& strm) const {
-    using namespace boost::log;
-
-    // Build a JSON object for the user attributes.
-    const auto& attrs = extract<TypeErasedAttributeStorage>(attributes::attributes(), rec).get();
-
-    StringData severity =
-        extract<LogSeverity>(attributes::severity(), rec).get().toStringDataCompact();
-    StringData component =
-        extract<LogComponent>(attributes::component(), rec).get().getNameForLog();
-
-    fmt::memory_buffer buffer;
+void JSONFormatter::format(fmt::memory_buffer& buffer,
+                           LogSeverity severity,
+                           LogComponent component,
+                           Date_t date,
+                           int32_t id,
+                           StringData context,
+                           StringData message,
+                           const TypeErasedAttributeStorage& attrs,
+                           LogTag tags,
+                           LogTruncation truncation) const {
+    StringData severityString = severity.toStringDataCompact();
+    StringData componentString = component.getNameForLog();
 
     // Put all fields up until the message value
     static const auto& fmtStrOpen = *new auto(fmt::compile<StringData>(R"({{)"
                                                                        R"("{}":{{"$date":")"));
     compiled_format_to(buffer, fmtStrOpen, constants::kTimestampFieldName);
-    Date_t date = extract<Date_t>(attributes::timeStamp(), rec).get();
     switch (_timestampFormat) {
         case LogTimestampFormat::kISO8601UTC:
             outputDateAsISOStringUTC(buffer, date);
@@ -253,49 +245,55 @@ void JSONFormatter::operator()(boost::log::record_view const& rec,
             outputDateAsISOStringLocal(buffer, date);
             break;
     };
-    static const auto& fmtStrBody = *new auto(
-        fmt::compile<StringData,
-                     StringData,
-                     StringData,
-                     int,
-                     StringData,
-                     StringData,
-                     StringData,
-                     int,
-                     StringData,
-                     int32_t,
-                     StringData,
-                     StringData,
-                     StringData>(R"("}},)"              // close timestamp
-                                 R"("{}":"{}"{: <{}})"  // severity with padding for the comma
-                                 R"("{}":"{}"{: <{}})"  // component with padding for the comma
-                                 R"("{}":{},)"          // id
-                                 R"("{}":"{}",)"        // context
-                                 R"("{}":")"            // message
-                                 ));
+    static const auto& fmtStrBody =
+        *new auto(fmt::compile<StringData,  // severity start
+                               StringData,
+                               StringData,
+                               int,
+                               StringData,  // component start
+                               StringData,
+                               StringData,
+                               int,
+                               StringData,  // id start
+                               StringData,
+                               StringData,
+                               int,
+                               StringData,  // context start
+                               StringData,
+                               StringData>  // message start
+                  (R"("}},)"                // close timestamp
+                   R"("{}":"{}"{: <{}})"    // severity with padding for the comma
+                   R"("{}":"{}"{: <{}})"    // component with padding for the comma
+                   R"("{}":{}{: <{}})"      // id with padding for the comma
+                   R"("{}":"{}",)"          // context
+                   R"("{}":")"              // message
+                   ));
+    fmt::format_int idString(id);
     compiled_format_to(
         buffer,
         fmtStrBody,
         // severity, left align the comma and add padding to create fixed column width
         constants::kSeverityFieldName,
-        severity,
+        severityString,
         ","_sd,
-        3 - severity.size(),
+        3 - severityString.size(),
         // component, left align the comma and add padding to create fixed column width
         constants::kComponentFieldName,
-        component,
+        componentString,
         ","_sd,
-        9 - component.size(),
+        9 - componentString.size(),
         // id
         constants::kIdFieldName,
-        extract<int32_t>(attributes::id(), rec).get(),
+        StringData(idString.data(), idString.size()),
+        ","_sd,
+        8 - idString.size(),
         // context
         constants::kContextFieldName,
-        extract<StringData>(attributes::threadName(), rec).get(),
+        context,
         // message
         constants::kMessageFieldName);
 
-    str::escapeForJSON(buffer, extract<StringData>(attributes::message(), rec).get());
+    str::escapeForJSON(buffer, message);
     buffer.push_back('"');
 
     static const auto& fmtStrAttr = *new auto(fmt::compile<StringData>(R"(,"{}":{{)"));
@@ -304,7 +302,7 @@ void JSONFormatter::operator()(boost::log::record_view const& rec,
         compiled_format_to(buffer, fmtStrAttr, constants::kAttributesFieldName);
         // comma separated list of attributes (no opening/closing brace are added here)
         size_t attributeMaxSize = 0;
-        if (extract<LogTruncation>(attributes::truncation(), rec).get() == LogTruncation::Enabled) {
+        if (truncation == LogTruncation::Enabled) {
             if (_maxAttributeSizeKB)
                 attributeMaxSize = _maxAttributeSizeKB->loadRelaxed() * 1024;
             else
@@ -327,7 +325,6 @@ void JSONFormatter::operator()(boost::log::record_view const& rec,
         }
     }
 
-    LogTag tags = extract<LogTag>(attributes::tags(), rec).get();
     static const auto& fmtStrTags = *new auto(fmt::compile<StringData>(R"(,"{}":)"));
     if (tags != LogTag::kNone) {
         compiled_format_to(buffer, fmtStrTags, constants::kTagsFieldName);
@@ -336,6 +333,24 @@ void JSONFormatter::operator()(boost::log::record_view const& rec,
     }
 
     buffer.push_back('}');
+}
+
+void JSONFormatter::operator()(boost::log::record_view const& rec,
+                               boost::log::formatting_ostream& strm) const {
+    using boost::log::extract;
+
+    fmt::memory_buffer buffer;
+
+    format(buffer,
+           extract<LogSeverity>(attributes::severity(), rec).get(),
+           extract<LogComponent>(attributes::component(), rec).get(),
+           extract<Date_t>(attributes::timeStamp(), rec).get(),
+           extract<int32_t>(attributes::id(), rec).get(),
+           extract<StringData>(attributes::threadName(), rec).get(),
+           extract<StringData>(attributes::message(), rec).get(),
+           extract<TypeErasedAttributeStorage>(attributes::attributes(), rec).get(),
+           extract<LogTag>(attributes::tags(), rec).get(),
+           extract<LogTruncation>(attributes::truncation(), rec).get());
 
     // Write final JSON object to output stream
     strm.write(buffer.data(), buffer.size());

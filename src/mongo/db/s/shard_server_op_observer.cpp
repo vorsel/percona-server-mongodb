@@ -120,6 +120,27 @@ private:
 };
 
 /**
+ * Used to submit a range deletion task once it is certain that the update/insert to
+ * config.rangeDeletions is committed.
+ */
+class SubmitRangeDeletionHandler final : public RecoveryUnit::Change {
+public:
+    SubmitRangeDeletionHandler(OperationContext* opCtx, RangeDeletionTask task)
+        : _opCtx(opCtx), _task(std::move(task)) {}
+
+    void commit(boost::optional<Timestamp>) override {
+        migrationutil::submitRangeDeletionTask(_opCtx, _task).getAsync([](auto) {});
+    }
+
+    void rollback() override {}
+
+private:
+    OperationContext* _opCtx;
+    RangeDeletionTask _task;
+};
+
+
+/**
  * Invalidates the in-memory routing table cache when a collection is dropped, so the next caller
  * with routing information will provoke a routing table refresh and see the drop.
  *
@@ -192,21 +213,10 @@ void incrementChunkOnInsertOrUpdate(OperationContext* opCtx,
 }
 
 /**
- * Aborts any ongoing migration for the given namespace if the observed operation was sent with a
- * shard version. Should only be called when observing index operations.
- *
- * TODO SERVER-45017: Update this comment once the check for a shard version is removed.
+ * Aborts any ongoing migration for the given namespace. Should only be called when observing
+ * index operations.
  */
 void abortOngoingMigrationIfNeeded(OperationContext* opCtx, const NamespaceString nss) {
-    // Only abort migrations if the request is versioned, meaning it came from a mongos using the
-    // 4.4 index operation protocol.
-    //
-    // TODO SERVER-45017: Remove this check once 4.4. is last-stable, since all index operations
-    // sent from a mongos will have shard versions.
-    if (!OperationShardingState::isOperationVersioned(opCtx)) {
-        return;
-    }
-
     auto* const csr = CollectionShardingRuntime::get(opCtx, nss);
     auto csrLock = CollectionShardingRuntime::CSRLock::lockShared(opCtx, csr);
     auto msm = MigrationSourceManager::get(csr, csrLock);
@@ -254,8 +264,10 @@ void ShardServerOpObserver::onInserts(OperationContext* opCtx,
             auto deletionTask = RangeDeletionTask::parse(
                 IDLParserErrorContext("ShardServerOpObserver"), insertedDoc);
 
-            if (!deletionTask.getPending())
-                migrationutil::submitRangeDeletionTask(opCtx, deletionTask).getAsync([](auto) {});
+            if (!deletionTask.getPending()) {
+                opCtx->recoveryUnit()->registerChange(
+                    std::make_unique<SubmitRangeDeletionHandler>(opCtx, deletionTask));
+            }
         }
 
         if (collDesc.isSharded()) {
@@ -377,7 +389,8 @@ void ShardServerOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateE
             if (deletionTask.getDonorShardId() != ShardingState::get(opCtx)->shardId()) {
                 // Range deletion tasks for moved away chunks are scheduled through the
                 // MigrationCoordinator, so only schedule a task for received chunks.
-                migrationutil::submitRangeDeletionTask(opCtx, deletionTask).getAsync([](auto) {});
+                opCtx->recoveryUnit()->registerChange(
+                    std::make_unique<SubmitRangeDeletionHandler>(opCtx, deletionTask));
             }
         }
     }

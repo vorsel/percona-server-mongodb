@@ -199,8 +199,7 @@ public:
 
     virtual Status setFollowerMode(const MemberState& newState) override;
 
-    virtual Status setFollowerModeStrict(OperationContext* opCtx,
-                                         const MemberState& newState) override;
+    virtual Status setFollowerModeRollback(OperationContext* opCtx) override;
 
     virtual ApplierState getApplierState() override;
 
@@ -210,8 +209,6 @@ public:
     virtual Status waitForDrainFinish(Milliseconds timeout) override;
 
     virtual void signalUpstreamUpdater() override;
-
-    virtual Status resyncData(OperationContext* opCtx, bool waitUntilCompleted) override;
 
     virtual StatusWith<BSONObj> prepareReplSetUpdatePositionCommand() const override;
 
@@ -250,6 +247,8 @@ public:
                                      GetNewConfigFn getNewConfig,
                                      bool force) override;
 
+    virtual Status awaitConfigCommitment(OperationContext* opCtx) override;
+
     virtual Status processReplSetInitiate(OperationContext* opCtx,
                                           const BSONObj& configObj,
                                           BSONObjBuilder* resultObj) override;
@@ -261,8 +260,6 @@ public:
 
     virtual std::vector<HostAndPort> getHostsWrittenTo(const OpTime& op,
                                                        bool durablyWritten) override;
-
-    virtual std::vector<HostAndPort> getOtherNodesInReplSet() const override;
 
     virtual WriteConcernOptions getGetLastErrorDefault() override;
 
@@ -277,10 +274,9 @@ public:
     virtual void resetLastOpTimesFromOplog(OperationContext* opCtx,
                                            DataConsistency consistency) override;
 
-    virtual bool shouldChangeSyncSource(
-        const HostAndPort& currentSource,
-        const rpc::ReplSetMetadata& replMetadata,
-        boost::optional<rpc::OplogQueryMetadata> oqMetadata) override;
+    virtual bool shouldChangeSyncSource(const HostAndPort& currentSource,
+                                        const rpc::ReplSetMetadata& replMetadata,
+                                        const rpc::OplogQueryMetadata& oqMetadata) override;
 
     virtual OpTime getLastCommittedOpTime() const override;
     virtual OpTimeAndWallTime getLastCommittedOpTimeAndWallTime() const override;
@@ -350,7 +346,7 @@ public:
 
     virtual TopologyVersion getTopologyVersion() const override;
 
-    virtual void incrementTopologyVersion(OperationContext* opCtx) override;
+    virtual void incrementTopologyVersion() override;
 
     using SharedIsMasterResponse = std::shared_ptr<const IsMasterResponse>;
 
@@ -439,6 +435,7 @@ public:
     void cleanupStableOpTimeCandidates_forTest(std::set<OpTimeAndWallTime>* candidates,
                                                OpTimeAndWallTime stableOpTime);
     std::set<OpTimeAndWallTime> getStableOpTimeCandidates_forTest();
+    void handleHeartbeatResponse_forTest(BSONObj response, int targetIndex);
 
     /**
      * Non-blocking version of updateTerm.
@@ -1028,7 +1025,12 @@ private:
      * Fulfills the promises that are waited on by awaitable isMaster requests. This increments the
      * server TopologyVersion.
      */
-    void _fulfillTopologyChangePromise(OperationContext* opCtx, WithLock);
+    void _fulfillTopologyChangePromise(WithLock);
+
+    /**
+     * Update _canAcceptNonLocalWrites based on _topCoord->canAcceptWrites().
+     */
+    void _updateWriteAbilityFromTopologyCoordinator(WithLock lk, OperationContext* opCtx);
 
     /**
      * Updates the cached value, _memberState, to match _topCoord's reported
@@ -1037,12 +1039,8 @@ private:
      * Returns an enum indicating what action to take after releasing _mutex, if any.
      * Call performPostMemberStateUpdateAction on the return value after releasing
      * _mutex.
-     *
-     * Note: opCtx may be null as currently not all paths thread an OperationContext all the way
-     * down, but it must be non-null for any calls that change _canAcceptNonLocalWrites.
      */
-    PostMemberStateUpdateAction _updateMemberStateFromTopologyCoordinator(WithLock lk,
-                                                                          OperationContext* opCtx);
+    PostMemberStateUpdateAction _updateMemberStateFromTopologyCoordinator(WithLock lk);
 
     /**
      * Performs a post member-state update action.  Do not call while holding _mutex.

@@ -254,13 +254,12 @@ Status renameCollectionAndDropTarget(OperationContext* opCtx,
             // replicated writes are not enabled.
             if (!renameOpTime.isNull()) {
                 LOGV2_FATAL(
-                    20403,
+                    40616,
                     "renameCollection: {source} to {target} (with dropTarget=true) - unexpected "
                     "renameCollection oplog entry written to the oplog with optime {renameOpTime}",
                     "source"_attr = source,
                     "target"_attr = target,
                     "renameOpTime"_attr = renameOpTime);
-                fassertFailed(40616);
             }
             renameOpTime = renameOpTimeFromApplyOps;
         }
@@ -605,8 +604,7 @@ Status renameBetweenDBs(OperationContext* opCtx,
         }
     });
 
-    // Copy the index descriptions from the source collection, adjusting the 'ns' field if
-    // necessary.
+    // Copy the index descriptions from the source collection.
     std::vector<BSONObj> indexesToCopy;
     for (auto sourceIndIt = sourceColl->getIndexCatalog()->getIndexIterator(opCtx, true);
          sourceIndIt->more();) {
@@ -615,27 +613,7 @@ Status renameBetweenDBs(OperationContext* opCtx,
             continue;
         }
 
-        const BSONObj currIndex = descriptor->infoObj();
-
-        // In FCV 4.4, there is no 'ns' field to modify.
-        if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-            serverGlobalParams.featureCompatibility.getVersion() ==
-                ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
-            indexesToCopy.push_back(currIndex);
-            continue;
-        }
-
-        // In FCV 4.2, we must rename the 'ns' field if it exists.
-        // Process the source index, adding fields in the same order as they were originally.
-        BSONObjBuilder newIndex;
-        for (auto&& elem : currIndex) {
-            if (elem.fieldNameStringData() == "ns") {
-                newIndex.append("ns", tmpName.ns());
-            } else {
-                newIndex.append(elem);
-            }
-        }
-        indexesToCopy.push_back(newIndex.obj());
+        indexesToCopy.push_back(descriptor->infoObj());
     }
 
     // Create indexes using the index specs on the empty temporary collection that was just created.

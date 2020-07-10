@@ -10,6 +10,7 @@ env.Library(
         env.Idlc('repl_server_parameters.idl')[0]
     ],
     LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/client/read_preference',
         '$BUILD_DIR/mongo/idl/server_parameter',
     ]
 )
@@ -234,6 +235,7 @@ env.Library(
         'repl_server_parameters',
         '$BUILD_DIR/mongo/db/catalog/database_holder',
         '$BUILD_DIR/mongo/db/storage/oplog_cap_maintainer_thread',
+        '$BUILD_DIR/mongo/db/storage/storage_control',
         '$BUILD_DIR/mongo/db/logical_clock',
     ],
 )
@@ -565,6 +567,7 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/commands/mongod_fsync',
+        '$BUILD_DIR/mongo/db/storage/storage_control',
         'repl_server_parameters',
         'replication_auth',
     ],
@@ -626,10 +629,17 @@ env.Library(
     ],
 )
 
+env.Library('member_data',
+            [
+                'member_data.cpp',
+            ],
+            LIBDEPS=[
+                'replica_set_messages',
+            ])
+
 env.Library('topology_coordinator',
             [
                 'heartbeat_response_action.cpp',
-                'member_data.cpp',
                 'topology_coordinator.cpp',
                 env.Idlc('topology_coordinator.idl')[0],
             ],
@@ -638,6 +648,7 @@ env.Library('topology_coordinator',
                 '$BUILD_DIR/mongo/rpc/metadata',
                 '$BUILD_DIR/mongo/util/fail_point',
                 'isself',
+                'member_data',
                 'replica_set_messages',
                 'repl_settings',
                 'rslog',
@@ -791,6 +802,7 @@ env.Library('replica_set_messages',
                 'update_position_args.cpp',
                 'last_vote.cpp',
                 env.Idlc('repl_set_config.idl')[0],
+                env.Idlc('repl_set_config_params.idl')[0],
             ],
             LIBDEPS=[
                 '$BUILD_DIR/mongo/base',
@@ -816,14 +828,23 @@ env.Library(
     source=[
         'repl_set_command.cpp',
         'repl_set_get_status_cmd.cpp',
+        'repl_set_test_egress.cpp',
+        env.Idlc('repl_set_test_egress.idl')[0],
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/auth/auth',
         '$BUILD_DIR/mongo/db/auth/authprivilege',
         '$BUILD_DIR/mongo/db/commands',
+        '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
         '$BUILD_DIR/mongo/db/lasterror',
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/executor/connection_pool_executor',
+        '$BUILD_DIR/mongo/executor/network_interface',
+        '$BUILD_DIR/mongo/executor/network_interface_factory',
+        '$BUILD_DIR/mongo/executor/network_interface_tl',
     ],
 )
 
@@ -843,6 +864,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
         '$BUILD_DIR/mongo/db/storage/storage_options',
         'drop_pending_collection_reaper',
+        'repl_server_parameters',
         'repl_set_status_commands',
         'repl_settings',
         'replica_set_messages',
@@ -934,6 +956,8 @@ env.Library(
     LIBDEPS = [
         'task_runner',
         'initial_sync_shared_data',
+        'member_data',
+        'replication_consistency_markers_impl',
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/client/clientdriver_network',
         '$BUILD_DIR/mongo/util/concurrency/thread_pool',
@@ -1167,10 +1191,12 @@ env.Library(
         'rollback_source_impl',
     ],
     LIBDEPS_PRIVATE=[
-        'local_oplog_info',
         '$BUILD_DIR/mongo/db/commands/mongod_fcv',
         '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
         '$BUILD_DIR/mongo/db/index_builds_coordinator_interface',
+        '$BUILD_DIR/mongo/db/replica_set_aware_service',
+        '$BUILD_DIR/mongo/db/storage/storage_control',
+        'local_oplog_info',
         'repl_server_parameters',
     ],
 )

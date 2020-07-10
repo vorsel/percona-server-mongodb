@@ -82,6 +82,11 @@ bool secondaryPredicate(const ServerDescriptionPtr& server) {
     return server->getType() == ServerType::kRSSecondary;
 }
 
+bool primaryOrSecondaryPredicate(const ServerDescriptionPtr& server) {
+    const auto serverType = server->getType();
+    return serverType == ServerType::kRSPrimary || serverType == ServerType::kRSSecondary;
+}
+
 std::string readPrefToStringWithMinOpTime(const ReadPreferenceSetting& readPref) {
     BSONObjBuilder builder;
     readPref.toInnerBSON(&builder);
@@ -167,11 +172,19 @@ void StreamableReplicaSetMonitor::init() {
     _topologyManager = std::make_unique<TopologyManager>(
         _sdamConfig, getGlobalServiceContext()->getPreciseClockSource(), _eventsPublisher);
 
+    _eventsPublisher->registerListener(shared_from_this());
+
+    _pingMonitor =
+        std::make_unique<ServerPingMonitor>(_uri,
+                                            _eventsPublisher.get(),
+                                            sdam::SdamConfiguration::kDefaultHeartbeatFrequencyMs,
+                                            _executor);
+    _eventsPublisher->registerListener(_pingMonitor);
+
     _isMasterMonitor = std::make_unique<ServerIsMasterMonitor>(
         _uri, _sdamConfig, _eventsPublisher, _topologyManager->getTopologyDescription(), _executor);
-
-    _eventsPublisher->registerListener(shared_from_this());
     _eventsPublisher->registerListener(_isMasterMonitor);
+
     _isDropped.store(false);
 
     ReplicaSetMonitorManager::get()->getNotifier().onFoundSet(getName());
@@ -185,6 +198,7 @@ void StreamableReplicaSetMonitor::drop() {
     LOGV2(4333209, "Closing Replica Set Monitor {setName}", "setName"_attr = getName());
     _eventsPublisher->close();
     _queryProcessor->shutdown();
+    _pingMonitor->shutdown();
     _isMasterMonitor->shutdown();
     _failOutstandingWithStatus(
         lock, Status{ErrorCodes::ShutdownInProgress, "the ReplicaSetMonitor is shutting down"});
@@ -226,12 +240,6 @@ SemiFuture<std::vector<HostAndPort>> StreamableReplicaSetMonitor::getHostsOrRefr
     // try to satisfy query immediately
     auto immediateResult = _getHosts(criteria);
     if (immediateResult) {
-        LOGV2_DEBUG(4333211,
-                    kLowerLogLevel,
-                    "RSM {setName} getHosts: {readPref} -> {result}",
-                    "readPref"_attr = readPrefToStringWithMinOpTime(criteria),
-                    "setName"_attr = getName(),
-                    "result"_attr = hostListToString(immediateResult));
         return {*immediateResult};
     }
 
@@ -483,34 +491,79 @@ sdam::TopologyDescriptionPtr StreamableReplicaSetMonitor::_currentTopology() con
     return _topologyManager->getTopologyDescription();
 }
 
+void StreamableReplicaSetMonitor::_setConfirmedNotifierState(
+    WithLock, const ServerDescriptionPtr& primaryDescription) {
+    invariant(primaryDescription && primaryDescription->getType() == sdam::ServerType::kRSPrimary);
+
+    const auto& hosts = primaryDescription->getHosts();
+    const auto& passives = primaryDescription->getPassives();
+
+    // TODO SERVER-45395: remove need for HostAndPort conversion
+    std::set<HostAndPort> confirmedHosts;
+    std::transform(hosts.begin(),
+                   hosts.end(),
+                   std::inserter(confirmedHosts, confirmedHosts.end()),
+                   [](const ServerAddress& addr) -> HostAndPort { return HostAndPort(addr); });
+
+    std::set<HostAndPort> confirmedPassives;
+    std::transform(passives.begin(),
+                   passives.end(),
+                   std::inserter(confirmedPassives, confirmedPassives.end()),
+                   [](const ServerAddress& addr) -> HostAndPort { return HostAndPort(addr); });
+
+    confirmedHosts.insert(confirmedPassives.begin(), confirmedPassives.end());
+
+    _confirmedNotifierState = ChangeNotifierState{
+        HostAndPort(primaryDescription->getAddress()),
+        confirmedPassives,
+        ConnectionString::forReplicaSet(
+            getName(), std::vector<HostAndPort>(confirmedHosts.begin(), confirmedHosts.end()))};
+}
+
 void StreamableReplicaSetMonitor::onTopologyDescriptionChangedEvent(
     UUID topologyId,
     TopologyDescriptionPtr previousDescription,
     TopologyDescriptionPtr newDescription) {
+    stdx::lock_guard lock(_mutex);
+    if (_isDropped.load())
+        return;
 
-    // notify external components, if there are membership
-    // changes in the topology.
+    // Notify external components if there are membership changes in the topology.
     if (_hasMembershipChange(previousDescription, newDescription)) {
         LOGV2(4333213,
               "RSM {setName} Topology Change: {topologyDescription}",
               "setName"_attr = getName(),
               "topologyDescription"_attr = newDescription->toString());
 
-        // TODO SERVER-45395: remove when HostAndPort conversion is done
-        std::vector<HostAndPort> servers = _extractHosts(newDescription->getServers());
-
-        auto connectionString = ConnectionString::forReplicaSet(getName(), servers);
         auto maybePrimary = newDescription->getPrimary();
         if (maybePrimary) {
-            // TODO SERVER-45395: remove need for HostAndPort conversion
-            auto hostList = _extractHosts(newDescription->findServers(secondaryPredicate));
-            std::set<HostAndPort> secondaries(hostList.begin(), hostList.end());
+            _setConfirmedNotifierState(lock, *maybePrimary);
 
-            auto primaryAddress = HostAndPort((*maybePrimary)->getAddress());
             ReplicaSetMonitorManager::get()->getNotifier().onConfirmedSet(
-                connectionString, primaryAddress, secondaries);
+                _confirmedNotifierState->connectionString,
+                _confirmedNotifierState->primaryAddress,
+                _confirmedNotifierState->passives);
         } else {
-            ReplicaSetMonitorManager::get()->getNotifier().onPossibleSet(connectionString);
+            if (_confirmedNotifierState) {
+                const auto& connectionString = _confirmedNotifierState->connectionString;
+                ReplicaSetMonitorManager::get()->getNotifier().onPossibleSet(connectionString);
+            } else {
+                // No confirmed hosts yet, just send list of hosts that are routable base on type.
+                const auto& primaryAndSecondaries =
+                    newDescription->findServers(primaryOrSecondaryPredicate);
+                if (primaryAndSecondaries.size() == 0) {
+                    LOGV2_DEBUG(4645401,
+                                kLowerLogLevel,
+                                "Skip publishing unconfirmed replica set members since there are "
+                                "no primaries or secondaries in the new topology",
+                                "replicaSetName"_attr = getName());
+                    return;
+                }
+
+                const auto connectionString = ConnectionString::forReplicaSet(
+                    getName(), _extractHosts(primaryAndSecondaries));
+                ReplicaSetMonitorManager::get()->getNotifier().onPossibleSet(connectionString);
+            }
         }
     }
 }
@@ -518,7 +571,8 @@ void StreamableReplicaSetMonitor::onTopologyDescriptionChangedEvent(
 void StreamableReplicaSetMonitor::onServerHeartbeatSucceededEvent(sdam::IsMasterRTT durationMs,
                                                                   const ServerAddress& hostAndPort,
                                                                   const BSONObj reply) {
-    IsMasterOutcome outcome(hostAndPort, reply, durationMs);
+    // After the inital handshake, isMasterResponses should not update the RTT with durationMs.
+    IsMasterOutcome outcome(hostAndPort, reply, boost::none);
     _topologyManager->onServerDescription(outcome);
 }
 
@@ -532,11 +586,23 @@ void StreamableReplicaSetMonitor::onServerHeartbeatFailureEvent(IsMasterRTT dura
 
 void StreamableReplicaSetMonitor::onServerPingFailedEvent(const ServerAddress& hostAndPort,
                                                           const Status& status) {
+    LOGV2_DEBUG(4668133,
+                0,
+                " StreamableReplicaSetMonitor::onServerPingFailedEvent, ServerPingMonitor got "
+                "status{status} ",
+                "addr"_attr = hostAndPort,
+                "status"_attr = status);
     failedHost(HostAndPort(hostAndPort), status);
 }
 
 void StreamableReplicaSetMonitor::onServerPingSucceededEvent(sdam::IsMasterRTT durationMS,
                                                              const ServerAddress& hostAndPort) {
+    LOGV2_DEBUG(4668132,
+                1,
+                " StreamableReplicaSetMonitor::onServerPingSucceededEvent, ServerPingMonitor for  "
+                "{addr}  with {rtt}",
+                "addr"_attr = hostAndPort,
+                "rtt"_attr = durationMS);
     _topologyManager->onServerRTTUpdated(hostAndPort, durationMS);
 }
 

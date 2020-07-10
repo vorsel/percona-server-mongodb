@@ -307,14 +307,15 @@ void MirrorMaestroImpl::_mirror(std::vector<HostAndPort> hosts,
                 return;
             }
 
-            invariant(args.response.isOK());
+            if (MONGO_unlikely(!args.response.isOK())) {
+                LOGV2_FATAL(4717301,
+                            "Received mirroring response with a non-okay status",
+                            "error"_attr = args.response);
+            }
 
             gMirroredReadsSection.resolved.fetchAndAdd(1);
-            LOGV2_DEBUG(31457,
-                        4,
-                        "Received response from {host}, response: {response}",
-                        "host"_attr = host,
-                        "response"_attr = args.response);
+            LOGV2_DEBUG(
+                31457, 4, "Response received", "host"_attr = host, "response"_attr = args.response);
         };
 
         auto newRequest = executor::RemoteCommandRequest(
@@ -324,11 +325,7 @@ void MirrorMaestroImpl::_mirror(std::vector<HostAndPort> hosts,
             newRequest.fireAndForgetMode = executor::RemoteCommandRequest::FireAndForgetMode::kOn;
         }
 
-        LOGV2_DEBUG(31455,
-                    4,
-                    "Mirroring to {host}, request: {request}",
-                    "host"_attr = host,
-                    "request"_attr = newRequest);
+        LOGV2_DEBUG(31455, 4, "About to mirror", "host"_attr = host, "request"_attr = newRequest);
 
         auto status =
             _executor->scheduleRemoteCommand(newRequest, std::move(mirrorResponseCallback))
@@ -339,7 +336,7 @@ void MirrorMaestroImpl::_mirror(std::vector<HostAndPort> hosts,
     }
 } catch (const DBException& e) {
     // TODO SERVER-44570 Invariant this only in testing
-    LOGV2_DEBUG(31456, 2, "Failed to mirror read command due to an error", "error"_attr = e);
+    LOGV2_DEBUG(31456, 2, "Mirroring failed", "reason"_attr = e);
 }
 
 void MirrorMaestroImpl::init(ServiceContext* serviceContext) noexcept {
@@ -357,8 +354,7 @@ void MirrorMaestroImpl::init(ServiceContext* serviceContext) noexcept {
             return;
         } break;
         case Liveness::kShutdown: {
-            LOGV2_DEBUG(
-                31453, 2, "MirrorMaestro cannot initialize as it has already been shutdown");
+            LOGV2_DEBUG(31453, 2, "Cannot initialize an already shutdown MirrorMaestro");
             return;
         } break;
     };

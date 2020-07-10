@@ -42,7 +42,6 @@
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/commands_in_multi_doc_txn_params_gen.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/curop_metrics.h"
@@ -52,7 +51,7 @@
 #include "mongo/db/introspect.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
-#include "mongo/db/ops/delete_request.h"
+#include "mongo/db/ops/delete_request_gen.h"
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/ops/parsed_delete.h"
 #include "mongo/db/ops/parsed_update.h"
@@ -78,7 +77,6 @@
 #include "mongo/db/write_concern.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/s/cannot_implicitly_create_collection_info.h"
 #include "mongo/s/would_change_owning_shard_exception.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/log_and_backoff.h"
@@ -214,25 +212,6 @@ void assertCanWrite_inlock(OperationContext* opCtx, const NamespaceString& ns) {
 }
 
 void makeCollection(OperationContext* opCtx, const NamespaceString& ns) {
-    auto isFullyUpgradedTo44 =
-        (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-         serverGlobalParams.featureCompatibility.getVersion() ==
-             ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44);
-
-    auto inTransaction = opCtx->inMultiDocumentTransaction();
-
-    uassert(ErrorCodes::OperationNotSupportedInTransaction,
-            str::stream()
-                << "Cannot create namespace " << ns.ns()
-                << " in multi-document transaction unless featureCompatibilityVersion is 4.4.",
-            isFullyUpgradedTo44 || !inTransaction);
-
-    uassert(ErrorCodes::OperationNotSupportedInTransaction,
-            str::stream() << "Cannot create namespace " << ns.ns()
-                          << "because creation of collections and indexes inside "
-                             "multi-document transactions is disabled.",
-            !inTransaction || gShouldMultiDocTxnCreateCollectionAndIndexes.load());
-
     writeConflictRetry(opCtx, "implicit collection creation", ns.ns(), [&opCtx, &ns] {
         AutoGetOrCreateDb db(opCtx, ns.db(), MODE_IX);
         Lock::CollectionLock collLock(opCtx, ns, MODE_IX);
@@ -288,14 +267,6 @@ bool handleError(OperationContext* opCtx,
             auto& oss = OperationShardingState::get(opCtx);
             oss.setShardingOperationFailedStatus(ex.toStatus());
         }
-
-        // Don't try doing more ops since they will fail with the same error.
-        // Command reply serializer will handle repeating this error if needed.
-        out->results.emplace_back(ex.toStatus());
-        return false;
-    } else if (ex.extraInfo<CannotImplicitlyCreateCollectionInfo>()) {
-        auto& oss = OperationShardingState::get(opCtx);
-        oss.setShardingOperationFailedStatus(ex.toStatus());
 
         // Don't try doing more ops since they will fail with the same error.
         // Command reply serializer will handle repeating this error if needed.
@@ -432,31 +403,51 @@ bool insertBatchAndHandleErrors(OperationContext* opCtx,
             &hangWithLockDuringBatchInsert, opCtx, "hangWithLockDuringBatchInsert");
     };
 
+    auto txnParticipant = TransactionParticipant::get(opCtx);
+    auto inTxn = txnParticipant && opCtx->inMultiDocumentTransaction();
+    bool shouldProceedWithBatchInsert = true;
+
     try {
         acquireCollection();
-        auto txnParticipant = TransactionParticipant::get(opCtx);
-        auto inTxn = txnParticipant && opCtx->inMultiDocumentTransaction();
-        if (!collection->getCollection()->isCapped() && !inTxn && batch.size() > 1) {
-            // First try doing it all together. If all goes well, this is all we need to do.
-            // See Collection::_insertDocuments for why we do all capped inserts one-at-a-time.
-            lastOpFixer->startingOp();
-            insertDocuments(
-                opCtx, collection->getCollection(), batch.begin(), batch.end(), fromMigrate);
-            lastOpFixer->finishedOpSuccessfully();
-            globalOpCounters.gotInserts(batch.size());
-            ServerWriteConcernMetrics::get(opCtx)->recordWriteConcernForInserts(
-                opCtx->getWriteConcern(), batch.size());
-            SingleWriteResult result;
-            result.setN(1);
-
-            std::fill_n(std::back_inserter(out->results), batch.size(), std::move(result));
-            curOp.debug().additiveMetrics.incrementNinserted(batch.size());
-            return true;
-        }
-    } catch (const DBException&) {
-        // Ignore this failure and behave as if we never tried to do the combined batch
-        // insert. The loop below will handle reporting any non-transient errors.
+    } catch (const DBException& ex) {
         collection.reset();
+        if (inTxn) {
+            // It is not safe to ignore errors from collection creation while inside a
+            // multi-document transaction.
+            auto canContinue =
+                handleError(opCtx, ex, wholeOp.getNamespace(), wholeOp.getWriteCommandBase(), out);
+            invariant(!canContinue);
+            return false;
+        }
+        // Otherwise, proceed as though the batch insert block failed, since the batch insert block
+        // assumes `acquireCollection` is successful.
+        shouldProceedWithBatchInsert = false;
+    }
+
+    if (shouldProceedWithBatchInsert) {
+        try {
+            if (!collection->getCollection()->isCapped() && !inTxn && batch.size() > 1) {
+                // First try doing it all together. If all goes well, this is all we need to do.
+                // See Collection::_insertDocuments for why we do all capped inserts one-at-a-time.
+                lastOpFixer->startingOp();
+                insertDocuments(
+                    opCtx, collection->getCollection(), batch.begin(), batch.end(), fromMigrate);
+                lastOpFixer->finishedOpSuccessfully();
+                globalOpCounters.gotInserts(batch.size());
+                ServerWriteConcernMetrics::get(opCtx)->recordWriteConcernForInserts(
+                    opCtx->getWriteConcern(), batch.size());
+                SingleWriteResult result;
+                result.setN(1);
+
+                std::fill_n(std::back_inserter(out->results), batch.size(), std::move(result));
+                curOp.debug().additiveMetrics.incrementNinserted(batch.size());
+                return true;
+            }
+        } catch (const DBException&) {
+            // Ignore this failure and behave as if we never tried to do the combined batch
+            // insert. The loop below will handle reporting any non-transient errors.
+            collection.reset();
+        }
     }
 
     // Try to insert the batch one-at-a-time. This path is executed for singular batches,
@@ -778,9 +769,8 @@ static SingleWriteResult performSingleUpdateOpWithDupKeyRetry(OperationContext* 
                           ::mongo::logv2::LogComponent::kWrite,
                           logv2::LogSeverity::Debug(1),
                           numAttempts,
-                          str::stream()
-                              << "Caught DuplicateKey exception during upsert for namespace "
-                              << ns.ns());
+                          "Caught DuplicateKey exception during upsert",
+                          "namespace"_attr = ns.ns());
         }
     }
 
@@ -878,7 +868,8 @@ static SingleWriteResult performSingleDeleteOp(OperationContext* opCtx,
         curOp.ensureStarted();
     }
 
-    DeleteRequest request(ns);
+    auto request = DeleteRequest{};
+    request.setNsString(ns);
     request.setQuery(op.getQ());
     request.setCollation(write_ops::collationOf(op));
     request.setMulti(op.getMulti());

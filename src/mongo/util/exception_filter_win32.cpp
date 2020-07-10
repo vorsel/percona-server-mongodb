@@ -64,8 +64,9 @@ void doMinidumpWithException(struct _EXCEPTION_POINTERS* exceptionInfo) {
     if (ret == 0) {
         int gle = GetLastError();
         LOGV2(23130,
-              "GetModuleFileName failed {errnoWithDescription_gle}",
-              "errnoWithDescription_gle"_attr = errnoWithDescription(gle));
+              "GetModuleFileName failed {error}",
+              "GetModuleFileName failed",
+              "error"_attr = errnoWithDescription(gle));
 
         // Fallback name
         wcscpy_s(moduleFileName, L"mongo");
@@ -91,10 +92,10 @@ void doMinidumpWithException(struct _EXCEPTION_POINTERS* exceptionInfo) {
     if (INVALID_HANDLE_VALUE == hFile) {
         DWORD lasterr = GetLastError();
         LOGV2(23131,
-              "failed to open minidump file {toUtf8String_dumpName_c_str} : "
-              "{errnoWithDescription_lasterr}",
-              "toUtf8String_dumpName_c_str"_attr = toUtf8String(dumpName.c_str()),
-              "errnoWithDescription_lasterr"_attr = errnoWithDescription(lasterr));
+              "Failed to open minidump file {dumpName}: {error}",
+              "Failed to open minidump file",
+              "dumpName"_attr = toUtf8String(dumpName.c_str()),
+              "error"_attr = errnoWithDescription(lasterr));
         return;
     }
 
@@ -111,8 +112,9 @@ void doMinidumpWithException(struct _EXCEPTION_POINTERS* exceptionInfo) {
                                    MiniDumpWithProcessThreadData);
 #endif
     LOGV2(23132,
-          "writing minidump diagnostic file {toUtf8String_dumpName_c_str}",
-          "toUtf8String_dumpName_c_str"_attr = toUtf8String(dumpName.c_str()));
+          "Writing minidump diagnostic file {dumpName}",
+          "Writing minidump diagnostic file",
+          "dumpName"_attr = toUtf8String(dumpName.c_str()));
 
     BOOL bstatus = MiniDumpWriteDump(GetCurrentProcess(),
                                      GetCurrentProcessId(),
@@ -124,12 +126,14 @@ void doMinidumpWithException(struct _EXCEPTION_POINTERS* exceptionInfo) {
     if (FALSE == bstatus) {
         DWORD lasterr = GetLastError();
         LOGV2(23133,
-              "failed to create minidump : {errnoWithDescription_lasterr}",
-              "errnoWithDescription_lasterr"_attr = errnoWithDescription(lasterr));
+              "Failed to create minidump: {error}",
+              "Failed to create minidump",
+              "error"_attr = errnoWithDescription(lasterr));
     }
 
     CloseHandle(hFile);
 }
+}  // namespace
 
 LONG WINAPI exceptionFilter(struct _EXCEPTION_POINTERS* excPointers) {
     char exceptionString[128];
@@ -144,10 +148,12 @@ LONG WINAPI exceptionFilter(struct _EXCEPTION_POINTERS* excPointers) {
               sizeof(addressString),
               "0x%p",
               excPointers->ExceptionRecord->ExceptionAddress);
-    LOGV2_FATAL(23134,
-                "*** unhandled exception {exceptionString} at {addressString}, terminating",
-                "exceptionString"_attr = exceptionString,
-                "addressString"_attr = addressString);
+    LOGV2_FATAL_CONTINUE(
+        23134,
+        "*** unhandled exception {exceptionString} at {addressString}, terminating",
+        "Unhandled exception",
+        "exceptionString"_attr = exceptionString,
+        "addressString"_attr = addressString);
     if (excPointers->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
         ULONG acType = excPointers->ExceptionRecord->ExceptionInformation[0];
         const char* acTypeString;
@@ -169,13 +175,14 @@ LONG WINAPI exceptionFilter(struct _EXCEPTION_POINTERS* excPointers) {
                   sizeof(addressString),
                   " 0x%llx",
                   excPointers->ExceptionRecord->ExceptionInformation[1]);
-        LOGV2_FATAL(23135,
-                    "*** access violation was a {acTypeString}{addressString}",
-                    "acTypeString"_attr = acTypeString,
-                    "addressString"_attr = addressString);
+        LOGV2_FATAL_CONTINUE(23135,
+                             "*** access violation was a {accessType}{address}",
+                             "Access violation",
+                             "accessType"_attr = acTypeString,
+                             "address"_attr = addressString);
     }
 
-    LOGV2_FATAL(23136, "*** stack trace for unhandled exception:");
+    LOGV2_FATAL_CONTINUE(23136, "*** stack trace for unhandled exception:");
 
     // Create a copy of context record because printWindowsStackTrace will mutate it.
     CONTEXT contextCopy(*(excPointers->ContextRecord));
@@ -186,13 +193,13 @@ LONG WINAPI exceptionFilter(struct _EXCEPTION_POINTERS* excPointers) {
 
     // Don't go through normal shutdown procedure. It may make things worse.
     // Do not go through _exit or ExitProcess(), terminate immediately
-    LOGV2_FATAL(23137, "*** immediate exit due to unhandled exception");
+    LOGV2_FATAL_CONTINUE(23137, "*** immediate exit due to unhandled exception");
     TerminateProcess(GetCurrentProcess(), EXIT_ABRUPT);
 
     // We won't reach here
     return EXCEPTION_EXECUTE_HANDLER;
 }
-}  // namespace
+
 
 LPTOP_LEVEL_EXCEPTION_FILTER filtLast = 0;
 

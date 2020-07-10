@@ -154,7 +154,7 @@ public:
 
     Status setFollowerMode(const repl::MemberState&) override;
 
-    Status setFollowerModeStrict(OperationContext* opCtx, const repl::MemberState&) override;
+    Status setFollowerModeRollback(OperationContext* opCtx) override;
 
     ApplierState getApplierState() override;
 
@@ -163,8 +163,6 @@ public:
     Status waitForDrainFinish(Milliseconds) override;
 
     void signalUpstreamUpdater() override;
-
-    Status resyncData(OperationContext*, bool) override;
 
     StatusWith<BSONObj> prepareReplSetUpdatePositionCommand() const override;
 
@@ -197,13 +195,13 @@ public:
                              GetNewConfigFn getNewConfig,
                              bool force) override;
 
+    Status awaitConfigCommitment(OperationContext* opCtx) override;
+
     Status processReplSetInitiate(OperationContext*, const BSONObj&, BSONObjBuilder*) override;
 
     Status processReplSetUpdatePosition(const repl::UpdatePositionArgs&, long long*) override;
 
     std::vector<HostAndPort> getHostsWrittenTo(const repl::OpTime&, bool) override;
-
-    std::vector<HostAndPort> getOtherNodesInReplSet() const override;
 
     Status checkReplEnabledForCommand(BSONObjBuilder*) override;
 
@@ -215,7 +213,7 @@ public:
 
     bool shouldChangeSyncSource(const HostAndPort&,
                                 const rpc::ReplSetMetadata&,
-                                boost::optional<rpc::OplogQueryMetadata>) override;
+                                const rpc::OplogQueryMetadata&) override;
 
     repl::OpTime getLastCommittedOpTime() const override;
 
@@ -273,7 +271,7 @@ public:
 
     TopologyVersion getTopologyVersion() const override;
 
-    void incrementTopologyVersion(OperationContext* opCtx) override;
+    void incrementTopologyVersion() override;
 
     std::shared_ptr<const repl::IsMasterResponse> awaitIsMasterResponse(
         OperationContext* opCtx,

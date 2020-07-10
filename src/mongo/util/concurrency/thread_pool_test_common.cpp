@@ -78,10 +78,10 @@ public:
     TptRegistrationAgent(const std::string& name, ThreadPoolTestCaseFactory makeTest) {
         auto& entry = threadPoolTestCaseRegistry()[name];
         if (entry) {
-            LOGV2_FATAL(23922,
+            LOGV2_FATAL(34355,
                         "Multiple attempts to register ThreadPoolTest named {name}",
+                        "Multiple attempts to register ThreadPoolTest",
                         "name"_attr = name);
-            fassertFailed(34355);
         }
         entry = std::move(makeTest);
     }
@@ -96,10 +96,10 @@ public:
     TptDeathRegistrationAgent(const std::string& name, ThreadPoolTestCaseFactory makeTest) {
         auto& entry = threadPoolTestCaseRegistry()[name];
         if (entry) {
-            LOGV2_FATAL(23923,
+            LOGV2_FATAL(34356,
                         "Multiple attempts to register ThreadPoolDeathTest named {name}",
+                        "Multiple attempts to register ThreadPoolDeathTest",
                         "name"_attr = name);
-            fassertFailed(34356);
         }
         entry = [makeTest](ThreadPoolFactory makeThreadPool) {
             return std::make_unique<::mongo::unittest::DeathTest<T>>(std::move(makeThreadPool));
@@ -153,7 +153,7 @@ COMMON_THREAD_POOL_TEST(CannotScheduleAfterShutdown) {
     pool.schedule([](auto status) { ASSERT_EQ(status, ErrorCodes::ShutdownInProgress); });
 }
 
-COMMON_THREAD_POOL_DEATH_TEST(DieOnDoubleStartUp, "it has already started") {
+COMMON_THREAD_POOL_DEATH_TEST(DieOnDoubleStartUp, "already started") {
     auto& pool = getThreadPool();
     pool.startup();
     pool.startup();

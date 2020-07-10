@@ -167,7 +167,7 @@ public:
 
     virtual Status setFollowerMode(const MemberState& newState);
 
-    virtual Status setFollowerModeStrict(OperationContext* opCtx, const MemberState& newState);
+    virtual Status setFollowerModeRollback(OperationContext* opCtx);
 
     virtual ApplierState getApplierState();
 
@@ -176,8 +176,6 @@ public:
     virtual Status waitForDrainFinish(Milliseconds timeout) override;
 
     virtual void signalUpstreamUpdater();
-
-    virtual Status resyncData(OperationContext* opCtx, bool waitUntilCompleted) override;
 
     virtual StatusWith<BSONObj> prepareReplSetUpdatePositionCommand() const override;
 
@@ -216,6 +214,8 @@ public:
                                      GetNewConfigFn getNewConfig,
                                      bool force);
 
+    Status awaitConfigCommitment(OperationContext* opCtx);
+
     virtual Status processReplSetInitiate(OperationContext* opCtx,
                                           const BSONObj& configObj,
                                           BSONObjBuilder* resultObj);
@@ -226,8 +226,6 @@ public:
     virtual bool buildsIndexes();
 
     virtual std::vector<HostAndPort> getHostsWrittenTo(const OpTime& op, bool durablyWritten);
-
-    virtual std::vector<HostAndPort> getOtherNodesInReplSet() const;
 
     virtual WriteConcernOptions getGetLastErrorDefault();
 
@@ -243,7 +241,7 @@ public:
 
     virtual bool shouldChangeSyncSource(const HostAndPort& currentSource,
                                         const rpc::ReplSetMetadata& replMetadata,
-                                        boost::optional<rpc::OplogQueryMetadata> oqMetadata);
+                                        const rpc::OplogQueryMetadata& oqMetadata);
 
     virtual OpTime getLastCommittedOpTime() const;
 
@@ -330,7 +328,7 @@ public:
 
     virtual TopologyVersion getTopologyVersion() const;
 
-    virtual void incrementTopologyVersion(OperationContext* opCtx) override;
+    virtual void incrementTopologyVersion() override;
 
     virtual std::shared_ptr<const IsMasterResponse> awaitIsMasterResponse(
         OperationContext* opCtx,

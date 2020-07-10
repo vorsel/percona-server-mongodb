@@ -203,10 +203,17 @@ bool opShouldFail(Client* client, const BSONObj& failPointInfo) {
 }  // namespace
 
 Status OperationContext::checkForInterruptNoAssert() noexcept {
-    // TODO: Remove the MONGO_likely(getClient()) once all operation contexts are constructed with
-    // clients.
-    if (MONGO_likely(getClient() && getServiceContext()) &&
-        getServiceContext()->getKillAllOperations() && !_isExecutingShutdown) {
+    // TODO: Remove the MONGO_likely(hasClientAndServiceContext) once all operation contexts are
+    // constructed with clients.
+    const auto hasClientAndServiceContext = getClient() && getServiceContext();
+
+    if (MONGO_likely(hasClientAndServiceContext) && getClient()->getKilled() &&
+        !_isExecutingShutdown) {
+        return Status(ErrorCodes::ClientMarkedKilled, "client has been killed");
+    }
+
+    if (MONGO_likely(hasClientAndServiceContext) && getServiceContext()->getKillAllOperations() &&
+        !_isExecutingShutdown) {
         return Status(ErrorCodes::InterruptedAtShutdown, "interrupted at shutdown");
     }
 
@@ -223,9 +230,7 @@ Status OperationContext::checkForInterruptNoAssert() noexcept {
 
     checkForInterruptFail.executeIf(
         [&](auto&&) {
-            LOGV2(20882,
-                  "set pending kill on op {getOpID}, for checkForInterruptFail",
-                  "getOpID"_attr = getOpID());
+            LOGV2(20882, "Marking operation as killed for failpoint", "opId"_attr = getOpID());
             markKilled();
         },
         [&](auto&& data) { return opShouldFail(getClient(), data); });
@@ -326,7 +331,7 @@ void OperationContext::markKilled(ErrorCodes::Error killCode) {
     invariant(!ErrorExtraInfo::parserFor(killCode));
 
     if (killCode == ErrorCodes::ClientDisconnect) {
-        LOGV2(20883, "operation was interrupted because a client disconnected");
+        LOGV2(20883, "Interrupted operation as its client disconnected", "opId"_attr = getOpID());
     }
 
     if (auto status = ErrorCodes::OK; _killCode.compareAndSwap(&status, killCode)) {

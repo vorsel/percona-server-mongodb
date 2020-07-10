@@ -147,7 +147,7 @@ public:
 
     Status setFollowerMode(const MemberState&) final;
 
-    Status setFollowerModeStrict(OperationContext* opCtx, const MemberState&) final;
+    Status setFollowerModeRollback(OperationContext* opCtx) final;
 
     ApplierState getApplierState() final;
 
@@ -156,8 +156,6 @@ public:
     Status waitForDrainFinish(Milliseconds) final;
 
     void signalUpstreamUpdater() final;
-
-    Status resyncData(OperationContext*, bool) final;
 
     StatusWith<BSONObj> prepareReplSetUpdatePositionCommand() const final;
 
@@ -190,13 +188,13 @@ public:
                              GetNewConfigFn getNewConfig,
                              bool force) final;
 
+    Status awaitConfigCommitment(OperationContext* opCtx) final;
+
     Status processReplSetInitiate(OperationContext*, const BSONObj&, BSONObjBuilder*) final;
 
     Status processReplSetUpdatePosition(const UpdatePositionArgs&, long long*) final;
 
     std::vector<HostAndPort> getHostsWrittenTo(const OpTime&, bool) final;
-
-    std::vector<HostAndPort> getOtherNodesInReplSet() const final;
 
     Status checkReplEnabledForCommand(BSONObjBuilder*) final;
 
@@ -208,7 +206,7 @@ public:
 
     bool shouldChangeSyncSource(const HostAndPort&,
                                 const rpc::ReplSetMetadata&,
-                                boost::optional<rpc::OplogQueryMetadata>) final;
+                                const rpc::OplogQueryMetadata&) final;
 
     OpTime getLastCommittedOpTime() const final;
 
@@ -258,7 +256,7 @@ public:
 
     void finishRecoveryIfEligible(OperationContext* opCtx) final;
 
-    void incrementTopologyVersion(OperationContext* opCtx) final;
+    void incrementTopologyVersion() final;
 
     void updateAndLogStateTransitionMetrics(
         const ReplicationCoordinator::OpsKillingStateTransitionEnum stateTransition,

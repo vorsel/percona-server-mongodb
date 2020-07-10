@@ -39,7 +39,6 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/speculative_majority_read_info.h"
-#include "mongo/db/s/implicit_create_collection.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/scoped_operation_completion_sharding_actions.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
@@ -50,7 +49,6 @@
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata/config_server_metadata.h"
 #include "mongo/rpc/metadata/sharding_metadata.h"
-#include "mongo/s/cannot_implicitly_create_collection_info.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/stale_exception.h"
 
@@ -83,18 +81,16 @@ public:
             if (ErrorCodes::isExceededTimeLimitError(rcStatus.code())) {
                 const int debugLevel =
                     serverGlobalParams.clusterRole == ClusterRole::ConfigServer ? 0 : 2;
-                LOGV2_DEBUG(
-                    21975,
-                    logSeverityV1toV2(debugLevel).toInt(),
-                    "Command on database {request_getDatabase} timed out waiting for read concern "
-                    "to be satisfied. Command: "
-                    "{ServiceEntryPointCommon_getRedactedCopyForLogging_invocation_definition_"
-                    "request_body}. Info: {rcStatus}",
-                    "request_getDatabase"_attr = request.getDatabase(),
-                    "ServiceEntryPointCommon_getRedactedCopyForLogging_invocation_definition_request_body"_attr =
-                        redact(ServiceEntryPointCommon::getRedactedCopyForLogging(
-                            invocation->definition(), request.body)),
-                    "rcStatus"_attr = redact(rcStatus));
+                LOGV2_DEBUG(21975,
+                            logSeverityV1toV2(debugLevel).toInt(),
+                            "Command on database {db} timed out waiting for read concern to be "
+                            "satisfied. Command: {command}. Info: {error}",
+                            "Command timed out waiting for read concern to be satisfied",
+                            "db"_attr = request.getDatabase(),
+                            "command"_attr =
+                                redact(ServiceEntryPointCommon::getRedactedCopyForLogging(
+                                    invocation->definition(), request.body)),
+                            "error"_attr = redact(rcStatus));
             }
 
             uassertStatusOK(rcStatus);
@@ -218,14 +214,6 @@ public:
             if (!opCtx->getClient()->isInDirectClient()) {
                 onDbVersionMismatchNoExcept(
                     opCtx, sce->getDb(), sce->getVersionReceived(), sce->getVersionWanted())
-                    .ignore();
-            }
-        } else if (auto cannotImplicitCreateCollInfo =
-                       e.extraInfo<CannotImplicitlyCreateCollectionInfo>()) {
-            if (ShardingState::get(opCtx)->enabled() &&
-                serverGlobalParams.featureCompatibility.getVersion() ==
-                    ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo42) {
-                onCannotImplicitlyCreateCollection(opCtx, cannotImplicitCreateCollInfo->getNss())
                     .ignore();
             }
         }

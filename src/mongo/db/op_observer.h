@@ -103,9 +103,6 @@ public:
                                    const CommitQuorumOptions& commitQuorum,
                                    bool fromMigrate) = 0;
 
-    /**
-     * TODO (SERVER-45017): Remove when v4.4 becomes last-stable.
-     */
     virtual void onStartIndexBuildSinglePhase(OperationContext* opCtx,
                                               const NamespaceString& nss) = 0;
 
@@ -378,7 +375,7 @@ public:
         bool configServerConfigVersionRolledBack = false;
 
         // Maps command names to a count of the number of those commands that are being rolled back.
-        StringMap<std::uint32_t> rollbackCommandCounts;
+        StringMap<long long> rollbackCommandCounts;
     };
 
     /**

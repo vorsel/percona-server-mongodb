@@ -665,7 +665,7 @@ TEST_F(RollbackImplTest, RollbackCallsRecoverToStableTimestamp) {
 
 DEATH_TEST_REGEX_F(RollbackImplTest,
                    RollbackFassertsIfRecoverToStableTimestampFails,
-                   "Fatal assertion.*31049") {
+                   "Fatal assertion.*45847000") {
     auto op = makeOpAndRecordId(1);
     _remoteOplog->setOperations({op});
     ASSERT_OK(_insertOplogEntry(op.first));
@@ -873,8 +873,7 @@ TEST_F(RollbackImplTest, RollbackSucceedsAndTruncatesOplog) {
 
 DEATH_TEST_REGEX_F(RollbackImplTest,
                    RollbackTriggersFatalAssertionOnFailingToTransitionFromRollbackToSecondary,
-                   "Failed to transition into .*; expected to be in state .*; found self in "
-                   ".*.*SECONDARY.*ROLLBACK.*ROLLBACK") {
+                   "Failed to perform replica set state transition") {
     _coordinator->failSettingFollowerMode(MemberState::RS_SECONDARY, ErrorCodes::IllegalOperation);
 
     auto op = makeOpAndRecordId(1);
@@ -1849,9 +1848,7 @@ TEST_F(RollbackImplObserverInfoTest, RollbackRecordsMultipleNamespacesOfOplogEnt
     ASSERT(expectedNamespaces == _rbInfo.rollbackNamespaces);
 }
 
-DEATH_TEST_F(RollbackImplObserverInfoTest,
-             RollbackFailsOnUnknownOplogEntryCommandType,
-             "Unknown oplog entry command type") {
+TEST_F(RollbackImplObserverInfoTest, RollbackFailsOnUnknownOplogEntryCommandType) {
     // Create a command of an unknown type.
     auto unknownCmdOp =
         makeCommandOp(Timestamp(2, 2), boost::none, "admin.$cmd", BSON("unknownCommand" << 1), 2);
@@ -1861,9 +1858,10 @@ DEATH_TEST_F(RollbackImplObserverInfoTest,
     ASSERT_OK(_insertOplogEntry(commonOp.first));
     ASSERT_OK(_insertOplogEntry(unknownCmdOp.first));
 
-    auto status = _rollback->runRollback(_opCtx.get());
-    LOGV2(21655, "Mongod did not crash. Status: {status}", "status"_attr = status);
-    MONGO_UNREACHABLE;
+    const StringData err(
+        "Unknown oplog entry command type: unknownCommand Object field: { unknownCommand: 1 }");
+    ASSERT_THROWS_CODE_AND_WHAT(
+        _rollback->runRollback(_opCtx.get()), DBException, ErrorCodes::BadValue, err);
 }
 
 TEST_F(RollbackImplObserverInfoTest, RollbackRecordsSessionIdFromOplogEntry) {

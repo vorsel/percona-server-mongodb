@@ -374,14 +374,6 @@ public:
         _slaveOk = slaveOk;
     }
 
-    bool isOplogReplay() const {
-        return _oplogReplay;
-    }
-
-    void setOplogReplay(bool oplogReplay) {
-        _oplogReplay = oplogReplay;
-    }
-
     bool isNoCursorTimeout() const {
         return _noCursorTimeout;
     }
@@ -448,14 +440,6 @@ public:
 
     void setResumeAfter(BSONObj resumeAfter) {
         _resumeAfter = resumeAfter;
-    }
-
-    bool use44SortKeys() const {
-        return _use44SortKeys;
-    }
-
-    void setUse44SortKeys(bool use44SortKeys) {
-        _use44SortKeys = use44SortKeys;
     }
 
     /**
@@ -583,7 +567,6 @@ private:
     // Options that can be specified in the OP_QUERY 'flags' header.
     TailableModeEnum _tailableMode = TailableModeEnum::kNormal;
     bool _slaveOk = false;
-    bool _oplogReplay = false;
     bool _noCursorTimeout = false;
     bool _exhaust = false;
     bool _allowPartialResults = false;
@@ -595,8 +578,6 @@ private:
     // The Timestamp that RecoveryUnit::setTimestampReadSource() should be called with. The optional
     // should only ever be engaged when testing commands are enabled.
     boost::optional<Timestamp> _internalReadAtClusterTime;
-
-    bool _use44SortKeys = false;
 };
 
 }  // namespace mongo

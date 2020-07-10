@@ -296,9 +296,8 @@ Status ReplicationCoordinatorMock::setFollowerMode(const MemberState& newState) 
     return Status::OK();
 }
 
-Status ReplicationCoordinatorMock::setFollowerModeStrict(OperationContext* opCtx,
-                                                         const MemberState& newState) {
-    return setFollowerMode(newState);
+Status ReplicationCoordinatorMock::setFollowerModeRollback(OperationContext* opCtx) {
+    return setFollowerMode(MemberState::RS_ROLLBACK);
 }
 
 ReplicationCoordinator::ApplierState ReplicationCoordinatorMock::getApplierState() {
@@ -313,10 +312,6 @@ Status ReplicationCoordinatorMock::waitForDrainFinish(Milliseconds timeout) {
 }
 
 void ReplicationCoordinatorMock::signalUpstreamUpdater() {}
-
-Status ReplicationCoordinatorMock::resyncData(OperationContext* opCtx, bool waitUntilCompleted) {
-    return Status::OK();
-}
 
 StatusWith<BSONObj> ReplicationCoordinatorMock::prepareReplSetUpdatePositionCommand() const {
     BSONObjBuilder cmdBuilder;
@@ -386,6 +381,10 @@ Status ReplicationCoordinatorMock::doReplSetReconfig(OperationContext* opCtx,
     return Status::OK();
 }
 
+Status ReplicationCoordinatorMock::awaitConfigCommitment(OperationContext* opCtx) {
+    return Status::OK();
+}
+
 Status ReplicationCoordinatorMock::processReplSetInitiate(OperationContext* opCtx,
                                                           const BSONObj& configObj,
                                                           BSONObjBuilder* resultObj) {
@@ -405,10 +404,6 @@ bool ReplicationCoordinatorMock::buildsIndexes() {
 
 std::vector<HostAndPort> ReplicationCoordinatorMock::getHostsWrittenTo(const OpTime& op,
                                                                        bool durablyWritten) {
-    return std::vector<HostAndPort>();
-}
-
-std::vector<HostAndPort> ReplicationCoordinatorMock::getOtherNodesInReplSet() const {
     return std::vector<HostAndPort>();
 }
 
@@ -451,10 +446,9 @@ bool ReplicationCoordinatorMock::lastOpTimesWereReset() const {
     return _resetLastOpTimesCalled;
 }
 
-bool ReplicationCoordinatorMock::shouldChangeSyncSource(
-    const HostAndPort& currentSource,
-    const rpc::ReplSetMetadata& replMetadata,
-    boost::optional<rpc::OplogQueryMetadata> oqMetadata) {
+bool ReplicationCoordinatorMock::shouldChangeSyncSource(const HostAndPort& currentSource,
+                                                        const rpc::ReplSetMetadata& replMetadata,
+                                                        const rpc::OplogQueryMetadata& oqMetadata) {
     MONGO_UNREACHABLE;
 }
 
@@ -571,7 +565,7 @@ TopologyVersion ReplicationCoordinatorMock::getTopologyVersion() const {
     return TopologyVersion(repl::instanceId, 0);
 }
 
-void ReplicationCoordinatorMock::incrementTopologyVersion(OperationContext* opCtx) {
+void ReplicationCoordinatorMock::incrementTopologyVersion() {
     return;
 }
 

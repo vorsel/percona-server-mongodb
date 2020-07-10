@@ -32,6 +32,7 @@
 #include "mongo/base/status.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/repl_set_config_checks.h"
 #include "mongo/db/repl/replication_coordinator_external_state.h"
@@ -203,6 +204,53 @@ TEST_F(ServiceContextTest, ValidateConfigForInitiate_ArbiterPriorityMustBeZeroOr
         ErrorCodes::InvalidReplicaSetConfig,
         validateConfigForInitiate(&presentOnceExternalState, twoConfig, getGlobalServiceContext())
             .getStatus());
+}
+
+TEST_F(ServiceContextTest, ValidateConfigForInitiate_NewlyAddedFieldNotAllowed) {
+    // Set the flag to add the 'newlyAdded' field to MemberConfigs.
+    enableAutomaticReconfig = true;
+    // Set the flag back to false after this test exits.
+    ON_BLOCK_EXIT([] { enableAutomaticReconfig = false; });
+    ReplSetConfig firstNewlyAdded;
+    ReplSetConfig lastNewlyAdded;
+    ASSERT_OK(
+        firstNewlyAdded.initializeForInitiate(BSON("_id"
+                                                   << "rs0"
+                                                   << "version" << 1 << "protocolVersion" << 1
+                                                   << "members"
+                                                   << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                                            << "newly_added_h1"
+                                                                            << "newlyAdded" << true)
+                                                                 << BSON("_id" << 2 << "host"
+                                                                               << "h2")
+                                                                 << BSON("_id" << 3 << "host"
+                                                                               << "h3")))));
+
+    ASSERT_OK(lastNewlyAdded.initializeForInitiate(
+        BSON("_id"
+             << "rs0"
+             << "version" << 1 << "protocolVersion" << 1 << "members"
+             << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                      << "h1")
+                           << BSON("_id" << 2 << "host"
+                                         << "h2")
+                           << BSON("_id" << 3 << "host"
+                                         << "newly_added_h3"
+                                         << "newlyAdded" << true)))));
+
+    ReplicationCoordinatorExternalStateMock presentOnceExternalState;
+    presentOnceExternalState.addSelf(HostAndPort("h1"));
+
+    auto status = validateConfigForInitiate(
+                      &presentOnceExternalState, firstNewlyAdded, getGlobalServiceContext())
+                      .getStatus();
+    ASSERT_EQUALS(status, ErrorCodes::InvalidReplicaSetConfig);
+    ASSERT_TRUE(status.reason().find("newly_added_h1") != std::string::npos);
+    status = validateConfigForInitiate(
+                 &presentOnceExternalState, lastNewlyAdded, getGlobalServiceContext())
+                 .getStatus();
+    ASSERT_EQUALS(status, ErrorCodes::InvalidReplicaSetConfig);
+    ASSERT_TRUE(status.reason().find("newly_added_h3") != std::string::npos);
 }
 
 TEST_F(ServiceContextTest, ValidateConfigForReconfig_NewConfigVersionNumberMustBeHigherThanOld) {
@@ -1101,20 +1149,6 @@ TEST_F(ServiceContextTest, ValidateForReconfig_MultiNodeRemovalDisallowed) {
     BSONArray newMembers = BSON_ARRAY(m1 << m2);  // remove 2 voting nodes.
     ASSERT_EQUALS(ErrorCodes::InvalidReplicaSetConfig,
                   validateMemberReconfig(oldMembers, newMembers, m1));
-}
-
-TEST_F(ServiceContextTest, ValidateForReconfig_MultiNodeAdditionAllowedFCV42) {
-    EnsureFCV fcv{ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo42};
-    BSONArray oldMembers = BSON_ARRAY(m1 << m2);
-    BSONArray newMembers = BSON_ARRAY(m1 << m2 << m3 << m4);  // add 2 voting nodes.
-    ASSERT_OK(validateMemberReconfig(oldMembers, newMembers, m1));
-}
-
-TEST_F(ServiceContextTest, ValidateForReconfig_MultiNodeRemovalAllowedFCV42) {
-    EnsureFCV fcv{ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo42};
-    BSONArray oldMembers = BSON_ARRAY(m1 << m2 << m3 << m4);
-    BSONArray newMembers = BSON_ARRAY(m1 << m2);  // remove 2 voting nodes.
-    ASSERT_OK(validateMemberReconfig(oldMembers, newMembers, m1));
 }
 
 TEST_F(ServiceContextTest, ValidateForReconfig_MultiNodeAdditionOfNonVotingNodesAllowed) {

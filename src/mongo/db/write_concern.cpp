@@ -45,6 +45,7 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/timer_stats.h"
+#include "mongo/db/storage/control/storage_control.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/transaction_validation.h"
 #include "mongo/db/write_concern_options.h"
@@ -80,7 +81,8 @@ bool commandSpecifiesWriteConcern(const BSONObj& cmdObj) {
 }
 
 StatusWith<WriteConcernOptions> extractWriteConcern(OperationContext* opCtx,
-                                                    const BSONObj& cmdObj) {
+                                                    const BSONObj& cmdObj,
+                                                    bool isInternalClient) {
     // The default write concern if empty is {w:1}. Specifying {w:0} is/was allowed, but is
     // interpreted identically to {w:1}.
     auto wcResult = WriteConcernOptions::extractWCFromCommand(cmdObj);
@@ -106,7 +108,7 @@ StatusWith<WriteConcernOptions> extractWriteConcern(OperationContext* opCtx,
                 repl::ReplicationCoordinator::get(opCtx)->isReplEnabled() &&
                 (!opCtx->inMultiDocumentTransaction() ||
                  isTransactionCommand(cmdObj.firstElementFieldName())) &&
-                !opCtx->getClient()->isInDirectClient()) {
+                !opCtx->getClient()->isInDirectClient() && !isInternalClient) {
 
                 auto wcDefault = ReadWriteConcernDefaults::get(opCtx->getServiceContext())
                                      .getDefaultWriteConcern(opCtx);
@@ -298,9 +300,8 @@ Status waitForWriteConcern(OperationContext* opCtx,
     try {
         switch (writeConcernWithPopulatedSyncMode.syncMode) {
             case WriteConcernOptions::SyncMode::UNSET:
-                LOGV2_FATAL(22550,
+                LOGV2_FATAL(34410,
                             "Attempting to wait on a WriteConcern with an unset sync option");
-                fassertFailed(34410);
             case WriteConcernOptions::SyncMode::NONE:
                 break;
             case WriteConcernOptions::SyncMode::FSYNC: {
@@ -313,13 +314,13 @@ Status waitForWriteConcern(OperationContext* opCtx,
                     result->fsyncFiles = 1;
                 } else {
                     // We only need to commit the journal if we're durable
-                    storageEngine->waitForJournalFlush(opCtx);
+                    StorageControl::waitForJournalFlush(opCtx);
                 }
                 break;
             }
             case WriteConcernOptions::SyncMode::JOURNAL:
                 waitForNoOplogHolesIfNeeded(opCtx);
-                storageEngine->waitForJournalFlush(opCtx);
+                StorageControl::waitForJournalFlush(opCtx);
                 break;
         }
     } catch (const DBException& ex) {

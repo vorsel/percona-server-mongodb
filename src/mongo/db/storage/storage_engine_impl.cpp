@@ -885,29 +885,7 @@ bool StorageEngineImpl::supportsTwoPhaseIndexBuild() const {
     if (!enableTwoPhaseIndexBuild) {
         return false;
     }
-
-    if (!serverGlobalParams.featureCompatibility.isVersionInitialized()) {
-        return false;
-    }
-
-    if (serverGlobalParams.featureCompatibility.getVersion() !=
-        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
-        return false;
-    }
-
     return true;
-}
-
-void StorageEngineImpl::triggerJournalFlush() const {
-    return _engine->triggerJournalFlush();
-}
-
-void StorageEngineImpl::waitForJournalFlush(OperationContext* opCtx) const {
-    return _engine->waitForJournalFlush(opCtx);
-}
-
-void StorageEngineImpl::interruptJournalFlusherForReplStateChange() const {
-    return _engine->interruptJournalFlusherForReplStateChange();
 }
 
 Timestamp StorageEngineImpl::getAllDurableTimestamp() const {
@@ -1050,8 +1028,11 @@ void StorageEngineImpl::TimestampMonitor::startup() {
                     _currentTimestamps.minOfCheckpointAndOldest = minOfCheckpointAndOldest;
                     notifyAll(TimestampType::kMinOfCheckpointAndOldest, minOfCheckpointAndOldest);
                 }
-            } catch (const ExceptionFor<ErrorCodes::InterruptedAtShutdown>& ex) {
-                // If we're interrupted at shutdown, it's fine to give up on future notifications
+            } catch (const ExceptionForCat<ErrorCategory::Interruption>& ex) {
+                if (!ErrorCodes::isCancelationError(ex))
+                    throw;
+                // If we're interrupted at shutdown or after PeriodicRunner's client has been
+                // killed, it's fine to give up on future notifications.
                 LOGV2(22263,
                       "{Timestamp_monitor_is_stopping_due_to_ex_reason}",
                       "Timestamp_monitor_is_stopping_due_to_ex_reason"_attr =

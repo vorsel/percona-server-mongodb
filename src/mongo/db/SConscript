@@ -455,6 +455,16 @@ env.Library(
 )
 
 env.Library(
+    target='replica_set_aware_service',
+    source=[
+        'replica_set_aware_service.cpp',
+    ],
+    LIBDEPS_PRIVATE=[
+        'service_context',
+    ],
+)
+
+env.Library(
     target='service_context',
     source=[
         'baton.cpp',
@@ -554,7 +564,6 @@ env.Library(
     target="commands",
     source=[
         'commands.cpp',
-        env.Idlc('commands_in_multi_doc_txn_params.idl')[0],
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
@@ -994,6 +1003,7 @@ env.Library(
         "commands/server_status_core",
         "s/sharding_api_d",
         "shared_request_handling",
+        "$BUILD_DIR/mongo/db/storage/storage_control",
     ],
 )
 
@@ -1737,6 +1747,7 @@ env.Library(
         'index/index_access_methods',
         'index_builds_coordinator_mongod',
         'service_context_d',
+        'storage/storage_control',
         'storage/devnull/storage_devnull',
         'storage/ephemeral_for_test/storage_ephemeral_for_test',
         'storage/storage_options',
@@ -1830,6 +1841,7 @@ env.Library(
         'ops/update.cpp',
         'ops/write_ops_retryability.cpp',
         env.Idlc('ops/single_write_result.idl')[0],
+        env.Idlc('ops/delete_request.idl')[0],
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
@@ -1912,6 +1924,7 @@ envWithAsio.CppUnitTest(
         'read_write_concern_defaults_test.cpp',
         'read_write_concern_provenance_test.cpp',
         'record_id_test.cpp',
+        'replica_set_aware_service_test.cpp',
         'server_options_test.cpp',
         'session_catalog_mongod_test.cpp',
         'session_catalog_test.cpp',
@@ -1978,6 +1991,7 @@ envWithAsio.CppUnitTest(
         'repl/repl_coordinator_interface',
         'repl/storage_interface_impl',
         'repl/replmocks',
+        'replica_set_aware_service',
         'server_options_servers',
         'service_context',
         'service_context_d',

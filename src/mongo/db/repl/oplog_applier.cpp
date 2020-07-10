@@ -75,8 +75,7 @@ Future<void> OplogApplier::startup() {
 void OplogApplier::shutdown() {
     // Shutdown will hang if this failpoint is enabled.
     if (globalFailPointRegistry().find("rsSyncApplyStop")->shouldFail()) {
-        LOGV2_FATAL(21227, "Turn off rsSyncApplyStop before attempting clean shutdown");
-        fassertFailedNoTrace(40304);
+        LOGV2_FATAL_NOTRACE(40304, "Turn off rsSyncApplyStop before attempting clean shutdown");
     }
 
     stdx::lock_guard<Latch> lock(_mutex);
@@ -110,8 +109,11 @@ void OplogApplier::enqueue(OperationContext* opCtx,
                            OplogBuffer::Batch::const_iterator end) {
     static Occasionally sampler;
     if (sampler.tick()) {
-        LOGV2_DEBUG(
-            21226, 2, "oplog buffer has {size} bytes", "size"_attr = _oplogBuffer->getSize());
+        LOGV2_DEBUG(21226,
+                    2,
+                    "oplog buffer has {oplogBufferSizeBytes} bytes",
+                    "Oplog buffer size",
+                    "oplogBufferSizeBytes"_attr = _oplogBuffer->getSize());
     }
     _oplogBuffer->push(opCtx, begin, end);
 }

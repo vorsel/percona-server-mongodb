@@ -162,8 +162,8 @@ baseEnv.Library(
         'util/platform_init.cpp',
         'util/shell_exec.cpp',
         'util/signal_handlers_synchronous.cpp',
+        'util/stacktrace.cpp',
         'util/stacktrace_${TARGET_OS_FAMILY}.cpp',
-        'util/stacktrace_json.cpp',
         'util/stacktrace_somap.cpp',
         'util/stacktrace_threads.cpp',
         'util/str.cpp',
@@ -452,6 +452,7 @@ mongod = env.Program(
         'db/storage/flow_control',
         'db/storage/flow_control_parameters',
         'db/storage/inmemory/storage_inmemory' if inmemory else [],
+        'db/storage/storage_control',
         'db/storage/storage_engine_lock_file',
         'db/storage/storage_engine_metadata',
         'db/storage/storage_init_d',
@@ -487,6 +488,7 @@ mongod = env.Program(
     ],
     LIBDEPS_PRIVATE=[
         'db/index/index_access_methods',
+        'db/replica_set_aware_service',
     ],
     AIB_COMPONENT="mongod",
     AIB_COMPONENTS_EXTRA=[

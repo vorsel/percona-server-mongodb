@@ -64,7 +64,7 @@
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/ops/delete_request.h"
+#include "mongo/db/ops/delete_request_gen.h"
 #include "mongo/db/ops/parsed_update.h"
 #include "mongo/db/ops/update_request.h"
 #include "mongo/db/query/get_executor.h"
@@ -74,6 +74,7 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/rollback_gen.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/storage/control/storage_control.h"
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/oplog_cap_maintainer_thread.h"
 #include "mongo/logv2/log.h"
@@ -192,8 +193,9 @@ StorageInterfaceImpl::createCollectionForBulkLoading(
 
     LOGV2_DEBUG(21753,
                 2,
-                "StorageInterfaceImpl::createCollectionForBulkLoading called for ns: {ns}",
-                "ns"_attr = nss.ns());
+                "StorageInterfaceImpl::createCollectionForBulkLoading called for ns: {namespace}",
+                "StorageInterfaceImpl::createCollectionForBulkLoading called",
+                "namespace"_attr = nss.ns());
 
     class StashClient {
     public:
@@ -400,7 +402,10 @@ Status StorageInterfaceImpl::dropReplicatedDatabases(OperationContext* opCtx) {
     std::vector<std::string> dbNames =
         opCtx->getServiceContext()->getStorageEngine()->listDatabases();
     invariant(!dbNames.empty());
-    LOGV2(21754, "dropReplicatedDatabases - dropping {num} databases", "num"_attr = dbNames.size());
+    LOGV2(21754,
+          "dropReplicatedDatabases - dropping {numDatabases} databases",
+          "dropReplicatedDatabases - dropping databases",
+          "numDatabases"_attr = dbNames.size());
 
     ReplicationCoordinator::get(opCtx)->dropAllSnapshots();
 
@@ -420,12 +425,17 @@ Status StorageInterfaceImpl::dropReplicatedDatabases(OperationContext* opCtx) {
                 LOGV2(21755,
                       "dropReplicatedDatabases - database disappeared after retrieving list of "
                       "database names but before drop: {dbName}",
+                      "dropReplicatedDatabases - database disappeared after retrieving list of "
+                      "database names but before drop",
                       "dbName"_attr = dbName);
             }
         });
     }
     invariant(hasLocalDatabase, "local database missing");
-    LOGV2(21756, "dropReplicatedDatabases - dropped {num} databases", "num"_attr = dbNames.size());
+    LOGV2(21756,
+          "dropReplicatedDatabases - dropped {numDatabases} databases",
+          "dropReplicatedDatabases - dropped databases",
+          "numDatabases"_attr = dbNames.size());
 
     return Status::OK();
 }
@@ -988,14 +998,15 @@ Status StorageInterfaceImpl::updateSingleton(OperationContext* opCtx,
 Status StorageInterfaceImpl::deleteByFilter(OperationContext* opCtx,
                                             const NamespaceString& nss,
                                             const BSONObj& filter) {
-    DeleteRequest request(nss);
+    auto request = DeleteRequest{};
+    request.setNsString(nss);
     request.setQuery(filter);
     request.setMulti(true);
     request.setYieldPolicy(PlanExecutor::NO_YIELD);
 
     // This disables the isLegalClientSystemNS() check in getExecutorDelete() which is used to
     // disallow client deletes from unrecognized system collections.
-    request.setGod();
+    request.setGod(true);
 
     return writeConflictRetry(opCtx, "StorageInterfaceImpl::deleteByFilter", nss.ns(), [&] {
         // ParsedDelete needs to be inside the write conflict retry loop because it may create a
@@ -1162,8 +1173,17 @@ void StorageInterfaceImpl::setInitialDataTimestamp(ServiceContext* serviceCtx,
     serviceCtx->getStorageEngine()->setInitialDataTimestamp(snapshotName);
 }
 
-StatusWith<Timestamp> StorageInterfaceImpl::recoverToStableTimestamp(OperationContext* opCtx) {
-    return opCtx->getServiceContext()->getStorageEngine()->recoverToStableTimestamp(opCtx);
+Timestamp StorageInterfaceImpl::recoverToStableTimestamp(OperationContext* opCtx) {
+    auto serviceContext = opCtx->getServiceContext();
+
+    StorageControl::stopStorageControls(serviceContext);
+
+    auto swStableTimestamp = serviceContext->getStorageEngine()->recoverToStableTimestamp(opCtx);
+    fassert(31049, swStableTimestamp);
+
+    StorageControl::startStorageControls(serviceContext);
+
+    return swStableTimestamp.getValue();
 }
 
 bool StorageInterfaceImpl::supportsRecoverToStableTimestamp(ServiceContext* serviceCtx) const {

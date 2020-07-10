@@ -46,8 +46,7 @@
 #include "mongo/logv2/log_truncation.h"
 #include "mongo/util/time_support.h"
 
-namespace mongo {
-namespace logv2 {
+namespace mongo::logv2 {
 
 // Custom logging source that automatically add our set of attributes
 class LogSource : public boost::log::sources::
@@ -88,7 +87,7 @@ public:
                                    LogComponent component,
                                    LogTag tags,
                                    LogTruncation truncation,
-                                   ErrorCodes::Error userassertErrorCode) {
+                                   int32_t userassertErrorCode) {
         // Perform a quick check first
         if (this->core()->get_logging_enabled()) {
             _severity.set(severity);
@@ -118,10 +117,8 @@ private:
     boost::log::attributes::mutable_constant<LogComponent> _component;
     boost::log::attributes::mutable_constant<LogTag> _tags;
     boost::log::attributes::mutable_constant<LogTruncation> _truncation;
-    boost::log::attributes::mutable_constant<ErrorCodes::Error> _uassertErrorCode;
+    boost::log::attributes::mutable_constant<int32_t> _uassertErrorCode;
     boost::log::attributes::mutable_constant<int32_t> _id;
 };
 
-
-}  // namespace logv2
-}  // namespace mongo
+}  // namespace mongo::logv2

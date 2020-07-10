@@ -320,7 +320,9 @@ StatusWith<unique_ptr<QueryRequest>> QueryRequest::parseFromFindCommand(unique_p
                 return status;
             }
 
-            qr->_oplogReplay = el.boolean();
+            // Ignore the 'oplogReplay' field for compatibility with old clients. Nodes 4.4 and
+            // greater will apply the 'oplogReplay' optimization to eligible oplog scans regardless
+            // of whether the flag is set explicitly, so the flag is no longer meaningful.
         } else if (fieldName == kNoCursorTimeoutField) {
             Status status = checkFieldType(el, Bool);
             if (!status.isOK()) {
@@ -417,7 +419,10 @@ StatusWith<unique_ptr<QueryRequest>> QueryRequest::parseFromFindCommand(unique_p
             if (!status.isOK()) {
                 return status;
             }
-            qr->_use44SortKeys = el.boolean();
+
+            // TODO SERVER-47065: A 4.6 node still has to accept the '_use44SortKeys' field, since
+            // it could be included in a command sent from a 4.4 mongos. In 4.7 development, this
+            // code to tolerate the '_use44SortKeys' field can be deleted.
         } else if (!isGenericArgument(fieldName)) {
             return Status(ErrorCodes::FailedToParse,
                           str::stream() << "Failed to parse: " << cmdObj.toString() << ". "
@@ -561,10 +566,6 @@ void QueryRequest::asFindCommandInternal(BSONObjBuilder* cmdBuilder) const {
         }
     }
 
-    if (_oplogReplay) {
-        cmdBuilder->append(kOplogReplayField, true);
-    }
-
     if (_noCursorTimeout) {
         cmdBuilder->append(kNoCursorTimeoutField, true);
     }
@@ -601,10 +602,6 @@ void QueryRequest::asFindCommandInternal(BSONObjBuilder* cmdBuilder) const {
 
     if (!_resumeAfter.isEmpty()) {
         cmdBuilder->append(kResumeAfterField, _resumeAfter);
-    }
-
-    if (_use44SortKeys) {
-        cmdBuilder->append(kUse44SortKeys, true);
     }
 }
 
@@ -953,9 +950,6 @@ int QueryRequest::getOptions() const {
     if (_slaveOk) {
         options |= QueryOption_SlaveOk;
     }
-    if (_oplogReplay) {
-        options |= QueryOption_OplogReplay;
-    }
     if (_noCursorTimeout) {
         options |= QueryOption_NoCursorTimeout;
     }
@@ -973,7 +967,6 @@ void QueryRequest::initFromInt(int options) {
     bool awaitData = (options & QueryOption_AwaitData) != 0;
     _tailableMode = uassertStatusOK(tailableModeFromBools(tailable, awaitData));
     _slaveOk = (options & QueryOption_SlaveOk) != 0;
-    _oplogReplay = (options & QueryOption_OplogReplay) != 0;
     _noCursorTimeout = (options & QueryOption_NoCursorTimeout) != 0;
     _exhaust = (options & QueryOption_Exhaust) != 0;
     _allowPartialResults = (options & QueryOption_PartialResults) != 0;
@@ -1013,11 +1006,6 @@ StatusWith<BSONObj> QueryRequest::asAggregationCommand() const {
     if (isTailable()) {
         return {ErrorCodes::InvalidPipelineOperator,
                 "Tailable cursors are not supported in aggregation."};
-    }
-    if (_oplogReplay) {
-        return {ErrorCodes::InvalidPipelineOperator,
-                str::stream() << "Option " << kOplogReplayField
-                              << " not supported in aggregation."};
     }
     if (_noCursorTimeout) {
         return {ErrorCodes::InvalidPipelineOperator,

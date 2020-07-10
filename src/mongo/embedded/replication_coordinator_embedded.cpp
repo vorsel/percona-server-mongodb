@@ -181,8 +181,7 @@ Status ReplicationCoordinatorEmbedded::setFollowerMode(const MemberState&) {
     UASSERT_NOT_IMPLEMENTED;
 }
 
-Status ReplicationCoordinatorEmbedded::setFollowerModeStrict(OperationContext* opCtx,
-                                                             const MemberState&) {
+Status ReplicationCoordinatorEmbedded::setFollowerModeRollback(OperationContext* opCtx) {
     UASSERT_NOT_IMPLEMENTED;
 }
 
@@ -293,10 +292,6 @@ HostAndPort ReplicationCoordinatorEmbedded::getMyHostAndPort() const {
     UASSERT_NOT_IMPLEMENTED;
 }
 
-Status ReplicationCoordinatorEmbedded::resyncData(OperationContext*, bool) {
-    UASSERT_NOT_IMPLEMENTED;
-}
-
 StatusWith<BSONObj> ReplicationCoordinatorEmbedded::prepareReplSetUpdatePositionCommand() const {
     UASSERT_NOT_IMPLEMENTED;
 }
@@ -353,6 +348,10 @@ Status ReplicationCoordinatorEmbedded::doReplSetReconfig(OperationContext* opCtx
     UASSERT_NOT_IMPLEMENTED;
 }
 
+Status ReplicationCoordinatorEmbedded::awaitConfigCommitment(OperationContext* opCtx) {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
 Status ReplicationCoordinatorEmbedded::processReplSetInitiate(OperationContext*,
                                                               const BSONObj&,
                                                               BSONObjBuilder*) {
@@ -373,10 +372,6 @@ Status ReplicationCoordinatorEmbedded::processReplSetUpdatePosition(const Update
 }
 
 std::vector<HostAndPort> ReplicationCoordinatorEmbedded::getHostsWrittenTo(const OpTime&, bool) {
-    UASSERT_NOT_IMPLEMENTED;
-}
-
-std::vector<HostAndPort> ReplicationCoordinatorEmbedded::getOtherNodesInReplSet() const {
     UASSERT_NOT_IMPLEMENTED;
 }
 
@@ -411,8 +406,9 @@ void ReplicationCoordinatorEmbedded::resetLastOpTimesFromOplog(OperationContext*
     UASSERT_NOT_IMPLEMENTED;
 }
 
-bool ReplicationCoordinatorEmbedded::shouldChangeSyncSource(
-    const HostAndPort&, const rpc::ReplSetMetadata&, boost::optional<rpc::OplogQueryMetadata>) {
+bool ReplicationCoordinatorEmbedded::shouldChangeSyncSource(const HostAndPort&,
+                                                            const rpc::ReplSetMetadata&,
+                                                            const rpc::OplogQueryMetadata&) {
     UASSERT_NOT_IMPLEMENTED;
 }
 
@@ -506,7 +502,7 @@ TopologyVersion ReplicationCoordinatorEmbedded::getTopologyVersion() const {
     UASSERT_NOT_IMPLEMENTED;
 }
 
-void ReplicationCoordinatorEmbedded::incrementTopologyVersion(OperationContext* opCtx) {
+void ReplicationCoordinatorEmbedded::incrementTopologyVersion() {
     UASSERT_NOT_IMPLEMENTED;
 }
 

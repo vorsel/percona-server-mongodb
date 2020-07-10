@@ -42,7 +42,7 @@
 #include "mongo/db/lasterror.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/ops/delete_request.h"
+#include "mongo/db/ops/delete_request_gen.h"
 #include "mongo/db/ops/parsed_delete.h"
 #include "mongo/db/ops/parsed_update.h"
 #include "mongo/db/ops/write_ops.h"
@@ -94,9 +94,7 @@ void serializeReply(OperationContext* opCtx,
 
     if (continueOnError && !result.results.empty()) {
         const auto& lastResult = result.results.back();
-        if (lastResult == ErrorCodes::StaleConfig ||
-            lastResult == ErrorCodes::CannotImplicitlyCreateCollection ||
-            lastResult == ErrorCodes::StaleDbVersion) {
+        if (lastResult == ErrorCodes::StaleConfig || lastResult == ErrorCodes::StaleDbVersion) {
             // For ordered:false commands we need to duplicate these error results for all ops
             // after we stopped. See handleError() in write_ops_exec.cpp for more info.
             auto err = result.results.back();
@@ -488,13 +486,14 @@ private:
                     "explained write batches must be of size 1",
                     _batch.getDeletes().size() == 1);
 
-            DeleteRequest deleteRequest(_batch.getNamespace());
+            auto deleteRequest = DeleteRequest{};
+            deleteRequest.setNsString(_batch.getNamespace());
             deleteRequest.setQuery(_batch.getDeletes()[0].getQ());
             deleteRequest.setCollation(write_ops::collationOf(_batch.getDeletes()[0]));
             deleteRequest.setMulti(_batch.getDeletes()[0].getMulti());
             deleteRequest.setYieldPolicy(PlanExecutor::YIELD_AUTO);
             deleteRequest.setHint(_batch.getDeletes()[0].getHint());
-            deleteRequest.setExplain();
+            deleteRequest.setIsExplain(true);
 
             ParsedDelete parsedDelete(opCtx, &deleteRequest);
             uassertStatusOK(parsedDelete.parseRequest());

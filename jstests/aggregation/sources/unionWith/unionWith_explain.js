@@ -102,4 +102,28 @@ testPipeline([{
         }
     }
 }]);
+
+// Ensure that both agg with the explain argument and the explain command work.
+assert.commandWorked(testDB.runCommand({
+    aggregate: collA.getName(),
+    pipeline: [{$unionWith: collB.getName()}],
+    cursor: {},
+    explain: true
+}));
+assert.commandWorked(testDB.runCommand({
+    explain: {
+        aggregate: collA.getName(),
+        pipeline: [{$unionWith: collB.getName()}],
+        cursor: {},
+    }
+}));
+
+// Ensure that $unionWith can still execute explain if followed by a stage that calls dispose().
+var result = assert.commandWorked(testDB.runCommand({
+    explain: {
+        aggregate: collA.getName(),
+        pipeline: [{$unionWith: collB.getName()}, {$limit: 1}],
+        cursor: {},
+    }
+}));
 })();

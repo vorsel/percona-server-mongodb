@@ -145,16 +145,18 @@ void appendRequiredFieldsToResponse(OperationContext* opCtx, BSONObjBuilder* res
         if (operationTime != LogicalTime::kUninitialized) {
             LOGV2_DEBUG(22764,
                         5,
-                        "Appending operationTime: {operationTime_asTimestamp}",
-                        "operationTime_asTimestamp"_attr = operationTime.asTimestamp());
+                        "Appending operationTime: {operationTime}",
+                        "Appending operationTime",
+                        "operationTime"_attr = operationTime.asTimestamp());
             responseBuilder->append(kOperationTime, operationTime.asTimestamp());
         } else if (now != LogicalTime::kUninitialized) {
             // If we don't know the actual operation time, use the cluster time instead. This is
             // safe but not optimal because we can always return a later operation time than actual.
             LOGV2_DEBUG(22765,
                         5,
-                        "Appending clusterTime as operationTime {now_asTimestamp}",
-                        "now_asTimestamp"_attr = now.asTimestamp());
+                        "Appending clusterTime as operationTime {clusterTime}",
+                        "Appending clusterTime as operationTime",
+                        "clusterTime"_attr = now.asTimestamp());
             responseBuilder->append(kOperationTime, now.asTimestamp());
         }
 
@@ -251,12 +253,6 @@ void execCommandClient(OperationContext* opCtx,
         auto body = result->getBodyBuilder();
         CommandHelpers::appendCommandStatusNoThrow(body, e.toStatus());
         return;
-    }
-
-    c->incrementCommandsExecuted();
-
-    if (c->shouldAffectCommandCounter()) {
-        globalOpCounters.gotCommand();
     }
 
     auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
@@ -464,12 +460,12 @@ void runCommand(OperationContext* opCtx,
                                            .getDefaultWriteConcern(opCtx)) {
                 wc = *wcDefault;
                 customDefaultWriteConcernWasApplied = true;
-                LOGV2_DEBUG(
-                    22766,
-                    2,
-                    "Applying default writeConcern on {request_getCommandName} of {wcDefault}",
-                    "request_getCommandName"_attr = request.getCommandName(),
-                    "wcDefault"_attr = wcDefault->toBSON());
+                LOGV2_DEBUG(22766,
+                            2,
+                            "Applying default writeConcern on {command} of {writeConcern}",
+                            "Applying default writeConcern on command",
+                            "command"_attr = request.getCommandName(),
+                            "writeConcern"_attr = *wcDefault);
             }
         }
 
@@ -531,11 +527,10 @@ void runCommand(OperationContext* opCtx,
                     customDefaultReadConcernWasApplied = true;
                     LOGV2_DEBUG(22767,
                                 2,
-                                "Applying default readConcern on {invocation_definition_getName} "
-                                "of {rcDefault}",
-                                "invocation_definition_getName"_attr =
-                                    invocation->definition()->getName(),
-                                "rcDefault"_attr = *rcDefault);
+                                "Applying default readConcern on {command} of {readConcern}",
+                                "Applying default readConcern on command",
+                                "command"_attr = invocation->definition()->getName(),
+                                "readConcern"_attr = *rcDefault);
                     // Update the readConcernSupport, since the default RC was applied.
                     readConcernSupport =
                         invocation->supportsReadConcern(readConcernArgs.getLevel());
@@ -607,7 +602,10 @@ void runCommand(OperationContext* opCtx,
         // then it is implicitly "local". There is no need to check whether this is supported,
         // because all commands either support "local" or upconvert the absent readConcern to a
         // stronger level that they do support; e.g. $changeStream upconverts to RC "majority".
-        if (!startTransaction && readConcernArgs.hasLevel()) {
+        //
+        // Individual transaction statements are checked later on, after we've unstashed the
+        // transaction resources.
+        if (!TransactionRouter::get(opCtx) && readConcernArgs.hasLevel()) {
             if (!readConcernSupport.readConcernSupport.isOK()) {
                 auto responseBuilder = replyBuilder->getBodyBuilder();
                 CommandHelpers::appendCommandStatusNoThrow(
@@ -622,6 +620,13 @@ void runCommand(OperationContext* opCtx,
         // Remember whether or not this operation is starting a transaction, in case something later
         // in the execution needs to adjust its behavior based on this.
         opCtx->setIsStartingMultiDocumentTransaction(startTransaction);
+
+        command->incrementCommandsExecuted();
+
+        if (command->shouldAffectCommandCounter()) {
+            globalOpCounters.gotCommand();
+        }
+
 
         for (int tries = 0;; ++tries) {
             // Try kMaxNumStaleVersionRetries times. On the last try, exceptions are rethrown.
@@ -665,7 +670,7 @@ void runCommand(OperationContext* opCtx,
 
                     // TODO SERVER-39704 Allow mongos to retry on stale shard, stale db, snapshot,
                     // or shard invalidated for targeting errors.
-                    if (!txnRouter.canContinueOnStaleShardOrDbError(commandName)) {
+                    if (!txnRouter.canContinueOnStaleShardOrDbError(commandName, ex.toStatus())) {
                         (void)catalogCache->getCollectionRoutingInfoWithRefresh(
                             opCtx, ex.extraInfo<ShardInvalidatedForTargetingInfo>()->getNss());
                         addContextForTransactionAbortingError(
@@ -708,7 +713,6 @@ void runCommand(OperationContext* opCtx,
                 }
 
                 auto catalogCache = Grid::get(opCtx)->catalogCache();
-
                 if (auto staleInfo = ex.extraInfo<StaleConfigInfo>()) {
                     catalogCache->invalidateShardOrEntireCollectionEntryForShardedCollection(
                         opCtx,
@@ -742,7 +746,7 @@ void runCommand(OperationContext* opCtx,
 
                     // TODO SERVER-39704 Allow mongos to retry on stale shard, stale db, snapshot,
                     // or shard invalidated for targeting errors.
-                    if (!txnRouter.canContinueOnStaleShardOrDbError(commandName)) {
+                    if (!txnRouter.canContinueOnStaleShardOrDbError(commandName, ex.toStatus())) {
                         addContextForTransactionAbortingError(
                             txnRouter.txnIdToString(),
                             txnRouter.getLatestStmtId(),
@@ -783,7 +787,7 @@ void runCommand(OperationContext* opCtx,
 
                     // TODO SERVER-39704 Allow mongos to retry on stale shard, stale db, snapshot,
                     // or shard invalidated for targeting errors.
-                    if (!txnRouter.canContinueOnStaleShardOrDbError(commandName)) {
+                    if (!txnRouter.canContinueOnStaleShardOrDbError(commandName, ex.toStatus())) {
                         addContextForTransactionAbortingError(
                             txnRouter.txnIdToString(),
                             txnRouter.getLatestStmtId(),
@@ -891,11 +895,12 @@ DbResponse Strategy::queryOp(OperationContext* opCtx, const NamespaceString& nss
 
     LOGV2_DEBUG(22768,
                 3,
-                "query: {q_ns} {q_query} ntoreturn: {q_ntoreturn} options: {q_queryOptions}",
-                "q_ns"_attr = q.ns,
-                "q_query"_attr = redact(q.query),
-                "q_ntoreturn"_attr = q.ntoreturn,
-                "q_queryOptions"_attr = q.queryOptions);
+                "Query: {namespace} {query} ntoreturn: {ntoreturn} options: {queryOptions}",
+                "Query",
+                "namespace"_attr = q.ns,
+                "query"_attr = redact(q.query),
+                "ntoreturn"_attr = q.ntoreturn,
+                "queryOptions"_attr = q.queryOptions);
 
     if (q.queryOptions & QueryOption_Exhaust) {
         uasserted(18526,
@@ -995,8 +1000,9 @@ DbResponse Strategy::clientCommand(OperationContext* opCtx, const Message& m) {
 
                 LOGV2_DEBUG(22769,
                             1,
-                            "Exception thrown while parsing command {causedBy_ex}",
-                            "causedBy_ex"_attr = causedBy(redact(ex)));
+                            "Exception thrown while parsing command {error}",
+                            "Exception thrown while parsing command",
+                            "error"_attr = redact(ex));
                 throw;
             }
         }();
@@ -1014,23 +1020,26 @@ DbResponse Strategy::clientCommand(OperationContext* opCtx, const Message& m) {
         try {
             LOGV2_DEBUG(22770,
                         3,
-                        "Command begin db: {db} msg id: {m_header_getId}",
+                        "Command begin db: {db} msg id: {headerId}",
+                        "Command begin",
                         "db"_attr = db,
-                        "m_header_getId"_attr = m.header().getId());
+                        "headerId"_attr = m.header().getId());
             runCommand(opCtx, request, m.operation(), reply.get(), &errorBuilder);
             LOGV2_DEBUG(22771,
                         3,
-                        "Command end db: {db} msg id: {m_header_getId}",
+                        "Command end db: {db} msg id: {headerId}",
+                        "Command end",
                         "db"_attr = db,
-                        "m_header_getId"_attr = m.header().getId());
+                        "headerId"_attr = m.header().getId());
         } catch (const DBException& ex) {
-            LOGV2_DEBUG(22772,
-                        1,
-                        "Exception thrown while processing command on {db} msg id: "
-                        "{m_header_getId}{causedBy_ex}",
-                        "db"_attr = db,
-                        "m_header_getId"_attr = m.header().getId(),
-                        "causedBy_ex"_attr = causedBy(redact(ex)));
+            LOGV2_DEBUG(
+                22772,
+                1,
+                "Exception thrown while processing command on {db} msg id: {headerId} {error}",
+                "Exception thrown while processing command",
+                "db"_attr = db,
+                "headerId"_attr = m.header().getId(),
+                "error"_attr = redact(ex));
 
             // Record the exception in CurOp.
             CurOp::get(opCtx)->debug().errInfo = ex.toStatus();
@@ -1169,7 +1178,8 @@ void Strategy::killCursors(OperationContext* opCtx, DbMessage* dbm) {
         if (!nss) {
             LOGV2_DEBUG(22773,
                         3,
-                        "Can't find cursor to kill.  Cursor id: {cursorId}.",
+                        "Can't find cursor to kill, no namespace found. Cursor id: {cursorId}",
+                        "Can't find cursor to kill, no namespace found",
                         "cursorId"_attr = cursorId);
             continue;
         }
@@ -1184,26 +1194,30 @@ void Strategy::killCursors(OperationContext* opCtx, DbMessage* dbm) {
             LOGV2_DEBUG(
                 22774,
                 3,
-                "Not authorized to kill cursor.  Namespace: '{nss}', cursor id: {cursorId}.",
-                "nss"_attr = *nss,
+                "Not authorized to kill cursor. Namespace: '{namespace}', cursor id: {cursorId}",
+                "Not authorized to kill cursor",
+                "namespace"_attr = *nss,
                 "cursorId"_attr = cursorId);
             continue;
         }
 
         Status killCursorStatus = manager->killCursor(opCtx, *nss, cursorId);
         if (!killCursorStatus.isOK()) {
-            LOGV2_DEBUG(22775,
-                        3,
-                        "Can't find cursor to kill.  Namespace: '{nss}', cursor id: {cursorId}.",
-                        "nss"_attr = *nss,
-                        "cursorId"_attr = cursorId);
+            LOGV2_DEBUG(
+                22775,
+                3,
+                "Can't find cursor to kill. Namespace: '{namespace}', cursor id: {cursorId}",
+                "Can't find cursor to kill",
+                "namespace"_attr = *nss,
+                "cursorId"_attr = cursorId);
             continue;
         }
 
         LOGV2_DEBUG(22776,
                     3,
-                    "Killed cursor.  Namespace: '{nss}', cursor id: {cursorId}.",
-                    "nss"_attr = *nss,
+                    "Killed cursor. Namespace: '{namespace}', cursor id: {cursorId}",
+                    "Killed cursor",
+                    "namespace"_attr = *nss,
                     "cursorId"_attr = cursorId);
     }
 }

@@ -477,9 +477,6 @@ Status ReplSetConfig::validate() const {
     std::map<HostAndPort, int> horizonHostNameCounts;
     for (size_t i = 0; i < _members.size(); ++i) {
         const MemberConfig& memberI = _members[i];
-        Status status = memberI.validate();
-        if (!status.isOK())
-            return status;
 
         // Check the replica set configuration for errors in horizon specification:
         //   * Check that all members have the same set of horizon names
@@ -999,6 +996,10 @@ bool ReplSetConfig::containsArbiter() const {
 
 void ReplSetConfig::setNewlyAddedFieldForMemberAtIndex(int memberIndex, bool newlyAdded) {
     _members[memberIndex].setNewlyAdded(newlyAdded);
+
+    // We must recalculate the majority, since nodes with the 'newlyAdded' field set
+    // should be treated as non-voting nodes.
+    _calculateMajorities();
 }
 
 }  // namespace repl

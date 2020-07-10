@@ -152,11 +152,10 @@ void setupFIPS() {
 #if defined(MONGO_CONFIG_HAVE_FIPS_MODE_SET)
     int status = FIPS_mode_set(1);
     if (!status) {
-        LOGV2_FATAL(
-            23173,
-            "can't activate FIPS mode: {SSLManagerInterface_getSSLErrorMessage_ERR_get_error}",
-            "SSLManagerInterface_getSSLErrorMessage_ERR_get_error"_attr =
-                SSLManagerInterface::getSSLErrorMessage(ERR_get_error()));
+        LOGV2_FATAL(23173,
+                    "can't activate FIPS mode: {error}",
+                    "Can't activate FIPS mode",
+                    "error"_attr = SSLManagerInterface::getSSLErrorMessage(ERR_get_error()));
         fassertFailedNoTrace(16703);
     }
     LOGV2(23172, "FIPS 140-2 mode activated");

@@ -85,7 +85,6 @@ let testCases = {
     _configsvrCommitChunkMigration: {skip: "internal command"},
     _configsvrCommitChunkSplit: {skip: "internal command"},
     _configsvrCommitMovePrimary: {skip: "internal command"},
-    _configsvrCreateCollection: {skip: "internal command"},
     _configsvrCreateDatabase: {skip: "internal command"},
     _configsvrDropCollection: {skip: "internal command"},
     _configsvrDropDatabase: {skip: "internal command"},
@@ -481,7 +480,6 @@ let testCases = {
     logout: {skip: "does not accept read or write concern"},
     makeSnapshot: {skip: "does not accept read or write concern"},
     mapReduce: {skip: "does not accept read or write concern"},
-    "mapreduce.shardedfinish": {skip: "internal command"},
     mergeChunks: {skip: "does not accept read or write concern"},
     moveChunk: {
         skip:
@@ -530,6 +528,7 @@ let testCases = {
     replSetStepUp: {skip: "does not accept read or write concern"},
     replSetSyncFrom: {skip: "does not accept read or write concern"},
     replSetTest: {skip: "does not accept read or write concern"},
+    replSetTestEgress: {skip: "does not accept read or write concern"},
     replSetUpdatePosition: {skip: "does not accept read or write concern"},
     resetError: {skip: "does not accept read or write concern"},
     resync: {skip: "does not accept read or write concern"},

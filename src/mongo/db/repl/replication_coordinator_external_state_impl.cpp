@@ -76,6 +76,7 @@
 #include "mongo/db/repl/replication_metrics.h"
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/replica_set_aware_service.h"
 #include "mongo/db/s/balancer/balancer.h"
 #include "mongo/db/s/chunk_splitter.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
@@ -89,6 +90,7 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/session_catalog_mongod.h"
+#include "mongo/db/storage/control/storage_control.h"
 #include "mongo/db/storage/flow_control.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/system_index.h"
@@ -324,7 +326,7 @@ void ReplicationCoordinatorExternalStateImpl::startThreads(const ReplSettings& s
     }
     if (_inShutdown) {
         LOGV2(21305,
-              "Not starting replication storage threads because replication is shutting down.");
+              "Not starting replication storage threads because replication is shutting down");
         return;
     }
 
@@ -408,15 +410,15 @@ void ReplicationCoordinatorExternalStateImpl::shutdown(OperationContext* opCtx) 
     // _taskExecutor pointer never changes.
     _taskExecutor->join();
 
-    // Clear the truncate point if we are still primary, so nothing gets truncated unnecessarily on
-    // startup. There are no oplog holes on clean primary shutdown. Stepdown is similarly safe and
-    // clears the truncate point. The other replication states do need truncation if the truncate
-    // point is set: e.g. interruption mid batch application can leave oplog holes.
+    // The oplog truncate after point must be cleared, if we are still primary for shutdown, so
+    // nothing gets truncated unnecessarily on startup. There are no oplog holes on clean primary
+    // shutdown. Stepdown is similarly safe from holes and halts updates to and clears the truncate
+    // point. The other replication states do need truncation if the truncate point is set: e.g.
+    // interruption mid batch application can leave oplog holes.
     if (!storageGlobalParams.readOnly &&
         _replicationProcess->getConsistencyMarkers()
             ->isOplogTruncateAfterPointBeingUsedForPrimary()) {
-        _replicationProcess->getConsistencyMarkers()->setOplogTruncateAfterPoint(opCtx,
-                                                                                 Timestamp());
+        _stopAsyncUpdatesOfAndClearOplogTruncateAfterPoint();
     }
 }
 
@@ -468,12 +470,7 @@ void ReplicationCoordinatorExternalStateImpl::onDrainComplete(OperationContext* 
         _oplogBuffer->exitDrainMode();
     }
 
-    // If this is a config server node becoming a primary, ensure the balancer is ready to start.
-    if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-        // We must ensure the balancer has stopped because it may still be in the process of
-        // stopping if this node was previously primary.
-        Balancer::get(opCtx)->waitForBalancerToStop();
-    }
+    ReplicaSetAwareServiceRegistry::get(_service).onStepUpBegin(opCtx);
 }
 
 OpTime ReplicationCoordinatorExternalStateImpl::onTransitionToPrimary(OperationContext* opCtx) {
@@ -530,6 +527,7 @@ OpTime ReplicationCoordinatorExternalStateImpl::onTransitionToPrimary(OperationC
     replCoord->createWMajorityWriteAvailabilityDateWaiter(opTimeToReturn);
 
     _shardingOnTransitionToPrimaryHook(opCtx);
+    ReplicaSetAwareServiceRegistry::get(_service).onStepUpComplete(opCtx);
 
     _dropAllTempCollections(opCtx);
 
@@ -742,9 +740,15 @@ void ReplicationCoordinatorExternalStateImpl::closeConnections() {
     _service->getServiceEntryPoint()->endAllSessions(transport::Session::kKeepOpen);
 }
 
-void ReplicationCoordinatorExternalStateImpl::shardingOnStepDownHook() {
+void ReplicationCoordinatorExternalStateImpl::onStepDownHook() {
+    ReplicaSetAwareServiceRegistry::get(_service).onStepDown();
+    _shardingOnStepDownHook();
+    stopNoopWriter();
+    _stopAsyncUpdatesOfAndClearOplogTruncateAfterPoint();
+}
+
+void ReplicationCoordinatorExternalStateImpl::_shardingOnStepDownHook() {
     if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-        Balancer::get(_service)->interruptBalancer();
         PeriodicShardedIndexConsistencyChecker::get(_service).onStepDown();
         TransactionCoordinatorService::get(_service)->onStepDown();
     } else if (ShardingState::get(_service)->enabled()) {
@@ -766,7 +770,7 @@ void ReplicationCoordinatorExternalStateImpl::shardingOnStepDownHook() {
     }
 }
 
-void ReplicationCoordinatorExternalStateImpl::clearOplogVisibilityStateForStepDown() {
+void ReplicationCoordinatorExternalStateImpl::_stopAsyncUpdatesOfAndClearOplogTruncateAfterPoint() {
     auto opCtx = cc().getOperationContext();
     // Temporarily turn off flow control ticketing. Getting a ticket can stall on a ticket being
     // available, which may have to wait for the ticket refresher to run, which in turn blocks on
@@ -787,13 +791,13 @@ void ReplicationCoordinatorExternalStateImpl::clearOplogVisibilityStateForStepDo
     //
     // This makes sure the JournalFlusher is not stuck waiting for a lock that stepdown might hold
     // before doing an update write to the truncate point.
-    _service->getStorageEngine()->interruptJournalFlusherForReplStateChange();
+    StorageControl::interruptJournalFlusherForReplStateChange(_service);
 
     // Wait for another round of journal flushing. This will ensure that we wait for the current
     // round to completely finish and have no chance of racing with unsetting the truncate point
     // below. It is possible that the JournalFlusher will not check for the interrupt signaled
     // above, if writing is imminent, so we must make sure that the code completes fully.
-    _service->getStorageEngine()->waitForJournalFlush(opCtx);
+    StorageControl::waitForJournalFlush(opCtx);
 
     // We can clear the oplogTruncateAfterPoint because we know there are no user writes during
     // stepdown and therefore presently no oplog holes.
@@ -839,9 +843,6 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook
         // Free any leftover locks from previous instantiations.
         auto distLockManager = Grid::get(opCtx)->catalogClient()->getDistLockManager();
         distLockManager->unlockAll(opCtx, distLockManager->getProcessID());
-
-        // If this is a config server node becoming a primary, start the balancer
-        Balancer::get(opCtx)->initiateBalancer(opCtx);
 
         if (auto validator = LogicalTimeValidator::get(_service)) {
             validator->enableKeyGenerator(opCtx, true);
@@ -933,7 +934,11 @@ void ReplicationCoordinatorExternalStateImpl::_dropAllTempCollections(OperationC
         // replica set members.
         if (*it == "local")
             continue;
-        LOGV2_DEBUG(21309, 2, "Removing temporary collections from {db}", "db"_attr = *it);
+        LOGV2_DEBUG(21309,
+                    2,
+                    "Removing temporary collections from {db}",
+                    "Removing temporary collections",
+                    "db"_attr = *it);
         AutoGetDb autoDb(opCtx, *it, MODE_IX);
         invariant(autoDb.getDb(), str::stream() << "Unable to get reference to database " << *it);
         autoDb.getDb()->clearTmpCollections(opCtx);
@@ -982,6 +987,8 @@ void ReplicationCoordinatorExternalStateImpl::notifyOplogMetadataWaiters(
                               "fail point dropPendingCollectionReaperHang enabled. "
                               "Blocking until fail point is disabled. "
                               "committedOpTime: {committedOpTime}",
+                              "fail point dropPendingCollectionReaperHang enabled. "
+                              "Blocking until fail point is disabled",
                               "committedOpTime"_attr = committedOpTime);
                         dropPendingCollectionReaperHang.pauseWhileSet();
                     }

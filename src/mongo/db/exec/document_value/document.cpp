@@ -470,7 +470,7 @@ constexpr StringData Document::metaFieldGeoNearPoint;
 constexpr StringData Document::metaFieldSearchScore;
 constexpr StringData Document::metaFieldSearchHighlights;
 
-BSONObj Document::toBsonWithMetaData(SortKeyFormat sortKeyFormat) const {
+BSONObj Document::toBsonWithMetaData() const {
     BSONObjBuilder bb;
     toBson(&bb);
     if (!metadata()) {
@@ -481,24 +481,10 @@ BSONObj Document::toBsonWithMetaData(SortKeyFormat sortKeyFormat) const {
         bb.append(metaFieldTextScore, metadata().getTextScore());
     if (metadata().hasRandVal())
         bb.append(metaFieldRandVal, metadata().getRandVal());
-    if (metadata().hasSortKey()) {
-        switch (sortKeyFormat) {
-            case SortKeyFormat::k42ChangeStreamSortKey:
-                invariant(metadata().isSingleElementKey());
-                metadata().getSortKey().addToBsonObj(&bb, metaFieldSortKey);
-                break;
-            case SortKeyFormat::k42SortKey:
-                bb.append(metaFieldSortKey,
-                          DocumentMetadataFields::serializeSortKeyAsObject(
-                              metadata().isSingleElementKey(), metadata().getSortKey()));
-                break;
-            case SortKeyFormat::k44SortKey:
-                bb.append(metaFieldSortKey,
-                          DocumentMetadataFields::serializeSortKeyAsArray(
-                              metadata().isSingleElementKey(), metadata().getSortKey()));
-                break;
-        }
-    }
+    if (metadata().hasSortKey())
+        bb.append(metaFieldSortKey,
+                  DocumentMetadataFields::serializeSortKey(metadata().isSingleElementKey(),
+                                                           metadata().getSortKey()));
     if (metadata().hasGeoNearDistance())
         bb.append(metaFieldGeoNearDistance, metadata().getGeoNearDistance());
     if (metadata().hasGeoNearPoint())
@@ -563,6 +549,68 @@ MutableValue MutableDocument::getNestedFieldHelper(const vector<Position>& posit
 MutableValue MutableDocument::getNestedField(const vector<Position>& positions) {
     fassert(16488, !positions.empty());
     return getNestedFieldHelper(positions, 0);
+}
+
+namespace {
+stdx::variant<BSONElement, Value, Document::TraversesArrayTag, stdx::monostate>
+getNestedFieldHelperBSON(BSONElement elt, const FieldPath& fp, size_t level) {
+    if (level == fp.getPathLength()) {
+        if (elt.ok()) {
+            return elt;
+        } else {
+            return stdx::monostate{};
+        }
+    }
+
+    if (elt.type() == BSONType::Array) {
+        return Document::TraversesArrayTag{};
+    } else if (elt.type() == BSONType::Object) {
+        auto subFieldElt = elt.embeddedObject()[fp.getFieldName(level)];
+        return getNestedFieldHelperBSON(subFieldElt, fp, level + 1);
+    }
+
+    // The path continues "past" a scalar, and therefore does not exist.
+    return stdx::monostate{};
+}
+}  // namespace
+
+stdx::variant<BSONElement, Value, Document::TraversesArrayTag, stdx::monostate>
+Document::getNestedFieldNonCachingHelper(const FieldPath& dottedField, size_t level) const {
+    if (!_storage) {
+        return stdx::monostate{};
+    }
+
+    StringData fieldName = dottedField.getFieldName(level);
+    auto bsonEltOrValue = _storage->getFieldNonCaching(fieldName);
+
+    if (stdx::holds_alternative<BSONElement>(bsonEltOrValue)) {
+        return getNestedFieldHelperBSON(
+            stdx::get<BSONElement>(bsonEltOrValue), dottedField, level + 1);
+    }
+
+    const Value& val = stdx::get<Value>(bsonEltOrValue);
+
+    if (level + 1 == dottedField.getPathLength()) {
+        if (val.missing()) {
+            return stdx::monostate{};
+        } else {
+            return val;
+        }
+    }
+
+    if (val.getType() == BSONType::Array) {
+        return Document::TraversesArrayTag{};
+    } else if (val.getType() == BSONType::Object) {
+        return val.getDocument().getNestedFieldNonCachingHelper(dottedField, level + 1);
+    }
+
+    // The path extends beyond a scalar, so it does not exist.
+    return stdx::monostate{};
+}
+
+stdx::variant<BSONElement, Value, Document::TraversesArrayTag, stdx::monostate>
+Document::getNestedFieldNonCaching(const FieldPath& dottedField) const {
+    return getNestedFieldNonCachingHelper(dottedField, 0);
 }
 
 static Value getNestedFieldHelper(const Document& doc,

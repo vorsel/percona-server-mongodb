@@ -277,7 +277,7 @@ auto NetworkInterfaceTL::CommandState::make(NetworkInterfaceTL* interface,
     return std::pair(state, std::move(future));
 }
 
-AsyncDBClient* NetworkInterfaceTL::RequestState::client() noexcept {
+AsyncDBClient* NetworkInterfaceTL::RequestState::getClient(const ConnectionHandle& conn) noexcept {
     if (!conn) {
         return nullptr;
     }
@@ -315,15 +315,13 @@ void NetworkInterfaceTL::CommandStateBase::setTimer() {
                                                   << ", deadline was " << deadline.toString()
                                                   << ", op was " << redact(requestOnAny.toString());
 
-        LOGV2_DEBUG(22595, 2, "{message}", "message"_attr = message);
+        LOGV2_DEBUG(22595, 2, "", "message"_attr = message);
         fulfillFinalPromise(Status(ErrorCodes::NetworkInterfaceExceededTimeLimit, message));
     });
 }
 
 void NetworkInterfaceTL::RequestState::returnConnection(Status status) noexcept {
-    // Settle the connection object on the reactor
     invariant(conn);
-    invariant(interface()->_reactor->onReactorThread());
 
     auto connToReturn = std::exchange(conn, {});
 
@@ -339,17 +337,16 @@ void NetworkInterfaceTL::RequestState::returnConnection(Status status) noexcept 
 void NetworkInterfaceTL::CommandStateBase::tryFinish(Status status) noexcept {
     invariant(finishLine.isReady());
 
-    LOGV2_DEBUG(4646302, 2, "Finished request {request_id}", "request_id"_attr = requestOnAny.id);
+    LOGV2_DEBUG(
+        4646302, 2, "Finished request", "requestId"_attr = requestOnAny.id, "status"_attr = status);
 
     if (timer) {
         // The command has resolved one way or another,
         timer->cancel(baton);
     }
 
-    if (!status.isOK()) {  // TODO: SERVER-46469: || (requestManager && requestManager->isHedging))
-        if (requestManager) {
-            requestManager->cancelRequests();
-        }
+    if (!status.isOK() && requestManager) {
+        requestManager->cancelRequests();
     }
 
     if (interface->_counters) {
@@ -362,38 +359,18 @@ void NetworkInterfaceTL::CommandStateBase::tryFinish(Status status) noexcept {
         stdx::lock_guard lk(interface->_inProgressMutex);
         interface->_inProgress.erase(cbHandle);
     }
+
+    if (operationKey && requestManager) {
+        // Kill operations for requests that we didn't use to fulfill the promise.
+        requestManager->killOperationsForPendingRequests();
+    }
 }
 
 void NetworkInterfaceTL::RequestState::cancel() noexcept {
-    invariant(requestManager);
-    {
-        stdx::lock_guard<Latch> lk(requestManager->mutex);
-        requestManager->isLocked = true;
-        if (requestManager->sentNone()) {
-            // We've canceled before any connections were acquired, we're all good.
-            return;
-        }
-    }
-
-    auto& reactor = interface()->_reactor;
-
-    // If we failed, then get the client to finish up.
-    // Note: CommandState::returnConnection() and CommandState::cancel() run on the reactor
-    // thread only. One goes first and then the other, so there isn't a risk of canceling
-    // the next command to run on the connection.
-    if (reactor->onReactorThread()) {
-        if (auto clientPtr = client()) {
-            // If we have a client, cancel it
-            clientPtr->cancel(cmdState->baton);
-        }
-    } else {
-        ExecutorFuture<void>(reactor).getAsync([this, anchor = shared_from_this()](Status status) {
-            invariant(status.isOK());
-            if (auto clientPtr = client()) {
-                // If we have a client, cancel it
-                clientPtr->cancel(cmdState->baton);
-            }
-        });
+    auto connToCancel = weakConn.lock();
+    if (auto clientPtr = getClient(connToCancel)) {
+        // If we have a client, cancel it
+        clientPtr->cancel(cmdState->baton);
     }
 }
 
@@ -411,7 +388,7 @@ Status NetworkInterfaceTL::startCommand(const TaskExecutor::CallbackHandle& cbHa
 
     LOGV2_DEBUG(22596,
                 logSeverityV1toV2(kDiagnosticLogLevel).toInt(),
-                "startCommand: {request}",
+                "startCommand",
                 "request"_attr = redact(request.toString()));
 
     if (_metadataHook) {
@@ -425,11 +402,30 @@ Status NetworkInterfaceTL::startCommand(const TaskExecutor::CallbackHandle& cbHa
         request.metadata = newMetadata.obj();
     }
 
+    bool targetHostsInAlphabeticalOrder =
+        MONGO_unlikely(networkInterfaceSendRequestsToTargetHostsInAlphabeticalOrder.shouldFail(
+            [request](const BSONObj&) { return request.hedgeOptions != boost::none; }));
+
+    if (targetHostsInAlphabeticalOrder) {
+        // Sort the target hosts by host names.
+        std::sort(request.target.begin(),
+                  request.target.end(),
+                  [](const HostAndPort& target1, const HostAndPort& target2) {
+                      return target1.toString() < target2.toString();
+                  });
+    }
+
     auto [cmdState, future] = CommandState::make(this, request, cbHandle);
     if (cmdState->requestOnAny.timeout != cmdState->requestOnAny.kNoTimeout) {
         cmdState->deadline = cmdState->stopwatch.start() + cmdState->requestOnAny.timeout;
     }
     cmdState->baton = baton;
+    cmdState->requestManager = std::make_unique<RequestManager>(cmdState->hedgeCount, cmdState);
+
+    std::vector<std::shared_ptr<NetworkInterfaceTL::RequestState>> requestStates;
+    for (size_t i = 0; i < cmdState->hedgeCount; i++) {
+        requestStates.emplace_back(cmdState->requestManager->makeRequest());
+    }
 
     if (_svcCtx && cmdState->requestOnAny.hedgeOptions) {
         auto hm = HedgingMetrics::get(_svcCtx);
@@ -473,10 +469,9 @@ Status NetworkInterfaceTL::startCommand(const TaskExecutor::CallbackHandle& cbHa
 
         LOGV2_DEBUG(22597,
                     2,
-                    "Request {cmdState_requestOnAny_id} finished with response: "
-                    "{rs_isOK_rs_data_rs_status_toString}",
-                    "cmdState_requestOnAny_id"_attr = cmdState->requestOnAny.id,
-                    "rs_isOK_rs_data_rs_status_toString"_attr =
+                    "Request finished with response",
+                    "requestId"_attr = cmdState->requestOnAny.id,
+                    "response"_attr =
                         redact(rs.isOK() ? rs.data.toString() : rs.status.toString()));
         onFinish(std::move(rs));
     });
@@ -486,36 +481,20 @@ Status NetworkInterfaceTL::startCommand(const TaskExecutor::CallbackHandle& cbHa
         return Status::OK();
     }
 
-    cmdState->requestManager = std::make_unique<RequestManager>(cmdState->hedgeCount, cmdState);
-
-    std::vector<std::shared_ptr<NetworkInterfaceTL::RequestState>> requestStates;
-
-    for (size_t i = 0; i < cmdState->hedgeCount; i++) {
-        requestStates.emplace_back(
-            cmdState->requestManager->makeRequest(cmdState->requestManager.get()));
-    }
-
-    invariant(cmdState->requestManager);
     RequestManager* rm = cmdState->requestManager.get();
-
-    if (MONGO_unlikely(networkInterfaceConnectTargetHostsInAlphabeticalOrder.shouldFail())) {
-        std::sort(request.target.begin(),
-                  request.target.end(),
-                  [](const HostAndPort& target1, const HostAndPort& target2) {
-                      return target1.toString() < target2.toString();
-                  });
-    }
 
     // Attempt to get a connection to every target host
     for (size_t idx = 0; idx < request.target.size() && !rm->usedAllConn(); ++idx) {
         auto connFuture = _pool->get(request.target[idx], request.sslMode, request.timeout);
 
-        if (connFuture.isReady()) {
+        // If connection future is ready or requests should be sent in order, send the request
+        // immediately.
+        if (connFuture.isReady() || targetHostsInAlphabeticalOrder) {
             rm->trySend(std::move(connFuture).getNoThrow(), idx);
             continue;
         }
 
-        // For every connection future we didn't have immediately ready, schedule
+        // Otherwise, schedule the request.
         std::move(connFuture).thenRunOn(_reactor).getAsync([requestStates, rm, idx](auto swConn) {
             rm->trySend(std::move(swConn), idx);
         });
@@ -524,13 +503,26 @@ Status NetworkInterfaceTL::startCommand(const TaskExecutor::CallbackHandle& cbHa
     return Status::OK();
 }
 
+void NetworkInterfaceTL::testEgress(const HostAndPort& hostAndPort,
+                                    transport::ConnectSSLMode sslMode,
+                                    Milliseconds timeout,
+                                    Status status) {
+    auto handle = _pool->get(hostAndPort, sslMode, timeout).get();
+    if (status.isOK()) {
+        handle->indicateSuccess();
+    } else {
+        handle->indicateFailure(status);
+    }
+}
+
 Future<RemoteCommandResponse> NetworkInterfaceTL::CommandState::sendRequest(size_t reqId) {
     auto requestState = requestManager->getRequest(reqId);
     invariant(requestState);
 
     return makeReadyFutureWith([this, requestState] {
                setTimer();
-               return requestState->client()->runCommandRequest(*requestState->request, baton);
+               return RequestState::getClient(requestState->conn)
+                   ->runCommandRequest(*requestState->request, baton);
            })
         .then([this, requestState](RemoteCommandResponse response) {
             doMetadataHook(RemoteCommandOnAnyResponse(requestState->host, response));
@@ -553,9 +545,19 @@ void NetworkInterfaceTL::CommandState::fulfillFinalPromise(
     promise.setFromStatusWith(std::move(response));
 }
 
+std::shared_ptr<NetworkInterfaceTL::RequestState>
+NetworkInterfaceTL::RequestManager::makeRequest() {
+    stdx::lock_guard<Latch> lk(mutex);
+    auto reqId = requestCount.fetchAndAdd(1);
+    auto requestState =
+        std::make_shared<NetworkInterfaceTL::RequestState>(this, cmdState.lock(), reqId);
+    requests[reqId] = requestState;
+    return requestState;
+}
+
 std::shared_ptr<NetworkInterfaceTL::RequestState> NetworkInterfaceTL::RequestManager::getRequest(
     size_t reqId) {
-    invariant(requestCnt.load() > reqId);
+    invariant(requestCount.load() > reqId);
     return requests[reqId].lock();
 }
 
@@ -563,26 +565,86 @@ std::shared_ptr<NetworkInterfaceTL::RequestState>
 NetworkInterfaceTL::RequestManager::getNextRequest() {
     stdx::lock_guard<Latch> lk(mutex);
     if (sentIdx.load() < requests.size()) {
-        auto req = requests[sentIdx.fetchAndAdd(1)].lock();
+        auto requestState = requests[sentIdx.fetchAndAdd(1)].lock();
+        invariant(requestState);
+
         if (sentIdx.load() > 1) {
-            req->isHedge = true;
+            requestState->isHedge = true;
         }
-        return req;
+        return requestState;
     } else {
         return nullptr;
     }
 }
 
+NetworkInterfaceTL::ConnStatus NetworkInterfaceTL::RequestManager::getConnStatus(size_t reqId) {
+    invariant(requestCount.load() > reqId);
+    return connStatus[reqId];
+}
+
+bool NetworkInterfaceTL::RequestManager::sentNone() const {
+    return sentIdx.load() == 0;
+}
+
+bool NetworkInterfaceTL::RequestManager::sentAll() const {
+    return sentIdx.load() == requests.size();
+}
+
+bool NetworkInterfaceTL::RequestManager::usedAllConn() const {
+    return std::count(connStatus.begin(), connStatus.end(), ConnStatus::Unset) == 0;
+}
+
 void NetworkInterfaceTL::RequestManager::cancelRequests() {
+    {
+        stdx::lock_guard<Latch> lk(mutex);
+        isLocked = true;
+
+        if (sentNone()) {
+            // We've canceled before any connections were acquired.
+            return;
+        }
+    }
+
+    for (size_t i = 0; i < requests.size(); i++) {
+        LOGV2_DEBUG(4646301,
+                    2,
+                    "Cancelling request",
+                    "requestId"_attr = cmdState.lock()->requestOnAny.id,
+                    "index"_attr = i);
+        if (auto requestState = requests[i].lock()) {
+            requestState->cancel();
+        }
+    }
+}
+
+void NetworkInterfaceTL::RequestManager::killOperationsForPendingRequests() {
+    {
+        stdx::lock_guard<Latch> lk(mutex);
+        isLocked = true;
+
+        if (sentNone()) {
+            // We've canceled before any connections were acquired.
+            return;
+        }
+    }
+
     for (size_t i = 0; i < requests.size(); i++) {
         auto requestState = requests[i].lock();
-        if (requestState) {
-            LOGV2_DEBUG(4646301,
+        if (!requestState || requestState->fulfilledPromise) {
+            continue;
+        }
+
+        // If the request was sent, send a remote command request to the target host
+        // to kill the operation started by the request.
+        bool hasAcquiredConn = getConnStatus(requestState->reqId) == ConnStatus::OK;
+        if (hasAcquiredConn && requestState->request) {
+            LOGV2_DEBUG(4664801,
                         2,
-                        "Cancelling request {request_id} with index {idx}",
-                        "request_id"_attr = cmdState.lock()->requestOnAny.id,
-                        "idx"_attr = i);
-            requestState->cancel();
+                        "Sending remote _killOperations request to cancel command",
+                        "operationKey"_attr = cmdState.lock()->operationKey,
+                        "target"_attr = requestState->request->target,
+                        "request_id"_attr = requestState->request->id);
+            requestState->interface()->_killOperation(requestState);
         }
     }
 }
@@ -615,59 +677,58 @@ void NetworkInterfaceTL::RequestManager::trySend(
 
     connStatus[idx] = ConnStatus::OK;
 
-    // Our command has already been satisfied
     {
         stdx::lock_guard<Latch> lk(mutex);
         if (cmdStatePtr->finishLine.isReady() || sentAll() || isLocked) {
+            // Our command has already been satisfied or we have already sent out all
+            // the requests.
             swConn.getValue()->indicateSuccess();
             return;
         }
     }
 
+    auto requestState = getNextRequest();
+    invariant(requestState);
+
     LOGV2_DEBUG(4646300,
                 2,
-                "Sending request {request_id} with index {idx} to {target}",
-                "request_id"_attr = cmdStatePtr->requestOnAny.id,
-                "idx"_attr = idx,
+                "Sending request",
+                "requestId"_attr = cmdStatePtr->requestOnAny.id,
                 "target"_attr = cmdStatePtr->requestOnAny.target[idx]);
 
-    auto req = getNextRequest();
-    if (req) {
-        RemoteCommandRequest remoteReq({cmdStatePtr->requestOnAny, idx});
-        if (remoteReq.hedgeOptions) {
-            req->hasHedgeOptions = true;
-        }
-        if (req->isHedge) {  // this is a hedged read
-            invariant(remoteReq.hedgeOptions);
-            auto maxTimeMS = remoteReq.hedgeOptions->maxTimeMSForHedgedReads;
-            if (remoteReq.timeout == remoteReq.kNoTimeout ||
-                remoteReq.timeout > Milliseconds(maxTimeMS)) {
-                BSONObjBuilder updatedCmdBuilder;
-                for (const auto& elem : remoteReq.cmdObj) {
-                    if (elem.fieldNameStringData() != kMaxTimeMSOptionName) {
-                        updatedCmdBuilder.append(elem);
-                    }
+    RemoteCommandRequest request({cmdStatePtr->requestOnAny, idx});
+
+    if (requestState->isHedge) {
+        invariant(cmdStatePtr->requestOnAny.hedgeOptions);
+
+        // Attach a maxTimeMS to the request.
+        auto maxTimeMS = request.hedgeOptions->maxTimeMSForHedgedReads;
+        if (request.timeout == request.kNoTimeout || request.timeout > Milliseconds(maxTimeMS)) {
+            BSONObjBuilder updatedCmdBuilder;
+            for (const auto& elem : request.cmdObj) {
+                if (elem.fieldNameStringData() != kMaxTimeMSOptionName) {
+                    updatedCmdBuilder.append(elem);
                 }
-                updatedCmdBuilder.append(kMaxTimeMSOptionName, maxTimeMS);
-
-                remoteReq.cmdObj = updatedCmdBuilder.obj();
-                LOGV2_DEBUG(
-                    4647200,
-                    2,
-                    "Set maxTimeMS to {maxTimeMS} for request {request_id} with index {idx}",
-                    "maxTimeMS"_attr = maxTimeMS,
-                    "request_id"_attr = cmdStatePtr->requestOnAny.id,
-                    "idx"_attr = idx);
             }
+            updatedCmdBuilder.append(kMaxTimeMSOptionName, maxTimeMS);
+            request.cmdObj = updatedCmdBuilder.obj();
 
-            if (cmdStatePtr->interface->_svcCtx) {
-                auto hm = HedgingMetrics::get(cmdStatePtr->interface->_svcCtx);
-                invariant(hm);
-                hm->incrementNumTotalHedgedOperations();
-            }
+            LOGV2_DEBUG(4647200,
+                        2,
+                        "Set maxTimeMS for request",
+                        "maxTimeMS"_attr = maxTimeMS,
+                        "request_id"_attr = cmdStatePtr->requestOnAny.id,
+                        "target"_attr = cmdStatePtr->requestOnAny.target[idx]);
         }
-        req->send(std::move(swConn), remoteReq);
+
+        if (cmdStatePtr->interface->_svcCtx) {
+            auto hm = HedgingMetrics::get(cmdStatePtr->interface->_svcCtx);
+            invariant(hm);
+            hm->incrementNumTotalHedgedOperations();
+        }
     }
+
+    requestState->send(std::move(swConn), request);
 }
 
 void NetworkInterfaceTL::RequestState::trySend(StatusWith<ConnectionPool::ConnectionHandle> swConn,
@@ -683,13 +744,15 @@ void NetworkInterfaceTL::RequestState::send(StatusWith<ConnectionPool::Connectio
     request.emplace(remoteCommandRequest);
     host = request.get().target;
     conn = std::move(swConn.getValue());
+    weakConn = conn;
 
     networkInterfaceHangCommandsAfterAcquireConn.pauseWhileSet();
 
-    if (MONGO_unlikely(networkInterfaceAfterAcquireConn.shouldFail())) {
+    if (networkInterfaceAfterAcquireConn.shouldFail()) {
         LOGV2(4630601,
-              "Request {request_id} acquired a connection",
-              "request_id"_attr = request.get().id);
+              "Request acquired a connection",
+              "requestId"_attr = request->id,
+              "target"_attr = request->target);
     }
 
     if (auto counters = interface()->_counters) {
@@ -703,8 +766,6 @@ void NetworkInterfaceTL::RequestState::resolve(Future<RemoteCommandResponse> fut
     auto& reactor = interface()->_reactor;
     auto& baton = cmdState->baton;
 
-    isSent = true;
-
     // Convert the RemoteCommandResponse to a RemoteCommandOnAnyResponse and wrap any error
     auto anyFuture =
         std::move(future)
@@ -717,67 +778,38 @@ void NetworkInterfaceTL::RequestState::resolve(Future<RemoteCommandResponse> fut
                 return RemoteCommandOnAnyResponse(host, std::move(error), stopwatch.elapsed());
             });
 
-    if (baton) {
-        // If we have a baton then use it for the promise and then switch to the reactor to return
-        // our connection.
-        std::move(anyFuture)
-            .thenRunOn(baton)
-            .onCompletion([ this, anchor = shared_from_this() ](auto swr) noexcept {
-                auto response = uassertStatusOK(swr);
-                auto status = swr.getValue().status;
-                auto commandStatus = getStatusFromCommandResult(response.data);
-                // ignore MaxTimeMS expiration errors for  hedged reads
-                if (hasHedgeOptions && isHedge && commandStatus == ErrorCodes::MaxTimeMSExpired) {
-                    LOGV2_DEBUG(4660700,
-                                2,
-                                "Hedged request {request_id} returned status {status}",
-                                "request_id"_attr = request.get().id,
-                                "status"_attr = commandStatus);
-                } else {
-                    if (cmdState->finishLine.arriveStrongly()) {
-                        if (hasHedgeOptions && isHedge) {
-                            auto hm = HedgingMetrics::get(cmdState->interface->_svcCtx);
-                            invariant(hm);
-                            hm->incrementNumAdvantageouslyHedgedOperations();
-                        }
-                        cmdState->fulfillFinalPromise(std::move(response));
-                    }
-                }
+    std::move(anyFuture)                                    //
+        .thenRunOn(makeGuaranteedExecutor(baton, reactor))  // Switch to the baton/reactor.
+        .getAsync([ this, anchor = shared_from_this() ](auto swr) noexcept {
+            auto response = uassertStatusOK(swr);
+            auto status = response.status;
 
-                return status;
-            })
-            .thenRunOn(reactor)
-            .getAsync(
-                [this, anchor = shared_from_this()](Status status) { returnConnection(status); });
-    } else {
-        // If we do not have a baton, then we can fulfill the promise and return our connection in
-        // the same callback
-        std::move(anyFuture).thenRunOn(reactor).getAsync(
-            [ this, anchor = shared_from_this() ](auto swr) noexcept {
-                auto response = uassertStatusOK(swr);
-                auto status = response.status;
-                auto commandStatus = getStatusFromCommandResult(response.data);
-                ON_BLOCK_EXIT([&] { returnConnection(status); });
-                if (!cmdState->finishLine.arriveStrongly()) {
-                    return;
+            returnConnection(status);
+
+            auto commandStatus = getStatusFromCommandResult(response.data);
+
+            if (!cmdState->finishLine.arriveStrongly()) {
+                return;
+            }
+
+            // Ignore maxTimeMS expiration errors for hedged reads
+            if (isHedge && commandStatus == ErrorCodes::MaxTimeMSExpired) {
+                LOGV2_DEBUG(4660701,
+                            2,
+                            "Hedged request returned status",
+                            "requestId"_attr = request->id,
+                            "target"_attr = request->target,
+                            "status"_attr = commandStatus);
+            } else {
+                if (isHedge) {
+                    auto hm = HedgingMetrics::get(cmdState->interface->_svcCtx);
+                    invariant(hm);
+                    hm->incrementNumAdvantageouslyHedgedOperations();
                 }
-                // ignore MaxTimeMS expiration errors for  hedged reads
-                if (hasHedgeOptions && isHedge && commandStatus == ErrorCodes::MaxTimeMSExpired) {
-                    LOGV2_DEBUG(4660701,
-                                2,
-                                "Hedged request {request_id} returned status {status}",
-                                "request_id"_attr = request.get().id,
-                                "status"_attr = commandStatus);
-                } else {
-                    if (hasHedgeOptions && isHedge) {
-                        auto hm = HedgingMetrics::get(cmdState->interface->_svcCtx);
-                        invariant(hm);
-                        hm->incrementNumAdvantageouslyHedgedOperations();
-                    }
-                    cmdState->fulfillFinalPromise(std::move(response));
-                }
-            });
-    }
+                fulfilledPromise = true;
+                cmdState->fulfillFinalPromise(std::move(response));
+            }
+        });
 }
 
 NetworkInterfaceTL::ExhaustCommandState::ExhaustCommandState(
@@ -844,8 +876,9 @@ Future<RemoteCommandResponse> NetworkInterfaceTL::ExhaustCommandState::sendReque
     return makeReadyFutureWith(
                [this, requestState, clientCallback = std::move(clientCallback)]() mutable {
                    setTimer();
-                   return requestState->client()->runExhaustCommandRequest(
-                       *requestState->request, std::move(clientCallback), baton);
+                   return RequestState::getClient(requestState->conn)
+                       ->runExhaustCommandRequest(
+                           *requestState->request, std::move(clientCallback), baton);
                })
         .then([this, requestState] { return prevResponse; });
 }
@@ -874,7 +907,7 @@ Status NetworkInterfaceTL::startExhaustCommand(const TaskExecutor::CallbackHandl
 
     LOGV2_DEBUG(23909,
                 logSeverityV1toV2(kDiagnosticLogLevel).toInt(),
-                "startCommand: {request}",
+                "startCommand",
                 "request"_attr = redact(request.toString()));
 
     if (_metadataHook) {
@@ -893,13 +926,12 @@ Status NetworkInterfaceTL::startExhaustCommand(const TaskExecutor::CallbackHandl
         cmdState->deadline = cmdState->stopwatch.start() + cmdState->requestOnAny.timeout;
     }
     cmdState->baton = baton;
-
     cmdState->requestManager = std::make_unique<RequestManager>(1, cmdState);
-    auto requestState = cmdState->requestManager->makeRequest(cmdState->requestManager.get());
+
+    auto requestState = cmdState->requestManager->makeRequest();
 
     // Attempt to get a connection to every target host
-    for (size_t idx = 0;
-         idx < request.target.size() && !requestState->requestManager->usedAllConn();
+    for (size_t idx = 0; idx < request.target.size() && !cmdState->requestManager->usedAllConn();
          ++idx) {
         auto connFuture = _pool->get(request.target[idx], request.sslMode, request.timeout);
 
@@ -937,48 +969,14 @@ void NetworkInterfaceTL::cancelCommand(const TaskExecutor::CallbackHandle& cbHan
         return;
     }
 
-    if (!cmdStateToCancel->requestManager) {
-        // The command was canceled before it has started.
-        cmdStateToCancel->fulfillFinalPromise(
-            {ErrorCodes::CallbackCanceled,
-             str::stream() << "Command canceled; original request was: "
-                           << redact(cmdStateToCancel->requestOnAny.toString())});
-        return;
-    }
-
-    for (size_t i = 0; i < cmdStateToCancel->requestManager->requests.size(); i++) {
-        auto requestStateToCancel = cmdStateToCancel->requestManager->requests[i].lock();
-
-        if (!requestStateToCancel) {
-            continue;
-        }
-
-        stdx::unique_lock<Latch> lk(requestStateToCancel->requestManager->mutex);
-        bool hasAcquiredConn = !requestStateToCancel->requestManager->sentNone();
-        requestStateToCancel->requestManager->isLocked = true;
-        lk.unlock();
-
-        // Only kill the command if it has an operation key and was attempted.
-        bool shouldKillOp =
-            cmdStateToCancel->operationKey && hasAcquiredConn && requestStateToCancel->request;
-
-        if (!shouldKillOp) {
-            // Satisfy the promise locally immediately.
-            LOGV2_DEBUG(
-                22599,
+    LOGV2_DEBUG(22599,
                 2,
-                "Canceling operation; original request was: {cmdStateToCancel_requestOnAny}",
-                "cmdStateToCancel_requestOnAny"_attr =
-                    redact(cmdStateToCancel->requestOnAny.toString()));
-            cmdStateToCancel->fulfillFinalPromise(
-                {ErrorCodes::CallbackCanceled,
-                 str::stream() << "Command canceled; original request was: "
-                               << redact(cmdStateToCancel->requestOnAny.toString())});
-            return;
-        }
-
-        _killOperation(requestStateToCancel);
-    }
+                "Canceling operation for request",
+                "request"_attr = redact(cmdStateToCancel->requestOnAny.toString()));
+    cmdStateToCancel->fulfillFinalPromise(
+        {ErrorCodes::CallbackCanceled,
+         str::stream() << "Command canceled; original request was: "
+                       << redact(cmdStateToCancel->requestOnAny.toString())});
 }
 
 void NetworkInterfaceTL::_killOperation(std::shared_ptr<RequestState> requestStateToKill) {
@@ -1001,39 +999,22 @@ void NetworkInterfaceTL::_killOperation(std::shared_ptr<RequestState> requestSta
     auto cbHandle = executor::TaskExecutor::CallbackHandle();
     auto [killOpCmdState, future] = CommandState::make(this, killOpRequest, cbHandle);
     killOpCmdState->deadline = killOpCmdState->stopwatch.start() + killOpRequest.timeout;
-
-    std::move(future).getAsync(
-        [this, operationKey, cmdStateToKill](StatusWith<RemoteCommandOnAnyResponse> swr) {
-            invariant(swr.isOK());
-            auto rs = std::move(swr.getValue());
-            LOGV2_DEBUG(
-                51813,
-                2,
-                "Remote _killOperations request to cancel command with operationKey {operationKey}"
-                " finished with response: {rsdata_or_status}",
-                "operationKey"_attr = operationKey,
-                "rsdata_or_status"_attr =
-                    redact(rs.isOK() ? rs.data.toString() : rs.status.toString()));
-
-            // Satisfy the promise locally.
-            if (rs.isOK()) {
-                // _killOperations succeeded but the operation interrupted error is expected to be
-                // ignored in resolve() since cancelCommand() crossed the command finishLine first.
-                cmdStateToKill->fulfillFinalPromise(
-                    {ErrorCodes::CallbackCanceled,
-                     str::stream() << "cancelCommand successfully issued remote interruption"});
-            } else {
-                // _killOperations timed out or failed due to other errors.
-                rs.status.addContext("operation's client canceled by cancelCommand");
-                cmdStateToKill->fulfillFinalPromise(std::move(rs.status));
-            }
-        });
-
     killOpCmdState->requestManager = std::make_unique<RequestManager>(1, killOpCmdState);
 
-    invariant(killOpCmdState->requestManager->connStatus.size() == 1);
-    auto killOpRequestState =
-        killOpCmdState->requestManager->makeRequest(killOpCmdState->requestManager.get());
+    auto killOpRequestState = killOpCmdState->requestManager->makeRequest();
+
+    std::move(future).getAsync(
+        [this, operationKey, target = target](StatusWith<RemoteCommandOnAnyResponse> swr) {
+            invariant(swr.isOK());
+            auto rs = std::move(swr.getValue());
+            LOGV2_DEBUG(51813,
+                        2,
+                        "Remote _killOperations request to cancel command finished with response",
+                        "operationKey"_attr = operationKey,
+                        "target"_attr = target,
+                        "response"_attr =
+                            redact(rs.isOK() ? rs.data.toString() : rs.status.toString()));
+        });
 
     // Send the _killOperations request.
     auto connFuture = _pool->get(target, sslMode, killOpRequest.kNoTimeout);
@@ -1169,8 +1150,8 @@ void NetworkInterfaceTL::_answerAlarm(Status status, std::shared_ptr<AlarmState>
     if (status.isOK() && currentTime < state->when) {
         LOGV2_DEBUG(22600,
                     2,
-                    "Alarm returned early. Expected at: {state_when}, fired at: {currentTime}",
-                    "state_when"_attr = state->when,
+                    "Alarm returned early",
+                    "expectedTime"_attr = state->when,
                     "currentTime"_attr = currentTime);
         state->timer->waitUntil(state->when, nullptr)
             .getAsync([this, state = std::move(state)](Status status) mutable {

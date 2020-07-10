@@ -47,8 +47,7 @@
 #include <boost/log/core.hpp>
 #include <boost/log/sinks.hpp>
 
-namespace mongo {
-namespace logv2 {
+namespace mongo::logv2 {
 
 void LogDomainGlobal::ConfigurationOptions::makeDisabled() {
     consoleEnabled = false;
@@ -168,7 +167,7 @@ Status LogDomainGlobal::Impl::configure(LogDomainGlobal::ConfigurationOptions co
 
     if (options.fileEnabled) {
         auto backend = boost::make_shared<RotatableFileBackend>(
-            boost::make_shared<FileRotateSink>(),
+            boost::make_shared<FileRotateSink>(options.timestampFormat),
             boost::make_shared<RamLogSink>(RamLog::get("global")),
             boost::make_shared<RamLogSink>(RamLog::get("startupWarnings")),
             boost::make_shared<UserAssertSink>());
@@ -286,5 +285,4 @@ LogComponentSettings& LogDomainGlobal::settings() {
     return _impl->_settings;
 }
 
-}  // namespace logv2
-}  // namespace mongo
+}  // namespace mongo::logv2

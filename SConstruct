@@ -758,6 +758,14 @@ env_vars.Add('GITDIFFFLAGS',
     help='Sets flags for git diff',
     default='')
 
+env_vars.Add('REVISION',
+    help='Base git revision',
+    default='')
+
+env_vars.Add('ENTERPRISE_REV',
+    help='Base git revision of enterprise modules',
+    default='')
+
 # Note: This probably is only really meaningful when configured via a variables file. It will
 # also override whatever the SCons platform defaults would be.
 env_vars.Add('ENV',
@@ -4163,13 +4171,6 @@ incremental_link = Tool('incremental_link')
 if incremental_link.exists(env):
     incremental_link(env)
 
-def checkErrorCodes():
-    import buildscripts.errorcodes as x
-    if x.check_error_codes() == False:
-        env.FatalError("next id to use: {0}", x.get_next_code())
-
-checkErrorCodes()
-
 # Resource Files are Windows specific
 def env_windows_resource_file(env, path):
     if env.TargetOSIs('windows'):
@@ -4214,7 +4215,7 @@ if get_option('lint-scope') == 'changed':
             "buildscripts/eslint.py",
             patch_file,
         ],
-        action="$PYTHON ${SOURCES[0]} lint-git-diff ${SOURCES[1]}"
+        action="REVISION=$REVISION ENTERPRISE_REV=$ENTERPRISE_REV $PYTHON ${SOURCES[0]} lint-git-diff"
     )
 
 else:
@@ -4248,11 +4249,16 @@ lint_py = env.Command(
     action="$PYTHON ${SOURCES[0]} lint",
 )
 
-env.Alias( "lint" , [ lint_py, eslint, clang_format, pylinters ] )
-env.Alias( "lint-fast" , [ eslint, clang_format, pylinters ] )
+lint_errorcodes = env.Command(
+    target="#lint-errorcodes",
+    source=["buildscripts/errorcodes.py"],
+    action="$PYTHON ${SOURCES[0]} --quiet",
+)
+
+env.Alias( "lint" , [ lint_py, eslint, clang_format, pylinters, lint_errorcodes ] )
+env.Alias( "lint-fast" , [ eslint, clang_format, pylinters, lint_errorcodes ] )
 env.AlwaysBuild( "lint" )
 env.AlwaysBuild( "lint-fast" )
-
 
 #  ----  INSTALL -------
 

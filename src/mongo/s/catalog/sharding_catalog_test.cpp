@@ -121,9 +121,11 @@ TEST_F(ShardingCatalogClientTest, GetCollectionExisting) {
                                      {newOpTime, Date_t() + Seconds(newOpTime.getSecs())},
                                      newOpTime,
                                      100,
+                                     0,
                                      OID(),
                                      30,
-                                     -1);
+                                     -1,
+                                     true);
             BSONObjBuilder builder;
             metadata.writeToMetadata(&builder).transitional_ignore();
 
@@ -194,9 +196,11 @@ TEST_F(ShardingCatalogClientTest, GetDatabaseExisting) {
                                  {newOpTime, Date_t() + Seconds(newOpTime.getSecs())},
                                  newOpTime,
                                  100,
+                                 0,
                                  OID(),
                                  30,
-                                 -1);
+                                 -1,
+                                 true);
         BSONObjBuilder builder;
         metadata.writeToMetadata(&builder).transitional_ignore();
 
@@ -421,9 +425,11 @@ TEST_F(ShardingCatalogClientTest, GetChunksForNSWithSortAndLimit) {
                                      {newOpTime, Date_t() + Seconds(newOpTime.getSecs())},
                                      newOpTime,
                                      100,
+                                     0,
                                      OID(),
                                      30,
-                                     -1);
+                                     -1,
+                                     true);
             BSONObjBuilder builder;
             metadata.writeToMetadata(&builder).transitional_ignore();
 
@@ -822,9 +828,11 @@ TEST_F(ShardingCatalogClientTest, GetCollectionsValidResultsNoDb) {
                                  {newOpTime, Date_t() + Seconds(newOpTime.getSecs())},
                                  newOpTime,
                                  100,
+                                 0,
                                  OID(),
                                  30,
-                                 -1);
+                                 -1,
+                                 true);
         BSONObjBuilder builder;
         metadata.writeToMetadata(&builder).transitional_ignore();
 

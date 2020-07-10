@@ -54,7 +54,7 @@
     do {                                                              \
         if (-1 == (EXPR)) {                                           \
             const int err = errno;                                    \
-            LOGV2_FATAL(24138,                                        \
+            LOGV2_ERROR(24138,                                        \
                         "{expr} failed: {errno}",                     \
                         "expr"_attr = #EXPR,                          \
                         "errno"_attr = errnoWithDescription(err));    \
@@ -136,12 +136,14 @@ void DeathTestBase::_doTest() {
     try {
         auto test = _doMakeTest();
         test->run();
+        LOGV2(20166, "Death test failed to die");
     } catch (const TestAssertionFailureException& tafe) {
-        LOGV2(24137, "Caught test exception while expecting death: {tafe}", "tafe"_attr = tafe);
-        // To fail the test, we must exit with a successful error code, because the parent process
-        // is checking for the child to die with an exit code indicating an error.
-        quickExit(EXIT_SUCCESS);
+        LOGV2(24137, "Death test threw test exception instead of dying", "exception"_attr = tafe);
+    } catch (...) {
+        LOGV2(20167, "Death test threw exception instead of dying");
     }
+    // To fail the test, we must exit with a successful error code, because the parent process
+    // is checking for the child to die with an exit code indicating an error.
     quickExit(EXIT_SUCCESS);
 #endif
 }

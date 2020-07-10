@@ -31,10 +31,7 @@
 
 namespace mongo {
 
-REGISTER_EXPRESSION_WITH_MIN_VERSION(
-    function,
-    ExpressionFunction::parse,
-    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44);
+REGISTER_EXPRESSION(function, ExpressionFunction::parse);
 
 ExpressionFunction::ExpressionFunction(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                        boost::intrusive_ptr<Expression> passedArgs,
@@ -67,6 +64,10 @@ boost::intrusive_ptr<Expression> ExpressionFunction::parse(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     BSONElement expr,
     const VariablesParseState& vps) {
+
+    uassert(4660800,
+            str::stream() << kExpressionName << " cannot be used inside a validator.",
+            !expCtx->isParsingCollectionValidator);
 
     uassert(31260,
             str::stream() << kExpressionName

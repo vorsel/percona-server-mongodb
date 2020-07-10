@@ -82,6 +82,7 @@
 namespace mongo {
 
 namespace {
+MONGO_FAIL_POINT_DEFINE(throwWCEDuringTxnCollCreate);
 MONGO_FAIL_POINT_DEFINE(hangBeforeLoggingCreateCollection);
 MONGO_FAIL_POINT_DEFINE(hangAndFailAfterCreateCollectionReservesOpTime);
 MONGO_FAIL_POINT_DEFINE(openCreateCollectionWindowFp);
@@ -573,6 +574,14 @@ void DatabaseImpl::_checkCanCreateCollection(OperationContext* opCtx,
         }
     }
 
+    if (MONGO_unlikely(throwWCEDuringTxnCollCreate.shouldFail()) &&
+        opCtx->inMultiDocumentTransaction()) {
+        LOGV2(4696600,
+              "Throwing WriteConflictException due to failpoint 'throwWCEDuringTxnCollCreate'");
+        throw WriteConflictException();
+    }
+
+
     uassert(17320,
             str::stream() << "cannot do createCollection on namespace with a $ in it: " << nss,
             nss.ns().find('$') == std::string::npos);
@@ -590,12 +599,10 @@ void DatabaseImpl::_checkCanCreateCollection(OperationContext* opCtx,
                           << " - database is in the process of being dropped.",
             !_dropPending.load());
 
-    uassert(ErrorCodes::IncompatibleServerVersion,
-            str::stream() << "Cannot create collection with a long name " << nss
-                          << " - upgrade to feature compatibility version "
-                          << FeatureCompatibilityVersionParser::kVersion44
-                          << " to be able to do so.",
-            nss.checkLengthForFCV());
+    uassert(17381,
+            str::stream() << "Fully qualified namespace is too long. Namespace: " << nss.ns()
+                          << " Max: " << NamespaceString::MaxNsCollectionLen,
+            !nss.isNormalCollection() || nss.size() <= NamespaceString::MaxNsCollectionLen);
 }
 
 Status DatabaseImpl::createView(OperationContext* opCtx,
@@ -644,10 +651,10 @@ Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
     bool generatedUUID = false;
     if (!optionsWithUUID.uuid) {
         if (!canAcceptWrites) {
-            std::string msg = str::stream()
-                << "Attempted to create a new collection " << nss << " without a UUID";
-            LOGV2_FATAL(20329, "{msg}", "msg"_attr = msg);
-            uasserted(ErrorCodes::InvalidOptions, msg);
+            LOGV2_ERROR_OPTIONS(20329,
+                                {logv2::UserAssertAfterLog(ErrorCodes::InvalidOptions)},
+                                "Attempted to create a new collection {nss} without a UUID",
+                                "nss"_attr = nss);
         } else {
             optionsWithUUID.uuid.emplace(CollectionUUID::gen());
             generatedUUID = true;

@@ -291,11 +291,12 @@ public:
     void onStepUp(OperationContext* opCtx);
 
     /**
-     * Invoked when the node enters the rollback state.
-     * Unblocks index builds that have been waiting to commit/abort during the secondary state.
-     * Returns an IndexBuilds of aborted index builds.
+     * Called during rollback to stop all active index builds. The state of these builds is distinct
+     * from "aborted" because no abortIndexBuild is replicated and the current node will restart
+     * these builds at the completion of rollback. Returns an IndexBuilds of stopped index builds.
+     * Single-phase index builds are not stopped.
      */
-    IndexBuilds onRollback(OperationContext* opCtx);
+    IndexBuilds stopIndexBuildsForRollback(OperationContext* opCtx);
 
     /**
      * Handles the 'VoteCommitIndexBuild' command request.
@@ -445,6 +446,17 @@ public:
      */
     static int getNumIndexesTotal(OperationContext* opCtx, Collection* collection);
 
+
+    /**
+     * Sets the index build action 'signal' for the index build pointed by 'replState'. Also, it
+     * cancels if there is any active remote 'voteCommitIndexBuild' command request callback handle
+     * for this index build.
+     */
+    virtual void setSignalAndCancelVoteRequestCbkIfActive(
+        WithLock ReplIndexBuildStateLk,
+        OperationContext* opCtx,
+        std::shared_ptr<ReplIndexBuildState> replState,
+        IndexBuildAction signal) = 0;
 
 private:
     /**

@@ -122,10 +122,13 @@ CollectionShardingRuntime* CollectionShardingRuntime::get_UNSAFE(ServiceContext*
     return checked_cast<CollectionShardingRuntime*>(css);
 }
 
-ScopedCollectionFilter CollectionShardingRuntime::getOwnershipFilter(OperationContext* opCtx) {
+ScopedCollectionFilter CollectionShardingRuntime::getOwnershipFilter(
+    OperationContext* opCtx, OrphanCleanupPolicy orphanCleanupPolicy) {
     const auto optReceivedShardVersion = getOperationReceivedVersion(opCtx, _nss);
     if (!optReceivedShardVersion)
         return {kUnshardedCollection};
+    invariant(!ChunkVersion::isIgnoredVersion(*optReceivedShardVersion),
+              "getOwnershipFilter called with an operationContext that has shard version IGNORED");
 
     const auto atClusterTime = repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime();
     auto optMetadata = _getMetadataWithVersionCheckAt(opCtx, atClusterTime);
@@ -214,9 +217,9 @@ void CollectionShardingRuntime::setFilteringMetadata(OperationContext* opCtx,
 
     if (!newMetadata.isSharded()) {
         LOGV2(21917,
-              "Marking collection {nss_ns} as {newMetadata_Basic}",
-              "nss_ns"_attr = _nss.ns(),
-              "newMetadata_Basic"_attr = newMetadata.toStringBasic());
+              "Marking collection {namespace} as unsharded",
+              "Marking collection as unsharded",
+              "namespace"_attr = _nss.ns());
         _metadataType = MetadataType::kUnsharded;
         _metadataManager.reset();
         ++_numMetadataManagerChanges;
@@ -283,8 +286,9 @@ Status CollectionShardingRuntime::waitForClean(OperationContext* opCtx,
             if (!stillScheduled) {
                 LOGV2_OPTIONS(21918,
                               {logv2::LogComponent::kShardingMigration},
-                              "Finished waiting for deletion of {nss_ns} range {orphanRange}",
-                              "nss_ns"_attr = nss.ns(),
+                              "Finished waiting for deletion of {namespace} range {orphanRange}",
+                              "Finished waiting for deletion of orphans",
+                              "namespace"_attr = nss.ns(),
                               "orphanRange"_attr = redact(orphanRange.toString()));
                 return Status::OK();
             }
@@ -292,8 +296,9 @@ Status CollectionShardingRuntime::waitForClean(OperationContext* opCtx,
 
         LOGV2_OPTIONS(21919,
                       {logv2::LogComponent::kShardingMigration},
-                      "Waiting for deletion of {nss_ns} range {orphanRange}",
-                      "nss_ns"_attr = nss.ns(),
+                      "Waiting for deletion of {namespace} range {orphanRange}",
+                      "Waiting for deletion of orphans",
+                      "namespace"_attr = nss.ns(),
                       "orphanRange"_attr = orphanRange);
 
         Status result = stillScheduled->getNoThrow(opCtx);

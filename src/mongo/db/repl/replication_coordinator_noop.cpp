@@ -174,8 +174,7 @@ Status ReplicationCoordinatorNoOp::setFollowerMode(const MemberState&) {
     MONGO_UNREACHABLE;
 }
 
-Status ReplicationCoordinatorNoOp::setFollowerModeStrict(OperationContext* opCtx,
-                                                         const MemberState&) {
+Status ReplicationCoordinatorNoOp::setFollowerModeRollback(OperationContext* opCtx) {
     MONGO_UNREACHABLE;
 }
 
@@ -268,10 +267,6 @@ HostAndPort ReplicationCoordinatorNoOp::getMyHostAndPort() const {
     MONGO_UNREACHABLE;
 }
 
-Status ReplicationCoordinatorNoOp::resyncData(OperationContext*, bool) {
-    MONGO_UNREACHABLE;
-}
-
 StatusWith<BSONObj> ReplicationCoordinatorNoOp::prepareReplSetUpdatePositionCommand() const {
     MONGO_UNREACHABLE;
 }
@@ -328,6 +323,10 @@ Status ReplicationCoordinatorNoOp::doReplSetReconfig(OperationContext* opCtx,
     MONGO_UNREACHABLE;
 }
 
+Status ReplicationCoordinatorNoOp::awaitConfigCommitment(OperationContext* opCtx) {
+    MONGO_UNREACHABLE;
+}
+
 Status ReplicationCoordinatorNoOp::processReplSetInitiate(OperationContext*,
                                                           const BSONObj&,
                                                           BSONObjBuilder*) {
@@ -348,10 +347,6 @@ Status ReplicationCoordinatorNoOp::processReplSetUpdatePosition(const UpdatePosi
 }
 
 std::vector<HostAndPort> ReplicationCoordinatorNoOp::getHostsWrittenTo(const OpTime&, bool) {
-    MONGO_UNREACHABLE;
-}
-
-std::vector<HostAndPort> ReplicationCoordinatorNoOp::getOtherNodesInReplSet() const {
     MONGO_UNREACHABLE;
 }
 
@@ -388,7 +383,7 @@ void ReplicationCoordinatorNoOp::resetLastOpTimesFromOplog(OperationContext*, Da
 
 bool ReplicationCoordinatorNoOp::shouldChangeSyncSource(const HostAndPort&,
                                                         const rpc::ReplSetMetadata&,
-                                                        boost::optional<rpc::OplogQueryMetadata>) {
+                                                        const rpc::OplogQueryMetadata&) {
     MONGO_UNREACHABLE;
 }
 
@@ -480,7 +475,7 @@ TopologyVersion ReplicationCoordinatorNoOp::getTopologyVersion() const {
     MONGO_UNREACHABLE;
 }
 
-void ReplicationCoordinatorNoOp::incrementTopologyVersion(OperationContext* opCtx) {
+void ReplicationCoordinatorNoOp::incrementTopologyVersion() {
     MONGO_UNREACHABLE;
 }
 

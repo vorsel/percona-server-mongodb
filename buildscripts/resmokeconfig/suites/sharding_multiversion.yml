@@ -6,6 +6,10 @@ selector:
   exclude_with_any_tags:
   - multiversion_incompatible
   - requires_fcv_44
+  exclude_files:
+  # Enable when 4.4 becomes last stable
+  - jstests/sharding/killop.js
+  - jstests/sharding/verify_sessions_expiration_sharded.js
 executor:
   config:
     shell_options:

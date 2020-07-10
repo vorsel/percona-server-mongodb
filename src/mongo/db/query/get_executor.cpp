@@ -414,7 +414,9 @@ StatusWith<PrepareExecutionResult> prepareExecution(OperationContext* opCtx,
             root = std::make_unique<ShardFilterStage>(
                 canonicalQuery->getExpCtx().get(),
                 CollectionShardingState::get(opCtx, canonicalQuery->nss())
-                    ->getOwnershipFilter(opCtx),
+                    ->getOwnershipFilter(
+                        opCtx,
+                        CollectionShardingState::OrphanCleanupPolicy::kDisallowOrphanCleanup),
                 ws,
                 std::move(root));
         }
@@ -441,7 +443,6 @@ StatusWith<PrepareExecutionResult> prepareExecution(OperationContext* opCtx,
                     ? QueryPlannerCommon::extractSortKeyMetaFieldsFromProjection(*cqProjection)
                     : std::vector<FieldPath>{},
                 ws,
-                canonicalQuery->getExpCtx()->sortKeyFormat,
                 std::move(root));
         } else if (cqProjection) {
             // There might be a projection. The idhack stage will always fetch the full
@@ -738,8 +739,8 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDelete(
     OperationContext* opCtx = expCtx->opCtx;
     const DeleteRequest* request = parsedDelete->getRequest();
 
-    const NamespaceString& nss(request->getNamespaceString());
-    if (!request->isGod()) {
+    const NamespaceString& nss(request->getNsString());
+    if (!request->getGod()) {
         if (nss.isSystem() && opCtx->lockState()->shouldConflictWithSecondaryBatchApplication()) {
             uassert(12050, "cannot delete from system namespace", nss.isLegalClientSystemNS());
         }
@@ -759,10 +760,10 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDelete(
     }
 
     auto deleteStageParams = std::make_unique<DeleteStageParams>();
-    deleteStageParams->isMulti = request->isMulti();
-    deleteStageParams->fromMigrate = request->isFromMigrate();
-    deleteStageParams->isExplain = request->isExplain();
-    deleteStageParams->returnDeleted = request->shouldReturnDeleted();
+    deleteStageParams->isMulti = request->getMulti();
+    deleteStageParams->fromMigrate = request->getFromMigrate();
+    deleteStageParams->isExplain = request->getIsExplain();
+    deleteStageParams->returnDeleted = request->getReturnDeleted();
     deleteStageParams->sort = request->getSort();
     deleteStageParams->opDebug = opDebug;
     deleteStageParams->stmtId = request->getStmtId();
@@ -859,7 +860,7 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDelete(
         cq->getExpCtx().get(), std::move(deleteStageParams), ws.get(), collection, root.release());
 
     if (!request->getProj().isEmpty()) {
-        invariant(request->shouldReturnDeleted());
+        invariant(request->getReturnDeleted());
 
         const bool allowPositional = true;
         StatusWith<unique_ptr<PlanStage>> projStatus = applyProjection(

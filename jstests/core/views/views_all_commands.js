@@ -91,7 +91,6 @@ let viewsCommandTests = {
     _configsvrCommitChunkMigration: {skip: isAnInternalCommand},
     _configsvrCommitChunkSplit: {skip: isAnInternalCommand},
     _configsvrCommitMovePrimary: {skip: isAnInternalCommand},
-    _configsvrCreateCollection: {skip: isAnInternalCommand},
     _configsvrCreateDatabase: {skip: isAnInternalCommand},
     _configsvrDropCollection: {skip: isAnInternalCommand},
     _configsvrDropDatabase: {skip: isAnInternalCommand},
@@ -404,7 +403,6 @@ let viewsCommandTests = {
             {mapReduce: "view", map: function() {}, reduce: function(key, vals) {}, out: "out"},
         expectFailure: true
     },
-    "mapreduce.shardedfinish": {skip: isAnInternalCommand},
     mergeChunks: {
         command: {mergeChunks: "test.view", bounds: [{x: 0}, {x: 10}]},
         skipStandalone: true,
@@ -467,6 +465,7 @@ let viewsCommandTests = {
     replSetStepUp: {skip: isUnrelated},
     replSetSyncFrom: {skip: isUnrelated},
     replSetTest: {skip: isUnrelated},
+    replSetTestEgress: {skip: isUnrelated},
     replSetUpdatePosition: {skip: isUnrelated},
     replSetResizeOplog: {skip: isUnrelated},
     resetError: {skip: isUnrelated},

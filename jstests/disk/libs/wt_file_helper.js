@@ -83,7 +83,7 @@ let assertErrorOnStartupWhenStartingAsReplSet = function(dbpath, port, rsName) {
     let node = MongoRunner.runMongod(
         {dbpath: dbpath, port: port, replSet: rsName, noCleanData: true, waitForConnect: false});
     assert.soon(function() {
-        return rawMongoProgramOutput().search(/Fatal Assertion.*50923/) >= 0;
+        return rawMongoProgramOutput().search(/Fatal assertion.*50923/) >= 0;
     });
     MongoRunner.stopMongod(node, null, {allowedExitCode: MongoRunner.EXIT_ABRUPT});
 };
@@ -99,7 +99,7 @@ let assertErrorOnStartupAfterIncompleteRepair = function(dbpath, port) {
     let node = MongoRunner.runMongod(
         {dbpath: dbpath, port: port, noCleanData: true, waitForConnect: false});
     assert.soon(function() {
-        return rawMongoProgramOutput().search(/Fatal Assertion.*50922/) >= 0;
+        return rawMongoProgramOutput().search(/Fatal assertion.*50922/) >= 0;
     });
     MongoRunner.stopMongod(node, null, {allowedExitCode: MongoRunner.EXIT_ABRUPT});
 };
@@ -206,4 +206,14 @@ let assertErrorOnRequestWhenFilesAreCorruptOrMissing = function(
 let runWiredTigerTool = function(...args) {
     const cmd = ['wt'].concat(args);
     assert.eq(run.apply(undefined, cmd), 0, "error executing: " + cmd.join(' '));
+};
+
+/**
+ * Stops the given mongod, runs the truncate command on the given uri using the WiredTiger tool, and
+ * starts mongod again on the same path.
+ */
+let truncateUriAndRestartMongod = function(uri, conn) {
+    MongoRunner.stopMongod(conn, null, {skipValidation: true});
+    runWiredTigerTool("-h", conn.dbpath, "truncate", uri);
+    return startMongodOnExistingPath(conn.dbpath, {});
 };

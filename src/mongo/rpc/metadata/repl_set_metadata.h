@@ -50,6 +50,7 @@ public:
      * Default primary index. Also used to indicate in metadata that there is no
      * primary.
      */
+    // TODO(SERVER-47125): remove post-4.4.
     static const int kNoPrimary = -1;
 
     ReplSetMetadata() = default;
@@ -57,9 +58,11 @@ public:
                     repl::OpTimeAndWallTime committedOpTime,
                     repl::OpTime visibleOpTime,
                     long long configVersion,
-                    OID replicaSetId,
+                    long long configTerm,
+                    OID id,
                     int currentPrimaryIndex,
-                    int currentSyncSourceIndex);
+                    int currentSyncSourceIndex,
+                    boost::optional<bool> isPrimary);
 
     /**
      * format:
@@ -70,14 +73,15 @@ public:
      *     configVersion: 0,
      *     replicaSetId: ObjectId("..."), // Only present in certain versions and above.
      *     primaryIndex: 0,
-     *     syncSourceIndex: 0
+     *     syncSourceIndex: 0,
+     *     isPrimary: false // 4.4 and later
      * }
      */
     static StatusWith<ReplSetMetadata> readFromMetadata(const BSONObj& doc);
     Status writeToMetadata(BSONObjBuilder* builder) const;
 
     /**
-     * Returns the OpTime of the most recent operation with which the client intereacted.
+     * Returns the OpTime of the most recent operation with which the client interacted.
      */
     repl::OpTime getLastOpVisible() const {
         return _lastOpVisible;
@@ -98,6 +102,13 @@ public:
     }
 
     /**
+     * Returns the ReplSetConfig term number of the sender.
+     */
+    long long getConfigTerm() const {
+        return _configTerm;
+    }
+
+    /**
      * Returns true if the sender has a replica set ID.
      */
     bool hasReplicaSetId() const {
@@ -111,6 +122,7 @@ public:
         return _replicaSetId;
     }
 
+    // TODO(SERVER-47125): remove post-4.4.
     /**
      * Returns the index of the current primary from the perspective of the sender.
      * Returns kNoPrimary if there is no primary.
@@ -125,6 +137,15 @@ public:
      */
     int getSyncSourceIndex() const {
         return _currentSyncSourceIndex;
+    }
+
+    /**
+     * Returns true if the sender is primary, false if it isn't, and boost::none if this metadata
+     * is from a pre-4.4 node that doesn't send isPrimary.
+     */
+    // TODO(SERVER-47125): make this a regular bool post-4.4.
+    boost::optional<bool> getIsPrimary() const {
+        return _isPrimary;
     }
 
     /**
@@ -144,9 +165,12 @@ private:
     repl::OpTime _lastOpVisible;
     long long _currentTerm = -1;
     long long _configVersion = -1;
+    long long _configTerm = repl::OpTime::kUninitializedTerm;
     OID _replicaSetId;
+    // TODO(SERVER-47125): remove this member variable post-4.4.
     int _currentPrimaryIndex = kNoPrimary;
     int _currentSyncSourceIndex = -1;
+    boost::optional<bool> _isPrimary;
 };
 
 }  // namespace rpc

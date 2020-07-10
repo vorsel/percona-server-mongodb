@@ -42,11 +42,9 @@
 
 namespace mongo {
 
-REGISTER_DOCUMENT_SOURCE_WITH_MIN_VERSION(
-    unionWith,
-    DocumentSourceUnionWith::LiteParsed::parse,
-    DocumentSourceUnionWith::createFromBson,
-    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44);
+REGISTER_DOCUMENT_SOURCE(unionWith,
+                         DocumentSourceUnionWith::LiteParsed::parse,
+                         DocumentSourceUnionWith::createFromBson);
 
 namespace {
 std::unique_ptr<Pipeline, PipelineDeleter> buildPipelineFromViewDefinition(
@@ -84,6 +82,12 @@ std::unique_ptr<Pipeline, PipelineDeleter> buildPipelineFromViewDefinition(
 
 }  // namespace
 
+DocumentSourceUnionWith::~DocumentSourceUnionWith() {
+    if (_pipeline && _pipeline->getContext()->explain) {
+        _pipeline->dispose(pExpCtx->opCtx);
+        _pipeline.reset();
+    }
+}
 std::unique_ptr<DocumentSourceUnionWith::LiteParsed> DocumentSourceUnionWith::LiteParsed::parse(
     const NamespaceString& nss, const BSONElement& spec) {
     uassert(ErrorCodes::FailedToParse,
@@ -238,17 +242,28 @@ bool DocumentSourceUnionWith::usedDisk() {
 void DocumentSourceUnionWith::doDispose() {
     if (_pipeline) {
         _usedDisk = _usedDisk || _pipeline->usedDisk();
-        _pipeline->dispose(pExpCtx->opCtx);
-        _pipeline.reset();
+        if (!_pipeline->getContext()->explain) {
+            _pipeline->dispose(pExpCtx->opCtx);
+            _pipeline.reset();
+        }
     }
 }
 
 Value DocumentSourceUnionWith::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
     if (explain) {
-        auto ctx = _pipeline->getContext();
-        auto containers = _pipeline->getSources();
-        auto pipeCopy = Pipeline::create(containers, ctx);
-        auto explainObj = pExpCtx->mongoProcessInterface->attachCursorSourceAndExplain(
+
+        auto pipeCopy = Pipeline::create(_pipeline->getSources(), _pipeline->getContext());
+
+        // If we have already started getting documents from the sub-pipeline, this is an explain
+        // that has done some execution. We don't want to serialize the mergeCursors stage, and
+        // explain will attach a new cursor stage if we were reading local only. Therefore, remove
+        // the cursor stage of the pipeline. There is an implicit invariant that if we are in
+        // either of these states, the pipeline starts with one of the two cursor stages.
+        if (_executionState != ExecutionProgress::kStartingSubPipeline &&
+            _executionState != ExecutionProgress::kIteratingSource) {
+            pipeCopy->popFront();
+        }
+        BSONObj explainObj = pExpCtx->mongoProcessInterface->attachCursorSourceAndExplain(
             pipeCopy.release(), *explain);
         LOGV2_DEBUG(4553501, 3, "$unionWith attached cursor to pipeline for explain");
         // We expect this to be an explanation of a pipeline -- there should only be one field.

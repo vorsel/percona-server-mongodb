@@ -386,9 +386,10 @@ void CurOp::setGenericOpRequestDetails(OperationContext* opCtx,
 void CurOp::setMessage_inlock(StringData message) {
     if (_progressMeter.isActive()) {
         LOGV2_ERROR(20527,
-                    "old _message: {message} new message:{message2}",
-                    "message"_attr = redact(_message),
-                    "message2"_attr = redact(message));
+                    "Changing message from {old} to {new}",
+                    "Updating message",
+                    "old"_attr = redact(_message),
+                    "new"_attr = redact(message));
         verify(!_progressMeter.isActive());
     }
     _message = message.toString();  // copy
@@ -475,16 +476,22 @@ bool CurOp::completeAndLogOperation(OperationContext* opCtx,
                 if (lk.isLocked()) {
                     _debug.storageStats = opCtx->recoveryUnit()->getOperationStatistics();
                 } else {
-                    LOGV2_WARNING_OPTIONS(20525,
-                                          {component},
-                                          "Unable to gather storage statistics for a slow "
-                                          "operation due to lock aquire timeout");
+                    LOGV2_WARNING_OPTIONS(
+                        20525,
+                        {component},
+                        "Failed to gather storage statistics for {opId} due to {reason}",
+                        "Failed to gather storage statistics for slow operation",
+                        "opId"_attr = opCtx->getOpID(),
+                        "reason"_attr = "lock acquire timeout"_sd);
                 }
-            } catch (const ExceptionForCat<ErrorCategory::Interruption>&) {
-                LOGV2_WARNING_OPTIONS(20526,
-                                      {component},
-                                      "Unable to gather storage statistics for a slow "
-                                      "operation due to interrupt");
+            } catch (const ExceptionForCat<ErrorCategory::Interruption>& ex) {
+                LOGV2_WARNING_OPTIONS(
+                    20526,
+                    {component},
+                    "Failed to gather storage statistics for {opId} due to {reason}",
+                    "Failed to gather storage statistics for slow operation",
+                    "opId"_attr = opCtx->getOpID(),
+                    "reason"_attr = redact(ex));
             }
         }
 
@@ -496,7 +503,7 @@ bool CurOp::completeAndLogOperation(OperationContext* opCtx,
 
         logv2::DynamicAttributes attr;
         _debug.report(opCtx, (lockerInfo ? &lockerInfo->stats : nullptr), &attr);
-        LOGV2(51803, "slow query", attr);
+        LOGV2_OPTIONS(51803, {component}, "Slow query", attr);
     }
 
     // Return 'true' if this operation should also be added to the profiler.
@@ -640,6 +647,10 @@ void CurOp::reportState(OperationContext* opCtx, BSONObjBuilder* builder, bool t
         } else {
             builder->append("msg", _message);
         }
+    }
+
+    if (!_failPointMessage.empty()) {
+        builder->append("failpointMsg", _failPointMessage);
     }
 
     if (auto n = _debug.additiveMetrics.prepareReadConflicts.load(); n > 0) {

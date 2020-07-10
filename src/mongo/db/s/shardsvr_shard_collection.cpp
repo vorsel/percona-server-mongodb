@@ -76,7 +76,6 @@ MONGO_FAIL_POINT_DEFINE(pauseShardCollectionBeforeCriticalSection);
 MONGO_FAIL_POINT_DEFINE(pauseShardCollectionReadOnlyCriticalSection);
 MONGO_FAIL_POINT_DEFINE(pauseShardCollectionCommitPhase);
 MONGO_FAIL_POINT_DEFINE(pauseShardCollectionAfterCriticalSection);
-MONGO_FAIL_POINT_DEFINE(pauseShardCollectionBeforeReturning);
 
 struct ShardCollectionTargetState {
     UUID uuid;
@@ -94,8 +93,9 @@ const ReadPreferenceSetting kConfigReadSelector(ReadPreference::Nearest, TagSet{
 void uassertStatusOKWithWarning(const Status& status) {
     if (!status.isOK()) {
         LOGV2_WARNING(22103,
-                      "shardsvrShardCollection failed{causedBy_status}",
-                      "causedBy_status"_attr = causedBy(redact(status)));
+                      "shardsvrShardCollection failed {error}",
+                      "shardsvrShardCollection failed",
+                      "error"_attr = redact(status));
         uassertStatusOK(status);
     }
 }
@@ -347,7 +347,8 @@ void logStartShardCollection(OperationContext* opCtx,
                              const ShardsvrShardCollection& request,
                              const ShardCollectionTargetState& prerequisites,
                              const ShardId& dbPrimaryShardId) {
-    LOGV2(22100, "CMD: shardcollection: {cmdObj}", "cmdObj"_attr = cmdObj);
+    LOGV2(
+        22100, "CMD: shardcollection: {command}", "CMD: shardcollection", "command"_attr = cmdObj);
 
     audit::logShardCollection(
         opCtx->getClient(), nss.ns(), prerequisites.shardKeyPattern.toBSON(), request.getUnique());
@@ -432,12 +433,7 @@ void writeFirstChunksToConfig(OperationContext* opCtx,
     std::vector<BSONObj> chunkObjs;
     chunkObjs.reserve(initialChunks.chunks.size());
     for (const auto& chunk : initialChunks.chunks) {
-        if (serverGlobalParams.featureCompatibility.getVersion() >=
-            ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo44) {
-            chunkObjs.push_back(chunk.toConfigBSON());
-        } else {
-            chunkObjs.push_back(chunk.toConfigBSONLegacyID());
-        }
+        chunkObjs.push_back(chunk.toConfigBSON());
     }
 
     Grid::get(opCtx)->catalogClient()->insertConfigDocumentsAsRetryableWrite(
@@ -595,11 +591,12 @@ UUID shardCollection(OperationContext* opCtx,
     }
 
     LOGV2(22101,
-          "Created {initialChunks_chunks_size} chunk(s) for: {nss}, producing collection version "
-          "{initialChunks_collVersion}",
-          "initialChunks_chunks_size"_attr = initialChunks.chunks.size(),
-          "nss"_attr = nss,
-          "initialChunks_collVersion"_attr = initialChunks.collVersion());
+          "Created {numInitialChunks} chunk(s) for: {namespace}, producing collection version "
+          "{initialCollectionVersion}",
+          "Created initial chunk(s)",
+          "numInitialChunks"_attr = initialChunks.chunks.size(),
+          "namespace"_attr = nss,
+          "initialCollectionVersion"_attr = initialChunks.collVersion());
 
 
     ShardingLogging::get(opCtx)->logChange(
@@ -687,11 +684,6 @@ public:
             uassert(ErrorCodes::InvalidUUID,
                     str::stream() << "Collection " << nss << " is sharded without UUID",
                     uuid);
-
-            if (MONGO_unlikely(pauseShardCollectionBeforeReturning.shouldFail())) {
-                LOGV2(22102, "Hit pauseShardCollectionBeforeReturning");
-                pauseShardCollectionBeforeReturning.pauseWhileSet(opCtx);
-            }
 
             scopedShardCollection.emplaceUUID(uuid);
         }

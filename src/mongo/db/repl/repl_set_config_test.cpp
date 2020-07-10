@@ -838,7 +838,7 @@ TEST(ReplSetConfig, ValidateFailsWithDuplicateMemberId) {
     ASSERT_EQUALS(ErrorCodes::BadValue, status);
 }
 
-TEST(ReplSetConfig, ValidateFailsWithInvalidMember) {
+TEST(ReplSetConfig, InitializeFailsWithInvalidMember) {
     ReplSetConfig config;
     Status status = config.initialize(BSON("_id"
                                            << "rs0"
@@ -846,10 +846,7 @@ TEST(ReplSetConfig, ValidateFailsWithInvalidMember) {
                                            << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                                     << "localhost:12345"
                                                                     << "hidden" << true))));
-    ASSERT_OK(status);
-
-    status = config.validate();
-    ASSERT_EQUALS(ErrorCodes::BadValue, status);
+    ASSERT_EQUALS(ErrorCodes::InvalidReplicaSetConfig, status);
 }
 
 TEST(ReplSetConfig, ChainingAllowedField) {
@@ -921,7 +918,7 @@ TEST(ReplSetConfig, SetNewlyAddedFieldForMemberConfig) {
     ASSERT_FALSE(config.findMemberByID(1)->isNewlyAdded());
 
     config.setNewlyAddedFieldForMemberAtIndex(0, true);
-    ASSERT_TRUE(config.findMemberByID(1)->isNewlyAdded().get());
+    ASSERT_TRUE(config.findMemberByID(1)->isNewlyAdded());
 }
 
 TEST(ReplSetConfig, ParsingNewlyAddedSetsFieldToTrueCorrectly) {
@@ -970,6 +967,38 @@ TEST(ReplSetConfig, CannotSetNewlyAddedFieldToFalseForMemberConfig) {
     ASSERT_THROWS_CODE(config.setNewlyAddedFieldForMemberAtIndex(0, false),
                        AssertionException,
                        ErrorCodes::InvalidReplicaSetConfig);
+}
+
+TEST(ReplSetConfig, NodeWithNewlyAddedFieldHasVotesZero) {
+    // Set the flag to add the 'newlyAdded' field to MemberConfigs.
+    enableAutomaticReconfig = true;
+    // Set the flag back to false after this test exits.
+    ON_BLOCK_EXIT([] { enableAutomaticReconfig = false; });
+
+    // Create a config for a three-node set with one arbiter and one node with 'newlyAdded: true'.
+    ReplSetConfig config;
+    ASSERT_OK(config.initialize(BSON("_id"
+                                     << "rs0"
+                                     << "version" << 1 << "protocolVersion" << 1 << "members"
+                                     << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                              << "n1:1"
+                                                              << "newlyAdded" << true)
+                                                   << BSON("_id" << 2 << "host"
+                                                                 << "n2:1")
+                                                   << BSON("_id" << 3 << "host"
+                                                                 << "n3:1"
+                                                                 << "arbiterOnly" << true)))));
+
+    // Verify that the member had its 'newlyAdded' field set to true after parsing.
+    ASSERT_TRUE(config.findMemberByID(1)->isNewlyAdded());
+    // Verify that the member is considered a non-voting node.
+    ASSERT_FALSE(config.findMemberByID(1)->isVoter());
+
+    // Verify that the rest of the counts were updated correctly.
+    ASSERT_EQ(2, config.getTotalVotingMembers());
+    ASSERT_EQ(2, config.getMajorityVoteCount());
+    ASSERT_EQ(1, config.getWriteMajority());
+    ASSERT_EQ(1, config.getWritableVotingMembersCount());
 }
 
 TEST(ReplSetConfig, ConfigServerFieldDefaults) {
@@ -1136,8 +1165,9 @@ bool operator==(const MemberConfig& a, const MemberConfig& b) {
     return a.getId() == b.getId() && a.getHostAndPort() == b.getHostAndPort() &&
         a.getPriority() == b.getPriority() && a.getSlaveDelay() == b.getSlaveDelay() &&
         a.isVoter() == b.isVoter() && a.isArbiter() == b.isArbiter() &&
-        a.isHidden() == b.isHidden() && a.shouldBuildIndexes() == b.shouldBuildIndexes() &&
-        a.getNumTags() == b.getNumTags() && a.getHorizonMappings() == b.getHorizonMappings() &&
+        a.isNewlyAdded() == b.isNewlyAdded() && a.isHidden() == b.isHidden() &&
+        a.shouldBuildIndexes() == b.shouldBuildIndexes() && a.getNumTags() == b.getNumTags() &&
+        a.getHorizonMappings() == b.getHorizonMappings() &&
         a.getHorizonReverseHostMappings() == b.getHorizonReverseHostMappings();
 }
 
@@ -1231,6 +1261,11 @@ TEST(ReplSetConfig, toBSONRoundTripAbilityWithHorizon) {
 }
 
 TEST(ReplSetConfig, toBSONRoundTripAbilityLarge) {
+    // Set the flag to add the 'newlyAdded' field to MemberConfigs.
+    enableAutomaticReconfig = true;
+    // Set the flag back to false after this test exits.
+    ON_BLOCK_EXIT([] { enableAutomaticReconfig = false; });
+
     ReplSetConfig configA;
     ReplSetConfig configB;
     ASSERT_OK(configA.initialize(BSON(
@@ -1244,7 +1279,7 @@ TEST(ReplSetConfig, toBSONRoundTripAbilityLarge) {
                                     << "localhost:3828"
                                     << "arbiterOnly" << false << "hidden" << true << "buildIndexes"
                                     << false << "priority" << 0 << "slaveDelay" << 17 << "votes"
-                                    << 0 << "tags"
+                                    << 0 << "newlyAdded" << true << "tags"
                                     << BSON("coast"
                                             << "east"
                                             << "ssd"
@@ -1274,23 +1309,25 @@ TEST(ReplSetConfig, toBSONRoundTripAbilityLarge) {
 TEST(ReplSetConfig, toBSONRoundTripAbilityInvalid) {
     ReplSetConfig configA;
     ReplSetConfig configB;
-    ASSERT_OK(configA.initialize(
-        BSON("_id"
-             << ""
-             << "version" << -3 << "protocolVersion" << 1 << "members"
-             << BSON_ARRAY(BSON("_id" << 0 << "host"
-                                      << "localhost:12345"
-                                      << "arbiterOnly" << true << "votes" << 0 << "priority" << 0)
-                           << BSON("_id" << 0 << "host"
-                                         << "localhost:3828"
-                                         << "arbiterOnly" << false << "buildIndexes" << false
-                                         << "priority" << 2)
-                           << BSON("_id" << 2 << "host"
-                                         << "localhost:3828"
-                                         << "votes" << 0 << "priority" << 0))
-             << "settings"
-             << BSON("heartbeatIntervalMillis" << -5000 << "heartbeatTimeoutSecs" << 20
-                                               << "electionTimeoutMillis" << 2))));
+    ASSERT_EQUALS(
+        configA.initialize(BSON(
+            "_id"
+            << ""
+            << "version" << -3 << "protocolVersion" << 1 << "members"
+            << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                     << "localhost:12345"
+                                     << "arbiterOnly" << true << "votes" << 0 << "priority" << 0)
+                          << BSON("_id" << 0 << "host"
+                                        << "localhost:3828"
+                                        << "arbiterOnly" << false << "buildIndexes" << false
+                                        << "priority" << 2)
+                          << BSON("_id" << 2 << "host"
+                                        << "localhost:3828"
+                                        << "votes" << 0 << "priority" << 0))
+            << "settings"
+            << BSON("heartbeatIntervalMillis" << -5000 << "heartbeatTimeoutSecs" << 20
+                                              << "electionTimeoutMillis" << 2))),
+        ErrorCodes::InvalidReplicaSetConfig);
     ASSERT_OK(configB.initialize(configA.toBSON()));
     ASSERT_NOT_OK(configA.validate());
     ASSERT_NOT_OK(configB.validate());

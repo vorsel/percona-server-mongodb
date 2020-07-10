@@ -159,12 +159,11 @@ public:
             auto toShardStatus = shardRegistry->getShard(opCtx, to);
             if (!toShardStatus.isOK()) {
                 LOGV2(21921,
-                      "Could not move database '{dbname}' to shard "
-                      "'{to}{causedBy_toShardStatus_getStatus}",
-                      "dbname"_attr = dbname,
-                      "to"_attr = to,
-                      "causedBy_toShardStatus_getStatus"_attr =
-                          causedBy(toShardStatus.getStatus()));
+                      "Could not move database {db} to shard {shardId}: {error}",
+                      "Could not move database to shard",
+                      "db"_attr = dbname,
+                      "shardId"_attr = to,
+                      "error"_attr = toShardStatus.getStatus());
                 uassertStatusOKWithContext(toShardStatus.getStatus(),
                                            str::stream() << "Could not move database '" << dbname
                                                          << "' to shard '" << to << "'");
@@ -195,21 +194,6 @@ public:
             CommandHelpers::appendMajorityWriteConcern(
                 CommandHelpers::appendPassthroughFields(cmdObj, shardMovePrimaryRequest.toBSON())),
             Shard::RetryPolicy::kIdempotent));
-
-        // If the `fromShard` is on v4.2 or earlier, it will not recognize the command name
-        // _shardsvrMovePrimary. We will retry the command with the old name _movePrimary.
-        if (cmdResponse.commandStatus == ErrorCodes::CommandNotFound) {
-            ShardMovePrimary legacyShardMovePrimaryRequest;
-            legacyShardMovePrimaryRequest.set_movePrimary(NamespaceString(dbname));
-            legacyShardMovePrimaryRequest.setTo(toShard->getId().toString());
-            cmdResponse = uassertStatusOK(fromShard->runCommandWithFixedRetryAttempts(
-                opCtx,
-                ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-                "admin",
-                CommandHelpers::appendMajorityWriteConcern(CommandHelpers::appendPassthroughFields(
-                    cmdObj, legacyShardMovePrimaryRequest.toBSON())),
-                Shard::RetryPolicy::kIdempotent));
-        }
 
         CommandHelpers::filterCommandReplyForPassthrough(cmdResponse.response, &result);
 
