@@ -238,12 +238,6 @@ Status validatePreImageRecording(OperationContext* opCtx, const NamespaceString&
                 "recordPreImages collection option is not supported on shards or config servers"};
     }
 
-    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
-    if (!replCoord->isReplEnabled()) {
-        return {ErrorCodes::InvalidOptions,
-                "recordPreImages collection option depends on being in a replica set"};
-    }
-
     return Status::OK();
 }
 
@@ -301,6 +295,8 @@ void CollectionImpl::init(OperationContext* opCtx) {
     // are not supported with certain combinations of action and level.
     _validationAction = uassertStatusOK(_parseValidationAction(collectionOptions.validationAction));
     _validationLevel = uassertStatusOK(_parseValidationLevel(collectionOptions.validationLevel));
+
+    // The recordPreImages field should only be present in FCV 4.4.
     if (collectionOptions.recordPreImages) {
         uassertStatusOK(validatePreImageRecording(opCtx, _ns));
         _recordPreImages = true;
@@ -873,9 +869,7 @@ bool CollectionImpl::getRecordPreImages() const {
 }
 
 void CollectionImpl::setRecordPreImages(OperationContext* opCtx, bool val) {
-    if (val) {
-        uassertStatusOK(validatePreImageRecording(opCtx, _ns));
-    }
+    uassertStatusOK(validatePreImageRecording(opCtx, _ns));
     DurableCatalog::get(opCtx)->setRecordPreImages(opCtx, getCatalogId(), val);
     _recordPreImages = val;
 }
