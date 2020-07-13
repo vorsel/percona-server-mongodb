@@ -160,6 +160,7 @@ let testCases = {
         useLogs: true,
     },
     applyOps: {skip: "internal command"},
+    auditGetOptions: {skip: "does not accept read or write concern"},
     authenticate: {skip: "does not accept read or write concern"},
     availableQueryOptions: {skip: "internal command"},
     balancerCollectionStatus: {skip: "does not accept read or write concern"},
@@ -243,6 +244,7 @@ let testCases = {
         checkReadConcern: false,
         checkWriteConcern: true,
     },
+    createBackup: {skip: "does not accept read or write concern"},
     createIndexes: {
         setUp: function(conn) {
             assert.commandWorked(conn.getCollection(nss).insert({x: 1}, {writeConcern: {w: 1}}));
