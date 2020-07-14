@@ -137,6 +137,9 @@ var getAuditEventsCollection = function(m, dbname, primary, useAuth) {
 // Load audit log events into a named collection
 var loadAuditEventsIntoCollection = function(m, filename, dbname, collname, primary, auth) {
     var db = primary !== undefined ? primary.getDB(dbname) : m.getDB(dbname);
+    // drop collection
+    db[collname].drop();
+    // load data from audit log file
     var auditCollection = db.getCollection(collname);
     cat(filename)
         .split('\n')
