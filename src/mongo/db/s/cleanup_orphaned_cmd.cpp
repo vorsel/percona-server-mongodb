@@ -91,8 +91,8 @@ CleanupResult cleanupOrphanedData(OperationContext* opCtx,
         if (!startingFromKey.isEmpty()) {
             if (!metadata->isValidKey(startingFromKey)) {
                 *errMsg = str::stream() << "could not cleanup orphaned data, start key "
-                                        << startingFromKey << " does not match shard key pattern "
-                                        << keyPattern;
+                                        << redact(startingFromKey)
+                                        << " does not match shard key pattern " << keyPattern;
 
                 log() << *errMsg;
                 return CleanupResult_Error;
@@ -111,7 +111,8 @@ CleanupResult cleanupOrphanedData(OperationContext* opCtx,
 
         *stoppedAtKey = targetRange->getMax();
 
-        notifn = css->cleanUpRange(*targetRange, CollectionShardingState::kNow);
+        notifn = css->cleanUpRange(
+            opCtx, autoColl.getCollection(), *targetRange, CollectionShardingState::kNow);
     }
 
     // Sleep waiting for our own deletion. We don't actually care about any others, so there is no

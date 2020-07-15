@@ -29,17 +29,6 @@ end
 
 if platform_family? 'debian'
 
-  # SERVER-40491 Debian 8 sources.list need to point to archive url
-  if node['platform_version'] == '8.1'
-    cookbook_file '/etc/apt/sources.list' do
-      source 'sources.list.debian8'
-      owner 'root'
-      group 'root'
-      mode '0644'
-      action :create
-    end
-  end
-
   execute 'apt-get update' do
     command 'apt-get update'
   end
@@ -115,23 +104,13 @@ if platform_family? 'suse'
   EOD
   end
 
-  %w(
-     SLES12-Pool
-     SLES12-Updates
-  ).each do |repo|
-    execute "add #{repo}" do
-      command "zypper addrepo --check --refresh --name \"#{repo}\" http://smt-ec2.susecloud.net/repo/SUSE/Products/SLE-SERVER/12/x86_64/product?credentials=SMT-http_smt-ec2_susecloud_net 'SMT-http_smt-ec2_susecloud_net:#{repo}'"
-      not_if "zypper lr | grep #{repo}"
-    end
-  end
-
   execute 'install mongod' do
-    command 'zypper -n install `find . -name "*server*.rpm"`'
+    command 'zypper --no-gpg-checks -n install `find . -name "*server*.rpm"`'
     cwd homedir
   end
 
   execute 'install mongo' do
-    command 'zypper -n install `find . -name "*shell*.rpm"`'
+    command 'zypper --no-gpg-checks -n install `find . -name "*shell*.rpm"`'
     cwd homedir
   end
 end
