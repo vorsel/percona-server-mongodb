@@ -382,6 +382,7 @@ EOL
       fi
       wget https://repo.percona.com/apt/percona-release_latest.$(lsb_release -sc)_all.deb && dpkg -i percona-release_latest.$(lsb_release -sc)_all.deb
       percona-release enable tools testing
+      apt-get -y update
       INSTALL_LIST="valgrind scons liblz4-dev devscripts debhelper debconf libpcap-dev libbz2-dev libsnappy-dev pkg-config zlib1g-dev libzlcore-dev dh-systemd libsasl2-dev gcc g++ cmake curl patchelf"
       if [ x"${DEBIAN}" = xfocal ]; then
           INSTALL_LIST="${INSTALL_LIST} python2 python2-dev "
