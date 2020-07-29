@@ -148,7 +148,7 @@ mv ${INSTALLDIR_AWS}/lib*/* ${INSTALLDIR}/lib/
 
 # Build PSfMDB with SCons
 pushd $RPM_BUILD_DIR/%{src_dir}
-buildscripts/scons.py CC=${CC} CXX=${CXX} --audit --release --ssl --opt=on  \
+buildscripts/scons.py CC=${CC} CXX=${CXX} --install-mode=legacy --audit --release --ssl --opt=on  \
 %{?_smp_mflags} --use-sasl-client CPPPATH=${INSTALLDIR}/include LIBPATH="${INSTALLDIR}/lib ${AWS_LIBS}/lib ${AWS_LIBS}/lib64" \
 --wiredtiger --inmemory --hotbackup ${PSM_TARGETS} || exit $?
 popd
