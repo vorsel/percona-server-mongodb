@@ -82,6 +82,11 @@ namespace {
             return createSaslBase(authzSession, db, mechanism);
     }
 
+    int saslServerLog(void* context, int priority, const char* message) throw() {
+        log() << "SASL server message: (" << priority << ") " << message;
+        return SASL_OK;  // do nothing
+    }
+
     // External SASL session factory needs to be set AFTER the native one has been set.
     MONGO_INITIALIZER_GENERAL(ExternalSaslServerCore, ("NativeSaslServerCore"), ("PostSaslCommands"))
         (InitializerContext* context) {
@@ -90,9 +95,14 @@ namespace {
         if (saslGlobalParams.serviceName.empty())
             saslGlobalParams.serviceName = "mongodb";
 
-        int result = sasl_server_init(NULL, saslDefaultServiceName);
+        typedef int (*SaslCallbackFn)();
+        static sasl_callback_t saslServerGlobalCallbacks[] = {
+            {SASL_CB_LOG, SaslCallbackFn(saslServerLog), nullptr /* context */},
+            {SASL_CB_LIST_END}
+        };
+        int result = sasl_server_init(saslServerGlobalCallbacks, saslDefaultServiceName);
         if (result != SASL_OK) {
-            log() << "Failed Initializing External Auth Session" << std::endl;
+            error() << "Failed Initializing External Auth Session";
             return ExternalSaslAuthenticationSession::getInitializationError(result);
         }
 
@@ -164,7 +174,7 @@ namespace {
         return Status(ErrorCodes::OperationFailed,
                       mongoutils::str::stream() <<
                       "SASL step did not complete: (" <<
-                      sasl_errstring(_results.result, NULL, NULL) <<
+                      sasl_errstring(_results.result, nullptr, nullptr) <<
                       ")");
     }
 
@@ -185,11 +195,11 @@ namespace {
 
     Status ExternalSaslAuthenticationSession::initializeConnection() {
         int result = sasl_server_new(saslDefaultServiceName,
-                                     prettyHostName().c_str(), // Fully Qualified Domain Name (FQDN), NULL => gethostname()
-                                     NULL, // User Realm string, NULL forces default value: FQDN.
-                                     NULL, // Local IP address
-                                     NULL, // Remote IP address
-                                     NULL, // Callbacks specific to this connection.
+                                     prettyHostName().c_str(), // Fully Qualified Domain Name (FQDN), nullptr => gethostname()
+                                     nullptr, // User Realm string, nullptr forces default value: FQDN.
+                                     nullptr, // Local IP address
+                                     nullptr, // Remote IP address
+                                     nullptr, // Callbacks specific to this connection.
                                      0,    // Security flags.
                                      &_saslConnection); // Connection object output parameter.
         if (result != SASL_OK) {
@@ -203,7 +213,7 @@ namespace {
         return Status(ErrorCodes::OperationFailed,
                       mongoutils::str::stream() <<
                       "Could not initialize sasl server session (" <<
-                      sasl_errstring(result, NULL, NULL) <<
+                      sasl_errstring(result, nullptr, nullptr) <<
                       ")");
     }
 
