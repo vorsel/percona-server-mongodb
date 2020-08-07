@@ -100,7 +100,7 @@ namespace {
             {SASL_CB_LOG, SaslCallbackFn(saslServerLog), nullptr /* context */},
             {SASL_CB_LIST_END}
         };
-        int result = sasl_server_init(saslServerGlobalCallbacks, saslDefaultServiceName);
+        int result = sasl_server_init(saslServerGlobalCallbacks, saslGlobalParams.serviceName.c_str());
         if (result != SASL_OK) {
             error() << "Failed Initializing External Auth Session";
             return ExternalSaslAuthenticationSession::getInitializationError(result);
@@ -194,8 +194,8 @@ namespace {
     }
 
     Status ExternalSaslAuthenticationSession::initializeConnection() {
-        int result = sasl_server_new(saslDefaultServiceName,
-                                     prettyHostName().c_str(), // Fully Qualified Domain Name (FQDN), nullptr => gethostname()
+        int result = sasl_server_new(saslGlobalParams.serviceName.c_str(),
+                                     saslGlobalParams.hostName.c_str(), // Fully Qualified Domain Name (FQDN), nullptr => gethostname()
                                      nullptr, // User Realm string, nullptr forces default value: FQDN.
                                      nullptr, // Local IP address
                                      nullptr, // Remote IP address
