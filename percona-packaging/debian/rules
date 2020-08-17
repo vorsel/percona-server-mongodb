@@ -23,7 +23,7 @@ override_dh_auto_clean:
 	#rm -fr $(INSTALLDIR)
 	buildscripts/scons.py CC=$(CC) CXX=$(CXX) -C $(PSMSRC) -c --disable-warnings-as-errors --audit --release --ssl --opt -j$(NJOBS) --use-sasl-client CPPPATH=$(INSTALLDIR)/include \
 	LIBPATH=$(INSTALLDIR)/lib LINKFLAGS="$(LINKFLAGS)" --wiredtiger --inmemory --hotbackup $(PSM_TARGETS) || exit $?
-	rm -fr build
+	rm -fr build resmoke.ini
 	find $(PSMSRC) -name '*.pyc' -delete
 
 # Finally PSfMDB

@@ -387,13 +387,24 @@ install_deps() {
       pip install --upgrade pip
 
     else
+      apt-get -y install lsb-release wget apt-transport-https
       export DEBIAN=$(lsb_release -sc)
       export ARCH=$(echo $(uname -m) | sed -e 's:i686:i386:g')
       wget https://repo.percona.com/apt/percona-release_latest.$(lsb_release -sc)_all.deb && dpkg -i percona-release_latest.$(lsb_release -sc)_all.deb
+      if [ x"${DEBIAN}" = "xxenial" -o x"${DEBIAN}" = "xbionic" -o x"${DEBIAN}" = "xfocal" ]; then
+        add-apt-repository -y ppa:deadsnakes/ppa
+      elif [ x"${DEBIAN}" = "xstretch" -o x"${DEBIAN}" = "xbuster" ]; then
+        wget https://people.debian.org/~paravoid/python-all/unofficial-python-all.asc
+        mv unofficial-python-all.asc /etc/apt/trusted.gpg.d/
+        echo "deb http://people.debian.org/~paravoid/python-all ${DEBIAN} main" | tee /etc/apt/sources.list.d/python-all.list
+      fi
       percona-release enable tools testing
       apt-get update
-      INSTALL_LIST="python3 python3-dev python3-pip valgrind scons liblz4-dev devscripts debhelper debconf libpcap-dev libbz2-dev libsnappy-dev pkg-config zlib1g-dev libzlcore-dev dh-systemd libsasl2-dev gcc g++ cmake curl"
+      INSTALL_LIST="python3.7 python3.7-dev valgrind scons liblz4-dev devscripts debhelper debconf libpcap-dev libbz2-dev libsnappy-dev pkg-config zlib1g-dev libzlcore-dev dh-systemd libsasl2-dev gcc g++ cmake curl"
       INSTALL_LIST="${INSTALL_LIST} libssl-dev libcurl4-openssl-dev libldap2-dev libkrb5-dev liblzma-dev patchelf"
+      if [ x"${DEBIAN}" != "xstretch" ]; then
+        INSTALL_LIST="${INSTALL_LIST} python3.7-distutils"
+      fi
       until apt-get -y install dirmngr; do
         sleep 1
         echo "waiting"
@@ -411,9 +422,11 @@ install_deps() {
       install_golang
       install_gcc_8_deb
       wget https://bootstrap.pypa.io/get-pip.py
-      update-alternatives --install /usr/bin/python python /usr/bin/python3 1
+      update-alternatives --install /usr/bin/python python /usr/bin/python3.7 1
+      ln -sf /usr/bin/python3.7 /usr/bin/python3
       python get-pip.py
       easy_install pip
+      pip install setuptools
     fi
     if [ x"${DEBIAN}" = "xstretch" ]; then
       LIBCURL_DEPS="libidn2-0-dev libldap2-dev libnghttp2-dev libnss3-dev libpsl-dev librtmp-dev libssh2-1-dev libssl1.0-dev"
@@ -649,8 +662,8 @@ build_source_deb(){
     mv ${TARFILE} ${PRODUCT}_${VERSION}.orig.tar.gz
     cd ${BUILDDIR}
     pip install --upgrade pip
-    pip install --user -r etc/pip/dev-requirements.txt
-    pip install --user -r etc/pip/evgtest-requirements.txt
+    pip install -r etc/pip/dev-requirements.txt
+    pip install -r etc/pip/evgtest-requirements.txt
 
     set_compiler
     fix_rules
@@ -701,8 +714,8 @@ build_deb(){
     #
     cd ${PRODUCT}-${VERSION}
     pip install --upgrade pip
-    pip install --user -r etc/pip/dev-requirements.txt
-    pip install --user -r etc/pip/evgtest-requirements.txt
+    pip install -r etc/pip/dev-requirements.txt
+    pip install -r etc/pip/evgtest-requirements.txt
     #
     cp -av percona-packaging/debian/rules debian/
     set_compiler
