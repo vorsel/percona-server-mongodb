@@ -17,7 +17,10 @@ function prepare {
     mkdir -p "$CURDIR"/temp
     mkdir -p "$TMP_DIR"/db "$TMP_DIR"/tests
 
-    TARBALL=$(basename $(find . -name "*.tar.gz" | sort))
+    TARBALLS=""
+    for tarball in $(find . -name "*.tar.gz"); do
+        TARBALLS+=" $(basename $tarball)"
+    done
     DIRLIST="bin lib/private"
 }
 
@@ -32,46 +35,49 @@ function install_deps {
 
 main () {
     prepare
-    echo "Unpacking tarball"
-    cd "$TMP_DIR"
-    tar xf "$CURDIR/$TARBALL"
-    cd "${TARBALL%.tar.gz}"
+    for tarfile in $TARBALLS; do
+        echo "Unpacking tarball"
+        cd "$TMP_DIR"
+        tar xf "$CURDIR/$tarfile"
+        cd "${tarfile%.tar.gz}"
 
-    echo "Building ELFs ldd output list"
-    for DIR in $DIRLIST; do
-        if ! check_libs "$DIR" >> "$TMP_DIR"/libs_err.log; then
-            echo "There is an error with libs linkage"
-            echo "Displaying log: "
+        echo "Building ELFs ldd output list"
+        for DIR in $DIRLIST; do
+            if ! check_libs "$DIR" >> "$TMP_DIR"/libs_err.log; then
+                echo "There is an error with libs linkage"
+                echo "Displaying log: "
+                cat "$TMP_DIR"/libs_err.log
+                exit 1
+            fi
+        done
+
+        echo "Checking for missing libraries"
+        if [[ ! -z $(grep "not found" $TMP_DIR/libs_err.log) ]]; then
+            echo "ERROR: There are missing libraries: "
+            grep "not found" "$TMP_DIR"/libs_err.log
+            echo "Log: "
             cat "$TMP_DIR"/libs_err.log
             exit 1
         fi
+
+        wget -O "$TMP_DIR"/mgodatagen.tar.gz https://github.com/feliixx/mgodatagen/releases/download/v0.8.2/mgodatagen_linux_x86_64.tar.gz
+        wget -O "$TMP_DIR"/tests/big.json https://raw.githubusercontent.com/feliixx/mgodatagen/master/datagen/testdata/big.json
+        tar -xvf "$TMP_DIR"/mgodatagen.tar.gz
+
+        ./bin/mongod --dbpath $TMP_DIR/db 2>&1 > status.log &
+        MONGOPID="$(echo $!)"
+        ./mgodatagen -f "$TMP_DIR"/tests/big.json
+        if [[ "$?" -eq 0 ]]; then
+            echo "Tests succeeded"
+            kill -2 "$MONGOPID"
+            echo "== PSMDB Log =="
+            cat status.log
+        else
+            echo "Tests failed"
+            exit 1
+        fi
+        rm -rf "${TMP_DIR:?}/*"
     done
-
-    echo "Checking for missing libraries"
-    if [[ ! -z $(grep "not found" $TMP_DIR/libs_err.log) ]]; then
-        echo "ERROR: There are missing libraries: "
-        grep "not found" "$TMP_DIR"/libs_err.log
-        echo "Log: "
-        cat "$TMP_DIR"/libs_err.log
-        exit 1
-    fi
-
-    wget -O "$TMP_DIR"/mgodatagen.tar.gz https://github.com/feliixx/mgodatagen/releases/download/v0.8.2/mgodatagen_linux_x86_64.tar.gz
-    wget -O "$TMP_DIR"/tests/big.json https://raw.githubusercontent.com/feliixx/mgodatagen/master/datagen/testdata/big.json
-    tar -xvf "$TMP_DIR"/mgodatagen.tar.gz
-
-    ./bin/mongod --dbpath $TMP_DIR/db 2>&1 > status.log &
-    MONGOPID="$(echo $!)"
-    ./mgodatagen -f "$TMP_DIR"/tests/big.json
-    if [[ "$?" -eq 0 ]]; then
-        echo "Tests succeeded"
-        kill -2 "$MONGOPID"
-        echo "== PSMDB Log =="
-        cat status.log
-    else
-        echo "Tests failed"
-        exit 1
-    fi
 }
 
 case "$1" in
