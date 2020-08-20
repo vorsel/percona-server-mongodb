@@ -1026,7 +1026,9 @@ void WiredTigerKVEngine::cleanShutdown() {
         closeConfig = "leak_memory=true,";
     }
 
+    bool downgrade = false;
     if (_fileVersion.shouldDowngrade(_readOnly, _inRepairMode, !_recoveryTimestamp.isNull())) {
+        downgrade = true;
         LOGV2(22324, "Downgrading WiredTiger datafiles.");
         invariantWTOK(_conn->close(_conn, closeConfig.c_str()));
 
@@ -1057,6 +1059,10 @@ void WiredTigerKVEngine::cleanShutdown() {
         quickExit(EXIT_SUCCESS);
     }
     _conn = nullptr;
+
+    if (_encryptionKeyDB && downgrade) {
+        _encryptionKeyDB->reconfigure(_fileVersion.getDowngradeString().c_str());
+    }
 }
 
 Status WiredTigerKVEngine::okToRename(OperationContext* opCtx,
