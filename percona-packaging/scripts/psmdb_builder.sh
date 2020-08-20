@@ -866,7 +866,7 @@ build_tarball(){
     if [ ! -d lib/private ]; then
         mkdir -p lib/private
     fi
-    LIBLIST="libcrypto.so libssl.so libsasl2.so libpcap.so libcurl.so libldap liblber libgssapi_krb5.so libkrb5.so libkrb5support.so libk5crypto.so libfreebl3.so libssl3.so libsmime3.so libnss3.so libnssutil3.so libplds4.so libplc4.so libnspr4.so libssl3.so libplds4.so"
+    LIBLIST="libcrypto.so libssl.so libsasl2.so libpcap.so libcurl.so libldap liblber libgssapi_krb5.so libkrb5.so libkrb5support.so libk5crypto.so libfreebl3.so libssl3.so libsmime3.so libnss3.so libnssutil3.so libplds4.so libplc4.so libnspr4.so libssl3.so libplds4.so libidn.so"
     DIRLIST="bin lib/private"
 
     LIBPATH=""
