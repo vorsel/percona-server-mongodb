@@ -156,21 +156,16 @@ popd
 
 # Mongo Tools compilation
 mkdir -p $RPM_BUILD_DIR/%{src_dir}/bin
-pushd $RPM_BUILD_DIR/
-[[ ${PATH} == *"/usr/local/go/bin"* && -x /usr/local/go/bin/go ]] || export PATH=/usr/local/go/bin:${PATH}
-export GOROOT="/usr/local/go/"
-export GOPATH=$(pwd)/
-export PATH="/usr/local/go/bin:$PATH:$GOPATH"
-export GOBINPATH="/usr/local/go/bin"
-mkdir -p $GOPATH/src/github.com/mongodb
-cp -r $RPM_BUILD_DIR/%{src_dir}/mongo-tools ${GOPATH}/src/github.com/mongodb
-pushd ${GOPATH}/src/github.com/mongodb/mongo-tools
+cp -r $(ls | grep -v build_tools) build_tools/src/github.com/mongodb/mongo-tools/
+pushd build_tools/src/github.com/mongodb/mongo-tools
+sed -i 's|VersionStr="$(go run release/release.go get-version)"|VersionStr="$PSMDB_TOOLS_REVISION"|' set_goenv.sh
+sed -i 's|GitCommit="$(git rev-parse HEAD)"|GitCommit="$PSMDB_TOOLS_COMMIT_HASH"|' set_goenv.sh
+sed -i 's|go build|go build -a -x|' build.sh
+sed -i 's|exit $ec||' build.sh
 . ./set_tools_revision.sh
-sed -i '12d' buildscript/build.go
-sed -i '169,178d' buildscript/build.go
-sed -i "s:versionStr,:\"$PSMDB_TOOLS_REVISION\",:" buildscript/build.go
-sed -i "s:gitCommit):\"$PSMDB_TOOLS_COMMIT_HASH\"):" buildscript/build.go
-./make build
+. ./set_goenv.sh
+mkdir -p bin
+. ./build.sh ${TOOLS_TAGS}
 mv bin/* $RPM_BUILD_DIR/%{src_dir}/bin
 popd
 popd
