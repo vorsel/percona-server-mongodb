@@ -39,9 +39,11 @@
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/oplog_interface_local.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
+#include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/db/session_catalog.h"
 #include "mongo/s/config_server_test_fixture.h"
@@ -59,6 +61,9 @@ public:
 
         auto service = getServiceContext();
         auto opCtx = cc().makeOperationContext();
+
+        // The rollback observer relies on the storage interface to query the FCV document.
+        repl::StorageInterface::set(service, std::make_unique<repl::StorageInterfaceImpl>());
 
         // Set up ReplicationCoordinator and create oplog.
         repl::ReplicationCoordinator::set(
@@ -285,6 +290,20 @@ TEST_F(OpObserverTest, OnRenameCollectionOmitsDropTargetFieldIfDropTargetUuidIsN
     auto oExpected = BSON(
         "renameCollection" << sourceNss.ns() << "to" << targetNss.ns() << "stayTemp" << stayTemp);
     ASSERT_BSONOBJ_EQ(oExpected, o);
+}
+
+TEST_F(OpObserverTest, MustBePrimaryToWriteOplogEntries) {
+    OpObserverImpl opObserver;
+    auto opCtx = cc().makeOperationContext();
+
+    ASSERT_OK(repl::ReplicationCoordinator::get(opCtx.get())
+                  ->setFollowerMode(repl::MemberState::RS_SECONDARY));
+
+    Lock::GlobalWrite globalWrite(opCtx.get());
+    WriteUnitOfWork wunit(opCtx.get());
+
+    // No-op writes should be prohibited.
+    ASSERT_THROWS(opObserver.onOpMessage(opCtx.get(), {}), AssertionException);
 }
 
 /**

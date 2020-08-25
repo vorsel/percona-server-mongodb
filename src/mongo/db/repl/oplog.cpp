@@ -219,8 +219,8 @@ bool shouldBuildInForeground(OperationContext* opCtx,
                              const NamespaceString& indexNss,
                              repl::OplogApplication::Mode mode) {
     if (mode == OplogApplication::Mode::kRecovering) {
-        LOG(3) << "apply op: building background index " << index
-               << " in the foreground because the node is in recovery";
+        log() << "apply op: building background index " << index
+              << " in the foreground because the node is in recovery - see SERVER-43097";
         return true;
     }
 
@@ -415,7 +415,7 @@ void _logOpsInner(OperationContext* opCtx,
                   Collection* oplogCollection,
                   OpTime finalOpTime) {
     auto replCoord = ReplicationCoordinator::get(opCtx);
-    if (nss.size() && replCoord->getReplicationMode() == ReplicationCoordinator::modeReplSet &&
+    if (replCoord->getReplicationMode() == ReplicationCoordinator::modeReplSet &&
         !replCoord->canAcceptWritesFor(opCtx, nss)) {
         uasserted(17405,
                   str::stream() << "logOp() but can't accept write to collection " << nss.ns());

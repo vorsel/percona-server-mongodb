@@ -879,7 +879,6 @@ functions:
 
         ${activate_virtualenv}
         pip install -r buildscripts/requirements.txt
-        pip install boto3==1.5.27
 
   "execute resmoke tests" : &execute_resmoke_tests
     command: shell.exec
@@ -894,7 +893,6 @@ functions:
         # Install any pip modules needed by the scripts or tests
         ${activate_virtualenv}
         pip install -r buildscripts/requirements.txt
-        pip install boto3==1.5.27
 
         if [[ ${disable_unit_tests|false} = "false" && ! -f ${skip_tests|/dev/null} ]]; then
 
@@ -5630,6 +5628,7 @@ tasks:
 - name: push
   patchable: false
   depends_on:
+  - name: compile
   - name: jsCore
   - name: dbtest
   - name: replica_sets_jscore_passthrough
@@ -5668,7 +5667,7 @@ tasks:
           cat <<EOF > notary_env.sh
           export NOTARY_TOKEN=${signing_auth_token_40}
           export BARQUE_USERNAME=${barque_user}
-          export BARQUE_PASSWORD=${barque_password}
+          export BARQUE_API_KEY=${barque_api_key}
           EOF
 
           echo "${signing_auth_token_40}" > signing_auth_token
@@ -11209,7 +11208,7 @@ buildvariants:
   expansions:
     test_flags: --excludeWithAnyTags=requires_mmapv1
     lang_environment: LANG=C
-    compile_flags: --ssl MONGO_DISTMOD=ubuntu1604 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars --link-model=dynamic
+    compile_flags: --ssl MONGO_DISTMOD=ubuntu1604 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars --link-model=dynamic --allocator=system
     scons_cache_scope: shared
     scons_cache_mode: all
     tooltags: "ssl sasl"
