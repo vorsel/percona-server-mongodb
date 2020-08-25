@@ -160,6 +160,8 @@ get_sources(){
     git clone https://github.com/mongodb/mongo-tools.git
     cd mongo-tools
     git checkout $MONGO_TOOLS_TAG
+    sed -i 's|VersionStr="$(go run release/release.go get-version)"|VersionStr="$PSMDB_TOOLS_REVISION"|' set_goenv.sh
+    sed -i 's|GitCommit="$(git rev-parse HEAD)"|GitCommit="$PSMDB_TOOLS_COMMIT_HASH"|' set_goenv.sh
     echo "export PSMDB_TOOLS_COMMIT_HASH=\"$(git rev-parse HEAD)\"" > set_tools_revision.sh
     echo "export PSMDB_TOOLS_REVISION=\"${PSM_VER}-${PSM_RELEASE}\"" >> set_tools_revision.sh
     chmod +x set_tools_revision.sh
@@ -705,8 +707,8 @@ build_deb(){
     cp -av percona-packaging/debian/rules debian/
     set_compiler
     fix_rules
-    sed -i 's|VersionStr="$(git describe)"|VersionStr="$PSMDB_TOOLS_REVISION"|' mongo-tools/set_goenv.sh
-    sed -i 's|Gitspec="$(git rev-parse HEAD)"|Gitspec="$PSMDB_TOOLS_COMMIT_HASH"|' mongo-tools/set_goenv.sh
+    sed -i 's|VersionStr="$(go run release/release.go get-version)"|VersionStr="$PSMDB_TOOLS_REVISION"|' mongo-tools/set_goenv.sh
+    sed -i 's|GitCommit="$(git rev-parse HEAD)"|GitCommit="$PSMDB_TOOLS_COMMIT_HASH"|' mongo-tools/set_goenv.sh
     sed -i 's|go build|go build -a -x|' mongo-tools/build.sh
     sed -i 's|exit $ec||' mongo-tools/build.sh
     dch -m -D "${DEBIAN}" --force-distribution -v "${VERSION}-${RELEASE}.${DEBIAN}" 'Update distribution'
@@ -870,8 +872,8 @@ build_tarball(){
     cp -r $(ls | grep -v build_tools) build_tools/src/github.com/mongodb/mongo-tools/
     cd build_tools/src/github.com/mongodb/mongo-tools
     . ./set_tools_revision.sh
-    sed -i 's|VersionStr="$(git describe)"|VersionStr="$PSMDB_TOOLS_REVISION"|' set_goenv.sh
-    sed -i 's|Gitspec="$(git rev-parse HEAD)"|Gitspec="$PSMDB_TOOLS_COMMIT_HASH"|' set_goenv.sh
+    sed -i 's|VersionStr="$(go run release/release.go get-version)"|VersionStr="$PSMDB_TOOLS_REVISION"|' set_goenv.sh
+    sed -i 's|GitCommit="$(git rev-parse HEAD)"|GitCommit="$PSMDB_TOOLS_COMMIT_HASH"|' set_goenv.sh
     . ./set_goenv.sh
     if [ ${DEBUG} = 0 ]; then
         sed -i 's|go build|go build -a -x|' build.sh
